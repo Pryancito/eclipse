@@ -29,6 +29,8 @@ fn every_canonical_command_round_trips_through_its_nr() {
         DRM_IOCTL_MODE_DETACHMODE,
         DRM_IOCTL_DROP_MASTER,
         DRM_IOCTL_WAIT_VBLANK,
+        DRM_IOCTL_CRTC_GET_SEQUENCE,
+        DRM_IOCTL_CRTC_QUEUE_SEQUENCE,
         DRM_IOCTL_MODE_GETRESOURCES,
         DRM_IOCTL_MODE_GETCRTC,
         DRM_IOCTL_MODE_SETCRTC,

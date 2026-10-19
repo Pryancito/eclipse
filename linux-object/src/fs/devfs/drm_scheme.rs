@@ -1990,6 +1990,60 @@ impl DrmDev {
                 }
                 Ok(0)
             }
+            DRM_IOCTL_CRTC_GET_SEQUENCE => {
+                // `drm_crtc_get_sequence_ioctl`: the CRTC by id (ENOENT),
+                // then `active` (`crtc_state->enable`, what GETCRTC's
+                // `mode_valid` reads), the vblank counter and the time of
+                // the vblank it counts, in nanoseconds. Xorg's modesetting
+                // driver asks this first (`ms_get_crtc_ust_msc`) and, told
+                // ENOTTY, fell back to WAIT_VBLANK for every MSC query:
+                // neither this nor QUEUE_SEQUENCE existed.
+                let req = unsafe { &mut *(data as *mut DrmCrtcGetSequence) };
+                if drm::get_crtc(req.crtc_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
+                let (seq, ns) = drm::vblank_seq_and_time_now();
+                req.active = drm::crtc_enabled() as u32;
+                req.sequence = seq as u64;
+                req.sequence_ns = ns as i64;
+                Ok(0)
+            }
+            DRM_IOCTL_CRTC_QUEUE_SEQUENCE => {
+                // `drm_crtc_queue_sequence_ioctl`: the CRTC (ENOENT), then
+                // the flags (RELATIVE and NEXT_ON_MISS only, EINVAL), then
+                // the target resolved as WAIT_VBLANK resolves its event
+                // form, and the reply is the sequence the event was queued
+                // for (the current one when the target had passed). The
+                // event is a `DRM_EVENT_CRTC_SEQUENCE` on this fd, paced
+                // like the vblank event: never before the next synthetic
+                // vblank (Linux sends a passed target's at once; see
+                // `schedule_flip_event` for why that spins here). The
+                // counter is 32-bit here, so the 64-bit target is taken
+                // modulo 2^32, wrap-safe like the vblank one.
+                const DRM_CRTC_SEQUENCE_RELATIVE: u32 = 0x1;
+                const DRM_CRTC_SEQUENCE_NEXT_ON_MISS: u32 = 0x2;
+                let req = unsafe { &mut *(data as *mut DrmCrtcQueueSequence) };
+                if drm::get_crtc(req.crtc_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
+                if req.flags & !(DRM_CRTC_SEQUENCE_RELATIVE | DRM_CRTC_SEQUENCE_NEXT_ON_MISS) != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                let now_seq = drm::vblank_seq_now();
+                let mut target = if req.flags & DRM_CRTC_SEQUENCE_RELATIVE != 0 {
+                    now_seq.wrapping_add(req.sequence as u32)
+                } else {
+                    req.sequence as u32
+                };
+                let passed = (target.wrapping_sub(now_seq) as i32) <= 0;
+                if passed && req.flags & DRM_CRTC_SEQUENCE_NEXT_ON_MISS != 0 {
+                    target = now_seq.wrapping_add(1);
+                }
+                drm::schedule_crtc_sequence_event(req.user_data, target, &self.file);
+                let still_passed = (target.wrapping_sub(now_seq) as i32) <= 0;
+                req.sequence = if still_passed { now_seq } else { target } as u64;
+                Ok(0)
+            }
             DRM_IOCTL_MODE_SETPLANE => {
                 // Primary-plane update: present immediately on the target CRTC.
                 // fb_id == 0 disables the plane, which we treat as a no-op.
@@ -3937,6 +3991,9 @@ const DRM_IOCTL_MODE_CURSOR2: u32 = 0xC02464BB;
 
 // Core (non-MODE) vblank wait.
 const DRM_IOCTL_WAIT_VBLANK: u32 = 0xC018643A;
+// The CRTC's vblank counter by id, and an event at a sequence of it.
+const DRM_IOCTL_CRTC_GET_SEQUENCE: u32 = 0xC018643B;
+const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: u32 = 0xC018643C;
 // Query an existing framebuffer object.
 const DRM_IOCTL_MODE_GETFB: u32 = 0xC01C64AD;
 const DRM_IOCTL_MODE_GETFB2: u32 = 0xC06864CE;
@@ -4815,74 +4872,8 @@ const NVIDIA_MOD_SECTOR_DESKTOP: u64 = 1;
 /// at `_THIRTYTWO_GOBS`).
 const NVIDIA_MOD_MAX_LOG2_GOBS_Y: u64 = 5;
 
-/// The page kinds a block-linear scanout buffer may carry: just
-/// `NV_MMU_VER2_PTE_KIND_GENERIC_MEMORY` (0x06), which is what NVK's layout
-/// library picks for every uncompressed tiled surface on Turing and what
-/// `VM_BIND` programs into the page tables verbatim. The page table and the
-/// copy engine have to agree on one kind, and this is it.
-///
-/// `0xfe`, which the canonicalization above can produce, is the generic kind
-/// of the **Fermi..Volta** mapping, so it only ever arrives alongside a `g`
-/// this decoder has already refused. It is not listed here, because listing
-/// it would mean accepting a Turing-generation modifier whose kind came from
-/// another generation's table.
-///
-/// A COMPRESSED kind is refused rather than downgraded: the comptags that
-/// give it meaning are allocated nowhere in this tree, and scanning out
-/// compressed bytes as if they were uncompressed is the one way this path
-/// paints garbage.
-const NVIDIA_SCANOUT_PAGE_KINDS: [u8; 1] = [0x06];
-
-/// What layout `modifier` asks for, or `None` if this scanout cannot present
-/// it.
-///
-/// Mirrors `nv_drm_framebuffer_init`'s checks (the lossless-compression field
-/// must be zero) and adds the two this tree needs: the GOB generation has to
-/// be the one the copy engine's `SET_SRC_BLOCK_SIZE` assumes, and the page
-/// kind has to be one `VM_BIND` maps verbatim.
-pub(super) fn decode_scanout_modifier(modifier: u64) -> Option<drm::ScanoutLayout> {
-    if modifier == DRM_FORMAT_MOD_LINEAR {
-        return Some(drm::ScanoutLayout::Linear);
-    }
-    if modifier == DRM_FORMAT_MOD_INVALID {
-        return None;
-    }
-    if modifier >> 56 != DRM_FORMAT_MOD_VENDOR_NVIDIA {
-        return None;
-    }
-    let m = canonicalize_nvidia_modifier(modifier & 0x00ff_ffff_ffff_ffff);
-    // Bit 4 must be 1: without it the value is one of the older
-    // non-block-linear NVIDIA modifiers, not a 2D block-linear one.
-    if m & 0x10 == 0 {
-        return None;
-    }
-    // Bits 8:5 and 11:9 are reserved and "must be zero"; so is everything
-    // from 28 up. Refusing them keeps a future 3D-surface or array-stride
-    // modifier from being silently presented as a 2D one.
-    if m & 0x00ff_ffff_f000_0fe0 != 0 {
-        return None;
-    }
-    let h = m & 0xf;
-    let k = (m >> 12) & 0xff;
-    let g = (m >> 20) & 0x3;
-    // `s` is bit 22 plus bits 27:26; the high half is already covered by the
-    // reserved-bits check above, so only bit 22 is left to read.
-    let s = (m >> 22) & 0x1;
-    let c = (m >> 23) & 0x7;
-    if c != 0 || g != NVIDIA_MOD_GEN_TURING || s != NVIDIA_MOD_SECTOR_DESKTOP {
-        return None;
-    }
-    if h > NVIDIA_MOD_MAX_LOG2_GOBS_Y {
-        return None;
-    }
-    if !NVIDIA_SCANOUT_PAGE_KINDS.contains(&(k as u8)) {
-        return None;
-    }
-    Some(drm::ScanoutLayout::BlockLinear {
-        log2_gobs_per_block_y: h as u8,
-        page_kind: k as u8,
-    })
-}
+mod scanout_modifier;
+use scanout_modifier::decode_scanout_modifier;
 
 /// The modifier word a layout came from, for `GETFB2` to report back.
 ///
@@ -5115,6 +5106,28 @@ struct DrmWaitVblank {
     val2: u64,
 }
 
+/// `struct drm_crtc_get_sequence` (24 bytes): `crtc_id` in; `active`,
+/// `sequence` and `sequence_ns` out.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmCrtcGetSequence {
+    crtc_id: u32,
+    active: u32,
+    sequence: u64,
+    sequence_ns: i64,
+}
+
+/// `struct drm_crtc_queue_sequence` (24 bytes): `sequence` is the target
+/// going in and the sequence the event was queued for coming out.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmCrtcQueueSequence {
+    crtc_id: u32,
+    flags: u32,
+    sequence: u64,
+    user_data: u64,
+}
+
 /// `struct drm_mode_set_plane` (48 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -5241,6 +5254,8 @@ const _: () = {
     assert!(size_of::<DrmModePropertyEnum>() == 40);
     assert!(size_of::<DrmModeGetPlane>() == 32); // DRM_IOCTL_MODE_GETPLANE 0x..20..
     assert!(size_of::<DrmWaitVblank>() == 24); // DRM_IOCTL_WAIT_VBLANK   0x..18..
+    assert!(size_of::<DrmCrtcGetSequence>() == 24); // CRTC_GET_SEQUENCE   0x..18..
+    assert!(size_of::<DrmCrtcQueueSequence>() == 24); // CRTC_QUEUE_SEQUENCE 0x..18..
     assert!(size_of::<DrmModeSetPlane>() == 48); // DRM_IOCTL_MODE_SETPLANE 0x..30..
     assert!(size_of::<DrmModeObjSetProperty>() == 24); // OBJ_SETPROPERTY  0x..18..
     assert!(size_of::<DrmModeFbDirtyCmd>() == 24); // DRM_IOCTL_MODE_DIRTYFB 0x..18..
@@ -5383,72 +5398,10 @@ fn modeinfo_active_area(m: &[u8; 68]) -> Option<(u32, u32)> {
     Some((hdisplay as u32, vdisplay as u32))
 }
 
-fn make_modeinfo(w: u32, h: u32) -> [u8; 68] {
-    make_modeinfo_with(w, h, panel_timing().as_ref())
-}
-
-/// [`make_modeinfo`] with the panel's timing handed in, so a test can drive
-/// both sources without touching the process-wide boot EDID.
-fn make_modeinfo_with(w: u32, h: u32, panel: Option<&edid::DetailedTiming>) -> [u8; 68] {
-    let mut m = [0u8; 68];
-    // The resolution has to match, and that is the whole safety argument: the
-    // preferred timing describes the panel's native mode, and firmware is free
-    // to have programmed a different one (1080p on a 4K panel is the common
-    // case). A timing for a mode that is not scanning out is a refresh rate
-    // for a different mode, which is worse than admitting we do not know.
-    let ml = panel
-        .filter(|t| t.hdisplay == w && t.vdisplay == h)
-        .and_then(Modeline::from_panel)
-        .unwrap_or_else(|| Modeline::synthetic(w, h));
-    m[0..4].copy_from_slice(&ml.clock_khz.to_ne_bytes());
-    m[4..6].copy_from_slice(&ml.hdisplay.to_ne_bytes());
-    m[6..8].copy_from_slice(&ml.hsync_start.to_ne_bytes());
-    m[8..10].copy_from_slice(&ml.hsync_end.to_ne_bytes());
-    m[10..12].copy_from_slice(&ml.htotal.to_ne_bytes());
-    // hskew @12..14 = 0
-    m[14..16].copy_from_slice(&ml.vdisplay.to_ne_bytes());
-    m[16..18].copy_from_slice(&ml.vsync_start.to_ne_bytes());
-    m[18..20].copy_from_slice(&ml.vsync_end.to_ne_bytes());
-    m[20..22].copy_from_slice(&ml.vtotal.to_ne_bytes());
-    // vscan @22..24 = 0
-    m[24..28].copy_from_slice(&ml.vrefresh.to_ne_bytes()); // vrefresh (Hz)
-    m[28..32].copy_from_slice(&ml.flags.to_ne_bytes());
-    // type @32..36: DRM_MODE_TYPE_DRIVER(0x40) | DRM_MODE_TYPE_PREFERRED(0x08)
-    m[32..36].copy_from_slice(&0x48u32.to_ne_bytes());
-    // name @36..68 ("WxH")
-    let mut name = [0u8; 32];
-    let mut i = 0;
-    let put = |buf: &mut [u8; 32], i: &mut usize, val: u32| {
-        if val == 0 {
-            if *i < buf.len() {
-                buf[*i] = b'0';
-                *i += 1;
-            }
-            return;
-        }
-        let mut digits = [0u8; 10];
-        let mut n = 0;
-        let mut v = val;
-        while v > 0 {
-            digits[n] = b'0' + (v % 10) as u8;
-            v /= 10;
-            n += 1;
-        }
-        while n > 0 && *i < buf.len() {
-            n -= 1;
-            buf[*i] = digits[n];
-            *i += 1;
-        }
-    };
-    put(&mut name, &mut i, w);
-    if i < name.len() {
-        name[i] = b'x';
-        i += 1;
-    }
-    put(&mut name, &mut i, h);
-    m[36..68].copy_from_slice(&name);
-    m
-}
+mod modeinfo;
+use modeinfo::make_modeinfo;
+#[cfg(test)]
+use modeinfo::make_modeinfo_with;
 
 const I32_MIN_U64: u64 = i32::MIN as i64 as u64;
 const MINUS_ONE_U64: u64 = -1i64 as u64;
@@ -6622,6 +6575,9 @@ mod legacy_state_readback_tests;
 
 #[cfg(test)]
 mod dpms_commit_tests;
+
+#[cfg(test)]
+mod crtc_sequence_tests;
 
 #[cfg(test)]
 mod trail_tests;
