@@ -389,10 +389,19 @@ fn kill_siblings(proc: &Arc<Process>, me: KoID) -> Vec<Arc<Thread>> {
 /// Waits for each sibling to actually be gone, not merely to be marked: the
 /// loader is about to remap, and a sibling still walking the old page tables
 /// is the fault this exists to prevent.
+///
+/// And out of the list, not merely dead: `Thread::terminate` signals
+/// `THREAD_TERMINATED` a step before it takes the thread out of its process,
+/// and the leader's tid is about to be handed on (see
+/// `ThreadExt::successor_as_leader`).
 async fn de_thread(proc: &Arc<Process>, me: KoID, _past_every_check: &ExecPreflight) {
     for t in kill_siblings(proc, me) {
+        let id = t.id();
         let obj: Arc<dyn KernelObject> = t;
         obj.wait_signal(Signal::THREAD_TERMINATED).await;
+        while proc.thread_ids().contains(&id) {
+            kernel_hal::thread::yield_now().await;
+        }
     }
 }
 
@@ -1546,6 +1555,32 @@ impl Syscall<'_> {
             let _ = abi;
             (sp, 0)
         };
+        // `de_thread()` makes the exec'ing thread the leader, so the new image
+        // starts with `gettid() == getpid()` whichever thread exec'd: winit's
+        // `is_main_thread()` asks exactly that, and `tgkill(pid, pid)` has to
+        // reach it. Here that is a new thread with the pid as its id, and this
+        // one ends; failing that, the image runs on in this thread, as before.
+        if self.thread.id() != self.zircon_process().id() {
+            match self.thread.successor_as_leader() {
+                Ok(leader) => {
+                    match leader.start_with_entry(entry, start_sp, arg0, 0, self.thread_fn) {
+                        Ok(()) => {
+                            self.thread.exit();
+                            return Ok(0);
+                        }
+                        Err(e) => {
+                            warn!("execve: the new leader did not start: {:?}", e);
+                            core::mem::swap(
+                                &mut *self.thread.lock_linux(),
+                                &mut *leader.lock_linux(),
+                            );
+                            leader.terminate_abandoned();
+                        }
+                    }
+                }
+                Err(e) => warn!("execve: no new leader: {:?}", e),
+            }
+        }
         self.thread.with_context(|ctx| {
             *ctx = UserContext::new();
             ctx.setup_uspace(entry, start_sp, &[arg0, 0, 0]);

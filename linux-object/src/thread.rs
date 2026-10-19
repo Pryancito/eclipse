@@ -13,7 +13,7 @@ use kernel_hal::sync::{Mutex, MutexGuard};
 use kernel_hal::user::{Out, UserInPtr, UserOutPtr, UserPtr};
 use zircon_object::object::KernelObject;
 use zircon_object::task::{CurrentThread, Process, Thread};
-use zircon_object::ZxResult;
+use zircon_object::{ZxError, ZxResult};
 
 /// Thread extension for linux
 pub trait ThreadExt {
@@ -53,6 +53,20 @@ pub trait ThreadExt {
     ) -> SysResult;
     /// Set robust list.
     fn set_robust_list(&self, head: UserInPtr<RobustList>, len: usize);
+    /// `execve` from a thread that is not the leader, once `de_thread` has
+    /// left it alone in its process: the thread the new image is to run in.
+    ///
+    /// Linux's `de_thread()` gives the exec'ing thread the leader's pid, so
+    /// the new image starts with `gettid() == getpid()` whichever thread
+    /// called `execve`. A tid here is the thread object's own id, which
+    /// nothing changes, so the new image runs in a new thread made with the
+    /// pid as its id, and this thread's Linux state -- mask, pending signals,
+    /// name, timer slack, I/O priority -- goes across to it, with its CPU
+    /// affinity and scheduling attributes. This thread keeps a fresh state
+    /// and is left to exit. `BAD_STATE`, and nothing moved, while any other
+    /// thread is still in the list: the old leader, still on its way out,
+    /// would be a second thread with the same tid.
+    fn successor_as_leader(&self) -> ZxResult<Arc<Thread>>;
 }
 
 /// CurrentThread extension for linux
@@ -227,6 +241,28 @@ impl Drop for LinuxThreadGuard<'_> {
 impl ThreadExt for Thread {
     fn create_linux(proc: &Arc<Process>) -> ZxResult<Arc<Self>> {
         Self::create_linux_with(proc, LinuxThread::initial())
+    }
+
+    fn successor_as_leader(&self) -> ZxResult<Arc<Thread>> {
+        let proc = self.proc();
+        if proc.thread_ids() != [self.id()] {
+            return Err(ZxError::BAD_STATE);
+        }
+        let leader = Thread::create_with_ext_id(
+            proc,
+            &self.name(),
+            LinuxThreadExt::new(LinuxThread::initial()),
+            Some(proc.id()),
+        )?;
+        core::mem::swap(&mut *self.lock_linux(), &mut *leader.lock_linux());
+        // A mask with every CPU this one may use is one the setter takes.
+        let _ = leader.set_affinity(self.affinity());
+        leader.set_sched(
+            self.sched_policy(),
+            self.sched_nice(),
+            self.sched_rt_priority(),
+        );
+        Ok(leader)
     }
 
     fn create_linux_with(proc: &Arc<Process>, linux: LinuxThread) -> ZxResult<Arc<Self>> {
@@ -1186,6 +1222,8 @@ impl LinuxThread {
 mod deliverable_mirror_tests;
 #[cfg(test)]
 mod robust_exit_tests;
+#[cfg(test)]
+mod successor_tests;
 
 #[cfg(test)]
 mod signal_delivery_tests {

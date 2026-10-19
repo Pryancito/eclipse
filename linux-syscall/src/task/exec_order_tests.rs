@@ -103,6 +103,44 @@ fn the_caller_is_picked_by_id_and_not_by_position() {
     assert_ne!(threads[2].state(), ThreadState::Dying);
 }
 
+/// `de_thread` comes back with the caller alone in the list, which is what
+/// lets the leader's tid be handed on without a second thread holding it.
+/// The siblings' run loops are stood in for by a host thread that finishes
+/// them once they are dying -- and holds open the step `Thread::terminate`
+/// takes between signalling `THREAD_TERMINATED` and leaving the list, which
+/// on a real CPU is too short to land in on purpose.
+#[test]
+fn de_thread_comes_back_with_the_caller_alone_in_the_list() {
+    extern crate std;
+    let proc = a_process_with(43_395, 3);
+    let threads = proc.threads();
+    let me = threads[1].id();
+    let token = a_token(&proc);
+
+    let others: Vec<Arc<Thread>> = threads.iter().filter(|t| t.id() != me).cloned().collect();
+    std::thread::spawn(move || {
+        while others.iter().any(|t| t.state() != ThreadState::Dying) {
+            std::thread::sleep(core::time::Duration::from_millis(5));
+        }
+        for t in &others {
+            t.signal_set(Signal::THREAD_TERMINATED);
+        }
+        std::thread::sleep(core::time::Duration::from_millis(100));
+        for t in &others {
+            t.terminate_abandoned();
+        }
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let proc2 = proc.clone();
+    std::thread::spawn(move || {
+        async_std::task::block_on(de_thread(&proc2, me, &token));
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(core::time::Duration::from_secs(5))
+        .expect("de_thread never came back");
+    assert_eq!(proc.thread_ids(), [me]);
+}
+
 /// The ordinary case: a shell forks and execs, single-threaded, and there is
 /// nothing to kill and nothing to wait for. Returning the caller here would
 /// make every `execve` in the system wait for the death of the thread doing
