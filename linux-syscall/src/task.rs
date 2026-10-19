@@ -12,9 +12,9 @@ use kernel_hal::context::{UserContext, UserContextField};
 use linux_object::error::LxResult;
 use linux_object::fs::{FileLike, PidFd};
 use linux_object::process::{
-    prio_target, wait_child_any_interest, wait_child_interest, Credentials, LinuxProcess,
-    PrioTarget, SchedFacts, SchedRequest, WaitInterest, CAP_LAST_CAP, CAP_SETGID, RLIMIT_NICE,
-    RLIMIT_RTPRIO,
+    killable_on, prio_target, wait_child_any_interest, wait_child_interest, Credentials,
+    LinuxProcess, PrioTarget, SchedFacts, SchedRequest, WaitInterest, CAP_LAST_CAP, CAP_SETGID,
+    RLIMIT_NICE, RLIMIT_RTPRIO,
 };
 use linux_object::signal::SigInfo;
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
@@ -646,9 +646,19 @@ impl Syscall<'_> {
             self.zircon_process().id(),
             new_proc.id()
         );
-        new_proc_obj
-            .wait_signal(Signal::USER_SIGNAL_0 | Signal::PROCESS_TERMINATED)
-            .await; // wait for execve or termination
+        // Until the child execs or ends -- or until this thread is killed.
+        // Linux's `wait_for_vfork_done()` is `TASK_KILLABLE`: a signal with a
+        // handler waits for the child, but an `exit_group` in another thread,
+        // a SIGKILL or a SIGTERM nobody catches ends the wait, and a parent
+        // whose child never got as far as `exec` -- a `posix_spawn` whose
+        // file action opens a FIFO nobody writes to -- can still be killed.
+        // The child goes on by itself (its address space is a copy) and the
+        // pid comes back as in Linux; the run loop carries the death out.
+        let _ = killable_on(
+            &self.thread.inner(),
+            new_proc_obj.wait_signal(Signal::USER_SIGNAL_0 | Signal::PROCESS_TERMINATED),
+        )
+        .await;
         Ok((new_proc, tid))
     }
 

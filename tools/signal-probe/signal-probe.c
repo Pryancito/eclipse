@@ -28,6 +28,9 @@
 //   * the image an `execve` from a second thread started ran with that
 //     thread's tid, not the pid: `gettid() != getpid()` in what Linux makes
 //     the first thread, and `tgkill(pid, pid)` reached nobody.
+//   * a parent waiting in `vfork` for a child that never got as far as
+//     `exec` could not be killed, and a process that exited with a thread
+//     in that wait was never torn down.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -65,9 +68,10 @@
 //              continued: the read reads, the sigsuspend waits for its signal
 //              and puts the old mask back.
 //   teardown   a process that exits with a second thread asleep -- in
-//              `pause`, `read`, `nanosleep`, `waitpid` -- has lost that
-//              thread by the time it is reaped: a robust mutex the thread
-//              held comes back EOWNERDEAD.
+//              `pause`, `read`, `nanosleep`, `waitpid`, or the `vfork` of a
+//              child that never execs -- has lost that thread by the time it
+//              is reaped: a robust mutex the thread held comes back
+//              EOWNERDEAD.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -971,13 +975,14 @@ static void sec_stop(void) {
 // it dies, and not before. The thread takes it in memory it shares with the
 // section, then goes to sleep. One mutex a check: a thread that outlives its
 // process holds its mutex for good.
-enum wait_kind { IN_PAUSE, IN_READ, IN_SLEEP, IN_WAITPID, WAIT_KINDS };
+enum wait_kind { IN_PAUSE, IN_READ, IN_SLEEP, IN_WAITPID, IN_VFORK, WAIT_KINDS };
 static struct {
     pthread_mutex_t m[WAIT_KINDS];
     volatile int held;
+    volatile pid_t vforked;  // the child the vfork wait is for, to clean up
 } *g_teardown;
 
-static const char *const WAIT_KIND[] = {"pause", "read", "nanosleep", "waitpid"};
+static const char *const WAIT_KIND[] = {"pause", "read", "nanosleep", "waitpid", "vfork"};
 static int g_teardown_pipe[2];
 
 static void *waits_in(void *arg) {
@@ -998,6 +1003,14 @@ static void *waits_in(void *arg) {
     case IN_WAITPID:
         waitpid(-1, &st, 0);
         break;
+    case IN_VFORK:
+        // A child that never gets as far as exec: its parent waits in vfork
+        // for as long as it lives, killably.
+        if (vfork() == 0) {
+            g_teardown->vforked = getpid();
+            for (;;) pause();
+        }
+        break;
     case WAIT_KINDS:
         break;
     }
@@ -1010,6 +1023,7 @@ static void *waits_in(void *arg) {
 // is still there; -1 if the child itself failed.
 static int what_the_mutex_says_after(enum wait_kind kind) {
     g_teardown->held = 0;
+    g_teardown->vforked = 0;
     pid_t c = fork();
     if (c == 0) {
         // Something to wait for that outlives this process.
@@ -1028,7 +1042,9 @@ static int what_the_mutex_says_after(enum wait_kind kind) {
     struct timespec until;
     clock_gettime(CLOCK_REALTIME, &until);
     until.tv_sec += 2;
-    return pthread_mutex_timedlock(&g_teardown->m[kind], &until);
+    int r = pthread_mutex_timedlock(&g_teardown->m[kind], &until);
+    if (g_teardown->vforked > 0) kill(g_teardown->vforked, SIGKILL);
+    return r;
 }
 
 static void sec_teardown(void) {

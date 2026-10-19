@@ -5723,6 +5723,66 @@ pub async fn interruptible_on<F: Future>(thread: &Arc<Thread>, future: F) -> LxR
     }
 }
 
+/// Whether `thread` is to die: it is on its way out (an `exit_group`, a
+/// SIGKILL, a sibling's `execve`), or an unblocked signal is pending that
+/// nobody catches and whose default action ends the process. Linux's
+/// `complete_signal()` turns such a signal into a group-wide SIGKILL the
+/// moment it is sent (`sig_fatal`), which is what `fatal_signal_pending()`
+/// -- and so every `TASK_KILLABLE` wait -- sees.
+pub fn fatal_signal_pending(thread: &Arc<Thread>) -> bool {
+    use crate::signal::SIG_DFL;
+    use crate::thread::ThreadExt;
+    if is_on_its_way_out(thread) {
+        return true;
+    }
+    let proc_linux = match thread.proc().try_linux() {
+        Some(lp) => lp,
+        None => return false,
+    };
+    // The thread's lock is let go before the disposition table's is taken,
+    // as in `check_signals_of`.
+    let pending = match thread.try_lock_linux() {
+        Some(linux_thread) => linux_thread.signals.mask_with(&linux_thread.signal_mask()),
+        None => return false,
+    };
+    let mut rest = pending;
+    while let Some(sig) = rest.find_first_signal() {
+        rest.remove(sig);
+        if proc_linux.signal_action(sig).handler == SIG_DFL && signal_default_action_interrupts(sig)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run `future` until it is done or `thread` is to die
+/// ([`fatal_signal_pending`]): a `TASK_KILLABLE` wait. A signal that runs a
+/// handler does not end it -- the handler runs once the wait is over -- and
+/// a kill does. `None` when the kill won; carrying the death out is then the
+/// run loop's, on the way out of the syscall.
+///
+/// The future is dropped when the kill wins, so it must be one that can be
+/// abandoned, as for [`interruptible_on`].
+pub async fn killable_on<F: Future>(thread: &Arc<Thread>, future: F) -> Option<F::Output> {
+    futures::pin_mut!(future);
+    let killed = async {
+        let mut park = SignalPark::new(thread);
+        loop {
+            park.prepare();
+            if fatal_signal_pending(thread) {
+                return;
+            }
+            park.park(None).await;
+        }
+    };
+    futures::pin_mut!(killed);
+    match futures::future::select(future, killed).await {
+        futures::future::Either::Left((out, _)) => Some(out),
+        futures::future::Either::Right(((), _)) => None,
+    }
+}
+
 /// The parking half of an interruptible wait on a Linux thread: wake when a
 /// signal is queued to `thread` -- blocked or not, which is what a
 /// `sigtimedwait` on a blocked set needs -- or when a deadline passes.
@@ -6310,6 +6370,9 @@ mod kill_wakes_tests;
 
 #[cfg(test)]
 mod dying_thread_signal_tests;
+
+#[cfg(test)]
+mod killable_tests;
 
 #[cfg(test)]
 mod interruptible_sleep_tests;
