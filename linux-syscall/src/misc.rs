@@ -850,11 +850,15 @@ impl Syscall<'_> {
         let may_raise_hard = self.linux_process().capable(CAP_SYS_RESOURCE);
         // `tsk = pid ? find_task_by_vpid(pid) : current;`
         let target = self.prlimit_target(pid)?;
-        let old = target.try_linux().ok_or(LxError::ESRCH)?.rlimit(
-            resource,
-            new_limit,
-            may_raise_hard,
-        )?;
+        let linux = target.try_linux().ok_or(LxError::ESRCH)?;
+        let old = linux.rlimit(resource, new_limit, may_raise_hard)?;
+        // `update_rlimit_cpu()`: a finite CPU limit is looked at from the
+        // target's next return from user mode (`run_cpu_timers`).
+        if resource == linux_object::process::RLIMIT_CPU
+            && new_limit.is_some_and(|l| l.cur != linux_object::process::RLIM_INFINITY)
+        {
+            linux.itimers().watch_cpu_limit();
+        }
         old_limit.write_if_not_null(old)?;
         Ok(0)
     }
