@@ -12743,17 +12743,34 @@ impl NvidiaGpu {
                     // before the channel is looked up.
                     return Err(nv::ENOSYS);
                 }
-                if !self.nouveau_owns_rm_channel(owner_pid) {
-                    crate::klog_warn!(
-                        "[nouveau-uapi] EXEC: this client does not own the RM-backed channel (no GR \
-                         channel/GPFIFO was ever built for it) -- refusing to submit against \
-                         uninitialised hardware; free it and CHANNEL_ALLOC again now that the \
-                         RM is attached"
-                    );
-                    return Err(nv::ENODEV);
-                }
                 let req = unsafe { &*(arg as *const nv::DrmNouveauExec) };
                 const MAX_EXEC_PUSH: u32 = 64;
+                // `nouveau_exec_ioctl_exec`, in its order: the channel in the
+                // caller's own list (ENOENT when it is not there, ENODEV for
+                // a discovery channel with no GPFIFO behind it: Linux's
+                // killed channel), then the push count against the maximum
+                // (EINVAL), and only then the arrays (`nouveau_exec_ucopy`,
+                // EFAULT). For EVERY exec, the empty probe included: the
+                // probe path used to skip the channel, so an empty EXEC
+                // against a freed channel, another process's, or a made-up
+                // id answered 0 and signaled its sigs as if that channel had
+                // drained. And the arrays and the sync caps used to come
+                // first, so a bad channel or 65 pushes with a null array
+                // was EFAULT, not ENOENT or EINVAL. A caller with no
+                // RM-backed channel at all ends here too: its id is in no
+                // list of its own (it was ENODEV).
+                self.exec_channel_check(req.channel, owner_pid)?;
+                // More pushes than the limit this driver advertises
+                // (`GETPARAM EXEC_PUSH_MAX`): EINVAL, as over Linux's own
+                // maximum.
+                if req.push_count > MAX_EXEC_PUSH {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] EXEC: push_count={} exceeds the {} an EXEC may carry",
+                        req.push_count,
+                        MAX_EXEC_PUSH
+                    );
+                    return Err(nv::EINVAL);
+                }
                 // NVK batches up to 256 waits and 256 signals per EXEC
                 // (`NVKMD_NOUVEAU_MAX_SYNCS`) and flushes at that count;
                 // Linux nouveau has no cap of its own. The old 64 turned a
@@ -12789,14 +12806,6 @@ impl NvidiaGpu {
                 {
                     return Err(nv::EFAULT);
                 }
-                // The channel first, for EVERY exec, the empty probe included:
-                // Linux's `nouveau_exec_ioctl_exec` finds the channel in the
-                // caller's own list before it looks at anything else, and
-                // answers ENOENT when it is not there. The probe path used to
-                // skip this: an empty EXEC against a freed channel, another
-                // process's, or a made-up id answered 0 and signaled its sigs
-                // as if that channel had drained.
-                self.exec_channel_check(req.channel, owner_pid)?;
                 // Every sig handle must exist BEFORE anything happens, as in
                 // Linux, where `nouveau_job_submit` looks the whole list up
                 // (`nouveau_job_fence_attach_prepare`) before the job is armed:
@@ -13057,18 +13066,6 @@ impl NvidiaGpu {
                         }
                     }
                     return Ok(0);
-                }
-                // More pushes than the limit this driver advertises
-                // (`GETPARAM EXEC_PUSH_MAX`): `nouveau_exec_ioctl_exec`
-                // answers EINVAL to a count over its own maximum. The
-                // pointer was range-checked above.
-                if req.push_count > MAX_EXEC_PUSH {
-                    crate::klog_warn!(
-                        "[nouveau-uapi] EXEC: push_count={} exceeds the {} an EXEC may carry",
-                        req.push_count,
-                        MAX_EXEC_PUSH
-                    );
-                    return Err(nv::EINVAL);
                 }
                 let pushes = unsafe {
                     core::slice::from_raw_parts(
