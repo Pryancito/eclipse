@@ -125,6 +125,10 @@ pub const FEAT_FIXED_SIZE: u64 = 4;
 pub const FEAT_BITMAP_CSUM: u64 = 8;
 /// Superblock feature: some directory has an encryption policy.
 pub const FEAT_ENCRYPT: u64 = 16;
+/// Chunks with RAID5/RAID6 parity (see [`crate::volume`]).
+pub const FEAT_RAID56: u64 = 1 << 8;
+/// Devices with a tier: the chunk map is version 2.
+pub const FEAT_TIERS: u64 = 1 << 9;
 
 /// Bitmap checksums per block of the table: the last 4 bytes are the
 /// CRC32C of the rest.

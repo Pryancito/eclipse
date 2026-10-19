@@ -35,7 +35,9 @@ use crate::fs::{
 use crate::journal::{JournalArea, Overlay};
 use crate::space::{metadata_reserve, BlockSpace, RangeSet, RefMap};
 use crate::v3::write_home;
-use crate::volume::{Chunk, ChunkKind, ChunkMap, Profile, Stripe, Volume, DEV_RESERVED, MIN_CHUNK};
+use crate::volume::{
+    Chunk, ChunkKind, ChunkMap, Profile, Stripe, Tier, Volume, DEV_RESERVED, MIN_CHUNK,
+};
 use crate::{Error, Result};
 
 const BS: u64 = BLOCK_SIZE;
@@ -311,6 +313,10 @@ fn read_volume_groups(
         }
         let (mut grp, crc) = read_group(dev, g, c.blocks, &mut buf, lenient)?;
         grp.kind = c.kind;
+        grp.tier = map.chunk_tier(c);
+        if c.profile.parity() > 0 {
+            grp.set_row(c.data_cols() as u64);
+        }
         groups.push(grp);
         crcs.push(crc);
     }
@@ -323,6 +329,9 @@ fn readable(c: &Chunk, missing: &[u32]) -> bool {
     match c.profile {
         Profile::Raid0 => c.stripes.iter().all(up),
         Profile::Raid10 => c.stripes.chunks(2).all(|p| p.iter().any(up)),
+        Profile::Raid5 | Profile::Raid6 => {
+            c.stripes.iter().filter(|s| !up(s)).count() <= c.profile.parity()
+        }
         _ => c.stripes.iter().any(up),
     }
 }
@@ -542,6 +551,7 @@ impl CowFs {
             last_commit: 0,
             sb,
         };
+        fs.refresh_layouts();
         fs.load_bitmap_sums(crcs)?;
         let free = fs.sp.alloc.free_blocks();
         if fs.sb.free_blocks != free {
@@ -632,7 +642,13 @@ impl CowFs {
                 .filter(|(d, _)| !self.sp.avoid.contains(d))
                 .map(|(_, n)| n)
                 .sum();
-            total += free / self.sp.profiles.0.copies() as u64;
+            let devices = map
+                .devices
+                .keys()
+                .filter(|d| !self.sp.avoid.contains(d))
+                .count();
+            let (raw, data) = self.sp.profiles.0.overhead(devices);
+            total += free * data / raw;
         }
         FsStat {
             block_size: BS,
@@ -865,6 +881,17 @@ impl CowFs {
             .clone();
         vs.data_profile = self.sp.profiles.0;
         vs.meta_profile = self.sp.profiles.1;
+        // Older drivers know neither parity profiles nor tiers.
+        let parity = map.chunks.values().any(|c| c.profile.parity() > 0)
+            || self.sp.profiles.0.parity() > 0
+            || self.sp.profiles.1.parity() > 0;
+        for (on, bit) in [(parity, FEAT_RAID56), (!map.tiers.is_empty(), FEAT_TIERS)] {
+            if on {
+                self.sb.features |= bit;
+            } else {
+                self.sb.features &= !bit;
+            }
+        }
         self.sp.chunks_dirty = false;
         Ok(())
     }
