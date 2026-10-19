@@ -8611,26 +8611,28 @@ impl NvidiaGpu {
         }
     }
 
-    /// What Linux refuses before it touches anything, for ONE op
-    /// (`bind_validate_op` + `nouveau_uvmm_validate_range`): an op it does
-    /// not know, a sparse region (not implemented here), a VA or a range off
-    /// the page, an empty range, one that wraps; and for a `MAP` of a real
-    /// object, a handle the caller does not hold and a window
-    /// (`bo_offset`, `range`) that does not fit the object. The `VM_BIND`
-    /// arm runs this over the WHOLE op list before the first op is applied,
-    /// the way `nouveau_uvmm_bind_job_submit` validates every op before the
-    /// job waits or modifies the VA space: a batch with a bad op in it
-    /// binds nothing and unbinds nothing.
+    /// What Linux refuses before it touches anything, for ONE op, in its
+    /// order. `nouveau_uvmm_bind_job_submit` walks the list once: for a
+    /// `MAP` it looks the object up first (`drm_gem_object_lookup`: a
+    /// handle the caller does not hold is ENOENT), then `bind_validate_op`
+    /// measures the window (`bo_offset`, `range`) against the object and
+    /// `nouveau_uvmm_validate_range` the VA (off the page, empty, wrapping,
+    /// past the VA space, inside the kernel-managed reservation: EINVAL).
+    /// An op it does not know is refused by its second walk, once every
+    /// op was looked up and measured, so that one is the arm's job (see
+    /// [`Self::vm_bind_unknown_op`]). A sparse region is not implemented
+    /// here and is refused before anything (EOPNOTSUPP). The `VM_BIND`
+    /// arm runs this over the WHOLE op list before the first op is
+    /// applied: a batch with a bad op in it binds nothing and unbinds
+    /// nothing. The range used to be measured before the object, so a
+    /// `MAP` of no object off the page, past the VA space or inside the
+    /// reservation was EINVAL where Linux says ENOENT.
     fn vm_bind_check_op(
         &self,
         owner_pid: u64,
         op: &super::nouveau_uapi::DrmNouveauVmBindOp,
     ) -> Result<(), i32> {
         use super::nouveau_uapi as nv;
-        if op.op != nv::VM_BIND_OP_MAP && op.op != nv::VM_BIND_OP_UNMAP {
-            log::warn!("[nouveau-uapi] VM_BIND: unknown op {:#x}", op.op);
-            return Err(nv::EINVAL);
-        }
         if op.flags & nv::VM_BIND_SPARSE != 0 {
             crate::klog_warn!(
                 "[nouveau-uapi] VM_BIND: SPARSE regions are not implemented (op={} addr={:#x} \
@@ -8642,6 +8644,50 @@ impl NvidiaGpu {
             return Err(nv::EOPNOTSUPP);
         }
         const VM_PAGE: u64 = 4096;
+        if op.op == nv::VM_BIND_OP_MAP {
+            // Only a holder may bind the object into its VAS: binding
+            // another process's buffer is a GPU read/write of it. Handle 0
+            // names no object (`drm_gem_object_lookup` misses it like any
+            // other): ENOENT, whatever the range holds. It used to skip
+            // this lookup and be applied as an unmap of the range -- a
+            // shape no client sends Linux (NVK unbinds with UNMAP, and its
+            // sparse regions are MAP with the SPARSE flag, refused above),
+            // so a stray handle took a live mapping with it instead of an
+            // error.
+            let obj_size = {
+                let gem = self.nouveau_gem.lock();
+                let Some(obj) = gem
+                    .iter()
+                    .find(|o| o.handle == op.handle && gem_usable_by(o, owner_pid))
+                else {
+                    return Err(nv::ENOENT);
+                };
+                obj.size
+            };
+            // The window must lie inside the object (`bind_validate_op`:
+            // the offset on a page, below the end, the range within what
+            // is left). The object's size is what was asked for; Linux
+            // rounds a BO up to whole pages, so measure against that, or a
+            // 100-byte object could never be mapped for its page. Past the
+            // end the RM either refused (EIO, after the drain had already
+            // unmapped the live range) or mapped whatever followed the
+            // allocation into the caller's VAS.
+            let obj_pages = obj_size.div_ceil(VM_PAGE).saturating_mul(VM_PAGE);
+            if !op.bo_offset.is_multiple_of(VM_PAGE)
+                || op.bo_offset >= obj_pages
+                || op.range > obj_pages - op.bo_offset
+            {
+                crate::klog_warn!(
+                    "[nouveau-uapi] VM_BIND MAP handle={} bo_offset={:#x} range={:#x} does not \
+                     fit the object ({} bytes) -> EINVAL",
+                    op.handle,
+                    op.bo_offset,
+                    op.range,
+                    obj_size
+                );
+                return Err(nv::EINVAL);
+            }
+        }
         if op.range == 0
             || !op.addr.is_multiple_of(VM_PAGE)
             || !op.range.is_multiple_of(VM_PAGE)
@@ -8690,47 +8736,19 @@ impl NvidiaGpu {
                 return Err(nv::EINVAL);
             }
         }
-        if op.op != nv::VM_BIND_OP_MAP {
-            return Ok(());
-        }
-        // Only a holder may bind the object into its VAS: binding another
-        // process's buffer is a GPU read/write of it. Handle 0 names no
-        // object (`drm_gem_object_lookup` in `nouveau_uvmm_bind_job_submit`
-        // misses it like any other): ENOENT, whatever the range holds. It
-        // used to skip this lookup and be applied as an unmap of the range
-        // -- a shape no client sends Linux (NVK unbinds with UNMAP, and its
-        // sparse regions are MAP with the SPARSE flag, refused above), so a
-        // stray handle took a live mapping with it instead of an error.
-        let obj_size = {
-            let gem = self.nouveau_gem.lock();
-            let Some(obj) = gem
-                .iter()
-                .find(|o| o.handle == op.handle && gem_usable_by(o, owner_pid))
-            else {
-                return Err(nv::ENOENT);
-            };
-            obj.size
-        };
-        // The window must lie inside the object (`bind_validate_op`: the
-        // offset on a page, below the end, the range within what is left).
-        // The object's size is what was asked for; Linux rounds a BO up to
-        // whole pages, so measure against that, or a 100-byte object could
-        // never be mapped for its page. Past the end the RM either refused
-        // (EIO, after the drain had already unmapped the live range) or
-        // mapped whatever followed the allocation into the caller's VAS.
-        let obj_pages = obj_size.div_ceil(VM_PAGE).saturating_mul(VM_PAGE);
-        if !op.bo_offset.is_multiple_of(VM_PAGE)
-            || op.bo_offset >= obj_pages
-            || op.range > obj_pages - op.bo_offset
-        {
-            crate::klog_warn!(
-                "[nouveau-uapi] VM_BIND MAP handle={} bo_offset={:#x} range={:#x} does not \
-                 fit the object ({} bytes) -> EINVAL",
-                op.handle,
-                op.bo_offset,
-                op.range,
-                obj_size
-            );
+        Ok(())
+    }
+
+    /// The second walk of `nouveau_uvmm_bind_job_submit`, for ONE op: an
+    /// op that is neither `MAP` nor `UNMAP` is EINVAL, but only once every
+    /// op of the list passed [`Self::vm_bind_check_op`], so a `MAP` of no
+    /// object behind an unknown op is still ENOENT and an unknown op off
+    /// the page is still measured first. It used to be the first thing
+    /// refused, ahead of every lookup.
+    fn vm_bind_unknown_op(op: &super::nouveau_uapi::DrmNouveauVmBindOp) -> Result<(), i32> {
+        use super::nouveau_uapi as nv;
+        if op.op != nv::VM_BIND_OP_MAP && op.op != nv::VM_BIND_OP_UNMAP {
+            log::warn!("[nouveau-uapi] VM_BIND: unknown op {:#x}", op.op);
             return Err(nv::EINVAL);
         }
         Ok(())
@@ -12621,10 +12639,18 @@ impl NvidiaGpu {
                 // caller (NVK, `vkQueueBindSparse` with up to 4096 coalesced
                 // ops per call) told that nothing happened -- and cost the
                 // caller the whole wait before it heard about a bad op.
+                // Two walks, like Linux's: every object is looked up and
+                // every window and range measured before an op nobody
+                // knows is refused.
                 if let Some((i, e)) = ops
                     .iter()
                     .enumerate()
                     .find_map(|(i, op)| self.vm_bind_check_op(owner_pid, op).err().map(|e| (i, e)))
+                    .or_else(|| {
+                        ops.iter()
+                            .enumerate()
+                            .find_map(|(i, op)| Self::vm_bind_unknown_op(op).err().map(|e| (i, e)))
+                    })
                 {
                     if req.op_count > 1 {
                         log::warn!(

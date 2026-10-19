@@ -6086,7 +6086,6 @@ fn a_vm_bind_off_a_page_or_past_the_object_is_einval_before_anything_is_unmapped
         ("a range that wraps", map(ha, u64::MAX - 4095, 8192)),
         ("an unmap off the page", unmap(VA + 1, 4096)),
         ("an empty unmap", unmap(VA, 0)),
-        ("a map of nothing off the page", map(0, VA, 100)),
     ];
     for (what, op) in bad {
         assert_eq!(vm_bind_ops(&gpu, A, &mut [op]), Err(nv::EINVAL), "{}", what);
