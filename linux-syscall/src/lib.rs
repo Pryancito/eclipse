@@ -195,6 +195,8 @@ mod intarg;
 mod ipc;
 mod misc;
 mod net;
+#[cfg(test)]
+mod on_a_thread;
 mod outparams;
 mod restart;
 mod signal;

@@ -708,6 +708,12 @@ impl Syscall<'_> {
         let proc = self.zircon_process();
         let vmar = proc.vmar();
         let vmo = guard.lock().shared_guard.clone();
+        // `do_shmat()` maps through `do_mmap()`, so `RLIMIT_AS` holds here
+        // as it does for `mmap`.
+        if !self.may_expand_vm(&vmar, vmo.len(), None) {
+            info!("shmat: {:#x} more bytes would pass RLIMIT_AS", vmo.len());
+            return Err(LxError::ENOMEM);
+        }
         info!(
             "shmat: id: {}, place = {:?}, size = {}, flags = {:?}",
             id,

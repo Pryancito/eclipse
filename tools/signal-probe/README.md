@@ -100,6 +100,9 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
     perfilador de Go arma uno asi en cada hilo), y los relojes de otro hilo
     o de otro proceso (`pthread_getcpuclockid`, `clock_getcpuclockid`) daban
     `EINVAL`.
+24. `RLIMIT_AS` se guardaba y no lo miraba nadie: con `ulimit -v`, `mmap`,
+    `brk`, `mremap` y `shmat` seguian creciendo el espacio de direcciones, y
+    un `malloc` que debia dar `NULL` daba memoria.
 
 ## Compilar
 
@@ -150,3 +153,4 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `fsize` | `RLIMIT_FSIZE` en toda escritura a un fichero: un `write`, `pwrite`, `writev` o `copy_file_range` que cruza el limite escribe hasta el, sin señal; uno que empieza en el limite o pasado da `EFBIG` y un `SIGXFSZ`, y una escritura vacia en el limite da 0. Un `ftruncate` o un `fallocate` que hacen crecer el fichero mas alla dan `EFBIG` y `SIGXFSZ`; recortar un fichero que ya lo pasaba se puede, aunque se quede pasado, y `FALLOC_FL_KEEP_SIZE` no es crecer. Una tuberia no tiene limite, y sin manejador `SIGXFSZ` mata |
 | `cputimer` | `ITIMER_VIRTUAL` e `ITIMER_PROF` de 100 ms no se mueven mientras el proceso duerme 300 ms y saltan a los 100 ms de su tiempo de CPU (`ITIMER_VIRTUAL`, de usuario); con intervalo de 20 ms saltan entre 8 y 20 veces en 300 ms de CPU. Con `RLIMIT_CPU` 1/2, un `SIGXCPU` al segundo de CPU (no de sueño), el limite blando pasa a 2 y `SIGKILL` a los 2 s; con 1 y sin manejador, `SIGXCPU` mata |
 | `cpuclock` | un temporizador de `timer_create` de 100 ms sobre un reloj de CPU se mueve solo lo que gasta el dueño de ese reloj (lo que dice `getrusage`, con 10 ms de margen: bajo un emulador la primera vuelta cobra decenas de ms de sistema, y la linea da el reparto usuario/sistema) y salta a sus 100 ms con `SI_TIMER` y su valor: el del proceso, que no se mueve mientras duerme 300 ms; el del propio hilo, que no se mueve con 300 ms de trabajo de otro hilo; el de otro hilo (`pthread_getcpuclockid`) y el de un hijo (`clock_getcpuclockid`), cuya señal llega al padre, ninguna mientras el hijo duerme. Con intervalo de 20 ms salta entre 8 y 20 veces en 300 ms de CPU; con `TIMER_ABSTIME` y una lectura ya pasada salta antes de que `timer_settime` vuelva; y un reloj dinamico da `EOPNOTSUPP` |
+| `aslimit` | con `RLIMIT_AS` a 4 MiB por encima del `VmSize` de `/proc/self/status` (solo el blando, que vuelve al acabar): 2 MiB de `mmap` caben y 8 no (`ENOMEM`), ni un `malloc` de 16 MiB (`NULL`), ni un `brk` de 8 MiB (devuelve el de antes; uno de 64 KiB si), ni un `mremap` de 2 a 16 MiB, ni un `shmat` de 8 MiB; un `MAP_FIXED` sobre paginas ya mapeadas no suma, y lo que libera `munmap` se puede volver a mapear |

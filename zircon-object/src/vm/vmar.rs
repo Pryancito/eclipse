@@ -2033,6 +2033,21 @@ impl VmAddressRegion {
         }
     }
 
+    /// Bytes mapped in `[start, end)`, each mapping counted for the part of it
+    /// inside the range whether its pages are committed or not. Over the
+    /// whole space it is the `VmSize` of `/proc/<pid>/status`, without the
+    /// committed-page walk [`Self::get_task_stats`] does for the rest.
+    pub fn mapped_bytes_in(&self, start: usize, end: usize) -> usize {
+        let mut bytes = 0;
+        self.for_each_mapping(&mut |map| {
+            let m = map.inner.lock();
+            let from = m.addr.max(start);
+            let to = (m.addr + m.size).min(end);
+            bytes += to.saturating_sub(from);
+        });
+        bytes
+    }
+
     /// Returns statistics about memory used by a task.
     pub fn get_task_stats(&self) -> TaskStatsInfo {
         let mut task_stats = TaskStatsInfo::default();
@@ -5279,222 +5294,10 @@ mod released_frames_tests {
 }
 
 #[cfg(test)]
-mod range_is_free_tests {
-    //! `MAP_FIXED_NOREPLACE` asks for one exact range and must be told
-    //! whether it is taken, because the answer is `EEXIST` and not "here is
-    //! somewhere else". `map_ext_min` already refuses an occupied explicit
-    //! offset, but it says `INVALID_ARGS` for that, for a misaligned offset
-    //! and for one past the end alike, and userspace needs those apart.
-
-    use super::*;
-
-    /// A root VMAR with one page mapped at offset `PAGE_SIZE`, so there is a
-    /// free page on either side of it.
-    fn vmar_with_a_mapped_page() -> (Arc<VmAddressRegion>, VirtAddr) {
-        let vmar = VmAddressRegion::new_root_zircon();
-        let vmo = VmObject::new_paged(1);
-        let addr = vmar.addr() + PAGE_SIZE;
-        vmar.map_at(PAGE_SIZE, vmo, 0, PAGE_SIZE, MMUFlags::READ)
-            .unwrap();
-        (vmar, addr)
-    }
-
-    #[test]
-    fn a_page_with_a_mapping_on_it_is_not_free() {
-        let (vmar, addr) = vmar_with_a_mapped_page();
-        assert!(!vmar.range_is_free(addr, PAGE_SIZE));
-        assert!(vmar.range_is_free(addr + PAGE_SIZE, PAGE_SIZE));
-        assert!(vmar.range_is_free(addr - PAGE_SIZE, PAGE_SIZE));
-    }
-
-    /// The question is about the whole range, not about its first page: a
-    /// request that starts in a hole and runs into a mapping is not free.
-    /// Answering from the start address alone is what a `find_mapping(addr)`
-    /// check would do, and it would let `MAP_FIXED_NOREPLACE` land on top of
-    /// the mapping it was told to leave alone.
-    #[test]
-    fn a_range_that_runs_into_a_mapping_is_not_free_either() {
-        let (vmar, addr) = vmar_with_a_mapped_page();
-        assert!(!vmar.range_is_free(addr - PAGE_SIZE, 2 * PAGE_SIZE));
-        assert!(!vmar.range_is_free(addr, 2 * PAGE_SIZE));
-        assert!(!vmar.range_is_free(addr - PAGE_SIZE, 3 * PAGE_SIZE));
-    }
-
-    /// A sub-region occupies its range as much as a mapping does: nothing may
-    /// be placed inside one from the parent.
-    #[test]
-    fn a_sub_region_occupies_its_range_too() {
-        let vmar = VmAddressRegion::new_root_zircon();
-        let child = vmar.allocate_at(0, PAGE_SIZE, VmarFlags::CAN_MAP_RXW, PAGE_SIZE);
-        let child = child.unwrap();
-        assert!(!vmar.range_is_free(vmar.addr(), PAGE_SIZE));
-        assert!(vmar.range_is_free(vmar.addr() + PAGE_SIZE, PAGE_SIZE));
-        drop(child);
-    }
-
-    /// Outside this VMAR there is no address to give out, so nothing there is
-    /// free. `MAP_FIXED_NOREPLACE` leans on this: the caller checks the range
-    /// is inside first, because a range that is not is a placement failure
-    /// and not `EEXIST`.
-    #[test]
-    fn a_range_outside_the_vmar_is_never_free() {
-        let vmar = VmAddressRegion::new_root_zircon();
-        assert!(!vmar.range_is_free(vmar.end_addr(), PAGE_SIZE));
-        assert!(!vmar.range_is_free(vmar.end_addr() - PAGE_SIZE, 2 * PAGE_SIZE));
-        // Below the base, which underflows the offset rather than exceeding
-        // the size.
-        if vmar.addr() >= PAGE_SIZE {
-            assert!(!vmar.range_is_free(vmar.addr() - PAGE_SIZE, PAGE_SIZE));
-        }
-        // And a range whose end wraps the address space.
-        assert!(!vmar.range_is_free(vmar.addr(), usize::MAX - vmar.addr() + 1));
-    }
-
-    /// An empty or misaligned range is not a question this can answer, and
-    /// `test_map` debug-asserts its alignment, so the guards have to come
-    /// first. `mmap` rejects a misaligned fixed address before it gets here;
-    /// this is what keeps a future caller from finding out the hard way.
-    #[test]
-    fn an_empty_or_misaligned_range_is_not_free() {
-        let vmar = VmAddressRegion::new_root_zircon();
-        let free = vmar.addr() + PAGE_SIZE;
-        assert!(vmar.range_is_free(free, PAGE_SIZE));
-        assert!(!vmar.range_is_free(free, 0));
-        assert!(!vmar.range_is_free(free + 1, PAGE_SIZE));
-        assert!(!vmar.range_is_free(free, PAGE_SIZE - 1));
-    }
-
-    /// A destroyed VMAR hands out nothing.
-    #[test]
-    fn a_destroyed_vmar_has_no_free_range() {
-        let vmar = VmAddressRegion::new_root_zircon();
-        let addr = vmar.addr() + PAGE_SIZE;
-        assert!(vmar.range_is_free(addr, PAGE_SIZE));
-        vmar.destroy().unwrap();
-        assert!(!vmar.range_is_free(addr, PAGE_SIZE));
-    }
-}
+mod range_is_free_tests;
 
 #[cfg(test)]
-mod mapping_count_tests {
-    //! A VMO counts how many mappings it has, and until now the count only ever
-    //! went up: nothing called `VmObject::remove_mapping`, so an object that had
-    //! been mapped and unmapped reported sharers it no longer had.
-    use super::*;
+mod mapping_count_tests;
 
-    fn one_page_vmo() -> Arc<VmObject> {
-        VmObject::new_paged(1)
-    }
-
-    #[test]
-    fn unmapping_brings_the_share_count_back_down() {
-        let vmar = VmAddressRegion::new_root_zircon();
-        let vmo = one_page_vmo();
-        assert_eq!(vmo.share_count(), 0, "a fresh VMO has no mappings");
-        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
-            .unwrap();
-        assert_eq!(vmo.share_count(), 1);
-        vmar.unmap(vmar.addr(), PAGE_SIZE).unwrap();
-        assert_eq!(
-            vmo.share_count(),
-            0,
-            "the mapping is gone and the VMO still counts it"
-        );
-    }
-
-    #[test]
-    fn mapping_and_unmapping_over_and_over_does_not_run_the_count_up() {
-        let vmar = VmAddressRegion::new_root_zircon();
-        let vmo = one_page_vmo();
-        for round in 0..8 {
-            vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
-                .unwrap();
-            vmar.unmap(vmar.addr(), PAGE_SIZE).unwrap();
-            assert_eq!(
-                vmo.share_count(),
-                0,
-                "round {}: the count kept what the last round mapped",
-                round
-            );
-        }
-    }
-
-    /// The count is what `set_cache_policy` refuses on, so a monotonic count
-    /// refused for the rest of the object's life.
-    #[test]
-    fn a_vmo_that_was_mapped_and_unmapped_accepts_a_cache_policy() {
-        let vmar = VmAddressRegion::new_root_zircon();
-        let vmo = one_page_vmo();
-        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
-            .unwrap();
-        assert_eq!(
-            vmo.set_cache_policy(CachePolicy::Uncached),
-            Err(ZxError::BAD_STATE),
-            "a mapped VMO must still refuse a cache policy"
-        );
-        vmar.unmap(vmar.addr(), PAGE_SIZE).unwrap();
-        vmo.set_cache_policy(CachePolicy::Uncached)
-            .expect("nothing is mapped any more, so this must be allowed");
-    }
-
-    /// `clear`/`destroy_internal` unmap the range and zero the mapping's size
-    /// first, so `Drop for VmMapping` returns early -- which is why the count
-    /// has to come down before that return and not after it.
-    #[test]
-    fn destroying_the_region_brings_the_count_down_too() {
-        let vmar = VmAddressRegion::new_root_zircon();
-        let vmo = one_page_vmo();
-        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
-            .unwrap();
-        assert_eq!(vmo.share_count(), 1);
-        vmar.clear().unwrap();
-        assert_eq!(
-            vmo.share_count(),
-            0,
-            "the region let the mapping go and the VMO still counts it"
-        );
-    }
-
-    /// Unmapping a hole in the middle splits one mapping into two, and `cut`
-    /// builds the second one by hand instead of through `VmMapping::new`, so
-    /// the VMO was never told about it.
-    #[test]
-    fn a_mapping_split_in_two_is_counted_twice() {
-        let vmar = VmAddressRegion::new_root_zircon();
-        let vmo = VmObject::new_paged(3);
-        vmar.map_at(0, vmo.clone(), 0, 3 * PAGE_SIZE, MMUFlags::READ)
-            .unwrap();
-        assert_eq!(vmo.share_count(), 1);
-        vmar.unmap(vmar.addr() + PAGE_SIZE, PAGE_SIZE).unwrap();
-        assert_eq!(
-            vmo.share_count(),
-            2,
-            "the hole left two mappings and the VMO counts one"
-        );
-        vmar.clear().unwrap();
-        assert_eq!(
-            vmo.share_count(),
-            0,
-            "both halves are gone and the VMO still counts one"
-        );
-    }
-
-    /// Two live mappings of one object is what the `share_count() > 1` guards
-    /// are for, and dropping one of them has to leave the other counted.
-    #[test]
-    fn dropping_one_of_two_mappings_leaves_the_other_counted() {
-        let vmar = VmAddressRegion::new_root_zircon();
-        let vmo = one_page_vmo();
-        vmar.map_at(0, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
-            .unwrap();
-        vmar.map_at(2 * PAGE_SIZE, vmo.clone(), 0, PAGE_SIZE, MMUFlags::READ)
-            .unwrap();
-        assert_eq!(vmo.share_count(), 2);
-        vmar.unmap(vmar.addr(), PAGE_SIZE).unwrap();
-        assert_eq!(
-            vmo.share_count(),
-            1,
-            "one mapping left, and the VMO says otherwise"
-        );
-    }
-}
+#[cfg(test)]
+mod mapped_bytes_tests;
