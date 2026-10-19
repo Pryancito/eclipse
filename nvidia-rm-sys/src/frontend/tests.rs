@@ -250,6 +250,7 @@ fn hosted_escapes_are_refused() {
     );
     assert!(rm_version().is_empty());
     assert_eq!(gpu_id(0), u32::MAX);
+    assert_eq!(gpu_uuid(0), None);
 }
 
 /// `RmFreeUnusedClients`: after the open's clients, the close frees every OS

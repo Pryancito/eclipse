@@ -66,6 +66,7 @@
 #include "class/cl0005.h"      /* NV01_EVENT */
 #include "class/cl90cd.h"      /* NV_EVENT_BUFFER_BIND */
 #include "ctrl/ctrl0000/ctrl0000gpu.h" /* NV0000_CTRL_GPU_INVALID_ID */
+#include "ctrl/ctrl2080/ctrl2080gpu.h" /* NV2080_GPU_CMD_GPU_GET_GID_FLAGS */
 #include "ctrl/ctrl00fd.h"     /* NV00FD_CTRL_CMD_ATTACH_GPU */
 #include "ctrl/ctrl00e0.h"     /* NV00E0_CTRL_CMD_EXPORT_MEM */
 #include "os/os.h"
@@ -1203,6 +1204,45 @@ NvU32 eclipse_rm_frontend_gpu_id(NvU32 gpuInstance)
     }
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
     return gpuId;
+}
+
+/*
+ * The binary UUID of a GPU (RM_SHA1_GID_SIZE bytes into pUuid): the one
+ * NV2080_CTRL_CMD_GPU_GET_GID_INFO answers with _TYPE_SHA1 | _FORMAT_BINARY,
+ * which is what libcuda names the GPU by in UVM_REGISTER_GPU. The read of
+ * RmGetGpuUuidRaw (osapi.c), whose PBI half does not apply here, under the
+ * same API lock. NV_ERR_GPU_UUID_NOT_FOUND when the instance names no GPU.
+ */
+NV_STATUS eclipse_rm_frontend_gpu_uuid(NvU32 gpuInstance, NvU8 *pUuid)
+{
+    THREAD_STATE_NODE threadState;
+    OBJGPU *pGpu;
+    NV_STATUS status = NV_ERR_GPU_UUID_NOT_FOUND;
+    NvU32 gidFlags = DRF_DEF(2080_GPU_CMD, _GPU_GET_GID_FLAGS, _TYPE, _SHA1)
+                   | DRF_DEF(2080_GPU_CMD, _GPU_GET_GID_FLAGS, _FORMAT, _BINARY);
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    if (gpumgrThreadEnableExpandedGpuVisibility() == NV_OK)
+    {
+        pGpu = gpumgrGetGpu(gpuInstance);
+        if ((pGpu != NULL) &&
+            (rmapiLockAcquire(RMAPI_LOCK_FLAGS_READ, RM_LOCK_MODULES_OSAPI) == NV_OK))
+        {
+            status = gpuGetGidInfo(pGpu, NULL, NULL, gidFlags);
+            if ((status == NV_OK) && !pGpu->gpuUuid.isInitialized)
+            {
+                status = NV_ERR_GPU_UUID_NOT_FOUND;
+            }
+            if (status == NV_OK)
+            {
+                portMemCopy(pUuid, RM_SHA1_GID_SIZE, pGpu->gpuUuid.uuid, RM_SHA1_GID_SIZE);
+            }
+            rmapiLockRelease();
+        }
+        gpumgrThreadDisableExpandedGpuVisibility();
+    }
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
 }
 
 /*
