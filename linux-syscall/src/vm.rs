@@ -280,7 +280,6 @@ impl Syscall<'_> {
         if placement == Placement::FixedNoReplace && in_vmar && !vmar.range_is_free(addr, len) {
             return Err(LxError::EEXIST);
         }
-        let fixed = placement != Placement::Hint;
         let overwrite = placement == Placement::Fixed;
         if overwrite {
             // hunter: the range is about to be replaced, so drop its W^X
@@ -303,7 +302,10 @@ impl Syscall<'_> {
         // `map_ext_min`'s `overwrite` does the same removal under the SAME VMAR
         // lock, immediately before inserting the replacement, so the range is
         // never left destroyed-and-empty.
-        let vmar_offset = fixed.then(|| addr - vmar.addr());
+        //
+        // A hint is read under `aspace_lock` too, so the range it found free
+        // is still free when the mapping goes in.
+        let vmar_offset = mmap_offset(placement, addr, len, &vmar);
         if flags.contains(MmapFlags::ANONYMOUS) {
             let vmo = VmObject::new_paged(pages(len));
             // MAP_SHARED | MAP_ANONYMOUS: the region must be one object shared
@@ -1455,7 +1457,8 @@ fn mmap_file_access(
 /// Where `mmap` must put the mapping.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum Placement {
-    /// `addr` is a hint; the kernel places the mapping where it likes.
+    /// `addr` is a hint: taken when the range it names is free, and
+    /// otherwise the kernel places the mapping where it likes.
     Hint,
     /// `MAP_FIXED`: at exactly `addr`, over whatever is already there.
     Fixed,
@@ -1481,6 +1484,37 @@ fn mmap_placement(flags: MmapFlags) -> Placement {
     } else {
         Placement::Hint
     }
+}
+
+/// Where in `vmar` the mapping goes, as an offset into it, or `None` to let
+/// the VMAR choose.
+///
+/// A fixed placement goes at `addr`. A hint is taken when the range it names
+/// is free, as Linux's `get_unmapped_area` takes it, and otherwise the VMAR
+/// chooses. Hints used to be ignored outright, which a program only notices
+/// when it checks where its mapping landed. libcuda lays its unified address
+/// space out at addresses it asks for, and that is the suspect behind
+/// `cuInit` failing on real hardware with CUDA_ERROR_OUT_OF_MEMORY.
+fn mmap_offset(
+    placement: Placement,
+    addr: usize,
+    len: usize,
+    vmar: &VmAddressRegion,
+) -> Option<usize> {
+    let at = match placement {
+        Placement::Hint => mmap_hint(addr).filter(|&hint| vmar.range_is_free(hint, len))?,
+        Placement::Fixed | Placement::FixedNoReplace => addr,
+    };
+    Some(at - vmar.addr())
+}
+
+/// The address an `mmap` hint names, or `None` for no hint at all (0).
+///
+/// `round_hint_to_min`: the hint is rounded down to its page, and one below
+/// `MMAP_MIN_ADDR` is raised to it rather than dropped.
+fn mmap_hint(addr: usize) -> Option<usize> {
+    let hint = round_down_pages(addr);
+    (hint != 0).then(|| hint.max(MMAP_MIN_ADDR))
 }
 
 /// `PROT_SEM`, which this kernel does not act on but Linux accepts.
@@ -3112,6 +3146,162 @@ mod mmap_flag_tests {
         // Huge-size encodings alone are meaningless without MAP_HUGETLB;
         // Linux ignores them on a normal mmap, and so do we.
         assert_eq!(mmap_no_hugetlb(MAP_PRIVATE | MAP_HUGE_2MB), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod mmap_hint_tests {
+    //! An `mmap` without `MAP_FIXED` names the address its caller would like,
+    //! and Linux gives it that address whenever the range is free. libcuda
+    //! reserves its address space that way and keeps the reservation only if
+    //! it landed exactly where it asked: anywhere else, it unmaps it and
+    //! `cuInit` fails with CUDA_ERROR_OUT_OF_MEMORY.
+
+    use super::{mmap_hint, mmap_offset, Placement, MMAP_MIN_ADDR, PAGE_SIZE};
+    use alloc::sync::Arc;
+    use zircon_object::vm::{MMUFlags, VmAddressRegion, VmObject};
+
+    /// Maps `pages` pages of `vmar` at `base`, an offset into it, and returns
+    /// where they went.
+    fn map(vmar: &VmAddressRegion, base: Option<usize>, pages: usize) -> usize {
+        vmar.map_ext_min(
+            base,
+            VmObject::new_paged(pages),
+            0,
+            pages * PAGE_SIZE,
+            MMUFlags::RXW,
+            MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap()
+    }
+
+    /// A root VMAR with `pages` pages mapped at `base`, and their address.
+    /// Every caller passes a `base` of its own, for the reason
+    /// `mm_walk_tests::mapped` gives.
+    fn mapped(base: usize, pages: usize) -> (Arc<VmAddressRegion>, usize) {
+        assert!(base >= 0x100_0000 && base.is_multiple_of(PAGE_SIZE));
+        let vmar = VmAddressRegion::new_root();
+        let addr = map(&vmar, Some(base), pages);
+        assert_eq!(addr, vmar.addr() + base);
+        (vmar, addr)
+    }
+
+    #[test]
+    fn zero_is_no_hint_and_so_is_anything_in_the_first_page() {
+        assert_eq!(mmap_hint(0), None);
+        assert_eq!(mmap_hint(PAGE_SIZE - 1), None);
+    }
+
+    #[test]
+    fn a_hint_is_rounded_down_to_its_page() {
+        assert_eq!(mmap_hint(0x2000_0000), Some(0x2000_0000));
+        assert_eq!(mmap_hint(0x2000_0123), Some(0x2000_0000));
+    }
+
+    /// `round_hint_to_min`: a low hint is not dropped, it is moved up to the
+    /// lowest address a mapping may have.
+    #[test]
+    fn a_hint_below_mmap_min_addr_is_raised_to_it() {
+        assert_eq!(mmap_hint(PAGE_SIZE), Some(MMAP_MIN_ADDR));
+        assert_eq!(mmap_hint(MMAP_MIN_ADDR - 1), Some(MMAP_MIN_ADDR));
+        assert_eq!(mmap_hint(MMAP_MIN_ADDR), Some(MMAP_MIN_ADDR));
+    }
+
+    #[test]
+    fn a_free_hint_is_where_the_mapping_goes() {
+        let (vmar, addr) = mapped(0x2000_0000, 1);
+        let hint = addr + 4 * PAGE_SIZE;
+        let at = mmap_offset(Placement::Hint, hint, 2 * PAGE_SIZE, &vmar);
+        assert_eq!(at, Some(hint - vmar.addr()));
+        assert_eq!(
+            mmap_offset(Placement::Hint, hint + 0x123, 2 * PAGE_SIZE, &vmar),
+            at,
+            "an unaligned hint names the page it falls in"
+        );
+        assert_eq!(map(&vmar, at, 2), hint, "and the mapping lands there");
+    }
+
+    /// The VMAR, left to choose, puts a mapping just above the highest one,
+    /// which is not where libcuda asked: this is the behaviour that failed
+    /// `cuInit`.
+    #[test]
+    fn a_free_hint_is_not_where_the_vmar_would_have_put_it() {
+        let (vmar, addr) = mapped(0x2100_0000, 1);
+        let hint = addr + 0x10_0000;
+        assert_ne!(map(&vmar, None, 1), hint);
+        let at = mmap_offset(Placement::Hint, hint, PAGE_SIZE, &vmar);
+        assert_eq!(map(&vmar, at, 1), hint);
+    }
+
+    #[test]
+    fn a_taken_hint_leaves_the_choice_to_the_vmar() {
+        let (vmar, addr) = mapped(0x2200_0000, 4);
+        let hint =
+            |at: usize, pages: usize| mmap_offset(Placement::Hint, at, pages * PAGE_SIZE, &vmar);
+        assert_eq!(hint(addr, 1), None, "on the mapping");
+        assert_eq!(hint(addr + 3 * PAGE_SIZE, 2), None, "running off its end");
+        assert_eq!(hint(addr - PAGE_SIZE, 2), None, "running into its start");
+        assert_eq!(
+            hint(addr - PAGE_SIZE, 1),
+            Some(addr - PAGE_SIZE - vmar.addr()),
+            "the page just below it is free"
+        );
+        assert_eq!(
+            hint(addr + 4 * PAGE_SIZE, 1),
+            Some(addr + 4 * PAGE_SIZE - vmar.addr()),
+            "and so is the page just above it"
+        );
+    }
+
+    /// libcuda probes for a 57-bit address space with a hint at 2^48, and on a
+    /// 4-level machine takes whatever it is given instead.
+    #[test]
+    fn a_hint_outside_the_address_space_leaves_the_choice_to_the_vmar() {
+        let (vmar, _) = mapped(0x2300_0000, 1);
+        let end = vmar.end_addr();
+        assert_eq!(mmap_offset(Placement::Hint, end, PAGE_SIZE, &vmar), None);
+        assert_eq!(
+            mmap_offset(Placement::Hint, end - PAGE_SIZE, 2 * PAGE_SIZE, &vmar),
+            None,
+            "a range that starts inside and ends past the end"
+        );
+        assert_eq!(
+            mmap_offset(Placement::Hint, 1 << 48, PAGE_SIZE, &vmar),
+            None
+        );
+    }
+
+    /// The answer is an offset into the VMAR, not an address. The two are the
+    /// same number in a Linux address space, which starts at zero, and not in
+    /// a Zircon one.
+    #[test]
+    fn the_answer_is_an_offset_into_the_vmar() {
+        let vmar = VmAddressRegion::new_root_zircon();
+        assert_ne!(vmar.addr(), 0);
+        let hint = vmar.addr() + 0x2500_0000;
+        let at = mmap_offset(Placement::Hint, hint, PAGE_SIZE, &vmar);
+        assert_eq!(at, Some(0x2500_0000));
+        assert_eq!(map(&vmar, at, 1), hint);
+        assert_eq!(mmap_offset(Placement::Fixed, hint, PAGE_SIZE, &vmar), at);
+    }
+
+    /// `MAP_FIXED` replaces what is there, and `MAP_FIXED_NOREPLACE` has
+    /// already been refused with `EEXIST` by the time the offset is asked
+    /// for, so neither looks at whether the range is free.
+    #[test]
+    fn a_fixed_placement_is_taken_even_over_a_mapping() {
+        let (vmar, addr) = mapped(0x2400_0000, 2);
+        for placement in [Placement::Fixed, Placement::FixedNoReplace] {
+            assert_eq!(
+                mmap_offset(placement, addr, PAGE_SIZE, &vmar),
+                Some(addr - vmar.addr()),
+                "{placement:?}"
+            );
+        }
     }
 }
 
