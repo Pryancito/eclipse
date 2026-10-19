@@ -123,13 +123,17 @@ impl CowFs {
     /// Group `i`'s bitmap as `owned` (every block held, see
     /// [`owned_blocks`](Self::owned_blocks)) says it should be.
     pub(super) fn group_from(&self, i: usize, owned: &RangeSet) -> AllocationGroup {
-        let (count, kind) = {
+        let (count, kind, row, tier) = {
             let g = &self.sp.alloc.groups()[i];
-            (g.block_count, g.kind)
+            (g.block_count, g.kind, g.row(), g.tier)
         };
         let start = i as u64 * GROUP_BLOCKS;
         let mut g = AllocationGroup::new(i as u32, count);
         g.kind = kind;
+        // Placement by tier stays as it was.
+        g.tier = tier;
+        // A parity chunk keeps handing out whole rows only.
+        g.set_row(row);
         for (s, l) in owned.within(start, start + count) {
             g.mark_used(s - start, l);
         }

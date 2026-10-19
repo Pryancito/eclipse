@@ -9,7 +9,10 @@
 //! `degraded` to mount a volume with devices missing, and `device=<dev>` to
 //! name a member of a volume, and `commit=<secs>` for how often the open
 //! transaction commits (5 by default, as ext4; a kernel task does it, and
-//! `fsync` writes the file to the fsync log in between). A volume's other
+//! `fsync` writes the file to the fsync log in between), and `repair` to
+//! put right what fsck finds before the filesystem is used (as `btrfs check
+//! --repair`; refused read-only, damage it cannot fix is logged and the
+//! mount goes on). A volume's other
 //! members are also found by
 //! scanning every block device the kernel registered, as `btrfs device
 //! scan` does. The filesystem ioctls (chattr, reflink, snapshots, quotas,
@@ -108,6 +111,8 @@ pub(crate) struct EfsOptions {
     pub subvolid: Option<u64>,
     /// `commit=`: seconds between commits.
     pub commit: Option<u64>,
+    /// `repair`: run the offline repair at mount.
+    pub repair: bool,
 }
 
 /// Seconds between commits when `commit=` does not say (ext4's default).
@@ -137,6 +142,7 @@ impl EfsOptions {
                     });
                 }
                 ("degraded", None) => o.degraded = true,
+                ("repair", None) => o.repair = true,
                 ("device", Some(v)) if !v.is_empty() => {
                     let name = v.rsplit('/').next().unwrap_or(v);
                     o.devices.push(String::from(name));
@@ -150,7 +156,7 @@ impl EfsOptions {
                     let secs: u64 = v.parse().map_err(|_| FsError::InvalidParam)?;
                     o.commit = Some(if secs == 0 { DEFAULT_COMMIT_SECS } else { secs });
                 }
-                ("device" | "subvol" | "subvolid" | "commit", _) => {
+                ("device" | "subvol" | "subvolid" | "commit" | "repair", _) => {
                     return Err(FsError::InvalidParam)
                 }
                 _ => {}
@@ -250,6 +256,17 @@ impl EclipseMountFs {
         fs.set_random(kernel_hal::rand::fill_random);
         if let Some(algo) = opts.compress {
             fs.set_mount_compression(algo).map_err(map_err)?;
+        }
+        if opts.repair {
+            if read_only {
+                warn!("eclipsefs: repair needs a read-write mount");
+                return Err(FsError::InvalidParam);
+            }
+            let r = fs.repair().map_err(map_err)?;
+            warn!("eclipsefs: repair: {:?}", r);
+            if let Some(why) = r.still_damaged {
+                warn!("eclipsefs: repair could not fix everything: {}", why);
+            }
         }
         let root = mount_root(&mut fs, opts)?;
         if !read_only {

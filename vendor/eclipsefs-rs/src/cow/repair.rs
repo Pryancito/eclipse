@@ -20,7 +20,13 @@
 //!    a tree node or a file extent, and its count is the number of pointers
 //!    to it. Two extents claiming the same blocks become a shared (reflinked)
 //!    range rather than a double allocation. A tree node that shares a block
-//!    with anything else cannot be fixed this way and is reported.
+//!    with anything else cannot be fixed this way and is reported. The
+//!    fsync log area (the root tree's `LOG_TREE` extent) counts as held like
+//!    any other extent and is never freed or written by repair; on parity
+//!    (RAID5/6) chunks a rebuilt bitmap keeps its row size, so new data still
+//!    never lands in a row holding committed data, and on a tiered volume
+//!    it keeps its tier. Every write goes through a normal commit (and so
+//!    through the volume layer).
 //! 3. **Names**, subvolume by subvolume. Items of inodes that do not exist
 //!    (and items that do not decode, overlapping or misplaced extents,
 //!    extents of special files) are deleted, their blocks released.
@@ -219,9 +225,12 @@ impl CowFs {
             return Ok(r);
         }
         // 2. Space, from the committed trees.
-        let Some(poison) = self.repair_space(&mut r)? else {
-            r.still_damaged = Some("a tree node shares its block");
-            return Ok(r);
+        let poison = match self.repair_space(&mut r)? {
+            Ok(poison) => poison,
+            Err(why) => {
+                r.still_damaged = Some(why);
+                return Ok(r);
+            }
         };
         // 3. Names. Copying a leaf shared with a snapshot references every
         // extent in it, damaged ones included.
@@ -230,8 +239,8 @@ impl CowFs {
         self.sp.lenient = false;
         names?;
         // Deleted items released blocks the old counts knew nothing about.
-        if self.repair_space(&mut r)?.is_none() {
-            r.still_damaged = Some("a tree node shares its block");
+        if let Err(why) = self.repair_space(&mut r)? {
+            r.still_damaged = Some(why);
             return Ok(r);
         }
         // 4. Checksums.
@@ -273,9 +282,12 @@ impl CowFs {
     /// Rebuild reference counts and bitmaps from the committed trees
     /// (commits first). Returns the blocks file extents may not claim
     /// (another extent's claim on them is not counted, and the extent is
-    /// to go), or `None`, with nothing changed, when a tree node shares its
-    /// block with something else.
-    fn repair_space(&mut self, r: &mut RepairReport) -> Result<Option<RangeSet>> {
+    /// to go), or why not, with nothing changed: a tree node or the fsync
+    /// log area shares its blocks with something else.
+    fn repair_space(
+        &mut self,
+        r: &mut RepairReport,
+    ) -> Result<core::result::Result<RangeSet, &'static str>> {
         self.flush()?;
         let total = self.sb.total_blocks;
         let mut counts = Counts::default();
@@ -329,13 +341,14 @@ impl CowFs {
         }
         if overlap(&nodes, &fixed) || nodes.iter().any(|(s, l)| s + l > total) {
             warn!("eclipsefs: repair: blocks of tree nodes are claimed twice");
-            return Ok(None);
+            return Ok(Err("a tree node shares its block"));
         }
         let mut poison = fixed.clone();
         for (s, l) in nodes.iter() {
             poison.insert(s, l);
         }
         let mut bad = RangeSet::default();
+        let mut log_bad = false;
         let mut seen = RangeSet::default();
         stack = roots;
         while let Some((b, level, gen)) = stack.pop() {
@@ -354,6 +367,10 @@ impl CowFs {
                                 Some(e) if e <= total && poison.within(s, e).next().is_none() => {
                                     counts.add(s, l)
                                 }
+                                // The fsync log area is the root tree's:
+                                // nothing would drop it, and freeing what
+                                // it claims could hand out live blocks.
+                                _ if k.objectid == LOG_TREE => log_bad = true,
                                 // Past the end or on metadata: not counted,
                                 // the extent goes with the names.
                                 _ => bad.insert(s, l.min(total.saturating_sub(s))),
@@ -362,6 +379,10 @@ impl CowFs {
                     }
                 }
             }
+        }
+        if log_bad {
+            warn!("eclipsefs: repair: the fsync log area overlaps metadata");
+            return Ok(Err("the fsync log area shares its blocks"));
         }
         for (s, l) in bad.iter() {
             poison.insert(s, l);
@@ -400,7 +421,7 @@ impl CowFs {
             }
         }
         self.flush()?;
-        Ok(Some(poison))
+        Ok(Ok(poison))
     }
 
     // -----------------------------------------------------------------------

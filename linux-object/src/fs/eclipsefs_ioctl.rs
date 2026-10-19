@@ -3128,6 +3128,7 @@ mod tests {
             Some(257)
         );
         assert_eq!(EfsOptions::parse("commit=30").unwrap().commit, Some(30));
+        assert!(EfsOptions::parse("rw,repair").unwrap().repair);
         assert_eq!(
             EfsOptions::parse("commit=0").unwrap().commit,
             Some(super::super::eclipsefs_mount::DEFAULT_COMMIT_SECS)
@@ -3139,10 +3140,30 @@ mod tests {
             "device=",
             "commit",
             "commit=soon",
+            "repair=yes",
         ] {
             assert!(EfsOptions::parse(bad).is_err(), "{}", bad);
         }
         assert_eq!(EfsOptions::parse("").unwrap(), EfsOptions::default());
+    }
+
+    #[test]
+    fn mount_option_repair_runs_the_repair() {
+        let disk = formatted(16 << 20);
+        {
+            let fs = mount(&disk);
+            file_with(&fs.root_inode(), "kept", b"still here");
+            fs.sync().unwrap();
+        }
+        // Read-only: nothing may be written, so it is refused.
+        let opts = EfsOptions::parse("repair").unwrap();
+        assert!(
+            EclipseMountFs::open_with(&MountBackend::Block(disk.clone()), true, &opts).is_err()
+        );
+        let fs = mount_with(&disk, false, "repair");
+        let f = fs.root_inode().find("kept").unwrap();
+        assert_eq!(read_all(&f), b"still here");
+        assert!(fs.inner.lock().check().is_ok());
     }
 
     #[test]

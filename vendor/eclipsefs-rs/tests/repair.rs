@@ -13,7 +13,7 @@ use common::*;
 use eclipsefs::btree::{Body, Key, Node};
 use eclipsefs::cowfmt::*;
 use eclipsefs::device::BlockDevice;
-use eclipsefs::{mkfs, ChunkKind, EclipseFS, Error, FileKind, Profile};
+use eclipsefs::{mkfs, ChunkKind, EclipseFS, Error, FileKind, Profile, Tier};
 
 const B: u64 = BLOCK as u64;
 
@@ -1170,4 +1170,242 @@ fn a_crash_during_repair_is_finished_by_the_next_one() {
             image[o..o + data.len()].copy_from_slice(data);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The fsync log, parity and tiers
+// ---------------------------------------------------------------------------
+
+/// The fsync log area (first block, blocks) in the root tree, if any.
+fn log_area(disk: &MemDisk) -> Option<(u64, u64)> {
+    let mut at = None;
+    edit(disk, |_, items| {
+        for (k, d) in items.iter() {
+            if *k == Key::new(LOG_TREE, EXTENT_DATA, 0) {
+                if let Ok(FileExtent::Prealloc { disk, blocks }) = FileExtent::decode(d) {
+                    at = Some((disk, blocks));
+                }
+            }
+        }
+        false
+    });
+    at
+}
+
+/// A filesystem whose root tree holds an fsync log area.
+fn with_log() -> (Arc<MemDisk>, u64, Vec<u8>) {
+    let (disk, mut fs) = fresh(64 * MIB);
+    let root = fs.root_ino();
+    let f = fs.create(root, "f", FileKind::Regular, 0o644, 0).unwrap();
+    let data = pattern(20_000, 7);
+    write_all(&mut fs, f, 0, &data);
+    fs.fsync(f).unwrap();
+    unmount(fs);
+    assert!(log_area(&disk).is_some(), "no log area to test with");
+    (disk, f, data)
+}
+
+#[test]
+fn the_fsync_log_area_is_kept() {
+    let (disk, f, data) = with_log();
+    let area = log_area(&disk).unwrap();
+    // Mark the log area free in group 0's bitmap (checksum kept in step).
+    let s = sb(&disk);
+    let mut bm = vec![0u8; BLOCK];
+    disk.read_at(B, &mut bm).unwrap();
+    for b in area.0..area.0 + area.1 {
+        bm[(b / 8) as usize] &= !(1 << (b % 8));
+    }
+    disk.write_at(B, &bm).unwrap();
+    let (table, _) = s.bitmap_sums.unwrap();
+    let mut tb = vec![0u8; BLOCK];
+    disk.read_at(table * B, &mut tb).unwrap();
+    let mut sums = decode_sums_block(&tb).unwrap();
+    sums[0] = eclipsefs::crc::crc32c(&bm);
+    disk.write_at(table * B, &encode_sums_block(&sums)).unwrap();
+    let (mut fs, r) = repair(&disk);
+    assert_eq!(r.bitmap_blocks_fixed, area.1, "{:?}", r);
+    assert_eq!(r.items_removed, 0, "{:?}", r);
+    assert_eq!(read_all(&mut fs, f), data);
+    // The area is where it was, and the log still works: new data does
+    // not land on it and an fsync survives a power cut.
+    let more = pattern(50_000, 8);
+    write_all(&mut fs, f, 0, &more);
+    fs.fsync(f).unwrap();
+    let mut after = EclipseFS::mount(disk.copy(), false).unwrap();
+    after.set_clock(clock);
+    assert_eq!(read_all(&mut after, f), more);
+    after.check().unwrap();
+    unmount(fs);
+    assert_eq!(log_area(&disk), Some(area));
+}
+
+#[test]
+fn a_filesystem_with_an_fsync_log_needs_no_repair() {
+    let (disk, mut fs) = fresh(64 * MIB);
+    let root = fs.root_ino();
+    let f = fs.create(root, "f", FileKind::Regular, 0o644, 0).unwrap();
+    write_all(&mut fs, f, 0, &pattern(10_000, 1));
+    fs.fsync(f).unwrap();
+    // A record, not a commit.
+    let want = pattern(30_000, 2);
+    write_all(&mut fs, f, 0, &want);
+    fs.fsync(f).unwrap();
+    assert!(fs.fsync_log_records() > 0);
+    // The crashed copy replays the log at mount.
+    let mut after = EclipseFS::mount(disk.copy(), false).unwrap();
+    after.set_clock(clock);
+    let r = after.repair().unwrap();
+    assert!(!r.changed(), "{:?}", r);
+    assert!(r.is_clean(), "{:?}", r);
+    assert_eq!(read_all(&mut after, f), want);
+    // And the live one, log and all.
+    let r = fs.repair().unwrap();
+    assert!(!r.changed(), "{:?}", r);
+    assert!(r.is_clean(), "{:?}", r);
+    assert_eq!(read_all(&mut fs, f), want);
+}
+
+#[test]
+fn a_log_area_on_metadata_is_reported_and_left_alone() {
+    let (disk, _, _) = with_log();
+    let area = log_area(&disk).unwrap();
+    let node = sb(&disk).root.bytenr;
+    edit(&disk, |_, items| {
+        let mut hit = false;
+        for (k, d) in items.iter_mut() {
+            if *k == Key::new(LOG_TREE, EXTENT_DATA, 0) {
+                *d = FileExtent::Prealloc {
+                    disk: node,
+                    blocks: area.1,
+                }
+                .encode();
+                hit = true;
+            }
+        }
+        hit
+    });
+    let mut fs = open(&disk);
+    let r = fs.repair().unwrap();
+    assert_eq!(
+        r.still_damaged,
+        Some("the fsync log area shares its blocks"),
+        "{:?}",
+        r
+    );
+    assert!(!r.is_clean());
+    assert_eq!(r.bitmap_blocks_fixed, 0, "{:?}", r);
+    assert_eq!(r.refcounts_fixed, 0, "{:?}", r);
+}
+
+fn volume(n: usize) -> Vec<Arc<MemDisk>> {
+    (0..n).map(|_| MemDisk::new(64 * MIB)).collect()
+}
+
+fn vol_devs(d: &[Arc<MemDisk>]) -> Vec<Arc<dyn BlockDevice>> {
+    d.iter()
+        .map(|d| d.clone() as Arc<dyn BlockDevice>)
+        .collect()
+}
+
+fn reopen_volume(d: &[Arc<MemDisk>], fs: EclipseFS) -> EclipseFS {
+    unmount(fs);
+    let mut fs = EclipseFS::mount_devices(vol_devs(d), false).unwrap();
+    fs.set_clock(clock);
+    fs
+}
+
+fn vol_files(fs: &mut EclipseFS, n: usize, seed: usize) -> Vec<(u64, Vec<u8>)> {
+    let root = fs.root_ino();
+    (0..n)
+        .map(|i| {
+            let f = fs
+                .create(root, &format!("v{seed}-{i}"), FileKind::Regular, 0o644, 0)
+                .unwrap();
+            let data = pattern(150_000 + i * 999, seed * 10 + i);
+            write_all(fs, f, 0, &data);
+            (f, data)
+        })
+        .collect()
+}
+
+fn vol_same(fs: &mut EclipseFS, files: &[(u64, Vec<u8>)]) {
+    for (f, data) in files {
+        assert_eq!(&read_all(fs, *f), data);
+    }
+}
+
+#[test]
+fn parity_volumes_are_repaired_through_the_volume_layer() {
+    for (n, p) in [(3, Profile::Raid5), (4, Profile::Raid6)] {
+        let d = volume(n);
+        mkfs::format_devices(&vol_devs(&d), &opts(), p, Profile::Raid1).unwrap();
+        let mut fs = EclipseFS::mount_devices(vol_devs(&d), false).unwrap();
+        fs.set_clock(clock);
+        let files = vol_files(&mut fs, 6, 1);
+        fs.sync().unwrap();
+        // Clean: nothing to do.
+        let r = fs.repair().unwrap();
+        assert!(!r.changed() && r.is_clean(), "{p:?}: {r:?}");
+        // Rot part of one device's share of the data chunks: repair's
+        // scrub puts it back from parity.
+        for c in fs
+            .chunks()
+            .into_iter()
+            .filter(|c| c.kind == ChunkKind::Data && c.profile == p)
+        {
+            let (dev, at) = c.stripes[1];
+            for b in (at + B..at + c.size_bytes / 4).step_by(BLOCK) {
+                d[dev as usize - 1].poke(b as usize + 100, 0x5A);
+            }
+        }
+        let mut fs = reopen_volume(&d, fs);
+        let r = fs.repair().unwrap();
+        assert!(r.scrub.repaired > 0, "{p:?}: {r:?}");
+        assert!(r.is_clean(), "{p:?}: {r:?}");
+        vol_same(&mut fs, &files);
+        // New data after a repair still goes to fresh rows, and the volume
+        // stays consistent.
+        let more = vol_files(&mut fs, 4, 2);
+        fs.sync().unwrap();
+        let mut fs = reopen_volume(&d, fs);
+        vol_same(&mut fs, &files);
+        vol_same(&mut fs, &more);
+        fs.check().unwrap();
+        assert!(fs.scrub().unwrap().is_clean());
+        let r = fs.repair().unwrap();
+        assert!(!r.changed() && r.is_clean(), "{p:?}: {r:?}");
+    }
+}
+
+#[test]
+fn tiered_volumes_keep_their_placement() {
+    let d = volume(2);
+    let tiers = [Tier::Fast, Tier::Slow];
+    mkfs::format_devices_tiered(
+        &vol_devs(&d),
+        &opts(),
+        Profile::Single,
+        Profile::Single,
+        &tiers,
+    )
+    .unwrap();
+    let mut fs = EclipseFS::mount_devices(vol_devs(&d), false).unwrap();
+    fs.set_clock(clock);
+    let files = vol_files(&mut fs, 4, 3);
+    let r = fs.repair().unwrap();
+    assert!(!r.changed() && r.is_clean(), "{r:?}");
+    let mut fs = reopen_volume(&d, fs);
+    let r = fs.repair().unwrap();
+    assert!(!r.changed() && r.is_clean(), "{r:?}");
+    let more = vol_files(&mut fs, 4, 4);
+    fs.sync().unwrap();
+    // Metadata stays on the fast device.
+    for c in fs.chunks().iter().filter(|c| c.kind == ChunkKind::Metadata) {
+        assert!(c.stripes.iter().all(|s| fs.device_tier(s.0) == Tier::Fast));
+    }
+    let mut fs = reopen_volume(&d, fs);
+    vol_same(&mut fs, &files);
+    vol_same(&mut fs, &more);
+    fs.check().unwrap();
 }
