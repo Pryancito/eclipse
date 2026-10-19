@@ -47,6 +47,8 @@
 //     SIGSEGV instead of returning: garbage, a script without `#!` (which a
 //     shell then runs itself, on ENOEXEC), a directory, a binary for another
 //     machine, a dynamic binary whose `PT_INTERP` is not installed.
+//   * `exit(-1)` reached the parent as a death by SIGHUP: the whole `int`
+//     was kept, and a negative exit code is how a kill is spelled inside.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -78,7 +80,8 @@
 //              the handlers and the alternate stack.
 //   wait       what `waitid` and `waitpid` report: an exit, a death by
 //              signal, a stop and a continue (each once), `WNOWAIT` leaving the
-//              child to be reaped again, `P_PGID` 0 as the caller's group,
+//              child to be reaped again, a negative exit code as its low
+//              byte, `P_PGID` 0 as the caller's group,
 //              `SA_NOCLDSTOP`; and a process ended or exec'd from a thread
 //              that is not its first.
 //   stop       a stop reaches a process blocked in a syscall -- `nanosleep`,
@@ -904,6 +907,20 @@ static void sec_wait(void) {
     pid_t got = waitpid(c, &st, WNOHANG);
     check(got == c && WIFEXITED(st) && WEXITSTATUS(st) == 42, "waitpid after WNOWAIT reaps it",
           "returned %d, status %#x", (int)got, st);
+
+    // A negative code is an exit with its low byte, through both ways a
+    // process can end itself: exit_group, and exit from its only thread.
+    const long ends[] = {SYS_exit_group, SYS_exit};
+    const int codes[] = {-1, -3};
+    const char *whats[] = {"exit_group(-1) is an exit with 255", "exit(-3) of the last thread: 253"};
+    for (int i = 0; i < 2; i++) {
+        c = fork();
+        if (c == 0) syscall(ends[i], codes[i]);
+        st = 0;
+        got = waitpid(c, &st, 0);
+        check(got == c && WIFEXITED(st) && WEXITSTATUS(st) == (codes[i] & 0xff), whats[i],
+              "returned %d, status %#x", (int)got, st);
+    }
 
     // A death by signal.
     c = fork();

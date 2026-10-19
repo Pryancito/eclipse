@@ -149,6 +149,14 @@ fn exit_code_after_failed_exec() -> i64 {
     linux_object::process::exit_code_killed_by(linux_object::signal::Signal::SIGSEGV as u8)
 }
 
+/// What a process that calls `exit(code)` or `exit_group(code)` finishes
+/// with: the low byte of `code`, as `do_group_exit((error_code & 0xff) << 8)`.
+/// The whole `int` was stored, and a negative one is how this kernel spells
+/// a death by signal, so `exit(-1)` reached the parent as killed by SIGHUP.
+fn exit_code_of(code: i32) -> i64 {
+    i64::from(code & 0xff)
+}
+
 /// What `nanosleep(2)` leaves in `rem` when a signal cuts the sleep short:
 /// the time that was still to go, so a loop that restarts the sleep on
 /// `EINTR` with `rem` picks up where it left off.
@@ -1661,7 +1669,7 @@ impl Syscall<'_> {
     /// last thread in the thread group.
     pub fn sys_exit(&mut self, exit_code: i32) -> SysResult {
         info!("exit: code={}", exit_code);
-        self.thread.exit_linux(exit_code);
+        self.thread.exit_linux(exit_code_of(exit_code) as i32);
         Ok(0)
     }
 
@@ -1676,7 +1684,7 @@ impl Syscall<'_> {
         // hunter state is released centrally in zircon Process::terminate so it
         // covers every teardown path (signal-kill, exception, _exit), not just
         // exit_group — see zircon-object/src/task/process.rs.
-        proc.exit(exit_code as i64);
+        proc.exit(exit_code_of(exit_code));
         Ok(0)
     }
 
@@ -2990,6 +2998,8 @@ mod abi_tests;
 
 #[cfg(test)]
 mod exec_order_tests;
+#[cfg(test)]
+mod exit_code_tests;
 #[cfg(test)]
 mod exit_signal_tests;
 #[cfg(test)]
