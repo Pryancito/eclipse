@@ -674,6 +674,7 @@ impl NewChild for Process {
             parent: Mutex::new(Arc::downgrade(parent)),
             vt: linux_parent.vt,
             exit_path: ExitPathSummary::default(),
+            exit_handed_over: AtomicBool::new(false),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
             itimers: Default::default(),
@@ -815,6 +816,8 @@ impl NewChild for Process {
                             (files, shm, futexes)
                         };
                         drop(dropped);
+                        // Only now may a `wait*` take it (`exit_handover`).
+                        lp.mark_exit_handed_over();
                     }
                     // The parent it has NOW, which after an adoption is the
                     // adopter. Working it out again from the parent it was
@@ -1012,6 +1015,7 @@ pub async fn wait_child_interest(
     reap: bool,
     interest: WaitInterest,
 ) -> LxResult<(ExitCode, ChildCpu)> {
+    let mut looked_since_clear = false;
     loop {
         check_signals()?;
         {
@@ -1031,7 +1035,7 @@ pub async fn wait_child_interest(
             inner.children.get(&pid).cloned().ok_or(LxError::ECHILD)?
         };
         if interest.exited {
-            if let Status::Exited(code) = child.status() {
+            if let Some(code) = exit_handover::waitable_exit_code(&child) {
                 let cpu = child_cpu(&child);
                 if !reap || claim_exited_child(proc, pid, cpu) {
                     return Ok((wait_status_exited(code), cpu));
@@ -1049,25 +1053,16 @@ pub async fn wait_child_interest(
         if nonblock {
             return Err(LxError::EAGAIN);
         }
-        // Exit, stop and continue all pulse SIGCHLD on the parent.
+        // Exit, stop and continue all pulse SIGCHLD on the parent. Cleared,
+        // and then everything above looked at once more before the park, so
+        // a pulse that came before the clear is not lost.
         let proc_obj: Arc<dyn KernelObject> = proc.clone();
-        proc_obj.signal_clear(Signal::SIGCHLD);
-        if interest.exited {
-            if let Status::Exited(code) = child.status() {
-                let cpu = child_cpu(&child);
-                if !reap || claim_exited_child(proc, pid, cpu) {
-                    return Ok((wait_status_exited(code), cpu));
-                }
-                continue;
-            }
+        if !looked_since_clear {
+            proc_obj.signal_clear(Signal::SIGCHLD);
+            looked_since_clear = true;
+            continue;
         }
-        if let Some(status) = child
-            .try_linux()
-            .and_then(|lp| lp.take_wait_notification(interest, reap))
-        {
-            return Ok((status, ChildCpu::default()));
-        }
-        check_signals()?;
+        looked_since_clear = false;
         proc_obj.wait_signal(Signal::SIGCHLD).await;
     }
 }
@@ -1160,7 +1155,7 @@ fn scan_waitable_children(
 
     for (pid, child) in kids {
         if interest.exited {
-            if let Status::Exited(code) = child.status() {
+            if let Some(code) = exit_handover::waitable_exit_code(&child) {
                 let cpu = child_cpu(&child);
                 if !reap || claim_exited_child(proc, pid, cpu) {
                     return Some(Ok((pid, wait_status_exited(code), cpu)));
@@ -1253,6 +1248,8 @@ pub struct LinuxProcess {
     ///
     /// See [`ExitPathSummary`].
     exit_path: ExitPathSummary,
+    /// Whether the exit teardown has run: see [`exit_handover`].
+    exit_handed_over: AtomicBool,
     /// Per-process syscall accounting (surfaced at `/proc/<pid>/perf`).
     perf: crate::perf::ProcPerf,
     /// The process's futex objects, keyed by the address of their word.
@@ -1847,6 +1844,7 @@ impl LinuxProcess {
             parent: Mutex::new(Weak::default()),
             vt,
             exit_path: ExitPathSummary::default(),
+            exit_handed_over: AtomicBool::new(false),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
             itimers: Default::default(),
@@ -6331,6 +6329,11 @@ fn wake_for_job_control(process: &Arc<Process>, signal: LinuxSignal) {
 mod exit_path;
 use exit_path::ExitPathSummary;
 
+mod exit_handover;
+
+#[cfg(test)]
+mod exit_handover_tests;
+
 #[cfg(test)]
 mod exit_path_benches;
 
@@ -6466,27 +6469,4 @@ mod fd_alloc_tests;
 mod wait_decision_tests;
 
 #[cfg(test)]
-mod rlimit_layout_tests {
-    //! `struct rlimit` as `getrlimit(2)` and `prlimit64(2)` hand it over.
-    //!
-    //! The soft limit comes first and the hard limit second, both the same
-    //! width -- so a swap compiles clean and reports the hard limit where
-    //! the soft one belongs. Which is not hypothetical here: a stack limit
-    //! that announced 8 MiB while the loader mapped 512 KiB is what killed
-    //! halloy in `libvulkan`, and the number userspace believed came out of
-    //! this struct.
-    //!
-    //! Against `include/uapi/linux/resource.h`.
-
-    use super::*;
-    use core::mem::{align_of, offset_of, size_of};
-
-    #[test]
-    fn rlimit_is_the_two_rlim_t_of_struct_rlimit_the_soft_one_first() {
-        assert_eq!(size_of::<RLimit>(), 16);
-        assert_eq!(align_of::<RLimit>(), 8);
-        assert_eq!(offset_of!(RLimit, cur), 0);
-        assert_eq!(offset_of!(RLimit, max), 8);
-        assert_eq!(offset_of!(RLimit, max) + 8, 16);
-    }
-}
+mod rlimit_layout_tests;

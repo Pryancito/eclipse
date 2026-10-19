@@ -18,6 +18,9 @@
 //     with SIGTERM or SIGUSR1 whose parent exited sent it to init, which
 //     reboots or halts on those; and an orphan's death was routed from the
 //     parent it was FORKED from, not the one that adopted it.
+//   * a `waitpid` could reap a dead parent before its children had gone to
+//     their adopter, so the subreaper that reaped it was told ECHILD for the
+//     orphan it was about to be handed, about one run in thirty.
 //   * a SIGSTOP (or Ctrl-Z's SIGTSTP) to a process blocked in a syscall did
 //     not stop it until the syscall returned by itself -- never, for a child
 //     in `pause()` -- and its parent's `waitpid(WUNTRACED)` waited with it.
@@ -78,7 +81,8 @@
 //   orphan     an orphan's death tells its ADOPTER, with SIGCHLD whatever
 //              signal its dead parent chose at clone(2), and wakes the
 //              adopter's `waitpid` even when a process in between volunteered
-//              as a subreaper after the adoption.
+//              as a subreaper after the adoption. And once `waitpid` has
+//              reaped the dead parent, the orphan is already the adopter's.
 //   inherit    what `fork` and `execve` hand down. A forked child keeps the
 //              handlers, the mask and the alternate stack, and starts with no
 //              pending signal and no alarm. An exec'd image keeps the mask,
@@ -716,8 +720,39 @@ static void sec_orphan(void) {
           : code == 1 ? "its waitpid(-1) returned the orphan, never its child"
                       : "the volunteer itself failed",
           code);
+    close(go[0]);
+    close(go[1]);
     signal(SIGALRM, SIG_DFL);
     alarm(20);
+
+    // 3. Linux hands the children over in `exit_notify`, before the parent
+    //    is a zombie anyone can reap: once our waitpid has reaped it, its
+    //    child is ours. A waitpid that lands in between is a matter of
+    //    timing, so it is asked many times.
+    if (pipe(go) != 0) {
+        check(0, "pipe", "%s", strerror(errno));
+        return;
+    }
+    g_watch_pid = 0;
+    int rounds = 128, strays = 0, unmade = 0;
+    for (int i = 0; i < rounds; i++) {
+        pid_t o = make_orphan(SIGCHLD, go[0]);
+        if (o <= 0) {
+            unmade++;
+            continue;
+        }
+        if (waitpid(o, &st, WNOHANG) != 0) strays++;
+        if (write(go[1], "x", 1) != 1) check(0, "write", "%s", strerror(errno));
+        for (int tries = 0; tries < 200; tries++) {
+            pid_t w = waitpid(o, &st, 0);
+            if (w == o || (w == -1 && errno != ECHILD && errno != EINTR)) break;
+            if (w == -1 && errno == ECHILD) sleep_ms(5);
+        }
+    }
+    check(strays == 0 && unmade == 0, "its parent reaped, the orphan is ours",
+          "%d of %d orphans not ours yet (%d not made)", strays, rounds, unmade);
+    close(go[0]);
+    close(go[1]);
 }
 
 // ---------------------------------------------------------------- inherit
