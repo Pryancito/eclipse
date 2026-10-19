@@ -677,7 +677,7 @@ impl NewChild for Process {
             exit_handed_over: AtomicBool::new(false),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
-            itimers: Default::default(),
+            itimers: crate::time::Itimers::forked(&linux_parent_inner.limits),
             aspace_lock: Mutex::new(()),
             inner: Mutex::new(linux_parent_inner.forked_child(
                 parent_pgid,
@@ -1283,9 +1283,9 @@ pub struct LinuxProcess {
     futexes: Mutex<FutexTable>,
     /// Interval timers (`setitimer(2)`), indexed by ITIMER_REAL/VIRTUAL/PROF.
     /// Outside `inner` so timer-wheel callbacks never contend the big lock.
-    /// A fresh process starts disarmed, and `fork` deliberately does not copy
-    /// this field — fork(2): "timers are not inherited by the child".
-    itimers: Mutex<[crate::time::ItimerSlot; 3]>,
+    /// `fork` copies no slot (fork(2): "timers are not inherited by the
+    /// child"), only the watch on `RLIMIT_CPU` ([`crate::time::Itimers`]).
+    itimers: crate::time::Itimers,
     /// This kernel's `mmap_lock`: serializes every MUTATION of the process's
     /// address-space LAYOUT (mmap / munmap / mprotect / mremap / brk / shmat /
     /// shmdt / execve's teardown) against `fork`.
@@ -1895,7 +1895,7 @@ impl LinuxProcess {
 
     /// Interval-timer slots (`setitimer(2)`), indexed by
     /// ITIMER_REAL (0) / ITIMER_VIRTUAL (1) / ITIMER_PROF (2).
-    pub fn itimers(&self) -> &Mutex<[crate::time::ItimerSlot; 3]> {
+    pub fn itimers(&self) -> &crate::time::Itimers {
         &self.itimers
     }
 

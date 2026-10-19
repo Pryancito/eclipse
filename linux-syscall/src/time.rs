@@ -12,13 +12,13 @@ use kernel_hal::{user::UserInOutPtr, user::UserInPtr, user::UserOutPtr};
 use lazy_static::lazy_static;
 use linux_object::error::{LxError, SysResult};
 use linux_object::process::ProcessExt;
-use linux_object::process::CAP_SYS_TIME;
+use linux_object::process::{RLimit, CAP_SYS_TIME, RLIMIT_CPU, RLIM_INFINITY};
 use linux_object::signal::{SigInfo, Signal};
 use linux_object::thread::ThreadExt;
 use linux_object::time::*;
 use lock::Mutex;
 use zircon_object::object::{KernelObject, KoID};
-use zircon_object::task::{Status, Thread, ROOT_JOB};
+use zircon_object::task::{Process, Status, Thread, ROOT_JOB};
 
 const USEC_PER_TICK: usize = 10000;
 
@@ -804,10 +804,10 @@ impl Syscall<'_> {
     /// `alarm(0)` needs in order to actually cancel.
     ///
     /// Each timer kind delivers its own signal (SIGALRM / SIGVTALRM /
-    /// SIGPROF). ITIMER_VIRTUAL and ITIMER_PROF should count process CPU
-    /// time; this kernel does not account CPU time per process, so they tick
-    /// on the wall clock — an upper bound of the correct expiry. Profilers get
-    /// their SIGPROF stream, just at wall-clock rate.
+    /// SIGPROF), and counts on its own clock ([`itimer_now`]): ITIMER_REAL
+    /// on the boot-monotonic one, from the timer wheel; ITIMER_VIRTUAL and
+    /// ITIMER_PROF on the process's CPU time, looked at by
+    /// [`run_cpu_timers`].
     pub fn sys_setitimer(
         &mut self,
         which: usize,
@@ -824,18 +824,9 @@ impl Syscall<'_> {
         }
         let value = Duration::from(val.value);
         let interval = Duration::from(val.interval);
-        let now = kernel_hal::timer::timer_now();
+        let now = itimer_now(self.zircon_process(), which);
         let owner = self.zircon_process().id();
-        let (old, arm) = {
-            let mut slots = self.linux_process().itimers().lock();
-            let slot = &mut slots[which];
-            let old = itimerval_from_slot(slot, now);
-            // A zero it_value disarms, whatever the interval says (POSIX).
-            let deadline = (!value.is_zero()).then(|| now + value);
-            let generation = rearm_itimer_slot(slot, deadline, interval);
-            let arm = deadline.map(|deadline| (deadline, generation));
-            (old, arm)
-        };
+        let (old, arm) = set_itimer(self.linux_process().itimers(), which, value, interval, now);
         // Reported LAST, after the timer is armed. Writing it here used to
         // abort the call on a faulting pointer with the slot ALREADY changed
         // and `arm_itimer` never reached: the process was left with a timer
@@ -859,7 +850,7 @@ impl Syscall<'_> {
         if which > ITIMER_PROF {
             return Err(LxError::EINVAL);
         }
-        let now = kernel_hal::timer::timer_now();
+        let now = itimer_now(self.zircon_process(), which);
         let val = {
             let slots = self.linux_process().itimers().lock();
             itimerval_from_slot(&slots[which], now)
@@ -1282,6 +1273,151 @@ fn slot_remaining(slot: &ItimerSlot, now: Duration) -> Duration {
     slot.deadline
         .map(|d| d.saturating_sub(now))
         .unwrap_or_default()
+}
+
+/// The clock itimer `which` of `proc` counts on, read now: the
+/// boot-monotonic one for ITIMER_REAL, and the process's CPU time for the
+/// other two ([`cpu_itimer_now`]).
+fn itimer_now(proc: &Process, which: usize) -> Duration {
+    match which {
+        ITIMER_REAL => kernel_hal::timer::timer_now(),
+        _ => cpu_itimer_now(which, proc.cpu_time_ns()),
+    }
+}
+
+/// What a CPU itimer reads in a process that has used `user` and `sys`
+/// nanoseconds of CPU: ITIMER_VIRTUAL its user time, ITIMER_PROF the two
+/// together.
+fn cpu_itimer_now(which: usize, (user, sys): (u64, u64)) -> Duration {
+    Duration::from_nanos(match which {
+        ITIMER_VIRTUAL => user,
+        _ => user.saturating_add(sys),
+    })
+}
+
+/// `do_setitimer` on the slots: point `which` at `value` from `now` on its
+/// own clock, then every `interval`, and say what it was and what the timer
+/// wheel has to arm. That is ITIMER_REAL's expiry and nothing else: a CPU
+/// timer's deadline is no point in time, the wheel would fire it on the wall
+/// clock, and [`run_cpu_timers`] watches it instead.
+fn set_itimer(
+    itimers: &Itimers,
+    which: usize,
+    value: Duration,
+    interval: Duration,
+    now: Duration,
+) -> (ITimerVal, Option<(Duration, u64)>) {
+    let mut slots = itimers.lock();
+    let slot = &mut slots[which];
+    let old = itimerval_from_slot(slot, now);
+    // A zero it_value disarms, whatever the interval says (POSIX).
+    let deadline = (!value.is_zero()).then(|| now + value);
+    let generation = rearm_itimer_slot(slot, deadline, interval);
+    if which != ITIMER_REAL {
+        if deadline.is_some() {
+            itimers.set_cpu_armed(true);
+        }
+        return (old, None);
+    }
+    (old, deadline.map(|deadline| (deadline, generation)))
+}
+
+/// `run_posix_cpu_timers()`, for the CPU timers a process has here:
+/// ITIMER_VIRTUAL, ITIMER_PROF and `RLIMIT_CPU`. A thread of `proc` runs it
+/// each time it comes back from user mode, which for one that makes no
+/// syscall is each tick of the timer interrupt -- what Linux checks them on
+/// too.
+///
+/// Both itimers counted on the wall clock, from the timer wheel, so a
+/// profiler's SIGPROF came as fast asleep as busy, and a process went on
+/// getting it while it waited. And `RLIMIT_CPU` was stored and nothing
+/// looked at it: no SIGXCPU at the soft limit, no SIGKILL at the hard one,
+/// so `ulimit -t` let a runaway loop run for ever.
+pub fn run_cpu_timers(proc: &Process) {
+    let Some(lp) = proc.try_linux() else {
+        return;
+    };
+    let itimers = lp.itimers();
+    if !itimers.cpu_armed() {
+        return;
+    }
+    let cpu = proc.cpu_time_ns();
+    let mut due = [None; 3];
+    {
+        // Everything is decided under the slots lock, the soft limit's move
+        // included, so two threads back from user mode at once send one
+        // signal between them.
+        let mut slots = itimers.lock();
+        let mut armed = false;
+        for (i, &which) in [ITIMER_VIRTUAL, ITIMER_PROF].iter().enumerate() {
+            let slot = &mut slots[which];
+            if expire_cpu_slot(slot, cpu_itimer_now(which, cpu)) {
+                due[i] = Signal::try_from(itimer_signo(which) as u8).ok();
+            }
+            armed |= slot.deadline.is_some();
+        }
+        if let Ok(limit) = lp.rlimit(RLIMIT_CPU, None, false) {
+            match rlimit_cpu_due(limit, cpu.0.saturating_add(cpu.1)) {
+                RlimitCpu::Within => {}
+                RlimitCpu::Kill => due[2] = Some(Signal::SIGKILL),
+                RlimitCpu::Xcpu => {
+                    due[2] = Some(Signal::SIGXCPU);
+                    // "send a SIGXCPU every second": the next one is a
+                    // second on, and `getrlimit` says so.
+                    let next = RLimit {
+                        cur: limit.cur + 1,
+                        max: limit.max,
+                    };
+                    let _ = lp.rlimit(RLIMIT_CPU, Some(next), true);
+                }
+            }
+            armed |= limit.cur != RLIM_INFINITY;
+        }
+        itimers.set_cpu_armed(armed);
+    }
+    for signal in due.iter().flatten().copied() {
+        let info = SigInfo::from_kernel(signal);
+        let _ = linux_object::process::send_signal_to_process_with_info(
+            proc.id() as usize,
+            signal,
+            Some(info),
+        );
+    }
+}
+
+/// One look at a CPU itimer slot whose clock reads `now`: whether it has
+/// gone off, and if so its next expiry, one interval on or none
+/// (`check_cpu_itimer`: one period a look, so a slot that fell behind goes
+/// off again at the next look, where the wall-clock slots skip ahead).
+fn expire_cpu_slot(slot: &mut ItimerSlot, now: Duration) -> bool {
+    match slot.deadline {
+        Some(expiry) if expiry <= now => {
+            slot.deadline = (!slot.interval.is_zero()).then(|| expiry + slot.interval);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Where a process that has used `cpu_ns` of CPU stands against its
+/// `RLIMIT_CPU`, in seconds (`check_process_timers`): SIGKILL at the hard
+/// limit, SIGXCPU at the soft one.
+#[derive(Debug, PartialEq, Eq)]
+enum RlimitCpu {
+    Within,
+    Xcpu,
+    Kill,
+}
+
+fn rlimit_cpu_due(limit: RLimit, cpu_ns: u64) -> RlimitCpu {
+    let reached = |secs: u64| secs != RLIM_INFINITY && cpu_ns >= secs.saturating_mul(1_000_000_000);
+    if reached(limit.max) {
+        RlimitCpu::Kill
+    } else if reached(limit.cur) {
+        RlimitCpu::Xcpu
+    } else {
+        RlimitCpu::Within
+    }
 }
 
 /// Point `slot` at a new expiry (`None` disarms) and give it a generation
@@ -1855,6 +1991,9 @@ mod settimeofday_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cpu_timer_tests;
 
 #[cfg(test)]
 mod itimer_tests {

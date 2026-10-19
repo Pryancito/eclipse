@@ -50,6 +50,7 @@ use self::file::{XattrOp, XattrTarget};
 pub use self::restart::{
     restarts_after_handler, restarts_after_stop, restarts_whatever_the_handler,
 };
+pub use self::time::run_cpu_timers;
 
 mod consts {
     // generated from syscall.h.in

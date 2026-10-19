@@ -706,6 +706,9 @@ async fn run_user(thread: CurrentThread) {
             .unwrap_or_default()
             .as_nanos();
         thread.time_add(user_ns);
+        // ITIMER_VIRTUAL, ITIMER_PROF and RLIMIT_CPU count this CPU time; a
+        // signal one of them sends is taken before the thread goes back.
+        linux_syscall::run_cpu_timers(thread.proc());
         debug!(
             "back from user: tid = {} pc = {:x} trap reason = {:?}",
             thread.id(),

@@ -91,6 +91,9 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
     `writev` y `fallocate` pasaban de el, un `pwrite` que lo cruzaba fallaba
     entero en vez de escribir hasta el, un fichero que ya lo pasaba no se
     podia recortar, y ningun `EFBIG` traia su `SIGXFSZ`.
+22. `ITIMER_VIRTUAL` e `ITIMER_PROF` contaban tiempo de reloj, asi que
+    saltaban en un proceso dormido, y `RLIMIT_CPU` no mandaba ni `SIGXCPU` ni
+    `SIGKILL`: un bucle desbocado con `ulimit -t` seguia para siempre.
 
 ## Compilar
 
@@ -139,3 +142,4 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `image` | el programa esta por encima de la pagina nula y leer por un puntero nulo mata con SIGSEGV, se enlazara como se enlazara (estatico, static-pie, dinamico). Compilada con el musl de `cargo image` la sonda es static-pie, que es el caso que fallaba |
 | `cputime` | el tiempo de CPU que cuentan `getrusage`, `times`, `wait4` y los relojes de CPU: nada para un proceso dormido o esperando; los 300 ms de un hijo que trabaja, en `wait4`, en `RUSAGE_CHILDREN` y en `times()`, tambien los de un hilo que sigue trabajando cuando el proceso llama a `exit_group`; y la parte del kernel de un bucle de syscalls en `CLOCK_THREAD_CPUTIME_ID` y `CLOCK_PROCESS_CPUTIME_ID` |
 | `fsize` | `RLIMIT_FSIZE` en toda escritura a un fichero: un `write`, `pwrite`, `writev` o `copy_file_range` que cruza el limite escribe hasta el, sin señal; uno que empieza en el limite o pasado da `EFBIG` y un `SIGXFSZ`, y una escritura vacia en el limite da 0. Un `ftruncate` o un `fallocate` que hacen crecer el fichero mas alla dan `EFBIG` y `SIGXFSZ`; recortar un fichero que ya lo pasaba se puede, aunque se quede pasado, y `FALLOC_FL_KEEP_SIZE` no es crecer. Una tuberia no tiene limite, y sin manejador `SIGXFSZ` mata |
+| `cputimer` | `ITIMER_VIRTUAL` e `ITIMER_PROF` de 100 ms no se mueven mientras el proceso duerme 300 ms y saltan a los 100 ms de su tiempo de CPU (`ITIMER_VIRTUAL`, de usuario); con intervalo de 20 ms saltan entre 8 y 20 veces en 300 ms de CPU. Con `RLIMIT_CPU` 1/2, un `SIGXCPU` al segundo de CPU (no de sueño), el limite blando pasa a 2 y `SIGKILL` a los 2 s; con 1 y sin manejador, `SIGXCPU` mata |

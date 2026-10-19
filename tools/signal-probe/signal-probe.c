@@ -74,6 +74,9 @@
 //     `write`, `writev` and `fallocate` went past it, a `pwrite` across it
 //     failed instead of stopping at it, a file already past it could not be
 //     cut down, and no `SIGXFSZ` came with any `EFBIG`.
+//   * ITIMER_VIRTUAL and ITIMER_PROF counted wall-clock time, so they went
+//     off in a process asleep, and RLIMIT_CPU sent neither SIGXCPU nor
+//     SIGKILL: `ulimit -t` let a runaway loop run for ever.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -143,6 +146,10 @@
 //              EFBIG with a SIGXFSZ, which kills by default, whatever the
 //              call; a new length past it is refused only when it grows the
 //              file; and a pipe is not a file.
+//   cputimer   ITIMER_VIRTUAL and ITIMER_PROF do not move while the process
+//              sleeps and go off at 100 ms of its CPU time, every 20 ms of it
+//              with an interval; RLIMIT_CPU sends SIGXCPU at the soft limit,
+//              which moves up a second, and SIGKILL at the hard one.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -174,6 +181,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/times.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -2043,6 +2051,124 @@ static void sec_fsize(void) {
     }
 }
 
+// ---------------------------------------------------------------- cputimer
+
+static volatile sig_atomic_t g_cpu_ticks;
+static volatile long g_cpu_at_tick;  // the process's CPU ms when the first came
+
+static void on_cpu_tick(int sig) {
+    (void)sig;
+    if (g_cpu_ticks++ == 0) g_cpu_at_tick = clock_ms(CLOCK_PROCESS_CPUTIME_ID);
+}
+
+// Work in user mode, with a syscall only every 200000 rounds, until `ticks`
+// signals have come or `ms` of wall time have gone by.
+static void spin_until(int ticks, long ms) {
+    long end = clock_ms(CLOCK_MONOTONIC) + ms;
+    while (g_cpu_ticks < ticks && clock_ms(CLOCK_MONOTONIC) < end) {
+        for (volatile int i = 0; i < 200000; i++) {
+        }
+    }
+}
+
+// One 100 ms `which` timer: it does not move while the process sleeps, and
+// goes off once the process has used 100 ms of CPU.
+static void itimer_checks(int which, const char *asleep, const char *used_what) {
+    g_cpu_ticks = 0;
+    struct itimerval it = {{0, 0}, {0, 100000}};
+    setitimer(which, &it, NULL);
+    sleep_ms(300);
+    struct itimerval left;
+    getitimer(which, &left);
+    long left_ms = left.it_value.tv_sec * 1000L + left.it_value.tv_usec / 1000;
+    check(g_cpu_ticks == 0 && left_ms >= 80, asleep, "%d signal(s), %ld ms left after 300 ms asleep",
+          (int)g_cpu_ticks, left_ms);
+    long start = clock_ms(CLOCK_PROCESS_CPUTIME_ID);
+    spin_until(1, 3000);
+    long used = g_cpu_at_tick - start;
+    check(g_cpu_ticks == 1 && used >= 80, used_what, "%d signal(s), at %ld ms of CPU",
+          (int)g_cpu_ticks, used);
+    struct itimerval off = {{0, 0}, {0, 0}};
+    setitimer(which, &off, NULL);
+}
+
+static volatile int *g_xcpu;  // count, CPU ms at the first, soft limit after it
+
+static void on_xcpu(int sig) {
+    (void)sig;
+    if (g_xcpu[0]++ == 0) {
+        g_xcpu[1] = (int)clock_ms(CLOCK_PROCESS_CPUTIME_ID);
+        struct rlimit rl;
+        getrlimit(RLIMIT_CPU, &rl);
+        g_xcpu[2] = (int)rl.rlim_cur;
+    }
+}
+
+// A child with RLIMIT_CPU `soft`/`hard` that sleeps 1.5 s and then works,
+// for 5 s of wall time at most; with `handled`, it counts its SIGXCPUs in
+// `g_xcpu`. Its status.
+static int rlimit_cpu_child(rlim_t soft, rlim_t hard, int handled) {
+    pid_t c = fork();
+    if (c == 0) {
+        struct rlimit no_core = {0, 0}, rl = {soft, hard};
+        setrlimit(RLIMIT_CORE, &no_core);
+        if (setrlimit(RLIMIT_CPU, &rl)) _exit(5);
+        signal(SIGXCPU, handled ? on_xcpu : SIG_DFL);
+        sleep_ms(1500);
+        g_xcpu[3] = g_xcpu[0];  // what came while asleep
+        long end = clock_ms(CLOCK_MONOTONIC) + 5000;
+        while (clock_ms(CLOCK_MONOTONIC) < end) {
+            for (volatile int i = 0; i < 200000; i++) {
+            }
+        }
+        _exit(7);  // still alive
+    }
+    return status_of(c);
+}
+
+static void sec_cputimer(void) {
+    // ITIMER_VIRTUAL counts the process's user time, ITIMER_PROF its user
+    // and kernel time: neither moves while it sleeps.
+    signal(SIGVTALRM, on_cpu_tick);
+    signal(SIGPROF, on_cpu_tick);
+    itimer_checks(ITIMER_VIRTUAL, "ITIMER_VIRTUAL: asleep, it waits",
+                  "ITIMER_VIRTUAL: 100 ms of user time");
+    itimer_checks(ITIMER_PROF, "ITIMER_PROF: asleep, it waits", "ITIMER_PROF: 100 ms of CPU");
+
+    // An interval goes on counting CPU time: every 20 ms over 300 ms of it.
+    g_cpu_ticks = 0;
+    struct itimerval every = {{0, 20000}, {0, 20000}}, off = {{0, 0}, {0, 0}};
+    setitimer(ITIMER_PROF, &every, NULL);
+    long start = clock_ms(CLOCK_PROCESS_CPUTIME_ID);
+    while (clock_ms(CLOCK_PROCESS_CPUTIME_ID) - start < 300) {
+        for (volatile int i = 0; i < 200000; i++) {
+        }
+    }
+    setitimer(ITIMER_PROF, &off, NULL);
+    check(g_cpu_ticks >= 8 && g_cpu_ticks <= 20, "ITIMER_PROF every 20 ms of CPU",
+          "%d in 300 ms of CPU", (int)g_cpu_ticks);
+
+    // RLIMIT_CPU: a SIGXCPU at the soft limit, which then goes up by one
+    // second, and SIGKILL at the hard one. Time asleep does not count.
+    g_xcpu = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (g_xcpu == MAP_FAILED) {
+        check(0, "a shared page", "%s", strerror(errno));
+        return;
+    }
+    int st = rlimit_cpu_child(1, 2, 1);
+    check(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL, "RLIMIT_CPU 1/2: SIGKILL at the hard limit",
+          "status %#x", st);
+    check(g_xcpu[3] == 0 && g_xcpu[0] == 1 && g_xcpu[1] >= 900 && g_xcpu[2] == 2,
+          "one SIGXCPU at 1 s of CPU, and soft becomes 2",
+          "%d while asleep, %d in all, the first at %d ms, soft then %d", g_xcpu[3], g_xcpu[0],
+          g_xcpu[1], g_xcpu[2]);
+    memset((void *)g_xcpu, 0, 4 * sizeof *g_xcpu);
+    st = rlimit_cpu_child(1, RLIM_INFINITY, 0);
+    check(WIFSIGNALED(st) && WTERMSIG(st) == SIGXCPU, "RLIMIT_CPU 1: unhandled, SIGXCPU kills",
+          "status %#x", st);
+    munmap((void *)g_xcpu, 4096);
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -2067,6 +2193,7 @@ static const struct {
     {"image", "the program is not mapped at the null page", sec_image},
     {"cputime", "what getrusage, times, wait4 and the CPU clocks count", sec_cputime},
     {"fsize", "RLIMIT_FSIZE holds every write to a file, with SIGXFSZ", sec_fsize},
+    {"cputimer", "ITIMER_VIRTUAL, ITIMER_PROF and RLIMIT_CPU count CPU time", sec_cputimer},
 };
 
 int main(int argc, char **argv) {

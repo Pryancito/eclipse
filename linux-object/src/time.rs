@@ -1,8 +1,12 @@
 //! Linux time objects
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
+use kernel_hal::sync::Mutex;
 use rcore_fs::vfs::*;
+
+use crate::process::{RLimits, RLIMIT_CPU, RLIM_INFINITY};
 
 /// TimeSpec struct for clock_gettime, similar to Timespec
 #[repr(C)]
@@ -100,6 +104,64 @@ pub struct ItimerSlot {
     /// whose pid went to another, expires silently instead of delivering a
     /// stale signal.
     pub generation: u64,
+}
+
+/// A process's three `setitimer(2)` slots (it derefs to them), and whether
+/// one of its CPU timers -- ITIMER_VIRTUAL, ITIMER_PROF, `RLIMIT_CPU` -- may
+/// be due.
+///
+/// The two CPU slots count on the process's CPU clocks, not the
+/// boot-monotonic one: their `deadline` is a reading of its user time
+/// (VIRTUAL) or of its user and kernel time (PROF). The timer wheel never
+/// fires them; a thread of the process looks at them each time it comes back
+/// from user mode (`linux_syscall::run_cpu_timers`), and `cpu_armed` is what
+/// lets every return of a process that has none skip the look with one load.
+#[derive(Default)]
+pub struct Itimers {
+    slots: Mutex<[ItimerSlot; 3]>,
+    cpu_armed: AtomicBool,
+}
+
+impl Itimers {
+    /// A forked child's: no timer at all (fork(2): "a child created via fork
+    /// does not inherit its parent's interval timers"), but the `RLIMIT_CPU`
+    /// it does inherit is watched from its first return from user mode.
+    pub fn forked(limits: &RLimits) -> Self {
+        let cpu_limited = limits
+            .get(RLIMIT_CPU)
+            .is_ok_and(|limit| limit.cur != RLIM_INFINITY);
+        Itimers {
+            slots: Default::default(),
+            cpu_armed: AtomicBool::new(cpu_limited),
+        }
+    }
+
+    /// Whether a CPU timer may be due: a look at the slots and the limit is
+    /// worth taking.
+    pub fn cpu_armed(&self) -> bool {
+        self.cpu_armed.load(Ordering::Acquire)
+    }
+
+    /// Say whether one is, with the slots locked: the look that finds nothing
+    /// left clears it under the same lock an arming sets it under, so the two
+    /// cannot cross and leave a timer armed that nobody looks at.
+    pub fn set_cpu_armed(&self, armed: bool) {
+        self.cpu_armed.store(armed, Ordering::Release);
+    }
+
+    /// `update_rlimit_cpu()`: a finite `RLIMIT_CPU` was just set.
+    pub fn watch_cpu_limit(&self) {
+        let _slots = self.slots.lock();
+        self.set_cpu_armed(true);
+    }
+}
+
+impl core::ops::Deref for Itimers {
+    type Target = Mutex<[ItimerSlot; 3]>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.slots
+    }
 }
 
 impl TimeVal {
