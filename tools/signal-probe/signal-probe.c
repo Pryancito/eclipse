@@ -21,6 +21,9 @@
 //   * a `waitpid` could reap a dead parent before its children had gone to
 //     their adopter, so the subreaper that reaped it was told ECHILD for the
 //     orphan it was about to be handed, about one run in thirty.
+//   * a zombie gave its pid back before it was reaped, so a fork could be
+//     handed it while the zombie still waited, and a `waitpid` for the new
+//     child collected the dead one.
 //   * a SIGSTOP (or Ctrl-Z's SIGTSTP) to a process blocked in a syscall did
 //     not stop it until the syscall returned by itself -- never, for a child
 //     in `pause()` -- and its parent's `waitpid(WUNTRACED)` waited with it.
@@ -1061,6 +1064,27 @@ static void sec_wait(void) {
           : WIFEXITED(st) && WEXITSTATUS(st) == 101 ? "the exec failed"
                                                     : "tid == pid, its own mask, tgkill reaches it",
           st);
+
+    // A zombie wears its pid until it is reaped. Linux counts pids up to
+    // pid_max before it comes round; a kernel that hands out freed pids
+    // first gives the zombie's to a fork within as many forks as it has
+    // pids free.
+    c = child_that_exits(0, 0);
+    memset(&si, 0, sizeof si);
+    waitid(P_PID, (id_t)c, &si, WEXITED | WNOWAIT);
+    int forks = 512, given = 0;
+    for (int i = 0; i < forks && !given; i++) {
+        pid_t k = child_that_exits(0, 0);
+        if (k == c) given = i + 1;
+        if (k > 0) waitpid(k, NULL, 0);
+    }
+    got = waitpid(c, &st, 0);
+    if (given)
+        check(0, "a zombie's pid is not handed out again", "fork %d of %d was handed it", given,
+              forks);
+    else
+        check(got == c, "a zombie's pid is not handed out again", "none of %d forks; waitpid: %s",
+              forks, got == c ? "the zombie" : "not the zombie");
 }
 
 // ------------------------------------------------------------------- stop

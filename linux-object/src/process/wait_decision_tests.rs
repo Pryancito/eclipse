@@ -540,8 +540,8 @@ mod which_child {
     /// A child already reaped out of the live table (the `SA_NOCLDWAIT` and
     /// death-notify path records it here) is still collectable, and exactly
     /// once. This is the shortcut at the top of the scan, which exists
-    /// because the `Arc<Process>` is gone by then and there is nothing left
-    /// to ask for a status.
+    /// because the child is off the live table by then and its record is
+    /// all there is to ask for a status.
     #[test]
     fn a_recorded_exit_is_collectable_without_the_child() {
         let parent = a_parent(93_538);
@@ -634,8 +634,8 @@ mod which_child {
     /// `waitid(P_PGID, WSTOPPED)` on a group whose only member is a zombie:
     /// there is nothing to collect, but there IS still a child of that group
     /// to wait for, so Linux blocks instead of answering `ECHILD`. The
-    /// zombie's pgid is the only thing that can say so, because the process
-    /// object is gone -- this is the one call that reaches the recorded
+    /// zombie's pgid is the only thing that can say so, because the child is
+    /// off the live table -- this is the one call that reaches the recorded
     /// exits WITHOUT the scan's shortcut, which only runs when the waiter
     /// asked about exits at all.
     #[test]

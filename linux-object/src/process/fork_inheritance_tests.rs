@@ -198,6 +198,7 @@ fn a_child_starts_with_no_children_of_its_own() {
             code: 0,
             cpu: Default::default(),
             pgid: 0,
+            _wears_pid: None,
         },
     );
     let child = fork_of(&parent);

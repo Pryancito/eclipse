@@ -70,6 +70,9 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
     pasaran al adoptante, y el subreaper que lo cosechaba recibia `ECHILD`
     por el huerfano que estaba a punto de heredar, mas o menos una vez de
     cada treinta.
+17. Un zombi devolvia su pid antes de que lo cosecharan, asi que un `fork`
+    podia recibirlo mientras el zombi seguia esperando, y un `waitpid` del
+    hijo nuevo recogia al muerto.
 
 ## Compilar
 
@@ -109,7 +112,7 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `ids` | el kernel rechaza lo que no puede cargar: un puntero de TLS fuera del espacio de usuario (`arch_prctl`, `clone(CLONE_SETTLS)`) y el pid `INT_MIN`, que no tiene negativo, en `waitpid` |
 | `orphan` | la muerte de un huerfano avisa a quien lo **adopto**, con SIGCHLD aunque su padre muerto eligiera otra señal en `clone(2)`, y despierta el `waitpid` del adoptante aunque un proceso de en medio se haya hecho subreaper despues de la adopcion. Y en cuanto `waitpid` ha cosechado al padre muerto, el huerfano ya es del adoptante (se pregunta 128 veces, porque es cuestion de tiempos). La señal elegida es SIGWINCH, que init descarta, por si el subreaper no se cumpliera |
 | `inherit` | lo que pasa por `fork` (manejadores, mascara y pila alternativa; ni señales pendientes ni alarma) y por `execve` (mascara, pendientes, alarma y `SIG_IGN`; los manejadores vuelven a `SIG_DFL` y la pila alternativa se va). La mitad del `execve` la cuenta la propia sonda relanzada con `--exec-report` |
-| `wait` | lo que cuentan `waitid` y `waitpid`: una salida con `WNOWAIT` y luego recogida; un codigo de salida negativo, que llega como su byte bajo (`exit_group(-1)` es 255 y el `exit(-3)` del ultimo hilo, 253); una muerte por SIGTERM (`CLD_KILLED`); una parada de un hijo en `pause()` y una continuacion, cada una contada una vez; `waitid(P_PGID, 0)`, que es el grupo propio; `SA_NOCLDSTOP`; `exit()` desde un segundo hilo, que acaba con todo el proceso; y `execve()` desde un segundo hilo, cuya imagen nueva toma el pid como tid, conserva la mascara de ese hilo y recibe un `tgkill(pid, pid)` |
+| `wait` | lo que cuentan `waitid` y `waitpid`: una salida con `WNOWAIT` y luego recogida; un codigo de salida negativo, que llega como su byte bajo (`exit_group(-1)` es 255 y el `exit(-3)` del ultimo hilo, 253); una muerte por SIGTERM (`CLD_KILLED`); una parada de un hijo en `pause()` y una continuacion, cada una contada una vez; `waitid(P_PGID, 0)`, que es el grupo propio; `SA_NOCLDSTOP`; `exit()` desde un segundo hilo, que acaba con todo el proceso; y `execve()` desde un segundo hilo, cuya imagen nueva toma el pid como tid, conserva la mascara de ese hilo y recibe un `tgkill(pid, pid)`. Y un zombi conserva su pid hasta que lo cosechan: ninguno de 512 `fork` lo recibe |
 | `stop` | una parada llega a un proceso metido en una syscall que espera (`nanosleep`, `read`, `sigsuspend`) y la syscall sigue cuando se le continua: el `read` lee, sin `EINTR`, y el `sigsuspend` sigue esperando su señal y al volver deja la mascara de antes |
 | `teardown` | un proceso que sale (`exit_group`) con un segundo hilo dormido en `pause`, `read`, `nanosleep`, `waitpid` o en el `vfork` de un hijo que no hace `exec` ya no tiene ese hilo cuando se le recoge: un mutex robusto compartido que el hilo tenia cogido vuelve con `EOWNERDEAD`. `/proc/meminfo` no sirve para esto ni en Linux, que a veces enseña tarde unos cientos de MiB liberados |
 | `spawn` | un hijo de `vfork` corre en la memoria de su padre: lo que escribe ahi lo lee el padre, asi que `posix_spawn` informa de un programa que no existe y de una accion de fichero que falla con `ENOENT`, y veinte `posix_spawn` de `sh -c 'exit 3'` seguidos devuelven cada uno su hijo con su estado |

@@ -1025,11 +1025,14 @@ pub async fn wait_child_interest(
         let child = {
             let mut inner = proc.linux().inner.lock();
             if interest.exited {
-                if let Some(&ReapedChild { code, cpu, .. }) = inner.reaped_children.get(&pid) {
+                if let Some(entry) = inner.reaped_children.get(&pid) {
+                    let (code, cpu) = (entry.code, entry.cpu);
+                    let zombie = reap.then(|| inner.reaped_children.remove(&pid));
                     if reap {
-                        inner.reaped_children.remove(&pid);
                         inner.add_children_cpu(cpu);
                     }
+                    drop(inner);
+                    drop(zombie);
                     return Ok((wait_status_exited(code), cpu));
                 }
             }
@@ -1137,12 +1140,14 @@ fn scan_waitable_children(
             .reaped_children
             .iter()
             .find(|(_, entry)| pgid.map(|want| entry.pgid == want).unwrap_or(true))
-            .map(|(&p, &entry)| (p, entry));
-        if let Some((pid, ReapedChild { code, cpu, .. })) = found {
+            .map(|(&p, entry)| (p, entry.code, entry.cpu));
+        if let Some((pid, code, cpu)) = found {
+            let zombie = reap.then(|| inner.reaped_children.remove(&pid));
             if reap {
-                inner.reaped_children.remove(&pid);
                 inner.add_children_cpu(cpu);
             }
+            drop(inner);
+            drop(zombie);
             return Some(Ok((pid, wait_status_exited(code), cpu)));
         }
     }
@@ -1186,11 +1191,13 @@ fn claim_exited_child(proc: &Arc<Process>, pid: KoID, cpu: ChildCpu) -> bool {
     if inner.children.remove(&pid).is_none() {
         return false;
     }
-    inner.reaped_children.remove(&pid);
+    let zombie = inner.reaped_children.remove(&pid);
     // So a later `record_child_exit` from death-notify does not
     // re-insert this pid as a fresh zombie.
     inner.waited_without_zombie.insert(pid);
     inner.add_children_cpu(cpu);
+    drop(inner);
+    drop(zombie);
     true
 }
 
@@ -1765,15 +1772,18 @@ impl LinuxProcess {
         self.inner.lock().reaped_children.contains_key(&pid)
     }
 
-    /// Drop the live child handle and keep only the exit code (plus the
-    /// child's final CPU usage, for the reaper's rusage) for a future `wait`.
+    /// Move a dead child from the live table to the zombies, with its exit
+    /// code (plus its final CPU usage, for the reaper's rusage) for a future
+    /// `wait`.
     pub fn record_child_exit(&self, child_id: KoID, exit_code: i64, cpu: ChildCpu, pgid: KoID) {
         let mut inner = self.inner.lock();
-        inner.children.remove(&child_id);
+        let wears_pid = inner.children.remove(&child_id);
         // A concurrent `wait*` can collect the live `Exited` child before
         // `PROCESS_TERMINATED` runs this path; that wait leaves a mark in
         // `waited_without_zombie` so we do not invent a second zombie.
         if inner.waited_without_zombie.remove(&child_id) {
+            drop(inner);
+            drop(wears_pid);
             return;
         }
         inner.reaped_children.insert(
@@ -1782,6 +1792,7 @@ impl LinuxProcess {
                 code: exit_code,
                 cpu,
                 pgid,
+                _wears_pid: wears_pid,
             },
         );
     }
@@ -1793,9 +1804,11 @@ impl LinuxProcess {
     /// that were waited for).
     pub fn forget_child(&self, child_id: KoID) {
         let mut inner = self.inner.lock();
-        inner.children.remove(&child_id);
-        inner.reaped_children.remove(&child_id);
+        let live = inner.children.remove(&child_id);
+        let zombie = inner.reaped_children.remove(&child_id);
         inner.waited_without_zombie.remove(&child_id);
+        drop(inner);
+        drop((live, zombie));
     }
 
     /// CPU totals of already-reaped children, in nanoseconds (utime, stime).
@@ -4874,9 +4887,9 @@ fn parent_wants_sigchld_for_stops(parent: &Arc<Process>) -> bool {
         .unwrap_or(false)
 }
 
-/// A child that has exited and whose `Arc<Process>` is gone: everything a
-/// `wait*` still has to be able to report about it.
-#[derive(Debug, Clone, Copy)]
+/// A child that has exited, a zombie: everything a `wait*` still has to be
+/// able to report about it.
+#[derive(Debug, Clone)]
 struct ReapedChild {
     /// The raw exit code, as `wait_status_exited` turns it into a status word.
     code: i64,
@@ -4885,6 +4898,11 @@ struct ReapedChild {
     /// The process group it died in, which is what `waitpid(-pgid)` matches
     /// against. A zombie keeps its pgid in Linux.
     pgid: KoID,
+    /// The child object, kept only for its pid: the pid goes back to the
+    /// pool when the object drops, and Linux hands a zombie's pid to no one
+    /// until it is reaped. Let go of with the lock released, since the last
+    /// drop runs the object's teardown. See `zombie_pid_tests`.
+    _wears_pid: Option<Arc<Process>>,
 }
 
 /// What a reaper's `SIGCHLD` disposition says to do with a child that just
@@ -6334,6 +6352,9 @@ mod exit_handover;
 
 #[cfg(test)]
 mod exit_handover_tests;
+
+#[cfg(test)]
+mod zombie_pid_tests;
 
 #[cfg(test)]
 mod exit_path_benches;
