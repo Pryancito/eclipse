@@ -107,19 +107,24 @@ pub struct ItimerSlot {
 }
 
 /// A process's three `setitimer(2)` slots (it derefs to them), and whether
-/// one of its CPU timers -- ITIMER_VIRTUAL, ITIMER_PROF, `RLIMIT_CPU` -- may
-/// be due.
+/// one of its CPU timers -- ITIMER_VIRTUAL, ITIMER_PROF, `RLIMIT_CPU`, or a
+/// `timer_create(2)` timer on one of its CPU clocks -- may be due.
 ///
 /// The two CPU slots count on the process's CPU clocks, not the
 /// boot-monotonic one: their `deadline` is a reading of its user time
 /// (VIRTUAL) or of its user and kernel time (PROF). The timer wheel never
 /// fires them; a thread of the process looks at them each time it comes back
-/// from user mode (`linux_syscall::run_cpu_timers`), and `cpu_armed` is what
-/// lets every return of a process that has none skip the look with one load.
+/// from user mode (`linux_syscall::run_cpu_timers`), and `cpu_armed` and
+/// `posix_cpu_armed` are what let every return of a process that has none
+/// skip the look with two loads.
 #[derive(Default)]
 pub struct Itimers {
     slots: Mutex<[ItimerSlot; 3]>,
     cpu_armed: AtomicBool,
+    /// A POSIX timer on this process's CPU clock, or on one of its
+    /// threads', may be armed. Set and cleared with that timer table's lock
+    /// held, for the reason `set_cpu_armed` gives.
+    posix_cpu_armed: AtomicBool,
 }
 
 impl Itimers {
@@ -133,6 +138,7 @@ impl Itimers {
         Itimers {
             slots: Default::default(),
             cpu_armed: AtomicBool::new(cpu_limited),
+            posix_cpu_armed: AtomicBool::new(false),
         }
     }
 
@@ -147,6 +153,16 @@ impl Itimers {
     /// cannot cross and leave a timer armed that nobody looks at.
     pub fn set_cpu_armed(&self, armed: bool) {
         self.cpu_armed.store(armed, Ordering::Release);
+    }
+
+    /// Whether a POSIX timer on one of this process's CPU clocks may be due.
+    pub fn posix_cpu_armed(&self) -> bool {
+        self.posix_cpu_armed.load(Ordering::Acquire)
+    }
+
+    /// Say whether one is; only ever with the POSIX timer table locked.
+    pub fn set_posix_cpu_armed(&self, armed: bool) {
+        self.posix_cpu_armed.store(armed, Ordering::Release);
     }
 
     /// `update_rlimit_cpu()`: a finite `RLIMIT_CPU` was just set.
@@ -465,12 +481,13 @@ pub fn clock_nanosleep_base(clock: usize) -> crate::error::LxResult<ClockBase> {
     Ok(match ClockId::from_raw(clock)? {
         ClockId::ClockRealTime => ClockBase::Wall,
         ClockId::ClockMonotonic => ClockBase::Monotonic,
-        // Linux sleeps on the process's own CPU time; this kernel does not
-        // account it, so the sleep runs on elapsed time instead. CPU time
-        // never runs ahead of elapsed time, so the sleep can end early and
-        // never late, which is the benign direction for a sleep.
-        // `sys_setitimer` makes the same choice for ITIMER_VIRTUAL and
-        // ITIMER_PROF.
+        // Linux sleeps on the process's own CPU time, which only the
+        // sleeper's other threads can use up. Nothing here wakes a sleeper
+        // on CPU time, so the sleep runs on elapsed time instead: it ends
+        // late while more than one of those threads is busy, the process
+        // then using CPU faster than time passes, and early while fewer
+        // are, down to a process with nothing else running, whose sleep
+        // Linux never ends.
         ClockId::ClockProcessCpuTimeId => ClockBase::Monotonic,
         // `thread_cpu_nsleep` is `return -EINVAL`.
         ClockId::ClockThreadCpuTimeId => return Err(LxError::EINVAL),
@@ -575,23 +592,54 @@ pub fn timerfd_clock_base(clock: usize) -> crate::error::LxResult<ClockBase> {
     })
 }
 
-/// The timeline `timer_create(2)` counts `clock` on, or why it will not take
+/// What a POSIX timer counts on: a timeline the timer wheel fires it on, or
+/// a CPU clock, which no point in time fires.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum PosixTimerClock {
+    /// The wall or the monotonic timeline.
+    Base(ClockBase),
+    /// A process's or a thread's CPU time.
+    Cpu(CpuClock),
+}
+
+/// The clock `timer_create(2)` counts `clock` on, or why it will not take
 /// that clock at all.
 ///
-/// Linux looks the clock up in `posix_clocks[]` and then asks it for a
-/// `timer_create`: an id it has never heard of is `EINVAL`, and one whose
-/// `k_clock` carries no `timer_create` — the raw and coarse clocks — is
-/// `EOPNOTSUPP`. The two CPU clocks do have one, unlike `nsleep`.
-pub fn posix_timer_clock_base(clock: usize) -> crate::error::LxResult<ClockBase> {
+/// Linux looks the clock up in `posix_clocks[]`, or for a negative id takes
+/// the CPU clocks or a dynamic one, and then asks it for a `timer_create`: an
+/// id it has never heard of is `EINVAL`, and one whose `k_clock` carries no
+/// `timer_create` -- the raw and coarse clocks, and a dynamic clock's fd
+/// (`clock_posix_dynamic`) -- is `EOPNOTSUPP`. The CPU clocks do have one,
+/// unlike `nsleep`, the ids `clock_getcpuclockid(3)` and
+/// `pthread_getcpuclockid(3)` hand back included.
+///
+/// The two CPU clocks used to be the monotonic timeline here ("this kernel
+/// does not account CPU time"), so a CPU-time timer fired on elapsed time,
+/// as busy as asleep, and the negative ids were `EINVAL`.
+pub fn posix_timer_clock(clock: usize) -> crate::error::LxResult<PosixTimerClock> {
     use crate::error::LxError;
-    Ok(match ClockId::from_raw(clock)? {
+    match CpuClock::from_raw(clock) {
+        Ok(Some(cpu)) => return Ok(PosixTimerClock::Cpu(cpu)),
+        Ok(None) => {}
+        Err(LxError::EBADF) => return Err(LxError::EOPNOTSUPP),
+        Err(e) => return Err(e),
+    }
+    Ok(PosixTimerClock::Base(match ClockId::from_raw(clock)? {
         ClockId::ClockRealTime => ClockBase::Wall,
         ClockId::ClockMonotonic => ClockBase::Monotonic,
-        // This kernel does not account CPU time, so these tick on elapsed
-        // time instead — the same substitution `clock_nanosleep_base` makes
-        // for the process clock and `sys_setitimer` for ITIMER_VIRTUAL and
-        // ITIMER_PROF.
-        ClockId::ClockProcessCpuTimeId | ClockId::ClockThreadCpuTimeId => ClockBase::Monotonic,
+        // Named by number above, before `ClockId` is asked.
+        ClockId::ClockProcessCpuTimeId => {
+            return Ok(PosixTimerClock::Cpu(CpuClock {
+                owner: CpuClockOwner::Process(0),
+                kind: CpuClockKind::Sched,
+            }))
+        }
+        ClockId::ClockThreadCpuTimeId => {
+            return Ok(PosixTimerClock::Cpu(CpuClock {
+                owner: CpuClockOwner::Thread(0),
+                kind: CpuClockKind::Sched,
+            }))
+        }
         // No `timer_create` in their `k_clock`, which is a different answer
         // from a clock Linux has never heard of.
         ClockId::ClockMonotonicRaw
@@ -603,7 +651,7 @@ pub fn posix_timer_clock_base(clock: usize) -> crate::error::LxResult<ClockBase>
         // `clock_tai` carries `common_timer_create`; the same offset remark
         // as in `clock_nanosleep_base` applies to an absolute expiry.
         ClockId::ClockTai => ClockBase::Wall,
-    })
+    }))
 }
 
 /// The point on the **monotonic** timeline a timer armed with `value` must
@@ -1643,29 +1691,48 @@ mod time_tests {
     #[test]
     fn a_posix_timer_may_only_be_made_on_a_clock_that_can_carry_one() {
         use crate::error::LxError;
+        use PosixTimerClock::{Base, Cpu};
+        let cpu = |owner, kind| Cpu(CpuClock { owner, kind });
         for (clock, base) in [
-            (0, ClockBase::Wall),
-            (1, ClockBase::Monotonic),
+            (0, Base(ClockBase::Wall)),
+            (1, Base(ClockBase::Monotonic)),
             // Unlike `nsleep`, both CPU clocks do carry a `timer_create`.
-            (2, ClockBase::Monotonic),
-            (3, ClockBase::Monotonic),
-            (7, ClockBase::Monotonic),
-            (8, ClockBase::Wall),
-            (9, ClockBase::Monotonic),
-            (11, ClockBase::Wall), // CLOCK_TAI: `common_timer_create`
+            (2, cpu(CpuClockOwner::Process(0), CpuClockKind::Sched)),
+            (3, cpu(CpuClockOwner::Thread(0), CpuClockKind::Sched)),
+            (7, Base(ClockBase::Monotonic)),
+            (8, Base(ClockBase::Wall)),
+            (9, Base(ClockBase::Monotonic)),
+            (11, Base(ClockBase::Wall)), // CLOCK_TAI: `common_timer_create`
+            // `clock_getcpuclockid(42)`: `MAKE_PROCESS_CPUCLOCK(42, SCHED)`.
+            (
+                (!42i32 << 3 | 2) as usize,
+                cpu(CpuClockOwner::Process(42), CpuClockKind::Sched),
+            ),
+            // `MAKE_THREAD_CPUCLOCK(43, VIRT)`.
+            (
+                (!43i32 << 3 | 4 | 1) as usize,
+                cpu(CpuClockOwner::Thread(43), CpuClockKind::Virt),
+            ),
         ] {
-            assert_eq!(posix_timer_clock_base(clock), Ok(base), "clock {}", clock);
+            assert_eq!(posix_timer_clock(clock), Ok(base), "clock {}", clock);
         }
-        for clock in [4, 5, 6] {
+        // The raw and coarse clocks, and `CLOCKFD`: a dynamic clock carries
+        // no `timer_create` either.
+        for clock in [4, 5, 6, (!3i32 << 3 | 3) as usize] {
             assert_eq!(
-                posix_timer_clock_base(clock),
+                posix_timer_clock(clock),
                 Err(LxError::EOPNOTSUPP),
                 "clock {}",
                 clock
             );
         }
-        assert_eq!(posix_timer_clock_base(10), Err(LxError::EINVAL));
-        assert_eq!(posix_timer_clock_base(NEG_ONE), Err(LxError::EINVAL));
+        assert_eq!(posix_timer_clock(10), Err(LxError::EINVAL));
+        assert_eq!(posix_timer_clock(NEG_ONE), Err(LxError::EINVAL));
+        // A thread clock of the fourth kind: `pid_for_clock`'s EINVAL.
+        assert_eq!(
+            posix_timer_clock((!43i32 << 3 | 4 | 3) as usize),
+            Err(LxError::EINVAL)
+        );
         // `clock_nanosleep` is the one that says EINVAL for the thread CPU
         // clock; the two answers are different on purpose.
         assert_eq!(clock_nanosleep_base(3), Err(LxError::EINVAL));
@@ -1765,7 +1832,10 @@ mod time_tests {
     #[test]
     fn boot_time_is_monotonic_time_in_this_kernel() {
         assert_eq!(timerfd_clock_base(7), Ok(ClockBase::Monotonic));
-        assert_eq!(posix_timer_clock_base(7), Ok(ClockBase::Monotonic));
+        assert_eq!(
+            posix_timer_clock(7),
+            Ok(PosixTimerClock::Base(ClockBase::Monotonic))
+        );
         assert_eq!(clock_nanosleep_base(7), Ok(ClockBase::Monotonic));
     }
 }

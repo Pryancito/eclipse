@@ -38,14 +38,14 @@ fn itimer_prof_goes_off_at_its_cpu_time_and_not_before() {
     assert_eq!(wheel, None, "a CPU timer was handed to the timer wheel");
     assert!(lp.itimers().cpu_armed());
 
-    run_cpu_timers(&proc);
+    run_cpu_timers(&thread);
     assert!(
         !took(&thread, Signal::SIGPROF),
         "no CPU used, and SIGPROF came"
     );
     thread.time_add(60_000_000);
     thread.sys_time_add(30_000_000);
-    run_cpu_timers(&proc);
+    run_cpu_timers(&thread);
     assert!(!took(&thread, Signal::SIGPROF), "SIGPROF at 90 ms of 100");
     assert_eq!(
         itimerval_from_slot(
@@ -59,7 +59,7 @@ fn itimer_prof_goes_off_at_its_cpu_time_and_not_before() {
     );
 
     thread.sys_time_add(10_000_000);
-    run_cpu_timers(&proc);
+    run_cpu_timers(&thread);
     assert!(
         took(&thread, Signal::SIGPROF),
         "no SIGPROF at 100 ms of CPU"
@@ -78,13 +78,13 @@ fn itimer_virtual_counts_user_time_only() {
     let now = itimer_now(&proc, ITIMER_VIRTUAL);
     set_itimer(lp.itimers(), ITIMER_VIRTUAL, ms(100), Duration::ZERO, now);
     thread.sys_time_add(500_000_000);
-    run_cpu_timers(&proc);
+    run_cpu_timers(&thread);
     assert!(
         !took(&thread, Signal::SIGVTALRM),
         "kernel time moved ITIMER_VIRTUAL"
     );
     thread.time_add(100_000_000);
-    run_cpu_timers(&proc);
+    run_cpu_timers(&thread);
     assert!(took(&thread, Signal::SIGVTALRM));
 }
 
@@ -156,23 +156,23 @@ fn rlimit_cpu_sends_a_sigxcpu_a_second_and_moves_the_soft_limit() {
     let soft = || lp.rlimit(RLIMIT_CPU, None, false).unwrap().cur;
 
     thread.time_add(900_000_000);
-    run_cpu_timers(&proc);
+    run_cpu_timers(&thread);
     assert!(
         !took(&thread, Signal::SIGXCPU),
         "SIGXCPU before the soft limit"
     );
     thread.time_add(300_000_000);
-    run_cpu_timers(&proc);
+    run_cpu_timers(&thread);
     assert!(took(&thread, Signal::SIGXCPU), "no SIGXCPU at 1.2 s of 1");
     assert_eq!(soft(), 2, "getrlimit does not show the next one");
-    run_cpu_timers(&proc);
+    run_cpu_timers(&thread);
     assert!(
         !took(&thread, Signal::SIGXCPU),
         "a second SIGXCPU for the same second"
     );
 
     thread.sys_time_add(1_000_000_000);
-    run_cpu_timers(&proc);
+    run_cpu_timers(&thread);
     assert!(
         took(&thread, Signal::SIGXCPU),
         "kernel time is CPU time too"
@@ -190,7 +190,7 @@ fn rlimit_cpu_kills_at_the_hard_limit() {
         .unwrap();
     lp.itimers().watch_cpu_limit();
     thread.time_add(2_000_000_000);
-    run_cpu_timers(&proc);
+    run_cpu_timers(&thread);
     let killed = matches!(proc.status(), Status::Exited(_)) || took(&thread, Signal::SIGKILL);
     assert!(killed, "2 s of CPU against a hard limit of 2, and alive");
     assert!(
@@ -209,4 +209,295 @@ fn a_fork_watches_the_cpu_limit_it_inherits() {
     let child = Itimers::forked(&limits);
     assert!(child.cpu_armed());
     assert!(child.lock().iter().all(|slot| slot.deadline.is_none()));
+}
+
+/// A `timer_create(2)` timer on `clock`, owned by `owner`, disarmed.
+fn a_cpu_timer(owner: KoID, clock: CpuClock, notify: TimerNotify) -> usize {
+    let id = NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed);
+    POSIX_TIMERS.lock().insert(
+        id,
+        PosixTimer {
+            owner,
+            notify,
+            clock: PosixTimerClock::Cpu(clock),
+            interval: Duration::ZERO,
+            next: Duration::ZERO,
+            generation: 0,
+            overrun_last: 0,
+        },
+    );
+    id
+}
+
+fn process_clock(proc: &Process) -> CpuClock {
+    CpuClock {
+        owner: CpuClockOwner::Process(proc.id() as usize),
+        kind: CpuClockKind::Sched,
+    }
+}
+
+/// `timer_settime` on CPU timer `id`, as `cpu_timer_settime` does it.
+fn arm(
+    proc: &Arc<Process>,
+    id: usize,
+    init: Duration,
+    interval: Duration,
+    abs: bool,
+) -> ITimerSpec {
+    let clock = match POSIX_TIMERS.lock()[&id].clock {
+        PosixTimerClock::Cpu(clock) => clock,
+        PosixTimerClock::Base(_) => unreachable!(),
+    };
+    let (target, now) = cpu_timer_target(proc, clock).expect("the clock's task is gone");
+    set_cpu_timer(id, proc.id(), &target, now, abs, init, interval).unwrap()
+}
+
+/// `timer_gettime`'s `it_value`.
+fn left(proc: &Arc<Process>, id: usize) -> Duration {
+    let PosixTimerClock::Cpu(clock) = POSIX_TIMERS.lock()[&id].clock else {
+        unreachable!()
+    };
+    let (_, now) = cpu_timer_target(proc, clock).unwrap();
+    timespec_to_duration(cpu_timer_spec(&POSIX_TIMERS.lock()[&id], now).value)
+}
+
+#[test]
+fn a_timer_on_the_process_clock_goes_off_at_its_cpu_time_and_not_before() {
+    let (proc, thread) = a_process(45_145);
+    let id = a_cpu_timer(
+        proc.id(),
+        process_clock(&proc),
+        TimerNotify::SIGALRM_TO_PROCESS,
+    );
+    arm(&proc, id, ms(100), Duration::ZERO, false);
+    assert!(proc.linux().itimers().posix_cpu_armed());
+
+    run_cpu_timers(&thread);
+    assert!(
+        !took(&thread, Signal::SIGALRM),
+        "no CPU used, and it went off"
+    );
+    thread.time_add(60_000_000);
+    thread.sys_time_add(30_000_000);
+    run_cpu_timers(&thread);
+    assert!(
+        !took(&thread, Signal::SIGALRM),
+        "it went off at 90 ms of 100"
+    );
+    assert_eq!(left(&proc, id), ms(10), "timer_gettime: 10 ms left");
+
+    thread.time_add(10_000_000);
+    run_cpu_timers(&thread);
+    let info = thread.lock_linux().take_siginfo(Signal::SIGALRM);
+    assert!(
+        info == SigInfo::timer(Signal::SIGALRM, id as i32, 0, 0),
+        "no SI_TIMER SIGALRM at 100 ms of CPU"
+    );
+    assert_eq!(left(&proc, id), Duration::ZERO, "a one-shot left armed");
+    assert!(
+        !proc.linux().itimers().posix_cpu_armed(),
+        "nothing left, and still looked at"
+    );
+    drop_posix_timers_of(proc.id());
+}
+
+/// The process clock is every thread's time together, whichever thread
+/// comes back to find the timer due.
+#[test]
+fn a_timer_on_the_process_clock_counts_every_thread() {
+    let (proc, first) = a_process(45_155);
+    let second = Thread::create_linux(&proc).unwrap();
+    let id = a_cpu_timer(
+        proc.id(),
+        process_clock(&proc),
+        TimerNotify::SIGALRM_TO_PROCESS,
+    );
+    arm(&proc, id, ms(100), Duration::ZERO, false);
+    first.time_add(60_000_000);
+    second.time_add(60_000_000);
+    run_cpu_timers(&second);
+    assert_eq!(
+        left(&proc, id),
+        Duration::ZERO,
+        "120 ms between two threads did not reach 100"
+    );
+    let pending = took(&first, Signal::SIGALRM) | took(&second, Signal::SIGALRM);
+    assert!(pending, "no SIGALRM");
+    drop_posix_timers_of(proc.id());
+}
+
+/// A thread's clock is its own time: another thread's running neither
+/// moves it nor takes the timer off the list to look at.
+#[test]
+fn a_timer_on_a_thread_clock_counts_that_thread_alone() {
+    let (proc, mine) = a_process(45_146);
+    let other = Thread::create_linux(&proc).unwrap();
+    let clock = CpuClock {
+        owner: CpuClockOwner::Thread(mine.id() as usize),
+        kind: CpuClockKind::Sched,
+    };
+    // Go's profiler: SIGPROF to the very thread whose clock it is.
+    let notify = TimerNotify {
+        signo: Signal::SIGPROF as usize,
+        value: 7,
+        thread: Some(mine.id()),
+    };
+    let id = a_cpu_timer(proc.id(), clock, notify);
+    arm(&proc, id, ms(10), ms(10), false);
+
+    other.time_add(1_000_000_000);
+    run_cpu_timers(&other);
+    assert!(
+        !took(&mine, Signal::SIGPROF),
+        "another thread's second of CPU"
+    );
+    assert!(!took(&other, Signal::SIGPROF));
+    assert!(
+        proc.linux().itimers().posix_cpu_armed(),
+        "the other thread's look stopped the timer being looked at"
+    );
+    run_cpu_timers(&mine);
+    assert!(
+        !took(&mine, Signal::SIGPROF),
+        "no CPU of its own, and it went off"
+    );
+
+    mine.time_add(10_000_000);
+    run_cpu_timers(&mine);
+    assert!(
+        took(&mine, Signal::SIGPROF),
+        "no SIGPROF at 10 ms of its CPU"
+    );
+    assert!(
+        !took(&other, Signal::SIGPROF),
+        "the signal went to the other thread"
+    );
+    assert_eq!(left(&proc, id), ms(10), "the period did not start again");
+    drop_posix_timers_of(proc.id());
+}
+
+/// `bump_cpu_timer`: one signal for a timer that fell behind, the periods it
+/// skipped in its overrun count, and the next expiry past the clock.
+#[test]
+fn a_periodic_cpu_timer_that_fell_behind_goes_off_once_with_an_overrun() {
+    let (proc, thread) = a_process(45_147);
+    let id = a_cpu_timer(
+        proc.id(),
+        process_clock(&proc),
+        TimerNotify::SIGALRM_TO_PROCESS,
+    );
+    arm(&proc, id, ms(10), ms(10), false);
+    thread.time_add(35_000_000);
+    run_cpu_timers(&thread);
+    let info = thread.lock_linux().take_siginfo(Signal::SIGALRM);
+    assert!(
+        info == SigInfo::timer(Signal::SIGALRM, id as i32, 2, 0),
+        "not one SIGALRM with 2 overruns for the expiries at 10, 20 and 30 ms"
+    );
+    assert_eq!(POSIX_TIMERS.lock()[&id].overrun_last, 2, "timer_getoverrun");
+    assert_eq!(left(&proc, id), ms(5), "next expiry not at 40 ms");
+    run_cpu_timers(&thread);
+    assert!(
+        !took(&thread, Signal::SIGALRM),
+        "a second signal for the same expiries"
+    );
+    drop_posix_timers_of(proc.id());
+}
+
+/// `TIMER_ABSTIME` on a CPU clock is a reading of that clock; one already
+/// gone by goes off at once (`cpu_timer_settime` looks right after arming),
+/// and `timer_gettime` says a due timer is about to go off, not disarmed.
+#[test]
+fn an_absolute_cpu_expiry_is_a_reading_of_the_clock() {
+    let (proc, thread) = a_process(45_148);
+    thread.time_add(20_000_000);
+    let id = a_cpu_timer(
+        proc.id(),
+        process_clock(&proc),
+        TimerNotify::SIGALRM_TO_PROCESS,
+    );
+    arm(&proc, id, ms(50), Duration::ZERO, true);
+    assert_eq!(
+        left(&proc, id),
+        ms(30),
+        "an absolute 50 ms read as a length"
+    );
+
+    let old = arm(&proc, id, ms(5), Duration::ZERO, true);
+    assert_eq!(timespec_to_duration(old.value), ms(30));
+    assert_eq!(
+        left(&proc, id),
+        Duration::from_nanos(1),
+        "a due timer reads as disarmed"
+    );
+    run_cpu_timers(&thread);
+    assert!(took(&thread, Signal::SIGALRM), "a past expiry did not fire");
+    drop_posix_timers_of(proc.id());
+}
+
+/// A timer may watch another process's clock (`clock_getcpuclockid`): that
+/// process running moves it, and the signal goes to the timer's owner.
+#[test]
+fn a_timer_on_another_process_clock_signals_its_owner() {
+    let (owner, owner_thread) = a_process(45_149);
+    let (watched, worker) = a_process(45_150);
+    let id = a_cpu_timer(
+        owner.id(),
+        process_clock(&watched),
+        TimerNotify::SIGALRM_TO_PROCESS,
+    );
+    let (target, _) = cpu_timer_target(&owner, process_clock(&watched)).unwrap();
+    assert_eq!(target.id(), watched.id());
+    arm(&owner, id, ms(10), Duration::ZERO, false);
+    assert!(watched.linux().itimers().posix_cpu_armed());
+    assert!(!owner.linux().itimers().posix_cpu_armed());
+
+    owner_thread.time_add(50_000_000);
+    run_cpu_timers(&owner_thread);
+    assert!(
+        !took(&owner_thread, Signal::SIGALRM),
+        "the owner's own CPU moved it"
+    );
+    worker.time_add(10_000_000);
+    run_cpu_timers(&worker);
+    assert!(
+        took(&owner_thread, Signal::SIGALRM),
+        "the owner got nothing"
+    );
+    assert!(
+        !took(&worker, Signal::SIGALRM),
+        "the watched process got it"
+    );
+    drop_posix_timers_of(owner.id());
+}
+
+/// `pid_for_clock` for a timer: a thread clock names a thread of the
+/// caller's own process, and a clock whose task is gone reads as nothing
+/// (`timer_settime`'s ESRCH).
+#[test]
+fn a_cpu_clock_names_a_live_task() {
+    let (proc, _thread) = a_process(45_151);
+    let (other, other_thread) = a_process(45_152);
+    let theirs = CpuClock {
+        owner: CpuClockOwner::Thread(other_thread.id() as usize),
+        kind: CpuClockKind::Sched,
+    };
+    assert!(cpu_timer_target(&other, theirs).is_some());
+    assert!(
+        cpu_timer_target(&proc, theirs).is_none(),
+        "a thread of another process"
+    );
+    let nobody = CpuClock {
+        owner: CpuClockOwner::Process(45_153),
+        kind: CpuClockKind::Sched,
+    };
+    assert!(cpu_timer_target(&proc, nobody).is_none());
+    let (dead, _) = a_process(45_154);
+    let clock = process_clock(&dead);
+    assert!(cpu_timer_target(&proc, clock).is_some());
+    dead.exit(0);
+    assert!(
+        cpu_timer_target(&proc, clock).is_none(),
+        "a process that has exited"
+    );
 }

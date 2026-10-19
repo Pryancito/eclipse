@@ -150,6 +150,10 @@
 //              sleeps and go off at 100 ms of its CPU time, every 20 ms of it
 //              with an interval; RLIMIT_CPU sends SIGXCPU at the soft limit,
 //              which moves up a second, and SIGKILL at the hard one.
+//   cpuclock   a `timer_create` timer on a CPU clock counts that clock: the
+//              process's, a thread's own, another thread's and another
+//              process's (`pthread_getcpuclockid`, `clock_getcpuclockid`);
+//              asleep it waits, an absolute expiry gone by fires at once.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -2169,6 +2173,214 @@ static void sec_cputimer(void) {
     munmap((void *)g_xcpu, 4096);
 }
 
+// ---------------------------------------------------------------- cpuclock
+
+static volatile sig_atomic_t g_clk_ticks;
+static volatile long g_clk_at;  // what `g_clk_watched` read at the first
+static volatile int g_clk_code, g_clk_value;
+static clockid_t g_clk_watched;
+
+static void on_clk(int sig, siginfo_t *si, void *uc) {
+    (void)sig;
+    (void)uc;
+    if (g_clk_ticks++ == 0) {
+        g_clk_at = clock_ms(g_clk_watched);
+        g_clk_code = si->si_code;
+        g_clk_value = si->si_value.sival_int;
+    }
+}
+
+// A timer on `clock` in `*t` that sends SIGUSR2 with `value`; whether
+// timer_create took it, with errno set if not. (Linux numbers a process's
+// timers from 0, so the id itself cannot say.)
+static int clk_timer(clockid_t clock, int value, timer_t *t) {
+    struct sigevent ev;
+    memset(&ev, 0, sizeof ev);
+    ev.sigev_notify = SIGEV_SIGNAL;
+    ev.sigev_signo = SIGUSR2;
+    ev.sigev_value.sival_int = value;
+    return timer_create(clock, &ev, t) == 0;
+}
+
+static void clk_arm(timer_t t, long first_ms, long every_ms) {
+    struct itimerspec it = {{every_ms / 1000, (every_ms % 1000) * 1000000L},
+                            {first_ms / 1000, (first_ms % 1000) * 1000000L}};
+    timer_settime(t, 0, &it, NULL);
+}
+
+static long clk_left_ms(timer_t t) {
+    struct itimerspec it;
+    timer_gettime(t, &it);
+    return it.it_value.tv_sec * 1000L + it.it_value.tv_nsec / 1000000;
+}
+
+// Work in user mode until the calling thread has used `cpu_ms` of CPU or
+// `wall_ms` of wall time has gone by.
+static void clk_burn(long cpu_ms, long wall_ms) {
+    long cpu0 = clock_ms(CLOCK_THREAD_CPUTIME_ID), end = clock_ms(CLOCK_MONOTONIC) + wall_ms;
+    while (clock_ms(CLOCK_THREAD_CPUTIME_ID) - cpu0 < cpu_ms && clock_ms(CLOCK_MONOTONIC) < end) {
+        for (volatile int i = 0; i < 200000; i++) {
+        }
+    }
+}
+
+// Work until `ticks` signals have come, or 3 s of wall time have gone by.
+static void clk_burn_until(int ticks) {
+    long end = clock_ms(CLOCK_MONOTONIC) + 3000;
+    while (g_clk_ticks < ticks && clock_ms(CLOCK_MONOTONIC) < end) {
+        for (volatile int i = 0; i < 200000; i++) {
+        }
+    }
+}
+
+static void *clk_worker(void *arg) {
+    clk_burn((long)arg, 5000);
+    return NULL;
+}
+
+// Watch `clock` with a fresh 100 ms timer: nothing while `idle` runs, then
+// one SI_TIMER with the timer's value once the clock has moved 100 ms.
+static void clk_watch(clockid_t clock, const char *name, void (*idle)(void), void (*busy)(void)) {
+    char what[64];
+    g_clk_watched = clock;
+    g_clk_ticks = 0;
+    timer_t t;
+    int made = clk_timer(clock, 0x55, &t);
+    snprintf(what, sizeof what, "%s: timer_create", name);
+    check(made, what, "%s", made ? "" : strerror(errno));
+    if (!made) return;
+    clk_arm(t, 100, 0);
+    long start = clock_ms(clock);
+    // The clock's owner does a little work of its own meanwhile (a sleep, a
+    // thread made and joined), and under an emulator that can be tens of
+    // ms of kernel time: the vCPU is preempted inside a syscall. So the
+    // check is that the timer moved by what the owner itself used, as
+    // getrusage counts it, within 10 ms, and not by the 300 ms someone
+    // else used, which would have fired it.
+    int who = clock == CLOCK_THREAD_CPUTIME_ID ? RUSAGE_THREAD : RUSAGE_SELF;
+    struct rusage r0, r1;
+    getrusage(who, &r0);
+    idle();
+    getrusage(who, &r1);
+    long left = clk_left_ms(t);
+    struct timeval zero = {0, 0}, du, ds;
+    timersub(&r1.ru_utime, &r0.ru_utime, &du);
+    timersub(&r1.ru_stime, &r0.ru_stime, &ds);
+    long user = ms_of(&du, &zero), sys = ms_of(&ds, &zero);
+    snprintf(what, sizeof what, "%s: idle, it waits", name);
+    check(g_clk_ticks == 0 && labs(100 - left - (user + sys)) <= 10, what,
+          "%d signal(s), %ld ms left, its own user %ld + sys %ld ms", (int)g_clk_ticks, left, user,
+          sys);
+    busy();
+    snprintf(what, sizeof what, "%s: 100 ms of it", name);
+    check(g_clk_ticks == 1 && g_clk_at - start >= 80 && g_clk_code == SI_TIMER &&
+              g_clk_value == 0x55,
+          what, "%d signal(s), at %ld ms, si_code %d, value %#x", (int)g_clk_ticks,
+          g_clk_at - start, g_clk_code, g_clk_value);
+    timer_delete(t);
+}
+
+static void clk_sleep(void) { sleep_ms(300); }
+static void clk_until_one(void) { clk_burn_until(1); }
+
+// Another thread works 300 ms while this one waits for it.
+static void clk_other_works(void) {
+    pthread_t w;
+    if (pthread_create(&w, NULL, clk_worker, (void *)300L) == 0) pthread_join(w, NULL);
+}
+
+static pthread_t g_clk_worker;
+static void clk_join_worker(void) { pthread_join(g_clk_worker, NULL); }
+
+static pid_t g_clk_child;
+static void clk_wait_for_one(void) {
+    long end = clock_ms(CLOCK_MONOTONIC) + 3500;
+    while (g_clk_ticks == 0 && clock_ms(CLOCK_MONOTONIC) < end) sleep_ms(10);
+}
+
+static void sec_cpuclock(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_clk;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGUSR2, &sa, NULL);
+
+    clk_watch(CLOCK_PROCESS_CPUTIME_ID, "the process clock", clk_sleep, clk_until_one);
+    // The caller's own thread clock: another thread's work does not move it.
+    clk_watch(CLOCK_THREAD_CPUTIME_ID, "this thread's clock", clk_other_works, clk_until_one);
+
+    // An interval goes on counting CPU time: every 20 ms over 300 ms of it.
+    timer_t t;
+    clk_timer(CLOCK_PROCESS_CPUTIME_ID, 1, &t);
+    g_clk_watched = CLOCK_PROCESS_CPUTIME_ID;
+    g_clk_ticks = 0;
+    clk_arm(t, 20, 20);
+    clk_burn(300, 3000);
+    clk_arm(t, 0, 0);
+    check(g_clk_ticks >= 8 && g_clk_ticks <= 20, "every 20 ms of CPU", "%d in 300 ms of CPU",
+          (int)g_clk_ticks);
+
+    // TIMER_ABSTIME is a reading of the clock, and one gone by fires before
+    // timer_settime returns.
+    g_clk_ticks = 0;
+    struct itimerspec past = {{0, 0}, {0, 1}};
+    int r = timer_settime(t, TIMER_ABSTIME, &past, NULL);
+    check(r == 0 && g_clk_ticks == 1, "an absolute expiry gone by: at once", "ret %d, %d signal(s)",
+          r, (int)g_clk_ticks);
+    timer_delete(t);
+
+    // Another thread's clock, as pthread_getcpuclockid names it: its work
+    // moves it while this thread waits.
+    clockid_t cid;
+    if (pthread_create(&g_clk_worker, NULL, clk_worker, (void *)300L) == 0 &&
+        pthread_getcpuclockid(g_clk_worker, &cid) == 0) {
+        g_clk_watched = cid;
+        g_clk_ticks = 0;
+        int made = clk_timer(cid, 0x55, &t);
+        check(made, "another thread's clock: timer_create", "%s", made ? "" : strerror(errno));
+        if (made) clk_arm(t, 100, 0);
+        long start = clock_ms(cid);
+        clk_join_worker();
+        check(g_clk_ticks == 1 && g_clk_at - start >= 80, "another thread's clock: its 100 ms",
+              "%d signal(s), at %ld ms of it", (int)g_clk_ticks, g_clk_at - start);
+        if (made) timer_delete(t);
+    }
+
+    // Another process's clock, as clock_getcpuclockid names it: the signal
+    // comes here, at the child's 100 ms of CPU, none of it while it sleeps.
+    g_clk_child = fork();
+    if (g_clk_child == 0) {
+        sleep_ms(300);
+        clk_burn(3000, 4000);
+        _exit(0);
+    }
+    if (clock_getcpuclockid(g_clk_child, &cid) == 0) {
+        g_clk_watched = cid;
+        g_clk_ticks = 0;
+        int made = clk_timer(cid, 0x55, &t);
+        check(made, "a child's clock: timer_create", "%s", made ? "" : strerror(errno));
+        if (made) clk_arm(t, 100, 0);
+        sleep_ms(200);
+        int asleep = g_clk_ticks;
+        clk_wait_for_one();
+        long at = g_clk_at;
+        check(asleep == 0 && g_clk_ticks == 1 && at >= 80, "a child's clock: its 100 ms, here",
+              "%d while it slept, %d in all, at %ld ms of it", asleep, (int)g_clk_ticks, at);
+        if (made) timer_delete(t);
+    }
+    kill(g_clk_child, SIGKILL);
+    status_of(g_clk_child);
+
+    // A dynamic clock (a PTP device's fd) carries no timer_create:
+    // FD_TO_CLOCKID(0) is -5.
+    timer_t none;
+    errno = 0;
+    r = timer_create((clockid_t)-5, NULL, &none);
+    check(r == -1 && errno == EOPNOTSUPP, "a dynamic clock: EOPNOTSUPP", "ret %d errno %d", r,
+          errno);
+    signal(SIGUSR2, SIG_DFL);
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -2194,6 +2406,7 @@ static const struct {
     {"cputime", "what getrusage, times, wait4 and the CPU clocks count", sec_cputime},
     {"fsize", "RLIMIT_FSIZE holds every write to a file, with SIGXFSZ", sec_fsize},
     {"cputimer", "ITIMER_VIRTUAL, ITIMER_PROF and RLIMIT_CPU count CPU time", sec_cputimer},
+    {"cpuclock", "a timer_create timer on a CPU clock counts that clock", sec_cpuclock},
 };
 
 int main(int argc, char **argv) {

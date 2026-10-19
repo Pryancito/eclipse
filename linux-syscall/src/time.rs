@@ -5,6 +5,8 @@ use crate::outparams::commit_and_report_old;
 use crate::Syscall;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
@@ -12,7 +14,7 @@ use kernel_hal::{user::UserInOutPtr, user::UserInPtr, user::UserOutPtr};
 use lazy_static::lazy_static;
 use linux_object::error::{LxError, SysResult};
 use linux_object::process::ProcessExt;
-use linux_object::process::{RLimit, CAP_SYS_TIME, RLIMIT_CPU, RLIM_INFINITY};
+use linux_object::process::{LinuxProcess, RLimit, CAP_SYS_TIME, RLIMIT_CPU, RLIM_INFINITY};
 use linux_object::signal::{SigInfo, Signal};
 use linux_object::thread::ThreadExt;
 use linux_object::time::*;
@@ -892,7 +894,10 @@ impl Syscall<'_> {
     /// SIGALRM, `SIGEV_NONE` delivers no signal. The new timer id is written to
     /// `timerid` (an `int`, the kernel's `timer_t`).
     pub fn sys_timer_create(&self, clockid: usize, sevp: usize, timerid: usize) -> SysResult {
-        let clock = posix_timer_clock_base(clockid)?;
+        let clock = match posix_timer_clock(clockid)? {
+            PosixTimerClock::Cpu(cpu) => PosixTimerClock::Cpu(self.cpu_timer_clock(cpu)?),
+            base => base,
+        };
         let notify = if sevp == 0 {
             TimerNotify::SIGALRM_TO_PROCESS
         } else {
@@ -952,6 +957,12 @@ impl Syscall<'_> {
         let abs = timer_settime_abs(flags)?;
         let interval = timespec_to_duration(spec.interval);
         let init = timespec_to_duration(spec.value);
+        let base = match posix_timer_clock_of(id, owner)? {
+            PosixTimerClock::Base(base) => base,
+            PosixTimerClock::Cpu(cpu) => {
+                return self.cpu_timer_settime(id, cpu, abs, init, interval, &mut old_value)
+            }
+        };
         // Both clocks read before the lock, so the deadline arithmetic below
         // happens with the map held and no HAL call under it.
         let now = kernel_hal::timer::timer_now();
@@ -978,7 +989,7 @@ impl Syscall<'_> {
                 // `init` is a point on the timer's OWN clock when
                 // TIMER_ABSTIME is set, and the kernel timer only takes
                 // monotonic deadlines.
-                let deadline = timer_arm_deadline(t.clock, abs, init, now, now_wall);
+                let deadline = timer_arm_deadline(base, abs, init, now, now_wall);
                 t.next = deadline;
                 Some((deadline, t.generation))
             };
@@ -998,6 +1009,23 @@ impl Syscall<'_> {
     /// `timer_gettime`: report the time until next expiration and the interval.
     pub fn sys_timer_gettime(&self, id: usize, curr_value: usize) -> SysResult {
         let owner = self.zircon_process().id();
+        if let PosixTimerClock::Cpu(cpu) = posix_timer_clock_of(id, owner)? {
+            // `posix_cpu_timer_get`: all zeros once the task is gone.
+            let out = match cpu_timer_target(self.zircon_process(), cpu) {
+                Some((_, now)) => {
+                    let timers = POSIX_TIMERS.lock();
+                    let t = timers
+                        .get(&id)
+                        .filter(|t| t.owner == owner)
+                        .ok_or(LxError::EINVAL)?;
+                    cpu_timer_spec(t, now)
+                }
+                None => ITimerSpec::default(),
+            };
+            let mut p: UserOutPtr<ITimerSpec> = curr_value.into();
+            p.write(out)?;
+            return Ok(0);
+        }
         let now = kernel_hal::timer::timer_now();
         let out = {
             let timers = POSIX_TIMERS.lock();
@@ -1042,6 +1070,138 @@ impl Syscall<'_> {
             Some(t) if t.owner == owner => Ok(t.overrun_last.min(DELAYTIMER_MAX) as usize),
             _ => Err(LxError::EINVAL),
         }
+    }
+}
+
+impl Syscall<'_> {
+    /// Whose CPU clock a timer on `clock` counts, by id, looked up once, at
+    /// `timer_create` (`posix_cpu_timer_create` -> `pid_for_clock`): a
+    /// thread clock names a thread of the caller's own process, and a
+    /// process clock any process, by pid.
+    fn cpu_timer_clock(&self, clock: CpuClock) -> Result<CpuClock, LxError> {
+        let proc = self.zircon_process();
+        let owner = match clock.owner {
+            CpuClockOwner::Thread(0) => CpuClockOwner::Thread(self.thread.id() as usize),
+            CpuClockOwner::Process(0) => CpuClockOwner::Process(proc.id() as usize),
+            owner => owner,
+        };
+        let cpu = CpuClock {
+            owner,
+            kind: clock.kind,
+        };
+        cpu_timer_target(proc, cpu).ok_or(LxError::EINVAL)?;
+        Ok(cpu)
+    }
+
+    /// `timer_settime` on a CPU clock (`posix_cpu_timer_set`): the expiry
+    /// is a reading of that clock, and nothing arms the timer wheel; a
+    /// thread of the process whose clock it is looks at it each time it
+    /// comes back from user mode ([`run_cpu_timers`]). An expiry that has
+    /// already gone by fires before this returns.
+    fn cpu_timer_settime(
+        &self,
+        id: usize,
+        cpu: CpuClock,
+        abs: bool,
+        init: Duration,
+        interval: Duration,
+        old_value: &mut UserOutPtr<ITimerSpec>,
+    ) -> SysResult {
+        let owner = self.zircon_process().id();
+        let (target, now) = cpu_timer_target(self.zircon_process(), cpu).ok_or(LxError::ESRCH)?;
+        let old = set_cpu_timer(id, owner, &target, now, abs, init, interval)?;
+        commit_and_report_old(old, old_value, || Ok(()))?;
+        run_cpu_timers(self.thread);
+        Ok(0)
+    }
+}
+
+/// Point CPU timer `id` of `owner` at `init` on its clock, which belongs to
+/// `target` and reads `now` -- a length, or with `abs` a reading of that
+/// clock; zero disarms -- and then every `interval`; and say what it was.
+fn set_cpu_timer(
+    id: usize,
+    owner: KoID,
+    target: &Process,
+    now: Duration,
+    abs: bool,
+    init: Duration,
+    interval: Duration,
+) -> Result<ITimerSpec, LxError> {
+    let mut timers = POSIX_TIMERS.lock();
+    let t = timers
+        .get_mut(&id)
+        .filter(|t| t.owner == owner)
+        .ok_or(LxError::EINVAL)?;
+    let old = cpu_timer_spec(t, now);
+    t.generation += 1;
+    t.interval = interval;
+    t.next = match (init.is_zero(), abs) {
+        (true, _) => Duration::ZERO,
+        (false, true) => init,
+        (false, false) => now.saturating_add(init),
+    };
+    if !t.next.is_zero() {
+        if let Some(lp) = target.try_linux() {
+            lp.itimers().set_posix_cpu_armed(true);
+        }
+    }
+    Ok(old)
+}
+
+/// The clock POSIX timer `id` of `owner` counts on, or `EINVAL` if `owner`
+/// has no such timer.
+fn posix_timer_clock_of(id: usize, owner: KoID) -> Result<PosixTimerClock, LxError> {
+    POSIX_TIMERS
+        .lock()
+        .get(&id)
+        .filter(|t| t.owner == owner)
+        .map(|t| t.clock)
+        .ok_or(LxError::EINVAL)
+}
+
+/// The process whose time CPU clock `cpu` counts, and what the clock reads
+/// now; `None` once its task is gone. A thread clock names a thread of
+/// `caller`, the process that made the timer, and a process clock a live
+/// process.
+fn cpu_timer_target(caller: &Arc<Process>, cpu: CpuClock) -> Option<(Arc<Process>, Duration)> {
+    let (proc, (user, sys)) = match cpu.owner {
+        CpuClockOwner::Thread(tid) => {
+            let thread = caller
+                .get_child(tid as KoID)
+                .ok()?
+                .downcast_arc::<Thread>()
+                .ok()?;
+            (caller.clone(), thread_cpu_ns(&thread))
+        }
+        CpuClockOwner::Process(pid) => {
+            let proc = if pid as KoID == caller.id() {
+                caller.clone()
+            } else {
+                linux_object::process::find_process(pid as KoID)?
+            };
+            if !process_is_alive(proc.id()) {
+                return None;
+            }
+            let times = proc.cpu_time_ns();
+            (proc, times)
+        }
+    };
+    Some((proc, Duration::from_nanos(cpu.kind.value_ns(user, sys))))
+}
+
+/// A CPU timer as `timer_gettime` reports it with its clock at `now`
+/// (`__posix_cpu_timer_get`): one that is due and has not fired yet is
+/// "just about to expire", 1 ns, not a disarmed timer's zero.
+fn cpu_timer_spec(t: &PosixTimer, now: Duration) -> ITimerSpec {
+    let value = match t.next {
+        next if next.is_zero() => Duration::ZERO,
+        next if next > now => next - now,
+        _ => Duration::from_nanos(1),
+    };
+    ITimerSpec {
+        interval: TimeSpec::from_duration(t.interval),
+        value: TimeSpec::from_duration(value),
     }
 }
 
@@ -1131,15 +1291,17 @@ struct PosixTimer {
     owner: KoID,
     /// Where the expiry goes: signal, `si_value`, and which thread.
     notify: TimerNotify,
-    /// The timeline `timer_create`'s `clockid` names, which is what an
+    /// The clock `timer_create`'s `clockid` names, which is what an
     /// absolute `timer_settime` counts against. The id used to be dropped
     /// on the floor (`_clockid`), so a `CLOCK_REALTIME` timer armed with
     /// `TIMER_ABSTIME` got a monotonic deadline of seconds-since-1970 and
-    /// never fired.
-    clock: ClockBase,
+    /// never fired. A CPU clock's owner is a pid or a tid, never the 0 that
+    /// means the caller.
+    clock: PosixTimerClock,
     /// Period for a periodic timer; `ZERO` = one-shot.
     interval: Duration,
-    /// Absolute monotonic deadline of the next expiry; `ZERO` = disarmed.
+    /// The next expiry; `ZERO` = disarmed. An absolute monotonic deadline,
+    /// or on a CPU clock that clock's reading.
     next: Duration,
     /// Bumped by settime/delete to invalidate an already-scheduled one-shot
     /// (`timer_set` callbacks are not cancellable, so they check this).
@@ -1322,25 +1484,36 @@ fn set_itimer(
     (old, deadline.map(|deadline| (deadline, generation)))
 }
 
-/// `run_posix_cpu_timers()`, for the CPU timers a process has here:
-/// ITIMER_VIRTUAL, ITIMER_PROF and `RLIMIT_CPU`. A thread of `proc` runs it
-/// each time it comes back from user mode, which for one that makes no
-/// syscall is each tick of the timer interrupt -- what Linux checks them on
-/// too.
+/// `run_posix_cpu_timers()`: the CPU timers `thread` running has moved.
+/// It runs this each time it comes back from user mode, which for one that
+/// makes no syscall is each tick of the timer interrupt -- what Linux checks
+/// them on too.
+///
+/// Those of its process -- ITIMER_VIRTUAL, ITIMER_PROF and `RLIMIT_CPU` --
+/// and the POSIX timers on its process's CPU clock and on its own
+/// ([`run_posix_cpu_timers`]).
+pub fn run_cpu_timers(thread: &Thread) {
+    let proc = thread.proc();
+    let Some(lp) = proc.try_linux() else {
+        return;
+    };
+    let itimers = lp.itimers();
+    if itimers.cpu_armed() {
+        run_process_cpu_timers(proc, lp, itimers);
+    }
+    if itimers.posix_cpu_armed() {
+        run_posix_cpu_timers(proc, thread, itimers);
+    }
+}
+
+/// ITIMER_VIRTUAL, ITIMER_PROF and `RLIMIT_CPU` of `proc`.
 ///
 /// Both itimers counted on the wall clock, from the timer wheel, so a
 /// profiler's SIGPROF came as fast asleep as busy, and a process went on
 /// getting it while it waited. And `RLIMIT_CPU` was stored and nothing
 /// looked at it: no SIGXCPU at the soft limit, no SIGKILL at the hard one,
 /// so `ulimit -t` let a runaway loop run for ever.
-pub fn run_cpu_timers(proc: &Process) {
-    let Some(lp) = proc.try_linux() else {
-        return;
-    };
-    let itimers = lp.itimers();
-    if !itimers.cpu_armed() {
-        return;
-    }
+fn run_process_cpu_timers(proc: &Process, lp: &LinuxProcess, itimers: &Itimers) {
     let cpu = proc.cpu_time_ns();
     let mut due = [None; 3];
     {
@@ -1383,6 +1556,74 @@ pub fn run_cpu_timers(proc: &Process) {
             Some(info),
         );
     }
+}
+
+/// The POSIX timers on `proc`'s CPU clock and on `thread`'s
+/// (`check_thread_timers` and `check_process_timers` for `timer_create(2)`).
+/// Another thread's own timers wait for that thread to run, which is the
+/// only thing that moves its clock.
+///
+/// They counted on the monotonic clock, from the timer wheel: a timer on
+/// `CLOCK_PROCESS_CPUTIME_ID` or `CLOCK_THREAD_CPUTIME_ID` -- Go's CPU
+/// profiler arms one on each thread's clock -- went off as often asleep as
+/// busy.
+///
+/// The table is the whole system's, so the walk costs every timer in it;
+/// it is taken only while `proc` has one of these armed.
+fn run_posix_cpu_timers(proc: &Process, thread: &Thread, itimers: &Itimers) {
+    let pid = proc.id() as usize;
+    let tid = thread.id() as usize;
+    let (process_ns, thread_ns) = (proc.cpu_time_ns(), thread_cpu_ns(thread));
+    let mut due = Vec::new();
+    {
+        let mut timers = POSIX_TIMERS.lock();
+        let mut armed = false;
+        for (&id, t) in timers.iter_mut() {
+            let PosixTimerClock::Cpu(cpu) = t.clock else {
+                continue;
+            };
+            let (user, sys) = match cpu.owner {
+                CpuClockOwner::Process(p) if p == pid => process_ns,
+                CpuClockOwner::Thread(x) if x == tid => thread_ns,
+                // A thread clock is one of its timer's own process.
+                CpuClockOwner::Thread(_) if t.owner == proc.id() => {
+                    armed |= !t.next.is_zero();
+                    continue;
+                }
+                _ => continue,
+            };
+            let now = Duration::from_nanos(cpu.kind.value_ns(user, sys));
+            if let Some(overrun) = expire_cpu_posix_timer(t, now) {
+                due.push((id, t.owner, t.notify, overrun));
+            }
+            armed |= !t.next.is_zero();
+        }
+        itimers.set_posix_cpu_armed(armed);
+    }
+    for (id, owner, notify, overrun) in due {
+        if let Some((signal, info)) = posix_timer_expiry_signal(id, notify, overrun) {
+            deliver_timer_signal(owner, notify.thread, signal, info);
+        }
+    }
+}
+
+/// One look at CPU timer `t` whose clock reads `now`: the overrun count of
+/// its expiry if it has gone off, with a periodic one moved past `now`
+/// (`bump_cpu_timer`) and a one-shot disarmed.
+fn expire_cpu_posix_timer(t: &mut PosixTimer, now: Duration) -> Option<u32> {
+    if t.next.is_zero() || t.next > now {
+        return None;
+    }
+    let overrun = if t.interval.is_zero() {
+        t.next = Duration::ZERO;
+        0
+    } else {
+        let (next, overrun) = forward_periodic(t.next, t.interval, now);
+        t.next = next;
+        overrun
+    };
+    t.overrun_last = overrun;
+    Some(overrun)
 }
 
 /// One look at a CPU itimer slot whose clock reads `now`: whether it has
@@ -2625,7 +2866,7 @@ mod exec_timer_tests {
             PosixTimer {
                 owner,
                 notify: TimerNotify::SIGALRM_TO_PROCESS,
-                clock: ClockBase::Monotonic,
+                clock: PosixTimerClock::Base(ClockBase::Monotonic),
                 interval: Duration::from_secs(1),
                 next: Duration::from_secs(1),
                 generation: 0,
@@ -2690,7 +2931,7 @@ mod exec_timer_tests {
         let fresh = || PosixTimer {
             owner,
             notify: TimerNotify::SIGALRM_TO_PROCESS,
-            clock: ClockBase::Monotonic,
+            clock: PosixTimerClock::Base(ClockBase::Monotonic),
             interval: Duration::ZERO,
             next: Duration::ZERO,
             generation: 0,
@@ -2753,7 +2994,7 @@ mod exit_timer_tests {
             PosixTimer {
                 owner,
                 notify: TimerNotify::SIGALRM_TO_PROCESS,
-                clock: ClockBase::Monotonic,
+                clock: PosixTimerClock::Base(ClockBase::Monotonic),
                 interval: Duration::from_secs(1),
                 next: Duration::from_secs(1),
                 generation: 0,
@@ -2990,7 +3231,7 @@ mod overrun_tests {
             PosixTimer {
                 owner,
                 notify: TimerNotify::SIGALRM_TO_PROCESS,
-                clock: ClockBase::Monotonic,
+                clock: PosixTimerClock::Base(ClockBase::Monotonic),
                 interval: ms(10),
                 next: ms(1000),
                 generation: 0,
