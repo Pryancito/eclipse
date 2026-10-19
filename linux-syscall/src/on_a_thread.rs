@@ -26,12 +26,13 @@ static CALLS: Mutex<Vec<(KoID, Call)>> = Mutex::new(Vec::new());
 
 fn run_call(current: CurrentThread) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(async move {
+        // A thread the call itself started -- a `fork`'s child, a `clone`'s
+        // thread -- has nothing to run here, and ends as if it had exited.
         let call = {
             let mut calls = CALLS.lock().unwrap();
-            let at = calls
-                .iter()
-                .position(|(id, _)| *id == current.id())
-                .expect("a thread started with no call to make");
+            let Some(at) = calls.iter().position(|(id, _)| *id == current.id()) else {
+                return;
+            };
             calls.swap_remove(at).1
         };
         let syscall = Syscall {

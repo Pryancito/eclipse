@@ -158,6 +158,10 @@
 //              (ENOMEM), nor a 16 MiB malloc, a brk of 8 MiB, an mremap to
 //              16 MiB or an 8 MiB shmat; a MAP_FIXED over mapped pages and
 //              what munmap gave back fit.
+//   nproc      RLIMIT_NPROC holds a user of its own to 4 tasks: three
+//              children and then EAGAIN, for `fork` and `pthread_create`
+//              alike; a zombie counts until it is reaped; root, real or
+//              effective, forks at a limit of 0.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -2479,6 +2483,142 @@ static void sec_aslimit(void) {
     if (shm >= 0) shmctl(shm, IPC_RMID, NULL);
 }
 
+// ------------------------------------------------------------------ nproc
+
+// A uid nothing else on the machine runs as, so every task it has is one
+// this section made.
+#define NPROC_UID 45399
+
+static void *nproc_thread(void *arg) {
+    (void)arg;
+    return NULL;
+}
+
+// A child of the user that lives until the write end of `rel` is closed.
+static pid_t nproc_child(const int rel[2]) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        char c;
+        close(rel[1]);
+        while (read(rel[0], &c, 1) == -1 && errno == EINTR) {
+        }
+        _exit(0);
+    }
+    return pid;
+}
+
+// Children until a fork fails, at most `max`; the failure's errno in `err`.
+static int nproc_fill(const int rel[2], pid_t *kids, int max, int *err) {
+    int n = 0;
+    *err = 0;
+    while (n < max) {
+        pid_t pid = nproc_child(rel);
+        if (pid < 0) {
+            *err = errno;
+            break;
+        }
+        kids[n++] = pid;
+    }
+    return n;
+}
+
+static void nproc_as_user(void) {
+    int rel[2];
+    if (pipe(rel) != 0) {
+        check(0, "RLIMIT_NPROC: a pipe", "errno %d", errno);
+        return;
+    }
+    // Soft 4 under a hard 6, set as root; then all three ids are the user's.
+    struct rlimit lim = {4, 6};
+    int set = setrlimit(RLIMIT_NPROC, &lim);
+    int became = setresuid(NPROC_UID, NPROC_UID, NPROC_UID);
+    pid_t kids[16];
+    int err;
+    // This process is one task, so three children make four.
+    int first = nproc_fill(rel, kids, 8, &err), n = first;
+    int full_err = err;
+    pthread_t t;
+    int thread_err = pthread_create(&t, NULL, nproc_thread, NULL);
+    if (thread_err == 0) pthread_join(t, NULL);
+    // A zombie is still a task until it is reaped.
+    pid_t zombie_fork = -1, reaped_fork = -1;
+    int zombie_err = 0;
+    if (n > 0) {
+        siginfo_t si;
+        kill(kids[0], SIGKILL);
+        waitid(P_PID, (id_t)kids[0], &si, WEXITED | WNOWAIT);
+        errno = 0;
+        zombie_fork = nproc_child(rel);
+        zombie_err = errno;
+        if (zombie_fork > 0) kids[n++] = zombie_fork;
+        waitpid(kids[0], NULL, 0);
+        kids[0] = -1;
+        reaped_fork = nproc_child(rel);
+        if (reaped_fork > 0) kids[n++] = reaped_fork;
+    }
+    // It is the soft limit that is held: raised to the hard one, two more.
+    lim.rlim_cur = 6;
+    int raised = setrlimit(RLIMIT_NPROC, &lim);
+    int more = nproc_fill(rel, kids + n, 4, &err);
+    n += more;
+
+    close(rel[1]);
+    close(rel[0]);
+    for (int i = 0; i < n; i++)
+        if (kids[i] > 0) waitpid(kids[i], NULL, 0);
+
+    check(set == 0 && became == 0, "RLIMIT_NPROC: 4 for a user of its own",
+          "setrlimit %d setresuid %d", set, became);
+    check(first == 3 && full_err == EAGAIN, "RLIMIT_NPROC: 3 children, then EAGAIN",
+          "%d children, then errno %d", first, full_err);
+    check(thread_err == EAGAIN, "RLIMIT_NPROC: a thread is a task too", "pthread_create %d",
+          thread_err);
+    check(zombie_fork < 0 && zombie_err == EAGAIN, "RLIMIT_NPROC: a zombie still counts",
+          "fork %d errno %d", (int)zombie_fork, zombie_err);
+    check(reaped_fork > 0, "RLIMIT_NPROC: reaped, its room is back", "fork %d",
+          (int)reaped_fork);
+    check(raised == 0 && more == 2 && err == EAGAIN, "RLIMIT_NPROC: soft raised to 6, two more",
+          "%d more, then errno %d", more, err);
+}
+
+// Whether a fork goes through with RLIMIT_NPROC at 0 and these three ids.
+static int nproc_exempt(uid_t ruid, uid_t euid) {
+    struct rlimit zero = {0, 0};
+    if (setrlimit(RLIMIT_NPROC, &zero) != 0 || setresuid(ruid, euid, euid) != 0) return -1;
+    pid_t pid = fork();
+    if (pid == 0) _exit(0);
+    if (pid > 0) waitpid(pid, NULL, 0);
+    return pid > 0;
+}
+
+static void sec_nproc(void) {
+    int st = 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        g_fail = 0;
+        nproc_as_user();
+        fflush(stdout);
+        _exit(g_fail > 100 ? 100 : g_fail);
+    }
+    waitpid(pid, &st, 0);
+    g_fail += WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+
+    // Root, real or effective, is not held to it.
+    struct {
+        uid_t ruid, euid;
+        const char *what;
+    } exempt[] = {
+        {0, 0, "RLIMIT_NPROC: root forks at a limit of 0"},
+        {NPROC_UID, 0, "RLIMIT_NPROC: so does an effective root"},
+    };
+    for (size_t i = 0; i < sizeof exempt / sizeof exempt[0]; i++) {
+        pid = fork();
+        if (pid == 0) _exit(nproc_exempt(exempt[i].ruid, exempt[i].euid) == 1 ? 0 : 1);
+        waitpid(pid, &st, 0);
+        check(WIFEXITED(st) && WEXITSTATUS(st) == 0, exempt[i].what, "st=%#x", st);
+    }
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -2506,6 +2646,7 @@ static const struct {
     {"cputimer", "ITIMER_VIRTUAL, ITIMER_PROF and RLIMIT_CPU count CPU time", sec_cputimer},
     {"cpuclock", "a timer_create timer on a CPU clock counts that clock", sec_cpuclock},
     {"aslimit", "RLIMIT_AS holds mmap, brk, mremap and shmat", sec_aslimit},
+    {"nproc", "RLIMIT_NPROC holds fork and pthread_create", sec_nproc},
 };
 
 int main(int argc, char **argv) {
