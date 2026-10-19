@@ -35,6 +35,7 @@ fn on_the_default_policy() -> SchedFacts {
         rt_priority: 0,
         rlimit_nice: 0,
         rlimit_rtprio: 0,
+        reset_on_fork: false,
     }
 }
 
@@ -43,6 +44,7 @@ fn want(policy: u8, nice: i8, rt_priority: u8) -> SchedRequest {
         policy,
         nice,
         rt_priority,
+        reset_on_fork: false,
     }
 }
 
@@ -345,4 +347,40 @@ fn sched_deadline_is_privileged_outright() {
         ),
         Ok(())
     );
+}
+
+// ---- SCHED_RESET_ON_FORK ---------------------------------------------
+
+#[test]
+fn only_privilege_takes_reset_on_fork_off() {
+    let flagged = SchedFacts {
+        reset_on_fork: true,
+        ..on_the_default_policy()
+    };
+    let keep = SchedRequest {
+        reset_on_fork: true,
+        ..want(SCHED_NORMAL, 0, 0)
+    };
+    assert_eq!(
+        verdict(&flagged, &want(SCHED_NORMAL, 0, 0)),
+        Err(LxError::EPERM),
+        "a user took the flag off their own task"
+    );
+    assert_eq!(verdict(&flagged, &keep), Ok(()), "keeping it is free");
+    let root = creds(ROOT_UID, ROOT_UID);
+    assert_eq!(
+        LinuxProcess::may_set_scheduler(&root, &root, &flagged, &want(SCHED_NORMAL, 0, 0)),
+        Ok(())
+    );
+}
+
+#[test]
+fn putting_reset_on_fork_on_is_free() {
+    // It only ever gives something up: the children it would have had at
+    // this class get the default one instead.
+    let keep = SchedRequest {
+        reset_on_fork: true,
+        ..want(SCHED_BATCH, 0, 0)
+    };
+    assert_eq!(verdict(&on_the_default_policy(), &keep), Ok(()));
 }

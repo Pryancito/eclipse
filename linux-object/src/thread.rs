@@ -262,6 +262,7 @@ impl ThreadExt for Thread {
             self.sched_nice(),
             self.sched_rt_priority(),
         );
+        leader.set_sched_reset_on_fork(self.sched_reset_on_fork());
         Ok(leader)
     }
 

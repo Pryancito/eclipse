@@ -93,6 +93,20 @@ pub fn task_pid(raw: usize) -> LxResult<usize> {
     Ok(pid as usize)
 }
 
+/// The `unsigned int len` of `sched_getaffinity(2)`, against `cpus`, the
+/// mask of the CPUs there are. Linux refuses a buffer without a bit for
+/// every possible CPU (`len * BITS_PER_BYTE < nr_cpu_ids`) or that is not a
+/// whole number of `unsigned long`s, both `EINVAL`. Only a zero was refused
+/// here, and a 1-byte buffer got one byte of an 8-byte mask.
+pub fn getaffinity_len(raw: usize, cpus: u64) -> LxResult<usize> {
+    let len = raw as u32 as usize;
+    let nr_cpu_ids = (u64::BITS - cpus.leading_zeros()) as usize;
+    if len * 8 < nr_cpu_ids || !len.is_multiple_of(core::mem::size_of::<u64>()) {
+        return Err(LxError::EINVAL);
+    }
+    Ok(len)
+}
+
 /// `waitid(2)`'s `id` for `P_PID` and `P_PGID`: an `id_t` that
 /// `kernel_waitid` reads as a `pid_t`. For `P_PID` it must be positive
 /// (`upid <= 0` is `EINVAL`); for `P_PGID` zero means the caller's own
@@ -379,6 +393,45 @@ mod tests {
             assert_eq!(waitid_id(raw, false), Err(LxError::EINVAL), "{:#x}", raw);
             assert_eq!(waitid_id(raw, true), Err(LxError::EINVAL), "{:#x}", raw);
         }
+    }
+}
+
+#[cfg(test)]
+mod affinity_len_tests {
+    //! What `sched_getaffinity(2)` will write into.
+
+    use super::*;
+
+    #[test]
+    fn a_buffer_must_be_whole_longs() {
+        for len in [0, 1, 4, 7, 9, 12, 15] {
+            assert_eq!(
+                getaffinity_len(len, 0b1111),
+                Err(LxError::EINVAL),
+                "{}",
+                len
+            );
+        }
+        for len in [8, 16, 128] {
+            assert_eq!(getaffinity_len(len, 0b1111), Ok(len));
+        }
+    }
+
+    #[test]
+    fn a_buffer_must_have_a_bit_for_every_cpu() {
+        // Bit 63 set: CPU 63 exists, so 64 bits are needed, and 8 bytes are
+        // exactly that.
+        assert_eq!(getaffinity_len(8, 1 << 63), Ok(8));
+        // What counts is the highest CPU, not how many there are: one CPU
+        // numbered 9 needs ten bits, which no buffer of whole longs lacks,
+        // but a zero-length one does.
+        assert_eq!(getaffinity_len(0, 1 << 9), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn the_length_is_an_unsigned_int() {
+        assert_eq!(getaffinity_len(0x1_0000_0008, 0b1), Ok(8));
+        assert_eq!(getaffinity_len(0x1_0000_0001, 0b1), Err(LxError::EINVAL));
     }
 }
 
