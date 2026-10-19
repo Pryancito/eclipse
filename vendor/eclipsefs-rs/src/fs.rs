@@ -176,6 +176,65 @@ impl ScrubReport {
     }
 }
 
+/// What [`EclipseFS::repair`] found and changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepairReport {
+    /// The scrub repair starts with: bad copies rewritten from good ones,
+    /// and what has no good copy left.
+    pub scrub: ScrubReport,
+    /// Reference count ranges that were wrong (or missing, or extra).
+    pub refcounts_fixed: u64,
+    /// Blocks marked free while in use, or in use while nothing holds them.
+    pub bitmap_blocks_fixed: u64,
+    /// Items deleted: of inodes that do not exist, that do not decode, or
+    /// file extents that overlap, sit on metadata or belong to a special
+    /// file.
+    pub items_removed: u64,
+    /// Directory entries dropped (naming a missing inode, a second name of
+    /// a directory, a duplicate name).
+    pub entries_removed: u64,
+    /// `DIR_ITEM`, `INODE_REF` and `DIR_INDEX` items rewritten to agree.
+    pub entries_fixed: u64,
+    /// Inodes (and subvolume counters) whose link count, parent, size or
+    /// byte count was corrected.
+    pub inodes_fixed: u64,
+    /// Inodes linked into `lost+found` (no name left, or cut off by a
+    /// directory cycle).
+    pub lost_found: u64,
+    /// Data checksums dropped (no extent references the block) and
+    /// computed (a block that needs one had none).
+    pub csums_dropped: u64,
+    pub csums_added: u64,
+    /// Problems repair could not fix (orphans of an encrypted root, a
+    /// subvolume without its root directory).
+    pub unrepaired: u64,
+    /// What [`EclipseFS::check`] still reports after the repair (`None`:
+    /// the filesystem is consistent).
+    pub still_damaged: Option<&'static str>,
+}
+
+impl RepairReport {
+    /// Whether the repair changed anything.
+    pub fn changed(&self) -> bool {
+        self.scrub.repaired
+            + self.refcounts_fixed
+            + self.bitmap_blocks_fixed
+            + self.items_removed
+            + self.entries_removed
+            + self.entries_fixed
+            + self.inodes_fixed
+            + self.lost_found
+            + self.csums_dropped
+            + self.csums_added
+            > 0
+    }
+
+    /// Consistent after the repair, with every block readable.
+    pub fn is_clean(&self) -> bool {
+        self.still_damaged.is_none() && self.unrepaired == 0 && self.scrub.is_clean()
+    }
+}
+
 /// One subvolume or snapshot, from [`EclipseFS::list_subvolumes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubvolInfo {
@@ -843,12 +902,29 @@ impl EclipseFS {
     }
 
     /// Read every tree node and data block from the device and verify its
-    /// checksum (btrfs scrub, without repair: there is no second copy yet).
+    /// checksum (btrfs scrub). On a writable mount of a volume with DUP or
+    /// RAID copies, a bad copy is rewritten from a good one (counted in
+    /// [`ScrubReport::repaired`]); a block with no good copy is reported.
     /// Commits first on a writable mount. Needs format v0.4.
     pub fn scrub(&mut self) -> Result<ScrubReport> {
         match &mut self.driver {
             Driver::V3(_) => Err(Error::Unsupported("scrub needs format v0.4")),
             Driver::V4(fs) => fs.scrub(),
+        }
+    }
+
+    /// Repair what [`check`](Self::check) finds (`btrfs check --repair`,
+    /// `xfs_repair`), keeping every file it still can: scrub (copies from
+    /// mirrors), reference counts and bitmaps rebuilt from the trees, items
+    /// of missing inodes and bad entries dropped, name indexes rebuilt,
+    /// orphans linked into `lost+found` as `#<inode>`, counters recomputed,
+    /// stale checksums dropped and missing ones computed. Needs a writable
+    /// mount of format v0.4; changes go through normal commits, so a crash
+    /// leaves a consistent filesystem (run it again to finish).
+    pub fn repair(&mut self) -> Result<RepairReport> {
+        match &mut self.driver {
+            Driver::V3(_) => Err(Error::Unsupported("repair needs format v0.4")),
+            Driver::V4(fs) => fs.repair(),
         }
     }
 }

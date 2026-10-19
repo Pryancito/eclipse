@@ -114,25 +114,35 @@ impl CowFs {
     fn rebuild_groups(&mut self, which: &[usize]) -> Result<()> {
         let owned = self.owned_blocks()?;
         for &i in which {
-            let (count, kind) = {
-                let g = &self.sp.alloc.groups()[i];
-                (g.block_count, g.kind)
-            };
-            let start = i as u64 * GROUP_BLOCKS;
-            let mut g = AllocationGroup::new(i as u32, count);
-            g.kind = kind;
-            for (s, l) in owned.iter() {
-                let (from, to) = (s.max(start), (s + l).min(start + count));
-                if from < to {
-                    g.mark_used(from - start, to - from);
-                }
-            }
-            g.mark_dirty();
-            self.bitmap_sums[i] = crc32c(&g.to_bytes());
-            self.sums_dirty.insert(i / SUMS_PER_BLOCK);
-            self.sp.alloc.groups_mut()[i] = g;
+            let g = self.group_from(i, &owned);
+            self.set_rebuilt_group(i, g);
         }
         Ok(())
+    }
+
+    /// Group `i`'s bitmap as `owned` (every block held, see
+    /// [`owned_blocks`](Self::owned_blocks)) says it should be.
+    pub(super) fn group_from(&self, i: usize, owned: &RangeSet) -> AllocationGroup {
+        let (count, kind) = {
+            let g = &self.sp.alloc.groups()[i];
+            (g.block_count, g.kind)
+        };
+        let start = i as u64 * GROUP_BLOCKS;
+        let mut g = AllocationGroup::new(i as u32, count);
+        g.kind = kind;
+        for (s, l) in owned.within(start, start + count) {
+            g.mark_used(s - start, l);
+        }
+        g
+    }
+
+    /// Put a rebuilt bitmap in place of group `i`'s, to be written (with
+    /// its checksum) by the next commit.
+    pub(super) fn set_rebuilt_group(&mut self, i: usize, mut g: AllocationGroup) {
+        g.mark_dirty();
+        self.bitmap_sums[i] = crc32c(&g.to_bytes());
+        self.sums_dirty.insert(i / SUMS_PER_BLOCK);
+        self.sp.alloc.groups_mut()[i] = g;
     }
 
     /// Every block something committed holds, but the group headers.

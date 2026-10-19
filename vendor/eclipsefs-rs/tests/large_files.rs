@@ -244,3 +244,15 @@ fn defrag_of_many_extents_rewrites_them_across_batches() {
     assert_eq!(read_all(&mut fs, f), expected(3 * N));
     fs.check().unwrap();
 }
+
+#[test]
+fn repairing_a_file_of_many_extents_stays_in_bounded_memory() {
+    let (disk, mut fs) = fresh(DISK);
+    let (f, o) = fragmented(&mut fs);
+    let (r, peak) = largest_alloc(|| fs.repair().unwrap());
+    assert!(!r.changed() && r.is_clean(), "{:?}", r);
+    assert!(peak < MAX_ALLOC, "largest allocation {peak} bytes");
+    let mut fs = remount(&disk, fs);
+    assert_eq!(read_all(&mut fs, f), expected(3 * N));
+    assert_eq!(read_all(&mut fs, o), other_data(0..2 * OTHER));
+}

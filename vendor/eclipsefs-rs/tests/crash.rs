@@ -454,6 +454,14 @@ fn verify(run: &Run, image: Vec<u8>, cut: usize) {
     if fs.format_version() == 4 {
         let r = fs.scrub().unwrap();
         assert!(r.is_clean(), "scrub after crash at {}: {:?}", cut, r);
+        // What a crash leaves is consistent: nothing for repair to do.
+        let r = fs.repair().unwrap();
+        assert!(
+            !r.changed() && r.is_clean(),
+            "repair after crash at {}: {:?}",
+            cut,
+            r
+        );
     }
     // Checked and scrubbed without the key; read with it.
     unlock(&mut fs);

@@ -249,6 +249,10 @@ pub struct BlockSpace {
     pub avoid: Vec<u32>,
     /// The chunk map changed since the last commit.
     pub chunks_dirty: bool,
+    /// Repair is running: a reference to blocks that are free or past the
+    /// end (a damaged extent in a leaf being copied) is ignored instead of
+    /// refused; repair drops such extents and recounts everything after.
+    pub lenient: bool,
 }
 
 /// Blocks kept back for metadata on a filesystem of `total` blocks: 1/64 of
@@ -272,6 +276,7 @@ impl BlockSpace {
             profiles: (Profile::Single, Profile::Single),
             avoid: Vec::new(),
             chunks_dirty: false,
+            lenient: false,
         }
     }
 
@@ -440,7 +445,16 @@ impl Space for BlockSpace {
     }
 
     fn incref(&mut self, start: u64, len: u64) -> Result<()> {
-        if (start..start + len).any(|b| !self.alloc.is_used(b)) {
+        // Past the end first: a damaged length must not make this walk
+        // billions of blocks.
+        let bad = match start.checked_add(len) {
+            Some(end) if end <= self.alloc.end() => (start..end).any(|b| !self.alloc.is_used(b)),
+            _ => true,
+        };
+        if bad {
+            if self.lenient {
+                return Ok(());
+            }
             return Err(Error::Corrupt("reference to a free block"));
         }
         self.refs.add(start, len, 1);
