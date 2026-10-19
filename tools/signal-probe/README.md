@@ -59,6 +59,10 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
 13. `exit(-1)` le llegaba al padre como una muerte por SIGHUP: se guardaba
     el `int` entero, y dentro del kernel un codigo negativo es como se
     escribe una muerte por señal.
+14. Un hijo de `fork` y un hilo nuevo nacian con nice 0, en `SCHED_OTHER` y
+    libres de correr en cualquier CPU, tuviera lo que tuviera su padre:
+    `nice make` solo bajaba la prioridad de `make`. Y `SCHED_RESET_ON_FORK`
+    se aceptaba y se tiraba.
 
 ## Compilar
 
@@ -103,3 +107,4 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `teardown` | un proceso que sale (`exit_group`) con un segundo hilo dormido en `pause`, `read`, `nanosleep`, `waitpid` o en el `vfork` de un hijo que no hace `exec` ya no tiene ese hilo cuando se le recoge: un mutex robusto compartido que el hilo tenia cogido vuelve con `EOWNERDEAD`. `/proc/meminfo` no sirve para esto ni en Linux, que a veces enseña tarde unos cientos de MiB liberados |
 | `spawn` | un hijo de `vfork` corre en la memoria de su padre: lo que escribe ahi lo lee el padre, asi que `posix_spawn` informa de un programa que no existe y de una accion de fichero que falla con `ENOENT`, y veinte `posix_spawn` de `sh -c 'exit 3'` seguidos devuelven cada uno su hijo con su estado |
 | `badexec` | un `execve` de lo que no es un programa vuelve, con el errno de Linux: `EACCES` sin bit de ejecucion, para un directorio o con un `PT_INTERP` que es un directorio; `ENOEXEC` para basura, un guion sin `#!`, un `#!` vacio o que nombra basura, y un ELF de otra maquina; `ENOENT` para un `#!` o un `PT_INTERP` que no existen; `EIO` para un `PT_INTERP` de 10 bytes y `ELIBBAD` para uno de 128 bytes de basura; cinco guiones encadenados corren y seis dan `ELOOP`. Y `sh -c` de un guion sin `#!` lo corre |
+| `sched` | lo que un hijo de `fork` y un hilo nuevo heredan del padre: el nice, la mascara de CPUs y la politica. Con `SCHED_RESET_ON_FORK` el padre la conserva y la informa (`sched_getscheduler`, `sched_getattr`) y el hijo nace sin ella: en `SCHED_OTHER` si el padre era de tiempo real, con nice 0 si el suyo era negativo y con el suyo si era positivo. Sin privilegio no se quita, `sched_setattr` no la acepta en la palabra de politica y `sched_getaffinity` quiere un buffer de `long` enteros. La seccion corre como root |

@@ -49,6 +49,9 @@
 //     machine, a dynamic binary whose `PT_INTERP` is not installed.
 //   * `exit(-1)` reached the parent as a death by SIGHUP: the whole `int`
 //     was kept, and a negative exit code is how a kill is spelled inside.
+//   * a forked child and a new thread started at nice 0, on SCHED_OTHER and
+//     free to run on any CPU, whatever their parent had: `nice make` only
+//     reniced make. And SCHED_RESET_ON_FORK was accepted and thrown away.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -101,6 +104,11 @@
 //              Linux gives -- EACCES, ENOEXEC, ENOENT, EIO, ELIBBAD, ELOOP --
 //              to a caller still alive to read it, and `sh` runs a script
 //              that has no `#!` line.
+//   sched      what a fork or a new thread takes from its parent: the nice
+//              value, the CPU mask and the policy, or the default class when
+//              the parent set SCHED_RESET_ON_FORK, which the parent keeps,
+//              reports, and cannot take off without privilege. And the size
+//              `sched_getaffinity` wants: whole longs.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -129,6 +137,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -1408,6 +1417,198 @@ static void sec_badexec(void) {
     for (size_t i = 0; i < sizeof made / sizeof made[0]; i++) unlink(made[i]);
 }
 
+// ------------------------------------------------------------------- sched
+
+#ifndef SCHED_FLAG_RESET_ON_FORK
+#define SCHED_FLAG_RESET_ON_FORK 0x01
+#endif
+
+// What a task reads back about its own scheduling.
+struct sched_seen {
+    int nice;
+    int policy;  // sched_getscheduler(): the policy, SCHED_RESET_ON_FORK included
+    int prio;    // sched_getparam()
+    unsigned long mask;  // the first word of sched_getaffinity()
+    long attr_flags;     // sched_getattr()'s sched_flags, -1 if it failed
+};
+
+// `struct sched_attr`, the 48-byte first version.
+struct probe_sched_attr {
+    uint32_t size, policy;
+    uint64_t flags;
+    int32_t nice;
+    uint32_t priority;
+    uint64_t runtime, deadline, period;
+};
+
+// musl's sched_setscheduler() and friends are ENOSYS on purpose (they are
+// per thread, POSIX says per process), so the section makes the syscalls.
+static int get_policy(void) {
+    return (int)syscall(SYS_sched_getscheduler, 0);
+}
+
+static void sched_seen_now(struct sched_seen *s) {
+    s->nice = getpriority(PRIO_PROCESS, 0);
+    s->policy = get_policy();
+    struct sched_param sp = {0};
+    syscall(SYS_sched_getparam, 0, &sp);
+    s->prio = sp.sched_priority;
+    s->mask = 0;
+    syscall(SYS_sched_getaffinity, 0, sizeof s->mask, &s->mask);
+    struct probe_sched_attr a = {0};
+    s->attr_flags =
+        syscall(SYS_sched_getattr, 0, &a, sizeof a, 0) == 0 ? (long)a.flags : -1;
+}
+
+// What a child forked now sees of itself.
+static struct sched_seen forked_sees(void) {
+    struct sched_seen s;
+    memset(&s, 0xff, sizeof s);
+    int fd[2];
+    if (pipe(fd) != 0) return s;
+    pid_t c = fork();
+    if (c == 0) {
+        struct sched_seen mine;
+        sched_seen_now(&mine);
+        _exit(write(fd[1], &mine, sizeof mine) == sizeof mine ? 0 : 1);
+    }
+    close(fd[1]);
+    if (read(fd[0], &s, sizeof s) != sizeof s) memset(&s, 0xff, sizeof s);
+    close(fd[0]);
+    while (waitpid(c, NULL, 0) == -1 && errno == EINTR) {
+    }
+    return s;
+}
+
+static void *sched_seen_thread(void *out) {
+    sched_seen_now(out);
+    return NULL;
+}
+
+// What a thread created now with the default attributes sees of itself.
+static struct sched_seen thread_sees(void) {
+    struct sched_seen s;
+    memset(&s, 0xff, sizeof s);
+    pthread_t t;
+    if (pthread_create(&t, NULL, sched_seen_thread, &s) == 0) pthread_join(t, NULL);
+    return s;
+}
+
+static int set_policy(int policy, int priority) {
+    struct sched_param sp = {.sched_priority = priority};
+    return (int)syscall(SYS_sched_setscheduler, 0, policy, &sp);
+}
+
+static void sec_sched(void) {
+    struct sched_seen s;
+
+    setpriority(PRIO_PROCESS, 0, 5);
+    s = forked_sees();
+    check(s.nice == 5, "fork: the nice value is kept", "child nice %d", s.nice);
+    s = thread_sees();
+    check(s.nice == 5, "a new thread keeps the nice value", "thread nice %d", s.nice);
+    setpriority(PRIO_PROCESS, 0, 0);
+
+    unsigned long all = 0;
+    syscall(SYS_sched_getaffinity, 0, sizeof all, &all);
+    unsigned long one = all & -all;  // the lowest CPU this task may use
+    if (syscall(SYS_sched_setaffinity, 0, sizeof one, &one) == 0) {
+        s = forked_sees();
+        check(s.mask == one, "fork: the CPU mask is kept", "child %#lx, parent %#lx", s.mask,
+              one);
+        s = thread_sees();
+        check(s.mask == one, "a new thread keeps the CPU mask", "thread %#lx, parent %#lx",
+              s.mask, one);
+        syscall(SYS_sched_setaffinity, 0, sizeof all, &all);
+    } else {
+        check(0, "sched_setaffinity to one CPU", "%s", strerror(errno));
+    }
+
+    set_policy(SCHED_BATCH, 0);
+    s = forked_sees();
+    check(s.policy == SCHED_BATCH, "fork: the policy is kept", "child policy %#x", s.policy);
+    s = thread_sees();
+    check(s.policy == SCHED_BATCH, "a new thread keeps the policy", "thread policy %#x",
+          s.policy);
+    set_policy(SCHED_OTHER, 0);
+
+    // SCHED_RESET_ON_FORK: kept, reported, and undone in every child.
+    if (set_policy(SCHED_FIFO | SCHED_RESET_ON_FORK, 10) != 0) {
+        check(0, "SCHED_FIFO|SCHED_RESET_ON_FORK", "%s (this section runs as root)",
+              strerror(errno));
+        return;
+    }
+    struct sched_seen me;
+    sched_seen_now(&me);
+    check(me.policy == (SCHED_FIFO | SCHED_RESET_ON_FORK),
+          "getscheduler reports RESET_ON_FORK", "policy %#x", me.policy);
+    check(me.attr_flags == SCHED_FLAG_RESET_ON_FORK, "getattr reports RESET_ON_FORK",
+          "sched_flags %#lx", me.attr_flags);
+    s = forked_sees();
+    check(s.policy == SCHED_OTHER && s.prio == 0 && s.attr_flags == 0,
+          "reset on fork: the child is SCHED_OTHER", "policy %#x prio %d flags %#lx", s.policy,
+          s.prio, s.attr_flags);
+    s = thread_sees();
+    check(s.policy == SCHED_OTHER && s.prio == 0, "reset on fork: and so is a new thread",
+          "policy %#x prio %d", s.policy, s.prio);
+    struct sched_param sp = {.sched_priority = 20};
+    syscall(SYS_sched_setparam, 0, &sp);
+    int pol = get_policy();
+    check(pol == (SCHED_FIFO | SCHED_RESET_ON_FORK), "sched_setparam keeps RESET_ON_FORK",
+          "policy %#x", pol);
+
+    // A fair policy keeps its class and a positive nice; a negative one is
+    // put back to 0.
+    set_policy(SCHED_OTHER, 0);
+    setpriority(PRIO_PROCESS, 0, -5);
+    set_policy(SCHED_BATCH | SCHED_RESET_ON_FORK, 0);
+    s = forked_sees();
+    check(s.policy == SCHED_BATCH && s.nice == 0, "reset on fork: a negative nice is 0",
+          "child policy %#x nice %d", s.policy, s.nice);
+    setpriority(PRIO_PROCESS, 0, 7);
+    s = forked_sees();
+    check(s.nice == 7, "reset on fork: a positive nice is kept", "child nice %d", s.nice);
+
+    // Only privilege takes the flag off; anybody may put it on. The child
+    // sets it itself: the one its parent had is the one a fork takes away.
+    set_policy(SCHED_OTHER, 0);
+    setpriority(PRIO_PROCESS, 0, 0);
+    pid_t c = fork();
+    if (c == 0) {
+        if (set_policy(SCHED_OTHER | SCHED_RESET_ON_FORK, 0) != 0 || setuid(65534) != 0)
+            _exit(10);
+        int off = set_policy(SCHED_OTHER, 0) == -1 && errno == EPERM;
+        int kept = set_policy(SCHED_OTHER | SCHED_RESET_ON_FORK, 0) == 0;
+        _exit(off && kept ? 0 : 1 + off + 2 * kept);
+    }
+    int st = 0;
+    while (waitpid(c, &st, 0) == -1 && errno == EINTR) {
+    }
+    check(WIFEXITED(st) && WEXITSTATUS(st) == 0, "unprivileged: the flag cannot come off",
+          "status %#x", st);
+
+    // The legacy bit belongs to sched_setscheduler; sched_setattr takes the
+    // flag in sched_flags and refuses it in the policy word.
+    struct probe_sched_attr a = {.size = sizeof a, .policy = SCHED_OTHER | SCHED_RESET_ON_FORK};
+    errno = 0;
+    long r = syscall(SYS_sched_setattr, 0, &a, 0);
+    check(r == -1 && errno == EINVAL, "setattr: the bit in the policy word", "ret %ld errno %d",
+          r, errno);
+
+    // sched_getaffinity needs a whole number of longs, with a bit per CPU.
+    unsigned long buf[2];
+    errno = 0;
+    r = syscall(SYS_sched_getaffinity, 0, 1, buf);
+    check(r == -1 && errno == EINVAL, "getaffinity: a 1-byte buffer", "ret %ld errno %d", r,
+          errno);
+    errno = 0;
+    r = syscall(SYS_sched_getaffinity, 0, 12, buf);
+    check(r == -1 && errno == EINVAL, "getaffinity: a 12-byte buffer", "ret %ld errno %d", r,
+          errno);
+    r = syscall(SYS_sched_getaffinity, 0, 16, buf);
+    check(r > 0 && r <= 16 && r % 8 == 0, "getaffinity: a 16-byte buffer", "ret %ld", r);
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -1428,6 +1629,7 @@ static const struct {
     {"teardown", "an exit ends every thread, whatever it waits in", sec_teardown},
     {"spawn", "a vfork child runs in its parent's memory", sec_spawn},
     {"badexec", "a failed execve returns, with Linux's errno", sec_badexec},
+    {"sched", "what a fork hands down to the scheduler", sec_sched},
 };
 
 int main(int argc, char **argv) {

@@ -1601,7 +1601,7 @@ pub fn is_rt_policy(policy: u8) -> bool {
 }
 
 /// What `user_check_sched_setscheduler()` needs to know about the task whose
-/// scheduling is being set. All five belong to the TARGET, limits included:
+/// scheduling is being set. All of it belongs to the TARGET, limits included:
 /// the budget spent is the one of the task being moved, not of whoever asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedFacts {
@@ -1615,6 +1615,8 @@ pub struct SchedFacts {
     pub rlimit_nice: u64,
     /// Its own soft `RLIMIT_RTPRIO`.
     pub rlimit_rtprio: u64,
+    /// Whether it has `SCHED_RESET_ON_FORK` set.
+    pub reset_on_fork: bool,
 }
 
 /// What a `sched_setscheduler`/`sched_setparam`/`sched_setattr` call is
@@ -1627,6 +1629,8 @@ pub struct SchedRequest {
     pub nice: i8,
     /// The real-time priority asked for.
     pub rt_priority: u8,
+    /// Whether `SCHED_RESET_ON_FORK` is to be set after the call.
+    pub reset_on_fork: bool,
 }
 
 /// What a `setpriority`/`getpriority` `which`/`who` pair names.
@@ -2753,9 +2757,6 @@ impl LinuxProcess {
     /// Every `goto req_priv` of `user_check_sched_setscheduler()`, read the
     /// other way round: the request needs no privilege when none of them
     /// fires.
-    ///
-    /// Not modelled: the `sched_reset_on_fork` clause, because this kernel
-    /// accepts that flag and does not keep it, so there is no flag to clear.
     fn sched_request_is_unprivileged(
         caller: &Credentials,
         target: &Credentials,
@@ -2799,8 +2800,9 @@ impl LinuxProcess {
         {
             return false;
         }
-        // And, last, it has to be your task.
-        Self::is_same_owner(caller, target)
+        // And, last, it has to be your task, and "normal users shall not
+        // reset the sched_reset_on_fork flag".
+        Self::is_same_owner(caller, target) && (want.reset_on_fork || !now.reset_on_fork)
     }
 
     /// Get the `File` with given `fd`.

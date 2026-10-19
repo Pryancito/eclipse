@@ -100,12 +100,17 @@ fn so_do_its_cpus_and_its_scheduling() {
     let (_proc, leader, worker) = leader_and_worker(48_103);
     worker.set_affinity(0b10).unwrap();
     worker.set_sched(0, 5, 0);
+    worker.set_sched_reset_on_fork(true);
     the_leader_gone(&leader);
 
     let successor = worker.successor_as_leader().unwrap();
 
     assert_eq!(successor.affinity(), 0b10);
     assert_eq!(successor.sched_nice(), 5);
+    assert!(
+        successor.sched_reset_on_fork(),
+        "SCHED_RESET_ON_FORK survives an execve, and the one from a second thread lost it"
+    );
 }
 
 /// While the old leader is still listed the pid is still its tid: a second

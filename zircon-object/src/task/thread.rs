@@ -2,6 +2,10 @@ mod published_state;
 /// That the word the return path reads is never wrong; see the module notes.
 #[cfg(test)]
 mod published_state_tests;
+mod sched_fork;
+/// What a cloned task starts with; see the module notes.
+#[cfg(test)]
+mod sched_fork_tests;
 mod signal_frames;
 mod thread_state;
 
@@ -510,6 +514,9 @@ struct SchedAttr {
     nice: AtomicI8,
     /// Static real-time priority (1..=99 for FIFO/RR, else 0).
     rt_priority: AtomicU8,
+    /// `SCHED_RESET_ON_FORK`: the next task this one clones starts on the
+    /// default class instead of this one's (see `sched_fork`).
+    reset_on_fork: AtomicBool,
     /// Monotonic time (ns) at which the current slice expires; 0 means
     /// "start a fresh slice on the next tick".
     ///
@@ -555,6 +562,7 @@ impl Default for SchedAttr {
             policy: AtomicU8::new(SCHED_NORMAL),
             nice: AtomicI8::new(0),
             rt_priority: AtomicU8::new(0),
+            reset_on_fork: AtomicBool::new(false),
             slice_end_ns: AtomicU64::new(0),
             parked: AtomicBool::new(false),
             slice_left_ns: AtomicU64::new(NO_SLICE_REMAINDER),
@@ -977,6 +985,17 @@ impl Thread {
     /// The thread's static real-time priority (1..=99 for FIFO/RR, else 0).
     pub fn sched_rt_priority(&self) -> u8 {
         self.sched.rt_priority.load(Ordering::Relaxed)
+    }
+
+    /// Whether the thread has `SCHED_RESET_ON_FORK` set.
+    pub fn sched_reset_on_fork(&self) -> bool {
+        self.sched.reset_on_fork.load(Ordering::Relaxed)
+    }
+
+    /// Set or clear `SCHED_RESET_ON_FORK`. The syscalls decide who may
+    /// clear it; this only stores it.
+    pub fn set_sched_reset_on_fork(&self, on: bool) {
+        self.sched.reset_on_fork.store(on, Ordering::Relaxed);
     }
 
     /// Whether the thread runs under a real-time policy (`SCHED_FIFO` /

@@ -112,8 +112,9 @@ const TIMERSLACK_DEFAULT_NS: u64 = 50_000;
 /// still leaves room for one long argument.
 const ARG_MAX: usize = USER_STACK_PAGES * PAGE_SIZE / 4;
 
-/// `SCHED_RESET_ON_FORK`: OR-ed into the policy by `sched_setscheduler` /
-/// `sched_setattr`. Accepted but not modelled (we never fork-reset).
+/// `SCHED_RESET_ON_FORK`: OR-ed into the policy word by `sched_setscheduler`
+/// and reported in it by `sched_getscheduler`; `sched_setattr` takes it as
+/// `SCHED_FLAG_RESET_ON_FORK` instead.
 const SCHED_RESET_ON_FORK: usize = 0x4000_0000;
 
 /// Linux `struct sched_attr` (the v0 / 48-byte layout) used by
@@ -728,6 +729,7 @@ impl Syscall<'_> {
         // A child forked inside a signal handler has the handler's frame in
         // its copy of the stack, and returns from it.
         new_thread.inherit_backup_contexts(self.thread);
+        new_thread.inherit_sched(self.thread);
         publish_child_tid(&new_thread, ctid);
         // Everything below this line and above `start` is "what the child has
         // to be holding before it can execute an instruction", and it is in
@@ -951,6 +953,7 @@ impl Syscall<'_> {
         // signal mask does come across (pthread_create(3)).
         let inherited = self.thread.lock_linux().new_thread();
         let new_thread = Thread::create_linux_with(self.zircon_process(), inherited)?;
+        new_thread.inherit_sched(self.thread);
         let tid = new_thread.id();
         // Everything from here to `start` can fail, and every one of those
         // failures is on a pointer or a context userspace chose. A thread that
@@ -1825,9 +1828,7 @@ impl Syscall<'_> {
             "sched_getaffinity: pid={} cpusetsize={} mask_ptr={:?}",
             pid, cpusetsize, mask_ptr
         );
-        if cpusetsize == 0 {
-            return Err(LxError::EINVAL);
-        }
+        let cpusetsize = crate::intarg::getaffinity_len(cpusetsize, Self::online_cpu_mask())?;
         let pid = crate::intarg::task_pid(pid)?;
         let mask = if pid == 0 || pid as u64 == self.thread.id() {
             self.thread.affinity()
@@ -1913,6 +1914,7 @@ impl Syscall<'_> {
         policy: u8,
         nice: i8,
         rt_priority: u8,
+        reset_on_fork: bool,
     ) -> LxResult<()> {
         // A target whose process is tearing down has no credentials to judge.
         let linux = thread.proc().try_linux().ok_or(LxError::ESRCH)?;
@@ -1922,6 +1924,7 @@ impl Syscall<'_> {
             rt_priority: thread.sched_rt_priority(),
             rlimit_nice: linux.rlimit(RLIMIT_NICE, None, false)?.cur,
             rlimit_rtprio: linux.rlimit(RLIMIT_RTPRIO, None, false)?.cur,
+            reset_on_fork: thread.sched_reset_on_fork(),
         };
         LinuxProcess::may_set_scheduler(
             &self.linux_process().credentials(),
@@ -1931,6 +1934,7 @@ impl Syscall<'_> {
                 policy,
                 nice,
                 rt_priority,
+                reset_on_fork,
             },
         )
     }
@@ -1959,7 +1963,8 @@ impl Syscall<'_> {
         policy: usize,
         param: UserInPtr<i32>,
     ) -> SysResult {
-        // The high SCHED_RESET_ON_FORK bit is accepted but not modelled.
+        // `_sched_setscheduler`'s "legacy SCHED_RESET_ON_FORK hack".
+        let reset_on_fork = policy & SCHED_RESET_ON_FORK != 0;
         let base = policy & !SCHED_RESET_ON_FORK;
         if base > u8::MAX as usize {
             return Err(LxError::EINVAL);
@@ -1975,8 +1980,9 @@ impl Syscall<'_> {
         let thread = self.sched_target(pid)?;
         let (p, rt, nice) =
             Self::sched_validate(base as u8, sched_priority, thread.sched_nice() as i32)?;
-        self.check_sched_permission(&thread, p, nice, rt)?;
+        self.check_sched_permission(&thread, p, nice, rt, reset_on_fork)?;
         thread.set_sched(p, nice, rt);
+        thread.set_sched_reset_on_fork(reset_on_fork);
         Ok(0)
     }
 
@@ -1985,7 +1991,12 @@ impl Syscall<'_> {
     /// See [linux man sched_getscheduler(2)](https://www.man7.org/linux/man-pages/man2/sched_getscheduler.2.html).
     pub fn sys_sched_getscheduler(&self, pid: usize) -> SysResult {
         let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
-        Ok(thread.sched_policy() as usize)
+        let flag = if thread.sched_reset_on_fork() {
+            SCHED_RESET_ON_FORK
+        } else {
+            0
+        };
+        Ok(thread.sched_policy() as usize | flag)
     }
 
     /// `sched_setparam` sets the (real-time) priority of thread `pid` without
@@ -2001,7 +2012,7 @@ impl Syscall<'_> {
             sched_priority,
             thread.sched_nice() as i32,
         )?;
-        self.check_sched_permission(&thread, p, nice, rt)?;
+        self.check_sched_permission(&thread, p, nice, rt, thread.sched_reset_on_fork())?;
         thread.set_sched(p, nice, rt);
         Ok(0)
     }
@@ -2084,18 +2095,16 @@ impl Syscall<'_> {
             pid,
             plan.policy,
             a.sched_flags,
-            // Read for the log only: fork-reset is not modelled (see
-            // `SCHED_RESET_ON_FORK`).
             a.sched_flags & SCHED_FLAG_RESET_ON_FORK != 0,
             a.sched_nice
         );
         let thread = self.sched_target(pid)?;
-        // `SETPARAM_POLICY`: the thread's own policy stands in for the one
-        // in the struct. `SCHED_RESET_ON_FORK` in the policy word is
-        // accepted but not modelled, as in `sched_setscheduler`.
-        let policy = match plan.policy {
-            None => thread.sched_policy() as usize,
-            Some(p) => (p & !(SCHED_RESET_ON_FORK as u32)) as usize,
+        // `SETPARAM_POLICY`: the thread's own policy and its own
+        // `sched_reset_on_fork` stand in for the struct's. The legacy bit in
+        // the policy word is no policy (`valid_policy`), and is EINVAL below.
+        let (policy, reset_on_fork) = match plan.policy {
+            None => (thread.sched_policy() as usize, thread.sched_reset_on_fork()),
+            Some(p) => (p as usize, a.sched_flags & SCHED_FLAG_RESET_ON_FORK != 0),
         };
         if policy == SCHED_DEADLINE as usize || policy > u8::MAX as usize {
             return Err(LxError::EINVAL);
@@ -2111,7 +2120,7 @@ impl Syscall<'_> {
             (a.sched_priority as i32, a.sched_nice)
         };
         let (p, rt, nice) = Self::sched_validate(policy as u8, priority, nice)?;
-        self.check_sched_permission(&thread, p, nice, rt)?;
+        self.check_sched_permission(&thread, p, nice, rt, reset_on_fork)?;
         // `KEEP_PARAMS` keeps the PARAMETERS, and that is all it keeps: the
         // class change goes through. `sys_sched_setattr` uses the flag only to
         // overwrite `attr`'s priority and nice from the task (`get_params`)
@@ -2123,6 +2132,7 @@ impl Syscall<'_> {
         // no-op that returned 0. Storing is safe either way: with the flag,
         // `nice` and `rt` ARE the thread's own, read out of it a few lines up.
         thread.set_sched(p, nice, rt);
+        thread.set_sched_reset_on_fork(reset_on_fork);
         Ok(0)
     }
 
@@ -2147,7 +2157,11 @@ impl Syscall<'_> {
         let a = SchedAttr {
             size: SCHED_ATTR_SIZE_VER0 as u32,
             sched_policy: thread.sched_policy() as u32,
-            sched_flags: 0,
+            sched_flags: if thread.sched_reset_on_fork() {
+                SCHED_FLAG_RESET_ON_FORK
+            } else {
+                0
+            },
             sched_nice: thread.sched_nice() as i32,
             sched_priority: thread.sched_rt_priority() as u32,
             sched_runtime: 0,
