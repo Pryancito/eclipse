@@ -19,7 +19,7 @@ use linux_object::thread::ThreadExt;
 use linux_object::time::TimeSpec;
 use numeric_enum_macro::numeric_enum;
 use zircon_object::object::KernelObject;
-use zircon_object::task::{Thread, ROOT_JOB};
+use zircon_object::task::{Status, Thread, ROOT_JOB};
 
 /// The `sigsetsize` every syscall that takes a `sigset_t` from userspace
 /// carries, and what it must be.
@@ -314,6 +314,10 @@ fn deliver_to_process(
     match cx.signal {
         // kill(pid, 0): finding the process was the whole answer.
         None => Ok(()),
+        // A zombie, or one on its way to being one, takes nothing and is not
+        // an error: `send_signal_to_process` found no thread left to take it
+        // and answered ESRCH, as if the pid named nobody.
+        Some(_) if matches!(process.status(), Status::Exited(_)) => Ok(()),
         Some(Signal::SIGKILL) => {
             deliver_direct_sigkill(&cx.caller, process);
             Ok(())
@@ -583,23 +587,18 @@ impl Syscall<'_> {
     }
 
     /// `kill(pid, sig)` with a positive pid.
+    ///
+    /// A zombie is a valid target until it is reaped, for whoever may signal
+    /// it: Linux delivers nothing and returns 0. Firefox's parent logged
+    /// "failed to send SIGKILL to process N" for every content process it
+    /// had already seen die, and its profile lock's `kill(pid, 0)` probe
+    /// treats ESRCH as "stale lock" but any other answer as "still running".
     fn signal_pid(&self, cx: &KillContext, pid: KoID) -> LxResult<()> {
-        let Some(process) = ROOT_JOB.find_process(pid) else {
-            // A child that exited but was not waited for is gone from the
-            // job yet still a valid target: Linux delivers nothing and
-            // returns 0. Firefox's parent logged "failed to send SIGKILL
-            // to process N" for every content process it had already
-            // seen die, and its profile lock's `kill(pid, 0)` probe
-            // treats ESRCH as "stale lock" but any other answer as
-            // "still running".
-            if self.linux_process().is_zombie_child(pid) {
-                return Ok(());
-            }
-            // A thread id names its process, as on Linux; see
-            // `process_of_thread` for why that is every `kill(gettid())`.
-            let process = linux_object::process::process_of_thread(pid).ok_or(LxError::ESRCH)?;
-            return self.signal_one_process(cx, &process);
-        };
+        // A thread id names its process, as on Linux; see `process_of_thread`
+        // for why that is every `kill(gettid())`.
+        let process = linux_object::process::find_task(pid)
+            .or_else(|| linux_object::process::process_of_thread(pid))
+            .ok_or(LxError::ESRCH)?;
         self.signal_one_process(cx, &process)
     }
 
@@ -883,8 +882,7 @@ impl Syscall<'_> {
         }
         // `kill_proc_info()` looks the pid up as `kill(2)` does: a thread id
         // names its process.
-        let process = ROOT_JOB
-            .find_process(pid as KoID)
+        let process = linux_object::process::find_task(pid as KoID)
             .or_else(|| linux_object::process::process_of_thread(pid as KoID))
             .ok_or(LxError::ESRCH)?;
         // `kill_proc_info()`, the same one `kill(2)` walks into: the
@@ -1062,6 +1060,9 @@ impl Drop for TempSigmaskGuard {
 ///
 /// Everything below is a pure decision lifted out of a syscall body, so it can
 /// be exercised without a thread, a process or a job.
+#[cfg(test)]
+mod zombie_tests;
+
 #[cfg(test)]
 mod sigaction_query_tests {
     //! Asking for the disposition of `SIGKILL` and `SIGSTOP`.

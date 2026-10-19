@@ -16,6 +16,8 @@ use crate::process::ProcessExt;
 
 /// `/proc/present`, in its own file: `procfs.rs` sits on the size ratchet.
 mod present;
+#[cfg(test)]
+mod zombie_tests;
 use present::proc_present_content;
 use smoltcp::wire::{IpAddress, IpCidr};
 
@@ -100,6 +102,14 @@ fn all_processes() -> Vec<Arc<Process>> {
     let mut out = Vec::new();
     collect_processes(&ROOT_JOB, &mut out);
     out
+}
+
+/// The processes `/proc` has a directory for: the live ones and the zombies
+/// nobody has reaped, which `ps` shows as `<defunct>` and which had none.
+fn pid_dir_processes() -> Vec<Arc<Process>> {
+    let mut procs = all_processes();
+    procs.extend(crate::process::unreaped_zombies());
+    procs
 }
 
 fn current_process_id() -> Option<u64> {
@@ -658,6 +668,12 @@ fn proc_pid_statm(proc: &Process) -> String {
 }
 
 fn proc_pid_cmdline(proc: &Process) -> Vec<u8> {
+    // A zombie has no memory left to read its arguments from
+    // (`get_mm_cmdline` finds no `mm`), and the empty file is what makes `ps`
+    // print it as `[name] <defunct>`.
+    if let Status::Exited(_) = proc.status() {
+        return Vec::new();
+    }
     let lp = match proc.try_linux() {
         Some(lp) => lp,
         None => return Vec::new(),
@@ -721,7 +737,7 @@ impl ProcRootINode {
             i if i - 2 < PROC_ROOT_STATIC.len() => Ok(PROC_ROOT_STATIC[i - 2].into()),
             i => {
                 let idx = i - 2 - PROC_ROOT_STATIC.len();
-                let procs = all_processes();
+                let procs = pid_dir_processes();
                 if idx >= procs.len() {
                     return Err(FsError::EntryNotFound);
                 }
@@ -753,7 +769,7 @@ impl INode for ProcRootINode {
         // `net`, `sysvipc`, `sys` and `perf`, plus a `/proc/<pid>` per live
         // process -- which is why Linux's `/proc` nlink moves as processes come
         // and go (`proc_root_getattr`: `nlink + nr_processes()`).
-        Ok(dir_metadata(10, 4 + all_processes().len()))
+        Ok(dir_metadata(10, 4 + pid_dir_processes().len()))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -826,7 +842,7 @@ impl INode for ProcRootINode {
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
-                    if ROOT_JOB.find_process(pid as _).is_some() {
+                    if crate::process::find_task(pid as _).is_some() {
                         return Ok(Arc::new(ProcPidDirINode { pid }));
                     }
                 }
@@ -896,7 +912,7 @@ pub(crate) fn pid_dir_inode(pid: u64) -> Arc<dyn INode> {
 
 impl ProcPidDirINode {
     fn process(&self) -> Option<Arc<Process>> {
-        ROOT_JOB.find_process(self.pid as _)
+        crate::process::find_task(self.pid as _)
     }
 
     /// `EACCES` unless the caller may read this process's innards.
@@ -1082,7 +1098,7 @@ struct ProcPidTaskDirINode {
 
 impl ProcPidTaskDirINode {
     fn process(&self) -> Option<Arc<Process>> {
-        ROOT_JOB.find_process(self.pid as _)
+        crate::process::find_task(self.pid as _)
     }
 
     fn tids(&self) -> Vec<u64> {
@@ -2540,9 +2556,7 @@ struct ProcPidFileINode {
 
 impl ProcPidFileINode {
     fn bytes(&self) -> Result<Vec<u8>> {
-        let proc = ROOT_JOB
-            .find_process(self.pid as _)
-            .ok_or(FsError::EntryNotFound)?;
+        let proc = crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
         Ok(match self.kind {
             ProcPidFileKind::Stat => proc_pid_stat(&proc).into_bytes(),
             ProcPidFileKind::Cmdline => proc_pid_cmdline(&proc),

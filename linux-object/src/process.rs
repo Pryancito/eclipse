@@ -674,7 +674,7 @@ impl NewChild for Process {
             parent: Mutex::new(Arc::downgrade(parent)),
             vt: linux_parent.vt,
             exit_path: ExitPathSummary::default(),
-            exit_handed_over: AtomicBool::new(false),
+            exit_stage: Default::default(),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
             itimers: crate::time::Itimers::forked(&linux_parent_inner.limits),
@@ -1025,12 +1025,13 @@ pub async fn wait_child_interest(
             if interest.exited {
                 if let Some(entry) = inner.reaped_children.get(&pid) {
                     let (code, cpu) = (entry.code, entry.cpu);
-                    let zombie = reap.then(|| inner.reaped_children.remove(&pid));
+                    let zombie = reap.then(|| {
+                        exit_handover::released_zombie(inner.reaped_children.remove(&pid))
+                    });
                     if reap {
                         inner.add_children_cpu(cpu);
                     }
-                    drop(inner);
-                    drop(zombie);
+                    drop((inner, zombie));
                     return Ok((wait_status_exited(code), cpu));
                 }
             }
@@ -1140,12 +1141,12 @@ fn scan_waitable_children(
             .find(|(_, entry)| pgid.map(|want| entry.pgid == want).unwrap_or(true))
             .map(|(&p, entry)| (p, entry.code, entry.cpu));
         if let Some((pid, code, cpu)) = found {
-            let zombie = reap.then(|| inner.reaped_children.remove(&pid));
+            let zombie =
+                reap.then(|| exit_handover::released_zombie(inner.reaped_children.remove(&pid)));
             if reap {
                 inner.add_children_cpu(cpu);
             }
-            drop(inner);
-            drop(zombie);
+            drop((inner, zombie));
             return Some(Ok((pid, wait_status_exited(code), cpu)));
         }
     }
@@ -1186,10 +1187,10 @@ fn scan_waitable_children(
 /// already took the child.
 fn claim_exited_child(proc: &Arc<Process>, pid: KoID, cpu: ChildCpu) -> bool {
     let mut inner = proc.linux().inner.lock();
-    if inner.children.remove(&pid).is_none() {
+    if exit_handover::released(inner.children.remove(&pid)).is_none() {
         return false;
     }
-    let zombie = inner.reaped_children.remove(&pid);
+    let zombie = exit_handover::released_zombie(inner.reaped_children.remove(&pid));
     // So a later `record_child_exit` from death-notify does not
     // re-insert this pid as a fresh zombie.
     inner.waited_without_zombie.insert(pid);
@@ -1254,8 +1255,8 @@ pub struct LinuxProcess {
     ///
     /// See [`ExitPathSummary`].
     exit_path: ExitPathSummary,
-    /// Whether the exit teardown has run: see [`exit_handover`].
-    exit_handed_over: AtomicBool,
+    /// Alive, zombie or reaped: see [`exit_handover`].
+    exit_stage: exit_handover::ExitStage,
     /// Per-process syscall accounting (surfaced at `/proc/<pid>/perf`).
     perf: crate::perf::ProcPerf,
     /// The process's futex objects, keyed by the address of their word.
@@ -1802,8 +1803,8 @@ impl LinuxProcess {
     /// that were waited for).
     pub fn forget_child(&self, child_id: KoID) {
         let mut inner = self.inner.lock();
-        let live = inner.children.remove(&child_id);
-        let zombie = inner.reaped_children.remove(&child_id);
+        let live = exit_handover::released(inner.children.remove(&child_id));
+        let zombie = exit_handover::released_zombie(inner.reaped_children.remove(&child_id));
         inner.waited_without_zombie.remove(&child_id);
         drop(inner);
         drop((live, zombie));
@@ -1856,7 +1857,7 @@ impl LinuxProcess {
             parent: Mutex::new(Weak::default()),
             vt,
             exit_path: ExitPathSummary::default(),
-            exit_handed_over: AtomicBool::new(false),
+            exit_stage: Default::default(),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
             itimers: Default::default(),
