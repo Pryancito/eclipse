@@ -23,7 +23,7 @@
 //! Everything else answers EINVAL and is logged the first time each escape
 //! is seen: RM_ALLOC_MEMORY, VID_HEAP_CONTROL, the NUMA and dma-buf escapes.
 //! `nvidia-smi` is what this much is for; CUDA needs those, and
-//! `/dev/nvidia-uvm` besides.
+//! `/dev/nvidia-uvm` besides (`nvidia_uvm.rs`).
 //!
 //! A mapping is made in two steps, as on Linux. RM_MAP_MEMORY has the RM map
 //! the memory and records the result on the open the client names in the

@@ -1,4 +1,5 @@
 mod btrfs_image;
+mod cuda_probe;
 mod desktop;
 mod eclipsefs_image;
 mod image;
