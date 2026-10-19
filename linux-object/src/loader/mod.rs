@@ -54,6 +54,40 @@ fn segment_names_freebsd(seg: &[u8]) -> bool {
 /// base.
 const PIE_LOAD_BASE: usize = 0x40_0000;
 
+/// The sub-VMAR of `size` bytes that `elf`'s segments are loaded into, the
+/// first free one in `vmar`.
+///
+/// A position-independent image (`ET_DYN`) bases its segments at vaddr 0, so
+/// in an empty address space the first free range is address 0: its first
+/// page, and the whole low range with the null page in it, would be mapped.
+/// That breaks the invariant that a null pointer faults, which libc and
+/// allocators such as Firefox's mozjemalloc rely on -- and every bug that
+/// reads through one reads the ELF header instead. So the range below
+/// [`PIE_LOAD_BASE`] is reserved first with a guard sub-VMAR, and the image,
+/// its interpreter, `mmap` and the stack all land above it, as above Linux's
+/// non-zero `ET_DYN` load base. An `ET_EXEC` image carries absolute vaddrs
+/// (0x400000 and up on x86-64), and gets no guard and no bias.
+///
+/// Only the program with a `PT_INTERP` used to get the guard. A static-pie,
+/// or a dynamic linker run as a program, loaded at 0.
+fn allocate_image_vmar(
+    vmar: &Arc<VmAddressRegion>,
+    elf: &ElfFile,
+    size: usize,
+) -> LxResult<Arc<VmAddressRegion>> {
+    if elf.header.pt2.type_().as_type() == xmas_elf::header::Type::SharedObject {
+        vmar.allocate_at(0, PIE_LOAD_BASE, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+            .inspect_err(|&e| {
+                error!("elf: reserve PIE low-address guard failed: {:?}", e);
+            })?;
+    }
+    Ok(vmar
+        .allocate(None, size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+        .inspect_err(|&e| {
+            error!("elf: allocate vmar for size {:#x} failed: {:?}", size, e);
+        })?)
+}
+
 /// Detect the ABI personality of an ELF image from its header and notes.
 ///
 /// The primary signal is `EI_OSABI == ELFOSABI_FREEBSD` (9), which FreeBSD's
@@ -425,37 +459,8 @@ impl LinuxElfLoader {
         if let Ok(interp) = elf.get_interpreter() {
             info!("interp: {:?}, path: {:?}", interp, path);
 
-            // A PIE (ET_DYN) executable bases its LOAD segments at vaddr 0.
-            // Loading one at VMAR offset 0 maps its first page — and the whole
-            // low range including the null page — at address 0. That breaks the
-            // null-pointer-faults invariant that libc and allocators such as
-            // Firefox's mozjemalloc rely on, and puts AT_PHDR at a near-null
-            // address. Reserve the low range with a guard sub-VMAR so the
-            // program, interpreter, mmap and stack all load above it and any
-            // access below it faults, matching Linux's non-zero PIE load base.
-            // A non-PIE (ET_EXEC) binary already carries high absolute vaddrs
-            // (0x400000+ on x86-64), so it needs no bias and gets none.
-            let is_pie = elf.header.pt2.type_().as_type() == xmas_elf::header::Type::SharedObject;
-            if is_pie {
-                vmar.allocate_at(0, PIE_LOAD_BASE, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
-                    .inspect_err(|&e| {
-                        error!("elf: reserve PIE low-address guard failed: {:?}", e);
-                    })?;
-            }
-
-            // Load the main program into the first free sub-VMAR. With the PIE
-            // guard in place this lands at PIE_LOAD_BASE; for a non-PIE binary
-            // there is no guard and app_base is 0 (segments carry their own
-            // absolute vaddrs).
             let app_size = elf.load_segment_size();
-            let app_vmar = vmar
-                .allocate(None, app_size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
-                .inspect_err(|&e| {
-                    error!(
-                        "elf: allocate vmar for app size {:#x} failed: {:?}",
-                        app_size, e
-                    );
-                })?;
+            let app_vmar = allocate_image_vmar(vmar, &elf, app_size)?;
             let app_base = app_vmar.addr();
             let _app_vmo = match image {
                 Some(img) => app_vmar.load_from_elf_image(&elf, img),
@@ -681,12 +686,11 @@ impl LinuxElfLoader {
             return Ok((interp_entry, sp, initial_brk, path, abi));
         }
 
+        // No interpreter, and still possibly position-independent: a
+        // static-pie (what musl's `gcc -static` builds by default) or a
+        // dynamic linker run as a program (`ldd` is `ld-musl` under a name).
         let size = elf.load_segment_size();
-        let image_vmar = vmar
-            .allocate(None, size, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
-            .inspect_err(|&e| {
-                error!("elf: allocate vmar for size {:#x} failed: {:?}", size, e);
-            })?;
+        let image_vmar = allocate_image_vmar(vmar, &elf, size)?;
         let base = image_vmar.addr();
         let _vmo = match image {
             Some(img) => image_vmar.load_from_elf_image(&elf, img),
@@ -1339,6 +1343,58 @@ mod elf_bounds_tests {
         let parsed = parse_checked_elf(&image).unwrap();
         let vmar = VmAddressRegion::new_root();
         assert!(vmar.load_from_elf(&parsed).is_ok());
+    }
+
+    /// A one-page image of type `e_type`, its segment at vaddr 0 as a
+    /// position-independent image has it.
+    fn an_image_of_type(e_type: u16) -> Vec<u8> {
+        let mut elf = Elf::new().phdr(Phdr {
+            p_type: 1,    // PT_LOAD
+            flags: 0b101, // R+X
+            offset: payload_at(1),
+            file_size: 4,
+            mem_size: 0x1000,
+            ..Default::default()
+        });
+        elf.payload = vec![0x90u8; 4];
+        let mut image = elf.build();
+        image[16..18].copy_from_slice(&e_type.to_le_bytes());
+        image
+    }
+
+    /// A static-pie -- what musl's `gcc -static` builds -- and a dynamic
+    /// linker run as a program have no `PT_INTERP`, and went into the first
+    /// free range of the address space, which is address 0: a null pointer
+    /// read the ELF header.
+    #[test]
+    fn a_position_independent_image_never_lands_on_the_null_page() {
+        let image = an_image_of_type(3); // ET_DYN
+        let elf = parse_checked_elf(&image).unwrap();
+        let root = VmAddressRegion::new_root();
+
+        let at = allocate_image_vmar(&root, &elf, 0x1000).unwrap();
+
+        assert_eq!(at.addr() - root.addr(), PIE_LOAD_BASE);
+        let next = root
+            .allocate(None, PAGE_SIZE, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
+            .unwrap();
+        assert!(
+            next.addr() - root.addr() >= PIE_LOAD_BASE,
+            "what is placed after the image went under the guard, at {:#x}",
+            next.addr()
+        );
+    }
+
+    /// An `ET_EXEC` image names its own addresses, and a guard would move it.
+    #[test]
+    fn an_image_at_absolute_addresses_gets_no_guard() {
+        let image = an_image_of_type(2); // ET_EXEC
+        let elf = parse_checked_elf(&image).unwrap();
+        let root = VmAddressRegion::new_root();
+
+        let at = allocate_image_vmar(&root, &elf, 0x1000).unwrap();
+
+        assert_eq!(at.addr(), root.addr());
     }
 
     /// A 32-bit image reaches `section_header` through the same door and is

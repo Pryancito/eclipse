@@ -285,6 +285,7 @@ fn a_forked_child_sees_its_parent_hole() {
             // not job-stopped, so the mirror the exit path reads starts empty,
             // exactly as both real constructors leave it.
             exit_path: Default::default(),
+            exit_handed_over: Default::default(),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
             itimers: Default::default(),

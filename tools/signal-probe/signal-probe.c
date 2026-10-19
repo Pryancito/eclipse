@@ -18,6 +18,14 @@
 //     with SIGTERM or SIGUSR1 whose parent exited sent it to init, which
 //     reboots or halts on those; and an orphan's death was routed from the
 //     parent it was FORKED from, not the one that adopted it.
+//   * a `waitpid` could reap a dead parent before its children had gone to
+//     their adopter, so the subreaper that reaped it was told ECHILD for the
+//     orphan it was about to be handed, about one run in thirty.
+//   * a zombie gave its pid back before it was reaped, so a fork could be
+//     handed it while the zombie still waited, and a `waitpid` for the new
+//     child collected the dead one.
+//   * an alarm a process left pending when it died went off in the process
+//     its pid went to next, which died of it.
 //   * a SIGSTOP (or Ctrl-Z's SIGTSTP) to a process blocked in a syscall did
 //     not stop it until the syscall returned by itself -- never, for a child
 //     in `pause()` -- and its parent's `waitpid(WUNTRACED)` waited with it.
@@ -52,6 +60,9 @@
 //   * a forked child and a new thread started at nice 0, on SCHED_OTHER and
 //     free to run on any CPU, whatever their parent had: `nice make` only
 //     reniced make. And SCHED_RESET_ON_FORK was accepted and thrown away.
+//   * a static-pie -- what musl's `gcc -static` builds, this probe included
+//     -- was loaded at address 0, so a null pointer read its ELF header
+//     instead of faulting.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -75,7 +86,8 @@
 //   orphan     an orphan's death tells its ADOPTER, with SIGCHLD whatever
 //              signal its dead parent chose at clone(2), and wakes the
 //              adopter's `waitpid` even when a process in between volunteered
-//              as a subreaper after the adoption.
+//              as a subreaper after the adoption. And once `waitpid` has
+//              reaped the dead parent, the orphan is already the adopter's.
 //   inherit    what `fork` and `execve` hand down. A forked child keeps the
 //              handlers, the mask and the alternate stack, and starts with no
 //              pending signal and no alarm. An exec'd image keeps the mask,
@@ -109,6 +121,9 @@
 //              the parent set SCHED_RESET_ON_FORK, which the parent keeps,
 //              reports, and cannot take off without privilege. And the size
 //              `sched_getaffinity` wants: whole longs.
+//   image      the program is mapped above the null page, and reading
+//              through a null pointer kills with SIGSEGV, however it was
+//              linked (static, static-pie, dynamic).
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -710,8 +725,39 @@ static void sec_orphan(void) {
           : code == 1 ? "its waitpid(-1) returned the orphan, never its child"
                       : "the volunteer itself failed",
           code);
+    close(go[0]);
+    close(go[1]);
     signal(SIGALRM, SIG_DFL);
     alarm(20);
+
+    // 3. Linux hands the children over in `exit_notify`, before the parent
+    //    is a zombie anyone can reap: once our waitpid has reaped it, its
+    //    child is ours. A waitpid that lands in between is a matter of
+    //    timing, so it is asked many times.
+    if (pipe(go) != 0) {
+        check(0, "pipe", "%s", strerror(errno));
+        return;
+    }
+    g_watch_pid = 0;
+    int rounds = 128, strays = 0, unmade = 0;
+    for (int i = 0; i < rounds; i++) {
+        pid_t o = make_orphan(SIGCHLD, go[0]);
+        if (o <= 0) {
+            unmade++;
+            continue;
+        }
+        if (waitpid(o, &st, WNOHANG) != 0) strays++;
+        if (write(go[1], "x", 1) != 1) check(0, "write", "%s", strerror(errno));
+        for (int tries = 0; tries < 200; tries++) {
+            pid_t w = waitpid(o, &st, 0);
+            if (w == o || (w == -1 && errno != ECHILD && errno != EINTR)) break;
+            if (w == -1 && errno == ECHILD) sleep_ms(5);
+        }
+    }
+    check(strays == 0 && unmade == 0, "its parent reaped, the orphan is ours",
+          "%d of %d orphans not ours yet (%d not made)", strays, rounds, unmade);
+    close(go[0]);
+    close(go[1]);
 }
 
 // ---------------------------------------------------------------- inherit
@@ -1020,6 +1066,59 @@ static void sec_wait(void) {
           : WIFEXITED(st) && WEXITSTATUS(st) == 101 ? "the exec failed"
                                                     : "tid == pid, its own mask, tgkill reaches it",
           st);
+
+    // A zombie wears its pid until it is reaped. Linux counts pids up to
+    // pid_max before it comes round; a kernel that hands out freed pids
+    // first gives the zombie's to a fork within as many forks as it has
+    // pids free.
+    c = child_that_exits(0, 0);
+    memset(&si, 0, sizeof si);
+    waitid(P_PID, (id_t)c, &si, WEXITED | WNOWAIT);
+    int forks = 512, given = 0;
+    for (int i = 0; i < forks && !given; i++) {
+        pid_t k = child_that_exits(0, 0);
+        if (k == c) given = i + 1;
+        if (k > 0) waitpid(k, NULL, 0);
+    }
+    got = waitpid(c, &st, 0);
+    if (given)
+        check(0, "a zombie's pid is not handed out again", "fork %d of %d was handed it", given,
+              forks);
+    else
+        check(got == c, "a zombie's pid is not handed out again", "none of %d forks; waitpid: %s",
+              forks, got == c ? "the zombie" : "not the zombie");
+
+    // An alarm dies with the process that set it. Once its pid is free, a
+    // fork can be handed it: that one arms an alarm of its own the same way
+    // and lives past the dead one's. Linux takes too long to come round to
+    // the pid for this to be asked there.
+    c = fork();
+    if (c == 0) {
+        alarm(1);
+        _exit(0);
+    }
+    waitpid(c, &st, 0);
+    int heir = 0, heir_st = 0;
+    for (int i = 0; i < forks && !heir; i++) {
+        pid_t k = fork();
+        if (k == 0) {
+            if (getpid() != c) _exit(0);
+            alarm(5);
+            sleep_ms(1500);
+            alarm(0);
+            _exit(42);
+        }
+        if (k == c) heir = i + 1;
+        if (k > 0) waitpid(k, &heir_st, 0);
+    }
+    if (!heir)
+        check(1, "a dead process's alarm dies with it", "no fork of %d was handed its pid", forks);
+    else
+        check(WIFEXITED(heir_st) && WEXITSTATUS(heir_st) == 42, "a dead process's alarm dies with it",
+              "fork %d was handed its pid and %s", heir,
+              WIFSIGNALED(heir_st) && WTERMSIG(heir_st) == SIGALRM ? "died of its alarm"
+              : WIFEXITED(heir_st) && WEXITSTATUS(heir_st) == 42 ? "lived past it"
+                                                                 : "ended some other way");
 }
 
 // ------------------------------------------------------------------- stop
@@ -1609,6 +1708,29 @@ static void sec_sched(void) {
     check(r > 0 && r <= 16 && r % 8 == 0, "getaffinity: a 16-byte buffer", "ret %ld", r);
 }
 
+// ------------------------------------------------------------------- image
+
+static void sec_image(void) {
+    // Linux keeps the low 64 KiB unmappable (`vm.mmap_min_addr`); an image
+    // loaded at 0 has its first function in the first few pages.
+    uintptr_t code = (uintptr_t)&sec_image;
+    check(code >= 0x10000, "the program is above the null page", "sec_image at %#lx",
+          (unsigned long)code);
+    pid_t c = fork();
+    if (c == 0) {
+        signal(SIGSEGV, SIG_DFL);
+        volatile int word = *g_unmapped;
+        (void)word;
+        _exit(3);  // the read came back
+    }
+    int st = 0;
+    while (waitpid(c, &st, 0) == -1 && errno == EINTR) {
+    }
+    check(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV, "a null read is a SIGSEGV",
+          "status %#x%s", st,
+          WIFEXITED(st) && WEXITSTATUS(st) == 3 ? " (the read came back)" : "");
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -1630,6 +1752,7 @@ static const struct {
     {"spawn", "a vfork child runs in its parent's memory", sec_spawn},
     {"badexec", "a failed execve returns, with Linux's errno", sec_badexec},
     {"sched", "what a fork hands down to the scheduler", sec_sched},
+    {"image", "the program is not mapped at the null page", sec_image},
 };
 
 int main(int argc, char **argv) {

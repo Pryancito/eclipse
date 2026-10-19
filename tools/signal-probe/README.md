@@ -63,6 +63,20 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
     libres de correr en cualquier CPU, tuviera lo que tuviera su padre:
     `nice make` solo bajaba la prioridad de `make`. Y `SCHED_RESET_ON_FORK`
     se aceptaba y se tiraba.
+15. Un static-pie (lo que construye el `gcc -static` de musl, esta sonda
+    incluida) se cargaba en la direccion 0, asi que un puntero nulo leia su
+    cabecera ELF en vez de fallar.
+16. Un `waitpid` podia cosechar a un padre muerto antes de que sus hijos
+    pasaran al adoptante, y el subreaper que lo cosechaba recibia `ECHILD`
+    por el huerfano que estaba a punto de heredar, mas o menos una vez de
+    cada treinta.
+17. Un zombi devolvia su pid antes de que lo cosecharan, asi que un `fork`
+    podia recibirlo mientras el zombi seguia esperando, y un `waitpid` del
+    hijo nuevo recogia al muerto.
+18. Una alarma que un proceso dejaba pendiente al morir saltaba en el proceso
+    que heredaba su pid, que moria de ella. La sonda `orphan` moria asi de
+    SIGALRM dos o tres vueltas de cada treinta, mucho antes de su propia
+    alarma de 20 s.
 
 ## Compilar
 
@@ -100,11 +114,12 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `restart` | con `SA_RESTART`, `read` y `wait4` se reanudan tras el manejador; `nanosleep` y `poll` dan `EINTR` igualmente, como en Linux; `sem_wait` (una espera futex sin timeout) tambien se reanuda; coger un mutex PI ocupado se rehace tras cualquier manejador, con `SA_RESTART` o sin el |
 | `badrip` | un manejador que pone un `rip` no canonico en su `ucontext` le cuesta al proceso un SIGSEGV (`SI_KERNEL`) y nada mas. Solo x86_64 |
 | `ids` | el kernel rechaza lo que no puede cargar: un puntero de TLS fuera del espacio de usuario (`arch_prctl`, `clone(CLONE_SETTLS)`) y el pid `INT_MIN`, que no tiene negativo, en `waitpid` |
-| `orphan` | la muerte de un huerfano avisa a quien lo **adopto**, con SIGCHLD aunque su padre muerto eligiera otra señal en `clone(2)`, y despierta el `waitpid` del adoptante aunque un proceso de en medio se haya hecho subreaper despues de la adopcion. La señal elegida es SIGWINCH, que init descarta, por si el subreaper no se cumpliera |
+| `orphan` | la muerte de un huerfano avisa a quien lo **adopto**, con SIGCHLD aunque su padre muerto eligiera otra señal en `clone(2)`, y despierta el `waitpid` del adoptante aunque un proceso de en medio se haya hecho subreaper despues de la adopcion. Y en cuanto `waitpid` ha cosechado al padre muerto, el huerfano ya es del adoptante (se pregunta 128 veces, porque es cuestion de tiempos). La señal elegida es SIGWINCH, que init descarta, por si el subreaper no se cumpliera |
 | `inherit` | lo que pasa por `fork` (manejadores, mascara y pila alternativa; ni señales pendientes ni alarma) y por `execve` (mascara, pendientes, alarma y `SIG_IGN`; los manejadores vuelven a `SIG_DFL` y la pila alternativa se va). La mitad del `execve` la cuenta la propia sonda relanzada con `--exec-report` |
-| `wait` | lo que cuentan `waitid` y `waitpid`: una salida con `WNOWAIT` y luego recogida; un codigo de salida negativo, que llega como su byte bajo (`exit_group(-1)` es 255 y el `exit(-3)` del ultimo hilo, 253); una muerte por SIGTERM (`CLD_KILLED`); una parada de un hijo en `pause()` y una continuacion, cada una contada una vez; `waitid(P_PGID, 0)`, que es el grupo propio; `SA_NOCLDSTOP`; `exit()` desde un segundo hilo, que acaba con todo el proceso; y `execve()` desde un segundo hilo, cuya imagen nueva toma el pid como tid, conserva la mascara de ese hilo y recibe un `tgkill(pid, pid)` |
+| `wait` | lo que cuentan `waitid` y `waitpid`: una salida con `WNOWAIT` y luego recogida; un codigo de salida negativo, que llega como su byte bajo (`exit_group(-1)` es 255 y el `exit(-3)` del ultimo hilo, 253); una muerte por SIGTERM (`CLD_KILLED`); una parada de un hijo en `pause()` y una continuacion, cada una contada una vez; `waitid(P_PGID, 0)`, que es el grupo propio; `SA_NOCLDSTOP`; `exit()` desde un segundo hilo, que acaba con todo el proceso; y `execve()` desde un segundo hilo, cuya imagen nueva toma el pid como tid, conserva la mascara de ese hilo y recibe un `tgkill(pid, pid)`. Y un zombi conserva su pid hasta que lo cosechan: ninguno de 512 `fork` lo recibe; y la alarma de un proceso muerto muere con el, aunque otro reciba su pid (en Linux el pid tarda demasiado en volver para preguntarlo) |
 | `stop` | una parada llega a un proceso metido en una syscall que espera (`nanosleep`, `read`, `sigsuspend`) y la syscall sigue cuando se le continua: el `read` lee, sin `EINTR`, y el `sigsuspend` sigue esperando su señal y al volver deja la mascara de antes |
 | `teardown` | un proceso que sale (`exit_group`) con un segundo hilo dormido en `pause`, `read`, `nanosleep`, `waitpid` o en el `vfork` de un hijo que no hace `exec` ya no tiene ese hilo cuando se le recoge: un mutex robusto compartido que el hilo tenia cogido vuelve con `EOWNERDEAD`. `/proc/meminfo` no sirve para esto ni en Linux, que a veces enseña tarde unos cientos de MiB liberados |
 | `spawn` | un hijo de `vfork` corre en la memoria de su padre: lo que escribe ahi lo lee el padre, asi que `posix_spawn` informa de un programa que no existe y de una accion de fichero que falla con `ENOENT`, y veinte `posix_spawn` de `sh -c 'exit 3'` seguidos devuelven cada uno su hijo con su estado |
 | `badexec` | un `execve` de lo que no es un programa vuelve, con el errno de Linux: `EACCES` sin bit de ejecucion, para un directorio o con un `PT_INTERP` que es un directorio; `ENOEXEC` para basura, un guion sin `#!`, un `#!` vacio o que nombra basura, y un ELF de otra maquina; `ENOENT` para un `#!` o un `PT_INTERP` que no existen; `EIO` para un `PT_INTERP` de 10 bytes y `ELIBBAD` para uno de 128 bytes de basura; cinco guiones encadenados corren y seis dan `ELOOP`. Y `sh -c` de un guion sin `#!` lo corre |
 | `sched` | lo que un hijo de `fork` y un hilo nuevo heredan del padre: el nice, la mascara de CPUs y la politica. Con `SCHED_RESET_ON_FORK` el padre la conserva y la informa (`sched_getscheduler`, `sched_getattr`) y el hijo nace sin ella: en `SCHED_OTHER` si el padre era de tiempo real, con nice 0 si el suyo era negativo y con el suyo si era positivo. Sin privilegio no se quita, `sched_setattr` no la acepta en la palabra de politica y `sched_getaffinity` quiere un buffer de `long` enteros. La seccion corre como root |
+| `image` | el programa esta por encima de la pagina nula y leer por un puntero nulo mata con SIGSEGV, se enlazara como se enlazara (estatico, static-pie, dinamico). Compilada con el musl de `cargo image` la sonda es static-pie, que es el caso que fallaba |
