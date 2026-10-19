@@ -216,6 +216,110 @@ fn a_legacy_setplane_writes_the_rectangles_the_atomic_uapi_reads_back() {
     c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
 }
 
+/// `drm_mode_page_flip_ioctl`: the new fb is measured against the
+/// primary plane's source rectangle (`drm_framebuffer_check_src_coords`),
+/// which SETCRTC's viewport, SETPLANE and an atomic commit all set. This
+/// measured the mode at (0, 0).
+#[test]
+fn a_page_flip_measures_the_new_fb_against_the_plane_source_rectangle() {
+    let (_screen, c) = atomic_client(32, 8);
+    let wide = c.create_dumb(64, 8);
+    let fb_wide = c.addfb2(&wide);
+    let exact = c.create_dumb(32, 8);
+    let fb_exact = c.addfb2(&exact);
+    let mid = c.create_dumb(48, 8);
+    let fb_mid = c.addfb2(&mid);
+    let enospc = Err(FsError::NoDeviceSpace);
+
+    // A plane never positioned (no SETCRTC yet: this tree lets a client
+    // start with a flip) is measured against the mode.
+    let narrow = c.create_dumb(16, 8);
+    let fb_narrow = c.addfb2(&narrow);
+    assert_eq!(
+        c.page_flip(CRTC, fb_narrow, 0),
+        enospc,
+        "no rectangle yet: the mode is the yardstick"
+    );
+    // As soon as any of the rectangle is set, the rectangle is. SRC_W
+    // alone on the off plane: 32 wide, 0 tall, which a 4-row fb holds
+    // and the 8-row mode would not.
+    assert_eq!(
+        commit(
+            &c,
+            &Request::new(&[PLANE], &[1], &[PROP_SRC_W], &[32 << 16]),
+            0
+        ),
+        Ok(0)
+    );
+    let short = c.create_dumb(32, 4);
+    let fb_short = c.addfb2(&short);
+    assert_eq!(
+        c.page_flip(CRTC, fb_short, 0),
+        Ok(0),
+        "a 32 x 0 rectangle fits"
+    );
+    drm::flush_pending_flip_completions();
+    assert_eq!(
+        c.page_flip(CRTC, fb_narrow, 0),
+        enospc,
+        "and 16 columns do not hold it"
+    );
+
+    // The plane 16 pixels into a 64-wide fb: a flip needs 48 columns.
+    set_crtc(&c, fb_wide, Some((32, 8, 16, 0)));
+    assert_eq!(
+        c.page_flip(CRTC, fb_exact, 1),
+        enospc,
+        "the size of the mode, but the plane starts 16 pixels in"
+    );
+    assert_eq!(c.page_flip(CRTC, fb_mid, 2), Ok(0), "16 + 32 fits in 48");
+    drm::flush_pending_flip_completions();
+    let crtc = get_crtc(&c);
+    assert_eq!(
+        (crtc.fb_id, crtc.x),
+        (fb_mid, 16),
+        "the flip keeps the viewport"
+    );
+
+    // An atomic commit moving the plane to the fb's origin: the exact fb
+    // fits again.
+    assert_eq!(
+        commit(&c, &Request::new(&[PLANE], &[1], &[PROP_SRC_X], &[0]), 0),
+        Ok(0)
+    );
+    assert_eq!(c.page_flip(CRTC, fb_exact, 3), Ok(0));
+    drm::flush_pending_flip_completions();
+
+    // SETPLANE scrolls the plane down 4 rows: an fb of 8 rows is short.
+    let mut req: DrmModeSetPlane = unsafe { core::mem::zeroed() };
+    req.plane_id = PLANE;
+    req.crtc_id = CRTC;
+    req.fb_id = fb_wide;
+    req.crtc_w = 32;
+    req.crtc_h = 4;
+    req.src_y = 4 << 16;
+    req.src_w = 32 << 16;
+    req.src_h = 4 << 16;
+    assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut req), Ok(0));
+    let tall = c.create_dumb(32, 12);
+    let fb_tall = c.addfb2(&tall);
+    assert_eq!(c.page_flip(CRTC, fb_exact, 4), Ok(0), "4 + 4 rows fit in 8");
+    drm::flush_pending_flip_completions();
+    // Rows 6..10 of the 12-row fb: the 8-row fb cannot hold them.
+    req.fb_id = fb_tall;
+    req.src_y = 6 << 16;
+    assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut req), Ok(0));
+    assert_eq!(c.page_flip(CRTC, fb_exact, 5), enospc, "6 + 4 rows do not");
+    assert_eq!(c.page_flip(CRTC, fb_tall, 6), Ok(0), "but fit in 12");
+    drm::flush_pending_flip_completions();
+    for fb in [fb_wide, fb_exact, fb_mid, fb_tall, fb_narrow, fb_short] {
+        c.rmfb(fb).expect("RMFB");
+    }
+    for buf in [&wide, &exact, &mid, &tall, &narrow, &short] {
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+}
+
 #[test]
 fn removing_the_scanout_fb_takes_the_mode_and_active_with_it() {
     let (_screen, c) = atomic_client(32, 8);
