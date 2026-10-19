@@ -13,6 +13,10 @@ mod mixer;
 /// (`nvidia.nvidiactl`). x86_64 only, like the NVIDIA driver under it.
 #[cfg(target_arch = "x86_64")]
 pub mod nvidia;
+/// `/dev/nvidia-uvm`, which CUDA opens beside `/dev/nvidiactl`
+/// (`nvidia.uvm`). x86_64 only, for the same reason.
+#[cfg(target_arch = "x86_64")]
+pub mod nvidia_uvm;
 pub mod pty;
 mod random;
 mod snd;

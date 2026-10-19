@@ -1381,6 +1381,9 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // driver (`nvidia.nvidiactl`, default off).
         #[cfg(target_arch = "x86_64")]
         devfs::nvidia::create_nodes(&devfs_root);
+        // `/dev/nvidia-uvm` beside them (`nvidia.uvm`, default off).
+        #[cfg(target_arch = "x86_64")]
+        devfs::nvidia_uvm::create_node(&devfs_root);
         if have_drm || have_display {
             if let Ok(dri_dev) = devfs_root.add_dir("dri") {
                 if let Err(e) = dri_dev.add("card0", Arc::new(devfs::DrmDev::new(0))) {

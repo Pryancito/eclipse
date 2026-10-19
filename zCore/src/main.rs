@@ -945,6 +945,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 kernel_hal::drivers::set_nvidiactl_enabled(true);
                 klog_info!("Eclipse: nvidia.nvidiactl -- /dev/nvidiactl and /dev/nvidia<N>");
             }
+            // `/dev/nvidia-uvm`, without which CUDA's cuInit fails. Default
+            // off: it serves only cuInit's three calls so far, and logs the
+            // first of every other one CUDA makes.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.uvm") {
+                kernel_hal::drivers::set_nvidia_uvm_enabled(true);
+                klog_info!("Eclipse: nvidia.uvm -- /dev/nvidia-uvm");
+            }
             if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gem_vram_bar1") {
                 kernel_hal::drivers::set_gem_vram_bar1_enabled(true);
                 klog_info!(

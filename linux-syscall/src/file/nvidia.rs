@@ -1,4 +1,4 @@
-//! The ioctls of `/dev/nvidiactl` and `/dev/nvidia<N>`.
+//! The ioctls of `/dev/nvidiactl`, `/dev/nvidia<N>` and `/dev/nvidia-uvm`.
 //!
 //! They are not dispatched through the inode's `io_control`, which sees
 //! neither the fd table nor the caller, and runs under the `File`'s lock:
@@ -10,11 +10,13 @@
 
 use super::*;
 use linux_object::fs::devfs::nvidia::{gpu_mask, NvCaller};
+use linux_object::fs::devfs::nvidia_uvm::UvmOpen;
 use linux_object::fs::devfs::NvidiaOpen;
 
 impl Syscall<'_> {
     /// `Some` when `file_like` is an open of an NVIDIA node, with the ioctl's
-    /// result; `None` sends the ioctl down the ordinary path.
+    /// result; `None` sends the ioctl down the ordinary path. UVM_MM_INITIALIZE
+    /// names a fd too, so `/dev/nvidia-uvm` comes through here as well.
     pub(super) fn sys_nvidia_ioctl(
         &self,
         file_like: &Arc<dyn FileLike>,
@@ -22,8 +24,12 @@ impl Syscall<'_> {
         arg: usize,
     ) -> Option<SysResult> {
         let inode = file_like.downcast_ref::<File>()?.inode();
-        let open = inode.downcast_ref::<NvidiaOpen>()?;
         let proc = self.linux_process();
+        if let Some(uvm) = inode.downcast_ref::<UvmOpen>() {
+            let open_of_fd = |fd: i32| Some(proc.get_file(fd.into()).ok()?.inode());
+            return Some(uvm.ioctl(request as u32, arg, &open_of_fd));
+        }
+        let open = inode.downcast_ref::<NvidiaOpen>()?;
         let mask = || {
             gpu_mask(
                 proc.get_files()

@@ -56,6 +56,11 @@ fn prepare_open_inode(inode: Arc<dyn INode>) -> LxResult<Arc<dyn INode>> {
     if let Some(nv) = inode.downcast_ref::<linux_object::fs::devfs::NvidiaDev>() {
         return nv.open_client().map_err(LxError::from);
     }
+    // `/dev/nvidia-uvm`: every open is its own, a VA space once initialised.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(uvm) = inode.downcast_ref::<linux_object::fs::devfs::nvidia_uvm::UvmDev>() {
+        return Ok(uvm.open_client());
+    }
     Ok(
         if inode
             .downcast_ref::<linux_object::fs::pty::PtmxINode>()

@@ -405,6 +405,15 @@ pub fn set_nvidiactl_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_nvidiactl_enabled(_v: bool) {}
 
+/// Creates `/dev/nvidia-uvm` as well (`nvidia.uvm`), which CUDA opens on top
+/// of `/dev/nvidiactl`. Default off: see `linux-object/src/fs/devfs/nvidia_uvm.rs`.
+#[cfg(target_arch = "x86_64")]
+pub fn set_nvidia_uvm_enabled(v: bool) {
+    zcore_drivers::display::nvctl::set_uvm_enabled(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_nvidia_uvm_enabled(_v: bool) {}
+
 /// Enables on-demand console-GPU GSP bring-up (`nvidia.console_gsp`). Default off.
 #[cfg(target_arch = "x86_64")]
 pub fn set_console_gsp_enabled(v: bool) {

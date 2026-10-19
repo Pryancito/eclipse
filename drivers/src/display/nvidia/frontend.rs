@@ -41,6 +41,19 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+static UVM_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// `nvidia.uvm`: create `/dev/nvidia-uvm` too. Latched like [`set_enabled`],
+/// and only read with it on: what CUDA hands `/dev/nvidia-uvm` are RM
+/// clients it made through `/dev/nvidiactl`.
+pub fn set_uvm_enabled(v: bool) {
+    UVM_ENABLED.store(v, Ordering::Relaxed);
+}
+
+pub fn uvm_enabled() -> bool {
+    UVM_ENABLED.load(Ordering::Relaxed)
+}
+
 /// Whether the RM core (OBJSYS and the resource server) is constructed. It
 /// is built by the first GPU attach, so a machine with no NVIDIA GPU, or a
 /// boot that has not attached one yet, has no RM to take an escape at all.

@@ -4,7 +4,8 @@
 //! (the `nvidia.nvidiactl` hatch). Installed unless the build is run with
 //! `ECLIPSE_NVIDIA_USERSPACE=0`, which also takes out NVIDIA's files an earlier
 //! build left in the rootfs. They never reach the QEMU live root, where there
-//! is no NVIDIA GPU for them.
+//! is no NVIDIA GPU for them. `/usr/bin/cuda-probe` (`cuda_probe.rs`), a
+//! check of CUDA through libcuda, comes and goes with them.
 //!
 //! # The version must match the vendored RM exactly
 //!
@@ -439,7 +440,8 @@ pub(super) fn remove(root: &Path, why: &str) {
     let Some(version) = super::nvidia_firmware::pinned_rm_version() else {
         return;
     };
-    let removed = remove_with(root, &plan(&version));
+    let probe = fs::remove_file(root.join(super::cuda_probe::PATH)).is_ok() as usize;
+    let removed = remove_with(root, &plan(&version)) + probe;
     if removed > 0 {
         println!(
             "  {}: took out NVIDIA's userspace ({removed} files): {why}",
@@ -461,7 +463,10 @@ pub(super) fn install(rootfs: &Path) {
     println!("Installing NVIDIA's userspace {version} (nvidia-smi, NVML, libcuda) and glibc...");
     let cache = PROJECT_DIR.join("ignored").join("nvidia-userspace-cache");
     match install_with(rootfs, &cache, &version, &plan(&version), &download) {
-        Ok(()) => println!("  done"),
+        Ok(()) => {
+            super::cuda_probe::install(rootfs);
+            println!("  done");
+        }
         Err(why) => eprintln!(
             "warning: NVIDIA userspace: {why}; the image has none. A machine that \
              cannot reach {POOL} can be given the packages in {}, and {HATCH}=0 \
