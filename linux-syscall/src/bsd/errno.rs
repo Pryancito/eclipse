@@ -24,8 +24,8 @@ use linux_object::error::LxError;
 ///
 /// Errors with no peer on FreeBSD say so here rather than landing on a
 /// number that means something else: `ETIME` (a timer that expired) answers
-/// `ETIMEDOUT`, `EUNDEF`, `EBADFD` and `EBADR` answer `EINVAL`, and `ENOKEY`
-/// answers `EACCES`.
+/// `ETIMEDOUT`, `EUNDEF`, `EBADFD` and `EBADR` answer `EINVAL`, `ENOKEY`
+/// answers `EACCES`, and `ELIBBAD` answers `ENOEXEC`.
 pub fn lx_to_freebsd(err: LxError) -> i32 {
     match err {
         // Not an error number on either system. It reaches here only from a
@@ -103,6 +103,10 @@ pub fn lx_to_freebsd(err: LxError) -> i32 {
         // worse than `EINVAL`: it would claim the descriptor itself is wrong,
         // and a program would close a descriptor that is still good.
         LxError::EBADFD => bsd::EINVAL,
+        // FreeBSD has no `ELIBBAD`. Its image activator answers a dynamic
+        // linker that is not one with `ENOEXEC`, and that is the errno a
+        // FreeBSD shell turns into "Exec format error".
+        LxError::ELIBBAD => bsd::ENOEXEC,
         LxError::ENOTSOCK => bsd::ENOTSOCK,
         LxError::EMSGSIZE => bsd::EMSGSIZE,
         LxError::ENOPROTOOPT => bsd::ENOPROTOOPT,
@@ -179,6 +183,7 @@ mod tests {
         LxError::ETIME,
         LxError::EBADR,
         LxError::EBADFD,
+        LxError::ELIBBAD,
         LxError::EOVERFLOW,
         LxError::ENOTSOCK,
         LxError::ENOPROTOOPT,
@@ -240,6 +245,7 @@ mod tests {
         assert_eq!(lx_to_freebsd(LxError::ETIME), 60); // ETIMEDOUT
         assert_eq!(lx_to_freebsd(LxError::EBADFD), 22); // EINVAL
         assert_eq!(lx_to_freebsd(LxError::ENOKEY), 13); // EACCES
+        assert_eq!(lx_to_freebsd(LxError::ELIBBAD), 8); // ENOEXEC
     }
 
     #[test]
@@ -272,6 +278,7 @@ mod tests {
                         | (LxError::EINVAL, LxError::EBADFD)
                         | (LxError::EUNDEF, LxError::EBADR)
                         | (LxError::EACCES, LxError::ENOKEY)
+                        | (LxError::ENOEXEC, LxError::ELIBBAD)
                         | (LxError::ETIMEDOUT, LxError::ETIME)
                         | (LxError::ETIME, LxError::ETIMEDOUT)
                 );

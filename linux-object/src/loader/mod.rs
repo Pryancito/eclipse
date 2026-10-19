@@ -221,8 +221,16 @@ const _: () = assert!(
 );
 
 mod abi;
+mod preflight;
 
 pub use abi::AuxIdentity;
+
+/// How many symbolic links a `#!` interpreter's path may go through, and a
+/// `PT_INTERP`'s. One constant each, shared by [`LinuxElfLoader::preflight`]
+/// and the loader, because the preflight is only worth anything while it
+/// finds exactly the file the loader is going to open.
+const SHEBANG_FOLLOW: usize = 1;
+const PT_INTERP_FOLLOW: usize = 4;
 
 /// Linux ELF Program Loader.
 pub struct LinuxElfLoader {
@@ -274,57 +282,15 @@ impl LinuxElfLoader {
         res
     }
 
-    /// Maximum number of interpreter levels (shebang + ELF PT_INTERP combined).
-    const MAX_INTERP_DEPTH: usize = 4;
-
-    /// Walk the shebang interpreter chain, resolving every level, WITHOUT
-    /// loading or mapping anything.
+    /// How deep a `#!` chain may go: the file at depth `d` is the one the
+    /// `d`-th script names, and one deeper than this is `ELOOP`.
     ///
-    /// `execve` has a point of no return: `vmar.clear()` destroys the calling
-    /// process's address space, and every step after it is assumed to succeed.
-    /// A shebang whose interpreter does not exist used to be discovered
-    /// *after* that point, so the ENOENT was returned to a process whose code
-    /// was no longer mapped, and it faulted on the instruction after the
-    /// syscall:
-    ///
-    /// ```text
-    /// shebang: lookup interp "usr/bin/env" failed: EntryNotFound
-    /// execve: LinuxElfLoader::load failed: ENOENT
-    /// unhandled page fault @ 0x55991a(EXECUTE | USER) [unmapped] -> SIGSEGV
-    /// ```
-    ///
-    /// Linux resolves the whole chain while building the `bprm`, before
-    /// `begin_new_exec` commits, so a missing interpreter is an ordinary
-    /// ENOENT and the shell simply reports "not found". Call this before the
-    /// clear and let its error propagate while the caller is still whole.
-    ///
-    /// Only the head of each file is read -- a shebang line is at most 512
-    /// bytes -- so this costs one `read_at` per interpreter level, and nothing
-    /// at all for the ELF case, which is the overwhelmingly common one.
-    pub fn preflight_interpreters(&self, head: &[u8]) -> LxResult<()> {
-        let mut buf = [0u8; 512];
-        let mut n = head.len().min(buf.len());
-        buf[..n].copy_from_slice(&head[..n]);
-        // One more level than the loader accepts: going deeper is the loader's
-        // error to report, with its own message, not this check's.
-        for _ in 0..=Self::MAX_INTERP_DEPTH {
-            let interp = match shebang_interp(&buf[..n]) {
-                Some(i) => i,
-                // Not a script: an ELF (or garbage the loader will reject).
-                None => return Ok(()),
-            };
-            let inode = self
-                .root_inode
-                .lookup_follow(interp.trim_start_matches('/'), 1)
-                .map_err(|e| {
-                    warn!("execve: interpreter {:?} does not resolve: {:?}", interp, e);
-                    e
-                })?;
-            // An interpreter may itself be a script, so keep walking.
-            n = inode.read_at(0, &mut buf)?;
-        }
-        Ok(())
-    }
+    /// `exec_binprm`'s `if (depth > 5)`: a script may name a script five
+    /// times over, and the sixth file must be the ELF. A `PT_INTERP` does not
+    /// count: it is not a rewrite of the image, and the dynamic linker's own
+    /// `PT_INTERP` is never read. This was 4, which refused a five-script
+    /// chain Linux runs.
+    const MAX_INTERP_DEPTH: usize = 5;
 
     /// Internal recursive loader that tracks interpreter depth.
     // Eight arguments, one over clippy's limit: every one of them is part of
@@ -395,10 +361,13 @@ impl LinuxElfLoader {
                 return Err(ZxError::ACCESS_DENIED.into());
             }
             let interp_rel = interp.trim_start_matches('/');
-            let inode = self.root_inode.lookup_follow(interp_rel, 1).map_err(|e| {
-                error!("shebang: lookup interp {:?} failed: {:?}", interp_rel, e);
-                e
-            })?;
+            let inode = self
+                .root_inode
+                .lookup_follow(interp_rel, SHEBANG_FOLLOW)
+                .map_err(|e| {
+                    error!("shebang: lookup interp {:?} failed: {:?}", interp_rel, e);
+                    e
+                })?;
             let interp_vmo = inode.read_as_vmo_cached().map_err(|e| {
                 error!("shebang: read interp {:?} failed: {:?}", interp_rel, e);
                 e
@@ -523,13 +492,16 @@ impl LinuxElfLoader {
                 return Err(ZxError::ACCESS_DENIED.into());
             }
             let interp_rel = interp.trim_start_matches('/');
-            let inode = self.root_inode.lookup_follow(interp_rel, 4).map_err(|e| {
-                error!(
-                    "elf: lookup PT_INTERP {:?} failed: {:?} (check if file exists in rootfs)",
-                    interp, e
-                );
-                e
-            })?;
+            let inode = self
+                .root_inode
+                .lookup_follow(interp_rel, PT_INTERP_FOLLOW)
+                .map_err(|e| {
+                    error!(
+                        "elf: lookup PT_INTERP {:?} failed: {:?} (check if file exists in rootfs)",
+                        interp, e
+                    );
+                    e
+                })?;
             let interp_vmo = inode.read_as_vmo_cached().map_err(|e| {
                 error!("elf: read interp {:?} failed: {:?}", interp, e);
                 e
@@ -892,9 +864,9 @@ mod shebang_tests {
         assert_eq!(split_shebang(""), None);
     }
 
-    /// `preflight_interpreters` must say "not a script" for anything that is
-    /// not a `#!` file, because the preflight runs on EVERY exec and an ELF
-    /// must not pay for it -- nor be rejected by it.
+    /// `shebang_interp` must say "not a script" for anything that is not a
+    /// `#!` file: the preflight runs it on EVERY exec, and an ELF read as a
+    /// script would be looked for an interpreter it does not have.
     #[test]
     fn only_a_hash_bang_file_names_an_interpreter() {
         assert_eq!(shebang_interp(b"#!/bin/sh\necho hi\n"), Some("/bin/sh"));
@@ -2575,12 +2547,11 @@ mod abi_and_limits_tests {
 
     #[test]
     fn the_interpreter_chain_stops_at_the_depth_linux_stops_at() {
-        // `BINPRM_MAX_RECURSION`, `include/linux/binfmts.h`. It is what
-        // `load_impl` refuses to go past and, one level deeper, how far
-        // `preflight_interpreters` resolves -- so a chain that is too deep is
-        // the loader's error to report, with its own message, and not the
-        // preflight check's.
-        assert_eq!(LinuxElfLoader::MAX_INTERP_DEPTH, 4);
+        // `exec_binprm`'s `depth > 5`, and measured on a Linux host: a chain
+        // of five scripts ending at `/bin/sh` runs, a chain of six is ELOOP.
+        // The preflight refuses past it with ELOOP; `load_impl`'s own check
+        // is the backstop, and must not refuse anything the preflight lets by.
+        assert_eq!(LinuxElfLoader::MAX_INTERP_DEPTH, 5);
     }
 
     #[test]
