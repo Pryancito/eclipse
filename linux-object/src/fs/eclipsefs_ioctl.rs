@@ -1599,6 +1599,42 @@ fn xattr(
     })
 }
 
+/// `pwritev2(RWF_ATOMIC)` into `inode` (opened as `path`) on an EclipseFS
+/// mount: all of `data` or nothing, untorn by a crash. `None` when the
+/// inode is on another filesystem.
+pub(crate) fn eclipsefs_write_atomic(
+    inode: &Arc<dyn INode>,
+    path: &str,
+    offset: u64,
+    data: &[u8],
+) -> Option<LxResult<usize>> {
+    let (fs, ino) = efs_of(inode)?;
+    Some((|| {
+        if fs.read_only || super::path_is_read_only(path) {
+            return Err(LxError::EROFS);
+        }
+        fs.inner
+            .lock()
+            .write_atomic(ino, offset, data)
+            .map_err(|e| match e {
+                // RWF_ATOMIC on a file that cannot do it.
+                EfsError::Unsupported(_) => LxError::EINVAL,
+                e => errno(e),
+            })
+    })())
+}
+
+/// `statx`'s atomic write unit (smallest, largest) for `inode`: a regular
+/// file of an EclipseFS mount that is not no-COW. `None` otherwise.
+pub fn eclipsefs_atomic_write_unit(inode: &Arc<dyn INode>) -> Option<(u32, u32)> {
+    let (fs, ino) = efs_of(inode)?;
+    let ok = fs.inner.lock().atomic_write_supported(ino).ok()?;
+    ok.then_some((
+        eclipsefs::format::BLOCK_SIZE as u32,
+        eclipsefs::cow::ATOMIC_WRITE_MAX as u32,
+    ))
+}
+
 /// `fallocate(2)` on a file of an EclipseFS mount, with the mode already
 /// judged by the syscall layer: real preallocation, a punched hole that
 /// gives its blocks back, a zeroed range (`None` for other filesystems).
@@ -2880,6 +2916,36 @@ mod tests {
     }
 
     #[test]
+    fn atomic_writes_go_through_whole_and_say_their_unit() {
+        let disk = formatted(32 << 20);
+        let fs = mount(&disk);
+        let root = fs.root_inode();
+        let inode = file_with(&root, "a", &pattern(300_000, 3));
+        assert_eq!(
+            eclipsefs_atomic_write_unit(&inode),
+            Some((4096, eclipsefs::cow::ATOMIC_WRITE_MAX as u32))
+        );
+        let file = File::new(inode.clone(), OpenFlags::RDWR, String::from("/efs-test/a"));
+        let data = pattern(65_536, 9);
+        assert_eq!(file.write_atomic_at(65_536, &data), Ok(65_536));
+        let mut back = vec![0u8; 65_536];
+        assert_eq!(inode.read_at(65_536, &mut back).unwrap(), 65_536);
+        assert_eq!(back, data);
+        // Read-only descriptors and directories.
+        let ro = File::new(
+            inode.clone(),
+            OpenFlags::RDONLY,
+            String::from("/efs-test/a"),
+        );
+        assert_eq!(ro.write_atomic_at(0, &data), Err(LxError::EBADF));
+        let dir = root.create("d", FileType::Dir, 0o755).unwrap();
+        assert_eq!(eclipsefs_atomic_write_unit(&dir), None);
+        // Too big for one atomic write.
+        let big = vec![0u8; eclipsefs::cow::ATOMIC_WRITE_MAX as usize * 2];
+        assert_eq!(file.write_atomic_at(0, &big), Err(LxError::EINVAL));
+    }
+
+    #[test]
     fn copy_file_range_reflinks_aligned_ranges_and_leaves_the_rest_to_a_copy() {
         let disk = formatted(32 << 20);
         let fs = mount(&disk);
@@ -3007,7 +3073,19 @@ mod tests {
             EfsOptions::parse("subvolid=257").unwrap().subvolid,
             Some(257)
         );
-        for bad in ["compress=brotli", "subvolid=x", "subvol", "device="] {
+        assert_eq!(EfsOptions::parse("commit=30").unwrap().commit, Some(30));
+        assert_eq!(
+            EfsOptions::parse("commit=0").unwrap().commit,
+            Some(super::super::eclipsefs_mount::DEFAULT_COMMIT_SECS)
+        );
+        for bad in [
+            "compress=brotli",
+            "subvolid=x",
+            "subvol",
+            "device=",
+            "commit",
+            "commit=soon",
+        ] {
             assert!(EfsOptions::parse(bad).is_err(), "{}", bad);
         }
         assert_eq!(EfsOptions::parse("").unwrap(), EfsOptions::default());

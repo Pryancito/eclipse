@@ -275,6 +275,19 @@ impl BlockSpace {
         }
     }
 
+    /// Whether `n` data blocks can be allocated now, making a data chunk
+    /// for them on a volume if needed.
+    pub fn ensure_data_room(&mut self, n: u64) -> bool {
+        loop {
+            if self.data_room() >= n {
+                return true;
+            }
+            if !self.grow(ChunkKind::Data) {
+                return false;
+            }
+        }
+    }
+
     /// Free blocks file data may take now.
     fn data_room(&self) -> u64 {
         if self.vol.is_none() {

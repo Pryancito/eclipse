@@ -405,6 +405,57 @@ impl EclipseFS {
         dispatch!(self, fs => fs.sync())
     }
 
+    /// Make file `ino` durable (`fsync`/`fdatasync`). On v0.4 a regular
+    /// file whose changes since the last commit are writes, truncates and
+    /// attribute changes gets one record in the fsync log and one device
+    /// flush; anything else commits, as [`sync`](Self::sync) does.
+    pub fn fsync(&mut self, ino: u64) -> Result<()> {
+        match &mut self.driver {
+            Driver::V3(fs) => fs.sync(),
+            Driver::V4(fs) => fs.fsync(ino),
+        }
+    }
+
+    /// Commit every `secs` seconds of the clock instead of every
+    /// [`COMMIT_OPS`] operations (v0.4; `None` restores the default). The
+    /// caller runs [`commit_if_due`](Self::commit_if_due) from a timer.
+    pub fn set_commit_interval(&mut self, secs: Option<u64>) {
+        if let Driver::V4(fs) = &mut self.driver {
+            fs.set_commit_interval(secs);
+        }
+    }
+
+    /// Commit if the commit interval has passed (and anything changed).
+    pub fn commit_if_due(&mut self) -> Result<bool> {
+        match &mut self.driver {
+            Driver::V3(fs) => fs.sync().map(|_| false),
+            Driver::V4(fs) => fs.commit_if_due(),
+        }
+    }
+
+    /// Whether [`write_atomic`](Self::write_atomic) works on `ino` (v0.4
+    /// regular files that are not no-COW).
+    pub fn atomic_write_supported(&mut self, ino: u64) -> Result<bool> {
+        match &mut self.driver {
+            Driver::V3(_) => Ok(false),
+            Driver::V4(fs) => fs.atomic_write_supported(ino),
+        }
+    }
+
+    /// `RWF_ATOMIC`: write all of `data` or nothing, untorn by a crash (at
+    /// most [`ATOMIC_WRITE_MAX`](crate::cow::ATOMIC_WRITE_MAX) bytes).
+    pub fn write_atomic(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
+        self.cow()?.write_atomic(ino, offset, data)
+    }
+
+    /// fsync log records written since mount (0 on v0.3).
+    pub fn fsync_log_records(&self) -> u64 {
+        match &self.driver {
+            Driver::V3(_) => 0,
+            Driver::V4(fs) => fs.log_records(),
+        }
+    }
+
     /// Grow the filesystem to the device's current size. `Ok(true)` if it grew.
     pub fn grow_to_device(&mut self) -> Result<bool> {
         dispatch!(self, fs => fs.grow_to_device())

@@ -7,7 +7,10 @@
 //! Mount options (`-o`): `compress=zlib|lz4|zstd|no` (and `compress-force=`),
 //! `subvol=<path>` / `subvolid=<id>` for the subvolume to show as `/`,
 //! `degraded` to mount a volume with devices missing, and `device=<dev>` to
-//! name a member of a volume. A volume's other members are also found by
+//! name a member of a volume, and `commit=<secs>` for how often the open
+//! transaction commits (5 by default, as ext4; a kernel task does it, and
+//! `fsync` writes the file to the fsync log in between). A volume's other
+//! members are also found by
 //! scanning every block device the kernel registered, as `btrfs device
 //! scan` does. The filesystem ioctls (chattr, reflink, snapshots, quotas,
 //! scrub, devices) are in `eclipsefs_ioctl`.
@@ -103,7 +106,12 @@ pub(crate) struct EfsOptions {
     pub devices: Vec<String>,
     pub subvol: Option<String>,
     pub subvolid: Option<u64>,
+    /// `commit=`: seconds between commits.
+    pub commit: Option<u64>,
 }
+
+/// Seconds between commits when `commit=` does not say (ext4's default).
+pub(crate) const DEFAULT_COMMIT_SECS: u64 = 5;
 
 impl EfsOptions {
     /// Read the comma-separated `data` of mount(2). Options of the generic
@@ -137,7 +145,14 @@ impl EfsOptions {
                 ("subvolid", Some(v)) => {
                     o.subvolid = Some(v.parse().map_err(|_| FsError::InvalidParam)?);
                 }
-                ("device" | "subvol" | "subvolid", _) => return Err(FsError::InvalidParam),
+                ("commit", Some(v)) => {
+                    // btrfs: 0 means the default.
+                    let secs: u64 = v.parse().map_err(|_| FsError::InvalidParam)?;
+                    o.commit = Some(if secs == 0 { DEFAULT_COMMIT_SECS } else { secs });
+                }
+                ("device" | "subvol" | "subvolid" | "commit", _) => {
+                    return Err(FsError::InvalidParam)
+                }
                 _ => {}
             }
         }
@@ -238,6 +253,7 @@ impl EclipseMountFs {
         }
         let root = mount_root(&mut fs, opts)?;
         if !read_only {
+            fs.set_commit_interval(Some(opts.commit.unwrap_or(DEFAULT_COMMIT_SECS)));
             match fs.grow_to_device() {
                 Ok(true) => warn!("eclipsefs: filesystem expanded to device size"),
                 Ok(false) => {}
@@ -252,7 +268,29 @@ impl EclipseMountFs {
             dir_cache: Mutex::new(BTreeMap::new()),
         });
         *arc.this.lock() = Arc::downgrade(&arc);
+        #[cfg(not(test))]
+        if !read_only {
+            Self::start_committer(Arc::downgrade(&arc));
+        }
         Ok(arc)
+    }
+
+    /// The kernel task that commits the open transaction every `commit=`
+    /// seconds, so that operations do not (and an idle filesystem still
+    /// does). It ends with the mount.
+    #[cfg(not(test))]
+    fn start_committer(fs: Weak<Self>) {
+        kernel_hal::thread::spawn(async move {
+            loop {
+                let tick = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(1);
+                kernel_hal::thread::sleep_until(tick).await;
+                let Some(fs) = fs.upgrade() else { break };
+                let r = fs.inner.lock().commit_if_due();
+                if let Err(e) = r {
+                    warn!("eclipsefs: periodic commit failed: {:?}", e);
+                }
+            }
+        });
     }
 
     pub(crate) fn inode(&self, ino: u64) -> Arc<EclipseMountINode> {
@@ -547,8 +585,10 @@ impl INode for EclipseMountINode {
             .map_err(map_err)
     }
 
+    /// `fsync`: the file alone through the fsync log when it can, a commit
+    /// otherwise (directories, new files, renames...).
     fn sync_all(&self) -> Result<()> {
-        self.fs.inner.lock().sync().map_err(map_err)
+        self.fs.inner.lock().fsync(self.ino).map_err(map_err)
     }
 
     fn sync_data(&self) -> Result<()> {

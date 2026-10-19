@@ -1238,6 +1238,24 @@ impl File {
     pub fn inode(&self) -> Arc<dyn INode> {
         self.inner.read().inode.clone()
     }
+
+    /// `pwritev2(RWF_ATOMIC)`: all of `buf` at `offset` or nothing, on a
+    /// filesystem that can (EclipseFS); `EOPNOTSUPP` on the others. A write
+    /// that `RLIMIT_FSIZE` would cut short is `EFBIG` instead.
+    pub fn write_atomic_at(&self, offset: u64, buf: &[u8]) -> LxResult<usize> {
+        let inner = self.inner.write();
+        if !inner.flags.writable() {
+            return Err(LxError::EBADF);
+        }
+        if fsize::fsize_room(&inner.inode, offset, buf.len())? < buf.len() {
+            return Err(LxError::EFBIG);
+        }
+        let n =
+            super::eclipsefs_ioctl::eclipsefs_write_atomic(&inner.inode, &self.path, offset, buf)
+                .ok_or(LxError::EOPNOTSUPP)??;
+        cache_overlay_write(&inner.inode, offset as usize, &buf[..n]);
+        Ok(n)
+    }
 }
 
 #[async_trait]

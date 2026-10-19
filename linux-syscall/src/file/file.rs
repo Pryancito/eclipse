@@ -805,8 +805,14 @@ impl Syscall<'_> {
     /// `pwritev2`: [`sys_pwritev`](Self::sys_pwritev) plus per-call flags
     /// (see [linux man pwritev2(2)](https://www.man7.org/linux/man-pages/man2/readv.2.html)).
     ///
-    /// Offset -1 falls back to `writev` semantics; non-zero flags answer
-    /// `EOPNOTSUPP` for the same reason as [`sys_preadv2`](Self::sys_preadv2).
+    /// Offset -1 falls back to `writev` semantics. `RWF_DSYNC`/`RWF_SYNC`
+    /// make the file durable after the write (`fsync`, which on EclipseFS
+    /// is one fsync log record). `RWF_ATOMIC` writes all or nothing, untorn
+    /// by a crash, where `statx(STATX_WRITE_ATOMIC)` says the file can: one
+    /// segment whose length is a power of two within the file's atomic unit,
+    /// at an offset aligned to it, else `EINVAL`; `EOPNOTSUPP` on other
+    /// filesystems. The other flags answer `EOPNOTSUPP` for the same reason
+    /// as [`sys_preadv2`](Self::sys_preadv2).
     pub async fn sys_pwritev2(
         &self,
         fd: FileDesc,
@@ -815,13 +821,57 @@ impl Syscall<'_> {
         offset: i64,
         flags: usize,
     ) -> SysResult {
-        if flags != 0 {
+        if flags & !(RWF_DSYNC | RWF_SYNC | RWF_ATOMIC) != 0 {
             return Err(LxError::EOPNOTSUPP);
         }
-        if offset == -1 {
-            return self.sys_writev(fd, iov_ptr, iov_count).await;
+        let written = if flags & RWF_ATOMIC != 0 {
+            self.pwrite_atomic(fd, iov_ptr, iov_count, offset)?
+        } else if offset == -1 {
+            self.sys_writev(fd, iov_ptr, iov_count).await?
+        } else {
+            self.sys_pwritev(fd, iov_ptr, iov_count, offset as u64)?
+        };
+        if flags & (RWF_DSYNC | RWF_SYNC) != 0 && written > 0 {
+            let file = self.linux_process().get_file(fd)?;
+            file.inode().sync_all()?;
         }
-        self.sys_pwritev(fd, iov_ptr, iov_count, offset as u64)
+        Ok(written)
+    }
+
+    /// The `RWF_ATOMIC` write of [`sys_pwritev2`](Self::sys_pwritev2).
+    fn pwrite_atomic(
+        &self,
+        fd: FileDesc,
+        iov_ptr: UserInPtr<IoVecIn>,
+        iov_count: usize,
+        offset: i64,
+    ) -> SysResult {
+        let file = self.linux_process().get_file(fd)?;
+        let (min, max) = linux_object::fs::eclipsefs_atomic_write_unit(&file.inode())
+            .ok_or(LxError::EOPNOTSUPP)?;
+        // One segment (`stx_atomic_write_segments_max`).
+        if iov_count != 1 {
+            return Err(LxError::EINVAL);
+        }
+        let iovs = iov_ptr.read_iovecs(iov_count)?;
+        let len = iovs.total_len();
+        let pos = if offset == -1 {
+            file.seek(SeekFrom::Current(0))?
+        } else {
+            linux_object::fs::user_offset(offset as u64)?
+        };
+        if !atomic_write_valid(len, pos, min as usize, max as usize) {
+            return Err(LxError::EINVAL);
+        }
+        let mut buf = crate::try_zeroed_buf(len)?;
+        if iovs.read_bytes_at(0, &mut buf)? != len {
+            return Err(LxError::EFAULT);
+        }
+        let n = file.write_atomic_at(pos, &buf)?;
+        if offset == -1 {
+            file.seek(SeekFrom::Start(pos + n as u64))?;
+        }
+        Ok(n)
     }
 
     /// repositions the offset of the open file associated with the file descriptor fd
@@ -4707,5 +4757,39 @@ mod benches {
     #[bench]
     fn sigpipe_decision(b: &mut Bencher) {
         b.iter(|| black_box(sigpipe_due(black_box(LxError::EPIPE), black_box(true))));
+    }
+}
+
+/// `pwritev2` flags (`include/uapi/linux/fs.h`).
+const RWF_DSYNC: usize = 0x2;
+const RWF_SYNC: usize = 0x4;
+const RWF_ATOMIC: usize = 0x40;
+
+/// `generic_atomic_write_valid`: a power-of-two length within the unit,
+/// at an offset aligned to it.
+fn atomic_write_valid(len: usize, pos: u64, min: usize, max: usize) -> bool {
+    len.is_power_of_two() && len >= min && len <= max && pos % len as u64 == 0
+}
+
+#[cfg(test)]
+mod rwf_atomic_tests {
+    use super::*;
+
+    #[test]
+    fn atomic_writes_need_a_power_of_two_in_the_unit_aligned_to_itself() {
+        let (min, max) = (4096, 1 << 20);
+        assert!(atomic_write_valid(4096, 0, min, max));
+        assert!(atomic_write_valid(65536, 65536 * 3, min, max));
+        assert!(atomic_write_valid(1 << 20, 1 << 20, min, max));
+        assert!(!atomic_write_valid(4096 * 3, 0, min, max));
+        assert!(!atomic_write_valid(2048, 0, min, max));
+        assert!(!atomic_write_valid(2 << 20, 0, min, max));
+        assert!(!atomic_write_valid(8192, 4096, min, max));
+        assert!(!atomic_write_valid(0, 0, min, max));
+    }
+
+    #[test]
+    fn the_rwf_numbers_are_linuxs() {
+        assert_eq!((RWF_DSYNC, RWF_SYNC, RWF_ATOMIC), (0x2, 0x4, 0x40));
     }
 }
