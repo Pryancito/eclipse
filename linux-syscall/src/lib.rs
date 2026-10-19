@@ -848,6 +848,18 @@ impl Syscall<'_> {
                 _ => alloc::string::String::new(),
             });
         }
+        // ... and every call of that process that failed, with its errno and
+        // what it was asked: the strace for a library that only says some OS
+        // call failed (libcuda's cuInit answers CUDA_ERROR_OPERATING_SYSTEM).
+        // A failed open is not one of these: `sys_openat` records it with its
+        // path.
+        if let Err(err) = ret {
+            if linux_object::boot_trace::enabled() && !is_open(num) {
+                linux_object::boot_trace::record_failure(pid, num, err as i32, || {
+                    failure_detail(num, &args, err)
+                });
+            }
+        }
         info!("<= {:?}", ret);
         // [einval-hunt] glxgears against the finally-alive Xwayland dies with
         // "XIO: fatal IO error 22 (Invalid argument)" in the GLX/DRI3 window
@@ -1135,6 +1147,74 @@ fn at_flags_register(takes_flags: bool, a3: usize) -> usize {
     }
 }
 
+/// Whether `num` is an open, which the boot tracer records with its path
+/// whether or not it fails.
+fn is_open(num: u32) -> bool {
+    match Sys::try_from(num) {
+        Ok(Sys::OPENAT) => true,
+        #[cfg(target_arch = "x86_64")]
+        Ok(Sys::OPEN) => true,
+        _ => false,
+    }
+}
+
+/// What a failed call was asked, for the boot tracer: the path of one that
+/// names a file, the fd and command of an ioctl, all six of an mmap, and
+/// otherwise its first four arguments. A call that failed with EFAULT gets
+/// its arguments in hex, as its path is what could not be read.
+fn failure_detail(num: u32, args: &[usize; 6], err: LxError) -> alloc::string::String {
+    let path_at = |i: usize| {
+        let path = UserInPtr::<u8>::from(args[i]).as_c_str().unwrap_or("?");
+        alloc::string::String::from(path)
+    };
+    let sys = Sys::try_from(num);
+    match sys {
+        Ok(Sys::IOCTL) => {
+            return alloc::format!(
+                "fd={} cmd={:#x} arg={:#x}",
+                args[0] as isize,
+                args[1],
+                args[2]
+            )
+        }
+        Ok(Sys::MMAP) => {
+            return alloc::format!(
+                "addr={:#x} len={:#x} prot={:#x} flags={:#x} fd={} off={:#x}",
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                args[4] as isize,
+                args[5]
+            )
+        }
+        _ if err == LxError::EFAULT => {}
+        Ok(
+            Sys::NEWFSTATAT
+            | Sys::FACCESSAT
+            | Sys::FACCESSAT2
+            | Sys::READLINKAT
+            | Sys::MKDIRAT
+            | Sys::MKNODAT
+            | Sys::UNLINKAT
+            | Sys::FCHMODAT
+            | Sys::STATX,
+        ) => return path_at(1),
+        #[cfg(target_arch = "x86_64")]
+        Ok(Sys::STAT | Sys::LSTAT | Sys::ACCESS | Sys::READLINK | Sys::MKNOD | Sys::UNLINK) => {
+            return path_at(0)
+        }
+        _ => {}
+    }
+    alloc::format!(
+        "a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+        args[0],
+        args[1],
+        args[2],
+        args[3]
+    )
+}
+
 /// Which of the `*at` syscalls dispatched with a flags word actually carry
 /// one. The dispatch asks this rather than deciding per arm, so the answer
 /// is one place and a test can read it. `fchmodat2` has no number in this
@@ -1322,6 +1402,40 @@ mod syscall_answer_tests {
         // three arguments, and whatever the stub left in the fourth register
         // used to arrive here as AT_ flags.
         assert!(!at_syscall_takes_flags(&Sys::FCHMODAT));
+    }
+
+    /// The boot tracer records a failed open with its path already, so the
+    /// failure hook leaves opens to it and takes everything else.
+    #[test]
+    fn only_an_open_is_left_to_the_open_recorder() {
+        assert!(is_open(Sys::OPENAT as u32));
+        #[cfg(target_arch = "x86_64")]
+        assert!(is_open(Sys::OPEN as u32));
+        assert!(!is_open(Sys::IOCTL as u32));
+        assert!(!is_open(Sys::NEWFSTATAT as u32));
+    }
+
+    /// What a FAIL line says a call was asked: an ioctl's fd and command
+    /// (the escape is in the command), all six of an mmap, and for a call
+    /// that failed with EFAULT the bare arguments, because its path is
+    /// exactly what could not be read.
+    #[test]
+    fn a_failure_is_described_by_what_the_call_was_asked() {
+        let ioctl = [3, 0xc020_462b, 0x1000, 0, 0, 0];
+        assert_eq!(
+            failure_detail(Sys::IOCTL as u32, &ioctl, LxError::EINVAL),
+            "fd=3 cmd=0xc020462b arg=0x1000"
+        );
+        let mmap = [0, 0x20_0000, 0x3, 0x22, usize::MAX, 0];
+        assert_eq!(
+            failure_detail(Sys::MMAP as u32, &mmap, LxError::ENOMEM),
+            "addr=0x0 len=0x200000 prot=0x3 flags=0x22 fd=-1 off=0x0"
+        );
+        let stat = [0xffff_ff9c, 0xdead_0000, 0x1000, 0, 0, 0];
+        assert_eq!(
+            failure_detail(Sys::NEWFSTATAT as u32, &stat, LxError::EFAULT),
+            "a0=0xffffff9c a1=0xdead0000 a2=0x1000 a3=0x0"
+        );
     }
 }
 

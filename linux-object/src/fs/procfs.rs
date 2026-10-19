@@ -1417,6 +1417,14 @@ impl INode for ProcTidCommINode {
         Ok(buf.len())
     }
 
+    /// `O_TRUNC` leaves the name as it is: in Linux `proc_setattr` takes the
+    /// size change and does nothing with it. libcuda names its threads with
+    /// `fopen(".../comm", "wb")`, and the default here (ENOSYS) failed that
+    /// open and `cuInit` with it, as CUDA_ERROR_OPERATING_SYSTEM (304).
+    fn resize(&self, _len: usize) -> Result<()> {
+        Ok(())
+    }
+
     fn poll(&self) -> Result<PollStatus> {
         Ok(PollStatus {
             read: true,
@@ -6070,6 +6078,11 @@ mod pid_task_dir_tests {
         // And it named THAT thread, not the process or its sibling.
         let n = comm_of(&second).read_at(0, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"programa\n");
+
+        // libcuda opens it with `fopen(..., "wb")`, so O_TRUNC comes first:
+        // it succeeds and leaves the name for the write that follows.
+        comm_of(&first).resize(0).unwrap();
+        assert_eq!(first.lock_linux().comm, "renderizador");
     }
 
     #[test]

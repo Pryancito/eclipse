@@ -15,8 +15,11 @@
 //   memory    cuMemAlloc of 1 MiB, cuMemsetD8, and cuMemcpyDtoH of it back:
 //             the pattern must come back.
 //
-// When a step fails on /dev/nvidia-uvm, `dmesg | grep nvidia-uvm` names the
-// call the kernel does not serve yet.
+// When a step fails, `dmesg | grep nvidia` names the NVIDIA call the kernel
+// does not serve yet, if that is what failed. Any other failing call is in
+// `/proc/bootprofile` when the kernel is booted with `BOOTTRACE=cuda-probe`
+// as well: it lists every call of this program that failed, with its errno.
+// CUDA_ERROR_OPERATING_SYSTEM (304) says no more than that one did.
 //
 // Needs the kernel booted with `nvidia.cuda` (or with both `nvidia.nvidiactl`
 // and `nvidia.uvm`). A glibc program, like libcuda itself: it is built with
@@ -61,7 +64,10 @@ static int report(const char *step, CUresult r)
 
 static int fail(const char *section)
 {
-    printf("[%s] FAILED. If it is /dev/nvidia-uvm: dmesg | grep nvidia-uvm\n", section);
+    printf("[%s] FAILED. What the kernel does not serve yet: dmesg | grep nvidia\n"
+           "  Every call that failed, booted with BOOTTRACE=cuda-probe:\n"
+           "  grep -E 'FAIL| e[0-9]' /proc/bootprofile\n",
+           section);
     return 1;
 }
 
