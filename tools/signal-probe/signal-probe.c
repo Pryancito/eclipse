@@ -31,6 +31,14 @@
 //   * a parent waiting in `vfork` for a child that never got as far as
 //     `exec` could not be killed, and a process that exited with a thread
 //     in that wait was never torn down.
+//   * a handler run over a thread waiting for a contended
+//     `PTHREAD_PRIO_INHERIT` mutex gave that mutex a second owner: the lock
+//     answered EINTR, which glibc's `pthread_mutex_lock` takes for the lock
+//     taken. Linux makes the lock again whatever the handler.
+//   * a `futex` wait with no timeout came back EINTR from a SA_RESTART
+//     handler, which Linux makes again, so glibc's `sem_wait` returned -1
+//     with no semaphore to a program that installed its handlers with
+//     `signal()`.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -44,6 +52,8 @@
 //   fork       a child forked inside a handler returns from that handler.
 //   restart    SA_RESTART restarts `read` and `wait4` after the handler, and
 //              does not restart `nanosleep` or `poll`, which Linux never does.
+//              It restarts `sem_wait` too, an untimed futex wait. Taking a
+//              contended PI mutex is made again by any handler.
 //   badrip     a handler that sets a non-canonical `rip` in its ucontext gets
 //              the process a SIGSEGV (SI_KERNEL), and nothing more. x86_64.
 //   ids        the kernel refuses what it cannot load: a TLS pointer outside
@@ -87,6 +97,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#include <semaphore.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -325,6 +336,92 @@ static void read_across_a_signal(int restart) {
     close(p[1]);
 }
 
+static sem_t g_sem;
+static volatile int g_sem_err;
+
+static void *waits_for_the_semaphore(void *arg) {
+    (void)arg;
+    g_sem_err = sem_wait(&g_sem) == 0 ? 0 : errno;
+    return NULL;
+}
+
+// An untimed `sem_wait` is a FUTEX_WAIT_BITSET with no timeout, which Linux
+// answers -ERESTARTSYS: a SA_RESTART handler leaves it waiting. glibc hands an
+// EINTR from it to the caller.
+static void sem_wait_across_a_signal(void) {
+    if (sem_init(&g_sem, 0, 0) != 0) {
+        check(0, "sem_wait: restarted with SA_RESTART", "sem_init: %s", strerror(errno));
+        return;
+    }
+    install(SIGUSR1, usr1_counts, SA_RESTART);
+    g_usr1_runs = 0;
+    g_sem_err = -1;
+    pthread_t t;
+    if (pthread_create(&t, NULL, waits_for_the_semaphore, NULL) != 0) {
+        check(0, "sem_wait: restarted with SA_RESTART", "pthread_create failed");
+        return;
+    }
+    sleep_ms(100);
+    pthread_kill(t, SIGUSR1);
+    sleep_ms(100);
+    int before_the_post = g_sem_err;
+    sem_post(&g_sem);
+    pthread_join(t, NULL);
+    check(before_the_post == -1 && g_sem_err == 0 && g_usr1_runs == 1,
+          "sem_wait: restarted with SA_RESTART",
+          "before the post: %s, after it: %s, handler ran %d time(s)",
+          before_the_post == -1 ? "waiting" : before_the_post ? strerror(before_the_post) : "took it",
+          g_sem_err ? strerror(g_sem_err) : "took it", (int)g_usr1_runs);
+    sem_destroy(&g_sem);
+}
+
+static pthread_mutex_t g_pi;
+static volatile int g_pi_taken;
+
+// Never unlocks: the mutex goes with the probe.
+static void *takes_the_pi_mutex(void *arg) {
+    (void)arg;
+    if (pthread_mutex_lock(&g_pi) == 0) g_pi_taken = 1;
+    return NULL;
+}
+
+// A thread waiting in FUTEX_LOCK_PI for a mutex this thread holds, and a
+// handler run over it with no SA_RESTART. Linux makes the lock again
+// (-ERESTARTNOINTR): glibc handles ESRCH and EDEADLK from it and takes
+// anything else for the lock taken, so an EINTR here is a second owner. musl
+// loops on EINTR itself, so only a glibc build sees it.
+static void pi_lock_across_a_signal(void) {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    int r = pthread_mutexattr_setprotocol(&a, PTHREAD_PRIO_INHERIT);
+    if (r == 0) r = pthread_mutex_init(&g_pi, &a);
+    pthread_mutexattr_destroy(&a);
+    if (r != 0) {
+        check(0, "FUTEX_LOCK_PI: made again anyway", "PI mutex: %s", strerror(r));
+        return;
+    }
+    install(SIGUSR1, usr1_counts, 0);
+    g_usr1_runs = 0;
+    g_pi_taken = 0;
+    pthread_mutex_lock(&g_pi);
+    pthread_t t;
+    if (pthread_create(&t, NULL, takes_the_pi_mutex, NULL) != 0) {
+        check(0, "FUTEX_LOCK_PI: made again anyway", "pthread_create failed");
+        pthread_mutex_unlock(&g_pi);
+        return;
+    }
+    sleep_ms(100);
+    pthread_kill(t, SIGUSR1);
+    sleep_ms(100);
+    int while_held = g_pi_taken;
+    pthread_mutex_unlock(&g_pi);
+    pthread_join(t, NULL);
+    check(!while_held && g_pi_taken && g_usr1_runs == 1,
+          "FUTEX_LOCK_PI: made again anyway",
+          "taken while held: %s, taken after the unlock: %s, handler ran %d time(s)",
+          while_held ? "YES" : "no", g_pi_taken ? "yes" : "no", (int)g_usr1_runs);
+}
+
 static void sec_restart(void) {
     read_across_a_signal(1);
     read_across_a_signal(0);
@@ -372,6 +469,9 @@ static void sec_restart(void) {
         close(p[0]);
         close(p[1]);
     }
+
+    sem_wait_across_a_signal();
+    pi_lock_across_a_signal();
 }
 
 // ----------------------------------------------------------------- badrip

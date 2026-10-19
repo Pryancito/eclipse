@@ -1585,8 +1585,9 @@ fn syscall_num(ctx: &UserContext) -> usize {
 
 /// A syscall a signal cut short, which is made again either by a handler
 /// installed with `SA_RESTART` (`linux_syscall::restarts_after_handler` says
-/// which ones) or by a job-control stop that ran no handler at all
-/// (`linux_syscall::restarts_after_stop`).
+/// which ones), by any handler at all (taking a PI lock,
+/// `linux_syscall::restarts_whatever_the_handler`) or by a job-control stop
+/// that ran no handler at all (`linux_syscall::restarts_after_stop`).
 ///
 /// What making it again takes is the two registers its `EINTR` overwrote or
 /// may have: the number, which shares `rax` with the result on x86_64, and
@@ -1596,10 +1597,8 @@ fn syscall_num(ctx: &UserContext) -> usize {
 struct Interrupted {
     num: usize,
     arg0: usize,
-    /// Whether a handler with `SA_RESTART` makes it again (`-ERESTARTSYS`).
-    /// The others -- `pause`, `poll`, a `futex` wait -- come back `EINTR`
-    /// from any handler, and are made again only past a stop.
-    by_handler: bool,
+    /// What a handler run over it does with it.
+    by_handler: ByHandler,
     /// A signal that runs no handler -- a stop -- was taken over it, and no
     /// handler since.
     stopped: bool,
@@ -1619,7 +1618,13 @@ impl Interrupted {
         (ret == eintr && linux_syscall::restarts_after_stop(num as u32, args)).then(|| Self {
             num,
             arg0: args[0],
-            by_handler: linux_syscall::restarts_after_handler(num as u32, args),
+            by_handler: if linux_syscall::restarts_whatever_the_handler(num as u32, args) {
+                ByHandler::Always
+            } else if linux_syscall::restarts_after_handler(num as u32, args) {
+                ByHandler::WithSaRestart
+            } else {
+                ByHandler::Never
+            },
             stopped: false,
         })
     }
@@ -1631,7 +1636,12 @@ impl Interrupted {
     /// the handler that decides, as it is in Linux.
     fn enter_handler(slot: &mut Option<Self>, action: &SignalAction, ctx: &mut UserContext) {
         if let Some(call) = slot.take() {
-            if call.by_handler && action.restarts_syscalls() {
+            let again = match call.by_handler {
+                ByHandler::Always => true,
+                ByHandler::WithSaRestart => action.restarts_syscalls(),
+                ByHandler::Never => false,
+            };
+            if again {
                 call.rewind(ctx);
             }
         }
@@ -1685,6 +1695,18 @@ impl Interrupted {
             }
         }
     }
+}
+
+/// Whether a handler run over a syscall a signal cut short makes it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByHandler {
+    /// Only with `SA_RESTART` (`-ERESTARTSYS`).
+    WithSaRestart,
+    /// Whatever the handler (`-ERESTARTNOINTR`): taking a PI lock.
+    Always,
+    /// Never: `pause`, `poll`, a timed `futex` wait come back `EINTR` from
+    /// any handler, and are made again only past a stop.
+    Never,
 }
 
 fn syscall_args(ctx: &UserContext) -> [usize; 6] {
@@ -2366,7 +2388,7 @@ mod syscall_restart_tests {
             Some(Interrupted {
                 num: READ,
                 arg0: 3,
-                by_handler: true,
+                by_handler: ByHandler::WithSaRestart,
                 stopped: false
             })
         );
@@ -2491,6 +2513,68 @@ mod syscall_restart_tests {
         );
         assert_eq!(ctx.get_field(UserContextField::ReturnValue), eintr());
         assert_eq!(slot, None, "a later handler could still restart it");
+    }
+
+    const FUTEX: usize = if cfg!(target_arch = "x86_64") {
+        202
+    } else {
+        98
+    };
+
+    /// `futex(uaddr, op | FUTEX_PRIVATE_FLAG, 0, NULL)`.
+    fn futex(op: usize) -> [usize; 6] {
+        [0x7ff0_2000, op | 0x80, 0, 0, 0, 0]
+    }
+
+    const FUTEX_WAIT_BITSET: usize = 9;
+
+    /// Taking a PI lock is `-ERESTARTNOINTR` in Linux: made again whatever
+    /// the handler. glibc takes an `EINTR` from it for the lock taken.
+    #[test]
+    fn a_pi_lock_cut_short_is_made_again_by_a_handler_without_sa_restart() {
+        const FUTEX_LOCK_PI: usize = 6;
+        let mut ctx = read_cut_short();
+        let mut slot = Interrupted::after(FUTEX, &futex(FUTEX_LOCK_PI), eintr());
+        Interrupted::enter_handler(&mut slot, &handler(SignalActionFlags::SIGINFO), &mut ctx);
+        assert_eq!(ctx.get_field(UserContextField::InstrPointer), AT);
+        assert_eq!(syscall_num(&ctx), FUTEX);
+        assert_eq!(slot, None);
+    }
+
+    /// An untimed futex wait is `-ERESTARTSYS`, like a `read`: glibc's
+    /// `sem_wait` gave up the wait with `EINTR` when a `signal()` handler
+    /// ran over it.
+    #[test]
+    fn an_untimed_futex_wait_is_made_again_by_sa_restart() {
+        let mut ctx = read_cut_short();
+        let mut slot = Interrupted::after(FUTEX, &futex(FUTEX_WAIT_BITSET), eintr());
+        Interrupted::enter_handler(&mut slot, &handler(SignalActionFlags::RESTART), &mut ctx);
+        assert_eq!(ctx.get_field(UserContextField::InstrPointer), AT);
+        assert_eq!(syscall_num(&ctx), FUTEX);
+
+        let mut ctx = read_cut_short();
+        let mut slot = Interrupted::after(FUTEX, &futex(FUTEX_WAIT_BITSET), eintr());
+        Interrupted::enter_handler(&mut slot, &handler(SignalActionFlags::SIGINFO), &mut ctx);
+        assert_eq!(
+            ctx.get_field(UserContextField::InstrPointer),
+            AT + Interrupted::SYSCALL_INSN_LEN,
+            "without SA_RESTART it is EINTR"
+        );
+    }
+
+    /// A timed one is not: `EINTR` from any handler, as from `poll`.
+    #[test]
+    fn a_timed_futex_wait_cut_short_is_not() {
+        let mut args = futex(FUTEX_WAIT_BITSET);
+        args[3] = 0x7ff0_3000;
+        let mut ctx = read_cut_short();
+        let mut slot = Interrupted::after(FUTEX, &args, eintr());
+        assert!(slot.is_some(), "a stop would make it again");
+        Interrupted::enter_handler(&mut slot, &handler(SignalActionFlags::RESTART), &mut ctx);
+        assert_eq!(
+            ctx.get_field(UserContextField::InstrPointer),
+            AT + Interrupted::SYSCALL_INSN_LEN
+        );
     }
 
     #[test]

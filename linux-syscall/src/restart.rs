@@ -5,14 +5,17 @@
 //! userspace as `EINTR` when the handler was installed with `SA_RESTART`:
 //!
 //! - `-ERESTARTSYS`: the wait for data, for a child, for a lock, for a
-//!   connection. With `SA_RESTART` the kernel winds the program counter back
-//!   onto the syscall instruction before it builds the signal frame, so when
-//!   the handler returns the same call is made again and the program never
-//!   sees the signal. Without it, `EINTR`.
+//!   connection, and a `futex` wait with no timeout (`sem_wait`). With
+//!   `SA_RESTART` the kernel winds the program counter back onto the syscall
+//!   instruction before it builds the signal frame, so when the handler
+//!   returns the same call is made again and the program never sees the
+//!   signal. Without it, `EINTR`.
 //! - `-ERESTARTNOHAND`: `poll`, `select`, `epoll_wait`, `pause`,
 //!   `rt_sigsuspend`. `EINTR` whenever a handler ran, `SA_RESTART` or not.
 //! - `-ERESTART_RESTARTBLOCK`: `nanosleep`, `clock_nanosleep`, a `futex` wait
 //!   with a timeout. Also `EINTR` when a handler ran.
+//! - `-ERESTARTNOINTR`: `FUTEX_LOCK_PI`. Made again whatever the handler:
+//!   [`restarts_whatever_the_handler`].
 //! - plain `-EINTR`: never restarted at all.
 //!
 //! `SA_RESTART` was stored and read by nobody, so every handler behaved as if
@@ -78,8 +81,32 @@ pub fn restarts_after_handler(num: u32, args: &[usize; 6]) -> bool {
         | Sys::SENDMSG
         | Sys::FLOCK => true,
         Sys::FCNTL => matches!(args[1], F_SETLKW | F_OFD_SETLKW),
+        // `__futex_wait()` answers `-ERESTARTSYS`, and only `futex_wait()`
+        // turns it into `-ERESTART_RESTARTBLOCK`, when there is a timeout to
+        // keep. glibc's `sem_wait` hands the `EINTR` to its caller, so with
+        // a handler from `signal()` an untimed `sem_wait` came back -1
+        // without the semaphore, where Linux goes on waiting.
+        Sys::FUTEX => {
+            matches!(args[1] & !FUTEX_FLAGS, FUTEX_WAIT | FUTEX_WAIT_BITSET) && args[3] == 0
+        }
         _ => false,
     }
+}
+
+/// Whether syscall `num`, called with `args`, is made again whatever the
+/// handler of the signal that cut it short, `SA_RESTART` or not
+/// (`-ERESTARTNOINTR`).
+///
+/// Taking a PI lock is the one that waits here: `futex_lock_pi()` turns its
+/// `-EINTR` into `-ERESTARTNOINTR`, and futex(2) lists `EINTR` for the waits
+/// only. glibc's `pthread_mutex_lock` relies on it. It handles `ESRCH` and
+/// `EDEADLK` from `FUTEX_LOCK_PI` and takes anything else as the lock taken,
+/// so the `EINTR` this answered when a handler ran over a contended
+/// `PTHREAD_PRIO_INHERIT` mutex gave it a second owner. The timeouts are
+/// absolute, so the same registers wait for the same end.
+pub fn restarts_whatever_the_handler(num: u32, args: &[usize; 6]) -> bool {
+    Sys::try_from(num) == Ok(Sys::FUTEX)
+        && matches!(args[1] & !FUTEX_FLAGS, FUTEX_LOCK_PI | FUTEX_LOCK_PI2)
 }
 
 /// `futex` operations, with the flags `FUTEX_CMD_MASK` takes off.
@@ -97,8 +124,8 @@ const FUTEX_FLAGS: usize = 0x80 | 0x100;
 /// Every call [`restarts_after_handler`] makes again, and on top of them the
 /// ones Linux answers `-ERESTARTNOHAND` or `-ERESTART_RESTARTBLOCK`, which
 /// only a handler turns into `EINTR`: `pause`, `rt_sigsuspend`, `poll`,
-/// `select`, a `futex` wait, `msgrcv`/`msgsnd`, `clock_nanosleep`. But only
-/// where making the call again with the same registers waits for what the
+/// `select`, a timed `futex` wait, `msgrcv`/`msgsnd`, `clock_nanosleep`. But
+/// only where making the call again with the same registers waits for what the
 /// first one did -- no timeout, or an absolute one. A relative timeout
 /// (`nanosleep`, a `poll` for 100 ms) would start over from the top, and
 /// Linux keeps the original end in `restart_block` for that; with nothing
@@ -200,7 +227,6 @@ mod tests {
             Sys::RT_SIGTIMEDWAIT,
             Sys::NANOSLEEP,
             Sys::CLOCK_NANOSLEEP,
-            Sys::FUTEX,
             Sys::CONNECT,
             Sys::CLOSE,
             Sys::IOCTL,
@@ -216,6 +242,30 @@ mod tests {
         for sys in [Sys::POLL, Sys::SELECT, Sys::EPOLL_WAIT, Sys::PAUSE] {
             let (restarts, sys) = restarts(sys);
             assert!(!restarts, "{:?} must come back EINTR", sys);
+        }
+    }
+
+    /// Measured on Linux 6.18 with a `SA_RESTART` handler: `FUTEX_WAIT` and
+    /// `FUTEX_WAIT_BITSET` with a NULL timeout, and glibc's `sem_wait`, go
+    /// on waiting; with a timeout of either kind they come back `EINTR`.
+    #[test]
+    fn a_futex_wait_is_made_again_only_without_a_timeout() {
+        let futex = |op: usize, timeout: usize| {
+            restarts_after_handler(Sys::FUTEX as u32, &[0x1000, op, 0, timeout, 0, 0])
+        };
+        let private = 0x80;
+        let realtime = 0x100;
+        assert!(futex(FUTEX_WAIT, 0));
+        assert!(futex(FUTEX_WAIT | private, 0));
+        assert!(futex(FUTEX_WAIT_BITSET | private, 0));
+        assert!(futex(FUTEX_WAIT_BITSET | private | realtime, 0));
+        assert!(!futex(FUTEX_WAIT | private, 0x2000));
+        assert!(!futex(FUTEX_WAIT_BITSET | private, 0x2000));
+        // A PI lock is made again whatever the handler, not only with
+        // `SA_RESTART`; a wake, a requeue, an unlock, a trylock wait for
+        // nothing.
+        for op in [FUTEX_LOCK_PI, FUTEX_LOCK_PI2, 1, 3, 4, 7, 8, 10] {
+            assert!(!futex(op | private, 0), "op {}", op);
         }
     }
 
@@ -243,7 +293,11 @@ mod tests {
     #[test]
     fn what_a_handler_makes_again_a_stop_makes_again_too() {
         for num in 0..600u32 {
-            for args in [[0; 6], [3, F_SETLKW, 0, 0, 0, 0]] {
+            for args in [
+                [0; 6],
+                [3, F_SETLKW, 0, 0, 0, 0],
+                [0x1000, FUTEX_WAIT_BITSET | 0x80, 0, 0, 0, 0],
+            ] {
                 if restarts_after_handler(num, &args) {
                     assert!(restarts_after_stop(num, &args), "syscall {}", num);
                 }
@@ -324,6 +378,48 @@ mod tests {
         // Nothing to make again in a wake, a requeue, a trylock.
         for op in [1, 3, 4, 7, 8, 10] {
             assert!(!futex(op | private, 0), "op {}", op);
+        }
+    }
+
+    /// `-ERESTARTNOINTR`: taking a PI lock, and nothing else that waits.
+    #[test]
+    fn a_pi_lock_is_made_again_whatever_the_handler() {
+        let futex = |op: usize| {
+            restarts_whatever_the_handler(Sys::FUTEX as u32, &[0x1000, op, 0, 0x2000, 0, 0])
+        };
+        let private = 0x80;
+        let realtime = 0x100;
+        assert!(futex(FUTEX_LOCK_PI));
+        assert!(futex(FUTEX_LOCK_PI | private));
+        assert!(futex(FUTEX_LOCK_PI2 | private));
+        assert!(futex(FUTEX_LOCK_PI2 | private | realtime));
+        // The waits are EINTR from a handler; a wake, an unlock, a trylock
+        // have nothing to make again.
+        for op in [FUTEX_WAIT, FUTEX_WAIT_BITSET, 1, 3, 4, 7, 8, 10] {
+            assert!(!futex(op | private), "op {}", op);
+        }
+        assert!(
+            !restarts_whatever_the_handler(Sys::READ as u32, &[3, FUTEX_LOCK_PI, 1, 0, 0, 0]),
+            "a read whose second argument is 6"
+        );
+        assert!(!restarts_whatever_the_handler(
+            u32::MAX,
+            &[0, FUTEX_LOCK_PI, 0, 0, 0, 0]
+        ));
+    }
+
+    /// What a handler makes again has to be left to make again in the first
+    /// place, which is what [`restarts_after_stop`] answers.
+    #[test]
+    fn what_any_handler_makes_again_a_stop_makes_again_too() {
+        for op in [FUTEX_LOCK_PI, FUTEX_LOCK_PI | 0x80, FUTEX_LOCK_PI2 | 0x180] {
+            let args = [0x1000, op, 0, 0x2000, 0, 0];
+            assert!(restarts_whatever_the_handler(Sys::FUTEX as u32, &args));
+            assert!(
+                restarts_after_stop(Sys::FUTEX as u32, &args),
+                "op {:#x}",
+                op
+            );
         }
     }
 

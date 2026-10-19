@@ -40,6 +40,14 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
 8. Un padre que esperaba en `vfork` a un hijo que no llegaba a hacer `exec`
    no se podia matar, y un proceso que salia con un hilo en esa espera no se
    desmontaba nunca.
+9. Un manejador que corria sobre un hilo esperando un mutex
+   `PTHREAD_PRIO_INHERIT` ocupado le daba al mutex un segundo dueño: el
+   `FUTEX_LOCK_PI` volvia con `EINTR`, y el `pthread_mutex_lock` de glibc lo
+   toma por el cerrojo cogido. Linux lo rehace sea cual sea el manejador.
+10. Una espera futex sin timeout volvia con `EINTR` de un manejador con
+    `SA_RESTART`, que Linux rehace, asi que el `sem_wait` de glibc devolvia
+    -1 sin el semaforo a un programa que instala sus manejadores con
+    `signal()`.
 
 ## Compilar
 
@@ -74,7 +82,7 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `nest` | un manejador interrumpido por otra señal vuelve a donde estaba, con sus registros vectoriales (`xmm8`), y el programa tambien |
 | `longjmp` | salir de un manejador con `siglongjmp` no impide que el siguiente fallo llegue a su manejador; tampoco un fallo dentro del manejador de otra señal |
 | `fork` | un hijo hecho con `fork` dentro de un manejador vuelve de ese manejador |
-| `restart` | con `SA_RESTART`, `read` y `wait4` se reanudan tras el manejador; `nanosleep` y `poll` dan `EINTR` igualmente, como en Linux |
+| `restart` | con `SA_RESTART`, `read` y `wait4` se reanudan tras el manejador; `nanosleep` y `poll` dan `EINTR` igualmente, como en Linux; `sem_wait` (una espera futex sin timeout) tambien se reanuda; coger un mutex PI ocupado se rehace tras cualquier manejador, con `SA_RESTART` o sin el |
 | `badrip` | un manejador que pone un `rip` no canonico en su `ucontext` le cuesta al proceso un SIGSEGV (`SI_KERNEL`) y nada mas. Solo x86_64 |
 | `ids` | el kernel rechaza lo que no puede cargar: un puntero de TLS fuera del espacio de usuario (`arch_prctl`, `clone(CLONE_SETTLS)`) y el pid `INT_MIN`, que no tiene negativo, en `waitpid` |
 | `orphan` | la muerte de un huerfano avisa a quien lo **adopto**, con SIGCHLD aunque su padre muerto eligiera otra señal en `clone(2)`, y despierta el `waitpid` del adoptante aunque un proceso de en medio se haya hecho subreaper despues de la adopcion. La señal elegida es SIGWINCH, que init descarta, por si el subreaper no se cumpliera |
