@@ -519,3 +519,41 @@ fn power_cuts_leave_no_write_hole() {
     }
     assert!(checked > 100);
 }
+
+/// An fsync on a parity volume goes through the fsync log, and what a power
+/// cut right after it leaves holds the synced data even with a device gone.
+#[test]
+fn fsync_log_records_survive_on_parity_volumes() {
+    for (n, profile) in [(3, Profile::Raid5), (4, Profile::Raid6)] {
+        let d = disks(n, 32 * MIB);
+        let mut fs = make(&d, profile, profile);
+        let root = fs.root_ino();
+        let f = fs.create(root, "f", FileKind::Regular, 0o644, 0).unwrap();
+        write_all(&mut fs, f, 0, &pattern(50_000, 1));
+        fs.fsync(f).unwrap();
+        let gen = fs.generation();
+        let records = fs.fsync_log_records();
+        write_all(&mut fs, f, 8192, &pattern(30_000, 2));
+        fs.fsync(f).unwrap();
+        assert_eq!(fs.generation(), gen, "{profile:?}: fsync committed");
+        assert_eq!(fs.fsync_log_records(), records + 1, "{profile:?}");
+        let want = read_all(&mut fs, f);
+        let copies: Vec<Arc<MemDisk>> = d.iter().map(|d| d.copy()).collect();
+        drop(fs);
+        {
+            let mut fs = open(&copies);
+            assert_eq!(read_all(&mut fs, f), want, "{profile:?}");
+            clean(&mut fs);
+        }
+        for gone in 0..n {
+            let left: Vec<Arc<MemDisk>> = copies
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != gone)
+                .map(|(_, d)| d.copy())
+                .collect();
+            let mut fs = EclipseFS::mount_degraded(devs(&left), true).unwrap();
+            assert_eq!(read_all(&mut fs, f), want, "{profile:?} without {gone}");
+        }
+    }
+}
