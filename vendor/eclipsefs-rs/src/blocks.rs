@@ -9,13 +9,19 @@
 //! The original bitmap was a `heapless::Vec<u64, 64>` under no_std (4096
 //! blocks, 16 MiB, for the whole filesystem); here every group carries a full
 //! bitmap block and the allocator holds them all in memory (8 KiB per GiB).
+//!
+//! Groups whose chunk keeps parity (RAID5/6, see [`crate::volume`]) hand
+//! out blocks by *rows* of `row` blocks: only from rows that are wholly
+//! free, or that the open transaction has already started. So no write
+//! ever lands in a row that holds committed data, and a crash can never
+//! leave a committed block's parity stale (the RAID write hole).
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::format::{BLOCK_SIZE, GROUP_BLOCKS};
-use crate::volume::ChunkKind;
+use crate::volume::{ChunkKind, Tier};
 use crate::{Error, Result};
 
 const WORDS: usize = (GROUP_BLOCKS / 64) as usize;
@@ -33,6 +39,13 @@ pub struct AllocationGroup {
     dirty: bool,
     /// Blocks from here on are not handed out (being emptied by a resize).
     fence: u64,
+    /// Data blocks per parity row (1: no rows).
+    row: u64,
+    /// Rows the open transaction has handed blocks out of, as ranges
+    /// (first row, rows).
+    open: BTreeMap<u64, u64>,
+    /// Tier of the devices behind the group.
+    pub tier: Tier,
 }
 
 impl AllocationGroup {
@@ -48,6 +61,9 @@ impl AllocationGroup {
             bitmap: vec![0; WORDS],
             dirty: true,
             fence: u64::MAX,
+            row: 1,
+            open: BTreeMap::new(),
+            tier: Tier::Any,
         };
         g.mark_tail_used();
         g.set_range(0, 2, true);
@@ -71,6 +87,9 @@ impl AllocationGroup {
             bitmap,
             dirty: false,
             fence: u64::MAX,
+            row: 1,
+            open: BTreeMap::new(),
+            tier: Tier::Any,
         };
         g.mark_tail_used();
         if !g.is_used(0) || !g.is_used(1) {
@@ -109,6 +128,9 @@ impl AllocationGroup {
             bitmap: vec![u64::MAX; WORDS],
             dirty: false,
             fence: u64::MAX,
+            row: 1,
+            open: BTreeMap::new(),
+            tier: Tier::Any,
         }
     }
 
@@ -169,6 +191,67 @@ impl AllocationGroup {
         self.dirty = true;
     }
 
+    /// Blocks per parity row of the chunk behind the group (1: none).
+    pub fn set_row(&mut self, row: u64) {
+        self.row = row.max(1);
+        self.open.clear();
+    }
+
+    pub fn row(&self) -> u64 {
+        self.row
+    }
+
+    /// The open transaction committed: its rows are committed rows now.
+    pub fn close_rows(&mut self) {
+        self.open.clear();
+    }
+
+    fn row_open(&self, r: u64) -> bool {
+        matches!(self.open.range(..=r).next_back(), Some((&s, &l)) if r < s + l)
+    }
+
+    /// Whether blocks of row `r` may be handed out: it is wholly free, or
+    /// the open transaction started it.
+    fn row_ok(&self, r: u64) -> bool {
+        if self.row <= 1 || self.row_open(r) {
+            return true;
+        }
+        let (s, e) = (r * self.row, (r + 1) * self.row);
+        e <= self.block_count && (s..e).all(|o| !self.is_used(o))
+    }
+
+    /// Note the rows of `off..off+len` as started by the open transaction.
+    fn open_rows(&mut self, off: u64, len: u64) {
+        if self.row <= 1 || len == 0 {
+            return;
+        }
+        let (mut a, mut b) = (off / self.row, (off + len - 1) / self.row + 1);
+        if let Some((&s, &l)) = self.open.range(..=a).next_back() {
+            if s + l >= a {
+                a = s;
+                b = b.max(s + l);
+                self.open.remove(&s);
+            }
+        }
+        while let Some((&s, &l)) = self.open.range(a..=b).next() {
+            b = b.max(s + l);
+            self.open.remove(&s);
+        }
+        self.open.insert(a, b - a);
+    }
+
+    /// First block at or after `from` that may be handed out.
+    fn next_alloc(&self, from: u64) -> Option<u64> {
+        let mut off = from;
+        loop {
+            let o = self.next_free(off)?;
+            if self.row_ok(o / self.row) {
+                return Some(o);
+            }
+            off = (o / self.row + 1) * self.row;
+        }
+    }
+
     /// End of the blocks allocations may take.
     fn alloc_end(&self) -> u64 {
         self.block_count.min(self.fence)
@@ -195,6 +278,14 @@ impl AllocationGroup {
         let end = self.alloc_end();
         let mut len = 0;
         while len < max && off + len < end && !self.is_used(off + len) {
+            if self.row > 1 {
+                let o = off + len;
+                if len > 0 && o.is_multiple_of(self.row) && !self.row_ok(o / self.row) {
+                    break;
+                }
+                len += 1;
+                continue;
+            }
             if (off + len).is_multiple_of(64)
                 && max - len >= 64
                 && self.bitmap[((off + len) / 64) as usize] == 0
@@ -214,10 +305,11 @@ impl AllocationGroup {
             return None;
         }
         let start = self
-            .next_free(from.min(self.block_count))
-            .or_else(|| self.next_free(0))?;
+            .next_alloc(from.min(self.block_count))
+            .or_else(|| self.next_alloc(0))?;
         let len = self.run_len(start, max);
         self.set_range(start, len, true);
+        self.open_rows(start, len);
         Some((start, len))
     }
 
@@ -227,13 +319,14 @@ impl AllocationGroup {
             return None;
         }
         let mut off = from.min(self.block_count);
-        while let Some(start) = self.next_free(off) {
+        while let Some(start) = self.next_alloc(off) {
             let len = self.run_len(start, n);
             if len == n {
                 self.set_range(start, n, true);
+                self.open_rows(start, n);
                 return Some(start);
             }
-            off = start + len;
+            off = start + len.max(1);
         }
         None
     }
@@ -338,6 +431,10 @@ impl BlockAllocator {
 
     /// Apply the frees held back so far.
     pub fn release_deferred(&mut self) -> Result<()> {
+        // The transaction is committing: rows it started are committed.
+        for g in self.groups.iter_mut() {
+            g.close_rows();
+        }
         let list = core::mem::take(&mut self.deferred);
         self.deferred_blocks = 0;
         for (start, len) in list {
@@ -376,6 +473,18 @@ impl BlockAllocator {
         max: u64,
         kind: Option<ChunkKind>,
     ) -> Option<(u64, u64)> {
+        self.allocate_tier(goal, max, kind, None)
+    }
+
+    /// [`allocate_for`](Self::allocate_for) from groups on `tier` only (any
+    /// if `None`).
+    pub fn allocate_tier(
+        &mut self,
+        goal: Option<u64>,
+        max: u64,
+        kind: Option<ChunkKind>,
+        tier: Option<Tier>,
+    ) -> Option<(u64, u64)> {
         let n = self.groups.len();
         if n == 0 {
             return None;
@@ -389,7 +498,7 @@ impl BlockAllocator {
         for i in 0..n {
             let gi = (first + i) % n;
             let g = &mut self.groups[gi];
-            if kind.is_some_and(|k| !g.kind.serves(k)) {
+            if kind.is_some_and(|k| !g.kind.serves(k)) || tier.is_some_and(|t| g.tier != t) {
                 continue;
             }
             let from = if i == 0 { from } else { 0 };
@@ -413,6 +522,17 @@ impl BlockAllocator {
         n: u64,
         kind: Option<ChunkKind>,
     ) -> Option<u64> {
+        self.allocate_run_tier(goal, n, kind, None)
+    }
+
+    /// [`allocate_run_for`](Self::allocate_run_for) from groups on `tier`.
+    pub fn allocate_run_tier(
+        &mut self,
+        goal: Option<u64>,
+        n: u64,
+        kind: Option<ChunkKind>,
+        tier: Option<Tier>,
+    ) -> Option<u64> {
         let groups = self.groups.len();
         let (first, from) = match goal {
             Some(g) if ((g / GROUP_BLOCKS) as usize) < groups => {
@@ -425,7 +545,7 @@ impl BlockAllocator {
         for i in 0..=groups {
             let gi = (first + i) % groups.max(1);
             let g = self.groups.get_mut(gi)?;
-            if kind.is_some_and(|k| !g.kind.serves(k)) {
+            if kind.is_some_and(|k| !g.kind.serves(k)) || tier.is_some_and(|t| g.tier != t) {
                 continue;
             }
             let from = if i == 0 { from } else { 0 };
@@ -663,6 +783,51 @@ mod tests {
         assert_eq!(a.deferred_blocks(), freed);
         a.release_deferred().unwrap();
         assert_eq!(a.free_blocks(), freed);
+    }
+
+    #[test]
+    fn parity_groups_never_reuse_a_committed_row() {
+        let mut a = BlockAllocator::new(vec![AllocationGroup::new(0, 400)]);
+        a.groups_mut()[0].set_row(4);
+        a.set_deferred_frees(true);
+        // Row 0 holds the header blocks: never handed out.
+        assert_eq!(a.allocate(None, 1), Some((4, 1)));
+        // The same transaction keeps filling the row it started.
+        assert_eq!(a.allocate(None, 2), Some((5, 2)));
+        a.release_deferred().unwrap();
+        // Committed: block 7 shares a row with committed data.
+        assert_eq!(a.allocate(None, 1), Some((8, 1)));
+        assert_eq!(a.allocate(None, 10), Some((9, 10)));
+        a.release_deferred().unwrap();
+        // A run never crosses into a committed row.
+        assert_eq!(a.allocate(Some(7), 3), Some((20, 3)));
+        a.release_deferred().unwrap();
+        // Freeing the whole row makes it usable again.
+        a.free(4, 3).unwrap();
+        a.release_deferred().unwrap();
+        assert_eq!(a.allocate(Some(4), 4), Some((4, 4)));
+        a.release_deferred().unwrap();
+        // Exact runs start in a fresh row too.
+        let r = a.allocate_run(Some(0), 6).unwrap();
+        assert_eq!(r % 4, 0);
+    }
+
+    #[test]
+    fn allocation_prefers_the_tier_asked_for() {
+        let mut a = BlockAllocator::new(vec![
+            AllocationGroup::new(0, 100),
+            AllocationGroup::new(1, 100),
+        ]);
+        a.groups_mut()[1].tier = Tier::Fast;
+        let (s, _) = a
+            .allocate_tier(Some(10), 5, None, Some(Tier::Fast))
+            .unwrap();
+        assert!(s >= GROUP_BLOCKS);
+        assert!(a.allocate_tier(None, 5, None, Some(Tier::Slow)).is_none());
+        let r = a
+            .allocate_run_tier(None, 5, None, Some(Tier::Fast))
+            .unwrap();
+        assert!(r >= GROUP_BLOCKS);
     }
 
     #[test]

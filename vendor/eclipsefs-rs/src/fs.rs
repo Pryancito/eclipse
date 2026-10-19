@@ -22,7 +22,7 @@ use crate::cow::{CowFs, SendStats};
 use crate::device::BlockDevice;
 use crate::format::{FileKind, BLOCK_SIZE, MAGIC};
 use crate::v3::EclipseFsV3;
-use crate::volume::{ChunkKind, Profile};
+use crate::volume::{ChunkKind, Profile, Tier};
 use crate::{Error, Result};
 
 /// Operations grouped into one transaction at most (unless `sync` or the
@@ -99,6 +99,8 @@ pub struct DeviceInfo {
     pub allocated_bytes: u64,
     /// False when mounted degraded without it.
     pub present: bool,
+    /// Fast or slow, for tiered placement.
+    pub tier: Tier,
 }
 
 /// One chunk of the logical space (see [`EclipseFS::chunks`]).
@@ -464,6 +466,57 @@ impl EclipseFS {
         dispatch!(self, fs => fs.sync())
     }
 
+    /// Make file `ino` durable (`fsync`/`fdatasync`). On v0.4 a regular
+    /// file whose changes since the last commit are writes, truncates and
+    /// attribute changes gets one record in the fsync log and one device
+    /// flush; anything else commits, as [`sync`](Self::sync) does.
+    pub fn fsync(&mut self, ino: u64) -> Result<()> {
+        match &mut self.driver {
+            Driver::V3(fs) => fs.sync(),
+            Driver::V4(fs) => fs.fsync(ino),
+        }
+    }
+
+    /// Commit every `secs` seconds of the clock instead of every
+    /// [`COMMIT_OPS`] operations (v0.4; `None` restores the default). The
+    /// caller runs [`commit_if_due`](Self::commit_if_due) from a timer.
+    pub fn set_commit_interval(&mut self, secs: Option<u64>) {
+        if let Driver::V4(fs) = &mut self.driver {
+            fs.set_commit_interval(secs);
+        }
+    }
+
+    /// Commit if the commit interval has passed (and anything changed).
+    pub fn commit_if_due(&mut self) -> Result<bool> {
+        match &mut self.driver {
+            Driver::V3(fs) => fs.sync().map(|_| false),
+            Driver::V4(fs) => fs.commit_if_due(),
+        }
+    }
+
+    /// Whether [`write_atomic`](Self::write_atomic) works on `ino` (v0.4
+    /// regular files that are not no-COW).
+    pub fn atomic_write_supported(&mut self, ino: u64) -> Result<bool> {
+        match &mut self.driver {
+            Driver::V3(_) => Ok(false),
+            Driver::V4(fs) => fs.atomic_write_supported(ino),
+        }
+    }
+
+    /// `RWF_ATOMIC`: write all of `data` or nothing, untorn by a crash (at
+    /// most [`ATOMIC_WRITE_MAX`](crate::cow::ATOMIC_WRITE_MAX) bytes).
+    pub fn write_atomic(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
+        self.cow()?.write_atomic(ino, offset, data)
+    }
+
+    /// fsync log records written since mount (0 on v0.3).
+    pub fn fsync_log_records(&self) -> u64 {
+        match &self.driver {
+            Driver::V3(_) => 0,
+            Driver::V4(fs) => fs.log_records(),
+        }
+    }
+
     /// Grow the filesystem to the device's current size. `Ok(true)` if it grew.
     pub fn grow_to_device(&mut self) -> Result<bool> {
         dispatch!(self, fs => fs.grow_to_device())
@@ -814,6 +867,35 @@ impl EclipseFS {
         meta: Option<Profile>,
     ) -> Result<BalanceReport> {
         self.cow()?.balance(data, meta)
+    }
+
+    /// Mark device `devid` fast (SSD) or slow (HDD), or neither. With both
+    /// kinds present, metadata and new data go to fast devices first.
+    pub fn set_device_tier(&mut self, devid: u32, tier: Tier) -> Result<()> {
+        self.cow()?.set_device_tier(devid, tier)
+    }
+
+    /// The tier of device `devid` ([`Tier::Any`] when it has none).
+    pub fn device_tier(&self, devid: u32) -> Tier {
+        match &self.driver {
+            Driver::V4(c) => c.device_tier(devid),
+            Driver::V3(_) => Tier::Any,
+        }
+    }
+
+    /// `btrfs device add` with a tier for the new device.
+    pub fn add_device_tier(&mut self, dev: Arc<dyn BlockDevice>, tier: Tier) -> Result<u32> {
+        let id = self.add_device(dev)?;
+        if tier != Tier::Any {
+            self.set_device_tier(id, tier)?;
+        }
+        Ok(id)
+    }
+
+    /// Move full data chunks from fast to slow devices and metadata chunks
+    /// to fast ones (every data chunk on a fast device with `all`).
+    pub fn tier_migrate(&mut self, all: bool) -> Result<BalanceReport> {
+        self.cow()?.tier_migrate(all)
     }
 
     /// Profiles of new data and metadata chunks.

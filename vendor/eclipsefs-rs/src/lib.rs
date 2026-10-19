@@ -40,6 +40,7 @@ pub mod format;
 pub mod fs;
 pub mod journal;
 pub mod mkfs;
+pub mod raid56;
 pub mod space;
 pub mod v3;
 pub mod volume;
@@ -52,7 +53,7 @@ pub use fs::{
     probe, BalanceReport, CheckReport, ChunkInfo, CompSize, DeviceInfo, DeviceProbe, DirEntry,
     EclipseFS, FileMapping, FsStat, InodeStat, QgroupInfo, RepairReport, ScrubReport, SubvolInfo,
 };
-pub use volume::{ChunkKind, Profile};
+pub use volume::{ChunkKind, Profile, Tier};
 
 /// Version of the on-disk format new filesystems get (v0.4.0).
 pub const ECLIPSEFS_VERSION: u32 = cowfmt::VERSION4;

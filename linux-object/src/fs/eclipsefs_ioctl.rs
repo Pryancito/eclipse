@@ -26,6 +26,8 @@
 //! | `BTRFS_IOC_BALANCE_V2` | balance, with `convert` to another profile |
 //! | `BTRFS_IOC_SEND` | send stream of a read-only snapshot into a file |
 //! | `EFS_IOC_RECEIVE` | receive such a stream into a directory (EclipseFS's own) |
+//! | `EFS_IOC_SET_TIER`, `GET_TIER` | a device's tier: fast (SSD) or slow (HDD) (EclipseFS's own) |
+//! | `EFS_IOC_TIER_MIGRATE` | move full data chunks to the slow devices (EclipseFS's own) |
 //! | `FS_IOC_SET_ENCRYPTION_POLICY`, `GET_ENCRYPTION_POLICY(_EX)` | fscrypt v2 policy of an empty directory |
 //! | `FS_IOC_ADD_ENCRYPTION_KEY`, `REMOVE_ENCRYPTION_KEY(_ALL_USERS)` | master keys (`fscrypt unlock`/`lock`) |
 //! | `FS_IOC_GET_ENCRYPTION_KEY_STATUS`, `GET_ENCRYPTION_NONCE` | `fscrypt status` |
@@ -53,7 +55,9 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 
 use eclipsefs::cowfmt::{handle, split, FIRST_INO, FS_TREE};
-use eclipsefs::{Compression, EclipseFS, EncryptionPolicy, Error as EfsError, FileKind, Profile};
+use eclipsefs::{
+    Compression, EclipseFS, EncryptionPolicy, Error as EfsError, FileKind, Profile, Tier,
+};
 use kernel_hal::user::{UserInPtr, UserOutPtr};
 use rcore_fs::vfs::INode;
 
@@ -140,6 +144,18 @@ const BTRFS_IOC_SNAP_DESTROY_V2: u32 = 0x5000_943f;
 /// stream in file `fd` (from its position) into the directory the ioctl is
 /// called on. EclipseFS's own; btrfs receives in userspace.
 pub const EFS_IOC_RECEIVE: u32 = 0x4020_94f0;
+/// `_IOW(0x94, 0xf1, struct { __u64 devid; __u64 tier; __u64 reserved[2]; })`:
+/// tier 0 none, 1 fast, 2 slow. With fast and slow devices both there,
+/// metadata and new data go to the fast ones first.
+pub const EFS_IOC_SET_TIER: u32 = 0x4020_94f1;
+/// `_IOWR(0x94, 0xf2, struct { __u64 devid; __u64 tier; __u64 reserved[2]; })`:
+/// the tier of device `devid`.
+pub const EFS_IOC_GET_TIER: u32 = 0xc020_94f2;
+/// `_IOWR(0x94, 0xf3, struct { __u64 flags; __u64 relocated; __u64 reserved[2]; })`:
+/// move full data chunks off the fast devices (every one with flag 1) and
+/// metadata onto them; `relocated` gets how many chunks moved.
+pub const EFS_IOC_TIER_MIGRATE: u32 = 0xc020_94f3;
+const EFS_TIER_MIGRATE_ALL: u64 = 1 << 0;
 
 const FS_IMMUTABLE_FL: u32 = 0x10;
 const FS_APPEND_FL: u32 = 0x20;
@@ -163,6 +179,8 @@ const BTRFS_BLOCK_GROUP_RAID0: u64 = 1 << 3;
 const BTRFS_BLOCK_GROUP_RAID1: u64 = 1 << 4;
 const BTRFS_BLOCK_GROUP_DUP: u64 = 1 << 5;
 const BTRFS_BLOCK_GROUP_RAID10: u64 = 1 << 6;
+const BTRFS_BLOCK_GROUP_RAID5: u64 = 1 << 7;
+const BTRFS_BLOCK_GROUP_RAID6: u64 = 1 << 8;
 const BTRFS_BLOCK_GROUP_RAID1C3: u64 = 1 << 9;
 const BTRFS_BLOCK_GROUP_RAID1C4: u64 = 1 << 10;
 const BTRFS_AVAIL_ALLOC_BIT_SINGLE: u64 = 1 << 48;
@@ -344,6 +362,9 @@ pub(crate) fn is_fs_ioctl(cmd: u32) -> bool {
             | BTRFS_IOC_GET_SUBVOL_INFO
             | BTRFS_IOC_SNAP_DESTROY_V2
             | EFS_IOC_RECEIVE
+            | EFS_IOC_SET_TIER
+            | EFS_IOC_GET_TIER
+            | EFS_IOC_TIER_MIGRATE
             | FS_IOC_SET_ENCRYPTION_POLICY
             | FS_IOC_GET_ENCRYPTION_POLICY
             | FS_IOC_GET_ENCRYPTION_POLICY_EX
@@ -722,6 +743,7 @@ impl<'a> Target<'a> {
             size_bytes: st.total_bytes,
             allocated_bytes: st.bytes_used,
             present: true,
+            tier: Tier::Any,
         }]
     }
 
@@ -932,6 +954,33 @@ impl<'a> Target<'a> {
             BTRFS_IOC_BALANCE_CTL | BTRFS_IOC_BALANCE_PROGRESS => return Err(LxError::ENOTCONN),
             BTRFS_IOC_SEND => self.send(buf, ctx)?,
             EFS_IOC_RECEIVE => self.receive(buf, ctx)?,
+            EFS_IOC_SET_TIER => {
+                Self::admin(ctx)?;
+                self.want_write()?;
+                let (devid, tier) = (get64(buf, 0), get64(buf, 8));
+                if devid > u32::MAX as u64 || tier > u8::MAX as u64 {
+                    return Err(LxError::EINVAL);
+                }
+                let tier = Tier::from_id(tier as u8).map_err(|_| LxError::EINVAL)?;
+                let devid = devid as u32;
+                self.with(|fs| fs.set_device_tier(devid, tier))?;
+            }
+            EFS_IOC_GET_TIER => {
+                let devid = get64(buf, 0);
+                let dev = self
+                    .devices()
+                    .into_iter()
+                    .find(|d| d.devid as u64 == devid)
+                    .ok_or(LxError::ENODEV)?;
+                put64(buf, 8, dev.tier.id() as u64);
+            }
+            EFS_IOC_TIER_MIGRATE => {
+                Self::admin(ctx)?;
+                self.want_write()?;
+                let all = get64(buf, 0) & EFS_TIER_MIGRATE_ALL != 0;
+                let r = self.with(|fs| fs.tier_migrate(all))?;
+                put64(buf, 8, r.relocated);
+            }
             _ => return Err(LxError::ENOTTY),
         }
         Ok(0)
@@ -1465,7 +1514,9 @@ fn profile(bits: u64) -> LxResult<Profile> {
         BTRFS_BLOCK_GROUP_RAID10 => Profile::Raid10,
         BTRFS_BLOCK_GROUP_RAID1C3 => Profile::Raid1c3,
         BTRFS_BLOCK_GROUP_RAID1C4 => Profile::Raid1c4,
-        // RAID5/6 and combinations.
+        BTRFS_BLOCK_GROUP_RAID5 => Profile::Raid5,
+        BTRFS_BLOCK_GROUP_RAID6 => Profile::Raid6,
+        // Combinations.
         _ => return Err(LxError::EINVAL),
     })
 }
@@ -1597,6 +1648,42 @@ fn xattr(
             XattrReply::Names(out)
         }
     })
+}
+
+/// `pwritev2(RWF_ATOMIC)` into `inode` (opened as `path`) on an EclipseFS
+/// mount: all of `data` or nothing, untorn by a crash. `None` when the
+/// inode is on another filesystem.
+pub(crate) fn eclipsefs_write_atomic(
+    inode: &Arc<dyn INode>,
+    path: &str,
+    offset: u64,
+    data: &[u8],
+) -> Option<LxResult<usize>> {
+    let (fs, ino) = efs_of(inode)?;
+    Some((|| {
+        if fs.read_only || super::path_is_read_only(path) {
+            return Err(LxError::EROFS);
+        }
+        fs.inner
+            .lock()
+            .write_atomic(ino, offset, data)
+            .map_err(|e| match e {
+                // RWF_ATOMIC on a file that cannot do it.
+                EfsError::Unsupported(_) => LxError::EINVAL,
+                e => errno(e),
+            })
+    })())
+}
+
+/// `statx`'s atomic write unit (smallest, largest) for `inode`: a regular
+/// file of an EclipseFS mount that is not no-COW. `None` otherwise.
+pub fn eclipsefs_atomic_write_unit(inode: &Arc<dyn INode>) -> Option<(u32, u32)> {
+    let (fs, ino) = efs_of(inode)?;
+    let ok = fs.inner.lock().atomic_write_supported(ino).ok()?;
+    ok.then_some((
+        eclipsefs::format::BLOCK_SIZE as u32,
+        eclipsefs::cow::ATOMIC_WRITE_MAX as u32,
+    ))
 }
 
 /// `fallocate(2)` on a file of an EclipseFS mount, with the mode already
@@ -1845,6 +1932,9 @@ mod tests {
         assert_eq!(BTRFS_IOC_GET_SUBVOL_INFO, ioc(R, 0x94, 60, 504));
         assert_eq!(BTRFS_IOC_SNAP_DESTROY_V2, ioc(W, 0x94, 63, 4096));
         assert_eq!(EFS_IOC_RECEIVE, ioc(W, 0x94, 0xf0, 32));
+        assert_eq!(EFS_IOC_SET_TIER, ioc(W, 0x94, 0xf1, 32));
+        assert_eq!(EFS_IOC_GET_TIER, ioc(R | W, 0x94, 0xf2, 32));
+        assert_eq!(EFS_IOC_TIER_MIGRATE, ioc(R | W, 0x94, 0xf3, 32));
         assert!(is_fs_ioctl(FICLONE));
         assert!(!is_fs_ioctl(0x5401), "TCGETS is not ours");
     }
@@ -2880,6 +2970,36 @@ mod tests {
     }
 
     #[test]
+    fn atomic_writes_go_through_whole_and_say_their_unit() {
+        let disk = formatted(32 << 20);
+        let fs = mount(&disk);
+        let root = fs.root_inode();
+        let inode = file_with(&root, "a", &pattern(300_000, 3));
+        assert_eq!(
+            eclipsefs_atomic_write_unit(&inode),
+            Some((4096, eclipsefs::cow::ATOMIC_WRITE_MAX as u32))
+        );
+        let file = File::new(inode.clone(), OpenFlags::RDWR, String::from("/efs-test/a"));
+        let data = pattern(65_536, 9);
+        assert_eq!(file.write_atomic_at(65_536, &data), Ok(65_536));
+        let mut back = vec![0u8; 65_536];
+        assert_eq!(inode.read_at(65_536, &mut back).unwrap(), 65_536);
+        assert_eq!(back, data);
+        // Read-only descriptors and directories.
+        let ro = File::new(
+            inode.clone(),
+            OpenFlags::RDONLY,
+            String::from("/efs-test/a"),
+        );
+        assert_eq!(ro.write_atomic_at(0, &data), Err(LxError::EBADF));
+        let dir = root.create("d", FileType::Dir, 0o755).unwrap();
+        assert_eq!(eclipsefs_atomic_write_unit(&dir), None);
+        // Too big for one atomic write.
+        let big = vec![0u8; eclipsefs::cow::ATOMIC_WRITE_MAX as usize * 2];
+        assert_eq!(file.write_atomic_at(0, &big), Err(LxError::EINVAL));
+    }
+
+    #[test]
     fn copy_file_range_reflinks_aligned_ranges_and_leaves_the_rest_to_a_copy() {
         let disk = formatted(32 << 20);
         let fs = mount(&disk);
@@ -3007,7 +3127,19 @@ mod tests {
             EfsOptions::parse("subvolid=257").unwrap().subvolid,
             Some(257)
         );
-        for bad in ["compress=brotli", "subvolid=x", "subvol", "device="] {
+        assert_eq!(EfsOptions::parse("commit=30").unwrap().commit, Some(30));
+        assert_eq!(
+            EfsOptions::parse("commit=0").unwrap().commit,
+            Some(super::super::eclipsefs_mount::DEFAULT_COMMIT_SECS)
+        );
+        for bad in [
+            "compress=brotli",
+            "subvolid=x",
+            "subvol",
+            "device=",
+            "commit",
+            "commit=soon",
+        ] {
             assert!(EfsOptions::parse(bad).is_err(), "{}", bad);
         }
         assert_eq!(EfsOptions::parse("").unwrap(), EfsOptions::default());
@@ -3126,6 +3258,68 @@ mod tests {
     }
 
     #[test]
+    fn parity_and_tiers_by_ioctl() {
+        let disks = volume(3, 0xa5, Profile::Raid5);
+        for (i, d) in disks.iter().enumerate() {
+            let block: Arc<dyn BlockScheme> = d.clone();
+            register_block_device(&format!("efs-vol-a5-{}", i), block);
+        }
+        let data = pattern(2 << 20, 25);
+        {
+            let fs = mount(&disks[0]);
+            assert_eq!(fs.inner.lock().profiles(), (Profile::Raid5, Profile::Raid5));
+            file_with(&fs.root_inode(), "striped", &data);
+            fs.sync().unwrap();
+            let ctx = Ctx::root();
+            let top = ctx.open(fs.root_inode(), OpenFlags::RDONLY);
+            // btrfs balance start -dconvert=raid6 (three devices are enough)
+            let mut bal = vec![0u8; 1024];
+            put64(&mut bal, 0, BTRFS_BALANCE_DATA);
+            put64(&mut bal, 16 + 56, BTRFS_BLOCK_GROUP_RAID6);
+            put64(&mut bal, 16 + 64, BTRFS_BALANCE_ARGS_CONVERT);
+            ctx.ioctl(top, BTRFS_IOC_BALANCE_V2, &mut bal).unwrap();
+            assert_eq!(fs.inner.lock().profiles(), (Profile::Raid6, Profile::Raid5));
+            // Device 1 fast, the others slow.
+            for (devid, tier) in [(1u64, 1u64), (2, 2), (3, 2)] {
+                let mut t = vec![0u8; 32];
+                put64(&mut t, 0, devid);
+                put64(&mut t, 8, tier);
+                ctx.ioctl(top, EFS_IOC_SET_TIER, &mut t).unwrap();
+            }
+            let mut t = vec![0u8; 32];
+            put64(&mut t, 0, 1);
+            ctx.ioctl(top, EFS_IOC_GET_TIER, &mut t).unwrap();
+            assert_eq!(get64(&t, 8), 1);
+            put64(&mut t, 0, 9);
+            assert_eq!(
+                ctx.ioctl(top, EFS_IOC_GET_TIER, &mut t),
+                Err(LxError::ENODEV)
+            );
+            let mut bad = vec![0u8; 32];
+            put64(&mut bad, 0, 1);
+            put64(&mut bad, 8, 7);
+            assert_eq!(
+                ctx.ioctl(top, EFS_IOC_SET_TIER, &mut bad),
+                Err(LxError::EINVAL)
+            );
+            // Only two slow devices: RAID6 data cannot live on them alone,
+            // so it stays put; nothing breaks.
+            let mut mig = vec![0u8; 32];
+            put64(&mut mig, 0, EFS_TIER_MIGRATE_ALL);
+            ctx.ioctl(top, EFS_IOC_TIER_MIGRATE, &mut mig).unwrap();
+            assert_eq!(read_all(&fs.root_inode().find("striped").unwrap()), data);
+            fs.sync().unwrap();
+        }
+        // Lose a device: parity has the rest.
+        forget_block_device("efs-vol-a5-2");
+        let fs = mount_with(&disks[0], true, "degraded");
+        assert_eq!(read_all(&fs.root_inode().find("striped").unwrap()), data);
+        assert_eq!(fs.inner.lock().device_tier(1), Tier::Fast);
+        forget_block_device("efs-vol-a5-0");
+        forget_block_device("efs-vol-a5-1");
+    }
+
+    #[test]
     fn devices_are_added_balanced_and_removed_by_ioctl() {
         let disk = formatted(48 << 20);
         let fs = mount(&disk);
@@ -3173,8 +3367,12 @@ mod tests {
             .unwrap();
         assert_eq!(fs.inner.lock().devices().len(), 1);
         assert_eq!(read_all(&src_named(&fs, "payload")), data);
-        // RAID5 is not a profile here.
-        put64(&mut bal, 16 + 56, 1 << 7);
+        // A combination of profiles is not one.
+        put64(
+            &mut bal,
+            16 + 56,
+            BTRFS_BLOCK_GROUP_RAID5 | BTRFS_BLOCK_GROUP_RAID1,
+        );
         assert_eq!(
             ctx.ioctl(top, BTRFS_IOC_BALANCE_V2, &mut bal),
             Err(LxError::EINVAL)

@@ -2,6 +2,7 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::blocks::{AllocationGroup, BlockAllocator};
@@ -9,7 +10,7 @@ use crate::device::BlockDevice;
 use crate::format::*;
 use crate::journal::JournalArea;
 use crate::v3::{extend_zeroed, write_chain, write_data, zero, ITABLE_GROW};
-use crate::volume::Profile;
+use crate::volume::{Profile, Tier};
 use crate::{Error, Result};
 
 /// Same fields as `btrfs::mkfs::MkfsOptions`, so callers can switch crates
@@ -118,6 +119,22 @@ pub fn format_devices(
     data: Profile,
     meta: Profile,
 ) -> Result<()> {
+    format_devices_tiered(devs, opts, data, meta, &[])
+}
+
+/// [`format_devices`] with a [`Tier`] for each device (`tiers[i]` for
+/// `devs[i]`; missing entries are untiered): metadata and new data go to
+/// the fast devices first, see [`crate::volume`].
+pub fn format_devices_tiered(
+    devs: &[Arc<dyn BlockDevice>],
+    opts: &MkfsOptions,
+    data: Profile,
+    meta: Profile,
+    tiers: &[Tier],
+) -> Result<()> {
+    if tiers.len() > devs.len() {
+        return Err(Error::Invalid);
+    }
     let first = devs.first().ok_or(Error::Invalid)?;
     if data.min_devices() > devs.len() || meta.min_devices() > devs.len() {
         return Err(Error::Unsupported("not enough devices for that profile"));
@@ -128,8 +145,14 @@ pub fn format_devices(
     format(&Prefix(first.clone(), sys * BLOCK_SIZE), opts)?;
     let mut fs = crate::cow::CowFs::mount(first.clone(), false)?;
     fs.make_volume_metadata()?;
+    let mut ids = vec![1u32];
     for d in &devs[1..] {
-        fs.add_device(d.clone())?;
+        ids.push(fs.add_device(d.clone())?);
+    }
+    for (&id, &t) in ids.iter().zip(tiers) {
+        if t != Tier::Any {
+            fs.set_device_tier(id, t)?;
+        }
     }
     fs.balance(Some(data), Some(meta))?;
     fs.sync()

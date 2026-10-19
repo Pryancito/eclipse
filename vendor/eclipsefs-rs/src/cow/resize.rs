@@ -52,6 +52,8 @@ impl CowFs {
     /// new size in bytes.
     pub fn resize(&mut self, devid: u32, size: Option<u64>) -> Result<u64> {
         self.writable()?;
+        // The fsync log area is not among what relocation moves.
+        self.drop_log_area()?;
         let r = match self.vol.clone() {
             None => self.resize_single(devid, size),
             Some(vol) => self.resize_member(&vol, devid, size),

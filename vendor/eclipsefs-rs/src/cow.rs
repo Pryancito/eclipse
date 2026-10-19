@@ -35,12 +35,17 @@ use crate::fs::{
 use crate::journal::{JournalArea, Overlay};
 use crate::space::{metadata_reserve, BlockSpace, RangeSet, RefMap};
 use crate::v3::write_home;
-use crate::volume::{Chunk, ChunkKind, ChunkMap, Profile, Stripe, Volume, DEV_RESERVED, MIN_CHUNK};
+use crate::volume::{
+    Chunk, ChunkKind, ChunkMap, Profile, Stripe, Tier, Volume, DEV_RESERVED, MIN_CHUNK,
+};
 use crate::{Error, Result};
 
 const BS: u64 = BLOCK_SIZE;
 /// Blocks handled per step of a large write (bounds the buffer).
 const WRITE_CHUNK: u64 = 2048;
+/// Largest [`CowFs::write_atomic`] (`RWF_ATOMIC`'s `atomic_write_unit_max`):
+/// the caller holds it in one buffer, which the kernel heap keeps at 1 MiB.
+pub const ATOMIC_WRITE_MAX: u64 = 1 << 20;
 /// Extents at least this long are left alone by [`CowFs::defrag`] (btrfs's
 /// default `extent_thresh`).
 const DEFRAG_THRESHOLD: u64 = 32 << 20;
@@ -48,6 +53,10 @@ const DEFRAG_THRESHOLD: u64 = 32 << 20;
 const DEFRAG_WINDOW: u64 = WRITE_CHUNK;
 /// Commit early once this many tree nodes wait to be written.
 const DIRTY_NODES_LIMIT: usize = 4096;
+/// With timed commits, commit early once this many data blocks wait for
+/// their checksums to go into the tree (256 MiB of data, a few MiB of
+/// kernel heap).
+const PENDING_SUMS_LIMIT: usize = 1 << 16;
 /// Items [`CowFs::purge`] reads in one step. Deleting an inode visits every
 /// item it owns, and a multi-GB file has millions of them, so the list they
 /// are read into is the allocation that matters, not the work.
@@ -75,6 +84,7 @@ fn key_after(k: &Key) -> Option<Key> {
 
 mod bitmap_sums;
 mod encrypt;
+mod fsync_log;
 
 pub use encrypt::EncryptionPolicy;
 mod repair;
@@ -187,6 +197,13 @@ pub struct CowFs {
     /// Encryption keys (memory only) and the source of nonces.
     keyring: encrypt::Keyring,
     random: Option<fn(&mut [u8])>,
+    /// What `fsync` may write to the log instead of committing.
+    log: fsync_log::LogState,
+    /// Timed commits: every this many seconds (by the clock) instead of
+    /// every [`COMMIT_OPS`] operations.
+    commit_interval: Option<u64>,
+    /// Clock time of the last commit (seconds).
+    last_commit: u64,
 }
 
 /// File blocks among `from..to` that `exts` map.
@@ -297,6 +314,10 @@ fn read_volume_groups(
         }
         let (mut grp, crc) = read_group(dev, g, c.blocks, &mut buf, lenient)?;
         grp.kind = c.kind;
+        grp.tier = map.chunk_tier(c);
+        if c.profile.parity() > 0 {
+            grp.set_row(c.data_cols() as u64);
+        }
         groups.push(grp);
         crcs.push(crc);
     }
@@ -309,6 +330,9 @@ fn readable(c: &Chunk, missing: &[u32]) -> bool {
     match c.profile {
         Profile::Raid0 => c.stripes.iter().all(up),
         Profile::Raid10 => c.stripes.chunks(2).all(|p| p.iter().any(up)),
+        Profile::Raid5 | Profile::Raid6 => {
+            c.stripes.iter().filter(|s| !up(s)).count() <= c.profile.parity()
+        }
         _ => c.stripes.iter().any(up),
     }
 }
@@ -523,8 +547,12 @@ impl CowFs {
             sums_pending: false,
             keyring: Default::default(),
             random: None,
+            log: Default::default(),
+            commit_interval: None,
+            last_commit: 0,
             sb,
         };
+        fs.refresh_layouts();
         fs.load_bitmap_sums(crcs)?;
         let free = fs.sp.alloc.free_blocks();
         if fs.sb.free_blocks != free {
@@ -539,6 +567,14 @@ impl CowFs {
         if fs.inode(root_dir)?.kind() != FileKind::Dir {
             return Err(Error::Corrupt("root is not a directory"));
         }
+        let replayed = fs.replay_log()?;
+        if replayed > 0 {
+            warn!("eclipsefs: replayed {} fsync log records", replayed);
+            if !read_only {
+                fs.flush()?;
+                fs.raw.sync()?;
+            }
+        }
         if !read_only {
             fs.resync_stale()?;
             fs.drop_unfinished_receives()?;
@@ -548,6 +584,40 @@ impl CowFs {
 
     pub fn set_clock(&mut self, clock: fn() -> (u64, u32)) {
         self.clock = Some(clock);
+        self.last_commit = clock().0;
+    }
+
+    /// Commit every `secs` seconds of the clock (`None`: every
+    /// [`COMMIT_OPS`] operations, the default) as ext4's and btrfs's
+    /// `commit=` do. Operations then only commit early when the
+    /// transaction grows large; whoever mounts calls
+    /// [`commit_if_due`](Self::commit_if_due) from a timer so an idle
+    /// filesystem commits too, and `fsync` uses the log in between.
+    pub fn set_commit_interval(&mut self, secs: Option<u64>) {
+        self.commit_interval = secs.map(|s| s.max(1));
+    }
+
+    pub fn commit_interval(&self) -> Option<u64> {
+        self.commit_interval
+    }
+
+    /// Commit if the interval has passed since the last commit (timed
+    /// commits) and anything changed. Returns whether it committed.
+    pub fn commit_if_due(&mut self) -> Result<bool> {
+        if self.read_only || self.nested || !self.commit_due() {
+            return Ok(false);
+        }
+        let gen = self.sb.generation;
+        self.flush()?;
+        Ok(self.sb.generation != gen)
+    }
+
+    fn commit_due(&self) -> bool {
+        match (self.commit_interval, self.clock) {
+            (Some(secs), Some(c)) => c().0.saturating_sub(self.last_commit) >= secs,
+            (Some(_), None) => self.pending_ops >= COMMIT_OPS,
+            (None, _) => self.pending_ops >= COMMIT_OPS,
+        }
     }
 
     pub fn label(&self) -> String {
@@ -573,7 +643,13 @@ impl CowFs {
                 .filter(|(d, _)| !self.sp.avoid.contains(d))
                 .map(|(_, n)| n)
                 .sum();
-            total += free / self.sp.profiles.0.copies() as u64;
+            let devices = map
+                .devices
+                .keys()
+                .filter(|d| !self.sp.avoid.contains(d))
+                .count();
+            let (raw, data) = self.sp.profiles.0.overhead(devices);
+            total += free * data / raw;
         }
         FsStat {
             block_size: BS,
@@ -613,7 +689,10 @@ impl CowFs {
             return Ok(());
         }
         self.pending_ops += 1;
-        if self.pending_ops >= COMMIT_OPS || self.st.dirty_count() >= DIRTY_NODES_LIMIT {
+        if self.commit_due()
+            || self.st.dirty_count() >= DIRTY_NODES_LIMIT
+            || self.sp.csums.len() >= PENDING_SUMS_LIMIT
+        {
             self.flush()?;
         }
         Ok(())
@@ -632,6 +711,10 @@ impl CowFs {
             || self.sums_pending
             || self.items_changed()?;
         if !changed {
+            self.log_committed();
+            if let Some(c) = self.clock {
+                self.last_commit = c().0;
+            }
             return Ok(());
         }
         // Data checksums into the checksum tree.
@@ -736,9 +819,15 @@ impl CowFs {
                     self.dev.insert(b, data);
                 }
             }
-        } else if let Some(v) = &self.vol {
-            // Chunks moved away from are no longer the committed state.
-            v.release();
+        } else {
+            if let Some(v) = &self.vol {
+                // Chunks moved away from are no longer the committed state.
+                v.release();
+            }
+            self.log_committed();
+            if let Some(c) = self.clock {
+                self.last_commit = c().0;
+            }
         }
         r
     }
@@ -793,6 +882,17 @@ impl CowFs {
             .clone();
         vs.data_profile = self.sp.profiles.0;
         vs.meta_profile = self.sp.profiles.1;
+        // Older drivers know neither parity profiles nor tiers.
+        let parity = map.chunks.values().any(|c| c.profile.parity() > 0)
+            || self.sp.profiles.0.parity() > 0
+            || self.sp.profiles.1.parity() > 0;
+        for (on, bit) in [(parity, FEAT_RAID56), (!map.tiers.is_empty(), FEAT_TIERS)] {
+            if on {
+                self.sb.features |= bit;
+            } else {
+                self.sb.features &= !bit;
+            }
+        }
         self.sp.chunks_dirty = false;
         Ok(())
     }
@@ -1013,14 +1113,17 @@ impl CowFs {
     }
 
     fn insert(&mut self, key: Key, v: Vec<u8>) -> Result<()> {
+        self.log_item(&key);
         self.st.insert(&mut self.sp, &mut self.fs_root, key, v)
     }
 
     fn upsert(&mut self, key: Key, v: Vec<u8>) -> Result<()> {
+        self.log_item(&key);
         self.st.upsert(&mut self.sp, &mut self.fs_root, key, v)
     }
 
     fn delete(&mut self, key: Key) -> Result<Vec<u8>> {
+        self.log_item(&key);
         self.st.delete(&mut self.sp, &mut self.fs_root, key)
     }
 
@@ -1035,6 +1138,7 @@ impl CowFs {
     }
 
     fn put_inode(&mut self, ino: u64, mut i: InodeItem) -> Result<()> {
+        self.log_attr(ino);
         i.seq += 1;
         let nbytes = i.nbytes;
         let old = self.st.modify(
@@ -1160,6 +1264,27 @@ impl CowFs {
         prealloc: bool,
     ) -> Result<()> {
         self.unmap(ino, inode, lblk, lblk + n)?;
+        // Blocks of another owner (a reflink) are more than the log
+        // follows.
+        if !self.sp.private_fresh(pblk, n) {
+            self.log_full(ino);
+        }
+        let was = core::mem::replace(&mut self.log.in_extents, true);
+        let r = self.map_new(ino, inode, lblk, n, pblk, prealloc);
+        self.log.in_extents = was;
+        r
+    }
+
+    /// The item part of [`map`](Self::map), once `lblk..lblk+n` is unmapped.
+    fn map_new(
+        &mut self,
+        ino: u64,
+        inode: &mut InodeItem,
+        lblk: u64,
+        n: u64,
+        pblk: u64,
+        prealloc: bool,
+    ) -> Result<()> {
         // Extend the previous extent when the new blocks continue it.
         if lblk > 0 {
             if let Some(prev) = self.extents(ino, lblk - 1, lblk)?.first().copied() {
@@ -1189,16 +1314,22 @@ impl CowFs {
     /// file walks every extent it has. What a batch handles is gone from
     /// `from..` (or cut to end at `from`) when the next one is read.
     fn unmap(&mut self, ino: u64, inode: &mut InodeItem, from: u64, to: u64) -> Result<()> {
-        let mut cur = from;
-        while cur < to {
-            let batch = self.extents_upto(ino, cur, to, EXTENT_BATCH)?;
-            let Some(last) = batch.last() else {
-                break;
-            };
-            cur = last.lblk + last.blocks;
-            self.unmap_batch(ino, inode, from, to, batch)?;
-        }
-        Ok(())
+        self.log_range(ino, from, to);
+        let was = core::mem::replace(&mut self.log.in_extents, true);
+        let r = (|| {
+            let mut cur = from;
+            while cur < to {
+                let batch = self.extents_upto(ino, cur, to, EXTENT_BATCH)?;
+                let Some(last) = batch.last() else {
+                    break;
+                };
+                cur = last.lblk + last.blocks;
+                self.unmap_batch(ino, inode, from, to, batch)?;
+            }
+            Ok(())
+        })();
+        self.log.in_extents = was;
+        r
     }
 
     fn unmap_batch(
@@ -4008,6 +4139,50 @@ impl CowFs {
     pub fn truncate(&mut self, h: u64, new_size: u64) -> Result<()> {
         let ino = self.at_rw(h)?;
         self.truncate_l(ino, new_size)
+    }
+
+    /// Whether [`write_atomic`](Self::write_atomic) works on file `h`: a
+    /// regular file that is not no-COW (those are rewritten in place).
+    pub fn atomic_write_supported(&mut self, h: u64) -> Result<bool> {
+        let ino = self.at(h)?;
+        let i = self.inode(ino)?;
+        Ok(i.kind() == FileKind::Regular && i.flags & FL_NOCOW as u64 == 0)
+    }
+
+    /// Write all of `data` at `offset` or nothing (`RWF_ATOMIC`): never a
+    /// short write, and a crash shows the old bytes or the new ones, never
+    /// a mix (copy-on-write and the fsync log already give that to every
+    /// write; what this adds is the up-front space check). At most
+    /// [`ATOMIC_WRITE_MAX`] bytes.
+    pub fn write_atomic(&mut self, h: u64, offset: u64, data: &[u8]) -> Result<usize> {
+        if data.is_empty() || data.len() as u64 > ATOMIC_WRITE_MAX {
+            return Err(Error::Invalid);
+        }
+        if !self.atomic_write_supported(h)? {
+            return Err(Error::Unsupported("atomic write on this file"));
+        }
+        let ino = self.at_rw(h)?;
+        self.writable()?;
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(Error::Invalid)?;
+        // Every block of the range is rewritten, plus the inline data a
+        // small file may have to move out.
+        let need = end.div_ceil(BS) - offset / BS + 1;
+        if !self.sp.ensure_data_room(need) {
+            return Err(Error::NoSpace);
+        }
+        let n = self.write_l(ino, offset, data)?;
+        if n != data.len() {
+            // The space was there a moment ago: nothing else ran since.
+            warn!(
+                "eclipsefs: atomic write came out short ({} of {})",
+                n,
+                data.len()
+            );
+            return Err(Error::Io);
+        }
+        Ok(n)
     }
 
     // -----------------------------------------------------------------------
