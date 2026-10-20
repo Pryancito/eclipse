@@ -36,6 +36,9 @@ use zircon_object::{
 
 /// Where a process's arguments and environment are in its own memory.
 mod arg_area;
+/// The thread a child was forked by, and what its exit tells the child.
+mod forking_thread;
+pub use forking_thread::forget_forking_thread;
 /// The file-descriptor table's allocator and its two range sweeps.
 mod census;
 mod child_usage;
@@ -1410,10 +1413,12 @@ struct LinuxProcessInner {
     job_stop_pending: bool,
     /// Continue notification not yet collected by a `wait*` with `WCONTINUED`.
     job_continued_pending: bool,
-    /// Signal delivered to this process when its parent terminates
-    /// (`prctl(PR_SET_PDEATHSIG)`); `0` = none. Deliberately NOT copied on
-    /// `fork` — prctl(2): "the value is cleared for the child of a fork".
+    /// Signal delivered to this process when its parent, or the thread of
+    /// it that forked it, terminates (`prctl(PR_SET_PDEATHSIG)`); `0` = none.
+    /// NOT copied on `fork`: "the value is cleared for the child of a fork".
     pdeathsig: u8,
+    /// The thread of the parent that forked this process (`real_parent`).
+    forking_thread: KoID,
     /// `prctl(PR_SET_CHILD_SUBREAPER)`: orphaned descendants are reparented to
     /// the nearest live subreaper ancestor instead of init. Like Linux, the
     /// attribute itself is not inherited across `fork`.
@@ -4632,6 +4637,7 @@ impl LinuxProcessInner {
             // `p->pdeath_signal = 0` in `copy_process`, and the subreaper
             // attribute is the parent's own role, not a child's.
             pdeathsig: 0,
+            forking_thread: 0,
             child_subreaper: false,
             // `copy_process`: `p->flags |= PF_FORKNOEXEC`. A fresh child is
             // still running the forking program, so its parent may still put

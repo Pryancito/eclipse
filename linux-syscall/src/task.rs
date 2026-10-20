@@ -714,6 +714,7 @@ impl Syscall<'_> {
         // so the stack comes across there just the same.)
         let inherited = self.thread.lock_linux().forked_child();
         let new_thread = Thread::create_linux_with(new_proc, inherited)?;
+        new_proc.linux().set_forking_thread(self.thread.id());
         let mut new_ctx = self.thread.context_cloned()?;
         if newsp != 0 {
             new_ctx.set_field(UserContextField::StackPointer, newsp);
