@@ -516,6 +516,13 @@ impl INode for MNode {
         self.inode.mmap(area)
     }
 
+    /// A magic link leads where it leads from wherever it is mounted:
+    /// `/proc/<pid>/fd/N` is reached through the mount of `/proc` by a link
+    /// such as `/dev/stdin`.
+    fn jump(&self) -> Option<Result<(Arc<dyn INode>, String)>> {
+        self.inode.jump()
+    }
+
     fn fs(&self) -> Arc<dyn FileSystem> {
         self.vfs.clone()
     }

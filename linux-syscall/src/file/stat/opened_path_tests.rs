@@ -27,7 +27,7 @@ const O_PATH: usize = 0o10_000_000;
 /// A process whose root holds, under `/<top>`: `real/f`, `real/sub/`,
 /// `l` -> `/<top>/real`, `rl` -> `real`, `ll` -> `l`, `real/lf` ->
 /// `/<top>/real/f` and `real/up` -> `../real/f`.
-fn a_process(pid: KoID, top: &str) -> Arc<Process> {
+pub(super) fn a_process(pid: KoID, top: &str) -> Arc<Process> {
     let lp = LinuxProcess::new(RamFS::new(), 0);
     let link = |dir: &Arc<dyn INode>, name: &str, to: &str| {
         let l = dir.create(name, FileType::SymLink, 0o777).unwrap();
@@ -45,11 +45,11 @@ fn a_process(pid: KoID, top: &str) -> Arc<Process> {
     Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "names", lp).unwrap()
 }
 
-fn c_path(path: &str) -> String {
+pub(super) fn c_path(path: &str) -> String {
     alloc::format!("{}\0", path)
 }
 
-fn open_at(sys: &Syscall<'_>, dir: FileDesc, path: &str, flags: usize) -> FileDesc {
+pub(super) fn open_at(sys: &Syscall<'_>, dir: FileDesc, path: &str, flags: usize) -> FileDesc {
     let path = c_path(path);
     let fd = sys
         .sys_openat(dir, UserInPtr::from(path.as_ptr() as usize), flags, 0o600)
@@ -58,14 +58,14 @@ fn open_at(sys: &Syscall<'_>, dir: FileDesc, path: &str, flags: usize) -> FileDe
 }
 
 /// What `/proc/self/fd/N` says of `open(path, flags)`.
-fn name_of(sys: &Syscall<'_>, path: &str, flags: usize) -> String {
+pub(super) fn name_of(sys: &Syscall<'_>, path: &str, flags: usize) -> String {
     let fd = open_at(sys, FileDesc::CWD, path, flags);
     let name = readlink(sys, &fd_link(fd)).unwrap();
     sys.sys_close(fd).unwrap();
     name
 }
 
-fn chdir(sys: &Syscall<'_>, path: &str) {
+pub(super) fn chdir(sys: &Syscall<'_>, path: &str) {
     let path = c_path(path);
     sys.sys_chdir(UserInPtr::from(path.as_ptr() as usize))
         .unwrap();

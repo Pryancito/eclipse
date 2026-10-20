@@ -1177,6 +1177,19 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         Ok(()) => warn!("[boot] /dev/shm: writable ramfs ready (SHM_RAMFS_V2)"),
         Err(e) => warn!("failed to mknod /dev/shm: {:?}", e),
     }
+    // The links into `/proc/self/fd` that every Linux `/dev` has (udev and
+    // OpenRC make them), and `echo x > /dev/stderr` or `cat /dev/stdin` in a
+    // script count on.
+    for (name, to) in [
+        ("fd", "/proc/self/fd"),
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+    ] {
+        if let Err(e) = devfs_root.add(name, Arc::new(Pseudo::new(to, FileType::SymLink))) {
+            warn!("failed to link /dev/{}: {:?}", name, e);
+        }
+    }
     devfs_root
         .add("tty", stdio::STDIN.clone())
         .expect("failed to mknod /dev/tty");
@@ -2337,7 +2350,8 @@ impl LinuxProcess {
         path: &str,
         follow: bool,
     ) -> LxResult<Arc<dyn INode>> {
-        self.lookup_inode_at_inner(dirfd, path, follow, FOLLOW_MAX_DEPTH, None)
+        let mut walked = Walked::default();
+        self.lookup_inode_at_inner(dirfd, path, follow, FOLLOW_MAX_DEPTH, &mut walked)
     }
 
     /// [`Self::lookup_inode_at`], and where the walk ended: what Linux names
@@ -2351,7 +2365,7 @@ impl LinuxProcess {
     ) -> LxResult<(Arc<dyn INode>, Walked)> {
         let mut walked = Walked::default();
         let inode =
-            self.lookup_inode_at_inner(dirfd, path, follow, FOLLOW_MAX_DEPTH, Some(&mut walked))?;
+            self.lookup_inode_at_inner(dirfd, path, follow, FOLLOW_MAX_DEPTH, &mut walked)?;
         Ok((inode, walked))
     }
 
@@ -2361,7 +2375,7 @@ impl LinuxProcess {
         path: &str,
         follow: bool,
         proc_self_exe_budget: usize,
-        walked: Option<&mut Walked>,
+        walked: &mut Walked,
     ) -> LxResult<Arc<dyn INode>> {
         debug!(
             "lookup_inode_at: dirfd: {:?}, cwd: {:?}, path: {:?}, follow: {:?}",
@@ -2402,17 +2416,18 @@ impl LinuxProcess {
         path: &str,
         follow: bool,
         proc_self_exe_budget: usize,
-        mut walked: Option<&mut Walked>,
+        walked: &mut Walked,
     ) -> LxResult<Arc<dyn INode>> {
+        // An absolute link starts over at this process's root, from `/proc`
+        // or `/dev` as from anywhere.
+        walked.root = Some(self.root_inode().clone());
         // The special paths below are each in `/proc/<pid>`, where `self` is
         // the calling process, as `fd` takes it.
-        let mut in_proc_self = |rest: core::fmt::Arguments| {
-            if let Some(walked) = walked.as_deref_mut() {
-                let pid = kernel_hal::thread::get_current_thread()
-                    .and_then(|t| t.downcast::<zircon_object::task::Thread>().ok())
-                    .map_or(0, |t| t.proc().id());
-                *walked = Walked::at(&format!("/proc/{}/{}", pid, rest), 1);
-            }
+        let in_proc_self = |walked: &mut Walked, rest: core::fmt::Arguments| {
+            let pid = kernel_hal::thread::get_current_thread()
+                .and_then(|t| t.downcast::<zircon_object::task::Thread>().ok())
+                .map_or(0, |t| t.proc().id());
+            walked.set(&format!("/proc/{}/{}", pid, rest));
         };
         // hard code special path
         if path == "/proc/self/exe" {
@@ -2438,7 +2453,7 @@ impl LinuxProcess {
                     walked,
                 );
             }
-            in_proc_self(format_args!("exe"));
+            in_proc_self(walked, format_args!("exe"));
             return Ok(Arc::new(Pseudo::new(
                 &self.execute_path(),
                 FileType::SymLink,
@@ -2467,7 +2482,7 @@ impl LinuxProcess {
                 .and_then(|t| t.downcast::<zircon_object::task::Thread>().ok())
                 .map(|t| t.proc().clone())
                 .ok_or(LxError::ENOENT)?;
-            in_proc_self(format_args!("fd"));
+            in_proc_self(walked, format_args!("fd"));
             return Ok(Arc::new(proc_self::ProcSelfFdDir { process: proc }));
         }
         let (fd_dir_path, fd_name) = split_path(path);
@@ -2476,28 +2491,22 @@ impl LinuxProcess {
             // `ENOENT`, as its listing and Linux say, not `EBADF` or `EINVAL`.
             let fd = FileDesc::try_from(fd_name).map_err(|_| LxError::ENOENT)?;
             let file = self.get_file_like(fd).map_err(|_| LxError::ENOENT)?;
-            in_proc_self(format_args!("fd/{}", i32::from(fd)));
+            in_proc_self(walked, format_args!("fd/{}", i32::from(fd)));
             if !follow {
-                return Ok(Arc::new(proc_self::FdLink::of(&*file)));
+                return Ok(Arc::new(proc_self::FdLink::of(&file)));
             }
             // Magic link: resolve to the open file itself (like Linux), so
             // execve("/proc/self/fd/N") runs the file, not the symlink's path
             // text, and the walk ends where the file is (`nd_jump_link`). A
             // descriptor that is no file leads to its object.
-            return Ok(match file.downcast_arc::<File>() {
-                Ok(file) => {
-                    if let Some(walked) = walked {
-                        *walked = Walked::at(file.path(), 0);
-                    }
-                    file.inode()
-                }
-                Err(object) => Arc::new(proc_self::FdObject(object)),
-            });
+            let (inode, name) = proc_self::fd_target(file);
+            walked.jump_to(&name);
+            return Ok(inode);
         }
 
         let follow_max_depth = if follow { FOLLOW_MAX_DEPTH } else { 0 };
         if path.starts_with('/') {
-            if let Some(result) = lookup_virtual_fs(path, follow_max_depth, walked.as_deref_mut()) {
+            if let Some(result) = lookup_virtual_fs(path, follow_max_depth, walked) {
                 return result;
             }
             // Absolute path on the real filesystem: the base inode is
@@ -2511,40 +2520,28 @@ impl LinuxProcess {
             // VFS walk (two String allocations + a directory scan per
             // component on SFS) before this.
             if follow {
-                if let Some(inode) = dcache::get(path, walked.as_deref_mut()) {
+                if let Some(inode) = dcache::get(path, walked) {
                     return Ok(inode);
                 }
             }
-            // The cache keeps where the walk ended with the inode, so a walk
-            // it will keep is noted whether the caller asked or not.
-            let mut own = Walked::default();
-            let mut walked = walked.or(follow.then_some(&mut own));
-            let inode =
-                self.root_inode()
-                    .lookup_walked(path, follow_max_depth, walked.as_deref_mut())?;
-            if let (true, Some(walked)) = (follow, walked) {
+            let inode = self
+                .root_inode()
+                .lookup_walked(path, follow_max_depth, Some(walked))?;
+            if follow {
                 dcache::put(path, &inode, walked);
             }
             return Ok(inode);
         }
-        // The walk goes on from where the directory is: a working directory
-        // is reached through the mounts, where an absolute link starts over
-        // at `/`, and a descriptor opened in `/proc`, `/sys` or `/dev` holds
-        // that file system's own inode, where it starts over at its root.
+        // The walk goes on from where the directory is, by its name.
         let (start, from) = if dirfd == FileDesc::CWD {
             let cwd = self.current_working_directory();
-            (self.root_inode().lookup(&cwd)?, (cwd, 0))
+            (self.root_inode().lookup(&cwd)?, cwd)
         } else {
             let file = self.get_file(dirfd)?;
-            let from = file.path().clone();
-            let root = usize::from(virtual_fs_top(&from).is_some());
-            (file.inode(), (from, root))
+            (file.inode(), file.path().clone())
         };
-        let walked = walked.map(|walked| {
-            *walked = Walked::at(&from.0, from.1);
-            walked
-        });
-        Ok(start.lookup_walked(path, follow_max_depth, walked)?)
+        walked.set(&from);
+        Ok(start.lookup_walked(path, follow_max_depth, Some(walked))?)
     }
 
     /// Lookup INode from the process.
@@ -3409,7 +3406,7 @@ fn virtual_fs_top(path: &str) -> Option<&'static str> {
 fn lookup_virtual_fs(
     path: &str,
     follow_times: usize,
-    walked: Option<&mut Walked>,
+    walked: &mut Walked,
 ) -> Option<LxResult<Arc<dyn INode>>> {
     let path = path.trim_end_matches('/');
     let top = virtual_fs_top(path)?;
@@ -3418,11 +3415,8 @@ fn lookup_virtual_fs(
         "/dev" => Some(DEVFS_ROOT.lock().clone()?),
         _ => None,
     };
-    // An absolute link in one of them starts over at its root.
-    let walked = walked.map(|walked| {
-        *walked = Walked::at(top, 1);
-        walked
-    });
+    walked.set(top);
+    let walked = Some(walked);
     let found = match dev {
         Some(root) if path == "/dev" => Ok(root as Arc<dyn INode>),
         Some(root) => {

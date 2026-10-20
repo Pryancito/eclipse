@@ -3,8 +3,10 @@
 //!
 //! Only paths that reach the real-FS branch of `lookup_inode_at_walk` are
 //! ever cached — `/proc`, `/sys` and `/dev` are intercepted earlier by
-//! `lookup_virtual_fs`, so dynamic pseudo-fs content (per-process `/proc`
-//! entries, hotplugged device nodes) can never go stale here.
+//! `lookup_virtual_fs`. A link on the real FS can still lead into `/proc`
+//! (to `/proc/self/stat`, say), or through one of its magic links, and what
+//! such a walk finds is another file to each process, so it is not kept: the
+//! first process to look used to hand its own to every other.
 //!
 //! Coherence is a single global epoch: every namespace-mutating operation
 //! (unlink/rename/mkdir/mknod/symlink/link, mount/umount, `O_CREAT` opens,
@@ -56,8 +58,8 @@ pub fn invalidate() {
     EPOCH.fetch_add(1, Ordering::Release);
 }
 
-/// The inode `path` leads to, with `walked` at it if one is given.
-pub fn get(path: &str, walked: Option<&mut Walked>) -> Option<Arc<dyn INode>> {
+/// The inode `path` leads to, with `walked` at it.
+pub fn get(path: &str, walked: &mut Walked) -> Option<Arc<dyn INode>> {
     let mut c = CACHE.lock();
     let now = EPOCH.load(Ordering::Acquire);
     if c.epoch != now {
@@ -66,14 +68,16 @@ pub fn get(path: &str, walked: Option<&mut Walked>) -> Option<Arc<dyn INode>> {
         return None;
     }
     let (inode, name) = c.map.get(path)?;
-    if let Some(walked) = walked {
-        *walked = Walked::at(name.as_deref().unwrap_or(path), 0);
-    }
+    walked.set(name.as_deref().unwrap_or(path));
     Some(inode.clone())
 }
 
-/// Keeps what `path` leads to, and `walked`, where the walk to it ended.
+/// Keeps what `path` leads to, and `walked`, where the walk to it ended,
+/// unless it is another file to each process.
 pub fn put(path: &str, inode: &Arc<dyn INode>, walked: &Walked) {
+    if walked.jumped || walked.names.first().is_some_and(|top| top == "proc") {
+        return;
+    }
     let mut c = CACHE.lock();
     let now = EPOCH.load(Ordering::Acquire);
     if c.epoch != now {
