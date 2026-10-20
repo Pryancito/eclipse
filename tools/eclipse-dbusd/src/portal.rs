@@ -1163,4 +1163,165 @@ mod tests {
             assert_eq!(f["/run/p/".len()..].matches('/').count(), 0, "{f}");
         }
     }
+
+    #[test]
+    fn an_option_key_is_matched_whole_and_its_value_is_taken_as_it_came() {
+        // The options dictionary is the client's: it may carry keys this
+        // portal has never heard of, from a newer revision of the
+        // specification or from another implementation. A key that merely
+        // EXTENDS one of ours must not be read as ours, and the flags are
+        // where that bites, because every one of them means "do the unusual
+        // thing" when set. `directory` refuses the dialog outright, so a
+        // client that sent `directory_hint` would get no dialog at all.
+        let longer = vec![
+            ("directory_hint".to_string(), Arg::Bool(true)),
+            ("multiple_files".to_string(), Arg::Bool(true)),
+            (
+                "current_folder_uri".to_string(),
+                Arg::Str("/root/otro".into()),
+            ),
+        ];
+        assert!(!opt_bool(&longer, "directory"), "a longer key is not ours");
+        assert!(!opt_bool(&longer, "multiple"));
+        assert_eq!(opt_text(&longer, "current_folder"), None);
+        let ask = ask_from("OpenFile", "t", &longer).unwrap();
+        assert_eq!(ask.unsupported(), None, "the dialog is still served");
+        assert_eq!((ask.multiple, ask.folder), (false, None));
+
+        // And the two `current_` keys that look alike are told apart, since
+        // one is a path and the other the filter the dialog starts with.
+        let opts = vec![
+            ("current_filter".to_string(), Arg::Str("Imagenes".into())),
+            (
+                "current_file".to_string(),
+                Arg::ByteArray(b"/root/foto.png\0".to_vec()),
+            ),
+        ];
+        assert_eq!(
+            opt_text(&opts, "current_file").as_deref(),
+            Some("/root/foto.png")
+        );
+        assert_eq!(
+            ask_from("SaveFile", "t", &opts).unwrap().name.as_deref(),
+            Some("foto.png")
+        );
+
+        // A text value is whatever the client sent, byte for byte. A filename
+        // may legitimately begin or end in a space, and normalising one away
+        // offers the application a name that names a different file -- or, for
+        // a folder, opens somewhere else entirely.
+        let spaced = vec![
+            ("current_name".to_string(), Arg::Str(" notas.txt ".into())),
+            (
+                "current_folder".to_string(),
+                Arg::ByteArray(b"/root/mis cosas \0".to_vec()),
+            ),
+        ];
+        let ask = ask_from("SaveFile", "t", &spaced).unwrap();
+        assert_eq!(ask.name.as_deref(), Some(" notas.txt "));
+        assert_eq!(ask.folder.as_deref(), Some("/root/mis cosas "));
+    }
+
+    #[test]
+    fn an_answer_path_with_a_space_in_it_still_names_one_file() {
+        // `--answers=DIR` is an operator's flag, so a directory with a space in
+        // it is ordinary. Unquoted, the command line splits there: `lunarfile`
+        // writes its answer to the first half and the portal waits on a file
+        // nobody wrote, which is an "Open file" that hangs for ever rather
+        // than failing.
+        let out = "/run/user/1000/eclipse portal/pick-7-1a-0";
+        let cmd = picker_command("lunarfile", &Ask::default(), out);
+        // Asked of the shell that will do the unquoting, not of a second
+        // opinion in Rust.
+        assert_eq!(sh(&format!("set -- {cmd}; echo $#")).trim(), "4");
+        assert_eq!(
+            sh(&format!("set -- {cmd}; printf '%s' \"$4\"")),
+            out,
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn a_byte_below_sixteen_is_escaped_with_two_digits_and_not_one() {
+        // A tab or a newline is legal in a filename, and `%9` is not an escape:
+        // the client reads the character after it as part of the number, so
+        // `/a<TAB>b` arrives as `/a` plus the byte 0x9b -- a different path,
+        // and usually one that is not there. The test above covers 0x7f, which
+        // needs no padding, so this is the case that was missing.
+        assert_eq!(file_uri("/a\tb"), "file:///a%09b");
+        assert_eq!(file_uri("/a\nb"), "file:///a%0Ab");
+        assert_eq!(file_uri("/a\u{1}b"), "file:///a%01b");
+        // Every escape is three characters wide, for every byte that needs one.
+        for b in 1u8..=0x0f {
+            let u = file_uri(&format!("/x{}y", b as char));
+            assert_eq!(u.len(), "file:///xy".len() + 3, "{u}");
+        }
+    }
+
+    #[test]
+    fn a_picked_path_keeps_its_own_spaces_and_loses_only_the_line_ending() {
+        // A filename may end in a space or a tab: trimming them hands the
+        // client a path that names another file, or nothing at all.
+        assert_eq!(parse_picked("/root/notas.txt \n"), ["/root/notas.txt "]);
+        assert_eq!(parse_picked("/root/a\tb\n"), ["/root/a\tb"]);
+        // A plain CRLF file does NOT exercise the trim: `str::lines` already
+        // takes `\r\n` as one line ending. What the trim is for is a write
+        // that stopped in the middle of one, which is what a chooser killed
+        // between the two bytes leaves behind -- and a path with a `\r` glued
+        // to its end is as wrong as one with a space eaten off it.
+        assert_eq!(
+            parse_picked("/root/a.txt\r\n/root/b.txt\r\n"),
+            ["/root/a.txt", "/root/b.txt"]
+        );
+        assert_eq!(parse_picked("/root/a.txt\r"), ["/root/a.txt"]);
+        assert_eq!(parse_picked("/root/a.txt\r\r\n"), ["/root/a.txt"]);
+        // And whitespace alone is still not an absolute path.
+        assert!(parse_picked(" \n\t\n").is_empty());
+    }
+
+    #[test]
+    fn the_version_property_is_declared_the_way_it_is_answered() {
+        // A typed client builds its call out of this document: `gdbus` and any
+        // generated proxy read the signature from here, and the access mode
+        // with it. Declaring `s` where a `u` comes back is a client that fails
+        // to demarshal the reply it asked for.
+        //
+        // `u` is D-Bus for u32, and it is spelled through the variant the
+        // portal actually sends so that changing the constant's type stops
+        // compiling here instead of quietly disagreeing.
+        let sig = match Arg::U32(FILE_CHOOSER_VERSION) {
+            Arg::U32(_) => "u",
+            _ => unreachable!(),
+        };
+        let xml = introspection(PORTAL_PATH);
+        assert!(
+            xml.contains(&format!(
+                "<property name=\"version\" type=\"{sig}\" access=\"read\"/>"
+            )),
+            "{xml}"
+        );
+        // And `read` is all there is: a `Set` on this interface is not a method
+        // this portal has, so advertising the property as writable would
+        // advertise a call that can only come back as an error.
+        assert_eq!(
+            classify(PORTAL_PATH, Some(IFACE_PROPERTIES), Some("Set")),
+            Call::NoSuchMethod
+        );
+    }
+
+    #[test]
+    fn the_three_response_codes_are_the_ones_the_specification_numbers() {
+        // These travel to the client as bare numbers and GTK switches on them.
+        // 1 is "the user cancelled", which shows no error and retries nothing;
+        // 2 is "the dialog could not be shown", which makes a GTK client fall
+        // back to its own widget. A cancellation numbered 2 turns "the user
+        // said no" into "the portal is broken", and an error numbered 1 hides
+        // a portal that cannot work at all. They are not ours to choose: the
+        // numbers are the specification's, which is why they are pinned here
+        // rather than left to read out of the constants.
+        assert_eq!(
+            (RESPONSE_OK, RESPONSE_CANCELLED, RESPONSE_OTHER),
+            (0u32, 1u32, 2u32)
+        );
+    }
 }
