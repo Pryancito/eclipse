@@ -9,6 +9,55 @@ fn forget_handles(ids: &[u32]) {
     state.handles.retain(|(h, _, _)| !ids.contains(&h.id));
 }
 
+/// `drm_gem_prime_fd_to_handle` asks the file's prime table before it
+/// imports (`drm_prime_lookup_buf_handle`), and the export fills that
+/// table too ("if we've exported this buffer then cheat and add it to
+/// the import list so we get the correct handle back"): re-importing
+/// what one exported gives the original handle, and importing the same
+/// buffer twice gives the same handle, with nothing new in the table
+/// either time. Here every import minted a new handle over the same
+/// frames.
+#[test]
+fn importing_a_buffer_the_process_already_holds_gives_that_handle() {
+    let _serialised = super::test_globals::lock();
+    let own = 9_911;
+    let vmo = VmObject::new_paged(1);
+    DRM_STATE.lock().handles.push((
+        GemHandle {
+            id: own,
+            size: 4096,
+            phys_addr: 0x8_0000,
+        },
+        vmo.clone(),
+        CLIENT,
+    ));
+    let count = || DRM_STATE.lock().handles.len();
+    let before = count();
+    // The exporter importing its own export: its own handle, nothing new.
+    assert_eq!(import_dmabuf_for(0x8_0000, 4096, vmo.clone(), CLIENT), own);
+    assert_eq!(count(), before);
+    // Another process: a handle of its own, minted once.
+    let theirs = import_dmabuf_for(0x8_0000, 4096, vmo.clone(), XWAYLAND);
+    assert_ne!(theirs, own);
+    assert_eq!(count(), before + 1);
+    assert_eq!(
+        import_dmabuf_for(0x8_0000, 4096, vmo.clone(), XWAYLAND),
+        theirs
+    );
+    assert_eq!(count(), before + 1);
+    assert!(resolve_gem_backing_for(theirs, XWAYLAND).is_some());
+    // The exporter still gets its own, not the importer's.
+    assert_eq!(import_dmabuf_for(0x8_0000, 4096, vmo.clone(), CLIENT), own);
+    // Another buffer of the same size at the same address is another
+    // handle: the identity is the backing, not what the dma-buf says
+    // about it.
+    let other = VmObject::new_paged(1);
+    let fresh = import_dmabuf_for(0x8_0000, 4096, other, XWAYLAND);
+    assert_ne!(fresh, theirs);
+    assert_eq!(count(), before + 2);
+    forget_handles(&[own, theirs, fresh]);
+}
+
 /// An imported dma-buf belongs to the process that imported it, so that
 /// process can use it and hand it on. Without this an importer would hold
 /// a handle it is not allowed to resolve — a buffer it can name and

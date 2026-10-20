@@ -3028,10 +3028,36 @@ fn fb_drop_gem_ref(handle_id: u32) {
     }
 }
 
-/// Import a dma-buf (PRIME): register a new GEM handle over the same backing
-/// frames and return its id. The `VmObject` keeps the memory alive.
+/// Import a dma-buf (PRIME): the GEM handle the calling process already
+/// holds on the same backing, or a new one over it. `drm_gem_prime_fd_to_handle`
+/// asks the file's prime table before it imports (`drm_prime_lookup_buf_handle`),
+/// and that table is filled by the export as well as by the import
+/// (`drm_gem_prime_handle_to_fd`: "if we've exported this buffer then cheat
+/// and add it to the import list so we get the correct handle back"), so
+/// re-importing what one exported gives the original handle and importing
+/// the same buffer twice gives the same handle, with nothing new in the
+/// table either time. This minted a new handle on every import, so a client
+/// that de-duplicates by handle (Mesa does, for every dma-buf it imports)
+/// saw one buffer as many and its one `GEM_CLOSE` left the rest behind.
+/// Linux's table is per file; handles are per process here, so a second
+/// open of the same process gets the same handle too. The identity of a
+/// dma-buf is its backing: the `Arc` the export cloned out of the handle,
+/// which an earlier import stored again. The `VmObject` keeps the memory
+/// alive.
 pub fn import_dmabuf(phys_addr: u64, size: usize, vmo: Arc<VmObject>) -> u32 {
+    import_dmabuf_for(phys_addr, size, vmo, current_pid())
+}
+
+fn import_dmabuf_for(phys_addr: u64, size: usize, vmo: Arc<VmObject>, pid: u64) -> u32 {
     let mut state = DRM_STATE.lock();
+    if let Some(id) = state
+        .handles
+        .iter()
+        .find(|(_, held, owner)| owned_by(*owner, pid) && Arc::ptr_eq(held, &vmo))
+        .map(|(h, _, _)| h.id)
+    {
+        return id;
+    }
     let id = state.next_handle_id;
     state.next_handle_id += 1;
     let handle = GemHandle {
@@ -3039,7 +3065,7 @@ pub fn import_dmabuf(phys_addr: u64, size: usize, vmo: Arc<VmObject>) -> u32 {
         size,
         phys_addr,
     };
-    state.handles.push((handle, vmo, current_pid()));
+    state.handles.push((handle, vmo, pid));
     id
 }
 
