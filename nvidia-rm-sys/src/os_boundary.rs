@@ -372,27 +372,8 @@ pub extern "C" fn osCountTailPages(arg0: NvU64) -> NvU32 {
     0
 }
 
-#[no_mangle]
-pub extern "C" fn osCreateMemFromOsDescriptor(
-    pGpu: *mut c_void,
-    pDescriptor: *mut c_void,
-    hClient: *mut c_void,
-    flags: NvU32,
-    pLimit: *mut NvU64,
-    ppMemDesc: *mut *mut c_void,
-    descriptorType: NvU32,
-    privilegeLevel: *mut c_void,
-) -> NV_STATUS {
-    let _ = pGpu;
-    let _ = pDescriptor;
-    let _ = hClient;
-    let _ = flags;
-    let _ = pLimit;
-    let _ = ppMemDesc;
-    let _ = descriptorType;
-    let _ = privilegeLevel;
-    NV_ERR_NOT_SUPPORTED
-}
+// osCreateMemFromOsDescriptor is C (vendor/eclipse_rm_mem.c): the one
+// descriptor it takes is built from RM memdesc calls.
 
 #[no_mangle]
 pub extern "C" fn osCreateNanoTimer(

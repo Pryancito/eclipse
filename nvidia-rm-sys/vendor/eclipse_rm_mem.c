@@ -6,6 +6,9 @@
  *     osAllocPagesInternal / osFreePagesInternal
  *     osMapSystemMemory    / osUnmapSystemMemory
  *
+ * and, at the end, of osCreateMemFromOsDescriptor: the one descriptor
+ * /dev/nvidia-uvm needs, of pages it lends the RM.
+ *
  * NVIDIA's own versions live in arch/nvalloc/unix/src/os.c -- the Linux
  * platform layer Eclipse does not vendor -- and are built on nv_alloc_pages
  * / nv_alloc_kernel_mapping / nv_state_t. Eclipse instead backs them with
@@ -31,6 +34,7 @@
  */
 #include "os/os.h"
 #include "nvos.h"
+#include "gpu/gpu.h"
 #include "gpu/mem_mgr/mem_desc.h"
 #include "gpu/mem_mgr/rm_page_size.h"
 #include "nvport/nvport.h"
@@ -235,4 +239,128 @@ NV_STATUS os_match_mmap_offset(
 
     *pPageIndex = index;
     return NV_OK;
+}
+
+/*
+ * osCreateMemFromOsDescriptor (osmemdesc.c on Linux), of every descriptor
+ * type only NVOS32_DESCRIPTOR_TYPE_OS_PHYS_ADDR, only for a kernel-privileged
+ * caller, and only of pages /dev/nvidia-uvm lends the RM for the length of
+ * one of its calls: a semaphore pool's, which the RM then maps into a GPU VA
+ * space (eclipse_rm_frontend.c, "UVM"). Anything else is
+ * NV_ERR_NOT_SUPPORTED, the answer every descriptor got before UVM needed
+ * one, so no other physical address can be made RM memory.
+ *
+ * This is osCreateOsDescriptorFromPhysAddr without nv_register_phys_pages:
+ * the pages are one of Eclipse's contiguous blocks, already in the physmap,
+ * so osMapSystemMemory finds them through the same EclipseSysmemAlloc as
+ * the RM's own. The memdesc holds the pages (eclipse_uvm_pages_hold) until
+ * the RM destroys it, after every object and mapping made of it is gone,
+ * however long that outlives the pool that lent them.
+ */
+
+/* nvidia-rm-sys src/frontend/uvm.rs, #[no_mangle]. */
+extern void *eclipse_uvm_pages_hold(NvU64 physBase, NvU64 size);
+extern void  eclipse_uvm_pages_release(void *pHold);
+
+/* memData of a memdesc of lent pages: EclipseSysmemAlloc first, as
+ * osMapSystemMemory reads every system-memory memdesc, then the hold. */
+typedef struct
+{
+    EclipseSysmemAlloc alloc;
+    void              *pHold;
+} EclipseLentPages;
+
+static void _eclipseLentPagesRelease(MEMORY_DESCRIPTOR *pMemDesc)
+{
+    EclipseLentPages *pLent = (EclipseLentPages *) memdescGetMemData(pMemDesc);
+
+    memdescUnmapIommu(pMemDesc, pMemDesc->pGpu->busInfo.iovaspaceId);
+    eclipse_uvm_pages_release(pLent->pHold);
+    portMemFree(pLent);
+}
+
+NV_STATUS osCreateMemFromOsDescriptor(
+    OBJGPU             *pGpu,
+    NvP64               pDescriptor,
+    NvHandle            hClient,
+    NvU32               flags,
+    NvU64              *pLimit,
+    MEMORY_DESCRIPTOR **ppMemDesc,
+    NvU32               descriptorType,
+    RS_PRIV_LEVEL       privilegeLevel
+)
+{
+    NvU64              base = (NvU64) (NvUPtr) NvP64_VALUE(pDescriptor);
+    NvU64              size;
+    MEMORY_DESCRIPTOR *pMemDesc;
+    EclipseLentPages  *pLent;
+    NV_STATUS          status;
+
+    (void) hClient;
+
+    if ((descriptorType != NVOS32_DESCRIPTOR_TYPE_OS_PHYS_ADDR) ||
+        (privilegeLevel < RS_PRIV_LEVEL_KERNEL))
+        return NV_ERR_NOT_SUPPORTED;
+
+    if ((base == 0) || (pLimit == NULL) || (*pLimit == 0) || (ppMemDesc == NULL))
+        return NV_ERR_INVALID_PARAM_STRUCT;
+
+    /* osCreateOsDescriptorFromPhysAddr: contiguous memory only. */
+    if (!FLD_TEST_DRF(OS02, _FLAGS, _PHYSICALITY, _CONTIGUOUS, flags))
+        return NV_ERR_INVALID_FLAGS;
+
+    if (!NV_IS_ALIGNED64(base, RM_PAGE_SIZE) || ((*pLimit + 1) == 0))
+        return NV_ERR_INVALID_ARGUMENT;
+    size = NV_ALIGN_UP64(*pLimit + 1, RM_PAGE_SIZE);
+
+    pLent = portMemAllocNonPaged(sizeof(*pLent));
+    if (pLent == NULL)
+        return NV_ERR_NO_MEMORY;
+
+    pLent->pHold = eclipse_uvm_pages_hold(base, size);
+    if (pLent->pHold == NULL)
+    {
+        portMemFree(pLent);
+        return NV_ERR_NOT_SUPPORTED;
+    }
+    pLent->alloc.physBase  = base;
+    pLent->alloc.pageCount = size / RM_PAGE_SIZE;
+    pLent->alloc.cacheType = NV_MEMORY_CACHED;
+
+    status = memdescCreate(ppMemDesc, pGpu, size, 0, NV_MEMORY_CONTIGUOUS,
+                           ADDR_SYSMEM, NV_MEMORY_CACHED, MEMDESC_FLAGS_NONE);
+    if (status != NV_OK)
+        goto release;
+
+    pMemDesc = *ppMemDesc;
+    memdescSetAddress(pMemDesc, NvP64_NULL);
+    memdescSetFlag(pMemDesc, MEMDESC_FLAGS_EXT_PAGE_ARRAY_MEM, NV_TRUE);
+    memdescGetPteArray(pMemDesc, AT_CPU)[0] = base;
+    memdescSetGpuCacheAttrib(pMemDesc,
+        FLD_TEST_DRF(OS02, _FLAGS, _GPU_CACHEABLE, _YES, flags) ?
+            NV_MEMORY_CACHED : NV_MEMORY_UNCACHED);
+
+    status = memdescSetAllocSizeFields(pMemDesc, size, RM_PAGE_SIZE);
+    if (status == NV_OK)
+    {
+        /* As on Linux, the private data is set, without its teardown, for
+         * memdescMapIommu, and the teardown wired up once that worked. */
+        memdescSetMemData(pMemDesc, pLent, NULL);
+        status = memdescMapIommu(pMemDesc, pGpu->busInfo.iovaspaceId);
+    }
+    if (status != NV_OK)
+    {
+        memdescSetMemData(pMemDesc, NULL, NULL);
+        memdescDestroy(pMemDesc);
+        *ppMemDesc = NULL;
+        goto release;
+    }
+
+    memdescSetMemData(pMemDesc, pLent, _eclipseLentPagesRelease);
+    return NV_OK;
+
+release:
+    eclipse_uvm_pages_release(pLent->pHold);
+    portMemFree(pLent);
+    return status;
 }
