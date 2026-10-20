@@ -145,23 +145,35 @@ impl dyn INode {
             .collect())
     }
 
-    /// Lookup path from current INode, and do not follow symlinks
+    /// Lookup path from current INode, and do not follow a symlink that is
+    /// its last component
     pub fn lookup(&self, path: &str) -> Result<Arc<dyn INode>> {
         self.lookup_follow(path, 0)
     }
 
     /// Lookup path from current INode, and follow symlinks at most `follow_times` times
     ///
-    /// With `follow_times == 0` no symlink is followed: one met as the last
-    /// component is returned as it is (`lstat`, `readlink`), one met on the
-    /// way is `NotDir`. With a budget, running out of it is `SymLoop`, as
-    /// `ELOOP` on Linux, never the symlink itself: a link that points at
-    /// itself used to come back as an ordinary file whose contents were its
-    /// own name.
+    /// With `follow_times == 0` the last component is not followed: a symlink
+    /// there is returned as it is (`lstat`, `readlink`, `O_NOFOLLOW`). The
+    /// links on the way to it still are, up to [`MAXSYMLINKS`], as Linux
+    /// follows them on every walk. They used to be `NotDir`, so `lstat` of
+    /// `/proc/self/stat`, or of anything under a directory reached through a
+    /// link, failed, and `ls -l` printed an error for each entry.
+    ///
+    /// With a budget, running out of it is `SymLoop`, as `ELOOP` on Linux,
+    /// never the symlink itself: a link that points at itself used to come
+    /// back as an ordinary file whose contents were its own name.
     pub fn lookup_follow(&self, path: &str, follow_times: usize) -> Result<Arc<dyn INode>> {
-        lookup_with_budget(self, path, follow_times, follow_times > 0)
+        match follow_times {
+            0 => lookup_with_budget(self, path, MAXSYMLINKS, false),
+            budget => lookup_with_budget(self, path, budget, true),
+        }
     }
 }
+
+/// How many symlinks one walk follows before it is `SymLoop`: Linux's
+/// `MAXSYMLINKS`, the links on the way and the last one together.
+pub const MAXSYMLINKS: usize = 40;
 
 /// The longest symlink target `lookup_follow` resolves: Linux's `PATH_MAX`.
 /// A longer one is `NameTooLong`. It used to be read into 256 bytes and cut
@@ -183,8 +195,8 @@ fn read_symlink(inode: &dyn INode) -> Result<String> {
 fn lookup_with_budget(
     start: &dyn INode,
     path: &str,
-    follow_times: usize,
-    following: bool,
+    budget: usize,
+    follow_last: bool,
 ) -> Result<Arc<dyn INode>> {
     if start.metadata()?.type_ != FileType::Dir {
         return Err(FsError::NotDir);
@@ -201,34 +213,32 @@ fn lookup_with_budget(
         if result.metadata()?.type_ != FileType::Dir {
             return Err(FsError::NotDir);
         }
-        let name;
-        match rest_path.find('/') {
-            None => {
-                name = rest_path;
-                rest_path = String::new();
-            }
+        // `on_the_way`: a slash comes after the name, if only a trailing one.
+        let (name, on_the_way) = match rest_path.find('/') {
+            None => (core::mem::take(&mut rest_path), false),
             Some(pos) => {
-                name = String::from(&rest_path[0..pos]);
+                let name = String::from(&rest_path[0..pos]);
                 rest_path = String::from(&rest_path[pos + 1..]);
+                (name, true)
             }
         };
         if name.is_empty() {
             continue;
         }
         let inode = result.find(&name)?;
-        // Handle symlink. `following` stays true after the budget is spent, so
-        // the next link is `SymLoop` rather than the link itself. A walk that
-        // was never asked to follow (`follow_times == 0`) leaves the link in
-        // place: the last component for `lstat`, `NotDir` if the path goes on.
-        if inode.metadata()?.type_ == FileType::SymLink && following {
-            if follow_times == 0 {
+        // Handle symlink. A link on the way is followed by every walk; the
+        // last component only by one asked to follow it, and otherwise it is
+        // what `lstat` and `readlink` want. A spent budget is `SymLoop`
+        // rather than the link where the walk stopped.
+        if inode.metadata()?.type_ == FileType::SymLink && (on_the_way || follow_last) {
+            if budget == 0 {
                 return Err(FsError::SymLoop);
             }
             let link_path = read_symlink(&*inode)?;
             // result remains unchanged: a relative target is resolved from the
             // directory that holds the link.
             let new_path = link_path + "/" + &rest_path;
-            return lookup_with_budget(&*result, &new_path, follow_times - 1, following);
+            return lookup_with_budget(&*result, &new_path, budget - 1, follow_last);
         } else {
             result = inode
         }
@@ -726,11 +736,55 @@ mod lookup_tests {
         assert!(same(&inode.lookup_follow("l3", 3).unwrap(), &file));
         assert_eq!(inode.lookup_follow("l3", 2).err(), Some(FsError::SymLoop));
 
-        // Without a budget the symlink is what `lstat` and `readlink` want.
+        // Without a budget the last symlink is what `lstat` and `readlink`
+        // want; the ones on the way are still followed, so a loop there is
+        // `SymLoop`, and a chain that ends in a file is `NotDir` past it.
         let link = root.children.lock()["self"].clone();
         assert!(same(&inode.lookup("self").unwrap(), &link));
-        assert_eq!(inode.lookup("self/x").err(), Some(FsError::NotDir));
+        assert_eq!(inode.lookup("self/x").err(), Some(FsError::SymLoop));
         assert_eq!(inode.lookup("l3/x").err(), Some(FsError::NotDir));
+    }
+
+    #[test]
+    fn a_walk_that_leaves_its_last_link_still_follows_the_ones_on_the_way() {
+        let tree = tree();
+        let root = &tree.root;
+        let dir = root.dir("d");
+        let file = dir.file("f", b"data");
+        dir.link("fl", "f");
+        root.link("dl", "d");
+        let inode = &**root as &dyn INode;
+        // `lstat("dl/f")`, `lstat("dl/fl")`, `readlink("dl/fl")`.
+        assert!(same(&inode.lookup("dl/f").unwrap(), &file));
+        let fl = dir.children.lock()["fl"].clone();
+        assert!(same(&inode.lookup("dl/fl").unwrap(), &fl));
+        // A slash after a link makes it one on the way, trailing or not.
+        assert!(same(&inode.lookup("dl/").unwrap(), &dir));
+        assert!(same(&inode.lookup("dl//f").unwrap(), &file));
+        let dl = root.children.lock()["dl"].clone();
+        assert!(same(&inode.lookup("dl").unwrap(), &dl));
+    }
+
+    #[test]
+    fn the_links_on_the_way_count_to_maxsymlinks() {
+        let tree = tree();
+        let root = &tree.root;
+        let file = root.dir("d").file("f", b"");
+        // l0 -> d, l1 -> l0, ..., l40 -> l39. The numbers are Linux's, written
+        // out: a test that counted from `MAXSYMLINKS` would move with it.
+        root.link("l0", "d");
+        for i in 1..=40 {
+            root.link(&alloc::format!("l{}", i), &alloc::format!("l{}", i - 1));
+        }
+        let inode = &**root as &dyn INode;
+        // Through l39 the walk takes 40 links, through l40 41.
+        assert!(same(&inode.lookup("l39/f").unwrap(), &file));
+        assert_eq!(inode.lookup("l40/f").err(), Some(FsError::SymLoop));
+        assert!(same(&inode.lookup_follow("l39/f", 40).unwrap(), &file));
+        assert_eq!(
+            inode.lookup_follow("l40/f", 40).err(),
+            Some(FsError::SymLoop)
+        );
     }
 }
 
