@@ -8,7 +8,7 @@ use kernel_hal::net::get_net_device;
 use lazy_static::lazy_static;
 use lock::Mutex;
 use rcore_fs::vfs::{
-    FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec,
+    FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec, Walked,
 };
 
 use crate::fs::pseudo::Pseudo;
@@ -3123,7 +3123,11 @@ pub(crate) mod test_bus {
 }
 
 /// Resolve an absolute `/sys/...` path without walking the ext2 backing store.
-pub(crate) fn lookup_path(path: &str, follow_times: usize) -> Result<Arc<dyn INode>> {
+pub(crate) fn lookup_path(
+    path: &str,
+    follow_times: usize,
+    walked: Option<&mut Walked>,
+) -> Result<Arc<dyn INode>> {
     let path = path.trim_end_matches('/');
     if path == "/sys" {
         return Ok(SYS_ROOT.clone());
@@ -3132,7 +3136,7 @@ pub(crate) fn lookup_path(path: &str, follow_times: usize) -> Result<Arc<dyn INo
     if rest.is_empty() {
         return Ok(SYS_ROOT.clone());
     }
-    SYS_ROOT.lookup_follow(rest, follow_times)
+    SYS_ROOT.lookup_walked(rest, follow_times, walked)
 }
 
 lazy_static! {
