@@ -281,4 +281,28 @@ mod tests {
         assert_eq!(r.len(), MAX_REFUSED_OUTPUTS);
         assert!(!r.contains(9999));
     }
+
+    #[test]
+    fn the_ceilings_that_have_to_agree_with_each_other_do() {
+        // Two of these are not free numbers, they are derived, and the
+        // derivation is what the comment above each one promises.
+        //
+        // A bar is created per output per edge, top and bottom, so a cap of one
+        // per output refuses every second bar on a healthy session: the bottom
+        // panel simply never appears, which reads as the compositor declining
+        // it rather than as a ceiling of ours.
+        assert_eq!(MAX_BARS, MAX_OUTPUTS * 2, "two bars per output");
+        // And `RefusedOutputs` holds one entry per bound `wl_output`, so its
+        // ceiling has to BE the output ceiling. Anything smaller makes `mark`
+        // refuse on a machine with enough monitors, and a refusal there puts
+        // the panel back in the loop this type exists to break: it recreates a
+        // surface the compositor keeps closing, at request rate.
+        assert_eq!(MAX_REFUSED_OUTPUTS, MAX_OUTPUTS, "one entry per output");
+        // The test below walks the list to its ceiling through the constant, so
+        // it cannot see the two drifting apart: this is the assertion that can.
+        let mut r = RefusedOutputs::default();
+        for g in 0..MAX_OUTPUTS as u32 {
+            assert!(r.mark(g), "output {g} of {MAX_OUTPUTS} got no slot");
+        }
+    }
 }

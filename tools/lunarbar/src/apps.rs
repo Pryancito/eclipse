@@ -391,15 +391,32 @@ pub const DEFAULT_PATH: &str = "/usr/local/bin:/bin:/usr/bin:/sbin:/usr/sbin";
 /// True if `cmd` (absolute, or a bare name on `PATH`) is an executable file.
 pub fn executable_exists(cmd: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    let is_exec = |p: &Path| {
+    exists_with(cmd, std::env::var("PATH").ok().as_deref(), |p| {
         std::fs::metadata(p)
             .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
-    };
+    })
+}
+
+/// The lookup half of [`executable_exists`]: which paths are asked about,
+/// given the `PATH` the environment carries (`None` when it is unset) and a
+/// test for one path.
+///
+/// Split off the way [`parse_desktop_text`] is the pure half of
+/// `parse_desktop`, and for the same reason: everything this decides was
+/// reachable only through the real environment and the real filesystem. And
+/// all three of its decisions matter -- that any slash makes `cmd` a path
+/// rather than a name to search for, that an unset `PATH` falls back to
+/// [`DEFAULT_PATH`] instead of searching nowhere, and that an EMPTY `PATH`
+/// entry is skipped rather than taken as the current directory, which is what
+/// it means to a shell.
+pub fn exists_with(cmd: &str, path_var: Option<&str>, is_exec: impl Fn(&Path) -> bool) -> bool {
     if cmd.contains('/') {
         return is_exec(Path::new(cmd));
     }
-    let path = std::env::var("PATH").unwrap_or_else(|_| DEFAULT_PATH.into());
+    // An empty `PATH` is a deliberate "search nowhere" and stays empty; only
+    // an UNSET one falls back, which is what `None` means here.
+    let path = path_var.unwrap_or(DEFAULT_PATH);
     path.split(':')
         .filter(|d| !d.is_empty())
         .any(|d| is_exec(&Path::new(d).join(cmd)))
@@ -813,5 +830,122 @@ mod tests {
             assert!(MAX_DEPTH >= 4);
             assert!(MAX_DESKTOP_BYTES >= 64 * 1024);
         }
+    }
+
+    #[test]
+    fn only_an_exact_type_application_is_an_application() {
+        // The spec defines three Types and the comparison is exact, so a value
+        // that merely CONTAINS the word is not one of them. The test above
+        // covers `Type=Link` and a file with no Type at all, which a substring
+        // check answers the same way.
+        assert!(parse("[Desktop Entry]\nType=Applications\nName=T\nExec=t\n").is_none());
+        assert!(parse("[Desktop Entry]\nType=XApplication\nName=T\nExec=t\n").is_none());
+        assert!(parse("[Desktop Entry]\nType=Application\nName=T\nExec=t\n").is_some());
+    }
+
+    #[test]
+    fn a_localized_name_key_may_carry_a_charset() {
+        // A POSIX locale is `lang_COUNTRY.ENCODING@MODIFIER`, and all of it is
+        // legal inside the brackets. The charset is cut before the tag is read,
+        // and with a REGION in the key the cut makes no difference, because the
+        // first part up to the `_` is still the language. Without one it does:
+        // `Name[es.UTF-8]` is a Spanish name, and dropping the cut makes the
+        // whole thing the language and nothing matches.
+        assert_eq!(parse(&entry("Name[es.UTF-8]=Cosa\n")).unwrap().name, "Cosa");
+        assert_eq!(
+            parse(&entry("Name[es_ES.UTF-8]=Cosa\n")).unwrap().name,
+            "Cosa"
+        );
+        // Ranked as the bare language, so a key with a region still beats it
+        // whatever order the two appear in.
+        assert_eq!(locale_rank("Name[es.UTF-8]", Some("es")), Some(1));
+        assert_eq!(locale_rank("Name[es_MX.UTF-8]", Some("es")), Some(2));
+        // And a charset on another language is still another language.
+        assert_eq!(locale_rank("Name[de.UTF-8]", Some("es")), None);
+    }
+
+    #[test]
+    fn a_file_without_the_execute_bit_is_not_an_executable() {
+        // `TryExec` names a BINARY, and an entry whose TryExec points at a data
+        // file is as dead as one pointing nowhere: it would sit in the menu and
+        // the launch would do nothing at all. The mode bits are the only thing
+        // that tells the two apart.
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("lunarbar-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let plain = base.join("datos");
+        let runnable = base.join("programa");
+        std::fs::write(&plain, b"no soy un programa").unwrap();
+        std::fs::write(&runnable, b"#!/bin/sh\n").unwrap();
+        // 0o644 is readable and WRITABLE, so a check that read the wrong bits
+        // would wave it through.
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&runnable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            !executable_exists(plain.to_str().unwrap()),
+            "a data file is not a program"
+        );
+        assert!(executable_exists(runnable.to_str().unwrap()));
+        // A directory is not one either, whatever its mode says.
+        assert!(!executable_exists(base.to_str().unwrap()));
+        assert!(!executable_exists(base.join("no-existe").to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_path_lookup_is_only_for_a_bare_name_and_skips_an_empty_entry() {
+        // Three decisions that used to be reachable only through the real
+        // `$PATH` and the real filesystem. `note` answers no to everything and
+        // records what it was asked, so what is being checked is WHICH paths
+        // the lookup considers, which is the whole of its behaviour.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let note = |p: &Path| {
+            seen.borrow_mut().push(p.to_string_lossy().into_owned());
+            false
+        };
+
+        // Any slash makes it a path, taken as given. `bin/sh` and `./x` are
+        // relative to the caller's directory; joining them onto every `$PATH`
+        // entry would ask about files nobody named.
+        assert!(!exists_with("bin/sh", Some("/usr:/opt"), note));
+        assert_eq!(seen.take(), ["bin/sh"]);
+        assert!(!exists_with("./x", Some("/usr"), note));
+        assert_eq!(seen.take(), ["./x"]);
+
+        // A bare name is joined onto each entry, in order.
+        assert!(!exists_with("sh", Some("/a:/b"), note));
+        assert_eq!(seen.take(), ["/a/sh", "/b/sh"]);
+
+        // An EMPTY entry is skipped, not searched. To a shell `PATH=:/bin`
+        // means the current directory, so joining "" would look a bare `ls` up
+        // in whatever directory the client happened to be started from -- for a
+        // client launched by a keybind, the compositor's.
+        assert!(!exists_with("ls", Some(":/bin:"), note));
+        assert_eq!(seen.take(), ["/bin/ls"]);
+
+        // An unset PATH is the image's own list and not nothing at all.
+        assert!(!exists_with("ls", None, note));
+        assert_eq!(
+            seen.take(),
+            DEFAULT_PATH
+                .split(':')
+                .map(|d| format!("{d}/ls"))
+                .collect::<Vec<_>>()
+        );
+        // An EMPTY one does stay empty, though: that is a deliberate "search
+        // nowhere" rather than a variable nobody set.
+        assert!(!exists_with("ls", Some(""), note));
+        assert!(seen.take().is_empty());
+
+        // And the answer is yes as soon as one path says yes, without asking
+        // about the rest.
+        let hits = std::cell::RefCell::new(0);
+        assert!(exists_with("sh", Some("/a:/b:/c"), |p: &Path| {
+            *hits.borrow_mut() += 1;
+            p == Path::new("/b/sh")
+        }));
+        assert_eq!(hits.take(), 2);
     }
 }
