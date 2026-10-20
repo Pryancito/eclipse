@@ -475,3 +475,130 @@ fn stat_follows_the_link_and_lstat_reports_it() {
         "lstat followed the link, which is what stat is for"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The rest of the credential table
+// ---------------------------------------------------------------------------
+
+/// A process that is root, with user and group ids set to four different
+/// numbers so no pair of them can answer for another.
+///
+/// The groups go first on purpose: moving the user ids takes the effective
+/// uid off root, and after that nothing else may be set.
+fn a_process_with_four_ids(pid: KoID, name: &str) -> Arc<Process> {
+    let lp = LinuxProcess::new(RamFS::new(), 0);
+    lp.set_resgid(RGID, EGID, RGID).unwrap();
+    lp.set_resuid(RUID, EUID, RUID).unwrap();
+    Process::create_with_fixed_id_ext(&ROOT_JOB, pid, name, lp).unwrap()
+}
+
+#[test]
+fn setting_two_user_ids_does_not_set_two_group_ids() {
+    // `setreuid(ruid, euid)` and `setregid(rgid, egid)`: two registers each,
+    // so the swap compiles, and both answer zero on success, so the return
+    // value says nothing. Only where the numbers landed does.
+    let proc = a_process(45_510, "dispatch-setreuid", "dispatch_setreuid");
+    let (ret, ids) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let ret = by_number(sys, Sys::SETREUID as u32, [1010, 1011, 0, 0, 0, 0]).await;
+            let p = sys.linux_process();
+            (ret, (p.uid(), p.euid(), p.gid(), p.egid()))
+        })
+    });
+    assert_eq!(ret, 0, "setreuid failed");
+    assert_eq!(
+        ids,
+        (1010, 1011, 0, 0),
+        "setreuid did not move the two user ids and leave the group ids alone"
+    );
+}
+
+#[test]
+fn the_three_user_ids_are_read_back_and_not_the_group_ids() {
+    // `getresuid` and `getresgid` each write three out pointers. The buffer
+    // starts holding a number no id here is, so "it was written" is visible,
+    // and the four ids differ, so writing the group ones is visible too.
+    const UNSET: u32 = 9_999;
+    let proc = a_process_with_four_ids(45_511, "dispatch-getresuid");
+    let (ret, got) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut ids = [UNSET; 3];
+            let ret = by_number(
+                sys,
+                Sys::GETRESUID as u32,
+                [
+                    &mut ids[0] as *mut u32 as usize,
+                    &mut ids[1] as *mut u32 as usize,
+                    &mut ids[2] as *mut u32 as usize,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+            .await;
+            (ret, ids)
+        })
+    });
+    assert_eq!(ret, 0, "getresuid failed");
+    assert_eq!(
+        got,
+        [RUID, EUID, RUID],
+        "getresuid answered the group ids, or wrote nothing at all"
+    );
+}
+
+#[test]
+fn asking_for_the_filesystem_user_id_is_not_asking_for_the_group_one() {
+    // `setfsuid(-1)` is the pure query: `(uid_t)-1` is not a user id, so the
+    // call changes nothing and answers the id it found. The filesystem ids
+    // track the effective ones, which here are two different numbers, so the
+    // answer alone says which of the two calls ran.
+    let proc = a_process_with_four_ids(45_512, "dispatch-setfsuid");
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(
+            async move { by_number(sys, Sys::SETFSUID as u32, [usize::MAX, 0, 0, 0, 0, 0]).await },
+        )
+    });
+    assert_eq!(
+        got, EUID as isize,
+        "setfsuid answered {}, and the filesystem GROUP id is {}",
+        got, EGID
+    );
+}
+
+#[test]
+fn getting_the_supplementary_groups_does_not_set_them() {
+    // `getgroups(size, list)` writes the list and answers how many; its
+    // neighbour `setgroups(size, list)` reads the list and answers zero. The
+    // buffer starts holding groups this process is not in, so a swap would
+    // put it in them -- and that is a privilege change, which is why this
+    // pair is worth a test of its own.
+    const SEEDED: [u32; 2] = [2_001, 2_002];
+    const JUNK: u32 = 3_003;
+    let lp = LinuxProcess::new(RamFS::new(), 0);
+    lp.set_groups(SEEDED.to_vec());
+    let proc = Process::create_with_fixed_id_ext(&ROOT_JOB, 45_513, "dispatch-groups", lp).unwrap();
+    let (ret, buf, after) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut buf = [JUNK; 4];
+            let ret = by_number(
+                sys,
+                Sys::GETGROUPS as u32,
+                [buf.len(), buf.as_mut_ptr() as usize, 0, 0, 0, 0],
+            )
+            .await;
+            (ret, buf, sys.linux_process().groups())
+        })
+    });
+    assert_eq!(ret, 2, "getgroups did not answer how many there are");
+    assert_eq!(
+        &buf[..2],
+        &SEEDED,
+        "getgroups did not write the list it was asked for"
+    );
+    assert_eq!(
+        after,
+        SEEDED.to_vec(),
+        "getgroups changed which groups the process is in, which is setgroups' job"
+    );
+}
