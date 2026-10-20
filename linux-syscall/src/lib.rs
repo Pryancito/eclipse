@@ -875,7 +875,7 @@ impl Syscall<'_> {
             }
             // ... and, for a process that made a UVM call, in dmesg.
             #[cfg(target_arch = "x86_64")]
-            cuda_failures::record(pid, num, err, || failure_detail(num, &args, err));
+            cuda_failures::record(pid, num, &args, err, || failure_detail(num, &args, err));
         }
         info!("<= {:?}", ret);
         // [einval-hunt] glxgears against the finally-alive Xwayland dies with

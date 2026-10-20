@@ -236,6 +236,49 @@ fn control_escapes_are_refused_on_a_gpu_node() {
     );
 }
 
+/// NV_ESC_NUMA_INFO, as Linux answers it for a GPU on PCIe: no node, NUMA
+/// disabled, nothing onlined and no retired page, with the memblock size
+/// SYS_PARAMS set. The 64 addresses and the padding go back as they came.
+#[test]
+fn numa_info_reports_a_gpu_without_numa_memory() {
+    let mut p = vec![0x5au8; NUMA_INFO_SIZE];
+    put_u32(&mut p, NUMA_INFO_OFFLINE_COUNT, 64);
+    assert_eq!(numa_info(&mut p, 0x800_0000), Ok(()));
+    assert_eq!(u32_at(&p, 0) as i32, -1, "nid");
+    assert_eq!(u32_at(&p, 4), 0, "status: disabled");
+    assert_eq!(u64_at(&p, 8), 0x800_0000, "memblock_size");
+    assert_eq!(u64_at(&p, 16), 0, "numa_mem_addr");
+    assert_eq!(u64_at(&p, 24), 0, "numa_mem_size");
+    assert_eq!(p[32], 0, "use_auto_online");
+    assert_eq!(u32_at(&p, NUMA_INFO_OFFLINE_COUNT), 0, "retired pages");
+    assert!(p[33..NUMA_INFO_OFFLINE_COUNT].iter().all(|&b| b == 0x5a));
+    assert!(p[NUMA_INFO_OFFLINE_COUNT + 4..].iter().all(|&b| b == 0x5a));
+}
+
+/// What nv.c refuses: room for more retired pages than the RM can list is
+/// EBUSY, a payload of another size EINVAL, and so is the control device
+/// (`NV_ACTUAL_DEVICE_ONLY`), which a GPU node is not.
+#[test]
+fn numa_info_is_refused_where_linux_refuses_it() {
+    let mut p = vec![0x5au8; NUMA_INFO_SIZE];
+    put_u32(&mut p, NUMA_INFO_OFFLINE_COUNT, 65);
+    assert_eq!(numa_info(&mut p, 0), Err(LxError::EBUSY));
+    assert_eq!(u32_at(&p, 0), 0x5a5a_5a5a, "nothing answered");
+    let mut short = vec![0u8; NUMA_INFO_SIZE - 8];
+    assert_eq!(numa_info(&mut short, 0), Err(LxError::EINVAL));
+
+    let mut p = vec![0u8; NUMA_INFO_SIZE];
+    assert_eq!(
+        ioctl_on(&ctl(), esc::NUMA_INFO, &mut p),
+        Err(LxError::EINVAL)
+    );
+    assert_eq!(u32_at(&p, 0), 0, "the control device answered nothing");
+    assert_eq!(ioctl_on(&gpu(0), esc::NUMA_INFO, &mut p), Ok(0));
+    assert_eq!(u32_at(&p, 0) as i32, -1);
+    assert_eq!(u64_at(&p, 8), MEMBLOCK_SIZE.load(Ordering::SeqCst));
+    assert!(!logged_not_served(esc::NUMA_INFO));
+}
+
 /// The payload is copied back even when the escape fails: the version check
 /// that refuses a client still hands it the kernel's version.
 #[test]

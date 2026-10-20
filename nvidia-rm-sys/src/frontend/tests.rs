@@ -280,7 +280,7 @@ fn a_hosted_build_agrees_with_its_own_layout() {
 fn the_mapping_record_has_the_c_layout() {
     assert_eq!(core::mem::size_of::<RawMmapContext>(), 40);
     assert_eq!(
-        LAYOUT[13],
+        LAYOUT[LAYOUT.len() - 1],
         (
             "EclipseRmMmapContext",
             core::mem::size_of::<RawMmapContext>()
