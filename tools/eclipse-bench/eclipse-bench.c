@@ -1605,6 +1605,39 @@ static void *parity_waker(void *arg) {
 // the denominator for the kernel counters read around that run.
 static uint64_t g_parity_wakes;
 
+// Create the two threads with the creator already pinned to the probe's CPU,
+// so they are born there (a new thread inherits its creator's mask, on Linux
+// and here) instead of being born wherever placement puts them and pinned
+// afterwards. The difference is the kernel's: a task pinned away from the CPU
+// it was born on still has its run queue there, and every wake of it has to
+// be fetched across.
+static int g_parity_born_pinned;
+
+// Where a late wake was spent, per wake of the last `parity_run`. A waker
+// pinned to CPU 0 but born elsewhere keeps its queue on its birth CPU, so
+// every wake is forwarded: the owner refuses it and kicks CPU 0, CPU 0 takes
+// the kick on its next pass, and that pass rescues the task. Each row is one
+// link of that chain: ~1 is a link that held, far below 1 is the link the
+// wakes fell out of, far above 1 is a chain run for more than the waker. The
+// floor rows are the other way a wake waits: a preemption denied for the
+// first 0.75 ms of the spinner's slice, with a timer armed to grant it when
+// the floor ends. Counters are machine-wide, so an idle machine reads best.
+static void parity_chain_rows(int have_kstat) {
+    double wk = have_kstat ? (double)g_parity_wakes : NA;
+    row("[kernel]", "  rescued per wake", kstat_per_op("sched steal:", 6, wk),
+        "x", "~1 = every wake reached CPU 0");
+    row("[kernel]", "  rescue kicks sent per wake",
+        kstat_per_op("sched rescue:", 0, wk), "x", "by the owner CPU");
+    row("[kernel]", "  rescue kicks taken per wake",
+        kstat_per_op("sched rescue:", 1, wk), "x", "by a pass on CPU 0");
+    row("[kernel]", "  taken, nothing rescued",
+        kstat_per_op("sched rescue:", 2, wk), "x", "the scan missed");
+    row("[kernel]", "  floor denials per wake",
+        kstat_per_op("wake floor:", 0, wk), "x", "");
+    row("[kernel]", "  floor timers per wake",
+        kstat_per_op("wake floor:", 1, wk), "x", "");
+}
+
 // Run the spinner on `cpu` for `budget_ns`, with `period_us > 0` adding a
 // co-pinned waker at that period. Returns the spinner's work units per second,
 // and fills the waker figures when asked for.
@@ -1618,8 +1651,15 @@ static double parity_run(int cpu, unsigned period_us, uint64_t budget_ns,
     c->cpu = cpu;
     c->period_us = period_us;
     pthread_t sp, wk;
+    cpu_set_t creator_mask;
+    int creator_pinned = g_parity_born_pinned &&
+                         pthread_getaffinity_np(pthread_self(), sizeof creator_mask,
+                                                &creator_mask) == 0 &&
+                         smpk_pin_self(cpu) == 0;
     CTL_LEND(c);
     if (pthread_create(&sp, NULL, parity_spinner, c) != 0) {
+        if (creator_pinned)
+            pthread_setaffinity_np(pthread_self(), sizeof creator_mask, &creator_mask);
         CTL_DROP(c); // the spinner's reference back
         CTL_DROP(c); // and ours
         return NA;
@@ -1632,6 +1672,8 @@ static double parity_run(int cpu, unsigned period_us, uint64_t budget_ns,
         else
             CTL_DROP(c);
     }
+    if (creator_pinned)
+        pthread_setaffinity_np(pthread_self(), sizeof creator_mask, &creator_mask);
     // Let both threads reach their gate and be placed before timing starts.
     struct timespec settle = {0, 30 * 1000 * 1000};
     nanosleep(&settle, NULL);
@@ -6317,30 +6359,25 @@ int main(int argc, char **argv) {
         row("[kernel]", "  waker rate achieved", w_hz, "wake/s", "");
         row("[kernel]", "  waker late (mean)", w_mean, "us", "");
         row("[kernel]", "  waker late (worst)", w_max, "us", "");
-        // Where a late wake was spent. The waker is pinned to CPU 0 but its
-        // queue lives on the CPU it was born on, so every wake is forwarded:
-        // the owner refuses it and kicks CPU 0, CPU 0 takes the kick on its
-        // next pass, and that pass rescues the task. Each row is one link of
-        // that chain, per wake: ~1 is a link that held, far below 1 is the
-        // link the wakes fell out of. The floor rows are the other way a wake
-        // waits: a preemption denied for the first 0.75 ms of the spinner's
-        // slice, with a timer armed to grant it when the floor ends.
-        {
-            double wk = parity_kstat ? (double)g_parity_wakes : NA;
-            row("[kernel]", "  rescued per wake",
-                kstat_per_op("sched steal:", 6, wk), "x",
-                "~1 = every wake reached CPU 0");
-            row("[kernel]", "  rescue kicks sent per wake",
-                kstat_per_op("sched rescue:", 0, wk), "x", "by the owner CPU");
-            row("[kernel]", "  rescue kicks taken per wake",
-                kstat_per_op("sched rescue:", 1, wk), "x", "by a pass on CPU 0");
-            row("[kernel]", "  taken, nothing rescued",
-                kstat_per_op("sched rescue:", 2, wk), "x", "the scan missed");
-            row("[kernel]", "  floor denials per wake",
-                kstat_per_op("wake floor:", 0, wk), "x", "");
-            row("[kernel]", "  floor timers per wake",
-                kstat_per_op("wake floor:", 1, wk), "x", "");
-        }
+        parity_chain_rows(parity_kstat);
+        // The same pair, born on CPU 0 instead of pinned there after birth.
+        // If this row is fast and the one above is slow, the cost is the
+        // forward a task pinned away from its birth CPU pays on every wake.
+        g_parity_born_pinned = 1;
+        g_parity_wakes = 0;
+        w_hz = w_mean = w_max = NA;
+        parity_kstat = g_kstat_ok > 0 && kstat_snapshot(g_kstat_a, sizeof g_kstat_a);
+        double born = parity_run(0, 200, g_short_ns, &w_hz, &w_mean, &w_max);
+        if (parity_kstat)
+            parity_kstat = kstat_snapshot(g_kstat_b, sizeof g_kstat_b);
+        g_parity_born_pinned = 0;
+        printf("  -- the same pair, born on CPU 0 rather than pinned to it --\n");
+        row("[kernel]", "spinner + waker, born on CPU 0",
+            born < 0 ? NA : born / 1e3, "kunit/s", "");
+        row("[kernel]", "  waker rate achieved", w_hz, "wake/s", "");
+        row("[kernel]", "  waker late (mean)", w_mean, "us", "");
+        row("[kernel]", "  waker late (worst)", w_max, "us", "");
+        parity_chain_rows(parity_kstat);
         printf("  the floor buys the spinner's throughput with the waker's\n");
         printf("  latency, so these rows are one result, not two. High retention\n");
         printf("  WITH low waker latency is the only unambiguously good outcome.\n");
