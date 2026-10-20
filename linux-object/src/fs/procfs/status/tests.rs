@@ -448,3 +448,120 @@ fn the_context_switches_are_the_task_s_own() {
     );
     assert_eq!(line(&status, "nonvoluntary_ctxt_switches"), Some("5"));
 }
+/// A process with no task to ask about -- between a `fork` and its first
+/// thread, or a zombie whose last thread has already gone -- still has a
+/// file. `Threads:` is never 0, as Linux's never is, and `Cpus_allowed:`
+/// falls back to every online CPU, which is what a task allowed to run
+/// anywhere reads anyway.
+#[test]
+fn a_process_with_no_task_has_one_thread_and_every_online_cpu() {
+    let online = kernel_hal::cpu_online_mask();
+    let job = ROOT_JOB.create_child().unwrap();
+    let bare = Process::create_with_fixed_id_ext(
+        &job,
+        45_383,
+        "status",
+        LinuxProcess::new(RamFS::new(), 0),
+    )
+    .unwrap();
+    assert!(bare.thread_ids().is_empty(), "the case this test is about");
+
+    let (_job, proc, thread) = a_process(45_384);
+    thread.set_affinity(online).unwrap();
+
+    let bare_status = proc_pid_status(&bare);
+    let threaded = proc_pid_status(&proc);
+    assert_eq!(
+        line(&bare_status, "Threads"),
+        Some("1"),
+        "{:?}",
+        bare_status
+    );
+    assert_eq!(
+        line(&bare_status, "Cpus_allowed"),
+        line(&threaded, "Cpus_allowed"),
+        "a process with no task was told it may run on no CPU at all: {:?}",
+        bare_status
+    );
+    assert_eq!(
+        line(&bare_status, "Cpus_allowed_list"),
+        line(&threaded, "Cpus_allowed_list")
+    );
+}
+
+/// `SigIgn:` and `SigCgt:` carry a bit for every signal there is, the last
+/// real-time one included: `task_sig()` walks `1..=_NSIG`, and a walk that
+/// stops one short hides the disposition of the highest RT signal from
+/// `ps s` and from anyone asking why their handler does nothing.
+#[test]
+fn the_highest_realtime_signal_s_disposition_is_published() {
+    let (_job, proc, _thread) = a_process(45_385);
+    let top = Signal::try_from(Signal::RTMAX as u8).unwrap();
+    proc.linux().set_signal_action(top, handler(0x7f00_1234));
+
+    let status = proc_pid_status(&proc);
+    let caught = u64::from_str_radix(line(&status, "SigCgt").unwrap(), 16).unwrap();
+    assert_eq!(
+        caught,
+        1u64 << (Signal::RTMAX as u8 - 1),
+        "bit {} is signal {}: {:?}",
+        Signal::RTMAX - 1,
+        Signal::RTMAX,
+        status
+    );
+}
+
+/// `%*pb` writes the top group as many hex DIGITS wide as the bits it holds,
+/// rounded UP: five bits are two digits, so a machine with 37 CPUs reads
+/// `01,00000000` and not `1,00000000`. And `cpu_lines` never asks for a
+/// zero-bit bitmap, which would leave `Cpus_allowed:` with no digits at all
+/// for a reader to parse.
+#[test]
+fn the_top_group_of_a_bitmap_is_padded_to_whole_hex_digits() {
+    assert_eq!(bitmap_hex(1u64 << 32, 37), "01,00000000");
+    assert_eq!(bitmap_list(1u64 << 32, 37), "32");
+
+    let mut out = String::new();
+    cpu_lines(&mut out, u64::MAX, 0);
+    assert!(
+        out.starts_with("Cpus_allowed:\t0\n"),
+        "no online CPU at all left the mask with no digits: {:?}",
+        out
+    );
+}
+
+/// `VmSize:` is in kB of 1024, as proc(5) says and as every reader divides
+/// back (`ps`, `top`, an OOM watcher): one MiB of mapping has to read 1024,
+/// not 1048. Asserted as the DELTA, so it pins the divisor and not whatever
+/// a fresh address space happens to start with.
+#[test]
+fn vmsize_is_in_kilobytes_of_1024() {
+    use zircon_object::vm::{MMUFlags, VmObject};
+    const MIB: usize = 1 << 20;
+    let (_job, proc, _thread) = a_process(45_386);
+    let kb = |status: &str| -> u64 {
+        line(status, "VmSize")
+            .and_then(|v| v.trim().strip_suffix("kB"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap()
+    };
+    let before = kb(&proc_pid_status(&proc));
+
+    // A real `mmap` happens under libos, so the address matters: `None` puts
+    // this mapping at guest address zero, which the host refuses with `EPERM`
+    // below `vm.mmap_min_addr` unless the caller holds `CAP_SYS_RAWIO`. This
+    // container runs as root and does, so it passed here and broke `Unit
+    // Test` on the runner. `0x40_0000` is where a non-PIE image loads and
+    // what every other mapping test in the tree asks for.
+    proc.vmar()
+        .map(
+            Some(0x40_0000),
+            VmObject::new_paged(MIB / 4096),
+            0,
+            MIB,
+            MMUFlags::READ,
+        )
+        .unwrap();
+
+    assert_eq!(kb(&proc_pid_status(&proc)) - before, 1024);
+}

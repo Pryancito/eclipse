@@ -131,3 +131,67 @@ fn nor_while_its_teardown_is_still_running() {
     );
     after_the_teardown(&reaper, &parent, &orphan);
 }
+
+/// The three tests above pin the `None` half: a dead child is not waitable
+/// until its teardown says so. This is the other half, and it is the
+/// sentence the module exists for -- once the handover has happened the
+/// child IS waitable, while it is still a live child and before anybody has
+/// reaped it.
+///
+/// Asked of `waitable_exit_code` directly, because a wait cannot reach it
+/// from out here: `wait_child_interest` looks in `reaped_children` first,
+/// and by the time an exit has returned the zombie is on file there. The
+/// live path is only ever taken inside this window, so the window is where
+/// the question has to be asked.
+#[test]
+fn a_child_that_has_handed_over_is_waitable_while_it_is_still_a_live_child() {
+    let [_reaper, parent, _orphan] = a_subreaper_its_child_and_grandchild(45_104);
+    let child = parent.clone();
+    let seen = before_the_teardown_of(&parent, move || {
+        let before = exit_handover::waitable_exit_code(&child);
+        child.linux().mark_exit_handed_over();
+        (before, exit_handover::waitable_exit_code(&child))
+    });
+
+    parent.exit(3);
+
+    assert_eq!(
+        seen.lock().unwrap().take(),
+        Some((None, Some(3))),
+        "the handover is what makes a dead child waitable, and nothing else"
+    );
+}
+
+/// `fetch_max` and not a store, which is the whole of what the comment on it
+/// says. A reaper that has let a zombie go put the stage at REAPED --
+/// `release_task()` freed the pid in the same breath, so from then on the pid
+/// names nothing -- and a teardown still running behind it must not take that
+/// pid back to a zombie a second `wait*` could collect.
+#[test]
+fn a_pid_a_reaper_has_let_go_of_does_not_come_back_as_a_zombie() {
+    let proc = Process::create_linux(&ROOT_JOB, RamFS::new(), 0, None, 45_105).unwrap();
+    exit_handover::released(Some(proc.clone()));
+    assert!(proc.linux().is_reaped(), "`released` is `release_task()`");
+
+    proc.linux().mark_exit_handed_over();
+
+    assert!(
+        proc.linux().is_reaped(),
+        "the handover took a reaped pid back to being a collectable zombie"
+    );
+}
+
+/// A process with no Linux side has no teardown to wait for, so its exit is
+/// collectable the moment its status says so. The stage only ever speaks for
+/// a process that has one, which is what `is_none_or` says.
+#[test]
+fn a_process_with_no_linux_side_is_waitable_as_soon_as_it_has_exited() {
+    let zircon = Process::create(&ROOT_JOB, "zircon").unwrap();
+    zircon.exit(7);
+
+    assert_eq!(
+        exit_handover::waitable_exit_code(&zircon),
+        Some(7),
+        "a process with no handover of its own was made to wait for one"
+    );
+}

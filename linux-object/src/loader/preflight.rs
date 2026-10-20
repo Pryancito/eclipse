@@ -808,4 +808,111 @@ mod tests {
         fs.file("script", &script);
         assert_eq!(fs.run(&dynamic("/script")), Err(LxError::ELIBBAD));
     }
+
+    /// A file that reports more bytes than it hands out, which is a file
+    /// being written while it is executed.
+    struct Shrunk {
+        inner: Arc<dyn INode>,
+        size: usize,
+    }
+
+    impl INode for Shrunk {
+        fn read_at(&self, offset: usize, buf: &mut [u8]) -> rcore_fs::vfs::Result<usize> {
+            self.inner.read_at(offset, buf)
+        }
+        fn write_at(&self, _: usize, _: &[u8]) -> rcore_fs::vfs::Result<usize> {
+            unimplemented!()
+        }
+        fn poll(&self) -> rcore_fs::vfs::Result<rcore_fs::vfs::PollStatus> {
+            unimplemented!()
+        }
+        fn metadata(&self) -> rcore_fs::vfs::Result<rcore_fs::vfs::Metadata> {
+            let mut m = self.inner.metadata()?;
+            m.size = self.size;
+            Ok(m)
+        }
+        fn as_any_ref(&self) -> &dyn core::any::Any {
+            self
+        }
+    }
+
+    /// `do_open_execat` refuses an interpreter that is not a regular file --
+    /// `if (!S_ISREG(...)) return -EACCES` -- and that is the row of the table
+    /// above that nothing asked for. The test next to it only names an
+    /// interpreter the caller may not execute, which is the other half of the
+    /// same function. A char device, a block device, a FIFO and a socket all
+    /// resolve and all carry an exec bit, so every other check lets them
+    /// through, and the only thing in the way is that one `==`: relaxed to
+    /// "not a directory", `#!/dev/tty` passed the preflight and the process
+    /// died past the point of no return, with the `SIGSEGV` this module exists
+    /// to replace by an errno.
+    #[test]
+    fn an_interpreter_that_is_not_a_regular_file_is_eacces() {
+        let fs = Fs::new();
+        for (name, kind) in [
+            ("tty", FileType::CharDevice),
+            ("sda", FileType::BlockDevice),
+            ("fifo", FileType::NamedPipe),
+            ("sock", FileType::Socket),
+        ] {
+            // 0o777, so the permission half of `opened_for_exec` passes and
+            // what is left is the kind of file this is.
+            fs.root.create2(name, kind, 0o777, 0).unwrap();
+            fs.file("s", alloc::format!("#!/{}\n", name).as_bytes());
+
+            assert_eq!(fs.exec("s"), Err(LxError::EACCES), "#!/{}", name);
+
+            fs.root.unlink("s").unwrap();
+            fs.root.unlink(name).unwrap();
+        }
+    }
+
+    /// A `PT_INTERP` of exactly `PATH_MAX` bytes is a path Linux reads, and
+    /// the range that says so is inclusive. The test above names only the far
+    /// side of each end -- 4097 refused, 1 refused -- so closing the range to
+    /// `2..MAX_INTERP_PATH` refused the longest legal interpreter path there
+    /// is, and refused it with `ENOEXEC`: the errno a shell takes as "this is
+    /// a shell script", so it would have run the dynamic binary as one.
+    #[test]
+    fn a_pt_interp_of_exactly_path_max_bytes_is_a_path() {
+        let fs = Fs::new();
+        // The whole segment, NUL-terminated at the path and zero to the end,
+        // which is how a linker pads it.
+        let mut path = vec![0u8; MAX_INTERP_PATH as usize];
+        path[..b"/ld.so".len()].copy_from_slice(b"/ld.so");
+
+        assert_eq!(fs.run(&image(&[(PT_INTERP, &path)])), Ok(()));
+    }
+
+    /// A `PT_INTERP` the file no longer holds is `EIO`, the errno `elf_read`
+    /// gives a short read.
+    ///
+    /// `image_phdrs` already measured that segment against the file's size, so
+    /// getting here means the file shrank between the two reads -- a binary
+    /// rewritten while it is being executed. The buffer is zeroed, so the
+    /// bytes that did arrive look like a NUL-terminated path: with the `!=`
+    /// relaxed, the preflight looked up whatever prefix it got and answered
+    /// `ENOENT`, which a shell prints as "not found" for an interpreter that
+    /// is installed.
+    #[test]
+    fn a_pt_interp_the_file_no_longer_holds_is_eio() {
+        let fs = Fs::new();
+        let whole = dynamic("/ld.so");
+        fs.file("x", &whole[..whole.len() - 4]);
+        let image: Arc<dyn INode> = Arc::new(Shrunk {
+            inner: fs.root.lookup("x").unwrap(),
+            size: whole.len(),
+        });
+        let loader = LinuxElfLoader {
+            syscall_entry: 0,
+            stack_pages: 1,
+            root_inode: fs.root.clone(),
+            identity: Default::default(),
+        };
+
+        assert_eq!(
+            loader.preflight(&image, &Credentials::default()),
+            Err(LxError::EIO)
+        );
+    }
 }

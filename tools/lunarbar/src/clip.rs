@@ -954,4 +954,186 @@ mod tests {
         // An empty history is a valid answer, not a missing one.
         assert_eq!(decode_list(&encode_list(&[])), Some(Vec::new()));
     }
+
+    #[test]
+    fn a_password_hint_is_recognised_whatever_its_spelling() {
+        // The hint is an atom name a password manager picked, and the one in
+        // the test above is the exact spelling KeePassXC sends. A manager
+        // that lower-cases it, or an X11 client whose atom arrives upper-cased
+        // through Xwayland, would otherwise have every password it copies
+        // written to the history file on disk -- which is the one thing this
+        // check exists to stop, so it is the one that has to hold for a
+        // spelling nobody anticipated.
+        for spelling in [
+            "x-kde-passwordmanagerhint",
+            "X-KDE-PASSWORDMANAGERHINT",
+            "x-KDE-PasswordManagerHint",
+        ] {
+            assert!(
+                is_secret(&mimes(&["text/plain;charset=utf-8", spelling])),
+                "{spelling}"
+            );
+        }
+        assert!(is_secret(&mimes(&["APPLICATION/X-LIBREOFFICE-PASSWORD"])));
+    }
+
+    #[test]
+    fn the_preferred_text_mime_wins_over_a_fallback_whatever_its_case() {
+        // Two things at once, and the test above can see neither: that the
+        // ORDER of `TEXT_MIMES` decides, and that the comparison ignores
+        // case. A case-variant the ordered pass misses still comes back from
+        // the `text/` fallback below it, so the answer looks right while the
+        // preference has quietly been lost -- and with an HTML offer in the
+        // list the fallback hands back the HTML.
+        let m = mimes(&["text/html", "TEXT/PLAIN;CHARSET=UTF-8"]);
+        assert_eq!(
+            best_text_mime(&m).as_deref(),
+            Some("TEXT/PLAIN;CHARSET=UTF-8")
+        );
+        // The X11 atoms as an old application spells them, which is the whole
+        // reason they are in the table.
+        let m = mimes(&["text/html", "utf8_string"]);
+        assert_eq!(best_text_mime(&m).as_deref(), Some("utf8_string"));
+    }
+
+    #[test]
+    fn a_search_ignores_the_case_of_the_entries_and_not_only_of_the_needle() {
+        // The needle is folded on the way in, so comparing it against the raw
+        // entry is case-insensitive in one direction only: every entry in the
+        // test above is lower case, where the two readings agree.
+        let mut h = History::new();
+        for t in ["Informe FINAL.pdf", "https://EJEMPLO.test/x"] {
+            h.push(t);
+        }
+        assert_eq!(h.search("informe").len(), 1);
+        assert_eq!(h.search("INFORME").len(), 1);
+        assert_eq!(h.search("ejemplo").len(), 1);
+        assert_eq!(h.search("").len(), 2);
+    }
+
+    #[test]
+    fn preview_replaces_del_and_keeps_the_last_character_the_font_has() {
+        // Two boundaries the test above does not reach. DEL is a control
+        // character with no glyph, which a copy out of a terminal carries as
+        // readily as the ESC that test uses. And U+00FF is the LAST character
+        // the ISO-8859-1 face can draw, so a cap of `>= 0xff` loses one real
+        // character while claiming to keep everything the font has.
+        assert_eq!(preview("a\u{7f}b", 40), "a?b");
+        assert_eq!(preview("a\u{ff}b", 40), "a\u{ff}b");
+        assert_eq!(preview("a\u{100}b", 40), "a?b");
+    }
+
+    #[test]
+    fn a_size_label_neither_jitters_at_ten_kibibytes_nor_reads_low_above_it() {
+        // Ten is where the decimal is dropped and the test above steps right
+        // over it: one side of the boundary is `9,9 KiB` and the other
+        // `10 KiB`, so a `<=` there prints `10,0 KiB` and the column is a
+        // character wider for one size in a thousand.
+        assert_eq!(size_label(10 * 1024 - 103), "9,9 KiB");
+        assert_eq!(size_label(10 * 1024), "10 KiB");
+        // And above it the whole number is ROUNDED, not cut. Every size the
+        // test above checks is a whole number of KiB, where the two agree.
+        assert_eq!(size_label(10 * 1024 + 614), "11 KiB");
+        assert_eq!(size_label(1024 * 1024 - 1), "1024 KiB");
+    }
+
+    #[test]
+    fn the_history_file_round_trips_text_that_is_not_ascii() {
+        // The length prefix is in BYTES, and every entry the round-trip test
+        // above is ASCII, where a byte and a character are the same number. A
+        // prefix that counted characters cuts the payload short, so `rest`
+        // lands in the middle of a character and the decoder stops there: one
+        // accent in one entry and everything below it in the history is gone.
+        let items = vec![
+            "ma\u{f1}ana".to_string(),
+            "\u{20ac} 12,50".to_string(),
+            "\u{4e2d}\u{6587}\nsegunda linea".to_string(),
+        ];
+        assert_eq!(decode(&encode(&items)), items);
+        // And the same through a History, which is how `save` writes it.
+        let mut h = History::new();
+        for i in items.iter().rev() {
+            assert!(h.push(i));
+        }
+        assert_eq!(decode(&encode(h.items())), items);
+    }
+
+    #[test]
+    fn a_copy_of_text_that_is_not_ascii_round_trips_over_the_wire() {
+        // The wire's framing is the file's framing and has the same bug
+        // available to it: `encode_req` counts the COPY payload and
+        // `parse_req` reads that many bytes back. Every payload in the
+        // round-trip test above is ASCII, so the two would first disagree the
+        // day a user copied an accent, which on a Spanish image is the first
+        // thing they copy.
+        for text in ["ma\u{f1}ana", "\u{20ac}", "a\u{4e2d}b\nc"] {
+            let req = Req::Copy(text.to_string());
+            let bytes = encode_req(&req);
+            // Everything but the payload's trailing newline, which belongs to
+            // the next parse.
+            assert_eq!(
+                parse_req(&bytes),
+                ReqParse::Done(req.clone(), bytes.len() - 1),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_that_ends_the_file_without_a_newline_still_decodes() {
+        // The newline after a payload is there so `cat` on the file is
+        // readable, and the decoder is documented not to require it -- but
+        // every history the tests encode has one, so a file written by
+        // anything else, or by a `save` cut off exactly at the payload, was
+        // the one shape never decoded.
+        let whole = encode(&["uno".to_string(), "dos".to_string()]);
+        let trimmed = &whole[..whole.len() - 1];
+        assert_eq!(*trimmed.last().unwrap(), b's', "the payload must end it");
+        assert_eq!(decode(trimmed), ["uno", "dos"]);
+    }
+
+    #[test]
+    fn a_copy_whose_payload_ends_the_buffer_is_already_complete() {
+        // The trailing newline of a COPY is the next read's problem, so a
+        // write split exactly at the end of the payload is a COMPLETE
+        // request. Answering `Incomplete` there parks the daemon waiting for
+        // a byte the client sends only with its next request, which it will
+        // not send until this one is answered. The split test above stops one
+        // byte short of this case on purpose.
+        let full = encode_req(&Req::Copy("un texto".to_string()));
+        let payload_end = &full[..full.len() - 1];
+        assert_eq!(
+            parse_req(payload_end),
+            ReqParse::Done(Req::Copy("un texto".to_string()), payload_end.len())
+        );
+    }
+
+    #[test]
+    fn a_copy_of_exactly_the_entry_cap_is_served_and_one_past_it_is_not() {
+        // The two caps have to agree. `worth_keeping` takes an entry of
+        // exactly `MAX_ENTRY_BYTES`, so a daemon answering `Bad` to one would
+        // refuse a copy the history would have kept -- and `Bad` drops the
+        // connection, so the client sees the selection vanish rather than an
+        // entry it could not store.
+        assert!(worth_keeping(&"x".repeat(MAX_ENTRY_BYTES)));
+        let at_cap = encode_req(&Req::Copy("x".repeat(MAX_ENTRY_BYTES)));
+        assert!(
+            matches!(parse_req(&at_cap), ReqParse::Done(Req::Copy(_), _)),
+            "a copy of exactly the cap has to be served"
+        );
+        let past = encode_req(&Req::Copy("x".repeat(MAX_ENTRY_BYTES + 1)));
+        assert_eq!(parse_req(&past), ReqParse::Bad);
+    }
+
+    #[test]
+    fn a_request_typed_with_crlf_is_the_same_request() {
+        // What a person debugging the daemon with `nc` sends, and what any
+        // client written on the assumption that a line protocol is CRLF
+        // sends. The carriage return belongs to the line and not to the verb,
+        // so leaving it on makes every request an unknown one -- and an
+        // unknown request drops the connection.
+        assert_eq!(parse_req(b"LIST\r\n"), ReqParse::Done(Req::List, 6));
+        assert_eq!(parse_req(b"CLEAR\r\n"), ReqParse::Done(Req::Clear, 7));
+        assert_eq!(parse_req(b"SET 3\r\n"), ReqParse::Done(Req::Set(3), 7));
+    }
 }

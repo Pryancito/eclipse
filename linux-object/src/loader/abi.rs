@@ -1059,4 +1059,474 @@ mod initial_stack_tests {
         assert_eq!(AT_EGID, 14);
         assert_eq!(AT_SECURE, 23);
     }
+
+    /// The image buffer is sized from the contents, and an auxiliary-vector
+    /// entry counts TWICE: the table carries a type and a value for each one.
+    ///
+    /// The test above measures a huge argv with a single entry in the map,
+    /// where counting one word per entry instead of two is swallowed by the
+    /// 32 bytes of slack. A real `execve` arrives with the whole block --
+    /// `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_BASE`, `AT_ENTRY`
+    /// and the five identity entries -- and then the buffer is short by the
+    /// other half of it, which is the assert in `push_slice_aligned`: the
+    /// same kernel panic from an ordinary command that sizing the buffer was
+    /// meant to end.
+    #[test]
+    fn a_huge_argument_list_with_a_full_auxiliary_vector_fits_too() {
+        let args: Vec<String> = (0..4000)
+            .map(|i| alloc::format!("/tmp/dir/file{:06}", i))
+            .collect();
+        let info = ProcInitInfo {
+            args: args.clone(),
+            envs: (0..200)
+                .map(|i| alloc::format!("VAR{}={}", i, "v".repeat(80)))
+                .collect(),
+            auxv: auxv_of(&[
+                (AT_PHDR, 0x40_0040),
+                (AT_PHENT, 56),
+                (AT_PHNUM, 11),
+                (AT_PAGESZ, 4096),
+                (AT_BASE, 0x1000),
+                (AT_ENTRY, 0x40_1000),
+                (AT_UID, 0),
+                (AT_EUID, 0),
+                (AT_GID, 0),
+                (AT_EGID, 0),
+                (AT_SECURE, 0),
+            ]),
+        };
+
+        let stack = info.push_at(TOP);
+
+        let img = Image {
+            sp: TOP - stack.len(),
+            bytes: stack.to_vec(),
+        };
+        let (argc, got_args, got_envs, auxv) = img.decode();
+        assert_eq!(argc, args.len());
+        assert_eq!(got_args[args.len() - 1], args[args.len() - 1]);
+        assert_eq!(got_envs.len(), 200);
+        // The eleven handed in, plus the `AT_RANDOM` and `AT_EXECFN` the
+        // builder adds itself.
+        assert_eq!(auxv.len(), 13);
+        assert!(img.sp.is_multiple_of(16));
+    }
+}
+
+/// The FreeBSD/amd64 initial stack; see the module notes.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod freebsd_stack_tests {
+    //! [`ProcInitInfo::push_at_freebsd`] had no test at all, and it is not a
+    //! variant of the Linux builder above: different auxiliary-vector numbers,
+    //! an SSP canary FreeBSD's csu reads through `AT_CANARY` instead of through
+    //! `AT_RANDOM`, a page-size array, and a `ps_strings` block that is pushed
+    //! before the pointer arrays exist and back-patched with their addresses
+    //! once they do. That back-patch is the only arithmetic in the tree that
+    //! has to name an address inside a table it did not push, so it is the one
+    //! most able to be quietly off by one pointer -- and `ps_strings` is what
+    //! FreeBSD's `setproctitle`, `ps` and `procstat` read, so wrong addresses
+    //! there are read as argv and envp by something outside the process.
+    //!
+    //! Everything here is arithmetic over one buffer, so it is checked exactly,
+    //! the way [`initial_stack_tests`] checks the Linux one.
+
+    use super::*;
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    /// Somewhere plausible and 16-byte aligned, like the real stack top.
+    const TOP: usize = 0x7fff_ffff_f000;
+
+    /// What the loader computes per image, with the values
+    /// `LinuxElfLoader::load` passes for a static FreeBSD binary.
+    fn an_auxv(execpath: &str) -> FreebsdAuxv {
+        FreebsdAuxv {
+            phdr: 0x40_0040,
+            phent: 56,
+            phnum: 11,
+            base: 0, // static binary: no interpreter
+            entry: 0x40_1000,
+            pagesz: 4096,
+            ehdrflags: 0,
+            osreldate: 1_400_097,
+            ncpus: 4,
+            execpath: execpath.to_string(),
+        }
+    }
+
+    /// A decoded FreeBSD initial stack, addressed the way the new process will.
+    struct Image {
+        bytes: Vec<u8>,
+        sp: usize,
+    }
+
+    impl Image {
+        fn of(args: &[&str], envs: &[&str]) -> Image {
+            Image::with(args, envs, &an_auxv("/bin/sh"))
+        }
+
+        fn with(args: &[&str], envs: &[&str], aux: &FreebsdAuxv) -> Image {
+            let info = ProcInitInfo {
+                args: args.iter().map(|s| s.to_string()).collect(),
+                envs: envs.iter().map(|s| s.to_string()).collect(),
+                // `push_at_freebsd` builds its own auxiliary vector and never
+                // reads this one, which is the Linux-numbered map.
+                auxv: BTreeMap::new(),
+            };
+            let bytes = info.push_at_freebsd(TOP, aux).to_vec();
+            Image {
+                sp: TOP - bytes.len(),
+                bytes,
+            }
+        }
+
+        /// The machine word at address `addr`.
+        fn word(&self, addr: usize) -> usize {
+            let off = addr - self.sp;
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&self.bytes[off..off + 8]);
+            usize::from_ne_bytes(w)
+        }
+
+        /// The NUL-terminated string at address `addr`.
+        fn cstr(&self, addr: usize) -> String {
+            let off = addr - self.sp;
+            let end = self.bytes[off..]
+                .iter()
+                .position(|&b| b == 0)
+                .expect("a string on the stack must be NUL-terminated")
+                + off;
+            String::from_utf8_lossy(&self.bytes[off..end]).into_owned()
+        }
+
+        fn in_bounds(&self, addr: usize, len: usize) -> bool {
+            addr >= self.sp && addr + len <= TOP
+        }
+
+        fn bytes_at(&self, addr: usize, len: usize) -> Vec<u8> {
+            let off = addr - self.sp;
+            self.bytes[off..off + len].to_vec()
+        }
+
+        /// `argc`, then the argv strings, the envp strings, and the auxiliary
+        /// vector -- read exactly as FreeBSD's `_start` walks them.
+        fn decode(&self) -> (usize, Vec<String>, Vec<String>, Vec<(usize, usize)>) {
+            let argc = self.word(self.sp);
+            let mut at = self.sp + 8;
+            let mut args = Vec::new();
+            for _ in 0..argc {
+                args.push(self.cstr(self.word(at)));
+                at += 8;
+            }
+            assert_eq!(self.word(at), 0, "argv is not NULL-terminated");
+            at += 8;
+            let mut envs = Vec::new();
+            while self.word(at) != 0 {
+                envs.push(self.cstr(self.word(at)));
+                at += 8;
+            }
+            at += 8;
+            let mut auxv = Vec::new();
+            loop {
+                let (k, v) = (self.word(at), self.word(at + 8));
+                at += 16;
+                if k == fbsd_at::AT_NULL {
+                    break;
+                }
+                auxv.push((k, v));
+            }
+            (argc, args, envs, auxv)
+        }
+
+        /// The value of one auxiliary-vector entry, by its FreeBSD type.
+        fn aux(&self, key: usize) -> Option<usize> {
+            let (_, _, _, auxv) = self.decode();
+            auxv.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+        }
+    }
+
+    #[test]
+    fn a_freebsd_process_reads_back_its_own_arguments_and_environment() {
+        let img = Image::of(
+            &["/bin/sh", "-c", "echo hola"],
+            &["PATH=/usr/bin", "HOME=/root"],
+        );
+
+        let (argc, args, envs, _) = img.decode();
+
+        assert_eq!(argc, 3);
+        assert_eq!(args, vec!["/bin/sh", "-c", "echo hola"]);
+        assert_eq!(envs, vec!["PATH=/usr/bin", "HOME=/root"]);
+    }
+
+    #[test]
+    fn the_freebsd_stack_pointer_is_sixteen_byte_aligned_whatever_is_on_it() {
+        // Same requirement as the Linux stack, and the same reason: the amd64
+        // ABI wants `rsp % 16 == 0` at `_start`, and FreeBSD's csu is compiled
+        // with SSE. The padding that guarantees it depends on how many
+        // pointers and how many string bytes there are, so walk both parities
+        // of each. The FreeBSD table is nineteen auxv pairs, not the caller's
+        // map, so it has its own parity.
+        for nargs in 0..6usize {
+            for nenvs in 0..6usize {
+                for pad in 0..3usize {
+                    let args: Vec<String> = (0..nargs).map(|i| "a".repeat(i + pad + 1)).collect();
+                    let envs: Vec<String> = (0..nenvs)
+                        .map(|i| "E=".to_string() + &"e".repeat(i))
+                        .collect();
+                    let info = ProcInitInfo {
+                        args,
+                        envs,
+                        auxv: BTreeMap::new(),
+                    };
+                    let stack = info.push_at_freebsd(TOP, &an_auxv("/bin/sh"));
+                    let sp = TOP - stack.len();
+                    assert!(
+                        sp.is_multiple_of(16),
+                        "sp {:#x} is not 16-byte aligned for {} args and {} envs",
+                        sp,
+                        nargs,
+                        nenvs
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ps_strings_points_at_the_argv_and_envp_arrays_the_table_holds() {
+        // `ps_strings` is pushed at the very top, before the pointer arrays
+        // have addresses, and back-patched once they do. Its four fields are
+        // read from outside the process: `ps` and `procstat` follow `argvstr`
+        // for `nargv` words to print a command line, and `setproctitle`
+        // rewrites the strings they point at. An `envstr` short by one word
+        // lands on the NULL that ends argv, so the environment reads as empty;
+        // one long by a word lands on envp[1].
+        let img = Image::of(&["/bin/sh", "-c", "echo"], &["PATH=/bin", "HOME=/root"]);
+        let ps = img
+            .aux(fbsd_at::AT_PS_STRINGS)
+            .expect("AT_PS_STRINGS must always be supplied");
+        assert!(img.in_bounds(ps, 32), "ps_strings is outside the image");
+
+        let (argvstr, nargv) = (img.word(ps), img.word(ps + 8));
+        let (envstr, nenv) = (img.word(ps + 16), img.word(ps + 24));
+
+        assert_eq!((nargv, nenv), (3, 2), "the two counts");
+        assert_eq!(
+            argvstr,
+            img.sp + 8,
+            "argv does not start one word above argc"
+        );
+        assert_eq!(img.cstr(img.word(argvstr)), "/bin/sh");
+        assert_eq!(img.cstr(img.word(argvstr + 8 * (nargv - 1))), "echo");
+        assert_eq!(
+            img.word(argvstr + 8 * nargv),
+            0,
+            "argv is not NULL-terminated where ps_strings says it ends"
+        );
+        assert_eq!(
+            img.word(envstr - 8),
+            0,
+            "envp does not start right after the NULL that ends argv"
+        );
+        assert_eq!(img.cstr(img.word(envstr)), "PATH=/bin");
+        assert_eq!(img.cstr(img.word(envstr + 8)), "HOME=/root");
+        assert_eq!(
+            img.word(envstr + 8 * nenv),
+            0,
+            "envp is not NULL-terminated where ps_strings says it ends"
+        );
+    }
+
+    #[test]
+    fn at_canary_points_at_sixteen_bytes_that_are_not_zeros() {
+        // FreeBSD's csu copies `AT_CANARYLEN` bytes from `AT_CANARY` into
+        // `__stack_chk_guard` and then zeroes them. That IS the process's
+        // stack canary, so sixteen zeros would make `-fstack-protector` a
+        // check an overflow passes by writing zeros, exactly as on the Linux
+        // stack above -- and a length that disagrees with the block copies
+        // whatever follows it.
+        let img = Image::of(&["/bin/true"], &[]);
+
+        let canary = img
+            .aux(fbsd_at::AT_CANARY)
+            .expect("AT_CANARY must always be supplied");
+
+        assert_eq!(img.aux(fbsd_at::AT_CANARYLEN), Some(16));
+        assert!(
+            img.in_bounds(canary, 16),
+            "AT_CANARY points at {:#x}, outside the image",
+            canary
+        );
+        assert_ne!(
+            img.bytes_at(canary, 16),
+            vec![0u8; 16],
+            "the canary is sixteen zeros, the same in every process"
+        );
+    }
+
+    #[test]
+    fn two_freebsd_processes_do_not_get_the_same_canary() {
+        let one = Image::of(&["/bin/true"], &[]);
+        let other = Image::of(&["/bin/true"], &[]);
+
+        let bytes = |img: &Image| img.bytes_at(img.aux(fbsd_at::AT_CANARY).unwrap(), 16);
+
+        assert_ne!(bytes(&one), bytes(&other), "one canary for every process");
+    }
+
+    #[test]
+    fn at_pagesizes_points_at_the_array_and_says_how_long_it_is() {
+        // `getpagesizes(3)` reads `AT_PAGESIZESLEN / sizeof(size_t)` entries
+        // through this pointer, so a length in entries rather than bytes, or a
+        // pointer at the string next to it, is a page size read out of
+        // somebody else's bytes.
+        let img = Image::of(&["/bin/true"], &[]);
+
+        let array = img
+            .aux(fbsd_at::AT_PAGESIZES)
+            .expect("AT_PAGESIZES must always be supplied");
+        let len = img
+            .aux(fbsd_at::AT_PAGESIZESLEN)
+            .expect("AT_PAGESIZESLEN must always be supplied");
+
+        assert_eq!(len, 8, "the length is in bytes, one u64");
+        assert!(img.in_bounds(array, len));
+        assert_eq!(img.word(array), 4096, "the base page size");
+    }
+
+    #[test]
+    fn the_page_size_array_is_aligned_and_does_not_eat_the_string_above_it() {
+        // [`Stack::push_slice`] rounds `sp` DOWN to the alignment of what it
+        // pushes, and this one push is the only place in the tree that asks it
+        // for more than a byte at an `sp` nobody has aligned first: the Linux
+        // builder pushes bytes, and then a table of words at an `sp` it has
+        // just masked, so there the rounding can be removed, doubled or turned
+        // round and no test moves. Here it decides two things at once.
+        // `getpagesizes(3)` dereferences this pointer as a `size_t *`, which
+        // faults on the aarch64 and riscv64 targets when it is not 8-aligned;
+        // and rounding `sp` the wrong WAY moves it up into the `execpath`
+        // string pushed just above, so that string comes back chewed. Walk
+        // every residue, because what is left over depends on the length of
+        // that string.
+        for pad in 0..8usize {
+            let path = alloc::format!("/bin/{}", "p".repeat(pad));
+            let img = Image::with(&["prog"], &[], &an_auxv(&path));
+
+            let array = img.aux(fbsd_at::AT_PAGESIZES).unwrap();
+
+            assert!(
+                array.is_multiple_of(8),
+                "AT_PAGESIZES points at {:#x}, which no libc can dereference",
+                array
+            );
+            assert_eq!(img.word(array), 4096);
+            assert_eq!(
+                img.cstr(img.aux(fbsd_at::AT_EXECPATH).unwrap()),
+                path,
+                "the page-size array was written over the execpath"
+            );
+        }
+    }
+
+    #[test]
+    fn at_execpath_names_the_program() {
+        // FreeBSD's rtld reads `AT_EXECPATH` to resolve `$ORIGIN` in a
+        // library path, and `getprogname` falls back to it.
+        let img = Image::with(
+            &["prog", "-v"],
+            &[],
+            &an_auxv("/usr/local/bin/freebsd-prog"),
+        );
+
+        let path = img
+            .aux(fbsd_at::AT_EXECPATH)
+            .expect("AT_EXECPATH must always be supplied");
+
+        assert_eq!(img.cstr(path), "/usr/local/bin/freebsd-prog");
+    }
+
+    #[test]
+    fn the_auxiliary_vector_carries_the_loaders_values_and_ends_in_at_null() {
+        let img = Image::of(&["/bin/true"], &["TERM=xterm"]);
+
+        let (_, _, _, auxv) = img.decode();
+
+        for (key, want) in [
+            (fbsd_at::AT_PHDR, 0x40_0040usize),
+            (fbsd_at::AT_PHENT, 56),
+            (fbsd_at::AT_PHNUM, 11),
+            (fbsd_at::AT_BASE, 0),
+            (fbsd_at::AT_ENTRY, 0x40_1000),
+            (fbsd_at::AT_PAGESZ, 4096),
+            (fbsd_at::AT_EHDRFLAGS, 0),
+            (fbsd_at::AT_OSRELDATE, 1_400_097),
+            (fbsd_at::AT_NCPUS, 4),
+            // PROT_READ | PROT_WRITE: rtld reads this to decide whether the
+            // stack it was handed is executable.
+            (fbsd_at::AT_STACKPROT, 0b11),
+            (fbsd_at::AT_USRSTACKBASE, TOP),
+            (fbsd_at::AT_USRSTACKLIM, 8 * 1024 * 1024),
+        ] {
+            let got = auxv.iter().find(|(k, _)| *k == key);
+            assert_eq!(got.map(|(_, v)| *v), Some(want), "auxv[{}] is wrong", key);
+        }
+        // `decode` walked to `AT_NULL` to build the list at all, so the count
+        // is what says nothing else rode along: nineteen entries, the array in
+        // `push_at_freebsd`, which is also the number `needed` sizes the
+        // buffer for.
+        assert_eq!(auxv.len(), 19, "the auxiliary vector grew or lost an entry");
+    }
+
+    #[test]
+    fn a_huge_freebsd_argument_list_does_not_overrun_the_image_buffer() {
+        // The buffer was a fixed 0x4000 on both builders, and an argv that
+        // outgrew it tripped the assert in `push_slice_aligned` -- a kernel
+        // panic from an ordinary `execve`. The FreeBSD bound has its own
+        // terms (the `ps_strings` block, the canary, the page-size array and
+        // nineteen auxv pairs), so it has to be measured on its own.
+        let args: Vec<String> = (0..4000)
+            .map(|i| alloc::format!("/tmp/dir/file{:06}", i))
+            .collect();
+        let envs: Vec<String> = (0..200)
+            .map(|i| alloc::format!("VAR{}={}", i, "v".repeat(80)))
+            .collect();
+        let info = ProcInitInfo {
+            args: args.clone(),
+            envs: envs.clone(),
+            auxv: BTreeMap::new(),
+        };
+
+        let stack = info.push_at_freebsd(TOP, &an_auxv("/bin/sh"));
+
+        let img = Image {
+            sp: TOP - stack.len(),
+            bytes: stack.to_vec(),
+        };
+        let (argc, got_args, got_envs, _) = img.decode();
+        assert_eq!(argc, args.len());
+        assert_eq!(got_args.len(), args.len());
+        assert_eq!(got_args[args.len() - 1], args[args.len() - 1]);
+        assert_eq!(got_envs.len(), envs.len());
+    }
+
+    #[test]
+    fn an_empty_freebsd_argument_list_builds_a_stack_instead_of_panicking() {
+        // `push_at` indexed `args[0]` for `AT_EXECFN` and panicked the kernel
+        // on an empty argv; this builder takes the path from the loader
+        // instead, so it never could. Say so, because the next entry somebody
+        // adds here is as likely to reach for `args[0]`.
+        let img = Image::of(&[], &[]);
+
+        let (argc, args, envs, _) = img.decode();
+
+        assert_eq!((argc, args.len(), envs.len()), (0, 0, 0));
+        let ps = img.aux(fbsd_at::AT_PS_STRINGS).unwrap();
+        assert_eq!(img.word(ps + 8), 0, "nargv");
+        assert_eq!(
+            img.word(ps + 16),
+            img.sp + 16,
+            "envp starts past argc and the argv NULL"
+        );
+    }
 }
