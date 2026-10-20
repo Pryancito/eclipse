@@ -548,4 +548,236 @@ mod tests {
         );
         assert!(TIMEOUT.as_secs() > 0, "un plazo de cero no espera nada");
     }
+
+    /// A socket that answers the four things `connect` asks of a bus and then
+    /// hands the stream to the test: the leading NUL and AUTH line, the OK
+    /// line, AGREE_UNIX_FD, and a reply to Hello.
+    ///
+    /// The auth phase is TEXT, so a bus that answers something NEARLY right --
+    /// `OKAY`, `AGREE_UNIX_FDX` -- is exactly what a real daemon cannot be
+    /// asked to answer, and it is where this client decides whether it is
+    /// talking to a bus at all. Past the handshake the test writes the bytes
+    /// itself, which is the only way to put half a message on the wire or to
+    /// answer a call out of order.
+    fn fake_bus<F>(ok: &str, agree: &str, after: F) -> String
+    where
+        F: FnOnce(&mut UnixStream) + Send + 'static,
+    {
+        let path = format!(
+            "/tmp/eclipse-dbusd-fake-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let (ok, agree) = (ok.to_string(), agree.to_string());
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let mut scratch = [0u8; 512];
+            // The NUL and the AUTH line arrive together.
+            let _ = s.read(&mut scratch);
+            let _ = s.write_all(ok.as_bytes());
+            let _ = s.read(&mut scratch); // NEGOTIATE_UNIX_FD
+            let _ = s.write_all(agree.as_bytes());
+            let _ = s.read(&mut scratch); // BEGIN, and maybe the Hello call
+                                          // Hello is always serial 1, because `send` counts up from zero.
+            let mut call = Message::method_call(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "Hello",
+            );
+            call.serial = 1;
+            let mut hello = Message::method_return(&call);
+            hello.serial = 1;
+            hello.set_body(&[Arg::Str(":1.7".into())]);
+            let _ = s.write_all(&hello.encode());
+            after(&mut s);
+            // Hold the socket open a moment: a close is a message of its own
+            // and only the test that wants one should send it.
+            std::thread::sleep(Duration::from_millis(1500));
+        });
+        path
+    }
+
+    #[test]
+    fn a_bus_that_nearly_says_ok_is_not_a_bus() {
+        // `OKAY-but-not-ok` is not `OK `, and `AGREE_UNIX_FDX` is not
+        // `AGREE_UNIX_FD`. These are SASL keywords, so a prefix match would
+        // take a strange server's word for it and then start speaking binary
+        // D-Bus at something that never agreed to listen.
+        let path = fake_bus("OKAY-but-not-ok\r\n", "AGREE_UNIX_FD\r\n", |_| {});
+        let e = Client::connect(&path).err().expect("OKAY no es OK");
+        assert!(e.contains("auth rejected"), "{e:?}");
+        let _ = std::fs::remove_file(&path);
+
+        let path = fake_bus("OK 1234\r\n", "AGREE_UNIX_FDX\r\n", |_| {});
+        let e = Client::connect(&path)
+            .err()
+            .expect("AGREE_UNIX_FDX no es AGREE_UNIX_FD");
+        assert!(e.contains("AGREE_UNIX_FD"), "{e:?}");
+        let _ = std::fs::remove_file(&path);
+
+        // And the handshake this same fake bus CAN complete, so the two above
+        // are verdicts on the keyword and not on the harness.
+        let path = fake_bus("OK 1234\r\n", "AGREE_UNIX_FD\r\n", |_| {});
+        let c = Client::connect(&path).expect("connect");
+        assert_eq!(c.unique, ":1.7");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_message_split_across_two_reads_is_not_a_poll_error() {
+        // One `read` can bring half a message: the bus writes when it likes.
+        // Half a message is not a message, and it is not an error either -- a
+        // client that reported it as one would turn a slow write into a
+        // session that has to be rebuilt.
+        let sig = {
+            let mut m = Message::signal("/p", "org.ejemplo.Senal", "Mitad");
+            m.serial = 7;
+            m.set_body(&[Arg::Str("entera".into())]);
+            m.encode()
+        };
+        let half = sig.len() / 2;
+        let (head, tail) = (sig[..half].to_vec(), sig[half..].to_vec());
+        let path = fake_bus("OK 1234\r\n", "AGREE_UNIX_FD\r\n", move |s| {
+            // Late enough that `connect` has finished and the client's buffer
+            // is empty, so the half message arrives during the poll's OWN
+            // read. Written any earlier it lands in the read that `connect`
+            // makes for the Hello reply, and then the poll answers from the
+            // buffer and never gets to the part that decides this.
+            std::thread::sleep(Duration::from_millis(120));
+            let _ = s.write_all(&head);
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = s.write_all(&tail);
+        });
+        let mut c = Client::connect(&path).expect("connect");
+        assert!(
+            c.poll(Duration::from_millis(500))
+                .expect("media senal no es un error")
+                .is_none(),
+            "media senal no es una senal"
+        );
+        // And once it IS in the buffer, a poll that finds only half of it
+        // there says the same thing without touching the socket.
+        assert!(c
+            .poll(Duration::from_millis(5))
+            .expect("media senal guardada tampoco es un error")
+            .is_none());
+        // And it survives the split: what comes back is the whole of it and
+        // not the tail.
+        let m = c
+            .wait_for(|m| m.kind == MSG_SIGNAL)
+            .expect("la senal se perdio por el camino");
+        assert_eq!(m.arg0_str().as_deref(), Some("entera"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_short_poll_does_not_shorten_the_next_wait() {
+        // `poll` sets the socket's read timeout to its own few milliseconds.
+        // Without putting the long one back, the NEXT wait inherits them: a
+        // `call` that should wait ten seconds gives up in five milliseconds,
+        // and on the guest that reads as the bus not answering.
+        let path = fake_bus("OK 1234\r\n", "AGREE_UNIX_FD\r\n", |s| {
+            std::thread::sleep(Duration::from_millis(300));
+            let mut m = Message::signal("/p", "org.ejemplo.Senal", "Tarde");
+            m.serial = 9;
+            let _ = s.write_all(&m.encode());
+        });
+        let mut c = Client::connect(&path).expect("connect");
+        assert!(c.poll(Duration::from_millis(5)).expect("poll").is_none());
+        // The signal lands 300 ms later, which only a wait longer than the
+        // poll's five milliseconds can see.
+        let m = c.recv().expect("la espera larga se quedo con los 5 ms");
+        assert_eq!(m.member.as_deref(), Some("Tarde"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_reply_to_someone_elses_call_is_not_this_calls_answer() {
+        // A reply is matched by SERIAL. Taking the next reply that comes along
+        // is wrong whenever two are in flight -- another client's reply the
+        // bus routed here, or a late answer to a call that already timed out
+        // -- and the caller gets the answer to a question it never asked.
+        let path = fake_bus("OK 1234\r\n", "AGREE_UNIX_FD\r\n", |s| {
+            // A reply to serial 99, which nobody here is waiting for.
+            let mut other = Message::method_call("a", "/a", "a.I", "Otra");
+            other.serial = 99;
+            let mut stray = Message::method_return(&other);
+            stray.serial = 50;
+            stray.set_body(&[Arg::Str("de otro".into())]);
+            let _ = s.write_all(&stray.encode());
+            // Then the reply to the call this client is about to make, which
+            // is serial 2 because Hello was 1.
+            let mut mine = Message::method_call("a", "/a", "a.I", "Mia");
+            mine.serial = 2;
+            let mut reply = Message::method_return(&mine);
+            reply.serial = 51;
+            reply.set_body(&[Arg::Str("la mia".into())]);
+            let _ = s.write_all(&reply.encode());
+        });
+        let mut c = Client::connect(&path).expect("connect");
+        let r = c.call("a", "/a", "a.I", "Mia", &[]).expect("call");
+        assert_eq!(r.arg0_str().as_deref(), Some("la mia"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_bus_that_closes_the_connection_says_so() {
+        // A read of zero bytes is end of stream, not a quiet moment. Read as
+        // "nothing yet" it turns every wait into a spin until its deadline and
+        // then blames the timeout, which is the opposite of what happened: the
+        // bus is gone and the session has to be built again.
+        let path = fake_bus("OK 1234\r\n", "AGREE_UNIX_FD\r\n", |s| {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        });
+        let mut c = Client::connect(&path).expect("connect");
+        let e = c.recv().expect_err("un socket cerrado no es un mensaje");
+        assert!(e.contains("closed the connection"), "{e:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_name_that_is_taken_is_refused_and_never_queued() {
+        // DO_NOT_QUEUE is the flag that matters: a portal that queued would
+        // sit there owning nothing while every client talked to the other one,
+        // and would then become the owner later, in the middle of a session,
+        // without anybody asking for it.
+        let path = daemon();
+        let mut first = Client::connect(&path).expect("connect");
+        let mut second = Client::connect(&path).expect("connect 2");
+        assert!(first.request_name("org.ejemplo.Unico").expect("pedir 1"));
+        assert!(
+            !second.request_name("org.ejemplo.Unico").expect("pedir 2"),
+            "dos duenos primarios de un nombre"
+        );
+        // The refusal is not a queue: when the first owner lets the name go,
+        // the second does NOT inherit it.
+        first
+            .call(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "ReleaseName",
+                &[Arg::Str("org.ejemplo.Unico".into())],
+            )
+            .expect("ReleaseName");
+        let e = second
+            .call(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "GetNameOwner",
+                &[Arg::Str("org.ejemplo.Unico".into())],
+            )
+            .expect_err("el nombre se quedo en cola");
+        assert!(e.contains("NameHasNoOwner"), "{e:?}");
+        drop((first, second));
+        let _ = std::fs::remove_file(&path);
+    }
 }

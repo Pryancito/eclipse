@@ -222,4 +222,52 @@ mod tests {
         }
         assert_eq!(streamed.hex(), hex(&data));
     }
+
+    #[test]
+    fn the_digest_of_a_file_is_the_digest_of_its_bytes() {
+        // `hex_of_file` reads in 1 MiB chunks, so the sizes that matter are
+        // the ones around a chunk boundary: the last read is the short one,
+        // and hashing the whole buffer instead of the bytes it filled puts a
+        // megabyte of stale zeros into the digest of every file whose size is
+        // not a multiple of the chunk, which is every payload the installer
+        // verifies.
+        let dir = std::env::temp_dir();
+        for len in [0usize, 1, 4095, 1 << 20, (1 << 20) + 1, (3 << 20) + 7] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let path = dir.join(format!("xtask-sha256-{}-{len}.bin", std::process::id()));
+            std::fs::write(&path, &data).unwrap();
+            assert_eq!(hex_of_file(&path).unwrap(), hex(&data), "len {len}");
+            std::fs::remove_file(&path).unwrap();
+        }
+        // A file that is not there is an error, not the digest of nothing:
+        // the installer tells the two apart to decide whether to go on.
+        assert!(hex_of_file(&dir.join("xtask-sha256-no-existe")).is_err());
+    }
+
+    #[test]
+    fn the_sidecar_is_the_line_sha256sum_reads_back() {
+        // `install-eclipse` reads the first field and a person reads the whole
+        // line with `sha256sum -c`, which wants exactly two spaces, the BARE
+        // file name and a trailing newline. Nothing ever read this file back,
+        // so all four could be wrong at once -- and a sidecar under the wrong
+        // NAME is the original bug: the installer does not find it and skips
+        // the check it was told to make.
+        let dir = std::env::temp_dir().join(format!("xtask-sidecar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = dir.join("rootfs.btrfs.gz");
+        let bytes = b"not really a payload";
+        std::fs::write(&payload, bytes).unwrap();
+        write_sidecar(&payload).unwrap();
+
+        let side = dir.join("rootfs.btrfs.gz.sha256");
+        assert!(side.exists(), "el instalador busca exactamente ese nombre");
+        let text = std::fs::read_to_string(&side).unwrap();
+        assert_eq!(text, format!("{}  rootfs.btrfs.gz\n", hex(bytes)));
+        // And each half of that line on its own, so a failure says which of
+        // the two moved.
+        let (digest, rest) = text.split_once("  ").expect("hacen falta DOS espacios");
+        assert_eq!(digest, hex(bytes));
+        assert_eq!(rest, "rootfs.btrfs.gz\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
