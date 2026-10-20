@@ -470,7 +470,7 @@ impl Syscall<'_> {
             Sys::MLOCKALL => self.sys_mlockall(a0),
             Sys::MUNLOCKALL => self.sys_munlockall(),
             Sys::MBIND => self.unimplemented("mbind", Err(LxError::ENOSYS)),
-            Sys::GET_MEMPOLICY => self.unimplemented("get_mempolicy", Err(LxError::ENOSYS)),
+            Sys::GET_MEMPOLICY => self.sys_get_mempolicy(a0.into(), a1.into(), a2, a3, a4),
             Sys::SET_MEMPOLICY => self.unimplemented("set_mempolicy", Err(LxError::ENOSYS)),
 
             // signal
