@@ -32,6 +32,9 @@ pub(crate) fn getcwd_into(cwd: &str, mut buf: UserOutPtr<u8>, len: usize) -> Sys
     Ok(with_nul)
 }
 
+/// Where `chdir` and `fchdir` leave a process.
+mod cwd;
+
 impl Syscall<'_> {
     /// return a null-terminated string containing an absolute pathname
     /// that is the current working directory of the calling process.
@@ -40,8 +43,11 @@ impl Syscall<'_> {
     pub fn sys_getcwd(&self, buf: UserOutPtr<u8>, len: usize) -> SysResult {
         info!("getcwd: buf={:?}, len={:#x}", buf, len);
         let proc = self.linux_process();
-        let cwd = proc.current_working_directory();
-        getcwd_into(&cwd, buf, len)
+        // `if (!d_unlinked(pwd.dentry)) ... else error = -ENOENT;`
+        if proc.working_directory_removed() {
+            return Err(LxError::ENOENT);
+        }
+        getcwd_into(&proc.current_working_directory(), buf, len)
     }
 
     /// Change the current directory.
@@ -57,7 +63,7 @@ impl Syscall<'_> {
             return Err(LxError::ENOTDIR);
         }
         proc.check_access(&info, 0o1, true)?;
-        proc.change_directory(path);
+        proc.change_directory(&cwd::physical_dir(proc, path));
         Ok(0)
     }
 
@@ -479,7 +485,7 @@ impl Syscall<'_> {
             return Err(LxError::ENOTDIR);
         }
         proc.check_access(&info, 0o1, true)?;
-        proc.change_directory(file.path());
+        proc.change_directory(&cwd::physical_dir(proc, file.path()));
         Ok(0)
     }
 

@@ -14,6 +14,8 @@ use zircon_object::task::{Job, Process, Status, Thread, ThreadState, ROOT_JOB};
 
 use crate::process::ProcessExt;
 
+#[cfg(test)]
+mod cwd_tests;
 /// `/proc/present`, in its own file: `procfs.rs` sits on the size ratchet.
 mod present;
 /// `/proc/<pid>/status`, in its own file for the same reason.
@@ -856,10 +858,10 @@ impl ProcPidDirINode {
         }
     }
 
-    fn entries() -> [&'static str; 14] {
+    fn entries() -> [&'static str; 16] {
         [
             ".", "..", "stat", "cmdline", "status", "perf", "maps", "fd", "comm", "environ",
-            "statm", "exe", "threads", "task",
+            "statm", "exe", "threads", "task", "cwd", "root",
         ]
     }
 }
@@ -975,6 +977,25 @@ impl INode for ProcPidDirINode {
                     .try_linux()
                     .map(|lp| lp.execute_path())
                     .unwrap_or_default();
+                Ok(Arc::new(super::pseudo::Pseudo::new(
+                    &path,
+                    FileType::SymLink,
+                )))
+            }
+            // The working directory and the root, which a process could not
+            // see of itself or another (`pwdx`, `lsof`). There is no
+            // `chroot`, so the root is everyone's.
+            "cwd" | "root" => {
+                self.check_read_innards()?;
+                let proc = self.process().ok_or(FsError::EntryNotFound)?;
+                // A zombie has neither (`exit_fs`).
+                if let Status::Exited(_) = proc.status() {
+                    return Err(FsError::EntryNotFound);
+                }
+                let path = match (name, proc.try_linux()) {
+                    ("cwd", Some(lp)) => lp.working_directory_link(),
+                    _ => String::from("/"),
+                };
                 Ok(Arc::new(super::pseudo::Pseudo::new(
                     &path,
                     FileType::SymLink,

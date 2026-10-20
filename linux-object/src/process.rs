@@ -37,6 +37,7 @@ use zircon_object::{
 /// The file-descriptor table's allocator and its two range sweeps.
 mod census;
 mod child_usage;
+mod cwd;
 mod orphan_group;
 pub use census::*;
 use child_usage::child_cpu;
