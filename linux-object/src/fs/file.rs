@@ -110,6 +110,15 @@ impl OpenFlags {
     pub fn close_on_exec(self) -> bool {
         self.contains(Self::CLOEXEC)
     }
+    /// The flags as `F_GETFL` and `/proc/<pid>/fdinfo` report them: without
+    /// the ones that only mattered while opening. `build_open_flags` strips
+    /// `O_CLOEXEC` and `do_dentry_open` strips `O_CREAT|O_EXCL|O_NOCTTY|O_TRUNC`
+    /// before they reach `f_flags`. Here they stay in the stored flags (the
+    /// `O_CLOEXEC` record seeds the descriptor's bit), so `F_GETFL` reported
+    /// them all and a `F_GETFL == O_RDONLY` test on an `O_CLOEXEC` open failed.
+    pub fn status(self) -> Self {
+        self - (Self::CREATE | Self::EXCLUSIVE | Self::NOCTTY | Self::TRUNCATE | Self::CLOEXEC)
+    }
     /// The bits `fcntl(F_SETFL)` may change: `SETFL_MASK` in `fs/fcntl.c`,
     /// the status flags. The access mode, the creation flags and `O_CLOEXEC`
     /// (per descriptor, `F_SETFD`) are not among them. Linux's mask is

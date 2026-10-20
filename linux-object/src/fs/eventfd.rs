@@ -96,6 +96,17 @@ impl FileLike for EventFd {
         String::from("anon_inode:[eventfd]")
     }
 
+    /// `eventfd_show_fdinfo`: the count in hex, right-aligned in 16 columns,
+    /// the eventfd's id and whether it is a semaphore.
+    fn fdinfo(&self) -> String {
+        alloc::format!(
+            "eventfd-count: {:16x}\neventfd-id: {}\neventfd-semaphore: {}\n",
+            self.counter.load(Ordering::SeqCst),
+            self.id(),
+            self.semaphore as u8
+        )
+    }
+
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         self.flags.lock().take_settable(f);
         Ok(())

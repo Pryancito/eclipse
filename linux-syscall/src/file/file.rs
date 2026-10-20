@@ -2592,7 +2592,7 @@ impl Syscall<'_> {
                     proc.set_fd_cloexec(fd, (arg & 1) != 0)?;
                     Ok(0)
                 }
-                FcntlCmd::GETFL => Ok(file_like.flags().bits()),
+                FcntlCmd::GETFL => Ok(file_like.flags().status().bits()),
                 FcntlCmd::SETFL => {
                     // Only the status flags change (`SETFL_MASK`); the raw
                     // argument used to go in whole, so `F_SETFL(O_NONBLOCK)`

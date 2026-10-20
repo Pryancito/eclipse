@@ -9,6 +9,9 @@ use rcore_fs::vfs::*;
 use zircon_object::object::KernelObject;
 use zircon_object::task::Process;
 
+mod fdinfo;
+pub use fdinfo::ProcFdInfoDir;
+
 pub struct ProcSelfFdDir {
     pub process: Arc<Process>,
 }

@@ -809,6 +809,8 @@ pub(crate) const PID_INODE_SLOTS: usize = 16;
 pub(crate) const PID_FD_DIR_SLOT: usize = 10;
 /// Slot of `/proc/<pid>/task`.
 pub(crate) const PID_TASK_DIR_SLOT: usize = 11;
+/// Slot of `/proc/<pid>/fdinfo` (`proc_self/fdinfo.rs`).
+pub(crate) const PID_FDINFO_DIR_SLOT: usize = 13;
 
 pub(crate) fn pid_inode(pid: u64, slot: usize) -> usize {
     debug_assert!(slot < PID_INODE_SLOTS);
@@ -864,10 +866,10 @@ impl ProcPidDirINode {
         }
     }
 
-    fn entries() -> [&'static str; 17] {
+    fn entries() -> [&'static str; 18] {
         [
-            ".", "..", "stat", "cmdline", "status", "perf", "maps", "fd", "comm", "environ",
-            "statm", "exe", "threads", "task", "cwd", "root", "limits",
+            ".", "..", "stat", "cmdline", "status", "perf", "maps", "fd", "fdinfo", "comm",
+            "environ", "statm", "exe", "threads", "task", "cwd", "root", "limits",
         ]
     }
 }
@@ -902,8 +904,9 @@ impl INode for ProcPidDirINode {
             ctime: Timespec { sec: 0, nsec: 0 },
             type_: FileType::Dir,
             mode: 0o555,
-            // `.`, the name in `/proc`, and the `..` of `fd` and of `task`.
-            nlinks: 4,
+            // `.`, the name in `/proc`, and the `..` of `fd`, `fdinfo` and
+            // `task`.
+            nlinks: 5,
             uid: 0,
             gid: 0,
             rdev: 0,
@@ -953,6 +956,12 @@ impl INode for ProcPidDirINode {
             "fd" => {
                 self.check_read_innards()?;
                 Ok(Arc::new(super::proc_self::ProcSelfFdDir {
+                    process: self.process().ok_or(FsError::EntryNotFound)?,
+                }))
+            }
+            "fdinfo" => {
+                self.check_read_innards()?;
+                Ok(Arc::new(super::proc_self::ProcFdInfoDir {
                     process: self.process().ok_or(FsError::EntryNotFound)?,
                 }))
             }
@@ -2471,7 +2480,9 @@ enum ProcPidFileKind {
 
 impl ProcPidFileKind {
     /// The file's slot in its process's inode numbers (see `pid_inode`):
-    /// one per kind, none of them the directory's 0 or `PID_FD_DIR_SLOT`.
+    /// one per kind, none of them the directory's 0 or a subdirectory's.
+    /// `limits` had 10, which `fd` has, so the two were one file to
+    /// anything that compares by inode.
     fn slot(self) -> usize {
         match self {
             Self::Stat => 1,
@@ -2483,7 +2494,7 @@ impl ProcPidFileKind {
             Self::Environ => 7,
             Self::Statm => 8,
             Self::Threads => 9,
-            Self::Limits => 10,
+            Self::Limits => 12,
         }
     }
 }
@@ -4771,26 +4782,20 @@ mod proc_inode_tests {
 
     #[test]
     fn a_process_s_directory_and_each_file_under_it_are_distinct_inodes() {
-        let kinds = [
-            ProcPidFileKind::Stat,
-            ProcPidFileKind::Cmdline,
-            ProcPidFileKind::Status,
-            ProcPidFileKind::Perf,
-            ProcPidFileKind::Maps,
-            ProcPidFileKind::Comm,
-            ProcPidFileKind::Environ,
-            ProcPidFileKind::Statm,
-            ProcPidFileKind::Threads,
-        ];
-        let inodes_of = |pid: u64| -> Vec<usize> {
-            let mut v = alloc::vec![ProcPidDirINode { pid }.metadata().unwrap().inode];
-            v.extend(
-                kinds
-                    .iter()
-                    .map(|&kind| ProcPidFileINode { pid, kind }.metadata().unwrap().inode),
-            );
-            v.push(pid_inode(pid, PID_FD_DIR_SLOT));
-            v
+        // Every entry the directory lists, looked up by its name, so none can
+        // be left out: the list was written by hand, `limits` was not on it,
+        // and it had the inode of `fd`. `..` is `/proc`, and the links (`exe`,
+        // `cwd`, `root`) are inode 0 whoever's they are.
+        let inodes_of = |pid: u64| -> Vec<(&'static str, usize)> {
+            let dir = ProcPidDirINode { pid };
+            ProcPidDirINode::entries()
+                .iter()
+                .filter(|&&name| name != "..")
+                .filter_map(|&name| {
+                    let m = dir.find(name).unwrap().metadata().unwrap();
+                    (m.type_ != FileType::SymLink).then_some((name, m.inode))
+                })
+                .collect()
         };
         // The files answer `metadata` from the process, so it must exist.
         let pids = [4601u64, 4607, 4661];
@@ -4809,15 +4814,11 @@ mod proc_inode_tests {
             .collect();
         let mut all: Vec<(String, usize)> = Vec::new();
         for pid in pids {
-            for (i, inode) in inodes_of(pid).into_iter().enumerate() {
-                assert!(
-                    inode >= PID_INODE_BASE,
-                    "pid {} slot {} at {}",
-                    pid,
-                    i,
-                    inode
-                );
-                all.push((alloc::format!("{}/{}", pid, i), inode));
+            let inodes = inodes_of(pid);
+            assert!(inodes.iter().any(|&(name, _)| name == "fdinfo"));
+            for (name, inode) in inodes {
+                assert!(inode >= PID_INODE_BASE, "{}/{} at {}", pid, name, inode);
+                all.push((alloc::format!("{}/{}", pid, name), inode));
             }
         }
         assert_eq!(duplicates(&all), Vec::new());

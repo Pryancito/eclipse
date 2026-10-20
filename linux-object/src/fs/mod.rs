@@ -501,7 +501,8 @@ pub fn new_memfd(name: &str, flags: usize) -> LxResult<Arc<File>> {
         }
     }
 
-    let mut open_flags = OpenFlags::RDWR;
+    // `memfd_create` sets `O_LARGEFILE` on the file itself, as `open` does.
+    let mut open_flags = OpenFlags::RDWR | OpenFlags::LARGEFILE;
     if flags & MFD_CLOEXEC != 0 {
         open_flags |= OpenFlags::CLOEXEC;
     }
@@ -858,6 +859,11 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     /// anonymous object answer with their own.
     fn link_name(&self) -> String {
         proc_self::default_link_name(self.metadata(), self.type_name())
+    }
+    /// What `/proc/<pid>/fdinfo/N` prints after `pos`, `flags`, `mnt_id` and
+    /// `ino`: each kind's `show_fdinfo`. Nothing, for one that has none.
+    fn fdinfo(&self) -> String {
+        String::new()
     }
     /// Set open flags.
     fn set_flags(&self, f: OpenFlags) -> LxResult;

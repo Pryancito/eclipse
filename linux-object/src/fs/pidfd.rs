@@ -66,6 +66,15 @@ impl FileLike for PidFd {
         String::from("anon_inode:[pidfd]")
     }
 
+    /// `pidfd_show_fdinfo`: the pid, a zombie's included, and -1 once a
+    /// `wait` has reaped it and the pid names nothing.
+    fn fdinfo(&self) -> String {
+        use crate::process::ProcessExt;
+        let reaped = self.process.try_linux().is_some_and(|l| l.is_reaped());
+        let pid = if reaped { -1 } else { self.process.id() as i64 };
+        alloc::format!("Pid:\t{pid}\nNSpid:\t{pid}\n")
+    }
+
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         // Same trap as eventfd/epoll before `take_settable`: copying only
         // NON_BLOCK/CLOEXEC made `fcntl(F_SETFL, O_ASYNC)` "succeed" while

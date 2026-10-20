@@ -267,6 +267,15 @@ pub(crate) fn open_flags(flags: usize) -> Result<OpenFlags, LxError> {
     Ok(path_open_flags(OpenFlags::from_bits_truncate(flags)))
 }
 
+/// What `open`/`openat` keep of a flag word: [`open_flags`], plus the
+/// `O_LARGEFILE` that `build_open_how` adds on every 64-bit kernel
+/// (`force_o_largefile`), which `O_PATH` then takes away again with the
+/// rest. glibc and musl never pass it, so `F_GETFL` of every open file said
+/// it was missing, where Linux 6.18 reports `0100000` for an `O_RDONLY` one.
+fn openat_flags(flags: usize) -> Result<OpenFlags, LxError> {
+    open_flags(flags | OpenFlags::LARGEFILE.bits())
+}
+
 /// `build_open_flags`: under `O_PATH` the kernel keeps `O_DIRECTORY`,
 /// `O_NOFOLLOW` and `O_CLOEXEC` and **drops every other bit**, the access
 /// mode among them.
@@ -418,7 +427,7 @@ impl Syscall<'_> {
         } else {
             path
         };
-        let flags = open_flags(flags)?;
+        let flags = openat_flags(flags)?;
         info!(
             "openat: dir_fd={:?}, path={:?}, flags={:?}, mode={:#o}",
             dir_fd, path, flags, mode

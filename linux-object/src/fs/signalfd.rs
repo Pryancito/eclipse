@@ -267,6 +267,12 @@ impl FileLike for SignalFd {
         String::from("anon_inode:[signalfd]")
     }
 
+    /// `signalfd_show_fdinfo`: the signals it accepts, as `render_sigset_t`
+    /// writes a set (bit `sig - 1`, 16 hex digits).
+    fn fdinfo(&self) -> String {
+        alloc::format!("sigmask:\t{:016x}\n", self.mask.load(SeqCst))
+    }
+
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         self.flags.lock().take_settable(f);
         Ok(())
