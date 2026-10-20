@@ -251,4 +251,44 @@ mod tests {
         frames.clear();
         assert!(frames.take(0x7ff0_0d00).is_none());
     }
+
+    /// `execve` replaces the image every frame points into, so they all go,
+    /// not only the one a `sigreturn` would take next. Forgetting just the
+    /// innermost left the outer handler's frame behind, and the frame a
+    /// `sigreturn` of the NEW image takes when its stack pointer matches
+    /// nothing is the innermost one left: the thread would have gone back to
+    /// an address of the replaced image, with its registers. The test above
+    /// says `clear` empties the queue; this one says the thread's own way in
+    /// empties it too, which is the call `execve` makes.
+    #[test]
+    fn exec_forgets_the_outer_frames_too() {
+        let t = a_thread();
+        t.backup_context(at(0x40_1000), 0, 0, 0x7ff0_0d00);
+        t.backup_context(at(0x40_2000), 0, 0, 0x7ff0_0900);
+
+        t.forget_backup_contexts();
+
+        assert!(
+            t.fetch_backup_context(0x7ff0_0d00).is_none(),
+            "the outer handler's frame survived the exec"
+        );
+        assert!(t.fetch_backup_context(0x7ff0_0900).is_none());
+    }
+
+    /// The two user addresses a frame carries come back the way they went in.
+    /// They are not interchangeable: the `ucontext_t` is where `sigreturn`
+    /// reads the mask to restore, and the `siginfo_t` is what a handler with
+    /// `SA_SIGINFO` was handed, so swapping them restores a mask read out of
+    /// the wrong structure. [`SignalFrames`] keeps them apart; this says the
+    /// thread's own way in and out does too, and the tests that go through the
+    /// thread all passed zeros for both.
+    #[test]
+    fn a_threads_frame_keeps_the_two_addresses_apart() {
+        let t = a_thread();
+        t.backup_context(at(0x40_1000), 0x7ff0_0f00, 0x7ff0_0e00, 0x7ff0_0d00);
+
+        let (_, siginfo, uctx) = t.fetch_backup_context(0x7ff0_0d00).unwrap();
+
+        assert_eq!((siginfo, uctx), (0x7ff0_0f00, 0x7ff0_0e00));
+    }
 }

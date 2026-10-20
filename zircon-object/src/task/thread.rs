@@ -2217,6 +2217,30 @@ mod tests {
         );
     }
 
+    /// A thread already `Dead` is not made `Dying` again by a kill that
+    /// arrives after it. `Process::exit` kills every thread on its list and a
+    /// thread leaves that list on its own way out, so a kill landing on a dead
+    /// thread is an ordinary race rather than a bug. What the early return
+    /// buys is that [`Thread::state`] never goes backwards: a thread that has
+    /// already handed its clocks to its process and dropped its signals would
+    /// otherwise publish `Dying` again, and `zx_object_get_info` and
+    /// `/proc/<pid>/task` read that word.
+    #[test]
+    fn killing_a_thread_that_is_already_dead_leaves_it_dead() {
+        let proc = Process::create(&Job::root(), "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+        thread.terminate_abandoned();
+        assert_eq!(
+            thread.state(),
+            ThreadState::Dead,
+            "the case this test is about"
+        );
+
+        thread.kill();
+
+        assert_eq!(thread.state(), ThreadState::Dead);
+    }
+
     #[test]
     fn resuming_a_thread_wakes_it_with_its_own_lock_let_go() {
         use core::sync::atomic::Ordering;
@@ -2515,6 +2539,38 @@ mod tests {
             thread.with_context(|ctx| ctx.get_field(UserContextField::InstrPointer)),
             Ok(0xdead),
             "the refused start rewrote the registers anyway"
+        );
+        thread.resume();
+        terminated(&thread).await;
+    }
+
+    /// And the start that DOES take writes them. The test above says the
+    /// refused start leaves the registers alone, which stays true if `setup`
+    /// writes nothing at all: the entry point, the stack and the two arguments
+    /// of `zx_thread_start` all go in through that closure, so the thread
+    /// would have started on whatever its context already held.
+    #[async_std::test]
+    async fn the_start_that_takes_writes_the_registers() {
+        async fn body(thread: CurrentThread) {
+            let cx = thread.wait_for_run().await;
+            thread.put_context(cx);
+        }
+        let proc = Process::create(&Job::root(), "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+        // Suspended, so the context stays home for us to read it.
+        thread.suspend();
+
+        thread
+            .start_with(
+                |ctx| ctx.set_field(UserContextField::InstrPointer, 0x40_1000),
+                |thread| Box::pin(body(thread)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            thread.with_context(|ctx| ctx.get_field(UserContextField::InstrPointer)),
+            Ok(0x40_1000),
+            "the start that took did not write the thread's own context"
         );
         thread.resume();
         terminated(&thread).await;
