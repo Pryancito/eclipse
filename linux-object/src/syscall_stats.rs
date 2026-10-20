@@ -275,6 +275,7 @@ mod tests {
 
     use super::*;
     use alloc::vec::Vec;
+    use core::sync::atomic::AtomicBool;
 
     /// Pids the `benches` module in this file records under. They write to
     /// the same static table, `cargo test` runs a `#[bench]` once each, and
@@ -283,7 +284,34 @@ mod tests {
     /// them rather than hoping.
     const BENCH_PIDS: &[u64] = &[1, 900, 901, 902];
 
-    /// `n` pids whose slots are distinct and clear of the bench pids.
+    /// Pids a test writes by name instead of asking for one, whose slots are
+    /// off the table for the same reason as the bench pids'. Pid 0 is
+    /// `an_untouched_slot_is_not_reported_but_a_zero_entry_is`'s, which has
+    /// to write the one word where every field is zero.
+    const NAMED_PIDS: &[u64] = &[0];
+
+    /// One flag per slot of [`TRACE`], set by the test that was handed a pid
+    /// landing in it.
+    ///
+    /// [`unclaimed_pids`] used to answer **the same pids to every caller**:
+    /// the scan starts at a fixed number and the slot mix is a pure
+    /// function, so ten tests asking for a pid each were handed pid 500000
+    /// ten times over. They write to one global table and the suite runs in
+    /// parallel, so they overwrote each other's entry -- and
+    /// `a_dead_process_stops_being_named` calls `forget` on its pid, which
+    /// made another test's entry vanish outright. That was 16 red runs in 30
+    /// of `cargo test -p linux-object --lib syscall_stats -- --test-threads=16`,
+    /// naming a different test each time and none of them broken: the
+    /// shape of a suite whose tests share global state rather than of a bug
+    /// in what they test.
+    ///
+    /// A slot is claimed for the rest of the process. The tests are the only
+    /// claimants and there are fewer than a tenth of [`TRACE_LEN`] of them,
+    /// so there is nothing to reclaim for -- and a slot handed back could be
+    /// handed straight to a test still reading it.
+    static CLAIMED: [AtomicBool; TRACE_LEN] = [const { AtomicBool::new(false) }; TRACE_LEN];
+
+    /// `n` pids whose slots belong to this caller alone.
     ///
     /// Bounded, and that is not decoration: the first version searched `while
     /// out.len() < n`, and a mutation that made every pid hash to the same
@@ -291,29 +319,55 @@ mod tests {
     /// as a hang rather than as a failure, which in CI is a job that burns
     /// its whole timeout and names nothing. A helper that cannot find what it
     /// needs says so.
+    ///
+    /// The claim is also what keeps one call's `n` pids in distinct slots,
+    /// which this used to do with a list of its own.
     fn unclaimed_pids(n: usize) -> Vec<u64> {
-        let mut taken: Vec<usize> = BENCH_PIDS.iter().map(|p| trace_slot(*p)).collect();
+        let spoken_for: Vec<usize> = BENCH_PIDS
+            .iter()
+            .chain(NAMED_PIDS)
+            .map(|p| trace_slot(*p))
+            .collect();
         let mut out = Vec::new();
         for pid in 500_000u64..500_000 + (TRACE_LEN as u64 * 64) {
             if out.len() == n {
                 return out;
             }
             let slot = trace_slot(pid);
-            if !taken.contains(&slot) {
-                taken.push(slot);
+            if spoken_for.contains(&slot) {
+                continue;
+            }
+            if CLAIMED[slot]
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
                 out.push(pid);
             }
         }
         assert_eq!(
             out.len(),
             n,
-            "no {} pids with distinct slots in a range of {}: the slot mix \
-             is collapsing everything onto a few slots",
+            "no {} pids with slots of their own in a range of {}: either the \
+             slot mix is collapsing everything onto a few slots, or the tests \
+             have claimed more of the table than it holds",
             n,
             TRACE_LEN * 64
         );
         out
     }
+
+    /// Held by the tests that move [`BANK_MASK`], which is one word every CPU
+    /// reads.
+    ///
+    /// `every_bank_a_cpu_can_name_is_inside_the_array` walks the CPUs and
+    /// collects the banks they name;
+    /// `the_knob_collapses_every_cpu_onto_one_bank_and_back` sets the mask to
+    /// zero and puts it back. Side by side the walk sees the mask move under
+    /// it and reports CPUs sharing banks -- "64 CPUs share 43 banks between
+    /// them" is the knob being turned mid-walk, not a mask that folds. A
+    /// setting the whole machine shares can only be tested by one test at a
+    /// time.
+    static KNOB: spin::Mutex<()> = spin::Mutex::new(());
 
     fn last_call_of(pid: u64) -> Option<u32> {
         trace().into_iter().find(|(p, _)| *p == pid).map(|(_, n)| n)
@@ -446,6 +500,7 @@ mod tests {
     /// makes that true. `cpu_id()` is a `u8`, so it can say 200.
     #[test]
     fn every_bank_a_cpu_can_name_is_inside_the_array() {
+        let _knob = KNOB.lock();
         let was = banks_enabled();
         set_banks_enabled(true);
         for cpu in [0u8, 1, 63, 64, 200, 255] {
@@ -537,6 +592,7 @@ mod tests {
     /// bank per CPU. Both are a mask, so neither costs a branch.
     #[test]
     fn the_knob_collapses_every_cpu_onto_one_bank_and_back() {
+        let _knob = KNOB.lock();
         let was = banks_enabled();
         set_banks_enabled(false);
         assert!(!banks_enabled());
