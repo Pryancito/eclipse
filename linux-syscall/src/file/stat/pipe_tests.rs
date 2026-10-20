@@ -15,7 +15,7 @@ use zircon_object::task::{Process, ROOT_JOB};
 
 const O_WRONLY: usize = 1;
 
-fn a_process(pid: KoID) -> Arc<Process> {
+pub(super) fn a_process(pid: KoID) -> Arc<Process> {
     let lp = LinuxProcess::new(RamFS::new(), 0);
     Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "pipes", lp).unwrap()
 }
@@ -28,7 +28,7 @@ fn pipe(sys: &Syscall<'_>) -> (FileDesc, FileDesc) {
 }
 
 /// `(type and mode, ino, uid, gid, blksize)` of `fstat(fd)`.
-fn fstat(sys: &Syscall<'_>, fd: FileDesc) -> LxResult<(u32, u64, u32, u32, u64)> {
+pub(super) fn fstat(sys: &Syscall<'_>, fd: FileDesc) -> LxResult<(u32, u64, u32, u32, u64)> {
     // Room for a `Stat`, aligned for it; its fields are read back by offset.
     let mut st = [0u64; 32];
     assert!(core::mem::size_of::<Stat>() <= core::mem::size_of_val(&st));
@@ -46,7 +46,7 @@ fn fstat(sys: &Syscall<'_>, fd: FileDesc) -> LxResult<(u32, u64, u32, u32, u64)>
     ))
 }
 
-fn readlink(sys: &Syscall<'_>, path: &str) -> LxResult<String> {
+pub(super) fn readlink(sys: &Syscall<'_>, path: &str) -> LxResult<String> {
     let path = alloc::format!("{}\0", path);
     let mut buf = [0u8; 64];
     let n = sys.sys_readlinkat(
@@ -58,7 +58,7 @@ fn readlink(sys: &Syscall<'_>, path: &str) -> LxResult<String> {
     Ok(String::from(core::str::from_utf8(&buf[..n]).unwrap()))
 }
 
-fn fd_link(fd: FileDesc) -> String {
+pub(super) fn fd_link(fd: FileDesc) -> String {
     alloc::format!("/proc/self/fd/{}", i32::from(fd))
 }
 

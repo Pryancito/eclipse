@@ -929,8 +929,9 @@ impl Syscall<'_> {
             }
 
             if clone_flags.contains(CloneFlags::PIDFD) {
+                use linux_object::fs::OpenFlags;
                 let pidfd =
-                    linux_object::fs::PidFd::new(process, linux_object::fs::OpenFlags::CLOEXEC);
+                    linux_object::fs::PidFd::new(process, OpenFlags::CLOEXEC | OpenFlags::RDWR);
                 let fd = self.linux_process().add_file(pidfd)?;
                 // Taken back if the caller never gets the number. (Linux also
                 // unwinds the whole child here; this one is already forked, so

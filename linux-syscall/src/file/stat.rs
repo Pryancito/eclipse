@@ -541,6 +541,9 @@ mod nofollow_tests;
 #[cfg(test)]
 mod pipe_tests;
 
+#[cfg(test)]
+mod fd_link_tests;
+
 #[cfg(all(test, target_arch = "x86_64"))]
 mod abi_tests {
     use super::*;

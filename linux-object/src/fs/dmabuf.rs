@@ -214,6 +214,12 @@ impl FileLike for DmaBuf {
         *self.flags.lock()
     }
 
+    /// `dma_buf_dname`: `/dmabuf:` and the buffer's name, which nothing
+    /// here keeps (`DMA_BUF_SET_NAME` is checked and dropped).
+    fn link_name(&self) -> String {
+        String::from("/dmabuf:")
+    }
+
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         // Same trap as syncobj/epoll/perf before `take_settable`: a hardcoded
         // `flags()` plus a no-op `set_flags` made `fcntl(F_SETFL, O_NONBLOCK)`
@@ -393,6 +399,13 @@ mod tests {
         assert_eq!(block_on(fd.read(&mut buf)), Err(LxError::EINVAL));
         assert_eq!(fd.write(&[0u8; 8]), Err(LxError::EINVAL));
         assert_eq!(block_on(fd.read_at(0, &mut buf)), Err(LxError::EINVAL));
+    }
+
+    /// `/proc/<pid>/fd` names a dma-buf by `dma_buf_dname`.
+    #[test]
+    fn a_dmabuf_is_named_as_linux_names_it() {
+        let fd = DmaBuf::new(0, 4096, VmObject::new_paged(1));
+        assert_eq!(fd.link_name(), "/dmabuf:");
     }
 
     /// `fcntl(F_SETFL, O_NONBLOCK)` on a dma-buf fd used to return success

@@ -61,6 +61,11 @@ impl FileLike for PidFd {
         *self.open_flags.lock()
     }
 
+    /// pidfs keeps the name pidfds had as anonymous inodes (`pidfs_dname`).
+    fn link_name(&self) -> String {
+        String::from("anon_inode:[pidfd]")
+    }
+
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         // Same trap as eventfd/epoll before `take_settable`: copying only
         // NON_BLOCK/CLOEXEC made `fcntl(F_SETFL, O_ASYNC)` "succeed" while

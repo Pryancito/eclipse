@@ -262,6 +262,11 @@ impl FileLike for SignalFd {
         *self.flags.lock()
     }
 
+    /// `signalfd4`: `anon_inode_getfile("[signalfd]", ...)`.
+    fn link_name(&self) -> String {
+        String::from("anon_inode:[signalfd]")
+    }
+
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         self.flags.lock().take_settable(f);
         Ok(())

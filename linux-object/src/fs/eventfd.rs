@@ -8,9 +8,8 @@ use zircon_object::object::*;
 
 /// `EFD_SEMAPHORE`. It is bit 0 of the `eventfd2(2)` flags word, which
 /// `sys_eventfd2` funnels through `OpenFlags::from_bits_truncate` — where bit 0
-/// spells `WRONLY`. The two meanings coexist only because nothing checks
-/// `flags().readable()` on an anonymous fd; read the bit by this name so the
-/// overlap is visible to whoever changes either side.
+/// spells `WRONLY`. [`EventFd::new`] takes it out of the open flags, so the
+/// two meanings never meet in `F_GETFL` or in the mode of the fd's link.
 const EFD_SEMAPHORE: usize = 1;
 
 /// eventfd implementation
@@ -20,18 +19,26 @@ pub struct EventFd {
     eventbus: Arc<Mutex<EventBus>>,
     /// Behind a lock so `fcntl(F_SETFL)` can change it after creation.
     flags: Mutex<OpenFlags>,
+    semaphore: bool,
 }
 
 impl_kobject!(EventFd);
 
 impl EventFd {
-    /// create an eventfd
+    /// Create an eventfd from the `eventfd2` flags word. Its `EFD_SEMAPHORE`
+    /// is the counter's, not the file's: the file is open for reading and
+    /// writing, as `eventfd2` opens it, whatever the word says. Bit 0 used to
+    /// stay in the open flags, so `F_GETFL` of a semaphore eventfd said
+    /// `O_WRONLY`, and of any other `O_RDONLY`.
     pub fn new(initval: u32, flags: OpenFlags) -> Arc<Self> {
+        let semaphore = flags.bits() & EFD_SEMAPHORE != 0;
+        let flags = OpenFlags::from_bits_truncate(flags.bits() & !EFD_SEMAPHORE) | OpenFlags::RDWR;
         let fd = EventFd {
             base: KObjectBase::new(),
             counter: Arc::new(AtomicU64::new(initval as u64)),
             eventbus: EventBus::new(),
             flags: Mutex::new(flags),
+            semaphore,
         };
         // A non-zero initial value is already an event to deliver.
         fd.publish_readiness();
@@ -39,7 +46,7 @@ impl EventFd {
     }
 
     fn semaphore(&self) -> bool {
-        self.flags().bits() & EFD_SEMAPHORE != 0
+        self.semaphore
     }
 
     /// Publish readiness from the counter.
@@ -82,6 +89,11 @@ impl EventFd {
 impl FileLike for EventFd {
     fn flags(&self) -> OpenFlags {
         *self.flags.lock()
+    }
+
+    /// `eventfd2`: `anon_inode_getfile("[eventfd]", ...)`.
+    fn link_name(&self) -> String {
+        String::from("anon_inode:[eventfd]")
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {

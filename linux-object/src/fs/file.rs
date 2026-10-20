@@ -1309,6 +1309,16 @@ impl FileLike for File {
         File::metadata(self)
     }
 
+    /// The path it was opened by, with ` (deleted)` once no name is left
+    /// for it (`d_path` of an unlinked dentry): a file unlinked while it is
+    /// open, and a memfd, which no directory holds.
+    fn link_name(&self) -> String {
+        match self.inner.read().inode.metadata() {
+            Ok(m) if m.nlinks == 0 => alloc::format!("{} (deleted)", self.path),
+            _ => self.path.clone(),
+        }
+    }
+
     fn seek(&self, pos: SeekFrom) -> LxResult<u64> {
         // Delegate to the inherent offset-tracking seek (UFCS avoids recursing
         // into this trait method).

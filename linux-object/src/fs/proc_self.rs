@@ -1,4 +1,5 @@
 use crate::fs::pseudo::Pseudo;
+use crate::fs::FileLike;
 use crate::process::ProcessExt;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -74,11 +75,24 @@ impl INode for ProcSelfFdDir {
                     .process
                     .try_linux()
                     .ok_or(FsError::EntryNotFound)?
-                    .get_file(fd.into())
+                    .get_file_like(fd.into())
                     .map_err(|_| FsError::EntryNotFound)?;
-                Ok(Arc::new(Pseudo::new(file.path(), FileType::SymLink)))
+                Ok(Arc::new(FdLink::of(&*file)))
             }
         }
+    }
+    /// Each descriptor is listed as a link without being looked at, as
+    /// `proc_readfd_common` lists it. Looking would take the open file's
+    /// lock, and an open `/proc/self/fd` is one of its own entries: `getdents`
+    /// holds that lock for the whole call, so `ls -l /proc/self/fd` hung on
+    /// the directory's own descriptor.
+    fn get_entry_with_metadata(&self, id: usize) -> Result<(Metadata, String)> {
+        let name = self.get_entry(id)?;
+        let meta = match id {
+            0 | 1 => self.find(&name)?.metadata()?,
+            _ => Pseudo::new("", FileType::SymLink).metadata()?,
+        };
+        Ok((meta, name))
     }
     /// The listing opens with `.` and `..`, as every other directory of this
     /// tree does.
@@ -111,6 +125,100 @@ impl INode for ProcSelfFdDir {
         }
     }
 }
+
+/// The name of a descriptor that has none of its own: a socket's
+/// (`sock_d_dname`: `socket:[ino]`, by the `st_ino` that `fstat` reports),
+/// and anything else is named by its type.
+pub(crate) fn default_link_name(meta: crate::error::LxResult<Metadata>, kind: &str) -> String {
+    match meta {
+        Ok(m) if m.type_ == FileType::Socket => alloc::format!("socket:[{}]", m.inode),
+        _ => alloc::format!("anon_inode:[{}]", kind),
+    }
+}
+
+/// `/proc/<pid>/fd/N` as `lstat` and `readlink` see it: a link whose text
+/// is the descriptor's name, 64 bytes long whatever that name is, with
+/// `r-x` for reading and `-wx` for writing (`tid_fd_update_inode`), and no
+/// bit at all for an `O_PATH` descriptor.
+///
+/// Every descriptor that was not a `File` used to be missing here: a
+/// socket or an eventfd was in the listing, but its entry was `ENOENT`, so
+/// `ls -l /proc/<pid>/fd` printed an error for it and `lsof` could not tell
+/// what it was.
+pub struct FdLink {
+    name: String,
+    mode: u16,
+}
+
+impl FdLink {
+    pub fn of(file: &dyn FileLike) -> Self {
+        let flags = file.flags();
+        let read = if flags.readable() { 0o500 } else { 0 };
+        let write = if flags.writable() { 0o300 } else { 0 };
+        FdLink {
+            name: file.link_name(),
+            mode: read | write,
+        }
+    }
+}
+
+impl INode for FdLink {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        let rest = self.name.as_bytes().get(offset..).unwrap_or(&[]);
+        let len = rest.len().min(buf.len());
+        buf[..len].copy_from_slice(&rest[..len]);
+        Ok(len)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+            hangup: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(Metadata {
+            size: 64,
+            mode: self.mode,
+            ..Pseudo::new("", FileType::SymLink).metadata()?
+        })
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Where `/proc/<pid>/fd/N` leads when the descriptor is no file: to the
+/// object itself. `stat` through the link describes it as `fstat` does, and
+/// an `O_PATH` open takes hold of it; any other open is `ENXIO`, since
+/// neither a socket (`sock_no_open`) nor an anonymous inode can be opened
+/// again.
+pub struct FdObject(pub Arc<dyn FileLike>);
+
+impl INode for FdObject {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Err(FsError::NotSupported)
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        self.0.metadata().map_err(|_| FsError::NotSupported)
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod fd_link_tests;
 
 #[cfg(test)]
 mod proc_self_fd_tests {

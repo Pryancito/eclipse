@@ -10,7 +10,7 @@ use crate::outparams::{commit_and_report_old, hand_out_pair};
 use alloc::string::String;
 use alloc::sync::Arc;
 use linux_object::error::LxResult;
-use linux_object::fs::{SignalFd, TimerFd};
+use linux_object::fs::{FdObject, SignalFd, TimerFd};
 use linux_object::time::{timerfd_clock_base, TimeSpec};
 use rcore_fs::vfs::INode;
 
@@ -49,6 +49,12 @@ impl ITimerSpec {
 }
 
 fn prepare_open_inode(inode: Arc<dyn INode>) -> LxResult<Arc<dyn INode>> {
+    // A socket or an anonymous object reached through `/proc/<pid>/fd/N`
+    // has no open to call again: `sock_no_open` and the anonymous inodes
+    // answer `ENXIO`.
+    if inode.downcast_ref::<FdObject>().is_some() {
+        return Err(LxError::ENXIO);
+    }
     // `/dev/nvidiactl` and `/dev/nvidia<N>`: every open is its own RM file
     // (its clients are freed when it closes), and a GPU the RM never brought
     // up does not open at all.
@@ -288,7 +294,10 @@ impl Syscall<'_> {
         // the timer simply never fired.
         let clock = timerfd_clock_base(clockid)?;
         let open_flags = anon_fd_flags(flags, ANON_CLOEXEC | ANON_NONBLOCK)?;
-        let tfd = TimerFd::new(open_flags, clock);
+        // `O_RDWR`, as `anon_inode_getfile` is given for every anonymous
+        // object but inotify's: it is what `F_GETFL` reports and what the
+        // mode of the `/proc/<pid>/fd` link says.
+        let tfd = TimerFd::new(open_flags | OpenFlags::RDWR, clock);
         let fd = self.linux_process().add_file(tfd)?;
         Ok(fd.into())
     }
@@ -384,7 +393,7 @@ impl Syscall<'_> {
             sfd.set_mask(sigmask);
             return Ok(fd.into());
         }
-        let sfd = SignalFd::new(sigmask, open_flags);
+        let sfd = SignalFd::new(sigmask, open_flags | OpenFlags::RDWR);
         let new_fd = proc.add_file(sfd)?;
         Ok(new_fd.into())
     }
@@ -666,10 +675,14 @@ impl Syscall<'_> {
                 prepare_open_inode(inode)?
             };
             // A pipe reopened through `/proc/<pid>/fd/N` (or `/dev/stdin`) is
-            // the same pipe, under the same name.
-            let abs_path = match inode.downcast_ref::<Pipe>() {
-                Some(pipe) => pipe.link_name(),
-                None => proc.get_absolute_path(dir_fd, path)?,
+            // the same pipe, under the same name; so is the object an
+            // `O_PATH` open takes hold of through the link of a socket.
+            let abs_path = if let Some(pipe) = inode.downcast_ref::<Pipe>() {
+                pipe.link_name()
+            } else if let Some(object) = inode.downcast_ref::<FdObject>() {
+                object.0.link_name()
+            } else {
+                proc.get_absolute_path(dir_fd, path)?
             };
             let file = File::new(inode, flags, abs_path);
             let fd = proc.add_file(file)?;
@@ -1087,7 +1100,7 @@ impl Syscall<'_> {
         } else {
             pid
         };
-        let event = PerfEvent::new(&attr_bytes, pid, cpu, plan.open_flags);
+        let event = PerfEvent::new(&attr_bytes, pid, cpu, plan.open_flags | OpenFlags::RDWR);
         let fd = self.linux_process().add_file(event)?;
         Ok(fd.into())
     }
