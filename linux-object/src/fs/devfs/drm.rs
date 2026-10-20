@@ -1480,6 +1480,9 @@ pub struct DrmFileState {
     /// primary and the cursor were not planes, and would drive them as
     /// overlays.
     universal_planes: AtomicBool,
+    /// `drm_file.aspect_ratio_allowed`: set by `DRM_CLIENT_CAP_ASPECT_RATIO`.
+    /// Without it `GETCRTC` masks the aspect-ratio bits out of the mode.
+    aspect_ratio: AtomicBool,
     events: Mutex<VecDeque<Vec<u8>>>,
     eventbus: Arc<Mutex<EventBus>>,
     /// The nouveau GEM handles this open imported through `PRIME_FD_TO_HANDLE`
@@ -1506,6 +1509,7 @@ impl DrmFileState {
         let file = Arc::new(Self {
             atomic_client: AtomicBool::new(false),
             universal_planes: AtomicBool::new(false),
+            aspect_ratio: AtomicBool::new(false),
             events: Mutex::new(VecDeque::new()),
             eventbus: EventBus::new(),
             prime_imports: Mutex::new(Vec::new()),
@@ -1600,6 +1604,14 @@ impl DrmFileState {
 
     pub fn universal_planes(&self) -> bool {
         self.universal_planes.load(Ordering::Relaxed)
+    }
+
+    pub fn set_aspect_ratio(&self, on: bool) {
+        self.aspect_ratio.store(on, Ordering::Relaxed);
+    }
+
+    pub fn aspect_ratio(&self) -> bool {
+        self.aspect_ratio.load(Ordering::Relaxed)
     }
 
     pub fn eventbus(&self) -> Arc<Mutex<EventBus>> {
