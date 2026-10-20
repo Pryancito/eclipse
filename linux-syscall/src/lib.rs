@@ -192,6 +192,8 @@ mod abi;
 pub mod bsd;
 #[cfg(target_arch = "x86_64")]
 mod cuda_failures;
+#[cfg(test)]
+mod dispatch_tests;
 mod file;
 mod intarg;
 mod ipc;
