@@ -14,6 +14,8 @@ use zircon_object::task::{Job, Process, Status, Thread, ThreadState, ROOT_JOB};
 
 use crate::process::ProcessExt;
 
+/// `/proc/<pid>/cmdline` and `environ` out of the process's memory.
+mod arg_area;
 #[cfg(test)]
 mod comm_tests;
 #[cfg(test)]
@@ -2532,7 +2534,9 @@ impl ProcPidFileINode {
         let proc = crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
         Ok(match self.kind {
             ProcPidFileKind::Stat => proc_pid_stat(&proc).into_bytes(),
-            ProcPidFileKind::Cmdline => proc_pid_cmdline(&proc),
+            ProcPidFileKind::Cmdline => {
+                arg_area::read(&proc, false).unwrap_or_else(|| proc_pid_cmdline(&proc))
+            }
             ProcPidFileKind::Status => proc_pid_status(&proc).into_bytes(),
             ProcPidFileKind::Perf => match proc.try_linux() {
                 Some(lp) => crate::perf::proc_report(lp, self.pid).into_bytes(),
@@ -2541,17 +2545,14 @@ impl ProcPidFileINode {
             ProcPidFileKind::Maps => proc_pid_maps(&proc).into_bytes(),
             ProcPidFileKind::Comm => alloc::format!("{}\n", proc_comm(&proc)).into_bytes(),
             // NUL-separated KEY=VALUE list, exactly like cmdline's encoding.
-            ProcPidFileKind::Environ => match proc.try_linux() {
-                Some(lp) => {
-                    let mut out = Vec::new();
-                    for env in lp.environ() {
-                        out.extend_from_slice(env.as_bytes());
-                        out.push(0);
-                    }
-                    out
+            ProcPidFileKind::Environ => arg_area::read(&proc, true).unwrap_or_else(|| {
+                let mut out = Vec::new();
+                for env in proc.try_linux().map(|lp| lp.environ()).unwrap_or_default() {
+                    out.extend_from_slice(env.as_bytes());
+                    out.push(0);
                 }
-                None => Vec::new(),
-            },
+                out
+            }),
             ProcPidFileKind::Statm => proc_pid_statm(&proc).into_bytes(),
             ProcPidFileKind::Threads => proc_pid_threads(&proc).into_bytes(),
             ProcPidFileKind::Limits => proc

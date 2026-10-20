@@ -280,7 +280,7 @@ fn spawn(
     //调用zircon-object/src/task/thread.start设置好要执行的thread
     // Likewise, a malformed/incompatible ELF for the base program must fall
     // back rather than panic the kernel.
-    let (entry, sp, initial_brk, execute_path, abi) =
+    let (entry, sp, initial_brk, execute_path, abi, arg_area) =
         match loader.load(&proc.vmar(), &vmo, args.clone(), envs, path) {
             Ok(loaded) => loaded,
             Err(e) => {
@@ -294,6 +294,7 @@ fn spawn(
     proc.linux().set_abi(abi);
     proc.linux().set_execute_path(&execute_path);
     proc.linux().set_cmdline(args);
+    proc.linux().set_arg_area(arg_area);
     proc.linux().set_brk(initial_brk);
     proc.set_name(comm_from_path(&execute_path));
 

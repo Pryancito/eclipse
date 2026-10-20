@@ -34,6 +34,8 @@ use zircon_object::{
     ZxError, ZxResult,
 };
 
+/// Where a process's arguments and environment are in its own memory.
+mod arg_area;
 /// The file-descriptor table's allocator and its two range sweeps.
 mod census;
 mod child_usage;
@@ -1302,10 +1304,12 @@ pub struct LinuxProcess {
 struct LinuxProcessInner {
     /// Execute path
     execute_path: String,
-    /// argv as seen by userland (`/proc/<pid>/cmdline`)
+    /// argv as `execve` was handed it (`/proc/<pid>/cmdline` without an `arg_area`)
     cmdline: Vec<String>,
-    /// Environment as of the last `execve` (`/proc/<pid>/environ`)
+    /// Environment as of the last `execve` (`environ`, likewise)
     environ: Vec<String>,
+    /// Where the image keeps both of those in its memory.
+    arg_area: Option<crate::loader::ArgArea>,
     /// Current Working Directory
     ///
     /// Omit leading '/'.
@@ -4550,8 +4554,8 @@ impl LinuxProcessInner {
         // the credentials, the working directory, the process group and
         // session, `no_new_privs`, the resource limits, and the `setitimer`
         // interval timers, which setitimer(2) preserves across an exec.
-        // `brk`/`mapped_brk`, `environ`, `cmdline`, `execute_path` and `abi`
-        // are all overwritten by the caller from the new image.
+        // `brk`/`mapped_brk`, `environ`, `cmdline`, `arg_area`, `execute_path`
+        // and `abi` are all overwritten by the caller from the new image.
         old_attachments
     }
 
@@ -4570,6 +4574,7 @@ impl LinuxProcessInner {
             // and a fork copies that memory, so a child that has not exec'd
             // still reports the parent's environment.
             environ: self.environ.clone(),
+            arg_area: self.arg_area,
             current_working_directory: self.current_working_directory.clone(),
             files: self.files.clone(),
             // The child's table is a copy of the parent's, so the parent's

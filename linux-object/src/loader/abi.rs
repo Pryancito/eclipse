@@ -67,25 +67,40 @@ impl ProcInitInfo {
         writer.push_str(execfn);
         let execfn_ptr = writer.sp;
 
-        // 3. Environment strings
-        let env_ptrs: Vec<_> = self
+        // 3. Environment strings, then 4. argv strings, each list pushed in
+        // reverse so that it reads upwards in order, as Linux lays them out:
+        // `argv[0]` lowest, every string right after the one before it, and
+        // the environment right after the last argument. That block is what
+        // `/proc/<pid>/cmdline` and `environ` read back out of the process
+        // ([`ArgArea`]), and what `setproctitle` writes a title over.
+        let env_end = writer.sp;
+        let mut env_ptrs: Vec<_> = self
             .envs
             .iter()
+            .rev()
             .map(|arg| {
                 writer.push_str(arg.as_str());
                 writer.sp
             })
             .collect();
-
-        // 4. Argv strings
-        let arg_ptrs: Vec<_> = self
+        env_ptrs.reverse();
+        let env_start = writer.sp;
+        let mut arg_ptrs: Vec<_> = self
             .args
             .iter()
+            .rev()
             .map(|arg| {
                 writer.push_str(arg.as_str());
                 writer.sp
             })
             .collect();
+        arg_ptrs.reverse();
+        writer.arg_area = Some(ArgArea {
+            arg_start: writer.sp,
+            arg_end: env_start,
+            env_start,
+            env_end,
+        });
 
         // Now we prepare the pointer arrays (auxv, envp, argv, argc).
         // These must be contiguous and the final sp (at argc) must be 16-byte aligned.
@@ -137,6 +152,25 @@ impl ProcInitInfo {
     }
 }
 
+/// Where a new image's argument and environment strings sit in its memory:
+/// `mm->arg_start`, `arg_end`, `env_start` and `env_end`.
+///
+/// `/proc/<pid>/cmdline` and `environ` are read from these addresses, not
+/// from a copy kept at `execve`: a program that writes over its own `argv`
+/// (`setproctitle`, a daemon that hides a password it was given) is shown as
+/// it is now, and a `#!` script as the interpreter's argument vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ArgArea {
+    /// The first byte of `argv[0]`.
+    pub arg_start: usize,
+    /// One past the NUL of the last argument.
+    pub arg_end: usize,
+    /// The first byte of the first environment string.
+    pub env_start: usize,
+    /// One past the NUL of the last environment string.
+    pub env_end: usize,
+}
+
 /// program stack
 pub struct Stack {
     /// stack pointer
@@ -145,6 +179,8 @@ pub struct Stack {
     stack_top: usize,
     /// stack data buffer
     data: Vec<u8>,
+    /// Where `push_at` put the argument and environment strings.
+    arg_area: Option<ArgArea>,
 }
 
 impl Stack {
@@ -165,7 +201,14 @@ impl Stack {
             sp,
             stack_top: sp,
             data,
+            arg_area: None,
         }
+    }
+
+    /// Where the argument and environment strings are, when this image is
+    /// one `push_at` built.
+    pub fn arg_area(&self) -> Option<ArgArea> {
+        self.arg_area
     }
     /// push slice into stack
     #[allow(unsafe_code)]
@@ -592,6 +635,46 @@ mod initial_stack_tests {
         assert_eq!(argc, 3);
         assert_eq!(args, vec!["/bin/sh", "-c", "echo hola"]);
         assert_eq!(envs, vec!["PATH=/usr/bin", "HOME=/root"]);
+    }
+
+    #[test]
+    fn the_strings_read_upwards_in_order_and_the_area_says_where() {
+        // Linux's layout, which `/proc/<pid>/cmdline` and `setproctitle`
+        // both count on: `argv[0]` lowest, each string right after the one
+        // before, and the environment right after the last argument.
+        let info = ProcInitInfo {
+            args: vec!["/bin/sh".to_string(), "-c".to_string(), "ls".to_string()],
+            envs: vec!["A=1".to_string(), "BB=22".to_string()],
+            auxv: auxv_of(&[(AT_PAGESZ as u8, 4096)]),
+        };
+        let stack = info.push_at(TOP);
+        let img = Image {
+            sp: TOP - stack.len(),
+            bytes: stack.to_vec(),
+        };
+        let area = stack
+            .arg_area()
+            .expect("push_at says where the strings are");
+        assert_eq!(
+            img.bytes_at(area.arg_start, area.arg_end - area.arg_start),
+            b"/bin/sh\0-c\0ls\0"
+        );
+        assert_eq!(area.env_start, area.arg_end);
+        assert_eq!(
+            img.bytes_at(area.env_start, area.env_end - area.env_start),
+            b"A=1\0BB=22\0"
+        );
+        let argv = img.sp + 8;
+        let envp = argv + 4 * 8;
+        assert_eq!(
+            [img.word(argv), img.word(argv + 8), img.word(argv + 16)],
+            [area.arg_start, area.arg_start + 8, area.arg_start + 11]
+        );
+        assert_eq!(
+            [img.word(envp), img.word(envp + 8)],
+            [area.env_start, area.env_start + 4]
+        );
+        assert!(area.env_end <= TOP);
     }
 
     #[test]
