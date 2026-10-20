@@ -32,6 +32,22 @@ fn pidfd_open_flags(flags: u32) -> linux_object::error::LxResult<OpenFlags> {
     Ok(open_flags)
 }
 
+/// The process `pidfd_open(pid, 0)` gives a descriptor on.
+///
+/// A zombie too: its pidfd is readable at once, and `waitid(P_PIDFD)`
+/// collects it. A thread that is not its group's leader is there, but is not
+/// a process: `pidfd_prepare()` says `ENOENT` for it without `PIDFD_THREAD`
+/// (measured on Linux 6.18), where this said `ESRCH`, "no such process", to
+/// a caller that had just read the tid out of `/proc/<pid>/task`.
+fn pidfd_open_target(pid: KoID) -> LxResult<Arc<zircon_object::task::Process>> {
+    use linux_object::process::{find_task, process_of_thread};
+    match find_task(pid) {
+        Some(process) => Ok(process),
+        None if process_of_thread(pid).is_some() => Err(LxError::ENOENT),
+        None => Err(LxError::ESRCH),
+    }
+}
+
 /// What `pidfd_send_signal(2)` does with the `siginfo` it was handed.
 ///
 /// ```c
@@ -90,9 +106,7 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         let open_flags = pidfd_open_flags(flags)?;
-        // A zombie too: its pidfd is readable at once, and `waitid(P_PIDFD)`
-        // collects it.
-        let process = linux_object::process::find_task(pid as KoID).ok_or(LxError::ESRCH)?;
+        let process = pidfd_open_target(pid as KoID)?;
         let pidfd = PidFd::new(process, open_flags);
         let fd = self.linux_process().add_file(pidfd)?;
         Ok(fd.into())
@@ -237,6 +251,49 @@ mod pidfd_open_flag_tests {
         for bad in [1u32, 2, 4, OpenFlags::CLOEXEC.bits() as u32, 1 << 31] {
             assert_eq!(pidfd_open_flags(bad), Err(LxError::EINVAL), "flag {}", bad);
         }
+    }
+}
+
+/// Which pid `pidfd_open` refuses, and with what. Fixed pids in 49_0xx.
+#[cfg(test)]
+mod pidfd_open_target_tests {
+    use super::*;
+    use linux_object::thread::ThreadExt;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::{Thread, ROOT_JOB};
+
+    #[test]
+    fn a_process_is_found_by_its_pid() {
+        let proc = zircon_object::task::Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            49_001,
+            "p",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&pidfd_open_target(49_001).unwrap(), &proc));
+    }
+
+    #[test]
+    fn a_thread_that_is_not_the_leader_is_enoent() {
+        let proc = zircon_object::task::Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            49_002,
+            "p",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let leader = Thread::create_linux(&proc).unwrap();
+        let worker = Thread::create_linux(&proc).unwrap();
+        assert_eq!(leader.id(), 49_002);
+        assert_ne!(worker.id(), 49_002);
+        assert_eq!(pidfd_open_target(worker.id()).err(), Some(LxError::ENOENT));
+        assert!(Arc::ptr_eq(&pidfd_open_target(leader.id()).unwrap(), &proc));
+    }
+
+    #[test]
+    fn a_pid_nobody_has_is_esrch() {
+        assert_eq!(pidfd_open_target(49_099).err(), Some(LxError::ESRCH));
     }
 }
 

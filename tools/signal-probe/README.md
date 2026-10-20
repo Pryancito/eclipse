@@ -121,6 +121,12 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
     `TracerPid:`, `FDSize:`, `NSpid:`, las mascaras de señales, las
     capacidades, `NoNewPrivs:` y `Cpus_allowed_list:`, y un zombi seguia
     escribiendo `VmSize:` y `VmRSS:`.
+29. `execveat` respondia `ENOSYS`, y `fexecve`, que cae entonces a
+    `execve("/proc/self/fd/N")`, dejaba `/proc/self/exe` en
+    `/proc/self/fd/N` y `comm` en `N`. `/proc/self/exe` era el camino tal cual lo escribio quien llamo:
+    relativo tras `./prog`, y el del enlace tras un enlace; el `comm` de un
+    script era el de su interprete. Y `pidfd_open` de un hilo que no es el
+    lider decia `ESRCH` en vez de `ENOENT`.
 
 ## Compilar
 
@@ -174,5 +180,6 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `aslimit` | con `RLIMIT_AS` a 4 MiB por encima del `VmSize` de `/proc/self/status` (solo el blando, que vuelve al acabar): 2 MiB de `mmap` caben y 8 no (`ENOMEM`), ni un `malloc` de 16 MiB (`NULL`), ni un `brk` de 8 MiB (devuelve el de antes; uno de 64 KiB si), ni un `mremap` de 2 a 16 MiB, ni un `shmat` de 8 MiB; un `MAP_FIXED` sobre paginas ya mapeadas no suma, y lo que libera `munmap` se puede volver a mapear |
 | `nproc` | un hijo con un uid suyo (45399) y `RLIMIT_NPROC` blando a 4 bajo un duro de 6: el y tres hijos son cuatro y el siguiente `fork` da `EAGAIN`, y `pthread_create` tambien; un hijo muerto sin recoger sigue contando, y recogido deja sitio; subido el blando a 6, caben dos mas. Root, real o efectivo, hace `fork` con el limite a 0 |
 | `zombie` | un hijo muerto sin recoger, 40 veces porque cada vuelta es una carrera con su propio final: `kill` con SIGTERM y con 0 da 0, `getpgid` y `getsid` dan su grupo y su sesion, y recogido `kill(pid, 0)` da `ESRCH`. Un hermano, que no es su padre, lo encuentra igual; `/proc/<pid>/stat` dice `Z` y nuestro pid, `cmdline` esta vacio y `ls /proc` lo lista; `sigqueue` da 0; su pidfd esta listo al abrirlo, acepta una señal y `waitid(P_PIDFD)` lo recoge. Recogido, `/proc/<pid>` ya no esta y su pidfd y un `pidfd_open` nuevo dan `ESRCH` |
-| `kin` | con `PR_SET_NAME` a «jefe», un hilo nuevo y un hijo de `fork` se llaman «jefe»; el campo 38 de `/proc/self/stat` es SIGCHLD y el de `/proc/self/task/<otro hilo>/stat` es -1; y 20 veces, en cuanto el `exec` de un hijo cierra su tuberia close-on-exec, `setpgid` sobre el da `EACCES` |
+| `kin` | con `PR_SET_NAME` a «jefe», un hilo nuevo y un hijo de `fork` se llaman «jefe»; el campo 38 de `/proc/self/stat` es SIGCHLD y el de `/proc/self/task/<otro hilo>/stat` es -1; `pidfd_open` de ese otro hilo da `ENOENT`; y 20 veces, en cuanto el `exec` de un hijo cierra su tuberia close-on-exec, `setpgid` sobre el da `EACCES` |
 | `status` | `/proc/self/status` tiene las lineas de Linux en su orden, y dicen lo mismo que las llamadas: `Umask` tras `umask(027)` es `0027`, `TracerPid` 0, `FDSize` 256 con el fd 255 abierto, los `NS*` son `getpid`/`getpgid`/`getsid`, `SigPnd`/`ShdPnd`/`SigBlk`/`SigIgn`/`SigCgt` lo que se levanto, se mando, se bloqueo, se ignora y se captura, `SigQ` cuenta esas dos y su limite es `RLIMIT_SIGPENDING`, `CapEff`/`CapPrm`/`CapBnd` lo que dicen `capget` y `PR_CAPBSET_READ`, `NoNewPrivs` sigue al `prctl` y `Cpus_allowed` a la afinidad; el de un hilo es suyo, y el de un zombi no tiene `Umask` ni lineas `Vm` y tiene `FDSize` 0 |
+| `execat` | `execveat` ejecuta por un fd de directorio, por el propio fd (tambien `O_PATH` y close-on-exec), con camino absoluto y un `dirfd` que no existe, y `fexecve`; y niega con el errno de Linux: `""` sin `AT_EMPTY_PATH` `ENOENT`, un flag desconocido `EINVAL`, `AT_SYMLINK_NOFOLLOW` sobre un enlace o `/proc/self/exe` `ELOOP`, un fichero como `dirfd` `ENOTDIR`, un fd que no existe `EBADF`, un directorio, `AT_FDCWD` o un socket `EACCES`. `/proc/self/exe` es el fichero desde la raiz y sin enlaces tras `./prog`, `/proc/self/fd/N`, un enlace o un directorio enlazado; `comm` es el nombre que uso quien llamo (`link`, `N`), y el de un script el suyo y no el del interprete |

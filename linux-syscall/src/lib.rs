@@ -533,6 +533,10 @@ impl Syscall<'_> {
 
             // process
             Sys::EXECVE => self.sys_execve(a0.into(), a1.into(), a2.into()).await,
+            Sys::EXECVEAT => {
+                self.sys_execveat(a0.into(), a1.into(), a2.into(), a3.into(), a4)
+                    .await
+            }
             // clone3 is deliberately ENOSYS (pre-Linux-5.3 behaviour; glibc and
             // musl fall back to legacy clone cleanly). Root cause, found in the
             // QEMU desktop lab: glibc's __clone3 child stub starts with

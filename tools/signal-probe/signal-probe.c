@@ -178,14 +178,21 @@
 //              gone, however soon after the `waitpid`.
 //   kin        a new thread and a forked child carry their creator's name;
 //              stat field 38 is SIGCHLD, and -1 for a thread that is not
-//              the leader; a child whose exec closed its close-on-exec
-//              pipe is EACCES to its parent's setpgid, 20 times out of 20.
+//              the leader, which `pidfd_open` refuses with ENOENT; a child
+//              whose exec closed its close-on-exec pipe is EACCES to its
+//              parent's setpgid, 20 times out of 20.
 //   status     /proc/<pid>/status has Linux's lines in Linux's order, and they
 //              say what the syscalls say: Umask, FDSize (256 with fd 255
 //              open), the NS ids, the pending, blocked, ignored and caught
 //              signals, SigQ, the capability sets, NoNewPrivs, the CPUs. A
 //              thread's file is the thread's; a zombie's has no Umask, no Vm
 //              lines and an FDSize of 0.
+//   execat     `execveat` runs a file by a directory fd, by its own fd
+//              (`O_PATH` and close-on-exec too) and by `fexecve`, and refuses
+//              what Linux refuses with Linux's errno. `/proc/self/exe` is the
+//              file from the root through every link, after `./prog`,
+//              `/proc/self/fd/N` or a link; `comm` is the name the caller
+//              used, a script's own and not its interpreter's.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -217,6 +224,7 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/shm.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -2844,9 +2852,17 @@ static void sec_kin(void) {
     char path[64];
     snprintf(path, sizeof path, "/proc/self/task/%d/stat", (int)g_kin_tid);
     long theirs = stat_field(path, 38);
+    // That thread is there, but it is no process: without PIDFD_THREAD,
+    // `pidfd_open` says ENOENT for it, not "no such process".
+    errno = 0;
+    long pidfd = syscall(SYS_pidfd_open, g_kin_tid, 0);
+    int pidfd_err = errno;
+    if (pidfd >= 0) close((int)pidfd);
     g_kin_go = 1;
     pthread_join(t, NULL);
     check(theirs == -1, "a thread's stat field 38 is -1", "%ld", theirs);
+    check(pidfd == -1 && pidfd_err == ENOENT, "pidfd_open of a thread: ENOENT", "%s",
+          pidfd >= 0 ? "a pidfd" : strerror(pidfd_err));
 
     // The EOF of a close-on-exec pipe is how `posix_spawn` and Rust's
     // `Command` learn the exec happened; Linux clears PF_FORKNOEXEC before
@@ -3112,6 +3128,166 @@ static void sec_status(void) {
           "zombie %d, no Umask %d, no VmSize %d, FDSize 0 %d", zombie, no_umask, no_vm, fd0);
 }
 
+// ----------------------------------------------------------------- execat
+
+// The far side of `execat`: what this image is called, written to `fd` as
+// "exe\ncomm\n".
+static int whoami_report(int fd) {
+    char exe[PATH_MAX] = {0}, comm[32] = {0};
+    if (readlink("/proc/self/exe", exe, sizeof exe - 1) < 0) strcpy(exe, "?");
+    int c = open("/proc/self/comm", O_RDONLY);
+    ssize_t n = c >= 0 ? read(c, comm, sizeof comm - 1) : -1;
+    if (c >= 0) close(c);
+    if (n > 0 && comm[n - 1] == '\n') comm[n - 1] = 0;
+    dprintf(fd, "%s\n%s\n", exe, comm);
+    return 0;
+}
+
+enum exec_by { BY_EXECVEAT, BY_FEXECVE, BY_EXECVE };
+
+// What an exec did: refused with `err`, or ran an image that calls itself
+// `exe` and `comm`.
+struct who {
+    int err;
+    char exe[PATH_MAX];
+    char comm[32];
+};
+
+// Exec this probe as `--whoami` from a child, by `by`; the image it starts
+// writes its names into a pipe, and a refused exec writes its errno there.
+static struct who exec_who(enum exec_by by, int dirfd, const char *path, int flags) {
+    struct who w;
+    memset(&w, 0, sizeof w);
+    int p[2];
+    if (pipe(p)) {
+        w.err = -1;
+        return w;
+    }
+    pid_t c = fork();
+    if (c == 0) {
+        close(p[0]);
+        char fd[16];
+        snprintf(fd, sizeof fd, "%d", p[1]);
+        char *args[] = {"ea-who", "--whoami", fd, NULL};
+        if (by == BY_EXECVEAT)
+            syscall(SYS_execveat, dirfd, path, args, environ, flags);
+        else if (by == BY_FEXECVE)
+            fexecve(dirfd, args, environ);
+        else
+            execve(path, args, environ);
+        dprintf(p[1], "!%d\n", errno);
+        _exit(0);
+    }
+    close(p[1]);
+    char buf[sizeof w.exe];
+    size_t len = 0;
+    ssize_t n;
+    while (len < sizeof buf - 1 && (n = read(p[0], buf + len, sizeof buf - 1 - len)) > 0)
+        len += (size_t)n;
+    buf[len] = 0;
+    close(p[0]);
+    status_of(c);
+    char *nl = strchr(buf, '\n');
+    if (buf[0] == '!' || !nl) {
+        // No line at all: the image died before it could say anything.
+        w.err = buf[0] == '!' ? atoi(buf + 1) : -1;
+        return w;
+    }
+    *nl = 0;
+    memcpy(w.exe, buf, (size_t)(nl - buf) + 1);
+    nl[1 + strcspn(nl + 1, "\n")] = 0;
+    snprintf(w.comm, sizeof w.comm, "%s", nl + 1);
+    return w;
+}
+
+static void check_ran(struct who w, const char *exe, const char *comm, const char *what) {
+    check(w.err == 0 && strcmp(w.exe, exe) == 0 && strcmp(w.comm, comm) == 0, what,
+          w.err ? "refused: %s" : "exe %s, comm %s", w.err > 0 ? strerror(w.err) : w.exe,
+          w.comm);
+}
+
+static void check_refused(struct who w, int want, const char *what) {
+    check(w.err == want, what, "%s", w.err == 0 ? "it ran" : w.err > 0 ? strerror(w.err) : "died");
+}
+
+#define EA "/tmp/ea"
+
+static void sec_execat(void) {
+    // A copy of this probe where the section knows the whole path, a link
+    // to it, a link to its directory, and a script it interprets.
+    const char *prog = EA "/real/prog";
+    mkdir(EA, 0755);
+    mkdir(EA "/real", 0755);
+    unlink(prog);
+    int in = open("/proc/self/exe", O_RDONLY), out = open(prog, O_CREAT | O_WRONLY, 0755);
+    char chunk[65536];
+    ssize_t n;
+    while (in >= 0 && out >= 0 && (n = read(in, chunk, sizeof chunk)) > 0)
+        if (write(out, chunk, (size_t)n) != n) break;
+    close(in);
+    close(out);
+    unlink(EA "/link");
+    unlink(EA "/dlink");
+    if (symlink("real/prog", EA "/link") || symlink("real", EA "/dlink")) {
+        check(0, "execat setup", "symlink: %s", strerror(errno));
+        return;
+    }
+    const char script[] = "#!" EA "/link\n";
+    write_file(EA "/s.sh", script, sizeof script - 1, 0755);
+
+    int dir = open(EA "/real", O_RDONLY | O_DIRECTORY);
+    int fd = open(prog, O_RDONLY);
+    int path_fd = open(prog, O_PATH);
+    int cloexec_fd = open(prog, O_RDONLY | O_CLOEXEC);
+    check_ran(exec_who(BY_EXECVEAT, dir, "prog", 0), prog, "prog", "execveat(dirfd, \"prog\")");
+    check_ran(exec_who(BY_EXECVEAT, fd, "", AT_EMPTY_PATH), prog, "prog",
+              "execveat(fd, \"\", AT_EMPTY_PATH)");
+    check_ran(exec_who(BY_EXECVEAT, path_fd, "", AT_EMPTY_PATH), prog, "prog",
+              "... of an O_PATH fd");
+    check_ran(exec_who(BY_EXECVEAT, cloexec_fd, "", AT_EMPTY_PATH), prog, "prog",
+              "... of a close-on-exec fd");
+    check_ran(exec_who(BY_EXECVEAT, 999, prog, 0), prog, "prog",
+              "an absolute path ignores dirfd");
+    check_ran(exec_who(BY_FEXECVE, fd, NULL, 0), prog, "prog", "fexecve");
+    char magic[64], fd_name[16];
+    snprintf(magic, sizeof magic, "/proc/self/fd/%d", fd);
+    snprintf(fd_name, sizeof fd_name, "%d", fd);
+    check_ran(exec_who(BY_EXECVE, -1, magic, 0), prog, fd_name, "execve(\"/proc/self/fd/N\")");
+
+    // /proc/self/exe is the file, from the root and through no link; comm
+    // is cut from the name the caller used.
+    check_ran(exec_who(BY_EXECVE, -1, EA "/link", 0), prog, "link", "through a link: the file");
+    check_ran(exec_who(BY_EXECVE, -1, EA "/dlink/prog", 0), prog, "prog",
+              "through a linked directory");
+    if (chdir(EA "/real") == 0) {
+        check_ran(exec_who(BY_EXECVE, -1, "./prog", 0), prog, "prog",
+                  "execve(\"./prog\"): from the root");
+        if (chdir("/")) {
+        }
+    }
+    check_ran(exec_who(BY_EXECVE, -1, EA "/s.sh", 0), prog, "s.sh",
+              "a script: own comm, interpreter exe");
+
+    check_refused(exec_who(BY_EXECVEAT, fd, "", 0), ENOENT, "\"\" without AT_EMPTY_PATH: ENOENT");
+    check_refused(exec_who(BY_EXECVEAT, dir, "prog", 0x8000), EINVAL, "an unknown flag: EINVAL");
+    check_refused(exec_who(BY_EXECVEAT, AT_FDCWD, EA "/link", AT_SYMLINK_NOFOLLOW), ELOOP,
+                  "NOFOLLOW on a link: ELOOP");
+    check_refused(exec_who(BY_EXECVEAT, AT_FDCWD, "/proc/self/exe", AT_SYMLINK_NOFOLLOW), ELOOP,
+                  "NOFOLLOW on /proc/self/exe: ELOOP");
+    check_refused(exec_who(BY_EXECVEAT, fd, "x", 0), ENOTDIR, "a file as dirfd: ENOTDIR");
+    check_refused(exec_who(BY_EXECVEAT, 999, "prog", 0), EBADF, "no such dirfd: EBADF");
+    check_refused(exec_who(BY_EXECVEAT, 999, "", AT_EMPTY_PATH), EBADF,
+                  "no such fd, AT_EMPTY_PATH: EBADF");
+    check_refused(exec_who(BY_EXECVEAT, dir, "", AT_EMPTY_PATH), EACCES,
+                  "a directory's fd: EACCES");
+    check_refused(exec_who(BY_EXECVEAT, AT_FDCWD, "", AT_EMPTY_PATH), EACCES,
+                  "AT_FDCWD itself: EACCES");
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0)
+        check_refused(exec_who(BY_EXECVEAT, sv[0], "", AT_EMPTY_PATH), EACCES,
+                      "a socket's fd: EACCES");
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -3143,6 +3319,7 @@ static const struct {
     {"zombie", "a dead child is a pid until it is reaped, and not after", sec_zombie},
     {"kin", "what a new thread or child is named, and when its parent lets go", sec_kin},
     {"status", "/proc/<pid>/status: Linux's lines, with the task's own numbers", sec_status},
+    {"execat", "what execveat runs, and what an exec calls the program", sec_execat},
 };
 
 int main(int argc, char **argv) {
@@ -3153,6 +3330,9 @@ int main(int argc, char **argv) {
         return exec_report();
     }
     if (argc == 2 && strcmp(argv[1], "--exec-from-thread") == 0) return exec_from_thread_report();
+    // Last, after the script a `#!` line put in front of it.
+    if (argc >= 3 && strcmp(argv[argc - 2], "--whoami") == 0)
+        return whoami_report(atoi(argv[argc - 1]));
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
             only = argv[++i];

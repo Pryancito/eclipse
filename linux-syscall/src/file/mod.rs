@@ -28,5 +28,7 @@ pub(crate) use xattr::{XattrOp, XattrTarget};
 // `deny(warnings)`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) use self::dir::collect_dirents;
-use self::dir::{at_flags, AtFlags, FSTATAT_FLAGS, STATX_FLAGS};
+/// Shared with `execveat`, which takes the same `AT_*` word.
+pub(crate) use self::dir::{at_flags, AtFlags};
+use self::dir::{FSTATAT_FLAGS, STATX_FLAGS};
 pub(crate) use self::poll::poll_timeout_msecs;
