@@ -88,4 +88,6 @@ pub(super) fn check_exec_args(
 }
 
 #[cfg(test)]
+mod abi_tests;
+#[cfg(test)]
 mod tests;
