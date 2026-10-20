@@ -465,7 +465,7 @@ fn mm_initialize_leaves_its_own_open_alone() {
 fn deinitialize_succeeds_and_the_rest_is_enosys() {
     let open = uvm();
     assert_eq!(open.ioctl(cmd::DEINITIALIZE, 0, &plain()), Ok(0));
-    let unserved: Vec<u32> = vec![31, 35, 69, 72, 74, 2047, 0x3000_0003];
+    let unserved: Vec<u32> = vec![31, 35, 69, 71, 74, 2047, 0x3000_0003];
     for cmd in unserved {
         assert_eq!(
             open.ioctl(cmd, 0, &plain()),
