@@ -28,6 +28,10 @@ use zircon_object::task::{
 };
 use zircon_object::vm::USER_STACK_PAGES;
 
+/// `execveat(2)`, and how both execs find what they run.
+mod execveat;
+use execveat::exec_target;
+
 const P_ALL: i32 = 0;
 const P_PID: i32 = 1;
 const P_PGID: i32 = 2;
@@ -1321,6 +1325,18 @@ impl Syscall<'_> {
         argv: UserInPtr<UserInPtr<u8>>,
         envp: UserInPtr<UserInPtr<u8>>,
     ) -> SysResult {
+        self.exec_at(FileDesc::CWD, path, argv, envp, 0).await
+    }
+
+    /// `execve`, and `execveat` with its `dirfd` and `flags`.
+    async fn exec_at(
+        &mut self,
+        dirfd: FileDesc,
+        path: UserInPtr<u8>,
+        argv: UserInPtr<UserInPtr<u8>>,
+        envp: UserInPtr<UserInPtr<u8>>,
+        flags: usize,
+    ) -> SysResult {
         let path_str = path.as_c_str().inspect_err(|&e| {
             error!("execve: path.as_c_str() failed: {:?}", e);
         })?;
@@ -1397,7 +1413,10 @@ impl Syscall<'_> {
         // Fix: canonicalize the magic link NOW — the current execute_path is
         // by construction the real on-disk binary path — so the literal
         // "/proc/self/exe" is never stored.
-        let path_str = if path_str == "/proc/self/exe" {
+        // `AT_SYMLINK_NOFOLLOW` asks for the link itself, which is `ELOOP`.
+        let path_str = if path_str == "/proc/self/exe"
+            && flags & crate::file::AtFlags::SYMLINK_NOFOLLOW.bits() == 0
+        {
             let real = proc.execute_path();
             if real.is_empty() {
                 return Err(LxError::ENOENT);
@@ -1407,7 +1426,9 @@ impl Syscall<'_> {
             alloc::borrow::Cow::Borrowed(path_str)
         };
         let path_str: &str = &path_str;
-        let inode = proc.lookup_inode(path_str)?;
+        let target = exec_target(proc, dirfd, path_str, flags)?;
+        let inode = &target.inode;
+        let absolute = &target.absolute;
         let metadata = inode.metadata()?;
         proc.check_access(&metadata, 0o1, true)?;
         // `do_open_execat`: `if (!S_ISREG(...)) return -EACCES`. Root passes
@@ -1416,31 +1437,25 @@ impl Syscall<'_> {
         if metadata.type_ != rcore_fs::vfs::FileType::File {
             return Err(LxError::EACCES);
         }
-        // Both mount questions are asked of the same absolute path, because both
-        // are decided by which mount it is on, and the path the caller named is
-        // still in hand here.
-        let absolute = proc
-            .get_absolute_path(FileDesc::CWD, path_str)
-            .unwrap_or_else(|_| path_str.to_string());
+        // Both mount questions are asked of the file's own path, through every
+        // link (`ExecTarget::absolute`), because both are decided by which
+        // mount the file is on.
         // `do_open_execat`: `if (path_noexec(&file->f_path)) return -EACCES;`.
         // Before the `bprm` is built and long before the address space is
         // touched, so a refusal comes back to the caller as an ordinary errno.
         // `/proc` and `/sys` are mounted `noexec` here, and said so in
         // `/proc/mounts` the whole time executing from them worked fine.
         //
-        // Asked of the name, where Linux asks it of the resolved file's own
-        // mount. The two differ only for a symbolic link that crosses a mount
-        // boundary, and the one that matters is `/proc/self/exe`, which busybox
-        // re-executes for every applet: it is canonicalised to the real on-disk
-        // path above, before this line, so what gets asked about is the binary
-        // and not `/proc`. Were it asked here as written by the caller, every
-        // busybox applet would answer EACCES.
-        if linux_object::fs::path_is_noexec(&absolute) {
+        // Asked of the name as written, a name under `/proc` -- the
+        // `/proc/self/exe` busybox re-executes for every applet, `fexecve`'s
+        // `/proc/self/fd/N` -- would be judged by `/proc`'s mount, and the
+        // file it leads to is somewhere else.
+        if linux_object::fs::path_is_noexec(absolute) {
             return Err(LxError::EACCES);
         }
         // `mnt_may_suid(bprm->file->f_path.mnt)`: a set-user-ID bit on a file
         // that lives on a `nosuid` mount grants nothing.
-        let may_suid = !linux_object::fs::path_is_nosuid(&absolute);
+        let may_suid = !linux_object::fs::path_is_nosuid(absolute);
         let vmo = inode.read_as_vmo_cached()?;
 
         // Everything below `vmar.clear()` is past the point of no return: the
@@ -1454,7 +1469,7 @@ impl Syscall<'_> {
         // the instruction after the syscall. Linux draws the same line: the
         // `bprm` is fully built before `begin_new_exec` commits.
         let past_every_check = execve_preflight(
-            &inode,
+            inode,
             self.syscall_entry,
             proc.root_inode(),
             &proc.credentials(),
@@ -1493,7 +1508,7 @@ impl Syscall<'_> {
 
         // 注意！即将销毁旧应用程序的用户空间，现在将必要的信息拷贝到内核！
         // Notice! About to destroy the user space of the old application, now copy the necessary information into kernel!
-        let path_str = path_str.to_string();
+        let path_str = target.name.clone();
         // A `vfork` child runs in its parent's address space, and so does the
         // parent while that child has not exec'd: the new image goes into one
         // of this process's own, which leaves the other its program.
@@ -1549,6 +1564,7 @@ impl Syscall<'_> {
         // The new image may speak a different ABI than the caller (e.g. a Linux
         // shell exec'ing a FreeBSD binary); adopt the freshly-detected one.
         proc.set_abi(abi);
+        let (execute_path, comm) = target.identity(proc, execute_path);
         proc.set_execute_path(&execute_path);
         proc.set_cmdline(args);
         proc.set_environ(envs);
@@ -1573,17 +1589,19 @@ impl Syscall<'_> {
         // now, so one left armed delivers its signal to an image that never
         // asked for it. (`setitimer` timers survive, and are left alone.)
         crate::time::drop_posix_timers_of(self.zircon_process().id());
-        self.zircon_process()
-            .set_name(comm_from_path(&execute_path));
+        self.zircon_process().set_name(&comm);
         // And thread side: the alternate signal stack, the robust futex list,
         // the `set_tid_address` word and the in-handler state all name the
-        // image that `vmar.clear()` just destroyed, plus the comm override so
-        // /proc/<pid>/comm and PR_GET_NAME fall back to the new basename.
+        // image that `vmar.clear()` just destroyed; and the comm is the new
+        // name (`__set_task_comm(me, kbasename(bprm->filename))`), which a
+        // script or a link does not share with the file that runs, so the
+        // readers' fall-back to the executable's basename would not do.
         // try_lock_linux: PID 1 / init can re-exec (e.g. `exec`ing its real
         // payload) and may carry no LinuxThread ext; there is nothing to
         // forget in that case, so skip quietly instead of unwrap-panicking.
         if let Some(mut lt) = self.thread.try_lock_linux() {
             lt.reset_for_exec();
+            lt.comm = comm_from_user_bytes(comm.as_bytes());
         }
         self.thread.forget_backup_contexts();
         // hunter: a new image is now in place — re-apply any default syscall
