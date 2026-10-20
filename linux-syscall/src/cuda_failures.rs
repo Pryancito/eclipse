@@ -5,10 +5,11 @@
 //! `/proc/bootprofile`, but only on a kernel booted with that. So from the
 //! first UVM call a process makes, which libcuda makes in `cuInit`, every
 //! call of that process that fails is logged the first time it fails with
-//! that errno:
+//! that errno, and an ioctl the first time each command does:
 //!
 //! ```text
 //! [nvidia-uvm] pid 1086: mbind failed: ENOSYS (a0=0x7f0000000000 ...)
+//! [nvidia-uvm] pid 1086: ioctl failed: EINVAL (fd=11 cmd=0xc23046d7 ...)
 //! ```
 //!
 //! That is a line `dmesg | grep nvidia-uvm` shows beside UVM's own, and the
@@ -21,6 +22,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use lock::Mutex;
 use zircon_object::object::KoID;
 
+use crate::consts::SyscallType as Sys;
 use linux_object::error::LxError;
 
 /// Whether any process has made a UVM call yet.
@@ -30,8 +32,8 @@ static ANY: AtomicBool = AtomicBool::new(false);
 /// one that exited stays here naming nothing.
 static CALLERS: Mutex<BTreeSet<KoID>> = Mutex::new(BTreeSet::new());
 
-/// The failures logged so far: process, call, errno.
-static LOGGED: Mutex<BTreeSet<(KoID, u32, i32)>> = Mutex::new(BTreeSet::new());
+/// The failures logged so far: process, call, [`command`], errno.
+static LOGGED: Mutex<BTreeSet<(KoID, u32, u32, i32)>> = Mutex::new(BTreeSet::new());
 
 /// At most this many processes are followed, and this many lines logged, in
 /// one boot: a CUDA program that keeps failing, or a host that keeps
@@ -51,14 +53,21 @@ fn note(callers: &mut BTreeSet<KoID>, pid: KoID) {
     }
 }
 
-/// Call `num` of `pid` failed with `err`. Logged, with what it was asked
-/// (`detail`), when `pid` made a UVM call and the call has not failed with
-/// that errno in it before.
-pub(crate) fn record(pid: KoID, num: u32, err: LxError, detail: impl FnOnce() -> String) {
+/// Call `num` of `pid`, made with `args`, failed with `err`. Logged, with
+/// what it was asked (`detail`), when `pid` made a UVM call and the call has
+/// not failed with that errno in it before.
+pub(crate) fn record(
+    pid: KoID,
+    num: u32,
+    args: &[usize; 6],
+    err: LxError,
+    detail: impl FnOnce() -> String,
+) {
     if !ANY.load(Ordering::Relaxed) {
         return;
     }
-    if !first_failure(&CALLERS.lock(), &mut LOGGED.lock(), pid, num, err) {
+    let cmd = command(num, args);
+    if !first_failure(&CALLERS.lock(), &mut LOGGED.lock(), pid, num, cmd, err) {
         return;
     }
     kernel_hal::klog_warn!(
@@ -70,21 +79,33 @@ pub(crate) fn record(pid: KoID, num: u32, err: LxError, detail: impl FnOnce() ->
     );
 }
 
+/// What tells two failures of call `num` apart besides their errno: an
+/// ioctl's command, 0 for any other call. One fd takes many commands, and
+/// the first that fails must not hide the next: NUMA_INFO's EINVAL would
+/// hide every escape after it that fails with EINVAL too.
+fn command(num: u32, args: &[usize; 6]) -> u32 {
+    if num == Sys::IOCTL as u32 {
+        args[1] as u32
+    } else {
+        0
+    }
+}
+
 /// Whether this failure is one to log, noting it in `logged` if it is.
 fn first_failure(
     callers: &BTreeSet<KoID>,
-    logged: &mut BTreeSet<(KoID, u32, i32)>,
+    logged: &mut BTreeSet<(KoID, u32, u32, i32)>,
     pid: KoID,
     num: u32,
+    cmd: u32,
     err: LxError,
 ) -> bool {
-    callers.contains(&pid) && logged.len() < MAX_LINES && logged.insert((pid, num, err as i32))
+    callers.contains(&pid) && logged.len() < MAX_LINES && logged.insert((pid, num, cmd, err as i32))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consts::SyscallType as Sys;
 
     const PID: KoID = 1086;
 
@@ -101,6 +122,7 @@ mod tests {
             &mut logged,
             PID,
             mbind,
+            0,
             LxError::ENOSYS
         ));
         assert!(!first_failure(
@@ -108,6 +130,7 @@ mod tests {
             &mut logged,
             PID,
             mbind,
+            0,
             LxError::ENOSYS
         ));
         assert!(logged.is_empty());
@@ -116,6 +139,7 @@ mod tests {
             &mut logged,
             PID,
             mbind,
+            0,
             LxError::ENOSYS
         ));
     }
@@ -128,12 +152,33 @@ mod tests {
         let mut logged = BTreeSet::new();
         let mbind = Sys::MBIND as u32;
         let mmap = Sys::MMAP as u32;
-        let mut first = |pid, num, err| first_failure(&callers, &mut logged, pid, num, err);
+        let mut first = |pid, num, err| first_failure(&callers, &mut logged, pid, num, 0, err);
         assert!(first(PID, mbind, LxError::ENOSYS));
         assert!(!first(PID, mbind, LxError::ENOSYS));
         assert!(first(PID, mbind, LxError::EINVAL));
         assert!(first(PID, mmap, LxError::ENOSYS));
         assert!(first(PID + 1, mbind, LxError::ENOSYS));
+    }
+
+    /// An ioctl is told apart by its command: NUMA_INFO failing does not
+    /// hide another escape failing with the same errno on the same fd.
+    #[test]
+    fn each_ioctl_command_is_its_own_failure() {
+        const NUMA_INFO: usize = 0xc230_46d7;
+        const XFER: usize = 0xc010_46d3;
+        let ioctl = Sys::IOCTL as u32;
+        assert_eq!(command(ioctl, &[11, NUMA_INFO, 0, 0, 0, 0]), 0xc230_46d7);
+        assert_eq!(command(Sys::MBIND as u32, &[11, NUMA_INFO, 0, 0, 0, 0]), 0);
+
+        let callers = callers(&[PID]);
+        let mut logged = BTreeSet::new();
+        let mut first = |cmd: usize| {
+            let cmd = command(ioctl, &[11, cmd, 0, 0, 0, 0]);
+            first_failure(&callers, &mut logged, PID, ioctl, cmd, LxError::EINVAL)
+        };
+        assert!(first(NUMA_INFO));
+        assert!(!first(NUMA_INFO));
+        assert!(first(XFER));
     }
 
     #[test]
@@ -146,6 +191,7 @@ mod tests {
                 &mut logged,
                 PID,
                 num,
+                0,
                 LxError::EINVAL
             ));
         }
@@ -154,6 +200,7 @@ mod tests {
             &mut logged,
             PID,
             9999,
+            0,
             LxError::EINVAL
         ));
 
@@ -166,7 +213,7 @@ mod tests {
     }
 
     /// Through the dispatcher: a call that fails in a process that made a
-    /// UVM call is handed over with its errno.
+    /// UVM call is handed over with its errno, and an ioctl with its command.
     #[test]
     fn the_dispatcher_hands_a_failure_over() {
         use crate::on_a_thread::on_a_thread;
@@ -187,6 +234,7 @@ mod tests {
         note_uvm_caller(CUDA);
         let mbind = Sys::MBIND as u32;
         let set_mempolicy = Sys::SET_MEMPOLICY as u32;
+        let ioctl = Sys::IOCTL as u32;
         let ret = on_a_thread(&proc, move |sys| {
             Box::pin(async move {
                 let mut full = Syscall {
@@ -194,17 +242,20 @@ mod tests {
                     thread_fn: sys.thread_fn,
                     syscall_entry: 0,
                 };
-                // MPOL_BIND over an unaligned start, then with no nodes.
+                // MPOL_BIND over an unaligned start, then with no nodes, then
+                // an ioctl on a fd that is not open.
                 (
                     full.syscall(mbind, [0x1001, 0x1000, 2, 0, 0, 0]).await,
                     full.syscall(set_mempolicy, [2, 0, 0, 0, 0, 0]).await,
+                    full.syscall(ioctl, [99, 0xc230_46d7, 0, 0, 0, 0]).await,
                 )
             })
         });
         let einval = -(LxError::EINVAL as isize);
-        assert_eq!(ret, (einval, einval));
+        assert_eq!(ret, (einval, einval, -(LxError::EBADF as isize)));
         let logged = LOGGED.lock();
-        assert!(logged.contains(&(CUDA, mbind, LxError::EINVAL as i32)));
-        assert!(logged.contains(&(CUDA, set_mempolicy, LxError::EINVAL as i32)));
+        assert!(logged.contains(&(CUDA, mbind, 0, LxError::EINVAL as i32)));
+        assert!(logged.contains(&(CUDA, set_mempolicy, 0, LxError::EINVAL as i32)));
+        assert!(logged.contains(&(CUDA, ioctl, 0xc230_46d7, LxError::EBADF as i32)));
     }
 }

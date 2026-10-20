@@ -1765,6 +1765,23 @@ impl DrmDev {
                     let Some(fb) = drm::get_fb(fb_id) else {
                         return Err(FsError::EntryNotFound);
                     };
+                    // "Unexpected aspect-ratio flag bits" (`drm_mode_setcrtc`,
+                    // EINVAL): a mode with an aspect-ratio code, any code,
+                    // from a client that never set
+                    // `DRM_CLIENT_CAP_ASPECT_RATIO`, after the fb and before
+                    // `drm_mode_convert_umode` (so before its ERANGE). Only
+                    // the code's range was checked here, so a client that
+                    // knows nothing of the bits set them unknowingly and
+                    // was shown them back by nobody.
+                    let mode_flags = u32::from_ne_bytes([
+                        req.mode[28],
+                        req.mode[29],
+                        req.mode[30],
+                        req.mode[31],
+                    ]);
+                    if !self.file.aspect_ratio() && mode_flags & DRM_MODE_FLAG_PIC_AR_MASK != 0 {
+                        return Err(FsError::InvalidParam);
+                    }
                     let (w, h) = modeinfo_active_area(&req.mode)?;
                     if w > fb.width
                         || req.x > fb.width - w

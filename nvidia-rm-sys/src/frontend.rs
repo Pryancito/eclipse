@@ -59,9 +59,10 @@ pub const RM_MAP_MEMORY: u32 = 0x4E;
 /// `eclipse_rm_frontend_layout` answers them: the offset of the one field it
 /// reads from RM_MAP_MEMORY's comes right after that payload, the OS events'
 /// payloads and the event they copy out ([`events::UnixEvent`]) after that,
-/// and last the size of the mapping record this file shares with the C
+/// then NUMA_INFO's and where its count of retired pages is, and last the
+/// size of the mapping record this file shares with the C
 /// ([`RawMmapContext`]).
-pub const LAYOUT: [(&str, usize); 14] = [
+pub const LAYOUT: [(&str, usize); 16] = [
     ("nv_ioctl_xfer_t", 16),
     ("nv_ioctl_card_info_t", 72),
     ("nv_ioctl_rm_api_version_t", 72),
@@ -75,6 +76,8 @@ pub const LAYOUT: [(&str, usize); 14] = [
     ("nv_ioctl_free_os_event_t", 16),
     ("NVOS41_PARAMETERS", 16),
     ("NvUnixEvent", events::UnixEvent::SIZE),
+    ("nv_ioctl_numa_info_t", 560),
+    ("nv_ioctl_numa_info_t.offline_addresses.numEntries", 552),
     ("EclipseRmMmapContext", 40),
 ];
 
