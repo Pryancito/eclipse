@@ -2428,6 +2428,7 @@ impl LinuxProcess {
                 .and_then(|t| t.downcast::<zircon_object::task::Thread>().ok())
                 .map_or(0, |t| t.proc().id());
             walked.set(&format!("/proc/{}/{}", pid, rest));
+            pid
         };
         // hard code special path
         if path == "/proc/self/exe" {
@@ -2453,10 +2454,11 @@ impl LinuxProcess {
                     walked,
                 );
             }
-            in_proc_self(walked, format_args!("exe"));
-            return Ok(Arc::new(Pseudo::new(
+            let pid = in_proc_self(walked, format_args!("exe"));
+            return Ok(Arc::new(proc_self::ProcessLink::new(
+                pid,
+                proc_self::Held::Program,
                 &self.execute_path(),
-                FileType::SymLink,
             )));
         }
         if path == "/proc/self/fd" || path == "/proc/self/fd/" {
@@ -2491,9 +2493,9 @@ impl LinuxProcess {
             // `ENOENT`, as its listing and Linux say, not `EBADF` or `EINVAL`.
             let fd = FileDesc::try_from(fd_name).map_err(|_| LxError::ENOENT)?;
             let file = self.get_file_like(fd).map_err(|_| LxError::ENOENT)?;
-            in_proc_self(walked, format_args!("fd/{}", i32::from(fd)));
+            let pid = in_proc_self(walked, format_args!("fd/{}", i32::from(fd)));
             if !follow {
-                return Ok(Arc::new(proc_self::FdLink::of(&file)));
+                return Ok(Arc::new(proc_self::FdLink::of(pid, fd, &file)));
             }
             // Magic link: resolve to the open file itself (like Linux), so
             // execve("/proc/self/fd/N") runs the file, not the symlink's path

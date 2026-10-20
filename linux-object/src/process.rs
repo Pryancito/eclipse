@@ -2843,6 +2843,11 @@ impl LinuxProcess {
         Ok(inner.files.clone())
     }
 
+    /// How many descriptors are open.
+    pub fn file_count(&self) -> usize {
+        self.inner.lock().files.len()
+    }
+
     /// Close file descriptor `fd`.
     ///
     /// The removed file is dropped AFTER `inner` is released. Dropping the
