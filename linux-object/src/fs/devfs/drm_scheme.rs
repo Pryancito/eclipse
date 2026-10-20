@@ -1814,7 +1814,7 @@ impl DrmDev {
                     let n = req.count_connectors as usize;
                     ucheck_n::<u32>(req.set_connectors_ptr as usize, n)?;
                     for i in 0..n {
-                        let id = unsafe { *(req.set_connectors_ptr as *const u32).add(i) };
+                        let id = unsafe { uget::<u32>(req.set_connectors_ptr, i) };
                         // `drm_connector_lookup`: the object, by id, as
                         // `get_crtc` above -- the synthetic connector stays
                         // answerable beside a card that owns the resource
@@ -2311,7 +2311,7 @@ impl DrmDev {
                     ucheck_n::<DrmClipRect>(cmd.clips_ptr as usize, cmd.num_clips as usize)?;
                     let mut union: Option<(u32, u32, u32, u32)> = None;
                     for i in 0..cmd.num_clips as usize {
-                        let clip = unsafe { *(cmd.clips_ptr as *const DrmClipRect).add(i) };
+                        let clip = unsafe { uget::<DrmClipRect>(cmd.clips_ptr, i) };
                         if clip.x2 <= clip.x1 || clip.y2 <= clip.y1 {
                             continue;
                         }
@@ -2422,9 +2422,10 @@ impl DrmDev {
                 } else {
                     let count = req.object_count as usize;
                     ucheck_n::<u32>(req.object_ids as usize, count)?;
-                    let ids =
-                        unsafe { core::slice::from_raw_parts(req.object_ids as *const u32, count) };
-                    lease_objects(ids, self.file.universal_planes())?
+                    let ids: alloc::vec::Vec<u32> = (0..count)
+                        .map(|i| unsafe { uget::<u32>(req.object_ids, i) })
+                        .collect();
+                    lease_objects(&ids, self.file.universal_planes())?
                 };
                 // `drm_lease_create`: an object a live lessee of this master
                 // still holds is EBUSY (`_drm_has_leased`), checked after the
@@ -2454,13 +2455,7 @@ impl DrmDev {
                 let fill = ids.len().min(req.count_lessees as usize);
                 if fill > 0 {
                     ucheck_n::<u32>(req.lessees_ptr as usize, fill)?;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            ids.as_ptr(),
-                            req.lessees_ptr as *mut u32,
-                            fill,
-                        );
-                    }
+                    unsafe { ucopy_out(req.lessees_ptr, &ids[..fill]) };
                 }
                 unsafe {
                     (*(data as *mut DrmModeListLessees)).count_lessees = ids.len() as u32;
@@ -2726,9 +2721,7 @@ impl DrmDev {
                     // EFAULT, not a skip.
                     if conn_res.count_encoders >= 1 {
                         ucheck_n::<u32>(conn_res.encoders_ptr as usize, 1)?;
-                        unsafe {
-                            *(conn_res.encoders_ptr as *mut u32) = drm::SYNTH_ENCODER_ID;
-                        }
+                        unsafe { uput(conn_res.encoders_ptr, 0, drm::SYNTH_ENCODER_ID) };
                     }
                     conn_res.count_encoders = 1;
 
@@ -2906,13 +2899,7 @@ impl DrmDev {
                     // they all fit, and room with a null array is EFAULT.
                     if res.count_format_types >= FORMATS.len() as u32 {
                         ucheck_n::<u32>(res.format_type_ptr as usize, FORMATS.len())?;
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                FORMATS.as_ptr(),
-                                res.format_type_ptr as *mut u32,
-                                FORMATS.len(),
-                            );
-                        }
+                        unsafe { ucopy_out(res.format_type_ptr, &FORMATS) };
                     }
                     res.count_format_types = FORMATS.len() as u32;
                     Ok(0)
@@ -2984,9 +2971,7 @@ impl DrmDev {
                         };
                         let ln = nm.len().min(31);
                         e.name[..ln].copy_from_slice(&nm.as_bytes()[..ln]);
-                        unsafe {
-                            *(res.enum_blob_ptr as *mut DrmModePropertyEnum).add(i) = e;
-                        }
+                        unsafe { uput(res.enum_blob_ptr, i, e) };
                     }
                 }
                 res.count_enum_blobs = spec.enums.len() as u32;
@@ -2996,9 +2981,7 @@ impl DrmDev {
                 {
                     ucheck_n::<u64>(res.values_ptr as usize, spec.values.len())?;
                     for (i, v) in spec.values.iter().enumerate() {
-                        unsafe {
-                            *(res.values_ptr as *mut u64).add(i) = *v;
-                        }
+                        unsafe { uput(res.values_ptr, i, *v) };
                     }
                 }
                 res.count_values = spec.values.len() as u32;
@@ -3282,7 +3265,7 @@ impl DrmDev {
                 // handles (`drm_syncobj_array_find`): one it does not hold
                 // is ENOENT and none of the others is touched.
                 let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
-                    .map(|i| unsafe { *(req.handles as *const u32).add(i) })
+                    .map(|i| unsafe { uget::<u32>(req.handles, i) })
                     .collect();
                 if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
                     return Err(FsError::EntryNotFound);
@@ -3292,7 +3275,7 @@ impl DrmDev {
                         return Err(FsError::EntryNotFound);
                     }
                 }
-                let h0 = unsafe { *(req.handles as *const u32) };
+                let h0 = unsafe { uget::<u32>(req.handles, 0) };
                 trace_syncobj(
                     if cmd == DRM_IOCTL_SYNCOBJ_RESET {
                         "RESET"
@@ -3326,7 +3309,7 @@ impl DrmDev {
                 // The caller's own handles, all of them, before any is
                 // signaled (`drm_syncobj_array_find`).
                 let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
-                    .map(|i| unsafe { *(req.handles as *const u32).add(i) })
+                    .map(|i| unsafe { uget::<u32>(req.handles, i) })
                     .collect();
                 if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
                     return Err(FsError::EntryNotFound);
@@ -3343,7 +3326,7 @@ impl DrmDev {
                     if req.points == 0 {
                         0
                     } else {
-                        unsafe { *(req.points as *const u64).add(i) }
+                        unsafe { uget::<u64>(req.points, i) }
                     }
                 };
                 for (i, handle) in handles.into_iter().enumerate() {
@@ -3351,7 +3334,7 @@ impl DrmDev {
                         return Err(FsError::EntryNotFound);
                     }
                 }
-                let h0 = unsafe { *(req.handles as *const u32) };
+                let h0 = unsafe { uget::<u32>(req.handles, 0) };
                 trace_syncobj("TIMELINE_SIGNAL", drm::current_pid(), h0, point_at(0), "ok");
                 Ok(0)
             }
@@ -3445,7 +3428,7 @@ impl DrmDev {
                 // The caller's own handles, all of them, before any point is
                 // written back (`drm_syncobj_array_find`).
                 let handles: alloc::vec::Vec<u32> = (0..req.count_handles as usize)
-                    .map(|i| unsafe { *(req.handles as *const u32).add(i) })
+                    .map(|i| unsafe { uget::<u32>(req.handles, i) })
                     .collect();
                 if !zcore_drivers::scheme::syncobj::all_usable_by(drm::current_pid(), &handles) {
                     return Err(FsError::EntryNotFound);
@@ -3466,9 +3449,9 @@ impl DrmDev {
                     if i == 0 {
                         first_pt = point;
                     }
-                    unsafe { *(req.points as *mut u64).add(i) = point };
+                    unsafe { uput(req.points, i, point) };
                 }
-                let h0 = unsafe { *(req.handles as *const u32) };
+                let h0 = unsafe { uget::<u32>(req.handles, 0) };
                 trace_syncobj(
                     if last_submitted {
                         "QUERY_LAST_SUBMITTED"
@@ -4531,6 +4514,39 @@ fn ucheck_n<T>(addr: usize, count: usize) -> Result<()> {
     }
 }
 
+/// `get_user` on element `i` of a user array `ucheck_n` passed. Linux
+/// reads nested arrays with `get_user`/`copy_from_user`, which take any
+/// address; `*(ptr as *const T).add(i)` wanted `T`'s alignment, which an
+/// odd pointer breaks: UB in release, an abort of the kernel under debug
+/// assertions ("misaligned pointer dereference").
+///
+/// # Safety
+/// `ucheck_n::<T>(ptr, i + 1)` passed, so the element is the caller's.
+unsafe fn uget<T: Copy>(ptr: u64, i: usize) -> T {
+    core::ptr::read_unaligned((ptr as *const T).wrapping_add(i))
+}
+
+/// `put_user` of `v` as element `i` of a user array `ucheck_n` passed.
+///
+/// # Safety
+/// As [`uget`].
+unsafe fn uput<T: Copy>(ptr: u64, i: usize, v: T) {
+    core::ptr::write_unaligned((ptr as *mut T).wrapping_add(i), v)
+}
+
+/// `copy_to_user` of `vals` to a user array `ucheck_n` passed, byte by
+/// byte, so the destination needs no alignment.
+///
+/// # Safety
+/// `ucheck_n::<T>(ptr, vals.len())` passed.
+unsafe fn ucopy_out<T: Copy>(ptr: u64, vals: &[T]) {
+    core::ptr::copy_nonoverlapping(
+        vals.as_ptr() as *const u8,
+        ptr as *mut u8,
+        core::mem::size_of_val(vals),
+    )
+}
+
 /// `drm_copy_field`: `value` cut to the room in `*buf_len`, no terminator,
 /// and `*buf_len` set to the value's full length so the caller can size a
 /// second call. A null buffer writes nothing (Linux would fault on it).
@@ -4667,12 +4683,12 @@ fn read_syncobj_wait(cmd: u32, data: usize) -> Result<Option<SyncobjWaitReq>> {
         ucheck_n::<u64>(points_ptr as usize, count_handles as usize)?;
     }
     let handles: alloc::vec::Vec<u32> = (0..count_handles as usize)
-        .map(|i| unsafe { *(handles_ptr as *const u32).add(i) })
+        .map(|i| unsafe { uget::<u32>(handles_ptr, i) })
         .collect();
     let points: Option<alloc::vec::Vec<u64>> = if timeline && points_ptr != 0 {
         Some(
             (0..count_handles as usize)
-                .map(|i| unsafe { *(points_ptr as *const u64).add(i) })
+                .map(|i| unsafe { uget::<u64>(points_ptr, i) })
                 .collect(),
         )
     } else {
@@ -5710,9 +5726,7 @@ fn fill_id_list(ptr: u64, room: u32, ids: &[u32]) -> Result<()> {
     // null pointer used to be a silent skip, with the count still written.
     if fill > 0 {
         ucheck_n::<u32>(ptr as usize, fill)?;
-        unsafe {
-            core::ptr::copy_nonoverlapping(ids.as_ptr(), ptr as *mut u32, fill);
-        }
+        unsafe { ucopy_out(ptr, &ids[..fill]) };
     }
     Ok(())
 }
@@ -5729,8 +5743,8 @@ fn fill_prop_list(props_ptr: u64, values_ptr: u64, room: u32, props: &[(u32, u64
         ucheck_n::<u64>(values_ptr as usize, fill)?;
         for (i, (pid, val)) in props.iter().take(fill).enumerate() {
             unsafe {
-                *(props_ptr as *mut u32).add(i) = *pid;
-                *(values_ptr as *mut u64).add(i) = *val;
+                uput(props_ptr, i, *pid);
+                uput(values_ptr, i, *val);
             }
         }
     }
@@ -6075,8 +6089,8 @@ fn walk_atomic_props(
     ucheck_n::<u32>(req.count_props_ptr as usize, req.count_objs as usize)?;
     let mut prop_idx = 0usize;
     for i in 0..req.count_objs as usize {
-        let obj_id = unsafe { *(req.objs_ptr as *const u32).add(i) };
-        let count_props = unsafe { *(req.count_props_ptr as *const u32).add(i) };
+        let obj_id = unsafe { uget::<u32>(req.objs_ptr, i) };
+        let count_props = unsafe { uget::<u32>(req.count_props_ptr, i) };
         if count_props > 64 {
             return Err(FsError::InvalidParam);
         }
@@ -6087,8 +6101,8 @@ fn walk_atomic_props(
         ucheck_n::<u32>(req.props_ptr as usize, span)?;
         ucheck_n::<u64>(req.prop_values_ptr as usize, span)?;
         for _ in 0..count_props {
-            let prop_id = unsafe { *(req.props_ptr as *const u32).add(prop_idx) };
-            let value = unsafe { *(req.prop_values_ptr as *const u64).add(prop_idx) };
+            let prop_id = unsafe { uget::<u32>(req.props_ptr, prop_idx) };
+            let value = unsafe { uget::<u64>(req.prop_values_ptr, prop_idx) };
             prop_idx += 1;
             visit(obj_id, prop_id, value)?;
         }
@@ -6733,6 +6747,8 @@ mod legacy_core_tests;
 
 #[cfg(test)]
 mod null_list_tests;
+#[cfg(test)]
+mod unaligned_user_array_tests;
 
 #[cfg(test)]
 mod setproperty_commit_tests;
