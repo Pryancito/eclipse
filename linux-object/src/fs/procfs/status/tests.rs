@@ -547,9 +547,15 @@ fn vmsize_is_in_kilobytes_of_1024() {
     };
     let before = kb(&proc_pid_status(&proc));
 
+    // A real `mmap` happens under libos, so the address matters: `None` puts
+    // this mapping at guest address zero, which the host refuses with `EPERM`
+    // below `vm.mmap_min_addr` unless the caller holds `CAP_SYS_RAWIO`. This
+    // container runs as root and does, so it passed here and broke `Unit
+    // Test` on the runner. `0x40_0000` is where a non-PIE image loads and
+    // what every other mapping test in the tree asks for.
     proc.vmar()
         .map(
-            None,
+            Some(0x40_0000),
             VmObject::new_paged(MIB / 4096),
             0,
             MIB,
