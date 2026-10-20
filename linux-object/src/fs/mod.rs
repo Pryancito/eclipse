@@ -3380,7 +3380,14 @@ mod tests {
 /// When the budget ran out, `lookup_follow` left a symlink inode in place and
 /// the next component failed with ENOTDIR ("Failed to get DRM device: Not a
 /// directory").
-pub(crate) const FOLLOW_MAX_DEPTH: usize = 40;
+///
+/// It is public because the syscall layer walks links of its own against the
+/// same budget: `real_path` in `linux-syscall`, which answers
+/// `/proc/self/exe`, follows a path's links itself rather than asking the
+/// lookup to. Two budgets that can drift apart would let an exec run a
+/// program through more links than `/proc/self/exe` can name, so that one
+/// derives from this one instead of repeating the number.
+pub const FOLLOW_MAX_DEPTH: usize = 40;
 
 /// Fast path for virtual filesystems mounted at `/proc`, `/sys`, and `/dev`.
 /// Avoids ext2 directory scans on every access (VBox AHCI can stall there).

@@ -277,6 +277,15 @@ mod tests {
         // F_SETLK and F_OFD_SETLK, which answer EAGAIN instead of waiting.
         assert!(!fcntl(6));
         assert!(!fcntl(37));
+        // And the two commands as their numbers, not as the constants above:
+        // `sys_fcntl` has its own copy of these -- declared inside the method
+        // body, where nothing can name it -- and it is that copy that decides
+        // whether the call waits. Asking with the constant would only say
+        // this file agrees with itself, and a renumbering here would quietly
+        // stop restarting the call that does wait.
+        assert!(fcntl(7), "F_SETLKW is 7 and it waits");
+        assert!(fcntl(38), "F_OFD_SETLKW is 38 and it waits");
+        assert!(!fcntl(36), "F_OFD_GETLK is 36 and it does not wait");
     }
 
     #[test]

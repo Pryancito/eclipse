@@ -275,6 +275,45 @@ fn real_path_follows_each_link_and_folds_dot_and_dot_dot_after_it() {
     assert_eq!(real_path(&proc, "/.."), "/");
 }
 
+/// The walk spends the lookup's whole budget of links and not one more: a
+/// chain of `MAXSYMLINKS` resolves, and one link longer comes back as given,
+/// which is where Linux answers `ELOOP`.
+///
+/// The budget is a number this shares with the lookup rather than a second
+/// copy, so this also pins that they are the same: a path the exec can walk
+/// is one `/proc/self/exe` can name.
+#[test]
+fn real_path_spends_the_lookups_whole_budget_of_links_and_no_more() {
+    let proc = a_process("xa_chain");
+    let top = proc.lookup_inode("/xa_chain").unwrap();
+    let link = |name: &str, to: &str| {
+        let l = top.create(name, FileType::SymLink, 0o777).unwrap();
+        l.write_at(0, to.as_bytes()).unwrap();
+    };
+    // `l1` names the file, and each one after it names the one before, so
+    // walking `lN` goes through N links.
+    link("l1", "/xa_chain/bin/prog");
+    for i in 2..=MAX_LINKS + 1 {
+        link(&format!("l{}", i), &format!("/xa_chain/l{}", i - 1));
+    }
+    assert_eq!(
+        real_path(&proc, &format!("/xa_chain/l{}", MAX_LINKS)),
+        "/xa_chain/bin/prog",
+        "{} links is the budget, not one over it",
+        MAX_LINKS
+    );
+    let over = format!("/xa_chain/l{}", MAX_LINKS + 1);
+    assert_eq!(real_path(&proc, &over), over);
+}
+
+/// Linux's `MAXSYMLINKS` is 40, written here as the number and not as the
+/// constant: an assertion that reads the same constant it checks says only
+/// that the file agrees with itself.
+#[test]
+fn the_budget_is_the_forty_links_linux_walks() {
+    assert_eq!(MAX_LINKS, 40);
+}
+
 #[test]
 fn real_path_keeps_the_path_it_cannot_walk() {
     let proc = a_process("xa_stuck");

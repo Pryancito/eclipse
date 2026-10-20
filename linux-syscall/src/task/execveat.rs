@@ -27,7 +27,13 @@ const EXECVEAT_FLAGS: usize = AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_
 
 /// `MAXSYMLINKS`: how many links [`real_path`] follows before it gives up on
 /// the walk and keeps the path it was given.
-const MAX_LINKS: usize = 40;
+///
+/// It is the lookup's own budget and not a second copy of 40: this walks the
+/// links itself, in parallel to `lookup_inode_at`, so a program the exec can
+/// reach through 40 links is one `/proc/self/exe` must be able to name. Were
+/// the two numbers separate, raising one would leave `/proc/self/exe`
+/// answering the unresolved path for a file that ran perfectly well.
+const MAX_LINKS: usize = linux_object::fs::FOLLOW_MAX_DEPTH;
 
 /// The file an exec runs, and the names it goes by.
 pub(super) struct ExecTarget {
