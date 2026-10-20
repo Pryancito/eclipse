@@ -1015,4 +1015,85 @@ mod tests {
         assert_eq!(places_in(home, &[media]).len(), MAX_PLACES);
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn a_disk_image_is_a_disk_and_not_a_file_nothing_knows_about() {
+        // Every member of the Disk family, because the whole point of a kind
+        // is the colour of its icon: a `.img` that came back `Other` looked
+        // like a file the system knows nothing about, which is the opposite
+        // of what a raw disk image is. The test above samples one extension
+        // per family, so losing one from a list is invisible -- and these
+        // lists are edited by hand.
+        for name in ["linux.iso", "sd.img", "disco.qcow2", "caja.vdi", "dd.raw"] {
+            assert_eq!(kind_of(name), Kind::Disk, "{name}");
+        }
+        // The one-off members of the other families, which are exactly the
+        // ones with nothing else to cover for them.
+        assert_eq!(kind_of("foto.tiff"), Kind::Image);
+        assert_eq!(kind_of("libro.epub"), Kind::Document);
+        assert_eq!(kind_of("paquete.rpm"), Kind::Archive);
+        assert_eq!(kind_of("voz.opus"), Kind::Media);
+        assert_eq!(kind_of("hoja.css"), Kind::Code);
+    }
+
+    #[test]
+    fn the_mounts_of_one_base_are_listed_in_name_order() {
+        // The rail is read top to bottom, so its order has to be the same on
+        // every start. `read_dir` yields entries in whatever order the
+        // filesystem feels like, which means two sticks plugged in the other
+        // order would swap places in the rail with nothing on screen having
+        // changed -- and the test above has only one mount, where any order
+        // is the right one.
+        let base = std::env::temp_dir().join(format!("lunarbar-orden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let media = base.join("media");
+        for name in ["zeta", "alfa", "Media", "beta"] {
+            std::fs::create_dir_all(media.join(name).join("x")).unwrap();
+        }
+
+        let got = places_in("/", &[media.to_str().unwrap()]);
+        // A home of `/` contributes nothing, so the root is the first entry
+        // and the mounts follow it.
+        let mounts: Vec<&str> = got.iter().skip(1).map(|p| p.label.as_str()).collect();
+        // A plain byte order, so a capital leads: that is what `cmp` on a
+        // `String` does, and the rail is not a place to invent a collation.
+        assert_eq!(mounts, ["Media", "alfa", "beta", "zeta"]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_file_stamped_at_the_epoch_has_no_date_rather_than_1970() {
+        // Zero is what a filesystem with no mtimes to give answers, and
+        // `short_date(0, ..)` turns it into a perfectly good "1 ene 1970":
+        // the column would then state a date nobody ever wrote. `None` is
+        // what leaves the cell empty, and it is the only thing the `> 0`
+        // filter is for.
+        let base = std::env::temp_dir().join(format!("lunarbar-epoca-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("sin-fecha"), b"x").unwrap();
+        std::fs::write(base.join("con-fecha"), b"x").unwrap();
+        let name = std::ffi::CString::new(base.join("sin-fecha").to_str().unwrap()).unwrap();
+        let epoch = [libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        }; 2];
+        // SAFETY: both arguments outlive the call, and `utimes` reads them
+        // without keeping a pointer to either.
+        let rc = unsafe { libc::utimes(name.as_ptr(), epoch.as_ptr()) };
+        assert_eq!(rc, 0, "utimes: {}", std::io::Error::last_os_error());
+        // A filesystem is free to refuse to store a zero mtime, and where it
+        // does there is nothing to leave out -- same shape as the test of a
+        // name that is not UTF-8 above.
+        let stored = std::os::unix::fs::MetadataExt::mtime(
+            &std::fs::metadata(base.join("sin-fecha")).unwrap(),
+        );
+        if stored == 0 {
+            let v = read_dir_sorted(base.to_str().unwrap()).unwrap();
+            let by = |n: &str| v.iter().find(|e| e.name == n).cloned().unwrap();
+            assert_eq!(by("sin-fecha").mtime, None, "the epoch is not a date");
+            assert!(by("con-fecha").mtime.is_some(), "a real mtime is kept");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
