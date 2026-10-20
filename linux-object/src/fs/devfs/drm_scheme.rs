@@ -1437,12 +1437,18 @@ impl DrmDev {
                         Ok(0)
                     }
                     // STEREO_3D, ASPECT_RATIO: a boolean each in Linux
-                    // (`drm_setclientcap`: `value > 1` is EINVAL); nothing
-                    // here changes with them, so accept the two legal values
-                    // and refuse the rest.
+                    // (`drm_setclientcap`: `value > 1` is EINVAL). Nothing
+                    // here changes with STEREO_3D; ASPECT_RATIO is
+                    // `drm_file.aspect_ratio_allowed`, which `GETCRTC` reads
+                    // to decide whether the mode's aspect-ratio bits are
+                    // reported. It was accepted and forgotten, so every
+                    // client read the bits back.
                     DRM_CLIENT_CAP_STEREO_3D | DRM_CLIENT_CAP_ASPECT_RATIO => {
                         if value > 1 {
                             return Err(FsError::InvalidParam);
+                        }
+                        if cap == DRM_CLIENT_CAP_ASPECT_RATIO {
+                            self.file.set_aspect_ratio(value != 0);
                         }
                         log::debug!("[drm] SET_CLIENT_CAP cap={} -> accepted", cap);
                         Ok(0)
@@ -2801,14 +2807,22 @@ impl DrmDev {
                 let crtc_res = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
                 if let Some(crtc) = drm::get_crtc(crtc_res.crtc_id) {
                     // `drm_mode_getcrtc`: the primary plane's fb, and the
-                    // mode (the display's native timings, the only mode the
-                    // pipeline has) only while `crtc_state->enable` -- a
-                    // CRTC that `SETCRTC` disabled or whose scanout fb was
-                    // removed has neither, whatever the panel can do. DPMS
-                    // off keeps both. `x`/`y` are the primary plane's
+                    // mode only while `crtc_state->enable` -- a CRTC that
+                    // `SETCRTC` disabled or whose scanout fb was removed has
+                    // neither, whatever the panel can do. DPMS off keeps
+                    // both. `x`/`y` are the primary plane's
                     // `src_x >> 16`/`src_y >> 16` (see `drm::get_crtc`).
                     // Compositors read this back to seed their initial
                     // output state.
+                    //
+                    // The mode is `crtc_state->mode`, the one the last
+                    // modeset committed (the kernel-owned blob `MODE_ID`
+                    // reads back), through `drm_mode_convert_to_umode`; only
+                    // the boot console, which no modeset put there, reports
+                    // the display's native timings. This arm answered the
+                    // native timings whatever the client had set, so a
+                    // compositor that set its own mode read a different one
+                    // back and took the output for reconfigured.
                     let enabled = drm::crtc_enabled();
                     crtc_res.fb_id = if enabled { crtc.fb_id } else { 0 };
                     crtc_res.x = crtc.x;
@@ -2816,7 +2830,18 @@ impl DrmDev {
                     crtc_res.gamma_size = CRTC_GAMMA_SIZE;
                     match drm::display_mode() {
                         Some((w, h, _)) if enabled => {
-                            crtc_res.mode = make_modeinfo(w, h);
+                            let (st, _) = drm::atomic_snapshot();
+                            let committed = drm::get_blob(st.mode_blob_id).and_then(|b| {
+                                let mut m = [0u8; 68];
+                                (b.len() == m.len()).then(|| {
+                                    m.copy_from_slice(&b);
+                                    m
+                                })
+                            });
+                            crtc_res.mode = match committed {
+                                Some(m) => committed_umode(&m, self.file.aspect_ratio()),
+                                None => make_modeinfo(w, h),
+                            };
                             crtc_res.mode_valid = 1;
                         }
                         _ => crtc_res.mode_valid = 0,
@@ -5349,6 +5374,72 @@ const DRM_MODE_FLAG_NHSYNC: u32 = 1 << 1;
 const DRM_MODE_FLAG_PVSYNC: u32 = 1 << 2;
 const DRM_MODE_FLAG_NVSYNC: u32 = 1 << 3;
 const DRM_MODE_FLAG_INTERLACE: u32 = 1 << 4;
+const DRM_MODE_FLAG_DBLSCAN: u32 = 1 << 5;
+/// `DRM_MODE_TYPE_ALL`: `PREFERRED | USERDEF | DRIVER`, the type bits
+/// `drm_mode_convert_umode` keeps of what a client hands in.
+const DRM_MODE_TYPE_ALL: u32 = 0x08 | 0x20 | 0x40;
+
+/// `drm_mode_vrefresh`, on a `struct drm_mode_modeinfo` as the ioctl carries
+/// it: `clock * 1000 / (htotal * vtotal)`, doubled by `INTERLACE`, halved by
+/// `DBLSCAN` and divided by `vscan` past 1, rounded to the nearest
+/// (`DIV_ROUND_CLOSEST_ULL`); 0 without totals or when a product overflows
+/// an `unsigned int` (`check_mul_overflow`).
+fn modeinfo_vrefresh(m: &[u8; 68]) -> u32 {
+    let u16_at = |i: usize| u16::from_ne_bytes([m[i], m[i + 1]]) as u32;
+    let clock = u32::from_ne_bytes([m[0], m[1], m[2], m[3]]);
+    let (htotal, vtotal, vscan) = (u16_at(10), u16_at(20), u16_at(22));
+    let flags = u32::from_ne_bytes([m[28], m[29], m[30], m[31]]);
+    if htotal == 0 || vtotal == 0 {
+        return 0;
+    }
+    let num = if flags & DRM_MODE_FLAG_INTERLACE != 0 {
+        2
+    } else {
+        1
+    };
+    let mut den = if flags & DRM_MODE_FLAG_DBLSCAN != 0 {
+        2
+    } else {
+        1
+    };
+    if vscan > 1 {
+        den *= vscan;
+    }
+    let (Some(num), Some(den)) = (clock.checked_mul(num), (htotal * vtotal).checked_mul(den))
+    else {
+        return 0;
+    };
+    let (num, den) = (num as u64 * 1000, den as u64);
+    ((num + den / 2) / den) as u32
+}
+
+/// `drm_mode_convert_to_umode` on the mode `drm_mode_convert_umode` stored
+/// from a `SETCRTC` (the committed blob holds the client's 68 bytes), plus
+/// the one edit `drm_mode_getcrtc` makes after it: the timings as given,
+/// `vrefresh` recomputed by [`modeinfo_vrefresh`] (what the client wrote
+/// there does not count), `type & DRM_MODE_TYPE_ALL`, the name through
+/// `strscpy_pad` (31 bytes, then NULs) and the aspect-ratio bits only for a
+/// client with `DRM_CLIENT_CAP_ASPECT_RATIO`.
+fn committed_umode(stored: &[u8; 68], aspect_ratio_allowed: bool) -> [u8; 68] {
+    let mut m = *stored;
+    m[24..28].copy_from_slice(&modeinfo_vrefresh(stored).to_ne_bytes());
+    let mut flags = u32::from_ne_bytes([m[28], m[29], m[30], m[31]]);
+    if !aspect_ratio_allowed {
+        flags &= !DRM_MODE_FLAG_PIC_AR_MASK;
+    }
+    m[28..32].copy_from_slice(&flags.to_ne_bytes());
+    let ty = u32::from_ne_bytes([m[32], m[33], m[34], m[35]]) & DRM_MODE_TYPE_ALL;
+    m[32..36].copy_from_slice(&ty.to_ne_bytes());
+    let name = &stored[36..68];
+    let len = name
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(name.len())
+        .min(31);
+    m[36..68].fill(0);
+    m[36..36 + len].copy_from_slice(&name[..len]);
+    m
+}
 
 /// The numbers that go into a `drm_mode_modeinfo`, from whichever source could
 /// supply them. Split out from the byte packing so both sources can be tested

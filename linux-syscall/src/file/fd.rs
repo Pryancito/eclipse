@@ -510,7 +510,8 @@ impl Syscall<'_> {
                 return Ok(fd.into());
             }
 
-            let (inode, created) = if flags.contains(OpenFlags::CREATE) {
+            // `walked` is where the walk ended: what the file is named.
+            let (inode, created, walked) = if flags.contains(OpenFlags::CREATE) {
                 // `open("", O_CREAT)` is `ENOENT`; `open("/", O_CREAT)`, like
                 // `.` and `..`, names a directory, `EISDIR`. Split as a plain
                 // name, either used to create a file called "" in the working
@@ -518,7 +519,7 @@ impl Syscall<'_> {
                 let (dir_path, last) = super::dir::last_component(path)?;
                 let file_name = last.to_open_create(super::dir::has_trailing_slash(path))?;
                 // relative to cwd
-                let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
+                let (dir_inode, mut walked) = proc.lookup_inode_walked(dir_fd, dir_path, true)?;
                 let dir_metadata = dir_inode.metadata()?;
                 proc.check_access(&dir_metadata, 0o3, true)?;
                 match dir_inode.find(file_name) {
@@ -537,8 +538,11 @@ impl Syscall<'_> {
                             if !follow {
                                 return Err(LxError::ELOOP);
                             }
-                            proc.lookup_inode_at(dir_fd, path, true)?
+                            let (file_inode, at) = proc.lookup_inode_walked(dir_fd, path, true)?;
+                            walked = at;
+                            file_inode
                         } else {
+                            walked.enter(String::from(file_name));
                             file_inode
                         };
                         let metadata = file_inode.metadata()?;
@@ -551,7 +555,7 @@ impl Syscall<'_> {
                         if flags.readable() {
                             proc.check_access(&metadata, 0o4, true)?;
                         }
-                        (file_inode, false)
+                        (file_inode, false, walked)
                     }
                     Err(FsError::EntryNotFound) => {
                         // `build_open_flags`: `op->mode = mode & S_IALLUGO`.
@@ -569,7 +573,8 @@ impl Syscall<'_> {
                             create_mode,
                             false,
                         )?;
-                        (inode, true)
+                        walked.enter(String::from(file_name));
+                        (inode, true, walked)
                     }
                     Err(e) => return Err(LxError::from(e)),
                 }
@@ -609,12 +614,15 @@ impl Syscall<'_> {
                 // asserts). Linux clears `LOOKUP_FOLLOW` for the LAST
                 // component alone, so the directory is resolved the ordinary
                 // way and the last name is looked up inside it.
-                let inode = if o_path_link {
+                let (inode, walked) = if o_path_link {
                     let (dir_path, file_name) = split_path(path);
-                    let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
-                    dir_inode.find(file_name)?
+                    let (dir_inode, mut walked) =
+                        proc.lookup_inode_walked(dir_fd, dir_path, true)?;
+                    let inode = dir_inode.find(file_name)?;
+                    walked.enter(String::from(file_name));
+                    (inode, walked)
                 } else {
-                    proc.lookup_inode_at(dir_fd, path, true)?
+                    proc.lookup_inode_walked(dir_fd, path, true)?
                 };
                 let metadata = inode.metadata()?;
                 // `may_open`: the type's refusals (ELOOP, EISDIR) come before
@@ -626,7 +634,7 @@ impl Syscall<'_> {
                 if flags.writable() {
                     proc.check_access(&metadata, 0o2, true)?;
                 }
-                (inode, false)
+                (inode, false, walked)
             };
             let metadata = inode.metadata()?;
             open_resolved_type(flags, metadata.type_)?;
@@ -641,15 +649,13 @@ impl Syscall<'_> {
             // rather than a mount, so a pty slave answers to `/dev`.
             //
             // The type test comes first and short-circuits: an ordinary file
-            // open pays one comparison, not a mount-table lock and a path
-            // allocation.
-            if nodev_blocks(flags, metadata.type_)
-                && linux_object::fs::path_is_nodev(
-                    &proc
-                        .get_absolute_path(dir_fd, path)
-                        .unwrap_or_else(|_| String::from(path)),
-                )
-            {
+            // open pays one comparison, not a mount-table lock.
+            //
+            // What decides is the mount the walk ended on, so a device node
+            // is judged by its own path and not by the link it was reached
+            // through: a link in `/tmp` to `/dev/null` opens it.
+            let opened = walked.path();
+            if nodev_blocks(flags, metadata.type_) && linux_object::fs::path_is_nodev(&opened) {
                 return Err(LxError::EACCES);
             }
             // `may_open`: "O_NOATIME can only be set by the owner or
@@ -692,7 +698,7 @@ impl Syscall<'_> {
             } else if let Some(object) = inode.downcast_ref::<FdObject>() {
                 object.0.link_name()
             } else {
-                proc.get_absolute_path(dir_fd, path)?
+                opened
             };
             let file = File::new(inode, flags, abs_path);
             let fd = proc.add_file(file)?;

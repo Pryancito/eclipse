@@ -46,7 +46,11 @@ impl Syscall<'_> {
             open_of_fd: &open_of_fd,
         };
         match (uvm, open) {
-            (Some(uvm), _) => Some(uvm.ioctl(request as u32, arg, &caller)),
+            (Some(uvm), _) => {
+                // A CUDA program: its failing calls go to dmesg from now on.
+                crate::cuda_failures::note_uvm_caller(self.zircon_process().id());
+                Some(uvm.ioctl(request as u32, arg, &caller))
+            }
             (_, Some(open)) => Some(open.ioctl(request as u32, arg, &caller)),
             (None, None) => None,
         }

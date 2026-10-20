@@ -164,10 +164,70 @@ impl dyn INode {
     /// never the symlink itself: a link that points at itself used to come
     /// back as an ordinary file whose contents were its own name.
     pub fn lookup_follow(&self, path: &str, follow_times: usize) -> Result<Arc<dyn INode>> {
+        self.lookup_walked(path, follow_times, None)
+    }
+
+    /// [`Self::lookup_follow`], and `walked` goes along: it holds where this
+    /// inode is when the walk starts, and where what it found is when it is
+    /// done.
+    pub fn lookup_walked(
+        &self,
+        path: &str,
+        follow_times: usize,
+        walked: Option<&mut Walked>,
+    ) -> Result<Arc<dyn INode>> {
         match follow_times {
-            0 => lookup_with_budget(self, path, MAXSYMLINKS, false),
-            budget => lookup_with_budget(self, path, budget, true),
+            0 => lookup_with_budget(self, path, MAXSYMLINKS, false, walked),
+            budget => lookup_with_budget(self, path, budget, true, walked),
         }
+    }
+}
+
+/// Where a walk is: the names of the directories it entered, from the root
+/// and through no link, which is what Linux names a file by (`d_path`).
+///
+/// A link the walk follows is not entered; its target is walked from the
+/// directory that holds it, so a `..` after a link climbs out of where the
+/// link leads.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Walked {
+    /// The names, from the root.
+    pub names: Vec<String>,
+    /// How many of `names` lead to the root of the file system the walk is
+    /// in, which is where an absolute target starts over.
+    pub root: usize,
+}
+
+impl Walked {
+    /// At `path`, an absolute path with nothing left to resolve in it, in a
+    /// file system whose root is `root` names down.
+    pub fn at(path: &str, root: usize) -> Self {
+        let mut walked = Walked {
+            names: Vec::new(),
+            root,
+        };
+        for name in path.split('/') {
+            walked.enter(String::from(name));
+        }
+        walked
+    }
+
+    /// One step down to `name`, or up for `..`.
+    pub fn enter(&mut self, name: String) {
+        match name.as_str() {
+            "" | "." => {}
+            ".." => {
+                if self.names.len() > self.root {
+                    self.names.pop();
+                }
+            }
+            _ => self.names.push(name),
+        }
+    }
+
+    /// The path, from the root.
+    pub fn path(&self) -> String {
+        String::from("/") + &self.names.join("/")
     }
 }
 
@@ -197,6 +257,7 @@ fn lookup_with_budget(
     path: &str,
     budget: usize,
     follow_last: bool,
+    mut walked: Option<&mut Walked>,
 ) -> Result<Arc<dyn INode>> {
     if start.metadata()?.type_ != FileType::Dir {
         return Err(FsError::NotDir);
@@ -204,6 +265,9 @@ fn lookup_with_budget(
 
     // handle absolute path
     let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
+        if let Some(walked) = walked.as_deref_mut() {
+            walked.names.truncate(walked.root);
+        }
         (start.fs().root_inode(), String::from(rest))
     } else {
         (start.find(".")?, String::from(path))
@@ -238,9 +302,12 @@ fn lookup_with_budget(
             // result remains unchanged: a relative target is resolved from the
             // directory that holds the link.
             let new_path = link_path + "/" + &rest_path;
-            return lookup_with_budget(&*result, &new_path, budget - 1, follow_last);
+            return lookup_with_budget(&*result, &new_path, budget - 1, follow_last, walked);
         } else {
-            result = inode
+            result = inode;
+            if let Some(walked) = walked.as_deref_mut() {
+                walked.enter(name);
+            }
         }
     }
     Ok(result)
@@ -763,6 +830,54 @@ mod lookup_tests {
         assert!(same(&inode.lookup("dl//f").unwrap(), &file));
         let dl = root.children.lock()["dl"].clone();
         assert!(same(&inode.lookup("dl").unwrap(), &dl));
+    }
+
+    /// What a walk found is named from the root through no link, whatever
+    /// way the walk took to it.
+    #[test]
+    fn the_walk_names_what_it_found_through_no_link() {
+        let tree = tree();
+        let root = &tree.root;
+        let real = root.dir("real");
+        real.dir("sub");
+        real.file("f", b"");
+        real.link("lf", "/real/f");
+        real.link("up", "../real/f");
+        root.link("l", "/real");
+        root.link("rl", "real");
+        root.link("ll", "l");
+        let inode = &**root as &dyn INode;
+        let name = |path: &str, follow: usize| {
+            let mut walked = Walked::default();
+            inode
+                .lookup_walked(path, follow, Some(&mut walked))
+                .unwrap();
+            walked.path()
+        };
+        for path in ["l/f", "rl/f", "ll/sub/../f", "real/lf", "real/up", "/l/./f"] {
+            assert_eq!(name(path, 4), "/real/f", "{}", path);
+        }
+        // The last link, left in place, is named in its real directory.
+        assert_eq!(name("l/lf", 0), "/real/lf");
+        assert_eq!(name("ll", 0), "/ll");
+        assert_eq!(name("l/..", 0), "/");
+        assert_eq!(name("..", 0), "/");
+
+        // A walk from a directory goes on from that directory's name, and an
+        // absolute target starts over at the root of the file system, which
+        // is `root` names down.
+        let sub = real.children.lock()["sub"].clone();
+        let mut walked = Walked::at("/mnt//x/./sub", 1);
+        assert_eq!(walked.names, ["mnt", "x", "sub"]);
+        (&*sub as &dyn INode)
+            .lookup_walked("../lf", 4, Some(&mut walked))
+            .unwrap();
+        assert_eq!(walked.path(), "/mnt/real/f");
+        let mut walked = Walked::at("/mnt", 1);
+        (&*sub as &dyn INode)
+            .lookup_walked("../../../..", 0, Some(&mut walked))
+            .unwrap();
+        assert_eq!(walked.path(), "/mnt");
     }
 
     #[test]

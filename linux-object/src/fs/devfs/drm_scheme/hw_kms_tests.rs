@@ -1918,6 +1918,165 @@ fn setcrtc_wants_a_mode_that_is_one_and_an_fb_that_holds_it() {
     c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
 }
 
+/// `drm_mode_getcrtc` answers `crtc_state->mode`, the mode the last
+/// `SETCRTC` committed, through `drm_mode_convert_to_umode`: the client's
+/// timings, `vrefresh` recomputed by `drm_mode_vrefresh`, `type` masked to
+/// `DRM_MODE_TYPE_ALL`, the name cut to 31 bytes and NUL-padded, and the
+/// aspect-ratio bits only for an open that set `DRM_CLIENT_CAP_ASPECT_RATIO`.
+/// This arm answered the panel's native timings whatever had been set.
+#[test]
+fn getcrtc_reads_back_the_mode_that_was_set_as_convert_to_umode_gives_it() {
+    let _screen = kms_emu::attach(32, 8);
+    let c = Client::open(0);
+    let (crtcs, conns) = topology(&c);
+    let (crtc, conn) = (crtcs[0], conns[0]);
+    let buf = c.create_dumb(32, 8);
+    paint(&buf, 0x0000_4444);
+    let fb = c.addfb2(&buf);
+
+    let setcrtc = |c: &Client, mode: [u8; 68]| {
+        let connectors = [conn];
+        let mut req = DrmModeGetCrtc {
+            set_connectors_ptr: connectors.as_ptr() as u64,
+            count_connectors: 1,
+            crtc_id: crtc,
+            fb_id: fb,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 1,
+            mode,
+        };
+        c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req)
+    };
+    let getcrtc = |c: &Client| {
+        let mut res = DrmModeGetCrtc {
+            set_connectors_ptr: 0,
+            count_connectors: 0,
+            crtc_id: crtc,
+            fb_id: 0,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 0,
+            mode: [0xAB; 68],
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut res).expect("GETCRTC");
+        res
+    };
+    let aspect_cap = |c: &Client, on: bool| {
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_ASPECT_RATIO, on as u64];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP ASPECT_RATIO");
+    };
+    let put_u16 =
+        |m: &mut [u8; 68], at: usize, v: u16| m[at..at + 2].copy_from_slice(&v.to_ne_bytes());
+    let put_u32 =
+        |m: &mut [u8; 68], at: usize, v: u32| m[at..at + 4].copy_from_slice(&v.to_ne_bytes());
+    let vrefresh_of = |m: &[u8; 68]| u32::from_ne_bytes([m[24], m[25], m[26], m[27]]);
+    let flags_of = |m: &[u8; 68]| u32::from_ne_bytes([m[28], m[29], m[30], m[31]]);
+    let type_of = |m: &[u8; 68]| u32::from_ne_bytes([m[32], m[33], m[34], m[35]]);
+
+    // The client's own mode: 32x8 active over 40x10 totals at 1000 kHz
+    // (2500 Hz, not the 77 it claims), with the aspect-ratio code the kernel
+    // defines last, every type bit set and a 32-byte name with no NUL.
+    let mut own = [0u8; 68];
+    put_u32(&mut own, 0, 1000);
+    for (at, v) in [
+        (4, 32),
+        (6, 34),
+        (8, 36),
+        (10, 40),
+        (14, 8),
+        (16, 9),
+        (18, 10),
+        (20, 10),
+    ] {
+        put_u16(&mut own, at, v);
+    }
+    put_u32(&mut own, 24, 77);
+    put_u32(&mut own, 28, 4 << 19);
+    put_u32(&mut own, 32, u32::MAX);
+    own[36..68].fill(b'n');
+    assert_eq!(setcrtc(&c, own), Ok(0));
+
+    let got = getcrtc(&c);
+    assert_eq!(got.mode_valid, 1);
+    assert_eq!(got.mode[..24], own[..24], "the timings are the client's");
+    assert_eq!(
+        vrefresh_of(&got.mode),
+        2500,
+        "vrefresh is drm_mode_vrefresh, not the client's"
+    );
+    assert_eq!(type_of(&got.mode), 0x68, "type & DRM_MODE_TYPE_ALL");
+    let mut name = [b'n'; 32];
+    name[31] = 0;
+    assert_eq!(got.mode[36..68], name, "strscpy_pad: 31 bytes and a NUL");
+    assert_eq!(
+        flags_of(&got.mode),
+        0,
+        "the aspect-ratio bits need the client cap"
+    );
+
+    // The cap is per open: this one sees the bits, a second open does not,
+    // and dropping the cap hides them again.
+    aspect_cap(&c, true);
+    assert_eq!(
+        flags_of(&getcrtc(&c).mode),
+        4 << 19,
+        "with DRM_CLIENT_CAP_ASPECT_RATIO"
+    );
+    let other = Client::open(0);
+    assert_eq!(
+        flags_of(&getcrtc(&other).mode),
+        0,
+        "another open without the cap"
+    );
+    aspect_cap(&c, false);
+    assert_eq!(flags_of(&getcrtc(&c).mode), 0, "the cap dropped");
+
+    // `drm_mode_vrefresh`: rounded to the nearest, doubled by INTERLACE,
+    // halved by DBLSCAN and divided by vscan.
+    let mut m = own;
+    put_u32(&mut m, 28, 0);
+    put_u32(&mut m, 0, 1001);
+    assert_eq!(setcrtc(&c, m), Ok(0));
+    assert_eq!(
+        vrefresh_of(&getcrtc(&c).mode),
+        2503,
+        "1001000 / 400 rounds up"
+    );
+    put_u32(&mut m, 0, 1000);
+    put_u32(&mut m, 28, DRM_MODE_FLAG_INTERLACE);
+    assert_eq!(setcrtc(&c, m), Ok(0));
+    assert_eq!(
+        vrefresh_of(&getcrtc(&c).mode),
+        5000,
+        "INTERLACE doubles the field rate"
+    );
+    put_u32(&mut m, 28, DRM_MODE_FLAG_DBLSCAN);
+    put_u16(&mut m, 22, 2);
+    assert_eq!(setcrtc(&c, m), Ok(0));
+    assert_eq!(
+        vrefresh_of(&getcrtc(&c).mode),
+        625,
+        "DBLSCAN halves it and vscan 2 again"
+    );
+
+    // A short name comes back NUL-padded, whatever followed its NUL.
+    let mut m = own;
+    put_u32(&mut m, 28, 0);
+    m[36..68].fill(b'z');
+    m[36..39].copy_from_slice(b"ab\0");
+    assert_eq!(setcrtc(&c, m), Ok(0));
+    let mut name = [0u8; 32];
+    name[..2].copy_from_slice(b"ab");
+    assert_eq!(getcrtc(&c).mode[36..68], name, "the name stops at its NUL");
+
+    c.rmfb(fb).expect("RMFB");
+    c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+}
+
 /// On the hardware-KMS path the driver's `get_crtc` carries its own
 /// framebuffer id, in its own namespace (`EMU_DRIVER_FB_BASE` here), and
 /// the core only overrides it while a DRM framebuffer is on the CRTC.

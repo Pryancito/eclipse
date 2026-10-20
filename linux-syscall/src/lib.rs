@@ -68,7 +68,7 @@ mod perf_accounting {
     use core::convert::TryFrom;
     use core::sync::atomic::{AtomicBool, Ordering};
 
-    fn resolve(num: u32) -> Option<String> {
+    pub(crate) fn resolve(num: u32) -> Option<String> {
         // `Sys` is `#[derive(Debug)]`; its variant name is the uppercase
         // syscall name. Lower-case it to match the conventional spelling.
         Sys::try_from(num)
@@ -190,6 +190,8 @@ mod abi;
 /// return). amd64-only: the ABI it implements is FreeBSD/amd64.
 #[cfg(target_arch = "x86_64")]
 pub mod bsd;
+#[cfg(target_arch = "x86_64")]
+mod cuda_failures;
 mod file;
 mod intarg;
 mod ipc;
@@ -469,9 +471,9 @@ impl Syscall<'_> {
             Sys::MUNLOCK => self.sys_munlock(a0, a1),
             Sys::MLOCKALL => self.sys_mlockall(a0),
             Sys::MUNLOCKALL => self.sys_munlockall(),
-            Sys::MBIND => self.unimplemented("mbind", Err(LxError::ENOSYS)),
+            Sys::MBIND => self.sys_mbind(a0, a1, a2, a3.into(), a4, a5),
             Sys::GET_MEMPOLICY => self.sys_get_mempolicy(a0.into(), a1.into(), a2, a3, a4),
-            Sys::SET_MEMPOLICY => self.unimplemented("set_mempolicy", Err(LxError::ENOSYS)),
+            Sys::SET_MEMPOLICY => self.sys_set_mempolicy(a0, a1.into(), a2),
 
             // signal
             Sys::RT_SIGACTION => self.sys_rt_sigaction(a0, a1.into(), a2.into(), a3),
@@ -871,6 +873,9 @@ impl Syscall<'_> {
                     failure_detail(num, &args, err)
                 });
             }
+            // ... and, for a process that made a UVM call, in dmesg.
+            #[cfg(target_arch = "x86_64")]
+            cuda_failures::record(pid, num, err, || failure_detail(num, &args, err));
         }
         info!("<= {:?}", ret);
         // [einval-hunt] glxgears against the finally-alive Xwayland dies with
@@ -1170,10 +1175,11 @@ fn is_open(num: u32) -> bool {
     }
 }
 
-/// What a failed call was asked, for the boot tracer: the path of one that
-/// names a file, the fd and command of an ioctl, all six of an mmap, and
-/// otherwise its first four arguments. A call that failed with EFAULT gets
-/// its arguments in hex, as its path is what could not be read.
+/// What a failed call was asked, for the boot tracer and for a CUDA
+/// program's failures in dmesg: the path of one that names a file, the fd
+/// and command of an ioctl, all six of an mmap, and otherwise its first four
+/// arguments. A call that failed with EFAULT gets its arguments in hex, as
+/// its path is what could not be read.
 fn failure_detail(num: u32, args: &[usize; 6], err: LxError) -> alloc::string::String {
     let path_at = |i: usize| {
         let path = UserInPtr::<u8>::from(args[i]).as_c_str().unwrap_or("?");
@@ -1202,7 +1208,8 @@ fn failure_detail(num: u32, args: &[usize; 6], err: LxError) -> alloc::string::S
         }
         _ if err == LxError::EFAULT => {}
         Ok(
-            Sys::NEWFSTATAT
+            Sys::OPENAT
+            | Sys::NEWFSTATAT
             | Sys::FACCESSAT
             | Sys::FACCESSAT2
             | Sys::READLINKAT
@@ -1213,9 +1220,15 @@ fn failure_detail(num: u32, args: &[usize; 6], err: LxError) -> alloc::string::S
             | Sys::STATX,
         ) => return path_at(1),
         #[cfg(target_arch = "x86_64")]
-        Ok(Sys::STAT | Sys::LSTAT | Sys::ACCESS | Sys::READLINK | Sys::MKNOD | Sys::UNLINK) => {
-            return path_at(0)
-        }
+        Ok(
+            Sys::OPEN
+            | Sys::STAT
+            | Sys::LSTAT
+            | Sys::ACCESS
+            | Sys::READLINK
+            | Sys::MKNOD
+            | Sys::UNLINK,
+        ) => return path_at(0),
         _ => {}
     }
     alloc::format!(
@@ -1428,9 +1441,9 @@ mod syscall_answer_tests {
     }
 
     /// What a FAIL line says a call was asked: an ioctl's fd and command
-    /// (the escape is in the command), all six of an mmap, and for a call
-    /// that failed with EFAULT the bare arguments, because its path is
-    /// exactly what could not be read.
+    /// (the escape is in the command), all six of an mmap, an open's path,
+    /// and for a call that failed with EFAULT the bare arguments, because
+    /// its path is exactly what could not be read.
     #[test]
     fn a_failure_is_described_by_what_the_call_was_asked() {
         let ioctl = [3, 0xc020_462b, 0x1000, 0, 0, 0];
@@ -1448,6 +1461,22 @@ mod syscall_answer_tests {
             failure_detail(Sys::NEWFSTATAT as u32, &stat, LxError::EFAULT),
             "a0=0xffffff9c a1=0xdead0000 a2=0x1000 a3=0x0"
         );
+        // The boot tracer records an open itself; a CUDA program's failures
+        // in dmesg need its path from here.
+        let path = b"/dev/nvidia-uvm\0";
+        let openat = [0xffff_ff9c, path.as_ptr() as usize, 0x2, 0, 0, 0];
+        assert_eq!(
+            failure_detail(Sys::OPENAT as u32, &openat, LxError::ENOENT),
+            "/dev/nvidia-uvm"
+        );
+        #[cfg(target_arch = "x86_64")]
+        {
+            let open = [path.as_ptr() as usize, 0x2, 0, 0, 0, 0];
+            assert_eq!(
+                failure_detail(Sys::OPEN as u32, &open, LxError::ENOENT),
+                "/dev/nvidia-uvm"
+            );
+        }
     }
 }
 
