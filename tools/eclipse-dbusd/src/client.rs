@@ -733,10 +733,22 @@ mod tests {
         // "nothing yet" it turns every wait into a spin until its deadline and
         // then blames the timeout, which is the opposite of what happened: the
         // bus is gone and the session has to be built again.
-        let path = fake_bus("OK 1234\r\n", "AGREE_UNIX_FD\r\n", |s| {
+        //
+        // The close waits for `connect` to come back, and that wait is the
+        // test and not politeness. `fake_bus` answers the handshake on the
+        // guess that BEGIN and the Hello call arrive in one read; when the
+        // client is descheduled between the two writes the bus replies and
+        // runs this closure first, and the shutdown reaches the client as
+        // `write: Broken pipe` out of `connect`. That is a red `Unit Test`
+        // naming this test for something it does not test, and it is what it
+        // did on the CI runner.
+        let (connected, wait) = std::sync::mpsc::channel::<()>();
+        let path = fake_bus("OK 1234\r\n", "AGREE_UNIX_FD\r\n", move |s| {
+            let _ = wait.recv();
             let _ = s.shutdown(std::net::Shutdown::Both);
         });
         let mut c = Client::connect(&path).expect("connect");
+        let _ = connected.send(());
         let e = c.recv().expect_err("un socket cerrado no es un mensaje");
         assert!(e.contains("closed the connection"), "{e:?}");
         let _ = std::fs::remove_file(&path);

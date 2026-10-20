@@ -545,6 +545,8 @@ mod pipe_tests;
 mod fd_link_tests;
 
 #[cfg(test)]
+mod empty_path_tests;
+#[cfg(test)]
 mod fdinfo_tests;
 #[cfg(test)]
 mod magic_link_tests;
@@ -599,6 +601,11 @@ mod abi_tests {
         );
         assert_eq!(x.stx_mask & 0x0001_0000, 0x0001_0000);
         assert_eq!(x.stx_attributes & 0x0040_0000, 0x0040_0000);
+        // `stx_attributes` is only readable through `stx_attributes_mask`:
+        // a bit the mask does not carry is one the filesystem said nothing
+        // about, so a program reading this the way the uapi tells it to
+        // ignores `STATX_ATTR_WRITE_ATOMIC` unless it is in both.
+        assert_eq!(x.stx_attributes_mask & 0x0040_0000, 0x0040_0000);
         assert_eq!(offset_of!(Statx, __spare2), 0x90);
         assert_eq!(size_of::<Statx>(), 0x100);
     }

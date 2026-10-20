@@ -2370,3 +2370,40 @@ fn the_frame_goes_to_the_card_with_the_monitor_not_to_the_first_one() {
     c.rmfb(fb).expect("RMFB");
     c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
 }
+
+/// `drm_mode_getplane` writes `gamma_size = 0` after the lookup ("FIXME:
+/// Plane gamma"): the field is the kernel's to answer, not the client's
+/// to keep, and libdrm's `drmModeGetPlane` hands it to the client as
+/// `gamma_size`. This arm left the caller's value alone, so a client
+/// that did not zero its struct read its own garbage back; on ENOENT
+/// nothing is written, as in Linux.
+#[test]
+fn getplane_writes_gamma_size_zero_after_the_lookup() {
+    let _screen = kms_emu::attach(32, 8);
+    let c = Client::open(0);
+    let mut cap: [u64; 2] = [DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1];
+    c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap).unwrap();
+    let getplane = |plane_id: u32| {
+        let mut res = DrmModeGetPlane {
+            plane_id,
+            crtc_id: 0,
+            fb_id: 0,
+            possible_crtcs: 0,
+            gamma_size: 0xDEAD_BEEF,
+            count_format_types: 0,
+            format_type_ptr: 0,
+        };
+        let r = c.ioctl(DRM_IOCTL_MODE_GETPLANE, &mut res);
+        (r, res.gamma_size)
+    };
+    assert_eq!(
+        getplane(drm::SYNTH_PLANE_ID),
+        (Ok(0), 0),
+        "gamma_size is the kernel's answer, 0"
+    );
+    assert_eq!(
+        getplane(4242),
+        (Err(FsError::EntryNotFound), 0xDEAD_BEEF),
+        "the lookup comes first: ENOENT writes nothing"
+    );
+}
