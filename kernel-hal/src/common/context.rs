@@ -834,12 +834,12 @@ impl UserContext {
     fn dbg_validate_user_ctx(&self, when: &str) {
         #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
         {
-            use core::sync::atomic::{AtomicUsize, Ordering};
-            static HB: AtomicUsize = AtomicUsize::new(0);
-            let n = HB.fetch_add(1, Ordering::Relaxed);
-            if n.is_multiple_of(200_000) {
-                warn!("[ctxcheck] heartbeat n={} ({})", n, when);
-            }
+            // No heartbeat counter here. It was one `static` every CPU
+            // incremented twice per trip into the kernel and back -- the same
+            // cacheline written from all of them on every syscall, which is
+            // most of why `getpid` from 20 threads scaled to 13 % of 20x one
+            // (Linux: >85 %) -- to print a line every 200 000 traps that said
+            // only that traps were happening.
             const USER_MAX: usize = 0x0000_8000_0000_0000;
             // Do NOT treat a low rip/rsp/rbp as corruption: this loader maps PIE
             // executables (apk and the musl dynamic linker `ld-musl`) at base 0

@@ -23,7 +23,11 @@ use lock::Mutex;
 /// use (Eclipse's custom syscalls go up to ~601).
 pub const PERF_NR: usize = 640;
 
-/// System-wide call counts, indexed by syscall number.
+/// System-wide call counts for the syscall numbers `syscall_stats` cannot
+/// hold (`>= syscall_stats::MAX_SYSCALL`, Eclipse's own calls). Every other
+/// number is counted there already, per CPU, and read from there: this table
+/// counted the same calls a second time into one row the whole machine
+/// shared, so twenty threads making the same syscall all wrote one cacheline.
 static SYS_COUNT: [AtomicU64; PERF_NR] = [const { AtomicU64::new(0) }; PERF_NR];
 /// System-wide cumulative time spent in each syscall, in nanoseconds.
 static SYS_NS: [AtomicU64; PERF_NR] = [const { AtomicU64::new(0) }; PERF_NR];
@@ -118,7 +122,9 @@ pub fn record(proc: &LinuxProcess, num: u32, ns: u64, timed: bool) {
         0
     };
     if (num as usize) < PERF_NR {
-        SYS_COUNT[num as usize].fetch_add(1, Relaxed);
+        if num as usize >= crate::syscall_stats::MAX_SYSCALL {
+            SYS_COUNT[num as usize].fetch_add(1, Relaxed);
+        }
         // Skipped when untimed: adding zero still dirties a cacheline that
         // every CPU making this syscall shares.
         if timed {
@@ -251,15 +257,24 @@ fn fmt_table(out: &mut String, mut rows: Vec<(u32, u64, u64)>) {
     }
 }
 
+/// How many times syscall `i` has been made, machine-wide.
+fn sys_calls_of(i: usize) -> u64 {
+    if i < crate::syscall_stats::MAX_SYSCALL {
+        crate::syscall_stats::calls_of(i as u32)
+    } else {
+        SYS_COUNT[i].load(Relaxed)
+    }
+}
+
 /// Render `/proc/perf`: system-wide syscall accounting.
 pub fn global_report() -> String {
     let uptime = kernel_hal::timer::timer_now().as_secs_f64();
     let mut total_calls = 0u64;
     let mut rows: Vec<(u32, u64, u64)> = Vec::new();
-    for i in 0..PERF_NR {
-        let calls = SYS_COUNT[i].load(Relaxed);
+    for (i, sys_ns) in SYS_NS.iter().enumerate() {
+        let calls = sys_calls_of(i);
         if calls != 0 {
-            let ns = SYS_NS[i].load(Relaxed);
+            let ns = sys_ns.load(Relaxed);
             total_calls += calls;
             rows.push((i as u32, calls, ns));
         }
