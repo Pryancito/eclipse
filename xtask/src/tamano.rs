@@ -63,6 +63,12 @@ const AJENOS: &[&str] = &["vendor/", "smoltcp/", "nvidia-rm-sys/vendor/"];
 /// sus tests viven todos en ficheros aparte desde hace tandas. Lo que queda
 /// dentro y es un tema entero son las credenciales (`setuid`/`setgid`/
 /// `setgroups` y sus comprobaciones) y el control de trabajos.
+///
+/// `linux-syscall/src/file/file.rs` **salio de aqui** el 20-oct-2026, por la
+/// misma via que `desktop.rs`: el #1986 lo dejo en 4795 sobre un techo de
+/// 4750 (master rojo en este test para todo el arbol), y sacar sus catorce
+/// `#[cfg(test)] mod X { ... }` de primer nivel a `file/X.rs` lo dejo en 3860
+/// sin tocar una linea de produccion. Ya no puede volver.
 const PASADOS: &[(&str, usize)] = &[
     // 15250: subido el 18-oct-2026 por la tanda de comptags, que añade dos
     // declaraciones de modulo y la decision de si se honra un kind comprimido
@@ -95,7 +101,6 @@ const PASADOS: &[(&str, usize)] = &[
     ("zircon-object/src/vm/vmar.rs", 5500),
     ("drivers/src/scheme/syncobj.rs", 5500),
     ("tools/lunarbar/src/main.rs", 5250),
-    ("linux-syscall/src/file/file.rs", 4750),
     (
         "linux-object/src/fs/devfs/drm_scheme/kms_scanout_tests.rs",
         4750,
