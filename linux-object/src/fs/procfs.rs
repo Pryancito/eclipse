@@ -15,7 +15,11 @@ use zircon_object::task::{Job, Process, Status, Thread, ThreadState, ROOT_JOB};
 use crate::process::ProcessExt;
 
 #[cfg(test)]
+mod comm_tests;
+#[cfg(test)]
 mod cwd_tests;
+/// `/proc/<pid>/limits`, in its own file for the same reason.
+mod limits;
 /// `/proc/present`, in its own file: `procfs.rs` sits on the size ratchet.
 mod present;
 /// `/proc/<pid>/status`, in its own file for the same reason.
@@ -858,10 +862,10 @@ impl ProcPidDirINode {
         }
     }
 
-    fn entries() -> [&'static str; 16] {
+    fn entries() -> [&'static str; 17] {
         [
             ".", "..", "stat", "cmdline", "status", "perf", "maps", "fd", "comm", "environ",
-            "statm", "exe", "threads", "task", "cwd", "root",
+            "statm", "exe", "threads", "task", "cwd", "root", "limits",
         ]
     }
 }
@@ -968,6 +972,10 @@ impl INode for ProcPidDirINode {
             "threads" => Ok(Arc::new(ProcPidFileINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Threads,
+            })),
+            "limits" => Ok(Arc::new(ProcPidFileINode {
+                pid: self.pid,
+                kind: ProcPidFileKind::Limits,
             })),
             "task" => Ok(Arc::new(ProcPidTaskDirINode { pid: self.pid })),
             "exe" => {
@@ -1342,6 +1350,29 @@ fn comm_from_written_bytes(bytes: &[u8]) -> String {
     comm
 }
 
+/// `comm_write`: `thread` takes the name written, if the writer is one of
+/// `proc`'s own threads. Anyone else gets `EINVAL` (`same_thread_group(
+/// current, p)`); it used to be able to rename any thread of any process.
+fn write_comm(proc: &Process, thread: &Thread, buf: &[u8]) -> Result<usize> {
+    use crate::thread::ThreadExt;
+    if !may_rename(current_process_id(), proc.id()) {
+        return Err(FsError::InvalidParam);
+    }
+    // Whatever the offset, the whole file is the one name: Linux ignores
+    // `*ppos` in `comm_write` too.
+    thread.lock_linux().comm = comm_from_written_bytes(buf);
+    // The caller wrote every byte it handed over, even the ones past
+    // `TASK_COMM_LEN` that the kernel drops; a short count would have
+    // `write(2)` loop and re-write the tail as a new name.
+    Ok(buf.len())
+}
+
+/// Whether `caller` may rename a thread of `target`: only its own. No caller
+/// is the kernel itself (and every host test).
+fn may_rename(caller: Option<u64>, target: u64) -> bool {
+    caller.is_none_or(|caller| caller == target)
+}
+
 /// `/proc/<pid>/task/<tid>/comm`.
 struct ProcTidCommINode {
     pid: u64,
@@ -1361,15 +1392,8 @@ impl INode for ProcTidCommINode {
     }
 
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
-        use crate::thread::ThreadExt;
-        let (_proc, thread) = tid_task(self.pid, self.tid)?;
-        // Whatever the offset, the whole file is the one name: Linux ignores
-        // `*ppos` in `comm_write` too.
-        thread.lock_linux().comm = comm_from_written_bytes(buf);
-        // The caller wrote every byte it handed over, even the ones past
-        // `TASK_COMM_LEN` that the kernel drops; a short count would have
-        // `write(2)` loop and re-write the tail as a new name.
-        Ok(buf.len())
+        let (proc, thread) = tid_task(self.pid, self.tid)?;
+        write_comm(&proc, &thread, buf)
     }
 
     /// `O_TRUNC` leaves the name as it is: in Linux `proc_setattr` takes the
@@ -2440,6 +2464,7 @@ enum ProcPidFileKind {
     Environ,
     Statm,
     Threads,
+    Limits,
 }
 
 impl ProcPidFileKind {
@@ -2456,6 +2481,7 @@ impl ProcPidFileKind {
             Self::Environ => 7,
             Self::Statm => 8,
             Self::Threads => 9,
+            Self::Limits => 10,
         }
     }
 }
@@ -2528,6 +2554,10 @@ impl ProcPidFileINode {
             },
             ProcPidFileKind::Statm => proc_pid_statm(&proc).into_bytes(),
             ProcPidFileKind::Threads => proc_pid_threads(&proc).into_bytes(),
+            ProcPidFileKind::Limits => proc
+                .try_linux()
+                .map(|lp| limits::proc_pid_limits(lp).into_bytes())
+                .unwrap_or_default(),
         })
     }
 }
@@ -2537,14 +2567,29 @@ impl INode for ProcPidFileINode {
         slice_read_at(&self.bytes()?, offset, buf)
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        Err(FsError::NotSupported)
+    /// `comm` renames the process's leader, as `task/<pid>/comm` does.
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        if !matches!(self.kind, ProcPidFileKind::Comm) {
+            return Err(FsError::NotSupported);
+        }
+        let proc = crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
+        let leader = proc_first_thread(&proc).ok_or(FsError::EntryNotFound)?;
+        write_comm(&proc, &leader, buf)
+    }
+
+    /// The `O_TRUNC` of an `fopen(.., "w")` on `comm`; see
+    /// [`ProcTidCommINode::resize`].
+    fn resize(&self, _len: usize) -> Result<()> {
+        match self.kind {
+            ProcPidFileKind::Comm => Ok(()),
+            _ => Err(FsError::NotSupported),
+        }
     }
 
     fn poll(&self) -> Result<PollStatus> {
         Ok(PollStatus {
             read: true,
-            write: false,
+            write: matches!(self.kind, ProcPidFileKind::Comm),
             error: false,
             hangup: false,
         })
@@ -2562,7 +2607,10 @@ impl INode for ProcPidFileINode {
             mtime: Timespec { sec: 0, nsec: 0 },
             ctime: Timespec { sec: 0, nsec: 0 },
             type_: FileType::File,
-            mode: 0o444,
+            mode: match self.kind {
+                ProcPidFileKind::Comm => 0o644,
+                _ => 0o444,
+            },
             nlinks: 1,
             uid: 0,
             gid: 0,
