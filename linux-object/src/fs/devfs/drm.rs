@@ -1861,6 +1861,14 @@ struct DrmLease {
 /// recorded, so `LIST_LESSEES` never listed one and `REVOKE_LEASE` had
 /// nothing to find.
 ///
+/// `None` when a lessee of this master still holds one of `objects`
+/// (`_drm_has_leased`, walked in `drm_lease_create` after the list was
+/// validated: EBUSY). A revoked lessee holds nothing (its `leases` idr was
+/// emptied), so what it had can be leased again; a lessee whose file
+/// closed is gone in Linux, and lives on here like the rest. Any object
+/// was leased as often as it was asked for, so two lessees held the same
+/// CRTC at once.
+///
 /// A lease here lives for the rest of the boot: the lessee's fd is a
 /// second descriptor of the lessor's own open (see the `CREATE_LEASE` arm of
 /// `sys_drm_prime`), so nothing tells its close from the lessor's, and
@@ -1868,8 +1876,15 @@ struct DrmLease {
 /// per node, not per master: a compositor that drops the master and a
 /// successor that takes it see the same list, where Linux would give the
 /// successor a fresh `drm_master` with none.
-pub fn lease_create(minor: u32, objects: Vec<u32>) -> u32 {
+pub fn lease_create(minor: u32, objects: Vec<u32>) -> Option<u32> {
     let mut state = DRM_STATE.lock();
+    if state
+        .leases
+        .iter()
+        .any(|l| l.minor == minor && l.objects.iter().any(|o| objects.contains(o)))
+    {
+        return None;
+    }
     let mut lessee_id = 1;
     while state
         .leases
@@ -1883,7 +1898,7 @@ pub fn lease_create(minor: u32, objects: Vec<u32>) -> u32 {
         lessee_id,
         objects,
     });
-    lessee_id
+    Some(lessee_id)
 }
 
 /// Forget a lease `lease_create` just made whose fd could not be installed
