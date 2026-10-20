@@ -520,6 +520,7 @@ mod which_child {
         let cpu = ChildCpu {
             utime_ns: 1_000,
             stime_ns: 2_000,
+            ..Default::default()
         };
 
         let before = parent.linux().children_cpu_ns();
@@ -551,6 +552,7 @@ mod which_child {
             ChildCpu {
                 utime_ns: 7,
                 stime_ns: 11,
+                ..Default::default()
             },
             93_538,
         );

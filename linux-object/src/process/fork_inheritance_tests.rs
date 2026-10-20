@@ -38,8 +38,12 @@ fn a_configured_parent() -> LinuxProcessInner {
         personality: 0x0004_0000,
         thp_disable: true,
         keep_caps: true,
-        children_utime_ns: 111,
-        children_stime_ns: 222,
+        children_usage: ChildCpu {
+            utime_ns: 111,
+            stime_ns: 222,
+            voluntary_switches: 333,
+            involuntary_switches: 444,
+        },
         pdeathsig: 15,
         child_subreaper: true,
         job_stopped: true,
@@ -210,8 +214,7 @@ fn a_child_starts_with_no_children_of_its_own() {
     // `copy_process` zeroes `cutime`/`cstime`: a child must not be born
     // already credited with the CPU time of its parent's other children,
     // or `times(2)` double-counts it up the whole tree.
-    assert_eq!(child.children_utime_ns, 0);
-    assert_eq!(child.children_stime_ns, 0);
+    assert_eq!(child.children_usage, ChildCpu::default());
 }
 
 /// `copy_process`: `p->flags |= PF_FORKNOEXEC`. The parent has exec'd --

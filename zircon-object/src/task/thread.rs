@@ -10,6 +10,10 @@ mod sched_fork;
 #[cfg(test)]
 mod sched_fork_tests;
 mod signal_frames;
+mod switches;
+/// What a poll that leaves the CPU counts; see the module notes.
+#[cfg(test)]
+mod switches_tests;
 mod thread_state;
 
 /// Lo que un hilo de calculo paga en cada tick; ver las notas del modulo.
@@ -21,6 +25,7 @@ mod sched_benches;
 #[cfg(test)]
 mod return_path_benches;
 
+pub(crate) use self::switches::ContextSwitches;
 pub use self::thread_state::ThreadStateKind;
 
 use alloc::{boxed::Box, sync::Arc};
@@ -628,6 +633,9 @@ pub struct Thread {
     /// is ever included. This is `/proc/[pid]/stat`'s `stime`, and
     /// `getrusage`'s.
     sys_time_ns: AtomicU64,
+    /// How often a poll of this thread has left the CPU; see
+    /// [`ContextSwitches`].
+    switches: ContextSwitches,
     /// Logical CPU core this thread last ran on (field 39, `processor`, of
     /// `/proc/[pid]/stat`). Updated on every poll from `ThreadSwitchFuture`.
     last_cpu: AtomicU32,
@@ -794,6 +802,7 @@ impl Thread {
             current_syscall: AtomicU32::new(0),
             time_ns: AtomicU64::new(0),
             sys_time_ns: AtomicU64::new(0),
+            switches: ContextSwitches::default(),
             last_cpu: AtomicU32::new(0),
         });
         thread.record_ext_birth();
@@ -1433,6 +1442,20 @@ impl Thread {
         self.sys_time_ns.load(Ordering::Relaxed)
     }
 
+    /// This thread's context switches, `(voluntary, nonvoluntary)`: what
+    /// `getrusage(RUSAGE_THREAD)` and its `/proc/<pid>/task/<tid>/status`
+    /// report.
+    pub fn context_switches(&self) -> (u64, u64) {
+        self.switches.get()
+    }
+
+    /// Count one context switch, made `runnable` or waiting. Called from
+    /// `ThreadSwitchFuture::poll`; public like [`Thread::time_add`], for the
+    /// crates that report the counts.
+    pub fn note_context_switch(&self, runnable: bool) {
+        self.switches.note(runnable);
+    }
+
     /// Set the logical CPU core this thread last ran on.
     pub(crate) fn set_last_cpu(&self, cpu: u32) {
         self.last_cpu.store(cpu, Ordering::Relaxed);
@@ -2045,6 +2068,8 @@ impl Future for ThreadSwitchFuture {
         // `/proc/[pid]/stat`'s `stime`.
         let poll_start = kernel_hal::timer::timer_now();
         let user_before = self.thread.get_time();
+        // A yield another task's poll left on this CPU is not this one's.
+        kernel_hal::thread::take_yielded();
         let ret = {
             // Count this thread as running only while it is actually being
             // polled; the guard drops (decrementing) as soon as the poll
@@ -2056,6 +2081,10 @@ impl Future for ThreadSwitchFuture {
             .checked_sub(poll_start)
             .unwrap_or_default()
             .as_nanos() as u64;
+        if ret.is_pending() {
+            self.thread
+                .note_context_switch(kernel_hal::thread::take_yielded());
+        }
         let user_ns = self.thread.get_time().saturating_sub(user_before);
         let sys_ns = poll_ns.saturating_sub(user_ns);
         if sys_ns > 0 {

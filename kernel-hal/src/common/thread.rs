@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 
 use super::future::{SleepFuture, YieldFuture};
@@ -26,6 +26,38 @@ pub async fn yield_now() {
 /// as any peer keeps waking.
 pub async fn preempt_now() {
     YieldFuture::involuntary().await
+}
+
+/// Whether the task each CPU is polling has given the CPU back still
+/// runnable: [`yield_now`] and [`preempt_now`] wake the task before they
+/// return `Pending`, and every other `Pending` waits for something to wake it.
+///
+/// That is Linux's line between the two context switches `getrusage` counts
+/// (`__schedule`: a task that leaves in `TASK_RUNNING` was preempted, or
+/// yielded, and its switch is nonvoluntary; one that leaves asleep gave the
+/// CPU up). A poll cannot see it from outside: both return `Pending`.
+static YIELDED: [AtomicBool; crate::config::MAX_CORE_NUM] =
+    [const { AtomicBool::new(false) }; crate::config::MAX_CORE_NUM];
+
+/// The task being polled on this CPU is giving the CPU back runnable.
+pub(super) fn note_yield() {
+    let cpu = crate::cpu::cpu_id() as usize;
+    if let Some(yielded) = YIELDED.get(cpu) {
+        yielded.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Whether a yield ended a poll on this CPU since the last time this was
+/// asked, and forget it.
+///
+/// Asked before a poll, to clear what another task's poll left, and after
+/// it: a `Pending` with it set left the CPU runnable, one without it went to
+/// sleep.
+pub fn take_yielded() -> bool {
+    let cpu = crate::cpu::cpu_id() as usize;
+    YIELDED
+        .get(cpu)
+        .is_some_and(|yielded| yielded.swap(false, Ordering::Relaxed))
 }
 
 /// Last RUN_TO_PARITY floor each CPU has already armed its timer for.
