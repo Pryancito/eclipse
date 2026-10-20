@@ -25,8 +25,27 @@ use rcore_fs::vfs::{INode, Walked};
 /// Generation counter; see module doc.
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 
-/// An inode, and its name where that is not the path it was looked up by.
-type Entry = (Arc<dyn INode>, Option<String>);
+/// An inode, the root the walk that found it started from, and its name
+/// where that is not the path it was looked up by.
+///
+/// The root is part of what a cached path MEANS: `/etc/passwd` names one
+/// inode under one root and another inode under another, so an entry put in
+/// from one root is not an answer for a lookup from a different one. The
+/// kernel has a single root today, where this never misses. The test binary
+/// does not: it gives every process its own `RamFS`, and without the root in
+/// the entry one test's absolute `open` was served another test's inode --
+/// `/` among them, which is the parent an `O_CREAT` resolves through, so the
+/// new file landed in the wrong filesystem and the next open of it came back
+/// `ENOENT`. That was one red round in four of `linux-syscall --lib` at 16
+/// threads.
+struct Entry {
+    inode: Arc<dyn INode>,
+    /// Held, not compared as a bare address: a freed root could be replaced
+    /// by a new one at the same address, and `ptr_eq` would then say yes to
+    /// the wrong root.
+    root: Arc<dyn INode>,
+    name: Option<String>,
+}
 
 struct Inner {
     /// Epoch the map contents belong to; a mismatch clears the map.
@@ -56,8 +75,13 @@ pub fn invalidate() {
     EPOCH.fetch_add(1, Ordering::Release);
 }
 
-/// The inode `path` leads to, with `walked` at it if one is given.
-pub fn get(path: &str, walked: Option<&mut Walked>) -> Option<Arc<dyn INode>> {
+/// The inode `path` leads to from `root`, with `walked` at it if one is
+/// given.
+pub fn get(
+    root: &Arc<dyn INode>,
+    path: &str,
+    walked: Option<&mut Walked>,
+) -> Option<Arc<dyn INode>> {
     let mut c = CACHE.lock();
     let now = EPOCH.load(Ordering::Acquire);
     if c.epoch != now {
@@ -65,15 +89,20 @@ pub fn get(path: &str, walked: Option<&mut Walked>) -> Option<Arc<dyn INode>> {
         c.epoch = now;
         return None;
     }
-    let (inode, name) = c.map.get(path)?;
-    if let Some(walked) = walked {
-        *walked = Walked::at(name.as_deref().unwrap_or(path), 0);
+    let entry = c.map.get(path)?;
+    // Another root's answer to the same path is not this root's.
+    if !Arc::ptr_eq(&entry.root, root) {
+        return None;
     }
-    Some(inode.clone())
+    if let Some(walked) = walked {
+        *walked = Walked::at(entry.name.as_deref().unwrap_or(path), 0);
+    }
+    Some(entry.inode.clone())
 }
 
-/// Keeps what `path` leads to, and `walked`, where the walk to it ended.
-pub fn put(path: &str, inode: &Arc<dyn INode>, walked: &Walked) {
+/// Keeps what `path` leads to from `root`, and `walked`, where the walk to
+/// it ended.
+pub fn put(root: &Arc<dyn INode>, path: &str, inode: &Arc<dyn INode>, walked: &Walked) {
     let mut c = CACHE.lock();
     let now = EPOCH.load(Ordering::Acquire);
     if c.epoch != now {
@@ -87,7 +116,14 @@ pub fn put(path: &str, inode: &Arc<dyn INode>, walked: &Walked) {
     }
     let name = walked.path();
     let name = (name != path).then_some(name);
-    c.map.insert(String::from(path), (inode.clone(), name));
+    c.map.insert(
+        String::from(path),
+        Entry {
+            inode: inode.clone(),
+            root: root.clone(),
+            name,
+        },
+    );
 }
 
 #[cfg(test)]

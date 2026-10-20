@@ -27,6 +27,7 @@ fn an_inode() -> Arc<dyn INode> {
 #[test]
 fn a_hit_gives_back_the_inode_under_the_name_the_walk_ended_at() {
     let inode = an_inode();
+    let root = an_inode();
     // A path that is its own name, and one that went through a link, which
     // is the only reason a name is kept beside the inode.
     let plain = "/dcache-test/by-its-own-name";
@@ -34,13 +35,16 @@ fn a_hit_gives_back_the_inode_under_the_name_the_walk_ended_at() {
     let leads_to = "/dcache-test/where-the-link-leads";
     let mut rounds = 0;
     for _ in 0..64 {
-        put(plain, &inode, &Walked::at(plain, 0));
-        put(link, &inode, &Walked::at(leads_to, 0));
+        put(&root, plain, &inode, &Walked::at(plain, 0));
+        put(&root, link, &inode, &Walked::at(leads_to, 0));
         let mut one = Walked::at("/", 0);
         let mut two = Walked::at("/", 0);
         // Both in the same round: a cache that cleared itself before every
         // insert would answer one of the two and never both.
-        let (Some(a), Some(b)) = (get(plain, Some(&mut one)), get(link, Some(&mut two))) else {
+        let (Some(a), Some(b)) = (
+            get(&root, plain, Some(&mut one)),
+            get(&root, link, Some(&mut two)),
+        ) else {
             continue;
         };
         assert!(Arc::ptr_eq(&a, &inode), "the inode that was put in");
@@ -64,21 +68,23 @@ fn a_hit_gives_back_the_inode_under_the_name_the_walk_ended_at() {
 #[test]
 fn an_invalidation_is_not_undone_by_the_lookup_that_notices_it() {
     let inode = an_inode();
+    let root = an_inode();
     let path = "/dcache-test/unlinked-right-after";
-    put(path, &inode, &Walked::at(path, 0));
+    put(&root, path, &inode, &Walked::at(path, 0));
     invalidate();
     // The lookup that sees the epoch move answers `None`. What must not
     // happen is that it leaves the entry behind, because the lookup after
     // that one is in the new epoch with the old contents and would serve the
     // inode of a path that has just been unlinked, renamed or mounted over.
-    assert!(get(path, None).is_none(), "the lookup that notices");
-    assert!(get(path, None).is_none(), "the one after it");
-    assert!(get(path, None).is_none(), "and the one after that");
+    assert!(get(&root, path, None).is_none(), "the lookup that notices");
+    assert!(get(&root, path, None).is_none(), "the one after it");
+    assert!(get(&root, path, None).is_none(), "and the one after that");
 }
 
 #[test]
 fn a_session_start_fits_and_a_full_cache_goes_whole() {
     let inode = an_inode();
+    let root = an_inode();
     let first = "/dcache-test/cap/the-first-one";
     // 4096 entries, and the number is the point: a desktop session start
     // (ldso across some fifty libraries, xkb, fontconfig, icon themes)
@@ -90,12 +96,12 @@ fn a_session_start_fits_and_a_full_cache_goes_whole() {
     for _ in 0..4 {
         // From an empty map, as any namespace mutation leaves it.
         invalidate();
-        put(first, &inode, &Walked::at(first, 0));
+        put(&root, first, &inode, &Walked::at(first, 0));
         for i in 0..fits {
             let p = format!("/dcache-test/cap/{}", i);
-            put(&p, &inode, &Walked::at(&p, 0));
+            put(&root, &p, &inode, &Walked::at(&p, 0));
         }
-        if get(first, None).is_some() {
+        if get(&root, first, None).is_some() {
             held = true;
             break;
         }
@@ -106,7 +112,44 @@ fn a_session_start_fits_and_a_full_cache_goes_whole() {
     // path, which is cheaper than keeping track of which path was used last.
     for i in 0..4100 {
         let p = format!("/dcache-test/over/{}", i);
-        put(&p, &inode, &Walked::at(&p, 0));
+        put(&root, &p, &inode, &Walked::at(&p, 0));
     }
-    assert!(get(first, None).is_none(), "a full cache is dropped whole");
+    assert!(
+        get(&root, first, None).is_none(),
+        "a full cache is dropped whole"
+    );
+}
+
+/// The same absolute path under two roots names two different files, and the
+/// cache was keyed by the path alone: a lookup from the second root was
+/// served the first root's inode.
+///
+/// The kernel has one root, so there it never came up. This binary gives
+/// every process its own `RamFS`, and there it did: `/` itself is the parent
+/// an `O_CREAT` resolves through, so a test's new file was created in
+/// another test's filesystem and its own next open of it was `ENOENT`.
+#[test]
+fn a_path_put_in_from_one_root_is_not_an_answer_for_another() {
+    let root = an_inode();
+    let other_root = an_inode();
+    let inode = an_inode();
+    assert!(!Arc::ptr_eq(&root, &other_root), "two different roots");
+    let path = "/dcache-test/two-roots/the-same-name";
+    let mut rounds = 0;
+    for _ in 0..64 {
+        put(&root, path, &inode, &Walked::at(path, 0));
+        // Asked for from the other root this is a miss, which a concurrent
+        // invalidation would also give -- so it is asserted as the absence
+        // it is, in either case.
+        assert!(
+            get(&other_root, path, None).is_none(),
+            "another root was served this root's inode"
+        );
+        let Some(got) = get(&root, path, None) else {
+            continue;
+        };
+        assert!(Arc::ptr_eq(&got, &inode), "and its own root still hits");
+        rounds += 1;
+    }
+    assert!(rounds > 0, "not one round of 64 cached anything");
 }
