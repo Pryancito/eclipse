@@ -921,8 +921,7 @@ fn unknown_mode_object_ids_answer_enoent_like_linux() {
     assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETPROPBLOB, &mut blob), enoent);
 
     // CLOSEFB, like RMFB.
-    let mut fb_id = BOGUS;
-    assert_eq!(c.ioctl(DRM_IOCTL_MODE_CLOSEFB, &mut fb_id), enoent);
+    assert_eq!(c.closefb(BOGUS, 0), enoent);
 
     // SETPLANE looks the plane up first; disabling the real one is fine.
     let mut set_plane: DrmModeSetPlane = zeroed();
