@@ -100,6 +100,15 @@ pub trait INode: Any + Sync + Send {
         Ok((entry.metadata()?, name))
     }
 
+    /// Where a magic link leads, as `/proc/<pid>/fd/N` does (`nd_jump_link`
+    /// on Linux): to an inode, and its name from the root, rather than to the
+    /// path its text spells, which is only what `readlink` reads. `None` for
+    /// every other inode, and an error for a magic link that leads nowhere
+    /// now.
+    fn jump(&self) -> Option<Result<(Arc<dyn INode>, String)>> {
+        None
+    }
+
     /// Control device
     fn io_control(&self, _cmd: u32, _data: usize) -> Result<usize> {
         Err(FsError::NotSupported)
@@ -189,27 +198,35 @@ impl dyn INode {
 /// A link the walk follows is not entered; its target is walked from the
 /// directory that holds it, so a `..` after a link climbs out of where the
 /// link leads.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone)]
 pub struct Walked {
     /// The names, from the root.
     pub names: Vec<String>,
-    /// How many of `names` lead to the root of the file system the walk is
-    /// in, which is where an absolute target starts over.
-    pub root: usize,
+    /// The root of whoever walks: where an absolute target starts over, and
+    /// what a `..` out of a file system reached without the mounts climbs
+    /// back through. Without it an absolute target starts over at the root
+    /// of the file system the walk is in, which for `/proc` or `/dev` is not
+    /// `/`, so a link there to `/tmp` led nowhere.
+    pub root: Option<Arc<dyn INode>>,
+    /// The walk went through a magic link ([`INode::jump`]): what it found
+    /// depends on who walked.
+    pub jumped: bool,
 }
 
 impl Walked {
-    /// At `path`, an absolute path with nothing left to resolve in it, in a
-    /// file system whose root is `root` names down.
-    pub fn at(path: &str, root: usize) -> Self {
-        let mut walked = Walked {
-            names: Vec::new(),
-            root,
-        };
-        for name in path.split('/') {
-            walked.enter(String::from(name));
-        }
+    /// At `path`, an absolute path with nothing left to resolve in it.
+    pub fn at(path: &str) -> Self {
+        let mut walked = Walked::default();
+        walked.set(path);
         walked
+    }
+
+    /// Moves to `path`, as [`Self::at`], keeping the root.
+    pub fn set(&mut self, path: &str) {
+        self.names.clear();
+        for name in path.split('/') {
+            self.enter(String::from(name));
+        }
     }
 
     /// One step down to `name`, or up for `..`.
@@ -217,17 +234,42 @@ impl Walked {
         match name.as_str() {
             "" | "." => {}
             ".." => {
-                if self.names.len() > self.root {
-                    self.names.pop();
-                }
+                self.names.pop();
             }
             _ => self.names.push(name),
         }
     }
 
+    /// Through a magic link to what is named `name`, keeping the root.
+    pub fn jump_to(&mut self, name: &str) {
+        self.set(name);
+        self.jumped = true;
+    }
+
     /// The path, from the root.
     pub fn path(&self) -> String {
         String::from("/") + &self.names.join("/")
+    }
+
+    /// Where `..` leads from `dir`, which is where the walk is.
+    ///
+    /// At the top of a file system reached without the mounts (`/proc`,
+    /// `/sys` and `/dev`, which the kernel walks straight into, and the
+    /// `/dev/shm` inside `/dev`) `..` is that top again, or nothing at all,
+    /// so `/proc/..` was `/proc` and `/dev/..` was `ENOENT`. The directory
+    /// the top is in is then found from the root, by name.
+    fn up(&self, dir: &dyn INode) -> Result<Arc<dyn INode>> {
+        let found = dir.find("..");
+        let (Some(root), Some((_, parent))) = (&self.root, self.names.split_last()) else {
+            return found;
+        };
+        if let Ok(up) = found {
+            let (here, there) = (dir.metadata()?, up.metadata()?);
+            if (here.dev, here.inode) != (there.dev, there.inode) {
+                return Ok(up);
+            }
+        }
+        root.lookup(&parent.join("/"))
     }
 }
 
@@ -255,7 +297,7 @@ fn read_symlink(inode: &dyn INode) -> Result<String> {
 fn lookup_with_budget(
     start: &dyn INode,
     path: &str,
-    budget: usize,
+    mut budget: usize,
     follow_last: bool,
     mut walked: Option<&mut Walked>,
 ) -> Result<Arc<dyn INode>> {
@@ -265,10 +307,14 @@ fn lookup_with_budget(
 
     // handle absolute path
     let (mut result, mut rest_path) = if let Some(rest) = path.strip_prefix('/') {
-        if let Some(walked) = walked.as_deref_mut() {
-            walked.names.truncate(walked.root);
-        }
-        (start.fs().root_inode(), String::from(rest))
+        let root = walked.as_deref_mut().and_then(|walked| {
+            walked.names.clear();
+            walked.root.clone()
+        });
+        (
+            root.unwrap_or_else(|| start.fs().root_inode()),
+            String::from(rest),
+        )
     } else {
         (start.find(".")?, String::from(path))
     };
@@ -289,7 +335,10 @@ fn lookup_with_budget(
         if name.is_empty() {
             continue;
         }
-        let inode = result.find(&name)?;
+        let inode = match walked.as_deref() {
+            Some(walked) if name == ".." => walked.up(&*result)?,
+            _ => result.find(&name)?,
+        };
         // Handle symlink. A link on the way is followed by every walk; the
         // last component only by one asked to follow it, and otherwise it is
         // what `lstat` and `readlink` want. A spent budget is `SymLoop`
@@ -297,6 +346,16 @@ fn lookup_with_budget(
         if inode.metadata()?.type_ == FileType::SymLink && (on_the_way || follow_last) {
             if budget == 0 {
                 return Err(FsError::SymLoop);
+            }
+            // A magic link leads to an inode, and the walk goes on from it.
+            if let Some(jump) = inode.jump() {
+                let (to, named) = jump?;
+                if let Some(walked) = walked.as_deref_mut() {
+                    walked.jump_to(&named);
+                }
+                result = to;
+                budget -= 1;
+                continue;
             }
             let link_path = read_symlink(&*inode)?;
             // result remains unchanged: a relative target is resolved from the
@@ -619,6 +678,8 @@ mod lookup_tests {
         parent: Mutex<Weak<Node>>,
         this: Mutex<Weak<Node>>,
         fs: Mutex<Weak<Tree>>,
+        /// A magic link's target, named as given.
+        to: Mutex<Option<(Weak<Node>, &'static str)>>,
     }
 
     struct Tree {
@@ -633,6 +694,7 @@ mod lookup_tests {
             parent: Mutex::new(Weak::new()),
             this: Mutex::new(Weak::new()),
             fs: Mutex::new(Weak::new()),
+            to: Mutex::new(None),
         });
         *node.this.lock() = Arc::downgrade(&node);
         node
@@ -664,6 +726,12 @@ mod lookup_tests {
         }
         fn link(self: &Arc<Self>, name: &str, target: &str) -> Arc<Node> {
             self.add(name, node(FileType::SymLink, target.as_bytes()))
+        }
+        /// A magic link to `to`, named `at`, whose text leads nowhere.
+        fn jump(self: &Arc<Self>, name: &str, to: &Arc<Node>, at: &'static str) -> Arc<Node> {
+            let link = self.link(name, "nowhere");
+            *link.to.lock() = Some((Arc::downgrade(to), at));
+            link
         }
     }
 
@@ -719,7 +787,7 @@ mod lookup_tests {
             }
             let found: Arc<Node> = match name {
                 "." => self.this.lock().upgrade().unwrap(),
-                ".." => self.parent.lock().upgrade().unwrap(),
+                ".." => self.parent.lock().upgrade().ok_or(FsError::EntryNotFound)?,
                 _ => self
                     .children
                     .lock()
@@ -731,6 +799,13 @@ mod lookup_tests {
         }
         fn fs(&self) -> Arc<dyn FileSystem> {
             self.fs.lock().upgrade().unwrap()
+        }
+        fn jump(&self) -> Option<Result<(Arc<dyn INode>, String)>> {
+            let (to, at) = self.to.lock().clone()?;
+            Some(match to.upgrade() {
+                Some(to) => Ok((to, String::from(at))),
+                None => Err(FsError::EntryNotFound),
+            })
         }
         fn as_any_ref(&self) -> &dyn Any {
             self
@@ -863,21 +938,124 @@ mod lookup_tests {
         assert_eq!(name("l/..", 0), "/");
         assert_eq!(name("..", 0), "/");
 
-        // A walk from a directory goes on from that directory's name, and an
-        // absolute target starts over at the root of the file system, which
-        // is `root` names down.
+        // A walk from a directory goes on from that directory's name.
         let sub = real.children.lock()["sub"].clone();
-        let mut walked = Walked::at("/mnt//x/./sub", 1);
-        assert_eq!(walked.names, ["mnt", "x", "sub"]);
+        let mut walked = Walked::at("/real//./sub");
+        assert_eq!(walked.names, ["real", "sub"]);
         (&*sub as &dyn INode)
-            .lookup_walked("../lf", 4, Some(&mut walked))
+            .lookup_walked("../up", 4, Some(&mut walked))
             .unwrap();
-        assert_eq!(walked.path(), "/mnt/real/f");
-        let mut walked = Walked::at("/mnt", 1);
-        (&*sub as &dyn INode)
-            .lookup_walked("../../../..", 0, Some(&mut walked))
+        assert_eq!(walked.path(), "/real/f");
+    }
+
+    /// A walk with a root of its own starts over there at an absolute
+    /// target, from a file system mounted below it as from anywhere: a link
+    /// in `/proc` or `/dev` leads where it says.
+    #[test]
+    fn an_absolute_target_starts_over_at_the_root_of_whoever_walks() {
+        let tree = tree();
+        let real = tree.root.dir("real");
+        let file = real.file("f", b"");
+        let proc = self::tree();
+        proc.root.link("abs", "/real/f");
+        proc.root.link("rel", "abs");
+        proc.root.link("absdir", "/real");
+        let in_proc = &*proc.root as &dyn INode;
+        let mut walked = Walked::at("/proc");
+        walked.root = Some(tree.root.clone());
+        for path in ["abs", "rel"] {
+            let mut walked = walked.clone();
+            let found = in_proc.lookup_walked(path, 4, Some(&mut walked)).unwrap();
+            assert!(same(&found, &file), "{}", path);
+            assert_eq!(walked.path(), "/real/f");
+        }
+        // From the root, `..` climbs to it and no higher.
+        let found = in_proc
+            .lookup_walked("absdir/../..", 4, Some(&mut walked))
             .unwrap();
-        assert_eq!(walked.path(), "/mnt");
+        assert!(same(&found, &tree.root));
+        assert_eq!(walked.path(), "/");
+        // Without one, it starts over at the root of its own file system.
+        let mut own = Walked::at("/proc");
+        assert_eq!(
+            in_proc.lookup_walked("abs", 4, Some(&mut own)).err(),
+            Some(FsError::EntryNotFound)
+        );
+    }
+
+    /// A magic link leads to an inode, where the walk goes on, and the walk
+    /// is then where that inode is; it costs a hop like any link, and one
+    /// left in place is the link.
+    #[test]
+    fn a_magic_link_leads_to_its_inode() {
+        let tree = tree();
+        let real = tree.root.dir("real");
+        let file = real.file("f", b"");
+        real.link("l", "f");
+        let proc = self::tree();
+        let fd = proc.root.jump("fd", &real, "/real");
+        let in_proc = &*proc.root as &dyn INode;
+        let walk = |path: &str, budget: usize| {
+            let mut walked = Walked::at("/proc");
+            let found = in_proc.lookup_walked(path, budget, Some(&mut walked));
+            (found, walked)
+        };
+        let (found, walked) = walk("fd/f", 4);
+        assert!(same(&found.unwrap(), &file));
+        assert_eq!(
+            (walked.path(), walked.jumped),
+            (String::from("/real/f"), true)
+        );
+        let (found, walked) = walk("fd/..", 4);
+        assert!(same(&found.unwrap(), &tree.root));
+        assert_eq!(walked.path(), "/");
+        let (found, walked) = walk("fd", 0);
+        assert!(same(&found.unwrap(), &fd));
+        assert_eq!(
+            (walked.path(), walked.jumped),
+            (String::from("/proc/fd"), false)
+        );
+        // The jump and the link after it are two hops.
+        assert!(same(&walk("fd/l", 2).0.unwrap(), &file));
+        assert_eq!(walk("fd/l", 1).0.err(), Some(FsError::SymLoop));
+        // One whose inode is gone leads nowhere, not to its text.
+        proc.root.link("nowhere", "fd");
+        let gone = proc.root.jump("gone", &node(FileType::Dir, b""), "/gone");
+        assert!(gone.to.lock().as_ref().unwrap().0.upgrade().is_none());
+        assert_eq!(walk("gone/x", 4).0.err(), Some(FsError::EntryNotFound));
+        assert_eq!(walk("gone", 4).0.err(), Some(FsError::EntryNotFound));
+    }
+
+    /// `..` at the top of a file system reached without the mounts climbs
+    /// to the directory that top is in, from the root, whether the top
+    /// answers `..` with itself (`/proc`) or not at all (`/dev`). Without a
+    /// root the walk has nowhere to climb to and stays.
+    #[test]
+    fn a_dotdot_at_the_top_of_a_file_system_climbs_out_of_it() {
+        let tree = tree();
+        let file = tree.root.dir("real").file("f", b"");
+        tree.root.dir("proc");
+        let dev = tree.root.dir("dev");
+        let proc = self::tree();
+        let shm = node(FileType::Dir, b"");
+        let walk = |from: &Arc<Node>, at: &str, path: &str| {
+            let mut walked = Walked::at(at);
+            walked.root = Some(tree.root.clone());
+            let found = (&**from as &dyn INode).lookup_walked(path, 4, Some(&mut walked));
+            (found.unwrap(), walked.path())
+        };
+        let (found, name) = walk(&proc.root, "/proc", "../real/f");
+        assert!(same(&found, &file));
+        assert_eq!(name, "/real/f");
+        let (found, name) = walk(&shm, "/dev/shm", "..");
+        assert!(same(&found, &dev));
+        assert_eq!(name, "/dev");
+        let in_proc = &*proc.root as &dyn INode;
+        assert!(same(&in_proc.lookup("..").unwrap(), &proc.root));
+        assert_eq!(
+            (&*shm as &dyn INode).lookup("..").err(),
+            Some(FsError::EntryNotFound)
+        );
     }
 
     #[test]

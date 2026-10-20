@@ -549,6 +549,8 @@ mod empty_path_tests;
 #[cfg(test)]
 mod fdinfo_tests;
 #[cfg(test)]
+mod magic_link_tests;
+#[cfg(test)]
 mod opened_path_tests;
 
 #[cfg(all(test, target_arch = "x86_64"))]

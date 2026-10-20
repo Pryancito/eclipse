@@ -55,11 +55,10 @@ fn a_hit_gives_back_the_inode_under_the_name_the_walk_ended_at() {
             leads_to,
             "the name the walk ended at, not the path asked for"
         );
-        // Where an absolute symlink target starts over: the root of the file
-        // system the walk ended in, which for a path already resolved whole
-        // is the top.
-        assert_eq!(one.root, 0);
-        assert_eq!(two.root, 0);
+        // Where an absolute symlink target starts over is the root of whoever
+        // walks, which a hit leaves as it was.
+        assert!(one.root.as_ref().is_some_and(|r| Arc::ptr_eq(r, &root)));
+        assert!(two.root.is_none());
         rounds += 1;
     }
     assert!(rounds > 0, "not one round of 64 cached anything");

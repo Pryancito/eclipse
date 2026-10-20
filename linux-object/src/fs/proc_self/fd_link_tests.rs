@@ -56,7 +56,8 @@ fn a_descriptor_that_is_no_file_has_an_entry_under_its_own_name() {
         ("anon_inode:inotify".into(), FileType::SymLink, 0o500, 64)
     );
     // Read from the middle, the rest of the name; from past its end, nothing.
-    let link = FdLink::of(&*EventFd::new(0, OpenFlags::RDWR));
+    let eventfd: Arc<dyn FileLike> = EventFd::new(0, OpenFlags::RDWR);
+    let link = FdLink::of(&eventfd);
     let mut buf = [0u8; 16];
     assert_eq!(
         link.read_at(11, &mut buf).map(|n| &buf[..n]),
@@ -69,8 +70,8 @@ fn a_descriptor_that_is_no_file_has_an_entry_under_its_own_name() {
 fn the_link_of_a_descriptor_says_how_it_was_opened() {
     let inode: Arc<dyn INode> = Arc::new(Pseudo::new("x", FileType::File));
     let mode = |flags| {
-        let file = File::new(inode.clone(), flags, String::from("/x"));
-        FdLink::of(&*file).metadata().unwrap().mode
+        let file: Arc<dyn FileLike> = File::new(inode.clone(), flags, String::from("/x"));
+        FdLink::of(&file).metadata().unwrap().mode
     };
     assert_eq!(
         [
