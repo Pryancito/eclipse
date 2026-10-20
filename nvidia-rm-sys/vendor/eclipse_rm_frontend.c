@@ -63,6 +63,7 @@
 #include "nvos.h"
 #include "nv_escape.h"
 #include "nv-ioctl.h"
+#include "nv-ioctl-numa.h"
 #include "nvUnixVersion.h"
 #include "class/cl0000.h"      /* NV01_ROOT, NV01_ROOT_CLIENT */
 #include "class/cl0001.h"      /* NV01_ROOT_NON_PRIV */
@@ -1604,8 +1605,9 @@ NvU32 eclipse_rm_frontend_gpu_instance(void *pGpu)
 /*
  * sizeof() of the nv-ioctl.h payloads the Rust side lays out by hand (and
  * the offset of the one field it reads from RM_MAP_MEMORY's, the event
- * RM_GET_EVENT_DATA copies out, and the size of the mapping record it shares
- * with this file), in the order of `LAYOUT` (frontend.rs). The kernel side compares them
+ * RM_GET_EVENT_DATA copies out, NUMA_INFO's payload and the offset of its
+ * count, and the size of the mapping record it shares with this file), in
+ * the order of `LAYOUT` (frontend.rs). The kernel side compares them
  * with its own `size_of` before serving the first ioctl, so a header that
  * moves under a re-pinned submodule refuses the front end instead of
  * writing the wrong bytes back to a client.
@@ -1627,7 +1629,9 @@ NvU32 eclipse_rm_frontend_layout(NvU32 which)
         case 10: return sizeof(nv_ioctl_free_os_event_t);
         case 11: return sizeof(NVOS41_PARAMETERS);
         case 12: return sizeof(NvUnixEvent);
-        case 13: return sizeof(EclipseRmMmapContext);
+        case 13: return sizeof(nv_ioctl_numa_info_t);
+        case 14: return (NvU32) NV_OFFSETOF(nv_ioctl_numa_info_t, offline_addresses.numEntries);
+        case 15: return sizeof(EclipseRmMmapContext);
         default: return 0;
     }
 }

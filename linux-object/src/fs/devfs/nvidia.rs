@@ -15,13 +15,14 @@
 //!   failed, unless what failed was a copy;
 //! - every failure is EINVAL unless nv.c answers something else.
 //!
-//! Served here: CARD_INFO, CHECK_VERSION_STR, SYS_PARAMS, ATTACH_GPUS_TO_FD,
-//! WAIT_OPEN_COMPLETE, STATUS_CODE, REGISTER_FD and the OS events
-//! (ALLOC_OS_EVENT, FREE_OS_EVENT, RM_GET_EVENT_DATA, and `poll`). Served by
-//! the RM (`nvidia-rm-sys/vendor/eclipse_rm_frontend.c`): RM_ALLOC, RM_FREE,
-//! RM_CONTROL, RM_DUP_OBJECT, RM_SHARE, RM_MAP_MEMORY and RM_UNMAP_MEMORY.
-//! Everything else answers EINVAL and is logged the first time each escape
-//! is seen: RM_ALLOC_MEMORY, VID_HEAP_CONTROL, the NUMA and dma-buf escapes.
+//! Served here: CARD_INFO, CHECK_VERSION_STR, SYS_PARAMS, NUMA_INFO,
+//! ATTACH_GPUS_TO_FD, WAIT_OPEN_COMPLETE, STATUS_CODE, REGISTER_FD and the OS
+//! events (ALLOC_OS_EVENT, FREE_OS_EVENT, RM_GET_EVENT_DATA, and `poll`).
+//! Served by the RM (`nvidia-rm-sys/vendor/eclipse_rm_frontend.c`): RM_ALLOC,
+//! RM_FREE, RM_CONTROL, RM_DUP_OBJECT, RM_SHARE, RM_MAP_MEMORY and
+//! RM_UNMAP_MEMORY. Everything else answers EINVAL and is logged the first
+//! time each escape is seen: RM_ALLOC_MEMORY, VID_HEAP_CONTROL,
+//! SET_NUMA_STATUS and the dma-buf escapes.
 //! `nvidia-smi` is what this much is for; CUDA needs those, and
 //! `/dev/nvidia-uvm` besides (`nvidia_uvm.rs`).
 //!
@@ -97,6 +98,7 @@ pub mod esc {
     pub const IOCTL_XFER_CMD: u32 = 211;
     pub const ATTACH_GPUS_TO_FD: u32 = 212;
     pub const SYS_PARAMS: u32 = 214;
+    pub const NUMA_INFO: u32 = 215;
     pub const WAIT_OPEN_COMPLETE: u32 = 218;
 }
 
@@ -122,7 +124,11 @@ const ALLOC_OS_EVENT_SIZE: usize = 16;
 const FREE_OS_EVENT_SIZE: usize = 16;
 /// `NVOS41_PARAMETERS`: `pEvent`, `MoreEvents`, `status`.
 const GET_EVENT_DATA_SIZE: usize = 16;
-const SIZES: [usize; 13] = [
+/// `nv_ioctl_numa_info_t` (nv-ioctl-numa.h), and where in it the count of
+/// retired pages is, after the 64 addresses it can hold.
+const NUMA_INFO_SIZE: usize = 560;
+const NUMA_INFO_OFFLINE_COUNT: usize = 552;
+const SIZES: [usize; 15] = [
     XFER_SIZE,
     CARD_INFO_SIZE,
     RM_API_VERSION_SIZE,
@@ -136,6 +142,8 @@ const SIZES: [usize; 13] = [
     FREE_OS_EVENT_SIZE,
     GET_EVENT_DATA_SIZE,
     nvctl::UnixEvent::SIZE,
+    NUMA_INFO_SIZE,
+    NUMA_INFO_OFFLINE_COUNT,
 ];
 
 /// The most events queued on one open that nobody has read. Linux queues
@@ -151,6 +159,11 @@ const NV_ERR_NOT_READY: u32 = 0x55;
 const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
 const NV_ERR_OPERATING_SYSTEM: u32 = 0x59;
 const PCI_VENDOR_NVIDIA: u16 = 0x10de;
+/// `NV0000_CTRL_NO_NUMA_NODE`, `NV_IOCTL_NUMA_STATUS_DISABLED` and
+/// `NV_IOCTL_NUMA_INFO_MAX_OFFLINE_ADDRESSES`.
+const NO_NUMA_NODE: i32 = -1;
+const NUMA_STATUS_DISABLED: u32 = 0;
+const NUMA_MAX_OFFLINE: u32 = 64;
 
 /// `_IOC_NR` and `_IOC_SIZE`: all `nvidia_ioctl` reads of the command.
 pub fn decode(cmd: u32) -> (u32, usize) {
@@ -457,6 +470,15 @@ impl NvidiaOpen {
         }
     }
 
+    /// `NV_ACTUAL_DEVICE_ONLY`.
+    fn gpu_only(&self) -> LxResult<()> {
+        if self.is_ctl() {
+            Err(LxError::EINVAL)
+        } else {
+            Ok(())
+        }
+    }
+
     /// The GPU minor this is an open of, or `None` for `/dev/nvidiactl`.
     pub fn gpu_minor(&self) -> Option<u32> {
         match self.node {
@@ -520,6 +542,10 @@ impl NvidiaOpen {
             esc::SYS_PARAMS => {
                 self.ctl_only()?;
                 sys_params(payload, &MEMBLOCK_SIZE)
+            }
+            esc::NUMA_INFO => {
+                self.gpu_only()?;
+                numa_info(payload, MEMBLOCK_SIZE.load(Ordering::SeqCst))
             }
             _ => self.rm_ioctl(nr, payload, caller),
         }
@@ -971,6 +997,33 @@ fn sys_params(payload: &[u8], memblock: &AtomicU64) -> LxResult<()> {
         Err(have) if have == want => Ok(()),
         Err(_) => Err(LxError::EBUSY),
     }
+}
+
+/// NV_ESC_NUMA_INFO: whether the GPU's memory is onlined as a NUMA node of
+/// the CPU's, answered as `rm_get_gpu_numa_info` and `nv_get_numa_status`
+/// answer for a GPU on PCIe: no node, nothing onlined, NUMA disabled, no
+/// automatic onlining, and no retired page inside a region that is empty.
+/// Only a GPU on a coherent link (Grace Hopper's) has its memory onlined,
+/// and this kernel drives none, so the RM is not asked: its
+/// FB_GET_NUMA_INFO gives the same for every GPU here. `memblock` is what
+/// the first SYS_PARAMS set, 0 before one.
+fn numa_info(payload: &mut [u8], memblock: u64) -> LxResult<()> {
+    if payload.len() != NUMA_INFO_SIZE {
+        return Err(LxError::EINVAL);
+    }
+    // Room for more retired pages than the RM can list is its
+    // NV_ERR_INVALID_ARGUMENT, which nv.c answers EBUSY.
+    if u32_at(payload, NUMA_INFO_OFFLINE_COUNT) > NUMA_MAX_OFFLINE {
+        return Err(LxError::EBUSY);
+    }
+    put_u32(payload, 0, NO_NUMA_NODE as u32);
+    put_u32(payload, 4, NUMA_STATUS_DISABLED);
+    put_u64(payload, 8, memblock);
+    put_u64(payload, 16, 0);
+    put_u64(payload, 24, 0);
+    payload[32] = 0;
+    put_u32(payload, NUMA_INFO_OFFLINE_COUNT, 0);
+    Ok(())
 }
 
 /// NV_ESC_STATUS_CODE: the adapter status of the GPU at `domain:bus:slot`,
