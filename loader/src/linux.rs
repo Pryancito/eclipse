@@ -1224,6 +1224,13 @@ fn fault_signal_kills(linux: &LinuxThread, signal: Signal, handler: usize) -> bo
         || handler == SIG_IGN
 }
 
+/// [`fault_signal_kills`] for the current thread, read the way
+/// [`force_fault_signal`] will read it a moment later.
+fn fault_kills(thread: &CurrentThread, signal: Signal) -> bool {
+    let action = thread.proc().linux().signal_action(signal);
+    fault_signal_kills(&thread.inner().lock_linux(), signal, action.handler)
+}
+
 fn force_fault_signal(thread: &CurrentThread, signal: Signal, info: SigInfo) {
     let action = thread.proc().linux().signal_action(signal);
     let inner = thread.inner();
@@ -1446,6 +1453,22 @@ async fn handle_user_trap(
                 .unwrap_or(0);
             let fault_result = vmar.handle_page_fault(vaddr, flags);
             if let Err(err) = fault_result {
+                if !fault_kills(thread, Signal::SIGSEGV) {
+                    // The process asked for this fault: a handler is waiting
+                    // for it and will run. That is a JIT, a GC write barrier,
+                    // a guard page -- a path taken thousands of times a
+                    // second -- and the report below went to the console on
+                    // every one of them: a serial line at 115200 baud spent
+                    // ~130 ms printing it, against ~7 us on Linux, which says
+                    // nothing either (`show_signal_msg` only speaks when
+                    // `unhandled_signal()`).
+                    debug!(
+                        "page fault @ {:#x}({:?}) -> SIGSEGV to its handler, pid={} pc={:#x}",
+                        vaddr, flags, pid, pc,
+                    );
+                    force_fault_signal(thread, Signal::SIGSEGV, page_fault_info(vaddr, err));
+                    return Ok(None);
+                }
                 error!(
                     "unhandled page fault @ {:#x}({:?}) [{}] {}: {:?}, pid={} proc={} pc={:#x} [{}] -> SIGSEGV",
                     vaddr,
@@ -1505,7 +1528,22 @@ async fn handle_user_trap(
             // killed by signal SIGSEGV` line, with no fault address, no
             // registers and no caller -- indistinguishable from a page fault
             // and unresolvable without the report the page-fault path prints.
+            // A fault a handler is waiting for gets none of it, as above.
             let vmar = thread.proc().vmar();
+            // A #DE is `FPE_INTDIV` at the instruction; a #GP and the rest
+            // are what Linux sends as `SI_KERNEL` with no address.
+            let info = match signal {
+                Signal::SIGFPE => SigInfo::fault(signal, SignalCode::FPE_INTDIV, pc),
+                _ => SigInfo::fault(signal, SignalCode::KERNEL, 0),
+            };
+            if !fault_kills(thread, signal) {
+                debug!(
+                    "cpu fault trap={:#x} -> {:?} to its handler, pid={} pc={:#x}",
+                    trap_num, signal, pid, pc,
+                );
+                force_fault_signal(thread, signal, info);
+                return Ok(None);
+            }
             error!(
                 "cpu fault from user mode: trap={:#x} -> {:?}, pid={} proc={} tid={} pc={:#x} [{}]",
                 trap_num,
@@ -1517,12 +1555,6 @@ async fn handle_user_trap(
                 describe_addr(&vmar, pc),
             );
             dump_user_fault_context(thread, &vmar, pc, true);
-            // A #DE is `FPE_INTDIV` at the instruction; a #GP and the rest
-            // are what Linux sends as `SI_KERNEL` with no address.
-            let info = match signal {
-                Signal::SIGFPE => SigInfo::fault(signal, SignalCode::FPE_INTDIV, pc),
-                _ => SigInfo::fault(signal, SignalCode::KERNEL, 0),
-            };
             force_fault_signal(thread, signal, info);
             Ok(())
         }
