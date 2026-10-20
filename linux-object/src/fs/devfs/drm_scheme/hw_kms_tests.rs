@@ -1714,6 +1714,11 @@ fn setcrtc_wants_a_mode_that_is_one_and_an_fb_that_holds_it() {
     let einval = Err(FsError::InvalidParam);
     let enospc = Err(FsError::NoDeviceSpace);
     let erange = Err(FsError::OutOfRange);
+    let aspect_cap = |on: bool| {
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_ASPECT_RATIO, on as u64];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP ASPECT_RATIO");
+    };
 
     let setcrtc_on = |crtc_id: u32, fb_id: u32, x: u32, y: u32, mode: [u8; 68]| {
         let connectors = [conn];
@@ -1822,6 +1827,34 @@ fn setcrtc_wants_a_mode_that_is_one_and_an_fb_that_holds_it() {
         "y pushes it past the bottom"
     );
 
+    // "Unexpected aspect-ratio flag bits": any aspect-ratio code from a
+    // client without DRM_CLIENT_CAP_ASPECT_RATIO is EINVAL, after the fb
+    // and before `drm_mode_convert_umode` looks at the clock.
+    let mut m = good;
+    put_u32(&mut m, 28, flags | (4 << 19));
+    assert_eq!(
+        setcrtc(fb, 0, 0, m),
+        einval,
+        "aspect-ratio code 4 without the cap"
+    );
+    assert_eq!(
+        setcrtc(4242, 0, 0, m),
+        Err(FsError::EntryNotFound),
+        "the fb is looked up before the aspect-ratio bits"
+    );
+    put_u32(&mut m, 0, i32::MAX as u32 + 1);
+    assert_eq!(
+        setcrtc(fb, 0, 0, m),
+        einval,
+        "the bits are checked before the clock's range"
+    );
+    assert_eq!(
+        get_crtc_fb(&c, crtc),
+        0,
+        "a refused modeset presented anyway"
+    );
+    aspect_cap(true);
+
     // The mode: `drm_mode_convert_umode` opens with the two u32s it copies
     // into ints, ERANGE past INT_MAX, after the fb and before the
     // aspect-ratio code it then checks.
@@ -1899,9 +1932,10 @@ fn setcrtc_wants_a_mode_that_is_one_and_an_fb_that_holds_it() {
         "a refused modeset presented anyway"
     );
 
-    // What passes: the fb that fits, with the last aspect-ratio code and
-    // the last 3D layout the kernel defines and every flag in
-    // DRM_MODE_FLAG_ALL below them, and then -1 for the same fb again.
+    // What passes: the fb that fits, with the last aspect-ratio code (the
+    // cap is still set) and the last 3D layout the kernel defines and every
+    // flag in DRM_MODE_FLAG_ALL below them, and then -1 for the same fb
+    // again.
     let mut m = good;
     let all = 0x3FF | DRM_MODE_FLAG_DBLCLK | DRM_MODE_FLAG_CLKDIV2;
     m[28..32].copy_from_slice(&(flags | all | (8 << 14) | (4 << 19)).to_ne_bytes());
@@ -1998,6 +2032,9 @@ fn getcrtc_reads_back_the_mode_that_was_set_as_convert_to_umode_gives_it() {
     put_u32(&mut own, 28, 4 << 19);
     put_u32(&mut own, 32, u32::MAX);
     own[36..68].fill(b'n');
+    // The code needs DRM_CLIENT_CAP_ASPECT_RATIO to be set at all
+    // (`drm_mode_setcrtc`: "Unexpected aspect-ratio flag bits").
+    aspect_cap(&c, true);
     assert_eq!(setcrtc(&c, own), Ok(0));
 
     let got = getcrtc(&c);
@@ -2014,18 +2051,13 @@ fn getcrtc_reads_back_the_mode_that_was_set_as_convert_to_umode_gives_it() {
     assert_eq!(got.mode[36..68], name, "strscpy_pad: 31 bytes and a NUL");
     assert_eq!(
         flags_of(&got.mode),
-        0,
-        "the aspect-ratio bits need the client cap"
-    );
-
-    // The cap is per open: this one sees the bits, a second open does not,
-    // and dropping the cap hides them again.
-    aspect_cap(&c, true);
-    assert_eq!(
-        flags_of(&getcrtc(&c).mode),
         4 << 19,
         "with DRM_CLIENT_CAP_ASPECT_RATIO"
     );
+
+    // The cap is per open: this one sees the bits, a second open does not,
+    // dropping the cap hides them (the mode on the CRTC keeps them) and
+    // setting it again shows them.
     let other = Client::open(0);
     assert_eq!(
         flags_of(&getcrtc(&other).mode),
@@ -2034,6 +2066,9 @@ fn getcrtc_reads_back_the_mode_that_was_set_as_convert_to_umode_gives_it() {
     );
     aspect_cap(&c, false);
     assert_eq!(flags_of(&getcrtc(&c).mode), 0, "the cap dropped");
+    aspect_cap(&c, true);
+    assert_eq!(flags_of(&getcrtc(&c).mode), 4 << 19, "the cap set again");
+    aspect_cap(&c, false);
 
     // `drm_mode_vrefresh`: rounded to the nearest, doubled by INTERLACE,
     // halved by DBLSCAN and divided by vscan.
