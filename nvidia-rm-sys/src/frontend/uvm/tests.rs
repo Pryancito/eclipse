@@ -20,6 +20,14 @@ const MAPPING: ExternalMapping = ExternalMapping {
     read_only: false,
 };
 
+const SKED: SkedRange = SkedRange {
+    h_client: 0xc1d0_0002,
+    h_device: 0x5c00_0002,
+    h_va_space: 0x5c00_0007,
+    base: 0x3_0000_0000,
+    length: 0x20_0000,
+};
+
 /// With no open to act through, the RM is not entered at all.
 #[test]
 fn nothing_reaches_the_rm_without_an_open() {
@@ -30,6 +38,10 @@ fn nothing_reaches_the_rm_without_an_open() {
     );
     assert_eq!(
         map_external(&caller(0), &MAPPING),
+        Err(NV_ERR_INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        sked_reflected(&caller(0), &SKED),
         Err(NV_ERR_INVALID_ARGUMENT)
     );
     assert_eq!(
@@ -61,6 +73,8 @@ fn a_hosted_build_knows_no_client() {
     );
     assert!(!super::super::IN_CALL.load(core::sync::atomic::Ordering::SeqCst));
     assert_eq!(map_external(&open, &MAPPING), Err(NV_ERR_INVALID_CLIENT));
+    assert!(!super::super::IN_CALL.load(core::sync::atomic::Ordering::SeqCst));
+    assert_eq!(sked_reflected(&open, &SKED), Err(NV_ERR_INVALID_CLIENT));
     assert!(!super::super::IN_CALL.load(core::sync::atomic::Ordering::SeqCst));
     assert_eq!(free(&open, 0xc1d0_0002, 0xcaf0_0000), NV_ERR_INVALID_CLIENT);
     assert!(!super::super::IN_CALL.load(core::sync::atomic::Ordering::SeqCst));

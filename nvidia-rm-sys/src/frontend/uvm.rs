@@ -15,6 +15,9 @@
 //! keeps a hold on them ([`eclipse_uvm_pages_hold`]) for as long as that
 //! memory lives, so they go back to the allocator only once neither the
 //! kernel nor the RM has them.
+//!
+//! A SKED reflected range is video memory of the user's client mapped with
+//! the kind of a message to SKED ([`sked_reflected`]).
 use super::{CallScope, Caller};
 use crate::types::*;
 use alloc::boxed::Box;
@@ -63,6 +66,17 @@ extern "C" {
         size: NvU64,
         gpu_cached: NvU32,
         h_memory: *mut NvU32,
+    ) -> NV_STATUS;
+    fn eclipse_rm_frontend_uvm_sked(
+        os_info: *mut c_void,
+        admin: NvU32,
+        h_client: NvU32,
+        h_device: NvU32,
+        h_va_space: NvU32,
+        base: NvU64,
+        length: NvU64,
+        h_memory: *mut NvU32,
+        h_virtual: *mut NvU32,
     ) -> NV_STATUS;
 }
 
@@ -113,6 +127,21 @@ unsafe fn eclipse_rm_frontend_uvm_pages(
     _size: NvU64,
     _gpu_cached: NvU32,
     _h_memory: *mut NvU32,
+) -> NV_STATUS {
+    NV_ERR_INVALID_CLIENT
+}
+#[cfg(not(target_os = "none"))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn eclipse_rm_frontend_uvm_sked(
+    _os_info: *mut c_void,
+    _admin: NvU32,
+    _h_client: NvU32,
+    _h_device: NvU32,
+    _h_va_space: NvU32,
+    _base: NvU64,
+    _length: NvU64,
+    _h_memory: *mut NvU32,
+    _h_virtual: *mut NvU32,
 ) -> NV_STATUS {
     NV_ERR_INVALID_CLIENT
 }
@@ -195,7 +224,8 @@ pub fn map_external(caller: &Caller, m: &ExternalMapping) -> Result<u32, NV_STAT
     }
 }
 
-/// Free `h_object` of `h_client`, an object [`map_external`] made.
+/// Free `h_object` of `h_client`, an object [`map_external`], [`pages`] or
+/// [`sked_reflected`] made.
 pub fn free(caller: &Caller, h_client: u32, h_object: u32) -> NV_STATUS {
     if caller.os_info == 0 {
         return NV_ERR_INVALID_ARGUMENT;
@@ -208,6 +238,48 @@ pub fn free(caller: &Caller, h_client: u32, h_object: u32) -> NV_STATUS {
             h_client,
             h_object,
         )
+    }
+}
+
+/// One GPU's SKED reflected range (UVM_MAP_DYNAMIC_PARALLELISM_REGION):
+/// `length` bytes at `base`, one PTE's worth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SkedRange {
+    pub h_client: u32,
+    /// The device the VA space hangs from ([`va_space_device`]).
+    pub h_device: u32,
+    pub h_va_space: u32,
+    /// The GPU virtual address it is mapped at.
+    pub base: u64,
+    pub length: u64,
+}
+
+/// Map `r`: the handles of the video memory behind it and of the
+/// NV50_MEMORY_VIRTUAL holding the mapping, which [`free`] frees in that
+/// order reversed. Nothing is left behind on failure.
+pub fn sked_reflected(caller: &Caller, r: &SkedRange) -> Result<(u32, u32), NV_STATUS> {
+    if caller.os_info == 0 {
+        return Err(NV_ERR_INVALID_ARGUMENT);
+    }
+    let (mut h_memory, mut h_virtual) = (0, 0);
+    let _scope = CallScope::enter(caller.gpu_mask, caller.admin);
+    let status = unsafe {
+        eclipse_rm_frontend_uvm_sked(
+            caller.os_info as *mut c_void,
+            caller.admin as NvU32,
+            r.h_client,
+            r.h_device,
+            r.h_va_space,
+            r.base,
+            r.length,
+            &mut h_memory,
+            &mut h_virtual,
+        )
+    };
+    if status == NV_OK {
+        Ok((h_memory, h_virtual))
+    } else {
+        Err(status)
     }
 }
 

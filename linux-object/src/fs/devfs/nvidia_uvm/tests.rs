@@ -53,6 +53,12 @@ pub(super) struct FakeState {
     /// The status lending pages under a device answers with, for those that
     /// fail.
     pub refuse_pages: BTreeMap<u32, u32>,
+    /// The SKED reflected ranges made, by the handle of their
+    /// NV50_MEMORY_VIRTUAL, with the handle of their memory.
+    pub skeds: BTreeMap<u32, (By, nvctl::SkedRange, u32)>,
+    /// The status a SKED reflected range in a VA space answers with, for
+    /// those that fail.
+    pub refuse_sked: BTreeMap<u32, u32>,
 }
 
 /// Pages made RM memory, with the hold the RM keeps on them.
@@ -135,9 +141,27 @@ impl Rm for FakeRm {
         Ok(h_memory)
     }
 
+    fn sked(
+        &self,
+        by: &nvctl::Caller,
+        r: &nvctl::SkedRange,
+    ) -> core::result::Result<(u32, u32), u32> {
+        let mut state = self.state();
+        if let Some(&status) = state.refuse_sked.get(&r.h_va_space) {
+            return Err(status);
+        }
+        state.last_memory += 1;
+        let h_memory = 0xbee0_0000 + state.last_memory;
+        state.last_virtual += 1;
+        let h_virtual = 0xcaf0_0000 + state.last_virtual;
+        state.skeds.insert(h_virtual, (By::of(by), *r, h_memory));
+        Ok((h_memory, h_virtual))
+    }
+
     fn free(&self, by: &nvctl::Caller, h_client: u32, h_object: u32) {
         let mut state = self.state();
         state.maps.remove(&h_object);
+        state.skeds.remove(&h_object);
         let hold = state.lent.remove(&h_object);
         state.frees.push((By::of(by), h_client, h_object));
         drop(state);
