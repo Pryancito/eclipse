@@ -10,8 +10,9 @@
 //! answers CUDA_ERROR_NOT_INITIALIZED (3). `cuCtxCreate` then hands UVM the
 //! GPU VA space of the context, maps the memory the context needs into it,
 //! registers the context's channels and makes a semaphore pool, which it
-//! maps for the CPU and then asks UVM to validate; if UVM refuses the GPU VA
-//! space, the pool or its validation, `cuCtxCreate` answers
+//! maps for the CPU and then asks UVM to validate, and then has UVM map the
+//! region a kernel launches kernels through; if UVM refuses the GPU VA
+//! space, the pool, its validation or that region, `cuCtxCreate` answers
 //! CUDA_ERROR_NOT_SUPPORTED (801). All of them are served here as uvm.c
 //! serves them:
 //!
@@ -43,10 +44,14 @@
 //!   each GPU with a GPU VA space maps at its address, and an mmap of
 //!   exactly that range maps for the CPU; UVM_FREE gives it back once the
 //!   CPU has unmapped it.
+//! - UVM_MAP_DYNAMIC_PARALLELISM_REGION makes a SKED reflected range on the
+//!   GPU it names: what a kernel writes there is a message to SKED, the unit
+//!   that launches the kernels a kernel launches (dynamic parallelism).
+//!   UVM_FREE gives it back.
 //! - UVM_VALIDATE_VA_RANGE answers whether a range is exactly one here,
-//!   external or a semaphore pool. Linux also counts the ranges it makes for
-//!   a channel's buffers, which this port leaves to the RM (below), so one
-//!   of those is not a range here.
+//!   external, a semaphore pool or SKED reflected. Linux also counts the
+//!   ranges it makes for a channel's buffers, which this port leaves to the
+//!   RM (below), so one of those is not a range here.
 //!
 //! One departure, the whole design of GPU VA spaces and of what is mapped in
 //! them: on Linux UVM owns the page tables of a GPU VA space registered with
@@ -61,7 +66,9 @@
 //! channel's own buffers in a VA space it owns. A semaphore pool's pages are
 //! the kernel's, made RM memory of the GPU VA space's client (an
 //! NV01_MEMORY_SYSTEM_OS_DESCRIPTOR of their physical address) and mapped
-//! like an external allocation. Without page faulting a GPU access outside
+//! like an external allocation. A SKED reflected range, one PTE of a kind of
+//! its own with no memory behind it on Linux, is video memory of the
+//! client's mapped with that PTE's kind. Without page faulting a GPU access outside
 //! every mapping is fatal to its channel instead of a fault UVM serves, which
 //! nothing served here relies on.
 //!
@@ -114,6 +121,7 @@ pub mod cmd {
     pub const REGISTER_GPU: u32 = 37;
     pub const UNREGISTER_GPU: u32 = 38;
     pub const PAGEABLE_MEM_ACCESS: u32 = 39;
+    pub const MAP_DYNAMIC_PARALLELISM_REGION: u32 = 65;
     pub const UNMAP_EXTERNAL: u32 = 66;
     pub const ALLOC_SEMAPHORE_POOL: u32 = 68;
     pub const VALIDATE_VA_RANGE: u32 = 72;
@@ -193,11 +201,12 @@ const MAX_GPUS: u64 = 256;
 /// `NV_STATUS rmStatus`.
 const RANGE_SIZE: usize = 24;
 const RANGE_STATUS: usize = 16;
-/// `UVM_UNMAP_EXTERNAL_PARAMS`: `NvU64 base`, `NvU64 length`,
-/// `NvProcessorUuid gpuUuid`, `NV_STATUS rmStatus`.
-const UNMAP_EXTERNAL_SIZE: usize = 40;
-const UNMAP_EXTERNAL_GPU: usize = 16;
-const UNMAP_EXTERNAL_STATUS: usize = 32;
+/// `UVM_UNMAP_EXTERNAL_PARAMS` and
+/// `UVM_MAP_DYNAMIC_PARALLELISM_REGION_PARAMS`: `NvU64 base`, `NvU64
+/// length`, `NvProcessorUuid gpuUuid`, `NV_STATUS rmStatus`.
+const GPU_RANGE_SIZE: usize = 40;
+const GPU_RANGE_GPU: usize = 16;
+const GPU_RANGE_STATUS: usize = 32;
 /// `UVM_ALLOC_SEMAPHORE_POOL_PARAMS`: `NvU64 base`, `NvU64 length`,
 /// `UvmGpuMappingAttributes perGpuAttributes[UVM_MAX_GPUS]`, `NvU64
 /// gpuAttributesCount`, `NV_STATUS rmStatus`.
@@ -212,6 +221,17 @@ const INIT_FLAGS_MASK: u64 = 0x3;
 /// `UVM_PAGE_SIZE_4K`, the alignment every range is checked for.
 const PAGE_4K: u64 = 0x1000;
 
+/// The page sizes of a Turing GPU's MMU (`page_sizes_pascal`), the only ones
+/// a SKED reflected range comes in there: 4 KiB, 64 KiB and 2 MiB. Ampere
+/// and later also map 512 MiB pages, which is refused here as on Turing.
+const SKED_PAGE_SIZES: [u64; 3] = [0x1000, 0x1_0000, 0x20_0000];
+
+/// The addresses both a GPU of 49-bit virtual addresses (Pascal to Ada) and
+/// an x86_64 CPU of 48 reach (`uvm_gpu_can_address`): below the first and
+/// from the second up, the canonical halves.
+const CANONICAL_LOW_END: u64 = 1 << 47;
+const CANONICAL_HIGH_START: u64 = 0xffff_8000_0000_0000;
+
 const NV_OK: u32 = 0;
 const NV_ERR_GPU_UUID_NOT_FOUND: u32 = 0x12;
 const NV_ERR_ILLEGAL_ACTION: u32 = 0x16;
@@ -222,6 +242,7 @@ const NV_ERR_INVALID_DEVICE: u32 = 0x26;
 const NV_ERR_NO_MEMORY: u32 = 0x51;
 const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
 const NV_ERR_OBJECT_NOT_FOUND: u32 = 0x57;
+const NV_ERR_OUT_OF_RANGE: u32 = 0x5B;
 const NV_ERR_UVM_ADDRESS_IN_USE: u32 = 0x68;
 const NV_WARN_NOTHING_TO_DO: u32 = 0x0001_0006;
 
@@ -248,7 +269,9 @@ fn layout(cmd: u32) -> Option<(usize, usize)> {
         cmd::FREE | cmd::VALIDATE_VA_RANGE | cmd::CREATE_EXTERNAL_RANGE => {
             (RANGE_SIZE, RANGE_STATUS)
         }
-        cmd::UNMAP_EXTERNAL => (UNMAP_EXTERNAL_SIZE, UNMAP_EXTERNAL_STATUS),
+        cmd::UNMAP_EXTERNAL | cmd::MAP_DYNAMIC_PARALLELISM_REGION => {
+            (GPU_RANGE_SIZE, GPU_RANGE_STATUS)
+        }
         cmd::ALLOC_SEMAPHORE_POOL => (POOL_SIZE, POOL_STATUS),
         _ => return None,
     })
@@ -341,13 +364,15 @@ struct VaSpace {
     gpu_va_spaces: BTreeMap<Uuid, GpuVaSpace>,
     /// The external ranges, by first byte.
     ranges: BTreeMap<u64, ExternalRange>,
-    /// The semaphore pools, by first byte. No two ranges overlap, of either
-    /// kind ([`VaSpace::overlaps`]).
+    /// The semaphore pools, by first byte.
     pools: BTreeMap<u64, SemaphorePool>,
+    /// The SKED reflected ranges, by first byte. No two ranges overlap, of
+    /// any kind ([`VaSpace::overlaps`]).
+    skeds: BTreeMap<u64, SkedRange>,
 }
 
 impl VaSpace {
-    /// Whether `[base, end)` overlaps a range here, external or a pool: the
+    /// Whether `[base, end)` overlaps a range here, of any kind: the
     /// collision `uvm_range_tree_add` refuses.
     fn overlaps(&self, base: u64, end: u64) -> bool {
         let range = self
@@ -360,11 +385,16 @@ impl VaSpace {
             .range(..end)
             .next_back()
             .is_some_and(|(_, pool)| pool.end > base);
-        range || pool
+        let sked = self
+            .skeds
+            .range(..end)
+            .next_back()
+            .is_some_and(|(_, sked)| sked.end > base);
+        range || pool || sked
     }
 
-    /// `uvm_va_range_find`: the range here, external or a pool, that holds
-    /// `addr`, as its first byte and one past its last.
+    /// `uvm_va_range_find`: the range here, of any kind, that holds `addr`,
+    /// as its first byte and one past its last.
     fn range_at(&self, addr: u64) -> Option<(u64, u64)> {
         let range = self
             .ranges
@@ -376,7 +406,16 @@ impl VaSpace {
             .range(..=addr)
             .next_back()
             .map(|(&base, pool)| (base, pool.end));
-        range.into_iter().chain(pool).find(|&(_, end)| end > addr)
+        let sked = self
+            .skeds
+            .range(..=addr)
+            .next_back()
+            .map(|(&base, sked)| (base, sked.end));
+        range
+            .into_iter()
+            .chain(pool)
+            .chain(sked)
+            .find(|&(_, end)| end > addr)
     }
 }
 
@@ -420,7 +459,7 @@ struct SemaphorePool {
     /// as [`PoolAttrs::default`] says.
     attrs: BTreeMap<Uuid, PoolAttrs>,
     /// Its mapping on each GPU with a GPU VA space.
-    maps: BTreeMap<Uuid, PoolMapping>,
+    maps: BTreeMap<Uuid, MemoryMapping>,
 }
 
 impl SemaphorePool {
@@ -439,13 +478,25 @@ struct PoolAttrs {
     cached: bool,
 }
 
-/// A semaphore pool's mapping on one GPU, both halves made in the GPU VA
-/// space's client: the pages as RM memory, and the NV50_MEMORY_VIRTUAL at
-/// the pool's address they are mapped into.
+/// Memory UVM made, mapped on one GPU, both halves made in the GPU VA
+/// space's client: the memory (a semaphore pool's pages, or a SKED reflected
+/// range's video memory), and the NV50_MEMORY_VIRTUAL at the range's address
+/// it is mapped into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PoolMapping {
+struct MemoryMapping {
     h_memory: u32,
     h_virtual: u32,
+}
+
+/// A SKED reflected range (`uvm_va_range_sked_reflected_t`): one PTE on one
+/// GPU.
+struct SkedRange {
+    /// One past its last byte.
+    end: u64,
+    /// The GPU it is mapped on, and how. Once that GPU's GPU VA space goes,
+    /// its mapping goes too and the range stays, mapped nowhere, until
+    /// UVM_FREE.
+    map: Option<(Uuid, MemoryMapping)>,
 }
 
 /// One GPU's mapping in an external range (`uvm_ext_gpu_map_t`).
@@ -546,6 +597,12 @@ trait Rm: Send + Sync {
         pages: &nvctl::Pages,
         gpu_cached: bool,
     ) -> RmResult;
+    /// `nvctl::uvm_sked_reflected`: the memory, then the virtual object.
+    fn sked(
+        &self,
+        by: &nvctl::Caller,
+        r: &nvctl::SkedRange,
+    ) -> core::result::Result<(u32, u32), u32>;
     /// `nvctl::uvm_free`.
     fn free(&self, by: &nvctl::Caller, h_client: u32, h_object: u32);
 }
@@ -583,6 +640,14 @@ impl Rm for KernelRm {
         gpu_cached: bool,
     ) -> RmResult {
         nvctl::uvm_pages(by, h_client, h_device, pages, gpu_cached)
+    }
+
+    fn sked(
+        &self,
+        by: &nvctl::Caller,
+        r: &nvctl::SkedRange,
+    ) -> core::result::Result<(u32, u32), u32> {
+        nvctl::uvm_sked_reflected(by, r)
     }
 
     fn free(&self, by: &nvctl::Caller, h_client: u32, h_object: u32) {
@@ -672,6 +737,12 @@ impl UvmOpen {
             cmd::UNMAP_EXTERNAL => self.unmap_external(params, Who::of(caller)),
             cmd::FREE => self.free(u64_at(params, 0), u64_at(params, 8), Who::of(caller)),
             cmd::ALLOC_SEMAPHORE_POOL => self.alloc_semaphore_pool(params, Who::of(caller)),
+            cmd::MAP_DYNAMIC_PARALLELISM_REGION => self.map_sked_reflected(
+                u64_at(params, 0),
+                u64_at(params, 8),
+                &uuid_at(params, GPU_RANGE_GPU),
+                Who::of(caller),
+            ),
             cmd::VALIDATE_VA_RANGE => self.validate_va_range(u64_at(params, 0), u64_at(params, 8)),
             cmd::REGISTER_CHANNEL => self.register_channel(params),
             cmd::UNREGISTER_CHANNEL => self.unregister_channel(
@@ -824,8 +895,7 @@ impl UvmOpen {
     }
 
     /// `remove_gpu_va_space`: the GPU VA space of `uuid`, if it has one, with
-    /// its channels and every mapping on that GPU, of external ranges and of
-    /// semaphore pools.
+    /// its channels and every mapping on that GPU, of any kind of range.
     fn remove_gpu_va_space(&self, va_space: &mut VaSpace, uuid: &Uuid, who: Who) -> bool {
         let Some(gpu_va_space) = va_space.gpu_va_spaces.remove(uuid) else {
             return false;
@@ -837,7 +907,13 @@ impl UvmOpen {
         }
         for pool in va_space.pools.values_mut() {
             if let Some(map) = pool.maps.remove(uuid) {
-                self.unmap_pool(&gpu_va_space, map, who);
+                self.unmap_memory(&gpu_va_space, map, who);
+            }
+        }
+        // `uvm_va_range_deinit_sked_reflected`.
+        for sked in va_space.skeds.values_mut() {
+            if let Some((_, map)) = sked.map.take_if(|(on, _)| on == uuid) {
+                self.unmap_memory(&gpu_va_space, map, who);
             }
         }
         true
@@ -898,7 +974,7 @@ impl UvmOpen {
             Ok(h_virtual) => {
                 pool.maps.insert(
                     *uuid,
-                    PoolMapping {
+                    MemoryMapping {
                         h_memory,
                         h_virtual,
                     },
@@ -912,11 +988,11 @@ impl UvmOpen {
         }
     }
 
-    /// A semaphore pool's mapping on one GPU undone, as the user: the
-    /// virtual object freed, then the memory, unless the open of their
-    /// client is closed and both went with it. The RM gives the pages back
-    /// once nothing it has holds them.
-    fn unmap_pool(&self, gpu_va_space: &GpuVaSpace, map: PoolMapping, who: Who) {
+    /// A mapping of memory UVM made undone, as the user: the virtual object
+    /// freed, then the memory, unless the open of their client is closed and
+    /// both went with it. The RM gives a pool's pages back once nothing it
+    /// has holds them.
+    fn unmap_memory(&self, gpu_va_space: &GpuVaSpace, map: MemoryMapping, who: Who) {
         let Some((_open, by)) = gpu_va_space.ctl.caller(who) else {
             return;
         };
@@ -934,7 +1010,7 @@ impl UvmOpen {
         for (uuid, map) in pool.maps {
             // A GPU has a mapping only while it has a GPU VA space.
             if let Some(gpu_va_space) = gpu_va_spaces.get(&uuid) {
-                self.unmap_pool(gpu_va_space, map, who);
+                self.unmap_memory(gpu_va_space, map, who);
             }
         }
     }
@@ -971,13 +1047,19 @@ impl UvmOpen {
         NV_OK
     }
 
-    /// `uvm_free`: only a whole range, external or a semaphore pool, with
-    /// what is mapped of it. A pool must be unmapped from the CPU first.
+    /// `uvm_free`: only a whole range, external, a semaphore pool or SKED
+    /// reflected, with what is mapped of it. A pool must be unmapped from the
+    /// CPU first.
     fn free(&self, base: u64, length: u64, who: Who) -> u32 {
         let Some(end) = range_end(base, length) else {
             return NV_ERR_INVALID_ADDRESS;
         };
         let mut va_space = self.va_space.lock();
+        if va_space.skeds.get(&base).map(|sked| sked.end) == Some(end) {
+            let sked = va_space.skeds.remove(&base).expect("just found");
+            self.unmap_sked(&va_space.gpu_va_spaces, sked, who);
+            return NV_OK;
+        }
         if va_space.pools.get(&base).map(|pool| pool.end) == Some(end) {
             if va_space.pools[&base].mapped_on_cpu() {
                 return NV_ERR_INVALID_ARGUMENT;
@@ -1164,7 +1246,7 @@ impl UvmOpen {
         let Some(end) = range_end(base, u64_at(params, 8)) else {
             return NV_ERR_INVALID_ADDRESS;
         };
-        let uuid = uuid_at(params, UNMAP_EXTERNAL_GPU);
+        let uuid = uuid_at(params, GPU_RANGE_GPU);
         let mut va_space = self.va_space.lock();
         let Some(range_base) = range_holding(&va_space.ranges, base, end) else {
             return NV_ERR_INVALID_ADDRESS;
@@ -1291,6 +1373,71 @@ impl UvmOpen {
         NV_ERR_INVALID_ADDRESS
     }
 
+    /// `uvm_map_sked_reflected_range`: `[base, base + length)` made a SKED
+    /// reflected range on GPU `uuid`, which must have a GPU VA space here.
+    /// The range must be whole 4 KiB pages the GPU can address, exactly one
+    /// page of a size its MMU maps, and overlap no range here. Its PTE is
+    /// video memory of the GPU VA space's client the RM maps with the kind
+    /// of a SKED message.
+    fn map_sked_reflected(&self, base: u64, length: u64, uuid: &Uuid, who: Who) -> u32 {
+        let Some(end) = range_end(base, length) else {
+            return NV_ERR_INVALID_ADDRESS;
+        };
+        let mut va_space = self.va_space.lock();
+        let Some(gpu_va_space) = va_space.gpu_va_spaces.get(uuid) else {
+            return NV_ERR_INVALID_DEVICE;
+        };
+        if !gpu_can_address(base, end) {
+            return NV_ERR_OUT_OF_RANGE;
+        }
+        if !SKED_PAGE_SIZES.contains(&length) || !base.is_multiple_of(length) {
+            return NV_ERR_INVALID_ADDRESS;
+        }
+        if va_space.overlaps(base, end) {
+            return NV_ERR_UVM_ADDRESS_IN_USE;
+        }
+        let Some((_open, by)) = gpu_va_space.ctl.caller(who) else {
+            return nvctl::NV_ERR_INVALID_CLIENT;
+        };
+        let range = nvctl::SkedRange {
+            h_client: gpu_va_space.h_client,
+            h_device: gpu_va_space.h_device,
+            h_va_space: gpu_va_space.h_va_space,
+            base,
+            length,
+        };
+        let (h_memory, h_virtual) = match self.rm.sked(&by, &range) {
+            Ok(handles) => handles,
+            Err(status) => {
+                sked_refused(base, length, status);
+                return status;
+            }
+        };
+        let map = MemoryMapping {
+            h_memory,
+            h_virtual,
+        };
+        va_space.skeds.insert(
+            base,
+            SkedRange {
+                end,
+                map: Some((*uuid, map)),
+            },
+        );
+        first_sked(base, length);
+        NV_OK
+    }
+
+    /// A SKED reflected range's mapping undone, if it still has one.
+    fn unmap_sked(&self, gpu_va_spaces: &BTreeMap<Uuid, GpuVaSpace>, sked: SkedRange, who: Who) {
+        if let Some((uuid, map)) = sked.map {
+            // A range is mapped only while its GPU has a GPU VA space.
+            if let Some(gpu_va_space) = gpu_va_spaces.get(&uuid) {
+                self.unmap_memory(gpu_va_space, map, who);
+            }
+        }
+    }
+
     /// `uvm_register_channel`: on a GPU with a GPU VA space here, and once.
     /// UVM retains the channel and maps the buffers RM gives it into
     /// `[base, base + length)` of a VA space it owns; in one the RM owns the
@@ -1357,6 +1504,9 @@ impl Drop for UvmOpen {
         for pool in va_space.pools.into_values() {
             self.unmap_pool_everywhere(&va_space.gpu_va_spaces, pool, Who::NOBODY);
         }
+        for sked in va_space.skeds.into_values() {
+            self.unmap_sked(&va_space.gpu_va_spaces, sked, Who::NOBODY);
+        }
     }
 }
 
@@ -1369,6 +1519,12 @@ fn range_end(base: u64, length: u64) -> Option<u64> {
         return None;
     }
     base.checked_add(length)
+}
+
+/// `uvm_gpu_can_address` for a GPU of 49-bit virtual addresses on a CPU of
+/// 48: whether `[base, end)` lies in one canonical half.
+fn gpu_can_address(base: u64, end: u64) -> bool {
+    end <= CANONICAL_LOW_END || base >= CANONICAL_HIGH_START
 }
 
 /// The first byte of the external range that holds all of `[base, end)`.
@@ -1663,6 +1819,33 @@ fn not_a_range(base: u64, length: u64, found: Option<(u64, u64)>) {
     }
 }
 
+/// One log line for the first SKED reflected range, with where it is and its
+/// size, which only libcuda decides.
+fn first_sked(base: u64, length: u64) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        zcore_drivers::klog_warn!(
+            "[nvidia-uvm] UVM_MAP_DYNAMIC_PARALLELISM_REGION: the first SKED reflected range, [{:#x}, +{:#x}), video memory the RM maps as SKED messages",
+            base,
+            length
+        );
+    }
+}
+
+/// One log line the first time the RM refuses a SKED reflected range, with
+/// the range: the RM's status alone does not say which size it took badly.
+fn sked_refused(base: u64, length: u64, status: u32) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        zcore_drivers::klog_warn!(
+            "[nvidia-uvm] UVM_MAP_DYNAMIC_PARALLELISM_REGION: the RM refused [{:#x}, +{:#x}): {:#x}",
+            base,
+            length,
+            status
+        );
+    }
+}
+
 /// One log line the first time UVM_REGISTER_GPU_VASPACE names a fd that is
 /// no open of `/dev/nvidiactl`, the only one an RM client is made through.
 fn not_a_ctl_open(fd: i32) {
@@ -1784,5 +1967,7 @@ pub fn create_node(root: &Arc<DevINode>) {
 mod mapping_tests;
 #[cfg(test)]
 mod pool_tests;
+#[cfg(test)]
+mod sked_tests;
 #[cfg(test)]
 mod tests;

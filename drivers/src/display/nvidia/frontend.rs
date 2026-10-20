@@ -23,7 +23,7 @@ pub use nvidia_rm_sys::frontend::events::{
     alloc_os_event, free_os_event, set_event_sink, UnixEvent, NV_ERR_INVALID_EVENT,
 };
 pub use nvidia_rm_sys::frontend::user_pages::UserPages;
-pub use nvidia_rm_sys::frontend::uvm::{ExternalMapping, Pages, NV_ERR_INVALID_CLIENT};
+pub use nvidia_rm_sys::frontend::uvm::{ExternalMapping, Pages, SkedRange, NV_ERR_INVALID_CLIENT};
 pub use nvidia_rm_sys::frontend::{
     caching, copy_version, layout_mismatch, rm_version, set_user_range_validator, version_check,
     Caller, CpuCaching, MmapContext, MmapMemory, GPU_UUID_LEN, LAYOUT, NV_ERR_STATE_IN_USE,
@@ -150,6 +150,15 @@ pub fn uvm_pages(
         return Err(NV_ERR_NOT_READY);
     }
     nvidia_rm_sys::frontend::uvm::pages(caller, h_client, h_device, pages, gpu_cached)
+}
+
+/// `nvidia_rm_sys::frontend::uvm::sked_reflected`, refused with
+/// `NV_ERR_NOT_READY` while there is no RM core to map in.
+pub fn uvm_sked_reflected(caller: &Caller, r: &SkedRange) -> Result<(u32, u32), NV_STATUS> {
+    if !rm_up() {
+        return Err(NV_ERR_NOT_READY);
+    }
+    nvidia_rm_sys::frontend::uvm::sked_reflected(caller, r)
 }
 
 /// `nvidia_rm_sys::frontend::uvm::free`. With no RM core nothing was ever
@@ -291,6 +300,14 @@ mod tests {
             read_only: false,
         };
         assert_eq!(uvm_map_external(&caller, &mapping), Err(NV_ERR_NOT_READY));
+        let sked = SkedRange {
+            h_client: 0xc1d0_0002,
+            h_device: 0x5c00_0002,
+            h_va_space: 0x5c00_0007,
+            base: 0x3_0000_0000,
+            length: 0x20_0000,
+        };
+        assert_eq!(uvm_sked_reflected(&caller, &sked), Err(NV_ERR_NOT_READY));
         let keep: alloc::sync::Arc<dyn core::any::Any + Send + Sync> = alloc::sync::Arc::new(());
         let pages = Pages {
             phys: 0x8000_0000,

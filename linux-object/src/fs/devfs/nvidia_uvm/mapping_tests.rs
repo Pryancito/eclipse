@@ -161,10 +161,10 @@ impl Process {
     }
 
     fn unmap(&self, base: u64, length: u64, uuid: &Uuid) -> u32 {
-        let mut params = vec![0u8; UNMAP_EXTERNAL_SIZE];
+        let mut params = vec![0u8; GPU_RANGE_SIZE];
         params[..8].copy_from_slice(&base.to_le_bytes());
         params[8..16].copy_from_slice(&length.to_le_bytes());
-        params[UNMAP_EXTERNAL_GPU..][..16].copy_from_slice(uuid);
+        params[GPU_RANGE_GPU..][..16].copy_from_slice(uuid);
         self.call(cmd::UNMAP_EXTERNAL, &mut params)
     }
 
@@ -614,6 +614,7 @@ fn cuctxcreate_calls_need_a_va_space() {
         cmd::UNREGISTER_CHANNEL,
         cmd::ALLOC_SEMAPHORE_POOL,
         cmd::VALIDATE_VA_RANGE,
+        cmd::MAP_DYNAMIC_PARALLELISM_REGION,
     ] {
         let (size, at) = layout(cmd).expect("served");
         let mut params = vec![0u8; size];
