@@ -28,6 +28,9 @@
  * the osEventNotification family), which hands each OS event that fires to
  * the registration the client made for it (see "OS events" below).
  *
+ * And what /dev/nvidia-uvm asks of the RM for a GPU VA space it does not own
+ * the page tables of (see "UVM" below).
+ *
  * What is NOT here yet, and answers NV_ERR_NOT_SUPPORTED (which the kernel
  * side turns into EINVAL, like an unknown escape on Linux): RM_ALLOC_MEMORY
  * and RM_VID_HEAP_CONTROL (OS descriptors: pinning user pages), and the two
@@ -76,6 +79,8 @@
 #include "gpu/subdevice/subdevice.h"
 #include "gpu/mem_mgr/mem_desc.h"
 #include "gpu/mem_mgr/rm_page_size.h"
+#include "gpu/mem_mgr/vaspace_api.h"
+#include "class/cl50a0.h"      /* NV50_MEMORY_VIRTUAL */
 #include "mem_mgr/mem.h"
 #include "rmapi/rs_utils.h"
 #include "rmapi/event.h"       /* EVENTNOTIFICATION */
@@ -1239,6 +1244,269 @@ NV_STATUS eclipse_rm_frontend_gpu_uuid(NvU32 gpuInstance, NvU8 *pUuid)
             }
             rmapiLockRelease();
         }
+        gpumgrThreadDisableExpandedGpuVisibility();
+    }
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/*
+ * UVM.
+ *
+ * On Linux, UVM_REGISTER_GPU_VASPACE hands a client's FERMI_VASPACE_A to
+ * nvidia-uvm.ko, which from then on owns its page tables: libcuda allocated
+ * it IS_EXTERNALLY_OWNED, so the RM never writes a PTE in it, and every GPU
+ * mapping CUDA makes there is UVM's (UVM_MAP_EXTERNAL_ALLOCATION). Eclipse
+ * has no UVM page-table code, so the kernel side
+ * (linux-object/src/fs/devfs/nvidia_uvm.rs) clears that flag, and page
+ * faulting with it, when the VA space is allocated, and the RM keeps its
+ * page tables. Each UVM mapping becomes what an RM client would do for
+ * itself: an NV50_MEMORY_VIRTUAL at the fixed address UVM was given, and an
+ * RM map of the memory into it, nv_gpu_ops.c's nvGpuOpsAllocVirtual and
+ * nvGpuOpsMapGpuMemory. Freeing the virtual object unmaps it.
+ *
+ * Those calls are made as the user: in the client the user named, under the
+ * open of /dev/nvidiactl that made it (`pOsInfo`, which the RM checks the
+ * client against), with the user's privilege, and with the parameters in
+ * kernel memory, which is what UVM's own dups through a kernel client come
+ * to without the second client.
+ */
+
+static API_SECURITY_INFO _eclipse_rm_frontend_uvm_sec_info(void *pOsInfo, NvU32 bAdmin)
+{
+    API_SECURITY_INFO secInfo = _eclipse_rm_frontend_sec_info(pOsInfo, bAdmin);
+
+    secInfo.paramLocation = PARAM_LOCATION_KERNEL;
+    return secInfo;
+}
+
+static NV_STATUS _eclipse_rm_frontend_uvm_va_space_locked(
+    RmClient *pRmClient,
+    void     *pOsInfo,
+    NvHandle  hVaSpace,
+    NvU32     gpuInstance,
+    NvHandle *phDevice)
+{
+    RsResourceRef *pResourceRef;
+    Device *pDevice;
+    NV_STATUS status;
+
+    /* Only a client made through the caller's own open of /dev/nvidiactl. */
+    if (pRmClient->pOSInfo != pOsInfo)
+    {
+        return NV_ERR_INVALID_CLIENT;
+    }
+
+    status = clientGetResourceRef(staticCast(pRmClient, RsClient), hVaSpace, &pResourceRef);
+    if (status != NV_OK)
+    {
+        return status;
+    }
+
+    if ((dynamicCast(pResourceRef->pResource, VaSpaceApi) == NULL) ||
+        (pResourceRef->pParentRef == NULL))
+    {
+        return NV_ERR_INVALID_OBJECT;
+    }
+
+    pDevice = dynamicCast(pResourceRef->pParentRef->pResource, Device);
+    if (pDevice == NULL)
+    {
+        return NV_ERR_INVALID_OBJECT;
+    }
+
+    if (GPU_RES_GET_GPU(pDevice)->gpuInstance != gpuInstance)
+    {
+        return NV_ERR_INVALID_DEVICE;
+    }
+
+    *phDevice = pResourceRef->pParentRef->hResource;
+    return NV_OK;
+}
+
+/*
+ * UVM_REGISTER_GPU_VASPACE's check of what it is handed: `hVaSpace` must be
+ * a FERMI_VASPACE_A of `hClient`, a client made through `pOsInfo`, on the
+ * GPU `gpuInstance` names. The device it hangs from, which the mappings are
+ * made under, goes to `phDevice`.
+ */
+NV_STATUS eclipse_rm_frontend_uvm_va_space(
+    void     *pOsInfo,
+    NvHandle  hClient,
+    NvHandle  hVaSpace,
+    NvU32     gpuInstance,
+    NvHandle *phDevice)
+{
+    THREAD_STATE_NODE threadState;
+    NV_STATUS status;
+
+    if ((pOsInfo == NULL) || (phDevice == NULL))
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status == NV_OK)
+    {
+        status = rmapiLockAcquire(RMAPI_LOCK_FLAGS_READ, RM_LOCK_MODULES_OSAPI);
+        if (status == NV_OK)
+        {
+            CLIENT_ENTRY *pClientEntry;
+            RmClient *pRmClient;
+
+            if (serverutilAcquireClient(hClient, LOCK_ACCESS_READ, &pClientEntry,
+                                        &pRmClient) != NV_OK)
+            {
+                status = NV_ERR_INVALID_CLIENT;
+            }
+            else
+            {
+                status = _eclipse_rm_frontend_uvm_va_space_locked(pRmClient, pOsInfo,
+                                                                  hVaSpace, gpuInstance,
+                                                                  phDevice);
+                serverutilReleaseClient(LOCK_ACCESS_READ, pClientEntry);
+            }
+            rmapiLockRelease();
+        }
+        gpumgrThreadDisableExpandedGpuVisibility();
+    }
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/*
+ * One GPU's half of UVM_MAP_EXTERNAL_ALLOCATION: `length` bytes of
+ * `hMemory` from `offset`, at GPU virtual address `base` of `hVaSpace`
+ * (under `hDevice`, both of `hClient`). The NV50_MEMORY_VIRTUAL that holds
+ * the mapping goes to `phVirtual`; freeing it unmaps it. Nothing is left
+ * behind on failure.
+ *
+ * A range that is not 64 KiB aligned at both ends (UVM only asks for 4 KiB)
+ * is mapped with 4 KiB pages; any other with the RM's default, as
+ * nvGpuOpsMapGpuMemory does.
+ */
+NV_STATUS eclipse_rm_frontend_uvm_map(
+    void     *pOsInfo,
+    NvU32     bAdmin,
+    NvHandle  hClient,
+    NvHandle  hDevice,
+    NvHandle  hVaSpace,
+    NvHandle  hMemory,
+    NvU64     offset,
+    NvU64     base,
+    NvU64     length,
+    NvU32     bReadOnly,
+    NvHandle *phVirtual)
+{
+    THREAD_STATE_NODE threadState;
+    API_SECURITY_INFO secInfo;
+    NV_MEMORY_ALLOCATION_PARAMS allocParams;
+    NVOS46_PARAMETERS mapParams;
+    RM_API *pRmApi = rmapiGetInterface(RMAPI_EXTERNAL);
+    NvHandle hVirtual = NV01_NULL_OBJECT;
+    NvBool bSmallPages = !NV_IS_ALIGNED64(base, RM_PAGE_SIZE_64K) ||
+                         !NV_IS_ALIGNED64(length, RM_PAGE_SIZE_64K);
+    NV_STATUS status;
+
+    if ((pOsInfo == NULL) || (phVirtual == NULL))
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    secInfo = _eclipse_rm_frontend_uvm_sec_info(pOsInfo, bAdmin);
+
+    portMemSet(&allocParams, 0, sizeof(allocParams));
+    allocParams.owner = hClient;
+    allocParams.type = NVOS32_TYPE_IMAGE;
+    allocParams.flags = NVOS32_ALLOC_FLAGS_VIRTUAL |
+                        NVOS32_ALLOC_FLAGS_FIXED_ADDRESS_ALLOCATE;
+    allocParams.attr = bSmallPages ? DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _4KB)
+                                   : DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _DEFAULT);
+    allocParams.offset = base;
+    allocParams.size = length;
+    allocParams.hVASpace = hVaSpace;
+
+    portMemSet(&mapParams, 0, sizeof(mapParams));
+    mapParams.hClient = hClient;
+    mapParams.hDevice = hDevice;
+    mapParams.hMemory = hMemory;
+    mapParams.offset = offset;
+    mapParams.length = length;
+    mapParams.flags = (bReadOnly ? DRF_DEF(OS46, _FLAGS, _ACCESS, _READ_ONLY)
+                                 : DRF_DEF(OS46, _FLAGS, _ACCESS, _READ_WRITE)) |
+                      DRF_DEF(OS46, _FLAGS, _CACHE_SNOOP, _ENABLE) |
+                      (bSmallPages ? DRF_DEF(OS46, _FLAGS, _PAGE_SIZE, _4KB)
+                                   : DRF_DEF(OS46, _FLAGS, _PAGE_SIZE, _DEFAULT));
+    /* Not _DMA_OFFSET_FIXED: relative to the virtual allocation, so its start. */
+    mapParams.dmaOffset = 0;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status == NV_OK)
+    {
+        status = pRmApi->AllocWithSecInfo(pRmApi, hClient, hDevice, &hVirtual,
+                                          NV50_MEMORY_VIRTUAL,
+                                          NV_PTR_TO_NvP64(&allocParams),
+                                          sizeof(allocParams),
+                                          RMAPI_ALLOC_FLAGS_NONE, NvP64_NULL,
+                                          &secInfo);
+        if ((status == NV_OK) && (allocParams.offset != base))
+        {
+            status = NV_ERR_INVALID_STATE;
+        }
+
+        if (status == NV_OK)
+        {
+            mapParams.hDma = hVirtual;
+            status = pRmApi->MapWithSecInfo(pRmApi, &mapParams, &secInfo);
+            if ((status == NV_OK) && (mapParams.dmaOffset != base))
+            {
+                status = NV_ERR_INVALID_STATE;
+            }
+        }
+
+        if ((status != NV_OK) && (hVirtual != NV01_NULL_OBJECT))
+        {
+            pRmApi->FreeWithSecInfo(pRmApi, hClient, hVirtual,
+                                    RMAPI_FREE_FLAGS_NONE, &secInfo);
+        }
+        gpumgrThreadDisableExpandedGpuVisibility();
+    }
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    if (status == NV_OK)
+    {
+        *phVirtual = hVirtual;
+    }
+    return status;
+}
+
+/* RM_FREE of `hObject`, as the user, for an object UVM made above. */
+NV_STATUS eclipse_rm_frontend_uvm_free(
+    void     *pOsInfo,
+    NvU32     bAdmin,
+    NvHandle  hClient,
+    NvHandle  hObject)
+{
+    THREAD_STATE_NODE threadState;
+    API_SECURITY_INFO secInfo;
+    RM_API *pRmApi = rmapiGetInterface(RMAPI_EXTERNAL);
+    NV_STATUS status;
+
+    if (pOsInfo == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    secInfo = _eclipse_rm_frontend_uvm_sec_info(pOsInfo, bAdmin);
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status == NV_OK)
+    {
+        status = pRmApi->FreeWithSecInfo(pRmApi, hClient, hObject,
+                                         RMAPI_FREE_FLAGS_NONE, &secInfo);
         gpumgrThreadDisableExpandedGpuVisibility();
     }
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
