@@ -420,6 +420,21 @@ impl NvidiaOpen {
         self.node == Node::Ctl
     }
 
+    /// `RmIoctl`'s `clientOSInfo`: the control open REGISTER_FD linked this
+    /// one to (`nvfp->ctl_nvfp`), or this open itself. Clients are only made
+    /// through a control open, and the RM refuses a call that names one with
+    /// any other `clientOSInfo` (NV_ERR_INVALID_CLIENT), as it refused
+    /// cuCtxCreate's NV01_EVENT_OS_EVENT on `/dev/nvidia<N>` (CUDA's 400).
+    /// The OS events this open registers stay its own.
+    fn client_os_info(&self) -> usize {
+        let state = self.state.lock();
+        let ctl = state
+            .ctl
+            .as_ref()
+            .and_then(|ctl| ctl.downcast_ref::<NvidiaOpen>());
+        ctl.map_or(self.os_info(), NvidiaOpen::os_info)
+    }
+
     /// What UVM makes its RM calls on a client of this open through (its
     /// `clientOSInfo`), when it is an open of `/dev/nvidiactl`, the only
     /// open a client is made through.
@@ -606,7 +621,7 @@ impl NvidiaOpen {
     /// Who the RM is told is calling.
     fn rm_caller(&self, caller: &NvCaller) -> nvctl::Caller {
         nvctl::Caller {
-            os_info: self.os_info(),
+            os_info: self.client_os_info(),
             ctl: self.is_ctl(),
             admin: caller.admin,
             gpu_mask: (caller.gpu_mask)(),
