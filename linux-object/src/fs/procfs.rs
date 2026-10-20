@@ -7,7 +7,7 @@ use lazy_static::lazy_static;
 
 use kernel_hal::drivers;
 use rcore_fs::vfs::{
-    FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec,
+    FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec, Walked,
 };
 use zircon_object::object::KernelObject;
 use zircon_object::task::{Job, Process, Status, Thread, ThreadState, ROOT_JOB};
@@ -32,7 +32,7 @@ use present::proc_present_content;
 use smoltcp::wire::{IpAddress, IpCidr};
 use status::{proc_pid_status, proc_task_status};
 
-const PROC_ROOT_STATIC: [&str; 57] = [
+const PROC_ROOT_STATIC: [&str; 58] = [
     "net",
     "present",
     "oops",
@@ -47,6 +47,7 @@ const PROC_ROOT_STATIC: [&str; 57] = [
     "uptime",
     "mounts",
     "self",
+    "thread-self",
     "stat",
     "loadavg",
     "sys",
@@ -774,6 +775,7 @@ impl INode for ProcRootINode {
             "bootprofile" => Ok(PROC_BOOTPROFILE.clone()),
             "kbd" => Ok(PROC_KBD.clone()),
             "self" => Ok(PROC_SELF_SYM.clone()),
+            "thread-self" => Ok(Arc::new(ProcSelfSymINode { thread: true })),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
                     if crate::process::find_task(pid as _).is_some() {
@@ -2409,14 +2411,29 @@ fn store_kbd(value: &str) -> Result<()> {
 }
 
 /// `/proc/self` — target pid is resolved on read, not at `find()` time.
-struct ProcSelfSymINode;
+///
+/// `/proc/thread-self` is the same link one level down: `<pid>/task/<tid>`,
+/// the calling thread's own directory (`proc_thread_self_get_link`).
+struct ProcSelfSymINode {
+    thread: bool,
+}
+
+impl ProcSelfSymINode {
+    fn target(&self) -> String {
+        let pid = current_process_id().unwrap_or(1);
+        if !self.thread {
+            return alloc::format!("{}", pid);
+        }
+        let tid = kernel_hal::thread::get_current_thread()
+            .and_then(|t| t.downcast::<Thread>().ok())
+            .map_or(pid, |t| t.id());
+        alloc::format!("{}/task/{}", pid, tid)
+    }
+}
 
 impl INode for ProcSelfSymINode {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        let target = current_process_id()
-            .map(|id| alloc::format!("{}", id))
-            .unwrap_or_else(|| "1".into());
-        slice_read_at(target.as_bytes(), offset, buf)
+        slice_read_at(self.target().as_bytes(), offset, buf)
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
@@ -2433,14 +2450,11 @@ impl INode for ProcSelfSymINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        let target = current_process_id()
-            .map(|id| alloc::format!("{}", id))
-            .unwrap_or_else(|| "1".into());
         Ok(Metadata {
             dev: 0,
-            // Its own: 12 is `/proc/cpuinfo`'s.
-            inode: 19,
-            size: target.len(),
+            // Its own: 12 is `/proc/cpuinfo`'s, 20 `/proc/net`'s.
+            inode: if self.thread { 28 } else { 19 },
+            size: self.target().len(),
             blk_size: 0,
             blocks: 0,
             atime: Timespec { sec: 0, nsec: 0 },
@@ -3906,7 +3920,11 @@ fn proc_net_if_inet6_content() -> String {
 }
 
 /// Resolve an absolute `/proc/...` path without walking the ext2 backing store.
-pub(crate) fn lookup_path(path: &str, follow_times: usize) -> Result<Arc<dyn INode>> {
+pub(crate) fn lookup_path(
+    path: &str,
+    follow_times: usize,
+    walked: Option<&mut Walked>,
+) -> Result<Arc<dyn INode>> {
     let path = path.trim_end_matches('/');
     if path == "/proc" {
         return Ok(PROC_ROOT.clone());
@@ -3915,7 +3933,7 @@ pub(crate) fn lookup_path(path: &str, follow_times: usize) -> Result<Arc<dyn INo
     if rest.is_empty() {
         return Ok(PROC_ROOT.clone());
     }
-    PROC_ROOT.lookup_follow(rest, follow_times)
+    PROC_ROOT.lookup_walked(rest, follow_times, walked)
 }
 
 // Its own `lazy_static!` block, not an entry in the big one below: that block
@@ -3962,7 +3980,7 @@ lazy_static! {
         inode: 48,
         generate: proc_perf_kernel_content,
     });
-    static ref PROC_SELF_SYM: Arc<dyn INode> = Arc::new(ProcSelfSymINode);
+    static ref PROC_SELF_SYM: Arc<dyn INode> = Arc::new(ProcSelfSymINode { thread: false });
     static ref PROC_MEMINFO: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 11,
         generate: proc_meminfo_content,
@@ -4767,6 +4785,7 @@ mod proc_inode_tests {
         // The two that shared a number with another file.
         let inode_of = |name: &str| root.find(name).unwrap().metadata().unwrap().inode;
         assert_ne!(inode_of("self"), inode_of("cpuinfo"));
+        assert_ne!(inode_of("self"), inode_of("thread-self"));
         assert_ne!(
             PROC_SYS_DIR
                 .find("kernel")
@@ -5688,7 +5707,7 @@ mod proc_numbers_tests {
     /// stops.
     #[test]
     fn proc_self_read_past_its_target_is_the_end() {
-        let inode = ProcSelfSymINode;
+        let inode = ProcSelfSymINode { thread: false };
         let mut buf = [0u8; 16];
         let n = inode.read_at(0, &mut buf).unwrap();
         assert_eq!(n, inode.metadata().unwrap().size);

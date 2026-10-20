@@ -2,6 +2,7 @@
 
 mod block_mount;
 mod btrfs_mount;
+mod dcache;
 pub mod devfs;
 mod dmabuf;
 mod eclipsefs_ioctl;
@@ -62,7 +63,7 @@ use lazy_static::lazy_static;
 use lock::Mutex;
 
 use kernel_hal::drivers;
-use rcore_fs::vfs::{FileSystem, FileType, INode, Result};
+use rcore_fs::vfs::{FileSystem, FileType, INode, Result, Walked};
 use rcore_fs_devfs::{
     special::{NullINode, ZeroINode},
     DevFS, DevINode,
@@ -2336,7 +2337,22 @@ impl LinuxProcess {
         path: &str,
         follow: bool,
     ) -> LxResult<Arc<dyn INode>> {
-        self.lookup_inode_at_inner(dirfd, path, follow, FOLLOW_MAX_DEPTH)
+        self.lookup_inode_at_inner(dirfd, path, follow, FOLLOW_MAX_DEPTH, None)
+    }
+
+    /// [`Self::lookup_inode_at`], and where the walk ended: what Linux names
+    /// the file by (`d_path`), from the root, through no link, and with the
+    /// pid in place of `/proc/self`.
+    pub fn lookup_inode_walked(
+        &self,
+        dirfd: FileDesc,
+        path: &str,
+        follow: bool,
+    ) -> LxResult<(Arc<dyn INode>, Walked)> {
+        let mut walked = Walked::default();
+        let inode =
+            self.lookup_inode_at_inner(dirfd, path, follow, FOLLOW_MAX_DEPTH, Some(&mut walked))?;
+        Ok((inode, walked))
     }
 
     fn lookup_inode_at_inner(
@@ -2345,6 +2361,7 @@ impl LinuxProcess {
         path: &str,
         follow: bool,
         proc_self_exe_budget: usize,
+        walked: Option<&mut Walked>,
     ) -> LxResult<Arc<dyn INode>> {
         debug!(
             "lookup_inode_at: dirfd: {:?}, cwd: {:?}, path: {:?}, follow: {:?}",
@@ -2370,8 +2387,8 @@ impl LinuxProcess {
         // walk skips empty components, so `stat("f/")` on a regular file
         // used to succeed and `lstat("l/")` returned the link itself.
         let trailing_slash = path.ends_with('/');
-        let inode =
-            self.lookup_inode_at_walk(dirfd, path, follow || trailing_slash, proc_self_exe_budget)?;
+        let follow = follow || trailing_slash;
+        let inode = self.lookup_inode_at_walk(dirfd, path, follow, proc_self_exe_budget, walked)?;
         if trailing_slash && inode.metadata()?.type_ != FileType::Dir {
             return Err(LxError::ENOTDIR);
         }
@@ -2385,7 +2402,18 @@ impl LinuxProcess {
         path: &str,
         follow: bool,
         proc_self_exe_budget: usize,
+        mut walked: Option<&mut Walked>,
     ) -> LxResult<Arc<dyn INode>> {
+        // The special paths below are each in `/proc/<pid>`, where `self` is
+        // the calling process, as `fd` takes it.
+        let mut in_proc_self = |rest: core::fmt::Arguments| {
+            if let Some(walked) = walked.as_deref_mut() {
+                let pid = kernel_hal::thread::get_current_thread()
+                    .and_then(|t| t.downcast::<zircon_object::task::Thread>().ok())
+                    .map_or(0, |t| t.proc().id());
+                *walked = Walked::at(&format!("/proc/{}/{}", pid, rest), 1);
+            }
+        };
         // hard code special path
         if path == "/proc/self/exe" {
             if follow {
@@ -2407,8 +2435,10 @@ impl LinuxProcess {
                     &exe,
                     true,
                     proc_self_exe_budget - 1,
+                    walked,
                 );
             }
+            in_proc_self(format_args!("exe"));
             return Ok(Arc::new(Pseudo::new(
                 &self.execute_path(),
                 FileType::SymLink,
@@ -2437,6 +2467,7 @@ impl LinuxProcess {
                 .and_then(|t| t.downcast::<zircon_object::task::Thread>().ok())
                 .map(|t| t.proc().clone())
                 .ok_or(LxError::ENOENT)?;
+            in_proc_self(format_args!("fd"));
             return Ok(Arc::new(proc_self::ProcSelfFdDir { process: proc }));
         }
         let (fd_dir_path, fd_name) = split_path(path);
@@ -2445,21 +2476,28 @@ impl LinuxProcess {
             // `ENOENT`, as its listing and Linux say, not `EBADF` or `EINVAL`.
             let fd = FileDesc::try_from(fd_name).map_err(|_| LxError::ENOENT)?;
             let file = self.get_file_like(fd).map_err(|_| LxError::ENOENT)?;
+            in_proc_self(format_args!("fd/{}", i32::from(fd)));
             if !follow {
                 return Ok(Arc::new(proc_self::FdLink::of(&*file)));
             }
             // Magic link: resolve to the open file itself (like Linux), so
             // execve("/proc/self/fd/N") runs the file, not the symlink's path
-            // text. A descriptor that is no file leads to its object.
+            // text, and the walk ends where the file is (`nd_jump_link`). A
+            // descriptor that is no file leads to its object.
             return Ok(match file.downcast_arc::<File>() {
-                Ok(file) => file.inode(),
+                Ok(file) => {
+                    if let Some(walked) = walked {
+                        *walked = Walked::at(file.path(), 0);
+                    }
+                    file.inode()
+                }
                 Err(object) => Arc::new(proc_self::FdObject(object)),
             });
         }
 
         let follow_max_depth = if follow { FOLLOW_MAX_DEPTH } else { 0 };
         if path.starts_with('/') {
-            if let Some(result) = lookup_virtual_fs(path, follow_max_depth) {
+            if let Some(result) = lookup_virtual_fs(path, follow_max_depth, walked.as_deref_mut()) {
                 return result;
             }
             // Absolute path on the real filesystem: the base inode is
@@ -2473,25 +2511,40 @@ impl LinuxProcess {
             // VFS walk (two String allocations + a directory scan per
             // component on SFS) before this.
             if follow {
-                if let Some(inode) = dcache_get(path) {
+                if let Some(inode) = dcache::get(path, walked.as_deref_mut()) {
                     return Ok(inode);
                 }
             }
-            let inode = self.root_inode().lookup_follow(path, follow_max_depth)?;
-            if follow {
-                dcache_put(path, &inode);
+            // The cache keeps where the walk ended with the inode, so a walk
+            // it will keep is noted whether the caller asked or not.
+            let mut own = Walked::default();
+            let mut walked = walked.or(follow.then_some(&mut own));
+            let inode =
+                self.root_inode()
+                    .lookup_walked(path, follow_max_depth, walked.as_deref_mut())?;
+            if let (true, Some(walked)) = (follow, walked) {
+                dcache::put(path, &inode, walked);
             }
             return Ok(inode);
         }
-        if dirfd == FileDesc::CWD {
-            Ok(self
-                .root_inode()
-                .lookup(&self.current_working_directory())?
-                .lookup_follow(path, follow_max_depth)?)
+        // The walk goes on from where the directory is: a working directory
+        // is reached through the mounts, where an absolute link starts over
+        // at `/`, and a descriptor opened in `/proc`, `/sys` or `/dev` holds
+        // that file system's own inode, where it starts over at its root.
+        let (start, from) = if dirfd == FileDesc::CWD {
+            let cwd = self.current_working_directory();
+            (self.root_inode().lookup(&cwd)?, (cwd, 0))
         } else {
             let file = self.get_file(dirfd)?;
-            Ok(file.lookup_follow(path, follow_max_depth)?)
-        }
+            let from = file.path().clone();
+            let root = usize::from(virtual_fs_top(&from).is_some());
+            (file.inode(), (from, root))
+        };
+        let walked = walked.map(|walked| {
+            *walked = Walked::at(&from.0, from.1);
+            walked
+        });
+        Ok(start.lookup_walked(path, follow_max_depth, walked)?)
     }
 
     /// Lookup INode from the process.
@@ -2601,100 +2654,13 @@ mod path_ending_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Path (dentry) cache for absolute lookups on the real filesystem
+// Path (dentry) cache for absolute lookups on the real filesystem: `dcache.rs`
 // ---------------------------------------------------------------------------
-//
-// Maps a fully-resolved absolute path (symlinks followed) to its final inode.
-// Only paths that reach the real-FS branch of `lookup_inode_at_inner` are ever
-// cached — `/proc`, `/sys` and `/dev` are intercepted earlier by
-// `lookup_virtual_fs`, so dynamic pseudo-fs content (per-process `/proc`
-// entries, hotplugged device nodes) can never go stale here.
-//
-// Coherence is a single global epoch: every namespace-mutating operation
-// (unlink/rename/mkdir/mknod/symlink/link, mount/umount, `O_CREAT` opens,
-// unix-socket binds — see `dcache_invalidate` call sites in linux-syscall)
-// bumps it, and a bumped epoch empties the cache on the next touch. Coarse,
-// but mutations are rare next to the lookup storms this exists for (a desktop
-// session start does thousands of absolute open/stat calls over immutable
-// library/config paths), and correctness never depends on fine-grained
-// invalidation.
-mod dcache {
-    use super::INode;
-    use alloc::string::String;
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicU64, Ordering};
-    use hashbrown::HashMap;
-    use lock::Mutex;
-
-    /// Generation counter; see module doc.
-    static EPOCH: AtomicU64 = AtomicU64::new(0);
-
-    struct Inner {
-        /// Epoch the map contents belong to; a mismatch clears the map.
-        epoch: u64,
-        map: HashMap<String, Arc<dyn INode>>,
-    }
-
-    lazy_static::lazy_static! {
-        static ref CACHE: Mutex<Inner> = Mutex::new(Inner {
-            epoch: 0,
-            map: HashMap::new(),
-        });
-    }
-
-    /// Entry bound: pins each cached inode `Arc` in memory, so keep it to the
-    /// working set of a session start rather than letting it grow unbounded.
-    /// 4096, not 1024: a desktop session start (ldso across ~50 libraries +
-    /// xkb + fontconfig + icon themes) touches more than 1024 distinct paths,
-    /// and hitting the cap drops the WHOLE cache mid-storm — exactly when the
-    /// hits matter most. An inode Arc is small; 4096 entries stay in the
-    /// hundreds of KiB.
-    const MAX_ENTRIES: usize = 4096;
-
-    /// Invalidate every cached path (a namespace mutation happened).
-    pub fn invalidate() {
-        EPOCH.fetch_add(1, Ordering::Release);
-    }
-
-    pub fn get(path: &str) -> Option<Arc<dyn INode>> {
-        let mut c = CACHE.lock();
-        let now = EPOCH.load(Ordering::Acquire);
-        if c.epoch != now {
-            c.map.clear();
-            c.epoch = now;
-            return None;
-        }
-        c.map.get(path).cloned()
-    }
-
-    pub fn put(path: &str, inode: &Arc<dyn INode>) {
-        let mut c = CACHE.lock();
-        let now = EPOCH.load(Ordering::Acquire);
-        if c.epoch != now {
-            c.map.clear();
-            c.epoch = now;
-        }
-        if c.map.len() >= MAX_ENTRIES {
-            // Full: drop everything rather than tracking recency — refill is
-            // one miss per path and the storm patterns are bursty anyway.
-            c.map.clear();
-        }
-        c.map.insert(String::from(path), inode.clone());
-    }
-}
 
 /// Drop every cached path→inode mapping. Call after any operation that
 /// creates, removes, renames or re-mounts anything in the file namespace.
 pub fn dcache_invalidate() {
     dcache::invalidate();
-}
-
-fn dcache_get(path: &str) -> Option<Arc<dyn INode>> {
-    dcache::get(path)
-}
-
-fn dcache_put(path: &str, inode: &Arc<dyn INode>) {
-    dcache::put(path, inode)
 }
 
 /// Split a `path` str to `(base_path, file_name)`
@@ -3431,27 +3397,41 @@ pub const FOLLOW_MAX_DEPTH: usize = 40;
 
 /// Fast path for virtual filesystems mounted at `/proc`, `/sys`, and `/dev`.
 /// Avoids ext2 directory scans on every access (VBox AHCI can stall there).
-fn lookup_virtual_fs(path: &str, follow_times: usize) -> Option<LxResult<Arc<dyn INode>>> {
+/// Which of the file systems that absolute paths reach without the mounts
+/// `path` is in.
+fn virtual_fs_top(path: &str) -> Option<&'static str> {
+    ["/proc", "/sys", "/dev"].iter().copied().find(|top| {
+        path.strip_prefix(*top)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
+}
+
+fn lookup_virtual_fs(
+    path: &str,
+    follow_times: usize,
+    walked: Option<&mut Walked>,
+) -> Option<LxResult<Arc<dyn INode>>> {
     let path = path.trim_end_matches('/');
-    if path == "/proc" || path.starts_with("/proc/") {
-        return Some(procfs::lookup_path(path, follow_times).map_err(LxError::from));
-    }
-    if path == "/sys" || path.starts_with("/sys/") {
-        return Some(sysfs::lookup_path(path, follow_times).map_err(LxError::from));
-    }
-    if path == "/dev" || path.starts_with("/dev/") {
-        let root = DEVFS_ROOT.lock().clone()?;
-        let root: Arc<dyn INode> = root;
-        if path == "/dev" {
-            return Some(Ok(root));
+    let top = virtual_fs_top(path)?;
+    // Until there is a devfs, `/dev` is a directory of the root.
+    let dev = match top {
+        "/dev" => Some(DEVFS_ROOT.lock().clone()?),
+        _ => None,
+    };
+    // An absolute link in one of them starts over at its root.
+    let walked = walked.map(|walked| {
+        *walked = Walked::at(top, 1);
+        walked
+    });
+    let found = match dev {
+        Some(root) if path == "/dev" => Ok(root as Arc<dyn INode>),
+        Some(root) => {
+            (root as Arc<dyn INode>).lookup_walked(&path["/dev/".len()..], follow_times, walked)
         }
-        let rest = path.strip_prefix("/dev/").unwrap();
-        return Some(
-            root.lookup_follow(rest, follow_times)
-                .map_err(LxError::from),
-        );
-    }
-    None
+        None if top == "/proc" => procfs::lookup_path(path, follow_times, walked),
+        None => sysfs::lookup_path(path, follow_times, walked),
+    };
+    Some(found.map_err(LxError::from))
 }
 
 /// Rescans and registers partitions for a block device in devfs.
