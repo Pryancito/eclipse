@@ -80,6 +80,7 @@
 #include "gpu/mem_mgr/mem_desc.h"
 #include "gpu/mem_mgr/rm_page_size.h"
 #include "gpu/mem_mgr/vaspace_api.h"
+#include "class/cl0071.h"      /* NV01_MEMORY_SYSTEM_OS_DESCRIPTOR */
 #include "class/cl50a0.h"      /* NV50_MEMORY_VIRTUAL */
 #include "mem_mgr/mem.h"
 #include "rmapi/rs_utils.h"
@@ -1270,6 +1271,12 @@ NV_STATUS eclipse_rm_frontend_gpu_uuid(NvU32 gpuInstance, NvU8 *pUuid)
  * client against), with the user's privilege, and with the parameters in
  * kernel memory, which is what UVM's own dups through a kernel client come
  * to without the second client.
+ *
+ * A semaphore pool (UVM_ALLOC_SEMAPHORE_POOL) is memory UVM allocates
+ * itself, at one address for the CPU and every GPU. Its pages are the
+ * kernel's; for each GPU VA space they are lent to the RM as a physical
+ * NV01_MEMORY_SYSTEM_OS_DESCRIPTOR in that space's client
+ * (eclipse_rm_frontend_uvm_pages), which is mapped like any other memory.
  */
 
 static API_SECURITY_INFO _eclipse_rm_frontend_uvm_sec_info(void *pOsInfo, NvU32 bAdmin)
@@ -1478,6 +1485,74 @@ NV_STATUS eclipse_rm_frontend_uvm_map(
     if (status == NV_OK)
     {
         *phVirtual = hVirtual;
+    }
+    return status;
+}
+
+/*
+ * A semaphore pool's pages, `size` bytes from physical `physBase`, as an
+ * NV01_MEMORY_SYSTEM_OS_DESCRIPTOR of `hClient` under `hDevice`, cached by
+ * the GPU or not as UVM was asked; its handle goes to `phMemory`, for
+ * eclipse_rm_frontend_uvm_map to map. The pages are only accepted while the
+ * kernel lends them (osCreateMemFromOsDescriptor, eclipse_rm_mem.c).
+ *
+ * Only a kernel caller may describe memory by its physical address
+ * (osdescConstruct), so this one call is made at kernel privilege, though
+ * still in the user's client and through the user's open. The CPU sees the
+ * pages write-back, as the kernel maps them to the user.
+ */
+NV_STATUS eclipse_rm_frontend_uvm_pages(
+    void     *pOsInfo,
+    NvHandle  hClient,
+    NvHandle  hDevice,
+    NvU64     physBase,
+    NvU64     size,
+    NvU32     bGpuCached,
+    NvHandle *phMemory)
+{
+    THREAD_STATE_NODE threadState;
+    API_SECURITY_INFO secInfo;
+    NV_OS_DESC_MEMORY_ALLOCATION_PARAMS allocParams;
+    RM_API *pRmApi = rmapiGetInterface(RMAPI_EXTERNAL);
+    NvHandle hMemory = NV01_NULL_OBJECT;
+    NV_STATUS status;
+
+    if ((pOsInfo == NULL) || (phMemory == NULL) || (size == 0))
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    secInfo = _eclipse_rm_frontend_uvm_sec_info(pOsInfo, NV_FALSE);
+    secInfo.privLevel = RS_PRIV_LEVEL_KERNEL;
+
+    portMemSet(&allocParams, 0, sizeof(allocParams));
+    allocParams.type = NVOS32_TYPE_IMAGE;
+    allocParams.attr = DRF_DEF(OS32, _ATTR, _LOCATION, _PCI) |
+                       DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS) |
+                       DRF_DEF(OS32, _ATTR, _COHERENCY, _CACHED);
+    allocParams.attr2 = bGpuCached ? DRF_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _YES)
+                                   : DRF_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _NO);
+    allocParams.descriptor = NV_PTR_TO_NvP64((void *) (NvUPtr) physBase);
+    allocParams.limit = size - 1;
+    allocParams.descriptorType = NVOS32_DESCRIPTOR_TYPE_OS_PHYS_ADDR;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status == NV_OK)
+    {
+        status = pRmApi->AllocWithSecInfo(pRmApi, hClient, hDevice, &hMemory,
+                                          NV01_MEMORY_SYSTEM_OS_DESCRIPTOR,
+                                          NV_PTR_TO_NvP64(&allocParams),
+                                          sizeof(allocParams),
+                                          RMAPI_ALLOC_FLAGS_NONE, NvP64_NULL,
+                                          &secInfo);
+        gpumgrThreadDisableExpandedGpuVisibility();
+    }
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    if (status == NV_OK)
+    {
+        *phMemory = hMemory;
     }
     return status;
 }

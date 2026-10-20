@@ -8,32 +8,32 @@ use alloc::vec::Vec;
 
 /// The client libcuda makes, and on each GPU the device and the
 /// FERMI_VASPACE_A under it it hands UVM.
-const CLIENT: u32 = 0xc1d0_0002;
-const DEVICE0: u32 = 0x5c00_0002;
-const VA_SPACE0: u32 = 0x5c00_0007;
-const DEVICE1: u32 = 0x5c00_1002;
-const VA_SPACE1: u32 = 0x5c00_1007;
+pub(super) const CLIENT: u32 = 0xc1d0_0002;
+pub(super) const DEVICE0: u32 = 0x5c00_0002;
+pub(super) const VA_SPACE0: u32 = 0x5c00_0007;
+pub(super) const DEVICE1: u32 = 0x5c00_1002;
+pub(super) const VA_SPACE1: u32 = 0x5c00_1007;
 /// The fds of the `/dev/nvidiactl` open and of a `/dev/nvidia0` open.
-const CTL_FD: i32 = 5;
+pub(super) const CTL_FD: i32 = 5;
 const GPU_NODE_FD: i32 = 6;
 const MEMORY: u32 = 0x5c00_0014;
 
 /// UvmGpuMappingType: ReadWriteAtomic and ReadOnly.
 const READ_WRITE_ATOMIC: u32 = 1;
-const READ_ONLY: u32 = 3;
+pub(super) const READ_ONLY: u32 = 3;
 
 /// A process with a `/dev/nvidiactl` open, a VA space of `/dev/nvidia-uvm`
 /// with both GPUs registered, and an RM that knows the VA space of each GPU
 /// as one of that open's.
-struct Process {
-    rm: Arc<FakeRm>,
-    uvm: Arc<UvmOpen>,
-    ctl: Option<Arc<dyn INode>>,
+pub(super) struct Process {
+    pub rm: Arc<FakeRm>,
+    pub uvm: Arc<UvmOpen>,
+    pub ctl: Option<Arc<dyn INode>>,
     gpu_node: Arc<dyn INode>,
 }
 
 impl Process {
-    fn new() -> Process {
+    pub(super) fn new() -> Process {
         let rm = FakeRm::new();
         let uvm = uvm_on(&rm);
         let ctl: Arc<dyn INode> = Arc::new(NvidiaOpen::for_uvm_test(true));
@@ -60,7 +60,7 @@ impl Process {
     }
 
     /// The `os_info` of the `/dev/nvidiactl` open.
-    fn os_info(&self) -> usize {
+    pub(super) fn os_info(&self) -> usize {
         let ctl = self.ctl.as_ref().expect("open");
         ctl.downcast_ref::<NvidiaOpen>()
             .and_then(NvidiaOpen::uvm_os_info)
@@ -68,7 +68,7 @@ impl Process {
     }
 
     /// Who the RM is told calls, as this process.
-    fn by(&self) -> By {
+    pub(super) fn by(&self) -> By {
         By {
             os_info: self.os_info(),
             admin: false,
@@ -77,7 +77,7 @@ impl Process {
     }
 
     /// `cmd` on `params`, from this process: the status.
-    fn call(&self, cmd: u32, params: &mut [u8]) -> u32 {
+    pub(super) fn call(&self, cmd: u32, params: &mut [u8]) -> u32 {
         let ctl = self.ctl.clone();
         let gpu_node = self.gpu_node.clone();
         let fds = move |fd: i32| match fd {
@@ -100,12 +100,12 @@ impl Process {
     }
 
     /// The GPU VA space libcuda made on `uuid`.
-    fn register_gpu_va_space(&self, uuid: &Uuid) -> u32 {
+    pub(super) fn register_gpu_va_space(&self, uuid: &Uuid) -> u32 {
         let h_va_space = if *uuid == GPU0 { VA_SPACE0 } else { VA_SPACE1 };
         self.register_gpu_va_space_with(uuid, CTL_FD, h_va_space)
     }
 
-    fn unregister_gpu_va_space(&self, uuid: &Uuid) -> u32 {
+    pub(super) fn unregister_gpu_va_space(&self, uuid: &Uuid) -> u32 {
         let mut params = vec![0u8; UNREGISTER_GPU_VASPACE_SIZE];
         params[..16].copy_from_slice(uuid);
         self.call(cmd::UNREGISTER_GPU_VASPACE, &mut params)
@@ -118,11 +118,11 @@ impl Process {
         self.call(cmd, &mut params)
     }
 
-    fn create_external_range(&self, base: u64, length: u64) -> u32 {
+    pub(super) fn create_external_range(&self, base: u64, length: u64) -> u32 {
         self.range_call(cmd::CREATE_EXTERNAL_RANGE, base, length)
     }
 
-    fn free(&self, base: u64, length: u64) -> u32 {
+    pub(super) fn free(&self, base: u64, length: u64) -> u32 {
         self.range_call(cmd::FREE, base, length)
     }
 
@@ -182,7 +182,7 @@ impl Process {
     }
 
     /// The bases of what the RM has mapped, on the VA space `h_va_space`.
-    fn mapped_on(&self, h_va_space: u32) -> Vec<u64> {
+    pub(super) fn mapped_on(&self, h_va_space: u32) -> Vec<u64> {
         let mut bases: Vec<u64> = self
             .rm
             .mapped()
@@ -608,6 +608,7 @@ fn cuctxcreate_calls_need_a_va_space() {
         cmd::FREE,
         cmd::REGISTER_CHANNEL,
         cmd::UNREGISTER_CHANNEL,
+        cmd::ALLOC_SEMAPHORE_POOL,
     ] {
         let (size, at) = layout(cmd).expect("served");
         let mut params = vec![0u8; size];

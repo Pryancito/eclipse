@@ -1732,6 +1732,16 @@ impl FileLike for File {
                     if let Some(nvidia) = inner.inode.downcast_ref::<super::devfs::NvidiaOpen>() {
                         return nvidia.get_vmo(offset, len);
                     }
+                    // `uvm_mmap` takes only MAP_SHARED, which is
+                    // `get_vmo_shared`'s.
+                    #[cfg(target_arch = "x86_64")]
+                    if inner
+                        .inode
+                        .downcast_ref::<super::devfs::nvidia_uvm::UvmOpen>()
+                        .is_some()
+                    {
+                        return Err(LxError::EINVAL);
+                    }
                     Err(LxError::ENOSYS)
                 }
             }
@@ -1742,6 +1752,15 @@ impl FileLike for File {
     fn get_vmo_shared(&self, offset: usize, len: usize) -> LxResult<(Arc<VmObject>, usize)> {
         let inner = self.inner.read();
         if inner.inode.metadata()?.type_ != FileType::File {
+            // A semaphore pool of /dev/nvidia-uvm is the one device mapping
+            // only MAP_SHARED reaches.
+            #[cfg(target_arch = "x86_64")]
+            if let Some(uvm) = inner
+                .inode
+                .downcast_ref::<super::devfs::nvidia_uvm::UvmOpen>()
+            {
+                return uvm.get_vmo(offset, len).map(|vmo| (vmo, 0));
+            }
             // Devices keep their own get_vmo (fb/drm are inherently shared).
             drop(inner);
             return self.get_vmo(offset, len).map(|vmo| (vmo, 0));
