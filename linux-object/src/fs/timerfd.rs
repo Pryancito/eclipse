@@ -216,6 +216,11 @@ impl FileLike for TimerFd {
         *self.flags.lock()
     }
 
+    /// `timerfd_create`: `anon_inode_getfile("[timerfd]", ...)`.
+    fn link_name(&self) -> String {
+        String::from("anon_inode:[timerfd]")
+    }
+
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         self.flags.lock().take_settable(f);
         Ok(())

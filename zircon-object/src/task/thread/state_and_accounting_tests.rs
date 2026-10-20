@@ -1,12 +1,6 @@
-//! The thread's own state machine, its signals, and the accounting a dying
-//! thread hands back to its process.
-//!
-//! The 28 tests above are almost all about how the scheduler hands out CPU
-//! slices. Everything else a `Thread` is — what state it reports while it is
-//! suspended, which signals each transition publishes, the generic "blocked in
-//! a syscall" marker, its CPU affinity, its two time counters and whether it
-//! is the first thread of its process — had no test at all, and mutating it
-//! left 16 of 26 mutants alive.
+//! Everything a `Thread` is besides its scheduling slices: the state it
+//! reports while suspended, the signals each transition publishes, the
+//! generic blocked marker, its affinity, its time counters and its flags.
 
 use super::*;
 use crate::object::KernelObject;

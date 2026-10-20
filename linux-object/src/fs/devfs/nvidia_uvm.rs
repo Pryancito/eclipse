@@ -9,9 +9,10 @@
 //! GPU with UVM and makes a range group, and if either fails `cuInit`
 //! answers CUDA_ERROR_NOT_INITIALIZED (3). `cuCtxCreate` then hands UVM the
 //! GPU VA space of the context, maps the memory the context needs into it,
-//! and registers the context's channels; if UVM refuses the first,
-//! `cuCtxCreate` answers CUDA_ERROR_NOT_SUPPORTED (801). All of them are
-//! served here as uvm.c serves them:
+//! registers the context's channels and makes a semaphore pool; if UVM
+//! refuses the first or the last, `cuCtxCreate` answers
+//! CUDA_ERROR_NOT_SUPPORTED (801). All of them are served here as uvm.c
+//! serves them:
 //!
 //! - UVM_INITIALIZE makes the open a VA space with the caller's flags. Asked
 //!   again with the same flags it changes nothing; with others, or with a
@@ -37,20 +38,27 @@
 //!   the range back.
 //! - UVM_REGISTER_CHANNEL and UVM_UNREGISTER_CHANNEL keep the list of a GPU
 //!   VA space's channels.
+//! - UVM_ALLOC_SEMAPHORE_POOL makes a range of zeroed system memory that
+//!   each GPU with a GPU VA space maps at its address, and an mmap of
+//!   exactly that range maps for the CPU; UVM_FREE gives it back once the
+//!   CPU has unmapped it.
 //!
-//! One departure, the whole design of the last four: on Linux UVM owns the
-//! page tables of a GPU VA space registered with it (libcuda allocates it
-//! IS_EXTERNALLY_OWNED, so the RM never writes a PTE there) and writes every
-//! PTE of its mappings itself. This port has no UVM page-table code, so the
-//! RM keeps them. An RM_ALLOC of such a VA space goes to the RM without
-//! IS_EXTERNALLY_OWNED and ENABLE_PAGE_FAULTING ([`rm_owned_va_space`]),
-//! each UVM mapping becomes an RM mapping in it, made as the user through
-//! the `/dev/nvidiactl` open that made the client (an NV50_MEMORY_VIRTUAL at
-//! the address UVM was given, and the memory mapped into it), and a channel
-//! needs nothing from UVM, as the RM maps a channel's own buffers in a VA
-//! space it owns. Without page faulting a GPU access outside every mapping
-//! is fatal to its channel instead of a fault UVM serves, which nothing
-//! served here relies on.
+//! One departure, the whole design of GPU VA spaces and of what is mapped in
+//! them: on Linux UVM owns the page tables of a GPU VA space registered with
+//! it (libcuda allocates it IS_EXTERNALLY_OWNED, so the RM never writes a PTE
+//! there) and writes every PTE of its mappings itself. This port has no UVM
+//! page-table code, so the RM keeps them. An RM_ALLOC of such a VA space goes
+//! to the RM without IS_EXTERNALLY_OWNED and ENABLE_PAGE_FAULTING
+//! ([`rm_owned_va_space`]), each UVM mapping becomes an RM mapping in it,
+//! made as the user through the `/dev/nvidiactl` open that made the client
+//! (an NV50_MEMORY_VIRTUAL at the address UVM was given, and the memory
+//! mapped into it), and a channel needs nothing from UVM, as the RM maps a
+//! channel's own buffers in a VA space it owns. A semaphore pool's pages are
+//! the kernel's, made RM memory of the GPU VA space's client (an
+//! NV01_MEMORY_SYSTEM_OS_DESCRIPTOR of their physical address) and mapped
+//! like an external allocation. Without page faulting a GPU access outside
+//! every mapping is fatal to its channel instead of a fault UVM serves, which
+//! nothing served here relies on.
 //!
 //! UVM_DEINITIALIZE succeeds and does nothing, as there. Every other command
 //! is ENOSYS, the module's answer to one it does not know, and is logged by
@@ -77,6 +85,7 @@ use lock::Mutex;
 use rcore_fs::vfs::*;
 use rcore_fs_devfs::{DevFS, DevINode};
 use zcore_drivers::display::nvctl;
+use zircon_object::vm::{MMUFlags, VmObject};
 
 use super::nvidia::{NvCaller, NvidiaOpen};
 use crate::error::{LxError, LxResult};
@@ -101,6 +110,7 @@ pub mod cmd {
     pub const UNREGISTER_GPU: u32 = 38;
     pub const PAGEABLE_MEM_ACCESS: u32 = 39;
     pub const UNMAP_EXTERNAL: u32 = 66;
+    pub const ALLOC_SEMAPHORE_POOL: u32 = 68;
     pub const CREATE_EXTERNAL_RANGE: u32 = 73;
     pub const MM_INITIALIZE: u32 = 75;
 }
@@ -181,6 +191,13 @@ const RANGE_STATUS: usize = 16;
 const UNMAP_EXTERNAL_SIZE: usize = 40;
 const UNMAP_EXTERNAL_GPU: usize = 16;
 const UNMAP_EXTERNAL_STATUS: usize = 32;
+/// `UVM_ALLOC_SEMAPHORE_POOL_PARAMS`: `NvU64 base`, `NvU64 length`,
+/// `UvmGpuMappingAttributes perGpuAttributes[UVM_MAX_GPUS]`, `NvU64
+/// gpuAttributesCount`, `NV_STATUS rmStatus`.
+const POOL_SIZE: usize = 9248;
+const POOL_ATTRIBUTES: usize = 16;
+const POOL_COUNT: usize = 9232;
+const POOL_STATUS: usize = 9240;
 
 /// `UVM_INIT_FLAGS_MASK`: DISABLE_HMM and MULTI_PROCESS_SHARING_MODE.
 const INIT_FLAGS_MASK: u64 = 0x3;
@@ -195,6 +212,7 @@ const NV_ERR_INVALID_ADDRESS: u32 = 0x1E;
 const NV_ERR_INVALID_ARGUMENT: u32 = 0x1F;
 const NV_ERR_INVALID_CHANNEL: u32 = 0x21;
 const NV_ERR_INVALID_DEVICE: u32 = 0x26;
+const NV_ERR_NO_MEMORY: u32 = 0x51;
 const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
 const NV_ERR_OBJECT_NOT_FOUND: u32 = 0x57;
 const NV_ERR_UVM_ADDRESS_IN_USE: u32 = 0x68;
@@ -222,6 +240,7 @@ fn layout(cmd: u32) -> Option<(usize, usize)> {
         cmd::MAP_EXTERNAL_ALLOCATION => (MAP_SIZE, MAP_STATUS),
         cmd::FREE | cmd::CREATE_EXTERNAL_RANGE => (RANGE_SIZE, RANGE_STATUS),
         cmd::UNMAP_EXTERNAL => (UNMAP_EXTERNAL_SIZE, UNMAP_EXTERNAL_STATUS),
+        cmd::ALLOC_SEMAPHORE_POOL => (POOL_SIZE, POOL_STATUS),
         _ => return None,
     })
 }
@@ -311,8 +330,29 @@ struct VaSpace {
     last_range_group: u64,
     /// The GPU VA spaces, by GPU: at most one per registered GPU.
     gpu_va_spaces: BTreeMap<Uuid, GpuVaSpace>,
-    /// The external ranges, by first byte; they never overlap.
+    /// The external ranges, by first byte.
     ranges: BTreeMap<u64, ExternalRange>,
+    /// The semaphore pools, by first byte. No two ranges overlap, of either
+    /// kind ([`VaSpace::overlaps`]).
+    pools: BTreeMap<u64, SemaphorePool>,
+}
+
+impl VaSpace {
+    /// Whether `[base, end)` overlaps a range here, external or a pool: the
+    /// collision `uvm_range_tree_add` refuses.
+    fn overlaps(&self, base: u64, end: u64) -> bool {
+        let range = self
+            .ranges
+            .range(..end)
+            .next_back()
+            .is_some_and(|(_, range)| range.end > base);
+        let pool = self
+            .pools
+            .range(..end)
+            .next_back()
+            .is_some_and(|(_, pool)| pool.end > base);
+        range || pool
+    }
 }
 
 /// A GPU VA space (`uvm_gpu_va_space_t`): the client's FERMI_VASPACE_A, and
@@ -336,6 +376,51 @@ struct ExternalRange {
     /// mappings never overlap. A GPU has an entry only while it has a GPU
     /// VA space, whose client every one of them was made in.
     maps: BTreeMap<Uuid, BTreeMap<u64, Mapping>>,
+}
+
+/// A semaphore pool (`uvm_va_range_semaphore_pool_t`): system memory the
+/// kernel allocates, which the GPUs and the CPU all map at its first byte.
+struct SemaphorePool {
+    /// One past its last byte.
+    end: u64,
+    /// Its pages: zeroed, contiguous and pinned. An mmap of the pool maps
+    /// this very object.
+    memory: Arc<VmObject>,
+    /// The physical address of its first page.
+    phys: u64,
+    /// What keeps `memory` allocated, which the RM holds a clone of for as
+    /// long as it has RM memory made of the pages ([`nvctl::Pages`]).
+    keep: Arc<dyn Any + Send + Sync>,
+    /// How each GPU `perGpuAttributes` named maps it; any other GPU maps it
+    /// as [`PoolAttrs::default`] says.
+    attrs: BTreeMap<Uuid, PoolAttrs>,
+    /// Its mapping on each GPU with a GPU VA space.
+    maps: BTreeMap<Uuid, PoolMapping>,
+}
+
+impl SemaphorePool {
+    /// `uvm_mem_mapped_on_cpu_user`: whether anything holds the pages but
+    /// the pool and what it keeps them with, which is a CPU mapping of them.
+    fn mapped_on_cpu(&self) -> bool {
+        Arc::strong_count(&self.memory) > 2
+    }
+}
+
+/// How a GPU maps a semaphore pool (`uvm_mem_gpu_mapping_attrs_t`); the
+/// default is read-write and not cached by the GPU.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PoolAttrs {
+    read_only: bool,
+    cached: bool,
+}
+
+/// A semaphore pool's mapping on one GPU, both halves made in the GPU VA
+/// space's client: the pages as RM memory, and the NV50_MEMORY_VIRTUAL at
+/// the pool's address they are mapped into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PoolMapping {
+    h_memory: u32,
+    h_virtual: u32,
 }
 
 /// One GPU's mapping in an external range (`uvm_ext_gpu_map_t`).
@@ -427,6 +512,15 @@ trait Rm: Send + Sync {
     ) -> RmResult;
     /// `nvctl::uvm_map_external`.
     fn map(&self, by: &nvctl::Caller, m: &nvctl::ExternalMapping) -> RmResult;
+    /// `nvctl::uvm_pages`.
+    fn pages(
+        &self,
+        by: &nvctl::Caller,
+        h_client: u32,
+        h_device: u32,
+        pages: &nvctl::Pages,
+        gpu_cached: bool,
+    ) -> RmResult;
     /// `nvctl::uvm_free`.
     fn free(&self, by: &nvctl::Caller, h_client: u32, h_object: u32);
 }
@@ -453,6 +547,17 @@ impl Rm for KernelRm {
 
     fn map(&self, by: &nvctl::Caller, m: &nvctl::ExternalMapping) -> RmResult {
         nvctl::uvm_map_external(by, m)
+    }
+
+    fn pages(
+        &self,
+        by: &nvctl::Caller,
+        h_client: u32,
+        h_device: u32,
+        pages: &nvctl::Pages,
+        gpu_cached: bool,
+    ) -> RmResult {
+        nvctl::uvm_pages(by, h_client, h_device, pages, gpu_cached)
     }
 
     fn free(&self, by: &nvctl::Caller, h_client: u32, h_object: u32) {
@@ -541,6 +646,7 @@ impl UvmOpen {
             cmd::MAP_EXTERNAL_ALLOCATION => self.map_external(params, Who::of(caller)),
             cmd::UNMAP_EXTERNAL => self.unmap_external(params, Who::of(caller)),
             cmd::FREE => self.free(u64_at(params, 0), u64_at(params, 8), Who::of(caller)),
+            cmd::ALLOC_SEMAPHORE_POOL => self.alloc_semaphore_pool(params, Who::of(caller)),
             cmd::REGISTER_CHANNEL => self.register_channel(params),
             cmd::UNREGISTER_CHANNEL => self.unregister_channel(
                 u32_at(params, UNREGISTER_CHANNEL_CLIENT),
@@ -666,6 +772,13 @@ impl UvmOpen {
                 channels: BTreeSet::new(),
             },
         );
+        // `uvm_va_range_add_gpu_va_space` of each semaphore pool: one that
+        // cannot be mapped on it fails the registration, and what was mapped
+        // goes with the GPU VA space.
+        if let Err(status) = self.map_pools_on(&mut va_space, &uuid, Who::of(caller)) {
+            self.remove_gpu_va_space(&mut va_space, &uuid, Who::of(caller));
+            return status;
+        }
         first_time(
             &FIRST_GPU_VA_SPACE,
             "UVM_REGISTER_GPU_VASPACE: the first GPU VA space registered; its page tables stay the RM's",
@@ -685,7 +798,8 @@ impl UvmOpen {
     }
 
     /// `remove_gpu_va_space`: the GPU VA space of `uuid`, if it has one, with
-    /// its channels and every mapping on that GPU.
+    /// its channels and every mapping on that GPU, of external ranges and of
+    /// semaphore pools.
     fn remove_gpu_va_space(&self, va_space: &mut VaSpace, uuid: &Uuid, who: Who) -> bool {
         let Some(gpu_va_space) = va_space.gpu_va_spaces.remove(uuid) else {
             return false;
@@ -695,7 +809,108 @@ impl UvmOpen {
                 self.unmap(&gpu_va_space, maps.into_values(), who);
             }
         }
+        for pool in va_space.pools.values_mut() {
+            if let Some(map) = pool.maps.remove(uuid) {
+                self.unmap_pool(&gpu_va_space, map, who);
+            }
+        }
         true
+    }
+
+    /// Every semaphore pool here mapped on the GPU VA space of `uuid`, which
+    /// has none of them mapped yet. The first that fails stops it, with its
+    /// status.
+    fn map_pools_on(
+        &self,
+        va_space: &mut VaSpace,
+        uuid: &Uuid,
+        who: Who,
+    ) -> core::result::Result<(), u32> {
+        let gpu_va_space = &va_space.gpu_va_spaces[uuid];
+        for (&base, pool) in va_space.pools.iter_mut() {
+            self.map_pool(gpu_va_space, uuid, base, pool, who)?;
+        }
+        Ok(())
+    }
+
+    /// `va_range_add_gpu_va_space_semaphore_pool`: the pool at `base` mapped
+    /// at `base` on the GPU VA space of `uuid`, as the user. Its pages are
+    /// lent to the RM as memory of the GPU VA space's client, which is then
+    /// mapped like an external allocation, and freed again if that fails.
+    fn map_pool(
+        &self,
+        gpu_va_space: &GpuVaSpace,
+        uuid: &Uuid,
+        base: u64,
+        pool: &mut SemaphorePool,
+        who: Who,
+    ) -> core::result::Result<(), u32> {
+        let Some((_open, by)) = gpu_va_space.ctl.caller(who) else {
+            return Err(nvctl::NV_ERR_INVALID_CLIENT);
+        };
+        let attrs = pool.attrs.get(uuid).copied().unwrap_or_default();
+        let pages = nvctl::Pages {
+            phys: pool.phys,
+            size: pool.end - base,
+            keep: &pool.keep,
+        };
+        let h_client = gpu_va_space.h_client;
+        let h_memory = self
+            .rm
+            .pages(&by, h_client, gpu_va_space.h_device, &pages, attrs.cached)?;
+        let mapping = nvctl::ExternalMapping {
+            h_client,
+            h_device: gpu_va_space.h_device,
+            h_va_space: gpu_va_space.h_va_space,
+            h_memory,
+            offset: 0,
+            base,
+            length: pool.end - base,
+            read_only: attrs.read_only,
+        };
+        match self.rm.map(&by, &mapping) {
+            Ok(h_virtual) => {
+                pool.maps.insert(
+                    *uuid,
+                    PoolMapping {
+                        h_memory,
+                        h_virtual,
+                    },
+                );
+                Ok(())
+            }
+            Err(status) => {
+                self.rm.free(&by, h_client, h_memory);
+                Err(status)
+            }
+        }
+    }
+
+    /// A semaphore pool's mapping on one GPU undone, as the user: the
+    /// virtual object freed, then the memory, unless the open of their
+    /// client is closed and both went with it. The RM gives the pages back
+    /// once nothing it has holds them.
+    fn unmap_pool(&self, gpu_va_space: &GpuVaSpace, map: PoolMapping, who: Who) {
+        let Some((_open, by)) = gpu_va_space.ctl.caller(who) else {
+            return;
+        };
+        self.rm.free(&by, gpu_va_space.h_client, map.h_virtual);
+        self.rm.free(&by, gpu_va_space.h_client, map.h_memory);
+    }
+
+    /// Every mapping of `pool`, on every GPU.
+    fn unmap_pool_everywhere(
+        &self,
+        gpu_va_spaces: &BTreeMap<Uuid, GpuVaSpace>,
+        pool: SemaphorePool,
+        who: Who,
+    ) {
+        for (uuid, map) in pool.maps {
+            // A GPU has a mapping only while it has a GPU VA space.
+            if let Some(gpu_va_space) = gpu_va_spaces.get(&uuid) {
+                self.unmap_pool(gpu_va_space, map, who);
+            }
+        }
     }
 
     /// The RM's half of an unmap: each mapping's virtual object freed, as
@@ -717,12 +932,7 @@ impl UvmOpen {
             return NV_ERR_INVALID_ADDRESS;
         };
         let mut va_space = self.va_space.lock();
-        let overlaps = va_space
-            .ranges
-            .range(..end)
-            .next_back()
-            .is_some_and(|(_, range)| range.end > base);
-        if overlaps {
+        if va_space.overlaps(base, end) {
             return NV_ERR_UVM_ADDRESS_IN_USE;
         }
         va_space.ranges.insert(
@@ -735,12 +945,21 @@ impl UvmOpen {
         NV_OK
     }
 
-    /// `uvm_free`: only a whole external range, with what is mapped in it.
+    /// `uvm_free`: only a whole range, external or a semaphore pool, with
+    /// what is mapped of it. A pool must be unmapped from the CPU first.
     fn free(&self, base: u64, length: u64, who: Who) -> u32 {
         let Some(end) = range_end(base, length) else {
             return NV_ERR_INVALID_ADDRESS;
         };
         let mut va_space = self.va_space.lock();
+        if va_space.pools.get(&base).map(|pool| pool.end) == Some(end) {
+            if va_space.pools[&base].mapped_on_cpu() {
+                return NV_ERR_INVALID_ARGUMENT;
+            }
+            let pool = va_space.pools.remove(&base).expect("just found");
+            self.unmap_pool_everywhere(&va_space.gpu_va_spaces, pool, who);
+            return NV_OK;
+        }
         if va_space.ranges.get(&base).map(|range| range.end) != Some(end) {
             return NV_ERR_INVALID_ADDRESS;
         }
@@ -931,6 +1150,104 @@ impl UvmOpen {
         NV_OK
     }
 
+    /// `uvm_api_alloc_semaphore_pool`: `length` bytes of zeroed system
+    /// memory at `base`, whole 4 KiB pages overlapping no range here, mapped
+    /// at `base` on each GPU with a GPU VA space now or later.
+    /// `perGpuAttributes` says how a GPU it names maps the pool; each GPU
+    /// named must be registered here, and at most one may cache it. When a
+    /// GPU fails, what was mapped goes, and the pool with it.
+    ///
+    /// The pages are one contiguous block, which is what the RM can take as
+    /// memory it did not allocate itself; Linux's may be scattered.
+    fn alloc_semaphore_pool(&self, params: &[u8], who: Who) -> u32 {
+        let base = u64_at(params, 0);
+        let Some(end) = range_end(base, u64_at(params, 8)) else {
+            return NV_ERR_INVALID_ADDRESS;
+        };
+        let count = u64_at(params, POOL_COUNT);
+        if count > MAX_GPUS {
+            return NV_ERR_INVALID_ARGUMENT;
+        }
+        let mut va_space = self.va_space.lock();
+        if va_space.overlaps(base, end) {
+            return NV_ERR_UVM_ADDRESS_IN_USE;
+        }
+        let mut attrs = BTreeMap::new();
+        let mut cached = false;
+        for i in 0..count as usize {
+            let attributes = &params[POOL_ATTRIBUTES + i * ATTRIBUTES_SIZE..][..ATTRIBUTES_SIZE];
+            let Some(gpu_attrs) = pool_attrs(attributes) else {
+                return NV_ERR_INVALID_ARGUMENT;
+            };
+            let uuid = uuid_at(attributes, 0);
+            if !va_space.gpus.contains(&uuid) {
+                return NV_ERR_INVALID_DEVICE;
+            }
+            // At most one GPU, the pool's owner, may cache it.
+            if gpu_attrs.cached && core::mem::replace(&mut cached, true) {
+                return NV_ERR_INVALID_ARGUMENT;
+            }
+            attrs.insert(uuid, gpu_attrs);
+        }
+        let Some((memory, phys)) = zeroed_pages(end - base) else {
+            return NV_ERR_NO_MEMORY;
+        };
+        let keep: Arc<dyn Any + Send + Sync> = Arc::new(memory.clone());
+        let mut pool = SemaphorePool {
+            end,
+            memory,
+            phys,
+            keep,
+            attrs,
+            maps: BTreeMap::new(),
+        };
+        for (uuid, gpu_va_space) in &va_space.gpu_va_spaces {
+            if let Err(status) = self.map_pool(gpu_va_space, uuid, base, &mut pool, who) {
+                self.unmap_pool_everywhere(&va_space.gpu_va_spaces, pool, who);
+                return status;
+            }
+        }
+        va_space.pools.insert(base, pool);
+        first_time(
+            &FIRST_POOL,
+            "UVM_ALLOC_SEMAPHORE_POOL: the first semaphore pool; its pages are the kernel's, lent to the RM on each GPU",
+        );
+        NV_OK
+    }
+
+    /// `uvm_mmap`, which takes only MAP_SHARED: what maps `len` bytes of the
+    /// open from `offset`, which must be a VA space. A semaphore pool that is
+    /// exactly that range maps its own pages (`uvm_mem_map_cpu_user`); a
+    /// range that overlaps one here otherwise, of either kind, is in use;
+    /// and any other is a range of managed memory, not served yet.
+    ///
+    /// Linux also refuses a mapping that is not where the offset says, or
+    /// not both readable and writable; neither reaches here, and the pages
+    /// are mapped where and as mmap was asked to.
+    pub fn get_vmo(&self, offset: usize, len: usize) -> LxResult<Arc<VmObject>> {
+        if !self.is_va_space() {
+            return Err(LxError::EBADFD);
+        }
+        let base = offset as u64;
+        let end = base.checked_add(len as u64).ok_or(LxError::EINVAL)?;
+        let va_space = self.va_space.lock();
+        if let Some(pool) = va_space.pools.get(&base).filter(|pool| pool.end == end) {
+            first_time(
+                &FIRST_POOL_CPU,
+                "mmap: the first semaphore pool mapped for the CPU",
+            );
+            return Ok(pool.memory.clone());
+        }
+        if va_space.overlaps(base, end) {
+            return Err(LxError::EADDRINUSE);
+        }
+        first_time(
+            &FIRST_MANAGED,
+            "mmap: a range of managed memory (cudaMallocManaged) is not served yet: ENODEV",
+        );
+        Err(LxError::ENODEV)
+    }
+
     /// `uvm_register_channel`: on a GPU with a GPU VA space here, and once.
     /// UVM retains the channel and maps the buffers RM gives it into
     /// `[base, base + length)` of a VA space it owns; in one the RM owns the
@@ -982,7 +1299,8 @@ impl UvmOpen {
 }
 
 /// `uvm_destroy_va_space`, of what is served: every mapping still made is
-/// unmapped, as the close of the VA space.
+/// unmapped, as the close of the VA space. A semaphore pool's pages stay
+/// while a CPU mapping or the RM still has them.
 impl Drop for UvmOpen {
     fn drop(&mut self) {
         let va_space = core::mem::take(self.va_space.get_mut());
@@ -992,6 +1310,9 @@ impl Drop for UvmOpen {
                     self.unmap(gpu_va_space, maps.into_values(), Who::NOBODY);
                 }
             }
+        }
+        for pool in va_space.pools.into_values() {
+            self.unmap_pool_everywhere(&va_space.gpu_va_spaces, pool, Who::NOBODY);
         }
     }
 }
@@ -1033,6 +1354,30 @@ fn read_only(attributes: &[u8]) -> Option<bool> {
         && matches!(element_bits, 0 | 1 | 2 | 4 | 5 | 6)
         && (format == 0) == (element_bits == 0);
     (mapping_ok && caching_ok && kind_ok).then_some(mapping == 3)
+}
+
+/// How a GPU maps a semaphore pool with these `UvmGpuMappingAttributes`,
+/// or `None` when the module refuses them (`uvm_mem_translate_gpu_attributes`,
+/// which looks at no format or compression).
+fn pool_attrs(attributes: &[u8]) -> Option<PoolAttrs> {
+    let mapping = u32_at(attributes, 16);
+    let caching = u32_at(attributes, 20);
+    // Default, ReadWriteAtomic, ReadWrite, ReadOnly; and Default,
+    // ForceUncached, ForceCached.
+    (mapping <= 3 && caching <= 2).then_some(PoolAttrs {
+        read_only: mapping == 3,
+        cached: caching == 2,
+    })
+}
+
+/// `length` bytes of zeroed, contiguous and pinned system memory, with the
+/// physical address of its first byte. A length no machine has is no
+/// memory, as there.
+fn zeroed_pages(length: u64) -> Option<(Arc<VmObject>, u64)> {
+    let pages = (length / PAGE_4K) as usize;
+    let memory = VmObject::new_contiguous(pages, PAGE_4K.trailing_zeros() as usize).ok()?;
+    let phys = memory.commit_page(0, MMUFlags::READ).ok()? as u64;
+    Some((memory, phys))
 }
 
 /// Whether a refused UVM_REGISTER_GPU was logged already.
@@ -1238,6 +1583,9 @@ static FIRST_GPU_VA_SPACE: AtomicBool = AtomicBool::new(false);
 static FIRST_MAPPING: AtomicBool = AtomicBool::new(false);
 static FIRST_KIND: AtomicBool = AtomicBool::new(false);
 static FIRST_CHANNEL: AtomicBool = AtomicBool::new(false);
+static FIRST_POOL: AtomicBool = AtomicBool::new(false);
+static FIRST_POOL_CPU: AtomicBool = AtomicBool::new(false);
+static FIRST_MANAGED: AtomicBool = AtomicBool::new(false);
 
 /// `line` in the log, the first time it is said: how far a CUDA program got
 /// shows in dmesg.
@@ -1366,5 +1714,7 @@ pub fn create_node(root: &Arc<DevINode>) {
 
 #[cfg(test)]
 mod mapping_tests;
+#[cfg(test)]
+mod pool_tests;
 #[cfg(test)]
 mod tests;

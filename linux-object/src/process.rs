@@ -34,9 +34,15 @@ use zircon_object::{
     ZxError, ZxResult,
 };
 
+/// Where a process's arguments and environment are in its own memory.
+mod arg_area;
+/// The thread a child was forked by, and what its exit tells the child.
+mod forking_thread;
+pub use forking_thread::forget_forking_thread;
 /// The file-descriptor table's allocator and its two range sweeps.
 mod census;
 mod child_usage;
+mod cwd;
 mod orphan_group;
 pub use census::*;
 use child_usage::child_cpu;
@@ -1301,10 +1307,12 @@ pub struct LinuxProcess {
 struct LinuxProcessInner {
     /// Execute path
     execute_path: String,
-    /// argv as seen by userland (`/proc/<pid>/cmdline`)
+    /// argv as `execve` was handed it (`/proc/<pid>/cmdline` without an `arg_area`)
     cmdline: Vec<String>,
-    /// Environment as of the last `execve` (`/proc/<pid>/environ`)
+    /// Environment as of the last `execve` (`environ`, likewise)
     environ: Vec<String>,
+    /// Where the image keeps both of those in its memory.
+    arg_area: Option<crate::loader::ArgArea>,
     /// Current Working Directory
     ///
     /// Omit leading '/'.
@@ -1405,10 +1413,12 @@ struct LinuxProcessInner {
     job_stop_pending: bool,
     /// Continue notification not yet collected by a `wait*` with `WCONTINUED`.
     job_continued_pending: bool,
-    /// Signal delivered to this process when its parent terminates
-    /// (`prctl(PR_SET_PDEATHSIG)`); `0` = none. Deliberately NOT copied on
-    /// `fork` — prctl(2): "the value is cleared for the child of a fork".
+    /// Signal delivered to this process when its parent, or the thread of
+    /// it that forked it, terminates (`prctl(PR_SET_PDEATHSIG)`); `0` = none.
+    /// NOT copied on `fork`: "the value is cleared for the child of a fork".
     pdeathsig: u8,
+    /// The thread of the parent that forked this process (`real_parent`).
+    forking_thread: KoID,
     /// `prctl(PR_SET_CHILD_SUBREAPER)`: orphaned descendants are reparented to
     /// the nearest live subreaper ancestor instead of init. Like Linux, the
     /// attribute itself is not inherited across `fork`.
@@ -4106,7 +4116,7 @@ impl LinuxProcess {
             // added for is fixed, and under LOG=debug the trace remains.
             if let Some(file) = f.downcast_ref::<crate::fs::File>() {
                 let p = file.path();
-                if p.starts_with("pipe_") {
+                if p.starts_with("pipe:") {
                     debug!(
                         "[cloexec] {} fd={:?} ({}) closed by execve CLOEXEC sweep",
                         exec_path, fd, p
@@ -4549,8 +4559,8 @@ impl LinuxProcessInner {
         // the credentials, the working directory, the process group and
         // session, `no_new_privs`, the resource limits, and the `setitimer`
         // interval timers, which setitimer(2) preserves across an exec.
-        // `brk`/`mapped_brk`, `environ`, `cmdline`, `execute_path` and `abi`
-        // are all overwritten by the caller from the new image.
+        // `brk`/`mapped_brk`, `environ`, `cmdline`, `arg_area`, `execute_path`
+        // and `abi` are all overwritten by the caller from the new image.
         old_attachments
     }
 
@@ -4569,6 +4579,7 @@ impl LinuxProcessInner {
             // and a fork copies that memory, so a child that has not exec'd
             // still reports the parent's environment.
             environ: self.environ.clone(),
+            arg_area: self.arg_area,
             current_working_directory: self.current_working_directory.clone(),
             files: self.files.clone(),
             // The child's table is a copy of the parent's, so the parent's
@@ -4626,6 +4637,7 @@ impl LinuxProcessInner {
             // `p->pdeath_signal = 0` in `copy_process`, and the subreaper
             // attribute is the parent's own role, not a child's.
             pdeathsig: 0,
+            forking_thread: 0,
             child_subreaper: false,
             // `copy_process`: `p->flags |= PF_FORKNOEXEC`. A fresh child is
             // still running the forking program, so its parent may still put

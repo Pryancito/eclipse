@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub use nvidia_rm_sys::frontend::events::{
     alloc_os_event, free_os_event, set_event_sink, UnixEvent, NV_ERR_INVALID_EVENT,
 };
-pub use nvidia_rm_sys::frontend::uvm::{ExternalMapping, NV_ERR_INVALID_CLIENT};
+pub use nvidia_rm_sys::frontend::uvm::{ExternalMapping, Pages, NV_ERR_INVALID_CLIENT};
 pub use nvidia_rm_sys::frontend::{
     caching, copy_version, layout_mismatch, rm_version, set_user_range_validator, version_check,
     Caller, CpuCaching, MmapContext, MmapMemory, GPU_UUID_LEN, LAYOUT, NV_ERR_STATE_IN_USE,
@@ -119,6 +119,21 @@ pub fn uvm_map_external(caller: &Caller, m: &ExternalMapping) -> Result<u32, NV_
         return Err(NV_ERR_NOT_READY);
     }
     nvidia_rm_sys::frontend::uvm::map_external(caller, m)
+}
+
+/// `nvidia_rm_sys::frontend::uvm::pages`, refused with `NV_ERR_NOT_READY`
+/// while there is no RM core to lend the pages to.
+pub fn uvm_pages(
+    caller: &Caller,
+    h_client: u32,
+    h_device: u32,
+    pages: &Pages,
+    gpu_cached: bool,
+) -> Result<u32, NV_STATUS> {
+    if !rm_up() {
+        return Err(NV_ERR_NOT_READY);
+    }
+    nvidia_rm_sys::frontend::uvm::pages(caller, h_client, h_device, pages, gpu_cached)
 }
 
 /// `nvidia_rm_sys::frontend::uvm::free`. With no RM core nothing was ever
@@ -256,6 +271,16 @@ mod tests {
             read_only: false,
         };
         assert_eq!(uvm_map_external(&caller, &mapping), Err(NV_ERR_NOT_READY));
+        let keep: alloc::sync::Arc<dyn core::any::Any + Send + Sync> = alloc::sync::Arc::new(());
+        let pages = Pages {
+            phys: 0x8000_0000,
+            size: 0x1000,
+            keep: &keep,
+        };
+        assert_eq!(
+            uvm_pages(&caller, 0xc1d0_0002, 0x5c00_0002, &pages, false),
+            Err(NV_ERR_NOT_READY)
+        );
         assert_eq!(
             uvm_free(&caller, 0xc1d0_0002, 0xcaf0_0000),
             NV_ERR_NOT_READY

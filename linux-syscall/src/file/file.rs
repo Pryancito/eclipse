@@ -1092,13 +1092,9 @@ impl Syscall<'_> {
         // Honour Linux's EBADF for an invalid descriptor.
         let file = self.linux_process().get_file_like(fd)?;
         // `generic_fadvise` answers ESPIPE for a FIFO before it ever looks at
-        // the hint. A pipe from `pipe2` is a `File` over a `Pipe` inode, which
-        // has no metadata of its own, so the `S_ISFIFO` test has to be made by
-        // identity as well as by type -- asking only one of the two misses
-        // half the pipes on the machine.
-        if super::splice::pipe_inode(&file).is_some()
-            || matches!(file.metadata(), Ok(m) if m.type_ == FileType::NamedPipe)
-        {
+        // the hint: a node from `mkfifo` or a pipe from `pipe2`, which is a
+        // FIFO to `fstat` as well.
+        if matches!(file.metadata(), Ok(m) if m.type_ == FileType::NamedPipe) {
             return Err(LxError::ESPIPE);
         }
         // `generic_fadvise`: `len < 0` is EINVAL, judged after the FIFO test
@@ -2596,7 +2592,7 @@ impl Syscall<'_> {
                     proc.set_fd_cloexec(fd, (arg & 1) != 0)?;
                     Ok(0)
                 }
-                FcntlCmd::GETFL => Ok(file_like.flags().bits()),
+                FcntlCmd::GETFL => Ok(file_like.flags().status().bits()),
                 FcntlCmd::SETFL => {
                     // Only the status flags change (`SETFL_MASK`); the raw
                     // argument used to go in whole, so `F_SETFL(O_NONBLOCK)`

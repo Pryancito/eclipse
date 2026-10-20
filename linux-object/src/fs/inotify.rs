@@ -179,6 +179,11 @@ impl FileLike for Inotify {
         *self.flags.lock()
     }
 
+    /// `inotify_init1` names it `anon_inode_getfd("inotify", ...)`, without brackets.
+    fn link_name(&self) -> String {
+        String::from("anon_inode:inotify")
+    }
+
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         self.flags.lock().take_settable(f);
         Ok(())

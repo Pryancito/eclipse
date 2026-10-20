@@ -10,7 +10,7 @@ use crate::outparams::{commit_and_report_old, hand_out_pair};
 use alloc::string::String;
 use alloc::sync::Arc;
 use linux_object::error::LxResult;
-use linux_object::fs::{SignalFd, TimerFd};
+use linux_object::fs::{FdObject, SignalFd, TimerFd};
 use linux_object::time::{timerfd_clock_base, TimeSpec};
 use rcore_fs::vfs::INode;
 
@@ -49,6 +49,12 @@ impl ITimerSpec {
 }
 
 fn prepare_open_inode(inode: Arc<dyn INode>) -> LxResult<Arc<dyn INode>> {
+    // A socket or an anonymous object reached through `/proc/<pid>/fd/N`
+    // has no open to call again: `sock_no_open` and the anonymous inodes
+    // answer `ENXIO`.
+    if inode.downcast_ref::<FdObject>().is_some() {
+        return Err(LxError::ENXIO);
+    }
     // `/dev/nvidiactl` and `/dev/nvidia<N>`: every open is its own RM file
     // (its clients are freed when it closes), and a GPU the RM never brought
     // up does not open at all.
@@ -261,6 +267,16 @@ pub(crate) fn open_flags(flags: usize) -> Result<OpenFlags, LxError> {
     Ok(path_open_flags(OpenFlags::from_bits_truncate(flags)))
 }
 
+/// What `open`/`openat` keep of a flag word: [`open_flags`], plus the
+/// `O_LARGEFILE` that `build_open_how` adds on every 64-bit kernel
+/// (`force_o_largefile`), which `O_PATH` then takes away again with the
+/// rest. glibc does not pass it (musl does, on every `open`), so `F_GETFL`
+/// of a file a glibc program opened said it was missing, where Linux 6.18
+/// reports `0100000` for an `O_RDONLY` one.
+fn openat_flags(flags: usize) -> Result<OpenFlags, LxError> {
+    open_flags(flags | OpenFlags::LARGEFILE.bits())
+}
+
 /// `build_open_flags`: under `O_PATH` the kernel keeps `O_DIRECTORY`,
 /// `O_NOFOLLOW` and `O_CLOEXEC` and **drops every other bit**, the access
 /// mode among them.
@@ -288,7 +304,10 @@ impl Syscall<'_> {
         // the timer simply never fired.
         let clock = timerfd_clock_base(clockid)?;
         let open_flags = anon_fd_flags(flags, ANON_CLOEXEC | ANON_NONBLOCK)?;
-        let tfd = TimerFd::new(open_flags, clock);
+        // `O_RDWR`, as `anon_inode_getfile` is given for every anonymous
+        // object but inotify's: it is what `F_GETFL` reports and what the
+        // mode of the `/proc/<pid>/fd` link says.
+        let tfd = TimerFd::new(open_flags | OpenFlags::RDWR, clock);
         let fd = self.linux_process().add_file(tfd)?;
         Ok(fd.into())
     }
@@ -384,7 +403,7 @@ impl Syscall<'_> {
             sfd.set_mask(sigmask);
             return Ok(fd.into());
         }
-        let sfd = SignalFd::new(sigmask, open_flags);
+        let sfd = SignalFd::new(sigmask, open_flags | OpenFlags::RDWR);
         let new_fd = proc.add_file(sfd)?;
         Ok(new_fd.into())
     }
@@ -409,7 +428,7 @@ impl Syscall<'_> {
         } else {
             path
         };
-        let flags = open_flags(flags)?;
+        let flags = openat_flags(flags)?;
         info!(
             "openat: dir_fd={:?}, path={:?}, flags={:?}, mode={:#o}",
             dir_fd, path, flags, mode
@@ -665,7 +684,16 @@ impl Syscall<'_> {
             } else {
                 prepare_open_inode(inode)?
             };
-            let abs_path = proc.get_absolute_path(dir_fd, path)?;
+            // A pipe reopened through `/proc/<pid>/fd/N` (or `/dev/stdin`) is
+            // the same pipe, under the same name; so is the object an
+            // `O_PATH` open takes hold of through the link of a socket.
+            let abs_path = if let Some(pipe) = inode.downcast_ref::<Pipe>() {
+                pipe.link_name()
+            } else if let Some(object) = inode.downcast_ref::<FdObject>() {
+                object.0.link_name()
+            } else {
+                proc.get_absolute_path(dir_fd, path)?
+            };
             let file = File::new(inode, flags, abs_path);
             let fd = proc.add_file(file)?;
             Ok(fd.into())
@@ -859,11 +887,15 @@ impl Syscall<'_> {
         // get either way.
         let base_flags = anon_fd_flags(flags, ANON_CLOEXEC | ANON_NONBLOCK)?;
         let proc = self.linux_process();
-        let (read, write) = Pipe::create_pair();
+        let (read, write) = Pipe::create_pair_for(proc.fsuid(), proc.fsgid());
+        // What `/proc/<pid>/fd/N` says of both ends, `pipe:[ino]`. It said
+        // `pipe_r:[]` and `pipe_w:[]`, with no number to tell one pipe from
+        // another or to match against `fstat`.
+        let name = read.link_name();
         let read_fd = proc.add_file(File::new(
             Arc::new(read),
             base_flags | OpenFlags::RDONLY,
-            String::from("pipe_r:[]"),
+            name.clone(),
         ))?;
 
         // The descriptors only belong to the caller once it has their numbers:
@@ -875,7 +907,7 @@ impl Syscall<'_> {
                 proc.add_file(File::new(
                     Arc::new(write),
                     base_flags | OpenFlags::WRONLY,
-                    String::from("pipe_w:[]"),
+                    name.clone(),
                 ))
             },
             |read_fd, write_fd| {
@@ -1078,7 +1110,7 @@ impl Syscall<'_> {
         } else {
             pid
         };
-        let event = PerfEvent::new(&attr_bytes, pid, cpu, plan.open_flags);
+        let event = PerfEvent::new(&attr_bytes, pid, cpu, plan.open_flags | OpenFlags::RDWR);
         let fd = self.linux_process().add_file(event)?;
         Ok(fd.into())
     }

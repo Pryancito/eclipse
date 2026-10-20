@@ -9,6 +9,7 @@ use smoltcp::{
 
 use crate::net::get_sockets;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sync::Mutex;
 use alloc::string::String;
@@ -160,6 +161,19 @@ impl<'a> phy::TxToken for LoopbackTxToken<'a> {
     }
 }
 
+/// Set when a loopback `poll` moved a packet from one local socket to another.
+///
+/// The loopback has no interrupt, so nothing else tells a reader parked on its
+/// net-RX wait that its bytes arrived: it waited out its fallback timer, 1 ms,
+/// on every hop. The drivers crate cannot reach the kernel's wakers directly,
+/// so the poller that drove this one ([`take_loopback_moved`]) does the wake.
+static LOOPBACK_MOVED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a loopback `poll` delivered anything since the last call.
+pub fn take_loopback_moved() -> bool {
+    LOOPBACK_MOVED.load(Ordering::Relaxed) && LOOPBACK_MOVED.swap(false, Ordering::AcqRel)
+}
+
 #[derive(Clone)]
 pub struct LoopbackInterface {
     pub iface: Arc<Mutex<Interface<'static, LoopbackDevice>>>,
@@ -219,7 +233,12 @@ impl NetScheme for LoopbackInterface {
             return Ok(());
         };
         match iface.poll(&mut sockets, timestamp) {
-            Ok(_) => Ok(()),
+            Ok(moved) => {
+                if moved {
+                    LOOPBACK_MOVED.store(true, Ordering::Release);
+                }
+                Ok(())
+            }
             Err(err) => {
                 debug!("poll got err {}", err);
                 Err(DeviceError::IoError)

@@ -2011,7 +2011,11 @@ impl Executor {
             // of the scan.
             crate::runtime::clear_need_resched(crate::arch::cpu_id() as usize);
             let mut task_info = None;
-            if crate::runtime::rebalance_due() {
+            // Called on every pass, so the rebalance cadence is unchanged by
+            // whether a rescue kick arrived.
+            let rebalance = crate::runtime::rebalance_due();
+            let rescue_kicked = crate::runtime::take_rescue_kick();
+            if rebalance || rescue_kicked {
                 // Rescue first, and with no condition on our own load: a peer
                 // holding a task its mask forbids there is holding something
                 // NOBODY comes for. Its owner refuses it every pass and kicks
@@ -2023,8 +2027,10 @@ impl Executor {
                 if crate::runtime::stranded_peer_exists() {
                     task_info = crate::runtime::rescue_stranded_task();
                 }
-                // Balance pull, unchanged: only when we have exactly one task.
-                if task_info.is_none() && self.task_collection.ready_num() == Some(1) {
+                // Balance pull, unchanged: only on the rebalance tick, and only
+                // when we have exactly one task. A rescue kick is not a reason
+                // to rebalance.
+                if rebalance && task_info.is_none() && self.task_collection.ready_num() == Some(1) {
                     task_info = crate::runtime::steal_for_balance();
                 }
             }

@@ -155,7 +155,16 @@ pub fn record(pid: u64, num: u32) {
 fn record_in_bank(bank: usize, pid: u64, num: u32) {
     let idx = (num as usize).min(MAX_SYSCALL - 1);
     COUNTS[bank & (COUNT_BANKS - 1)][idx].fetch_add(1, Ordering::Relaxed);
-    TRACE[trace_slot(pid)].store(pack(pid, num), Ordering::Relaxed);
+    // Read before writing: the threads of one process all write the same
+    // slot, and a word that already says so is left alone. A store of the
+    // value already there still takes the line exclusive and pulls it from
+    // whichever CPU wrote it last, so twenty threads calling the same
+    // syscall bounced it on every call to store what it already held.
+    let slot = &TRACE[trace_slot(pid)];
+    let word = pack(pid, num);
+    if slot.load(Ordering::Relaxed) != word {
+        slot.store(word, Ordering::Relaxed);
+    }
 }
 
 /// Pack a `(pid, syscall)` into one word, never zero.

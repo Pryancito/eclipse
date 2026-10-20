@@ -377,7 +377,11 @@ impl KObjectBase {
     /// above the pid space, so object churn can never push a value that
     /// userspace treats as a `pid_t` past any limit. At 2^32..2^64 there is
     /// headroom for millions of years of allocation.
-    fn new_koid() -> KoID {
+    ///
+    /// Public for what needs a number from the same space without being a
+    /// kernel object: a pipe's inode number, which sits next to the ids that
+    /// sockets and the other anonymous descriptors report as theirs.
+    pub fn new_koid() -> KoID {
         static KOID: AtomicU64 = AtomicU64::new(1 << 32);
         KOID.fetch_add(1, Ordering::SeqCst)
     }

@@ -46,3 +46,70 @@ fn a_negative_argument_is_out_of_range() {
     assert_eq!(pdeathsig_from_arg(usize::MAX), Err(LxError::EINVAL));
     assert_eq!(pdeathsig_from_arg(-9i64 as usize), Err(LxError::EINVAL));
 }
+
+/// A fork records the thread it was made from: that thread's exit, and not
+/// only its whole process's, is the parent death the child asked to hear of.
+#[test]
+fn a_fork_remembers_the_thread_it_came_from() {
+    use crate::on_a_thread::on_a_thread;
+    use alloc::boxed::Box;
+    use linux_object::process::{find_process, LinuxProcess};
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::ROOT_JOB;
+
+    let proc = Process::create_with_fixed_id_ext(
+        &ROOT_JOB,
+        45_465,
+        "padre",
+        LinuxProcess::new(RamFS::new(), 0),
+    )
+    .unwrap();
+    let (recorded, forker) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let child = sys.sys_fork(0, 0).unwrap();
+            let child = find_process(child as KoID).unwrap();
+            (child.linux().forking_thread(), sys.thread.id())
+        })
+    });
+    assert_eq!(recorded, forker);
+}
+
+/// That thread leaving while another goes on is a parent death to the
+/// child, and it gets the signal it asked for then, not at the process's end.
+#[test]
+fn the_forking_thread_leaving_tells_the_child() {
+    use crate::on_a_thread::on_a_thread;
+    use alloc::boxed::Box;
+    use linux_object::process::LinuxProcess;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::ROOT_JOB;
+
+    let parent = Process::create_with_fixed_id_ext(
+        &ROOT_JOB,
+        45_466,
+        "padre",
+        LinuxProcess::new(RamFS::new(), 0),
+    )
+    .unwrap();
+    let _stays = Thread::create_linux(&parent).unwrap();
+    let child = Process::fork_from(&parent).unwrap();
+    let child_thread = Thread::create_linux(&child).unwrap();
+    child.linux().set_pdeathsig(LinuxSignal::SIGUSR1 as u8);
+    let forked = child.clone();
+    on_a_thread(&parent, move |sys| {
+        Box::pin(async move {
+            forked.linux().set_forking_thread(sys.thread.id());
+            sys.thread.exit_linux(0);
+        })
+    });
+    let told = child_thread
+        .lock_linux()
+        .signals
+        .contains(LinuxSignal::SIGUSR1);
+    child.exit(0);
+    parent.exit(0);
+    assert!(
+        told,
+        "the thread that forked it left and the child was never told"
+    );
+}
