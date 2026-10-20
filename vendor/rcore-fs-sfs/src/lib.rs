@@ -28,6 +28,10 @@ use rcore_fs::{
 
 pub use structs::*;
 
+#[cfg(test)]
+mod dot_tests;
+#[cfg(test)]
+mod space_tests;
 mod structs;
 #[cfg(test)]
 mod tests;

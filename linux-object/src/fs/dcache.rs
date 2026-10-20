@@ -89,3 +89,6 @@ pub fn put(path: &str, inode: &Arc<dyn INode>, walked: &Walked) {
     let name = (name != path).then_some(name);
     c.map.insert(String::from(path), (inode.clone(), name));
 }
+
+#[cfg(test)]
+mod epoch_tests;
