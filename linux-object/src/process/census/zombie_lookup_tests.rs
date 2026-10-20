@@ -79,12 +79,26 @@ fn a_zombie_out_of_its_job_is_found_until_it_is_reaped() {
 
     reap(&parent, pid);
     assert_eq!(found(&job, pid), None);
-    assert_eq!(
-        get_process_pgid(pid),
-        Err(LxError::ESRCH),
-        "a reaped pid still names a process: {}",
-        whoever_answers(pid)
-    );
+    // `getpgid` walks the WHOLE root job, which every test in the crate
+    // shares, and **the pid went back to the pool at the reap** -- that is
+    // what `zombie_pid_tests` is about. So between the line above and this
+    // one another test's fork can already be wearing this number, and then
+    // `getpgid` answers for it rightly: that is Linux recycling a pid, not a
+    // zombie that would not die. Asked as a flat `ESRCH` this failed one run
+    // in forty at 16 threads, naming a process whose parent was the 45336 of
+    // `a_live_child_is_not_a_zombie`, two tests down this file.
+    //
+    // What has to be gone is the PROCESS, and a new owner of the number is
+    // told from it by the group this test put it in, which nobody else uses.
+    match find_task(pid) {
+        None => {}
+        Some(other) => assert_ne!(
+            effective_pgid(&other),
+            45_339,
+            "a reaped pid still names the process this test reaped: {}",
+            whoever_answers(pid)
+        ),
+    }
     assert!(unreaped_zombies_in(&job).is_empty());
 }
 
@@ -113,6 +127,9 @@ fn a_child_reaped_while_still_in_its_job_is_gone_at_once() {
     );
     assert!(child.linux().is_reaped());
     assert_eq!(found(&job, pid), None);
+    // A flat `ESRCH` is safe to ask for here, unlike in the test above: this
+    // one is still holding `child`, so the object never dropped and its pid
+    // never went back to the pool for another test to be handed.
     assert_eq!(get_process_pgid(pid), Err(LxError::ESRCH));
 }
 
