@@ -311,7 +311,7 @@ mod tests {
         let code = instructions(include_str!("arch/riscv64/executor_entry.S"));
         let load = code.find("ld a0, 0(sp)").unwrap();
         let adjust = code.find("addi sp, sp, 16").unwrap();
-        let branch = code.find("j run_executor").unwrap();
+        let branch = code.find("tail run_executor").unwrap();
         assert!(load < adjust && adjust < branch);
     }
 
