@@ -893,6 +893,18 @@ pub fn kernel_report() -> String {
              away from its owner)",
             scans, probed, ok, aff_empty, rebalance, skipped, rescue
         );
+        let (kicks, taken, empty) = kernel_hal::kstats::sched_rescue_kick_stats();
+        let _ = writeln!(
+            out,
+            "sched rescue: {} kicks sent, {} taken by a pass, {} taken with nothing rescued",
+            kicks, taken, empty
+        );
+        let (denied, armed) = kernel_hal::thread::wake_floor_stats();
+        let _ = writeln!(
+            out,
+            "wake floor:   {} wake preemptions denied, {} floor timers armed",
+            denied, armed
+        );
         let (fx_ops, fx_probes, fx_hits, fx_walks) = kernel_hal::kstats::futex_stats();
         let _ = writeln!(
             out,
