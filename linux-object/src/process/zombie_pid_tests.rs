@@ -12,7 +12,40 @@ extern crate std;
 
 use super::*;
 use async_std::task::block_on;
+use core::time::Duration;
 use rcore_fs_ramfs::RamFS;
+
+/// Whether the process object has been let go, giving the rest of the suite
+/// a moment to drop its own hold on it.
+///
+/// `weak.upgrade().is_none()` is the pid being back in the pool, and asking
+/// it **this instant** is a claim about the whole crate rather than about
+/// this test. Every test here creates its processes in `ROOT_JOB`, and a
+/// census of that tree clones an `Arc` for every live process in it
+/// (`Job::processes`), so a test walking it holds this test's dying child
+/// for as long as its own walk takes. At 16 threads that was one red run in
+/// twenty, blaming an autoreap that had happened.
+///
+/// A hold that is somebody else's walk goes away; a hold that is the
+/// parent's own `children` entry never does, which is what this has to
+/// fail on. The bound is what tells them apart.
+fn let_go(weak: &Weak<Process>) -> bool {
+    for round in 0..600 {
+        if weak.upgrade().is_none() {
+            return true;
+        }
+        // A walk of the job tree is microseconds, so the first rounds are a
+        // yield and cost nothing in the ordinary case; the rest are a
+        // millisecond each, which puts a floor of half a second under a real
+        // failure instead of spinning a core until the harness gives up.
+        if round < 100 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    false
+}
 
 /// A parent and the pid of a child that died and has not been waited for,
 /// with a weak pointer to the child object: as long as it upgrades, the pid
@@ -100,9 +133,18 @@ fn a_child_nobody_will_wait_for_lets_it_go_at_death() {
         },
     );
     let child = Process::fork_from(&parent).unwrap();
+    let pid = child.id();
     let weak = Arc::downgrade(&child);
     child.exit(0);
     drop(child);
 
-    assert!(weak.upgrade().is_none(), "an autoreaped child kept its pid");
+    // The autoreap itself, asked of the parent's own record, which nothing
+    // else in the suite can answer for: with SIGCHLD ignored the death was
+    // never written down as a zombie, so there is nothing left to wait for.
+    assert_eq!(
+        block_on(wait_child(&parent, pid, true, true)).map(|(status, _)| status),
+        Err(LxError::ECHILD),
+        "an autoreaped child is still waitable"
+    );
+    assert!(let_go(&weak), "an autoreaped child kept its pid");
 }
