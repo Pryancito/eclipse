@@ -114,6 +114,8 @@ pub struct Process {
     dead_threads_time: AtomicU64,
     /// Kernel-mode counterpart of `dead_threads_time` (see `Thread::sys_time_ns`).
     dead_threads_sys_time: AtomicU64,
+    /// The context switches of threads that have already exited.
+    dead_threads_switches: super::thread::ContextSwitches,
     /// Exit code a thread asked to publish when it becomes the last one.
     ///
     /// `i64::MIN` means unset. Two concurrent `_exit` calls can both see
@@ -526,6 +528,7 @@ impl Process {
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::Debugger),
             dead_threads_time: AtomicU64::new(0),
             dead_threads_sys_time: AtomicU64::new(0),
+            dead_threads_switches: Default::default(),
             exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
@@ -559,6 +562,7 @@ impl Process {
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::Debugger),
             dead_threads_time: AtomicU64::new(0),
             dead_threads_sys_time: AtomicU64::new(0),
+            dead_threads_switches: Default::default(),
             exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
@@ -619,6 +623,7 @@ impl Process {
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::Debugger),
             dead_threads_time: AtomicU64::new(0),
             dead_threads_sys_time: AtomicU64::new(0),
+            dead_threads_switches: Default::default(),
             exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
@@ -1262,6 +1267,21 @@ impl Process {
         (user, sys)
     }
 
+    /// The context switches of this process's threads, `(voluntary,
+    /// nonvoluntary)`: the exited threads' and the live threads' so far, read
+    /// the way [`cpu_time_ns`](Self::cpu_time_ns) reads the clocks. What
+    /// `getrusage(RUSAGE_SELF)` and a parent's `wait4` report.
+    pub fn context_switches(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        let (mut voluntary, mut involuntary) = self.dead_threads_switches.get();
+        for t in inner.threads.iter() {
+            let (v, i) = t.context_switches();
+            voluntary += v;
+            involuntary += i;
+        }
+        (voluntary, involuntary)
+    }
+
     pub(super) fn remove_thread(&self, tid: KoID) {
         let mut inner = self.inner.lock();
         // `retain` asks every entry for its id, which is a load through it,
@@ -1279,6 +1299,7 @@ impl Process {
             }
             self.dead_threads_time_add(t.get_time());
             self.dead_threads_sys_time_add(t.get_sys_time());
+            self.dead_threads_switches.add(t.context_switches());
             false
         });
         if inner.threads.is_empty() {

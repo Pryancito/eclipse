@@ -192,15 +192,11 @@ pub(crate) async fn sleep_or_eintr(
     }
 }
 
-/// The child's final CPU usage as `wait4(2)` and `waitid(2)` hand it out:
-/// what `time(1)` prints. The struct is written in the FULL Linux layout,
-/// the fields this kernel does not account for as zero.
+/// The child's final usage as `wait4(2)` and `waitid(2)` hand it out: what
+/// `time(1)` prints. The struct is written in the FULL Linux layout, the
+/// fields this kernel does not account for as zero.
 fn child_rusage(cpu: linux_object::process::ChildCpu) -> RUsage {
-    RUsage {
-        utime: core::time::Duration::from_nanos(cpu.utime_ns).into(),
-        stime: core::time::Duration::from_nanos(cpu.stime_ns).into(),
-        ..RUsage::default()
-    }
+    RUsage::from(cpu)
 }
 
 /// The argument of `prctl(PR_SET_KEEPCAPS)`: `kernel/sys.c` takes 0 or 1
@@ -3149,6 +3145,7 @@ mod wait4_finish_tests {
         let cpu = ChildCpu {
             utime_ns: 1_500_000_000,
             stime_ns: 250_000,
+            ..Default::default()
         };
         assert_eq!(wait4_finish(ws, ru, Some((4242, 7 << 8, cpu))), Ok(4242));
         assert_eq!(status, 7 << 8);
@@ -3158,6 +3155,7 @@ mod wait4_finish_tests {
         let cpu = ChildCpu {
             utime_ns: 0,
             stime_ns: 0,
+            ..Default::default()
         };
         assert_eq!(
             wait4_finish(UserOutPtr::from(0), UserOutPtr::from(0), Some((5, 0, cpu))),
@@ -3196,12 +3194,14 @@ mod waitid_report_tests {
     }
 
     /// A child found is a `SIGCHLD` `siginfo_t` with its pid where glibc
-    /// reads `si_pid`, and its CPU time in the `rusage`.
+    /// reads `si_pid`, and its CPU time and context switches in the `rusage`.
     #[test]
     fn a_reported_child_carries_its_pid_and_its_cpu_time() {
         let cpu = ChildCpu {
             utime_ns: 1_500_000_000,
             stime_ns: 250_000,
+            voluntary_switches: 26,
+            involuntary_switches: 3,
         };
         let report = waitid_report(Some((4242, 1000, 7 << 8, cpu)));
         assert_eq!(report.info.signo, LinuxSignal::SIGCHLD as i32);
@@ -3211,7 +3211,8 @@ mod waitid_report_tests {
         let rusage = report.rusage.expect("a child was reported");
         assert_eq!((rusage.utime.sec, rusage.utime.usec), (1, 500_000));
         assert_eq!((rusage.stime.sec, rusage.stime.usec), (0, 250));
-        assert!(rusage.other.iter().all(|&f| f == 0), "the rest is zero");
+        assert_eq!((rusage.nvcsw, rusage.nivcsw), (26, 3));
+        assert_eq!((rusage.maxrss, rusage.minflt), (0, 0), "not kept");
     }
 
     /// The same struct `wait4` writes: `time(1)` over either call agrees.
@@ -3220,6 +3221,7 @@ mod waitid_report_tests {
         let cpu = ChildCpu {
             utime_ns: 3_000_000_000,
             stime_ns: 2_000_000_000,
+            ..Default::default()
         };
         let via_wait4 = child_rusage(cpu);
         let via_waitid = waitid_report(Some((1, 0, 0, cpu))).rusage.unwrap();

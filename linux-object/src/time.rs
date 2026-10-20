@@ -347,12 +347,12 @@ impl From<TimeSpec> for TimeVal {
 
 /// RUsage for sys_getrusage() — full Linux `struct rusage` layout.
 ///
-/// Only the two time fields carry data; the 14 trailing longs
-/// (`ru_maxrss` … `ru_nivcsw`) read as zero, which is also how Linux reports
-/// the fields it does not maintain. Carrying them in the struct still matters:
-/// when only the two timevals were written, the tail of the caller's buffer
-/// kept whatever garbage was on the stack, and rusage consumers (`time(1)`,
-/// libuv's getrusage wrapper) read uninitialized memory as huge fault counts.
+/// The two times and the two context switch counts carry data; the other
+/// fields read as zero, which is also how Linux reports the ones it does not
+/// maintain. Carrying them in the struct still matters: when only the two
+/// timevals were written, the tail of the caller's buffer kept whatever
+/// garbage was on the stack, and rusage consumers (`time(1)`, libuv's
+/// getrusage wrapper) read uninitialized memory as huge fault counts.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default)]
 pub struct RUsage {
@@ -360,8 +360,57 @@ pub struct RUsage {
     pub utime: TimeVal,
     /// system CPU time used
     pub stime: TimeVal,
-    /// ru_maxrss … ru_nivcsw, all reported as zero
-    pub other: [i64; 14],
+    /// `ru_maxrss`, not kept: 0
+    pub maxrss: i64,
+    /// `ru_ixrss`, which Linux does not keep either
+    pub ixrss: i64,
+    /// `ru_idrss`, which Linux does not keep either
+    pub idrss: i64,
+    /// `ru_isrss`, which Linux does not keep either
+    pub isrss: i64,
+    /// `ru_minflt`, not kept: 0
+    pub minflt: i64,
+    /// `ru_majflt`, not kept: 0
+    pub majflt: i64,
+    /// `ru_nswap`, which Linux does not keep either
+    pub nswap: i64,
+    /// `ru_inblock`, not kept: 0
+    pub inblock: i64,
+    /// `ru_oublock`, not kept: 0
+    pub oublock: i64,
+    /// `ru_msgsnd`, which Linux does not keep either
+    pub msgsnd: i64,
+    /// `ru_msgrcv`, which Linux does not keep either
+    pub msgrcv: i64,
+    /// `ru_nsignals`, which Linux does not keep either
+    pub nsignals: i64,
+    /// voluntary context switches: the task went to wait
+    pub nvcsw: i64,
+    /// involuntary context switches: the task left its CPU runnable
+    pub nivcsw: i64,
+}
+
+impl RUsage {
+    /// What this kernel keeps: CPU time, `(user, kernel)` nanoseconds, and
+    /// context switches, `(voluntary, nonvoluntary)`.
+    pub fn of((user_ns, kernel_ns): (u64, u64), (voluntary, involuntary): (u64, u64)) -> Self {
+        Self {
+            utime: Duration::from_nanos(user_ns).into(),
+            stime: Duration::from_nanos(kernel_ns).into(),
+            nvcsw: voluntary as i64,
+            nivcsw: involuntary as i64,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<crate::process::ChildCpu> for RUsage {
+    fn from(cpu: crate::process::ChildCpu) -> Self {
+        Self::of(
+            (cpu.utime_ns, cpu.stime_ns),
+            (cpu.voluntary_switches, cpu.involuntary_switches),
+        )
+    }
 }
 
 /// Tms for times()
@@ -1837,5 +1886,51 @@ mod time_tests {
             Ok(PosixTimerClock::Base(ClockBase::Monotonic))
         );
         assert_eq!(clock_nanosleep_base(7), Ok(ClockBase::Monotonic));
+    }
+}
+
+#[cfg(test)]
+mod rusage_layout_tests {
+    //! `struct rusage` is read by offset: the switch counts are the last two
+    //! of its sixteen longs, and a field one place off is another number.
+
+    use super::*;
+    use core::mem::{offset_of, size_of};
+
+    #[test]
+    fn rusage_is_linux_s_struct_rusage() {
+        assert_eq!(size_of::<RUsage>(), 144);
+        assert_eq!(offset_of!(RUsage, maxrss), 32);
+        assert_eq!(offset_of!(RUsage, minflt), 64);
+        assert_eq!(offset_of!(RUsage, nvcsw), 128);
+        assert_eq!(offset_of!(RUsage, nivcsw), 136);
+    }
+
+    #[test]
+    fn a_reaped_child_s_usage_is_its_times_and_switches_and_nothing_else() {
+        let ru = RUsage::from(crate::process::ChildCpu {
+            utime_ns: 1_500_000_000,
+            stime_ns: 250_000,
+            voluntary_switches: 26,
+            involuntary_switches: 3,
+        });
+        assert_eq!((ru.utime.sec, ru.utime.usec), (1, 500_000));
+        assert_eq!((ru.stime.sec, ru.stime.usec), (0, 250));
+        assert_eq!((ru.nvcsw, ru.nivcsw), (26, 3));
+        let rest = [
+            ru.maxrss,
+            ru.ixrss,
+            ru.idrss,
+            ru.isrss,
+            ru.minflt,
+            ru.majflt,
+            ru.nswap,
+            ru.inblock,
+            ru.oublock,
+            ru.msgsnd,
+            ru.msgrcv,
+            ru.nsignals,
+        ];
+        assert_eq!(rest, [0; 12]);
     }
 }

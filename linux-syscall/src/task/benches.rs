@@ -116,6 +116,8 @@ fn child_rusage_build(b: &mut Bencher) {
     let cpu = linux_object::process::ChildCpu {
         utime_ns: 1_234_567_890,
         stime_ns: 98_765_432,
+        voluntary_switches: 26,
+        involuntary_switches: 3,
     };
     b.iter(|| black_box(child_rusage(black_box(cpu))));
 }

@@ -7,8 +7,8 @@
 //! `Cpus_allowed_list:` were missing, so a program asking whether it is being
 //! traced (`grep TracerPid`) found nothing to read, `ps s` had no masks to
 //! show, and a check of `CapEff:` before trying something privileged read an
-//! empty string. The memory lines Linux writes after `NSsid:` and the context
-//! switch counts at the end need numbers this kernel does not keep yet.
+//! empty string. The memory lines Linux writes after `NSsid:` need numbers
+//! this kernel does not keep yet.
 
 use super::*;
 use crate::fs::FileDesc;
@@ -125,6 +125,14 @@ pub(super) fn proc_task_status(proc: &Process, thread: Option<&Arc<Thread>>) -> 
     let online = kernel_hal::cpu_online_mask();
     let allowed = task.as_ref().map_or(online, |t| t.affinity());
     cpu_lines(&mut out, allowed, online);
+    // `task_context_switch_counts()`: the task's own, the leader's for the
+    // process's file, since Linux counts them per task.
+    let (voluntary, involuntary) = task.as_ref().map_or((0, 0), |t| t.context_switches());
+    let _ = write!(
+        out,
+        "voluntary_ctxt_switches:\t{}\nnonvoluntary_ctxt_switches:\t{}\n",
+        voluntary, involuntary
+    );
     out
 }
 

@@ -86,6 +86,10 @@
 //     instead of their creator's; field 38 of /proc/<pid>/stat read 0
 //     instead of the signal the parent gets; and a parent woken by the EOF
 //     of its child's close-on-exec pipe could still move it to a group.
+//   * nobody counted context switches: `ru_nvcsw` and `ru_nivcsw` were 0
+//     and /proc/<pid>/status had no lines for them; and what a child had
+//     reaped of its own was not the child's, so `wait4` and RUSAGE_CHILDREN
+//     left out the grandchildren that did the work.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -149,8 +153,9 @@
 //              linked (static, static-pie, dynamic).
 //   cputime    the CPU time `getrusage`, `times`, `wait4` and the CPU clocks
 //              report: none for a process asleep, the 300 ms a child worked
-//              (a thread still working at `exit_group` included), and the
-//              kernel's part of a loop of syscalls on the CPU clocks.
+//              (a thread still working at `exit_group` included, and a
+//              grandchild's, which the child reaped), and the kernel's part
+//              of a loop of syscalls on the CPU clocks.
 //   fsize      `RLIMIT_FSIZE`: a write across it stops at it and one at it is
 //              EFBIG with a SIGXFSZ, which kills by default, whatever the
 //              call; a new length past it is refused only when it grows the
@@ -193,6 +198,11 @@
 //              file from the root through every link, after `./prog`,
 //              `/proc/self/fd/N` or a link; `comm` is the name the caller
 //              used, a script's own and not its interpreter's.
+//   ctxsw      a sleep is a voluntary context switch and sharing one CPU
+//              with a process that never sleeps a nonvoluntary one, in
+//              getrusage (RUSAGE_THREAD, RUSAGE_SELF with a thread gone,
+//              RUSAGE_CHILDREN), wait4 (a child's and its child's) and
+//              /proc/<pid>/status, where a thread's file is the thread's.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -1904,6 +1914,28 @@ static void sec_cputime(void) {
     long ticks = (long)(t1.tms_cutime + t1.tms_cstime - t0.tms_cutime - t0.tms_cstime);
     check(ticks >= hz * 15 / 100, "times() adds it", "%ld ticks at %ld Hz", ticks, hz);
 
+    // What a child reaped of its own is the child's too: wait4 hands out
+    // its children's time with its own, and the reaper adds both up. This
+    // is the 300 ms `time sh -c make` has to show, made by a grandchild.
+    children = ru_ms(RUSAGE_CHILDREN);
+    c = fork();
+    if (c == 0) {
+        pid_t g = fork();
+        if (g == 0) {
+            busy_ms(300);
+            _exit(0);
+        }
+        status_of(g);
+        _exit(0);
+    }
+    while ((w = wait4(c, &st, 0, &ru)) == -1 && errno == EINTR) {
+    }
+    used = ms_of(&ru.ru_utime, &ru.ru_stime);
+    children = ru_ms(RUSAGE_CHILDREN) - children;
+    check(w == c && used >= 150 && used <= 450 && children >= 150 && children <= 450,
+          "a grandchild's 300 ms: in wait4 and in RUSAGE_CHILDREN",
+          "wait4 %ld ms, RUSAGE_CHILDREN %ld ms", used, children);
+
     // A thread still working when the process calls exit_group is counted:
     // the main thread sleeps, the other one works.
     c = fork();
@@ -3288,6 +3320,152 @@ static void sec_execat(void) {
                       "a socket's fd: EACCES");
 }
 
+// ------------------------------------------------------------------ ctxsw
+
+// The context switches getrusage reports for `who`: voluntary, nonvoluntary.
+static void ru_switches(int who, long *vol, long *invol) {
+    struct rusage ru;
+    memset(&ru, 0, sizeof ru);
+    getrusage(who, &ru);
+    *vol = ru.ru_nvcsw;
+    *invol = ru.ru_nivcsw;
+}
+
+static long status_long(const char *path, const char *key) {
+    char v[64];
+    return status_value(path, key, v, sizeof v) ? strtol(v, NULL, 10) : -1;
+}
+
+#define CTX_SLEEPS 25
+
+static void ctx_sleeps(void) {
+    for (int i = 0; i < CTX_SLEEPS; i++) sleep_ms(2);
+}
+
+static volatile pid_t g_ctx_tid;
+static volatile long g_ctx_vol;
+static int g_ctx_go[2];
+
+// Sleeps, says how often it went to sleep, and waits on a pipe for leave.
+static void *ctx_thread(void *arg) {
+    (void)arg;
+    g_ctx_tid = (pid_t)syscall(SYS_gettid);
+    ctx_sleeps();
+    long vol, invol;
+    ru_switches(RUSAGE_THREAD, &vol, &invol);
+    g_ctx_vol = vol;
+    char c;
+    while (read(g_ctx_go[0], &c, 1) == -1 && errno == EINTR) {
+    }
+    return NULL;
+}
+
+static void *ctx_sleeper(void *arg) {
+    (void)arg;
+    ctx_sleeps();
+    return NULL;
+}
+
+static void sec_ctxsw(void) {
+    const char *self = "/proc/self/status";
+    long v0, i0, v1, i1;
+
+    // Going to sleep is giving the CPU up: one voluntary switch a sleep.
+    ru_switches(RUSAGE_THREAD, &v0, &i0);
+    ctx_sleeps();
+    ru_switches(RUSAGE_THREAD, &v1, &i1);
+    check(v1 - v0 >= CTX_SLEEPS && i1 - i0 < CTX_SLEEPS, "a sleep is a voluntary switch",
+          "%ld voluntary and %ld nonvoluntary for %d sleeps", v1 - v0, i1 - i0, CTX_SLEEPS);
+
+    // The status file has both lines, and they are the thread's.
+    long sv = status_long(self, "voluntary_ctxt_switches");
+    long si = status_long(self, "nonvoluntary_ctxt_switches");
+    ru_switches(RUSAGE_THREAD, &v1, &i1);
+    check(sv >= v0 + CTX_SLEEPS && sv <= v1 && si >= 0 && si <= i1,
+          "status: voluntary_ctxt_switches and nonvoluntary_ctxt_switches are the thread's",
+          "status %ld/%ld, getrusage %ld/%ld", sv, si, v1, i1);
+
+    // Another thread's file is that thread's own count; this one's does not
+    // move with it.
+    pthread_t t;
+    if (pipe(g_ctx_go) == 0 && pthread_create(&t, NULL, ctx_thread, NULL) == 0) {
+        long mine0 = status_long(self, "voluntary_ctxt_switches");
+        long end = clock_ms(CLOCK_MONOTONIC) + 5000;
+        while (!g_ctx_vol && clock_ms(CLOCK_MONOTONIC) < end) {
+        }
+        char path[64];
+        snprintf(path, sizeof path, "/proc/self/task/%d/status", (int)g_ctx_tid);
+        long theirs = status_long(path, "voluntary_ctxt_switches");
+        long mine1 = status_long(self, "voluntary_ctxt_switches");
+        check(g_ctx_vol >= CTX_SLEEPS && theirs >= g_ctx_vol && theirs <= g_ctx_vol + 3 &&
+                  mine1 - mine0 < CTX_SLEEPS,
+              "task/<tid>/status: that thread's switches",
+              "it counted %ld, its file %ld; this thread's file moved %ld", (long)g_ctx_vol,
+              theirs, mine1 - mine0);
+        if (write(g_ctx_go[1], "x", 1) != 1)
+            check(0, "task/<tid>/status: let it go", "%s", strerror(errno));
+        pthread_join(t, NULL);
+        close(g_ctx_go[0]);
+        close(g_ctx_go[1]);
+    }
+
+    // RUSAGE_SELF is every thread's, those that have exited included.
+    ru_switches(RUSAGE_SELF, &v0, &i0);
+    if (pthread_create(&t, NULL, ctx_sleeper, NULL) == 0) pthread_join(t, NULL);
+    ru_switches(RUSAGE_SELF, &v1, &i1);
+    check(v1 - v0 >= CTX_SLEEPS, "RUSAGE_SELF: a thread's switches, after it is gone",
+          "%ld voluntary for its %d sleeps", v1 - v0, CTX_SLEEPS);
+
+    // wait4 hands out the child's, with its own reaped children's; and
+    // RUSAGE_CHILDREN adds them up.
+    ru_switches(RUSAGE_CHILDREN, &v0, &i0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        pid_t grand = fork();
+        if (grand == 0) {
+            ctx_sleeps();
+            _exit(0);
+        }
+        status_of(grand);
+        ctx_sleeps();
+        _exit(0);
+    }
+    struct rusage ru;
+    memset(&ru, 0, sizeof ru);
+    int status;
+    pid_t got = wait4(pid, &status, 0, &ru);
+    ru_switches(RUSAGE_CHILDREN, &v1, &i1);
+    check(got == pid && ru.ru_nvcsw >= 2 * CTX_SLEEPS,
+          "wait4: the child's switches and its children's", "%ld voluntary for %d sleeps",
+          ru.ru_nvcsw, 2 * CTX_SLEEPS);
+    check(v1 - v0 >= 2 * CTX_SLEEPS && v1 - v0 <= ru.ru_nvcsw + 2,
+          "RUSAGE_CHILDREN: what wait4 handed out", "%ld voluntary, wait4 said %ld", v1 - v0,
+          ru.ru_nvcsw);
+
+    // Two processes that never sleep, on one CPU: each takes the CPU from
+    // the other, and that is a nonvoluntary switch.
+    cpu_set_t one, before;
+    CPU_ZERO(&one);
+    CPU_SET(0, &one);
+    sched_getaffinity(0, sizeof before, &before);
+    sched_setaffinity(0, sizeof one, &one);
+    pid = fork();
+    if (pid == 0) {
+        clk_burn(300, 3000);
+        _exit(0);
+    }
+    ru_switches(RUSAGE_THREAD, &v0, &i0);
+    clk_burn(300, 3000);
+    ru_switches(RUSAGE_THREAD, &v1, &i1);
+    memset(&ru, 0, sizeof ru);
+    got = wait4(pid, &status, 0, &ru);
+    sched_setaffinity(0, sizeof before, &before);
+    check(i1 - i0 >= 2 && got == pid && ru.ru_nivcsw >= 2,
+          "sharing a CPU: nonvoluntary switches, both sides",
+          "this one %ld nonvoluntary (%ld voluntary), the child %ld", i1 - i0, v1 - v0,
+          ru.ru_nivcsw);
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -3320,6 +3498,7 @@ static const struct {
     {"kin", "what a new thread or child is named, and when its parent lets go", sec_kin},
     {"status", "/proc/<pid>/status: Linux's lines, with the task's own numbers", sec_status},
     {"execat", "what execveat runs, and what an exec calls the program", sec_execat},
+    {"ctxsw", "the context switches getrusage, wait4 and /proc count", sec_ctxsw},
 };
 
 int main(int argc, char **argv) {

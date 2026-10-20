@@ -126,6 +126,7 @@ impl Future for YieldFuture {
             if self.voluntary {
                 mark::end_voluntary_yield();
             }
+            super::thread::note_yield();
             Poll::Pending
         }
     }
@@ -432,6 +433,28 @@ mod tests {
             0,
             "an end-of-slice preemption is being filed as a voluntary yield"
         );
+    }
+
+    /// Poll `fut` once and say whether this CPU then says it yielded.
+    fn yielded_after_one_poll(fut: impl Future<Output = ()>) -> bool {
+        let probe = Probe::new();
+        let waker = waker_of(&probe);
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(fut);
+        crate::thread::take_yielded();
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        crate::thread::take_yielded()
+    }
+
+    /// Both ways of yielding give the CPU back runnable -- a nonvoluntary
+    /// context switch -- and a `Pending` that waits for a wake does not; the
+    /// answer is given once.
+    #[test]
+    fn a_yield_leaves_the_cpu_runnable_and_a_wait_does_not() {
+        assert!(yielded_after_one_poll(crate::thread::yield_now()));
+        assert!(!crate::thread::take_yielded(), "asked twice, said twice");
+        assert!(yielded_after_one_poll(crate::thread::preempt_now()));
+        assert!(!yielded_after_one_poll(core::future::pending::<()>()));
     }
 
     #[test]
