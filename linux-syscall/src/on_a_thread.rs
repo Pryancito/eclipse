@@ -10,12 +10,15 @@ extern crate std;
 
 use super::*;
 use alloc::boxed::Box;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::time::Duration;
 use linux_object::thread::ThreadExt;
-use std::sync::{mpsc, Mutex};
+use std::collections::HashMap;
+use std::sync::{mpsc, Mutex, Once};
+use std::thread::ThreadId;
 use zircon_object::task::Thread;
 
 type Call = Box<
@@ -23,6 +26,40 @@ type Call = Box<
 >;
 
 static CALLS: Mutex<Vec<(KoID, Call)>> = Mutex::new(Vec::new());
+
+/// What the last panic on each host thread said.
+///
+/// A panic inside the call used to reach the test as `the call never came
+/// back: Disconnected`, which names neither the failing assertion nor its
+/// file: `async_std::task::spawn` drops the `JoinHandle`, so the executor
+/// catches the unwind and throws the payload away, and libtest's output
+/// capture is inherited by the executor's worker threads from whichever test
+/// first spawned one -- so the printed message lands in that test's captured
+/// output and is discarded when it passes. The hook below keeps the message
+/// where the unwinding task can pick it up and send it on.
+static PANICS: Mutex<Option<HashMap<ThreadId, String>>> = Mutex::new(None);
+
+/// Keep what every panic says, on top of whatever the harness already does
+/// with it.
+fn remember_panics() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if let Ok(mut panics) = PANICS.lock() {
+                panics
+                    .get_or_insert_with(HashMap::new)
+                    .insert(std::thread::current().id(), info.to_string());
+            }
+            previous(info);
+        }));
+    });
+}
+
+/// What the panic that is unwinding this thread said, taken out of the map.
+fn panic_of(id: ThreadId) -> Option<String> {
+    PANICS.lock().ok()?.as_mut()?.remove(&id)
+}
 
 fn run_call(current: CurrentThread) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(async move {
@@ -55,15 +92,42 @@ pub(crate) fn on_a_thread<R: Send + 'static>(
         + Send
         + 'static,
 ) -> R {
+    remember_panics();
     let thread = Thread::create_linux(proc).unwrap();
     let (tx, rx) = mpsc::channel();
     let call: Call = Box::new(move |syscall| {
         Box::pin(async move {
-            let _ = tx.send(call(syscall).await);
+            // A panic inside the call unwinds this future and drops the
+            // sender with it, leaving the receiver a closed channel and
+            // nothing else. Send what the panic said on the way out.
+            struct Unwound<R> {
+                tx: mpsc::Sender<Result<R, String>>,
+                answered: bool,
+            }
+            impl<R> Drop for Unwound<R> {
+                fn drop(&mut self) {
+                    if !self.answered {
+                        let said = panic_of(std::thread::current().id())
+                            .unwrap_or_else(|| String::from("the task was dropped"));
+                        let _ = self.tx.send(Err(said));
+                    }
+                }
+            }
+            let mut unwound = Unwound {
+                tx: tx.clone(),
+                answered: false,
+            };
+            let got = call(syscall).await;
+            unwound.answered = true;
+            let _ = tx.send(Ok(got));
         })
     });
     CALLS.lock().unwrap().push((thread.id(), call));
     thread.start_with(|_| {}, run_call).unwrap();
-    rx.recv_timeout(Duration::from_secs(20))
-        .expect("the call never came back")
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(Ok(got)) => got,
+        // Where the panic the executor swallowed reaches the test.
+        Ok(Err(said)) => panic!("the call panicked: {}", said),
+        Err(e) => panic!("the call never came back: {:?}", e),
+    }
 }
