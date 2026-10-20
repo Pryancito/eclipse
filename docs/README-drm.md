@@ -59,6 +59,17 @@ kernel devuelve **EFAULT**, como `access_ok()` en Linux.
 > no pide privilegios, así que cualquier cliente podía dar una dirección del
 > kernel y hacer que el kernel escribiera allí.
 
+Y ninguno pide alineación: Linux lee y escribe los arreglos anidados con
+`get_user`/`put_user`/`copy_to_user`, que toman cualquier dirección, y aquí lo
+hacen `uget`/`uput`/`ucopy_out` (`read_unaligned`/`write_unaligned`, junto a
+`ucheck_n`). Hasta el 20-oct-2026 los 25 arreglos anidados (los conectores de
+`SETCRTC`, los clips de `DIRTYFB`, los ids y arrendatarios de las *leases*, el
+encoder y las propiedades de `GETCONNECTOR`, los formatos de `GETPLANE`, los
+valores y enums de `GETPROPERTY`, las listas de ids y de propiedades, los
+handles y puntos de los syncobj y los cuatro arreglos de `ATOMIC`) se leían con
+un deref directo (`*(ptr as *const T).add(i)`): con un puntero impar es UB, y
+con las aserciones de depuración un aborto del kernel entero.
+
 ### Despacho por número de ioctl
 
 Linux nunca despacha por el comando codificado: `drm_ioctl()` toma
