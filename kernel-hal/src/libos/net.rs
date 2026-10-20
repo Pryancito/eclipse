@@ -81,6 +81,9 @@ pub fn clear_net_rx_waker(_waker: &Waker) {}
 /// libOS host build: RX wakers are no-ops.
 pub fn wake_net_rx_waiters() {}
 
+/// libOS host build: RX wakers are no-ops.
+pub fn wake_net_rx_waiters_now() {}
+
 pub fn get_net_device() -> Vec<Arc<dyn NetScheme>> {
     let mut devices = all_net().as_vec().clone();
     devices.sort_by_key(|d| if d.get_ifname() == "loopback" { 1 } else { 0 });
