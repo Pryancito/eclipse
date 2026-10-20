@@ -1360,12 +1360,12 @@ pub extern "C" fn os_bug_check(code: NvU32, message: *const c_char) -> ! {
 }
 #[no_mangle]
 pub extern "C" fn os_lock_user_pages(
-    _a: *mut c_void,
-    _b: NvU64,
-    _c: *mut *mut c_void,
-    _d: NvU32,
+    address: *mut c_void,
+    page_count: NvU64,
+    page_array: *mut *mut c_void,
+    flags: NvU32,
 ) -> NV_STATUS {
-    NV_ERR_NOT_SUPPORTED
+    crate::frontend::user_pages::lock(address, page_count, page_array, flags)
 }
 #[no_mangle]
 pub extern "C" fn os_lookup_user_io_memory(
@@ -1376,8 +1376,12 @@ pub extern "C" fn os_lookup_user_io_memory(
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
-pub extern "C" fn os_unlock_user_pages(_a: NvU64, _b: *mut c_void, _c: NvU32) -> NV_STATUS {
-    NV_ERR_NOT_SUPPORTED
+pub extern "C" fn os_unlock_user_pages(
+    _page_count: NvU64,
+    page_array: *mut c_void,
+    _flags: NvU32,
+) -> NV_STATUS {
+    crate::frontend::user_pages::unlock(page_array)
 }
 // os_match_mmap_offset: real impl in vendor/eclipse_rm_mem.c, which knows
 // what an allocation's memData is.

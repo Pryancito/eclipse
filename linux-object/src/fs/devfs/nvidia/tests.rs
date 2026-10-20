@@ -18,10 +18,15 @@ fn no_gpus() -> u32 {
     0
 }
 
+fn no_pins(_va: usize, _count: usize, _write: bool) -> LxResult<nvctl::UserPages> {
+    Err(LxError::EFAULT)
+}
+
 const NOBODY: NvCaller<'static> = NvCaller {
     admin: false,
     gpu_mask: &no_gpus,
     open_of_fd: &no_fds,
+    pin_user_pages: &no_pins,
 };
 
 fn ctl() -> NvidiaOpen {
@@ -352,7 +357,7 @@ fn a_payload_nobody_can_read_is_efault() {
 #[test]
 fn escapes_not_served_are_einval() {
     for nr in [
-        0x27, /* RM_ALLOC_MEMORY */
+        0x4A, /* RM_VID_HEAP_CONTROL */
         206,  /* ALLOC_OS_EVENT */
         213, 0x99,
     ] {
@@ -366,7 +371,13 @@ fn escapes_not_served_are_einval() {
     }
     // Hosted there is no RM behind the RM escapes either, but they are
     // served: refused for want of an RM, not logged as escapes to write.
-    for nr in [esc::RM_CONTROL, esc::RM_MAP_MEMORY, esc::RM_UNMAP_MEMORY] {
+    for nr in [
+        esc::RM_CONTROL,
+        esc::RM_MAP_MEMORY,
+        esc::RM_UNMAP_MEMORY,
+        0x27, /* RM_ALLOC_MEMORY */
+        0x5E, /* RM_UPDATE_DEVICE_MAPPING_INFO */
+    ] {
         let mut p = [0u8; 56];
         assert_eq!(
             ioctl_on(&ctl(), nr, &mut p),
@@ -375,7 +386,7 @@ fn escapes_not_served_are_einval() {
         );
         assert!(!logged_not_served(nr), "{:#x} is served", nr);
     }
-    assert!(logged_not_served(0x27));
+    assert!(logged_not_served(0x4A));
 }
 
 fn logged_not_served(nr: u32) -> bool {
@@ -402,6 +413,7 @@ fn caller_with_fd<'a>(fd_table: &'a dyn Fn(i32) -> Option<Arc<dyn INode>>) -> Nv
         admin: false,
         gpu_mask: &no_gpus,
         open_of_fd: fd_table,
+        pin_user_pages: &no_pins,
     }
 }
 
@@ -1085,4 +1097,122 @@ fn poll_through_the_file_reaches_the_open() {
     open.events.post(None);
     assert_eq!(count.0.load(Ordering::SeqCst), 1);
     assert!(file.poll(PollEvents::IN).unwrap().read);
+}
+
+/// An RM_ALLOC_MEMORY payload: `hClass`, `flags`, `pMemory` and `limit`.
+fn alloc_memory(class: u32, flags: u32, address: u64, limit: u64) -> [u8; ALLOC_MEMORY_SIZE] {
+    let mut p = [0u8; ALLOC_MEMORY_SIZE];
+    put_u32(&mut p, ALLOC_MEMORY_CLASS, class);
+    put_u32(&mut p, ALLOC_MEMORY_FLAGS, flags);
+    put_u64(&mut p, ALLOC_MEMORY_PMEMORY, address);
+    put_u64(&mut p, ALLOC_MEMORY_LIMIT, limit);
+    p
+}
+
+#[test]
+fn an_os_descriptor_has_the_pages_its_limit_covers_pinned() {
+    // The limit is the last byte: 0x2000 bytes are two pages, one more three.
+    for (limit, pages) in [(0, 1), (0xfff, 1), (0x1fff, 2), (0x2000, 3)] {
+        let p = alloc_memory(OS_DESCRIPTOR_CLASS, 0, 0x7000_0000, limit);
+        assert_eq!(
+            os_descriptor_pages(&p, false),
+            Some((0x7000_0000, pages, true)),
+            "limit {limit:#x}"
+        );
+    }
+    // NVOS02_FLAGS_ALLOC_USER_READ_ONLY_YES: pinned for reading only.
+    let p = alloc_memory(OS_DESCRIPTOR_CLASS, 1 << 21, 0x7000_0000, 0xfff);
+    assert_eq!(
+        os_descriptor_pages(&p, false),
+        Some((0x7000_0000, 1, false))
+    );
+    // The other flags are the RM's to check.
+    let p = alloc_memory(OS_DESCRIPTOR_CLASS, !(1 << 21), 0x7000_0000, 0xfff);
+    assert_eq!(os_descriptor_pages(&p, false), Some((0x7000_0000, 1, true)));
+}
+
+#[test]
+fn nothing_is_pinned_for_a_call_the_rm_refuses_before_it_pins() {
+    let good = alloc_memory(OS_DESCRIPTOR_CLASS, 0, 0x7000_0000, 0xfff);
+    assert!(os_descriptor_pages(&good, false).is_some());
+    assert_eq!(
+        os_descriptor_pages(&good, true),
+        None,
+        "on the control device"
+    );
+    assert_eq!(
+        os_descriptor_pages(&good[..48], false),
+        None,
+        "a payload of the wrong size"
+    );
+    for (p, why) in [
+        (
+            alloc_memory(0x3E, 0, 0x7000_0000, 0xfff),
+            "NV01_MEMORY_SYSTEM",
+        ),
+        (
+            alloc_memory(OS_DESCRIPTOR_CLASS, 0, 0x7000_0800, 0xfff),
+            "an unaligned address",
+        ),
+        (
+            alloc_memory(OS_DESCRIPTOR_CLASS, 0, 0x7000_0000, u64::MAX),
+            "a limit that overflows",
+        ),
+    ] {
+        assert_eq!(os_descriptor_pages(&p, false), None, "{why}");
+    }
+}
+
+#[test]
+fn an_os_descriptor_is_pinned_as_the_payload_asks() {
+    let asked = core::cell::RefCell::new(Vec::new());
+    let pin = |va: usize, count: usize, write: bool| {
+        asked.borrow_mut().push((va, count, write));
+        Ok(nvctl::UserPages {
+            va,
+            phys: vec![0x1000; count],
+            writable: write,
+            keep: alloc::boxed::Box::new(()),
+        })
+    };
+    let caller = NvCaller {
+        pin_user_pages: &pin,
+        ..caller_with_fd(&no_fds)
+    };
+    let p = alloc_memory(OS_DESCRIPTOR_CLASS, 1 << 21, 0x7000_0000, 0x2fff);
+    let pages = pin_os_descriptor(&p, false, &caller).expect("pinned");
+    assert_eq!(
+        (pages.va, pages.phys.len(), pages.writable),
+        (0x7000_0000, 3, false)
+    );
+    assert_eq!(*asked.borrow(), [(0x7000_0000, 3, false)]);
+
+    // Nothing is pinned for any other call, and a failure lends nothing.
+    assert!(pin_os_descriptor(&p, true, &caller).is_none());
+    assert_eq!(asked.borrow().len(), 1);
+    let p = alloc_memory(OS_DESCRIPTOR_CLASS, 0, 0x7000_0000, 0xfff);
+    assert!(pin_os_descriptor(&p, false, &caller_with_fd(&no_fds)).is_none());
+}
+
+#[test]
+fn nothing_is_pinned_while_there_is_no_rm() {
+    let asked = core::cell::Cell::new(false);
+    let pin = |_: usize, _: usize, _: bool| {
+        asked.set(true);
+        Err(LxError::EFAULT)
+    };
+    let caller = NvCaller {
+        pin_user_pages: &pin,
+        ..caller_with_fd(&no_fds)
+    };
+    let mut p = alloc_memory(OS_DESCRIPTOR_CLASS, 0, 0x7000_0000, 0xfff);
+    assert_eq!(
+        gpu(0).ioctl(
+            iowr(esc::RM_ALLOC_MEMORY, p.len()),
+            p.as_mut_ptr() as usize,
+            &caller
+        ),
+        Err(LxError::EINVAL)
+    );
+    assert!(!asked.get());
 }

@@ -22,6 +22,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub use nvidia_rm_sys::frontend::events::{
     alloc_os_event, free_os_event, set_event_sink, UnixEvent, NV_ERR_INVALID_EVENT,
 };
+pub use nvidia_rm_sys::frontend::user_pages::UserPages;
 pub use nvidia_rm_sys::frontend::uvm::{ExternalMapping, Pages, NV_ERR_INVALID_CLIENT};
 pub use nvidia_rm_sys::frontend::{
     caching, copy_version, layout_mismatch, rm_version, set_user_range_validator, version_check,
@@ -69,6 +70,21 @@ pub fn rm_escape(cmd: u32, payload: &mut [u8], caller: &Caller) -> NV_STATUS {
         return NV_ERR_NOT_READY;
     }
     nvidia_rm_sys::frontend::rm_escape(cmd, payload, caller)
+}
+
+/// `nvidia_rm_sys::frontend::user_pages::rm_escape_lending`, refused with
+/// `NV_ERR_NOT_READY` while there is no RM core to run it, and `pages`
+/// unpinned at once.
+pub fn rm_escape_lending(
+    cmd: u32,
+    payload: &mut [u8],
+    caller: &Caller,
+    pages: Option<UserPages>,
+) -> NV_STATUS {
+    if !rm_up() {
+        return NV_ERR_NOT_READY;
+    }
+    nvidia_rm_sys::frontend::user_pages::rm_escape_lending(cmd, payload, caller, pages)
 }
 
 /// `nvidia_rm_sys::frontend::rm_map_memory`, refused with `NV_ERR_NOT_READY`
@@ -249,6 +265,10 @@ mod tests {
             gpu_mask: 0,
         };
         assert_eq!(rm_escape(0x2A, &mut [0u8; 32], &caller), NV_ERR_NOT_READY);
+        assert_eq!(
+            rm_escape_lending(0x27, &mut [0u8; 56], &caller, None),
+            NV_ERR_NOT_READY
+        );
         let mut payload = [0u8; 56];
         assert_eq!(
             rm_map_memory(&mut payload, &caller),

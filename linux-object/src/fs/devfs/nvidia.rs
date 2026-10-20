@@ -19,10 +19,12 @@
 //! ATTACH_GPUS_TO_FD, WAIT_OPEN_COMPLETE, STATUS_CODE, REGISTER_FD and the OS
 //! events (ALLOC_OS_EVENT, FREE_OS_EVENT, RM_GET_EVENT_DATA, and `poll`).
 //! Served by the RM (`nvidia-rm-sys/vendor/eclipse_rm_frontend.c`): RM_ALLOC,
-//! RM_FREE, RM_CONTROL, RM_DUP_OBJECT, RM_SHARE, RM_MAP_MEMORY and
-//! RM_UNMAP_MEMORY. Everything else answers EINVAL and is logged the first
-//! time each escape is seen: RM_ALLOC_MEMORY, VID_HEAP_CONTROL,
-//! SET_NUMA_STATUS and the dma-buf escapes.
+//! RM_FREE, RM_CONTROL, RM_DUP_OBJECT, RM_SHARE, RM_MAP_MEMORY,
+//! RM_UNMAP_MEMORY, RM_UPDATE_DEVICE_MAPPING_INFO, and RM_ALLOC_MEMORY of an
+//! OS descriptor, whose pages are pinned here first (`pin.rs`). Everything
+//! else answers EINVAL and is logged the first time each escape is seen:
+//! RM_ALLOC_MEMORY of any other class, VID_HEAP_CONTROL, SET_NUMA_STATUS and
+//! the dma-buf escapes.
 //! `nvidia-smi` is what this much is for; CUDA needs those, and
 //! `/dev/nvidia-uvm` besides (`nvidia_uvm.rs`).
 //!
@@ -57,6 +59,7 @@ use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::convert::TryFrom;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::Waker;
 
@@ -81,6 +84,7 @@ const GPU_MINOR_MAX: u32 = 247;
 
 /// The escapes this file knows by name (nv-ioctl-numbers.h, nv_escape.h).
 pub mod esc {
+    pub const RM_ALLOC_MEMORY: u32 = 0x27;
     pub const RM_FREE: u32 = 0x29;
     pub const RM_CONTROL: u32 = 0x2A;
     pub const RM_ALLOC: u32 = 0x2B;
@@ -89,6 +93,7 @@ pub mod esc {
     pub const RM_GET_EVENT_DATA: u32 = 0x52;
     pub const RM_MAP_MEMORY: u32 = 0x4E;
     pub const RM_UNMAP_MEMORY: u32 = 0x4F;
+    pub const RM_UPDATE_DEVICE_MAPPING_INFO: u32 = 0x5E;
     pub const CARD_INFO: u32 = 200;
     pub const REGISTER_FD: u32 = 201;
     pub const ALLOC_OS_EVENT: u32 = 206;
@@ -128,7 +133,16 @@ const GET_EVENT_DATA_SIZE: usize = 16;
 /// retired pages is, after the 64 addresses it can hold.
 const NUMA_INFO_SIZE: usize = 560;
 const NUMA_INFO_OFFLINE_COUNT: usize = 552;
-const SIZES: [usize; 15] = [
+/// `nv_ioctl_nvos02_parameters_with_fd`, and where in it the address of the
+/// memory an OS descriptor names is. `hClass`, `flags` and `limit` sit
+/// around it, as NVOS02_PARAMETERS lays them out.
+const ALLOC_MEMORY_SIZE: usize = 56;
+const ALLOC_MEMORY_PMEMORY: usize = 24;
+const ALLOC_MEMORY_CLASS: usize = 12;
+const ALLOC_MEMORY_FLAGS: usize = 16;
+const ALLOC_MEMORY_LIMIT: usize = 32;
+const ALLOC_MEMORY_STATUS: usize = 40;
+const SIZES: [usize; 17] = [
     XFER_SIZE,
     CARD_INFO_SIZE,
     RM_API_VERSION_SIZE,
@@ -144,6 +158,8 @@ const SIZES: [usize; 15] = [
     nvctl::UnixEvent::SIZE,
     NUMA_INFO_SIZE,
     NUMA_INFO_OFFLINE_COUNT,
+    ALLOC_MEMORY_SIZE,
+    ALLOC_MEMORY_PMEMORY,
 ];
 
 /// The most events queued on one open that nobody has read. Linux queues
@@ -298,6 +314,9 @@ pub struct NvCaller<'a> {
     pub gpu_mask: &'a dyn Fn() -> u32,
     /// The inode behind one of the caller's fds, for REGISTER_FD.
     pub open_of_fd: &'a dyn Fn(i32) -> Option<Arc<dyn INode>>,
+    /// `(address, pages, for writing)` of the caller's memory, pinned
+    /// ([`pin_user_pages`]), for RM_ALLOC_MEMORY of an OS descriptor.
+    pub pin_user_pages: &'a dyn Fn(usize, usize, bool) -> LxResult<nvctl::UserPages>,
 }
 
 /// Serialises REGISTER_FD's check-and-link, which Linux runs under the RM
@@ -582,11 +601,27 @@ impl NvidiaOpen {
                 }
                 escape_result(nr, status)
             }
+            esc::RM_ALLOC_MEMORY => {
+                if !nvctl::rm_up() {
+                    no_rm_yet();
+                    return Err(LxError::EINVAL);
+                }
+                // An OS descriptor names memory of the caller's: its pages
+                // are pinned here, outside the RM gate, and lent to the RM,
+                // which takes them in `os_lock_user_pages`.
+                let pages = pin_os_descriptor(payload, self.is_ctl(), caller);
+                let status = nvctl::rm_escape_lending(nr, payload, &self.rm_caller(caller), pages);
+                if status == NV_OK {
+                    alloc_memory_refused(payload);
+                }
+                escape_result(nr, status)
+            }
             esc::RM_FREE
             | esc::RM_CONTROL
             | esc::RM_DUP_OBJECT
             | esc::RM_SHARE
-            | esc::RM_UNMAP_MEMORY => {
+            | esc::RM_UNMAP_MEMORY
+            | esc::RM_UPDATE_DEVICE_MAPPING_INFO => {
                 if !nvctl::rm_up() {
                     no_rm_yet();
                     return Err(LxError::EINVAL);
@@ -831,6 +866,82 @@ fn dropped_event() {
             MAX_QUEUED_EVENTS
         );
     }
+}
+
+/// `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` (cl0071.h).
+const OS_DESCRIPTOR_CLASS: u32 = 0x71;
+/// `NVOS02_FLAGS_ALLOC_USER_READ_ONLY` (nvos.h, bit 21).
+const ALLOC_USER_READ_ONLY: u32 = 1 << 21;
+
+/// The pages an RM_ALLOC_MEMORY payload has the RM pin, as
+/// RmCreateOsDescriptor asks `os_lock_user_pages` for them: `(address,
+/// pages, for writing)`. `None` for a call that never gets that far: a
+/// payload of the wrong size, the control device, another class, an address
+/// that is not page aligned, or a limit that overflows.
+fn os_descriptor_pages(payload: &[u8], ctl: bool) -> Option<(usize, usize, bool)> {
+    if payload.len() != ALLOC_MEMORY_SIZE
+        || ctl
+        || u32_at(payload, ALLOC_MEMORY_CLASS) != OS_DESCRIPTOR_CLASS
+    {
+        return None;
+    }
+    let address = u64_at(payload, ALLOC_MEMORY_PMEMORY);
+    if !address.is_multiple_of(PAGE_SIZE as u64) {
+        return None;
+    }
+    let size = u64_at(payload, ALLOC_MEMORY_LIMIT).checked_add(1)?;
+    let count = 1 + (size - 1) / PAGE_SIZE as u64;
+    let write = u32_at(payload, ALLOC_MEMORY_FLAGS) & ALLOC_USER_READ_ONLY == 0;
+    Some((
+        usize::try_from(address).ok()?,
+        usize::try_from(count).ok()?,
+        write,
+    ))
+}
+
+/// The pages of the OS descriptor an RM_ALLOC_MEMORY payload names, pinned
+/// for the RM to take; `None` for any other call, and for pages that could
+/// not be pinned.
+fn pin_os_descriptor(payload: &[u8], ctl: bool, caller: &NvCaller) -> Option<nvctl::UserPages> {
+    let (va, count, write) = os_descriptor_pages(payload, ctl)?;
+    match (caller.pin_user_pages)(va, count, write) {
+        Ok(pages) => Some(pages),
+        Err(e) => {
+            unpinned(va, count, write, e);
+            None
+        }
+    }
+}
+
+/// One log line for each OS descriptor whose pages could not be pinned: the
+/// RM then refuses the call in its status (its `os_lock_user_pages` answers
+/// `NV_ERR_INVALID_ADDRESS`, and there is no I/O memory to fall back to),
+/// which no failed syscall shows.
+fn unpinned(va: usize, count: usize, write: bool, e: LxError) {
+    zcore_drivers::klog_warn!(
+        "[nvidiactl] RM_ALLOC_MEMORY: {} pages at {:#x} not pinned for {}: {:?}",
+        count,
+        va,
+        if write { "writing" } else { "reading" },
+        e
+    );
+}
+
+/// One log line for an RM_ALLOC_MEMORY the RM refused in its status, which
+/// no failed syscall shows either: what the client asked for, and the RM's
+/// answer.
+fn alloc_memory_refused(payload: &[u8]) {
+    if payload.len() != ALLOC_MEMORY_SIZE || u32_at(payload, ALLOC_MEMORY_STATUS) == NV_OK {
+        return;
+    }
+    zcore_drivers::klog_warn!(
+        "[nvidiactl] RM_ALLOC_MEMORY of class {:#x}, flags {:#x}, limit {:#x} at {:#x}: RM status {:#x}",
+        u32_at(payload, ALLOC_MEMORY_CLASS),
+        u32_at(payload, ALLOC_MEMORY_FLAGS),
+        u64_at(payload, ALLOC_MEMORY_LIMIT),
+        u64_at(payload, ALLOC_MEMORY_PMEMORY),
+        u32_at(payload, ALLOC_MEMORY_STATUS)
+    );
 }
 
 /// `rm_ioctl`'s answer for an RM escape: any status but NV_OK is EINVAL, as
@@ -1126,6 +1237,9 @@ pub fn create_nodes(root: &Arc<DevINode>) {
         core::str::from_utf8(nvctl::rm_version()).unwrap_or("?"),
     );
 }
+
+mod pin;
+pub use pin::pin_user_pages;
 
 #[cfg(test)]
 mod tests;

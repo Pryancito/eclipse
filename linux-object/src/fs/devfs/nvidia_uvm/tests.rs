@@ -159,6 +159,10 @@ fn no_fds(_fd: i32) -> Option<Arc<dyn INode>> {
     None
 }
 
+fn no_pins(_va: usize, _count: usize, _write: bool) -> LxResult<nvctl::UserPages> {
+    Err(LxError::EFAULT)
+}
+
 /// Both GPUs, as RM instances 0 and 1.
 pub(super) fn both_gpus() -> u32 {
     0b11
@@ -170,6 +174,7 @@ pub(super) fn with_fds(fds: &dyn Fn(i32) -> Option<Arc<dyn INode>>) -> NvCaller<
         admin: false,
         gpu_mask: &both_gpus,
         open_of_fd: fds,
+        pin_user_pages: &no_pins,
     }
 }
 
