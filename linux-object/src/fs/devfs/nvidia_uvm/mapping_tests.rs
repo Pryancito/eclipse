@@ -126,6 +126,10 @@ impl Process {
         self.range_call(cmd::FREE, base, length)
     }
 
+    pub(super) fn validate(&self, base: u64, length: u64) -> u32 {
+        self.range_call(cmd::VALIDATE_VA_RANGE, base, length)
+    }
+
     /// UVM_MAP_EXTERNAL_ALLOCATION of MEMORY of CLIENT from `offset`, on
     /// each of `gpus` with its mapping type and default kind.
     fn map(&self, base: u64, length: u64, offset: u64, gpus: &[(Uuid, u32)]) -> u32 {
@@ -609,6 +613,7 @@ fn cuctxcreate_calls_need_a_va_space() {
         cmd::REGISTER_CHANNEL,
         cmd::UNREGISTER_CHANNEL,
         cmd::ALLOC_SEMAPHORE_POOL,
+        cmd::VALIDATE_VA_RANGE,
     ] {
         let (size, at) = layout(cmd).expect("served");
         let mut params = vec![0u8; size];

@@ -1601,6 +1601,10 @@ static void *parity_waker(void *arg) {
     return NULL;
 }
 
+// Wake cycles the last `parity_run` waker completed, 0 when it published none:
+// the denominator for the kernel counters read around that run.
+static uint64_t g_parity_wakes;
+
 // Run the spinner on `cpu` for `budget_ns`, with `period_us > 0` adding a
 // co-pinned waker at that period. Returns the spinner's work units per second,
 // and fills the waker figures when asked for.
@@ -1651,6 +1655,7 @@ static double parity_run(int cpu, unsigned period_us, uint64_t budget_ns,
         // abandoned waker never published its own numbers, so they stay n/a
         // rather than being read out from under a thread still writing them.
         int wk_num = have_waker && wk_ok;
+        g_parity_wakes = wk_num ? c->wakes : 0;
         if (wake_hz)
             *wake_hz = wk_num ? (double)c->wakes * 1e9 / (double)dt : NA;
         if (late_mean_us)
@@ -6287,7 +6292,11 @@ int main(int argc, char **argv) {
         row("[kernel]", "spinner alone, 1 CPU", solo < 0 ? NA : solo / 1e3,
             "kunit/s", "");
         double w_hz = NA, w_mean = NA, w_max = NA;
+        g_parity_wakes = 0;
+        int parity_kstat = g_kstat_ok > 0 && kstat_snapshot(g_kstat_a, sizeof g_kstat_a);
         double shared = parity_run(0, 200, g_short_ns, &w_hz, &w_mean, &w_max);
+        if (parity_kstat)
+            parity_kstat = kstat_snapshot(g_kstat_b, sizeof g_kstat_b);
         row("[kernel]", "spinner + 200us waker", shared < 0 ? NA : shared / 1e3,
             "kunit/s", "");
         // A spinner cannot do MORE work with a waker stealing its CPU than it
@@ -6308,6 +6317,30 @@ int main(int argc, char **argv) {
         row("[kernel]", "  waker rate achieved", w_hz, "wake/s", "");
         row("[kernel]", "  waker late (mean)", w_mean, "us", "");
         row("[kernel]", "  waker late (worst)", w_max, "us", "");
+        // Where a late wake was spent. The waker is pinned to CPU 0 but its
+        // queue lives on the CPU it was born on, so every wake is forwarded:
+        // the owner refuses it and kicks CPU 0, CPU 0 takes the kick on its
+        // next pass, and that pass rescues the task. Each row is one link of
+        // that chain, per wake: ~1 is a link that held, far below 1 is the
+        // link the wakes fell out of. The floor rows are the other way a wake
+        // waits: a preemption denied for the first 0.75 ms of the spinner's
+        // slice, with a timer armed to grant it when the floor ends.
+        {
+            double wk = parity_kstat ? (double)g_parity_wakes : NA;
+            row("[kernel]", "  rescued per wake",
+                kstat_per_op("sched steal:", 6, wk), "x",
+                "~1 = every wake reached CPU 0");
+            row("[kernel]", "  rescue kicks sent per wake",
+                kstat_per_op("sched rescue:", 0, wk), "x", "by the owner CPU");
+            row("[kernel]", "  rescue kicks taken per wake",
+                kstat_per_op("sched rescue:", 1, wk), "x", "by a pass on CPU 0");
+            row("[kernel]", "  taken, nothing rescued",
+                kstat_per_op("sched rescue:", 2, wk), "x", "the scan missed");
+            row("[kernel]", "  floor denials per wake",
+                kstat_per_op("wake floor:", 0, wk), "x", "");
+            row("[kernel]", "  floor timers per wake",
+                kstat_per_op("wake floor:", 1, wk), "x", "");
+        }
         printf("  the floor buys the spinner's throughput with the waker's\n");
         printf("  latency, so these rows are one result, not two. High retention\n");
         printf("  WITH low waker latency is the only unambiguously good outcome.\n");

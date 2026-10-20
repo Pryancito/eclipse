@@ -2027,6 +2027,9 @@ impl Executor {
                 if crate::runtime::stranded_peer_exists() {
                     task_info = crate::runtime::rescue_stranded_task();
                 }
+                if rescue_kicked && task_info.is_none() {
+                    crate::runtime::note_rescue_kick_empty();
+                }
                 // Balance pull, unchanged: only on the rebalance tick, and only
                 // when we have exactly one task. A rescue kick is not a reason
                 // to rebalance.

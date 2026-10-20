@@ -9,8 +9,9 @@
 //! GPU with UVM and makes a range group, and if either fails `cuInit`
 //! answers CUDA_ERROR_NOT_INITIALIZED (3). `cuCtxCreate` then hands UVM the
 //! GPU VA space of the context, maps the memory the context needs into it,
-//! registers the context's channels and makes a semaphore pool; if UVM
-//! refuses the first or the last, `cuCtxCreate` answers
+//! registers the context's channels and makes a semaphore pool, which it
+//! maps for the CPU and then asks UVM to validate; if UVM refuses the GPU VA
+//! space, the pool or its validation, `cuCtxCreate` answers
 //! CUDA_ERROR_NOT_SUPPORTED (801). All of them are served here as uvm.c
 //! serves them:
 //!
@@ -42,6 +43,10 @@
 //!   each GPU with a GPU VA space maps at its address, and an mmap of
 //!   exactly that range maps for the CPU; UVM_FREE gives it back once the
 //!   CPU has unmapped it.
+//! - UVM_VALIDATE_VA_RANGE answers whether a range is exactly one here,
+//!   external or a semaphore pool. Linux also counts the ranges it makes for
+//!   a channel's buffers, which this port leaves to the RM (below), so one
+//!   of those is not a range here.
 //!
 //! One departure, the whole design of GPU VA spaces and of what is mapped in
 //! them: on Linux UVM owns the page tables of a GPU VA space registered with
@@ -111,6 +116,7 @@ pub mod cmd {
     pub const PAGEABLE_MEM_ACCESS: u32 = 39;
     pub const UNMAP_EXTERNAL: u32 = 66;
     pub const ALLOC_SEMAPHORE_POOL: u32 = 68;
+    pub const VALIDATE_VA_RANGE: u32 = 72;
     pub const CREATE_EXTERNAL_RANGE: u32 = 73;
     pub const MM_INITIALIZE: u32 = 75;
 }
@@ -182,8 +188,9 @@ const MAP_STATUS: usize = 9260;
 const ATTRIBUTES_SIZE: usize = 36;
 /// `UVM_MAX_GPUS`: the entries of `perGpuAttributes`.
 const MAX_GPUS: u64 = 256;
-/// `UVM_FREE_PARAMS` and `UVM_CREATE_EXTERNAL_RANGE_PARAMS`: `NvU64 base`,
-/// `NvU64 length`, `NV_STATUS rmStatus`.
+/// `UVM_FREE_PARAMS`, `UVM_VALIDATE_VA_RANGE_PARAMS` and
+/// `UVM_CREATE_EXTERNAL_RANGE_PARAMS`: `NvU64 base`, `NvU64 length`,
+/// `NV_STATUS rmStatus`.
 const RANGE_SIZE: usize = 24;
 const RANGE_STATUS: usize = 16;
 /// `UVM_UNMAP_EXTERNAL_PARAMS`: `NvU64 base`, `NvU64 length`,
@@ -238,7 +245,9 @@ fn layout(cmd: u32) -> Option<(usize, usize)> {
         cmd::REGISTER_CHANNEL => (REGISTER_CHANNEL_SIZE, REGISTER_CHANNEL_STATUS),
         cmd::UNREGISTER_CHANNEL => (UNREGISTER_CHANNEL_SIZE, UNREGISTER_CHANNEL_STATUS),
         cmd::MAP_EXTERNAL_ALLOCATION => (MAP_SIZE, MAP_STATUS),
-        cmd::FREE | cmd::CREATE_EXTERNAL_RANGE => (RANGE_SIZE, RANGE_STATUS),
+        cmd::FREE | cmd::VALIDATE_VA_RANGE | cmd::CREATE_EXTERNAL_RANGE => {
+            (RANGE_SIZE, RANGE_STATUS)
+        }
         cmd::UNMAP_EXTERNAL => (UNMAP_EXTERNAL_SIZE, UNMAP_EXTERNAL_STATUS),
         cmd::ALLOC_SEMAPHORE_POOL => (POOL_SIZE, POOL_STATUS),
         _ => return None,
@@ -352,6 +361,22 @@ impl VaSpace {
             .next_back()
             .is_some_and(|(_, pool)| pool.end > base);
         range || pool
+    }
+
+    /// `uvm_va_range_find`: the range here, external or a pool, that holds
+    /// `addr`, as its first byte and one past its last.
+    fn range_at(&self, addr: u64) -> Option<(u64, u64)> {
+        let range = self
+            .ranges
+            .range(..=addr)
+            .next_back()
+            .map(|(&base, range)| (base, range.end));
+        let pool = self
+            .pools
+            .range(..=addr)
+            .next_back()
+            .map(|(&base, pool)| (base, pool.end));
+        range.into_iter().chain(pool).find(|&(_, end)| end > addr)
     }
 }
 
@@ -647,6 +672,7 @@ impl UvmOpen {
             cmd::UNMAP_EXTERNAL => self.unmap_external(params, Who::of(caller)),
             cmd::FREE => self.free(u64_at(params, 0), u64_at(params, 8), Who::of(caller)),
             cmd::ALLOC_SEMAPHORE_POOL => self.alloc_semaphore_pool(params, Who::of(caller)),
+            cmd::VALIDATE_VA_RANGE => self.validate_va_range(u64_at(params, 0), u64_at(params, 8)),
             cmd::REGISTER_CHANNEL => self.register_channel(params),
             cmd::UNREGISTER_CHANNEL => self.unregister_channel(
                 u32_at(params, UNREGISTER_CHANNEL_CLIENT),
@@ -1248,6 +1274,23 @@ impl UvmOpen {
         Err(LxError::ENODEV)
     }
 
+    /// `uvm_api_validate_va_range`: whether `[base, base + length)` is
+    /// exactly one range here, external or a semaphore pool. The range is
+    /// not checked for whole pages, as there; one that is not exactly a
+    /// range is logged with where it is, the first time.
+    fn validate_va_range(&self, base: u64, length: u64) -> u32 {
+        let found = self.va_space.lock().range_at(base);
+        if found == Some((base, base.wrapping_add(length))) {
+            first_time(
+                &FIRST_VALIDATED,
+                "UVM_VALIDATE_VA_RANGE: the first range validated",
+            );
+            return NV_OK;
+        }
+        not_a_range(base, length, found);
+        NV_ERR_INVALID_ADDRESS
+    }
+
     /// `uvm_register_channel`: on a GPU with a GPU VA space here, and once.
     /// UVM retains the channel and maps the buffers RM gives it into
     /// `[base, base + length)` of a VA space it owns; in one the RM owns the
@@ -1586,12 +1629,37 @@ static FIRST_CHANNEL: AtomicBool = AtomicBool::new(false);
 static FIRST_POOL: AtomicBool = AtomicBool::new(false);
 static FIRST_POOL_CPU: AtomicBool = AtomicBool::new(false);
 static FIRST_MANAGED: AtomicBool = AtomicBool::new(false);
+static FIRST_VALIDATED: AtomicBool = AtomicBool::new(false);
 
 /// `line` in the log, the first time it is said: how far a CUDA program got
 /// shows in dmesg.
 fn first_time(said: &AtomicBool, line: &str) {
     if !said.swap(true, Ordering::Relaxed) {
         zcore_drivers::klog_warn!("[nvidia-uvm] {}", line);
+    }
+}
+
+/// One log line the first time UVM_VALIDATE_VA_RANGE is asked about a range
+/// that is not exactly one here, with the range that holds its first byte,
+/// if any: what libcuda expected to find there.
+fn not_a_range(base: u64, length: u64, found: Option<(u64, u64)>) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    match found {
+        Some((start, end)) => zcore_drivers::klog_warn!(
+            "[nvidia-uvm] UVM_VALIDATE_VA_RANGE: [{:#x}, +{:#x}) is not a range; [{:#x}, {:#x}) holds its start: NV_ERR_INVALID_ADDRESS",
+            base,
+            length,
+            start,
+            end
+        ),
+        None => zcore_drivers::klog_warn!(
+            "[nvidia-uvm] UVM_VALIDATE_VA_RANGE: [{:#x}, +{:#x}) is in no range: NV_ERR_INVALID_ADDRESS",
+            base,
+            length
+        ),
     }
 }
 

@@ -421,6 +421,18 @@ pub fn wakeup_preempt_stats() -> (u64, u64, u64) {
     (0, 0, 0)
 }
 
+/// `(rescue kicks sent, kicks taken by a pass, taken kicks that rescued
+/// nothing)`.
+#[cfg(target_os = "none")]
+pub fn sched_rescue_kick_stats() -> (u64, u64, u64) {
+    executor::sched_rescue_kick_stats()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn sched_rescue_kick_stats() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
 /// `(steal scans, victims probed, steals ok, affinity-empty victims skipped,
 /// rebalance pulls, scans skipped by the stealable hint, rescue pulls)`.
 #[cfg(target_os = "none")]
