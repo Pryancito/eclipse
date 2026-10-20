@@ -2898,6 +2898,10 @@ impl DrmDev {
                     res.crtc_id = plane.crtc_id;
                     res.fb_id = plane.fb_id;
                     res.possible_crtcs = plane.possible_crtcs;
+                    // `drm_mode_getplane` writes `gamma_size = 0` after the
+                    // lookup ("FIXME: Plane gamma"); the caller's value was
+                    // left as it came, so a client read its own garbage back.
+                    res.gamma_size = 0;
                     // Advertise the formats the software scanout consumes, via
                     // the two-call pattern (count first, then fill).
                     const FORMATS: [u32; 2] = drm::SCANOUT_FORMATS;
