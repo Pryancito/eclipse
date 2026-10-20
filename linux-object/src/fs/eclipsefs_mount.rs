@@ -1340,4 +1340,207 @@ mod tests {
         t.join().unwrap();
         assert!(fs.inner.shared().is_some(), "and gives way once it is done");
     }
+
+    /// The listing cache, and the four operations that move a name.
+    #[test]
+    fn the_directory_cache_is_dropped_by_every_change_of_a_name() {
+        // `getdents` over a big directory would otherwise be one full
+        // listing per entry, so a listing is kept by inode. Every change to
+        // a directory has to drop it, and the hole does not show unless
+        // something READ the directory first: a listing nobody asked for
+        // yet is not stale. So each step here lists, changes, and lists
+        // again.
+        let disk = formatted(8 * 1024 * 1024);
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let root = fs.root_inode();
+        let from = root.create("from", FileType::Dir, 0o755).unwrap();
+        let to = root.create("to", FileType::Dir, 0o755).unwrap();
+        let names = |dir: &Arc<dyn INode>| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut i = 2;
+            while let Ok(n) = dir.get_entry(i) {
+                out.push(n);
+                i += 1;
+            }
+            out
+        };
+
+        // create
+        from.create("a", FileType::File, 0o644).unwrap();
+        assert_eq!(names(&from), ["a"]);
+        let b = from.create("b", FileType::File, 0o644).unwrap();
+        assert_eq!(names(&from), ["a", "b"], "a new name shows at once");
+
+        // link
+        from.link("c", &b).unwrap();
+        assert_eq!(names(&from), ["a", "b", "c"], "a second name as well");
+
+        // unlink
+        from.unlink("c").unwrap();
+        assert_eq!(names(&from), ["a", "b"], "and a name taken away is gone");
+
+        // move_, which changes TWO directories and has to drop both
+        // listings: the one the name left and the one it arrived in.
+        assert!(names(&to).is_empty());
+        from.move_("b", &to, "moved").unwrap();
+        assert_eq!(names(&from), ["a"]);
+        assert_eq!(names(&to), ["moved"], "the name arrived where it was sent");
+    }
+
+    /// What `poll(2)` says about a file and about a directory.
+    #[test]
+    fn poll_says_a_file_can_be_written_and_a_directory_cannot() {
+        let disk = formatted(4 * 1024 * 1024);
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let root = fs.root_inode();
+        let f = root.create("f", FileType::File, 0o644).unwrap();
+        let d = root.create("d", FileType::Dir, 0o755).unwrap();
+        // Readable always: a read of a file gives its bytes and a read of a
+        // directory gives `EISDIR`, but neither of them blocks, and `poll`
+        // answers about blocking.
+        for node in [&f, &d] {
+            assert!(node.poll().unwrap().read, "nothing here blocks a read");
+            assert!(!node.poll().unwrap().error);
+            assert!(!node.poll().unwrap().hangup);
+        }
+        assert!(f.poll().unwrap().write);
+        assert!(!d.poll().unwrap().write, "a directory is not written to");
+        // Which is the same answer `write_at` gives, with the error a
+        // program expects for it.
+        assert_eq!(f.write_at(0, b"x").unwrap(), 1);
+        assert_eq!(d.write_at(0, b"x").err(), Some(FsError::IsDir));
+    }
+
+    /// The names a path walk hands to `find`.
+    #[test]
+    fn an_empty_component_of_a_path_is_the_directory_itself() {
+        // A trailing slash and a doubled one leave an empty component, and
+        // the VFS passes it down as it came: `/etc/` and `/etc//passwd`
+        // resolve on Linux, so an empty name is this directory and not a
+        // name to look up, which no directory has.
+        let disk = formatted(4 * 1024 * 1024);
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let root = fs.root_inode();
+        let etc = root.create("etc", FileType::Dir, 0o755).unwrap();
+        let ino = |node: &Arc<dyn INode>| node.metadata().unwrap().inode;
+        assert_eq!(ino(&etc.find("").unwrap()), ino(&etc));
+        assert_eq!(ino(&etc.find(".").unwrap()), ino(&etc));
+        assert_eq!(ino(&etc.find("..").unwrap()), ino(&root));
+        assert_eq!(etc.find("nada").err(), Some(FsError::EntryNotFound));
+    }
+
+    /// Inodes of another filesystem.
+    #[test]
+    fn an_inode_of_another_filesystem_is_never_linked_into_this_one() {
+        // An inode is a `(filesystem, number)` pair, and the number alone
+        // means nothing outside its own mount: a link or a rename that took
+        // one from somewhere else would write a number of one filesystem
+        // into a directory of another.
+        let one =
+            EclipseMountFs::open(&MountBackend::Block(formatted(4 * 1024 * 1024)), false).unwrap();
+        let two =
+            EclipseMountFs::open(&MountBackend::Block(formatted(4 * 1024 * 1024)), false).unwrap();
+        let root_one = one.root_inode();
+        let root_two = two.root_inode();
+        let theirs = root_two.create("theirs", FileType::File, 0o644).unwrap();
+        // Two mounts of the same kind: the downcast goes through and what
+        // tells them apart is which filesystem they belong to.
+        assert_eq!(
+            root_one.link("stolen", &theirs).err(),
+            Some(FsError::NotSameFs)
+        );
+        root_one.create("mine", FileType::File, 0o644).unwrap();
+        assert_eq!(
+            root_one.move_("mine", &root_two, "mine").err(),
+            Some(FsError::NotSameFs)
+        );
+        // And an inode of another kind of filesystem altogether, where the
+        // downcast itself fails, is the same answer and not a different
+        // one: `mv` reads `EXDEV` as "copy it and unlink the original", and
+        // anything else makes it give up instead.
+        let ram = rcore_fs_ramfs::RamFS::new();
+        let alien = ram
+            .root_inode()
+            .create("alien", FileType::File, 0o644)
+            .unwrap();
+        assert_eq!(
+            root_one.link("alien", &alien).err(),
+            Some(FsError::NotSameFs)
+        );
+        assert_eq!(
+            root_one.move_("mine", &alien, "mine").err(),
+            Some(FsError::NotSameFs)
+        );
+    }
+
+    /// The pre-mount probe, which decides whether this is EclipseFS at all.
+    #[test]
+    fn the_probe_reads_the_whole_magic_and_measures_the_device_in_sectors() {
+        let disk = formatted(8 * 1024 * 1024);
+        let dev: Arc<dyn BlockScheme> = disk.clone();
+        assert!(probe_eclipsefs_superblock(&dev));
+        // The magic is nine bytes and all nine of them are the magic. The
+        // comparison here is only a cheap first look: `eclipsefs::probe`,
+        // below it, reads the same nine, so what this pins is the answer
+        // and not which of the two said no.
+        let was = disk.bytes.lock()[8];
+        disk.bytes.lock()[8] = was ^ 0xff;
+        assert!(!probe_eclipsefs_superblock(&dev), "the ninth byte counts");
+        disk.bytes.lock()[8] = was;
+        assert!(probe_eclipsefs_superblock(&dev));
+        // And the probe asks whether the filesystem FITS on the device it
+        // is on, which means turning the device's block count into bytes
+        // with the size of a block scheme's block, 512. Eight times too
+        // many bytes accepts a filesystem that runs off the end of the
+        // disk, and then every read past the end is a device error.
+        disk.bytes.lock().truncate(1024 * 1024);
+        assert_eq!(dev.block_count(), 2048);
+        assert!(
+            !probe_eclipsefs_superblock(&dev),
+            "a filesystem of 8 MiB does not fit on 1 MiB"
+        );
+    }
+
+    /// `fdatasync` of a file.
+    #[test]
+    fn sync_data_writes_the_file_out_the_way_sync_all_does() {
+        // EclipseFS has no way to write a file's data without its metadata
+        // (an extent is a tree entry), so `fdatasync` is `fsync`, and the
+        // contract a program counts on is the same one: once it returns,
+        // what was written is on the device, with no `sync` of the whole
+        // filesystem and nothing else closing the mount down.
+        let disk = formatted(8 * 1024 * 1024);
+        {
+            let fs = EclipseMountFs::open(&MountBackend::Block(disk.clone()), false).unwrap();
+            let f = fs
+                .root_inode()
+                .create("durable", FileType::File, 0o644)
+                .unwrap();
+            assert_eq!(f.write_at(0, b"this has to reach the disk").unwrap(), 26);
+            f.sync_data().unwrap();
+        }
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let mut back = [0u8; 32];
+        let f = fs.root_inode().find("durable").unwrap();
+        let n = f.read_at(0, &mut back).unwrap();
+        assert_eq!(&back[..n], b"this has to reach the disk");
+        // And it has to DO it, not just answer `Ok`: a program that gets
+        // `Ok` from `fdatasync` believes its bytes are on the device. The
+        // filesystem puts them either in the fsync log or in a commit of
+        // its own, and one of the two numbers has to move.
+        let count = || {
+            let fs = fs.inner.lock();
+            (fs.generation(), fs.fsync_log_records())
+        };
+        let before = count();
+        assert_eq!(f.write_at(26, b" and so does this").unwrap(), 17);
+        f.sync_data().unwrap();
+        let after = count();
+        assert!(
+            after.1 > before.1 || after.0 > before.0,
+            "{:?} -> {:?}",
+            before,
+            after
+        );
+    }
 }
