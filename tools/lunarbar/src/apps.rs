@@ -948,4 +948,31 @@ mod tests {
         }));
         assert_eq!(hits.take(), 2);
     }
+
+    #[test]
+    fn an_empty_only_show_in_restricts_nothing_rather_than_everything() {
+        // `OnlyShowIn=` with nothing after it is a list of ZERO desktops, and
+        // "shown on no desktop at all" is not what that means: an absent key and
+        // an empty one are both the absence of a restriction. Keeping the empty
+        // segment instead of dropping it makes the list one entry long, and
+        // nothing can ever match that entry, because the names it is compared
+        // against come from `desktops_from`, which drops empty segments on its
+        // side. So the entry would vanish from the menu on every desktop
+        // instead of showing on all of them.
+        for v in ["", ";", ";;", " ; "] {
+            assert!(
+                parse(&entry(&format!("OnlyShowIn={v}\n"))).is_some(),
+                "OnlyShowIn={v:?} restricts nothing"
+            );
+        }
+        // The same emptiness in `NotShowIn` is harmless either way, because that
+        // list is never asked whether it is empty, only whether one of its
+        // entries matches. Pinned so the asymmetry reads as deliberate.
+        assert!(parse(&entry("NotShowIn=\n")).is_some());
+        // And a list that does name a desktop still gates, with or without the
+        // trailing ';' the spec asks for.
+        assert!(parse(&entry("OnlyShowIn=gnome\n")).is_none());
+        assert!(parse(&entry("OnlyShowIn=gnome;\n")).is_none());
+        assert!(parse(&entry("OnlyShowIn=labwc\n")).is_some());
+    }
 }
