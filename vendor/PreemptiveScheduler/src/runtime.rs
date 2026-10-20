@@ -371,6 +371,17 @@ static STRANDED: AtomicU64 = AtomicU64::new(0);
 /// Rescue pulls: tasks taken off a peer that was not allowed to poll them.
 static STEAL_RESCUE: AtomicU64 = AtomicU64::new(0);
 
+/// Rescue kicks: sent by an owner forwarding a stranded task, taken by the
+/// kicked CPU's next pass, and taken passes whose rescue scan came back empty.
+///
+/// `STEAL_RESCUE` alone cannot say which link of the forward a lost wake fell
+/// out of. A pinned waker that runs once in 32 wakes shows the same low rescue
+/// count whether the owner never kicked, the kicked CPU never made a pass, or
+/// the pass came and the scan missed -- and each of those is a different fix.
+static RESCUE_KICK_SENT: AtomicU64 = AtomicU64::new(0);
+static RESCUE_KICK_TAKEN: AtomicU64 = AtomicU64::new(0);
+static RESCUE_KICK_EMPTY: AtomicU64 = AtomicU64::new(0);
+
 /// `cpu`'s generator just refused a task its affinity mask forbids here.
 ///
 /// Read before the RMW, like [`note_stealable`]: on a CPU that is already
@@ -481,6 +492,7 @@ pub(crate) fn note_rescue_kick(cpu: usize) {
     if cpu >= MAX_CORE_NUM {
         return;
     }
+    RESCUE_KICK_SENT.fetch_add(1, Ordering::Relaxed);
     if RESCUE_KICK[cpu].0.load(Ordering::Relaxed) == 0 {
         RESCUE_KICK[cpu].0.store(1, Ordering::Release);
     }
@@ -493,8 +505,28 @@ pub(crate) fn take_rescue_kick() -> bool {
     if cpu >= MAX_CORE_NUM {
         return false;
     }
-    RESCUE_KICK[cpu].0.load(Ordering::Relaxed) != 0
-        && RESCUE_KICK[cpu].0.swap(0, Ordering::Acquire) != 0
+    let taken = RESCUE_KICK[cpu].0.load(Ordering::Relaxed) != 0
+        && RESCUE_KICK[cpu].0.swap(0, Ordering::Acquire) != 0;
+    if taken {
+        RESCUE_KICK_TAKEN.fetch_add(1, Ordering::Relaxed);
+    }
+    taken
+}
+
+/// A pass that took a rescue kick found nothing to rescue.
+#[inline]
+pub(crate) fn note_rescue_kick_empty() {
+    RESCUE_KICK_EMPTY.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(rescue kicks sent, kicks taken by a pass, taken kicks that rescued
+/// nothing)`. See [`RESCUE_KICK_SENT`].
+pub fn sched_rescue_kick_stats() -> (u64, u64, u64) {
+    (
+        RESCUE_KICK_SENT.load(Ordering::Relaxed),
+        RESCUE_KICK_TAKEN.load(Ordering::Relaxed),
+        RESCUE_KICK_EMPTY.load(Ordering::Relaxed),
+    )
 }
 
 /// `(steal scans, victims probed, steals ok, affinity-empty victims skipped,

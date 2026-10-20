@@ -69,6 +69,22 @@ pub fn take_yielded() -> bool {
 static FLOOR_ARMED_NS: [AtomicU64; crate::config::MAX_CORE_NUM] =
     [const { AtomicU64::new(0) }; crate::config::MAX_CORE_NUM];
 
+/// Wake-up preemption requests the RUN_TO_PARITY floor denied, and the floor
+/// timers armed for them. A denial with no timer is one the dedup in
+/// [`should_arm_floor`] folded into a timer already pending; a denial rate far
+/// above the woken task's wake rate means the same request is being turned
+/// down over and over, which the timer was meant to make impossible.
+static FLOOR_DENIED: AtomicU64 = AtomicU64::new(0);
+static FLOOR_ARMS: AtomicU64 = AtomicU64::new(0);
+
+/// `(wake preemptions denied by the floor, floor timers armed)` since boot.
+pub fn wake_floor_stats() -> (u64, u64) {
+    (
+        FLOOR_DENIED.load(Ordering::Relaxed),
+        FLOOR_ARMS.load(Ordering::Relaxed),
+    )
+}
+
 /// Whether a floor at `deadline` still needs a timer on a CPU whose last armed
 /// floor was `armed`, read at `now`.
 ///
@@ -95,11 +111,13 @@ pub fn arm_wake_preempt_floor(floor: Duration) {
     if cpu >= crate::config::MAX_CORE_NUM {
         return;
     }
+    FLOOR_DENIED.fetch_add(1, Ordering::Relaxed);
     let now = crate::timer::timer_now().as_nanos() as u64;
     let deadline = floor.as_nanos() as u64;
     if !should_arm_floor(now, deadline, FLOOR_ARMED_NS[cpu].load(Ordering::Relaxed)) {
         return;
     }
+    FLOOR_ARMS.fetch_add(1, Ordering::Relaxed);
     FLOOR_ARMED_NS[cpu].store(deadline, Ordering::Relaxed);
     crate::timer::timer_set(floor, alloc::boxed::Box::new(|_| {}));
 }
