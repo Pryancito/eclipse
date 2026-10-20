@@ -3,6 +3,81 @@
 use core::alloc::Layout;
 use core::panic::PanicInfo;
 
+/// Rows of each OOM attribution table that reach the screen.
+///
+/// The kernel OOM report is written to a console that cannot scroll (the early
+/// framebuffer console wraps and paints over its own first lines), so the
+/// budget is one screen for the whole thing: report, panic banner and
+/// backtrace, on a screen as small as 1024x768 (48 rows of the 16-pixel
+/// font). Six rows of each table, ranked by bytes, is what the two
+/// photographed OOMs would have needed to name their eater; the classes below
+/// them are summarised in one line rather than dropped.
+#[cfg(any(all(target_arch = "x86_64", not(feature = "libos")), test))]
+const OOM_TOP_ROWS: usize = 6;
+
+/// Call sites printed per attribution table. Lower than [`OOM_TOP_ROWS`]
+/// because each of these lines carries symbolised return addresses and is
+/// wide enough to wrap.
+#[cfg(any(all(target_arch = "x86_64", not(feature = "libos")), test))]
+const OOM_TOP_SITES: usize = 4;
+
+/// Return addresses printed per call site (the tables keep more).
+#[cfg(any(all(target_arch = "x86_64", not(feature = "libos")), test))]
+const OOM_SITE_FRAMES: usize = 2;
+
+/// The `N` heaviest rows of a `(unit_bytes, live_count)` table, heaviest
+/// first, plus how many rows were left out and how many bytes they held.
+///
+/// Allocation-free by construction — it is called from the
+/// `#[alloc_error_handler]`, where `alloc::vec` would re-enter the failure it
+/// is reporting — so the ranking is an insertion sort over a fixed array
+/// rather than a `sort_by_key` over a `Vec`.
+///
+/// Rows with a zero count or a zero unit are not rows: they are the empty
+/// slots of the fixed tables these come from, and counting them as "left out"
+/// would put `(+19 lighter classes, ~0 MiB)` under every report.
+#[cfg(any(all(target_arch = "x86_64", not(feature = "libos")), test))]
+fn top_rows_by_bytes<const N: usize>(
+    rows: impl Iterator<Item = (usize, usize)>,
+) -> ([(usize, usize); N], usize, usize) {
+    let mut top = [(0usize, 0usize); N];
+    let mut omitted = 0usize;
+    let mut omitted_bytes = 0usize;
+    let note_omitted = |unit: usize, count: usize, omitted: &mut usize, bytes: &mut usize| {
+        if count == 0 {
+            return;
+        }
+        *omitted += 1;
+        *bytes = bytes.saturating_add(unit.saturating_mul(count));
+    };
+    for (unit, count) in rows {
+        if unit == 0 || count == 0 {
+            continue;
+        }
+        let bytes = unit.saturating_mul(count);
+        let mut pos = N;
+        for (i, (u, c)) in top.iter().enumerate() {
+            if bytes > u.saturating_mul(*c) {
+                pos = i;
+                break;
+            }
+        }
+        if pos == N {
+            note_omitted(unit, count, &mut omitted, &mut omitted_bytes);
+            continue;
+        }
+        let (du, dc) = top[N - 1];
+        note_omitted(du, dc, &mut omitted, &mut omitted_bytes);
+        let mut i = N - 1;
+        while i > pos {
+            top[i] = top[i - 1];
+            i -= 1;
+        }
+        top[pos] = (unit, count);
+    }
+    (top, omitted, omitted_bytes)
+}
+
 #[cfg(not(test))]
 #[alloc_error_handler]
 fn alloc_error(layout: Layout) -> ! {
@@ -71,18 +146,36 @@ fn alloc_error(layout: Layout) -> ! {
     // total bytes if every allocation were at the bound).
     #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
     {
+        // Every line below lands on a console that CANNOT scroll: the early
+        // framebuffer console wraps, so a report longer than one screen
+        // overwrites its own head -- and the head is where the heaviest
+        // classes are. Both tables are therefore capped at their heaviest
+        // `OOM_TOP_ROWS` rows, with one line for what was left out, so the
+        // whole report plus the panic banner and backtrace fit on one
+        // photograph. Two of them have already been taken with NOTHING of
+        // this on them.
         let hist = crate::memory::heap_live_histogram();
-        emit(format_args!("heap live by size class:\n"));
-        for (i, count) in hist.iter().enumerate() {
-            if *count > 0 {
-                let size = 1usize << i;
-                emit(format_args!(
-                    "  <={:>10}B x {:<8} (~{} MiB)\n",
-                    size,
-                    count,
-                    (count * size) >> 20,
-                ));
+        let (classes, more_classes, more_class_bytes) = top_rows_by_bytes::<OOM_TOP_ROWS>(
+            hist.iter().enumerate().map(|(i, c)| (1usize << i, *c)),
+        );
+        emit(format_args!("heap live by size class (heaviest first):\n"));
+        for (size, count) in classes {
+            if count == 0 {
+                continue;
             }
+            emit(format_args!(
+                "  <={:>10}B x {:<8} (~{} MiB)\n",
+                size,
+                count,
+                (count * size) >> 20,
+            ));
+        }
+        if more_classes > 0 {
+            emit(format_args!(
+                "  (+{} lighter class(es), ~{} MiB in all)\n",
+                more_classes,
+                more_class_bytes >> 20,
+            ));
         }
         // memfd attribution: the 4 KiB blocks are ramfs file pages, and the
         // desktop's big page consumers are wl_shm pools backed by memfd.
@@ -96,18 +189,112 @@ fn alloc_error(layout: Layout) -> ! {
                 bytes >> 20,
             ));
         }
-        emit(format_args!("hot exact sizes:\n"));
-        for (size, live) in crate::memory::heap_hot_sizes() {
-            if size != 0 && live > 0 {
+        emit(format_args!("hot exact sizes (heaviest first):\n"));
+        let (hot, more_hot, more_hot_bytes) =
+            top_rows_by_bytes::<OOM_TOP_ROWS>(crate::memory::heap_hot_sizes().into_iter());
+        for (size, live) in hot {
+            if live == 0 {
+                continue;
+            }
+            emit(format_args!(
+                "  {}B x {} (~{} MiB)\n",
+                size,
+                live,
+                (size * live) >> 20,
+            ));
+        }
+        if more_hot > 0 {
+            emit(format_args!(
+                "  (+{} lighter size(s), ~{} MiB in all)\n",
+                more_hot,
+                more_hot_bytes >> 20,
+            ));
+        }
+        // WHO holds the blocks, not just how big they are. `/proc/kheap` and
+        // the `[heap-pressure]` report have named the call sites since #1820,
+        // but that reporter builds a `String` and so cannot run from here:
+        // the one report that fires when the heap is ACTUALLY gone was the
+        // only one without them. These two tables are alloc-free (fixed
+        // atomics + `ksyms::Addr`, which formats straight out of the symbol
+        // blob), so they can.
+        let (big, big_missed) = crate::memory::heap_big_blocks();
+        if big.iter().any(|(sz, _)| *sz > 0) {
+            emit(format_args!(
+                "live blocks >= 2 MiB, by allocating call site:\n"
+            ));
+            let mut shown = 0usize;
+            for (sz, site) in big.iter() {
+                if *sz == 0 {
+                    continue;
+                }
+                if shown >= OOM_TOP_SITES {
+                    break;
+                }
+                shown += 1;
+                emit(format_args!("  {:>5} KiB <-", sz >> 10));
+                for f in site.iter() {
+                    if *f != 0 {
+                        emit(format_args!(" {}", kernel_hal::ksyms::Addr(*f as u64)));
+                    }
+                }
+                emit(format_args!("\n"));
+            }
+            if big_missed > 0 {
                 emit(format_args!(
-                    "  {}B x {} (~{} MiB)\n",
-                    size,
-                    live,
-                    (size * live) >> 20,
+                    "  ({} more were not tracked: the table holds 128 live blocks)\n",
+                    big_missed,
                 ));
             }
         }
+        let (sites, missed, scale) = crate::memory::heap_alloc_sites();
+        if sites.iter().any(|(live, _, _)| *live > 0) {
+            emit(format_args!(
+                "live blocks by allocating call site (1 in {} sampled, so x{}):\n",
+                scale, scale,
+            ));
+            let mut shown = 0usize;
+            for (live, bytes, frames) in sites {
+                if live == 0 {
+                    continue;
+                }
+                if shown >= OOM_TOP_SITES {
+                    break;
+                }
+                shown += 1;
+                emit(format_args!(
+                    "  ~{:>6} KiB in ~{} blocks <-",
+                    (bytes * scale) >> 10,
+                    live * scale,
+                ));
+                // Two frames, not four: a symbolised frame is most of a
+                // screen line, and four of them wrap one site over three
+                // rows -- which on this console costs two other sites.
+                for f in frames.iter().take(OOM_SITE_FRAMES) {
+                    if *f != 0 {
+                        emit(format_args!(" {}", kernel_hal::ksyms::Addr(*f as u64)));
+                    }
+                }
+                emit(format_args!("\n"));
+            }
+            if missed > 0 {
+                emit(format_args!("  ({} samples found no slot)\n", missed));
+            }
+        } else {
+            emit(format_args!(
+                "call sites: no sampled block is live (sampling arms at the first \
+                 heap-pressure level)\n"
+            ));
+        }
     }
+    // The used/total line again, LAST. It is printed first, and first is what
+    // a wrapping console overwrites first; it is also the one number that says
+    // whether this is a leak or a kernel whose heap was never big enough.
+    emit(format_args!(
+        "kernel OOM: alloc {} bytes failed (used {} / total {} MiB)\n",
+        layout.size(),
+        heap_used / 1024 / 1024,
+        heap_total / 1024 / 1024,
+    ));
     panic!("memory allocation of {} bytes failed", layout.size());
 }
 
@@ -1430,6 +1617,95 @@ fn panic(info: &PanicInfo) -> ! {
 /// report were written, twice rewritten, and never once executed by a job.
 /// Only `#[panic_handler]` and `#[alloc_error_handler]` genuinely cannot be
 /// here (std supplies both); everything below is the code the machine runs.
+
+/// The OOM report's ranking, which decides what a photograph of a dead machine
+/// says. It is called from the `#[alloc_error_handler]`, which `cargo test`
+/// cannot run at all, so it is a free function with its own tests rather than
+/// a loop inside the handler.
+#[cfg(test)]
+mod oom_ranking_tests {
+    use super::top_rows_by_bytes;
+
+    #[test]
+    fn rows_come_back_heaviest_first_by_bytes_not_by_count() {
+        // 1 block of 1 MiB outweighs 100 blocks of 16 B, and the old report,
+        // which printed the classes in index order, buried it under them.
+        let (top, more, more_bytes) =
+            top_rows_by_bytes::<4>([(16, 100), (1 << 20, 1), (4096, 2)].into_iter());
+        assert_eq!(top[0], (1 << 20, 1));
+        assert_eq!(top[1], (4096, 2));
+        assert_eq!(top[2], (16, 100));
+        assert_eq!(top[3], (0, 0));
+        assert_eq!((more, more_bytes), (0, 0));
+    }
+
+    #[test]
+    fn what_does_not_fit_is_counted_and_its_bytes_added_up() {
+        let (top, more, more_bytes) =
+            top_rows_by_bytes::<2>([(100, 1), (200, 1), (300, 1), (400, 1)].into_iter());
+        assert_eq!(top, [(400, 1), (300, 1)]);
+        assert_eq!(more, 2);
+        assert_eq!(more_bytes, 100 + 200);
+    }
+
+    /// A row that arrives late and outranks one already in the table pushes it
+    /// out — and the pushed-out row is then one of the omitted, not a row that
+    /// vanished from both the list and the count.
+    #[test]
+    fn a_row_evicted_by_a_heavier_one_is_counted_as_omitted() {
+        let (top, more, more_bytes) =
+            top_rows_by_bytes::<2>([(10, 1), (20, 1), (30, 1)].into_iter());
+        assert_eq!(top, [(30, 1), (20, 1)]);
+        assert_eq!((more, more_bytes), (1, 10));
+    }
+
+    /// The tables these read are fixed arrays with empty slots. An empty slot
+    /// is not a class that was left out.
+    #[test]
+    fn empty_slots_are_neither_shown_nor_counted() {
+        let (top, more, more_bytes) =
+            top_rows_by_bytes::<3>([(0, 0), (64, 2), (0, 5), (8, 0)].into_iter());
+        assert_eq!(top[0], (64, 2));
+        assert_eq!(top[1], (0, 0));
+        assert_eq!((more, more_bytes), (0, 0));
+    }
+
+    #[test]
+    fn an_empty_table_reports_nothing_rather_than_a_row_of_zeroes() {
+        let (top, more, more_bytes) = top_rows_by_bytes::<3>(core::iter::empty());
+        assert_eq!(top, [(0, 0); 3]);
+        assert_eq!((more, more_bytes), (0, 0));
+    }
+
+    /// Every row the handler can print costs a screen line, and the budget is
+    /// one screen: the report has to leave room for the panic banner and the
+    /// backtrace under it. This pins the headline number of that budget.
+    #[test]
+    fn the_report_cannot_grow_past_what_one_screen_holds() {
+        // Two capped tables of rows and two of call sites, each with a
+        // header and a "+N more" line, plus the fixed lines (the used/total
+        // line at each end, memfd, and the call-site note) and the panic
+        // banner + backtrace under all of it.
+        let report_lines = 2 * (super::OOM_TOP_ROWS + 2) + 2 * (super::OOM_TOP_SITES + 2) + 4;
+        let backtrace_lines = 14;
+        // 1024x768 — the smallest mode the early console is ever handed —
+        // is 48 rows of the 16-pixel font.
+        assert!(
+            report_lines + backtrace_lines <= 48,
+            "{} lines",
+            report_lines + backtrace_lines
+        );
+    }
+
+    /// Counted as the handler prints them, because a site line that wraps
+    /// costs two rows of the budget above and the frame cap is what holds it
+    /// to one.
+    #[test]
+    fn a_call_site_line_prints_at_most_two_symbolised_frames() {
+        assert_eq!(super::OOM_SITE_FRAMES, 2);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2279,6 +2279,115 @@ mod write_room_tests {
 }
 
 #[cfg(test)]
+mod poll_subscription_soak_tests {
+    //! The shape read out of the kernel panic photographed on 2026-10-21
+    //! (`memory allocation of 16 bytes failed` inside
+    //! `UnixSocketState::subscribe_readiness`, under `sys_poll`, after ~656 s
+    //! of desktop): a readiness subscription leaked per `poll` pass, growing
+    //! the socket's event bus until the kernel heap was gone.
+    //!
+    //! It is not what happens. `sys_poll` parks a fresh waker on every pass of
+    //! the wait and drops the previous pass's first (`this.subs.clear()`), and
+    //! the handle unsubscribes on drop, so a session of any length leaves the
+    //! bus holding nothing. The 16 bytes that failed are the `Box` of that
+    //! handle's unsubscribe closure — an `Arc` and a `u64` — which is to say
+    //! this path is where the heap ran out, not what emptied it.
+    //!
+    //! These pin that, so the reading can be discarded by a test run rather
+    //! than by reading the code again next time.
+
+    use super::*;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::Waker;
+
+    struct Counter(AtomicUsize);
+
+    impl Wake for Counter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn a_waker() -> Waker {
+        Waker::from(Arc::new(Counter(AtomicUsize::new(0))))
+    }
+
+    fn pair() -> (Arc<UnixSocketState>, Arc<UnixSocketState>) {
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+        (a, b)
+    }
+
+    fn parked_on(sock: &UnixSocketState) -> usize {
+        sock.inner.lock().eventbus.get_callback_len()
+    }
+
+    /// A poll session as long as the one in the crash: pass after pass of
+    /// subscribe-then-drop on the same socket, with nothing to read, which is
+    /// what a compositor's idle fd does for ten minutes.
+    #[test]
+    fn ten_thousand_poll_passes_leave_nothing_parked_on_the_bus() {
+        let (a, _b) = pair();
+        let waker = a_waker();
+        for pass in 0..10_000 {
+            let sub = FileLike::subscribe_readiness(&*a, PollEvents::IN, &waker);
+            assert!(sub.is_some(), "a unix socket must answer with a handle");
+            // One parked waker at a time, never two: the previous pass's is
+            // gone before this one is made.
+            assert_eq!(parked_on(&a), 1, "pass {}", pass);
+            drop(sub);
+            assert_eq!(parked_on(&a), 0, "pass {} left a waker behind", pass);
+        }
+    }
+
+    /// The same session held open across passes, the way `sys_poll` holds it:
+    /// the handles of a pass are dropped as a set at the top of the next one.
+    #[test]
+    fn a_whole_set_of_handles_unparks_when_the_pass_ends() {
+        let (a, _b) = pair();
+        let waker = a_waker();
+        let mut subs = alloc::vec::Vec::new();
+        for _ in 0..64 {
+            subs.push(FileLike::subscribe_readiness(&*a, PollEvents::IN, &waker));
+        }
+        assert_eq!(parked_on(&a), 64);
+        subs.clear();
+        assert_eq!(parked_on(&a), 0);
+    }
+
+    /// Readiness that is already there is answered on the spot, with nothing
+    /// stored: the pass that returns to userspace parks no waker at all.
+    #[test]
+    fn a_socket_with_data_parks_no_waker() {
+        let (a, b) = pair();
+        Socket::write(&*b, b"hola", None).unwrap();
+        let waker = a_waker();
+        let sub = FileLike::subscribe_readiness(&*a, PollEvents::IN, &waker);
+        assert!(sub.is_some());
+        assert_eq!(parked_on(&a), 0);
+        drop(sub);
+        assert_eq!(parked_on(&a), 0);
+    }
+
+    /// And dropping the socket while a handle is still alive must not keep
+    /// the socket alive through the closure the handle carries: the handle
+    /// holds an `Arc` to the inner state, so the test is that unsubscribing
+    /// after the last user fd is gone is harmless, not that it is skipped.
+    #[test]
+    fn a_handle_outliving_its_socket_unsubscribes_without_a_fuss() {
+        let (a, _b) = pair();
+        let waker = a_waker();
+        let sub = FileLike::subscribe_readiness(&*a, PollEvents::IN, &waker);
+        let inner = a.inner.clone();
+        drop(a);
+        drop(sub);
+        assert_eq!(inner.lock().eventbus.get_callback_len(), 0);
+    }
+}
+
+#[cfg(test)]
 mod edge_direction_tests {
     //! An edge-triggered `epoll` entry must not be re-armed by a publication
     //! in a direction it never asked about.
