@@ -1716,7 +1716,16 @@ impl DrmDev {
             DRM_IOCTL_MODE_SETCRTC => {
                 // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
                 let req = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
-                // `drm_mode_setcrtc` finds the CRTC before anything else
+                // "Universal plane src offsets are only 16.16"
+                // (`drm_mode_setcrtc`, ERANGE): an x or y with a bit above
+                // the 16th is refused first of all, before the CRTC is
+                // looked up and whether or not a mode comes with it. Here
+                // such an x fell out of the viewport check (ENOSPC, only
+                // with a mode) and was not read at all without one.
+                if req.x & 0xffff_0000 != 0 || req.y & 0xffff_0000 != 0 {
+                    return Err(FsError::OutOfRange);
+                }
+                // `drm_mode_setcrtc` then finds the CRTC before anything else
                 // (ENOENT), refuses a connector list with no mode or no fb to
                 // set them to (EINVAL) or longer than the card's connectors
                 // (EINVAL), and looks every connector in it up (ENOENT). None
@@ -1729,9 +1738,10 @@ impl DrmDev {
                 // With a mode, `drm_mode_setcrtc` then looks the fb up
                 // (ENOENT; -1 names the fb already on the CRTC, EINVAL when
                 // there is none), runs the mode through
-                // `drm_mode_convert_umode` (EINVAL for a zero clock, a zero
-                // active area, sync timings out of order or an aspect-ratio
-                // code it does not define) and wants the active area at
+                // `drm_mode_convert_umode` (ERANGE for a clock or vrefresh
+                // past INT_MAX, EINVAL for a zero clock, a zero active area,
+                // sync timings out of order or an aspect-ratio code it does
+                // not define) and wants the active area at
                 // (x, y) inside the fb (`drm_crtc_check_viewport`, ENOSPC).
                 // None of it was read: a mode wider or taller than its fb
                 // was scanned out as if the fb fit it, a mode with no clock
@@ -1749,9 +1759,7 @@ impl DrmDev {
                     let Some(fb) = drm::get_fb(fb_id) else {
                         return Err(FsError::EntryNotFound);
                     };
-                    let Some((w, h)) = modeinfo_active_area(&req.mode) else {
-                        return Err(FsError::InvalidParam);
-                    };
+                    let (w, h) = modeinfo_active_area(&req.mode)?;
                     if w > fb.width
                         || req.x > fb.width - w
                         || h > fb.height
@@ -5410,19 +5418,30 @@ const DRM_MODE_FLAG_ALL: u32 =
     0x3FF | DRM_MODE_FLAG_DBLCLK | DRM_MODE_FLAG_CLKDIV2 | DRM_MODE_FLAG_3D_MASK;
 
 /// `drm_mode_validate_basic`, on a `struct drm_mode_modeinfo` as the ioctl
-/// carries it, plus the aspect-ratio code check of `drm_mode_convert_umode`:
-/// the modes the kernel refuses with EINVAL before any driver sees them. For a
-/// mode that passes, its active area `(hdisplay, vdisplay)`.
-fn modeinfo_active_area(m: &[u8; 68]) -> Option<(u32, u32)> {
+/// carries it, plus the two checks `drm_mode_convert_umode` makes of its own:
+/// the modes the kernel refuses before any driver sees them. For a mode that
+/// passes, its active area `(hdisplay, vdisplay)`.
+///
+/// The order is the kernel's: `drm_mode_convert_umode` opens with
+/// `clock > INT_MAX || vrefresh > INT_MAX` (ERANGE, the two `u32`s it
+/// copies into `int`s), then the aspect-ratio code (EINVAL), then
+/// `drm_mode_validate_driver` runs the basic checks (EINVAL). A clock or
+/// vrefresh past `INT_MAX` was accepted here and the aspect-ratio code was
+/// checked first.
+fn modeinfo_active_area(m: &[u8; 68]) -> Result<(u32, u32)> {
     let u16_at = |i: usize| u16::from_ne_bytes([m[i], m[i + 1]]);
     let clock = u32::from_ne_bytes([m[0], m[1], m[2], m[3]]);
+    let vrefresh = u32::from_ne_bytes([m[24], m[25], m[26], m[27]]);
+    if clock > i32::MAX as u32 || vrefresh > i32::MAX as u32 {
+        return Err(FsError::OutOfRange);
+    }
     let (hdisplay, hsync_start, hsync_end, htotal) = (u16_at(4), u16_at(6), u16_at(8), u16_at(10));
     let (vdisplay, vsync_start, vsync_end, vtotal) =
         (u16_at(14), u16_at(16), u16_at(18), u16_at(20));
     let flags = u32::from_ne_bytes([m[28], m[29], m[30], m[31]]);
     if (flags & DRM_MODE_FLAG_PIC_AR_MASK) >> DRM_MODE_FLAG_PIC_AR_SHIFT > DRM_MODE_FLAG_PIC_AR_MAX
     {
-        return None;
+        return Err(FsError::InvalidParam);
     }
     // A flag the kernel does not define (`BCAST`, `PIXMUX`, anything past the
     // aspect-ratio field) or a 3D layout past the last one it defines is
@@ -5430,18 +5449,18 @@ fn modeinfo_active_area(m: &[u8; 68]) -> Option<(u32, u32)> {
     // aspect-ratio code.
     let flags = flags & !DRM_MODE_FLAG_PIC_AR_MASK;
     if flags & !DRM_MODE_FLAG_ALL != 0 || flags & DRM_MODE_FLAG_3D_MASK > DRM_MODE_FLAG_3D_MAX {
-        return None;
+        return Err(FsError::InvalidParam);
     }
     if clock == 0 {
-        return None;
+        return Err(FsError::InvalidParam);
     }
     if hdisplay == 0 || hsync_start < hdisplay || hsync_end < hsync_start || htotal < hsync_end {
-        return None;
+        return Err(FsError::InvalidParam);
     }
     if vdisplay == 0 || vsync_start < vdisplay || vsync_end < vsync_start || vtotal < vsync_end {
-        return None;
+        return Err(FsError::InvalidParam);
     }
-    Some((hdisplay as u32, vdisplay as u32))
+    Ok((hdisplay as u32, vdisplay as u32))
 }
 
 mod modeinfo;
