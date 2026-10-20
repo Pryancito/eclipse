@@ -665,7 +665,12 @@ impl Syscall<'_> {
             } else {
                 prepare_open_inode(inode)?
             };
-            let abs_path = proc.get_absolute_path(dir_fd, path)?;
+            // A pipe reopened through `/proc/<pid>/fd/N` (or `/dev/stdin`) is
+            // the same pipe, under the same name.
+            let abs_path = match inode.downcast_ref::<Pipe>() {
+                Some(pipe) => pipe.link_name(),
+                None => proc.get_absolute_path(dir_fd, path)?,
+            };
             let file = File::new(inode, flags, abs_path);
             let fd = proc.add_file(file)?;
             Ok(fd.into())
@@ -859,11 +864,15 @@ impl Syscall<'_> {
         // get either way.
         let base_flags = anon_fd_flags(flags, ANON_CLOEXEC | ANON_NONBLOCK)?;
         let proc = self.linux_process();
-        let (read, write) = Pipe::create_pair();
+        let (read, write) = Pipe::create_pair_for(proc.fsuid(), proc.fsgid());
+        // What `/proc/<pid>/fd/N` says of both ends, `pipe:[ino]`. It said
+        // `pipe_r:[]` and `pipe_w:[]`, with no number to tell one pipe from
+        // another or to match against `fstat`.
+        let name = read.link_name();
         let read_fd = proc.add_file(File::new(
             Arc::new(read),
             base_flags | OpenFlags::RDONLY,
-            String::from("pipe_r:[]"),
+            name.clone(),
         ))?;
 
         // The descriptors only belong to the caller once it has their numbers:
@@ -875,7 +884,7 @@ impl Syscall<'_> {
                 proc.add_file(File::new(
                     Arc::new(write),
                     base_flags | OpenFlags::WRONLY,
-                    String::from("pipe_w:[]"),
+                    name.clone(),
                 ))
             },
             |read_fd, write_fd| {

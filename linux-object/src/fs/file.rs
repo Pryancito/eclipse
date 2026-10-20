@@ -1466,15 +1466,8 @@ impl FileLike for File {
         // implement it and return ENOSYS — those must fall through to the inode's
         // own poll(), NOT propagate the error (that regressed `poll()` on packet
         // sockets, e.g. udhcpc, to "Function not implemented").
-        if let Ok(meta) = inner.inode.metadata() {
-            if meta.type_ == FileType::NamedPipe {
-                return Ok(PollStatus {
-                    read: meta.size > 0,
-                    write: true,
-                    error: false,
-                    hangup: false,
-                });
-            }
+        if let Some(status) = fifo_node_poll(&inner.inode) {
+            return Ok(status);
         }
         Ok(inner.inode.poll()?)
     }
@@ -1486,15 +1479,8 @@ impl FileLike for File {
         // when metadata() is available — sockets/special devices return ENOSYS
         // and must fall through to the inode's own async_poll() rather than
         // failing the whole poll() syscall.
-        if let Ok(meta) = inode.metadata() {
-            if meta.type_ == FileType::NamedPipe {
-                return Ok(PollStatus {
-                    read: meta.size > 0,
-                    write: true,
-                    error: false,
-                    hangup: false,
-                });
-            }
+        if let Some(status) = fifo_node_poll(&inode) {
+            return Ok(status);
         }
 
         // `INode::async_poll` takes no events, so every inode that implements it
@@ -1774,6 +1760,23 @@ impl FileLike for File {
     }
 }
 
+/// What `poll` says of a FIFO node opened from the fs, which has no pipe
+/// buffer or writer count behind it here: readable only once it holds bytes,
+/// or a reader that never gets a writer spins on 0-byte reads. A pipe from
+/// `pipe2` is a FIFO to `fstat` as well, and answers for itself.
+fn fifo_node_poll(inode: &Arc<dyn INode>) -> Option<PollStatus> {
+    if inode.downcast_ref::<super::pipe::Pipe>().is_some() {
+        return None;
+    }
+    let meta = inode.metadata().ok()?;
+    (meta.type_ == FileType::NamedPipe).then_some(PollStatus {
+        read: meta.size > 0,
+        write: true,
+        error: false,
+        hangup: false,
+    })
+}
+
 /// The `FIONREAD` answer of a `File` over an inode of `type_`: bytes from
 /// `offset` to `size` for a regular file (a position past the end is 0,
 /// not a wrap), and `None`, which hands the request to the inode's own
@@ -1862,6 +1865,28 @@ mod fionread_tests {
 #[cfg(test)]
 mod pipe_seek_tests {
     use super::*;
+
+    /// A pipe is a FIFO to `fstat`, and still polls for itself: readable once
+    /// it holds bytes, writable while it has room. The FIFO-node answer is
+    /// for a node from `mkfifo`, whose size is what it holds; a pipe's size
+    /// is 0 whatever it holds, so taken for one it never read as readable.
+    #[test]
+    fn a_pipe_polls_for_itself_and_not_as_a_fifo_node() {
+        let (r, w) = crate::fs::Pipe::create_pair();
+        let reader = File::new(Arc::new(r), OpenFlags::RDONLY, String::from("pipe:[r]"));
+        let writer = File::new(Arc::new(w), OpenFlags::WRONLY, String::from("pipe:[w]"));
+        let ready = |f: &Arc<File>| {
+            let s = FileLike::poll(&**f, PollEvents::IN | PollEvents::OUT).unwrap();
+            (s.read, s.write)
+        };
+        assert_eq!(ready(&reader), (false, false));
+        assert_eq!(ready(&writer), (false, true));
+        writer.write(b"x").unwrap();
+        assert_eq!(ready(&reader), (true, false));
+        use async_std::task::block_on;
+        let s = block_on(FileLike::async_poll(&*reader, PollEvents::IN)).unwrap();
+        assert!(s.read, "and the same when a poll waits");
+    }
 
     /// `lseek` on a pipe must be `ESPIPE`, not a silent success.
     #[test]

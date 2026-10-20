@@ -2406,8 +2406,10 @@ impl LinuxProcess {
         }
         let (fd_dir_path, fd_name) = split_path(path);
         if fd_dir_path == "/proc/self/fd" {
-            let fd = FileDesc::try_from(fd_name)?;
-            let file = self.get_file(fd)?;
+            // A name that is no open descriptor is not in the directory:
+            // `ENOENT`, as its listing and Linux say, not `EBADF` or `EINVAL`.
+            let fd = FileDesc::try_from(fd_name).map_err(|_| LxError::ENOENT)?;
+            let file = self.get_file(fd).map_err(|_| LxError::ENOENT)?;
             if follow {
                 // Magic link: resolve to the open file itself (like Linux),
                 // so execve("/proc/self/fd/N") runs the file, not the

@@ -4116,7 +4116,7 @@ impl LinuxProcess {
             // added for is fixed, and under LOG=debug the trace remains.
             if let Some(file) = f.downcast_ref::<crate::fs::File>() {
                 let p = file.path();
-                if p.starts_with("pipe_") {
+                if p.starts_with("pipe:") {
                     debug!(
                         "[cloexec] {} fd={:?} ({}) closed by execve CLOEXEC sweep",
                         exec_path, fd, p
