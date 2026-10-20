@@ -15,6 +15,9 @@ mod switches;
 #[cfg(test)]
 mod switches_tests;
 mod thread_state;
+/// Why the trap path asks the wake floor before it ticks; see the module notes.
+#[cfg(test)]
+mod wake_order_tests;
 
 /// Lo que un hilo de calculo paga en cada tick; ver las notas del modulo.
 #[cfg(test)]
