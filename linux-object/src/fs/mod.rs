@@ -2520,18 +2520,14 @@ impl LinuxProcess {
             // VFS walk (two String allocations + a directory scan per
             // component on SFS) before this.
             if follow {
-                if let Some(inode) = dcache::get(self.root_inode(), path, walked.as_deref_mut()) {
+                if let Some(inode) = dcache::get(self.root_inode(), path, walked) {
                     return Ok(inode);
                 }
             }
-            // The cache keeps where the walk ended with the inode, so a walk
-            // it will keep is noted whether the caller asked or not.
-            let mut own = Walked::default();
-            let mut walked = walked.or(follow.then_some(&mut own));
-            let inode =
-                self.root_inode()
-                    .lookup_walked(path, follow_max_depth, walked.as_deref_mut())?;
-            if let (true, Some(walked)) = (follow, walked) {
+            let inode = self
+                .root_inode()
+                .lookup_walked(path, follow_max_depth, Some(walked))?;
+            if follow {
                 dcache::put(self.root_inode(), path, &inode, walked);
             }
             return Ok(inode);
