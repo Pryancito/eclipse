@@ -3627,4 +3627,291 @@ mod tests {
         )
         .unwrap();
     }
+
+    /// Every error the crate raises has one errno at this boundary, and
+    /// btrfs-progs reads them: `EOPNOTSUPP` is "this filesystem cannot",
+    /// `ENOKEY` is "unlock it first", and `EIO` is the one that means the
+    /// disk. Four of the twelve arms answered for nothing until now.
+    #[test]
+    fn the_twelve_errors_of_the_crate_keep_their_meaning_at_the_ioctl_boundary() {
+        let table = [
+            (EfsError::Io, LxError::EIO),
+            (EfsError::BadSuperblock, LxError::EINVAL),
+            (EfsError::Corrupt("a torn node"), LxError::EIO),
+            (
+                EfsError::Unsupported("a format from the future"),
+                LxError::EOPNOTSUPP,
+            ),
+            (EfsError::NotFound, LxError::ENOENT),
+            (EfsError::Exists, LxError::EEXIST),
+            (EfsError::NotDir, LxError::ENOTDIR),
+            (EfsError::IsDir, LxError::EISDIR),
+            (EfsError::NotEmpty, LxError::ENOTEMPTY),
+            (EfsError::NoSpace, LxError::ENOSPC),
+            (EfsError::Invalid, LxError::EINVAL),
+            (EfsError::NoKey, LxError::ENOKEY),
+        ];
+        for (e, want) in table {
+            assert_eq!(errno(e), want, "{:?}", e);
+        }
+        // A corrupt filesystem and a bad superblock are different things to
+        // say, so they do not share an errno: the first is EIO (the disk
+        // says one thing and the tree another), the second EINVAL (this is
+        // not an EclipseFS at all).
+        assert_ne!(errno(EfsError::Corrupt("")), errno(EfsError::BadSuperblock));
+    }
+
+    /// A name field that holds its NUL but is not UTF-8 is EINVAL: it is not
+    /// too long, it just does not say a name. The two errors are what tell a
+    /// truncated field from a mangled one.
+    #[test]
+    fn a_name_that_is_not_utf8_is_einval_and_not_enametoolong() {
+        let disk = formatted(16 << 20);
+        let fs = mount(&disk);
+        let ctx = Ctx::root();
+        let top = ctx.open(fs.root_inode(), OpenFlags::RDONLY);
+        let mut args = vol_args(0, "");
+        // A lone continuation byte and a byte no UTF-8 sequence starts with.
+        args[8..11].copy_from_slice(&[0x80, 0xff, 0x00]);
+        assert_eq!(
+            ctx.ioctl(top, BTRFS_IOC_SUBVOL_CREATE, &mut args),
+            Err(LxError::EINVAL)
+        );
+        // The same bytes with no NUL in the whole field are the other error.
+        let mut unterminated = vec![0x80u8; 4096];
+        unterminated[0..8].fill(0);
+        assert_eq!(
+            ctx.ioctl(top, BTRFS_IOC_SUBVOL_CREATE, &mut unterminated),
+            Err(LxError::ENAMETOOLONG)
+        );
+    }
+
+    /// The four names a subvolume cannot have are refused BEFORE the mount's
+    /// writability and before the caller's capabilities. That order is the
+    /// whole of what the check here buys: `check_name` one layer down
+    /// refuses the same four, so on a writable mount and as root the answer
+    /// is EINVAL either way -- what changes is the answer a read-only mount
+    /// and an unprivileged caller get, and btrfs-progs prints it.
+    #[test]
+    fn a_subvolume_name_is_judged_before_the_mount_and_before_the_caller() {
+        let disk = formatted(16 << 20);
+        {
+            let fs = mount(&disk);
+            fs.root_inode().create("sv", FileType::Dir, 0o755).unwrap();
+            fs.sync().unwrap();
+        }
+        let fs = mount_with(&disk, true, "");
+        let root = fs.root_inode();
+        let ctx = Ctx::root();
+        let top = ctx.open(root.clone(), OpenFlags::RDONLY);
+        for bad in ["", ".", "..", "a/b"] {
+            assert_eq!(
+                ctx.ioctl(top, BTRFS_IOC_SUBVOL_CREATE, &mut vol_args(0, bad)),
+                Err(LxError::EINVAL),
+                "{:?} on a read-only mount",
+                bad
+            );
+        }
+        // A name that is a name is where EROFS comes from, which is what
+        // makes the four above a verdict on the name and not on the mount.
+        assert_eq!(
+            ctx.ioctl(top, BTRFS_IOC_SUBVOL_CREATE, &mut vol_args(0, "new")),
+            Err(LxError::EROFS)
+        );
+        // Deleting reads the name before it asks for CAP_SYS_ADMIN.
+        let user = Ctx::as_user(1000);
+        let utop = user.open(root, OpenFlags::RDONLY);
+        for bad in ["", ".", "..", "a/b"] {
+            assert_eq!(
+                user.ioctl(utop, BTRFS_IOC_SNAP_DESTROY, &mut vol_args(0, bad)),
+                Err(LxError::EINVAL),
+                "{:?} as an unprivileged caller",
+                bad
+            );
+        }
+        assert_eq!(
+            user.ioctl(utop, BTRFS_IOC_SNAP_DESTROY, &mut vol_args(0, "sv")),
+            Err(LxError::EPERM)
+        );
+    }
+
+    /// A string that exactly fills its field leaves no room for the
+    /// terminator, so it is already too long: the field is `max` bytes
+    /// counting the NUL, the way every btrfs name field is.
+    #[test]
+    fn a_name_that_fills_its_field_leaves_no_room_for_the_terminator() {
+        let mut b = [0xffu8; 16];
+        assert_eq!(put_cstr(&mut b, 4, 4, "abcd"), Err(LxError::ENAMETOOLONG));
+        assert_eq!(b, [0xffu8; 16], "a refused name wrote something anyway");
+        // One byte shorter fits, NUL and all, and nothing past the field is
+        // touched.
+        put_cstr(&mut b, 4, 4, "abc").unwrap();
+        assert_eq!(&b[3..9], b"\xffabc\0\xff");
+    }
+
+    /// Every suffix the kernel's `memparse` takes, ten bits apart, in both
+    /// the cases btrfs-progs writes them in.
+    #[test]
+    fn the_size_suffixes_are_the_kernels_powers_of_1024() {
+        let table = [
+            ("", 0u32),
+            ("k", 10),
+            ("m", 20),
+            ("g", 30),
+            ("t", 40),
+            ("p", 50),
+            ("e", 60),
+        ];
+        for (suffix, shift) in table {
+            let lower = format!("3{}", suffix);
+            let upper = format!("3{}", suffix.to_uppercase());
+            assert_eq!(memparse(&lower), Some(3u64 << shift), "{:?}", lower);
+            assert_eq!(memparse(&upper), Some(3u64 << shift), "{:?}", upper);
+        }
+        // Two suffixes, or a suffix of its own, is not a size.
+        assert_eq!(memparse("3kk"), None);
+        assert_eq!(memparse("3 k"), None);
+    }
+
+    /// The gate and the numbers at once: every ioctl this module answers is
+    /// called by the number Linux and btrfs-progs call it by, and
+    /// `is_fs_ioctl` lets that number in.
+    ///
+    /// Both halves matter, and the gate half is the one nothing else here
+    /// checks: the tests of this module reach `Target` directly, the way the
+    /// syscall layer does only after `eclipsefs_ioctl` has asked the gate.
+    /// So an entry dropped from the gate list -- which makes the ioctl fall
+    /// through to the inode and answer ENOTTY -- leaves every other test in
+    /// this file green.
+    #[test]
+    fn the_gate_lets_in_every_number_this_module_answers() {
+        const fn ioc(dir: u32, ty: u32, nr: u32, size: u32) -> u32 {
+            dir << 30 | size << 16 | ty << 8 | nr
+        }
+        const W: u32 = 1;
+        const R: u32 = 2;
+        // The ones `the_ioctl_numbers_are_the_ones_linux_and_btrfs_progs_use`
+        // and `the_fscrypt_numbers_are_the_ones_linux_uses` leave out, plus
+        // FICLONERANGE, whose number is checked there but whose place in the
+        // gate list was not.
+        let table = [
+            ("FS_IOC32_GETFLAGS", ioc(R, b'f' as u32, 1, 4)),
+            ("FS_IOC32_SETFLAGS", ioc(W, b'f' as u32, 2, 4)),
+            ("FICLONERANGE", ioc(W, 0x94, 13, 32)),
+            ("BTRFS_IOC_SNAP_CREATE", ioc(W, 0x94, 1, 4096)),
+            ("BTRFS_IOC_SYNC", ioc(0, 0x94, 8, 0)),
+            ("BTRFS_IOC_ADD_DEV", ioc(W, 0x94, 10, 4096)),
+            ("BTRFS_IOC_RM_DEV", ioc(W, 0x94, 11, 4096)),
+            ("BTRFS_IOC_SUBVOL_CREATE", ioc(W, 0x94, 14, 4096)),
+            ("BTRFS_IOC_SNAP_DESTROY", ioc(W, 0x94, 15, 4096)),
+            ("BTRFS_IOC_INO_LOOKUP", ioc(R | W, 0x94, 18, 4096)),
+            ("BTRFS_IOC_DEFAULT_SUBVOL", ioc(W, 0x94, 19, 8)),
+            ("BTRFS_IOC_WAIT_SYNC", ioc(W, 0x94, 22, 8)),
+            ("BTRFS_IOC_SUBVOL_GETFLAGS", ioc(R, 0x94, 25, 8)),
+            ("BTRFS_IOC_SUBVOL_SETFLAGS", ioc(W, 0x94, 26, 8)),
+            ("BTRFS_IOC_SCRUB_CANCEL", ioc(0, 0x94, 28, 0)),
+            ("BTRFS_IOC_SCRUB_PROGRESS", ioc(R | W, 0x94, 29, 1024)),
+            ("BTRFS_IOC_BALANCE_CTL", ioc(W, 0x94, 33, 4)),
+            ("BTRFS_IOC_BALANCE_PROGRESS", ioc(R, 0x94, 34, 1024)),
+            ("BTRFS_IOC_QUOTA_CTL", ioc(R | W, 0x94, 40, 16)),
+            ("BTRFS_IOC_QUOTA_RESCAN", ioc(W, 0x94, 44, 64)),
+            ("BTRFS_IOC_QUOTA_RESCAN_STATUS", ioc(R, 0x94, 45, 64)),
+            ("BTRFS_IOC_QUOTA_RESCAN_WAIT", ioc(0, 0x94, 46, 0)),
+            ("BTRFS_IOC_GET_FEATURES", ioc(R, 0x94, 57, 24)),
+            ("BTRFS_IOC_RM_DEV_V2", ioc(W, 0x94, 58, 4096)),
+        ];
+        for (name, cmd) in table {
+            assert!(is_fs_ioctl(cmd), "{} does not reach this module", name);
+        }
+        // And the ones this module does not answer stay out, so the gate is
+        // a list and not a `true`.
+        for (name, cmd) in [
+            ("FS_IOC_GETVERSION", ioc(R, b'v' as u32, 1, 8)),
+            ("BTRFS_IOC_TRANS_START", ioc(0, 0x94, 6, 0)),
+            ("TIOCGWINSZ", 0x5413),
+        ] {
+            assert!(!is_fs_ioctl(cmd), "{} is not ours", name);
+        }
+    }
+
+    /// The nine profiles `btrfs balance -dconvert=` names, as the nine bit
+    /// patterns it sends. btrfs-progs sets the "available" bit alongside the
+    /// profile, and that bit names no profile of its own.
+    #[test]
+    fn the_nine_balance_profiles_are_the_nine_btrfs_bit_patterns() {
+        let table = [
+            (0, Profile::Single),
+            (BTRFS_BLOCK_GROUP_DUP, Profile::Dup),
+            (BTRFS_BLOCK_GROUP_RAID0, Profile::Raid0),
+            (BTRFS_BLOCK_GROUP_RAID1, Profile::Raid1),
+            (BTRFS_BLOCK_GROUP_RAID10, Profile::Raid10),
+            (BTRFS_BLOCK_GROUP_RAID1C3, Profile::Raid1c3),
+            (BTRFS_BLOCK_GROUP_RAID1C4, Profile::Raid1c4),
+            (BTRFS_BLOCK_GROUP_RAID5, Profile::Raid5),
+            (BTRFS_BLOCK_GROUP_RAID6, Profile::Raid6),
+        ];
+        for (bits, want) in table {
+            assert_eq!(profile(bits), Ok(want), "{:#x}", bits);
+            assert_eq!(
+                profile(bits | BTRFS_AVAIL_ALLOC_BIT_SINGLE),
+                Ok(want),
+                "{:#x} with the available bit",
+                bits
+            );
+        }
+        // Two profiles at once is not a profile.
+        assert_eq!(
+            profile(BTRFS_BLOCK_GROUP_RAID1 | BTRFS_BLOCK_GROUP_RAID10),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    /// A punched or zeroed range leaves nothing of itself in the page cache.
+    ///
+    /// The pages have to be IN the cache before the call, which is why
+    /// nothing saw this: a cache nobody has read holds nothing to go stale,
+    /// and a read after the hole fills it from the filesystem, which already
+    /// says zeros. So the test reads first, punches second and reads the
+    /// cache again, and both modes that change bytes under it count --
+    /// PUNCH_HOLE and ZERO_RANGE alike.
+    #[test]
+    fn a_zeroed_or_punched_range_leaves_nothing_behind_in_the_page_cache() {
+        let disk = formatted(32 << 20);
+        let fs = mount(&disk);
+        let data = pattern(64 << 10, 23);
+        let inode = file_with(&fs.root_inode(), "f", &data);
+        let file = File::new(inode.clone(), OpenFlags::RDWR, String::from("/efs-test/f"));
+        let (vmo, _) = file.get_vmo_shared(0, data.len()).unwrap();
+        let mut seen = vec![0u8; 8192];
+        // This read is what fills the cache, and without it the two modes
+        // below are indistinguishable.
+        vmo.read(8192, &mut seen).unwrap();
+        assert_eq!(&seen[..], &data[8192..16384], "the page cache did not fill");
+
+        // FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE.
+        eclipsefs_fallocate(&file, 0x11, 8192, 4096)
+            .unwrap()
+            .unwrap();
+        vmo.read(8192, &mut seen).unwrap();
+        assert!(
+            seen[..4096].iter().all(|&b| b == 0),
+            "the cache still holds what a zeroed range gave up"
+        );
+        assert_eq!(&seen[4096..], &data[12288..16384], "past the zeroed range");
+
+        // FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE.
+        eclipsefs_fallocate(&file, 0x3, 12288, 4096)
+            .unwrap()
+            .unwrap();
+        vmo.read(12288, &mut seen[..4096]).unwrap();
+        assert!(
+            seen[..4096].iter().all(|&b| b == 0),
+            "the cache still holds what a punched hole gave up"
+        );
+        // And the filesystem says the same thing, so the cache was not
+        // zeroed on its own.
+        let mut want = data;
+        want[8192..16384].fill(0);
+        assert_eq!(read_all(&inode), want);
+    }
 }
