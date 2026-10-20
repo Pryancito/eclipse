@@ -3,8 +3,10 @@
 //!
 //! Only paths that reach the real-FS branch of `lookup_inode_at_walk` are
 //! ever cached — `/proc`, `/sys` and `/dev` are intercepted earlier by
-//! `lookup_virtual_fs`, so dynamic pseudo-fs content (per-process `/proc`
-//! entries, hotplugged device nodes) can never go stale here.
+//! `lookup_virtual_fs`. A link on the real FS can still lead into `/proc`
+//! (to `/proc/self/stat`, say), or through one of its magic links, and what
+//! such a walk finds is another file to each process, so it is not kept: the
+//! first process to look used to hand its own to every other.
 //!
 //! Coherence is a single global epoch: every namespace-mutating operation
 //! (unlink/rename/mkdir/mknod/symlink/link, mount/umount, `O_CREAT` opens,

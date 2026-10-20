@@ -12,6 +12,7 @@ use rcore_fs::vfs::{
 use zircon_object::object::KernelObject;
 use zircon_object::task::{Job, Process, Status, Thread, ThreadState, ROOT_JOB};
 
+use super::proc_self::{Held, ProcessLink};
 use crate::process::ProcessExt;
 
 /// `/proc/<pid>/cmdline` and `environ` out of the process's memory.
@@ -998,10 +999,7 @@ impl INode for ProcPidDirINode {
                     .try_linux()
                     .map(|lp| lp.execute_path())
                     .unwrap_or_default();
-                Ok(Arc::new(super::pseudo::Pseudo::new(
-                    &path,
-                    FileType::SymLink,
-                )))
+                Ok(Arc::new(ProcessLink::new(self.pid, Held::Program, &path)))
             }
             // The working directory and the root, which a process could not
             // see of itself or another (`pwdx`, `lsof`). There is no
@@ -1013,14 +1011,11 @@ impl INode for ProcPidDirINode {
                 if let Status::Exited(_) = proc.status() {
                     return Err(FsError::EntryNotFound);
                 }
-                let path = match (name, proc.try_linux()) {
-                    ("cwd", Some(lp)) => lp.working_directory_link(),
-                    _ => String::from("/"),
+                let (held, path) = match (name, proc.try_linux()) {
+                    ("cwd", Some(lp)) => (Held::WorkingDirectory, lp.working_directory_link()),
+                    _ => (Held::Root, String::from("/")),
                 };
-                Ok(Arc::new(super::pseudo::Pseudo::new(
-                    &path,
-                    FileType::SymLink,
-                )))
+                Ok(Arc::new(ProcessLink::new(self.pid, held, &path)))
             }
             _ => Err(FsError::EntryNotFound),
         }
@@ -1158,14 +1153,20 @@ impl INode for ProcPidTaskDirINode {
 /// those readers want from a thread directory they reached by tid and is
 /// closer than the `ENOENT` they got before. `comm` is writable, because
 /// `pthread_setname_np` names a thread by writing to it.
+///
+/// The descriptors, the working directory, the root and the program are the
+/// process's, which every thread here shares: `/proc/thread-self/fd/N` was
+/// `ENOENT`.
 struct ProcTidDirINode {
     pid: u64,
     tid: u64,
 }
 
 impl ProcTidDirINode {
-    fn entries() -> [&'static str; 5] {
-        [".", "..", "comm", "stat", "status"]
+    fn entries() -> [&'static str; 10] {
+        [
+            ".", "..", "comm", "stat", "status", "fd", "fdinfo", "cwd", "root", "exe",
+        ]
     }
 
     fn alive(&self) -> Result<()> {
@@ -1226,6 +1227,7 @@ impl INode for ProcTidDirINode {
                 tid: self.tid,
                 kind: ProcTidFileKind::Status,
             })),
+            "fd" | "fdinfo" | "cwd" | "root" | "exe" => pid_dir_inode(self.pid).find(name),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -6002,13 +6004,29 @@ mod pid_task_dir_tests {
         };
         assert_eq!(
             names_of(&dir),
-            alloc::vec![".", "..", "comm", "stat", "status"]
+            alloc::vec![".", "..", "comm", "stat", "status", "fd", "fdinfo", "cwd", "root", "exe"]
         );
         for name in ["comm", "stat", "status"] {
             let file = dir.find(name).unwrap();
             assert_eq!(file.metadata().unwrap().type_, FileType::File);
             let mut buf = [0u8; 16];
             assert!(file.read_at(0, &mut buf).unwrap() > 0, "{} vacio", name);
+        }
+        // The descriptors, the working directory, the root and the program
+        // are the process's.
+        let whose = ProcPidDirINode { pid: proc.id() };
+        for name in ["fd", "fdinfo", "cwd", "root", "exe"] {
+            let (a, b) = (dir.find(name).unwrap(), whose.find(name).unwrap());
+            assert_eq!(
+                a.metadata().unwrap().inode,
+                b.metadata().unwrap().inode,
+                "{}",
+                name
+            );
+            let mut text = [[0u8; 32]; 2];
+            let read = [a.read_at(0, &mut text[0]), b.read_at(0, &mut text[1])];
+            assert_eq!(read[0], read[1], "{}", name);
+            assert_eq!(text[0], text[1], "{}", name);
         }
         // `..` is the task directory, not the process one.
         assert_eq!(

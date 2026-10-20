@@ -1,8 +1,9 @@
+use crate::fs::file::File;
 use crate::fs::pseudo::Pseudo;
 use crate::fs::FileLike;
 use crate::process::ProcessExt;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use rcore_fs::vfs::*;
@@ -80,7 +81,7 @@ impl INode for ProcSelfFdDir {
                     .ok_or(FsError::EntryNotFound)?
                     .get_file_like(fd.into())
                     .map_err(|_| FsError::EntryNotFound)?;
-                Ok(Arc::new(FdLink::of(&*file)))
+                Ok(Arc::new(FdLink::of(&file)))
             }
         }
     }
@@ -148,20 +149,41 @@ pub(crate) fn default_link_name(meta: crate::error::LxResult<Metadata>, kind: &s
 /// socket or an eventfd was in the listing, but its entry was `ENOENT`, so
 /// `ls -l /proc/<pid>/fd` printed an error for it and `lsof` could not tell
 /// what it was.
+///
+/// Followed, it leads to the open file ([`fd_target`]) and not to its text,
+/// which names no file for a pipe or a socket and the wrong one once the
+/// file is unlinked or renamed. Only `/proc/self/fd/N` did, spelled just
+/// so, so `/dev/stdin` of a pipe, `/proc/<pid>/fd/N` and
+/// `/proc/self/fd/N/name` of a directory led nowhere.
 pub struct FdLink {
     name: String,
     mode: u16,
+    /// Not held: a descriptor of the link (`O_PATH|O_NOFOLLOW`) keeps no
+    /// pipe open.
+    file: Weak<dyn FileLike>,
 }
 
 impl FdLink {
-    pub fn of(file: &dyn FileLike) -> Self {
+    pub fn of(file: &Arc<dyn FileLike>) -> Self {
         let flags = file.flags();
         let read = if flags.readable() { 0o500 } else { 0 };
         let write = if flags.writable() { 0o300 } else { 0 };
         FdLink {
             name: file.link_name(),
             mode: read | write,
+            file: Arc::downgrade(file),
         }
+    }
+}
+
+/// Where a descriptor's link leads (`nd_jump_link`): to the open file itself,
+/// and its name, so a reopen is that file even once it is unlinked; or to the
+/// object, when the descriptor is no file, which `sys_openat` names by the
+/// object and not by a walk.
+pub fn fd_target(file: Arc<dyn FileLike>) -> (Arc<dyn INode>, String) {
+    match file.downcast_arc::<File>() {
+        Ok(file) => (file.inode(), file.path().clone()),
+        Err(object) => (Arc::new(FdObject(object)), String::new()),
     }
 }
 
@@ -189,6 +211,87 @@ impl INode for FdLink {
             mode: self.mode,
             ..Pseudo::new("", FileType::SymLink).metadata()?
         })
+    }
+    /// While the descriptor is open (`proc_fd_link`).
+    fn jump(&self) -> Option<Result<(Arc<dyn INode>, String)>> {
+        self.file.upgrade().map(|file| Ok(fd_target(file)))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// What [`ProcessLink`] leads to.
+#[derive(Clone, Copy)]
+pub enum Held {
+    WorkingDirectory,
+    Root,
+    Program,
+}
+
+/// `/proc/<pid>/cwd`, `root` and `exe`. The text is a path, but the link
+/// leads (`proc_cwd_link`, `proc_root_link`, `proc_exe_link`) where the
+/// process is, from its own root, and not where that text leads from
+/// wherever it is followed: from `/proc` an absolute text started over at
+/// the root of `/proc`, so `/proc/self/cwd/f` was `ENOENT`.
+///
+/// A walk through one depends on whose link it is, so the path cache does
+/// not keep it.
+pub struct ProcessLink {
+    pid: u64,
+    held: Held,
+    text: Pseudo,
+}
+
+impl ProcessLink {
+    pub fn new(pid: u64, held: Held, text: &str) -> Self {
+        ProcessLink {
+            pid,
+            held,
+            text: Pseudo::new(text, FileType::SymLink),
+        }
+    }
+
+    fn lead(&self) -> Result<(Arc<dyn INode>, String)> {
+        let proc = crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
+        let lp = proc.try_linux().ok_or(FsError::EntryNotFound)?;
+        let root = lp.root_inode();
+        let path = match self.held {
+            Held::Root => return Ok((root.clone(), String::from("/"))),
+            Held::WorkingDirectory => lp.current_working_directory(),
+            // No program is in `/proc`: one recorded there would lead back
+            // here, and a kernel task has none.
+            Held::Program => match lp.execute_path() {
+                exe if exe.is_empty() || exe.starts_with("/proc/") => {
+                    return Err(FsError::EntryNotFound)
+                }
+                exe => exe,
+            },
+        };
+        let mut at = Walked {
+            root: Some(root.clone()),
+            ..Walked::default()
+        };
+        let found = root.lookup_walked(&path, super::FOLLOW_MAX_DEPTH, Some(&mut at))?;
+        Ok((found, at.path()))
+    }
+}
+
+impl INode for ProcessLink {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        self.text.read_at(offset, buf)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        self.text.poll()
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        self.text.metadata()
+    }
+    fn jump(&self) -> Option<Result<(Arc<dyn INode>, String)>> {
+        Some(self.lead())
     }
     fn as_any_ref(&self) -> &dyn Any {
         self

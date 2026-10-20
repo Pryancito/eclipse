@@ -20,7 +20,7 @@ pub(super) fn a_process(pid: KoID) -> Arc<Process> {
     Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "pipes", lp).unwrap()
 }
 
-fn pipe(sys: &Syscall<'_>) -> (FileDesc, FileDesc) {
+pub(super) fn pipe(sys: &Syscall<'_>) -> (FileDesc, FileDesc) {
     let mut fds = [0i32; 2];
     sys.sys_pipe2(UserOutPtr::from(fds.as_mut_ptr() as usize), 0)
         .unwrap();
