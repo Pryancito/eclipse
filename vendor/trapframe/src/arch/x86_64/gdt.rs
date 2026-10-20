@@ -49,7 +49,22 @@ struct CpuLocalRegion {
     /// DEBUG: dirección base donde `trap_syscall_entry` guardó el último
     /// `GeneralRegs` en ESTA CPU (escrita por el asm vía `gs:`).
     dbg_save: usize,
+    /// The user `FSBASE` this CPU's MSR holds, as `syscall_return` last wrote
+    /// it; `UNKNOWN_BASE` until the first write. See `syscall.S`.
+    user_fsbase: u64,
+    /// The same for the user `GSBASE`, which sits in `KERNEL_GS_BASE` while
+    /// the CPU is in the kernel.
+    user_gsbase: u64,
 }
+
+/// A base no user context can hold -- it is not canonical, and
+/// `refuse_noncanonical_entry` turns such a context away before
+/// `syscall_return` -- so the first return on a CPU always writes both MSRs.
+const UNKNOWN_BASE: u64 = u64::MAX;
+
+/// Offsets of the base caches in [`CpuLocalRegion`], for the asm.
+pub const USER_FSBASE_GS_OFFSET: usize = core::mem::offset_of!(CpuLocalRegion, user_fsbase);
+pub const USER_GSBASE_GS_OFFSET: usize = core::mem::offset_of!(CpuLocalRegion, user_gsbase);
 
 /// The one field of [`CpuLocalRegion`] whose offset is hardcoded elsewhere.
 ///
@@ -193,6 +208,8 @@ pub fn init() {
         logical_cpu_valid: 0,
         _pad: [0; 6],
         dbg_save: 0,
+        user_fsbase: UNKNOWN_BASE,
+        user_gsbase: UNKNOWN_BASE,
     });
     // Trap/exception stack used on ring3->ring0 transitions (TSS sp0). 4 KiB was
     // dangerously small for deep user-trap handling (page-fault -> VMO commit ->
@@ -308,6 +325,8 @@ pub fn init_ap() {
         logical_cpu_valid: 0,
         _pad: [0; 6],
         dbg_save: 0,
+        user_fsbase: UNKNOWN_BASE,
+        user_gsbase: UNKNOWN_BASE,
     });
     // Trap/exception stack used on ring3->ring0 transitions (TSS sp0). 4 KiB was
     // dangerously small for deep user-trap handling (page-fault -> VMO commit ->

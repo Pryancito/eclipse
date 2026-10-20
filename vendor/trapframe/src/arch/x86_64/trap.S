@@ -80,8 +80,8 @@ __from_user_regs_push:
     # push trap_num, error_code
     push [rax + 2*8]        # push error_code from entry frame
     push [rax + 1*8]        # push trap_num from entry frame
-    push rax                # skip gsbase
-    push rax                # skip fsbase
+    sub rsp, 16             # skip gsbase, fsbase: they hold what
+                            # `syscall_return` loaded, and must keep it
     # push general registers
     push [rax + 5*8]        # push rflags from entry frame
     push [rax + 3*8]        # push rip from entry frame
