@@ -1713,13 +1713,14 @@ fn setcrtc_wants_a_mode_that_is_one_and_an_fb_that_holds_it() {
     let fb = c.addfb2(&buf);
     let einval = Err(FsError::InvalidParam);
     let enospc = Err(FsError::NoDeviceSpace);
+    let erange = Err(FsError::OutOfRange);
 
-    let setcrtc = |fb_id: u32, x: u32, y: u32, mode: [u8; 68]| {
+    let setcrtc_on = |crtc_id: u32, fb_id: u32, x: u32, y: u32, mode: [u8; 68]| {
         let connectors = [conn];
         let mut req = DrmModeGetCrtc {
             set_connectors_ptr: connectors.as_ptr() as u64,
             count_connectors: 1,
-            crtc_id: crtc,
+            crtc_id,
             fb_id,
             x,
             y,
@@ -1729,9 +1730,13 @@ fn setcrtc_wants_a_mode_that_is_one_and_an_fb_that_holds_it() {
         };
         c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req)
     };
+    let setcrtc = |fb_id: u32, x: u32, y: u32, mode: [u8; 68]| setcrtc_on(crtc, fb_id, x, y, mode);
     let good = make_modeinfo(32, 8);
+    let flags = u32::from_ne_bytes([good[28], good[29], good[30], good[31]]);
     let put_u16 =
         |m: &mut [u8; 68], at: usize, v: u16| m[at..at + 2].copy_from_slice(&v.to_ne_bytes());
+    let put_u32 =
+        |m: &mut [u8; 68], at: usize, v: u32| m[at..at + 4].copy_from_slice(&v.to_ne_bytes());
 
     // The fb: -1 with nothing on the CRTC, and an id that is not one.
     let mut off = DrmModeGetCrtc {
@@ -1748,6 +1753,42 @@ fn setcrtc_wants_a_mode_that_is_one_and_an_fb_that_holds_it() {
     c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut off)
         .expect("SETCRTC off");
     assert_eq!(get_crtc_fb(&c, crtc), 0);
+
+    // "Universal plane src offsets are only 16.16": an x or y with a bit
+    // above the 16th is ERANGE before anything else is looked at -- before
+    // the fb, before the CRTC, and with or without a mode.
+    assert_eq!(
+        setcrtc(fb, 0x1_0000, 0, good),
+        erange,
+        "an x with high bits set"
+    );
+    assert_eq!(
+        setcrtc(fb, 0, 0x1_0000, good),
+        erange,
+        "a y with high bits set"
+    );
+    assert_eq!(
+        setcrtc(4242, 0x1_0000, 0, good),
+        erange,
+        "the offsets are checked before the fb"
+    );
+    assert_eq!(
+        setcrtc_on(4242, 4242, 0x1_0000, 0, good),
+        erange,
+        "and before the CRTC"
+    );
+    let mut off_high = off;
+    off_high.y = 0x1_0000;
+    assert_eq!(
+        c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut off_high),
+        erange,
+        "and with no mode: the pipe is not turned off"
+    );
+    assert_eq!(
+        setcrtc_on(4242, fb, 0, 0, good),
+        Err(FsError::EntryNotFound),
+        "offsets that fit: the CRTC is looked up"
+    );
     assert_eq!(
         setcrtc(u32::MAX, 0, 0, good),
         einval,
@@ -1780,13 +1821,37 @@ fn setcrtc_wants_a_mode_that_is_one_and_an_fb_that_holds_it() {
         enospc,
         "y pushes it past the bottom"
     );
-    assert_eq!(
-        setcrtc(fb, 0x1_0000, 0, good),
-        enospc,
-        "an x with high bits set is outside any fb"
-    );
 
-    // The mode: what `drm_mode_validate_basic` refuses.
+    // The mode: `drm_mode_convert_umode` opens with the two u32s it copies
+    // into ints, ERANGE past INT_MAX, after the fb and before the
+    // aspect-ratio code it then checks.
+    let mut m = good;
+    put_u32(&mut m, 0, i32::MAX as u32 + 1);
+    assert_eq!(setcrtc(fb, 0, 0, m), erange, "clock INT_MAX + 1");
+    assert_eq!(
+        setcrtc(4242, 0, 0, m),
+        Err(FsError::EntryNotFound),
+        "the fb is looked up before the mode is converted"
+    );
+    put_u32(&mut m, 28, flags | (5 << 19));
+    assert_eq!(
+        setcrtc(fb, 0, 0, m),
+        erange,
+        "the range comes before the aspect-ratio code"
+    );
+    let mut m = good;
+    put_u32(&mut m, 24, u32::MAX);
+    assert_eq!(setcrtc(fb, 0, 0, m), erange, "vrefresh past INT_MAX");
+    let mut m = good;
+    put_u32(&mut m, 0, i32::MAX as u32);
+    assert_eq!(setcrtc(fb, 0, 0, m), Ok(0), "clock INT_MAX fits an int");
+    assert_eq!(get_crtc_fb(&c, crtc), fb);
+    let mut off_again = off;
+    c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut off_again)
+        .expect("SETCRTC off again");
+    assert_eq!(get_crtc_fb(&c, crtc), 0);
+
+    // And what `drm_mode_validate_basic` refuses.
     let mut m = good;
     m[0..4].copy_from_slice(&0u32.to_ne_bytes());
     assert_eq!(setcrtc(fb, 0, 0, m), einval, "clock 0");
@@ -1815,7 +1880,6 @@ fn setcrtc_wants_a_mode_that_is_one_and_an_fb_that_holds_it() {
     put_u16(&mut m, 20, u16::from_ne_bytes([good[18], good[19]]) - 1);
     assert_eq!(setcrtc(fb, 0, 0, m), einval, "vtotal before vsync_end");
     let mut m = good;
-    let flags = u32::from_ne_bytes([good[28], good[29], good[30], good[31]]);
     m[28..32].copy_from_slice(&(flags | (5 << 19)).to_ne_bytes());
     assert_eq!(setcrtc(fb, 0, 0, m), einval, "aspect-ratio code 5");
     for (bit, what) in [
