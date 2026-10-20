@@ -84,20 +84,24 @@ fn an_exec_detaches_the_segments_on_the_segment_side_too() {
     assert_eq!(guard.lock().shmid_ds.lock().nattch, 0);
 }
 
-/// `begin_new_exec`: `me->flags &= ~PF_FORKNOEXEC`. The exec is what
-/// closes the parent's `setpgid` window, so it is the exec that has to
-/// record it -- and it does so whether or not the new image is
-/// privileged, unlike the death signal below.
+/// `begin_new_exec`: `me->flags &= ~PF_FORKNOEXEC`, and BEFORE
+/// `do_close_on_exec`. A parent learns that its child exec'd from the EOF of
+/// a close-on-exec pipe (`posix_spawn`, Rust's `Command`), and from that
+/// moment its `setpgid` on the child is EACCES. Marked at the end of the
+/// exec, as it was, the parent could still regroup a child that had closed
+/// the pipe on its way into another program.
 #[test]
-fn an_exec_is_what_ends_the_window_its_parent_had_to_group_it() {
-    let mut inner = a_process_about_to_exec();
-    assert!(!inner.has_execed, "a forked child has not exec'd yet");
-    inner.reset_for_exec(false);
-    assert!(inner.has_execed);
+fn the_window_its_parent_had_to_group_it_shuts_as_the_descriptors_go() {
+    use super::dup_fd_tests::{a_process, an_open_log, Log};
+    let proc = a_process();
+    let fd = proc
+        .add_file_cloexec(an_open_log(Log::new(), OpenFlags::RDWR), true)
+        .unwrap();
+    assert!(!proc.has_execed(), "a new process has not exec'd yet");
 
-    let mut privileged = a_process_about_to_exec();
-    privileged.reset_for_exec(true);
-    assert!(privileged.has_execed);
+    proc.remove_cloexec_files();
+    assert!(proc.get_file_like(fd).is_err(), "the descriptor went");
+    assert!(proc.has_execed());
 }
 
 #[test]

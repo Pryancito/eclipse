@@ -798,8 +798,9 @@ pub struct LinuxThread {
     /// every other signal.
     pub handling_signal: Option<u32>,
     /// Thread name (`prctl(PR_SET_NAME)` / `/proc/<pid>/comm`), at most
-    /// [`TASK_COMM_LEN`]` - 1` bytes. Empty = never set: readers fall back to
-    /// the executable's basename, so a fresh thread reports its program name.
+    /// [`TASK_COMM_LEN`]` - 1` bytes, taken from the creating thread. Empty =
+    /// never set since the last exec: readers fall back to the executable's
+    /// basename.
     pub comm: String,
     /// Timer slack in nanoseconds (`prctl(PR_SET_TIMERSLACK)`). `0` = never
     /// set → reads as the Linux default of 50 µs. Recorded and read back;
@@ -1020,6 +1021,14 @@ impl LinuxThread {
             // child of `ionice -c3 make` is idle-class too; with CLONE_IO it
             // shares the creator's, which reads the same.
             ioprio: self.ioprio,
+            // `dup_task_struct()` copies the whole task, name included, and
+            // nothing in `copy_process` resets it: a thread, or a child, is
+            // called what its creator is called until it renames itself or
+            // execs. A creator that never named itself passes on the empty
+            // name, which reads as the program's basename, as its own does.
+            // Started empty, a `prctl(PR_SET_NAME, "worker")` thread's
+            // helpers all reported the program's name in `top -H`.
+            comm: self.comm.clone(),
             // sigaltstack(2): "A child created via fork(2) inherits a copy of
             // its parent's alternate signal stack settings" -- but a THREAD
             // must not, or two threads take their signal frames to the same
@@ -1061,10 +1070,6 @@ impl LinuxThread {
             // Pending signals are fresh (above), and so is what went with them.
             pending_info: BTreeMap::new(),
             handling_info: SigInfo::default(),
-            // A new thread reports the program's name until it sets one of
-            // its own; empty is how a reader knows to fall back to the
-            // executable's basename.
-            comm: String::new(),
         }
     }
 
@@ -2491,11 +2496,14 @@ mod clone_inheritance_tests {
     }
 
     #[test]
-    fn a_new_thread_answers_to_the_programs_name() {
-        // Empty is how a reader knows to fall back to the executable's
-        // basename, which is what a thread with no `prctl(PR_SET_NAME)` of
-        // its own reports.
-        assert!(the_creating_thread().new_thread().comm.is_empty());
+    fn a_new_thread_and_a_forked_child_are_called_what_their_creator_is() {
+        // `dup_task_struct()` copies the name with the rest of the task.
+        assert_eq!(the_creating_thread().new_thread().comm, "el-que-crea");
+        assert_eq!(the_creating_thread().forked_child().comm, "el-que-crea");
+        // A creator that never named itself passes on nothing, which reads
+        // as the executable's basename.
+        assert!(LinuxThread::initial().new_thread().comm.is_empty());
+        assert!(LinuxThread::initial().forked_child().comm.is_empty());
     }
 
     #[test]

@@ -494,6 +494,14 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
         .map(|t| t.last_cpu() as i64)
         .unwrap_or(0);
 
+    // Field 38 (exit_signal): what the parent is sent when this task dies,
+    // `SIGCHLD` unless `clone` named another. `copy_process` gives every
+    // `CLONE_THREAD` task -1, so a thread other than the leader reads -1.
+    let exit_signal = match thread {
+        Some(t) if !proc_first_thread(proc).is_some_and(|f| Arc::ptr_eq(&f, t)) => -1,
+        _ => proc.try_linux().map_or(0, |lp| lp.exit_signal() as i64),
+    };
+
     // Job-control ids (proc(5) fields 5-8): the effective pgid/sid resolve the
     // "0 = own pid" convention, tty_nr encodes the per-process VT console as
     // major 4 (TTY_MAJOR) + minor, and tpgid is the tty's foreground group.
@@ -536,6 +544,7 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
     rest[22 - 5] = starttime;
     rest[23 - 5] = vsize;
     rest[24 - 5] = rss;
+    rest[38 - 5] = exit_signal;
     rest[39 - 5] = processor;
     rest[40 - 5] = rt_priority;
     rest[41 - 5] = policy;
@@ -4485,6 +4494,24 @@ mod pid_stat_tests {
         assert_eq!(field(&line, 8), 777, "{:?}", line);
         // And the tty it names is that same VT, so the two fields agree.
         assert_eq!(field(&line, 7), (4 << 8) | 4, "{:?}", line);
+    }
+
+    /// Field 38 (`exit_signal`) is the signal the parent gets when the task
+    /// dies, and -1 on the `stat` of a thread that is not the leader. It
+    /// read 0, which is a `clone` that asked for no signal at all.
+    #[test]
+    fn field_38_is_the_signal_the_parent_gets_when_it_dies() {
+        let proc = a_process(45_361);
+        let leader = Thread::create_linux(&proc).unwrap();
+        let other = Thread::create_linux(&proc).unwrap();
+        let sigchld = crate::signal::Signal::SIGCHLD as i64;
+        assert_eq!(field(&proc_pid_stat(&proc), 38), sigchld);
+        assert_eq!(field(&proc_task_stat(&proc, Some(&leader)), 38), sigchld);
+        assert_eq!(field(&proc_task_stat(&proc, Some(&other)), 38), -1);
+        // `clone(CLONE_VM | SIGUSR1)`, say.
+        proc.linux()
+            .set_exit_signal(crate::signal::Signal::SIGUSR1 as u8);
+        assert_eq!(field(&proc_pid_stat(&proc), 38), 10);
     }
 
     #[test]

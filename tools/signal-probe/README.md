@@ -112,6 +112,11 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
     cualquier otro; una señal a uno que aun acababa de morir daba `ESRCH`, y
     un hijo recogido mientras acababa seguia contestando a `kill(pid, 0)`
     justo despues del `waitpid`.
+27. Un hilo nuevo, y un hijo de `fork`, se llamaban como el programa y no
+    como quien los creo; el campo 38 de `/proc/<pid>/stat` daba 0 en vez de
+    la señal que recibe el padre; y un padre que se enteraba del `exec` de
+    su hijo por el EOF de una tuberia close-on-exec aun podia cambiarlo de
+    grupo con `setpgid`.
 
 ## Compilar
 
@@ -165,3 +170,4 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `aslimit` | con `RLIMIT_AS` a 4 MiB por encima del `VmSize` de `/proc/self/status` (solo el blando, que vuelve al acabar): 2 MiB de `mmap` caben y 8 no (`ENOMEM`), ni un `malloc` de 16 MiB (`NULL`), ni un `brk` de 8 MiB (devuelve el de antes; uno de 64 KiB si), ni un `mremap` de 2 a 16 MiB, ni un `shmat` de 8 MiB; un `MAP_FIXED` sobre paginas ya mapeadas no suma, y lo que libera `munmap` se puede volver a mapear |
 | `nproc` | un hijo con un uid suyo (45399) y `RLIMIT_NPROC` blando a 4 bajo un duro de 6: el y tres hijos son cuatro y el siguiente `fork` da `EAGAIN`, y `pthread_create` tambien; un hijo muerto sin recoger sigue contando, y recogido deja sitio; subido el blando a 6, caben dos mas. Root, real o efectivo, hace `fork` con el limite a 0 |
 | `zombie` | un hijo muerto sin recoger, 40 veces porque cada vuelta es una carrera con su propio final: `kill` con SIGTERM y con 0 da 0, `getpgid` y `getsid` dan su grupo y su sesion, y recogido `kill(pid, 0)` da `ESRCH`. Un hermano, que no es su padre, lo encuentra igual; `/proc/<pid>/stat` dice `Z` y nuestro pid, `cmdline` esta vacio y `ls /proc` lo lista; `sigqueue` da 0; su pidfd esta listo al abrirlo, acepta una señal y `waitid(P_PIDFD)` lo recoge. Recogido, `/proc/<pid>` ya no esta y su pidfd y un `pidfd_open` nuevo dan `ESRCH` |
+| `kin` | con `PR_SET_NAME` a «jefe», un hilo nuevo y un hijo de `fork` se llaman «jefe»; el campo 38 de `/proc/self/stat` es SIGCHLD y el de `/proc/self/task/<otro hilo>/stat` es -1; y 20 veces, en cuanto el `exec` de un hijo cierra su tuberia close-on-exec, `setpgid` sobre el da `EACCES` |

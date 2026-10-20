@@ -4080,6 +4080,10 @@ impl LinuxProcess {
         type RemovedFds = Vec<(FileDesc, Arc<dyn FileLike>)>;
         let (removed, forget, exec_path): (RemovedFds, _, String) = {
             let mut inner = self.inner.lock();
+            // `begin_new_exec()` clears `PF_FORKNOEXEC` BEFORE
+            // `do_close_on_exec()`: a parent woken by the EOF of a
+            // close-on-exec pipe is refused by `setpgid`. See `has_execed`.
+            inner.has_execed = true;
             // Per-fd state is authoritative — NOT the flag inside the (possibly
             // fork-shared) `File` objects, which is only a creation-time record.
             let close_fds = inner.cloexec_fds.drain().collect::<Vec<_>>();
@@ -4510,11 +4514,6 @@ impl LinuxProcessInner {
         // detach of a segment the process no longer has punches a hole in the
         // new program. The detach itself is the table's drop.
         let old_attachments = core::mem::take(&mut self.shm_identifiers);
-
-        // `begin_new_exec()`: `me->flags &= ~PF_FORKNOEXEC`. From here on the
-        // process runs an image of its own choosing, and a `setpgid` from the
-        // parent must be refused with `EACCES`. See `has_execed`.
-        self.has_execed = true;
 
         // `begin_new_exec()`: `if (bprm->secureexec) me->pdeath_signal = 0;`
         // The parent picked this signal while the child was still running
