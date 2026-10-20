@@ -17,6 +17,31 @@ use linux_object::fs::ioctl::{
 use linux_object::{process::FsInfo, thread::ThreadExt, time::TimeSpec};
 use rcore_fs::vfs::INode;
 
+/// POSIX record locks, classic and open-file-description flavours, as
+/// `fcntl(2)` numbers them.
+///
+/// They are at module level, and not inside `sys_fcntl` where they were
+/// declared, because this is where it is decided whether a lock command
+/// waits -- `F_SETLKW` and `F_OFD_SETLKW` do -- and `restart` has to report
+/// on exactly that set. A constant in a method body cannot be named from
+/// anywhere, so `restart` had its own copy of 38, free to be renumbered on
+/// its own while this one went on deciding: the call that really waits would
+/// then come back `EINTR` with `SA_RESTART` installed, which is the one
+/// thing that file exists to prevent.
+pub(crate) const F_GETLK: usize = 5;
+/// `F_SETLK`: take a classic lock or fail; it answers `EAGAIN` and never
+/// waits.
+pub(crate) const F_SETLK: usize = 6;
+/// `F_SETLKW`: take a classic lock, waiting for it. Cut short, it is
+/// `-ERESTARTSYS`.
+pub(crate) const F_SETLKW: usize = 7;
+/// `F_OFD_GETLK`: ask about an open-file-description lock.
+pub(crate) const F_OFD_GETLK: usize = 36;
+/// `F_OFD_SETLK`: take one or fail, as `F_SETLK` does.
+pub(crate) const F_OFD_SETLK: usize = 37;
+/// `F_OFD_SETLKW`: take one, waiting for it, as `F_SETLKW` does.
+pub(crate) const F_OFD_SETLKW: usize = 38;
+
 /// Land one entry in the calling process's DRM ioctl trail for a call this
 /// layer answered itself.
 ///
@@ -2519,13 +2544,6 @@ impl Syscall<'_> {
         const F_GET_SEALS: usize = 1034;
         const F_SETPIPE_SZ: usize = 1031;
         const F_GETPIPE_SZ: usize = 1032;
-        // POSIX record locks, classic and open-file-description flavours.
-        const F_GETLK: usize = 5;
-        const F_SETLK: usize = 6;
-        const F_SETLKW: usize = 7;
-        const F_OFD_GETLK: usize = 36;
-        const F_OFD_SETLK: usize = 37;
-        const F_OFD_SETLKW: usize = 38;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
         if cmd == F_ADD_SEALS || cmd == F_GET_SEALS {

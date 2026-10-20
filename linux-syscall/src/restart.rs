@@ -40,13 +40,14 @@
 //! arguments still say the same thing the second time.
 
 use super::Sys;
+/// The `fcntl` commands that wait for a lock: the only ones that can be cut
+/// short, and `-ERESTARTSYS` when they are (`fcntl_setlk`).
+///
+/// From `sys_fcntl`, which is what decides whether the command waits, so
+/// that there is one number and not two that can drift.
+use crate::file::{F_OFD_SETLKW, F_SETLKW};
 use core::convert::TryFrom;
 use linux_object::time::TIMER_ABSTIME;
-
-/// `fcntl` commands that wait for a lock: the only ones that can be cut
-/// short, and `-ERESTARTSYS` when they are (`fcntl_setlk`).
-const F_SETLKW: usize = 7;
-const F_OFD_SETLKW: usize = 38;
 
 /// Whether syscall `num`, called with `args`, is made again when the handler
 /// of the signal that cut it short has `SA_RESTART`.
@@ -277,6 +278,13 @@ mod tests {
         // F_SETLK and F_OFD_SETLK, which answer EAGAIN instead of waiting.
         assert!(!fcntl(6));
         assert!(!fcntl(37));
+        // And the two commands as their numbers, not as the constants: those
+        // now come from `sys_fcntl`, which is what decides whether the call
+        // waits, and asking with them would only say the two files agree.
+        // This is what pins the numbers themselves.
+        assert!(fcntl(7), "F_SETLKW is 7 and it waits");
+        assert!(fcntl(38), "F_OFD_SETLKW is 38 and it waits");
+        assert!(!fcntl(36), "F_OFD_GETLK is 36 and it does not wait");
     }
 
     #[test]

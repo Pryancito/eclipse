@@ -13,6 +13,9 @@ pub(crate) use fd::{anon_fd_flags, open_flags, ANON_CLOEXEC, ANON_NONBLOCK};
 #[allow(clippy::module_inception)]
 mod file;
 pub(crate) use file::{after_write_error, sigpipe_due, writes_a_file, AfterWriteError};
+/// Shared with `restart`, which reports on the two lock commands that wait:
+/// `sys_fcntl` is what decides it, so the numbers live there and not twice.
+pub(crate) use file::{F_OFD_SETLKW, F_SETLKW};
 mod mount;
 #[cfg(target_arch = "x86_64")]
 mod nvidia;
