@@ -165,14 +165,15 @@ mod the_one_process_a_pid_names {
         assert_eq!(get_process_sid(proc.id()), Ok(94_160));
     }
 
-    /// Asked from INSIDE the death, which is the only moment the filter can
-    /// be seen: the process is still in its job, so the lookup succeeds and
-    /// the status is the only thing saying it is gone. After the exit returns
-    /// the lookup fails on its own and the filter is doing nothing.
+    /// Asked from INSIDE the death, while the process is still in its job.
+    /// Nobody has reaped it, so it is a zombie, and a zombie keeps its group
+    /// and its session until it is (`find_task_by_vpid` finds it): this said
+    /// `ESRCH`, from the status alone.
     #[test]
-    fn an_exited_process_is_esrch_while_it_is_still_in_its_job() {
+    fn an_exited_process_answers_while_nobody_has_reaped_it() {
         let proc = a_process_in(&ROOT_JOB, 94_170);
         let pid = proc.id();
+        proc.linux().set_pgid_raw(94_171);
         let seen: Arc<spin::Mutex<Option<(LxResult<KoID>, LxResult<KoID>)>>> =
             Arc::new(spin::Mutex::new(None));
         let writer = seen.clone();
@@ -185,7 +186,7 @@ mod the_one_process_a_pid_names {
         proc.exit(0);
         assert_eq!(
             *seen.lock(),
-            Some((Err(LxError::ESRCH), Err(LxError::ESRCH))),
+            Some((Ok(94_171), Ok(94_170))),
             "still in the job, already gone"
         );
     }

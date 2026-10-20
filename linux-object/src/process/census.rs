@@ -23,31 +23,57 @@ pub fn live_effective_pgids() -> Vec<KoID> {
     all_live_processes().iter().map(effective_pgid).collect()
 }
 
-/// One live process by pid, which is what a syscall that takes a pid wants.
-///
-/// The census is the wrong tool for this and was what both callers used: it
-/// clones an `Arc` and reads a status for every process on the machine to
-/// then throw all but one away. The job tree can be asked directly.
-///
-/// The `Exited` filter is kept deliberately, so this answers exactly what
-/// the census walk answered: a process that has exited is gone as far as
-/// `getpgid`/`getsid` are concerned.
-fn find_live_process(pid: KoID) -> LxResult<Arc<Process>> {
-    let proc = find_process(pid).ok_or(LxError::ESRCH)?;
-    if matches!(proc.status(), Status::Exited(_)) {
-        return Err(LxError::ESRCH);
-    }
-    Ok(proc)
-}
-
-/// `getpgid`: the effective process-group id of process `pid`.
+/// `getpgid`: the effective process-group id of process `pid`, a zombie's
+/// included -- it keeps the group it died in until it is reaped.
 pub fn get_process_pgid(pid: KoID) -> LxResult<KoID> {
-    Ok(effective_pgid(&find_live_process(pid)?))
+    Ok(effective_pgid(&find_task(pid).ok_or(LxError::ESRCH)?))
 }
 
-/// `getsid`: the effective session id of process `pid`.
+/// `getsid`: the effective session id of process `pid`, as [`get_process_pgid`].
 pub fn get_process_sid(pid: KoID) -> LxResult<KoID> {
-    Ok(effective_sid(&find_live_process(pid)?))
+    Ok(effective_sid(&find_task(pid).ok_or(LxError::ESRCH)?))
+}
+
+/// The process `pid` names as Linux's pid table answers: one that is alive,
+/// or a zombie nobody has reaped yet (`find_task_by_vpid()`).
+///
+/// A zombie answered `ESRCH` to everybody but its parent's `kill`: it leaves
+/// the job when its last thread is gone, so `getpgid`, `getsid`,
+/// `pidfd_open` and `/proc/<pid>` could not find it, and `ps` never showed a
+/// `<defunct>`. Such a zombie is where its reaper keeps it. And the other
+/// way round, a process a `wait*` has already collected can still be in the
+/// job finishing its teardown; its pid names nothing, as after Linux's
+/// `release_task()`, and `kill(pid, 0)` right after the `waitpid` said it
+/// was there.
+pub fn find_task(pid: KoID) -> Option<Arc<Process>> {
+    find_task_in(&ROOT_JOB, pid)
+}
+
+/// [`find_task`] over one job's subtree, for the tests.
+pub fn find_task_in(job: &Arc<Job>, pid: KoID) -> Option<Arc<Process>> {
+    let found = job.find_process(pid).or_else(|| {
+        all_live_processes_in(job)
+            .iter()
+            .find_map(|parent| parent.try_linux()?.dead_child(pid))
+    })?;
+    let reaped = found.try_linux().is_some_and(|linux| linux.is_reaped());
+    (!reaped).then_some(found)
+}
+
+/// The zombies nobody has reaped yet, in or out of the job: the processes
+/// `/proc` lists besides the live ones.
+pub fn unreaped_zombies() -> Vec<Arc<Process>> {
+    unreaped_zombies_in(&ROOT_JOB)
+}
+
+/// [`unreaped_zombies`] over one job's subtree, for the tests.
+pub fn unreaped_zombies_in(job: &Arc<Job>) -> Vec<Arc<Process>> {
+    all_live_processes_in(job)
+        .iter()
+        .filter_map(|parent| parent.try_linux().map(|linux| linux.dead_children()))
+        .flatten()
+        .filter(|zombie| zombie.try_linux().is_none_or(|linux| !linux.is_reaped()))
+        .collect()
 }
 
 /// The live process thread `tid` belongs to.
@@ -187,6 +213,39 @@ impl LinuxProcess {
         Ok(())
     }
 
+    /// The dead child `pid` names, as long as this process keeps it: on file
+    /// as a zombie, or exited and not on file yet. Only asked about a pid the
+    /// job no longer has, so a child found in the live table is a dead one.
+    fn dead_child(&self, pid: KoID) -> Option<Arc<Process>> {
+        let inner = self.inner.lock();
+        match inner.reaped_children.get(&pid) {
+            Some(zombie) => zombie._wears_pid.clone(),
+            None => inner.children.get(&pid).cloned(),
+        }
+    }
+
+    /// Every dead child this process keeps, as [`Self::dead_child`]. The
+    /// status of a live-table one is read after the lock is let go.
+    fn dead_children(&self) -> Vec<Arc<Process>> {
+        let (mut zombies, children): (Vec<_>, Vec<_>) = {
+            let inner = self.inner.lock();
+            (
+                inner
+                    .reaped_children
+                    .values()
+                    .filter_map(|zombie| zombie._wears_pid.clone())
+                    .collect(),
+                inner.children.values().cloned().collect(),
+            )
+        };
+        zombies.extend(
+            children
+                .into_iter()
+                .filter(|child| matches!(child.status(), Status::Exited(_))),
+        );
+        zombies
+    }
+
     /// The children of this process that are zombies of user `uid`.
     ///
     /// The zombies are taken out under the lock and asked their uid after it
@@ -208,3 +267,6 @@ impl LinuxProcess {
 
 #[cfg(test)]
 mod nproc_tests;
+
+#[cfg(test)]
+mod zombie_lookup_tests;

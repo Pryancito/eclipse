@@ -7,7 +7,7 @@ use linux_object::fs::{OpenFlags, PidFd, PIDFD_THREAD};
 use linux_object::process::LinuxProcess;
 use linux_object::signal::{SigInfo, Signal};
 use zircon_object::object::{KernelObject, KoID};
-use zircon_object::task::{Status, ROOT_JOB};
+use zircon_object::task::Status;
 
 /// Reduce `pidfd_open(2)`'s flag word to the open flags the new fd carries.
 ///
@@ -90,7 +90,9 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         let open_flags = pidfd_open_flags(flags)?;
-        let process = ROOT_JOB.find_process(pid as KoID).ok_or(LxError::ESRCH)?;
+        // A zombie too: its pidfd is readable at once, and `waitid(P_PIDFD)`
+        // collects it.
+        let process = linux_object::process::find_task(pid as KoID).ok_or(LxError::ESRCH)?;
         let pidfd = PidFd::new(process, open_flags);
         let fd = self.linux_process().add_file(pidfd)?;
         Ok(fd.into())
@@ -120,7 +122,9 @@ impl Syscall<'_> {
         let signal = Signal::from_syscall_arg(signum)?;
         let pidfd = PidFd::from_file_like(self.linux_process().get_file_like(pidfd)?)?;
         let target = pidfd.target().clone();
-        if matches!(target.status(), Status::Exited(_)) {
+        // Until it is reaped, a dead process is a zombie that takes nothing
+        // and answers 0, as through `kill(2)`; reaped, the pid is gone.
+        if target.try_linux().is_some_and(|linux| linux.is_reaped()) {
             return Err(LxError::ESRCH);
         }
         let user = if info.is_null() {

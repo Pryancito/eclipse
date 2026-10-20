@@ -77,6 +77,15 @@
 //   * ITIMER_VIRTUAL and ITIMER_PROF counted wall-clock time, so they went
 //     off in a process asleep, and RLIMIT_CPU sent neither SIGXCPU nor
 //     SIGKILL: `ulimit -t` let a runaway loop run for ever.
+//   * a zombie was not a pid to anybody but its parent once its last thread
+//     was gone (no `getpgid`, no `pidfd_open`, no `/proc/<pid>`, so `ps`
+//     never showed a `<defunct>`), a signal to one still finishing its
+//     teardown was ESRCH, and a child reaped while it finished was still
+//     found by `kill(pid, 0)` right after the `waitpid`.
+//   * a new thread, and a forked child, were called by the program's name
+//     instead of their creator's; field 38 of /proc/<pid>/stat read 0
+//     instead of the signal the parent gets; and a parent woken by the EOF
+//     of its child's close-on-exec pipe could still move it to a group.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -162,6 +171,15 @@
 //              children and then EAGAIN, for `fork` and `pthread_create`
 //              alike; a zombie counts until it is reaped; root, real or
 //              effective, forks at a limit of 0.
+//   zombie     a dead child is a pid until it is reaped, for whoever asks:
+//              kill and sigqueue answer 0, getpgid and getsid its group and
+//              session, pidfd_open a pidfd that is ready, /proc/<pid> a `Z`
+//              and an empty cmdline. Reaped, every one of them is ESRCH or
+//              gone, however soon after the `waitpid`.
+//   kin        a new thread and a forked child carry their creator's name;
+//              stat field 38 is SIGCHLD, and -1 for a thread that is not
+//              the leader; a child whose exec closed its close-on-exec
+//              pipe is EACCES to its parent's setpgid, 20 times out of 20.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -172,6 +190,7 @@
 // Eclipse is a bug in Eclipse.
 
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -2619,6 +2638,243 @@ static void sec_nproc(void) {
     }
 }
 
+// ----------------------------------------------------------------- zombie
+
+// A dead child is a pid until somebody reaps it, and nothing after: kill,
+// sigqueue, getpgid, getsid, pidfd_open and /proc/<pid> all find a zombie,
+// whoever asks, and none of them finds a reaped one. Every round is a race
+// against the child's own teardown, which goes on after its exit status is
+// on file and after it is reaped, so the round is made many times.
+
+#ifndef P_PIDFD
+#define P_PIDFD 3
+#endif
+
+#define ZOMBIE_ROUNDS 40
+
+// A child that has exited, and that nobody has reaped yet.
+static pid_t zombie_child(void) {
+    pid_t c = fork();
+    if (c == 0) _exit(0);
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    while (waitid(P_PID, (id_t)c, &si, WEXITED | WNOWAIT) == -1 && errno == EINTR) {
+    }
+    return c;
+}
+
+// Fields 3 and 4 of /proc/<pid>/stat, as "Z 123"; empty when there is none.
+static void stat_state_and_ppid(pid_t pid, char *out, size_t len) {
+    char path[64], buf[512];
+    out[0] = 0;
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = 0;
+    char *p = strrchr(buf, ')');
+    char state;
+    int ppid;
+    if (p && sscanf(p + 2, "%c %d", &state, &ppid) == 2) snprintf(out, len, "%c %d", state, ppid);
+}
+
+static long cmdline_bytes(pid_t pid) {
+    char path[64], buf[256];
+    snprintf(path, sizeof path, "/proc/%d/cmdline", (int)pid);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    long n = (long)read(fd, buf, sizeof buf);
+    close(fd);
+    return n;
+}
+
+static int proc_lists(pid_t pid) {
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    int found = 0;
+    struct dirent *e;
+    while (!found && (e = readdir(d)) != NULL) found = atoi(e->d_name) == pid;
+    closedir(d);
+    return found;
+}
+
+static void sec_zombie(void) {
+    int term = 0, zero = 0, pgid = 0, sid = 0, reaped = 0;
+    for (int i = 0; i < ZOMBIE_ROUNDS; i++) {
+        pid_t c = zombie_child();
+        term += kill(c, SIGTERM) != 0;
+        zero += kill(c, 0) != 0;
+        pgid += getpgid(c) != getpgrp();
+        sid += getsid(c) != getsid(0);
+        waitpid(c, NULL, 0);
+        reaped += !(kill(c, 0) == -1 && errno == ESRCH);
+    }
+    check(term == 0, "kill(zombie, SIGTERM) is 0", "%d of %d ESRCH", term, ZOMBIE_ROUNDS);
+    check(zero == 0, "kill(zombie, 0) is 0", "%d of %d ESRCH", zero, ZOMBIE_ROUNDS);
+    check(pgid == 0, "getpgid of a zombie: its group", "%d of %d not", pgid, ZOMBIE_ROUNDS);
+    check(sid == 0, "getsid of a zombie: its session", "%d of %d not", sid, ZOMBIE_ROUNDS);
+    check(reaped == 0, "reaped, kill(pid, 0) is ESRCH", "%d of %d still there", reaped,
+          ZOMBIE_ROUNDS);
+
+    // Somebody else's: a sibling asks, which is not the zombie's parent.
+    pid_t z = zombie_child();
+    pid_t k = fork();
+    if (k == 0) _exit((kill(z, SIGTERM) != 0) | (kill(z, 0) != 0) << 1 | (getpgid(z) < 0) << 2);
+    int st = 0;
+    waitpid(k, &st, 0);
+    check(WIFEXITED(st) && WEXITSTATUS(st) == 0, "a sibling finds the zombie too",
+          "kill(SIGTERM) %s, kill(0) %s, getpgid %s",
+          WEXITSTATUS(st) & 1 ? "ESRCH" : "0", WEXITSTATUS(st) & 2 ? "ESRCH" : "0",
+          WEXITSTATUS(st) & 4 ? "ESRCH" : "ok");
+
+    char got[32], want[32];
+    stat_state_and_ppid(z, got, sizeof got);
+    snprintf(want, sizeof want, "Z %d", (int)getpid());
+    check(strcmp(got, want) == 0, "/proc/<zombie>/stat: Z, and us", "'%s'", got);
+    long len = cmdline_bytes(z);
+    check(len == 0, "/proc/<zombie>/cmdline is empty", "%ld bytes", len);
+    check(proc_lists(z), "`ls /proc` lists the zombie", "%s", proc_lists(z) ? "listed" : "not");
+
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.si_signo = SIGUSR1;
+    si.si_code = SI_QUEUE;
+    si.si_pid = getpid();
+    si.si_uid = getuid();
+    long r = syscall(SYS_rt_sigqueueinfo, z, SIGUSR1, &si);
+    check(r == 0, "sigqueue to a zombie is 0", "%s", r == 0 ? "0" : strerror(errno));
+
+    int fd = (int)syscall(SYS_pidfd_open, z, 0);
+    struct pollfd pf = {fd, POLLIN, 0};
+    int ready = fd >= 0 ? poll(&pf, 1, 0) : -1;
+    long sent = fd >= 0 ? syscall(SYS_pidfd_send_signal, fd, SIGTERM, NULL, 0) : -1;
+    check(fd >= 0 && ready == 1 && sent == 0, "pidfd of a zombie: ready, signalled",
+          "pidfd_open %s, poll %d, send %ld", fd >= 0 ? "ok" : strerror(errno), ready, sent);
+
+    memset(&si, 0, sizeof si);
+    int w = fd >= 0 ? waitid(P_PIDFD, (id_t)fd, &si, WEXITED) : waitid(P_PID, (id_t)z, &si, WEXITED);
+    check(w == 0 && si.si_pid == z, "reaped", "waitid %d, si_pid %d", w, (int)si.si_pid);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d", (int)z);
+    struct stat sb;
+    int there = stat(path, &sb) == 0;
+    int listed = proc_lists(z);
+    check(!there && !listed, "reaped, /proc/<pid> is gone", "%s",
+          there ? "still there" : listed ? "still listed" : "gone");
+    if (fd >= 0) {
+        sent = syscall(SYS_pidfd_send_signal, fd, 0, NULL, 0);
+        check(sent == -1 && errno == ESRCH, "reaped, its pidfd says ESRCH", "%ld", sent);
+        close(fd);
+    }
+    int again = (int)syscall(SYS_pidfd_open, z, 0);
+    check(again == -1 && errno == ESRCH, "reaped, pidfd_open is ESRCH", "%d", again);
+}
+
+// -------------------------------------------------------------------- kin
+
+static char g_kin_name[16];
+static volatile pid_t g_kin_tid;
+static volatile int g_kin_go;
+
+static void *kin_reports_name(void *arg) {
+    (void)arg;
+    prctl(PR_GET_NAME, g_kin_name);
+    return NULL;
+}
+
+static void *kin_waits(void *arg) {
+    (void)arg;
+    g_kin_tid = (pid_t)syscall(SYS_gettid);
+    while (!g_kin_go) sleep_ms(1);
+    return NULL;
+}
+
+// Field `n` of a stat file, as proc(5) numbers them; -999 when unreadable.
+static long stat_field(const char *path, int n) {
+    char buf[1024];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -999;
+    ssize_t len = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (len <= 0) return -999;
+    buf[len] = 0;
+    char *p = strrchr(buf, ')');
+    for (int i = 3; p && i <= n; i++) {
+        p = strchr(p, ' ');
+        if (p) p++;
+    }
+    return p ? strtol(p, NULL, 10) : -999;
+}
+
+#define KIN_EXECS 20
+
+static void sec_kin(void) {
+    char old[16] = {0};
+    prctl(PR_GET_NAME, old);
+    prctl(PR_SET_NAME, "jefe");
+    pthread_t t;
+    pthread_create(&t, NULL, kin_reports_name, NULL);
+    pthread_join(t, NULL);
+    check(strcmp(g_kin_name, "jefe") == 0, "a new thread is named as its creator", "'%s'",
+          g_kin_name);
+    pid_t c = fork();
+    if (c == 0) {
+        char name[16] = {0};
+        prctl(PR_GET_NAME, name);
+        _exit(strcmp(name, "jefe") != 0);
+    }
+    int st = 0;
+    waitpid(c, &st, 0);
+    check(WIFEXITED(st) && WEXITSTATUS(st) == 0, "a forked child is named as its parent",
+          "status %#x", st);
+    prctl(PR_SET_NAME, old);
+
+    long ours = stat_field("/proc/self/stat", 38);
+    check(ours == SIGCHLD, "stat field 38 is SIGCHLD", "%ld", ours);
+    pthread_create(&t, NULL, kin_waits, NULL);
+    while (!g_kin_tid) sleep_ms(1);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d/stat", (int)g_kin_tid);
+    long theirs = stat_field(path, 38);
+    g_kin_go = 1;
+    pthread_join(t, NULL);
+    check(theirs == -1, "a thread's stat field 38 is -1", "%ld", theirs);
+
+    // The EOF of a close-on-exec pipe is how `posix_spawn` and Rust's
+    // `Command` learn the exec happened; Linux clears PF_FORKNOEXEC before
+    // it closes those descriptors.
+    int refused = 0, failed = 0;
+    for (int i = 0; i < KIN_EXECS; i++) {
+        int p[2];
+        if (pipe2(p, O_CLOEXEC)) {
+            check(0, "pipe2", "%s", strerror(errno));
+            return;
+        }
+        c = fork();
+        if (c == 0) {
+            char *args[] = {"sleep", "5", NULL};
+            execv("/bin/sleep", args);
+            _exit(127);
+        }
+        close(p[1]);
+        char b;
+        ssize_t n = read(p[0], &b, 1);
+        close(p[0]);
+        int r = setpgid(c, c);
+        int e = errno;
+        kill(c, SIGKILL);
+        waitpid(c, &st, 0);
+        if (n != 0 || (WIFEXITED(st) && WEXITSTATUS(st) == 127))
+            failed++;
+        else if (r == -1 && e == EACCES)
+            refused++;
+    }
+    check(refused == KIN_EXECS, "setpgid on a child past its exec: EACCES",
+          "%d of %d refused, %d did not exec", refused, KIN_EXECS, failed);
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -2647,6 +2903,8 @@ static const struct {
     {"cpuclock", "a timer_create timer on a CPU clock counts that clock", sec_cpuclock},
     {"aslimit", "RLIMIT_AS holds mmap, brk, mremap and shmat", sec_aslimit},
     {"nproc", "RLIMIT_NPROC holds fork and pthread_create", sec_nproc},
+    {"zombie", "a dead child is a pid until it is reaped, and not after", sec_zombie},
+    {"kin", "what a new thread or child is named, and when its parent lets go", sec_kin},
 };
 
 int main(int argc, char **argv) {

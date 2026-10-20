@@ -16,6 +16,8 @@ use crate::process::ProcessExt;
 
 /// `/proc/present`, in its own file: `procfs.rs` sits on the size ratchet.
 mod present;
+#[cfg(test)]
+mod zombie_tests;
 use present::proc_present_content;
 use smoltcp::wire::{IpAddress, IpCidr};
 
@@ -100,6 +102,14 @@ fn all_processes() -> Vec<Arc<Process>> {
     let mut out = Vec::new();
     collect_processes(&ROOT_JOB, &mut out);
     out
+}
+
+/// The processes `/proc` has a directory for: the live ones and the zombies
+/// nobody has reaped, which `ps` shows as `<defunct>` and which had none.
+fn pid_dir_processes() -> Vec<Arc<Process>> {
+    let mut procs = all_processes();
+    procs.extend(crate::process::unreaped_zombies());
+    procs
 }
 
 fn current_process_id() -> Option<u64> {
@@ -484,6 +494,14 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
         .map(|t| t.last_cpu() as i64)
         .unwrap_or(0);
 
+    // Field 38 (exit_signal): what the parent is sent when this task dies,
+    // `SIGCHLD` unless `clone` named another. `copy_process` gives every
+    // `CLONE_THREAD` task -1, so a thread other than the leader reads -1.
+    let exit_signal = match thread {
+        Some(t) if !proc_first_thread(proc).is_some_and(|f| Arc::ptr_eq(&f, t)) => -1,
+        _ => proc.try_linux().map_or(0, |lp| lp.exit_signal() as i64),
+    };
+
     // Job-control ids (proc(5) fields 5-8): the effective pgid/sid resolve the
     // "0 = own pid" convention, tty_nr encodes the per-process VT console as
     // major 4 (TTY_MAJOR) + minor, and tpgid is the tty's foreground group.
@@ -526,6 +544,7 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
     rest[22 - 5] = starttime;
     rest[23 - 5] = vsize;
     rest[24 - 5] = rss;
+    rest[38 - 5] = exit_signal;
     rest[39 - 5] = processor;
     rest[40 - 5] = rt_priority;
     rest[41 - 5] = policy;
@@ -658,6 +677,12 @@ fn proc_pid_statm(proc: &Process) -> String {
 }
 
 fn proc_pid_cmdline(proc: &Process) -> Vec<u8> {
+    // A zombie has no memory left to read its arguments from
+    // (`get_mm_cmdline` finds no `mm`), and the empty file is what makes `ps`
+    // print it as `[name] <defunct>`.
+    if let Status::Exited(_) = proc.status() {
+        return Vec::new();
+    }
     let lp = match proc.try_linux() {
         Some(lp) => lp,
         None => return Vec::new(),
@@ -721,7 +746,7 @@ impl ProcRootINode {
             i if i - 2 < PROC_ROOT_STATIC.len() => Ok(PROC_ROOT_STATIC[i - 2].into()),
             i => {
                 let idx = i - 2 - PROC_ROOT_STATIC.len();
-                let procs = all_processes();
+                let procs = pid_dir_processes();
                 if idx >= procs.len() {
                     return Err(FsError::EntryNotFound);
                 }
@@ -753,7 +778,7 @@ impl INode for ProcRootINode {
         // `net`, `sysvipc`, `sys` and `perf`, plus a `/proc/<pid>` per live
         // process -- which is why Linux's `/proc` nlink moves as processes come
         // and go (`proc_root_getattr`: `nlink + nr_processes()`).
-        Ok(dir_metadata(10, 4 + all_processes().len()))
+        Ok(dir_metadata(10, 4 + pid_dir_processes().len()))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -826,7 +851,7 @@ impl INode for ProcRootINode {
             "self" => Ok(PROC_SELF_SYM.clone()),
             name => {
                 if let Ok(pid) = name.parse::<u64>() {
-                    if ROOT_JOB.find_process(pid as _).is_some() {
+                    if crate::process::find_task(pid as _).is_some() {
                         return Ok(Arc::new(ProcPidDirINode { pid }));
                     }
                 }
@@ -896,7 +921,7 @@ pub(crate) fn pid_dir_inode(pid: u64) -> Arc<dyn INode> {
 
 impl ProcPidDirINode {
     fn process(&self) -> Option<Arc<Process>> {
-        ROOT_JOB.find_process(self.pid as _)
+        crate::process::find_task(self.pid as _)
     }
 
     /// `EACCES` unless the caller may read this process's innards.
@@ -1082,7 +1107,7 @@ struct ProcPidTaskDirINode {
 
 impl ProcPidTaskDirINode {
     fn process(&self) -> Option<Arc<Process>> {
-        ROOT_JOB.find_process(self.pid as _)
+        crate::process::find_task(self.pid as _)
     }
 
     fn tids(&self) -> Vec<u64> {
@@ -2540,9 +2565,7 @@ struct ProcPidFileINode {
 
 impl ProcPidFileINode {
     fn bytes(&self) -> Result<Vec<u8>> {
-        let proc = ROOT_JOB
-            .find_process(self.pid as _)
-            .ok_or(FsError::EntryNotFound)?;
+        let proc = crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
         Ok(match self.kind {
             ProcPidFileKind::Stat => proc_pid_stat(&proc).into_bytes(),
             ProcPidFileKind::Cmdline => proc_pid_cmdline(&proc),
@@ -4471,6 +4494,24 @@ mod pid_stat_tests {
         assert_eq!(field(&line, 8), 777, "{:?}", line);
         // And the tty it names is that same VT, so the two fields agree.
         assert_eq!(field(&line, 7), (4 << 8) | 4, "{:?}", line);
+    }
+
+    /// Field 38 (`exit_signal`) is the signal the parent gets when the task
+    /// dies, and -1 on the `stat` of a thread that is not the leader. It
+    /// read 0, which is a `clone` that asked for no signal at all.
+    #[test]
+    fn field_38_is_the_signal_the_parent_gets_when_it_dies() {
+        let proc = a_process(45_361);
+        let leader = Thread::create_linux(&proc).unwrap();
+        let other = Thread::create_linux(&proc).unwrap();
+        let sigchld = crate::signal::Signal::SIGCHLD as i64;
+        assert_eq!(field(&proc_pid_stat(&proc), 38), sigchld);
+        assert_eq!(field(&proc_task_stat(&proc, Some(&leader)), 38), sigchld);
+        assert_eq!(field(&proc_task_stat(&proc, Some(&other)), 38), -1);
+        // `clone(CLONE_VM | SIGUSR1)`, say.
+        proc.linux()
+            .set_exit_signal(crate::signal::Signal::SIGUSR1 as u8);
+        assert_eq!(field(&proc_pid_stat(&proc), 38), 10);
     }
 
     #[test]

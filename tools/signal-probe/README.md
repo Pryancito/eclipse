@@ -106,6 +106,17 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
 25. `RLIMIT_NPROC` se guardaba y no lo miraba nadie: con `ulimit -u`,
     `fork`, `vfork` y `pthread_create` de un usuario seguian saliendo por
     encima del limite.
+26. Un zombi solo era un pid para su padre en cuanto su ultimo hilo se
+    habia ido: `getpgid`, `getsid`, `pidfd_open` y `/proc/<pid>` daban
+    `ESRCH` (`ps` no enseñaba nunca un `<defunct>`), igual que un `kill` de
+    cualquier otro; una señal a uno que aun acababa de morir daba `ESRCH`, y
+    un hijo recogido mientras acababa seguia contestando a `kill(pid, 0)`
+    justo despues del `waitpid`.
+27. Un hilo nuevo, y un hijo de `fork`, se llamaban como el programa y no
+    como quien los creo; el campo 38 de `/proc/<pid>/stat` daba 0 en vez de
+    la señal que recibe el padre; y un padre que se enteraba del `exec` de
+    su hijo por el EOF de una tuberia close-on-exec aun podia cambiarlo de
+    grupo con `setpgid`.
 
 ## Compilar
 
@@ -158,3 +169,5 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `cpuclock` | un temporizador de `timer_create` de 100 ms sobre un reloj de CPU se mueve solo lo que gasta el dueño de ese reloj (lo que dice `getrusage`, con 10 ms de margen: bajo un emulador la primera vuelta cobra decenas de ms de sistema, y la linea da el reparto usuario/sistema) y salta a sus 100 ms con `SI_TIMER` y su valor: el del proceso, que no se mueve mientras duerme 300 ms; el del propio hilo, que no se mueve con 300 ms de trabajo de otro hilo; el de otro hilo (`pthread_getcpuclockid`) y el de un hijo (`clock_getcpuclockid`), cuya señal llega al padre, ninguna mientras el hijo duerme. Con intervalo de 20 ms salta entre 8 y 20 veces en 300 ms de CPU; con `TIMER_ABSTIME` y una lectura ya pasada salta antes de que `timer_settime` vuelva; y un reloj dinamico da `EOPNOTSUPP` |
 | `aslimit` | con `RLIMIT_AS` a 4 MiB por encima del `VmSize` de `/proc/self/status` (solo el blando, que vuelve al acabar): 2 MiB de `mmap` caben y 8 no (`ENOMEM`), ni un `malloc` de 16 MiB (`NULL`), ni un `brk` de 8 MiB (devuelve el de antes; uno de 64 KiB si), ni un `mremap` de 2 a 16 MiB, ni un `shmat` de 8 MiB; un `MAP_FIXED` sobre paginas ya mapeadas no suma, y lo que libera `munmap` se puede volver a mapear |
 | `nproc` | un hijo con un uid suyo (45399) y `RLIMIT_NPROC` blando a 4 bajo un duro de 6: el y tres hijos son cuatro y el siguiente `fork` da `EAGAIN`, y `pthread_create` tambien; un hijo muerto sin recoger sigue contando, y recogido deja sitio; subido el blando a 6, caben dos mas. Root, real o efectivo, hace `fork` con el limite a 0 |
+| `zombie` | un hijo muerto sin recoger, 40 veces porque cada vuelta es una carrera con su propio final: `kill` con SIGTERM y con 0 da 0, `getpgid` y `getsid` dan su grupo y su sesion, y recogido `kill(pid, 0)` da `ESRCH`. Un hermano, que no es su padre, lo encuentra igual; `/proc/<pid>/stat` dice `Z` y nuestro pid, `cmdline` esta vacio y `ls /proc` lo lista; `sigqueue` da 0; su pidfd esta listo al abrirlo, acepta una señal y `waitid(P_PIDFD)` lo recoge. Recogido, `/proc/<pid>` ya no esta y su pidfd y un `pidfd_open` nuevo dan `ESRCH` |
+| `kin` | con `PR_SET_NAME` a «jefe», un hilo nuevo y un hijo de `fork` se llaman «jefe»; el campo 38 de `/proc/self/stat` es SIGCHLD y el de `/proc/self/task/<otro hilo>/stat` es -1; y 20 veces, en cuanto el `exec` de un hijo cierra su tuberia close-on-exec, `setpgid` sobre el da `EACCES` |
