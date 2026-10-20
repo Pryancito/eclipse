@@ -161,6 +161,23 @@ pub fn wake_net_rx_waiters() {
     }
 }
 
+/// [`wake_net_rx_waiters`] without the rate limit, for a wake that answers a
+/// delivery the caller has just made itself rather than a NIC interrupt.
+///
+/// The loopback is that case: the bytes a `write` to 127.0.0.1 hands its peer
+/// are in the peer's buffer before the `write` returns, and a ping-pong over
+/// it wakes the other side every few microseconds. Under the 250 us limit
+/// every one of those wakes after the first was dropped, so each hop waited
+/// out the reader's 1 ms park instead -- a loopback round trip of ~1.2 ms
+/// against ~12 us on Linux. A storm cannot come of it: each call answers one
+/// `iface.poll` that moved a packet.
+pub fn wake_net_rx_waiters_now() {
+    let wakers: Vec<Waker> = core::mem::take(&mut *NET_RX_WAKERS.lock());
+    for w in wakers {
+        w.wake();
+    }
+}
+
 /// Shared waker slot for a parked net-RX timeout timer.
 ///
 /// `timer_set` has no cancel API: Drop / Ready `take()` the waker so a late
