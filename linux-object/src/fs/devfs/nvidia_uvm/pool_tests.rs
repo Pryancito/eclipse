@@ -1,5 +1,6 @@
 //! What `cuCtxCreate` asks of UVM once its channels are registered: a
-//! semaphore pool, kernel pages that every GPU VA space and the CPU map.
+//! semaphore pool, kernel pages that every GPU VA space and the CPU map,
+//! which it then validates.
 
 use super::mapping_tests::*;
 use super::tests::*;
@@ -322,6 +323,47 @@ fn mmap_maps_exactly_a_pool() {
             .map(|_| ()),
         Err(LxError::EBADFD)
     );
+}
+
+/// What `cuCtxCreate` does once the CPU maps its pool (580.178.04 on the
+/// two RTX 2060 SUPER): UVM_VALIDATE_VA_RANGE of the pool, whose refusal is
+/// its 801. Exactly a pool or an external range is NV_OK, even beside
+/// another; a range a page short or long, one that starts inside a range or
+/// before it, and one where nothing is are NV_ERR_INVALID_ADDRESS, and so
+/// is the pool once it is freed.
+#[test]
+fn validate_answers_for_exactly_one_range() {
+    let process = with_both();
+    assert_eq!(alloc(&process, &[]), NV_OK);
+    let mapping = cpu_map(&process).unwrap();
+    assert_eq!(process.validate(POOL, LENGTH), NV_OK);
+    assert_eq!(process.create_external_range(POOL - 0x4000, 0x4000), NV_OK);
+    assert_eq!(process.create_external_range(POOL + LENGTH, 0x4000), NV_OK);
+    assert_eq!(process.validate(POOL, LENGTH), NV_OK);
+    assert_eq!(process.validate(POOL - 0x4000, 0x4000), NV_OK);
+    assert_eq!(process.validate(POOL + LENGTH, 0x4000), NV_OK);
+    for (base, length) in [
+        (POOL, LENGTH - 0x1000),
+        (POOL, LENGTH + 0x1000),
+        (POOL + 0x1000, LENGTH - 0x1000),
+        (POOL - 0x1000, LENGTH + 0x1000),
+        (POOL - 0x4000, 0x4000 + LENGTH),
+        (POOL, 0),
+        (0x40_0000, 0x1000),
+        (0, 0),
+    ] {
+        assert_eq!(
+            process.validate(base, length),
+            NV_ERR_INVALID_ADDRESS,
+            "[{:#x}, +{:#x})",
+            base,
+            length
+        );
+    }
+    drop(mapping);
+    assert_eq!(process.free(POOL, LENGTH), NV_OK);
+    assert_eq!(process.validate(POOL, LENGTH), NV_ERR_INVALID_ADDRESS);
+    assert_eq!(process.validate(POOL - 0x4000, 0x4000), NV_OK);
 }
 
 /// Unregistering a GPU VA space unmaps the pool there and frees what was
