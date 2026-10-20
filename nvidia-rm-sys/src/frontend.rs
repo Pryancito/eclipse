@@ -412,8 +412,9 @@ pub fn instance_in_mask(instance: u32, mask: u32) -> bool {
 /// Who is calling, for one escape.
 #[derive(Clone, Copy, Debug)]
 pub struct Caller {
-    /// The open `/dev/nvidiactl` the escape came in on, as a token that is
-    /// unique for as long as that open lives. Clients are filed under it.
+    /// The open `/dev/nvidiactl` the escape came in on, or the one REGISTER_FD
+    /// linked the open it came in on to, as a token that is unique for as
+    /// long as that open lives. Clients are filed under it.
     pub os_info: usize,
     /// Whether the escape came in on the control device. The RM escapes are
     /// control-device calls; on `/dev/nvidia<N>` they are refused, as on Linux.

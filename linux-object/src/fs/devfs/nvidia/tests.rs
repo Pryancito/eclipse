@@ -380,6 +380,27 @@ fn a_gpu_open_registers_its_control_fd_once() {
     assert_eq!(Arc::strong_count(&target), before);
 }
 
+/// `RmIoctl`'s `clientOSInfo`: once linked, a GPU open calls the RM as the
+/// control open its clients were made through, and still as a GPU open.
+#[test]
+fn a_linked_open_calls_the_rm_as_its_control_open() {
+    let target: Arc<dyn INode> = Arc::new(ctl());
+    let ctl_os_info = target.downcast_ref::<NvidiaOpen>().unwrap().os_info();
+    let lookup = |fd: i32| (fd == 3).then(|| target.clone());
+    let caller = caller_with_fd(&lookup);
+    let open = gpu(0);
+    assert_eq!(open.rm_caller(&caller).os_info, open.os_info(), "unlinked");
+    assert_eq!(open.register_fd(3, &caller), Ok(()));
+    let rm = open.rm_caller(&caller);
+    assert_eq!(rm.os_info, ctl_os_info);
+    assert!(
+        !rm.ctl,
+        "the RM still refuses what only /dev/nvidiactl takes"
+    );
+    let ctl_open = target.downcast_ref::<NvidiaOpen>().unwrap();
+    assert_eq!(ctl_open.rm_caller(&caller).os_info, ctl_os_info);
+}
+
 #[test]
 fn register_fd_wants_an_unlinked_control_open_that_is_not_itself() {
     let gpu_node: Arc<dyn INode> = Arc::new(gpu(0));
