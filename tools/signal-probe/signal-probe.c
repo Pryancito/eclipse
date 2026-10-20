@@ -180,6 +180,12 @@
 //              stat field 38 is SIGCHLD, and -1 for a thread that is not
 //              the leader; a child whose exec closed its close-on-exec
 //              pipe is EACCES to its parent's setpgid, 20 times out of 20.
+//   status     /proc/<pid>/status has Linux's lines in Linux's order, and they
+//              say what the syscalls say: Umask, FDSize (256 with fd 255
+//              open), the NS ids, the pending, blocked, ignored and caught
+//              signals, SigQ, the capability sets, NoNewPrivs, the CPUs. A
+//              thread's file is the thread's; a zombie's has no Umask, no Vm
+//              lines and an FDSize of 0.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -2875,6 +2881,237 @@ static void sec_kin(void) {
           "%d of %d refused, %d did not exec", refused, KIN_EXECS, failed);
 }
 
+// ----------------------------------------------------------------- status
+
+// The value of line `key` of a status file into `out`; 0 when the file or
+// the line is not there.
+static int status_value(const char *path, const char *key, char *out, size_t size) {
+    char buf[8192];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t len = 0, n;
+    while (len < (ssize_t)sizeof buf - 1 && (n = read(fd, buf + len, sizeof buf - 1 - len)) > 0)
+        len += n;
+    close(fd);
+    buf[len < 0 ? 0 : len] = 0;
+    size_t klen = strlen(key);
+    for (char *l = buf; l && *l; l = strchr(l, '\n'), l = l ? l + 1 : NULL) {
+        if (strncmp(l, key, klen) || l[klen] != ':' || l[klen + 1] != '\t') continue;
+        char *v = l + klen + 2, *end = strchr(v, '\n');
+        size_t vlen = end ? (size_t)(end - v) : strlen(v);
+        if (vlen >= size) vlen = size - 1;
+        memcpy(out, v, vlen);
+        out[vlen] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static unsigned long long status_hex(const char *path, const char *key) {
+    char v[256];
+    if (!status_value(path, key, v, sizeof v)) return ~0ULL;
+    char digits[256];
+    size_t n = 0;
+    for (char *p = v; *p && n < sizeof digits - 1; p++)
+        if (*p != ',') digits[n++] = *p;
+    digits[n] = 0;
+    return strtoull(digits, NULL, 16);
+}
+
+// The order `proc_pid_status()` writes these in. Linux writes more (the
+// memory lines, `Seccomp:`, the context switches), so this is the order of
+// the ones named, not the whole file.
+static const char *const STATUS_KEYS[] = {
+    "Name",     "Umask",  "State",  "Tgid",        "Ngid",   "Pid",    "PPid",
+    "TracerPid", "Uid",   "Gid",    "FDSize",      "Groups", "NStgid", "NSpid",
+    "NSpgid",   "NSsid",  "Threads", "SigQ",       "SigPnd", "ShdPnd", "SigBlk",
+    "SigIgn",   "SigCgt", "CapInh", "CapPrm",      "CapEff", "CapBnd", "CapAmb",
+    "NoNewPrivs", "Cpus_allowed", "Cpus_allowed_list", "Mems_allowed_list",
+};
+
+// The first key of STATUS_KEYS missing from the file or out of its order.
+static const char *status_order(const char *path) {
+    char buf[8192];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return "the file";
+    ssize_t len = 0, n;
+    while (len < (ssize_t)sizeof buf - 1 && (n = read(fd, buf + len, sizeof buf - 1 - len)) > 0)
+        len += n;
+    close(fd);
+    buf[len < 0 ? 0 : len] = 0;
+    size_t want = 0, nkeys = sizeof STATUS_KEYS / sizeof STATUS_KEYS[0];
+    for (char *l = buf; l && *l && want < nkeys; l = strchr(l, '\n'), l = l ? l + 1 : NULL) {
+        size_t klen = strlen(STATUS_KEYS[want]);
+        if (!strncmp(l, STATUS_KEYS[want], klen) && l[klen] == ':') want++;
+    }
+    return want == nkeys ? NULL : STATUS_KEYS[want];
+}
+
+static volatile pid_t g_status_tid;
+static volatile int g_status_go;
+
+static void *status_thread(void *arg) {
+    (void)arg;
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, SIGHUP);
+    pthread_sigmask(SIG_SETMASK, &s, NULL);
+    g_status_tid = (pid_t)syscall(SYS_gettid);
+    while (!g_status_go) sleep_ms(1);
+    return NULL;
+}
+
+static void status_caught(int sig) { (void)sig; }
+
+static void sec_status(void) {
+    const char *self = "/proc/self/status";
+    char v[256], want[256];
+    const char *missing = status_order(self);
+    check(!missing, "status has Linux's lines in Linux's order", "first missing or out of place: %s",
+          missing ? missing : "-");
+
+    mode_t old = umask(027);
+    int got = status_value(self, "Umask", v, sizeof v);
+    umask(old);
+    check(got && !strcmp(v, "0027"), "Umask is the process's, as %#04o", "'%s'", got ? v : "(none)");
+    got = status_value(self, "TracerPid", v, sizeof v);
+    check(got && !strcmp(v, "0"), "TracerPid is 0 for a process nobody traces", "'%s'",
+          got ? v : "(none)");
+
+    // A shell keeps its terminal on fd 255: 256 slots.
+    dup2(0, 255);
+    got = status_value(self, "FDSize", v, sizeof v);
+    close(255);
+    check(got && !strcmp(v, "256"), "FDSize with fd 255 open is 256", "'%s'", got ? v : "(none)");
+
+    char ids[4][32];
+    const char *keys[4] = {"NStgid", "NSpid", "NSpgid", "NSsid"};
+    long expect[4] = {getpid(), getpid(), getpgid(0), getsid(0)};
+    int ids_ok = 1;
+    for (int i = 0; i < 4; i++) {
+        snprintf(want, sizeof want, "%ld", expect[i]);
+        if (!status_value(self, keys[i], ids[i], sizeof ids[i]) || strcmp(ids[i], want)) ids_ok = 0;
+    }
+    check(ids_ok, "NStgid, NSpid, NSpgid and NSsid are getpid, getpid, getpgid and getsid",
+          "%s %s %s %s", ids[0], ids[1], ids[2], ids[3]);
+
+    // Pending on the thread (`raise` is a tgkill) and on the process (`kill`),
+    // both blocked; SIGINT ignored and SIGTERM caught.
+    sigset_t block, before;
+    sigemptyset(&block);
+    sigaddset(&block, SIGUSR1);
+    sigaddset(&block, SIGUSR2);
+    sigaddset(&block, SIGWINCH);
+    sigprocmask(SIG_SETMASK, &block, &before);
+    signal(SIGINT, SIG_IGN);
+    signal(SIGTERM, status_caught);
+    raise(SIGUSR1);
+    kill(getpid(), SIGUSR2);
+    unsigned long long pnd = status_hex(self, "SigPnd"), shd = status_hex(self, "ShdPnd");
+    unsigned long long blk = status_hex(self, "SigBlk");
+    unsigned long long ign = status_hex(self, "SigIgn") & 0x7fffffff;
+    unsigned long long cgt = status_hex(self, "SigCgt") & 0x7fffffff;
+    got = status_value(self, "SigQ", v, sizeof v);
+    unsigned long long expect_ign = 0, expect_cgt = 0;
+    for (int sig = 1; sig < 32; sig++) {
+        struct sigaction sa;
+        if (sigaction(sig, NULL, &sa)) continue;
+        if (sa.sa_handler == SIG_IGN) expect_ign |= 1ULL << (sig - 1);
+        else if (sa.sa_handler != SIG_DFL) expect_cgt |= 1ULL << (sig - 1);
+    }
+    signal(SIGUSR1, SIG_IGN);  // throws the two pending ones away
+    signal(SIGUSR2, SIG_IGN);
+    sigprocmask(SIG_SETMASK, &before, NULL);
+    check(pnd == 1ULL << (SIGUSR1 - 1), "SigPnd is what was raised on the thread", "%016llx", pnd);
+    check(shd == 1ULL << (SIGUSR2 - 1), "ShdPnd is what was sent to the process", "%016llx", shd);
+    unsigned long long expect_blk =
+        1ULL << (SIGUSR1 - 1) | 1ULL << (SIGUSR2 - 1) | 1ULL << (SIGWINCH - 1);
+    check(blk == expect_blk, "SigBlk is the mask", "%016llx, want %016llx", blk, expect_blk);
+    check(ign == expect_ign && (ign & 1ULL << (SIGINT - 1)), "SigIgn is what is ignored",
+          "%016llx, want %016llx", ign, expect_ign);
+    check(cgt == expect_cgt && (cgt & 1ULL << (SIGTERM - 1)), "SigCgt is what is caught",
+          "%016llx, want %016llx", cgt, expect_cgt);
+    struct rlimit rl;
+    getrlimit(RLIMIT_SIGPENDING, &rl);
+    unsigned long long queued = 0, limit = 0;
+    int parsed = got && sscanf(v, "%llu/%llu", &queued, &limit) == 2;
+    check(parsed && limit == (unsigned long long)rl.rlim_cur && queued >= 2,
+          "SigQ counts our two pending and its limit is RLIMIT_SIGPENDING", "'%s', limit %llu",
+          got ? v : "(none)", (unsigned long long)rl.rlim_cur);
+
+    struct {
+        uint32_t version;
+        int pid;
+    } hdr = {0x20080522, 0};
+    struct {
+        uint32_t effective, permitted, inheritable;
+    } data[2] = {{0, 0, 0}, {0, 0, 0}};
+    syscall(SYS_capget, &hdr, data);
+    unsigned long long eff = data[0].effective | (unsigned long long)data[1].effective << 32;
+    unsigned long long prm = data[0].permitted | (unsigned long long)data[1].permitted << 32;
+    unsigned long long bnd = 0;
+    for (int cap = 0; cap < 64; cap++)
+        if (prctl(PR_CAPBSET_READ, cap, 0, 0, 0) == 1) bnd |= 1ULL << cap;
+    unsigned long long s_eff = status_hex(self, "CapEff"), s_prm = status_hex(self, "CapPrm");
+    unsigned long long s_bnd = status_hex(self, "CapBnd");
+    check(s_eff == eff && s_prm == prm && s_bnd == bnd,
+          "CapEff, CapPrm and CapBnd are what capget and PR_CAPBSET_READ say",
+          "%llx %llx %llx, want %llx %llx %llx", s_eff, s_prm, s_bnd, eff, prm, bnd);
+
+    int nnp_before = status_value(self, "NoNewPrivs", v, sizeof v) && !strcmp(v, "0");
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    int nnp_after = status_value(self, "NoNewPrivs", v, sizeof v) && !strcmp(v, "1");
+    check(nnp_before && nnp_after, "NoNewPrivs follows PR_SET_NO_NEW_PRIVS", "%d then %d",
+          nnp_before, nnp_after);
+
+    unsigned long mask = 0;
+    syscall(SYS_sched_getaffinity, 0, sizeof mask, &mask);
+    unsigned long long hex = status_hex(self, "Cpus_allowed");
+    check(hex == mask, "Cpus_allowed is the affinity", "%llx, want %lx", hex, mask);
+    int first = __builtin_ctzl(mask);
+    unsigned long one = 1UL << first;
+    syscall(SYS_sched_setaffinity, 0, sizeof one, &one);
+    snprintf(want, sizeof want, "%d", first);
+    got = status_value(self, "Cpus_allowed_list", v, sizeof v);
+    syscall(SYS_sched_setaffinity, 0, sizeof mask, &mask);
+    check(got && !strcmp(v, want), "Cpus_allowed_list follows sched_setaffinity", "'%s', want '%s'",
+          got ? v : "(none)", want);
+
+    pthread_t t;
+    g_status_tid = 0;
+    g_status_go = 0;
+    pthread_create(&t, NULL, status_thread, NULL);
+    while (!g_status_tid) sleep_ms(1);
+    char path[64], tid[32], pid[32], tgid[32];
+    snprintf(path, sizeof path, "/proc/self/task/%d/status", (int)g_status_tid);
+    snprintf(want, sizeof want, "%d", (int)g_status_tid);
+    int pid_ok = status_value(path, "Pid", pid, sizeof pid) && !strcmp(pid, want);
+    int nspid_ok = status_value(path, "NSpid", tid, sizeof tid) && !strcmp(tid, want);
+    snprintf(want, sizeof want, "%d", (int)getpid());
+    int tgid_ok = status_value(path, "Tgid", tgid, sizeof tgid) && !strcmp(tgid, want);
+    unsigned long long their_blk = status_hex(path, "SigBlk");
+    g_status_go = 1;
+    pthread_join(t, NULL);
+    check(pid_ok && nspid_ok && tgid_ok && their_blk == 1ULL << (SIGHUP - 1),
+          "a thread's status has its own Pid, NSpid and SigBlk, and the process's Tgid",
+          "Pid %d NSpid %d Tgid %d SigBlk %016llx", pid_ok, nspid_ok, tgid_ok, their_blk);
+
+    pid_t z = fork();
+    if (z == 0) _exit(0);
+    snprintf(path, sizeof path, "/proc/%d/status", (int)z);
+    int zombie = 0;
+    for (int i = 0; i < 2000 && !zombie; i++) {
+        zombie = status_value(path, "State", v, sizeof v) && v[0] == 'Z';
+        if (!zombie) sleep_ms(1);
+    }
+    int no_umask = !status_value(path, "Umask", v, sizeof v);
+    int no_vm = !status_value(path, "VmSize", v, sizeof v);
+    int fd0 = status_value(path, "FDSize", v, sizeof v) && !strcmp(v, "0");
+    waitpid(z, NULL, 0);
+    check(zombie && no_umask && no_vm && fd0, "a zombie's status has no Umask, no Vm lines and FDSize 0",
+          "zombie %d, no Umask %d, no VmSize %d, FDSize 0 %d", zombie, no_umask, no_vm, fd0);
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -2905,6 +3142,7 @@ static const struct {
     {"nproc", "RLIMIT_NPROC holds fork and pthread_create", sec_nproc},
     {"zombie", "a dead child is a pid until it is reaped, and not after", sec_zombie},
     {"kin", "what a new thread or child is named, and when its parent lets go", sec_kin},
+    {"status", "/proc/<pid>/status: Linux's lines, with the task's own numbers", sec_status},
 };
 
 int main(int argc, char **argv) {

@@ -16,10 +16,13 @@ use crate::process::ProcessExt;
 
 /// `/proc/present`, in its own file: `procfs.rs` sits on the size ratchet.
 mod present;
+/// `/proc/<pid>/status`, in its own file for the same reason.
+mod status;
 #[cfg(test)]
 mod zombie_tests;
 use present::proc_present_content;
 use smoltcp::wire::{IpAddress, IpCidr};
+use status::{proc_pid_status, proc_task_status};
 
 const PROC_ROOT_STATIC: [&str; 57] = [
     "net",
@@ -577,92 +580,6 @@ fn stat_memory_fields(mapped_bytes: u64, resident_bytes: u64) -> (i64, i64) {
         mapped_bytes as i64,
         (resident_bytes / PROC_PAGE_SIZE) as i64,
     )
-}
-
-/// The `State:` line of `/proc/<pid>/status` for a `/proc/<pid>/stat` state
-/// letter.
-///
-/// The letter and the word have to agree, because different readers take
-/// different halves: `procps` matches the word, `htop` the letter. Reaching
-/// this table through [`proc_pid_status`] needs a process whose leader thread
-/// is in the state in question, and a thread only reads `Suspended` once it
-/// has a context, which no test can give it -- so `T` was the one row nothing
-/// could ever ask for. As an argument it is four rows of a table.
-fn status_state_text(letter: char) -> &'static str {
-    match letter {
-        'R' => "R (running)",
-        'T' => "T (stopped)",
-        'Z' => "Z (zombie)",
-        _ => "S (sleeping)",
-    }
-}
-
-fn proc_pid_status(proc: &Process) -> String {
-    proc_task_status(proc, None)
-}
-
-/// `/proc/<pid>/status`, and `/proc/<pid>/task/<tid>/status` when `thread`
-/// names one.
-///
-/// `Name:` and `State:` are the task's own, `Tgid:` is always the process and
-/// `Pid:` the task -- which is the whole point of those two lines being
-/// separate, and is how a reader holding a tid tells which group it is in.
-/// The memory and credential lines belong to the address space, so they are
-/// the process's for every thread, as in Linux.
-fn proc_task_status(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
-    let pid = proc.id();
-    let tid = match thread {
-        Some(t) => t.id(),
-        None => pid,
-    };
-    let name = escaped_comm(&match thread {
-        Some(t) => thread_comm(proc, t),
-        None => proc_comm(proc),
-    });
-    let ppid = proc_ppid(proc);
-    let state = status_state_text(match thread {
-        Some(t) => thread_state_char(t.state()),
-        None => proc_state_char(proc),
-    });
-    // VmSize = total mapped address space; VmRSS = committed (resident)
-    // bytes, private + shared — the fields `ps`/`top`/OOM-watchers read.
-    let stats = proc.vmar().get_task_stats();
-    let vm_size_kb = stats.mapped_bytes() / 1024;
-    let vm_rss_kb = (stats.private_bytes() + stats.shared_bytes()) / 1024;
-    let threads = proc.thread_ids().len().max(1);
-    // The ids are the process's own, not a constant: `polkit`, `sudo`,
-    // `ps -u` and `pkexec` read the `Uid:` line to decide who is asking.
-    let ids = proc
-        .try_linux()
-        .map(|lp| credential_lines(&lp.credentials()))
-        .unwrap_or_default();
-    format!(
-        "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n{}VmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\n",
-        name, state, pid, tid, ppid, ids, vm_size_kb, vm_rss_kb, threads
-    )
-}
-
-/// The `Uid:`, `Gid:` and `Groups:` lines of `/proc/<pid>/status`, in the
-/// order proc(5) gives them: real, effective, saved, filesystem. `Groups:`
-/// follows `task_state()` in `fs/proc/array.c`: each id followed by a space,
-/// then the newline.
-fn credential_lines(creds: &crate::process::Credentials) -> String {
-    let mut out = format!(
-        "Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nGroups:\t",
-        creds.ruid,
-        creds.euid,
-        creds.suid,
-        creds.fsuid,
-        creds.rgid,
-        creds.egid,
-        creds.sgid,
-        creds.fsgid
-    );
-    for group in &creds.groups {
-        let _ = write!(out, "{} ", group);
-    }
-    out.push('\n');
-    out
 }
 
 /// `/proc/<pid>/statm`: memory usage in PAGES — "size resident shared text
@@ -4368,70 +4285,6 @@ lazy_static! {
 }
 
 #[cfg(test)]
-mod pid_status_tests {
-    //! `/proc/<pid>/status` said `Uid:\t0\t0\t0\t0` and `Gid:\t0\t0\t0\t0`
-    //! for every process on the machine, whoever it belonged to. That line is
-    //! what `polkit`, `pkexec`, `sudo` and `ps -u` read to learn who is
-    //! asking, so every unprivileged process looked like root to them.
-
-    use super::*;
-    use crate::process::{Credentials, LinuxProcess};
-    use rcore_fs_ramfs::RamFS;
-
-    fn creds() -> Credentials {
-        Credentials {
-            ruid: 1000,
-            euid: 1001,
-            suid: 1002,
-            rgid: 2000,
-            egid: 2001,
-            sgid: 2002,
-            fsuid: 1003,
-            fsgid: 2003,
-            groups: alloc::vec![1000, 4, 24],
-            umask: 0o022,
-        }
-    }
-
-    #[test]
-    fn the_uid_and_gid_lines_are_the_process_s_own_ids_in_proc_5_order() {
-        // Real, effective, saved, filesystem: the order proc(5) gives, and
-        // the one `ps` and `polkit` parse by position.
-        let lines = credential_lines(&creds());
-        assert!(lines.starts_with("Uid:\t1000\t1001\t1002\t1003\nGid:\t2000\t2001\t2002\t2003\n"));
-    }
-
-    #[test]
-    fn the_groups_line_lists_every_supplementary_group() {
-        let lines = credential_lines(&creds());
-        assert!(lines.ends_with("Groups:\t1000 4 24 \n"), "{:?}", lines);
-    }
-
-    #[test]
-    fn a_process_that_dropped_to_a_user_reports_that_user() {
-        // The whole file, on a real process: root that became uid 1000 via
-        // setresuid, the way `login` and `su` end up.
-        let proc = Process::create_with_fixed_id_ext(
-            &Job::root(),
-            4242,
-            "root",
-            LinuxProcess::new(RamFS::new(), 0),
-        )
-        .unwrap();
-        let lp = proc.linux();
-        lp.set_resgid(100, 100, 100).unwrap();
-        lp.set_groups(alloc::vec![100, 27]);
-        lp.set_resuid(1000, 1000, 1000).unwrap();
-        let status = proc_pid_status(&proc);
-        assert!(
-            status.contains("PPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t100\t100\t100\t100\nGroups:\t100 27 \nVmSize:"),
-            "{:?}",
-            status
-        );
-    }
-}
-
-#[cfg(test)]
 mod pid_stat_tests {
     //! `/proc/<pid>/stat` fields 16/17 (cutime/cstime), 22 (starttime), 23
     //! (vsize) and 24 (rss) were written as 0 for every process, while
@@ -4621,7 +4474,7 @@ mod pid_stat_tests {
         assert_eq!(field(&line, 21), 0, "{:?}", line);
         // And `status` carries it too: the two files describe the same task.
         let status = proc_pid_status(&proc);
-        assert!(status.ends_with("Threads:\t1\n"), "{:?}", status);
+        assert!(status.contains("\nThreads:\t1\n"), "{:?}", status);
     }
 
     /// proc(5) field 18: `20 + nice` for the fair policies and `-1 -
@@ -4701,18 +4554,6 @@ mod pid_stat_tests {
         assert_eq!(letter, Some('Z'), "{:?}", line);
         let status = proc_pid_status(&proc);
         assert!(status.contains("State:\tZ (zombie)\n"), "{:?}", status);
-    }
-
-    /// The `State:` line carries the letter and the word, and different
-    /// readers take different halves: `procps` matches the word, `htop` the
-    /// letter. The four rows as a table, because reaching `T` through a
-    /// process needs a leader thread with a context, which no test can give it.
-    #[test]
-    fn the_state_line_of_status_carries_the_letter_and_the_word() {
-        assert_eq!(status_state_text('R'), "R (running)");
-        assert_eq!(status_state_text('T'), "T (stopped)");
-        assert_eq!(status_state_text('Z'), "Z (zombie)");
-        assert_eq!(status_state_text('S'), "S (sleeping)");
     }
 
     /// `VmSize` and `VmRSS` are in kB, and the resident one counts the shared
