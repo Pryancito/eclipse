@@ -36,8 +36,11 @@ use zircon_object::{
 
 /// The file-descriptor table's allocator and its two range sweeps.
 mod census;
+mod child_usage;
 mod orphan_group;
 pub use census::*;
+use child_usage::child_cpu;
+pub use child_usage::ChildCpu;
 pub use orphan_group::*;
 mod fd_table;
 
@@ -904,25 +907,6 @@ impl NewChild for Process {
     }
 }
 
-/// Wait for state changes in a child of the calling process, and obtain information about
-/// the child whose state has changed.
-///
-/// A state change is considered to be:
-/// - the child terminated.
-/// - the child was stopped by a signal (`WSTOPPED` / `WUNTRACED`).
-/// - the child was resumed by a signal (`WCONTINUED`).
-///
-/// CPU usage a child had accumulated by the time it exited: what `wait4(2)`
-/// reports through its rusage out-parameter and what the parent adds to its
-/// `RUSAGE_CHILDREN` totals when it reaps the child.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ChildCpu {
-    /// User-mode nanoseconds.
-    pub utime_ns: u64,
-    /// Kernel-mode nanoseconds.
-    pub stime_ns: u64,
-}
-
 /// Which child state changes a `wait*` call is interested in.
 #[derive(Debug, Clone, Copy)]
 pub struct WaitInterest {
@@ -987,16 +971,13 @@ pub const WAIT_STATUS_CONTINUED: i32 = 0xffff;
 /// Zircon user signal used to wake threads parked in a job-control stop.
 const JOB_CONTINUE_SIGNAL: Signal = Signal::USER_SIGNAL_1;
 
-/// Read an exited child's final CPU usage off its still-live object: its
-/// threads' measured time, live ones included, since an `exit_group` makes
-/// the child waitable before they are gone. It was the exited threads' user
-/// time alone, which was nothing for a child that called `exit`, and the
-/// syscall estimate of `/proc/perf` as kernel time.
-fn child_cpu(child: &Arc<Process>) -> ChildCpu {
-    let (utime_ns, stime_ns) = child.cpu_time_ns();
-    ChildCpu { utime_ns, stime_ns }
-}
-
+/// Wait for state changes in a child of the calling process, and obtain information about
+/// the child whose state has changed.
+///
+/// A state change is considered to be:
+/// - the child terminated.
+/// - the child was stopped by a signal (`WSTOPPED` / `WUNTRACED`).
+/// - the child was resumed by a signal (`WCONTINUED`).
 pub async fn wait_child(
     proc: &Arc<Process>,
     pid: KoID,
@@ -1384,11 +1365,9 @@ struct LinuxProcessInner {
     /// left). [`Self::record_child_exit`] must not re-insert those, or a
     /// second `wait` would collect the same child again.
     waited_without_zombie: HashSet<KoID>,
-    /// CPU totals of children this process has reaped (`wait*` with reap):
-    /// what getrusage(RUSAGE_CHILDREN) and times() cutime/cstime report.
-    children_utime_ns: u64,
-    /// Kernel-side counterpart of `children_utime_ns`.
-    children_stime_ns: u64,
+    /// Totals of children this process has reaped (`wait*` with reap): what
+    /// `RUSAGE_CHILDREN` and `times()` cutime/cstime report.
+    children_usage: ChildCpu,
     /// When this process was created, in nanoseconds of the monotonic clock
     /// (`task->start_boottime`): what field 22 of `/proc/<pid>/stat` reports
     /// in clock ticks, and what `ps -o etime,start` and `top`'s TIME+ column
@@ -1812,8 +1791,13 @@ impl LinuxProcess {
 
     /// CPU totals of already-reaped children, in nanoseconds (utime, stime).
     pub fn children_cpu_ns(&self) -> (u64, u64) {
-        let inner = self.inner.lock();
-        (inner.children_utime_ns, inner.children_stime_ns)
+        let usage = self.children_usage();
+        (usage.utime_ns, usage.stime_ns)
+    }
+
+    /// Totals of already-reaped children, their own reaped children's in.
+    pub fn children_usage(&self) -> ChildCpu {
+        self.inner.lock().children_usage
     }
 
     /// Create a new process bound to virtual terminal `vt`, building a fresh
@@ -4638,8 +4622,7 @@ impl LinuxProcessInner {
             children: Default::default(),
             reaped_children: Default::default(),
             waited_without_zombie: Default::default(),
-            children_utime_ns: 0,
-            children_stime_ns: 0,
+            children_usage: ChildCpu::default(),
             // `p->pdeath_signal = 0` in `copy_process`, and the subreaper
             // attribute is the parent's own role, not a child's.
             pdeathsig: 0,
@@ -4693,8 +4676,7 @@ impl LinuxProcessInner {
 
     /// Fold a reaped child's CPU usage into the RUSAGE_CHILDREN totals.
     fn add_children_cpu(&mut self, cpu: ChildCpu) {
-        self.children_utime_ns += cpu.utime_ns;
-        self.children_stime_ns += cpu.stime_ns;
+        self.children_usage.add(cpu);
     }
 }
 

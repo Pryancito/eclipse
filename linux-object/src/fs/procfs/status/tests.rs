@@ -114,7 +114,7 @@ fn the_state_line_of_status_carries_the_letter_and_the_word() {
 
 /// The file stopped at eleven lines. These are the keys `proc_pid_status()`
 /// writes, in its order, but for the memory lines this kernel does not keep
-/// numbers for yet and the context switch counts at the end.
+/// numbers for yet.
 #[test]
 fn the_file_has_linux_s_lines_in_linux_s_order() {
     let (_job, proc, _thread) = a_process(45_371);
@@ -164,6 +164,8 @@ fn the_file_has_linux_s_lines_in_linux_s_order() {
             "Cpus_allowed_list",
             "Mems_allowed",
             "Mems_allowed_list",
+            "voluntary_ctxt_switches",
+            "nonvoluntary_ctxt_switches",
         ],
         "{:?}",
         status
@@ -412,4 +414,37 @@ fn a_thread_s_file_has_the_thread_s_mask_and_cpus() {
         line(&status, "Cpus_allowed_list"),
         Some(bitmap_list(leader.affinity() & online, cpus).as_str())
     );
+}
+
+/// The context switch counts are the task's own, as Linux keeps them per
+/// task: the thread's in its file, the leader's in the process's.
+#[test]
+fn the_context_switches_are_the_task_s_own() {
+    let (_job, proc, leader) = a_process(45_382);
+    let worker = Thread::create_linux(&proc).unwrap();
+    for _ in 0..3 {
+        leader.note_context_switch(false);
+    }
+    leader.note_context_switch(true);
+    worker.note_context_switch(false);
+    for _ in 0..5 {
+        worker.note_context_switch(true);
+    }
+
+    let status = proc_pid_status(&proc);
+    assert_eq!(
+        line(&status, "voluntary_ctxt_switches"),
+        Some("3"),
+        "{:?}",
+        status
+    );
+    assert_eq!(line(&status, "nonvoluntary_ctxt_switches"), Some("1"));
+    let status = proc_task_status(&proc, Some(&worker));
+    assert_eq!(
+        line(&status, "voluntary_ctxt_switches"),
+        Some("1"),
+        "{:?}",
+        status
+    );
+    assert_eq!(line(&status, "nonvoluntary_ctxt_switches"), Some("5"));
 }

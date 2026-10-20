@@ -688,29 +688,31 @@ impl Syscall<'_> {
     ///
     /// `ru_utime` and `ru_stime` are the CPU time of the caller's process
     /// (`Process::cpu_time_ns`) or of its thread ([`thread_cpu_ns`]), and
-    /// `RUSAGE_CHILDREN` the reaped children's totals.
+    /// `RUSAGE_CHILDREN` the reaped children's totals; `ru_nvcsw` and
+    /// `ru_nivcsw` the context switches of the same tasks, which were 0.
     /// The previous implementation wrote the wall-clock time-since-boot into
     /// both fields, which made any "CPU used" computation (`time(1)`, build
     /// systems' self-profiling) nonsense.
-    pub fn sys_getrusage(&mut self, who: usize, mut rusage: UserOutPtr<RUsage>) -> SysResult {
+    pub fn sys_getrusage(&self, who: usize, mut rusage: UserOutPtr<RUsage>) -> SysResult {
         info!("getrusage: who: {}, rusage: {:?}", who, rusage);
         use crate::intarg::RusageWho;
         // `who` is an `int`: `RUSAGE_CHILDREN` is -1, and read out of all 64
         // bits of the register it was 4294967295 (EINVAL) whenever the
         // caller's compiler had zero-extended it, which is what a varargs
         // `syscall(SYS_getrusage, RUSAGE_CHILDREN, &ru)` does.
-        let (utime_ns, stime_ns) = match getrusage_args(who, rusage.is_null())? {
-            RusageWho::Process => self.zircon_process().cpu_time_ns(),
-            RusageWho::Thread => thread_cpu_ns(self.thread),
+        let usage = match getrusage_args(who, rusage.is_null())? {
+            RusageWho::Process => {
+                let proc = self.zircon_process();
+                RUsage::of(proc.cpu_time_ns(), proc.context_switches())
+            }
+            RusageWho::Thread => {
+                RUsage::of(thread_cpu_ns(self.thread), self.thread.context_switches())
+            }
             // Totals of children this process has reaped, accumulated at
             // wait4/waitid time exactly like Linux does.
-            RusageWho::Children => self.linux_process().children_cpu_ns(),
+            RusageWho::Children => RUsage::from(self.linux_process().children_usage()),
         };
-        rusage.write(RUsage {
-            utime: Duration::from_nanos(utime_ns).into(),
-            stime: Duration::from_nanos(stime_ns).into(),
-            ..RUsage::default()
-        })?;
+        rusage.write(usage)?;
         Ok(0)
     }
 
@@ -2235,6 +2237,9 @@ mod settimeofday_tests {
 
 #[cfg(test)]
 mod cpu_timer_tests;
+
+#[cfg(test)]
+mod rusage_tests;
 
 #[cfg(test)]
 mod itimer_tests {

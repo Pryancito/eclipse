@@ -4377,6 +4377,7 @@ mod pid_stat_tests {
         proc.linux().credit_children_cpu(ChildCpu {
             utime_ns: 2_500_000_000,
             stime_ns: 30_000_000,
+            ..Default::default()
         });
         let line = proc_pid_stat(&proc);
         assert_eq!(field(&line, 16), 250, "{:?}", line);
