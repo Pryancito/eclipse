@@ -86,6 +86,7 @@
 #include "gpu/mem_mgr/mem_desc.h"
 #include "gpu/mem_mgr/rm_page_size.h"
 #include "gpu/mem_mgr/vaspace_api.h"
+#include "class/cl0040.h"      /* NV01_MEMORY_LOCAL_USER */
 #include "class/cl0071.h"      /* NV01_MEMORY_SYSTEM_OS_DESCRIPTOR */
 #include "class/cl50a0.h"      /* NV50_MEMORY_VIRTUAL */
 #include "mem_mgr/mem.h"
@@ -1644,6 +1645,10 @@ NV_STATUS eclipse_rm_frontend_gpu_uuid(NvU32 gpuInstance, NvU8 *pUuid)
  * kernel's; for each GPU VA space they are lent to the RM as a physical
  * NV01_MEMORY_SYSTEM_OS_DESCRIPTOR in that space's client
  * (eclipse_rm_frontend_uvm_pages), which is mapped like any other memory.
+ *
+ * A SKED reflected range (UVM_MAP_DYNAMIC_PARALLELISM_REGION) is one PTE
+ * UVM writes with no memory behind it; here it is video memory of the
+ * client's mapped with that PTE's kind (eclipse_rm_frontend_uvm_sked).
  */
 
 static API_SECURITY_INFO _eclipse_rm_frontend_uvm_sec_info(void *pOsInfo, NvU32 bAdmin)
@@ -1920,6 +1925,174 @@ NV_STATUS eclipse_rm_frontend_uvm_pages(
     if (status == NV_OK)
     {
         *phMemory = hMemory;
+    }
+    return status;
+}
+
+/* NV_MMU_PTE_KIND_SMSKED_MESSAGE (dev_mmu.h), the same from Turing on. */
+#define ECLIPSE_UVM_KIND_SMSKED_MESSAGE 0x0F
+
+/*
+ * One GPU's UVM_MAP_DYNAMIC_PARALLELISM_REGION: `length` bytes at GPU
+ * virtual address `base` of `hVaSpace` (under `hDevice`, both of `hClient`)
+ * made a SKED reflected range, which is one PTE of `length` bytes (4 KiB,
+ * 64 KiB or 2 MiB, `base` aligned to it). uvm_map_sked_reflected_range
+ * writes that PTE valid, of kind SMSKED_MESSAGE, in the local aperture
+ * (make_sked_reflected_pte_turing): what a kernel writes through it is a
+ * message to SKED, the unit that launches the grids a kernel launches
+ * (dynamic parallelism), and its address is never looked at, as
+ * kgrobjSetComputeMmio says of the RM's own SKED mapping. Here it is an RM
+ * mapping of as much contiguous video memory, allocated as
+ * nvGpuOpsAllocPhysical does, with its kind overridden to SMSKED_MESSAGE:
+ * the same PTE, its address one of memory the client owns. The memory's
+ * handle goes to `phMemory` and the NV50_MEMORY_VIRTUAL's to `phVirtual`;
+ * freeing the virtual object unmaps it, and then the memory can go.
+ * Nothing is left behind on failure.
+ */
+NV_STATUS eclipse_rm_frontend_uvm_sked(
+    void     *pOsInfo,
+    NvU32     bAdmin,
+    NvHandle  hClient,
+    NvHandle  hDevice,
+    NvHandle  hVaSpace,
+    NvU64     base,
+    NvU64     length,
+    NvHandle *phMemory,
+    NvHandle *phVirtual)
+{
+    THREAD_STATE_NODE threadState;
+    API_SECURITY_INFO secInfo;
+    NV_MEMORY_ALLOCATION_PARAMS memoryParams;
+    NV_MEMORY_ALLOCATION_PARAMS virtualParams;
+    NVOS46_PARAMETERS mapParams;
+    RM_API *pRmApi = rmapiGetInterface(RMAPI_EXTERNAL);
+    NvHandle hMemory = NV01_NULL_OBJECT;
+    NvHandle hVirtual = NV01_NULL_OBJECT;
+    NvU32 pageAttr;
+    NvU32 pageAttr2 = 0;
+    NvU32 mapPageSize;
+    NV_STATUS status;
+
+    if ((pOsInfo == NULL) || (phMemory == NULL) || (phVirtual == NULL))
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    switch (length)
+    {
+        case RM_PAGE_SIZE:
+            pageAttr = DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _4KB);
+            mapPageSize = DRF_DEF(OS46, _FLAGS, _PAGE_SIZE, _4KB);
+            break;
+        case RM_PAGE_SIZE_64K:
+            pageAttr = DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG);
+            mapPageSize = DRF_DEF(OS46, _FLAGS, _PAGE_SIZE, _BIG);
+            break;
+        case RM_PAGE_SIZE_HUGE:
+            pageAttr = DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _HUGE);
+            pageAttr2 = DRF_DEF(OS32, _ATTR2, _PAGE_SIZE_HUGE, _2MB);
+            mapPageSize = DRF_DEF(OS46, _FLAGS, _PAGE_SIZE, _HUGE);
+            break;
+        default:
+            return NV_ERR_INVALID_ARGUMENT;
+    }
+    if (!NV_IS_ALIGNED64(base, length))
+    {
+        return NV_ERR_INVALID_ADDRESS;
+    }
+
+    secInfo = _eclipse_rm_frontend_uvm_sec_info(pOsInfo, bAdmin);
+
+    portMemSet(&memoryParams, 0, sizeof(memoryParams));
+    memoryParams.owner = hClient;
+    memoryParams.type = NVOS32_TYPE_IMAGE;
+    memoryParams.attr = DRF_DEF(OS32, _ATTR, _LOCATION, _VIDMEM) |
+                        DRF_DEF(OS32, _ATTR, _COHERENCY, _UNCACHED) |
+                        DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS) |
+                        pageAttr;
+    memoryParams.attr2 = pageAttr2;
+    memoryParams.size = length;
+
+    portMemSet(&virtualParams, 0, sizeof(virtualParams));
+    virtualParams.owner = hClient;
+    virtualParams.type = NVOS32_TYPE_IMAGE;
+    virtualParams.flags = NVOS32_ALLOC_FLAGS_VIRTUAL |
+                          NVOS32_ALLOC_FLAGS_FIXED_ADDRESS_ALLOCATE;
+    virtualParams.attr = pageAttr;
+    virtualParams.attr2 = pageAttr2;
+    virtualParams.offset = base;
+    virtualParams.size = length;
+    virtualParams.hVASpace = hVaSpace;
+
+    portMemSet(&mapParams, 0, sizeof(mapParams));
+    mapParams.hClient = hClient;
+    mapParams.hDevice = hDevice;
+    mapParams.offset = 0;
+    mapParams.length = length;
+    mapParams.flags = DRF_DEF(OS46, _FLAGS, _ACCESS, _READ_WRITE) |
+                      DRF_DEF(OS46, _FLAGS, _PAGE_KIND_OVERRIDE, _YES) |
+                      mapPageSize;
+    mapParams.kindOverride = ECLIPSE_UVM_KIND_SMSKED_MESSAGE;
+    /* Not _DMA_OFFSET_FIXED: relative to the virtual allocation, so its start. */
+    mapParams.dmaOffset = 0;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status == NV_OK)
+    {
+        status = pRmApi->AllocWithSecInfo(pRmApi, hClient, hDevice, &hMemory,
+                                          NV01_MEMORY_LOCAL_USER,
+                                          NV_PTR_TO_NvP64(&memoryParams),
+                                          sizeof(memoryParams),
+                                          RMAPI_ALLOC_FLAGS_NONE, NvP64_NULL,
+                                          &secInfo);
+
+        if (status == NV_OK)
+        {
+            status = pRmApi->AllocWithSecInfo(pRmApi, hClient, hDevice, &hVirtual,
+                                              NV50_MEMORY_VIRTUAL,
+                                              NV_PTR_TO_NvP64(&virtualParams),
+                                              sizeof(virtualParams),
+                                              RMAPI_ALLOC_FLAGS_NONE, NvP64_NULL,
+                                              &secInfo);
+            if ((status == NV_OK) && (virtualParams.offset != base))
+            {
+                status = NV_ERR_INVALID_STATE;
+            }
+        }
+
+        if (status == NV_OK)
+        {
+            mapParams.hDma = hVirtual;
+            mapParams.hMemory = hMemory;
+            status = pRmApi->MapWithSecInfo(pRmApi, &mapParams, &secInfo);
+            if ((status == NV_OK) && (mapParams.dmaOffset != base))
+            {
+                status = NV_ERR_INVALID_STATE;
+            }
+        }
+
+        if (status != NV_OK)
+        {
+            if (hVirtual != NV01_NULL_OBJECT)
+            {
+                pRmApi->FreeWithSecInfo(pRmApi, hClient, hVirtual,
+                                        RMAPI_FREE_FLAGS_NONE, &secInfo);
+            }
+            if (hMemory != NV01_NULL_OBJECT)
+            {
+                pRmApi->FreeWithSecInfo(pRmApi, hClient, hMemory,
+                                        RMAPI_FREE_FLAGS_NONE, &secInfo);
+            }
+        }
+        gpumgrThreadDisableExpandedGpuVisibility();
+    }
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+
+    if (status == NV_OK)
+    {
+        *phMemory = hMemory;
+        *phVirtual = hVirtual;
     }
     return status;
 }
