@@ -10,7 +10,7 @@
 //! state the RM's OS callbacks need while a user-mode call is in flight, and
 //! the version comparison.
 //!
-//! Two OS callbacks change meaning here, and ONLY while a front-end call is
+//! Some OS callbacks change meaning here, and ONLY while a front-end call is
 //! in flight ([`CallScope`]):
 //!
 //! - `os_memcpy_from_user` / `os_memcpy_to_user` copy, after the kernel's
@@ -25,6 +25,9 @@
 //! - `osIsAdministrator` answers whether the caller's effective uid is 0
 //!   (Linux asks `capable(CAP_SYS_ADMIN)`). Outside a call it keeps
 //!   answering `NV_FALSE`.
+//! - `os_lock_user_pages` hands the RM the pages of the caller's that the
+//!   kernel pinned for the call ([`user_pages`]). Outside a call it keeps
+//!   answering `NV_ERR_NOT_SUPPORTED`.
 //!
 //! The C half keeps one more such state of its own: the user mappings
 //! (`osMapPciMemoryUser`, and `osMapSystemMemory` for a user) answer only
@@ -35,6 +38,7 @@ use crate::types::*;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 pub mod events;
+pub mod user_pages;
 pub mod uvm;
 
 /// `NV_RM_API_VERSION_STRING_LENGTH` (nv-ioctl.h).
@@ -59,10 +63,10 @@ pub const RM_MAP_MEMORY: u32 = 0x4E;
 /// `eclipse_rm_frontend_layout` answers them: the offset of the one field it
 /// reads from RM_MAP_MEMORY's comes right after that payload, the OS events'
 /// payloads and the event they copy out ([`events::UnixEvent`]) after that,
-/// then NUMA_INFO's and where its count of retired pages is, and last the
-/// size of the mapping record this file shares with the C
-/// ([`RawMmapContext`]).
-pub const LAYOUT: [(&str, usize); 16] = [
+/// then NUMA_INFO's and where its count of retired pages is, RM_ALLOC_MEMORY's
+/// and where its address is, and last the size of the mapping record this
+/// file shares with the C ([`RawMmapContext`]).
+pub const LAYOUT: [(&str, usize); 18] = [
     ("nv_ioctl_xfer_t", 16),
     ("nv_ioctl_card_info_t", 72),
     ("nv_ioctl_rm_api_version_t", 72),
@@ -78,6 +82,8 @@ pub const LAYOUT: [(&str, usize); 16] = [
     ("NvUnixEvent", events::UnixEvent::SIZE),
     ("nv_ioctl_numa_info_t", 560),
     ("nv_ioctl_numa_info_t.offline_addresses.numEntries", 552),
+    ("nv_ioctl_nvos02_parameters_with_fd", 56),
+    ("nv_ioctl_nvos02_parameters_with_fd.params.pMemory", 24),
     ("EclipseRmMmapContext", 40),
 ];
 
@@ -245,7 +251,8 @@ extern "C" {
 // reach: every escape is refused, nothing is ever filed under an open, and
 // no GPU exists. Same shape as the `eclipse_rm_edid` stand-in in rm_init.rs.
 // The tests can have RM_MAP_MEMORY answer with a record of their own, and
-// see what was unmapped, to check what this file does with the C's answer.
+// see what was unmapped, to check what this file does with the C's answer,
+// or run an escape body of their own inside the call.
 #[cfg(not(target_os = "none"))]
 unsafe fn eclipse_rm_frontend_escape(
     _cmd: NvU32,
@@ -258,6 +265,10 @@ unsafe fn eclipse_rm_frontend_escape(
 ) -> NV_STATUS {
     #[cfg(test)]
     if let Some(status) = tests::stand_in_map(_mmap) {
+        return status;
+    }
+    #[cfg(test)]
+    if let Some(status) = tests::stand_in_body(_cmd) {
         return status;
     }
     NV_ERR_NOT_SUPPORTED
@@ -433,21 +444,7 @@ pub struct Caller {
 /// value is the escape's own status, as `RmIoctl`'s: `NV_OK` means the RM's
 /// answer is in the payload's `status` field.
 pub fn rm_escape(cmd: u32, payload: &mut [u8], caller: &Caller) -> NV_STATUS {
-    if caller.os_info == 0 {
-        return NV_ERR_INVALID_ARGUMENT;
-    }
-    let _scope = CallScope::enter(caller.gpu_mask, caller.admin);
-    unsafe {
-        eclipse_rm_frontend_escape(
-            cmd,
-            payload.as_mut_ptr() as *mut c_void,
-            payload.len() as NvU32,
-            caller.os_info as *mut c_void,
-            caller.ctl as NvU32,
-            caller.admin as NvU32,
-            core::ptr::null_mut(),
-        )
-    }
+    user_pages::rm_escape_lending(cmd, payload, caller, None)
 }
 
 /// RM_MAP_MEMORY, on the kernel copy of its payload: the escape's status,

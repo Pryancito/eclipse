@@ -19,6 +19,21 @@ std::thread_local! {
     /// unmap.
     static MAP_ANSWER: Cell<Option<(NV_STATUS, RawMmapContext)>> = const { Cell::new(None) };
     static UNMAPPED: RefCell<Vec<NV_STATUS>> = const { RefCell::new(Vec::new()) };
+    /// What the stand-in runs for this thread's next escape, inside the call.
+    static BODY: RefCell<Option<std::boxed::Box<dyn FnMut(NvU32) -> NV_STATUS>>> =
+        const { RefCell::new(None) };
+}
+
+/// The stand-in's escape, when a test set a body for it.
+pub(super) fn stand_in_body(cmd: NvU32) -> Option<NV_STATUS> {
+    // Taken first: the body may well make an escape of its own.
+    let mut body = BODY.with(|b| b.borrow_mut().take())?;
+    Some(body(cmd))
+}
+
+/// Have the stand-in run `body` for this thread's next escape.
+pub(super) fn answer_with(body: impl FnMut(NvU32) -> NV_STATUS + 'static) {
+    BODY.with(|b| *b.borrow_mut() = Some(std::boxed::Box::new(body)));
 }
 
 /// The stand-in's RM_MAP_MEMORY, when a test set an answer.

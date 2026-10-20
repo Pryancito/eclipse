@@ -9,7 +9,7 @@
 //! needs to know here: whether the mapping is read-only.
 
 use super::*;
-use linux_object::fs::devfs::nvidia::{gpu_mask, NvCaller};
+use linux_object::fs::devfs::nvidia::{gpu_mask, pin_user_pages, NvCaller};
 use linux_object::fs::devfs::nvidia_uvm::UvmOpen;
 use linux_object::fs::devfs::NvidiaOpen;
 
@@ -40,10 +40,13 @@ impl Syscall<'_> {
             )
         };
         let open_of_fd = |fd: i32| Some(proc.get_file(fd.into()).ok()?.inode());
+        let vmar = self.zircon_process().vmar();
+        let pin = |va: usize, count: usize, write: bool| pin_user_pages(&vmar, va, count, write);
         let caller = NvCaller {
             admin: proc.euid() == 0,
             gpu_mask: &mask,
             open_of_fd: &open_of_fd,
+            pin_user_pages: &pin,
         };
         match (uvm, open) {
             (Some(uvm), _) => {

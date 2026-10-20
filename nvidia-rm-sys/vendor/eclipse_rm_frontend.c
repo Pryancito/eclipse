@@ -31,11 +31,16 @@
  * And what /dev/nvidia-uvm asks of the RM for a GPU VA space it does not own
  * the page tables of (see "UVM" below).
  *
+ * And RM_ALLOC_MEMORY of an OS descriptor, a client's own memory made RM
+ * memory, with escape.c's RmAllocOsDescriptor and RmCreateOsDescriptor
+ * (see "OS descriptors" below), and RM_UPDATE_DEVICE_MAPPING_INFO, with
+ * osapi.c's rm_update_device_mapping_info.
+ *
  * What is NOT here yet, and answers NV_ERR_NOT_SUPPORTED (which the kernel
  * side turns into EINVAL, like an unknown escape on Linux): RM_ALLOC_MEMORY
- * and RM_VID_HEAP_CONTROL (OS descriptors: pinning user pages), and the two
- * controls that carry a device fd inside their parameters
- * (NV00FD_CTRL_CMD_ATTACH_GPU, NV00E0_CTRL_CMD_EXPORT_MEM). The nv.c-level
+ * of any other class, RM_VID_HEAP_CONTROL, and the two controls that carry
+ * a device fd inside their parameters (NV00FD_CTRL_CMD_ATTACH_GPU,
+ * NV00E0_CTRL_CMD_EXPORT_MEM). The nv.c-level
  * escapes (CARD_INFO, CHECK_VERSION_STR, ATTACH_GPUS_TO_FD, REGISTER_FD, ...)
  * are not RM calls on Linux either and live on the Rust side
  * (linux-object/src/fs/devfs/nvidia.rs), and so do the three OS-event
@@ -85,6 +90,7 @@
 #include "class/cl50a0.h"      /* NV50_MEMORY_VIRTUAL */
 #include "mem_mgr/mem.h"
 #include "rmapi/rs_utils.h"
+#include "rmapi/resource_fwd_decls.h" /* classId(KernelCcuApi), classId(KernelChannel) */
 #include "rmapi/event.h"       /* EVENTNOTIFICATION */
 #include "nv-unix-nvos-params-wrappers.h" /* nv_ioctl_nvos33_parameters_with_fd */
 #include "eclipse_rm_mem.h"
@@ -550,6 +556,309 @@ static void _eclipse_rm_unmap_unrecorded(
     }                                          \
 }
 
+/* escape.c's NV_ACTUAL_DEVICE_ONLY: the one escape here that is a
+ * /dev/nvidia<N> call, RM_ALLOC_MEMORY, is refused on the control device. */
+#define ECLIPSE_ACTUAL_DEVICE_ONLY(bCtl)       \
+{                                              \
+    if (bCtl)                                  \
+    {                                          \
+        rmStatus = NV_ERR_INVALID_ARGUMENT;    \
+        goto done;                             \
+    }                                          \
+}
+
+/*
+ * OS descriptors.
+ *
+ * libcuda hands the GPU memory it allocated itself (an anonymous mmap) as an
+ * NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: RM_ALLOC_MEMORY on /dev/nvidia<N> names
+ * the range, os_lock_user_pages pins the pages behind it, and the RM makes
+ * memory of them (osCreateMemFromOsDescriptor, eclipse_rm_mem.c), which
+ * keeps them pinned until it is destroyed. The two functions below are
+ * escape.c's, transliterated.
+ *
+ * The pinning itself is the kernel's, done before the call
+ * (frontend/user_pages.rs): os_lock_user_pages hands the RM what was pinned
+ * for exactly this range, and answers NV_ERR_INVALID_ADDRESS for any other,
+ * as Linux does for a range pin_user_pages cannot pin.
+ */
+
+/* RmCreateOsDescriptor (escape.c). Only returns errors through pApi->status. */
+static void _eclipse_rm_create_os_descriptor(NVOS32_PARAMETERS *pApi, API_SECURITY_INFO secInfo)
+{
+    NV_STATUS rmStatus;
+    NvBool writable;
+    NvU32 flags = 0;
+    NvU64 allocSize, pageCount, *pPteArray = NULL;
+    void *pDescriptor, *pPageArray = NULL;
+    NVOS32_PARAMETERS allocApi = *pApi;
+    NVOS32_PARAMETERS *pAllocApi = &allocApi;
+
+    pDescriptor = NvP64_VALUE(pApi->data.AllocOsDesc.descriptor);
+    if (((NvUPtr)pDescriptor & ~os_page_mask) != 0)
+    {
+        rmStatus = NV_ERR_NOT_SUPPORTED;
+        goto done;
+    }
+
+    // Check to prevent an NvU64 overflow
+    if ((pApi->data.AllocOsDesc.limit + 1) == 0)
+    {
+        rmStatus = NV_ERR_INVALID_LIMIT;
+        goto done;
+    }
+
+    allocSize = (pApi->data.AllocOsDesc.limit + 1);
+    pageCount = (1 + ((allocSize - 1) / os_page_size));
+
+    writable = FLD_TEST_DRF(OS32, _ATTR2, _PROTECTION_USER, _READ_WRITE, pApi->data.AllocOsDesc.attr2);
+
+    flags = FLD_SET_DRF_NUM(_LOCK_USER_PAGES, _FLAGS, _WRITE, writable, flags);
+    rmStatus = os_lock_user_pages(pDescriptor, pageCount, &pPageArray, flags);
+    if (rmStatus == NV_OK)
+    {
+        pAllocApi->data.AllocOsDesc.descriptor = (NvP64)(NvUPtr)pPageArray;
+        pAllocApi->data.AllocOsDesc.descriptorType = NVOS32_DESCRIPTOR_TYPE_OS_PAGE_ARRAY;
+    }
+    else if (rmStatus == NV_ERR_INVALID_ADDRESS)
+    {
+        rmStatus = os_lookup_user_io_memory(pDescriptor, pageCount, &pPteArray);
+        if (rmStatus == NV_OK)
+        {
+            pAllocApi->data.AllocOsDesc.descriptor = (NvP64)(NvUPtr)pPteArray;
+            pAllocApi->data.AllocOsDesc.descriptorType = NVOS32_DESCRIPTOR_TYPE_OS_IO_MEMORY;
+        }
+    }
+    if (rmStatus != NV_OK)
+        goto done;
+
+    Nv04VidHeapControlWithSecInfo(pAllocApi, secInfo);
+
+    pApi->status = pAllocApi->status;
+    pApi->data.AllocOsDesc.hMemory = pAllocApi->data.AllocOsDesc.hMemory;
+
+    if ((pAllocApi->status != NV_OK) &&
+        (pAllocApi->data.AllocOsDesc.descriptor != NvP64_NULL))
+    {
+        switch (pAllocApi->data.AllocOsDesc.descriptorType)
+        {
+            default:
+                break;
+            case NVOS32_DESCRIPTOR_TYPE_OS_PAGE_ARRAY:
+                os_unlock_user_pages(pageCount, pPageArray, flags);
+                break;
+        }
+    }
+
+done:
+    if (pPteArray != NULL)
+    {
+        os_free_mem(pPteArray);
+    }
+
+    if (rmStatus != NV_OK)
+        pApi->status = rmStatus;
+}
+
+/* RmAllocOsDescriptor (escape.c). Only returns errors through pApi->status. */
+static void _eclipse_rm_alloc_os_descriptor(NVOS02_PARAMETERS *pApi, API_SECURITY_INFO secInfo)
+{
+    NV_STATUS rmStatus = NV_OK;
+    NvU32 flags, attr, attr2;
+    NVOS32_PARAMETERS *pVidHeapParams;
+
+    if (!FLD_TEST_DRF(OS02, _FLAGS, _LOCATION, _PCI, pApi->flags) ||
+        !FLD_TEST_DRF(OS02, _FLAGS, _MAPPING, _NO_MAP, pApi->flags))
+    {
+        rmStatus = NV_ERR_INVALID_FLAGS;
+        goto done;
+    }
+
+    attr = DRF_DEF(OS32, _ATTR, _LOCATION, _PCI);
+
+    if (FLD_TEST_DRF(OS02, _FLAGS, _COHERENCY, _CACHED, pApi->flags) ||
+        FLD_TEST_DRF(OS02, _FLAGS, _COHERENCY, _WRITE_BACK, pApi->flags))
+    {
+        attr = FLD_SET_DRF(OS32, _ATTR, _COHERENCY, _WRITE_BACK, attr);
+    }
+    else if (FLD_TEST_DRF(OS02, _FLAGS, _COHERENCY, _UNCACHED, pApi->flags))
+        attr = FLD_SET_DRF(OS32, _ATTR, _COHERENCY, _UNCACHED, attr);
+    else {
+        rmStatus = NV_ERR_INVALID_FLAGS;
+        goto done;
+    }
+
+    if (FLD_TEST_DRF(OS02, _FLAGS, _PHYSICALITY, _CONTIGUOUS, pApi->flags))
+        attr = FLD_SET_DRF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS, attr);
+    else
+        attr = FLD_SET_DRF(OS32, _ATTR, _PHYSICALITY, _NONCONTIGUOUS, attr);
+
+    if (FLD_TEST_DRF(OS02, _FLAGS, _GPU_CACHEABLE, _YES, pApi->flags))
+        attr2 = DRF_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _YES);
+    else
+        attr2 = DRF_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _NO);
+
+    if (FLD_TEST_DRF(OS02, _FLAGS, _MEMORY_PROTECTION, _UNPROTECTED, pApi->flags))
+        attr2 = FLD_SET_DRF(OS32, _ATTR2, _MEMORY_PROTECTION, _UNPROTECTED, attr2);
+
+    pVidHeapParams = portMemAllocNonPaged(sizeof(NVOS32_PARAMETERS));
+    if (pVidHeapParams == NULL)
+    {
+        rmStatus = NV_ERR_NO_MEMORY;
+        goto done;
+    }
+    portMemSet(pVidHeapParams, 0, sizeof(NVOS32_PARAMETERS));
+
+    pVidHeapParams->hRoot = pApi->hRoot;
+    pVidHeapParams->hObjectParent = pApi->hObjectParent;
+    pVidHeapParams->function = NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR;
+
+    flags = (NVOS32_ALLOC_FLAGS_MEMORY_HANDLE_PROVIDED |
+             NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED);
+
+    if (DRF_VAL(OS02, _FLAGS, _ALLOC_USER_READ_ONLY, pApi->flags))
+        attr2 = FLD_SET_DRF(OS32, _ATTR2, _PROTECTION_USER, _READ_ONLY, attr2);
+
+    // Currently CPU-RO memory implies GPU-RO as well
+    if (DRF_VAL(OS02, _FLAGS, _ALLOC_DEVICE_READ_ONLY, pApi->flags) ||
+        DRF_VAL(OS02, _FLAGS, _ALLOC_USER_READ_ONLY, pApi->flags))
+        attr2 = FLD_SET_DRF(OS32, _ATTR2, _PROTECTION_DEVICE, _READ_ONLY, attr2);
+
+    pVidHeapParams->data.AllocOsDesc.hMemory = pApi->hObjectNew;
+    pVidHeapParams->data.AllocOsDesc.flags = flags;
+    pVidHeapParams->data.AllocOsDesc.attr = attr;
+    pVidHeapParams->data.AllocOsDesc.attr2 = attr2;
+    pVidHeapParams->data.AllocOsDesc.descriptor = pApi->pMemory;
+    pVidHeapParams->data.AllocOsDesc.limit = pApi->limit;
+    pVidHeapParams->data.AllocOsDesc.descriptorType = NVOS32_DESCRIPTOR_TYPE_VIRTUAL_ADDRESS;
+
+    _eclipse_rm_create_os_descriptor(pVidHeapParams, secInfo);
+
+    pApi->status = pVidHeapParams->status;
+
+    portMemFree(pVidHeapParams);
+
+done:
+    if (rmStatus != NV_OK)
+        pApi->status = rmStatus;
+}
+
+/*
+ * RmUpdateDeviceMappingInfo (osapi.c), with rm_update_device_mapping_info's
+ * API lock around it: the CPU mapping of `hMappable` that RM_MAP_MEMORY
+ * answered `pOldCpuAddress` for, made by this process, is from now on at
+ * `pNewCpuAddress`, where the client mmapped it. RM_UNMAP_MEMORY names a
+ * mapping by that address.
+ */
+static NV_STATUS _eclipse_rm_update_device_mapping_info_locked(
+    NvHandle    hClient,
+    NvHandle    hDevice,
+    NvHandle    hMappable,
+    void       *pOldCpuAddress,
+    void       *pNewCpuAddress
+)
+{
+    NV_STATUS status;
+    CLIENT_ENTRY *pClientEntry;
+    RsClient *pClient;
+    RsResourceRef *pMappableRef;
+    RsCpuMapping *pCpuMapping;
+    Device *pDevice;
+    Subdevice *pSubdevice;
+    NvU32 gpuMask = 0;
+
+    status = serverAcquireClient(&g_resServ, hClient, LOCK_ACCESS_WRITE, &pClientEntry);
+    if (status != NV_OK)
+        return status;
+
+    pClient = pClientEntry->pClient;
+
+    status = deviceGetByHandle(pClient, hDevice, &pDevice);
+    if (status != NV_OK)
+    {
+        status = subdeviceGetByHandle(pClient, hDevice, &pSubdevice);
+        if (status != NV_OK)
+            goto done;
+
+        status = rmGpuGroupLockAcquire(pSubdevice->subDeviceInst,
+                                       GPU_LOCK_GRP_SUBDEVICE,
+                                       GPUS_LOCK_FLAGS_NONE,
+                                       RM_LOCK_MODULES_GPU,
+                                       &gpuMask);
+        if (status != NV_OK)
+            goto done;
+
+        GPU_RES_SET_THREAD_BC_STATE(pSubdevice);
+    }
+    else
+    {
+        status = rmGpuGroupLockAcquire(pDevice->deviceInst,
+                                       GPU_LOCK_GRP_DEVICE,
+                                       GPUS_LOCK_FLAGS_NONE,
+                                       RM_LOCK_MODULES_GPU,
+                                       &gpuMask);
+        if (status != NV_OK)
+            goto done;
+
+        GPU_RES_SET_THREAD_BC_STATE(pDevice);
+    }
+
+    status = clientGetResourceRef(pClient, hMappable, &pMappableRef);
+    if (status != NV_OK)
+        goto done;
+
+    if ((objDynamicCastById(pMappableRef->pResource, classId(Memory)) == NULL) &&
+        (objDynamicCastById(pMappableRef->pResource, classId(KernelCcuApi)) == NULL) &&
+        (objDynamicCastById(pMappableRef->pResource, classId(KernelChannel)) == NULL))
+    {
+        status = NV_ERR_INVALID_OBJECT_HANDLE;
+        goto done;
+    }
+
+    status = refFindCpuMappingWithFilter(pMappableRef,
+                                         NV_PTR_TO_NvP64(pOldCpuAddress),
+                                         serverutilMappingFilterCurrentUserProc,
+                                         &pCpuMapping);
+    if (status != NV_OK)
+        goto done;
+
+    pCpuMapping->pLinearAddress = NV_PTR_TO_NvP64(pNewCpuAddress);
+
+done:
+
+    if (gpuMask != 0)
+        rmGpuGroupLockRelease(gpuMask, GPUS_LOCK_FLAGS_NONE);
+
+    serverReleaseClient(&g_resServ, LOCK_ACCESS_WRITE, pClientEntry);
+    return status;
+}
+
+static NV_STATUS _eclipse_rm_update_device_mapping_info(
+    NvHandle    hClient,
+    NvHandle    hDevice,
+    NvHandle    hMemory,
+    void       *pOldCpuAddress,
+    void       *pNewCpuAddress
+)
+{
+    NV_STATUS RmStatus;
+
+    // LOCK: acquire API lock
+    if ((RmStatus = rmapiLockAcquire(RMAPI_LOCK_FLAGS_READ, RM_LOCK_MODULES_GPU)) == NV_OK)
+    {
+        RmStatus = _eclipse_rm_update_device_mapping_info_locked(hClient,
+                                                                 hDevice,
+                                                                 hMemory,
+                                                                 pOldCpuAddress,
+                                                                 pNewCpuAddress);
+
+        // UNLOCK: release API lock
+        rmapiLockRelease();
+    }
+
+    return RmStatus;
+}
+
 static NV_STATUS _eclipse_rm_frontend_dispatch(
     NvU32 cmd,
     void *pData,
@@ -749,6 +1058,63 @@ static NV_STATUS _eclipse_rm_frontend_dispatch(
             ECLIPSE_CTL_DEVICE_ONLY(bCtl);
 
             Nv04UnmapMemoryWithSecInfo(pApi, secInfo);
+            break;
+        }
+
+        case NV_ESC_RM_ALLOC_MEMORY:
+        {
+            nv_ioctl_nvos02_parameters_with_fd *pApi;
+            NVOS02_PARAMETERS *pParms;
+
+            if (dataSize != sizeof(*pApi))
+            {
+                rmStatus = NV_ERR_INVALID_ARGUMENT;
+                goto done;
+            }
+
+            pApi = pData;
+            pParms = &pApi->params;
+
+            ECLIPSE_ACTUAL_DEVICE_ONLY(bCtl);
+
+            /*
+             * The other classes are Nv01AllocMemoryWithSecInfo, and system
+             * memory to be mapped at once also has its mapping recorded on
+             * the file the payload's fd names, which this call cannot do
+             * yet. They are refused by name rather than half served.
+             */
+            if (pParms->hClass != NV01_MEMORY_SYSTEM_OS_DESCRIPTOR)
+            {
+                rmStatus = NV_ERR_NOT_SUPPORTED;
+                goto done;
+            }
+
+            _eclipse_rm_alloc_os_descriptor(pParms, secInfo);
+            break;
+        }
+
+        case NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO:
+        {
+            NVOS56_PARAMETERS *pApi = pData;
+            void *pOldCpuAddress;
+            void *pNewCpuAddress;
+
+            if (dataSize != sizeof(*pApi))
+            {
+                rmStatus = NV_ERR_INVALID_ARGUMENT;
+                goto done;
+            }
+
+            ECLIPSE_CTL_DEVICE_ONLY(bCtl);
+
+            pOldCpuAddress = NvP64_VALUE(pApi->pOldCpuAddress);
+            pNewCpuAddress = NvP64_VALUE(pApi->pNewCpuAddress);
+
+            pApi->status = _eclipse_rm_update_device_mapping_info(pApi->hClient,
+                                                                  pApi->hDevice,
+                                                                  pApi->hMemory,
+                                                                  pOldCpuAddress,
+                                                                  pNewCpuAddress);
             break;
         }
 
@@ -1606,7 +1972,8 @@ NvU32 eclipse_rm_frontend_gpu_instance(void *pGpu)
  * sizeof() of the nv-ioctl.h payloads the Rust side lays out by hand (and
  * the offset of the one field it reads from RM_MAP_MEMORY's, the event
  * RM_GET_EVENT_DATA copies out, NUMA_INFO's payload and the offset of its
- * count, and the size of the mapping record it shares with this file), in
+ * count, RM_ALLOC_MEMORY's payload and the offset of its address, and the
+ * size of the mapping record it shares with this file), in
  * the order of `LAYOUT` (frontend.rs). The kernel side compares them
  * with its own `size_of` before serving the first ioctl, so a header that
  * moves under a re-pinned submodule refuses the front end instead of
@@ -1631,7 +1998,9 @@ NvU32 eclipse_rm_frontend_layout(NvU32 which)
         case 12: return sizeof(NvUnixEvent);
         case 13: return sizeof(nv_ioctl_numa_info_t);
         case 14: return (NvU32) NV_OFFSETOF(nv_ioctl_numa_info_t, offline_addresses.numEntries);
-        case 15: return sizeof(EclipseRmMmapContext);
+        case 15: return sizeof(nv_ioctl_nvos02_parameters_with_fd);
+        case 16: return (NvU32) NV_OFFSETOF(nv_ioctl_nvos02_parameters_with_fd, params.pMemory);
+        case 17: return sizeof(EclipseRmMmapContext);
         default: return 0;
     }
 }
