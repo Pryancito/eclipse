@@ -62,4 +62,6 @@ pub(super) fn proc_pid_limits(lp: &LinuxProcess) -> String {
 }
 
 #[cfg(test)]
+mod row_tests;
+#[cfg(test)]
 mod tests;
