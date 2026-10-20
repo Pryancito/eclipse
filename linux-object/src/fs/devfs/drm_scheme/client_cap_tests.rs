@@ -87,3 +87,86 @@ fn set_client_cap_takes_booleans_and_refuses_hotspot_and_the_unknown() {
         assert_eq!(set_cap(&c, unknown, 0), Err(FsError::InvalidParam));
     }
 }
+
+/// `drm_setclientcap` stores the ATOMIC value in `atomic`,
+/// `universal_planes` AND `aspect_ratio_allowed` ("No atomic user-space
+/// blows up on aspect ratio mode data"): an atomic client gets the
+/// aspect-ratio codes through SETCRTC and back from GETCRTC without ever
+/// asking for `DRM_CLIENT_CAP_ASPECT_RATIO`, and ATOMIC 0 takes them
+/// away again. Here the cap set the first two fields only, so every
+/// atomic compositor had EINVAL on a SETCRTC with an aspect-ratio code
+/// ("Unexpected aspect-ratio flag bits") and read none back.
+#[test]
+fn set_client_cap_atomic_grants_the_aspect_ratio_codes_too() {
+    let (_screen, c) = super::out_fence_tests::atomic_client(32, 8);
+    let state = c.file_state();
+    assert!(state.atomic_client() && state.universal_planes());
+    assert!(state.aspect_ratio(), "ATOMIC 1 is aspect_ratio_allowed too");
+
+    let (crtc, conn) = (drm::SYNTH_CRTC_ID, drm::SYNTH_CONNECTOR_ID);
+    let buf = c.create_dumb(32, 8);
+    let fb = c.addfb2(&buf);
+    let mut with_code = make_modeinfo(32, 8);
+    let flags = u32::from_ne_bytes([with_code[28], with_code[29], with_code[30], with_code[31]]);
+    let code = 4 << 19;
+    with_code[28..32].copy_from_slice(&(flags | code).to_ne_bytes());
+    let setcrtc = |mode: [u8; 68]| {
+        let connectors = [conn];
+        let mut req = DrmModeGetCrtc {
+            set_connectors_ptr: connectors.as_ptr() as u64,
+            count_connectors: 1,
+            crtc_id: crtc,
+            fb_id: fb,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 1,
+            mode,
+        };
+        c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req)
+    };
+    let aspect_bits_read_back = || {
+        let mut res = DrmModeGetCrtc {
+            set_connectors_ptr: 0,
+            count_connectors: 0,
+            crtc_id: crtc,
+            fb_id: 0,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 0,
+            mode: [0xAB; 68],
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut res).expect("GETCRTC");
+        u32::from_ne_bytes([res.mode[28], res.mode[29], res.mode[30], res.mode[31]])
+            & DRM_MODE_FLAG_PIC_AR_MASK
+    };
+
+    // The code goes through and comes back, with no ASPECT_RATIO cap set.
+    assert_eq!(
+        setcrtc(with_code),
+        Ok(0),
+        "aspect-ratio code 4 as an atomic client"
+    );
+    assert_eq!(aspect_bits_read_back(), code);
+
+    // ATOMIC 0: the three fields go together, and the code is refused
+    // and hidden again.
+    assert_eq!(set_cap(&c, DRM_CLIENT_CAP_ATOMIC, 0), Ok(0));
+    assert!(!state.atomic_client() && !state.universal_planes());
+    assert!(
+        !state.aspect_ratio(),
+        "ATOMIC 0 takes aspect_ratio_allowed away"
+    );
+    assert_eq!(setcrtc(with_code), Err(FsError::InvalidParam));
+    assert_eq!(
+        aspect_bits_read_back(),
+        0,
+        "the bits are masked without the cap"
+    );
+
+    // ATOMIC 2 (relaxed checking) grants them like 1 does.
+    assert_eq!(set_cap(&c, DRM_CLIENT_CAP_ATOMIC, 2), Ok(0));
+    assert!(state.aspect_ratio());
+    assert_eq!(aspect_bits_read_back(), code);
+}

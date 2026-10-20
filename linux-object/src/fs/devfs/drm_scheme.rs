@@ -1405,10 +1405,16 @@ impl DrmDev {
                         if value > 2 {
                             return Err(FsError::InvalidParam);
                         }
-                        // Setting atomic also implies universal planes:
-                        // `drm_setclientcap` stores the value in both fields.
+                        // Setting atomic also implies universal planes AND
+                        // the aspect-ratio codes: `drm_setclientcap` stores
+                        // the value in all three fields ("No atomic
+                        // user-space blows up on aspect ratio mode data").
+                        // The third was left alone, so every atomic
+                        // compositor had EINVAL on a SETCRTC with an
+                        // aspect-ratio code and read none back from GETCRTC.
                         self.file.set_atomic_client(value != 0);
                         self.file.set_universal_planes(value != 0);
+                        self.file.set_aspect_ratio(value != 0);
                         log::debug!("[drm] SET_CLIENT_CAP ATOMIC={} -> accepted", value);
                         Ok(0)
                     }
