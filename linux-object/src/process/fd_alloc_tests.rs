@@ -647,6 +647,35 @@ mod epoll_fds {
             vec![usize::from(ep)]
         );
     }
+
+    /// The `else` in `note_fd_inserted`, which is what keeps the set exact
+    /// when a file goes in over a number that is ALREADY open: a
+    /// `HashMap::insert` quietly drops what was there and no `note_fd_freed`
+    /// runs for it, so only the removal on the way IN keeps the books
+    /// straight.
+    ///
+    /// Asked of `insert_file` directly because nothing else reaches it that
+    /// way any more: `add_file_at` goes through `replace_file`, which frees
+    /// first, and the production comment says the `else` stays for the next
+    /// caller that does not. A mutation run removed it and all 3481 tests of
+    /// the crate stayed green, which is what this is for.
+    #[test]
+    fn a_file_inserted_over_a_live_epoll_number_takes_the_epoll_out_of_the_set() {
+        let proc = a_process();
+        let ep = proc.add_file(Epoll::new(OpenFlags::empty())).unwrap();
+        assert_eq!(bookkeeping(&proc), vec![usize::from(ep)]);
+
+        let inner = proc.inner.lock();
+        proc.insert_file(inner, ep, an_open_log(Log::new(), OpenFlags::RDWR), false)
+            .expect("well inside the default limit");
+
+        assert!(
+            bookkeeping(&proc).is_empty(),
+            "the number still claims to hold an epoll, so every later close \
+             will build a plan for one that is not there"
+        );
+        assert_in_step(&proc, "an insert over a live epoll number");
+    }
 }
 
 /// The CABLING between a close and the epolls watching what it closed, which
@@ -910,6 +939,34 @@ mod holders {
         proc.close_range(FileDesc::from(0), FileDesc::from(i32::MAX));
         assert!(bookkeeping(&proc).is_empty());
         assert_in_step(&proc, "closing everything");
+    }
+
+    /// What a dying process does: the table goes in one go, and the counts
+    /// have to go with it. Every OTHER removal reports itself through
+    /// `note_fd_freed`; a bulk one that forgot would leave
+    /// `holds_description` answering "still held" for a description nobody
+    /// holds, and the close of a later descriptor that landed at the same
+    /// address would then never tell the epolls.
+    #[test]
+    fn emptying_the_table_forgets_the_holder_counts_too() {
+        let proc = a_process();
+        let file = an_open_log(Log::new(), OpenFlags::RDWR);
+        proc.add_file(file.clone()).unwrap();
+        proc.add_file_cloexec(file.clone(), false).unwrap();
+        assert!(
+            proc.inner.lock().holds_description(&file),
+            "the table has to START holding it, or nothing below is testing \
+             anything"
+        );
+
+        let taken = proc.inner.lock().take_all_files();
+        assert_eq!(taken.len(), 2, "both descriptors came back out");
+
+        assert!(
+            !proc.inner.lock().holds_description(&file),
+            "a description the table no longer holds is still on its books"
+        );
+        assert_in_step(&proc, "emptying the table");
     }
 }
 

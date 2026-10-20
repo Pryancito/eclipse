@@ -17,13 +17,28 @@ pub fn ifreq_name(raw: &[u8; 16]) -> LxResult<&str> {
     core::str::from_utf8(&raw[..len]).map_err(|_| LxError::EINVAL)
 }
 
+/// The transport protocol of an IP packet, when its header says so directly
+/// (an IPv6 extension header reads as "not known" and the caller must assume
+/// anything).
+fn ip_transport_protocol(packet: &[u8]) -> Option<u8> {
+    match packet.first()? >> 4 {
+        4 => packet.get(9).copied(),
+        6 => packet.get(6).copied(),
+        _ => None,
+    }
+}
+
 fn loopback_tx_handler(packet: &[u8]) {
     let version = packet.first().map(|b| b >> 4).unwrap_or(4);
-    info!(
-        "[loopback tx] packet version={}, len={}",
-        version,
-        packet.len()
-    );
+    // TCP and UDP over 127.0.0.1 concern nobody here but an `AF_PACKET`
+    // socket: the ARP, NDP, router-advertisement and ICMP taps `push_packet`
+    // also feeds read none of them. Building the frame anyway cost a zeroed
+    // allocation and a copy of every loopback segment -- 64 KiB of each per
+    // write in a bulk transfer -- on the way to being thrown away.
+    if matches!(ip_transport_protocol(packet), Some(6) | Some(17)) && !packet::has_packet_sockets()
+    {
+        return;
+    }
     let ethertype = if version == 6 { 0x86ddu16 } else { 0x0800u16 };
     // Size the ethernet frame to the actual packet. The old fixed 2 KiB stack
     // buffer truncated any IP packet larger than 2034 bytes, but loopback has a
@@ -1126,6 +1141,9 @@ pub fn poll_ifaces() {
                 warn!("error : {:?}", e)
             }
         }
+    }
+    if zcore_drivers::net::loopback::take_loopback_moved() {
+        kernel_hal::net::wake_net_rx_waiters_now();
     }
     maybe_run_net_housekeeping(mono_us(), false);
 }

@@ -47,6 +47,23 @@ pub(super) struct FakeState {
     pub refuse: BTreeMap<u32, u32>,
     /// Every free, as (by, hClient, hObject).
     pub frees: Vec<(By, u32, u32)>,
+    /// The pages lent to it and not freed, by the handle of their memory.
+    pub lent: BTreeMap<u32, LentPages>,
+    pub last_memory: u32,
+    /// The status lending pages under a device answers with, for those that
+    /// fail.
+    pub refuse_pages: BTreeMap<u32, u32>,
+}
+
+/// Pages made RM memory, with the hold the RM keeps on them.
+pub(super) struct LentPages {
+    pub by: By,
+    pub h_client: u32,
+    pub h_device: u32,
+    pub phys: u64,
+    pub size: u64,
+    pub gpu_cached: bool,
+    pub hold: Arc<dyn Any + Send + Sync>,
 }
 
 impl FakeRm {
@@ -91,10 +108,40 @@ impl Rm for FakeRm {
         Ok(h_virtual)
     }
 
+    fn pages(
+        &self,
+        by: &nvctl::Caller,
+        h_client: u32,
+        h_device: u32,
+        pages: &nvctl::Pages,
+        gpu_cached: bool,
+    ) -> RmResult {
+        let mut state = self.state();
+        if let Some(&status) = state.refuse_pages.get(&h_device) {
+            return Err(status);
+        }
+        state.last_memory += 1;
+        let h_memory = 0xbee0_0000 + state.last_memory;
+        let lent = LentPages {
+            by: By::of(by),
+            h_client,
+            h_device,
+            phys: pages.phys,
+            size: pages.size,
+            gpu_cached,
+            hold: pages.keep.clone(),
+        };
+        state.lent.insert(h_memory, lent);
+        Ok(h_memory)
+    }
+
     fn free(&self, by: &nvctl::Caller, h_client: u32, h_object: u32) {
         let mut state = self.state();
         state.maps.remove(&h_object);
+        let hold = state.lent.remove(&h_object);
         state.frees.push((By::of(by), h_client, h_object));
+        drop(state);
+        drop(hold);
     }
 }
 
@@ -418,7 +465,7 @@ fn mm_initialize_leaves_its_own_open_alone() {
 fn deinitialize_succeeds_and_the_rest_is_enosys() {
     let open = uvm();
     assert_eq!(open.ioctl(cmd::DEINITIALIZE, 0, &plain()), Ok(0));
-    let unserved: Vec<u32> = vec![31, 35, 68, 72, 74, 2047, 0x3000_0003];
+    let unserved: Vec<u32> = vec![31, 35, 69, 72, 74, 2047, 0x3000_0003];
     for cmd in unserved {
         assert_eq!(
             open.ioctl(cmd, 0, &plain()),

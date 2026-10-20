@@ -13,6 +13,8 @@ pub fn dbg_save_addr() -> usize {
 global_asm!(
     include_str!("syscall.S"),
     DBG_OFF = const super::gdt::DBG_SAVE_GS_OFFSET,
+    FS_CACHE = const super::gdt::USER_FSBASE_GS_OFFSET,
+    GS_CACHE = const super::gdt::USER_GSBASE_GS_OFFSET,
 );
 
 pub fn init() {
@@ -94,12 +96,21 @@ impl UserContext {
                 );
                 syscall_return(self);
                 let fp = core::ptr::addr_of_mut!(self.fpstate) as *mut u8;
-                core::arch::asm!(
-                    "xsave [{}]",
-                    in(reg) fp,
-                    in("eax") mask, in("edx") 0u32,
-                    options(nostack, preserves_flags),
-                );
+                if super::XSAVEOPT.load(core::sync::atomic::Ordering::Relaxed) {
+                    core::arch::asm!(
+                        "xsaveopt [{}]",
+                        in(reg) fp,
+                        in("eax") mask, in("edx") 0u32,
+                        options(nostack, preserves_flags),
+                    );
+                } else {
+                    core::arch::asm!(
+                        "xsave [{}]",
+                        in(reg) fp,
+                        in("eax") mask, in("edx") 0u32,
+                        options(nostack, preserves_flags),
+                    );
+                }
             } else {
                 core::arch::asm!("fxrstor [{}]", in(reg) fp, options(readonly, nostack, preserves_flags));
                 syscall_return(self);

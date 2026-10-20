@@ -616,6 +616,11 @@ impl FileLike for Epoll {
         *self.flags.lock()
     }
 
+    /// `epoll_create1`: `anon_inode_getfile("[eventpoll]", ...)`.
+    fn link_name(&self) -> String {
+        String::from("anon_inode:[eventpoll]")
+    }
+
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         // Same trap as eventfd/signalfd/timerfd before `take_settable`: a
         // no-op `Ok(())` made `fcntl(F_SETFL, O_NONBLOCK)` "succeed" while

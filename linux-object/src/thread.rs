@@ -566,6 +566,9 @@ impl CurrentThreadExt for CurrentThread {
             }
         }
         drop(linux_thread);
+        // The children this thread forked are told now, if they asked for
+        // it, and not only once the whole process has gone.
+        crate::process::forget_forking_thread(self.proc(), self.id());
         // `exit(2)` from the LAST thread of a process is the process's exit,
         // and its code is the process's code. Publish the hint first: two
         // concurrent `_exit` calls can both see `thread_count() == 2` and

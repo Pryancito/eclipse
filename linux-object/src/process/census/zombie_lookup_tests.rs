@@ -11,6 +11,7 @@ use crate::signal::{SignalAction, SignalActionFlags, Sigset};
 use crate::thread::ThreadExt;
 use async_std::task::block_on;
 use rcore_fs_ramfs::RamFS;
+use std::sync::Mutex as StdMutex;
 
 /// A live process, with a thread, in a job of its own.
 fn a_parent(pid: KoID) -> (Arc<Job>, Arc<Process>) {
@@ -122,5 +123,88 @@ fn a_live_process_is_found_and_nobody_is_not() {
     let (job, parent) = a_parent(45_334);
     assert_eq!(found(&job, parent.id()), Some(parent.id()));
     assert_eq!(found(&job, 45_338), None);
+    assert!(unreaped_zombies_in(&job).is_empty());
+}
+/// A child that has just exited is already a zombie for `/proc`, before its
+/// teardown has filed it as one. `record_child_exit` moves it from the live
+/// table to the zombies during the teardown, so in the gap the only place it
+/// exists is `children`, with an `Exited` status -- and the zombie list has
+/// to read that table too, or `ps` showed no `<defunct>` for a child that
+/// had already died.
+///
+/// The gap is reached the way another CPU reaches it: a `PROCESS_TERMINATED`
+/// callback registered after fork's runs first, with the status published
+/// and the teardown not started. Note what the job says there: it still has
+/// the child, which is why [`find_task`] never needs the live table for a
+/// single pid -- a pid the job has lost is a pid already filed.
+#[test]
+fn a_child_that_has_just_exited_is_already_a_zombie_for_proc() {
+    let (job, parent) = a_parent(45_335);
+    let child = Process::fork_from(&parent).unwrap();
+    let pid = child.id();
+
+    let seen = Arc::new(StdMutex::new(None));
+    let out = seen.clone();
+    let watched = job.clone();
+    let reaper = parent.clone();
+    child.add_signal_callback(Box::new(move |signal| {
+        if signal.contains(Signal::PROCESS_TERMINATED) {
+            let zombies: Vec<KoID> = unreaped_zombies_in(&watched)
+                .iter()
+                .map(|z| z.id())
+                .collect();
+            *out.lock().unwrap() = Some((
+                watched.find_process(pid).is_some(),
+                reaper.linux().is_zombie_child(pid),
+                found(&watched, pid),
+                zombies,
+            ));
+            return true;
+        }
+        false
+    }));
+
+    child.exit(0);
+
+    let (in_its_job, on_file, names, zombies) =
+        seen.lock().unwrap().take().expect("the callback never ran");
+    assert_eq!(
+        (in_its_job, on_file, names),
+        (true, false, Some(pid)),
+        "(still in its job, on file as a zombie, what its pid names)"
+    );
+    assert_eq!(
+        zombies,
+        [pid],
+        "`/proc` did not list a child that had already exited"
+    );
+
+    reap(&parent, pid);
+    assert_eq!(found(&job, pid), None);
+}
+
+/// A live child is not a zombie. The zombie list reads the parent's LIVE
+/// table as well as its zombies, because a child that has just exited is
+/// still in the live one, so it has to tell the two apart by status: taking
+/// the live table whole listed every running child as a `<defunct>`.
+#[test]
+fn a_live_child_is_not_a_zombie() {
+    let (job, parent) = a_parent(45_336);
+    let alive = Process::fork_from(&parent).unwrap();
+    Thread::create_linux(&alive).unwrap();
+    let dead = Process::fork_from(&parent).unwrap();
+    let dead_pid = dead.id();
+    dead.exit(0);
+    drop(dead);
+
+    let zombies: Vec<KoID> = unreaped_zombies_in(&job).iter().map(|z| z.id()).collect();
+    assert_eq!(
+        zombies,
+        [dead_pid],
+        "the live child {} was counted among the zombies",
+        alive.id()
+    );
+
+    reap(&parent, dead_pid);
     assert!(unreaped_zombies_in(&job).is_empty());
 }

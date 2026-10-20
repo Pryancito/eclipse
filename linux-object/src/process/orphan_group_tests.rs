@@ -228,3 +228,32 @@ fn a_stopped_job_whose_shell_is_alive_stays_stopped() {
         "the shell is still there to run `fg`, so the stop is still the user's"
     );
 }
+
+/// The candidate list is the group the dying process is ITSELF in as well as
+/// its children's, and the first half is the one every end-to-end test above
+/// gets for free: in all of them the stopped job is a CHILD of the process
+/// that dies, so its group arrives through the children either way. A member
+/// of a stopped pipeline that dies while a sibling is still parked in the
+/// same group leaves a group that nothing else would have named.
+#[test]
+fn the_group_the_dying_process_is_in_is_a_candidate_too() {
+    let login = a_process(46_605);
+    login.linux().become_session_leader(login.id());
+    let dying = Process::fork_from(&login).unwrap();
+    Thread::create_linux(&dying).unwrap();
+    dying.linux().set_pgid_raw(dying.id());
+    let child = Process::fork_from(&dying).unwrap();
+    Thread::create_linux(&child).unwrap();
+    child.linux().set_pgid_raw(child.id());
+
+    let candidates = groups_this_death_could_orphan(&dying);
+
+    assert!(
+        candidates.contains(&dying.id()),
+        "the group the dying process is itself in was not named"
+    );
+    assert!(
+        candidates.contains(&child.id()),
+        "the group of a child it still holds was not named"
+    );
+}

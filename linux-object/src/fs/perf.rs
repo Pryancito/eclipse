@@ -455,6 +455,11 @@ impl FileLike for PerfEvent {
         *self.flags.lock()
     }
 
+    /// `perf_event_open`: `anon_inode_getfile("[perf_event]", ...)`.
+    fn link_name(&self) -> String {
+        String::from("anon_inode:[perf_event]")
+    }
+
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         // Same trap as epoll/eventfd before `take_settable`: a no-op made
         // `fcntl(F_SETFL, O_NONBLOCK)` "succeed" while `F_GETFL` never changed.
@@ -742,6 +747,12 @@ mod tests {
             -1,
             OpenFlags::empty(),
         )
+    }
+
+    /// `/proc/<pid>/fd` names a perf event as `perf_event_open` does.
+    #[test]
+    fn a_perf_event_is_named_as_linux_names_it() {
+        assert_eq!(open(0, 0, 0, 1).link_name(), "anon_inode:[perf_event]");
     }
 
     /// `fcntl(F_SETFL, O_NONBLOCK)` on a perf fd used to return success while

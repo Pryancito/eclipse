@@ -110,6 +110,15 @@ impl OpenFlags {
     pub fn close_on_exec(self) -> bool {
         self.contains(Self::CLOEXEC)
     }
+    /// The flags as `F_GETFL` and `/proc/<pid>/fdinfo` report them: without
+    /// the ones that only mattered while opening. `build_open_flags` strips
+    /// `O_CLOEXEC` and `do_dentry_open` strips `O_CREAT|O_EXCL|O_NOCTTY|O_TRUNC`
+    /// before they reach `f_flags`. Here they stay in the stored flags (the
+    /// `O_CLOEXEC` record seeds the descriptor's bit), so `F_GETFL` reported
+    /// them all and a `F_GETFL == O_RDONLY` test on an `O_CLOEXEC` open failed.
+    pub fn status(self) -> Self {
+        self - (Self::CREATE | Self::EXCLUSIVE | Self::NOCTTY | Self::TRUNCATE | Self::CLOEXEC)
+    }
     /// The bits `fcntl(F_SETFL)` may change: `SETFL_MASK` in `fs/fcntl.c`,
     /// the status flags. The access mode, the creation flags and `O_CLOEXEC`
     /// (per descriptor, `F_SETFD`) are not among them. Linux's mask is
@@ -1309,6 +1318,16 @@ impl FileLike for File {
         File::metadata(self)
     }
 
+    /// The path it was opened by, with ` (deleted)` once no name is left
+    /// for it (`d_path` of an unlinked dentry): a file unlinked while it is
+    /// open, and a memfd, which no directory holds.
+    fn link_name(&self) -> String {
+        match self.inner.read().inode.metadata() {
+            Ok(m) if m.nlinks == 0 => alloc::format!("{} (deleted)", self.path),
+            _ => self.path.clone(),
+        }
+    }
+
     fn seek(&self, pos: SeekFrom) -> LxResult<u64> {
         // Delegate to the inherent offset-tracking seek (UFCS avoids recursing
         // into this trait method).
@@ -1466,15 +1485,8 @@ impl FileLike for File {
         // implement it and return ENOSYS — those must fall through to the inode's
         // own poll(), NOT propagate the error (that regressed `poll()` on packet
         // sockets, e.g. udhcpc, to "Function not implemented").
-        if let Ok(meta) = inner.inode.metadata() {
-            if meta.type_ == FileType::NamedPipe {
-                return Ok(PollStatus {
-                    read: meta.size > 0,
-                    write: true,
-                    error: false,
-                    hangup: false,
-                });
-            }
+        if let Some(status) = fifo_node_poll(&inner.inode) {
+            return Ok(status);
         }
         Ok(inner.inode.poll()?)
     }
@@ -1486,15 +1498,8 @@ impl FileLike for File {
         // when metadata() is available — sockets/special devices return ENOSYS
         // and must fall through to the inode's own async_poll() rather than
         // failing the whole poll() syscall.
-        if let Ok(meta) = inode.metadata() {
-            if meta.type_ == FileType::NamedPipe {
-                return Ok(PollStatus {
-                    read: meta.size > 0,
-                    write: true,
-                    error: false,
-                    hangup: false,
-                });
-            }
+        if let Some(status) = fifo_node_poll(&inode) {
+            return Ok(status);
         }
 
         // `INode::async_poll` takes no events, so every inode that implements it
@@ -1732,6 +1737,16 @@ impl FileLike for File {
                     if let Some(nvidia) = inner.inode.downcast_ref::<super::devfs::NvidiaOpen>() {
                         return nvidia.get_vmo(offset, len);
                     }
+                    // `uvm_mmap` takes only MAP_SHARED, which is
+                    // `get_vmo_shared`'s.
+                    #[cfg(target_arch = "x86_64")]
+                    if inner
+                        .inode
+                        .downcast_ref::<super::devfs::nvidia_uvm::UvmOpen>()
+                        .is_some()
+                    {
+                        return Err(LxError::EINVAL);
+                    }
                     Err(LxError::ENOSYS)
                 }
             }
@@ -1742,6 +1757,15 @@ impl FileLike for File {
     fn get_vmo_shared(&self, offset: usize, len: usize) -> LxResult<(Arc<VmObject>, usize)> {
         let inner = self.inner.read();
         if inner.inode.metadata()?.type_ != FileType::File {
+            // A semaphore pool of /dev/nvidia-uvm is the one device mapping
+            // only MAP_SHARED reaches.
+            #[cfg(target_arch = "x86_64")]
+            if let Some(uvm) = inner
+                .inode
+                .downcast_ref::<super::devfs::nvidia_uvm::UvmOpen>()
+            {
+                return uvm.get_vmo(offset, len).map(|vmo| (vmo, 0));
+            }
             // Devices keep their own get_vmo (fb/drm are inherently shared).
             drop(inner);
             return self.get_vmo(offset, len).map(|vmo| (vmo, 0));
@@ -1772,6 +1796,23 @@ impl FileLike for File {
         drop(inner);
         self.get_vmo(offset, len).map(|vmo| (vmo, 0))
     }
+}
+
+/// What `poll` says of a FIFO node opened from the fs, which has no pipe
+/// buffer or writer count behind it here: readable only once it holds bytes,
+/// or a reader that never gets a writer spins on 0-byte reads. A pipe from
+/// `pipe2` is a FIFO to `fstat` as well, and answers for itself.
+fn fifo_node_poll(inode: &Arc<dyn INode>) -> Option<PollStatus> {
+    if inode.downcast_ref::<super::pipe::Pipe>().is_some() {
+        return None;
+    }
+    let meta = inode.metadata().ok()?;
+    (meta.type_ == FileType::NamedPipe).then_some(PollStatus {
+        read: meta.size > 0,
+        write: true,
+        error: false,
+        hangup: false,
+    })
 }
 
 /// The `FIONREAD` answer of a `File` over an inode of `type_`: bytes from
@@ -1862,6 +1903,28 @@ mod fionread_tests {
 #[cfg(test)]
 mod pipe_seek_tests {
     use super::*;
+
+    /// A pipe is a FIFO to `fstat`, and still polls for itself: readable once
+    /// it holds bytes, writable while it has room. The FIFO-node answer is
+    /// for a node from `mkfifo`, whose size is what it holds; a pipe's size
+    /// is 0 whatever it holds, so taken for one it never read as readable.
+    #[test]
+    fn a_pipe_polls_for_itself_and_not_as_a_fifo_node() {
+        let (r, w) = crate::fs::Pipe::create_pair();
+        let reader = File::new(Arc::new(r), OpenFlags::RDONLY, String::from("pipe:[r]"));
+        let writer = File::new(Arc::new(w), OpenFlags::WRONLY, String::from("pipe:[w]"));
+        let ready = |f: &Arc<File>| {
+            let s = FileLike::poll(&**f, PollEvents::IN | PollEvents::OUT).unwrap();
+            (s.read, s.write)
+        };
+        assert_eq!(ready(&reader), (false, false));
+        assert_eq!(ready(&writer), (false, true));
+        writer.write(b"x").unwrap();
+        assert_eq!(ready(&reader), (true, false));
+        use async_std::task::block_on;
+        let s = block_on(FileLike::async_poll(&*reader, PollEvents::IN)).unwrap();
+        assert!(s.read, "and the same when a poll waits");
+    }
 
     /// `lseek` on a pipe must be `ESPIPE`, not a silent success.
     #[test]

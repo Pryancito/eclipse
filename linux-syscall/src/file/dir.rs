@@ -32,6 +32,9 @@ pub(crate) fn getcwd_into(cwd: &str, mut buf: UserOutPtr<u8>, len: usize) -> Sys
     Ok(with_nul)
 }
 
+/// Where `chdir` and `fchdir` leave a process.
+mod cwd;
+
 impl Syscall<'_> {
     /// return a null-terminated string containing an absolute pathname
     /// that is the current working directory of the calling process.
@@ -40,8 +43,11 @@ impl Syscall<'_> {
     pub fn sys_getcwd(&self, buf: UserOutPtr<u8>, len: usize) -> SysResult {
         info!("getcwd: buf={:?}, len={:#x}", buf, len);
         let proc = self.linux_process();
-        let cwd = proc.current_working_directory();
-        getcwd_into(&cwd, buf, len)
+        // `if (!d_unlinked(pwd.dentry)) ... else error = -ENOENT;`
+        if proc.working_directory_removed() {
+            return Err(LxError::ENOENT);
+        }
+        getcwd_into(&proc.current_working_directory(), buf, len)
     }
 
     /// Change the current directory.
@@ -57,7 +63,7 @@ impl Syscall<'_> {
             return Err(LxError::ENOTDIR);
         }
         proc.check_access(&info, 0o1, true)?;
-        proc.change_directory(path);
+        proc.change_directory(&cwd::physical_dir(proc, path));
         Ok(0)
     }
 
@@ -424,39 +430,16 @@ impl Syscall<'_> {
             proc.lookup_inode_at(dirfd, path, false)?;
             return Err(LxError::EINVAL);
         }
-        // readlink(2) must follow symlinks in *intermediate* path components but
-        // NOT the final one.
-        //
-        // Two resolution strategies are needed:
-        //  1. Whole-path, no-follow: this is what reaches the magic links that
-        //     `lookup_inode_at` special-cases on the FULL path string
-        //     (`/proc/self/exe`, `/proc/self/fd/N`, ...). Firefox reads
-        //     `/proc/self/exe` to find its install dir, so this MUST work.
-        //  2. Parent-follow + final-no-follow: needed for a link whose parent
-        //     dir is itself reached through a symlink — e.g. libdrm's
-        //     readlink("/sys/dev/char/226:0/device/subsystem") where `device`
-        //     is a symlink; strategy 1 stops at it (no-follow) and fails.
-        // Try (1) first and accept it only when it yields a symlink; otherwise
-        // fall back to (2). (1) never matched the magic links before because
-        // this function split the path and bypassed the full-path special case.
-        let inode = match proc.lookup_inode_at(dirfd, path, false) {
-            Ok(i)
-                if i.metadata()
-                    .map(|m| m.type_ == FileType::SymLink)
-                    .unwrap_or(false) =>
-            {
-                i
-            }
-            _ => {
-                let (dir_path, file_name) = split_path(path);
-                if file_name.is_empty() || file_name == "." || file_name == ".." {
-                    proc.lookup_inode_at(dirfd, path, false)?
-                } else {
-                    let dir = proc.lookup_inode_at(dirfd, dir_path, true)?;
-                    dir.find(file_name).map_err(LxError::from)?
-                }
-            }
-        };
+        // readlink(2) follows the links on the way to the last component and
+        // not the last one, which is what a lookup that does not follow does.
+        // Asking for the whole path is also what reaches the magic links that
+        // `lookup_inode_at` special-cases on the full path string
+        // (`/proc/self/exe`, `/proc/self/fd/N`, ...): Firefox reads
+        // `/proc/self/exe` to find its install dir. Until the walk followed
+        // the links on the way, this fell back to looking the parent up with
+        // follow and the name in it, for libdrm's
+        // `readlink("/sys/dev/char/226:0/device/subsystem")`.
+        let inode = proc.lookup_inode_at(dirfd, path, false)?;
         if inode.metadata()?.type_ != FileType::SymLink {
             return Err(LxError::EINVAL);
         }
@@ -479,7 +462,7 @@ impl Syscall<'_> {
             return Err(LxError::ENOTDIR);
         }
         proc.check_access(&info, 0o1, true)?;
-        proc.change_directory(file.path());
+        proc.change_directory(&cwd::physical_dir(proc, file.path()));
         Ok(0)
     }
 

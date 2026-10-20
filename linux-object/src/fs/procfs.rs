@@ -14,6 +14,14 @@ use zircon_object::task::{Job, Process, Status, Thread, ThreadState, ROOT_JOB};
 
 use crate::process::ProcessExt;
 
+/// `/proc/<pid>/cmdline` and `environ` out of the process's memory.
+mod arg_area;
+#[cfg(test)]
+mod comm_tests;
+#[cfg(test)]
+mod cwd_tests;
+/// `/proc/<pid>/limits`, in its own file for the same reason.
+mod limits;
 /// `/proc/present`, in its own file: `procfs.rs` sits on the size ratchet.
 mod present;
 /// `/proc/<pid>/status`, in its own file for the same reason.
@@ -801,6 +809,8 @@ pub(crate) const PID_INODE_SLOTS: usize = 16;
 pub(crate) const PID_FD_DIR_SLOT: usize = 10;
 /// Slot of `/proc/<pid>/task`.
 pub(crate) const PID_TASK_DIR_SLOT: usize = 11;
+/// Slot of `/proc/<pid>/fdinfo` (`proc_self/fdinfo.rs`).
+pub(crate) const PID_FDINFO_DIR_SLOT: usize = 13;
 
 pub(crate) fn pid_inode(pid: u64, slot: usize) -> usize {
     debug_assert!(slot < PID_INODE_SLOTS);
@@ -856,10 +866,10 @@ impl ProcPidDirINode {
         }
     }
 
-    fn entries() -> [&'static str; 14] {
+    fn entries() -> [&'static str; 18] {
         [
-            ".", "..", "stat", "cmdline", "status", "perf", "maps", "fd", "comm", "environ",
-            "statm", "exe", "threads", "task",
+            ".", "..", "stat", "cmdline", "status", "perf", "maps", "fd", "fdinfo", "comm",
+            "environ", "statm", "exe", "threads", "task", "cwd", "root", "limits",
         ]
     }
 }
@@ -894,8 +904,9 @@ impl INode for ProcPidDirINode {
             ctime: Timespec { sec: 0, nsec: 0 },
             type_: FileType::Dir,
             mode: 0o555,
-            // `.`, the name in `/proc`, and the `..` of `fd` and of `task`.
-            nlinks: 4,
+            // `.`, the name in `/proc`, and the `..` of `fd`, `fdinfo` and
+            // `task`.
+            nlinks: 5,
             uid: 0,
             gid: 0,
             rdev: 0,
@@ -948,6 +959,12 @@ impl INode for ProcPidDirINode {
                     process: self.process().ok_or(FsError::EntryNotFound)?,
                 }))
             }
+            "fdinfo" => {
+                self.check_read_innards()?;
+                Ok(Arc::new(super::proc_self::ProcFdInfoDir {
+                    process: self.process().ok_or(FsError::EntryNotFound)?,
+                }))
+            }
             "comm" => Ok(Arc::new(ProcPidFileINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Comm,
@@ -967,6 +984,10 @@ impl INode for ProcPidDirINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Threads,
             })),
+            "limits" => Ok(Arc::new(ProcPidFileINode {
+                pid: self.pid,
+                kind: ProcPidFileKind::Limits,
+            })),
             "task" => Ok(Arc::new(ProcPidTaskDirINode { pid: self.pid })),
             "exe" => {
                 self.check_read_innards()?;
@@ -975,6 +996,25 @@ impl INode for ProcPidDirINode {
                     .try_linux()
                     .map(|lp| lp.execute_path())
                     .unwrap_or_default();
+                Ok(Arc::new(super::pseudo::Pseudo::new(
+                    &path,
+                    FileType::SymLink,
+                )))
+            }
+            // The working directory and the root, which a process could not
+            // see of itself or another (`pwdx`, `lsof`). There is no
+            // `chroot`, so the root is everyone's.
+            "cwd" | "root" => {
+                self.check_read_innards()?;
+                let proc = self.process().ok_or(FsError::EntryNotFound)?;
+                // A zombie has neither (`exit_fs`).
+                if let Status::Exited(_) = proc.status() {
+                    return Err(FsError::EntryNotFound);
+                }
+                let path = match (name, proc.try_linux()) {
+                    ("cwd", Some(lp)) => lp.working_directory_link(),
+                    _ => String::from("/"),
+                };
                 Ok(Arc::new(super::pseudo::Pseudo::new(
                     &path,
                     FileType::SymLink,
@@ -1321,6 +1361,29 @@ fn comm_from_written_bytes(bytes: &[u8]) -> String {
     comm
 }
 
+/// `comm_write`: `thread` takes the name written, if the writer is one of
+/// `proc`'s own threads. Anyone else gets `EINVAL` (`same_thread_group(
+/// current, p)`); it used to be able to rename any thread of any process.
+fn write_comm(proc: &Process, thread: &Thread, buf: &[u8]) -> Result<usize> {
+    use crate::thread::ThreadExt;
+    if !may_rename(current_process_id(), proc.id()) {
+        return Err(FsError::InvalidParam);
+    }
+    // Whatever the offset, the whole file is the one name: Linux ignores
+    // `*ppos` in `comm_write` too.
+    thread.lock_linux().comm = comm_from_written_bytes(buf);
+    // The caller wrote every byte it handed over, even the ones past
+    // `TASK_COMM_LEN` that the kernel drops; a short count would have
+    // `write(2)` loop and re-write the tail as a new name.
+    Ok(buf.len())
+}
+
+/// Whether `caller` may rename a thread of `target`: only its own. No caller
+/// is the kernel itself (and every host test).
+fn may_rename(caller: Option<u64>, target: u64) -> bool {
+    caller.is_none_or(|caller| caller == target)
+}
+
 /// `/proc/<pid>/task/<tid>/comm`.
 struct ProcTidCommINode {
     pid: u64,
@@ -1340,15 +1403,8 @@ impl INode for ProcTidCommINode {
     }
 
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
-        use crate::thread::ThreadExt;
-        let (_proc, thread) = tid_task(self.pid, self.tid)?;
-        // Whatever the offset, the whole file is the one name: Linux ignores
-        // `*ppos` in `comm_write` too.
-        thread.lock_linux().comm = comm_from_written_bytes(buf);
-        // The caller wrote every byte it handed over, even the ones past
-        // `TASK_COMM_LEN` that the kernel drops; a short count would have
-        // `write(2)` loop and re-write the tail as a new name.
-        Ok(buf.len())
+        let (proc, thread) = tid_task(self.pid, self.tid)?;
+        write_comm(&proc, &thread, buf)
     }
 
     /// `O_TRUNC` leaves the name as it is: in Linux `proc_setattr` takes the
@@ -2419,11 +2475,14 @@ enum ProcPidFileKind {
     Environ,
     Statm,
     Threads,
+    Limits,
 }
 
 impl ProcPidFileKind {
     /// The file's slot in its process's inode numbers (see `pid_inode`):
-    /// one per kind, none of them the directory's 0 or `PID_FD_DIR_SLOT`.
+    /// one per kind, none of them the directory's 0 or a subdirectory's.
+    /// `limits` had 10, which `fd` has, so the two were one file to
+    /// anything that compares by inode.
     fn slot(self) -> usize {
         match self {
             Self::Stat => 1,
@@ -2435,6 +2494,7 @@ impl ProcPidFileKind {
             Self::Environ => 7,
             Self::Statm => 8,
             Self::Threads => 9,
+            Self::Limits => 12,
         }
     }
 }
@@ -2485,7 +2545,9 @@ impl ProcPidFileINode {
         let proc = crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
         Ok(match self.kind {
             ProcPidFileKind::Stat => proc_pid_stat(&proc).into_bytes(),
-            ProcPidFileKind::Cmdline => proc_pid_cmdline(&proc),
+            ProcPidFileKind::Cmdline => {
+                arg_area::read(&proc, false).unwrap_or_else(|| proc_pid_cmdline(&proc))
+            }
             ProcPidFileKind::Status => proc_pid_status(&proc).into_bytes(),
             ProcPidFileKind::Perf => match proc.try_linux() {
                 Some(lp) => crate::perf::proc_report(lp, self.pid).into_bytes(),
@@ -2494,19 +2556,20 @@ impl ProcPidFileINode {
             ProcPidFileKind::Maps => proc_pid_maps(&proc).into_bytes(),
             ProcPidFileKind::Comm => alloc::format!("{}\n", proc_comm(&proc)).into_bytes(),
             // NUL-separated KEY=VALUE list, exactly like cmdline's encoding.
-            ProcPidFileKind::Environ => match proc.try_linux() {
-                Some(lp) => {
-                    let mut out = Vec::new();
-                    for env in lp.environ() {
-                        out.extend_from_slice(env.as_bytes());
-                        out.push(0);
-                    }
-                    out
+            ProcPidFileKind::Environ => arg_area::read(&proc, true).unwrap_or_else(|| {
+                let mut out = Vec::new();
+                for env in proc.try_linux().map(|lp| lp.environ()).unwrap_or_default() {
+                    out.extend_from_slice(env.as_bytes());
+                    out.push(0);
                 }
-                None => Vec::new(),
-            },
+                out
+            }),
             ProcPidFileKind::Statm => proc_pid_statm(&proc).into_bytes(),
             ProcPidFileKind::Threads => proc_pid_threads(&proc).into_bytes(),
+            ProcPidFileKind::Limits => proc
+                .try_linux()
+                .map(|lp| limits::proc_pid_limits(lp).into_bytes())
+                .unwrap_or_default(),
         })
     }
 }
@@ -2516,14 +2579,29 @@ impl INode for ProcPidFileINode {
         slice_read_at(&self.bytes()?, offset, buf)
     }
 
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        Err(FsError::NotSupported)
+    /// `comm` renames the process's leader, as `task/<pid>/comm` does.
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        if !matches!(self.kind, ProcPidFileKind::Comm) {
+            return Err(FsError::NotSupported);
+        }
+        let proc = crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
+        let leader = proc_first_thread(&proc).ok_or(FsError::EntryNotFound)?;
+        write_comm(&proc, &leader, buf)
+    }
+
+    /// The `O_TRUNC` of an `fopen(.., "w")` on `comm`; see
+    /// [`ProcTidCommINode::resize`].
+    fn resize(&self, _len: usize) -> Result<()> {
+        match self.kind {
+            ProcPidFileKind::Comm => Ok(()),
+            _ => Err(FsError::NotSupported),
+        }
     }
 
     fn poll(&self) -> Result<PollStatus> {
         Ok(PollStatus {
             read: true,
-            write: false,
+            write: matches!(self.kind, ProcPidFileKind::Comm),
             error: false,
             hangup: false,
         })
@@ -2541,7 +2619,10 @@ impl INode for ProcPidFileINode {
             mtime: Timespec { sec: 0, nsec: 0 },
             ctime: Timespec { sec: 0, nsec: 0 },
             type_: FileType::File,
-            mode: 0o444,
+            mode: match self.kind {
+                ProcPidFileKind::Comm => 0o644,
+                _ => 0o444,
+            },
             nlinks: 1,
             uid: 0,
             gid: 0,
@@ -4701,26 +4782,20 @@ mod proc_inode_tests {
 
     #[test]
     fn a_process_s_directory_and_each_file_under_it_are_distinct_inodes() {
-        let kinds = [
-            ProcPidFileKind::Stat,
-            ProcPidFileKind::Cmdline,
-            ProcPidFileKind::Status,
-            ProcPidFileKind::Perf,
-            ProcPidFileKind::Maps,
-            ProcPidFileKind::Comm,
-            ProcPidFileKind::Environ,
-            ProcPidFileKind::Statm,
-            ProcPidFileKind::Threads,
-        ];
-        let inodes_of = |pid: u64| -> Vec<usize> {
-            let mut v = alloc::vec![ProcPidDirINode { pid }.metadata().unwrap().inode];
-            v.extend(
-                kinds
-                    .iter()
-                    .map(|&kind| ProcPidFileINode { pid, kind }.metadata().unwrap().inode),
-            );
-            v.push(pid_inode(pid, PID_FD_DIR_SLOT));
-            v
+        // Every entry the directory lists, looked up by its name, so none can
+        // be left out: the list was written by hand, `limits` was not on it,
+        // and it had the inode of `fd`. `..` is `/proc`, and the links (`exe`,
+        // `cwd`, `root`) are inode 0 whoever's they are.
+        let inodes_of = |pid: u64| -> Vec<(&'static str, usize)> {
+            let dir = ProcPidDirINode { pid };
+            ProcPidDirINode::entries()
+                .iter()
+                .filter(|&&name| name != "..")
+                .filter_map(|&name| {
+                    let m = dir.find(name).unwrap().metadata().unwrap();
+                    (m.type_ != FileType::SymLink).then_some((name, m.inode))
+                })
+                .collect()
         };
         // The files answer `metadata` from the process, so it must exist.
         let pids = [4601u64, 4607, 4661];
@@ -4739,15 +4814,11 @@ mod proc_inode_tests {
             .collect();
         let mut all: Vec<(String, usize)> = Vec::new();
         for pid in pids {
-            for (i, inode) in inodes_of(pid).into_iter().enumerate() {
-                assert!(
-                    inode >= PID_INODE_BASE,
-                    "pid {} slot {} at {}",
-                    pid,
-                    i,
-                    inode
-                );
-                all.push((alloc::format!("{}/{}", pid, i), inode));
+            let inodes = inodes_of(pid);
+            assert!(inodes.iter().any(|&(name, _)| name == "fdinfo"));
+            for (name, inode) in inodes {
+                assert!(inode >= PID_INODE_BASE, "{}/{} at {}", pid, name, inode);
+                all.push((alloc::format!("{}/{}", pid, name), inode));
             }
         }
         assert_eq!(duplicates(&all), Vec::new());

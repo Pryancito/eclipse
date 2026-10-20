@@ -15,6 +15,12 @@ fn a_configured_parent() -> LinuxProcessInner {
         execute_path: String::from("/usr/bin/labwc"),
         cmdline: alloc::vec![String::from("labwc"), String::from("-s")],
         environ: alloc::vec![String::from("WAYLAND_DISPLAY=wayland-0")],
+        arg_area: Some(crate::loader::ArgArea {
+            arg_start: 0x7fff_0000,
+            arg_end: 0x7fff_0010,
+            env_start: 0x7fff_0010,
+            env_end: 0x7fff_0030,
+        }),
         current_working_directory: String::from("/home/moebius"),
         limits: {
             let mut limits = RLimits::default();
@@ -135,6 +141,14 @@ fn the_environment_survives_the_fork() {
         child.environ,
         alloc::vec![String::from("WAYLAND_DISPLAY=wayland-0")]
     );
+}
+
+#[test]
+fn the_child_reads_its_arguments_where_the_parent_did() {
+    // A fork copies the memory at the same addresses, so the child's
+    // `/proc/<pid>/cmdline` is read from the same place until it execs.
+    let child = fork_of(&a_configured_parent());
+    assert_eq!(child.arg_area, a_configured_parent().arg_area);
 }
 
 #[test]

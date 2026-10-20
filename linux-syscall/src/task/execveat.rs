@@ -133,7 +133,7 @@ pub(super) fn exec_target(
 /// A step the walk cannot take -- a component that is not there any more, a
 /// link that cannot be read, a chain longer than `MAXSYMLINKS` -- leaves the
 /// path as given, folded, which is what this said before it followed links.
-pub(super) fn real_path(proc: &LinuxProcess, path: &str) -> String {
+pub(crate) fn real_path(proc: &LinuxProcess, path: &str) -> String {
     let fold = |parts: &[String]| String::from("/") + &parts.join("/");
     let given = || {
         let mut parts = Vec::new();

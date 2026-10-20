@@ -114,3 +114,28 @@ fn a_new_thread_starts_without_the_flag() {
     t.set_sched_reset_on_fork(false);
     assert!(!t.sched_reset_on_fork());
 }
+
+/// A real-time parent that did NOT ask for a reset hands its priority down
+/// with its class. Only `SCHED_RESET_ON_FORK` takes it away, and every test
+/// here with a priority in it set that flag: a child cloned from a
+/// `SCHED_FIFO` thread at priority 30 kept the class and started at 0, which
+/// in a fixed-priority class is not a thread that runs a little later, it is a
+/// thread the scheduler never picks over any other FIFO task.
+#[test]
+fn a_cloned_thread_of_a_real_time_parent_keeps_its_priority() {
+    let parent = a_thread();
+    parent.set_sched(SCHED_FIFO, 0, 30);
+    let child = a_thread();
+
+    child.inherit_sched(&parent);
+
+    assert_eq!(
+        (
+            child.sched_policy(),
+            child.sched_nice(),
+            child.sched_rt_priority()
+        ),
+        (SCHED_FIFO, 0, 30),
+        "the child of a SCHED_FIFO task that never asked for a reset"
+    );
+}

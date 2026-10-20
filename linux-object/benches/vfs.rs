@@ -228,3 +228,29 @@ fn perf_kernel_report(b: &mut Bencher) {
 fn perf_global_report(b: &mut Bencher) {
     b.iter(|| test::black_box(linux_object::perf::global_report()));
 }
+
+/// One `pwrite(2)` of a byte to `/dev/null` through the `File` chokepoint every
+/// `write(2)` on a descriptor passes: the room `RLIMIT_FSIZE` leaves, the memfd
+/// seal check and the page-cache overlay, none of which a character device
+/// has any use for. The `_256` row keeps that many memfds alive beside it, as a
+/// desktop does (a `wl_shm` pool per window, a segment per Firefox IPC
+/// message): a check that walks them all on every write grows with them.
+fn bench_pwrite_dev_null(b: &mut Bencher, memfds: usize) {
+    use linux_object::fs::FileLike;
+    let null: Arc<dyn INode> = Arc::new(rcore_fs_devfs::special::NullINode::new());
+    let file = File::new(null, OpenFlags::WRONLY, "/dev/null".into());
+    let _keep: Vec<_> = (0..memfds)
+        .map(|i| linux_object::fs::new_memfd(&format!("bench{}", i), 0).expect("a memfd"))
+        .collect();
+    b.iter(|| test::black_box(file.write_at(0, &[1u8]).expect("/dev/null takes it")));
+}
+
+#[bench]
+fn pwrite_dev_null(b: &mut Bencher) {
+    bench_pwrite_dev_null(b, 0);
+}
+
+#[bench]
+fn pwrite_dev_null_with_256_memfds(b: &mut Bencher) {
+    bench_pwrite_dev_null(b, 256);
+}

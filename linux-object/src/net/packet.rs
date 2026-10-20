@@ -32,6 +32,11 @@ lazy_static! {
     static ref PACKET_SOCKETS: Mutex<Vec<Weak<PacketSocketInner>>> = Mutex::new(Vec::new());
 }
 
+/// Whether any `AF_PACKET` socket is open to be handed a frame.
+pub fn has_packet_sockets() -> bool {
+    PACKET_SOCKETS.lock().iter().any(|w| w.strong_count() > 0)
+}
+
 fn purge_dead_sockets(sockets: &mut Vec<Weak<PacketSocketInner>>) {
     sockets.retain(|w| w.strong_count() > 0);
 }

@@ -6,11 +6,14 @@ syscall_return:
     cli
 
     # save callee-saved registers
-    mov ecx, 0xC0000100
-    rdmsr
-    shl rdx, 32
-    or  rax, rdx
-    push rax                # push fsbase
+    #
+    # The kernel's own FSBASE is not saved here, nor restored on the way back
+    # in: no kernel code addresses through `fs` (the kernel image has no
+    # `fs:` operand), so the user's base can stay loaded while the CPU runs
+    # the kernel, as on Linux. That was one RDMSR and one WRMSR on every
+    # syscall and every trap from user mode. Its slot stays, as padding, so
+    # the kernel rsp stored in TSS.sp0 below keeps its 16-byte alignment.
+    push rax                # pad (was fsbase)
     push r15
     push r14
     push r13
@@ -24,15 +27,39 @@ syscall_return:
     mov rsp, rdi            # set rsp = bottom of trap frame
 
     # pop fsbase gsbase
-    swapgs                  # store kernel gsbase
+    #
+    # Each base is written only when it differs from what this CPU's MSR
+    # already holds (`gs:[FS_CACHE]`, `gs:[GS_CACHE]`). A thread going back to
+    # the CPU it trapped on -- every syscall that does not block -- finds both
+    # equal and pays for no WRMSR at all; it paid two on every return, and two
+    # RDMSRs on every entry to read back values that cannot have changed:
+    # CR4.FSGSBASE is clear, so ring 3 has no way to move either base except
+    # `arch_prctl`, which writes the saved context and so comes back through
+    # here. The entry paths therefore leave the two slots alone, and they still
+    # hold what was loaded from them.
+    #
+    # The user GSBASE goes into KERNEL_GS_BASE while the kernel's GS is still
+    # active (`gs:` is the per-CPU region until the `swapgs`), and the `swapgs`
+    # below makes it the active one.
+    mov rax, [rsp + 18*8]   # fsbase
+    cmp rax, gs:[{FS_CACHE}]
+    je 1f
+    mov gs:[{FS_CACHE}], rax
+    mov rdx, rax
+    shr rdx, 32
     mov ecx, 0xC0000100
-    mov edx, [rsp + 18*8+4]
-    mov eax, [rsp + 18*8]
     wrmsr                   # pop fsbase
-    mov ecx, 0xC0000101
-    mov edx, [rsp + 19*8+4]
-    mov eax, [rsp + 19*8]
-    wrmsr                   # pop gsbase
+1:
+    mov rax, [rsp + 19*8]   # gsbase
+    cmp rax, gs:[{GS_CACHE}]
+    je 2f
+    mov gs:[{GS_CACHE}], rax
+    mov rdx, rax
+    shr rdx, 32
+    mov ecx, 0xC0000102
+    wrmsr                   # pop gsbase (into KERNEL_GS_BASE)
+2:
+    swapgs                  # store kernel gsbase, load user gsbase
 
     pop rax
     pop rbx
@@ -141,15 +168,7 @@ trap_syscall_entry:
     # el GeneralRegs (rsp apunta ahora al slot de rax = base de GeneralRegs).
     mov gs:[{DBG_OFF}], rsp
 
-    # push fsbase gsbase
-    mov ecx, 0xC0000100
-    rdmsr
-    mov [rsp + 18*8+4], edx
-    mov [rsp + 18*8], eax
-    mov ecx, 0xC0000102     # kernelgs
-    rdmsr
-    mov [rsp + 19*8+4], edx
-    mov [rsp + 19*8], eax
+    # fsbase and gsbase are not read back: see `syscall_return`.
 
     # restore callee-saved registers
     mov rsp, gs:4           # load kernel rsp <- TSS.sp0
@@ -161,12 +180,7 @@ trap_syscall_entry:
     pop r13
     pop r14
     pop r15
-
-    pop rax
-    mov ecx, 0xC0000100
-    mov rdx, rax
-    shr rdx, 32
-    wrmsr                   # pop fsbase
+    pop rax                 # pad (was fsbase)
 
     # go back to Rust
     ret

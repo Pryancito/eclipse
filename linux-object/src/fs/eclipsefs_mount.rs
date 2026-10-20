@@ -864,6 +864,8 @@ mod tests {
     //! The adapter end to end on a RAM disk: format, mount through the same
     //! `MountBackend` the kernel uses, and drive it through `INode`.
 
+    extern crate std;
+
     use super::testdisk::*;
     use super::*;
 
@@ -990,5 +992,555 @@ mod tests {
         let n = l.read_at(0, &mut t).unwrap();
         assert_eq!(&t[..n], b"target");
         assert!(matches!(root.read_at(0, &mut t), Err(FsError::IsDir)));
+    }
+
+    /// The two tables that translate between the on-disk file kinds and the
+    /// VFS ones, walked entry by entry in both directions.
+    #[test]
+    fn the_file_kind_tables_name_the_same_seven_things_both_ways() {
+        // Written out rather than derived from one of the tables, because
+        // what matters is the PAIRING: a round trip through both of them
+        // also comes back right when the same two entries are swapped in
+        // each, and `getdents` would then call a socket a fifo for ever
+        // without one test noticing.
+        let pairs = [
+            (FileKind::Regular, FileType::File),
+            (FileKind::Dir, FileType::Dir),
+            (FileKind::Symlink, FileType::SymLink),
+            (FileKind::CharDevice, FileType::CharDevice),
+            (FileKind::BlockDevice, FileType::BlockDevice),
+            (FileKind::Fifo, FileType::NamedPipe),
+            (FileKind::Socket, FileType::Socket),
+        ];
+        for &(kind, type_) in pairs.iter() {
+            assert_eq!(vfs_type(kind), type_, "{:?}", kind);
+            assert_eq!(efs_kind(type_), kind, "{:?}", type_);
+        }
+    }
+
+    /// Every error the filesystem crate can return, and the `FsError` the
+    /// VFS gets for it.
+    #[test]
+    fn every_error_of_the_crate_keeps_its_meaning_at_the_vfs_boundary() {
+        // One line per variant, because a wrong line here is a wrong errno
+        // that a program acts on: ENOTDIR where EISDIR belongs sends
+        // `mkdir -p` down its "make the parent" path on a file.
+        let table = [
+            (EfsError::Io, FsError::DeviceError),
+            (EfsError::BadSuperblock, FsError::WrongFs),
+            (EfsError::Corrupt("tree"), FsError::DeviceError),
+            (EfsError::Unsupported("feature"), FsError::NotSupported),
+            (EfsError::NotFound, FsError::EntryNotFound),
+            (EfsError::Exists, FsError::EntryExist),
+            (EfsError::NotDir, FsError::NotDir),
+            (EfsError::IsDir, FsError::IsDir),
+            (EfsError::NotEmpty, FsError::DirNotEmpty),
+            (EfsError::NoSpace, FsError::NoDeviceSpace),
+            (EfsError::Invalid, FsError::InvalidParam),
+            (EfsError::NoKey, FsError::NoKey),
+        ];
+        for (from, want) in table {
+            assert_eq!(map_err(from), want, "{:?}", from);
+        }
+    }
+
+    /// The numbers `stat(2)` hands a program about one file.
+    #[test]
+    fn the_metadata_of_a_file_reads_back_field_by_field() {
+        let disk = formatted(8 * 1024 * 1024);
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let root = fs.root_inode();
+        let stat_of = |node: &Arc<dyn INode>| {
+            let ino = node.downcast_ref::<EclipseMountINode>().unwrap().ino;
+            fs.inner.lock().stat(ino).unwrap()
+        };
+
+        // A small file lives inside its own inode, so what it takes on disk
+        // is its exact length, which is not a whole number of blocks: a
+        // count that rounds DOWN says the file occupies nothing at all, and
+        // `du` adds up zeros.
+        let small = root.create("small", FileType::File, 0o644).unwrap();
+        assert_eq!(small.write_at(0, &[1u8; 100]).unwrap(), 100);
+        let md = small.metadata().unwrap();
+        let st = stat_of(&small);
+        assert_eq!(st.nbytes, 100, "a file that small is stored in its inode");
+        assert_eq!(md.size, 100);
+        assert!(md.blocks >= 1, "100 bytes occupy a block, not none");
+        assert_eq!(md.blocks as u64, st.nbytes.div_ceil(md.blk_size as u64));
+
+        // A big one takes whole filesystem blocks, and that is where the
+        // unit the count is in shows: `blocks` is a number of `blk_size`
+        // bytes, and `linux-syscall` hands both to the program as they are
+        // (`st_blocks` and `st_blksize` in `file/stat.rs`), so a count in
+        // some other unit is a size wrong by a factor.
+        let big = root.create("big", FileType::File, 0o644).unwrap();
+        let payload = [2u8; 10_000];
+        assert_eq!(big.write_at(0, &payload).unwrap(), payload.len());
+        let st = stat_of(&big);
+        let md = big.metadata().unwrap();
+        assert_eq!(md.size, payload.len(), "the file's length, not its extents");
+        assert!(st.nbytes >= payload.len() as u64, "{}", st.nbytes);
+        assert_eq!(md.blk_size, 512, "the unit POSIX counts st_blocks in");
+        assert_eq!(
+            md.blocks as u64,
+            st.nbytes.div_ceil(md.blk_size as u64),
+            "{} bytes in blocks of {}",
+            st.nbytes,
+            md.blk_size
+        );
+
+        // setuid, setgid and the sticky bit sit above the nine permission
+        // bits: masking them off is silent, and `ls -l` would show a plain
+        // -rwxr-xr-x on a setuid binary.
+        let mut md = small.metadata().unwrap();
+        md.mode = 0o6755;
+        // Two different times, each with its own nanoseconds, so that
+        // neither a swap of the two nor a dropped `nsec` reads back equal.
+        md.atime = Timespec {
+            sec: 1_700_000_111,
+            nsec: 222,
+        };
+        md.mtime = Timespec {
+            sec: 1_700_000_333,
+            nsec: 444,
+        };
+        small.set_metadata(&md).unwrap();
+        let back = small.metadata().unwrap();
+        assert_eq!(back.mode, 0o6755, "{:#o}", back.mode);
+        assert_eq!(back.atime, md.atime);
+        assert_eq!(back.mtime, md.mtime);
+        assert_eq!(back.type_, FileType::File);
+
+        // A hard link is a second name for one inode and the count says so:
+        // a fixed 1 would have `rm` of either name free the file.
+        assert_eq!(back.nlinks, 1);
+        root.link("small2", &small).unwrap();
+        assert_eq!(small.metadata().unwrap().nlinks, 2);
+    }
+
+    /// What `statfs(2)` says about the mount as a whole.
+    #[test]
+    fn statfs_counts_blocks_and_takes_its_name_limit_from_the_format() {
+        let bytes = 8 * 1024 * 1024;
+        let disk = formatted(bytes);
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let info = fs.info();
+        assert!(info.bsize >= 512, "{}", info.bsize);
+        assert_eq!(info.frsize, info.bsize);
+        // `blocks` is a count of `bsize` units, so the whole filesystem has
+        // to fit on the device it is on. Bytes there tell `df` the disk is
+        // `bsize` times bigger than it is.
+        assert!(info.blocks > 0);
+        assert!(
+            info.blocks <= bytes / info.bsize,
+            "{} blocks of {} on {} bytes",
+            info.blocks,
+            info.bsize,
+            bytes
+        );
+        assert!(info.bfree <= info.blocks);
+        assert_eq!(info.bavail, info.bfree);
+        // The longest name is the on-disk format's, not a number of this
+        // adapter's own: what `statfs` promises is what `create` honours.
+        assert_eq!(info.namemax, eclipsefs::format::MAX_NAME_LEN);
+        let root = fs.root_inode();
+        let longest = "n".repeat(info.namemax);
+        root.create(&longest, FileType::File, 0o644).unwrap();
+        let longer = "n".repeat(info.namemax + 1);
+        assert_eq!(
+            root.create(&longer, FileType::File, 0o644).err(),
+            Some(FsError::InvalidParam)
+        );
+    }
+
+    /// The `-o` string as `mount(8)` hands it over.
+    #[test]
+    fn the_mount_options_are_read_the_way_they_are_typed() {
+        // A user types spaces after the commas, and trimming is what makes
+        // " degraded" the option instead of an unknown one. An unknown one
+        // is dropped in silence, so the mount would quietly not be degraded.
+        let o = EfsOptions::parse(" degraded , compress=lz4 , subvolid=7 ").unwrap();
+        assert!(o.degraded, "a spaced option is still the option");
+        assert_eq!(o.compress, Some(Some(Compression::Lz4)));
+        assert_eq!(o.subvolid, Some(7));
+        // `compress=none` is btrfs's own spelling of "no compression", and
+        // it is not the same as an algorithm nobody knows, which is an
+        // error: taking it for one refuses the mount outright.
+        assert_eq!(
+            EfsOptions::parse("compress=none").unwrap().compress,
+            Some(None)
+        );
+        assert_eq!(
+            EfsOptions::parse("compress=no").unwrap().compress,
+            Some(None)
+        );
+        assert_eq!(
+            EfsOptions::parse("compress=nope"),
+            Err(FsError::InvalidParam)
+        );
+        // The level after a colon is btrfs's too: the algorithm is what is
+        // in front of it.
+        assert_eq!(
+            EfsOptions::parse("compress=zstd:3").unwrap().compress,
+            Some(Some(Compression::Zstd))
+        );
+        // `commit=0` means the default, not "never".
+        assert_eq!(
+            EfsOptions::parse("commit=0").unwrap().commit,
+            Some(DEFAULT_COMMIT_SECS)
+        );
+        // The generic layer's options, and the empty segments a trailing
+        // comma leaves, are not ours and not errors either.
+        assert_eq!(EfsOptions::parse("").unwrap(), EfsOptions::default());
+        assert_eq!(
+            EfsOptions::parse("ro,,noatime,").unwrap(),
+            EfsOptions::default()
+        );
+        // `device=` keeps the basename, because that is how the registry
+        // names what the kernel found; an empty one is an error.
+        assert_eq!(
+            EfsOptions::parse("device=/dev/sdb1").unwrap().devices,
+            ["sdb1"]
+        );
+        assert_eq!(EfsOptions::parse("device="), Err(FsError::InvalidParam));
+    }
+
+    /// Which directory the mount shows as `/`.
+    #[test]
+    fn the_subvolume_shown_as_root_is_the_one_the_options_asked_for() {
+        // v0.3 has no subvolumes at all, so asking for one is refused and
+        // not ignored: a mount that quietly showed the whole filesystem
+        // where a subvolume was asked for would hand a container the lot.
+        let v3 = formatted_with(8 * 1024 * 1024, eclipsefs::mkfs::format_v3);
+        let byid = EfsOptions {
+            subvolid: Some(256),
+            ..EfsOptions::default()
+        };
+        assert_eq!(
+            EclipseMountFs::open_with(&MountBackend::Block(v3.clone()), false, &byid).err(),
+            Some(FsError::NotSupported)
+        );
+        let bypath = EfsOptions {
+            subvol: Some(String::from("@home")),
+            ..EfsOptions::default()
+        };
+        assert_eq!(
+            EclipseMountFs::open_with(&MountBackend::Block(v3), false, &bypath).err(),
+            Some(FsError::NotSupported)
+        );
+        // On v0.4 an id no subvolume has is an error too, and not the top of
+        // the filesystem: mounting something else than what was asked for is
+        // worse than not mounting.
+        let disk = formatted(8 * 1024 * 1024);
+        let bogus = EfsOptions {
+            subvolid: Some(4096),
+            ..EfsOptions::default()
+        };
+        assert!(
+            EclipseMountFs::open_with(&MountBackend::Block(disk.clone()), false, &bogus).is_err()
+        );
+        // `subvol=` is a path from the top subvolume, so what is walked are
+        // its own components: an empty one and a `.` name nothing to look
+        // up, and `/./` is the top itself.
+        let dot = EfsOptions {
+            subvol: Some(String::from("/./")),
+            ..EfsOptions::default()
+        };
+        let fs = EclipseMountFs::open_with(&MountBackend::Block(disk), false, &dot).unwrap();
+        let root = fs.root_inode();
+        assert_eq!(root.metadata().unwrap().type_, FileType::Dir);
+        root.create("here", FileType::Dir, 0o755).unwrap();
+        assert_eq!(root.get_entry(2).unwrap(), "here");
+    }
+
+    /// A mount that cannot do what it was asked says so.
+    #[test]
+    fn a_mount_refuses_what_it_cannot_do_instead_of_pretending() {
+        let disk = formatted(8 * 1024 * 1024);
+        // `repair` writes. On a read-only mount it is refused outright,
+        // because a repair that silently did not run leaves the filesystem
+        // damaged and the mount looking fine.
+        let repair = EfsOptions {
+            repair: true,
+            ..EfsOptions::default()
+        };
+        assert_eq!(
+            EclipseMountFs::open_with(&MountBackend::Block(disk.clone()), true, &repair).err(),
+            Some(FsError::InvalidParam)
+        );
+        // Read-write it runs, and a filesystem it has nothing to fix mounts.
+        EclipseMountFs::open_with(&MountBackend::Block(disk.clone()), false, &repair).unwrap();
+        // `degraded` sends the mount down the volume path, and a whole
+        // filesystem on one device goes through it fine ...
+        let degraded = EfsOptions {
+            degraded: true,
+            ..EfsOptions::default()
+        };
+        EclipseMountFs::open_with(&MountBackend::Block(disk), false, &degraded).unwrap();
+        // ... but v0.3 has no volumes at all, so that path cannot read it
+        // and says so instead of quietly mounting it whole, which is what
+        // taking the single-device path would do: `-o degraded` is a user
+        // saying a device is missing, and a mount that answers it with the
+        // filesystem as if nothing were missing is the answer to another
+        // question.
+        let v3 = formatted_with(8 * 1024 * 1024, eclipsefs::mkfs::format_v3);
+        assert_eq!(
+            EclipseMountFs::open_with(&MountBackend::Block(v3), false, &degraded).err(),
+            Some(FsError::WrongFs)
+        );
+    }
+
+    /// One name in the registry is one device.
+    #[test]
+    fn a_block_device_registered_twice_is_remembered_once() {
+        // `volume_members` searches this registry by name, and a name comes
+        // back into circulation when a disk is unplugged. Two entries under
+        // one name hand the scan the disk that is gone, and forgetting the
+        // name takes out only one of them.
+        let old = formatted(1024 * 1024);
+        let new = formatted(2 * 1024 * 1024);
+        assert_ne!(old.block_count(), new.block_count());
+        register_block_device("t33disk", old);
+        register_block_device("t33disk", new.clone());
+        let found: Vec<usize> = BLOCK_DEVICES
+            .lock()
+            .iter()
+            .filter(|(n, _)| n == "t33disk")
+            .map(|(_, b)| b.block_count())
+            .collect();
+        assert_eq!(found, [new.block_count()], "the newest one, once");
+        forget_block_device("t33disk");
+        assert!(!BLOCK_DEVICES.lock().iter().any(|(n, _)| n == "t33disk"));
+    }
+
+    /// A writer says it wants the lock before it waits for it.
+    #[test]
+    fn a_waiting_writer_is_counted_before_it_blocks_and_not_after() {
+        extern crate std;
+        let disk = formatted(4 * 1024 * 1024);
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        // Held shared, so the writer below has to wait for it.
+        let held = fs.inner.shared().unwrap();
+        let writer = fs.clone();
+        let t = std::thread::spawn(move || drop(writer.inner.lock()));
+        // Counting itself only after the lock is in hand would leave the
+        // counter at zero for the whole wait, which is exactly when it is
+        // read: readers would keep going in ahead of the writer and it
+        // would spin for as long as they kept coming.
+        let mut turned_away = false;
+        for _ in 0..500 {
+            if fs.inner.shared().is_none() {
+                turned_away = true;
+                break;
+            }
+            std::thread::sleep(core::time::Duration::from_millis(1));
+        }
+        assert!(turned_away, "a reader got in while a writer waited");
+        drop(held);
+        t.join().unwrap();
+        assert!(fs.inner.shared().is_some(), "and gives way once it is done");
+    }
+
+    /// The listing cache, and the four operations that move a name.
+    #[test]
+    fn the_directory_cache_is_dropped_by_every_change_of_a_name() {
+        // `getdents` over a big directory would otherwise be one full
+        // listing per entry, so a listing is kept by inode. Every change to
+        // a directory has to drop it, and the hole does not show unless
+        // something READ the directory first: a listing nobody asked for
+        // yet is not stale. So each step here lists, changes, and lists
+        // again.
+        let disk = formatted(8 * 1024 * 1024);
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let root = fs.root_inode();
+        let from = root.create("from", FileType::Dir, 0o755).unwrap();
+        let to = root.create("to", FileType::Dir, 0o755).unwrap();
+        let names = |dir: &Arc<dyn INode>| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut i = 2;
+            while let Ok(n) = dir.get_entry(i) {
+                out.push(n);
+                i += 1;
+            }
+            out
+        };
+
+        // create
+        from.create("a", FileType::File, 0o644).unwrap();
+        assert_eq!(names(&from), ["a"]);
+        let b = from.create("b", FileType::File, 0o644).unwrap();
+        assert_eq!(names(&from), ["a", "b"], "a new name shows at once");
+
+        // link
+        from.link("c", &b).unwrap();
+        assert_eq!(names(&from), ["a", "b", "c"], "a second name as well");
+
+        // unlink
+        from.unlink("c").unwrap();
+        assert_eq!(names(&from), ["a", "b"], "and a name taken away is gone");
+
+        // move_, which changes TWO directories and has to drop both
+        // listings: the one the name left and the one it arrived in.
+        assert!(names(&to).is_empty());
+        from.move_("b", &to, "moved").unwrap();
+        assert_eq!(names(&from), ["a"]);
+        assert_eq!(names(&to), ["moved"], "the name arrived where it was sent");
+    }
+
+    /// What `poll(2)` says about a file and about a directory.
+    #[test]
+    fn poll_says_a_file_can_be_written_and_a_directory_cannot() {
+        let disk = formatted(4 * 1024 * 1024);
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let root = fs.root_inode();
+        let f = root.create("f", FileType::File, 0o644).unwrap();
+        let d = root.create("d", FileType::Dir, 0o755).unwrap();
+        // Readable always: a read of a file gives its bytes and a read of a
+        // directory gives `EISDIR`, but neither of them blocks, and `poll`
+        // answers about blocking.
+        for node in [&f, &d] {
+            assert!(node.poll().unwrap().read, "nothing here blocks a read");
+            assert!(!node.poll().unwrap().error);
+            assert!(!node.poll().unwrap().hangup);
+        }
+        assert!(f.poll().unwrap().write);
+        assert!(!d.poll().unwrap().write, "a directory is not written to");
+        // Which is the same answer `write_at` gives, with the error a
+        // program expects for it.
+        assert_eq!(f.write_at(0, b"x").unwrap(), 1);
+        assert_eq!(d.write_at(0, b"x").err(), Some(FsError::IsDir));
+    }
+
+    /// The names a path walk hands to `find`.
+    #[test]
+    fn an_empty_component_of_a_path_is_the_directory_itself() {
+        // A trailing slash and a doubled one leave an empty component, and
+        // the VFS passes it down as it came: `/etc/` and `/etc//passwd`
+        // resolve on Linux, so an empty name is this directory and not a
+        // name to look up, which no directory has.
+        let disk = formatted(4 * 1024 * 1024);
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let root = fs.root_inode();
+        let etc = root.create("etc", FileType::Dir, 0o755).unwrap();
+        let ino = |node: &Arc<dyn INode>| node.metadata().unwrap().inode;
+        assert_eq!(ino(&etc.find("").unwrap()), ino(&etc));
+        assert_eq!(ino(&etc.find(".").unwrap()), ino(&etc));
+        assert_eq!(ino(&etc.find("..").unwrap()), ino(&root));
+        assert_eq!(etc.find("nada").err(), Some(FsError::EntryNotFound));
+    }
+
+    /// Inodes of another filesystem.
+    #[test]
+    fn an_inode_of_another_filesystem_is_never_linked_into_this_one() {
+        // An inode is a `(filesystem, number)` pair, and the number alone
+        // means nothing outside its own mount: a link or a rename that took
+        // one from somewhere else would write a number of one filesystem
+        // into a directory of another.
+        let one =
+            EclipseMountFs::open(&MountBackend::Block(formatted(4 * 1024 * 1024)), false).unwrap();
+        let two =
+            EclipseMountFs::open(&MountBackend::Block(formatted(4 * 1024 * 1024)), false).unwrap();
+        let root_one = one.root_inode();
+        let root_two = two.root_inode();
+        let theirs = root_two.create("theirs", FileType::File, 0o644).unwrap();
+        // Two mounts of the same kind: the downcast goes through and what
+        // tells them apart is which filesystem they belong to.
+        assert_eq!(
+            root_one.link("stolen", &theirs).err(),
+            Some(FsError::NotSameFs)
+        );
+        root_one.create("mine", FileType::File, 0o644).unwrap();
+        assert_eq!(
+            root_one.move_("mine", &root_two, "mine").err(),
+            Some(FsError::NotSameFs)
+        );
+        // And an inode of another kind of filesystem altogether, where the
+        // downcast itself fails, is the same answer and not a different
+        // one: `mv` reads `EXDEV` as "copy it and unlink the original", and
+        // anything else makes it give up instead.
+        let ram = rcore_fs_ramfs::RamFS::new();
+        let alien = ram
+            .root_inode()
+            .create("alien", FileType::File, 0o644)
+            .unwrap();
+        assert_eq!(
+            root_one.link("alien", &alien).err(),
+            Some(FsError::NotSameFs)
+        );
+        assert_eq!(
+            root_one.move_("mine", &alien, "mine").err(),
+            Some(FsError::NotSameFs)
+        );
+    }
+
+    /// The pre-mount probe, which decides whether this is EclipseFS at all.
+    #[test]
+    fn the_probe_reads_the_whole_magic_and_measures_the_device_in_sectors() {
+        let disk = formatted(8 * 1024 * 1024);
+        let dev: Arc<dyn BlockScheme> = disk.clone();
+        assert!(probe_eclipsefs_superblock(&dev));
+        // The magic is nine bytes and all nine of them are the magic. The
+        // comparison here is only a cheap first look: `eclipsefs::probe`,
+        // below it, reads the same nine, so what this pins is the answer
+        // and not which of the two said no.
+        let was = disk.bytes.lock()[8];
+        disk.bytes.lock()[8] = was ^ 0xff;
+        assert!(!probe_eclipsefs_superblock(&dev), "the ninth byte counts");
+        disk.bytes.lock()[8] = was;
+        assert!(probe_eclipsefs_superblock(&dev));
+        // And the probe asks whether the filesystem FITS on the device it
+        // is on, which means turning the device's block count into bytes
+        // with the size of a block scheme's block, 512. Eight times too
+        // many bytes accepts a filesystem that runs off the end of the
+        // disk, and then every read past the end is a device error.
+        disk.bytes.lock().truncate(1024 * 1024);
+        assert_eq!(dev.block_count(), 2048);
+        assert!(
+            !probe_eclipsefs_superblock(&dev),
+            "a filesystem of 8 MiB does not fit on 1 MiB"
+        );
+    }
+
+    /// `fdatasync` of a file.
+    #[test]
+    fn sync_data_writes_the_file_out_the_way_sync_all_does() {
+        // EclipseFS has no way to write a file's data without its metadata
+        // (an extent is a tree entry), so `fdatasync` is `fsync`, and the
+        // contract a program counts on is the same one: once it returns,
+        // what was written is on the device, with no `sync` of the whole
+        // filesystem and nothing else closing the mount down.
+        let disk = formatted(8 * 1024 * 1024);
+        {
+            let fs = EclipseMountFs::open(&MountBackend::Block(disk.clone()), false).unwrap();
+            let f = fs
+                .root_inode()
+                .create("durable", FileType::File, 0o644)
+                .unwrap();
+            assert_eq!(f.write_at(0, b"this has to reach the disk").unwrap(), 26);
+            f.sync_data().unwrap();
+        }
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let mut back = [0u8; 32];
+        let f = fs.root_inode().find("durable").unwrap();
+        let n = f.read_at(0, &mut back).unwrap();
+        assert_eq!(&back[..n], b"this has to reach the disk");
+        // And it has to DO it, not just answer `Ok`: a program that gets
+        // `Ok` from `fdatasync` believes its bytes are on the device. The
+        // filesystem puts them either in the fsync log or in a commit of
+        // its own, and one of the two numbers has to move.
+        let count = || {
+            let fs = fs.inner.lock();
+            (fs.generation(), fs.fsync_log_records())
+        };
+        let before = count();
+        assert_eq!(f.write_at(26, b" and so does this").unwrap(), 17);
+        f.sync_data().unwrap();
+        let after = count();
+        assert!(
+            after.1 > before.1 || after.0 > before.0,
+            "{:?} -> {:?}",
+            before,
+            after
+        );
     }
 }

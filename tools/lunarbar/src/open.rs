@@ -355,4 +355,22 @@ vacio=
         assert_eq!(program_of("MOZ_ENABLE_WAYLAND=1 firefox %f"), None);
         assert_eq!(program_of("(cd /tmp && p) %f"), None);
     }
+
+    #[test]
+    fn a_commented_out_line_stays_commented_out() {
+        // The likeliest comment in this file is a disabled entry: a whole
+        // `ext=command` line with a `#` put in front of it, which is how
+        // anyone turns an override off without losing what it said. The
+        // comments in the test above carry no `=`, so they are skipped by the
+        // parse rather than by the `#` check, and the check itself was never
+        // the thing being tested.
+        let ov = parse_openers("#png=eclipse-view2 %f\n  # .pdf = zathura %f\npng=visor %f\n");
+        assert_eq!(ov.len(), 1, "only the live line is an override: {ov:?}");
+        assert_eq!(handler_for("x.png", &ov).as_deref(), Some("visor %f"));
+        // And a disabled override does not shadow the built-in table either.
+        assert_eq!(
+            handler_for("x.pdf", &ov).as_deref(),
+            Some("eclipse-firefox %f")
+        );
+    }
 }

@@ -36,6 +36,17 @@ fn nothing_reaches_the_rm_without_an_open() {
         free(&caller(0), 0xc1d0_0002, 0xcaf0_0000),
         NV_ERR_INVALID_ARGUMENT
     );
+    let keep: Arc<dyn Any + Send + Sync> = Arc::new(());
+    let lent = Pages {
+        phys: PHYS,
+        size: SIZE,
+        keep: &keep,
+    };
+    assert_eq!(
+        pages(&caller(0), 0xc1d0_0002, 0x5c00_0002, &lent, false),
+        Err(NV_ERR_INVALID_ARGUMENT)
+    );
+    assert_eq!(Arc::strong_count(&keep), 1);
 }
 
 /// A hosted build has no RM, so no client: each call is refused as for a
@@ -53,4 +64,70 @@ fn a_hosted_build_knows_no_client() {
     assert!(!super::super::IN_CALL.load(core::sync::atomic::Ordering::SeqCst));
     assert_eq!(free(&open, 0xc1d0_0002, 0xcaf0_0000), NV_ERR_INVALID_CLIENT);
     assert!(!super::super::IN_CALL.load(core::sync::atomic::Ordering::SeqCst));
+    let keep: Arc<dyn Any + Send + Sync> = Arc::new(());
+    let lent = Pages {
+        phys: PHYS,
+        size: SIZE,
+        keep: &keep,
+    };
+    assert_eq!(
+        pages(&open, 0xc1d0_0002, 0x5c00_0002, &lent, true),
+        Err(NV_ERR_INVALID_CLIENT)
+    );
+    assert!(!super::super::IN_CALL.load(core::sync::atomic::Ordering::SeqCst));
+    // The loan ended with the call.
+    assert!(eclipse_uvm_pages_hold(PHYS, SIZE).is_null());
+    assert_eq!(Arc::strong_count(&keep), 1);
+}
+
+/// A semaphore pool's pages, as the tests lend them.
+const PHYS: u64 = 0x8000_0000;
+const SIZE: u64 = 0x1_0000;
+
+/// The RM gets a hold only on exactly the pages lent to it, and only while
+/// they are; the hold keeps them past the loan, until the RM gives it back.
+#[test]
+fn the_rm_holds_only_the_pages_lent_to_it() {
+    let _t = super::super::tests::turnstile();
+    let keep: Arc<dyn Any + Send + Sync> = Arc::new(());
+    let pages = Pages {
+        phys: PHYS,
+        size: SIZE,
+        keep: &keep,
+    };
+    assert!(eclipse_uvm_pages_hold(PHYS, SIZE).is_null());
+    let lent = Lent::new(&pages);
+    assert_eq!(Arc::strong_count(&keep), 2);
+    assert!(eclipse_uvm_pages_hold(PHYS, SIZE - 0x1000).is_null());
+    assert!(eclipse_uvm_pages_hold(PHYS + 0x1000, SIZE - 0x1000).is_null());
+    let hold = eclipse_uvm_pages_hold(PHYS, SIZE);
+    assert!(!hold.is_null());
+    assert_eq!(Arc::strong_count(&keep), 3);
+    drop(lent);
+    assert_eq!(Arc::strong_count(&keep), 2);
+    assert!(eclipse_uvm_pages_hold(PHYS, SIZE).is_null());
+    eclipse_uvm_pages_release(hold);
+    assert_eq!(Arc::strong_count(&keep), 1);
+    eclipse_uvm_pages_release(core::ptr::null_mut());
+}
+
+/// Two loans of one block are two: the end of one leaves the other.
+#[test]
+fn each_loan_ends_on_its_own() {
+    let _t = super::super::tests::turnstile();
+    let keep: Arc<dyn Any + Send + Sync> = Arc::new(());
+    let pages = Pages {
+        phys: PHYS,
+        size: SIZE,
+        keep: &keep,
+    };
+    let first = Lent::new(&pages);
+    let second = Lent::new(&pages);
+    drop(first);
+    let hold = eclipse_uvm_pages_hold(PHYS, SIZE);
+    assert!(!hold.is_null());
+    eclipse_uvm_pages_release(hold);
+    drop(second);
+    assert!(eclipse_uvm_pages_hold(PHYS, SIZE).is_null());
+    assert_eq!(Arc::strong_count(&keep), 1);
 }
