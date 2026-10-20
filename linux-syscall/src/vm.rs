@@ -1966,6 +1966,8 @@ fn mincore_residency(vmar: &Arc<VmAddressRegion>, addr: usize, pages: usize) -> 
     Ok(residency)
 }
 
+mod mempolicy;
+
 #[cfg(test)]
 mod as_rlimit_tests;
 
