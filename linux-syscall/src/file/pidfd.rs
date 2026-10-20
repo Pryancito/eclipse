@@ -24,8 +24,9 @@ fn pidfd_open_flags(flags: u32) -> linux_object::error::LxResult<OpenFlags> {
     if flags & PIDFD_THREAD != 0 {
         return Err(LxError::EINVAL);
     }
-    // pidfd_open(2): the fd is always close-on-exec, whatever the caller asked.
-    let mut open_flags = OpenFlags::CLOEXEC;
+    // pidfd_open(2): the fd is always close-on-exec, whatever the caller
+    // asked, and open for reading and writing.
+    let mut open_flags = OpenFlags::CLOEXEC | OpenFlags::RDWR;
     if flags & NONBLOCK != 0 {
         open_flags |= OpenFlags::NON_BLOCK;
     }

@@ -147,6 +147,7 @@ pub use eclipsefs_ioctl::{
     eclipsefs_seek, eclipsefs_xattr, FsIoctlContext, XattrReply, XattrRequest, EFS_IOC_RECEIVE,
 };
 pub use epoll::{Epoll, EpollEvent};
+pub use proc_self::FdObject;
 
 /// If `f` is a DRM-related fd (a /dev/dri device File, a PRIME dma-buf, or
 /// an exported syncobj), return a short description for diagnostics; None
@@ -500,7 +501,8 @@ pub fn new_memfd(name: &str, flags: usize) -> LxResult<Arc<File>> {
         }
     }
 
-    let mut open_flags = OpenFlags::RDWR;
+    // `memfd_create` sets `O_LARGEFILE` on the file itself, as `open` does.
+    let mut open_flags = OpenFlags::RDWR | OpenFlags::LARGEFILE;
     if flags & MFD_CLOEXEC != 0 {
         open_flags |= OpenFlags::CLOEXEC;
     }
@@ -851,6 +853,17 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     /// socket's `S_IFSOCK`) override it.
     fn metadata(&self) -> LxResult<rcore_fs::vfs::Metadata> {
         Ok(anon_metadata(FileType::File, self.id() as usize))
+    }
+    /// `readlink` of `/proc/<pid>/fd/N`: the name Linux's `d_path` gives
+    /// the open file. The default serves every socket; a file and each
+    /// anonymous object answer with their own.
+    fn link_name(&self) -> String {
+        proc_self::default_link_name(self.metadata(), self.type_name())
+    }
+    /// What `/proc/<pid>/fdinfo/N` prints after `pos`, `flags`, `mnt_id` and
+    /// `ino`: each kind's `show_fdinfo`. Nothing, for one that has none.
+    fn fdinfo(&self) -> String {
+        String::new()
     }
     /// Set open flags.
     fn set_flags(&self, f: OpenFlags) -> LxResult;
@@ -2406,15 +2419,20 @@ impl LinuxProcess {
         }
         let (fd_dir_path, fd_name) = split_path(path);
         if fd_dir_path == "/proc/self/fd" {
-            let fd = FileDesc::try_from(fd_name)?;
-            let file = self.get_file(fd)?;
-            if follow {
-                // Magic link: resolve to the open file itself (like Linux),
-                // so execve("/proc/self/fd/N") runs the file, not the
-                // symlink's path text.
-                return Ok(file.inode());
+            // A name that is no open descriptor is not in the directory:
+            // `ENOENT`, as its listing and Linux say, not `EBADF` or `EINVAL`.
+            let fd = FileDesc::try_from(fd_name).map_err(|_| LxError::ENOENT)?;
+            let file = self.get_file_like(fd).map_err(|_| LxError::ENOENT)?;
+            if !follow {
+                return Ok(Arc::new(proc_self::FdLink::of(&*file)));
             }
-            return Ok(Arc::new(Pseudo::new(file.path(), FileType::SymLink)));
+            // Magic link: resolve to the open file itself (like Linux), so
+            // execve("/proc/self/fd/N") runs the file, not the symlink's path
+            // text. A descriptor that is no file leads to its object.
+            return Ok(match file.downcast_arc::<File>() {
+                Ok(file) => file.inode(),
+                Err(object) => Arc::new(proc_self::FdObject(object)),
+            });
         }
 
         let follow_max_depth = if follow { FOLLOW_MAX_DEPTH } else { 0 };

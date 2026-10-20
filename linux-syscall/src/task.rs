@@ -28,9 +28,12 @@ use zircon_object::task::{
 };
 use zircon_object::vm::USER_STACK_PAGES;
 
+/// What an exec hands the new program, and when that is too much.
+mod exec_args;
 /// `execveat(2)`, and how both execs find what they run.
 mod execveat;
 use execveat::exec_target;
+pub(crate) use execveat::real_path;
 
 const P_ALL: i32 = 0;
 const P_PID: i32 = 1;
@@ -106,9 +109,9 @@ const PR_GET_THP_DISABLE: i32 = 42;
 /// `PR_GET_TIMERSLACK` reports until somebody sets another.
 const TIMERSLACK_DEFAULT_NS: u64 = 50_000;
 
-/// The most `argv` plus `envp` may take, which is Linux's `_STK_LIM / 4`
-/// derived from the stack the loader actually maps rather than restated as a
-/// number. The cap covers the bytes plus one 8-byte table pointer per entry.
+/// The most `argv` plus `envp` may ever take, whatever `RLIMIT_STACK` says
+/// ([`exec_args::arg_limit`]): a quarter of the stack the loader actually
+/// maps, the bytes plus one 8-byte table pointer per entry.
 ///
 /// It is a bound, not an ABI number: what matters is that it stays strictly
 /// below the stack image the builder lays out --- the `assert!` in there
@@ -711,6 +714,7 @@ impl Syscall<'_> {
         // so the stack comes across there just the same.)
         let inherited = self.thread.lock_linux().forked_child();
         let new_thread = Thread::create_linux_with(new_proc, inherited)?;
+        new_proc.linux().set_forking_thread(self.thread.id());
         let mut new_ctx = self.thread.context_cloned()?;
         if newsp != 0 {
             new_ctx.set_field(UserContextField::StackPointer, newsp);
@@ -925,8 +929,9 @@ impl Syscall<'_> {
             }
 
             if clone_flags.contains(CloneFlags::PIDFD) {
+                use linux_object::fs::OpenFlags;
                 let pidfd =
-                    linux_object::fs::PidFd::new(process, linux_object::fs::OpenFlags::CLOEXEC);
+                    linux_object::fs::PidFd::new(process, OpenFlags::CLOEXEC | OpenFlags::RDWR);
                 let fd = self.linux_process().add_file(pidfd)?;
                 // Taken back if the caller never gets the number. (Linux also
                 // unwinds the whole child here; this one is already forked, so
@@ -1309,7 +1314,8 @@ impl Syscall<'_> {
     /// `envp` is an array of strings, conventionally of the form `key=value`,
     /// which are passed as environment to the new program.
     ///
-    /// > **NOTE!** Differ from linux, `argv` & `envp` can not be NULL.
+    /// `argv` and `envp` may be NULL: no environment, and one empty argument
+    /// (see [`exec_args`]).
     ///
     /// > **NOTE!** For multi-thread programs,
     /// > A call to any exec function from a process with more than one thread
@@ -1339,7 +1345,7 @@ impl Syscall<'_> {
         // Normal program launch — keep at debug so shells / fork+exec loops
         // don't pay a synchronous serial write per exec at the default LOG=warn.
         debug!("EXECVE: path={:?}", path_str);
-        let args = argv.read_cstring_array().inspect_err(|&e| {
+        let args = exec_args::read_argv(argv).inspect_err(|&e| {
             error!("execve: argv.read_cstring_array() failed: {:?}", e);
         })?;
         let mut envs: Vec<String> = Vec::new();
@@ -1352,19 +1358,9 @@ impl Syscall<'_> {
         // expanding to thousands of paths -- fails with E2BIG instead of
         // overrunning the initial stack image the loader builds. Without this
         // the stack builder's `assert!` tripped and PANICKED THE KERNEL from an
-        // ordinary userspace command. Linux's rule is a quarter of the
-        // stack (`_STK_LIM / 4`), so derive it from the stack the loader maps
-        // rather than restating a number: the cap covers the arg/env bytes
-        // plus one 8-byte table pointer per entry.
-        let arg_bytes: usize = args.iter().map(|s| s.len() + 1 + 8).sum::<usize>()
-            + envs.iter().map(|s| s.len() + 1 + 8).sum::<usize>();
-        if arg_bytes > ARG_MAX {
-            warn!(
-                "execve: argv+envp too large ({} > {} bytes) for {:?} -> E2BIG",
-                arg_bytes, ARG_MAX, path_str
-            );
-            return Err(LxError::E2BIG);
-        }
+        // ordinary userspace command.
+        exec_args::check_exec_args(self.linux_process(), path_str, &args, &envs)
+            .inspect_err(|_| warn!("execve: argv+envp too large for {:?} -> E2BIG", path_str))?;
         info!(
             "execve: path: {:?}, args: {:?}, envs: {:?}",
             path_str, args, envs
@@ -1380,10 +1376,6 @@ impl Syscall<'_> {
             path_str,
             args
         );
-        if args.is_empty() {
-            error!("execve: args is empty");
-            return Err(LxError::EINVAL);
-        }
         if args[0].is_empty() {
             warn!("execve: argv[0] is empty for path {:?}", path_str);
         }
@@ -1544,7 +1536,7 @@ impl Syscall<'_> {
         // the task with SIGSEGV here rather than returning; do the same, so
         // the parent sees a dead child instead of a live one wandering through
         // an empty address space.
-        let (entry, sp, initial_brk, execute_path, abi) = match load {
+        let (entry, sp, initial_brk, execute_path, abi, arg_area) = match load {
             Ok(loaded) => loaded,
             Err(e) => {
                 error!(
@@ -1564,6 +1556,7 @@ impl Syscall<'_> {
         proc.set_execute_path(&execute_path);
         proc.set_cmdline(args);
         proc.set_environ(envs);
+        proc.set_arg_area(arg_area);
         proc.set_brk(initial_brk);
         // CRUCIAL: reset the heap's *mapped* upper bound too. `execve` replaced
         // the whole address space (`vmar.clear()` above), so the previous image's

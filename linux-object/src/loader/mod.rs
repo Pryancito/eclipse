@@ -257,7 +257,12 @@ const _: () = assert!(
 mod abi;
 mod preflight;
 
-pub use abi::AuxIdentity;
+pub use abi::{ArgArea, AuxIdentity};
+
+/// What [`LinuxElfLoader::load`] hands back: the entry point, the stack
+/// pointer, the initial break, the path of the image that runs, its ABI, and
+/// where its argument and environment strings are.
+pub type Loaded = (VirtAddr, VirtAddr, usize, String, Abi, Option<ArgArea>);
 
 /// How many symbolic links an interpreter's path may go through, a `#!`
 /// one's or a `PT_INTERP`'s: as many as any other path, since `open_exec`
@@ -303,7 +308,7 @@ impl LinuxElfLoader {
         args: Vec<String>,
         envs: Vec<String>,
         path: String,
-    ) -> LxResult<(VirtAddr, VirtAddr, usize, String, Abi)> {
+    ) -> LxResult<Loaded> {
         let size = zircon_object::vm::roundup_pages(vmo.len());
         let virt_addr = zircon_object::vm::KERNEL_ASPACE.map(
             None,
@@ -344,7 +349,7 @@ impl LinuxElfLoader {
         path: String,
         recursion: u8,
         image: Option<&Arc<VmObject>>,
-    ) -> LxResult<(VirtAddr, VirtAddr, usize, String, Abi)> {
+    ) -> LxResult<Loaded> {
         debug!(
             "elf: load_impl recursion={} len={:#x} path={:?}",
             recursion,
@@ -687,7 +692,14 @@ impl LinuxElfLoader {
             // tree does not ship — so in practice only *static* FreeBSD binaries
             // (handled in the no-interpreter path below) get a FreeBSD stack.
             let initial_brk = heap_base(vmar);
-            return Ok((interp_entry, sp, initial_brk, path, abi));
+            return Ok((
+                interp_entry,
+                sp,
+                initial_brk,
+                path,
+                abi,
+                init_stack.arg_area(),
+            ));
         }
 
         // No interpreter, and still possibly position-independent: a
@@ -845,7 +857,7 @@ impl LinuxElfLoader {
         // static binary has no interpreter mapping its own libraries, but it
         // still mmaps, and the collision is the same one.
         let initial_brk = heap_base(vmar);
-        Ok((entry, sp, initial_brk, path, abi))
+        Ok((entry, sp, initial_brk, path, abi, init_stack.arg_area()))
     }
 }
 

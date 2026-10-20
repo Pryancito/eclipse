@@ -94,6 +94,12 @@ impl PipeData {
 pub struct Pipe {
     data: Arc<Mutex<PipeData>>,
     direction: PipeEnd,
+    /// What `fstat` says of either end, which pipefs keeps in the pipe's
+    /// inode: its number, the same at both ends and the one in its
+    /// `/proc/<pid>/fd` name, and who made it.
+    ino: usize,
+    uid: usize,
+    gid: usize,
 }
 
 impl Clone for Pipe {
@@ -106,6 +112,7 @@ impl Clone for Pipe {
         Pipe {
             data: self.data.clone(),
             direction: self.direction.clone(),
+            ..*self
         }
     }
 }
@@ -136,6 +143,14 @@ impl Drop for Pipe {
 impl Pipe {
     /// Create a pair of INode: (read, write)
     pub fn create_pair() -> (Pipe, Pipe) {
+        Self::create_pair_for(0, 0)
+    }
+
+    /// [`create_pair`](Self::create_pair) for a pipe that `uid` and `gid`
+    /// own, as pipefs gives its inode the creator's `fsuid` and `fsgid`:
+    /// reopening an end through `/proc/<pid>/fd/N` asks the same permission
+    /// as opening a file.
+    pub fn create_pair_for(uid: u32, gid: u32) -> (Pipe, Pipe) {
         let mut inner = PipeData {
             buf: VecDeque::new(),
             eventbus: EventBus::default(),
@@ -147,16 +162,29 @@ impl Pipe {
         // anything happened must not wait for a transition that never comes.
         inner.publish_room();
         let data = Arc::new(Mutex::new(inner));
+        let ino = zircon_object::object::KObjectBase::new_koid() as usize;
+        let (uid, gid) = (uid as usize, gid as usize);
         (
             Pipe {
                 data: data.clone(),
                 direction: PipeEnd::Read,
+                ino,
+                uid,
+                gid,
             },
             Pipe {
                 data,
                 direction: PipeEnd::Write,
+                ino,
+                uid,
+                gid,
             },
         )
+    }
+
+    /// What `/proc/<pid>/fd/N` names either end: `pipe:[ino]`.
+    pub fn link_name(&self) -> alloc::string::String {
+        alloc::format!("pipe:[{}]", self.ino)
     }
     /// True when this handle is the read end of the pipe.
     pub fn is_read_end(&self) -> bool {
@@ -479,6 +507,19 @@ impl INode for Pipe {
         })
     }
 
+    /// `fstat` of either end: a FIFO, `0600`, with the pipe's own number and
+    /// a page for `st_blksize`, as pipefs answers. There was no answer at
+    /// all, so `fstat` of a pipe failed (`ENOSYS`): `S_ISFIFO` could not be
+    /// asked of one, and stdio, which sizes its buffer from `st_blksize`,
+    /// had to guess.
+    fn metadata(&self) -> Result<Metadata> {
+        let mut meta = crate::fs::anon_metadata(FileType::NamedPipe, self.ino);
+        meta.blk_size = PIPE_BUF;
+        meta.uid = self.uid;
+        meta.gid = self.gid;
+        Ok(meta)
+    }
+
     /// return the any ref
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -764,5 +805,35 @@ mod tests {
         // Growing publishes the room, so a writer parked on the old size wakes.
         assert!(w.data.lock().eventbus.events().contains(Event::WRITABLE));
         assert_eq!(w.write_at(0, b"x"), Ok(1));
+    }
+
+    /// `fstat` of either end is one FIFO: the same number at both ends, a
+    /// different one for the next pipe, `0600`, a page for `st_blksize`, and
+    /// the creator for owner, which a reopen through `/proc` is checked
+    /// against. A clone (a `dup`) is the same pipe again.
+    #[test]
+    fn both_ends_answer_fstat_as_one_fifo() {
+        let (r, w) = Pipe::create_pair_for(1000, 100);
+        let (other, _) = Pipe::create_pair();
+        let (rm, wm) = (r.metadata().unwrap(), w.metadata().unwrap());
+        assert_eq!(
+            (rm.type_, wm.type_),
+            (FileType::NamedPipe, FileType::NamedPipe)
+        );
+        assert_eq!(rm.inode, wm.inode);
+        assert_ne!(rm.inode, other.metadata().unwrap().inode);
+        assert_eq!((rm.mode, rm.blk_size, rm.nlinks), (0o600, 4096, 1));
+        assert_eq!((wm.uid, wm.gid), (1000, 100));
+        let again = w.clone().metadata().unwrap();
+        assert_eq!((again.inode, again.uid, again.gid), (wm.inode, 1000, 100));
+    }
+
+    /// `/proc/<pid>/fd/N` names a pipe by that same number.
+    #[test]
+    fn a_pipe_is_named_by_its_inode() {
+        let (r, w) = Pipe::create_pair();
+        let ino = r.metadata().unwrap().inode;
+        assert_eq!(r.link_name(), alloc::format!("pipe:[{}]", ino));
+        assert_eq!(w.link_name(), r.link_name());
     }
 }

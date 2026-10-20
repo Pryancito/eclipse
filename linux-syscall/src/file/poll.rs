@@ -1160,7 +1160,7 @@ impl Syscall<'_> {
         // `EPOLL_CLOEXEC` is the only flag there is.
         let flags = anon_fd_flags(flags, ANON_CLOEXEC)?;
         let proc = self.linux_process();
-        let epoll = Epoll::new(flags);
+        let epoll = Epoll::new(flags | OpenFlags::RDWR);
         let fd = proc.add_file(epoll)?;
         Ok(fd.into())
     }

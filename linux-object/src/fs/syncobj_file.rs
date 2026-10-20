@@ -691,6 +691,15 @@ impl FileLike for SyncobjHandle {
         *self.flags.lock()
     }
 
+    /// `drm_syncobj_get_fd` and `sync_file_alloc` name theirs
+    /// `anon_inode_getfile("syncobj_file", ...)` and `("sync_file", ...)`.
+    fn link_name(&self) -> String {
+        String::from(match self.sync_file_point {
+            None => "anon_inode:syncobj_file",
+            Some(_) => "anon_inode:sync_file",
+        })
+    }
+
     fn set_flags(&self, f: OpenFlags) -> LxResult {
         // Same trap as epoll/perf before `take_settable`: a hardcoded
         // `flags()` plus a no-op `set_flags` made `fcntl(F_SETFL, O_NONBLOCK)`
@@ -862,6 +871,20 @@ mod sync_file_poll_tests {
         f.set(OpenFlags::NON_BLOCK, true);
         fd.set_flags(f).unwrap();
         assert!(fd.flags().non_block() && fd.flags().close_on_exec());
+    }
+
+    /// `/proc/<pid>/fd` names a syncobj fd and a sync_file as
+    /// `anon_inode_getfile` was told to.
+    #[test]
+    fn a_syncobj_fd_and_a_sync_file_are_named_as_linux_names_them() {
+        let handle = zcore_drivers::scheme::syncobj::create(false);
+        assert!(zcore_drivers::scheme::syncobj::timeline_signal(handle, 1));
+        assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
+        let fence = SyncobjHandle::new_sync_file(handle, 1);
+        assert_eq!(
+            [SyncobjHandle::new(0).link_name(), fence.link_name()],
+            ["anon_inode:syncobj_file", "anon_inode:sync_file"]
+        );
     }
 
     /// The regression this guards. Mesa's `sync_wait(fd, 0)` is a zero-timeout
