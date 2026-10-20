@@ -1405,10 +1405,21 @@ async fn handle_user_trap(
                 //    request exists to prevent. Left pending, it is honoured at
                 //    the next interrupt past the floor, so the latency a woken
                 //    task can lose is bounded by one scheduler tick.
+                //
+                //    And the wake verdict is read BEFORE the tick. A thread
+                //    with no slice on record (just resumed after a sleep that
+                //    paid for its slice, or a `set_sched`) is one the floor
+                //    lets a wake through -- `wake_preempt_allowed` refuses to
+                //    turn an unknown run length into latency. But the tick is
+                //    what starts that slice, so asked after it, the floor saw a
+                //    slice begun this very nanosecond and denied the wake on
+                //    the one vector that carries most of them.
+                let wake_may_preempt = kernel_hal::thread::need_resched_pending()
+                    && thread.sched_may_preempt_on_wake();
                 let slice_expired = vector == kernel_hal::context::TIMER_INTERRUPT_VEC
                     && thread.tick_should_preempt();
-                let wake_resched = kernel_hal::thread::need_resched_pending()
-                    && (slice_expired || thread.sched_may_preempt_on_wake())
+                let wake_resched = (slice_expired || wake_may_preempt)
+                    && kernel_hal::thread::need_resched_pending()
                     && kernel_hal::thread::take_need_resched();
                 // `preempt_now`, not `yield_now`: neither of these is the
                 // task volunteering. `yield_now` files the self-wake in the

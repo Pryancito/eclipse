@@ -457,6 +457,46 @@ pub(crate) fn rescue_stranded_task() -> Option<(Key, Arc<Task>, Arc<WakerRef>)> 
     task
 }
 
+/// Per-CPU "an owner forwarded you a task its mask forbids there" latch.
+///
+/// [`kick_for_affinity`] used to be only a `request_resched`, and the kicked
+/// CPU looked for the stranded task only on its rebalance tick -- one pass in
+/// [`REBALANCE_EVERY`]. A CPU running a userspace spinner makes a pass only
+/// when it is kicked, so a thread pinned beside it, born on another CPU, got
+/// one wake in thirty-two: `eclipse-bench`'s timeslice-floor probe, a 200 us
+/// waker pinned with a spinner, achieved 43 wakes a second and came back 18 ms
+/// late on average. The waker page's owner never changes, so EVERY wake of such
+/// a thread is a forwarded one, not just the first.
+///
+/// So the kick says what it is for, and the next pass on the kicked CPU
+/// answers it with a rescue scan, whatever its rebalance cadence.
+static RESCUE_KICK: [CacheAligned; MAX_CORE_NUM] = [const { CacheAligned::new() }; MAX_CORE_NUM];
+
+/// Ask `cpu` to rescue a stranded task on its next pass.
+///
+/// Read before the store, as [`note_stranded`]: a CPU already asked costs a
+/// load, not a write to a line its owner is reading on every pass.
+#[inline]
+pub(crate) fn note_rescue_kick(cpu: usize) {
+    if cpu >= MAX_CORE_NUM {
+        return;
+    }
+    if RESCUE_KICK[cpu].0.load(Ordering::Relaxed) == 0 {
+        RESCUE_KICK[cpu].0.store(1, Ordering::Release);
+    }
+}
+
+/// Consume this CPU's rescue request, if any.
+#[inline]
+pub(crate) fn take_rescue_kick() -> bool {
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu >= MAX_CORE_NUM {
+        return false;
+    }
+    RESCUE_KICK[cpu].0.load(Ordering::Relaxed) != 0
+        && RESCUE_KICK[cpu].0.swap(0, Ordering::Acquire) != 0
+}
+
 /// `(steal scans, victims probed, steals ok, affinity-empty victims skipped,
 /// rebalance pulls, scans skipped by the `STEALABLE` hint, rescue pulls)`.
 pub fn sched_steal_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
@@ -1325,6 +1365,8 @@ pub(crate) fn kick_for_affinity(mask: u64, skip: usize) {
     let Some(target) = target else {
         return;
     };
+    // Before the kick, so the pass the kick causes sees the request.
+    note_rescue_kick(target as usize);
     request_resched(target);
 }
 
@@ -3669,6 +3711,26 @@ mod stranded_tests {
         let out = f();
         STRANDED.store(saved, Ordering::SeqCst);
         out
+    }
+
+    /// A forwarded wake must reach the kicked CPU's very next pass, not its
+    /// rebalance tick: one request, taken exactly once, and nothing for a CPU
+    /// id the array cannot hold.
+    #[test]
+    fn a_rescue_kick_is_taken_once_by_the_cpu_it_names() {
+        let _g = super::resched_test_lock();
+        let _ = take_rescue_kick();
+        assert!(!take_rescue_kick(), "a pass rescued with nobody asking");
+        note_rescue_kick(0);
+        note_rescue_kick(0);
+        assert!(take_rescue_kick(), "the kick was lost before the pass");
+        assert!(!take_rescue_kick(), "one kick bought two rescue scans");
+        // Another CPU's kick is not ours.
+        note_rescue_kick(1);
+        assert!(!take_rescue_kick());
+        RESCUE_KICK[1].0.store(0, Ordering::SeqCst);
+        note_rescue_kick(MAX_CORE_NUM);
+        note_rescue_kick(usize::MAX);
     }
 
     #[test]
