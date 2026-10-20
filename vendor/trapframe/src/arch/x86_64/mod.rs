@@ -49,6 +49,21 @@ pub use trap::TrapFrame;
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 pub(crate) static XSAVE_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Whether [`UserContext::run`] saves with XSAVEOPT instead of XSAVE: set
+/// when the CPU has it (`CPUID.(EAX=0DH,ECX=1):EAX[0]`) and XSAVE is in use.
+///
+/// XSAVEOPT skips the components the program has not touched since the
+/// XRSTOR that loaded them, and those in their initial state. `run` restores
+/// and saves the same buffer on the same CPU with nothing in between but user
+/// code, which is the pattern the optimisation is defined for; a syscall loop
+/// that never touches AVX no longer writes the whole save area back on every
+/// return to the kernel. The buffer is only ever read back by XRSTOR (and
+/// copied whole on fork), which honours XSTATE_BV, so the bytes left unwritten
+/// for an initial-state component are never seen.
+#[cfg(any(target_os = "none", target_os = "uefi"))]
+pub(crate) static XSAVEOPT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Set by the kernel (before `init`) to force the FXSAVE path even on a CPU that
 /// supports XSAVE + AVX. A boot-time escape hatch (e.g. `noavx` on the kernel
 /// command line) for isolating AVX enablement while debugging.
@@ -118,6 +133,8 @@ fn init_fpu() {
             let flags = XCr0Flags::X87 | XCr0Flags::SSE | XCr0Flags::AVX;
             XCr0::write(flags);
             XSAVE_MASK.store(flags.bits() as u32, core::sync::atomic::Ordering::Relaxed);
+            let leaf_d1 = core::arch::x86_64::__cpuid_count(0xd, 1);
+            XSAVEOPT.store(leaf_d1.eax & 1 != 0, core::sync::atomic::Ordering::Relaxed);
         }
     }
 }
