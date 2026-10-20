@@ -204,6 +204,28 @@ mod tests {
         );
     }
 
+    /// `& 0o777` and nothing wider: the setuid, setgid and sticky bits are
+    /// dropped, so a host file that carries one loses it on the way into an
+    /// image. Whether that is wanted is another matter; what this pins is that
+    /// the mask is the permission bits alone, so moving it either way shows up.
+    #[test]
+    fn the_mode_is_the_permission_bits_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("marked");
+        fs::write(&path, b"x").expect("writing the file");
+        for carried in [0o4710u32, 0o2710, 0o1710] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(carried))
+                .expect("chmod with a bit above the permissions");
+            // A host that will not keep the bit has nothing to say about the
+            // mask, so there is nothing to read off it either.
+            let kept = fs::metadata(&path).expect("stat").permissions().mode() & 0o7777;
+            if kept != carried {
+                continue;
+            }
+            assert_eq!(of(&path).mode, 0o710, "from mode {:o}", carried);
+        }
+    }
+
     #[test]
     fn a_hard_link_is_counted_on_both_names() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -286,6 +308,11 @@ mod tests {
         let a = of(&one);
         let b = of(&two);
         assert_eq!(a.dev, b.dev, "two files of one directory on two devices");
+        assert_ne!(
+            a.dev, a.rdev,
+            "the device the file is ON came out of the device the file IS, \
+             which a regular file is not"
+        );
         assert_ne!(a.inode, b.inode, "two files sharing an inode number");
         assert_eq!(a.inode, of(&one).inode, "one file with two inode numbers");
         assert_eq!(a.size, 1);
