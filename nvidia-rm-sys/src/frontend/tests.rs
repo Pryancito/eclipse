@@ -8,7 +8,7 @@ use std::vec::Vec;
 /// `IN_CALL`, `CALLER_GPUS` and `USER_RANGE_OK` are process-globals and
 /// `cargo test` runs in parallel: every test that reads or sets them holds
 /// this, so "outside a call" really is outside every test's call.
-fn turnstile() -> MutexGuard<'static, ()> {
+pub(super) fn turnstile() -> MutexGuard<'static, ()> {
     static T: Mutex<()> = Mutex::new(());
     T.lock().unwrap_or_else(|e| e.into_inner())
 }

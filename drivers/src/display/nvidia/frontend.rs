@@ -22,6 +22,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub use nvidia_rm_sys::frontend::events::{
     alloc_os_event, free_os_event, set_event_sink, UnixEvent, NV_ERR_INVALID_EVENT,
 };
+pub use nvidia_rm_sys::frontend::uvm::{ExternalMapping, NV_ERR_INVALID_CLIENT};
 pub use nvidia_rm_sys::frontend::{
     caching, copy_version, layout_mismatch, rm_version, set_user_range_validator, version_check,
     Caller, CpuCaching, MmapContext, MmapMemory, GPU_UUID_LEN, LAYOUT, NV_ERR_STATE_IN_USE,
@@ -95,6 +96,38 @@ pub fn release(os_info: usize) {
     if rm_up() {
         nvidia_rm_sys::frontend::release(os_info);
     }
+}
+
+/// `nvidia_rm_sys::frontend::uvm::va_space_device`, refused with
+/// `NV_ERR_NOT_READY` while there is no RM core to ask.
+pub fn uvm_va_space_device(
+    caller: &Caller,
+    h_client: u32,
+    h_va_space: u32,
+    gpu_instance: u32,
+) -> Result<u32, NV_STATUS> {
+    if !rm_up() {
+        return Err(NV_ERR_NOT_READY);
+    }
+    nvidia_rm_sys::frontend::uvm::va_space_device(caller, h_client, h_va_space, gpu_instance)
+}
+
+/// `nvidia_rm_sys::frontend::uvm::map_external`, refused with
+/// `NV_ERR_NOT_READY` while there is no RM core to map in.
+pub fn uvm_map_external(caller: &Caller, m: &ExternalMapping) -> Result<u32, NV_STATUS> {
+    if !rm_up() {
+        return Err(NV_ERR_NOT_READY);
+    }
+    nvidia_rm_sys::frontend::uvm::map_external(caller, m)
+}
+
+/// `nvidia_rm_sys::frontend::uvm::free`. With no RM core nothing was ever
+/// mapped, and the RM must not be entered to find that out.
+pub fn uvm_free(caller: &Caller, h_client: u32, h_object: u32) -> NV_STATUS {
+    if !rm_up() {
+        return NV_ERR_NOT_READY;
+    }
+    nvidia_rm_sys::frontend::uvm::free(caller, h_client, h_object)
 }
 
 /// One GPU as `NV_ESC_CARD_INFO` describes it (`nvidia_read_card_info`,
@@ -208,6 +241,25 @@ mod tests {
         );
         map_unrecorded(&mut payload, &caller, NV_ERR_STATE_IN_USE);
         release(0x1000);
+        assert_eq!(
+            uvm_va_space_device(&caller, 0xc1d0_0002, 0x5c00_0007, 0),
+            Err(NV_ERR_NOT_READY)
+        );
+        let mapping = ExternalMapping {
+            h_client: 0xc1d0_0002,
+            h_device: 0x5c00_0002,
+            h_va_space: 0x5c00_0007,
+            h_memory: 0x5c00_0014,
+            offset: 0,
+            base: 0x2_0000_0000,
+            length: 0x20_0000,
+            read_only: false,
+        };
+        assert_eq!(uvm_map_external(&caller, &mapping), Err(NV_ERR_NOT_READY));
+        assert_eq!(
+            uvm_free(&caller, 0xc1d0_0002, 0xcaf0_0000),
+            NV_ERR_NOT_READY
+        );
     }
 
     /// The instance is read at the time of asking: a GPU the RM brings up

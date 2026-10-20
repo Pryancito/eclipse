@@ -35,6 +35,7 @@ use crate::types::*;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 pub mod events;
+pub mod uvm;
 
 /// `NV_RM_API_VERSION_STRING_LENGTH` (nv-ioctl.h).
 pub const VERSION_STRING_LENGTH: usize = 64;

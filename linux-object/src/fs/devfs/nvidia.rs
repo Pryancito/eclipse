@@ -420,6 +420,19 @@ impl NvidiaOpen {
         self.node == Node::Ctl
     }
 
+    /// What UVM makes its RM calls on a client of this open through (its
+    /// `clientOSInfo`), when it is an open of `/dev/nvidiactl`, the only
+    /// open a client is made through.
+    pub(super) fn uvm_os_info(&self) -> Option<usize> {
+        self.is_ctl().then(|| self.os_info())
+    }
+
+    /// An open of `/dev/nvidiactl`, or of `/dev/nvidia0`, for the UVM tests.
+    #[cfg(test)]
+    pub(super) fn for_uvm_test(ctl: bool) -> Self {
+        NvidiaOpen::new(if ctl { Node::Ctl } else { Node::Gpu(0) }, 1)
+    }
+
     /// `NV_CTL_DEVICE_ONLY`.
     fn ctl_only(&self) -> LxResult<()> {
         if self.is_ctl() {
@@ -514,8 +527,21 @@ impl NvidiaOpen {
                 }
                 self.register_fd(u32_at(payload, 0) as i32, caller)
             }
-            esc::RM_ALLOC
-            | esc::RM_FREE
+            esc::RM_ALLOC => {
+                if !nvctl::rm_up() {
+                    no_rm_yet();
+                    return Err(LxError::EINVAL);
+                }
+                // A VA space libcuda means to hand UVM goes to the RM as one
+                // the RM keeps the page tables of (nvidia_uvm.rs).
+                let uvm_flags = super::nvidia_uvm::rm_owned_va_space(payload);
+                let status = nvctl::rm_escape(nr, payload, &self.rm_caller(caller));
+                if let Some(flags) = uvm_flags {
+                    flags.restore();
+                }
+                escape_result(nr, status)
+            }
+            esc::RM_FREE
             | esc::RM_CONTROL
             | esc::RM_DUP_OBJECT
             | esc::RM_SHARE

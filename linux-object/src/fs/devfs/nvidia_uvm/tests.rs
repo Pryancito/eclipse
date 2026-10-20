@@ -2,41 +2,150 @@ use super::*;
 use alloc::vec;
 use alloc::vec::Vec;
 
+/// The two GPUs of the machine under test, as the RM names them.
+pub(super) const GPU0: Uuid = [
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+];
+pub(super) const GPU1: Uuid = [
+    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+];
+
+/// Who a call came from, as the RM was told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct By {
+    pub os_info: usize,
+    pub admin: bool,
+    pub gpu_mask: u32,
+}
+
+impl By {
+    fn of(caller: &nvctl::Caller) -> By {
+        By {
+            os_info: caller.os_info,
+            admin: caller.admin,
+            gpu_mask: caller.gpu_mask,
+        }
+    }
+}
+
+/// The RM of the machine under test: [`GPU0`] and [`GPU1`] as RM instances
+/// 0 and 1, the VA spaces it is told of, and every call UVM made on it.
+#[derive(Default)]
+pub(super) struct FakeRm {
+    state: spin::Mutex<FakeState>,
+}
+
+#[derive(Default)]
+pub(super) struct FakeState {
+    /// The VA spaces it knows, as (os_info, hClient, hVaSpace, instance),
+    /// with the device each hangs from.
+    pub va_spaces: BTreeMap<(usize, u32, u32, u32), u32>,
+    /// What is mapped, by the handle of its NV50_MEMORY_VIRTUAL.
+    pub maps: BTreeMap<u32, (By, nvctl::ExternalMapping)>,
+    pub last_virtual: u32,
+    /// The status a map in a VA space answers with, for those that fail.
+    pub refuse: BTreeMap<u32, u32>,
+    /// Every free, as (by, hClient, hObject).
+    pub frees: Vec<(By, u32, u32)>,
+}
+
+impl FakeRm {
+    pub fn new() -> Arc<FakeRm> {
+        Arc::new(FakeRm::default())
+    }
+
+    pub fn state(&self) -> spin::MutexGuard<'_, FakeState> {
+        self.state.lock()
+    }
+
+    /// The mappings made and not freed, in the order they were made.
+    pub fn mapped(&self) -> Vec<nvctl::ExternalMapping> {
+        self.state().maps.values().map(|&(_, m)| m).collect()
+    }
+}
+
+impl Rm for FakeRm {
+    fn gpus(&self) -> Vec<(Uuid, u32)> {
+        vec![(GPU0, 0), (GPU1, 1)]
+    }
+
+    fn va_space_device(
+        &self,
+        by: &nvctl::Caller,
+        h_client: u32,
+        h_va_space: u32,
+        instance: u32,
+    ) -> RmResult {
+        let key = (by.os_info, h_client, h_va_space, instance);
+        self.state().va_spaces.get(&key).copied().ok_or(0x31)
+    }
+
+    fn map(&self, by: &nvctl::Caller, m: &nvctl::ExternalMapping) -> RmResult {
+        let mut state = self.state();
+        if let Some(&status) = state.refuse.get(&m.h_va_space) {
+            return Err(status);
+        }
+        state.last_virtual += 1;
+        let h_virtual = 0xcaf0_0000 + state.last_virtual;
+        state.maps.insert(h_virtual, (By::of(by), *m));
+        Ok(h_virtual)
+    }
+
+    fn free(&self, by: &nvctl::Caller, h_client: u32, h_object: u32) {
+        let mut state = self.state();
+        state.maps.remove(&h_object);
+        state.frees.push((By::of(by), h_client, h_object));
+    }
+}
+
+/// An open of `/dev/nvidia-uvm` on its own [`FakeRm`].
 fn uvm() -> Arc<UvmOpen> {
-    Arc::new(UvmOpen::new(1))
+    uvm_on(&FakeRm::new())
+}
+
+pub(super) fn uvm_on(rm: &Arc<FakeRm>) -> Arc<UvmOpen> {
+    let rm: Arc<dyn Rm> = rm.clone();
+    Arc::new(UvmOpen::with_rm(1, rm))
 }
 
 fn no_fds(_fd: i32) -> Option<Arc<dyn INode>> {
     None
 }
 
-/// The two GPUs of the machine under test, as the RM names them.
-const GPU0: Uuid = [
-    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-];
-const GPU1: Uuid = [
-    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
-];
-
-fn two_gpus() -> Vec<Uuid> {
-    vec![GPU0, GPU1]
+/// Both GPUs, as RM instances 0 and 1.
+pub(super) fn both_gpus() -> u32 {
+    0b11
 }
 
-fn status_at(params: &[u8], at: usize) -> u32 {
+/// A caller with the fds `fds`, not root, with both GPUs open.
+pub(super) fn with_fds(fds: &dyn Fn(i32) -> Option<Arc<dyn INode>>) -> NvCaller<'_> {
+    NvCaller {
+        admin: false,
+        gpu_mask: &both_gpus,
+        open_of_fd: fds,
+    }
+}
+
+/// [`with_fds`] with no fd at all.
+pub(super) fn plain() -> NvCaller<'static> {
+    with_fds(&no_fds)
+}
+
+pub(super) fn status_at(params: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([params[at], params[at + 1], params[at + 2], params[at + 3]])
 }
 
-fn initialize(open: &UvmOpen, flags: u64) -> u32 {
+pub(super) fn initialize(open: &UvmOpen, flags: u64) -> u32 {
     let mut params = vec![0u8; INITIALIZE_SIZE];
     params[..8].copy_from_slice(&flags.to_le_bytes());
-    open.call(cmd::INITIALIZE, &mut params, &no_fds, &two_gpus);
+    open.call(cmd::INITIALIZE, &mut params, &plain());
     status_at(&params, INITIALIZE_STATUS)
 }
 
 fn mm_initialize_on(open: &UvmOpen, fd: i32, fds: &dyn Fn(i32) -> Option<Arc<dyn INode>>) -> u32 {
     let mut params = vec![0u8; MM_INITIALIZE_SIZE];
     params[..4].copy_from_slice(&fd.to_le_bytes());
-    open.call(cmd::MM_INITIALIZE, &mut params, fds, &two_gpus);
+    open.call(cmd::MM_INITIALIZE, &mut params, &with_fds(fds));
     status_at(&params, MM_INITIALIZE_STATUS)
 }
 
@@ -45,7 +154,7 @@ fn mm_initialize_on(open: &UvmOpen, fd: i32, fds: &dyn Fn(i32) -> Option<Arc<dyn
 fn pageable_mem_access(open: &UvmOpen, came: u8) -> (u8, u32) {
     let mut params = vec![0u8; PAGEABLE_MEM_ACCESS_SIZE];
     params[0] = came;
-    open.call(cmd::PAGEABLE_MEM_ACCESS, &mut params, &no_fds, &two_gpus);
+    open.call(cmd::PAGEABLE_MEM_ACCESS, &mut params, &plain());
     (params[0], status_at(&params, PAGEABLE_MEM_ACCESS_STATUS))
 }
 
@@ -57,32 +166,32 @@ fn register_gpu_params(open: &UvmOpen, uuid: &Uuid) -> Vec<u8> {
     params[..16].copy_from_slice(uuid);
     params[REGISTER_GPU_NUMA_ENABLED..REGISTER_GPU_NUMA_NODE_ID + 4].fill(0xAA);
     params[24..28].copy_from_slice(&(-1i32).to_le_bytes());
-    open.call(cmd::REGISTER_GPU, &mut params, &no_fds, &two_gpus);
+    open.call(cmd::REGISTER_GPU, &mut params, &plain());
     params
 }
 
-fn register_gpu(open: &UvmOpen, uuid: &Uuid) -> u32 {
+pub(super) fn register_gpu(open: &UvmOpen, uuid: &Uuid) -> u32 {
     status_at(&register_gpu_params(open, uuid), REGISTER_GPU_STATUS)
 }
 
-fn unregister_gpu(open: &UvmOpen, uuid: &Uuid) -> u32 {
+pub(super) fn unregister_gpu(open: &UvmOpen, uuid: &Uuid) -> u32 {
     let mut params = vec![0u8; UNREGISTER_GPU_SIZE];
     params[..16].copy_from_slice(uuid);
-    open.call(cmd::UNREGISTER_GPU, &mut params, &no_fds, &two_gpus);
+    open.call(cmd::UNREGISTER_GPU, &mut params, &plain());
     status_at(&params, UNREGISTER_GPU_STATUS)
 }
 
 /// The id and the status.
 fn create_range_group(open: &UvmOpen) -> (u64, u32) {
     let mut params = vec![0u8; RANGE_GROUP_SIZE];
-    open.call(cmd::CREATE_RANGE_GROUP, &mut params, &no_fds, &two_gpus);
+    open.call(cmd::CREATE_RANGE_GROUP, &mut params, &plain());
     (u64_at(&params, 0), status_at(&params, RANGE_GROUP_STATUS))
 }
 
 fn destroy_range_group(open: &UvmOpen, id: u64) -> u32 {
     let mut params = vec![0u8; RANGE_GROUP_SIZE];
     params[..8].copy_from_slice(&id.to_le_bytes());
-    open.call(cmd::DESTROY_RANGE_GROUP, &mut params, &no_fds, &two_gpus);
+    open.call(cmd::DESTROY_RANGE_GROUP, &mut params, &plain());
     status_at(&params, RANGE_GROUP_STATUS)
 }
 
@@ -208,7 +317,7 @@ fn gpus_and_range_groups_need_a_va_space() {
     assert_eq!(params[REGISTER_GPU_NUMA_ENABLED], 0xAA);
     assert_eq!(unregister_gpu(&open, &GPU0), NV_ERR_ILLEGAL_ACTION);
     let mut params = vec![0x55u8; RANGE_GROUP_SIZE];
-    open.call(cmd::CREATE_RANGE_GROUP, &mut params, &no_fds, &two_gpus);
+    open.call(cmd::CREATE_RANGE_GROUP, &mut params, &plain());
     assert_eq!(
         status_at(&params, RANGE_GROUP_STATUS),
         NV_ERR_ILLEGAL_ACTION
@@ -308,10 +417,15 @@ fn mm_initialize_leaves_its_own_open_alone() {
 #[test]
 fn deinitialize_succeeds_and_the_rest_is_enosys() {
     let open = uvm();
-    assert_eq!(open.ioctl(cmd::DEINITIALIZE, 0, &no_fds), Ok(0));
-    let unserved: Vec<u32> = vec![25, 27, 31, 33, 68, 72, 2047, 0x3000_0003];
+    assert_eq!(open.ioctl(cmd::DEINITIALIZE, 0, &plain()), Ok(0));
+    let unserved: Vec<u32> = vec![31, 35, 68, 72, 74, 2047, 0x3000_0003];
     for cmd in unserved {
-        assert_eq!(open.ioctl(cmd, 0, &no_fds), Err(LxError::ENOSYS), "{}", cmd);
+        assert_eq!(
+            open.ioctl(cmd, 0, &plain()),
+            Err(LxError::ENOSYS),
+            "{}",
+            cmd
+        );
     }
 }
 
@@ -322,6 +436,8 @@ fn the_log_names_the_command() {
     assert_eq!(name(25), "UVM_REGISTER_GPU_VASPACE");
     assert_eq!(name(33), "UVM_MAP_EXTERNAL_ALLOCATION");
     assert_eq!(name(68), "UVM_ALLOC_SEMAPHORE_POOL");
+    assert_eq!(name(cmd::INITIALIZE), "UVM_INITIALIZE");
+    assert_eq!(name(cmd::MM_INITIALIZE), "UVM_MM_INITIALIZE");
     assert_eq!(name(2047), "unknown");
 }
 
