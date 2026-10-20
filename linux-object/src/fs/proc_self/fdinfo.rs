@@ -186,4 +186,6 @@ impl INode for FdInfo {
 }
 
 #[cfg(test)]
+mod inode_tests;
+#[cfg(test)]
 mod tests;
