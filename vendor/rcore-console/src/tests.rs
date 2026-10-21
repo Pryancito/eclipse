@@ -5,6 +5,7 @@
 //! runs on real hardware. What the tests drive is the byte stream -- the same
 //! escape sequences a shell, `ls` or a full-screen app emits.
 
+use crate::ansi::{Attr, Handler, Performer};
 use crate::cell::{Cell, Flags};
 use crate::color::{Color, NamedColor};
 use crate::console::Console;
@@ -13,6 +14,7 @@ use crate::text_buffer_cache::TextBufferCache;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
+use vte::Parser;
 
 /// A plain in-memory [`TextBuffer`], standing in for the frame buffer.
 ///
@@ -2498,5 +2500,279 @@ fn a_cell_is_drawn_at_its_own_row_and_column() {
         g.target().outside,
         0,
         "the renderer wrote past the end of the frame buffer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// One SGR number is not its neighbour
+// ---------------------------------------------------------------------------
+//
+// A mutation lot that swapped each arm of the SGR and `J` tables for the arm
+// below it left six mutants alive against the 134 tests above. Every one of
+// them is the same shape: the parameter was read correctly, the attribute it
+// was turned into was the wrong one, and the wrong one is *invisible* here --
+// either because `Console` drops both of them on its `_ =>` floor, or because
+// the right one and the wrong one agree about the flag the test looked at and
+// differ only in what else they take with them.
+//
+// So the tests below ask what the suite had not asked: not "did 21 clear the
+// bold" but "did 21 clear ONLY the bold".
+
+/// A [`Handler`] that keeps every attribute the parser hands it.
+///
+/// `Console` is the handler the kernel uses, and it can only honour the
+/// attributes a frame buffer can draw: the two blinks and a couple of cancels
+/// go to a `debug!` and no further. That is right for a frame buffer and blind
+/// for a test, because two SGR numbers that mean different things upstream
+/// become the same nothing downstream. This handler draws nothing at all and
+/// only writes down what it was told, which is the one place the difference is
+/// still there to see.
+#[derive(Default)]
+struct Recorder {
+    attrs: Vec<Attr>,
+}
+
+impl Handler for Recorder {
+    fn terminal_attribute(&mut self, attr: Attr) {
+        self.attrs.push(attr);
+    }
+}
+
+/// Drive `seq` through the very parser `Console` drives, and hand back the
+/// attributes it asked for.
+fn attrs_of(seq: &str) -> Vec<Attr> {
+    let mut rec = Recorder::default();
+    let mut parser = Parser::new();
+    for byte in seq.bytes() {
+        parser.advance(&mut Performer::new(&mut rec), byte);
+    }
+    rec.attrs
+}
+
+#[test]
+fn every_sgr_number_names_its_own_attribute() {
+    // The whole table, read back one number at a time. `Console` folds several
+    // of these together -- 5 and 6 are both nothing to it -- so the table can
+    // only be checked on this side of it.
+    for (param, attr) in [
+        ("0", Attr::Reset),
+        ("1", Attr::Bold),
+        ("2", Attr::Dim),
+        ("3", Attr::Italic),
+        ("4", Attr::Underline),
+        ("4:0", Attr::CancelUnderline),
+        ("4:2", Attr::DoubleUnderline),
+        ("5", Attr::BlinkSlow),
+        ("6", Attr::BlinkFast),
+        ("7", Attr::Reverse),
+        ("8", Attr::Hidden),
+        ("9", Attr::Strike),
+        ("21", Attr::CancelBold),
+        ("22", Attr::CancelBoldDim),
+        ("23", Attr::CancelItalic),
+        ("24", Attr::CancelUnderline),
+        ("25", Attr::CancelBlink),
+        ("27", Attr::CancelReverse),
+        ("28", Attr::CancelHidden),
+        ("29", Attr::CancelStrike),
+    ] {
+        assert_eq!(
+            attrs_of(&alloc::format!("\x1b[{}m", param)),
+            vec![attr],
+            "SGR {} named the wrong attribute",
+            param
+        );
+    }
+
+    // And a number the table does not have is dropped, not rounded to the
+    // neighbour that does: 26 and 10 are both holes in the real table.
+    for hole in ["10", "26", "50", "99"] {
+        assert_eq!(
+            attrs_of(&alloc::format!("\x1b[{}m", hole)),
+            vec![],
+            "SGR {} is not in the table and was answered anyway",
+            hole
+        );
+    }
+}
+
+#[test]
+fn every_colour_number_names_its_own_colour() {
+    // Thirty-two arms of the same table, and the suite above reaches them
+    // through `Console`, which keeps the colour but not which number asked for
+    // it. Off by one here is a shell whose red is green.
+    let plain = [
+        NamedColor::Black,
+        NamedColor::Red,
+        NamedColor::Green,
+        NamedColor::Yellow,
+        NamedColor::Blue,
+        NamedColor::Magenta,
+        NamedColor::Cyan,
+        NamedColor::White,
+    ];
+    let bright = [
+        NamedColor::BrightBlack,
+        NamedColor::BrightRed,
+        NamedColor::BrightGreen,
+        NamedColor::BrightYellow,
+        NamedColor::BrightBlue,
+        NamedColor::BrightMagenta,
+        NamedColor::BrightCyan,
+        NamedColor::BrightWhite,
+    ];
+    for (base, names, is_fg) in [
+        (30u16, &plain, true),
+        (40, &plain, false),
+        (90, &bright, true),
+        (100, &bright, false),
+    ] {
+        for (offset, name) in names.iter().enumerate() {
+            let param = base + offset as u16;
+            let colour = Color::Named(*name);
+            let want = if is_fg {
+                Attr::Foreground(colour)
+            } else {
+                Attr::Background(colour)
+            };
+            assert_eq!(
+                attrs_of(&alloc::format!("\x1b[{}m", param)),
+                vec![want],
+                "SGR {} named the wrong colour or the wrong ground",
+                param
+            );
+        }
+    }
+
+    // The bright eight are a second set of names, not the first set again: if
+    // 90 and 30 came out equal, half the palette would be unreachable.
+    for offset in 0..8u16 {
+        assert_ne!(
+            attrs_of(&alloc::format!("\x1b[{}m", 30 + offset)),
+            attrs_of(&alloc::format!("\x1b[{}m", 90 + offset)),
+            "SGR {} and SGR {} are the same colour",
+            30 + offset,
+            90 + offset
+        );
+    }
+}
+
+#[test]
+fn the_fast_blink_is_not_the_inverse_video() {
+    // 6 is "blink fast", which this console cannot draw and therefore does
+    // nothing about. 7 is right next to it in the table and swaps the two
+    // colours of every cell from there on, which is about as visible as an
+    // attribute gets.
+    let mut c = uncached(8, 2);
+    send(&mut c, "\x1b[6mX");
+    assert!(
+        !cell(&mut c, 0, 0).flags.contains(Flags::INVERSE),
+        "SGR 6 turned the screen inside out"
+    );
+    for blink in ["5", "6"] {
+        let mut c = uncached(8, 2);
+        send(&mut c, &alloc::format!("\x1b[31m\x1b[{}mX", blink));
+        let x = cell(&mut c, 0, 0);
+        assert_eq!(x.flags, Flags::empty(), "SGR {} set a flag", blink);
+        assert_eq!(
+            x.fg,
+            Color::Named(NamedColor::Red),
+            "SGR {} lost the colour that was already set",
+            blink
+        );
+    }
+}
+
+#[test]
+fn cancelling_the_bold_leaves_the_dim_where_it_was() {
+    // 21 cancels the bold; 22, the arm under it, cancels the bold AND the dim.
+    // Asked only whether the bold went, the two are the same answer, and the
+    // suite above asked exactly that.
+    let mut c = uncached(8, 2);
+    send(&mut c, "\x1b[1m\x1b[2m\x1b[21mX");
+    let x = cell(&mut c, 0, 0);
+    assert!(!x.flags.contains(Flags::BOLD), "SGR 21 left the bold on");
+    assert!(
+        x.flags.contains(Flags::DIM),
+        "SGR 21 took the dim with it, which is what 22 is for"
+    );
+
+    // And 22 really does take both, so the pair is not interchangeable in
+    // either direction.
+    let mut c = uncached(8, 2);
+    send(&mut c, "\x1b[1m\x1b[2m\x1b[22mX");
+    assert_eq!(
+        cell(&mut c, 0, 0).flags,
+        Flags::empty(),
+        "SGR 22 left one of the two standing"
+    );
+}
+
+#[test]
+fn cancelling_the_blink_leaves_the_inverse_video_where_it_was() {
+    // 25 cancels a blink this console never drew, so the right behaviour is to
+    // change nothing. 27, the arm under it, un-inverts the screen.
+    let mut c = uncached(8, 2);
+    send(&mut c, "\x1b[7m\x1b[25mX");
+    assert!(
+        cell(&mut c, 0, 0).flags.contains(Flags::INVERSE),
+        "SGR 25 cancelled the inverse video, which is what 27 is for"
+    );
+}
+
+#[test]
+fn cancelling_the_strikeout_cancels_nothing_else() {
+    // 29 is the last of the cancels and `Reset` is the first arm of the whole
+    // table; one clears a flag, the other clears the cell. Asked only about
+    // the strikeout they agree.
+    let mut c = uncached(8, 2);
+    send(&mut c, "\x1b[1;31;44m\x1b[9m\x1b[29mX");
+    let x = cell(&mut c, 0, 0);
+    assert!(
+        !x.flags.contains(Flags::STRIKEOUT),
+        "SGR 29 left the strikeout on"
+    );
+    assert!(
+        x.flags.contains(Flags::BOLD),
+        "SGR 29 reset the whole cell instead of clearing one flag"
+    );
+    assert_eq!(
+        x.fg,
+        Color::Named(NamedColor::Red),
+        "SGR 29 lost the colour"
+    );
+    assert_eq!(
+        x.bg,
+        Color::Named(NamedColor::Blue),
+        "SGR 29 lost the background"
+    );
+}
+
+#[test]
+fn clearing_the_scrollback_leaves_the_screen_standing() {
+    // `\e[3J` clears the scrollback, and this console has none: it keeps one
+    // screen and that is all, so the whole sequence is a no-op. `\e[0J`, the
+    // arm under it in the same table, clears from the cursor to the bottom.
+    // Confusing them wipes half the screen every time a shell starts up,
+    // because `clear` sends `\e[3J` first.
+    let mut c = uncached(4, 3);
+    send(&mut c, "abcd\r\nefgh\r\nijkl");
+    send(&mut c, "\x1b[2;3H");
+    let before = screen(&mut c);
+    send(&mut c, "\x1b[3J");
+    assert_eq!(
+        screen(&mut c),
+        before,
+        "clearing the scrollback cleared the screen"
+    );
+    assert_eq!(c.cursor(), (1, 2), "and it moved the cursor");
+
+    // The arm under it is the one that does wipe, so the two are not the same
+    // no-op seen twice.
+    send(&mut c, "\x1b[0J");
+    assert_ne!(
+        screen(&mut c),
+        before,
+        "clearing below the cursor cleared nothing"
     );
 }
