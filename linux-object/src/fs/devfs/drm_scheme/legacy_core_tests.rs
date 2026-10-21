@@ -141,3 +141,58 @@ fn get_client_reports_who_is_authenticated_and_the_hollowed_ioctls_answer_as_lin
         Err(FsError::InvalidParam)
     );
 }
+
+/// The nouveau uAPI switch for the scope, and back after.
+struct NouveauUapi(bool);
+impl NouveauUapi {
+    fn new(on: bool) -> Self {
+        let was = zcore_drivers::display::nouveau_uapi_enabled();
+        zcore_drivers::display::set_nouveau_uapi_enabled(on);
+        NouveauUapi(was)
+    }
+}
+impl Drop for NouveauUapi {
+    fn drop(&mut self) {
+        zcore_drivers::display::set_nouveau_uapi_enabled(self.0);
+    }
+}
+
+/// `DRM_IOCTL_NOUVEAU_SETPARAM` is `drm_invalid_op` in nouveau's table,
+/// behind `DRM_AUTH | DRM_MASTER | DRM_ROOT_ONLY`: EACCES to a non-root,
+/// to an unauthenticated open and (under `drm.master_check`) to one that
+/// is not the master, and EINVAL once the permit passes. Only with the
+/// nouveau uAPI on; without it the number stays the driver's (here, with
+/// no driver behind the node, ENOSYS). It went to the driver either way.
+#[test]
+fn nouveau_setparam_is_drm_invalid_op_behind_auth_master_and_root() {
+    let _serialised = drm::test_globals::lock();
+    drm::set_test_root(false);
+    let eacces = Err(FsError::NoPermission);
+    let einval = Err(FsError::InvalidParam);
+    let master = Client::open(81);
+    let client = Client::open(81);
+    // The number libdrm sends, spelled out so the constant is checked too.
+    let setparam = |c: &Client| noop::<16>(c, 0xC0106441);
+
+    {
+        let _off = NouveauUapi::new(false);
+        assert_eq!(setparam(&client), Err(FsError::NotSupported), "no driver");
+    }
+    let _on = NouveauUapi::new(true);
+    assert_eq!(setparam(&master), eacces, "the master, but not root");
+    assert_eq!(setparam(&client), eacces, "neither root nor authenticated");
+
+    drm::set_test_root(true);
+    assert_eq!(setparam(&master), einval, "root, authenticated, master");
+    assert_eq!(setparam(&client), eacces, "root but not authenticated");
+    let mut magic = 0u32;
+    client.ioctl(DRM_IOCTL_GET_MAGIC, &mut magic).unwrap();
+    master.ioctl(DRM_IOCTL_AUTH_MAGIC, &mut magic).unwrap();
+    let was = master_check_enabled();
+    set_master_check_enabled(true);
+    assert_eq!(setparam(&client), eacces, "authenticated, not the master");
+    set_master_check_enabled(false);
+    assert_eq!(setparam(&client), einval, "without drm.master_check");
+    set_master_check_enabled(was);
+    drm::set_test_root(false);
+}
