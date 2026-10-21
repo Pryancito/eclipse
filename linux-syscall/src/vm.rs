@@ -3923,3 +3923,9 @@ mod brk_chunk_tests {
 
 #[cfg(test)]
 mod brk_wiring_tests;
+
+/// What `mprotect` and `mremap` answer when they refuse: the two matches
+/// that turn a Zircon error into an errno, and the empty `mprotect` that
+/// answers before a single mapping is consulted.
+#[cfg(test)]
+mod mprotect_mremap_tests;
