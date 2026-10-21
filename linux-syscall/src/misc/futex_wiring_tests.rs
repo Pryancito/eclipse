@@ -59,6 +59,7 @@ use core::sync::atomic::{AtomicI32, Ordering};
 use linux_object::process::LinuxProcess;
 use rcore_fs_ramfs::RamFS;
 use zircon_object::task::ROOT_JOB;
+use zircon_object::vm::{MMUFlags, VmObject, PAGE_SIZE};
 
 /// `FUTEX_BITSET_MATCH_ANY`: the mask musl and glibc are the only callers to
 /// send, and the only one this kernel honours. Zero is the empty set, which
@@ -166,9 +167,14 @@ fn a_waiter(
 /// Ask for `count` wakes on `addr` until one of them finds somebody, and
 /// answer with that first non-zero count. `None` when the budget ran out
 /// without anybody being there.
-async fn a_wake_that_finds_somebody(sys: &Syscall<'_>, addr: usize, count: u32) -> Option<usize> {
+async fn a_wake_that_finds_somebody(
+    sys: &Syscall<'_>,
+    addr: usize,
+    op: u32,
+    count: u32,
+) -> Option<usize> {
     for _ in 0..TRIES {
-        match futex(sys, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, count, 0, 0, 0).await {
+        match futex(sys, addr, op, count, 0, 0, 0).await {
             Ok(0) => async_std::task::sleep(A_MOMENT).await,
             other => return other.ok(),
         }
@@ -378,6 +384,23 @@ fn a_wait_on_a_word_that_has_already_changed_never_reads_the_timeout() {
                 Err(LxError::EFAULT),
                 "an unreadable timespec on a word that matched"
             );
+            // The value compared is the one the caller GAVE, not zero: a
+            // word holding seven and a wait expecting seven do match, and
+            // the proof is that the unreadable timeout gets read after all.
+            assert_eq!(
+                futex(
+                    sys,
+                    changed,
+                    FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+                    7,
+                    at + 1,
+                    0,
+                    0
+                )
+                .await,
+                Err(LxError::EFAULT),
+                "a wait whose expected value really is the word's"
+            );
             // And a `timespec` that is readable but names no duration is
             // EINVAL, whether or not we would have ended up waiting.
             for bad in [
@@ -555,12 +578,12 @@ fn a_wake_releases_the_waiters_one_at_a_time_and_a_count_of_zero_releases_none()
         Box::pin(async move {
             nobody_is_woken_while_the_count_is_zero(sys, addr).await;
             assert_eq!(
-                a_wake_that_finds_somebody(sys, addr, 1).await,
+                a_wake_that_finds_somebody(sys, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1).await,
                 Some(1),
                 "the first wake did not take exactly one of the two waiters"
             );
             assert_eq!(
-                a_wake_that_finds_somebody(sys, addr, 1).await,
+                a_wake_that_finds_somebody(sys, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1).await,
                 Some(1),
                 "the second wake did not reach the other waiter"
             );
@@ -1252,4 +1275,97 @@ fn a_contended_priority_lock_times_out_on_the_clock_its_command_chooses() {
             );
         })
     });
+}
+
+/// A page of this binary's own for a shared mapping to land on.
+///
+/// The hosted page table maps a frame with `MAP_FIXED` at the user address,
+/// so that address has to be a page-aligned region this process already
+/// owns: anywhere else the mapping lands on whatever the host keeps there.
+/// Leaked, and never touched through this type again.
+#[repr(align(4096))]
+struct APage([u8; 4096]);
+
+impl APage {
+    /// Where this page begins, as userspace names it.
+    fn at(&self) -> usize {
+        self.0.as_ptr() as usize
+    }
+}
+
+/// One page of a SHARED object mapped into `proc` read-write, and the user
+/// address its futex word sits at.
+///
+/// This is the shape libxshmfence uses, and the reason shared futexes exist
+/// at all: one `int32` in a `memfd` that two processes map, waited on by the
+/// X client and woken by the X server, neither side carrying the private
+/// flag.
+fn a_shared_word_in(proc: &Arc<Process>) -> usize {
+    assert_eq!(PAGE_SIZE, 4096, "the page this test leaks is 4 KiB");
+    let vmo = VmObject::new_paged(1);
+    vmo.set_share_on_fork();
+    vmo.commit(0, PAGE_SIZE).unwrap();
+    let user = Box::leak(Box::new(APage([0; 4096]))).at();
+    let vmar = proc.vmar();
+    vmar.map_at(
+        user - vmar.addr(),
+        vmo,
+        0,
+        PAGE_SIZE,
+        MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
+    )
+    .unwrap();
+    // The mapping must never be undone: the frame now covers a page of this
+    // binary's own heap, and tearing it down would leave that address
+    // unmapped for the rest of the run.
+    core::mem::forget(proc.clone());
+    user
+}
+
+/// A word in a mapping two processes could share belongs to one queue, and
+/// the per-process table is a different one: the private flag picks which,
+/// and a wake sent to the wrong one reaches nobody at all.
+///
+/// This is the whole of what the shared-futex table is for, and the
+/// asymmetry behind `eglgears_wayland` running while `glxgears` hung on the
+/// same machine. libxshmfence waits and wakes on a word in a shared `memfd`
+/// with no private flag; serving that from the per-process table, which
+/// keys by the caller's own virtual address, gives each side its own queue,
+/// so the X server's wake never reaches the client and the window freezes
+/// with no way to tell why. Wayland clients do not use xshmfence, which is
+/// why only one of the two hung.
+///
+/// Nothing in the test reads the word: it is a fresh committed page, so it
+/// holds zero, which is the value the waiter expects.
+#[test]
+fn a_word_in_a_shared_mapping_is_a_different_queue_from_the_private_one() {
+    let proc = a_process(47_273, "futex-shared");
+    let addr = a_shared_word_in(&proc);
+    let waiting = a_waiter(&proc, addr, FUTEX_WAIT, Some(Duration::from_secs(10)));
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            // A second of wakes carrying the private flag, which go to the
+            // per-process table: the waiter is not there to be found.
+            for _ in 0..100 {
+                assert_eq!(
+                    futex(sys, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0).await,
+                    Ok(0),
+                    "a private wake reached a waiter queued on the shared word"
+                );
+                async_std::task::sleep(A_MOMENT).await;
+            }
+            // And one without the flag, which goes looking for the shared
+            // word first and finds the queue the waiter is really on.
+            assert_eq!(
+                a_wake_that_finds_somebody(sys, addr, FUTEX_WAKE, 1).await,
+                Some(1),
+                "a shared wake did not reach the waiter on the shared word"
+            );
+        })
+    });
+    assert_eq!(
+        waiting.join().unwrap(),
+        Ok(0),
+        "the waiter on the shared word"
+    );
 }
