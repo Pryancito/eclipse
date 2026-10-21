@@ -63,19 +63,24 @@ fn a_process(pid: KoID, name: &str, top: &str) -> Arc<Process> {
     Process::create_with_fixed_id_ext(&ROOT_JOB, pid, name, lp).unwrap()
 }
 
-/// A file of `dir_path` with exactly this owner and mode.
+/// A file of `dir_path` named `name`, with exactly this owner and mode.
 ///
 /// Owner and mode are written through `set_metadata` rather than left to
 /// whatever `create` puts there, because every answer below is read off
 /// them.
-fn a_file_owned_by(lp: &LinuxProcess, dir_path: &str, uid: u32, gid: u32, mode: u16) {
+fn a_file_named(lp: &LinuxProcess, dir_path: &str, name: &str, uid: u32, gid: u32, mode: u16) {
     let dir = lp.lookup_inode(dir_path).unwrap();
-    let inode = dir.create("f", FileType::File, 0o644).unwrap();
+    let inode = dir.create(name, FileType::File, 0o644).unwrap();
     let mut metadata = inode.metadata().unwrap();
     metadata.uid = uid as _;
     metadata.gid = gid as _;
     metadata.mode = mode;
     inode.set_metadata(&metadata).unwrap();
+}
+
+/// [`a_file_named`] for the one file a test has, which is called `f`.
+fn a_file_owned_by(lp: &LinuxProcess, dir_path: &str, uid: u32, gid: u32, mode: u16) {
+    a_file_named(lp, dir_path, "f", uid, gid, mode)
 }
 
 /// The mode the file really has, asked of the filesystem and not of the
@@ -96,33 +101,50 @@ fn the_mode_that_lands_is_the_one_the_gate_decided_and_not_the_one_asked_for() {
     // was handed. A syscall that wrote the argument instead of the verdict
     // would pass a test that only looked at the return value: it returns 0
     // either way.
+    //
+    // And it is asked from BOTH sides of the group, because one side alone
+    // cannot tell "strips setgid from a caller outside the group" from
+    // "strips setgid from everyone who is not root" -- which is what this
+    // used to do, silently, so `chmod 2755` left `0755` behind and a program
+    // that read back the mode it had just set saw a different one. The two
+    // files differ by their group and by nothing else.
     let proc = a_process(47_160, "chmod-verdict", "chmod_verdict");
-    let path = String::from("/chmod_verdict/f");
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
             let lp = sys.linux_process();
-            // Owned by `A_USER`, in a group `A_USER` is not in.
-            a_file_owned_by(&lp, "/chmod_verdict", A_USER, ANOTHER_GROUP, IS_REG | 0o644);
+            let dir = "/chmod_verdict";
+            a_file_named(&lp, dir, "mine", A_USER, A_GROUP, IS_REG | 0o644);
+            a_file_named(&lp, dir, "theirs", A_USER, ANOTHER_GROUP, IS_REG | 0o644);
             // The groups go first: once the user id is down, moving the
             // group ids is `EPERM`, which is the whole point of them.
             lp.set_groups(alloc::vec::Vec::new());
             lp.set_resgid(A_GROUP, A_GROUP, A_GROUP).unwrap();
             lp.set_resuid(A_USER, A_USER, A_USER).unwrap();
-            let at = c(&path);
 
-            assert_eq!(
-                sys.sys_chmod(
-                    UserInPtr::from(at.as_ptr() as usize),
-                    (SETUID | SETGID | 0o755) as usize
+            for (name, landed, why) in [
+                (
+                    "mine",
+                    IS_REG | SETUID | SETGID | 0o755,
+                    "setgid was stripped from a caller who is in the file group",
                 ),
-                Ok(0),
-                "the owner was refused the mode of their own file"
-            );
-            assert_eq!(
-                mode_of(&lp, &path),
-                IS_REG | SETUID | 0o755,
-                "setgid survived a chmod by someone outside the file group, or setuid did not"
-            );
+                (
+                    "theirs",
+                    IS_REG | SETUID | 0o755,
+                    "setgid survived a caller outside the file group, or setuid did not",
+                ),
+            ] {
+                let path = alloc::format!("{}/{}", dir, name);
+                let at = c(&path);
+                assert_eq!(
+                    sys.sys_chmod(
+                        UserInPtr::from(at.as_ptr() as usize),
+                        (SETUID | SETGID | 0o755) as usize
+                    ),
+                    Ok(0),
+                    "the owner was refused the mode of their own file"
+                );
+                assert_eq!(mode_of(&lp, &path), landed, "{}", why);
+            }
         })
     });
 }
