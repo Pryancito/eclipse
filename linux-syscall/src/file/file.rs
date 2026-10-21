@@ -3941,3 +3941,15 @@ fn atomic_write_valid(len: usize, pos: u64, min: usize, max: usize) -> bool {
 
 #[cfg(test)]
 mod rwf_atomic_tests;
+
+#[cfg(test)]
+mod vfs_ioctl_tests;
+
+#[cfg(test)]
+mod record_lock_wiring_tests;
+
+#[cfg(test)]
+mod fcntl_families_tests;
+
+#[cfg(test)]
+mod read_write_refusal_tests;
