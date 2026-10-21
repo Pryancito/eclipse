@@ -391,6 +391,58 @@ impl FakeDev {
         }
     }
 
+    /// Una tableta de máquina virtual: puntero **absoluto**, que es lo que
+    /// usa QEMU con `usb-tablet` y lo que hay debajo del ratón del escritorio
+    /// cuando se arranca con `make qemu`.
+    ///
+    /// Se reconoce por el fabricante (QEMU) con `bInterfaceProtocol` 0, no
+    /// por su descriptor de informe: su diseño es conocido y no se le pide.
+    /// Informe: `[botones, X16, Y16, rueda, pan]`, con X e Y de 0 a 32767.
+    pub(super) fn tablet() -> Self {
+        Self::vm_tablet(0x0627, 0x0001)
+    }
+
+    /// La tableta de VirtualBox, que lleva el mismo papel con **otro**
+    /// diseño: `[botones, dz, dw, relleno, X16, Y16]`. Tomar uno por el otro
+    /// deja el puntero en una esquina, que es el síntoma que la distingue.
+    pub(super) fn vbox_tablet() -> Self {
+        Self::vm_tablet(0x80ee, 0x0021)
+    }
+
+    fn vm_tablet(vid: u16, pid: u16) -> Self {
+        let mut config: Vec<u8> = alloc::vec![
+            0x09, 0x02, 0x00, 0x00, 0x01, 0x01, 0x00, 0xa0, 0x32,
+            // Interface 0: HID (3), sin subclase de arranque, protocolo 0.
+            0x09, 0x04, 0x00, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00,
+            // HID: dice tener descriptor de informe, pero a una tableta de
+            // máquina virtual no se le pide.
+            0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x34, 0x00,
+            // Endpoint 1 IN, interrupción, 8 bytes cada 10 ms.
+            0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0a,
+        ];
+        let total = config.len() as u16;
+        config[2..4].copy_from_slice(&total.to_le_bytes());
+        let mut device: Vec<u8> = alloc::vec![
+            0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x01, 0x02, 0x03, 0x01,
+        ];
+        device[8..10].copy_from_slice(&vid.to_le_bytes());
+        device[10..12].copy_from_slice(&pid.to_le_bytes());
+        Self {
+            device,
+            config,
+            report: Vec::new(),
+            stall: Vec::new(),
+            silent: Vec::new(),
+            mute: false,
+            mute_first: 0,
+            seen: Vec::new(),
+            hub: None,
+            disk: None,
+            queued: Vec::new(),
+        }
+    }
+
     /// Un teclado de protocolo de arranque: la otra mitad del camino HID, y
     /// el único informe que no lleva longitud mínima, porque las teclas van
     /// en un array y no en bytes con signo.

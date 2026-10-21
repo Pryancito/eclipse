@@ -4508,16 +4508,26 @@ pub fn master_check_enabled() -> bool {
     MASTER_CHECK_ENABLED.load(Ordering::Relaxed)
 }
 
-/// The modeset ioctls `drm_ioctls[]` marks `DRM_MASTER` and nothing else:
-/// `drm_ioctl_permit` refuses them to anyone but the current master, before
-/// the handler runs. (`AUTH_MAGIC`, `CREATE_LEASE`, `LIST_LESSEES` and
+/// The ioctls `drm_ioctls[]` marks `DRM_MASTER`: `drm_ioctl_permit` refuses
+/// them to anyone but the current master, before the handler runs. The
+/// twelve of modeset, `SET_VERSION`, and the six hollowed legacy ones
+/// (`DRM_AUTH | DRM_MASTER | DRM_ROOT_ONLY`), which began at the modeset
+/// ones: a second open had `SET_VERSION` answered and, as authenticated
+/// root, the legacy six. (`AUTH_MAGIC`, `CREATE_LEASE`, `LIST_LESSEES` and
 /// `REVOKE_LEASE` are `DRM_MASTER` too, and check it in their own arms;
 /// `SET_MASTER` and `DROP_MASTER` have `drm_master_check_perm` instead,
 /// [`master_check`].)
 fn needs_master(cmd: u32) -> bool {
     matches!(
         cmd,
-        DRM_IOCTL_MODE_SETCRTC
+        DRM_IOCTL_SET_VERSION
+            | DRM_IOCTL_SET_UNIQUE
+            | DRM_IOCTL_BLOCK
+            | DRM_IOCTL_UNBLOCK
+            | DRM_IOCTL_ADD_DRAW
+            | DRM_IOCTL_RM_DRAW
+            | DRM_IOCTL_UPDATE_DRAW
+            | DRM_IOCTL_MODE_SETCRTC
             | DRM_IOCTL_MODE_SETPLANE
             | DRM_IOCTL_MODE_CURSOR
             | DRM_IOCTL_MODE_CURSOR2

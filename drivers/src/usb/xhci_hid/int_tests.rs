@@ -74,6 +74,7 @@ fn motions(seen: &Arc<Mutex<Vec<(u16, u16, i32)>>>) -> Vec<(u16, i32)> {
 /// el driver lo decodifica y lo publica.
 #[test]
 fn un_informe_de_un_raton_sale_como_movimiento_relativo() {
+    let _abs = AbsPointerTurn::new();
     let (hw, mut x) = with_mouse();
     let dci = x.hids[0].ep_dci;
     assert_eq!(dci, 3, "el endpoint de interrupción IN 1 es el DCI 3");
@@ -99,6 +100,7 @@ fn un_informe_de_un_raton_sale_como_movimiento_relativo() {
 /// residual del evento es lo único que lo dice.
 #[test]
 fn un_informe_corto_no_arrastra_la_cola_del_anterior() {
+    let _abs = AbsPointerTurn::new();
     let (hw, mut x) = with_mouse();
     let dci = x.hids[0].ep_dci;
     let (lis, seen) = listener();
@@ -128,6 +130,7 @@ fn un_informe_corto_no_arrastra_la_cola_del_anterior() {
 /// sueltos. Con un botón pulsado, eso suelta el botón él solo.
 #[test]
 fn un_informe_de_longitud_cero_no_se_entrega() {
+    let _abs = AbsPointerTurn::new();
     let (hw, mut x) = with_mouse();
     let dci = x.hids[0].ep_dci;
     let (lis, seen) = listener();
@@ -171,6 +174,7 @@ fn un_informe_de_longitud_cero_no_se_entrega() {
 /// rompe aunque no se pierda ninguno.
 #[test]
 fn una_rafaga_mas_larga_que_el_anillo_sale_en_orden() {
+    let _abs = AbsPointerTurn::new();
     let (hw, mut x) = with_mouse();
     let dci = x.hids[0].ep_dci;
     let (lis, seen) = listener();
@@ -204,6 +208,7 @@ fn una_rafaga_mas_larga_que_el_anillo_sale_en_orden() {
 /// drenaje de eventos.
 #[test]
 fn un_stall_en_el_endpoint_lo_recupera_y_sigue_entregando() {
+    let _abs = AbsPointerTurn::new();
     let (hw, mut x) = with_mouse();
     let dci = x.hids[0].ep_dci;
     let (lis, seen) = listener();
@@ -244,6 +249,7 @@ fn un_stall_en_el_endpoint_lo_recupera_y_sigue_entregando() {
 /// fallido.
 #[test]
 fn un_fallo_que_no_deja_halt_no_resetea_el_endpoint() {
+    let _abs = AbsPointerTurn::new();
     let (hw, mut x) = with_mouse();
     let dci = x.hids[0].ep_dci;
     let (lis, seen) = listener();
@@ -280,6 +286,7 @@ fn un_fallo_que_no_deja_halt_no_resetea_el_endpoint() {
 /// comandos que esperan en el anillo de eventos.
 #[test]
 fn un_cambio_avisado_por_el_hub_enumera_lo_que_se_acaba_de_enchufar() {
+    let _abs = AbsPointerTurn::new();
     let (hw, mut x) = with_hub();
     let dci = x.hubs[0].ep_dci;
     assert_ne!(dci, 0, "el hub no tiene endpoint de estado");
@@ -315,6 +322,7 @@ fn un_cambio_avisado_por_el_hub_enumera_lo_que_se_acaba_de_enchufar() {
 /// pasa nada: señalar un puerto ahí sería enumerar lo que ya está enumerado.
 #[test]
 fn un_mapa_de_bits_sin_cambios_no_senala_ningun_puerto() {
+    let _abs = AbsPointerTurn::new();
     let (hw, mut x) = with_hub();
     let dci = x.hubs[0].ep_dci;
     let (lis, _seen) = listener();
@@ -334,6 +342,7 @@ fn un_mapa_de_bits_sin_cambios_no_senala_ningun_puerto() {
 /// barrido de los puertos del hub.
 #[test]
 fn un_fallo_del_endpoint_de_estado_deja_un_barrido_pendiente() {
+    let _abs = AbsPointerTurn::new();
     let (hw, mut x) = with_hub();
     let dci = x.hubs[0].ep_dci;
     let (lis, _seen) = listener();
@@ -353,6 +362,7 @@ fn un_fallo_del_endpoint_de_estado_deja_un_barrido_pendiente() {
 /// sondeo.
 #[test]
 fn el_endpoint_de_estado_se_rearma_tras_cada_informe() {
+    let _abs = AbsPointerTurn::new();
     let (hw, mut x) = with_hub();
     let dci = x.hubs[0].ep_dci;
     let (lis, _seen) = listener();
@@ -376,6 +386,7 @@ fn el_endpoint_de_estado_se_rearma_tras_cada_informe() {
 /// mismo fallo que en el ratón, pero aquí sí se nota.
 #[test]
 fn un_informe_vacio_no_suelta_las_teclas_pulsadas() {
+    let _abs = AbsPointerTurn::new();
     let hw = Hw::new(SLOTS, PORTS);
     hw.set_auto_advance(1_000);
     let mut x = hw.inner(SLOTS, PORTS, 0);
