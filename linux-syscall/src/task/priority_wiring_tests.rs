@@ -23,7 +23,7 @@
 use super::*;
 use crate::on_a_thread::on_a_thread;
 use alloc::boxed::Box;
-use linux_object::process::{LinuxProcess, PRIO_PROCESS};
+use linux_object::process::{LinuxProcess, PRIO_PGRP, PRIO_PROCESS};
 use rcore_fs_ramfs::RamFS;
 use zircon_object::task::{Process, ROOT_JOB};
 
@@ -376,6 +376,57 @@ fn sched_rr_get_interval_is_zero_for_everything_but_round_robin() {
                 (fifo.sec, fifo.nsec),
                 (0, 0),
                 "a FIFO thread reported a round-robin timeslice"
+            );
+        })
+    });
+}
+
+#[test]
+fn getpriority_answers_the_most_favoured_of_the_set_and_not_the_least() {
+    // Over a set of tasks `getpriority` is a MAXIMUM, and that is only
+    // visible with two tasks that differ: every other test here asks
+    // about a single target, where the maximum and the minimum are the
+    // same number. Because the encoding runs backwards, a minimum would
+    // report the LEAST favoured task of the group, which is the opposite
+    // of what the call promises -- and `renice -g` reads the answer back
+    // to decide what to ask for next.
+    //
+    // The set is a process group: the process is born with pgid 0, so
+    // `effective_pgid` answers its own pid, which nothing else in this
+    // binary has.
+    let proc = a_process(47_108, "prio-most-favoured");
+    let sibling = Thread::create_linux(&proc).unwrap();
+    let group = proc.clone();
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            assert_eq!(
+                group.threads().len(),
+                2,
+                "the group under test does not have two tasks in it"
+            );
+
+            // Root, so moving either way is allowed at all. 20 - 10 = 10
+            // for the one that gave way, 20 - -5 = 25 for the favoured
+            // one.
+            assert_eq!(sys.sys_setpriority(PRIO_PROCESS, 0, 10), Ok(0));
+            assert_eq!(
+                sys.sys_setpriority(PRIO_PROCESS, sibling.id() as usize, -5),
+                Ok(0)
+            );
+            assert_eq!(
+                sys.sys_getpriority(PRIO_PGRP, 0),
+                Ok(25),
+                "getpriority reported the least favoured task of the group"
+            );
+
+            // And the group walk really is a walk: renicing the group has
+            // to move the sibling too, or the favoured 25 would still be
+            // there to be read.
+            assert_eq!(sys.sys_setpriority(PRIO_PGRP, 0, 7), Ok(0));
+            assert_eq!(
+                sys.sys_getpriority(PRIO_PGRP, 0),
+                Ok(13),
+                "setpriority over a group left a task where it was"
             );
         })
     });
