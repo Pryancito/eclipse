@@ -11,6 +11,8 @@ use bitflags::bitflags;
 use kernel_hal::context::{UserContext, UserContextField};
 use linux_object::error::LxResult;
 use linux_object::fs::{FileLike, PidFd};
+use linux_object::fs::{INodeExt, Walker};
+use linux_object::loader::{interp_lookup_of, LinuxElfLoader};
 use linux_object::process::{
     killable_on, prio_target, wait_child_any_interest, wait_child_interest, Capabilities,
     Credentials, LinuxProcess, PrioTarget, SchedFacts, SchedRequest, WaitInterest, CAP_LAST_CAP,
@@ -20,7 +22,6 @@ use linux_object::signal::SigInfo;
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
 use linux_object::time::RUsage;
 use linux_object::time::TimeSpec;
-use linux_object::{fs::INodeExt, loader::LinuxElfLoader};
 use zircon_object::object::{KernelObject, KoID, Signal};
 use zircon_object::task::{
     Thread, MAX_NICE, MAX_RT_PRIO, MIN_NICE, MIN_RT_PRIO, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO,
@@ -385,19 +386,20 @@ struct ExecPreflight(());
 fn execve_preflight(
     image: &Arc<dyn rcore_fs::vfs::INode>,
     syscall_entry: VirtAddr,
-    root_inode: &Arc<dyn rcore_fs::vfs::INode>,
-    creds: &linux_object::process::Credentials,
+    proc: &Arc<Process>,
 ) -> LxResult<ExecPreflight> {
     LinuxElfLoader {
         syscall_entry,
         stack_pages: USER_STACK_PAGES,
-        root_inode: root_inode.clone(),
+        root_inode: proc.linux().root_inode().clone(),
+        // `open_exec` walks as the caller, whose credentials these still are.
+        interp_lookup: Some(interp_lookup_of(proc, Walker::Caller)),
         // Preflight reads headers and builds no stack, so there is no aux
         // vector to be right about here -- and there could not be one yet:
         // the set-user-ID transition that decides it has not happened.
         identity: Default::default(),
     }
-    .preflight(image, creds)?;
+    .preflight(image, &proc.linux().credentials())?;
     Ok(ExecPreflight(()))
 }
 
@@ -1477,12 +1479,7 @@ impl Syscall<'_> {
         // as a script, prints "not found") instead of the process dying on
         // the instruction after the syscall. Linux draws the same line: the
         // `bprm` is fully built before `begin_new_exec` commits.
-        let past_every_check = execve_preflight(
-            inode,
-            self.syscall_entry,
-            proc.root_inode(),
-            &proc.credentials(),
-        )?;
+        let past_every_check = execve_preflight(inode, self.syscall_entry, self.zircon_process())?;
 
         // POSIX/Linux: execve in a multithreaded process kills every other
         // thread in the group before the address space is replaced. Leaving
@@ -1541,6 +1538,11 @@ impl Syscall<'_> {
                 syscall_entry: self.syscall_entry,
                 stack_pages: USER_STACK_PAGES,
                 root_inode: proc.root_inode().clone(),
+                // The same files the preflight found, from the same working
+                // directory; asking the caller's question again could only
+                // refuse after the point of no return, with the credentials
+                // of a set-user-ID image already in place.
+                interp_lookup: Some(interp_lookup_of(self.zircon_process(), Walker::Kernel)),
                 identity: proc.aux_identity(privileged),
             }
             .load(&vmar, &vmo, args.clone(), envs.clone(), path_str)
@@ -3054,6 +3056,8 @@ mod exit_code_tests;
 mod exit_signal_tests;
 #[cfg(test)]
 mod fork_child_tid_tests;
+#[cfg(test)]
+mod interp_tests;
 #[cfg(test)]
 mod sched_validate_tests;
 

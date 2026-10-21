@@ -82,13 +82,8 @@ fn a_static_elf() -> Vec<u8> {
 /// nothing wrong with.
 fn a_token(proc: &Arc<Process>) -> ExecPreflight {
     let image = a_file(proc, "static", &a_static_elf());
-    execve_preflight(
-        &image,
-        0,
-        proc.linux().root_inode(),
-        &proc.linux().credentials(),
-    )
-    .expect("a static program for this machine has nothing to refuse")
+    execve_preflight(&image, 0, proc)
+        .expect("a static program for this machine has nothing to refuse")
 }
 
 /// The caller of `execve` is the one thread that comes out the other side.
@@ -203,12 +198,7 @@ fn a_shebang_naming_a_missing_interpreter_is_refused_and_costs_the_caller_nothin
     let before = proc.thread_count();
 
     let script = a_file(&proc, "script", b"#!/nonexistent/interpreter\n");
-    let got = execve_preflight(
-        &script,
-        0,
-        proc.linux().root_inode(),
-        &proc.linux().credentials(),
-    );
+    let got = execve_preflight(&script, 0, &proc);
 
     assert!(
         got.is_err(),

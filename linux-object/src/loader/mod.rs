@@ -275,6 +275,33 @@ pub type Loaded = (VirtAddr, VirtAddr, usize, String, Abi, Option<ArgArea>);
 /// `/etc/alternatives`) was `ELOOP` where Linux runs it.
 const INTERP_FOLLOW: usize = crate::fs::FOLLOW_MAX_DEPTH;
 
+/// How an interpreter's path is turned into a file: see
+/// [`LinuxElfLoader::interp_lookup`].
+pub type InterpLookup = Arc<dyn Fn(&str) -> LxResult<Arc<dyn INode>> + Send + Sync>;
+
+/// The [`InterpLookup`] of a process: `open_exec`, which is
+/// `do_open_execat(AT_FDCWD, name, 0)` -- a relative interpreter starts at
+/// the working directory, as any relative path does, and every directory on
+/// the way is asked for search permission by `walker`.
+///
+/// Linux 6.18 runs `#!as-interp` and a `PT_INTERP` of `as-interp` from a
+/// working directory that holds `as-interp`, and refuses an interpreter in a
+/// directory the caller may not search with `EACCES` (`interp-survey`,
+/// measured there with glibc and musl). Both were looked up from the root
+/// here, asking nothing: `ENOENT` for the first, and the interpreter ran for
+/// the second.
+pub fn interp_lookup_of(
+    proc: &Arc<zircon_object::task::Process>,
+    walker: crate::fs::Walker,
+) -> InterpLookup {
+    use crate::process::ProcessExt;
+    let proc = proc.clone();
+    Arc::new(move |path: &str| {
+        proc.linux()
+            .lookup_inode_at_by(crate::fs::FileDesc::CWD, path, true, walker)
+    })
+}
+
 /// Linux ELF Program Loader.
 pub struct LinuxElfLoader {
     /// syscall entry
@@ -283,6 +310,11 @@ pub struct LinuxElfLoader {
     pub stack_pages: usize,
     /// root inode of LinuxElfLoader
     pub root_inode: Arc<dyn INode>,
+    /// How an interpreter (`#!` or `PT_INTERP`) is looked up, by the
+    /// preflight and by the load alike: [`interp_lookup_of`] for a process.
+    /// `None` looks it up from `root_inode` and asks nothing, which is all a
+    /// loader with no calling process (the first one) has.
+    pub interp_lookup: Option<InterpLookup>,
     /// Who the new image runs as, and whether this exec raised privileges.
     ///
     /// The caller computes it, because only the caller knows: the identity
@@ -323,6 +355,16 @@ impl LinuxElfLoader {
 
         zircon_object::vm::KERNEL_ASPACE.unmap(virt_addr, size)?;
         res
+    }
+
+    /// The file an interpreter's path names: see [`Self::interp_lookup`].
+    fn lookup_interp(&self, interp: &str) -> LxResult<Arc<dyn INode>> {
+        match &self.interp_lookup {
+            Some(lookup) => lookup(interp),
+            None => Ok(self
+                .root_inode
+                .lookup_follow(interp.trim_start_matches('/'), INTERP_FOLLOW)?),
+        }
     }
 
     /// How deep a `#!` chain may go: the file at depth `d` is the one the
@@ -403,16 +445,11 @@ impl LinuxElfLoader {
             if !hunter::check_exec_path(interp) {
                 return Err(ZxError::ACCESS_DENIED.into());
             }
-            let interp_rel = interp.trim_start_matches('/');
-            let inode = self
-                .root_inode
-                .lookup_follow(interp_rel, INTERP_FOLLOW)
-                .map_err(|e| {
-                    error!("shebang: lookup interp {:?} failed: {:?}", interp_rel, e);
-                    e
-                })?;
+            let inode = self.lookup_interp(interp).inspect_err(|e| {
+                error!("shebang: lookup interp {:?} failed: {:?}", interp, e);
+            })?;
             let interp_vmo = inode.read_as_vmo_cached().map_err(|e| {
-                error!("shebang: read interp {:?} failed: {:?}", interp_rel, e);
+                error!("shebang: read interp {:?} failed: {:?}", interp, e);
                 e
             })?;
             let interp_size = zircon_object::vm::roundup_pages(interp_vmo.len());
@@ -505,17 +542,12 @@ impl LinuxElfLoader {
             if !hunter::check_exec_path(interp) {
                 return Err(ZxError::ACCESS_DENIED.into());
             }
-            let interp_rel = interp.trim_start_matches('/');
-            let inode = self
-                .root_inode
-                .lookup_follow(interp_rel, INTERP_FOLLOW)
-                .map_err(|e| {
-                    error!(
-                        "elf: lookup PT_INTERP {:?} failed: {:?} (check if file exists in rootfs)",
-                        interp, e
-                    );
-                    e
-                })?;
+            let inode = self.lookup_interp(interp).inspect_err(|e| {
+                error!(
+                    "elf: lookup PT_INTERP {:?} failed: {:?} (check if file exists in rootfs)",
+                    interp, e
+                );
+            })?;
             let interp_vmo = inode.read_as_vmo_cached().map_err(|e| {
                 error!("elf: read interp {:?} failed: {:?}", interp, e);
                 e
