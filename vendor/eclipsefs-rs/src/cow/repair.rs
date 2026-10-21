@@ -312,12 +312,11 @@ impl CowFs {
             self.root_tree.level,
             Some(self.root_tree.gen),
         )];
-        for (k, d) in self.st.range(
-            &self.root_tree,
-            &Key::new(0, ROOT_ITEM, 0),
-            &Key::MAX,
-            usize::MAX,
-        )? {
+        let first = Key::new(0, ROOT_ITEM, 0);
+        for (k, d) in self
+            .st
+            .range(&self.root_tree, &first, &Key::MAX, usize::MAX)?
+        {
             if k.ty == ROOT_ITEM {
                 let root = RootItem::decode(&d)?.root;
                 stack.push((root.bytenr, root.level, Some(root.gen)));
@@ -648,10 +647,8 @@ impl CowFs {
                         Some(i) => {
                             if e.kind != i.kind() {
                                 e.kind = i.kind();
-                                self.upsert(
-                                    Key::new(e.dir, DIR_INDEX, e.index),
-                                    encode_pair(e.ino, 0, e.kind, &e.name),
-                                )?;
+                                let v = encode_pair(e.ino, 0, e.kind, &e.name);
+                                self.upsert(Key::new(e.dir, DIR_INDEX, e.index), v)?;
                                 r.entries_fixed += 1;
                             }
                             if e.kind == FileKind::Dir {
@@ -692,10 +689,8 @@ impl CowFs {
                 continue;
             }
             let target = handle(id, FIRST_INO);
-            self.upsert(
-                Key::new(b.ino, DIR_INDEX, b.index),
-                encode_pair(target, 0, FileKind::Dir, &b.name),
-            )?;
+            let v = encode_pair(target, 0, FileKind::Dir, &b.name);
+            self.upsert(Key::new(b.ino, DIR_INDEX, b.index), v)?;
             linked.insert(id);
             keep.push(Entry {
                 dir: b.ino,
@@ -857,14 +852,16 @@ impl CowFs {
             v
         };
         for (&(dir, h), list) in &s.items {
-            if !items.contains_key(&(dir, h)) && s.inodes.contains_key(&dir) {
-                self.delete(Key::new(dir, DIR_ITEM, h))?;
-                r.entries_fixed += 1;
-            } else if let Some(want) = items.get(&(dir, h)) {
-                if sorted(want) != sorted(list) {
+            match items.get(&(dir, h)) {
+                None if s.inodes.contains_key(&dir) => {
+                    self.delete(Key::new(dir, DIR_ITEM, h))?;
+                    r.entries_fixed += 1;
+                }
+                Some(want) if sorted(want) != sorted(list) => {
                     self.upsert(Key::new(dir, DIR_ITEM, h), encode_dir_item(want))?;
                     r.entries_fixed += 1;
                 }
+                _ => {}
             }
         }
         for (&(dir, h), want) in &items {
@@ -1121,8 +1118,9 @@ impl CowFs {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use super::super::encrypt::EncryptionPolicy;
     use super::*;
-    use crate::testdisk::Rng;
+    use crate::testdisk::{clock, formatted, Ram, Rng};
 
     /// `Counts` against an array of counts: after any sequence of `add`s
     /// every block has the count it should, neighbours with equal counts are
@@ -1172,5 +1170,340 @@ mod tests {
         c.add(10, 0);
         assert!(c.0.is_empty());
         assert!(c.held().is_empty());
+    }
+
+    fn mounted() -> (Arc<Ram>, CowFs) {
+        let d = formatted(32);
+        let mut fs = CowFs::mount(d.clone(), false).unwrap();
+        fs.set_clock(clock);
+        (d, fs)
+    }
+
+    fn file(fs: &mut CowFs, dir: u64, name: &str) -> u64 {
+        let h = fs.create(dir, name, FileKind::Regular, 0o644, 0).unwrap();
+        fs.write(h, 0, name.as_bytes()).unwrap();
+        h
+    }
+
+    /// Commit what the test broke and repair it.
+    fn repaired(fs: &mut CowFs) -> RepairReport {
+        fs.sync().unwrap();
+        fs.repair().unwrap()
+    }
+
+    fn clean(fs: &mut CowFs) {
+        let r = repaired(fs);
+        assert_eq!(r.still_damaged, None, "{:?}", r);
+        fs.check().unwrap();
+    }
+
+    /// Drop every name of `ino` in `dir` (its entries and back reference).
+    fn unname(fs: &mut CowFs, dir: u64, name: &[u8], ino: u64) {
+        let index = fs.lookup_index(dir, name);
+        fs.delete(Key::new(dir, DIR_INDEX, index)).unwrap();
+        fs.delete(Key::new(dir, DIR_ITEM, name_hash(name))).unwrap();
+        fs.delete(Key::new(ino, INODE_REF, ref_hash(dir, index)))
+            .unwrap();
+    }
+
+    impl CowFs {
+        fn lookup_index(&mut self, dir: u64, name: &[u8]) -> u64 {
+            let d = self
+                .get(Key::new(dir, DIR_ITEM, name_hash(name)))
+                .unwrap()
+                .unwrap();
+            decode_dir_item(&d)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == name)
+                .unwrap()
+                .index
+        }
+    }
+
+    #[test]
+    fn tree_nodes_that_cannot_be_read_stop_the_repair() {
+        let (d, mut fs) = mounted();
+        for i in 0..300 {
+            file(&mut fs, FIRST_INO, &alloc::format!("file-{}", i));
+        }
+        fs.sync().unwrap();
+        let Body::Internal(ptrs) = &fs
+            .st
+            .node(fs.fs_root.bytenr, fs.fs_root.level, None)
+            .unwrap()
+            .body
+        else {
+            panic!("one leaf");
+        };
+        let leaf = ptrs.last().unwrap().bytenr;
+        drop(fs);
+        d.poke((leaf * BS + 200) as usize, 0xff);
+        let mut fs = CowFs::mount(d, false).unwrap();
+        let r = fs.repair().unwrap();
+        assert_eq!(r.still_damaged, Some("tree nodes cannot be read"));
+    }
+
+    #[test]
+    fn tree_nodes_past_the_end_stop_the_repair() {
+        let (_, mut fs) = mounted();
+        fs.sync().unwrap();
+        fs.sb.total_blocks = fs.journal.start + fs.journal.blocks;
+        let r = fs.repair().unwrap();
+        assert_eq!(r.still_damaged, Some("a tree node shares its block"));
+    }
+
+    /// Bad items of every kind the scan meets go.
+    #[test]
+    fn items_that_cannot_be_are_dropped() {
+        let (_, mut fs) = mounted();
+        let f = split(file(&mut fs, FIRST_INO, "f")).1;
+        let item = fs.inode(f).unwrap().encode();
+        fs.insert(Key::new(f + 100, INODE_ITEM, 1), item).unwrap();
+        fs.insert(
+            Key::new(f, XATTR_ITEM, 12345),
+            encode_xattrs(&[(b"user.a".to_vec(), vec![1])]),
+        )
+        .unwrap();
+        fs.insert(Key::new(f, ENC_CONTEXT, 0), vec![1; 40]).unwrap();
+        let r = repaired(&mut fs);
+        assert!(r.items_removed >= 3, "{:?}", r);
+        assert_eq!(r.still_damaged, None);
+    }
+
+    /// A subvolume being received is left to its receive.
+    #[test]
+    fn a_subvolume_being_received_is_skipped() {
+        let (_, mut fs) = mounted();
+        let root = fs.st.create(&mut fs.sp, FIRST_SUBVOL, 0).unwrap();
+        let item = RootItem {
+            root,
+            next_ino: FIRST_INO,
+            root_dir: FIRST_INO,
+            flags: ROOT_FLAG_RECEIVING,
+            ..Default::default()
+        };
+        fs.root_insert(Key::new(FIRST_SUBVOL, ROOT_ITEM, 0), item.encode())
+            .unwrap();
+        let r = repaired(&mut fs);
+        assert!(!r.changed(), "{:?}", r);
+    }
+
+    #[test]
+    fn a_subvolume_without_a_root_directory_is_left() {
+        let (_, mut fs) = mounted();
+        let mut i = fs.inode(FIRST_INO).unwrap();
+        i.mode = (i.mode & 0o7777) | crate::format::S_IFREG;
+        fs.put_inode(FIRST_INO, i).unwrap();
+        let r = repaired(&mut fs);
+        assert_eq!(r.unrepaired, 1);
+        assert!(r.still_damaged.is_some());
+    }
+
+    /// Entries: a second name of a directory, one whose kind is not its
+    /// inode's, one naming the subvolume itself.
+    #[test]
+    fn entries_that_disagree_with_their_inodes() {
+        let (_, mut fs) = mounted();
+        let a = fs.create(FIRST_INO, "a", FileKind::Dir, 0o755, 0).unwrap();
+        let f = file(&mut fs, FIRST_INO, "f");
+        let (_, ai) = split(a);
+        let (_, fi) = split(f);
+        fs.insert(
+            Key::new(FIRST_INO, DIR_INDEX, 500),
+            encode_pair(ai, 0, FileKind::Dir, b"a2"),
+        )
+        .unwrap();
+        let fx = fs.lookup_index(FIRST_INO, b"f");
+        fs.upsert(
+            Key::new(FIRST_INO, DIR_INDEX, fx),
+            encode_pair(fi, 0, FileKind::Symlink, b"f"),
+        )
+        .unwrap();
+        let me = handle(fs.subvol, FIRST_INO);
+        fs.insert(
+            Key::new(FIRST_INO, DIR_INDEX, 501),
+            encode_pair(me, 0, FileKind::Dir, b"me"),
+        )
+        .unwrap();
+        let r = repaired(&mut fs);
+        assert!(r.entries_removed >= 2 && r.entries_fixed >= 1, "{:?}", r);
+        assert_eq!(r.still_damaged, None);
+        assert_eq!(fs.stat(f).unwrap().kind, FileKind::Regular);
+    }
+
+    /// A subvolume whose back reference is gone is named by its entry; one
+    /// whose entry is gone and whose name is taken stays unnamed.
+    #[test]
+    fn subvolume_names_and_back_references() {
+        let (_, mut fs) = mounted();
+        let sv = fs.create_subvolume(FIRST_INO, "sv").unwrap();
+        let id = split(sv).0;
+        let (p, _) = fs.backref(id).unwrap().unwrap();
+        fs.root_delete(Key::new(id, ROOT_BACKREF, p)).unwrap();
+        let r = repaired(&mut fs);
+        assert_eq!(r.entries_fixed, 1, "{:?}", r);
+        assert!(fs.backref(id).unwrap().is_some());
+        fs.check().unwrap();
+
+        let index = fs.lookup_index(FIRST_INO, b"sv");
+        fs.delete(Key::new(FIRST_INO, DIR_INDEX, index)).unwrap();
+        fs.delete(Key::new(FIRST_INO, DIR_ITEM, name_hash(b"sv")))
+            .unwrap();
+        file(&mut fs, FIRST_INO, "sv");
+        let r = repaired(&mut fs);
+        assert_eq!(r.unrepaired, 1, "{:?}", r);
+    }
+
+    /// Orphans go to the lost+found there is, under a name not taken; a
+    /// file named lost+found makes it lost+found_.
+    #[test]
+    fn lost_and_found_names() {
+        let (_, mut fs) = mounted();
+        file(&mut fs, FIRST_INO, "lost+found");
+        let f = file(&mut fs, FIRST_INO, "f");
+        unname(&mut fs, FIRST_INO, b"f", split(f).1);
+        let r = repaired(&mut fs);
+        assert_eq!(r.lost_found, 1, "{:?}", r);
+        fs.lookup(FIRST_INO, "lost+found_").unwrap();
+        fs.check().unwrap();
+
+        // The second orphan finds the lost+found the first one made.
+        let (_, mut fs) = mounted();
+        let f = file(&mut fs, FIRST_INO, "f");
+        unname(&mut fs, FIRST_INO, b"f", split(f).1);
+        repaired(&mut fs);
+        let lf = fs.lookup(FIRST_INO, "lost+found").unwrap();
+        let g = file(&mut fs, FIRST_INO, "g");
+        let gi = split(g).1;
+        file(&mut fs, lf, &alloc::format!("#{}", gi));
+        unname(&mut fs, FIRST_INO, b"g", gi);
+        let r = repaired(&mut fs);
+        assert_eq!(r.lost_found, 1, "{:?}", r);
+        fs.lookup(lf, &alloc::format!("#{}_", gi)).unwrap();
+        clean(&mut fs);
+    }
+
+    /// The root of an encrypted subvolume has no lost+found to give.
+    #[test]
+    fn orphans_of_an_encrypted_root_stay_orphans() {
+        let (_, mut fs) = mounted();
+        fs.set_random(|b| b.fill(7));
+        let key = fs.add_encryption_key(&[0x42; 64]).unwrap();
+        let sv = fs.create_subvolume(FIRST_INO, "sv").unwrap();
+        fs.set_encryption_policy(sv, &EncryptionPolicy::new(key))
+            .unwrap();
+        let f = file(&mut fs, sv, "secret-name");
+        fs.enter(split(sv).0).unwrap();
+        let fi = split(f).1;
+        let refs = fs.items_of(fi, INODE_REF, 10).unwrap();
+        let (rk, rv) = &refs[0];
+        let pair = decode_pair(rv).unwrap();
+        fs.delete(*rk).unwrap();
+        fs.delete(Key::new(FIRST_INO, DIR_INDEX, pair.index))
+            .unwrap();
+        fs.delete(Key::new(FIRST_INO, DIR_ITEM, name_hash(&pair.name)))
+            .unwrap();
+        let r = repaired(&mut fs);
+        assert_eq!(r.unrepaired, 1, "{:?}", r);
+    }
+
+    /// Checksum items that are not, or do not decode.
+    #[test]
+    fn bad_checksum_items_are_dropped() {
+        let (_, mut fs) = mounted();
+        let f = fs
+            .create(FIRST_INO, "f", FileKind::Regular, 0o644, 0)
+            .unwrap();
+        fs.write(f, 0, &[1; 3 * BS as usize]).unwrap();
+        fs.sync().unwrap();
+        for k in [
+            Key::new(CSUM_BUCKET + 1, CSUM_ITEM, 0),
+            Key::new(77 * CSUM_BUCKET, CSUM_ITEM, 0),
+        ] {
+            fs.st
+                .insert(&mut fs.sp, &mut fs.csum_root, k, vec![1])
+                .unwrap();
+        }
+        let root = fs.csum_root;
+        fs.store_root(CSUM_TREE, root).unwrap();
+        let r = repaired(&mut fs);
+        assert!(r.csums_dropped >= 2, "{:?}", r);
+        assert_eq!(r.still_damaged, None);
+    }
+
+    /// Name hash forging: `prefix` and ten more bytes whose low seven bits
+    /// make `name_hash` come out as `target`, if they are a usable name.
+    fn forge(prefix: &[u8], target: u64) -> Option<Vec<u8>> {
+        let with = |x: u128| {
+            let mut n = prefix.to_vec();
+            n.extend((0..10).map(|k| 0x40 ^ ((x >> (7 * k)) & 0x7f) as u8));
+            n
+        };
+        let h0 = name_hash(&with(0));
+        // Columns of the (affine) map from the 70 free bits to the hash.
+        let mut basis: Vec<(u64, u128)> = Vec::new();
+        for i in 0..70 {
+            let (mut v, mut c) = (name_hash(&with(1 << i)) ^ h0, 1u128 << i);
+            for &(bv, bc) in &basis {
+                if v ^ bv < v {
+                    v ^= bv;
+                    c ^= bc;
+                }
+            }
+            if v != 0 {
+                basis.push((v, c));
+                basis.sort_by(|a, b| b.0.cmp(&a.0));
+            }
+        }
+        let (mut t, mut x) = (target ^ h0, 0u128);
+        for &(bv, bc) in &basis {
+            if t ^ bv < t {
+                t ^= bv;
+                x ^= bc;
+            }
+        }
+        let n = with(x);
+        (t == 0 && core::str::from_utf8(&n).is_ok_and(|s| check_name(s).is_ok())).then_some(n)
+    }
+
+    /// Names whose entries no longer fit one hash item cannot be put back.
+    #[test]
+    fn colliding_names_past_an_item_are_no_space() {
+        let (_, mut fs) = mounted();
+        let first = alloc::vec![b'a'; 255];
+        let target = name_hash(&first);
+        let mut names = alloc::vec![first];
+        let mut k = 0u32;
+        while names.len() < 9 {
+            let mut prefix = alloc::format!("{:08}", k).into_bytes();
+            prefix.resize(245, b'b');
+            k += 1;
+            if let Some(n) = forge(&prefix, target) {
+                assert_eq!(name_hash(&n), target);
+                names.push(n);
+            }
+        }
+        let mut made = 0;
+        for n in &names {
+            let n = core::str::from_utf8(n).unwrap();
+            match fs.create(FIRST_INO, n, FileKind::Regular, 0o644, 0) {
+                Ok(_) => made += 1,
+                Err(e) => {
+                    assert_eq!(e, Error::NoSpace);
+                    break;
+                }
+            }
+        }
+        let extra = split(file(&mut fs, FIRST_INO, "x")).1;
+        let n = &names[made];
+        fs.insert(
+            Key::new(FIRST_INO, DIR_INDEX, 900),
+            encode_pair(extra, 0, FileKind::Regular, n),
+        )
+        .unwrap();
+        fs.delete(Key::new(FIRST_INO, DIR_ITEM, target)).unwrap();
+        fs.sync().unwrap();
+        assert_eq!(fs.repair().err(), Some(Error::NoSpace));
     }
 }

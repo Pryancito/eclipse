@@ -306,7 +306,7 @@ impl CowFs {
         while let Some(from) = next {
             let batch = self.st.range(&self.fs_root, &from, &Key::MAX, 256)?;
             let Some(&(last, _)) = batch.last() else {
-                return Ok(());
+                break;
             };
             for (k, d) in batch {
                 if k.ty != EXTENT_DATA {
@@ -446,6 +446,8 @@ impl CowFs {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use crate::testdisk::{clock, formatted, opts, Ram};
+    use crate::volume::Profile;
 
     #[test]
     fn next_key_steps_and_carries() {
@@ -474,5 +476,136 @@ mod tests {
         assert!(!touches(&set, 90, 10));
         assert!(!touches(&set, 110, 5));
         assert!(!touches(&RangeSet::default(), 0, 1000));
+    }
+
+    fn volume(n: usize, profile: Profile) -> CowFs {
+        let devs: Vec<Arc<dyn BlockDevice>> = (0..n)
+            .map(|_| Ram::new(64 << 20) as Arc<dyn BlockDevice>)
+            .collect();
+        crate::mkfs::format_devices(&devs, &opts(), profile, profile).unwrap();
+        let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+        fs.set_clock(clock);
+        fs
+    }
+
+    /// Files of 4 MiB, committed.
+    fn files(fs: &mut CowFs, n: usize) -> Vec<u64> {
+        let hs = (0..n)
+            .map(|i| {
+                let name = alloc::format!("f{}", i);
+                let h = fs
+                    .create(fs.root_ino(), &name, FileKind::Regular, 0o644, 0)
+                    .unwrap();
+                fs.write(h, 0, &vec![i as u8; 4 << 20]).unwrap();
+                h
+            })
+            .collect();
+        fs.sync().unwrap();
+        hs
+    }
+
+    fn unlink_all(fs: &mut CowFs, n: usize) {
+        for i in 0..n {
+            fs.unlink(fs.root_ino(), &alloc::format!("f{}", i)).unwrap();
+        }
+        fs.sync().unwrap();
+    }
+
+    /// The data chunk that ends last on `devid`: (group, its end there).
+    fn last_chunk(fs: &CowFs, devid: u32) -> (u64, u64) {
+        let map = fs.vol.as_ref().unwrap().map();
+        map.chunks
+            .iter()
+            .filter_map(|(&g, c)| {
+                let s = c.stripes.iter().find(|s| s.devid == devid)?;
+                Some((g, s.phys + c.stripe_len()))
+            })
+            .max_by_key(|&(_, end)| end)
+            .unwrap()
+    }
+
+    /// A block nothing holds, marked in use in group `g`.
+    fn leak(fs: &mut CowFs, g: u64) {
+        let grp = &mut fs.sp.alloc.groups_mut()[g as usize];
+        let off = (2..grp.block_count).find(|&o| !grp.is_used(o)).unwrap();
+        grp.mark_used(off, 1);
+    }
+
+    #[test]
+    fn device_sizes_that_cannot_be() {
+        let mut fs = volume(1, Profile::Single);
+        let size = 64 << 20;
+        assert_eq!(fs.resize(1, Some(size + BS)), Err(Error::Invalid));
+        assert_eq!(fs.resize(1, Some(BS * 100)), Err(Error::Invalid));
+        assert_eq!(fs.resize(1, Some(size)), Ok(size));
+    }
+
+    /// A mirrored chunk past the end of one device, with no room inside
+    /// it and nowhere else for a second copy: the shrink fails, and the
+    /// device keeps its size.
+    #[test]
+    fn a_mirrored_chunk_with_nowhere_to_go() {
+        let mut fs = volume(2, Profile::Raid1);
+        files(&mut fs, 6);
+        let (_, end) = last_chunk(&fs, 2);
+        let limit = end - 100;
+        assert_eq!(fs.resize(2, Some(limit * BS)), Err(Error::NoSpace));
+        assert_eq!(fs.vol.as_ref().unwrap().map().devices[&2], 16384);
+        fs.check().unwrap();
+    }
+
+    /// Empty chunks past the end are just dropped.
+    #[test]
+    fn empty_chunks_past_the_end_are_dropped() {
+        let mut fs = volume(2, Profile::Single);
+        files(&mut fs, 6);
+        unlink_all(&mut fs, 6);
+        let before = fs.vol.as_ref().unwrap().map().chunks.len();
+        assert_eq!(fs.resize(2, Some(1000 * BS)), Ok(1000 * BS));
+        assert!(fs.vol.as_ref().unwrap().map().chunks.len() < before);
+        fs.check().unwrap();
+    }
+
+    /// A chunk that cannot move and still holds a block once emptied.
+    #[test]
+    fn a_chunk_that_does_not_empty_stays() {
+        let mut fs = volume(1, Profile::Single);
+        files(&mut fs, 6);
+        unlink_all(&mut fs, 6);
+        let (g, end) = last_chunk(&fs, 1);
+        leak(&mut fs, g);
+        assert_eq!(fs.resize(1, Some((end - 10) * BS)), Err(Error::NoSpace));
+        assert_eq!(fs.vol.as_ref().unwrap().map().devices[&1], 16384);
+    }
+
+    /// Shrinking through the middle of an extent moves only its tail; a
+    /// block nothing holds past the end stops the shrink.
+    #[test]
+    fn shrinking_through_an_extent() {
+        let d = formatted(64);
+        let mut fs = CowFs::mount(d, false).unwrap();
+        fs.set_clock(clock);
+        let filler = fs
+            .create(fs.root_ino(), "filler", FileKind::Regular, 0o644, 0)
+            .unwrap();
+        fs.write(filler, 0, &vec![1; 6000 * BS as usize]).unwrap();
+        let h = fs
+            .create(fs.root_ino(), "f", FileKind::Regular, 0o644, 0)
+            .unwrap();
+        let data: Vec<u8> = (0..256 * BS).map(|i| (i / BS) as u8).collect();
+        fs.write(h, 0, &data).unwrap();
+        fs.unlink(fs.root_ino(), "filler").unwrap();
+        fs.sync().unwrap();
+        let e = fs.extents(split(h).1, 0, 1).unwrap()[0];
+        let want = e.pblk + e.blocks / 2;
+        assert_eq!(fs.resize(1, Some(want * BS)), Ok(want * BS));
+        let mut back = vec![0u8; data.len()];
+        fs.read(h, 0, &mut back).unwrap();
+        assert!(back == data);
+        fs.check().unwrap();
+
+        let free = (0..want).rev().find(|&b| !fs.sp.alloc.is_used(b)).unwrap();
+        fs.sp.alloc.groups_mut()[0].mark_used(free, 1);
+        assert_eq!(fs.resize(1, Some(free * BS)), Err(Error::NoSpace));
     }
 }
