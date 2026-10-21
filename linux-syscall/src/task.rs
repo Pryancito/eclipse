@@ -3102,6 +3102,12 @@ mod sched_attr_wiring_tests;
 #[cfg(test)]
 mod chmod_wiring_tests;
 
+/// `exit(2)` and `exit_group(2)` through the syscall: which one ends a
+/// thread and which a process, where the code a thread named goes when it
+/// turns out to be the last one, and the word a join waits on.
+#[cfg(test)]
+mod exit_wiring_tests;
+
 #[cfg(test)]
 mod comm_from_path_tests {
     //! `comm` after an `execve`: the last component of the path, which is
