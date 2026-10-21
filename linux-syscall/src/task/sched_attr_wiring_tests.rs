@@ -14,10 +14,11 @@
 //! the buffer. A zero is version 0 for the first and nothing at all for
 //! the second.
 //!
-//! The second is the **extensible struct**: a size past the 48 bytes of
-//! version 0 is accepted only if everything past them is zero, and `E2BIG`
-//! otherwise. That is how an old kernel refuses a struct a new userspace
-//! filled in, instead of silently ignoring the half it does not know.
+//! The second is the **extensible struct**: a size past the 56 bytes this
+//! kernel knows is accepted only if everything past them is zero, and
+//! `E2BIG` otherwise. That is how a kernel refuses a struct a newer
+//! userspace filled in, instead of silently ignoring the half it does not
+//! know.
 //!
 //! The third is that **`SCHED_FLAG_RESET_ON_FORK` lives in `sched_flags`
 //! here**, while the very same bit reaches `sched_setscheduler` inside the
@@ -52,9 +53,9 @@ fn a_process(pid: KoID, name: &str) -> Arc<Process> {
         .unwrap()
 }
 
-/// A `struct sched_attr` with room past version 0, which is what an
-/// extensible struct needs to be asked about at all. `#[repr(C)]` so the
-/// tail really does start at byte 48.
+/// A `struct sched_attr` with room past the version this kernel knows,
+/// which is what an extensible struct needs to be asked about at all.
+/// `#[repr(C)]` so the tail really does start at byte 56.
 #[repr(C)]
 struct Wide {
     attr: SchedAttr,
@@ -75,6 +76,8 @@ impl Wide {
                 sched_runtime: 0,
                 sched_deadline: 0,
                 sched_period: 0,
+                sched_util_min: 0,
+                sched_util_max: 0,
             },
             tail: [0; 16],
         }
@@ -92,6 +95,8 @@ impl Wide {
                 sched_runtime: u64::from_le_bytes([A_SEED; 8]),
                 sched_deadline: u64::from_le_bytes([A_SEED; 8]),
                 sched_period: u64::from_le_bytes([A_SEED; 8]),
+                sched_util_min: u32::from_le_bytes([A_SEED; 4]),
+                sched_util_max: u32::from_le_bytes([A_SEED; 4]),
             },
             tail: [A_SEED; 16],
         }
@@ -172,7 +177,7 @@ fn an_out_of_range_size_is_e2big_asking_and_einval_answering() {
 }
 
 #[test]
-fn everything_past_the_version_zero_struct_has_to_be_zero() {
+fn everything_past_the_struct_this_kernel_knows_has_to_be_zero() {
     // The extensible-struct rule, and the only way an old kernel can
     // refuse a request a new userspace built: a field it does not know is
     // zero (so nothing was asked for) or it is not (so something was, and
@@ -181,7 +186,7 @@ fn everything_past_the_version_zero_struct_has_to_be_zero() {
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
             let mut empty = Wide::asking(SCHED_NORMAL as u32, 0, 0, A_NICE);
-            empty.attr.size = (SCHED_ATTR_SIZE_VER0 + 16) as u32;
+            empty.attr.size = (SCHED_ATTR_SIZE_VER1 + 16) as u32;
             assert_eq!(
                 sys.sys_sched_setattr(0, empty.asked(), 0),
                 Ok(0),
@@ -192,7 +197,7 @@ fn everything_past_the_version_zero_struct_has_to_be_zero() {
             // One byte, anywhere in the tail, and only that byte.
             for at in [0, 7, 15] {
                 let mut filled = Wide::asking(SCHED_NORMAL as u32, 0, 0, ANOTHER_NICE);
-                filled.attr.size = (SCHED_ATTR_SIZE_VER0 + 16) as u32;
+                filled.attr.size = (SCHED_ATTR_SIZE_VER1 + 16) as u32;
                 filled.tail[at] = 1;
                 assert_eq!(
                     sys.sys_sched_setattr(0, filled.asked(), 0),
@@ -394,12 +399,16 @@ fn keep_policy_takes_the_threads_own_class_and_its_own_reset_on_fork() {
 }
 
 #[test]
-fn getattr_answers_the_version_zero_size_zeros_for_the_deadline_fields_and_no_more() {
+fn getattr_answers_with_its_own_version_and_zeroes_what_it_has_nothing_for() {
     // What a caller reads out of its buffer, field by field: the size is
     // the kernel's own version and not the one the caller asked with, the
-    // three deadline fields are zero because this scheduler has none, and
-    // nothing past the 48 bytes of version 0 is touched even when the
-    // caller said its buffer was bigger.
+    // three deadline fields are zero because this scheduler has no
+    // deadline class, the two util clamps are zero because it has no
+    // clamps either, and the part of a bigger buffer the kernel has
+    // nothing to put in comes back zeroed and not untouched, which is what
+    // `copy_struct_to_user` does: a caller reads the whole `size` it was
+    // answered with, so the bytes beyond this version have to mean
+    // something, and zero is "nothing here".
     let proc = a_process(47_157, "attr-answer");
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
@@ -408,11 +417,11 @@ fn getattr_answers_the_version_zero_size_zeros_for_the_deadline_fields_and_no_mo
 
             let mut got = Wide::seeded();
             assert_eq!(
-                sys.sys_sched_getattr(0, got.answered(), SCHED_ATTR_SIZE_VER0 + 16, 0),
+                sys.sys_sched_getattr(0, got.answered(), SCHED_ATTR_SIZE_VER1 + 16, 0),
                 Ok(0)
             );
             assert_eq!(
-                got.attr.size, SCHED_ATTR_SIZE_VER0 as u32,
+                got.attr.size, SCHED_ATTR_SIZE_VER1 as u32,
                 "sched_getattr did not report the version it answered with"
             );
             assert_eq!(
@@ -425,8 +434,13 @@ fn getattr_answers_the_version_zero_size_zeros_for_the_deadline_fields_and_no_mo
                 "a scheduler with no deadline class reported deadline numbers"
             );
             assert_eq!(
-                got.tail, [A_SEED; 16],
-                "sched_getattr wrote past the version it answered with"
+                (got.attr.sched_util_min, got.attr.sched_util_max),
+                (0, 0),
+                "a scheduler with no util clamps reported clamp numbers"
+            );
+            assert_eq!(
+                got.tail, [0; 16],
+                "sched_getattr left the rest of a bigger buffer as it was"
             );
         })
     });
