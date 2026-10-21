@@ -220,9 +220,35 @@ pub struct Walked {
     /// The walk went through a magic link ([`INode::jump`]): what it found
     /// depends on who walked.
     pub jumped: bool,
+    /// Whether whoever walks may search a directory (`may_lookup`), asked
+    /// of each one before a name is looked up in it. Without it the walk
+    /// searches every directory, as the kernel's own walks do.
+    pub search: Option<Search>,
+    /// The directories on the way that not everybody may search, which a
+    /// walk remembered by its path has to ask again for each walker.
+    pub gates: Vec<Arc<dyn INode>>,
 }
 
+/// The question [`Walked::search`] asks: whether a directory, with that
+/// metadata, may be searched.
+pub type Search = Arc<dyn Fn(&dyn INode, &Metadata) -> Result<()> + Send + Sync>;
+
 impl Walked {
+    /// `may_lookup`: whether a name may be looked up in `dir`, whose
+    /// metadata is `meta`. A directory everybody may search (`x` for the
+    /// owner, the group and the others) is no question for anyone, root
+    /// without its capabilities included; any other is a gate.
+    pub fn may_look_in(&mut self, dir: &Arc<dyn INode>, meta: &Metadata) -> Result<()> {
+        if meta.mode & 0o111 == 0o111 {
+            return Ok(());
+        }
+        self.gates.push(dir.clone());
+        match &self.search {
+            Some(search) => search(&**dir, meta),
+            None => Ok(()),
+        }
+    }
+
     /// At `path`, an absolute path with nothing left to resolve in it.
     pub fn at(path: &str) -> Self {
         let mut walked = Walked::default();
@@ -329,7 +355,8 @@ fn lookup_with_budget(
     };
 
     while !rest_path.is_empty() {
-        if result.metadata()?.type_ != FileType::Dir {
+        let here = result.metadata()?;
+        if here.type_ != FileType::Dir {
             return Err(FsError::NotDir);
         }
         // `on_the_way`: a slash comes after the name, if only a trailing one.
@@ -343,6 +370,9 @@ fn lookup_with_budget(
         };
         if name.is_empty() {
             continue;
+        }
+        if let Some(walked) = walked.as_deref_mut() {
+            walked.may_look_in(&result, &here)?;
         }
         let inode = match walked.as_deref() {
             Some(walked) if name == ".." => walked.up(&*result)?,
@@ -689,6 +719,7 @@ mod lookup_tests {
         fs: Mutex<Weak<Tree>>,
         /// A magic link's target, named as given.
         to: Mutex<Option<(Weak<Node>, &'static str)>>,
+        mode: Mutex<u16>,
     }
 
     struct Tree {
@@ -704,6 +735,7 @@ mod lookup_tests {
             this: Mutex::new(Weak::new()),
             fs: Mutex::new(Weak::new()),
             to: Mutex::new(None),
+            mode: Mutex::new(0o777),
         });
         *node.this.lock() = Arc::downgrade(&node);
         node
@@ -783,7 +815,7 @@ mod lookup_tests {
                 mtime: Timespec { sec: 0, nsec: 0 },
                 ctime: Timespec { sec: 0, nsec: 0 },
                 type_: self.type_,
-                mode: 0o777,
+                mode: *self.mode.lock(),
                 nlinks: 1,
                 uid: 0,
                 gid: 0,
@@ -823,6 +855,134 @@ mod lookup_tests {
 
     fn same(a: &Arc<dyn INode>, b: &Arc<Node>) -> bool {
         a.metadata().unwrap().inode == b.metadata().unwrap().inode
+    }
+
+    /// A walk that keeps, in `asked`, the inode of each directory it asks
+    /// about, in order, and is refused every one of them with `refuse`.
+    fn a_walker(asked: &Arc<Mutex<Vec<usize>>>, refuse: bool) -> Walked {
+        let asked = asked.clone();
+        Walked {
+            search: Some(Arc::new(move |_: &dyn INode, meta: &Metadata| {
+                asked.lock().push(meta.inode);
+                if refuse {
+                    Err(FsError::NoPermission)
+                } else {
+                    Ok(())
+                }
+            })),
+            ..Walked::default()
+        }
+    }
+
+    fn id(node: &Arc<Node>) -> usize {
+        node.metadata().unwrap().inode
+    }
+
+    #[test]
+    fn a_walk_asks_about_each_directory_it_looks_a_name_up_in() {
+        // `link_path_walk`: `may_lookup` before every component, the last
+        // included, and never of what the last one names.
+        let tree = tree();
+        let root = &tree.root;
+        let a = root.dir("a");
+        let b = a.dir("b");
+        b.file("f", b"");
+        *a.mode.lock() = 0o700;
+        *b.mode.lock() = 0o750;
+        let inode = &**root as &dyn INode;
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let walk = |path: &str, follow: usize| {
+            asked.lock().clear();
+            let mut walked = a_walker(&asked, false);
+            inode
+                .lookup_walked(path, follow, Some(&mut walked))
+                .unwrap();
+            let gates: Vec<usize> = walked
+                .gates
+                .iter()
+                .map(|g| g.metadata().unwrap().inode)
+                .collect();
+            assert_eq!(
+                gates,
+                *asked.lock(),
+                "{}: every directory asked about is a gate",
+                path
+            );
+            asked.lock().clone()
+        };
+        assert_eq!(walk("a/b/f", 0), [id(&a), id(&b)]);
+        assert_eq!(
+            walk("a/b", 0),
+            [id(&a)],
+            "what the last name names is not asked about"
+        );
+        assert_eq!(walk("a/b/", 0), [id(&a)], "nor with a slash after it");
+        assert_eq!(walk("a", 0), []);
+        assert_eq!(walk("a/.", 0), [id(&a)], "a dot is a name looked up");
+        assert_eq!(walk("a/b/..", 0), [id(&a), id(&b)], "and so are two");
+        assert_eq!(walk("a//b", 0), [id(&a)], "an empty name is none");
+        // A link's target is walked as any path, from where the link is.
+        root.link("l", "a/b/f");
+        a.link("up", "../a/b/f");
+        assert_eq!(walk("l", 4), [id(&a), id(&b)]);
+        assert_eq!(walk("l", 0), [], "a link left in place leads nowhere");
+        // `up` in `a`, then `..` in `a`, `a` in the root, `b` in `a` and
+        // `f` in `b`.
+        assert_eq!(walk("a/up", 4), [id(&a), id(&a), id(&a), id(&b)]);
+    }
+
+    #[test]
+    fn a_directory_everybody_may_search_is_no_question() {
+        // `x` for the owner, the group and the others: nobody, root without
+        // its capabilities included, is refused, so nobody is asked.
+        let tree = tree();
+        let root = &tree.root;
+        let open = root.dir("open");
+        open.file("f", b"");
+        let inode = &**root as &dyn INode;
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        for (mode, is_asked) in [
+            (0o111, false),
+            (0o711, false),
+            (0o110, true),
+            (0o101, true),
+            (0o011, true),
+            (0o666, true),
+        ] {
+            *open.mode.lock() = mode;
+            asked.lock().clear();
+            let mut walked = a_walker(&asked, false);
+            inode.lookup_walked("open/f", 0, Some(&mut walked)).unwrap();
+            assert_eq!(!asked.lock().is_empty(), is_asked, "{:o}", mode);
+            assert_eq!(!walked.gates.is_empty(), is_asked, "{:o}", mode);
+        }
+    }
+
+    #[test]
+    fn a_refused_search_stops_the_walk_there() {
+        let tree = tree();
+        let root = &tree.root;
+        let shut = root.dir("shut");
+        shut.file("f", b"");
+        *shut.mode.lock() = 0o700;
+        root.link("l", "/shut/f");
+        let inode = &**root as &dyn INode;
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        for path in ["shut/f", "shut/absent", "shut/.", "l"] {
+            let mut walked = a_walker(&asked, true);
+            assert_eq!(
+                inode.lookup_walked(path, 4, Some(&mut walked)).err(),
+                Some(FsError::NoPermission),
+                "{}: refused before the name is looked up",
+                path
+            );
+        }
+        // Without a question the kernel's own walk goes through, and still
+        // remembers the gate.
+        let mut walked = Walked::default();
+        inode.lookup_walked("shut/f", 0, Some(&mut walked)).unwrap();
+        assert_eq!(walked.gates.len(), 1);
+        assert!(inode.lookup("shut/f").is_ok());
     }
 
     #[test]

@@ -2650,7 +2650,7 @@ impl Syscall<'_> {
         let inode = proc.lookup_inode(path)?;
         let mut metadata = inode.metadata()?;
         proc.chmod_metadata(&mut metadata, mode as u16)?;
-        inode.set_metadata(&metadata)?;
+        linux_object::fs::set_mode(&inode, &metadata)?;
         Ok(0)
     }
 

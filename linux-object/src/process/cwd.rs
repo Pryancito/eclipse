@@ -7,7 +7,7 @@
 //! `readlink("/proc/self/cwd")` found nothing.
 
 use super::*;
-use crate::fs::FileDesc;
+use crate::fs::{FileDesc, Walker};
 
 impl LinuxProcess {
     /// Whether the working directory has gone since the process went into
@@ -19,7 +19,7 @@ impl LinuxProcess {
     pub fn working_directory_removed(&self) -> bool {
         let cwd = self.current_working_directory();
         let dir = self
-            .lookup_inode_at(FileDesc::CWD, &cwd, true)
+            .lookup_inode_at_by(FileDesc::CWD, &cwd, true, Walker::Kernel)
             .and_then(|inode| Ok(inode.metadata()?));
         !matches!(dir, Ok(m) if m.type_ == FileType::Dir)
     }

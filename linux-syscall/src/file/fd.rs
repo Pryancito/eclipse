@@ -570,9 +570,11 @@ impl Syscall<'_> {
                 let (dir_path, last) = super::dir::last_component(path)?;
                 let file_name = last.to_open_create(super::dir::has_trailing_slash(path))?;
                 // relative to cwd
-                let (dir_inode, mut walked) = proc.lookup_inode_walked(dir_fd, dir_path, true)?;
+                let (dir_inode, mut walked) = proc.lookup_parent_walked(dir_fd, dir_path)?;
                 let dir_metadata = dir_inode.metadata()?;
-                proc.check_access(&dir_metadata, 0o3, true)?;
+                // Only a name to make needs `w` on the directory: `lookup_open`
+                // keeps `may_o_create`'s error for a name that is not there,
+                // so `O_CREAT` opens one that is, and `O_EXCL` is EEXIST.
                 match dir_inode.find(file_name) {
                     Ok(file_inode) => {
                         if flags.contains(OpenFlags::EXCLUSIVE) {
@@ -609,6 +611,7 @@ impl Syscall<'_> {
                         (file_inode, false, walked)
                     }
                     Err(FsError::EntryNotFound) => {
+                        proc.check_access(&dir_metadata, 0o3, true)?;
                         // `build_open_flags`: `op->mode = mode & S_IALLUGO`.
                         // Without the mask, `open(..., O_CREAT, 0o100644)`
                         // left `S_IFREG` in the inode mode. `mknod` shares
@@ -647,7 +650,7 @@ impl Syscall<'_> {
                 let o_path_link = o_path_holds_the_link(flags, follow, path);
                 if !follow && !o_path_link {
                     let (dir_path, file_name) = split_path(path);
-                    let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
+                    let dir_inode = proc.lookup_parent_at(dir_fd, dir_path)?;
                     if matches!(
                         dir_inode.find(file_name).map(|i| i.metadata()),
                         Ok(Ok(m)) if m.type_ == FileType::SymLink
@@ -667,8 +670,7 @@ impl Syscall<'_> {
                 // way and the last name is looked up inside it.
                 let (inode, walked) = if o_path_link {
                     let (dir_path, file_name) = split_path(path);
-                    let (dir_inode, mut walked) =
-                        proc.lookup_inode_walked(dir_fd, dir_path, true)?;
+                    let (dir_inode, mut walked) = proc.lookup_parent_walked(dir_fd, dir_path)?;
                     let inode = dir_inode.find(file_name)?;
                     walked.enter(String::from(file_name));
                     (inode, walked)
