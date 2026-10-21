@@ -2515,3 +2515,200 @@ mod pollfd_layout_tests {
         assert!(offset_of!(PollFd, revents) > offset_of!(PollFd, events));
     }
 }
+
+#[cfg(test)]
+mod end_to_end_tests {
+    //! `poll(2)` made the way a program makes it, which nothing did.
+    //!
+    //! The pure helpers above are well covered -- `poll_nfds`,
+    //! `poll_wait_decision`, `watch_kinds`, `only_terminals` and the rest all
+    //! have tests of their own. What had never run is the body that uses
+    //! them: `PollFuture::poll`, 260 lines that scan the set, classify every
+    //! descriptor, count the ready ones and decide whether to park. Nothing
+    //! in this crate called `sys_poll`, `sys_ppoll`, `sys_select`,
+    //! `sys_pselect6`, `sys_epoll_wait` or `sys_epoll_pwait` even once, so
+    //! the file sat at 21% of its production lines.
+    //!
+    //! A file on RamFS is always ready for both directions, and that is
+    //! enough to ask the three things this body decides on its own, without
+    //! a network stack, a device or a timer: what the return VALUE counts,
+    //! what an fd the process does not have answers, and what a negative fd
+    //! does.
+
+    use super::*;
+    use crate::on_a_thread::on_a_thread;
+    use alloc::boxed::Box;
+    use alloc::string::String;
+    use linux_object::fs::{File, OpenFlags};
+    use linux_object::process::LinuxProcess;
+    use rcore_fs::vfs::FileType;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::{Process, ROOT_JOB};
+
+    /// Ask for nothing and the entry is still scanned; these are the two
+    /// bits a reader and a writer ask for.
+    const IN_AND_OUT: u16 = 0x0001 | 0x0004;
+    /// The same question written the long way, with the stream names beside
+    /// the generic ones, which is what glibc's `poll` passes through.
+    const IN_AND_OUT_WITH_STREAMS: u16 = 0x0001 | 0x0040 | 0x0004 | 0x0100;
+    /// `POLLNVAL`, which is an answer and not an error.
+    const NVAL: u16 = 0x0020;
+
+    fn an_entry(fd: i32, events: u16) -> PollFd {
+        PollFd {
+            fd: FileDesc::from(fd),
+            events: PollEvents::from_bits_truncate(events),
+            revents: PollEvents::empty(),
+        }
+    }
+
+    /// A process whose root holds a `/<top>` of its own, because a lookup
+    /// from the root goes through a path cache every process in this binary
+    /// shares.
+    fn a_process(pid: KoID, name: &str, top: &str) -> Arc<Process> {
+        let lp = LinuxProcess::new(RamFS::new(), 0);
+        lp.root_inode().create(top, FileType::Dir, 0o755).unwrap();
+        Process::create_with_fixed_id_ext(&ROOT_JOB, pid, name, lp).unwrap()
+    }
+
+    /// `poll(ufds, nfds, timeout)` by the syscall, with the set in memory it
+    /// reads and writes back through a pointer.
+    ///
+    /// `sys_poll` wants `&mut self` and `on_a_thread` lends a shared one, so
+    /// this builds its own out of the same three parts, as
+    /// `dispatch_tests::by_number` does.
+    async fn poll_them(sys: &Syscall<'_>, set: &mut [PollFd], timeout_msecs: isize) -> SysResult {
+        let mut own = Syscall {
+            thread: sys.thread,
+            thread_fn: sys.thread_fn,
+            syscall_entry: sys.syscall_entry,
+        };
+        own.sys_poll(
+            UserInOutPtr::from(set.as_mut_ptr() as usize),
+            set.len(),
+            timeout_msecs,
+        )
+        .await
+    }
+
+    /// Open a file of `top` and poll `set`, whose first entry is given that
+    /// file's descriptor. Returns what the syscall returned and the set as
+    /// the syscall wrote it back.
+    fn poll_with_a_file(
+        proc: &Arc<Process>,
+        top: &str,
+        mut set: alloc::vec::Vec<PollFd>,
+        at: usize,
+        timeout_msecs: isize,
+    ) -> (SysResult, alloc::vec::Vec<PollFd>) {
+        // Owned before the closure: `on_a_thread` wants a `'static` one.
+        let dir_path = alloc::format!("/{}", top);
+        let path = alloc::format!("/{}/f", top);
+        on_a_thread(proc, move |sys| {
+            Box::pin(async move {
+                let lp = sys.linux_process();
+                let dir = lp.lookup_inode(&dir_path).unwrap();
+                let inode = dir.create("f", FileType::File, 0o644).unwrap();
+                let fd: i32 = lp
+                    .add_file(File::new(inode, OpenFlags::RDWR, String::from(&path)))
+                    .unwrap()
+                    .into();
+                set[at] = an_entry(fd, set[at].events.bits());
+                let got = poll_them(sys, &mut set, timeout_msecs).await;
+                (got, set)
+            })
+        })
+    }
+
+    #[test]
+    fn the_answer_counts_descriptors_and_not_event_bits() {
+        // Linux's poll(2) returns "the number of fds with nonzero revents,
+        // not the number of event bits set". One file ready both ways is
+        // ONE, however many bits come back in it -- and asking the question
+        // the long way must not turn it into more.
+        let proc = a_process(45_560, "poll-count", "poll_count");
+        let (got, set) = poll_with_a_file(
+            &proc,
+            "poll_count",
+            alloc::vec![an_entry(0, IN_AND_OUT_WITH_STREAMS)],
+            0,
+            0,
+        );
+
+        assert_eq!(got, Ok(1), "a file ready both ways was not one descriptor");
+        assert_eq!(
+            set[0].revents.bits(),
+            IN_AND_OUT_WITH_STREAMS,
+            "the four bits asked for did not all come back"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_the_process_does_not_have_is_pollnval_and_is_counted() {
+        // POLLNVAL is a well-defined answer and not a kernel error: the
+        // syscall succeeds, the entry carries the bit, and it counts towards
+        // the return value like any other ready entry.
+        let proc = a_process(45_561, "poll-nval", "poll_nval");
+        let mut set = alloc::vec![an_entry(999, IN_AND_OUT)];
+        let (got, set) = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let got = poll_them(sys, &mut set, 0).await;
+                (got, set)
+            })
+        });
+
+        assert_eq!(got, Ok(1), "a stale descriptor was not counted");
+        assert_eq!(
+            set[0].revents.bits(),
+            NVAL,
+            "a stale descriptor did not come back as POLLNVAL alone"
+        );
+    }
+
+    #[test]
+    fn a_negative_descriptor_is_ignored_and_counts_for_nothing() {
+        // poll(2)'s "skip this entry", which udhcpc6 leaves in the set. A
+        // set of nothing but ignored entries, with a timeout of zero, is a
+        // return of zero and not a wait.
+        let proc = a_process(45_562, "poll-skip", "poll_skip");
+        let mut set = alloc::vec![an_entry(-1, IN_AND_OUT), an_entry(-1, IN_AND_OUT)];
+        let (got, set) = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let got = poll_them(sys, &mut set, 0).await;
+                (got, set)
+            })
+        });
+
+        assert_eq!(got, Ok(0), "an ignored entry was counted or waited on");
+        assert_eq!(set[0].revents.bits(), 0, "an ignored entry got an answer");
+        assert_eq!(set[1].revents.bits(), 0, "an ignored entry got an answer");
+    }
+
+    #[test]
+    fn the_three_kinds_of_entry_are_counted_separately_in_one_set() {
+        // The three paths of the scan, in the one set, so that the count is
+        // read against entries that answer differently: the ready file and
+        // the stale descriptor each count, the ignored one does not.
+        let proc = a_process(45_563, "poll-mixed", "poll_mixed");
+        let (got, set) = poll_with_a_file(
+            &proc,
+            "poll_mixed",
+            alloc::vec![
+                an_entry(-1, IN_AND_OUT),
+                an_entry(0, IN_AND_OUT),
+                an_entry(999, IN_AND_OUT),
+            ],
+            1,
+            0,
+        );
+
+        assert_eq!(got, Ok(2), "the mixed set did not count two of three");
+        assert_eq!(set[0].revents.bits(), 0, "the ignored entry got an answer");
+        assert_eq!(
+            set[1].revents.bits(),
+            IN_AND_OUT,
+            "the ready file did not answer both directions"
+        );
+        assert_eq!(set[2].revents.bits(), NVAL, "the stale entry was not NVAL");
+    }
+}
