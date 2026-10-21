@@ -414,7 +414,13 @@ fn getattr_answers_its_own_size_zeros_for_what_it_lacks_and_no_more() {
 
             let mut got = Wide::seeded();
             assert_eq!(
-                sys.sys_sched_getattr(0, got.answered(), SCHED_ATTR_SIZE_VER1 + 16, 0),
+                // Eight bytes past the struct, not sixteen: the buffer is
+                // 72 bytes wide (56 of struct and 16 of tail), so asking
+                // with all 72 would have the kernel zero the WHOLE tail and
+                // there would be nothing left to prove it stopped where it
+                // was told. Half a tail declared leaves the other half as
+                // the witness.
+                sys.sys_sched_getattr(0, got.answered(), SCHED_ATTR_SIZE_VER1 + 8, 0),
                 Ok(0)
             );
             assert_eq!(
