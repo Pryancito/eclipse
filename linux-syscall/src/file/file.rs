@@ -3884,6 +3884,13 @@ mod utimes_times_tests;
 #[cfg(test)]
 mod utimes_gate_tests;
 
+/// `utimes` through the syscall. Its pure half has `utimes_times_tests`
+/// beside it; what only this can see is that the `timeval` microseconds
+/// become nanoseconds on the way to the inode, and that a null pathname
+/// here is a bad pointer and not the `futimens` of `utimensat`.
+#[cfg(test)]
+mod utimes_wiring_tests;
+
 #[cfg(test)]
 mod fallocate_mode_tests;
 
