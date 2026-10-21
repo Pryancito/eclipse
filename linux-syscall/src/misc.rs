@@ -2869,3 +2869,9 @@ mod rlimit_wiring_tests;
 /// on, and the numbers `uptime` and `top` print.
 #[cfg(test)]
 mod uts_and_machine_tests;
+
+/// What a program asks about its own privilege and what priority the disk
+/// serves it at: the two capability sets through their version
+/// negotiation, and an I/O priority set on a task and read back off it.
+#[cfg(test)]
+mod caps_and_ioprio_tests;
