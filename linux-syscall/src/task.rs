@@ -3070,6 +3070,13 @@ mod credential_wiring_tests;
 #[cfg(test)]
 mod priority_wiring_tests;
 
+/// The session and process-group syscalls through the syscall. Their gates
+/// are covered on both sides; what only this can see is that the crate
+/// asks them, and that a refusal leaves the membership it refused to
+/// change where it was.
+#[cfg(test)]
+mod session_wiring_tests;
+
 #[cfg(test)]
 mod comm_from_path_tests {
     //! `comm` after an `execve`: the last component of the path, which is
