@@ -7691,6 +7691,11 @@ mod controller_tests;
 #[cfg(test)]
 mod enum_tests;
 
+/// Un hub y lo que cuelga de él: el camino de la clase hub, con el route
+/// string y el traductor de transacciones de cada hijo.
+#[cfg(test)]
+mod hub_tree_tests;
+
 /// La tabla de la página HID del teclado y el delta entre dos informes, que
 /// es el camino que `tests` no toca: ahí todo es ratón.
 #[cfg(test)]

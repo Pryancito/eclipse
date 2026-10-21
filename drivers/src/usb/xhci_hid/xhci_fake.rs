@@ -122,6 +122,32 @@ impl Setup {
     }
 }
 
+/// Un puerto de un hub de los de abajo.
+#[derive(Clone, Copy, Default)]
+struct HubPort {
+    connected: bool,
+    /// Velocidad de PORTSC del dispositivo enchufado.
+    speed: u8,
+    /// `wPortStatus` tal y como lo devuelve `GET_STATUS`.
+    status: u16,
+    /// `wPortChange`, con sus bits de cambio.
+    change: u16,
+    /// Lecturas de estado que le quedan con el reset todavía puesto.
+    reset_reads: u8,
+}
+
+/// Lo que un hub tiene además de ser un dispositivo.
+pub(super) struct HubState {
+    ports: Vec<HubPort>,
+    /// `bPwrOn2PwrGood` del descriptor, en unidades de 2 ms.
+    power_good: u8,
+    /// Un hub cuyos puertos no se habilitan al resetearlos.
+    never_enables: bool,
+    /// Lecturas de estado durante las que un puerto reseteado sigue
+    /// señalando el reset, habilitado o no.
+    slow_reset: u8,
+}
+
 /// Un dispositivo contestando por EP0. Los descriptores los pone el test:
 /// el fake no se inventa ninguno, sólo los entrega recortados a `wLength`
 /// como lo haría el dispositivo.
@@ -140,6 +166,8 @@ pub(super) struct FakeDev {
     pub mute_first: u32,
     /// Todo lo que se le pidió, en orden.
     pub seen: Vec<Setup>,
+    /// Si además es un hub, el estado de sus puertos.
+    pub hub: Option<HubState>,
 }
 
 impl FakeDev {
@@ -177,7 +205,60 @@ impl FakeDev {
             mute: false,
             mute_first: 0,
             seen: Vec::new(),
+            hub: None,
         }
+    }
+
+    /// Un hub de `ports` puertos: clase 9 en el dispositivo y en su única
+    /// interfaz, con el endpoint de interrupción por el que avisa de los
+    /// cambios (USB 2.0 §11.12.1).
+    pub(super) fn hub(ports: u8) -> Self {
+        let mut config: Vec<u8> = alloc::vec![
+            0x09, 0x02, 0x00, 0x00, 0x01, 0x01, 0x00, 0xe0, 0x32,
+            // Interface 0: clase 9 (hub), subclase 0, protocolo 0 (TT único).
+            0x09, 0x04, 0x00, 0x00, 0x01, 0x09, 0x00, 0x00, 0x00,
+            // Endpoint 1 IN, interrupción, un byte de mapa de cambios.
+            0x07, 0x05, 0x81, 0x03, 0x01, 0x00, 0x0c,
+        ];
+        let total = config.len() as u16;
+        config[2..4].copy_from_slice(&total.to_le_bytes());
+        Self {
+            device: alloc::vec![
+                0x12, 0x01, 0x00, 0x02, 0x09, 0x00, 0x01, 0x40, 0x09, 0x1a, 0x01, 0x00, 0x00,
+                0x01, 0x00, 0x00, 0x00, 0x01,
+            ],
+            config,
+            report: Vec::new(),
+            stall: Vec::new(),
+            mute: false,
+            mute_first: 0,
+            seen: Vec::new(),
+            hub: Some(HubState {
+                ports: alloc::vec![HubPort::default(); ports as usize],
+                // 50 ms, que es lo que dice casi cualquier hub de verdad.
+                power_good: 25,
+                never_enables: false,
+                slow_reset: 0,
+            }),
+        }
+    }
+
+    /// Un hub que señala el puerto habilitado mientras su reset sigue puesto,
+    /// durante `reads` lecturas de estado. Hay hubs que lo hacen, y un puerto
+    /// en reset no se puede usar todavía.
+    pub(super) fn with_slow_reset(mut self, reads: u8) -> Self {
+        if let Some(h) = self.hub.as_mut() {
+            h.slow_reset = reads;
+        }
+        self
+    }
+
+    /// Un hub cuyos puertos no se habilitan por mucho que se reseteen.
+    pub(super) fn with_dead_ports(mut self) -> Self {
+        if let Some(h) = self.hub.as_mut() {
+            h.never_enables = true;
+        }
+        self
     }
 
     /// `bMaxPacketSize0` que anuncia el descriptor de dispositivo.
@@ -239,6 +320,13 @@ impl FakeDev {
             // SET_CONFIGURATION, SET_INTERFACE y las dos opcionales de HID
             // (SET_IDLE, SET_PROTOCOL) no llevan datos.
             (0x00, 0x09, _) | (0x01, 0x0b, _) | (0x21, 0x0a, _) | (0x21, 0x0b, _) => Vec::new(),
+            // Lo de clase, que sólo un hub contesta.
+            (0xa0, 0x06, USB_DESC_HUB) | (0xa3, 0x00, _) | (0x23, 0x03, _) | (0x23, 0x01, _) => {
+                match self.hub.as_mut() {
+                    Some(hub) => hub.class_request(s),
+                    None => return Some((Vec::new(), TRB_CC_STALL)),
+                }
+            }
             // Cualquier otra cosa es lo que un dispositivo hace con lo que no
             // entiende: rechazarla.
             _ => return Some((Vec::new(), TRB_CC_STALL)),
@@ -253,13 +341,136 @@ impl FakeDev {
     }
 }
 
+impl HubState {
+    /// Las cuatro peticiones de clase que el driver le hace a un hub.
+    fn class_request(&mut self, s: Setup) -> Vec<u8> {
+        match (s.bmrt, s.breq) {
+            // Descriptor de hub (USB 2.0 §11.23.2.1). Son nueve bytes y el
+            // driver pide quince: la diferencia sale por Short Packet.
+            (0xa0, 0x06) => alloc::vec![
+                0x09,
+                USB_DESC_HUB,
+                self.ports.len() as u8,
+                // wHubCharacteristics: alimentación por puertos, think time 0.
+                0x09,
+                0x00,
+                self.power_good,
+                0x64,
+                0x00,
+                0xff,
+            ],
+            // GET_STATUS de un puerto: wPortStatus y wPortChange.
+            (0xa3, 0x00) => {
+                if let Some(p) = self.port_mut(s.windex) {
+                    // El reset se va solo, y hay hubs que tardan en irse.
+                    if p.reset_reads > 0 {
+                        p.reset_reads -= 1;
+                    } else {
+                        p.status &= !HUB_PORT_RESET;
+                    }
+                }
+                let p = self.port(s.windex).unwrap_or_default();
+                let mut out = Vec::new();
+                out.extend_from_slice(&p.status.to_le_bytes());
+                out.extend_from_slice(&p.change.to_le_bytes());
+                out
+            }
+            // SET_FEATURE y CLEAR_FEATURE sobre un puerto.
+            (0x23, breq) => {
+                let set = breq == 0x03;
+                let never_enables = self.never_enables;
+                let slow_reset = self.slow_reset;
+                if let Some(p) = self.port_mut(s.windex) {
+                    if set {
+                        hub_set_feature(p, s.wvalue, never_enables, slow_reset);
+                    } else {
+                        hub_clear_feature(p, s.wvalue);
+                    }
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn port(&self, windex: u16) -> Option<HubPort> {
+        self.ports.get((windex as usize).wrapping_sub(1)).copied()
+    }
+
+    fn port_mut(&mut self, windex: u16) -> Option<&mut HubPort> {
+        self.ports.get_mut((windex as usize).wrapping_sub(1))
+    }
+}
+
+/// `SET_FEATURE` sobre un puerto de hub, con la parte que el hardware hace
+/// sola: encender un puerto hace aparecer lo que tenga enchufado, y
+/// resetearlo lo habilita.
+fn hub_set_feature(p: &mut HubPort, feature: u16, never_enables: bool, slow_reset: u8) {
+    match feature {
+        HUB_FEAT_PORT_POWER => {
+            p.status |= 1 << 8;
+            if p.connected {
+                p.status |= HUB_PORT_CONNECTION;
+                p.status |= hub_speed_bits(p.speed);
+                p.change |= 1; // C_PORT_CONNECTION
+            }
+        }
+        HUB_FEAT_PORT_RESET => {
+            // El reset de un hub termina antes de que el driver vuelva a
+            // preguntar: lo que ve es el puerto ya habilitado y el cambio
+            // puesto. Un hub roto deja el puerto en reset para siempre.
+            if never_enables {
+                p.status |= HUB_PORT_RESET;
+                return;
+            }
+            if slow_reset > 0 {
+                p.status |= HUB_PORT_RESET;
+                p.reset_reads = slow_reset;
+            } else {
+                p.status &= !HUB_PORT_RESET;
+            }
+            if p.connected {
+                p.status |= HUB_PORT_ENABLE;
+            }
+            p.change |= 1 << 4; // C_PORT_RESET
+        }
+        _ => {}
+    }
+}
+
+/// `CLEAR_FEATURE`: las cinco características de cambio de un hub USB 2.0 son
+/// los cinco bits bajos de `wPortChange`, en el mismo orden.
+fn hub_clear_feature(p: &mut HubPort, feature: u16) {
+    if (HUB_FEAT_C_PORT_CONNECTION..=HUB_FEAT_C_PORT_RESET).contains(&feature) {
+        p.change &= !(1 << (feature - HUB_FEAT_C_PORT_CONNECTION));
+    }
+}
+
+/// Los bits de velocidad de `wPortStatus` para una velocidad de PORTSC.
+fn hub_speed_bits(speed: u8) -> u16 {
+    match speed {
+        SPEED_LOW => HUB_PORT_LOW_SPEED,
+        SPEED_HIGH => HUB_PORT_HIGH_SPEED,
+        _ => 0,
+    }
+}
+
 /// El anillo EP0 de un slot ya direccionado, por donde va el consumidor.
 #[derive(Clone, Copy)]
 struct Ep0 {
-    /// Puerto raíz del slot, que es por donde se llega a su dispositivo.
-    port: usize,
+    /// Índice en `devs` del dispositivo al que habla este slot.
+    node: usize,
     deq: u64,
     cycle: bool,
+}
+
+/// Un dispositivo y por dónde se llega a él.
+struct DevNode {
+    /// Puerto del hub raíz (base 1).
+    port: u8,
+    /// Route string: un nibble por nivel, 0 en un puerto raíz.
+    route: u32,
+    dev: FakeDev,
 }
 
 struct Fake {
@@ -310,8 +521,10 @@ struct Fake {
     events_posted: u32,
 
     ports: Vec<Port>,
-    /// Lo que hay enchufado en cada puerto, en paralelo a `ports`.
-    devs: Vec<Option<FakeDev>>,
+    /// Todo lo enchufado, cada cosa con el puerto raíz y el route string por
+    /// los que se llega a ella: detrás de un hub hay más de un dispositivo en
+    /// el mismo puerto raíz, y lo único que los distingue es el route.
+    devs: Vec<DevNode>,
     /// Anillo EP0 de cada slot, indexado por slot id.
     ep0: Vec<Option<Ep0>>,
     /// El `Max Packet Size` de EP0 que llevaba cada Evaluate Context, en
@@ -535,6 +748,17 @@ fn run_command_ring(st: &mut Fake) {
         // contexto al que le falte algo de eso no se puede servir, y eso es un
         // Parameter Error, no un comando que sale bien.
         let mut cc = st.cmd_cc;
+        // Address Device y Configure Endpoint publican el contexto que les
+        // llega: el controlador lo copia del contexto de entrada al de salida
+        // del dispositivo, que es de donde el driver lo vuelve a leer para el
+        // siguiente comando. Sin esa copia, un Configure Endpoint que
+        // arrastra el contexto anterior arrastraría ceros.
+        if ty == 11 || ty == 12 || ty == 13 {
+            // Evaluate Context no publica el Slot Context: sólo evalúa Max
+            // Exit Latency e Interrupter Target (§4.6.7), así que lo que un
+            // driver meta ahí esperando que cuaje no cuaja.
+            copy_contexts(st, cmd.slot, cmd.param, ty != 13);
+        }
         if ty == 11 && !bind_ep0(st, cmd.slot, cmd.param) {
             cc = TRB_CC_PARAM;
         }
@@ -576,7 +800,10 @@ fn bind_ep0(st: &mut Fake, slot: u8, input_ctx: u64) -> bool {
     }
     // Slot Context DW1 bits 23:16: Root Hub Port Number. Sin él el
     // controlador no sabe por qué puerto hablarle al dispositivo.
-    let port = ((peek(ic + csz + 4) >> 16) & 0xff) as usize;
+    let port = ((peek(ic + csz + 4) >> 16) & 0xff) as u8;
+    // Slot Context DW0 bits 19:0: Route String, que es lo que dice *cuál* de
+    // los dispositivos de ese puerto es éste.
+    let route = peek(ic + csz) & 0x000f_ffff;
     // EP0 Context DW1 bits 31:16: Max Packet Size. Un control de cero bytes
     // por paquete no es una transferencia posible.
     let mps = peek(ic + 2 * csz + 4) >> 16;
@@ -590,17 +817,62 @@ fn bind_ep0(st: &mut Fake, slot: u8, input_ctx: u64) -> bool {
     } else {
         peek64(st.dcbaap as usize + slot as usize * 8)
     };
-    if port == 0 || port > st.ports.len() || mps == 0 || ring == 0 || dev_ctx == 0 {
+    if port == 0 || port as usize > st.ports.len() || mps == 0 || ring == 0 || dev_ctx == 0 {
+        return false;
+    }
+    let Some(node) = st
+        .devs
+        .iter()
+        .position(|n| n.port == port && n.route == route)
+    else {
+        // Un puerto sin nada detrás: el controlador no tiene a quién
+        // direccionar, y eso es un Parameter Error como cualquier otro.
+        return false;
+    };
+    // Y si el dispositivo está detrás de un hub, ese hub tiene que estar
+    // declarado como hub en su contexto, con bastantes puertos para el nibble
+    // que lo nombra: un slot sin el bit Hub no rutea nada aguas abajo
+    // (§4.3.3), así que el controlador no llega hasta aquí.
+    if route != 0 && !routes_through_a_hub(st, port, route) {
         return false;
     }
     if let Some(slot_ep0) = st.ep0.get_mut(slot as usize) {
         *slot_ep0 = Some(Ep0 {
-            port,
+            node,
             deq: ring & !0xf,
             cycle: (ring & 1) != 0,
         });
     }
     true
+}
+
+/// Copia del contexto de entrada al contexto de salida del dispositivo lo que
+/// las banderas de Add Context digan, igual que lo hace el controlador: el
+/// índice `n+1` del contexto de entrada es el `n` del de salida.
+fn copy_contexts(st: &Fake, slot: u8, input_ctx: u64, with_slot_ctx: bool) {
+    let csz = ctx_size(st);
+    let ic = (input_ctx & !0x3f) as usize;
+    let dev = device_context(st, slot);
+    if ic == 0 || dev == 0 {
+        return;
+    }
+    let add = peek(ic + 4);
+    for e in 0..32usize {
+        if (add & (1 << e)) == 0 || (e == 0 && !with_slot_ctx) {
+            continue;
+        }
+        for i in 0..csz / 4 {
+            poke(dev + e * csz + i * 4, peek(ic + (e + 1) * csz + i * 4));
+        }
+    }
+}
+
+/// El contexto de salida del slot, que el controlador busca en el DCBAA.
+fn device_context(st: &Fake, slot: u8) -> usize {
+    if st.dcbaap == 0 {
+        return 0;
+    }
+    peek64(st.dcbaap as usize + slot as usize * 8) as usize
 }
 
 /// El tamaño de contexto que anuncia HCCPARAMS1 (bit 2, CSZ).
@@ -610,6 +882,35 @@ fn ctx_size(st: &Fake) -> usize {
     } else {
         32
     }
+}
+
+/// ¿Hay un hub declarado como tal, con puertos de sobra, por el que pase este
+/// route string? Sólo se mira el primer nivel, que es hasta donde llegan los
+/// tests.
+fn routes_through_a_hub(st: &Fake, port: u8, route: u32) -> bool {
+    let Some(parent) = st
+        .devs
+        .iter()
+        .position(|n| n.port == port && n.route == 0)
+    else {
+        return false;
+    };
+    // El slot del padre es aquel cuyo EP0 habla con ese dispositivo.
+    let Some(parent_slot) = st
+        .ep0
+        .iter()
+        .position(|e| e.is_some_and(|e| e.node == parent))
+    else {
+        return false;
+    };
+    let dev = device_context(st, parent_slot as u8);
+    if dev == 0 {
+        return false;
+    }
+    // Slot Context DW0 bit 26: Hub. DW1 bits 31:24: Number of Ports.
+    let is_hub = (peek(dev) & (1 << 26)) != 0;
+    let ports = peek(dev + 4) >> 24;
+    is_hub && (route & 0xf) <= ports
 }
 
 /// Consume el anillo de EP0 de un slot: cada tanda Setup (+ Data) + Status es
@@ -671,9 +972,8 @@ fn run_ep0(st: &mut Fake, slot: u8) {
         ep = after;
         let answer = st
             .devs
-            .get_mut(port_index(ep.port))
-            .and_then(|o| o.as_mut())
-            .and_then(|dev| dev.answer(setup));
+            .get_mut(ep.node)
+            .and_then(|n| n.dev.answer(setup));
         let Some((data, cc)) = answer else {
             // Ni dispositivo ni respuesta: el driver se queda esperando su
             // plazo, que es lo que ve cuando el aparato no está.
@@ -695,12 +995,6 @@ fn run_ep0(st: &mut Fake, slot: u8) {
     if let Some(slot_ep0) = st.ep0.get_mut(slot as usize) {
         *slot_ep0 = Some(ep);
     }
-}
-
-/// El índice en `devs` del puerto `port` (1-indexado); 0 no es un puerto, y
-/// se queda fuera del vector a propósito.
-fn port_index(port: usize) -> usize {
-    port.wrapping_sub(1)
 }
 
 /// Escribe un evento en el anillo de eventos del driver, con el bit de ciclo
@@ -777,7 +1071,7 @@ impl Hw {
                 ev_cycle: true,
                 events_posted: 0,
                 ports: alloc::vec![Port::default(); ports as usize],
-                devs: (0..ports as usize).map(|_| None).collect(),
+                devs: Vec::new(),
                 ep0: (0..=256).map(|_| None).collect(),
                 eval_mps: Vec::new(),
             });
@@ -844,10 +1138,64 @@ impl Hw {
     /// que contesta por EP0.
     pub(super) fn plug(&self, port: u8, speed: u8, dev: FakeDev) {
         self.connect(port, speed);
+        self.add_dev(port, 0, dev);
+    }
+
+    /// Enchufa un dispositivo al puerto `hub_port` del hub que está en el
+    /// puerto raíz `port`: le marca a ese hub el puerto como conectado y
+    /// registra al hijo con el route string que le va a tocar (un nibble por
+    /// nivel, el primero en los bits 3:0).
+    pub(super) fn plug_behind(&self, port: u8, hub_port: u8, speed: u8, dev: FakeDev) {
         self.with(|st| {
-            if let Some(d) = st.devs.get_mut(port as usize - 1) {
-                *d = Some(dev);
+            if let Some(hub) = st
+                .devs
+                .iter_mut()
+                .find(|n| n.port == port && n.route == 0)
+                .and_then(|n| n.dev.hub.as_mut())
+            {
+                if let Some(p) = hub.ports.get_mut(hub_port as usize - 1) {
+                    p.connected = true;
+                    p.speed = speed;
+                    // Si el puerto ya está alimentado, el hub ve la conexión
+                    // en el momento: eso es el hotplug. Si no, lo verá cuando
+                    // le llegue su PORT_POWER.
+                    if (p.status & (1 << 8)) != 0 {
+                        p.status |= HUB_PORT_CONNECTION | hub_speed_bits(speed);
+                        p.change |= 1; // C_PORT_CONNECTION
+                    }
+                }
             }
+        });
+        self.add_dev(port, hub_port as u32, dev);
+    }
+
+    /// Desenchufa lo que haya en el puerto `hub_port` de ese hub: el puerto
+    /// pierde la conexión y señala el cambio, que es lo que el driver
+    /// encuentra al barrer.
+    pub(super) fn unplug_behind(&self, port: u8, hub_port: u8) {
+        self.with(|st| {
+            if let Some(hub) = st
+                .devs
+                .iter_mut()
+                .find(|n| n.port == port && n.route == 0)
+                .and_then(|n| n.dev.hub.as_mut())
+            {
+                if let Some(p) = hub.ports.get_mut(hub_port as usize - 1) {
+                    p.connected = false;
+                    p.speed = 0;
+                    p.status &= !(HUB_PORT_CONNECTION | HUB_PORT_ENABLE);
+                    p.change |= 1; // C_PORT_CONNECTION
+                }
+            }
+            st.devs
+                .retain(|n| !(n.port == port && n.route == hub_port as u32));
+        });
+    }
+
+    fn add_dev(&self, port: u8, route: u32, dev: FakeDev) {
+        self.with(|st| {
+            st.devs.retain(|n| !(n.port == port && n.route == route));
+            st.devs.push(DevNode { port, route, dev });
         });
     }
 
@@ -870,13 +1218,32 @@ impl Hw {
         test_clock::set_auto_advance(us);
     }
 
-    /// Las peticiones de control que recibió el aparato del puerto `port`.
-    pub(super) fn requests(&self, port: u8) -> Vec<Setup> {
+    /// `wPortChange` del puerto `hub_port` del hub que está en el puerto raíz
+    /// `port`, para ver si el driver reconoció sus cambios.
+    pub(super) fn hub_port_change(&self, port: u8, hub_port: u8) -> u16 {
         self.with(|st| {
             st.devs
-                .get(port as usize - 1)
-                .and_then(|o| o.as_ref())
-                .map(|d| d.seen.clone())
+                .iter()
+                .find(|n| n.port == port && n.route == 0)
+                .and_then(|n| n.dev.hub.as_ref())
+                .and_then(|h| h.port(hub_port as u16))
+                .map(|p| p.change)
+                .unwrap_or_default()
+        })
+    }
+
+    /// Las peticiones de control que recibió el aparato del puerto `port`.
+    pub(super) fn requests(&self, port: u8) -> Vec<Setup> {
+        self.requests_at(port, 0)
+    }
+
+    /// Lo mismo, para un dispositivo que está detrás de un hub.
+    pub(super) fn requests_at(&self, port: u8, route: u32) -> Vec<Setup> {
+        self.with(|st| {
+            st.devs
+                .iter()
+                .find(|n| n.port == port && n.route == route)
+                .map(|n| n.dev.seen.clone())
                 .unwrap_or_default()
         })
     }
