@@ -602,3 +602,157 @@ fn getting_the_supplementary_groups_does_not_set_them() {
         "getgroups changed which groups the process is in, which is setgroups' job"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Four more neighbours, four more ways to tell them apart
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setting_the_host_name_does_not_set_the_domain_name() {
+    // `sethostname` and `setdomainname` take the same pointer and length and
+    // both answer zero, so only which of the two names moved says which ran.
+    // Both are machine-wide, so this test puts them back.
+    let was_host = linux_object::uname::hostname();
+    let was_domain = linux_object::uname::domainname();
+    let proc = a_process(45_514, "dispatch-hostname", "dispatch_hostname");
+    let (ret, host, domain) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let name = b"dispatch-host";
+            let ret = by_number(
+                sys,
+                Sys::SETHOSTNAME as u32,
+                [name.as_ptr() as usize, name.len(), 0, 0, 0, 0],
+            )
+            .await;
+            (
+                ret,
+                linux_object::uname::hostname(),
+                linux_object::uname::domainname(),
+            )
+        })
+    });
+    linux_object::uname::set_hostname(&was_host);
+    linux_object::uname::set_domainname(&was_domain);
+
+    assert_eq!(ret, 0, "sethostname failed");
+    assert_eq!(
+        host, "dispatch-host",
+        "sethostname did not move the host name"
+    );
+    assert_eq!(
+        domain, was_domain,
+        "sethostname moved the domain name, which is setdomainname's job"
+    );
+}
+
+#[test]
+fn the_highest_real_time_priority_is_not_the_lowest() {
+    // `sched_get_priority_max` and `_min` take a policy and answer a number,
+    // and for the fair policies both answer zero -- so asked about
+    // SCHED_OTHER the two are indistinguishable, which is how the pair
+    // survived. SCHED_FIFO is where they differ: 99 and 1.
+    const SCHED_FIFO: usize = 1;
+    const SCHED_OTHER: usize = 0;
+    let proc = a_process(45_515, "dispatch-sched", "dispatch_sched");
+    let (max, min, other_max) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            (
+                by_number(
+                    sys,
+                    Sys::SCHED_GET_PRIORITY_MAX as u32,
+                    [SCHED_FIFO, 0, 0, 0, 0, 0],
+                )
+                .await,
+                by_number(
+                    sys,
+                    Sys::SCHED_GET_PRIORITY_MIN as u32,
+                    [SCHED_FIFO, 0, 0, 0, 0, 0],
+                )
+                .await,
+                by_number(
+                    sys,
+                    Sys::SCHED_GET_PRIORITY_MAX as u32,
+                    [SCHED_OTHER, 0, 0, 0, 0, 0],
+                )
+                .await,
+            )
+        })
+    });
+    assert_eq!(max, 99, "the highest SCHED_FIFO priority");
+    assert_eq!(min, 1, "the lowest SCHED_FIFO priority");
+    assert_eq!(other_max, 0, "a fair policy has no real-time priority band");
+}
+
+#[test]
+fn setting_a_limit_writes_the_limit_and_not_the_buffer() {
+    // The other half of the pair above `getrlimit`: `setrlimit(resource,
+    // rlim)` moves the limit, and `getrusage(who, usage)`, the arm under it,
+    // only fills a buffer and leaves every limit where it was. So what says
+    // which one ran is the limit afterwards, read back through the table as
+    // well.
+    const NOFILE: usize = 7;
+    let proc = a_process(45_516, "dispatch-setrlimit", "dispatch_setrlimit");
+    let (set, got) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let want = [100u64, 200];
+            let set = by_number(
+                sys,
+                Sys::SETRLIMIT as u32,
+                [NOFILE, want.as_ptr() as usize, 0, 0, 0, 0],
+            )
+            .await;
+            let mut got = [0u64; 2];
+            by_number(
+                sys,
+                Sys::GETRLIMIT as u32,
+                [NOFILE, got.as_mut_ptr() as usize, 0, 0, 0, 0],
+            )
+            .await;
+            (set, got)
+        })
+    });
+    assert_eq!(set, 0, "setrlimit failed");
+    assert_eq!(got, [100, 200], "setrlimit did not move the limit");
+}
+
+#[test]
+fn asking_for_the_capabilities_does_not_drop_them() {
+    // `capget(hdr, data)` writes `data`; `capset(hdr, data)`, the arm under
+    // it, reads it and answers zero without writing anything. The buffer
+    // starts empty, which as an argument to `capset` means "drop everything"
+    // and is accepted, so a swap answers zero and leaves the buffer empty --
+    // a program asking what it may do would be told "nothing".
+    //
+    // The header is Linux's own: `_LINUX_CAPABILITY_VERSION_3` is 0x20080522
+    // and pid 0 means the caller.
+    const V3: u32 = 0x2008_0522;
+    let proc = a_process(45_517, "dispatch-capget", "dispatch_capget");
+    let (ret, data) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            // `{ version: u32, pid: i32 }` and then two sets of
+            // `{ effective, permitted, inheritable }`.
+            let mut hdr = [V3, 0];
+            let mut data = [0u32; 6];
+            let ret = by_number(
+                sys,
+                Sys::CAPGET as u32,
+                [
+                    hdr.as_mut_ptr() as usize,
+                    data.as_mut_ptr() as usize,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+            .await;
+            (ret, data)
+        })
+    });
+    assert_eq!(ret, 0, "capget failed");
+    assert!(
+        data[0] != 0 || data[3] != 0,
+        "capget left the buffer empty, so this root process was told it may do nothing: {:?}",
+        data
+    );
+}
