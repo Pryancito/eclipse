@@ -570,6 +570,23 @@ fn an_array_that_cannot_proceed_leaves_every_semaphore_as_it_was() {
                 holds_zero(sys, id, 0).await,
                 "the release of a refused array was applied"
             );
+
+            // And an array that moves TWO semaphores moves both of them. A
+            // kernel that applied only the first value of a plan it had
+            // decided whole would pass every assertion above.
+            assert_eq!(
+                semop(sys, id, &[SemBuf::new(0, 2, 0), SemBuf::new(1, 3, 0)]).await,
+                Ok(0),
+                "an array that touches two semaphores was refused"
+            );
+            assert!(
+                held_exactly(sys, id, 1, 3).await,
+                "the second semaphore of the array was left as it was"
+            );
+            assert!(
+                held_exactly(sys, id, 0, 2).await,
+                "the first semaphore of the array was left as it was"
+            );
         })
     });
 }
@@ -701,13 +718,17 @@ fn the_operation_in_the_way_is_the_one_that_decides_whether_the_call_waits() {
         Box::pin(async move { semget(sys, MINE, 2, CREAT | EVERYBODY).unwrap() })
     });
 
-    // Semaphore 1 is at zero, so the leading "wait for zero" proceeds and
-    // the take on semaphore 0 is what cannot. It carries the flag.
+    // Semaphore 0 is at zero, so the leading "wait for zero" proceeds and
+    // the take on semaphore 1 is what cannot. It carries the flag.
+    //
+    // The semaphore in the way is deliberately not the first of the set
+    // either: a call that parked on semaphore 0 -- the one its array names
+    // first -- would be waiting for a change nobody is going to make.
     let asked_not_to_wait = a_process(47_294, "semop-nowait-asked");
     on_a_thread(&asked_not_to_wait, move |sys| {
         Box::pin(async move {
             assert_eq!(
-                semop(sys, id, &[SemBuf::new(1, 0, 0), SemBuf::new(0, -1, NOWAIT)]).await,
+                semop(sys, id, &[SemBuf::new(0, 0, 0), SemBuf::new(1, -1, NOWAIT)]).await,
                 Err(LxError::EAGAIN),
                 "IPC_NOWAIT on the operation in the way did not answer EAGAIN"
             );
@@ -720,16 +741,16 @@ fn the_operation_in_the_way_is_the_one_that_decides_whether_the_call_waits() {
     let waiter = a_waiter(
         &waiting,
         id,
-        Vec::from([SemBuf::new(1, 0, NOWAIT), SemBuf::new(0, -1, 0)]),
+        Vec::from([SemBuf::new(0, 0, NOWAIT), SemBuf::new(1, -1, 0)]),
     );
 
     let posting = a_process(47_296, "semop-nowait-poster");
     on_a_thread(&posting, move |sys| {
         Box::pin(async move {
-            nothing_moves_while_the_waiter_parks(sys, id, 0).await;
-            assert_eq!(semop(sys, id, &[SemBuf::new(0, 1, 0)]).await, Ok(0));
+            nothing_moves_while_the_waiter_parks(sys, id, 1).await;
+            assert_eq!(semop(sys, id, &[SemBuf::new(1, 1, 0)]).await, Ok(0));
             assert!(
-                the_waiter_took_it(sys, id, 0).await,
+                the_waiter_took_it(sys, id, 1).await,
                 "the waiter that did not ask for IPC_NOWAIT never woke"
             );
         })
