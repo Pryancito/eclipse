@@ -588,6 +588,12 @@ fn the_arguments_arrive_in_the_order_the_syscall_table_names_them() {
 
             // `mlock2(addr, len, flags)` and `msync(addr, len, flags)`: the
             // flags are third in both.
+            //
+            // A call that FAILS cannot tell an argument swap: with the length
+            // and the flag word exchanged, a length of one page reads as a
+            // flag word of 4096 and is refused too, for the wrong reason. So
+            // each of these is asked once in a shape that has to SUCCEED --
+            // and a swap turns that success into a refusal.
             assert_eq!(
                 by_number(
                     sys,
@@ -600,16 +606,37 @@ fn the_arguments_arrive_in_the_order_the_syscall_table_names_them() {
             assert_eq!(
                 by_number(
                     sys,
+                    crate::Sys::MLOCK2,
+                    [at, 3 * PAGE, MLOCK_ONFAULT, 0, 0, 0]
+                )
+                .await,
+                0,
+                "mlock2 by number read its length or its flag somewhere else"
+            );
+            assert_eq!(
+                by_number(
+                    sys,
                     crate::Sys::MSYNC,
                     [at, PAGE, MS_SYNC | MS_ASYNC, 0, 0, 0]
                 )
                 .await,
                 -(LxError::EINVAL as isize)
             );
+            assert_eq!(
+                by_number(sys, crate::Sys::MSYNC, [at, 3 * PAGE, MS_SYNC, 0, 0, 0]).await,
+                0,
+                "msync by number read its length or its flags somewhere else"
+            );
             // `mlock(addr, len)` takes two and no more.
             assert_eq!(
                 by_number(sys, crate::Sys::MLOCK, [at, 3 * PAGE, 0, 0, 0, 0]).await,
-                0
+                0,
+                "mlock by number read its address or its length somewhere else"
+            );
+            assert_eq!(
+                by_number(sys, crate::Sys::MUNLOCK, [at, 3 * PAGE, 0, 0, 0, 0]).await,
+                0,
+                "munlock by number read its address or its length somewhere else"
             );
             assert_eq!(
                 by_number(sys, crate::Sys::MUNLOCK, [at, 4 * PAGE, 0, 0, 0, 0]).await,
