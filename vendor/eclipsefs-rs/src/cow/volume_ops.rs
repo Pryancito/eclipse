@@ -28,9 +28,8 @@ impl CowFs {
         }
         self.writable()?;
         self.flush()?;
-        if !self.dev.is_empty() {
-            return Err(Error::Corrupt("uncommitted blocks"));
-        }
+        // The commit put every block where it lives.
+        debug_assert!(self.dev.is_empty());
         let mut map = ChunkMap::default();
         map.devices.insert(1, self.raw.size() / BS);
         for g in self.sp.alloc.groups().iter().filter(|g| !g.is_hole()) {

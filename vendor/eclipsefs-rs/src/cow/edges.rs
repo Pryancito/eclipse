@@ -1199,3 +1199,117 @@ fn nodes_grow_the_fast_tier() {
         Tier::Fast
     );
 }
+
+// ---------------------------------------------------------------------------
+// Devices
+// ---------------------------------------------------------------------------
+
+fn devices(n: usize) -> Vec<Arc<dyn BlockDevice>> {
+    (0..n)
+        .map(|_| Ram::new(64 * MIB) as Arc<dyn BlockDevice>)
+        .collect()
+}
+
+#[test]
+fn device_operations_that_do_nothing_or_are_refused() {
+    let (_, mut fs) = mounted();
+    assert_eq!(fs.tier_migrate(true).unwrap(), BalanceReport::default());
+
+    let mut fs = CowFs::mount_devices(volume(), false, false).unwrap();
+    fs.drop_chunk(999).unwrap();
+    assert_eq!(
+        fs.add_device(Ram::new(MIB) as Arc<dyn BlockDevice>),
+        Err(Error::NoSpace)
+    );
+    assert_eq!(
+        fs.replace_device(99, Ram::new(64 * MIB)),
+        Err(Error::NotFound)
+    );
+    // A device holding another filesystem is taken.
+    let other = formatted(64);
+    edit_super(&other, |sb| sb.uuid[0] ^= 1);
+    assert_eq!(fs.add_device(other).unwrap(), 3);
+    fs.check().unwrap();
+}
+
+#[test]
+fn a_device_larger_than_its_map_grows_the_volume() {
+    let mut fs = CowFs::mount_devices(volume(), false, false).unwrap();
+    let vol = fs.vol.clone().unwrap();
+    let size = vol.map().devices[&1];
+    vol.with_map(|m| m.devices.insert(1, size - 1000));
+    assert!(fs.grow_volume(&vol).unwrap());
+    assert_eq!(vol.map().devices[&1], size);
+    assert!(!fs.grow_volume(&vol).unwrap());
+}
+
+/// Chunks of groups the allocator does not have yet are skipped.
+#[test]
+fn layouts_skip_chunks_past_the_groups() {
+    let mut fs = CowFs::mount_devices(volume(), false, false).unwrap();
+    let vol = fs.vol.clone().unwrap();
+    let c = vol.map().chunks[&0].clone();
+    vol.with_map(|m| m.chunks.insert(999, c));
+    fs.refresh_layouts();
+    vol.with_map(|m| m.chunks.remove(&999));
+    fs.refresh_layouts();
+    fs.check().unwrap();
+}
+
+/// A missing device whose chunks cannot be read again cannot be removed.
+#[test]
+fn removing_a_missing_device_without_copies_fails() {
+    let devs = devices(3);
+    mkfs::format_devices(&devs, &opts(), Profile::Single, Profile::Raid1).unwrap();
+    let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+    fs.set_clock(clock);
+    for i in 0..6 {
+        file(&mut fs, &alloc::format!("f{}", i), &vec![i as u8; 4 << 20]);
+    }
+    fs.sync().unwrap();
+    let vol = fs.vol.clone().unwrap();
+    let on3 = vol
+        .map()
+        .chunks
+        .values()
+        .any(|c| c.stripes.iter().any(|s| s.devid == 3));
+    assert!(on3);
+    vol.detach(3);
+    assert!(fs.remove_device(3).is_err());
+    assert!(fs.sp.avoid.contains(&3));
+}
+
+/// Metadata on the slow tier moves to the fast one, if it has room.
+#[test]
+fn metadata_migrates_to_the_fast_tier_when_it_can() {
+    let devs = devices(2);
+    mkfs::format_devices_tiered(
+        &devs,
+        &opts(),
+        Profile::Single,
+        Profile::Single,
+        &[Tier::Fast, Tier::Slow],
+    )
+    .unwrap();
+    let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+    fs.set_clock(clock);
+    assert!(fs.sp.grow_on(ChunkKind::Metadata, Some(Tier::Slow)));
+    fs.sync().unwrap();
+    let on_slow = |fs: &CowFs| {
+        let map = fs.vol.as_ref().unwrap().map();
+        map.chunks
+            .values()
+            .filter(|c| c.kind == ChunkKind::Metadata && map.chunk_tier(c) == Tier::Slow)
+            .count()
+    };
+    assert_eq!(on_slow(&fs), 1);
+    fs.tier_migrate(false).unwrap();
+    assert_eq!(on_slow(&fs), 0);
+    // No room on the fast device: it stays.
+    while fs.sp.grow_on(ChunkKind::Data, Some(Tier::Fast)) {}
+    assert!(fs.sp.grow_on(ChunkKind::Metadata, Some(Tier::Slow)));
+    fs.sync().unwrap();
+    fs.tier_migrate(false).unwrap();
+    assert_eq!(on_slow(&fs), 1);
+    fs.check().unwrap();
+}
