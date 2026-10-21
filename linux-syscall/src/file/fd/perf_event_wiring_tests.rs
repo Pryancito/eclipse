@@ -35,6 +35,10 @@ use zircon_object::task::ROOT_JOB;
 
 /// `perf_event_open(2)`'s flags (`<linux/perf_event.h>`).
 const PERF_FLAG_FD_NO_GROUP: usize = 1;
+/// `PERF_FLAG_FD_OUTPUT`: the event writes into the leader's ring buffer.
+/// This kernel gives every event a ring of its own, so the flag is accepted
+/// and not modelled -- refusing it would be a rule Linux does not have.
+const PERF_FLAG_FD_OUTPUT: usize = 2;
 const PERF_FLAG_PID_CGROUP: usize = 4;
 const PERF_FLAG_FD_CLOEXEC: usize = 8;
 /// A bit outside `PERF_FLAG_ALL`, which is how a caller finds out this kernel
@@ -67,6 +71,9 @@ const PERF_FORMAT_ID: u64 = 1 << 2;
 /// A sample period that is not 1, so the count a sample adds is recognisable
 /// and not a number the event could have arrived at by itself.
 const A_PERIOD: u64 = 7;
+/// A cpu a sample can be taken on without an event having been opened for
+/// it, which is the other half of the match an event makes.
+const A_CPU_THAT_IS_NOT_ZERO: u32 = 5;
 
 /// `fcntl(2)` commands.
 const F_GETFD: usize = 1;
@@ -465,10 +472,12 @@ fn a_pid_of_zero_is_the_calling_process() {
 
             let mine = perf_open(sys, &attr, THE_CALLER, ANY_CPU, NO_GROUP, 0).unwrap();
             let somebody_elses = perf_open(sys, &attr, own + 1000, ANY_CPU, NO_GROUP, 0).unwrap();
+            let on_cpu_zero = perf_open(sys, &attr, THE_CALLER, 0, NO_GROUP, 0).unwrap();
             assert_eq!(count_of(sys, mine).await, Ok(0), "a new event has no count");
+            assert_eq!(count_of(sys, on_cpu_zero).await, Ok(0));
 
-            // One sample taken on this process, as the timer-interrupt
-            // return path takes them.
+            // One sample taken on this process on cpu 0, as the
+            // timer-interrupt return path takes them.
             linux_object::fs::perf_sample_user(own, own, 0, 0xdead_beef);
 
             assert_eq!(
@@ -481,6 +490,28 @@ fn a_pid_of_zero_is_the_calling_process() {
                 Ok(0),
                 "an event opened for another process took this one's sample"
             );
+            assert_eq!(
+                count_of(sys, on_cpu_zero).await,
+                Ok(A_PERIOD),
+                "an event bound to cpu 0 missed a sample taken on cpu 0"
+            );
+
+            // And the cpu side of the same match: the event bound to cpu 0
+            // does not take a sample from another cpu, where the one opened
+            // for any cpu takes both.
+            linux_object::fs::perf_sample_user(own, own, A_CPU_THAT_IS_NOT_ZERO, 0xdead_beef);
+
+            assert_eq!(
+                count_of(sys, on_cpu_zero).await,
+                Ok(A_PERIOD),
+                "an event bound to cpu 0 took a sample from another cpu"
+            );
+            assert_eq!(
+                count_of(sys, mine).await,
+                Ok(A_PERIOD * 2),
+                "an event opened for any cpu takes every sample"
+            );
+            assert_eq!(count_of(sys, somebody_elses).await, Ok(0));
         })
     });
 }
@@ -529,6 +560,18 @@ fn perf_flag_fd_cloexec_is_the_only_flag_that_reaches_the_descriptor() {
                 Ok(false),
                 "PERF_FLAG_FD_NO_GROUP is not PERF_FLAG_FD_CLOEXEC"
             );
+
+            // The flag this kernel accepts and does not model: every event
+            // has a ring of its own, so there is nothing to share, and
+            // Linux takes the flag all the same.
+            let shared_ring =
+                perf_open(sys, &attr, own, ANY_CPU, NO_GROUP, PERF_FLAG_FD_OUTPUT).unwrap();
+            assert_eq!(
+                status_flags(sys, shared_ring).await,
+                Ok(O_RDWR),
+                "PERF_FLAG_FD_OUTPUT is not an open flag either"
+            );
+            assert_eq!(is_cloexec(sys, shared_ring).await, Ok(false));
         })
     });
 }
