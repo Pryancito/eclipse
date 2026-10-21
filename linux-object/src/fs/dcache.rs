@@ -77,13 +77,8 @@ pub fn invalidate() {
     EPOCH.fetch_add(1, Ordering::Release);
 }
 
-/// The inode `path` leads to from `root`, with `walked` at it if one is
-/// given.
-pub fn get(
-    root: &Arc<dyn INode>,
-    path: &str,
-    walked: Option<&mut Walked>,
-) -> Option<Arc<dyn INode>> {
+/// The inode `path` leads to from `root`, with `walked` at it.
+pub fn get(root: &Arc<dyn INode>, path: &str, walked: &mut Walked) -> Option<Arc<dyn INode>> {
     let mut c = CACHE.lock();
     let now = EPOCH.load(Ordering::Acquire);
     if c.epoch != now {
@@ -96,15 +91,16 @@ pub fn get(
     if !Arc::ptr_eq(&entry.root, root) {
         return None;
     }
-    if let Some(walked) = walked {
-        *walked = Walked::at(entry.name.as_deref().unwrap_or(path), 0);
-    }
+    walked.set(entry.name.as_deref().unwrap_or(path));
     Some(entry.inode.clone())
 }
 
 /// Keeps what `path` leads to from `root`, and `walked`, where the walk to
-/// it ended.
+/// it ended, unless it is another file to each process.
 pub fn put(root: &Arc<dyn INode>, path: &str, inode: &Arc<dyn INode>, walked: &Walked) {
+    if walked.jumped || walked.names.first().is_some_and(|top| top == "proc") {
+        return;
+    }
     let mut c = CACHE.lock();
     let now = EPOCH.load(Ordering::Acquire);
     if c.epoch != now {

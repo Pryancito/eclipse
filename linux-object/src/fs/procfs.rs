@@ -25,6 +25,8 @@ mod cwd_tests;
 mod limits;
 /// `/proc/present`, in its own file: `procfs.rs` sits on the size ratchet.
 mod present;
+#[cfg(test)]
+mod stat_tests;
 /// `/proc/<pid>/status`, in its own file for the same reason.
 mod status;
 #[cfg(test)]
@@ -807,13 +809,19 @@ impl INode for ProcRootINode {
 /// The numbers start above every fixed one and leave `PID_INODE_SLOTS` per
 /// process: slot 0 is the directory, the rest its entries.
 pub(crate) const PID_INODE_BASE: usize = 0x1_0000;
-pub(crate) const PID_INODE_SLOTS: usize = 16;
+pub(crate) const PID_INODE_SLOTS: usize = 32;
 /// Slot of `/proc/<pid>/fd` (`proc_self.rs`); the files use their kind's.
 pub(crate) const PID_FD_DIR_SLOT: usize = 10;
 /// Slot of `/proc/<pid>/task`.
 pub(crate) const PID_TASK_DIR_SLOT: usize = 11;
 /// Slot of `/proc/<pid>/fdinfo` (`proc_self/fdinfo.rs`).
 pub(crate) const PID_FDINFO_DIR_SLOT: usize = 13;
+/// Slots of `/proc/<pid>/exe`, `cwd` and `root` (`proc_self.rs`), which were
+/// all inode 0: a listing gave them `d_ino` 0, which a glibc older than 2.37
+/// takes for a deleted entry and skips.
+pub(crate) const PID_EXE_SLOT: usize = 14;
+pub(crate) const PID_CWD_SLOT: usize = 15;
+pub(crate) const PID_ROOT_SLOT: usize = 16;
 
 pub(crate) fn pid_inode(pid: u64, slot: usize) -> usize {
     debug_assert!(slot < PID_INODE_SLOTS);
@@ -825,7 +833,7 @@ pub(crate) fn pid_inode(pid: u64, slot: usize) -> usize {
 /// They have to miss both the fixed `/proc` numbers (10..=999) and the whole
 /// per-pid range, which `pid_inode` can take as high as
 /// `PID_INODE_BASE + pid_max * PID_INODE_SLOTS` -- `pid_max` is 4194304 here,
-/// so that range ends just past `0x400_0000`. This one starts above it and
+/// so that range ends just past `0x800_0000`. This one starts above it and
 /// leaves `TID_INODE_SLOTS` per thread: slot 0 is the directory, the rest its
 /// files.
 const TID_INODE_BASE: usize = 0x1000_0000;
@@ -900,7 +908,7 @@ impl INode for ProcPidDirINode {
             dev: 0,
             inode: pid_inode(self.pid, 0),
             size: 0,
-            blk_size: 0,
+            blk_size: BLOCK_SIZE,
             blocks: 0,
             atime: Timespec { sec: 0, nsec: 0 },
             mtime: Timespec { sec: 0, nsec: 0 },
@@ -1294,23 +1302,8 @@ impl INode for ProcTidFileINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        let size = self.bytes()?.len();
-        Ok(Metadata {
-            dev: 0,
-            inode: tid_inode(self.tid, self.kind.slot()),
-            size,
-            blk_size: 4096,
-            blocks: size.div_ceil(4096),
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
-            type_: FileType::File,
-            mode: 0o444,
-            nlinks: 1,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-        })
+        tid_task(self.pid, self.tid)?;
+        Ok(file_metadata(tid_inode(self.tid, self.kind.slot()), 0o444))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -1429,23 +1422,8 @@ impl INode for ProcTidCommINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        let size = self.bytes()?.len();
-        Ok(Metadata {
-            dev: 0,
-            inode: tid_inode(self.tid, 1),
-            size,
-            blk_size: 4096,
-            blocks: size.div_ceil(4096),
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
-            type_: FileType::File,
-            mode: 0o644,
-            nlinks: 1,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-        })
+        tid_task(self.pid, self.tid)?;
+        Ok(file_metadata(tid_inode(self.tid, 1), 0o644))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -1948,7 +1926,7 @@ fn dir_metadata(inode: usize, subdirs: usize) -> Metadata {
         dev: 0,
         inode,
         size: 0,
-        blk_size: 0,
+        blk_size: BLOCK_SIZE,
         blocks: 0,
         atime: Timespec { sec: 0, nsec: 0 },
         mtime: Timespec { sec: 0, nsec: 0 },
@@ -1956,6 +1934,44 @@ fn dir_metadata(inode: usize, subdirs: usize) -> Metadata {
         type_: FileType::Dir,
         mode: 0o555,
         nlinks: 2 + subdirs,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+    }
+}
+
+/// The block size of everything in `/proc` (`proc_fill_super` sets
+/// `s_blocksize` to 1024), where nothing takes up a block.
+pub(crate) const BLOCK_SIZE: usize = 1024;
+
+/// A file of `/proc`, which is written out when it is read and says size 0
+/// until then, as in Linux. The files of `/proc/<pid>` used to say how long
+/// they were, so finding that out wrote each one out whole at every `stat`,
+/// and an `open` of `/proc/self/stat` did it three times.
+fn file_metadata(inode: usize, mode: u16) -> Metadata {
+    Metadata {
+        type_: FileType::File,
+        mode,
+        ..link_metadata(inode, 0)
+    }
+}
+
+/// A link of `/proc`: size 0 for `/proc/self` and the links of `/proc/<pid>`,
+/// 64 for those of its `fd` (`proc_pid_readlink` reads the text when asked,
+/// and `stat` never does).
+pub(crate) fn link_metadata(inode: usize, size: usize) -> Metadata {
+    Metadata {
+        dev: 0,
+        inode,
+        size,
+        blk_size: BLOCK_SIZE,
+        blocks: 0,
+        atime: Timespec { sec: 0, nsec: 0 },
+        mtime: Timespec { sec: 0, nsec: 0 },
+        ctime: Timespec { sec: 0, nsec: 0 },
+        type_: FileType::SymLink,
+        mode: 0o777,
+        nlinks: 1,
         uid: 0,
         gid: 0,
         rdev: 0,
@@ -2273,23 +2289,7 @@ impl INode for ProcSeqINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        // Linux reports size 0 for seq_file pseudo entries; content is generated on read.
-        Ok(Metadata {
-            dev: 0,
-            inode: self.inode,
-            size: 0,
-            blk_size: 4096,
-            blocks: 0,
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
-            type_: FileType::File,
-            mode: 0o444,
-            nlinks: 1,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-        })
+        Ok(file_metadata(self.inode, 0o444))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -2342,22 +2342,7 @@ impl INode for ProcSysWritableINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        Ok(Metadata {
-            dev: 0,
-            inode: self.inode,
-            size: 0,
-            blk_size: 4096,
-            blocks: 0,
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
-            type_: FileType::File,
-            mode: 0o644,
-            nlinks: 1,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-        })
+        Ok(file_metadata(self.inode, 0o644))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -2452,23 +2437,8 @@ impl INode for ProcSelfSymINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        Ok(Metadata {
-            dev: 0,
-            // Its own: 12 is `/proc/cpuinfo`'s, 20 `/proc/net`'s.
-            inode: if self.thread { 28 } else { 19 },
-            size: self.target().len(),
-            blk_size: 0,
-            blocks: 0,
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
-            type_: FileType::SymLink,
-            mode: 0o777,
-            nlinks: 1,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-        })
+        // Its own: 12 is `/proc/cpuinfo`'s, 20 `/proc/net`'s.
+        Ok(link_metadata(if self.thread { 28 } else { 19 }, 0))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -2624,26 +2594,12 @@ impl INode for ProcPidFileINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        let size = self.bytes()?.len();
-        Ok(Metadata {
-            dev: 0,
-            inode: pid_inode(self.pid, self.kind.slot()),
-            size,
-            blk_size: 4096,
-            blocks: size.div_ceil(4096),
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
-            type_: FileType::File,
-            mode: match self.kind {
-                ProcPidFileKind::Comm => 0o644,
-                _ => 0o444,
-            },
-            nlinks: 1,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-        })
+        crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
+        let mode = match self.kind {
+            ProcPidFileKind::Comm => 0o644,
+            _ => 0o444,
+        };
+        Ok(file_metadata(pid_inode(self.pid, self.kind.slot()), mode))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -5712,7 +5668,6 @@ mod proc_numbers_tests {
         let inode = ProcSelfSymINode { thread: false };
         let mut buf = [0u8; 16];
         let n = inode.read_at(0, &mut buf).unwrap();
-        assert_eq!(n, inode.metadata().unwrap().size);
         let text = core::str::from_utf8(&buf[..n]).unwrap();
         assert!(text.parse::<u64>().is_ok(), "{:?} no es un pid", text);
         assert_eq!(inode.read_at(n, &mut buf).unwrap(), 0);

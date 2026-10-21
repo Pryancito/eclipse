@@ -552,6 +552,8 @@ mod fdinfo_tests;
 mod magic_link_tests;
 #[cfg(test)]
 mod opened_path_tests;
+#[cfg(test)]
+mod proc_link_stat_tests;
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod abi_tests {

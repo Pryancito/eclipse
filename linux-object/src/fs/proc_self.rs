@@ -1,6 +1,6 @@
 use crate::fs::file::File;
 use crate::fs::pseudo::Pseudo;
-use crate::fs::FileLike;
+use crate::fs::{FileDesc, FileLike};
 use crate::process::ProcessExt;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
@@ -32,12 +32,14 @@ impl INode for ProcSelfFdDir {
             hangup: false,
         })
     }
+    /// Its size is how many descriptors are open, as since Linux 6.2
+    /// (`proc_fd_getattr`).
     fn metadata(&self) -> Result<Metadata> {
         Ok(Metadata {
             dev: 0,
             inode: super::procfs::pid_inode(self.process.id(), super::procfs::PID_FD_DIR_SLOT),
-            size: 0,
-            blk_size: 0,
+            size: self.process.try_linux().map_or(0, |lp| lp.file_count()),
+            blk_size: super::procfs::BLOCK_SIZE,
             blocks: 0,
             atime: Timespec { sec: 0, nsec: 0 },
             mtime: Timespec { sec: 0, nsec: 0 },
@@ -81,7 +83,7 @@ impl INode for ProcSelfFdDir {
                     .ok_or(FsError::EntryNotFound)?
                     .get_file_like(fd.into())
                     .map_err(|_| FsError::EntryNotFound)?;
-                Ok(Arc::new(FdLink::of(&file)))
+                Ok(Arc::new(FdLink::of(self.process.id(), fd.into(), &file)))
             }
         }
     }
@@ -92,9 +94,9 @@ impl INode for ProcSelfFdDir {
     /// the directory's own descriptor.
     fn get_entry_with_metadata(&self, id: usize) -> Result<(Metadata, String)> {
         let name = self.get_entry(id)?;
-        let meta = match id {
-            0 | 1 => self.find(&name)?.metadata()?,
-            _ => Pseudo::new("", FileType::SymLink).metadata()?,
+        let meta = match (id, name.parse::<i32>()) {
+            (2.., Ok(fd)) => fd_link_metadata(self.process.id(), fd.into()),
+            _ => self.find(&name)?.metadata()?,
         };
         Ok((meta, name))
     }
@@ -158,22 +160,36 @@ pub(crate) fn default_link_name(meta: crate::error::LxResult<Metadata>, kind: &s
 pub struct FdLink {
     name: String,
     mode: u16,
+    inode: usize,
     /// Not held: a descriptor of the link (`O_PATH|O_NOFOLLOW`) keeps no
     /// pipe open.
     file: Weak<dyn FileLike>,
 }
 
 impl FdLink {
-    pub fn of(file: &Arc<dyn FileLike>) -> Self {
+    /// The entry for `fd`, which is `file`, of process `pid`.
+    pub fn of(pid: u64, fd: FileDesc, file: &Arc<dyn FileLike>) -> Self {
         let flags = file.flags();
         let read = if flags.readable() { 0o500 } else { 0 };
         let write = if flags.writable() { 0o300 } else { 0 };
         FdLink {
             name: file.link_name(),
             mode: read | write,
+            inode: fd_link_metadata(pid, fd).inode,
             file: Arc::downgrade(file),
         }
     }
+}
+
+/// What `lstat` and a listing of `/proc/<pid>/fd` say of the entry for
+/// `fd`, without looking at the descriptor. Every entry was inode 0, and
+/// so `d_ino` 0, which a glibc older than 2.37 skips as a deleted entry.
+/// The numbers start above those of `fdinfo` (`fdinfo_inode`), which can
+/// reach 2^32 + 2^42.
+fn fd_link_metadata(pid: u64, fd: FileDesc) -> Metadata {
+    let fd: i32 = fd.into();
+    let inode = (1 << 43) + (pid as usize) * (crate::process::NR_OPEN as usize) + fd as usize;
+    super::procfs::link_metadata(inode, 64)
 }
 
 /// Where a descriptor's link leads (`nd_jump_link`): to the open file itself,
@@ -207,9 +223,8 @@ impl INode for FdLink {
     }
     fn metadata(&self) -> Result<Metadata> {
         Ok(Metadata {
-            size: 64,
             mode: self.mode,
-            ..Pseudo::new("", FileType::SymLink).metadata()?
+            ..super::procfs::link_metadata(self.inode, 64)
         })
     }
     /// While the descriptor is open (`proc_fd_link`).
@@ -287,8 +302,15 @@ impl INode for ProcessLink {
     fn poll(&self) -> Result<PollStatus> {
         self.text.poll()
     }
+    /// Size 0, as in Linux, and a number of its own: it was the `Pseudo`'s 0.
     fn metadata(&self) -> Result<Metadata> {
-        self.text.metadata()
+        use super::procfs::{pid_inode, PID_CWD_SLOT, PID_EXE_SLOT, PID_ROOT_SLOT};
+        let slot = match self.held {
+            Held::WorkingDirectory => PID_CWD_SLOT,
+            Held::Root => PID_ROOT_SLOT,
+            Held::Program => PID_EXE_SLOT,
+        };
+        Ok(super::procfs::link_metadata(pid_inode(self.pid, slot), 0))
     }
     fn jump(&self) -> Option<Result<(Arc<dyn INode>, String)>> {
         Some(self.lead())

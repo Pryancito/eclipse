@@ -67,6 +67,7 @@ impl INode for ProcFdInfoDir {
                 crate::fs::procfs::PID_FDINFO_DIR_SLOT,
             ),
             nlinks: 2,
+            blk_size: crate::fs::procfs::BLOCK_SIZE,
             ..Pseudo::new("", FileType::Dir).metadata()?
         })
     }
@@ -177,6 +178,7 @@ impl INode for FdInfo {
         Ok(Metadata {
             inode: fdinfo_inode(self.process.id(), self.fd),
             size: 0,
+            blk_size: crate::fs::procfs::BLOCK_SIZE,
             ..Pseudo::new("", FileType::File).metadata()?
         })
     }
