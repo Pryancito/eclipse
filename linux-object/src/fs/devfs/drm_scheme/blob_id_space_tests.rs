@@ -2,8 +2,9 @@
 //!
 //! `GETPROPBLOB` takes an id and nothing else -- libdrm identifies a blob
 //! purely by id -- and resolves it against the blob store first, then the
-//! range reserved for connector EDIDs. The synthetic KMS objects and the
-//! framebuffers number from 1 upwards in the same space.
+//! range reserved for connector EDIDs. The synthetic KMS objects number
+//! from 1 upwards in the same space, and the framebuffers share the
+//! store's counter (Linux's single idr).
 //!
 //! Until now the only thing keeping the three apart was a comment and the
 //! literal `20000` written out at both ends of the EDID encoding, in two
@@ -47,7 +48,7 @@ fn the_edid_range_ends_before_the_blob_store_begins() {
 /// And nothing below the range is an EDID either: the synthetic KMS object
 /// ids and the framebuffer ids live down there.
 #[test]
-fn the_low_ids_belong_to_objects_and_framebuffers() {
+fn the_low_ids_are_not_edid_blobs() {
     for id in [
         0,
         drm::SYNTH_CRTC_ID,

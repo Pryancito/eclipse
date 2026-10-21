@@ -5675,9 +5675,9 @@ fn mode_object_kind(obj_id: u32) -> Option<u32> {
 /// `DRM_MODE_OBJECT_ANY` or the object's own type (any other type is
 /// ENOENT, like every lookup), and an object without a property table is
 /// then `!obj->properties`, EINVAL. All three answered ENOENT, the
-/// answer for an id that names nothing. (Ids are numbered per kind here,
-/// so an fb, a blob or a property whose number a KMS object has is that
-/// object first, as [`find_mode_object`] already decides.)
+/// answer for an id that names nothing. (Framebuffers and blobs are
+/// numbered from one counter above every KMS id, and no property id is a
+/// KMS id, so [`find_mode_object`] answering first never hides one.)
 fn propertyless_lookup_error(obj_id: u32, obj_type: u32) -> FsError {
     let kind = if drm::get_fb(obj_id).is_some() {
         DRM_MODE_OBJECT_FB

@@ -39,11 +39,14 @@ pub const SYNTH_ENCODER_ID: u32 = 3;
 /// Primary plane id exposed to userspace for the synthetic output.
 pub const SYNTH_PLANE_ID: u32 = 4;
 
-/// First id handed to a KMS property blob (`CREATEPROPBLOB`, and the
-/// kernel-owned current-mode blob). libdrm identifies a blob by id alone, and
-/// so does this tree's `GETPROPBLOB`, which consults the blob store and then
-/// the reserved EDID range; the two must not overlap. `drm_scheme` asserts
-/// that against its own `EDID_BLOB_BASE` at compile time.
+/// First id handed to a framebuffer or a KMS property blob (`ADDFB*`,
+/// `CREATEPROPBLOB`, and the kernel-owned current-mode blob), from one
+/// counter: Linux numbers every mode object out of a single idr, so no fb
+/// shares a number with a CRTC, a plane, a property or a blob. libdrm
+/// identifies a blob by id alone, and so does this tree's `GETPROPBLOB`,
+/// which consults the blob store and then the reserved EDID range; the two
+/// must not overlap. `drm_scheme` asserts that against its own
+/// `EDID_BLOB_BASE` at compile time.
 pub const BLOB_ID_BASE: u32 = 30_000;
 
 /// One-shot guard so the first scanout logs (every-frame logging would spam).
@@ -2039,7 +2042,6 @@ pub struct DrmFramebuffer {
 struct DrmState {
     drivers: Vec<Arc<dyn DrmScheme>>,
     next_handle_id: u32,
-    next_fb_id: u32,
     /// Live GEM objects: `(handle, backing VMO, owning pid)`.
     ///
     /// The pid is what makes these releasable. Linux frees a file's GEM
@@ -2105,10 +2107,11 @@ struct DrmState {
     /// (e.g. the `MODE_ID` blob an atomic compositor uploads) and
     /// kernel-created (the current-mode blob echoed via OBJ_GETPROPERTIES).
     blobs: Vec<DrmBlob>,
-    /// Next blob id. Starts at [`BLOB_ID_BASE`], above the synthetic KMS ids,
-    /// the fb ids and the EDID blob ids, so the object-id namespaces never
-    /// collide — libdrm identifies blobs purely by id.
-    next_blob_id: u32,
+    /// Next framebuffer or blob id, one counter for both (Linux's single
+    /// idr). Starts at [`BLOB_ID_BASE`], above the synthetic KMS ids and the
+    /// EDID blob ids, so the object-id namespaces never collide — libdrm
+    /// identifies blobs purely by id.
+    next_object_id: u32,
     /// `drm_device.master` per node: `(minor, file)`. One holder per minor.
     masters: Vec<(u32, usize)>,
     /// `drm_master.magic_map`: `(device, magic, file)`, keyed by
@@ -2275,7 +2278,6 @@ lazy_static::lazy_static! {
     static ref DRM_STATE: Mutex<DrmState> = Mutex::new(DrmState {
         drivers: Vec::new(),
         next_handle_id: 1,
-        next_fb_id: 1,
         handles: Vec::new(),
         framebuffers: Vec::new(),
         fb_backing: Vec::new(),
@@ -2294,7 +2296,7 @@ lazy_static::lazy_static! {
             hw: false,
         },
         blobs: Vec::new(),
-        next_blob_id: BLOB_ID_BASE,
+        next_object_id: BLOB_ID_BASE,
         masters: Vec::new(),
         magics: Vec::new(),
         next_magic: 1,
@@ -3446,8 +3448,8 @@ pub fn create_fb_with_layout(
     fb_take_gem_ref(handle_id);
 
     let mut state = DRM_STATE.lock();
-    let fb_id = state.next_fb_id;
-    state.next_fb_id += 1;
+    let fb_id = state.next_object_id;
+    state.next_object_id += 1;
 
     let fb = DrmFramebuffer {
         id: fb_id,
@@ -6822,8 +6824,8 @@ pub fn create_blob(data: Vec<u8>, user_created: bool) -> u32 {
 /// [`create_blob`] on behalf of the open file `owner` (see [`DrmBlob::owner`]).
 pub fn create_blob_owned(data: Vec<u8>, user_created: bool, owner: usize) -> u32 {
     let mut state = DRM_STATE.lock();
-    let id = state.next_blob_id;
-    state.next_blob_id += 1;
+    let id = state.next_object_id;
+    state.next_object_id += 1;
     state.blobs.push(DrmBlob {
         id,
         user_created,
@@ -6893,8 +6895,8 @@ fn set_mode_blob_locked(state: &mut DrmState, data: Vec<u8>) {
     if let Some(existing) = state.blobs.iter_mut().find(|b| b.id == cur_id) {
         existing.data = data;
     } else {
-        let id = state.next_blob_id;
-        state.next_blob_id += 1;
+        let id = state.next_object_id;
+        state.next_object_id += 1;
         state.blobs.push(DrmBlob {
             id,
             user_created: false,

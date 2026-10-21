@@ -1554,8 +1554,8 @@ fn a_property_write_is_checked_against_the_object_and_the_property() {
         set(plane, DRM_MODE_OBJECT_PLANE, PROP_FB_ID, fb as u64),
         Ok(0)
     );
-    // (Not "the CRTC's id": framebuffer ids and mode-object ids are
-    // separate namespaces here, so fb 1 and CRTC 1 can both exist.)
+    // (Not "the CRTC's id": framebuffers are numbered from the blob
+    // counter, above every KMS id, so no fb is numbered like the CRTC.)
     assert_eq!(
         set(plane, DRM_MODE_OBJECT_PLANE, PROP_FB_ID, 0xdead_0000),
         einval,
@@ -2408,6 +2408,70 @@ fn getplane_writes_gamma_size_zero_after_the_lookup() {
     );
 }
 
+/// Linux hands every mode object its id from one idr, so a framebuffer
+/// never shares a number with a CRTC, a plane, a property or a blob. The
+/// framebuffers had a counter of their own from 1: fb 1 was the CRTC's
+/// number and fb 10 the `type` property's, and every lookup that takes an
+/// id of any kind (`OBJ_GETPROPERTIES`, `SETPROPERTY`, the lease list) had
+/// to decide which of the two a number meant. Now they draw from the blob
+/// counter, above every KMS id.
+#[test]
+fn framebuffers_and_blobs_draw_their_ids_from_one_counter() {
+    let _screen = kms_emu::attach(32, 8);
+    let c = Client::open(0);
+    let create_blob = || {
+        let bytes = [9u8; 8];
+        let mut req = DrmModeCreateBlob {
+            data: bytes.as_ptr() as u64,
+            length: bytes.len() as u32,
+            blob_id: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut req)
+            .expect("CREATEPROPBLOB");
+        req.blob_id
+    };
+    let buf_a = c.create_dumb(32, 8);
+    let fb_a = c.addfb2(&buf_a);
+    let blob = create_blob();
+    let buf_b = c.create_dumb(32, 8);
+    let fb_b = c.addfb2(&buf_b);
+    let blob_b = create_blob();
+
+    assert!(
+        fb_a >= drm::BLOB_ID_BASE,
+        "fb {} is numbered below the shared counter",
+        fb_a
+    );
+    assert!(
+        fb_a < blob && blob < fb_b && fb_b < blob_b,
+        "one counter, in order: {} {} {} {}",
+        fb_a,
+        blob,
+        fb_b,
+        blob_b
+    );
+    for id in [fb_a, blob, fb_b, blob_b] {
+        assert!(mode_object_kind(id).is_none(), "{} is a KMS object", id);
+        assert!(prop_spec(id).is_none(), "{} is a property", id);
+    }
+    assert!(drm::get_fb(blob).is_none(), "a blob id names no fb");
+    assert!(drm::get_blob(fb_a).is_none(), "an fb id names no blob");
+    assert!(drm::get_fb(fb_a).is_some() && drm::get_fb(fb_b).is_some());
+    assert!(drm::get_blob(blob).is_some() && drm::get_blob(blob_b).is_some());
+
+    // The kernel-owned current-mode blob a modeset creates draws from the
+    // same counter, so the blob created after it is its own.
+    let (_, crtcs, _) = drm::get_resources();
+    set_crtc(&c, crtcs[0], fb_a, 32, 8);
+    let after_modeset = create_blob();
+    assert!(after_modeset > blob_b, "{} after {}", after_modeset, blob_b);
+    assert_eq!(
+        drm::get_blob(after_modeset).as_deref(),
+        Some(&[9u8; 8][..]),
+        "the modeset's mode blob took this blob's id"
+    );
+}
+
 /// `drm_mode_object_find` finds a framebuffer, a property blob or a
 /// property in the same idr as the KMS objects, with `DRM_MODE_OBJECT_ANY`
 /// or the object's own type (another type is ENOENT, like every lookup),
@@ -2424,43 +2488,24 @@ fn an_object_without_a_property_table_is_einval_not_enoent() {
     let einval = Err(FsError::InvalidParam);
     let enoent = Err(FsError::EntryNotFound);
 
-    // Ids are numbered per kind here (Linux has one idr), so each id
-    // this test uses has to be nobody else's: a KMS object with the
-    // same number would answer first, as it should.
-    let unshared = |id: u32| mode_object_kind(id).is_none() && prop_spec(id).is_none();
-    let mut bufs = Vec::new();
-    let fb = loop {
-        let buf = c.create_dumb(32, 8);
-        let id = c.addfb2(&buf);
-        bufs.push(buf);
-        if unshared(id) && drm::get_blob(id).is_none() {
-            break id;
-        }
-        assert!(bufs.len() < 64, "no fb id of its own");
-    };
+    // Framebuffers and blobs are numbered from one counter above every
+    // KMS id, and a property's id is none of the KMS ids, so each of the
+    // three is nobody else's.
+    let buf = c.create_dumb(32, 8);
+    let fb = c.addfb2(&buf);
     let bytes = [7u8; 16];
-    let mut blobs = 0;
-    let blob = loop {
-        let mut req = DrmModeCreateBlob {
-            data: bytes.as_ptr() as u64,
-            length: bytes.len() as u32,
-            blob_id: 0,
-        };
-        c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut req)
-            .expect("CREATEPROPBLOB");
-        blobs += 1;
-        if unshared(req.blob_id) && drm::get_fb(req.blob_id).is_none() {
-            break req.blob_id;
-        }
-        assert!(blobs < 64, "no blob id of its own");
+    let mut req = DrmModeCreateBlob {
+        data: bytes.as_ptr() as u64,
+        length: bytes.len() as u32,
+        blob_id: 0,
     };
-    let prop = [PROP_DPMS, PROP_NON_DESKTOP]
-        .iter()
-        .copied()
-        .find(|&p| {
-            mode_object_kind(p).is_none() && drm::get_fb(p).is_none() && drm::get_blob(p).is_none()
-        })
-        .expect("a property id of its own");
+    c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut req)
+        .expect("CREATEPROPBLOB");
+    let blob = req.blob_id;
+    let prop = PROP_DPMS;
+    for id in [fb, blob, prop] {
+        assert!(mode_object_kind(id).is_none(), "{} is a KMS object", id);
+    }
 
     let getprops = |obj_id: u32, obj_type: u32| {
         let mut req = DrmModeObjGetProperties {
