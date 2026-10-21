@@ -610,11 +610,16 @@ fn the_arguments_arrive_in_the_order_the_syscall_table_names_them() {
                 "the fifth argument is the flag word"
             );
 
-            linux_object::fs::perf_sample_user(own, own, 0, 0xdead_beef);
+            // The sample is taken on a cpu nobody opened an event for, so
+            // that the pid and the cpu cannot stand in for one another: this
+            // event is "any cpu, this process", and the swap of the two
+            // arguments would make it "cpu 0, any process", which no sample
+            // on another cpu reaches.
+            linux_object::fs::perf_sample_user(own, own, A_CPU_THAT_IS_NOT_ZERO, 0xdead_beef);
             assert_eq!(
                 count_of(sys, fd).await,
                 Ok(A_PERIOD),
-                "the second argument is the pid"
+                "the second argument is the pid and the third is the cpu"
             );
         })
     });
