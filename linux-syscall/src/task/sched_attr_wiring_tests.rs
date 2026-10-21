@@ -413,8 +413,12 @@ fn getattr_answers_its_own_size_zeros_for_what_it_lacks_and_no_more() {
             assert_eq!(sys.sys_sched_setattr(0, asking.asked(), 0), Ok(0));
 
             let mut got = Wide::seeded();
+            // Asked with a size HALF of the tail wide, so the two halves of
+            // `copy_struct_to_user` can be told apart: what it zeroes, and
+            // where it stops. Asking with the whole tail only shows the
+            // first.
             assert_eq!(
-                sys.sys_sched_getattr(0, got.answered(), SCHED_ATTR_SIZE_VER1 + 16, 0),
+                sys.sys_sched_getattr(0, got.answered(), SCHED_ATTR_SIZE_VER1 + 8, 0),
                 Ok(0)
             );
             assert_eq!(
