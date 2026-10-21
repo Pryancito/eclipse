@@ -2760,3 +2760,9 @@ mod sem_wiring_tests;
 /// which of its fourteen commands needs what, and the two stamps a set keeps.
 #[cfg(test)]
 mod semctl_wiring_tests;
+
+/// System V message queues reached through the syscall: a message sent in
+/// one process and taken in another, which message a receiver gets, and the
+/// two parks a queue has.
+#[cfg(test)]
+mod msg_wiring_tests;
