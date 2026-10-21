@@ -83,6 +83,12 @@ fn key_after(k: &Key) -> Option<Key> {
 }
 
 mod bitmap_sums;
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod checks;
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod edges;
 mod encrypt;
 mod fsync_log;
 
@@ -935,12 +941,8 @@ impl CowFs {
     /// Point the root tree's item for tree `id` at `root` if it moved.
     fn store_root(&mut self, id: u64, root: Root) -> Result<()> {
         let key = Key::new(id, ROOT_ITEM, 0);
-        let mut it = RootItem::decode(
-            &self
-                .st
-                .get(&self.root_tree, &key)?
-                .ok_or(Error::Corrupt("missing tree"))?,
-        )?;
+        let d = self.st.get(&self.root_tree, &key)?;
+        let mut it = RootItem::decode(&d.ok_or(Error::Corrupt("missing tree"))?)?;
         if it.root != root {
             it.root = root;
             self.st
@@ -1148,6 +1150,27 @@ impl CowFs {
         self.st.delete(&mut self.sp, &mut self.fs_root, key)
     }
 
+    /// Up to `limit` items `(ino, ty, *)` of the current subvolume.
+    fn items_of(&mut self, ino: u64, ty: u8, limit: usize) -> Result<Vec<(Key, Vec<u8>)>> {
+        let (lo, hi) = (Key::new(ino, ty, 0), Key::new(ino, ty, u64::MAX));
+        self.st.range(&self.fs_root, &lo, &hi, limit)
+    }
+
+    fn root_insert(&mut self, key: Key, v: Vec<u8>) -> Result<()> {
+        self.st.insert(&mut self.sp, &mut self.root_tree, key, v)
+    }
+
+    fn root_delete(&mut self, key: Key) -> Result<Vec<u8>> {
+        self.st.delete(&mut self.sp, &mut self.root_tree, key)
+    }
+
+    /// Whether the path to the extent item of `ino` at `lblk` is shared
+    /// with another tree.
+    fn ext_shared(&mut self, ino: u64, lblk: u64) -> Result<bool> {
+        self.st
+            .path_shared(&self.sp, &self.fs_root, &Self::ext_key(ino, lblk))
+    }
+
     fn inode(&mut self, ino: u64) -> Result<InodeItem> {
         if ino < FIRST_INO || ino >= self.fs_item.next_ino {
             return Err(Error::NotFound);
@@ -1315,10 +1338,8 @@ impl CowFs {
                     && prev.prealloc == prealloc
                     && prev.blocks + n <= MAX_EXTENT_BLOCKS
                 {
-                    self.upsert(
-                        Self::ext_key(ino, prev.lblk),
-                        Ext::item(prev.pblk, prev.blocks + n, prealloc),
-                    )?;
+                    let item = Ext::item(prev.pblk, prev.blocks + n, prealloc);
+                    self.upsert(Self::ext_key(ino, prev.lblk), item)?;
                     inode.nbytes += n * BS;
                     return Ok(());
                 }
@@ -1514,9 +1535,9 @@ impl CowFs {
             }
             let s = (e.lblk * BS).max(off);
             let t = ((e.lblk + e.blocks) * BS).min(end);
-            if s >= t {
-                continue;
-            }
+            // `extents` only returns extents overlapping the blocks of
+            // `off..end`, so they overlap its bytes too.
+            debug_assert!(s < t);
             if s > zeroed_to {
                 buf[(zeroed_to - off) as usize..(s - off) as usize].fill(0);
             }
@@ -1647,11 +1668,7 @@ impl CowFs {
                         && (self.sp.private_fresh(p, n)
                             || nocow
                                 && (p..p + n).all(|b| self.sp.refs.get(b) == 1)
-                                && !self.st.path_shared(
-                                    &self.sp,
-                                    &self.fs_root,
-                                    &Self::ext_key(ino, e.lblk),
-                                )?);
+                                && !self.ext_shared(ino, e.lblk)?);
                     (run_end, mine.then_some(p))
                 }
                 None => {
@@ -1740,13 +1757,10 @@ impl CowFs {
                 let chunk = &data[at..at + (ZCHUNK * BS) as usize];
                 if !self.write_packed(ino, inode, lb, chunk, algo)? {
                     // Incompressible: as it is.
-                    let n = self.write_plain(ino, inode, lb * BS, chunk).or_else(|e| {
-                        if e == Error::NoSpace {
-                            Ok(0)
-                        } else {
-                            Err(e)
-                        }
-                    })?;
+                    let n = match self.write_plain(ino, inode, lb * BS, chunk) {
+                        Err(Error::NoSpace) => 0,
+                        r => r?,
+                    };
                     if n < chunk.len() {
                         return Ok(at + n);
                     }
@@ -1765,9 +1779,8 @@ impl CowFs {
             self.pend(ino, pos, n);
             pos += n as u64;
         }
-        if pos > inode.size {
-            inode.size = pos;
-        }
+        // Normally the writes above have already moved the size this far.
+        inode.size = inode.size.max(pos);
         Ok((pos - off) as usize)
     }
 
@@ -1839,7 +1852,6 @@ impl CowFs {
             let Some(algo) = self.compression_for(&inode) else {
                 continue;
             };
-            let before = inode.clone();
             let blocks = inode.size.div_ceil(BS);
             for (s, l) in ranges.iter() {
                 // Up to the file's chunk grid, then whole chunks, so that
@@ -1853,9 +1865,7 @@ impl CowFs {
                     lb = next;
                 }
             }
-            if inode != before {
-                self.put_inode(ino, inode)?;
-            }
+            self.put_inode(ino, inode)?;
         }
         self.enter(cur)
     }
@@ -1921,15 +1931,7 @@ impl CowFs {
     }
 
     fn has_extents(&mut self, ino: u64) -> Result<bool> {
-        Ok(!self
-            .st
-            .range(
-                &self.fs_root,
-                &Key::new(ino, EXTENT_DATA, 0),
-                &Key::new(ino, EXTENT_DATA, u64::MAX),
-                1,
-            )?
-            .is_empty())
+        Ok(!self.items_of(ino, EXTENT_DATA, 1)?.is_empty())
     }
 
     /// Write file data (regular files and symlink targets).
@@ -2031,15 +2033,17 @@ impl CowFs {
             return Err(Error::NotDir);
         }
         let index = match at {
-            Some(i) if (2..u64::MAX).contains(&i) => {
-                if self.get(Key::new(dir, DIR_INDEX, i))?.is_some() {
-                    return Err(Error::Exists);
-                }
-                i
-            }
+            Some(i) if (2..u64::MAX).contains(&i) => i,
             Some(_) => return Err(Error::Invalid),
             None => d.dir_next,
         };
+        // Everything that can refuse the entry is checked before anything
+        // changes, so a refusal leaves no half-made entry behind.
+        let ikey = Key::new(dir, DIR_INDEX, index);
+        let rkey = Key::new(ino, INODE_REF, ref_hash(dir, index));
+        if self.get(ikey)?.is_some() || !is_link(ino) && self.get(rkey)?.is_some() {
+            return Err(Error::Exists);
+        }
         let hkey = Key::new(dir, DIR_ITEM, name_hash(name));
         let mut list = match self.get(hkey)? {
             Some(v) => decode_dir_item(&v)?,
@@ -2059,15 +2063,9 @@ impl CowFs {
             return Err(Error::NoSpace);
         }
         self.upsert(hkey, v)?;
-        self.insert(
-            Key::new(dir, DIR_INDEX, index),
-            encode_pair(ino, 0, kind, name),
-        )?;
+        self.insert(ikey, encode_pair(ino, 0, kind, name))?;
         if !is_link(ino) {
-            self.insert(
-                Key::new(ino, INODE_REF, ref_hash(dir, index)),
-                encode_pair(dir, index, kind, name),
-            )?;
+            self.insert(rkey, encode_pair(dir, index, kind, name))?;
         }
         let now = self.now();
         d.dir_next = d.dir_next.max(index + 1);
@@ -2108,15 +2106,7 @@ impl CowFs {
     }
 
     fn dir_is_empty(&mut self, dir: u64) -> Result<bool> {
-        Ok(self
-            .st
-            .range(
-                &self.fs_root,
-                &Key::new(dir, DIR_INDEX, 0),
-                &Key::new(dir, DIR_INDEX, u64::MAX),
-                1,
-            )?
-            .is_empty())
+        Ok(self.items_of(dir, DIR_INDEX, 1)?.is_empty())
     }
 
     /// Delete an inode and everything it owns.
@@ -2140,8 +2130,9 @@ impl CowFs {
         self.zpending.remove(&(self.subvol, ino));
         self.keyring.forget(self.subvol, Some(ino));
         let hi = Key::new(ino, u8::MAX, u64::MAX);
-        let mut lo = Key::new(ino, 0, 0);
-        loop {
+        // `None` once `last` was Key::MAX: nothing can follow it.
+        let mut next = Some(Key::new(ino, 0, 0));
+        while let Some(lo) = next {
             let items = self.st.range(&self.fs_root, &lo, &hi, PURGE_BATCH)?;
             let Some(last) = items.last().map(|(k, _)| *k) else {
                 break;
@@ -2158,11 +2149,7 @@ impl CowFs {
                     self.sp_decref(s, l)?;
                 }
             }
-            match key_after(&last) {
-                Some(next) => lo = next,
-                // `last` was Key::MAX: nothing can follow it.
-                None => break,
-            }
+            next = key_after(&last);
         }
         self.fs_item.inode_count = self.fs_item.inode_count.saturating_sub(1);
         Ok(())
@@ -2182,16 +2169,7 @@ impl CowFs {
             i.ctime = self.now();
             if i.parent == dir {
                 // Point `parent` at a remaining name.
-                if let Some((_, d)) = self
-                    .st
-                    .range(
-                        &self.fs_root,
-                        &Key::new(ino, INODE_REF, 0),
-                        &Key::new(ino, INODE_REF, u64::MAX),
-                        1,
-                    )?
-                    .pop()
-                {
+                if let Some((_, d)) = self.items_of(ino, INODE_REF, 1)?.pop() {
                     i.parent = decode_pair(&d)?.ino;
                 }
             }
@@ -2260,12 +2238,7 @@ impl CowFs {
         if self.inode(dir)?.kind() != FileKind::Dir {
             return Err(Error::NotDir);
         }
-        let items = self.st.range(
-            &self.fs_root,
-            &Key::new(dir, DIR_INDEX, 0),
-            &Key::new(dir, DIR_INDEX, u64::MAX),
-            usize::MAX,
-        )?;
+        let items = self.items_of(dir, DIR_INDEX, usize::MAX)?;
         let shower = self.name_shower(dir)?;
         let mut out = Vec::with_capacity(items.len());
         for (_, d) in items {
@@ -2676,12 +2649,8 @@ impl CowFs {
 
     fn root_items(&mut self) -> Result<Vec<(u64, RootItem)>> {
         let mut out = Vec::new();
-        for (k, d) in self.st.range(
-            &self.root_tree,
-            &Key::new(0, ROOT_ITEM, 0),
-            &Key::MAX,
-            usize::MAX,
-        )? {
+        let lo = Key::new(0, ROOT_ITEM, 0);
+        for (k, d) in self.st.range(&self.root_tree, &lo, &Key::MAX, usize::MAX)? {
             if k.ty == ROOT_ITEM && (k.objectid == FS_TREE || k.objectid >= FIRST_SUBVOL) {
                 out.push((k.objectid, RootItem::decode(&d)?));
             }
@@ -2692,12 +2661,11 @@ impl CowFs {
     /// The entry naming subvolume `id`: (parent subvolume, directory,
     /// index, name).
     fn backref(&mut self, id: u64) -> Result<Option<(u64, DirEnt)>> {
-        let mut v = self.st.range(
-            &self.root_tree,
-            &Key::new(id, ROOT_BACKREF, 0),
-            &Key::new(id, ROOT_BACKREF, u64::MAX),
-            2,
-        )?;
+        let (lo, hi) = (
+            Key::new(id, ROOT_BACKREF, 0),
+            Key::new(id, ROOT_BACKREF, u64::MAX),
+        );
+        let mut v = self.st.range(&self.root_tree, &lo, &hi, 2)?;
         if v.len() > 1 {
             return Err(Error::Corrupt("subvolume named twice"));
         }
@@ -2716,18 +2684,10 @@ impl CowFs {
         name: &[u8],
     ) -> Result<()> {
         if let Some((p, _)) = self.backref(id)? {
-            self.st.delete(
-                &mut self.sp,
-                &mut self.root_tree,
-                Key::new(id, ROOT_BACKREF, p),
-            )?;
+            self.root_delete(Key::new(id, ROOT_BACKREF, p))?;
         }
-        self.st.insert(
-            &mut self.sp,
-            &mut self.root_tree,
-            Key::new(id, ROOT_BACKREF, parent),
-            encode_pair(dir, index, FileKind::Dir, name),
-        )
+        let v = encode_pair(dir, index, FileKind::Dir, name);
+        self.root_insert(Key::new(id, ROOT_BACKREF, parent), v)
     }
 
     fn new_subvol_id(&mut self) -> Result<u64> {
@@ -2773,12 +2733,8 @@ impl CowFs {
         let mut root = self.st.create(&mut self.sp, id, 0)?;
         let mut top = InodeItem::new(FileKind::Dir, 0o755, now, self.st.gen);
         top.parent = FIRST_INO;
-        self.st.insert(
-            &mut self.sp,
-            &mut root,
-            Key::new(FIRST_INO, INODE_ITEM, 0),
-            top.encode(),
-        )?;
+        let key = Key::new(FIRST_INO, INODE_ITEM, 0);
+        self.st.insert(&mut self.sp, &mut root, key, top.encode())?;
         let item = RootItem {
             root,
             next_ino: FIRST_INO + 1,
@@ -2791,12 +2747,7 @@ impl CowFs {
             uuid: subvol_uuid(&self.sb.uuid, id, self.st.gen, now),
             ..Default::default()
         };
-        self.st.insert(
-            &mut self.sp,
-            &mut self.root_tree,
-            Key::new(id, ROOT_ITEM, 0),
-            item.encode(),
-        )?;
+        self.root_insert(Key::new(id, ROOT_ITEM, 0), item.encode())?;
         self.link_subvol(d, name, id)?;
         self.commit()?;
         Ok(handle(id, FIRST_INO))
@@ -2828,12 +2779,7 @@ impl CowFs {
         item.rtime = (0, 0);
         // Same counter (same files), no limit of its own.
         item.limit = 0;
-        self.st.insert(
-            &mut self.sp,
-            &mut self.root_tree,
-            Key::new(id, ROOT_ITEM, 0),
-            item.encode(),
-        )?;
+        self.root_insert(Key::new(id, ROOT_ITEM, 0), item.encode())?;
         // Subvolumes nested in the source are not part of the snapshot.
         let nested: Vec<DirEnt> = self
             .backrefs()?
@@ -2906,16 +2852,8 @@ impl CowFs {
                 (item.root, item)
             }
         };
-        self.st.delete(
-            &mut self.sp,
-            &mut self.root_tree,
-            Key::new(id, ROOT_ITEM, 0),
-        )?;
-        self.st.delete(
-            &mut self.sp,
-            &mut self.root_tree,
-            Key::new(id, ROOT_BACKREF, self.subvol),
-        )?;
+        self.root_delete(Key::new(id, ROOT_ITEM, 0))?;
+        self.root_delete(Key::new(id, ROOT_BACKREF, self.subvol))?;
         self.st.release(&mut self.sp, root)?;
         self.commit()
     }
@@ -3223,12 +3161,7 @@ impl CowFs {
         let ino = self.at(h)?;
         self.inode(ino)?;
         let mut out = Vec::new();
-        for (_, d) in self.st.range(
-            &self.fs_root,
-            &Key::new(ino, XATTR_ITEM, 0),
-            &Key::new(ino, XATTR_ITEM, u64::MAX),
-            usize::MAX,
-        )? {
+        for (_, d) in self.items_of(ino, XATTR_ITEM, usize::MAX)? {
             for (n, _) in decode_xattrs(&d)? {
                 out.push(String::from_utf8(n).map_err(|_| Error::Corrupt("xattr name"))?);
             }
@@ -3435,9 +3368,7 @@ impl CowFs {
                 None => (e.pblk * BS, e.blocks),
             };
             let shared = (e.pblk..e.pblk + disk_blocks).any(|b| self.sp.refs.get(b) > 1)
-                || self
-                    .st
-                    .path_shared(&self.sp, &self.fs_root, &Self::ext_key(ino, e.lblk))?;
+                || self.ext_shared(ino, e.lblk)?;
             if shared {
                 flags |= FIEMAP_EXTENT_SHARED;
             }
@@ -3488,9 +3419,8 @@ impl CowFs {
                 }
                 let s = (e.lblk * BS).max(off);
                 let t = ((e.lblk + e.blocks) * BS).min(size);
-                if s >= t {
-                    continue;
-                }
+                // Every extent returned overlaps the blocks of `off..size`.
+                debug_assert!(s < t);
                 match &mut found {
                     None => found = Some((s, t)),
                     Some(r) if r.1 == s => r.1 = t,
@@ -3550,9 +3480,7 @@ impl CowFs {
             return Ok(0);
         }
         // Small writes waiting to be compressed settle first.
-        if !self.nested {
-            self.flush()?;
-        }
+        self.flush()?;
         let mut inode = self.inode(ino)?;
         let before = inode.clone();
         // No-COW and encrypted data is never compressed.
@@ -3675,9 +3603,7 @@ impl CowFs {
         }
         // Rewriting keeps the size; compressed pieces must not stretch it.
         inode.size = before.size;
-        if inode != before {
-            self.put_inode(ino, inode)?;
-        }
+        self.put_inode(ino, inode)?;
         self.commit()?;
         Ok(rewritten)
     }
@@ -3688,8 +3614,8 @@ impl CowFs {
         let mut out = CompSize::default();
         let mut seen = BTreeSet::new();
         let hi = Key::new(ino, EXTENT_DATA, u64::MAX);
-        let mut lo = Key::new(ino, EXTENT_DATA, 0);
-        loop {
+        let mut next = Some(Key::new(ino, EXTENT_DATA, 0));
+        while let Some(lo) = next {
             let items = self.st.range(&self.fs_root, &lo, &hi, EXTENT_BATCH)?;
             let Some(last) = items.last().map(|(k, _)| *k) else {
                 break;
@@ -3697,10 +3623,7 @@ impl CowFs {
             for (_, d) in items {
                 Self::compsize_item(&mut out, &mut seen, &d)?;
             }
-            match key_after(&last) {
-                Some(next) => lo = next,
-                None => break,
-            }
+            next = key_after(&last);
         }
         Ok(out)
     }
@@ -3803,12 +3726,8 @@ impl CowFs {
         for id in ids {
             self.enter(id)?;
             let mut total = 0u64;
-            for (k, d) in self.st.range(
-                &self.fs_root,
-                &Key::new(0, INODE_ITEM, 0),
-                &Key::MAX,
-                usize::MAX,
-            )? {
+            let lo = Key::new(0, INODE_ITEM, 0);
+            for (k, d) in self.st.range(&self.fs_root, &lo, &Key::MAX, usize::MAX)? {
                 if k.ty == INODE_ITEM {
                     total += InodeItem::decode(&d)?.nbytes;
                 }
@@ -3897,13 +3816,14 @@ impl CowFs {
                 *excl.entry(only).or_default() += (pos - at) * BS;
             }
             at = pos;
+            let c = active.entry(id).or_default();
             if d > 0 {
-                *active.entry(id).or_default() += 1;
-            } else if let Some(c) = active.get_mut(&id) {
-                *c -= 1;
-                if *c == 0 {
-                    active.remove(&id);
-                }
+                *c += 1;
+            } else {
+                *c = c.saturating_sub(1);
+            }
+            if *c == 0 {
+                active.remove(&id);
             }
         }
         for q in &mut out {
@@ -4289,12 +4209,8 @@ impl CowFs {
         // Trees: a node shared by several parents is counted once per parent
         // and walked once.
         let mut roots = vec![self.root_tree];
-        for (k, d) in self.st.range(
-            &self.root_tree,
-            &Key::new(0, ROOT_ITEM, 0),
-            &Key::MAX,
-            usize::MAX,
-        )? {
+        let lo = Key::new(0, ROOT_ITEM, 0);
+        for (k, d) in self.st.range(&self.root_tree, &lo, &Key::MAX, usize::MAX)? {
             if k.ty == ROOT_ITEM {
                 roots.push(RootItem::decode(&d)?.root);
             }
@@ -4447,8 +4363,8 @@ impl CowFs {
         // Inodes with inline or compressed data.
         let mut packed: BTreeSet<u64> = BTreeSet::new();
         // A batch of items at a time: a file of tens of GB has millions.
-        let mut lo = Key::MIN;
-        loop {
+        let mut next = Some(Key::MIN);
+        while let Some(lo) = next {
             let items = self.st.range(&item.root, &lo, &Key::MAX, PURGE_BATCH)?;
             let Some(last) = items.last().map(|(k, _)| *k) else {
                 break;
@@ -4543,7 +4459,7 @@ impl CowFs {
                     },
                     XATTR_ITEM => {
                         let list = decode_xattrs(d)?;
-                        if list.is_empty() || list.iter().any(|(n, _)| name_hash(n) != k.offset) {
+                        if list.iter().any(|(n, _)| name_hash(n) != k.offset) {
                             return Err(Error::Corrupt("fsck: xattr item"));
                         }
                         xattr_owners.insert(k.objectid);
@@ -4551,10 +4467,7 @@ impl CowFs {
                     _ => return Err(Error::Corrupt("fsck: unknown item")),
                 }
             }
-            match key_after(&last) {
-                Some(next) => lo = next,
-                None => break,
-            }
+            next = key_after(&last);
         }
         if index_names != item_names {
             return Err(Error::Corrupt("fsck: name indexes differ"));
@@ -4860,12 +4773,8 @@ pub(crate) fn format(
     let mut fs_root = st.create(&mut sp, FS_TREE, 0)?;
     let mut dir = InodeItem::new(FileKind::Dir, 0o755, now, gen);
     dir.parent = FIRST_INO;
-    st.insert(
-        &mut sp,
-        &mut fs_root,
-        Key::new(FIRST_INO, INODE_ITEM, 0),
-        dir.encode(),
-    )?;
+    let key = Key::new(FIRST_INO, INODE_ITEM, 0);
+    st.insert(&mut sp, &mut fs_root, key, dir.encode())?;
     let item = |root: Root, next_ino: u64, count: u64| RootItem {
         root,
         next_ino,
@@ -4877,47 +4786,41 @@ pub(crate) fn format(
         parent_gen: 0,
         ..Default::default()
     };
+    let fs_item = RootItem {
+        uuid: subvol_uuid(&uuid, FS_TREE, gen, now),
+        ..item(fs_root, FIRST_INO + 1, 1)
+    };
     // The root tree's own changes below do not move the other roots.
-    st.insert(
-        &mut sp,
-        &mut root_tree,
-        Key::new(REFS_TREE, ROOT_ITEM, 0),
-        item(refs_root, 0, 0).encode(),
-    )?;
-    st.insert(
-        &mut sp,
-        &mut root_tree,
-        Key::new(CSUM_TREE, ROOT_ITEM, 0),
-        item(csum_root, 0, 0).encode(),
-    )?;
-    st.insert(
-        &mut sp,
-        &mut root_tree,
-        Key::new(FS_TREE, ROOT_ITEM, 0),
-        RootItem {
-            uuid: subvol_uuid(&uuid, FS_TREE, gen, now),
-            ..item(fs_root, FIRST_INO + 1, 1)
-        }
-        .encode(),
-    )?;
+    for (id, it) in [
+        (REFS_TREE, item(refs_root, 0, 0)),
+        (CSUM_TREE, item(csum_root, 0, 0)),
+        (FS_TREE, fs_item),
+    ] {
+        st.insert(
+            &mut sp,
+            &mut root_tree,
+            Key::new(id, ROOT_ITEM, 0),
+            it.encode(),
+        )?;
+    }
     let nodes = st.take_dirty();
     write_home(dev, &nodes)?;
     let mut alloc = sp.alloc;
     let n = alloc.groups().len();
     let need = n.div_ceil(SUMS_PER_BLOCK).max(1) as u64;
-    let bitmap_sums = alloc.groups_mut()[0]
+    // Group 0 of a new filesystem has room: mkfs checked the size.
+    let at = alloc.groups_mut()[0]
         .allocate_run(2, need)
-        .map(|at| (at, need as u32));
+        .ok_or(Error::NoSpace)?;
+    let bitmap_sums = Some((at, need as u32));
     let mut sums = Vec::with_capacity(n);
     for g in alloc.groups() {
         let bytes = g.to_bytes();
         dev.write_at(g.bitmap_block() * BS, &bytes)?;
         sums.push(crc32c(&bytes));
     }
-    if let Some((at, _)) = bitmap_sums {
-        for (k, part) in sums.chunks(SUMS_PER_BLOCK).enumerate() {
-            dev.write_at((at + k as u64) * BS, &encode_sums_block(part))?;
-        }
+    for (k, part) in sums.chunks(SUMS_PER_BLOCK).enumerate() {
+        dev.write_at((at + k as u64) * BS, &encode_sums_block(part))?;
     }
     let sb = SuperV4 {
         total_blocks: total,
