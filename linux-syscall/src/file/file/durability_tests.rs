@@ -261,6 +261,13 @@ fn sync_goes_to_the_process_root_and_leaves_the_descriptors_alone() {
     // descriptor-shaped call next to it. The counting file is open the
     // whole time and its filesystem is not the root's, so a `sync` that
     // had wandered onto a descriptor would show up on the tally.
+    //
+    // The other half -- that it reaches the root at all -- is not askable
+    // from here: rooting the process on a counting filesystem instead is
+    // what `create_root_fs` builds the whole mount tree out of, and a
+    // stand-in that is not a real tree sends it into its own recursion.
+    // On RAM-backed filesystems a `sync` has no observable effect either
+    // way, so there is nothing left for a test to see.
     let proc = a_process(45_902, "sync-root", "sync_root");
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
@@ -409,6 +416,22 @@ fn readahead_wants_a_readable_descriptor_on_something_with_a_page_cache() {
             let (readable, _tally) = a_counting_file(&lp, OpenFlags::RDWR);
             let (write_only, _wtally) = a_counting_file(&lp, OpenFlags::WRONLY);
             let fifo = a_node_named(&lp, &dir_path, "fifo", FileType::NamedPipe);
+            // Both wrong at once: not readable AND nothing to fill. Which
+            // answer comes back is the order.
+            let write_only_fifo = {
+                let inode = lp
+                    .lookup_inode(&alloc::format!("{}/fifo", dir_path))
+                    .unwrap();
+                let fd: i32 = lp
+                    .add_file(File::new(
+                        inode,
+                        OpenFlags::WRONLY,
+                        alloc::format!("{}/fifo", dir_path),
+                    ))
+                    .unwrap()
+                    .into();
+                fd as usize
+            };
 
             assert_eq!(
                 sys.sys_readahead(FileDesc::from(readable), 0, 4096),
@@ -429,6 +452,11 @@ fn readahead_wants_a_readable_descriptor_on_something_with_a_page_cache() {
                 sys.sys_readahead(FileDesc::from(readable), 0, A_NEGATIVE_LENGTH),
                 Err(LxError::EINVAL),
                 "readahead took a negative count"
+            );
+            assert_eq!(
+                sys.sys_readahead(FileDesc::from(write_only_fifo), 0, 4096),
+                Err(LxError::EBADF),
+                "readahead judged what kind of file it was before the access mode"
             );
             assert_eq!(
                 sys.sys_readahead(FileDesc::from(A_CLOSED_FD), 0, 4096),
