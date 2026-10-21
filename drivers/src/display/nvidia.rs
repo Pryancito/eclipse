@@ -14260,6 +14260,22 @@ impl NvidiaGpu {
                     pb.suffix1 = 0;
                     return Err(nv::EINVAL);
                 }
+                // Then the buffer list itself (`pushbuf_validate`), with the
+                // suffixes written like any error past the copy.
+                let all_bos = match pb.nr_buffers {
+                    0 => &[][..],
+                    n => unsafe {
+                        core::slice::from_raw_parts(
+                            pb.buffers as *const nv::DrmNouveauGemPushbufBo,
+                            n as usize,
+                        )
+                    },
+                };
+                if let Err(e) = self.pushbuf_validate(all_bos, owner_pid) {
+                    pb.suffix0 = 0;
+                    pb.suffix1 = 0;
+                    return Err(e);
+                }
                 log::warn!(
                     "[nouveau-uapi] GEM_PUSHBUF: channel={} nr_buffers={} nr_relocs={} \
                      nr_push={} suffix0={:#x} suffix1={:#x} vram_avail={:#x} gart_avail={:#x}",

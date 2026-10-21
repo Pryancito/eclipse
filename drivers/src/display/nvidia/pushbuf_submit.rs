@@ -21,6 +21,54 @@ pub(super) struct ResolvedBo {
 }
 
 impl super::NvidiaGpu {
+    /// `nouveau_gem_pushbuf_validate` before anything is mapped, hatch or
+    /// no hatch: `validate_init` walks the buffer list in order and judges
+    /// each entry before the next -- a handle that is not a GEM object the
+    /// caller may use (its own, or a PRIME import it holds) is ENOENT
+    /// ("Unknown handle"), and a handle listed twice is EINVAL ("multiple
+    /// instances of buffer"); then `validate_list` passes each entry
+    /// through `nouveau_gem_set_domain`, where `valid_domains` naming
+    /// neither VRAM nor GART is EINVAL ("invalid valid domains"). The list
+    /// went unread: a stranger's handle, a duplicate or an empty domain
+    /// mask reached the (refused) submission as good as a real buffer.
+    /// Each entry is read before the table's lock is taken.
+    pub(super) fn pushbuf_validate(
+        &self,
+        bos: &[nv::DrmNouveauGemPushbufBo],
+        owner_pid: u64,
+    ) -> Result<(), i32> {
+        for (i, bo) in bos.iter().enumerate() {
+            let handle = bo.handle;
+            let known = self
+                .nouveau_gem
+                .lock()
+                .iter()
+                .any(|o| o.handle == handle && super::gem_usable_by(o, owner_pid));
+            if !known {
+                crate::klog_warn!(
+                    "[nouveau-uapi] GEM_PUSHBUF bo[{i}]: unknown handle {handle:#010x} (pid={owner_pid}) -> ENOENT"
+                );
+                return Err(nv::ENOENT);
+            }
+            if bos[..i].iter().any(|b| b.handle == handle) {
+                crate::klog_warn!(
+                    "[nouveau-uapi] GEM_PUSHBUF bo[{i}]: multiple instances of buffer {handle} on validation list -> EINVAL"
+                );
+                return Err(nv::EINVAL);
+            }
+        }
+        for (i, bo) in bos.iter().enumerate() {
+            let valid = bo.valid_domains;
+            if valid & (nv::NOUVEAU_GEM_DOMAIN_VRAM | nv::NOUVEAU_GEM_DOMAIN_GART) == 0 {
+                crate::klog_warn!(
+                    "[nouveau-uapi] GEM_PUSHBUF bo[{i}]: invalid valid domains: {valid:#010x} -> EINVAL"
+                );
+                return Err(nv::EINVAL);
+            }
+        }
+        Ok(())
+    }
+
     /// Give every listed buffer a GPU VA in `ctx_idx`'s VAS.
     ///
     /// A legacy (non-uvmm) client never calls `VM_BIND`, so nothing has
