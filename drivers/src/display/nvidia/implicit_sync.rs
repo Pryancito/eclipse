@@ -339,4 +339,40 @@ mod tests {
         assert_eq!(WAIT_BUDGET_US, 3 * 1_000_000 / 60 + 50_000 - 50_000);
         assert!(WAIT_BUDGET_US > 1_000_000 / 60);
     }
+
+    /// The line `/proc/gpudbg` prints: the switch spelled out, then the
+    /// seven counters in the order their doc comments above give them.
+    #[test]
+    fn the_profile_line_names_the_switch_and_every_counter_in_order() {
+        let _serialised = crate::test_globals::LOCK.lock();
+        let was = enabled();
+        let counters: [(&AtomicU64, u64); 7] = [
+            (&EXECS_WITH_DEPS, 7),
+            (&WAITED, 6),
+            (&WAIT_US, 5),
+            (&ALREADY_LANDED, 4),
+            (&NO_FENCE, 3),
+            (&ZOMBIE_PRODUCER, 2),
+            (&TIMED_OUT, 1),
+        ];
+        for (c, v) in counters.iter() {
+            c.store(*v, Ordering::Relaxed);
+        }
+        set_enabled(true);
+        assert_eq!(
+            profile_line(),
+            "[gpudbg]  implicit sync: ON -- execs with foreign buffers=7 waited=6 (5us) \
+             already-landed=4 no-fence=3 zombie-producer=2 TIMED-OUT=1"
+        );
+        set_enabled(false);
+        assert_eq!(
+            profile_line(),
+            "[gpudbg]  implicit sync: OFF (nvidia.implicit_sync=off) -- execs with foreign \
+             buffers=7 waited=6 (5us) already-landed=4 no-fence=3 zombie-producer=2 TIMED-OUT=1"
+        );
+        set_enabled(was);
+        for (c, _) in counters.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
 }

@@ -639,6 +639,8 @@ pub(super) struct FakeRm {
     /// Every entry point in call order.
     pub calls: Vec<&'static str>,
     pub fail_ctx_alloc: bool,
+    /// What `comptag_caps` answers; `None` is a failed query.
+    pub comptag_caps: Option<RmComptagCaps>,
     /// `ctx_alloc` returns `NV_OK` with a non-zero `sched_status`: the
     /// C side's shape for a ladder that failed part-way. It has already
     /// freed every handle it made, so nothing of this context lives.
@@ -712,6 +714,16 @@ const EMPTY_RM: FakeRm = FakeRm {
     bad: 0,
     calls: Vec::new(),
     fail_ctx_alloc: false,
+    comptag_caps: Some(RmComptagCaps {
+        one_to_one: 0,
+        one_to_four: 0,
+        raw_mode: 0,
+        compbit_backing_off: 0,
+        post_l2_off: 0,
+        scrub_on_free: 0,
+        vas_for_ce: 0,
+        compr_page_shift: 0,
+    }),
     incomplete_ctx: false,
     fail_prime: false,
     fail_ctx_free: false,
@@ -978,8 +990,8 @@ extern "C" fn eclipse_rm_gem_free(_inst: u32, h_memory: u32) -> u32 {
         }
     }
 }
-/// Succeeds with every capability clear, which is the "query worked, this GPU
-/// is in no mode we understand" case. Deliberately not a plausible Turing: a
+/// Succeeds, unless a test said otherwise, with every capability clear, which
+/// is the "query worked, this GPU is in no mode we understand" case. Deliberately not a plausible Turing: a
 /// double that claimed one-to-one would make `may_honour_compressed_kind`
 /// return true across the host suite and quietly turn a behaviour change on in
 /// tests that are about something else. A test that wants the permissive case
@@ -988,8 +1000,13 @@ extern "C" fn eclipse_rm_gem_free(_inst: u32, h_memory: u32) -> u32 {
 extern "C" fn eclipse_rm_comptag_caps(_inst: u32, out: *mut RmComptagCaps) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("comptag_caps");
-    unsafe { *out = RmComptagCaps::default() };
-    NV_OK
+    match f.comptag_caps {
+        Some(caps) => {
+            unsafe { *out = caps };
+            NV_OK
+        }
+        None => NV_ERR_NOT_SUPPORTED,
+    }
 }
 
 #[no_mangle]

@@ -193,6 +193,18 @@ pub(super) fn claim_caps_query() -> bool {
 
 static CAPS_ASKED: AtomicBool = AtomicBool::new(false);
 
+/// What is cached, for the tests of the reader next door.
+#[cfg(test)]
+pub(super) fn caps() -> Option<ComptagCaps> {
+    *CAPS.lock()
+}
+
+/// Puts the one-shot back, so a test can watch the claim happen.
+#[cfg(test)]
+pub(super) fn reset_caps_asked() {
+    CAPS_ASKED.store(false, Ordering::Relaxed);
+}
+
 /// Everything `VM_BIND` needs to decide, in one call: the hatch, whether the
 /// kind is compressible at all, the GPU's caps and the surface's placement.
 ///
@@ -510,17 +522,20 @@ mod tests {
     /// no GPU the caps read never succeeds, so without this every single
     /// `VM_BIND` would take the RM lock to be told so again.
     ///
-    /// `CAPS_ASKED` is a one-shot static shared by the whole test binary and
-    /// nothing can put it back, so this is the only test allowed to touch it
-    /// -- which is also why it asserts the initial value first.
+    /// `CAPS_ASKED` is a one-shot static shared by the whole test binary;
+    /// `reset_caps_asked` puts it back, here and in `comptag_caps`'s tests,
+    /// under the one lock, so the order the tests run in does not matter.
     #[test]
     fn the_caps_query_is_claimed_once_and_never_again() {
+        let _serialised = crate::test_globals::LOCK.lock();
+        reset_caps_asked();
         assert!(
             claim_caps_query(),
             "the first bind that needs the caps must be allowed to ask",
         );
         assert!(!claim_caps_query(), "no second bind may re-enter the RM");
         assert!(!claim_caps_query());
+        reset_caps_asked();
     }
 
     #[test]
