@@ -7701,6 +7701,11 @@ mod hub_tree_tests;
 #[cfg(test)]
 mod msc_tests;
 
+/// `/proc/usbhid`: el informe que contesta si el sistema ve lo que se acaba
+/// de enchufar, que es lo que se pega en un informe de fallo.
+#[cfg(test)]
+mod proc_tests;
+
 /// El disco que ve el sistema: el alta y la baja por el hueco de `hotplug` y
 /// la traducción de sectores de 512 a bloques del dispositivo.
 #[cfg(test)]
