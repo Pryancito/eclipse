@@ -870,7 +870,8 @@ fn asking_a_timer_for_its_overruns_does_not_delete_it() {
         Box::pin(async move {
             let mut id = [0i32];
             // CLOCK_REALTIME, no `sigevent`: SIGALRM to the process.
-            sys.sys_timer_create(0, 0, id.as_mut_ptr() as usize).unwrap();
+            sys.sys_timer_create(0, 0, id.as_mut_ptr() as usize)
+                .unwrap();
             let id = id[0] as usize;
             let first = by_number(sys, Sys::TIMER_GETOVERRUN as u32, [id, 0, 0, 0, 0, 0]).await;
             let second = by_number(sys, Sys::TIMER_GETOVERRUN as u32, [id, 0, 0, 0, 0, 0]).await;
@@ -970,12 +971,7 @@ fn controlling_a_message_queue_is_not_making_a_semaphore_set() {
                 [NO_SUCH_QUEUE, IPC_SET, CREATE, 0, 0, 0],
             )
             .await;
-            let get = by_number(
-                sys,
-                Sys::SEMGET as u32,
-                [FRESH_KEY, 1, CREATE, 0, 0, 0],
-            )
-            .await;
+            let get = by_number(sys, Sys::SEMGET as u32, [FRESH_KEY, 1, CREATE, 0, 0, 0]).await;
             (ctl, get)
         })
     });
