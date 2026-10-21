@@ -2766,3 +2766,9 @@ mod semctl_wiring_tests;
 /// two parks a queue has.
 #[cfg(test)]
 mod msg_wiring_tests;
+
+/// System V shared memory reached through the syscall: a segment made in one
+/// process and read in another, where an attach lands, and what a detach
+/// leaves behind.
+#[cfg(test)]
+mod shm_wiring_tests;
