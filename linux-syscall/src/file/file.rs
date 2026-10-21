@@ -3944,3 +3944,6 @@ mod rwf_atomic_tests;
 
 #[cfg(test)]
 mod vfs_ioctl_tests;
+
+#[cfg(test)]
+mod record_lock_wiring_tests;
