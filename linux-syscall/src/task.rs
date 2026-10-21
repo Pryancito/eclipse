@@ -3077,6 +3077,12 @@ mod priority_wiring_tests;
 #[cfg(test)]
 mod session_wiring_tests;
 
+/// `set_tid_address` and the two `robust_list` calls through the syscall:
+/// the length gate, the thread the pid argument names, and the id a
+/// thread is answered with.
+#[cfg(test)]
+mod robust_list_wiring_tests;
+
 #[cfg(test)]
 mod comm_from_path_tests {
     //! `comm` after an `execve`: the last component of the path, which is
