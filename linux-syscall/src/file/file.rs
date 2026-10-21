@@ -3950,3 +3950,6 @@ mod record_lock_wiring_tests;
 
 #[cfg(test)]
 mod fcntl_families_tests;
+
+#[cfg(test)]
+mod read_write_refusal_tests;
