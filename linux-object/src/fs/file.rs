@@ -2393,6 +2393,155 @@ mod poll_events_tests {
 }
 
 #[cfg(test)]
+mod poll_number_tests {
+    //! The bits of `poll(2)` themselves, which nothing above can check.
+    //!
+    //! Every assertion in [`poll_events_tests`] -- and in `fs::epoll`, and in
+    //! `linux-syscall`'s `poll` and `select` -- names the bit it expects
+    //! (`PollEvents::IN`) on both sides of the question: the interest mask the
+    //! test hands in and the `revents` it compares against are built from the
+    //! same constant, so they agree with each other whatever that constant
+    //! says. Userspace does not agree by construction. It sends the NUMBER --
+    //! `0x001` for `POLLIN`, out of its own `asm-generic/poll.h` -- in the
+    //! `events` field of a `pollfd`, and `epoll_ctl` hands its `events` word
+    //! straight to `PollEvents::from_bits_truncate`.
+    //!
+    //! Giving `IN` the `0x004` of `OUT` and `OUT` the `0x001` of `IN` -- one
+    //! transposition in a hand-written list -- passed every test of this
+    //! crate and of `linux-syscall`. What it does to a running system is turn
+    //! every `poll(POLLIN)` into a question about writability: a reader is
+    //! woken on a socket with nothing in it, and sleeps on one that is full.
+    //!
+    //! So the numbers below are written from the header userspace compiles
+    //! against and not read back out of the table, which would only prove the
+    //! table agrees with itself.
+
+    use super::{PollEvents, PollStatus};
+
+    /// Every bit the table carries, with the number `poll.h` gives it.
+    const EVERY_BIT: [(PollEvents, u16); 10] = [
+        (PollEvents::IN, 0x0001),
+        (PollEvents::PRI, 0x0002),
+        (PollEvents::OUT, 0x0004),
+        (PollEvents::ERR, 0x0008),
+        (PollEvents::HUP, 0x0010),
+        (PollEvents::INVAL, 0x0020),
+        (PollEvents::RDNORM, 0x0040),
+        (PollEvents::RDBAND, 0x0080),
+        (PollEvents::WRNORM, 0x0100),
+        (PollEvents::WRBAND, 0x0200),
+    ];
+
+    fn status(read: bool, write: bool) -> PollStatus {
+        PollStatus {
+            read,
+            write,
+            error: false,
+            hangup: false,
+        }
+    }
+
+    #[test]
+    fn every_bit_carries_the_number_userspace_sends() {
+        for (bit, n) in EVERY_BIT {
+            assert_eq!(
+                bit.bits(),
+                n,
+                "a poll bit is {:#06x} where userspace sends {:#06x}",
+                bit.bits(),
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn the_table_above_leaves_no_bit_out() {
+        // `PollEvents` is a bitflags struct, not an enum, so a bit added
+        // without a number here cannot be made to fail to compile the way a
+        // new `LxError` variant can. What it can be made to do is fail here:
+        // `all()` grows the moment someone adds a bit and the or of the table
+        // does not.
+        let named = EVERY_BIT.iter().fold(0u16, |acc, (_, n)| acc | n);
+        assert_eq!(
+            PollEvents::all().bits(),
+            named,
+            "a bit was added to PollEvents without a number of its own above"
+        );
+        assert_eq!(
+            named, 0x03ff,
+            "the ten bits of poll.h are not what is named"
+        );
+    }
+
+    #[test]
+    fn the_two_interest_masks_are_the_numbers_they_claim() {
+        // These two decide which direction a request is about, so a wrong bit
+        // in either sends a waiter to the other side of the file. They are
+        // built from the names above, which is why the numbers are spelled
+        // out again here.
+        assert_eq!(
+            PollEvents::READ_INTEREST.bits(),
+            0x0001 | 0x0002 | 0x0040 | 0x0080,
+            "the read-interest mask is not POLLIN|POLLPRI|POLLRDNORM|POLLRDBAND"
+        );
+        assert_eq!(
+            PollEvents::WRITE_INTEREST.bits(),
+            0x0004 | 0x0100 | 0x0200,
+            "the write-interest mask is not POLLOUT|POLLWRNORM|POLLWRBAND"
+        );
+        assert_eq!(
+            PollEvents::READ_INTEREST.bits() & PollEvents::WRITE_INTEREST.bits(),
+            0,
+            "a bit asks about reading and about writing at once"
+        );
+    }
+
+    #[test]
+    fn a_raw_interest_word_is_answered_in_raw_numbers() {
+        // The path `epoll_ctl` takes, and the one a `pollfd` takes: a number
+        // chosen by userspace, truncated into the table, answered with bits
+        // that go back out as numbers. Asked with `0x001` about a file that
+        // is readable and not writable, the answer is `0x001`; asked the same
+        // about a file that is only writable, it is nothing.
+        let readable = status(true, false);
+        let writable = status(false, true);
+        let pollin = PollEvents::from_bits_truncate(0x0001);
+        let pollout = PollEvents::from_bits_truncate(0x0004);
+        assert_eq!(
+            PollEvents::revents(&readable, pollin).bits(),
+            0x0001,
+            "0x001 on a readable file did not come back as 0x001"
+        );
+        assert_eq!(
+            PollEvents::revents(&writable, pollout).bits(),
+            0x0004,
+            "0x004 on a writable file did not come back as 0x004"
+        );
+        assert_eq!(
+            PollEvents::revents(&writable, pollin).bits(),
+            0x0000,
+            "0x001 was answered about a file that was only writable"
+        );
+        assert_eq!(
+            PollEvents::revents(&readable, pollout).bits(),
+            0x0000,
+            "0x004 was answered about a file that was only readable"
+        );
+        // And the streams names, whose numbers no test reached either.
+        assert_eq!(
+            PollEvents::revents(&readable, PollEvents::from_bits_truncate(0x0040)).bits(),
+            0x0040,
+            "0x040 (POLLRDNORM) on a readable file did not come back as 0x040"
+        );
+        assert_eq!(
+            PollEvents::revents(&writable, PollEvents::from_bits_truncate(0x0100)).bits(),
+            0x0100,
+            "0x100 (POLLWRNORM) on a writable file did not come back as 0x100"
+        );
+    }
+}
+
+#[cfg(test)]
 mod async_poll_tests {
     //! `INode::async_poll` takes no events, so the inodes that override it all
     //! wait for readability whatever was asked. A caller that asked only about
