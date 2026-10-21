@@ -614,7 +614,8 @@ fn getting_the_supplementary_groups_does_not_set_them() {
 fn setting_the_host_name_does_not_set_the_domain_name() {
     // `sethostname` and `setdomainname` take the same pointer and length and
     // both answer zero, so only which of the two names moved says which ran.
-    // Both are machine-wide, so this test puts them back.
+    // Both are machine-wide, so this test holds them and puts them back.
+    let _names = crate::on_a_thread::the_machine_names();
     let was_host = linux_object::uname::hostname();
     let was_domain = linux_object::uname::domainname();
     let proc = a_process(45_514, "dispatch-hostname", "dispatch_hostname");

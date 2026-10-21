@@ -131,3 +131,20 @@ pub(crate) fn on_a_thread<R: Send + 'static>(
         Err(e) => panic!("the call never came back: {:?}", e),
     }
 }
+
+/// The machine-wide `utsname` names, held for the duration of one test.
+///
+/// `sethostname` and `setdomainname` write a global that every test in this
+/// binary shares, and `cargo test` runs tests in parallel: two tests that
+/// each set a name and then read it back can read each other's. Every test
+/// that writes either name takes this first, and puts the names back before
+/// it lets go.
+///
+/// Poisoning is ignored on purpose. A test that panicked holding this has
+/// already failed and said why; the tests that follow should go on to say
+/// what THEY found, so each of them sets the name it is about rather than
+/// trusting the one it inherited.
+pub(crate) fn the_machine_names() -> std::sync::MutexGuard<'static, ()> {
+    static NAMES: Mutex<()> = Mutex::new(());
+    NAMES.lock().unwrap_or_else(|held| held.into_inner())
+}

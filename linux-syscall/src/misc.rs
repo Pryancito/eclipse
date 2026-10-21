@@ -2863,3 +2863,9 @@ mod sysinfo_layout_tests {
 /// and the old limit going out while the new one goes in.
 #[cfg(test)]
 mod rlimit_wiring_tests;
+
+/// The machine a program asks about: the two names it can set and the
+/// `utsname` it reads them back from, its execution domain, which CPU it is
+/// on, and the numbers `uptime` and `top` print.
+#[cfg(test)]
+mod uts_and_machine_tests;
