@@ -1072,11 +1072,8 @@ impl CowFs {
                 };
                 if !stale.is_empty() {
                     r.csums_dropped += stale.len() as u64;
-                    self.edit_csum_bucket(bucket, |cb| {
-                        for i in stale {
-                            cb.0[i] = None;
-                        }
-                    })?;
+                    let clear = |cb: &mut CsumBucket| stale.iter().for_each(|&i| cb.0[i] = None);
+                    self.edit_csum_bucket(bucket, clear)?;
                 }
             }
             next = key_after(&last);
@@ -1099,11 +1096,12 @@ impl CowFs {
                 if !fill.is_empty() {
                     r.csums_added += fill.len() as u64;
                     let bucket = b / CSUM_BUCKET * CSUM_BUCKET;
-                    self.edit_csum_bucket(bucket, |cb| {
+                    let set = |cb: &mut CsumBucket| {
                         for (at, c) in fill {
                             cb.0[(at - bucket) as usize] = Some(c);
                         }
-                    })?;
+                    };
+                    self.edit_csum_bucket(bucket, set)?;
                 }
                 b += n;
             }
@@ -1515,7 +1513,10 @@ mod tests {
         fs.set_encryption_policy(v, &EncryptionPolicy::new(key))
             .unwrap();
         let f = split(file(&mut fs, FIRST_INO, "f")).1;
-        let ctx = fs.get(Key::new(split(v).1, ENC_CONTEXT, 0)).unwrap().unwrap();
+        let ctx = fs
+            .get(Key::new(split(v).1, ENC_CONTEXT, 0))
+            .unwrap()
+            .unwrap();
         fs.insert(Key::new(f, ENC_CONTEXT, 0), ctx).unwrap();
         let old = handle(1, FIRST_INO);
         let v = encode_pair(old, 0, FileKind::Dir, b"old");
@@ -1534,8 +1535,12 @@ mod tests {
         let sv = fs.create_subvolume(FIRST_INO, "sv").unwrap();
         fs.set_encryption_policy(sv, &EncryptionPolicy::new(key))
             .unwrap();
-        let a = fs.create(sv, "dir-a-long-name", FileKind::Dir, 0o700, 0).unwrap();
-        let b = fs.create(a, "dir-b-long-name", FileKind::Dir, 0o700, 0).unwrap();
+        let a = fs
+            .create(sv, "dir-a-long-name", FileKind::Dir, 0o700, 0)
+            .unwrap();
+        let b = fs
+            .create(a, "dir-b-long-name", FileKind::Dir, 0o700, 0)
+            .unwrap();
         fs.enter(split(sv).0).unwrap();
         let (a, b) = (split(a).1, split(b).1);
         // a's entry moves from the root into b.

@@ -1072,12 +1072,17 @@ mod tests {
         while let Some(r) = fs.sp.alloc.allocate(None, u64::MAX) {
             runs.push(r);
         }
-        for (s, l) in runs {
+        for &(s, l) in &runs {
             for b in (s..s + l).step_by(2) {
                 fs.sp.alloc.free_now(b, 1).unwrap();
             }
         }
         assert!(!fs.make_log_area().unwrap());
+        // Less room than an area: a smaller one.
+        while fs.sp.alloc.allocate(None, u64::MAX).is_some() {}
+        let (s, _) = runs[0];
+        fs.sp.alloc.free_now(s, 40).unwrap();
+        assert!(fs.make_log_area().unwrap());
     }
 
     #[test]

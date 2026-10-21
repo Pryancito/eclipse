@@ -800,6 +800,82 @@ fn scrub_repairs_a_bad_copy_of_a_tree_node() {
 }
 
 #[test]
+fn a_shared_range_over_a_bad_node_fails() {
+    let (d, mut fs) = mounted();
+    file(&mut fs, "f", b"x");
+    fs.sync().unwrap();
+    d.write_at(fs.fs_root.bytenr * BS, &[0xff; BS as usize])
+        .unwrap();
+    fs.drop_caches();
+    let first = Key::new(0, 0, 0);
+    assert!(fs
+        .st
+        .range_shared(&fs.fs_root, &first, &Key::MAX, 10)
+        .is_err());
+}
+
+/// A device whose sync fails once `fail` is set.
+struct SyncFails {
+    ram: Arc<dyn BlockDevice>,
+    fail: core::sync::atomic::AtomicBool,
+}
+
+impl BlockDevice for SyncFails {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.ram.read_at(offset, buf)
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.ram.write_at(offset, buf)
+    }
+    fn sync(&self) -> Result<()> {
+        match self.fail.load(core::sync::atomic::Ordering::Relaxed) {
+            true => Err(Error::Io),
+            false => Ok(()),
+        }
+    }
+    fn size(&self) -> u64 {
+        self.ram.size()
+    }
+}
+
+/// A scrub that repairs a copy but cannot sync the repair fails.
+#[test]
+fn scrub_repairs_that_cannot_be_synced() {
+    for node in [true, false] {
+        let wrapped: Vec<Arc<SyncFails>> = volume()
+            .into_iter()
+            .map(|ram| {
+                Arc::new(SyncFails {
+                    ram,
+                    fail: false.into(),
+                })
+            })
+            .collect();
+        let devs = wrapped
+            .iter()
+            .map(|d| d.clone() as Arc<dyn BlockDevice>)
+            .collect();
+        let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+        let h = file(&mut fs, "f", &[3; 20000]);
+        fs.sync().unwrap();
+        let b = match node {
+            true => fs.fs_root.bytenr,
+            false => fs.fiemap(h, 0, 20000).unwrap()[0].physical / BS,
+        };
+        fs.vol
+            .clone()
+            .unwrap()
+            .write_copy(b * BS, &[0xff; BS as usize], 0)
+            .unwrap();
+        fs.drop_caches();
+        for d in &wrapped {
+            d.fail.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        assert_eq!(fs.scrub().err(), Some(Error::Io), "node: {node}");
+    }
+}
+
+#[test]
 fn the_formatting_stand_in_device_is_never_read() {
     let d = NullDev(5);
     assert_eq!(d.size(), 5);

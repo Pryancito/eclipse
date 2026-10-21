@@ -1074,6 +1074,17 @@ mod tests {
         fs.check().unwrap();
     }
 
+    /// Compression still pending in a failed receive goes with its tree.
+    #[test]
+    fn a_failed_receive_drops_its_pending_compression() {
+        let mut fs = mounted();
+        fs.set_mount_compression(Some(Compression::Lz4));
+        let s = stream(0, G + 1, &with_files(&[write(G + 5, 0, b"x")]));
+        assert_eq!(recv(&mut fs, &s).err(), Some(BAD));
+        assert!(fs.zpending.is_empty());
+        fs.check().unwrap();
+    }
+
     #[test]
     fn a_hand_made_stream_is_received() {
         let mut fs = mounted();
