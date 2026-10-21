@@ -298,3 +298,216 @@ impl GpuBringup {
         w32(slot * 2 + 1, entry1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::host_hooks as shim;
+    use core::sync::atomic::Ordering;
+
+    fn rd64(r: &DmaRegion, i: usize) -> u64 {
+        unsafe { core::ptr::read_volatile(r.as_ptr::<u64>().add(i)) }
+    }
+    fn rd32(r: &DmaRegion, i: usize) -> u32 {
+        unsafe { core::ptr::read_volatile(r.as_ptr::<u32>().add(i)) }
+    }
+
+    // 2 MiB: the packed region's slot is pdei 1, and every leaf index
+    // starts at 0, so a table written at the wrong level or index reads
+    // as a zero where a value is expected.
+    const VA: u64 = 0x20_0000;
+    const VRAM: u64 = 0x4000_0000;
+
+    /// Twelve coherent regions (ten pages, the 8-page CE fault buffer and
+    /// the 64-page HUB fault buffer), the five engine-visible buffers and
+    /// the fault-method pages mapped at their slots of the one 2 MiB
+    /// region through a five-level chain (leaf, the SMALL half of pd0's
+    /// dual PDE, pd2, pd3, root) that the dump prints by the same numbers;
+    /// the VRAM-resident structures at fixed page offsets of `vram_base`.
+    #[test]
+    fn the_plan_chains_five_tables_to_the_packed_region_and_lays_the_vram_side_out() {
+        shim::alone_with_the_allocator(|| {
+            let plan = GpuBringup::build(VA, VRAM).expect("twelve regions");
+            assert_eq!(shim::ALLOC_CALLS.load(Ordering::SeqCst), 12);
+            assert_eq!(
+                shim::ALLOC_PAGES.load(Ordering::SeqCst),
+                10 + 8 + 64,
+                "ten pages, 32 KiB of CE fault methods, 256 KiB of HUB faults"
+            );
+            assert_eq!(shim::MARK_CALLS.load(Ordering::SeqCst), 12, "all coherent");
+            let leaf = [
+                (0, plan.src.paddr(), "src"),
+                (1, plan.dst.paddr(), "dst"),
+                (2, plan.sem.paddr(), "sem"),
+                (3, plan.pushbuf.paddr(), "pushbuffer"),
+                (4, plan.gpfifo.paddr(), "gpfifo"),
+            ];
+            for (i, pa, what) in leaf {
+                assert_eq!(
+                    rd64(&plan.spt, i),
+                    gmmu::encode_pte_sys(pa as u64),
+                    "{what}"
+                );
+            }
+            for p in 0..8usize {
+                assert_eq!(
+                    rd64(&plan.spt, 5 + p),
+                    gmmu::encode_pte_sys(plan.ce_fault.paddr() as u64 + (p as u64) * 0x1000),
+                    "CE fault page {p}"
+                );
+            }
+            assert_eq!(rd64(&plan.spt, 13), 0, "nothing past the fault methods");
+            assert_eq!(rd64(&plan.spt, 511), 0);
+            assert_eq!(rd64(&plan.pd0, 2), 0, "the BIG half of pdei 1 is unused");
+            assert_eq!(
+                rd64(&plan.pd0, 3),
+                gmmu::encode_pde_sys(plan.spt.paddr() as u64),
+                "the SMALL half points at the leaf"
+            );
+            assert_eq!(rd64(&plan.pd0, 0), 0, "pdei 0 is nobody's");
+            assert_eq!(rd64(&plan.pd0, 1), 0);
+            assert_eq!(
+                rd64(&plan.pd2, 0),
+                gmmu::encode_pde_sys(plan.pd0.paddr() as u64)
+            );
+            assert_eq!(
+                rd64(&plan.pd3, 0),
+                gmmu::encode_pde_sys(plan.pd2.paddr() as u64)
+            );
+            assert_eq!(
+                rd64(&plan.root, 0),
+                gmmu::encode_pde_sys(plan.pd3.paddr() as u64)
+            );
+            assert_eq!(rd64(&plan.root, 1), 0);
+            assert_eq!(
+                (
+                    plan.inst_vram(),
+                    plan.runlist_vram(),
+                    plan.userd_vram(),
+                    plan.bar2_inst_vram()
+                ),
+                (VRAM, VRAM + 0x1000, VRAM + 0x2000, VRAM + 0x3000)
+            );
+            assert_eq!(
+                (plan.gpfifo_va(), plan.ce_fault_va()),
+                (VA + 0x4000, VA + 0x5000)
+            );
+
+            let d = plan.dump();
+            for line in [
+                alloc::format!(
+                    "PD  phys: root={:#x} pd3={:#x} pd2={:#x} pd0={:#x} spt={:#x}",
+                    plan.root.paddr(),
+                    plan.pd3.paddr(),
+                    plan.pd2.paddr(),
+                    plan.pd0.paddr(),
+                    plan.spt.paddr()
+                ),
+                alloc::format!(
+                    "sysmem phys: gpfifo={:#x} pb={:#x} sem={:#x} src={:#x} dst={:#x}",
+                    plan.gpfifo.paddr(),
+                    plan.pushbuf.paddr(),
+                    plan.sem.paddr(),
+                    plan.src.paddr(),
+                    plan.dst.paddr()
+                ),
+                alloc::format!(
+                    "VRAM off: inst={:#x} runlist={:#x} userd={:#x}",
+                    VRAM,
+                    VRAM + 0x1000,
+                    VRAM + 0x2000
+                ),
+                alloc::format!("VA base={:#x} idx[root=0 pd3=0 pd2=0 pd0=1]", VA),
+                alloc::format!("root[0] = {:#018x}", rd64(&plan.root, 0)),
+                alloc::format!("pd3 [0] = {:#018x}", rd64(&plan.pd3, 0)),
+                alloc::format!("pd2 [0] = {:#018x}", rd64(&plan.pd2, 0)),
+                alloc::format!(
+                    "pd0 [1] big={:#018x} small={:#018x}",
+                    0u64,
+                    rd64(&plan.pd0, 3)
+                ),
+                alloc::format!(
+                    "spt [  3] pb va={:#x} pte={:#018x}",
+                    VA + 0x3000,
+                    rd64(&plan.spt, 3)
+                ),
+                alloc::format!(
+                    "spt [  4] gpfifo va={:#x} pte={:#018x}",
+                    VA + 0x4000,
+                    rd64(&plan.spt, 4)
+                ),
+                alloc::format!(
+                    "inst PD-base qword(@0x200) = {:#018x} (root|0xC06",
+                    plan.root.paddr() as u64 | 0xC06
+                ),
+            ] {
+                assert!(d.contains(&line), "missing {:?} in:\n{}", line, d);
+            }
+            assert_eq!(d.lines().count(), 15);
+        });
+    }
+
+    /// The SET_OBJECT stream is two words (`INC` subchannel 4 method 0,
+    /// count 1; the TURING_DMA_COPY_A class) and nothing after them; a
+    /// GPFIFO entry is the pushbuffer VA with its two low bits dropped and
+    /// the VA's bits above 32 beside the dword count shifted by ten, at
+    /// its own slot only.
+    #[test]
+    fn the_pushbuffer_and_the_gpfifo_entry_are_written_as_the_host_decodes_them() {
+        shim::alone_with_the_allocator(|| {
+            let plan = GpuBringup::build(VA, VRAM).unwrap();
+            assert_eq!(plan.write_setobject_pushbuffer(), 2);
+            assert_eq!(
+                [
+                    rd32(&plan.pushbuf, 0),
+                    rd32(&plan.pushbuf, 1),
+                    rd32(&plan.pushbuf, 2)
+                ],
+                [0x2001_8000, 0x0000_c5b5, 0]
+            );
+            plan.write_gpfifo_entry(3, 0x1_2345_678b, 2);
+            assert_eq!(
+                [rd32(&plan.gpfifo, 6), rd32(&plan.gpfifo, 7)],
+                [0x2345_6788, 0x01 | (2 << 10)],
+                "slot 3: GET without its low bits, GET_HI and LENGTH << 10"
+            );
+            assert_eq!(
+                [rd32(&plan.gpfifo, 0), rd32(&plan.gpfifo, 1)],
+                [0, 0],
+                "slot 0 untouched"
+            );
+            assert_eq!(
+                [rd32(&plan.gpfifo, 4), rd32(&plan.gpfifo, 5)],
+                [0, 0],
+                "slot 2 untouched"
+            );
+            plan.write_gpfifo_entry(0, VA + 0x3000, 0x3ff);
+            assert_eq!(
+                [rd32(&plan.gpfifo, 0), rd32(&plan.gpfifo, 1)],
+                [(VA + 0x3000) as u32, 0x3ff << 10]
+            );
+        });
+    }
+
+    /// A region the allocator cannot give is the whole plan refused, and
+    /// every region taken before it goes back; the first refusal costs
+    /// nothing.
+    #[test]
+    fn a_plan_the_allocator_cannot_finish_gives_every_page_back() {
+        shim::alone_with_the_allocator(|| {
+            shim::FAIL_ALLOC_AFTER.store(11, Ordering::SeqCst);
+            assert!(
+                GpuBringup::build(VA, VRAM).is_none(),
+                "the HUB fault buffer"
+            );
+            assert_eq!(shim::ALLOC_CALLS.load(Ordering::SeqCst), 12);
+            assert_eq!(shim::DEALLOC_CALLS.load(Ordering::SeqCst), 11);
+            assert_eq!(shim::DEALLOC_PAGES.load(Ordering::SeqCst), 10 + 8);
+        });
+        shim::alone_with_the_allocator(|| {
+            shim::FAIL_ALLOC_AFTER.store(0, Ordering::SeqCst);
+            assert!(GpuBringup::build(VA, VRAM).is_none(), "the root table");
+            assert_eq!(shim::DEALLOC_CALLS.load(Ordering::SeqCst), 0);
+        });
+    }
+}

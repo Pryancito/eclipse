@@ -696,7 +696,14 @@ pub(super) struct FakeRm {
     pub step17_builds: u32,
     /// How many times `ctx0_reset` found a channel to tear down.
     pub ctx0_resets: u32,
+    /// Where the next mapping the RM is left to place (`requested_va == 0`)
+    /// goes: 2 MiB-aligned ranges handed out upward from `RM_PICKS_FROM`.
+    /// A test may set it to 0 for a mapping the RM "placed" at VA 0.
+    pub picked_va: u64,
 }
+
+/// The first VA the fake hands out when the caller lets the RM pick.
+pub(super) const RM_PICKS_FROM: u64 = 0x20_0000_0000;
 
 const EMPTY_RM: FakeRm = FakeRm {
     next: 0x100,
@@ -750,6 +757,7 @@ const EMPTY_RM: FakeRm = FakeRm {
     chan_built: false,
     step17_builds: 0,
     ctx0_resets: 0,
+    picked_va: RM_PICKS_FROM,
 };
 
 pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);
@@ -806,6 +814,16 @@ impl FakeRm {
             return [0, 0, 0, NV_ERR_BUSY_RETRY];
         }
         [0, 0, 0, 0]
+    }
+
+    /// Every push the ring of context `ctx` was handed, in order: its VA
+    /// and its length.
+    pub fn submits_of_ctx(&self, ctx: u32) -> Vec<(u64, u32)> {
+        self.submits
+            .iter()
+            .filter(|s| s.0 == ctx)
+            .map(|s| (s.1, s.2))
+            .collect()
     }
 
     pub fn maps_of_ctx(&self, ctx: u32) -> Vec<(u64, u64, u32)> {
@@ -1023,6 +1041,13 @@ extern "C" fn eclipse_rm_vm_bind_map(
 ) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("vm_bind_map");
+    // `requested_va == 0` leaves the placement to the RM (what a legacy
+    // `GEM_PUSHBUF` client's buffers get): the fake places it like one.
+    let va = if requested_va == 0 {
+        f.picked_va
+    } else {
+        requested_va
+    };
     let r = if f.gem(h_memory).is_none() {
         VmBind {
             virt_status: 0,
@@ -1030,7 +1055,7 @@ extern "C" fn eclipse_rm_vm_bind_map(
             h_virt: 0,
             actual_va: 0,
         }
-    } else if f.refuse_map || f.va_taken(ctx_idx, requested_va, size) {
+    } else if f.refuse_map || f.va_taken(ctx_idx, va, size) {
         VmBind {
             virt_status: RM_VA_TAKEN,
             map_status: RM_VA_TAKEN,
@@ -1038,21 +1063,17 @@ extern "C" fn eclipse_rm_vm_bind_map(
             actual_va: 0,
         }
     } else {
+        if requested_va == 0 {
+            f.picked_va = va.wrapping_add((size + 0x1f_ffff) & !0x1f_ffff);
+        }
         let h_virt = f.fresh();
-        f.maps.push((
-            h_virt,
-            ctx_idx,
-            h_memory,
-            requested_va,
-            size,
-            bo_offset,
-            pte_kind,
-        ));
+        f.maps
+            .push((h_virt, ctx_idx, h_memory, va, size, bo_offset, pte_kind));
         VmBind {
             virt_status: 0,
             map_status: 0,
             h_virt,
-            actual_va: requested_va,
+            actual_va: va,
         }
     };
     unsafe { *out = r };
