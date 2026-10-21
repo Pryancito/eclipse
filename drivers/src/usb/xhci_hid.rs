@@ -7696,6 +7696,12 @@ mod enum_tests;
 #[cfg(test)]
 mod hub_tree_tests;
 
+/// Las transferencias de interrupción: los informes de un ratón y el mapa de
+/// bits de cambios de un hub, que es lo que llega por los endpoints que no
+/// son EP0.
+#[cfg(test)]
+mod int_tests;
+
 /// La tabla de la página HID del teclado y el delta entre dos informes, que
 /// es el camino que `tests` no toca: ahí todo es ratón.
 #[cfg(test)]

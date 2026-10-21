@@ -32,10 +32,14 @@ fn with_hub() -> (Hw, XhciInner) {
 fn un_hub_se_configura_como_hub_y_enciende_sus_puertos() {
     let (hw, mut x) = with_hub();
 
-    x.setup_device(DevTopo::root(1), HS).expect("el hub enumera");
+    x.setup_device(DevTopo::root(1), HS)
+        .expect("el hub enumera");
 
     assert_eq!(x.hubs.len(), 1, "el hub no se ha apuntado");
-    assert_eq!(x.hubs[0].ports, 4, "los puertos salen del descriptor de hub");
+    assert_eq!(
+        x.hubs[0].ports, 4,
+        "los puertos salen del descriptor de hub"
+    );
     assert_eq!(x.hubs[0].slot, 1);
 
     let reqs = hw.requests(1);
@@ -71,7 +75,8 @@ fn un_raton_detras_de_un_hub_se_enumera_con_su_route_string() {
     let (hw, mut x) = with_hub();
     hw.plug_behind(1, 2, HS, FakeDev::mouse());
 
-    x.setup_device(DevTopo::root(1), HS).expect("el hub enumera");
+    x.setup_device(DevTopo::root(1), HS)
+        .expect("el hub enumera");
 
     assert_eq!(x.devs.len(), 2, "el hub y el ratón son dos dispositivos");
     let hijo = x
@@ -107,7 +112,8 @@ fn un_dispositivo_lento_detras_de_un_hub_lleva_su_traductor() {
     let (hw, mut x) = with_hub();
     hw.plug_behind(1, 3, FS, FakeDev::mouse());
 
-    x.setup_device(DevTopo::root(1), HS).expect("el hub enumera");
+    x.setup_device(DevTopo::root(1), HS)
+        .expect("el hub enumera");
 
     let hijo = x
         .devs
@@ -130,7 +136,8 @@ fn los_cambios_de_un_puerto_quedan_reconocidos() {
     let (hw, mut x) = with_hub();
     hw.plug_behind(1, 2, HS, FakeDev::mouse());
 
-    x.setup_device(DevTopo::root(1), HS).expect("el hub enumera");
+    x.setup_device(DevTopo::root(1), HS)
+        .expect("el hub enumera");
 
     for p in 1..=4 {
         assert_eq!(
@@ -153,7 +160,8 @@ fn un_puerto_de_hub_que_no_se_habilita_no_enumera() {
     hw.plug(1, HS, FakeDev::hub(2).with_dead_ports());
     hw.plug_behind(1, 1, HS, FakeDev::mouse());
 
-    x.setup_device(DevTopo::root(1), HS).expect("el hub enumera");
+    x.setup_device(DevTopo::root(1), HS)
+        .expect("el hub enumera");
 
     assert_eq!(x.hubs.len(), 1, "el hub sí tiene que quedarse");
     assert_eq!(
@@ -168,7 +176,8 @@ fn un_puerto_de_hub_que_no_se_habilita_no_enumera() {
 fn un_hub_vacio_no_enumera_nada_detras() {
     let (hw, mut x) = with_hub();
 
-    x.setup_device(DevTopo::root(1), HS).expect("el hub enumera");
+    x.setup_device(DevTopo::root(1), HS)
+        .expect("el hub enumera");
 
     assert_eq!(x.devs.len(), 1, "sólo está el hub");
     assert!(
@@ -203,7 +212,8 @@ fn un_hub_que_no_dice_puertos_no_se_configura() {
 #[test]
 fn un_raton_enchufado_despues_lo_coge_el_barrido() {
     let (hw, mut x) = with_hub();
-    x.setup_device(DevTopo::root(1), HS).expect("el hub enumera");
+    x.setup_device(DevTopo::root(1), HS)
+        .expect("el hub enumera");
     assert_eq!(x.devs.len(), 1, "el hub empieza vacío");
 
     hw.plug_behind(1, 4, HS, FakeDev::mouse());
@@ -227,7 +237,8 @@ fn un_raton_enchufado_despues_lo_coge_el_barrido() {
 fn un_raton_que_se_va_libera_su_slot() {
     let (hw, mut x) = with_hub();
     hw.plug_behind(1, 2, HS, FakeDev::mouse());
-    x.setup_device(DevTopo::root(1), HS).expect("el hub enumera");
+    x.setup_device(DevTopo::root(1), HS)
+        .expect("el hub enumera");
     let hijo = x
         .devs
         .iter()
@@ -239,12 +250,15 @@ fn un_raton_que_se_va_libera_su_slot() {
     x.hubs[0].scan_due = true;
     x.scan_hubs_if_due();
 
-    assert_eq!(x.devs.len(), 1, "el ratón sigue en la lista: {:?}", x.devs.len());
+    assert_eq!(
+        x.devs.len(),
+        1,
+        "el ratón sigue en la lista: {:?}",
+        x.devs.len()
+    );
     assert!(x.hids.is_empty(), "ha quedado un endpoint HID armado");
     assert!(
-        hw.commands()
-            .iter()
-            .any(|c| c.ty == 10 && c.slot == hijo),
+        hw.commands().iter().any(|c| c.ty == 10 && c.slot == hijo),
         "el slot {} no se ha devuelto con Disable Slot: {:?}",
         hijo,
         hw.commands()
@@ -263,7 +277,8 @@ fn un_puerto_no_se_usa_mientras_su_reset_sigue_puesto() {
     hw.plug(1, HS, FakeDev::hub(2).with_slow_reset(2));
     hw.plug_behind(1, 1, HS, FakeDev::mouse());
 
-    x.setup_device(DevTopo::root(1), HS).expect("el hub enumera");
+    x.setup_device(DevTopo::root(1), HS)
+        .expect("el hub enumera");
 
     assert_eq!(
         x.devs.len(),

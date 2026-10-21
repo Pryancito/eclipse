@@ -84,7 +84,10 @@ fn un_raton_enchufado_se_enumera_entero() {
     // Y el endpoint de interrupción, que es lo que de verdad trae los
     // movimientos: EP1 IN es el DCI 3 (2*1 + dirección).
     assert_eq!(x.hids.len(), 1, "el endpoint HID no se ha armado");
-    assert_eq!(x.hids[0].ep_dci, 3, "DCI mal calculado desde bEndpointAddress");
+    assert_eq!(
+        x.hids[0].ep_dci, 3,
+        "DCI mal calculado desde bEndpointAddress"
+    );
     assert_eq!(x.hids[0].slot_id, 1);
     assert_eq!(x.hids[0].iface, 0);
     assert_ne!(x.hids[0].protocol, 0, "el ratón no se ha clasificado");
@@ -176,16 +179,8 @@ fn un_dispositivo_lento_lo_coge_el_reintento_del_puerto() {
         1,
         "el reintento no ha llegado a enumerar nada"
     );
-    let enables = hw
-        .commands()
-        .iter()
-        .filter(|c| c.ty == 9)
-        .count();
-    assert_eq!(
-        enables, 2,
-        "no se ha reintentado: {} Enable Slot",
-        enables
-    );
+    let enables = hw.commands().iter().filter(|c| c.ty == 9).count();
+    assert_eq!(enables, 2, "no se ha reintentado: {} Enable Slot", enables);
 }
 
 /// Un puerto vacío no toca nada: ni un comando, ni un slot.
@@ -377,7 +372,8 @@ fn un_puerto_que_no_entrena_no_se_enumera() {
     // Conectado, sí; con velocidad, no.
     hw.connect(1, 0);
 
-    x.try_port_hid(1).expect("un puerto que no entrena no es un error");
+    x.try_port_hid(1)
+        .expect("un puerto que no entrena no es un error");
 
     assert_eq!(
         hw.commands().len(),

@@ -64,6 +64,7 @@ const TRB_CC_STALL: u32 = 6;
 const TRB_CC_PARAM: u32 = 17;
 
 /// Tipos de TRB, ya desplazados a su campo.
+const TY_NORMAL: u32 = 1;
 const TY_SETUP: u32 = 2;
 const TY_DATA: u32 = 3;
 const TY_STATUS: u32 = 4;
@@ -168,6 +169,10 @@ pub(super) struct FakeDev {
     pub seen: Vec<Setup>,
     /// Si además es un hub, el estado de sus puertos.
     pub hub: Option<HubState>,
+    /// Lo que todavía tiene por entregar por los endpoints que no son EP0,
+    /// como `(dci, carga, código de terminación)`: el informe de un ratón o
+    /// el mapa de bits de cambios de un hub.
+    pub queued: Vec<(u8, Vec<u8>, u32)>,
 }
 
 impl FakeDev {
@@ -196,8 +201,8 @@ impl FakeDev {
         config[25..27].copy_from_slice(&rlen.to_le_bytes());
         Self {
             device: alloc::vec![
-                0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40, 0x6d, 0x04, 0x77, 0xc0, 0x00,
-                0x01, 0x01, 0x02, 0x03, 0x01,
+                0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40, 0x6d, 0x04, 0x77, 0xc0, 0x00, 0x01,
+                0x01, 0x02, 0x03, 0x01,
             ],
             config,
             report,
@@ -206,6 +211,48 @@ impl FakeDev {
             mute_first: 0,
             seen: Vec::new(),
             hub: None,
+            queued: Vec::new(),
+        }
+    }
+
+    /// Un teclado de protocolo de arranque: la otra mitad del camino HID, y
+    /// el único informe que no lleva longitud mínima, porque las teclas van
+    /// en un array y no en bytes con signo.
+    pub(super) fn keyboard() -> Self {
+        let report: Vec<u8> = alloc::vec![
+            0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00,
+            0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
+            0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x95, 0x05, 0x75, 0x01, 0x91, 0x02, 0x95, 0x01,
+            0x75, 0x03, 0x91, 0x01, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x15, 0x00, 0x25, 0x65,
+            0x75, 0x08, 0x95, 0x06, 0x81, 0x00, 0xC0,
+        ];
+        let rlen = report.len() as u16;
+        let mut config: Vec<u8> = alloc::vec![
+            // Configuration: un total que se arregla abajo, 1 interfaz.
+            0x09, 0x02, 0x00, 0x00, 0x01, 0x01, 0x00, 0xa0, 0x32,
+            // Interface 0: HID (3), subclase boot (1), protocolo teclado (1).
+            0x09, 0x04, 0x00, 0x00, 0x01, 0x03, 0x01, 0x01, 0x00,
+            // HID: un descriptor de informe, con su longitud.
+            0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x00, 0x00,
+            // Endpoint 1 IN, interrupción, 8 bytes cada 10 ms.
+            0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0a,
+        ];
+        let total = config.len() as u16;
+        config[2..4].copy_from_slice(&total.to_le_bytes());
+        config[25..27].copy_from_slice(&rlen.to_le_bytes());
+        Self {
+            device: alloc::vec![
+                0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40, 0x6d, 0x04, 0x2d, 0xc3, 0x00, 0x01,
+                0x01, 0x02, 0x03, 0x01,
+            ],
+            config,
+            report,
+            stall: Vec::new(),
+            mute: false,
+            mute_first: 0,
+            seen: Vec::new(),
+            hub: None,
+            queued: Vec::new(),
         }
     }
 
@@ -224,8 +271,8 @@ impl FakeDev {
         config[2..4].copy_from_slice(&total.to_le_bytes());
         Self {
             device: alloc::vec![
-                0x12, 0x01, 0x00, 0x02, 0x09, 0x00, 0x01, 0x40, 0x09, 0x1a, 0x01, 0x00, 0x00,
-                0x01, 0x00, 0x00, 0x00, 0x01,
+                0x12, 0x01, 0x00, 0x02, 0x09, 0x00, 0x01, 0x40, 0x09, 0x1a, 0x01, 0x00, 0x00, 0x01,
+                0x00, 0x00, 0x00, 0x01,
             ],
             config,
             report: Vec::new(),
@@ -240,6 +287,7 @@ impl FakeDev {
                 never_enables: false,
                 slow_reset: 0,
             }),
+            queued: Vec::new(),
         }
     }
 
@@ -464,6 +512,13 @@ struct Ep0 {
     cycle: bool,
 }
 
+/// El anillo de un endpoint que no es EP0, por donde salen los informes.
+#[derive(Clone, Copy)]
+struct EpIn {
+    deq: u64,
+    cycle: bool,
+}
+
 /// Un dispositivo y por dónde se llega a él.
 struct DevNode {
     /// Puerto del hub raíz (base 1).
@@ -530,6 +585,9 @@ struct Fake {
     /// El `Max Packet Size` de EP0 que llevaba cada Evaluate Context, en
     /// orden: es lo único que ese comando viene a cambiar.
     eval_mps: Vec<u32>,
+    /// Anillos de los endpoints que no son EP0, como `((slot, dci), estado)`.
+    /// Se descubren al primer timbre, leyendo el contexto de salida.
+    eps: Vec<((u8, u8), EpIn)>,
 }
 
 std::thread_local! {
@@ -627,6 +685,8 @@ pub(super) fn on_write(base: usize, off: usize, v: u32) {
                 run_command_ring(st);
             } else if dci == 1 {
                 run_ep0(st, slot);
+            } else {
+                run_ep_in(st, slot, dci);
             }
             return;
         }
@@ -888,11 +948,7 @@ fn ctx_size(st: &Fake) -> usize {
 /// route string? Sólo se mira el primer nivel, que es hasta donde llegan los
 /// tests.
 fn routes_through_a_hub(st: &Fake, port: u8, route: u32) -> bool {
-    let Some(parent) = st
-        .devs
-        .iter()
-        .position(|n| n.port == port && n.route == 0)
-    else {
+    let Some(parent) = st.devs.iter().position(|n| n.port == port && n.route == 0) else {
         return false;
     };
     // El slot del padre es aquel cuyo EP0 habla con ese dispositivo.
@@ -970,10 +1026,7 @@ fn run_ep0(st: &mut Fake, slot: u8) {
             break;
         };
         ep = after;
-        let answer = st
-            .devs
-            .get_mut(ep.node)
-            .and_then(|n| n.dev.answer(setup));
+        let answer = st.devs.get_mut(ep.node).and_then(|n| n.dev.answer(setup));
         let Some((data, cc)) = answer else {
             // Ni dispositivo ni respuesta: el driver se queda esperando su
             // plazo, que es lo que ve cuando el aparato no está.
@@ -994,6 +1047,90 @@ fn run_ep0(st: &mut Fake, slot: u8) {
     }
     if let Some(slot_ep0) = st.ep0.get_mut(slot as usize) {
         *slot_ep0 = Some(ep);
+    }
+}
+
+/// Consume el anillo de un endpoint IN que no es EP0: cada Normal TRB se
+/// llena con lo que el dispositivo tenga encolado para ese endpoint y se
+/// contesta con su Transfer Event.
+///
+/// El anillo no lo dice el test: sale del contexto de salida del endpoint
+/// (`TR Dequeue Pointer`, con el bit de ciclo del consumidor en el bit 0),
+/// que es de donde lo lee un controlador de verdad. Así, un mutante que
+/// publique el contexto mal deja el endpoint mudo.
+fn run_ep_in(st: &mut Fake, slot: u8, dci: u8) {
+    let Some(node) = st.ep0.get(slot as usize).copied().flatten().map(|e| e.node) else {
+        return;
+    };
+    let mut ep = match st.eps.iter().find(|(k, _)| *k == (slot, dci)) {
+        Some((_, e)) => *e,
+        None => {
+            let dev = device_context(st, slot);
+            if dev == 0 {
+                return;
+            }
+            let raw = peek64(dev + dci as usize * ctx_size(st) + 8);
+            if (raw & !0xfu64) == 0 {
+                return;
+            }
+            EpIn {
+                deq: raw & !0xf,
+                cycle: (raw & 1) != 0,
+            }
+        }
+    };
+    loop {
+        let addr = ep.deq as usize;
+        let ctrl = peek(addr + 12);
+        if (ctrl & 1) != ep.cycle as u32 {
+            break;
+        }
+        let ty = (ctrl >> 10) & 0x3f;
+        if ty == TY_LINK {
+            ep.deq = peek64(addr) & !0xf;
+            if (ctrl & 2) != 0 {
+                ep.cycle = !ep.cycle;
+            }
+            continue;
+        }
+        if ty != TY_NORMAL {
+            ep.deq += 16;
+            continue;
+        }
+        // Un endpoint IN armado sin nada que entregar se queda esperando, que
+        // es lo que hace el de un ratón quieto.
+        let Some(pos) = st
+            .devs
+            .get(node)
+            .and_then(|n| n.dev.queued.iter().position(|(d, _, _)| *d == dci))
+        else {
+            break;
+        };
+        let (_, payload, cc) = st.devs[node].dev.queued.remove(pos);
+        let buf = peek64(addr);
+        let len = (peek(addr + 8) & 0x1_ffff) as usize;
+        let n = if cc == TRB_CC_SUCCESS {
+            payload.len().min(len)
+        } else {
+            0
+        };
+        if n > 0 && buf != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(payload.as_ptr(), buf as *mut u8, n);
+            }
+        }
+        ep.deq += 16;
+        let residual = (len - n) as u32;
+        post_event(
+            st,
+            addr as u64,
+            (residual & 0x00ff_ffff) | (cc << 24),
+            TRB_EVT_TRANSFER | ((slot as u32) << 24) | ((dci as u32) << 16),
+        );
+    }
+    match st.eps.iter_mut().find(|(k, _)| *k == (slot, dci)) {
+        Some(e) => e.1 = ep,
+        None => st.eps.push(((slot, dci), ep)),
     }
 }
 
@@ -1074,6 +1211,7 @@ impl Hw {
                 devs: Vec::new(),
                 ep0: (0..=256).map(|_| None).collect(),
                 eval_mps: Vec::new(),
+                eps: Vec::new(),
             });
         });
         hw
@@ -1197,6 +1335,84 @@ impl Hw {
             st.devs.retain(|n| !(n.port == port && n.route == route));
             st.devs.push(DevNode { port, route, dev });
         });
+    }
+
+    /// Un informe que el aparato del puerto `port` entrega por el endpoint
+    /// `dci`, como lo hace un ratón que se mueve: se escribe en el TRB que el
+    /// driver dejó armado y se contesta con su Transfer Event.
+    pub(super) fn send_in(&self, port: u8, dci: u8, data: &[u8]) {
+        self.send_in_at(port, 0, dci, data);
+    }
+
+    /// Lo mismo, para un dispositivo que está detrás de un hub.
+    pub(super) fn send_in_at(&self, port: u8, route: u32, dci: u8, data: &[u8]) {
+        self.deliver(port, route, dci, data.to_vec(), TRB_CC_SUCCESS);
+    }
+
+    /// Una transferencia que falla en ese endpoint, con el código de
+    /// terminación que diga el test: un endpoint con halt contesta así.
+    pub(super) fn fail_in(&self, port: u8, dci: u8, cc: u32) {
+        self.deliver(port, 0, dci, Vec::new(), cc);
+    }
+
+    /// El mapa de bits de cambios que el hub del puerto `port` manda por su
+    /// endpoint de estado: el bit 0 es el hub y el bit `n` su puerto `n`,
+    /// exactamente los que tienen cambios sin reconocer.
+    pub(super) fn hub_notify(&self, port: u8, dci: u8) {
+        let bitmap = self.with(|st| {
+            let hub = st
+                .devs
+                .iter()
+                .find(|n| n.port == port && n.route == 0)
+                .and_then(|n| n.dev.hub.as_ref())?;
+            let mut map = alloc::vec![0u8; hub.ports.len() / 8 + 1];
+            for (i, p) in hub.ports.iter().enumerate() {
+                if p.change != 0 {
+                    let bit = i + 1;
+                    map[bit / 8] |= 1 << (bit % 8);
+                }
+            }
+            Some(map)
+        });
+        if let Some(bitmap) = bitmap {
+            self.deliver(port, 0, dci, bitmap, TRB_CC_SUCCESS);
+        }
+    }
+
+    /// Encola la carga y la entrega en el acto, que es el orden de verdad: el
+    /// dato llega del cable y el controlador llena el TRB que ya estaba
+    /// armado. Lo que no quepa en ningún TRB se queda a la espera del
+    /// siguiente timbre.
+    fn deliver(&self, port: u8, route: u32, dci: u8, data: Vec<u8>, cc: u32) {
+        self.with(|st| {
+            let Some(node) = st
+                .devs
+                .iter()
+                .position(|n| n.port == port && n.route == route)
+            else {
+                return;
+            };
+            st.devs[node].dev.queued.push((dci, data, cc));
+            let slot = st
+                .ep0
+                .iter()
+                .position(|e| e.is_some_and(|e| e.node == node));
+            if let Some(slot) = slot {
+                run_ep_in(st, slot as u8, dci);
+            }
+        });
+    }
+
+    /// Lo que un dispositivo no ha podido entregar todavía porque su endpoint
+    /// no tenía ningún TRB armado.
+    pub(super) fn undelivered(&self, port: u8) -> usize {
+        self.with(|st| {
+            st.devs
+                .iter()
+                .find(|n| n.port == port && n.route == 0)
+                .map(|n| n.dev.queued.len())
+                .unwrap_or_default()
+        })
     }
 
     /// Los tamaños de paquete de EP0 que llevaron los Evaluate Context.
