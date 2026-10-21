@@ -7696,6 +7696,11 @@ mod enum_tests;
 #[cfg(test)]
 mod hub_tree_tests;
 
+/// Un pendrive: el transporte Bulk-Only y las órdenes SCSI de encima, con un
+/// medio de verdad detrás para que una lectura y una escritura se noten.
+#[cfg(test)]
+mod msc_tests;
+
 /// Las transferencias de interrupción: los informes de un ratón y el mapa de
 /// bits de cambios de un hub, que es lo que llega por los endpoints que no
 /// son EP0.
