@@ -60,3 +60,115 @@ pub(super) fn ensure_read_once(device_instance: u32) {
     }
     comptags::set_caps(caps);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::rm_host_shims::{reset_fake_rm, FAKE_RM};
+    use super::*;
+    use nvidia_rm_sys::rm_init::RmComptagCaps;
+
+    fn rm_calls() -> usize {
+        FAKE_RM
+            .lock()
+            .calls
+            .iter()
+            .filter(|c| **c == "comptag_caps")
+            .count()
+    }
+
+    /// The hatch off, nothing cached and the one-shot fresh for the scope,
+    /// and the same again after it.
+    struct Fresh;
+    impl Fresh {
+        fn new() -> Self {
+            reset_fake_rm();
+            Fresh::clear();
+            Fresh
+        }
+        fn clear() {
+            comptags::set_enabled(false);
+            comptags::set_caps(None);
+            comptags::reset_caps_asked();
+        }
+    }
+    impl Drop for Fresh {
+        fn drop(&mut self) {
+            Fresh::clear();
+        }
+    }
+
+    #[test]
+    fn without_the_hatch_the_rm_is_never_asked_and_the_claim_stays_free() {
+        let _serialised = crate::test_globals::LOCK.lock();
+        let _fresh = Fresh::new();
+        ensure_read_once(0);
+        ensure_read_once(0);
+        assert_eq!(
+            rm_calls(),
+            0,
+            "a boot without nvidia.gem_comptags never enters the RM for this"
+        );
+        assert_eq!(comptags::caps(), None);
+        assert!(comptags::claim_caps_query(), "nothing was claimed");
+    }
+
+    #[test]
+    fn with_the_hatch_the_caps_are_read_once_and_cached_field_for_field() {
+        let _serialised = crate::test_globals::LOCK.lock();
+        let _fresh = Fresh::new();
+        comptags::set_enabled(true);
+        FAKE_RM.lock().comptag_caps = Some(RmComptagCaps {
+            one_to_one: 0,
+            one_to_four: 1,
+            raw_mode: 0,
+            compbit_backing_off: 1,
+            post_l2_off: 0,
+            scrub_on_free: 1,
+            vas_for_ce: 0,
+            compr_page_shift: 17,
+        });
+        ensure_read_once(0);
+        assert_eq!(rm_calls(), 1);
+        assert_eq!(
+            comptags::caps(),
+            Some(ComptagCaps {
+                one_to_one: false,
+                one_to_four: true,
+                raw_mode: false,
+                compbit_backing_off: true,
+                post_l2_off: false,
+                scrub_on_free: true,
+                vas_for_ce: false,
+                compr_page_shift: 17,
+            }),
+            "every flag crosses as a bool and the shift as itself"
+        );
+        // A game binds dozens of surfaces a second: the next bind does not
+        // take the RM lock for an answer that cannot change.
+        ensure_read_once(0);
+        assert_eq!(rm_calls(), 1, "asked once");
+        assert!(!comptags::claim_caps_query());
+    }
+
+    #[test]
+    fn a_failed_read_counts_as_asked_and_leaves_the_kinds_downgraded() {
+        let _serialised = crate::test_globals::LOCK.lock();
+        let _fresh = Fresh::new();
+        comptags::set_enabled(true);
+        comptags::set_caps(Some(ComptagCaps::default()));
+        FAKE_RM.lock().comptag_caps = None;
+        ensure_read_once(0);
+        assert_eq!(rm_calls(), 1);
+        assert_eq!(
+            comptags::caps(),
+            None,
+            "the failed answer replaces what was cached"
+        );
+        ensure_read_once(0);
+        assert_eq!(
+            rm_calls(),
+            1,
+            "with no GPU every bind would otherwise re-enter the RM to be told so again"
+        );
+    }
+}
