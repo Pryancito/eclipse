@@ -865,6 +865,171 @@ fn un_pch_no_prueba_la_eeprom_que_no_tiene() {
 }
 
 // ---------------------------------------------------------------------------
+// La NVM por flash de los PCH
+// ---------------------------------------------------------------------------
+
+/// Un I219 sin RAL/RAH y con la flash sembrada: banco 0 valido y el MAC en sus
+/// tres primeras palabras.
+fn con_flash(mac: [u8; 6]) -> (Hw, E1000eHw) {
+    let (hw, dev) = tarjeta(I219_SPT);
+    hw.poke(E1000E_STRAP, 0);
+    hw.set_flash_bank_sig(0, true);
+    hw.set_flash(0, &mac);
+    (hw, dev)
+}
+
+#[test]
+fn el_mac_sale_de_la_flash_del_pch() {
+    let (_hw, mut dev) = con_flash([0x68, 0x05, 0xCA, 0x11, 0x22, 0x33]);
+    dev.mac = [0; 6];
+    unsafe { dev.read_mac_from_hw() };
+    assert_eq!(dev.mac, [0x68, 0x05, 0xCA, 0x11, 0x22, 0x33]);
+}
+
+#[test]
+fn el_ciclo_de_flash_pide_cuatro_bytes_y_una_lectura() {
+    let (hw, mut dev) = con_flash([0x68, 0x05, 0xCA, 0x11, 0x22, 0x33]);
+    unsafe { dev.read_mac_from_hw() };
+    let ciclos = hw.flash_cycles();
+    assert!(!ciclos.is_empty(), "no pidio ningun ciclo de flash");
+    for c in &ciclos {
+        assert_eq!(
+            (c >> 8) & 3,
+            3,
+            "el ciclo no pide los cuatro bytes del dword: {c:#06x}"
+        );
+        assert_eq!(
+            (c >> 1) & 3,
+            0,
+            "el ciclo no es de lectura: {c:#06x}, y un ciclo de escritura en la NVM se queda grabado"
+        );
+    }
+}
+
+#[test]
+fn el_banco_activo_se_elige_por_su_firma() {
+    let (hw, mut dev) = tarjeta(I219_SPT);
+    // STRAP a cero: 4 KiB de NVM, 1024 palabras por banco, o sea que el banco
+    // 1 empieza en el byte 0x800.
+    hw.poke(E1000E_STRAP, 0);
+    hw.set_flash_bank_sig(0, false);
+    hw.set_flash_bank_sig(0x800, true);
+    hw.set_flash(0, &[0xAA; 6]);
+    hw.set_flash(0x800, &[0x68, 0x05, 0xCA, 0x44, 0x55, 0x66]);
+    dev.mac = [0; 6];
+    unsafe { dev.read_mac_from_hw() };
+    assert_eq!(
+        dev.mac,
+        [0x68, 0x05, 0xCA, 0x44, 0x55, 0x66],
+        "leyo el banco que su firma dice que no es el activo"
+    );
+}
+
+#[test]
+fn sin_ninguna_firma_valida_se_lee_el_banco_cero() {
+    let (hw, mut dev) = tarjeta(I219_SPT);
+    hw.poke(E1000E_STRAP, 0);
+    hw.set_flash_bank_sig(0, false);
+    hw.set_flash_bank_sig(0x800, false);
+    hw.set_flash(0, &[0x68, 0x05, 0xCA, 0x77, 0x88, 0x99]);
+    dev.mac = [0; 6];
+    unsafe { dev.read_mac_from_hw() };
+    assert_eq!(dev.mac, [0x68, 0x05, 0xCA, 0x77, 0x88, 0x99]);
+}
+
+#[test]
+fn con_los_dos_bancos_validos_manda_el_cero() {
+    let (hw, mut dev) = tarjeta(I219_SPT);
+    hw.poke(E1000E_STRAP, 0);
+    hw.set_flash_bank_sig(0, true);
+    hw.set_flash_bank_sig(0x800, true);
+    hw.set_flash(0, &[0x68, 0x05, 0xCA, 0x11, 0x22, 0x33]);
+    hw.set_flash(0x800, &[0x68, 0x05, 0xCA, 0x44, 0x55, 0x66]);
+    dev.mac = [0; 6];
+    unsafe { dev.read_mac_from_hw() };
+    // Los dos bancos tienen firma buena: el primero que la tiene es el activo,
+    // y con los dos escritos la firma es lo unico que los distingue.
+    assert_eq!(dev.mac, [0x68, 0x05, 0xCA, 0x11, 0x22, 0x33]);
+}
+
+#[test]
+fn una_firma_que_quedo_de_otro_ciclo_no_bloquea_la_lectura() {
+    let (hw, mut dev) = con_flash([0x68, 0x05, 0xCA, 0x11, 0x22, 0x33]);
+    // La firmware leyo la NVM antes de nosotros y dejo sus bits de resultado
+    // puestos: si no se limpian, el primer ciclo nuestro parece fallado.
+    hw.set_flash_stale_status(HSFSTS_FLCERR | HSFSTS_DAEL);
+    dev.mac = [0; 6];
+    unsafe { dev.read_mac_from_hw() };
+    assert_eq!(
+        dev.mac,
+        [0x68, 0x05, 0xCA, 0x11, 0x22, 0x33],
+        "los bits de resultado del ciclo anterior se quedaron sin limpiar"
+    );
+}
+
+#[test]
+fn un_descriptor_de_flash_invalido_no_da_ningun_ciclo() {
+    let (hw, mut dev) = con_flash([0x68, 0x05, 0xCA, 0x11, 0x22, 0x33]);
+    hw.faults(|f| f.flash_desc_invalid = true);
+    dev.mac = [0; 6];
+    unsafe { dev.read_mac_from_hw() };
+    assert!(
+        hw.flash_cycles().is_empty(),
+        "arranco un ciclo sin descriptor"
+    );
+    assert_eq!(dev.mac, [0; 6], "se invento un MAC");
+}
+
+#[test]
+fn un_ciclo_de_flash_con_error_no_devuelve_datos() {
+    let (hw, mut dev) = con_flash([0x68, 0x05, 0xCA, 0x11, 0x22, 0x33]);
+    hw.faults(|f| f.flash_err = true);
+    dev.mac = [0; 6];
+    unsafe { dev.read_mac_from_hw() };
+    // `FDATA0` trae datos plausibles: el hardware no lo limpia al fallar, y
+    // creerselos es leer el MAC de la vuelta anterior.
+    assert_eq!(dev.mac, [0; 6], "se creyo un ciclo que acabo en error");
+}
+
+#[test]
+fn un_ciclo_que_nunca_arranca_no_cuelga_la_lectura() {
+    let (hw, mut dev) = con_flash([0x68, 0x05, 0xCA, 0x11, 0x22, 0x33]);
+    // FLCINPROG pegado: hay un ciclo en curso que no es nuestro y no acaba.
+    hw.faults(|f| f.flash_in_progress = true);
+    dev.mac = [0; 6];
+    unsafe { dev.read_mac_from_hw() };
+    assert!(hw.flash_cycles().is_empty());
+    assert_eq!(dev.mac, [0; 6]);
+}
+
+#[test]
+fn un_mac_de_flash_sin_grabar_no_se_toma_por_un_mac() {
+    let (hw, mut dev) = tarjeta(I219_SPT);
+    hw.poke(E1000E_STRAP, 0);
+    hw.set_flash_bank_sig(0, true);
+    // La flora del falso es 0xFF: una NVM sin grabar.
+    assert!(
+        !unsafe { dev.read_mac_from_ich_flash() },
+        "dio por bueno un MAC a todo unos"
+    );
+}
+
+#[test]
+fn un_pch_anterior_a_sunrise_point_no_mira_su_flash() {
+    let (hw, mut dev) = tarjeta(I217);
+    hw.poke(E1000E_STRAP, 0);
+    hw.set_flash_bank_sig(0, true);
+    hw.set_flash(0, &[0x68, 0x05, 0xCA, 0x11, 0x22, 0x33]);
+    // Antes de SPT la flash vive en BAR1, que este driver no mapea: leerla en
+    // BAR0 es leer otro registro cualquiera.
+    assert!(!unsafe { dev.read_mac_from_ich_flash() });
+    assert!(
+        hw.flash_cycles().is_empty(),
+        "leyo una ventana que no es la suya"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Los anillos
 // ---------------------------------------------------------------------------
 

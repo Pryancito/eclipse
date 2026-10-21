@@ -2003,6 +2003,10 @@ impl E1000eHw {
     #[inline]
     unsafe fn flash_write32(&self, off: usize, val: u32) {
         write_volatile((self.base + E1000E_FLASH_BASE_OFF + off) as *mut u32, val);
+        // Same seam as `mmio_write`, for the window the flash controller lives
+        // in: a cycle nobody completes is a read that never returns.
+        #[cfg(test)]
+        e1000e_fake::on_write(self.base, E1000E_FLASH_BASE_OFF + off, val);
     }
 
     /// SPT-style flash cycle init (HSFSTS via dword at offset 0x4).

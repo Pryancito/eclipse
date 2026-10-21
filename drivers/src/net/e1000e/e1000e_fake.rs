@@ -44,6 +44,12 @@ pub(super) struct Faults {
     pub(super) queue_enable_stuck: bool,
     /// La EEPROM no contesta a `EERD` con ningun bit de DONE.
     pub(super) eerd_dead: bool,
+    /// El descriptor de la flash no es valido: `HSFSTS.FLDESVALID` a cero.
+    pub(super) flash_desc_invalid: bool,
+    /// Cada ciclo de flash acaba con `HSFSTS.FLCERR`.
+    pub(super) flash_err: bool,
+    /// Hay un ciclo de flash en curso que no termina nunca.
+    pub(super) flash_in_progress: bool,
 }
 
 struct State {
@@ -57,6 +63,15 @@ struct State {
     phy: BTreeMap<(u8, u32, u32), u16>,
     /// Lo ultimo que se escribio en `PHY_PAGE_SELECT`.
     page: u32,
+    /// La mitad baja de `HSFSTS` (el estado) y la alta (`HSFCTL`), aparte: el
+    /// driver escribe una sin la otra, y en memoria eso borraria la que no
+    /// toca.
+    flash_status: u16,
+    flash_ctl: u16,
+    /// El contenido de la flash, byte a byte.
+    flash: Vec<u8>,
+    /// Los `HSFCTL` con los que se ha pedido un ciclo.
+    flash_cycles: Vec<u16>,
     /// Registros Kumeran por offset.
     kmrn: BTreeMap<u32, u16>,
     /// Palabras de la EEPROM, indexadas por offset.
@@ -101,7 +116,12 @@ impl Hw {
             phy_writes: Vec::new(),
             swflag_takes: 0,
             lanphypc_forced: false,
+            flash_status: HSFSTS_FLDESVALID,
+            flash_ctl: 0,
+            flash: vec![0xFF; 0x1_0000],
+            flash_cycles: Vec::new(),
         };
+        st.regs[(E1000E_FLASH_BASE_OFF + ICH_FLASH_HSFSTS) / 4] = HSFSTS_FLDESVALID as u32;
         st.regs[E1000E_STATUS] = STATUS_LU | STATUS_FD | (2 << STATUS_SPEED_SHIFT);
         FAKE.with(|f| *f.borrow_mut() = Some(st));
         Self { base }
@@ -117,7 +137,12 @@ impl Hw {
 
     /// Cambia las averias del MAC falso.
     pub(super) fn faults(&self, body: impl FnOnce(&mut Faults)) {
-        self.with(|st| body(&mut st.faults));
+        self.with(|st| {
+            body(&mut st.faults);
+            // Las de la flash se ven en un registro que el driver lee ANTES de
+            // escribir nada, asi que hay que publicarlas ya.
+            st.publish_flash();
+        });
     }
 
     pub(super) fn poke(&self, reg: usize, val: u32) {
@@ -187,6 +212,32 @@ impl Hw {
         });
     }
 
+    /// Pone `bytes` en la flash a partir del byte `off`.
+    pub(super) fn set_flash(&self, off: usize, bytes: &[u8]) {
+        self.with(|st| st.flash[off..off + bytes.len()].copy_from_slice(bytes));
+    }
+
+    /// Pone la firma que marca un banco como valido (`(sig & 0xC0) == 0x80`),
+    /// o una que no lo marca. La firma es el byte alto del dword que hay en el
+    /// offset de palabra 0x13 del banco.
+    pub(super) fn set_flash_bank_sig(&self, bank_bytes: usize, valida: bool) {
+        let sig: u8 = if valida { 0x80 } else { 0xC0 };
+        self.set_flash(bank_bytes + (0x13 << 1) + 1, &[sig]);
+    }
+
+    /// Deja puestos en `HSFSTS` los bits de resultado de otro, como los deja
+    /// una firmware que leyo la NVM antes del arranque.
+    pub(super) fn set_flash_stale_status(&self, bits: u16) {
+        self.with(|st| {
+            st.flash_status |= bits;
+            st.publish_flash();
+        });
+    }
+
+    pub(super) fn flash_cycles(&self) -> Vec<u16> {
+        self.with(|st| st.flash_cycles.clone())
+    }
+
     pub(super) fn swflag_takes(&self) -> u32 {
         self.with(|st| st.swflag_takes)
     }
@@ -207,6 +258,10 @@ pub(super) fn on_write(base: usize, off: usize, val: u32) {
         if st.base != base {
             // La ventana de otro test (los anillos tienen la suya, sin falso
             // detras): ni mirarla.
+            return;
+        }
+        if off >= E1000E_FLASH_BASE_OFF {
+            st.react_flash(off - E1000E_FLASH_BASE_OFF, val);
             return;
         }
         st.react(off / 4, val);
@@ -337,6 +392,58 @@ impl State {
                 self.regs[E1000E_CTRL_EXT] |= CTRL_EXT_LPCD;
             }
         }
+    }
+
+    /// La ventana del controlador de flash. `HSFSTS` y `HSFCTL` comparten un
+    /// dword y el driver escribe uno sin el otro, asi que el falso los guarda
+    /// por separado y publica el dword entero.
+    fn react_flash(&mut self, off: usize, val: u32) {
+        if off != ICH_FLASH_HSFSTS {
+            return;
+        }
+        let lo = (val & 0xFFFF) as u16;
+        let hi = (val >> 16) as u16;
+        if lo != 0 {
+            // Los bits de resultado son de limpiar-escribiendo-uno.
+            self.flash_status &= !(lo & (HSFSTS_FLCERR | HSFSTS_DAEL | HSFSTS_FLCDONE));
+        }
+        if hi != 0 {
+            self.flash_ctl = hi;
+            if hi & 1 != 0 {
+                self.flash_cycles.push(hi);
+                self.run_flash_cycle();
+            }
+        }
+        self.publish_flash();
+    }
+
+    fn run_flash_cycle(&mut self) {
+        let faddr = (self.regs[(E1000E_FLASH_BASE_OFF + ICH_FLASH_FADDR) / 4]
+            & ICH_FLASH_LINEAR_ADDR_MASK) as usize;
+        let mut d = [0u8; 4];
+        for (i, b) in d.iter_mut().enumerate() {
+            *b = self.flash.get(faddr + i).copied().unwrap_or(0xFF);
+        }
+        // Los datos se publican tambien cuando el ciclo acaba en error: el
+        // hardware no limpia `FDATA0`, asi que ahi se queda lo de la vuelta
+        // anterior, y un driver que no mirara `FLCERR` se lo creeria.
+        self.regs[(E1000E_FLASH_BASE_OFF + ICH_FLASH_FDATA0) / 4] = u32::from_le_bytes(d);
+        self.flash_status |= HSFSTS_FLCDONE;
+        if self.faults.flash_err {
+            self.flash_status |= HSFSTS_FLCERR;
+        }
+    }
+
+    fn publish_flash(&mut self) {
+        let mut st = self.flash_status;
+        if self.faults.flash_desc_invalid {
+            st &= !HSFSTS_FLDESVALID;
+        }
+        if self.faults.flash_in_progress {
+            st |= HSFSTS_FLCINPROG;
+        }
+        self.regs[(E1000E_FLASH_BASE_OFF + ICH_FLASH_HSFSTS) / 4] =
+            ((self.flash_ctl as u32) << 16) | st as u32;
     }
 
     fn h2me(&mut self, val: u32) {
