@@ -492,12 +492,31 @@ cfg_if! {
             HEAP_REENTRANCY_EVENTS.load(core::sync::atomic::Ordering::Relaxed)
         }
 
-        /// Both consoles: on a box with only a monitor, a serial-only report
-        /// is invisible exactly when it is needed. `graphic_console_write_fmt_spin`
-        /// is best-effort try_lock, so it cannot deadlock this path.
+        /// The SERIAL LINE ONLY, on purpose.
+        ///
+        /// These reports used to go to both consoles, on the reasoning that a
+        /// box with only a monitor cannot read a serial-only report. What
+        /// that gets you in practice is a screen full of `[heap-wild]`: the
+        /// refusals fire once per free, so a fault in a write path prints
+        /// them by the hundred and the desktop becomes unusable before
+        /// anything has crashed. And each one is drawn straight onto the
+        /// framebuffer, so it also paints over whatever was there -- the
+        /// photographed OOM of 2026-10-21 had two of these where its heap
+        /// attribution should have been.
+        ///
+        /// Nothing is lost for the diagnosis. Every one of these reports is
+        /// COUNTED, and the counts reach the screen where they matter:
+        /// `/proc/kheap` prints the registered regions and the wild blocks
+        /// refused with their bytes, and the OOM report prints the same
+        /// totals next to the attribution. The call chains, which are what
+        /// needs a console that scrolls, stay on the serial line.
+        ///
+        /// The panic path is deliberately NOT changed: a panic report, a
+        /// stack-guard halt and a stack-uaf halt still reach the monitor,
+        /// because a machine that stops dead with a black screen reads as a
+        /// freeze.
         fn emit(args: core::fmt::Arguments<'_>) {
             kernel_hal::console::serial_write_fmt_spin(args);
-            kernel_hal::console::graphic_console_write_fmt_spin(args);
         }
 
         /// `[heap-grow]` / `[heap-reentrant]` banners. The elastic growth and

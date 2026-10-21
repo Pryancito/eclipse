@@ -175,7 +175,7 @@ fn alloc_error(layout: Layout) -> ! {
     if reentrancy > 0 {
         emit(format_args!(
             "heap re-entrancy guard has refused {} allocation(s) — if this OOM is one of \
-             them the heap is not out of memory; see [heap-reentrant] above\n",
+             them the heap is not out of memory; see [heap-reentrant] on the serial line\n",
             reentrancy,
         ));
     }
@@ -188,7 +188,7 @@ fn alloc_error(layout: Layout) -> ! {
     if wild > 0 {
         emit(format_args!(
             "heap has refused and LEAKED {} wild block(s), {} KiB in all -- something freed \
-             memory the heap never handed out; see [heap-wild] above for the call chain\n",
+             memory the heap never handed out; the call chains are on the serial line\n",
             wild,
             crate::memory::heap_wild_bytes() >> 10,
         ));
@@ -200,7 +200,7 @@ fn alloc_error(layout: Layout) -> ! {
     if uaf > 0 {
         emit(format_args!(
             "heap has caught {} free block(s) written after their free, or freed twice, \
-             and leaked them with their lists; see [heap-uaf] above\n",
+             and leaked them with their lists; see [heap-uaf] on the serial line\n",
             uaf,
         ));
     }
