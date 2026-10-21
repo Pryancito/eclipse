@@ -1300,16 +1300,26 @@ impl APage {
 /// at all: one `int32` in a `memfd` that two processes map, waited on by the
 /// X client and woken by the X server, neither side carrying the private
 /// flag.
-fn a_shared_word_in(proc: &Arc<Process>) -> usize {
-    assert_eq!(PAGE_SIZE, 4096, "the page this test leaks is 4 KiB");
+fn a_shared_object() -> Arc<VmObject> {
+    assert_eq!(PAGE_SIZE, 4096, "the pages these tests leak are 4 KiB");
     let vmo = VmObject::new_paged(1);
     vmo.set_share_on_fork();
     vmo.commit(0, PAGE_SIZE).unwrap();
+    vmo
+}
+
+/// `vmo` mapped read-write into `proc`, and the user address of the word at
+/// the start of it.
+///
+/// Each call leaks its own page, so two processes handed the same object
+/// name its word at two DIFFERENT addresses, which is the case the shared
+/// table exists for.
+fn mapped_into(proc: &Arc<Process>, vmo: &Arc<VmObject>) -> usize {
     let user = Box::leak(Box::new(APage([0; 4096]))).at();
     let vmar = proc.vmar();
     vmar.map_at(
         user - vmar.addr(),
-        vmo,
+        vmo.clone(),
         0,
         PAGE_SIZE,
         MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
@@ -1340,7 +1350,7 @@ fn a_shared_word_in(proc: &Arc<Process>) -> usize {
 #[test]
 fn a_word_in_a_shared_mapping_is_a_different_queue_from_the_private_one() {
     let proc = a_process(47_273, "futex-shared");
-    let addr = a_shared_word_in(&proc);
+    let addr = mapped_into(&proc, &a_shared_object());
     let waiting = a_waiter(&proc, addr, FUTEX_WAIT, Some(Duration::from_secs(10)));
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
@@ -1367,5 +1377,60 @@ fn a_word_in_a_shared_mapping_is_a_different_queue_from_the_private_one() {
         waiting.join().unwrap(),
         Ok(0),
         "the waiter on the shared word"
+    );
+}
+
+/// Two processes mapping one object at two different addresses wait and
+/// wake on ONE queue, and the per-process table cannot serve them.
+///
+/// This is the case the shared table exists for, and the one no single
+/// process can show: the per-process table keys by the caller's own virtual
+/// address inside its own process, so two processes naming the same word
+/// get two queues and neither can ever reach the other. Here the two
+/// addresses are deliberately different, which is what a `memfd` mapped by
+/// an X client and the X server looks like, and the wake crosses from one
+/// process to the other only because the futex is keyed by the object and
+/// the offset instead.
+///
+/// The private flag cannot cross: a wake carrying it stays in the waker's
+/// own table, however long it keeps asking.
+#[test]
+fn a_wake_in_one_process_reaches_a_waiter_in_another_on_a_word_they_share() {
+    let word = a_shared_object();
+    let theirs = a_process(47_274, "futex-shared-waiter");
+    let ours = a_process(47_275, "futex-shared-waker");
+    let there = mapped_into(&theirs, &word);
+    let here = mapped_into(&ours, &word);
+    assert_ne!(
+        there, here,
+        "the two processes have to name the word at different addresses, or \
+         the per-process table would serve them by accident"
+    );
+    let waiting = a_waiter(&theirs, there, FUTEX_WAIT, Some(Duration::from_secs(10)));
+    on_a_thread(&ours, move |sys| {
+        Box::pin(async move {
+            // A second of wakes carrying the private flag: they stay in
+            // this process's own table and cross to nobody.
+            for _ in 0..100 {
+                assert_eq!(
+                    futex(sys, here, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0).await,
+                    Ok(0),
+                    "a private wake crossed into another process"
+                );
+                async_std::task::sleep(A_MOMENT).await;
+            }
+            // And one without it, which is keyed by the object and reaches
+            // the thread waiting in the other process.
+            assert_eq!(
+                a_wake_that_finds_somebody(sys, here, FUTEX_WAKE, 1).await,
+                Some(1),
+                "a shared wake did not cross to the waiter in the other process"
+            );
+        })
+    });
+    assert_eq!(
+        waiting.join().unwrap(),
+        Ok(0),
+        "the waiter in the other process"
     );
 }
