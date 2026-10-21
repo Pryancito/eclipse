@@ -381,6 +381,10 @@ fn a_capget_pid_that_names_nobody_is_esrch_and_a_negative_one_never_gets_that_fa
                 hdr.version, LINUX_CAPABILITY_VERSION_3,
                 "the probe did not learn the version"
             );
+            // And the pid it sent is still there: the write-back replaces
+            // the version and nothing else, so a probe made with a pid in
+            // the header does not have it taken away.
+            assert_eq!(hdr.pid, -1, "the write-back cleared the pid");
 
             // Its own process id names itself, exactly like 0 does.
             let mine = sys.zircon_process().id() as i32;
