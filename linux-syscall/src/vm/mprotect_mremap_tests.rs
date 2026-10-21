@@ -242,3 +242,92 @@ fn an_mremap_that_grows_past_the_as_rlimit_is_enomem() {
 fn proc_of(sys: &Syscall<'_>) -> Arc<Process> {
     sys.zircon_process().clone()
 }
+
+/// Whether hunter's W^X tracker can still answer precisely for this pid.
+/// It fails CLOSED: a pid it has forgotten, or one whose interval list
+/// saturated, answers "ever writable" for every address. An address far
+/// past anything this test mapped is the probe -- if that comes back
+/// writable, the tracker is in its fail-closed state and nothing can be
+/// concluded from it, so the assertions that follow are skipped instead of
+/// failing for a reason that has nothing to do with the code under test.
+fn the_tracker_still_answers(pid: KoID, nowhere: usize) -> bool {
+    !hunter::wx::is_ever_writable(pid, nowhere, PAGE)
+}
+
+#[test]
+fn a_shrink_in_place_retires_the_tail_from_the_wx_history() {
+    // The pages that drop off the end have to leave hunter's
+    // ever-writable history with them. If they did not, the next mapping
+    // the allocator puts there would be refused an `mprotect(PROT_EXEC)`
+    // as a two-step W-then-X bypass, for writes that happened to a
+    // mapping that no longer exists.
+    let proc = a_process(48_906);
+    on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let pid = sys.zircon_process().id();
+            let at = anon(sys, 4).await.expect("four pages");
+            let nowhere = at + 1024 * PAGE;
+            assert!(
+                hunter::wx::is_ever_writable(pid, at, 4 * PAGE),
+                "a writable mapping goes into the history"
+            );
+            let precise = the_tracker_still_answers(pid, nowhere);
+
+            assert_eq!(
+                sys.sys_mremap(at, 4 * PAGE, 2 * PAGE, 0, 0),
+                Ok(at),
+                "a shrink stays where it was"
+            );
+            if precise {
+                assert!(
+                    !hunter::wx::is_ever_writable(pid, at + 2 * PAGE, 2 * PAGE),
+                    "the tail's writable history goes with the pages"
+                );
+                assert!(
+                    hunter::wx::is_ever_writable(pid, at, 2 * PAGE),
+                    "and the part that stays keeps its own"
+                );
+            }
+        })
+    });
+}
+
+#[test]
+fn a_grow_in_place_keeps_the_history_of_the_part_that_stays() {
+    // The other direction, and the one that matters for the bypass: a
+    // range that was writable once must still be known to have been
+    // writable after it is resized. Treating a resize in place as a move
+    // retires the old range's history and re-records only what the
+    // mapping's CURRENT flags say, so a program could mmap(RW), write
+    // code, mprotect(R), mremap to resize -- and arrive at
+    // mprotect(RX) with a clean record.
+    let proc = a_process(48_907);
+    on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let pid = sys.zircon_process().id();
+            let at = anon(sys, 2).await.expect("two pages");
+            let nowhere = at + 1024 * PAGE;
+            let precise = the_tracker_still_answers(pid, nowhere);
+
+            // Take the write bit away, which is what makes the two
+            // branches tell different stories: the resize reads the
+            // CURRENT flags, and they now say "not writable".
+            assert_eq!(sys.sys_mprotect(at, 2 * PAGE, 0x1), Ok(0));
+            assert_eq!(
+                sys.sys_mremap(at, 2 * PAGE, 4 * PAGE, MREMAP_MAYMOVE, 0),
+                Ok(at),
+                "a grow with room after it stays where it was"
+            );
+            if precise {
+                assert!(
+                    hunter::wx::is_ever_writable(pid, at, 2 * PAGE),
+                    "the range was writable once and the resize must not forget it"
+                );
+                assert!(
+                    !hunter::wx::is_ever_writable(pid, at + 2 * PAGE, 2 * PAGE),
+                    "and the pages the grow added were never writable"
+                );
+            }
+        })
+    });
+}
