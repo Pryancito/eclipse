@@ -1939,6 +1939,183 @@ mod tests {
         assert!(!is_fs_ioctl(0x5401), "TCGETS is not ours");
     }
 
+    /// The request numbers the test above does not reach, same derivation.
+    ///
+    /// That test grew with the dispatch arms it was written beside and stopped
+    /// at 29 of the 82 numbers this module carries. The other 53 are no less
+    /// a wire contract: every one of them is chosen by `btrfs-progs`,
+    /// `chattr`, `filefrag` or `fscryptctl` out of its own copy of these
+    /// headers, and nothing inside this kernel can notice a wrong one. Both
+    /// halves of a dispatch read the same constant and agree with each other
+    /// whatever it says; the request simply falls past its arm to the
+    /// `ENOTTY` at the end, which the caller reads as "this filesystem does
+    /// not do that". `btrfs subvolume snapshot` answering that is a backup
+    /// that never runs.
+    ///
+    /// So these are built the way `include/uapi/asm-generic/ioctl.h` builds
+    /// them, out of the magic letter and the command number written beside
+    /// each name in `linux/btrfs.h` and `linux/fs.h`, and can be read against
+    /// those headers line by line.
+    #[test]
+    fn the_rest_of_the_ioctl_numbers_are_the_ones_linux_uses() {
+        const fn ioc(dir: u32, ty: u32, nr: u32, size: u32) -> u32 {
+            dir << 30 | size << 16 | ty << 8 | nr
+        }
+        const NONE: u32 = 0;
+        const W: u32 = 1;
+        const R: u32 = 2;
+        assert_eq!(FS_IOC32_GETFLAGS, ioc(R, b'f' as u32, 1, 4));
+        assert_eq!(FS_IOC32_SETFLAGS, ioc(W, b'f' as u32, 2, 4));
+        assert_eq!(BTRFS_IOC_SNAP_CREATE, ioc(W, 0x94, 1, 4096));
+        assert_eq!(BTRFS_IOC_SYNC, ioc(NONE, 0x94, 8, 0));
+        assert_eq!(BTRFS_IOC_ADD_DEV, ioc(W, 0x94, 10, 4096));
+        assert_eq!(BTRFS_IOC_RM_DEV, ioc(W, 0x94, 11, 4096));
+        assert_eq!(BTRFS_IOC_SUBVOL_CREATE, ioc(W, 0x94, 14, 4096));
+        assert_eq!(BTRFS_IOC_SNAP_DESTROY, ioc(W, 0x94, 15, 4096));
+        assert_eq!(BTRFS_IOC_INO_LOOKUP, ioc(R | W, 0x94, 18, 4096));
+        assert_eq!(BTRFS_IOC_DEFAULT_SUBVOL, ioc(W, 0x94, 19, 8));
+        assert_eq!(BTRFS_IOC_WAIT_SYNC, ioc(W, 0x94, 22, 8));
+        assert_eq!(BTRFS_IOC_SUBVOL_GETFLAGS, ioc(R, 0x94, 25, 8));
+        assert_eq!(BTRFS_IOC_SUBVOL_SETFLAGS, ioc(W, 0x94, 26, 8));
+        assert_eq!(BTRFS_IOC_SCRUB_CANCEL, ioc(NONE, 0x94, 28, 0));
+        assert_eq!(BTRFS_IOC_SCRUB_PROGRESS, ioc(R | W, 0x94, 29, 1024));
+        assert_eq!(BTRFS_IOC_BALANCE_CTL, ioc(W, 0x94, 33, 4));
+        assert_eq!(BTRFS_IOC_BALANCE_PROGRESS, ioc(R, 0x94, 34, 1024));
+        assert_eq!(BTRFS_IOC_QUOTA_CTL, ioc(R | W, 0x94, 40, 16));
+        assert_eq!(BTRFS_IOC_QUOTA_RESCAN, ioc(W, 0x94, 44, 64));
+        assert_eq!(BTRFS_IOC_QUOTA_RESCAN_STATUS, ioc(R, 0x94, 45, 64));
+        assert_eq!(BTRFS_IOC_QUOTA_RESCAN_WAIT, ioc(NONE, 0x94, 46, 0));
+        assert_eq!(BTRFS_IOC_GET_FEATURES, ioc(R, 0x94, 57, 24));
+        assert_eq!(BTRFS_IOC_RM_DEV_V2, ioc(W, 0x94, 58, 4096));
+    }
+
+    /// The flag bits and status codes, which are wire numbers just the same.
+    ///
+    /// These are not request numbers, so a wrong one does not fall through to
+    /// `ENOTTY`: it is obeyed, as a different flag. `BTRFS_SUBVOL_RDONLY`
+    /// with the bit of `BTRFS_SUBVOL_QGROUP_INHERIT` makes
+    /// `btrfs subvolume snapshot -r` hand back a writable snapshot, and a
+    /// wrong `BTRFS_BLOCK_GROUP_RAID1` makes `btrfs filesystem usage` name
+    /// the wrong profile for the data it is about to rebalance.
+    ///
+    /// Written from `linux/btrfs.h`, `linux/btrfs_tree.h`, `linux/fs.h`,
+    /// `linux/fiemap.h`, `linux/fscrypt.h` and `linux/capability.h`, as plain
+    /// numbers rather than as the shifts the declarations use, so that the
+    /// two spellings have to agree.
+    #[test]
+    fn the_flag_bits_and_status_codes_are_the_ones_userspace_names() {
+        // Subvolume and device arguments.
+        assert_eq!(BTRFS_SUBVOL_RDONLY, 0x2);
+        assert_eq!(BTRFS_SUBVOL_QGROUP_INHERIT, 0x4);
+        assert_eq!(BTRFS_DEVICE_SPEC_BY_ID, 0x8);
+        assert_eq!(BTRFS_SUBVOL_SPEC_BY_ID, 0x10);
+        // What `BTRFS_IOC_FS_INFO` says it filled in.
+        assert_eq!(BTRFS_FS_INFO_FLAG_CSUM_INFO, 0x1);
+        assert_eq!(BTRFS_FS_INFO_FLAG_GENERATION, 0x2);
+        assert_eq!(BTRFS_FS_INFO_FLAG_METADATA_UUID, 0x4);
+        // Balance, defrag, quota and send.
+        assert_eq!(BTRFS_BALANCE_DATA, 0x1);
+        assert_eq!(BTRFS_BALANCE_SYSTEM, 0x2);
+        assert_eq!(BTRFS_BALANCE_METADATA, 0x4);
+        assert_eq!(BTRFS_BALANCE_RESUME, 0x10);
+        assert_eq!(BTRFS_BALANCE_ARGS_CONVERT, 0x100);
+        assert_eq!(BTRFS_DEFRAG_RANGE_COMPRESS, 0x1);
+        assert_eq!(BTRFS_DEFRAG_RANGE_START_IO, 0x2);
+        assert_eq!(BTRFS_QGROUP_LIMIT_MAX_RFER, 0x1);
+        assert_eq!(BTRFS_SEND_FLAG_VERSION, 0x8);
+        // The allocation profiles, which go out in `fs_info` and in the
+        // balance arguments.
+        assert_eq!(BTRFS_BLOCK_GROUP_RAID0, 0x8);
+        assert_eq!(BTRFS_BLOCK_GROUP_RAID1, 0x10);
+        assert_eq!(BTRFS_BLOCK_GROUP_DUP, 0x20);
+        assert_eq!(BTRFS_BLOCK_GROUP_RAID10, 0x40);
+        assert_eq!(BTRFS_BLOCK_GROUP_RAID5, 0x80);
+        assert_eq!(BTRFS_BLOCK_GROUP_RAID6, 0x100);
+        assert_eq!(BTRFS_BLOCK_GROUP_RAID1C3, 0x200);
+        assert_eq!(BTRFS_BLOCK_GROUP_RAID1C4, 0x400);
+        assert_eq!(BTRFS_AVAIL_ALLOC_BIT_SINGLE, 0x1_0000_0000_0000);
+        // `chattr` and `lsattr`, and the one `filefrag` sets.
+        assert_eq!(FS_IMMUTABLE_FL, 0x10);
+        assert_eq!(FS_APPEND_FL, 0x20);
+        assert_eq!(FIEMAP_FLAG_SYNC, 0x1);
+        // What `FIDEDUPERANGE` writes back per range.
+        assert_eq!(FILE_DEDUPE_RANGE_SAME, 0);
+        assert_eq!(FILE_DEDUPE_RANGE_DIFFERS, 1);
+        // `fscryptctl`: the policy version, the key specifier it uses, and
+        // the three status words a key query answers with.
+        assert_eq!(FSCRYPT_POLICY_V2, 2);
+        assert_eq!(FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER, 2);
+        assert_eq!(FSCRYPT_KEY_STATUS_ABSENT, 1);
+        assert_eq!(FSCRYPT_KEY_STATUS_PRESENT, 2);
+        assert_eq!(FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF, 1);
+        // The three capabilities these ioctls check, from `capability.h`.
+        assert_eq!(CAP_FOWNER, 3);
+        assert_eq!(CAP_LINUX_IMMUTABLE, 9);
+        assert_eq!(CAP_SYS_ADMIN, 21);
+    }
+
+    /// The guard that makes the list above have to grow.
+    ///
+    /// A list of `const`s is not an enum and not a `bitflags`, so a member
+    /// added without a line in the test above cannot be made to fail to
+    /// compile. What it can be made to do is fail here: Linux publishes the
+    /// or of each family as a mask of its own, and a new profile or balance
+    /// type changes the mask without changing the sum of what is named.
+    #[test]
+    fn no_profile_or_balance_type_is_missing_from_the_list_above() {
+        // BTRFS_BLOCK_GROUP_PROFILE_MASK, btrfs_tree.h.
+        assert_eq!(
+            BTRFS_BLOCK_GROUP_RAID0
+                | BTRFS_BLOCK_GROUP_RAID1
+                | BTRFS_BLOCK_GROUP_DUP
+                | BTRFS_BLOCK_GROUP_RAID10
+                | BTRFS_BLOCK_GROUP_RAID5
+                | BTRFS_BLOCK_GROUP_RAID6
+                | BTRFS_BLOCK_GROUP_RAID1C3
+                | BTRFS_BLOCK_GROUP_RAID1C4,
+            0x7f8,
+            "the profiles named here are not BTRFS_BLOCK_GROUP_PROFILE_MASK"
+        );
+        // BTRFS_EXTENDED_PROFILE_MASK: the above plus the single-copy bit.
+        assert_eq!(
+            0x7f8_u64 | BTRFS_AVAIL_ALLOC_BIT_SINGLE,
+            0x1_0000_0000_07f8,
+            "the extended profile mask is not what btrfs_tree.h lays out"
+        );
+        // BTRFS_BALANCE_TYPE_MASK, btrfs.h.
+        assert_eq!(
+            BTRFS_BALANCE_DATA | BTRFS_BALANCE_SYSTEM | BTRFS_BALANCE_METADATA,
+            0x7,
+            "the balance types named here are not BTRFS_BALANCE_TYPE_MASK"
+        );
+    }
+
+    /// The struct sizes these ioctls measure their buffers against.
+    ///
+    /// Each one is a `sizeof` in the header, and it is also baked into the
+    /// request number above as its 14-bit size field, so a wrong one here is
+    /// a short read or a buffer walked off the end rather than a flag obeyed
+    /// wrongly. They are spelled out from the layouts in `linux/fiemap.h` and
+    /// `linux/fscrypt.h`.
+    #[test]
+    fn the_struct_sizes_the_ioctls_measure_against_are_the_ones_linux_lays_out() {
+        // struct fiemap: two u64, four u32, then the extent array.
+        assert_eq!(FIEMAP_HEADER, 8 + 8 + 4 + 4 + 4 + 4);
+        // struct fiemap_extent: three u64, two reserved u64, a u32 of flags
+        // and three reserved u32.
+        assert_eq!(FIEMAP_EXTENT, 8 + 8 + 8 + 16 + 4 + 12);
+        // struct fscrypt_policy_v2: eight bytes of header and the 16-byte
+        // master key identifier.
+        assert_eq!(FSCRYPT_POLICY_V2_SIZE, 8 + 16);
+        // struct fscrypt_key_specifier: a u32 type, a u32 of padding and a
+        // 32-byte union.
+        assert_eq!(FSCRYPT_KEY_SPEC, 4 + 4 + 32);
+        // struct fscrypt_add_key_arg: that specifier, two u32 and eight
+        // reserved u32, with the raw key following it.
+        assert_eq!(FSCRYPT_ADD_KEY_ARG, 40 + 4 + 4 + 32);
+        assert_eq!(FSCRYPT_MAX_KEY_SIZE, 64);
+    }
+
     #[test]
     fn an_ioctl_this_module_does_not_know_is_enotty() {
         let disk = formatted(16 << 20);
