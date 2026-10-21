@@ -193,6 +193,10 @@ pub(super) struct DiskState {
     /// `READ CAPACITY(10)` contesta el último LBA saturado, que es como una
     /// unidad grande dice «pregúntame con la de 16».
     needs_16: bool,
+    /// `READ CAPACITY(10)` contesta un tamaño de bloque de cero, que es lo
+    /// que da una unidad con el medio a medio reconocer: la orden va bien y
+    /// lo que contesta no se puede usar.
+    bad_block_size: bool,
     /// El CSW lleva un tag que no es el del CBW.
     wrong_tag: bool,
     /// La fase de datos de una lectura entrega estos bytes de menos, con el
@@ -218,6 +222,7 @@ impl DiskState {
             not_ready: 0,
             fail_op: None,
             needs_16: false,
+            bad_block_size: false,
             wrong_tag: false,
             short_by: 0,
             cdbs: Vec::new(),
@@ -265,7 +270,12 @@ impl DiskState {
         };
         let mut d = alloc::vec![0u8; 8];
         d[0..4].copy_from_slice(&last.to_be_bytes());
-        d[4..8].copy_from_slice(&self.block_size.to_be_bytes());
+        let bs = if self.bad_block_size {
+            0
+        } else {
+            self.block_size
+        };
+        d[4..8].copy_from_slice(&bs.to_be_bytes());
         d
     }
 
@@ -462,6 +472,14 @@ impl FakeDev {
     pub(super) fn with_not_ready(mut self, n: u32) -> Self {
         if let Some(d) = self.disk.as_mut() {
             d.not_ready = n;
+        }
+        self
+    }
+
+    /// Una unidad que contesta su capacidad con bloques de cero bytes.
+    pub(super) fn with_zero_block_size(mut self) -> Self {
+        if let Some(d) = self.disk.as_mut() {
+            d.bad_block_size = true;
         }
         self
     }
@@ -1719,6 +1737,22 @@ impl Hw {
     pub(super) fn plug(&self, port: u8, speed: u8, dev: FakeDev) {
         self.connect(port, speed);
         self.add_dev(port, 0, dev);
+    }
+
+    /// Desenchufa lo que haya en el puerto raíz `port`: pierde la conexión y
+    /// señala el cambio, que es lo que el driver encuentra cuando le llega el
+    /// Port Status Change Event.
+    pub(super) fn unplug(&self, port: u8) {
+        self.with(|st| {
+            if let Some(p) = st.ports.get_mut(port as usize - 1) {
+                p.connected = false;
+                p.speed = 0;
+            }
+            st.devs.retain(|n| n.port != port);
+        });
+        // CCS a cero, CSC puesto, PED a cero y la velocidad fuera.
+        let sc = (self.portsc(port) & !(1 | (1 << 1) | (0xf << 10))) | (1 << 17);
+        self.set_portsc(port, sc);
     }
 
     /// Enchufa un dispositivo al puerto `hub_port` del hub que está en el
