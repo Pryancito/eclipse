@@ -2749,3 +2749,9 @@ mod info_layout_tests {
         );
     }
 }
+
+/// System V semaphores reached through the syscall: a set made in one
+/// process and operated from another, the array that lands whole or not at
+/// all, and the park a blocked `semop` goes into.
+#[cfg(test)]
+mod sem_wiring_tests;
