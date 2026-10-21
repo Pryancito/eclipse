@@ -65,18 +65,38 @@ const SW_SUSPEND: u32 = 0x4567_89ab;
 /// one.
 const A_SEED: u8 = 0xa5;
 
-/// The fixed kernel log these tests read. Short enough to ask for less than
-/// all of it and long enough that "all of it" is not one byte.
+/// The bytes the fake log is made of, repeated as far as a read goes.
 const A_LOG: &[u8] = b"<6>eclipse: one line of log\n";
 
+/// What the fake ring reports as its size, which is what
+/// `SYSLOG_ACTION_SIZE_BUFFER` answers. Deliberately NOT the length of
+/// [`A_LOG`] and deliberately smaller than the longest read below: the read
+/// is clamped to this before a byte is allocated, and a clamp to something
+/// the test also happens to be asking for proves nothing.
+const A_RING: usize = 32;
+
+/// How many bytes the fake ring will hand over, which a test sets.
+///
+/// A real ring reports a size and then gives a reader however much is
+/// actually there, and the two numbers are what tell "how many bytes were
+/// asked for" apart from "how many came". `usize::MAX` is a ring with more
+/// to give than anybody will ask for.
+static UNREAD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// What a read of `len` bytes should bring back: [`A_LOG`] over and over.
+fn a_log_pattern(len: usize) -> alloc::vec::Vec<u8> {
+    (0..len).map(|i| A_LOG[i % A_LOG.len()]).collect()
+}
+
 fn a_log_read(dst: &mut [u8]) -> usize {
-    let n = dst.len().min(A_LOG.len());
-    dst[..n].copy_from_slice(&A_LOG[..n]);
+    let unread = UNREAD.load(core::sync::atomic::Ordering::SeqCst);
+    let n = dst.len().min(unread);
+    dst[..n].copy_from_slice(&a_log_pattern(n));
     n
 }
 
 fn a_log_size() -> usize {
-    A_LOG.len()
+    A_RING
 }
 
 /// Emitting goes nowhere: every `klog_info!` in this crate's tests arrives
@@ -89,11 +109,30 @@ fn a_log_emit(_level: u8, _line: &str) {}
 /// There is no unregistering, so this is deliberately idempotent and
 /// deliberately called by every test here before it asks anything of the
 /// log: whichever test runs first, the log is the same one.
-fn a_kernel_log() {
+/// Register [`A_LOG`] as this binary's kernel log, once, and hold the log
+/// for the duration of one test.
+///
+/// There is no unregistering, so the registration is deliberately
+/// idempotent and deliberately done by every test here before it asks
+/// anything: whichever test runs first, the log is the same one. The lock is
+/// for [`UNREAD`], which is a global of the whole binary like the
+/// registration itself.
+///
+/// Poisoning is ignored: a test that panicked holding this has already said
+/// why, and every test here sets the number of unread bytes it is about
+/// rather than trusting the one it inherited.
+fn a_kernel_log() -> std::sync::MutexGuard<'static, ()> {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         kernel_hal::console::klog_register(a_log_read, a_log_size, a_log_emit);
     });
+    static LOG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOG.lock().unwrap_or_else(|held| held.into_inner())
+}
+
+/// Say how many bytes the ring will hand over from here on.
+fn with_unread(n: usize) {
+    UNREAD.store(n, core::sync::atomic::Ordering::SeqCst);
 }
 
 fn a_process(pid: KoID, name: &str) -> Arc<Process> {
@@ -238,25 +277,30 @@ fn the_commands_this_kernel_answers_without_stopping_the_machine() {
 
 #[test]
 fn reading_the_log_copies_the_bytes_out_and_answers_how_many() {
-    a_kernel_log();
+    let _log = a_kernel_log();
+    with_unread(usize::MAX);
     let root = a_process(47_253, "syslog-read");
     on_a_thread(&root, move |sys| {
         Box::pin(async move {
-            // What the ring holds, which is what `SIZE_BUFFER` answers.
-            let size = kernel_hal::console::klog_buf_size();
-            assert_eq!(size, A_LOG.len(), "the registered log is not the one read");
+            // The size of the ring, which is what `SIZE_BUFFER` answers
+            // and is not the same number as "how much a read brings back".
+            assert_eq!(
+                kernel_hal::console::klog_buf_size(),
+                A_RING,
+                "the registered log is not the one read"
+            );
             assert_eq!(
                 syslog_bare(sys, SYSLOG_ACTION_SIZE_BUFFER, 0),
-                Ok(size),
+                Ok(A_RING),
                 "size_buffer did not answer the size of the ring"
             );
             assert_eq!(
                 syslog_bare(sys, SYSLOG_ACTION_SIZE_UNREAD, 0),
-                Ok(size),
+                Ok(A_RING),
                 "size_unread did not answer the size of the ring"
             );
 
-            // A read of less than all of it gets that much, from the
+            // A read of less than the ring holds gets that much, from the
             // front, and touches nothing past it.
             let mut buf = [A_SEED; 64];
             assert_eq!(
@@ -264,38 +308,58 @@ fn reading_the_log_copies_the_bytes_out_and_answers_how_many() {
                 Ok(8),
                 "a short read"
             );
-            assert_eq!(&buf[..8], &A_LOG[..8], "the bytes read are not the log's");
+            assert_eq!(
+                &buf[..8],
+                &a_log_pattern(8)[..],
+                "the bytes read are not the log's"
+            );
             assert!(
                 buf[8..].iter().all(|&b| b == A_SEED),
                 "the read wrote past the length it was given"
             );
 
-            // A read of more than all of it gets all of it, and the answer
-            // is how many bytes CAME, not how many were asked for.
+            // A read of MORE than the ring holds is cut to the ring, and
+            // cut before a byte is allocated: that clamp is what keeps a
+            // caller asking for `INT_MAX` from being handed an allocation
+            // of two gigabytes, and the only way to see it is to ask for
+            // more than the ring while the ring still has that much to
+            // give.
             let mut buf = [A_SEED; 64];
             assert_eq!(
                 syslog(sys, SYSLOG_ACTION_READ_ALL, &mut buf, 64),
-                Ok(A_LOG.len()),
-                "a long read did not answer the length of the log"
+                Ok(A_RING),
+                "a read longer than the ring was not cut to it"
             );
-            assert_eq!(&buf[..A_LOG.len()], A_LOG, "the whole log");
             assert_eq!(
-                buf[A_LOG.len()],
-                A_SEED,
-                "the read wrote past the end of the log"
+                &buf[..A_RING],
+                &a_log_pattern(A_RING)[..],
+                "the bytes of a ring-length read"
+            );
+            assert!(
+                buf[A_RING..].iter().all(|&b| b == A_SEED),
+                "the read wrote past the size of the ring"
             );
 
-            // A length no allocation could serve, which is the reason the
-            // read is clamped to the size of the ring before anything is
-            // allocated: without the clamp this is `ENOMEM` for a log of
-            // twenty-eight bytes.
+            // And when the ring has LESS to give than the read is cut to,
+            // the answer is how many bytes CAME, not how many were asked
+            // for and not how big the buffer was.
+            with_unread(20);
             let mut buf = [A_SEED; 64];
             assert_eq!(
-                syslog(sys, SYSLOG_ACTION_READ_ALL, &mut buf, i32::MAX),
-                Ok(A_LOG.len()),
-                "a huge length was allocated instead of clamped"
+                syslog(sys, SYSLOG_ACTION_READ_ALL, &mut buf, 64),
+                Ok(20),
+                "the read answered a length instead of what came"
             );
-            assert_eq!(&buf[..A_LOG.len()], A_LOG, "the whole log, again");
+            assert_eq!(
+                &buf[..20],
+                &a_log_pattern(20)[..],
+                "the bytes of a partial read"
+            );
+            assert!(
+                buf[20..].iter().all(|&b| b == A_SEED),
+                "the read wrote more than came"
+            );
+            with_unread(usize::MAX);
 
             // A read of nothing is not an error and writes nothing.
             let mut buf = [A_SEED; 64];
@@ -328,7 +392,8 @@ fn reading_the_log_copies_the_bytes_out_and_answers_how_many() {
 
 #[test]
 fn only_the_two_open_log_actions_are_open_to_anybody() {
-    a_kernel_log();
+    let _log = a_kernel_log();
+    with_unread(usize::MAX);
     let them = a_process_of(47_254, "syslog-stranger", A_USER);
     let root = a_process(47_255, "syslog-root");
     on_a_thread(&them, move |sys| {
@@ -344,7 +409,7 @@ fn only_the_two_open_log_actions_are_open_to_anybody() {
             );
             assert_eq!(
                 syslog_bare(sys, SYSLOG_ACTION_SIZE_BUFFER, 0),
-                Ok(A_LOG.len()),
+                Ok(A_RING),
                 "size_buffer needs no privilege"
             );
 
