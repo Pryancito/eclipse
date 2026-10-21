@@ -3851,6 +3851,9 @@ pub(crate) fn utimes_times(
 mod utimes_times_tests;
 
 #[cfg(test)]
+mod utimes_gate_tests;
+
+#[cfg(test)]
 mod fallocate_mode_tests;
 
 #[cfg(test)]
