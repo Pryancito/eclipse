@@ -1222,6 +1222,27 @@ fn the_file_and_the_offset_are_the_last_two_words_of_the_only_six_word_arm() {
                 errno(LxError::EINVAL),
                 "mmap took an offset that is not a whole number of pages"
             );
+
+            // The third word is a protection, and nothing it can answer says
+            // which one it got: what a protection does is only visible in
+            // what the page will take. A read-only page refuses a write --
+            // and `mmap` keeps only the three bits it knows, so the flag word
+            // in its place would be truncated to `PROT_WRITE` and take one.
+            let only_read = sys.zircon_process().vmar().addr() + 0x4820_0000;
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::MMAP,
+                    [only_read, PAGE, PROT_READ, ANON_FIXED, NO_FILE, 0]
+                )
+                .await,
+                only_read as isize,
+                "a read-only anonymous page maps"
+            );
+            assert!(
+                !takes_a_write(sys, only_read),
+                "the page mmap mapped read-only took a write"
+            );
         })
     });
 }
@@ -1263,20 +1284,24 @@ fn a_mapping_is_protected_and_removed_a_page_at_a_time() {
                 "mprotect took a page size as a set of protection bits"
             );
 
-            // The same two words again, this time removing the mapping.
+            // The same two words again, this time removing the mapping --
+            // and the SECOND page of the two, not the first. Swapping an
+            // address and a length leaves their sum alone, so a range asked
+            // only about where it ENDS cannot tell the two apart: what
+            // separates them is a page below the start surviving.
             let gone = anonymous(sys, 0x4a00_0000, 2).await;
             assert_eq!(
-                by_number(sys, Sys::MUNMAP, [gone, PAGE, 0, 0, 0, 0]).await,
+                by_number(sys, Sys::MUNMAP, [gone + PAGE, PAGE, 0, 0, 0, 0]).await,
                 0,
                 "munmap over one mapped page"
             );
             assert!(
-                !takes_a_write(sys, gone),
+                !takes_a_write(sys, gone + PAGE),
                 "the page the first word named is still there"
             );
             assert!(
-                takes_a_write(sys, gone + PAGE),
-                "the length reached a page munmap was not given"
+                takes_a_write(sys, gone),
+                "munmap reached back past the address it was given"
             );
         })
     });
