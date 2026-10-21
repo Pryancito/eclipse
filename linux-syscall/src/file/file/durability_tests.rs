@@ -379,6 +379,14 @@ fn sync_file_range_judges_its_flags_then_its_range_then_its_descriptor() {
                 Err(LxError::EINVAL),
                 "the flag word was read after the range or the descriptor"
             );
+            // The flags against the descriptor alone, with the range
+            // perfectly good: otherwise the negative offset above answers
+            // for them and a flag word read last would never show.
+            assert_eq!(
+                sys.sys_sync_file_range(closed, 0, 0, unknown_flag),
+                Err(LxError::EINVAL),
+                "the flag word was read after the descriptor"
+            );
             assert_eq!(
                 sys.sys_sync_file_range(closed, A_NEGATIVE_LENGTH, 0, 0),
                 Err(LxError::EINVAL),
