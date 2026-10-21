@@ -1260,6 +1260,12 @@ mod anon_fd_wiring_tests;
 #[cfg(test)]
 mod shared_description_tests;
 
+/// `open` and `openat` through the syscall: the `O_LARGEFILE` the kernel adds
+/// of its own accord, the refusals that have to arrive before anything is
+/// created or emptied, and the mode arriving at the inode through the umask.
+#[cfg(test)]
+mod open_wiring_tests;
+
 #[cfg(test)]
 mod dup_limit_tests {
     //! The three `RLIMIT_NOFILE` checks the dup family did not have. The
