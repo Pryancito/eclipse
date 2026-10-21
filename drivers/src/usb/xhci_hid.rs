@@ -2287,6 +2287,13 @@ pub fn usb_abs_pointer_active() -> bool {
     USB_ABS_POINTER.load(Ordering::Relaxed)
 }
 
+/// El torniquete de [`USB_ABS_POINTER`] para los tests vive en su propio
+/// fichero: aquí sólo cabe lo que entra en el techo de tamaño.
+#[cfg(test)]
+mod abs_turn;
+#[cfg(test)]
+pub(super) use abs_turn::AbsPointerTurn;
+
 /// Number of TRBs (and report buffers) kept queued on every interrupt-IN HID
 /// endpoint. A single in-flight TRB is fragile: if one transfer-completion
 /// event is ever missed (event-ring race, lost MSI, idle-induced timer stall)
@@ -7700,6 +7707,11 @@ mod hub_tree_tests;
 /// medio de verdad detrás para que una lectura y una escritura se noten.
 #[cfg(test)]
 mod msc_tests;
+
+/// El puntero absoluto: las tabletas de máquina virtual y sus dos diseños de
+/// informe.
+#[cfg(test)]
+mod tablet_tests;
 
 /// La recuperación de un controlador atragantado y el sondeo de respaldo que
 /// la llama.
