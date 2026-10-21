@@ -3255,6 +3255,14 @@ mod truncate_type_tests;
 #[cfg(test)]
 mod truncate_and_statfs_tests;
 
+/// Where the two copying syscalls put their arguments. `copy_range` has
+/// `copy_range_tests` for the loop itself; what nothing could see from
+/// there is that `sendfile` hands the offset to the **input** and writes
+/// the output at its own cursor, that an explicit offset comes back in the
+/// caller's variable, and that both ends check their own window.
+#[cfg(test)]
+mod sendfile_and_copy_tests;
+
 /// `SYNC_IOC_MERGE` is `_IOWR('>', 3, struct sync_merge_data)`: type `'>'`
 /// (0x3e), nr 3, 48 bytes. Matched on type and nr, like the DRM syncobj fd
 /// ioctls: the struct is UABI-frozen, and a size-pinned constant is how this
