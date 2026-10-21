@@ -2881,3 +2881,9 @@ mod caps_and_ioprio_tests;
 /// barriers, plus the execution base of a thread.
 #[cfg(test)]
 mod boot_and_log_tests;
+
+/// The futex through the syscall: an operation judged before the word is
+/// looked at, the clock an absolute deadline sits on, and the park and wake
+/// pair made from two threads of one process.
+#[cfg(test)]
+mod futex_wiring_tests;
