@@ -24,11 +24,15 @@
 //! the one it inherited, so a test that panicked earlier cannot make the
 //! next one lie.
 //!
-//! What is NOT pinned, and cannot be from here: `getcpu`'s two slots the
-//! other way round. This host runs the tests on CPU 0 and has one NUMA
-//! node, so both numbers are zero and the swap is invisible; what the test
-//! below does pin is that each slot is written at all, and that a null one
-//! is skipped instead of faulting.
+//! One measured surprise: `getcpu`'s two slots the other way round IS
+//! pinned, and why is worth knowing. A hosted kernel's `cpu_id()` is not a
+//! constant -- it is a slot claimed out of a bitmap by the host thread that
+//! asks for it, given back when that thread exits -- so in a test binary
+//! with this many live threads the harness thread's slot is almost never 0,
+//! while the one NUMA node always is, and the two numbers differ. The
+//! mutation lot killed the swap for exactly that reason. It is luck rather
+//! than law: a run whose harness thread happened to hold slot 0 would let it
+//! through, and nothing here can choose the slot.
 //!
 //! Fixed pids live in 47_21x.
 
@@ -549,7 +553,18 @@ fn sysinfo_fills_the_struct_the_caller_gave_it_and_nowhere_is_efault() {
                 "more memory free than there is"
             );
             assert!(info.procs >= 1, "nothing is running, not even this test");
-            assert_ne!(info.uptime, u64::MAX, "the uptime was not written");
+            // The uptime is the monotonic clock's own seconds, the source
+            // `/proc/uptime` reads too. Asked OF the clock here rather than
+            // just compared against the seed: a kernel that answered a
+            // constant would pass a test that only looked for "not what I
+            // put there".
+            let now = timer_now().as_secs();
+            assert!(
+                info.uptime <= now && now - info.uptime <= 1,
+                "the uptime is not the clock's: {} against {}",
+                info.uptime,
+                now
+            );
             // The fields this kernel has no number for are written too, as
             // zeros: left alone they would come back as whatever the caller
             // had there, which is what the seed above stands for.
