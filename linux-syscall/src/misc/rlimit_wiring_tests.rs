@@ -50,6 +50,17 @@ const A_USER: u32 = 1000;
 /// Somebody else, whose processes are none of `A_USER`'s business.
 const ANOTHER_USER: u32 = 2000;
 
+/// A group of `A_USER`'s own, and a third group: the gid half of the same
+/// story, because the six comparisons are three uids AND three gids, and a
+/// fixture whose groups are all root's cannot see which gid is compared.
+const A_GROUP: u32 = 1000;
+/// See [`A_GROUP`].
+const A_THIRD_GROUP: u32 = 3000;
+
+/// A third user, who owns nothing here: the caller's EFFECTIVE id in the one
+/// test that moves the real pair away from the effective one.
+const A_THIRD_USER: u32 = 3000;
+
 /// What an out-parameter holds before a call, so that "left alone" cannot
 /// pass for "written".
 ///
@@ -458,14 +469,46 @@ fn another_users_process_is_eperm_and_one_with_the_same_ids_is_not() {
     // capability to fall back on, and the refusal arriving BEFORE anything
     // is changed: the stranger's limit is read afterwards and has to be
     // where it was.
-    let caller = a_process_of(47_198, "rlimit-user", A_USER);
+    //
+    // The caller's REAL pair is what this gate compares, and its effective
+    // pair is deliberately a different user again. `prlimit64` is one of the
+    // two callers Linux hands the real pair (`PTRACE_MODE_*_REALCREDS`),
+    // while the gated files of `/proc/<pid>/` ask the same six comparisons
+    // about the filesystem pair -- so the wrong pair here reads as correct
+    // code, and a fixture whose pairs agree, which is every fixture that
+    // does not go out of its way, cannot tell them apart.
+    let caller = a_process(47_198, "rlimit-user");
+    // The groups go first: once the user id is down, moving the group ids is
+    // `EPERM`.
+    caller
+        .linux()
+        .set_resgid(A_GROUP, A_THIRD_GROUP, A_THIRD_GROUP)
+        .unwrap();
+    caller
+        .linux()
+        .set_resuid(A_USER, A_THIRD_USER, A_THIRD_USER)
+        .unwrap();
     let stranger = a_process_of(47_199, "rlimit-stranger", ANOTHER_USER);
-    let same = a_process_of(47_200, "rlimit-sameuser", A_USER);
+    // The one the caller reaches holds the caller's REAL pair and nothing
+    // else: all three of its uids are `A_USER` and all three of its gids
+    // `A_GROUP`. Its groups go first for the same reason the caller's do.
+    let same = a_process(47_200, "rlimit-sameuser");
+    same.linux().set_resgid(A_GROUP, A_GROUP, A_GROUP).unwrap();
+    same.linux().set_resuid(A_USER, A_USER, A_USER).unwrap();
     let stranger_was = limit_of(&stranger, RLIMIT_NOFILE);
     let (theirs, ours) = (stranger.clone(), same.clone());
     let (stranger_pid, same_pid) = (stranger.id() as usize, same.id() as usize);
     on_a_thread(&caller, move |sys| {
         Box::pin(async move {
+            let creds = sys.linux_process().credentials();
+            assert_ne!(
+                creds.ruid, creds.euid,
+                "the caller's two uids agree, so nothing here can see which is compared"
+            );
+            assert_ne!(
+                creds.rgid, creds.egid,
+                "the caller's two gids agree, so nothing here can see which is compared"
+            );
             let want = RLimit { cur: 128, max: 128 };
             let giving = &want as *const RLimit as usize;
             let mut out = A_SEED;
