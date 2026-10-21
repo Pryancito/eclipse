@@ -787,3 +787,198 @@ impl CowFs {
         Ok(seq)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testdisk::{Ram, Rng};
+
+    /// 1/256 of the filesystem, between 64 and 4096 blocks.
+    #[test]
+    fn the_log_area_scales_within_bounds() {
+        assert_eq!(area_blocks(0), 64);
+        assert_eq!(area_blocks(64 * 256), 64);
+        assert_eq!(area_blocks(1000 * 256), 1000);
+        assert_eq!(area_blocks(u64::MAX), 4096);
+    }
+
+    fn ext(pblk: u64, blocks: u64, sums: bool) -> LogExt {
+        LogExt {
+            pblk,
+            blocks,
+            prealloc: false,
+            sums: sums.then(|| (0..blocks as u32).map(|i| 1000 + i).collect()),
+        }
+    }
+
+    /// Cutting the middle of an extent leaves its two ends, each pointing at
+    /// the right disk blocks and carrying the checksums of exactly those
+    /// blocks. A later record that rewrites part of a file depends on it.
+    #[test]
+    fn a_cut_keeps_both_ends_with_their_sums() {
+        let mut r = Replay::default();
+        r.exts.insert(10, ext(500, 10, true));
+        r.cut(13, 16);
+        let got: Vec<(u64, u64, u64)> =
+            r.exts.iter().map(|(&l, x)| (l, x.pblk, x.blocks)).collect();
+        assert_eq!(got, vec![(10, 500, 3), (16, 506, 4)]);
+        assert_eq!(r.exts[&10].sums.as_deref(), Some(&[1000, 1001, 1002][..]));
+        assert_eq!(
+            r.exts[&16].sums.as_deref(),
+            Some(&[1006, 1007, 1008, 1009][..])
+        );
+    }
+
+    #[test]
+    fn a_cut_drops_what_it_covers_and_spares_its_neighbours() {
+        let mut r = Replay::default();
+        r.exts.insert(0, ext(100, 4, false));
+        r.exts.insert(4, ext(200, 4, false));
+        r.exts.insert(8, ext(300, 4, false));
+        r.cut(4, 8);
+        assert_eq!(r.exts.keys().copied().collect::<Vec<_>>(), vec![0, 8]);
+        // Cutting where nothing is mapped is a no-op.
+        r.cut(50, 60);
+        assert_eq!(r.exts.len(), 2);
+        // A cut across both trims each side.
+        r.cut(2, 10);
+        let got: Vec<(u64, u64, u64)> =
+            r.exts.iter().map(|(&l, x)| (l, x.pblk, x.blocks)).collect();
+        assert_eq!(got, vec![(0, 100, 2), (10, 302, 2)]);
+    }
+
+    /// Random cuts against a block-by-block model of the mapping.
+    #[test]
+    fn cuts_match_a_block_model() {
+        let mut rng = Rng::new(31);
+        for _ in 0..200 {
+            let mut r = Replay::default();
+            let mut model = [None::<u64>; 128];
+            let mut at = 0;
+            while at < 120 {
+                let n = 1 + rng.below(8);
+                if rng.below(3) > 0 {
+                    let p = 1000 + rng.below(1000) * 16;
+                    r.exts.insert(at, ext(p, n, true));
+                    for i in 0..n {
+                        model[(at + i) as usize] = Some(p + i);
+                    }
+                }
+                at += n;
+            }
+            for _ in 0..4 {
+                let s = rng.below(128);
+                let e = s + rng.below(128 - s);
+                r.cut(s, e);
+                model[s as usize..e as usize].fill(None);
+            }
+            let mut seen = [None::<u64>; 128];
+            for (&l, x) in &r.exts {
+                assert!(x.blocks > 0);
+                assert_eq!(x.sums.as_ref().unwrap().len() as u64, x.blocks);
+                for i in 0..x.blocks {
+                    seen[(l + i) as usize] = Some(x.pblk + i);
+                }
+            }
+            assert_eq!(seen, model);
+        }
+    }
+
+    fn writer(dev: &Arc<Ram>, start: u64, blocks: u64) -> LogWriter {
+        LogWriter {
+            raw: dev.clone(),
+            next: start,
+            end: start + blocks,
+            buf: Vec::new(),
+            len: 0,
+            crc: 0,
+        }
+    }
+
+    /// What the writer puts, in pieces of any size, the reader takes back,
+    /// and the running CRC is the CRC of the payload (not of the padding).
+    #[test]
+    fn a_payload_reads_back_with_its_crc() {
+        let dev = Ram::new(64 * BS as usize);
+        let mut rng = Rng::new(4);
+        let mut payload = vec![0u8; 3 * BS as usize + 123];
+        rng.fill(&mut payload);
+        let mut w = writer(&dev, 5, 10);
+        let mut rest = &payload[..];
+        while !rest.is_empty() {
+            let n = (1 + rng.below(5000) as usize).min(rest.len());
+            assert!(w.put(&rest[..n]).unwrap());
+            rest = &rest[n..];
+        }
+        assert!(w.finish().unwrap());
+        assert_eq!(w.len, payload.len() as u64);
+        assert_eq!(w.next, 9);
+        assert_eq!(w.crc, crc32c(&payload));
+
+        let mut r = LogReader {
+            raw: dev.clone(),
+            next: 5,
+            end: 15,
+            left: payload.len() as u64,
+            buf: Vec::new(),
+            at: 0,
+        };
+        let mut back = vec![0u8; payload.len()];
+        let (a, b) = back.split_at_mut(1000);
+        r.take(a).unwrap();
+        r.take(b).unwrap();
+        assert_eq!(back, payload);
+        // Past the payload is a corrupt record, not padding.
+        assert!(matches!(r.u8(), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn the_reader_decodes_little_endian_fields() {
+        let dev = Ram::new(16 * BS as usize);
+        let mut w = writer(&dev, 0, 4);
+        w.put(&[7]).unwrap();
+        w.put(&0xDEAD_BEEFu32.to_le_bytes()).unwrap();
+        w.put(&0x0102_0304_0506_0708u64.to_le_bytes()).unwrap();
+        w.finish().unwrap();
+        let mut r = LogReader {
+            raw: dev,
+            next: 0,
+            end: 4,
+            left: w.len,
+            buf: Vec::new(),
+            at: 0,
+        };
+        assert_eq!(r.u8().unwrap(), 7);
+        assert_eq!(r.u32().unwrap(), 0xDEAD_BEEF);
+        assert_eq!(r.u64().unwrap(), 0x0102_0304_0506_0708);
+    }
+
+    /// A payload larger than the area does not spill past it: the writer
+    /// says no and the blocks after the area are untouched.
+    #[test]
+    fn the_writer_stops_at_the_end_of_the_area() {
+        let dev = Ram::new(16 * BS as usize);
+        let after = dev.peek(3 * BS as usize, BS as usize);
+        let mut w = writer(&dev, 1, 2);
+        assert!(w.put(&vec![1u8; 2 * BS as usize]).unwrap());
+        assert!(!w.put(&[2u8; 10]).unwrap() || !w.finish().unwrap());
+        assert_eq!(dev.peek(3 * BS as usize, BS as usize), after);
+    }
+
+    /// A reader whose area ends before the payload does is reading a torn
+    /// record.
+    #[test]
+    fn a_short_area_is_a_corrupt_record() {
+        let dev = Ram::new(16 * BS as usize);
+        let mut r = LogReader {
+            raw: dev,
+            next: 0,
+            end: 1,
+            left: 3 * BS,
+            buf: Vec::new(),
+            at: 0,
+        };
+        let mut b = vec![0u8; 2 * BS as usize];
+        assert!(matches!(r.take(&mut b), Err(Error::Corrupt(_))));
+    }
+}

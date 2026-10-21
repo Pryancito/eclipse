@@ -44,6 +44,11 @@ impl RangeSet {
     }
 
     pub fn remove(&mut self, start: u64, len: u64) {
+        // An empty range removes nothing; without this the run holding
+        // `start` would be split in two touching runs.
+        if len == 0 {
+            return;
+        }
         let end = start + len;
         let mut cut = Vec::new();
         if let Some((&ps, &pl)) = self.0.range(..start).next_back() {
@@ -645,5 +650,106 @@ mod tests {
         assert!(sp.alloc.is_used(s));
         assert!(sp.private_fresh(s, 1));
         assert!(sp.incref(60, 1).is_err());
+    }
+
+    /// `RangeSet` against the dumbest model there is, a bit per block, over
+    /// thousands of random inserts and removes: after every step the two
+    /// agree block by block, and the set stays canonical (sorted, merged,
+    /// nothing empty), which is what `iter` users rely on.
+    #[test]
+    fn range_set_matches_a_bitmap_model() {
+        use crate::testdisk::Rng;
+        const N: u64 = 512;
+        let mut rng = Rng::new(0xEC11);
+        for _round in 0..20 {
+            let mut set = RangeSet::default();
+            let mut model = [false; N as usize];
+            for _ in 0..300 {
+                let s = rng.below(N);
+                let l = rng.below(40).min(N - s);
+                if rng.below(3) == 0 {
+                    set.remove(s, l);
+                    model[s as usize..(s + l) as usize].fill(false);
+                } else {
+                    set.insert(s, l);
+                    model[s as usize..(s + l) as usize].fill(true);
+                }
+                let mut prev_end = None;
+                for (s, l) in set.iter() {
+                    assert!(l > 0, "empty run at {}", s);
+                    if let Some(e) = prev_end {
+                        assert!(s > e, "runs not merged or not sorted at {}", s);
+                    }
+                    prev_end = Some(s + l);
+                }
+                for b in 0..N {
+                    assert_eq!(set.contains(b), model[b as usize], "block {}", b);
+                }
+                let (a, b) = (rng.below(N), rng.below(N));
+                let (a, b) = (a.min(b), a.max(b));
+                let inside: u64 = set.within(a, b).map(|(_, l)| l).sum();
+                let want = model[a as usize..b as usize].iter().filter(|&&x| x).count() as u64;
+                assert_eq!(inside, want, "within({}, {})", a, b);
+                assert_eq!(
+                    set.covers(a, b - a),
+                    model[a as usize..b as usize].iter().all(|&x| x)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn range_set_subset_and_clear() {
+        let mut a = RangeSet::default();
+        let mut b = RangeSet::default();
+        a.insert(5, 5);
+        b.insert(0, 20);
+        assert!(a.is_subset(&b) && !b.is_subset(&a));
+        assert!(RangeSet::default().is_subset(&a));
+        a.insert(19, 2);
+        assert!(!a.is_subset(&b));
+        a.clear();
+        assert!(a.is_empty() && a.is_subset(&b));
+        // Zero-length operations change nothing.
+        b.insert(100, 0);
+        b.remove(3, 0);
+        assert_eq!(b.iter().collect::<Vec<_>>(), vec![(0, 20)]);
+    }
+
+    /// `RefMap` against an array of counts: whatever the sequence of
+    /// increments and decrements, every block's count matches, only shared
+    /// blocks (count >= 2) have entries, and what `add` reports as dropped to
+    /// zero is exactly the blocks whose count did.
+    #[test]
+    fn ref_map_matches_a_count_model() {
+        use crate::testdisk::Rng;
+        const N: u64 = 256;
+        let mut rng = Rng::new(77);
+        let mut m = RefMap::default();
+        let mut model = [1i64; N as usize];
+        for _ in 0..3000 {
+            let s = rng.below(N);
+            let l = 1 + rng.below(24).min(N - s - 1);
+            let range = s as usize..(s + l) as usize;
+            let delta = if rng.below(2) == 0 { 1 } else { -1 };
+            let zero = m.add(s, l, delta);
+            let mut want_zero = RangeSet::default();
+            for b in range {
+                model[b] += delta as i64;
+                if model[b] == 0 {
+                    want_zero.insert(b as u64, 1);
+                    model[b] = 1; // freed and handed out again
+                }
+            }
+            let mut got = RangeSet::default();
+            for (zs, zl) in zero {
+                got.insert(zs, zl);
+            }
+            assert_eq!(got, want_zero);
+            for b in 0..N {
+                assert_eq!(m.get(b) as i64, model[b as usize], "block {}", b);
+            }
+            assert!(m.entries().all(|(_, l, c)| l > 0 && c >= 2));
+        }
     }
 }

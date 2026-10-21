@@ -231,3 +231,143 @@ pub fn format_v3(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
     dev.write_at(0, &enc)?;
     dev.sync()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testdisk::{formatted, opts, Ram, MIB};
+    use crate::EclipseFS;
+
+    /// 1/256 of the disk within [64, 4096] blocks, but never more than a
+    /// quarter of a tiny disk and never fewer than the journal needs.
+    /// Monotonic, so a bigger disk never gets a smaller journal.
+    #[test]
+    fn the_journal_scales_with_the_disk_within_bounds() {
+        assert_eq!(journal_blocks(64), 16);
+        assert_eq!(journal_blocks(32), MIN_JOURNAL_BLOCKS as u64);
+        assert_eq!(journal_blocks(256), 64);
+        assert_eq!(journal_blocks(1 << 16), 256);
+        assert_eq!(journal_blocks(1 << 20), 4096);
+        assert_eq!(journal_blocks(1 << 30), 4096);
+        let mut last = 0;
+        for total in (64..200_000).step_by(997) {
+            let j = journal_blocks(total);
+            assert!(j >= last, "shrinks at {}", total);
+            assert!(j >= MIN_JOURNAL_BLOCKS as u64);
+            assert!(j <= 4096);
+            last = j;
+        }
+    }
+
+    #[test]
+    fn a_label_must_fit_the_superblock() {
+        let d = Ram::new(8 * MIB);
+        let mut o = opts();
+        o.label = "x".repeat(64);
+        assert_eq!(format(&*d, &o), Err(Error::Invalid));
+        o.label = "x".repeat(63);
+        format(&*d, &o).unwrap();
+        assert_eq!(EclipseFS::mount(d, true).unwrap().label(), o.label);
+    }
+
+    #[test]
+    fn a_disk_smaller_than_one_group_is_refused() {
+        let d = Ram::new((MIN_GROUP_BLOCKS as usize - 1) * BLOCK_SIZE as usize);
+        assert_eq!(format(&*d, &opts()), Err(Error::NoSpace));
+        assert_eq!(format_v3(&*d, &opts()), Err(Error::NoSpace));
+    }
+
+    /// The smallest disk mkfs takes still gives a filesystem that mounts and
+    /// passes fsck.
+    #[test]
+    fn the_smallest_disk_still_works() {
+        for blocks in [MIN_GROUP_BLOCKS * 4, 1024] {
+            let d = Ram::new((blocks * BLOCK_SIZE) as usize);
+            if format(&*d, &opts()).is_err() {
+                continue;
+            }
+            let mut fs = EclipseFS::mount(d, false).unwrap();
+            fs.check().unwrap();
+        }
+    }
+
+    /// A btrfs that was on the disk before must not be found by `blkid`
+    /// after mkfs: both of its superblocks are wiped.
+    #[test]
+    fn stale_btrfs_superblocks_are_wiped() {
+        let d = Ram::new(128 * MIB);
+        for at in STALE_SIGNATURES {
+            d.write_at(at + 0x40, b"_BHRfS_M").unwrap();
+        }
+        format(&*d, &opts()).unwrap();
+        for at in STALE_SIGNATURES {
+            assert_ne!(d.peek(at as usize + 0x40, 8), b"_BHRfS_M");
+        }
+    }
+
+    /// A tail too short to be a group is left out rather than made into a
+    /// group the allocator cannot use.
+    #[test]
+    fn a_short_tail_is_left_out() {
+        let blocks = GROUP_BLOCKS + MIN_GROUP_BLOCKS - 1;
+        let d = Ram::new((blocks * BLOCK_SIZE) as usize);
+        format(&*d, &opts()).unwrap();
+        let p = crate::fs::probe(&*d).unwrap();
+        assert_eq!(p.min_device_bytes, GROUP_BLOCKS * BLOCK_SIZE);
+    }
+
+    #[test]
+    fn both_formats_pass_fsck_when_fresh() {
+        let mut fs = EclipseFS::mount(formatted(64), false).unwrap();
+        let r = fs.check().unwrap();
+        assert_eq!(r.directories, 1);
+        let d = Ram::new(64 * MIB);
+        format_v3(&*d, &opts()).unwrap();
+        EclipseFS::mount(d, false).unwrap().check().unwrap();
+    }
+
+    /// Formatting twice gives the same bytes: mkfs depends on its options
+    /// only, so images built by `xtask` are reproducible.
+    #[test]
+    fn mkfs_is_deterministic() {
+        let a = formatted(16);
+        let b = formatted(16);
+        assert!(a.peek(0, 16 * MIB) == b.peek(0, 16 * MIB));
+    }
+
+    #[test]
+    fn a_volume_needs_devices_enough_for_its_profiles() {
+        let one: Vec<Arc<dyn BlockDevice>> = vec![Ram::new(64 * MIB)];
+        assert!(matches!(
+            format_devices(&one, &opts(), Profile::Raid1, Profile::Raid1),
+            Err(Error::Unsupported(_))
+        ));
+        assert_eq!(
+            format_devices(&[], &opts(), Profile::Single, Profile::Single),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            format_devices_tiered(
+                &one,
+                &opts(),
+                Profile::Single,
+                Profile::Single,
+                &[Tier::Fast, Tier::Slow]
+            ),
+            Err(Error::Invalid)
+        );
+    }
+
+    #[test]
+    fn prefix_caps_the_size_and_passes_the_rest_through() {
+        let d = Ram::new(MIB);
+        let p = Prefix(d.clone(), 4096);
+        assert_eq!(p.size(), 4096);
+        assert_eq!(Prefix(d.clone(), 2 * MIB as u64).size(), MIB as u64);
+        p.write_at(10, b"abc").unwrap();
+        assert_eq!(d.peek(10, 3), b"abc");
+        let mut b = [0u8; 3];
+        p.read_at(10, &mut b).unwrap();
+        assert_eq!(&b, b"abc");
+    }
+}

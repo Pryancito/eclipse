@@ -208,4 +208,45 @@ mod tests {
         assert_eq!(Compression::from_disk(2), None);
         assert_eq!(Compression::from_name("lzo"), None);
     }
+
+    /// Data with some structure in it (what real files are), in sizes that
+    /// are not whole blocks: what comes back is what went in, or nothing was
+    /// packed at all. Never other bytes.
+    #[test]
+    fn round_trips_on_mixed_data() {
+        use crate::testdisk::Rng;
+        let mut rng = Rng::new(9);
+        for algo in Compression::ALL {
+            for _ in 0..24 {
+                let blocks = 2 + rng.below(30) as usize;
+                let mut d = vec![0u8; blocks * BS];
+                // Runs of random bytes between runs of one byte.
+                let mut i = 0;
+                while i < d.len() {
+                    let n = (1 + rng.below(3000) as usize).min(d.len() - i);
+                    if rng.below(2) == 0 {
+                        rng.fill(&mut d[i..i + n]);
+                    } else {
+                        let v = rng.next() as u8;
+                        d[i..i + n].fill(v);
+                    }
+                    i += n;
+                }
+                if let Some(p) = pack(algo, &d) {
+                    assert!(p.len() < d.len() && p.len() % BS == 0);
+                    assert_eq!(unpack(algo, &p, d.len()).unwrap(), d, "{:?}", algo);
+                }
+            }
+        }
+    }
+
+    /// Packing gives the same bytes every time: send streams and dedupe
+    /// compare compressed extents byte for byte.
+    #[test]
+    fn packing_is_deterministic() {
+        for algo in Compression::ALL {
+            let d = text(9);
+            assert_eq!(pack(algo, &d), pack(algo, &d));
+        }
+    }
 }

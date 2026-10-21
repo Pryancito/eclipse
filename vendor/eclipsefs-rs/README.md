@@ -418,7 +418,13 @@ cargo test --release -p eclipsefs --features std
 ```
 
 - Tests de unidad en cada módulo (`crc`, `extent`, `blocks`, `format`,
-  `btree`, `space`, `cowfmt`, `v3`), incluido un árbol B+ contra un modelo.
+  `btree`, `space`, `cowfmt`, `v3`, `fs`, `mkfs`, `device`, `compress`,
+  `raid56`, `crypt`, `journal`, `volume` y los de `cow/`: log de fsync,
+  send/receive, cifrado, reparación y redimensionado), incluido un árbol B+
+  contra un modelo. `RangeSet`, `RefMap`, los contadores de la reparación y
+  los cortes del log de fsync se comparan con un modelo bloque a bloque en
+  miles de operaciones aleatorias (semilla fija, así un fallo se reproduce).
+  `src/testdisk.rs` es el disco en RAM que comparten.
 - `tests/cow.rs`: ningún bloque confirmado se reescribe entre dos
   confirmaciones, sobrescrituras de todas las formas, archivos en línea y
   compatibilidad con imágenes v0.3.
@@ -504,6 +510,21 @@ cargo test --release -p eclipsefs --features std
 - `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
   y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las
   ejecuta en release; `ECLIPSEFS_BENCH_SCALE=4` las agranda.
+- `benches/primitives.rs` y `benches/fs.rs`: benchmarks de referencia con
+  `#[bench]` nativo (como `zircon-object/benches/vm.rs`, sin dependencias
+  nuevas). `primitives` mide las piezas por separado (CRC32C con la
+  instrucción contra la tabla, compresión en texto y en ruido, paridad
+  RAID5/6, AES-XTS/CTS); `fs` mide las llamadas del driver sobre un disco en
+  RAM (lookup/create en directorios de 1 a 10000 entradas, lecturas y
+  escrituras de 4 KiB con y sin COW, `fsync` por el log contra un commit
+  completo, snapshot, montaje, fsck). Las familias van por tamaños para leer
+  la pendiente, cada una con su fila de control.
+
+  ```sh
+  cargo bench -p eclipsefs --features std --bench primitives
+  cargo bench -p eclipsefs --features std --bench fs
+  cargo test --release -p eclipsefs --features std --benches   # cada fila una vez (CI)
+  ```
 - `scripts/eclipsefs-linux-bench.sh` (como root): EclipseFS contra los
   sistemas de archivos del kernel Linux (ext4, xfs, btrfs) con fio y tar,
   cada uno en una imagen del mismo tamaño en un dispositivo loop. EclipseFS se

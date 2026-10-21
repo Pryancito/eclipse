@@ -42,6 +42,8 @@ pub mod journal;
 pub mod mkfs;
 pub mod raid56;
 pub mod space;
+#[cfg(test)]
+pub(crate) mod testdisk;
 pub mod v3;
 pub mod volume;
 

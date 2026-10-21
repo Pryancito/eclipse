@@ -107,13 +107,15 @@ impl Counts {
             .map(|(&s, _)| s)
             .collect();
         for s in keys.into_iter().rev() {
-            let Some(&(l, c)) = self.0.get(&s) else {
-                continue;
-            };
-            if let Some(&(nl, nc)) = self.0.get(&(s + l)) {
-                if nc == c {
-                    self.0.remove(&(s + l));
-                    self.0.insert(s, (l + nl, c));
+            // Keep absorbing the next run while it has the same count: a
+            // run of three equal neighbours needs two merges at `s`.
+            while let Some(&(l, c)) = self.0.get(&s) {
+                match self.0.get(&(s + l)) {
+                    Some(&(nl, nc)) if nc == c => {
+                        self.0.remove(&(s + l));
+                        self.0.insert(s, (l + nl, c));
+                    }
+                    _ => break,
                 }
             }
         }
@@ -1125,5 +1127,61 @@ impl CowFs {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testdisk::Rng;
+
+    /// `Counts` against an array of counts: after any sequence of `add`s
+    /// every block has the count it should, neighbours with equal counts are
+    /// merged, `held` is every block with a holder and `refs` the ones with
+    /// two or more. Repair rebuilds the whole reference tree from this, so a
+    /// block counted wrong here is a block freed while in use.
+    #[test]
+    fn counts_match_a_count_model() {
+        const N: u64 = 300;
+        let mut rng = Rng::new(0x5EED);
+        for _ in 0..30 {
+            let mut c = Counts::default();
+            let mut model = [0u32; N as usize];
+            for _ in 0..150 {
+                let s = rng.below(N);
+                let l = rng.below(30).min(N - s);
+                c.add(s, l);
+                for b in s..s + l {
+                    model[b as usize] += 1;
+                }
+            }
+            let mut prev: Option<(u64, u32)> = None;
+            for (&s, &(l, n)) in &c.0 {
+                assert!(l > 0 && n >= 1);
+                if let Some((end, pn)) = prev {
+                    assert!(s >= end, "overlap at {}", s);
+                    assert!(!(s == end && pn == n), "unmerged neighbours at {}", s);
+                }
+                for b in s..s + l {
+                    assert_eq!(model[b as usize], n, "block {}", b);
+                }
+                prev = Some((s + l, n));
+            }
+            let held = c.held();
+            let refs = c.refs().unwrap();
+            for b in 0..N {
+                assert_eq!(held.contains(b), model[b as usize] > 0, "held {}", b);
+                let want = model[b as usize].max(1);
+                assert_eq!(refs.get(b), want, "refs {}", b);
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_add_holds_nothing() {
+        let mut c = Counts::default();
+        c.add(10, 0);
+        assert!(c.0.is_empty());
+        assert!(c.held().is_empty());
     }
 }

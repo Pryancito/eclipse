@@ -274,4 +274,70 @@ mod tests {
             assert!(recover(&mut r, k, &[0, 1, 2]).is_err());
         }
     }
+
+    /// Multiplication is a field: commutative, associative, and every power
+    /// of the generator up to 255 is distinct (2 generates the whole group).
+    #[test]
+    fn the_generator_spans_the_field() {
+        let mut seen = [false; 256];
+        for n in 0..255 {
+            let g = pow2(n);
+            assert!(!seen[g as usize], "g^{} repeats", n);
+            seen[g as usize] = true;
+        }
+        assert_eq!(pow2(255), 1);
+        for (a, b, c) in [(2u8, 3u8, 5u8), (0x8e, 0x47, 0xfe), (17, 34, 68)] {
+            assert_eq!(mul(a, b), mul(b, a));
+            assert_eq!(mul(mul(a, b), c), mul(a, mul(b, c)));
+        }
+    }
+
+    /// Parity is linear: the parity of `a ^ b` is the parity of `a` xor that
+    /// of `b`. A read-modify-write that patches parity with only the changed
+    /// block relies on exactly this.
+    #[test]
+    fn parity_is_linear() {
+        let a = rand_row(5, 2, 1);
+        let b = rand_row(5, 2, 2);
+        let x: Vec<Vec<u8>> = (0..5)
+            .map(|i| a[i].iter().zip(&b[i]).map(|(p, q)| p ^ q).collect())
+            .collect();
+        let refs: Vec<&[u8]> = x.iter().map(|v| &v[..]).collect();
+        let (mut p, mut q) = (vec![0u8; 64], vec![0u8; 64]);
+        gen(&refs, &mut p, Some(&mut q));
+        for i in 0..64 {
+            assert_eq!(p[i], a[5][i] ^ b[5][i]);
+            assert_eq!(q[i], a[6][i] ^ b[6][i]);
+        }
+    }
+
+    /// Recovery works on whole blocks, not only the short rows above, and
+    /// asking for nothing changes nothing.
+    #[test]
+    fn recovery_on_block_sized_rows() {
+        use crate::testdisk::Rng;
+        let mut rng = Rng::new(56);
+        let k = 6;
+        let mut row: Vec<Vec<u8>> = (0..k)
+            .map(|_| {
+                let mut b = vec![0u8; 4096];
+                rng.fill(&mut b);
+                b
+            })
+            .collect();
+        let (mut p, mut q) = (vec![0u8; 4096], vec![0u8; 4096]);
+        {
+            let refs: Vec<&[u8]> = row.iter().map(|v| &v[..]).collect();
+            gen(&refs, &mut p, Some(&mut q));
+        }
+        row.push(p);
+        row.push(q);
+        let good = row.clone();
+        recover(&mut row, k, &[]).unwrap();
+        assert_eq!(row, good);
+        row[2].fill(0);
+        row[k + 1].fill(0);
+        recover(&mut row, k, &[2, k + 1]).unwrap();
+        assert_eq!(row, good);
+    }
 }

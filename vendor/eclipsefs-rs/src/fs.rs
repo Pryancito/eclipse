@@ -1038,3 +1038,287 @@ impl EclipseFS {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mkfs;
+    use crate::testdisk::{clock, formatted, opts, Ram, MIB};
+
+    fn mounted(mib: usize) -> (Arc<Ram>, EclipseFS) {
+        let d = formatted(mib);
+        let mut fs = EclipseFS::mount(d.clone(), false).unwrap();
+        fs.set_clock(clock);
+        (d, fs)
+    }
+
+    // -- probe -------------------------------------------------------------
+
+    /// `blkid` runs on every disk the machine has: anything that is not
+    /// EclipseFS has to say so, not panic or claim it.
+    #[test]
+    fn probe_rejects_what_is_not_eclipsefs() {
+        assert_eq!(probe(&*Ram::new(100)), Err(Error::BadSuperblock));
+        assert_eq!(probe(&*Ram::new(MIB)), Err(Error::BadSuperblock));
+        let d = Ram::new(MIB);
+        d.write_at(0, b"ECLIPSEF_").unwrap();
+        assert_eq!(probe(&*d), Err(Error::BadSuperblock));
+    }
+
+    /// A newer major version is someone else's format to read.
+    #[test]
+    fn probe_refuses_unknown_versions() {
+        let d = formatted(8);
+        d.write_at(12, &0x0009_0000u32.to_le_bytes()).unwrap();
+        assert!(matches!(probe(&*d), Err(Error::Unsupported(_))));
+        assert!(matches!(
+            EclipseFS::mount(d, false),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn probe_reads_a_fresh_v4_superblock() {
+        let d = formatted(8);
+        let p = probe(&*d).unwrap();
+        assert_eq!(p.version, crate::ECLIPSEFS_VERSION);
+        assert_eq!(p.uuid, opts().fsid);
+        assert_eq!(p.label, "unit");
+        assert_eq!((p.devid, p.num_devices), (1, 1));
+        assert_eq!(p.min_device_bytes, 8 * MIB as u64);
+    }
+
+    #[test]
+    fn probe_reads_a_v3_superblock() {
+        let d = Ram::new(8 * MIB);
+        mkfs::format_v3(&*d, &opts()).unwrap();
+        let p = probe(&*d).unwrap();
+        assert_eq!(p.version >> 16, 3);
+        assert_eq!(p.label, "unit");
+        assert_eq!(p.generation, 1);
+    }
+
+    /// The generation `probe` shows is the last commit's: `btrfs device
+    /// scan` picks the newest copy of a volume by it.
+    #[test]
+    fn probe_follows_the_generation() {
+        let (d, mut fs) = mounted(8);
+        let before = probe(&*d).unwrap().generation;
+        let f = fs
+            .create(fs.root_ino(), "f", FileKind::Regular, 0o644, 0)
+            .unwrap();
+        fs.write(f, 0, b"x").unwrap();
+        fs.sync().unwrap();
+        assert_eq!(probe(&*d).unwrap().generation, fs.generation());
+        assert!(fs.generation() > before);
+    }
+
+    /// A damaged superblock is `Corrupt`, so the mount tells corruption
+    /// apart from an empty disk.
+    #[test]
+    fn probe_checks_the_superblock_checksum() {
+        let d = formatted(8);
+        d.poke(40, 0x10);
+        assert!(matches!(probe(&*d), Err(Error::Corrupt(_))));
+    }
+
+    // -- mount -------------------------------------------------------------
+
+    #[test]
+    fn mount_picks_the_driver_from_the_superblock() {
+        let (_, fs) = mounted(8);
+        assert_eq!(fs.format_version(), 4);
+        let d = Ram::new(8 * MIB);
+        mkfs::format_v3(&*d, &opts()).unwrap();
+        assert_eq!(EclipseFS::mount(d, false).unwrap().format_version(), 3);
+    }
+
+    #[test]
+    fn mount_rejects_a_blank_disk() {
+        assert!(matches!(
+            EclipseFS::mount(Ram::new(8 * MIB), false),
+            Err(Error::BadSuperblock)
+        ));
+        assert!(matches!(
+            EclipseFS::mount(Ram::new(10), false),
+            Err(Error::BadSuperblock)
+        ));
+    }
+
+    /// One device given to `mount_devices` is a plain mount, so the kernel
+    /// can always go through the volume path.
+    #[test]
+    fn mount_devices_with_one_device_is_a_plain_mount() {
+        let d = formatted(8);
+        let fs = EclipseFS::mount_devices(vec![d as Arc<dyn BlockDevice>], true).unwrap();
+        assert_eq!(fs.format_version(), 4);
+    }
+
+    #[test]
+    fn mount_devices_rejects_a_stranger_in_the_set() {
+        let a = formatted(8);
+        let b = Ram::new(8 * MIB);
+        let r = EclipseFS::mount_devices(vec![a as Arc<dyn BlockDevice>, b], false);
+        assert!(matches!(r, Err(Error::BadSuperblock)));
+    }
+
+    #[test]
+    fn a_fresh_filesystem_reports_what_mkfs_gave_it() {
+        let (_, mut fs) = mounted(16);
+        assert_eq!(fs.label(), "unit");
+        assert_eq!(fs.uuid(), opts().fsid);
+        assert_eq!(fs.sectorsize(), BLOCK_SIZE as usize);
+        let st = fs.fsinfo();
+        assert_eq!(st.block_size, BLOCK_SIZE);
+        assert_eq!(st.total_bytes, 16 * MIB as u64);
+        assert!(st.bytes_used > 0 && st.bytes_used < st.total_bytes);
+        let root = fs.root_ino();
+        assert_eq!(fs.stat(root).unwrap().kind, FileKind::Dir);
+        assert!(fs
+            .readdir(root)
+            .unwrap()
+            .iter()
+            .all(|e| e.name == "." || e.name == ".."));
+        fs.check().unwrap();
+    }
+
+    /// A read-only mount changes nothing on the disk, whatever is asked of
+    /// it.
+    #[test]
+    fn a_read_only_mount_refuses_every_change() {
+        let d = formatted(8);
+        let before = d.peek(0, 8 * MIB);
+        let mut fs = EclipseFS::mount(d.clone(), true).unwrap();
+        let root = fs.root_ino();
+        assert!(fs.create(root, "x", FileKind::Regular, 0o644, 0).is_err());
+        assert!(fs.symlink(root, "l", b"/").is_err());
+        assert!(fs.set_xattr(root, "user.a", b"1", 0).is_err());
+        fs.sync().unwrap();
+        drop(fs);
+        assert!(d.peek(0, 8 * MIB) == before);
+    }
+
+    /// Bytes used follow the data: a written file takes space, and deleting
+    /// it gives the space back once committed.
+    #[test]
+    fn bytes_used_follow_the_data() {
+        let (_, mut fs) = mounted(32);
+        fs.sync().unwrap();
+        let empty = fs.fsinfo().bytes_used;
+        let f = fs
+            .create(fs.root_ino(), "big", FileKind::Regular, 0o644, 0)
+            .unwrap();
+        fs.write(f, 0, &vec![0x5A; 4 * MIB]).unwrap();
+        fs.sync().unwrap();
+        let full = fs.fsinfo().bytes_used;
+        assert!(full >= empty + 4 * MIB as u64, "{} -> {}", empty, full);
+        fs.unlink(fs.root_ino(), "big").unwrap();
+        fs.sync().unwrap();
+        assert!(fs.fsinfo().bytes_used < empty + MIB as u64);
+    }
+
+    /// The shared read path answers either nothing (ask again exclusively)
+    /// or exactly what the exclusive one does.
+    #[test]
+    fn shared_reads_agree_with_exclusive_ones() {
+        let (_, mut fs) = mounted(16);
+        let f = fs
+            .create(fs.root_ino(), "f", FileKind::Regular, 0o644, 0)
+            .unwrap();
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        fs.write(f, 0, &data).unwrap();
+        fs.sync().unwrap();
+        for (off, len) in [
+            (0u64, 4096usize),
+            (4095, 3),
+            (100_000, 50_000),
+            (299_990, 100),
+        ] {
+            let mut a = vec![0u8; len];
+            let mut b = vec![0u8; len];
+            let n = fs.read(f, off, &mut a).unwrap();
+            if let Some(m) = fs.read_shared(f, off, &mut b).unwrap() {
+                assert_eq!(n, m);
+                assert_eq!(a[..n], b[..m]);
+            }
+        }
+        if let Some(st) = fs.stat_shared(f).unwrap() {
+            assert_eq!(st.size, data.len() as u64);
+        }
+    }
+
+    #[test]
+    fn scrub_of_a_clean_filesystem_is_clean() {
+        let (_, mut fs) = mounted(16);
+        let f = fs
+            .create(fs.root_ino(), "f", FileKind::Regular, 0o644, 0)
+            .unwrap();
+        fs.write(f, 0, &vec![1u8; 200_000]).unwrap();
+        let r = fs.scrub().unwrap();
+        assert!(r.is_clean());
+        assert!(r.tree_nodes > 0 && r.data_blocks >= 49);
+        let r = fs.repair().unwrap();
+        assert!(r.is_clean() && !r.changed(), "{:?}", r);
+    }
+
+    #[test]
+    fn scrub_and_repair_need_v4() {
+        let d = Ram::new(8 * MIB);
+        mkfs::format_v3(&*d, &opts()).unwrap();
+        let mut fs = EclipseFS::mount(d, false).unwrap();
+        assert!(matches!(fs.scrub(), Err(Error::Unsupported(_))));
+    }
+
+    // -- reports -----------------------------------------------------------
+
+    #[test]
+    fn a_scrub_report_is_clean_only_without_bad_blocks() {
+        let mut r = ScrubReport::default();
+        assert!(r.is_clean());
+        r.repaired = 3;
+        assert!(r.is_clean(), "a repaired copy is not damage");
+        r.bad_data_blocks.push(9);
+        assert!(!r.is_clean());
+        r.bad_data_blocks.clear();
+        r.bad_tree_nodes.push(1);
+        assert!(!r.is_clean());
+    }
+
+    /// Every counter of the repair report has to count as a change: one left
+    /// out and `mount -o repair` says "nothing to do" after doing something.
+    #[test]
+    fn every_repair_counter_is_a_change() {
+        assert!(!RepairReport::default().changed());
+        let setters: [fn(&mut RepairReport); 10] = [
+            |r| r.scrub.repaired = 1,
+            |r| r.refcounts_fixed = 1,
+            |r| r.bitmap_blocks_fixed = 1,
+            |r| r.items_removed = 1,
+            |r| r.entries_removed = 1,
+            |r| r.entries_fixed = 1,
+            |r| r.inodes_fixed = 1,
+            |r| r.lost_found = 1,
+            |r| r.csums_dropped = 1,
+            |r| r.csums_added = 1,
+        ];
+        for (i, set) in setters.iter().enumerate() {
+            let mut r = RepairReport::default();
+            set(&mut r);
+            assert!(r.changed(), "counter {} is not a change", i);
+        }
+    }
+
+    #[test]
+    fn a_repair_is_clean_only_with_nothing_left() {
+        let mut r = RepairReport::default();
+        assert!(r.is_clean());
+        r.unrepaired = 1;
+        assert!(!r.is_clean());
+        r.unrepaired = 0;
+        r.still_damaged = Some("refcount");
+        assert!(!r.is_clean());
+        r.still_damaged = None;
+        r.scrub.bad_tree_nodes.push(4);
+        assert!(!r.is_clean());
+    }
+}

@@ -469,3 +469,116 @@ fn no_key_name(ct: &[u8]) -> Vec<u8> {
     v.extend_from_slice(&crypt::sha256(&ct[NOKEY_PREFIX..]));
     crypt::base64url(&v)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_policy_is_xts_cts_padded_to_32() {
+        let p = EncryptionPolicy::new([9; KEY_ID_SIZE]);
+        assert!(p.supported());
+        assert_eq!(p.pad(), 32);
+        assert_eq!(p.key_id, [9; KEY_ID_SIZE]);
+    }
+
+    #[test]
+    fn the_padding_follows_the_flags() {
+        let mut p = EncryptionPolicy::new([0; KEY_ID_SIZE]);
+        for (flags, pad) in [(0u8, 4usize), (1, 8), (2, 16), (3, 32)] {
+            p.flags = flags;
+            assert_eq!(p.pad(), pad);
+        }
+    }
+
+    /// Only the modes this crate implements are accepted: a context naming
+    /// another one must not be read with the wrong cipher.
+    #[test]
+    fn other_modes_and_flags_are_unsupported() {
+        let ok = EncryptionPolicy::new([0; KEY_ID_SIZE]);
+        assert!(!EncryptionPolicy {
+            contents_mode: 9,
+            ..ok
+        }
+        .supported());
+        assert!(!EncryptionPolicy {
+            filenames_mode: 1,
+            ..ok
+        }
+        .supported());
+        assert!(!EncryptionPolicy { flags: 0x04, ..ok }.supported());
+    }
+
+    /// The context is the 40-byte `fscrypt_context_v2`, and decodes back to
+    /// itself.
+    #[test]
+    fn a_context_round_trips_in_the_fscrypt_layout() {
+        let c = Context {
+            policy: EncryptionPolicy::new(*b"0123456789abcdef"),
+            nonce: *b"fedcba9876543210",
+        };
+        let b = c.encode();
+        assert_eq!(b.len(), CONTEXT_LEN);
+        assert_eq!(b[0], CONTEXT_V2);
+        assert_eq!(
+            (b[1], b[2], b[3]),
+            (MODE_AES_256_XTS, MODE_AES_256_CTS, POLICY_FLAGS_PAD_32)
+        );
+        assert_eq!(&b[4..8], &[0; 4]);
+        assert_eq!(&b[8..24], b"0123456789abcdef");
+        assert_eq!(&b[24..40], b"fedcba9876543210");
+        assert_eq!(Context::decode(&b).unwrap(), c);
+    }
+
+    #[test]
+    fn a_bad_context_is_refused() {
+        let good = Context {
+            policy: EncryptionPolicy::new([1; KEY_ID_SIZE]),
+            nonce: [2; NONCE_SIZE],
+        }
+        .encode();
+        assert!(matches!(
+            Context::decode(&good[..39]),
+            Err(Error::Corrupt(_))
+        ));
+        let mut b = good.clone();
+        b.push(0);
+        assert!(matches!(Context::decode(&b), Err(Error::Corrupt(_))));
+        let mut b = good.clone();
+        b[0] = 1;
+        assert!(matches!(Context::decode(&b), Err(Error::Corrupt(_))));
+        let mut b = good.clone();
+        b[5] = 1;
+        assert!(matches!(Context::decode(&b), Err(Error::Corrupt(_))));
+        let mut b = good;
+        b[1] = 2;
+        assert!(matches!(Context::decode(&b), Err(Error::Unsupported(_))));
+    }
+
+    fn keyring_with(entries: &[(u64, u64)]) -> Keyring {
+        let mut k = Keyring::default();
+        for &(sv, ino) in entries {
+            let keys = Arc::new(FileKeys::new(&[7u8; 64], &[0; NONCE_SIZE]));
+            k.files.insert((sv, ino), (keys, [0; KEY_ID_SIZE]));
+        }
+        k
+    }
+
+    /// `forget` drops one inode's keys, or all of one subvolume's, and never
+    /// another subvolume's inode that happens to have the same number.
+    #[test]
+    fn forget_drops_only_what_it_names() {
+        let mut k = keyring_with(&[(5, 300), (5, 301), (6, 300)]);
+        k.forget(5, Some(300));
+        assert_eq!(
+            k.files.keys().copied().collect::<Vec<_>>(),
+            vec![(5, 301), (6, 300)]
+        );
+        let mut k = keyring_with(&[(5, 300), (5, 301), (6, 300)]);
+        k.forget(5, None);
+        assert_eq!(k.files.keys().copied().collect::<Vec<_>>(), vec![(6, 300)]);
+        let mut k = Keyring::default();
+        k.forget(5, None);
+        assert!(k.files.is_empty());
+    }
+}
