@@ -22,6 +22,9 @@ use lock::Mutex;
 use zircon_object::object::{KernelObject, KoID};
 use zircon_object::task::{Process, Status, Thread, ROOT_JOB};
 
+mod overrun;
+use overrun::*;
+
 const USEC_PER_TICK: usize = 10000;
 
 /// What `times(2)` returns: the monotonic clock in `USER_HZ` (100 Hz)
@@ -932,7 +935,7 @@ impl Syscall<'_> {
             interval: Duration::ZERO,
             next: Duration::ZERO,
             generation: 0,
-            overrun_last: 0,
+            overrun: Overrun::default(),
         };
         register_posix_timer(timer, |id| {
             let mut out: UserOutPtr<i32> = timerid.into();
@@ -970,38 +973,11 @@ impl Syscall<'_> {
                 return self.cpu_timer_settime(id, cpu, abs, init, interval, &mut old_value)
             }
         };
-        // Both clocks read before the lock, so the deadline arithmetic below
+        // Both clocks read before the lock, so the deadline arithmetic
         // happens with the map held and no HAL call under it.
         let now = kernel_hal::timer::timer_now();
         let now_wall = kernel_hal::timer::wall_clock_now();
-
-        let (old, arm) = {
-            let mut timers = POSIX_TIMERS.lock();
-            let t = timers
-                .get_mut(&id)
-                .filter(|t| t.owner == owner)
-                .ok_or(LxError::EINVAL)?;
-            let remaining = t.next.checked_sub(now).unwrap_or(Duration::ZERO);
-            let old = ITimerSpec {
-                interval: TimeSpec::from_duration(t.interval),
-                value: TimeSpec::from_duration(remaining),
-            };
-            // Bump the generation so any in-flight one-shot is dropped.
-            t.generation += 1;
-            t.interval = interval;
-            let arm = if init.is_zero() {
-                t.next = Duration::ZERO;
-                None
-            } else {
-                // `init` is a point on the timer's OWN clock when
-                // TIMER_ABSTIME is set, and the kernel timer only takes
-                // monotonic deadlines.
-                let deadline = timer_arm_deadline(base, abs, init, now, now_wall);
-                t.next = deadline;
-                Some((deadline, t.generation))
-            };
-            (old, arm)
-        };
+        let (old, arm) = set_posix_timer(id, owner, base, abs, init, interval, now, now_wall)?;
         // Same as `setitimer`: armed first, reported after. A faulting
         // `old_value` used to leave the timer recorded as due and never armed.
         commit_and_report_old(old, &mut old_value, || {
@@ -1068,15 +1044,11 @@ impl Syscall<'_> {
         }
     }
 
-    /// `timer_getoverrun`: the overrun count of the timer's last expiry,
-    /// which used to be a fixed 0 (see [`forward_periodic`]).
+    /// `timer_getoverrun`: what the last signal of the timer that was taken
+    /// carried in `si_overrun` ([`posix_timer_overrun`]).
     pub fn sys_timer_getoverrun(&self, id: usize) -> SysResult {
         let owner = self.zircon_process().id();
-        let timers = POSIX_TIMERS.lock();
-        match timers.get(&id) {
-            Some(t) if t.owner == owner => Ok(t.overrun_last.min(DELAYTIMER_MAX) as usize),
-            _ => Err(LxError::EINVAL),
-        }
+        Ok(posix_timer_overrun(id, owner)? as usize)
     }
 }
 
@@ -1123,6 +1095,53 @@ impl Syscall<'_> {
     }
 }
 
+/// Point timer `id` of `owner`, on `base`'s clock, at `init` -- a length,
+/// or with `abs` a time on that clock; zero disarms -- and then every
+/// `interval`, with the monotonic and the wall clock reading `now` and
+/// `now_wall`; and say what it was, and the deadline and generation to arm
+/// the timer wheel with.
+#[allow(clippy::too_many_arguments)]
+fn set_posix_timer(
+    id: usize,
+    owner: KoID,
+    base: ClockBase,
+    abs: bool,
+    init: Duration,
+    interval: Duration,
+    now: Duration,
+    now_wall: Duration,
+) -> Result<(ITimerSpec, Option<(Duration, u64)>), LxError> {
+    let mut timers = POSIX_TIMERS.lock();
+    let t = timers
+        .get_mut(&id)
+        .filter(|t| t.owner == owner)
+        .ok_or(LxError::EINVAL)?;
+    let remaining = t.next.checked_sub(now).unwrap_or(Duration::ZERO);
+    let old = ITimerSpec {
+        interval: TimeSpec::from_duration(t.interval),
+        value: TimeSpec::from_duration(remaining),
+    };
+    // Bump the generation so any in-flight one-shot is dropped.
+    t.generation += 1;
+    t.interval = interval;
+    t.overrun = Overrun::default();
+    if init.is_zero() {
+        t.next = Duration::ZERO;
+        return Ok((old, None));
+    }
+    // `init` is a point on the timer's OWN clock when TIMER_ABSTIME is set,
+    // and the kernel timer only takes monotonic deadlines.
+    let deadline = timer_arm_deadline(base, abs, init, now, now_wall);
+    // A periodic one counts its overruns from the expiry it was given, gone
+    // by or not.
+    (t.next, t.overrun.before_boot) = if abs && !interval.is_zero() {
+        programmed_expiry(base, init, interval, now, now_wall)
+    } else {
+        (deadline, 0)
+    };
+    Ok((old, Some((deadline, t.generation))))
+}
+
 /// Point CPU timer `id` of `owner` at `init` on its clock, which belongs to
 /// `target` and reads `now` -- a length, or with `abs` a reading of that
 /// clock; zero disarms -- and then every `interval`; and say what it was.
@@ -1143,6 +1162,7 @@ fn set_cpu_timer(
     let old = cpu_timer_spec(t, now);
     t.generation += 1;
     t.interval = interval;
+    t.overrun = Overrun::default();
     t.next = match (init.is_zero(), abs) {
         (true, _) => Duration::ZERO,
         (false, true) => init,
@@ -1313,10 +1333,9 @@ struct PosixTimer {
     /// Bumped by settime/delete to invalidate an already-scheduled one-shot
     /// (`timer_set` callbacks are not cancellable, so they check this).
     generation: u64,
-    /// The overrun count of the last expiry (`it_overrun_last`): the
-    /// periods that went by without a signal of their own because the
-    /// timer was late, what `timer_getoverrun(2)` and `si_overrun` report.
-    overrun_last: u32,
+    /// What `si_overrun` and `timer_getoverrun(2)` say about the expiries
+    /// that went by without a signal of their own.
+    overrun: Overrun,
 }
 
 lazy_static! {
@@ -1600,24 +1619,22 @@ fn run_posix_cpu_timers(proc: &Process, thread: &Thread, itimers: &Itimers) {
                 _ => continue,
             };
             let now = Duration::from_nanos(cpu.kind.value_ns(user, sys));
-            if let Some(overrun) = expire_cpu_posix_timer(t, now) {
-                due.push((id, t.owner, t.notify, overrun));
+            if let Some(expiry) = expire_cpu_posix_timer(t, now) {
+                due.push((id, t.generation, t.owner, t.notify, expiry));
             }
             armed |= !t.next.is_zero();
         }
         itimers.set_posix_cpu_armed(armed);
     }
-    for (id, owner, notify, overrun) in due {
-        if let Some((signal, info)) = posix_timer_expiry_signal(id, notify, overrun) {
-            deliver_timer_signal(owner, notify.thread, signal, info);
-        }
+    for (id, gen, owner, notify, expiry) in due {
+        signal_posix_timer_expiry(id, gen, owner, notify, expiry);
     }
 }
 
-/// One look at CPU timer `t` whose clock reads `now`: the overrun count of
-/// its expiry if it has gone off, with a periodic one moved past `now`
-/// (`bump_cpu_timer`) and a one-shot disarmed.
-fn expire_cpu_posix_timer(t: &mut PosixTimer, now: Duration) -> Option<u32> {
+/// One look at CPU timer `t` whose clock reads `now`: its expiry if it has
+/// gone off, with a periodic one moved past `now` (`bump_cpu_timer`) and a
+/// one-shot disarmed.
+fn expire_cpu_posix_timer(t: &mut PosixTimer, now: Duration) -> Option<Expiry> {
     if t.next.is_zero() || t.next > now {
         return None;
     }
@@ -1629,8 +1646,7 @@ fn expire_cpu_posix_timer(t: &mut PosixTimer, now: Duration) -> Option<u32> {
         t.next = next;
         overrun
     };
-    t.overrun_last = overrun;
-    Some(overrun)
+    Some(t.overrun.expiry(overrun))
 }
 
 /// One look at a CPU itimer slot whose clock reads `now`: whether it has
@@ -1903,10 +1919,9 @@ fn arm_posix_timer(id: usize, deadline: Duration, gen: u64) {
     );
 }
 
-/// One expiry of POSIX timer `id`, at `now`: deliver its signal, with the
-/// overrun count of this expiry in `si_overrun` and kept for
-/// `timer_getoverrun`, and say when it fires next if it is periodic.
-/// Nothing if the timer was deleted or re-armed since (`gen`).
+/// One expiry of POSIX timer `id`, at `now`: tell its owner
+/// ([`signal_posix_timer_expiry`]), and say when it fires next if it is
+/// periodic. Nothing if the timer was deleted or re-armed since (`gen`).
 fn expire_posix_timer(id: usize, gen: u64, now: Duration) -> Option<Duration> {
     // The owner first, and outside the table's lock: `find_process` takes the
     // job's. A timer whose owner has died since it was armed (the exit hook
@@ -1931,20 +1946,17 @@ fn expire_posix_timer(id: usize, gen: u64, now: Duration) -> Option<Duration> {
                     t.next = Duration::ZERO;
                     0
                 } else {
-                    let (next, overrun) = forward_periodic(t.next, t.interval, now);
+                    let (next, overrun) = next_periodic(t.next, t.interval, now);
                     t.next = next;
                     rearm = Some(next);
                     overrun
                 };
-                t.overrun_last = overrun;
-                fire = Some((t.owner, t.notify, overrun));
+                fire = Some((t.owner, t.notify, t.overrun.expiry(overrun)));
             }
         }
     }
-    if let Some((owner, notify, overrun)) = fire {
-        if let Some((signal, info)) = posix_timer_expiry_signal(id, notify, overrun) {
-            deliver_timer_signal(owner, notify.thread, signal, info);
-        }
+    if let Some((owner, notify, expiry)) = fire {
+        signal_posix_timer_expiry(id, gen, owner, notify, expiry);
     }
     rearm
 }
@@ -2880,7 +2892,7 @@ mod exec_timer_tests {
                 interval: Duration::from_secs(1),
                 next: Duration::from_secs(1),
                 generation: 0,
-                overrun_last: 0,
+                overrun: Overrun::default(),
             },
         );
         id
@@ -2945,7 +2957,7 @@ mod exec_timer_tests {
             interval: Duration::ZERO,
             next: Duration::ZERO,
             generation: 0,
-            overrun_last: 0,
+            overrun: Overrun::default(),
         };
         assert_eq!(
             register_posix_timer(fresh(), |_| Err(LxError::EFAULT)),
@@ -3008,7 +3020,7 @@ mod exit_timer_tests {
                 interval: Duration::from_secs(1),
                 next: Duration::from_secs(1),
                 generation: 0,
-                overrun_last: 0,
+                overrun: Overrun::default(),
             },
         );
         id
@@ -3245,7 +3257,7 @@ mod overrun_tests {
                 interval: ms(10),
                 next: ms(1000),
                 generation: 0,
-                overrun_last: 0,
+                overrun: Overrun::default(),
             },
         );
         id
@@ -3298,9 +3310,13 @@ mod overrun_tests {
             "not SI_TIMER: a POSIX timer expiry"
         );
         assert_eq!(si_overrun(&info), 50, "si_overrun");
+        assert_eq!(
+            posix_timer_overrun(id, proc.id()),
+            Ok(50),
+            "timer_getoverrun would answer this"
+        );
         let timers = POSIX_TIMERS.lock();
         let t = timers.get(&id).unwrap();
-        assert_eq!(t.overrun_last, 50, "timer_getoverrun would answer this");
         assert_eq!(t.next, ms(1510));
         assert!(
             !thread.lock_linux().signals.contains(Signal::SIGALRM),

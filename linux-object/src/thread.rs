@@ -1191,6 +1191,15 @@ impl LinuxThread {
         info
     }
 
+    /// The `siginfo_t` `signal` is pending with, to change in place: `None`
+    /// when it is not pending, or came without one.
+    pub fn pending_siginfo_mut(&mut self, signal: Signal) -> Option<&mut SigInfo> {
+        if !self.signals.contains(signal) {
+            return None;
+        }
+        self.pending_info.get_mut(&(signal as u8))
+    }
+
     /// The signals this thread would take **right now**: pending and not
     /// blocked. Zero means [`Self::handle_signal`] would answer `None`.
     ///
