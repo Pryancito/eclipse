@@ -5,8 +5,8 @@ use futures::future::{select, Either};
 use futures::{pin_mut, poll};
 use kernel_hal::timer::timer_now;
 use linux_object::process::{
-    check_signals_of, Capabilities, SignalPark, CAP_FULL_SET, CAP_SYSLOG, CAP_SYS_ADMIN,
-    CAP_SYS_BOOT, CAP_SYS_NICE, CAP_SYS_RESOURCE,
+    check_signals_of, Capabilities, SignalPark, CAP_FULL_SET, CAP_SETPCAP, CAP_SYSLOG,
+    CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_NICE, CAP_SYS_RESOURCE,
 };
 use linux_object::thread::ThreadExt;
 use linux_object::time::*;
@@ -1429,7 +1429,8 @@ fn cap_user_data(caps: &Capabilities) -> [CapUserData; 2] {
 /// `EPERM`, in the kernel's order:
 ///
 /// ```c
-/// if (!cap_issubset(*inheritable, cap_combine(old->cap_inheritable, old->cap_permitted)))
+/// if (cap_inh_is_capped() &&
+///     !cap_issubset(*inheritable, cap_combine(old->cap_inheritable, old->cap_permitted)))
 ///         return -EPERM;   /* incapable of using this inheritable set */
 /// if (!cap_issubset(*inheritable, cap_combine(old->cap_inheritable, old->cap_bset)))
 ///         return -EPERM;   /* no new pI capabilities outside bounding set */
@@ -1442,9 +1443,17 @@ fn cap_user_data(caps: &Capabilities) -> [CapUserData; 2] {
 /// A set may only ever shrink: nothing checked this before, so a process
 /// running as any user could `capset` itself every capability and be told
 /// it had them (nothing stored them, but the answer was the lie).
+///
+/// `cap_inh_is_capped` is false for a caller with `CAP_SETPCAP` in its
+/// effective set (`capset` only ever changes the caller, so `old` is that
+/// caller): it may make inheritable what it does not hold, as long as the
+/// bounding set allows it. Measured on Linux 6.18: root without
+/// `CAP_NET_ADMIN` in its permitted set may still make it inheritable, and
+/// gets `EPERM` once `CAP_SETPCAP` is out of its effective set.
 fn capset_sets_verdict(old: &CapSets, bset: u64, new: &CapSets) -> LxResult {
     let subset = |part: u64, whole: u64| part & !whole == 0;
-    if !subset(new.inheritable, old.inheritable | old.permitted) {
+    let inh_is_capped = old.effective & (1 << CAP_SETPCAP) == 0;
+    if inh_is_capped && !subset(new.inheritable, old.inheritable | old.permitted) {
         return Err(LxError::EPERM);
     }
     if !subset(new.inheritable, old.inheritable | bset) {
@@ -2259,6 +2268,46 @@ mod capability_tests {
         );
         // ...unless it was inheritable already (old inheritable | bset).
         assert_eq!(capset_sets_verdict(&held, 0x7, &sets(0, 0x7, 0x8)), Ok(()));
+    }
+
+    /// What Linux 6.18 did with root that had `CAP_NET_ADMIN` (bit 12) out
+    /// of its effective and permitted sets: with `CAP_SETPCAP` effective it
+    /// may still make bit 12 inheritable; with `CAP_SETPCAP` out of its
+    /// effective set (but still permitted) the same request is `EPERM`.
+    #[test]
+    fn setpcap_lets_the_inheritable_set_go_past_what_is_held() {
+        const NET_ADMIN: u64 = 1 << 12;
+        const SETPCAP: u64 = 1 << CAP_SETPCAP;
+        let without = CAP_FULL_SET & !NET_ADMIN;
+        let held = sets(without, without, 0);
+        assert_eq!(
+            capset_sets_verdict(&held, CAP_FULL_SET, &sets(without, without, NET_ADMIN)),
+            Ok(())
+        );
+        let unable = sets(without & !SETPCAP, without, 0);
+        assert_eq!(
+            capset_sets_verdict(
+                &unable,
+                CAP_FULL_SET,
+                &sets(without & !SETPCAP, without, NET_ADMIN)
+            ),
+            Err(LxError::EPERM)
+        );
+        // The bounding set still has the last word: `CAP_SETPCAP` lifts
+        // only the first of the two inheritable tests.
+        assert_eq!(
+            capset_sets_verdict(
+                &held,
+                CAP_FULL_SET & !NET_ADMIN,
+                &sets(without, without, NET_ADMIN)
+            ),
+            Err(LxError::EPERM)
+        );
+        // And it lifts nothing about the permitted set.
+        assert_eq!(
+            capset_sets_verdict(&held, CAP_FULL_SET, &sets(without, CAP_FULL_SET, 0)),
+            Err(LxError::EPERM)
+        );
     }
 }
 
