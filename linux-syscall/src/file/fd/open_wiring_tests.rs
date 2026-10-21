@@ -830,6 +830,7 @@ fn where_a_relative_open_starts_is_the_descriptor_it_was_given() {
                     O_CREAT | O_WRONLY,
                     A_PLAIN_MODE
                 )
+                .await
                 .is_ok());
             assert!(
                 exists(&lp, &alloc::format!("{dir}/here")),

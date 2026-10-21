@@ -458,20 +458,23 @@ fn capset_lets_a_set_shrink_and_refuses_one_that_grows() {
                 Ok(0),
                 "root may not keep what it holds"
             );
-            assert_eq!(
-                capset(sys, &mut hdr, &sets(0, 0, 0)),
-                Ok(0),
-                "root may not drop what it holds"
-            );
 
-            // And it may make the lot inheritable: its bounding set is
-            // every capability there is, which is what `PR_CAPBSET_READ`
-            // reports. A kernel that passed an empty bounding set in here
-            // would refuse this.
+            // And while it holds them it may make the lot inheritable: its
+            // bounding set is every capability there is, which is what
+            // `PR_CAPBSET_READ` reports. A kernel that passed an empty
+            // bounding set in here would refuse this. It has to come
+            // before the drop: the sets are kept, so a root that has given
+            // everything away no longer holds what it would be passing on,
+            // and Linux refuses it then too.
             assert_eq!(
                 capset(sys, &mut hdr, &sets(0, 0, EVERY_CAPABILITY)),
                 Ok(0),
                 "root may not make what it holds inheritable"
+            );
+            assert_eq!(
+                capset(sys, &mut hdr, &sets(0, 0, 0)),
+                Ok(0),
+                "root may not drop what it holds"
             );
 
             // What is refused even of root: an effective set wider than
