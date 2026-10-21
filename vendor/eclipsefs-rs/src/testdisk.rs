@@ -15,8 +15,25 @@ use crate::{Error, Result};
 /// would.
 pub(crate) struct Ram(Spin<Vec<u8>>);
 
+/// Every log record, formatted and dropped, so the arguments of `warn!`
+/// and `debug!` run in tests too.
+struct Sink;
+
+impl log::Log for Sink {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, r: &log::Record) {
+        core::hint::black_box(alloc::format!("{}", r.args()));
+    }
+    fn flush(&self) {}
+}
+
 impl Ram {
     pub(crate) fn new(bytes: usize) -> Arc<Self> {
+        if log::set_logger(&Sink).is_ok() {
+            log::set_max_level(log::LevelFilter::Trace);
+        }
         Arc::new(Self(Spin::new(vec![0xA5; bytes])))
     }
 

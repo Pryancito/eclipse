@@ -471,6 +471,7 @@ fn no_key_name(ct: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

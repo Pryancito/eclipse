@@ -21,6 +21,8 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(warnings)]
+// `cargo llvm-cov` measures the driver, not the tests that exercise it.
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 extern crate alloc;
 
@@ -43,6 +45,7 @@ pub mod mkfs;
 pub mod raid56;
 pub mod space;
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod testdisk;
 pub mod v3;
 pub mod volume;

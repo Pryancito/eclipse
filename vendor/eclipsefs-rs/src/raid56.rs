@@ -131,10 +131,9 @@ pub fn recover(row: &mut [Vec<u8>], k: usize, missing: &[usize]) -> Result<()> {
             row[x] = out;
         }
         1 => {
-            // P lost too: from Q. g^x·Dx = Q ^ sum of the others.
-            if parity < 2 || q_lost {
-                return Err(Error::Io);
-            }
+            // P lost too: from Q. g^x·Dx = Q ^ sum of the others. Two
+            // blocks are missing, so this is a RAID6 row and Q is intact.
+            debug_assert!(parity >= 2 && !q_lost);
             let x = lost_data[0];
             let mut out = row[k + 1].clone();
             for (i, d) in row[..k].iter().enumerate() {
@@ -186,6 +185,7 @@ pub fn recover(row: &mut [Vec<u8>], k: usize, missing: &[usize]) -> Result<()> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -339,5 +339,39 @@ mod tests {
         row[k + 1].fill(0);
         recover(&mut row, k, &[2, k + 1]).unwrap();
         assert_eq!(row, good);
+    }
+
+    #[test]
+    fn the_field_tables_rebuild_at_run_time() {
+        let (exp, log) = tables();
+        assert_eq!(exp, EXP);
+        assert_eq!(log, LOG);
+    }
+
+    #[test]
+    fn multiplying_by_zero_adds_nothing() {
+        let mut d = vec![7u8; 16];
+        mul_xor(&mut d, &[9u8; 16], 0);
+        assert_eq!(d, vec![7u8; 16]);
+    }
+
+    /// A row with more parity blocks than RAID6 has is not something
+    /// `recover` knows how to solve for three lost data blocks.
+    #[test]
+    fn three_lost_data_blocks_are_an_error() {
+        let mut r = rand_row(4, 2, 5);
+        r.push(vec![0; 64]);
+        assert_eq!(recover(&mut r, 4, &[0, 1, 2]), Err(Error::Io));
+    }
+
+    #[test]
+    fn missing_blocks_outside_the_row_are_an_error() {
+        let mut r = rand_row(3, 2, 6);
+        assert_eq!(recover(&mut r, 3, &[9]), Err(Error::Io));
+        // Naming a block twice is naming it once.
+        let good = r.clone();
+        r[1] = vec![0; 64];
+        recover(&mut r, 3, &[1, 1]).unwrap();
+        assert_eq!(r, good);
     }
 }
