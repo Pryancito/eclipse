@@ -309,6 +309,66 @@ impl TcpSocketState {
         inner.bound = Some(ep);
         Ok(ep)
     }
+
+    /// The blocking half of `connect`: wait for the handshake of a socket in
+    /// `SynSent` to end, in a connection or in an error.
+    async fn wait_for_handshake(&self, handle: smoltcp::socket::SocketHandle) -> SysResult {
+        let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(30);
+        let mut empty_polls: u32 = 0;
+        loop {
+            drain_net_poll(4);
+            kernel_hal::deferred_job::drain_deferred_jobs();
+
+            match get_sockets().lock().get::<TcpSocket>(handle).state() {
+                TcpState::SynSent | TcpState::SynReceived => {}
+                TcpState::Established => {
+                    flush_socket_egress();
+                    let mut inner = self.inner.lock();
+                    inner.connect_in_progress = false;
+                    inner.was_connected = true;
+                    inner.pending_error = 0;
+                    return Ok(0);
+                }
+                TcpState::Closed | TcpState::TimeWait => {
+                    // The peer refused the connection (RST moves SynSent->Closed).
+                    // Report it immediately with the correct errno instead of
+                    // spinning until the 30s deadline and returning ETIMEDOUT.
+                    // Mirrors the non-blocking path above. ETIMEDOUT is still
+                    // returned below for the SynSent/SynReceived no-response case.
+                    let mut inner = self.inner.lock();
+                    inner.connect_in_progress = false;
+                    inner.pending_error = LxError::ECONNREFUSED as isize as i32;
+                    return Err(LxError::ECONNREFUSED);
+                }
+                other => {
+                    warn!("connect: unexpected state {:?}, retrying", other);
+                }
+            }
+
+            if kernel_hal::timer::timer_now() >= deadline {
+                warn!("connect: timed out after 30s");
+                // Given up on, as `tcp_write_err` gives it up: closed, so the
+                // next connect starts over instead of waiting on this one.
+                get_sockets().lock().get::<TcpSocket>(handle).abort();
+                let mut inner = self.inner.lock();
+                inner.connect_in_progress = false;
+                inner.pending_error = LxError::ETIMEDOUT as isize as i32;
+                return Err(LxError::ETIMEDOUT);
+            }
+
+            // A signal ends the wait and leaves the handshake going on, as
+            // `SS_CONNECTING`: a kill did not, and held the caller for up to
+            // 30 s -- its memory too, reaped or not.
+            if let Err(e) = crate::process::check_signals() {
+                self.inner.lock().connect_in_progress = true;
+                return Err(e);
+            }
+            // Park on the RX IRQ waker (adaptive fallback) while the handshake
+            // completes, rather than busy-spinning — see read().
+            empty_polls = empty_polls.saturating_add(1);
+            kernel_hal::net::NetRxOrTimeoutFuture::new(adaptive_park_ms(empty_polls)).await;
+        }
+    }
 }
 
 #[async_trait]
@@ -604,20 +664,27 @@ impl Socket for TcpSocketState {
             ip.addr = Self::loopback_addr(ipv6);
         }
 
-        {
+        let connecting = {
             let sockets = get_sockets();
             let mut sets = sockets.lock();
             let socket = sets.get::<TcpSocket>(handle);
-            // A connect() while the handshake is still in progress must return
-            // EALREADY (POSIX), not EISCONN. Apps re-issue connect() to poll a
-            // non-blocking connect to completion; EISCONN makes them believe the
-            // socket is connected and write() on SynSent -> EPIPE.
-            if matches!(socket.state(), TcpState::SynSent | TcpState::SynReceived) {
-                return Err(LxError::EALREADY);
-            }
-            if socket.is_active() {
+            let connecting = matches!(socket.state(), TcpState::SynSent | TcpState::SynReceived);
+            if !connecting && socket.is_active() {
                 return Err(LxError::EISCONN);
             }
+            connecting
+        };
+        // A connect() while the handshake is still in progress must return
+        // EALREADY (POSIX), not EISCONN. Apps re-issue connect() to poll a
+        // non-blocking connect to completion; EISCONN makes them believe the
+        // socket is connected and write() on SynSent -> EPIPE. A blocking one
+        // goes back to waiting for the handshake (`__inet_stream_connect`),
+        // which is also what a connect a signal cut short is made again as.
+        if connecting {
+            if non_block {
+                return Err(LxError::EALREADY);
+            }
+            return self.wait_for_handshake(handle).await;
         }
 
         // Honor a prior bind(): use its local endpoint; if unbound, take an
@@ -676,51 +743,7 @@ impl Socket for TcpSocketState {
             }
         }
 
-        let deadline = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(30);
-        let mut empty_polls: u32 = 0;
-        loop {
-            drain_net_poll(4);
-            kernel_hal::deferred_job::drain_deferred_jobs();
-
-            match get_sockets().lock().get::<TcpSocket>(handle).state() {
-                TcpState::SynSent | TcpState::SynReceived => {}
-                TcpState::Established => {
-                    flush_socket_egress();
-                    let mut inner = self.inner.lock();
-                    inner.connect_in_progress = false;
-                    inner.was_connected = true;
-                    inner.pending_error = 0;
-                    return Ok(0);
-                }
-                TcpState::Closed | TcpState::TimeWait => {
-                    // The peer refused the connection (RST moves SynSent->Closed).
-                    // Report it immediately with the correct errno instead of
-                    // spinning until the 30s deadline and returning ETIMEDOUT.
-                    // Mirrors the non-blocking path above. ETIMEDOUT is still
-                    // returned below for the SynSent/SynReceived no-response case.
-                    let mut inner = self.inner.lock();
-                    inner.connect_in_progress = false;
-                    inner.pending_error = LxError::ECONNREFUSED as isize as i32;
-                    return Err(LxError::ECONNREFUSED);
-                }
-                other => {
-                    warn!("connect: unexpected state {:?}, retrying", other);
-                }
-            }
-
-            if kernel_hal::timer::timer_now() >= deadline {
-                warn!("connect: timed out after 30s");
-                let mut inner = self.inner.lock();
-                inner.connect_in_progress = false;
-                inner.pending_error = LxError::ETIMEDOUT as isize as i32;
-                return Err(LxError::ETIMEDOUT);
-            }
-
-            // Park on the RX IRQ waker (adaptive fallback) while the handshake
-            // completes, rather than busy-spinning — see read().
-            empty_polls = empty_polls.saturating_add(1);
-            kernel_hal::net::NetRxOrTimeoutFuture::new(adaptive_park_ms(empty_polls)).await;
-        }
+        self.wait_for_handshake(handle).await
     }
     /// wait for some event on a file descriptor
     fn poll(&self, events: PollEvents) -> (bool, bool, bool) {
@@ -1001,6 +1024,10 @@ impl Socket for TcpSocketState {
                 if non_block {
                     return Err(LxError::EAGAIN);
                 }
+                // `inet_csk_wait_for_connect` sleeps interruptibly: a signal
+                // ends it, and a kill did not, so a server killed in `accept`
+                // was reaped and then never let go of its memory.
+                crate::process::check_signals()?;
                 thread::sleep_until(
                     kernel_hal::timer::timer_now() + core::time::Duration::from_millis(5),
                 )
@@ -1605,7 +1632,7 @@ mod port_tests {
     //! `inet_connection_sock.c`, on the host: the sockets live in the real
     //! global smoltcp set and a loopback interface built here carries the
     //! handshake between two of them. Every test takes `NET_TEST_LOCK`
-    //! (shared with the UDP tests) and uses its own ports, 41010-41090.
+    //! (shared with the UDP tests) and uses its own ports, 41010-41092.
 
     use super::*;
     use alloc::collections::BTreeMap;
@@ -2063,6 +2090,78 @@ mod port_tests {
             Some(Endpoint::Ip(ep)) if ep == IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), 41050)
         ));
         assert_eq!(connect(&c, lo(41050)), Err(LxError::EISCONN));
+    }
+
+    /// `call` made by a thread of a process that is being killed, on a host
+    /// thread of its own, and what it returned: `None` if it did not. A
+    /// blocking socket call that does not look for signals never returns
+    /// there, and a process killed in it was reaped and kept its memory.
+    fn killed_while_in<T, F>(pid: u64, call: impl FnOnce() -> F + Send + 'static) -> Option<T>
+    where
+        T: Send + 'static,
+        F: core::future::Future<Output = T>,
+    {
+        extern crate std;
+        use crate::thread::ThreadExt;
+        use zircon_object::task::{Process, Thread, ROOT_JOB};
+        let lp = crate::process::LinuxProcess::new(rcore_fs_ramfs::RamFS::new(), 0);
+        let proc = Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "killed", lp).unwrap();
+        let thread = Thread::create_linux(&proc).unwrap();
+        proc.exit(137);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // The current thread is the task's: set inside the one task.
+            let got = async_std::task::block_on(async move {
+                kernel_hal::thread::set_current_thread(Some(thread));
+                call().await
+            });
+            let _ = tx.send(got);
+        });
+        rx.recv_timeout(core::time::Duration::from_secs(3)).ok()
+    }
+
+    /// A blocking `accept` nobody connects to: `EINTR` once the caller is
+    /// being killed, where it napped 5 ms at a time for good.
+    #[test]
+    fn a_kill_ends_a_blocking_accept() {
+        let _g = LOCK.lock();
+        let server = TcpSocketState::new(false).unwrap();
+        assert_eq!(Socket::bind(&server, v4(41091)), Ok(0));
+        assert_eq!(Socket::listen(&server), Ok(0));
+        let got = killed_while_in(47_141, move || async move {
+            Socket::accept(&server).await.err()
+        });
+        assert_eq!(got, Some(Some(LxError::EINTR)));
+    }
+
+    /// A blocking connect whose SYN nobody has answered: `EINTR` once the
+    /// caller is being killed, and the handshake goes on (`SS_CONNECTING`).
+    /// Made again blocking it goes back to waiting, as on Linux, which here
+    /// ends in `EINTR` again and not in `EALREADY`; and the refusal that ends
+    /// the handshake afterwards is the socket's `SO_ERROR`.
+    #[test]
+    fn a_kill_ends_a_blocking_connect_and_leaves_the_handshake_going() {
+        let _g = LOCK.lock();
+        let mut iface = loopback();
+        let c = Arc::new(TcpSocketState::new(false).unwrap());
+        let first = c.clone();
+        let got = killed_while_in(47_142, move || async move {
+            Socket::connect(&*first, lo(41092)).await
+        });
+        assert_eq!(got, Some(Err(LxError::EINTR)));
+        assert_eq!(state_of(&c), TcpState::SynSent, "the handshake goes on");
+        let again = c.clone();
+        let got = killed_while_in(47_143, move || async move {
+            Socket::connect(&*again, lo(41092)).await
+        });
+        assert_eq!(got, Some(Err(LxError::EINTR)), "made again, it waits");
+        // Nobody listens on the port: the SYN is answered with a RST.
+        deliver(&mut iface);
+        assert_eq!(state_of(&c), TcpState::Closed);
+        assert_eq!(
+            Socket::take_so_error(&*c),
+            LxError::ECONNREFUSED as isize as i32
+        );
     }
 
     #[test]

@@ -77,58 +77,102 @@ fn usb_tablet_owns_pointer() -> bool {
     }
 }
 
-fn wait_write() -> bool {
-    let mut status_port = Port::<u8>::new(0x64);
+/// Todo lo que el camino PS/2 consulta fuera de sí mismo: los dos puertos del
+/// i8042 y el pestillo del tablet USB. El hardware es una implementación más
+/// (`HwIo`), de modo que lo que hay por encima -- la negociación de la rueda,
+/// la resincronización de paquetes, el barrido de la IRQ -- queda por ENCIMA
+/// de esta costura y se puede ejercitar contra un 8042 de mentira.
+trait Ps2Io {
+    /// Puerto 0x64 en lectura: bit 0 = hay byte que leer, bit 1 = el buffer de
+    /// entrada está ocupado, bit 5 = el byte que viene es del puerto aux.
+    fn status(&mut self) -> u8;
+    /// Puerto 0x60 en lectura.
+    fn read(&mut self) -> u8;
+    /// Puerto 0x60 en escritura.
+    fn write_data(&mut self, value: u8);
+    /// Puerto 0x64 en escritura: comandos del controlador.
+    fn write_cmd(&mut self, value: u8);
+    /// Si un tablet USB ya manda el puntero en absoluto.
+    fn tablet_owns_pointer(&mut self) -> bool {
+        usb_tablet_owns_pointer()
+    }
+}
+
+/// El i8042 de verdad, y el único sitio del fichero que toca puertos.
+struct HwIo {
+    data: Port<u8>,
+    status: Port<u8>,
+}
+
+impl HwIo {
+    fn new() -> Self {
+        Self {
+            data: Port::new(0x60),
+            status: Port::new(0x64),
+        }
+    }
+}
+
+impl Ps2Io for HwIo {
+    fn status(&mut self) -> u8 {
+        unsafe { self.status.read() }
+    }
+
+    fn read(&mut self) -> u8 {
+        unsafe { self.data.read() }
+    }
+
+    fn write_data(&mut self, value: u8) {
+        unsafe { self.data.write(value) }
+    }
+
+    fn write_cmd(&mut self, value: u8) {
+        unsafe { self.status.write(value) }
+    }
+}
+
+fn wait_write<I: Ps2Io>(io: &mut I) -> bool {
     let mut timeout = 100_000;
-    unsafe {
-        while (status_port.read() & 0x02) != 0 && timeout > 0 {
-            timeout -= 1;
-            core::hint::spin_loop();
-        }
-        timeout > 0
+    while (io.status() & 0x02) != 0 && timeout > 0 {
+        timeout -= 1;
+        core::hint::spin_loop();
     }
+    timeout > 0
 }
 
-fn wait_read() -> bool {
-    let mut status_port = Port::<u8>::new(0x64);
+fn wait_read<I: Ps2Io>(io: &mut I) -> bool {
     let mut timeout = 100_000;
-    unsafe {
-        while (status_port.read() & 0x01) == 0 && timeout > 0 {
-            timeout -= 1;
-            core::hint::spin_loop();
-        }
-        timeout > 0
+    while (io.status() & 0x01) == 0 && timeout > 0 {
+        timeout -= 1;
+        core::hint::spin_loop();
+    }
+    timeout > 0
+}
+
+fn drain_output<I: Ps2Io>(io: &mut I) {
+    while (io.status() & 0x01) != 0 {
+        let _ = io.read();
     }
 }
 
-fn drain_output(data_port: &mut Port<u8>, status_port: &mut Port<u8>) {
-    unsafe {
-        while (status_port.read() & 0x01) != 0 {
-            let _ = data_port.read();
-        }
-    }
-}
-
-fn read_data(data_port: &mut Port<u8>) -> Option<u8> {
-    if wait_read() {
-        Some(unsafe { data_port.read() })
+fn read_data<I: Ps2Io>(io: &mut I) -> Option<u8> {
+    if wait_read(io) {
+        Some(io.read())
     } else {
         None
     }
 }
 
-fn write_aux(data_port: &mut Port<u8>, status_port: &mut Port<u8>, cmd: u8) -> bool {
-    unsafe {
-        if !wait_write() {
-            return false;
-        }
-        status_port.write(0xD4);
-        if !wait_write() {
-            return false;
-        }
-        data_port.write(cmd);
+fn write_aux<I: Ps2Io>(io: &mut I, cmd: u8) -> bool {
+    if !wait_write(io) {
+        return false;
     }
-    matches!(read_data(data_port), Some(0xFA))
+    io.write_cmd(0xD4);
+    if !wait_write(io) {
+        return false;
+    }
+    io.write_data(cmd);
+    matches!(read_data(io), Some(0xFA))
 }
 
 impl Default for Ps2Input {
@@ -139,68 +183,12 @@ impl Default for Ps2Input {
 
 impl Ps2Input {
     pub fn new() -> Self {
-        let proto;
-        // Initialize PS/2 controller
-        unsafe {
-            let mut data_port = Port::<u8>::new(0x60);
-            let mut status_port = Port::<u8>::new(0x64);
+        Self::with_io(&mut HwIo::new())
+    }
 
-            drain_output(&mut data_port, &mut status_port);
-
-            // 1. Enable ports (keyboard & mouse)
-            if wait_write() {
-                status_port.write(0xAE); // Enable keyboard port
-            }
-            if wait_write() {
-                status_port.write(0xA8); // Enable mouse port
-            }
-
-            // 2. Read Controller Configuration Byte
-            if wait_write() {
-                status_port.write(0x20);
-            }
-            let mut config = 0;
-            if let Some(v) = read_data(&mut data_port) {
-                config = v;
-            }
-
-            // 3. Update Configuration Byte:
-            // - Bit 0: Enable keyboard interrupt
-            // - Bit 1: Enable mouse interrupt
-            // - Bit 4: Clear disable keyboard clock
-            // - Bit 5: Clear disable mouse clock
-            // - Bit 6: Enable translation to Scan Code Set 1
-            config |= 0x01;
-            config |= 0x02;
-            config &= !0x10;
-            config &= !0x20;
-            config |= 0x40;
-
-            if wait_write() {
-                status_port.write(0x60);
-                if wait_write() {
-                    data_port.write(config);
-                }
-            }
-
-            drain_output(&mut data_port, &mut status_port);
-
-            // 4. Reset the mouse first: real hardware often ignores follow-up
-            // commands until BAT/device-id have completed.
-            if write_aux(&mut data_port, &mut status_port, 0xFF) {
-                let _ = read_data(&mut data_port); // BAT result (usually 0xAA)
-                let _ = read_data(&mut data_port); // Device ID (usually 0x00)
-            }
-
-            // 5. Restore defaults, negotiate a wheel protocol, then enable
-            // streaming packet reports. The knock MUST happen while the device
-            // is still disabled (0xF4 comes last): a mouse in stream mode
-            // interleaves motion packets with command replies and the id read
-            // below would pick up a motion byte instead.
-            let _ = write_aux(&mut data_port, &mut status_port, 0xF6);
-            proto = negotiate_wheel(&mut data_port, &mut status_port);
-            let _ = write_aux(&mut data_port, &mut status_port, 0xF4);
-        }
+    /// El arranque completo contra cualquier `Ps2Io`.
+    fn with_io<I: Ps2Io>(io: &mut I) -> Self {
+        let proto = init_controller(io);
 
         info!("[ps2] aux protocol: {:?}", proto);
 
@@ -213,19 +201,80 @@ impl Ps2Input {
     }
 }
 
+/// Programa el i8042 y deja al ratón enviando paquetes, devolviendo el
+/// protocolo aux que admitió.
+fn init_controller<I: Ps2Io>(io: &mut I) -> Ps2MouseProto {
+    drain_output(io);
+
+    // 1. Enable ports (keyboard & mouse)
+    if wait_write(io) {
+        io.write_cmd(0xAE); // Enable keyboard port
+    }
+    if wait_write(io) {
+        io.write_cmd(0xA8); // Enable mouse port
+    }
+
+    // 2. Read Controller Configuration Byte
+    if wait_write(io) {
+        io.write_cmd(0x20);
+    }
+    let mut config = 0;
+    if let Some(v) = read_data(io) {
+        config = v;
+    }
+
+    // 3. Update Configuration Byte:
+    // - Bit 0: Enable keyboard interrupt
+    // - Bit 1: Enable mouse interrupt
+    // - Bit 4: Clear disable keyboard clock
+    // - Bit 5: Clear disable mouse clock
+    // - Bit 6: Enable translation to Scan Code Set 1
+    config |= 0x01;
+    config |= 0x02;
+    config &= !0x10;
+    config &= !0x20;
+    config |= 0x40;
+
+    if wait_write(io) {
+        io.write_cmd(0x60);
+        if wait_write(io) {
+            io.write_data(config);
+        }
+    }
+
+    drain_output(io);
+
+    // 4. Reset the mouse first: real hardware often ignores follow-up
+    // commands until BAT/device-id have completed.
+    if write_aux(io, 0xFF) {
+        let _ = read_data(io); // BAT result (usually 0xAA)
+        let _ = read_data(io); // Device ID (usually 0x00)
+    }
+
+    // 5. Restore defaults, negotiate a wheel protocol, then enable
+    // streaming packet reports. The knock MUST happen while the device
+    // is still disabled (0xF4 comes last): a mouse in stream mode
+    // interleaves motion packets with command replies and the id read
+    // below would pick up a motion byte instead.
+    let _ = write_aux(io, 0xF6);
+    let proto = negotiate_wheel(io);
+    let _ = write_aux(io, 0xF4);
+    proto
+}
+
 /// Ask the mouse for its device id (GET_INFO, 0xF2). `None` if it does not
 /// answer, which is the normal outcome when there is no aux device at all.
-fn mouse_id(data_port: &mut Port<u8>, status_port: &mut Port<u8>) -> Option<u8> {
-    if !write_aux(data_port, status_port, 0xF2) {
+fn mouse_id<I: Ps2Io>(io: &mut I) -> Option<u8> {
+    if !write_aux(io, 0xF2) {
         return None;
     }
-    read_data(data_port)
+    read_data(io)
 }
 
 /// Set the reporting rate (SET_SAMPLE_RATE, 0xF3 + value). Used both for its
 /// own sake and as the "magic knock" the Microsoft wheel extensions listen for.
-fn set_sample_rate(data_port: &mut Port<u8>, status_port: &mut Port<u8>, rate: u8) -> bool {
-    write_aux(data_port, status_port, 0xF3) && write_aux(data_port, status_port, rate)
+fn set_sample_rate<I: Ps2Io>(io: &mut I, rate: u8) -> bool {
+    write_aux(io, 0xF3) && write_aux(io, rate)
 }
 
 /// Talk the mouse into the richest protocol it admits to, exactly the sequence
@@ -240,31 +289,31 @@ fn set_sample_rate(data_port: &mut Port<u8>, status_port: &mut Port<u8>, rate: u
 /// so a failed knock costs nothing and leaves the plain 3-byte protocol.
 /// Without this the mouse never sends a fourth byte at all: the wheel is not
 /// "ignored" downstream, it is never transmitted.
-fn negotiate_wheel(data_port: &mut Port<u8>, status_port: &mut Port<u8>) -> Ps2MouseProto {
+fn negotiate_wheel<I: Ps2Io>(io: &mut I) -> Ps2MouseProto {
     let mut proto = Ps2MouseProto::Ps2;
     for rate in [200u8, 100, 80] {
-        if !set_sample_rate(data_port, status_port, rate) {
+        if !set_sample_rate(io, rate) {
             return proto;
         }
     }
-    if mouse_id(data_port, status_port) != Some(3) {
+    if mouse_id(io) != Some(3) {
         // Leave the device at a sane rate even when the knock did not take.
-        let _ = set_sample_rate(data_port, status_port, 100);
+        let _ = set_sample_rate(io, 100);
         return proto;
     }
     proto = Ps2MouseProto::Imps;
 
     for rate in [200u8, 200, 80] {
-        if !set_sample_rate(data_port, status_port, rate) {
-            let _ = set_sample_rate(data_port, status_port, 100);
+        if !set_sample_rate(io, rate) {
+            let _ = set_sample_rate(io, 100);
             return proto;
         }
     }
-    if mouse_id(data_port, status_port) == Some(4) {
+    if mouse_id(io) == Some(4) {
         proto = Ps2MouseProto::Imex;
     }
     // 100 reports/s is the psmouse default; the knock left it at 80.
-    let _ = set_sample_rate(data_port, status_port, 100);
+    let _ = set_sample_rate(io, 100);
     proto
 }
 
@@ -344,172 +393,176 @@ impl Scheme for Ps2Input {
     }
 
     fn handle_irq(&self, _irq_num: usize) {
-        let mut data_port = Port::<u8>::new(0x60);
-        let mut status_port = Port::<u8>::new(0x64);
+        self.service(&mut HwIo::new());
+    }
+}
 
-        unsafe {
-            loop {
-                let status = status_port.read();
-                if (status & 0x01) == 0 {
-                    break;
+impl Ps2Input {
+    /// El barrido de la IRQ: vacía el buffer del 8042 y convierte cada byte en
+    /// eventos evdev. Separado de `handle_irq` para poder alimentarlo con un
+    /// 8042 de mentira; el hardware entra por `HwIo`.
+    fn service<I: Ps2Io>(&self, io: &mut I) {
+        loop {
+            let status = io.status();
+            if (status & 0x01) == 0 {
+                break;
+            }
+
+            let is_aux = (status & 0x20) != 0;
+            let code = io.read();
+
+            if is_aux {
+                // Handle mouse data
+                let mut state = self.mouse_state.lock();
+                // Packet resync. Byte 0 of every PS/2 mouse packet has bit 3
+                // (the "always one" signature) SET. If we are at the START of a
+                // packet and this byte does not, the 3-byte stream has slipped --
+                // a dropped/extra byte from an i8042 output-buffer overflow under
+                // load, or the 0xAA (BAT) / 0x00 (device id) a real mouse streams
+                // ~500 ms after its power-on reset, long after our short init
+                // read timed out. Drop the stray byte and STAY at phase 0 rather
+                // than latch a SHIFTED packet: a shifted packet decodes dx/dy in
+                // place of the flags byte, so motion becomes garbage and the
+                // pointer sticks in place ("raton en estatico") until reboot,
+                // even though it is still drawn. Skipping mis-first bytes here
+                // realigns to the next real packet boundary on its own. On an
+                // already aligned stream (QEMU) byte 0 always has bit 3, so this
+                // never fires there -- no behaviour change on the working path.
+                if state.phase == 0 && (code & 0x08) == 0 {
+                    continue;
                 }
+                let phase = state.phase as usize;
+                state.bytes[phase] = code;
+                state.phase += 1;
 
-                let is_aux = (status & 0x20) != 0;
-                let code = data_port.read();
+                if state.phase as usize == self.proto.packet_len() {
+                    state.phase = 0;
+                    let bytes = state.bytes;
 
-                if is_aux {
-                    // Handle mouse data
-                    let mut state = self.mouse_state.lock();
-                    // Packet resync. Byte 0 of every PS/2 mouse packet has bit 3
-                    // (the "always one" signature) SET. If we are at the START of a
-                    // packet and this byte does not, the 3-byte stream has slipped --
-                    // a dropped/extra byte from an i8042 output-buffer overflow under
-                    // load, or the 0xAA (BAT) / 0x00 (device id) a real mouse streams
-                    // ~500 ms after its power-on reset, long after our short init
-                    // read timed out. Drop the stray byte and STAY at phase 0 rather
-                    // than latch a SHIFTED packet: a shifted packet decodes dx/dy in
-                    // place of the flags byte, so motion becomes garbage and the
-                    // pointer sticks in place ("raton en estatico") until reboot,
-                    // even though it is still drawn. Skipping mis-first bytes here
-                    // realigns to the next real packet boundary on its own. On an
-                    // already aligned stream (QEMU) byte 0 always has bit 3, so this
-                    // never fires there -- no behaviour change on the working path.
-                    if state.phase == 0 && (code & 0x08) == 0 {
+                    // A USB tablet already owns the pointer (absolute).
+                    // Emitting PS/2 relative packets on top makes the
+                    // cursor jump in VirtualBox (`--mouse usbtablet`).
+                    if io.tablet_owns_pointer() {
                         continue;
                     }
-                    let phase = state.phase as usize;
-                    state.bytes[phase] = code;
-                    state.phase += 1;
 
-                    if state.phase as usize == self.proto.packet_len() {
-                        state.phase = 0;
-                        let bytes = state.bytes;
+                    let pkt = decode_aux_packet(self.proto, &bytes);
+                    let changed = pkt.buttons ^ state.last_buttons;
+                    state.last_buttons = pkt.buttons;
+                    drop(state);
 
-                        // A USB tablet already owns the pointer (absolute).
-                        // Emitting PS/2 relative packets on top makes the
-                        // cursor jump in VirtualBox (`--mouse usbtablet`).
-                        if usb_tablet_owns_pointer() {
-                            continue;
-                        }
-
-                        let pkt = decode_aux_packet(self.proto, &bytes);
-                        let changed = pkt.buttons ^ state.last_buttons;
-                        state.last_buttons = pkt.buttons;
-                        drop(state);
-
-                        if pkt.dx != 0 {
-                            self.listener.trigger(InputEvent {
-                                event_type: InputEventType::RelAxis,
-                                code: rel::REL_X,
-                                value: pkt.dx,
-                            });
-                        }
-                        if pkt.dy != 0 {
-                            self.listener.trigger(InputEvent {
-                                event_type: InputEventType::RelAxis,
-                                code: rel::REL_Y,
-                                value: pkt.dy,
-                            });
-                        }
-                        // Only the buttons that actually changed, so an idle
-                        // hand on a moving mouse does not push six events per
-                        // packet through a 64-deep evdev ring.
-                        for (bit, code) in [
-                            (0u8, key::BTN_LEFT),
-                            (1, key::BTN_RIGHT),
-                            (2, key::BTN_MIDDLE),
-                            (3, key::BTN_SIDE),
-                            (4, key::BTN_EXTRA),
-                        ] {
-                            if changed & (1 << bit) != 0 {
-                                self.listener.trigger(InputEvent {
-                                    event_type: InputEventType::Key,
-                                    code,
-                                    value: ((pkt.buttons >> bit) & 1) as i32,
-                                });
-                            }
-                        }
-                        // Wheel, low- and high-resolution. Linux has emitted
-                        // both since 5.0 and libinput prefers the hi-res axis
-                        // when the device advertises it; one detent is 120.
-                        if pkt.wheel != 0 {
-                            self.listener.trigger(InputEvent {
-                                event_type: InputEventType::RelAxis,
-                                code: rel::REL_WHEEL,
-                                value: pkt.wheel,
-                            });
-                            self.listener.trigger(InputEvent {
-                                event_type: InputEventType::RelAxis,
-                                code: rel::REL_WHEEL_HI_RES,
-                                value: pkt.wheel * 120,
-                            });
-                        }
-                        if pkt.hwheel != 0 {
-                            self.listener.trigger(InputEvent {
-                                event_type: InputEventType::RelAxis,
-                                code: rel::REL_HWHEEL,
-                                value: pkt.hwheel,
-                            });
-                            self.listener.trigger(InputEvent {
-                                event_type: InputEventType::RelAxis,
-                                code: rel::REL_HWHEEL_HI_RES,
-                                value: pkt.hwheel * 120,
-                            });
-                        }
-
-                        // Sync
+                    if pkt.dx != 0 {
                         self.listener.trigger(InputEvent {
-                            event_type: InputEventType::Syn,
-                            code: 0,
-                            value: 0,
+                            event_type: InputEventType::RelAxis,
+                            code: rel::REL_X,
+                            value: pkt.dx,
                         });
                     }
-                } else {
-                    // Handle keyboard data
-                    if code == 0xE0 {
-                        *self.extended.lock() = true;
-                        continue;
+                    if pkt.dy != 0 {
+                        self.listener.trigger(InputEvent {
+                            event_type: InputEventType::RelAxis,
+                            code: rel::REL_Y,
+                            value: pkt.dy,
+                        });
+                    }
+                    // Only the buttons that actually changed, so an idle
+                    // hand on a moving mouse does not push six events per
+                    // packet through a 64-deep evdev ring.
+                    for (bit, code) in [
+                        (0u8, key::BTN_LEFT),
+                        (1, key::BTN_RIGHT),
+                        (2, key::BTN_MIDDLE),
+                        (3, key::BTN_SIDE),
+                        (4, key::BTN_EXTRA),
+                    ] {
+                        if changed & (1 << bit) != 0 {
+                            self.listener.trigger(InputEvent {
+                                event_type: InputEventType::Key,
+                                code,
+                                value: ((pkt.buttons >> bit) & 1) as i32,
+                            });
+                        }
+                    }
+                    // Wheel, low- and high-resolution. Linux has emitted
+                    // both since 5.0 and libinput prefers the hi-res axis
+                    // when the device advertises it; one detent is 120.
+                    if pkt.wheel != 0 {
+                        self.listener.trigger(InputEvent {
+                            event_type: InputEventType::RelAxis,
+                            code: rel::REL_WHEEL,
+                            value: pkt.wheel,
+                        });
+                        self.listener.trigger(InputEvent {
+                            event_type: InputEventType::RelAxis,
+                            code: rel::REL_WHEEL_HI_RES,
+                            value: pkt.wheel * 120,
+                        });
+                    }
+                    if pkt.hwheel != 0 {
+                        self.listener.trigger(InputEvent {
+                            event_type: InputEventType::RelAxis,
+                            code: rel::REL_HWHEEL,
+                            value: pkt.hwheel,
+                        });
+                        self.listener.trigger(InputEvent {
+                            event_type: InputEventType::RelAxis,
+                            code: rel::REL_HWHEEL_HI_RES,
+                            value: pkt.hwheel * 120,
+                        });
                     }
 
-                    let is_extended = {
-                        let mut ext = self.extended.lock();
-                        let was_ext = *ext;
-                        *ext = false;
-                        was_ext
-                    };
-
-                    let pressed = (code & 0x80) == 0;
-                    let scancode = code & 0x7F;
-
-                    let keycode = if is_extended {
-                        match scancode {
-                            0x48 => 103, // Up
-                            0x50 => 108, // Down
-                            0x4B => 105, // Left
-                            0x4D => 106, // Right
-                            0x1D => 97,  // RCtrl
-                            0x38 => 100, // RAlt / AltGr
-                            0x35 => 98,  // KP_Divide
-                            0x1C => 96,  // KP_Enter
-                            0x53 => 111, // Delete
-                            _ => scancode as u16,
-                        }
-                    } else {
-                        scancode as u16
-                    };
-
-                    self.listener.trigger(InputEvent {
-                        event_type: InputEventType::Key,
-                        code: keycode,
-                        value: if pressed { 1 } else { 0 },
-                    });
-
+                    // Sync
                     self.listener.trigger(InputEvent {
                         event_type: InputEventType::Syn,
                         code: 0,
                         value: 0,
                     });
                 }
+            } else {
+                // Handle keyboard data
+                if code == 0xE0 {
+                    *self.extended.lock() = true;
+                    continue;
+                }
+
+                let is_extended = {
+                    let mut ext = self.extended.lock();
+                    let was_ext = *ext;
+                    *ext = false;
+                    was_ext
+                };
+
+                let pressed = (code & 0x80) == 0;
+                let scancode = code & 0x7F;
+
+                let keycode = if is_extended {
+                    match scancode {
+                        0x48 => 103, // Up
+                        0x50 => 108, // Down
+                        0x4B => 105, // Left
+                        0x4D => 106, // Right
+                        0x1D => 97,  // RCtrl
+                        0x38 => 100, // RAlt / AltGr
+                        0x35 => 98,  // KP_Divide
+                        0x1C => 96,  // KP_Enter
+                        0x53 => 111, // Delete
+                        _ => scancode as u16,
+                    }
+                } else {
+                    scancode as u16
+                };
+
+                self.listener.trigger(InputEvent {
+                    event_type: InputEventType::Key,
+                    code: keycode,
+                    value: if pressed { 1 } else { 0 },
+                });
+
+                self.listener.trigger(InputEvent {
+                    event_type: InputEventType::Syn,
+                    code: 0,
+                    value: 0,
+                });
             }
         }
     }
@@ -517,55 +570,849 @@ impl Scheme for Ps2Input {
 
 impl InputScheme for Ps2Input {
     fn capability(&self, cap_type: CapabilityType) -> InputCapability {
-        let mut cap = InputCapability::empty();
-        // VirtualBox ICH9 still exposes i8042 even with `--mouse usbtablet`.
-        // If we advertise REL_X/Y + BTN_LEFT, libinput opens a second (silent)
-        // relative pointer that fights the USB tablet. Keyboard bits stay.
-        let tablet = usb_tablet_owns_pointer();
-        let wheel = self.proto.has_wheel();
-        match cap_type {
-            CapabilityType::Event => {
-                cap.set(ev::EV_SYN);
-                cap.set(ev::EV_KEY);
-                if !tablet {
-                    cap.set(ev::EV_REL);
-                }
-            }
-            CapabilityType::Key => {
-                let end = if tablet { 0x110 } else { 0x120 };
-                for i in 0..end {
-                    cap.set(i);
-                }
-            }
-            CapabilityType::RelAxis if !tablet => {
-                cap.set(rel::REL_X);
-                cap.set(rel::REL_Y);
-                // Only when the device answered the IntelliMouse knock. A
-                // pointer that advertises REL_WHEEL and never sends one makes
-                // libinput treat it as a wheel mouse whose wheel is broken.
-                if wheel {
-                    cap.set(rel::REL_WHEEL);
-                    cap.set(rel::REL_WHEEL_HI_RES);
-                }
-                if self.proto == Ps2MouseProto::Imex {
-                    cap.set(rel::REL_HWHEEL);
-                    cap.set(rel::REL_HWHEEL_HI_RES);
-                }
-            }
-            _ => {}
-        }
-        cap
+        capability_for(self.proto, usb_tablet_owns_pointer(), cap_type)
     }
+}
+
+/// Qué anuncia el dispositivo: depende del protocolo que negoció el ratón y de
+/// si un tablet USB ya manda el puntero. Puro, para poder comprobar las dos
+/// ramas del tablet sin tocar el pestillo global de USB.
+fn capability_for(proto: Ps2MouseProto, tablet: bool, cap_type: CapabilityType) -> InputCapability {
+    let mut cap = InputCapability::empty();
+    // VirtualBox ICH9 still exposes i8042 even with `--mouse usbtablet`.
+    // If we advertise REL_X/Y + BTN_LEFT, libinput opens a second (silent)
+    // relative pointer that fights the USB tablet. Keyboard bits stay.
+    let wheel = proto.has_wheel();
+    match cap_type {
+        CapabilityType::Event => {
+            cap.set(ev::EV_SYN);
+            cap.set(ev::EV_KEY);
+            if !tablet {
+                cap.set(ev::EV_REL);
+            }
+        }
+        CapabilityType::Key => {
+            let end = if tablet { 0x110 } else { 0x120 };
+            for i in 0..end {
+                cap.set(i);
+            }
+        }
+        CapabilityType::RelAxis if !tablet => {
+            cap.set(rel::REL_X);
+            cap.set(rel::REL_Y);
+            // Only when the device answered the IntelliMouse knock. A
+            // pointer that advertises REL_WHEEL and never sends one makes
+            // libinput treat it as a wheel mouse whose wheel is broken.
+            if wheel {
+                cap.set(rel::REL_WHEEL);
+                cap.set(rel::REL_WHEEL_HI_RES);
+            }
+            if proto == Ps2MouseProto::Imex {
+                cap.set(rel::REL_HWHEEL);
+                cap.set(rel::REL_HWHEEL_HI_RES);
+            }
+        }
+        _ => {}
+    }
+    cap
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
+    use alloc::collections::VecDeque;
+    use alloc::sync::Arc;
+    use alloc::{vec, vec::Vec};
 
     fn pkt(bytes: [u8; 4]) -> [u8; 4] {
         bytes
     }
 
+    // ---------------------------------------------------------------------
+    // Un i8042 de mentira, que es lo que deja probar todo lo que hay entre
+    // los puertos y los eventos: el arranque, la llamada magica de la rueda,
+    // la resincronizacion de paquetes y el barrido de la IRQ.
+    // ---------------------------------------------------------------------
+
+    /// Lo que la logica escribio, en orden y por que puerto.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum W {
+        /// Puerto 0x64: comando del controlador.
+        Cmd(u8),
+        /// Puerto 0x60: dato.
+        Data(u8),
+    }
+
+    /// Un raton PS/2 al otro lado del puerto aux: contesta 0xFA a lo que
+    /// conoce y sube su id cuando oye la llamada magica, igual que el de
+    /// verdad. `max_id` es lo mas alto que este aparato admite: 0 para un
+    /// raton llano, 3 para un IntelliMouse, 4 para un Explorer.
+    struct FakeMouse {
+        max_id: u8,
+        id: u8,
+        /// Cuantos comandos contesta antes de quedarse mudo, para los
+        /// aparatos que se plantan a mitad de la llamada.
+        deaf_after: Option<usize>,
+        /// Comandos recibidos, para contar contra `deaf_after`.
+        heard: usize,
+        /// Las tasas que le han puesto, en orden. Sirven para reconocer la
+        /// llamada y para comprobar con que rate se queda el aparato.
+        rates: Vec<u8>,
+        /// Si el siguiente byte de datos es el valor de un 0xF3.
+        expect_rate: bool,
+    }
+
+    impl FakeMouse {
+        fn new(max_id: u8) -> Self {
+            Self {
+                max_id,
+                id: 0,
+                deaf_after: None,
+                heard: 0,
+                rates: Vec::new(),
+                expect_rate: false,
+            }
+        }
+
+        /// Procesa un byte dirigido al aux y devuelve lo que contesta.
+        fn command(&mut self, byte: u8) -> Vec<u8> {
+            self.heard += 1;
+            if matches!(self.deaf_after, Some(n) if self.heard > n) {
+                return Vec::new();
+            }
+            if self.expect_rate {
+                self.expect_rate = false;
+                self.rates.push(byte);
+                self.knock();
+                return vec![0xFA];
+            }
+            match byte {
+                // Reset: ack, resultado del BAT y el id del aparato.
+                0xFF => vec![0xFA, 0xAA, self.id],
+                0xF2 => vec![0xFA, self.id],
+                0xF3 => {
+                    self.expect_rate = true;
+                    vec![0xFA]
+                }
+                0xF4..=0xF6 => vec![0xFA],
+                _ => vec![0xFE],
+            }
+        }
+
+        /// Las dos secuencias de tasas que las extensiones de Microsoft
+        /// escuchan: 200-100-80 sube a IntelliMouse y 200-200-80 (ya en id 3)
+        /// a Explorer.
+        fn knock(&mut self) {
+            let n = self.rates.len();
+            if n < 3 {
+                return;
+            }
+            let tail = &self.rates[n - 3..];
+            if self.id == 0 && self.max_id >= 3 && tail == [200, 100, 80] {
+                self.id = 3;
+            } else if self.id == 3 && self.max_id >= 4 && tail == [200, 200, 80] {
+                self.id = 4;
+            }
+        }
+    }
+
+    struct FakeIo {
+        /// Bytes que la logica va a leer, cada uno con su bit de aux.
+        inbox: VecDeque<(u8, bool)>,
+        wrote: Vec<W>,
+        /// Cuantas consultas mas de estado diran «buffer de entrada ocupado».
+        busy: u32,
+        /// A partir de que consulta de estado el buffer se queda ocupado para
+        /// siempre, para cortar una secuencia por la mitad.
+        busy_after: Option<u32>,
+        /// Cuantas veces se ha consultado el estado, para ver que las esperas
+        /// esperan y no giran de mas.
+        status_reads: u32,
+        tablet: bool,
+        mouse: Option<FakeMouse>,
+        /// Si el siguiente 0x60 va al raton, porque un 0xD4 lo desvio.
+        to_aux: bool,
+        /// Byte de configuracion que el controlador devuelve ante un 0x20.
+        config: u8,
+        /// Lo que se escribio tras un 0x60, que es la configuracion nueva.
+        config_written: Option<u8>,
+        expect_config: bool,
+    }
+
+    impl FakeIo {
+        fn new() -> Self {
+            Self {
+                inbox: VecDeque::new(),
+                wrote: Vec::new(),
+                busy: 0,
+                busy_after: None,
+                status_reads: 0,
+                tablet: false,
+                mouse: None,
+                to_aux: false,
+                config: 0,
+                config_written: None,
+                expect_config: false,
+            }
+        }
+
+        fn with_mouse(max_id: u8) -> Self {
+            let mut io = Self::new();
+            io.mouse = Some(FakeMouse::new(max_id));
+            io
+        }
+
+        fn queue(&mut self, bytes: &[u8], aux: bool) {
+            for b in bytes {
+                self.inbox.push_back((*b, aux));
+            }
+        }
+
+        fn rates(&self) -> Vec<u8> {
+            self.mouse
+                .as_ref()
+                .map(|m| m.rates.clone())
+                .unwrap_or_default()
+        }
+
+        /// Los comandos que llegaron al aux, en orden: cada dato escrito
+        /// justo despues de un 0xD4.
+        fn aux_cmds(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut armed = false;
+            for w in &self.wrote {
+                match *w {
+                    W::Cmd(0xD4) => armed = true,
+                    W::Cmd(_) => armed = false,
+                    W::Data(v) => {
+                        if armed {
+                            out.push(v);
+                            armed = false;
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        /// Los comandos que llegaron al controlador (0x64), en orden.
+        fn ctrl_cmds(&self) -> Vec<u8> {
+            self.wrote
+                .iter()
+                .filter_map(|w| match *w {
+                    W::Cmd(v) => Some(v),
+                    W::Data(_) => None,
+                })
+                .collect()
+        }
+    }
+
+    impl Ps2Io for FakeIo {
+        fn status(&mut self) -> u8 {
+            self.status_reads += 1;
+            if matches!(self.busy_after, Some(n) if self.status_reads > n) {
+                return 0x02;
+            }
+            if self.busy > 0 {
+                self.busy -= 1;
+                return 0x02;
+            }
+            match self.inbox.front() {
+                Some((_, true)) => 0x21,
+                Some((_, false)) => 0x01,
+                None => 0,
+            }
+        }
+
+        fn read(&mut self) -> u8 {
+            self.inbox.pop_front().map(|(b, _)| b).unwrap_or(0xFF)
+        }
+
+        fn write_data(&mut self, value: u8) {
+            self.wrote.push(W::Data(value));
+            if self.expect_config {
+                self.expect_config = false;
+                self.config_written = Some(value);
+                return;
+            }
+            if self.to_aux {
+                self.to_aux = false;
+                let reply = match self.mouse.as_mut() {
+                    Some(m) => m.command(value),
+                    None => Vec::new(),
+                };
+                for b in reply {
+                    self.inbox.push_back((b, true));
+                }
+            }
+        }
+
+        fn write_cmd(&mut self, value: u8) {
+            self.wrote.push(W::Cmd(value));
+            match value {
+                0xD4 => self.to_aux = true,
+                // Leer la configuracion la deja esperando en el 0x60.
+                0x20 => {
+                    let config = self.config;
+                    self.inbox.push_back((config, false));
+                }
+                0x60 => self.expect_config = true,
+                _ => {}
+            }
+        }
+
+        fn tablet_owns_pointer(&mut self) -> bool {
+            self.tablet
+        }
+    }
+
+    /// Un dispositivo sin pasar por el arranque, para probar el barrido.
+    fn dev(proto: Ps2MouseProto) -> Ps2Input {
+        Ps2Input {
+            listener: EventListener::new(),
+            extended: Mutex::new(false),
+            mouse_state: Mutex::new(MouseState::default()),
+            proto,
+        }
+    }
+
+    /// Recoge lo que el dispositivo emite, como (tipo, codigo, valor).
+    fn watch(device: &Ps2Input) -> Arc<Mutex<Vec<(u16, u16, i32)>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _ = device.listener.subscribe(
+            Box::new(move |e: &InputEvent| {
+                sink.lock().push((e.event_type as u16, e.code, e.value));
+            }),
+            false,
+        );
+        seen
+    }
+
+    const REL: u16 = ev::EV_REL;
+    const KEY: u16 = ev::EV_KEY;
+    const SYN: u16 = ev::EV_SYN;
+
+    // --- las esperas de los dos puertos ---------------------------------
+
+    #[test]
+    fn la_espera_de_escritura_aguanta_hasta_que_se_vacia_el_buffer() {
+        let mut io = FakeIo::new();
+        io.busy = 5;
+        assert!(wait_write(&mut io));
+        // Cinco consultas ocupadas mas la que lo ve libre.
+        assert_eq!(io.status_reads, 6);
+    }
+
+    #[test]
+    fn la_espera_de_escritura_se_rinde_con_el_buffer_siempre_ocupado() {
+        let mut io = FakeIo::new();
+        io.busy = u32::MAX;
+        assert!(!wait_write(&mut io));
+        // Y se rinde: no gira para siempre.
+        assert_eq!(io.status_reads, 100_001);
+    }
+
+    #[test]
+    fn la_espera_de_lectura_se_rinde_cuando_no_llega_nada() {
+        let mut io = FakeIo::new();
+        assert!(!wait_read(&mut io));
+        assert_eq!(io.status_reads, 100_001);
+        assert!(read_data(&mut io).is_none());
+    }
+
+    #[test]
+    fn la_espera_de_lectura_vuelve_en_cuanto_hay_un_byte() {
+        let mut io = FakeIo::new();
+        io.queue(&[0x42], false);
+        assert!(wait_read(&mut io));
+        assert_eq!(io.status_reads, 1);
+        assert_eq!(read_data(&mut io), Some(0x42));
+    }
+
+    #[test]
+    fn el_vaciado_se_lleva_todo_lo_que_haya_pendiente() {
+        let mut io = FakeIo::new();
+        io.queue(&[1, 2, 3], false);
+        io.queue(&[4], true);
+        drain_output(&mut io);
+        assert_eq!(io.status(), 0);
+        assert!(io.inbox.is_empty());
+    }
+
+    // --- el camino de comandos del aux -----------------------------------
+
+    #[test]
+    fn un_comando_de_raton_va_precedido_del_d4() {
+        let mut io = FakeIo::with_mouse(0);
+        assert!(write_aux(&mut io, 0xF4));
+        assert_eq!(io.wrote, vec![W::Cmd(0xD4), W::Data(0xF4)]);
+    }
+
+    #[test]
+    fn un_comando_de_raton_falla_si_la_respuesta_no_es_un_ack() {
+        let mut io = FakeIo::new();
+        // Sin raton emulado: la respuesta la ponemos a mano.
+        io.queue(&[0xFE], true);
+        assert!(!write_aux(&mut io, 0xF4));
+    }
+
+    #[test]
+    fn un_comando_de_raton_no_se_escribe_si_el_buffer_no_se_vacia() {
+        let mut io = FakeIo::with_mouse(0);
+        io.busy = u32::MAX;
+        assert!(!write_aux(&mut io, 0xF4));
+        assert!(io.wrote.is_empty());
+    }
+
+    #[test]
+    fn la_tasa_de_muestreo_son_dos_comandos_el_f3_y_el_valor() {
+        let mut io = FakeIo::with_mouse(0);
+        assert!(set_sample_rate(&mut io, 80));
+        assert_eq!(io.aux_cmds(), vec![0xF3, 80]);
+        assert_eq!(io.rates(), vec![80]);
+    }
+
+    #[test]
+    fn el_id_del_raton_sale_del_f2() {
+        let mut io = FakeIo::with_mouse(3);
+        // Un aparato recien encendido contesta 0 hasta que oye la llamada.
+        assert_eq!(mouse_id(&mut io), Some(0));
+        assert_eq!(io.aux_cmds(), vec![0xF2]);
+    }
+
+    #[test]
+    fn sin_raton_el_id_no_es_cero_sino_nada() {
+        let mut io = FakeIo::new();
+        assert_eq!(mouse_id(&mut io), None);
+    }
+
+    // --- la llamada magica de la rueda -----------------------------------
+
+    #[test]
+    fn un_raton_llano_se_queda_en_ps2() {
+        let mut io = FakeIo::with_mouse(0);
+        assert_eq!(negotiate_wheel(&mut io), Ps2MouseProto::Ps2);
+        // Solo se intenta la primera llamada, y el aparato queda a 100.
+        assert_eq!(io.rates(), vec![200, 100, 80, 100]);
+    }
+
+    #[test]
+    fn un_intellimouse_responde_a_la_primera_llamada() {
+        let mut io = FakeIo::with_mouse(3);
+        assert_eq!(negotiate_wheel(&mut io), Ps2MouseProto::Imps);
+        // Se prueba tambien la segunda llamada, que este aparato no admite.
+        assert_eq!(io.rates(), vec![200, 100, 80, 200, 200, 80, 100]);
+    }
+
+    #[test]
+    fn un_explorer_responde_a_las_dos_llamadas() {
+        let mut io = FakeIo::with_mouse(4);
+        assert_eq!(negotiate_wheel(&mut io), Ps2MouseProto::Imex);
+        assert_eq!(io.rates(), vec![200, 100, 80, 200, 200, 80, 100]);
+        assert_eq!(io.aux_cmds().iter().filter(|c| **c == 0xF2).count(), 2);
+    }
+
+    #[test]
+    fn sin_aparato_la_negociacion_no_inventa_rueda() {
+        let mut io = FakeIo::new();
+        assert_eq!(negotiate_wheel(&mut io), Ps2MouseProto::Ps2);
+        // Y no sigue pidiendo tasas despues del primer fallo.
+        assert_eq!(io.aux_cmds(), vec![0xF3]);
+    }
+
+    // --- el arranque del controlador -------------------------------------
+
+    #[test]
+    fn el_arranque_enciende_los_dos_puertos_antes_de_leer_la_configuracion() {
+        let mut io = FakeIo::with_mouse(0);
+        init_controller(&mut io);
+        let cmds = io.ctrl_cmds();
+        let pos = |v: u8| cmds.iter().position(|c| *c == v).unwrap();
+        assert!(pos(0xAE) < pos(0xA8));
+        assert!(pos(0xA8) < pos(0x20));
+        assert!(pos(0x20) < pos(0x60));
+    }
+
+    #[test]
+    fn el_arranque_deja_las_dos_interrupciones_y_la_traduccion_encendidas() {
+        let mut io = FakeIo::with_mouse(0);
+        io.config = 0x30;
+        init_controller(&mut io);
+        // 0x30 con los bits 0, 1 y 6 puestos y los relojes (0x10, 0x20)
+        // destapados.
+        assert_eq!(io.config_written, Some(0x43));
+    }
+
+    #[test]
+    fn el_arranque_no_pisa_los_demas_bits_de_la_configuracion() {
+        let mut io = FakeIo::with_mouse(0);
+        io.config = 0xFF;
+        init_controller(&mut io);
+        assert_eq!(io.config_written, Some(0xCF));
+    }
+
+    #[test]
+    fn el_arranque_resetea_el_raton_antes_de_llamar_y_lo_enciende_al_final() {
+        let mut io = FakeIo::with_mouse(4);
+        init_controller(&mut io);
+        let cmds = io.aux_cmds();
+        assert_eq!(cmds.first(), Some(&0xFF));
+        let primer_f3 = cmds.iter().position(|c| *c == 0xF3).unwrap();
+        let f6 = cmds.iter().position(|c| *c == 0xF6).unwrap();
+        // El 0xF6 va antes de la llamada, y el 0xF4 despues de todo: la
+        // llamada tiene que ocurrir con el aparato aun callado.
+        assert!(f6 < primer_f3);
+        assert_eq!(cmds.last(), Some(&0xF4));
+    }
+
+    #[test]
+    fn el_arranque_se_queda_con_el_protocolo_que_negocio() {
+        let mut io = FakeIo::with_mouse(4);
+        assert_eq!(init_controller(&mut io), Ps2MouseProto::Imex);
+        let device = Ps2Input::with_io(&mut FakeIo::with_mouse(3));
+        assert_eq!(device.proto, Ps2MouseProto::Imps);
+        assert_eq!(
+            Ps2Input::with_io(&mut FakeIo::new()).proto,
+            Ps2MouseProto::Ps2
+        );
+    }
+
+    #[test]
+    fn el_arranque_no_se_cuelga_cuando_el_controlador_no_contesta() {
+        // Buffer de entrada ocupado para siempre: ni una escritura sale, y
+        // aun asi el arranque termina y deja el protocolo llano.
+        let mut io = FakeIo::new();
+        io.busy = u32::MAX;
+        assert_eq!(init_controller(&mut io), Ps2MouseProto::Ps2);
+        assert!(io.wrote.is_empty());
+    }
+
+    // --- el barrido de la IRQ --------------------------------------------
+
+    #[test]
+    fn un_paquete_de_raton_sale_como_dos_ejes_y_un_sync() {
+        let device = dev(Ps2MouseProto::Ps2);
+        let seen = watch(&device);
+        let mut io = FakeIo::new();
+        // firma, dx=+5, dy=+3 (PS/2 cuenta la Y hacia arriba).
+        io.queue(&[0x08, 5, 3], true);
+        device.service(&mut io);
+        assert_eq!(
+            *seen.lock(),
+            vec![(REL, rel::REL_X, 5), (REL, rel::REL_Y, -3), (SYN, 0, 0)]
+        );
+    }
+
+    #[test]
+    fn el_barrido_para_cuando_el_buffer_se_vacia() {
+        let device = dev(Ps2MouseProto::Ps2);
+        let seen = watch(&device);
+        let mut io = FakeIo::new();
+        device.service(&mut io);
+        assert!(seen.lock().is_empty());
+        // Una sola consulta de estado: ve el buffer vacio y sale.
+        assert_eq!(io.status_reads, 1);
+    }
+
+    #[test]
+    fn un_byte_sin_la_firma_se_tira_en_vez_de_desplazar_el_paquete() {
+        let device = dev(Ps2MouseProto::Ps2);
+        let seen = watch(&device);
+        let mut io = FakeIo::new();
+        // El 0x00 de delante es el id que un raton escupe tras su reset: si
+        // se latase como byte 0, dx y dy saldrian corridos y el puntero se
+        // quedaria clavado.
+        io.queue(&[0x00, 0x08, 5, 3], true);
+        device.service(&mut io);
+        assert_eq!(
+            *seen.lock(),
+            vec![(REL, rel::REL_X, 5), (REL, rel::REL_Y, -3), (SYN, 0, 0)]
+        );
+    }
+
+    #[test]
+    fn solo_los_botones_que_cambian_emiten_evento() {
+        let device = dev(Ps2MouseProto::Ps2);
+        let seen = watch(&device);
+        let mut io = FakeIo::new();
+        // Boton izquierdo pulsado, y el mismo paquete dos veces.
+        io.queue(&[0x09, 0, 0, 0x09, 0, 0], true);
+        device.service(&mut io);
+        assert_eq!(
+            *seen.lock(),
+            vec![(KEY, key::BTN_LEFT, 1), (SYN, 0, 0), (SYN, 0, 0)]
+        );
+        // Y al soltarlo, el cero.
+        seen.lock().clear();
+        io.queue(&[0x08, 0, 0], true);
+        device.service(&mut io);
+        assert_eq!(*seen.lock(), vec![(KEY, key::BTN_LEFT, 0), (SYN, 0, 0)]);
+    }
+
+    #[test]
+    fn los_cinco_botones_tienen_su_codigo() {
+        let device = dev(Ps2MouseProto::Imex);
+        let seen = watch(&device);
+        let mut io = FakeIo::new();
+        // Los tres de la cabecera mas los dos que el Explorer mete en el
+        // cuarto byte.
+        io.queue(&[0x0F, 0, 0, 0x30], true);
+        device.service(&mut io);
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                (KEY, key::BTN_LEFT, 1),
+                (KEY, key::BTN_RIGHT, 1),
+                (KEY, key::BTN_MIDDLE, 1),
+                (KEY, key::BTN_SIDE, 1),
+                (KEY, key::BTN_EXTRA, 1),
+                (SYN, 0, 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn la_rueda_sale_tambien_por_el_eje_de_alta_resolucion() {
+        let device = dev(Ps2MouseProto::Imps);
+        let seen = watch(&device);
+        let mut io = FakeIo::new();
+        io.queue(&[0x08, 0, 0, 0xFF], true);
+        device.service(&mut io);
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                (REL, rel::REL_WHEEL, 1),
+                (REL, rel::REL_WHEEL_HI_RES, 120),
+                (SYN, 0, 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn la_rueda_horizontal_sale_por_su_propio_eje() {
+        let device = dev(Ps2MouseProto::Imex);
+        let seen = watch(&device);
+        let mut io = FakeIo::new();
+        io.queue(&[0x08, 0, 0, 0x41], true);
+        device.service(&mut io);
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                (REL, rel::REL_HWHEEL, -1),
+                (REL, rel::REL_HWHEEL_HI_RES, -120),
+                (SYN, 0, 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn un_tablet_usb_calla_el_raton_ps2_sin_descolocar_el_paquete() {
+        let device = dev(Ps2MouseProto::Ps2);
+        let seen = watch(&device);
+        let mut io = FakeIo::new();
+        io.tablet = true;
+        io.queue(&[0x08, 5, 3], true);
+        device.service(&mut io);
+        assert!(seen.lock().is_empty());
+        // El paquete se consumio entero: el siguiente empieza en su byte 0.
+        assert_eq!(device.mouse_state.lock().phase, 0);
+        io.tablet = false;
+        io.queue(&[0x08, 5, 3], true);
+        device.service(&mut io);
+        assert_eq!(seen.lock().len(), 3);
+    }
+
+    #[test]
+    fn una_tecla_sale_con_su_codigo_y_su_sync() {
+        let device = dev(Ps2MouseProto::Ps2);
+        let seen = watch(&device);
+        let mut io = FakeIo::new();
+        // 0x1E pulsada, y el mismo scancode con el bit 0x80 al soltarla.
+        io.queue(&[0x1E, 0x9E], false);
+        device.service(&mut io);
+        assert_eq!(
+            *seen.lock(),
+            vec![(KEY, 0x1E, 1), (SYN, 0, 0), (KEY, 0x1E, 0), (SYN, 0, 0)]
+        );
+    }
+
+    #[test]
+    fn el_prefijo_e0_traduce_las_flechas_y_se_gasta_en_una_tecla() {
+        let device = dev(Ps2MouseProto::Ps2);
+        let seen = watch(&device);
+        let mut io = FakeIo::new();
+        // 0xE0 0x48 es la flecha arriba (103); el 0x48 que viene detras, ya
+        // sin prefijo, es el 8 del teclado numerico.
+        io.queue(&[0xE0, 0x48, 0x48], false);
+        device.service(&mut io);
+        assert_eq!(
+            *seen.lock(),
+            vec![(KEY, 103, 1), (SYN, 0, 0), (KEY, 0x48, 1), (SYN, 0, 0)]
+        );
+        assert!(!*device.extended.lock());
+    }
+
+    #[test]
+    fn un_scancode_extendido_sin_traduccion_pasa_tal_cual() {
+        let device = dev(Ps2MouseProto::Ps2);
+        let seen = watch(&device);
+        let mut io = FakeIo::new();
+        io.queue(&[0xE0, 0x10], false);
+        device.service(&mut io);
+        assert_eq!(*seen.lock(), vec![(KEY, 0x10, 1), (SYN, 0, 0)]);
+    }
+
+    #[test]
+    fn el_teclado_y_el_raton_se_reparten_el_mismo_buffer() {
+        let device = dev(Ps2MouseProto::Ps2);
+        let seen = watch(&device);
+        let mut io = FakeIo::new();
+        // Un byte de teclado en medio de un paquete de raton: el bit de aux
+        // del estado es lo unico que los distingue, y el paquete tiene que
+        // sobrevivir al corte.
+        io.queue(&[0x08, 5], true);
+        io.queue(&[0x1E], false);
+        io.queue(&[3], true);
+        device.service(&mut io);
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                (KEY, 0x1E, 1),
+                (SYN, 0, 0),
+                (REL, rel::REL_X, 5),
+                (REL, rel::REL_Y, -3),
+                (SYN, 0, 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn un_comando_de_raton_se_corta_si_el_buffer_se_ocupa_tras_el_d4() {
+        let mut io = FakeIo::with_mouse(0);
+        // Libre para la primera espera y ocupado para la segunda: el 0xD4 sale
+        // y el comando se queda sin escribir.
+        io.busy_after = Some(1);
+        assert!(!write_aux(&mut io, 0xF4));
+        assert_eq!(io.wrote, vec![W::Cmd(0xD4)]);
+    }
+
+    #[test]
+    fn un_aparato_que_se_planta_en_la_segunda_llamada_se_queda_en_intellimouse() {
+        let mut io = FakeIo::with_mouse(3);
+        // Contesta la primera llamada entera y su id, y despues se calla: la
+        // segunda llamada no llega a terminar.
+        io.mouse.as_mut().unwrap().deaf_after = Some(7);
+        assert_eq!(negotiate_wheel(&mut io), Ps2MouseProto::Imps);
+        assert_eq!(io.rates(), vec![200, 100, 80]);
+    }
+
+    #[test]
+    fn las_teclas_extendidas_tienen_su_traduccion_completa() {
+        // La tabla entera, con los codigos que espera un teclado de Linux.
+        for (scancode, keycode) in [
+            (0x48u8, 103u16), // arriba
+            (0x50, 108),      // abajo
+            (0x4B, 105),      // izquierda
+            (0x4D, 106),      // derecha
+            (0x1D, 97),       // Ctrl derecho
+            (0x38, 100),      // AltGr
+            (0x35, 98),       // division del numerico
+            (0x1C, 96),       // Enter del numerico
+            (0x53, 111),      // Supr
+        ] {
+            let device = dev(Ps2MouseProto::Ps2);
+            let seen = watch(&device);
+            let mut io = FakeIo::new();
+            io.queue(&[0xE0, scancode], false);
+            device.service(&mut io);
+            assert_eq!(
+                *seen.lock(),
+                vec![(KEY, keycode, 1), (SYN, 0, 0)],
+                "scancode extendido {scancode:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn el_dispositivo_se_llama_por_su_nombre_y_anuncia_lo_que_negocio() {
+        let device = dev(Ps2MouseProto::Imps);
+        assert_eq!(device.name(), "ps2-input");
+        // El metodo del trait, que es el que consulta el pestillo del tablet.
+        let cap = device.capability(CapabilityType::Event);
+        assert!(cap.contains(ev::EV_SYN));
+        assert!(cap.contains(ev::EV_KEY));
+    }
+
+    // --- lo que el dispositivo anuncia -----------------------------------
+
+    #[test]
+    fn un_raton_llano_no_anuncia_rueda() {
+        let cap = capability_for(Ps2MouseProto::Ps2, false, CapabilityType::RelAxis);
+        assert!(cap.contains(rel::REL_X));
+        assert!(cap.contains(rel::REL_Y));
+        assert!(!cap.contains(rel::REL_WHEEL));
+        assert!(!cap.contains(rel::REL_WHEEL_HI_RES));
+    }
+
+    #[test]
+    fn un_intellimouse_anuncia_rueda_vertical_y_nada_mas() {
+        let cap = capability_for(Ps2MouseProto::Imps, false, CapabilityType::RelAxis);
+        assert!(cap.contains(rel::REL_WHEEL));
+        assert!(cap.contains(rel::REL_WHEEL_HI_RES));
+        assert!(!cap.contains(rel::REL_HWHEEL));
+        assert!(!cap.contains(rel::REL_HWHEEL_HI_RES));
+    }
+
+    #[test]
+    fn un_explorer_anuncia_tambien_la_horizontal() {
+        let cap = capability_for(Ps2MouseProto::Imex, false, CapabilityType::RelAxis);
+        assert!(cap.contains(rel::REL_HWHEEL));
+        assert!(cap.contains(rel::REL_HWHEEL_HI_RES));
+    }
+
+    #[test]
+    fn los_tipos_de_evento_llevan_el_relativo_solo_sin_tablet() {
+        let cap = capability_for(Ps2MouseProto::Imex, false, CapabilityType::Event);
+        assert!(cap.contains(ev::EV_SYN));
+        assert!(cap.contains(ev::EV_KEY));
+        assert!(cap.contains(ev::EV_REL));
+        let con_tablet = capability_for(Ps2MouseProto::Imex, true, CapabilityType::Event);
+        assert!(con_tablet.contains(ev::EV_SYN));
+        assert!(con_tablet.contains(ev::EV_KEY));
+        assert!(!con_tablet.contains(ev::EV_REL));
+    }
+
+    #[test]
+    fn con_un_tablet_usb_delante_el_ps2_no_anuncia_ejes() {
+        let cap = capability_for(Ps2MouseProto::Imex, true, CapabilityType::RelAxis);
+        assert!(!cap.contains(rel::REL_X));
+        assert!(!cap.contains(rel::REL_Y));
+        assert!(!cap.contains(rel::REL_WHEEL));
+    }
+
+    #[test]
+    fn con_un_tablet_usb_delante_las_teclas_se_cortan_antes_de_los_botones() {
+        // 0x110 es BTN_LEFT: con el tablet delante el ultimo codigo que se
+        // anuncia es el de antes, para que libinput no abra un segundo
+        // puntero relativo.
+        let cap = capability_for(Ps2MouseProto::Ps2, true, CapabilityType::Key);
+        assert!(cap.contains(0x10F));
+        assert!(!cap.contains(key::BTN_LEFT));
+        let sin_tablet = capability_for(Ps2MouseProto::Ps2, false, CapabilityType::Key);
+        assert!(sin_tablet.contains(key::BTN_LEFT));
+        assert!(sin_tablet.contains(0x11F));
+        assert!(!sin_tablet.contains(0x120));
+    }
+
+    #[test]
+    fn los_tipos_que_el_ps2_no_tiene_salen_vacios() {
+        let cap = capability_for(Ps2MouseProto::Imex, false, CapabilityType::AbsAxis);
+        for code in 0..64 {
+            assert!(!cap.contains(code));
+        }
+    }
     #[test]
     fn plain_ps2_packet_has_no_wheel() {
         // flags=0x08 (signature only), dx=+5, dy=+3 (PS/2 up-positive).

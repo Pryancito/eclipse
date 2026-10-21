@@ -22,6 +22,7 @@ fn user(uid: u32, gid: u32) -> Credentials {
         fsgid: gid,
         groups: Vec::new(),
         umask: 0o022,
+        caps: Capabilities::for_uids(uid, uid, uid),
     }
 }
 
@@ -109,9 +110,11 @@ fn root_reads_and_writes_anything_but_executes_only_what_has_an_x_bit() {
         "a 0700 (or 0000) directory is searchable by root"
     );
     // The override follows the SELECTED uid: a setuid-root program asked
-    // about its real ids is not root for `access(2)`.
+    // about its real ids is not root for `access(2)`. Its exec made the
+    // bounding set its own.
     let mut setuid_root = user(OWNER, GROUP);
     setuid_root.set_euid(ROOT_UID);
+    setuid_root.caps = Capabilities::for_uids(OWNER, ROOT_UID, ROOT_UID);
     assert!(may(&setuid_root, 0o000, 0o2, true));
     assert!(!may(&setuid_root, 0o000, 0o2, false));
 }

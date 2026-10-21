@@ -72,10 +72,7 @@ fn layout(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<(u64, BlockAlloca
     let mut alloc = BlockAllocator::new(groups);
     // The journal sits right after group 0's bitmap, in one piece.
     let jblocks = journal_blocks(total);
-    let jstart = match alloc.allocate(Some(2), jblocks) {
-        Some((s, n)) if n == jblocks => s,
-        _ => return Err(Error::NoSpace),
-    };
+    let jstart = alloc.allocate_run(Some(2), jblocks).ok_or(Error::NoSpace)?;
     JournalArea {
         start: jstart,
         blocks: jblocks,
@@ -185,19 +182,13 @@ pub fn format_v3(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
     root.nlink = 2;
     root.parent = ROOT_INO;
     let rec = root.encode();
-    if write_data(
-        dev,
-        &mut alloc,
-        &mut itable,
-        ROOT_INO * INODE_SIZE as u64,
-        &rec,
-    )? < INODE_SIZE
-    {
-        return Err(Error::NoSpace);
-    }
-    if itable.extents_dirty {
-        write_chain(dev, &mut alloc, ITABLE_INO, &mut itable)?;
-    }
+    // The root's slot is inside the table `extend_zeroed` just wrote, so
+    // this allocates nothing and writes the whole record.
+    let at = ROOT_INO * INODE_SIZE as u64;
+    let n = write_data(dev, &mut alloc, &mut itable, at, &rec)?;
+    debug_assert_eq!(n, INODE_SIZE);
+    // The table's extents are new: their chain (if any) goes out now.
+    write_chain(dev, &mut alloc, ITABLE_INO, &mut itable)?;
 
     let label = label_bytes(opts);
     let sb = Superblock {
@@ -233,6 +224,7 @@ pub fn format_v3(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::testdisk::{formatted, opts, Ram, MIB};
@@ -283,9 +275,7 @@ mod tests {
     fn the_smallest_disk_still_works() {
         for blocks in [MIN_GROUP_BLOCKS * 4, 1024] {
             let d = Ram::new((blocks * BLOCK_SIZE) as usize);
-            if format(&*d, &opts()).is_err() {
-                continue;
-            }
+            format(&*d, &opts()).unwrap();
             let mut fs = EclipseFS::mount(d, false).unwrap();
             fs.check().unwrap();
         }
@@ -369,5 +359,36 @@ mod tests {
         let mut b = [0u8; 3];
         p.read_at(10, &mut b).unwrap();
         assert_eq!(&b, b"abc");
+    }
+
+    /// v0.3 on a disk of several groups: every group after the first gets a
+    /// backup superblock.
+    #[test]
+    fn v3_writes_backup_superblocks_in_every_group() {
+        let d = Ram::new(3 * (GROUP_BLOCKS * BLOCK_SIZE) as usize);
+        format_v3(&*d, &opts()).unwrap();
+        let primary = d.peek(0, 9);
+        for g in 1..3 {
+            let at = (g * GROUP_BLOCKS * BLOCK_SIZE) as usize;
+            assert_eq!(d.peek(at, 9), primary, "group {}", g);
+        }
+        EclipseFS::mount(d, false).unwrap().check().unwrap();
+    }
+
+    /// Devices left untiered in a tiered volume stay `Any`.
+    #[test]
+    fn a_tiered_volume_may_leave_devices_untiered() {
+        let devs: Vec<Arc<dyn BlockDevice>> = vec![Ram::new(64 * MIB), Ram::new(64 * MIB)];
+        format_devices_tiered(
+            &devs,
+            &opts(),
+            Profile::Single,
+            Profile::Single,
+            &[Tier::Any, Tier::Fast],
+        )
+        .unwrap();
+        let fs = EclipseFS::mount_devices(devs, false).unwrap();
+        assert_eq!(fs.device_tier(1), Tier::Any);
+        assert_eq!(fs.device_tier(2), Tier::Fast);
     }
 }

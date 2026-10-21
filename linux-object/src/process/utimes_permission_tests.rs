@@ -17,6 +17,7 @@ fn creds(uid: u32) -> Credentials {
         fsgid: uid,
         groups: Vec::new(),
         umask: 0o022,
+        caps: Capabilities::for_uids(uid, uid, uid),
     }
 }
 

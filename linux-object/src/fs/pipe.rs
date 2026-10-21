@@ -2,15 +2,18 @@
 #![deny(missing_docs)]
 
 use crate::{sync::Event, sync::EventBus};
-use alloc::{boxed::Box, collections::vec_deque::VecDeque, sync::Arc};
+use alloc::{boxed::Box, collections::vec_deque::VecDeque, sync::Arc, vec::Vec};
 use core::{any::Any, cmp::min};
 use core::{
     future::Future,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 use kernel_hal::sync::Mutex;
 use rcore_fs::vfs::*;
+
+mod fifo;
+pub use fifo::FifoPartner;
 
 #[derive(Clone, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -20,6 +23,8 @@ pub enum PipeEnd {
     Read,
     /// write end
     Write,
+    /// Both at once: a FIFO opened `O_RDWR`, which reads what it writes.
+    Both,
 }
 
 /// Default pipe capacity reported by `fcntl(F_GETPIPE_SZ)`: 16 pages, the
@@ -48,14 +53,32 @@ pub struct PipeData {
     /// of room. The queue used to be unbounded and every write went through:
     /// `yes | sleep 10` grew the kernel heap by however fast `yes` runs.
     capacity: usize,
+    /// How many read ends, and write ends, have ever been opened
+    /// (`r_counter`, `w_counter`): a FIFO opener waits for the other one to
+    /// move, not for its side to be open, so a writer that came and went
+    /// lets a waiting reader go all the same. One each for a `pipe2` pipe.
+    r_counter: u64,
+    w_counter: u64,
+    /// FIFO openers parked until the other side is opened.
+    partner_waiters: Vec<Waker>,
 }
 
 impl PipeData {
-    fn hangup_for(&self, direction: &PipeEnd) -> bool {
-        match direction {
-            PipeEnd::Read => self.write_cnt == 0,
-            PipeEnd::Write => self.read_cnt == 0,
-        }
+    fn new(ends: i32) -> Self {
+        let mut data = PipeData {
+            buf: VecDeque::new(),
+            eventbus: EventBus::default(),
+            read_cnt: ends,
+            write_cnt: ends,
+            capacity: PIPE_DEFAULT_CAPACITY,
+            r_counter: ends as u64,
+            w_counter: ends as u64,
+            partner_waiters: Vec::new(),
+        };
+        // An empty pipe has room: a writer subscribing for `WRITABLE` before
+        // anything happened must not wait for a transition that never comes.
+        data.publish_room();
+        data
     }
 
     /// Bytes a write may add right now.
@@ -100,18 +123,28 @@ pub struct Pipe {
     ino: usize,
     uid: usize,
     gid: usize,
+    /// The FIFO node this end was opened through, which `fstat` describes;
+    /// `None` for a `pipe2` pipe.
+    node: Option<Arc<dyn INode>>,
+    /// The `w_counter` a FIFO reader opened `O_NONBLOCK` with no writer saw
+    /// (`f_pipe`): having no writer is not a hangup for it until one has
+    /// come. 0, which no `w_counter` of a `pipe2` pipe is, for every other.
+    hup_after: u64,
 }
 
 impl Clone for Pipe {
     fn clone(&self) -> Self {
         let mut data = self.data.lock();
-        match self.direction {
-            PipeEnd::Read => data.read_cnt += 1,
-            PipeEnd::Write => data.write_cnt += 1,
+        if self.reads() {
+            data.read_cnt += 1;
+        }
+        if self.writes() {
+            data.write_cnt += 1;
         }
         Pipe {
             data: self.data.clone(),
             direction: self.direction.clone(),
+            node: self.node.clone(),
             ..*self
         }
     }
@@ -121,19 +154,27 @@ impl Drop for Pipe {
     fn drop(&mut self) {
         // pipe end closed
         let mut data = self.data.lock();
-        match self.direction {
-            PipeEnd::Read => data.read_cnt -= 1,
-            PipeEnd::Write => data.write_cnt -= 1,
+        let mut side_gone = false;
+        if self.reads() {
+            data.read_cnt -= 1;
+            side_gone |= data.read_cnt == 0;
         }
-        // Latch CLOSED only when a whole SIDE is gone (EOF for readers /
-        // EPIPE for writers) — that is when `poll()` starts reporting the
-        // condition, so "CLOSED latched ⇒ a poll scan is ready" holds and a
-        // parked readiness subscription can never immediate-fire in a loop.
-        // The previous unconditional `set` latched CLOSED whenever ANY handle
-        // dropped — including a dup'd fd with live siblings (routine in shell
-        // redirections), which left the flag permanently on for a perfectly
-        // healthy pipe and woke every later event-bus waiter spuriously.
-        if data.read_cnt == 0 || data.write_cnt == 0 {
+        if self.writes() {
+            data.write_cnt -= 1;
+            side_gone |= data.write_cnt == 0;
+        }
+        // Latch CLOSED only when this drop takes a whole SIDE away (EOF for
+        // readers / EPIPE for writers) — that is when `poll()` starts
+        // reporting the condition, so "CLOSED latched ⇒ a poll scan is ready"
+        // holds and a parked readiness subscription can never immediate-fire
+        // in a loop. The previous unconditional `set` latched CLOSED whenever
+        // ANY handle dropped — including a dup'd fd with live siblings
+        // (routine in shell redirections), which left the flag permanently on
+        // for a perfectly healthy pipe and woke every later event-bus waiter
+        // spuriously. And not on every drop while a side is gone: a FIFO's
+        // sides come back (an open clears the flag), and a FIFO reader with
+        // no writer yet must not be woken by another reader's close.
+        if side_gone {
             data.eventbus.set(Event::CLOSED);
         }
     }
@@ -151,17 +192,7 @@ impl Pipe {
     /// reopening an end through `/proc/<pid>/fd/N` asks the same permission
     /// as opening a file.
     pub fn create_pair_for(uid: u32, gid: u32) -> (Pipe, Pipe) {
-        let mut inner = PipeData {
-            buf: VecDeque::new(),
-            eventbus: EventBus::default(),
-            read_cnt: 1,
-            write_cnt: 1,
-            capacity: PIPE_DEFAULT_CAPACITY,
-        };
-        // An empty pipe has room: a writer subscribing for `WRITABLE` before
-        // anything happened must not wait for a transition that never comes.
-        inner.publish_room();
-        let data = Arc::new(Mutex::new(inner));
+        let data = Arc::new(Mutex::new(PipeData::new(1)));
         let ino = zircon_object::object::KObjectBase::new_koid() as usize;
         let (uid, gid) = (uid as usize, gid as usize);
         (
@@ -171,6 +202,8 @@ impl Pipe {
                 ino,
                 uid,
                 gid,
+                node: None,
+                hup_after: 0,
             },
             Pipe {
                 data,
@@ -178,6 +211,8 @@ impl Pipe {
                 ino,
                 uid,
                 gid,
+                node: None,
+                hup_after: 0,
             },
         )
     }
@@ -189,6 +224,33 @@ impl Pipe {
     /// True when this handle is the read end of the pipe.
     pub fn is_read_end(&self) -> bool {
         self.direction == PipeEnd::Read
+    }
+
+    /// The FIFO node this end was opened through, `None` for a `pipe2`
+    /// pipe: reopening the end through `/proc/<pid>/fd/N` opens the node.
+    pub fn fifo_node(&self) -> Option<Arc<dyn INode>> {
+        self.node.clone()
+    }
+
+    /// Whether this end reads: the read end, or a FIFO opened `O_RDWR`.
+    fn reads(&self) -> bool {
+        matches!(self.direction, PipeEnd::Read | PipeEnd::Both)
+    }
+
+    /// Whether this end writes: the write end, or a FIFO opened `O_RDWR`.
+    fn writes(&self) -> bool {
+        matches!(self.direction, PipeEnd::Write | PipeEnd::Both)
+    }
+
+    /// `pipe_poll`'s hangup for this end: a reader all of whose writers are
+    /// gone, once it has seen one (see `hup_after`), and a writer all of
+    /// whose readers are. An end that does both is its own other side.
+    fn hangup(&self, data: &PipeData) -> bool {
+        match self.direction {
+            PipeEnd::Read => data.write_cnt == 0 && data.w_counter != self.hup_after,
+            PipeEnd::Write => data.read_cnt == 0,
+            PipeEnd::Both => false,
+        }
     }
 
     /// Whether `other` shares this pipe's buffer. `tee`/`splice` between
@@ -282,7 +344,7 @@ impl Pipe {
     /// "would block" from end-of-stream when the buffer comes back empty.
     /// `None` when called on the write end.
     pub fn peek_data(&self, len: usize) -> Option<(alloc::vec::Vec<u8>, bool)> {
-        if self.direction != PipeEnd::Read {
+        if !self.reads() {
             return None;
         }
         let data = self.data.lock();
@@ -302,7 +364,7 @@ impl Pipe {
     /// what `peek_data` showed it), returning how many went; `None` on the
     /// write end. Readiness moves exactly as after a `read_at` of that size.
     pub fn consume(&self, len: usize) -> Option<usize> {
-        if self.direction != PipeEnd::Read {
+        if !self.reads() {
             return None;
         }
         let mut data = self.data.lock();
@@ -313,7 +375,7 @@ impl Pipe {
 
     /// whether the pipe struct is readable
     fn can_read(&self) -> bool {
-        if let PipeEnd::Read = self.direction {
+        if self.reads() {
             // true
             let data = self.data.lock();
             !data.buf.is_empty() || data.write_cnt == 0 // other end closed
@@ -324,12 +386,122 @@ impl Pipe {
 
     /// whether the pipe struct is writeable
     fn can_write(&self) -> bool {
-        if let PipeEnd::Write = self.direction {
+        if self.writes() {
             let data = self.data.lock();
             data.read_cnt > 0 && data.has_room()
         } else {
             false
         }
+    }
+
+    /// [`INode::async_poll`] for the directions `events` asks about. Only
+    /// an end that does both needs telling: `async_poll` waits for what a
+    /// read waits for, and a blocking write into a full FIFO opened
+    /// `O_RDWR` would be told at once that its bytes are still there.
+    pub fn async_poll_for(
+        &self,
+        events: crate::fs::PollEvents,
+    ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + '_>> {
+        match self.direction {
+            PipeEnd::Both => self.ready(events.wants_read(), events.wants_write()),
+            _ => self.async_poll(),
+        }
+    }
+
+    /// Wait until this end can read (`read`) or write (`write`), or has
+    /// hung up, and answer what `poll` says then.
+    fn ready(
+        &self,
+        read: bool,
+        write: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + '_>> {
+        #[must_use = "future does nothing unless polled/`await`-ed"]
+        struct PipeFuture<'a> {
+            pipe: &'a Pipe,
+            read: bool,
+            write: bool,
+            sub_id: Option<u64>,
+        }
+
+        impl Drop for PipeFuture<'_> {
+            fn drop(&mut self) {
+                if let Some(id) = self.sub_id.take() {
+                    self.pipe.data.lock().eventbus.unsubscribe(id);
+                }
+            }
+        }
+
+        impl<'a> Future for PipeFuture<'a> {
+            type Output = Result<PollStatus>;
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+                // Readiness and subscription under ONE hold of the pipe lock.
+                // The previous shape checked readiness (taking and releasing
+                // the lock inside `can_read`/`can_write`), and only then
+                // re-took the lock to subscribe — a window in which the peer
+                // could push its byte and fire the eventbus at nobody. With the
+                // bus latching flags and firing only on transitions, a wake
+                // missed there was not late, it was lost for good. The
+                // subscribe-time check in `EventBus::subscribe` now also closes
+                // this generically; doing it under one lock here means the pipe
+                // does not depend on that second line of defense.
+                //
+                // sub_id + Drop: poll/epoll re-scan drops this future every
+                // pass; without unsubscribe, orphaned wakers pile up and a
+                // later pipe write wakes a freed task (UAF → delayed PAGE FAULT).
+                let this = self.get_mut();
+                let mut data = this.pipe.data.lock();
+                let hangup = this.pipe.hangup(&data);
+                // Readable data, or EOF/hangup when writers are gone. Room to
+                // write while readers remain; hangup when they are gone (must
+                // wake POLLHUP/POLLERR interest, not spin Pending). A full
+                // pipe parks the writer here until a read frees a `PIPE_BUF`.
+                let ready =
+                    hangup || this.read && !data.buf.is_empty() || this.write && data.has_room();
+                if ready {
+                    if let Some(id) = this.sub_id.take() {
+                        data.eventbus.unsubscribe(id);
+                    }
+                    drop(data);
+                    return Poll::Ready(this.pipe.poll());
+                }
+                // Not `sub_id.is_none()`: the callback is one-shot, so after
+                // the first wake the id names nothing on the bus. Another
+                // reader that drains the buffer before we run leaves us
+                // Pending forever with no callback. See `EventBusFuture`.
+                let live = this
+                    .sub_id
+                    .map(|id| data.eventbus.is_subscribed(id))
+                    .unwrap_or(false);
+                if !live {
+                    this.sub_id = None;
+                    // Only this end's own transitions: the flags are latched
+                    // and `subscribe` fires at once on any that is already
+                    // set, so a reader parked on an empty pipe must not be
+                    // woken by the `WRITABLE` an empty pipe always carries
+                    // (nor a full pipe's writer by `READABLE`). `CLOSED` is
+                    // set only once a whole side is gone, which is a hangup
+                    // for whichever end is left to poll.
+                    let mut mask = Event::CLOSED | Event::ERROR;
+                    if this.read {
+                        mask |= Event::READABLE;
+                    }
+                    if this.write {
+                        mask |= Event::WRITABLE;
+                    }
+                    this.sub_id =
+                        crate::sync::subscribe_waker(&mut data.eventbus, mask, cx.waker());
+                }
+                Poll::Pending
+            }
+        }
+
+        Box::pin(PipeFuture {
+            pipe: self,
+            read,
+            write,
+            sub_id: None,
+        })
     }
 }
 
@@ -339,7 +511,7 @@ impl INode for Pipe {
         if buf.is_empty() {
             return Ok(0);
         }
-        if let PipeEnd::Read = self.direction {
+        if self.reads() {
             let mut data = self.data.lock();
             if data.buf.is_empty() && data.write_cnt > 0 {
                 Err(FsError::Again)
@@ -374,7 +546,7 @@ impl INode for Pipe {
     /// away was never noticed, so `yes | head -1` ran `yes` for ever, and the
     /// queue grew without bound while it did.
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
-        if let PipeEnd::Write = self.direction {
+        if self.writes() {
             let mut data = self.data.lock();
             if data.read_cnt == 0 {
                 return Err(FsError::Broken);
@@ -406,105 +578,26 @@ impl INode for Pipe {
     /// if the write end is not close and the buffer is empty, the read end will be block
     fn poll(&self) -> Result<PollStatus> {
         let data = self.data.lock();
-        let hangup = data.hangup_for(&self.direction);
+        let hangup = self.hangup(&data);
         Ok(PollStatus {
-            read: matches!(self.direction, PipeEnd::Read) && (!data.buf.is_empty() || hangup),
+            read: self.reads() && (!data.buf.is_empty() || hangup),
             // Writable with a `PIPE_BUF` of room, as `pipe_poll` reports
             // `POLLOUT` for a free slot; a full pipe is not writable, or a
             // writer parked on it spins on `Again`.
-            write: matches!(self.direction, PipeEnd::Write) && data.read_cnt > 0 && data.has_room(),
+            write: self.writes() && data.read_cnt > 0 && data.has_room(),
             // Linux: POLLERR on the write end when no readers remain.
-            error: matches!(self.direction, PipeEnd::Write) && hangup,
+            error: self.writes() && data.read_cnt == 0,
             hangup,
         })
     }
 
+    /// What a blocking read waits for, as every `async_poll` does: an end
+    /// that does both waits to read, and [`Pipe::async_poll_for`] is how a
+    /// writer waits on it.
     fn async_poll<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + 'a>> {
-        #[must_use = "future does nothing unless polled/`await`-ed"]
-        struct PipeFuture<'a> {
-            pipe: &'a Pipe,
-            sub_id: Option<u64>,
-        }
-
-        impl Drop for PipeFuture<'_> {
-            fn drop(&mut self) {
-                if let Some(id) = self.sub_id.take() {
-                    self.pipe.data.lock().eventbus.unsubscribe(id);
-                }
-            }
-        }
-
-        impl<'a> Future for PipeFuture<'a> {
-            type Output = Result<PollStatus>;
-
-            fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-                // Readiness and subscription under ONE hold of the pipe lock.
-                // The previous shape checked readiness (taking and releasing
-                // the lock inside `can_read`/`can_write`), and only then
-                // re-took the lock to subscribe — a window in which the peer
-                // could push its byte and fire the eventbus at nobody. With the
-                // bus latching flags and firing only on transitions, a wake
-                // missed there was not late, it was lost for good. The
-                // subscribe-time check in `EventBus::subscribe` now also closes
-                // this generically; doing it under one lock here means the pipe
-                // does not depend on that second line of defense.
-                //
-                // sub_id + Drop: poll/epoll re-scan drops this future every
-                // pass; without unsubscribe, orphaned wakers pile up and a
-                // later pipe write wakes a freed task (UAF → delayed PAGE FAULT).
-                let this = self.get_mut();
-                let mut data = this.pipe.data.lock();
-                let hangup = data.hangup_for(&this.pipe.direction);
-                let ready = match this.pipe.direction {
-                    // Readable data, or EOF/hangup when writers are gone.
-                    PipeEnd::Read => !data.buf.is_empty() || hangup,
-                    // Room to write while readers remain; hangup when they
-                    // are gone (must wake POLLHUP/POLLERR interest, not spin
-                    // Pending). A full pipe parks the writer here until a
-                    // read frees a `PIPE_BUF`.
-                    PipeEnd::Write => data.has_room() || hangup,
-                };
-                if ready {
-                    if let Some(id) = this.sub_id.take() {
-                        data.eventbus.unsubscribe(id);
-                    }
-                    drop(data);
-                    return Poll::Ready(this.pipe.poll());
-                }
-                // Not `sub_id.is_none()`: the callback is one-shot, so after
-                // the first wake the id names nothing on the bus. Another
-                // reader that drains the buffer before we run leaves us
-                // Pending forever with no callback. See `EventBusFuture`.
-                let live = this
-                    .sub_id
-                    .map(|id| data.eventbus.is_subscribed(id))
-                    .unwrap_or(false);
-                if !live {
-                    this.sub_id = None;
-                    // Only this end's own transitions: the flags are latched
-                    // and `subscribe` fires at once on any that is already
-                    // set, so a reader parked on an empty pipe must not be
-                    // woken by the `WRITABLE` an empty pipe always carries
-                    // (nor a full pipe's writer by `READABLE`). `CLOSED` is
-                    // set only once a whole side is gone, which is a hangup
-                    // for whichever end is left to poll.
-                    let mask = match this.pipe.direction {
-                        PipeEnd::Read => Event::READABLE | Event::CLOSED | Event::ERROR,
-                        PipeEnd::Write => Event::WRITABLE | Event::CLOSED | Event::ERROR,
-                    };
-                    this.sub_id =
-                        crate::sync::subscribe_waker(&mut data.eventbus, mask, cx.waker());
-                }
-                Poll::Pending
-            }
-        }
-
-        Box::pin(PipeFuture {
-            pipe: self,
-            sub_id: None,
-        })
+        self.ready(self.reads(), !self.reads())
     }
 
     /// `fstat` of either end: a FIFO, `0600`, with the pipe's own number and
@@ -512,7 +605,15 @@ impl INode for Pipe {
     /// all, so `fstat` of a pipe failed (`ENOSYS`): `S_ISFIFO` could not be
     /// asked of one, and stdio, which sizes its buffer from `st_blksize`,
     /// had to guess.
+    ///
+    /// An end of a FIFO is its node, with nothing in it: what was written
+    /// is in the pipe.
     fn metadata(&self) -> Result<Metadata> {
+        if let Some(node) = &self.node {
+            let mut meta = node.metadata()?;
+            meta.size = 0;
+            return Ok(meta);
+        }
         let mut meta = crate::fs::anon_metadata(FileType::NamedPipe, self.ino);
         meta.blk_size = PIPE_BUF;
         meta.uid = self.uid;

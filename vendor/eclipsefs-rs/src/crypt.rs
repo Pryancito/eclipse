@@ -269,6 +269,7 @@ pub fn unbase64url(s: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -390,5 +391,12 @@ mod tests {
         FileKeys::new(&[1u8; 64], &[0u8; 16]).encrypt_blocks(0, &mut b1, 4096);
         FileKeys::new(&[1u8; 64], &[1u8; 16]).encrypt_blocks(0, &mut b2, 4096);
         assert_ne!(b1, b2);
+    }
+
+    #[test]
+    fn a_name_shorter_than_a_block_does_not_decrypt() {
+        let k = FileKeys::new(&[1u8; 64], &[2; NONCE_SIZE]);
+        assert_eq!(k.decrypt_name(&[0u8; 15]), None);
+        assert_eq!(k.decrypt_name(&[]), None);
     }
 }

@@ -249,6 +249,12 @@ impl Syscall<'_> {
         for op in ops.iter() {
             sem_flags(op.flags)?;
         }
+        // `find_alloc_undo` makes the caller's undo list before it looks
+        // for the set, so a `semop` that then fails leaves one too.
+        let undo = |op: &SemBuf| sem_flags(op.flags).is_ok_and(|f| f.contains(SemFlags::SEM_UNDO));
+        if ops.iter().any(undo) {
+            self.linux_process().semaphores_make_undo_list();
+        }
 
         let sem_array = self
             .linux_process()

@@ -38,6 +38,7 @@ use zircon_object::{
 mod arg_area;
 /// The thread a child was forked by, and what its exit tells the child.
 mod forking_thread;
+pub mod remote_memory;
 pub use forking_thread::forget_forking_thread;
 /// The file-descriptor table's allocator and its two range sweeps.
 mod census;
@@ -48,7 +49,10 @@ pub use census::*;
 use child_usage::child_cpu;
 pub use child_usage::ChildCpu;
 pub use orphan_group::*;
+/// The capability sets and the rules that move them.
+mod capabilities;
 mod fd_table;
+pub use capabilities::*;
 
 pub use rcore_fs::vfs::FsInfo;
 
@@ -112,47 +116,6 @@ fn alone_in_its_address_space(parent: &Process) -> bool {
 
 const ROOT_UID: u32 = 0;
 
-// The capability numbers this kernel names, from `include/uapi/linux/
-// capability.h`. Only the ones a gate actually asks about are here: a number
-// nobody asks about is a number nobody can get wrong, and is exactly the kind
-// of write-only constant this change exists to remove.
-
-/// `CAP_KILL`: signal a process none of whose ids you hold.
-pub const CAP_KILL: u32 = 5;
-/// `CAP_SETGID`: change group ids, and set the supplementary group list.
-pub const CAP_SETGID: u32 = 6;
-/// `CAP_SETUID`: change user ids, `setfsuid(2)` included.
-pub const CAP_SETUID: u32 = 7;
-/// `CAP_SETPCAP`: drop capabilities from the bounding set
-/// (`prctl(PR_CAPBSET_DROP)`), among other things.
-pub const CAP_SETPCAP: u32 = 8;
-/// `CAP_SYS_PTRACE`: trace, inspect or reach into the innards of a process
-/// that is not yours -- `pidfd_getfd(2)` included.
-pub const CAP_SYS_PTRACE: u32 = 19;
-/// `CAP_SYS_ADMIN`: the catch-all -- mount, `sethostname`, and much else.
-pub const CAP_SYS_ADMIN: u32 = 21;
-/// `CAP_SYS_BOOT`: `reboot(2)` and `kexec_load(2)`.
-pub const CAP_SYS_BOOT: u32 = 22;
-/// `CAP_SYS_NICE`: raise a task's priority, and set the scheduling
-/// parameters or CPU affinity of a task that is not yours.
-pub const CAP_SYS_NICE: u32 = 23;
-/// `CAP_SYS_RESOURCE`: raise a hard resource limit, and reach into another
-/// process's limits.
-pub const CAP_SYS_RESOURCE: u32 = 24;
-/// `CAP_SYS_TIME`: set the system clock and discipline it.
-pub const CAP_SYS_TIME: u32 = 25;
-/// `CAP_MKNOD`: make a character or block device node with `mknod(2)`.
-pub const CAP_MKNOD: u32 = 27;
-/// `CAP_SYSLOG`: the `syslog(2)` actions that change the kernel log or the
-/// console (clear, read-and-clear, console on/off/level) -- and, under
-/// `dmesg_restrict`, reading it at all.
-pub const CAP_SYSLOG: u32 = 34;
-
-/// The highest capability number this kernel reports. 40 is Linux 5.15's
-/// `CAP_LAST_CAP` (`CAP_CHECKPOINT_RESTORE`); `capget`, `prctl`'s bounding
-/// set and [`LinuxProcess::capable`] all measure against this one number.
-pub const CAP_LAST_CAP: u32 = 40;
-
 /// Whether one id pair holds **every** id of `target` -- all three uids and all
 /// three gids.
 ///
@@ -176,27 +139,6 @@ fn holds_every_id_of(caller_uid: u32, caller_gid: u32, target: &Credentials) -> 
         && caller_gid == target.rgid
         && caller_gid == target.egid
         && caller_gid == target.sgid
-}
-
-/// Whether a process with effective uid `euid` holds capability `cap`.
-///
-/// Split from the process so the rule can be read on its own: it is the
-/// whole of this kernel's privilege model, and both [`LinuxProcess::capable`]
-/// and [`published_capabilities`] are it.
-pub fn has_capability(euid: u32, cap: u32) -> bool {
-    cap <= CAP_LAST_CAP && euid == ROOT_UID
-}
-
-/// The capability set `capget(2)` reports for a process with this effective
-/// uid, as the bitmap userspace reads.
-///
-/// Built out of [`has_capability`] one bit at a time rather than written down
-/// as a constant, so the set the kernel *publishes* cannot drift from the one
-/// it *honours*.
-pub fn published_capabilities(euid: u32) -> u64 {
-    (0..=CAP_LAST_CAP)
-        .filter(|&cap| has_capability(euid, cap))
-        .fold(0u64, |set, cap| set | 1u64 << cap)
 }
 
 const NO_ID: u32 = u32::MAX;
@@ -239,6 +181,9 @@ pub struct Credentials {
     pub fsgid: u32,
     pub groups: Vec<u32>,
     pub umask: u16,
+    /// The capability sets, which every privilege check asks
+    /// ([`Credentials::capable`]) and the `set*uid` calls and `execve` move.
+    pub caps: Capabilities,
 }
 
 impl Credentials {
@@ -273,6 +218,7 @@ impl Default for Credentials {
             fsgid: ROOT_UID,
             groups: vec![ROOT_UID],
             umask: 0o022,
+            caps: Capabilities::ROOT,
         }
     }
 }
@@ -437,14 +383,17 @@ impl ProcessExt for Process {
                         // with it. It has its own lock now (see
                         // `LinuxProcess::futexes`), so it comes out the same
                         // way and goes with every lock released.
+                        // And a leader that exited first: a `Thread`, which
+                        // holds this process too (`exited_leader`).
                         let dropped = {
                             let futexes = core::mem::take(&mut *lp.futexes.lock());
+                            let leader = lp.release_exited_leader();
                             let mut inner = lp.inner.lock();
                             let files = inner.take_all_files();
                             inner.cloexec_fds.clear();
                             inner.semaphores = Default::default();
                             let shm = core::mem::take(&mut inner.shm_identifiers);
-                            (files, shm, futexes)
+                            (files, shm, futexes, leader)
                         };
                         drop(dropped);
                     }
@@ -684,6 +633,7 @@ impl NewChild for Process {
             vt: linux_parent.vt,
             exit_path: ExitPathSummary::default(),
             exit_stage: Default::default(),
+            exited_leader: Default::default(),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
             itimers: crate::time::Itimers::forked(&linux_parent_inner.limits),
@@ -815,14 +765,17 @@ impl NewChild for Process {
                         // with it. It has its own lock now (see
                         // `LinuxProcess::futexes`), so it comes out the same
                         // way and goes with every lock released.
+                        // And a leader that exited first: a `Thread`, which
+                        // holds this process too (`exited_leader`).
                         let dropped = {
                             let futexes = core::mem::take(&mut *lp.futexes.lock());
+                            let leader = lp.release_exited_leader();
                             let mut inner = lp.inner.lock();
                             let files = inner.take_all_files();
                             inner.cloexec_fds.clear();
                             inner.semaphores = Default::default();
                             let shm = core::mem::take(&mut inner.shm_identifiers);
-                            (files, shm, futexes)
+                            (files, shm, futexes, leader)
                         };
                         drop(dropped);
                         // Only now may a `wait*` take it (`exit_handover`).
@@ -1080,18 +1033,18 @@ pub async fn wait_child_any_interest(
         }
         {
             let inner = proc.linux().inner.lock();
-            let has_candidate = if let Some(want) = pgid {
-                inner
-                    .children
-                    .iter()
-                    .any(|(_, c)| effective_pgid(c) == want)
-                    || inner
+            // A dead child is no child of a wait for stops and continues
+            // alone (`wait_task_zombie` without `WEXITED`): with only those
+            // left it is `ECHILD`, as on Linux, where it blocked for good.
+            let has_candidate = inner
+                .children
+                .values()
+                .any(|c| pgid.is_none_or(|want| effective_pgid(c) == want))
+                || interest.exited
+                    && inner
                         .reaped_children
                         .values()
-                        .any(|entry| entry.pgid == want)
-            } else {
-                !inner.children.is_empty() || !inner.reaped_children.is_empty()
-            };
+                        .any(|entry| pgid.is_none_or(|want| entry.pgid == want));
             if !has_candidate {
                 return Err(LxError::ECHILD);
             }
@@ -1244,6 +1197,8 @@ pub struct LinuxProcess {
     exit_path: ExitPathSummary,
     /// Alive, zombie or reaped: see [`exit_handover`].
     exit_stage: exit_handover::ExitStage,
+    /// A leader that has exited before its group: see [`exited_leader`].
+    exited_leader: exited_leader::ExitedLeader,
     /// Per-process syscall accounting (surfaced at `/proc/<pid>/perf`).
     perf: crate::perf::ProcPerf,
     /// The process's futex objects, keyed by the address of their word.
@@ -1449,13 +1404,12 @@ struct LinuxProcessInner {
     /// `prctl(PR_SET_THP_DISABLE)`: recorded and read back; there is no
     /// transparent-hugepage machinery for it to steer.
     thp_disable: bool,
-    /// `prctl(PR_SET_KEEPCAPS)`, `SECBIT_KEEP_CAPS`: recorded, read back by
-    /// `PR_GET_KEEPCAPS`, inherited by `fork` and cleared by `execve`
-    /// (`cap_bprm_creds_from_file`). Capabilities here follow the effective
-    /// uid alone, so there is nothing for it to keep, but a daemon that
-    /// drops privilege asks for it before `setuid` and treats a refusal as
-    /// fatal: `prctl(PR_SET_KEEPCAPS, 1)` was EINVAL and ntpd, chrony and
-    /// dumpcap (and libcap's `cap_setuid`) stopped at startup.
+    /// `prctl(PR_SET_KEEPCAPS)`, `SECBIT_KEEP_CAPS`: a `set*uid` that leaves
+    /// root behind keeps the permitted set ([`Capabilities::follow_setuid`]).
+    /// Read back by `PR_GET_KEEPCAPS`, inherited by `fork`, cleared by
+    /// `execve` (`cap_bprm_creds_from_file`) and NOT by the `setuid` it was
+    /// asked for. ntpd, chrony and dumpcap (and libcap's `cap_setuid`) ask
+    /// for it before they drop to their user.
     keep_caps: bool,
     /// Signal actions
     signal_actions: SignalActions,
@@ -1852,6 +1806,7 @@ impl LinuxProcess {
             vt,
             exit_path: ExitPathSummary::default(),
             exit_stage: Default::default(),
+            exited_leader: Default::default(),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
             itimers: Default::default(),
@@ -2359,8 +2314,7 @@ impl LinuxProcess {
     /// The six comparisons are [`holds_every_id_of`]; what this rule chooses is
     /// the caller's **REAL** pair, and `CAP_SYS_RESOURCE` as the way past them.
     pub fn may_touch_limits_of(caller: &Credentials, target: &Credentials) -> bool {
-        holds_every_id_of(caller.ruid, caller.rgid, target)
-            || has_capability(caller.euid, CAP_SYS_RESOURCE)
+        holds_every_id_of(caller.ruid, caller.rgid, target) || caller.capable(CAP_SYS_RESOURCE)
     }
 
     /// Whether `caller` may reach INTO `target`: read its memory, trace it, or
@@ -2409,11 +2363,9 @@ impl LinuxProcess {
     /// unconditional, because Linux's `if (same_thread_group(task, current))
     /// return 0;` returns before this check rather than jumping to it.
     ///
-    /// Which capability is named cannot be tested: [`has_capability`] asks only
-    /// whether the effective uid is root, so `CAP_SYS_PTRACE` and
-    /// `CAP_SYS_RESOURCE` are the same word here. It is spelled correctly
-    /// anyway, because the day this kernel keeps a real capability set the two
-    /// rules part company and nothing will point at this line.
+    /// The capability is `CAP_SYS_PTRACE`, not the `CAP_SYS_RESOURCE` of
+    /// [`Self::may_touch_limits_of`]: the sets are kept, so a process may hold
+    /// one and not the other.
     pub fn may_attach_to(
         caller: &Credentials,
         target: &Credentials,
@@ -2423,7 +2375,7 @@ impl LinuxProcess {
         if same_thread_group {
             return true;
         }
-        if has_capability(caller.euid, CAP_SYS_PTRACE) {
+        if caller.capable(CAP_SYS_PTRACE) {
             return true;
         }
         holds_every_id_of(caller.ruid, caller.rgid, target) && target_dumpable == SUID_DUMP_USER
@@ -2463,7 +2415,7 @@ impl LinuxProcess {
         if same_thread_group {
             return true;
         }
-        if has_capability(caller.euid, CAP_SYS_PTRACE) {
+        if caller.capable(CAP_SYS_PTRACE) {
             return true;
         }
         holds_every_id_of(caller.fsuid, caller.fsgid, target) && target_dumpable == SUID_DUMP_USER
@@ -2528,8 +2480,7 @@ impl LinuxProcess {
 
     /// `can_nice()`: the target's budget, or the caller's capability.
     pub fn can_nice(caller: &Credentials, target_rlimit_nice: u64, nice: i8) -> bool {
-        Self::is_nice_reduction(target_rlimit_nice, nice)
-            || has_capability(caller.euid, CAP_SYS_NICE)
+        Self::is_nice_reduction(target_rlimit_nice, nice) || caller.capable(CAP_SYS_NICE)
     }
 
     /// `check_same_owner()`: whether the task is `caller`'s to schedule.
@@ -2564,7 +2515,7 @@ impl LinuxProcess {
     /// and the `check_same_owner()` in `__sched_setaffinity()` -- and they
     /// are one rule, so it is written once here.
     pub fn may_set_priority_of(caller: &Credentials, target: &Credentials) -> bool {
-        Self::is_same_owner(caller, target) || has_capability(caller.euid, CAP_SYS_NICE)
+        Self::is_same_owner(caller, target) || caller.capable(CAP_SYS_NICE)
     }
 
     /// `set_task_ioprio()` (`block/ioprio.c`): whether `caller` may change
@@ -2582,9 +2533,7 @@ impl LinuxProcess {
     /// for I/O, and a caller's real uid counts where `setpriority` only
     /// looks at the effective one.
     pub fn may_set_ioprio_of(caller: &Credentials, target: &Credentials) -> bool {
-        target.ruid == caller.euid
-            || target.ruid == caller.ruid
-            || has_capability(caller.euid, CAP_SYS_NICE)
+        target.ruid == caller.euid || target.ruid == caller.ruid || caller.capable(CAP_SYS_NICE)
     }
 
     /// `set_one_prio()`'s two gates, in order: whether the task is yours,
@@ -2661,7 +2610,7 @@ impl LinuxProcess {
             || caller.euid == target.ruid
             || caller.ruid == target.suid
             || caller.ruid == target.ruid
-            || has_capability(caller.euid, CAP_KILL)
+            || caller.capable(CAP_KILL)
     }
 
     /// `check_kill_permission()`: the verdict on one target.
@@ -2752,7 +2701,7 @@ impl LinuxProcess {
         want: &SchedRequest,
     ) -> LxResult<()> {
         if Self::sched_request_is_unprivileged(caller, target, now, want)
-            || has_capability(caller.euid, CAP_SYS_NICE)
+            || caller.capable(CAP_SYS_NICE)
         {
             return Ok(());
         }
@@ -2998,21 +2947,31 @@ impl LinuxProcess {
     }
 
     /// Whether this process holds `cap`, one of the [`CAP_SYS_ADMIN`]-family
-    /// numbers from `linux/capability.h`.
+    /// numbers from `linux/capability.h`, in its effective set.
     ///
     /// **One answer for two jobs.** `capget(2)` hands userspace a capability
     /// set, and a program reads it to decide whether to even try a privileged
     /// call; the kernel then has to honour exactly that set when the call
     /// arrives. Answering the two separately is how a kernel ends up telling
-    /// `ping` it has no capabilities and rebooting for it anyway. So this is
-    /// the single answer: `sys_capget` builds the set it publishes out of it,
-    /// and every gate asks it.
-    ///
-    /// The model is the one this kernel has everywhere else -- root, or not --
-    /// so there are no per-process sets to store, and a capability number
-    /// above [`CAP_LAST_CAP`] is held by nobody.
+    /// `ping` it has no capabilities and rebooting for it anyway. So both
+    /// read the one set the credentials keep.
     pub fn capable(&self, cap: u32) -> bool {
-        has_capability(self.euid(), cap)
+        self.inner.lock().credentials.capable(cap)
+    }
+
+    /// The capability sets, as `capget(2)` and `/proc/<pid>/status` show them.
+    pub fn capabilities(&self) -> Capabilities {
+        self.inner.lock().credentials.caps
+    }
+
+    /// Run `change` on the capability sets under the process lock, keeping
+    /// what it leaves only when it answers `Ok`: `capset(2)` and
+    /// `PR_CAPBSET_DROP` decide against the sets they then change.
+    pub fn change_capabilities(
+        &self,
+        change: impl FnOnce(&mut Capabilities) -> LxResult,
+    ) -> LxResult {
+        capabilities::change(&mut self.inner.lock().credentials.caps, change)
     }
 
     /// Apply umask to file creation mode.
@@ -3128,9 +3087,6 @@ impl LinuxProcess {
         use_effective: bool,
     ) -> u16 {
         let (uid, _) = Self::acting_fs_ids(creds, use_effective);
-        if uid == ROOT_UID {
-            return mode & 0o777;
-        }
         if uid == owner_uid {
             return (mode >> 6) & 0o7;
         }
@@ -3143,7 +3099,15 @@ impl LinuxProcess {
     /// The whole DAC decision (Linux's `generic_permission`) on pure inputs:
     /// may `creds` do `requested` (an `0o7` mask) to a file owned by
     /// `owner_uid:owner_gid` with mode `mode`? `use_effective` selects the
-    /// effective ids (every normal path) or the real ones (`access(2)`).
+    /// effective ids (every normal path) or the real ones (`access(2)`, which
+    /// checks with the capabilities of the real uid too).
+    ///
+    /// The bits first, then the two capabilities past them. A directory is
+    /// read and searched with `CAP_DAC_READ_SEARCH` and anything with
+    /// `CAP_DAC_OVERRIDE` (testing only the others-exec bit here once locked
+    /// root out of 0700 directories, e.g. apk's /lib/apk/exec). Anything else
+    /// is read with either, and written or executed with `CAP_DAC_OVERRIDE`
+    /// alone, which does not execute a file with no exec bit anywhere.
     pub(crate) fn access_verdict(
         creds: &Credentials,
         owner_uid: u32,
@@ -3153,20 +3117,24 @@ impl LinuxProcess {
         requested: u16,
         use_effective: bool,
     ) -> LxResult {
-        let (selected_uid, _) = Self::acting_fs_ids(creds, use_effective);
-        if selected_uid == ROOT_UID {
-            // CAP_DAC_OVERRIDE semantics: root bypasses permission checks
-            // except executing a non-directory with no exec bit set anywhere
-            // (mode & 0o111 == 0). Directories are always searchable by root;
-            // testing only the others-exec bit here used to lock root out of
-            // 0700 directories (e.g. apk's /lib/apk/exec, breaking triggers).
-            if requested & ACCESS_EXEC != 0 && !is_dir && mode & 0o111 == 0 {
-                return Err(LxError::EACCES);
-            }
-            return Ok(());
-        }
         let granted = Self::access_bits(creds, owner_uid, owner_gid, mode, use_effective);
         if Self::check_requested_access(granted, requested) {
+            return Ok(());
+        }
+        let caps = if use_effective {
+            creds.caps
+        } else {
+            creds.caps.for_access(creds.ruid)
+        };
+        let read_search = caps.has(CAP_DAC_READ_SEARCH);
+        let overridden = if is_dir {
+            (requested & ACCESS_WRITE == 0 && read_search) || caps.has(CAP_DAC_OVERRIDE)
+        } else {
+            (requested == ACCESS_READ && read_search)
+                || ((requested & ACCESS_EXEC == 0 || mode & 0o111 != 0)
+                    && caps.has(CAP_DAC_OVERRIDE))
+        };
+        if overridden {
             Ok(())
         } else {
             Err(LxError::EACCES)
@@ -3225,9 +3193,9 @@ impl LinuxProcess {
         }
         // `__check_sticky()` opens with `kuid_t fsuid = current_fsuid();` and
         // compares that one id against both inodes.
-        if creds.fsuid == ROOT_UID
-            || creds.fsuid == dir_metadata.uid as u32
+        if creds.fsuid == dir_metadata.uid as u32
             || creds.fsuid == target_metadata.uid as u32
+            || creds.capable(CAP_FOWNER)
         {
             Ok(())
         } else {
@@ -3323,11 +3291,12 @@ impl LinuxProcess {
         mode: u16,
     ) -> LxResult<u16> {
         // `inode_owner_or_capable()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
-        if creds.fsuid != ROOT_UID && creds.fsuid != owner_uid {
+        if !Self::owner_or_capable(creds, owner_uid) {
             return Err(LxError::EPERM);
         }
         let mut out = cur_mode & !MODE_PERM_MASK | (mode & MODE_PERM_MASK);
-        if creds.fsuid != ROOT_UID && !Self::acts_as_group(creds, owner_gid, true) {
+        // `in_group_or_capable()`: the group, or `CAP_FSETID`.
+        if !Self::acts_as_group(creds, owner_gid, true) && !creds.capable(CAP_FSETID) {
             out &= !MODE_SET_GID;
         }
         Ok(out)
@@ -3369,8 +3338,7 @@ impl LinuxProcess {
         is_dir: bool,
         explicit: bool,
     ) -> LxResult {
-        // `inode_owner_or_capable()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
-        if creds.fsuid == ROOT_UID || creds.fsuid == owner_uid {
+        if Self::owner_or_capable(creds, owner_uid) {
             return Ok(());
         }
         if explicit {
@@ -3426,8 +3394,7 @@ impl LinuxProcess {
         if type_ == FileType::Dir {
             return Err(LxError::EPERM);
         }
-        // `inode_owner_or_capable()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
-        if creds.fsuid == ROOT_UID || creds.fsuid == owner_uid {
+        if Self::owner_or_capable(creds, owner_uid) {
             return Ok(());
         }
         if type_ != FileType::File {
@@ -3452,11 +3419,11 @@ impl LinuxProcess {
     }
 
     /// `inode_owner_or_capable`: whether `creds` own the file (by the
-    /// FILESYSTEM uid, `vfsuid_eq_kuid(vfsuid, current_fsuid())`) or are
-    /// root. The question behind chmod, chown of a group, explicit utimes
+    /// FILESYSTEM uid, `vfsuid_eq_kuid(vfsuid, current_fsuid())`) or hold
+    /// `CAP_FOWNER`. The question behind chmod, explicit utimes, a hard link
     /// and `O_NOATIME`.
     fn owner_or_capable(creds: &Credentials, owner_uid: u32) -> bool {
-        creds.fsuid == ROOT_UID || creds.fsuid == owner_uid
+        creds.fsuid == owner_uid || creds.capable(CAP_FOWNER)
     }
 
     /// `may_open`: "O_NOATIME can only be set by the owner or superuser",
@@ -3485,9 +3452,9 @@ impl LinuxProcess {
     /// Change owner/group following a conservative POSIX-compatible policy.
     pub fn chown_metadata(&self, metadata: &mut Metadata, uid: u32, gid: u32) -> LxResult {
         let creds = self.credentials();
-        // `chown_ok()`/`chgrp_ok()` (`fs/attr.c`) both open on
-        // `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
-        let privileged = creds.fsuid == ROOT_UID;
+        // `chown_ok()`/`chgrp_ok()` (`fs/attr.c`): the owner, by
+        // `vfsuid_eq_kuid(vfsuid, current_fsuid())`, or `CAP_CHOWN`.
+        let privileged = creds.capable(CAP_CHOWN);
         if !privileged {
             if uid != NO_ID && uid != metadata.uid as u32 {
                 return Err(LxError::EPERM);
@@ -3552,8 +3519,8 @@ impl LinuxProcess {
         // asking to be given.
         if !is_dir
             && (final_mode & (MODE_SET_GID | MODE_EXEC_GRP)) == (MODE_SET_GID | MODE_EXEC_GRP)
-            && creds.fsuid != ROOT_UID
             && !Self::acts_as_group(&creds, metadata.gid as u32, true)
+            && !creds.capable(CAP_FSETID)
         {
             final_mode &= !MODE_SET_GID;
         }
@@ -3630,7 +3597,7 @@ impl LinuxProcess {
     pub fn set_uid(&self, uid: u32) -> LxResult {
         let mut inner = self.inner.lock();
         let before = inner.ids();
-        let privileged = inner.credentials.euid == ROOT_UID;
+        let privileged = inner.credentials.capable(CAP_SETUID);
         if privileged {
             inner.credentials.ruid = uid;
             inner.credentials.euid = uid;
@@ -3651,7 +3618,7 @@ impl LinuxProcess {
     pub fn set_gid(&self, gid: u32) -> LxResult {
         let mut inner = self.inner.lock();
         let before = inner.ids();
-        let privileged = inner.credentials.euid == ROOT_UID;
+        let privileged = inner.credentials.capable(CAP_SETGID);
         if privileged {
             inner.credentials.rgid = gid;
             inner.credentials.egid = gid;
@@ -3672,7 +3639,7 @@ impl LinuxProcess {
     pub fn set_reuid(&self, ruid: u32, euid: u32) -> LxResult {
         let mut inner = self.inner.lock();
         let before = inner.ids();
-        let privileged = inner.credentials.euid == ROOT_UID;
+        let privileged = inner.credentials.capable(CAP_SETUID);
         if !privileged {
             if ruid != NO_ID
                 && !Self::set_real_allowed(inner.credentials.ruid, inner.credentials.euid, ruid)
@@ -3701,7 +3668,7 @@ impl LinuxProcess {
     pub fn set_regid(&self, rgid: u32, egid: u32) -> LxResult {
         let mut inner = self.inner.lock();
         let before = inner.ids();
-        let privileged = inner.credentials.euid == ROOT_UID;
+        let privileged = inner.credentials.capable(CAP_SETGID);
         if !privileged {
             if rgid != NO_ID
                 && !Self::set_real_allowed(inner.credentials.rgid, inner.credentials.egid, rgid)
@@ -3730,7 +3697,7 @@ impl LinuxProcess {
     pub fn set_resuid(&self, ruid: u32, euid: u32, suid: u32) -> LxResult {
         let mut inner = self.inner.lock();
         let before = inner.ids();
-        let privileged = inner.credentials.euid == ROOT_UID;
+        let privileged = inner.credentials.capable(CAP_SETUID);
         if !privileged {
             for uid in [ruid, euid, suid] {
                 if uid != NO_ID && !Self::allowed_uid(&inner.credentials, uid) {
@@ -3755,7 +3722,7 @@ impl LinuxProcess {
     pub fn set_resgid(&self, rgid: u32, egid: u32, sgid: u32) -> LxResult {
         let mut inner = self.inner.lock();
         let before = inner.ids();
-        let privileged = inner.credentials.euid == ROOT_UID;
+        let privileged = inner.credentials.capable(CAP_SETGID);
         if !privileged {
             for gid in [rgid, egid, sgid] {
                 if gid != NO_ID && !Self::allowed_gid(&inner.credentials, gid) {
@@ -3798,10 +3765,9 @@ impl LinuxProcess {
         if uid == NO_ID || uid == c.fsuid {
             return c.fsuid;
         }
-        if Self::setfsid_allowed(c.ruid, c.euid, c.suid, c.fsuid, uid)
-            || has_capability(c.euid, CAP_SETUID)
-        {
+        if Self::setfsid_allowed(c.ruid, c.euid, c.suid, c.fsuid, uid) || c.capable(CAP_SETUID) {
             inner.credentials.fsuid = uid;
+            inner.credentials.caps.follow_setfsuid(c.fsuid, uid);
             // `commit_creds()` treats a move of `fsuid` alone exactly like a
             // `set*id`: `if (!uid_eq(new->fsuid, old->fsuid) || ...)
             // set_dumpable(task->mm, suid_dumpable); task->pdeath_signal =
@@ -3822,9 +3788,7 @@ impl LinuxProcess {
         if gid == NO_ID || gid == c.fsgid {
             return c.fsgid;
         }
-        if Self::setfsid_allowed(c.rgid, c.egid, c.sgid, c.fsgid, gid)
-            || has_capability(c.euid, CAP_SETGID)
-        {
+        if Self::setfsid_allowed(c.rgid, c.egid, c.sgid, c.fsgid, gid) || c.capable(CAP_SETGID) {
             inner.credentials.fsgid = gid;
             inner.sugid = true;
             inner.dumpable = Some(SUID_DUMP_DISABLE);
@@ -4167,6 +4131,16 @@ impl LinuxProcess {
         self.inner.lock().semaphores.add_undo(id, num, op)
     }
 
+    /// See [`SemProc::make_undo_list`].
+    pub fn semaphores_make_undo_list(&self) {
+        self.inner.lock().semaphores.make_undo_list()
+    }
+
+    /// See [`SemProc::has_undo_list`].
+    pub fn semaphores_undo_list(&self) -> bool {
+        self.inner.lock().semaphores.has_undo_list()
+    }
+
     /// Remove an `SemArray` by ID
     pub fn semaphores_remove(&self, id: usize) {
         self.inner.lock().semaphores.remove(id)
@@ -4367,6 +4341,10 @@ impl LinuxProcessInner {
         self.follow_effective_ids();
         self.credentials.suid = self.credentials.euid;
         self.credentials.sgid = self.credentials.egid;
+        let (ruid, euid) = (self.credentials.ruid, self.credentials.euid);
+        self.credentials
+            .caps
+            .follow_exec(ruid, euid, self.no_new_privs);
 
         // `do_execve()` asks the same three questions to decide FreeBSD's
         // `P_SUGID`: `setsugid(p)` when the image granted an id, and
@@ -4404,6 +4382,9 @@ impl LinuxProcessInner {
         if self.ids() != before {
             self.sugid = true;
         }
+        let c = &mut self.credentials;
+        let (old, new) = ([before[0], before[1], before[2]], [c.ruid, c.euid, c.suid]);
+        c.caps.follow_setuid(old, new, self.keep_caps);
 
         // `commit_creds()`:
         //
@@ -4948,29 +4929,6 @@ fn child_death_policy(reaper: &LinuxProcess, exit_sig: u8) -> ChildDeathPolicy {
             autoreap: false,
             notify: true,
         }
-    }
-}
-
-/// Park the current task until this process leaves a job-control stop (or dies).
-pub async fn wait_while_job_stopped(proc: &Arc<Process>) {
-    loop {
-        let stopped = proc
-            .try_linux()
-            .map(|lp| lp.is_job_stopped())
-            .unwrap_or(false);
-        if !stopped || matches!(proc.status(), Status::Exited(_)) {
-            return;
-        }
-        proc.signal_clear(JOB_CONTINUE_SIGNAL);
-        let stopped = proc
-            .try_linux()
-            .map(|lp| lp.is_job_stopped())
-            .unwrap_or(false);
-        if !stopped || matches!(proc.status(), Status::Exited(_)) {
-            return;
-        }
-        let obj: Arc<dyn KernelObject> = proc.clone();
-        obj.wait_signal(JOB_CONTINUE_SIGNAL).await;
     }
 }
 
@@ -5670,6 +5628,13 @@ fn is_on_its_way_out(thread: &Thread) -> bool {
 /// signal -- left a sibling in `pause`, `nanosleep` or `read` asleep for good:
 /// the `execve` waited on it forever, and the process it belonged to never
 /// let go of its address space.
+///
+/// A thread of a job-control-stopped process is parked in
+/// [`wait_while_job_stopped`], on a bit of the process of its own, and the
+/// kill set neither of the two above: `kill -9` on a Ctrl-Z'd process
+/// reaped it and left its thread parked for good, with its memory and its
+/// robust futexes held -- a waiter on one of those timed out where Linux
+/// hands it `EOWNERDEAD`.
 fn wake_the_dying(thread: &Thread) {
     // A process with no Linux side has no Linux waits to end.
     if thread.proc().try_linux().is_none() {
@@ -5677,6 +5642,7 @@ fn wake_the_dying(thread: &Thread) {
     }
     thread.signal_set(SIGNAL_WAKE);
     thread.proc().signal_set(Signal::SIGCHLD);
+    thread.proc().signal_set(JOB_CONTINUE_SIGNAL);
 }
 
 static KILL_WAKES_THE_WAITS: AtomicBool = AtomicBool::new(false);
@@ -6214,20 +6180,6 @@ pub fn prepare_signal(process: &Arc<Process>, signal: LinuxSignal) {
     }
 }
 
-/// The job-control half of `complete_signal()`, for a signal aimed at ONE
-/// thread (`tkill`, `tgkill`, `rt_tgsigqueueinfo`, and so `pthread_kill`).
-///
-/// Queueing the signal on the thread is not enough, and this is the half that
-/// was missing: a thread of a job-control-stopped process is parked in
-/// `wait_while_job_stopped`, which nothing but `job_continue` clears, and a
-/// stopped thread does not run to notice a pending `SIGKILL` either. So
-/// `tgkill(pid, tid, SIGCONT)` on a Ctrl-Z'd process never resumed it and
-/// `tgkill(pid, tid, SIGKILL)` never woke it to die -- and Go, the JVM and
-/// glibc route nearly every signal they send through `tgkill`.
-pub fn complete_signal_for_job_control(process: &Arc<Process>, signal: LinuxSignal) {
-    wake_for_job_control(process, signal)
-}
-
 pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
     send_signal_to_process_with_info(pid, signal, None)
 }
@@ -6321,31 +6273,17 @@ pub fn send_signal_to_process_with_info(
     }
 }
 
-/// `complete_signal()`: the wake-up half, once the signal is queued.
-///
-/// It goes here, in the SENDER, because the work is only ever needed when the
-/// target is job-control stopped -- and a stopped process's threads are
-/// parked in [`wait_while_job_stopped`], so they cannot do it for themselves.
-/// After the queueing, as Linux does it, so the thread that wakes already has
-/// the signal to act on.
-fn wake_for_job_control(process: &Arc<Process>, signal: LinuxSignal) {
-    let lp = match process.try_linux() {
-        Some(lp) => lp,
-        None => return,
-    };
-    match send_effect(signal) {
-        SendEffect::Resume => {
-            lp.job_continue(process);
-        }
-        SendEffect::WakeToDie => lp.job_wake_to_die(process),
-        SendEffect::Stop | SendEffect::None => {}
-    }
-}
+mod job_stop;
+use job_stop::wake_for_job_control;
+pub use job_stop::{complete_signal_for_job_control, wait_while_job_stopped};
 
 mod exit_path;
 use exit_path::ExitPathSummary;
 
 mod exit_handover;
+
+mod exited_leader;
+pub use exited_leader::{exited_leader_of, task_count, task_ids, task_of};
 
 #[cfg(test)]
 mod exit_handover_tests;
@@ -6373,9 +6311,6 @@ mod sugid_tests;
 
 #[cfg(test)]
 mod dumpable_tests;
-
-#[cfg(test)]
-mod capability_tests;
 
 #[cfg(test)]
 mod rlimit_tests;

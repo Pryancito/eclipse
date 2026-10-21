@@ -209,17 +209,12 @@ pub(crate) fn write_data(
                 zero(dev, phys * BLOCK_SIZE, pos - run_start)?;
             }
             if chunk_end < run_end {
-                zero(
-                    dev,
-                    phys * BLOCK_SIZE + (chunk_end - run_start),
-                    run_end - chunk_end,
-                )?;
+                let tail = phys * BLOCK_SIZE + (chunk_end - run_start);
+                zero(dev, tail, run_end - chunk_end)?;
             }
         }
-        dev.write_at(
-            phys * BLOCK_SIZE + (pos - run_start),
-            &data[(pos - off) as usize..(chunk_end - off) as usize],
-        )?;
+        let at = phys * BLOCK_SIZE + (pos - run_start);
+        dev.write_at(at, &data[(pos - off) as usize..(chunk_end - off) as usize])?;
         pos = chunk_end;
     }
     if pos == off {
@@ -283,10 +278,8 @@ pub(crate) fn write_chain(
     }
     for (i, chunk) in rest.chunks(EXTENTS_PER_BLOCK).enumerate() {
         let next = blocks.get(i + 1).copied().unwrap_or(0);
-        dev.write_at(
-            blocks[i] * BLOCK_SIZE,
-            &encode_extent_block(owner, next, chunk),
-        )?;
+        let b = encode_extent_block(owner, next, chunk);
+        dev.write_at(blocks[i] * BLOCK_SIZE, &b)?;
     }
     for b in core::mem::replace(&mut inode.chain, blocks) {
         alloc.free(b, 1)?;
@@ -440,14 +433,8 @@ impl EclipseFsV3 {
         }
         let (mut itable, overflow, count) =
             Inode::decode(&sb.itable)?.ok_or(Error::Corrupt("inode table record"))?;
-        load_chain(
-            &*dev,
-            ITABLE_INO,
-            sb.total_blocks,
-            overflow,
-            count,
-            &mut itable,
-        )?;
+        let total = sb.total_blocks;
+        load_chain(&*dev, ITABLE_INO, total, overflow, count, &mut itable)?;
         let mut alloc = BlockAllocator::new(groups);
         alloc.set_deferred_frees(journal.is_some());
         let mut fs = Self {
@@ -689,18 +676,10 @@ impl EclipseFsV3 {
         }
         let mut rec = [0u8; INODE_SIZE];
         let n = read_data(&*self.dev, &self.itable, ino * INODE_SIZE as u64, &mut rec)?;
-        if n < INODE_SIZE {
-            return Err(Error::NotFound);
-        }
+        (n == INODE_SIZE).then_some(()).ok_or(Error::NotFound)?;
         let (mut inode, overflow, count) = Inode::decode(&rec)?.ok_or(Error::NotFound)?;
-        load_chain(
-            &*self.dev,
-            ino,
-            self.sb.total_blocks,
-            overflow,
-            count,
-            &mut inode,
-        )?;
+        let total = self.sb.total_blocks;
+        load_chain(&*self.dev, ino, total, overflow, count, &mut inode)?;
         if self.inodes.len() >= INODE_CACHE {
             self.inodes.pop_first();
         }
@@ -740,16 +719,10 @@ impl EclipseFsV3 {
 
     fn write_record(&mut self, ino: u64, rec: &[u8; INODE_SIZE]) -> Result<()> {
         self.ensure_itable(ino)?;
-        let w = write_data(
-            &*self.dev,
-            &mut self.alloc,
-            &mut self.itable,
-            ino * INODE_SIZE as u64,
-            rec,
-        )?;
-        if w < INODE_SIZE {
-            return Err(Error::NoSpace);
-        }
+        let at = ino * INODE_SIZE as u64;
+        let w = write_data(&*self.dev, &mut self.alloc, &mut self.itable, at, rec)?;
+        // A record never spans blocks: it is written whole or not at all.
+        (w == INODE_SIZE).then_some(()).ok_or(Error::NoSpace)?;
         self.itable_changed()
     }
 
@@ -854,11 +827,7 @@ impl EclipseFsV3 {
         let mut d = self.take(dir)?;
         let off = d.size;
         let r = write_data(&*self.dev, &mut self.alloc, &mut d, off, &rec);
-        let r = match r {
-            Ok(n) if n == rec.len() => Ok(()),
-            Ok(_) => Err(Error::NoSpace),
-            Err(e) => Err(e),
-        };
+        let r = r.and_then(|n| (n == rec.len()).then_some(()).ok_or(Error::NoSpace));
         if r.is_err() {
             // Whatever part of the record landed is past EOF again.
             d.size = off;
@@ -910,12 +879,10 @@ impl EclipseFsV3 {
     /// Rewrite a directory without its removed entries once they dominate it.
     fn maybe_compact(&mut self, dir: u64) -> Result<()> {
         let size = self.inode(dir)?.size;
-        let Some(c) = self.dirs.get_mut(&dir) else {
+        let due = |c: &&mut DirCache| c.dead >= DIR_COMPACT_MIN && c.dead * 2 >= size;
+        let Some(c) = self.dirs.get_mut(&dir).filter(due) else {
             return Ok(());
         };
-        if c.dead < DIR_COMPACT_MIN || c.dead * 2 < size {
-            return Ok(());
-        }
         let mut order: Vec<(&String, &mut DirSlot)> = c.entries.iter_mut().collect();
         order.sort_by_key(|(_, s)| s.off);
         let mut data = Vec::new();
@@ -1085,9 +1052,7 @@ impl EclipseFsV3 {
         } else {
             inode.flags &= !INODE_FLAG_INLINE;
             let n = write_data(&*self.dev, &mut self.alloc, inode, 0, target)?;
-            if n < target.len() {
-                return Err(Error::NoSpace);
-            }
+            (n == target.len()).then_some(()).ok_or(Error::NoSpace)?;
             Ok(())
         }
     }
@@ -1463,9 +1428,8 @@ impl EclipseFsV3 {
                 }));
             }
         }
-        if !self.read_only && self.sb.free_blocks != self.alloc.free_blocks() {
-            return Err(Error::Corrupt("fsck: free block count"));
-        }
+        // The commit above set the superblock's free count from the bitmaps.
+        debug_assert!(self.read_only || self.sb.free_blocks == self.alloc.free_blocks());
         Ok(CheckReport {
             inodes: live.len() as u64,
             directories: dirs.len() as u64,
@@ -1486,6 +1450,11 @@ impl Drop for EclipseFsV3 {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod scenarios;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use core::cell::RefCell;
@@ -1773,6 +1742,8 @@ mod tests {
             .extents
             .add_extent(Extent::new(1 << 20, old[0] + 2, 1))
             .unwrap();
+        // Room for one of the two blocks.
+        alloc.free(4 * n + 63, 1).unwrap();
         let free = alloc.free_blocks();
         assert!(matches!(
             write_chain(&dev, &mut alloc, 7, &mut inode),

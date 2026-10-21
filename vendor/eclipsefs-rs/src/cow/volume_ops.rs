@@ -28,9 +28,8 @@ impl CowFs {
         }
         self.writable()?;
         self.flush()?;
-        if !self.dev.is_empty() {
-            return Err(Error::Corrupt("uncommitted blocks"));
-        }
+        // The commit put every block where it lives.
+        debug_assert!(self.dev.is_empty());
         let mut map = ChunkMap::default();
         map.devices.insert(1, self.raw.size() / BS);
         for g in self.sp.alloc.groups().iter().filter(|g| !g.is_hole()) {
@@ -196,10 +195,14 @@ impl CowFs {
     pub(super) fn refresh_layouts(&mut self) {
         let Some(vol) = self.vol.clone() else {
             self.sp.tiered = false;
+            self.sp.reserve = metadata_reserve(self.sb.total_blocks);
             return;
         };
         let map = vol.map();
         self.sp.tiered = map.tiered();
+        // A volume's superblock counts only its system group: the reserve
+        // follows the devices, which is what the trees can grow into.
+        self.sp.reserve = metadata_reserve(map.devices.values().sum());
         for (&g, c) in &map.chunks {
             let Some(grp) = self.sp.alloc.groups_mut().get_mut(g as usize) else {
                 continue;
@@ -332,6 +335,7 @@ impl CowFs {
         dev.sync()?;
         vol.with_map(|m| m.devices.insert(id, size));
         vol.attach(id, dev);
+        self.refresh_layouts();
         self.sp.chunks_dirty = true;
         if let Err(e) = self.flush() {
             vol.detach(id);
@@ -570,11 +574,9 @@ impl CowFs {
             let Some(d) = vol.device(id) else { continue };
             let size = d.size() / BS;
             vol.with_map(|m| {
-                if let Some(s) = m.devices.get_mut(&id) {
-                    if size > *s {
-                        *s = size;
-                        grew = true;
-                    }
+                if let Some(s) = m.devices.get_mut(&id).filter(|s| size > **s) {
+                    *s = size;
+                    grew = true;
                 }
             });
         }

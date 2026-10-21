@@ -134,6 +134,32 @@ fn leaf_bytes(items: &[(Key, Vec<u8>)]) -> usize {
     items.iter().map(|(_, d)| LEAF_ITEM + d.len()).sum()
 }
 
+impl Body {
+    fn ptrs(&self) -> Option<&Vec<Ptr>> {
+        match self {
+            Body::Internal(p) => Some(p),
+            Body::Leaf(_) => None,
+        }
+    }
+
+    fn ptrs_mut(&mut self) -> Option<&mut Vec<Ptr>> {
+        match self {
+            Body::Internal(p) => Some(p),
+            Body::Leaf(_) => None,
+        }
+    }
+
+    /// Append a right sibling's contents.
+    fn append(&mut self, other: Body) -> Result<()> {
+        match (self, other) {
+            (Body::Leaf(x), Body::Leaf(y)) => x.extend(y),
+            (Body::Internal(x), Body::Internal(y)) => x.extend(y),
+            _ => return Err(Error::Corrupt("tree sibling levels")),
+        }
+        Ok(())
+    }
+}
+
 impl Node {
     pub fn empty_leaf(owner: u64, gen: u64) -> Self {
         Self {
@@ -1010,38 +1036,6 @@ impl Store {
         }
     }
 
-    /// Every node block of a tree with its level, for checking.
-    pub fn walk_nodes(
-        &mut self,
-        root: &Root,
-        visit: &mut dyn FnMut(u64, &Node) -> bool,
-    ) -> Result<()> {
-        self.walk_rec(root.bytenr, root.level, None, visit)
-    }
-
-    fn walk_rec(
-        &mut self,
-        b: u64,
-        level: u8,
-        gen: Option<u64>,
-        visit: &mut dyn FnMut(u64, &Node) -> bool,
-    ) -> Result<()> {
-        self.load(b, level, gen)?;
-        let node = self.cache[&b].clone();
-        if !visit(b, &node) {
-            return Ok(());
-        }
-        if let Body::Internal(ptrs) = node.body {
-            for p in ptrs {
-                if level == 0 {
-                    return Err(Error::Corrupt("tree level"));
-                }
-                self.walk_rec(p.bytenr, level - 1, Some(p.gen), visit)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Items that differ between trees `a` and `b`, in key order, as
     /// (key, value in `a`, value in `b`). Subtrees the two share (a
     /// snapshot and its source) are skipped without being read.
@@ -1271,6 +1265,15 @@ impl Store {
         Ok(out.old)
     }
 
+    /// The pointers of the cached internal node `b`, which the caller has
+    /// already been through as one.
+    fn internal_mut(&mut self, b: u64) -> &mut Vec<Ptr> {
+        self.cache
+            .get_mut(&b)
+            .and_then(|n| n.body.ptrs_mut())
+            .expect("cached internal node")
+    }
+
     fn modify_rec(
         &mut self,
         sp: &mut dyn Space,
@@ -1295,17 +1298,13 @@ impl Store {
         let gen = self.gen;
         let child_first = self.cache[&child].first_key();
         {
-            let Body::Internal(ptrs) = &mut self.cache.get_mut(&b).unwrap().body else {
-                unreachable!()
-            };
+            let ptrs = self.internal_mut(b);
             ptrs[idx].bytenr = child;
             ptrs[idx].gen = gen;
         }
         let out = r?;
         {
-            let Body::Internal(ptrs) = &mut self.cache.get_mut(&b).unwrap().body else {
-                unreachable!()
-            };
+            let ptrs = self.internal_mut(b);
             ptrs[idx].bytenr = child;
             ptrs[idx].gen = gen;
             if let Some(k) = child_first {
@@ -1424,10 +1423,11 @@ impl Store {
         level: u8,
         idx: usize,
     ) -> Result<()> {
-        let ptrs = match &self.cache[&parent].body {
-            Body::Internal(p) => p.clone(),
-            _ => unreachable!(),
-        };
+        let ptrs = self.cache[&parent]
+            .body
+            .ptrs()
+            .expect("merge under a leaf")
+            .clone();
         if ptrs.len() < 2 {
             return Ok(());
         }
@@ -1475,19 +1475,10 @@ impl Store {
             self.dirty.remove(&rb);
             self.cache.remove(&rb);
         }
-        {
-            let left = self.cache.get_mut(&lb).unwrap();
-            match (&mut left.body, right.body) {
-                (Body::Leaf(x), Body::Leaf(y)) => x.extend(y),
-                (Body::Internal(x), Body::Internal(y)) => x.extend(y),
-                _ => unreachable!(),
-            }
-        }
+        self.cache.get_mut(&lb).unwrap().body.append(right.body)?;
         let first = self.cache[&lb].first_key();
         let gen = self.gen;
-        let Body::Internal(p) = &mut self.cache.get_mut(&parent).unwrap().body else {
-            unreachable!()
-        };
+        let p = self.internal_mut(parent);
         p.remove(r);
         p[l].bytenr = lb;
         p[l].gen = gen;
@@ -1508,6 +1499,7 @@ impl Store {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::format::GROUP_BLOCKS;
@@ -2030,5 +2022,448 @@ mod tests {
         }
         let all = st.range(&root, &Key::MIN, &Key::MAX, usize::MAX).unwrap();
         assert_eq!(all.len(), 200);
+    }
+
+    fn reseal(b: &mut [u8]) {
+        let c = crc32c(&b[8..]);
+        put32(b, 4, c);
+    }
+
+    /// Write every dirty node out and forget the cache, as a commit would.
+    fn commit(st: &mut Store) {
+        for (b, img) in st.take_dirty() {
+            st.dev.write_at(b * BLOCK_SIZE, &img).unwrap();
+        }
+        st.cache.clear();
+    }
+
+    /// Put `node` in the cache at `b` as a node of this transaction.
+    fn inject(st: &mut Store, sp: &mut TestSpace, b: u64, node: Node) {
+        sp.refs.insert(b, 1);
+        st.cache.insert(b, node);
+        st.dirty.insert(b);
+    }
+
+    fn leaf_node(gen: u64, items: Vec<(Key, Vec<u8>)>) -> Node {
+        Node {
+            owner: 5,
+            gen,
+            level: 0,
+            body: Body::Leaf(items),
+        }
+    }
+
+    fn internal_node(gen: u64, level: u8, ptrs: &[(Key, u64)]) -> Node {
+        Node {
+            owner: 5,
+            gen,
+            level,
+            body: Body::Internal(
+                ptrs.iter()
+                    .map(|&(key, bytenr)| Ptr { key, bytenr, gen })
+                    .collect(),
+            ),
+        }
+    }
+
+    #[test]
+    fn an_empty_shared_range_reads_nothing() {
+        let (st, _, root) = setup();
+        assert!(st
+            .range_shared(&root, &Key::MAX, &Key::MIN, 10)
+            .unwrap()
+            .is_empty());
+        assert!(st
+            .range_shared(&root, &Key::MIN, &Key::MAX, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn node_len_and_body_accessors() {
+        let mut n = Node::empty_leaf(1, 1);
+        assert!(n.is_empty());
+        assert!(n.body.ptrs().is_none());
+        assert!(n.body.ptrs_mut().is_none());
+        let mut i = internal_node(1, 1, &[(Key::MIN, 7)]);
+        assert!(!i.is_empty());
+        assert_eq!(i.body.ptrs_mut().unwrap().len(), 1);
+        assert_eq!(
+            n.body.append(i.body.clone()).unwrap_err(),
+            Error::Corrupt("tree sibling levels")
+        );
+    }
+
+    #[test]
+    fn decode_rejects_every_kind_of_damage() {
+        let fsid = [0; 16];
+        let n = leaf_node(1, vec![(Key::new(1, 0, 0), vec![1, 2, 3])]);
+        let good = n.encode(5, &fsid);
+
+        let mut b = good.clone();
+        b[36] = MAX_LEVEL + 1;
+        reseal(&mut b);
+        assert_eq!(
+            Node::decode(&b, 5, &fsid).unwrap_err(),
+            Error::Corrupt("tree node level")
+        );
+
+        let mut b = good.clone();
+        put32(&mut b, 32, (LEAF_SPACE / LEAF_ITEM + 1) as u32);
+        reseal(&mut b);
+        assert_eq!(
+            Node::decode(&b, 5, &fsid).unwrap_err(),
+            Error::Corrupt("tree leaf item count")
+        );
+
+        // Data inside the item table, then running off the end of the block.
+        for (off, len) in [(0u32, 3u32), ((BS - 2) as u32, 3)] {
+            let mut b = good.clone();
+            put32(&mut b, NODE_HDR + KEY_SIZE, off);
+            put32(&mut b, NODE_HDR + KEY_SIZE + 4, len);
+            reseal(&mut b);
+            assert_eq!(
+                Node::decode(&b, 5, &fsid).unwrap_err(),
+                Error::Corrupt("tree leaf item bounds")
+            );
+        }
+
+        let i = internal_node(1, 1, &[(Key::new(2, 0, 0), 7), (Key::new(1, 0, 0), 8)]);
+        assert_eq!(
+            Node::decode(&i.encode(5, &fsid), 5, &fsid).unwrap_err(),
+            Error::Corrupt("tree node key order")
+        );
+    }
+
+    /// Every way into the store checks the block number, level and
+    /// generation a pointer gives against the node it finds.
+    #[test]
+    fn the_store_checks_what_pointers_say() {
+        let (mut st, mut sp, mut root) = setup();
+        st.insert(&mut sp, &mut root, Key::new(1, 0, 0), vec![1])
+            .unwrap();
+        let img = st.cache[&root.bytenr].encode(root.bytenr, &st.fsid);
+        commit(&mut st);
+        let range = Error::Corrupt("tree pointer out of range");
+        let mismatch = Error::Corrupt("tree node level or generation");
+
+        assert_eq!(st.check_node(&img, 1, 0, None).unwrap_err(), range);
+        assert_eq!(st.check_node(&img, 40_000, 0, None).unwrap_err(), range);
+        assert_eq!(
+            st.check_node(&img, root.bytenr, 1, None).unwrap_err(),
+            mismatch
+        );
+        assert!(st.check_node(&img, root.bytenr, 0, Some(1)).is_ok());
+        assert_eq!(st.read_disk(0, 0, None).unwrap_err(), range);
+        assert_eq!(st.read_disk(root.bytenr, 0, Some(7)).unwrap_err(), mismatch);
+        assert!(st.read_disk(root.bytenr, 0, None).is_ok());
+
+        // From the device, then from the cache.
+        assert_eq!(st.node(1, 0, None).unwrap_err(), range);
+        assert_eq!(st.node(root.bytenr, 1, None).unwrap_err(), mismatch);
+        st.node(root.bytenr, 0, None).unwrap();
+        assert_eq!(st.node(root.bytenr, 1, None).unwrap_err(), mismatch);
+
+        // The shared readers, from the cache and from the device.
+        let wrong = Root { level: 1, ..root };
+        assert_eq!(st.get_shared(&wrong, &Key::MIN).unwrap_err(), mismatch);
+        let outside = Root { bytenr: 1, ..root };
+        assert_eq!(st.get_shared(&outside, &Key::MIN).unwrap_err(), range);
+    }
+
+    /// A key below everything in a tree of more than one level stops at the
+    /// first internal node.
+    #[test]
+    fn shared_seek_below_the_first_key() {
+        let (mut st, mut sp, mut root) = setup();
+        for i in 1..2000u64 {
+            st.insert(&mut sp, &mut root, Key::new(i, 1, 0), val(i, 30))
+                .unwrap();
+        }
+        assert!(root.level >= 1);
+        assert_eq!(st.seek_le_shared(&root, &Key::MIN).unwrap(), None);
+        commit(&mut st);
+        assert_eq!(st.seek_le_shared(&root, &Key::MIN).unwrap(), None);
+        assert_eq!(
+            st.seek_le_shared(&root, &Key::new(5, 1, 0))
+                .unwrap()
+                .unwrap()
+                .0,
+            Key::new(5, 1, 0)
+        );
+    }
+
+    /// An internal node that says it is a leaf (or the other way round)
+    /// stops every walk instead of sending it below level 0.
+    #[test]
+    fn a_node_at_the_wrong_level_is_corrupt_everywhere() {
+        let (mut st, mut sp, root) = setup();
+        let gen = st.gen;
+        let level = Error::Corrupt("tree level");
+        let shared = Error::Corrupt("tree node level or generation");
+        // A level-0 node with pointers.
+        inject(
+            &mut st,
+            &mut sp,
+            30_000,
+            internal_node(gen, 0, &[(Key::MIN, root.bytenr)]),
+        );
+        let bad0 = Root {
+            bytenr: 30_000,
+            level: 0,
+            gen,
+        };
+        // A level-1 node with items.
+        let mut l = leaf_node(gen, vec![(Key::MIN, vec![1])]);
+        l.level = 1;
+        inject(&mut st, &mut sp, 30_001, l);
+        let bad1 = Root {
+            bytenr: 30_001,
+            level: 1,
+            gen,
+        };
+
+        assert_eq!(st.seek_le_shared(&bad0, &Key::MAX).unwrap_err(), shared);
+        assert_eq!(
+            st.range_shared(&bad0, &Key::MIN, &Key::MAX, 10)
+                .unwrap_err(),
+            shared
+        );
+        let mut r = bad0;
+        assert_eq!(st.relocate(&mut sp, &mut r, &|_| true).unwrap_err(), level);
+        assert_eq!(st.diff(&bad0, &root).unwrap_err(), level);
+        assert_eq!(st.diff(&root, &bad1).unwrap_err(), level);
+        let mut r = bad1;
+        assert_eq!(
+            st.upsert(&mut sp, &mut r, Key::new(2, 0, 0), vec![2])
+                .unwrap_err(),
+            level
+        );
+        assert_eq!(
+            st.modify_leaf(&mut sp, 30_000, Key::MIN, Op::Delete)
+                .err()
+                .unwrap(),
+            level
+        );
+    }
+
+    /// `modify` checks the key before copying anything; the leaf checks it
+    /// again on its own.
+    #[test]
+    fn the_leaf_checks_presence_too() {
+        let (mut st, mut sp, mut root) = setup();
+        st.insert(&mut sp, &mut root, Key::new(1, 0, 0), vec![1])
+            .unwrap();
+        let b = root.bytenr;
+        assert_eq!(
+            st.modify_leaf(&mut sp, b, Key::new(1, 0, 0), Op::Insert(vec![2]))
+                .err()
+                .unwrap(),
+            Error::Exists
+        );
+        assert_eq!(
+            st.modify_leaf(&mut sp, b, Key::new(2, 0, 0), Op::Delete)
+                .err()
+                .unwrap(),
+            Error::NotFound
+        );
+        assert_eq!(
+            st.modify_leaf(&mut sp, b, Key::new(2, 0, 0), Op::Update(vec![]))
+                .err()
+                .unwrap(),
+            Error::NotFound
+        );
+    }
+
+    /// The split point moves so that neither half is over a node, however
+    /// lopsided the items.
+    #[test]
+    fn split_keeps_the_left_half_within_a_node() {
+        let (mut st, mut sp, _) = setup();
+        let gen = st.gen;
+        let items = (0..10u64)
+            .map(|i| (Key::new(i, 0, 0), val(i, MAX_ITEM)))
+            .collect();
+        inject(&mut st, &mut sp, 30_000, leaf_node(gen, items));
+        let (k, _) = st.split(&mut sp, 30_000).unwrap();
+        let Body::Leaf(left) = &st.cache[&30_000].body else {
+            panic!()
+        };
+        assert_eq!(left.len(), 4);
+        assert_eq!(k, Key::new(4, 0, 0));
+    }
+
+    #[test]
+    fn siblings_at_different_levels_do_not_merge() {
+        let (mut st, mut sp, _) = setup();
+        let gen = st.gen;
+        inject(&mut st, &mut sp, 30_000, leaf_node(gen, vec![]));
+        inject(
+            &mut st,
+            &mut sp,
+            30_001,
+            internal_node(gen, 0, &[(Key::MIN, 3)]),
+        );
+        inject(
+            &mut st,
+            &mut sp,
+            30_002,
+            internal_node(gen, 1, &[(Key::MIN, 30_000), (Key::new(5, 0, 0), 30_001)]),
+        );
+        assert_eq!(
+            st.merge_child(&mut sp, 30_002, 1, 0).unwrap_err(),
+            Error::Corrupt("tree sibling levels")
+        );
+    }
+
+    /// Two empty children merge into nothing: both go, unless they were the
+    /// only child left.
+    #[test]
+    fn empty_siblings_are_dropped_together() {
+        for (empties, left) in [(2u64, 1usize), (1, 1)] {
+            let (mut st, mut sp, _) = setup();
+            let gen = st.gen;
+            let mut ptrs = Vec::new();
+            for i in 0..empties {
+                inject(&mut st, &mut sp, 30_000 + i, leaf_node(gen, vec![]));
+                ptrs.push((Key::new(i, 0, 0), 30_000 + i));
+            }
+            let k = Key::new(10, 0, 0);
+            inject(&mut st, &mut sp, 30_010, leaf_node(gen, vec![(k, vec![1])]));
+            ptrs.push((k, 30_010));
+            inject(&mut st, &mut sp, 30_020, internal_node(gen, 1, &ptrs));
+            let mut root = Root {
+                bytenr: 30_020,
+                level: 1,
+                gen,
+            };
+            assert_eq!(st.delete(&mut sp, &mut root, k).unwrap(), vec![1]);
+            // One empty leaf is left, and the root collapsed onto it.
+            assert_eq!(root.level, 0);
+            assert_eq!(root.bytenr, 30_000);
+            // The tree `setup` made is still there too.
+            let live = sp.refs.values().filter(|&&c| c > 0).count();
+            assert_eq!(live, left + 1);
+        }
+    }
+
+    /// A tree already MAX_LEVEL high cannot grow another level.
+    #[test]
+    fn a_tree_at_the_height_limit_refuses_to_grow() {
+        let (mut st, mut sp, _) = setup();
+        let gen = st.gen;
+        let half = vec![0u8; MAX_ITEM];
+        inject(
+            &mut st,
+            &mut sp,
+            30_000,
+            leaf_node(
+                gen,
+                vec![(Key::new(1, 0, 0), half.clone()), (Key::new(3, 0, 0), half)],
+            ),
+        );
+        for level in 1..=MAX_LEVEL {
+            let b = 30_000 + level as u64;
+            let mut ptrs = vec![(Key::MIN, b - 1)];
+            for i in 1..MAX_PTRS as u64 {
+                ptrs.push((Key::new(1000 + i, 0, 0), 39_000));
+            }
+            inject(&mut st, &mut sp, b, internal_node(gen, level, &ptrs));
+        }
+        let mut root = Root {
+            bytenr: 30_000 + MAX_LEVEL as u64,
+            level: MAX_LEVEL,
+            gen,
+        };
+        assert_eq!(
+            st.insert(&mut sp, &mut root, Key::new(2, 0, 0), vec![1])
+                .unwrap_err(),
+            Error::NoSpace
+        );
+    }
+
+    /// Items only in the first tree, past the end of the second.
+    #[test]
+    fn diff_lists_what_only_the_first_tree_has() {
+        let (mut st, mut sp, mut a) = setup();
+        let mut b = st.create(&mut sp, 5, 0).unwrap();
+        for i in 0..10u64 {
+            st.insert(&mut sp, &mut a, Key::new(i, 0, 0), vec![i as u8])
+                .unwrap();
+            if i < 5 {
+                st.insert(&mut sp, &mut b, Key::new(i, 0, 0), vec![i as u8])
+                    .unwrap();
+            }
+        }
+        let d = st.diff(&a, &b).unwrap();
+        assert_eq!(d.len(), 5);
+        assert!(d.iter().all(|(_, va, vb)| va.is_some() && vb.is_none()));
+    }
+
+    /// A bad leaf in the second tree fails the diff: its internal nodes are
+    /// read for the first pass, its leaves only for the second.
+    #[test]
+    fn diff_fails_on_a_bad_leaf_of_the_second_tree() {
+        let (mut st, mut sp, mut a) = setup();
+        let mut b = st.create(&mut sp, 5, 0).unwrap();
+        st.insert(&mut sp, &mut a, Key::MIN, vec![1]).unwrap();
+        for i in 0..500u64 {
+            st.insert(&mut sp, &mut b, Key::new(i, 1, 0), val(i, 60))
+                .unwrap();
+        }
+        assert!(b.level >= 1);
+        commit(&mut st);
+        let Body::Internal(ptrs) = st.node(b.bytenr, b.level, None).unwrap().body.clone() else {
+            panic!()
+        };
+        let leaf = ptrs[1].bytenr;
+        st.dev.write_at(leaf * BLOCK_SIZE, &[0xff; 8]).unwrap();
+        st.cache.clear();
+        assert!(matches!(st.diff(&a, &b), Err(Error::Corrupt(_))));
+    }
+
+    /// Merging into a copy while the right sibling is still shared with a
+    /// snapshot: what moves gains an owner, so the snapshot keeps it.
+    #[test]
+    fn merges_with_a_shared_right_sibling_keep_the_snapshot_whole() {
+        let (mut st, mut sp, mut a) = setup();
+        let mut model = BTreeMap::new();
+        for i in 0..12_000u64 {
+            let mut v = val(i, 24);
+            let k = if i % 4 == 0 {
+                v[..8].copy_from_slice(&(100_000 + i).to_le_bytes());
+                v[8..16].copy_from_slice(&1u64.to_le_bytes());
+                Key::new(i, 108, 0)
+            } else {
+                Key::new(i, 1, 0)
+            };
+            st.insert(&mut sp, &mut a, k, v.clone()).unwrap();
+            model.insert(k, v);
+        }
+        assert!(a.level >= 2, "level {}", a.level);
+        st.take_dirty();
+        st.share(&mut sp, a).unwrap();
+        let mut b = a;
+        let keys: Vec<Key> = model.keys().copied().collect();
+        let mut mb = model.clone();
+        // Thin out the tree from the left, a few keys from each leaf and
+        // then almost everything, so merges reach the internal levels.
+        for (n, k) in keys.iter().enumerate() {
+            if n % 8 != 0 {
+                let v = st.delete(&mut sp, &mut b, *k).unwrap();
+                // The caller drops what a deleted extent item points at.
+                if let Some((s, l)) = (st.extent_of)(k, &v) {
+                    sp.decref_data(s, l).unwrap();
+                }
+                mb.remove(k);
+            }
+        }
+        check_all(&mut st, &a, &model);
+        check_all(&mut st, &b, &mb);
+        st.release(&mut sp, a).unwrap();
+        check_all(&mut st, &b, &mb);
+        st.release(&mut sp, b).unwrap();
+        assert!(sp.refs.values().all(|&c| c == 0));
+        assert!(sp.data_refs.values().all(|&c| c == 0));
     }
 }

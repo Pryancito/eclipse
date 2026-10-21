@@ -668,6 +668,7 @@ impl BlockAllocator {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -1085,5 +1086,50 @@ mod tests {
         // Dropping the last group trims the holes before it.
         a.set_group(AllocationGroup::hole(2));
         assert_eq!(a.groups().len(), 1);
+    }
+
+    /// Rows a transaction opens are kept as merged ranges: opening the rows
+    /// between two open ranges joins all three into one.
+    #[test]
+    fn opened_rows_merge_with_both_neighbours() {
+        let mut g = AllocationGroup::new(0, 256);
+        g.set_row(4);
+        let a = g.allocate_run(32, 4).unwrap();
+        let b = g.allocate_run(48, 4).unwrap();
+        assert_eq!((a, b), (32, 48));
+        // Rows 9..12 sit between rows 8 and 12: one range 8..13 remains.
+        assert_eq!(g.allocate_run(36, 12), Some(36));
+        assert_eq!(
+            g.open.iter().map(|(&s, &l)| (s, l)).collect::<Vec<_>>(),
+            vec![(8, 5)]
+        );
+    }
+
+    /// Enough free blocks in total but no run as long as asked: no run.
+    #[test]
+    fn a_fragmented_group_has_no_long_run() {
+        let mut g = AllocationGroup::new(0, 64);
+        let free = g.free_blocks;
+        let (s, n) = g.allocate(0, free).unwrap();
+        assert_eq!(n, free);
+        for o in (s..s + n).step_by(2) {
+            g.free(o, 1).unwrap();
+        }
+        assert!(g.free_blocks >= 2);
+        assert_eq!(g.allocate_run(0, 2), None);
+    }
+
+    #[test]
+    fn shrinking_needs_a_free_tail() {
+        let mut g = AllocationGroup::new(0, 128);
+        g.shrink(128).unwrap();
+        g.shrink(500).unwrap();
+        assert_eq!(g.block_count, 128);
+        assert_eq!(g.shrink(1), Err(Error::Invalid));
+        g.mark_used(100, 1);
+        assert_eq!(g.shrink(64), Err(Error::Invalid));
+        g.free(100, 1).unwrap();
+        g.shrink(64).unwrap();
+        assert_eq!(g.block_count, 64);
     }
 }

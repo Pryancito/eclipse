@@ -58,7 +58,7 @@ pub(super) fn proc_task_status(proc: &Process, thread: Option<&Arc<Thread>>) -> 
         None => proc_comm(proc),
     });
     let state = status_state_text(match thread {
-        Some(t) => thread_state_char(t.state()),
+        Some(t) => task_state_char(proc, t.state()),
         None => proc_state_char(proc),
     });
     // A zombie has given up its `fs_struct`, its descriptor table and its
@@ -111,10 +111,10 @@ pub(super) fn proc_task_status(proc: &Process, thread: Option<&Arc<Thread>>) -> 
             vm_size_kb, vm_rss_kb
         );
     }
-    let _ = writeln!(out, "Threads:\t{}", proc.thread_ids().len().max(1));
+    let _ = writeln!(out, "Threads:\t{}", crate::process::task_count(proc));
     if let (Some(lp), Some(creds)) = (lp, creds.as_ref()) {
         signal_lines(&mut out, lp, task.as_ref(), creds.ruid);
-        capability_lines(&mut out, creds.euid);
+        capability_lines(&mut out, &creds.caps);
         let _ = writeln!(out, "NoNewPrivs:\t{}", lp.no_new_privs() as u8);
     }
     // No `Seccomp:` lines: `prctl(PR_GET_SECCOMP)` answers as a kernel built
@@ -234,17 +234,14 @@ fn signals_pending_for_user_in(job: &Arc<Job>, uid: u32) -> u64 {
         .sum()
 }
 
-/// `CapInh:` to `CapAmb:`. The sets are the ones `capget(2)` publishes
-/// (root holds every capability, anybody else none, nothing is inheritable),
-/// and the bounding set is every capability: `prctl(PR_CAPBSET_READ)` answers
-/// 1 for each one there is.
-fn capability_lines(out: &mut String, euid: u32) {
-    let held = crate::process::published_capabilities(euid);
-    let bounding = (1u64 << (crate::process::CAP_LAST_CAP + 1)) - 1;
+/// `CapInh:` to `CapAmb:`: the sets the process keeps, the ones `capget(2)`
+/// publishes and `prctl(PR_CAPBSET_READ)` reads. The ambient set is always
+/// empty (there is no `PR_CAP_AMBIENT`).
+fn capability_lines(out: &mut String, caps: &crate::process::Capabilities) {
     let _ = write!(
         out,
         "CapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\n",
-        0, held, held, bounding, 0
+        caps.inheritable, caps.permitted, caps.effective, caps.bounding, 0
     );
 }
 

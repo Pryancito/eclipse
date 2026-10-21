@@ -14,8 +14,32 @@ pub struct MemDisk {
     data: Mutex<Vec<u8>>,
 }
 
+/// Every log record, formatted and dropped: the arguments of `warn!` and
+/// `debug!` are then evaluated, so a log line that would panic or read
+/// freed state shows up in tests instead of on the one machine that logs.
+struct Sink;
+
+impl log::Log for Sink {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, r: &log::Record) {
+        std::hint::black_box(format!("{}", r.args()));
+    }
+    fn flush(&self) {}
+}
+
+pub fn trace_logs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = log::set_logger(&Sink);
+        log::set_max_level(log::LevelFilter::Trace);
+    });
+}
+
 impl MemDisk {
     pub fn new(size: usize) -> Arc<Self> {
+        trace_logs();
         Arc::new(Self {
             data: Mutex::new(vec![0xA5; size]),
         })

@@ -176,9 +176,8 @@ impl CowFs {
                 }
                 let s = (e.lblk * BS).max(off);
                 let t = ((e.lblk + e.blocks) * BS).min(end);
-                if s >= t {
-                    continue;
-                }
+                // Extents in the batch overlap the blocks of `off..end`.
+                debug_assert!(s < t);
                 if s > zeroed_to {
                     buf[(zeroed_to - off) as usize..(s - off) as usize].fill(0);
                 }

@@ -25,6 +25,7 @@ fn creds(ruid: u32, euid: u32) -> Credentials {
         fsgid: euid,
         groups: Vec::new(),
         umask: 0o022,
+        caps: Capabilities::for_uids(ruid, euid, euid),
     }
 }
 

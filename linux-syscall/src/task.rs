@@ -12,9 +12,9 @@ use kernel_hal::context::{UserContext, UserContextField};
 use linux_object::error::LxResult;
 use linux_object::fs::{FileLike, PidFd};
 use linux_object::process::{
-    killable_on, prio_target, wait_child_any_interest, wait_child_interest, Credentials,
-    LinuxProcess, PrioTarget, SchedFacts, SchedRequest, WaitInterest, CAP_LAST_CAP, CAP_SETGID,
-    RLIMIT_NICE, RLIMIT_RTPRIO,
+    killable_on, prio_target, wait_child_any_interest, wait_child_interest, Capabilities,
+    Credentials, LinuxProcess, PrioTarget, SchedFacts, SchedRequest, WaitInterest, CAP_LAST_CAP,
+    CAP_SETGID, RLIMIT_NICE, RLIMIT_RTPRIO,
 };
 use linux_object::signal::SigInfo;
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
@@ -34,6 +34,13 @@ mod exec_args;
 mod execveat;
 use execveat::exec_target;
 pub(crate) use execveat::real_path;
+/// `kcmp(2)`.
+mod kcmp;
+/// `process_vm_readv(2)` and `process_vm_writev(2)`.
+mod process_vm;
+/// `struct sched_attr` in and out.
+mod sched_attr;
+use sched_attr::*;
 
 const P_ALL: i32 = 0;
 const P_PID: i32 = 1;
@@ -124,7 +131,7 @@ const ARG_MAX: usize = USER_STACK_PAGES * PAGE_SIZE / 4;
 /// `SCHED_FLAG_RESET_ON_FORK` instead.
 const SCHED_RESET_ON_FORK: usize = 0x4000_0000;
 
-/// Linux `struct sched_attr` (the v0 / 48-byte layout) used by
+/// Linux `struct sched_attr` (the v1 / 56-byte layout) used by
 /// `sched_setattr(2)` / `sched_getattr(2)`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -145,6 +152,10 @@ pub struct SchedAttr {
     pub sched_deadline: u64,
     /// `SCHED_DEADLINE` period in nanoseconds (unused here).
     pub sched_period: u64,
+    /// `SCHED_FLAG_UTIL_CLAMP_MIN`'s floor; this kernel has no util clamps.
+    pub sched_util_min: u32,
+    /// `SCHED_FLAG_UTIL_CLAMP_MAX`'s ceiling.
+    pub sched_util_max: u32,
 }
 
 /// What a process that failed `execve` AFTER its address space was replaced
@@ -227,6 +238,16 @@ pub(crate) fn capbset_drop_verdict(cap: usize, may_set_pcap: bool) -> LxResult<(
     if cap > CAP_LAST_CAP as usize {
         return Err(LxError::EINVAL);
     }
+    Ok(())
+}
+
+/// `PR_CAPBSET_DROP` on `caps`: [`capbset_drop_verdict`] against the
+/// effective set, then `cap` out of the bounding set alone
+/// (`cap_prctl_drop`: `cap_lower(new->cap_bset, cap)`). The permitted set
+/// keeps it until the next exec, as on Linux 6.18.
+pub(crate) fn capbset_drop(caps: &mut Capabilities, cap: usize) -> LxResult<()> {
+    capbset_drop_verdict(cap, caps.has(linux_object::process::CAP_SETPCAP))?;
+    caps.bounding &= !(1u64 << cap);
     Ok(())
 }
 
@@ -1762,6 +1783,15 @@ impl Syscall<'_> {
     /// process for a thread whose TID matches; failing that we treat `pid` as a
     /// process id and return its leader thread, so `taskset -p <pid>` works for
     /// single-threaded processes.
+    ///
+    /// That second look is the one that finds a process which has exited, so
+    /// it asks [`find_task`](linux_object::process::find_task) and not the
+    /// job: a child `wait4` has collected can still be in its job while its
+    /// last thread finishes dying, and in QEMU a third of the `sched_*`,
+    /// `getpriority` and `ioprio_get` calls made right after the `waitpid`
+    /// found that thread, where Linux answers `ESRCH`. A zombie still has its
+    /// thread while it is in the job, and is found, as on Linux; once it has
+    /// left, it has no thread to answer with.
     fn find_thread_by_tid(&self, pid: usize) -> Option<Arc<Thread>> {
         let id = pid as KoID;
         for proc in linux_object::process::all_live_processes() {
@@ -1771,7 +1801,7 @@ impl Syscall<'_> {
                 }
             }
         }
-        let proc = zircon_object::task::ROOT_JOB.find_process(id)?;
+        let proc = linux_object::process::find_task(id)?;
         proc.threads().first().cloned()
     }
 
@@ -1889,17 +1919,11 @@ impl Syscall<'_> {
     /// policies require it to be `0`. A nice value outside `-20..=19` is
     /// `EINVAL`.
     ///
-    /// Not a clamp: `__sched_setscheduler` refuses it outright,
-    /// `if (attr->sched_nice < MIN_NICE || attr->sched_nice > MAX_NICE)
-    /// return -EINVAL;`. Clamping is right for `setpriority(2)`, which Linux
-    /// really does clamp (and [`Self::sys_setpriority`] with it), and wrong
-    /// here: `sched_setattr(0, {policy = SCHED_OTHER, nice = 100})` came back
-    /// SUCCESSFUL with nice 19, so a caller probing for the accepted range --
-    /// which is how a library finds out what it may ask for -- got told 100
-    /// was fine and then ran at a priority it never chose. The other two
-    /// callers hand in `thread.sched_nice()`, a value that is in range by
-    /// construction, so this only ever fires on what `sched_setattr` was
-    /// given.
+    /// No caller hands one in: `sched_setattr` has brought the caller's nice
+    /// into range already, as Linux's `sched_copy_attr` does ("lenient like
+    /// existing syscalls": nice 50 is 19 on Linux 6.18, measured), and the
+    /// other two callers hand in `thread.sched_nice()`, in range by
+    /// construction. The check stays as the guard of the `as i8` below.
     fn sched_validate(policy: u8, sched_priority: i32, nice: i32) -> Result<(u8, u8, i8), LxError> {
         if !(MIN_NICE as i32..=MAX_NICE as i32).contains(&nice) {
             return Err(LxError::EINVAL);
@@ -2096,17 +2120,7 @@ impl Syscall<'_> {
         if flags != 0 {
             return Err(LxError::EINVAL);
         }
-        // The size is read on its own first, as `sched_copy_attr` does it:
-        // it decides how much of the struct is there to read at all.
-        let size = sched_setattr_size(UserInPtr::<u32>::from(attr.as_addr()).read()?)?;
-        if size > SCHED_ATTR_SIZE_VER0 {
-            let tail = UserInPtr::<u8>::from(attr.as_addr() + SCHED_ATTR_SIZE_VER0)
-                .read_array(size - SCHED_ATTR_SIZE_VER0)?;
-            if !extensible_tail_is_empty(&tail) {
-                return Err(LxError::E2BIG);
-            }
-        }
-        let a = attr.read()?;
+        let a = sched_copy_attr(attr.as_addr())?;
         let plan = sched_setattr_plan(a.sched_flags, a.sched_policy)?;
         info!(
             "sched_setattr: pid={} policy={:?} flags={:#x} reset_on_fork={} nice={}",
@@ -2117,6 +2131,7 @@ impl Syscall<'_> {
             a.sched_nice
         );
         let thread = self.sched_target(pid)?;
+        sched_flags_known(a.sched_flags)?;
         // `SETPARAM_POLICY`: the thread's own policy and its own
         // `sched_reset_on_fork` stand in for the struct's. The legacy bit in
         // the policy word is no policy (`valid_policy`), and is EINVAL below.
@@ -2139,6 +2154,12 @@ impl Syscall<'_> {
         };
         let (p, rt, nice) = Self::sched_validate(policy as u8, priority, nice)?;
         self.check_sched_permission(&thread, p, nice, rt, reset_on_fork)?;
+        // `uclamp_validate` of a kernel built without `CONFIG_UCLAMP_TASK`:
+        // the last check, once every other one has passed, and nothing
+        // changes.
+        if a.sched_flags & SCHED_FLAG_UTIL_CLAMP != 0 {
+            return Err(LxError::EOPNOTSUPP);
+        }
         // `KEEP_PARAMS` keeps the PARAMETERS, and that is all it keeps: the
         // class change goes through. `sys_sched_setattr` uses the flag only to
         // overwrite `attr`'s priority and nice from the task (`get_params`)
@@ -2155,13 +2176,14 @@ impl Syscall<'_> {
     }
 
     /// `sched_getattr` writes thread `pid`'s scheduling attributes into a
-    /// caller-supplied `struct sched_attr` of `size` bytes.
+    /// caller-supplied `struct sched_attr` of `size` bytes: see
+    /// [`sched_attr_out`] for how much of it.
     ///
     /// See [linux man sched_getattr(2)](https://www.man7.org/linux/man-pages/man2/sched_getattr.2.html).
     pub fn sys_sched_getattr(
         &self,
         pid: usize,
-        mut attr: UserOutPtr<SchedAttr>,
+        attr: UserOutPtr<SchedAttr>,
         size: usize,
         flags: usize,
     ) -> SysResult {
@@ -2173,7 +2195,7 @@ impl Syscall<'_> {
         sched_getattr_size(size)?;
         let thread = self.sched_target(pid)?;
         let a = SchedAttr {
-            size: SCHED_ATTR_SIZE_VER0 as u32,
+            size: 0,
             sched_policy: thread.sched_policy() as u32,
             sched_flags: if thread.sched_reset_on_fork() {
                 SCHED_FLAG_RESET_ON_FORK
@@ -2185,8 +2207,10 @@ impl Syscall<'_> {
             sched_runtime: 0,
             sched_deadline: 0,
             sched_period: 0,
+            sched_util_min: 0,
+            sched_util_max: 0,
         };
-        attr.write(a)?;
+        UserOutPtr::<u8>::from(attr.as_addr()).write_array(&sched_attr_out(a, size))?;
         Ok(0)
     }
 
@@ -2551,15 +2575,10 @@ impl Syscall<'_> {
                 if a2 > CAP_LAST_CAP as usize {
                     return Err(LxError::EINVAL);
                 }
-                // Root-run kernel: every valid capability is in the bounding
-                // set (consistent with sys_capget).
-                Ok(1)
+                Ok(proc.capabilities().bounds(a2 as u32) as usize)
             }
             PR_CAPBSET_DROP => {
-                capbset_drop_verdict(a2, proc.capable(linux_object::process::CAP_SETPCAP))?;
-                // There is no stored bounding set to shrink; accepting keeps
-                // privilege-dropping daemons on their happy path, consistent
-                // with sys_capset.
+                proc.change_capabilities(|caps| capbset_drop(caps, a2))?;
                 Ok(0)
             }
             PR_SET_TIMERSLACK => {
@@ -2774,8 +2793,8 @@ pub(crate) const CLONE_ARGS_SIZE_VER0: usize = 64;
 use crate::extensible_tail_is_empty;
 use kernel_hal::PAGE_SIZE;
 
-/// Size of `struct sched_attr` version 0 (Linux `SCHED_ATTR_SIZE_VER0`), and
-/// the whole of what this kernel knows of that struct.
+/// Size of `struct sched_attr` version 0 (Linux `SCHED_ATTR_SIZE_VER0`), the
+/// smallest one `sched_setattr` and `sched_getattr` take.
 pub(crate) const SCHED_ATTR_SIZE_VER0: usize = 48;
 
 /// How many bytes of `struct clone_args` `clone3` will read, or the errno
@@ -2824,7 +2843,8 @@ pub(crate) const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
 pub(crate) const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
 /// `SCHED_FLAG_ALL`: every flag `sched_setattr` knows (`RESET_ON_FORK`,
 /// `RECLAIM`, `DL_OVERRUN`, `KEEP_POLICY`, `KEEP_PARAMS`, `UTIL_CLAMP_MIN`,
-/// `UTIL_CLAMP_MAX`). A flag outside it is `EINVAL`.
+/// `UTIL_CLAMP_MAX`). A flag outside it is `EINVAL`, once the task has been
+/// found ([`sched_flags_known`]).
 pub(crate) const SCHED_FLAG_ALL: u64 = 0x7f;
 
 /// What `sched_setattr` will do to the thread, decided from `sched_flags`
@@ -2841,13 +2861,14 @@ pub(crate) struct SchedAttrPlan {
     pub keep_params: bool,
 }
 
-/// `sched_setattr`'s reading of `sched_flags`: a flag outside
-/// `SCHED_FLAG_ALL` is `EINVAL`; `SCHED_FLAG_KEEP_POLICY` makes the policy
-/// `SETPARAM_POLICY`, which is "the one the thread has"; and
+/// `sched_setattr`'s reading of `sched_flags`: `SCHED_FLAG_KEEP_POLICY` makes
+/// the policy `SETPARAM_POLICY`, which is "the one the thread has"; and
 /// `SCHED_FLAG_KEEP_PARAMS` copies the thread's priority and nice over the
 /// caller's (`get_params`). A negative
 /// `sched_policy` (`(int)attr.sched_policy < 0`) is `EINVAL` before any of
-/// that, and before the pid is looked up.
+/// that, and before the pid is looked up. A flag outside `SCHED_FLAG_ALL`
+/// is not looked at here: Linux finds the task first
+/// ([`sched_flags_known`]).
 ///
 /// The flags were never read. `KEEP_POLICY` is how a program changes the
 /// nice of a thread without knowing its policy (systemd's `Nice=` on a
@@ -2857,9 +2878,6 @@ pub(crate) struct SchedAttrPlan {
 /// `SCHED_OTHER`. And a flag Linux does not know was accepted.
 pub(crate) fn sched_setattr_plan(sched_flags: u64, sched_policy: u32) -> LxResult<SchedAttrPlan> {
     if (sched_policy as i32) < 0 {
-        return Err(LxError::EINVAL);
-    }
-    if sched_flags & !SCHED_FLAG_ALL != 0 {
         return Err(LxError::EINVAL);
     }
     Ok(SchedAttrPlan {
@@ -3050,6 +3068,8 @@ mod clone_tls_tests;
 #[cfg(test)]
 mod wait_option_tests;
 
+#[cfg(test)]
+mod collected_pid_tests;
 #[cfg(test)]
 mod nproc_tests;
 #[cfg(test)]
@@ -3293,15 +3313,15 @@ mod extensible_struct_tests {
 
     use super::*;
 
-    /// The two struct versions this kernel knows, and the fact that the
-    /// `sched_attr` it defines *is* version 0 -- which is what makes
-    /// "everything past `SCHED_ATTR_SIZE_VER0`" the right thing to demand be
-    /// zero.
+    /// The two version-0 sizes, and the fact that the `sched_attr` this
+    /// kernel defines is version 1 -- which is what makes "everything past
+    /// `SCHED_ATTR_SIZE_VER1`" the right thing to demand be zero.
     #[test]
     fn the_two_version_zero_sizes_are_the_uapi_ones() {
         assert_eq!(CLONE_ARGS_SIZE_VER0, 64);
         assert_eq!(SCHED_ATTR_SIZE_VER0, 48);
-        assert_eq!(size_of::<SchedAttr>(), SCHED_ATTR_SIZE_VER0);
+        assert_eq!(SCHED_ATTR_SIZE_VER1, 56);
+        assert_eq!(size_of::<SchedAttr>(), SCHED_ATTR_SIZE_VER1);
         assert_eq!(CLONE_ARGS_SIZE_VER0 % 8, 0, "read back as eight u64");
     }
 
@@ -3397,87 +3417,10 @@ mod extensible_struct_tests {
 }
 
 #[cfg(test)]
-mod sched_attr_flag_tests {
-    //! `sched_setattr(2)`'s `sched_flags`, which were never read.
+mod sched_attr_flag_tests;
 
-    use super::*;
-
-    /// A flag Linux does not know is `EINVAL`; the known ones are not, alone
-    /// or together.
-    #[test]
-    fn an_unknown_flag_is_einval() {
-        assert_eq!(sched_setattr_plan(0x80, 0), Err(LxError::EINVAL));
-        assert_eq!(sched_setattr_plan(1 << 63, 0), Err(LxError::EINVAL));
-        assert_eq!(
-            sched_setattr_plan(SCHED_FLAG_KEEP_POLICY | 0x100, 0),
-            Err(LxError::EINVAL)
-        );
-        assert!(sched_setattr_plan(SCHED_FLAG_ALL, 0).is_ok());
-        assert!(sched_setattr_plan(SCHED_FLAG_RESET_ON_FORK, 0).is_ok());
-        // Their uapi values.
-        assert_eq!(SCHED_FLAG_RESET_ON_FORK, 0x01);
-        assert_eq!(SCHED_FLAG_KEEP_POLICY, 0x08);
-        assert_eq!(SCHED_FLAG_KEEP_PARAMS, 0x10);
-        assert_eq!(SCHED_FLAG_ALL, 0x7f);
-    }
-
-    /// `SCHED_FLAG_KEEP_POLICY` keeps the thread's policy whatever
-    /// `sched_policy` says; without it `sched_policy` is the policy.
-    #[test]
-    fn keep_policy_ignores_the_policy_in_the_struct() {
-        assert_eq!(
-            sched_setattr_plan(SCHED_FLAG_KEEP_POLICY, 0),
-            Ok(SchedAttrPlan {
-                policy: None,
-                keep_params: false
-            })
-        );
-        assert_eq!(
-            sched_setattr_plan(SCHED_FLAG_KEEP_POLICY, 1),
-            Ok(SchedAttrPlan {
-                policy: None,
-                keep_params: false
-            })
-        );
-        assert_eq!(
-            sched_setattr_plan(0, 1),
-            Ok(SchedAttrPlan {
-                policy: Some(1),
-                keep_params: false
-            })
-        );
-        assert_eq!(
-            sched_setattr_plan(SCHED_FLAG_KEEP_PARAMS, 2),
-            Ok(SchedAttrPlan {
-                policy: Some(2),
-                keep_params: true
-            })
-        );
-        assert_eq!(
-            sched_setattr_plan(SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS, 2),
-            Ok(SchedAttrPlan {
-                policy: None,
-                keep_params: true
-            })
-        );
-    }
-
-    /// `(int)attr.sched_policy < 0` is `EINVAL`, even under `KEEP_POLICY`,
-    /// and before the flags are looked at.
-    #[test]
-    fn a_negative_policy_is_einval_before_the_flags() {
-        assert_eq!(sched_setattr_plan(0, 0x8000_0000), Err(LxError::EINVAL));
-        assert_eq!(sched_setattr_plan(0, u32::MAX), Err(LxError::EINVAL));
-        assert_eq!(
-            sched_setattr_plan(SCHED_FLAG_KEEP_POLICY, u32::MAX),
-            Err(LxError::EINVAL)
-        );
-        assert!(
-            sched_setattr_plan(0, 0x7fff_ffff).is_ok(),
-            "the sign, not the range"
-        );
-    }
-}
+#[cfg(test)]
+mod sched_attr_tests;
 
 #[cfg(test)]
 mod setpgid_argument_tests {
@@ -3709,53 +3652,8 @@ mod setaffinity_migration_tests {
 #[cfg(test)]
 mod benches;
 
-/// `struct sched_attr`, field by field.
-///
-/// `sched_setattr(2)` reads these bytes out of the caller's memory and
-/// `sched_getattr(2)` writes them back, so the order of the fields is the ABI.
-/// The size was already checked against `SCHED_ATTR_SIZE_VER0`, and that is
-/// not the same thing: swapping two neighbours of the same width leaves the
-/// forty-eight bytes exactly as they were. Three such swaps survived the whole
-/// crate suite.
 #[cfg(test)]
-mod sched_attr_layout_tests {
-    use super::*;
-    use core::mem::{align_of, offset_of, size_of};
-
-    /// The worst of the three swaps is the first pair, because `size` is the
-    /// self-describing length `sys_sched_setattr` validates before it trusts
-    /// anything else: read the policy as the size, and the caller's
-    /// `SCHED_OTHER` becomes a forty-eight-byte claim of zero.
-    #[test]
-    fn struct_sched_attr_is_the_v0_forty_eight_byte_layout() {
-        assert_eq!(size_of::<SchedAttr>(), 48);
-        assert_eq!(size_of::<SchedAttr>(), SCHED_ATTR_SIZE_VER0);
-        assert_eq!(align_of::<SchedAttr>(), 8);
-        assert_eq!(offset_of!(SchedAttr, size), 0);
-        assert_eq!(offset_of!(SchedAttr, sched_policy), 4);
-        assert_eq!(offset_of!(SchedAttr, sched_flags), 8);
-        assert_eq!(offset_of!(SchedAttr, sched_nice), 16);
-        assert_eq!(offset_of!(SchedAttr, sched_priority), 20);
-        assert_eq!(offset_of!(SchedAttr, sched_runtime), 24);
-        assert_eq!(offset_of!(SchedAttr, sched_deadline), 32);
-        assert_eq!(offset_of!(SchedAttr, sched_period), 40);
-    }
-
-    /// The two four-byte fields sit in the eight bytes between `sched_flags`
-    /// and `sched_runtime` with no padding, which is why eight fields of
-    /// mixed width come to exactly six words.
-    #[test]
-    fn the_nice_and_the_priority_share_one_word_with_no_padding() {
-        assert_eq!(
-            offset_of!(SchedAttr, sched_priority) - offset_of!(SchedAttr, sched_nice),
-            4
-        );
-        assert_eq!(
-            offset_of!(SchedAttr, sched_runtime) - offset_of!(SchedAttr, sched_nice),
-            8
-        );
-    }
-}
+mod sched_attr_layout_tests;
 
 /// The namespace flags this kernel has no implementation for.
 ///

@@ -17,6 +17,28 @@ pub struct ProcSelfFdDir {
     pub process: Arc<Process>,
 }
 
+/// `proc_fd_permission`: a process may open, list and go into its own `fd`
+/// directory, whatever its mode and owner say. One that is not dumpable, as
+/// any change of its ids leaves it, finds that directory root's and 0500, and
+/// still has to see its own descriptors to close them before an `exec`.
+/// `verdict` is what the ordinary check said of `inode` for `caller`.
+pub fn fd_permission(
+    verdict: crate::error::LxResult,
+    inode: &Arc<dyn INode>,
+    caller: &Process,
+) -> crate::error::LxResult {
+    match verdict {
+        Err(crate::error::LxError::EACCES)
+            if inode
+                .downcast_ref::<ProcSelfFdDir>()
+                .is_some_and(|dir| dir.process.id() == caller.id()) =>
+        {
+            Ok(())
+        }
+        verdict => verdict,
+    }
+}
+
 impl INode for ProcSelfFdDir {
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
         Ok(0)
@@ -33,9 +55,10 @@ impl INode for ProcSelfFdDir {
         })
     }
     /// Its size is how many descriptors are open, as since Linux 6.2
-    /// (`proc_fd_getattr`).
+    /// (`proc_fd_getattr`). Mode 0500, so only its owner may list it, and
+    /// [`fd_permission`] lets the process itself in whoever that is.
     fn metadata(&self) -> Result<Metadata> {
-        Ok(Metadata {
+        let metadata = Metadata {
             dev: 0,
             inode: super::procfs::pid_inode(self.process.id(), super::procfs::PID_FD_DIR_SLOT),
             size: self.process.try_linux().map_or(0, |lp| lp.file_count()),
@@ -45,12 +68,13 @@ impl INode for ProcSelfFdDir {
             mtime: Timespec { sec: 0, nsec: 0 },
             ctime: Timespec { sec: 0, nsec: 0 },
             type_: FileType::Dir,
-            mode: 0o555,
+            mode: 0o500,
             nlinks: 2,
             uid: 0,
             gid: 0,
             rdev: 0,
-        })
+        };
+        Ok(super::procfs::owner::of(&self.process, metadata))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -160,6 +184,7 @@ pub(crate) fn default_link_name(meta: crate::error::LxResult<Metadata>, kind: &s
 pub struct FdLink {
     name: String,
     mode: u16,
+    pid: u64,
     inode: usize,
     /// Not held: a descriptor of the link (`O_PATH|O_NOFOLLOW`) keeps no
     /// pipe open.
@@ -175,6 +200,7 @@ impl FdLink {
         FdLink {
             name: file.link_name(),
             mode: read | write,
+            pid,
             inode: fd_link_metadata(pid, fd).inode,
             file: Arc::downgrade(file),
         }
@@ -222,10 +248,11 @@ impl INode for FdLink {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(Metadata {
+        let metadata = Metadata {
             mode: self.mode,
             ..super::procfs::link_metadata(self.inode, 64)
-        })
+        };
+        Ok(super::procfs::owner::of_pid(self.pid, metadata))
     }
     /// While the descriptor is open (`proc_fd_link`).
     fn jump(&self) -> Option<Result<(Arc<dyn INode>, String)>> {
@@ -310,7 +337,8 @@ impl INode for ProcessLink {
             Held::Root => PID_ROOT_SLOT,
             Held::Program => PID_EXE_SLOT,
         };
-        Ok(super::procfs::link_metadata(pid_inode(self.pid, slot), 0))
+        let metadata = super::procfs::link_metadata(pid_inode(self.pid, slot), 0);
+        Ok(super::procfs::owner::of_pid(self.pid, metadata))
     }
     fn jump(&self) -> Option<Result<(Arc<dyn INode>, String)>> {
         Some(self.lead())

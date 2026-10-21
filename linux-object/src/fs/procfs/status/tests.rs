@@ -21,6 +21,7 @@ fn creds() -> Credentials {
         fsgid: 2003,
         groups: alloc::vec![1000, 4, 24],
         umask: 0o022,
+        caps: crate::process::Capabilities::for_uids(1000, 1001, 1002),
     }
 }
 
@@ -564,4 +565,25 @@ fn vmsize_is_in_kilobytes_of_1024() {
         .unwrap();
 
     assert_eq!(kb(&proc_pid_status(&proc)) - before, 1024);
+}
+
+/// Each `Cap*:` line is its own set: capset, a bounding-set drop and an
+/// inheritable bit, all different, each read back on its line.
+#[test]
+fn each_capability_line_is_its_own_set() {
+    let (_job, proc, _thread) = a_process(45_378);
+    proc.linux()
+        .change_capabilities(|caps| {
+            caps.effective = 0x1ff_ffff_fffe;
+            caps.inheritable = 0x20;
+            caps.bounding = 0x1ff_ffbf_ffff;
+            Ok(())
+        })
+        .unwrap();
+    let status = proc_pid_status(&proc);
+    assert_eq!(line(&status, "CapInh"), Some("0000000000000020"));
+    assert_eq!(line(&status, "CapPrm"), Some("000001ffffffffff"));
+    assert_eq!(line(&status, "CapEff"), Some("000001fffffffffe"));
+    assert_eq!(line(&status, "CapBnd"), Some("000001ffffbfffff"));
+    assert_eq!(line(&status, "CapAmb"), Some("0000000000000000"));
 }

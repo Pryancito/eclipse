@@ -1033,12 +1033,8 @@ impl Volume {
             .devs
             .with(|d| d.iter().map(|(&i, d)| (i, d.clone())).collect());
         devs.sort_by_key(|d| stale.contains(&d.0));
-        for (_, d) in devs {
-            if d.read_at(inner, buf).is_ok() {
-                return Ok(());
-            }
-        }
-        Err(Error::Io)
+        let ok = devs.iter().any(|(_, d)| d.read_at(inner, buf).is_ok());
+        ok.then_some(()).ok_or(Error::Io)
     }
 
     /// Read `buf` at `offset` from copy `k` of every block (no fallback).
@@ -1127,18 +1123,13 @@ impl Volume {
             let (dst, b) = to.locate(off);
             let run = a.min(b).min(start + n - off).min(256);
             buf.resize((run * BS) as usize, 0);
-            let mut done = false;
             let stale = self.stale();
             let mut src = src;
             src.sort_by_key(|s| stale.contains(&s.devid));
-            for s in &src {
-                if let Some(d) = self.device(s.devid) {
-                    if d.read_at(s.phys * BS, &mut buf).is_ok() {
-                        done = true;
-                        break;
-                    }
-                }
-            }
+            let done = src.iter().any(|s| {
+                self.device(s.devid)
+                    .is_some_and(|d| d.read_at(s.phys * BS, &mut buf).is_ok())
+            });
             if !done {
                 return Err(Error::Io);
             }
@@ -1178,20 +1169,13 @@ impl Volume {
                 copies.into_iter().partition(|s| stale.contains(&s.devid));
             if !old.is_empty() {
                 buf.resize((run * BS) as usize, 0);
-                let mut got = false;
-                for s in &fresh {
-                    if let Some(d) = self.device(s.devid) {
-                        if d.read_at(s.phys * BS, &mut buf).is_ok() {
-                            got = true;
-                            break;
-                        }
-                    }
-                }
+                let got = fresh.iter().any(|s| {
+                    self.device(s.devid)
+                        .is_some_and(|d| d.read_at(s.phys * BS, &mut buf).is_ok())
+                });
                 if got {
-                    for s in &old {
-                        if let Some(d) = self.device(s.devid) {
-                            d.write_at(s.phys * BS, &buf)?;
-                        }
+                    for (s, d) in old.iter().filter_map(|s| Some((s, self.device(s.devid)?))) {
+                        d.write_at(s.phys * BS, &buf)?;
                     }
                 }
             }
@@ -1727,9 +1711,10 @@ impl Volume {
             crate::raid56::recover(&mut row.cols, k as usize, &row.lost)?;
             for &col in &row.lost {
                 let st = c.stripes[c.col_stripe(r, col)];
-                if let Some(d) = self.device(st.devid) {
-                    d.write_at((st.phys + r) * BS, &row.cols[col])?;
-                }
+                let Some(d) = self.device(st.devid) else {
+                    continue;
+                };
+                d.write_at((st.phys + r) * BS, &row.cols[col])?;
             }
         }
         Ok(())
@@ -1737,6 +1722,7 @@ impl Volume {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -2239,5 +2225,139 @@ mod tests {
         assert!(m.check().is_ok());
         assert_eq!(Tier::from_name("ssd"), Some(Tier::Fast));
         assert_eq!(Profile::from_name("raid6"), Some(Profile::Raid6));
+    }
+
+    #[test]
+    fn profiles_tiers_and_small_maps() {
+        assert_eq!(Profile::Raid5.tolerates(), 1);
+        assert_eq!(Profile::Raid6.tolerates(), 2);
+        for t in [Tier::Any, Tier::Fast, Tier::Slow] {
+            assert_eq!(Tier::from_id(t.id()).unwrap(), t);
+            assert_eq!(Tier::from_name(t.name()), Some(t));
+        }
+        assert_eq!(Tier::from_name("hdd"), Some(Tier::Slow));
+        assert_eq!(Tier::from_name("any"), Some(Tier::Any));
+        assert_eq!(Tier::from_name("tape"), None);
+
+        // Group 0 is never striped.
+        let striped = Chunk {
+            kind: ChunkKind::Metadata,
+            profile: Profile::Raid0,
+            blocks: 64,
+            stripes: (1..=2).map(|d| Stripe { devid: d, phys: 16 }).collect(),
+        };
+        let mut b = [0u8; 64];
+        striped.encode_sys(&mut b);
+        assert!(Chunk::decode_sys(&b).is_err());
+
+        // A version 2 map that ends before its tiers.
+        let mut m = map(&[(1, 50_000)]);
+        m.set_tier(1, Tier::Fast);
+        let b = m.encode();
+        assert_eq!(
+            ChunkMap::decode(&b[..36]),
+            Err(Error::Corrupt("chunk map length"))
+        );
+
+        let mut m = map(&[(1, 1000), (2, 1000)]);
+        let one = Stripe {
+            devid: 1,
+            phys: 950,
+        };
+        m.chunks.insert(
+            0,
+            Chunk {
+                kind: ChunkKind::Data,
+                profile: Profile::Raid1,
+                blocks: 100,
+                stripes: vec![one],
+            },
+        );
+        assert_eq!(m.check(), Err(Error::Corrupt("chunk stripes")));
+        m.chunks.insert(
+            0,
+            Chunk {
+                kind: ChunkKind::Data,
+                profile: Profile::Single,
+                blocks: 100,
+                stripes: vec![one],
+            },
+        );
+        assert_eq!(
+            m.check(),
+            Err(Error::Corrupt("chunk past the end of its device"))
+        );
+        assert!(m.free_extents(9, &[]).is_empty());
+
+        m.set_tier(1, Tier::Fast);
+        m.set_tier(2, Tier::Slow);
+        let both = Chunk {
+            kind: ChunkKind::Data,
+            profile: Profile::Raid1,
+            blocks: 10,
+            stripes: vec![one, Stripe { devid: 2, phys: 16 }],
+        };
+        assert_eq!(m.chunk_tier(&both), Tier::Any);
+    }
+
+    /// A single chunk moving off its device goes to the one with the most
+    /// room.
+    #[test]
+    fn a_moving_single_chunk_goes_where_the_room_is() {
+        let mut m = map(&[(1, 10_000), (2, 8_000), (3, 6_000), (4, 500)]);
+        let c = add(&mut m, 0, Profile::Single, 1000);
+        let avoid = [c.stripes[0].devid];
+        let s = m.place_moving(&c, Profile::Single, &avoid, &[]).unwrap();
+        assert_eq!(s.len(), 1);
+        assert_ne!(s[0].devid, avoid[0]);
+        let room = |d: u32| m.free_extents(d, &[]).iter().map(|e| e.1).sum::<u64>();
+        let other = [2, 3]
+            .into_iter()
+            .find(|&d| d != avoid[0] && d != s[0].devid)
+            .unwrap();
+        assert!(room(s[0].devid) >= room(other));
+    }
+
+    /// I/O the volume refuses, or cannot do with what is missing.
+    #[test]
+    fn volume_io_that_cannot_be() {
+        let (v, _mems, c) = parity_volume(4, Profile::Raid5, 100);
+        let bs = BS as usize;
+        // The superblock area: read from any device, never repaired.
+        let mut sb = vec![0u8; bs];
+        v.read_copy(0, &mut sb, 0).unwrap();
+        v.write_copy(0, &sb, 0).unwrap();
+        v.write_at(100, &[1; 10]).unwrap();
+        // Parity chunks take whole blocks inside the chunk.
+        assert_eq!(v.write_copy(G1 + 100, &sb, 0), Err(Error::Invalid));
+        let past = G1 + c.blocks * BS;
+        assert!(matches!(v.read_at(past, &mut sb), Err(Error::Corrupt(_))));
+        assert!(matches!(v.write_at(past, &sb), Err(Error::Corrupt(_))));
+        // RAID5 has no second rebuild.
+        assert_eq!(v.read_copy(G1, &mut sb, 2), Err(Error::Invalid));
+        // Groups with no chunk, read in one piece.
+        let g3 = 3 * G1;
+        let mut two = vec![0u8; 2 * bs];
+        assert!(matches!(
+            v.read_at(g3 - BS, &mut two),
+            Err(Error::Corrupt(_))
+        ));
+        // Nothing to resync.
+        v.resync(&c, 0, 0).unwrap();
+        v.resync(&c, 0, 10).unwrap();
+
+        // Missing devices.
+        v.detach(2);
+        v.resync(&c, 0, 10).unwrap();
+        v.detach(3);
+        // A whole row, so nothing needs reading first.
+        let row = vec![0u8; 3 * bs];
+        assert_eq!(v.write_at(G1, &row), Err(Error::Io));
+        v.detach(1);
+        assert_eq!(v.write_at(20 * BS, &sb), Err(Error::Io));
+        v.detach(4);
+        assert_eq!(v.read_copy(0, &mut sb, 0), Err(Error::Io));
+        let g0 = v.map().chunks[&0].clone();
+        assert_eq!(v.copy_between(&g0, &c, 0, 1), Err(Error::Io));
     }
 }
