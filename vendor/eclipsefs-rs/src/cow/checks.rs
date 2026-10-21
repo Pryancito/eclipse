@@ -354,6 +354,12 @@ fn a_volume_whose_chunks_do_not_add_up() {
 
     let mut fs = volume();
     let vs = fs.sb.vol.as_mut().unwrap();
+    vs.chunk_map = fs.sb.total_blocks - 1;
+    vs.chunk_map_len = 2 * BS as u32;
+    corrupt(fs.check().map(|_| ()), "fsck: block past the end");
+
+    let mut fs = volume();
+    let vs = fs.sb.vol.as_mut().unwrap();
     vs.chunk_map = vs.sys.blocks;
     corrupt(fs.check().map(|_| ()), "fsck: chunk map outside group 0");
 

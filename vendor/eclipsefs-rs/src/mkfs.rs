@@ -184,13 +184,8 @@ pub fn format_v3(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
     let rec = root.encode();
     // The root's slot is inside the table `extend_zeroed` just wrote, so
     // this allocates nothing and writes the whole record.
-    let n = write_data(
-        dev,
-        &mut alloc,
-        &mut itable,
-        ROOT_INO * INODE_SIZE as u64,
-        &rec,
-    )?;
+    let at = ROOT_INO * INODE_SIZE as u64;
+    let n = write_data(dev, &mut alloc, &mut itable, at, &rec)?;
     debug_assert_eq!(n, INODE_SIZE);
     // The table's extents are new: their chain (if any) goes out now.
     write_chain(dev, &mut alloc, ITABLE_INO, &mut itable)?;

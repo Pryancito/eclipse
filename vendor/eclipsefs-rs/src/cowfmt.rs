@@ -958,6 +958,14 @@ impl CsumBucket {
 mod tests {
     use super::*;
 
+    /// Only a volume's superblock names a device; any other block goes to
+    /// every device as it is.
+    #[test]
+    fn a_plain_block_is_the_same_on_every_device() {
+        let b = vec![7u8; 4096];
+        assert_eq!(sb_for_device(&b, 3), b);
+    }
+
     #[test]
     fn xattr_items_round_trip() {
         let list = vec![

@@ -1746,10 +1746,9 @@ impl CowFs {
             if first * BS > off {
                 let head = &data[..(first * BS - off) as usize];
                 let n = self.write_plain(ino, inode, off, head)?;
+                // Inside one block: written whole, or `NoSpace` above.
+                debug_assert_eq!(n, head.len());
                 self.pend(ino, off, n);
-                if n < head.len() {
-                    return Ok(n);
-                }
             }
             let mut lb = first;
             while end / BS >= lb + ZCHUNK {
@@ -1923,9 +1922,7 @@ impl CowFs {
             let size = inode.size;
             let n = self.write_extents(ino, inode, 0, &d)?;
             inode.size = size;
-            if n < d.len() {
-                return Err(Error::NoSpace);
-            }
+            (n == d.len()).then_some(()).ok_or(Error::NoSpace)?;
         }
         Ok(())
     }
@@ -2316,10 +2313,7 @@ impl CowFs {
         self.put_inode(ino, i)?;
         let n = r?;
         self.commit()?;
-        if n < target.len() {
-            return Err(Error::NoSpace);
-        }
-        Ok(ino)
+        (n == target.len()).then_some(ino).ok_or(Error::NoSpace)
     }
 
     fn write_symlink_l(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
@@ -2347,10 +2341,9 @@ impl CowFs {
         self.put_inode(ino, i)?;
         let n = r?;
         self.commit()?;
-        if n < target.len() {
-            return Err(Error::NoSpace);
-        }
-        Ok(data.len())
+        (n == target.len())
+            .then_some(data.len())
+            .ok_or(Error::NoSpace)
     }
 
     fn read_link_l(&mut self, ino: u64) -> Result<Vec<u8>> {
@@ -3006,13 +2999,7 @@ impl CowFs {
                 v.resize(si.size as usize, 0);
                 let bytes = &v[src_off as usize..s_end as usize];
                 self.write_data(d_ino, &mut di, dst_off, bytes)
-                    .and_then(|n| {
-                        if n < bytes.len() {
-                            Err(Error::NoSpace)
-                        } else {
-                            Ok(())
-                        }
-                    })
+                    .and_then(|n| (n == bytes.len()).then_some(()).ok_or(Error::NoSpace))
             }
             None => {
                 let src = (split(src).0, s_ino);
@@ -3080,9 +3067,8 @@ impl CowFs {
         for e in exts.iter().filter(|e| !e.prealloc) {
             let from = e.lblk.max(s0);
             let to = (e.lblk + e.blocks).min(s0 + blocks);
-            if from >= to {
-                continue;
-            }
+            // The batch is of extents overlapping `s0..s0 + blocks`.
+            debug_assert!(from < to);
             if let Some(z) = e.z {
                 crate::btree::Space::incref(&mut self.sp, e.pblk, z.disk_blocks)?;
                 self.insert(Self::ext_key(ino, d0 + (from - s0)), e.piece(from, to))?;
@@ -4119,16 +4105,9 @@ impl CowFs {
             return Err(Error::NoSpace);
         }
         let n = self.write_l(ino, offset, data)?;
-        if n != data.len() {
-            // The space was there a moment ago: nothing else ran since.
-            warn!(
-                "eclipsefs: atomic write came out short ({} of {})",
-                n,
-                data.len()
-            );
-            return Err(Error::Io);
-        }
-        Ok(n)
+        // The space was there a moment ago and nothing else ran since, so
+        // a short write is a failing device.
+        (n == data.len()).then_some(n).ok_or(Error::Io)
     }
 
     // -----------------------------------------------------------------------

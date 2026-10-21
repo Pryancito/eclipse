@@ -546,6 +546,30 @@ mod tests {
         assert_eq!(s.with(|v| *v), 200_000);
     }
 
+    /// A second taker waits for the first to let go.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_spin_lock_waits_for_its_holder() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let s = Arc::new(Spin::new(0u64));
+        let held = Arc::new(AtomicBool::new(false));
+        let holder = {
+            let (s, held) = (s.clone(), held.clone());
+            std::thread::spawn(move || {
+                s.with(|v| {
+                    held.store(true, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    *v = 1;
+                })
+            })
+        };
+        while !held.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+        assert_eq!(s.with(|v| *v), 1);
+        holder.join().unwrap();
+    }
+
     #[test]
     fn the_test_disk_syncs() {
         ram(1).sync().unwrap();

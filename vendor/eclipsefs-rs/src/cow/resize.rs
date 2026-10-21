@@ -302,8 +302,8 @@ impl CowFs {
     /// Point every file extent of the current subvolume that has blocks in
     /// `cut` at copies of them outside it.
     fn move_extents(&mut self, cut: &RangeSet, moves: &mut DataMoves) -> Result<()> {
-        let mut from = Key::MIN;
-        loop {
+        let mut next = Some(Key::MIN);
+        while let Some(from) = next {
             let batch = self.st.range(&self.fs_root, &from, &Key::MAX, 256)?;
             let Some(&(last, _)) = batch.last() else {
                 return Ok(());
@@ -312,8 +312,8 @@ impl CowFs {
                 if k.ty != EXTENT_DATA {
                     continue;
                 }
-                match FileExtent::decode(&d)? {
-                    FileExtent::Inline(_) => {}
+                let (disk, blocks, prealloc) = match FileExtent::decode(&d)? {
+                    FileExtent::Inline(_) => continue,
                     FileExtent::Comp(c) => {
                         if !touches(cut, c.disk, c.disk_blocks) {
                             continue;
@@ -322,42 +322,36 @@ impl CowFs {
                         crate::btree::Space::incref(&mut self.sp, new, c.disk_blocks)?;
                         self.update(k, FileExtent::Comp(Comp { disk: new, ..c }).encode())?;
                         self.sp_decref(c.disk, c.disk_blocks)?;
+                        continue;
                     }
-                    e @ (FileExtent::Reg { .. } | FileExtent::Prealloc { .. }) => {
-                        let (disk, blocks, prealloc) = match e {
-                            FileExtent::Reg { disk, blocks } => (disk, blocks, false),
-                            FileExtent::Prealloc { disk, blocks } => (disk, blocks, true),
-                            _ => unreachable!(),
-                        };
-                        if !touches(cut, disk, blocks) {
-                            continue;
-                        }
-                        let pieces = self.move_run(disk, blocks, cut, moves)?;
-                        let mut off = 0;
-                        for (i, &(old, n, new)) in pieces.iter().enumerate() {
-                            let key = Key::new(k.objectid, EXTENT_DATA, k.offset + off * BS);
-                            if new != old {
-                                crate::btree::Space::incref(&mut self.sp, new, n)?;
-                            }
-                            let item = Ext::item(new, n, prealloc);
-                            if i == 0 {
-                                self.update(key, item)?;
-                            } else {
-                                self.insert(key, item)?;
-                            }
-                            if new != old {
-                                self.sp_decref(old, n)?;
-                            }
-                            off += n;
-                        }
+                    FileExtent::Reg { disk, blocks } => (disk, blocks, false),
+                    FileExtent::Prealloc { disk, blocks } => (disk, blocks, true),
+                };
+                if !touches(cut, disk, blocks) {
+                    continue;
+                }
+                let pieces = self.move_run(disk, blocks, cut, moves)?;
+                let mut off = 0;
+                for (i, &(old, n, new)) in pieces.iter().enumerate() {
+                    let key = Key::new(k.objectid, EXTENT_DATA, k.offset + off * BS);
+                    if new != old {
+                        crate::btree::Space::incref(&mut self.sp, new, n)?;
                     }
+                    let item = Ext::item(new, n, prealloc);
+                    if i == 0 {
+                        self.update(key, item)?;
+                    } else {
+                        self.insert(key, item)?;
+                    }
+                    if new != old {
+                        self.sp_decref(old, n)?;
+                    }
+                    off += n;
                 }
             }
-            match next_key(last) {
-                Some(k) => from = k,
-                None => return Ok(()),
-            }
+            next = next_key(last);
         }
+        Ok(())
     }
 
     fn update(&mut self, key: Key, v: Vec<u8>) -> Result<()> {

@@ -303,7 +303,7 @@ impl BlockSpace {
     }
 
     /// Free blocks file data may take now.
-    fn data_room(&self) -> u64 {
+    pub(crate) fn data_room(&self) -> u64 {
         if self.vol.is_none() {
             return self.alloc.free_blocks().saturating_sub(self.reserve);
         }

@@ -2067,6 +2067,19 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_shared_range_reads_nothing() {
+        let (st, _, root) = setup();
+        assert!(st
+            .range_shared(&root, &Key::MAX, &Key::MIN, 10)
+            .unwrap()
+            .is_empty());
+        assert!(st
+            .range_shared(&root, &Key::MIN, &Key::MAX, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn node_len_and_body_accessors() {
         let mut n = Node::empty_leaf(1, 1);
         assert!(n.is_empty());

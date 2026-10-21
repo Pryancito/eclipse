@@ -6,7 +6,7 @@ use super::*;
 use crate::fs::FIEMAP_EXTENT_DATA_INLINE;
 use crate::mkfs;
 use crate::testdisk::{clock, formatted, opts, Ram, MIB};
-use crate::volume::{ChunkKind, Profile, Stripe};
+use crate::volume::{ChunkKind, Profile, Stripe, Tier};
 
 fn mounted() -> (Arc<Ram>, CowFs) {
     let d = formatted(16);
@@ -806,4 +806,353 @@ fn the_formatting_stand_in_device_is_never_read() {
     assert_eq!(d.read_at(0, &mut [0; 4]).err(), Some(Error::Io));
     assert_eq!(d.write_at(0, &[0; 4]).err(), Some(Error::Io));
     d.sync().unwrap();
+}
+
+#[test]
+fn mount_compression_is_kept() {
+    let (_, mut fs) = mounted();
+    assert_eq!(fs.mount_compression(), None);
+    fs.set_mount_compression(Some(Compression::Lz4));
+    assert_eq!(fs.mount_compression(), Some(Compression::Lz4));
+}
+
+#[test]
+fn compsize_counts_inline_data() {
+    let (_, mut fs) = mounted();
+    let h = file(&mut fs, "f", &[1; 300]);
+    let c = fs.compsize(h).unwrap();
+    assert_eq!((c.disk_bytes, c.uncompressed_bytes), (300, 300));
+}
+
+/// A superblock in the journal for a bigger filesystem than the device
+/// holds (a grow whose superblock never reached its home).
+#[test]
+fn a_journal_cannot_make_the_filesystem_larger_than_its_device() {
+    let d = formatted(16);
+    let big = Ram::new(32 * MIB);
+    big.write_at(0, &d.peek(0, 16 * MIB)).unwrap();
+    let home = big.peek(0, BS as usize);
+    let mut fs = CowFs::mount(big.clone(), false).unwrap();
+    assert!(fs.grow_to_device().unwrap());
+    drop(fs);
+    let small = Ram::new(16 * MIB);
+    small.write_at(0, &big.peek(0, 16 * MIB)).unwrap();
+    small.write_at(0, &home).unwrap();
+    assert_eq!(
+        CowFs::mount(small, false).err(),
+        Some(Error::Corrupt("filesystem larger than device"))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tree nodes from mirrors
+// ---------------------------------------------------------------------------
+
+/// A node bad in one of three copies is read from the next good one and,
+/// on a writable mount, rewritten.
+#[test]
+fn a_node_is_read_around_a_bad_copy() {
+    let devs: Vec<Arc<dyn BlockDevice>> = (0..3)
+        .map(|_| Ram::new(64 * MIB) as Arc<dyn BlockDevice>)
+        .collect();
+    mkfs::format_devices(&devs, &opts(), Profile::Raid1c3, Profile::Raid1c3).unwrap();
+    for read_only in [false, true] {
+        let mut fs = CowFs::mount_devices(devs.clone(), read_only, false).unwrap();
+        let b = fs.fs_root.bytenr;
+        let v = fs.vol.clone().unwrap();
+        v.write_copy(b * BS, &[0xff; BS as usize], 0).unwrap();
+        fs.drop_caches();
+        fs.stat(fs.root_ino()).unwrap();
+        let mut img = vec![0u8; BS as usize];
+        v.read_copy(b * BS, &mut img, 0).unwrap();
+        assert_eq!(img[0] == 0xff, read_only, "repaired: {}", !read_only);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared reads
+// ---------------------------------------------------------------------------
+
+#[test]
+fn shared_reads_of_a_subvolume_not_loaded_take_the_exclusive_path() {
+    let (_, fs) = mounted();
+    let h = handle(FIRST_SUBVOL + 9, FIRST_INO);
+    assert!(fs.stat_shared(h).unwrap().is_none());
+    assert_eq!(fs.read_shared(h, 0, &mut [0; 8]).unwrap(), None);
+}
+
+#[test]
+fn shared_reads_of_small_files_in_blocks_and_of_preallocated_space() {
+    let (_, mut fs) = mounted();
+    let h = file(&mut fs, "small", &[7; 8192]);
+    fs.truncate(h, 100).unwrap();
+    let mut buf = [0u8; 100];
+    assert_eq!(fs.read_shared(h, 0, &mut buf).unwrap(), Some(100));
+    assert_eq!(buf, [7; 100]);
+
+    let p = create(&mut fs, "pre", FileKind::Regular);
+    fs.fallocate(p, 0, 0, 3 * BS).unwrap();
+    fs.write(p, 3 * BS, &[1; 10]).unwrap();
+    let mut buf = vec![9u8; (3 * BS + 10) as usize];
+    assert_eq!(fs.read_shared(p, 0, &mut buf).unwrap(), Some(buf.len()));
+    assert!(buf[..(3 * BS) as usize].iter().all(|&b| b == 0));
+}
+
+/// Damage the shared reader meets: an inline item past the inline size,
+/// an extent off the block grid, a block that fails its checksum, one
+/// freed by the open transaction.
+#[test]
+fn shared_reads_of_damaged_files() {
+    let (d, mut fs) = mounted();
+    let h = file(&mut fs, "f", &[7; 3 * BS as usize]);
+    let ino = split(h).1;
+    fs.sync().unwrap();
+    let e = fs.extents(ino, 0, 1).unwrap()[0];
+
+    // A block freed in this transaction has no checksum to read it by.
+    fs.sp.csums_freed.insert(e.pblk, 1);
+    assert_eq!(fs.read_shared(h, 0, &mut [0; 8]).unwrap(), None);
+    fs.sp.csums_freed = RangeSet::default();
+
+    // Bad data, read whole and in part.
+    d.poke((e.pblk * BS + 5) as usize, 1);
+    assert_eq!(fs.read_shared(h, 0, &mut [0; 8]).unwrap(), None);
+    assert_eq!(fs.read_shared(h, 100, &mut [0; 8]).unwrap(), None);
+
+    let (k, v) = fs.items_of(ino, EXTENT_DATA, 1).unwrap().remove(0);
+    fs.delete(k).unwrap();
+    fs.insert(Key::new(ino, EXTENT_DATA, 7), v.clone()).unwrap();
+    assert_eq!(
+        fs.read_shared(h, 0, &mut [0; 8]).err(),
+        Some(Error::Corrupt("unaligned file extent"))
+    );
+    fs.delete(Key::new(ino, EXTENT_DATA, 7)).unwrap();
+    fs.insert(k, FileExtent::Inline(vec![1; 10]).encode())
+        .unwrap();
+    let mut buf = [5u8; 8];
+    assert_eq!(fs.read_shared(h, 0, &mut buf).unwrap(), Some(8));
+    assert_eq!(buf, [0; 8]);
+}
+
+// ---------------------------------------------------------------------------
+// Encryption
+// ---------------------------------------------------------------------------
+
+fn random(buf: &mut [u8]) {
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+    }
+}
+
+/// A filesystem with an encrypted directory "vault", its handle and key.
+fn vault() -> (CowFs, u64, [u8; 16]) {
+    let (_, mut fs) = mounted();
+    fs.set_random(random);
+    let id = fs.add_encryption_key(&[0x42; 64]).unwrap();
+    let dir = fs
+        .create(fs.root_ino(), "vault", FileKind::Dir, 0o700, 0)
+        .unwrap();
+    fs.set_encryption_policy(dir, &EncryptionPolicy::new(id))
+        .unwrap();
+    (fs, dir, id)
+}
+
+#[test]
+fn a_subvolume_cannot_move_into_an_encrypted_directory() {
+    let (mut fs, dir, _) = vault();
+    fs.create_subvolume(fs.root_ino(), "sv").unwrap();
+    assert!(fs.rename(fs.root_ino(), "sv", dir, "sv").is_err());
+}
+
+#[test]
+fn no_key_names_that_cannot_be_there() {
+    let (mut fs, dir, id) = vault();
+    fs.create(dir, "a", FileKind::Regular, 0o600, 0).unwrap();
+    fs.remove_encryption_key(&id).unwrap();
+    let too_long = crate::crypt::base64url(&[1; 200]);
+    let whole = crate::crypt::base64url(&[1; 189]);
+    for name in [too_long, whole] {
+        let name = core::str::from_utf8(&name).unwrap();
+        assert_eq!(fs.lookup(dir, name).err(), Some(Error::NotFound));
+    }
+}
+
+#[test]
+fn an_encrypted_directory_without_its_context_does_not_list() {
+    let (mut fs, dir, _) = vault();
+    let ino = split(dir).1;
+    fs.delete(Key::new(ino, ENC_CONTEXT, 0)).unwrap();
+    fs.keyring.files.clear();
+    assert!(matches!(fs.readdir(dir), Err(Error::Corrupt(_))));
+}
+
+#[test]
+fn fsck_of_encryption() {
+    let (mut fs, dir, _) = vault();
+    let f = fs
+        .create(dir, "secret-file-name", FileKind::Regular, 0o600, 0)
+        .unwrap();
+    let (d, f) = (split(dir).1, split(f).1);
+    let ctx = fs.get(Key::new(d, ENC_CONTEXT, 0)).unwrap().unwrap();
+    let mut inodes = BTreeMap::new();
+    inodes.insert(d, fs.inode(d).unwrap());
+    inodes.insert(f, fs.inode(f).unwrap());
+    let mut contexts = BTreeMap::new();
+    contexts.insert(d, ctx.clone());
+    contexts.insert(f, ctx.clone());
+    let none = BTreeSet::new();
+    encrypt::check(&inodes, &contexts, &none, &BTreeSet::new()).unwrap();
+
+    let mut missing = contexts.clone();
+    missing.remove(&f);
+    let what = |r: Result<()>| match r {
+        Err(Error::Corrupt(w)) => w,
+        r => panic!("{:?}", r),
+    };
+    assert_eq!(
+        what(encrypt::check(&inodes, &missing, &none, &BTreeSet::new())),
+        "fsck: encryption flag and context differ"
+    );
+    let packed: BTreeSet<u64> = [f].into_iter().collect();
+    assert_eq!(
+        what(encrypt::check(
+            &inodes,
+            &contexts,
+            &packed,
+            &BTreeSet::new()
+        )),
+        "fsck: inline or compressed encrypted data"
+    );
+    let mut extra = contexts.clone();
+    extra.insert(FIRST_INO + 999, ctx);
+    assert_eq!(
+        what(encrypt::check(&inodes, &extra, &none, &BTreeSet::new())),
+        "fsck: encryption context of a missing inode"
+    );
+    let short: BTreeSet<(u64, u64, Vec<u8>, u64)> =
+        [(d, 2, b"short".to_vec(), f)].into_iter().collect();
+    assert_eq!(
+        what(encrypt::check(&inodes, &contexts, &none, &short)),
+        "fsck: entry of an encrypted directory"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bitmap checksums
+// ---------------------------------------------------------------------------
+
+/// A bitmap bad on every copy is rebuilt from the trees, shared nodes
+/// and all.
+#[test]
+fn bitmaps_bad_everywhere_are_rebuilt_from_the_trees() {
+    let devs = volume();
+    let mut fs = CowFs::mount_devices(devs.clone(), false, false).unwrap();
+    fs.set_clock(clock);
+    for i in 0..300 {
+        file(&mut fs, &alloc::format!("f{}", i), &[i as u8; 600]);
+    }
+    fs.snapshot(fs.root_ino(), fs.root_ino(), "snap", true)
+        .unwrap();
+    fs.sync().unwrap();
+    let v = fs.vol.clone().unwrap();
+    drop(fs);
+    for k in 0..2 {
+        v.write_copy(BS, &[0x0f; BS as usize], k).unwrap();
+    }
+    let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+    fs.check().unwrap();
+}
+
+#[test]
+fn the_checksum_table_is_resized_or_skipped() {
+    // Moved when its size changes.
+    let (_, mut fs) = mounted();
+    let at = fs.sp.alloc.allocate_run(None, 2).unwrap();
+    fs.sb.bitmap_sums = Some((at, 2));
+    fs.place_bitmap_sums().unwrap();
+    assert_eq!(fs.sb.bitmap_sums.map(|s| s.1), Some(1));
+
+    // No room in group 0 for it: the filesystem goes on without one.
+    let (_, mut fs) = mounted();
+    fs.sb.bitmap_sums = None;
+    while fs.sp.alloc.groups_mut()[0].allocate_run(2, 1).is_some() {}
+    fs.place_bitmap_sums().unwrap();
+    assert_eq!(fs.sb.bitmap_sums, None);
+    fs.write_bitmap_sums().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Space on volumes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_single_device_has_no_chunks_to_grow() {
+    let (_, mut fs) = mounted();
+    assert!(!fs.sp.grow_on(ChunkKind::Data, None));
+}
+
+/// Data room and runs past what the chunks hold make new data chunks;
+/// nodes past the metadata ones make metadata chunks, until the devices
+/// are full.
+#[test]
+fn space_on_a_volume_grows_by_chunks() {
+    let devs = volume();
+    let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+    let room = fs.sp.data_room();
+    assert!(fs.sp.ensure_data_room(room + 100));
+    while fs.sp.data_room() > 50 {
+        fs.sp
+            .alloc
+            .allocate_for(None, 50, Some(ChunkKind::Data))
+            .unwrap();
+    }
+    assert!(fs.sp.alloc_data_run(None, 200).is_some());
+
+    while fs
+        .sp
+        .alloc
+        .allocate_for(None, u64::MAX, Some(ChunkKind::Metadata))
+        .is_some()
+    {}
+    crate::btree::Space::alloc_node(&mut fs.sp, 0).unwrap();
+    while fs.sp.grow(ChunkKind::Data) {}
+    while fs
+        .sp
+        .alloc
+        .allocate_for(None, u64::MAX, Some(ChunkKind::Metadata))
+        .is_some()
+    {}
+    assert_eq!(
+        crate::btree::Space::alloc_node(&mut fs.sp, 0).err(),
+        Some(Error::NoSpace)
+    );
+}
+
+/// On a tiered volume nodes go to the fast devices, which grow a chunk
+/// when theirs are full.
+#[test]
+fn nodes_grow_the_fast_tier() {
+    let devs: Vec<Arc<dyn BlockDevice>> = (0..2)
+        .map(|_| Ram::new(64 * MIB) as Arc<dyn BlockDevice>)
+        .collect();
+    mkfs::format_devices_tiered(
+        &devs,
+        &opts(),
+        Profile::Single,
+        Profile::Single,
+        &[Tier::Fast, Tier::Slow],
+    )
+    .unwrap();
+    let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+    while fs
+        .sp
+        .alloc
+        .allocate_tier(None, u64::MAX, Some(ChunkKind::Metadata), Some(Tier::Fast))
+        .is_some()
+    {}
+    let b = crate::btree::Space::alloc_node(&mut fs.sp, 0).unwrap();
+    assert_eq!(
+        fs.sp.alloc.groups()[(b / GROUP_BLOCKS) as usize].tier,
+        Tier::Fast
+    );
 }
