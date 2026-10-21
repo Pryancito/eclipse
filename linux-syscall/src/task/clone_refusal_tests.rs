@@ -91,7 +91,7 @@ fn the_refusal_names_what_was_asked_for_and_no_more() {
 }
 
 /// Sharing the descriptor table, the filesystem information, the signal
-/// handlers or the parent is only implemented together with
+/// handlers or the `SEM_UNDO` list is only implemented together with
 /// `CLONE_THREAD`.
 ///
 /// Accepting any of them as a plain fork answered success and then did a
@@ -103,7 +103,7 @@ fn sharing_state_without_clone_thread_is_refused() {
         (1 << 9, "CLONE_FS"),
         (1 << 10, "CLONE_FILES"),
         (1 << 11, "CLONE_SIGHAND"),
-        (1 << 15, "CLONE_PARENT"),
+        (1 << 18, "CLONE_SYSVSEM"),
     ];
     for (bits, name) in named.iter() {
         let f = CloneFlags::from_bits_truncate(*bits);
@@ -121,8 +121,8 @@ fn sharing_state_without_clone_thread_is_refused() {
     }
     assert_eq!(
         UNSUPPORTED_CLONE_SHARE.bits(),
-        0x8E00,
-        "FS, FILES, SIGHAND and PARENT"
+        0x4_0E00,
+        "FS, FILES, SIGHAND and SYSVSEM"
     );
     assert_eq!(UNSUPPORTED_CLONE_SHARE.bits().count_ones(), 4);
 }
@@ -157,4 +157,20 @@ fn a_thread_still_cannot_ask_for_a_namespace() {
     let f = CloneFlags::THREAD | CloneFlags::VM | CloneFlags::NEWNET;
     assert_eq!(clone_namespaces_refused(f), CloneFlags::NEWNET);
     assert!(!clone_shares_without_thread(f));
+}
+
+/// `CLONE_PARENT` is a fork of its own now (see `ChildOf`), from anybody
+/// but init, which has no parent to give the child to.
+#[test]
+fn clone_parent_is_a_fork_and_init_cannot_ask_for_it() {
+    let parent = CloneFlags::from_bits_truncate(1 << 15);
+    assert_eq!(parent, CloneFlags::PARENT);
+    assert!(!clone_shares_without_thread(parent));
+    assert!(clone_parent_refused(parent, 1), "init made a sibling");
+    assert!(!clone_parent_refused(parent, 2));
+    assert!(
+        !clone_parent_refused(CloneFlags::empty(), 1),
+        "init cannot fork"
+    );
+    assert!(!clone_parent_refused(CloneFlags::VFORK | CloneFlags::VM, 1));
 }

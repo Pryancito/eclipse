@@ -1047,10 +1047,23 @@ fn each_setting_answers_what_it_was_set_to() {
                 "the membarrier query answered no commands at all"
             );
 
-            // And the arm that is an answer and nothing else.
+            // `unshare(flags)`: nothing to unshare is 0, a namespace is still
+            // `ENOSYS` and a bit nobody has is `EINVAL`, so the flags are the
+            // first word.
+            assert_eq!(by_number(sys, Sys::UNSHARE, [0, 0, 0, 0, 0, 0]).await, 0);
             assert_eq!(
-                by_number(sys, Sys::UNSHARE, [0, 0, 0, 0, 0, 0]).await,
-                errno(LxError::ENOSYS)
+                by_number(sys, Sys::UNSHARE, [1 << 28, 0, 0, 0, 0, 0]).await,
+                errno(LxError::ENOSYS),
+                "a new user namespace is not ENOSYS any more"
+            );
+            assert_eq!(
+                by_number(sys, Sys::UNSHARE, [0, 1 << 28, 0, 0, 0, 0]).await,
+                0,
+                "unshare read its flags from the second word"
+            );
+            assert_eq!(
+                by_number(sys, Sys::UNSHARE, [0x8000_0000, 0, 0, 0, 0, 0]).await,
+                errno(LxError::EINVAL)
             );
         })
     });

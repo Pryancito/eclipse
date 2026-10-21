@@ -41,6 +41,8 @@ mod kcmp;
 mod process_vm;
 /// `struct sched_attr` in and out.
 mod sched_attr;
+/// `unshare(2)` without namespaces.
+mod unshare;
 use sched_attr::*;
 
 const P_ALL: i32 = 0;
@@ -454,6 +456,31 @@ fn exit_signal_of_clone(flags: usize) -> u8 {
     (flags & 0xff) as u8
 }
 
+/// Whose child a new process is: whom its death is told to, and with which
+/// signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildOf {
+    /// The caller's, told with this signal (`CSIGNAL`, 0 for none).
+    Caller(u8),
+    /// The caller's parent's, told with the signal the caller's own death
+    /// sends it (`CLONE_PARENT`, see
+    /// [`linux_object::process::give_to_callers_parent`]).
+    CallersParent,
+}
+
+/// [`ChildOf`] for a fork-like `clone` of flags word `flags`.
+///
+/// `copy_process` gives a `CLONE_PARENT` child
+/// `current->group_leader->exit_signal`: the signal in the flags word is
+/// not used at all.
+fn child_of_clone(f: CloneFlags, flags: usize) -> ChildOf {
+    if f.contains(CloneFlags::PARENT) {
+        ChildOf::CallersParent
+    } else {
+        ChildOf::Caller(exit_signal_of_clone(flags))
+    }
+}
+
 /// The `pid` argument of `setpgid`/`getpgid`/`getsid`: `0` means the caller.
 ///
 /// `pid_t` is SIGNED, and `find_task_by_vpid` can only ever fail on a negative
@@ -651,7 +678,7 @@ impl Syscall<'_> {
         newsp: usize,
         newtls: usize,
         ctid: ChildTidRequest,
-        exit_signal: u8,
+        child_of: ChildOf,
     ) -> LxResult<(Arc<Process>, KoID)> {
         info!("fork: newsp={:#x} newtls={:#x}", newsp, newtls);
         self.linux_process().may_start_task()?;
@@ -660,7 +687,7 @@ impl Syscall<'_> {
         if !path.is_empty() {
             new_proc.set_name(comm_from_path(&path));
         }
-        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid, exit_signal)?;
+        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid, child_of)?;
         info!("fork: {} -> {}", self.zircon_process().id(), new_proc.id());
         Ok((new_proc, tid))
     }
@@ -676,7 +703,7 @@ impl Syscall<'_> {
         newsp: usize,
         newtls: usize,
         ctid: ChildTidRequest,
-        exit_signal: u8,
+        child_of: ChildOf,
         shares_memory: bool,
     ) -> LxResult<(Arc<Process>, KoID)> {
         info!("vfork: newsp={:#x} newtls={:#x}", newsp, newtls);
@@ -686,7 +713,7 @@ impl Syscall<'_> {
         } else {
             Process::fork_from(self.zircon_process())?
         };
-        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid, exit_signal)?;
+        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid, child_of)?;
 
         let new_proc_obj: Arc<dyn KernelObject> = new_proc.clone();
         info!(
@@ -727,7 +754,7 @@ impl Syscall<'_> {
         newsp: usize,
         newtls: usize,
         ctid: ChildTidRequest,
-        exit_signal: u8,
+        child_of: ChildOf,
     ) -> LxResult<KoID> {
         // What the child thread takes from this one -- the signal mask above
         // all, which a `fork` inherits (sigprocmask(2)). `false`: a fork does
@@ -767,7 +794,12 @@ impl Syscall<'_> {
         // the same function as the `start` on purpose: each of these used to
         // be done somewhere the child was already running by the time it
         // happened.
-        new_proc.linux().set_exit_signal(exit_signal);
+        match child_of {
+            ChildOf::Caller(signal) => new_proc.linux().set_exit_signal(signal),
+            ChildOf::CallersParent => {
+                linux_object::process::give_to_callers_parent(self.zircon_process(), new_proc)
+            }
+        }
         // hunter: inherit the parent's syscall whitelist into the child so a
         // process cannot shed its policy merely by forking, and seed a fresh
         // anomaly window for the new pid.
@@ -792,7 +824,7 @@ impl Syscall<'_> {
             newsp,
             newtls,
             ChildTidRequest::none(),
-            linux_object::signal::Signal::SIGCHLD as u8,
+            ChildOf::Caller(linux_object::signal::Signal::SIGCHLD as u8),
         )
         .map(|(proc, _)| proc.id() as usize)
     }
@@ -803,7 +835,7 @@ impl Syscall<'_> {
             newsp,
             newtls,
             ChildTidRequest::none(),
-            linux_object::signal::Signal::SIGCHLD as u8,
+            ChildOf::Caller(linux_object::signal::Signal::SIGCHLD as u8),
             true,
         )
         .await
@@ -861,6 +893,9 @@ impl Syscall<'_> {
                 "clone: rejecting unsupported namespace flags {:#x} (no namespaces in this kernel)",
                 refused_ns.bits()
             );
+            return Err(LxError::EINVAL);
+        }
+        if clone_parent_refused(clone_flags, self.zircon_process().id()) {
             return Err(LxError::EINVAL);
         }
         if clone_shares_without_thread(clone_flags) {
@@ -931,16 +966,16 @@ impl Syscall<'_> {
             // left a zombie nobody reaped; a `clone3` with `exit_signal = 0`
             // got a signal it had explicitly asked not to get -- which also
             // decides, in `child_death_policy`, whether the zombie is left at
-            // all.
-            let exit_signal = exit_signal_of_clone(flags);
+            // all. `CLONE_PARENT` names no signal of its own: see `ChildOf`.
+            let child_of = child_of_clone(clone_flags, flags);
             let (process, tid) = if clone_flags.contains(CloneFlags::VFORK) {
                 info!("sys_clone: dispatching to sys_vfork for flags {:#x}", flags);
                 let shares_memory = clone_flags.contains(CloneFlags::VM);
-                self.vfork_impl(newsp, tls, ctid, exit_signal, shares_memory)
+                self.vfork_impl(newsp, tls, ctid, child_of, shares_memory)
                     .await?
             } else {
                 info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
-                self.fork_impl(newsp, tls, ctid, exit_signal)?
+                self.fork_impl(newsp, tls, ctid, child_of)?
             };
             let pid = process.id() as usize;
             // In the parent, once the child exists (Linux writes it before the
@@ -3686,12 +3721,15 @@ const UNSUPPORTED_CLONE_NS: CloneFlags = CloneFlags::from_bits_truncate(
 /// The sharing flags that are only implemented together with `CLONE_THREAD`.
 ///
 /// Accepting them as a plain fork lied about sharing the descriptor table,
-/// the filesystem information, the signal handlers and the parent.
+/// the filesystem information, the signal handlers and the `SEM_UNDO`
+/// list: a child's `semop(.., SEM_UNDO)` was undone when the child exited,
+/// where Linux keeps it until the last of the two does. (`CLONE_PARENT` is
+/// implemented, see [`ChildOf`].)
 const UNSUPPORTED_CLONE_SHARE: CloneFlags = CloneFlags::from_bits_truncate(
     CloneFlags::FILES.bits()
         | CloneFlags::FS.bits()
         | CloneFlags::SIGHAND.bits()
-        | CloneFlags::PARENT.bits(),
+        | CloneFlags::SYSVSEM.bits(),
 );
 
 /// Which of `f`'s namespace flags this kernel refuses, if any.
@@ -3714,6 +3752,12 @@ fn clone_shares_without_thread(f: CloneFlags) -> bool {
     !f.contains(CloneFlags::THREAD)
         && (f.intersects(UNSUPPORTED_CLONE_SHARE)
             || (f.contains(CloneFlags::VM) && !f.contains(CloneFlags::VFORK)))
+}
+
+/// `CLONE_PARENT` from init: `EINVAL`, as for Linux's `SIGNAL_UNKILLABLE`
+/// init. Its sibling would have no parent to be the child of.
+fn clone_parent_refused(f: CloneFlags, caller: KoID) -> bool {
+    f.contains(CloneFlags::PARENT) && caller == zircon_object::task::INIT_PID
 }
 
 /// `copy_thread` on x86_64: a `CLONE_SETTLS` pointer becomes the new
@@ -3755,6 +3799,9 @@ fn wait4_target(pid: i32) -> LxResult<WaitTarget> {
 
 #[cfg(test)]
 mod clone_refusal_tests;
+
+#[cfg(test)]
+mod clone_parent_wiring_tests;
 
 #[cfg(test)]
 mod wait_family_wiring_tests;
