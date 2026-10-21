@@ -124,7 +124,12 @@ fn gem_pushbuf_checks_what_linux_checks_before_it_submits() {
     assert_eq!(pushbuf(&gpu, &mut r, A), Err(nv::EFAULT), "null buffers");
     assert_eq!((r.suffix0, r.suffix1), dead);
 
-    // Every push names a buffer of the list.
+    // Every push names a buffer of the list; the list itself is two
+    // objects of the caller's (`pushbuf_validate` reads it next).
+    for b in bos.iter_mut() {
+        b.handle = object(&gpu, A, 4096, None);
+        b.valid_domains = nv::NOUVEAU_GEM_DOMAIN_GART;
+    }
     pushes[1].bo_index = 2;
     let mut r = pushbuf_req(c, 2, push, 2, buffers);
     assert_eq!(
@@ -145,6 +150,103 @@ fn gem_pushbuf_checks_what_linux_checks_before_it_submits() {
         (pushes[0].bo_index, pushes[1].bo_index),
         (0, 1),
         "the pushes are only read"
+    );
+}
+
+/// `nouveau_gem_pushbuf_validate` before the submission, hatch or no
+/// hatch: `validate_init` walks the list in order -- a handle that is not
+/// a GEM object the caller may use is ENOENT (another client's, unless
+/// the caller holds it as a PRIME import; a handle nobody has), and one
+/// listed twice is EINVAL -- and only then `validate_list` wants
+/// `valid_domains` to name VRAM or GART (EINVAL for an empty mask or one
+/// with other bits only; either domain alone passes). Every refusal
+/// writes the suffixes, like any error past the copy. The list went
+/// unread: a stranger's handle or a duplicate reached the submission
+/// as good as a real buffer.
+#[test]
+fn gem_pushbuf_validates_the_buffer_list_like_validate_init() {
+    let _g = LOCK.lock();
+    let gpu = gpu();
+    let c = channel_alloc(&gpu, A).unwrap().channel as u32;
+    let mine = object(&gpu, A, 65536, Some(0x1000_0000));
+    let mine_too = object(&gpu, A, 4096, None);
+    let imported = object(&gpu, B, 8192, Some(0x2000_0000));
+    assert!(crate::scheme::gem_mmap::add_ref(imported, A).is_some());
+    let theirs = object(&gpu, B, 4096, None);
+    let mut pushes = [push_of(0, 0, 16)];
+    let push = pushes.as_mut_ptr() as u64;
+    let gart = nv::NOUVEAU_GEM_DOMAIN_GART;
+    let vram = nv::NOUVEAU_GEM_DOMAIN_VRAM;
+    let try_list = |list: &mut [nv::DrmNouveauGemPushbufBo]| {
+        let mut r = pushbuf_req(c, 1, push, list.len() as u32, list.as_mut_ptr() as u64);
+        let got = pushbuf(&gpu, &mut r, A);
+        assert_eq!((r.suffix0, r.suffix1), (0, 0), "written on the way out");
+        got
+    };
+    let with = |handle: u32, valid: u32| {
+        let mut b = bo(handle);
+        b.valid_domains = valid;
+        b
+    };
+
+    assert_eq!(
+        try_list(&mut [with(mine, gart), with(imported, gart)]),
+        Err(nv::EOPNOTSUPP),
+        "own and imported: past validation, to the submission this driver does not do"
+    );
+    assert_eq!(
+        try_list(&mut [with(mine, gart), with(theirs, gart)]),
+        Err(nv::ENOENT),
+        "another client's, not imported"
+    );
+    assert_eq!(
+        try_list(&mut [with(mine, gart), with(0xdead, gart)]),
+        Err(nv::ENOENT),
+        "nobody's"
+    );
+    assert_eq!(
+        try_list(&mut [with(0xdead, gart), with(mine, gart)]),
+        Err(nv::ENOENT),
+        "nobody's, listed first"
+    );
+    assert_eq!(
+        try_list(&mut [with(mine, gart), with(mine_too, gart), with(mine, gart)]),
+        Err(nv::EINVAL),
+        "multiple instances of buffer"
+    );
+    assert_eq!(
+        try_list(&mut [with(mine, 0)]),
+        Err(nv::EINVAL),
+        "no valid domain"
+    );
+    assert_eq!(
+        // `NOUVEAU_GEM_DOMAIN_CPU` alone.
+        try_list(&mut [with(mine, 1)]),
+        Err(nv::EINVAL),
+        "neither VRAM nor GART"
+    );
+    assert_eq!(
+        try_list(&mut [with(mine, vram)]),
+        Err(nv::EOPNOTSUPP),
+        "VRAM alone"
+    );
+    assert_eq!(
+        try_list(&mut [with(mine_too, gart)]),
+        Err(nv::EOPNOTSUPP),
+        "GART alone"
+    );
+    // `validate_init` runs over the whole list before `validate_list`
+    // looks at a domain: the unknown handle wins over the empty mask
+    // listed before it.
+    assert_eq!(
+        try_list(&mut [with(mine, 0), with(0xdead, gart)]),
+        Err(nv::ENOENT),
+        "the list is looked up before any domain is judged"
+    );
+    assert_eq!(
+        try_list(&mut [with(mine, gart), with(mine_too, 0)]),
+        Err(nv::EINVAL),
+        "and the domain of every entry is judged"
     );
 }
 
@@ -170,7 +272,7 @@ fn bo(handle: u32) -> nv::DrmNouveauGemPushbufBo {
         handle,
         read_domains: 0,
         write_domains: 0,
-        valid_domains: 0,
+        valid_domains: nv::NOUVEAU_GEM_DOMAIN_VRAM | nv::NOUVEAU_GEM_DOMAIN_GART,
         presumed: nv::DrmNouveauGemPushbufBoPresumed {
             valid: 0,
             domain: 0,
@@ -479,11 +581,11 @@ fn gem_pushbuf_refuses_what_it_cannot_map_place_or_push() {
     let one = [push_of(0, 0, 0x20)];
     let eio = Err(nv::EIO);
 
-    // `mine`, ahead of the bad one, is placed the first time and reused
-    // the second; the bad one never reaches the RM.
-    for (handle, why, placed) in [
-        (0xdead_0001, "no such handle", 1),
-        (theirs, "another client's", 0),
+    // The list is validated whole before anything is mapped: `mine`,
+    // ahead of the bad one, is not placed either, and the RM is not asked.
+    for (handle, why) in [
+        (0xdead_0001, "no such handle"),
+        (theirs, "another client's"),
     ] {
         let before = FAKE_RM.lock().calls.len();
         let mut bos = [bo(mine), bo(handle)];
@@ -492,12 +594,8 @@ fn gem_pushbuf_refuses_what_it_cannot_map_place_or_push() {
             Err(nv::ENOENT),
             "{why}"
         );
-        assert_eq!(
-            rm_calls_since(before),
-            alloc::vec!["vm_bind_map"; placed],
-            "{why}: before the RM"
-        );
-        assert_eq!(driver_maps(&gpu, A).len(), 1, "{why}");
+        assert!(rm_calls_since(before).is_empty(), "{}: before the RM", why);
+        assert!(driver_maps(&gpu, A).is_empty(), "{}", why);
     }
 
     let fresh = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
@@ -511,7 +609,7 @@ fn gem_pushbuf_refuses_what_it_cannot_map_place_or_push() {
         "the RM refused"
     );
     FAKE_RM.lock().refuse_map = false;
-    assert_eq!(driver_maps(&gpu, A).len(), 1, "nothing recorded");
+    assert!(driver_maps(&gpu, A).is_empty(), "nothing recorded");
     let was = core::mem::replace(&mut FAKE_RM.lock().picked_va, 0);
     assert_eq!(
         submit(&gpu, A, ch, &mut bos, &[], &one),
@@ -519,7 +617,7 @@ fn gem_pushbuf_refuses_what_it_cannot_map_place_or_push() {
         "placed at VA 0"
     );
     FAKE_RM.lock().picked_va = was;
-    assert_eq!(driver_maps(&gpu, A).len(), 1);
+    assert!(driver_maps(&gpu, A).is_empty());
     assert_eq!(presumed(&bos[0]).0, 0, "never placed: presumed untouched");
 
     let before = FAKE_RM.lock().calls.len();
