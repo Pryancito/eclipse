@@ -29,3 +29,19 @@ btrfs = { path = "../btrfs-rs", features = ["std"] }
 # Independent implementations the encryption modes are checked against.
 xts-mode = "0.5"
 cts = "0.6"
+
+# Reference benchmarks, native `#[bench]` like `zircon-object/benches/vm.rs`
+# (no benchmarking crate enters the kernel's `Cargo.lock`). They need the
+# host (`std`), so without the feature `--all-targets` skips them.
+#
+#   cargo bench -p eclipsefs --features std --bench primitives
+#   cargo bench -p eclipsefs --features std --bench fs
+[[bench]]
+name = "primitives"
+harness = true
+required-features = ["std"]
+
+[[bench]]
+name = "fs"
+harness = true
+required-features = ["std"]

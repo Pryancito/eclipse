@@ -447,3 +447,37 @@ impl CowFs {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_key_steps_and_carries() {
+        assert_eq!(next_key(Key::new(1, 2, 3)), Some(Key::new(1, 2, 4)));
+        assert_eq!(next_key(Key::new(1, 2, u64::MAX)), Some(Key::new(1, 3, 0)));
+        assert_eq!(
+            next_key(Key::new(1, u8::MAX, u64::MAX)),
+            Some(Key::new(2, 0, 0))
+        );
+        assert_eq!(next_key(Key::MAX), None);
+        // The same step `purge` uses: the two must never disagree.
+        for k in [Key::MIN, Key::new(9, 1, 7), Key::new(0, 0, u64::MAX)] {
+            assert_eq!(next_key(k), key_after(&k));
+        }
+    }
+
+    /// A run touches the set when they share a block; runs that only meet
+    /// at an edge do not.
+    #[test]
+    fn touches_means_sharing_a_block() {
+        let mut set = RangeSet::default();
+        set.insert(100, 10);
+        assert!(touches(&set, 105, 1));
+        assert!(touches(&set, 90, 11));
+        assert!(touches(&set, 109, 50));
+        assert!(!touches(&set, 90, 10));
+        assert!(!touches(&set, 110, 5));
+        assert!(!touches(&RangeSet::default(), 0, 1000));
+    }
+}

@@ -839,3 +839,137 @@ impl Sent {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A command is `[type | length | CRC32C | payload]`, and the byte count
+    /// the stats report is what went to the sink.
+    #[test]
+    fn a_command_is_framed_with_its_length_and_crc() {
+        let mut out = Vec::new();
+        let mut sink = |b: &[u8]| -> Result<()> {
+            out.extend_from_slice(b);
+            Ok(())
+        };
+        let mut w = Writer {
+            out: &mut sink,
+            bytes: 0,
+        };
+        w.cmd(CMD_WRITE, b"payload").unwrap();
+        w.cmd(CMD_END, &[]).unwrap();
+        assert_eq!(w.bytes, 9 + 7 + 9);
+        assert_eq!(out[0], CMD_WRITE);
+        assert_eq!(u32::from_le_bytes(out[1..5].try_into().unwrap()), 7);
+        assert_eq!(
+            u32::from_le_bytes(out[5..9].try_into().unwrap()),
+            crc32c(b"payload")
+        );
+        assert_eq!(&out[9..16], b"payload");
+        assert_eq!(out[16], CMD_END);
+        assert_eq!(out.len(), 25);
+    }
+
+    /// A sink that fails stops the stream with its error.
+    #[test]
+    fn a_failing_sink_stops_the_stream() {
+        let mut sink = |_: &[u8]| -> Result<()> { Err(Error::NoSpace) };
+        let mut w = Writer {
+            out: &mut sink,
+            bytes: 0,
+        };
+        assert_eq!(w.cmd(CMD_END, &[]), Err(Error::NoSpace));
+        assert_eq!(w.bytes, 0);
+    }
+
+    #[test]
+    fn payloads_read_back_as_built() {
+        let p = P::default()
+            .u64(FIRST_INO + 5)
+            .u8(3)
+            .u64(u64::MAX)
+            .bytes(b"name");
+        let mut r = R(&p.0);
+        assert_eq!(r.ino().unwrap(), FIRST_INO + 5);
+        assert_eq!(r.u8().unwrap(), 3);
+        assert_eq!(r.u64().unwrap(), u64::MAX);
+        assert_eq!(r.rest(), b"name");
+        assert_eq!(r.rest(), b"");
+    }
+
+    /// Every short read is a corrupt stream, never a panic: `receive` reads
+    /// whatever arrives over the network.
+    #[test]
+    fn short_payloads_are_corrupt_streams() {
+        let p = P::default().u64(FIRST_INO).0;
+        for n in 0..8 {
+            assert_eq!(R(&p[..n]).u64(), Err(BAD));
+            assert_eq!(R(&p[..n]).ino(), Err(BAD));
+        }
+        assert_eq!(R(&[]).u8(), Err(BAD));
+        assert_eq!(R(&[1, 2]).take(3), Err(BAD));
+    }
+
+    /// Inode numbers outside the range a subvolume can hold are rejected
+    /// before they are used as keys.
+    #[test]
+    fn inode_numbers_are_range_checked() {
+        for bad in [0, 1, FIRST_INO - 1, INO_MASK + 1, u64::MAX] {
+            assert_eq!(R(&P::default().u64(bad).0).ino(), Err(BAD), "{}", bad);
+        }
+        for good in [FIRST_INO, INO_MASK] {
+            assert_eq!(R(&P::default().u64(good).0).ino(), Ok(good));
+        }
+    }
+
+    fn plain(lblk: u64, pblk: u64, blocks: u64) -> Ext {
+        Ext {
+            lblk,
+            pblk,
+            blocks,
+            prealloc: false,
+            z: None,
+        }
+    }
+
+    /// A range sent before is found again, at the right offset, only when
+    /// all of it was sent: half of a clone source is not a clone source.
+    #[test]
+    fn sent_extents_are_found_again_for_clones() {
+        let mut s = Sent::default();
+        let e = plain(0, 1000, 16);
+        s.add(&e, 4, 12, FIRST_INO + 1);
+        let other = plain(100, 1000, 16);
+        assert_eq!(s.find(&other, 104, 112), Some((FIRST_INO + 1, 4)));
+        assert_eq!(s.find(&other, 106, 108), Some((FIRST_INO + 1, 6)));
+        assert_eq!(s.find(&other, 102, 106), None);
+        assert_eq!(s.find(&other, 110, 114), None);
+        assert_eq!(s.find(&plain(0, 5000, 4), 0, 4), None);
+    }
+
+    #[test]
+    fn compressed_extents_match_on_disk_block_and_offset() {
+        let z = Zext {
+            algo: Compression::Zstd,
+            disk_blocks: 2,
+            ram_blocks: 8,
+            offset: 0,
+        };
+        let e = Ext {
+            lblk: 0,
+            pblk: 700,
+            blocks: 8,
+            prealloc: false,
+            z: Some(z),
+        };
+        let mut s = Sent::default();
+        s.add(&e, 0, 8, FIRST_INO);
+        assert_eq!(s.find(&e, 2, 6), Some((FIRST_INO, 2)));
+        // Same offsets in a different compressed extent: not the same data.
+        let other = Ext { pblk: 701, ..e };
+        assert_eq!(s.find(&other, 2, 6), None);
+        // A plain extent at the same disk block is not that data either.
+        assert_eq!(s.find(&plain(0, 700, 8), 0, 8), None);
+    }
+}
