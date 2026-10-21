@@ -2749,3 +2749,26 @@ mod info_layout_tests {
         );
     }
 }
+
+/// System V semaphores reached through the syscall: a set made in one
+/// process and operated from another, the array that lands whole or not at
+/// all, and the park a blocked `semop` goes into.
+#[cfg(test)]
+mod sem_wiring_tests;
+
+/// `semctl` reached through the syscall: what its first argument names,
+/// which of its fourteen commands needs what, and the two stamps a set keeps.
+#[cfg(test)]
+mod semctl_wiring_tests;
+
+/// System V message queues reached through the syscall: a message sent in
+/// one process and taken in another, which message a receiver gets, and the
+/// two parks a queue has.
+#[cfg(test)]
+mod msg_wiring_tests;
+
+/// System V shared memory reached through the syscall: a segment made in one
+/// process and read in another, where an attach lands, and what a detach
+/// leaves behind.
+#[cfg(test)]
+mod shm_wiring_tests;

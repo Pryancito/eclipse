@@ -210,6 +210,12 @@ impl linux_object::fs::FsIoctlContext for FsIoctlCtx<'_> {
 mod ioctl_number_tests;
 
 #[cfg(test)]
+mod permission_tests;
+
+#[cfg(test)]
+mod positional_io_tests;
+
+#[cfg(test)]
 mod sync_file_range_tests;
 
 #[cfg(test)]
@@ -3241,6 +3247,37 @@ mod seek_and_access_tests;
 #[cfg(test)]
 mod truncate_type_tests;
 
+/// The two length calls and the two filesystem-statistics calls, asked
+/// through the syscalls: `truncate_type` and `ftruncate_type` have pure
+/// tests above, but which syscall asks which of them -- they disagree about
+/// a directory and about permissions -- is only visible end to end, and the
+/// eight numbers of `statfs` had never been read back at all.
+#[cfg(test)]
+mod truncate_and_statfs_tests;
+
+/// Where the two copying syscalls put their arguments. `copy_range` has
+/// `copy_range_tests` for the loop itself; what nothing could see from
+/// there is that `sendfile` hands the offset to the **input** and writes
+/// the output at its own cursor, that an explicit offset comes back in the
+/// caller's variable, and that both ends check their own window.
+#[cfg(test)]
+mod sendfile_and_copy_tests;
+
+/// Which sync each of the five durability syscalls asks for. They all
+/// return `Ok(0)` on a ramfs and differ only in the method they reach for,
+/// so the module hands them a file that counts what it was asked, which
+/// is also what makes `readahead`'s errors -- its whole contract, since
+/// there is no page cache here to fill -- askable.
+#[cfg(test)]
+mod durability_tests;
+
+/// What `fallocate` does to the file. `fallocate_mode_tests` decodes the
+/// mode word; what nothing could see from there is that two of those modes
+/// promise the range **reads back as zeros afterwards**, and that a caller
+/// probing for a mode on a read-only descriptor is told about the mode.
+#[cfg(test)]
+mod fallocate_wiring_tests;
+
 /// `SYNC_IOC_MERGE` is `_IOWR('>', 3, struct sync_merge_data)`: type `'>'`
 /// (0x3e), nr 3, 48 bytes. Matched on type and nr, like the DRM syncobj fd
 /// ioctls: the struct is UABI-frozen, and a size-pinned constant is how this
@@ -3843,6 +3880,16 @@ pub(crate) fn utimes_times(
 
 #[cfg(test)]
 mod utimes_times_tests;
+
+#[cfg(test)]
+mod utimes_gate_tests;
+
+/// `utimes` through the syscall. Its pure half has `utimes_times_tests`
+/// beside it; what only this can see is that the `timeval` microseconds
+/// become nanoseconds on the way to the inode, and that a null pathname
+/// here is a bad pointer and not the `futimens` of `utimensat`.
+#[cfg(test)]
+mod utimes_wiring_tests;
 
 #[cfg(test)]
 mod fallocate_mode_tests;

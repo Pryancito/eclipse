@@ -3,6 +3,14 @@
 !.cargo/*
 
 **/target
+# Los artefactos de medir cobertura. `**/target` no coge `target-cov`, que es
+# donde va la construccion instrumentada para no pisar `target/`, y los
+# `.profraw` los dejan caer en la raiz los guiones de construccion, que no
+# heredan `LLVM_PROFILE_FILE`: una vez aparecieron 243 sueltos. Entre los dos
+# son varios gigas, y basta un `git add -A`.
+/target-cov
+*.profraw
+*.profdata
 *.img
 
 /ignored

@@ -614,7 +614,8 @@ fn getting_the_supplementary_groups_does_not_set_them() {
 fn setting_the_host_name_does_not_set_the_domain_name() {
     // `sethostname` and `setdomainname` take the same pointer and length and
     // both answer zero, so only which of the two names moved says which ran.
-    // Both are machine-wide, so this test puts them back.
+    // Both are machine-wide, so this test holds them and puts them back.
+    let _names = crate::on_a_thread::the_machine_names();
     let was_host = linux_object::uname::hostname();
     let was_domain = linux_object::uname::domainname();
     let proc = a_process(45_514, "dispatch-hostname", "dispatch_hostname");
@@ -1396,5 +1397,71 @@ fn flushing_a_file_is_not_flushing_only_its_data() {
         after_fdatasync,
         (1, 1),
         "fdatasync did not reach sync_data and it alone"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Ending a thread against ending a process
+// ---------------------------------------------------------------------------
+
+// The last pair of the table, and the one that resisted longest: both arms
+// end the thread the question is being asked from, so the obvious test loses
+// whoever was going to answer it.
+//
+// What separates them is one line of `exit_linux`: it calls `Process::exit`
+// only `if last_thread_of(thread_count())`, while `sys_exit_group` calls it
+// whatever the count. So give the process a SECOND thread and the two arms
+// stop agreeing -- `exit` leaves it alive, `exit_group` does not. The call
+// still gets to return either way, because both arms end a thread by marking
+// its state and not by unwinding, and nothing is awaited after them.
+
+/// A process with one more thread than the call will use, so the caller is
+/// not the last thread of its group.
+///
+/// Created and not started: `Thread::create` is what registers a thread with
+/// its process, which is all `thread_count` reads, and a started one would
+/// be a task still running after the test returns.
+fn with_a_sibling_thread(pid: KoID, name: &str, top: &str) -> (Arc<Process>, Arc<Thread>) {
+    let proc = a_process(pid, name, top);
+    let sibling = Thread::create_linux(&proc).unwrap();
+    (proc, sibling)
+}
+
+/// Not 0, so that "the process exited" cannot be confused with the 0 a
+/// process gets invented for it when it is torn down without a code.
+const AN_EXIT_CODE: usize = 7;
+
+#[test]
+fn ending_a_thread_is_not_ending_its_process() {
+    let (proc, _sibling) = with_a_sibling_thread(45_530, "dispatch-exit", "dispatch_exit");
+    let ret = on_a_thread(&proc, |sys| {
+        Box::pin(
+            async move { by_number(sys, Sys::EXIT as u32, [AN_EXIT_CODE, 0, 0, 0, 0, 0]).await },
+        )
+    });
+
+    assert_eq!(ret, 0, "exit did not return");
+    assert_eq!(
+        proc.exit_code(),
+        None,
+        "exit from one of two threads took the whole process with it"
+    );
+}
+
+#[test]
+fn ending_the_group_ends_the_whole_process() {
+    let (proc, _sibling) =
+        with_a_sibling_thread(45_531, "dispatch-exit-group", "dispatch_exit_group");
+    let ret = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            by_number(sys, Sys::EXIT_GROUP as u32, [AN_EXIT_CODE, 0, 0, 0, 0, 0]).await
+        })
+    });
+
+    assert_eq!(ret, 0, "exit_group did not return");
+    assert_eq!(
+        proc.exit_code(),
+        Some(AN_EXIT_CODE as i64),
+        "exit_group left the process alive, or gave it another code"
     );
 }

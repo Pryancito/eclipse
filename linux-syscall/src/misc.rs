@@ -2857,3 +2857,33 @@ mod sysinfo_layout_tests {
         assert_eq!(offset_of!(SysInfo, mem_unit) + 4 + 4, 112);
     }
 }
+
+/// The sixteen resource limits through `prlimit64`, `getrlimit` and
+/// `setrlimit`: which process a pid names, whose capability decides a raise,
+/// and the old limit going out while the new one goes in.
+#[cfg(test)]
+mod rlimit_wiring_tests;
+
+/// The machine a program asks about: the two names it can set and the
+/// `utsname` it reads them back from, its execution domain, which CPU it is
+/// on, and the numbers `uptime` and `top` print.
+#[cfg(test)]
+mod uts_and_machine_tests;
+
+/// What a program asks about its own privilege and what priority the disk
+/// serves it at: the two capability sets through their version
+/// negotiation, and an I/O priority set on a task and read back off it.
+#[cfg(test)]
+mod caps_and_ioprio_tests;
+
+/// The machine as a whole rather than the process: the reboot nobody but
+/// root may ask for, the kernel log, the entropy source and the memory
+/// barriers, plus the execution base of a thread.
+#[cfg(test)]
+mod boot_and_log_tests;
+
+/// The futex through the syscall: an operation judged before the word is
+/// looked at, the clock an absolute deadline sits on, and the park and wake
+/// pair made from two threads of one process.
+#[cfg(test)]
+mod futex_wiring_tests;

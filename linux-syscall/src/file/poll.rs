@@ -2515,3 +2515,561 @@ mod pollfd_layout_tests {
         assert!(offset_of!(PollFd, revents) > offset_of!(PollFd, events));
     }
 }
+
+#[cfg(test)]
+mod end_to_end_tests {
+    //! `poll(2)` made the way a program makes it, which nothing did.
+    //!
+    //! The pure helpers above are well covered -- `poll_nfds`,
+    //! `poll_wait_decision`, `watch_kinds`, `only_terminals` and the rest all
+    //! have tests of their own. What had never run is the body that uses
+    //! them: `PollFuture::poll`, 260 lines that scan the set, classify every
+    //! descriptor, count the ready ones and decide whether to park. Nothing
+    //! in this crate called `sys_poll`, `sys_ppoll`, `sys_select`,
+    //! `sys_pselect6`, `sys_epoll_wait` or `sys_epoll_pwait` even once, so
+    //! the file sat at 21% of its production lines.
+    //!
+    //! A file on RamFS is always ready for both directions, and that is
+    //! enough to ask the three things this body decides on its own, without
+    //! a network stack, a device or a timer: what the return VALUE counts,
+    //! what an fd the process does not have answers, and what a negative fd
+    //! does.
+
+    use super::*;
+    use crate::on_a_thread::on_a_thread;
+    use alloc::boxed::Box;
+    use alloc::string::String;
+    use linux_object::fs::{File, OpenFlags};
+    use linux_object::process::LinuxProcess;
+    use rcore_fs::vfs::FileType;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::task::{Process, ROOT_JOB};
+
+    /// Ask for nothing and the entry is still scanned; these are the two
+    /// bits a reader and a writer ask for.
+    const IN_AND_OUT: u16 = 0x0001 | 0x0004;
+    /// The same question written the long way, with the stream names beside
+    /// the generic ones, which is what glibc's `poll` passes through.
+    const IN_AND_OUT_WITH_STREAMS: u16 = 0x0001 | 0x0040 | 0x0004 | 0x0100;
+    /// `POLLNVAL`, which is an answer and not an error.
+    const NVAL: u16 = 0x0020;
+
+    fn an_entry(fd: i32, events: u16) -> PollFd {
+        PollFd {
+            fd: FileDesc::from(fd),
+            events: PollEvents::from_bits_truncate(events),
+            revents: PollEvents::empty(),
+        }
+    }
+
+    /// A process whose root holds a `/<top>` of its own, because a lookup
+    /// from the root goes through a path cache every process in this binary
+    /// shares.
+    fn a_process(pid: KoID, name: &str, top: &str) -> Arc<Process> {
+        let lp = LinuxProcess::new(RamFS::new(), 0);
+        lp.root_inode().create(top, FileType::Dir, 0o755).unwrap();
+        Process::create_with_fixed_id_ext(&ROOT_JOB, pid, name, lp).unwrap()
+    }
+
+    /// `poll(ufds, nfds, timeout)` by the syscall, with the set in memory it
+    /// reads and writes back through a pointer.
+    ///
+    /// `sys_poll` wants `&mut self` and `on_a_thread` lends a shared one, so
+    /// this builds its own out of the same three parts, as
+    /// `dispatch_tests::by_number` does.
+    async fn poll_them(sys: &Syscall<'_>, set: &mut [PollFd], timeout_msecs: isize) -> SysResult {
+        let mut own = Syscall {
+            thread: sys.thread,
+            thread_fn: sys.thread_fn,
+            syscall_entry: sys.syscall_entry,
+        };
+        own.sys_poll(
+            UserInOutPtr::from(set.as_mut_ptr() as usize),
+            set.len(),
+            timeout_msecs,
+        )
+        .await
+    }
+
+    /// Open a file of `top` and poll `set`, whose first entry is given that
+    /// file's descriptor. Returns what the syscall returned and the set as
+    /// the syscall wrote it back.
+    fn poll_with_a_file(
+        proc: &Arc<Process>,
+        top: &str,
+        mut set: alloc::vec::Vec<PollFd>,
+        at: usize,
+        timeout_msecs: isize,
+    ) -> (SysResult, alloc::vec::Vec<PollFd>) {
+        // Owned before the closure: `on_a_thread` wants a `'static` one.
+        let dir_path = alloc::format!("/{}", top);
+        let path = alloc::format!("/{}/f", top);
+        on_a_thread(proc, move |sys| {
+            Box::pin(async move {
+                let lp = sys.linux_process();
+                let dir = lp.lookup_inode(&dir_path).unwrap();
+                let inode = dir.create("f", FileType::File, 0o644).unwrap();
+                let fd: i32 = lp
+                    .add_file(File::new(inode, OpenFlags::RDWR, String::from(&path)))
+                    .unwrap()
+                    .into();
+                set[at] = an_entry(fd, set[at].events.bits());
+                let got = poll_them(sys, &mut set, timeout_msecs).await;
+                (got, set)
+            })
+        })
+    }
+
+    #[test]
+    fn the_answer_counts_descriptors_and_not_event_bits() {
+        // Linux's poll(2) returns "the number of fds with nonzero revents,
+        // not the number of event bits set". One file ready both ways is
+        // ONE, however many bits come back in it -- and asking the question
+        // the long way must not turn it into more.
+        let proc = a_process(45_560, "poll-count", "poll_count");
+        let (got, set) = poll_with_a_file(
+            &proc,
+            "poll_count",
+            alloc::vec![an_entry(0, IN_AND_OUT_WITH_STREAMS)],
+            0,
+            0,
+        );
+
+        assert_eq!(got, Ok(1), "a file ready both ways was not one descriptor");
+        assert_eq!(
+            set[0].revents.bits(),
+            IN_AND_OUT_WITH_STREAMS,
+            "the four bits asked for did not all come back"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_the_process_does_not_have_is_pollnval_and_is_counted() {
+        // POLLNVAL is a well-defined answer and not a kernel error: the
+        // syscall succeeds, the entry carries the bit, and it counts towards
+        // the return value like any other ready entry.
+        let proc = a_process(45_561, "poll-nval", "poll_nval");
+        let mut set = alloc::vec![an_entry(999, IN_AND_OUT)];
+        let (got, set) = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let got = poll_them(sys, &mut set, 0).await;
+                (got, set)
+            })
+        });
+
+        assert_eq!(got, Ok(1), "a stale descriptor was not counted");
+        assert_eq!(
+            set[0].revents.bits(),
+            NVAL,
+            "a stale descriptor did not come back as POLLNVAL alone"
+        );
+    }
+
+    #[test]
+    fn a_negative_descriptor_is_ignored_and_counts_for_nothing() {
+        // poll(2)'s "skip this entry", which udhcpc6 leaves in the set. A
+        // set of nothing but ignored entries, with a timeout of zero, is a
+        // return of zero and not a wait.
+        let proc = a_process(45_562, "poll-skip", "poll_skip");
+        let mut set = alloc::vec![an_entry(-1, IN_AND_OUT), an_entry(-1, IN_AND_OUT)];
+        let (got, set) = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let got = poll_them(sys, &mut set, 0).await;
+                (got, set)
+            })
+        });
+
+        assert_eq!(got, Ok(0), "an ignored entry was counted or waited on");
+        assert_eq!(set[0].revents.bits(), 0, "an ignored entry got an answer");
+        assert_eq!(set[1].revents.bits(), 0, "an ignored entry got an answer");
+    }
+
+    #[test]
+    fn the_three_kinds_of_entry_are_counted_separately_in_one_set() {
+        // The three paths of the scan, in the one set, so that the count is
+        // read against entries that answer differently: the ready file and
+        // the stale descriptor each count, the ignored one does not.
+        let proc = a_process(45_563, "poll-mixed", "poll_mixed");
+        let (got, set) = poll_with_a_file(
+            &proc,
+            "poll_mixed",
+            alloc::vec![
+                an_entry(-1, IN_AND_OUT),
+                an_entry(0, IN_AND_OUT),
+                an_entry(999, IN_AND_OUT),
+            ],
+            1,
+            0,
+        );
+
+        assert_eq!(got, Ok(2), "the mixed set did not count two of three");
+        assert_eq!(set[0].revents.bits(), 0, "the ignored entry got an answer");
+        assert_eq!(
+            set[1].revents.bits(),
+            IN_AND_OUT,
+            "the ready file did not answer both directions"
+        );
+        assert_eq!(set[2].revents.bits(), NVAL, "the stale entry was not NVAL");
+    }
+
+    // ---- select(2) and epoll_wait(2) -------------------------------------
+    //
+    // `select_core` (the shared body of `select` and `pselect6`) and
+    // `Epoll::wait` behind `sys_epoll_pwait` were as unexecuted as
+    // `PollFuture::poll` was. They are not more of the same: select counts
+    // its answer differently from poll, hands the answer back by rewriting
+    // the caller's own bitmaps, and has a whole check -- `max_select_fd` --
+    // that poll does not.
+
+    /// `EPOLL_CTL_ADD`. `/usr/include/linux/eventpoll.h` says 1, and the
+    /// number is written here rather than read back out of the kernel under
+    /// test: a test that takes its numbers from the table it is checking
+    /// agrees with whatever that table says.
+    const CTL_ADD: i32 = 1;
+
+    /// A descriptor the process does not have. Above stdio and above the one
+    /// file these tests open, so nothing can hand it out by accident.
+    const A_CLOSED_FD: usize = 100;
+
+    /// A `fd_set` in host memory: one `u32` per 32 descriptors, which is how
+    /// select reads it and how `commit` writes it back. Sized by `nfds`,
+    /// like the array a caller declares -- so every `fd` named here must sit
+    /// inside those words, including the ones past `nfds` that a test puts
+    /// there on purpose.
+    fn a_set(nfds: usize, fds: &[usize]) -> alloc::vec::Vec<u32> {
+        let mut words = alloc::vec![0u32; nfds.div_ceil(FD_PER_ITEM).max(1)];
+        for &fd in fds {
+            words[fd / FD_PER_ITEM] |= 1 << (fd % FD_PER_ITEM);
+        }
+        words
+    }
+
+    /// A node of `dir_path` opened read-write, and the descriptor it got.
+    ///
+    /// A node on RamFS is always ready for reading and for writing, whatever
+    /// kind it is, which is what makes these answers knowable with no
+    /// device, no network stack and no timer in the way. The kind still
+    /// matters to epoll, which refuses a regular file outright: see
+    /// `epoll_refuses_the_regular_file_that_poll_reports_always_ready`.
+    fn a_ready_node(lp: &LinuxProcess, dir_path: &str, type_: FileType) -> usize {
+        let dir = lp.lookup_inode(dir_path).unwrap();
+        let inode = dir.create("f", type_, 0o644).unwrap();
+        let path = alloc::format!("{}/f", dir_path);
+        let fd: i32 = lp
+            .add_file(File::new(inode, OpenFlags::RDWR, path))
+            .unwrap()
+            .into();
+        fd as usize
+    }
+
+    /// `select(nfds, &read, &write, &except, &timeout)` by the syscall, with
+    /// the four arguments in memory it reads and writes back through
+    /// pointers.
+    ///
+    /// All three sets are real buffers, never null: a null set is a
+    /// different path of `FdSet::new` and an empty slice's pointer is
+    /// dangling rather than null, so passing one would hand production a
+    /// pointer it is entitled to read.
+    ///
+    /// `sys_select` wants `&mut self` and `on_a_thread` lends a shared one,
+    /// so this builds its own out of the same three parts, as `poll_them`
+    /// does.
+    async fn select_them(
+        sys: &Syscall<'_>,
+        nfds: usize,
+        read: &mut [u32],
+        write: &mut [u32],
+        except: &mut [u32],
+        timeout: &mut TimeVal,
+    ) -> SysResult {
+        let mut own = Syscall {
+            thread: sys.thread,
+            thread_fn: sys.thread_fn,
+            syscall_entry: sys.syscall_entry,
+        };
+        own.sys_select(
+            nfds,
+            UserInOutPtr::from(read.as_mut_ptr() as usize),
+            UserInOutPtr::from(write.as_mut_ptr() as usize),
+            UserInOutPtr::from(except.as_mut_ptr() as usize),
+            UserInOutPtr::from(timeout as *mut TimeVal as usize),
+        )
+        .await
+    }
+
+    /// `epoll_pwait` with no signal mask, which is what `sys_epoll_wait`
+    /// passes. The output array is the caller's, and the answer says how
+    /// many of its entries were filled.
+    async fn wait_on(sys: &Syscall<'_>, epfd: usize, out: &mut [EpollEvent]) -> SysResult {
+        sys.sys_epoll_pwait(
+            FileDesc::from(epfd),
+            UserOutPtr::from(out.as_mut_ptr() as usize),
+            out.len(),
+            0,
+            // Built here and not shared: `UserInPtr` is not `Copy`, so a
+            // null kept in a local would be moved by the first call.
+            UserInPtr::from(0),
+            0,
+        )
+        .await
+    }
+
+    #[test]
+    fn selects_answer_counts_bits_and_polls_counts_descriptors() {
+        // The same file, ready the same two ways, is TWO to select(2) and
+        // ONE to poll(2): select "returns the total number of bits that are
+        // set in readfds, writefds and exceptfds", poll "the number of fds
+        // with nonzero revents". Neither count had a test, and the pair is
+        // asked here in one go so that a change which made the two agree
+        // cannot pass.
+        let proc = a_process(45_564, "select-bits", "select_bits");
+        let dir_path = String::from("/select_bits");
+        let (selected, polled) = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let lp = sys.linux_process();
+                let fd = a_ready_node(&lp, &dir_path, FileType::File);
+                let nfds = fd + 1;
+                let mut read = a_set(nfds, &[fd]);
+                let mut write = a_set(nfds, &[fd]);
+                let mut except = a_set(nfds, &[]);
+                let mut timeout = TimeVal { sec: 0, usec: 0 };
+                let selected =
+                    select_them(sys, nfds, &mut read, &mut write, &mut except, &mut timeout).await;
+                let mut set = alloc::vec![an_entry(fd as i32, IN_AND_OUT)];
+                let polled = poll_them(sys, &mut set, 0).await;
+                (selected, polled)
+            })
+        });
+
+        assert_eq!(selected, Ok(2), "select did not count both of its bits");
+        assert_eq!(polled, Ok(1), "poll counted bits instead of descriptors");
+    }
+
+    #[test]
+    fn a_closed_descriptor_in_a_set_is_ebadf_before_anything_is_waited_on() {
+        // `max_select_fd` (fs/select.c): a descriptor in any of the three
+        // sets that the process does not have makes the whole call EBADF,
+        // and it does so before the wait begins. It used to be skipped
+        // instead, so a program that had closed a socket and left its bit
+        // set waited out the timeout -- or for ever -- rather than being
+        // told which descriptor to drop.
+        //
+        // Asked with a timeout of zero, so that a kernel which skipped the
+        // check answers Ok(0) at once instead of hanging the suite.
+        let proc = a_process(45_565, "select-badfd", "select_badfd");
+        let nfds = A_CLOSED_FD + 1;
+        let mut read = a_set(nfds, &[A_CLOSED_FD]);
+        let mut write = a_set(nfds, &[]);
+        let mut except = a_set(nfds, &[]);
+        let got = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let mut timeout = TimeVal { sec: 0, usec: 0 };
+                select_them(sys, nfds, &mut read, &mut write, &mut except, &mut timeout).await
+            })
+        });
+
+        assert_eq!(
+            got,
+            Err(LxError::EBADF),
+            "a closed descriptor in readfds did not stop the call"
+        );
+    }
+
+    #[test]
+    fn nothing_lands_in_exceptfds_and_a_spent_timeout_hands_the_sets_back_cleared() {
+        // Three things that only show up together. `select_ready` reports
+        // `except: false` whatever the status says, because POLLEX_SET is
+        // PRI alone and nothing here raises it -- so a file that is ready
+        // both ways is still not ready in exceptfds. That makes this a
+        // select which finds nothing, which is the one path that answers
+        // through `PollWait::ReturnEmpty`: Linux returns 0 AND writes the
+        // (empty) ready sets back, so the caller's bit is gone from the set
+        // it handed in.
+        let proc = a_process(45_566, "select-except", "select_except");
+        let dir_path = String::from("/select_except");
+        let (got, read, write, except) = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let lp = sys.linux_process();
+                let fd = a_ready_node(&lp, &dir_path, FileType::File);
+                let nfds = fd + 1;
+                let mut read = a_set(nfds, &[]);
+                let mut write = a_set(nfds, &[]);
+                let mut except = a_set(nfds, &[fd]);
+                let mut timeout = TimeVal { sec: 0, usec: 0 };
+                let got =
+                    select_them(sys, nfds, &mut read, &mut write, &mut except, &mut timeout).await;
+                (got, read, write, except)
+            })
+        });
+
+        assert_eq!(got, Ok(0), "a file was reported ready in exceptfds");
+        assert_eq!(except[0], 0, "the exception bit was handed back still set");
+        assert_eq!(read[0], 0, "a set select was not asked about came back set");
+        assert_eq!(
+            write[0], 0,
+            "a set select was not asked about came back set"
+        );
+    }
+
+    #[test]
+    fn a_bit_above_nfds_is_neither_an_error_nor_looked_at() {
+        // `nfds` is the count of descriptors to consider, not the size of
+        // the words the caller passed: a `fd_set` is always a whole number
+        // of 32-bit words, so bits above `nfds` are there whether the
+        // caller meant them or not. They must be neither scanned nor
+        // EBADF'd, and they must not survive into the answer.
+        let proc = a_process(45_567, "select-clamp", "select_clamp");
+        let dir_path = String::from("/select_clamp");
+        let (got, read, only_the_file) = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let lp = sys.linux_process();
+                let fd = a_ready_node(&lp, &dir_path, FileType::File);
+                let nfds = fd + 1;
+                // The second one is past `nfds` and belongs to nobody: it
+                // shares the first word, as the words a caller declares do.
+                let mut read = a_set(nfds, &[fd, fd + 8]);
+                let mut write = a_set(nfds, &[]);
+                let mut except = a_set(nfds, &[]);
+                let mut timeout = TimeVal { sec: 0, usec: 0 };
+                let got =
+                    select_them(sys, nfds, &mut read, &mut write, &mut except, &mut timeout).await;
+                (got, read[0], 1u32 << fd)
+            })
+        });
+
+        assert_eq!(got, Ok(1), "a bit above nfds was counted or made an error");
+        assert_eq!(
+            read, only_the_file,
+            "the answer kept a bit that is past nfds"
+        );
+    }
+
+    #[test]
+    fn an_epoll_hands_back_the_cookie_the_caller_registered() {
+        // The point of `epoll_data`: the kernel keeps 64 bits on behalf of
+        // the caller and reports them untouched, so a program can hang its
+        // own pointer off a watch instead of keeping a second descriptor to
+        // object map. Nothing had ever read one back out.
+        let proc = a_process(45_568, "epoll-cookie", "epoll_cookie");
+        let dir_path = String::from("/epoll_cookie");
+        const A_COOKIE: u64 = 0x0bad_c0de_dead_beef;
+        let (got, events, cookie) = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let lp = sys.linux_process();
+                // A device node and not a regular file: `can_epoll`
+                // refuses the latter, which is the next test. Not a FIFO
+                // either -- an empty one answers writable alone, on purpose
+                // (`fifo_node_poll`, already covered where it lives).
+                let fd = a_ready_node(&lp, &dir_path, FileType::CharDevice);
+                let epfd = sys.sys_epoll_create1(0).unwrap();
+                let watch = EpollEvent {
+                    events: u32::from(IN_AND_OUT),
+                    data: A_COOKIE,
+                };
+                sys.sys_epoll_ctl(
+                    FileDesc::from(epfd),
+                    CTL_ADD,
+                    FileDesc::from(fd),
+                    UserInPtr::from(&watch as *const EpollEvent as usize),
+                )
+                .unwrap();
+                let mut out = alloc::vec![EpollEvent { events: 0, data: 0 }; 8];
+                let got = wait_on(sys, epfd, &mut out).await;
+                // Copied out of the array before being asserted on:
+                // `EpollEvent` is packed, so a reference to a field of one
+                // (which is what `assert_eq!` takes) does not exist.
+                (got, out[0].events, out[0].data)
+            })
+        });
+
+        assert_eq!(got, Ok(1), "a ready file was not reported once");
+        assert_eq!(cookie, A_COOKIE, "the caller's cookie came back changed");
+        assert_eq!(
+            events,
+            u32::from(IN_AND_OUT),
+            "a file ready both ways was not reported both ways"
+        );
+    }
+
+    #[test]
+    fn an_epoll_wait_tells_a_closed_descriptor_from_one_that_is_not_an_epoll() {
+        // Two different answers, and they were once the same one: the
+        // downcast was mapped to EBADF, so a live descriptor that simply
+        // was not an epoll reported itself closed. `do_epoll_wait` gives
+        // EBADF for a descriptor the process does not have and EINVAL for
+        // one it has that is of the wrong kind -- the difference between
+        // "you closed it" and "that is a file".
+        let proc = a_process(45_569, "epoll-kind", "epoll_kind");
+        let dir_path = String::from("/epoll_kind");
+        let (not_an_epoll, closed) = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let lp = sys.linux_process();
+                let fd = a_ready_node(&lp, &dir_path, FileType::File);
+                let mut out = alloc::vec![EpollEvent { events: 0, data: 0 }; 4];
+                let not_an_epoll = wait_on(sys, fd, &mut out).await;
+                let closed = wait_on(sys, A_CLOSED_FD, &mut out).await;
+                (not_an_epoll, closed)
+            })
+        });
+
+        assert_eq!(
+            not_an_epoll,
+            Err(LxError::EINVAL),
+            "waiting on a plain file did not say it is the wrong kind"
+        );
+        assert_eq!(
+            closed,
+            Err(LxError::EBADF),
+            "waiting on a descriptor the process does not have was not EBADF"
+        );
+    }
+
+    #[test]
+    fn epoll_refuses_the_regular_file_that_poll_reports_always_ready() {
+        // The one place where the three multiplexers disagree about the same
+        // descriptor, and it is not a quirk of this kernel: a regular file
+        // has no `poll` operation on any disk filesystem, so `epoll_ctl`
+        // answers EPERM for every op before it looks at anything else about
+        // the request, while `poll(2)` and `select(2)` are required to report
+        // that same file always ready. A file watched by epoll is the shape
+        // of the mistake this refuses -- the watch would never fire, because
+        // there is nothing to fire it.
+        //
+        // Both halves are asked of ONE descriptor in one process, so that a
+        // change which made epoll accept the file, or poll refuse it, cannot
+        // pass by moving the disagreement somewhere else.
+        let proc = a_process(45_570, "epoll-regular", "epoll_regular");
+        let dir_path = String::from("/epoll_regular");
+        let (watched, polled) = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let lp = sys.linux_process();
+                let fd = a_ready_node(&lp, &dir_path, FileType::File);
+                let epfd = sys.sys_epoll_create1(0).unwrap();
+                let watch = EpollEvent {
+                    events: u32::from(IN_AND_OUT),
+                    data: 0,
+                };
+                let watched = sys.sys_epoll_ctl(
+                    FileDesc::from(epfd),
+                    CTL_ADD,
+                    FileDesc::from(fd),
+                    UserInPtr::from(&watch as *const EpollEvent as usize),
+                );
+                let mut set = alloc::vec![an_entry(fd as i32, IN_AND_OUT)];
+                let polled = poll_them(sys, &mut set, 0).await;
+                (watched, polled)
+            })
+        });
+
+        assert_eq!(
+            watched,
+            Err(LxError::EPERM),
+            "epoll took a watch on a file that has nothing to wake it"
+        );
+        assert_eq!(
+            polled,
+            Ok(1),
+            "poll did not report a regular file always ready"
+        );
+    }
+}

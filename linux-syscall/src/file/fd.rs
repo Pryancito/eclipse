@@ -1248,6 +1248,30 @@ fn dup_target(newfd: usize, nofile: u64) -> Result<FileDesc, LxError> {
     Ok(FileDesc::from(newfd))
 }
 
+/// The descriptors with no file behind them, reached through the syscall:
+/// where each flag word ends up, in what order the arguments are judged, and
+/// what a refusal leaves behind.
+#[cfg(test)]
+mod anon_fd_wiring_tests;
+
+/// One open file description and the descriptors that name it: what a copy
+/// shares, what it gets of its own, and the lock `flock` hangs on the
+/// description rather than on the descriptor.
+#[cfg(test)]
+mod shared_description_tests;
+
+/// `perf_event_open` through the syscall: what it judges before it reads the
+/// attr, how much of the attr it reads, and what of that image reaches the
+/// event.
+#[cfg(test)]
+mod perf_event_wiring_tests;
+
+/// `open` and `openat` through the syscall: the `O_LARGEFILE` the kernel adds
+/// of its own accord, the refusals that have to arrive before anything is
+/// created or emptied, and the mode arriving at the inode through the umask.
+#[cfg(test)]
+mod open_wiring_tests;
+
 #[cfg(test)]
 mod dup_limit_tests {
     //! The three `RLIMIT_NOFILE` checks the dup family did not have. The
