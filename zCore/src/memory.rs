@@ -390,6 +390,13 @@ pub fn heap_wild_blocks() -> u32 {
     0
 }
 
+/// Bytes those refusals leaked (mirrors `memory_x86_64::heap_wild_bytes`).
+/// This build does not check.
+#[allow(dead_code)]
+pub fn heap_wild_bytes() -> usize {
+    0
+}
+
 /// Free blocks found written after their free (mirrors
 /// `memory_x86_64::heap_written_after_free`). This build does not check.
 #[allow(dead_code)]

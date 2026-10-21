@@ -509,11 +509,22 @@ cfg_if! {
         static HEAP_WILD_BLOCKS: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
 
+        /// Bytes those blocks held. Every refusal leaks its block on purpose,
+        /// so this is the part of the heap the guard itself is holding -- and
+        /// at 16 KiB a refusal on a path a desktop takes on every write, it is
+        /// the difference between a diagnosis and the OOM.
+        static HEAP_WILD_BYTES: AtomicUsize = AtomicUsize::new(0);
+
         /// Wild blocks refused so far. Non-zero is a diagnosis, not a warning:
         /// something in this kernel handed the allocator a block that is not
         /// the allocator's.
         pub fn heap_wild_blocks() -> u32 {
             HEAP_WILD_BLOCKS.load(core::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// Bytes leaked by those refusals.
+        pub fn heap_wild_bytes() -> usize {
+            HEAP_WILD_BYTES.load(Ordering::Relaxed)
         }
 
         /// Name the code that handed the allocator a block it must not touch.
@@ -533,8 +544,20 @@ cfg_if! {
         ) {
             use core::sync::atomic::{AtomicU32, Ordering};
             HEAP_WILD_BLOCKS.fetch_add(1, Ordering::Relaxed);
+            HEAP_WILD_BYTES.fetch_add(sz, Ordering::Relaxed);
             static REPORTED: AtomicU32 = AtomicU32::new(0);
             if REPORTED.fetch_add(1, Ordering::Relaxed) >= 8 {
+                return;
+            }
+            // Once a CPU is panicking, this console belongs to the panic. The
+            // other CPUs keep running -- and keep freeing -- for as long as it
+            // takes to print the report, so a refusal on one of them lands on
+            // top of the attribution the panic is writing. That happened: the
+            // OOM report of 2026-10-21 was photographed with the heap
+            // attribution gone and two of these in its place, which cost a
+            // round trip to hardware. The refusal still counts (above) and the
+            // OOM report prints the totals.
+            if crate::lang::any_cpu_panicking() {
                 return;
             }
             emit(format_args!(
@@ -554,6 +577,51 @@ cfg_if! {
                     ""
                 },
             ));
+            // Which side of the fence. "Outside every region" alone cannot
+            // tell a pointer the heap never owned from a sound block whose
+            // `Layout` has stopped matching it, and the two are different
+            // bugs in different crates. Say where the pointer actually sits.
+            if fault == heap_regions::BlockFault::Outside {
+                match heap_regions::region_of(ptr) {
+                    Some((i, start, end)) => emit(format_args!(
+                        "[heap-wild]   ptr IS inside region #{} [{:#x}, {:#x}), but ptr+size \
+                         ({:#x}) runs {:#x} byte(s) past its end: a size that no longer \
+                         matches the allocation, not foreign memory\n",
+                        i,
+                        start,
+                        end,
+                        ptr + sz,
+                        (ptr + sz).saturating_sub(end),
+                    )),
+                    None => {
+                        let (below, above) = heap_regions::neighbours(ptr);
+                        match below {
+                            Some((s, e)) => emit(format_args!(
+                                "[heap-wild]   nearest region below: [{:#x}, {:#x}), ends {:#x} \
+                                 byte(s) before ptr\n",
+                                s,
+                                e,
+                                ptr - e,
+                            )),
+                            None => emit(format_args!(
+                                "[heap-wild]   no registered region lies below ptr\n"
+                            )),
+                        }
+                        match above {
+                            Some((s, e)) => emit(format_args!(
+                                "[heap-wild]   nearest region above: [{:#x}, {:#x}), starts \
+                                 {:#x} byte(s) after ptr\n",
+                                s,
+                                e,
+                                s - ptr,
+                            )),
+                            None => emit(format_args!(
+                                "[heap-wild]   no registered region lies above ptr\n"
+                            )),
+                        }
+                    }
+                }
+            }
             let mut rbp: usize;
             unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
             for _ in 0..24 {
@@ -2342,6 +2410,59 @@ pub mod heap_regions {
         start != 0 && addr >= start && end <= ENDS[i].load(Ordering::SeqCst)
     }
 
+    /// One registered region, as `(start, end)`.
+    pub type Region = (usize, usize);
+
+    /// The region `ptr` STARTS in, ignoring the block's size: `(index,
+    /// start, end)`.
+    ///
+    /// [`contains`] asks the question a free has to answer -- does the whole
+    /// block lie in one region -- and answers "no" the same way for a pointer
+    /// that is nowhere near the heap and for one that is a sound block's
+    /// address with a corrupt size on it. A refusal that cannot tell those
+    /// apart sends the reader hunting for the wrong bug: the first is memory
+    /// the heap never owned, the second is a `Layout` that stopped matching
+    /// its allocation. So the report asks this as well.
+    pub fn region_of(ptr: usize) -> Option<(usize, usize, usize)> {
+        let n = registered();
+        (0..n).find_map(|i| {
+            let start = STARTS[i].load(Ordering::SeqCst);
+            let end = ENDS[i].load(Ordering::SeqCst);
+            (start != 0 && ptr >= start && ptr < end).then_some((i, start, end))
+        })
+    }
+
+    /// The registered regions nearest `ptr` on each side: the one with the
+    /// greatest `end` at or below it, and the one with the smallest `start`
+    /// above it.
+    ///
+    /// What a refusal is missing is a yardstick. "Outside every region" from a
+    /// registry whose regions are a page away from the pointer says the block
+    /// is sound and the registry lost a growth; the same words with the
+    /// nearest region a gigabyte away say the pointer was never the heap's.
+    /// Returned rather than printed so the pure part can be tested on the
+    /// host, where the allocator itself is not compiled at all.
+    pub fn neighbours(ptr: usize) -> (Option<Region>, Option<Region>) {
+        let n = registered();
+        let mut below: Option<Region> = None;
+        let mut above: Option<Region> = None;
+        for i in 0..n {
+            let start = STARTS[i].load(Ordering::SeqCst);
+            let end = ENDS[i].load(Ordering::SeqCst);
+            if start == 0 {
+                continue;
+            }
+            if end <= ptr {
+                if below.is_none_or(|(_, e)| end > e) {
+                    below = Some((start, end));
+                }
+            } else if start > ptr && above.is_none_or(|(s, _)| start < s) {
+                above = Some((start, end));
+            }
+        }
+        (below, above)
+    }
+
     /// Regions on record.
     pub fn registered() -> usize {
         COUNT.load(Ordering::SeqCst).min(MAX_REGIONS)
@@ -2380,6 +2501,29 @@ pub mod heap_regions {
         Some(BlockFault::Outside)
     }
 
+    /// The first [`SNAPSHOT`] regions, in the order they were taken, for a
+    /// reader that wants the map rather than a verdict (`/proc/kheap`).
+    /// Empty slots come back as `(0, 0)`.
+    pub fn snapshot() -> [Region; SNAPSHOT] {
+        let n = registered().min(SNAPSHOT);
+        core::array::from_fn(|i| {
+            if i < n {
+                (
+                    STARTS[i].load(Ordering::SeqCst),
+                    ENDS[i].load(Ordering::SeqCst),
+                )
+            } else {
+                (0, 0)
+            }
+        })
+    }
+
+    /// Regions one [`snapshot`] carries. Enough for the static arena plus the
+    /// growths a 2 GiB heap needs at the usual 32 MiB chunk, which is the
+    /// shape every reading so far has had; a heap that fell back to smaller
+    /// chunks prints the first of them and says how many it did not.
+    pub const SNAPSHOT: usize = 64;
+
     /// Forget every region. Tests only — the heap's regions are never given
     /// back while the kernel runs.
     #[cfg(test)]
@@ -2393,6 +2537,25 @@ pub mod heap_regions {
         UNREGISTERED.store(0, Ordering::SeqCst);
         HINT.store(0, Ordering::SeqCst);
     }
+}
+
+/// Regions the kernel heap owns right now, for `/proc/kheap`.
+#[allow(dead_code)]
+pub fn heap_regions_count() -> usize {
+    heap_regions::registered()
+}
+
+/// Regions the heap owns that did not fit the registry. Non-zero turns every
+/// wild-block verdict into a maybe, so the report says so.
+#[allow(dead_code)]
+pub fn heap_regions_unregistered() -> usize {
+    heap_regions::unregistered()
+}
+
+/// The first regions, in the order they were taken.
+#[allow(dead_code)]
+pub fn heap_regions_list() -> [(usize, usize); heap_regions::SNAPSHOT] {
+    heap_regions::snapshot()
 }
 
 /// Who holds the SMALL blocks.
@@ -3164,6 +3327,84 @@ mod heap_region_tests {
         assert_eq!(
             heap_regions::check(0x1_fff0, 0x40, 8),
             Some(BlockFault::Outside)
+        );
+    }
+
+    /// A refusal that says only "outside every region" reads the same for a
+    /// pointer the heap never owned and for a sound block whose `Layout` has
+    /// stopped matching it. These two are what the report uses to tell them
+    /// apart, and they are the whole reason a second photograph was needed.
+    #[test]
+    fn a_block_that_runs_past_its_region_is_still_inside_it_by_its_pointer() {
+        let _alone = alone();
+        with_arena();
+        // The block starts in the arena; only `ptr + size` leaves it.
+        assert_eq!(
+            heap_regions::check(ARENA + ARENA_LEN - 0x1000, 0x4000, 1),
+            Some(BlockFault::Outside),
+            "the free itself is still refused"
+        );
+        assert_eq!(
+            heap_regions::region_of(ARENA + ARENA_LEN - 0x1000),
+            Some((0, ARENA, ARENA + ARENA_LEN)),
+            "but the pointer is the heap's, which is a different bug"
+        );
+    }
+
+    #[test]
+    fn a_pointer_nowhere_near_the_heap_is_in_no_region() {
+        let _alone = alone();
+        with_arena();
+        assert_eq!(heap_regions::region_of(0xffff_8001_3dd4_0000), None);
+        assert_eq!(heap_regions::region_of(ARENA - 1), None);
+        assert_eq!(
+            heap_regions::region_of(ARENA + ARENA_LEN),
+            None,
+            "one past the end is past the end"
+        );
+    }
+
+    /// The yardstick: how far the nearest region is on each side. A refusal
+    /// whose neighbours are a page away is a registry that lost a growth; one
+    /// whose neighbours are gigabytes away is memory the heap never owned.
+    #[test]
+    fn the_neighbours_of_a_refused_pointer_are_the_nearest_region_each_side() {
+        let _alone = alone();
+        heap_regions::reset();
+        heap_regions::register(0x2000_0000, 0x3000_0000);
+        heap_regions::register(0x1000_0000, 0x1100_0000);
+        heap_regions::register(0x5000_0000, 0x5100_0000);
+        let (below, above) = heap_regions::neighbours(0x1800_0000);
+        assert_eq!(below, Some((0x1000_0000, 0x1100_0000)));
+        assert_eq!(above, Some((0x2000_0000, 0x3000_0000)));
+    }
+
+    #[test]
+    fn a_pointer_below_every_region_has_no_neighbour_below_it() {
+        let _alone = alone();
+        with_arena();
+        let (below, above) = heap_regions::neighbours(ARENA - 0x1000);
+        assert_eq!(below, None);
+        assert_eq!(above, Some((ARENA, ARENA + ARENA_LEN)));
+        let (below, above) = heap_regions::neighbours(ARENA + ARENA_LEN + 0x1000);
+        assert_eq!(below, Some((ARENA, ARENA + ARENA_LEN)));
+        assert_eq!(above, None);
+    }
+
+    /// `/proc/kheap` prints this, and a reader counts regions in it. An empty
+    /// slot must look empty rather than like a region at address zero.
+    #[test]
+    fn the_snapshot_carries_the_regions_in_the_order_they_were_taken() {
+        let _alone = alone();
+        heap_regions::reset();
+        heap_regions::register(ARENA, ARENA + ARENA_LEN);
+        heap_regions::register(0x4000_0000, 0x4200_0000);
+        let snap = heap_regions::snapshot();
+        assert_eq!(snap[0], (ARENA, ARENA + ARENA_LEN));
+        assert_eq!(snap[1], (0x4000_0000, 0x4200_0000));
+        assert!(
+            snap[2..].iter().all(|r| *r == (0, 0)),
+            "unused slots must be empty, not a region at 0"
         );
     }
 

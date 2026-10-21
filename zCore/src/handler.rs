@@ -531,6 +531,53 @@ impl KernelHandler for ZcoreKernelHandler {
         if refused > 0 {
             let _ = writeln!(s, "ReentrancyRefusals: {}", refused);
         }
+        // The elastic heap: how many separate regions the buddy is holding,
+        // and where they are. A `[heap-wild]` refusal is judged against this
+        // list, so a reader chasing one needs to see it -- and seeing it here
+        // costs no crash, which is the whole point of this file. The regions
+        // are printed in the order they were taken: the first is the static
+        // arena in `.bss`, the rest are growths out of physical RAM.
+        let regions = memory::heap_regions_list();
+        let shown = regions.iter().filter(|(s, _)| *s != 0).count();
+        let _ = writeln!(
+            s,
+            "heap regions: {} on record{}",
+            memory::heap_regions_count(),
+            if memory::heap_regions_unregistered() > 0 {
+                " (AND SOME THAT DID NOT FIT: a wild-block verdict is no longer evidence)"
+            } else {
+                ""
+            },
+        );
+        for (i, (start, end)) in regions.iter().enumerate() {
+            if *start == 0 {
+                continue;
+            }
+            let _ = writeln!(
+                s,
+                "  #{:<3} [{:#018x}, {:#018x})  {} MiB",
+                i,
+                start,
+                end,
+                (end - start) >> 20
+            );
+        }
+        if memory::heap_regions_count() > shown {
+            let _ = writeln!(
+                s,
+                "  ({} more not printed)",
+                memory::heap_regions_count() - shown
+            );
+        }
+        let wild = memory::heap_wild_blocks();
+        if wild > 0 {
+            let _ = writeln!(
+                s,
+                "WILD BLOCKS REFUSED AND LEAKED: {} ({} KiB) -- see [heap-wild] in dmesg",
+                wild,
+                memory::heap_wild_bytes() >> 10,
+            );
+        }
         let _ = writeln!(s, "live by size class:");
         for (i, count) in memory::heap_live_histogram().iter().enumerate() {
             if *count > 0 {
