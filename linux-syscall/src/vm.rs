@@ -3920,3 +3920,6 @@ mod brk_chunk_tests {
         assert_eq!(BRK_CHUNK, 1 << 20);
     }
 }
+
+#[cfg(test)]
+mod brk_wiring_tests;
