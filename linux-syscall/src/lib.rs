@@ -192,6 +192,10 @@ mod abi;
 pub mod bsd;
 #[cfg(target_arch = "x86_64")]
 mod cuda_failures;
+/// What each arm of the table hands over, and in what order: the six words
+/// of a call made by number, landing where that handler expects them.
+#[cfg(test)]
+mod dispatch_args_tests;
 #[cfg(test)]
 mod dispatch_tests;
 mod file;

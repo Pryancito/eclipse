@@ -189,6 +189,24 @@ fn getdents64_wants_a_directory_and_copies_out_what_the_walk_found() {
                 "a huge buffer length was taken at its word"
             );
 
+            // And a buffer with no room for even the first entry is EINVAL,
+            // not a short answer: `getdents64`'s `if (!lastdirent) error =
+            // -EINVAL;`. Zero bytes is how the end of a directory is
+            // reported, so answering it here would make `ls` stop on a
+            // buffer it never grew instead of growing it.
+            let fd3 = opened(sys, &dir, O_DIRECTORY);
+            let mut tiny = [0u8; 64];
+            assert_eq!(
+                sys.sys_getdents64(
+                    FileDesc::from(fd3),
+                    UserOutPtr::from(tiny.as_mut_ptr() as usize),
+                    8,
+                ),
+                Err(LxError::EINVAL),
+                "a buffer too small for one entry answered as an empty directory"
+            );
+            assert_eq!(tiny[..8], [0u8; 8], "the refused call copied bytes out");
+
             // A descriptor that is not a directory, and one that is not a
             // descriptor.
             let file = c("/x/one");
@@ -284,6 +302,17 @@ fn a_second_name_is_the_same_file_and_the_flag_word_is_read_first() {
                 Err(LxError::EPERM),
                 "a directory was given a hard link"
             );
+            // And a name that is TAKEN is EEXIST even for a directory, which
+            // the refusal above cannot show: the new name is looked up before
+            // this file's right to a second name is weighed. Without that
+            // order the answer would be the EPERM of `check_link`, and it is
+            // the only way to tell the lookup from the filesystem's own
+            // `EntryExist`, which answers the same thing one call later.
+            assert_eq!(
+                sys.sys_link(UserInPtr::from(at(&dir)), UserInPtr::from(at(&link))),
+                Err(LxError::EEXIST),
+                "the file was weighed before the name was looked up"
+            );
 
             // `AT_EMPTY_PATH` links the file the descriptor is open on, with
             // no path at all.
@@ -350,6 +379,27 @@ fn renameat2_closes_the_directory_trap_before_it_asks_anything() {
             assert_eq!(
                 sys.sys_rename(UserInPtr::from(at(&a)), UserInPtr::from(at(&a_again))),
                 Err(LxError::EINVAL)
+            );
+
+            // And the trap closes BEFORE the filesystem is asked, which the
+            // two shapes above cannot show: ramfs walks up from the
+            // destination itself and answers EINVAL too, so dropping this
+            // check changes no answer there. Name a target that is there and
+            // has something in it and the two part company: the filesystem
+            // gets as far as looking at the target and answers ENOTEMPTY,
+            // while the trap refuses without asking it anything. A
+            // filesystem with no walk of its own -- the point of having the
+            // check here at all -- would have moved the directory.
+            a_file_named(sys.linux_process(), "/x/a/b", "deep", b"kept");
+            let into_b = c("/x/a/b");
+            assert_eq!(
+                sys.sys_rename(UserInPtr::from(at(&a)), UserInPtr::from(at(&into_b))),
+                Err(LxError::EINVAL),
+                "the filesystem was asked, and answered about the target"
+            );
+            assert!(
+                is_there(sys.linux_process(), "/x/a/b/deep"),
+                "something under the target was unlinked on the way"
             );
 
             // The source is resolved before either parent's mode is asked,
