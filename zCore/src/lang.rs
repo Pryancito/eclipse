@@ -1230,6 +1230,7 @@ fn panicking_cpu() -> usize {
 /// the report the panicking CPU is writing -- on a console with one page and
 /// no scrollback, that is the report lost. The counters they keep are printed
 /// by the OOM report itself, so standing down costs nothing.
+#[cfg(any(all(target_arch = "x86_64", not(feature = "libos")), test))]
 pub(crate) fn any_cpu_panicking() -> bool {
     PANICKING_CPUS.load(core::sync::atomic::Ordering::SeqCst) != 0
 }

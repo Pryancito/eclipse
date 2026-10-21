@@ -2410,6 +2410,9 @@ pub mod heap_regions {
         start != 0 && addr >= start && end <= ENDS[i].load(Ordering::SeqCst)
     }
 
+    /// One registered region, as `(start, end)`.
+    pub type Region = (usize, usize);
+
     /// The region `ptr` STARTS in, ignoring the block's size: `(index,
     /// start, end)`.
     ///
@@ -2439,10 +2442,10 @@ pub mod heap_regions {
     /// nearest region a gigabyte away say the pointer was never the heap's.
     /// Returned rather than printed so the pure part can be tested on the
     /// host, where the allocator itself is not compiled at all.
-    pub fn neighbours(ptr: usize) -> (Option<(usize, usize)>, Option<(usize, usize)>) {
+    pub fn neighbours(ptr: usize) -> (Option<Region>, Option<Region>) {
         let n = registered();
-        let mut below: Option<(usize, usize)> = None;
-        let mut above: Option<(usize, usize)> = None;
+        let mut below: Option<Region> = None;
+        let mut above: Option<Region> = None;
         for i in 0..n {
             let start = STARTS[i].load(Ordering::SeqCst);
             let end = ENDS[i].load(Ordering::SeqCst);
@@ -2501,7 +2504,7 @@ pub mod heap_regions {
     /// The first [`SNAPSHOT`] regions, in the order they were taken, for a
     /// reader that wants the map rather than a verdict (`/proc/kheap`).
     /// Empty slots come back as `(0, 0)`.
-    pub fn snapshot() -> [(usize, usize); SNAPSHOT] {
+    pub fn snapshot() -> [Region; SNAPSHOT] {
         let n = registered().min(SNAPSHOT);
         core::array::from_fn(|i| {
             if i < n {
