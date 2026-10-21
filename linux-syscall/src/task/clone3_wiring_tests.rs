@@ -51,6 +51,18 @@ const A_NAMESPACE: u64 = 1 << 28;
 /// argument at all.
 const SETTLS: u64 = 1 << 19;
 
+/// `CLONE_PIDFD`, which is the one flag that makes `clone3` use its own
+/// `pidfd` field instead of the `parent_tid` one.
+const PIDFD: u64 = 1 << 12;
+
+/// An exit signal in the low byte of the flags word, which is where legacy
+/// `clone` carries it and where `clone3` refuses it.
+const A_SIGNAL_IN_THE_FLAGS: u64 = 17;
+
+/// What a slot holds before anything is written to it, so "left alone" cannot
+/// pass for "written".
+const A_SEED: i32 = -0x55;
+
 /// Something that is not zero, for the tail that has to be empty. It goes in
 /// the LAST byte of the tail every time: a tail check that reads one byte, or
 /// any number of bytes short of the whole, passes an empty-looking tail that
@@ -229,6 +241,15 @@ fn the_flags_word_reaches_sys_clone_which_refuses_a_namespace_this_kernel_has_no
         "the decode refuses CLONE_NEWUSER itself, so this proves nothing"
     );
 
+    // And the other direction, because the decode's own refusals have to
+    // arrive as well: an exit signal in the low byte of the flags word is
+    // where legacy `clone` keeps it and `clone3` will not have it, so the
+    // decode answers EINVAL -- and a swallowed error there FORKS.
+    assert_eq!(
+        clone3_to_clone([A_SIGNAL_IN_THE_FLAGS, 0, 0, 0, 0, 0, 0, 0]).err(),
+        Some(LxError::EINVAL)
+    );
+
     let proc = a_process(47_182, "clone3-flags");
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
@@ -237,6 +258,13 @@ fn the_flags_word_reaches_sys_clone_which_refuses_a_namespace_this_kernel_has_no
                 sys.sys_clone3(asking.asked(), CLONE_ARGS_SIZE_VER0).await,
                 Err(LxError::EINVAL),
                 "the flags word did not reach the namespace gate"
+            );
+
+            let mut dirty = Wide::asking(A_SIGNAL_IN_THE_FLAGS);
+            assert_eq!(
+                sys.sys_clone3(dirty.asked(), CLONE_ARGS_SIZE_VER0).await,
+                Err(LxError::EINVAL),
+                "the decode refused the struct and the call forked anyway"
             );
         })
     });
@@ -354,6 +382,66 @@ fn a_clone_args_with_nothing_wrong_forks_and_the_child_is_the_callers() {
                     .await,
                 Ok(pid),
                 "the pid clone3 answered is not a child of the caller"
+            );
+        })
+    });
+}
+
+#[test]
+fn the_pidfd_slot_is_its_own_field_and_the_descriptor_lands_in_it() {
+    // The third difference `clone3` exists for, after the separate exit
+    // signal and the stack given as base plus length: the pidfd gets a field
+    // of its own, where legacy `clone` has to report it through the
+    // `parent_tid` slot. So the decode moves word 1 into the argument legacy
+    // `clone` calls `parent_tid`, and only when `CLONE_PIDFD` is set.
+    //
+    // Which makes this the one test that pins word 1, the `parent_slot`
+    // argument, and the move between them: taking word 3 instead -- the
+    // obvious mistake, since that is the word legacy `clone` would have read
+    // -- is a write to a null pointer, i.e. EFAULT instead of a child.
+    let proc = a_process(47_186, "clone3-pidfd");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            // The slot is built HERE and not outside the closure: a `move`
+            // closure takes a copy of an `i32`, so an address taken outside
+            // names the copy the test can no longer read.
+            let mut slot: i32 = A_SEED;
+            let at = &mut slot as *mut i32 as usize;
+            assert_eq!(
+                clone3_to_clone([PIDFD, at as u64, 0, 0, 0, 0, 0, 0]),
+                Ok(Clone3Args {
+                    flags: PIDFD as usize,
+                    newsp: 0,
+                    parent_slot: at,
+                    tls: 0,
+                    child_tid: 0,
+                }),
+                "the decode does not move the pidfd field into the parent_tid slot"
+            );
+
+            let mut asking = Wide::asking(PIDFD);
+            asking.args[1] = at as u64;
+            let pid = sys
+                .sys_clone3(asking.asked(), CLONE_ARGS_SIZE_VER0)
+                .await
+                .expect("a clone3 asking for a pidfd did not fork");
+
+            // Seeded negative, so "never written" cannot pass for a
+            // descriptor, and closable, so a number that is not one cannot
+            // pass either.
+            let fd = slot;
+            assert_ne!(fd, A_SEED, "nothing was written to the pidfd slot");
+            assert!(fd >= 0, "the pidfd slot got {} and not a descriptor", fd);
+            assert_eq!(
+                sys.sys_close((fd as usize).into()),
+                Ok(0),
+                "the number in the pidfd slot names no open file"
+            );
+
+            assert_eq!(
+                sys.sys_wait4(pid as i32, UserOutPtr::from(0), 0, UserOutPtr::from(0))
+                    .await,
+                Ok(pid)
             );
         })
     });
