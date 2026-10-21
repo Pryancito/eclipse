@@ -23,6 +23,9 @@ mod comm_tests;
 mod cwd_tests;
 /// `/proc/<pid>/limits`, in its own file for the same reason.
 mod limits;
+pub(crate) mod owner;
+#[cfg(test)]
+mod owner_tests;
 /// `/proc/present`, in its own file: `procfs.rs` sits on the size ratchet.
 mod present;
 #[cfg(test)]
@@ -906,24 +909,27 @@ impl INode for ProcPidDirINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        Ok(Metadata {
-            dev: 0,
-            inode: pid_inode(self.pid, 0),
-            size: 0,
-            blk_size: BLOCK_SIZE,
-            blocks: 0,
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
-            type_: FileType::Dir,
-            mode: 0o555,
-            // `.`, the name in `/proc`, and the `..` of `fd`, `fdinfo` and
-            // `task`.
-            nlinks: 5,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-        })
+        Ok(owner::of_pid(
+            self.pid,
+            Metadata {
+                dev: 0,
+                inode: pid_inode(self.pid, 0),
+                size: 0,
+                blk_size: BLOCK_SIZE,
+                blocks: 0,
+                atime: Timespec { sec: 0, nsec: 0 },
+                mtime: Timespec { sec: 0, nsec: 0 },
+                ctime: Timespec { sec: 0, nsec: 0 },
+                type_: FileType::Dir,
+                mode: 0o555,
+                // `.`, the name in `/proc`, and the `..` of `fd`, `fdinfo` and
+                // `task`.
+                nlinks: 5,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+            },
+        ))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -1109,9 +1115,9 @@ impl INode for ProcPidTaskDirINode {
         // which is both impossible and below the `CHECK_LE(3, nlink)` every
         // reader of this directory makes.
         let threads = self.tids().len().max(1);
-        Ok(dir_metadata(
-            pid_inode(self.pid, PID_TASK_DIR_SLOT),
-            threads,
+        Ok(owner::of_pid(
+            self.pid,
+            dir_metadata(pid_inode(self.pid, PID_TASK_DIR_SLOT), threads),
         ))
     }
 
@@ -1203,8 +1209,8 @@ impl INode for ProcTidDirINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        self.alive()?;
-        Ok(dir_metadata(tid_inode(self.tid, 0), 0))
+        let (proc, _) = tid_task(self.pid, self.tid)?;
+        Ok(owner::of(&proc, dir_metadata(tid_inode(self.tid, 0), 0)))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -1308,8 +1314,9 @@ impl INode for ProcTidFileINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        tid_task(self.pid, self.tid)?;
-        Ok(file_metadata(tid_inode(self.tid, self.kind.slot()), 0o444))
+        let (proc, _) = tid_task(self.pid, self.tid)?;
+        let metadata = file_metadata(tid_inode(self.tid, self.kind.slot()), 0o444);
+        Ok(owner::of(&proc, metadata))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -1432,8 +1439,11 @@ impl INode for ProcTidCommINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        tid_task(self.pid, self.tid)?;
-        Ok(file_metadata(tid_inode(self.tid, 1), 0o644))
+        let (proc, _) = tid_task(self.pid, self.tid)?;
+        Ok(owner::of(
+            &proc,
+            file_metadata(tid_inode(self.tid, 1), 0o644),
+        ))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -2651,12 +2661,14 @@ impl INode for ProcPidFileINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
+        let proc = crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
         let mode = match self.kind {
             ProcPidFileKind::Comm => 0o644,
+            ProcPidFileKind::Environ => 0o400,
             _ => 0o444,
         };
-        Ok(file_metadata(pid_inode(self.pid, self.kind.slot()), mode))
+        let metadata = file_metadata(pid_inode(self.pid, self.kind.slot()), mode);
+        Ok(owner::of(&proc, metadata))
     }
 
     fn as_any_ref(&self) -> &dyn Any {

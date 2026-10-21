@@ -148,7 +148,7 @@ pub use eclipsefs_ioctl::{
     eclipsefs_seek, eclipsefs_xattr, FsIoctlContext, XattrReply, XattrRequest, EFS_IOC_RECEIVE,
 };
 pub use epoll::{Epoll, EpollEvent};
-pub use proc_self::FdObject;
+pub use proc_self::{fd_permission, FdObject};
 
 /// If `f` is a DRM-related fd (a /dev/dri device File, a PRIME dma-buf, or
 /// an exported syncobj), return a short description for diagnostics; None

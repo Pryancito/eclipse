@@ -629,7 +629,8 @@ impl Syscall<'_> {
                 // `inode_permission`.
                 open_resolved_type(flags, metadata.type_)?;
                 if flags.readable() {
-                    proc.check_access(&metadata, 0o4, true)?;
+                    let verdict = proc.check_access(&metadata, 0o4, true);
+                    linux_object::fs::fd_permission(verdict, &inode, self.zircon_process())?;
                 }
                 if flags.writable() {
                     proc.check_access(&metadata, 0o2, true)?;

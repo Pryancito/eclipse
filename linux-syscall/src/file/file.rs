@@ -2731,7 +2731,8 @@ impl Syscall<'_> {
         let metadata = inode.metadata()?;
         let requested = Self::access_mode(mode)?;
         let use_effective = flags.contains(AtFlags::EACCESS);
-        proc.check_access(&metadata, requested, use_effective)?;
+        let verdict = proc.check_access(&metadata, requested, use_effective);
+        linux_object::fs::fd_permission(verdict, &inode, self.zircon_process())?;
         Ok(0)
     }
 
