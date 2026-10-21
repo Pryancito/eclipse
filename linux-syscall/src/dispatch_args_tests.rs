@@ -745,6 +745,14 @@ fn the_three_group_ids_are_three_different_numbers() {
                 53,
                 "setfsgid did not answer the filesystem group it replaced"
             );
+            // Asked again, so that the 59 above is one it KEPT and not just
+            // one it read: the answer to the second call is the first call's
+            // argument.
+            assert_eq!(
+                by_number(sys, Sys::SETFSGID, [61, 0, 0, 0, 0, 0]).await,
+                59,
+                "the filesystem group the call before set is not the one it replaced"
+            );
         })
     });
 }
