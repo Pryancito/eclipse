@@ -358,7 +358,9 @@ fn waitid_through_a_pidfd_refuses_one_that_is_not_my_child() {
 fn waitid_refuses_an_unknown_idtype_and_wnowait_leaves_the_child_waitable() {
     let parent = a_process(48_305);
     let pid = a_zombie_child(&parent, 11);
-    let (unknown, for_nothing, not_interested, peeked, reaped, after) =
+    let alive = a_live_child(&parent);
+    let alive_pid = alive.id();
+    let (unknown, for_nothing, not_interested, not_ready, peeked, reaped, after) =
         on_a_thread(&parent, move |sys| {
             Box::pin(async move {
                 let mut info = a_stale_report();
@@ -381,6 +383,12 @@ fn waitid_refuses_an_unknown_idtype_and_wnowait_leaves_the_child_waitable() {
                     0,
                 )
                 .await;
+                // A child of mine that has not changed state: WNOHANG is
+                // success with no child, and si_pid says which it was.
+                let not_ready = (
+                    waitid(sys, P_PID, alive_pid as usize, ip, WEXITED | WNOHANG, 0).await,
+                    word(&info, SI_PID),
+                );
                 let mut peeked = Vec::new();
                 for _ in 0..2 {
                     let r = waitid(sys, P_PID, pid as usize, ip, WEXITED | WNOWAIT, 0).await;
@@ -388,7 +396,15 @@ fn waitid_refuses_an_unknown_idtype_and_wnowait_leaves_the_child_waitable() {
                 }
                 let reaped = waitid(sys, P_PID, pid as usize, ip, WEXITED, 0).await;
                 let after = waitid(sys, P_PID, pid as usize, ip, WEXITED | WNOHANG, 0).await;
-                (unknown, for_nothing, not_interested, peeked, reaped, after)
+                (
+                    unknown,
+                    for_nothing,
+                    not_interested,
+                    not_ready,
+                    peeked,
+                    reaped,
+                    after,
+                )
             })
         });
     assert_eq!(unknown, [EINVAL; 4], "4, 5, 99 and -1 are no idtype");
@@ -401,12 +417,18 @@ fn waitid_refuses_an_unknown_idtype_and_wnowait_leaves_the_child_waitable() {
         "a wait for stops and continues alone does not see a child that exited"
     );
     assert_eq!(
+        not_ready,
+        (0, 0),
+        "a live child of mine is success with no child, and infop is zeroed"
+    );
+    assert_eq!(
         peeked,
         [(0, 11), (0, 11)],
         "WNOWAIT reported the same child twice without collecting it"
     );
     assert_eq!(reaped, 0, "and a call without the bit collects it");
     assert_eq!(after, ECHILD, "once, and only once");
+    alive.exit(0);
     parent.exit(0);
 }
 
