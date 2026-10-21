@@ -3947,3 +3947,6 @@ mod vfs_ioctl_tests;
 
 #[cfg(test)]
 mod record_lock_wiring_tests;
+
+#[cfg(test)]
+mod fcntl_families_tests;
