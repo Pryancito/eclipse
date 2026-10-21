@@ -15,10 +15,10 @@
 //! the second.
 //!
 //! The second is the **extensible struct**: a size past the 56 bytes this
-//! kernel knows is accepted only if everything past them is zero, and
-//! `E2BIG` otherwise. That is how a kernel refuses a struct a newer
-//! userspace filled in, instead of silently ignoring the half it does not
-//! know.
+//! kernel knows (version 1, with the two util clamps) is accepted only if
+//! everything past them is zero, and `E2BIG` otherwise. That is how an old
+//! kernel refuses a struct a new userspace filled in, instead of silently
+//! ignoring the half it does not know.
 //!
 //! The third is that **`SCHED_FLAG_RESET_ON_FORK` lives in `sched_flags`
 //! here**, while the very same bit reaches `sched_setscheduler` inside the
@@ -53,9 +53,9 @@ fn a_process(pid: KoID, name: &str) -> Arc<Process> {
         .unwrap()
 }
 
-/// A `struct sched_attr` with room past the version this kernel knows,
-/// which is what an extensible struct needs to be asked about at all.
-/// `#[repr(C)]` so the tail really does start at byte 56.
+/// A `struct sched_attr` with room past version 0, which is what an
+/// extensible struct needs to be asked about at all. `#[repr(C)]` so the
+/// tail really does start at byte 56, right after the version 1 struct.
 #[repr(C)]
 struct Wide {
     attr: SchedAttr,
@@ -399,16 +399,13 @@ fn keep_policy_takes_the_threads_own_class_and_its_own_reset_on_fork() {
 }
 
 #[test]
-fn getattr_answers_with_its_own_version_and_zeroes_what_it_has_nothing_for() {
+fn getattr_answers_its_own_size_zeros_for_what_it_lacks_and_no_more() {
     // What a caller reads out of its buffer, field by field: the size is
-    // the kernel's own version and not the one the caller asked with, the
-    // three deadline fields are zero because this scheduler has no
-    // deadline class, the two util clamps are zero because it has no
-    // clamps either, and the part of a bigger buffer the kernel has
-    // nothing to put in comes back zeroed and not untouched, which is what
-    // `copy_struct_to_user` does: a caller reads the whole `size` it was
-    // answered with, so the bytes beyond this version have to mean
-    // something, and zero is "nothing here".
+    // the kernel's own version (56 bytes, version 1) and not the one the
+    // caller asked with, the three deadline fields and the two clamps are
+    // zero because this scheduler has neither, and the part of a bigger
+    // buffer this kernel has nothing for is zeroed up to the size the
+    // caller gave (`copy_struct_to_user`), and not one byte past it.
     let proc = a_process(47_157, "attr-answer");
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
@@ -439,8 +436,14 @@ fn getattr_answers_with_its_own_version_and_zeroes_what_it_has_nothing_for() {
                 "a scheduler with no util clamps reported clamp numbers"
             );
             assert_eq!(
-                got.tail, [0; 16],
-                "sched_getattr left the rest of a bigger buffer as it was"
+                got.tail[..8],
+                [0; 8],
+                "the part of the buffer past this kernel's struct was not zeroed"
+            );
+            assert_eq!(
+                got.tail[8..],
+                [A_SEED; 8],
+                "sched_getattr wrote past the size it was given"
             );
         })
     });

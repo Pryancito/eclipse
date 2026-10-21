@@ -19,6 +19,7 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use hashbrown::HashMap;
 use lock::Mutex;
@@ -47,6 +48,10 @@ struct Entry {
     /// the wrong root.
     root: Arc<dyn INode>,
     name: Option<String>,
+    /// The directories on the way that not everybody may search, asked
+    /// again for whoever looks the path up: the walk that put it in asked
+    /// them for someone else.
+    gates: Vec<Arc<dyn INode>>,
 }
 
 struct Inner {
@@ -91,8 +96,20 @@ pub fn get(root: &Arc<dyn INode>, path: &str, walked: &mut Walked) -> Option<Arc
     if !Arc::ptr_eq(&entry.root, root) {
         return None;
     }
-    walked.set(entry.name.as_deref().unwrap_or(path));
-    Some(entry.inode.clone())
+    let inode = entry.inode.clone();
+    if entry.gates.is_empty() {
+        walked.set(entry.name.as_deref().unwrap_or(path));
+        return Some(inode);
+    }
+    // Asked with the cache let go: a file system's `metadata` takes its own
+    // locks. A gate that refuses is the walk's to report, where it stops.
+    let (name, gates) = (entry.name.clone(), entry.gates.clone());
+    drop(c);
+    for gate in &gates {
+        walked.may_look_in(gate, &gate.metadata().ok()?).ok()?;
+    }
+    walked.set(name.as_deref().unwrap_or(path));
+    Some(inode)
 }
 
 /// Keeps what `path` leads to from `root`, and `walked`, where the walk to
@@ -120,6 +137,7 @@ pub fn put(root: &Arc<dyn INode>, path: &str, inode: &Arc<dyn INode>, walked: &W
             inode: inode.clone(),
             root: root.clone(),
             name,
+            gates: walked.gates.clone(),
         },
     );
 }

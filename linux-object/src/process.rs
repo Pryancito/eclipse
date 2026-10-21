@@ -162,7 +162,7 @@ pub const SUID_DUMP_DISABLE: u8 = 0;
 /// See [`SUID_DUMP_DISABLE`].
 pub const SUID_DUMP_USER: u8 = 1;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Credentials {
     pub ruid: u32,
     pub euid: u32,
@@ -1440,6 +1440,8 @@ struct LinuxProcessInner {
     mapped_brk: usize,
     /// Process credentials.
     credentials: Credentials,
+    /// What a path walk asks each directory, made for these credentials.
+    searches: crate::fs::Searches,
     /// System-call personality (Linux vs FreeBSD). Set by the loader from the
     /// ELF header and inherited across `fork`; re-evaluated at `execve`.
     abi: Abi,
@@ -2881,6 +2883,13 @@ impl LinuxProcess {
     /// Get a snapshot of current credentials.
     pub fn credentials(&self) -> Credentials {
         self.inner.lock().credentials.clone()
+    }
+
+    /// What a walk by this process asks each directory on its way, by its
+    /// effective or its real ids: [`crate::fs::Searches::ask_as`].
+    pub(crate) fn search_as(&self, use_effective: bool) -> Option<rcore_fs::vfs::Search> {
+        let inner = &mut *self.inner.lock();
+        inner.searches.ask_as(&inner.credentials, use_effective)
     }
 
     /// Get real uid.
@@ -4585,6 +4594,7 @@ impl LinuxProcessInner {
             limits: self.limits,
             signal_actions: self.signal_actions.clone(),
             credentials: self.credentials.clone(),
+            searches: Default::default(),
             pgid,
             sid,
             // fork(2)/prctl(2) inheritance: no_new_privs, dumpable, the

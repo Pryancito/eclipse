@@ -2736,14 +2736,20 @@ impl Syscall<'_> {
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
         // `AT_EMPTY_PATH` names the file `dirfd` is open on (`do_faccessat`
         // takes `LOOKUP_EMPTY`); without it an empty path is `ENOENT`.
+        let use_effective = flags.contains(AtFlags::EACCESS);
+        // The walk too is the real user's, unless `AT_EACCESS` says otherwise.
+        let walker = if use_effective {
+            Walker::Caller
+        } else {
+            Walker::RealIds
+        };
         let inode = if flags.contains(AtFlags::EMPTY_PATH) && path.is_empty() {
             super::dir::inode_of_dirfd(proc, dirfd)?
         } else {
-            proc.lookup_inode_at(dirfd, path, follow)?
+            proc.lookup_inode_at_by(dirfd, path, follow, walker)?
         };
         let metadata = inode.metadata()?;
         let requested = Self::access_mode(mode)?;
-        let use_effective = flags.contains(AtFlags::EACCESS);
         let verdict = proc.check_access(&metadata, requested, use_effective);
         linux_object::fs::fd_permission(verdict, &inode, self.zircon_process())?;
         Ok(0)
@@ -2755,7 +2761,7 @@ impl Syscall<'_> {
         let inode = proc.get_file(fd)?.inode();
         let mut metadata = inode.metadata()?;
         proc.chmod_metadata(&mut metadata, mode as u16)?;
-        inode.set_metadata(&metadata)?;
+        set_mode(&inode, &metadata)?;
         Ok(0)
     }
 
@@ -2780,7 +2786,7 @@ impl Syscall<'_> {
         };
         let mut metadata = inode.metadata()?;
         proc.chmod_metadata(&mut metadata, mode as u16)?;
-        inode.set_metadata(&metadata)?;
+        set_mode(&inode, &metadata)?;
         Ok(0)
     }
 

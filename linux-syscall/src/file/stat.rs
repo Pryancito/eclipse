@@ -556,6 +556,8 @@ mod opened_path_tests;
 mod proc_link_stat_tests;
 #[cfg(test)]
 mod proc_owner_tests;
+#[cfg(test)]
+mod search_tests;
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod abi_tests {
