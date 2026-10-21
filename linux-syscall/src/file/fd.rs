@@ -1260,6 +1260,12 @@ mod anon_fd_wiring_tests;
 #[cfg(test)]
 mod shared_description_tests;
 
+/// `perf_event_open` through the syscall: what it judges before it reads the
+/// attr, how much of the attr it reads, and what of that image reaches the
+/// event.
+#[cfg(test)]
+mod perf_event_wiring_tests;
+
 /// `open` and `openat` through the syscall: the `O_LARGEFILE` the kernel adds
 /// of its own accord, the refusals that have to arrive before anything is
 /// created or emptied, and the mode arriving at the inode through the umask.
