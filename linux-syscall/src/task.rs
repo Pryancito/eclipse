@@ -3063,6 +3063,13 @@ mod prctl_arg_tests;
 #[cfg(test)]
 mod credential_wiring_tests;
 
+/// The priority and scheduling-policy syscalls through the syscall. What
+/// only this can see is `getpriority`'s `20 - nice` encoding and that
+/// `SCHED_RESET_ON_FORK` rides inside the policy argument, so both setter
+/// and getter have to move it.
+#[cfg(test)]
+mod priority_wiring_tests;
+
 #[cfg(test)]
 mod comm_from_path_tests {
     //! `comm` after an `execve`: the last component of the path, which is
