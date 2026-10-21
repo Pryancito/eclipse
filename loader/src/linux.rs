@@ -228,6 +228,7 @@ fn spawn(
         syscall_entry: kernel_hal::context::syscall_entry as *const () as usize,
         stack_pages: USER_STACK_PAGES,
         root_inode: root_inode.clone(),
+        interp_lookup: None,
         // A process the kernel starts itself was asked for by nobody, so
         // there is no less-privileged caller whose environment it has to
         // distrust: `AT_SECURE` is 0 and the four ids are the ones the

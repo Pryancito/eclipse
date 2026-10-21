@@ -28,6 +28,7 @@
 //! | a `#!` line with no interpreter on it     | `ENOEXEC` |
 //! | an interpreter that is not a regular file | `EACCES`  |
 //! | an interpreter the caller may not execute | `EACCES`  |
+//! | an interpreter in a directory the caller may not search | `EACCES` |
 //! | a sixth `#!` script in one chain          | `ELOOP`   |
 //! | `PT_INTERP` not NUL-terminated, or empty  | `ENOEXEC` |
 //! | `PT_INTERP` naming nothing                | `ENOENT`  |
@@ -238,12 +239,9 @@ impl LinuxElfLoader {
             }
             // `load_script`: "No interpreter name found".
             let interp = shebang_interp(head).ok_or(LxError::ENOEXEC)?;
-            let next = self
-                .root_inode
-                .lookup_follow(interp.trim_start_matches('/'), INTERP_FOLLOW)
-                .inspect_err(|e| {
-                    warn!("execve: interpreter {:?} does not resolve: {:?}", interp, e);
-                })?;
+            let next = self.lookup_interp(interp).inspect_err(|e| {
+                warn!("execve: interpreter {:?} does not resolve: {:?}", interp, e);
+            })?;
             opened_for_exec(&next, creds)?;
             file = next;
         }
@@ -288,12 +286,9 @@ impl LinuxElfLoader {
             Ok(interp) if !interp.is_empty() => interp,
             _ => return Err(LxError::ENOENT),
         };
-        let file = self
-            .root_inode
-            .lookup_follow(interp.trim_start_matches('/'), INTERP_FOLLOW)
-            .inspect_err(|e| {
-                warn!("execve: PT_INTERP {:?} does not resolve: {:?}", interp, e);
-            })?;
+        let file = self.lookup_interp(interp).inspect_err(|e| {
+            warn!("execve: PT_INTERP {:?} does not resolve: {:?}", interp, e);
+        })?;
         opened_for_exec(&file, creds)?;
         let mut head = [0u8; EHDR_SIZE];
         if read_full(&file, 0, &mut head)? != EHDR_SIZE {
@@ -417,6 +412,7 @@ mod tests {
                 syscall_entry: 0,
                 stack_pages: 1,
                 root_inode: self.root.clone(),
+                interp_lookup: None,
                 identity: Default::default(),
             }
             .preflight(&image, creds)
@@ -469,9 +465,50 @@ mod tests {
             syscall_entry: 0,
             stack_pages: 1,
             root_inode: fs.root.clone(),
+            interp_lookup: None,
             identity: Default::default(),
         };
         assert_eq!(loader.preflight(&image, &Credentials::default()), Ok(()));
+    }
+
+    /// Every interpreter is looked up by the lookup the loader was given, a
+    /// `#!` one and a `PT_INTERP` alike, with its path as written: the
+    /// process's lookup is the one that knows the working directory a
+    /// relative path starts at and whom to ask for search permission, and
+    /// its refusal is the `execve`'s. Without one it is the root, asking
+    /// nothing.
+    #[test]
+    fn every_interpreter_is_looked_up_by_the_lookup_the_loader_was_given() {
+        let fs = Fs::new();
+        fs.file("script", b"#!as-interp\n");
+        fs.file("dynamic", &dynamic("as-interp"));
+        let exec_with = |name: &str, lookup: Option<InterpLookup>| {
+            LinuxElfLoader {
+                syscall_entry: 0,
+                stack_pages: 1,
+                root_inode: fs.root.clone(),
+                interp_lookup: lookup,
+                identity: Default::default(),
+            }
+            .preflight(&fs.root.lookup(name).unwrap(), &Credentials::default())
+        };
+        let refusing: InterpLookup = Arc::new(|path: &str| {
+            assert_eq!(path, "as-interp", "the path reaches the lookup as written");
+            Err(LxError::EACCES)
+        });
+        assert_eq!(
+            exec_with("script", Some(refusing.clone())),
+            Err(LxError::EACCES)
+        );
+        assert_eq!(exec_with("dynamic", Some(refusing)), Err(LxError::EACCES));
+
+        let ld = fs.root.lookup("ld.so").unwrap();
+        let finding: InterpLookup = Arc::new(move |_: &str| Ok(ld.clone()));
+        assert_eq!(exec_with("script", Some(finding.clone())), Ok(()));
+        assert_eq!(exec_with("dynamic", Some(finding)), Ok(()));
+
+        assert_eq!(exec_with("script", None), Err(LxError::ENOENT));
+        assert_eq!(exec_with("dynamic", None), Err(LxError::ENOENT));
     }
 
     #[test]
@@ -908,6 +945,7 @@ mod tests {
             syscall_entry: 0,
             stack_pages: 1,
             root_inode: fs.root.clone(),
+            interp_lookup: None,
             identity: Default::default(),
         };
 
