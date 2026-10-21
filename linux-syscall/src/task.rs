@@ -3089,6 +3089,13 @@ mod robust_list_wiring_tests;
 #[cfg(test)]
 mod prctl_wiring_tests;
 
+/// `sched_setattr` and `sched_getattr` through the syscall: the two
+/// errnos the same size question gets, the tail an extensible struct has
+/// to leave empty, and the reset-on-fork bit that rides in `sched_flags`
+/// here and inside the policy word there.
+#[cfg(test)]
+mod sched_attr_wiring_tests;
+
 #[cfg(test)]
 mod comm_from_path_tests {
     //! `comm` after an `execve`: the last component of the path, which is
