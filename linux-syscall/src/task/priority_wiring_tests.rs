@@ -382,17 +382,24 @@ fn sched_rr_get_interval_is_zero_for_everything_but_round_robin() {
 }
 
 #[test]
-fn getpriority_answers_the_most_favoured_of_the_set_and_not_the_least() {
+fn getpriority_answers_the_most_favoured_of_the_group_whichever_task_that_is() {
     // Over a set of tasks `getpriority` is a MAXIMUM, and that is only
     // visible with two tasks that differ: every other test here asks
     // about a single target, where the maximum and the minimum are the
-    // same number. Because the encoding runs backwards, a minimum would
-    // report the LEAST favoured task of the group, which is the opposite
-    // of what the call promises -- and `renice -g` reads the answer back
-    // to decide what to ask for next.
+    // same number. Because the encoding runs backwards, a minimum reports
+    // the LEAST favoured task of the group, the opposite of what the call
+    // promises -- and `renice -g` reads the answer back to decide what to
+    // ask for next.
     //
-    // The set is a process group: the process is born with pgid 0, so
-    // `effective_pgid` answers its own pid, which nothing else in this
+    // Asked twice, with the two tasks swapped, and each round renices the
+    // whole group and asks again. Both halves are needed and neither is
+    // padding: whichever task happens to be first in the group, one round
+    // has the favoured one second, so a kernel answering "the first task"
+    // rather than "the best" is caught, and so is one whose group renice
+    // stops after the first task.
+    //
+    // The set is a process group because the process is born with pgid 0,
+    // so `effective_pgid` answers its own pid, which nothing else in this
     // binary has.
     let proc = a_process(47_108, "prio-most-favoured");
     let sibling = Thread::create_linux(&proc).unwrap();
@@ -404,30 +411,27 @@ fn getpriority_answers_the_most_favoured_of_the_set_and_not_the_least() {
                 2,
                 "the group under test does not have two tasks in it"
             );
+            let other = sibling.id() as usize;
 
-            // Root, so moving either way is allowed at all. 20 - 10 = 10
-            // for the one that gave way, 20 - -5 = 25 for the favoured
-            // one.
-            assert_eq!(sys.sys_setpriority(PRIO_PROCESS, 0, 10), Ok(0));
-            assert_eq!(
-                sys.sys_setpriority(PRIO_PROCESS, sibling.id() as usize, -5),
-                Ok(0)
-            );
-            assert_eq!(
-                sys.sys_getpriority(PRIO_PGRP, 0),
-                Ok(25),
-                "getpriority reported the least favoured task of the group"
-            );
+            // Root, so moving either way is allowed at all. 20 - -5 = 25
+            // for the favoured task against 20 - 10 = 10 for the one that
+            // gave way, and 20 - 7 = 13 once the group is levelled.
+            for (own, theirs) in [(-5, 10), (10, -5)] {
+                assert_eq!(sys.sys_setpriority(PRIO_PROCESS, 0, own), Ok(0));
+                assert_eq!(sys.sys_setpriority(PRIO_PROCESS, other, theirs), Ok(0));
+                assert_eq!(
+                    sys.sys_getpriority(PRIO_PGRP, 0),
+                    Ok(25),
+                    "getpriority missed the favoured task of the group"
+                );
 
-            // And the group walk really is a walk: renicing the group has
-            // to move the sibling too, or the favoured 25 would still be
-            // there to be read.
-            assert_eq!(sys.sys_setpriority(PRIO_PGRP, 0, 7), Ok(0));
-            assert_eq!(
-                sys.sys_getpriority(PRIO_PGRP, 0),
-                Ok(13),
-                "setpriority over a group left a task where it was"
-            );
+                assert_eq!(sys.sys_setpriority(PRIO_PGRP, 0, 7), Ok(0));
+                assert_eq!(
+                    sys.sys_getpriority(PRIO_PGRP, 0),
+                    Ok(13),
+                    "setpriority over a group left a task where it was"
+                );
+            }
         })
     });
 }
