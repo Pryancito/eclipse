@@ -1607,3 +1607,91 @@ mod win_size_layout_tests {
         assert_eq!(offset_of!(ConsoleWinSize, ws_ypixel) + 2, 8);
     }
 }
+
+/// The row a one-page emergency console moves to after `cur_y`.
+///
+/// The early framebuffer console has no scrollback and no shadow buffer, and
+/// when its cursor reached the bottom it used to CLEAR THE WHOLE SCREEN and
+/// start again at the top. On a report longer than one page that is not a
+/// scroll, it is an erase: what survives is whatever happened to be printed
+/// after the last wipe, and how much that is depends only on where the report
+/// happened to cross the bottom row. Two photographed kernel OOMs showed
+/// exactly that — the panic banner and the backtrace alone on an otherwise
+/// blank screen, with none of the heap attribution that had been emitted to
+/// this very console immediately before them, which is the half of the report
+/// that names what ate the heap.
+///
+/// Wrapping instead keeps a whole page: the caller clears the single row it is
+/// about to write, so the oldest line goes, not all of them.
+///
+/// It lives here, and not beside its one caller, because that caller is in
+/// `bare/arch/x86_64/early_fb_console.rs` behind `#[cfg(feature = "graphic")]`
+/// and no `cargo test` in this tree compiles a line of that file.
+pub fn next_console_row(cur_y: u32, max_rows: u32) -> u32 {
+    // A console with no rows has no row to move to, and `% 0` would be a
+    // division by zero: the framebuffer geometry is read from atomics that are
+    // zero until `prime`, and the panic path does not get to pick when it runs.
+    if max_rows == 0 {
+        return 0;
+    }
+    let next = cur_y.saturating_add(1);
+    if next >= max_rows {
+        0
+    } else {
+        next
+    }
+}
+
+#[cfg(test)]
+mod next_console_row_tests {
+    use super::next_console_row;
+
+    #[test]
+    fn it_advances_one_row_inside_the_screen() {
+        assert_eq!(next_console_row(0, 40), 1);
+        assert_eq!(next_console_row(38, 40), 39);
+    }
+
+    #[test]
+    fn the_bottom_row_wraps_to_the_top_instead_of_wiping_the_screen() {
+        assert_eq!(next_console_row(39, 40), 0);
+    }
+
+    /// A page of output lands on a page of rows: every row is written exactly
+    /// once before any is written twice. That is the property the old
+    /// clear-on-full did not have — it gave back a screen holding anywhere
+    /// from one line to a full page, depending on where the report crossed the
+    /// bottom.
+    #[test]
+    fn a_full_page_of_lines_visits_every_row_once() {
+        let rows = 40u32;
+        let mut y = 0u32;
+        let mut seen = vec![0usize; rows as usize];
+        seen[0] += 1;
+        for _ in 1..rows {
+            y = next_console_row(y, rows);
+            seen[y as usize] += 1;
+        }
+        assert!(seen.iter().all(|n| *n == 1), "{:?}", seen);
+        // And the next line lands back on the top row, overwriting the oldest.
+        assert_eq!(next_console_row(y, rows), 0);
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_comes_back_to_the_top() {
+        // Geometry can change under the console (a mode set, a panic between
+        // `prime` and `latch`), leaving the cursor outside the new screen.
+        assert_eq!(next_console_row(999, 40), 0);
+    }
+
+    #[test]
+    fn a_screen_with_no_rows_answers_zero_rather_than_dividing_by_it() {
+        assert_eq!(next_console_row(0, 0), 0);
+        assert_eq!(next_console_row(7, 0), 0);
+    }
+
+    #[test]
+    fn the_last_row_of_a_one_row_screen_is_the_first_one() {
+        assert_eq!(next_console_row(0, 1), 0);
+    }
+}

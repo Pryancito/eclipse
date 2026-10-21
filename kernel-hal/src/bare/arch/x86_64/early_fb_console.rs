@@ -190,15 +190,47 @@ fn stroke_rect(x: u32, y: u32, w: u32, h: u32, thickness: u32, argb: u32) {
     }
 }
 
+/// Clear one text row to black, so the line about to be written there does not
+/// show the tail of the line this console wrote a page ago.
+///
+/// Cheap on purpose: one row of pixels, written straight to the framebuffer
+/// with no reads. Scrolling properly would mean reading the framebuffer back —
+/// seconds of uncached reads on a real GOP framebuffer, from a path that only
+/// ever runs on a machine that is already dying.
+fn clear_row(row: u32) {
+    let base = FB_BASE.load(Ordering::SeqCst);
+    let w = FB_WIDTH.load(Ordering::SeqCst) as usize;
+    let h = FB_HEIGHT.load(Ordering::SeqCst) as usize;
+    let stride = FB_STRIDE_PIXELS.load(Ordering::SeqCst) as usize;
+    if base == 0 || w == 0 || h == 0 {
+        return;
+    }
+    let y0 = (row * CHAR_H) as usize;
+    let y1 = (y0 + CHAR_H as usize).min(h);
+    let fb_ptr = base as *mut u32;
+    for y in y0..y1 {
+        #[allow(unsafe_code)]
+        unsafe {
+            for x in 0..w {
+                core::ptr::write_volatile(fb_ptr.add(y * stride + x), 0xFF00_0000);
+            }
+        }
+    }
+}
+
 fn newline() {
     CUR_X.store(0, Ordering::SeqCst);
-    CUR_Y.fetch_add(1, Ordering::SeqCst);
-    // crude scroll: clear screen when full
+    // Wrap, do NOT wipe. This used to clear the whole screen when the cursor
+    // reached the bottom, which erases the report being printed instead of
+    // scrolling it: see `kernel_hal::console::next_console_row`, which holds
+    // the rule and its tests (nothing here is compiled by a test binary).
     let max_rows = FB_HEIGHT.load(Ordering::SeqCst) / CHAR_H;
-    if CUR_Y.load(Ordering::SeqCst) >= max_rows {
-        clear_black();
-        CUR_Y.store(0, Ordering::SeqCst);
-    }
+    let next = crate::common::console::next_console_row(CUR_Y.load(Ordering::SeqCst), max_rows);
+    CUR_Y.store(next, Ordering::SeqCst);
+    // The glyphs themselves paint their own cell background, so only the tail
+    // of the row past the end of the new line can show through from the page
+    // before. Clear the row we are moving onto, not the screen.
+    clear_row(next);
 }
 
 fn draw_char(c: u8) {
