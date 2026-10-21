@@ -3055,6 +3055,14 @@ mod nproc_tests;
 #[cfg(test)]
 mod prctl_arg_tests;
 
+/// The credential syscalls through the syscall. Their argument gates have
+/// `id_arg_tests` and their policy lives in `linux-object`; what only this
+/// can see is that `setuid(-1)` and `setreuid(-1, ..)` read the same
+/// register two different ways, and that `setfsuid` and `umask` hand back
+/// the value they replaced.
+#[cfg(test)]
+mod credential_wiring_tests;
+
 #[cfg(test)]
 mod comm_from_path_tests {
     //! `comm` after an `execve`: the last component of the path, which is
