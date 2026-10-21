@@ -355,57 +355,181 @@ impl From<Error> for LxError {
 mod errno_tests {
     use super::*;
 
-    /// The numbers, checked against `asm-generic/errno.h` (which x86_64,
-    /// aarch64 and riscv64 all use). These are the values userspace compares
-    /// against, so a table that drifts is a program taking the wrong branch.
+    /// EVERY variant with the number userspace knows it by, written out from
+    /// `asm-generic/errno-base.h` and `asm-generic/errno.h` -- the headers
+    /// x86_64, aarch64 and riscv64 all compile against -- and not read back
+    /// out of the enum, which would only prove it agrees with itself.
+    ///
+    /// The whole suite, here and in every crate above, says which error it
+    /// expects **by name** (`Err(LxError::EINVAL)`), and a name survives any
+    /// swap of the numbers behind it. What userspace gets is the NUMBER, so
+    /// the numbers need a table of their own: this one. Two of them used to
+    /// have none. Giving `EISCONN` the 107 of `ENOTCONN` and `ENOTCONN` the
+    /// 106 of `EISCONN` -- one mistyped digit in a hand-written list, and the
+    /// difference between a socket that is connected and one that is not --
+    /// passed every test of `linux-object` and of `linux-syscall`. So did
+    /// swapping `EADDRINUSE` with `EADDRNOTAVAIL`.
+    const EVERY_ERRNO: [(LxError, isize); 67] = [
+        (LxError::EUNDEF, 0),
+        (LxError::EPERM, 1),
+        (LxError::ENOENT, 2),
+        (LxError::ESRCH, 3),
+        (LxError::EINTR, 4),
+        (LxError::EIO, 5),
+        (LxError::ENXIO, 6),
+        (LxError::E2BIG, 7),
+        (LxError::ENOEXEC, 8),
+        (LxError::EBADF, 9),
+        (LxError::ECHILD, 10),
+        (LxError::EAGAIN, 11),
+        (LxError::ENOMEM, 12),
+        (LxError::EACCES, 13),
+        (LxError::EFAULT, 14),
+        (LxError::ENOTBLK, 15),
+        (LxError::EBUSY, 16),
+        (LxError::EEXIST, 17),
+        (LxError::EXDEV, 18),
+        (LxError::ENODEV, 19),
+        (LxError::ENOTDIR, 20),
+        (LxError::EISDIR, 21),
+        (LxError::EINVAL, 22),
+        (LxError::ENFILE, 23),
+        (LxError::EMFILE, 24),
+        (LxError::ENOTTY, 25),
+        (LxError::ETXTBSY, 26),
+        (LxError::EFBIG, 27),
+        (LxError::ENOSPC, 28),
+        (LxError::ESPIPE, 29),
+        (LxError::EROFS, 30),
+        (LxError::EMLINK, 31),
+        (LxError::EPIPE, 32),
+        (LxError::EDOM, 33),
+        (LxError::ERANGE, 34),
+        (LxError::EDEADLK, 35),
+        (LxError::ENAMETOOLONG, 36),
+        (LxError::ENOLCK, 37),
+        (LxError::ENOSYS, 38),
+        (LxError::ENOTEMPTY, 39),
+        (LxError::ELOOP, 40),
+        (LxError::ENOMSG, 42),
+        (LxError::EIDRM, 43),
+        (LxError::EBADR, 53),
+        (LxError::ENODATA, 61),
+        (LxError::ETIME, 62),
+        (LxError::EOVERFLOW, 75),
+        (LxError::EBADFD, 77),
+        (LxError::ELIBBAD, 80),
+        (LxError::ENOTSOCK, 88),
+        (LxError::EMSGSIZE, 90),
+        (LxError::ENOPROTOOPT, 92),
+        (LxError::EPROTONOSUPPORT, 93),
+        (LxError::EOPNOTSUPP, 95),
+        (LxError::EPFNOSUPPORT, 96),
+        (LxError::EAFNOSUPPORT, 97),
+        (LxError::EADDRINUSE, 98),
+        (LxError::EADDRNOTAVAIL, 99),
+        (LxError::ECONNRESET, 104),
+        (LxError::ENOBUFS, 105),
+        (LxError::EISCONN, 106),
+        (LxError::ENOTCONN, 107),
+        (LxError::ETIMEDOUT, 110),
+        (LxError::ECONNREFUSED, 111),
+        (LxError::EALREADY, 114),
+        (LxError::EINPROGRESS, 115),
+        (LxError::ENOKEY, 126),
+    ];
+
     #[test]
-    fn the_numbers_are_the_ones_userspace_knows() {
-        for (err, n) in [
-            (LxError::EPERM, 1),
-            (LxError::ENOENT, 2),
-            (LxError::ESRCH, 3),
-            (LxError::EINTR, 4),
-            (LxError::EIO, 5),
-            (LxError::ENXIO, 6),
-            (LxError::EBADR, 53),
-            (LxError::EBADF, 9),
-            (LxError::EAGAIN, 11),
-            (LxError::ENOMEM, 12),
-            (LxError::EACCES, 13),
-            (LxError::EFAULT, 14),
-            (LxError::EBUSY, 16),
-            (LxError::EEXIST, 17),
-            (LxError::EXDEV, 18),
-            (LxError::ENODEV, 19),
-            (LxError::ENOTDIR, 20),
-            (LxError::EISDIR, 21),
-            (LxError::EINVAL, 22),
-            (LxError::ENOTTY, 25),
-            (LxError::EFBIG, 27),
-            (LxError::ENOSPC, 28),
-            (LxError::ESPIPE, 29),
-            (LxError::EROFS, 30),
-            (LxError::EPIPE, 32),
-            (LxError::ERANGE, 34),
-            (LxError::ENOSYS, 38),
-            (LxError::ENOTEMPTY, 39),
-            (LxError::ELOOP, 40),
-            (LxError::ETIME, 62),
-            (LxError::EOVERFLOW, 75),
-            (LxError::EBADFD, 77),
-            (LxError::ELIBBAD, 80),
-            (LxError::ENOTSOCK, 88),
-            (LxError::ENOPROTOOPT, 92),
-            (LxError::EPROTONOSUPPORT, 93),
-            (LxError::EOPNOTSUPP, 95),
-            (LxError::ETIMEDOUT, 110),
-            (LxError::ECONNREFUSED, 111),
-            (LxError::EALREADY, 114),
-            (LxError::EINPROGRESS, 115),
-            (LxError::ENOKEY, 126),
-        ] {
+    fn every_errno_carries_the_number_userspace_knows() {
+        for (err, n) in EVERY_ERRNO {
             assert_eq!(err as isize, n, "{:?}", err);
         }
+    }
+
+    /// And the table above is EVERY variant rather than most of them: the
+    /// match below has no wildcard, so an error added to the enum does not
+    /// compile until it is named here, which is the reminder to put it in
+    /// `EVERY_ERRNO` as well. The 42 entries this grew out of covered two
+    /// thirds of the enum and nothing said which third was missing.
+    #[test]
+    fn the_table_above_leaves_no_error_out() {
+        for (err, _) in EVERY_ERRNO {
+            let named = match err {
+                LxError::EUNDEF
+                | LxError::EPERM
+                | LxError::ENOENT
+                | LxError::ESRCH
+                | LxError::EINTR
+                | LxError::EIO
+                | LxError::ENXIO
+                | LxError::E2BIG
+                | LxError::ENOEXEC
+                | LxError::EBADF
+                | LxError::ECHILD
+                | LxError::EAGAIN
+                | LxError::ENOMEM
+                | LxError::EACCES
+                | LxError::EFAULT
+                | LxError::ENOTBLK
+                | LxError::EBUSY
+                | LxError::EEXIST
+                | LxError::EXDEV
+                | LxError::ENODEV
+                | LxError::ENOTDIR
+                | LxError::EISDIR
+                | LxError::EINVAL
+                | LxError::ENFILE
+                | LxError::EMFILE
+                | LxError::ENOTTY
+                | LxError::ETXTBSY
+                | LxError::EFBIG
+                | LxError::ENOSPC
+                | LxError::ESPIPE
+                | LxError::EROFS
+                | LxError::EMLINK
+                | LxError::EPIPE
+                | LxError::EDOM
+                | LxError::ERANGE
+                | LxError::EDEADLK
+                | LxError::ENAMETOOLONG
+                | LxError::ENOLCK
+                | LxError::ENOSYS
+                | LxError::ENOTEMPTY
+                | LxError::ELOOP
+                | LxError::ENOMSG
+                | LxError::EIDRM
+                | LxError::EBADR
+                | LxError::ENODATA
+                | LxError::ETIME
+                | LxError::EOVERFLOW
+                | LxError::EBADFD
+                | LxError::ELIBBAD
+                | LxError::ENOTSOCK
+                | LxError::EMSGSIZE
+                | LxError::ENOPROTOOPT
+                | LxError::EPROTONOSUPPORT
+                | LxError::EOPNOTSUPP
+                | LxError::EPFNOSUPPORT
+                | LxError::EAFNOSUPPORT
+                | LxError::EADDRINUSE
+                | LxError::EADDRNOTAVAIL
+                | LxError::ECONNRESET
+                | LxError::ENOBUFS
+                | LxError::EISCONN
+                | LxError::ENOTCONN
+                | LxError::ETIMEDOUT
+                | LxError::ECONNREFUSED
+                | LxError::EALREADY
+                | LxError::EINPROGRESS
+                | LxError::ENOKEY => true,
+            };
+            assert!(named, "{:?}", err);
+        }
+        assert_eq!(
+            EVERY_ERRNO.len(),
+            67,
+            "an error was added to EVERY_ERRNO without a number of its own"
+        );
     }
 
     #[test]
