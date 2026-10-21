@@ -189,6 +189,24 @@ fn getdents64_wants_a_directory_and_copies_out_what_the_walk_found() {
                 "a huge buffer length was taken at its word"
             );
 
+            // And a buffer with no room for even the first entry is EINVAL,
+            // not a short answer: `getdents64`'s `if (!lastdirent) error =
+            // -EINVAL;`. Zero bytes is how the end of a directory is
+            // reported, so answering it here would make `ls` stop on a
+            // buffer it never grew instead of growing it.
+            let fd3 = opened(sys, &dir, O_DIRECTORY);
+            let mut tiny = [0u8; 64];
+            assert_eq!(
+                sys.sys_getdents64(
+                    FileDesc::from(fd3),
+                    UserOutPtr::from(tiny.as_mut_ptr() as usize),
+                    8,
+                ),
+                Err(LxError::EINVAL),
+                "a buffer too small for one entry answered as an empty directory"
+            );
+            assert_eq!(tiny[..8], [0u8; 8], "the refused call copied bytes out");
+
             // A descriptor that is not a directory, and one that is not a
             // descriptor.
             let file = c("/x/one");
