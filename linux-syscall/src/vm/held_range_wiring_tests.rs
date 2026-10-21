@@ -25,8 +25,12 @@
 //! 4. **That `MADV_DONTNEED` really discards.** The promise is that the
 //!    range reads back as zero on next access, which is a thing a program
 //!    can look at and a return value cannot.
+//! 5. **That a hole in the range is reported, and reported late.** Linux
+//!    applies the advice to the mappings it finds and answers `ENOMEM` for
+//!    the gap afterwards, so the only way to tell that apart from a refusal
+//!    is to read the bytes of the half that WAS mapped.
 //!
-//! Fixed pids live in 47_43x here.
+//! Fixed pids live in 47_43x and 47_44x here.
 
 use super::*;
 use crate::on_a_thread::on_a_thread;
@@ -658,6 +662,67 @@ fn the_arguments_arrive_in_the_order_the_syscall_table_names_them() {
                 by_number(sys, crate::Sys::MUNLOCKALL, [usize::MAX; 6]).await,
                 0
             );
+        })
+    });
+}
+
+#[test]
+fn a_hole_in_the_madvise_range_is_reported_after_the_advice_is_honoured() {
+    // `madvise_walk_vmas` walks the VMAs the range covers, applies the
+    // advice to each one, and returns its `unmapped_error` -- ENOMEM -- for
+    // the gaps between them. So both halves of the contract are visible at
+    // once: the page that WAS mapped comes back zero, and the call still
+    // fails. A kernel that refused the whole range at the hole would pass a
+    // test that only read the errno, and leave behind exactly the stale
+    // bytes an allocator reuses.
+    let proc = a_process(47_440, "held-hole");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            // Two one-page mappings side by side, so that dropping the
+            // second one leaves a hole without having to split a mapping.
+            let at = mapped(sys, 0x4400_0000, 1).await;
+            let next = mapped(sys, 0x4400_1000, 1).await;
+            assert_eq!(next, at + PAGE, "the second page went somewhere else");
+            touch(sys, at);
+            write_bytes(at, b"stale");
+
+            // Mapped end to end, this is the success the four calls around
+            // it already promise, and it has to stay one.
+            assert_eq!(sys.sys_madvise(at, 2 * PAGE, MADV_NORMAL), Ok(0));
+
+            assert_eq!(sys.sys_munmap(next, PAGE), Ok(0));
+            assert_eq!(
+                sys.sys_madvise(at, 2 * PAGE, MADV_DONTNEED),
+                Err(LxError::ENOMEM),
+                "madvise reported success for a range with a hole in it"
+            );
+
+            // And the half that was mapped was discarded all the same.
+            assert!(
+                !is_resident(sys, at),
+                "the error came back before the advice was applied"
+            );
+            touch(sys, at);
+            assert_eq!(
+                read_bytes(at, 5),
+                [0u8; 5],
+                "the page that was mapped kept its old bytes"
+            );
+
+            // A range wholly unmapped is the same answer, for a discard and
+            // for a hint alike: the walk is about the range, not the advice.
+            assert_eq!(
+                sys.sys_madvise(next, PAGE, MADV_DONTNEED),
+                Err(LxError::ENOMEM)
+            );
+            assert_eq!(
+                sys.sys_madvise(next, PAGE, MADV_NORMAL),
+                Err(LxError::ENOMEM)
+            );
+
+            // An empty range names no page, so it is still success wherever
+            // it points: the walk never runs, as in the other four.
+            assert_eq!(sys.sys_madvise(next, 0, MADV_DONTNEED), Ok(0));
         })
     });
 }

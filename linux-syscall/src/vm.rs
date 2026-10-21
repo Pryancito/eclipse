@@ -1151,6 +1151,8 @@ impl Syscall<'_> {
         // had been dropped/PROT_NONE'd — mimalloc reused exactly such a page and
         // found its old bytes, hence the deterministic "corrupted free list
         // entry" abort during `apk update`.
+        let proc = self.zircon_process();
+        let vmar = proc.vmar();
         if madvise_discards(advice) {
             // Zero the committed pages in the range THROUGH THE VMO so they read
             // back as zero on next access — including pages whose PTE was dropped
@@ -1158,11 +1160,24 @@ impl Syscall<'_> {
             // let mimalloc reuse a stale frame and abort). Done in place, leaving
             // the mapping and frames intact (an earlier unmap+decommit variant
             // turned the abort into a SIGSEGV).
-            let proc = self.zircon_process();
-            let vmar = proc.vmar();
             vmar.madv_dontneed(addr, len);
         }
-        Ok(0)
+        // A hole in the range is ENOMEM (`madvise_walk_vmas`'s
+        // `unmapped_error`, mm/madvise.c), and Linux answers it AFTER having
+        // applied the advice to the VMAs it did find: the gap is reported,
+        // not refused. That order is the part worth being careful about. A
+        // discard that bailed out at the hole would leave stale bytes in the
+        // pages that WERE mapped, and an allocator that decommits a
+        // partially-unmapped span and later reuses it reads them back --
+        // which is the mimalloc abort described above, reached by another
+        // road.
+        //
+        // Until this walk was here, `madvise` was the one call in this file
+        // that reported success for a range it had never looked at: the four
+        // around it (`mlock`, `munlock`, `msync`, `mincore`) all check theirs
+        // with this same helper, and `MADV_DONTNEED` over a span half of
+        // which had already been unmapped came back 0.
+        walk_mapped(&vmar, addr, addr + len)
     }
 }
 
