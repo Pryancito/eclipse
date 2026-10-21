@@ -24,9 +24,12 @@ use crate::on_a_thread::on_a_thread;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::any::Any;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use linux_object::fs::{File, OpenFlags, PollStatus};
 use linux_object::process::LinuxProcess;
 use linux_object::thread::ThreadExt;
-use rcore_fs::vfs::FileType;
+use rcore_fs::vfs::{FileType, INode};
 use rcore_fs_ramfs::RamFS;
 use zircon_object::task::{Process, Thread, ROOT_JOB};
 
@@ -1298,5 +1301,100 @@ fn sending_a_batch_of_messages_is_not_receiving_one() {
     assert_eq!(
         &got, b"abcd",
         "the bytes that arrived are not the ones sent"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Flushing a file is not flushing only its data
+// ---------------------------------------------------------------------------
+
+/// An inode that does nothing but count which of the two syncs reached it.
+///
+/// Every filesystem in the tree implements both, and through the syscall
+/// both answer zero on a real file, so `fsync` and `fdatasync` are the one
+/// pair of this table that no real file can separate. What is on trial here
+/// is the routing, not the flushing, so an inode that only counts is
+/// exactly as much filesystem as the question needs.
+#[derive(Default)]
+struct SyncCounter {
+    all: AtomicUsize,
+    data: AtomicUsize,
+}
+
+impl INode for SyncCounter {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> rcore_fs::vfs::Result<usize> {
+        Ok(0)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> rcore_fs::vfs::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn poll(&self) -> rcore_fs::vfs::Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: true,
+            error: false,
+            hangup: false,
+        })
+    }
+
+    fn sync_all(&self) -> rcore_fs::vfs::Result<()> {
+        self.all.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn sync_data(&self) -> rcore_fs::vfs::Result<()> {
+        self.data.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[test]
+fn flushing_a_file_is_not_flushing_only_its_data() {
+    let proc = a_process(45_529, "dispatch-fsync", "dispatch_fsync");
+    let counted = Arc::new(SyncCounter::default());
+    let inode = counted.clone();
+    let (fsync_ret, after_fsync, fdatasync_ret, after_fdatasync) = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let fd: i32 = sys
+                .linux_process()
+                .add_file(File::new(
+                    inode,
+                    OpenFlags::RDWR,
+                    String::from("/dispatch_fsync/counted"),
+                ))
+                .unwrap()
+                .into();
+            let fsync_ret = by_number(sys, Sys::FSYNC as u32, [fd as usize, 0, 0, 0, 0, 0]).await;
+            let after_fsync = (
+                counted.all.load(Ordering::SeqCst),
+                counted.data.load(Ordering::SeqCst),
+            );
+            let fdatasync_ret =
+                by_number(sys, Sys::FDATASYNC as u32, [fd as usize, 0, 0, 0, 0, 0]).await;
+            let after_fdatasync = (
+                counted.all.load(Ordering::SeqCst),
+                counted.data.load(Ordering::SeqCst),
+            );
+            (fsync_ret, after_fsync, fdatasync_ret, after_fdatasync)
+        })
+    });
+
+    assert_eq!(fsync_ret, 0, "fsync failed");
+    assert_eq!(
+        after_fsync,
+        (1, 0),
+        "fsync did not reach sync_all and it alone"
+    );
+    assert_eq!(fdatasync_ret, 0, "fdatasync failed");
+    assert_eq!(
+        after_fdatasync,
+        (1, 1),
+        "fdatasync did not reach sync_data and it alone"
     );
 }
