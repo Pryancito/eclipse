@@ -433,14 +433,8 @@ impl EclipseFsV3 {
         }
         let (mut itable, overflow, count) =
             Inode::decode(&sb.itable)?.ok_or(Error::Corrupt("inode table record"))?;
-        load_chain(
-            &*dev,
-            ITABLE_INO,
-            sb.total_blocks,
-            overflow,
-            count,
-            &mut itable,
-        )?;
+        let total = sb.total_blocks;
+        load_chain(&*dev, ITABLE_INO, total, overflow, count, &mut itable)?;
         let mut alloc = BlockAllocator::new(groups);
         alloc.set_deferred_frees(journal.is_some());
         let mut fs = Self {
@@ -727,9 +721,8 @@ impl EclipseFsV3 {
         self.ensure_itable(ino)?;
         let at = ino * INODE_SIZE as u64;
         let w = write_data(&*self.dev, &mut self.alloc, &mut self.itable, at, rec)?;
-        if w < INODE_SIZE {
-            return Err(Error::NoSpace);
-        }
+        // A record never spans blocks: it is written whole or not at all.
+        (w == INODE_SIZE).then_some(()).ok_or(Error::NoSpace)?;
         self.itable_changed()
     }
 
@@ -1059,9 +1052,7 @@ impl EclipseFsV3 {
         } else {
             inode.flags &= !INODE_FLAG_INLINE;
             let n = write_data(&*self.dev, &mut self.alloc, inode, 0, target)?;
-            if n < target.len() {
-                return Err(Error::NoSpace);
-            }
+            (n == target.len()).then_some(()).ok_or(Error::NoSpace)?;
             Ok(())
         }
     }

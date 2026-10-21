@@ -2304,14 +2304,14 @@ mod tests {
     /// room.
     #[test]
     fn a_moving_single_chunk_goes_where_the_room_is() {
-        let mut m = map(&[(1, 10_000), (2, 8_000), (3, 6_000)]);
+        let mut m = map(&[(1, 10_000), (2, 8_000), (3, 6_000), (4, 500)]);
         let c = add(&mut m, 0, Profile::Single, 1000);
         let avoid = [c.stripes[0].devid];
         let s = m.place_moving(&c, Profile::Single, &avoid, &[]).unwrap();
         assert_eq!(s.len(), 1);
         assert_ne!(s[0].devid, avoid[0]);
         let room = |d: u32| m.free_extents(d, &[]).iter().map(|e| e.1).sum::<u64>();
-        let other = [1, 2, 3]
+        let other = [2, 3]
             .into_iter()
             .filter(|&d| d != avoid[0] && d != s[0].devid)
             .next()
@@ -2351,7 +2351,9 @@ mod tests {
         v.detach(2);
         v.resync(&c, 0, 10).unwrap();
         v.detach(3);
-        assert_eq!(v.write_at(G1, &sb), Err(Error::Io));
+        // A whole row, so nothing needs reading first.
+        let row = vec![0u8; 3 * bs];
+        assert_eq!(v.write_at(G1, &row), Err(Error::Io));
         v.detach(1);
         assert_eq!(v.write_at(20 * BS, &sb), Err(Error::Io));
         v.detach(4);

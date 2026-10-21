@@ -50,6 +50,12 @@ pub(crate) mod testdisk;
 pub mod v3;
 pub mod volume;
 
+#[cfg(all(test, coverage_nightly))]
+extern crate self as eclipsefs;
+#[cfg(all(test, coverage_nightly, feature = "std"))]
+#[coverage(off)]
+mod integration;
+
 pub use compress::Compression;
 pub use cow::{EncryptionPolicy, SendStats};
 pub use device::BlockDevice;

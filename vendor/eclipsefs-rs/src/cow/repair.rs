@@ -241,10 +241,10 @@ impl CowFs {
         self.sp.lenient = false;
         names?;
         // Deleted items released blocks the old counts knew nothing about.
-        if let Err(why) = self.repair_space(&mut r)? {
-            r.still_damaged = Some(why);
-            return Ok(r);
-        }
+        // (The tree nodes passed the first time, and new ones come from the
+        // allocator: they cannot share a block now.)
+        let again = self.repair_space(&mut r)?;
+        debug_assert!(again.is_ok(), "{:?}", again.err());
         // 4. Checksums.
         self.repair_csums(&mut r)?;
         self.flush()?;
@@ -269,9 +269,7 @@ impl CowFs {
             }
             self.enter(id)?;
             self.repair_subvol(r, poison)?;
-            if self.st.dirty_count() >= DIRTY_NODES_LIMIT {
-                self.flush()?;
-            }
+            self.flush()?;
         }
         self.enter(home)?;
         self.flush()
@@ -954,9 +952,8 @@ impl CowFs {
                 lf
             }
         };
-        if ino == lf {
-            return Ok(false);
-        }
+        // Orphans have no entry, and lost+found is named in the root.
+        debug_assert_ne!(ino, lf);
         let kind = s.inodes.get(&ino).ok_or(Error::NotFound)?.kind();
         let mut name = alloc::format!("#{}", ino).into_bytes();
         while keep.iter().any(|e| e.dir == lf && e.name == name) {
@@ -1505,5 +1502,52 @@ mod tests {
         fs.delete(Key::new(FIRST_INO, DIR_ITEM, target)).unwrap();
         fs.sync().unwrap();
         assert_eq!(fs.repair().err(), Some(Error::NoSpace));
+    }
+
+    /// With the encryption feature on, a context on an inode without the
+    /// flag goes; a link to a subvolume number no subvolume can have, too.
+    #[test]
+    fn contexts_without_the_flag_and_impossible_links() {
+        let (_, mut fs) = mounted();
+        fs.set_random(|b| b.fill(7));
+        let key = fs.add_encryption_key(&[0x42; 64]).unwrap();
+        let v = fs.create(FIRST_INO, "v", FileKind::Dir, 0o700, 0).unwrap();
+        fs.set_encryption_policy(v, &EncryptionPolicy::new(key))
+            .unwrap();
+        let f = split(file(&mut fs, FIRST_INO, "f")).1;
+        let ctx = fs.get(Key::new(split(v).1, ENC_CONTEXT, 0)).unwrap().unwrap();
+        fs.insert(Key::new(f, ENC_CONTEXT, 0), ctx).unwrap();
+        let old = handle(1, FIRST_INO);
+        let v = encode_pair(old, 0, FileKind::Dir, b"old");
+        fs.insert(Key::new(FIRST_INO, DIR_INDEX, 600), v).unwrap();
+        let r = repaired(&mut fs);
+        assert!(r.items_removed >= 1 && r.entries_removed >= 1, "{:?}", r);
+        assert_eq!(r.still_damaged, None);
+    }
+
+    /// A directory cycle under an encrypted root has nowhere to go.
+    #[test]
+    fn a_cycle_under_an_encrypted_root_stays() {
+        let (_, mut fs) = mounted();
+        fs.set_random(|b| b.fill(7));
+        let key = fs.add_encryption_key(&[0x42; 64]).unwrap();
+        let sv = fs.create_subvolume(FIRST_INO, "sv").unwrap();
+        fs.set_encryption_policy(sv, &EncryptionPolicy::new(key))
+            .unwrap();
+        let a = fs.create(sv, "dir-a-long-name", FileKind::Dir, 0o700, 0).unwrap();
+        let b = fs.create(a, "dir-b-long-name", FileKind::Dir, 0o700, 0).unwrap();
+        fs.enter(split(sv).0).unwrap();
+        let (a, b) = (split(a).1, split(b).1);
+        // a's entry moves from the root into b.
+        let (k, v) = fs
+            .items_of(FIRST_INO, DIR_INDEX, 100)
+            .unwrap()
+            .into_iter()
+            .find(|(_, v)| decode_pair(v).unwrap().ino == a)
+            .unwrap();
+        fs.delete(k).unwrap();
+        fs.insert(Key::new(b, DIR_INDEX, 100), v).unwrap();
+        let r = repaired(&mut fs);
+        assert_eq!(r.unrepaired, 1, "{:?}", r);
     }
 }

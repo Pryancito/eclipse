@@ -1066,6 +1066,18 @@ mod tests {
         let g = &fs.sp.alloc.groups()[(at / GROUP_BLOCKS) as usize];
         assert_ne!(g.kind, ChunkKind::Metadata);
         let _ = h;
+        // Room enough, but in pieces: no area.
+        fs.drop_log_area().unwrap();
+        let mut runs = Vec::new();
+        while let Some(r) = fs.sp.alloc.allocate(None, u64::MAX) {
+            runs.push(r);
+        }
+        for (s, l) in runs {
+            for b in (s..s + l).step_by(2) {
+                fs.sp.alloc.free_now(b, 1).unwrap();
+            }
+        }
+        assert!(!fs.make_log_area().unwrap());
     }
 
     #[test]

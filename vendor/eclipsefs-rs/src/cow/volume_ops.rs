@@ -574,11 +574,9 @@ impl CowFs {
             let Some(d) = vol.device(id) else { continue };
             let size = d.size() / BS;
             vol.with_map(|m| {
-                if let Some(s) = m.devices.get_mut(&id) {
-                    if size > *s {
-                        *s = size;
-                        grew = true;
-                    }
+                if let Some(s) = m.devices.get_mut(&id).filter(|s| size > **s) {
+                    *s = size;
+                    grew = true;
                 }
             });
         }
