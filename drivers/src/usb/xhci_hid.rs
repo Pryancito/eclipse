@@ -522,7 +522,17 @@ impl XhciMmio {
         self.write_rt(0x20, (iman & 0x02) | 0x01);
     }
 
+    /// The offset within the BAR of an access through one of the windows
+    /// below, which is the only name the fake controller of the test binary
+    /// knows a register by.
+    #[cfg(test)]
+    fn bar_off(&self, addr: usize) -> usize {
+        addr - self.cap_base
+    }
+
     fn read_op(&self, o: usize) -> u32 {
+        #[cfg(test)]
+        xhci_fake::on_read(self.cap_base, self.bar_off(self.op_base + o));
         fence(Ordering::Acquire);
         let v = unsafe { read_volatile((self.op_base + o) as *const u32) };
         fence(Ordering::Acquire);
@@ -533,27 +543,48 @@ impl XhciMmio {
         fence(Ordering::Release);
         unsafe { write_volatile((self.op_base + o) as *mut u32, v) }
         fence(Ordering::Release);
+        #[cfg(test)]
+        xhci_fake::on_write(self.cap_base, self.bar_off(self.op_base + o), v);
     }
 
     fn write_op64(&self, o: usize, v: u64) {
         fence(Ordering::Release);
         unsafe { write_volatile((self.op_base + o) as *mut u64, v) }
         fence(Ordering::Release);
+        // The fake is told in halves, low first, because that is the order a
+        // controller latches a 64-bit register pair it is allowed to read
+        // between the two halves.
+        #[cfg(test)]
+        {
+            let off = self.bar_off(self.op_base + o);
+            xhci_fake::on_write(self.cap_base, off, v as u32);
+            xhci_fake::on_write(self.cap_base, off + 4, (v >> 32) as u32);
+        }
     }
 
     fn write_rt(&self, o: usize, v: u32) {
         fence(Ordering::Release);
         unsafe { write_volatile((self.rt_base + o) as *mut u32, v) }
         fence(Ordering::Release);
+        #[cfg(test)]
+        xhci_fake::on_write(self.cap_base, self.bar_off(self.rt_base + o), v);
     }
 
     fn write_rt64(&self, o: usize, v: u64) {
         fence(Ordering::Release);
         unsafe { write_volatile((self.rt_base + o) as *mut u64, v) }
         fence(Ordering::Release);
+        #[cfg(test)]
+        {
+            let off = self.bar_off(self.rt_base + o);
+            xhci_fake::on_write(self.cap_base, off, v as u32);
+            xhci_fake::on_write(self.cap_base, off + 4, (v >> 32) as u32);
+        }
     }
 
     fn read_rt(&self, o: usize) -> u32 {
+        #[cfg(test)]
+        xhci_fake::on_read(self.cap_base, self.bar_off(self.rt_base + o));
         fence(Ordering::Acquire);
         let v = unsafe { read_volatile((self.rt_base + o) as *const u32) };
         fence(Ordering::Acquire);
@@ -569,6 +600,12 @@ impl XhciMmio {
             );
         }
         fence(Ordering::Release);
+        #[cfg(test)]
+        xhci_fake::on_write(
+            self.cap_base,
+            self.bar_off(self.db_base + (slot as usize) * 4),
+            doorbell as u32,
+        );
     }
 }
 
@@ -7635,6 +7672,17 @@ mod disk_tests;
 /// leave uncovered.
 #[cfg(test)]
 mod trb_tests;
+
+/// Un controlador xHCI en memoria del host, que es lo que les falta a los
+/// módulos de arriba para poder llamar a `XhciInner`: hasta aquí todos los
+/// tests eran de funciones puras.
+#[cfg(test)]
+mod xhci_fake;
+
+/// El arranque del controlador y el camino de los comandos, contra el
+/// controlador de [`xhci_fake`].
+#[cfg(test)]
+mod controller_tests;
 
 /// La tabla de la página HID del teclado y el delta entre dos informes, que
 /// es el camino que `tests` no toca: ahí todo es ratón.
