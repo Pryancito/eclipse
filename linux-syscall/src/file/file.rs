@@ -3941,3 +3941,6 @@ fn atomic_write_valid(len: usize, pos: u64, min: usize, max: usize) -> bool {
 
 #[cfg(test)]
 mod rwf_atomic_tests;
+
+#[cfg(test)]
+mod vfs_ioctl_tests;
