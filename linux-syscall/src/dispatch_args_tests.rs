@@ -27,8 +27,17 @@
 //! 5. **The struct a `stat` fills has to be the same one the handler fills
 //!    when it is called by name**, which is the reference these tests
 //!    compare against rather than reading a private field.
+//! 6. **A round trip is the strongest thing a pair of arms can be asked
+//!    for.** `set_robust_list` then `get_robust_list` has to give the same
+//!    address and the same length back; `prctl(PR_SET_NAME)` then
+//!    `PR_GET_NAME` the same name.
+//! 7. **Where nothing can be read back, each word refuses in its own way.**
+//!    `setpgid` answers `ESRCH` about its first word and `EPERM` about its
+//!    second; `syslog` answers `EINVAL` about a type nobody has, about a
+//!    read with no buffer, and about a console level out of range, which is
+//!    the only place its third word is a number and not a length.
 //!
-//! Fixed pids live in 48_12x here.
+//! Fixed pids live in 48_12x and 48_13x here.
 
 use super::*;
 use crate::on_a_thread::on_a_thread;
@@ -676,4 +685,401 @@ fn the_directory_a_descriptor_names_becomes_the_working_one() {
             );
         })
     });
+}
+
+#[test]
+fn the_three_group_ids_are_three_different_numbers() {
+    // The group half of the table. `dispatch_tests` has the user half, where
+    // the ids are read back by name; here they come back through
+    // `getresgid`, whose three words are three pointers that look alike, so
+    // one call checks the order both arms put them in. Every value is
+    // different from every other on purpose: with `rgid == egid` a swap is
+    // the same answer.
+    let proc = a_process(48_130, "args-gids", "args_gids");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let (mut r, mut e, mut s) = (0u32, 0u32, 0u32);
+            let out = [
+                &mut r as *mut u32 as usize,
+                &mut e as *mut u32 as usize,
+                &mut s as *mut u32 as usize,
+            ];
+            assert_eq!(
+                by_number(sys, Sys::SETRESGID, [31, 37, 41, 0, 0, 0]).await,
+                0
+            );
+            assert_eq!(
+                by_number(sys, Sys::GETRESGID, [out[0], out[1], out[2], 0, 0, 0]).await,
+                0
+            );
+            assert_eq!(
+                (r, e, s),
+                (31, 37, 41),
+                "the three group ids came back in another order"
+            );
+
+            // `setregid` has two words where `setresgid` has three.
+            assert_eq!(by_number(sys, Sys::SETREGID, [43, 47, 0, 0, 0, 0]).await, 0);
+            assert_eq!(
+                by_number(sys, Sys::GETRESGID, [out[0], out[1], out[2], 0, 0, 0]).await,
+                0
+            );
+            assert_eq!(
+                (r, e),
+                (43, 47),
+                "setregid put the real id where the effective one goes"
+            );
+
+            // `setgid` from a privileged process moves all three.
+            assert_eq!(by_number(sys, Sys::SETGID, [53, 0, 0, 0, 0, 0]).await, 0);
+            assert_eq!(
+                by_number(sys, Sys::GETRESGID, [out[0], out[1], out[2], 0, 0, 0]).await,
+                0
+            );
+            assert_eq!((r, e, s), (53, 53, 53));
+
+            // `setfsgid` answers the id it is REPLACING, which is the only
+            // thing that says its word was read at all.
+            assert_eq!(
+                by_number(sys, Sys::SETFSGID, [59, 0, 0, 0, 0, 0]).await,
+                53,
+                "setfsgid did not answer the filesystem group it replaced"
+            );
+        })
+    });
+}
+
+#[test]
+fn setgroups_takes_the_count_before_the_list() {
+    // `setgroups(size, list)`: two words, one a count and one a pointer, and
+    // nothing in the answer tells them apart. Read back by name, because
+    // `getgroups` is already called by number elsewhere.
+    let proc = a_process(48_131, "args-groups", "args_groups");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let wanted = [61u32, 67, 71];
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::SETGROUPS,
+                    [3, wanted.as_ptr() as usize, 0, 0, 0, 0]
+                )
+                .await,
+                0
+            );
+            let mut got = [0u32; 8];
+            assert_eq!(
+                sys.sys_getgroups(8, UserOutPtr::from(got.as_mut_ptr() as usize)),
+                Ok(3)
+            );
+            assert_eq!(
+                &got[..3],
+                &wanted[..],
+                "the supplementary groups are not the ones setgroups was given"
+            );
+        })
+    });
+}
+
+#[test]
+fn the_process_group_of_a_pid_nobody_asked_about() {
+    // `getpgrp` takes no arguments, and the arm says so by passing a zero of
+    // its own rather than `a0`: a program that leaves rubbish in `rdi` --
+    // which it may, the call has no arguments -- must still get its own
+    // process group. The reference is the same handler called by name with
+    // the zero the arm should have used.
+    let proc = a_process(48_132, "args-pgrp", "args_pgrp");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let mine = sys.sys_getpgid(0).expect("a process has a group");
+            assert_eq!(
+                by_number(sys, Sys::GETPGRP, [0x5eed_5eed, 7, 0, 0, 0, 0]).await,
+                mine as isize,
+                "getpgrp read a word that is not its own"
+            );
+
+            // `setpgid(pid, pgid)`: a process that is not there and a group
+            // that is not there are DIFFERENT refusals -- `ESRCH` for the
+            // first word and `EPERM` for the second, since joining a group
+            // outside the caller's session is not allowed -- so the pair
+            // pins the order with nothing else set up.
+            const NOBODY: usize = 999_999;
+            assert_eq!(
+                by_number(sys, Sys::SETPGID, [NOBODY, 0, 0, 0, 0, 0]).await,
+                errno(LxError::ESRCH),
+                "setpgid looked for the process in the wrong word"
+            );
+            assert_eq!(
+                by_number(sys, Sys::SETPGID, [0, NOBODY, 0, 0, 0, 0]).await,
+                errno(LxError::EPERM),
+                "setpgid took the group id from the wrong word"
+            );
+
+            // And a process group leader may not open a session: POSIX, and
+            // the reason the daemonize idiom forks first.
+            assert_eq!(
+                by_number(sys, Sys::SETSID, [0, 0, 0, 0, 0, 0]).await,
+                errno(LxError::EPERM),
+                "a group leader was given a session of its own"
+            );
+        })
+    });
+}
+
+#[test]
+fn the_robust_list_comes_back_as_it_went_in() {
+    // `set_robust_list(head, len)` and `get_robust_list(pid, head, len)`
+    // are a round trip, which is the strongest thing a pair of arms can be
+    // asked for: the address and the length have to come back where they
+    // went in. The length is checked against the size of the structure, so a
+    // swap is an error and not a wrong answer.
+    let proc = a_process(48_133, "args-robust", "args_robust");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let size = core::mem::size_of::<linux_object::thread::RobustList>();
+            let head = [0usize; 3];
+            let at_head = head.as_ptr() as usize;
+
+            assert_eq!(
+                by_number(sys, Sys::SET_ROBUST_LIST, [at_head, 8, 0, 0, 0, 0]).await,
+                errno(LxError::EINVAL),
+                "set_robust_list took a length that is not the structure's"
+            );
+            assert_eq!(
+                by_number(sys, Sys::SET_ROBUST_LIST, [at_head, size, 0, 0, 0, 0]).await,
+                0
+            );
+
+            let mut back = 0usize;
+            let mut len = 0usize;
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::GET_ROBUST_LIST,
+                    [
+                        0,
+                        &mut back as *mut usize as usize,
+                        &mut len as *mut usize as usize,
+                        0,
+                        0,
+                        0
+                    ]
+                )
+                .await,
+                0
+            );
+            assert_eq!(back, at_head, "the robust list came back somewhere else");
+            assert_eq!(len, size, "the robust list came back a different size");
+
+            // `set_tid_address` answers the caller's thread id, which is the
+            // only way to see that its one word was taken as a pointer and
+            // not as something else.
+            let mut slot = 0i32;
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::SET_TID_ADDRESS,
+                    [&mut slot as *mut i32 as usize, 0, 0, 0, 0, 0]
+                )
+                .await,
+                sys.thread.id() as isize
+            );
+        })
+    });
+}
+
+#[test]
+fn each_setting_answers_what_it_was_set_to() {
+    // Four arms whose words are all small integers, and whose answer is the
+    // state they left behind: `personality` answers the persona it is
+    // REPLACING, `setpriority` is read back by name, `sched_setscheduler`
+    // takes a pointer where its neighbours take a number, and `membarrier`
+    // has a flag word that must be zero.
+    let proc = a_process(48_134, "args-set", "args_set");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            // `ADDR_NO_RANDOMIZE`. The first call answers the persona before
+            // it, the query answers the one after: one word, two readings.
+            assert_eq!(
+                by_number(sys, Sys::PERSONALITY, [8, 0, 0, 0, 0, 0]).await,
+                0
+            );
+            assert_eq!(
+                by_number(sys, Sys::PERSONALITY, [0xffff_ffff, 0, 0, 0, 0, 0]).await,
+                8,
+                "personality did not keep the persona it was given"
+            );
+
+            // `setpriority(which, who, prio)`: `PRIO_PROCESS` and the caller,
+            // so the only word with anything in it is the third.
+            assert_eq!(
+                by_number(sys, Sys::SETPRIORITY, [0, 0, 7, 0, 0, 0]).await,
+                0
+            );
+            assert_eq!(
+                sys.sys_getpriority(0, 0),
+                Ok(13),
+                "the nice value is not the one setpriority was given (20 - 7)"
+            );
+
+            // `sched_setscheduler(pid, policy, param)`: the parameter is a
+            // pointer, and a policy where the pointer goes is a number too
+            // big to be a policy.
+            let priority = 10i32;
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::SCHED_SETSCHEDULER,
+                    [0, 1, &priority as *const i32 as usize, 0, 0, 0]
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                sys.sys_sched_getscheduler(0),
+                Ok(1),
+                "the policy is not the one sched_setscheduler was given"
+            );
+
+            // `membarrier(cmd, flags, cpu)`: the query answers a mask of the
+            // commands it has, and a flag word that is not zero is EINVAL.
+            assert_eq!(
+                by_number(sys, Sys::MEMBARRIER, [0, 1, 0, 0, 0, 0]).await,
+                errno(LxError::EINVAL),
+                "membarrier read its flag word somewhere else"
+            );
+            assert!(
+                by_number(sys, Sys::MEMBARRIER, [0, 0, 0, 0, 0, 0]).await > 0,
+                "the membarrier query answered no commands at all"
+            );
+
+            // And the arm that is an answer and nothing else.
+            assert_eq!(
+                by_number(sys, Sys::UNSHARE, [0, 0, 0, 0, 0, 0]).await,
+                errno(LxError::ENOSYS)
+            );
+        })
+    });
+}
+
+#[test]
+fn the_name_a_process_gives_itself_and_the_domain_it_lives_in() {
+    // `prctl` is the widest arm in the table -- an option and four words --
+    // and a round trip through `PR_SET_NAME` and `PR_GET_NAME` says that the
+    // option is the first of them and the argument the second. `uname` then
+    // shows the domain name `setdomainname` was given, which is the only
+    // thing that proves its length word was read.
+    let proc = a_process(48_135, "args-name", "args_name");
+    let was_domain = linux_object::uname::domainname();
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            const PR_SET_NAME: usize = 15;
+            const PR_GET_NAME: usize = 16;
+            let name = b"a-thread-name\0";
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::PRCTL,
+                    [PR_SET_NAME, name.as_ptr() as usize, 0, 0, 0, 0]
+                )
+                .await,
+                0
+            );
+            let mut got = [0u8; 16];
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::PRCTL,
+                    [PR_GET_NAME, got.as_mut_ptr() as usize, 0, 0, 0, 0]
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                &got[..13],
+                b"a-thread-name",
+                "the name prctl gave back is not the one it was given"
+            );
+
+            // The domain name is a global every test in this binary shares,
+            // so it goes back where it was at the end.
+            let domain = b"args.example";
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::SETDOMAINNAME,
+                    [domain.as_ptr() as usize, domain.len(), 0, 0, 0, 0]
+                )
+                .await,
+                0
+            );
+            let mut uts = [0u8; 512];
+            let mut uts_by_name = [0u8; 512];
+            assert_eq!(
+                by_number(sys, Sys::UNAME, [uts.as_mut_ptr() as usize, 0, 0, 0, 0, 0]).await,
+                0
+            );
+            sys.sys_uname(UserOutPtr::from(uts_by_name.as_mut_ptr() as usize))
+                .expect("uname by name");
+            assert_eq!(uts[..], uts_by_name[..], "uname filled another struct");
+            assert!(
+                uts.windows(domain.len()).any(|w| w == &domain[..]),
+                "uname does not show the domain name setdomainname was given"
+            );
+
+            // `getrandom(buf, len, flags)` answers the count it filled, and
+            // sixteen zero bytes out of a random source is not a thing that
+            // happens.
+            let mut bytes = [0u8; 16];
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::GETRANDOM,
+                    [bytes.as_mut_ptr() as usize, 16, 0, 0, 0, 0]
+                )
+                .await,
+                16
+            );
+            assert!(
+                bytes.iter().any(|b| *b != 0),
+                "getrandom left the buffer as it found it"
+            );
+
+            // `syslog(type, buf, len)`: each of the three words refuses in
+            // its own way. A type nobody has is EINVAL; a read with no
+            // buffer is EINVAL; and the console level wants its level in
+            // 1..=8, which is the only place the third word is a NUMBER and
+            // not a length -- read as a signed one, so a -1 that a wider
+            // cast would turn into something huge and positive is EINVAL
+            // here.
+            assert_eq!(
+                by_number(sys, Sys::SYSLOG, [99, 0, 0, 0, 0, 0]).await,
+                errno(LxError::EINVAL),
+                "syslog took the type from another word"
+            );
+            assert_eq!(
+                by_number(sys, Sys::SYSLOG, [2, 0, 16, 0, 0, 0]).await,
+                errno(LxError::EINVAL),
+                "syslog read into a buffer it was not given"
+            );
+            assert_eq!(by_number(sys, Sys::SYSLOG, [8, 0, 5, 0, 0, 0]).await, 0);
+            assert_eq!(
+                by_number(sys, Sys::SYSLOG, [8, 0, 9, 0, 0, 0]).await,
+                errno(LxError::EINVAL),
+                "syslog took a console level nobody has"
+            );
+            let mut log = [0u8; 32];
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::SYSLOG,
+                    [2, log.as_mut_ptr() as usize, -1isize as usize, 0, 0, 0]
+                )
+                .await,
+                errno(LxError::EINVAL),
+                "syslog read its length as an unsigned number"
+            );
+        })
+    });
+    linux_object::uname::set_domainname(&was_domain);
 }
