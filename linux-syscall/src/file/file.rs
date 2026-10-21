@@ -3271,6 +3271,13 @@ mod sendfile_and_copy_tests;
 #[cfg(test)]
 mod durability_tests;
 
+/// What `fallocate` does to the file. `fallocate_mode_tests` decodes the
+/// mode word; what nothing could see from there is that two of those modes
+/// promise the range **reads back as zeros afterwards**, and that a caller
+/// probing for a mode on a read-only descriptor is told about the mode.
+#[cfg(test)]
+mod fallocate_wiring_tests;
+
 /// `SYNC_IOC_MERGE` is `_IOWR('>', 3, struct sync_merge_data)`: type `'>'`
 /// (0x3e), nr 3, 48 bytes. Matched on type and nr, like the DRM syncobj fd
 /// ioctls: the struct is UABI-frozen, and a size-pinned constant is how this
