@@ -26,6 +26,8 @@ mod limits;
 /// `/proc/present`, in its own file: `procfs.rs` sits on the size ratchet.
 mod present;
 #[cfg(test)]
+mod seq_tests;
+#[cfg(test)]
 mod stat_tests;
 /// `/proc/<pid>/status`, in its own file for the same reason.
 mod status;
@@ -1288,6 +1290,10 @@ impl INode for ProcTidFileINode {
         slice_read_at(&self.bytes()?, offset, buf)
     }
 
+    fn seq_text(&self) -> Option<Result<Vec<u8>>> {
+        Some(self.bytes())
+    }
+
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
         Err(FsError::NotSupported)
     }
@@ -1397,6 +1403,10 @@ impl ProcTidCommINode {
 impl INode for ProcTidCommINode {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
         slice_read_at(&self.bytes()?, offset, buf)
+    }
+
+    fn seq_text(&self) -> Option<Result<Vec<u8>>> {
+        Some(self.bytes())
     }
 
     fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
@@ -2239,7 +2249,8 @@ fn proc_sys_pipe_max_size_content() -> String {
     String::from("1048576\n")
 }
 
-/// Proc file that regenerates text on each read (no snapshot in `find()`).
+/// Proc file that regenerates text on each read (no snapshot in `find()`),
+/// a `seq_file` on Linux: an open one reads one copy ([`INode::seq_text`]).
 struct ProcSeqINode {
     inode: usize,
     generate: fn() -> String,
@@ -2275,6 +2286,10 @@ impl INode for ProcSeqINode {
         seq_read_at(self.generate, offset, buf)
     }
 
+    fn seq_text(&self) -> Option<Result<Vec<u8>>> {
+        Some(Ok((self.generate)().into_bytes()))
+    }
+
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
         Err(FsError::NotSupported)
     }
@@ -2298,6 +2313,38 @@ impl INode for ProcSeqINode {
 
     fn fs(&self) -> Arc<dyn FileSystem> {
         Arc::new(ProcFS)
+    }
+}
+
+/// A `/proc/sys` value that is only read: read like [`ProcSeqINode`], but no
+/// `seq_file`. Linux answers each read of one at its offset (`proc_sys_read`)
+/// and seeks it as a file of size 0 (`default_llseek`), so `lseek` from its
+/// end is not `EINVAL` as it is for the rest of `/proc`.
+struct ProcSysValueINode(ProcSeqINode);
+
+impl INode for ProcSysValueINode {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        self.0.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
+        self.0.write_at(offset, buf)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        self.0.poll()
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        self.0.metadata()
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        self.0.fs()
     }
 }
 
@@ -2563,6 +2610,16 @@ impl ProcPidFileINode {
 impl INode for ProcPidFileINode {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
         slice_read_at(&self.bytes()?, offset, buf)
+    }
+
+    /// Every one but `cmdline` and `environ`, which Linux reads from the
+    /// process's memory at each offset (`proc_pid_cmdline_read`,
+    /// `environ_read`) and seeks as files of size 0.
+    fn seq_text(&self) -> Option<Result<Vec<u8>>> {
+        match self.kind {
+            ProcPidFileKind::Cmdline | ProcPidFileKind::Environ => None,
+            _ => Some(self.bytes()),
+        }
     }
 
     /// `comm` renames the process's leader, as `task/<pid>/comm` does.
@@ -3913,14 +3970,14 @@ lazy_static! {
     static ref PROC_NET_DIR: Arc<dyn INode> = Arc::new(ProcNetDirINode);
     static ref PROC_SYS_DIR: Arc<dyn INode> = Arc::new(ProcSysDirINode);
     static ref PROC_SYS_KERNEL_DIR: Arc<dyn INode> = Arc::new(ProcSysKernelDirINode);
-    static ref PROC_PERF_PARANOID: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    static ref PROC_PERF_PARANOID: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 42,
         generate: proc_perf_event_paranoid_content,
-    });
-    static ref PROC_KPTR_RESTRICT: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_KPTR_RESTRICT: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 43,
         generate: proc_kptr_restrict_content,
-    });
+    }));
     static ref PROC_PERF_DIR: Arc<dyn INode> = Arc::new(ProcPerfDirINode);
     static ref PROC_PERF_SYSCALLS: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 44,
@@ -4232,48 +4289,48 @@ lazy_static! {
         generate: proc_sys_domainname_content,
         store: store_domainname,
     });
-    static ref PROC_SYS_OSTYPE: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    static ref PROC_SYS_OSTYPE: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 53,
         generate: proc_sys_ostype_content,
-    });
-    static ref PROC_SYS_OSRELEASE: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_SYS_OSRELEASE: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 54,
         generate: proc_sys_osrelease_content,
-    });
-    static ref PROC_SYS_VERSION: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_SYS_VERSION: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 55,
         generate: proc_sys_version_content,
-    });
-    static ref PROC_SYS_PID_MAX: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_SYS_PID_MAX: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 56,
         generate: proc_sys_pid_max_content,
-    });
-    static ref PROC_SYS_NGROUPS_MAX: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_SYS_NGROUPS_MAX: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 57,
         generate: proc_sys_ngroups_max_content,
-    });
-    static ref PROC_SYS_THREADS_MAX: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_SYS_THREADS_MAX: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 58,
         generate: proc_sys_threads_max_content,
-    });
-    static ref PROC_SYS_OVERFLOWUID: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_SYS_OVERFLOWUID: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         // Its own: 107 is `/proc/gpuroles`'s.
         inode: 112,
         generate: proc_sys_overflowuid_content,
-    });
-    static ref PROC_SYS_OVERFLOWGID: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_SYS_OVERFLOWGID: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 108,
         generate: proc_sys_overflowgid_content,
-    });
+    }));
     static ref PROC_SYS_KERNEL_RANDOM_DIR: Arc<dyn INode> = Arc::new(ProcSysKernelRandomDirINode);
-    static ref PROC_SYS_BOOT_ID: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    static ref PROC_SYS_BOOT_ID: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 60,
         generate: proc_sys_boot_id_content,
-    });
-    static ref PROC_SYS_UUID: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_SYS_UUID: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 61,
         generate: proc_sys_uuid_content,
-    });
+    }));
     static ref PROC_SYSVIPC_DIR: Arc<dyn INode> = Arc::new(ProcSysvipcDirINode);
     static ref PROC_SYSVIPC_MSG: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 22,
@@ -4288,40 +4345,40 @@ lazy_static! {
         generate: proc_sysvipc_shm_content,
     });
     static ref PROC_SYS_VM_DIR: Arc<dyn INode> = Arc::new(ProcSysVmDirINode);
-    static ref PROC_SYS_OVERCOMMIT: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    static ref PROC_SYS_OVERCOMMIT: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 63,
         generate: proc_sys_overcommit_content,
-    });
-    static ref PROC_SYS_MAX_MAP_COUNT: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_SYS_MAX_MAP_COUNT: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 64,
         generate: proc_sys_max_map_count_content,
-    });
+    }));
     static ref PROC_SYS_FS_DIR: Arc<dyn INode> = Arc::new(ProcSysFsDirINode);
-    static ref PROC_SYS_FILE_MAX: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    static ref PROC_SYS_FILE_MAX: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 66,
         generate: proc_sys_file_max_content,
-    });
-    static ref PROC_SYS_NR_OPEN: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_SYS_NR_OPEN: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 67,
         generate: proc_sys_nr_open_content,
-    });
-    static ref PROC_SYS_PIPE_MAX_SIZE: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_SYS_PIPE_MAX_SIZE: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 68,
         generate: proc_sys_pipe_max_size_content,
-    });
+    }));
     static ref PROC_SYS_FS_INOTIFY_DIR: Arc<dyn INode> = Arc::new(ProcSysFsInotifyDirINode);
-    static ref PROC_SYS_INOTIFY_MAX_USER_WATCHES: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    static ref PROC_SYS_INOTIFY_MAX_USER_WATCHES: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 25,
         generate: proc_sys_inotify_max_user_watches_content,
-    });
-    static ref PROC_SYS_INOTIFY_MAX_USER_INSTANCES: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_SYS_INOTIFY_MAX_USER_INSTANCES: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 26,
         generate: proc_sys_inotify_max_user_instances_content,
-    });
-    static ref PROC_SYS_INOTIFY_MAX_QUEUED_EVENTS: Arc<dyn INode> = Arc::new(ProcSeqINode {
+    }));
+    static ref PROC_SYS_INOTIFY_MAX_QUEUED_EVENTS: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 27,
         generate: proc_sys_inotify_max_queued_events_content,
-    });
+    }));
     static ref PROC_NET_TCP: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 70,
         generate: proc_net_tcp_content,

@@ -109,6 +109,15 @@ pub trait INode: Any + Sync + Send {
         None
     }
 
+    /// The whole of a file that is written out when it is read, as a
+    /// `seq_file` of `/proc` is on Linux: an open file reads one copy of it
+    /// until a read starts elsewhere than where the last one ended, and it
+    /// has no end to `lseek` from. `None` for every other inode, and an error
+    /// when there is nothing to write out now, as for a process that is gone.
+    fn seq_text(&self) -> Option<Result<Vec<u8>>> {
+        None
+    }
+
     /// Control device
     fn io_control(&self, _cmd: u32, _data: usize) -> Result<usize> {
         Err(FsError::NotSupported)

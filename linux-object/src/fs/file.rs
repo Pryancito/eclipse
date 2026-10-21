@@ -1,6 +1,6 @@
 //! File handle for process
 
-use alloc::{boxed::Box, string::String, sync::Arc};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
 use async_trait::async_trait;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -268,6 +268,12 @@ struct FileInner {
     flags: OpenFlags,
     /// file INode
     inode: Arc<dyn INode>,
+    /// The copy of a file written out when it is read that this open file
+    /// reads, and where the last read of it ended: `seq_file`'s `buf` and
+    /// `read_pos` (see [`File::seq_read`]).
+    seq: Option<(Vec<u8>, u64)>,
+    /// The inode said it is no such file, so no read asks it again.
+    not_seq: bool,
 }
 
 /// file implement struct
@@ -1094,6 +1100,8 @@ impl File {
                 offset: 0,
                 flags,
                 inode,
+                seq: None,
+                not_seq: false,
             }),
         })
     }
@@ -1121,6 +1129,15 @@ impl File {
         // "succeeds" and advances a phantom offset that nothing else uses.
         if self.is_pipe_or_fifo() {
             return Err(LxError::ESPIPE);
+        }
+        // A file written out when it is read has no end to seek from
+        // (`seq_lseek`). Asked with no lock held: writing out
+        // `/proc/self/fdinfo/N` of this very descriptor reads its flags.
+        if let SeekFrom::End(_) = pos {
+            let inode = self.inner.read().inode.clone();
+            if inode.seq_text().is_some() {
+                return Err(LxError::EINVAL);
+            }
         }
         let mut inner = self.inner.write();
         // Compute the new offset with checked arithmetic and reject results
@@ -1190,6 +1207,53 @@ impl File {
     /// get the name of dir entry
     pub fn read_entry(&self) -> LxResult<String> {
         Ok(self.read_entry_with_metadata()?.1)
+    }
+
+    /// A read of a file written out when it is read ([`INode::seq_text`]),
+    /// as `seq_read` does one: from the copy the last read left when it
+    /// starts where that one ended (`kept` says there is one), else from a
+    /// new copy, which the next read goes on from; `advance` moves the file
+    /// position, as `read` does and `pread` does not. `None` for any other
+    /// file, which the open file then remembers: asking cost every other
+    /// `read` some 70 instructions.
+    ///
+    /// Each `read` wrote the whole file out again. A read in pieces, as
+    /// stdio's is with a buffer of `st_blksize` (1024 in `/proc`), could mix
+    /// two states of the process and paid for the whole file at each piece.
+    /// The copy is written out with no lock held, for the reason
+    /// [`Self::seek`] gives.
+    fn seq_read(
+        &self,
+        inode: &Arc<dyn INode>,
+        kept: bool,
+        offset: u64,
+        buf: &mut [u8],
+        advance: bool,
+    ) -> Option<LxResult<usize>> {
+        let copy = match kept {
+            true => self.inner.write().seq.take(),
+            false => None,
+        };
+        let text = match copy {
+            Some((text, end)) if end == offset => text,
+            _ => match inode.seq_text() {
+                Some(Ok(text)) => text,
+                Some(Err(e)) => return Some(Err(e.into())),
+                None => {
+                    self.inner.write().not_seq = true;
+                    return None;
+                }
+            },
+        };
+        let from = text.len().min(offset as usize);
+        let len = (text.len() - from).min(buf.len());
+        buf[..len].copy_from_slice(&text[from..from + len]);
+        let mut inner = self.inner.write();
+        inner.seq = Some((text, offset + len as u64));
+        if advance {
+            inner.offset += len as u64;
+        }
+        Some(Ok(len))
     }
 
     /// Hand back the entry [`read_entry_with_metadata`](Self::read_entry_with_metadata)
@@ -1335,13 +1399,24 @@ impl FileLike for File {
     }
 
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
-        let (offset, flags, inode) = {
+        let (offset, flags, inode, kept, not_seq) = {
             let inner = self.inner.read();
-            (inner.offset, inner.flags, inner.inode.clone())
+            (
+                inner.offset,
+                inner.flags,
+                inner.inode.clone(),
+                inner.seq.is_some(),
+                inner.not_seq,
+            )
         };
 
         if !flags.readable() {
             return Err(LxError::EBADF);
+        }
+        if !not_seq {
+            if let Some(len) = self.seq_read(&inode, kept, offset, buf, true) {
+                return len;
+            }
         }
 
         let len = if !flags.non_block() {
@@ -1412,13 +1487,23 @@ impl FileLike for File {
         if self.is_pipe_or_fifo() {
             return Err(LxError::ESPIPE);
         }
-        let (flags, inode) = {
+        let (flags, inode, kept, not_seq) = {
             let inner = self.inner.read();
-            (inner.flags, inner.inode.clone())
+            (
+                inner.flags,
+                inner.inode.clone(),
+                inner.seq.is_some(),
+                inner.not_seq,
+            )
         };
 
         if !flags.readable() {
             return Err(LxError::EBADF);
+        }
+        if !not_seq {
+            if let Some(len) = self.seq_read(&inode, kept, offset, buf, false) {
+                return len;
+            }
         }
 
         if !flags.non_block() {
@@ -1826,6 +1911,9 @@ fn regular_file_readable_bytes(type_: FileType, size: usize, offset: u64) -> Opt
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod seq_tests;
 
 #[cfg(test)]
 mod fionread_tests {
