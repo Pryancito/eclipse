@@ -733,6 +733,15 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 linux_object::fs::devfs::drm::set_atomic_enabled(true);
                 klog_info!("Eclipse: DRM atomic modesetting ENABLED (drm.atomic)");
             }
+            // `DRM_MASTER` on the modeset ioctls (`drm_ioctl_permit`: EACCES
+            // to anyone but the current master) is OPT-IN too: switched on
+            // blind it could leave a compositor that is not the first open of
+            // card0 without a screen. Boot with `drm.master_check`; AUTH_MAGIC
+            // and the leases demand the master either way.
+            if kernel_hal::cmdline::flag(&options.cmdline, "drm.master_check") {
+                linux_object::fs::devfs::drm_scheme::set_master_check_enabled(true);
+                klog_info!("Eclipse: DRM_MASTER check ENABLED (drm.master_check)");
+            }
             // Sincronizacion implicita en los buffers que un proceso presta
             // a otro, ENCENDIDA por defecto: un EXEC espera a lo que el dueno
             // del buffer tenga en vuelo antes de leerlo, que es lo que en
