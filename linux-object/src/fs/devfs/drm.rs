@@ -1692,6 +1692,7 @@ impl Drop for DrmFileState {
         // `drm_master_release`: the master goes with the file that held it,
         // and so does the magic it minted.
         master_release(self.minor, self as *const DrmFileState as usize);
+        super::drm_scheme::master_check::forget(self as *const DrmFileState as usize);
     }
 }
 

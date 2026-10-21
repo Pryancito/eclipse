@@ -109,7 +109,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_GET_UNIQUE` | ✅ | el *busid* del master como `drm_getunique`: vacío (longitud 0) hasta que `SET_VERSION` pide la interfaz 1.1 o posterior (`drm_set_busid`), luego `pci:DDDD:BB:SS.F` del dispositivo PCI que nombra el enlace `device` del nodo en sysfs (`drm_pci_set_busid`; `zcore-gpu` para un nodo sin PCI detrás); copia solo si cabe entero, sin NUL, y un `unique_len` con puntero nulo es EFAULT. Se va con el master (`DROP_MASTER` o cierre). Xorg lo parsea para encontrar el `pci_device` del nodo y elegir la GPU primaria |
 | `DRM_IOCTL_SET_VERSION` | ✅ | interfaz 1.4 y la versión del driver que da VERSION; valida el par pedido (major y minor) como `drm_setversion` (lo usa Xorg/modesetting); una interfaz 1.1+ aceptada fija el *busid* que da GET_UNIQUE |
 | `DRM_IOCTL_GET_MAGIC` / `AUTH_MAGIC` | ✅ | magic por fichero, minted una vez; `AUTH_MAGIC` solo desde el master (EACCES), de un magic de ese nodo (EINVAL) y una sola vez; autentica al dueño del magic (`drm_file.authenticated`, que también tiene quien toma el master y todo `open` de root, como en `drm_file_alloc`) |
-| `DRM_IOCTL_SET_MASTER` / `DROP_MASTER` | ✅ | un master por nodo: el primer `open` lo toma (`drm_master_open`), `SET_MASTER` con otro fichero como master es EBUSY, `DROP_MASTER` sin serlo es EINVAL; se suelta al cerrar el fd; conmuta la consola de texto del kernel (KD_GRAPHICS/KD_TEXT) |
+| `DRM_IOCTL_SET_MASTER` / `DROP_MASTER` | ✅ | un master por nodo: el primer `open` lo toma (`drm_master_open`), `SET_MASTER` con otro fichero como master es EBUSY, `DROP_MASTER` sin serlo es EINVAL; con `drm.master_check`, antes de eso, `drm_master_check_perm`: EACCES a un fd que nunca fue master o que lo fue pero lo llama otro proceso que el que lo abrió, salvo root; se suelta al cerrar el fd; conmuta la consola de texto del kernel (KD_GRAPHICS/KD_TEXT) |
 | `DRM_IOCTL_GET_CLIENT` / `GET_STATS` / `FINISH` / `SET_UNIQUE` / `BLOCK` / `UNBLOCK` / `ADD_DRAW` / `RM_DRAW` / `UPDATE_DRAW` / `MODE_ATTACHMODE` / `MODE_DETACHMODE` | ✅ | los huecos de `drm_ioctl.c`: `GET_CLIENT` solo responde `idx == 0` (con `auth` = `authenticated`, el pid del que llama, `uid` = *overflowuid* y magic/iocs a 0; otro idx es EINVAL, lo que para la enumeración de libva), `GET_STATS` pone la struct a cero, `FINISH` es un no-op `DRM_AUTH` (EACCES sin autenticar), `SET_UNIQUE` es `drm_invalid_op` y `BLOCK`…`UPDATE_DRAW` no-ops, todos `DRM_ROOT_ONLY` (EACCES sin `CAP_SYS_ADMIN`; el master no se exige, ver más abajo), `ATTACHMODE`/`DETACHMODE` no-ops |
 | `DRM_IOCTL_GET_CAP` | ✅ | ver tabla de *caps* |
 | `DRM_IOCTL_SET_CLIENT_CAP` | ✅ | `ATOMIC` según `drm.atomic` (ver sección atómico), y como `drm_setclientcap` su valor se guarda a la vez en `atomic`, `universal_planes` y `aspect_ratio_allowed` («No atomic user-space blows up on aspect ratio mode data»): un cliente atómico recibe y devuelve los códigos de aspecto sin pedir `ASPECT_RATIO`, y `ATOMIC` 0 se los quita; `WRITEBACK` solo para clientes atómicos (EINVAL como Linux); `UNIVERSAL_PLANES` y `ASPECT_RATIO` booleanos que se recuerdan por open; `STEREO_3D` aceptado; `CURSOR_PLANE_HOTSPOT` EOPNOTSUPP |
@@ -338,9 +338,12 @@ Detalles:
   primer `open` como en `drm_master_open`), y **los ioctls que Linux marca
   `DRM_MASTER` lo exigen solo con `drm.master_check`** (opt-in: EACCES a quien
   no es master, antes de leer el argumento, como `drm_ioctl_permit`; sin el
-  flag cualquiera puede emitirlos). `AUTH_MAGIC` y los arrendamientos lo exigen
-  siempre. Es opt-in porque encenderlo a ciegas podía dejar sin pantalla a un
-  compositor que no sea el primer `open` de `card0`.
+  flag cualquiera puede emitirlos), y con el mismo flag `SET_MASTER` y
+  `DROP_MASTER` pasan por `drm_master_check_perm` (EACCES a quien no fue master
+  desde su propio proceso ni es root, antes del EBUSY o el EINVAL). `AUTH_MAGIC`
+  y los arrendamientos lo exigen siempre. Es opt-in porque encenderlo a ciegas
+  podía dejar sin pantalla a un compositor que no sea el primer `open` de
+  `card0`.
 - **`drm-usage-stats.rst` (fdinfo)**. No se exponen estadísticas de
   uso/memoria/engine por `fdinfo`.
 - **Render / 3D**. No hay aceleración: se usa el render por software de Mesa
@@ -364,7 +367,7 @@ esto no:
 | Sin caché de dma-buf por objeto ni de handles PRIME por fichero | Tope GEM subido a 256; sigue sin dedup PRIME por fichero |
 | ~~`ADDFB2` no valida formato, flags ni modifiers~~ | **Corregido:** `framebuffer_check` entero (fila de la tabla de ioctls); un modifier con tiling es EINVAL |
 | El límite de clips de `DIRTYFB` es 64 donde Linux usa 256, y `ANNOTATE_COPY` no está | Cada frame con más daño cae al blit de pantalla completa por CPU |
-| ~~Los ioctls `DRM_MASTER` no comprueban el master (que sí existe)~~ | **Corregido, opt-in:** con `drm.master_check` los doce ioctls de modeset que `drm_ioctls[]` marca `DRM_MASTER` (`SETCRTC`, `SETPLANE`, `CURSOR`/`CURSOR2`, `SETGAMMA`, `ATTACHMODE`/`DETACHMODE`, `SETPROPERTY`, `PAGE_FLIP`, `DIRTYFB`, `OBJ_SETPROPERTY`, `ATOMIC`) son EACCES para quien no es master, antes de leer el argumento; sin el flag siguen abiertos a cualquiera |
+| ~~Los ioctls `DRM_MASTER` no comprueban el master (que sí existe)~~ | **Corregido, opt-in:** con `drm.master_check` los doce ioctls de modeset que `drm_ioctls[]` marca `DRM_MASTER` (`SETCRTC`, `SETPLANE`, `CURSOR`/`CURSOR2`, `SETGAMMA`, `ATTACHMODE`/`DETACHMODE`, `SETPROPERTY`, `PAGE_FLIP`, `DIRTYFB`, `OBJ_SETPROPERTY`, `ATOMIC`) son EACCES para quien no es master, antes de leer el argumento, y `SET_MASTER`/`DROP_MASTER` son EACCES (`drm_master_check_perm`) a un fd que nunca fue master o que lo llama otro proceso que el que lo abrió, salvo root; sin el flag siguen abiertos a cualquiera |
 | `GET_CLIENT` no existe | libva da la inicialización por fallida: sin VA-API |
 | Sin `GAMMA_LUT`/`CTM` | gammastep, luz nocturna y la gamma de RandR no hacen nada |
 | Sin `IN_FORMATS` en el plano | Inocuo mientras `DRM_CAP_ADDFB2_MODIFIERS` sea 0; obligatorio el día que se ponga a 1 |
