@@ -129,6 +129,7 @@ fn gem_pushbuf_checks_what_linux_checks_before_it_submits() {
     for b in bos.iter_mut() {
         b.handle = object(&gpu, A, 4096, None);
         b.valid_domains = nv::NOUVEAU_GEM_DOMAIN_GART;
+        b.read_domains = nv::NOUVEAU_GEM_DOMAIN_GART;
     }
     pushes[1].bo_index = 2;
     let mut r = pushbuf_req(c, 2, push, 2, buffers);
@@ -154,15 +155,16 @@ fn gem_pushbuf_checks_what_linux_checks_before_it_submits() {
 }
 
 /// `nouveau_gem_pushbuf_validate` before the submission, hatch or no
-/// hatch: `validate_init` walks the list in order -- a handle that is not
-/// a GEM object the caller may use is ENOENT (another client's, unless
-/// the caller holds it as a PRIME import; a handle nobody has), and one
-/// listed twice is EINVAL -- and only then `validate_list` wants
-/// `valid_domains` to name VRAM or GART (EINVAL for an empty mask or one
-/// with other bits only; either domain alone passes). Every refusal
-/// writes the suffixes, like any error past the copy. The list went
-/// unread: a stranger's handle or a duplicate reached the submission
-/// as good as a real buffer.
+/// hatch: `validate_init` walks the list in order and judges each entry
+/// whole before the next -- a handle that is not a GEM object the caller
+/// may use is ENOENT (another client's, unless the caller holds it as a
+/// PRIME import; a handle nobody has), one listed twice is EINVAL, and
+/// `valid_domains` has to name VRAM or GART (EINVAL for an empty mask or
+/// one with other bits only) -- and only then `validate_list` asks
+/// `nouveau_gem_set_domain` whether the entry's domains meet the
+/// object's. Every refusal writes the suffixes, like any error past the
+/// copy. The list went unread: a stranger's handle or a duplicate reached
+/// the submission as good as a real buffer.
 #[test]
 fn gem_pushbuf_validates_the_buffer_list_like_validate_init() {
     let _g = LOCK.lock();
@@ -173,6 +175,7 @@ fn gem_pushbuf_validates_the_buffer_list_like_validate_init() {
     let imported = object(&gpu, B, 8192, Some(0x2000_0000));
     assert!(crate::scheme::gem_mmap::add_ref(imported, A).is_some());
     let theirs = object(&gpu, B, 4096, None);
+    let in_vram = vram_object(&gpu, A, 65536);
     let mut pushes = [push_of(0, 0, 16)];
     let push = pushes.as_mut_ptr() as u64;
     let gart = nv::NOUVEAU_GEM_DOMAIN_GART;
@@ -226,27 +229,106 @@ fn gem_pushbuf_validates_the_buffer_list_like_validate_init() {
         "neither VRAM nor GART"
     );
     assert_eq!(
-        try_list(&mut [with(mine, vram)]),
+        try_list(&mut [with(in_vram, vram)]),
         Err(nv::EOPNOTSUPP),
-        "VRAM alone"
+        "VRAM alone, for an object in VRAM"
     );
     assert_eq!(
         try_list(&mut [with(mine_too, gart)]),
         Err(nv::EOPNOTSUPP),
-        "GART alone"
+        "GART alone, for an object in GART"
     );
-    // `validate_init` runs over the whole list before `validate_list`
-    // looks at a domain: the unknown handle wins over the empty mask
-    // listed before it.
+    // `validate_init` judges an entry whole before it looks at the next:
+    // the empty mask listed first wins over the unknown handle after it.
     assert_eq!(
         try_list(&mut [with(mine, 0), with(0xdead, gart)]),
-        Err(nv::ENOENT),
-        "the list is looked up before any domain is judged"
+        Err(nv::EINVAL),
+        "each entry is judged whole before the next is looked up"
     );
     assert_eq!(
         try_list(&mut [with(mine, gart), with(mine_too, 0)]),
         Err(nv::EINVAL),
         "and the domain of every entry is judged"
+    );
+}
+
+/// `validate_list`, `nouveau_gem_set_domain` for each entry: the entry's
+/// `valid_domains`, the object's own (what `GEM_NEW` asked for, VRAM|GART at
+/// most) and the domains the push writes it in -- or reads it in, when it
+/// writes nowhere -- have to meet somewhere, or it is EINVAL ("fail
+/// set_domain"). So a GART-only object cannot be listed as VRAM-only, a
+/// write to VRAM decides over a read anywhere, and an entry that neither
+/// reads nor writes has no domain to meet in. An object created VRAM|GART
+/// keeps both for validation wherever it was put, which is what libdrm
+/// relies on when it lists one as VRAM-only.
+#[test]
+fn gem_pushbuf_set_domain_wants_a_domain_the_object_may_sit_in() {
+    let _g = LOCK.lock();
+    let gpu = gpu_rm();
+    let c = channel_alloc(&gpu, A).unwrap().channel as u32;
+    let gart = nv::NOUVEAU_GEM_DOMAIN_GART;
+    let vram = nv::NOUVEAU_GEM_DOMAIN_VRAM;
+    let in_gart = object(&gpu, A, 65536, Some(0x1000_0000));
+    let either = gem_new_rm(&gpu, 65536, vram | gart, A).unwrap().handle;
+    {
+        let gem = gpu.nouveau_gem.lock();
+        let o = gem.iter().find(|o| o.handle == either).unwrap();
+        assert_eq!((o.domain, o.valid_domains), (gart, vram | gart));
+    }
+    let mut pushes = [push_of(0, 0, 16)];
+    let push = pushes.as_mut_ptr() as u64;
+    let try_one = |handle: u32, valid: u32, read: u32, write: u32| {
+        let mut b = bo(handle);
+        b.valid_domains = valid;
+        b.read_domains = read;
+        b.write_domains = write;
+        let mut list = [b];
+        let mut r = pushbuf_req(c, 1, push, 1, list.as_mut_ptr() as u64);
+        let got = pushbuf(&gpu, &mut r, A);
+        assert_eq!((r.suffix0, r.suffix1), (0, 0), "written on the way out");
+        got
+    };
+    let both = vram | gart;
+
+    assert_eq!(
+        try_one(in_gart, both, both, 0),
+        Err(nv::EOPNOTSUPP),
+        "read anywhere"
+    );
+    assert_eq!(
+        try_one(in_gart, vram, both, 0),
+        Err(nv::EINVAL),
+        "listed VRAM-only, an object GEM_NEW put in GART only"
+    );
+    assert_eq!(
+        try_one(in_gart, both, vram, 0),
+        Err(nv::EINVAL),
+        "read in VRAM only"
+    );
+    assert_eq!(
+        try_one(in_gart, both, both, vram),
+        Err(nv::EINVAL),
+        "written in VRAM: the write domains decide over the read ones"
+    );
+    assert_eq!(
+        try_one(in_gart, both, 0, gart),
+        Err(nv::EOPNOTSUPP),
+        "written in GART, read nowhere"
+    );
+    assert_eq!(
+        try_one(in_gart, both, 0, 0),
+        Err(nv::EINVAL),
+        "neither read nor written: no domain to meet in"
+    );
+    assert_eq!(
+        try_one(either, vram, vram, 0),
+        Err(nv::EOPNOTSUPP),
+        "created VRAM|GART and put in GART, it may still be listed as VRAM"
+    );
+    assert_eq!(
+        try_one(either, gart, gart, 0),
+        Err(nv::EOPNOTSUPP),
+        "...or as GART"
     );
 }
 
@@ -270,7 +352,8 @@ fn bo(handle: u32) -> nv::DrmNouveauGemPushbufBo {
     nv::DrmNouveauGemPushbufBo {
         user_priv: 0,
         handle,
-        read_domains: 0,
+        // What libdrm puts on a `NOUVEAU_BO_RD` reference to a VRAM|GART bo.
+        read_domains: nv::NOUVEAU_GEM_DOMAIN_VRAM | nv::NOUVEAU_GEM_DOMAIN_GART,
         write_domains: 0,
         valid_domains: nv::NOUVEAU_GEM_DOMAIN_VRAM | nv::NOUVEAU_GEM_DOMAIN_GART,
         presumed: nv::DrmNouveauGemPushbufBoPresumed {

@@ -13988,6 +13988,8 @@ impl NvidiaGpu {
                     phys_addr,
                     vram_offset,
                     domain: used_domain,
+                    valid_domains: req.info.domain
+                        & (nv::NOUVEAU_GEM_DOMAIN_VRAM | nv::NOUVEAU_GEM_DOMAIN_GART),
                     // Remember what was asked for so GEM_INFO round-trips it.
                     // The allocation itself is linear; a non-zero PTE kind is
                     // programmed (or refused) at VM_BIND time, which is where

@@ -260,6 +260,7 @@ fn object(gpu: &NvidiaGpu, owner: u64, size: u64, phys: Option<u64>) -> u32 {
         phys_addr: phys,
         vram_offset: None,
         domain: nv::NOUVEAU_GEM_DOMAIN_GART,
+        valid_domains: nv::NOUVEAU_GEM_DOMAIN_GART,
         tile_mode: 0x10,
         tile_flags: 0x600,
     });
@@ -277,6 +278,7 @@ fn vram_object(gpu: &NvidiaGpu, owner: u64, size: u64) -> u32 {
     let mut gem = gpu.nouveau_gem.lock();
     let obj = gem.iter_mut().find(|o| o.handle == handle).unwrap();
     obj.domain = nv::NOUVEAU_GEM_DOMAIN_VRAM;
+    obj.valid_domains = nv::NOUVEAU_GEM_DOMAIN_VRAM;
     obj.vram_offset = Some(0x100_0000 * u64::from(handle & 0xff));
     handle
 }

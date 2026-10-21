@@ -23,15 +23,20 @@ pub(super) struct ResolvedBo {
 impl super::NvidiaGpu {
     /// `nouveau_gem_pushbuf_validate` before anything is mapped, hatch or
     /// no hatch: `validate_init` walks the buffer list in order and judges
-    /// each entry before the next -- a handle that is not a GEM object the
-    /// caller may use (its own, or a PRIME import it holds) is ENOENT
-    /// ("Unknown handle"), and a handle listed twice is EINVAL ("multiple
-    /// instances of buffer"); then `validate_list` passes each entry
-    /// through `nouveau_gem_set_domain`, where `valid_domains` naming
-    /// neither VRAM nor GART is EINVAL ("invalid valid domains"). The list
-    /// went unread: a stranger's handle, a duplicate or an empty domain
-    /// mask reached the (refused) submission as good as a real buffer.
-    /// Each entry is read before the table's lock is taken.
+    /// each entry whole before the next -- a handle that is not a GEM
+    /// object the caller may use (its own, or a PRIME import it holds) is
+    /// ENOENT ("Unknown handle"), a handle listed twice is EINVAL
+    /// ("multiple instances of buffer"), and `valid_domains` naming neither
+    /// VRAM nor GART is EINVAL ("invalid valid domains"); then
+    /// `validate_list` passes each entry through `nouveau_gem_set_domain`,
+    /// where the entry's `valid_domains`, the object's own (what `GEM_NEW`
+    /// allowed) and its write domains -- or its read domains when it writes
+    /// nowhere -- have to meet, or it is EINVAL ("fail set_domain"). Linux
+    /// would then move the object into the meeting; this driver never
+    /// moves one, so the meeting is all it asks. The list went unread: a
+    /// stranger's handle, a duplicate or an empty domain mask reached the
+    /// (refused) submission as good as a real buffer. Each entry is read
+    /// before the table's lock is taken.
     pub(super) fn pushbuf_validate(
         &self,
         bos: &[nv::DrmNouveauGemPushbufBo],
@@ -56,12 +61,30 @@ impl super::NvidiaGpu {
                 );
                 return Err(nv::EINVAL);
             }
-        }
-        for (i, bo) in bos.iter().enumerate() {
             let valid = bo.valid_domains;
             if valid & (nv::NOUVEAU_GEM_DOMAIN_VRAM | nv::NOUVEAU_GEM_DOMAIN_GART) == 0 {
                 crate::klog_warn!(
                     "[nouveau-uapi] GEM_PUSHBUF bo[{i}]: invalid valid domains: {valid:#010x} -> EINVAL"
+                );
+                return Err(nv::EINVAL);
+            }
+        }
+        for (i, bo) in bos.iter().enumerate() {
+            let wanted = if bo.write_domains != 0 {
+                bo.write_domains
+            } else {
+                bo.read_domains
+            };
+            let allowed = self
+                .nouveau_gem
+                .lock()
+                .iter()
+                .find(|o| o.handle == bo.handle)
+                .map_or(0, |o| o.valid_domains);
+            if bo.valid_domains & allowed & wanted == 0 {
+                crate::klog_warn!(
+                    "[nouveau-uapi] GEM_PUSHBUF bo[{i}]: fail set_domain (valid={:#x} object={allowed:#x} wanted={wanted:#x}) -> EINVAL",
+                    bo.valid_domains
                 );
                 return Err(nv::EINVAL);
             }

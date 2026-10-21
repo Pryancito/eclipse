@@ -472,6 +472,7 @@ mod tests {
             phys_addr: None,
             vram_offset: Some(PA),
             domain: super::super::super::nouveau_uapi::NOUVEAU_GEM_DOMAIN_VRAM,
+            valid_domains: super::super::super::nouveau_uapi::NOUVEAU_GEM_DOMAIN_VRAM,
             tile_mode: 0,
             tile_flags: 0,
         }

@@ -1526,6 +1526,13 @@ pub(super) struct NouveauGemObject {
     /// Domain actually used (`NOUVEAU_GEM_DOMAIN_GART` or `_VRAM`), so
     /// `GEM_INFO` reports the backing rather than a hardcoded VRAM lie.
     pub domain: u32,
+    /// The domains the object may be validated into (`nvbo->valid_domains`):
+    /// what `GEM_NEW` asked for, restricted to VRAM|GART, while `domain` is
+    /// where it actually sits. `GEM_PUSHBUF`'s `nouveau_gem_set_domain`
+    /// meets this with the entry's `valid_domains` and its write (or else
+    /// read) domains, and an empty meeting is EINVAL -- the one thing this
+    /// driver does with it, since it never moves an object.
+    pub valid_domains: u32,
     /// Tiling the client asked for at `GEM_NEW`, kept so `GEM_INFO` returns
     /// what was requested. `tile_flags`'s upper bits carry the PTE kind
     /// (`pte_kind << 8`); 0/0 is plain linear.
