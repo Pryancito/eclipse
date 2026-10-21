@@ -3108,6 +3108,12 @@ mod chmod_wiring_tests;
 #[cfg(test)]
 mod exit_wiring_tests;
 
+/// `clone3(2)` through the syscall and through its number: the size judged
+/// before the struct is read, the tail an extensible struct has to leave
+/// empty, and the eight decoded words reaching `sys_clone` as arguments.
+#[cfg(test)]
+mod clone3_wiring_tests;
+
 #[cfg(test)]
 mod comm_from_path_tests {
     //! `comm` after an `execve`: the last component of the path, which is
