@@ -2755,3 +2755,8 @@ mod info_layout_tests {
 /// all, and the park a blocked `semop` goes into.
 #[cfg(test)]
 mod sem_wiring_tests;
+
+/// `semctl` reached through the syscall: what its first argument names,
+/// which of its fourteen commands needs what, and the two stamps a set keeps.
+#[cfg(test)]
+mod semctl_wiring_tests;
