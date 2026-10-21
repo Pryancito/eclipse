@@ -66,10 +66,9 @@ fn a_real_time_policy_wants_its_priority_inside_the_band_it_announces() {
     }
 }
 
-/// The nice value is refused, not clamped. Clamping is right for
-/// `setpriority(2)` and wrong here: `sched_setattr` with nice 100 answered
-/// SUCCESS and stored 19, so a caller probing for the accepted range -- which
-/// is how a library finds out -- came away believing 100 was fine.
+/// A nice value out of range is refused here, not clamped. `sched_setattr`
+/// clamps it before it gets here, as Linux does (`sched_copy_attr`): that is
+/// `sched_attr_tests`.
 #[test]
 fn a_nice_outside_the_range_is_refused_and_not_clamped() {
     for nice in [MIN_NICE as i32, 0, MAX_NICE as i32] {

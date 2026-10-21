@@ -54,6 +54,7 @@ fn a_refused_switch_does_not_taint() {
         inner.credentials.ruid = 1000;
         inner.credentials.set_euid(1000);
         inner.credentials.suid = 1000;
+        inner.credentials.caps = Capabilities::for_uids(1000, 1000, 1000);
     }
     assert!(proc.set_uid(ROOT_UID).is_err());
     assert!(!proc.is_sugid());

@@ -140,13 +140,17 @@ impl Syscall<'_> {
             sys::PWRITE => BsdRet::from_result(self.sys_pwrite(a0.into(), a1.into(), a2, a3 as _)),
             sys::OPEN => match translate::open_flags_to_linux(a1 as i32) {
                 Err(e) => BsdRet::from_lx(e),
-                Ok(f) => {
-                    BsdRet::from_result(self.sys_openat(FileDesc::CWD, a0.into(), f as usize, a2))
-                }
+                Ok(f) => BsdRet::from_result(
+                    self.sys_openat_waiting(FileDesc::CWD, a0.into(), f as usize, a2)
+                        .await,
+                ),
             },
             sys::OPENAT => match translate::open_flags_to_linux(a2 as i32) {
                 Err(e) => BsdRet::from_lx(e),
-                Ok(f) => BsdRet::from_result(self.sys_openat(a0.into(), a1.into(), f as usize, a3)),
+                Ok(f) => BsdRet::from_result(
+                    self.sys_openat_waiting(a0.into(), a1.into(), f as usize, a3)
+                        .await,
+                ),
             },
             sys::CLOSE => BsdRet::from_result(self.sys_close(a0.into())),
             sys::CLOSE_RANGE => BsdRet::from_result(self.sys_close_range(a0, a1, a2)),

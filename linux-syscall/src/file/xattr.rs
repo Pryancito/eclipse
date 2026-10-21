@@ -140,7 +140,7 @@ impl Syscall<'_> {
             _ => XattrRequest::List,
         };
         let euid = proc.euid();
-        let admin = linux_object::process::has_capability(euid, CAP_SYS_ADMIN);
+        let admin = proc.capable(CAP_SYS_ADMIN);
         match linux_object::fs::eclipsefs_xattr(&inode, &path, request, euid, admin) {
             None => xattr_answer(op),
             Some(reply) => match reply? {

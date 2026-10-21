@@ -62,7 +62,8 @@ impl Syscall<'_> {
         if info.type_ != FileType::Dir {
             return Err(LxError::ENOTDIR);
         }
-        proc.check_access(&info, 0o1, true)?;
+        let verdict = proc.check_access(&info, 0o1, true);
+        linux_object::fs::fd_permission(verdict, &inode, self.zircon_process())?;
         proc.change_directory(&cwd::physical_dir(proc, path));
         Ok(0)
     }
@@ -461,7 +462,8 @@ impl Syscall<'_> {
         if info.type_ != FileType::Dir {
             return Err(LxError::ENOTDIR);
         }
-        proc.check_access(&info, 0o1, true)?;
+        let verdict = proc.check_access(&info, 0o1, true);
+        linux_object::fs::fd_permission(verdict, &file.inode(), self.zircon_process())?;
         proc.change_directory(&cwd::physical_dir(proc, file.path()));
         Ok(0)
     }

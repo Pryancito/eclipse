@@ -3,6 +3,9 @@ use rcore_fs::vfs::FileSystem;
 use rcore_fs_ramfs::RamFS;
 
 fn creds(euid: u32, fsuid: u32) -> Credentials {
+    // What `setfsuid(fsuid)` leaves of the capabilities.
+    let mut caps = Capabilities::for_uids(euid, euid, euid);
+    caps.follow_setfsuid(euid, fsuid);
     Credentials {
         ruid: euid,
         euid,
@@ -14,6 +17,7 @@ fn creds(euid: u32, fsuid: u32) -> Credentials {
         fsgid: fsuid,
         groups: Vec::new(),
         umask: 0o022,
+        caps,
     }
 }
 

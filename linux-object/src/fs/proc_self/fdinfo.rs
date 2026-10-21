@@ -61,7 +61,7 @@ impl INode for ProcFdInfoDir {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(Metadata {
+        let metadata = Metadata {
             inode: crate::fs::procfs::pid_inode(
                 self.process.id(),
                 crate::fs::procfs::PID_FDINFO_DIR_SLOT,
@@ -69,7 +69,8 @@ impl INode for ProcFdInfoDir {
             nlinks: 2,
             blk_size: crate::fs::procfs::BLOCK_SIZE,
             ..Pseudo::new("", FileType::Dir).metadata()?
-        })
+        };
+        Ok(crate::fs::procfs::owner::of(&self.process, metadata))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -178,12 +179,13 @@ impl INode for FdInfo {
     }
     /// Never looks at the descriptor: the listing calls this.
     fn metadata(&self) -> Result<Metadata> {
-        Ok(Metadata {
+        let metadata = Metadata {
             inode: fdinfo_inode(self.process.id(), self.fd),
             size: 0,
             blk_size: crate::fs::procfs::BLOCK_SIZE,
             ..Pseudo::new("", FileType::File).metadata()?
-        })
+        };
+        Ok(crate::fs::procfs::owner::of(&self.process, metadata))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self

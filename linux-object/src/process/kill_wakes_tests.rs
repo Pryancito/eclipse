@@ -162,6 +162,29 @@ fn a_sibling_that_is_not_killed_waits_on() {
     assert_eq!(left.recv_timeout(WATCHDOG), Ok(LxError::EINTR));
 }
 
+/// A thread of a Ctrl-Z'd process is parked until the process is continued,
+/// and `kill -9` ends the process without continuing it. The thread stayed
+/// parked: the process was reaped, but it never let go of its memory or of
+/// its robust futexes, and a waiter on one of those timed out.
+#[test]
+fn a_kill_ends_a_job_control_stop() {
+    let (proc, threads) = a_process(47_131, 1);
+    proc.linux().job_stop(&proc, LinuxSignal::SIGSTOP as u8);
+    let stop = parked(&threads[0], |t| async move {
+        wait_while_job_stopped(t.proc()).await
+    });
+    assert!(
+        stop.try_recv().is_err(),
+        "nothing should end a stop before the kill"
+    );
+    proc.exit(exit_code_killed_by(LinuxSignal::SIGKILL as u8));
+    assert_eq!(
+        stop.recv_timeout(WATCHDOG),
+        Ok(()),
+        "the thread of the killed process is still parked in its stop"
+    );
+}
+
 /// A thread of a process with no Linux side has no Linux waits, and its
 /// user signals are not this crate's to set.
 #[test]
@@ -175,4 +198,5 @@ fn a_thread_with_no_linux_side_is_left_alone() {
     assert!(!thread.signal().contains(SIGNAL_WAKE));
     let proc_obj: Arc<dyn KernelObject> = proc.clone();
     assert!(!proc_obj.signal().contains(Signal::SIGCHLD));
+    assert!(!proc_obj.signal().contains(JOB_CONTINUE_SIGNAL));
 }

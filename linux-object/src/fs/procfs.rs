@@ -21,8 +21,13 @@ mod arg_area;
 mod comm_tests;
 #[cfg(test)]
 mod cwd_tests;
+#[cfg(test)]
+mod exited_leader_tests;
 /// `/proc/<pid>/limits`, in its own file for the same reason.
 mod limits;
+pub(crate) mod owner;
+#[cfg(test)]
+mod owner_tests;
 /// `/proc/present`, in its own file: `procfs.rs` sits on the size ratchet.
 mod present;
 #[cfg(test)]
@@ -272,6 +277,18 @@ fn thread_state_char(state: ThreadState) -> char {
     }
 }
 
+/// [`thread_state_char`] for a thread of `proc`, which a job-control stop
+/// makes `T` (`TASK_STOPPED`) while it is not on its way out. A stopped
+/// thread is parked in the run loop, not in a syscall, so it read as `R`,
+/// and `ps` showed a Ctrl-Z'd job as running.
+fn task_state_char(proc: &Process, state: ThreadState) -> char {
+    match thread_state_char(state) {
+        'Z' => 'Z',
+        _ if proc.try_linux().is_some_and(|lp| lp.is_job_stopped()) => 'T',
+        letter => letter,
+    }
+}
+
 /// The state letter for `/proc/<pid>/stat` and `/proc/<pid>/status`.
 ///
 /// Linux reports the thread-group leader's scheduling state, and the
@@ -284,7 +301,7 @@ fn proc_state_char(proc: &Process) -> char {
         return 'Z';
     }
     match proc_first_thread(proc).map(|t| t.state()) {
-        Some(state) => thread_state_char(state),
+        Some(state) => task_state_char(proc, state),
         // No leader thread yet: created, not started.
         None => 'S',
     }
@@ -308,7 +325,7 @@ fn proc_pid_threads(proc: &Process) -> String {
     let mut out = String::from("# tid state (name) syscall\n");
     for thread in proc.threads() {
         let tid = thread.id();
-        let state = thread_state_char(thread.state());
+        let state = task_state_char(proc, thread.state());
         // try_lock: a thread tearing down may hold its own lock, and a /proc
         // read must never block on it.
         let name = thread
@@ -366,9 +383,10 @@ fn proc_ppid(proc: &Process) -> u64 {
 }
 
 /// The first (leader) thread of a process, if any, for reporting its
-/// scheduling attributes.
+/// scheduling attributes: a leader that has exited before the rest of its
+/// group is still that, a zombie (see `process::exited_leader`).
 fn proc_first_thread(proc: &Process) -> Option<Arc<Thread>> {
-    proc.threads().first().cloned()
+    crate::process::exited_leader_of(proc).or_else(|| proc.threads().first().cloned())
 }
 
 fn proc_pid_stat(proc: &Process) -> String {
@@ -434,14 +452,14 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
         None => proc_comm(proc),
     };
     let state = match thread {
-        Some(t) => thread_state_char(t.state()),
+        Some(t) => task_state_char(proc, t.state()),
         None => proc_state_char(proc),
     };
     let ppid = proc_ppid(proc);
 
     // Field 20 is the thread-group count, and Linux reports it on a thread's
     // own `stat` too: it describes the group the task belongs to.
-    let nthreads = proc.thread_ids().len().max(1) as i64;
+    let nthreads = crate::process::task_count(proc) as i64;
     // priority(18)/nice(19)/rt_priority(40)/policy(41) are the task's own, so
     // they come from `thread` when there is one and from the leader
     // otherwise. Per proc(5): for real-time policies the priority field is
@@ -906,24 +924,27 @@ impl INode for ProcPidDirINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        Ok(Metadata {
-            dev: 0,
-            inode: pid_inode(self.pid, 0),
-            size: 0,
-            blk_size: BLOCK_SIZE,
-            blocks: 0,
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
-            type_: FileType::Dir,
-            mode: 0o555,
-            // `.`, the name in `/proc`, and the `..` of `fd`, `fdinfo` and
-            // `task`.
-            nlinks: 5,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-        })
+        Ok(owner::of_pid(
+            self.pid,
+            Metadata {
+                dev: 0,
+                inode: pid_inode(self.pid, 0),
+                size: 0,
+                blk_size: BLOCK_SIZE,
+                blocks: 0,
+                atime: Timespec { sec: 0, nsec: 0 },
+                mtime: Timespec { sec: 0, nsec: 0 },
+                ctime: Timespec { sec: 0, nsec: 0 },
+                type_: FileType::Dir,
+                mode: 0o555,
+                // `.`, the name in `/proc`, and the `..` of `fd`, `fdinfo` and
+                // `task`.
+                nlinks: 5,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+            },
+        ))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -1076,9 +1097,8 @@ impl ProcPidTaskDirINode {
 
     fn tids(&self) -> Vec<u64> {
         self.process()
-            .map(|p| p.thread_ids())
+            .map(|p| crate::process::task_ids(&p))
             .unwrap_or_default()
-            .to_vec()
     }
 }
 
@@ -1109,9 +1129,9 @@ impl INode for ProcPidTaskDirINode {
         // which is both impossible and below the `CHECK_LE(3, nlink)` every
         // reader of this directory makes.
         let threads = self.tids().len().max(1);
-        Ok(dir_metadata(
-            pid_inode(self.pid, PID_TASK_DIR_SLOT),
-            threads,
+        Ok(owner::of_pid(
+            self.pid,
+            dir_metadata(pid_inode(self.pid, PID_TASK_DIR_SLOT), threads),
         ))
     }
 
@@ -1203,8 +1223,8 @@ impl INode for ProcTidDirINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        self.alive()?;
-        Ok(dir_metadata(tid_inode(self.tid, 0), 0))
+        let (proc, _) = tid_task(self.pid, self.tid)?;
+        Ok(owner::of(&proc, dir_metadata(tid_inode(self.tid, 0), 0)))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -1308,8 +1328,9 @@ impl INode for ProcTidFileINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        tid_task(self.pid, self.tid)?;
-        Ok(file_metadata(tid_inode(self.tid, self.kind.slot()), 0o444))
+        let (proc, _) = tid_task(self.pid, self.tid)?;
+        let metadata = file_metadata(tid_inode(self.tid, self.kind.slot()), 0o444);
+        Ok(owner::of(&proc, metadata))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -1328,14 +1349,7 @@ fn tid_task(pid: u64, tid: u64) -> Result<(Arc<Process>, Arc<Thread>)> {
     let proc = ROOT_JOB
         .find_process(pid as _)
         .ok_or(FsError::EntryNotFound)?;
-    if !proc.thread_ids().contains(&tid) {
-        return Err(FsError::EntryNotFound);
-    }
-    let thread = proc
-        .get_child(tid)
-        .map_err(|_| FsError::EntryNotFound)?
-        .downcast_arc::<Thread>()
-        .map_err(|_| FsError::EntryNotFound)?;
+    let thread = crate::process::task_of(&proc, tid).ok_or(FsError::EntryNotFound)?;
     Ok((proc, thread))
 }
 
@@ -1432,8 +1446,11 @@ impl INode for ProcTidCommINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        tid_task(self.pid, self.tid)?;
-        Ok(file_metadata(tid_inode(self.tid, 1), 0o644))
+        let (proc, _) = tid_task(self.pid, self.tid)?;
+        Ok(owner::of(
+            &proc,
+            file_metadata(tid_inode(self.tid, 1), 0o644),
+        ))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -2023,7 +2040,7 @@ fn proc_perf_tasks_content() -> String {
         let pid = proc.id();
         let comm = escaped_comm(&proc_comm(&proc));
         let state = proc_state_char(&proc);
-        let nthr = proc.thread_ids().len().max(1);
+        let nthr = crate::process::task_count(&proc);
         let (calls, ns) = proc
             .try_linux()
             .map(|lp| lp.perf().totals())
@@ -2651,12 +2668,14 @@ impl INode for ProcPidFileINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
+        let proc = crate::process::find_task(self.pid as _).ok_or(FsError::EntryNotFound)?;
         let mode = match self.kind {
             ProcPidFileKind::Comm => 0o644,
+            ProcPidFileKind::Environ => 0o400,
             _ => 0o444,
         };
-        Ok(file_metadata(pid_inode(self.pid, self.kind.slot()), mode))
+        let metadata = file_metadata(pid_inode(self.pid, self.kind.slot()), mode);
+        Ok(owner::of(&proc, metadata))
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -5500,6 +5519,47 @@ mod comm_field_tests {
         let line = threads.lines().nth(1).unwrap();
         let per_thread = line.split(' ').nth(1).unwrap();
         assert_eq!(per_thread, alloc::format!("{}", letter), "{:?}", threads);
+    }
+
+    /// A Ctrl-Z'd process and each of its threads are `T` (`TASK_STOPPED`) in
+    /// every file that has a state, as on Linux. They were `R`: a stopped
+    /// thread is parked in the run loop, not in a syscall. A thread on its
+    /// way out stays `Z`, and a continue gives back the threads' own state.
+    #[test]
+    fn a_stopped_process_and_its_threads_are_t_in_every_file() {
+        let proc = a_process(9231, "stopped");
+        let threads = [
+            Thread::create_linux(&proc).unwrap(),
+            Thread::create_linux(&proc).unwrap(),
+        ];
+        let letter = |line: String| line.split(") ").nth(1).and_then(|t| t.chars().next());
+        let stopped = "State:\tT (stopped)\n";
+        proc.linux()
+            .job_stop(&proc, crate::signal::Signal::SIGTSTP as u8);
+        assert_eq!(letter(proc_pid_stat(&proc)), Some('T'));
+        assert!(proc_pid_status(&proc).contains(stopped));
+        for t in &threads {
+            assert_eq!(letter(proc_task_stat(&proc, Some(t))), Some('T'));
+            assert!(proc_task_status(&proc, Some(t)).contains(stopped));
+        }
+        let listed = proc_pid_threads(&proc);
+        let states: Vec<_> = listed
+            .lines()
+            .skip(1)
+            .map(|l| l.split(' ').nth(1))
+            .collect();
+        assert_eq!(states, [Some("T"), Some("T")], "{:?}", listed);
+        zircon_object::task::Task::kill(&*threads[1]);
+        assert_eq!(
+            letter(proc_task_stat(&proc, Some(&threads[1]))),
+            Some('Z'),
+            "a dying thread is not stopped"
+        );
+        proc.linux().job_continue(&proc);
+        assert_eq!(
+            letter(proc_pid_stat(&proc)),
+            Some(thread_state_char(threads[0].state()))
+        );
     }
 
     #[test]

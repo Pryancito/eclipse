@@ -1266,6 +1266,30 @@ impl Syscall<'_> {
         result
     }
 
+    /// `epoll_pwait2(2)`: [`sys_epoll_pwait`](Self::sys_epoll_pwait) with its
+    /// timeout as a `timespec`. A null one waits for ever and `{0, 0}` does
+    /// not wait. One out of range is `EINVAL`, read and checked before
+    /// anything else, as `epoll_pwait2` does before `do_epoll_pwait`. The
+    /// wait counts in milliseconds, as every wait here does, so a timeout is
+    /// rounded up to the next one and never comes back early.
+    pub async fn sys_epoll_pwait2(
+        &self,
+        epfd: FileDesc,
+        events: UserOutPtr<EpollEvent>,
+        maxevents: usize,
+        timeout: UserInPtr<TimeSpec>,
+        sigmask: UserInPtr<Sigset>,
+        sigsetsize: usize,
+    ) -> SysResult {
+        let timeout = if timeout.is_null() {
+            -1
+        } else {
+            timeout.read()?.try_into_poll_msecs()?
+        };
+        self.sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
+            .await
+    }
+
     /// wait for an I/O event on an epoll file descriptor
     pub async fn sys_epoll_wait(
         &self,

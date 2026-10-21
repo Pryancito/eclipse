@@ -514,7 +514,8 @@ impl Syscall<'_> {
     /// and `Process::cpu_time_ns` for a process. Whose is
     /// resolved as `pid_for_clock` does: `0` is the caller, a thread clock
     /// names a thread of the caller's own process, a process clock names any
-    /// process, and anything else is `EINVAL`.
+    /// process the pid table still has, a zombie's included, and anything
+    /// else is `EINVAL`.
     fn cpu_clock_ns(&self, clock: CpuClock) -> Result<u64, LxError> {
         let (utime_ns, stime_ns) = match clock.owner {
             CpuClockOwner::Thread(0) => thread_cpu_ns(self.thread),
@@ -528,10 +529,14 @@ impl Syscall<'_> {
                 thread_cpu_ns(&thread)
             }
             CpuClockOwner::Process(pid) => {
+                // `find_task` and not the job: a child `wait4` has collected
+                // can still be in its job finishing its teardown, and its
+                // clock was read in that window, nearly every time right
+                // after the `waitpid`, where Linux has nobody left to read.
                 let proc = if pid == 0 {
                     self.zircon_process().clone()
                 } else {
-                    linux_object::process::find_process(pid as KoID).ok_or(LxError::EINVAL)?
+                    linux_object::process::find_task(pid as KoID).ok_or(LxError::EINVAL)?
                 };
                 proc.cpu_time_ns()
             }
@@ -1164,8 +1169,11 @@ fn posix_timer_clock_of(id: usize, owner: KoID) -> Result<PosixTimerClock, LxErr
 
 /// The process whose time CPU clock `cpu` counts, and what the clock reads
 /// now; `None` once its task is gone. A thread clock names a thread of
-/// `caller`, the process that made the timer, and a process clock a live
-/// process.
+/// `caller`, the process that made the timer, and a process clock any
+/// process the pid table still has: a zombie, whose clock has stopped, is
+/// one (`lookup_task` takes any task `find_task_by_vpid` finds), and a
+/// child already collected by `wait4` is not, even while it is still in its
+/// job finishing its teardown.
 fn cpu_timer_target(caller: &Arc<Process>, cpu: CpuClock) -> Option<(Arc<Process>, Duration)> {
     let (proc, (user, sys)) = match cpu.owner {
         CpuClockOwner::Thread(tid) => {
@@ -1180,11 +1188,8 @@ fn cpu_timer_target(caller: &Arc<Process>, cpu: CpuClock) -> Option<(Arc<Process
             let proc = if pid as KoID == caller.id() {
                 caller.clone()
             } else {
-                linux_object::process::find_process(pid as KoID)?
+                linux_object::process::find_task(pid as KoID)?
             };
-            if !process_is_alive(proc.id()) {
-                return None;
-            }
             let times = proc.cpu_time_ns();
             (proc, times)
         }

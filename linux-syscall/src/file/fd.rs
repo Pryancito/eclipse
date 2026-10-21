@@ -408,17 +408,68 @@ impl Syscall<'_> {
         Ok(new_fd.into())
     }
     /// Opens or creates a file, depending on the flags passed to the call. Returns an integer with the file descriptor.
-    pub fn sys_open(&self, path: UserInPtr<u8>, flags: usize, mode: usize) -> SysResult {
-        self.sys_openat(FileDesc::CWD, path, flags, mode)
+    pub async fn sys_open(&self, path: UserInPtr<u8>, flags: usize, mode: usize) -> SysResult {
+        self.sys_openat_waiting(FileDesc::CWD, path, flags, mode)
+            .await
+    }
+
+    /// `creat(2)`, an `open` with `O_CREAT | O_WRONLY | O_TRUNC`. glibc's
+    /// `creat` makes it by number here.
+    #[cfg(target_arch = "x86_64")]
+    pub async fn sys_creat(&self, path: UserInPtr<u8>, mode: usize) -> SysResult {
+        let flags = OpenFlags::CREATE | OpenFlags::WRONLY | OpenFlags::TRUNCATE;
+        self.sys_open(path, flags.bits(), mode).await
+    }
+
+    /// `openat(2)` as the dispatchers make it: [`sys_openat`](Self::sys_openat),
+    /// and, for a FIFO opened without `O_NONBLOCK` with nobody at its other
+    /// end, the wait for someone (`fifo_open`). A signal ends the wait with
+    /// `EINTR`, which an `SA_RESTART` handler turns into the open again.
+    pub async fn sys_openat_waiting(
+        &self,
+        dir_fd: FileDesc,
+        path: UserInPtr<u8>,
+        flags: usize,
+        mode: usize,
+    ) -> SysResult {
+        let mut waits = None;
+        let ret = self.openat(dir_fd, path, flags, mode, Some(&mut waits));
+        let Some((file, partner)) = waits else {
+            return ret;
+        };
+        let inode = file.inode();
+        let end = inode.downcast_ref::<Pipe>().ok_or(LxError::EINVAL)?;
+        // Dropping `file` on the way out takes its end of the pipe back.
+        linux_object::process::interruptible(end.partner(partner)).await?;
+        let fd = self.linux_process().add_file(file)?;
+        Ok(fd.into())
     }
 
     /// open file relative to directory file descriptor
+    ///
+    /// All of `openat(2)` but one wait: a FIFO with nobody at its other end
+    /// is opened at once, as [`sys_openat_waiting`](Self::sys_openat_waiting)
+    /// opens it once someone comes.
     pub fn sys_openat(
         &self,
         dir_fd: FileDesc,
         path: UserInPtr<u8>,
         flags: usize,
         mode: usize,
+    ) -> SysResult {
+        self.openat(dir_fd, path, flags, mode, None)
+    }
+
+    /// [`sys_openat`](Self::sys_openat), which hands a FIFO end that has to
+    /// wait for the other side to `waits`, when there is one, instead of
+    /// opening it.
+    fn openat(
+        &self,
+        dir_fd: FileDesc,
+        path: UserInPtr<u8>,
+        flags: usize,
+        mode: usize,
+        mut waits: Option<&mut Option<(Arc<File>, FifoPartner)>>,
     ) -> SysResult {
         let proc = self.linux_process();
         let path = path.as_c_str()?;
@@ -629,7 +680,8 @@ impl Syscall<'_> {
                 // `inode_permission`.
                 open_resolved_type(flags, metadata.type_)?;
                 if flags.readable() {
-                    proc.check_access(&metadata, 0o4, true)?;
+                    let verdict = proc.check_access(&metadata, 0o4, true);
+                    linux_object::fs::fd_permission(verdict, &inode, self.zircon_process())?;
                 }
                 if flags.writable() {
                     proc.check_access(&metadata, 0o2, true)?;
@@ -667,6 +719,24 @@ impl Syscall<'_> {
                 proc.check_access(&metadata, 0o2, true)?;
                 inode.resize(0)?;
                 linux_object::fs::cache_truncate(&inode, 0);
+            }
+            // A FIFO opens an end of the pipe its node stands for, and so does
+            // an end of one reopened through `/proc/<pid>/fd/N`, which is its
+            // node again (`fifo_open`); an end of a `pipe2` pipe reopened that
+            // way is that same end, below. It is named by its path.
+            let fifo = match inode.downcast_ref::<Pipe>() {
+                Some(pipe) => pipe.fifo_node(),
+                None => (metadata.type_ == FileType::NamedPipe).then(|| inode.clone()),
+            };
+            if let Some(node) = fifo.filter(|_| !flags.is_path()) {
+                let (end, partner) = Pipe::open_fifo(node, flags)?;
+                let file = File::new(Arc::new(end), flags, opened);
+                if let (Some(partner), Some(waits)) = (partner, waits.as_deref_mut()) {
+                    *waits = Some((file, partner));
+                    return Ok(0);
+                }
+                let fd = proc.add_file(file)?;
+                return Ok(fd.into());
             }
             // `/dev/ptmx` is a cloning device: each open allocates a fresh PTY
             // master (and publishes its slave at `/dev/pts/N`). Prefer the
@@ -711,6 +781,8 @@ impl Syscall<'_> {
         // this open (path + result + timestamp) for the one process whose
         // `comm` matches — the raw material for /proc/bootprofile and the
         // desktop preload list. `comm` is computed lazily inside record_open.
+        // A FIFO handed to `waits` is recorded as 0 before its wait: the
+        // trace is of which paths a boot opens, not of descriptors.
         if linux_object::boot_trace::enabled() {
             let pid = self.zircon_process().id();
             let code = match &ret {
@@ -1271,6 +1343,9 @@ mod perf_event_wiring_tests;
 /// created or emptied, and the mode arriving at the inode through the umask.
 #[cfg(test)]
 mod open_wiring_tests;
+
+#[cfg(test)]
+mod fifo_tests;
 
 #[cfg(test)]
 mod dup_limit_tests {

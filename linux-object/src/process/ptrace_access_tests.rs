@@ -27,6 +27,7 @@ fn ids(ruid: u32, euid: u32, suid: u32, rgid: u32, egid: u32, sgid: u32) -> Cred
         fsgid: egid,
         groups: Vec::new(),
         umask: 0o022,
+        caps: Capabilities::for_uids(ruid, euid, suid),
     }
 }
 

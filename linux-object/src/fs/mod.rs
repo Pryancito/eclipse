@@ -148,7 +148,7 @@ pub use eclipsefs_ioctl::{
     eclipsefs_seek, eclipsefs_xattr, FsIoctlContext, XattrReply, XattrRequest, EFS_IOC_RECEIVE,
 };
 pub use epoll::{Epoll, EpollEvent};
-pub use proc_self::FdObject;
+pub use proc_self::{fd_permission, FdObject};
 
 /// If `f` is a DRM-related fd (a /dev/dri device File, a PRIME dma-buf, or
 /// an exported syncobj), return a short description for diagnostics; None
@@ -180,7 +180,7 @@ pub use file::{
 pub use inotify::{inotify_watch_lookup, Inotify, WatchLookup};
 pub use perf::{sample_user as perf_sample_user, PerfEvent};
 pub use pidfd::{PidFd, PIDFD_THREAD};
-pub use pipe::{Pipe, PIPE_BUF, PIPE_DEFAULT_CAPACITY};
+pub use pipe::{FifoPartner, Pipe, PIPE_BUF, PIPE_DEFAULT_CAPACITY};
 pub use rcore_fs::vfs::{self, PollStatus};
 pub use signalfd::SignalFd;
 pub use stdio::{STDIN, STDOUT};

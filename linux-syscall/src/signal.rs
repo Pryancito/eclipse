@@ -19,7 +19,7 @@ use linux_object::thread::ThreadExt;
 use linux_object::time::TimeSpec;
 use numeric_enum_macro::numeric_enum;
 use zircon_object::object::KernelObject;
-use zircon_object::task::{Status, Thread, ROOT_JOB};
+use zircon_object::task::{Status, Thread};
 
 /// The `sigsetsize` every syscall that takes a `sigset_t` from userspace
 /// carries, and what it must be.
@@ -120,6 +120,43 @@ fn kill_target(pid: i32) -> SendTarget {
     }
 }
 
+/// Thread `tid` of process `tgid` as `do_send_specific` finds it for
+/// `tgkill` and `rt_tgsigqueueinfo`: `find_task_by_vpid(tid)`, anywhere on
+/// the machine, and then `task_tgid_vnr(p) == tgid`.
+///
+/// Of a process that has exited only its leader is still a task, until the
+/// reap; it takes the permission check and the signal does nothing, so it
+/// comes back without a thread. So does a leader that has exited while the
+/// rest of its process runs on: it is a zombie task, and a signal sent to it
+/// as a thread is not delivered, not even `SIGKILL`. A child `wait4` has
+/// collected is nobody,
+/// though it can still be in its job finishing its teardown -- which is
+/// where `tgkill` looked, and found it, and where it did not find a zombie
+/// that had already left.
+fn specific_task(
+    tgid: KoID,
+    tid: KoID,
+) -> LxResult<(Arc<zircon_object::task::Process>, Option<Arc<Thread>>)> {
+    let process = linux_object::process::find_task(tgid).ok_or(LxError::ESRCH)?;
+    if matches!(process.status(), Status::Exited(_)) {
+        return match tid == tgid {
+            true => Ok((process, None)),
+            false => Err(LxError::ESRCH),
+        };
+    }
+    let thread = process
+        .get_child(tid)
+        .ok()
+        .and_then(|obj| obj.downcast_arc::<Thread>().ok());
+    match thread {
+        Some(thread) => Ok((process, Some(thread))),
+        None if tid == tgid && linux_object::process::exited_leader_of(&process).is_some() => {
+            Ok((process, None))
+        }
+        None => Err(LxError::ESRCH),
+    }
+}
+
 /// `tkill(2)`/`tgkill(2)`: "This is only valid for single tasks", so Linux
 /// refuses a non-positive id with `EINVAL` before it looks anything up.
 ///
@@ -201,6 +238,12 @@ fn deliver_direct_sigkill(
         KillOutcome::Target => {
             linux_object::process::trace_direct_kill(process, caller);
             process.exit(retcode);
+            // Out of any job-control stop, as `complete_signal` takes a group
+            // a `SIGKILL` is fatal to: a stop left on file was reported to a
+            // `waitid(WSTOPPED)` after the kill, and the stopped thread stayed
+            // parked. After the exit, so the thread that wakes goes to die
+            // instead of back to user mode.
+            linux_object::process::complete_signal_for_job_control(process, Signal::SIGKILL);
         }
         KillOutcome::IgnoredForInit => {
             warn!("SIGKILL for init (pid 1) from pid {} ignored", caller.id());
@@ -693,7 +736,14 @@ impl Syscall<'_> {
             .map(|thread| (own.clone(), thread))
             .or_else(|| linux_object::process::find_thread(tid));
         let Some((process, thread)) = found else {
-            return Err(LxError::ESRCH);
+            // A process that has exited and not been reaped is still a task:
+            // its leader, whose tid is the pid. `do_send_specific` finds it,
+            // asks `check_kill_permission`, and the signal does nothing. The
+            // same goes for a leader that has exited before the rest of its
+            // process, whose pid this also finds.
+            let zombie = linux_object::process::find_task(tid).ok_or(LxError::ESRCH)?;
+            self.may_signal_process(&self.kill_context(signal), &zombie)?;
+            return Ok(0);
         };
         // `do_send_specific()` -> `check_kill_permission()`, as for `tgkill`;
         // the caller's own threads always pass it.
@@ -705,8 +755,8 @@ impl Syscall<'_> {
         Ok(0)
     }
 
-    /// Send a signal to a thread specified by tgid (i.e., process) and pid
-    /// Note: the job of the target process should be the same as the calling thread
+    /// Send a signal to thread `tid` of process `tgid`, wherever on the
+    /// machine that process is.
     ///
     /// This one reaches into ANOTHER process, so `check_kill_permission()`
     /// applies exactly as it does to `kill(2)` -- and to `tkill(2)` next door,
@@ -722,28 +772,10 @@ impl Syscall<'_> {
             tgid,
             signum
         );
-        let parent = self.zircon_process().clone();
-        let Ok(process) = parent
-            .job()
-            .get_child(tgid)
-            .map_err(|_| LxError::ESRCH)
-            .and_then(|obj| {
-                obj.downcast_arc::<zircon_object::task::Process>()
-                    .map_err(|_| LxError::ESRCH)
-            })
-        else {
-            return Err(LxError::ESRCH);
-        };
-        let Ok(obj) = process.get_child(tid) else {
-            return Err(LxError::ESRCH);
-        };
-        let thread: Arc<Thread> = match obj.downcast_arc() {
-            Ok(t) => t,
-            Err(_) => return Err(LxError::ESRCH),
-        };
+        let (process, thread) = specific_task(tgid, tid)?;
         self.may_signal_process(&self.kill_context(signal), &process)?;
         // tgkill(tgid, tid, 0) probes the thread and delivers nothing.
-        if let Some(signal) = signal {
+        if let (Some(signal), Some(thread)) = (signal, thread) {
             queue_signal_to_thread(&thread, signal, self.sent_by_me(signal, SignalCode::TKILL));
         }
         Ok(0)
@@ -919,9 +951,7 @@ impl Syscall<'_> {
         if !may_queue_siginfo(user.code.0, tid == self.thread.id()) {
             return Err(LxError::EPERM);
         }
-        let process = ROOT_JOB.find_process(tgid).ok_or(LxError::ESRCH)?;
-        let thread_obj = process.get_child(tid).map_err(|_| LxError::ESRCH)?;
-        let thread: Arc<Thread> = thread_obj.downcast_arc().map_err(|_| LxError::ESRCH)?;
+        let (process, thread) = specific_task(tgid, tid)?;
         let signal = Signal::from_syscall_arg(signum)?;
         // `do_send_specific()`, which is `tgkill`'s own path: the credentials
         // of the thread GROUP, since a thread has none of its own.
@@ -929,7 +959,7 @@ impl Syscall<'_> {
         // rt_tgsigqueueinfo(tgid, tid, 0) probes and delivers nothing -- but
         // it is refused just the same, so it cannot report the existence of a
         // thread you may not signal.
-        if let Some(signal) = signal {
+        if let (Some(signal), Some(thread)) = (signal, thread) {
             queue_signal_to_thread(&thread, signal, queued_from_user(signal, user));
         }
         Ok(0)
@@ -1062,6 +1092,9 @@ impl Drop for TempSigmaskGuard {
 /// be exercised without a thread, a process or a job.
 #[cfg(test)]
 mod zombie_tests;
+
+#[cfg(test)]
+mod exited_leader_tests;
 
 #[cfg(test)]
 mod sigaction_query_tests {
@@ -1583,6 +1616,33 @@ mod direct_sigkill_tests {
         deliver_direct_sigkill(&caller, &caller);
         killed_by_sigkill(&caller);
     }
+
+    /// `kill -9` on a Ctrl-Z'd job, which nobody had waited for in its stop:
+    /// the stop goes with the kill. It stayed on file, so `waitid(WSTOPPED)`
+    /// reported a process that was already dead as stopped.
+    #[test]
+    fn a_direct_sigkill_takes_the_target_out_of_its_stop() {
+        use linux_object::process::{ProcessExt, WaitInterest};
+        let caller = a_process(43_211);
+        let target = a_process(43_212);
+        target.linux().job_stop(&target, Signal::SIGSTOP as u8);
+        deliver_direct_sigkill(&caller, &target);
+        killed_by_sigkill(&target);
+        assert!(
+            !target.linux().is_job_stopped(),
+            "still stopped after the kill"
+        );
+        let any_change = WaitInterest {
+            exited: false,
+            stopped: true,
+            continued: true,
+        };
+        assert_eq!(
+            target.linux().take_wait_notification(any_change, false),
+            None,
+            "the stop is still there to be reported"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1597,7 +1657,7 @@ mod sigtimedwait_tests {
     use linux_object::process::{send_signal_to_process, LinuxProcess};
     use linux_object::signal::{SignalAction, SignalActionFlags, Sigset};
     use rcore_fs_ramfs::RamFS;
-    use zircon_object::task::Process;
+    use zircon_object::task::{Process, ROOT_JOB};
 
     fn set_of(signal: Signal) -> Sigset {
         Sigset::new(1 << (signal as u64 - 1))

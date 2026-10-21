@@ -286,6 +286,7 @@ fn a_forked_child_sees_its_parent_hole() {
             // exactly as both real constructors leave it.
             exit_path: Default::default(),
             exit_stage: Default::default(),
+            exited_leader: Default::default(),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
             itimers: Default::default(),

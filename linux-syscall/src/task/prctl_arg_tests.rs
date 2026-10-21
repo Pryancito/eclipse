@@ -54,3 +54,29 @@ fn the_comm_is_bytes_to_the_first_nul_and_never_refused() {
     // Whole multibyte characters survive.
     assert_eq!(comm_from_user_bytes("señal".as_bytes()), "señal");
 }
+
+/// What Linux 6.18 does with `PR_CAPBSET_DROP(CAP_CHOWN)` as root: out of
+/// the bounding set (`PR_CAPBSET_READ` 0, `CapBnd` without it), still
+/// permitted and effective. Without `CAP_SETPCAP` nothing moves.
+#[test]
+fn a_drop_takes_the_capability_out_of_the_bounding_set_alone() {
+    let mut caps = Capabilities::ROOT;
+    assert_eq!(capbset_drop(&mut caps, 0), Ok(()));
+    assert!(!caps.bounds(0));
+    assert!(caps.bounds(1));
+    assert_eq!(caps.permitted, Capabilities::ROOT.permitted);
+    assert_eq!(caps.effective, Capabilities::ROOT.effective);
+    assert_eq!(caps.bounding, Capabilities::ROOT.bounding & !1);
+    // Dropping it again is no error.
+    assert_eq!(capbset_drop(&mut caps, 0), Ok(()));
+
+    let mut caps = Capabilities::ROOT;
+    caps.effective &= !(1 << linux_object::process::CAP_SETPCAP);
+    let before = caps;
+    assert_eq!(capbset_drop(&mut caps, 5), Err(LxError::EPERM));
+    assert_eq!(capbset_drop(&mut caps, 41), Err(LxError::EPERM));
+    assert_eq!(caps, before);
+    let mut caps = Capabilities::ROOT;
+    assert_eq!(capbset_drop(&mut caps, 41), Err(LxError::EINVAL));
+    assert_eq!(caps, Capabilities::ROOT);
+}

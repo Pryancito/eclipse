@@ -204,6 +204,8 @@ mod on_a_thread;
 mod outparams;
 mod restart;
 mod signal;
+#[cfg(test)]
+mod table_tests;
 mod task;
 mod time;
 mod vm;
@@ -328,7 +330,7 @@ impl Syscall<'_> {
         let ret = match sys_type {
             Sys::READ => self.sys_read(a0.into(), a1.into(), a2).await,
             Sys::WRITE => self.sys_write(a0.into(), a1.into(), a2).await,
-            Sys::OPENAT => self.sys_openat(a0.into(), a1.into(), a2, a3),
+            Sys::OPENAT => self.sys_openat_waiting(a0.into(), a1.into(), a2, a3).await,
             Sys::CLOSE => self.sys_close(a0.into()),
             Sys::FSTAT => self.sys_fstat(a0.into(), a1.into()),
             Sys::NEWFSTATAT => self.sys_fstatat(a0.into(), a1.into(), a2.into(), a3),
@@ -432,6 +434,10 @@ impl Syscall<'_> {
                     a5,
                 )
                 .await
+            }
+            Sys::EPOLL_PWAIT2 => {
+                self.sys_epoll_pwait2(a0.into(), a1.into(), a2, a3.into(), a4.into(), a5)
+                    .await
             }
             Sys::EVENTFD2 => self.sys_eventfd2(a0 as u32, a1),
             // Legacy `inotify_init` exists only in the x86_64 table; the generic
@@ -574,6 +580,13 @@ impl Syscall<'_> {
                 self.sys_pidfd_send_signal(a0.into(), a1, a2.into(), a3 as u32)
             }
             Sys::PIDFD_GETFD => self.sys_pidfd_getfd(a0.into(), a1 as i32, a2 as u32),
+            Sys::PROCESS_VM_READV => {
+                self.sys_process_vm_readv(a0, a1.into(), a2, a3.into(), a4, a5)
+            }
+            Sys::PROCESS_VM_WRITEV => {
+                self.sys_process_vm_writev(a0, a1.into(), a2, a3.into(), a4, a5)
+            }
+            Sys::KCMP => self.sys_kcmp(a0, a1, a2, a3, a4),
 
             // time
             Sys::NANOSLEEP => self.sys_nanosleep(a0.into(), a1.into()).await,
@@ -921,7 +934,7 @@ impl Syscall<'_> {
     async fn x86_64_syscall(&mut self, sys_type: Sys, args: [usize; 6]) -> SysResult {
         let [a0, a1, a2, a3, a4, _a5] = args;
         match sys_type {
-            Sys::OPEN => self.sys_open(a0.into(), a1, a2),
+            Sys::OPEN => self.sys_open(a0.into(), a1, a2).await,
             Sys::STAT => self.sys_stat(a0.into(), a1.into()),
             Sys::LSTAT => self.sys_lstat(a0.into(), a1.into()),
             Sys::POLL => self.sys_poll(a0.into(), a1, poll_timeout_msecs(a2)).await,
@@ -946,6 +959,9 @@ impl Syscall<'_> {
             Sys::READLINK => self.sys_readlink(a0.into(), a1.into(), a2),
             Sys::CHMOD => self.sys_chmod(a0.into(), a1),
             Sys::CHOWN => self.sys_fchownat(FileDesc::CWD, a0.into(), a1, a2, 0),
+            // glibc's `creat` and both libcs' `lchown` make these by number.
+            Sys::CREAT => self.sys_creat(a0.into(), a1).await,
+            Sys::LCHOWN => self.sys_lchown(a0.into(), a1, a2),
             Sys::ARCH_PRCTL => self.sys_arch_prctl(a0 as _, a1),
             Sys::TIME => self.sys_time(a0.into()),
             Sys::CLONE => self.sys_clone(a0, a1, a2.into(), a4, a3.into()).await,
@@ -1348,9 +1364,9 @@ mod syscall_answer_tests {
         // the kernel has it. Answering +22 told it yes.
         for num in [
             440u32, // process_madvise
-            441,    // epoll_pwait2
             443,    // quotactl_fd
             447,    // memfd_secret
+            448,    // process_mrelease
             449,    // futex_waitv
             451,    // cachestat
             452,    // fchmodat2
