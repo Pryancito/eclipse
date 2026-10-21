@@ -87,7 +87,7 @@ impl Syscall<'_> {
         let (dir_path, last) = last_component(path)?;
         let file_name = last.to_mkdir()?;
         let proc = self.linux_process();
-        let inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
+        let inode = proc.lookup_parent_at(dirfd, dir_path)?;
         let dir_metadata = inode.metadata()?;
         // Existence BEFORE write permission, as Linux does (`filename_create`
         // answers EEXIST from the lookup, before `may_create` ever looks at the
@@ -139,7 +139,7 @@ impl Syscall<'_> {
         {
             return Err(LxError::EPERM);
         }
-        let inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
+        let inode = proc.lookup_parent_at(dirfd, dir_path)?;
         let dir_metadata = inode.metadata()?;
         // The name is looked up BEFORE the parent's mode, as `filename_create`
         // does it: Linux answers `EEXIST` from the lookup and only then asks
@@ -246,7 +246,7 @@ impl Syscall<'_> {
         } else {
             proc.lookup_inode_at(olddirfd, oldpath, follow)?
         };
-        let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, true)?;
+        let new_dir_inode = proc.lookup_parent_at(newdirfd, new_dir_path)?;
         let new_dir_metadata = new_dir_inode.metadata()?;
         // `do_linkat`: the new name is looked up (`filename_create`, EEXIST)
         // before the parent's mode and before `may_linkat` and `vfs_link`
@@ -294,7 +294,7 @@ impl Syscall<'_> {
         } else {
             last.to_unlink()?
         };
-        let dir_inode = proc.lookup_inode_at(dirfd, dir_path, true)?;
+        let dir_inode = proc.lookup_parent_at(dirfd, dir_path)?;
         let dir_metadata = dir_inode.metadata()?;
         // The name first, the parent's mode after: `do_unlinkat` resolves it
         // with search permission alone and answers `ENOENT` from the lookup,
@@ -362,8 +362,8 @@ impl Syscall<'_> {
         let new_file_name = new_last.to_rename()?;
         // The parents are intermediate components: a symlink among them is
         // followed, as everywhere else (`mv x /tmp/link-to-dir/y`).
-        let old_dir_inode = proc.lookup_inode_at(olddirfd, old_dir_path, true)?;
-        let new_dir_inode = proc.lookup_inode_at(newdirfd, new_dir_path, true)?;
+        let old_dir_inode = proc.lookup_parent_at(olddirfd, old_dir_path)?;
+        let new_dir_inode = proc.lookup_parent_at(newdirfd, new_dir_path)?;
         let old_dir_metadata = old_dir_inode.metadata()?;
         let new_dir_metadata = new_dir_inode.metadata()?;
         // The source name first: `do_renameat2` resolves both sides before
@@ -490,7 +490,7 @@ impl Syscall<'_> {
         let (dir_path, last) = last_component(linkpath)?;
         let file_name = last.to_create(has_trailing_slash(linkpath))?;
         let proc = self.linux_process();
-        let inode = proc.lookup_inode_at(newdirfd, dir_path, true)?;
+        let inode = proc.lookup_parent_at(newdirfd, dir_path)?;
         let dir_metadata = inode.metadata()?;
         // The name is looked up BEFORE the parent's mode, as `filename_create`
         // does it: Linux answers `EEXIST` from the lookup and only then asks
@@ -1113,7 +1113,8 @@ pub(crate) fn inode_of_dirfd(
     dirfd: FileDesc,
 ) -> LxResult<Arc<dyn INode>> {
     if dirfd == FileDesc::CWD {
-        proc.lookup_inode_at(FileDesc::CWD, ".", true)
+        // The working directory itself, which no name is looked up in.
+        proc.lookup_inode_at_by(FileDesc::CWD, ".", true, Walker::Kernel)
     } else {
         Ok(proc.get_file(dirfd)?.inode())
     }

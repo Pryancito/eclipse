@@ -28,15 +28,16 @@ pub fn fd_permission(
     caller: &Process,
 ) -> crate::error::LxResult {
     match verdict {
-        Err(crate::error::LxError::EACCES)
-            if inode
-                .downcast_ref::<ProcSelfFdDir>()
-                .is_some_and(|dir| dir.process.id() == caller.id()) =>
-        {
-            Ok(())
-        }
+        Err(crate::error::LxError::EACCES) if is_fd_dir_of(&**inode, caller.id()) => Ok(()),
         verdict => verdict,
     }
+}
+
+/// Whether `inode` is the `fd` directory of the process `pid`.
+pub(super) fn is_fd_dir_of(inode: &dyn INode, pid: u64) -> bool {
+    inode
+        .downcast_ref::<ProcSelfFdDir>()
+        .is_some_and(|dir| dir.process.id() == pid)
 }
 
 impl INode for ProcSelfFdDir {

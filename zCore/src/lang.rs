@@ -78,6 +78,61 @@ fn top_rows_by_bytes<const N: usize>(
     (top, omitted, omitted_bytes)
 }
 
+/// Sentinel for "no emergency reporter has claimed the screen yet".
+///
+/// Not a KD mode: `normalize_kd_mode` accepts only 0..=3, so `u32::MAX` can
+/// never be a mode somebody actually set.
+const KD_UNCLAIMED: u32 = u32::MAX;
+
+/// The KD mode the active VT was in before the first emergency reporter took
+/// the screen, or [`KD_UNCLAIMED`].
+static PRE_REPORT_KD: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(KD_UNCLAIMED);
+
+/// The mode to put the VT back in once a contained fault lets the machine run
+/// on: the one it was in before the FIRST reporter claimed the screen, not the
+/// one it is in now.
+///
+/// By the time the panic handler reads the live mode, a reporter that ran
+/// ahead of it has already forced `KD_TEXT`, so the live value would restore
+/// text mode over a compositor that is still alive and still rendering -- the
+/// desktop would look frozen although only one process died. Pure, because
+/// this is the whole of the decision and none of it needs a VT.
+fn kd_restore_target(pre_report: u32, live: u32) -> u32 {
+    if pre_report == KD_UNCLAIMED {
+        live
+    } else {
+        pre_report
+    }
+}
+
+/// Put the screen where an emergency report can be read, ONCE.
+///
+/// Everything the OOM report and the panic handler print goes to the early
+/// framebuffer console, which draws straight into the framebuffer. A VT
+/// repaint paints over all of it. So the first reporter forces `KD_TEXT` --
+/// which repaints -- and every reporter after it finds the screen already
+/// claimed and does not repaint again.
+///
+/// This is not a refinement: on 2026-10-21 a desktop boot with labwc holding
+/// tty7 was photographed with the init log as a background and the panic
+/// banner on top, and NOTHING of the heap attribution in between. The report
+/// had been drawn; the panic handler's own `set_kd_mode(KD_TEXT)` then fell
+/// back to tty1 and repainted it over the top.
+fn claim_text_console() {
+    use core::sync::atomic::Ordering;
+    let live = kernel_hal::console::kd_mode();
+    if PRE_REPORT_KD
+        .compare_exchange(KD_UNCLAIMED, live, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        // Somebody is already reporting on this screen. Repainting now would
+        // paint over what they wrote.
+        return;
+    }
+    kernel_hal::console::set_kd_mode(kernel_hal::console::KD_TEXT);
+}
+
 #[cfg(not(test))]
 #[alloc_error_handler]
 fn alloc_error(layout: Layout) -> ! {
@@ -96,6 +151,13 @@ fn alloc_error(layout: Layout) -> ! {
         kernel_hal::console::serial_write_fmt_spin(args);
         kernel_hal::console::graphic_console_write_fmt_spin(args);
     }
+
+    // BEFORE the first line: take the screen off whatever compositor owns it.
+    // Forcing KD_TEXT repaints the text console, and a repaint paints over
+    // everything the early framebuffer console has drawn -- so it has to
+    // happen first, not after the report is on the glass. `claim_text_console`
+    // also stops the panic handler below from repainting a second time.
+    claim_text_console();
 
     let heap_used = crate::memory::heap_used();
     let heap_total = crate::memory::heap_total();
@@ -1427,8 +1489,11 @@ fn panic(info: &PanicInfo) -> ! {
     // machine keeps running, and leaving the VT in KD_TEXT would strand a live
     // compositor rendering into a buffer that is no longer presented — the
     // desktop would look frozen even though nothing but one process died.
-    let prev_kd = kernel_hal::console::kd_mode();
-    kernel_hal::console::set_kd_mode(kernel_hal::console::KD_TEXT);
+    let prev_kd = kd_restore_target(
+        PRE_REPORT_KD.load(core::sync::atomic::Ordering::SeqCst),
+        kernel_hal::console::kd_mode(),
+    );
+    claim_text_console();
 
     // Use spin variant: interrupts are already off above, and try_lock silently
     // discards output if another CPU holds the lock — unacceptable in panic context.
@@ -1630,6 +1695,49 @@ fn panic(info: &PanicInfo) -> ! {
 /// report were written, twice rewritten, and never once executed by a job.
 /// Only `#[panic_handler]` and `#[alloc_error_handler]` genuinely cannot be
 /// here (std supplies both); everything below is the code the machine runs.
+
+/// Which mode the VT goes back to when a fault is contained and the machine
+/// runs on. The screen is claimed before the report is written, so the live
+/// mode by then is the reporter's own `KD_TEXT` and restoring it would strand
+/// a compositor that is still alive.
+#[cfg(test)]
+mod kd_restore_tests {
+    use super::{kd_restore_target, KD_UNCLAIMED};
+
+    const KD_TEXT: u32 = 0;
+    const KD_GRAPHICS: u32 = 1;
+
+    #[test]
+    fn with_nobody_claiming_the_live_mode_is_what_gets_restored() {
+        // The plain panic: no reporter ran ahead of the handler, so the mode
+        // read a line earlier is still the one the machine was in.
+        assert_eq!(kd_restore_target(KD_UNCLAIMED, KD_GRAPHICS), KD_GRAPHICS);
+        assert_eq!(kd_restore_target(KD_UNCLAIMED, KD_TEXT), KD_TEXT);
+    }
+
+    #[test]
+    fn a_claim_wins_over_the_live_mode() {
+        // The OOM path: the reporter already forced KD_TEXT, so the live
+        // value is its own doing. Restoring it would leave a live labwc
+        // rendering into a buffer nothing presents -- a desktop that looks
+        // frozen although only one process died.
+        assert_eq!(kd_restore_target(KD_GRAPHICS, KD_TEXT), KD_GRAPHICS);
+    }
+
+    #[test]
+    fn a_claim_taken_while_already_in_text_restores_text() {
+        // Nothing to put back, and nothing to get wrong: the claim recorded
+        // KD_TEXT because that is where the screen was.
+        assert_eq!(kd_restore_target(KD_TEXT, KD_TEXT), KD_TEXT);
+    }
+
+    #[test]
+    fn the_sentinel_is_not_a_mode_any_vt_can_be_in() {
+        // `normalize_kd_mode` accepts 0..=3 and nothing else, so no VT can
+        // ever hold the sentinel and be mistaken for unclaimed.
+        assert!(KD_UNCLAIMED > 3);
+    }
+}
 
 /// The OOM report's ranking, which decides what a photograph of a dead machine
 /// says. It is called from the `#[alloc_error_handler]`, which `cargo test`
