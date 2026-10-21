@@ -298,6 +298,12 @@ mod pidfd_open_target_tests {
     }
 }
 
+/// The three through the syscall: that `pidfd_getfd` asks whether the caller
+/// may attach at all, that the caller's `siginfo_t` reaches the check, and
+/// which argument each one rejects first.
+#[cfg(test)]
+mod wiring_tests;
+
 /// `pidfd_send_signal(2)`'s `siginfo` argument, which was taken and dropped.
 #[cfg(test)]
 mod pidfd_siginfo_tests {
