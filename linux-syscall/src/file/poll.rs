@@ -3097,3 +3097,6 @@ mod end_to_end_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pselect_ppoll_wiring_tests;
