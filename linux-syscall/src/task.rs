@@ -34,6 +34,8 @@ mod exec_args;
 mod execveat;
 use execveat::exec_target;
 pub(crate) use execveat::real_path;
+/// `kcmp(2)`.
+mod kcmp;
 /// `process_vm_readv(2)` and `process_vm_writev(2)`.
 mod process_vm;
 

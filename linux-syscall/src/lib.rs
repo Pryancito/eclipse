@@ -586,6 +586,7 @@ impl Syscall<'_> {
             Sys::PROCESS_VM_WRITEV => {
                 self.sys_process_vm_writev(a0, a1.into(), a2, a3.into(), a4, a5)
             }
+            Sys::KCMP => self.sys_kcmp(a0, a1, a2, a3, a4),
 
             // time
             Sys::NANOSLEEP => self.sys_nanosleep(a0.into(), a1.into()).await,

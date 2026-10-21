@@ -4168,6 +4168,16 @@ impl LinuxProcess {
         self.inner.lock().semaphores.add_undo(id, num, op)
     }
 
+    /// See [`SemProc::make_undo_list`].
+    pub fn semaphores_make_undo_list(&self) {
+        self.inner.lock().semaphores.make_undo_list()
+    }
+
+    /// See [`SemProc::has_undo_list`].
+    pub fn semaphores_undo_list(&self) -> bool {
+        self.inner.lock().semaphores.has_undo_list()
+    }
+
     /// Remove an `SemArray` by ID
     pub fn semaphores_remove(&self, id: usize) {
         self.inner.lock().semaphores.remove(id)

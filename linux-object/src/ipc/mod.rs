@@ -21,6 +21,10 @@ pub struct SemProc {
     arrays: BTreeMap<SemId, Arc<SemArray>>,
     /// Undo operations when process terminates
     undos: BTreeMap<(SemId, SemNum), SemOp>,
+    /// Whether the process has a `SEM_UNDO` list, which Linux makes at its
+    /// first `semop` with `SEM_UNDO` and keeps until it exits, whatever
+    /// becomes of the records in it. Only `kcmp(KCMP_SYSVSEM)` can tell.
+    undo_list: bool,
 }
 
 /// A process's own view of the System V shared memory it is using: the
@@ -216,6 +220,17 @@ impl SemProc {
         self.undos.is_empty()
     }
 
+    /// Make the `SEM_UNDO` list, as `find_alloc_undo` does before it looks
+    /// for the set: a `semop` with `SEM_UNDO` that then fails makes it too.
+    pub fn make_undo_list(&mut self) {
+        self.undo_list = true;
+    }
+
+    /// Whether [`make_undo_list`](Self::make_undo_list) has been called.
+    pub fn has_undo_list(&self) -> bool {
+        self.undo_list
+    }
+
     /// Add an undo operation
     ///
     /// The record is the adjustment that will put the semaphore back where it
@@ -236,6 +251,7 @@ impl Clone for SemProc {
         SemProc {
             arrays: self.arrays.clone(),
             undos: BTreeMap::default(),
+            undo_list: false,
         }
     }
 }

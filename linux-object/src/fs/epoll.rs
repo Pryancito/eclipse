@@ -515,6 +515,20 @@ impl Epoll {
         before - inner.interest_list.len()
     }
 
+    /// The file watched under `fd`, as `kcmp(KCMP_EPOLL_TFD)` asks for it:
+    /// the `toff`-th entry added under that number (`ep_find_tfd`). Linux
+    /// keys its list by file and number, so a number closed and handed out
+    /// again while its first file stayed open elsewhere can have several;
+    /// here the new entry takes the old one's place, and there is only ever
+    /// a first.
+    pub fn watched(&self, fd: FileDesc, toff: u32) -> Option<Arc<dyn FileLike>> {
+        if toff != 0 {
+            return None;
+        }
+        let inner = self.inner.lock();
+        inner.interest_list.get(&fd).map(|(_, file)| file.clone())
+    }
+
     /// Store the [`EdgeState`]s a scan computed, for the entries that still
     /// watch the file the scan looked at.
     fn store_edges(&self, scanned: &[(FileDesc, Arc<dyn FileLike>, EdgeState, bool)]) {
