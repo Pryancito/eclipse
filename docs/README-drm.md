@@ -90,7 +90,7 @@ de framebuffers en `file_priv->fbs`, y resuelve cada id de la uAPI contra el
 fichero que llama (`drm_gem_object_lookup(file, handle)`). Aquí las tablas son
 globales y el sustituto es el pid del propietario, comprobado en las mismas
 entradas: exportar por PRIME, `mmap` de un objeto del driver, `ADDFB`/`ADDFB2`,
-`RMFB`/`CLOSEFB` y el handle que devuelven `GETFB`/`GETFB2`. Los caminos
+`RMFB`/`CLOSEFB`; y el handle que devuelven `GETFB`/`GETFB2` se resuelve a uno del pid que llama. Los caminos
 internos del kernel (pid 0) y el de presentación siguen sin comprobar nada, que
 es la misma separación que hace Linux.
 
@@ -135,8 +135,8 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_MODE_ADDFB2` | ✅ | `framebuffer_check` en su orden para el único plano de aquí (XR24/AR24 lineales): flags fuera de `INTERLACED \| MODIFIERS` EINVAL, `MODIFIERS` EINVAL (sin soporte), formato desconocido o no escaneable EINVAL, anchura o altura 0 EINVAL, sin handle EINVAL, una fila de píxeles que no cabe en u32 o un plano cuyo último byte pasa de 4 GiB **ERANGE**, pitch menor que la fila EINVAL, modifier sin la bandera EINVAL; en los planos que el formato no tiene solo se mira el modifier (handle, pitch y offset solo cuentan bajo `MODIFIERS`). Local: `offsets[0]` debe ser 0 y no hay `max_width` (un fb mayor que el panel se recorta) |
 | `DRM_IOCTL_MODE_RMFB` | ✅ | apaga el CRTC que mostraba el fb, como `drm_framebuffer_remove` (la salida de proceso conserva la última imagen para la restauración de consola) |
 | `DRM_IOCTL_MODE_CLOSEFB` | ✅ | Linux 6.6+: suelta la referencia sin apagar el plano; `pad` distinto de 0 es EINVAL antes de buscar el fb, y un id que no es del fichero ENOENT (`drm_mode_closefb_ioctl`) |
-| `DRM_IOCTL_MODE_GETFB` | ✅ | devuelve geometría + handle (cliente master único) |
-| `DRM_IOCTL_MODE_GETFB2` | ✅ | formato `XR24`, plano 0 |
+| `DRM_IOCTL_MODE_GETFB` | ✅ | geometría a todos; el handle solo al master del nodo o a root (`drm_mode_getfb`: «GET_FB() is an unprivileged ioctl so we must not return a buffer-handle to non-master processes!»), y como handle del que llama (`create_handle`: el suyo si ya lo tiene, si no uno nuevo sobre el mismo objeto: un dumb comparte el `VmObject` como una autoimportación PRIME, un objeto nouveau suma al llamante como poseedor) |
+| `DRM_IOCTL_MODE_GETFB2` | ✅ | formato `XR24`, plano 0; el handle con la misma regla que `GETFB` |
 | `DRM_IOCTL_MODE_DIRTYFB` | ✅ | blitea la unión de los `drm_clip_rect` (sin *clips*, o si excede el límite, re-escanea todo); los bordes horizontales se expanden a líneas WC de 64 B para no manchar píxeles vecinos. Las comprobaciones de `drm_mode_dirtyfb_ioctl` en su orden: fb desconocido ENOENT; cuenta sin puntero o puntero sin cuenta EINVAL; las banderas se **enmascaran** a `ANNOTATE_COPY \| ANNOTATE_FILL` (un bit que Linux no define se ignora, no es EINVAL); `ANNOTATE_COPY` con cuenta impar EINVAL; más de 256 clips EINVAL |
 
 ### KMS (modeset legacy)

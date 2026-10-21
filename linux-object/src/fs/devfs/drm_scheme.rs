@@ -2207,23 +2207,11 @@ impl DrmDev {
                     } else {
                         24
                     };
-                    // The backing GEM handle goes only to the client that
-                    // created this framebuffer. Linux gates it on DRM master
-                    // or CAP_SYS_ADMIN and zeroes the field otherwise, with
-                    // the comment "GET_FB() is an unprivileged ioctl so we
-                    // must not return a buffer-handle to non-master
-                    // processes!". There is no master state to consult here,
-                    // and the premise this used to rest on -- that a single
-                    // client is implicitly master -- is not true of a session
-                    // running Xwayland or any Vulkan probe alongside the
-                    // compositor. Handing the handle out made fb ids, which
-                    // are sequential from 1, an enumeration route straight to
-                    // the compositor's pixels.
-                    cmd.handle = if drm::fb_owned_by_caller(&fb) {
-                        fb.gem_handle_id
-                    } else {
-                        0
-                    };
+                    // The backing GEM handle goes to the master or root
+                    // only, as a handle of the caller's (`getfb.rs`): fb
+                    // ids are sequential from 1, so handing it out further
+                    // is an enumeration route to the compositor's pixels.
+                    cmd.handle = self.fb_handle_for_caller(&fb);
                     Ok(0)
                 } else {
                     // ENOENT, like `drm_mode_getfb`'s framebuffer lookup. This
@@ -2244,11 +2232,7 @@ impl DrmDev {
                     cmd.flags = 0;
                     // Same gate as GETFB above; `drm_mode_getfb2_ioctl`
                     // carries the identical check.
-                    cmd.handles = if drm::fb_owned_by_caller(&fb) {
-                        [fb.gem_handle_id, 0, 0, 0]
-                    } else {
-                        [0; 4]
-                    };
+                    cmd.handles = [self.fb_handle_for_caller(&fb), 0, 0, 0];
                     // `fb.pitch` is the uAPI number ADDFB2 was handed, not a
                     // byte count: `create_fb_with_layout` derives its byte
                     // pitch for the size check and stores the request
@@ -6798,6 +6782,9 @@ mod atomic_walk_tests;
 #[cfg(test)]
 mod syncobj_wait_routing_tests;
 
+mod getfb;
+#[cfg(test)]
+mod getfb_tests;
 pub(crate) mod master_check;
 #[cfg(test)]
 mod master_check_tests;

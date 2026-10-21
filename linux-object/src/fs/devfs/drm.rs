@@ -3146,17 +3146,6 @@ fn owned_by(owner: u64, pid: u64) -> bool {
     pid == 0 || owner == 0 || owner == pid
 }
 
-/// Whether the calling process created `fb`, i.e. whether `GETFB`/`GETFB2`
-/// may hand it the backing GEM handle.
-///
-/// Linux gates that field on DRM master or `CAP_SYS_ADMIN` and zeroes it
-/// otherwise. There is no master state here, so the framebuffer's creator is
-/// the closest honest stand-in: the compositor still gets the handles for its
-/// own framebuffers, and nobody else gets a route to them.
-pub fn fb_owned_by_caller(fb: &DrmFramebuffer) -> bool {
-    owned_by(fb.owner, current_pid())
-}
-
 /// The framebuffer ids `GETRESOURCES` lists for `pid`: the ones it may
 /// touch, by the same rule `RMFB` and `GETFB`'s handle use ([`owned_by`]).
 ///
@@ -5212,6 +5201,7 @@ fn composite_cursor_after_driver_flip(fb_id: u32) -> bool {
 }
 
 mod cursor_blit;
+pub(crate) mod fb_handle;
 use cursor_blit::{blit_cursor_patch, repaint_cursor_from_panel};
 
 /// Make a cursor set/move take effect immediately (the legacy cursor ioctls
