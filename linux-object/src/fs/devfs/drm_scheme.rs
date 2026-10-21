@@ -2287,11 +2287,12 @@ impl DrmDev {
                 // three dropped frames. Scanout expands each span to 64-byte WC
                 // lines so a partial store cannot smear neighbouring pixels.
                 //
-                // An oversized, zero, or unreadable clip list means "the whole
-                // frame is dirty" (true DIRTYFB semantics for num_clips == 0).
-                // Linux accepts up to 256 clips (`DRM_MODE_FB_DIRTY_MAX_CLIPS`);
-                // 64 made dense-damage frames fall back to a full-screen blit.
-                const MAX_DIRTY_CLIPS: u32 = 256;
+                // No clips means "the whole frame is dirty" (true DIRTYFB
+                // semantics for num_clips == 0). Linux accepts up to 256 clips
+                // (`DRM_MODE_FB_DIRTY_MAX_CLIPS`) and copies the WHOLE list in
+                // before it looks at one (`copy_from_user`: EFAULT for a list
+                // the kernel cannot read, whatever its count); 64 made
+                // dense-damage frames fall back to a full-screen blit.
                 const MAX_DIRTY_SPANS: usize = 8;
                 let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
                 // `drm_mode_dirtyfb_ioctl`, in its order: the fb is looked up
@@ -2327,10 +2328,9 @@ impl DrmDev {
                 let mut n = 0usize;
                 let mut area = 0u64;
                 let mut too_many = false;
-                let rect = if cmd.num_clips > 0
-                    && cmd.num_clips <= MAX_DIRTY_CLIPS
-                    && cmd.clips_ptr != 0
-                {
+                // The checks above leave a count of 1 to 256 with a pointer
+                // (or neither): the list is read whole, as Linux copies it.
+                let rect = if cmd.num_clips > 0 {
                     ucheck_n::<DrmClipRect>(cmd.clips_ptr as usize, cmd.num_clips as usize)?;
                     let mut union: Option<(u32, u32, u32, u32)> = None;
                     for i in 0..cmd.num_clips as usize {

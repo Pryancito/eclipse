@@ -75,12 +75,37 @@ fn clip(x1: u16, y1: u16, x2: u16, y2: u16) -> DrmClipRect {
     DrmClipRect { x1, y1, x2, y2 }
 }
 
+/// Where the user half ends on x86_64 (`kernel_hal::user::USER_MAX`): the
+/// first address `access_ok()` refuses.
+const USER_MAX: u64 = 0x0000_8000_0000_0000;
+
+/// The user-half bound of `access_ok()`, applied on this thread for as long
+/// as the guard lives (`kernel_hal::user::set_strict_user_half`).
+struct StrictUserHalf;
+
+impl StrictUserHalf {
+    fn on() -> Self {
+        kernel_hal::user::set_strict_user_half(true);
+        Self
+    }
+}
+
+impl Drop for StrictUserHalf {
+    fn drop(&mut self) {
+        kernel_hal::user::set_strict_user_half(false);
+    }
+}
+
 /// What `drm_mode_dirtyfb_ioctl` refuses before any driver sees the
 /// flush: a framebuffer that does not exist (ENOENT), a clip count and a
 /// clip pointer that disagree about whether there are clips (EINVAL), an
 /// odd count with ANNOTATE_COPY, whose clips come in pairs (EINVAL), and
 /// more than 256 clips (EINVAL). None of it was read: every one of these
-/// came back as a flush done. And what it does NOT refuse: a flag it
+/// came back as a flush done. Then the list is copied in WHOLE
+/// (`copy_from_user`), so one the kernel cannot read is EFAULT whatever
+/// its count -- here the user-half bound of `access_ok()`, which `libos`
+/// lifts (host addresses are not user addresses) and [`StrictUserHalf`]
+/// puts back for this thread. And what it does NOT refuse: a flag it
 /// does not define is masked off (`DRM_MODE_FB_DIRTY_FLAGS & r->flags`),
 /// with the defined bits beside it still in force; this answered EINVAL.
 /// The shapes Xorg's modesetting shadow sends keep going through.
@@ -134,6 +159,32 @@ fn dirtyfb_refuses_what_linux_refuses() {
         "more clips than the kernel reads"
     );
 
+    {
+        let _strict = StrictUserHalf::on();
+        const KERNEL_PTR: u64 = 0xffff_8000_0000_0000;
+        let efault = Err(FsError::BadAddress);
+        assert_eq!(dirty(fb, 0, 1, KERNEL_PTR), efault, "a kernel pointer");
+        assert_eq!(
+            dirty(fb, 0, 2, USER_MAX - 8),
+            efault,
+            "two clips where only one fits below the user half"
+        );
+        assert_eq!(
+            dirty(4242, 0, 1, KERNEL_PTR),
+            Err(FsError::EntryNotFound),
+            "the fb is looked up before the list is read"
+        );
+        assert_eq!(
+            dirty(fb, 0, 257, KERNEL_PTR),
+            einval,
+            "and the count is checked before the list is read"
+        );
+        assert_eq!(
+            dirty(fb, 0, 2, ptr),
+            Ok(0),
+            "the host's own list still reads"
+        );
+    }
     assert_eq!(dirty(fb, 0, 256, ptr), Ok(0), "exactly the kernel's limit");
     assert_eq!(dirty(fb, ANNOTATE_COPY, 2, ptr), Ok(0));
     assert_eq!(dirty(fb, ANNOTATE_FILL, 1, ptr), Ok(0));
