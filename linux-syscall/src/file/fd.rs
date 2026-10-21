@@ -1248,6 +1248,12 @@ fn dup_target(newfd: usize, nofile: u64) -> Result<FileDesc, LxError> {
     Ok(FileDesc::from(newfd))
 }
 
+/// The descriptors with no file behind them, reached through the syscall:
+/// where each flag word ends up, in what order the arguments are judged, and
+/// what a refusal leaves behind.
+#[cfg(test)]
+mod anon_fd_wiring_tests;
+
 #[cfg(test)]
 mod dup_limit_tests {
     //! The three `RLIMIT_NOFILE` checks the dup family did not have. The
