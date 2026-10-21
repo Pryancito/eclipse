@@ -742,6 +742,80 @@ fn transfer_reads_its_padding_and_flags_and_wants_a_submitted_source() {
     }
 }
 
+/// The order `drm_syncobj_transfer_ioctl` reads its request in: the
+/// padding, then the destination (`drm_syncobj_find`, ENOENT), then
+/// `drm_syncobj_find_fence` refuses a flag other than WAIT_FOR_SUBMIT
+/// (EINVAL) before it looks the source up (ENOENT). The flags were read
+/// ahead of both ends, so an unknown destination with a bad flag was
+/// EINVAL, and a bad flag with an unknown source was ENOENT.
+#[test]
+fn transfer_looks_the_destination_up_before_the_flags_and_the_source_after() {
+    let _serialised = drm::test_globals::lock();
+    let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+    let _on = NouveauOn::new();
+    let c = Client::open(0);
+    let signaled = create(&c, true);
+    let dst = create(&c, false);
+    let nobody = 0xdead_u32;
+    let bad_flag = 0x8000_0000_u32;
+    let transfer = |dst_handle: u32, src_handle: u32, flags: u32, pad: u32| {
+        let mut req = DrmSyncobjTransfer {
+            src_handle,
+            dst_handle,
+            src_point: 0,
+            dst_point: 0,
+            flags,
+            pad,
+        };
+        c.ioctl(DRM_IOCTL_SYNCOBJ_TRANSFER, &mut req)
+    };
+    let einval = Err(FsError::InvalidParam);
+    let enoent = Err(FsError::EntryNotFound);
+
+    assert_eq!(
+        transfer(nobody, signaled, bad_flag, 1),
+        einval,
+        "the padding comes before the destination"
+    );
+    assert_eq!(
+        transfer(nobody, signaled, bad_flag, 0),
+        enoent,
+        "an unknown destination comes before the flags"
+    );
+    assert_eq!(
+        transfer(nobody, nobody, 0, 0),
+        enoent,
+        "two unknown ends are the destination's ENOENT"
+    );
+    assert_eq!(
+        transfer(dst, nobody, bad_flag, 0),
+        einval,
+        "a bad flag comes before an unknown source"
+    );
+    assert_eq!(
+        transfer(dst, nobody, 0, 0),
+        enoent,
+        "an unknown source, flags fine"
+    );
+    assert_eq!(
+        transfer(dst, nobody, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, 0),
+        enoent,
+        "WAIT_FOR_SUBMIT does not wait for a handle that does not exist"
+    );
+    let mut points = [0xdeadu64];
+    timeline_array(&c, DRM_IOCTL_SYNCOBJ_QUERY, &[dst], &mut points).expect("QUERY");
+    assert_eq!(points[0], 0, "none of the refused transfers touched dst");
+    assert_eq!(
+        transfer(dst, signaled, 0, 0),
+        Ok(0),
+        "and the good one goes"
+    );
+
+    for h in [signaled, dst] {
+        destroy(&c, h);
+    }
+}
+
 /// The flag and padding rules of `drm_syncobj.c`, ioctl by ioctl:
 /// CREATE takes SIGNALED alone, DESTROY/RESET/SIGNAL want their pad
 /// empty, TIMELINE_SIGNAL has no flags, QUERY takes LAST_SUBMITTED alone,
