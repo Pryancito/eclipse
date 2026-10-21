@@ -452,7 +452,7 @@ impl CowFs {
     /// as) its parent. Returns the new subvolume's root directory.
     pub fn receive(&mut self, dir: u64, input: ReceiveSource) -> Result<u64> {
         let d = self.at_rw(dir)?;
-        self.writable()?;
+        self.growable()?;
         let dir_sv = self.subvol;
         // Header.
         let mut h = vec![0u8; 8 + 4 + 16 + 16 + 2];

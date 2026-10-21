@@ -1138,4 +1138,157 @@ mod tests {
             assert!(seen.insert(name_hash(&i.to_le_bytes())));
         }
     }
+
+    fn fresh_sb() -> Vec<u8> {
+        let d = crate::testdisk::formatted(8);
+        d.peek(0, BLOCK_SIZE as usize)
+    }
+
+    fn reseal(b: &mut [u8]) {
+        let c = crc32c(&b[..SB_CRC]);
+        put32(b, SB_CRC, c);
+    }
+
+    /// Each field `decode` refuses to guess about, with a valid checksum so
+    /// the refusal is about the field and not the CRC.
+    #[test]
+    fn superblock_fields_it_cannot_mount() {
+        let good = fresh_sb();
+        SuperV4::decode(&good).unwrap();
+        let mut b = good.clone();
+        put32(&mut b, 12, 0x0005_0000);
+        reseal(&mut b);
+        assert!(matches!(SuperV4::decode(&b), Err(Error::Unsupported(_))));
+        let mut b = good.clone();
+        put32(&mut b, 16, 8192);
+        reseal(&mut b);
+        assert!(matches!(SuperV4::decode(&b), Err(Error::Unsupported(_))));
+        let mut b = good.clone();
+        b[180] = 9;
+        reseal(&mut b);
+        assert!(matches!(SuperV4::decode(&b), Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn a_bitmap_checksum_table_out_of_place_is_corrupt() {
+        let good = fresh_sb();
+        let sb = SuperV4::decode(&good).unwrap();
+        assert!(sb.features & FEAT_BITMAP_CSUM != 0);
+        for (at, n) in [(0u64, 1u32), (5, 0), (sb.total_blocks, 1)] {
+            let mut b = good.clone();
+            put64(&mut b, 288, at);
+            put32(&mut b, 296, n);
+            reseal(&mut b);
+            assert_eq!(
+                SuperV4::decode(&b).err(),
+                Some(Error::Corrupt("bitmap checksum table location")),
+                "{} {}",
+                at,
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn groups_split_the_blocks() {
+        let mut sb = SuperV4::decode(&fresh_sb()).unwrap();
+        sb.total_blocks = GROUP_BLOCKS * 2 + 100;
+        assert_eq!(sb.groups(), (3, 100));
+        sb.total_blocks = GROUP_BLOCKS;
+        assert_eq!(sb.groups(), (1, GROUP_BLOCKS));
+    }
+
+    #[test]
+    fn compressed_extents_with_impossible_geometry() {
+        let good = Comp {
+            algo: Compression::Zstd,
+            disk: 100,
+            disk_blocks: 2,
+            ram_blocks: 8,
+            offset: 0,
+            blocks: 8,
+        };
+        assert!(FileExtent::decode(&FileExtent::Comp(good).encode()).is_ok());
+        for bad in [
+            Comp {
+                disk_blocks: 0,
+                ..good
+            },
+            Comp {
+                disk_blocks: 8,
+                ..good
+            },
+            Comp {
+                ram_blocks: ZCHUNK + 1,
+                disk_blocks: 2,
+                ..good
+            },
+            Comp { blocks: 0, ..good },
+            Comp {
+                offset: 4,
+                blocks: 5,
+                ..good
+            },
+        ] {
+            assert_eq!(
+                FileExtent::decode(&FileExtent::Comp(bad).encode()).err(),
+                Some(Error::Corrupt("compressed extent item")),
+                "{:?}",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn short_items_are_corrupt() {
+        let one = encode_dir_item(&[DirEnt {
+            ino: 300,
+            index: 2,
+            kind: FileKind::Regular,
+            name: b"a".to_vec(),
+        }]);
+        // A tail too short for another entry header.
+        let mut b = one.clone();
+        b.extend_from_slice(&[0u8; 5]);
+        assert_eq!(
+            decode_dir_item(&b).err(),
+            Some(Error::Corrupt("directory item"))
+        );
+        // A name item holds exactly one entry.
+        let mut two = one.clone();
+        two.extend_from_slice(&one);
+        assert_eq!(decode_pair(&two).err(), Some(Error::Corrupt("name item")));
+        assert_eq!(
+            RootItem::decode(&[0u8; 3]).err(),
+            Some(Error::Corrupt("root item"))
+        );
+        assert_eq!(
+            decode_ref(&[0u8; 11]).err(),
+            Some(Error::Corrupt("reference item"))
+        );
+        let mut x = encode_xattrs(&[(b"user.a".to_vec(), b"1".to_vec())]);
+        x.extend_from_slice(&[1, 0]);
+        assert_eq!(decode_xattrs(&x).err(), Some(Error::Corrupt("xattr item")));
+    }
+
+    #[test]
+    fn checksum_buckets_that_do_not_fit() {
+        let mut bucket = CsumBucket::default();
+        bucket.0.resize(CSUM_BUCKET as usize, None);
+        bucket.0[3] = Some(7);
+        let b = bucket.encode();
+        assert_eq!(CsumBucket::lookup(&b, 3), Ok(Some(7)));
+        // The bit says "present" but the map stops before it.
+        let mut short = b.clone();
+        short[0] |= 1 << 5;
+        assert_eq!(
+            CsumBucket::lookup(&short, 5).err(),
+            Some(Error::Corrupt("checksum item"))
+        );
+        let long = vec![0u8; CSUM_MAP + 4 * (CSUM_BUCKET as usize + 1)];
+        assert_eq!(
+            CsumBucket::decode(&long).err(),
+            Some(Error::Corrupt("checksum item"))
+        );
+    }
 }

@@ -183,7 +183,7 @@ impl CowFs {
     /// Setting the policy a directory already has does nothing.
     pub fn set_encryption_policy(&mut self, h: u64, policy: &EncryptionPolicy) -> Result<()> {
         let ino = self.at_rw(h)?;
-        self.writable()?;
+        self.growable()?;
         if !policy.supported() {
             return Err(Error::Invalid);
         }

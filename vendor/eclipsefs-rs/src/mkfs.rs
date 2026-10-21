@@ -182,19 +182,18 @@ pub fn format_v3(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
     root.nlink = 2;
     root.parent = ROOT_INO;
     let rec = root.encode();
-    if write_data(
+    // The root's slot is inside the table `extend_zeroed` just wrote, so
+    // this allocates nothing and writes the whole record.
+    let n = write_data(
         dev,
         &mut alloc,
         &mut itable,
         ROOT_INO * INODE_SIZE as u64,
         &rec,
-    )? < INODE_SIZE
-    {
-        return Err(Error::NoSpace);
-    }
-    if itable.extents_dirty {
-        write_chain(dev, &mut alloc, ITABLE_INO, &mut itable)?;
-    }
+    )?;
+    debug_assert_eq!(n, INODE_SIZE);
+    // The table's extents are new: their chain (if any) goes out now.
+    write_chain(dev, &mut alloc, ITABLE_INO, &mut itable)?;
 
     let label = label_bytes(opts);
     let sb = Superblock {

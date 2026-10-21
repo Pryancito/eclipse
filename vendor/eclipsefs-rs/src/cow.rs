@@ -563,7 +563,6 @@ impl CowFs {
             );
             fs.sb.free_blocks = free;
         }
-        fs.sp.reserve = metadata_reserve(fs.sb.total_blocks);
         let root_dir = fs.fs_item.root_dir;
         if fs.inode(root_dir)?.kind() != FileKind::Dir {
             return Err(Error::Corrupt("root is not a directory"));
@@ -675,6 +674,19 @@ impl CowFs {
 
     fn now(&self) -> (u64, u32) {
         self.clock.map(|c| c()).unwrap_or((0, 0))
+    }
+
+    /// Start of every mutating call that adds to the trees (names, data,
+    /// attributes): on a full filesystem it is refused with `NoSpace` while
+    /// half of the metadata reserve is left, so the transaction can still
+    /// be committed and files deleted. Calls that only remove things use
+    /// [`writable`](Self::writable) and may take that last half.
+    fn growable(&mut self) -> Result<()> {
+        self.writable()?;
+        if !self.sp.meta_headroom() {
+            return Err(Error::NoSpace);
+        }
+        Ok(())
     }
 
     /// Start of every mutating call.
@@ -2207,7 +2219,7 @@ impl CowFs {
         atime: Option<(u64, u32)>,
         mtime: Option<(u64, u32)>,
     ) -> Result<()> {
-        self.writable()?;
+        self.growable()?;
         let mut i = self.inode(ino)?;
         permit(frozen(&i))?;
         if let Some(m) = mode {
@@ -2281,7 +2293,7 @@ impl CowFs {
     ) -> Result<u64> {
         let name = self.disk_name(dir, name, encrypt::NameUse::Create)?;
         let name = &name[..];
-        self.writable()?;
+        self.growable()?;
         if self.dir_lookup(dir, name)?.is_some() {
             return Err(Error::Exists);
         }
@@ -2338,7 +2350,7 @@ impl CowFs {
     }
 
     fn write_symlink_l(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
-        self.writable()?;
+        self.growable()?;
         let i = self.inode(ino)?;
         if i.kind() != FileKind::Symlink {
             return Err(Error::Invalid);
@@ -2395,7 +2407,7 @@ impl CowFs {
     fn link_l(&mut self, dir: u64, name: &str, ino: u64) -> Result<()> {
         let name = self.disk_name(dir, name, encrypt::NameUse::Create)?;
         let name = &name[..];
-        self.writable()?;
+        self.growable()?;
         let mut i = self.inode(ino)?;
         if i.kind() == FileKind::Dir {
             return Err(Error::IsDir);
@@ -2437,7 +2449,7 @@ impl CowFs {
         let old_name = &old_name[..];
         let new_name = self.disk_name(new_dir, new_name, encrypt::NameUse::Create)?;
         let new_name = &new_name[..];
-        self.writable()?;
+        self.growable()?;
         let e = self.dir_lookup(old_dir, old_name)?.ok_or(Error::NotFound)?;
         if old_dir == new_dir && old_name == new_name {
             return Ok(());
@@ -2549,7 +2561,7 @@ impl CowFs {
         if data.is_empty() {
             return Ok(0);
         }
-        self.writable()?;
+        self.growable()?;
         let mut i = self.inode(ino)?;
         match i.kind() {
             FileKind::Dir => return Err(Error::IsDir),
@@ -2743,7 +2755,7 @@ impl CowFs {
     fn new_name<'a>(&mut self, dir: u64, name: &'a str) -> Result<(u64, &'a [u8])> {
         let name = check_name(name)?;
         let d = self.at_rw(dir)?;
-        self.writable()?;
+        self.growable()?;
         if self.inode(d)?.flags & FL_ENCRYPT as u64 != 0 {
             return Err(Error::Unsupported("subvolume in an encrypted directory"));
         }
@@ -3027,7 +3039,7 @@ impl CowFs {
             None => self.mapped(s_ino, s0, s0 + blocks)?,
         };
         let d_ino = self.at_rw(dst)?;
-        self.writable()?;
+        self.growable()?;
         let mut di = self.inode(d_ino)?;
         match di.kind() {
             FileKind::Regular => {}
@@ -3231,7 +3243,7 @@ impl CowFs {
             return Err(Error::Invalid);
         }
         let ino = self.at_rw(h)?;
-        self.writable()?;
+        self.growable()?;
         let mut i = self.inode(ino)?;
         permit(frozen(&i))?;
         let (key, mut list) = self.xattr_list(ino, n)?;
@@ -3291,7 +3303,7 @@ impl CowFs {
             return Err(Error::Invalid);
         }
         let ino = self.at_rw(h)?;
-        self.writable()?;
+        self.growable()?;
         let mut i = self.inode(ino)?;
         let old = i.flags as u32;
         // No-COW only changes on an empty file (its blocks would otherwise
@@ -3336,7 +3348,7 @@ impl CowFs {
     /// with `algo`, or stop doing so. Data already written stays as it is.
     pub fn set_compression(&mut self, h: u64, algo: Option<Compression>) -> Result<()> {
         let ino = self.at_rw(h)?;
-        self.writable()?;
+        self.growable()?;
         let mut i = self.inode(ino)?;
         permit(frozen(&i))?;
         if algo.is_some() && i.flags & FL_NOCOW as u64 != 0 {
@@ -3524,7 +3536,7 @@ impl CowFs {
         compress: Option<Compression>,
     ) -> Result<u64> {
         let ino = self.at_rw(h)?;
-        self.writable()?;
+        self.growable()?;
         let inode = self.inode(ino)?;
         match inode.kind() {
             // btrfs defragments the metadata of a directory; the trees here
@@ -3916,7 +3928,12 @@ impl CowFs {
         }
         let end = offset.checked_add(len).ok_or(Error::Invalid)?;
         let ino = self.at_rw(h)?;
-        self.writable()?;
+        // Punching a hole gives space back, so it may use the last of it.
+        if punch {
+            self.writable()?;
+        } else {
+            self.growable()?;
+        }
         let mut i = self.inode(ino)?;
         match i.kind() {
             FileKind::Regular => {}
@@ -4171,7 +4188,7 @@ impl CowFs {
             return Err(Error::Unsupported("atomic write on this file"));
         }
         let ino = self.at_rw(h)?;
-        self.writable()?;
+        self.growable()?;
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or(Error::Invalid)?;

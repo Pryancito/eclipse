@@ -1363,6 +1363,7 @@ mod tests {
         // The clock does not move: not due yet.
         assert_eq!(fs.commit_if_due(), Ok(false));
         fs.set_commit_interval(None);
+        assert_eq!(fs.fsync_log_records(), 0);
     }
 
     /// A device added without a tier stays untiered.

@@ -390,6 +390,27 @@ impl BlockSpace {
         None
     }
 
+    /// Whether tree changes may still take blocks without eating into the
+    /// half of the reserve kept for the commit (and for deletes, which
+    /// copy nodes too). On a volume a metadata chunk is made if that is
+    /// what it takes.
+    pub fn meta_headroom(&mut self) -> bool {
+        let need = self.reserve / 2;
+        loop {
+            let free = match self.vol {
+                None => self.alloc.free_blocks(),
+                Some(_) => self.meta_free(),
+            };
+            if free >= need {
+                return true;
+            }
+            if !self.grow_on(ChunkKind::Metadata, self.target()) && !self.grow(ChunkKind::Metadata)
+            {
+                return false;
+            }
+        }
+    }
+
     /// Free blocks metadata may take.
     pub fn meta_free(&self) -> u64 {
         self.alloc.free_in(ChunkKind::Metadata) + self.alloc.free_in(ChunkKind::Mixed)
