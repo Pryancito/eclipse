@@ -413,6 +413,14 @@ impl Syscall<'_> {
             .await
     }
 
+    /// `creat(2)`, an `open` with `O_CREAT | O_WRONLY | O_TRUNC`. glibc's
+    /// `creat` makes it by number here.
+    #[cfg(target_arch = "x86_64")]
+    pub async fn sys_creat(&self, path: UserInPtr<u8>, mode: usize) -> SysResult {
+        let flags = OpenFlags::CREATE | OpenFlags::WRONLY | OpenFlags::TRUNCATE;
+        self.sys_open(path, flags.bits(), mode).await
+    }
+
     /// `openat(2)` as the dispatchers make it: [`sys_openat`](Self::sys_openat),
     /// and, for a FIFO opened without `O_NONBLOCK` with nobody at its other
     /// end, the wait for someone (`fifo_open`). A signal ends the wait with

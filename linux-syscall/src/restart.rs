@@ -55,8 +55,9 @@ pub fn restarts_after_handler(num: u32, args: &[usize; 6]) -> bool {
     let Ok(sys) = Sys::try_from(num) else {
         return false;
     };
+    // `creat` is an `open`, and waits for a FIFO's reader as one does.
     #[cfg(target_arch = "x86_64")]
-    if sys == Sys::OPEN {
+    if sys == Sys::OPEN || sys == Sys::CREAT {
         return true;
     }
     match sys {
@@ -221,6 +222,7 @@ mod tests {
     #[test]
     fn open_is_made_again_like_openat() {
         assert!(restarts(Sys::OPEN).0);
+        assert!(restarts(Sys::CREAT).0);
     }
 
     #[test]
@@ -231,6 +233,7 @@ mod tests {
             Sys::PPOLL,
             Sys::PSELECT6,
             Sys::EPOLL_PWAIT,
+            Sys::EPOLL_PWAIT2,
             Sys::RT_SIGSUSPEND,
             Sys::RT_SIGTIMEDWAIT,
             Sys::NANOSLEEP,
@@ -445,7 +448,12 @@ mod tests {
         // with a `SO_SNDTIMEO` set, as it has `accept` and `recv` only with a
         // `SO_RCVTIMEO`, and without one a stopped and continued `connect`
         // goes on waiting (measured on Linux 6.18).
-        for sys in [Sys::EPOLL_PWAIT, Sys::RT_SIGTIMEDWAIT, Sys::SEMTIMEDOP] {
+        for sys in [
+            Sys::EPOLL_PWAIT,
+            Sys::EPOLL_PWAIT2,
+            Sys::RT_SIGTIMEDWAIT,
+            Sys::SEMTIMEDOP,
+        ] {
             let num = sys as u32;
             assert!(!restarts_after_stop(num, &[0; 6]), "syscall {}", num);
         }

@@ -2788,6 +2788,14 @@ impl Syscall<'_> {
         Ok(0)
     }
 
+    /// `lchown(2)`: the owner of a symbolic link and not of what it names.
+    /// glibc's and musl's `lchown` make it by number here.
+    #[cfg(target_arch = "x86_64")]
+    pub fn sys_lchown(&self, path: UserInPtr<u8>, uid: usize, gid: usize) -> SysResult {
+        let nofollow = AtFlags::SYMLINK_NOFOLLOW.bits();
+        self.sys_fchownat(FileDesc::CWD, path, uid, gid, nofollow)
+    }
+
     /// Change file owner/group relative to a directory file descriptor.
     pub fn sys_fchownat(
         &self,
