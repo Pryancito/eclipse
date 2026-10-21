@@ -290,6 +290,16 @@ fn a_length_that_is_not_positive_or_an_offset_that_is_negative_is_einval() {
                 Err(LxError::EINVAL),
                 "a negative offset was accepted"
             );
+            // And the range is judged before the mode. A call that gets
+            // both wrong has to hear about the range: a program probing
+            // for a mode reads EOPNOTSUPP as "this kernel does not have
+            // it", and getting that answer for a range it also got wrong
+            // is how it concludes the mode is missing when it is not.
+            assert_eq!(
+                sys.sys_fallocate(fd, AN_UNKNOWN_MODE, A_NEGATIVE, 4),
+                Err(LxError::EINVAL),
+                "the mode was judged before the range"
+            );
             assert_eq!(length_of(&lp, &dir_path, "f"), 10);
         })
     });
@@ -336,6 +346,18 @@ fn each_kind_of_node_gets_the_errno_its_kind_calls_for() {
             assert_eq!(
                 sys.sys_fallocate(FileDesc::from(chr), 0, 0, 4),
                 Err(LxError::ENODEV)
+            );
+
+            // The EISDIR arm is belt and braces, and asking with a call
+            // that grows the file cannot tell the belt from the braces:
+            // `set_len` on a directory inode answers `FsError::NotFile`,
+            // which is EISDIR as well. A call that keeps the size never
+            // reaches `set_len`, so without the arm it reports success
+            // for work it did not do, which is the answer that matters.
+            assert_eq!(
+                sys.sys_fallocate(FileDesc::from(dir), FALLOC_FL_KEEP_SIZE, 0, 4),
+                Err(LxError::EISDIR),
+                "a directory was told its fallocate succeeded"
             );
         })
     });
