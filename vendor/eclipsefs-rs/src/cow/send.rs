@@ -616,9 +616,6 @@ impl CowFs {
                     return Err(BAD);
                 }
                 let (d0, s0, n) = (off / BS, src_off / BS, len / BS);
-                if d0.checked_add(n).is_none() || s0.checked_add(n).is_none() {
-                    return Err(BAD);
-                }
                 if src == ino && d0 < s0 + n && s0 < d0 + n {
                     return Err(BAD);
                 }
@@ -1148,8 +1145,8 @@ mod tests {
             create(h, FileKind::Regular),
             link(FIRST_INO, 4, h, FileKind::Regular, b"h"),
             write(h, 0, b"abc"),
-            range(CMD_PUNCH, h, 0, 3),
             range(CMD_PUNCH, h, 5, 3),
+            range(CMD_PUNCH, h, 0, 3),
             write(h, 0, b"abc"),
             range(CMD_PREALLOC, h, BS, BS),
         ]);

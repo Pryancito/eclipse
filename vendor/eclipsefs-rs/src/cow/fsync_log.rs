@@ -191,22 +191,10 @@ impl LogWriter {
         Ok(true)
     }
 
+    /// Write what is left of the last block, if anything. The CRC covers
+    /// what was put, not the padding.
     fn finish(&mut self) -> Result<bool> {
-        if self.buf.is_empty() {
-            return Ok(true);
-        }
-        // The CRC covers what was put, not the padding.
-        let n = self.buf.len();
-        if self.next >= self.end {
-            return Ok(false);
-        }
-        self.crc = crc32c_update(self.crc, &self.buf);
-        self.len += n as u64;
-        self.buf.resize(BS as usize, 0);
-        self.raw.write_at(self.next * BS, &self.buf)?;
-        self.next += 1;
-        self.buf.clear();
-        Ok(true)
+        Ok(self.buf.is_empty() || self.emit()?)
     }
 }
 
@@ -445,13 +433,9 @@ impl CowFs {
         if inode.kind() != FileKind::Regular {
             return Ok(false);
         }
-        let Some((area, area_n)) = self.log_area()? else {
-            return Ok(false);
-        };
-        let ranges = match self.log.inodes.get(&(sv, ino)) {
-            Some(s) => s.ranges.clone(),
-            None => return Ok(true),
-        };
+        // fsync saw the area and the inode's changes.
+        let (area, area_n) = self.log_area()?.ok_or(Error::Corrupt("fsync log area"))?;
+        let ranges = self.log.inodes[&(sv, ino)].ranges.clone();
         let start = area + self.log.pos;
         if self.log.pos + 2 > area_n {
             return Ok(false);
@@ -473,9 +457,9 @@ impl CowFs {
         let item = inode.encode();
         head.extend_from_slice(&(item.len() as u32).to_le_bytes());
         head.extend_from_slice(&item);
-        if !w.put(&head)? {
-            return Ok(false);
-        }
+        // Less than a block: it cannot reach the end of the area.
+        let fits = w.put(&head)?;
+        debug_assert!(fits);
         for (s, l) in ranges.iter() {
             let e = s.saturating_add(l);
             let mut tag = vec![TAG_RANGE];
@@ -791,8 +775,10 @@ impl CowFs {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use super::super::split;
     use super::*;
-    use crate::testdisk::{Ram, Rng};
+    use crate::compress::Compression;
+    use crate::testdisk::{clock, formatted, Ram, Rng};
 
     /// 1/256 of the filesystem, between 64 and 4096 blocks.
     #[test]
@@ -962,7 +948,12 @@ mod tests {
         let after = dev.peek(3 * BS as usize, BS as usize);
         let mut w = writer(&dev, 1, 2);
         assert!(w.put(&vec![1u8; 2 * BS as usize]).unwrap());
-        assert!(!w.put(&[2u8; 10]).unwrap() || !w.finish().unwrap());
+        assert!(w.finish().unwrap());
+        assert!(!w.put(&vec![2u8; BS as usize]).unwrap());
+        let mut w = writer(&dev, 1, 2);
+        assert!(w.put(&vec![1u8; 2 * BS as usize]).unwrap());
+        assert!(w.put(&[2u8; 10]).unwrap());
+        assert!(!w.finish().unwrap());
         assert_eq!(dev.peek(3 * BS as usize, BS as usize), after);
     }
 
@@ -981,5 +972,292 @@ mod tests {
         };
         let mut b = vec![0u8; 2 * BS as usize];
         assert!(matches!(r.take(&mut b), Err(Error::Corrupt(_))));
+    }
+
+    fn mounted(mib: usize) -> (Arc<Ram>, CowFs) {
+        let d = formatted(mib);
+        let mut fs = CowFs::mount(d.clone(), false).unwrap();
+        fs.set_clock(clock);
+        (d, fs)
+    }
+
+    fn file(fs: &mut CowFs, name: &str, data: &[u8]) -> u64 {
+        let h = fs
+            .create(fs.root_ino(), name, FileKind::Regular, 0o644, 0)
+            .unwrap();
+        fs.write(h, 0, data).unwrap();
+        h
+    }
+
+    /// A file committed, rewritten in place and with a log area: its next
+    /// fsync writes a record.
+    fn logged(mib: usize, blocks: u64) -> (Arc<Ram>, CowFs, u64) {
+        let (d, mut fs) = mounted(mib);
+        let h = file(&mut fs, "f", &vec![1; (blocks * BS) as usize]);
+        fs.fsync(h).unwrap();
+        assert!(fs.log_area().unwrap().is_some());
+        fs.write(h, 0, &vec![2; (blocks * BS) as usize]).unwrap();
+        (d, fs, h)
+    }
+
+    /// Room for the header and one payload block only.
+    fn one_block_left(fs: &mut CowFs) {
+        let (_, n) = fs.log_area().unwrap().unwrap();
+        fs.log.pos = n - 2;
+    }
+
+    #[test]
+    fn a_log_area_item_that_is_not_one_is_corrupt() {
+        let (_, mut fs) = mounted(16);
+        let bad = FileExtent::Prealloc {
+            disk: 100,
+            blocks: 1,
+        }
+        .encode();
+        fs.root_insert(CowFs::log_key(), bad).unwrap();
+        assert_eq!(fs.log_area().err(), Some(Error::Corrupt("fsync log area")));
+    }
+
+    /// Short of room the area shrinks, and without any there is none: the
+    /// fsync commits.
+    #[test]
+    fn the_log_area_takes_the_room_there_is() {
+        let (_, mut fs) = mounted(16);
+        let h = file(&mut fs, "f", b"x");
+        let free = fs.sp.alloc.free_blocks();
+        fs.sp.reserve = (free - 20) / 2;
+        fs.fsync(h).unwrap();
+        assert_eq!(fs.log_area().unwrap().unwrap().1, 16);
+
+        let (_, mut fs) = mounted(16);
+        let h = file(&mut fs, "f", b"x");
+        fs.sp.reserve = fs.sp.alloc.free_blocks();
+        fs.fsync(h).unwrap();
+        assert_eq!(fs.log_area().unwrap(), None);
+        assert_eq!(fs.log_records(), 0);
+    }
+
+    /// On a volume whose metadata chunks are full the area goes to a data
+    /// chunk.
+    #[test]
+    fn the_log_area_of_a_volume_falls_back_to_any_chunk() {
+        let devs: Vec<Arc<dyn BlockDevice>> = (0..2)
+            .map(|_| Ram::new(64 << 20) as Arc<dyn BlockDevice>)
+            .collect();
+        crate::mkfs::format_devices(
+            &devs,
+            &crate::testdisk::opts(),
+            crate::volume::Profile::Single,
+            crate::volume::Profile::Single,
+        )
+        .unwrap();
+        let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+        fs.set_clock(clock);
+        let h = file(&mut fs, "f", &vec![1; 300 * BS as usize]);
+        fs.sp.reserve = 0;
+        while fs
+            .sp
+            .alloc
+            .allocate_for(None, u64::MAX, Some(ChunkKind::Metadata))
+            .is_some()
+        {}
+        assert!(fs.make_log_area().unwrap());
+        let (at, _) = fs.log_area().unwrap().unwrap();
+        let g = &fs.sp.alloc.groups()[(at / GROUP_BLOCKS) as usize];
+        assert_ne!(g.kind, ChunkKind::Metadata);
+        let _ = h;
+    }
+
+    #[test]
+    fn fsync_with_nothing_to_write() {
+        let (d, mut fs, h) = logged(16, 2);
+        fs.fsync(h).unwrap();
+        assert_eq!(fs.log_records(), 1);
+        // Nothing since that record.
+        fs.fsync(h).unwrap();
+        assert_eq!(fs.log_records(), 1);
+        drop(fs);
+        let mut ro = CowFs::mount(d, true).unwrap();
+        ro.fsync(h).unwrap();
+    }
+
+    /// A directory, compressed or shared blocks, and blocks without a
+    /// checksum known all commit instead.
+    #[test]
+    fn records_the_log_cannot_carry() {
+        let (_, mut fs, h) = logged(16, 2);
+        let root = fs.root_ino();
+        fs.set_attr(root, Some(0o700), None, None, None, None)
+            .unwrap();
+        let (_, dir) = split(root);
+        fs.log_attr(dir);
+        fs.fsync(root).unwrap();
+        assert_eq!(fs.log_records(), 0);
+
+        // Blocks of the last commit.
+        let (_, ino) = split(h);
+        fs.write(h, 0, &[3; BS as usize]).unwrap();
+        fs.log_range(ino, 1, 2);
+        fs.fsync(h).unwrap();
+        assert_eq!(fs.log_records(), 0);
+
+        // Compressed data.
+        let c = file(&mut fs, "c", &[0; 64 * BS as usize]);
+        fs.defrag(c, 0, 64 * BS, 0, Some(Compression::Lz4)).unwrap();
+        fs.sync().unwrap();
+        let (_, cino) = split(c);
+        assert!(fs.extents(cino, 0, 1).unwrap()[0].z.is_some());
+        fs.log_range(cino, 0, 64);
+        fs.fsync(c).unwrap();
+        assert_eq!(fs.log_records(), 0);
+        fs.check().unwrap();
+
+        // A fresh block whose checksum is not known.
+        fs.write(h, 0, &[4; BS as usize]).unwrap();
+        let e = fs.extents(ino, 0, 1).unwrap()[0];
+        fs.sp.csums.remove(&e.pblk);
+        fs.fsync(h).unwrap();
+        assert_eq!(fs.log_records(), 0);
+    }
+
+    /// Records that do not fit what is left of the area commit instead,
+    /// whichever part of them reaches its end.
+    #[test]
+    fn records_larger_than_the_area_left() {
+        // The extent's checksums run two blocks past it.
+        let (_, mut fs, h) = logged(64, 2100);
+        one_block_left(&mut fs);
+        fs.fsync(h).unwrap();
+        assert_eq!(fs.log_records(), 0);
+        // The last bytes do.
+        let (_, mut fs, h) = logged(64, 1000);
+        one_block_left(&mut fs);
+        fs.fsync(h).unwrap();
+        assert_eq!(fs.log_records(), 0);
+        // Ranges with no extents in them do.
+        let (_, mut fs, h) = logged(16, 2);
+        let ino = split(h).1;
+        for b in 0..600 {
+            fs.log_range(ino, 100 + 2 * b, 101 + 2 * b);
+        }
+        one_block_left(&mut fs);
+        fs.fsync(h).unwrap();
+        assert_eq!(fs.log_records(), 0);
+        fs.check().unwrap();
+    }
+
+    /// Write a record by hand at the start of the log area: header (with
+    /// `edit` applied before its CRC) and payload.
+    fn put_record(fs: &mut CowFs, payload: &[u8], edit: impl FnOnce(&mut [u8])) {
+        let (area, n) = fs.log_area().unwrap().unwrap();
+        let mut w = LogWriter {
+            raw: fs.raw.clone(),
+            next: area + 1,
+            end: area + n,
+            buf: Vec::new(),
+            len: 0,
+            crc: 0,
+        };
+        assert!(w.put(payload).unwrap() && w.finish().unwrap());
+        let mut hdr = vec![0u8; BS as usize];
+        put32(&mut hdr, 0, LOG_MAGIC);
+        put32(&mut hdr, 4, LOG_VERSION);
+        hdr[8..24].copy_from_slice(&fs.sb.uuid);
+        put64(&mut hdr, 24, fs.sb.generation);
+        put64(&mut hdr, 32, 0);
+        put32(&mut hdr, 40, (w.next - area - 1) as u32);
+        put64(&mut hdr, 48, w.len);
+        put32(&mut hdr, 56, w.crc);
+        edit(&mut hdr);
+        let c = crc32c(&hdr[..HDR_CRC]);
+        put32(&mut hdr, HDR_CRC, c);
+        fs.raw.write_at(area * BS, &hdr).unwrap();
+    }
+
+    fn payload(ino: u64, item_len: usize, rest: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&FS_TREE.to_le_bytes());
+        p.extend_from_slice(&ino.to_le_bytes());
+        p.extend_from_slice(&(item_len as u32).to_le_bytes());
+        let item = InodeItem::new(FileKind::Regular, 0o644, clock(), 1).encode();
+        p.extend_from_slice(&item[..item_len.min(item.len())]);
+        p.resize(20 + item_len, 0);
+        p.extend_from_slice(rest);
+        p
+    }
+
+    fn range(s: u64, e: u64) -> Vec<u8> {
+        let mut v = vec![TAG_RANGE];
+        v.extend_from_slice(&s.to_le_bytes());
+        v.extend_from_slice(&e.to_le_bytes());
+        v
+    }
+
+    fn extent(lb: u64, pblk: u64, n: u64) -> Vec<u8> {
+        let mut v = vec![TAG_EXTENT];
+        v.extend_from_slice(&lb.to_le_bytes());
+        v.extend_from_slice(&pblk.to_le_bytes());
+        v.extend_from_slice(&n.to_le_bytes());
+        v.extend_from_slice(&[0, 0]);
+        v
+    }
+
+    /// Records whose header or payload do not hold together end the log
+    /// at mount: nothing of them is replayed.
+    #[test]
+    fn damaged_records_are_not_replayed() {
+        let (_, mut fs) = mounted(16);
+        let h = file(&mut fs, "f", b"x");
+        fs.fsync(h).unwrap();
+        let ino = split(h).1;
+        let (area, n) = fs.log_area().unwrap().unwrap();
+        let free = fs.sp.alloc.allocate_run(None, 4).unwrap();
+        fs.sp.alloc.free_now(free, 4).unwrap();
+        let ok = |rest: &[u8]| payload(ino, INODE_ITEM_SIZE, rest);
+        let end = [TAG_END];
+        let corrupt: [(Vec<u8>, &str); 6] = [
+            (payload(ino, 3, &end), "fsync log inode item"),
+            (ok(&[range(5, 5), end.to_vec()].concat()), "fsync log range"),
+            (
+                ok(&[extent(0, free, 1), end.to_vec()].concat()),
+                "fsync log extent",
+            ),
+            (
+                ok(&[range(0, 1), extent(0, free, 0), end.to_vec()].concat()),
+                "fsync log extent",
+            ),
+            (ok(&[9]), "fsync log tag"),
+            (ok(&[]), "fsync log record"),
+        ];
+        for (p, what) in corrupt {
+            put_record(&mut fs, &p, |_| {});
+            assert_eq!(
+                fs.read_record(area, area + n, 0).err(),
+                Some(Error::Corrupt(what))
+            );
+            assert_eq!(fs.replay_log().unwrap(), 0);
+        }
+        // Headers that do not fit their payload.
+        let p = ok(&end);
+        for edit in [
+            (|h: &mut [u8]| put32(h, 40, 1 << 30)) as fn(&mut [u8]),
+            |h| put64(h, 48, 3 * BS),
+            |h| put32(h, 40, 3),
+        ] {
+            put_record(&mut fs, &p, edit);
+            assert!(fs.read_record(area, area + n, 0).unwrap().is_none());
+        }
+        // A missing inode, blocks already in use.
+        put_record(&mut fs, &payload(ino + 50, INODE_ITEM_SIZE, &end), |_| {});
+        assert!(fs.read_record(area, area + n, 0).unwrap().is_some());
+        assert_eq!(fs.replay_log().unwrap(), 0);
+        let used = [range(0, 1), extent(0, area, 1), end.to_vec()].concat();
+        put_record(&mut fs, &ok(&used), |_| {});
+        assert!(fs.read_record(area, area + n, 0).unwrap().is_some());
+        assert_eq!(fs.replay_log().unwrap(), 0);
+        // And a good one.
+        let good = [range(1, 2), extent(1, free, 1), end.to_vec()].concat();
+        put_record(&mut fs, &ok(&good), |_| {});
+        assert_eq!(fs.replay_log().unwrap(), 1);
     }
 }

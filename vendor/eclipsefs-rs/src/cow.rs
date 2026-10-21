@@ -4775,12 +4775,8 @@ pub(crate) fn format(
         (CSUM_TREE, item(csum_root, 0, 0)),
         (FS_TREE, fs_item),
     ] {
-        st.insert(
-            &mut sp,
-            &mut root_tree,
-            Key::new(id, ROOT_ITEM, 0),
-            it.encode(),
-        )?;
+        let k = Key::new(id, ROOT_ITEM, 0);
+        st.insert(&mut sp, &mut root_tree, k, it.encode())?;
     }
     let nodes = st.take_dirty();
     write_home(dev, &nodes)?;

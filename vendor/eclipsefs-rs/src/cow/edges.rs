@@ -896,6 +896,13 @@ fn shared_reads_of_small_files_in_blocks_and_of_preallocated_space() {
     let mut buf = vec![9u8; (3 * BS + 10) as usize];
     assert_eq!(fs.read_shared(p, 0, &mut buf).unwrap(), Some(buf.len()));
     assert!(buf[..(3 * BS) as usize].iter().all(|&b| b == 0));
+
+    // Small and sparse: no item at all.
+    let z = create(&mut fs, "sparse", FileKind::Regular);
+    fs.truncate(z, 100).unwrap();
+    let mut buf = [9u8; 100];
+    assert_eq!(fs.read_shared(z, 0, &mut buf).unwrap(), Some(100));
+    assert_eq!(buf, [0; 100]);
 }
 
 /// Damage the shared reader meets: an inline item past the inline size,
@@ -918,6 +925,8 @@ fn shared_reads_of_damaged_files() {
     d.poke((e.pblk * BS + 5) as usize, 1);
     assert_eq!(fs.read_shared(h, 0, &mut [0; 8]).unwrap(), None);
     assert_eq!(fs.read_shared(h, 100, &mut [0; 8]).unwrap(), None);
+    let mut whole = vec![0u8; BS as usize];
+    assert_eq!(fs.read_shared(h, 0, &mut whole).unwrap(), None);
 
     let (k, v) = fs.items_of(ino, EXTENT_DATA, 1).unwrap().remove(0);
     fs.delete(k).unwrap();
@@ -958,6 +967,17 @@ fn vault() -> (CowFs, u64, [u8; 16]) {
 }
 
 #[test]
+fn shared_reads_of_encrypted_blocks() {
+    let (mut fs, dir, _) = vault();
+    let h = fs.create(dir, "f", FileKind::Regular, 0o600, 0).unwrap();
+    let data: Vec<u8> = (0..2 * BS).map(|i| i as u8).collect();
+    fs.write(h, 0, &data).unwrap();
+    let mut buf = vec![0u8; data.len()];
+    assert_eq!(fs.read_shared(h, 0, &mut buf).unwrap(), Some(data.len()));
+    assert_eq!(buf, data);
+}
+
+#[test]
 fn a_subvolume_cannot_move_into_an_encrypted_directory() {
     let (mut fs, dir, _) = vault();
     fs.create_subvolume(fs.root_ino(), "sv").unwrap();
@@ -969,7 +989,8 @@ fn no_key_names_that_cannot_be_there() {
     let (mut fs, dir, id) = vault();
     fs.create(dir, "a", FileKind::Regular, 0o600, 0).unwrap();
     fs.remove_encryption_key(&id).unwrap();
-    let too_long = crate::crypt::base64url(&[1; 200]);
+    // The longest name that decodes to more than a whole one.
+    let too_long = crate::crypt::base64url(&[1; 190]);
     let whole = crate::crypt::base64url(&[1; 189]);
     for name in [too_long, whole] {
         let name = core::str::from_utf8(&name).unwrap();
@@ -1041,25 +1062,44 @@ fn fsck_of_encryption() {
 // Bitmap checksums
 // ---------------------------------------------------------------------------
 
-/// A bitmap bad on every copy is rebuilt from the trees, shared nodes
-/// and all.
+/// A bitmap bad on every copy is rebuilt from the trees.
 #[test]
 fn bitmaps_bad_everywhere_are_rebuilt_from_the_trees() {
     let devs = volume();
     let mut fs = CowFs::mount_devices(devs.clone(), false, false).unwrap();
     fs.set_clock(clock);
+    file(&mut fs, "f", &[1; 3 * BS as usize]);
+    fs.sync().unwrap();
+    let v = fs.vol.clone().unwrap();
+    let js = fs.journal.start;
+    drop(fs);
+    // The journal would hand the last bitmaps back.
+    for k in 0..2 {
+        v.write_copy(js * BS, &[0; BS as usize], k).unwrap();
+        v.write_copy(BS, &[0x0f; BS as usize], k).unwrap();
+    }
+    let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+    fs.check().unwrap();
+}
+
+/// Internal nodes, nodes a snapshot shares and the fsync log area all
+/// hold blocks of a rebuilt bitmap.
+#[test]
+fn a_rebuilt_bitmap_counts_every_kind_of_block() {
+    let (d, mut fs) = mounted();
     for i in 0..300 {
         file(&mut fs, &alloc::format!("f{}", i), &[i as u8; 600]);
     }
     fs.snapshot(fs.root_ino(), fs.root_ino(), "snap", true)
         .unwrap();
-    fs.sync().unwrap();
-    let v = fs.vol.clone().unwrap();
+    let h = file(&mut fs, "logged", &[1; 100]);
+    fs.fsync(h).unwrap();
+    assert!(fs.log_area().unwrap().is_some());
+    let js = fs.journal.start;
     drop(fs);
-    for k in 0..2 {
-        v.write_copy(BS, &[0x0f; BS as usize], k).unwrap();
-    }
-    let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+    d.write_at(js * BS, &[0; BS as usize]).unwrap();
+    d.write_at(BS, &[0x0f; BS as usize]).unwrap();
+    let mut fs = remount(&d).unwrap();
     fs.check().unwrap();
 }
 
@@ -1126,6 +1166,9 @@ fn space_on_a_volume_grows_by_chunks() {
         crate::btree::Space::alloc_node(&mut fs.sp, 0).err(),
         Some(Error::NoSpace)
     );
+
+    // Data cannot grow either: metadata needs its reserve first.
+    assert!(!fs.sp.grow(ChunkKind::Data));
 }
 
 /// On a tiered volume nodes go to the fast devices, which grow a chunk

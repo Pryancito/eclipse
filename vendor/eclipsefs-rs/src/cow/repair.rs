@@ -435,8 +435,8 @@ impl CowFs {
         let mut s = Scan::default();
         let total = self.sb.total_blocks;
         let mut last_end: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut lo = Key::MIN;
-        loop {
+        let mut next = Some(Key::MIN);
+        while let Some(lo) = next {
             let items = self.st.range(&self.fs_root, &lo, &Key::MAX, PURGE_BATCH)?;
             let Some(last) = items.last().map(|(k, _)| *k) else {
                 break;
@@ -521,10 +521,7 @@ impl CowFs {
                     _ => s.bad.push(k),
                 }
             }
-            match key_after(&last) {
-                Some(next) => lo = next,
-                None => break,
-            }
+            next = key_after(&last);
         }
         // Objects whose items came before their inode (or with none).
         s.homeless.retain(|o| !s.inodes.contains_key(o));
@@ -546,9 +543,9 @@ impl CowFs {
     /// Delete every item of object `o` of the current subvolume.
     fn drop_object(&mut self, o: u64, poison: &RangeSet) -> Result<u64> {
         let hi = Key::new(o, u8::MAX, u64::MAX);
-        let mut lo = Key::new(o, 0, 0);
+        let mut next = Some(Key::new(o, 0, 0));
         let mut n = 0;
-        loop {
+        while let Some(lo) = next {
             let keys: Vec<Key> = self
                 .st
                 .range(&self.fs_root, &lo, &hi, PURGE_BATCH)?
@@ -562,10 +559,7 @@ impl CowFs {
                 self.drop_item(k, poison)?;
                 n += 1;
             }
-            match key_after(&last) {
-                Some(next) => lo = next,
-                None => break,
-            }
+            next = key_after(&last);
         }
         Ok(n)
     }
@@ -1024,8 +1018,8 @@ impl CowFs {
         for (id, _) in self.root_items()? {
             self.enter(id)?;
             let mut nocow = false;
-            let mut lo = Key::MIN;
-            loop {
+            let mut next = Some(Key::MIN);
+            while let Some(lo) = next {
                 let items = self.st.range(&self.fs_root, &lo, &Key::MAX, PURGE_BATCH)?;
                 let Some(last) = items.last().map(|(k, _)| *k) else {
                     break;
@@ -1048,16 +1042,13 @@ impl CowFs {
                         }
                     }
                 }
-                match key_after(&last) {
-                    Some(next) => lo = next,
-                    None => break,
-                }
+                next = key_after(&last);
             }
         }
         self.enter(home)?;
         // Stale ones.
-        let mut lo = Key::MIN;
-        loop {
+        let mut next = Some(Key::MIN);
+        while let Some(lo) = next {
             let items = self
                 .st
                 .range(&self.csum_root, &lo, &Key::MAX, PURGE_BATCH)?;
@@ -1094,10 +1085,7 @@ impl CowFs {
                     })?;
                 }
             }
-            match key_after(&last) {
-                Some(next) => lo = next,
-                None => break,
-            }
+            next = key_after(&last);
         }
         // Missing ones.
         let mut buf = vec![0u8; BS as usize];

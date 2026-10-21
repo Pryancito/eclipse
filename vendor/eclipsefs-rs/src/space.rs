@@ -674,6 +674,20 @@ mod tests {
         assert!(sp.incref(60, 1).is_err());
     }
 
+    /// Free blocks in pieces too small for a run.
+    #[test]
+    fn a_run_needs_contiguous_room() {
+        let mut g = AllocationGroup::new(0, 64);
+        g.mark_used(0, 64);
+        for b in (8..64).step_by(2) {
+            g.free(b, 1).unwrap();
+        }
+        let mut sp = BlockSpace::new(BlockAllocator::new(vec![g]), RefMap::default());
+        assert!(sp.data_room() >= 4);
+        assert_eq!(sp.alloc_data_run(None, 4), None);
+        assert!(sp.alloc_data_run(None, 1).is_some());
+    }
+
     /// `RangeSet` against the dumbest model there is, a bit per block, over
     /// thousands of random inserts and removes: after every step the two
     /// agree block by block, and the set stays canonical (sorted, merged,
