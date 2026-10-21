@@ -125,9 +125,10 @@ fn alloc_error(layout: Layout) -> ! {
     let wild = crate::memory::heap_wild_blocks();
     if wild > 0 {
         emit(format_args!(
-            "heap has refused and LEAKED {} wild block(s) -- something freed memory the \
-             heap never handed out; see [heap-wild] above for the call chain\n",
+            "heap has refused and LEAKED {} wild block(s), {} KiB in all -- something freed \
+             memory the heap never handed out; see [heap-wild] above for the call chain\n",
             wild,
+            crate::memory::heap_wild_bytes() >> 10,
         ));
     }
     // Free blocks caught written after their free, or freed twice. The front
@@ -1222,6 +1223,17 @@ fn panicking_cpu() -> usize {
 /// A cpu id the bitmap cannot hold is never treated as "already panicking":
 /// answering "no" there costs at most one extra line, while answering "yes"
 /// would silence a report.
+/// Whether any CPU is inside the panic handler right now.
+///
+/// Asked by the diagnostic reporters that run on the OTHER CPUs. A panic does
+/// not stop them: they keep running, and whatever they print lands on top of
+/// the report the panicking CPU is writing -- on a console with one page and
+/// no scrollback, that is the report lost. The counters they keep are printed
+/// by the OOM report itself, so standing down costs nothing.
+pub(crate) fn any_cpu_panicking() -> bool {
+    PANICKING_CPUS.load(core::sync::atomic::Ordering::SeqCst) != 0
+}
+
 #[cfg(not(test))]
 fn mark_panicking(cpu: usize) -> bool {
     use core::sync::atomic::Ordering;
