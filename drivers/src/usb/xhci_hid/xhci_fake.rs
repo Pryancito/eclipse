@@ -948,6 +948,18 @@ struct Fake {
     cmd_cc: u32,
     /// Un controlador que no contesta: el timbre no hace nada.
     deaf: bool,
+    /// Los bits pegajosos de USBSTS, como los guarda el aparato.
+    ///
+    /// Hace falta una copia porque el driver escribe el registro *antes* de
+    /// avisar al fake (es lo que hace el `write_volatile` de verdad), así que
+    /// al llegar aquí el valor anterior ya no está en memoria y un registro
+    /// de borrar-escribiendo-uno no se podría modelar: cualquier escritura
+    /// borraría el registro entero y «qué bits se limpiaron» dejaría de ser
+    /// observable.
+    usbsts: u32,
+    /// El controlador no contesta a MMIO: todo lectura sale a unos, que es lo
+    /// que se lee de un aparato apagado (D3) o que se cayó del bus.
+    dead: bool,
 
     /// Anillo de eventos tal y como lo publicó el driver.
     ev_seg: u64,
@@ -1037,8 +1049,14 @@ pub(super) fn on_read(base: usize, off: usize) {
         if st.read_tick_us != 0 {
             test_clock::advance(st.read_tick_us);
         }
+        if st.dead {
+            // Un aparato que no contesta deja el bus a unos, y eso es lo que
+            // el driver lee en cada registro.
+            poke(st.base + off, u32::MAX);
+            return;
+        }
         if off == CAPLEN + OP_USBSTS {
-            let mut sts = peek(st.base + off) & !(USBSTS_HCH | USBSTS_CNR);
+            let mut sts = st.usbsts & !(USBSTS_HCH | USBSTS_CNR);
             if !st.running {
                 sts |= USBSTS_HCH;
             }
@@ -1125,9 +1143,11 @@ pub(super) fn on_write(base: usize, off: usize, v: u32) {
                 st.running = (v & USBCMD_RS) != 0 && !st.never_runs;
             }
             OP_USBSTS => {
-                // RW1C: los bits escritos a 1 se apagan.
-                let prev = peek(st.base + off);
-                poke(st.base + off, prev & !v);
+                // RW1C: los bits escritos a 1 se apagan. El valor anterior
+                // sale de la copia del aparato, no de la memoria, que la
+                // escritura del driver ya se llevó por delante.
+                st.usbsts &= !v;
+                poke(st.base + off, st.usbsts);
             }
             OP_CRCR => {
                 st.crcr = join_lo(st.crcr, v);
@@ -1662,6 +1682,8 @@ impl Hw {
                 next_slot: 1,
                 cmd_cc: TRB_CC_SUCCESS,
                 deaf: false,
+                usbsts: 0,
+                dead: false,
                 ev_seg: 0,
                 ev_trbs: 0,
                 ev_enq: 0,
@@ -1694,6 +1716,20 @@ impl Hw {
 
     pub(super) fn set_op(&self, off: usize, v: u32) {
         poke(self.base + CAPLEN + off, v);
+    }
+
+    /// Pone los bits pegajosos de USBSTS, como los dejaría un error del
+    /// propio controlador.
+    pub(super) fn set_usbsts(&self, v: u32) {
+        self.with(|st| {
+            st.usbsts = v;
+            poke(st.base + CAPLEN + OP_USBSTS, v);
+        });
+    }
+
+    /// Los bits pegajosos de USBSTS que el aparato sigue guardando.
+    pub(super) fn usbsts(&self) -> u32 {
+        self.with(|st| st.usbsts)
     }
 
     pub(super) fn op64(&self, off: usize) -> u64 {
@@ -1981,6 +2017,45 @@ impl Hw {
     /// El controlador acepta RS pero nunca limpia HCHalted.
     pub(super) fn never_run(&self) {
         self.with(|st| st.never_runs = true);
+    }
+
+    /// El controlador se para solo, sin que nadie le quite RS: eso es lo que
+    /// deja un error de bus (HSE), y lo que el driver encuentra como
+    /// HCHalted sin haberlo pedido.
+    pub(super) fn halt(&self) {
+        self.with(|st| st.running = false);
+    }
+
+    /// Un halt que además deja RS caído: eso es lo que deja el firmware o la
+    /// SMM cuando se lleva el controlador por delante, y entonces volver a
+    /// poner RS es lo único que lo levanta.
+    pub(super) fn halt_clearing_rs(&self) {
+        self.with(|st| {
+            st.running = false;
+            let off = CAPLEN + OP_USBCMD;
+            let prev = peek(st.base + off);
+            poke(st.base + off, prev & !USBCMD_RS);
+        });
+    }
+
+    /// El controlador deja de contestar a MMIO: todo sale a unos.
+    pub(super) fn go_dead(&self) {
+        self.with(|st| {
+            st.dead = true;
+            // Un aparato que se cayó del bus no corre: si alguien le escribe
+            // RS y vuelve a «correr», es que le escribió a un aparato que no
+            // está.
+            st.running = false;
+        });
+    }
+
+    /// Y vuelve a contestar, para ver que el que ya se dejó por muerto no se
+    /// vuelve a mirar.
+    pub(super) fn revive(&self) {
+        self.with(|st| {
+            st.dead = false;
+            st.running = true;
+        });
     }
 
     /// El controlador no se para cuando le quitan RS.
