@@ -1,5 +1,5 @@
-//! `drm_ioctl_permit` for the modeset ioctls `drm_ioctls[]` marks
-//! `DRM_MASTER`, and `drm_master_check_perm` for `SET_MASTER` and
+//! `drm_ioctl_permit` for the ioctls `drm_ioctls[]` marks `DRM_MASTER`
+//! (the modeset twelve, `SET_VERSION` and the hollowed legacy six), and `drm_master_check_perm` for `SET_MASTER` and
 //! `DROP_MASTER`, under `drm.master_check`.
 
 use super::gl_client_sequence_tests::Client;
@@ -67,8 +67,11 @@ fn authenticate(master: &Client, other: &Client) {
         .expect("AUTH_MAGIC");
 }
 
-/// The twelve, by name, so a refusal says which.
-const MASTER_IOCTLS: [(u32, &str); 12] = [
+/// The twelve of modeset and `SET_VERSION`, by name, so a refusal says
+/// which. (`SET_VERSION` with zeros asks for interface 0.0: EINVAL, which
+/// is not EACCES, from the master.)
+const MASTER_IOCTLS: [(u32, &str); 13] = [
+    (DRM_IOCTL_SET_VERSION, "SET_VERSION"),
     (DRM_IOCTL_MODE_SETCRTC, "SETCRTC"),
     (DRM_IOCTL_MODE_SETPLANE, "SETPLANE"),
     (DRM_IOCTL_MODE_CURSOR, "CURSOR"),
@@ -86,7 +89,9 @@ const MASTER_IOCTLS: [(u32, &str); 12] = [
 /// Every ioctl `drm_ioctls[]` marks `DRM_MASTER` is EACCES to an open that
 /// is not the current master, before its argument is read, and only under
 /// `drm.master_check`; the master gets its usual answer to an all-zero
-/// argument (ENOENT, EINVAL, or the no-op's 0), never EACCES. An
+/// argument (ENOENT, EINVAL, or the no-op's 0), never EACCES. `SET_VERSION`
+/// is `DRM_MASTER` like the modeset twelve, and was left out: a second
+/// open had it answered (Xorg's modesetting calls it right after open). An
 /// authenticated open is still not the master. Once the master drops and
 /// the other open takes it, the refusals swap sides. Nothing checked the
 /// master, so every open could set a mode or flip over the compositor.
@@ -97,7 +102,7 @@ fn the_modeset_ioctls_want_the_master_before_they_read_their_argument() {
     let other = Client::open(78);
     authenticate(&master, &other);
     let eacces = Err(FsError::NoPermission);
-    // Wide enough for the largest of the twelve (SETCRTC, 104 bytes).
+    // Wide enough for the largest of them (SETCRTC, 104 bytes).
     let mut zeros = [0u8; 128];
 
     {
@@ -207,4 +212,71 @@ fn set_and_drop_master_are_for_the_open_that_was_master_from_its_process_or_root
         Ok(0),
         "and the first open never lost it"
     );
+}
+
+/// The six hollowed legacy ioctls (`SET_UNIQUE`, `BLOCK`, `UNBLOCK`,
+/// `ADD_DRAW`, `RM_DRAW`, `UPDATE_DRAW`), answered as root once `legacy_permit`
+/// passes, with what each answers.
+fn legacy_six(c: &Client) -> [Result<usize>; 6] {
+    [
+        c.ioctl(DRM_IOCTL_SET_UNIQUE, &mut [0u8; 16]),
+        c.ioctl(DRM_IOCTL_BLOCK, &mut 0u32),
+        c.ioctl(DRM_IOCTL_UNBLOCK, &mut 0u32),
+        c.ioctl(DRM_IOCTL_ADD_DRAW, &mut 0u32),
+        c.ioctl(DRM_IOCTL_RM_DRAW, &mut 0u32),
+        c.ioctl(DRM_IOCTL_UPDATE_DRAW, &mut [0u8; 24]),
+    ]
+}
+
+/// The six hollowed legacy ioctls are `DRM_AUTH | DRM_MASTER | DRM_ROOT_ONLY`
+/// and `SET_VERSION` is `DRM_MASTER`: under `drm.master_check` they are
+/// EACCES to an open that is not the master even when it is authenticated
+/// root (the gate at the top of the dispatch, before `legacy_permit`), while
+/// the master as root gets `SET_UNIQUE`'s EINVAL, the no-ops' 0 and
+/// `SET_VERSION`'s answer to a query. Without the flag an authenticated root
+/// open gets them all. `AUTH_MAGIC` is `DRM_MASTER` with its own check, flag
+/// or no flag, like the leases. `needs_master` began at the modeset ioctls,
+/// so a second open had `SET_VERSION` answered and, as authenticated root,
+/// the legacy six.
+#[test]
+fn the_hollowed_legacy_ioctls_want_the_master_too() {
+    let _serialised = drm::test_globals::lock();
+    let master = Client::open(84);
+    let other = Client::open(84);
+    authenticate(&master, &other);
+    let eacces = Err(FsError::NoPermission);
+    let einval = Err(FsError::InvalidParam);
+    let answered = [
+        Err(FsError::InvalidParam),
+        Ok(0),
+        Ok(0),
+        Ok(0),
+        Ok(0),
+        Ok(0),
+    ];
+    // `-1` throughout: "query only", which `drm_setversion` answers with 0.
+    let query = |c: &Client| c.ioctl(DRM_IOCTL_SET_VERSION, &mut [-1i32; 4]);
+    let auth_magic0 = |c: &Client| c.ioctl(DRM_IOCTL_AUTH_MAGIC, &mut 0u32);
+    let _root = Root::new();
+
+    {
+        let _off = MasterCheck::new(false);
+        assert_eq!(legacy_six(&other), answered, "root, authenticated: no flag");
+        assert_eq!(query(&other), Ok(0), "no flag");
+        assert_eq!(
+            auth_magic0(&other),
+            eacces,
+            "AUTH_MAGIC checks the master itself"
+        );
+        assert_eq!(auth_magic0(&master), einval, "magic 0 is never minted");
+    }
+    let _on = MasterCheck::new(true);
+    for r in legacy_six(&other).iter() {
+        assert_eq!(*r, eacces, "not the master, however privileged");
+    }
+    assert_eq!(query(&other), eacces, "not the master");
+    assert_eq!(legacy_six(&master), answered, "the master, as root");
+    assert_eq!(query(&master), Ok(0), "the master");
+    assert_eq!(auth_magic0(&other), eacces);
+    assert_eq!(auth_magic0(&master), einval);
 }
