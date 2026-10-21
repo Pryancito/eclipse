@@ -76,6 +76,9 @@ pub fn restarts_after_handler(num: u32, args: &[usize; 6]) -> bool {
         | Sys::WAITID
         | Sys::ACCEPT
         | Sys::ACCEPT4
+        // Made again on a socket still connecting, a blocking `connect` goes
+        // back to waiting for the same handshake.
+        | Sys::CONNECT
         | Sys::RECVFROM
         | Sys::RECVMSG
         | Sys::SENDTO
@@ -199,6 +202,10 @@ mod tests {
             Sys::WAITID,
             Sys::ACCEPT,
             Sys::ACCEPT4,
+            // Measured on Linux 6.18: a blocking connect to an address that
+            // never answers goes on past a `SA_RESTART` handler, and past a
+            // stop and a continue.
+            Sys::CONNECT,
             Sys::RECVFROM,
             Sys::RECVMSG,
             Sys::SENDTO,
@@ -228,7 +235,6 @@ mod tests {
             Sys::RT_SIGTIMEDWAIT,
             Sys::NANOSLEEP,
             Sys::CLOCK_NANOSLEEP,
-            Sys::CONNECT,
             Sys::CLOSE,
             Sys::IOCTL,
         ] {
@@ -435,13 +441,11 @@ mod tests {
     fn what_linux_fails_after_a_stop_and_a_continue_is_not() {
         // signal(7): "certain blocking interfaces can fail with the error
         // EINTR after the process is stopped by one of the stop signals and
-        // then resumed via SIGCONT."
-        for sys in [
-            Sys::EPOLL_PWAIT,
-            Sys::RT_SIGTIMEDWAIT,
-            Sys::SEMTIMEDOP,
-            Sys::CONNECT,
-        ] {
+        // then resumed via SIGCONT." Not `connect`: that list has it only
+        // with a `SO_SNDTIMEO` set, as it has `accept` and `recv` only with a
+        // `SO_RCVTIMEO`, and without one a stopped and continued `connect`
+        // goes on waiting (measured on Linux 6.18).
+        for sys in [Sys::EPOLL_PWAIT, Sys::RT_SIGTIMEDWAIT, Sys::SEMTIMEDOP] {
             let num = sys as u32;
             assert!(!restarts_after_stop(num, &[0; 6]), "syscall {}", num);
         }

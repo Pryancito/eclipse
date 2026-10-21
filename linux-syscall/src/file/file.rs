@@ -218,6 +218,9 @@ mod wire_layout_tests;
 #[cfg(test)]
 mod drm_ioctl_layout_tests;
 
+#[cfg(test)]
+mod setlkw_tests;
+
 /// Whether an `EINVAL` from the file's own ioctl handler should be reported
 /// as `ENOTTY`: the request is in the `0x54xx` terminal block and is not one
 /// of the file ioctls that block also carries.
@@ -2685,6 +2688,10 @@ impl Syscall<'_> {
                         if record_lock::setlk(key, &req, false) {
                             return Ok(0);
                         }
+                        // An interruptible wait in Linux: a kill did not end
+                        // it, so a process killed in it was reaped and stayed
+                        // for as long as the lock it waited on was held.
+                        linux_object::process::check_signals()?;
                         kernel_hal::thread::sleep_until(kernel_hal::timer::deadline_after(
                             Duration::from_millis(10),
                         ))

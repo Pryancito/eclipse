@@ -634,37 +634,64 @@ mod which_child {
     }
 
     /// `waitid(P_PGID, WSTOPPED)` on a group whose only member is a zombie:
-    /// there is nothing to collect, but there IS still a child of that group
-    /// to wait for, so Linux blocks instead of answering `ECHILD`. The
-    /// zombie's pgid is the only thing that can say so, because the child is
-    /// off the live table -- this is the one call that reaches the recorded
-    /// exits WITHOUT the scan's shortcut, which only runs when the waiter
-    /// asked about exits at all.
+    /// `ECHILD`, measured on Linux 6.18, blocking or not. A dead child is no
+    /// child of a wait for stops (`wait_task_zombie` answers 0 without
+    /// `WEXITED`, and leaves `notask_error` as it was), so there is nothing
+    /// to wait for. This used to say Linux blocks; it answers at once.
     #[test]
-    fn a_group_wait_for_stops_blocks_on_a_group_that_only_has_a_zombie() {
+    fn a_group_wait_for_stops_on_a_group_that_only_has_a_zombie_is_echild() {
         extern crate std;
         let parent = a_parent(93_544);
         parent
             .linux()
             .record_child_exit(424_244, 0, ChildCpu::default(), 93_544);
-        let stops_only = WaitInterest {
-            exited: false,
-            stopped: true,
-            continued: false,
-        };
         let got = async_std::task::block_on(wait_child_any_interest(
             &parent,
             true,
             true,
-            stops_only,
+            STOPS_ONLY,
             Some(93_544),
         ));
+        assert_eq!(got.map(|(p, _, _)| p), Err(LxError::ECHILD));
+    }
+
+    /// And over all the children: with only zombies left, a wait for stops
+    /// is `ECHILD` there too, where it blocked for good; with a live child
+    /// next to them there is something to wait for (both measured on Linux
+    /// 6.18).
+    #[test]
+    fn a_wait_for_stops_alone_has_no_dead_child_to_wait_for() {
+        extern crate std;
+        use async_std::task::block_on;
+        let parent = a_parent(93_571);
+        parent
+            .linux()
+            .record_child_exit(424_271, 3, ChildCpu::default(), 93_571);
+        let stops = |interest| {
+            block_on(wait_child_any_interest(
+                &parent, true, false, interest, None,
+            ))
+            .map(|(p, _, _)| p)
+        };
+        assert_eq!(stops(STOPS_ONLY), Err(LxError::ECHILD));
+        let _live = Process::fork_from(&parent).unwrap();
         assert_eq!(
-            got.map(|(p, _, _)| p),
+            stops(STOPS_ONLY),
             Err(LxError::EAGAIN),
-            "the group still has a child, it just has nothing to report yet"
+            "a live child is still to be waited for"
+        );
+        assert_eq!(
+            stops(WaitInterest::EXITED_ONLY),
+            Ok(424_271),
+            "and a wait that takes deaths takes the zombie"
         );
     }
+
+    const STOPS_ONLY: WaitInterest = WaitInterest {
+        exited: false,
+        stopped: true,
+        continued: false,
+    };
 }
 
 /// The zombie bookkeeping: `reaped_children`, and the mark that keeps a

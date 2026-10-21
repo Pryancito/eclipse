@@ -1080,18 +1080,18 @@ pub async fn wait_child_any_interest(
         }
         {
             let inner = proc.linux().inner.lock();
-            let has_candidate = if let Some(want) = pgid {
-                inner
-                    .children
-                    .iter()
-                    .any(|(_, c)| effective_pgid(c) == want)
-                    || inner
+            // A dead child is no child of a wait for stops and continues
+            // alone (`wait_task_zombie` without `WEXITED`): with only those
+            // left it is `ECHILD`, as on Linux, where it blocked for good.
+            let has_candidate = inner
+                .children
+                .values()
+                .any(|c| pgid.is_none_or(|want| effective_pgid(c) == want))
+                || interest.exited
+                    && inner
                         .reaped_children
                         .values()
-                        .any(|entry| entry.pgid == want)
-            } else {
-                !inner.children.is_empty() || !inner.reaped_children.is_empty()
-            };
+                        .any(|entry| pgid.is_none_or(|want| entry.pgid == want));
             if !has_candidate {
                 return Err(LxError::ECHILD);
             }
@@ -4951,29 +4951,6 @@ fn child_death_policy(reaper: &LinuxProcess, exit_sig: u8) -> ChildDeathPolicy {
     }
 }
 
-/// Park the current task until this process leaves a job-control stop (or dies).
-pub async fn wait_while_job_stopped(proc: &Arc<Process>) {
-    loop {
-        let stopped = proc
-            .try_linux()
-            .map(|lp| lp.is_job_stopped())
-            .unwrap_or(false);
-        if !stopped || matches!(proc.status(), Status::Exited(_)) {
-            return;
-        }
-        proc.signal_clear(JOB_CONTINUE_SIGNAL);
-        let stopped = proc
-            .try_linux()
-            .map(|lp| lp.is_job_stopped())
-            .unwrap_or(false);
-        if !stopped || matches!(proc.status(), Status::Exited(_)) {
-            return;
-        }
-        let obj: Arc<dyn KernelObject> = proc.clone();
-        obj.wait_signal(JOB_CONTINUE_SIGNAL).await;
-    }
-}
-
 /// Everything `setpgid(2)` decides on, read off the two processes involved
 /// before any of them is touched.
 ///
@@ -5670,6 +5647,13 @@ fn is_on_its_way_out(thread: &Thread) -> bool {
 /// signal -- left a sibling in `pause`, `nanosleep` or `read` asleep for good:
 /// the `execve` waited on it forever, and the process it belonged to never
 /// let go of its address space.
+///
+/// A thread of a job-control-stopped process is parked in
+/// [`wait_while_job_stopped`], on a bit of the process of its own, and the
+/// kill set neither of the two above: `kill -9` on a Ctrl-Z'd process
+/// reaped it and left its thread parked for good, with its memory and its
+/// robust futexes held -- a waiter on one of those timed out where Linux
+/// hands it `EOWNERDEAD`.
 fn wake_the_dying(thread: &Thread) {
     // A process with no Linux side has no Linux waits to end.
     if thread.proc().try_linux().is_none() {
@@ -5677,6 +5661,7 @@ fn wake_the_dying(thread: &Thread) {
     }
     thread.signal_set(SIGNAL_WAKE);
     thread.proc().signal_set(Signal::SIGCHLD);
+    thread.proc().signal_set(JOB_CONTINUE_SIGNAL);
 }
 
 static KILL_WAKES_THE_WAITS: AtomicBool = AtomicBool::new(false);
@@ -6214,20 +6199,6 @@ pub fn prepare_signal(process: &Arc<Process>, signal: LinuxSignal) {
     }
 }
 
-/// The job-control half of `complete_signal()`, for a signal aimed at ONE
-/// thread (`tkill`, `tgkill`, `rt_tgsigqueueinfo`, and so `pthread_kill`).
-///
-/// Queueing the signal on the thread is not enough, and this is the half that
-/// was missing: a thread of a job-control-stopped process is parked in
-/// `wait_while_job_stopped`, which nothing but `job_continue` clears, and a
-/// stopped thread does not run to notice a pending `SIGKILL` either. So
-/// `tgkill(pid, tid, SIGCONT)` on a Ctrl-Z'd process never resumed it and
-/// `tgkill(pid, tid, SIGKILL)` never woke it to die -- and Go, the JVM and
-/// glibc route nearly every signal they send through `tgkill`.
-pub fn complete_signal_for_job_control(process: &Arc<Process>, signal: LinuxSignal) {
-    wake_for_job_control(process, signal)
-}
-
 pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
     send_signal_to_process_with_info(pid, signal, None)
 }
@@ -6321,26 +6292,9 @@ pub fn send_signal_to_process_with_info(
     }
 }
 
-/// `complete_signal()`: the wake-up half, once the signal is queued.
-///
-/// It goes here, in the SENDER, because the work is only ever needed when the
-/// target is job-control stopped -- and a stopped process's threads are
-/// parked in [`wait_while_job_stopped`], so they cannot do it for themselves.
-/// After the queueing, as Linux does it, so the thread that wakes already has
-/// the signal to act on.
-fn wake_for_job_control(process: &Arc<Process>, signal: LinuxSignal) {
-    let lp = match process.try_linux() {
-        Some(lp) => lp,
-        None => return,
-    };
-    match send_effect(signal) {
-        SendEffect::Resume => {
-            lp.job_continue(process);
-        }
-        SendEffect::WakeToDie => lp.job_wake_to_die(process),
-        SendEffect::Stop | SendEffect::None => {}
-    }
-}
+mod job_stop;
+use job_stop::wake_for_job_control;
+pub use job_stop::{complete_signal_for_job_control, wait_while_job_stopped};
 
 mod exit_path;
 use exit_path::ExitPathSummary;

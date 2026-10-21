@@ -275,6 +275,18 @@ fn thread_state_char(state: ThreadState) -> char {
     }
 }
 
+/// [`thread_state_char`] for a thread of `proc`, which a job-control stop
+/// makes `T` (`TASK_STOPPED`) while it is not on its way out. A stopped
+/// thread is parked in the run loop, not in a syscall, so it read as `R`,
+/// and `ps` showed a Ctrl-Z'd job as running.
+fn task_state_char(proc: &Process, state: ThreadState) -> char {
+    match thread_state_char(state) {
+        'Z' => 'Z',
+        _ if proc.try_linux().is_some_and(|lp| lp.is_job_stopped()) => 'T',
+        letter => letter,
+    }
+}
+
 /// The state letter for `/proc/<pid>/stat` and `/proc/<pid>/status`.
 ///
 /// Linux reports the thread-group leader's scheduling state, and the
@@ -287,7 +299,7 @@ fn proc_state_char(proc: &Process) -> char {
         return 'Z';
     }
     match proc_first_thread(proc).map(|t| t.state()) {
-        Some(state) => thread_state_char(state),
+        Some(state) => task_state_char(proc, state),
         // No leader thread yet: created, not started.
         None => 'S',
     }
@@ -311,7 +323,7 @@ fn proc_pid_threads(proc: &Process) -> String {
     let mut out = String::from("# tid state (name) syscall\n");
     for thread in proc.threads() {
         let tid = thread.id();
-        let state = thread_state_char(thread.state());
+        let state = task_state_char(proc, thread.state());
         // try_lock: a thread tearing down may hold its own lock, and a /proc
         // read must never block on it.
         let name = thread
@@ -437,7 +449,7 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
         None => proc_comm(proc),
     };
     let state = match thread {
-        Some(t) => thread_state_char(t.state()),
+        Some(t) => task_state_char(proc, t.state()),
         None => proc_state_char(proc),
     };
     let ppid = proc_ppid(proc);
@@ -5512,6 +5524,47 @@ mod comm_field_tests {
         let line = threads.lines().nth(1).unwrap();
         let per_thread = line.split(' ').nth(1).unwrap();
         assert_eq!(per_thread, alloc::format!("{}", letter), "{:?}", threads);
+    }
+
+    /// A Ctrl-Z'd process and each of its threads are `T` (`TASK_STOPPED`) in
+    /// every file that has a state, as on Linux. They were `R`: a stopped
+    /// thread is parked in the run loop, not in a syscall. A thread on its
+    /// way out stays `Z`, and a continue gives back the threads' own state.
+    #[test]
+    fn a_stopped_process_and_its_threads_are_t_in_every_file() {
+        let proc = a_process(9231, "stopped");
+        let threads = [
+            Thread::create_linux(&proc).unwrap(),
+            Thread::create_linux(&proc).unwrap(),
+        ];
+        let letter = |line: String| line.split(") ").nth(1).and_then(|t| t.chars().next());
+        let stopped = "State:\tT (stopped)\n";
+        proc.linux()
+            .job_stop(&proc, crate::signal::Signal::SIGTSTP as u8);
+        assert_eq!(letter(proc_pid_stat(&proc)), Some('T'));
+        assert!(proc_pid_status(&proc).contains(stopped));
+        for t in &threads {
+            assert_eq!(letter(proc_task_stat(&proc, Some(t))), Some('T'));
+            assert!(proc_task_status(&proc, Some(t)).contains(stopped));
+        }
+        let listed = proc_pid_threads(&proc);
+        let states: Vec<_> = listed
+            .lines()
+            .skip(1)
+            .map(|l| l.split(' ').nth(1))
+            .collect();
+        assert_eq!(states, [Some("T"), Some("T")], "{:?}", listed);
+        zircon_object::task::Task::kill(&*threads[1]);
+        assert_eq!(
+            letter(proc_task_stat(&proc, Some(&threads[1]))),
+            Some('Z'),
+            "a dying thread is not stopped"
+        );
+        proc.linux().job_continue(&proc);
+        assert_eq!(
+            letter(proc_pid_stat(&proc)),
+            Some(thread_state_char(threads[0].state()))
+        );
     }
 
     #[test]

@@ -201,6 +201,12 @@ fn deliver_direct_sigkill(
         KillOutcome::Target => {
             linux_object::process::trace_direct_kill(process, caller);
             process.exit(retcode);
+            // Out of any job-control stop, as `complete_signal` takes a group
+            // a `SIGKILL` is fatal to: a stop left on file was reported to a
+            // `waitid(WSTOPPED)` after the kill, and the stopped thread stayed
+            // parked. After the exit, so the thread that wakes goes to die
+            // instead of back to user mode.
+            linux_object::process::complete_signal_for_job_control(process, Signal::SIGKILL);
         }
         KillOutcome::IgnoredForInit => {
             warn!("SIGKILL for init (pid 1) from pid {} ignored", caller.id());
@@ -1582,6 +1588,33 @@ mod direct_sigkill_tests {
         let caller = a_process(43_204);
         deliver_direct_sigkill(&caller, &caller);
         killed_by_sigkill(&caller);
+    }
+
+    /// `kill -9` on a Ctrl-Z'd job, which nobody had waited for in its stop:
+    /// the stop goes with the kill. It stayed on file, so `waitid(WSTOPPED)`
+    /// reported a process that was already dead as stopped.
+    #[test]
+    fn a_direct_sigkill_takes_the_target_out_of_its_stop() {
+        use linux_object::process::{ProcessExt, WaitInterest};
+        let caller = a_process(43_211);
+        let target = a_process(43_212);
+        target.linux().job_stop(&target, Signal::SIGSTOP as u8);
+        deliver_direct_sigkill(&caller, &target);
+        killed_by_sigkill(&target);
+        assert!(
+            !target.linux().is_job_stopped(),
+            "still stopped after the kill"
+        );
+        let any_change = WaitInterest {
+            exited: false,
+            stopped: true,
+            continued: true,
+        };
+        assert_eq!(
+            target.linux().take_wait_notification(any_change, false),
+            None,
+            "the stop is still there to be reported"
+        );
     }
 }
 

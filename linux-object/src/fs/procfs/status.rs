@@ -58,7 +58,7 @@ pub(super) fn proc_task_status(proc: &Process, thread: Option<&Arc<Thread>>) -> 
         None => proc_comm(proc),
     });
     let state = status_state_text(match thread {
-        Some(t) => thread_state_char(t.state()),
+        Some(t) => task_state_char(proc, t.state()),
         None => proc_state_char(proc),
     });
     // A zombie has given up its `fs_struct`, its descriptor table and its
