@@ -1380,3 +1380,119 @@ fn the_relative_axes_never_appear_without_each_other() {
         }
     }
 }
+
+// --- las formas del descriptor que el clasificador no veía ---------------
+
+/// Lo que QEMU y VirtualBox enchufan como `usb-tablet`: la misma colección de
+/// ratón, pero con X/Y **absolutas** (el bit 2 del Input a cero) y en 16 bits.
+const TABLET_ABS: &[u8] = &[
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, //
+    0x09, 0x01, 0xA1, 0x00, //
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x03, //
+    0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, //
+    0x95, 0x01, 0x75, 0x05, 0x81, 0x01, //   padding
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, //   X, Y
+    0x15, 0x00, 0x26, 0xFF, 0x7F, //         Logical 0..32767
+    0x35, 0x00, 0x46, 0xFF, 0x7F, //         Physical 0..32767
+    0x75, 0x10, 0x95, 0x02, //
+    0x81, 0x02, //   Input (Data,Var,ABS)
+    0xC0, 0xC0,
+];
+
+#[test]
+fn una_tableta_de_ejes_absolutos_no_es_un_raton() {
+    // Un puntero absoluto no se puede tratar como relativo: los eventos
+    // saldrían como motion y el cursor se iría a un lado de la pantalla.
+    assert_eq!(classify_hid_report(TABLET_ABS), HidClass::Tablet);
+}
+
+#[test]
+fn un_item_largo_no_descoloca_el_recorrido() {
+    // Un item largo (prefijo 0xFE) lleva su tamaño en el byte siguiente y no
+    // nos dice nada, pero hay que saltarlo entero. El último byte de su dato
+    // es aquí un 0x75 (`Report Size`, que lleva un byte detrás): si el salto
+    // se queda corto, ese byte se lee como un item, se come el `0x81` del
+    // `Input` y el recorrido ya no vuelve a alinearse.
+    const ITEM_LARGO: &[u8] = &[0xFE, 0x02, 0x00, 0xAA, 0x75];
+    const CAMPOS: &[u8] = &[
+        0x09, 0x30, 0x09, 0x31, // X, Y
+        0x15, 0x81, 0x25, 0x7F, // Logical -127..127
+        0x75, 0x08, 0x95, 0x02, // Report Size 8, Report Count 2
+    ];
+    const INPUT_REL: &[u8] = &[0x81, 0x06];
+
+    // Sin colección de aplicación, lo único que hace que esto sea un ratón
+    // son los ejes relativos del `Input`: un salto mal contado no llega a
+    // verlo.
+    let mut suelto = alloc::vec![0x05u8, 0x01];
+    suelto.extend_from_slice(CAMPOS);
+    suelto.extend_from_slice(ITEM_LARGO);
+    suelto.extend_from_slice(INPUT_REL);
+    assert_eq!(classify_hid_report(&suelto), HidClass::Mouse);
+
+    // Y con una colección de ratón de verdad, los campos tienen que salir en
+    // el mismo bit que sin el item largo delante. El item se cuela justo
+    // antes del `Input` de los ejes, que es donde un desplazamiento ya no
+    // tiene cómo recuperarse.
+    const ANTES: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, //
+        0x95, 0x03, 0x75, 0x01, 0x81, 0x02, //   3 botones
+        0x95, 0x01, 0x75, 0x05, 0x81, 0x01, //   relleno
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, //   X, Y, rueda
+        0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03,
+    ];
+    const DESPUES: &[u8] = &[0x81, 0x06, 0xC0, 0xC0];
+    let armar = |con_item: bool| {
+        let mut d = alloc::vec![];
+        d.extend_from_slice(ANTES);
+        if con_item {
+            d.extend_from_slice(ITEM_LARGO);
+        }
+        d.extend_from_slice(DESPUES);
+        d
+    };
+    let con = parse_hid_descriptor(&armar(true)).mouse;
+    assert_eq!(con, parse_hid_descriptor(&armar(false)).mouse);
+    // Y no es que las dos salgan vacías: el descriptor declara ejes y rueda.
+    let primario = con.primary().expect("el descriptor declara X e Y");
+    assert!(primario.x.is_some() && primario.y.is_some());
+    assert!(con.has_wheel());
+}
+
+#[test]
+fn un_item_de_cuatro_bytes_se_lee_entero() {
+    // `Usage Page` con tamaño 3 en el prefijo son CUATRO bytes de dato, no
+    // cero: si la tabla de tamaños se los come, el `0x09 0x30` de detrás se
+    // lee como otra cosa y el ratón deja de ser un ratón.
+    let desc = alloc::vec![
+        0x07u8, 0x01, 0x00, 0x00, 0x00, // Usage Page (Generic Desktop), 4 bytes
+        0x09, 0x02, 0xA1, 0x01, //         Mouse / Collection (Application)
+        0x09, 0x30, 0x09, 0x31, //         X, Y
+        0x81, 0x06, //                     Input (Data,Var,Rel)
+        0xC0,
+    ];
+    assert_eq!(classify_hid_report(&desc), HidClass::Mouse);
+}
+
+#[test]
+fn un_descriptor_cortado_a_medias_no_se_sale_del_buffer() {
+    // Tres formas de quedarse corto: un item con dato que no está, un item
+    // largo sin su tamaño, y un descriptor vacío. Ninguna puede indexar más
+    // allá del final.
+    assert_eq!(classify_hid_report(&[0x05, 0x01, 0x09]), HidClass::Unknown);
+    assert_eq!(classify_hid_report(&[0xFE]), HidClass::Unknown);
+    assert_eq!(classify_hid_report(&[]), HidClass::Unknown);
+}
+
+#[test]
+fn una_coleccion_de_una_pagina_que_no_conducimos_no_es_nada() {
+    // Un digitalizador (página 0x0D) sin X/Y de escritorio: no es teclado,
+    // no es ratón y no es consumer, así que no se clasifica.
+    let desc = alloc::vec![
+        0x05u8, 0x0D, 0x09, 0x01, 0xA1, 0x01, // Digitizer / Collection
+        0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02, //
+        0xC0,
+    ];
+    assert_eq!(classify_hid_report(&desc), HidClass::Unknown);
+}

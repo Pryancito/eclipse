@@ -7635,3 +7635,8 @@ mod disk_tests;
 /// leave uncovered.
 #[cfg(test)]
 mod trb_tests;
+
+/// La tabla de la página HID del teclado y el delta entre dos informes, que
+/// es el camino que `tests` no toca: ahí todo es ratón.
+#[cfg(test)]
+mod keyboard_tests;
