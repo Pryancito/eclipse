@@ -8,14 +8,20 @@ use super::*;
 use crate::mkfs;
 use crate::testdisk::{clock, opts, Ram, MIB};
 
-/// A RAM disk whose writes at or past byte `fail_from` fail.
+/// A RAM disk whose writes at or past byte `fail_from` fail, and whose
+/// reads of block `fail_read` fail.
 struct Faulty {
     ram: Arc<Ram>,
     fail_from: AtomicU64,
+    fail_read: AtomicU64,
 }
 
 impl BlockDevice for Faulty {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let b = self.fail_read.load(Ordering::Relaxed) * BLOCK_SIZE;
+        if offset < b + BLOCK_SIZE && offset + buf.len() as u64 > b {
+            return Err(Error::Io);
+        }
         self.ram.read_at(offset, buf)
     }
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
@@ -224,6 +230,7 @@ fn a_device_that_fails_writes() {
     let dev = Arc::new(Faulty {
         ram: ram.clone(),
         fail_from: AtomicU64::new(u64::MAX),
+        fail_read: AtomicU64::new(u64::MAX / BLOCK_SIZE),
     });
     let mut fs = EclipseFsV3::mount(dev.clone(), false).unwrap();
     fs.set_clock(clock);
@@ -243,6 +250,114 @@ fn a_device_that_fails_writes() {
     drop(ro);
     let mut fs = EclipseFsV3::mount(ram, false).unwrap();
     fs.check().unwrap();
+}
+
+/// A superblock replayed from the journal that the device cannot hold.
+#[test]
+fn a_journal_that_grows_the_filesystem_past_the_device() {
+    let d = formatted(8);
+    let mut buf = vec![0u8; BLOCK_SIZE as usize];
+    d.read_at(0, &mut buf).unwrap();
+    let sb = Superblock::decode(&buf).unwrap();
+    let j = JournalArea {
+        start: sb.journal_start,
+        blocks: sb.journal_blocks as u64,
+    };
+    let mut big = sb.clone();
+    big.total_blocks += 1;
+    j.write(&*d, &sb.uuid, 1, &[(0, big.encode())]).unwrap();
+    assert_eq!(
+        EclipseFsV3::mount(d, true).err(),
+        Some(Error::Corrupt("filesystem larger than device"))
+    );
+}
+
+#[test]
+fn a_root_that_is_not_a_directory() {
+    let (d, mut fs) = mounted(8);
+    let mut root = fs.take(ROOT_INO).unwrap();
+    root.kind = FileKind::Regular;
+    fs.put(ROOT_INO, root).unwrap();
+    fs.sync().unwrap();
+    drop(fs);
+    assert_eq!(
+        EclipseFsV3::mount(d, false).err(),
+        Some(Error::Corrupt("root is not a directory"))
+    );
+}
+
+/// Space freed in the open transaction is committed early once it is what
+/// the next call needs.
+#[test]
+fn freed_space_commits_when_it_runs_short() {
+    let (_, mut fs) = mounted(8);
+    let big = file(&mut fs, ROOT_INO, "big");
+    let chunk = vec![1u8; MIB];
+    let mut at = 0;
+    while let Ok(n) = fs.write(big, at, &chunk) {
+        at += n as u64;
+    }
+    fs.sync().unwrap();
+    fs.unlink(ROOT_INO, "big").unwrap();
+    assert!(fs.alloc.deferred_blocks() > 0);
+    file(&mut fs, ROOT_INO, "next");
+    assert_eq!(fs.alloc.deferred_blocks(), 0);
+    fs.check().unwrap();
+}
+
+/// Inodes whose sizes or parents cannot be.
+#[test]
+fn inodes_out_of_bounds() {
+    let (_, mut fs) = mounted(8);
+    let d = dir(&mut fs, ROOT_INO, "d");
+    let f = file(&mut fs, ROOT_INO, "f");
+    let l = fs.symlink(ROOT_INO, "l", b"f").unwrap();
+    fs.dirs.remove(&d);
+    fs.inodes.get_mut(&d).unwrap().size = MAX_DIR_BYTES + 1;
+    assert_eq!(fs.lookup(d, "x"), Err(Error::Corrupt("directory size")));
+    fs.inodes.get_mut(&l).unwrap().size = MAX_SYMLINK_LEN as u64 + 1;
+    assert_eq!(fs.read_link(l), Err(Error::Corrupt("symlink size")));
+    fs.inodes.get_mut(&f).unwrap().parent = 0;
+    assert_eq!(fs.parent(f), Err(Error::NotFound));
+}
+
+/// A compaction that cannot write drops the cached directory.
+#[test]
+fn a_compaction_that_fails() {
+    let ram = formatted(8);
+    let dev = Arc::new(Faulty {
+        ram,
+        fail_from: AtomicU64::new(u64::MAX),
+        fail_read: AtomicU64::new(u64::MAX / BLOCK_SIZE),
+    });
+    let mut fs = EclipseFsV3::mount(dev.clone(), false).unwrap();
+    let d = dir(&mut fs, ROOT_INO, "d");
+    let mut i = 0;
+    // Three blocks and more than half of a fourth.
+    while fs.inode(d).unwrap().size < 3 * BLOCK_SIZE + BLOCK_SIZE / 2 {
+        file(&mut fs, d, &format!("entry-with-a-long-name-{i:04}"));
+        i += 1;
+    }
+    fs.sync().unwrap();
+    // Entries of the first block and of the last two go; the compacted
+    // tail lands in the second block, which cannot be read.
+    let gone: Vec<String> = fs.dirs[&d]
+        .entries
+        .iter()
+        .filter(|(_, s)| s.off + s.len <= BLOCK_SIZE || s.off >= 2 * BLOCK_SIZE)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let (p, _) = fs.inode(d).unwrap().extents.lookup(1).unwrap();
+    dev.fail_read.store(p, Ordering::Relaxed);
+    let mut failed = false;
+    for n in gone {
+        if fs.unlink(d, &n) == Err(Error::Io) {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed);
+    assert!(!fs.dirs.contains_key(&d));
 }
 
 // ---------------------------------------------------------------------------
