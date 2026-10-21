@@ -3247,6 +3247,14 @@ mod seek_and_access_tests;
 #[cfg(test)]
 mod truncate_type_tests;
 
+/// The two length calls and the two filesystem-statistics calls, asked
+/// through the syscalls: `truncate_type` and `ftruncate_type` have pure
+/// tests above, but which syscall asks which of them -- they disagree about
+/// a directory and about permissions -- is only visible end to end, and the
+/// eight numbers of `statfs` had never been read back at all.
+#[cfg(test)]
+mod truncate_and_statfs_tests;
+
 /// `SYNC_IOC_MERGE` is `_IOWR('>', 3, struct sync_merge_data)`: type `'>'`
 /// (0x3e), nr 3, 48 bytes. Matched on type and nr, like the DRM syncobj fd
 /// ioctls: the struct is UABI-frozen, and a size-pinned constant is how this
