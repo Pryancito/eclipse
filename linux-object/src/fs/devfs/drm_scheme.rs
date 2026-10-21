@@ -3640,6 +3640,20 @@ impl DrmDev {
                     size,
                     dir
                 );
+                // `DRM_IOCTL_NOUVEAU_SETPARAM`: nouveau's table lists it as
+                // `drm_invalid_op` under `DRM_AUTH | DRM_MASTER |
+                // DRM_ROOT_ONLY`, so with the nouveau uAPI in force the
+                // permit answers first (EACCES) and the op itself is EINVAL.
+                // It went to the driver, which has no arm for it: ENOSYS.
+                if nr == DRM_IOCTL_NOUVEAU_SETPARAM & 0xff
+                    && zcore_drivers::display::nouveau_uapi_enabled()
+                {
+                    self.legacy_permit(true)?;
+                    if master_check_enabled() && !drm::is_master(self.minor, self.file_owner()) {
+                        return Err(FsError::NoPermission);
+                    }
+                    return Err(FsError::InvalidParam);
+                }
                 if let Some(driver) = self.driver() {
                     driver
                         .ioctl_owned(cmd, data, drm::current_pid())
@@ -4033,6 +4047,9 @@ const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010640D;
 const DRM_IOCTL_GEM_CLOSE: u32 = 0x40086409;
 const DRM_IOCTL_SET_MASTER: u32 = 0x0000641E;
 const DRM_IOCTL_DROP_MASTER: u32 = 0x0000641F;
+/// `DRM_IOWR(DRM_COMMAND_BASE + DRM_NOUVEAU_SETPARAM, struct drm_nouveau_setparam)`
+/// (16 bytes); matched by number, like every ioctl here.
+const DRM_IOCTL_NOUVEAU_SETPARAM: u32 = 0xC0106441;
 
 const DRM_IOCTL_MODE_GETRESOURCES: u32 = 0xC04064A0;
 const DRM_IOCTL_MODE_GETCRTC: u32 = 0xC06864A1;
