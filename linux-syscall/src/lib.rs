@@ -580,6 +580,12 @@ impl Syscall<'_> {
                 self.sys_pidfd_send_signal(a0.into(), a1, a2.into(), a3 as u32)
             }
             Sys::PIDFD_GETFD => self.sys_pidfd_getfd(a0.into(), a1 as i32, a2 as u32),
+            Sys::PROCESS_VM_READV => {
+                self.sys_process_vm_readv(a0, a1.into(), a2, a3.into(), a4, a5)
+            }
+            Sys::PROCESS_VM_WRITEV => {
+                self.sys_process_vm_writev(a0, a1.into(), a2, a3.into(), a4, a5)
+            }
 
             // time
             Sys::NANOSLEEP => self.sys_nanosleep(a0.into(), a1.into()).await,

@@ -38,6 +38,7 @@ use zircon_object::{
 mod arg_area;
 /// The thread a child was forked by, and what its exit tells the child.
 mod forking_thread;
+pub mod remote_memory;
 pub use forking_thread::forget_forking_thread;
 /// The file-descriptor table's allocator and its two range sweeps.
 mod census;

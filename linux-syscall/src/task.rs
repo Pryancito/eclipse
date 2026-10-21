@@ -34,6 +34,8 @@ mod exec_args;
 mod execveat;
 use execveat::exec_target;
 pub(crate) use execveat::real_path;
+/// `process_vm_readv(2)` and `process_vm_writev(2)`.
+mod process_vm;
 
 const P_ALL: i32 = 0;
 const P_PID: i32 = 1;
