@@ -6925,9 +6925,11 @@ pub fn set_poll_instance(dev: Option<Arc<XhciUsbHid>>) {
 /// skipped poll costs nothing, while waiting for a contended lock closed a
 /// genuine AB-BA cycle against the graphic console:
 ///
-///     cpu=3 at drivers/src/usb/xhci_hid.rs:3417      <- holds the shadow fb,
-///     cpu=2 at drivers/src/utils/shadow_fb.rs:113       wants the xHCI lock
-///     HOLDER cpu=3 at :113
+/// ```text
+/// cpu=3 at drivers/src/usb/xhci_hid.rs:3417      <- holds the shadow fb,
+/// cpu=2 at drivers/src/utils/shadow_fb.rs:113       wants the xHCI lock
+/// HOLDER cpu=3 at :113
+/// ```
 ///
 /// The console reaches the input subsystem while holding the framebuffer lock
 /// (io-wait ticks poll HID); the HID path draws the cursor, which takes the
@@ -7683,6 +7685,11 @@ mod xhci_fake;
 /// controlador de [`xhci_fake`].
 #[cfg(test)]
 mod controller_tests;
+
+/// La enumeración de un dispositivo, contra el aparato de [`xhci_fake`] que
+/// contesta por EP0.
+#[cfg(test)]
+mod enum_tests;
 
 /// La tabla de la página HID del teclado y el delta entre dos informes, que
 /// es el camino que `tests` no toca: ahí todo es ratón.

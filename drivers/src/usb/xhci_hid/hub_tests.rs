@@ -671,7 +671,9 @@ fn a_bit_above_the_port_count_or_past_the_report_is_ignored() {
 fn the_backstop_sweep_is_slower_than_the_sweep_that_is_the_only_signal() {
     // Si se igualaran, un hub con su endpoint armado pagaria una
     // transferencia de control por puerto y por segundo para nada.
-    assert!(HUB_BACKSTOP_PERIOD_US > HUB_SCAN_PERIOD_US);
+    const {
+        assert!(HUB_BACKSTOP_PERIOD_US > HUB_SCAN_PERIOD_US);
+    }
 }
 
 #[test]
