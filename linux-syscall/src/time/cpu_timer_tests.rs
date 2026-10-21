@@ -5,7 +5,8 @@
 use super::*;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use linux_object::process::LinuxProcess;
+use async_std::task::block_on;
+use linux_object::process::{wait_child, LinuxProcess};
 use rcore_fs_ramfs::RamFS;
 
 fn ms(n: u64) -> Duration {
@@ -473,9 +474,11 @@ fn a_timer_on_another_process_clock_signals_its_owner() {
 
 /// `pid_for_clock` for a timer: a thread clock names a thread of the
 /// caller's own process, and a clock whose task is gone reads as nothing
-/// (`timer_settime`'s ESRCH).
+/// (`timer_settime`'s ESRCH). A zombie is still a task, with its clock
+/// stopped; a child its parent has collected is not, even while it is
+/// still in its job finishing its teardown.
 #[test]
-fn a_cpu_clock_names_a_live_task() {
+fn a_cpu_clock_names_a_task_until_it_is_reaped() {
     let (proc, _thread) = a_process(45_151);
     let (other, other_thread) = a_process(45_152);
     let theirs = CpuClock {
@@ -492,12 +495,20 @@ fn a_cpu_clock_names_a_live_task() {
         kind: CpuClockKind::Sched,
     };
     assert!(cpu_timer_target(&proc, nobody).is_none());
-    let (dead, _) = a_process(45_154);
-    let clock = process_clock(&dead);
+    let child = Process::fork_from(&proc).unwrap();
+    let child_thread = Thread::create_linux(&child).unwrap();
+    let clock = process_clock(&child);
     assert!(cpu_timer_target(&proc, clock).is_some());
-    dead.exit(0);
+    child.exit(0);
+    assert!(cpu_timer_target(&proc, clock).is_some(), "a zombie");
+    block_on(wait_child(&proc, child.id(), true, true)).unwrap();
+    assert!(
+        ROOT_JOB.find_process(child.id()).is_some(),
+        "the case this is about: collected, still in its job"
+    );
     assert!(
         cpu_timer_target(&proc, clock).is_none(),
-        "a process that has exited"
+        "a child its parent has collected"
     );
+    child_thread.terminate_abandoned();
 }

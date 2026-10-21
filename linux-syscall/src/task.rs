@@ -1766,6 +1766,15 @@ impl Syscall<'_> {
     /// process for a thread whose TID matches; failing that we treat `pid` as a
     /// process id and return its leader thread, so `taskset -p <pid>` works for
     /// single-threaded processes.
+    ///
+    /// That second look is the one that finds a process which has exited, so
+    /// it asks [`find_task`](linux_object::process::find_task) and not the
+    /// job: a child `wait4` has collected can still be in its job while its
+    /// last thread finishes dying, and in QEMU a third of the `sched_*`,
+    /// `getpriority` and `ioprio_get` calls made right after the `waitpid`
+    /// found that thread, where Linux answers `ESRCH`. A zombie still has its
+    /// thread while it is in the job, and is found, as on Linux; once it has
+    /// left, it has no thread to answer with.
     fn find_thread_by_tid(&self, pid: usize) -> Option<Arc<Thread>> {
         let id = pid as KoID;
         for proc in linux_object::process::all_live_processes() {
@@ -1775,7 +1784,7 @@ impl Syscall<'_> {
                 }
             }
         }
-        let proc = zircon_object::task::ROOT_JOB.find_process(id)?;
+        let proc = linux_object::process::find_task(id)?;
         proc.threads().first().cloned()
     }
 
@@ -3054,6 +3063,8 @@ mod clone_tls_tests;
 #[cfg(test)]
 mod wait_option_tests;
 
+#[cfg(test)]
+mod collected_pid_tests;
 #[cfg(test)]
 mod nproc_tests;
 #[cfg(test)]

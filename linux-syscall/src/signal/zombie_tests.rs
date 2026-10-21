@@ -14,6 +14,7 @@ use crate::on_a_thread::on_a_thread;
 use alloc::boxed::Box;
 use linux_object::process::{effective_pgid, effective_sid, LinuxProcess, ProcessExt};
 use rcore_fs_ramfs::RamFS;
+use zircon_object::task::ROOT_JOB;
 
 const SIGTERM: usize = 15;
 

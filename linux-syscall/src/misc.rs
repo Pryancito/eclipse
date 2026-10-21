@@ -864,8 +864,10 @@ impl Syscall<'_> {
     }
 
     /// The process `prlimit64(pid, ...)` is about: the caller for `pid == 0`
-    /// or for its own pid, otherwise whichever process that is -- `ESRCH`
-    /// when there is none, `EPERM` when it is not the caller's to touch.
+    /// or for its own pid, otherwise whichever process that is, a zombie
+    /// included -- `ESRCH` when there is none, a child `wait4` has already
+    /// collected among them, and `EPERM` when it is not the caller's to
+    /// touch.
     fn prlimit_target(&self, pid: usize) -> linux_object::error::LxResult<Arc<Process>> {
         // A `pid_t`: the low 32 bits of the register, and a negative one is
         // a task `find_task_by_vpid` does not find.
@@ -874,7 +876,7 @@ impl Syscall<'_> {
         if pid == 0 || pid as u64 == me.id() {
             return Ok(me.clone());
         }
-        let target = linux_object::process::find_process(pid as u64).ok_or(LxError::ESRCH)?;
+        let target = linux_object::process::find_task(pid as u64).ok_or(LxError::ESRCH)?;
         let allowed = {
             let other = target.try_linux().ok_or(LxError::ESRCH)?;
             LinuxProcess::may_touch_limits_of(
@@ -1223,11 +1225,13 @@ fn capget_names_the_caller(pid: i32, self_pid: KoID) -> bool {
     pid == 0 || pid as KoID == self_pid
 }
 
-/// The process the task `pid` belongs to: the process of that id, or the
-/// one owning a thread of that id, since Linux's `find_task_by_vpid` takes a
-/// TID. `None` when there is no such task.
+/// The process the task `pid` belongs to: the process of that id, a
+/// zombie's included, or the one owning a thread of that id, since Linux's
+/// `find_task_by_vpid` takes a TID. `None` when there is no such task, as
+/// for a child `wait4` has collected that is still in its job finishing its
+/// teardown.
 fn process_of_task(pid: KoID) -> Option<Arc<zircon_object::task::Process>> {
-    linux_object::process::find_process(pid).or_else(|| {
+    linux_object::process::find_task(pid).or_else(|| {
         linux_object::process::all_live_processes()
             .into_iter()
             .find(|proc| proc.get_child(pid).is_ok())
