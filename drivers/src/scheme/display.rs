@@ -2,6 +2,9 @@ use super::Scheme;
 use crate::DeviceResult;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(test)]
+extern crate std;
+
 /// When set, GOP scanout is stored left-right reversed. Opt-in (`FB_MIRROR_X`);
 /// default is left-to-right. Do not use this to compensate for mirrored glyphs.
 static SCANOUT_MIRROR_X: AtomicBool = AtomicBool::new(false);
@@ -11,8 +14,26 @@ pub fn set_scanout_mirror_x(on: bool) {
     SCANOUT_MIRROR_X.store(on, Ordering::SeqCst);
 }
 
+// Under test, this thread's own answer, taking precedence over the flag.
+//
+// The flag is a boot-time opt-in that every test in this file reads, and the
+// tests run in parallel, so a test that stored into it would change what the
+// others see half way through their blit. A per-thread override lets one
+// test run the mirrored half of every primitive while the rest of the binary
+// keeps seeing the default. The seam sits BELOW the primitives: `blit_from`,
+// `read_into` and the rest run their real code, and only the answer the flag
+// would have given is substituted.
+#[cfg(test)]
+std::thread_local! {
+    static MIRROR_OVERRIDE: core::cell::Cell<Option<bool>> = const { core::cell::Cell::new(None) };
+}
+
 #[inline]
 fn scanout_mirror_x() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = MIRROR_OVERRIDE.with(|m| m.get()) {
+        return forced;
+    }
     SCANOUT_MIRROR_X.load(Ordering::Relaxed)
 }
 
@@ -854,6 +875,26 @@ mod blit_tests {
                 },
                 mem: Mutex::new(alloc::vec![0u8; size]),
                 wc,
+            })
+        }
+
+        /// A 24-bit panel, unpadded. Not ARGB8888, so `blit_from` has no row
+        /// copy for it and goes through `draw_pixel`, and `read_into` refuses
+        /// it outright.
+        fn rgb888(width: u32, height: u32) -> Arc<Self> {
+            let pitch = width * 3;
+            let size = (pitch * height) as usize;
+            Arc::new(Self {
+                info: DisplayInfo {
+                    width,
+                    height,
+                    pitch,
+                    format: ColorFormat::RGB888,
+                    fb_base_vaddr: 0,
+                    fb_size: size,
+                },
+                mem: Mutex::new(alloc::vec![0u8; size]),
+                wc: false,
             })
         }
 
@@ -1943,12 +1984,31 @@ mod blit_tests {
 
     // ---- the mirror ----
 
-    /// Build a mapping without touching the process-wide flag, so the mirrored
-    /// half of the primitives can be checked at all. `SCANOUT_MIRROR_X` is a
-    /// boot-time opt-in that every test in this module reads, so a test that
-    /// flipped it would depend on the execution order; this does not.
+    /// Build a mapping without touching the process-wide flag. `SCANOUT_MIRROR_X`
+    /// is a boot-time opt-in that every test in this module reads, so a test
+    /// that flipped it would depend on the execution order; this does not,
+    /// and neither does [`Mirrored`], which answers for one thread only.
     fn xmap(mirror: bool, width: u32) -> XMap {
         XMap { mirror, width }
+    }
+
+    /// The mirror, on, for this thread's tests and nobody else's, for as long
+    /// as the guard lives. This is how the mirrored half of `blit_from` and
+    /// `read_into` -- which read the flag through `scanout_mirror_x`, not
+    /// through a mapping handed to them -- gets run at all.
+    struct Mirrored;
+
+    impl Mirrored {
+        fn on() -> Self {
+            MIRROR_OVERRIDE.with(|m| m.set(Some(true)));
+            Self
+        }
+    }
+
+    impl Drop for Mirrored {
+        fn drop(&mut self) {
+            MIRROR_OVERRIDE.with(|m| m.set(None));
+        }
     }
 
     #[test]
@@ -2096,6 +2156,250 @@ mod blit_tests {
             mem[7], 0xAA,
             "the fourth byte of a 24-bit pixel was written"
         );
+    }
+
+    // ---- the mirror, through the primitives ----
+
+    #[test]
+    fn the_boot_time_switch_and_the_override_are_what_the_primitives_read() {
+        // Storing the default is the one store that cannot disturb the tests
+        // running beside this one; it is also all the boot code ever does on
+        // Moebius's machines.
+        set_scanout_mirror_x(false);
+        assert!(!scanout_mirror_x());
+        assert_eq!(XMap::of(8), xmap(false, 8));
+        {
+            let _m = Mirrored::on();
+            assert!(scanout_mirror_x());
+            assert_eq!(XMap::of(8), xmap(true, 8));
+        }
+        assert!(!scanout_mirror_x(), "the override outlived its guard");
+    }
+
+    #[test]
+    fn a_mirrored_blit_lands_each_column_at_its_distance_from_the_right_edge() {
+        let _m = Mirrored::on();
+        let d = FakeDisplay::new(8, 2, 16);
+        let src = numbered(4, 2);
+        d.blit_from(1, 0, &src, 4, 4, 2);
+        for r in 0..2u32 {
+            for c in 0..4u32 {
+                // Logical column `1 + c` of an 8-wide screen is physical `6 - c`.
+                assert_eq!(
+                    d.px(6 - c, r),
+                    src[(r * 4 + c) as usize],
+                    "row {} logical column {}",
+                    r,
+                    1 + c
+                );
+            }
+        }
+        // Logical 0 (physical 7) and logical 5.. (physical 2 and below) were
+        // not part of the blit.
+        assert_eq!((d.px(7, 0), d.px(2, 0)), (0, 0));
+        // And the padding past the visible width is never a mirrored
+        // destination: the logical right edge is the physical LEFT edge.
+        for x in 8..16 {
+            assert_eq!((d.px(x, 0), d.px(x, 1)), (0, 0), "padding column {}", x);
+        }
+    }
+
+    #[test]
+    fn a_mirrored_blit_is_clipped_at_the_physical_left_edge_not_wrapped_below_it() {
+        let _m = Mirrored::on();
+        // A padded pitch, so the padded right limit the row copies use would
+        // let logical 8 and 9 through: mirrored, those map below column 0.
+        let d = FakeDisplay::new(8, 2, 16);
+        let src = numbered(4, 1);
+        // Logical 6..10 on row 1: only 6 and 7 are visible, and they land on
+        // physical 1 and 0. Below physical 0 lies the END of row 0 in memory,
+        // not more of row 1.
+        d.blit_from(6, 1, &src, 4, 4, 1);
+        assert_eq!((d.px(1, 1), d.px(0, 1)), (0x1000, 0x1001));
+        assert_eq!(
+            (d.px(15, 0), d.px(14, 0), d.px(7, 0)),
+            (0, 0, 0),
+            "the blit walked into the previous row"
+        );
+        // Entirely off the edge, below the last row, or with no stride to
+        // walk the source by: nothing at all.
+        let before = d.snapshot();
+        d.blit_from(8, 0, &src, 4, 4, 1);
+        d.blit_from(0, 2, &src, 4, 4, 1);
+        d.blit_from(0, 0, &src, 0, 4, 1);
+        assert_eq!(d.snapshot(), before);
+    }
+
+    #[test]
+    fn a_mirrored_blit_stops_where_its_source_or_the_aperture_ends() {
+        let _m = Mirrored::on();
+        // One source row for a two-row blit: the second row is left alone.
+        let d = FakeDisplay::new(4, 2, 4);
+        d.blit_from(0, 0, &numbered(4, 1), 4, 4, 2);
+        assert_eq!((d.px(3, 0), d.px(0, 0)), (0x1000, 0x1003));
+        assert_eq!(
+            (0..4).map(|x| d.px(x, 1)).sum::<u32>(),
+            0,
+            "row 1 had no source"
+        );
+        // An aperture 8 bytes short of `pitch * height`: physical columns 2
+        // and 3 of the last row do not exist. Mirrored, a row is written right
+        // to left in memory, so its FIRST logical pixel is the one that does
+        // not fit, and the row is dropped whole rather than drawn from its
+        // third pixel on.
+        let t = truncated(4, 2, 4, 8);
+        t.blit_from(0, 0, &numbered(4, 2), 4, 4, 2);
+        assert_eq!((t.px(3, 0), t.px(0, 0)), (0x1000, 0x1003));
+        assert_eq!((t.px(0, 1), t.px(1, 1)), (0, 0));
+    }
+
+    #[test]
+    fn reading_a_mirrored_window_back_returns_what_the_blit_was_given() {
+        let _m = Mirrored::on();
+        let d = FakeDisplay::new(8, 3, 16);
+        let src = numbered(5, 2);
+        d.blit_from(2, 1, &src, 5, 5, 2);
+        let mut back = alloc::vec![0u32; 10];
+        assert!(d.read_into(2, 1, &mut back, 5, 5, 2));
+        assert_eq!(
+            back, src,
+            "the software cursor would restore different pixels than it saved"
+        );
+        // The read clips at the visible width like the blit did, and never at
+        // the pitch: logical 6..10 is two columns, physical 1 and 0.
+        let mut edge = alloc::vec![0xEEu32; 8];
+        assert!(d.read_into(6, 1, &mut edge, 4, 4, 2));
+        assert_eq!(&edge[..2], &[d.px(1, 1), d.px(0, 1)]);
+        assert_eq!(&edge[4..6], &[d.px(1, 2), d.px(0, 2)]);
+        assert_eq!(
+            (edge[2], edge[3], edge[6], edge[7]),
+            (0xEE, 0xEE, 0xEE, 0xEE),
+            "a column past the edge was filled"
+        );
+    }
+
+    #[test]
+    fn a_read_that_cannot_fill_the_whole_window_fills_none_of_it() {
+        let d = FakeDisplay::new(8, 2, 8);
+        d.blit_from(0, 0, &numbered(8, 2), 8, 8, 2);
+        let mut dst = alloc::vec![0xEEu32; 16];
+        assert!(!d.read_into(0, 0, &mut dst, 0, 4, 1), "a zero stride");
+        assert!(
+            !d.read_into(0, 2, &mut dst, 8, 4, 1),
+            "a window below the last row"
+        );
+        assert!(
+            !d.read_into(8, 0, &mut dst, 8, 4, 1),
+            "a window past the right edge"
+        );
+        assert!(
+            !d.read_into(0, 0, &mut dst[..12], 8, 8, 2),
+            "a destination short of a row"
+        );
+        let short = truncated(8, 2, 8, 4);
+        assert!(
+            !short.read_into(0, 0, &mut dst, 8, 8, 2),
+            "a scanout short of a row"
+        );
+        let rgb = FakeDisplay::rgb888(8, 2);
+        assert!(!rgb.fb_readable());
+        assert!(
+            !rgb.read_into(0, 0, &mut dst, 8, 4, 1),
+            "a panel that is not ARGB8888"
+        );
+        assert!(
+            dst.iter().all(|&p| p == 0xEE),
+            "a refused read wrote into its destination"
+        );
+        // The same call, satisfiable, succeeds: the refusals above were the
+        // conditions, not the shape of the call.
+        assert!(d.read_into(0, 0, &mut dst, 8, 8, 2));
+        assert_eq!(dst, numbered(8, 2));
+    }
+
+    #[test]
+    fn a_panel_that_is_not_argb_takes_the_blit_pixel_by_pixel() {
+        let d = FakeDisplay::rgb888(4, 2); // 12 bytes per row, three per pixel
+        let src = [
+            0xAA11_2233u32,
+            0x0044_5566,
+            0x0077_8899, // row 0
+            0x00AA_BBCC,
+            0x00DD_EEFF,
+            0x0012_3456, // row 1
+        ];
+        d.blit_from(1, 0, &src, 3, 3, 2);
+        let m = d.snapshot();
+        // B, G, R per pixel; the alpha byte of the first source pixel has
+        // nowhere to go and is dropped.
+        assert_eq!(&m[0..3], &[0, 0, 0], "column 0 was not in the blit");
+        assert_eq!(
+            &m[3..12],
+            &[0x33, 0x22, 0x11, 0x66, 0x55, 0x44, 0x99, 0x88, 0x77]
+        );
+        assert_eq!(
+            &m[15..24],
+            &[0xCC, 0xBB, 0xAA, 0xFF, 0xEE, 0xDD, 0x56, 0x34, 0x12]
+        );
+        // Clipped at the visible width, and a row the source does not have is
+        // left alone.
+        let d = FakeDisplay::rgb888(4, 2);
+        d.blit_from(2, 0, &src[..3], 3, 3, 2);
+        let m = d.snapshot();
+        assert_eq!(&m[6..12], &[0x33, 0x22, 0x11, 0x66, 0x55, 0x44]);
+        assert_eq!(&m[12..24], &[0u8; 12], "row 1 had no source");
+    }
+
+    #[test]
+    fn a_row_copy_stops_where_its_source_or_the_aperture_ends() {
+        // Two source rows for a three-row blit onto a write-back panel.
+        let d = FakeDisplay::write_back(4, 3, 4);
+        d.blit_from(0, 0, &numbered(4, 2), 4, 4, 3);
+        assert_eq!((d.px(0, 0), d.px(0, 1)), (0x1000, 0x1004));
+        assert_eq!(
+            (0..4).map(|x| d.px(x, 2)).sum::<u32>(),
+            0,
+            "row 2 had no source"
+        );
+        // An aperture one pixel short: the non-temporal path refuses the blit
+        // outright (its bounds check is on the whole transfer) and the row
+        // copies take over, stopping at the row that does not fit.
+        let t = truncated(4, 3, 4, 4);
+        t.blit_from(0, 0, &numbered(4, 3), 4, 4, 3);
+        assert_eq!((t.px(0, 1), t.px(3, 1)), (0x1004, 0x1007));
+        assert_eq!(
+            (t.px(0, 2), t.px(1, 2)),
+            (0, 0),
+            "a row that does not fit whole was copied"
+        );
+    }
+
+    #[test]
+    fn what_a_backend_inherits_when_it_overrides_nothing() {
+        let d = FakeDisplay::new(4, 1, 4);
+        assert_eq!(d.accel_caps(), AccelCaps::default(), "software only");
+        assert!(!d.need_flush());
+        assert!(d.flush().is_ok());
+        let c = RgbColor::new(0x12, 0x34, 0x56);
+        assert_eq!(
+            (c.r(), c.g(), c.b(), c.raw_value()),
+            (0x12, 0x34, 0x56, 0x0012_3456)
+        );
+        // A zero pitch means "unpadded": the width times the bytes of a pixel.
+        let unpadded = DisplayInfo {
+            width: 100,
+            height: 1,
+            pitch: 0,
+            format: ColorFormat::RGB565,
+            fb_base_vaddr: 0,
+            fb_size: 200,
+        };
+        assert_eq!(unpadded.pitch(), 200);
+        // The framebuffer view is the bytes it was built over.
+        let mut mem = [7u8; 8];
+        let fb = FrameBuffer::from_slice(&mut mem);
+        assert_eq!(&*fb, &[7u8; 8]);
+        assert_eq!(fb.len(), 8);
     }
 
     // ------------------------------------------------------------------

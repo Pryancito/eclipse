@@ -86,7 +86,16 @@ fn resetting_the_fake_empties_every_ledger_including_the_one_that_is_not_zero() 
     let h = gem(4096, true);
     bind(1, h, 0x1_0000, 4096);
     eclipse_rm_ctx_prime(0, 1);
-    FAKE_RM.lock().ring_full = true;
+    {
+        let mut f = FAKE_RM.lock();
+        f.ring_full = true;
+        f.runs = true;
+        f.vm_bind_invisible = true;
+        f.refuse_submit = true;
+        f.fail_map_cpu = true;
+        f.writes_lost = true;
+        f.releases.push((1, 0x1_1000, 1));
+    }
 
     {
         let f = FAKE_RM.lock();
@@ -100,7 +109,16 @@ fn resetting_the_fake_empties_every_ledger_including_the_one_that_is_not_zero() 
     assert!(f.maps.is_empty(), "a binding survived the reset");
     assert!(f.primed.is_empty());
     assert!(f.calls.is_empty(), "the call trail survived the reset");
-    assert!(!f.ring_full, "a switch survived the reset");
+    assert!(
+        !(f.ring_full
+            || f.runs
+            || f.vm_bind_invisible
+            || f.refuse_submit
+            || f.fail_map_cpu
+            || f.writes_lost),
+        "a switch survived the reset"
+    );
+    assert!(f.releases.is_empty(), "a release survived the reset");
     assert_eq!((f.gem_frees, f.ctx_frees, f.unmaps, f.bad), (0, 0, 0, 0));
     assert_eq!(
         f.next, 0x100,
@@ -798,3 +816,230 @@ fn the_address_space_of_a_context_is_its_own_bindings_with_the_kind_asked_for() 
 }
 
 const MIB: u64 = 1024 * 1024;
+
+/// `exec_submit_signaled` through the shim.
+fn signaled(ctx: u32, va: u64, len: u32, payload: u32) -> ExecSignal {
+    let mut out = zeroed::<ExecSignal>();
+    assert_eq!(
+        eclipse_rm_exec_submit_signaled(0, ctx, va, len, payload, 0, &mut out),
+        NV_OK
+    );
+    out
+}
+
+/// The 6-dword host semaphore RELEASE of `payload` at `sem_va`, written
+/// at `at` the way the C fence builder and the kernel's self-test write it.
+fn write_release(at: u64, sem_va: u64, payload: u32, op: u32) {
+    let words = [
+        SEM_STREAM_HDR,
+        sem_va as u32,
+        ((sem_va >> 32) & 0xff) as u32,
+        payload,
+        0,
+        op,
+    ];
+    for (i, w) in words.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((at + 4 * i as u64) as *mut u32, *w) };
+    }
+}
+
+fn word_at(at: u64) -> u32 {
+    unsafe { core::ptr::read_volatile(at as *const u32) }
+}
+
+/// The C side's own wait lands only when the ring runs: without `runs`
+/// the wait is unreached (the fake has no GPU), with it the wait is 0 and
+/// a push the fake can read -- a host semaphore RELEASE fetched through a
+/// binding of a sysmem object -- writes its payload at its VA through the
+/// same bindings, and is recorded. A stream that is not a release, one
+/// that releases at a VA nothing binds, and a push too short to hold one
+/// run without a trace; with `writes_lost` the wait lands and the write
+/// does not. If `runs` executed nothing, the self-test's stage A would
+/// pass with the semaphore still at zero -- and its test would be
+/// checking the fake's word rather than the kernel's stream.
+#[test]
+fn the_ring_runs_a_release_it_can_read_only_when_told_to() {
+    let _g = LOCK.lock();
+    reset_fake_rm();
+    ctx(1);
+    let h = gem(0x2000, true);
+    bind(1, h, 0xa0_0000, 0x2000);
+    let page = FAKE_RM.lock().pa_of(h).unwrap();
+    let sem = page + 0x1000;
+    write_release(page, 0xa0_1000, 0xabcd, 1);
+
+    let out = signaled(1, 0xa0_0000, 24, 7);
+    assert_eq!((out.submit_status, out.fence_submit_status), (0, 0));
+    assert_eq!(out.fence_wait_status, 0xFFFF_FFFF, "waited out with no GPU");
+    assert_eq!(word_at(sem), 0, "the ring ran without being told to");
+    assert!(FAKE_RM.lock().releases.is_empty());
+
+    FAKE_RM.lock().runs = true;
+    let out = signaled(1, 0xa0_0000, 24, 7);
+    assert_eq!((out.fence_wait_status, out.fence_value), (0, 7));
+    assert_eq!(word_at(sem), 0xabcd, "the release did not land");
+    assert_eq!(FAKE_RM.lock().releases, alloc::vec![(1, 0xa0_1000, 0xabcd)]);
+
+    // Not a release: an ACQUIRE (op 2), and a stream with another header.
+    write_release(page, 0xa0_1000, 0x1111, 2);
+    assert_eq!(signaled(1, 0xa0_0000, 24, 8).fence_wait_status, 0);
+    write_release(page, 0xa0_1000, 0x2222, 1);
+    unsafe { core::ptr::write_volatile(page as *mut u32, SEM_STREAM_HDR + 1) };
+    assert_eq!(signaled(1, 0xa0_0000, 24, 9).fence_wait_status, 0);
+    // A release at a VA nothing binds, and a push too short to be one.
+    write_release(page, 0xb0_0000, 0x3333, 1);
+    assert_eq!(signaled(1, 0xa0_0000, 24, 10).fence_wait_status, 0);
+    write_release(page, 0xa0_1000, 0x4444, 1);
+    assert_eq!(signaled(1, 0xa0_0000, 20, 11).fence_wait_status, 0);
+    assert_eq!(
+        word_at(sem),
+        0xabcd,
+        "something that is not a release wrote"
+    );
+    assert_eq!(FAKE_RM.lock().releases.len(), 1);
+
+    // The write lost on the way to memory: the wait lands all the same.
+    FAKE_RM.lock().writes_lost = true;
+    let out = signaled(1, 0xa0_0000, 24, 12);
+    assert_eq!((out.fence_wait_status, out.fence_value), (0, 12));
+    assert_eq!(word_at(sem), 0xabcd, "a lost write landed");
+    assert_eq!(
+        FAKE_RM.lock().releases.len(),
+        1,
+        "a lost write was recorded"
+    );
+    FAKE_RM.lock().writes_lost = false;
+
+    // A refused push runs nothing: the ring is full.
+    FAKE_RM.lock().ring_full = true;
+    let out = signaled(1, 0xa0_0000, 24, 13);
+    assert_eq!(out.submit_status, NV_ERR_BUSY_RETRY);
+    assert_eq!(out.fence_wait_status, 0xFFFF_FFFF);
+    assert_eq!(FAKE_RM.lock().releases.len(), 1, "a refused push ran");
+}
+
+/// The channel's own buffer, which the RM maps itself at the VA
+/// `ctx_alloc` reports, is found by the lookup with no binding of the
+/// client's -- for a context the fake built, wholly inside it. With
+/// `vm_bind_invisible` only a push from there runs: one fetched through a
+/// binding is submitted and never waited out, and releases nothing. That
+/// is the self-test's stage B, and the fake had no channel buffer at all.
+#[test]
+fn invisible_ptes_run_only_the_channels_own_buffer() {
+    let _g = LOCK.lock();
+    reset_fake_rm();
+    ctx(1);
+    let buf = chan_buf_va(1);
+    assert_eq!(buf, 0x10_0000, "where ctx_alloc put it");
+    let h = gem(0x2000, true);
+    bind(1, h, 0xa0_0000, 0x2000);
+    let page = FAKE_RM.lock().pa_of(h).unwrap();
+    write_release(page, 0xa0_1000, 0xabcd, 1);
+    {
+        let mut f = FAKE_RM.lock();
+        f.runs = true;
+        f.vm_bind_invisible = true;
+    }
+
+    let out = signaled(1, 0xa0_0000, 24, 1);
+    assert_eq!((out.lookup_status, out.submit_status), (0, 0));
+    assert_eq!(
+        out.fence_wait_status, 0xFFFF_FFFF,
+        "ran through invisible PTEs"
+    );
+    assert_eq!(word_at(page + 0x1000), 0);
+    let out = signaled(1, buf + 0x9000, 24, 2);
+    assert_eq!((out.lookup_status, out.submit_status), (0, 0));
+    assert_eq!(
+        out.fence_wait_status, 0,
+        "the channel's own push did not run"
+    );
+    assert!(FAKE_RM.lock().releases.is_empty(), "nothing to read there");
+
+    assert_eq!(
+        submit(1, buf, CHAN_BUF_SIZE as u32),
+        [0, 0, 0, 0],
+        "the whole buffer"
+    );
+    assert_eq!(
+        submit(1, buf + CHAN_BUF_SIZE - 16, 17)[0],
+        NV_ERR_OBJECT_NOT_FOUND,
+        "a push running off the buffer's end"
+    );
+    assert_eq!(
+        submit(2, chan_buf_va(2), 16)[0],
+        NV_ERR_OBJECT_NOT_FOUND,
+        "a context never built has no buffer"
+    );
+    assert_eq!(FAKE_RM.lock().submits.len(), 5, "every attempt recorded");
+}
+
+/// `refuse_submit` is the call itself refusing, not a stage: the shim
+/// answers `NV_ERR_NOT_SUPPORTED`, writes nothing into the out-parameter
+/// and records no submit -- what the Rust wrappers turn into `Err`.
+#[test]
+fn a_refused_submit_is_the_call_itself_and_leaves_no_trace() {
+    let _g = LOCK.lock();
+    reset_fake_rm();
+    ctx(1);
+    let h = gem(0x1000, true);
+    bind(1, h, 0xc0_0000, 0x1000);
+    FAKE_RM.lock().refuse_submit = true;
+
+    let mut out = zeroed::<ExecSubmit>();
+    out.submit_status = 0xEEEE;
+    assert_eq!(
+        eclipse_rm_exec_submit(0, 1, 0xc0_0000, 16, &mut out),
+        NV_ERR_NOT_SUPPORTED
+    );
+    assert_eq!(out.submit_status, 0xEEEE, "a refused call wrote a stage");
+    let mut sig = zeroed::<ExecSignal>();
+    sig.fence_wait_status = 0xEEEE;
+    assert_eq!(
+        eclipse_rm_exec_submit_signaled(0, 1, 0xc0_0000, 16, 3, 0, &mut sig),
+        NV_ERR_NOT_SUPPORTED
+    );
+    assert_eq!(sig.fence_wait_status, 0xEEEE);
+    let f = FAKE_RM.lock();
+    assert!(
+        f.submits.is_empty(),
+        "a call that never reached the ring was recorded as a submit"
+    );
+    assert_eq!(
+        f.calls,
+        [
+            "ctx_alloc",
+            "gem_alloc",
+            "vm_bind_map",
+            "exec_submit",
+            "exec_submit_signaled"
+        ]
+    );
+}
+
+/// `fail_map_cpu` makes `gem_map_cpu` say not found for an object the
+/// fake holds -- the shape of a lookup the RM refused -- and nothing else
+/// changes: without it the same object maps.
+#[test]
+fn a_cpu_mapping_the_rm_refuses_says_not_found_for_an_object_it_holds() {
+    let _g = LOCK.lock();
+    reset_fake_rm();
+    let h = gem(0x1000, true);
+    let map = |h: u32| {
+        let mut out = zeroed::<GemMapCpu>();
+        assert_eq!(eclipse_rm_gem_map_cpu(0, h, &mut out), NV_OK);
+        out
+    };
+    FAKE_RM.lock().fail_map_cpu = true;
+    let out = map(h);
+    assert_eq!(out.lookup_status, NV_ERR_OBJECT_NOT_FOUND);
+    assert_eq!(
+        (out.phys_addr, out.size),
+        (0, 0),
+        "a refused lookup still answered"
+    );
+    FAKE_RM.lock().fail_map_cpu = false;
+    let out = map(h);
+    assert_eq!(out.lookup_status, 0, "the switch stuck");
+    assert_eq!(out.phys_addr, FAKE_RM.lock().pa_of(h).unwrap());
+}

@@ -421,6 +421,22 @@ pub(super) fn record_gr_hang_probe(snapshot: alloc::string::String) {
     }
 }
 
+/// Forget the `ctx_prime` line of `ctx_idx`, so a test of what the probe
+/// says of a context that was never primed is not reading the line a test
+/// before it recorded for the same index.
+#[cfg(test)]
+pub(super) fn forget_prime(ctx_idx: u32) {
+    LAST_PRIME.lock().retain(|(c, _)| *c != ctx_idx);
+}
+
+/// The snapshot the first timeout stored, taken out so the next timeout is
+/// the first again: a test of the probe reads what the probe wrote,
+/// whatever timed out earlier in the same binary.
+#[cfg(test)]
+pub(super) fn take_gr_hang_probe() -> Option<alloc::string::String> {
+    LAST_GR_HANG_PROBE.lock().take()
+}
+
 /// `/proc/gpudbg` section: GR-engine hang probe snapshot, or a note that no
 /// fence-wait timeout has occurred this boot.
 fn format_gr_hang_probe() -> alloc::string::String {

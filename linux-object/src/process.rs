@@ -6257,7 +6257,9 @@ pub fn send_signal_to_process_with_info(
 
 mod job_stop;
 use job_stop::wake_for_job_control;
+mod pending_timer;
 pub use job_stop::{complete_signal_for_job_control, wait_while_job_stopped};
+pub use pending_timer::with_pending_timer_signal;
 
 mod exit_path;
 use exit_path::ExitPathSummary;
