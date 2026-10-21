@@ -806,11 +806,11 @@ fn the_one_path_this_kernel_rewrites_is_dev_shm_testshm() {
 
 #[test]
 fn where_a_relative_open_starts_is_the_descriptor_it_was_given() {
-    // `sys_open` is `sys_openat(AT_FDCWD, ...)` and nothing else, so the
-    // whole of `open(2)` is that one argument being right. And a relative
-    // name under a `dir_fd` has to start at that directory: `openat` is how
-    // every `find`, `rsync` and `install` walks a tree without racing a
-    // rename above it.
+    // `sys_open` is `sys_openat_waiting(AT_FDCWD, ...)` and nothing else,
+    // so the whole of `open(2)` is that one argument being right. And a
+    // relative name under a `dir_fd` has to start at that directory:
+    // `openat` is how every `find`, `rsync` and `install` walks a tree
+    // without racing a rename above it.
     let proc = a_process(47_412, "open-relative", "open_relative");
     let dir = String::from("/open_relative");
     on_a_thread(&proc, move |sys| {
@@ -830,6 +830,7 @@ fn where_a_relative_open_starts_is_the_descriptor_it_was_given() {
                     O_CREAT | O_WRONLY,
                     A_PLAIN_MODE
                 )
+                .await
                 .is_ok());
             assert!(
                 exists(&lp, &alloc::format!("{dir}/here")),

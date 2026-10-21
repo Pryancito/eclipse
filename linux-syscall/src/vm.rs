@@ -1971,6 +1971,13 @@ mod mempolicy;
 #[cfg(test)]
 mod as_rlimit_tests;
 
+/// The eight calls that work on a range the process already has (`msync`,
+/// `mincore`, the four `mlock`s and `madvise`), asked through the syscall:
+/// which range each one validates, the order it judges its arguments in, and
+/// what of the answer reaches the caller's buffer.
+#[cfg(test)]
+mod held_range_wiring_tests;
+
 #[cfg(test)]
 mod mmap_offset_tests {
     //! `mmap`'s sixth argument is a raw machine word that userspace chooses,
