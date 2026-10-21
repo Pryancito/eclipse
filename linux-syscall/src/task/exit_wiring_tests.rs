@@ -129,6 +129,17 @@ fn the_code_a_thread_exited_with_is_the_processs_code_once_the_last_one_goes() {
     //
     // The sibling here is the one that empties the list, and it never ran:
     // what it exercises is the handover, not the scheduler.
+    //
+    // What this cannot pin is WHERE in the exit the hint is published. The
+    // mutation batch moved it after `self.exit()` and after a real
+    // `terminate()`, and both survived -- because the hint is read by
+    // whichever thread empties the list, which here is strictly later, and on
+    // the one path where the exiting thread empties the list itself
+    // (`last_thread_of`) `Process::exit` sets the status directly and the
+    // hint never decides. The ordering only bites in the race the comment
+    // above describes, and that race needs two running threads. What is
+    // pinned is the hint's value reaching the process, which is what the two
+    // dead mutants -- no hint at all, and a hint of zero -- say.
     let proc = a_process(47_172, "exit-hint");
     let sibling = Thread::create_linux(&proc).unwrap();
     let watch = proc.clone();
