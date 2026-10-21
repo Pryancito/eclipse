@@ -559,6 +559,12 @@ impl AhciPort {
 
     fn write_reg(&self, offset: usize, val: u32) {
         unsafe { write_volatile((self.base + offset) as *mut u32, val) }
+        // El registro queda escrito ANTES de que el controlador lo vea, que es
+        // el orden que tiene en el hardware. Bajo test el que lo ve es el HBA
+        // falso, y es lo único que necesita una costura: un `PxCI` que nadie
+        // baja es un comando que nunca acaba.
+        #[cfg(test)]
+        ahci_fake::on_write(self.base, offset, val);
     }
 
     fn stop_engine(&self) {
@@ -1823,6 +1829,15 @@ static EXTRA_DISKS: Mutex<Vec<Device>> = Mutex::new(Vec::new());
 pub fn take_extra_disks() -> Vec<Device> {
     core::mem::take(&mut *EXTRA_DISKS.lock())
 }
+
+/// Un HBA de AHCI falso en memoria del anfitrión, para los caminos que
+/// hablan con el controlador.
+#[cfg(test)]
+mod ahci_fake;
+
+/// El motor: enumerar el puerto, el IDENTIFY, y mover un bloque.
+#[cfg(test)]
+mod engine_tests;
 
 #[cfg(test)]
 mod command_tests {
