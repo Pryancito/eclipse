@@ -131,7 +131,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 
 | ioctl | Estado | Notas |
 |---|---|---|
-| `DRM_IOCTL_MODE_ADDFB` | ✅ | |
+| `DRM_IOCTL_MODE_ADDFB` | ✅ | el id del fb sale del mismo contador que los blobs de propiedad (desde 30000, por encima de todo id KMS y del rango EDID), como el idr único de Linux: ningún fb comparte número con un CRTC, un plano, una propiedad o un blob |
 | `DRM_IOCTL_MODE_ADDFB2` | ✅ | `framebuffer_check` en su orden para el único plano de aquí (XR24/AR24 lineales): flags fuera de `INTERLACED \| MODIFIERS` EINVAL, `MODIFIERS` EINVAL (sin soporte), formato desconocido o no escaneable EINVAL, anchura o altura 0 EINVAL, sin handle EINVAL, una fila de píxeles que no cabe en u32 o un plano cuyo último byte pasa de 4 GiB **ERANGE**, pitch menor que la fila EINVAL, modifier sin la bandera EINVAL; en los planos que el formato no tiene solo se mira el modifier (handle, pitch y offset solo cuentan bajo `MODIFIERS`). Local: `offsets[0]` debe ser 0 y no hay `max_width` (un fb mayor que el panel se recorta) |
 | `DRM_IOCTL_MODE_RMFB` | ✅ | apaga el CRTC que mostraba el fb, como `drm_framebuffer_remove` (la salida de proceso conserva la última imagen para la restauración de consola) |
 | `DRM_IOCTL_MODE_CLOSEFB` | ✅ | Linux 6.6+: suelta la referencia sin apagar el plano; `pad` distinto de 0 es EINVAL antes de buscar el fb, y un id que no es del fichero ENOENT (`drm_mode_closefb_ioctl`) |
