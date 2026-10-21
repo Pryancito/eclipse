@@ -3758,3 +3758,6 @@ mod clone_refusal_tests;
 
 #[cfg(test)]
 mod wait_family_wiring_tests;
+
+#[cfg(test)]
+mod execve_refusal_wiring_tests;
