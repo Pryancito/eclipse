@@ -213,7 +213,7 @@ impl DrmDev {
         value: u64,
     ) -> Result<usize> {
         let Some((kind, props)) = find_mode_object(obj_id, obj_type, true) else {
-            return Err(FsError::EntryNotFound);
+            return Err(propertyless_lookup_error(obj_id, obj_type));
         };
         // `drm_mode_obj_find_prop_id`.
         if !props.iter().any(|&(id, _)| id == prop_id) {
@@ -2937,7 +2937,7 @@ impl DrmDev {
                 // nothing.
                 let atomic = self.file.atomic_client();
                 let Some((_, props)) = find_mode_object(res.obj_id, res.obj_type, atomic) else {
-                    return Err(FsError::EntryNotFound);
+                    return Err(propertyless_lookup_error(res.obj_id, res.obj_type));
                 };
                 fill_prop_list(res.props_ptr, res.prop_values_ptr, res.count_props, &props)?;
                 res.count_props = props.len() as u32;
@@ -4334,6 +4334,8 @@ const DRM_MODE_OBJECT_CRTC: u32 = 0xcccc_cccc;
 const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 const DRM_MODE_OBJECT_ENCODER: u32 = 0xe0e0_e0e0;
 const DRM_MODE_OBJECT_FB: u32 = 0xfbfb_fbfb;
+const DRM_MODE_OBJECT_BLOB: u32 = 0xbbbb_bbbb;
+const DRM_MODE_OBJECT_PROPERTY: u32 = 0xb0b0_b0b0;
 const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
 /// `DRM_MODE_OBJECT_ANY`: a lookup that does not care about the type.
 const DRM_MODE_OBJECT_ANY: u32 = 0;
@@ -5659,6 +5661,33 @@ fn mode_object_kind(obj_id: u32) -> Option<u32> {
         Some(DRM_MODE_OBJECT_ENCODER)
     } else {
         None
+    }
+}
+
+/// What `drm_mode_obj_get_properties_ioctl` and
+/// `drm_mode_obj_set_property_ioctl` answer for an id [`find_mode_object`]
+/// does not know: `drm_mode_object_find` finds a framebuffer, a property
+/// blob or a property in the same idr as the KMS objects, with
+/// `DRM_MODE_OBJECT_ANY` or the object's own type (any other type is
+/// ENOENT, like every lookup), and an object without a property table is
+/// then `!obj->properties`, EINVAL. All three answered ENOENT, the
+/// answer for an id that names nothing. (Ids are numbered per kind here,
+/// so an fb, a blob or a property whose number a KMS object has is that
+/// object first, as [`find_mode_object`] already decides.)
+fn propertyless_lookup_error(obj_id: u32, obj_type: u32) -> FsError {
+    let kind = if drm::get_fb(obj_id).is_some() {
+        DRM_MODE_OBJECT_FB
+    } else if drm::get_blob(obj_id).is_some() {
+        DRM_MODE_OBJECT_BLOB
+    } else if prop_spec(obj_id).is_some() {
+        DRM_MODE_OBJECT_PROPERTY
+    } else {
+        return FsError::EntryNotFound;
+    };
+    if obj_type == DRM_MODE_OBJECT_ANY || obj_type == kind {
+        FsError::InvalidParam
+    } else {
+        FsError::EntryNotFound
     }
 }
 

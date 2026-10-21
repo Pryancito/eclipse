@@ -2407,3 +2407,108 @@ fn getplane_writes_gamma_size_zero_after_the_lookup() {
         "the lookup comes first: ENOENT writes nothing"
     );
 }
+
+/// `drm_mode_object_find` finds a framebuffer, a property blob or a
+/// property in the same idr as the KMS objects, with `DRM_MODE_OBJECT_ANY`
+/// or the object's own type (another type is ENOENT, like every lookup),
+/// and `drm_mode_obj_get_properties_ioctl` and
+/// `drm_mode_obj_set_property_ioctl` answer an object without a property
+/// table with EINVAL (`!obj->properties`). The lookup here knew the KMS
+/// objects only, so all three were ENOENT, the answer for an id that
+/// names nothing, and a client could not tell "not an object" from "an
+/// object with nothing to list".
+#[test]
+fn an_object_without_a_property_table_is_einval_not_enoent() {
+    let _screen = kms_emu::attach(32, 8);
+    let c = Client::open(0);
+    let einval = Err(FsError::InvalidParam);
+    let enoent = Err(FsError::EntryNotFound);
+
+    // Ids are numbered per kind here (Linux has one idr), so each id
+    // this test uses has to be nobody else's: a KMS object with the
+    // same number would answer first, as it should.
+    let unshared = |id: u32| mode_object_kind(id).is_none() && prop_spec(id).is_none();
+    let mut bufs = Vec::new();
+    let fb = loop {
+        let buf = c.create_dumb(32, 8);
+        let id = c.addfb2(&buf);
+        bufs.push(buf);
+        if unshared(id) && drm::get_blob(id).is_none() {
+            break id;
+        }
+        assert!(bufs.len() < 64, "no fb id of its own");
+    };
+    let bytes = [7u8; 16];
+    let mut blobs = 0;
+    let blob = loop {
+        let mut req = DrmModeCreateBlob {
+            data: bytes.as_ptr() as u64,
+            length: bytes.len() as u32,
+            blob_id: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut req)
+            .expect("CREATEPROPBLOB");
+        blobs += 1;
+        if unshared(req.blob_id) && drm::get_fb(req.blob_id).is_none() {
+            break req.blob_id;
+        }
+        assert!(blobs < 64, "no blob id of its own");
+    };
+    let prop = [PROP_DPMS, PROP_NON_DESKTOP]
+        .iter()
+        .copied()
+        .find(|&p| {
+            mode_object_kind(p).is_none() && drm::get_fb(p).is_none() && drm::get_blob(p).is_none()
+        })
+        .expect("a property id of its own");
+
+    let getprops = |obj_id: u32, obj_type: u32| {
+        let mut req = DrmModeObjGetProperties {
+            props_ptr: 0,
+            prop_values_ptr: 0,
+            count_props: 0,
+            obj_id,
+            obj_type,
+        };
+        c.ioctl(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &mut req)
+    };
+    let setprop = |obj_id: u32, obj_type: u32| {
+        let mut req = DrmModeObjSetProperty {
+            value: 0,
+            prop_id: PROP_DPMS,
+            obj_id,
+            obj_type,
+        };
+        c.ioctl(DRM_IOCTL_MODE_OBJ_SETPROPERTY, &mut req)
+    };
+    for (what, id, kind) in [
+        ("fb", fb, DRM_MODE_OBJECT_FB),
+        ("blob", blob, DRM_MODE_OBJECT_BLOB),
+        ("property", prop, DRM_MODE_OBJECT_PROPERTY),
+    ] {
+        assert_eq!(getprops(id, DRM_MODE_OBJECT_ANY), einval, "{} as ANY", what);
+        assert_eq!(getprops(id, kind), einval, "{} as its own type", what);
+        assert_eq!(
+            getprops(id, DRM_MODE_OBJECT_CRTC),
+            enoent,
+            "{} as a CRTC",
+            what
+        );
+        assert_eq!(
+            setprop(id, DRM_MODE_OBJECT_ANY),
+            einval,
+            "set on {} as ANY",
+            what
+        );
+        assert_eq!(setprop(id, kind), einval, "set on {} as its own type", what);
+        assert_eq!(
+            setprop(id, DRM_MODE_OBJECT_PLANE),
+            enoent,
+            "set on {} as a plane",
+            what
+        );
+    }
+    // An id that names nothing at all is still ENOENT.
+    assert_eq!(getprops(4242, DRM_MODE_OBJECT_ANY), enoent);
+    assert_eq!(setprop(4242, DRM_MODE_OBJECT_ANY), enoent);
+}
