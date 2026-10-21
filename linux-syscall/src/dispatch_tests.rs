@@ -24,9 +24,12 @@ use crate::on_a_thread::on_a_thread;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::any::Any;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use linux_object::fs::{File, OpenFlags, PollStatus};
 use linux_object::process::LinuxProcess;
 use linux_object::thread::ThreadExt;
-use rcore_fs::vfs::FileType;
+use rcore_fs::vfs::{FileType, INode};
 use rcore_fs_ramfs::RamFS;
 use zircon_object::task::{Process, Thread, ROOT_JOB};
 
@@ -754,5 +757,644 @@ fn asking_for_the_capabilities_does_not_drop_them() {
         data[0] != 0 || data[3] != 0,
         "capget left the buffer empty, so this root process was told it may do nothing: {:?}",
         data
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reading is not setting, the second time round
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setting_a_scheduling_priority_is_not_reading_one() {
+    // A `struct sched_param` is one `int`. The getter writes it and the
+    // setter reads it, so it starts out holding a priority NO policy accepts:
+    // -5 is outside the 1..=99 of the real-time policies and is not the zero
+    // the fair ones demand. So `sched_setparam` refuses it whatever policy
+    // this thread happens to carry, and `sched_getparam` overwrites it.
+    const REFUSED: i32 = -5;
+    let proc = a_process(45_518, "dispatch-sched", "dispatch_sched");
+    let (get_ret, after_get, set_ret, after_set) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut read_into = [REFUSED];
+            let get_ret = by_number(
+                sys,
+                Sys::SCHED_GETPARAM as u32,
+                [0, read_into.as_mut_ptr() as usize, 0, 0, 0, 0],
+            )
+            .await;
+
+            let mut given = [REFUSED];
+            let set_ret = by_number(
+                sys,
+                Sys::SCHED_SETPARAM as u32,
+                [0, given.as_mut_ptr() as usize, 0, 0, 0, 0],
+            )
+            .await;
+            (get_ret, read_into[0], set_ret, given[0])
+        })
+    });
+
+    assert_eq!(get_ret, 0, "sched_getparam failed");
+    assert_ne!(
+        after_get, REFUSED,
+        "sched_getparam left the buffer as it was, so it read the priority instead of answering it"
+    );
+    assert!(
+        set_ret < 0,
+        "sched_setparam accepted a priority no policy allows: {}",
+        set_ret
+    );
+    assert_eq!(
+        after_set, REFUSED,
+        "sched_setparam wrote the buffer, so it answered a priority instead of setting one"
+    );
+}
+
+#[test]
+fn the_resolution_of_a_clock_is_not_a_time_to_set_it_to() {
+    // The same shape as `clock_gettime` against `clock_settime`: the buffer
+    // starts holding a nanosecond field of two thousand million, which is
+    // not a time, so the setter refuses it before it asks who is calling and
+    // the getter writes the resolution over it. Nothing here can move the
+    // wall clock, so nothing here can disturb another test.
+    const BAD_NSEC: usize = 2_000_000_000;
+    const SEC: usize = 7;
+    let proc = a_process(45_519, "dispatch-clockres", "dispatch_clockres");
+    let (res_ret, res, set_ret, set) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut res = [SEC, BAD_NSEC];
+            let res_ret = by_number(
+                sys,
+                Sys::CLOCK_GETRES as u32,
+                [0, res.as_mut_ptr() as usize, 0, 0, 0, 0],
+            )
+            .await;
+
+            let mut set = [SEC, BAD_NSEC];
+            let set_ret = by_number(
+                sys,
+                Sys::CLOCK_SETTIME as u32,
+                [0, set.as_mut_ptr() as usize, 0, 0, 0, 0],
+            )
+            .await;
+            (res_ret, res, set_ret, set)
+        })
+    });
+
+    assert_eq!(res_ret, 0, "clock_getres failed");
+    assert!(
+        res[1] < 1_000_000_000,
+        "clock_getres left the buffer as it was, so it read it instead of writing it: {:?}",
+        res
+    );
+    assert!(
+        set_ret < 0,
+        "clock_settime accepted a nanosecond field of two thousand million: {}",
+        set_ret
+    );
+    assert_eq!(
+        set,
+        [SEC, BAD_NSEC],
+        "clock_settime wrote the buffer, so it answered a resolution instead of setting the clock"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// One question twice, because the first answer is the same on both sides
+// ---------------------------------------------------------------------------
+
+#[test]
+fn asking_a_timer_for_its_overruns_does_not_delete_it() {
+    // Both arms take nothing but a timer id, and on a timer that has never
+    // fired both answer zero, so no single call can tell them apart. The
+    // next call can: what `timer_delete` leaves behind is nothing.
+    let proc = a_process(45_520, "dispatch-timer", "dispatch_timer");
+    let (first, second, deleted, after) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut id = [0i32];
+            // CLOCK_REALTIME, no `sigevent`: SIGALRM to the process.
+            sys.sys_timer_create(0, 0, id.as_mut_ptr() as usize)
+                .unwrap();
+            let id = id[0] as usize;
+            let first = by_number(sys, Sys::TIMER_GETOVERRUN as u32, [id, 0, 0, 0, 0, 0]).await;
+            let second = by_number(sys, Sys::TIMER_GETOVERRUN as u32, [id, 0, 0, 0, 0, 0]).await;
+            let deleted = by_number(sys, Sys::TIMER_DELETE as u32, [id, 0, 0, 0, 0, 0]).await;
+            let after = by_number(sys, Sys::TIMER_GETOVERRUN as u32, [id, 0, 0, 0, 0, 0]).await;
+            (first, second, deleted, after)
+        })
+    });
+
+    assert_eq!(first, 0, "a timer that has never fired has no overruns");
+    assert_eq!(
+        second, 0,
+        "the timer was gone by the second question, so timer_getoverrun deleted it"
+    );
+    assert_eq!(deleted, 0, "timer_delete failed");
+    assert!(
+        after < 0,
+        "the timer answered after timer_delete, so the call only read its overrun count: {}",
+        after
+    );
+}
+
+// ---------------------------------------------------------------------------
+// How far into the buffer the answer reaches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_state_of_the_system_is_not_the_times_of_a_process() {
+    // `sysinfo` and `times` each take one pointer and each answer zero or
+    // better, so neither the registers nor the return value separates them.
+    // The size of what they write does: a `struct tms` is four counters, and
+    // a `struct sysinfo` keeps filling in well past where that ends --
+    // `mem_unit` alone is never zero. Both buffers here are the bigger of
+    // the two sizes, so neither call can run off the end of one.
+    const FILL: u8 = 0xA5;
+    const INFO_LEN: usize = core::mem::size_of::<crate::misc::SysInfo>();
+    const TMS_LEN: usize = core::mem::size_of::<linux_object::time::Tms>();
+    let proc = a_process(45_521, "dispatch-sysinfo", "dispatch_sysinfo");
+    let (info_ret, info, times_ret, times) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut info = [FILL; INFO_LEN];
+            let info_ret = by_number(
+                sys,
+                Sys::SYSINFO as u32,
+                [info.as_mut_ptr() as usize, 0, 0, 0, 0, 0],
+            )
+            .await;
+
+            let mut times = [FILL; INFO_LEN];
+            let times_ret = by_number(
+                sys,
+                Sys::TIMES as u32,
+                [times.as_mut_ptr() as usize, 0, 0, 0, 0, 0],
+            )
+            .await;
+            (info_ret, info, times_ret, times)
+        })
+    });
+
+    assert!(
+        INFO_LEN > TMS_LEN,
+        "a struct sysinfo is the bigger of the two"
+    );
+    assert_eq!(info_ret, 0, "sysinfo failed");
+    assert!(
+        info[TMS_LEN..].iter().any(|b| *b != FILL),
+        "sysinfo wrote no further than a struct tms reaches, so it answered the process times"
+    );
+    assert!(times_ret >= 0, "times failed: {}", times_ret);
+    assert!(
+        times[TMS_LEN..].iter().all(|b| *b == FILL),
+        "times wrote past the end of a struct tms, so it answered the state of the system"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// System V: three registers, two different calls
+// ---------------------------------------------------------------------------
+
+#[test]
+fn controlling_a_message_queue_is_not_making_a_semaphore_set() {
+    // `msgctl(id, cmd, buf)` and `semget(key, nsems, flags)` take the same
+    // three registers, so the swap compiles. One set of numbers separates
+    // them: a command of 1 is `IPC_SET`, which wants a queue that exists,
+    // while the very same numbers read as a key, a count of one and
+    // `IPC_CREAT | 0666` are exactly what makes a semaphore set.
+    const CREATE: usize = 0o1000 | 0o666;
+    const IPC_SET: usize = 1;
+    const NO_SUCH_QUEUE: usize = 45_522_001;
+    const FRESH_KEY: usize = 45_522_002;
+    let proc = a_process(45_522, "dispatch-sysv", "dispatch_sysv");
+    let (ctl, get) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let ctl = by_number(
+                sys,
+                Sys::MSGCTL as u32,
+                [NO_SUCH_QUEUE, IPC_SET, CREATE, 0, 0, 0],
+            )
+            .await;
+            let get = by_number(sys, Sys::SEMGET as u32, [FRESH_KEY, 1, CREATE, 0, 0, 0]).await;
+            (ctl, get)
+        })
+    });
+
+    assert!(
+        ctl < 0,
+        "msgctl made a semaphore set out of a queue that does not exist: {}",
+        ctl
+    );
+    assert!(
+        get >= 0,
+        "semget did not make a semaphore set out of the arguments made for one: {}",
+        get
+    );
+}
+
+#[test]
+fn making_a_shared_segment_is_not_attaching_one() {
+    // `shmget(key, size, flags)` answers an identifier and `shmat(id, addr,
+    // flags)` answers an address, and that is the one difference the shared
+    // registers cannot hide: an identifier is a small number counted from
+    // zero, an attached segment is somewhere up in the address space.
+    const KEY: usize = 45_523_001;
+    const PAGE: isize = 4096;
+    const CREATE: usize = 0o1000 | 0o666;
+    let proc = a_process(45_523, "dispatch-shm", "dispatch_shm");
+    let (id, at) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let id = by_number(
+                sys,
+                Sys::SHMGET as u32,
+                [KEY, PAGE as usize, CREATE, 0, 0, 0],
+            )
+            .await;
+            let at = by_number(sys, Sys::SHMAT as u32, [id as usize, 0, 0, 0, 0, 0]).await;
+            (id, at)
+        })
+    });
+
+    assert!(id >= 0, "shmget did not make a segment: {}", id);
+    assert!(
+        id < PAGE,
+        "shmget answered an address, not an identifier: {:#x}",
+        id
+    );
+    assert!(
+        at >= PAGE,
+        "shmat answered an identifier, not an address: {}",
+        at
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A group is not a session
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_group_of_a_process_is_not_its_session() {
+    // A process whose group and session ids are both unset answers its own
+    // pid to either question, which is why this pair was invisible: the rest
+    // of the suite never has them differ. A stored group id of its own makes
+    // them two different numbers, the session being still unset and so
+    // resolving to the pid.
+    const PID: KoID = 45_524;
+    const PGID: u64 = 45_524_001;
+    let lp = LinuxProcess::new(RamFS::new(), 0);
+    lp.set_pgid_raw(PGID);
+    let proc = Process::create_with_fixed_id_ext(&ROOT_JOB, PID, "dispatch-pgid", lp).unwrap();
+    let (pgid, sid) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let pgid = by_number(sys, Sys::GETPGID as u32, [0, 0, 0, 0, 0, 0]).await;
+            let sid = by_number(sys, Sys::GETSID as u32, [0, 0, 0, 0, 0, 0]).await;
+            (pgid, sid)
+        })
+    });
+
+    assert_eq!(pgid, PGID as isize, "getpgid did not answer the group id");
+    assert_eq!(sid, PID as isize, "getsid did not answer the session id");
+}
+
+// ---------------------------------------------------------------------------
+// Reserving space is not writing it back
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reserving_space_in_a_file_is_not_writing_it_back() {
+    // `fallocate(fd, mode, offset, len)` and `sync_file_range(fd, offset,
+    // nbytes, flags)` take four registers each and both answer zero, but
+    // only one of them changes the file: a reservation past the end grows
+    // it, and a write-back never does.
+    const GROW: usize = 100;
+    let proc = a_process(45_525, "dispatch-falloc", "dispatch_falloc");
+    let (alloc_ret, after_alloc, sync_ret, after_sync) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let path = c_path("/dispatch_falloc/f");
+            let fd = sys
+                .sys_openat(
+                    FileDesc::CWD,
+                    UserInPtr::from(path.as_ptr() as usize),
+                    0o102, // O_RDWR | O_CREAT
+                    0o600,
+                )
+                .unwrap();
+            let inode = sys
+                .linux_process()
+                .lookup_inode("/dispatch_falloc/f")
+                .unwrap();
+
+            let alloc_ret = by_number(sys, Sys::FALLOCATE as u32, [fd, 0, 0, GROW, 0, 0]).await;
+            let after_alloc = inode.metadata().unwrap().size;
+
+            // Flags of zero ask for no write-back at all, which is a valid
+            // `sync_file_range` and a `fallocate` of zero length -- the one
+            // length `fallocate` refuses.
+            let sync_ret = by_number(sys, Sys::SYNC_FILE_RANGE as u32, [fd, 0, 0, 0, 0, 0]).await;
+            let after_sync = inode.metadata().unwrap().size;
+            (alloc_ret, after_alloc, sync_ret, after_sync)
+        })
+    });
+
+    assert_eq!(alloc_ret, 0, "fallocate failed");
+    assert_eq!(after_alloc, GROW, "fallocate did not grow the file");
+    assert_eq!(sync_ret, 0, "sync_file_range failed");
+    assert_eq!(
+        after_sync, GROW,
+        "sync_file_range changed the length of the file, so it reserved space instead of writing it back"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The pairs that need a socket
+// ---------------------------------------------------------------------------
+
+/// AF_UNIX, so none of this needs a network stack.
+const AF_UNIX: usize = 1;
+/// `SOCK_STREAM`.
+const A_STREAM: usize = 1;
+/// `SOCK_NONBLOCK`, so a read with nothing to read answers instead of waiting
+/// for ever: a swapped arm that waits is a suite that hangs, not a test that
+/// fails with a name.
+const NONBLOCK: usize = 0o4000;
+
+/// A `struct msghdr` laid out as the ABI has it: seven words on this target
+/// -- `msg_name`, `msg_namelen` with its padding, `msg_iov`, `msg_iovlen`,
+/// `msg_control`, `msg_controllen`, and `msg_flags` with its padding. The
+/// numbers are Linux's rather than the kernel's own struct, so a field in
+/// the wrong place is something this can still catch.
+fn a_msghdr(iov: &[usize; 2]) -> [usize; 7] {
+    let mut hdr = [0usize; 7];
+    hdr[2] = iov.as_ptr() as usize;
+    hdr[3] = 1;
+    hdr
+}
+
+#[test]
+fn the_name_of_a_socket_is_not_the_name_of_its_peer() {
+    // An unconnected AF_UNIX socket has a local address -- AF_UNIX with an
+    // empty path, which is what `unix_getname` answers -- and no remote one.
+    // So on the very same descriptor, with the very same three registers,
+    // `getsockname` answers and `getpeername` says it is not connected.
+    let proc = a_process(45_526, "dispatch-sockname", "dispatch_sockname");
+    let (fd, name_ret, wrote, peer_ret, untouched) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let fd = by_number(sys, Sys::SOCKET as u32, [AF_UNIX, A_STREAM, 0, 0, 0, 0]).await;
+
+            let mut addr = [0u8; 128];
+            let mut len = [addr.len() as u32];
+            let name_ret = by_number(
+                sys,
+                Sys::GETSOCKNAME as u32,
+                [
+                    fd as usize,
+                    addr.as_mut_ptr() as usize,
+                    len.as_mut_ptr() as usize,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+            .await;
+            let wrote = addr.iter().any(|b| *b != 0) || len[0] != 128;
+
+            let mut peer = [0u8; 128];
+            let mut peer_len = [peer.len() as u32];
+            let peer_ret = by_number(
+                sys,
+                Sys::GETPEERNAME as u32,
+                [
+                    fd as usize,
+                    peer.as_mut_ptr() as usize,
+                    peer_len.as_mut_ptr() as usize,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+            .await;
+            let untouched = peer.iter().all(|b| *b == 0);
+            (fd, name_ret, wrote, peer_ret, untouched)
+        })
+    });
+
+    assert!(fd >= 0, "socket(AF_UNIX, SOCK_STREAM) failed: {}", fd);
+    assert_eq!(name_ret, 0, "getsockname failed");
+    assert!(wrote, "getsockname wrote no address at all");
+    assert!(
+        peer_ret < 0,
+        "getpeername answered on a socket with no peer, so it asked for the local name: {}",
+        peer_ret
+    );
+    assert!(
+        untouched,
+        "getpeername wrote an address this socket does not have"
+    );
+}
+
+#[test]
+fn sending_a_message_is_not_receiving_one() {
+    // A connected AF_UNIX pair, both ends nonblocking. `sendmsg` on an empty
+    // end hands over three bytes and `recvmsg` on that same end has nothing
+    // to hand back, so the one call that answers three is the sender.
+    let proc = a_process(45_527, "dispatch-sendmsg", "dispatch_sendmsg");
+    let (pair, sent, recvd, got) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut sv = [0i32; 2];
+            let pair = by_number(
+                sys,
+                Sys::SOCKETPAIR as u32,
+                [
+                    AF_UNIX,
+                    A_STREAM | NONBLOCK,
+                    0,
+                    sv.as_mut_ptr() as usize,
+                    0,
+                    0,
+                ],
+            )
+            .await;
+
+            let out = *b"abc";
+            let iov = [out.as_ptr() as usize, out.len()];
+            let mut hdr = a_msghdr(&iov);
+            let sent = by_number(
+                sys,
+                Sys::SENDMSG as u32,
+                [sv[0] as usize, hdr.as_mut_ptr() as usize, 0, 0, 0, 0],
+            )
+            .await;
+
+            // And the other end really holds them.
+            let mut got = *b"...";
+            let back = [got.as_mut_ptr() as usize, got.len()];
+            let mut back_hdr = a_msghdr(&back);
+            let recvd = by_number(
+                sys,
+                Sys::RECVMSG as u32,
+                [sv[1] as usize, back_hdr.as_mut_ptr() as usize, 0, 0, 0, 0],
+            )
+            .await;
+            (pair, sent, recvd, got)
+        })
+    });
+
+    assert_eq!(pair, 0, "socketpair failed");
+    assert_eq!(sent, 3, "sendmsg did not hand over the three bytes");
+    assert_eq!(recvd, 3, "recvmsg did not take the three bytes back");
+    assert_eq!(&got, b"abc", "the bytes did not arrive at the other end");
+}
+
+#[test]
+fn sending_a_batch_of_messages_is_not_receiving_one() {
+    // A `struct mmsghdr` is a `struct msghdr` and then the `unsigned int`
+    // the call fills in with what it moved, eight words in all. One message
+    // in the batch is enough: on the empty end of a nonblocking pair
+    // `sendmmsg` hands one over and `recvmmsg` has none to hand back.
+    const LEN_WORD: usize = 7;
+    let proc = a_process(45_528, "dispatch-sendmmsg", "dispatch_sendmmsg");
+    let (pair, sent, reported, recvd, got) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut sv = [0i32; 2];
+            let pair = by_number(
+                sys,
+                Sys::SOCKETPAIR as u32,
+                [
+                    AF_UNIX,
+                    A_STREAM | NONBLOCK,
+                    0,
+                    sv.as_mut_ptr() as usize,
+                    0,
+                    0,
+                ],
+            )
+            .await;
+
+            let out = *b"abcd";
+            let iov = [out.as_ptr() as usize, out.len()];
+            let mut batch = [0usize; 8];
+            batch[..LEN_WORD].copy_from_slice(&a_msghdr(&iov));
+            let sent = by_number(
+                sys,
+                Sys::SENDMMSG as u32,
+                [sv[0] as usize, batch.as_mut_ptr() as usize, 1, 0, 0, 0],
+            )
+            .await;
+            let reported = batch[LEN_WORD] as u32;
+
+            let mut got = *b"....";
+            let back = [got.as_mut_ptr() as usize, got.len()];
+            let mut back_hdr = a_msghdr(&back);
+            let recvd = by_number(
+                sys,
+                Sys::RECVMSG as u32,
+                [sv[1] as usize, back_hdr.as_mut_ptr() as usize, 0, 0, 0, 0],
+            )
+            .await;
+            (pair, sent, reported, recvd, got)
+        })
+    });
+
+    assert_eq!(pair, 0, "socketpair failed");
+    assert_eq!(sent, 1, "sendmmsg did not hand over the one message");
+    assert_eq!(reported, 4, "sendmmsg did not report the length it sent");
+    assert_eq!(recvd, 4, "the four bytes did not reach the other end");
+    assert_eq!(
+        &got, b"abcd",
+        "the bytes that arrived are not the ones sent"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Flushing a file is not flushing only its data
+// ---------------------------------------------------------------------------
+
+/// An inode that does nothing but count which of the two syncs reached it.
+///
+/// Every filesystem in the tree implements both, and through the syscall
+/// both answer zero on a real file, so `fsync` and `fdatasync` are the one
+/// pair of this table that no real file can separate. What is on trial here
+/// is the routing, not the flushing, so an inode that only counts is
+/// exactly as much filesystem as the question needs.
+#[derive(Default)]
+struct SyncCounter {
+    all: AtomicUsize,
+    data: AtomicUsize,
+}
+
+impl INode for SyncCounter {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> rcore_fs::vfs::Result<usize> {
+        Ok(0)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> rcore_fs::vfs::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn poll(&self) -> rcore_fs::vfs::Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: true,
+            error: false,
+            hangup: false,
+        })
+    }
+
+    fn sync_all(&self) -> rcore_fs::vfs::Result<()> {
+        self.all.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn sync_data(&self) -> rcore_fs::vfs::Result<()> {
+        self.data.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[test]
+fn flushing_a_file_is_not_flushing_only_its_data() {
+    let proc = a_process(45_529, "dispatch-fsync", "dispatch_fsync");
+    let counted = Arc::new(SyncCounter::default());
+    let inode = counted.clone();
+    let (fsync_ret, after_fsync, fdatasync_ret, after_fdatasync) = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let fd: i32 = sys
+                .linux_process()
+                .add_file(File::new(
+                    inode,
+                    OpenFlags::RDWR,
+                    String::from("/dispatch_fsync/counted"),
+                ))
+                .unwrap()
+                .into();
+            let fsync_ret = by_number(sys, Sys::FSYNC as u32, [fd as usize, 0, 0, 0, 0, 0]).await;
+            let after_fsync = (
+                counted.all.load(Ordering::SeqCst),
+                counted.data.load(Ordering::SeqCst),
+            );
+            let fdatasync_ret =
+                by_number(sys, Sys::FDATASYNC as u32, [fd as usize, 0, 0, 0, 0, 0]).await;
+            let after_fdatasync = (
+                counted.all.load(Ordering::SeqCst),
+                counted.data.load(Ordering::SeqCst),
+            );
+            (fsync_ret, after_fsync, fdatasync_ret, after_fdatasync)
+        })
+    });
+
+    assert_eq!(fsync_ret, 0, "fsync failed");
+    assert_eq!(
+        after_fsync,
+        (1, 0),
+        "fsync did not reach sync_all and it alone"
+    );
+    assert_eq!(fdatasync_ret, 0, "fdatasync failed");
+    assert_eq!(
+        after_fdatasync,
+        (1, 1),
+        "fdatasync did not reach sync_data and it alone"
     );
 }
