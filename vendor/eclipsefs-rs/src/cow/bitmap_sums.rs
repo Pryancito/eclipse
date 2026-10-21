@@ -164,12 +164,11 @@ impl CowFs {
             self.root_tree.level,
             Some(self.root_tree.gen),
         )];
-        for (k, d) in self.st.range(
-            &self.root_tree,
-            &Key::new(0, ROOT_ITEM, 0),
-            &Key::MAX,
-            usize::MAX,
-        )? {
+        let first = Key::new(0, ROOT_ITEM, 0);
+        for (k, d) in self
+            .st
+            .range(&self.root_tree, &first, &Key::MAX, usize::MAX)?
+        {
             if k.ty == ROOT_ITEM {
                 let r = RootItem::decode(&d)?.root;
                 stack.push((r.bytenr, r.level, Some(r.gen)));

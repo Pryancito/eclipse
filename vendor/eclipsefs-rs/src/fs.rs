@@ -1040,6 +1040,7 @@ impl EclipseFS {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::mkfs;
@@ -1320,5 +1321,56 @@ mod tests {
         r.still_damaged = None;
         r.scrub.bad_tree_nodes.push(4);
         assert!(!r.is_clean());
+    }
+
+    /// The v0.4-only calls answer on a v0.3 mount too, with what "nothing of
+    /// that here" means for each, rather than failing the caller.
+    #[test]
+    fn v4_only_calls_degrade_gracefully_on_v3() {
+        let d = Ram::new(16 * MIB);
+        mkfs::format_v3(&*d, &opts()).unwrap();
+        let mut fs = EclipseFS::mount(d, false).unwrap();
+        fs.set_clock(clock);
+        let root = fs.root_ino();
+        let f = fs.create(root, "f", FileKind::Regular, 0o644, 0).unwrap();
+        fs.write(f, 0, b"v3").unwrap();
+        let g = fs.generation();
+        fs.fsync(f).unwrap();
+        assert!(fs.generation() >= g);
+        fs.set_commit_interval(Some(5));
+        assert_eq!(fs.commit_if_due(), Ok(false));
+        assert_eq!(fs.atomic_write_supported(f), Ok(false));
+        assert_eq!(fs.fsync_log_records(), 0);
+        let mut buf = [0u8; 2];
+        assert_eq!(fs.read_shared(f, 0, &mut buf), Ok(None));
+        assert!(fs.stat_shared(f).unwrap().is_none());
+        assert_eq!(fs.encryption_policy(f), Ok(None));
+        assert_eq!(fs.device_tier(1), Tier::Any);
+        assert_eq!(fs.profiles(), (Profile::Single, Profile::Single));
+        assert!(fs.devices().is_empty());
+        assert!(fs.chunks().is_empty());
+        assert_eq!(fs.nodesize(), BLOCK_SIZE as usize);
+    }
+
+    #[test]
+    fn the_commit_interval_reaches_the_v4_driver() {
+        let (_, mut fs) = mounted(8);
+        fs.set_commit_interval(Some(30));
+        let f = fs
+            .create(fs.root_ino(), "f", FileKind::Regular, 0o644, 0)
+            .unwrap();
+        fs.write(f, 0, b"x").unwrap();
+        // The clock does not move: not due yet.
+        assert_eq!(fs.commit_if_due(), Ok(false));
+        fs.set_commit_interval(None);
+        assert_eq!(fs.fsync_log_records(), 0);
+    }
+
+    /// A device added without a tier stays untiered.
+    #[test]
+    fn adding_an_untiered_device() {
+        let (_, mut fs) = mounted(64);
+        let id = fs.add_device_tier(Ram::new(64 * MIB), Tier::Any).unwrap();
+        assert_eq!(fs.device_tier(id), Tier::Any);
     }
 }

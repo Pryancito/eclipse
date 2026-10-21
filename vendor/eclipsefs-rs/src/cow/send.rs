@@ -298,18 +298,11 @@ impl CowFs {
         for (&ino, c) in &changes {
             if c.xattrs && !c.deleted {
                 let mut list = Vec::new();
-                for (_, d) in self.st.range(
-                    &self.fs_root,
-                    &Key::new(ino, XATTR_ITEM, 0),
-                    &Key::new(ino, XATTR_ITEM, u64::MAX),
-                    usize::MAX,
-                )? {
+                for (_, d) in self.items_of(ino, XATTR_ITEM, usize::MAX)? {
                     list.extend(decode_xattrs(&d)?);
                 }
-                w.cmd(
-                    CMD_XATTRS,
-                    &P::default().u64(ino).bytes(&encode_xattrs(&list)).0,
-                )?;
+                let p = P::default().u64(ino).bytes(&encode_xattrs(&list));
+                w.cmd(CMD_XATTRS, &p.0)?;
             }
         }
         // Final attributes (sizes, link counts, times) last.
@@ -400,10 +393,8 @@ impl CowFs {
             let s = e.lblk.max(from);
             let t = (e.lblk + e.blocks).min(to);
             if s > lb && !created {
-                w.cmd(
-                    CMD_PUNCH,
-                    &P::default().u64(ino).u64(lb * BS).u64((s - lb) * BS).0,
-                )?;
+                let p = P::default().u64(ino).u64(lb * BS).u64((s - lb) * BS);
+                w.cmd(CMD_PUNCH, &p.0)?;
             }
             lb = t;
             if e.prealloc {
@@ -438,10 +429,8 @@ impl CowFs {
             }
         }
         if lb < to && !created {
-            w.cmd(
-                CMD_PUNCH,
-                &P::default().u64(ino).u64(lb * BS).u64((to - lb) * BS).0,
-            )?;
+            let p = P::default().u64(ino).u64(lb * BS).u64((to - lb) * BS);
+            w.cmd(CMD_PUNCH, &p.0)?;
         }
         Ok(())
     }
@@ -452,7 +441,7 @@ impl CowFs {
     /// as) its parent. Returns the new subvolume's root directory.
     pub fn receive(&mut self, dir: u64, input: ReceiveSource) -> Result<u64> {
         let d = self.at_rw(dir)?;
-        self.writable()?;
+        self.growable()?;
         let dir_sv = self.subvol;
         // Header.
         let mut h = vec![0u8; 8 + 4 + 16 + 16 + 2];
@@ -513,12 +502,7 @@ impl CowFs {
         item.otime = now;
         item.uuid = subvol_uuid(&self.sb.uuid, id, self.st.gen, now);
         item.received_uuid = [0; 16];
-        self.st.insert(
-            &mut self.sp,
-            &mut self.root_tree,
-            Key::new(id, ROOT_ITEM, 0),
-            item.encode(),
-        )?;
+        self.root_insert(Key::new(id, ROOT_ITEM, 0), item.encode())?;
         self.enter(id)?;
         let r = self.apply_stream(input);
         let r = r.and_then(|_| {
@@ -530,10 +514,8 @@ impl CowFs {
             let mut item = self.fs_item.clone();
             item.root = self.fs_root;
             let (_, _, links, _) = self.check_subvol(&item)?;
-            if !links.is_empty() || self.inode(FIRST_INO)?.kind() != FileKind::Dir {
-                return Err(BAD);
-            }
-            Ok(())
+            let root_is_dir = self.inode(FIRST_INO)?.kind() == FileKind::Dir;
+            (links.is_empty() && root_is_dir).then_some(()).ok_or(BAD)
         });
         if let Err(e) = r {
             warn!("eclipsefs: receive failed: {:?}", e);
@@ -622,9 +604,7 @@ impl CowFs {
                 off.checked_add(data.len() as u64).ok_or(BAD)?;
                 let n = self.write_data(ino, &mut i, off, data)?;
                 self.put_inode(ino, i)?;
-                if n < data.len() {
-                    return Err(Error::NoSpace);
-                }
+                (n == data.len()).then_some(()).ok_or(Error::NoSpace)?;
             }
             CMD_CLONE => {
                 let ino = r.ino()?;
@@ -636,9 +616,6 @@ impl CowFs {
                     return Err(BAD);
                 }
                 let (d0, s0, n) = (off / BS, src_off / BS, len / BS);
-                if d0.checked_add(n).is_none() || s0.checked_add(n).is_none() {
-                    return Err(BAD);
-                }
                 if src == ino && d0 < s0 + n && s0 < d0 + n {
                     return Err(BAD);
                 }
@@ -694,12 +671,7 @@ impl CowFs {
                     decode_xattrs(rest)?
                 };
                 self.inode(ino)?;
-                for (k, _) in self.st.range(
-                    &self.fs_root,
-                    &Key::new(ino, XATTR_ITEM, 0),
-                    &Key::new(ino, XATTR_ITEM, u64::MAX),
-                    usize::MAX,
-                )? {
+                for (k, _) in self.items_of(ino, XATTR_ITEM, usize::MAX)? {
                     self.delete(k)?;
                 }
                 let mut by_hash: BTreeMap<u64, Xattrs> = BTreeMap::new();
@@ -728,14 +700,12 @@ impl CowFs {
                 }
                 let nbytes = i.nbytes;
                 let flags = new.flags & !(FL_ENCRYPT as u64);
-                self.put_inode(
-                    ino,
-                    InodeItem {
-                        nbytes,
-                        flags,
-                        ..new
-                    },
-                )?;
+                let i = InodeItem {
+                    nbytes,
+                    flags,
+                    ..new
+                };
+                self.put_inode(ino, i)?;
             }
             _ => return Err(BAD),
         }
@@ -764,11 +734,7 @@ impl CowFs {
                 RootItem::decode(&d)?.root
             }
         };
-        self.st.delete(
-            &mut self.sp,
-            &mut self.root_tree,
-            Key::new(id, ROOT_ITEM, 0),
-        )?;
+        self.root_delete(Key::new(id, ROOT_ITEM, 0))?;
         self.st.release(&mut self.sp, root)
     }
 
@@ -841,6 +807,7 @@ impl Sent {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -971,5 +938,329 @@ mod tests {
         assert_eq!(s.find(&other, 2, 6), None);
         // A plain extent at the same disk block is not that data either.
         assert_eq!(s.find(&plain(0, 700, 8), 0, 8), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Streams end to end
+    // -----------------------------------------------------------------------
+
+    use crate::testdisk::{clock, formatted};
+
+    fn mounted() -> CowFs {
+        let mut fs = CowFs::mount(formatted(32), false).unwrap();
+        fs.set_clock(clock);
+        fs
+    }
+
+    fn sent(fs: &mut CowFs, snap: u64, parent: Option<u64>) -> Vec<u8> {
+        let mut out = Vec::new();
+        fs.send(snap, parent, &mut |b: &[u8]| {
+            out.extend_from_slice(b);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    fn recv(fs: &mut CowFs, bytes: &[u8]) -> Result<u64> {
+        let mut at = 0;
+        fs.receive(fs.root_ino(), &mut |buf: &mut [u8]| {
+            let b = bytes.get(at..at + buf.len()).ok_or(Error::Io)?;
+            buf.copy_from_slice(b);
+            at += buf.len();
+            Ok(())
+        })
+    }
+
+    /// A header for a full stream named "got", then `cmds` and `END`.
+    fn stream(flags: u32, next_ino: u64, cmds: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(MAGIC);
+        h.extend_from_slice(&flags.to_le_bytes());
+        h.extend_from_slice(&[3; 16]);
+        h.extend_from_slice(&[0; 16]);
+        h.extend_from_slice(&3u16.to_le_bytes());
+        h.extend_from_slice(b"got");
+        h.extend_from_slice(&next_ino.to_le_bytes());
+        let crc = crc32c(&h);
+        h.extend_from_slice(&crc.to_le_bytes());
+        let mut out = h;
+        {
+            let mut sink = |b: &[u8]| -> Result<()> {
+                out.extend_from_slice(b);
+                Ok(())
+            };
+            let mut w = Writer {
+                out: &mut sink,
+                bytes: 0,
+            };
+            for (ty, p) in cmds {
+                w.cmd(*ty, p).unwrap();
+            }
+            w.cmd(CMD_END, &[]).unwrap();
+        }
+        out
+    }
+
+    fn inode(kind: FileKind) -> Vec<u8> {
+        let mut i = InodeItem::new(kind, 0o755, clock(), 1);
+        i.parent = FIRST_INO;
+        if kind == FileKind::Dir {
+            i.nlink = 2;
+        }
+        i.encode()
+    }
+
+    fn create(ino: u64, kind: FileKind) -> (u8, Vec<u8>) {
+        (CMD_CREATE, P::default().u64(ino).bytes(&inode(kind)).0)
+    }
+
+    fn link(dir: u64, index: u64, ino: u64, kind: FileKind, name: &[u8]) -> (u8, Vec<u8>) {
+        let p = P::default()
+            .u64(dir)
+            .u64(index)
+            .u64(ino)
+            .u8(kind.to_disk())
+            .bytes(name);
+        (CMD_LINK, p.0)
+    }
+
+    fn write(ino: u64, off: u64, data: &[u8]) -> (u8, Vec<u8>) {
+        (CMD_WRITE, P::default().u64(ino).u64(off).bytes(data).0)
+    }
+
+    fn range(ty: u8, ino: u64, off: u64, len: u64) -> (u8, Vec<u8>) {
+        (ty, P::default().u64(ino).u64(off).u64(len).0)
+    }
+
+    fn clone(ino: u64, off: u64, len: u64, src: u64, src_off: u64) -> (u8, Vec<u8>) {
+        let p = P::default()
+            .u64(ino)
+            .u64(off)
+            .u64(len)
+            .u64(src)
+            .u64(src_off);
+        (CMD_CLONE, p.0)
+    }
+
+    const F: u64 = FIRST_INO + 1;
+    const G: u64 = FIRST_INO + 2;
+
+    /// The root directory and two files, `f` holding two blocks and `g`
+    /// a few bytes inline, then `more`.
+    fn with_files(more: &[(u8, Vec<u8>)]) -> Vec<(u8, Vec<u8>)> {
+        let mut v = alloc::vec![
+            create(FIRST_INO, FileKind::Dir),
+            create(F, FileKind::Regular),
+            create(G, FileKind::Regular),
+            link(FIRST_INO, 2, F, FileKind::Regular, b"f"),
+            link(FIRST_INO, 3, G, FileKind::Regular, b"g"),
+            write(F, 0, &[1; 2 * BS as usize]),
+            write(G, 0, b"inline"),
+        ];
+        v.extend_from_slice(more);
+        v
+    }
+
+    fn refused(cmds: &[(u8, Vec<u8>)]) {
+        let mut fs = mounted();
+        let s = stream(0, G + 1, &with_files(cmds));
+        assert_eq!(
+            recv(&mut fs, &s).err(),
+            Some(BAD),
+            "{:?}",
+            cmds.iter().map(|c| c.0).collect::<Vec<_>>()
+        );
+        fs.check().unwrap();
+    }
+
+    /// Compression still pending in a failed receive goes with its tree.
+    #[test]
+    fn a_failed_receive_drops_its_pending_compression() {
+        let mut fs = mounted();
+        fs.set_mount_compression(Some(Compression::Lz4));
+        let s = stream(0, G + 1, &with_files(&[write(G + 5, 0, b"x")]));
+        assert_eq!(recv(&mut fs, &s).err(), Some(BAD));
+        assert!(fs.zpending.is_empty());
+        fs.check().unwrap();
+    }
+
+    #[test]
+    fn a_hand_made_stream_is_received() {
+        let mut fs = mounted();
+        let s = stream(0, G + 1, &with_files(&[]));
+        let h = recv(&mut fs, &s).unwrap();
+        let (sv, _) = split(h);
+        let f = fs.lookup(h, "f").unwrap();
+        assert_eq!(split(f), (sv, F));
+        fs.check().unwrap();
+    }
+
+    #[test]
+    fn headers_that_are_not_streams() {
+        let mut fs = mounted();
+        let mut s = stream(0, G + 1, &with_files(&[]));
+        s[0] = b'X';
+        assert!(matches!(recv(&mut fs, &s), Err(Error::Unsupported(_))));
+        let mut s = stream(0, G + 1, &[]);
+        s[50] ^= 1;
+        assert_eq!(recv(&mut fs, &s).err(), Some(BAD));
+        let s = stream(4, G + 1, &[]);
+        assert_eq!(recv(&mut fs, &s).err(), Some(BAD));
+        let s = stream(0, INO_MASK + 2, &with_files(&[]));
+        assert_eq!(recv(&mut fs, &s).err(), Some(BAD));
+        // A command longer than any is.
+        let mut s = stream(0, G + 1, &[]);
+        let end = s.len() - 9;
+        s[end + 1..end + 5].copy_from_slice(&(MAX_CMD as u32 + 1).to_le_bytes());
+        assert_eq!(recv(&mut fs, &s).err(), Some(BAD));
+        fs.check().unwrap();
+    }
+
+    #[test]
+    fn commands_that_do_not_fit_what_is_there() {
+        // Created twice.
+        refused(&[create(F, FileKind::Regular)]);
+        // Linked as what it is not.
+        refused(&[link(FIRST_INO, 9, F, FileKind::Dir, b"d")]);
+        // Attributes of another kind.
+        refused(&[(
+            CMD_SETATTR,
+            P::default().u64(F).bytes(&inode(FileKind::Dir)).0,
+        )]);
+        // Data written to a directory.
+        refused(&[write(FIRST_INO, 0, b"x")]);
+        // A command nobody knows.
+        refused(&[(99, Vec::new())]);
+        // One xattr bigger than an item.
+        let big = encode_xattrs(&[(b"user.x".to_vec(), alloc::vec![0; MAX_ITEM])]);
+        refused(&[(CMD_XATTRS, P::default().u64(F).bytes(&big).0)]);
+    }
+
+    #[test]
+    fn clones_that_cannot_be() {
+        refused(&[clone(F, 1, BS, F, 0)]);
+        refused(&[clone(F, 0, 0, F, 0)]);
+        refused(&[clone(F, u64::MAX / BS * BS, BS, G, 0)]);
+        refused(&[clone(F, 0, BS, F, 0)]);
+        refused(&[clone(F, 0, BS, G, 0)]);
+    }
+
+    /// Clones, holes and preallocation into files still inline.
+    #[test]
+    fn data_commands_on_inline_files() {
+        let mut fs = mounted();
+        let h = FIRST_INO + 3;
+        let cmds = with_files(&[
+            clone(G, BS, BS, F, 0),
+            create(h, FileKind::Regular),
+            link(FIRST_INO, 4, h, FileKind::Regular, b"h"),
+            write(h, 0, b"abc"),
+            range(CMD_PUNCH, h, 5, 3),
+            range(CMD_PUNCH, h, 0, 3),
+            write(h, 0, b"abc"),
+            range(CMD_PREALLOC, h, BS, BS),
+        ]);
+        let got = recv(&mut fs, &stream(0, h + 1, &cmds)).unwrap();
+        fs.check().unwrap();
+        let g = fs.lookup(got, "g").unwrap();
+        let mut buf = [0u8; 6];
+        fs.read(g, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"inline");
+    }
+
+    /// An unfinished receive is dropped at mount, even while it is the
+    /// subvolume entered.
+    #[test]
+    fn an_unfinished_receive_entered_is_dropped() {
+        let mut fs = mounted();
+        let root = fs.st.create(&mut fs.sp, FIRST_SUBVOL, 0).unwrap();
+        let item = RootItem {
+            root,
+            next_ino: FIRST_INO,
+            root_dir: FIRST_INO,
+            flags: ROOT_FLAG_RECEIVING,
+            ..Default::default()
+        };
+        fs.root_insert(Key::new(FIRST_SUBVOL, ROOT_ITEM, 0), item.encode())
+            .unwrap();
+        fs.enter(FIRST_SUBVOL).unwrap();
+        fs.drop_unfinished_receives().unwrap();
+        assert_eq!(fs.subvol, FS_TREE);
+        fs.check().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Sending
+    // -----------------------------------------------------------------------
+
+    /// A received subvolume is sent under the identity it was received
+    /// as, from a read-only mount too; the top subvolume has no name to
+    /// send (and so no receiver takes it).
+    #[test]
+    fn identities_and_names_of_what_is_sent() {
+        let mut fs = mounted();
+        let top = fs.root_ino();
+        let f = fs.create(top, "f", FileKind::Regular, 0o644, 0).unwrap();
+        fs.write(f, 0, b"data").unwrap();
+        let snap = fs.snapshot(top, top, "snap", true).unwrap();
+        let s = sent(&mut fs, snap, None);
+        let d = formatted(32);
+        let mut other = CowFs::mount(d.clone(), false).unwrap();
+        let got = recv(&mut other, &s).unwrap();
+        let again = sent(&mut other, got, None);
+        assert_eq!(again[12..28], s[12..28]);
+        drop(other);
+        let mut ro = CowFs::mount(d, true).unwrap();
+        assert_eq!(sent(&mut ro, got, None), again);
+
+        fs.set_subvolume_read_only(FS_TREE, true).unwrap();
+        let unnamed = sent(&mut fs, top, None);
+        assert_eq!(&unnamed[44..46], &[0, 0]);
+        assert_eq!(recv(&mut mounted(), &unnamed).err(), Some(Error::Invalid));
+    }
+
+    /// Holes punched, blocks preallocated and compressed blocks rewritten
+    /// since the parent all reach the other side.
+    #[test]
+    fn increments_with_holes_preallocation_and_compression() {
+        use crate::cowfmt::FALLOC_FL_PUNCH_HOLE;
+        let mut fs = mounted();
+        let top = fs.root_ino();
+        let sv = fs.create_subvolume(top, "sv").unwrap();
+        let a = fs.create(sv, "a", FileKind::Regular, 0o644, 0).unwrap();
+        fs.write(a, 0, &[1; 4 * BS as usize]).unwrap();
+        let z = fs.create(sv, "z", FileKind::Regular, 0o644, 0).unwrap();
+        fs.set_compression(z, Some(Compression::Zlib)).unwrap();
+        fs.write(z, 0, &[2; 32 * BS as usize]).unwrap();
+        let s = fs.create(sv, "s", FileKind::Regular, 0o644, 0).unwrap();
+        fs.write(s, 3 * BS, &[3; BS as usize]).unwrap();
+        let p1 = fs.snapshot(sv, top, "p1", true).unwrap();
+
+        fs.fallocate(a, FALLOC_FL_PUNCH_HOLE | 1, BS, BS).unwrap();
+        fs.write(a, 2 * BS, &[9; BS as usize]).unwrap();
+        fs.fallocate(a, 0, 6 * BS, 2 * BS).unwrap();
+        fs.fallocate(a, FALLOC_FL_PUNCH_HOLE | 1, 3 * BS, BS)
+            .unwrap();
+        fs.write(z, 5 * BS, &[8; BS as usize]).unwrap();
+        fs.truncate(s, 0).unwrap();
+        fs.write(s, 0, b"now inline").unwrap();
+        let p2 = fs.snapshot(sv, top, "p2", true).unwrap();
+
+        let full = sent(&mut fs, p1, None);
+        let inc = sent(&mut fs, p2, Some(p1));
+        let mut other = mounted();
+        recv(&mut other, &full).unwrap();
+        let got = recv(&mut other, &inc).unwrap();
+        other.check().unwrap();
+        for (name, len) in [("a", 8 * BS), ("z", 32 * BS), ("s", 10)] {
+            let mut want = vec![0u8; len as usize];
+            let mut have = vec![0u8; len as usize];
+            let h = fs.lookup(p2, name).unwrap();
+            fs.read(h, 0, &mut want).unwrap();
+            let h = other.lookup(got, name).unwrap();
+            other.read(h, 0, &mut have).unwrap();
+            assert_eq!(want, have, "{}", name);
+        }
     }
 }

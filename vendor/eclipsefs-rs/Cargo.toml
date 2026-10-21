@@ -8,6 +8,10 @@ description = "EclipseFS on-disk filesystem (no_std): read/write driver and mkfs
 default = []
 std = []
 
+[lints.rust]
+# Set by `cargo llvm-cov` on nightly: test modules are left out of coverage.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+
 [dependencies]
 log = "0.4"
 # Transparent compression (format v0.4): zlib as on btrfs, LZ4 and zstd.

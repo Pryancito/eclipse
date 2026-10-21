@@ -549,6 +549,7 @@ pub fn parse_dirents(data: &[u8]) -> Result<Vec<RawDirent<'_>>> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -920,5 +921,28 @@ mod tests {
         d.extend_from_slice(&[0, 0, 0]);
         assert!(parse_dirents(&d).is_err());
         assert!(parse_dirents(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn supported_versions_are_v3_and_v4() {
+        assert!(is_supported_version(VERSION));
+        assert!(is_supported_version(0x0004_0001));
+        assert!(!is_supported_version(0x0002_0000));
+        assert!(!is_supported_version(0x0005_0000));
+    }
+
+    /// A block whose checksum is right but whose count is too large is
+    /// corrupt, not a reason to read past its end.
+    #[test]
+    fn an_extent_block_with_a_valid_crc_but_too_many_extents() {
+        let mut b = encode_extent_block(7, 0, &[Extent::new(0, 100, 1)]);
+        put32(&mut b, 4, EXTENTS_PER_BLOCK as u32 + 1);
+        put32(&mut b, 24, 0);
+        let crc = crc32(&b);
+        put32(&mut b, 24, crc);
+        assert_eq!(
+            decode_extent_block(7, &b).err(),
+            Some(Error::Corrupt("extent block count"))
+        );
     }
 }

@@ -336,6 +336,7 @@ impl JournalArea {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use alloc::sync::Arc;
@@ -494,5 +495,83 @@ mod tests {
             j.write(&*dev, &[1; 16], 1, &vec![(40, block(1)); 15]),
             Err(Error::NoSpace)
         );
+    }
+
+    /// A header whose descriptor count does not match its block count (or
+    /// asks for more than the area holds) is no transaction.
+    #[test]
+    fn a_header_with_the_wrong_shape_is_ignored() {
+        let dev = ram(64);
+        let area = JournalArea {
+            start: 4,
+            blocks: 16,
+        };
+        let uuid = [3u8; 16];
+        area.write(&*dev, &uuid, 9, &[(40, block(1)), (41, block(2))])
+            .unwrap();
+        assert!(area.read(&*dev, &uuid, 64).unwrap().is_some());
+        let forge = |count: u32, ndesc: u32| {
+            let mut h = vec![0u8; BS];
+            dev.read_at(4 * BLOCK_SIZE, &mut h).unwrap();
+            h[16..20].copy_from_slice(&count.to_le_bytes());
+            h[20..24].copy_from_slice(&ndesc.to_le_bytes());
+            let c = crc32(&h[..HDR_CRC]);
+            h[HDR_CRC..HDR_CRC + 4].copy_from_slice(&c.to_le_bytes());
+            dev.write_at(4 * BLOCK_SIZE, &h).unwrap();
+        };
+        forge(2, 2);
+        assert_eq!(area.read(&*dev, &uuid, 64).unwrap(), None);
+        forge(100, 1);
+        assert_eq!(area.read(&*dev, &uuid, 64).unwrap(), None);
+    }
+
+    /// The lock really excludes: two threads adding through it lose nothing.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_spin_lock_excludes() {
+        let s = Arc::new(Spin::new(0u64));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50_000 {
+                        s.with(|v| *v += 1);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(s.with(|v| *v), 200_000);
+    }
+
+    /// A second taker waits for the first to let go.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_spin_lock_waits_for_its_holder() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let s = Arc::new(Spin::new(0u64));
+        let held = Arc::new(AtomicBool::new(false));
+        let holder = {
+            let (s, held) = (s.clone(), held.clone());
+            std::thread::spawn(move || {
+                s.with(|v| {
+                    held.store(true, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    *v = 1;
+                })
+            })
+        };
+        while !held.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+        assert_eq!(s.with(|v| *v), 1);
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn the_test_disk_syncs() {
+        ram(1).sync().unwrap();
     }
 }

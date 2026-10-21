@@ -95,7 +95,7 @@ mod hw {
     use core::sync::atomic::{AtomicU8, Ordering};
 
     /// 0: not probed yet, 1: SSE4.2, 2: none.
-    static SSE42: AtomicU8 = AtomicU8::new(0);
+    pub(super) static SSE42: AtomicU8 = AtomicU8::new(0);
 
     pub fn available() -> bool {
         match SSE42.load(Ordering::Relaxed) {
@@ -256,6 +256,7 @@ pub fn crc32c_table(crc: u32, data: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{crc32, crc32_update, crc32c, crc32c_table, crc32c_update};
 
@@ -385,5 +386,39 @@ mod tests {
             let d: alloc::vec::Vec<u8> = (0..len).map(|i| (i * 13 + 5) as u8).collect();
             assert_eq!(crc32(&d), slow(&d), "len {}", len);
         }
+    }
+
+    /// The tables are built by `const fn`s at compile time, which no run
+    /// ever executes. Building them again at run time checks the builders
+    /// (and keeps them covered).
+    #[test]
+    fn the_tables_rebuild_at_run_time() {
+        assert_eq!(super::make_table(), super::TABLE);
+        assert_eq!(super::make_c_tables(), super::C_TABLES);
+        #[cfg(target_arch = "x86_64")]
+        {
+            // x^(8n) mod P: zero bytes appended to a raw state multiply it.
+            assert_eq!(super::x8n(0), 1 << 31);
+            let a = [0x5Au8; 8];
+            let raw = !crc32c(&a);
+            let joined = !crc32c_update(crc32c(&a), &[0u8; 16]);
+            assert_eq!(super::mulmod(raw, super::x8n(16)), joined);
+        }
+    }
+
+    /// On a CPU without SSE4.2 every checksum comes from the tables. Pretend
+    /// to be one for a moment: the answers have to be the same (other tests
+    /// running meanwhile only take the slower path).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn without_the_instruction_the_tables_answer() {
+        use core::sync::atomic::Ordering;
+        let data: alloc::vec::Vec<u8> = (0..5000u32).map(|i| (i * 13) as u8).collect();
+        let hw = crc32c(&data);
+        let was = super::hw::SSE42.swap(2, Ordering::Relaxed);
+        assert!(!super::hw::available());
+        assert_eq!(crc32c(&data), hw);
+        super::hw::SSE42.store(was, Ordering::Relaxed);
+        assert_eq!(crc32c(&data), hw);
     }
 }

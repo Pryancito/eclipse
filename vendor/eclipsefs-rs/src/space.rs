@@ -303,7 +303,7 @@ impl BlockSpace {
     }
 
     /// Free blocks file data may take now.
-    fn data_room(&self) -> u64 {
+    pub(crate) fn data_room(&self) -> u64 {
         if self.vol.is_none() {
             return self.alloc.free_blocks().saturating_sub(self.reserve);
         }
@@ -388,6 +388,27 @@ impl BlockSpace {
             }
         }
         None
+    }
+
+    /// Whether tree changes may still take blocks without eating into the
+    /// half of the reserve kept for the commit (and for deletes, which
+    /// copy nodes too). On a volume a metadata chunk is made if that is
+    /// what it takes.
+    pub fn meta_headroom(&mut self) -> bool {
+        let need = self.reserve / 2;
+        loop {
+            let free = match self.vol {
+                None => self.alloc.free_blocks(),
+                Some(_) => self.meta_free(),
+            };
+            if free >= need {
+                return true;
+            }
+            if !self.grow_on(ChunkKind::Metadata, self.target()) && !self.grow(ChunkKind::Metadata)
+            {
+                return false;
+            }
+        }
     }
 
     /// Free blocks metadata may take.
@@ -574,6 +595,7 @@ impl Space for BlockSpace {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::blocks::AllocationGroup;
@@ -650,6 +672,20 @@ mod tests {
         assert!(sp.alloc.is_used(s));
         assert!(sp.private_fresh(s, 1));
         assert!(sp.incref(60, 1).is_err());
+    }
+
+    /// Free blocks in pieces too small for a run.
+    #[test]
+    fn a_run_needs_contiguous_room() {
+        let mut g = AllocationGroup::new(0, 64);
+        g.mark_used(0, 64);
+        for b in (8..64).step_by(2) {
+            g.free(b, 1).unwrap();
+        }
+        let mut sp = BlockSpace::new(BlockAllocator::new(vec![g]), RefMap::default());
+        assert!(sp.data_room() >= 4);
+        assert_eq!(sp.alloc_data_run(None, 4), None);
+        assert!(sp.alloc_data_run(None, 1).is_some());
     }
 
     /// `RangeSet` against the dumbest model there is, a bit per block, over

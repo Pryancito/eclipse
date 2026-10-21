@@ -183,7 +183,7 @@ impl CowFs {
     /// Setting the policy a directory already has does nothing.
     pub fn set_encryption_policy(&mut self, h: u64, policy: &EncryptionPolicy) -> Result<()> {
         let ino = self.at_rw(h)?;
-        self.writable()?;
+        self.growable()?;
         if !policy.supported() {
             return Err(Error::Invalid);
         }
@@ -334,9 +334,7 @@ impl CowFs {
             return Ok(Cow::Borrowed(plain));
         }
         let d = self.inode(dir)?;
-        if d.flags & FL_ENCRYPT as u64 == 0 {
-            return Ok(Cow::Borrowed(plain));
-        }
+        // A plain directory has no keys.
         match self.file_keys(dir, &d) {
             Ok(Some(k)) => {
                 let pad = self
@@ -355,11 +353,8 @@ impl CowFs {
                 if ct.len() > NOKEY_WHOLE {
                     return Err(Error::NotFound);
                 }
-                // A whole 189-byte name, or the prefix and digest of a
-                // longer one.
-                if self.dir_lookup(dir, &ct)?.is_some() {
-                    return Ok(Cow::Owned(ct));
-                }
+                // The prefix and digest of a longer name: no whole one is
+                // 189 bytes, as names are padded to a multiple of 4.
                 self.find_long_name(dir, &ct).map(Cow::Owned)
             }
             Err(e) => Err(e),
@@ -367,13 +362,7 @@ impl CowFs {
     }
 
     fn find_long_name(&mut self, dir: u64, nokey: &[u8]) -> Result<Vec<u8>> {
-        let items = self.st.range(
-            &self.fs_root,
-            &Key::new(dir, DIR_INDEX, 0),
-            &Key::new(dir, DIR_INDEX, u64::MAX),
-            usize::MAX,
-        )?;
-        for (_, d) in items {
+        for (_, d) in self.items_of(dir, DIR_INDEX, usize::MAX)? {
             let e = decode_pair(&d)?;
             if e.name.len() > NOKEY_WHOLE && no_key_name(&e.name) == crypt::base64url(nokey) {
                 return Ok(e.name);
@@ -471,6 +460,7 @@ fn no_key_name(ct: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
