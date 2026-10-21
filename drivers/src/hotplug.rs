@@ -78,6 +78,25 @@ pub fn remove(dev: &Device) -> bool {
     }
 }
 
+/// Un torniquete para los tests que instalan destino, y la forma de dejar el
+/// hueco vacio otra vez.
+///
+/// `SINK` es un global del proceso entero, asi que no basta con que los tests
+/// de este modulo tomen turno entre ellos: el driver de xHCI publica discos
+/// por aqui y sus tests tambien instalan destino. Dos suites distintas
+/// pisandose el destino es un fallo de uno de cada tres en paralelo, y de los
+/// que ensenan un test roto que no lo esta. Por eso el torniquete vive aqui,
+/// debajo de los dos, y no en el modulo de tests de ninguno.
+#[cfg(test)]
+pub(crate) static TEST_TURNSTILE: Mutex<()> = Mutex::new(());
+
+/// Desinstala el destino. Solo para los tests: en marcha el destino lo pone
+/// `kernel-hal` una vez y no se quita.
+#[cfg(test)]
+pub(crate) fn clear_sink() {
+    *SINK.lock() = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,11 +104,6 @@ mod tests {
     use crate::DeviceResult;
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicUsize, Ordering};
-
-    /// `SINK` is one global for the whole process, so these tests take turns.
-    /// There is nothing to be gained from running them together and the
-    /// install is by definition shared state.
-    static TURNSTILE: Mutex<()> = Mutex::new(());
 
     /// What the installed sink saw. The sink is a plain `fn` pointer (that is
     /// what lets the static be built in `const`), so it cannot capture: the
@@ -107,7 +121,7 @@ mod tests {
 
     impl Alone {
         fn new() -> Self {
-            let g = TURNSTILE.lock();
+            let g = TEST_TURNSTILE.lock();
             clear();
             Self(g)
         }
@@ -120,7 +134,7 @@ mod tests {
     }
 
     fn clear() {
-        *SINK.lock() = None;
+        clear_sink();
         ADDED.store(0, Ordering::SeqCst);
         REMOVED.store(0, Ordering::SeqCst);
         LAST_ADDED.store(0, Ordering::SeqCst);
