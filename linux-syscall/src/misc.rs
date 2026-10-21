@@ -5,8 +5,8 @@ use futures::future::{select, Either};
 use futures::{pin_mut, poll};
 use kernel_hal::timer::timer_now;
 use linux_object::process::{
-    check_signals_of, SignalPark, CAP_SYSLOG, CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_NICE,
-    CAP_SYS_RESOURCE,
+    check_signals_of, Capabilities, SignalPark, CAP_FULL_SET, CAP_SYSLOG, CAP_SYS_ADMIN,
+    CAP_SYS_BOOT, CAP_SYS_NICE, CAP_SYS_RESOURCE,
 };
 use linux_object::thread::ThreadExt;
 use linux_object::time::*;
@@ -280,10 +280,10 @@ impl Syscall<'_> {
     ///
     /// Implements the header version-negotiation protocol from
     /// `linux/capability.h`: an unrecognised version gets the preferred one
-    /// (V3) written back plus `EINVAL`, which is how libcap probes. Every
-    /// process running as root reports the full capability set; anything else
-    /// reports empty sets. Tools like `ping` and container runtimes check
-    /// themselves with this before attempting privileged operations.
+    /// (V3) written back plus `EINVAL`, which is how libcap probes. It reports
+    /// the sets the process keeps, the ones every privilege check asks. Tools
+    /// like `ping` and container runtimes check themselves with this before
+    /// attempting privileged operations.
     pub fn sys_capget(
         &self,
         mut header: UserInOutPtr<CapUserHeader>,
@@ -302,23 +302,17 @@ impl Syscall<'_> {
             None => return Ok(0),
         };
         // `cap_get_target_pid`: the caller's own sets, or those of the task
-        // `pid` names, which must exist (`ESRCH`). Built out of the same
-        // predicate every gate asks, so what this publishes and what the
-        // kernel honours cannot drift apart.
-        let euid = if capget_names_the_caller(hdr.pid, self.zircon_process().id()) {
-            self.linux_process().euid()
+        // `pid` names, which must exist (`ESRCH`). The very sets every gate
+        // asks, so what this publishes and what the kernel honours cannot
+        // drift apart.
+        let caps = if capget_names_the_caller(hdr.pid, self.zircon_process().id()) {
+            self.linux_process().capabilities()
         } else {
             process_of_task(hdr.pid as KoID)
-                .and_then(|p| p.try_linux().map(|lp| lp.euid()))
+                .and_then(|p| p.try_linux().map(|lp| lp.capabilities()))
                 .ok_or(LxError::ESRCH)?
         };
-        let caps = linux_object::process::published_capabilities(euid);
-        let mut out = [CapUserData::default(); 2];
-        out[0].effective = caps as u32;
-        out[0].permitted = caps as u32;
-        out[1].effective = (caps >> 32) as u32;
-        out[1].permitted = (caps >> 32) as u32;
-        data.write_array(&out[..elems])?;
+        data.write_array(&cap_user_data(&caps)[..elems])?;
         Ok(0)
     }
 
@@ -330,13 +324,10 @@ impl Syscall<'_> {
     /// call may only affect the caller (`EPERM` for any other pid, negative
     /// ones included: there is no `EINVAL` for a bad pid here, unlike
     /// `capget`), and the new sets must fit inside the old ones
-    /// ([`capset_sets_verdict`]). A set that passes is then accepted without
-    /// being stored: every root process holds the full set here and there is
-    /// no privilege machinery for a reduced set to constrain, so a daemon
-    /// dropping capabilities proceeds as if it worked, which on this
-    /// single-user kernel it effectively has. What is refused is what Linux
-    /// refuses: an unprivileged process granting itself capabilities, or
-    /// anyone making effective what is not permitted.
+    /// ([`capset_sets_verdict`]). Sets that pass become the process's own,
+    /// and every privilege check asks them from then on. They used to be
+    /// checked and thrown away: a root daemon that put `CAP_DAC_OVERRIDE`
+    /// down still read every file.
     pub fn sys_capset(
         &self,
         mut header: UserInOutPtr<CapUserHeader>,
@@ -356,16 +347,8 @@ impl Syscall<'_> {
         };
         capset_target(hdr.pid, self.zircon_process().id())?;
         let new = CapSets::from_user(&data.read_array(elems)?);
-        // What this process holds now: the published set is both its
-        // permitted and its effective set, nothing is inheritable, and the
-        // bounding set is every capability (`PR_CAPBSET_READ` says so).
-        let held = linux_object::process::published_capabilities(self.linux_process().euid());
-        let old = CapSets {
-            effective: held,
-            permitted: held,
-            inheritable: 0,
-        };
-        capset_sets_verdict(&old, CAP_FULL_SET, &new)?;
+        self.linux_process()
+            .change_capabilities(|caps| capset_apply(caps, &new))?;
         Ok(0)
     }
 
@@ -1185,10 +1168,6 @@ fn cap_version_elems(version: u32) -> Option<usize> {
     }
 }
 
-/// Every capability there is: the bounding set of a process nothing has
-/// ever narrowed (`CAP_FULL_SET`).
-const CAP_FULL_SET: u64 = (1u64 << (linux_object::process::CAP_LAST_CAP + 1)) - 1;
-
 /// What `capget(2)` does before it looks at any process, from
 /// `SYSCALL_DEFINE2(capget)`:
 ///
@@ -1401,7 +1380,10 @@ fn capset_target(pid: i32, self_pid: KoID) -> LxResult {
 /// The three capability sets as 64-bit masks, assembled from the one or two
 /// `CapUserData` elements the negotiated version transfers. Version 1
 /// sends one element, and the upper 32 bits are then zero (the kernel:
-/// `if (i < tocopy) ... else effective.val |= 0`).
+/// `if (i < tocopy) ... else effective.val |= 0`), so a version 1 `capset`
+/// drops capabilities 32 and up. A bit past `CAP_LAST_CAP` is not a
+/// capability and is dropped (`mk_kernel_cap`: `& CAP_VALID_MASK`): on Linux
+/// 6.18 root's `capset` with bit 41 set in each set answers 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CapSets {
     effective: u64,
@@ -1422,8 +1404,24 @@ impl CapSets {
             sets.permitted |= (elem.permitted as u64) << shift;
             sets.inheritable |= (elem.inheritable as u64) << shift;
         }
+        sets.effective &= CAP_FULL_SET;
+        sets.permitted &= CAP_FULL_SET;
+        sets.inheritable &= CAP_FULL_SET;
         sets
     }
+}
+
+/// The two `CapUserData` elements `capget(2)` writes for `caps`, low half
+/// first; a version 1 caller is handed the first one only.
+fn cap_user_data(caps: &Capabilities) -> [CapUserData; 2] {
+    let mut out = [CapUserData::default(); 2];
+    for (i, elem) in out.iter_mut().enumerate() {
+        let shift = 32 * i as u32;
+        elem.effective = (caps.effective >> shift) as u32;
+        elem.permitted = (caps.permitted >> shift) as u32;
+        elem.inheritable = (caps.inheritable >> shift) as u32;
+    }
+    out
 }
 
 /// `cap_capset` (`security/commoncap.c`): may a process holding `old`, with
@@ -1458,6 +1456,22 @@ fn capset_sets_verdict(old: &CapSets, bset: u64, new: &CapSets) -> LxResult {
     if !subset(new.effective, new.permitted) {
         return Err(LxError::EPERM);
     }
+    Ok(())
+}
+
+/// `capset(2)` on `caps`: [`capset_sets_verdict`] against the sets they
+/// hold now and their bounding set, then the three sets asked for. The
+/// bounding set is not one of them.
+fn capset_apply(caps: &mut Capabilities, new: &CapSets) -> LxResult {
+    let old = CapSets {
+        effective: caps.effective,
+        permitted: caps.permitted,
+        inheritable: caps.inheritable,
+    };
+    capset_sets_verdict(&old, caps.bounding, new)?;
+    caps.effective = new.effective;
+    caps.permitted = new.permitted;
+    caps.inheritable = new.inheritable;
     Ok(())
 }
 
@@ -2050,6 +2064,117 @@ mod capability_tests {
     }
 
     #[test]
+    fn a_bit_past_the_last_capability_is_dropped_before_the_verdict_sees_it() {
+        // Linux 6.18: root's `capset` with bit 41 set in each set answers 0
+        // (`mk_kernel_cap` keeps `CAP_VALID_MASK`), where the verdict alone
+        // would call bit 41 a gain.
+        let low = CapUserData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        };
+        let past = CapUserData {
+            effective: 1 << 9,
+            permitted: 1 << 9,
+            inheritable: 1 << 18,
+        };
+        assert_eq!(
+            CapSets::from_user(&[low, past]),
+            CapSets {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0
+            }
+        );
+        let all = CapUserData {
+            effective: u32::MAX,
+            permitted: u32::MAX,
+            inheritable: u32::MAX,
+        };
+        let sets = CapSets::from_user(&[all, all]);
+        assert_eq!(
+            (sets.effective, sets.permitted, sets.inheritable),
+            (CAP_FULL_SET, CAP_FULL_SET, CAP_FULL_SET)
+        );
+    }
+
+    /// What Linux 6.18 did with root's `capset`, in the order the probe ran
+    /// it: CAP_CHOWN out of the effective set and back, then out of the
+    /// permitted set for good.
+    #[test]
+    fn capset_keeps_what_it_allows_and_nothing_it_refuses() {
+        const CHOWN: u64 = 1;
+        let mut caps = Capabilities::ROOT;
+        let drop_eff = sets(CAP_FULL_SET & !CHOWN, CAP_FULL_SET, 0);
+        assert_eq!(capset_apply(&mut caps, &drop_eff), Ok(()));
+        assert_eq!(caps.effective, CAP_FULL_SET & !CHOWN);
+        assert_eq!(caps.permitted, CAP_FULL_SET);
+        assert_eq!(
+            capset_apply(&mut caps, &sets(CAP_FULL_SET, CAP_FULL_SET, 0)),
+            Ok(())
+        );
+        assert_eq!(caps, Capabilities::ROOT);
+
+        let gone = sets(CAP_FULL_SET & !CHOWN, CAP_FULL_SET & !CHOWN, 0);
+        assert_eq!(capset_apply(&mut caps, &gone), Ok(()));
+        let after = caps;
+        // Effective back: EPERM; permitted back: EPERM; neither moves a bit.
+        assert_eq!(
+            capset_apply(&mut caps, &sets(CAP_FULL_SET, CAP_FULL_SET & !CHOWN, 0)),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(
+            capset_apply(&mut caps, &sets(CAP_FULL_SET & !CHOWN, CAP_FULL_SET, 0)),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(caps, after);
+        assert_eq!(
+            caps.bounding, CAP_FULL_SET,
+            "capset leaves the bounding set alone"
+        );
+    }
+
+    /// `PR_CAPBSET_DROP(CAP_CHOWN)`, then `capset(FULL, FULL, CAP_CHOWN)`:
+    /// EPERM on Linux 6.18, because the bounding set no longer has it and
+    /// it was not inheritable before.
+    #[test]
+    fn capset_asks_the_process_s_own_bounding_set() {
+        let mut caps = Capabilities {
+            bounding: CAP_FULL_SET & !1,
+            ..Capabilities::ROOT
+        };
+        assert_eq!(
+            capset_apply(&mut caps, &sets(CAP_FULL_SET, CAP_FULL_SET, 1)),
+            Err(LxError::EPERM)
+        );
+        assert_eq!(caps.inheritable, 0);
+        assert_eq!(
+            capset_apply(&mut caps, &sets(CAP_FULL_SET, CAP_FULL_SET, 2)),
+            Ok(())
+        );
+        assert_eq!(caps.inheritable, 2);
+    }
+
+    #[test]
+    fn capget_writes_each_of_the_three_sets_low_half_first() {
+        let caps = Capabilities {
+            effective: 0x1_0000_0002,
+            permitted: 0x1ff_0000_0003,
+            inheritable: 0x100_0000_0004,
+            bounding: 0,
+        };
+        let out = cap_user_data(&caps);
+        assert_eq!(
+            (out[0].effective, out[0].permitted, out[0].inheritable),
+            (2, 3, 4)
+        );
+        assert_eq!(
+            (out[1].effective, out[1].permitted, out[1].inheritable),
+            (1, 0x1ff, 0x100)
+        );
+    }
+
+    #[test]
     fn the_full_set_is_every_capability_up_to_cap_last_cap() {
         use linux_object::process::CAP_LAST_CAP;
         assert_eq!(CAP_FULL_SET.count_ones(), CAP_LAST_CAP + 1);
@@ -2091,7 +2216,8 @@ mod capability_tests {
             Err(LxError::EPERM)
         );
         // A permitted bit outside the old permitted set is a gain for root
-        // too: bit 41 is above CAP_LAST_CAP and root does not hold it.
+        // too: bit 41 is above CAP_LAST_CAP and root does not hold it. The
+        // syscall never hands the verdict one: `from_user` drops it.
         assert_eq!(
             capset_sets_verdict(&root, CAP_FULL_SET, &sets(0, 1 << 41, 0)),
             Err(LxError::EPERM)

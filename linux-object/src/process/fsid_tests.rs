@@ -42,6 +42,7 @@ fn creds(ruid: u32, euid: u32, suid: u32) -> Credentials {
         fsgid: euid,
         groups: Vec::new(),
         umask: 0o022,
+        caps: Capabilities::for_uids(ruid, euid, suid),
     }
 }
 
@@ -326,6 +327,8 @@ fn a_files_permission_bits_are_weighed_against_the_filesystem_id() {
     let mut root = creds(ROOT_UID, ROOT_UID, ROOT_UID);
     root.fsuid = REAL;
     root.fsgid = REAL;
+    // And the filesystem capabilities with it, as `setfsuid` does.
+    root.caps.follow_setfsuid(ROOT_UID, REAL);
     assert_eq!(
         LinuxProcess::access_verdict(&root, OTHER, OTHER, 0o600, false, ACCESS_WRITE, true),
         Err(LxError::EACCES)
@@ -390,6 +393,7 @@ fn a_chmod_is_refused_to_a_filesystem_id_that_does_not_own_the_file() {
     // `inode_owner_or_capable()`: `vfsuid_eq_kuid(vfsuid, current_fsuid())`.
     let mut root = creds(ROOT_UID, ROOT_UID, ROOT_UID);
     root.fsuid = REAL;
+    root.caps.follow_setfsuid(ROOT_UID, REAL);
     assert_eq!(
         LinuxProcess::chmod_bits(&root, OTHER, OTHER, 0o644, 0o600),
         Err(LxError::EPERM)
@@ -577,6 +581,17 @@ fn root_may_still_ask_for_it() {
     proc.initialize_created_metadata(&inode, Some(&a_shared_directory(SPOOL)), 0o2755, false)
         .unwrap();
     assert_eq!(inode.metadata().unwrap().mode & 0o7777, 0o2755);
+    // It is the capability, not the uid: root that put CAP_FSETID down is
+    // outside the group like anybody else.
+    proc.change_capabilities(|caps| {
+        caps.effective &= !(1 << CAP_FSETID);
+        Ok(())
+    })
+    .unwrap();
+    let inode: Arc<dyn INode> = Owned::new();
+    proc.initialize_created_metadata(&inode, Some(&a_shared_directory(SPOOL)), 0o2755, false)
+        .unwrap();
+    assert_eq!(inode.metadata().unwrap().mode & 0o7777, 0o0755);
 }
 
 /// An inode whose stored mode already carries its file type, the way a real

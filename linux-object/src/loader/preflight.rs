@@ -691,6 +691,7 @@ mod tests {
             sgid: 1000,
             fsgid: 1000,
             groups: vec![1000],
+            caps: crate::process::Capabilities::for_uids(1000, 1000, 1000),
             ..Credentials::default()
         };
         assert_eq!(fs.exec_as("script", &stranger), Err(LxError::EACCES));

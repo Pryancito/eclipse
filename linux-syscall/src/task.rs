@@ -12,9 +12,9 @@ use kernel_hal::context::{UserContext, UserContextField};
 use linux_object::error::LxResult;
 use linux_object::fs::{FileLike, PidFd};
 use linux_object::process::{
-    killable_on, prio_target, wait_child_any_interest, wait_child_interest, Credentials,
-    LinuxProcess, PrioTarget, SchedFacts, SchedRequest, WaitInterest, CAP_LAST_CAP, CAP_SETGID,
-    RLIMIT_NICE, RLIMIT_RTPRIO,
+    killable_on, prio_target, wait_child_any_interest, wait_child_interest, Capabilities,
+    Credentials, LinuxProcess, PrioTarget, SchedFacts, SchedRequest, WaitInterest, CAP_LAST_CAP,
+    CAP_SETGID, RLIMIT_NICE, RLIMIT_RTPRIO,
 };
 use linux_object::signal::SigInfo;
 use linux_object::thread::{CurrentThreadExt, RobustList, ThreadExt};
@@ -238,6 +238,16 @@ pub(crate) fn capbset_drop_verdict(cap: usize, may_set_pcap: bool) -> LxResult<(
     if cap > CAP_LAST_CAP as usize {
         return Err(LxError::EINVAL);
     }
+    Ok(())
+}
+
+/// `PR_CAPBSET_DROP` on `caps`: [`capbset_drop_verdict`] against the
+/// effective set, then `cap` out of the bounding set alone
+/// (`cap_prctl_drop`: `cap_lower(new->cap_bset, cap)`). The permitted set
+/// keeps it until the next exec, as on Linux 6.18.
+pub(crate) fn capbset_drop(caps: &mut Capabilities, cap: usize) -> LxResult<()> {
+    capbset_drop_verdict(cap, caps.has(linux_object::process::CAP_SETPCAP))?;
+    caps.bounding &= !(1u64 << cap);
     Ok(())
 }
 
@@ -2565,15 +2575,10 @@ impl Syscall<'_> {
                 if a2 > CAP_LAST_CAP as usize {
                     return Err(LxError::EINVAL);
                 }
-                // Root-run kernel: every valid capability is in the bounding
-                // set (consistent with sys_capget).
-                Ok(1)
+                Ok(proc.capabilities().bounds(a2 as u32) as usize)
             }
             PR_CAPBSET_DROP => {
-                capbset_drop_verdict(a2, proc.capable(linux_object::process::CAP_SETPCAP))?;
-                // There is no stored bounding set to shrink; accepting keeps
-                // privilege-dropping daemons on their happy path, consistent
-                // with sys_capset.
+                proc.change_capabilities(|caps| capbset_drop(caps, a2))?;
                 Ok(0)
             }
             PR_SET_TIMERSLACK => {

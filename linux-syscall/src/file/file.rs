@@ -198,7 +198,7 @@ impl linux_object::fs::FsIoctlContext for FsIoctlCtx<'_> {
     }
 
     fn capable(&self, cap: u32) -> bool {
-        linux_object::process::has_capability(self.proc.euid(), cap)
+        self.proc.capable(cap)
     }
 
     fn euid(&self) -> u32 {
