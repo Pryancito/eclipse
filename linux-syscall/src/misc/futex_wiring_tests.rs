@@ -695,6 +695,28 @@ fn an_uncontended_priority_lock_takes_the_word_and_gives_it_back() {
                 0x1234,
                 "a refused PI operation wrote to the word anyway"
             );
+            // `FUTEX_TRYLOCK_PI` never sleeps, so it never reads the
+            // timeout either: a `timespec` that names no duration at all is
+            // nothing to it.
+            let nonsense = TimeSpec {
+                sec: 0,
+                nsec: 2_000_000_000,
+            };
+            let at = &nonsense as *const TimeSpec as usize;
+            assert_eq!(
+                futex(
+                    sys,
+                    somebody_elses,
+                    FUTEX_TRYLOCK_PI | FUTEX_PRIVATE_FLAG,
+                    0,
+                    at,
+                    0,
+                    0
+                )
+                .await,
+                Err(LxError::EAGAIN),
+                "a try-lock read a timeout it never uses"
+            );
             // `FUTEX_LOCK_PI2` is the same acquire on its own clock, and
             // the third name in the arm.
             assert_eq!(
@@ -811,13 +833,23 @@ fn a_requeue_wakes_the_count_it_was_given_and_moves_the_rest_to_the_word_it_name
     let elsewhere = a_futex_word(0);
     let from = addr_of(word);
     let to = addr_of(elsewhere);
+    // Three waiters and two DIFFERENT counts, so the number to wake and
+    // the number to move cannot pass for one another.
     let untimed = a_waiter(&proc, from, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, None);
-    let timed = a_waiter(
-        &proc,
-        from,
-        FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
-        Some(Duration::from_secs(10)),
-    );
+    let timed = [
+        a_waiter(
+            &proc,
+            from,
+            FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+            Some(Duration::from_secs(10)),
+        ),
+        a_waiter(
+            &proc,
+            from,
+            FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+            Some(Duration::from_secs(10)),
+        ),
+    ];
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
             nobody_is_woken_while_the_count_is_zero(sys, from).await;
@@ -827,32 +859,36 @@ fn a_requeue_wakes_the_count_it_was_given_and_moves_the_rest_to_the_word_it_name
                     from,
                     FUTEX_CMP_REQUEUE | FUTEX_PRIVATE_FLAG,
                     1,
-                    1,
+                    2,
                     to,
                     0
                 )
                 .await,
-                Ok(2),
-                "one woken and one moved is two waiters accounted for"
+                Ok(3),
+                "one woken and two moved is three waiters accounted for"
             );
             // The source queue is empty now: one left through the wake and
-            // one left through the move.
+            // two through the move.
             assert_eq!(
-                futex(sys, from, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 2, 0, 0, 0).await,
+                futex(sys, from, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 3, 0, 0, 0).await,
                 Ok(0),
                 "somebody was still on the word the requeue emptied"
             );
-            // And the one that moved is on the target, reachable by a wake
-            // addressed to it.
+            // And the two that moved are both on the target word. The move
+            // happens inside the requeue call, so they are there already
+            // and there is nothing to wait for: a wake addressed to the
+            // target finds exactly the two of them.
             assert_eq!(
-                a_wake_that_finds_somebody(sys, to, 1).await,
-                Some(1),
-                "the waiter the requeue moved was not on the target word"
+                futex(sys, to, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 3, 0, 0, 0).await,
+                Ok(2),
+                "the waiters the requeue moved were not both on the target"
             );
         })
     });
     assert_eq!(untimed.join().unwrap(), Ok(0), "the untimed waiter");
-    assert_eq!(timed.join().unwrap(), Ok(0), "the timed waiter");
+    for (n, waiter) in IntoIterator::into_iter(timed).enumerate() {
+        assert_eq!(waiter.join().unwrap(), Ok(0), "timed waiter {}", n);
+    }
 }
 
 /// The six arguments reach `sys_futex` in the order the syscall table hands
@@ -1037,6 +1073,182 @@ fn every_futex_call_whose_operation_was_understood_is_counted() {
                 "{} calls counted {} descents of the address space",
                 2 * EACH,
                 now_walks - walks
+            );
+        })
+    });
+}
+
+/// A thread of `proc` contending for the PI lock at `addr`, on its own host
+/// thread, answering with what it got and which tid it is.
+///
+/// Its own tid is the point: what the word holds after the hand-off is the
+/// claim this makes, and only the thread that took it knows the number.
+fn a_pi_waiter(proc: &Arc<Process>, addr: usize) -> std::thread::JoinHandle<(SysResult, i32)> {
+    let proc = proc.clone();
+    std::thread::spawn(move || {
+        on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let tid = (sys.thread.id() as i32) & FUTEX_TID_MASK;
+                let got = futex(sys, addr, FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0).await;
+                (got, tid)
+            })
+        })
+    })
+}
+
+/// A contended PI lock publishes `FUTEX_WAITERS` in the word, and the
+/// owner's unlock passes the word on with that mark still in it.
+///
+/// This is the half of the protocol a single thread cannot reach, and the
+/// mark is the whole of why the unlock has to come to the kernel at all: a
+/// word that does not carry it is released by a userspace compare-and-swap
+/// and the thread queued behind it is never woken. After the hand-off the
+/// word names its new owner AND still says somebody was queued, because the
+/// acquire keeps the flag bits it found rather than overwriting the word.
+///
+/// The test knows the waiter is queued by watching for that mark rather
+/// than by sleeping for a while: the bit appearing is the waiter's own
+/// announcement that it is about to park.
+#[test]
+fn a_contended_priority_lock_passes_the_word_from_its_owner_to_the_waiter() {
+    let proc = a_process(47_271, "futex-pi-pair");
+    let word = a_futex_word(0);
+    let addr = addr_of(word);
+    let theirs = proc.clone();
+    let waiter = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let tid = (sys.thread.id() as i32) & FUTEX_TID_MASK;
+            assert_eq!(
+                futex(sys, addr, FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0).await,
+                Ok(0),
+                "the uncontended acquire this test starts from"
+            );
+            // Only now that the word is held can anybody contend for it.
+            let waiter = a_pi_waiter(&theirs, addr);
+            let mut queued = false;
+            for _ in 0..TRIES {
+                if word.load(Ordering::SeqCst) & FUTEX_WAITERS != 0 {
+                    queued = true;
+                    break;
+                }
+                async_std::task::sleep(A_MOMENT).await;
+            }
+            assert!(
+                queued,
+                "the contending thread never marked the word: {:#x}",
+                word.load(Ordering::SeqCst)
+            );
+            assert_eq!(
+                word.load(Ordering::SeqCst),
+                tid | FUTEX_WAITERS,
+                "the mark did not go in beside the owner that is still there"
+            );
+            assert_eq!(
+                futex(sys, addr, FUTEX_UNLOCK_PI | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0).await,
+                Ok(0),
+                "the owner's unlock with somebody queued"
+            );
+            waiter
+        })
+    });
+    let (got, their_tid) = waiter.join().unwrap();
+    assert_eq!(got, Ok(0), "the thread that waited for the lock");
+    assert_ne!(their_tid, 0, "a thread with tid 0 cannot own a PI lock");
+    assert_eq!(
+        word.load(Ordering::SeqCst),
+        their_tid | FUTEX_WAITERS,
+        "the word did not pass to the waiter with its mark still on it"
+    );
+}
+
+/// Which clock a PI lock's absolute deadline is a point on is decided by
+/// the command, not by the caller: `FUTEX_LOCK_PI` always reads it on the
+/// wall clock, `FUTEX_LOCK_PI2` on the monotonic one unless
+/// `FUTEX_CLOCK_REALTIME` says otherwise.
+///
+/// `FUTEX_LOCK_PI` predates the flag and could never carry it, which is
+/// exactly why its clock is not negotiable and why nothing but a timed
+/// contended lock can show which one it used. One deadline tells all three
+/// readings apart: a point a second and a half ahead of the monotonic clock
+/// is decades past on the wall clock.
+#[test]
+fn a_contended_priority_lock_times_out_on_the_clock_its_command_chooses() {
+    let proc = a_process(47_272, "futex-pi-clock");
+    // One word per case: a lock that timed out leaves its mark behind.
+    let on_the_wall = addr_of(a_futex_word(0x1234));
+    let on_the_tick = addr_of(a_futex_word(0x1234));
+    let told_otherwise = addr_of(a_futex_word(0x1234));
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let wall = Duration::from(TimeSpec::now());
+            let mono = Duration::from(TimeSpec::now_monotonic());
+            assert!(
+                wall > mono + A_TIMEOUT,
+                "the wall clock {:?} is not past the monotonic one {:?}",
+                wall,
+                mono
+            );
+            let deadline = TimeSpec::from_duration(mono + A_TIMEOUT);
+            let at = &deadline as *const TimeSpec as usize;
+            let started = std::time::Instant::now();
+            assert_eq!(
+                futex(
+                    sys,
+                    on_the_wall,
+                    FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG,
+                    0,
+                    at,
+                    0,
+                    0
+                )
+                .await,
+                Err(LxError::ETIMEDOUT),
+                "a LOCK_PI on a word another thread holds"
+            );
+            assert!(
+                started.elapsed() < HALFWAY,
+                "LOCK_PI read its deadline on the monotonic clock: {:?}",
+                started.elapsed()
+            );
+            let started = std::time::Instant::now();
+            assert_eq!(
+                futex(
+                    sys,
+                    on_the_tick,
+                    FUTEX_LOCK_PI2 | FUTEX_PRIVATE_FLAG,
+                    0,
+                    at,
+                    0,
+                    0
+                )
+                .await,
+                Err(LxError::ETIMEDOUT),
+                "a LOCK_PI2 on a word another thread holds"
+            );
+            assert!(
+                started.elapsed() >= HALFWAY,
+                "LOCK_PI2 read its deadline on the wall clock: {:?}",
+                started.elapsed()
+            );
+            let started = std::time::Instant::now();
+            assert_eq!(
+                futex(
+                    sys,
+                    told_otherwise,
+                    FUTEX_LOCK_PI2 | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME,
+                    0,
+                    at,
+                    0,
+                    0
+                )
+                .await,
+                Err(LxError::ETIMEDOUT),
+                "a LOCK_PI2 told to use the wall clock"
+            );
+            assert!(
+                started.elapsed() < HALFWAY,
+                "FUTEX_CLOCK_REALTIME did not change the clock: {:?}",
+                started.elapsed()
             );
         })
     });
