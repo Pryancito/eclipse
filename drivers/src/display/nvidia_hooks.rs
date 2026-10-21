@@ -11,7 +11,9 @@
 //! bus=device=function=0 location never collides with 0/null.
 
 use crate::builder::IoMapper;
-use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+#[cfg(not(test))]
+use crate::bus::pci::PortOpsImpl;
+use crate::bus::pci::PCI_ACCESS;
 use crate::bus::{drivers_timer_now_as_micros, phys_to_virt};
 use alloc::sync::Arc;
 use core::hint::spin_loop;
@@ -30,6 +32,19 @@ fn decode_handle(handle: usize) -> Location {
         device: ((handle >> 8) & 0xFF) as u8,
         function: (handle & 0xFF) as u8,
     }
+}
+
+/// The port I/O the hooks go through: the real `in`/`out` of
+/// [`PortOpsImpl`] in the kernel, and under test a double that records every
+/// access and answers what the test loaded, because an `in` instruction in a
+/// host process is a fault, not a read.
+#[cfg(not(test))]
+fn port_ops() -> &'static PortOpsImpl {
+    &PortOpsImpl
+}
+#[cfg(test)]
+fn port_ops() -> &'static fake_ports::FakePorts {
+    &fake_ports::PORTS
 }
 
 pub struct EclipseNvrmHooks {
@@ -103,7 +118,7 @@ fn udelay(us: u64) {
 impl KernelHooks for EclipseNvrmHooks {
     fn pci_config_read(&self, pci_handle: usize, offset: u32, len: u32) -> u32 {
         let loc = decode_handle(pci_handle);
-        let ops = &PortOpsImpl;
+        let ops = port_ops();
         unsafe {
             match len {
                 1 => PCI_ACCESS.read8(ops, loc, offset as u16) as u32,
@@ -115,7 +130,7 @@ impl KernelHooks for EclipseNvrmHooks {
 
     fn pci_config_write(&self, pci_handle: usize, offset: u32, len: u32, value: u32) {
         let loc = decode_handle(pci_handle);
-        let ops = &PortOpsImpl;
+        let ops = port_ops();
         unsafe {
             match len {
                 1 => PCI_ACCESS.write8(ops, loc, offset as u16, value as u8),
@@ -143,7 +158,7 @@ impl KernelHooks for EclipseNvrmHooks {
     }
 
     fn io_read(&self, port: u32, len: u32) -> u32 {
-        let ops = &PortOpsImpl;
+        let ops = port_ops();
         unsafe {
             match len {
                 1 => ops.read8(port as u16) as u32,
@@ -154,7 +169,7 @@ impl KernelHooks for EclipseNvrmHooks {
     }
 
     fn io_write(&self, port: u32, len: u32, value: u32) {
-        let ops = &PortOpsImpl;
+        let ops = port_ops();
         unsafe {
             match len {
                 1 => ops.write8(port as u16, value as u8),
@@ -184,6 +199,59 @@ pub fn install(mapper: &Option<Arc<dyn IoMapper>>) {
         ECLIPSE_NVRM_HOOKS.set_mapper(m.clone());
     }
     nvidia_rm_sys::hooks::register_hooks(&ECLIPSE_NVRM_HOOKS);
+}
+
+/// The port I/O double behind [`port_ops`] under test: every access lands in
+/// `log` as `(read, port, len, value)`, and every read answers `answer`.
+/// Process-global like the real ports, so a test that uses it holds
+/// `crate::test_globals::LOCK` and empties the log first.
+#[cfg(test)]
+pub(super) mod fake_ports {
+    use alloc::vec::Vec;
+    use lock::Mutex;
+    use pci::PortOps;
+
+    pub(super) struct FakePorts {
+        pub log: Mutex<Vec<(bool, u32, u32, u32)>>,
+        pub answer: Mutex<u32>,
+    }
+
+    pub(super) static PORTS: FakePorts = FakePorts {
+        log: Mutex::new(Vec::new()),
+        answer: Mutex::new(0),
+    };
+
+    impl FakePorts {
+        fn read(&self, port: u32, len: u32) -> u32 {
+            let v = *self.answer.lock();
+            self.log.lock().push((true, port, len, v));
+            v
+        }
+        fn write(&self, port: u32, len: u32, v: u32) {
+            self.log.lock().push((false, port, len, v));
+        }
+    }
+
+    impl PortOps for FakePorts {
+        unsafe fn read8(&self, port: u16) -> u8 {
+            self.read(port as u32, 1) as u8
+        }
+        unsafe fn read16(&self, port: u16) -> u16 {
+            self.read(port as u32, 2) as u16
+        }
+        unsafe fn read32(&self, port: u32) -> u32 {
+            self.read(port, 4)
+        }
+        unsafe fn write8(&self, port: u16, val: u8) {
+            self.write(port as u32, 1, val as u32)
+        }
+        unsafe fn write16(&self, port: u16, val: u16) {
+            self.write(port as u32, 2, val as u32)
+        }
+        unsafe fn write32(&self, port: u32, val: u32) {
+            self.write(port, 4, val)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -352,5 +420,232 @@ mod nvidia_hooks_tests {
         // It came back, and it came back past the wrap rather than before it.
         assert!(test_clock::now() < 100, "the wait did not cross the wrap");
         test_clock::set(0);
+    }
+
+    /// A delay on a timer that never moves cannot end by the clock, and the
+    /// RM asks for them with interrupts off: it gives up after the reading has
+    /// stayed identical for ten million spins, and says so, instead of
+    /// hanging the CPU for good.
+    #[test]
+    fn a_delay_on_a_frozen_timer_gives_up_instead_of_hanging() {
+        test_clock::set_auto_advance(0);
+        test_clock::set(7);
+        udelay(10);
+        assert_eq!(
+            test_clock::now(),
+            7,
+            "the clock never moved, and it came back"
+        );
+        test_clock::set(0);
+    }
+
+    use crate::builder::IoMapper;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// An `IoMapper` that answers `paddr + OFFSET` for what it was asked to
+    /// map, or nothing when `refuse` is set, and counts the calls.
+    struct FakeMapper {
+        calls: AtomicUsize,
+        refuse: bool,
+    }
+    const OFFSET: usize = 0xFFFF_8000_0000_0000;
+    impl IoMapper for FakeMapper {
+        fn query_or_map(&self, paddr: usize, size: usize) -> Option<usize> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(size, 0x1000, "the size asked for is the size mapped");
+            (!self.refuse).then(|| paddr + OFFSET)
+        }
+    }
+
+    /// The RM maps its registers through the kernel's `IoMapper` once one has
+    /// been stashed; before that, or when the mapper has nothing for the
+    /// range, through the identity window `phys_to_virt`. Unmapping is a
+    /// no-op: device mappings live as long as the kernel.
+    #[test]
+    fn registers_are_mapped_through_the_stashed_mapper_or_the_identity_window() {
+        let hooks = EclipseNvrmHooks::new();
+        assert_eq!(
+            hooks.map_kernel_space(0xF000_0000, 0x1000),
+            0xF000_0000,
+            "no mapper yet: phys_to_virt, the identity on the host"
+        );
+        let mapper = Arc::new(FakeMapper {
+            calls: AtomicUsize::new(0),
+            refuse: false,
+        });
+        hooks.set_mapper(mapper.clone());
+        assert_eq!(
+            hooks.map_kernel_space(0xF000_0000, 0x1000),
+            (0xF000_0000 + OFFSET) as u64
+        );
+        assert_eq!(mapper.calls.load(Ordering::Relaxed), 1);
+        hooks.set_mapper(Arc::new(FakeMapper {
+            calls: AtomicUsize::new(0),
+            refuse: true,
+        }));
+        assert_eq!(
+            hooks.map_kernel_space(0xF000_0000, 0x1000),
+            0xF000_0000,
+            "a mapper with nothing for the range: the identity window"
+        );
+        hooks.unmap_kernel_space(0xF000_0000, 0x1000);
+    }
+
+    fn ports_log() -> Vec<(bool, u32, u32, u32)> {
+        fake_ports::PORTS.log.lock().drain(..).collect()
+    }
+
+    /// Legacy port I/O goes straight to the port with the width asked for:
+    /// 1, 2 or 4 bytes, and anything else is a dword, as `os_io_*` in the
+    /// RM's OS layer has it.
+    #[test]
+    fn port_io_goes_to_the_port_with_the_width_asked_for() {
+        let _serialised = crate::test_globals::LOCK.lock();
+        let hooks = EclipseNvrmHooks::new();
+        *fake_ports::PORTS.answer.lock() = 0x1122_3344;
+        ports_log();
+        assert_eq!(hooks.io_read(0x3C4, 1), 0x44, "a byte, as a byte");
+        assert_eq!(hooks.io_read(0x3C4, 2), 0x3344);
+        assert_eq!(hooks.io_read(0x3C4, 4), 0x1122_3344);
+        assert_eq!(
+            hooks.io_read(0x3C4, 3),
+            0x1122_3344,
+            "any other width is a dword"
+        );
+        hooks.io_write(0x3C5, 1, 0xAB);
+        hooks.io_write(0x3C5, 2, 0xCDEF);
+        hooks.io_write(0x3C5, 4, 0xCAFE_BABE);
+        hooks.io_write(0x3C5, 8, 0xDEAD_BEEF);
+        assert_eq!(
+            ports_log(),
+            [
+                (true, 0x3C4, 1, 0x1122_3344),
+                (true, 0x3C4, 2, 0x1122_3344),
+                (true, 0x3C4, 4, 0x1122_3344),
+                (true, 0x3C4, 4, 0x1122_3344),
+                (false, 0x3C5, 1, 0xAB),
+                (false, 0x3C5, 2, 0xCDEF),
+                (false, 0x3C5, 4, 0xCAFE_BABE),
+                (false, 0x3C5, 4, 0xDEAD_BEEF),
+            ]
+        );
+    }
+
+    /// `CONFIG_ADDRESS` (0xCF8) takes the enable bit, the location from the
+    /// handle and the dword-aligned offset; `CONFIG_DATA` (0xCFC) carries the
+    /// dword, from which a byte or a word is picked by the offset's low bits.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pci_config_reads_go_through_the_legacy_ports_at_the_handles_location() {
+        let _serialised = crate::test_globals::LOCK.lock();
+        let hooks = EclipseNvrmHooks::new();
+        // bus 0x65, device 0, function 1: the second function of the GPU.
+        let handle = nvidia_rm_sys::os_interface::os_pci_init_handle(
+            0,
+            0x65,
+            0,
+            1,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        ) as usize;
+        let address = 0x8000_0000 | (0x65 << 16) | (1 << 8);
+        *fake_ports::PORTS.answer.lock() = 0x1122_3344;
+        ports_log();
+        assert_eq!(hooks.pci_config_read(handle, 0, 4), 0x1122_3344);
+        assert_eq!(hooks.pci_config_read(handle, 2, 2), 0x1122, "the high word");
+        assert_eq!(hooks.pci_config_read(handle, 1, 1), 0x33, "the second byte");
+        assert_eq!(hooks.pci_config_read(handle, 0x10, 4), 0x1122_3344, "BAR0");
+        assert_eq!(
+            ports_log(),
+            [
+                (false, 0xCF8, 4, address),
+                (true, 0xCFC, 4, 0x1122_3344),
+                (false, 0xCF8, 4, address),
+                (true, 0xCFC, 4, 0x1122_3344),
+                (false, 0xCF8, 4, address),
+                (true, 0xCFC, 4, 0x1122_3344),
+                (false, 0xCF8, 4, address | 0x10),
+                (true, 0xCFC, 4, 0x1122_3344),
+            ]
+        );
+    }
+
+    /// A dword is written as it is; a byte or a word is merged into the dword
+    /// that is there (read first), so the RM's byte-wide writes to a command
+    /// or latency register leave their neighbours alone.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pci_config_writes_merge_a_byte_or_a_word_into_the_dword_there() {
+        let _serialised = crate::test_globals::LOCK.lock();
+        let hooks = EclipseNvrmHooks::new();
+        let handle = nvidia_rm_sys::os_interface::os_pci_init_handle(
+            0,
+            0x65,
+            0,
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        ) as usize;
+        let address = 0x8000_0000 | (0x65 << 16);
+        *fake_ports::PORTS.answer.lock() = 0x1122_3344;
+        ports_log();
+        hooks.pci_config_write(handle, 4, 4, 0xCAFE_BABE);
+        hooks.pci_config_write(handle, 0, 1, 0xAB);
+        hooks.pci_config_write(handle, 0, 2, 0xCDEF);
+        assert_eq!(
+            ports_log(),
+            [
+                (false, 0xCF8, 4, address | 4),
+                (false, 0xCFC, 4, 0xCAFE_BABE),
+                (false, 0xCF8, 4, address),
+                (true, 0xCFC, 4, 0x1122_3344),
+                (false, 0xCF8, 4, address),
+                (false, 0xCFC, 4, 0x1122_33AB),
+                (false, 0xCF8, 4, address),
+                (true, 0xCFC, 4, 0x1122_3344),
+                (false, 0xCF8, 4, address),
+                (false, 0xCFC, 4, 0x1122_CDEF),
+            ]
+        );
+    }
+
+    /// `install` registers these hooks with `nvidia-rm-sys`, so the RM's OS
+    /// layer reaches the kernel through them from then on, and stashes the
+    /// mapper when it is given one; without a mapper the registration still
+    /// happens and the identity window serves.
+    #[test]
+    fn install_registers_the_hooks_and_stashes_the_mapper_it_is_given() {
+        let _serialised = crate::test_globals::LOCK.lock();
+        use nvidia_rm_sys::os_interface::{os_io_read_word, os_map_kernel_space};
+        *fake_ports::PORTS.answer.lock() = 0x5A5A;
+        ports_log();
+        install(&None);
+        assert_eq!(
+            os_io_read_word(0x3DA),
+            0x5A5A,
+            "the RM reaches the ports through us"
+        );
+        assert_eq!(ports_log(), [(true, 0x3DA, 2, 0x5A5A)]);
+        assert_eq!(
+            os_map_kernel_space(0xF000_0000, 0x1000, 0) as usize,
+            0xF000_0000,
+            "no mapper: the identity window"
+        );
+        let mapper: Arc<dyn IoMapper> = Arc::new(FakeMapper {
+            calls: AtomicUsize::new(0),
+            refuse: false,
+        });
+        install(&Some(mapper));
+        assert_eq!(
+            os_map_kernel_space(0xF000_0000, 0x1000, 0) as usize,
+            0xF000_0000 + OFFSET,
+            "the stashed mapper"
+        );
+        // Leave the global as the other tests found it: no mapper stashed.
+        ECLIPSE_NVRM_HOOKS.set_mapper(Arc::new(FakeMapper {
+            calls: AtomicUsize::new(0),
+            refuse: true,
+        }));
     }
 }
