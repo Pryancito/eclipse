@@ -226,10 +226,16 @@ fn pselect6_reads_its_timeout_in_nanoseconds_and_not_microseconds() {
     // left of it, so the units are visible without spending any of them.
     // Under the old reading the answer would be a hundred seconds minus a
     // few microseconds: `sec` would be 99, not 0.
+    //
+    // The same call is then asked for a `timespec` that names no duration at
+    // all. That belongs here rather than beside `ppoll`'s copy of it: the two
+    // syscalls read their timeout through different calls, and a conversion
+    // that dropped the range check here would answer a wait of some other
+    // length instead of the EINVAL Linux gives.
     const A_HUNDRED_MS: usize = 100_000_000;
     let proc = a_process(48_600, "pselect-ns", "pselect_ns");
     let dir_path = String::from("/pselect_ns");
-    let (got, left) = on_a_thread(&proc, move |sys| {
+    let (got, left, out_of_range) = on_a_thread(&proc, move |sys| {
         Box::pin(async move {
             let lp = sys.linux_process();
             let fd = a_ready_node(&lp, &dir_path, FileType::File);
@@ -251,7 +257,24 @@ fn pselect6_reads_its_timeout_in_nanoseconds_and_not_microseconds() {
                 0,
             )
             .await;
-            (got, timeout)
+            let mut read = a_set(nfds, &[fd]);
+            let mut write = a_set(nfds, &[]);
+            let mut except = a_set(nfds, &[]);
+            let mut nonsense = TimeSpec {
+                sec: 0,
+                nsec: 2_000_000_000,
+            };
+            let out_of_range = pselect6(
+                sys,
+                nfds,
+                &mut read,
+                &mut write,
+                &mut except,
+                Some(&mut nonsense),
+                0,
+            )
+            .await;
+            (got, timeout, out_of_range)
         })
     });
 
@@ -273,6 +296,11 @@ fn pselect6_reads_its_timeout_in_nanoseconds_and_not_microseconds() {
     assert!(
         left.nsec > 0,
         "a timeout that was never waited on came back spent"
+    );
+    assert_eq!(
+        out_of_range,
+        Err(LxError::EINVAL),
+        "a timespec that names no duration was converted instead of refused"
     );
 }
 
