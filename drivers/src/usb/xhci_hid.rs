@@ -2287,12 +2287,12 @@ pub fn usb_abs_pointer_active() -> bool {
     USB_ABS_POINTER.load(Ordering::Relaxed)
 }
 
-/// El torniquete de [`USB_ABS_POINTER`] para los tests vive en su propio
+/// Los torniquetes de los globales que los tests tocan viven en su propio
 /// fichero: aquí sólo cabe lo que entra en el techo de tamaño.
 #[cfg(test)]
-mod abs_turn;
+mod test_turns;
 #[cfg(test)]
-pub(super) use abs_turn::AbsPointerTurn;
+pub(super) use test_turns::{AbsPointerTurn, MsiTurn, PollTurn};
 
 /// Number of TRBs (and report buffers) kept queued on every interrupt-IN HID
 /// endpoint. A single in-flight TRB is fragile: if one transfer-completion
@@ -7707,6 +7707,10 @@ mod hub_tree_tests;
 /// medio de verdad detrás para que una lectura y una escritura se noten.
 #[cfg(test)]
 mod msc_tests;
+
+/// El enganche con el bus: de un dispositivo PCI al controlador en marcha.
+#[cfg(test)]
+mod pci_tests;
 
 /// El puntero absoluto: las tabletas de máquina virtual y sus dos diseños de
 /// informe.

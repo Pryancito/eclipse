@@ -3,17 +3,10 @@ use crate::scheme::{IrqHandler, IrqScheme};
 extern crate std;
 
 fn alone_with_the_queue<R>(body: impl FnOnce() -> R) -> R {
-    static TURNSTILE: Mutex<()> = Mutex::new(());
-    let _guard = TURNSTILE.lock();
-    clear();
-    let out = body();
-    clear();
-    out
-}
-
-fn clear() {
-    MSI_PENDING.lock().clear();
-    *MSI_IRQ_HOST.lock() = None;
+    // El torniquete vive debajo de los dos lados: estos tests y los del
+    // enganche con el bus apuntan los dos en la misma cola.
+    let _guard = MsiTurn::new();
+    body()
 }
 
 struct PickyIntc {
