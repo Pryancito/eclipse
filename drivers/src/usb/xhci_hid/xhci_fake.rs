@@ -149,6 +149,166 @@ pub(super) struct HubState {
     slow_reset: u8,
 }
 
+/// El `dci` con el que la unidad encola lo que sale por su endpoint bulk IN:
+/// el fake no lo sabe hasta que el driver lo configura, y no hace falta, porque
+/// los DCI impares son IN y los pares OUT (`dci = 2*ep + dirección`).
+const DCI_BULK_IN: u8 = 0xff;
+
+/// Las órdenes SCSI que la unidad falsa entiende.
+const SCSI_TEST_UNIT_READY: u8 = 0x00;
+const SCSI_REQUEST_SENSE: u8 = 0x03;
+const SCSI_INQUIRY: u8 = 0x12;
+const SCSI_READ_CAPACITY_10: u8 = 0x25;
+const SCSI_READ_10: u8 = 0x28;
+const SCSI_WRITE_10: u8 = 0x2a;
+const SCSI_SYNCHRONIZE_CACHE_10: u8 = 0x35;
+const SCSI_SERVICE_ACTION_IN_16: u8 = 0x9e;
+
+const BOT_CBW_SIGNATURE: u32 = 0x4342_5355;
+const BOT_CSW_SIGNATURE: u32 = 0x5342_5355;
+
+/// Una unidad de almacenamiento masivo sobre Bulk-Only Transport: su medio,
+/// lo que contesta a cada orden y los moldes para que conteste mal.
+///
+/// El transporte es el de verdad (USB MSC BOT §5): por el endpoint OUT llega
+/// un CBW de 31 bytes, por el que toque va la fase de datos, y por el IN sale
+/// un CSW de 13 con el mismo `tag`. El fake lo lleva como máquina de estados
+/// porque es justo ahí donde el driver se puede equivocar: creerse un CSW de
+/// otro tag es leer el resultado de otra orden.
+pub(super) struct DiskState {
+    /// El medio, bloque a bloque.
+    media: Vec<u8>,
+    block_size: u32,
+    blocks: u64,
+    vendor: [u8; 8],
+    product: [u8; 16],
+    revision: [u8; 4],
+    removable: bool,
+    /// Unidades lógicas menos una, que es lo que contesta `GET_MAX_LUN`.
+    max_lun: u8,
+    /// `TEST UNIT READY` falla estas veces más antes de decir que sí.
+    not_ready: u32,
+    /// Esta orden se rechaza con CSW status 1.
+    fail_op: Option<u8>,
+    /// `READ CAPACITY(10)` contesta el último LBA saturado, que es como una
+    /// unidad grande dice «pregúntame con la de 16».
+    needs_16: bool,
+    /// El CSW lleva un tag que no es el del CBW.
+    wrong_tag: bool,
+    /// La fase de datos de una lectura entrega estos bytes de menos, con el
+    /// CSW diciendo que todo fue bien: eso es un sector a medias.
+    short_by: usize,
+    /// Cada CDB que recibió, en orden.
+    pub cdbs: Vec<Vec<u8>>,
+    /// Una fase de datos OUT a medias: `(lba, bytes que faltan, tag, pedidos)`.
+    pending_write: Option<(u64, usize, u32, u32)>,
+}
+
+impl DiskState {
+    fn new(blocks: u64, block_size: u32) -> Self {
+        Self {
+            media: alloc::vec![0u8; (blocks * block_size as u64) as usize],
+            block_size,
+            blocks,
+            vendor: *b"Eclipse ",
+            product: *b"Pendrive Falso  ",
+            revision: *b"0001",
+            removable: true,
+            max_lun: 0,
+            not_ready: 0,
+            fail_op: None,
+            needs_16: false,
+            wrong_tag: false,
+            short_by: 0,
+            cdbs: Vec::new(),
+            pending_write: None,
+        }
+    }
+
+    /// Lo que hay escrito en un bloque, para comprobar una escritura.
+    fn block(&self, lba: u64) -> Vec<u8> {
+        let off = (lba * self.block_size as u64) as usize;
+        let end = (off + self.block_size as usize).min(self.media.len());
+        self.media.get(off..end).unwrap_or(&[]).to_vec()
+    }
+
+    fn put_block(&mut self, lba: u64, data: &[u8]) {
+        let off = (lba * self.block_size as u64) as usize;
+        for (i, b) in data.iter().enumerate() {
+            if let Some(slot) = self.media.get_mut(off + i) {
+                *slot = *b;
+            }
+        }
+    }
+
+    /// Los 36 bytes de `INQUIRY`.
+    fn inquiry(&self) -> Vec<u8> {
+        let mut d = alloc::vec![0u8; 36];
+        d[0] = 0; // Direct access block device.
+        d[1] = if self.removable { 0x80 } else { 0 };
+        d[2] = 0x04; // SPC-2.
+        d[3] = 0x02;
+        d[4] = 31; // Additional length.
+        d[8..16].copy_from_slice(&self.vendor);
+        d[16..32].copy_from_slice(&self.product);
+        d[32..36].copy_from_slice(&self.revision);
+        d
+    }
+
+    /// Los 8 bytes de `READ CAPACITY(10)`: último LBA y tamaño de bloque, los
+    /// dos en big endian, que es como habla SCSI.
+    fn capacity10(&self) -> Vec<u8> {
+        let last = if self.needs_16 {
+            0xffff_ffffu32
+        } else {
+            self.blocks.saturating_sub(1).min(0xffff_fffe) as u32
+        };
+        let mut d = alloc::vec![0u8; 8];
+        d[0..4].copy_from_slice(&last.to_be_bytes());
+        d[4..8].copy_from_slice(&self.block_size.to_be_bytes());
+        d
+    }
+
+    /// Los 32 de `READ CAPACITY(16)`: el último LBA cabe en ocho bytes.
+    fn capacity16(&self) -> Vec<u8> {
+        let mut d = alloc::vec![0u8; 32];
+        d[0..8].copy_from_slice(&self.blocks.saturating_sub(1).to_be_bytes());
+        d[8..12].copy_from_slice(&self.block_size.to_be_bytes());
+        d
+    }
+
+    /// Los 18 de `REQUEST SENSE`, con la condición que explica un «no lista».
+    fn sense(&self) -> Vec<u8> {
+        let mut d = alloc::vec![0u8; 18];
+        d[0] = 0x70; // Current error, fixed format.
+        d[2] = 0x02; // NOT READY.
+        d[7] = 10; // Additional length.
+        d[12] = 0x3a; // MEDIUM NOT PRESENT.
+        d
+    }
+}
+
+/// `(lba, bloques)` de un READ(10) o WRITE(10).
+fn rw10_range(cdb: &[u8]) -> Option<(u64, u32)> {
+    if cdb.len() < 10 {
+        return None;
+    }
+    let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]) as u64;
+    let blocks = u16::from_be_bytes([cdb[7], cdb[8]]) as u32;
+    Some((lba, blocks))
+}
+
+/// Los 13 bytes de un CSW. `wrong_tag` contesta con el tag de al lado, que es
+/// el fallo que el driver tiene que cazar: un CSW de otra orden.
+fn bot_csw(tag: u32, residue: u32, status: u8, wrong_tag: bool) -> Vec<u8> {
+    let mut d = alloc::vec![0u8; 13];
+    d[0..4].copy_from_slice(&BOT_CSW_SIGNATURE.to_le_bytes());
+    d[4..8].copy_from_slice(&tag.wrapping_add(u32::from(wrong_tag)).to_le_bytes());
+    d[8..12].copy_from_slice(&residue.to_le_bytes());
+    d[12] = status;
+    d
+}
+
 /// Un dispositivo contestando por EP0. Los descriptores los pone el test:
 /// el fake no se inventa ninguno, sólo los entrega recortados a `wLength`
 /// como lo haría el dispositivo.
@@ -161,6 +321,8 @@ pub(super) struct FakeDev {
     pub report: Vec<u8>,
     /// Peticiones que este dispositivo rechaza, como `(bmRequestType, bRequest)`.
     pub stall: Vec<(u8, u8)>,
+    /// Peticiones que deja sin contestar, igual.
+    pub silent: Vec<(u8, u8)>,
     /// Un dispositivo que no contesta: ninguna petición genera evento.
     pub mute: bool,
     /// Peticiones que todavía va a dejar sin contestar, al principio.
@@ -169,6 +331,8 @@ pub(super) struct FakeDev {
     pub seen: Vec<Setup>,
     /// Si además es un hub, el estado de sus puertos.
     pub hub: Option<HubState>,
+    /// Si además es una unidad de almacenamiento, su medio y su estado.
+    pub disk: Option<DiskState>,
     /// Lo que todavía tiene por entregar por los endpoints que no son EP0,
     /// como `(dci, carga, código de terminación)`: el informe de un ratón o
     /// el mapa de bits de cambios de un hub.
@@ -207,10 +371,12 @@ impl FakeDev {
             config,
             report,
             stall: Vec::new(),
+            silent: Vec::new(),
             mute: false,
             mute_first: 0,
             seen: Vec::new(),
             hub: None,
+            disk: None,
             queued: Vec::new(),
         }
     }
@@ -248,12 +414,190 @@ impl FakeDev {
             config,
             report,
             stall: Vec::new(),
+            silent: Vec::new(),
             mute: false,
             mute_first: 0,
             seen: Vec::new(),
             hub: None,
+            disk: None,
             queued: Vec::new(),
         }
+    }
+
+    /// Una unidad de almacenamiento masivo con `blocks` bloques de
+    /// `block_size`: clase 8, subclase 6 (SCSI transparente), protocolo 0x50
+    /// (Bulk-Only) y la pareja de endpoints bulk que eso exige.
+    pub(super) fn disk(blocks: u64, block_size: u32) -> Self {
+        let mut config: Vec<u8> = alloc::vec![
+            // Configuration: un total que se arregla abajo, 1 interfaz.
+            0x09, 0x02, 0x00, 0x00, 0x01, 0x01, 0x00, 0x80, 0xfa,
+            // Interface 0: almacenamiento masivo (8), SCSI (6), Bulk-Only.
+            0x09, 0x04, 0x00, 0x00, 0x02, 0x08, 0x06, 0x50, 0x00,
+            // Endpoint 2 IN, bulk, 512 bytes.
+            0x07, 0x05, 0x82, 0x02, 0x00, 0x02, 0x00, // Endpoint 1 OUT, bulk, 512 bytes.
+            0x07, 0x05, 0x01, 0x02, 0x00, 0x02, 0x00,
+        ];
+        let total = config.len() as u16;
+        config[2..4].copy_from_slice(&total.to_le_bytes());
+        Self {
+            device: alloc::vec![
+                0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40, 0x81, 0x07, 0x38, 0x62, 0x00, 0x01,
+                0x01, 0x02, 0x03, 0x01,
+            ],
+            config,
+            report: Vec::new(),
+            stall: Vec::new(),
+            silent: Vec::new(),
+            mute: false,
+            mute_first: 0,
+            seen: Vec::new(),
+            hub: None,
+            disk: Some(DiskState::new(blocks, block_size)),
+            queued: Vec::new(),
+        }
+    }
+
+    /// Una unidad que dice «no lista» las `n` primeras veces, que es lo que
+    /// hace un pendrive mientras arranca.
+    pub(super) fn with_not_ready(mut self, n: u32) -> Self {
+        if let Some(d) = self.disk.as_mut() {
+            d.not_ready = n;
+        }
+        self
+    }
+
+    /// Una unidad que rechaza esa orden con CSW status 1.
+    pub(super) fn failing_scsi(mut self, op: u8) -> Self {
+        if let Some(d) = self.disk.as_mut() {
+            d.fail_op = Some(op);
+        }
+        self
+    }
+
+    /// Una unidad tan grande que `READ CAPACITY(10)` no la puede contar.
+    pub(super) fn needing_capacity16(mut self) -> Self {
+        if let Some(d) = self.disk.as_mut() {
+            d.needs_16 = true;
+        }
+        self
+    }
+
+    /// Una unidad cuyo CSW contesta con un tag que no es el de la orden.
+    pub(super) fn with_wrong_csw_tag(mut self) -> Self {
+        if let Some(d) = self.disk.as_mut() {
+            d.wrong_tag = true;
+        }
+        self
+    }
+
+    /// Una unidad que entrega menos datos de los que la orden pidió y aun así
+    /// dice que todo fue bien.
+    pub(super) fn with_short_data(mut self, bytes: usize) -> Self {
+        if let Some(d) = self.disk.as_mut() {
+            d.short_by = bytes;
+        }
+        self
+    }
+
+    /// `GET_MAX_LUN` contesta esto, que son las unidades lógicas menos una.
+    pub(super) fn with_luns(mut self, max_lun: u8) -> Self {
+        if let Some(d) = self.disk.as_mut() {
+            d.max_lun = max_lun;
+        }
+        self
+    }
+
+    /// Un bloque del medio, para ver si una escritura llegó.
+    pub(super) fn media_block(&self, lba: u64) -> Vec<u8> {
+        self.disk.as_ref().map(|d| d.block(lba)).unwrap_or_default()
+    }
+
+    /// Deja un bloque escrito de antemano, para que una lectura traiga algo.
+    pub(super) fn with_block(mut self, lba: u64, data: &[u8]) -> Self {
+        if let Some(d) = self.disk.as_mut() {
+            d.put_block(lba, data);
+        }
+        self
+    }
+
+    /// Lo que llegó por el endpoint bulk OUT: un CBW, o la fase de datos de
+    /// una escritura que ya se había anunciado.
+    ///
+    /// Encola lo que la unidad conteste por su endpoint IN. Devuelve `false`
+    /// cuando esto no es una unidad de almacenamiento, y entonces el
+    /// controlador no tiene nada que contestar.
+    fn bulk_out(&mut self, bytes: &[u8]) -> bool {
+        let Some(disk) = self.disk.as_mut() else {
+            return false;
+        };
+        // La fase de datos de una escritura anunciada: el medio se queda con
+        // lo que llegó y después sale su CSW.
+        if let Some((lba, want, tag, asked)) = disk.pending_write.take() {
+            let n = bytes.len().min(want);
+            disk.put_block(lba, &bytes[..n]);
+            let status = u8::from(n < want);
+            let csw = bot_csw(tag, asked.saturating_sub(n as u32), status, disk.wrong_tag);
+            self.queued.push((DCI_BULK_IN, csw, TRB_CC_SUCCESS));
+            return true;
+        }
+        if bytes.len() < 31
+            || u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != BOT_CBW_SIGNATURE
+        {
+            return true;
+        }
+        let tag = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let asked = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let cb_len = (bytes[14] & 0x1f) as usize;
+        let cdb = bytes[15..(15 + cb_len).min(bytes.len())].to_vec();
+        disk.cdbs.push(cdb.clone());
+        let op = cdb.first().copied().unwrap_or(0xff);
+        if disk.fail_op == Some(op) {
+            let csw = bot_csw(tag, asked, 1, disk.wrong_tag);
+            self.queued.push((DCI_BULK_IN, csw, TRB_CC_SUCCESS));
+            return true;
+        }
+        let (data, status) = match op {
+            SCSI_TEST_UNIT_READY => {
+                let not_ready = disk.not_ready > 0;
+                disk.not_ready = disk.not_ready.saturating_sub(1);
+                (Vec::new(), u8::from(not_ready))
+            }
+            SCSI_REQUEST_SENSE => (disk.sense(), 0),
+            SCSI_INQUIRY => (disk.inquiry(), 0),
+            SCSI_READ_CAPACITY_10 => (disk.capacity10(), 0),
+            SCSI_SERVICE_ACTION_IN_16 if cdb.get(1) == Some(&0x10) => (disk.capacity16(), 0),
+            SCSI_SYNCHRONIZE_CACHE_10 => (Vec::new(), 0),
+            SCSI_READ_10 => match rw10_range(&cdb) {
+                Some((lba, blocks)) if lba + blocks as u64 <= disk.blocks => {
+                    let off = (lba * disk.block_size as u64) as usize;
+                    let len =
+                        (blocks as usize * disk.block_size as usize).saturating_sub(disk.short_by);
+                    (disk.media[off..off + len].to_vec(), 0)
+                }
+                // Fuera del medio es un fallo de la orden, no del transporte.
+                _ => (Vec::new(), 1),
+            },
+            SCSI_WRITE_10 => match rw10_range(&cdb) {
+                Some((lba, blocks)) if lba + blocks as u64 <= disk.blocks => {
+                    // El CSW no sale hasta que llegue la fase de datos.
+                    let len = blocks as usize * disk.block_size as usize;
+                    disk.pending_write = Some((lba, len, tag, asked));
+                    return true;
+                }
+                _ => (Vec::new(), 1),
+            },
+            // Una orden que la unidad no entiende.
+            _ => (Vec::new(), 1),
+        };
+        let moved = data.len().min(asked as usize) as u32;
+        let wrong_tag = disk.wrong_tag;
+        if moved > 0 {
+            self.queued
+                .push((DCI_BULK_IN, data[..moved as usize].to_vec(), TRB_CC_SUCCESS));
+        }
+        let csw = bot_csw(tag, asked - moved, status, wrong_tag);
+        self.queued.push((DCI_BULK_IN, csw, TRB_CC_SUCCESS));
+        true
     }
 
     /// Un hub de `ports` puertos: clase 9 en el dispositivo y en su única
@@ -277,6 +621,7 @@ impl FakeDev {
             config,
             report: Vec::new(),
             stall: Vec::new(),
+            silent: Vec::new(),
             mute: false,
             mute_first: 0,
             seen: Vec::new(),
@@ -287,6 +632,7 @@ impl FakeDev {
                 never_enables: false,
                 slow_reset: 0,
             }),
+            disk: None,
             queued: Vec::new(),
         }
     }
@@ -318,6 +664,14 @@ impl FakeDev {
     /// Esta petición se rechaza con STALL.
     pub(super) fn stalling(mut self, bmrt: u8, breq: u8) -> Self {
         self.stall.push((bmrt, breq));
+        self
+    }
+
+    /// Esta petición se queda sin contestar: ni datos ni STALL, que es lo que
+    /// hace un aparato al que esa petición le sienta mal. El driver sólo sale
+    /// de ahí por su plazo.
+    pub(super) fn muting(mut self, bmrt: u8, breq: u8) -> Self {
+        self.silent.push((bmrt, breq));
         self
     }
 
@@ -357,6 +711,9 @@ impl FakeDev {
             self.mute_first -= 1;
             return None;
         }
+        if self.silent.contains(&(s.bmrt, s.breq)) {
+            return None;
+        }
         if self.stall.contains(&(s.bmrt, s.breq)) {
             return Some((Vec::new(), TRB_CC_STALL));
         }
@@ -369,6 +726,12 @@ impl FakeDev {
             // (SET_IDLE, SET_PROTOCOL) no llevan datos.
             (0x00, 0x09, _) | (0x01, 0x0b, _) | (0x21, 0x0a, _) | (0x21, 0x0b, _) => Vec::new(),
             // Lo de clase, que sólo un hub contesta.
+            // GET_MAX_LUN (MSC BOT §3.2): sin unidad es un STALL, que es
+            // justo lo que el driver tiene que leer como «una sola unidad».
+            (0xa1, 0xfe, _) => match self.disk.as_ref() {
+                Some(d) => alloc::vec![d.max_lun],
+                None => return Some((Vec::new(), TRB_CC_STALL)),
+            },
             (0xa0, 0x06, USB_DESC_HUB) | (0xa3, 0x00, _) | (0x23, 0x03, _) | (0x23, 0x01, _) => {
                 match self.hub.as_mut() {
                     Some(hub) => hub.class_request(s),
@@ -685,6 +1048,8 @@ pub(super) fn on_write(base: usize, off: usize, v: u32) {
                 run_command_ring(st);
             } else if dci == 1 {
                 run_ep0(st, slot);
+            } else if dci.is_multiple_of(2) {
+                run_ep_out(st, slot, dci);
             } else {
                 run_ep_in(st, slot, dci);
             }
@@ -1097,13 +1462,15 @@ fn run_ep_in(st: &mut Fake, slot: u8, dci: u8) {
             ep.deq += 16;
             continue;
         }
-        // Un endpoint IN armado sin nada que entregar se queda esperando, que
-        // es lo que hace el de un ratón quieto.
-        let Some(pos) = st
-            .devs
-            .get(node)
-            .and_then(|n| n.dev.queued.iter().position(|(d, _, _)| *d == dci))
-        else {
+        // Un endpoint IN armado sin nada que entregar se queda esperando. Una
+        // unidad de almacenamiento encola con `DCI_BULK_IN` porque no sabe qué
+        // DCI le tocó: cualquier endpoint IN impar es el suyo.
+        let Some(pos) = st.devs.get(node).and_then(|n| {
+            n.dev
+                .queued
+                .iter()
+                .position(|(d, _, _)| *d == dci || *d == DCI_BULK_IN)
+        }) else {
             break;
         };
         let (_, payload, cc) = st.devs[node].dev.queued.remove(pos);
@@ -1125,6 +1492,81 @@ fn run_ep_in(st: &mut Fake, slot: u8, dci: u8) {
             st,
             addr as u64,
             (residual & 0x00ff_ffff) | (cc << 24),
+            TRB_EVT_TRANSFER | ((slot as u32) << 24) | ((dci as u32) << 16),
+        );
+    }
+    match st.eps.iter_mut().find(|(k, _)| *k == (slot, dci)) {
+        Some(e) => e.1 = ep,
+        None => st.eps.push(((slot, dci), ep)),
+    }
+}
+
+/// Consume el anillo de un endpoint bulk OUT: lo que el driver escribió en el
+/// buffer de cada Normal TRB se le entrega al dispositivo, que contesta
+/// encolando lo que salga por su endpoint IN.
+///
+/// Por aquí pasa el CBW de cada orden SCSI y la fase de datos de una
+/// escritura, que es la única dirección en la que el host habla.
+fn run_ep_out(st: &mut Fake, slot: u8, dci: u8) {
+    let Some(node) = st.ep0.get(slot as usize).copied().flatten().map(|e| e.node) else {
+        return;
+    };
+    let mut ep = match st.eps.iter().find(|(k, _)| *k == (slot, dci)) {
+        Some((_, e)) => *e,
+        None => {
+            let dev = device_context(st, slot);
+            if dev == 0 {
+                return;
+            }
+            let raw = peek64(dev + dci as usize * ctx_size(st) + 8);
+            if (raw & !0xfu64) == 0 {
+                return;
+            }
+            EpIn {
+                deq: raw & !0xf,
+                cycle: (raw & 1) != 0,
+            }
+        }
+    };
+    loop {
+        let addr = ep.deq as usize;
+        let ctrl = peek(addr + 12);
+        if (ctrl & 1) != ep.cycle as u32 {
+            break;
+        }
+        let ty = (ctrl >> 10) & 0x3f;
+        if ty == TY_LINK {
+            ep.deq = peek64(addr) & !0xf;
+            if (ctrl & 2) != 0 {
+                ep.cycle = !ep.cycle;
+            }
+            continue;
+        }
+        if ty != TY_NORMAL {
+            ep.deq += 16;
+            continue;
+        }
+        let buf = peek64(addr);
+        let len = (peek(addr + 8) & 0x1_ffff) as usize;
+        let mut bytes = alloc::vec![0u8; len];
+        if buf != 0 && len > 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf as *const u8, bytes.as_mut_ptr(), len);
+            }
+        }
+        let answered = st
+            .devs
+            .get_mut(node)
+            .is_some_and(|n| n.dev.bulk_out(&bytes));
+        ep.deq += 16;
+        if !answered {
+            // Nadie al otro lado: el driver se queda esperando su plazo.
+            continue;
+        }
+        post_event(
+            st,
+            addr as u64,
+            TRB_CC_SUCCESS << 24,
             TRB_EVT_TRANSFER | ((slot as u32) << 24) | ((dci as u32) << 16),
         );
     }
@@ -1401,6 +1843,29 @@ impl Hw {
                 run_ep_in(st, slot as u8, dci);
             }
         });
+    }
+
+    /// Lo que la unidad del puerto `port` tiene escrito en un bloque.
+    pub(super) fn media_block(&self, port: u8, lba: u64) -> Vec<u8> {
+        self.with(|st| {
+            st.devs
+                .iter()
+                .find(|n| n.port == port && n.route == 0)
+                .map(|n| n.dev.media_block(lba))
+                .unwrap_or_default()
+        })
+    }
+
+    /// Las órdenes SCSI que recibió la unidad del puerto `port`, en orden.
+    pub(super) fn scsi_cdbs(&self, port: u8) -> Vec<Vec<u8>> {
+        self.with(|st| {
+            st.devs
+                .iter()
+                .find(|n| n.port == port && n.route == 0)
+                .and_then(|n| n.dev.disk.as_ref())
+                .map(|d| d.cdbs.clone())
+                .unwrap_or_default()
+        })
     }
 
     /// Lo que un dispositivo no ha podido entregar todavía porque su endpoint

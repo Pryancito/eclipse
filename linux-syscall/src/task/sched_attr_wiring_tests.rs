@@ -412,6 +412,9 @@ fn getattr_answers_its_own_size_zeros_for_what_it_lacks_and_no_more() {
             let mut asking = Wide::asking(SCHED_RR as u32, 0, A_PRIORITY, A_NICE);
             assert_eq!(sys.sys_sched_setattr(0, asking.asked(), 0), Ok(0));
 
+            // A buffer 8 bytes bigger than this kernel's struct, inside a
+            // `Wide` 16 bytes bigger: the first 8 of the tail are the
+            // caller's to have zeroed, the last 8 are not the call's at all.
             let mut got = Wide::seeded();
             // Asked with a size HALF of the tail wide, so the two halves of
             // `copy_struct_to_user` can be told apart: what it zeroes, and
