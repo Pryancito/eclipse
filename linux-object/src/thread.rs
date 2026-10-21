@@ -1,6 +1,7 @@
 //! Linux Thread
 
 use crate::error::SysResult;
+use crate::process::ProcessExt;
 use crate::signal::{SigInfo, Signal, SignalStack, SignalUserContext, Sigset};
 use crate::sync::shared_futex;
 use alloc::collections::BTreeMap;
@@ -248,6 +249,9 @@ impl ThreadExt for Thread {
         if proc.thread_ids() != [self.id()] {
             return Err(ZxError::BAD_STATE);
         }
+        // An old leader that exited first goes now, as `de_thread` releases
+        // it: the pid is the new one's.
+        drop(proc.try_linux().and_then(|lp| lp.release_exited_leader()));
         let leader = Thread::create_with_ext_id(
             proc,
             &self.name(),
@@ -579,6 +583,16 @@ impl CurrentThreadExt for CurrentThread {
         self.proc().hint_exit_code(exit_code as i64);
         if last_thread_of(self.proc().thread_count()) {
             self.proc().exit(exit_code as i64);
+        } else if self.id() == self.proc().id() {
+            // The leader, leaving before the rest of its group: it stays a
+            // task, a zombie, until they have gone (`exited_leader`).
+            let me = self.proc().get_child(self.id()).ok();
+            if let (Some(lp), Some(me)) = (
+                self.proc().try_linux(),
+                me.and_then(|obj| obj.downcast_arc::<Thread>().ok()),
+            ) {
+                lp.keep_exited_leader(me);
+            }
         }
         self.exit();
     }

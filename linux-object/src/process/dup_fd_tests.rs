@@ -84,6 +84,7 @@ pub(super) fn a_process() -> LinuxProcess {
         vt: 0,
         exit_path: Default::default(),
         exit_stage: Default::default(),
+        exited_leader: Default::default(),
         perf: crate::perf::ProcPerf::new(),
         futexes: Default::default(),
         itimers: Default::default(),

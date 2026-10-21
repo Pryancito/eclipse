@@ -21,6 +21,8 @@ mod arg_area;
 mod comm_tests;
 #[cfg(test)]
 mod cwd_tests;
+#[cfg(test)]
+mod exited_leader_tests;
 /// `/proc/<pid>/limits`, in its own file for the same reason.
 mod limits;
 pub(crate) mod owner;
@@ -381,9 +383,10 @@ fn proc_ppid(proc: &Process) -> u64 {
 }
 
 /// The first (leader) thread of a process, if any, for reporting its
-/// scheduling attributes.
+/// scheduling attributes: a leader that has exited before the rest of its
+/// group is still that, a zombie (see `process::exited_leader`).
 fn proc_first_thread(proc: &Process) -> Option<Arc<Thread>> {
-    proc.threads().first().cloned()
+    crate::process::exited_leader_of(proc).or_else(|| proc.threads().first().cloned())
 }
 
 fn proc_pid_stat(proc: &Process) -> String {
@@ -456,7 +459,7 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
 
     // Field 20 is the thread-group count, and Linux reports it on a thread's
     // own `stat` too: it describes the group the task belongs to.
-    let nthreads = proc.thread_ids().len().max(1) as i64;
+    let nthreads = crate::process::task_count(proc) as i64;
     // priority(18)/nice(19)/rt_priority(40)/policy(41) are the task's own, so
     // they come from `thread` when there is one and from the leader
     // otherwise. Per proc(5): for real-time policies the priority field is
@@ -1094,9 +1097,8 @@ impl ProcPidTaskDirINode {
 
     fn tids(&self) -> Vec<u64> {
         self.process()
-            .map(|p| p.thread_ids())
+            .map(|p| crate::process::task_ids(&p))
             .unwrap_or_default()
-            .to_vec()
     }
 }
 
@@ -1347,14 +1349,7 @@ fn tid_task(pid: u64, tid: u64) -> Result<(Arc<Process>, Arc<Thread>)> {
     let proc = ROOT_JOB
         .find_process(pid as _)
         .ok_or(FsError::EntryNotFound)?;
-    if !proc.thread_ids().contains(&tid) {
-        return Err(FsError::EntryNotFound);
-    }
-    let thread = proc
-        .get_child(tid)
-        .map_err(|_| FsError::EntryNotFound)?
-        .downcast_arc::<Thread>()
-        .map_err(|_| FsError::EntryNotFound)?;
+    let thread = crate::process::task_of(&proc, tid).ok_or(FsError::EntryNotFound)?;
     Ok((proc, thread))
 }
 
@@ -2045,7 +2040,7 @@ fn proc_perf_tasks_content() -> String {
         let pid = proc.id();
         let comm = escaped_comm(&proc_comm(&proc));
         let state = proc_state_char(&proc);
-        let nthr = proc.thread_ids().len().max(1);
+        let nthr = crate::process::task_count(&proc);
         let (calls, ns) = proc
             .try_linux()
             .map(|lp| lp.perf().totals())

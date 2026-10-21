@@ -126,7 +126,10 @@ fn kill_target(pid: i32) -> SendTarget {
 ///
 /// Of a process that has exited only its leader is still a task, until the
 /// reap; it takes the permission check and the signal does nothing, so it
-/// comes back without a thread. A child `wait4` has collected is nobody,
+/// comes back without a thread. So does a leader that has exited while the
+/// rest of its process runs on: it is a zombie task, and a signal sent to it
+/// as a thread is not delivered, not even `SIGKILL`. A child `wait4` has
+/// collected is nobody,
 /// though it can still be in its job finishing its teardown -- which is
 /// where `tgkill` looked, and found it, and where it did not find a zombie
 /// that had already left.
@@ -144,9 +147,14 @@ fn specific_task(
     let thread = process
         .get_child(tid)
         .ok()
-        .and_then(|obj| obj.downcast_arc::<Thread>().ok())
-        .ok_or(LxError::ESRCH)?;
-    Ok((process, Some(thread)))
+        .and_then(|obj| obj.downcast_arc::<Thread>().ok());
+    match thread {
+        Some(thread) => Ok((process, Some(thread))),
+        None if tid == tgid && linux_object::process::exited_leader_of(&process).is_some() => {
+            Ok((process, None))
+        }
+        None => Err(LxError::ESRCH),
+    }
 }
 
 /// `tkill(2)`/`tgkill(2)`: "This is only valid for single tasks", so Linux
@@ -730,7 +738,9 @@ impl Syscall<'_> {
         let Some((process, thread)) = found else {
             // A process that has exited and not been reaped is still a task:
             // its leader, whose tid is the pid. `do_send_specific` finds it,
-            // asks `check_kill_permission`, and the signal does nothing.
+            // asks `check_kill_permission`, and the signal does nothing. The
+            // same goes for a leader that has exited before the rest of its
+            // process, whose pid this also finds.
             let zombie = linux_object::process::find_task(tid).ok_or(LxError::ESRCH)?;
             self.may_signal_process(&self.kill_context(signal), &zombie)?;
             return Ok(0);
@@ -1082,6 +1092,9 @@ impl Drop for TempSigmaskGuard {
 /// be exercised without a thread, a process or a job.
 #[cfg(test)]
 mod zombie_tests;
+
+#[cfg(test)]
+mod exited_leader_tests;
 
 #[cfg(test)]
 mod sigaction_query_tests {

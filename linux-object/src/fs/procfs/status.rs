@@ -111,7 +111,7 @@ pub(super) fn proc_task_status(proc: &Process, thread: Option<&Arc<Thread>>) -> 
             vm_size_kb, vm_rss_kb
         );
     }
-    let _ = writeln!(out, "Threads:\t{}", proc.thread_ids().len().max(1));
+    let _ = writeln!(out, "Threads:\t{}", crate::process::task_count(proc));
     if let (Some(lp), Some(creds)) = (lp, creds.as_ref()) {
         signal_lines(&mut out, lp, task.as_ref(), creds.ruid);
         capability_lines(&mut out, creds.euid);

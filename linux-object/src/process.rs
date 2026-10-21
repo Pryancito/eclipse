@@ -438,14 +438,17 @@ impl ProcessExt for Process {
                         // with it. It has its own lock now (see
                         // `LinuxProcess::futexes`), so it comes out the same
                         // way and goes with every lock released.
+                        // And a leader that exited first: a `Thread`, which
+                        // holds this process too (`exited_leader`).
                         let dropped = {
                             let futexes = core::mem::take(&mut *lp.futexes.lock());
+                            let leader = lp.release_exited_leader();
                             let mut inner = lp.inner.lock();
                             let files = inner.take_all_files();
                             inner.cloexec_fds.clear();
                             inner.semaphores = Default::default();
                             let shm = core::mem::take(&mut inner.shm_identifiers);
-                            (files, shm, futexes)
+                            (files, shm, futexes, leader)
                         };
                         drop(dropped);
                     }
@@ -685,6 +688,7 @@ impl NewChild for Process {
             vt: linux_parent.vt,
             exit_path: ExitPathSummary::default(),
             exit_stage: Default::default(),
+            exited_leader: Default::default(),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
             itimers: crate::time::Itimers::forked(&linux_parent_inner.limits),
@@ -816,14 +820,17 @@ impl NewChild for Process {
                         // with it. It has its own lock now (see
                         // `LinuxProcess::futexes`), so it comes out the same
                         // way and goes with every lock released.
+                        // And a leader that exited first: a `Thread`, which
+                        // holds this process too (`exited_leader`).
                         let dropped = {
                             let futexes = core::mem::take(&mut *lp.futexes.lock());
+                            let leader = lp.release_exited_leader();
                             let mut inner = lp.inner.lock();
                             let files = inner.take_all_files();
                             inner.cloexec_fds.clear();
                             inner.semaphores = Default::default();
                             let shm = core::mem::take(&mut inner.shm_identifiers);
-                            (files, shm, futexes)
+                            (files, shm, futexes, leader)
                         };
                         drop(dropped);
                         // Only now may a `wait*` take it (`exit_handover`).
@@ -1245,6 +1252,8 @@ pub struct LinuxProcess {
     exit_path: ExitPathSummary,
     /// Alive, zombie or reaped: see [`exit_handover`].
     exit_stage: exit_handover::ExitStage,
+    /// A leader that has exited before its group: see [`exited_leader`].
+    exited_leader: exited_leader::ExitedLeader,
     /// Per-process syscall accounting (surfaced at `/proc/<pid>/perf`).
     perf: crate::perf::ProcPerf,
     /// The process's futex objects, keyed by the address of their word.
@@ -1853,6 +1862,7 @@ impl LinuxProcess {
             vt,
             exit_path: ExitPathSummary::default(),
             exit_stage: Default::default(),
+            exited_leader: Default::default(),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
             itimers: Default::default(),
@@ -6311,6 +6321,9 @@ mod exit_path;
 use exit_path::ExitPathSummary;
 
 mod exit_handover;
+
+mod exited_leader;
+pub use exited_leader::{exited_leader_of, task_count, task_ids, task_of};
 
 #[cfg(test)]
 mod exit_handover_tests;
