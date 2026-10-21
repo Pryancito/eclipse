@@ -162,6 +162,9 @@ impl INode for FdInfo {
         buf[..len].copy_from_slice(&rest[..len]);
         Ok(len)
     }
+    fn seq_text(&self) -> Option<Result<alloc::vec::Vec<u8>>> {
+        Some(self.render().map(String::into_bytes))
+    }
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
         Err(FsError::NotSupported)
     }

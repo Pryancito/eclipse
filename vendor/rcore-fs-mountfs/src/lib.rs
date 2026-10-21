@@ -9,6 +9,7 @@ use alloc::{
     collections::BTreeMap,
     string::String,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use core::{any::Any, future::Future, pin::Pin};
 use rcore_fs::vfs::*;
@@ -521,6 +522,10 @@ impl INode for MNode {
     /// such as `/dev/stdin`.
     fn jump(&self) -> Option<Result<(Arc<dyn INode>, String)>> {
         self.inode.jump()
+    }
+
+    fn seq_text(&self) -> Option<Result<Vec<u8>>> {
+        self.inode.seq_text()
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
@@ -1292,6 +1297,47 @@ mod tests {
         assert_eq!(got.0, Some(FsError::DeviceError));
         assert_eq!(got.1, Some(FsError::DeviceError));
         assert_eq!(got.2, Some(FsError::DeviceError));
+    }
+
+    /// A file of a mounted file system that is written out when it is read
+    /// is one still through its mount: `/proc/self/stat` walked to from `/`
+    /// by a relative path is reached through the mount of `/proc`.
+    #[test]
+    fn a_seq_file_is_one_through_its_mount() {
+        struct SeqFile;
+        impl INode for SeqFile {
+            fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+                Ok(0)
+            }
+            fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+                Err(FsError::NotSupported)
+            }
+            fn poll(&self) -> Result<PollStatus> {
+                Ok(PollStatus::default())
+            }
+            fn as_any_ref(&self) -> &dyn Any {
+                self
+            }
+            fn seq_text(&self) -> Option<Result<Vec<u8>>> {
+                Some(Ok(b"text".to_vec()))
+            }
+        }
+        struct SeqFs;
+        impl FileSystem for SeqFs {
+            fn sync(&self) -> Result<()> {
+                Ok(())
+            }
+            fn root_inode(&self) -> Arc<dyn INode> {
+                Arc::new(SeqFile)
+            }
+            fn info(&self) -> FsInfo {
+                RamFS::new().info()
+            }
+        }
+        let seq = MountFS::new(Arc::new(SeqFs)).mountpoint_root_inode();
+        assert_eq!(seq.seq_text().unwrap().unwrap(), b"text");
+        let (_top, root) = tree();
+        assert!(file_at(&root, "f").seq_text().is_none());
     }
 
     #[test]
