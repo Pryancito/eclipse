@@ -14,27 +14,6 @@ const SLOTS: u8 = 8;
 const PORTS: u8 = 4;
 const HS: u8 = 3;
 
-/// `POLL_INSTANCES` es un global del proceso, y el fake es por hilo: dos
-/// tests sondeando a la vez se encontrarían con el controlador del otro. Los
-/// que usan `poll` toman turno aquí.
-static TURNSTILE: Mutex<()> = Mutex::new(());
-
-struct Alone(#[allow(dead_code)] lock::MutexGuard<'static, ()>);
-
-impl Alone {
-    fn new() -> Self {
-        let g = TURNSTILE.lock();
-        set_poll_instance(None);
-        Self(g)
-    }
-}
-
-impl Drop for Alone {
-    fn drop(&mut self) {
-        set_poll_instance(None);
-    }
-}
-
 fn ctrl(mut x: XhciInner) -> Arc<XhciUsbHid> {
     // Lo que hace `probe` tras enumerar: sin esto, la primera vuelta del
     // sondeo vuelve a enumerar la raíz y se lleva por delante los endpoints
@@ -223,7 +202,7 @@ fn dos_intentos_seguidos_respetan_la_espera() {
 /// drena lo que haya llegado: ésa es la vuelta normal.
 #[test]
 fn el_sondeo_drena_los_informes_que_llegaron() {
-    let _alone = Alone::new();
+    let _alone = PollTurn::new();
     let (hw, dev) = with_mouse();
     let dci = dev.inner.lock().as_ref().expect("el controlador").hids[0].ep_dci;
     hw.send_in(1, dci, &[0x00, 7, 0, 0]);
@@ -247,7 +226,7 @@ fn el_sondeo_drena_los_informes_que_llegaron() {
 /// una gráfica sin nada enchufado.
 #[test]
 fn un_controlador_que_no_responde_se_deja_de_sondear() {
-    let _alone = Alone::new();
+    let _alone = PollTurn::new();
     let (hw, dev) = with_mouse();
     hw.go_dead();
     set_poll_instance(Some(dev.clone()));
@@ -280,7 +259,7 @@ fn un_controlador_que_no_responde_se_deja_de_sondear() {
 /// entrada muerta en un parpadeo del bus.
 #[test]
 fn un_halt_que_no_se_recupera_se_latcha_pero_no_en_el_primer_intento() {
-    let _alone = Alone::new();
+    let _alone = PollTurn::new();
     let (hw, dev) = with_mouse();
     // Cada lectura de registro mueve el reloj más que la espera entre
     // intentos, así que cada vuelta del sondeo gasta un intento de verdad.
@@ -312,7 +291,7 @@ fn un_halt_que_no_se_recupera_se_latcha_pero_no_en_el_primer_intento() {
 /// recuperó de todos.
 #[test]
 fn un_controlador_que_vuelve_a_estar_sano_recupera_su_presupuesto() {
-    let _alone = Alone::new();
+    let _alone = PollTurn::new();
     let (_hw, dev) = with_mouse();
     dev.inner
         .lock()
@@ -339,7 +318,7 @@ fn un_controlador_que_vuelve_a_estar_sano_recupera_su_presupuesto() {
 /// es el ciclo que cerró el cuelgue con `shadow_fb`.
 #[test]
 fn el_sondeo_no_espera_a_quien_tenga_el_cerrojo() {
-    let _alone = Alone::new();
+    let _alone = PollTurn::new();
     let (hw, dev) = with_mouse();
     let dci = dev.inner.lock().as_ref().expect("el controlador").hids[0].ep_dci;
     hw.send_in(1, dci, &[0x00, 7, 0, 0]);

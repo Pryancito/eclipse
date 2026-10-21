@@ -1757,6 +1757,13 @@ impl Hw {
         XhciInner::new(mmio, slots, ports, msi_vector).expect("el driver cabe en memoria")
     }
 
+    /// La dirección de la ventana de registros, que es lo que un BAR de PCI
+    /// le daría al driver. Aquí la traducción de física a virtual es la
+    /// identidad, así que vale tal cual como dirección de BAR.
+    pub(super) fn base(&self) -> usize {
+        self.base
+    }
+
     /// Escribe un registro de capacidad (HCSPARAMS2, HCCPARAMS1, ...).
     pub(super) fn set_cap(&self, off: usize, v: u32) {
         poke(self.base + off, v);
