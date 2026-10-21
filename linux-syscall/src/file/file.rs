@@ -3263,6 +3263,14 @@ mod truncate_and_statfs_tests;
 #[cfg(test)]
 mod sendfile_and_copy_tests;
 
+/// Which sync each of the five durability syscalls asks for. They all
+/// return `Ok(0)` on a ramfs and differ only in the method they reach for,
+/// so the module hands them a file that counts what it was asked, which
+/// is also what makes `readahead`'s errors -- its whole contract, since
+/// there is no page cache here to fill -- askable.
+#[cfg(test)]
+mod durability_tests;
+
 /// `SYNC_IOC_MERGE` is `_IOWR('>', 3, struct sync_merge_data)`: type `'>'`
 /// (0x3e), nr 3, 48 bytes. Matched on type and nr, like the DRM syncobj fd
 /// ioctls: the struct is UABI-frozen, and a size-pinned constant is how this
