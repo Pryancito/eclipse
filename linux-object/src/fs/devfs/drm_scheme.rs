@@ -142,11 +142,18 @@ impl DrmDev {
     /// The open itself: the state is scoped to this node, and takes the
     /// node's master when no open holds it (`drm_master_open`).
     fn open_client_dev(&self) -> DrmDev {
-        DrmDev {
+        let dev = DrmDev {
             inode_id: self.inode_id,
             minor: self.minor,
             file: drm::DrmFileState::for_minor(self.minor),
-        }
+        };
+        let owner = dev.file_owner();
+        master_check::note_open(
+            owner,
+            master_check::caller_pid(),
+            drm::is_master(self.minor, owner),
+        );
+        dev
     }
 
     pub fn file_state(&self) -> &Arc<drm::DrmFileState> {
@@ -184,6 +191,17 @@ impl DrmDev {
             return Err(FsError::NoPermission);
         }
         if self.minor < 128 && !drm::is_authenticated(self.minor, self.file_owner()) {
+            return Err(FsError::NoPermission);
+        }
+        Ok(())
+    }
+
+    /// `drm_master_check_perm` for `SET_MASTER` and `DROP_MASTER`, under
+    /// `drm.master_check`: EACCES unless this open was master from the
+    /// caller's own process, or the caller is root
+    /// ([`master_check::check_perm`]).
+    fn master_check_perm(&self) -> Result<()> {
+        if master_check_enabled() && !master_check::check_perm(self.file_owner()) {
             return Err(FsError::NoPermission);
         }
         Ok(())
@@ -1277,10 +1295,13 @@ impl DrmDev {
                 // recorded: every caller was told it was master, and
                 // `drm-probe --scanout` or `eclipse-bench`, which stand down
                 // on EBUSY, took the display from the running compositor.
+                // `drm_master_check_perm` comes first: EACCES before EBUSY.
+                self.master_check_perm()?;
                 if let Err(drm::MasterError::Busy) = drm::set_master(self.minor, self.file_owner())
                 {
                     return Err(FsError::Busy);
                 }
+                master_check::note_master(self.file_owner());
                 // Become DRM master, but do NOT switch the console to graphics
                 // yet: defer that to the first real scanout (`drm::scanout`). If
                 // the client stalls before presenting a frame (e.g. its renderer
@@ -1303,6 +1324,8 @@ impl DrmDev {
                 // `drm_dropmaster_ioctl`: a file that is not the master has
                 // nothing to drop (EINVAL), and in particular does not run
                 // the console restore below on the compositor's behalf.
+                // `drm_master_check_perm` comes first: EACCES before EINVAL.
+                self.master_check_perm()?;
                 if !drm::drop_master(self.minor, self.file_owner()) {
                     return Err(FsError::InvalidParam);
                 }
@@ -4471,7 +4494,9 @@ pub fn master_check_enabled() -> bool {
 /// The modeset ioctls `drm_ioctls[]` marks `DRM_MASTER` and nothing else:
 /// `drm_ioctl_permit` refuses them to anyone but the current master, before
 /// the handler runs. (`AUTH_MAGIC`, `CREATE_LEASE`, `LIST_LESSEES` and
-/// `REVOKE_LEASE` are `DRM_MASTER` too, and check it in their own arms.)
+/// `REVOKE_LEASE` are `DRM_MASTER` too, and check it in their own arms;
+/// `SET_MASTER` and `DROP_MASTER` have `drm_master_check_perm` instead,
+/// [`master_check`].)
 fn needs_master(cmd: u32) -> bool {
     matches!(
         cmd,
@@ -6740,6 +6765,7 @@ mod atomic_walk_tests;
 #[cfg(test)]
 mod syncobj_wait_routing_tests;
 
+pub(crate) mod master_check;
 #[cfg(test)]
 mod master_check_tests;
 #[cfg(test)]
