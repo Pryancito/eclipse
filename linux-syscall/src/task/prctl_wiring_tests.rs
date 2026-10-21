@@ -289,9 +289,10 @@ fn a_thread_that_was_never_named_is_called_after_its_executables_basename() {
     // it is the whole program's name rather than its path: a buffer of
     // sixteen bytes could not hold the path anyway, and `ps` prints this.
     let proc = a_process(47_145, "prctl-basename");
-    proc.linux().set_execute_path("/usr/local/bin/a-program");
+    let it = proc.clone();
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
+            it.linux().set_execute_path("/usr/local/bin/a-program");
             let mut buf = [A_SEED; TASK_COMM_LEN];
             assert_eq!(
                 sys.sys_prctl(PR_GET_NAME, buf.as_mut_ptr() as usize, 0, 0, 0),
@@ -303,6 +304,29 @@ fn a_thread_that_was_never_named_is_called_after_its_executables_basename() {
                 "an unnamed thread was not named after its executable"
             );
             assert_eq!(buf[9], 0, "the fallback name came back unterminated");
+
+            // The fallback is the ONE name that can be longer than
+            // fifteen bytes: `PR_SET_NAME` never stores more, but an
+            // executable's basename has no such limit, so this is the
+            // only path on which the terminator can be lost -- and a
+            // caller that reads a sixteen-byte buffer with no NUL in it
+            // runs off the end of its own array.
+            it.linux()
+                .set_execute_path("/opt/a-program-whose-name-is-far-too-long");
+            let mut long = [A_SEED; TASK_COMM_LEN];
+            assert_eq!(
+                sys.sys_prctl(PR_GET_NAME, long.as_mut_ptr() as usize, 0, 0, 0),
+                Ok(0)
+            );
+            assert_eq!(
+                &long[..15],
+                b"a-program-whose",
+                "a long fallback name was not cut at fifteen bytes"
+            );
+            assert_eq!(
+                long[15], 0,
+                "a fallback name longer than the buffer came back unterminated"
+            );
         })
     });
 }
