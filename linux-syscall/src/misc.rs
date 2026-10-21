@@ -2875,3 +2875,9 @@ mod uts_and_machine_tests;
 /// negotiation, and an I/O priority set on a task and read back off it.
 #[cfg(test)]
 mod caps_and_ioprio_tests;
+
+/// The machine as a whole rather than the process: the reboot nobody but
+/// root may ask for, the kernel log, the entropy source and the memory
+/// barriers, plus the execution base of a thread.
+#[cfg(test)]
+mod boot_and_log_tests;
