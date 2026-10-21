@@ -210,6 +210,9 @@ impl linux_object::fs::FsIoctlContext for FsIoctlCtx<'_> {
 mod ioctl_number_tests;
 
 #[cfg(test)]
+mod permission_tests;
+
+#[cfg(test)]
 mod positional_io_tests;
 
 #[cfg(test)]
