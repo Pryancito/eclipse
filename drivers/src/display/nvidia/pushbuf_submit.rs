@@ -250,8 +250,14 @@ impl super::NvidiaGpu {
                 );
                 return Err(nv::EINVAL);
             };
+            // `exec_submit` answers `Ok` whenever the call itself went
+            // through; whether the push reached the ring is in the stage
+            // statuses, as `submit_push_plain` reads them for EXEC. Only
+            // the call's own failure was being read here, so a full ring
+            // (`NV_ERR_BUSY_RETRY`) or a VA the RM could not look up was
+            // reported to the client as submitted.
             match nvidia_rm_sys::rm_init::exec_submit(device_instance, ctx_idx, va, len) {
-                Ok(out) => log::debug!(
+                Ok(out) if out.submit_status == 0 => log::debug!(
                     "[nouveau-uapi] GEM_PUSHBUF push[{}]: submitted va={:#x} len={:#x} \
                      (gp_put={})",
                     i,
@@ -259,6 +265,18 @@ impl super::NvidiaGpu {
                     len,
                     out.gp_put_after
                 ),
+                Ok(out) => {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] GEM_PUSHBUF push[{i}]: the ring did not take \
+                         va={va:#x} len={len:#x} (lookup={:#x} map={:#x} token={:#x} \
+                         submit={:#x}) -> EIO",
+                        out.lookup_status,
+                        out.map_status,
+                        out.token_status,
+                        out.submit_status
+                    );
+                    return Err(nv::EIO);
+                }
                 Err(status) => {
                     crate::klog_warn!(
                         "[nouveau-uapi] GEM_PUSHBUF push[{i}]: the ring refused va={va:#x} \
