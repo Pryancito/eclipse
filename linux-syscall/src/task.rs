@@ -3096,6 +3096,12 @@ mod prctl_wiring_tests;
 #[cfg(test)]
 mod sched_attr_wiring_tests;
 
+/// `chmod(2)` by path through the syscall: the file the gate is asked
+/// about, the acting id it is judged against, the refusal that arrives
+/// before the write, and the verdict's own mode reaching the inode.
+#[cfg(test)]
+mod chmod_wiring_tests;
+
 #[cfg(test)]
 mod comm_from_path_tests {
     //! `comm` after an `execve`: the last component of the path, which is
