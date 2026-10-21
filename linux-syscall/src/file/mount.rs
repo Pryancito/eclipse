@@ -84,6 +84,7 @@ mod tests {
     use alloc::boxed::Box;
     use alloc::format;
     use alloc::string::String;
+    use alloc::vec;
     use linux_object::process::LinuxProcess;
     use rcore_fs_ramfs::RamFS;
     use zircon_object::task::{Process, ROOT_JOB};
@@ -160,6 +161,43 @@ mod tests {
             got,
             Err(LxError::EPERM),
             "an unprivileged mount was not refused"
+        );
+    }
+
+    /// A target no other test names, so looking for it in the mount table --
+    /// which every test in this binary shares -- cannot race with anything.
+    const A_TARGET_OF_ITS_OWN: &str = "/mount-gate-probe";
+
+    #[test]
+    fn a_refused_mount_leaves_no_trace_in_the_mount_table() {
+        // The errno alone does not say the mount did not happen. Asking
+        // `may_mount` AFTER the work returns EPERM just the same, having
+        // mounted the filesystem on the way -- which is the whole of the
+        // bug. So this asks what userspace would ask: `/proc/mounts`, where
+        // `register_mount` publishes a mount that took place.
+        let proc = an_unprivileged_process(45_544, "mount-no-trace");
+        let (none, target, fstype) = (c("none"), c(A_TARGET_OF_ITS_OWN), c("proc"));
+        let (got, mounts) = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let got = sys.sys_mount(at(&none), at(&target), at(&fstype), 0, UserInPtr::from(0));
+                let inode = sys.linux_process().lookup_inode("/proc/mounts").unwrap();
+                let mut buf = vec![0u8; 8192];
+                let read = inode.read_at(0, &mut buf).unwrap();
+                buf.truncate(read);
+                (got, String::from_utf8_lossy(&buf).into_owned())
+            })
+        });
+
+        assert_eq!(
+            got,
+            Err(LxError::EPERM),
+            "an unprivileged mount was not refused"
+        );
+        assert!(
+            !mounts.contains(A_TARGET_OF_ITS_OWN),
+            "a mount the gate refused was carried out anyway and published \
+             in /proc/mounts:\n{}",
+            mounts
         );
     }
 
