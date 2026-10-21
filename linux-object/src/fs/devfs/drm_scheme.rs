@@ -3354,20 +3354,24 @@ impl DrmDev {
                     return Err(FsError::OpNotSupported);
                 }
                 let req = unsafe { &*(data as *const DrmSyncobjTransfer) };
-                // `drm_syncobj_transfer_ioctl`: the padding first, then
-                // `drm_syncobj_find_fence`, for which WAIT_FOR_SUBMIT is the
-                // only flag. Neither field was read.
+                // `drm_syncobj_transfer_ioctl`: the padding first; then
+                // `drm_syncobj_transfer_to_timeline`/`_to_binary` look the
+                // destination up (`drm_syncobj_find`, ENOENT) before
+                // `drm_syncobj_find_fence` refuses a flag other than
+                // WAIT_FOR_SUBMIT (EINVAL) and looks the source up (ENOENT).
+                // The flags were read ahead of both ends, so an unknown
+                // destination with a bad flag was EINVAL.
                 if req.pad != 0 {
                     return Err(FsError::InvalidParam);
+                }
+                let pid = drm::current_pid();
+                if !zcore_drivers::scheme::syncobj::usable_by(pid, req.dst_handle) {
+                    return Err(FsError::EntryNotFound);
                 }
                 if req.flags & !DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0 {
                     return Err(FsError::InvalidParam);
                 }
-                // Both ends must be the caller's (`drm_syncobj_find` on each).
-                if !zcore_drivers::scheme::syncobj::all_usable_by(
-                    drm::current_pid(),
-                    &[req.dst_handle, req.src_handle],
-                ) {
+                if !zcore_drivers::scheme::syncobj::usable_by(pid, req.src_handle) {
                     return Err(FsError::EntryNotFound);
                 }
                 // Without WAIT_FOR_SUBMIT the source has to carry a fence at
