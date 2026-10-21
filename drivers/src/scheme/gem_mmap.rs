@@ -93,7 +93,15 @@ impl HandleSlice {
 /// Reserve the next per-GPU slice of the driver-private handle range. Called
 /// once per GPU, from `NvidiaGpu::new`.
 pub fn alloc_handle_slice() -> HandleSlice {
-    let slot = NEXT_SLICE.fetch_add(1, Ordering::Relaxed);
+    alloc_handle_slice_from(&NEXT_SLICE)
+}
+
+/// [`alloc_handle_slice`] over any counter, so a test can walk a private one
+/// to the end: the real counter is reserved from by every GPU the binary
+/// builds and never rewinds, and running IT out would hand every GPU built
+/// after the test an empty slice.
+fn alloc_handle_slice_from(next: &AtomicU32) -> HandleSlice {
+    let slot = next.fetch_add(1, Ordering::Relaxed);
     if slot >= HANDLE_SLICES {
         crate::klog_warn!(
             "[gem] more than {} GPUs asked for a GEM handle slice -- GEM_NEW on this one will \
@@ -107,7 +115,12 @@ pub fn alloc_handle_slice() -> HandleSlice {
         // Skip id `0x8000_0000` on the first slice only, so the very first
         // handle stays `0x8000_0001` as it has always been.
         base: if slot == 0 { base + 1 } else { base },
-        end: base + HANDLES_PER_GPU,
+        // The last slice ends at the top of `u32`, one past `u32::MAX`, which
+        // a `u32` cannot hold: `base + HANDLES_PER_GPU` overflowed there (a
+        // panic with overflow checks on, and without them a wrap to 0 that
+        // made the 64th card's slice contain nothing). Saturating costs that
+        // card one id, `u32::MAX`, and nothing else.
+        end: base.saturating_add(HANDLES_PER_GPU),
     }
 }
 
@@ -586,6 +599,86 @@ mod handle_slice_tests {
         let last_end =
             (DRIVER_HANDLE_BASE as u64) + (HANDLE_SLICES as u64) * (HANDLES_PER_GPU as u64);
         assert_eq!(last_end, (u32::MAX as u64) + 1);
+    }
+
+    /// The last slice is the one whose end is that top of `u32`, which the
+    /// field cannot hold: `base + HANDLES_PER_GPU` used to overflow there. It
+    /// now ends at `u32::MAX`, so the 64th card has every id of its range but
+    /// the last one. Over a private counter, because the real one belongs to
+    /// the whole binary.
+    #[test]
+    fn the_last_slice_ends_at_the_top_of_u32_instead_of_overflowing() {
+        let next = AtomicU32::new(HANDLE_SLICES - 1);
+        let s = alloc_handle_slice_from(&next);
+        assert_eq!(
+            s.base(),
+            DRIVER_HANDLE_BASE + (HANDLE_SLICES - 1) * HANDLES_PER_GPU
+        );
+        assert_eq!(s.end(), u32::MAX);
+        assert!(s.contains(s.base()));
+        assert!(s.contains(u32::MAX - 1));
+        assert!(!s.contains(u32::MAX), "the one id saturating costs");
+        // And the first slice over a fresh counter skips `0x8000_0000`.
+        let first = alloc_handle_slice_from(&AtomicU32::new(0));
+        assert_eq!(first.base(), DRIVER_HANDLE_BASE + 1);
+        assert_eq!(first.end(), DRIVER_HANDLE_BASE + HANDLES_PER_GPU);
+    }
+
+    /// Past the last slice: the counter keeps counting, the answer is the
+    /// empty slice, and dmesg says so, once per card that asked.
+    #[test]
+    fn the_sixty_fifth_card_gets_the_empty_slice_and_a_line_in_dmesg() {
+        let next = AtomicU32::new(HANDLE_SLICES);
+        crate::utils::host_hooks::take_dmesg();
+        assert_eq!(alloc_handle_slice_from(&next), HandleSlice::exhausted());
+        assert_eq!(next.load(Ordering::Relaxed), HANDLE_SLICES + 1);
+        assert_eq!(alloc_handle_slice_from(&next), HandleSlice::exhausted());
+        let dmesg = crate::utils::host_hooks::take_dmesg();
+        let said: Vec<&str> = dmesg
+            .iter()
+            .map(|(_, l)| l.as_str())
+            .filter(|l| l.contains("more than 64 GPUs asked for a GEM handle slice"))
+            .collect();
+        assert_eq!(said.len(), 2, "{:?}", dmesg);
+        assert!(said[0].contains("GEM_NEW on this one will fail"));
+    }
+}
+
+/// The bookkeeping calls with a trivial answer that nothing above asked:
+/// the count of a handle, pid 0 as a process to release or rekey, and
+/// unregistering what was never registered.
+#[cfg(test)]
+mod bookkeeping_edge_tests {
+    use super::*;
+
+    const OWNER: u64 = 77_001;
+    const OTHER: u64 = 77_002;
+
+    #[test]
+    fn pid_zero_is_nobodys_process_to_release_or_rekey() {
+        let _g = crate::test_globals::LOCK.lock();
+        let handle = DRIVER_HANDLE_BASE + 0x20_0001;
+        assert_eq!(
+            ref_count(handle),
+            None,
+            "a handle nobody registered has no count"
+        );
+        register(handle, 0x5_0000_0000, 0x1000, OWNER);
+        assert_eq!(ref_count(handle), Some(1));
+        assert_eq!(add_ref(handle, OTHER), Some(2));
+        // A reference the kernel itself holds (no current thread).
+        assert_eq!(add_ref(handle, 0), Some(3));
+        assert_eq!(ref_count(handle), Some(3));
+        // Pid 0 is "no current thread", not a process: there is no exit that
+        // drops what it holds and no zombie to rekey, and nobody else's
+        // references go with it.
+        assert!(release_pid(0).is_empty());
+        assert_eq!(rekey_pid(0, OTHER), 0);
+        assert_eq!(ref_count(handle), Some(3), "pid 0 took a holder with it");
+        assert!(holds(handle, OWNER) && holds(handle, OTHER));
+        assert!(unregister(handle));
+        assert!(!unregister(handle), "unregistered twice");
+        assert_eq!(ref_count(handle), None);
     }
 }
 

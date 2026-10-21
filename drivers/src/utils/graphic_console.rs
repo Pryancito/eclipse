@@ -14,6 +14,9 @@ use rcore_console::{
 use super::shadow_fb::ShadowFramebuffer;
 use crate::scheme::display::DisplayScheme;
 
+#[cfg(test)]
+extern crate std;
+
 /// Height in pixels of one text row (matches `rcore_console`'s `FONT_9X18`).
 const CHAR_HEIGHT: usize = 18;
 /// Width in pixels of one character cell (matches `rcore_console`'s `FONT_9X18`).
@@ -84,7 +87,47 @@ pub fn note_panicking() {
 
 #[inline]
 fn panicking() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = test_panic_override() {
+        return forced;
+    }
     PANICKING.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// Forces [`panicking`]'s answer for the calling thread, so a host test can
+// ask what the console does mid-panic without storing into [`PANICKING`],
+// which is process-wide and never cleared: one store would silence the cache
+// for every test running beside it. Below the functions under test, like
+// [`test_gate_override`]: `ensure_dims`, `redraw` and `write` run their real
+// code and only the flag's answer is substituted.
+#[cfg(test)]
+std::thread_local! {
+    static PANIC_OVERRIDE: core::cell::Cell<Option<bool>> = const { core::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn test_panic_override() -> Option<bool> {
+    PANIC_OVERRIDE.with(|c| c.get())
+}
+
+/// Hold [`panicking`]'s answer at `true` on this thread for as long as the
+/// guard lives.
+#[cfg(test)]
+struct ForcedPanic;
+
+#[cfg(test)]
+impl ForcedPanic {
+    fn new() -> Self {
+        PANIC_OVERRIDE.with(|c| c.set(Some(true)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcedPanic {
+    fn drop(&mut self) {
+        PANIC_OVERRIDE.with(|c| c.set(None));
+    }
 }
 
 /// Presents refused because the `dyn DisplayScheme` fat pointer could not be
@@ -1535,6 +1578,216 @@ mod scrollback_tests {
         lsb.buf.truncate(1);
         lsb.new_line(tagged(22));
         assert_eq!(lsb.buf.len(), 3);
+    }
+
+    // ------------------------------------------------- the rest of the paths
+
+    /// The gate's other forced answer: `live` dispatches, whatever the fat
+    /// pointer would have said. Every test above relies on a live gate and
+    /// none pinned the forced form of it.
+    #[test]
+    fn a_gate_forced_live_dispatches_the_present() {
+        let (mut lsb, d) = console(4, 3);
+        paint_row(&mut lsb, 1, 22);
+        let _gate = ForcedDisplayGate::new(true);
+        lsb.present(false);
+        assert_eq!(on_screen(&d, 1), tag_argb(22));
+    }
+
+    /// Scrolling forward by less than the distance scrolled back lands in
+    /// between, not on the live screen: two pages back and one forward is one
+    /// page back.
+    #[test]
+    fn a_page_forward_from_two_pages_back_is_one_page_back() {
+        let (mut lsb, d) = console(4, 6);
+        let s = stream(&mut lsb, 30);
+        let page = lsb.height() - 2;
+        lsb.scroll_history(1);
+        lsb.scroll_history(1);
+        assert_eq!(lsb.scrollback_offset, Some(2 * page));
+        lsb.scroll_history(-1);
+        flush(&lsb);
+        assert_eq!(lsb.scrollback_offset, Some(page));
+        assert_eq!(
+            screen(&d, 6),
+            s[s.len() - 6 - page..s.len() - page].to_vec()
+        );
+    }
+
+    /// An offset that outruns the history -- which `scroll_history` never
+    /// produces, but the field is plain data -- maps the rows above the
+    /// oldest line to nothing, and nothing is drawn as background rather than
+    /// as the newest lines wrapped around.
+    #[test]
+    fn rows_before_the_oldest_line_are_background_not_a_wrap() {
+        let (mut lsb, d) = console(4, 4);
+        // Tag the top row first so the OLDEST line of history is not blank,
+        // or a wrap and a gap would look the same.
+        paint_row(&mut lsb, 0, 30);
+        stream(&mut lsb, 6);
+        let history_len = lsb.history.len();
+        assert_eq!(cached(&lsb, 0), tag_argb(23));
+        lsb.scrollback_offset = Some(history_len + 2);
+        lsb.redraw();
+        flush(&lsb);
+        assert_eq!(
+            screen(&d, 4),
+            vec![blank_argb(), blank_argb(), tag_argb(30), blank_argb()],
+            "two rows of gap, then the oldest line, then the next"
+        );
+    }
+
+    /// Mid-panic the console stands down from everything but drawing: the
+    /// cache is neither resized nor replayed (it may be what the fault
+    /// corrupted), and a cell with no cache slot is still rasterised, because
+    /// the text going through here IS the crash report.
+    #[test]
+    fn mid_panic_the_glyphs_are_drawn_and_the_cache_is_left_alone() {
+        let (mut lsb, d) = console(4, 3);
+        paint_row(&mut lsb, 0, 23);
+        flush(&lsb);
+        lsb.buf.clear(); // what a corrupted console looks like
+        let _panic = ForcedPanic::new();
+        lsb.write(1, 0, tagged(24));
+        assert!(lsb.buf.is_empty(), "the cache was rebuilt mid-panic");
+        flush(&lsb);
+        assert_eq!(
+            on_screen(&d, 1),
+            tag_argb(24),
+            "the report's cell was dropped"
+        );
+        assert_eq!((lsb.cursor_row, lsb.cursor_col), (1, 1));
+        // A repaint would replay the (empty) cache over the report.
+        lsb.redraw();
+        flush(&lsb);
+        assert_eq!(
+            screen(&d, 3),
+            vec![tag_argb(23), tag_argb(24), blank_argb()]
+        );
+    }
+
+    /// A region scroll while the view is scrolled back moves the cache and
+    /// redraws the view instead of moving pixels: its history rows stay where
+    /// they are, and the two live rows that anchor the bottom of a page show
+    /// the moved cache. Back on the live screen, the whole cache shows.
+    #[test]
+    fn a_region_scroll_while_scrolled_back_moves_the_cache_and_redraws_the_view() {
+        let (mut lsb, d) = console(4, 6);
+        stream(&mut lsb, 20);
+        let live = cached_rows(&lsb, 6);
+        lsb.scroll_history(1);
+        flush(&lsb);
+        let shown = screen(&d, 6);
+        assert_ne!(shown, live);
+        assert_eq!(&shown[4..], &live[..2], "a page keeps two live rows");
+
+        lsb.scroll_region_up(0, 5, 1, Cell::default());
+        flush(&lsb);
+        let mut up = live[1..].to_vec();
+        up.push(blank_argb());
+        assert_eq!(cached_rows(&lsb, 6), up);
+        let mut view = shown[..4].to_vec();
+        view.extend_from_slice(&up[..2]);
+        assert_eq!(screen(&d, 6), view, "the history rows moved");
+
+        lsb.scroll_region_down(0, 5, 2, Cell::default());
+        flush(&lsb);
+        let mut down = vec![blank_argb(), blank_argb()];
+        down.extend_from_slice(&up[..4]);
+        assert_eq!(cached_rows(&lsb, 6), down);
+        let mut view = shown[..4].to_vec();
+        view.extend_from_slice(&down[..2]);
+        assert_eq!(screen(&d, 6), view, "the history rows moved");
+
+        lsb.scroll_history(-1);
+        flush(&lsb);
+        assert_eq!(
+            screen(&d, 6),
+            down,
+            "the live screen does not show the moved rows"
+        );
+    }
+
+    /// The wrapper the kernel actually drives: `present` and the blink tick
+    /// draw the block cursor where the Console's own parser says it is, honour
+    /// DECTCEM, and `repaint` rebuilds the screen from the cache.
+    #[test]
+    fn the_graphic_console_draws_the_parsers_cursor_and_honours_dectcem() {
+        use core::fmt::Write;
+        let d = FakeDisplay::new(8, 3);
+        let mut gc = GraphicConsole::new(d.clone() as Arc<dyn DisplayScheme>);
+        assert_eq!((gc.rows(), gc.columns()), (3, 8));
+        gc.write_str("ab").unwrap();
+        gc.present();
+        assert_eq!(gc.cursor(), (0, 2));
+        let under_cursor = |d: &FakeDisplay| d.px(2 * CHAR_WIDTH + 3, 8);
+        let inverted = blank_argb() ^ 0x00FF_FFFF;
+        assert_eq!(under_cursor(&d), inverted, "no block cursor at (0, 2)");
+        gc.set_cursor_blink(false);
+        assert_eq!(
+            under_cursor(&d),
+            blank_argb(),
+            "the blink tick did not hide it"
+        );
+        gc.set_cursor_blink(true);
+        assert_eq!(under_cursor(&d), inverted);
+        // `?25l`: a hidden cursor is neither presented nor blinked back.
+        gc.write_str("\x1b[?25l").unwrap();
+        gc.present();
+        assert_eq!(under_cursor(&d), blank_argb());
+        gc.set_cursor_blink(true);
+        assert_eq!(
+            under_cursor(&d),
+            blank_argb(),
+            "a hidden cursor blinked into view"
+        );
+        gc.write_str("\x1b[?25h").unwrap();
+        gc.present();
+        assert_eq!(under_cursor(&d), inverted);
+        // Something else drew on the panel (a VT switch): a repaint puts the
+        // console back, cursor included.
+        d.poke(3, 2 * CHAR_HEIGHT + 8, 0x00AB_CDEF);
+        d.poke(2 * CHAR_WIDTH + 3, 8, 0x00AB_CDEF);
+        gc.repaint();
+        assert_eq!(on_screen(&d, 2), blank_argb());
+        assert_eq!(under_cursor(&d), inverted);
+    }
+
+    /// The draw target every glyph goes through: pixels at negative
+    /// coordinates (a glyph clipped at the top-left by rcore-console) are
+    /// dropped before they can wrap to a huge unsigned column, and the target
+    /// reports the panel's size.
+    #[test]
+    fn the_draw_target_drops_negative_pixels_and_knows_its_size() {
+        use rcore_console::embedded_graphics::prelude::Point;
+        let d = FakeDisplay::new(1, 1);
+        let shadow = ShadowFramebuffer::new(CHAR_WIDTH, CHAR_HEIGHT);
+        let mut draw = ShadowDraw {
+            shadow: shadow.clone(),
+            width: CHAR_WIDTH as u32,
+            height: CHAR_HEIGHT as u32,
+        };
+        assert_eq!(
+            draw.size(),
+            Size::new(CHAR_WIDTH as u32, CHAR_HEIGHT as u32)
+        );
+        draw.draw_iter([
+            Pixel(Point::new(-1, 0), Rgb888::new(0xFF, 0, 0)),
+            Pixel(Point::new(0, -1), Rgb888::new(0, 0xFF, 0)),
+            Pixel(Point::new(1, 2), Rgb888::new(0x11, 0x22, 0x33)),
+        ])
+        .unwrap();
+        shadow.present(&*d);
+        assert_eq!(d.px(1, 2), 0x0011_2233);
+        assert_eq!(
+            (
+                d.px(0, 0),
+                d.px(CHAR_WIDTH - 1, 0),
+                d.px(0, CHAR_HEIGHT - 1)
+            ),
+            (0, 0, 0),
+            "a negative coordinate wrapped onto the panel"
+        );
     }
 }
 
