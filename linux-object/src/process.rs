@@ -43,6 +43,8 @@ pub use forking_thread::forget_forking_thread;
 /// The file-descriptor table's allocator and its two range sweeps.
 mod census;
 mod child_usage;
+/// Who may chown what, and the set-ID bits it takes away.
+mod chown;
 mod cwd;
 mod orphan_group;
 pub use census::*;
@@ -3456,36 +3458,6 @@ impl LinuxProcess {
             metadata.mode,
             metadata.type_,
         )
-    }
-
-    /// Change owner/group following a conservative POSIX-compatible policy.
-    pub fn chown_metadata(&self, metadata: &mut Metadata, uid: u32, gid: u32) -> LxResult {
-        let creds = self.credentials();
-        // `chown_ok()`/`chgrp_ok()` (`fs/attr.c`): the owner, by
-        // `vfsuid_eq_kuid(vfsuid, current_fsuid())`, or `CAP_CHOWN`.
-        let privileged = creds.capable(CAP_CHOWN);
-        if !privileged {
-            if uid != NO_ID && uid != metadata.uid as u32 {
-                return Err(LxError::EPERM);
-            }
-            if creds.fsuid != metadata.uid as u32 {
-                return Err(LxError::EPERM);
-            }
-            // Linux `chgrp_ok`: `in_group_p(gid)` -- the acting gid plus the
-            // supplementary list, the same set `acts_as_group` answers for
-            // the permission check. The real gid is not in it.
-            if gid != NO_ID && !Self::acts_as_group(&creds, gid, true) {
-                return Err(LxError::EPERM);
-            }
-        }
-        if uid != NO_ID {
-            metadata.uid = uid as _;
-        }
-        if gid != NO_ID {
-            metadata.gid = gid as _;
-        }
-        metadata.mode &= !(MODE_SET_UID | MODE_SET_GID);
-        Ok(())
     }
 
     /// Set owner/group for a newly created inode.
