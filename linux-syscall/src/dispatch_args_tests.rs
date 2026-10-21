@@ -79,6 +79,10 @@ const SYNC_FILE_RANGE_WAIT_AFTER: usize = 4;
 const A_SYNC_FILE_RANGE_FLAG_OF_NOBODY: usize = 8;
 /// `arch_prctl`'s code for reading the thread pointer back.
 const ARCH_GET_FS: usize = 0x1003;
+/// `MS_BIND`, the one `mount` flag that changes which path is looked at
+/// first, and `POLLIN`, the one event a file always has.
+const MS_BIND: usize = 4096;
+const POLLIN: u16 = 0x0001;
 /// `get_mempolicy`'s flag that makes it answer about an address, and a
 /// `maxnode` big enough that a mask may be asked for at all.
 const MPOL_F_ADDR: usize = 1 << 1;
@@ -1723,6 +1727,157 @@ fn the_two_buffers_get_mempolicy_fills_and_the_one_arch_prctl_writes() {
                 .await,
                 0,
                 "arch_prctl took its second word as the code"
+            );
+        })
+    });
+}
+
+#[test]
+fn the_pointer_words_of_a_mount_and_an_unmount() {
+    // `mount` is a five-word arm and `umount2` a two-word one, and all but
+    // one of those seven words is a POINTER. That is what makes them the
+    // hardest arms here: under libos a user pointer is a HOST address, so a
+    // swap that puts a small number where a pointer belongs does not answer
+    // EFAULT, it dereferences it and takes the process with it. What works
+    // instead is three refusals that come from three DIFFERENT places --
+    // `parse_fstype` has one errno for a type that is empty and another for
+    // one it has never heard of, and `check()` has a third for a pointer
+    // that is null -- so each word can be told from its neighbour without
+    // anything being read out of nowhere.
+    let proc = a_process(48_160, "args-mount", "args_mount");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let (empty, unknown) = (c(""), c("nosuchfs"));
+            let (none, slash) = (c("none"), c("/"));
+
+            // The third word is the filesystem type. An empty one is EINVAL
+            // and a path is a type nobody has, which is ENODEV: with the
+            // type swapped for either of the two paths beside it the answer
+            // changes, and it changes to a DIFFERENT error rather than to a
+            // success nothing could tell apart.
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::MOUNT,
+                    [at(&none), at(&slash), at(&empty), 0, 0, 0]
+                )
+                .await,
+                errno(LxError::EINVAL),
+                "mount took one of its paths as the filesystem type"
+            );
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::MOUNT,
+                    [at(&none), at(&slash), at(&unknown), 0, 0, 0]
+                )
+                .await,
+                errno(LxError::ENODEV),
+                "mount did not read its third word as the type"
+            );
+
+            // And the fourth word is the only one that is not a pointer. With
+            // `MS_BIND` set the call goes down a different path entirely --
+            // it resolves the SOURCE before it has looked at the type at all
+            // -- so the same three pointers answer something other than
+            // ENODEV. That is what tells the flag word from a constant zero.
+            let bound = by_number(
+                sys,
+                Sys::MOUNT,
+                [at(&none), at(&slash), at(&unknown), MS_BIND, 0, 0],
+            )
+            .await;
+            // It resolves "none", which is not a path, and says so. Two
+            // mutants land on this one answer: with the flag word read as a
+            // zero the type would be judged instead (ENODEV), and with the
+            // source and the target swapped the path resolved would be "/",
+            // which is there.
+            assert_eq!(
+                bound,
+                errno(LxError::ENOENT),
+                "mount under MS_BIND did not resolve its FIRST word"
+            );
+
+            // `umount2`'s two words are a pointer and a flag word, and the
+            // one thing a swap cannot survive is the flag word being zero: a
+            // null pointer is refused by the check that every user pointer
+            // goes through, before the path is read.
+            assert_eq!(
+                by_number(sys, Sys::UMOUNT2, [at(&slash), 0, 0, 0, 0, 0]).await,
+                errno(LxError::EINVAL),
+                "umount2 took its flag word as the path"
+            );
+            assert_eq!(
+                by_number(sys, Sys::UMOUNT2, [0, at(&slash), 0, 0, 0, 0]).await,
+                errno(LxError::EFAULT),
+                "umount2 read a path out of a null pointer"
+            );
+        })
+    });
+}
+
+#[test]
+fn the_three_words_of_a_poll() {
+    // `poll(fds, nfds, timeout)`: an array, a count and a timeout, and the
+    // arm converts the third on the way through. Here too a swap must not be
+    // allowed to dereference a count, and `poll` makes that easy because it
+    // judges `nfds` against RLIMIT_NOFILE BEFORE the array is touched: a
+    // pointer in the count's place is a refusal and not a read. What tells
+    // the count from the timeout is an entry that is ready: a count of one
+    // reports it and a count of zero has nothing to report.
+    let proc = a_process(48_161, "args-poll", "args_poll");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            a_file_named(sys.linux_process(), "/args_poll", "f", b"0123456789");
+            let path = c("/args_poll/f");
+            let fd = opened(sys, &path, O_RDWR);
+            // `pollfd` as userspace lays one out: a descriptor, then the
+            // events asked for and the events reported, a half-word each.
+            // `PollFd` is `repr(C)` over exactly those three, so the eight
+            // bytes below are its layout as long as the three are these
+            // widths -- which is what this asks.
+            assert_eq!(
+                core::mem::size_of::<FileDesc>(),
+                4,
+                "a descriptor is not the four bytes a pollfd starts with"
+            );
+            assert_eq!(
+                core::mem::size_of::<linux_object::fs::PollEvents>(),
+                2,
+                "an event word is not the two bytes a pollfd carries two of"
+            );
+            let mut entry = [fd as u32, POLLIN as u32];
+
+            // A file always has data to read, so one entry comes back
+            // reported. With the count and the timeout in each other's
+            // places the count would be zero and nothing would.
+            assert_eq!(
+                by_number(sys, Sys::POLL, [entry.as_mut_ptr() as usize, 1, 0, 0, 0, 0]).await,
+                1,
+                "poll took its third word as the count"
+            );
+            assert_eq!(
+                entry[1] >> 16,
+                POLLIN as u32,
+                "the entry came back without the event it was reported for"
+            );
+
+            // The second word is a count, judged against the open-file limit
+            // before the array is read: an address in its place is far past
+            // that limit, which is a refusal and not a dereference.
+            assert_eq!(
+                by_number(sys, Sys::POLL, [entry.as_mut_ptr() as usize, 0, 0, 0, 0, 0]).await,
+                0,
+                "poll with nothing to look at"
+            );
+
+            // And the first word is the array. A null one is refused by the
+            // check every user pointer goes through, so the timeout in its
+            // place is that refusal rather than an answer.
+            assert_eq!(
+                by_number(sys, Sys::POLL, [0, 1, 0, 0, 0, 0]).await,
+                errno(LxError::EFAULT),
+                "poll read an array out of a null pointer"
             );
         })
     });
