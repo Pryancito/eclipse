@@ -7701,6 +7701,11 @@ mod hub_tree_tests;
 #[cfg(test)]
 mod msc_tests;
 
+/// La recuperación de un controlador atragantado y el sondeo de respaldo que
+/// la llama.
+#[cfg(test)]
+mod recovery_tests;
+
 /// `/proc/usbhid`: el informe que contesta si el sistema ve lo que se acaba
 /// de enchufar, que es lo que se pega en un informe de fallo.
 #[cfg(test)]
