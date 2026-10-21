@@ -35,6 +35,13 @@ pub(crate) fn getcwd_into(cwd: &str, mut buf: UserOutPtr<u8>, len: usize) -> Sys
 /// Where `chdir` and `fchdir` leave a process.
 mod cwd;
 
+/// `getdents64`, `linkat`, `renameat` and `renameat2` through the syscall:
+/// that a second name is the same inode, the order each one judges its
+/// arguments in, and that the directory-into-itself trap closes before the
+/// filesystem is asked.
+#[cfg(test)]
+mod wiring_tests;
+
 impl Syscall<'_> {
     /// return a null-terminated string containing an absolute pathname
     /// that is the current working directory of the calling process.
