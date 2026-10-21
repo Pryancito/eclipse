@@ -68,6 +68,29 @@ const A_FACCESSAT_FLAG_OF_NOBODY: usize = 0x2000;
 /// keeps in `rdev` and `mkdir` has no word for.
 const S_IFCHR: usize = 0o020000;
 const NULL_DEVICE: usize = 0x0103;
+/// `POSIX_FADV_WILLNEED`, and an advice nobody has.
+const POSIX_FADV_WILLNEED: usize = 3;
+const AN_ADVICE_OF_NOBODY: usize = 99;
+/// A length that is negative as a `loff_t`, which three of these arms refuse
+/// and none of them accepts as an offset.
+const A_NEGATIVE_LENGTH: usize = -1isize as usize;
+/// Two of `sync_file_range`'s flags, and a bit nobody has.
+const SYNC_FILE_RANGE_WAIT_AFTER: usize = 4;
+const A_SYNC_FILE_RANGE_FLAG_OF_NOBODY: usize = 8;
+/// `arch_prctl`'s code for reading the thread pointer back.
+const ARCH_GET_FS: usize = 0x1003;
+/// `MS_BIND`, the one `mount` flag that changes which path is looked at
+/// first, and `POLLIN`, the one event a file always has.
+const MS_BIND: usize = 4096;
+const POLLIN: u16 = 0x0001;
+/// `get_mempolicy`'s flag that makes it answer about an address, and a
+/// `maxnode` big enough that a mask may be asked for at all.
+const MPOL_F_ADDR: usize = 1 << 1;
+const MPOL_DEFAULT: i32 = 0;
+const ENOUGH_NODES: usize = 64;
+/// What a buffer is seeded with, so that "wrote nothing" cannot pass for
+/// "wrote zero" and a write past the end shows up.
+const A_SEED: u8 = 0xaa;
 /// A page, as the memory arms count.
 const PAGE: usize = PAGE_SIZE;
 /// `PROT_READ | PROT_WRITE`, and read-only on its own.
@@ -1222,6 +1245,27 @@ fn the_file_and_the_offset_are_the_last_two_words_of_the_only_six_word_arm() {
                 errno(LxError::EINVAL),
                 "mmap took an offset that is not a whole number of pages"
             );
+
+            // The third word is a protection, and nothing it can answer says
+            // which one it got: what a protection does is only visible in
+            // what the page will take. A read-only page refuses a write --
+            // and `mmap` keeps only the three bits it knows, so the flag word
+            // in its place would be truncated to `PROT_WRITE` and take one.
+            let only_read = sys.zircon_process().vmar().addr() + 0x4820_0000;
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::MMAP,
+                    [only_read, PAGE, PROT_READ, ANON_FIXED, NO_FILE, 0]
+                )
+                .await,
+                only_read as isize,
+                "a read-only anonymous page maps"
+            );
+            assert!(
+                !takes_a_write(sys, only_read),
+                "the page mmap mapped read-only took a write"
+            );
         })
     });
 }
@@ -1263,20 +1307,24 @@ fn a_mapping_is_protected_and_removed_a_page_at_a_time() {
                 "mprotect took a page size as a set of protection bits"
             );
 
-            // The same two words again, this time removing the mapping.
+            // The same two words again, this time removing the mapping --
+            // and the SECOND page of the two, not the first. Swapping an
+            // address and a length leaves their sum alone, so a range asked
+            // only about where it ENDS cannot tell the two apart: what
+            // separates them is a page below the start surviving.
             let gone = anonymous(sys, 0x4a00_0000, 2).await;
             assert_eq!(
-                by_number(sys, Sys::MUNMAP, [gone, PAGE, 0, 0, 0, 0]).await,
+                by_number(sys, Sys::MUNMAP, [gone + PAGE, PAGE, 0, 0, 0, 0]).await,
                 0,
                 "munmap over one mapped page"
             );
             assert!(
-                !takes_a_write(sys, gone),
+                !takes_a_write(sys, gone + PAGE),
                 "the page the first word named is still there"
             );
             assert!(
-                takes_a_write(sys, gone + PAGE),
-                "the length reached a page munmap was not given"
+                takes_a_write(sys, gone),
+                "munmap reached back past the address it was given"
             );
         })
     });
@@ -1342,6 +1390,494 @@ fn the_break_and_a_moved_mapping_both_answer_with_an_address() {
                 by_number(sys, Sys::MREMAP, [to, PAGE, PAGE, to, 2, 0]).await,
                 errno(LxError::EINVAL),
                 "mremap took an address as a set of flags"
+            );
+        })
+    });
+}
+
+#[test]
+fn the_words_of_the_hints_and_the_syncs_about_a_file() {
+    // Seven arms that answer zero and nothing else: `fadvise64`,
+    // `readahead`, `sync_file_range`, `fsync`, `fdatasync`, `syncfs` and
+    // `sync`. Nothing comes back out of any of them, so what tells their
+    // words apart is WHICH of them refuses: the word next to the descriptor
+    // is a number no descriptor has, so a call that read it instead would be
+    // about a file nobody opened.
+    let proc = a_process(48_150, "args-hint", "args_hint");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            a_file_named(sys.linux_process(), "/args_hint", "f", b"0123456789");
+            let path = c("/args_hint/f");
+            let fd = opened(sys, &path, O_RDWR);
+
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::FADVISE64,
+                    [fd, A_DESCRIPTOR_OF_NOBODY, 4, POSIX_FADV_WILLNEED, 0, 0]
+                )
+                .await,
+                0,
+                "fadvise64 took its second word as the descriptor"
+            );
+            // The fourth word is an advice and the third a length. An advice
+            // nobody has is EINVAL; with the two in each other's places the
+            // advice would be 4, which this kernel knows.
+            assert_eq!(
+                by_number(sys, Sys::FADVISE64, [fd, 0, 4, AN_ADVICE_OF_NOBODY, 0, 0]).await,
+                errno(LxError::EINVAL),
+                "fadvise64 took a length as its advice"
+            );
+            // And the second word is only an offset, which this call does not
+            // judge, while the third is a length read as a SIGNED number: a
+            // negative offset is fine and a negative length is not.
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::FADVISE64,
+                    [fd, A_NEGATIVE_LENGTH, 4, POSIX_FADV_WILLNEED, 0, 0]
+                )
+                .await,
+                0,
+                "fadvise64 judged an offset it has no business judging"
+            );
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::FADVISE64,
+                    [fd, 0, A_NEGATIVE_LENGTH, POSIX_FADV_WILLNEED, 0, 0]
+                )
+                .await,
+                errno(LxError::EINVAL),
+                "fadvise64 read its length as an unsigned number"
+            );
+
+            // `readahead`'s three words, told apart the same two ways.
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::READAHEAD,
+                    [fd, A_DESCRIPTOR_OF_NOBODY, 4, 0, 0, 0]
+                )
+                .await,
+                0,
+                "readahead took its second word as the descriptor"
+            );
+            assert_eq!(
+                by_number(sys, Sys::READAHEAD, [fd, 0, A_NEGATIVE_LENGTH, 0, 0, 0]).await,
+                errno(LxError::EINVAL),
+                "readahead read its count as an unsigned number"
+            );
+
+            // `sync_file_range` judges its FLAGS first and its descriptor
+            // last, so a flag nobody has is EINVAL even about a file nobody
+            // opened -- and that is also what tells its fourth word from its
+            // third, because the third in that place would be a flag it has.
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::SYNC_FILE_RANGE,
+                    [
+                        A_DESCRIPTOR_OF_NOBODY,
+                        0,
+                        SYNC_FILE_RANGE_WAIT_AFTER,
+                        A_SYNC_FILE_RANGE_FLAG_OF_NOBODY,
+                        0,
+                        0
+                    ]
+                )
+                .await,
+                errno(LxError::EINVAL),
+                "sync_file_range took a length as its flags"
+            );
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::SYNC_FILE_RANGE,
+                    [
+                        fd,
+                        A_DESCRIPTOR_OF_NOBODY,
+                        4,
+                        SYNC_FILE_RANGE_WAIT_AFTER,
+                        0,
+                        0
+                    ]
+                )
+                .await,
+                0,
+                "sync_file_range took its second word as the descriptor"
+            );
+
+            // Three arms of one word each.
+            assert_eq!(
+                by_number(sys, Sys::FSYNC, [fd, A_DESCRIPTOR_OF_NOBODY, 0, 0, 0, 0]).await,
+                0,
+                "fsync took its second word as the descriptor"
+            );
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::FDATASYNC,
+                    [fd, A_DESCRIPTOR_OF_NOBODY, 0, 0, 0, 0]
+                )
+                .await,
+                0,
+                "fdatasync took its second word as the descriptor"
+            );
+            assert_eq!(
+                by_number(sys, Sys::SYNCFS, [fd, A_DESCRIPTOR_OF_NOBODY, 0, 0, 0, 0]).await,
+                0,
+                "syncfs took its second word as the descriptor"
+            );
+            // And one of none at all: the table hands `sync` nothing, so with
+            // garbage in all six words it answers the same.
+            assert_eq!(
+                by_number(sys, Sys::SYNC, [A_DESCRIPTOR_OF_NOBODY; 6]).await,
+                0,
+                "sync looked at a word it does not have"
+            );
+        })
+    });
+}
+
+#[test]
+fn the_descriptors_these_arms_hand_out_and_the_ones_they_ask_for() {
+    // `pidfd_open`, `pidfd_getfd`, `inotify_init`, `epoll_create` and
+    // `name_to_handle_at`. Four of them answer a descriptor, which says
+    // nothing about where their words came from -- but `pidfd_getfd` hands
+    // back a descriptor on a file this process already has open, and THAT can
+    // be read from. Two of the five pass a word of their own rather than one
+    // of the caller's, and those are told apart by putting garbage where the
+    // word they do not read would be.
+    let proc = a_process(48_151, "args-pidfd", "args_pidfd");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            a_file_named(sys.linux_process(), "/args_pidfd", "f", b"0123456789");
+            let path = c("/args_pidfd/f");
+            // Twice, so the descriptor asked for below is not zero: a zero
+            // would be indistinguishable from the flag word beside it.
+            let _first = opened(sys, &path, O_RDWR);
+            let second = opened(sys, &path, O_RDWR);
+            assert_ne!(second, 0, "the second open did not get its own descriptor");
+
+            // The first word is a pid and the second a flag word. A pid of
+            // zero is the one pid `pidfd_open` refuses outright, so the flag
+            // word in its place is a refusal and not a descriptor.
+            let own = sys.zircon_process().id() as usize;
+            let pidfd = by_number(sys, Sys::PIDFD_OPEN, [own, 0, 0, 0, 0, 0]).await;
+            assert!(
+                pidfd >= 0,
+                "pidfd_open took its second word as the pid: {}",
+                pidfd
+            );
+
+            // `pidfd_getfd(pidfd, targetfd, flags)`: the flags have to be
+            // zero, so the descriptor in their place is a refusal; and the
+            // pidfd is the first word, so a regular file in its place is one
+            // too. What proves it worked is reading the file's own bytes out
+            // of the descriptor that came back.
+            let taken =
+                by_number(sys, Sys::PIDFD_GETFD, [pidfd as usize, second, 0, 0, 0, 0]).await;
+            assert!(
+                taken >= 0,
+                "pidfd_getfd did not hand back a descriptor: {}",
+                taken
+            );
+            let mut buf = [0u8; 4];
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::PREAD64,
+                    [taken as usize, buf.as_mut_ptr() as usize, 4, 0, 0, 0]
+                )
+                .await,
+                4
+            );
+            assert_eq!(
+                &buf, b"0123",
+                "the descriptor that came back does not name the file asked for"
+            );
+
+            // `inotify_init` has no words, and the table hands it a zero of
+            // its own rather than `a0`: with garbage in that place it still
+            // answers a descriptor, because garbage is not a flag word it
+            // would accept.
+            let watch = by_number(sys, Sys::INOTIFY_INIT, [A_DESCRIPTOR_OF_NOBODY; 6]).await;
+            assert!(
+                watch >= 0,
+                "inotify_init believed the garbage in its first word: {}",
+                watch
+            );
+
+            // `epoll_create(size)` takes one word, and the size has to be
+            // positive: the zero beside it is a refusal.
+            let epoll = by_number(sys, Sys::EPOLL_CREATE, [1, 0, 0, 0, 0, 0]).await;
+            assert!(
+                epoll >= 0,
+                "epoll_create took its second word as the size: {}",
+                epoll
+            );
+
+            // And one arm that reads nothing and refuses everything.
+            assert_eq!(
+                by_number(sys, Sys::NAME_TO_HANDLE_AT, [A_DESCRIPTOR_OF_NOBODY; 6]).await,
+                errno(LxError::ENOSYS),
+                "name_to_handle_at answered something other than ENOSYS"
+            );
+        })
+    });
+}
+
+#[test]
+fn the_two_buffers_get_mempolicy_fills_and_the_one_arch_prctl_writes() {
+    // `get_mempolicy(policy, nmask, maxnode, addr, flags)` is a five-word arm
+    // whose first TWO words are output pointers of different widths, so a
+    // swap writes four bytes where eight belong and eight where four do: the
+    // only thing that sees it is reading both buffers byte for byte, with a
+    // guard past the end of each. Its third and fourth words are told apart
+    // by a `maxnode` too small for a mask, and its fourth and fifth by an
+    // address that has to be mapped.
+    let proc = a_process(48_152, "args-mempol", "args_mempol");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            // Four slots' worth of room for a word, so that a swap writing
+            // eight bytes here cannot run off anything.
+            let mut policy = [MPOL_DEFAULT - 7; 4];
+            let mut mask = [A_SEED; 16];
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::GET_MEMPOLICY,
+                    [
+                        policy.as_mut_ptr() as usize,
+                        mask.as_mut_ptr() as usize,
+                        ENOUGH_NODES,
+                        0,
+                        0,
+                        0
+                    ]
+                )
+                .await,
+                0,
+                "get_mempolicy over a buffer with room"
+            );
+            assert_eq!(
+                policy[0], MPOL_DEFAULT,
+                "the mode did not land in its own word"
+            );
+            assert_eq!(
+                mask[..8],
+                [0u8; 8],
+                "the mask the second word names is not the one that was filled"
+            );
+            assert_eq!(
+                mask[8..],
+                [A_SEED; 8],
+                "the mask ran past the eight bytes this many nodes take"
+            );
+
+            // The third word is a node count and the fourth an address. A
+            // count of zero is too small for any mask at all, so the address
+            // in its place is a refusal and not a zeroed mask.
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::GET_MEMPOLICY,
+                    [
+                        policy.as_mut_ptr() as usize,
+                        mask.as_mut_ptr() as usize,
+                        0,
+                        0,
+                        0,
+                        0
+                    ]
+                )
+                .await,
+                errno(LxError::EINVAL),
+                "get_mempolicy accepted a node count with no room for a mask"
+            );
+
+            // And the fifth word is a flag word that makes the fourth an
+            // address this process has to have mapped. In each other's
+            // places the address would be 2 and the flags a number whose
+            // bits nobody defined.
+            let here = anonymous(sys, 0x4c00_0000, 1).await;
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::GET_MEMPOLICY,
+                    [policy.as_mut_ptr() as usize, 0, 0, here, MPOL_F_ADDR, 0]
+                )
+                .await,
+                0,
+                "get_mempolicy did not take its fourth word as the address"
+            );
+
+            // `arch_prctl(code, addr)`: the code names what to do and the
+            // address where to put it, and the only thing that proves which
+            // is which is the word landing there. A code nobody has is
+            // EINVAL, so the address in its place is a refusal.
+            let mut tp = [0usize; 1];
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::ARCH_PRCTL,
+                    [ARCH_GET_FS, tp.as_mut_ptr() as usize, 0, 0, 0, 0]
+                )
+                .await,
+                0,
+                "arch_prctl took its second word as the code"
+            );
+        })
+    });
+}
+
+#[test]
+fn the_pointer_words_of_a_mount_and_an_unmount() {
+    // `mount` is a five-word arm and `umount2` a two-word one, and all but
+    // one of those seven words is a POINTER. That is what makes them the
+    // hardest arms here: under libos a user pointer is a HOST address, so a
+    // swap that puts a small number where a pointer belongs does not answer
+    // EFAULT, it dereferences it and takes the process with it. What works
+    // instead is three refusals that come from three DIFFERENT places --
+    // `parse_fstype` has one errno for a type that is empty and another for
+    // one it has never heard of, and `check()` has a third for a pointer
+    // that is null -- so each word can be told from its neighbour without
+    // anything being read out of nowhere.
+    let proc = a_process(48_160, "args-mount", "args_mount");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let (empty, unknown) = (c(""), c("nosuchfs"));
+            let (none, slash) = (c("none"), c("/"));
+
+            // The third word is the filesystem type. An empty one is EINVAL
+            // and a path is a type nobody has, which is ENODEV: with the
+            // type swapped for either of the two paths beside it the answer
+            // changes, and it changes to a DIFFERENT error rather than to a
+            // success nothing could tell apart.
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::MOUNT,
+                    [at(&none), at(&slash), at(&empty), 0, 0, 0]
+                )
+                .await,
+                errno(LxError::EINVAL),
+                "mount took one of its paths as the filesystem type"
+            );
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::MOUNT,
+                    [at(&none), at(&slash), at(&unknown), 0, 0, 0]
+                )
+                .await,
+                errno(LxError::ENODEV),
+                "mount did not read its third word as the type"
+            );
+
+            // And the fourth word is the only one that is not a pointer. With
+            // `MS_BIND` set the call goes down a different path entirely --
+            // it resolves the SOURCE before it has looked at the type at all
+            // -- so the same three pointers answer something other than
+            // ENODEV. That is what tells the flag word from a constant zero.
+            let bound = by_number(
+                sys,
+                Sys::MOUNT,
+                [at(&none), at(&slash), at(&unknown), MS_BIND, 0, 0],
+            )
+            .await;
+            // It resolves "none", which is not a path, and says so. Two
+            // mutants land on this one answer: with the flag word read as a
+            // zero the type would be judged instead (ENODEV), and with the
+            // source and the target swapped the path resolved would be "/",
+            // which is there.
+            assert_eq!(
+                bound,
+                errno(LxError::ENOENT),
+                "mount under MS_BIND did not resolve its FIRST word"
+            );
+
+            // `umount2`'s two words are a pointer and a flag word, and the
+            // one thing a swap cannot survive is the flag word being zero: a
+            // null pointer is refused by the check that every user pointer
+            // goes through, before the path is read.
+            assert_eq!(
+                by_number(sys, Sys::UMOUNT2, [at(&slash), 0, 0, 0, 0, 0]).await,
+                errno(LxError::EINVAL),
+                "umount2 took its flag word as the path"
+            );
+            assert_eq!(
+                by_number(sys, Sys::UMOUNT2, [0, at(&slash), 0, 0, 0, 0]).await,
+                errno(LxError::EFAULT),
+                "umount2 read a path out of a null pointer"
+            );
+        })
+    });
+}
+
+#[test]
+fn the_three_words_of_a_poll() {
+    // `poll(fds, nfds, timeout)`: an array, a count and a timeout, and the
+    // arm converts the third on the way through. Here too a swap must not be
+    // allowed to dereference a count, and `poll` makes that easy because it
+    // judges `nfds` against RLIMIT_NOFILE BEFORE the array is touched: a
+    // pointer in the count's place is a refusal and not a read. What tells
+    // the count from the timeout is an entry that is ready: a count of one
+    // reports it and a count of zero has nothing to report.
+    let proc = a_process(48_161, "args-poll", "args_poll");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            a_file_named(sys.linux_process(), "/args_poll", "f", b"0123456789");
+            let path = c("/args_poll/f");
+            let fd = opened(sys, &path, O_RDWR);
+            // `pollfd` as userspace lays one out: a descriptor, then the
+            // events asked for and the events reported, a half-word each.
+            // `PollFd` is `repr(C)` over exactly those three, so the eight
+            // bytes below are its layout as long as the three are these
+            // widths -- which is what this asks.
+            assert_eq!(
+                core::mem::size_of::<FileDesc>(),
+                4,
+                "a descriptor is not the four bytes a pollfd starts with"
+            );
+            assert_eq!(
+                core::mem::size_of::<linux_object::fs::PollEvents>(),
+                2,
+                "an event word is not the two bytes a pollfd carries two of"
+            );
+            let mut entry = [fd as u32, POLLIN as u32];
+
+            // A file always has data to read, so one entry comes back
+            // reported. With the count and the timeout in each other's
+            // places the count would be zero and nothing would.
+            assert_eq!(
+                by_number(sys, Sys::POLL, [entry.as_mut_ptr() as usize, 1, 0, 0, 0, 0]).await,
+                1,
+                "poll took its third word as the count"
+            );
+            assert_eq!(
+                entry[1] >> 16,
+                POLLIN as u32,
+                "the entry came back without the event it was reported for"
+            );
+
+            // The second word is a count, judged against the open-file limit
+            // before the array is read: an address in its place is far past
+            // that limit, which is a refusal and not a dereference.
+            assert_eq!(
+                by_number(sys, Sys::POLL, [entry.as_mut_ptr() as usize, 0, 0, 0, 0, 0]).await,
+                0,
+                "poll with nothing to look at"
+            );
+
+            // And the first word is the array. A null one is refused by the
+            // check every user pointer goes through, so the timeout in its
+            // place is that refusal rather than an answer.
+            assert_eq!(
+                by_number(sys, Sys::POLL, [0, 1, 0, 0, 0, 0]).await,
+                errno(LxError::EFAULT),
+                "poll read an array out of a null pointer"
             );
         })
     });
