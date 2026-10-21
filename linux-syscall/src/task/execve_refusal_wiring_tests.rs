@@ -97,6 +97,7 @@ fn a_process(pid: KoID, threads: usize) -> Arc<Process> {
         ("prog", 0o755, an_elf()),
         ("unreadable", 0o644, an_elf()),
         ("junk", 0o755, alloc::vec![0x42u8; 64]),
+        ("rootonly", 0o700, alloc::vec![0x42u8; 64]),
         ("script", 0o755, b"#!/nonexistent/interpreter\n".to_vec()),
     ] {
         let file = root.create(name, FileType::File, mode).unwrap();
@@ -279,6 +280,41 @@ fn proc_self_exe_is_rewritten_before_the_path_is_resolved() {
     assert_eq!(
         when_there_is_none, ENOENT,
         "a process with no image to name cannot re-execute itself"
+    );
+    assert!(all_alive(&proc));
+    proc.exit(0);
+}
+
+/// `execve` asks for execute permission with the caller's EFFECTIVE uid, as
+/// every open does, and not with its real one like `access(2)`. A process
+/// that has dropped its real uid but kept an effective 0 may still execute a
+/// program only root may run.
+///
+/// Nothing but a process whose two uids differ can tell the two apart: with
+/// both at 0, or both at 1000, the answer is the same either way. The image
+/// is deliberately not an ELF, so passing the check ends in `ENOEXEC`
+/// instead of replacing this test's address space.
+#[test]
+fn execve_asks_for_permission_with_the_effective_uid_and_not_the_real_one() {
+    let proc = a_process(48_405, 1);
+    proc.linux().set_resuid(1000, 0, 0).unwrap();
+    let (as_root_still, once_it_is_really_1000) = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let path = CStr::new("/rootonly");
+            let argv = Argv::of("prog");
+            let as_root_still = execve(sys, path.at(), argv.at(), 0).await;
+            sys.linux_process().set_resuid(1000, 1000, 1000).unwrap();
+            let once_it_is_really_1000 = execve(sys, path.at(), argv.at(), 0).await;
+            (as_root_still, once_it_is_really_1000)
+        })
+    });
+    assert_eq!(
+        as_root_still, ENOEXEC,
+        "an effective 0 passes the check and the junk answers"
+    );
+    assert_eq!(
+        once_it_is_really_1000, EACCES,
+        "with no effective 0 left, a 0700 file of root's is not executable"
     );
     assert!(all_alive(&proc));
     proc.exit(0);
