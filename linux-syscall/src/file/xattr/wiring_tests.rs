@@ -20,10 +20,17 @@
 //!    looks the file up, so a path that is not there, asked with a name
 //!    that is too long, is `ERANGE` and not `ENOENT`. The twelve used to
 //!    be answered from the dispatcher without reading an argument at all.
-//! 3. **That `listxattr` has no name.** Its buffer is the SECOND machine
-//!    word where `getxattr`'s is the third, which is the one place in this
-//!    family where two calls of the same shape take their arguments in
-//!    different places.
+//! 3. **That `listxattr` takes its path where the others take theirs.** It
+//!    has no name, so its buffer sits one machine word earlier than
+//!    `getxattr`'s: the one place in this family where two calls of the
+//!    same shape read their arguments from different words. Only the path
+//!    is pinned here, and the mutation run is what says so -- a table that
+//!    read a name for `listxattr` survives these tests. Nothing reads it:
+//!    `sys_xattr`'s `List` arm never looks at the name, so the `0.into()`
+//!    the three arms pass is decoration, and the buffer cannot be reached
+//!    on a filesystem with no attributes to list, because
+//!    `eclipsefs_xattr` answers `None` before `xattr_copy_out`. Pinning
+//!    that one needs EclipseFS mounted.
 //! 4. **What a descriptor with no inode behind it gets.** An eventfd is a
 //!    file-like and not a `File`, so the lookup yields nothing to ask, and
 //!    the answer has to be the no-attributes one rather than `EBADF` or a
@@ -647,10 +654,12 @@ fn the_arguments_arrive_in_the_order_the_syscall_table_names_them() {
                 errno(LxError::EOPNOTSUPP)
             );
 
-            // `listxattr(path, list, size)`: the buffer is the SECOND word.
-            // Asked with the path in the second, the first would be read as
-            // a path and the call would answer for whatever is there -- so
-            // the shape that must SUCCEED is the one that pins it.
+            // `listxattr(path, list, size)`: the path is the FIRST word, as
+            // everywhere else, and the shape that must SUCCEED is what pins
+            // it -- with the path in the second word the first is read as
+            // one and the answer is EFAULT. Where the LIST goes cannot be
+            // pinned from here (see the module note): nothing on a
+            // filesystem without attributes ever writes to it.
             assert_eq!(
                 by_number(sys, crate::Sys::LISTXATTR, [p, 0, 0, 0, 0, 0]).await,
                 0
