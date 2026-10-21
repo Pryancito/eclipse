@@ -328,7 +328,7 @@ impl Syscall<'_> {
         let ret = match sys_type {
             Sys::READ => self.sys_read(a0.into(), a1.into(), a2).await,
             Sys::WRITE => self.sys_write(a0.into(), a1.into(), a2).await,
-            Sys::OPENAT => self.sys_openat(a0.into(), a1.into(), a2, a3),
+            Sys::OPENAT => self.sys_openat_waiting(a0.into(), a1.into(), a2, a3).await,
             Sys::CLOSE => self.sys_close(a0.into()),
             Sys::FSTAT => self.sys_fstat(a0.into(), a1.into()),
             Sys::NEWFSTATAT => self.sys_fstatat(a0.into(), a1.into(), a2.into(), a3),
@@ -921,7 +921,7 @@ impl Syscall<'_> {
     async fn x86_64_syscall(&mut self, sys_type: Sys, args: [usize; 6]) -> SysResult {
         let [a0, a1, a2, a3, a4, _a5] = args;
         match sys_type {
-            Sys::OPEN => self.sys_open(a0.into(), a1, a2),
+            Sys::OPEN => self.sys_open(a0.into(), a1, a2).await,
             Sys::STAT => self.sys_stat(a0.into(), a1.into()),
             Sys::LSTAT => self.sys_lstat(a0.into(), a1.into()),
             Sys::POLL => self.sys_poll(a0.into(), a1, poll_timeout_msecs(a2)).await,

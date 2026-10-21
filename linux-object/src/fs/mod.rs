@@ -180,7 +180,7 @@ pub use file::{
 pub use inotify::{inotify_watch_lookup, Inotify, WatchLookup};
 pub use perf::{sample_user as perf_sample_user, PerfEvent};
 pub use pidfd::{PidFd, PIDFD_THREAD};
-pub use pipe::{Pipe, PIPE_BUF, PIPE_DEFAULT_CAPACITY};
+pub use pipe::{FifoPartner, Pipe, PIPE_BUF, PIPE_DEFAULT_CAPACITY};
 pub use rcore_fs::vfs::{self, PollStatus};
 pub use signalfd::SignalFd;
 pub use stdio::{STDIN, STDOUT};

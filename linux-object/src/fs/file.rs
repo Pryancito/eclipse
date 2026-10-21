@@ -1611,6 +1611,12 @@ impl FileLike for File {
                 }
             }
         }
+        // A FIFO opened `O_RDWR` is both ends of its pipe, and its own
+        // `async_poll` waits to read, as every one does: a writer parked on
+        // a full one would be told at once that its bytes are still there.
+        if let Some(pipe) = inode.downcast_ref::<super::pipe::Pipe>() {
+            return Ok(pipe.async_poll_for(_events).await?);
+        }
         Ok(inode.async_poll().await?)
     }
 
