@@ -3083,6 +3083,12 @@ mod session_wiring_tests;
 #[cfg(test)]
 mod robust_list_wiring_tests;
 
+/// `prctl(2)` option by option through the syscall: the eight
+/// setter/getter pairs over eight fields, and the default arm that used
+/// to answer `Ok(0)` to everything.
+#[cfg(test)]
+mod prctl_wiring_tests;
+
 #[cfg(test)]
 mod comm_from_path_tests {
     //! `comm` after an `execve`: the last component of the path, which is
