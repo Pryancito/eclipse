@@ -1100,3 +1100,203 @@ fn reserving_space_in_a_file_is_not_writing_it_back() {
         "sync_file_range changed the length of the file, so it reserved space instead of writing it back"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The pairs that need a socket
+// ---------------------------------------------------------------------------
+
+/// AF_UNIX, so none of this needs a network stack.
+const AF_UNIX: usize = 1;
+/// `SOCK_STREAM`.
+const A_STREAM: usize = 1;
+/// `SOCK_NONBLOCK`, so a read with nothing to read answers instead of waiting
+/// for ever: a swapped arm that waits is a suite that hangs, not a test that
+/// fails with a name.
+const NONBLOCK: usize = 0o4000;
+
+/// A `struct msghdr` laid out as the ABI has it: seven words on this target
+/// -- `msg_name`, `msg_namelen` with its padding, `msg_iov`, `msg_iovlen`,
+/// `msg_control`, `msg_controllen`, and `msg_flags` with its padding. The
+/// numbers are Linux's rather than the kernel's own struct, so a field in
+/// the wrong place is something this can still catch.
+fn a_msghdr(iov: &[usize; 2]) -> [usize; 7] {
+    let mut hdr = [0usize; 7];
+    hdr[2] = iov.as_ptr() as usize;
+    hdr[3] = 1;
+    hdr
+}
+
+#[test]
+fn the_name_of_a_socket_is_not_the_name_of_its_peer() {
+    // An unconnected AF_UNIX socket has a local address -- AF_UNIX with an
+    // empty path, which is what `unix_getname` answers -- and no remote one.
+    // So on the very same descriptor, with the very same three registers,
+    // `getsockname` answers and `getpeername` says it is not connected.
+    let proc = a_process(45_526, "dispatch-sockname", "dispatch_sockname");
+    let (fd, name_ret, wrote, peer_ret, untouched) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let fd = by_number(sys, Sys::SOCKET as u32, [AF_UNIX, A_STREAM, 0, 0, 0, 0]).await;
+
+            let mut addr = [0u8; 128];
+            let mut len = [addr.len() as u32];
+            let name_ret = by_number(
+                sys,
+                Sys::GETSOCKNAME as u32,
+                [
+                    fd as usize,
+                    addr.as_mut_ptr() as usize,
+                    len.as_mut_ptr() as usize,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+            .await;
+            let wrote = addr.iter().any(|b| *b != 0) || len[0] != 128;
+
+            let mut peer = [0u8; 128];
+            let mut peer_len = [peer.len() as u32];
+            let peer_ret = by_number(
+                sys,
+                Sys::GETPEERNAME as u32,
+                [
+                    fd as usize,
+                    peer.as_mut_ptr() as usize,
+                    peer_len.as_mut_ptr() as usize,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+            .await;
+            let untouched = peer.iter().all(|b| *b == 0);
+            (fd, name_ret, wrote, peer_ret, untouched)
+        })
+    });
+
+    assert!(fd >= 0, "socket(AF_UNIX, SOCK_STREAM) failed: {}", fd);
+    assert_eq!(name_ret, 0, "getsockname failed");
+    assert!(wrote, "getsockname wrote no address at all");
+    assert!(
+        peer_ret < 0,
+        "getpeername answered on a socket with no peer, so it asked for the local name: {}",
+        peer_ret
+    );
+    assert!(
+        untouched,
+        "getpeername wrote an address this socket does not have"
+    );
+}
+
+#[test]
+fn sending_a_message_is_not_receiving_one() {
+    // A connected AF_UNIX pair, both ends nonblocking. `sendmsg` on an empty
+    // end hands over three bytes and `recvmsg` on that same end has nothing
+    // to hand back, so the one call that answers three is the sender.
+    let proc = a_process(45_527, "dispatch-sendmsg", "dispatch_sendmsg");
+    let (pair, sent, recvd, got) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut sv = [0i32; 2];
+            let pair = by_number(
+                sys,
+                Sys::SOCKETPAIR as u32,
+                [
+                    AF_UNIX,
+                    A_STREAM | NONBLOCK,
+                    0,
+                    sv.as_mut_ptr() as usize,
+                    0,
+                    0,
+                ],
+            )
+            .await;
+
+            let out = *b"abc";
+            let iov = [out.as_ptr() as usize, out.len()];
+            let mut hdr = a_msghdr(&iov);
+            let sent = by_number(
+                sys,
+                Sys::SENDMSG as u32,
+                [sv[0] as usize, hdr.as_mut_ptr() as usize, 0, 0, 0, 0],
+            )
+            .await;
+
+            // And the other end really holds them.
+            let mut got = *b"...";
+            let back = [got.as_mut_ptr() as usize, got.len()];
+            let mut back_hdr = a_msghdr(&back);
+            let recvd = by_number(
+                sys,
+                Sys::RECVMSG as u32,
+                [sv[1] as usize, back_hdr.as_mut_ptr() as usize, 0, 0, 0, 0],
+            )
+            .await;
+            (pair, sent, recvd, got)
+        })
+    });
+
+    assert_eq!(pair, 0, "socketpair failed");
+    assert_eq!(sent, 3, "sendmsg did not hand over the three bytes");
+    assert_eq!(recvd, 3, "recvmsg did not take the three bytes back");
+    assert_eq!(&got, b"abc", "the bytes did not arrive at the other end");
+}
+
+#[test]
+fn sending_a_batch_of_messages_is_not_receiving_one() {
+    // A `struct mmsghdr` is a `struct msghdr` and then the `unsigned int`
+    // the call fills in with what it moved, eight words in all. One message
+    // in the batch is enough: on the empty end of a nonblocking pair
+    // `sendmmsg` hands one over and `recvmmsg` has none to hand back.
+    const LEN_WORD: usize = 7;
+    let proc = a_process(45_528, "dispatch-sendmmsg", "dispatch_sendmmsg");
+    let (pair, sent, reported, recvd, got) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut sv = [0i32; 2];
+            let pair = by_number(
+                sys,
+                Sys::SOCKETPAIR as u32,
+                [
+                    AF_UNIX,
+                    A_STREAM | NONBLOCK,
+                    0,
+                    sv.as_mut_ptr() as usize,
+                    0,
+                    0,
+                ],
+            )
+            .await;
+
+            let out = *b"abcd";
+            let iov = [out.as_ptr() as usize, out.len()];
+            let mut batch = [0usize; 8];
+            batch[..LEN_WORD].copy_from_slice(&a_msghdr(&iov));
+            let sent = by_number(
+                sys,
+                Sys::SENDMMSG as u32,
+                [sv[0] as usize, batch.as_mut_ptr() as usize, 1, 0, 0, 0],
+            )
+            .await;
+            let reported = batch[LEN_WORD] as u32;
+
+            let mut got = *b"....";
+            let back = [got.as_mut_ptr() as usize, got.len()];
+            let mut back_hdr = a_msghdr(&back);
+            let recvd = by_number(
+                sys,
+                Sys::RECVMSG as u32,
+                [sv[1] as usize, back_hdr.as_mut_ptr() as usize, 0, 0, 0, 0],
+            )
+            .await;
+            (pair, sent, reported, recvd, got)
+        })
+    });
+
+    assert_eq!(pair, 0, "socketpair failed");
+    assert_eq!(sent, 1, "sendmmsg did not hand over the one message");
+    assert_eq!(reported, 4, "sendmmsg did not report the length it sent");
+    assert_eq!(recvd, 4, "the four bytes did not reach the other end");
+    assert_eq!(
+        &got, b"abcd",
+        "the bytes that arrived are not the ones sent"
+    );
+}
