@@ -2993,41 +2993,44 @@ impl DrmDev {
                 let n = spec.name.len().min(31);
                 name[..n].copy_from_slice(&spec.name.as_bytes()[..n]);
                 res.name = name;
-                // Two-call pattern: report counts, fill when arrays are big
-                // enough. Enum properties expose both the (value, name) pairs
-                // and the raw value list; range/object properties only values.
-                if !spec.enums.is_empty()
-                    && res.enum_blob_ptr != 0
-                    && (res.count_enum_blobs as usize) >= spec.enums.len()
-                {
-                    // `access_ok()`. These two arrays were the ONLY nested ioctl
-                    // pointers in this file written without one, and this ioctl
-                    // is unprivileged: a client passing a kernel address as
-                    // `enum_blob_ptr`/`values_ptr` had the kernel write its enum
-                    // records or property values straight to it. Linux copies
-                    // both out with `copy_to_user()`, which faults to EFAULT.
-                    ucheck_n::<DrmModePropertyEnum>(res.enum_blob_ptr as usize, spec.enums.len())?;
-                    for (i, (val, nm)) in spec.enums.iter().enumerate() {
-                        let mut e = DrmModePropertyEnum {
-                            value: *val,
-                            name: [0u8; 32],
-                        };
-                        let ln = nm.len().min(31);
-                        e.name[..ln].copy_from_slice(&nm.as_bytes()[..ln]);
-                        unsafe { uput(res.enum_blob_ptr, i, e) };
-                    }
-                }
-                res.count_enum_blobs = spec.enums.len() as u32;
-                if !spec.values.is_empty()
-                    && res.values_ptr != 0
-                    && (res.count_values as usize) >= spec.values.len()
-                {
-                    ucheck_n::<u64>(res.values_ptr as usize, spec.values.len())?;
-                    for (i, v) in spec.values.iter().enumerate() {
+                // `drm_mode_getproperty_ioctl`: the first `count_values`
+                // values go out (`put_user` one by one, so a null pointer
+                // with room is EFAULT), then the first `count_enum_blobs`
+                // enum records; each count comes back as the total, and
+                // `count_enum_blobs` is written for an enum or bitmask
+                // property (the total) and a blob (0) only: a range or an
+                // object property leaves the caller's. Values before enums,
+                // so a bad values pointer faults before any enum is written.
+                // This filled each array all or nothing, skipped a null one
+                // silently and zeroed `count_enum_blobs` for every property.
+                let n_values = (res.count_values as usize).min(spec.values.len());
+                if n_values > 0 {
+                    // `access_ok()`: this ioctl is unprivileged, and these
+                    // two arrays were once written without one.
+                    ucheck_n::<u64>(res.values_ptr as usize, n_values)?;
+                    for (i, v) in spec.values[..n_values].iter().enumerate() {
                         unsafe { uput(res.values_ptr, i, *v) };
                     }
                 }
                 res.count_values = spec.values.len() as u32;
+                if spec.flags & (DRM_MODE_PROP_ENUM | DRM_MODE_PROP_BITMASK) != 0 {
+                    let n_enums = (res.count_enum_blobs as usize).min(spec.enums.len());
+                    if n_enums > 0 {
+                        ucheck_n::<DrmModePropertyEnum>(res.enum_blob_ptr as usize, n_enums)?;
+                        for (i, (val, nm)) in spec.enums[..n_enums].iter().enumerate() {
+                            let mut e = DrmModePropertyEnum {
+                                value: *val,
+                                name: [0u8; 32],
+                            };
+                            let ln = nm.len().min(31);
+                            e.name[..ln].copy_from_slice(&nm.as_bytes()[..ln]);
+                            unsafe { uput(res.enum_blob_ptr, i, e) };
+                        }
+                    }
+                    res.count_enum_blobs = spec.enums.len() as u32;
+                } else if spec.flags & DRM_MODE_PROP_BLOB != 0 {
+                    res.count_enum_blobs = 0;
+                }
                 Ok(0)
             }
             DRM_IOCTL_MODE_GETPROPBLOB => {
@@ -4379,6 +4382,9 @@ const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
 const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
 const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
 const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
+/// No property here is a bitmask, but `GETPROPERTY` lists enums for one
+/// as for an enum (`drm_property_type_is`), so the type is named.
+const DRM_MODE_PROP_BITMASK: u32 = 1 << 5;
 const DRM_MODE_PROP_OBJECT: u32 = 1 << 6; // DRM_MODE_PROP_TYPE(1)
 const DRM_MODE_PROP_SIGNED_RANGE: u32 = 2 << 6; // DRM_MODE_PROP_TYPE(2)
 const DRM_MODE_PROP_ATOMIC: u32 = 0x8000_0000;
@@ -6892,6 +6898,9 @@ mod lease_tests;
 #[cfg(test)]
 mod legacy_core_tests;
 
+/// `GETPROPERTY`'s two arrays, filled as far as the caller made room.
+#[cfg(test)]
+mod getproperty_tests;
 #[cfg(test)]
 mod null_list_tests;
 #[cfg(test)]
