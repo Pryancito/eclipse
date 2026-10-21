@@ -43,10 +43,12 @@ use super::*;
 use crate::on_a_thread::on_a_thread;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use kernel_hal::PAGE_SIZE;
 use linux_object::process::LinuxProcess;
 use rcore_fs::vfs::FileType;
 use rcore_fs_ramfs::RamFS;
 use zircon_object::task::{Process, ROOT_JOB};
+use zircon_object::vm::MMUFlags;
 
 /// `AT_FDCWD`, as the number userspace passes.
 const AT_FDCWD: usize = -100i32 as usize;
@@ -66,6 +68,20 @@ const A_FACCESSAT_FLAG_OF_NOBODY: usize = 0x2000;
 /// keeps in `rdev` and `mkdir` has no word for.
 const S_IFCHR: usize = 0o020000;
 const NULL_DEVICE: usize = 0x0103;
+/// A page, as the memory arms count.
+const PAGE: usize = PAGE_SIZE;
+/// `PROT_READ | PROT_WRITE`, and read-only on its own.
+const RW: usize = 0x3;
+const PROT_READ: usize = 0x1;
+/// `MAP_PRIVATE | MAP_FIXED`, with and without `MAP_ANONYMOUS`.
+const PRIVATE_FIXED: usize = 0x12;
+const ANON_FIXED: usize = 0x32;
+/// What an anonymous mapping passes for a descriptor, and a descriptor that
+/// is not anybody's.
+const NO_FILE: usize = -1i32 as usize;
+const A_DESCRIPTOR_OF_NOBODY: usize = 4242;
+/// `MREMAP_MAYMOVE | MREMAP_FIXED`: move it, and to this exact address.
+const MREMAP_TO_A_FIXED_ADDRESS: usize = 0x3;
 
 /// A process at `pid` whose root holds a `/<top>` of its own, because a
 /// lookup from the root goes through a path cache every process in this
@@ -147,6 +163,53 @@ async fn by_number(sys: &Syscall<'_>, which: Sys, args: [usize; 6]) -> isize {
 /// What an errno looks like on the way back out of the table.
 fn errno(e: LxError) -> isize {
     -(e as isize)
+}
+
+/// `pages` anonymous pages at an offset of this test's own. Every process in
+/// this binary shares one address-space base, so each test picks a band
+/// nobody else uses -- and `MAP_FIXED` is what makes the choice stick.
+async fn anonymous(sys: &Syscall<'_>, offset: usize, pages: usize) -> usize {
+    let at = sys.zircon_process().vmar().addr() + offset;
+    let got = by_number(
+        sys,
+        Sys::MMAP,
+        [at, pages * PAGE, RW, ANON_FIXED, NO_FILE, 0],
+    )
+    .await;
+    assert_eq!(got, at as isize, "MAP_FIXED did not map where it was told");
+    at
+}
+
+/// A page touched the way a program touches it: the fault a write takes,
+/// which is what commits the frame. Under libos there is no CPU to take it,
+/// so the test asks the VMAR itself.
+fn touch(sys: &Syscall<'_>, page: usize) {
+    sys.zircon_process()
+        .vmar()
+        .handle_page_fault(page, MMUFlags::WRITE | MMUFlags::USER)
+        .expect("a mapped, writable page takes a write fault");
+}
+
+/// And whether it takes one at all, which is what a protection change and a
+/// removal are for.
+fn takes_a_write(sys: &Syscall<'_>, page: usize) -> bool {
+    sys.zircon_process()
+        .vmar()
+        .handle_page_fault(page, MMUFlags::WRITE | MMUFlags::USER)
+        .is_ok()
+}
+
+/// Bytes a program leaves in a page it has touched.
+fn write_bytes(at: usize, bytes: &[u8]) {
+    let mut out: UserOutPtr<u8> = UserOutPtr::from(at);
+    out.write_array(bytes).expect("a touched page is writable");
+}
+
+/// And what it reads back out of one.
+fn read_bytes(at: usize, len: usize) -> Vec<u8> {
+    UserInPtr::<u8>::from(at)
+        .read_array(len)
+        .expect("a touched page is readable")
 }
 
 /// An open descriptor on a path that is there.
@@ -1090,4 +1153,196 @@ fn the_name_a_process_gives_itself_and_the_domain_it_lives_in() {
         })
     });
     linux_object::uname::set_domainname(&was_domain);
+}
+
+#[test]
+fn the_file_and_the_offset_are_the_last_two_words_of_the_only_six_word_arm() {
+    // `mmap` is the one arm of the table that hands over all six words, and
+    // the last two are the ones that cannot be told apart by a return value:
+    // whatever it maps, it answers with an address. What separates them is
+    // the BYTES that turn up at that address, so the file here holds a
+    // different letter in each of its three pages.
+    let proc = a_process(48_140, "args-mmap", "args_mmap");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let mut three: Vec<u8> = Vec::new();
+            for letter in [b'A', b'B', b'C'] {
+                three.resize(three.len() + PAGE, letter);
+            }
+            a_file_named(sys.linux_process(), "/args_mmap", "pages", &three);
+            let path = c("/args_mmap/pages");
+            let fd = opened(sys, &path, O_RDWR);
+
+            // One page of that file, from its THIRD page. A length and an
+            // offset the wrong way round would map two pages from the second
+            // one, land at the same address, and answer the same number: the
+            // letter is the only thing that tells them apart.
+            let at = sys.zircon_process().vmar().addr() + 0x4800_0000;
+            assert_eq!(
+                by_number(sys, Sys::MMAP, [at, PAGE, RW, PRIVATE_FIXED, fd, 2 * PAGE]).await,
+                at as isize,
+                "MAP_FIXED did not map where it was told to"
+            );
+            touch(sys, at);
+            assert_eq!(
+                read_bytes(at, 4),
+                b"CCCC",
+                "the page that turned up is not the one the sixth word named"
+            );
+
+            // The fifth word is a descriptor and the fourth a flag word.
+            // Swapped, the flag word would be a small number and the
+            // descriptor an impossible one.
+            let other = sys.zircon_process().vmar().addr() + 0x4810_0000;
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::MMAP,
+                    [other, PAGE, RW, PRIVATE_FIXED, A_DESCRIPTOR_OF_NOBODY, 0]
+                )
+                .await,
+                errno(LxError::EBADF),
+                "mmap mapped a descriptor nobody has"
+            );
+
+            // The second word is a length, and a length of zero is the one
+            // thing `mmap` refuses outright. With the address in its place
+            // this would be an enormous mapping and not a refusal.
+            assert_eq!(
+                by_number(sys, Sys::MMAP, [other, 0, RW, ANON_FIXED, NO_FILE, 0]).await,
+                errno(LxError::EINVAL),
+                "mmap took its first word as the length"
+            );
+
+            // And the sixth word is an offset into the file, which has to be
+            // a whole number of pages. One byte is not, and the second word
+            // in its place would be.
+            assert_eq!(
+                by_number(sys, Sys::MMAP, [other, PAGE, RW, PRIVATE_FIXED, fd, 1]).await,
+                errno(LxError::EINVAL),
+                "mmap took an offset that is not a whole number of pages"
+            );
+        })
+    });
+}
+
+#[test]
+fn a_mapping_is_protected_and_removed_a_page_at_a_time() {
+    // `mprotect(addr, len, prot)` and `munmap(addr, len)`: three words and
+    // two, all of them plain integers, and both arms answer zero. What they
+    // did is only visible in which PAGE still takes a write fault, so each
+    // call here is given a two-page mapping and asked about the first page
+    // alone -- a length that reached the second page, or an address that
+    // started there, shows up as the wrong page changing.
+    let proc = a_process(48_141, "args-prot", "args_prot");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let at = anonymous(sys, 0x4900_0000, 2).await;
+            // Read-only, and only the first page of the two. Done before
+            // either page is touched, so what is being asked is the mapping
+            // and not a stale entry.
+            assert_eq!(
+                by_number(sys, Sys::MPROTECT, [at, PAGE, PROT_READ, 0, 0, 0]).await,
+                0,
+                "mprotect over one mapped page"
+            );
+            assert!(
+                !takes_a_write(sys, at),
+                "the page the first word named is still writable"
+            );
+            assert!(
+                takes_a_write(sys, at + PAGE),
+                "the length reached a page mprotect was not given"
+            );
+
+            // The third word is a protection and the second a length. In
+            // each other's places the protection would be a bit nobody has.
+            assert_eq!(
+                by_number(sys, Sys::MPROTECT, [at, PROT_READ, PAGE, 0, 0, 0]).await,
+                errno(LxError::EINVAL),
+                "mprotect took a page size as a set of protection bits"
+            );
+
+            // The same two words again, this time removing the mapping.
+            let gone = anonymous(sys, 0x4a00_0000, 2).await;
+            assert_eq!(
+                by_number(sys, Sys::MUNMAP, [gone, PAGE, 0, 0, 0, 0]).await,
+                0,
+                "munmap over one mapped page"
+            );
+            assert!(
+                !takes_a_write(sys, gone),
+                "the page the first word named is still there"
+            );
+            assert!(
+                takes_a_write(sys, gone + PAGE),
+                "the length reached a page munmap was not given"
+            );
+        })
+    });
+}
+
+#[test]
+fn the_break_and_a_moved_mapping_both_answer_with_an_address() {
+    // `brk(addr)` is a one-word arm and `mremap(old, old_len, new_len,
+    // flags, new_addr)` a five-word one, and both answer an address. For
+    // `brk` the second word in the first one's place is a zero, which is the
+    // query form and answers the break that is already there; for `mremap`
+    // the words are told apart by the mapping landing where the fifth word
+    // says, two pages long where it was one, with the bytes it had.
+    let proc = a_process(48_142, "args-brk", "args_brk");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let base = linux_object::loader::heap_base(&sys.zircon_process().vmar());
+            sys.linux_process().set_brk(base);
+            assert_eq!(
+                by_number(sys, Sys::BRK, [base + 3 * PAGE, 0, 0, 0, 0, 0]).await,
+                (base + 3 * PAGE) as isize,
+                "brk did not move the break to the address it was given"
+            );
+            // And asked again with nothing, it answers the break it now has
+            // rather than the one it started with: one call could not tell
+            // the stored break from the word just passed in.
+            assert_eq!(
+                by_number(sys, Sys::BRK, [0, base, 0, 0, 0, 0]).await,
+                (base + 3 * PAGE) as isize,
+                "brk read its break out of the word next to it"
+            );
+
+            let old = anonymous(sys, 0x4b00_0000, 1).await;
+            touch(sys, old);
+            write_bytes(old, b"moved");
+            let to = sys.zircon_process().vmar().addr() + 0x4b10_0000;
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::MREMAP,
+                    [old, PAGE, 2 * PAGE, MREMAP_TO_A_FIXED_ADDRESS, to, 0]
+                )
+                .await,
+                to as isize,
+                "mremap did not put the mapping where its fifth word said"
+            );
+            touch(sys, to);
+            assert_eq!(
+                read_bytes(to, 5),
+                b"moved",
+                "the mapping that moved is not the one that was there"
+            );
+            // Two pages long now, so the second one is there to be written:
+            // with the old and the new length swapped this would have shrunk
+            // instead, and nothing would be mapped here.
+            assert!(
+                takes_a_write(sys, to + PAGE),
+                "mremap grew the mapping by the wrong length"
+            );
+            // The fourth word is a flag word and the fifth an address. In
+            // each other's places the flags would be bits nobody has.
+            assert_eq!(
+                by_number(sys, Sys::MREMAP, [to, PAGE, PAGE, to, 2, 0]).await,
+                errno(LxError::EINVAL),
+                "mremap took an address as a set of flags"
+            );
+        })
+    });
 }
