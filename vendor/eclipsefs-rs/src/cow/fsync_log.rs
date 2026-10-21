@@ -344,13 +344,13 @@ impl CowFs {
                 .free_blocks()
                 .saturating_sub(self.sp.reserve * 2);
             if n <= room {
-                if let Some(at) = self.sp.alloc.allocate_run_for(None, n, kind) {
+                // On a volume, any chunk will do when no metadata one has room.
+                let alloc = &mut self.sp.alloc;
+                let found = alloc
+                    .allocate_run_for(None, n, kind)
+                    .or_else(|| kind.and_then(|_| alloc.allocate_run_for(None, n, None)));
+                if let Some(at) = found {
                     break at;
-                }
-                if kind.is_some() {
-                    if let Some(at) = self.sp.alloc.allocate_run_for(None, n, None) {
-                        break at;
-                    }
                 }
             }
             if n <= 16 {

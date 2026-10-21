@@ -2313,8 +2313,7 @@ mod tests {
         let room = |d: u32| m.free_extents(d, &[]).iter().map(|e| e.1).sum::<u64>();
         let other = [2, 3]
             .into_iter()
-            .filter(|&d| d != avoid[0] && d != s[0].devid)
-            .next()
+            .find(|&d| d != avoid[0] && d != s[0].devid)
             .unwrap();
         assert!(room(s[0].devid) >= room(other));
     }

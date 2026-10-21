@@ -47,10 +47,8 @@ fn fill(fs: &mut EclipseFS, prefix: &str, size: usize, algo: Option<Compression>
             Err(Error::NoSpace) => return i,
             Err(e) => panic!("{:?}", e),
         };
-        if algo.is_some() {
-            if fs.set_compression(f, algo).is_err() {
-                return i;
-            }
+        if algo.is_some() && fs.set_compression(f, algo).is_err() {
+            return i;
         }
         let mut at = 0;
         while at < data.len() {

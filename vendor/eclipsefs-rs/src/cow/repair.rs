@@ -1448,7 +1448,7 @@ mod tests {
             }
             if v != 0 {
                 basis.push((v, c));
-                basis.sort_by(|a, b| b.0.cmp(&a.0));
+                basis.sort_by_key(|&(v, _)| core::cmp::Reverse(v));
             }
         }
         let (mut t, mut x) = (target ^ h0, 0u128);
