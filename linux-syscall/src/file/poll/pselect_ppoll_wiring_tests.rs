@@ -423,6 +423,11 @@ fn pselect6_reads_its_sixth_argument_as_a_pointer_and_then_a_length() {
     // sixth argument is no mask at all and asks nothing about either word.
     // Read the other way round, the accepted case would hand a pointer
     // value in as the length and be EINVAL too.
+    //
+    // The pack is laid out here as two bare machine words and NOT as a
+    // `PSelectSigsetArg`, on purpose: built out of the kernel's own struct
+    // it would follow that struct wherever its fields went, and the one
+    // thing being asked is where they are.
     let proc = a_process(48_603, "sigset-pack", "sigset_pack");
     let dir_path = String::from("/sigset_pack");
     let (with_a_mask, bad_length, no_pack) = on_a_thread(&proc, move |sys| {
@@ -431,14 +436,8 @@ fn pselect6_reads_its_sixth_argument_as_a_pointer_and_then_a_length() {
             let fd = a_ready_node(&lp, &dir_path, FileType::File);
             let nfds = fd + 1;
             let mask = Sigset::new(0);
-            let good = PSelectSigsetArg {
-                ss: &mask as *const Sigset as usize,
-                ss_len: SIGSETSIZE,
-            };
-            let short = PSelectSigsetArg {
-                ss: &mask as *const Sigset as usize,
-                ss_len: SIGSETSIZE / 2,
-            };
+            let good: [usize; 2] = [&mask as *const Sigset as usize, SIGSETSIZE];
+            let short: [usize; 2] = [&mask as *const Sigset as usize, SIGSETSIZE / 2];
             // Each call gets its own sets: the answer is written back into
             // them, so a reused one would be asking a different question.
             let mut read = a_set(nfds, &[fd]);
@@ -452,7 +451,7 @@ fn pselect6_reads_its_sixth_argument_as_a_pointer_and_then_a_length() {
                 &mut write,
                 &mut except,
                 Some(&mut ts),
-                &good as *const PSelectSigsetArg as usize,
+                good.as_ptr() as usize,
             )
             .await;
             let mut read = a_set(nfds, &[fd]);
@@ -466,7 +465,7 @@ fn pselect6_reads_its_sixth_argument_as_a_pointer_and_then_a_length() {
                 &mut write,
                 &mut except,
                 Some(&mut ts),
-                &short as *const PSelectSigsetArg as usize,
+                short.as_ptr() as usize,
             )
             .await;
             let mut read = a_set(nfds, &[fd]);
