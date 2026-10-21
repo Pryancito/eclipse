@@ -323,6 +323,25 @@ impl SigInfo {
         info
     }
 
+    /// The timer an `SI_TIMER` signal is an expiry of (`si_timerid`), and
+    /// `None` for any other signal.
+    pub fn timer_id(&self) -> Option<i32> {
+        let p = &self.field.pad;
+        (self.code == SignalCode::TIMER).then(|| i32::from_ne_bytes([p[0], p[1], p[2], p[3]]))
+    }
+
+    /// `si_overrun` of an `SI_TIMER` signal: the expiries it stands for
+    /// besides its own.
+    pub fn timer_overrun(&self) -> u32 {
+        let p = &self.field.pad;
+        u32::from_ne_bytes([p[4], p[5], p[6], p[7]])
+    }
+
+    /// Make the `si_overrun` of an `SI_TIMER` signal `overrun`.
+    pub fn set_timer_overrun(&mut self, overrun: u32) {
+        self.field.pad[4..8].copy_from_slice(&overrun.to_ne_bytes());
+    }
+
     /// The `siginfo_t` of a signal the kernel itself sends with no sender
     /// behind it (`SEND_SIG_PRIV`): `SI_KERNEL`, pid and uid 0. What an
     /// interval timer's `SIGALRM` (`it_real_fn`) carries.

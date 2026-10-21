@@ -224,7 +224,7 @@ fn a_cpu_timer(owner: KoID, clock: CpuClock, notify: TimerNotify) -> usize {
             interval: Duration::ZERO,
             next: Duration::ZERO,
             generation: 0,
-            overrun_last: 0,
+            overrun: Overrun::default(),
         },
     );
     id
@@ -395,12 +395,44 @@ fn a_periodic_cpu_timer_that_fell_behind_goes_off_once_with_an_overrun() {
         info == SigInfo::timer(Signal::SIGALRM, id as i32, 2, 0),
         "not one SIGALRM with 2 overruns for the expiries at 10, 20 and 30 ms"
     );
-    assert_eq!(POSIX_TIMERS.lock()[&id].overrun_last, 2, "timer_getoverrun");
+    assert_eq!(
+        posix_timer_overrun(id, proc.id()),
+        Ok(2),
+        "timer_getoverrun"
+    );
     assert_eq!(left(&proc, id), ms(5), "next expiry not at 40 ms");
     run_cpu_timers(&thread);
     assert!(
         !took(&thread, Signal::SIGALRM),
         "a second signal for the same expiries"
+    );
+    drop_posix_timers_of(proc.id());
+}
+
+/// A CPU timer's expiries while its signal waits are counted into it, as a
+/// wall-clock one's are.
+#[test]
+fn a_cpu_timer_counts_into_the_signal_still_waiting() {
+    let (proc, thread) = a_process(44_309);
+    let id = a_cpu_timer(
+        proc.id(),
+        process_clock(&proc),
+        TimerNotify::SIGALRM_TO_PROCESS,
+    );
+    arm(&proc, id, ms(10), ms(10), false);
+    thread.time_add(35_000_000);
+    run_cpu_timers(&thread);
+    thread.time_add(20_000_000);
+    run_cpu_timers(&thread);
+    assert_eq!(posix_timer_overrun(id, proc.id()), Ok(0), "0 until taken");
+    let info = thread.lock_linux().take_siginfo(Signal::SIGALRM);
+    assert_eq!(info.timer_overrun(), 4, "floor((55 - 10) / 10) periods");
+    assert_eq!(posix_timer_overrun(id, proc.id()), Ok(4));
+    arm(&proc, id, ms(10), ms(10), false);
+    assert_eq!(
+        posix_timer_overrun(id, proc.id()),
+        Ok(0),
+        "timer_settime resets it"
     );
     drop_posix_timers_of(proc.id());
 }

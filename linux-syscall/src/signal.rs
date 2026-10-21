@@ -315,9 +315,17 @@ pub(crate) async fn sigtimedwait_on(
     let mut park = SignalPark::new(thread);
     let outcome = loop {
         park.prepare();
-        // A waited-for signal pending? Dequeue and return it.
+        // A waited-for signal pending? Dequeue and return it. One that every
+        // thread blocks waits on the process, and `sigwait` above makes this
+        // thread one that takes it, so it is pulled here first, as signalfd
+        // does. It used to be pulled only by `check_signals_of` below, after
+        // the look: a zero timeout said `EAGAIN` with it pending, and any
+        // other waited until something else woke the wait.
         {
             let mut lt = thread.lock_linux();
+            if let Some(lp) = thread.proc().try_linux() {
+                lp.pull_shared_pending_locked(&mut lt);
+            }
             let ready = Sigset::new(lt.signals.val() & waitset.val());
             if let Some(sig) = ready.find_first_signal() {
                 let si = lt.take_siginfo(sig);
@@ -1729,6 +1737,29 @@ mod sigtimedwait_tests {
             0,
             "a thread that left the wait is still offered the signal"
         );
+    }
+
+    /// One sent while every thread blocked it waits on the process, and
+    /// the wait takes it from there at once, timeout or none.
+    #[test]
+    fn one_waiting_on_the_process_is_taken_at_once() {
+        let (proc, main, waiter) = program(44_321);
+        let on_a_thread = |t: &Arc<Thread>| t.lock_linux().signals.contains(Signal::SIGUSR1);
+        send_signal_to_process(proc.id() as usize, Signal::SIGUSR1).unwrap();
+        assert!(
+            !on_a_thread(&main) && !on_a_thread(&waiter),
+            "the test needs it on the process"
+        );
+        let (r, _) = wait(&waiter, Signal::SIGUSR1, Duration::ZERO);
+        assert_eq!(
+            r.map(|(s, _)| s),
+            Ok(Signal::SIGUSR1),
+            "EAGAIN with it pending"
+        );
+        send_signal_to_process(proc.id() as usize, Signal::SIGUSR1).unwrap();
+        let (r, took) = wait(&waiter, Signal::SIGUSR1, Duration::from_secs(3));
+        assert_eq!(r.map(|(s, _)| s), Ok(Signal::SIGUSR1));
+        assert!(took < Duration::from_secs(1), "taken after {:?}", took);
     }
 
     #[test]
