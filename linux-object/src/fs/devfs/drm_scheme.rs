@@ -176,9 +176,9 @@ impl DrmDev {
     /// `drm_ioctl_permit` for the hollowed legacy ioctls, in its order:
     /// `DRM_ROOT_ONLY` wants `capable(CAP_SYS_ADMIN)` (EACCES), `DRM_AUTH`
     /// wants an authenticated open or a render client (EACCES). `DRM_MASTER`
-    /// is not enforced on any ioctl here, and a render client's own
-    /// refusal (`!DRM_RENDER_ALLOW`) is observed, not enforced, at the top
-    /// of the dispatch.
+    /// is the gate at the top of the dispatch ([`needs_master`], under
+    /// `drm.master_check`), and a render client's own refusal
+    /// (`!DRM_RENDER_ALLOW`) is enforced there too.
     fn legacy_permit(&self, root_only: bool) -> Result<()> {
         if root_only && !drm::current_is_root() {
             return Err(FsError::NoPermission);
@@ -910,6 +910,16 @@ impl DrmDev {
         if self.minor >= 128 && !render_allowed(cmd) {
             return Err(FsError::NoPermission);
         }
+        // `drm_ioctl_permit`, next: a `DRM_MASTER` ioctl wants the current
+        // master (EACCES), before its argument is read. Under
+        // `drm.master_check` only (see [`master_check_enabled`]); AUTH_MAGIC
+        // and the leases check it in their own arms, flag or no flag.
+        if master_check_enabled()
+            && needs_master(cmd)
+            && !drm::is_master(self.minor, self.file_owner())
+        {
+            return Err(FsError::NoPermission);
+        }
         // KMS-query trace for Vulkan's VK_KHR_display probe (wsi_display).
         // `vulkaninfo` dies with ERROR_OUT_OF_HOST_MEMORY inside
         // vkGetPhysicalDeviceDisplayPlanePropertiesKHR on RTX, and Mesa
@@ -1257,8 +1267,8 @@ impl DrmDev {
                 Ok(0)
             }
             DRM_IOCTL_MODE_ATTACHMODE | DRM_IOCTL_MODE_DETACHMODE => {
-                // `drm_noop` under `DRM_MASTER`, which the modeset ioctls
-                // do not enforce here (README-drm, "Leases").
+                // `drm_noop` under `DRM_MASTER`, which the gate at the top
+                // of the dispatch enforces under `drm.master_check`.
                 Ok(0)
             }
             DRM_IOCTL_SET_MASTER => {
@@ -4441,6 +4451,45 @@ fn drm_node_name(minor: u32) -> alloc::string::String {
     drm::node_name(minor)
 }
 
+/// `drm.master_check`: whether the ioctls `drm_ioctls[]` marks `DRM_MASTER`
+/// demand the current master (`drm_ioctl_permit`, EACCES). Off by default:
+/// switched on blind it could leave a compositor that is not the first open
+/// of card0 without a screen, so it is opt-in until a desktop has booted with
+/// it. `AUTH_MAGIC` and the leases demand the master whatever the flag says.
+static MASTER_CHECK_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Boot-time switch for [`master_check_enabled`] (`drm.master_check`).
+pub fn set_master_check_enabled(on: bool) {
+    MASTER_CHECK_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// See [`MASTER_CHECK_ENABLED`].
+pub fn master_check_enabled() -> bool {
+    MASTER_CHECK_ENABLED.load(Ordering::Relaxed)
+}
+
+/// The modeset ioctls `drm_ioctls[]` marks `DRM_MASTER` and nothing else:
+/// `drm_ioctl_permit` refuses them to anyone but the current master, before
+/// the handler runs. (`AUTH_MAGIC`, `CREATE_LEASE`, `LIST_LESSEES` and
+/// `REVOKE_LEASE` are `DRM_MASTER` too, and check it in their own arms.)
+fn needs_master(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        DRM_IOCTL_MODE_SETCRTC
+            | DRM_IOCTL_MODE_SETPLANE
+            | DRM_IOCTL_MODE_CURSOR
+            | DRM_IOCTL_MODE_CURSOR2
+            | DRM_IOCTL_MODE_SETGAMMA
+            | DRM_IOCTL_MODE_ATTACHMODE
+            | DRM_IOCTL_MODE_DETACHMODE
+            | DRM_IOCTL_MODE_SETPROPERTY
+            | DRM_IOCTL_MODE_PAGE_FLIP
+            | DRM_IOCTL_MODE_DIRTYFB
+            | DRM_IOCTL_MODE_OBJ_SETPROPERTY
+            | DRM_IOCTL_MODE_ATOMIC
+    )
+}
+
 /// First id of the range reserved for EDID blobs, one per connector.
 ///
 /// A connector's EDID is served through `GETPROPBLOB` like any other property
@@ -6691,6 +6740,8 @@ mod atomic_walk_tests;
 #[cfg(test)]
 mod syncobj_wait_routing_tests;
 
+#[cfg(test)]
+mod master_check_tests;
 #[cfg(test)]
 mod master_tests;
 #[cfg(test)]

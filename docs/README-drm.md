@@ -335,8 +335,12 @@ Detalles:
   los handles y los framebuffers el pid del propietario cubre el acceso entre
   procesos (ver arriba), pero no aísla dos fds del mismo proceso. El master
   **sí** es por fd y por nodo (`drm::set_master`/`drop_master`, tomado por el
-  primer `open` como en `drm_master_open`), pero **los ioctls que Linux marca
-  `DRM_MASTER` todavía no lo exigen**: cualquiera puede emitirlos.
+  primer `open` como en `drm_master_open`), y **los ioctls que Linux marca
+  `DRM_MASTER` lo exigen solo con `drm.master_check`** (opt-in: EACCES a quien
+  no es master, antes de leer el argumento, como `drm_ioctl_permit`; sin el
+  flag cualquiera puede emitirlos). `AUTH_MAGIC` y los arrendamientos lo exigen
+  siempre. Es opt-in porque encenderlo a ciegas podía dejar sin pantalla a un
+  compositor que no sea el primer `open` de `card0`.
 - **`drm-usage-stats.rst` (fdinfo)**. No se exponen estadísticas de
   uso/memoria/engine por `fdinfo`.
 - **Render / 3D**. No hay aceleración: se usa el render por software de Mesa
@@ -360,7 +364,7 @@ esto no:
 | Sin caché de dma-buf por objeto ni de handles PRIME por fichero | Tope GEM subido a 256; sigue sin dedup PRIME por fichero |
 | ~~`ADDFB2` no valida formato, flags ni modifiers~~ | **Corregido:** `framebuffer_check` entero (fila de la tabla de ioctls); un modifier con tiling es EINVAL |
 | El límite de clips de `DIRTYFB` es 64 donde Linux usa 256, y `ANNOTATE_COPY` no está | Cada frame con más daño cae al blit de pantalla completa por CPU |
-| Los ioctls `DRM_MASTER` no comprueban el master (que sí existe) | Todo ioctl `DRM_MASTER` lo puede emitir cualquiera |
+| ~~Los ioctls `DRM_MASTER` no comprueban el master (que sí existe)~~ | **Corregido, opt-in:** con `drm.master_check` los doce ioctls de modeset que `drm_ioctls[]` marca `DRM_MASTER` (`SETCRTC`, `SETPLANE`, `CURSOR`/`CURSOR2`, `SETGAMMA`, `ATTACHMODE`/`DETACHMODE`, `SETPROPERTY`, `PAGE_FLIP`, `DIRTYFB`, `OBJ_SETPROPERTY`, `ATOMIC`) son EACCES para quien no es master, antes de leer el argumento; sin el flag siguen abiertos a cualquiera |
 | `GET_CLIENT` no existe | libva da la inicialización por fallida: sin VA-API |
 | Sin `GAMMA_LUT`/`CTM` | gammastep, luz nocturna y la gamma de RandR no hacen nada |
 | Sin `IN_FORMATS` en el plano | Inocuo mientras `DRM_CAP_ADDFB2_MODIFIERS` sea 0; obligatorio el día que se ponga a 1 |
