@@ -2857,3 +2857,9 @@ mod sysinfo_layout_tests {
         assert_eq!(offset_of!(SysInfo, mem_unit) + 4 + 4, 112);
     }
 }
+
+/// The sixteen resource limits through `prlimit64`, `getrlimit` and
+/// `setrlimit`: which process a pid names, whose capability decides a raise,
+/// and the old limit going out while the new one goes in.
+#[cfg(test)]
+mod rlimit_wiring_tests;
