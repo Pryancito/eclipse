@@ -3755,3 +3755,6 @@ fn wait4_target(pid: i32) -> LxResult<WaitTarget> {
 
 #[cfg(test)]
 mod clone_refusal_tests;
+
+#[cfg(test)]
+mod wait_family_wiring_tests;
