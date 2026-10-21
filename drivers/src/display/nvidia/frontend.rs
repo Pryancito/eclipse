@@ -324,6 +324,71 @@ mod tests {
         );
     }
 
+    /// `nvidia.nvidiactl` and `nvidia.uvm` read back as set; and `cards()`
+    /// lists every GPU in the registry in minor order, each as
+    /// `frontend_card` describes it, with the instance it has at the time
+    /// of asking. The registry is process-wide (`crate::test_globals::LOCK`)
+    /// and may hold what another test registered, so the two GPUs here
+    /// are read relative to what was there, and taken out before anything
+    /// is asserted.
+    #[test]
+    fn the_switches_latch_and_cards_lists_the_registry_in_minor_order() {
+        let _g = crate::test_globals::LOCK.lock();
+        let was = (enabled(), uvm_enabled());
+        set_enabled(true);
+        set_uvm_enabled(false);
+        assert!(enabled() && !uvm_enabled());
+        set_enabled(false);
+        set_uvm_enabled(true);
+        assert!(!enabled() && uvm_enabled());
+        set_enabled(was.0);
+        set_uvm_enabled(was.1);
+
+        let mut a = NvidiaGpu::for_test(0x1f06, 8192);
+        a.pci_bus = 0x2d;
+        a.bar0_phys = 0xfb00_0000;
+        a.bar0_len = 16 << 20;
+        let mut b = NvidiaGpu::for_test(0x1e07, 4096);
+        b.pci_bus = 0x41;
+        b.pci_device = 3;
+        b.bar1_phys = 0xc000_0000;
+        *b.rm_device_instance.lock() = Some(1);
+        let before = NVIDIA_GPUS.lock().len();
+        NVIDIA_GPUS.lock().push(alloc::sync::Arc::new(a));
+        NVIDIA_GPUS.lock().push(alloc::sync::Arc::new(b));
+        let cards = cards();
+        NVIDIA_GPUS.lock().truncate(before);
+
+        assert_eq!(cards.len(), before + 2);
+        let (first, second) = (cards[before], cards[before + 1]);
+        assert_eq!(
+            (
+                first.minor,
+                first.bus,
+                first.device_id,
+                first.reg_address,
+                first.reg_size
+            ),
+            (before as u32, 0x2d, 0x1f06, 0xfb00_0000, 16 << 20)
+        );
+        assert_eq!(
+            (first.instance, first.gpu_id(), first.uuid()),
+            (None, u32::MAX, None)
+        );
+        assert_eq!(
+            (
+                second.minor,
+                second.bus,
+                second.slot,
+                second.device_id,
+                second.fb_address
+            ),
+            (before as u32 + 1, 0x41, 3, 0x1e07, 0xc000_0000)
+        );
+        assert_eq!(second.instance, Some(1), "the instance it had when asked");
+        assert_eq!(second.fb_size, 256 << 20, "for_test's framebuffer");
+    }
+
     /// The instance is read at the time of asking: a GPU the RM brings up
     /// after boot (the console GPU's deferred bring-up) is listed from then on.
     #[test]
