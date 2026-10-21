@@ -1254,6 +1254,12 @@ fn dup_target(newfd: usize, nofile: u64) -> Result<FileDesc, LxError> {
 #[cfg(test)]
 mod anon_fd_wiring_tests;
 
+/// One open file description and the descriptors that name it: what a copy
+/// shares, what it gets of its own, and the lock `flock` hangs on the
+/// description rather than on the descriptor.
+#[cfg(test)]
+mod shared_description_tests;
+
 #[cfg(test)]
 mod dup_limit_tests {
     //! The three `RLIMIT_NOFILE` checks the dup family did not have. The
