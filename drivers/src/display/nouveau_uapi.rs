@@ -3358,6 +3358,9 @@ mod direct_submit_tests {
 /// and a compositor that dies saying nothing. Its one exclusion has to be
 /// exactly as wide as its justification.
 #[cfg(test)]
+mod gpudbg_tests;
+
+#[cfg(test)]
 mod errno_reporter_tests {
     use super::*;
 
