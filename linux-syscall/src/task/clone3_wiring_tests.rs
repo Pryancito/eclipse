@@ -32,6 +32,17 @@
 //!    `EPERM` is an errno nothing in `clone3`'s own decoding can produce.
 //!    It pins the LAST of the eight words as well as the first.
 //!
+//! Between them the tests follow seven of the eight words to the end: the
+//! flags, the pidfd slot (`CLONE_PIDFD`, where the descriptor lands), the
+//! child_tid (`CLONE_CHILD_SETTID`, where the new task's tid lands), the
+//! parent_tid (the slot the pidfd does NOT come from), the stack and its
+//! length, and the tls. What is NOT pinned is `newsp` as an ARGUMENT: the
+//! sum of words 5 and 6 only ever lands in a task's stack pointer, so the
+//! mutation lot's `args.newsp` as a constant survives everything here, and
+//! what would see it is a child that runs -- which this harness ends at
+//! once, by design. What is pinned there is the sum being read and refused
+//! when it overflows, and `newsp` not being confused with another argument.
+//!
 //! Every test asserts the decode as a premise first, so a failure says which
 //! half it is in.
 //!
@@ -62,6 +73,12 @@ const A_SIGNAL_IN_THE_FLAGS: u64 = 17;
 /// What a slot holds before anything is written to it, so "left alone" cannot
 /// pass for "written".
 const A_SEED: i32 = -0x55;
+
+/// `CLONE_THREAD` with the two flags Linux insists come with it, plus
+/// `CLONE_CHILD_SETTID`. The one combination whose write this test can read
+/// back, because a thread SHARES the address space it is written into, where
+/// a fork gets a copy of it.
+const A_THREAD_ASKING_FOR_ITS_TID: u64 = (1 << 16) | (1 << 8) | (1 << 11) | (1 << 24);
 
 /// Something that is not zero, for the tail that has to be empty. It goes in
 /// the LAST byte of the tail every time: a tail check that reads one byte, or
@@ -442,6 +459,94 @@ fn the_pidfd_slot_is_its_own_field_and_the_descriptor_lands_in_it() {
                 sys.sys_wait4(pid as i32, UserOutPtr::from(0), 0, UserOutPtr::from(0))
                     .await,
                 Ok(pid)
+            );
+        })
+    });
+}
+
+#[test]
+fn the_child_tid_word_reaches_sys_clone_and_the_new_task_writes_its_tid_there() {
+    // Word 2, and the last of the eight this file can follow to the end.
+    // `CLONE_CHILD_SETTID` is what makes `sys_clone` write to it at all, and
+    // it has to write BEFORE the new task runs, because the parent's pthread
+    // library reads the word immediately -- which is also what makes it
+    // readable here.
+    //
+    // A thread and not a fork, because a fork writes into the CHILD's copy of
+    // the page and there is no copy to read here: `fork_child_tid_tests` next
+    // door asks that of `publish_child_tid` directly, with two address spaces
+    // and a mapped page. A thread shares the one address space, so the word
+    // the test holds IS the word the kernel writes.
+    let proc = a_process(47_187, "clone3-ctid");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let mut word: i32 = A_SEED;
+            let at = &mut word as *mut i32 as usize;
+            assert_eq!(
+                clone3_to_clone([A_THREAD_ASKING_FOR_ITS_TID, 0, at as u64, 0, 0, 0, 0, 0]),
+                Ok(Clone3Args {
+                    flags: A_THREAD_ASKING_FOR_ITS_TID as usize,
+                    newsp: 0,
+                    parent_slot: 0,
+                    tls: 0,
+                    child_tid: at,
+                }),
+                "the decode does not carry word 2 as the child_tid"
+            );
+
+            let mut asking = Wide::asking(A_THREAD_ASKING_FOR_ITS_TID);
+            asking.args[2] = at as u64;
+            let tid = sys
+                .sys_clone3(asking.asked(), CLONE_ARGS_SIZE_VER0)
+                .await
+                .expect("a clone3 asking for a thread did not make one");
+
+            assert_ne!(
+                tid as KoID,
+                sys.thread.id(),
+                "clone3 answered the caller's own tid"
+            );
+            assert_ne!(word, A_SEED, "nothing was written to the child_tid word");
+            assert_eq!(
+                word, tid as i32,
+                "the child_tid word got something that is not the new thread's tid"
+            );
+        })
+    });
+}
+
+#[test]
+fn the_stack_words_are_read_and_a_sum_that_overflows_is_refused_and_not_a_panic() {
+    // Words 5 and 6, and the reason they are worth a test of their own: the
+    // child's stack pointer is `stack + stack_size`, both straight out of
+    // userspace, and a plain `+` panics on a debug build. `clone3` with
+    // `stack = u64::MAX` and `stack_size = 1` was a kernel panic any process
+    // could ask for, and it sat there unreachable behind an `ENOSYS` stub
+    // waiting for the day somebody deleted the stub -- which is since.
+    //
+    // `clone3_tests` fixes the arithmetic. What this adds is that the refusal
+    // comes back as an errno through the call userspace makes, which is the
+    // one thing a panic would not do.
+    let proc = a_process(47_188, "clone3-stack");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let mut over = Wide::asking(0);
+            over.args[5] = u64::MAX;
+            over.args[6] = 1;
+            assert_eq!(
+                sys.sys_clone3(over.asked(), CLONE_ARGS_SIZE_VER0).await,
+                Err(LxError::EINVAL),
+                "stack + stack_size overflowed instead of being refused"
+            );
+
+            // And the other half of `clone3_stack_valid`: both zero, or
+            // neither. A stack with no length is not a stack.
+            let mut half = Wide::asking(0);
+            half.args[5] = 0x7000_0000;
+            assert_eq!(
+                sys.sys_clone3(half.asked(), CLONE_ARGS_SIZE_VER0).await,
+                Err(LxError::EINVAL),
+                "a stack with no length was accepted"
             );
         })
     });
