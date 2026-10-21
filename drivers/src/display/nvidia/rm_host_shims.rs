@@ -700,7 +700,44 @@ pub(super) struct FakeRm {
     /// goes: 2 MiB-aligned ranges handed out upward from `RM_PICKS_FROM`.
     /// A test may set it to 0 for a mapping the RM "placed" at VA 0.
     pub picked_va: u64,
+    /// `gem_map_cpu` answers `lookup_status` set for an object it holds:
+    /// the C side's shape for a lookup the RM refused.
+    pub fail_map_cpu: bool,
+    /// `exec_submit` and `exec_submit_signaled` fail as calls, before any
+    /// stage: what the Rust wrappers turn into `Err`.
+    pub refuse_submit: bool,
+    /// The ring runs what it fetches: a signalled submit lands its wait
+    /// (`fence_wait_status == 0`), and a push the fake can read -- the
+    /// 6-dword host semaphore RELEASE, fetched through a binding of a
+    /// sysmem object -- writes its payload where it says, through the
+    /// same bindings. Without it the fence is submitted and never waited
+    /// out, which is what a fake with no GPU behind it always answered.
+    pub runs: bool,
+    /// With `runs`: the PTEs `vm_bind_map` wrote are not GPU-visible, so a
+    /// push from a bound VA fetches nothing and its wait never lands; only
+    /// a push from the channel's own RM-mapped buffer runs.
+    pub vm_bind_invisible: bool,
+    /// With `runs`: the ring runs and the wait lands, but a release's write
+    /// never reaches memory -- the coherency failure `GR-IDLE-NOFENCE`
+    /// names, and the one shape of "the fence landed" that is not a pass.
+    pub writes_lost: bool,
+    /// Every semaphore RELEASE the ring executed: `(ctx, VA, payload)`.
+    pub releases: Vec<(u32, u64, u32)>,
 }
+
+/// `ECLIPSE_CHAN_BUF_SIZE`: the channel's own buffer, pushbuffer and ring,
+/// which the RM maps itself at the VA `ctx_alloc` reports.
+pub(super) const CHAN_BUF_SIZE: u64 = 0x1_0000;
+
+/// Where the fake's `ctx_alloc` puts the channel buffer of context `ctx`.
+pub(super) fn chan_buf_va(ctx: u32) -> u64 {
+    0x10_0000 * u64::from(ctx)
+}
+
+/// `ECLIPSE_PUSH_HDR(subch=0, NVC46F_SEM_ADDR_LO, count=5)`: the header of
+/// the host semaphore stream, as the C fence builder and the kernel's
+/// self-test write it.
+const SEM_STREAM_HDR: u32 = (1 << 29) | (5 << 16) | (0x5c >> 2);
 
 /// The first VA the fake hands out when the caller lets the RM pick.
 pub(super) const RM_PICKS_FROM: u64 = 0x20_0000_0000;
@@ -758,6 +795,12 @@ const EMPTY_RM: FakeRm = FakeRm {
     step17_builds: 0,
     ctx0_resets: 0,
     picked_va: RM_PICKS_FROM,
+    fail_map_cpu: false,
+    refuse_submit: false,
+    runs: false,
+    vm_bind_invisible: false,
+    writes_lost: false,
+    releases: Vec::new(),
 };
 
 pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);
@@ -795,9 +838,62 @@ impl FakeRm {
     /// `ctx`: what the RM's own lookup answers before it rings the
     /// doorbell.
     fn push_mapped(&self, ctx: u32, va: u64, len: u32) -> bool {
-        self.maps.iter().any(|m| {
-            m.1 == ctx && va >= m.3 && va.wrapping_add(u64::from(len)) <= m.3.wrapping_add(m.4)
-        })
+        self.in_chan_buf(ctx, va, len)
+            || self.maps.iter().any(|m| {
+                m.1 == ctx && va >= m.3 && va.wrapping_add(u64::from(len)) <= m.3.wrapping_add(m.4)
+            })
+    }
+
+    /// Whether `[va, va + len)` lies inside the channel buffer of a context
+    /// `ctx_alloc` built: the RM mapped that one itself, so its lookup
+    /// finds it with no binding of the client's.
+    fn in_chan_buf(&self, ctx: u32, va: u64, len: u32) -> bool {
+        let base = chan_buf_va(ctx);
+        self.ctxs.contains(&ctx)
+            && va >= base
+            && va.wrapping_add(u64::from(len)) <= base.wrapping_add(CHAN_BUF_SIZE)
+    }
+
+    /// The host address of `va` in context `ctx`, through a binding of a
+    /// sysmem object; `None` for a VA the CPU cannot reach that way.
+    fn host_addr(&self, ctx: u32, va: u64) -> Option<u64> {
+        self.maps
+            .iter()
+            .find(|m| m.1 == ctx && va >= m.3 && va < m.3.wrapping_add(m.4))
+            .and_then(|m| Some(self.pa_of(m.2)? + m.5 + (va - m.3)))
+    }
+
+    /// Whether the ring runs a push fetched at `va`: with `runs`, unless
+    /// the PTEs are invisible and the push is not the channel's own.
+    fn runs_push(&self, ctx: u32, va: u64, len: u32) -> bool {
+        self.runs && (!self.vm_bind_invisible || self.in_chan_buf(ctx, va, len))
+    }
+
+    /// Run a push the fake can read: a host semaphore RELEASE writes its
+    /// payload at its VA, through the context's bindings, as the PBDMA
+    /// would. Anything else, or a VA the fake has no memory behind
+    /// (the channel's own buffer), runs without a trace.
+    fn execute(&mut self, ctx: u32, va: u64, len: u32) {
+        let Some(push) = self.host_addr(ctx, va) else {
+            return;
+        };
+        if len < 24 {
+            return;
+        }
+        let w = |i: u64| unsafe { core::ptr::read_volatile((push + 4 * i) as *const u32) };
+        // SEM_EXECUTE's OPERATION field, bits [2:0]: 1 is RELEASE.
+        if w(0) != SEM_STREAM_HDR || w(5) & 0x7 != 1 {
+            return;
+        }
+        let sem_va = u64::from(w(1)) | (u64::from(w(2) & 0xff) << 32);
+        let payload = w(3);
+        if self.writes_lost {
+            return;
+        }
+        if let Some(sem) = self.host_addr(ctx, sem_va) {
+            unsafe { core::ptr::write_volatile(sem as *mut u32, payload) };
+            self.releases.push((ctx, sem_va, payload));
+        }
     }
 
     /// One submit through the fake: the RM's lookup of the push VA in
@@ -881,7 +977,7 @@ extern "C" fn eclipse_rm_ctx_alloc(_inst: u32, ctx_idx: u32, out: *mut CtxAlloc)
             h_compute: 0,
             channel_class: 0xc46f,
             userd_size: 0,
-            buf_gpu_va: 0x10_0000 * u64::from(ctx_idx),
+            buf_gpu_va: chan_buf_va(ctx_idx),
         };
     }
     NV_OK
@@ -945,7 +1041,14 @@ extern "C" fn eclipse_rm_gem_map_cpu(_inst: u32, h_memory: u32, out: *mut GemMap
     let mut f = FAKE_RM.lock();
     f.calls.push("gem_map_cpu");
     let elsewhere = f.map_cpu_elsewhere;
+    let refused = f.fail_map_cpu;
     let r = match f.gem(h_memory) {
+        Some(_) if refused => GemMapCpu {
+            lookup_status: NV_ERR_OBJECT_NOT_FOUND,
+            address_space: 0,
+            phys_addr: 0,
+            size: 0,
+        },
         Some((_, size, true)) if elsewhere => GemMapCpu {
             lookup_status: 0,
             address_space: 2,
@@ -1146,6 +1249,9 @@ extern "C" fn eclipse_rm_exec_submit(
 ) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("exec_submit");
+    if f.refuse_submit {
+        return NV_ERR_NOT_SUPPORTED;
+    }
     let [lookup, map, token, submit] = f.submit(ctx_idx, push_va, push_len, None);
     unsafe {
         *out = ExecSubmit {
@@ -1172,12 +1278,20 @@ extern "C" fn eclipse_rm_exec_submit_signaled(
 ) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("exec_submit_signaled");
+    if f.refuse_submit {
+        return NV_ERR_NOT_SUPPORTED;
+    }
     let [lookup, map, token, submit] = f.submit(ctx_idx, push_va, push_len, Some(fence_payload));
     let submitted = lookup == 0 && submit == 0;
     // The GPU "runs" the push before the call returns: the fence lands
     // unless told to stall. The driver polls it itself (async path).
     if submitted && !f.fence_stalls {
         FENCE_SEM.store(fence_payload, Ordering::Release);
+    }
+    // And the C side's own wait on it: only a ring that runs lands it.
+    let ran = submitted && f.runs_push(ctx_idx, push_va, push_len);
+    if ran {
+        f.execute(ctx_idx, push_va, push_len);
     }
     unsafe {
         *out = ExecSignal {
@@ -1186,8 +1300,8 @@ extern "C" fn eclipse_rm_exec_submit_signaled(
             token_status: token,
             submit_status: submit,
             fence_submit_status: if submitted { 0 } else { 0xFFFF_FFFF },
-            fence_wait_status: 0xFFFF_FFFF,
-            fence_value: 0,
+            fence_wait_status: if ran { 0 } else { 0xFFFF_FFFF },
+            fence_value: if ran { fence_payload } else { 0 },
             work_token: 0x1000 + ctx_idx,
             runlist_id: 0,
             fence_sem_phys: if submitted {

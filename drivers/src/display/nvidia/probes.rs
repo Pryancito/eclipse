@@ -382,20 +382,27 @@ impl NvidiaGpu {
         // (golden context was never loaded before NVK's first
         // push hit the cold load), or a global-ctx-buffer
         // (patch/attribute/pagepool) was not mapped for this ctx.
+        // Two lines, like the verdict above: with the five registers in
+        // front, the sentence ran past `klog_emit`'s 256 bytes and the cut
+        // landed before the pointer to the PRIME line, which is the one
+        // thing this line exists to give.
         if fecs_status != 0 || gpccs_status != 0 {
             crate::klog_warn!(
                 "[nouveau-uapi] EXEC: ctx={} FECS/GPCCS ctx-switch hang \
                  (FECS_STATUS={:#010x} GPCCS_STATUS={:#010x} \
-                 MAILBOX0={:#010x} MAILBOX1={:#010x} PRIV_ERR={:#010x}) -- \
-                 GR context-image for this client channel is incomplete; \
-                 check whether ctx_prime timed out at CHANNEL_ALLOC \
-                 (see /proc/gpudbg last PRIME line for ctx={})",
+                 MAILBOX0={:#010x} MAILBOX1={:#010x} PRIV_ERR={:#010x})",
                 ctx_idx,
                 fecs_status,
                 gpccs_status,
                 fecs_mb0,
                 fecs_mb1,
-                fecs_priv_err,
+                fecs_priv_err
+            );
+            crate::klog_warn!(
+                "[nouveau-uapi] EXEC: ctx={} GR context-image for this client channel is \
+                 incomplete; check whether ctx_prime timed out at CHANNEL_ALLOC \
+                 (see /proc/gpudbg last PRIME line for ctx={})",
+                ctx_idx,
                 ctx_idx
             );
         }

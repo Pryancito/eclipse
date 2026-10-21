@@ -86,6 +86,8 @@ std::thread_local! {
     static MARK_CALLS_CELL: Cell<usize> = const { Cell::new(0) };
     static VERIFY_CALLS_CELL: Cell<usize> = const { Cell::new(0) };
     static WAKE_CALLS_CELL: Cell<usize> = const { Cell::new(0) };
+    static DMESG_CELL: core::cell::RefCell<alloc::vec::Vec<(u8, alloc::string::String)>> =
+        const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
 }
 
 /// `drivers_dma_alloc` answers 0 (out of memory).
@@ -236,8 +238,37 @@ extern "C" fn drivers_timer_now_as_micros() -> u64 {
     crate::nvme::nvme_queue::test_clock::now()
 }
 
+/// Every dmesg line *this thread* emitted since the last call, oldest
+/// first, each with its syslog priority; the call empties the record.
+///
+/// `drivers_klog_emit` was a no-op here, so a branch whose only effect is
+/// a dmesg line -- a diagnostic's verdict, a probe's recovery attempt --
+/// could be reached by a test and still not be told apart from the branch
+/// next to it. Per thread like the counters above, for the same reason: a
+/// test reads its own lines, whatever the rest of the binary is logging.
+/// The record keeps the last [`DMESG_KEPT`] lines, so a test that never
+/// takes them costs nothing to the ones after it.
+pub fn take_dmesg() -> alloc::vec::Vec<(u8, alloc::string::String)> {
+    DMESG_CELL.with(|c| core::mem::take(&mut *c.borrow_mut()))
+}
+
+/// How many lines [`take_dmesg`] keeps per thread.
+pub const DMESG_KEPT: usize = 4096;
+
 #[no_mangle]
-extern "C" fn drivers_klog_emit(_priority: u8, _msg: *const u8, _len: usize) {}
+extern "C" fn drivers_klog_emit(priority: u8, msg: *const u8, len: usize) {
+    // `msg` is valid for `len` bytes: `klog_emit` hands it the line it just
+    // formatted, which outlives the call.
+    let bytes = unsafe { core::slice::from_raw_parts(msg, len) };
+    let line = alloc::string::String::from_utf8_lossy(bytes).into_owned();
+    DMESG_CELL.with(|c| {
+        let mut lines = c.borrow_mut();
+        if lines.len() == DMESG_KEPT {
+            lines.remove(0);
+        }
+        lines.push((priority, line));
+    });
+}
 
 #[no_mangle]
 extern "C" fn drivers_intr_on() {}
@@ -549,5 +580,46 @@ mod tests {
             assert!(FAIL_ALLOC.load(Ordering::SeqCst));
             assert_eq!(ALLOC_CALLS.load(Ordering::SeqCst), 42);
         });
+    }
+
+    /// A dmesg line reaches the thread that emitted it, with its priority
+    /// and its terminator, and taking the lines empties the record; a
+    /// thread's lines are its own; and the record is bounded, dropping the
+    /// oldest. The hook was a no-op, so no test could read what a driver
+    /// told dmesg.
+    #[test]
+    fn dmesg_lines_are_kept_per_thread_until_taken_and_bounded() {
+        let _ = take_dmesg();
+        crate::klog_warn!("[hook] first {}", 1);
+        crate::klog_info!("[hook] second");
+        let other = std::thread::spawn(|| {
+            crate::klog_err!("[hook] elsewhere");
+            take_dmesg()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            other,
+            alloc::vec![(crate::bus::klog::LOG_ERR, "[hook] elsewhere\n".into())],
+            "another thread's line"
+        );
+        assert_eq!(
+            take_dmesg(),
+            alloc::vec![
+                (crate::bus::klog::LOG_WARNING, "[hook] first 1\n".into()),
+                (crate::bus::klog::LOG_INFO, "[hook] second\n".into()),
+            ]
+        );
+        assert!(take_dmesg().is_empty(), "taking empties the record");
+        for i in 0..DMESG_KEPT + 3 {
+            crate::klog_info!("[hook] {}", i);
+        }
+        let kept = take_dmesg();
+        assert_eq!(kept.len(), DMESG_KEPT);
+        assert_eq!(kept[0].1, "[hook] 3\n", "the oldest went first");
+        assert_eq!(
+            kept[DMESG_KEPT - 1].1,
+            alloc::format!("[hook] {}\n", DMESG_KEPT + 2)
+        );
     }
 }

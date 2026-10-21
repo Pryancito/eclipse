@@ -9335,3 +9335,7 @@ mod resv_tests;
 /// The GEM_PUSHBUF arm (the nvc0 Gallium path): same harness, own file,
 /// same reason.
 mod pushbuf_tests;
+
+/// The channel self-test and the GR hang probe (`probes.rs`): same
+/// harness, own file, same reason.
+mod probes_tests;
