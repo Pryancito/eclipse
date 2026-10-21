@@ -19,9 +19,10 @@
 //!    nothing about where they then go.
 //!
 //! The last one is the hard one, because `sys_clone` with nothing wrong
-//! FORKS, and a unit test has no use for a child process. So each test here
-//! leaves exactly one thing wrong, and picks a wrong thing whose errno no
-//! other stage can answer:
+//! FORKS. One test here does exactly that and reaps the child, since nothing
+//! else can show that the chain arrives at all; the rest leave exactly one
+//! thing wrong, and pick a wrong thing whose errno no other stage can
+//! answer:
 //!
 //!  * `CLONE_NEWUSER` is a bit this kernel NAMES, so `clone3_to_clone`
 //!    hands it on, and REFUSES, in `sys_clone`'s namespace gate. A struct
@@ -50,8 +51,11 @@ const A_NAMESPACE: u64 = 1 << 28;
 /// argument at all.
 const SETTLS: u64 = 1 << 19;
 
-/// Something that is not zero, for the tail that has to be empty.
-const A_TAIL_WORD: u64 = 1;
+/// Something that is not zero, for the tail that has to be empty. It goes in
+/// the LAST byte of the tail every time: a tail check that reads one byte, or
+/// any number of bytes short of the whole, passes an empty-looking tail that
+/// is not empty.
+const A_TAIL_BYTE: u8 = 1;
 
 fn a_process(pid: KoID, name: &str) -> Arc<Process> {
     Process::create_with_fixed_id_ext(&ROOT_JOB, pid, name, LinuxProcess::new(RamFS::new(), 0))
@@ -63,7 +67,7 @@ fn a_process(pid: KoID, name: &str) -> Arc<Process> {
 #[repr(C)]
 struct Wide {
     args: [u64; 8],
-    tail: [u64; 1],
+    tail: [u8; 8],
 }
 
 impl Wide {
@@ -71,7 +75,7 @@ impl Wide {
     fn asking(flags: u64) -> Self {
         Wide {
             args: [flags, 0, 0, 0, 0, 0, 0, 0],
-            tail: [0],
+            tail: [0; 8],
         }
     }
 
@@ -170,7 +174,7 @@ fn the_tail_past_version_zero_is_read_past_the_struct_and_has_to_be_empty() {
             );
 
             let mut filled = Wide::asking(A_NAMESPACE);
-            filled.tail[0] = A_TAIL_WORD;
+            filled.tail[7] = A_TAIL_BYTE;
             assert_eq!(
                 sys.sys_clone3(filled.asked(), CLONE_ARGS_SIZE_VER0 + 8)
                     .await,
@@ -185,6 +189,17 @@ fn the_tail_past_version_zero_is_read_past_the_struct_and_has_to_be_empty() {
                 sys.sys_clone3(whole, PAGE_SIZE).await,
                 Err(LxError::EINVAL),
                 "a page exactly was refused as a size, or its empty tail was not empty"
+            );
+
+            // And the whole of that tail is looked at: the one byte that is
+            // not zero is the very last of the 4032.
+            let last = a_page.len() - 1;
+            a_page[last] = (A_TAIL_BYTE as u64) << 56;
+            let whole = UserInPtr::<u64>::from(a_page.as_mut_ptr() as usize);
+            assert_eq!(
+                sys.sys_clone3(whole, PAGE_SIZE).await,
+                Err(LxError::E2BIG),
+                "the last byte of the tail was never read"
             );
         })
     });
@@ -297,6 +312,48 @@ fn clone3_answers_from_its_own_number_with_the_pointer_first_and_the_size_second
                 by_number(sys, [at, CLONE_ARGS_SIZE_VER0, 0, 0, 0, 0]).await,
                 -(LxError::EINVAL as isize),
                 "clone3 by number did not reach sys_clone with the struct"
+            );
+        })
+    });
+}
+
+#[test]
+fn a_clone_args_with_nothing_wrong_forks_and_the_child_is_the_callers() {
+    // Every test above leaves one thing wrong, because that is the only way
+    // to ask about the wiring without a child process at the end of it. This
+    // one leaves nothing wrong, which is the one thing they cannot show: that
+    // the chain ARRIVES. A `clone3` refused at every stage and a `clone3`
+    // that never reaches the fork answer alike.
+    //
+    // The struct is all zeros, which for `clone3` is a plain fork asking for
+    // no exit signal at all -- `exit_signal` has a field of its own here, and
+    // a 0 in it means "tell the parent nothing", which legacy `clone` cannot
+    // say, since a 0 in the low byte of its flags word is the same as not
+    // asking. The zombie is still left for a `wait4` to find; only the
+    // notification goes.
+    //
+    // The child's thread has nothing to run in this harness, so it ends as if
+    // it had exited, and the `wait4` both proves the parentage and reaps it.
+    let proc = a_process(47_185, "clone3-forks");
+    let caller = proc.id();
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let mut asking = Wide::asking(0);
+            let pid = sys
+                .sys_clone3(asking.asked(), CLONE_ARGS_SIZE_VER0)
+                .await
+                .expect("a clone_args with nothing wrong did not fork");
+            assert_ne!(
+                pid, 0,
+                "clone3 answered the child's 0, not the parent's pid"
+            );
+            assert_ne!(pid as KoID, caller, "clone3 answered the caller's own pid");
+
+            assert_eq!(
+                sys.sys_wait4(pid as i32, UserOutPtr::from(0), 0, UserOutPtr::from(0))
+                    .await,
+                Ok(pid),
+                "the pid clone3 answered is not a child of the caller"
             );
         })
     });
