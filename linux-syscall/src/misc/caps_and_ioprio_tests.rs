@@ -450,9 +450,7 @@ fn capset_lets_a_set_shrink_and_refuses_one_that_grows() {
         Box::pin(async move {
             let mut hdr = a_header(LINUX_CAPABILITY_VERSION_3, 0);
 
-            // Root holds everything, so it may ask for everything, and it
-            // may give the lot away. A daemon dropping privilege does the
-            // second one.
+            // Root holds everything, so it may ask for everything.
             assert_eq!(
                 capset(sys, &mut hdr, &sets(EVERY_CAPABILITY, EVERY_CAPABILITY, 0)),
                 Ok(0),
@@ -467,7 +465,11 @@ fn capset_lets_a_set_shrink_and_refuses_one_that_grows() {
             // everything away no longer holds what it would be passing on,
             // and Linux refuses it then too.
             assert_eq!(
-                capset(sys, &mut hdr, &sets(0, 0, EVERY_CAPABILITY)),
+                capset(
+                    sys,
+                    &mut hdr,
+                    &sets(EVERY_CAPABILITY, EVERY_CAPABILITY, EVERY_CAPABILITY)
+                ),
                 Ok(0),
                 "root may not make what it holds inheritable"
             );
@@ -483,6 +485,22 @@ fn capset_lets_a_set_shrink_and_refuses_one_that_grows() {
                 capset(sys, &mut hdr, &sets(EVERY_CAPABILITY, 0, 0)),
                 Err(LxError::EPERM),
                 "an effective set outside the permitted one was accepted"
+            );
+
+            // Giving the lot away is what a daemon dropping privilege
+            // does, and it is a door that only opens one way: these sets
+            // are what the process KEEPS, so each call is judged against
+            // what the one before it left behind, and once the permitted
+            // set is empty not even root asks it back.
+            assert_eq!(
+                capset(sys, &mut hdr, &sets(0, 0, 0)),
+                Ok(0),
+                "root may not drop what it holds"
+            );
+            assert_eq!(
+                capset(sys, &mut hdr, &sets(0, EVERY_CAPABILITY, 0)),
+                Err(LxError::EPERM),
+                "a permitted set came back after it had been dropped"
             );
         })
     });

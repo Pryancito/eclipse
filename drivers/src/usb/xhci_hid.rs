@@ -7691,6 +7691,17 @@ mod controller_tests;
 #[cfg(test)]
 mod enum_tests;
 
+/// Un hub y lo que cuelga de él: el camino de la clase hub, con el route
+/// string y el traductor de transacciones de cada hijo.
+#[cfg(test)]
+mod hub_tree_tests;
+
+/// Las transferencias de interrupción: los informes de un ratón y el mapa de
+/// bits de cambios de un hub, que es lo que llega por los endpoints que no
+/// son EP0.
+#[cfg(test)]
+mod int_tests;
+
 /// La tabla de la página HID del teclado y el delta entre dos informes, que
 /// es el camino que `tests` no toca: ahí todo es ratón.
 #[cfg(test)]

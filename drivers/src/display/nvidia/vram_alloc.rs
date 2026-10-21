@@ -65,8 +65,14 @@ impl NvidiaVramAllocator {
         None
     }
 
+    /// Frees the pages `[phys_addr, phys_addr + size)` names; an address
+    /// outside the aperture frees nothing. (Below `base_phys` it used to
+    /// saturate to offset 0 and free the first pages.)
     pub(super) fn free(&mut self, phys_addr: u64, size: usize) {
-        let offset = phys_addr.saturating_sub(self.base_phys);
+        if phys_addr < self.base_phys {
+            return;
+        }
+        let offset = phys_addr - self.base_phys;
         if offset >= self.total_size {
             return;
         }
@@ -78,5 +84,143 @@ impl NvidiaVramAllocator {
                 self.bitmap[b / 64] &= !(1 << (b % 64));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The allocator on its own: nothing exercised it (`_alloc` has no
+    //! caller and `free` only runs on a real GPU), so none of its lines
+    //! had a test. Pages are 4 KiB; the aperture here is tiny and the
+    //! numbers are the bitmap's own.
+
+    use super::*;
+
+    const BASE: u64 = 0x1_0000_0000;
+    const PAGE: u64 = 4096;
+
+    fn used(a: &NvidiaVramAllocator) -> Vec<usize> {
+        let pages = (a.total_size / PAGE) as usize;
+        (0..pages)
+            .filter(|&b| a.bitmap[b / 64] & (1 << (b % 64)) != 0)
+            .collect()
+    }
+
+    #[test]
+    fn the_bitmap_has_one_bit_per_page_rounded_up_to_a_word() {
+        assert_eq!(NvidiaVramAllocator::new(BASE, 0).bitmap.len(), 0);
+        assert_eq!(NvidiaVramAllocator::new(BASE, PAGE).bitmap.len(), 1);
+        assert_eq!(NvidiaVramAllocator::new(BASE, 64 * PAGE).bitmap.len(), 1);
+        assert_eq!(NvidiaVramAllocator::new(BASE, 65 * PAGE).bitmap.len(), 2);
+        // A size that is not whole pages loses the tail.
+        let a = NvidiaVramAllocator::new(BASE, 3 * PAGE + 100);
+        assert_eq!(a.total_size, 3 * PAGE + 100);
+        assert_eq!(used(&a), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn allocations_are_first_fit_from_the_base_and_round_up_to_pages() {
+        let mut a = NvidiaVramAllocator::new(BASE, 8 * PAGE);
+        assert_eq!(a._alloc(1, 0), Some(BASE), "a byte takes the first page");
+        assert_eq!(
+            a._alloc(PAGE as usize + 1, 0),
+            Some(BASE + PAGE),
+            "two pages"
+        );
+        assert_eq!(used(&a), alloc::vec![0, 1, 2]);
+        assert_eq!(a._alloc(5 * PAGE as usize, 0), Some(BASE + 3 * PAGE));
+        assert_eq!(a._alloc(1, 0), None, "full");
+        assert_eq!(used(&a), (0..8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_run_broken_by_a_used_page_starts_over_after_it() {
+        let mut a = NvidiaVramAllocator::new(BASE, 8 * PAGE);
+        // Pages 0..8 free; take page 2 so the free run before it is 2 long.
+        a.bitmap[0] |= 1 << 2;
+        assert_eq!(
+            a._alloc(3 * PAGE as usize, 0),
+            Some(BASE + 3 * PAGE),
+            "three pages do not fit in 0..2, so they go after page 2"
+        );
+        assert_eq!(used(&a), alloc::vec![2, 3, 4, 5]);
+        assert_eq!(
+            a._alloc(2 * PAGE as usize, 0),
+            Some(BASE),
+            "two pages still fit in 0..2"
+        );
+    }
+
+    #[test]
+    fn alignment_is_honoured_in_pages_and_anything_under_a_page_is_a_page() {
+        let mut a = NvidiaVramAllocator::new(BASE, 16 * PAGE);
+        assert_eq!(a._alloc(1, 0), Some(BASE));
+        assert_eq!(
+            a._alloc(1, 4 * PAGE as usize),
+            Some(BASE + 4 * PAGE),
+            "the next 4-page boundary, pages 1..4 skipped"
+        );
+        assert_eq!(
+            a._alloc(1, 1),
+            Some(BASE + PAGE),
+            "an alignment under a page is a page"
+        );
+        assert_eq!(
+            a._alloc(2 * PAGE as usize, 8 * PAGE as usize),
+            Some(BASE + 8 * PAGE)
+        );
+        assert_eq!(used(&a), alloc::vec![0, 1, 4, 8, 9]);
+        assert_eq!(
+            a._alloc(1, 16 * PAGE as usize),
+            None,
+            "no free 16-page boundary but 0, which is taken"
+        );
+        assert_eq!(
+            a._alloc(8 * PAGE as usize, 8 * PAGE as usize),
+            None,
+            "8..16 has page 8 and 9 taken"
+        );
+    }
+
+    #[test]
+    fn free_clears_exactly_the_pages_it_names_and_they_come_back() {
+        let mut a = NvidiaVramAllocator::new(BASE, 8 * PAGE);
+        let first = a._alloc(3 * PAGE as usize, 0).unwrap();
+        let second = a._alloc(2 * PAGE as usize, 0).unwrap();
+        assert_eq!((first, second), (BASE, BASE + 3 * PAGE));
+        a.free(first, 3 * PAGE as usize);
+        assert_eq!(used(&a), alloc::vec![3, 4]);
+        a.free(second + PAGE, 1);
+        assert_eq!(
+            used(&a),
+            alloc::vec![3],
+            "a byte frees the one page it is in"
+        );
+        assert_eq!(
+            a._alloc(3 * PAGE as usize, 0),
+            Some(BASE),
+            "freed pages are reused"
+        );
+        assert_eq!(used(&a), alloc::vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn free_outside_the_aperture_touches_nothing() {
+        let mut a = NvidiaVramAllocator::new(BASE, 4 * PAGE);
+        assert_eq!(a._alloc(4 * PAGE as usize, 0), Some(BASE));
+        a.free(BASE - PAGE, PAGE as usize);
+        assert_eq!(
+            used(&a),
+            alloc::vec![0, 1, 2, 3],
+            "below the base: not page 0"
+        );
+        a.free(BASE + 4 * PAGE, PAGE as usize);
+        assert_eq!(used(&a), alloc::vec![0, 1, 2, 3], "at the end");
+        a.free(u64::MAX, PAGE as usize);
+        assert_eq!(used(&a), alloc::vec![0, 1, 2, 3]);
+        // A range that starts inside and runs off the end frees what is
+        // inside and stops at the bitmap.
+        a.free(BASE + 3 * PAGE, 100 * PAGE as usize);
+        assert_eq!(used(&a), alloc::vec![0, 1, 2]);
     }
 }
