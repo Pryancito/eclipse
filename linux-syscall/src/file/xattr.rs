@@ -170,6 +170,13 @@ fn xattr_copy_out(bytes: &[u8], buf: usize, size: usize) -> SysResult {
     Ok(bytes.len())
 }
 
+/// The twelve, each one made by number through the dispatch table: which file
+/// each number names (the `l*` forms differ by one `bool`, and only a dangling
+/// symlink can tell them apart), the order the arguments are judged in, and
+/// which of the two user buffers each call touches.
+#[cfg(test)]
+mod wiring_tests;
+
 #[cfg(test)]
 mod xattr_tests {
     //! What the xattr syscalls judge before the filesystem gets a say. They
