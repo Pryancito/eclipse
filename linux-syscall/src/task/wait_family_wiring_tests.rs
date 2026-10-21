@@ -179,15 +179,19 @@ fn waitid_by_pid_reports_the_child_in_infop_and_collects_it() {
     parent.exit(0);
 }
 
-/// `waitid(P_ALL)` takes the children one at a time, and whatever it finds
-/// it writes `infop`: a `WNOHANG` that found nothing zeroes the struct
-/// rather than leave the previous call's child in it, and leaves the rusage
-/// alone.
+/// `waitid(P_ALL)` takes the children one at a time, whatever group they are
+/// in -- one of these two left for a group of its own, and ALL means all --
+/// and whatever it finds it writes `infop`: a `WNOHANG` that found nothing
+/// zeroes the struct rather than leave the previous call's child in it, and
+/// leaves the rusage alone.
 #[test]
 fn waitid_for_any_child_takes_one_at_a_time_and_writes_infop_either_way() {
     let parent = a_process(48_301);
     let first_pid = a_zombie_child(&parent, 1);
-    let second_pid = a_zombie_child(&parent, 2);
+    let elsewhere = a_live_child(&parent);
+    let second_pid = elsewhere.id();
+    set_process_pgid(&parent, second_pid, second_pid).expect("a group of its own");
+    elsewhere.exit(2);
     let alive = a_live_child(&parent);
     let (mut found, mut statuses, empty, stale_info, stale_rusage) =
         on_a_thread(&parent, move |sys| {
