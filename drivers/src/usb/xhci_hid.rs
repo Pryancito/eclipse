@@ -7536,6 +7536,11 @@ mod irq_tests;
 #[cfg(test)]
 mod classify_tests;
 
+/// La cara que el controlador le enseña a libinput, y el informe cuando no
+/// se puede mirar.
+#[cfg(test)]
+mod capability_tests;
+
 /// La tabla de la página HID del teclado y el delta entre dos informes, que
 /// es el camino que `tests` no toca: ahí todo es ratón.
 #[cfg(test)]

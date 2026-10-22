@@ -534,6 +534,32 @@ impl FakeDev {
         }
     }
 
+    /// Un dispositivo compuesto con `n` interfaces HID de ratón, todas
+    /// iguales: es lo que tiene un teclado de los de teclas de más, y lo que
+    /// hace falta para pasar del tope de interfaces que el driver apunta.
+    pub(super) fn hid_many_ifaces(n: u8) -> Self {
+        let base = Self::mouse();
+        let report = base.report.clone();
+        let rlen = report.len() as u16;
+        let mut config: Vec<u8> = alloc::vec![
+            // Configuration: un total y un número de interfaces que se
+            // arreglan abajo.
+            0x09, 0x02, 0x00, 0x00, n, 0x01, 0x00, 0xa0, 0x32,
+        ];
+        for i in 0..n {
+            // Interface i: HID (3), subclase boot (1), protocolo ratón (2).
+            config.extend_from_slice(&[0x09, 0x04, i, 0x00, 0x01, 0x03, 0x01, 0x02, 0x00]);
+            // HID, con la longitud de su descriptor de informe.
+            config.extend_from_slice(&[0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22]);
+            config.extend_from_slice(&rlen.to_le_bytes());
+            // Endpoint (i + 1) IN, interrupción.
+            config.extend_from_slice(&[0x07, 0x05, 0x81 + i, 0x03, 0x08, 0x00, 0x0a]);
+        }
+        let total = config.len() as u16;
+        config[2..4].copy_from_slice(&total.to_le_bytes());
+        Self { config, ..base }
+    }
+
     /// Un raton de arranque con una interfaz de fabricante **de mas**, de
     /// protocolo 0 y con el mismo descriptor de puntero: los dos se
     /// clasifican como raton y el driver tiene que quedarse con uno.
