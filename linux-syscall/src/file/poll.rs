@@ -3106,3 +3106,6 @@ mod parked_wait_tests;
 
 #[cfg(test)]
 mod refusing_file_tests;
+
+#[cfg(test)]
+mod unwatchable_tests;
