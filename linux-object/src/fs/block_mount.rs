@@ -332,6 +332,12 @@ impl BlockCache {
 
     /// Insert or replace a full sector, evicting the LRU victim(s) if at
     /// capacity. `data` must be exactly one sector.
+    ///
+    /// When at capacity the victim's `Box` is reused for the newcomer: a
+    /// streaming multi-GB write (Ollama model download, `apk` extracting
+    /// libLLVM) otherwise does `drop`+`Box::new([0u8; 512])` once per sector
+    /// — millions of heap churn events that left the buddy freelist unable to
+    /// satisfy even a 16-byte `epoll` subscription and panicking the kernel.
     fn insert(&mut self, sector: u64, data: &[u8]) {
         debug_assert_eq!(data.len(), SECTOR);
         let new_tick = self.next_tick();
@@ -347,17 +353,21 @@ impl BlockCache {
             self.lru.insert(new_tick, sector);
             return;
         }
-        // Fresh sector: evict the least-recently-used until under capacity.
+        // Fresh sector: evict the least-recently-used until under capacity,
+        // keeping one victim buffer to refill instead of allocating again.
+        let mut recycled: Option<Box<[u8; SECTOR]>> = None;
         while self.lines.len() >= self.capacity {
             let victim_tick = match self.lru.keys().next().copied() {
                 Some(t) => t,
                 None => break,
             };
             if let Some(victim_sector) = self.lru.remove(&victim_tick) {
-                self.lines.remove(&victim_sector);
+                if let Some(line) = self.lines.remove(&victim_sector) {
+                    recycled = Some(line.data);
+                }
             }
         }
-        let mut boxed = Box::new([0u8; SECTOR]);
+        let mut boxed = recycled.unwrap_or_else(|| Box::new([0u8; SECTOR]));
         boxed.copy_from_slice(data);
         self.lines.insert(
             sector,
@@ -720,22 +730,34 @@ impl Device for CachedDevice {
         let first = offset / SECTOR;
         let last = (end - 1) / SECTOR;
         let mut cache = self.cache.lock();
-        for sector in first..=last {
-            let s_start = sector * SECTOR;
-            let s_end = s_start + SECTOR;
-            let cov_start = max(s_start, offset);
-            let cov_end = min(s_end, end);
-            if cov_start == s_start && cov_end == s_end {
-                // Whole sector overwritten: store the authoritative copy.
-                cache.insert(sector as u64, &buf[cov_start - offset..cov_end - offset]);
-            } else {
-                // Partial sector: patch a resident copy so it cannot go stale;
-                // if absent, leave it out (disk already has the new bytes).
-                cache.patch(
-                    sector as u64,
-                    cov_start - s_start,
-                    &buf[cov_start - offset..cov_end - offset],
-                );
+        // A streaming write (model download, package extract) spans many
+        // sectors once and is almost never re-read from this cache: stuffing
+        // every sector in would only thrash the LRU. Invalidate the span so
+        // a later reader fetches from disk; metadata writes stay small and
+        // still update in place below.
+        const STREAMING_WRITE: usize = 64 * 1024;
+        if n >= STREAMING_WRITE {
+            for sector in first as u64..=last as u64 {
+                cache.invalidate(sector);
+            }
+        } else {
+            for sector in first..=last {
+                let s_start = sector * SECTOR;
+                let s_end = s_start + SECTOR;
+                let cov_start = max(s_start, offset);
+                let cov_end = min(s_end, end);
+                if cov_start == s_start && cov_end == s_end {
+                    // Whole sector overwritten: store the authoritative copy.
+                    cache.insert(sector as u64, &buf[cov_start - offset..cov_end - offset]);
+                } else {
+                    // Partial sector: patch a resident copy so it cannot go stale;
+                    // if absent, leave it out (disk already has the new bytes).
+                    cache.patch(
+                        sector as u64,
+                        cov_start - s_start,
+                        &buf[cov_start - offset..cov_end - offset],
+                    );
+                }
             }
         }
         // A short write is the same story on a smaller scale: the bytes past `n`
@@ -1297,6 +1319,37 @@ mod block_byte_tests {
         // Still room for exactly one more before eviction.
         c.insert(6, &[0x33; SECTOR]);
         assert!(c.contains(5) && c.contains(6));
+    }
+
+    #[test]
+    fn cache_insert_at_capacity_never_grows_past_the_ceiling() {
+        let mut c = BlockCache::new(4);
+        for i in 0..200u64 {
+            c.insert(i, &[(i as u8).wrapping_mul(3); SECTOR]);
+            assert!(
+                c.lines.len() <= 4 && c.lru.len() == c.lines.len(),
+                "insert #{i} left lines={} lru={}",
+                c.lines.len(),
+                c.lru.len()
+            );
+        }
+        assert_eq!(c.lines.len(), 4);
+    }
+
+    #[test]
+    fn a_streaming_write_does_not_stuff_the_sector_cache() {
+        let dev = MockBlock::new(512); // 256 KiB
+        let cd = cached(dev, 64);
+        let big = vec![0x5au8; 128 * 1024]; // past STREAMING_WRITE
+        assert_eq!(cd.write_at(0, &big).unwrap(), big.len());
+        assert_eq!(
+            cd.cache.lock().lines.len(),
+            0,
+            "a multi-sector streaming write must invalidate, not densify"
+        );
+        // A small metadata-sized write still warms the cache.
+        assert_eq!(cd.write_at(0, &[0x11; SECTOR]).unwrap(), SECTOR);
+        assert!(cd.cache.lock().contains(0));
     }
 
     /// A backing device that stops part-way: everything below `fail_from` lands

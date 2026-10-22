@@ -38,14 +38,17 @@
  *
  * What is NOT here yet, and answers NV_ERR_NOT_SUPPORTED (which the kernel
  * side turns into EINVAL, like an unknown escape on Linux): RM_ALLOC_MEMORY
- * of any other class, RM_VID_HEAP_CONTROL, and the two controls that carry
- * a device fd inside their parameters (NV00FD_CTRL_CMD_ATTACH_GPU,
- * NV00E0_CTRL_CMD_EXPORT_MEM). The nv.c-level
- * escapes (CARD_INFO, CHECK_VERSION_STR, ATTACH_GPUS_TO_FD, REGISTER_FD, ...)
- * are not RM calls on Linux either and live on the Rust side
- * (linux-object/src/fs/devfs/nvidia.rs), and so do the three OS-event
+ * of any other class, and the two controls that carry a device fd inside
+ * their parameters (NV00FD_CTRL_CMD_ATTACH_GPU, NV00E0_CTRL_CMD_EXPORT_MEM).
+ * The nv.c-level escapes (CARD_INFO, CHECK_VERSION_STR, ATTACH_GPUS_TO_FD,
+ * REGISTER_FD, ...) are not RM calls on Linux either and live on the Rust
+ * side (linux-object/src/fs/devfs/nvidia.rs), and so do the three OS-event
  * escapes, which rm_ioctl serves before RmIoctl without entering the RM
  * core (ALLOC_OS_EVENT, FREE_OS_EVENT, RM_GET_EVENT_DATA).
+ *
+ * RM_VID_HEAP_CONTROL is here: cuMemAlloc's VRAM path (ALLOC_SIZE / …)
+ * goes through Nv04VidHeapControlWithSecInfo; ALLOC_OS_DESCRIPTOR reuses
+ * the same RmCreateOsDescriptor transliteration as RM_ALLOC_MEMORY.
  *
  * Two departures from Linux, both forced by how Eclipse brings the RM up:
  *
@@ -1091,6 +1094,29 @@ static NV_STATUS _eclipse_rm_frontend_dispatch(
             }
 
             _eclipse_rm_alloc_os_descriptor(pParms, secInfo);
+            break;
+        }
+
+        case NV_ESC_RM_VID_HEAP_CONTROL:
+        {
+            NVOS32_PARAMETERS *pApi = pData;
+
+            if (dataSize != sizeof(*pApi))
+            {
+                rmStatus = NV_ERR_INVALID_ARGUMENT;
+                goto done;
+            }
+
+            ECLIPSE_CTL_DEVICE_ONLY(bCtl);
+
+            /* escape.c: OS descriptor goes through RmCreateOsDescriptor;
+             * every other heap function is Nv04VidHeapControlWithSecInfo
+             * (cuMemAlloc's ALLOC_SIZE among them). */
+            if (pApi->function == NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR)
+                _eclipse_rm_create_os_descriptor(pApi, secInfo);
+            else
+                Nv04VidHeapControlWithSecInfo(pApi, secInfo);
+
             break;
         }
 

@@ -375,6 +375,17 @@ pub fn memfd_stats() -> (usize, usize, usize) {
     (created, count, bytes)
 }
 
+/// Shared ramfs/tmpfs/memfd pool for OOM dumps: `(live_bytes, cap_bytes,
+/// page_backend)`. `page_backend == false` with a large cap densifies the
+/// kernel heap — see `install_tmpfs_frame_backend`.
+pub fn ramfs_oom_stats() -> (usize, usize, bool) {
+    (
+        rcore_fs_ramfs::ramfs_live_bytes(),
+        rcore_fs_ramfs::bytes_cap(),
+        rcore_fs_ramfs::page_backend_installed(),
+    )
+}
+
 /// One line per live memfd (seq, size, inode strong count), newest first,
 /// up to `max` entries — enough to tell leaked wl_shm pools (MiB-sized, extra
 /// strong refs) from cursor-sized scratch files.
@@ -609,7 +620,7 @@ fn mount_ramfs_at(root: &Arc<MNode>, rel: &str, target: &str) {
         if last {
             match cur.mount(RamFS::new()) {
                 Ok(_) => {
-                    register_mount("tmpfs", target, "tmpfs", "rw,nosuid,nodev", None);
+                    register_mount("tmpfs", target, "tmpfs", &tmpfs_mount_opts(), None);
                     warn!("[boot] tmpfs on {target}");
                 }
                 Err(e) => warn!("[boot] mount {target} failed: {e:?}"),
@@ -1135,9 +1146,67 @@ const EVDEV_MAJOR: usize = 13;
 /// See [`EVDEV_MAJOR`].
 const EVDEV_EVENT_MINOR_BASE: usize = 64;
 
+/// Install frame-backed tmpfs pages and a Linux-style size cap (MemTotal/2)
+/// before any RamFS mount materializes file data.
+fn install_tmpfs_frame_backend() {
+    fn alloc_page() -> Option<*mut u8> {
+        let frame = kernel_hal::mem::PhysFrame::new_zero()?;
+        let ptr = frame.as_mut_ptr();
+        core::mem::forget(frame);
+        Some(ptr)
+    }
+    fn free_page(ptr: *mut u8) {
+        // Safety: ptr came from alloc_page / PhysFrame::as_mut_ptr above.
+        unsafe {
+            drop(kernel_hal::mem::PhysFrame::from_virt_owned(ptr as usize));
+        }
+    }
+    rcore_fs_ramfs::set_page_backend(alloc_page, free_page);
+    // If the frame probe fails, keep the 128 MiB heap-safe ceiling: raising
+    // MemTotal/2 while pages still densify the fixed kernel heap is what
+    // turns a download into `alloc_error` of a few dozen bytes elsewhere
+    // (e.g. `UserPin` growth inside `epoll_pwait`).
+    let probe_ok = match alloc_page() {
+        Some(p) => {
+            free_page(p);
+            true
+        }
+        None => false,
+    };
+    let (_used, total) = kernel_hal::mem::memory_usage();
+    let cap = if probe_ok && total > 0 {
+        total / 2
+    } else {
+        128 * 1024 * 1024
+    };
+    rcore_fs_ramfs::set_bytes_cap(cap);
+    if probe_ok {
+        warn!(
+            "[boot] tmpfs: frame-backed, size={} MiB (MemTotal/2)",
+            cap >> 20
+        );
+    } else {
+        warn!(
+            "[boot] tmpfs: frame probe FAILED — heap-safe cap {} MiB (not MemTotal/2)",
+            cap >> 20
+        );
+    }
+}
+
+/// Options string for a tmpfs mount, including the live size= cap.
+fn tmpfs_mount_opts() -> String {
+    alloc::format!(
+        "rw,nosuid,nodev,size={}",
+        rcore_fs_ramfs::bytes_cap()
+    )
+}
+
 /// create root filesystem, mount DevFS and RamFS
 pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     warn!("[boot] create_root_fs: begin");
+    // Pages for /tmp, /run, /dev/shm come from the frame allocator (not the
+    // fixed kernel heap), with a shared MemTotal/2 ceiling — like Linux tmpfs.
+    install_tmpfs_frame_backend();
     // Filesystem from the boot medium (initrd / SFS). We use it to read the boot
     // `/etc/fstab` and, when an installed btrfs/ext2 ROOT partition is
     // detected, to pivot the real root onto it (similar to an initramfs
@@ -1631,17 +1700,18 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // `add("shm", ...)` above); it is not a MountFS mount, because `/dev/*`
         // lookups bypass MountFS via the `lookup_virtual_fs` fast path. Register
         // it in the mount table only so `/proc/mounts` reflects reality.
-        register_mount("tmpfs", "/dev/shm", "tmpfs", "rw,nosuid,nodev", None);
+        register_mount("tmpfs", "/dev/shm", "tmpfs", &tmpfs_mount_opts(), None);
     }
 
-    // mount RamFS at /tmp
+    // mount RamFS at /tmp — frame-backed pages, shared MemTotal/2 ceiling with
+    // `/run`, `/dev/shm` and memfd (see `install_tmpfs_frame_backend`).
     warn!("[boot] create_root_fs: mount /tmp");
     let ramfs = RamFS::new();
     let tmp = resolve_mount_dir(&rootfs, &root, root_fstype, "tmp", 0o666);
     if let Err(e) = tmp.mount(ramfs) {
         warn!("[boot] create_root_fs: mount /tmp failed: {:?}", e);
     } else {
-        register_mount("tmpfs", "/tmp", "tmpfs", "rw,nosuid,nodev", None);
+        register_mount("tmpfs", "/tmp", "tmpfs", &tmpfs_mount_opts(), None);
     }
 
     // mount RamFS at /run (essential for DHCP clients and other daemons)
@@ -1713,7 +1783,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     if let Err(e) = run.mount(run_ramfs) {
         warn!("[boot] create_root_fs: mount /run failed: {:?}", e);
     } else {
-        register_mount("tmpfs", "/run", "tmpfs", "rw,nosuid,nodev", None);
+        register_mount("tmpfs", "/run", "tmpfs", &tmpfs_mount_opts(), None);
     }
 
     // PulseAudio `--system` (change_user) always mkdir+chowns these two
@@ -1745,7 +1815,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                     .expect("failed to mkdir /var/cache/apk")
             });
             if apk_cache.mount(RamFS::new()).is_ok() {
-                register_mount("tmpfs", "/var/cache/apk", "tmpfs", "rw,nosuid,nodev", None);
+                register_mount("tmpfs", "/var/cache/apk", "tmpfs", &tmpfs_mount_opts(), None);
             } else {
                 warn!("[boot] create_root_fs: mount /var/cache/apk failed");
             }

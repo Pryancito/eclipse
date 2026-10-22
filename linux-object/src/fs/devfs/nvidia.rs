@@ -20,13 +20,12 @@
 //! events (ALLOC_OS_EVENT, FREE_OS_EVENT, RM_GET_EVENT_DATA, and `poll`).
 //! Served by the RM (`nvidia-rm-sys/vendor/eclipse_rm_frontend.c`): RM_ALLOC,
 //! RM_FREE, RM_CONTROL, RM_DUP_OBJECT, RM_SHARE, RM_MAP_MEMORY,
-//! RM_UNMAP_MEMORY, RM_UPDATE_DEVICE_MAPPING_INFO, and RM_ALLOC_MEMORY of an
-//! OS descriptor, whose pages are pinned here first (`pin.rs`). Everything
-//! else answers EINVAL and is logged the first time each escape is seen:
-//! RM_ALLOC_MEMORY of any other class, VID_HEAP_CONTROL, SET_NUMA_STATUS and
-//! the dma-buf escapes.
-//! `nvidia-smi` is what this much is for; CUDA needs those, and
-//! `/dev/nvidia-uvm` besides (`nvidia_uvm.rs`).
+//! RM_UNMAP_MEMORY, RM_VID_HEAP_CONTROL (cuMemAlloc / heap),
+//! RM_UPDATE_DEVICE_MAPPING_INFO, and RM_ALLOC_MEMORY of an OS descriptor,
+//! whose pages are pinned here first (`pin.rs`). Everything else answers
+//! EINVAL and is logged the first time each escape is seen: RM_ALLOC_MEMORY
+//! of any other class, SET_NUMA_STATUS and the dma-buf escapes.
+//! CUDA also needs `/dev/nvidia-uvm` (`nvidia_uvm.rs`).
 //!
 //! A mapping is made in two steps, as on Linux. RM_MAP_MEMORY has the RM map
 //! the memory and records the result on the open the client names in the
@@ -91,6 +90,7 @@ pub mod esc {
     pub const RM_DUP_OBJECT: u32 = 0x34;
     pub const RM_SHARE: u32 = 0x35;
     pub const RM_GET_EVENT_DATA: u32 = 0x52;
+    pub const RM_VID_HEAP_CONTROL: u32 = 0x4A;
     pub const RM_MAP_MEMORY: u32 = 0x4E;
     pub const RM_UNMAP_MEMORY: u32 = 0x4F;
     pub const RM_UPDATE_DEVICE_MAPPING_INFO: u32 = 0x5E;
@@ -620,6 +620,7 @@ impl NvidiaOpen {
             | esc::RM_CONTROL
             | esc::RM_DUP_OBJECT
             | esc::RM_SHARE
+            | esc::RM_VID_HEAP_CONTROL
             | esc::RM_UNMAP_MEMORY
             | esc::RM_UPDATE_DEVICE_MAPPING_INFO => {
                 if !nvctl::rm_up() {

@@ -54,6 +54,23 @@ impl PhysFrame {
         }
     }
 
+    /// Reclaim a frame previously obtained from [`Self::new`] / [`Self::new_zero`]
+    /// whose ownership was forgotten at the kernel virt address of that frame
+    /// (tmpfs/ramfs page backing). Dropping the returned value frees it.
+    ///
+    /// # Safety
+    ///
+    /// `vaddr` must be `phys_to_virt` of a frame this CPU still owns and that
+    /// was allocated through the frame allocator (not a borrowed mapping).
+    pub unsafe fn from_virt_owned(vaddr: crate::VirtAddr) -> Self {
+        let paddr = crate::mem::virt_to_phys(vaddr);
+        assert!(crate::addr::is_aligned(paddr));
+        Self {
+            paddr,
+            allocated: true,
+        }
+    }
+
     /// Get the start physical address of this frame.
     pub fn paddr(&self) -> PhysAddr {
         self.paddr

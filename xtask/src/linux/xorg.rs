@@ -369,6 +369,11 @@ const DEFAULT_PACKAGES: &[&str] = &[
     // separate package with a separate binary name and does NOT `provides`
     // this one, so a mirror carrying only ESR needs ECLIPSE_XORG_PACKAGES.
     "firefox",
+    // Tools for optional `install-ollama-cuda` (official .tar.zst); Ollama is
+    // not in the default image — the user installs it when they want it.
+    "zstd",
+    "curl",
+    "ca-certificates",
     // What Firefox's GPU probe (`glxtest`, run before the first window) uses
     // to read the graphics card's PCI vendor and device id: it sees
     // `/sys/bus/pci/` and then `dlopen`s `libpci.so.3`, and without the

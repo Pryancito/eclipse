@@ -277,9 +277,13 @@ impl Pipe {
         match id {
             Some(id) => {
                 let data = self.data.clone();
-                crate::sync::ReadinessSub::new(Box::new(move || {
+                crate::sync::ReadinessSub::try_new(move || {
                     data.lock().eventbus.unsubscribe(id);
-                }))
+                })
+                .unwrap_or_else(|| {
+                    self.data.lock().eventbus.unsubscribe(id);
+                    crate::sync::ReadinessSub::noop()
+                })
             }
             None => crate::sync::ReadinessSub::noop(),
         }
@@ -306,9 +310,13 @@ impl Pipe {
         match id {
             Some(id) => {
                 let data = self.data.clone();
-                crate::sync::ReadinessSub::new(Box::new(move || {
+                crate::sync::ReadinessSub::try_new(move || {
                     data.lock().eventbus.unsubscribe(id);
-                }))
+                })
+                .unwrap_or_else(|| {
+                    self.data.lock().eventbus.unsubscribe(id);
+                    crate::sync::ReadinessSub::noop()
+                })
             }
             None => crate::sync::ReadinessSub::noop(),
         }

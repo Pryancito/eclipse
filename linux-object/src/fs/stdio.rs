@@ -1861,9 +1861,13 @@ impl Stdin {
             // finds the same bus this subscription went on.
             Some(id) => {
                 let vt = self.vt;
-                crate::sync::ReadinessSub::new(Box::new(move || {
+                crate::sync::ReadinessSub::try_new(move || {
                     vt_stdin(vt).eventbus.lock().unsubscribe(id);
-                }))
+                })
+                .unwrap_or_else(|| {
+                    vt_stdin(vt).eventbus.lock().unsubscribe(id);
+                    crate::sync::ReadinessSub::noop()
+                })
             }
             None => crate::sync::ReadinessSub::noop(),
         }

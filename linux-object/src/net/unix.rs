@@ -1208,9 +1208,15 @@ impl FileLike for UnixSocketState {
         Some(match id {
             Some(id) => {
                 let inner = self.inner.clone();
-                crate::sync::ReadinessSub::new(Box::new(move || {
+                crate::sync::ReadinessSub::try_new(move || {
                     inner.lock().eventbus.unsubscribe(id);
-                }))
+                })
+                .unwrap_or_else(|| {
+                    // Heap full: drop the park rather than panic the kernel
+                    // (the Ollama download OOM landed on this 16-byte Box).
+                    self.inner.lock().eventbus.unsubscribe(id);
+                    crate::sync::ReadinessSub::noop()
+                })
             }
             None => crate::sync::ReadinessSub::noop(),
         })
@@ -1232,9 +1238,13 @@ impl FileLike for UnixSocketState {
         Some(match id {
             Some(id) => {
                 let inner = self.inner.clone();
-                crate::sync::ReadinessSub::new(Box::new(move || {
+                crate::sync::ReadinessSub::try_new(move || {
                     inner.lock().eventbus.unsubscribe(id);
-                }))
+                })
+                .unwrap_or_else(|| {
+                    self.inner.lock().eventbus.unsubscribe(id);
+                    crate::sync::ReadinessSub::noop()
+                })
             }
             None => crate::sync::ReadinessSub::noop(),
         })

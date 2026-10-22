@@ -147,6 +147,13 @@ fn plan(version: &str) -> Plan {
         "libdl.so.2",
         "libpthread.so.0",
         "librt.so.1",
+        // Official Ollama (and other glibc Go binaries) need these; without
+        // them the loader fails on `libresolv.so.2` and users reach for
+        // Alpine `gcompat`, which overwrites `/lib64/ld-linux-x86-64.so.2`
+        // and then dies on `fcntl64`.
+        "libresolv.so.2",
+        "libnss_dns.so.2",
+        "libnss_files.so.2",
     ] {
         libc.push(same(&format!("{LIBDIR}/{lib}")));
     }
@@ -440,7 +447,9 @@ pub(super) fn remove(root: &Path, why: &str) {
     let Some(version) = super::nvidia_firmware::pinned_rm_version() else {
         return;
     };
-    let probe = fs::remove_file(root.join(super::cuda_probe::PATH)).is_ok() as usize;
+    let probe = fs::remove_file(root.join(super::cuda_probe::PATH)).is_ok() as usize
+        + fs::remove_file(root.join(super::cuda_probe::STATUS_PATH)).is_ok() as usize
+        + fs::remove_file(root.join(super::cuda_probe::INSTALL_OLLAMA_PATH)).is_ok() as usize;
     let removed = remove_with(root, &plan(&version)) + probe;
     if removed > 0 {
         println!(

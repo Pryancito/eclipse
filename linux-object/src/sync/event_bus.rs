@@ -305,33 +305,103 @@ impl EventBus {
 /// poller that stops waiting (completed, timed out, or was killed) does not
 /// leave a callback behind to wake a recycled task slot later.
 ///
-/// Carries a type-erased unsubscribe closure rather than an
-/// `Arc<Mutex<EventBus>>` because the bus lives behind a different owner per
-/// file type (a bare field inside the pipe's data mutex, an `Arc<Mutex<_>>`
-/// on eventfd/timerfd, a global for the DRM device); each subscriber captures
-/// whatever handle it needs.
+/// The common `Arc<Mutex<EventBus>>` case needs no heap allocation for the
+/// handle ([`ReadinessSub::on_bus`]): a full kernel heap used to panic here
+/// on a 16-byte `Box` inside `epoll_pwait` (Ollama downloading a large model
+/// into tmpfs until the heap was gone). Nested buses still use a fallible
+/// boxed unsubscribe ([`ReadinessSub::try_new`]).
 pub struct ReadinessSub {
-    unsub: Option<alloc::boxed::Box<dyn FnOnce() + Send>>,
+    kind: UnsubKind,
+}
+
+enum UnsubKind {
+    Noop,
+    Bus {
+        bus: Arc<Mutex<EventBus>>,
+        id: u64,
+    },
+    Boxed(alloc::boxed::Box<dyn FnOnce() + Send>),
 }
 
 impl ReadinessSub {
     /// A subscription whose cleanup runs `unsub` on drop.
     pub fn new(unsub: alloc::boxed::Box<dyn FnOnce() + Send>) -> Self {
-        Self { unsub: Some(unsub) }
+        Self {
+            kind: UnsubKind::Boxed(unsub),
+        }
+    }
+
+    /// Like [`Self::new`], but refuses instead of panicking when the heap
+    /// cannot hold the unsubscribe closure. Callers that already parked a
+    /// callback must unsubscribe it themselves when this returns `None`.
+    pub fn try_new(unsub: impl FnOnce() + Send + 'static) -> Option<Self> {
+        Some(Self {
+            kind: UnsubKind::Boxed(try_box_fn_once(unsub)?),
+        })
+    }
+
+    /// Unsubscribe `id` from `bus` on drop, with no heap allocation.
+    pub fn on_bus(bus: Arc<Mutex<EventBus>>, id: u64) -> Self {
+        Self {
+            kind: UnsubKind::Bus { bus, id },
+        }
     }
 
     /// A subscription with nothing to clean up: the waker already fired at
     /// subscribe time (events were pending), so no callback was stored.
     pub fn noop() -> Self {
-        Self { unsub: None }
+        Self {
+            kind: UnsubKind::Noop,
+        }
     }
 }
 
 impl Drop for ReadinessSub {
     fn drop(&mut self) {
-        if let Some(f) = self.unsub.take() {
-            f();
+        match core::mem::replace(&mut self.kind, UnsubKind::Noop) {
+            UnsubKind::Noop => {}
+            UnsubKind::Bus { bus, id } => {
+                bus.lock().unsubscribe(id);
+            }
+            UnsubKind::Boxed(f) => f(),
         }
+    }
+}
+
+/// Fallible `Box::new` for a `FnOnce() + Send` without `allocator_api`.
+fn try_box_fn_once<F: FnOnce() + Send + 'static>(
+    f: F,
+) -> Option<alloc::boxed::Box<dyn FnOnce() + Send>> {
+    let layout = alloc::alloc::Layout::new::<F>();
+    if layout.size() == 0 {
+        // ZST: `Box` stores nothing on the heap.
+        return Some(alloc::boxed::Box::new(f));
+    }
+    // SAFETY: layout is for `F`; null means OOM.
+    let raw = unsafe { alloc::alloc::alloc(layout) as *mut F };
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: raw is allocated for one `F` and not yet initialized.
+    unsafe {
+        raw.write(f);
+        Some(alloc::boxed::Box::from_raw(raw))
+    }
+}
+
+/// Fallible `Box::new` for an [`EventHandler`].
+fn try_box_event_handler<F: Fn(Event) -> bool + Send + 'static>(f: F) -> Option<EventHandler> {
+    let layout = alloc::alloc::Layout::new::<F>();
+    if layout.size() == 0 {
+        return Some(alloc::boxed::Box::new(f));
+    }
+    let raw = unsafe { alloc::alloc::alloc(layout) as *mut F };
+    if raw.is_null() {
+        return None;
+    }
+    unsafe {
+        raw.write(f);
+        Some(alloc::boxed::Box::from_raw(raw))
     }
 }
 
@@ -340,16 +410,18 @@ impl Drop for ReadinessSub {
 /// Returns the subscription id, or `None` when events in `mask` were already
 /// pending — in that case the waker has been woken right here (the latched
 /// flags + subscribe-time fire in [`EventBus::subscribe`] make
-/// check-then-subscribe race-free) and nothing was stored.
+/// check-then-subscribe race-free) and nothing was stored. Also `None` when
+/// the heap cannot hold the callback: better a missed park than a kernel panic.
 pub fn subscribe_waker(bus: &mut EventBus, mask: Event, waker: &core::task::Waker) -> Option<u64> {
     let waker = waker.clone();
-    bus.subscribe(Box::new(move |events| {
+    let callback = try_box_event_handler(move |events| {
         if (events & mask).is_empty() {
             return false;
         }
         waker.wake_by_ref();
         true
-    }))
+    })?;
+    bus.subscribe(callback)
 }
 
 /// [`subscribe_waker`] + RAII handle for the common `Arc<Mutex<EventBus>>`
@@ -360,12 +432,7 @@ pub fn subscribe_readiness_on(
     waker: &core::task::Waker,
 ) -> ReadinessSub {
     match subscribe_waker(&mut bus.lock(), mask, waker) {
-        Some(id) => {
-            let bus = bus.clone();
-            ReadinessSub::new(Box::new(move || {
-                bus.lock().unsubscribe(id);
-            }))
-        }
+        Some(id) => ReadinessSub::on_bus(bus.clone(), id),
         None => ReadinessSub::noop(),
     }
 }
@@ -379,12 +446,7 @@ pub fn subscribe_edge_on(
     seen: u64,
 ) -> ReadinessSub {
     match bus.lock().subscribe_edge(mask, waker, seen) {
-        Some(id) => {
-            let bus = bus.clone();
-            ReadinessSub::new(Box::new(move || {
-                bus.lock().unsubscribe(id);
-            }))
-        }
+        Some(id) => ReadinessSub::on_bus(bus.clone(), id),
         None => ReadinessSub::noop(),
     }
 }

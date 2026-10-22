@@ -357,9 +357,8 @@ fn a_payload_nobody_can_read_is_efault() {
 #[test]
 fn escapes_not_served_are_einval() {
     for nr in [
-        0x4A, /* RM_VID_HEAP_CONTROL */
-        206,  /* ALLOC_OS_EVENT */
-        213, 0x99,
+        213, /* SET_NUMA_STATUS (not served) */
+        0x99,
     ] {
         let mut p = [0u8; 16];
         assert_eq!(
@@ -368,6 +367,7 @@ fn escapes_not_served_are_einval() {
             "{:#x}",
             nr
         );
+        assert!(logged_not_served(nr), "{:#x} must be logged as not served", nr);
     }
     // Hosted there is no RM behind the RM escapes either, but they are
     // served: refused for want of an RM, not logged as escapes to write.
@@ -375,6 +375,7 @@ fn escapes_not_served_are_einval() {
         esc::RM_CONTROL,
         esc::RM_MAP_MEMORY,
         esc::RM_UNMAP_MEMORY,
+        esc::RM_VID_HEAP_CONTROL,
         0x27, /* RM_ALLOC_MEMORY */
         0x5E, /* RM_UPDATE_DEVICE_MAPPING_INFO */
     ] {
@@ -386,7 +387,6 @@ fn escapes_not_served_are_einval() {
         );
         assert!(!logged_not_served(nr), "{:#x} is served", nr);
     }
-    assert!(logged_not_served(0x4A));
 }
 
 fn logged_not_served(nr: u32) -> bool {

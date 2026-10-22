@@ -10,8 +10,9 @@ use alloc::{
     vec::Vec,
 };
 use core::any::Any;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use rcore_fs::vfs::*;
-use spin::{RwLock, RwLockWriteGuard};
+use spin::{Mutex, RwLock, RwLockWriteGuard};
 
 /// Size of a storage block. File content is kept as a list of independently
 /// allocated blocks instead of one contiguous `Vec<u8>`, so that growing a
@@ -20,6 +21,192 @@ use spin::{RwLock, RwLockWriteGuard};
 /// capacity. This mirrors how a real kernel keeps file data in page-sized
 /// units and removes the O(n) realloc-copy that dominated large writes.
 const BLOCK: usize = 4096;
+
+/// Materialized ramfs/tmpfs/memfd bytes across every mount.
+///
+/// With [`set_page_backend`] installed (kernel boot), each block is a physical
+/// frame — like Linux tmpfs — so `/tmp` can hold multi‑GB downloads without
+/// densifying the fixed ~512 MiB kernel heap. Without a backend (tests),
+/// blocks are heap `Box`es. Past [`bytes_cap`] a write answers
+/// [`FsError::NoDeviceSpace`] instead of panicking the machine.
+static RAMFS_LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Shared ceiling for all ramfs content (`/tmp`, `/run`, `/dev/shm`, memfd).
+/// Boot sets this to **MemTotal / 2** (Linux tmpfs default). Fallback before
+/// that (and in unit tests) is 128 MiB.
+static RAMFS_BYTES_CAP: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024);
+
+/// Override the live-bytes ceiling (boot: MemTotal/2; tests: small caps).
+pub fn set_bytes_cap(bytes: usize) {
+    RAMFS_BYTES_CAP.store(bytes, Ordering::Relaxed);
+}
+
+/// Current live-bytes ceiling (what `df` reports as total size).
+pub fn bytes_cap() -> usize {
+    RAMFS_BYTES_CAP.load(Ordering::Relaxed)
+}
+
+/// How many materialized ramfs bytes are live right now (tests / `df`).
+pub fn ramfs_live_bytes() -> usize {
+    RAMFS_LIVE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Allocate a [`BLOCK`]-byte page for file data. Returns a writable pointer
+/// (kernel virt) or `None` if out of frames.
+pub type PageAllocFn = fn() -> Option<*mut u8>;
+/// Free a page previously returned by the matching [`PageAllocFn`].
+pub type PageFreeFn = fn(*mut u8);
+
+struct PageBackend {
+    alloc: PageAllocFn,
+    free: PageFreeFn,
+}
+
+static PAGE_BACKEND: Mutex<Option<PageBackend>> = Mutex::new(None);
+
+/// Install page alloc/free hooks (kernel: PhysFrame). Leave unset for heap Box.
+/// Call once at boot before mounting tmpfs.
+pub fn set_page_backend(alloc: PageAllocFn, free: PageFreeFn) {
+    *PAGE_BACKEND.lock() = Some(PageBackend { alloc, free });
+}
+
+/// Clear the page backend (tests that need heap Box after a previous install).
+#[cfg(test)]
+pub fn clear_page_backend() {
+    *PAGE_BACKEND.lock() = None;
+}
+
+/// Whether [`set_page_backend`] is installed (frames) vs heap `Box`.
+pub fn page_backend_installed() -> bool {
+    PAGE_BACKEND.lock().is_some()
+}
+
+/// Cap that is safe when file pages are still `Box` on the kernel heap.
+/// A MemTotal/2 ceiling without [`set_page_backend`] would densify the fixed
+/// ~512 MiB heap until `alloc_error` — ENOSPC here is the lesser evil.
+const HEAP_BACKEND_SAFE_CAP: usize = 128 * 1024 * 1024;
+
+/// Ceiling used for charging: the configured cap, but never above
+/// [`HEAP_BACKEND_SAFE_CAP`] while pages still come from the heap `Box` path.
+fn effective_cap() -> usize {
+    let cap = bytes_cap();
+    if PAGE_BACKEND.lock().is_some() {
+        cap
+    } else {
+        cap.min(HEAP_BACKEND_SAFE_CAP)
+    }
+}
+
+fn charge_block() -> Result<()> {
+    let mut cur = RAMFS_LIVE_BYTES.load(Ordering::Relaxed);
+    let cap = effective_cap();
+    loop {
+        let Some(new) = cur.checked_add(BLOCK) else {
+            return Err(FsError::NoDeviceSpace);
+        };
+        if new > cap {
+            return Err(FsError::NoDeviceSpace);
+        }
+        match RAMFS_LIVE_BYTES.compare_exchange_weak(
+            cur,
+            new,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+fn release_block() {
+    RAMFS_LIVE_BYTES.fetch_sub(BLOCK, Ordering::Release);
+}
+
+/// One file-data page: frame-backed when [`set_page_backend`] is installed,
+/// otherwise a heap `Box` (tests / hosted).
+struct RamBlock {
+    kind: RamBlockKind,
+}
+
+enum RamBlockKind {
+    Heap(alloc::boxed::Box<[u8]>),
+    Page(*mut u8),
+}
+
+// Page pointers are only touched under the owning inode lock.
+unsafe impl Send for RamBlock {}
+unsafe impl Sync for RamBlock {}
+
+impl RamBlock {
+    fn alloc_zeroed() -> Result<Self> {
+        charge_block()?;
+        let backend = PAGE_BACKEND.lock();
+        if let Some(ref b) = *backend {
+            match (b.alloc)() {
+                Some(ptr) => {
+                    // Backend may already zero (PhysFrame::new_zero); be sure.
+                    unsafe {
+                        core::ptr::write_bytes(ptr, 0, BLOCK);
+                    }
+                    Ok(RamBlock {
+                        kind: RamBlockKind::Page(ptr),
+                    })
+                }
+                None => {
+                    release_block();
+                    Err(FsError::NoDeviceSpace)
+                }
+            }
+        } else {
+            let mut v = Vec::new();
+            if v.try_reserve_exact(BLOCK).is_err() {
+                release_block();
+                return Err(FsError::NoDeviceSpace);
+            }
+            v.resize(BLOCK, 0);
+            Ok(RamBlock {
+                kind: RamBlockKind::Heap(v.into_boxed_slice()),
+            })
+        }
+    }
+
+    fn alloc_from(src: &[u8]) -> Result<Self> {
+        debug_assert_eq!(src.len(), BLOCK);
+        let mut b = Self::alloc_zeroed()?;
+        b.as_mut_slice().copy_from_slice(src);
+        Ok(b)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match &self.kind {
+            RamBlockKind::Heap(b) => b.as_ref(),
+            RamBlockKind::Page(ptr) => unsafe { core::slice::from_raw_parts(*ptr, BLOCK) },
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match &mut self.kind {
+            RamBlockKind::Heap(b) => b.as_mut(),
+            RamBlockKind::Page(ptr) => unsafe { core::slice::from_raw_parts_mut(*ptr, BLOCK) },
+        }
+    }
+}
+
+impl Drop for RamBlock {
+    fn drop(&mut self) {
+        match &self.kind {
+            RamBlockKind::Heap(_) => release_block(),
+            RamBlockKind::Page(ptr) => {
+                let p = *ptr;
+                if let Some(ref b) = *PAGE_BACKEND.lock() {
+                    (b.free)(p);
+                }
+                release_block();
+            }
+        }
+    }
+}
 
 /// Paged byte buffer: `len` logical bytes stored SPARSELY across `BLOCK`-sized
 /// blocks — `None` slots are holes that read back as zeros and cost no memory.
@@ -32,7 +219,7 @@ const BLOCK: usize = 4096;
 /// whole desktop. Blocks now materialize only when first written.
 #[derive(Default)]
 struct PagedBytes {
-    blocks: Vec<Option<alloc::boxed::Box<[u8]>>>,
+    blocks: Vec<Option<RamBlock>>,
     len: usize,
 }
 
@@ -42,13 +229,10 @@ impl PagedBytes {
         self.len
     }
 
-    fn alloc_zeroed_block() -> alloc::boxed::Box<[u8]> {
-        alloc::vec![0u8; BLOCK].into_boxed_slice()
-    }
-
     /// Resize to `new_len`. Growing exposes a hole (zeros, no allocation);
-    /// shrinking frees now-unreachable blocks and zeroes the stale tail of the
-    /// last partial block so a later grow does not resurrect old bytes.
+    /// shrinking drops unreachable [`RamBlock`]s (which release the charge)
+    /// and zeroes the stale tail of the last partial block so a later grow
+    /// does not resurrect old bytes.
     fn resize(&mut self, new_len: usize) {
         let nblocks = new_len.div_ceil(BLOCK);
         if nblocks < self.blocks.len() {
@@ -61,7 +245,7 @@ impl PagedBytes {
             let off = new_len % BLOCK;
             if off != 0 {
                 if let Some(Some(b)) = self.blocks.get_mut(new_len / BLOCK) {
-                    for x in &mut b[off..] {
+                    for x in &mut b.as_mut_slice()[off..] {
                         *x = 0;
                     }
                 }
@@ -82,7 +266,9 @@ impl PagedBytes {
             let bo = pos % BLOCK;
             let chunk = (BLOCK - bo).min(n - done);
             match self.blocks.get(bi).and_then(|b| b.as_ref()) {
-                Some(b) => buf[done..done + chunk].copy_from_slice(&b[bo..bo + chunk]),
+                Some(b) => {
+                    buf[done..done + chunk].copy_from_slice(&b.as_slice()[bo..bo + chunk])
+                }
                 // Hole: reads as zeros.
                 None => buf[done..done + chunk].fill(0),
             }
@@ -91,7 +277,10 @@ impl PagedBytes {
         n
     }
 
-    fn write_at(&mut self, offset: usize, buf: &[u8]) {
+    /// Write `buf` at `offset`. Materializing a new block can refuse with
+    /// [`FsError::NoDeviceSpace`] when the shared ramfs ceiling is hit or the
+    /// page/heap backend cannot hold another page — never panic the machine.
+    fn write_at(&mut self, offset: usize, buf: &[u8]) -> Result<usize> {
         let end = offset + buf.len();
         let nblocks = end.div_ceil(BLOCK);
         if nblocks > self.blocks.len() {
@@ -105,23 +294,25 @@ impl PagedBytes {
             let bo = pos % BLOCK;
             let chunk = (BLOCK - bo).min(buf.len() - done);
             match &mut self.blocks[bi] {
-                Some(b) => b[bo..bo + chunk].copy_from_slice(&buf[done..done + chunk]),
+                Some(b) => {
+                    b.as_mut_slice()[bo..bo + chunk]
+                        .copy_from_slice(&buf[done..done + chunk]);
+                }
                 slot @ None => {
                     // First write materializes the block. A fully covered block
                     // skips the zero-fill. An all-zero write into a hole stays a
                     // hole (no allocation) — matches sparse file semantics and
-                    // avoids heap densification from zero writeback.
+                    // avoids densification from zero writeback.
                     if buf[done..done + chunk].iter().all(|&b| b == 0) {
                         done += chunk;
                         continue;
                     }
                     let b = if bo == 0 && chunk == BLOCK {
-                        let mut v = alloc::vec::Vec::with_capacity(BLOCK);
-                        v.extend_from_slice(&buf[done..done + chunk]);
-                        v.into_boxed_slice()
+                        RamBlock::alloc_from(&buf[done..done + chunk])?
                     } else {
-                        let mut b = Self::alloc_zeroed_block();
-                        b[bo..bo + chunk].copy_from_slice(&buf[done..done + chunk]);
+                        let mut b = RamBlock::alloc_zeroed()?;
+                        b.as_mut_slice()[bo..bo + chunk]
+                            .copy_from_slice(&buf[done..done + chunk]);
                         b
                     };
                     *slot = Some(b);
@@ -132,6 +323,7 @@ impl PagedBytes {
         if end > self.len {
             self.len = end;
         }
+        Ok(buf.len())
     }
 }
 
@@ -159,15 +351,22 @@ impl FileSystem for RamFS {
     }
 
     fn info(&self) -> FsInfo {
+        // One shared pool for every ramfs mount: `df /tmp` must show the
+        // ceiling (MemTotal/2 after boot) so a download that landed here gets
+        // ENOSPC with a visible reason, not a kernel panic.
+        let used = ramfs_live_bytes();
+        let cap = effective_cap();
+        let total = cap / BLOCK;
+        let free = cap.saturating_sub(used) / BLOCK;
         FsInfo {
-            bsize: 0,
-            frsize: 0,
-            blocks: 0,
-            bfree: 0,
-            bavail: 0,
+            bsize: BLOCK,
+            frsize: BLOCK,
+            blocks: total,
+            bfree: free,
+            bavail: free,
             files: 0,
             ffree: 0,
-            namemax: 0,
+            namemax: 255,
         }
     }
 }
@@ -346,7 +545,7 @@ impl INode for LockedINode {
             return Err(FsError::IsDir);
         }
         let before = file.content.len();
-        file.content.write_at(offset, buf);
+        let n = file.content.write_at(offset, buf)?;
         // Growth telemetry: a ramfs file silently growing without bound is a
         // kernel-heap leak (each 4 KiB block is a heap allocation) — the
         // desktop OOM was ~456 MiB of such blocks with no obvious owner. Warn
@@ -362,7 +561,7 @@ impl INode for LockedINode {
                 offset
             );
         }
-        Ok(buf.len())
+        Ok(n)
     }
 
     fn poll(&self) -> Result<PollStatus> {
@@ -806,7 +1005,7 @@ mod tests {
     fn a_write_of_nothing_but_zeros_into_a_hole_leaves_it_a_hole() {
         let mut p = PagedBytes::default();
         p.resize(2 * BLOCK);
-        p.write_at(0, &[0u8; BLOCK]);
+        p.write_at(0, &[0u8; BLOCK]).unwrap();
         assert_eq!(
             allocated(&p),
             0,
@@ -822,7 +1021,7 @@ mod tests {
     fn a_write_of_one_nonzero_byte_materializes_only_its_own_block() {
         let mut p = PagedBytes::default();
         p.resize(10 * BLOCK);
-        p.write_at(5 * BLOCK + 3, b"x");
+        p.write_at(5 * BLOCK + 3, b"x").unwrap();
         assert_eq!(allocated(&p), 1);
         let mut buf = [0u8; 1];
         p.read_at(5 * BLOCK + 3, &mut buf);
@@ -832,8 +1031,8 @@ mod tests {
     #[test]
     fn a_write_past_the_end_leaves_the_gap_between_a_hole() {
         let mut p = PagedBytes::default();
-        p.write_at(0, b"a");
-        p.write_at(3 * BLOCK, b"b");
+        p.write_at(0, b"a").unwrap();
+        p.write_at(3 * BLOCK, b"b").unwrap();
         assert_eq!(p.len(), 3 * BLOCK + 1);
         assert_eq!(allocated(&p), 2, "blocks 1 and 2 were never written");
         let mut buf = [0xffu8; 16];
@@ -845,7 +1044,7 @@ mod tests {
     fn a_write_that_spans_three_blocks_reads_back_whole() {
         let mut p = PagedBytes::default();
         let data: Vec<u8> = (0..2 * BLOCK + 4).map(|i| (i % 251) as u8).collect();
-        p.write_at(BLOCK - 2, &data);
+        p.write_at(BLOCK - 2, &data).unwrap();
         assert_eq!(p.len(), 3 * BLOCK + 2);
         let mut back = alloc::vec![0u8; data.len()];
         assert_eq!(p.read_at(BLOCK - 2, &mut back), data.len());
@@ -858,7 +1057,7 @@ mod tests {
     #[test]
     fn a_block_written_end_to_end_reads_back_end_to_end() {
         let mut p = PagedBytes::default();
-        p.write_at(0, &[7u8; BLOCK]);
+        p.write_at(0, &[7u8; BLOCK]).unwrap();
         assert_eq!(p.len(), BLOCK);
         let mut back = [0u8; BLOCK];
         p.read_at(0, &mut back);
@@ -868,7 +1067,7 @@ mod tests {
     #[test]
     fn a_read_is_clipped_to_the_length_and_not_to_the_blocks() {
         let mut p = PagedBytes::default();
-        p.write_at(0, b"hello");
+        p.write_at(0, b"hello").unwrap();
         let mut buf = [0xffu8; 10];
         assert_eq!(p.read_at(0, &mut buf), 5);
         assert_eq!(&buf[..5], b"hello");
@@ -878,7 +1077,7 @@ mod tests {
     #[test]
     fn a_read_starting_past_the_end_reads_nothing() {
         let mut p = PagedBytes::default();
-        p.write_at(0, b"hello");
+        p.write_at(0, b"hello").unwrap();
         let mut buf = [0xffu8; 4];
         assert_eq!(p.read_at(5, &mut buf), 0);
         assert_eq!(p.read_at(9999, &mut buf), 0);
@@ -888,7 +1087,7 @@ mod tests {
     #[test]
     fn shrinking_then_growing_does_not_resurrect_the_old_tail() {
         let mut p = PagedBytes::default();
-        p.write_at(0, &[0xaau8; 10]);
+        p.write_at(0, &[0xaau8; 10]).unwrap();
         p.resize(4);
         p.resize(10);
         let mut back = [0xffu8; 10];
@@ -905,8 +1104,8 @@ mod tests {
     #[test]
     fn shrinking_frees_the_blocks_past_the_new_end() {
         let mut p = PagedBytes::default();
-        p.write_at(0, b"first");
-        p.write_at(3 * BLOCK, b"last");
+        p.write_at(0, b"first").unwrap();
+        p.write_at(3 * BLOCK, b"last").unwrap();
         assert_eq!(allocated(&p), 2);
         p.resize(BLOCK);
         assert_eq!(p.blocks.len(), 1);
@@ -916,7 +1115,7 @@ mod tests {
     #[test]
     fn shrinking_to_nothing_frees_everything() {
         let mut p = PagedBytes::default();
-        p.write_at(0, &[1u8; 3 * BLOCK]);
+        p.write_at(0, &[1u8; 3 * BLOCK]).unwrap();
         assert_eq!(allocated(&p), 3);
         p.resize(0);
         assert_eq!(p.len(), 0);
@@ -1668,11 +1867,122 @@ mod tests {
         assert!(root.sync_data().is_ok());
     }
 
+    /// Serialize tests that mutate the shared live-bytes / cap counters.
+    fn with_ramfs_accounting<R>(f: impl FnOnce() -> R) -> R {
+        static LOCK: spin::Mutex<()> = spin::Mutex::new(());
+        let _g = LOCK.lock();
+        f()
+    }
+
     #[test]
-    fn a_ramfs_reports_no_quota_at_all() {
-        let fs = RamFS::new();
-        let info = fs.info();
-        assert_eq!((info.blocks, info.bfree, info.bavail), (0, 0, 0));
+    fn a_ramfs_reports_the_shared_ceiling() {
+        with_ramfs_accounting(|| {
+            let fs = RamFS::new();
+            let info = fs.info();
+            assert_eq!(info.bsize, BLOCK);
+            assert_eq!(info.blocks, bytes_cap() / BLOCK);
+            assert!(info.bfree <= info.blocks);
+            assert_eq!(info.bavail, info.bfree);
+        });
+    }
+
+    /// A write that would push past the shared ceiling is `ENOSPC`, not a
+    /// kernel panic.
+    #[test]
+    fn a_write_past_the_ramfs_ceiling_is_enospc() {
+        with_ramfs_accounting(|| {
+            clear_page_backend();
+            let prev_cap = bytes_cap();
+            // Cap at the current live total: no headroom. Parallel tests may
+            // free under us, so re-sample immediately before the write.
+            let fs = RamFS::new();
+            let f = file_at(&fs.root_inode(), "fat");
+            set_bytes_cap(ramfs_live_bytes());
+            let err = f.write_at(0, &[0x5au8; BLOCK]);
+            drop(f);
+            drop(fs);
+            set_bytes_cap(prev_cap);
+            assert_eq!(
+                err,
+                Err(FsError::NoDeviceSpace),
+                "a download into /tmp past the ceiling must be ENOSPC"
+            );
+        });
+    }
+
+    /// Cap can be raised above the old 128 MiB fixed policy; heap backend still
+    /// charges and refuses only at the configured ceiling.
+    #[test]
+    fn a_configured_cap_allows_more_than_one_block_then_enospc() {
+        with_ramfs_accounting(|| {
+            clear_page_backend();
+            let prev_cap = bytes_cap();
+            let base = ramfs_live_bytes();
+            // Plenty of room for three blocks of our own.
+            set_bytes_cap(base.saturating_add(64 * BLOCK));
+            let fs = RamFS::new();
+            let f = file_at(&fs.root_inode(), "big");
+            let chunk = [0xabu8; BLOCK];
+            let err = (|| {
+                f.write_at(0, &chunk)?;
+                f.write_at(BLOCK, &chunk)?;
+                f.write_at(2 * BLOCK, &chunk)?;
+                // Snap the ceiling to "exactly full" so the next materialization
+                // is ENOSPC even if peers freed under us.
+                set_bytes_cap(ramfs_live_bytes());
+                f.write_at(3 * BLOCK, &chunk)
+            })();
+            drop(f);
+            drop(fs);
+            set_bytes_cap(prev_cap);
+            assert_eq!(err, Err(FsError::NoDeviceSpace));
+        });
+    }
+
+    /// Custom page backend is used when installed; free is called on drop.
+    #[test]
+    fn a_page_backend_allocates_and_frees() {
+        with_ramfs_accounting(|| {
+            use core::sync::atomic::AtomicUsize;
+            static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+            static FREES: AtomicUsize = AtomicUsize::new(0);
+            fn alloc_page() -> Option<*mut u8> {
+                ALLOCS.fetch_add(1, Ordering::SeqCst);
+                let layout = alloc::alloc::Layout::from_size_align(BLOCK, BLOCK).unwrap();
+                let p = unsafe { alloc::alloc::alloc_zeroed(layout) };
+                if p.is_null() {
+                    None
+                } else {
+                    Some(p)
+                }
+            }
+            fn free_page(p: *mut u8) {
+                FREES.fetch_add(1, Ordering::SeqCst);
+                let layout = alloc::alloc::Layout::from_size_align(BLOCK, BLOCK).unwrap();
+                unsafe { alloc::alloc::dealloc(p, layout) };
+            }
+
+            let prev_cap = bytes_cap();
+            let base = ramfs_live_bytes();
+            ALLOCS.store(0, Ordering::SeqCst);
+            FREES.store(0, Ordering::SeqCst);
+            set_page_backend(alloc_page, free_page);
+            set_bytes_cap(base.saturating_add(2 * BLOCK));
+
+            {
+                let fs = RamFS::new();
+                let f = file_at(&fs.root_inode(), "p");
+                f.write_at(0, &[1u8; BLOCK]).unwrap();
+                assert_eq!(ALLOCS.load(Ordering::SeqCst), 1);
+                drop(f);
+                drop(fs);
+            }
+            // Drop all Page blocks before clearing the backend so free runs.
+            assert_eq!(FREES.load(Ordering::SeqCst), 1);
+            assert_eq!(ramfs_live_bytes(), base);
+            clear_page_backend();
+            set_bytes_cap(prev_cap);
+        });
     }
 
     #[test]

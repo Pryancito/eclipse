@@ -167,6 +167,9 @@ fn the_plan_puts_glibc_where_its_binaries_look() {
         "libdl.so.2",
         "libpthread.so.0",
         "librt.so.1",
+        "libresolv.so.2",
+        "libnss_dns.so.2",
+        "libnss_files.so.2",
         "libgcc_s.so.1",
     ] {
         let path = format!("usr/lib/x86_64-linux-gnu/{lib}");

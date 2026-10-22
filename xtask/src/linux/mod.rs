@@ -6,6 +6,7 @@ mod image;
 mod nvctl_probe;
 pub(crate) mod nvidia_firmware;
 mod nvidia_userspace;
+mod ollama_cuda;
 mod opencv;
 mod portal;
 mod signal_probe;
@@ -1733,6 +1734,15 @@ impl LinuxRootfs {
                  imagen de este arco, ver apk_closure_fits_image",
                 self.0.name()
             );
+        }
+        // Official Ollama + CUDA under /usr/local — opt-in (`ECLIPSE_OLLAMA_CUDA=1`).
+        // Default image only ships install-ollama-cuda for the user to run later.
+        if self.0.name() == "x86_64" {
+            if ollama_cuda::wanted() {
+                ollama_cuda::install(dir);
+            } else {
+                ollama_cuda::remove(dir, "Ollama not in the default image");
+            }
         }
         // Needs the firefox package on disk, i.e. after xorg::install.
         desktop::write_firefox_default_prefs(dir);

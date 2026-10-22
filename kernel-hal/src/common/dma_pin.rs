@@ -52,6 +52,10 @@ pub struct PinRegistry {
 /// block out of the pool for the rest of the boot.
 static UNBALANCED_UNPINS: AtomicU64 = AtomicU64::new(0);
 
+/// `pins.push` refused because the kernel heap could not grow the registry.
+/// Those VMOs run unpinned (DMA free may race); better than `alloc_error`.
+static PIN_PUSH_OOM: AtomicU64 = AtomicU64::new(0);
+
 /// Whether two page ranges share a page.
 ///
 /// The end of a range is computed without wrapping, and a range that would run
@@ -93,6 +97,13 @@ impl PinRegistry {
             .find(|e| e.base == base && e.pages == pages)
         {
             e.refs = e.refs.saturating_add(1);
+            return;
+        }
+        // Heap exhaustion here used to panic the machine inside whatever
+        // syscall was running (`epoll_pwait` was one photographed victim)
+        // while allocating ~96 B to grow this list. Skip the pin instead.
+        if self.pins.try_reserve(1).is_err() {
+            PIN_PUSH_OOM.fetch_add(1, Relaxed);
             return;
         }
         self.pins.push(UserPin {
@@ -159,6 +170,12 @@ impl PinRegistry {
             return false;
         }
         if !self.held.iter().any(|h| h.base == base && h.pages == pages) {
+            if self.held.try_reserve(1).is_err() {
+                PIN_PUSH_OOM.fetch_add(1, Relaxed);
+                // Still report "held" so the caller does not free under a pin;
+                // the block is lost until reboot rather than recycled early.
+                return true;
+            }
             self.held.push(HeldFree { base, pages });
         }
         true
@@ -218,6 +235,18 @@ pub fn hold_if_pinned(paddr: usize, pages: usize) -> bool {
 /// Unpins that named a range no pin covered, since boot.
 pub fn unbalanced_unpins() -> u64 {
     UNBALANCED_UNPINS.load(Relaxed)
+}
+
+/// Registry snapshot for OOM / `/proc` dumps: `(live_pins, held_frees,
+/// unbalanced_unpins, pin_push_ooms)`.
+pub fn stats() -> (usize, usize, u64, u64) {
+    let g = REGISTRY.lock();
+    (
+        g.pins.len(),
+        g.held.len(),
+        unbalanced_unpins(),
+        PIN_PUSH_OOM.load(Relaxed),
+    )
 }
 
 #[cfg(test)]

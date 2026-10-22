@@ -251,6 +251,26 @@ fn alloc_error(layout: Layout) -> ! {
                 live,
                 bytes >> 20,
             ));
+            // Shared with /tmp /run /dev/shm: frame-backed after boot, else
+            // heap Box. A high live_bytes with page_backend=0 is the old
+            // densify-the-heap failure mode.
+            let (ram_live, ram_cap, ram_frames) = linux_object::fs::ramfs_oom_stats();
+            emit(format_args!(
+                "ramfs: live={} MiB cap={} MiB page_backend={}\n",
+                ram_live >> 20,
+                ram_cap >> 20,
+                ram_frames as u8,
+            ));
+        }
+        // DMA/GEM pin registry: growth of this list was the photographed
+        // `UserPin` OOM victim inside `epoll_pwait` when the heap was already
+        // gone. Counts are lock + atomics only (no alloc).
+        {
+            let (pins, held, unbalanced, oom) = kernel_hal::dma_pin::stats();
+            emit(format_args!(
+                "dma_pin: live={} held={} unbalanced={} push_oom={}\n",
+                pins, held, unbalanced, oom,
+            ));
         }
         emit(format_args!("hot exact sizes (heaviest first):\n"));
         let (hot, more_hot, more_hot_bytes) =

@@ -784,8 +784,10 @@ impl super::LinuxRootfs {
                 super::xorg::copy_into_live(&rootfs_path, &live_root);
                 // That copies usr/lib and usr/bin whole, NVIDIA's userspace
                 // with them, and QEMU has no NVIDIA GPU for it: libcuda and
-                // its PTX JIT alone are 130 MiB of RAM initramfs.
+                // its PTX JIT alone are 130 MiB of RAM initramfs. Official
+                // Ollama CUDA runners are ~3 GiB — same story.
                 super::nvidia_userspace::remove(&live_root, "QEMU has no NVIDIA GPU");
+                super::ollama_cuda::remove(&live_root, "QEMU has no NVIDIA GPU");
             } else {
                 println!("minimal variant: not copying the desktop into the live root");
             }
