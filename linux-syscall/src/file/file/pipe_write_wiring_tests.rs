@@ -380,3 +380,56 @@ fn a_gather_write_with_no_reader_gets_the_signal_too() {
     );
     assert!(signalled, "writev answered EPIPE with no SIGPIPE behind it");
 }
+
+/// Enough to be over `PIPE_BUF`, so the pipe takes the prefix that fits
+/// instead of refusing the write outright, and more than
+/// `A_SMALL_PIPE - A_HEAD_START` so what fits is only a prefix.
+const MORE_THAN_THE_ROOM: usize = 5000;
+
+#[test]
+fn a_blocking_gather_write_carries_on_after_a_chunk_the_pipe_only_half_took() {
+    // The sibling above never reaches the line this one is about: a pipe
+    // with NO room answers "no room for this" and the write goes straight to
+    // the wait, so `w < n` never happens. Here the pipe has SOME room, the
+    // first write takes a prefix, and the question is what the caller is
+    // told: a blocking caller asked for every byte, so a half-taken chunk is
+    // a reason to wait for the rest, not to stop and report a short write.
+    //
+    // Found by the mutation lot, not by reading: dropping `&& !waits` from
+    // that line survived every test in the batch until this one existed.
+    let (proc, fd, read_end) =
+        a_process_writing_into_a_pipe(49_367, "pipe-gather-half", OpenFlags::empty());
+    read_end.set_capacity(A_SMALL_PIPE).unwrap();
+    let go = Arc::new(AtomicBool::new(false));
+    let drainer = a_drainer(read_end.clone(), go.clone());
+    let (head_start, gathered) = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let fd = FileDesc::from(fd);
+            let head = vec![b'h'; A_HEAD_START];
+            let head_start = sys
+                .sys_write(fd, UserInPtr::from(head.as_ptr() as usize), A_HEAD_START)
+                .await;
+            let rest = vec![b'r'; MORE_THAN_THE_ROOM];
+            let set = [an_iovec(&rest)];
+            go.store(true, Ordering::SeqCst);
+            let gathered = sys
+                .sys_writev(fd, UserInPtr::from(set.as_ptr() as usize), 1)
+                .await;
+            (head_start, gathered)
+        })
+    });
+    let drained = drainer.join().unwrap();
+    assert_eq!(head_start, Ok(A_HEAD_START), "the head start did not go in");
+    assert_eq!(
+        gathered,
+        Ok(MORE_THAN_THE_ROOM),
+        "a blocking gather write reported a short count instead of waiting \
+         for the rest of a chunk the pipe only half took"
+    );
+    assert_eq!(drained, A_SMALL_PIPE, "the drainer never filled its sink");
+    assert_eq!(
+        read_end.buffered_len(),
+        A_HEAD_START + MORE_THAN_THE_ROOM - A_SMALL_PIPE,
+        "what the pipe holds does not match what went in minus what came out"
+    );
+}
