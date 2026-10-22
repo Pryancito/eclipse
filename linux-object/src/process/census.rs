@@ -76,6 +76,16 @@ pub fn unreaped_zombies_in(job: &Arc<Job>) -> Vec<Arc<Process>> {
         .collect()
 }
 
+/// Every process a pid still names: the live ones and the zombies nobody
+/// has reaped. A walk over a process group or over a user's tasks visits a
+/// zombie on Linux (`do_each_pid_thread`, `for_each_process_thread`) until
+/// `release_task()`, and `getpriority(PRIO_PGRP)` counts it.
+pub fn live_and_zombie_processes() -> Vec<Arc<Process>> {
+    let mut procs = all_live_processes();
+    procs.extend(unreaped_zombies());
+    procs
+}
+
 /// The live process thread `tid` belongs to.
 ///
 /// `kill(2)` takes a pid, and on Linux a pid is a TID: `kill_pid_info()`

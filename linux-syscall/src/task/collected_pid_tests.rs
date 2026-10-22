@@ -216,18 +216,21 @@ fn a_collected_child_still_in_its_job_names_nothing() {
 }
 
 /// A zombie that has left its job -- its last thread is gone, so its parent
-/// keeps it -- is still a task to the calls that are about the process: its
-/// CPU clock, which has stopped, a CPU timer on that clock, its limits, its
-/// capabilities, and a signal at its leader, which does nothing. The
-/// `sched_*`, `getpriority` and `ioprio_get` ask a THREAD, and it has none
-/// left to answer with; on Linux the leader's task lingers and they answer.
+/// keeps it -- is still a task to every call: its CPU clock, which has
+/// stopped, a CPU timer on that clock, its limits, its capabilities, a
+/// signal at its leader, which does nothing, and the `sched_*`,
+/// `getpriority` and `ioprio_get`, which ask a THREAD. It has none left;
+/// its leader's attributes stayed on file when it went, as Linux's leader
+/// task lingers, and they answer with those. They were `ESRCH`.
 #[test]
 fn a_zombie_out_of_its_job_is_still_a_task() {
     let parent = a_process(47_803);
     let child = Process::fork_from(&parent).unwrap();
+    let leader = Thread::create_linux(&child).unwrap();
     let pid = child.id();
     child.exit(0);
-    drop(child);
+    leader.terminate_abandoned();
+    drop((child, leader));
     assert!(
         parent.job().find_process(pid).is_none(),
         "the case this test is about"
@@ -242,21 +245,7 @@ fn a_zombie_out_of_its_job_is_still_a_task() {
             )
         })
     });
-    assert_eq!(
-        found_by(&zombie),
-        [
-            "clock_gettime",
-            "clock_getres",
-            "timer_create",
-            "prlimit",
-            "capget",
-            "tgkill",
-            "tkill",
-            "rt_tgsigqueueinfo"
-        ],
-        "{:?}",
-        zombie
-    );
+    assert_eq!(found_by(&zombie), NAMES, "{:?}", zombie);
     assert_eq!(reaped, pid as isize);
     assert_eq!(found_by(&collected), Vec::<&str>::new(), "{:?}", collected);
     parent.exit(0);

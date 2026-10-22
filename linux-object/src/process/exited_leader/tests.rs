@@ -85,3 +85,28 @@ fn a_forked_child_lets_its_leader_go_when_it_dies() {
     assert!(kept.upgrade().is_none(), "something else still holds it");
     parent.exit(0);
 }
+
+/// A `setpriority` or `sched_setaffinity` that found the kept leader
+/// changed the object; the zombie the process becomes answers with that,
+/// not with what the leader had when it left the thread list.
+#[test]
+fn what_the_kept_leader_was_given_is_what_its_zombie_keeps() {
+    let (proc, leader, worker) = the_leader_gone_first(46_914);
+    assert_eq!(
+        proc.leader_sched().map(|s| s.nice),
+        Some(0),
+        "what it had when it left the list"
+    );
+    let kept = leader.upgrade().unwrap();
+    kept.set_sched(SCHED_BATCH, 9, 0);
+    kept.set_affinity(0b100).unwrap();
+    drop(kept);
+
+    worker.terminate_abandoned();
+    let filed = proc.leader_sched().unwrap();
+    assert_eq!(
+        (filed.policy, filed.nice, filed.affinity),
+        (SCHED_BATCH, 9, 0b100)
+    );
+    assert!(leader.upgrade().is_none());
+}

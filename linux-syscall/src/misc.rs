@@ -8,7 +8,6 @@ use linux_object::process::{
     check_signals_of, Capabilities, SignalPark, CAP_FULL_SET, CAP_SETPCAP, CAP_SYSLOG,
     CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_NICE, CAP_SYS_RESOURCE,
 };
-use linux_object::thread::ThreadExt;
 use linux_object::time::*;
 use zircon_object::task::ThreadState;
 use zircon_object::{ZxError, ZxResult};
@@ -225,19 +224,27 @@ impl Syscall<'_> {
     /// or the best (numerically lowest) one across a process group or a
     /// user's tasks, as `ioprio_best` folds them.
     ///
-    /// A task that never set one reports what `get_task_ioprio` derives
-    /// from its nice value: best-effort, level `(nice + 20) / 5`. See
-    /// [`effective_ioprio`].
+    /// One task reports the word it set (`get_task_raw_ioprio`), so a task
+    /// that never set one is `IOPRIO_CLASS_NONE`, 0: that is how `ionice -p`
+    /// tells "none" from a setting. In a group or a user's tasks, a task
+    /// that never set one counts with what `get_task_ioprio` derives from
+    /// its nice value, best-effort level `(nice + 20) / 5` ([`effective_ioprio`]).
+    /// Linux 6.18, measured: nice 7 and nothing set is 0 for the process
+    /// and best-effort 5 for its group. This reported the derived word for
+    /// the process too.
     pub fn sys_ioprio_get(&self, which: usize, who: usize) -> SysResult {
         info!("ioprio_get: which={}, who={}", which, who);
         let which = ioprio_which(which)?;
-        let best = self
-            .priority_targets(which, who)?
-            .iter()
-            .map(|t| effective_ioprio(t.lock_linux().ioprio, t.sched_nice()))
-            .reduce(ioprio_best)
-            .ok_or(LxError::ESRCH)?;
-        Ok(best as usize)
+        let tasks = self.priority_targets(which, who)?;
+        let best = if which == linux_object::process::PRIO_PROCESS {
+            tasks.first().map(|t| t.ioprio())
+        } else {
+            tasks
+                .iter()
+                .map(|t| effective_ioprio(t.ioprio(), t.sched_nice()))
+                .reduce(ioprio_best)
+        };
+        Ok(best.ok_or(LxError::ESRCH)? as usize)
     }
 
     /// `ioprio_set(2)`: record the I/O priority of every task `which`/`who`
@@ -270,7 +277,7 @@ impl Syscall<'_> {
             if !LinuxProcess::may_set_ioprio_of(&caller, &linux.credentials()) {
                 return Err(LxError::EPERM);
             }
-            thread.lock_linux().ioprio = ioprio;
+            thread.set_ioprio(ioprio);
         }
         Ok(0)
     }

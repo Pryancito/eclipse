@@ -46,6 +46,7 @@ use super::*;
 use crate::on_a_thread::on_a_thread;
 use alloc::boxed::Box;
 use linux_object::process::{LinuxProcess, CAP_LAST_CAP};
+use linux_object::thread::ThreadExt;
 use rcore_fs_ramfs::RamFS;
 use zircon_object::task::{Thread, ROOT_JOB};
 
@@ -70,6 +71,7 @@ const A_LONE_USER: u32 = 47_221;
 /// `IOPRIO_WHO_PROCESS`, `IOPRIO_WHO_PGRP` and `IOPRIO_WHO_USER` as
 /// userspace spells them: 1, 2 and 3, one above `setpriority`'s.
 const WHO_PROCESS: usize = 1;
+const WHO_PGRP: usize = 2;
 const WHO_USER: usize = 3;
 
 /// A `which` that is none of the three.
@@ -553,10 +555,10 @@ fn the_io_priority_set_on_a_task_is_the_one_read_back_from_it() {
             );
 
             // `who == 0` is mine and nobody else's: the other task still
-            // reports what it never set.
+            // reports that it never set one.
             assert_eq!(
                 ioprio_get(sys, WHO_PROCESS, their_tid),
-                Ok(nice_ioprio(0) as usize),
+                Ok(0),
                 "setting mine moved somebody else's"
             );
 
@@ -581,29 +583,33 @@ fn the_io_priority_set_on_a_task_is_the_one_read_back_from_it() {
     });
 }
 
+/// One task reports the word it set, so a task that never set one is
+/// `IOPRIO_CLASS_NONE`, 0, whatever its nice (`get_task_raw_ioprio`); a
+/// group counts it at the level that nice is served at. This reported the
+/// derived level for one task too. Linux 6.18, measured: nice 7 and nothing
+/// set is 0 for the process and best-effort 5 for its group.
 #[test]
-fn a_task_that_never_set_one_reports_the_class_its_nice_value_derives() {
+fn a_task_that_never_set_one_reports_none_and_its_group_the_level_it_is_served_at() {
     let root = a_process(47_231, "ioprio-derived");
     let (them, thread) = a_process_with_a_thread(47_232, "ioprio-fresh", A_USER);
+    thread.set_sched(thread.sched_policy(), 7, 0);
     let their_tid = thread.id() as usize;
+    let their_group = them.id() as usize;
     let _held = them;
     on_a_thread(&root, move |sys| {
         Box::pin(async move {
-            // Nice 0 derives best-effort level 4, `(0 + 20) / 5`. What it
-            // must NOT report is the zero word it actually stores, whose
-            // class is NONE: a task that never asked still has a priority
-            // the disk serves it at, and `ionice -p` prints it.
-            let derived = ioprio_get(sys, WHO_PROCESS, their_tid);
             assert_eq!(
-                derived,
-                Ok(ioprio_value(IOPRIO_CLASS_BE, 4) as usize),
-                "a fresh task's derived priority"
+                ioprio_get(sys, WHO_PROCESS, their_tid),
+                Ok(0),
+                "a fresh task's word is none"
             );
-            assert_ne!(derived, Ok(0), "the stored zero word was reported raw");
+            // Nice 7 is best-effort level 5, `(7 + 20) / 5`: a task that
+            // never asked still has a priority the disk serves it at, and
+            // its group's fold has to compare that.
             assert_eq!(
-                ioprio_class_and_level(derived.unwrap() as u16).0,
-                IOPRIO_CLASS_BE,
-                "a fresh task is not best-effort"
+                ioprio_get(sys, WHO_PGRP, their_group),
+                Ok(ioprio_value(IOPRIO_CLASS_BE, 5) as usize),
+                "a fresh task's group"
             );
         })
     });
@@ -776,7 +782,7 @@ fn either_of_the_callers_two_user_ids_may_set_a_task_and_a_strangers_is_eperm() 
             // permission, so the stranger's priority is readable.
             assert_eq!(
                 ioprio_get(sys, WHO_PROCESS, strange_tid),
-                Ok(nice_ioprio(0) as usize),
+                Ok(0),
                 "ioprio_get asked for permission"
             );
         })
