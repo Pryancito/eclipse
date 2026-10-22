@@ -1072,6 +1072,9 @@ impl PciDriver for E1000DriverPci {
 }
 
 #[cfg(test)]
+mod hw_tests;
+
+#[cfg(test)]
 mod ring_tests {
     //! The e1000 is QEMU's default NIC, so this driver is the one every guest
     //! boots with -- and until recently it had no tests at all. Three of the

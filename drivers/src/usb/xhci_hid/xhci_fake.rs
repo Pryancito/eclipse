@@ -48,6 +48,9 @@ const OP_DCBAAP: usize = 0x30;
 const OP_CONFIG: usize = 0x38;
 const OP_PORTSC: usize = 0x400;
 
+const LEGSUP_BIOS_OWNED: u32 = 1 << 16;
+const LEGSUP_OS_OWNED: u32 = 1 << 24;
+
 const RT_IMAN: usize = 0x20;
 const RT_ERSTSZ: usize = 0x28;
 const RT_ERSTBA: usize = 0x30;
@@ -484,6 +487,107 @@ impl FakeDev {
             disk: None,
             queued: Vec::new(),
         }
+    }
+
+    /// Un HID cualquiera: la interfaz que le digan, con el descriptor de
+    /// informe que le digan. Es el constructor con el que se prueba la
+    /// clasificacion, donde lo que decide no es el modelo del aparato sino la
+    /// combinacion de `bInterfaceSubClass`, `bInterfaceProtocol`, VID/PID y lo
+    /// que diga el descriptor.
+    ///
+    /// `report` vacio sale como un dispositivo que declara no tener
+    /// descriptor de informe (longitud 0 en el descriptor HID), que es otro
+    /// caso distinto de uno que lo declara y lo rechaza.
+    pub(super) fn hid(subclass: u8, proto: u8, vid: u16, pid: u16, report: Vec<u8>) -> Self {
+        let rlen = report.len() as u16;
+        let mut config: Vec<u8> = alloc::vec![
+            // Configuration: un total que se arregla abajo, 1 interfaz.
+            0x09, 0x02, 0x00, 0x00, 0x01, 0x01, 0x00, 0xa0, 0x32,
+            // Interface 0: HID (3), con la subclase y el protocolo pedidos.
+            0x09, 0x04, 0x00, 0x00, 0x01, 0x03, subclass, proto, 0x00,
+            // HID: un descriptor de informe, con su longitud.
+            0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x00, 0x00,
+            // Endpoint 1 IN, interrupción, 8 bytes cada 10 ms.
+            0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0a,
+        ];
+        let total = config.len() as u16;
+        config[2..4].copy_from_slice(&total.to_le_bytes());
+        config[25..27].copy_from_slice(&rlen.to_le_bytes());
+        let mut device: Vec<u8> = alloc::vec![
+            0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x01, 0x02, 0x03, 0x01,
+        ];
+        device[8..10].copy_from_slice(&vid.to_le_bytes());
+        device[10..12].copy_from_slice(&pid.to_le_bytes());
+        Self {
+            device,
+            config,
+            report,
+            stall: Vec::new(),
+            silent: Vec::new(),
+            mute: false,
+            mute_first: 0,
+            seen: Vec::new(),
+            hub: None,
+            disk: None,
+            queued: Vec::new(),
+        }
+    }
+
+    /// Un dispositivo compuesto con `n` interfaces HID de ratón, todas
+    /// iguales: es lo que tiene un teclado de los de teclas de más, y lo que
+    /// hace falta para pasar del tope de interfaces que el driver apunta.
+    pub(super) fn hid_many_ifaces(n: u8) -> Self {
+        let base = Self::mouse();
+        let report = base.report.clone();
+        let rlen = report.len() as u16;
+        let mut config: Vec<u8> = alloc::vec![
+            // Configuration: un total y un número de interfaces que se
+            // arreglan abajo.
+            0x09, 0x02, 0x00, 0x00, n, 0x01, 0x00, 0xa0, 0x32,
+        ];
+        for i in 0..n {
+            // Interface i: HID (3), subclase boot (1), protocolo ratón (2).
+            config.extend_from_slice(&[0x09, 0x04, i, 0x00, 0x01, 0x03, 0x01, 0x02, 0x00]);
+            // HID, con la longitud de su descriptor de informe.
+            config.extend_from_slice(&[0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22]);
+            config.extend_from_slice(&rlen.to_le_bytes());
+            // Endpoint (i + 1) IN, interrupción.
+            config.extend_from_slice(&[0x07, 0x05, 0x81 + i, 0x03, 0x08, 0x00, 0x0a]);
+        }
+        let total = config.len() as u16;
+        config[2..4].copy_from_slice(&total.to_le_bytes());
+        Self { config, ..base }
+    }
+
+    /// Un raton de arranque con una interfaz de fabricante **de mas**, de
+    /// protocolo 0 y con el mismo descriptor de puntero: los dos se
+    /// clasifican como raton y el driver tiene que quedarse con uno.
+    pub(super) fn boot_mouse_with_vendor_iface() -> Self {
+        let base = Self::mouse();
+        let report = base.report.clone();
+        let rlen = report.len() as u16;
+        let mut config: Vec<u8> = alloc::vec![
+            // Configuration: un total que se arregla abajo, 2 interfaces.
+            0x09, 0x02, 0x00, 0x00, 0x02, 0x01, 0x00, 0xa0, 0x32,
+            // Interface 0: HID (3), subclase boot (1), protocolo ratón (2).
+            0x09, 0x04, 0x00, 0x00, 0x01, 0x03, 0x01, 0x02, 0x00,
+            // HID: un descriptor de informe, con su longitud.
+            0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x00, 0x00,
+            // Endpoint 1 IN, interrupción.
+            0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0a,
+            // Interface 1: HID (3), sin subclase de arranque, protocolo 0.
+            0x09, 0x04, 0x01, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00,
+            // Su descriptor de informe, el mismo de puntero.
+            0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x00, 0x00,
+            // Endpoint 2 IN, el suyo.
+            0x07, 0x05, 0x82, 0x03, 0x08, 0x00, 0x0a,
+        ];
+        let total = config.len() as u16;
+        config[2..4].copy_from_slice(&total.to_le_bytes());
+        config[25..27].copy_from_slice(&rlen.to_le_bytes());
+        config[50..52].copy_from_slice(&rlen.to_le_bytes());
+        Self { config, ..base }
     }
 
     /// Una unidad de almacenamiento masivo con `blocks` bloques de
@@ -973,6 +1077,10 @@ struct Fake {
     never_halts: bool,
     /// CNR sigue puesto durante estas lecturas más de USBSTS.
     cnr_reads: u32,
+    /// Offset de la capacidad USB Legacy Support en la ventana, si la hay.
+    legsup: Option<usize>,
+    /// Un BIOS que no suelta el controlador pase lo que pase.
+    legsup_stuck: bool,
     /// Microsegundos que avanza el reloj por lectura de registro.
     read_tick_us: u64,
 
@@ -1021,6 +1129,15 @@ struct Fake {
     events_posted: u32,
 
     ports: Vec<Port>,
+    /// Cuántas veces se le pidió un reset (PR) a cada puerto raíz, indexado
+    /// por puerto - 1. Un puerto reseteado otra vez es la unica diferencia
+    /// observable entre reintentar la enumeracion desde el principio y
+    /// volver a pedirle descriptores al mismo dispositivo.
+    port_resets: Vec<u32>,
+    /// Cuántas escrituras recibió el PORTSC de cada puerto raíz: un puerto
+    /// vacío que no se toca no recibe ninguna, y el valor que queda en
+    /// memoria no lo distingue de uno que se reseteó en vano.
+    port_writes: Vec<u32>,
     /// Todo lo enchufado, cada cosa con el puerto raíz y el route string por
     /// los que se llega a ella: detrás de un hub hay más de un dispositivo en
     /// el mismo puerto raíz, y lo único que los distingue es el route.
@@ -1125,6 +1242,14 @@ pub(super) fn on_read(base: usize, off: usize) {
 /// en memoria.
 pub(super) fn on_write(base: usize, off: usize, v: u32) {
     with_state(base, |st| {
+        if st.legsup == Some(off) {
+            // El BIOS suelta el controlador en cuanto la OS pide el semáforo,
+            // y lo que la OS ve de eso es su propio bit de dueño apagándose.
+            if (v & LEGSUP_OS_OWNED) != 0 && !st.legsup_stuck {
+                poke(st.base + off, v & !LEGSUP_BIOS_OWNED);
+            }
+            return;
+        }
         if off >= DBOFF {
             let slot = ((off - DBOFF) / 4) as u8;
             let dci = v as u8;
@@ -1217,6 +1342,15 @@ pub(super) fn on_write(base: usize, off: usize, v: u32) {
                 let Some(port) = st.ports.get(idx).copied() else {
                     return;
                 };
+                if let Some(n) = st.port_writes.get_mut(idx) {
+                    *n += 1;
+                }
+                // PR es el bit 4: pedirlo es el reset del puerto.
+                if (v & (1 << 4)) != 0 {
+                    if let Some(n) = st.port_resets.get_mut(idx) {
+                        *n += 1;
+                    }
+                }
                 let sc = portsc_after_write(port.sc, v, port);
                 if let Some(p) = st.ports.get_mut(idx) {
                     p.sc = sc;
@@ -1717,6 +1851,8 @@ impl Hw {
                 never_runs: false,
                 never_halts: false,
                 cnr_reads: 0,
+                legsup: None,
+                legsup_stuck: false,
                 read_tick_us: 1,
                 config_slots: 0,
                 dcbaap: 0,
@@ -1742,6 +1878,8 @@ impl Hw {
                 ev_cycle: true,
                 events_posted: 0,
                 ports: alloc::vec![Port::default(); ports as usize],
+                port_resets: alloc::vec![0u32; ports as usize],
+                port_writes: alloc::vec![0u32; ports as usize],
                 devs: Vec::new(),
                 ep0: (0..=256).map(|_| None).collect(),
                 eval_mps: Vec::new(),
@@ -1769,8 +1907,37 @@ impl Hw {
         poke(self.base + off, v);
     }
 
+    /// Una capacidad USB Legacy Support en `off`, con el BIOS como dueño del
+    /// controlador: la cadena xECP de HCCPARAMS1 la apunta y no sigue a nadie.
+    pub(super) fn set_legacy_cap(&self, off: usize) {
+        poke(self.base + 0x10, ((off >> 2) as u32) << 16);
+        poke(self.base + off, 1 | LEGSUP_BIOS_OWNED);
+        self.with(|st| st.legsup = Some(off));
+    }
+
+    /// Un BIOS que se queda el controlador aunque la OS pida el semáforo.
+    pub(super) fn bios_keeps_the_controller(&self) {
+        self.with(|st| st.legsup_stuck = true);
+    }
+
+    /// La capacidad legacy tal como está ahora en la ventana.
+    pub(super) fn legsup(&self) -> u32 {
+        self.with(|st| peek(st.base + st.legsup.expect("no hay capacidad legacy")))
+    }
+
+    /// El USBLEGCTLSTS que va detrás de la capacidad legacy.
+    pub(super) fn legctlsts(&self) -> u32 {
+        self.with(|st| peek(st.base + st.legsup.expect("no hay capacidad legacy") + 4))
+    }
+
     pub(super) fn op(&self, off: usize) -> u32 {
         peek(self.base + CAPLEN + off)
+    }
+
+    /// Un registro de la ventana de ejecución tal como está en memoria, que es
+    /// lo único que ve quien escribe ahí sin pasar por el driver.
+    pub(super) fn rt(&self, off: usize) -> u32 {
+        peek(self.base + RTSOFF + off)
     }
 
     pub(super) fn set_op(&self, off: usize, v: u32) {
@@ -2166,6 +2333,16 @@ impl Hw {
 
     pub(super) fn resets(&self) -> u32 {
         self.with(|st| st.resets)
+    }
+
+    /// Cuántos resets (PR) se le pidieron al puerto raíz `port`.
+    pub(super) fn port_resets(&self, port: u8) -> u32 {
+        self.with(|st| st.port_resets.get(port as usize - 1).copied().unwrap_or(0))
+    }
+
+    /// Cuántas escrituras recibió el PORTSC del puerto raíz `port`.
+    pub(super) fn port_writes(&self, port: u8) -> u32 {
+        self.with(|st| st.port_writes.get(port as usize - 1).copied().unwrap_or(0))
     }
 
     pub(super) fn running(&self) -> bool {

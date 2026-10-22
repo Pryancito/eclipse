@@ -191,6 +191,11 @@ impl Mouse {
     }
 }
 
+/// `Mouse` on top of an input scheme: what makes a device eligible, and what
+/// reaches a client once it is.
+#[cfg(test)]
+mod scheme_tests;
+
 #[cfg(test)]
 mod mouse_tests {
     //! `MouseState` is the whole of the PS/2 side of the mouse: every packet
