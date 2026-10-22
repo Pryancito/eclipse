@@ -687,3 +687,90 @@ fn the_execution_base_a_hosted_kernel_cannot_honour_is_refused_and_the_other_rou
         })
     });
 }
+
+/// A read of a log that has nothing in it answers zero and leaves the
+/// caller's buffer alone.
+///
+/// The `if n > 0` around the copy is the whole of it: a ring that reports a
+/// size and then hands over nothing is the ordinary state of a freshly
+/// booted kernel, and the two numbers are not the same number. Every read
+/// above this one asks a ring that has something to give, so the empty case
+/// had never run. What it would cost to get wrong is a `write_array` of an
+/// empty slice into whatever the caller passed -- `dmesg` hands `syslog(2)`
+/// a buffer it has not initialised, so a kernel that wrote to it on an empty
+/// read would be writing the uninitialised bytes back.
+#[test]
+fn reading_a_log_with_nothing_in_it_answers_zero_and_writes_nothing() {
+    let _log = a_kernel_log();
+    with_unread(0);
+    let root = a_process(49_200, "syslog-empty");
+    on_a_thread(&root, move |sys| {
+        Box::pin(async move {
+            // The ring still reports its size: "how big is it" and "how
+            // much is in it" are different questions, and only the second
+            // one is zero.
+            assert_eq!(
+                syslog_bare(sys, SYSLOG_ACTION_SIZE_BUFFER, 0),
+                Ok(A_RING),
+                "an empty ring stopped reporting its size"
+            );
+
+            let mut buf = [A_SEED; 64];
+            assert_eq!(
+                syslog(sys, SYSLOG_ACTION_READ_ALL, &mut buf, 64),
+                Ok(0),
+                "a read of an empty log did not answer zero"
+            );
+            assert!(
+                buf.iter().all(|&b| b == A_SEED),
+                "a read of an empty log wrote into the caller's buffer"
+            );
+        })
+    });
+    // Put it back for whoever runs next: the number is a global of the
+    // whole binary, and the lock only covers this test.
+    with_unread(usize::MAX);
+}
+
+/// `arch_prctl(ARCH_GET_GS)` answers with the base the kernel actually has,
+/// which on a hosted kernel is none.
+///
+/// `ARCH_GET_FS` is read next door and this one never was, so the arm was
+/// three lines at zero. It is worth its own assertion rather than being
+/// folded in with `FS`, because the two are not symmetric here: setting the
+/// GS base is refused on a hosted kernel (the host runtime owns `gs`), and a
+/// kernel that refuses to SET a value has to keep answering the GET
+/// honestly. Reading back something non-zero would mean the refusal was not
+/// a refusal, and reading back the FS base would mean the two arms had been
+/// crossed -- the one mistake a single-register test cannot see.
+#[test]
+fn the_gs_base_reads_back_as_the_nothing_a_hosted_kernel_keeps() {
+    let proc = a_process(49_201, "arch-get-gs");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            // A thread pointer this kernel will take, so that FS and GS
+            // hold different things and crossing them would show.
+            let base = 0x7fff_0000_1000usize;
+            assert_eq!(
+                as_mut(sys).sys_arch_prctl(ARCH_SET_FS, base),
+                Ok(0),
+                "arch_prctl refused a canonical thread pointer"
+            );
+
+            let mut got = usize::MAX;
+            assert_eq!(
+                as_mut(sys).sys_arch_prctl(ARCH_GET_GS, (&mut got) as *mut usize as usize),
+                Ok(0),
+                "arch_prctl could not read the gs base"
+            );
+            assert_eq!(
+                got, 0,
+                "a hosted kernel handed back a gs base it had refused to set"
+            );
+            assert_ne!(
+                got, base,
+                "the gs arm answered with the fs base: the two are crossed"
+            );
+        })
+    });
+}

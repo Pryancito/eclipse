@@ -84,6 +84,15 @@ const TRIES: usize = 300;
 /// A gap between tries, long enough that the retries are not a spin.
 const A_MOMENT: Duration = Duration::from_millis(10);
 
+/// How long a thread that is going to kill the process waits for the park it
+/// is meant to interrupt: 20 seconds, the harness's own cap for one call.
+///
+/// Deliberately much larger than [`TRIES`], and deliberately a budget that
+/// kills NOTHING when it runs out. A waiter is slower to park when the whole
+/// suite is running than when its own test is, and a killer that gives up
+/// and kills anyway reports a wrong answer for a call it was never about.
+const A_KILL_BUDGET: usize = 2_000;
+
 fn a_process(pid: KoID, name: &str) -> Arc<Process> {
     Process::create_with_fixed_id_ext(&ROOT_JOB, pid, name, LinuxProcess::new(RamFS::new(), 0))
         .unwrap()
@@ -1432,5 +1441,228 @@ fn a_wake_in_one_process_reaches_a_waiter_in_another_on_a_word_they_share() {
         waiting.join().unwrap(),
         Ok(0),
         "the waiter in the other process"
+    );
+}
+
+/// A signal ends a `FUTEX_WAIT` that nothing woke, with `EINTR`.
+///
+/// This is the half of the park that is not about futexes at all, and the
+/// bug it closes is not a late `^C`. musl implements `setuid`, `seteuid`,
+/// `setgid` and friends with `__synccall`, which blocks every application
+/// signal, stops each other thread with SIGRT34 and waits for it to check
+/// in. A thread parked in a condvar that cannot hear that is a process
+/// parked FOR GOOD, deaf to `^C` because the signals are already blocked:
+/// that is gzdoom printing its version banner and never coming back, and it
+/// would be any threaded musl program that drops privilege.
+///
+/// The body says so in a comment and nothing tested it: the `interrupted`
+/// arm of the race was five lines at zero. A timeout cannot stand in for
+/// it, because a timeout comes back `ETIMEDOUT` through a different arm --
+/// the point is `EINTR`, which is the answer musl's `__timedwait` expects
+/// and re-waits on.
+///
+/// Shaped like `file/file/setlkw_tests.rs`: the thread that parks is the
+/// test's own, so the call is certainly entered before anything can end it,
+/// and the kill comes from a thread of its own.
+#[test]
+fn a_signal_ends_a_wait_that_nothing_woke() {
+    let proc = a_process(49_202, "futex-eintr");
+    let word = a_futex_word(0);
+    let addr = addr_of(word);
+    // Not a word to wait on: a flag the test sets immediately before it
+    // parks, so the kill cannot land anywhere but on that park.
+    //
+    // A fixed sleep here is what a first draft of this test used, and it is
+    // a race twice over: too short and the kill arrives before the call is
+    // entered, too long and it is dead time in every run. Worse, a killer
+    // that gives up waiting and kills ANYWAY turns a slow machine into a
+    // kill at the wrong moment -- which is exactly how this test failed
+    // once in eight runs of the whole suite while passing every time on its
+    // own. So the budget here is the harness's own, and running out of it
+    // kills nothing: the park then hangs and says so, instead of a
+    // confusing assertion about the wrong call.
+    let ready = a_futex_word(0);
+    let killer = proc.clone();
+    std::thread::spawn(move || {
+        for _ in 0..A_KILL_BUDGET {
+            if ready.load(Ordering::SeqCst) != 0 {
+                killer.exit(137);
+                return;
+            }
+            std::thread::sleep(A_MOMENT);
+        }
+    });
+    let got = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            ready.store(1, Ordering::SeqCst);
+            // No timeout at all: a null `timespec` is "block
+            // indefinitely", so nothing but a wake or a signal can end
+            // this. Nobody wakes it.
+            futex(
+                sys,
+                addr,
+                FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+                0,
+                0,
+                0,
+                MATCH_ANY,
+            )
+            .await
+        })
+    });
+    assert_eq!(
+        got,
+        Err(LxError::EINTR),
+        "a parked wait did not come out on a signal"
+    );
+}
+
+/// A signal ends a CONTENDED priority lock too, instead of leaving it
+/// unkillable.
+///
+/// The same race, one function along, and the comment there records the
+/// same fix being needed twice: awaiting the raw future left a contended PI
+/// mutex unkillable. It is worth its own test rather than being taken on
+/// trust from the `FUTEX_WAIT` one, because the two parks are written out
+/// separately -- two `select`s, two `poll!`s, two `CANCELED` arms -- so a
+/// fix applied to one of them says nothing about the other. The seven lines
+/// of this one were at zero while the wake and the timeout cases next door
+/// both passed.
+///
+/// The kill waits for the waiter's own announcement, the `FUTEX_WAITERS`
+/// mark in the word, rather than for a while: the bit appearing is the
+/// waiter saying it is about to park.
+#[test]
+fn a_signal_ends_a_contended_priority_lock_instead_of_leaving_it_unkillable() {
+    let proc = a_process(49_203, "futex-pi-eintr");
+    let word = a_futex_word(0);
+    let addr = addr_of(word);
+    let theirs = proc.clone();
+    let victim = proc.clone();
+    std::thread::spawn(move || {
+        // On the budget rather than on [`TRIES`], and killing nothing if it
+        // runs out: see [`A_KILL_BUDGET`]. Here the mark is the waiter's own
+        // announcement that it is about to park, so a kill before it would
+        // land on the OWNER's uncontended acquire instead.
+        for _ in 0..A_KILL_BUDGET {
+            if word.load(Ordering::SeqCst) & FUTEX_WAITERS != 0 {
+                victim.exit(137);
+                return;
+            }
+            std::thread::sleep(A_MOMENT);
+        }
+    });
+    let waiter = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            assert_eq!(
+                futex(sys, addr, FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0).await,
+                Ok(0),
+                "the uncontended acquire this test starts from"
+            );
+            // Only now that the word is held can anybody contend for it,
+            // and only a contender publishes the mark the killer waits for.
+            let waiter = a_pi_waiter(&theirs, addr);
+            // Waited for HERE as well as in the killer, and not as a
+            // belt-and-braces: `on_a_thread` ends the process with its last
+            // thread, so an owner that returned before the contender's
+            // thread existed would take the process down and the contender
+            // would never get as far as parking.
+            let mut queued = false;
+            for _ in 0..TRIES {
+                if word.load(Ordering::SeqCst) & FUTEX_WAITERS != 0 {
+                    queued = true;
+                    break;
+                }
+                async_std::task::sleep(A_MOMENT).await;
+            }
+            assert!(
+                queued,
+                "the contending thread never marked the word: {:#x}",
+                word.load(Ordering::SeqCst)
+            );
+            waiter
+        })
+    });
+    let (got, their_tid) = waiter.join().unwrap();
+    assert_ne!(their_tid, 0, "a thread with tid 0 cannot own a PI lock");
+    assert_eq!(
+        got,
+        Err(LxError::EINTR),
+        "a thread queued behind a PI lock did not come out on a signal"
+    );
+}
+
+/// A requeue that carries no private flag resolves its TARGET through the
+/// shared table too, not just its source.
+///
+/// Both sides, or the waiters are moved onto a queue nobody can reach again
+/// and sleep for good -- Linux keys both ends through `get_futex_key`. The
+/// source half is covered by the wake test above; the target half was one
+/// line at zero, because every requeue test here is private.
+///
+/// The asymmetry is what makes it invisible otherwise: a requeue whose
+/// target came out of the per-process table still SUCCEEDS and still
+/// answers 1. The waiter is simply somewhere nobody will ever wake it from,
+/// so the only assertion that can tell the two apart is a shared wake on
+/// the target afterwards finding somebody.
+#[test]
+fn a_shared_requeue_moves_its_waiters_somewhere_a_shared_wake_can_reach() {
+    let proc = a_process(49_204, "futex-shared-requeue");
+    // Two pages of one shared object, named at two addresses of this
+    // process: a requeue has a source and a destination and they must be
+    // different words.
+    let from = mapped_into(&proc, &a_shared_object());
+    let to = mapped_into(&proc, &a_shared_object());
+    assert_ne!(from, to, "the source and the target are the same word");
+
+    // Parked on the SHARED source queue, with a deadline long enough that
+    // only the requeue and the wake below can end it.
+    let waiting = a_waiter(&proc, from, FUTEX_WAIT, Some(Duration::from_secs(10)));
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            // Wake nobody, move one, and only once the waiter is really
+            // queued: a requeue that found nobody answers 0 and would make
+            // the wake below prove nothing.
+            let mut moved = None;
+            for _ in 0..TRIES {
+                match futex(sys, from, FUTEX_CMP_REQUEUE, 0, 1, to, 0).await {
+                    Ok(0) => async_std::task::sleep(A_MOMENT).await,
+                    other => {
+                        moved = other.ok();
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                moved,
+                Some(1),
+                "a shared requeue never found the waiter on the shared source"
+            );
+
+            // A PRIVATE wake on the target reaches nobody: if the requeue
+            // had resolved the target through the per-process table, this is
+            // where the waiter would be, and this assertion is the one that
+            // fails.
+            for _ in 0..50 {
+                assert_eq!(
+                    futex(sys, to, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0).await,
+                    Ok(0),
+                    "the requeue put the waiter on the private queue of the target"
+                );
+                async_std::task::sleep(A_MOMENT).await;
+            }
+
+            // And a shared one finds it, which is the whole point.
+            assert_eq!(
+                a_wake_that_finds_somebody(sys, to, FUTEX_WAKE, 1).await,
+                Some(1),
+                "a shared wake did not reach the waiter the requeue moved"
+            );
+        })
+    });
+    assert_eq!(
+        waiting.join().unwrap(),
+        Ok(0),
+        "the waiter that was moved and then woken"
     );
 }
