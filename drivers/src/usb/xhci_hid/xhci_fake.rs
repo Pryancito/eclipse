@@ -489,6 +489,81 @@ impl FakeDev {
         }
     }
 
+    /// Un HID cualquiera: la interfaz que le digan, con el descriptor de
+    /// informe que le digan. Es el constructor con el que se prueba la
+    /// clasificacion, donde lo que decide no es el modelo del aparato sino la
+    /// combinacion de `bInterfaceSubClass`, `bInterfaceProtocol`, VID/PID y lo
+    /// que diga el descriptor.
+    ///
+    /// `report` vacio sale como un dispositivo que declara no tener
+    /// descriptor de informe (longitud 0 en el descriptor HID), que es otro
+    /// caso distinto de uno que lo declara y lo rechaza.
+    pub(super) fn hid(subclass: u8, proto: u8, vid: u16, pid: u16, report: Vec<u8>) -> Self {
+        let rlen = report.len() as u16;
+        let mut config: Vec<u8> = alloc::vec![
+            // Configuration: un total que se arregla abajo, 1 interfaz.
+            0x09, 0x02, 0x00, 0x00, 0x01, 0x01, 0x00, 0xa0, 0x32,
+            // Interface 0: HID (3), con la subclase y el protocolo pedidos.
+            0x09, 0x04, 0x00, 0x00, 0x01, 0x03, subclass, proto, 0x00,
+            // HID: un descriptor de informe, con su longitud.
+            0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x00, 0x00,
+            // Endpoint 1 IN, interrupción, 8 bytes cada 10 ms.
+            0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0a,
+        ];
+        let total = config.len() as u16;
+        config[2..4].copy_from_slice(&total.to_le_bytes());
+        config[25..27].copy_from_slice(&rlen.to_le_bytes());
+        let mut device: Vec<u8> = alloc::vec![
+            0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x01, 0x02, 0x03, 0x01,
+        ];
+        device[8..10].copy_from_slice(&vid.to_le_bytes());
+        device[10..12].copy_from_slice(&pid.to_le_bytes());
+        Self {
+            device,
+            config,
+            report,
+            stall: Vec::new(),
+            silent: Vec::new(),
+            mute: false,
+            mute_first: 0,
+            seen: Vec::new(),
+            hub: None,
+            disk: None,
+            queued: Vec::new(),
+        }
+    }
+
+    /// Un raton de arranque con una interfaz de fabricante **de mas**, de
+    /// protocolo 0 y con el mismo descriptor de puntero: los dos se
+    /// clasifican como raton y el driver tiene que quedarse con uno.
+    pub(super) fn boot_mouse_with_vendor_iface() -> Self {
+        let base = Self::mouse();
+        let report = base.report.clone();
+        let rlen = report.len() as u16;
+        let mut config: Vec<u8> = alloc::vec![
+            // Configuration: un total que se arregla abajo, 2 interfaces.
+            0x09, 0x02, 0x00, 0x00, 0x02, 0x01, 0x00, 0xa0, 0x32,
+            // Interface 0: HID (3), subclase boot (1), protocolo ratón (2).
+            0x09, 0x04, 0x00, 0x00, 0x01, 0x03, 0x01, 0x02, 0x00,
+            // HID: un descriptor de informe, con su longitud.
+            0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x00, 0x00,
+            // Endpoint 1 IN, interrupción.
+            0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0a,
+            // Interface 1: HID (3), sin subclase de arranque, protocolo 0.
+            0x09, 0x04, 0x01, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00,
+            // Su descriptor de informe, el mismo de puntero.
+            0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x00, 0x00,
+            // Endpoint 2 IN, el suyo.
+            0x07, 0x05, 0x82, 0x03, 0x08, 0x00, 0x0a,
+        ];
+        let total = config.len() as u16;
+        config[2..4].copy_from_slice(&total.to_le_bytes());
+        config[25..27].copy_from_slice(&rlen.to_le_bytes());
+        config[50..52].copy_from_slice(&rlen.to_le_bytes());
+        Self { config, ..base }
+    }
+
     /// Una unidad de almacenamiento masivo con `blocks` bloques de
     /// `block_size`: clase 8, subclase 6 (SCSI transparente), protocolo 0x50
     /// (Bulk-Only) y la pareja de endpoints bulk que eso exige.
@@ -1028,6 +1103,15 @@ struct Fake {
     events_posted: u32,
 
     ports: Vec<Port>,
+    /// Cuántas veces se le pidió un reset (PR) a cada puerto raíz, indexado
+    /// por puerto - 1. Un puerto reseteado otra vez es la unica diferencia
+    /// observable entre reintentar la enumeracion desde el principio y
+    /// volver a pedirle descriptores al mismo dispositivo.
+    port_resets: Vec<u32>,
+    /// Cuántas escrituras recibió el PORTSC de cada puerto raíz: un puerto
+    /// vacío que no se toca no recibe ninguna, y el valor que queda en
+    /// memoria no lo distingue de uno que se reseteó en vano.
+    port_writes: Vec<u32>,
     /// Todo lo enchufado, cada cosa con el puerto raíz y el route string por
     /// los que se llega a ella: detrás de un hub hay más de un dispositivo en
     /// el mismo puerto raíz, y lo único que los distingue es el route.
@@ -1232,6 +1316,15 @@ pub(super) fn on_write(base: usize, off: usize, v: u32) {
                 let Some(port) = st.ports.get(idx).copied() else {
                     return;
                 };
+                if let Some(n) = st.port_writes.get_mut(idx) {
+                    *n += 1;
+                }
+                // PR es el bit 4: pedirlo es el reset del puerto.
+                if (v & (1 << 4)) != 0 {
+                    if let Some(n) = st.port_resets.get_mut(idx) {
+                        *n += 1;
+                    }
+                }
                 let sc = portsc_after_write(port.sc, v, port);
                 if let Some(p) = st.ports.get_mut(idx) {
                     p.sc = sc;
@@ -1759,6 +1852,8 @@ impl Hw {
                 ev_cycle: true,
                 events_posted: 0,
                 ports: alloc::vec![Port::default(); ports as usize],
+                port_resets: alloc::vec![0u32; ports as usize],
+                port_writes: alloc::vec![0u32; ports as usize],
                 devs: Vec::new(),
                 ep0: (0..=256).map(|_| None).collect(),
                 eval_mps: Vec::new(),
@@ -2212,6 +2307,16 @@ impl Hw {
 
     pub(super) fn resets(&self) -> u32 {
         self.with(|st| st.resets)
+    }
+
+    /// Cuántos resets (PR) se le pidieron al puerto raíz `port`.
+    pub(super) fn port_resets(&self, port: u8) -> u32 {
+        self.with(|st| st.port_resets.get(port as usize - 1).copied().unwrap_or(0))
+    }
+
+    /// Cuántas escrituras recibió el PORTSC del puerto raíz `port`.
+    pub(super) fn port_writes(&self, port: u8) -> u32 {
+        self.with(|st| st.port_writes.get(port as usize - 1).copied().unwrap_or(0))
     }
 
     pub(super) fn running(&self) -> bool {

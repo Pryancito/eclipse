@@ -7531,6 +7531,11 @@ mod int_tests;
 #[cfg(test)]
 mod irq_tests;
 
+/// Qué clase de dispositivo de entrada hay detrás de una interfaz HID, y el
+/// barrido del puerto que llega hasta ahí.
+#[cfg(test)]
+mod classify_tests;
+
 /// La tabla de la página HID del teclado y el delta entre dos informes, que
 /// es el camino que `tests` no toca: ahí todo es ratón.
 #[cfg(test)]
