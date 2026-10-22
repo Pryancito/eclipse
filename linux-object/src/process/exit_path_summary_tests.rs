@@ -184,6 +184,20 @@ fn a_shared_signal_discarded_by_sig_ign_clears_the_mirror() {
 }
 
 #[test]
+fn a_stop_a_continue_throws_away_on_the_process_clears_the_mirror() {
+    let (proc, _t) = a_process_blocking_usr1(78_013);
+    let lp = proc.linux();
+    lp.queue_shared_signal(LinuxSignal::SIGTSTP, None);
+    prepare_signal(&proc, LinuxSignal::SIGCONT);
+    assert_eq!(
+        mirror(lp).0,
+        0,
+        "the stop was thrown away, so the fast path must stop taking the lock"
+    );
+    assert_mirror_agrees(lp, "prepare_signal(SIGCONT)");
+}
+
+#[test]
 fn a_job_stop_is_visible_without_the_lock_and_a_continue_clears_it() {
     let (proc, _t) = a_process_blocking_usr1(78_008);
     let lp = proc.linux();
