@@ -2593,6 +2593,38 @@ mod controller_tests {
         })
     }
 
+    #[test]
+    fn the_completion_queue_wraps_and_the_phase_bit_turns_over_with_it() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            let entries = io.lock().cq.len();
+
+            // One completion per entry, all with the phase a fresh queue
+            // expects.
+            the_controller_answers(&io, &alloc::vec![OK; entries]);
+            for _ in 0..entries {
+                assert_eq!(drive.flush(), Ok(()));
+            }
+
+            // Round the end the head is back at zero and the phase has turned
+            // over, which is the only thing that stops the entries still
+            // lying there from reading as a second set of completions.
+            {
+                let q = io.lock();
+                assert_eq!(q.cq_head, 0);
+                assert_eq!(q.cq_phase, 0);
+            }
+
+            // So the next completion carries a zero in bit 0, and is believed.
+            a_completion_at(&io, 0, (entries + 1) as u16, 0);
+            assert_eq!(drive.flush(), Ok(()));
+            assert_eq!(cq_doorbell(base, 1), 1, "the head went round and on");
+        })
+    }
+
     // --- reads and writes ---
 
     #[test]
@@ -2886,11 +2918,18 @@ mod controller_tests {
             // at CSTS has nothing to end it.
             a_quick_clock();
             let drive = a_drive(base);
-            // Poisoned, so the flush it starts with refuses at once and the
-            // shutdown is all this test is looking at.
-            drive.poisoned.store(true, Ordering::Relaxed);
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[OK]);
 
             drive.quiesce_for_reboot();
+
+            // The write cache is flushed before the shutdown is asked for. On
+            // a controller without DRAM that flush is the moment the mapping
+            // tables reach the NAND instead of being rebuilt on next
+            // power-up, so skipping it is not a missing optimisation.
+            assert_eq!(submitted(&io), 1);
+            assert_eq!(sq_entry(&io, 0).nsid, 1, "a flush of the namespace");
+            assert_eq!(sq_doorbell(base, 1), 1);
 
             // The shutdown field was replaced, not or-ed into: asking for a
             // normal shutdown on top of an abrupt one spells neither.
@@ -2921,6 +2960,11 @@ mod controller_tests {
             assert!(
                 clock_spent() > 1_000_000,
                 "left before the second it gives the drive: {} us",
+                clock_spent()
+            );
+            assert!(
+                clock_spent() < 10_000_000,
+                "waited far past that second: {} us",
                 clock_spent()
             );
         })
