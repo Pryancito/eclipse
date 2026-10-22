@@ -48,6 +48,9 @@ const OP_DCBAAP: usize = 0x30;
 const OP_CONFIG: usize = 0x38;
 const OP_PORTSC: usize = 0x400;
 
+const LEGSUP_BIOS_OWNED: u32 = 1 << 16;
+const LEGSUP_OS_OWNED: u32 = 1 << 24;
+
 const RT_IMAN: usize = 0x20;
 const RT_ERSTSZ: usize = 0x28;
 const RT_ERSTBA: usize = 0x30;
@@ -973,6 +976,10 @@ struct Fake {
     never_halts: bool,
     /// CNR sigue puesto durante estas lecturas más de USBSTS.
     cnr_reads: u32,
+    /// Offset de la capacidad USB Legacy Support en la ventana, si la hay.
+    legsup: Option<usize>,
+    /// Un BIOS que no suelta el controlador pase lo que pase.
+    legsup_stuck: bool,
     /// Microsegundos que avanza el reloj por lectura de registro.
     read_tick_us: u64,
 
@@ -1125,6 +1132,14 @@ pub(super) fn on_read(base: usize, off: usize) {
 /// en memoria.
 pub(super) fn on_write(base: usize, off: usize, v: u32) {
     with_state(base, |st| {
+        if st.legsup == Some(off) {
+            // El BIOS suelta el controlador en cuanto la OS pide el semáforo,
+            // y lo que la OS ve de eso es su propio bit de dueño apagándose.
+            if (v & LEGSUP_OS_OWNED) != 0 && !st.legsup_stuck {
+                poke(st.base + off, v & !LEGSUP_BIOS_OWNED);
+            }
+            return;
+        }
         if off >= DBOFF {
             let slot = ((off - DBOFF) / 4) as u8;
             let dci = v as u8;
@@ -1717,6 +1732,8 @@ impl Hw {
                 never_runs: false,
                 never_halts: false,
                 cnr_reads: 0,
+                legsup: None,
+                legsup_stuck: false,
                 read_tick_us: 1,
                 config_slots: 0,
                 dcbaap: 0,
@@ -1769,8 +1786,37 @@ impl Hw {
         poke(self.base + off, v);
     }
 
+    /// Una capacidad USB Legacy Support en `off`, con el BIOS como dueño del
+    /// controlador: la cadena xECP de HCCPARAMS1 la apunta y no sigue a nadie.
+    pub(super) fn set_legacy_cap(&self, off: usize) {
+        poke(self.base + 0x10, ((off >> 2) as u32) << 16);
+        poke(self.base + off, 1 | LEGSUP_BIOS_OWNED);
+        self.with(|st| st.legsup = Some(off));
+    }
+
+    /// Un BIOS que se queda el controlador aunque la OS pida el semáforo.
+    pub(super) fn bios_keeps_the_controller(&self) {
+        self.with(|st| st.legsup_stuck = true);
+    }
+
+    /// La capacidad legacy tal como está ahora en la ventana.
+    pub(super) fn legsup(&self) -> u32 {
+        self.with(|st| peek(st.base + st.legsup.expect("no hay capacidad legacy")))
+    }
+
+    /// El USBLEGCTLSTS que va detrás de la capacidad legacy.
+    pub(super) fn legctlsts(&self) -> u32 {
+        self.with(|st| peek(st.base + st.legsup.expect("no hay capacidad legacy") + 4))
+    }
+
     pub(super) fn op(&self, off: usize) -> u32 {
         peek(self.base + CAPLEN + off)
+    }
+
+    /// Un registro de la ventana de ejecución tal como está en memoria, que es
+    /// lo único que ve quien escribe ahí sin pasar por el driver.
+    pub(super) fn rt(&self, off: usize) -> u32 {
+        peek(self.base + RTSOFF + off)
     }
 
     pub(super) fn set_op(&self, off: usize, v: u32) {

@@ -434,6 +434,11 @@ impl XhciMmio {
             write_volatile((self.cap_base + o) as *mut u32, v);
         }
         fence(Ordering::Release);
+        // Same seam as the operational and runtime windows. The reaction this
+        // one carries is the BIOS dropping the controller when the OS asks for
+        // the semaphore: without it the handoff can only be seen timing out.
+        #[cfg(test)]
+        xhci_fake::on_write(self.cap_base, o, v);
     }
 
     /// xHCI xECP: USB Legacy Support Capability — ceder control a la OS y desactivar SMI (metal).
@@ -7737,6 +7742,11 @@ mod usbdisk_tests;
 /// son EP0.
 #[cfg(test)]
 mod int_tests;
+
+/// El camino de la interrupción de MSI: lo que se confirma con el cerrojo y
+/// sin él, y el handoff del BIOS que precede a todo.
+#[cfg(test)]
+mod irq_tests;
 
 /// La tabla de la página HID del teclado y el delta entre dos informes, que
 /// es el camino que `tests` no toca: ahí todo es ratón.
