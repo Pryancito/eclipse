@@ -1383,7 +1383,15 @@ mod card_tests {
         unsafe { core::ptr::write_volatile((base + at * 4) as *mut u32, value) }
     }
 
+    /// The virtual clock has to move on its own. `E1000::new` waits ten
+    /// milliseconds for the reset to settle, and with the clock standing at
+    /// zero that wait runs to its ten-million-spin cap every time instead.
+    fn a_moving_clock() {
+        crate::nvme::nvme_queue::test_clock::set_auto_advance(1_000);
+    }
+
     fn a_card(base: usize) -> E1000 {
+        a_moving_clock();
         E1000::new(base, REGISTERS * 4, EthernetAddress(MAC)).expect("the shim serves the rings")
     }
 
