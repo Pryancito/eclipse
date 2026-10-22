@@ -4127,6 +4127,18 @@ impl LinuxProcess {
         self.inner.lock().semaphores.remove(id)
     }
 
+    /// `unshare(CLONE_SYSVSEM)`, which Linux calls "equivalent to
+    /// `sys_exit()`" (`exit_sem`): the `SEM_UNDO` adjustments owed go back
+    /// now, outside the big lock, and the sets stay known.
+    pub fn semaphores_unshare(&self) {
+        let owed = {
+            let mut inner = self.inner.lock();
+            let fresh = inner.semaphores.clone();
+            core::mem::replace(&mut inner.semaphores, fresh)
+        };
+        drop(owed);
+    }
+
     /// get ShmId from Virtual Addr
     pub fn shm_get_id(&self, id: usize) -> Option<usize> {
         self.inner.lock().shm_identifiers.get_id(id)
@@ -6259,6 +6271,8 @@ mod job_stop;
 use job_stop::wake_for_job_control;
 mod pending_timer;
 pub use job_stop::{complete_signal_for_job_control, wait_while_job_stopped};
+mod clone_parent;
+pub use clone_parent::give_to_callers_parent;
 pub use pending_timer::with_pending_timer_signal;
 
 mod exit_path;

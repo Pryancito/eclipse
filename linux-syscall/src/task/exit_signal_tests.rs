@@ -91,3 +91,20 @@ fn a_forked_child_starts_out_sending_sigchld() {
     // through the `SIGCHLD` disposition at all (`child_death_policy`).
     assert_ne!(child.linux().exit_signal(), 0);
 }
+
+/// `CLONE_PARENT`: the child's death goes to the caller's parent, with the
+/// signal the caller's own goes with, and not with the one in the word.
+#[test]
+fn a_clone_parent_child_takes_no_signal_from_the_flags() {
+    let sibling = 0x8000 | LinuxSignal::SIGUSR1 as usize;
+    assert_eq!(
+        child_of_clone(CloneFlags::from_bits_truncate(sibling), sibling),
+        ChildOf::CallersParent
+    );
+    let fork = LinuxSignal::SIGUSR1 as usize;
+    assert_eq!(
+        child_of_clone(CloneFlags::from_bits_truncate(fork), fork),
+        ChildOf::Caller(LinuxSignal::SIGUSR1 as u8)
+    );
+    assert_eq!(child_of_clone(CloneFlags::empty(), 0), ChildOf::Caller(0));
+}

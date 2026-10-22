@@ -705,8 +705,9 @@ impl Syscall<'_> {
             // name_to_handle_at on hotplug/device paths and handle ENOSYS
             // fine; the loud per-call ERROR line was pure log noise.
             Sys::NAME_TO_HANDLE_AT => Err(LxError::ENOSYS),
-            // No namespaces in this kernel. ENOSYS here is LOAD-BEARING, not a
-            // placeholder: bubblewrap turns it into
+            // No namespaces in this kernel, and `sys_unshare` answers ENOSYS
+            // to every call that asks for one. That ENOSYS is LOAD-BEARING, not
+            // a placeholder: bubblewrap turns it into
             //   bwrap: Creating new namespace failed: Function not implemented
             // and glycin — which is how Alpine's gdk-pixbuf decodes every image
             // format, out of process, one loader per format — matches exactly
@@ -720,8 +721,10 @@ impl Syscall<'_> {
             // recognise, and every image decode in the desktop would fail (a
             // NULL pixbuf, which libwnck `g_assert`s on, taking the session
             // down with it). If namespaces are ever added, they must actually
-            // work before this arm goes away.
-            Sys::UNSHARE => Err(LxError::ENOSYS),
+            // work before that answer goes away. What `unshare` is without them
+            // (`CLONE_FS`, `CLONE_FILES`, `CLONE_SYSVSEM` and the rest) is what
+            // Linux answers: see `task/unshare.rs`.
+            Sys::UNSHARE => self.sys_unshare(a0),
             Sys::MEMBARRIER => self.sys_membarrier(a0 as i32, a1 as u32, a2 as i32),
             Sys::PRLIMIT64 => self.sys_prlimit64(a0, a1, a2.into(), a3.into()),
             Sys::REBOOT => self.sys_reboot(a0 as u32, a1 as u32, a2 as u32, a3.into()),
