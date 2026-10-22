@@ -116,6 +116,8 @@ pub struct Process {
     dead_threads_sys_time: AtomicU64,
     /// The context switches of threads that have already exited.
     dead_threads_switches: super::thread::ContextSwitches,
+    /// The minor page faults of threads that have already exited.
+    dead_threads_faults: super::thread::MinorFaults,
     /// Exit code a thread asked to publish when it becomes the last one.
     ///
     /// `i64::MIN` means unset. Two concurrent `_exit` calls can both see
@@ -529,6 +531,7 @@ impl Process {
             dead_threads_time: AtomicU64::new(0),
             dead_threads_sys_time: AtomicU64::new(0),
             dead_threads_switches: Default::default(),
+            dead_threads_faults: Default::default(),
             exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
@@ -563,6 +566,7 @@ impl Process {
             dead_threads_time: AtomicU64::new(0),
             dead_threads_sys_time: AtomicU64::new(0),
             dead_threads_switches: Default::default(),
+            dead_threads_faults: Default::default(),
             exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
@@ -624,6 +628,7 @@ impl Process {
             dead_threads_time: AtomicU64::new(0),
             dead_threads_sys_time: AtomicU64::new(0),
             dead_threads_switches: Default::default(),
+            dead_threads_faults: Default::default(),
             exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
@@ -1289,6 +1294,17 @@ impl Process {
         (voluntary, involuntary)
     }
 
+    /// The minor page faults of this process's threads, the exited ones'
+    /// and the live ones' so far, read the way
+    /// [`context_switches`](Self::context_switches) reads its counts. What
+    /// `getrusage(RUSAGE_SELF)`, `/proc/<pid>/stat` and a parent's `wait4`
+    /// report.
+    pub fn minor_faults(&self) -> u64 {
+        let inner = self.inner.lock();
+        let gone = self.dead_threads_faults.get();
+        gone + inner.threads.iter().map(|t| t.minor_faults()).sum::<u64>()
+    }
+
     pub(super) fn remove_thread(&self, tid: KoID) {
         let mut inner = self.inner.lock();
         // `retain` asks every entry for its id, which is a load through it,
@@ -1307,6 +1323,7 @@ impl Process {
             self.dead_threads_time_add(t.get_time());
             self.dead_threads_sys_time_add(t.get_sys_time());
             self.dead_threads_switches.add(t.context_switches());
+            self.dead_threads_faults.add(t.minor_faults());
             false
         });
         if inner.threads.is_empty() {

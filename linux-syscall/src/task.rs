@@ -3307,7 +3307,8 @@ mod waitid_report_tests {
     }
 
     /// A child found is a `SIGCHLD` `siginfo_t` with its pid where glibc
-    /// reads `si_pid`, and its CPU time and context switches in the `rusage`.
+    /// reads `si_pid`, and its CPU time, context switches and minor faults in
+    /// the `rusage`.
     #[test]
     fn a_reported_child_carries_its_pid_and_its_cpu_time() {
         let cpu = ChildCpu {
@@ -3315,6 +3316,7 @@ mod waitid_report_tests {
             stime_ns: 250_000,
             voluntary_switches: 26,
             involuntary_switches: 3,
+            minor_faults: 1_027,
         };
         let report = waitid_report(Some((4242, 1000, 7 << 8, cpu)));
         assert_eq!(report.info.signo, LinuxSignal::SIGCHLD as i32);
@@ -3325,7 +3327,8 @@ mod waitid_report_tests {
         assert_eq!((rusage.utime.sec, rusage.utime.usec), (1, 500_000));
         assert_eq!((rusage.stime.sec, rusage.stime.usec), (0, 250));
         assert_eq!((rusage.nvcsw, rusage.nivcsw), (26, 3));
-        assert_eq!((rusage.maxrss, rusage.minflt), (0, 0), "not kept");
+        assert_eq!(rusage.minflt, 1_027);
+        assert_eq!(rusage.maxrss, 0, "not kept");
     }
 
     /// The same struct `wait4` writes: `time(1)` over either call agrees.

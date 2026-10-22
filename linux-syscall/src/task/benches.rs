@@ -118,6 +118,7 @@ fn child_rusage_build(b: &mut Bencher) {
         stime_ns: 98_765_432,
         voluntary_switches: 26,
         involuntary_switches: 3,
+        minor_faults: 1_027,
     };
     b.iter(|| black_box(child_rusage(black_box(cpu))));
 }
