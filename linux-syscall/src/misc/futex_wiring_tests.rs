@@ -84,14 +84,39 @@ const TRIES: usize = 300;
 /// A gap between tries, long enough that the retries are not a spin.
 const A_MOMENT: Duration = Duration::from_millis(10);
 
-/// How long a thread that is going to kill the process waits for the park it
-/// is meant to interrupt: 20 seconds, the harness's own cap for one call.
+/// How long a thread that is going to signal the process waits for the park
+/// it is meant to interrupt: 20 seconds, the harness's own cap for one call.
 ///
 /// Deliberately much larger than [`TRIES`], and deliberately a budget that
-/// kills NOTHING when it runs out. A waiter is slower to park when the whole
-/// suite is running than when its own test is, and a killer that gives up
-/// and kills anyway reports a wrong answer for a call it was never about.
-const A_KILL_BUDGET: usize = 2_000;
+/// sends NOTHING when it runs out. A waiter is slower to park when the whole
+/// suite is running than when its own test is, and a helper that gives up
+/// and signals anyway reports a wrong answer for a call it was never about.
+const A_SIGNAL_BUDGET: usize = 2_000;
+
+/// What the two tests below send, and the reason they send a signal rather
+/// than ending the process.
+///
+/// `Process::exit` is not a signal: it takes the process out from under the
+/// call, and a `FUTEX_WAIT` that gets as far as its bounds check after that
+/// answers **ESRCH**, not EINTR. Measured, with `exit(137)` in place of this:
+/// four of ten whole-suite runs at 16 threads, `left: Err(ESRCH)`, while the
+/// same test passed every time on its own and at one thread. The park is
+/// simply slower to be reached when fifteen other tests are running, and no
+/// handshake can fix that, because the thing being raced is the process's
+/// own existence.
+///
+/// A signal cannot lose that race in either direction. Queued before the
+/// park, it is answered by the `check_signals_of` at the top of the park;
+/// queued after, by the park's own wake. The process stays alive for both,
+/// so both orderings give EINTR and the test stops depending on which one
+/// happened. It is also what the kernel comment this covers is actually
+/// about: musl's `__synccall` sends SIGRT34 to every other thread of a very
+/// much living process.
+///
+/// Any disposition but "ignore" would do here (see
+/// `signal_default_action_interrupts`); SIGUSR1 is the one with nothing else
+/// attached to it.
+const A_SIGNAL: linux_object::signal::Signal = linux_object::signal::Signal::SIGUSR1;
 
 fn a_process(pid: KoID, name: &str) -> Arc<Process> {
     Process::create_with_fixed_id_ext(&ROOT_JOB, pid, name, LinuxProcess::new(RamFS::new(), 0))
@@ -1473,20 +1498,22 @@ fn a_signal_ends_a_wait_that_nothing_woke() {
     // parks, so the kill cannot land anywhere but on that park.
     //
     // A fixed sleep here is what a first draft of this test used, and it is
-    // a race twice over: too short and the kill arrives before the call is
-    // entered, too long and it is dead time in every run. Worse, a killer
-    // that gives up waiting and kills ANYWAY turns a slow machine into a
-    // kill at the wrong moment -- which is exactly how this test failed
-    // once in eight runs of the whole suite while passing every time on its
-    // own. So the budget here is the harness's own, and running out of it
-    // kills nothing: the park then hangs and says so, instead of a
+    // a race twice over: too short and the signal arrives before the call is
+    // entered, too long and it is dead time in every run. Worse, a helper
+    // that gives up waiting and acts ANYWAY turns a slow machine into an
+    // interruption at the wrong moment -- which is exactly how this test
+    // failed once in eight runs of the whole suite while passing every time
+    // on its own. So the budget here is the harness's own, and running out
+    // of it sends nothing: the park then hangs and says so, instead of a
     // confusing assertion about the wrong call.
+    //
+    // And what arrives is a SIGNAL, not the end of the process, which is
+    // what the flag alone could not make safe: see [`A_SIGNAL`].
     let ready = a_futex_word(0);
-    let killer = proc.clone();
     std::thread::spawn(move || {
-        for _ in 0..A_KILL_BUDGET {
+        for _ in 0..A_SIGNAL_BUDGET {
             if ready.load(Ordering::SeqCst) != 0 {
-                killer.exit(137);
+                linux_object::process::send_signal_to_process(49_202, A_SIGNAL).unwrap();
                 return;
             }
             std::thread::sleep(A_MOMENT);
@@ -1540,13 +1567,16 @@ fn a_signal_ends_a_contended_priority_lock_instead_of_leaving_it_unkillable() {
     let theirs = proc.clone();
     let victim = proc.clone();
     std::thread::spawn(move || {
-        // On the budget rather than on [`TRIES`], and killing nothing if it
-        // runs out: see [`A_KILL_BUDGET`]. Here the mark is the waiter's own
-        // announcement that it is about to park, so a kill before it would
-        // land on the OWNER's uncontended acquire instead.
-        for _ in 0..A_KILL_BUDGET {
-            if word.load(Ordering::SeqCst) & FUTEX_WAITERS != 0 {
-                victim.exit(137);
+        // On the budget rather than on [`TRIES`], and sending nothing if it
+        // runs out: see [`A_SIGNAL_BUDGET`]. Two marks are waited for, not
+        // one, because a signal is delivered to a THREAD: the first is the
+        // waiter's own announcement that it is about to park (before it, the
+        // signal would land on the OWNER's uncontended acquire instead), and
+        // the second is the owner's thread being gone, which leaves the
+        // parked waiter as the only thread `send_signal_to_process` can pick.
+        for _ in 0..A_SIGNAL_BUDGET {
+            if word.load(Ordering::SeqCst) & FUTEX_WAITERS != 0 && victim.threads().len() == 1 {
+                linux_object::process::send_signal_to_process(49_203, A_SIGNAL).unwrap();
                 return;
             }
             std::thread::sleep(A_MOMENT);
