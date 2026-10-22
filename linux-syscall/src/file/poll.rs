@@ -3100,3 +3100,12 @@ mod end_to_end_tests {
 
 #[cfg(test)]
 mod pselect_ppoll_wiring_tests;
+
+#[cfg(test)]
+mod parked_wait_tests;
+
+#[cfg(test)]
+mod refusing_file_tests;
+
+#[cfg(test)]
+mod unwatchable_tests;

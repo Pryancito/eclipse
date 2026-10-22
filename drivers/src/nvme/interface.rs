@@ -1899,3 +1899,1151 @@ mod completion_layout_tests {
         assert_eq!(offset_of!(NvmeCompletion, status) + 2, 16);
     }
 }
+
+#[cfg(test)]
+mod controller_tests {
+    //! Host tests for the bodies: bring-up, the completion wait, and the
+    //! block API that runs on top of them.
+    //!
+    //! `command_tests` above covers every pure helper in this file and not one
+    //! of the functions that call them, because reaching those needs a
+    //! controller. There is one here, and two properties of the driver build
+    //! it. The BAR is only ever read and written volatile at `bar + offset`,
+    //! so a leaked window of words is a register file; and the completion
+    //! queue is *host* memory the controller DMAs into, so a test can post the
+    //! completion itself -- which is the whole of what `wait_cq` waits for.
+    //!
+    //! The clock is the other half. `test_clock` is per-thread, so a frozen
+    //! clock means no deadline can fire and a function that returns did so
+    //! because the controller answered, while a galloping clock means the
+    //! deadline fires on the first look, which is how the timeouts are
+    //! reached without waiting for them.
+
+    use super::*;
+    use crate::nvme::nvme_queue::test_clock;
+    use crate::utils::host_hooks::alone_with_the_allocator;
+
+    /// The fake BAR, long enough for the doorbells of the admin queue and one
+    /// I/O queue at the minimum stride.
+    const BAR_BYTES: usize = 0x2000;
+    /// Doorbell stride, `4 << CAP.DSTRD` with DSTRD zero.
+    const STRIDE: usize = 4;
+    /// Entries in each queue.
+    const ENTRIES: usize = 32;
+    /// Namespace size in the 512-byte sectors the block API speaks.
+    const SECTORS: usize = 4096;
+
+    /// A completion whose status says "mine, and it went well". Bit 0 is the
+    /// phase, which a fresh queue expects to be 1; bits 1..9 are the status
+    /// code and 9..12 its type, and zero in both is success.
+    const OK: u16 = 1;
+    /// The same, reporting an error. The command is over either way, which is
+    /// what makes it safe to re-issue.
+    const FAILED: u16 = 1 | (0x04 << 1);
+
+    /// The address of a leaked register window, which is all a BAR ever is to
+    /// this driver. Only the address comes back, so nothing here holds a
+    /// reference to the memory the driver reads and writes volatile; and it is
+    /// a block of `u64`, because CAP, ASQ and ACQ are read and written eight
+    /// bytes at a time.
+    fn a_window() -> usize {
+        let window: &'static mut [u64] = alloc::vec![0u64; BAR_BYTES / 8].leak();
+        window.as_mut_ptr() as usize
+    }
+
+    fn reg(base: usize, at: usize) -> u32 {
+        // SAFETY: `base` came from `a_window` and `at` is inside it.
+        unsafe { read_volatile((base + at) as *const u32) }
+    }
+
+    fn set_reg(base: usize, at: usize, value: u32) {
+        // SAFETY: as `reg`.
+        unsafe { write_volatile((base + at) as *mut u32, value) }
+    }
+
+    fn reg64(base: usize, at: usize) -> u64 {
+        // SAFETY: as `reg`, and the window is eight-byte aligned.
+        unsafe { read_volatile((base + at) as *const u64) }
+    }
+
+    /// Where the driver writes the new submission tail of queue `qid`.
+    fn sq_doorbell(base: usize, qid: usize) -> u32 {
+        reg(base, NVME_REG_DBS + 2 * qid * STRIDE)
+    }
+
+    /// Where it writes the consumed completion head.
+    fn cq_doorbell(base: usize, qid: usize) -> u32 {
+        reg(base, NVME_REG_DBS + 2 * qid * STRIDE + STRIDE)
+    }
+
+    type Queue = Arc<Mutex<NvmeQueue<ProviderImpl>>>;
+
+    fn a_queue(qid: usize) -> Queue {
+        Arc::new(Mutex::new(
+            NvmeQueue::new(qid, ENTRIES).expect("the shim serves four regions"),
+        ))
+    }
+
+    /// The driver as `new` leaves it just before `nvme_configure_admin_queue`:
+    /// queues built, nothing asked of the controller yet.
+    fn a_drive_not_yet_brought_up(base: usize) -> NvmeInterface {
+        NvmeInterface {
+            name: String::from("nvme"),
+            admin_queue: a_queue(0),
+            io_queues: alloc::vec![a_queue(1)],
+            bar: base,
+            stride: STRIDE,
+            irq: 11,
+            capacity: 0,
+            lba_shift: 9,
+            max_transfer: PAGE_SIZE,
+            poisoned: AtomicBool::new(false),
+        }
+    }
+
+    /// The driver as bring-up leaves it: a namespace of 512-byte blocks and a
+    /// per-command cap as big as the bounce buffer.
+    fn a_drive(base: usize) -> NvmeInterface {
+        let mut drive = a_drive_not_yet_brought_up(base);
+        drive.capacity = SECTORS;
+        drive.max_transfer = PAGE_SIZE * 32;
+        drive
+    }
+
+    /// Post one completion into `queue`'s completion queue, which is what the
+    /// controller's DMA engine would have done.
+    fn a_completion_at(queue: &Queue, head: usize, cid: u16, status: u16) {
+        let mut q = queue.lock();
+        q.cq[head].write(NvmeCompletion {
+            command_id: cid,
+            status,
+            ..Default::default()
+        });
+    }
+
+    /// Post one completion per status, in order, for the command ids
+    /// `next_cid` is about to hand out.
+    fn the_controller_answers(queue: &Queue, statuses: &[u16]) {
+        let (head, first_cid) = {
+            let q = queue.lock();
+            (q.cq_head, q.cid_counter.wrapping_add(1))
+        };
+        for (i, status) in statuses.iter().enumerate() {
+            a_completion_at(queue, head + i, first_cid.wrapping_add(i as u16), *status);
+        }
+    }
+
+    /// Fill the queue's bounce buffer the way a read command's DMA would.
+    fn the_controller_leaves(queue: &Queue, at: usize, bytes: &[u8]) {
+        let q = queue.lock();
+        // SAFETY: the bounce is 32 pages and `at + len` stays inside it.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), (q.data_va + at) as *mut u8, bytes.len())
+        }
+    }
+
+    /// What is in the bounce buffer now, which for a write is what the
+    /// controller would have read out of it.
+    fn the_bounce(queue: &Queue, at: usize, len: usize) -> Vec<u8> {
+        let q = queue.lock();
+        // SAFETY: as `the_controller_leaves`.
+        unsafe { core::slice::from_raw_parts((q.data_va + at) as *const u8, len) }.to_vec()
+    }
+
+    fn sq_entry(queue: &Queue, at: usize) -> NvmeCommonCommand {
+        let q = queue.lock();
+        q.sq[at].read()
+    }
+
+    /// How many commands have been submitted on this queue.
+    fn submitted(queue: &Queue) -> usize {
+        queue.lock().sq_tail
+    }
+
+    /// The same sixty-four bytes read back as the command they are. `io_rw`
+    /// and the two bring-up steps build their entries by transmuting the
+    /// other way, so this is that transmute undone.
+    fn as_rw(cmd: NvmeCommonCommand) -> NvmeRWCommand {
+        // SAFETY: both are `#[repr(C)]` and sixty-four bytes wide.
+        unsafe { core::mem::transmute(cmd) }
+    }
+
+    fn as_identify(cmd: NvmeCommonCommand) -> NvmeIdentify {
+        // SAFETY: as `as_rw`.
+        unsafe { core::mem::transmute(cmd) }
+    }
+
+    fn as_create_cq(cmd: NvmeCommonCommand) -> NvmeCreateCq {
+        // SAFETY: as `as_rw`.
+        unsafe { core::mem::transmute(cmd) }
+    }
+
+    fn as_create_sq(cmd: NvmeCommonCommand) -> NvmeCreateSq {
+        // SAFETY: as `as_rw`.
+        unsafe { core::mem::transmute(cmd) }
+    }
+
+    /// The Identify payload the driver reads back, written into the one bounce
+    /// buffer both Identify commands share. That sharing is why the model
+    /// string and the namespace's format byte overlap: byte 26 of the buffer
+    /// is the third character of the model *and* FLBAS, so the character has
+    /// to be one whose low nibble is a format index that exists.
+    fn an_identified_namespace(queue: &Queue, nsze: u64, lbads: u8, mdts: u8) {
+        let q = queue.lock();
+        // SAFETY: the bounce is 32 pages, far more than the 4 KiB Identify
+        // returns.
+        let data = unsafe { core::slice::from_raw_parts_mut(q.data_va as *mut u8, 4096) };
+        data[..8].copy_from_slice(&nsze.to_le_bytes());
+        let model = b"EC0IPSE FAKE NVME";
+        data[24..24 + model.len()].copy_from_slice(model);
+        for byte in data[24 + model.len()..64].iter_mut() {
+            *byte = b' ';
+        }
+        data[77] = mdts;
+        data[128..132].copy_from_slice(&((lbads as u32) << 16).to_le_bytes());
+    }
+
+    /// The one thing a window of memory cannot do: answer. A real controller
+    /// raises CSTS.RDY *because* the host wrote CC.EN, so the driver's two
+    /// waits are one handshake and a passive window can only ever satisfy one
+    /// of them. This watches for the enable and answers it.
+    ///
+    /// It gives up after a bounded wait and answers anyway, so a test that
+    /// never writes CC fails on the flag it returns instead of hanging; and
+    /// the driver's own clock is left galloping, so even then the wait ends.
+    fn a_controller_that_answers(base: usize) -> std::thread::JoinHandle<bool> {
+        std::thread::spawn(move || {
+            let mut saw_the_enable = false;
+            for _ in 0..1_000_000u32 {
+                if reg(base, NVME_REG_CC) & NVME_CC_ENABLE != 0 {
+                    saw_the_enable = true;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            set_reg(base, NVME_REG_CSTS, NVME_CSTS_RDY);
+            saw_the_enable
+        })
+    }
+
+    /// A clock that moves a microsecond per look, with a five second deadline
+    /// on top: more than enough room for the answering thread, and still
+    /// bounded if it never answers.
+    fn a_patient_clock() -> u64 {
+        test_clock::set(0);
+        test_clock::set_auto_advance(1);
+        5_000_000
+    }
+
+    /// A clock that jumps ten seconds per look, so the first deadline check
+    /// fails and every timeout is reached at once.
+    fn a_galloping_clock() {
+        test_clock::set(0);
+        test_clock::set_auto_advance(10_000_000);
+    }
+
+    /// A clock that moves a second per look. Every wait below is satisfied by
+    /// a completion that is already there, so the clock does not matter to
+    /// what is being tested -- but it means a test that breaks ends on a
+    /// deadline in a handful of looks instead of spinning out the hard cap.
+    fn a_quick_clock() {
+        test_clock::set(0);
+        test_clock::set_auto_advance(1_000_000);
+    }
+
+    /// Microseconds the driver's waits have consumed, read without moving the
+    /// clock any further.
+    fn clock_spent() -> u64 {
+        test_clock::set_auto_advance(0);
+        test_clock::now()
+    }
+
+    // --- bring-up ---
+
+    #[test]
+    fn a_bar_too_small_for_the_doorbells_is_refused() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            // CAP: MQES 31 (32 entries), DSTRD 0 (a 4-byte stride), TO 2.
+            // SAFETY: the window is eight-byte aligned.
+            unsafe { write_volatile(base as *mut u64, 0x0000_0002_0000_001f) };
+
+            // Two queues at a four-byte stride put the last doorbell at
+            // 0x1010, which does not fit in sixteen bytes of BAR. Writing it
+            // there would land outside the controller's own window, on every
+            // single command.
+            assert!(matches!(
+                NvmeInterface::new(base, 0x10, 11),
+                Err(DeviceError::NotSupported)
+            ));
+            // And it was refused before taking a single DMA region, which is
+            // the point of reading CAP first: a probe that fails should not
+            // have to give anything back.
+            assert_eq!(
+                crate::utils::host_hooks::ALLOC_CALLS.load(Ordering::SeqCst),
+                0
+            );
+        })
+    }
+
+    #[test]
+    fn a_ready_bit_that_never_clears_stops_the_bring_up_before_the_queues_are_handed_over() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            // A controller wedged with RDY set, and a CC that already carries
+            // a setting the reset must not disturb.
+            set_reg(base, NVME_REG_CSTS, NVME_CSTS_RDY);
+            set_reg(base, NVME_REG_CC, NVME_CC_ENABLE | NVME_CC_IOSQES);
+            a_galloping_clock();
+
+            let mut drive = a_drive_not_yet_brought_up(base);
+            assert_eq!(
+                drive.nvme_configure_admin_queue(1_000),
+                Err(DeviceError::IoError)
+            );
+
+            // The enable bit was taken away and nothing else was,
+            assert_eq!(reg(base, NVME_REG_CC), NVME_CC_IOSQES);
+            // and the queues were never handed over, which is the point of
+            // giving up here: a controller that has not let go of its old
+            // configuration must not be told where the new rings are.
+            assert_eq!(reg(base, NVME_REG_AQA), 0);
+            assert_eq!(reg64(base, NVME_REG_ASQ), 0);
+            assert_eq!(reg64(base, NVME_REG_ACQ), 0);
+            assert_eq!(reg(base, NVME_REG_INTMS), 0);
+        })
+    }
+
+    #[test]
+    fn the_admin_queue_is_handed_over_and_the_controller_told_how_to_read_it() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_galloping_clock();
+
+            let mut drive = a_drive_not_yet_brought_up(base);
+            let (sq_pa, cq_pa, entries) = {
+                let q = drive.admin_queue.lock();
+                (q.sq_pa as u64, q.cq_pa as u64, q.sq.len())
+            };
+
+            // RDY never rises, so this ends in the enable timeout -- after
+            // the programming below, which is what is being read back.
+            assert_eq!(
+                drive.nvme_configure_admin_queue(1_000),
+                Err(DeviceError::IoError)
+            );
+
+            // Both halves of AQA are the queue depth minus one, because the
+            // field is zero-based: the depth itself asks for one entry more
+            // than exists.
+            let aqa = reg(base, NVME_REG_AQA);
+            assert_eq!(aqa & 0xfff, (entries - 1) as u32);
+            assert_eq!((aqa >> 16) & 0xfff, (entries - 1) as u32);
+
+            // The two rings sit at their own physical addresses, not at one
+            // address twice.
+            assert_eq!(reg64(base, NVME_REG_ASQ), sq_pa);
+            assert_eq!(reg64(base, NVME_REG_ACQ), cq_pa);
+            assert_ne!(sq_pa, cq_pa);
+
+            // CC, field by field. The two entry-size fields are log2 of the
+            // size, so they are checked against the structs the driver
+            // actually puts in the rings.
+            let cc = reg(base, NVME_REG_CC);
+            assert_eq!(cc & 1, 1, "enabled");
+            assert_eq!((cc >> 4) & 0x7, 0, "the NVM command set");
+            assert_eq!((cc >> 7) & 0xf, 0, "4 KiB pages");
+            assert_eq!((cc >> 11) & 0x7, 0, "round robin arbitration");
+            assert_eq!((cc >> 14) & 0x3, 0, "no shutdown asked for");
+            assert_eq!(
+                1usize << ((cc >> 16) & 0xf),
+                core::mem::size_of::<NvmeCommonCommand>(),
+                "the submission entry size the driver writes"
+            );
+            assert_eq!(
+                1usize << ((cc >> 20) & 0xf),
+                core::mem::size_of::<NvmeCompletion>(),
+                "the completion entry size the driver reads"
+            );
+
+            // And nothing was asked of the controller: the interrupt mask
+            // comes after it reports ready.
+            assert_eq!(reg(base, NVME_REG_INTMS), 0);
+            assert_eq!(submitted(&drive.admin_queue), 0);
+        })
+    }
+
+    #[test]
+    fn a_controller_that_reports_a_fatal_status_while_enabling_is_given_up_on_at_once() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            // RDY clear so the reset passes, CFS set so the enable cannot.
+            set_reg(base, NVME_REG_CSTS, NVME_CSTS_CFS);
+            // A clock that crawls, against a deadline five million microseconds
+            // away: reaching the deadline would take five million looks, so a
+            // clock that barely moved is the proof this returned on the fatal
+            // status and not on the timeout.
+            let deadline = a_patient_clock();
+
+            let mut drive = a_drive_not_yet_brought_up(base);
+            assert_eq!(
+                drive.nvme_configure_admin_queue(deadline),
+                Err(DeviceError::IoError)
+            );
+            assert!(
+                clock_spent() < 1_000,
+                "gave up on the deadline, not on the fatal status: {} us",
+                clock_spent()
+            );
+        })
+    }
+
+    #[test]
+    fn a_controller_that_answers_the_enable_gets_its_interrupts_masked_and_is_identified() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let deadline = a_patient_clock();
+
+            let mut drive = a_drive_not_yet_brought_up(base);
+            the_controller_answers(&drive.admin_queue, &[OK, OK]);
+            an_identified_namespace(&drive.admin_queue, 1024, 9, 5);
+            let answered = a_controller_that_answers(base);
+
+            assert_eq!(drive.nvme_configure_admin_queue(deadline), Ok(()));
+            assert!(
+                answered.join().expect("the controller thread lived"),
+                "the fake controller answered before the enable was written"
+            );
+
+            // We poll for completions, so every controller interrupt is
+            // masked -- and only once the controller is ready to be written.
+            assert_eq!(reg(base, NVME_REG_INTMS), 0xffff_ffff);
+
+            // Two Identify commands went out: the controller, then namespace
+            // one. Both read into the queue's bounce buffer.
+            let data_pa = drive.admin_queue.lock().data_pa as u64;
+            assert_eq!(submitted(&drive.admin_queue), 2);
+            let controller = as_identify(sq_entry(&drive.admin_queue, 0));
+            assert_eq!(controller.opcode, 0x06);
+            assert_eq!(controller.cns, 1, "identify the controller");
+            assert_eq!(controller.nsid, 0);
+            assert_eq!(controller.prp1, data_pa);
+            let namespace = as_identify(sq_entry(&drive.admin_queue, 1));
+            assert_eq!(namespace.cns, 0, "identify a namespace");
+            assert_eq!(namespace.nsid, 1);
+            assert_eq!(namespace.prp1, data_pa);
+
+            // Both completions were consumed and the controller told so.
+            assert_eq!(cq_doorbell(base, 0), 2);
+        })
+    }
+
+    #[test]
+    fn the_namespace_size_and_block_size_come_out_of_identify() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let deadline = a_patient_clock();
+
+            let mut drive = a_drive_not_yet_brought_up(base);
+            the_controller_answers(&drive.admin_queue, &[OK, OK]);
+            // 1024 blocks of 4 KiB, and a transfer cap of 2^5 pages.
+            an_identified_namespace(&drive.admin_queue, 1024, 12, 5);
+            let answered = a_controller_that_answers(base);
+
+            assert_eq!(drive.nvme_configure_admin_queue(deadline), Ok(()));
+            answered.join().expect("the controller thread lived");
+
+            // The block API counts in 512-byte sectors and the drive counts
+            // in its own 4 KiB blocks, so the capacity is eight times the
+            // block count -- without the scaling seven eighths of the disk
+            // would be unreachable.
+            assert_eq!(drive.logical_block_size(), 4096);
+            assert_eq!(drive.block_count(), 1024 * 8);
+            // MDTS 5 means 2^5 pages of the controller's minimum page size.
+            assert_eq!(drive.max_transfer, 32 * 4096);
+        })
+    }
+
+    #[test]
+    fn a_controller_with_no_transfer_limit_is_not_given_one() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let deadline = a_patient_clock();
+
+            let mut drive = a_drive_not_yet_brought_up(base);
+            the_controller_answers(&drive.admin_queue, &[OK, OK]);
+            an_identified_namespace(&drive.admin_queue, 1024, 9, 0);
+            let answered = a_controller_that_answers(base);
+
+            assert_eq!(drive.nvme_configure_admin_queue(deadline), Ok(()));
+            answered.join().expect("the controller thread lived");
+
+            // MDTS zero means no limit at all, not "no transfers". Read as a
+            // limit it would be a cap of zero bytes, which stalls the
+            // transfer loop and underflows the block count.
+            assert_eq!(drive.max_transfer, usize::MAX);
+        })
+    }
+
+    #[test]
+    fn a_namespace_of_zero_size_is_refused() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let deadline = a_patient_clock();
+
+            let mut drive = a_drive_not_yet_brought_up(base);
+            the_controller_answers(&drive.admin_queue, &[OK, OK]);
+            an_identified_namespace(&drive.admin_queue, 0, 9, 5);
+            let answered = a_controller_that_answers(base);
+
+            assert_eq!(
+                drive.nvme_configure_admin_queue(deadline),
+                Err(DeviceError::NoResources)
+            );
+            answered.join().expect("the controller thread lived");
+            assert_eq!(drive.block_count(), 0);
+        })
+    }
+
+    #[test]
+    fn a_block_size_this_driver_cannot_work_with_is_refused() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let deadline = a_patient_clock();
+
+            let mut drive = a_drive_not_yet_brought_up(base);
+            the_controller_answers(&drive.admin_queue, &[OK, OK]);
+            // 2^14 is 16 KiB, twice what the read-modify-write path will take.
+            an_identified_namespace(&drive.admin_queue, 1024, 14, 5);
+            let answered = a_controller_that_answers(base);
+
+            assert_eq!(
+                drive.nvme_configure_admin_queue(deadline),
+                Err(DeviceError::NotSupported)
+            );
+            answered.join().expect("the controller thread lived");
+            // The refusal left the defaults alone rather than half-applying
+            // a format it cannot serve.
+            assert_eq!(drive.logical_block_size(), 512);
+        })
+    }
+
+    #[test]
+    fn the_io_queue_is_asked_for_and_then_created_in_the_right_order() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut drive = a_drive_not_yet_brought_up(base);
+            the_controller_answers(&drive.admin_queue, &[OK, OK, OK]);
+
+            assert_eq!(drive.nvme_alloc_io_queue(), Ok(()));
+
+            assert_eq!(submitted(&drive.admin_queue), 3);
+            // Set Features first: a queue cannot be created before the
+            // controller has agreed to have one.
+            let features = sq_entry(&drive.admin_queue, 0);
+            assert_eq!(features.opcode, 0x09);
+            assert_eq!(features.cdw10, 0x07, "feature 7, the number of queues");
+            // Then the completion queue, then the submission queue that
+            // reports into it -- the other order names a queue that does not
+            // exist yet.
+            assert_eq!(as_create_cq(sq_entry(&drive.admin_queue, 1)).opcode, 0x05);
+            assert_eq!(as_create_sq(sq_entry(&drive.admin_queue, 2)).opcode, 0x01);
+            assert_eq!(cq_doorbell(base, 0), 3);
+        })
+    }
+
+    #[test]
+    fn the_io_queue_is_created_over_the_memory_the_driver_allocated_for_it() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut drive = a_drive_not_yet_brought_up(base);
+            the_controller_answers(&drive.admin_queue, &[OK, OK, OK]);
+            let (sq_pa, cq_pa, entries) = {
+                let q = drive.io_queues[0].lock();
+                (q.sq_pa as u64, q.cq_pa as u64, q.sq.len())
+            };
+
+            assert_eq!(drive.nvme_alloc_io_queue(), Ok(()));
+
+            let cq = as_create_cq(sq_entry(&drive.admin_queue, 1));
+            assert_eq!(cq.prp1, cq_pa);
+            assert_eq!(cq.cqid, 1);
+            assert_eq!(cq.qsize, (entries - 1) as u16, "zero-based, like AQA");
+            assert_eq!(cq.cq_flags & 1, 1, "physically contiguous");
+            // Interrupts stay off: the driver polls.
+            assert_eq!(cq.cq_flags & 2, 0, "no interrupt vector");
+
+            let sq = as_create_sq(sq_entry(&drive.admin_queue, 2));
+            assert_eq!(sq.prp1, sq_pa);
+            assert_eq!(sq.sqid, 1);
+            assert_eq!(sq.cqid, 1, "reports into the queue just created");
+            assert_eq!(sq.qsize, (entries - 1) as u16);
+            assert_eq!(sq.sq_flags & 1, 1, "physically contiguous");
+            assert_ne!(sq_pa, cq_pa);
+        })
+    }
+
+    // --- waiting for a completion ---
+
+    #[test]
+    fn a_completion_for_another_command_is_consumed_and_the_wait_goes_on() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+
+            // A completion for a command nobody is waiting for sits in front
+            // of ours. Abandoning the wait there would leave the head and the
+            // phase one behind the controller for ever, so it is consumed and
+            // the wait carries on.
+            a_completion_at(&io, 0, 99, OK);
+            a_completion_at(&io, 1, 1, OK);
+
+            assert_eq!(drive.flush(), Ok(()));
+            // Both were consumed, and the controller was told so -- that is
+            // what keeps the queue in step.
+            assert_eq!(io.lock().cq_head, 2);
+            assert_eq!(cq_doorbell(base, 1), 2);
+            assert_eq!(submitted(&io), 1, "and ours was not sent twice");
+        })
+    }
+
+    #[test]
+    fn an_error_completion_is_retried() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[FAILED, OK]);
+
+            // An error completion means the command is over, so the buffer is
+            // ours again and the identical command can go out once more.
+            assert_eq!(drive.flush(), Ok(()));
+            assert_eq!(submitted(&io), 2);
+            assert_eq!(sq_doorbell(base, 1), 2);
+            assert!(!drive.poisoned.load(Ordering::Relaxed));
+        })
+    }
+
+    #[test]
+    fn an_error_completion_on_every_attempt_gives_up_without_poisoning() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[FAILED, FAILED, FAILED, FAILED, OK]);
+
+            assert_eq!(drive.flush(), Err(DeviceError::IoError));
+            // Four attempts and no more: the fifth completion is still
+            // sitting there untouched.
+            assert_eq!(submitted(&io), 4);
+            // And the device is still usable, because every one of those
+            // commands finished. This is the whole difference from a timeout.
+            assert!(!drive.poisoned.load(Ordering::Relaxed));
+            assert_eq!(drive.flush(), Ok(()));
+        })
+    }
+
+    #[test]
+    fn a_command_that_never_completes_poisons_the_device_and_is_not_retried() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+
+            // Nothing answers. The command is still the controller's, and so
+            // is the buffer its pointers name.
+            assert_eq!(drive.flush(), Err(DeviceError::IoError));
+            assert!(drive.poisoned.load(Ordering::Relaxed));
+            // Exactly one command went out. Re-issuing a command the
+            // controller may still be working on is what the retry loop must
+            // not do, and the poison is what stops it.
+            assert_eq!(submitted(&io), 1);
+        })
+    }
+
+    #[test]
+    fn a_fatal_controller_status_poisons_the_device() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            set_reg(base, NVME_REG_CSTS, NVME_CSTS_CFS);
+            // A crawling clock, so the five-second deadline is five million
+            // looks away and the fatal status -- read every 256 looks -- is
+            // what ends the wait.
+            let _ = a_patient_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+
+            assert_eq!(drive.flush(), Err(DeviceError::IoError));
+            assert!(drive.poisoned.load(Ordering::Relaxed));
+            assert_eq!(submitted(&io), 1);
+            assert!(
+                clock_spent() < 1_000_000,
+                "ended on the deadline, not on the fatal status: {} us",
+                clock_spent()
+            );
+        })
+    }
+
+    #[test]
+    fn a_poisoned_device_refuses_every_request_without_touching_the_controller() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            // Completions are waiting, so nothing here is refused for want of
+            // an answer.
+            the_controller_answers(&io, &[OK, OK, OK]);
+            drive.poisoned.store(true, Ordering::Relaxed);
+
+            let mut buf = alloc::vec![0u8; 512];
+            assert_eq!(drive.read_block(0, &mut buf), Err(DeviceError::IoError));
+            assert_eq!(drive.write_block(0, &buf), Err(DeviceError::IoError));
+            assert_eq!(drive.flush(), Err(DeviceError::IoError));
+
+            // Not one command was submitted and no doorbell was rung: the
+            // refusal happens before the controller is involved, because the
+            // controller is exactly what cannot be trusted any more.
+            assert_eq!(submitted(&io), 0);
+            assert_eq!(sq_doorbell(base, 1), 0);
+        })
+    }
+
+    #[test]
+    fn the_completion_queue_wraps_and_the_phase_bit_turns_over_with_it() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            let entries = io.lock().cq.len();
+
+            // One completion per entry, all with the phase a fresh queue
+            // expects.
+            the_controller_answers(&io, &alloc::vec![OK; entries]);
+            for _ in 0..entries {
+                assert_eq!(drive.flush(), Ok(()));
+            }
+
+            // Round the end the head is back at zero and the phase has turned
+            // over, which is the only thing that stops the entries still
+            // lying there from reading as a second set of completions.
+            {
+                let q = io.lock();
+                assert_eq!(q.cq_head, 0);
+                assert_eq!(q.cq_phase, 0);
+            }
+
+            // So the next completion carries a zero in bit 0, and is believed.
+            a_completion_at(&io, 0, (entries + 1) as u16, 0);
+            assert_eq!(drive.flush(), Ok(()));
+            assert_eq!(cq_doorbell(base, 1), 1, "the head went round and on");
+        })
+    }
+
+    // --- reads and writes ---
+
+    #[test]
+    fn a_read_of_one_sector_asks_for_it_and_hands_back_what_arrived() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[OK]);
+            let arrived: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+            the_controller_leaves(&io, 0, &arrived);
+
+            let mut buf = alloc::vec![0u8; 512];
+            assert_eq!(drive.read_block(8, &mut buf), Ok(()));
+            assert_eq!(buf, arrived, "what the controller left is what came back");
+
+            let data_pa = io.lock().data_pa as u64;
+            let cmd = as_rw(sq_entry(&io, 0));
+            assert_eq!(cmd.opcode, 0x02, "a read");
+            assert_eq!(cmd.nsid, 1);
+            assert_eq!(cmd.slba, 8);
+            assert_eq!(cmd.length, 0, "one block, and the field is zero-based");
+            assert_eq!(cmd.prp1, data_pa);
+            assert_eq!(cmd.prp2, 0, "one page needs no second pointer");
+            assert_eq!(sq_doorbell(base, 1), 1);
+        })
+    }
+
+    #[test]
+    fn a_read_of_several_sectors_goes_in_one_command() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[OK]);
+            let arrived: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
+            the_controller_leaves(&io, 0, &arrived);
+
+            let mut buf = alloc::vec![0u8; 4096];
+            assert_eq!(drive.read_block(0, &mut buf), Ok(()));
+            assert_eq!(buf, arrived);
+
+            // Eight blocks in one command, not eight commands.
+            assert_eq!(submitted(&io), 1);
+            assert_eq!(as_rw(sq_entry(&io, 0)).length, 7);
+        })
+    }
+
+    #[test]
+    fn a_read_inside_a_bigger_block_reads_the_whole_block_and_copies_out_the_part_asked_for() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let mut drive = a_drive(base);
+            // A namespace of 4 KiB blocks, addressed in 512-byte sectors: a
+            // one-sector read lands in the middle of a block and the drive
+            // cannot transfer less than one.
+            drive.lba_shift = 12;
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[OK]);
+            let arrived: Vec<u8> = (0..4096u32).map(|i| (i % 247) as u8).collect();
+            the_controller_leaves(&io, 0, &arrived);
+
+            let mut buf = alloc::vec![0u8; 512];
+            assert_eq!(drive.read_block(1, &mut buf), Ok(()));
+            // The second sector of the block, not the first.
+            assert_eq!(buf, arrived[512..1024].to_vec());
+
+            let cmd = as_rw(sq_entry(&io, 0));
+            assert_eq!(cmd.slba, 0, "the block the sector lives in");
+            assert_eq!(cmd.length, 0, "and the whole of it");
+        })
+    }
+
+    #[test]
+    fn a_read_of_exactly_two_pages_points_the_second_pointer_at_the_second_page() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let mut drive = a_drive(base);
+            drive.lba_shift = 12;
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[OK]);
+            let (data_pa, prp_list_va) = {
+                let q = io.lock();
+                (q.data_pa, q.prp_list_va)
+            };
+
+            let mut buf = alloc::vec![0u8; 2 * PAGE_SIZE];
+            assert_eq!(drive.read_block(0, &mut buf), Ok(()));
+
+            // With one page left over there is nothing to list, and a
+            // controller told to read a list would read the data itself as
+            // addresses.
+            let cmd = as_rw(sq_entry(&io, 0));
+            assert_eq!(cmd.prp2, (data_pa + PAGE_SIZE) as u64);
+            // SAFETY: the list is a whole page.
+            let list = unsafe { core::ptr::read_volatile(prp_list_va as *const u64) };
+            assert_eq!(list, 0, "and the list was left alone");
+        })
+    }
+
+    #[test]
+    fn a_read_bigger_than_two_pages_hands_the_controller_a_list_of_them() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let mut drive = a_drive(base);
+            drive.lba_shift = 12;
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[OK]);
+            let (data_pa, prp_list_pa, prp_list_va) = {
+                let q = io.lock();
+                (q.data_pa, q.prp_list_pa, q.prp_list_va)
+            };
+
+            let mut buf = alloc::vec![0u8; 4 * PAGE_SIZE];
+            assert_eq!(drive.read_block(0, &mut buf), Ok(()));
+
+            let cmd = as_rw(sq_entry(&io, 0));
+            assert_eq!(
+                cmd.prp1, data_pa as u64,
+                "page zero rides in the first pointer"
+            );
+            assert_eq!(cmd.prp2, prp_list_pa as u64, "and the rest in a list");
+            assert_eq!(cmd.length, 3, "four blocks");
+
+            // SAFETY: the list is a whole page, far more than four entries.
+            let list = unsafe { core::slice::from_raw_parts(prp_list_va as *const u64, 4) };
+            assert_eq!(
+                list[0],
+                (data_pa + PAGE_SIZE) as u64,
+                "the list starts at the SECOND page, because the first is already in prp1"
+            );
+            assert_eq!(list[1], (data_pa + 2 * PAGE_SIZE) as u64);
+            assert_eq!(list[2], (data_pa + 3 * PAGE_SIZE) as u64);
+            assert_eq!(list[3], 0, "and stops there");
+        })
+    }
+
+    #[test]
+    fn a_read_longer_than_the_controller_accepts_is_cut_into_commands() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let mut drive = a_drive(base);
+            // A controller that takes one page per command, which is what
+            // MDTS says on plenty of real ones.
+            drive.max_transfer = PAGE_SIZE;
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[OK, OK]);
+            let arrived: Vec<u8> = (0..PAGE_SIZE as u32).map(|i| (i % 241) as u8).collect();
+            the_controller_leaves(&io, 0, &arrived);
+
+            let mut buf = alloc::vec![0u8; 2 * PAGE_SIZE];
+            assert_eq!(drive.read_block(0, &mut buf), Ok(()));
+
+            // Two commands of one page, where the bounce buffer alone would
+            // have allowed thirty-two.
+            assert_eq!(submitted(&io), 2);
+            let first = as_rw(sq_entry(&io, 0));
+            let second = as_rw(sq_entry(&io, 1));
+            assert_eq!((first.slba, first.length), (0, 7));
+            assert_eq!(
+                (second.slba, second.length),
+                (8, 7),
+                "carrying on where it stopped"
+            );
+            // Both halves came out of the bounce, so neither was skipped.
+            assert_eq!(buf[..PAGE_SIZE].to_vec(), arrived);
+            assert_eq!(buf[PAGE_SIZE..].to_vec(), arrived);
+        })
+    }
+
+    #[test]
+    fn an_error_completion_on_a_read_is_retried_after_a_settle() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            // Ten milliseconds a look, so the settle between attempts really
+            // has to go round rather than being over before it starts.
+            test_clock::set(0);
+            test_clock::set_auto_advance(10_000);
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[FAILED, OK]);
+            let arrived: Vec<u8> = (0..512u32).map(|i| (i % 229) as u8).collect();
+            the_controller_leaves(&io, 0, &arrived);
+
+            let mut buf = alloc::vec![0u8; 512];
+            assert_eq!(drive.read_block(0, &mut buf), Ok(()));
+            // One transient hiccup should not fail the caller's read, which
+            // is why the error completion is retried at all.
+            assert_eq!(submitted(&io), 2);
+            assert_eq!(buf, arrived);
+            assert!(
+                clock_spent() >= 50_000,
+                "did not settle between the attempts: {} us",
+                clock_spent()
+            );
+        })
+    }
+
+    #[test]
+    fn a_write_of_whole_blocks_goes_through_the_bounce_buffer() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[OK]);
+            let payload: Vec<u8> = (0..1024u32).map(|i| (i % 239) as u8).collect();
+
+            assert_eq!(drive.write_block(4, &payload), Ok(()));
+
+            // The controller reads its data out of the bounce, so the bounce
+            // is where the caller's bytes have to be before the doorbell.
+            assert_eq!(the_bounce(&io, 0, 1024), payload);
+            let cmd = as_rw(sq_entry(&io, 0));
+            assert_eq!(cmd.opcode, 0x01, "a write");
+            assert_eq!(cmd.slba, 4);
+            assert_eq!(cmd.length, 1, "two blocks");
+            assert_eq!(sq_doorbell(base, 1), 1);
+        })
+    }
+
+    #[test]
+    fn a_write_inside_a_bigger_block_reads_it_first_and_writes_it_back_changed() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let mut drive = a_drive(base);
+            drive.lba_shift = 12;
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[OK, OK]);
+            // What is on the drive now, as the read would bring it back.
+            let on_the_drive: Vec<u8> = (0..4096u32).map(|i| (i % 233) as u8).collect();
+            the_controller_leaves(&io, 0, &on_the_drive);
+
+            assert_eq!(drive.write_block(1, &[0xAB; 512]), Ok(()));
+
+            // Two commands: the block is read, changed in place, written back.
+            // Writing only the sector would have handed the controller a whole
+            // block with three quarters of it whatever the bounce held.
+            assert_eq!(submitted(&io), 2);
+            let read = as_rw(sq_entry(&io, 0));
+            let write = as_rw(sq_entry(&io, 1));
+            assert_eq!((read.opcode, read.slba, read.length), (0x02, 0, 0));
+            assert_eq!((write.opcode, write.slba, write.length), (0x01, 0, 0));
+
+            // And the block that went back has the one sector changed and the
+            // rest exactly as it came.
+            assert_eq!(the_bounce(&io, 0, 512), on_the_drive[..512].to_vec());
+            assert_eq!(the_bounce(&io, 512, 512), alloc::vec![0xABu8; 512]);
+            assert_eq!(the_bounce(&io, 1024, 3072), on_the_drive[1024..].to_vec());
+        })
+    }
+
+    #[test]
+    fn a_request_the_namespace_cannot_hold_is_refused_before_any_command() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            // Answers are waiting, so nothing below is refused for want of one.
+            the_controller_answers(&io, &[OK, OK, OK]);
+
+            let mut two_sectors = alloc::vec![0u8; 1024];
+            // One sector of this straddles the end of the namespace.
+            assert_eq!(
+                drive.read_block(SECTORS - 1, &mut two_sectors),
+                Err(DeviceError::InvalidParam)
+            );
+            assert_eq!(
+                drive.write_block(SECTORS, &two_sectors),
+                Err(DeviceError::InvalidParam)
+            );
+            // And half a sector is not a request a block device can serve.
+            let mut half = alloc::vec![0u8; 256];
+            assert_eq!(
+                drive.read_block(0, &mut half),
+                Err(DeviceError::InvalidParam)
+            );
+
+            assert_eq!(submitted(&io), 0);
+            assert_eq!(sq_doorbell(base, 1), 0);
+        })
+    }
+
+    #[test]
+    fn the_last_sector_of_the_namespace_can_be_read_and_the_one_after_it_cannot() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[OK]);
+
+            assert_eq!(drive.block_count(), SECTORS);
+            let mut buf = alloc::vec![0u8; 512];
+            // The bound is the sector after the last, not the last.
+            assert_eq!(drive.read_block(SECTORS - 1, &mut buf), Ok(()));
+            assert_eq!(
+                drive.read_block(SECTORS, &mut buf),
+                Err(DeviceError::InvalidParam)
+            );
+            assert_eq!(submitted(&io), 1);
+        })
+    }
+
+    #[test]
+    fn the_driver_answers_to_the_name_the_registry_matches_on() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let drive = a_drive(base);
+
+            assert_eq!(Scheme::name(&drive), "nvme");
+            assert_eq!(drive.get_name_irq(), (String::from("nvme"), 11));
+
+            // Completions are polled and the controller's interrupts are
+            // masked, so an interrupt must not move the queue on.
+            drive.handle_irq(11);
+            assert_eq!(sq_doorbell(base, 1), 0);
+            assert_eq!(cq_doorbell(base, 1), 0);
+            assert_eq!(submitted(&drive.io_queues[0]), 0);
+        })
+    }
+
+    // --- shutting down ---
+
+    #[test]
+    fn a_reboot_asks_for_an_orderly_shutdown_and_keeps_the_rest_of_the_configuration() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            // A controller running, with an abrupt shutdown left in the
+            // shutdown field by whatever ran before.
+            set_reg(
+                base,
+                NVME_REG_CC,
+                NVME_CC_ENABLE | NVME_CC_IOSQES | NVME_CC_SHN_ABRUPT,
+            );
+            set_reg(base, NVME_REG_CSTS, NVME_CSTS_SHST_CMPLT);
+            // The handshake is answered already, so the clock is beside the
+            // point here -- but it has to move, or a wait that stops looking
+            // at CSTS has nothing to end it.
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[OK]);
+
+            drive.quiesce_for_reboot();
+
+            // The write cache is flushed before the shutdown is asked for. On
+            // a controller without DRAM that flush is the moment the mapping
+            // tables reach the NAND instead of being rebuilt on next
+            // power-up, so skipping it is not a missing optimisation.
+            assert_eq!(submitted(&io), 1);
+            assert_eq!(sq_entry(&io, 0).nsid, 1, "a flush of the namespace");
+            assert_eq!(sq_doorbell(base, 1), 1);
+
+            // The shutdown field was replaced, not or-ed into: asking for a
+            // normal shutdown on top of an abrupt one spells neither.
+            let cc = reg(base, NVME_REG_CC);
+            assert_eq!((cc >> 14) & 3, 1, "a normal shutdown, not an abrupt one");
+            assert_eq!(cc & 1, 1, "still enabled, which the shutdown needs");
+            assert_eq!((cc >> 16) & 0xf, 6, "and the entry size untouched");
+        })
+    }
+
+    #[test]
+    fn a_controller_that_never_reports_its_shutdown_does_not_hold_the_reboot() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            set_reg(base, NVME_REG_CC, NVME_CC_ENABLE);
+            // CSTS.SHST stays at "no shutdown occurring", which is what a
+            // wedged controller reports for ever.
+            test_clock::set(0);
+            test_clock::set_auto_advance(2_000_000);
+            let drive = a_drive(base);
+            drive.poisoned.store(true, Ordering::Relaxed);
+
+            // Returning at all is the behaviour: a reboot cannot wait on a
+            // drive that has stopped answering.
+            drive.quiesce_for_reboot();
+
+            assert_eq!((reg(base, NVME_REG_CC) >> 14) & 3, 1, "it did ask");
+            assert!(
+                clock_spent() > 1_000_000,
+                "left before the second it gives the drive: {} us",
+                clock_spent()
+            );
+            assert!(
+                clock_spent() < 10_000_000,
+                "waited far past that second: {} us",
+                clock_spent()
+            );
+        })
+    }
+}

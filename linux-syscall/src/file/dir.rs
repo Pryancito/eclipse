@@ -42,6 +42,13 @@ mod cwd;
 #[cfg(test)]
 mod wiring_tests;
 
+/// The refusals the bodies answer on their own account: the device-node
+/// capability, the order a taken name is judged in, a trailing slash that
+/// is not part of a name, and a rename that would cross a file with a
+/// directory.
+#[cfg(test)]
+mod refusal_tests;
+
 impl Syscall<'_> {
     /// return a null-terminated string containing an absolute pathname
     /// that is the current working directory of the calling process.

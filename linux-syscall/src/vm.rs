@@ -3920,3 +3920,17 @@ mod brk_chunk_tests {
         assert_eq!(BRK_CHUNK, 1 << 20);
     }
 }
+
+#[cfg(test)]
+mod brk_wiring_tests;
+
+/// What `mprotect` and `mremap` answer when they refuse: the two matches
+/// that turn a Zircon error into an errno, and the empty `mprotect` that
+/// answers before a single mapping is consulted.
+#[cfg(test)]
+mod mprotect_mremap_tests;
+
+/// What `mmap` of a file hands back -- one object per inode for `MAP_SHARED`
+/// -- and the three refusals of `sys_mmap` that had never been asked for.
+#[cfg(test)]
+mod mmap_file_tests;

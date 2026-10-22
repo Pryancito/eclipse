@@ -341,3 +341,203 @@ fn only_the_owner_may_set_an_explicit_time_through_this_call_too() {
         })
     });
 }
+
+// ---------------------------------------------------------------------------
+// `utimensat(2)` with a PATH, which is the form nothing had ever called.
+//
+// The module above asks `utimes` for everything it does, and the null-path
+// form of `utimensat` -- `futimens(3)` -- is asked for elsewhere. What was
+// never asked for is `utimensat` with a pathname in it: seven lines, the
+// whole `else` of the one `if` that chooses between the two forms. That is
+// the form every tool actually calls (`touch -a`, `cp -p`, `tar -x`, every
+// build system stamping an output), and it is the only one that reads the
+// flag word, so `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` had never reached
+// the syscall either.
+//
+// `AT_EMPTY_PATH` is the piece worth the most: with it, an EMPTY pathname
+// names the file `dirfd` is open on, which is a third way to spell the same
+// call. Without it an empty path is `ENOENT`, and the two are one `contains`
+// apart.
+//
+// Fixed pids live in 49_35x.
+
+/// `AT_FDCWD`, which an absolute path makes irrelevant and the syscall still
+/// has to accept.
+const AT_CWD: FileDesc = FileDesc::CWD;
+
+/// A nanosecond count no clock here will produce by accident.
+const AN_ODD_NANOSECOND: usize = 123_456_789;
+
+/// A flag `utimensat(2)` has no business with (`AT_EACCESS`, which is
+/// `faccessat`'s), to ask whether the flag word is checked at all.
+const A_FLAG_THAT_IS_NOT_OURS: usize = 0x200;
+
+fn ts(sec: usize, nsec: usize) -> TimeSpec {
+    TimeSpec { sec, nsec }
+}
+
+/// `utimensat(dirfd, pathname, times, flags)` by the syscall. A null
+/// `pathname` is the `futimens` form and is not what this half is about.
+fn utimensat(
+    sys: &Syscall<'_>,
+    dirfd: FileDesc,
+    pathname: usize,
+    times: &[TimeSpec; 2],
+    flags: usize,
+) -> SysResult {
+    let mut own = Syscall {
+        thread: sys.thread,
+        thread_fn: sys.thread_fn,
+        syscall_entry: sys.syscall_entry,
+    };
+    own.sys_utimensat(
+        dirfd,
+        UserInPtr::from(pathname),
+        UserInOutPtr::from(times as *const [TimeSpec; 2] as usize),
+        flags,
+    )
+}
+
+/// A descriptor open on `dir_path/name`, for the `AT_EMPTY_PATH` form.
+fn an_open_file(lp: &LinuxProcess, dir_path: &str, name: &str) -> FileDesc {
+    let path = alloc::format!("{}/{}", dir_path, name);
+    let inode = lp.lookup_inode(&path).unwrap();
+    lp.add_file(linux_object::fs::File::new(
+        inode,
+        linux_object::fs::OpenFlags::RDWR,
+        path,
+    ))
+    .unwrap()
+}
+
+/// The sub-second halves as the file really has them.
+fn file_nanos(lp: &LinuxProcess, dir_path: &str, name: &str) -> (i32, i32) {
+    nanos_of(lp, dir_path, name)
+}
+
+#[test]
+fn a_utimensat_that_names_a_path_sets_that_files_times() {
+    // The form every tool calls, through the syscall, with four different
+    // numbers so a kernel that wrote one time into both, or lost the
+    // sub-second half, could not pass.
+    let proc = a_process(49_350, "utimensat-path", "named");
+    let lp = proc.linux();
+    a_file_named(lp, "/named", "stamped", 0, 0o644);
+    // A second file, untouched, so "it set the times" cannot be "it set
+    // everybody's times".
+    a_file_named(lp, "/named", "untouched", 0, 0o644);
+    let got = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let times = [
+                ts(AN_OLD_SECOND, AN_ODD_NANOSECOND),
+                ts(A_DIFFERENT_OLD_SECOND, 0),
+            ];
+            utimensat(
+                sys,
+                AT_CWD,
+                c("/named/stamped").as_ptr() as usize,
+                &times,
+                0,
+            )
+        })
+    });
+    assert_eq!(got, Ok(0));
+    assert_eq!(
+        times_of(proc.linux(), "/named", "stamped"),
+        (AN_OLD_SECOND as i64, A_DIFFERENT_OLD_SECOND as i64),
+        "the two times went in, and not the same one twice"
+    );
+    assert_eq!(
+        file_nanos(proc.linux(), "/named", "stamped"),
+        (AN_ODD_NANOSECOND as i32, 0),
+        "a timespec's nanoseconds go in as they are, with no scaling"
+    );
+    assert_eq!(
+        times_of(proc.linux(), "/named", "untouched"),
+        (0, 0),
+        "the call named one file and touched another"
+    );
+}
+
+#[test]
+fn an_empty_path_with_at_empty_path_names_the_file_the_descriptor_is_open_on() {
+    // The third spelling of the same call, and the one `contains` that tells
+    // it from the mistake below.
+    let proc = a_process(49_351, "utimensat-empty", "named");
+    let lp = proc.linux();
+    a_file_named(lp, "/named", "by-fd", 0, 0o644);
+    let fd = an_open_file(lp, "/named", "by-fd");
+    let got = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let times = [ts(AN_OLD_SECOND, 0), ts(A_DIFFERENT_OLD_SECOND, 0)];
+            utimensat(sys, fd, c("").as_ptr() as usize, &times, 0x1000)
+        })
+    });
+    assert_eq!(got, Ok(0));
+    assert_eq!(
+        times_of(proc.linux(), "/named", "by-fd"),
+        (AN_OLD_SECOND as i64, A_DIFFERENT_OLD_SECOND as i64),
+        "AT_EMPTY_PATH did not reach the file the descriptor is open on"
+    );
+}
+
+#[test]
+fn an_empty_path_without_at_empty_path_names_nothing() {
+    // Not the `futimens` form: the pathname is a valid pointer to an empty
+    // string, not a null pointer, so the call takes the path branch and
+    // looks up a name that does not exist.
+    let proc = a_process(49_352, "utimensat-noname", "named");
+    let lp = proc.linux();
+    a_file_named(lp, "/named", "by-fd", 0, 0o644);
+    let fd = an_open_file(lp, "/named", "by-fd");
+    let got = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let times = [ts(AN_OLD_SECOND, 0), ts(A_DIFFERENT_OLD_SECOND, 0)];
+            utimensat(sys, fd, c("").as_ptr() as usize, &times, 0)
+        })
+    });
+    assert_eq!(got, Err(LxError::ENOENT));
+    assert_eq!(
+        times_of(proc.linux(), "/named", "by-fd"),
+        (0, 0),
+        "a call that named nothing stamped something anyway"
+    );
+}
+
+#[test]
+fn the_flag_word_of_the_path_form_is_checked_and_not_ignored() {
+    // Only this form reads the flags at all, so this is where a flag that
+    // belongs to another syscall has to be refused -- and where the one flag
+    // that does belong here has to be accepted. `AT_SYMLINK_NOFOLLOW` on a
+    // file that is not a symlink changes nothing about the answer, which is
+    // the point: it must not be mistaken for a flag to refuse.
+    let proc = a_process(49_353, "utimensat-flags", "named");
+    let lp = proc.linux();
+    a_file_named(lp, "/named", "flagged", 0, 0o644);
+    let (refused, accepted) = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let times = [ts(AN_OLD_SECOND, 0), ts(A_DIFFERENT_OLD_SECOND, 0)];
+            let path = c("/named/flagged");
+            let refused = utimensat(
+                sys,
+                AT_CWD,
+                path.as_ptr() as usize,
+                &times,
+                A_FLAG_THAT_IS_NOT_OURS,
+            );
+            let accepted = utimensat(sys, AT_CWD, path.as_ptr() as usize, &times, 0x100);
+            (refused, accepted)
+        })
+    });
+    assert_eq!(
+        refused,
+        Err(LxError::EINVAL),
+        "a flag from another syscall was accepted"
+    );
+    assert_eq!(accepted, Ok(0), "AT_SYMLINK_NOFOLLOW was refused");
+    assert_eq!(
+        times_of(proc.linux(), "/named", "flagged"),
+        (AN_OLD_SECOND as i64, A_DIFFERENT_OLD_SECOND as i64),
+        "the accepted call did not reach the file"
+    );
+}

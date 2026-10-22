@@ -1320,3 +1320,606 @@ mod e1000_desc_layout_tests {
         assert_eq!(offset_of!(E1000RecvDesc, special), 14);
     }
 }
+
+/// The driver over a register window in ordinary memory.
+///
+/// `ring_tests` and `e1000_desc_layout_tests` above cover the pure helpers --
+/// `next_desc`, `rx_len_clamped`, `tx_frame_postable`, `tx_ring_has_room`,
+/// `tx_stage` -- and the descriptor layout, and they are good tests. What
+/// nothing covered is **the bodies that use them**: `E1000::new`, `receive`,
+/// `send`, `can_send` and `handle_interrupt` were at zero lines, 568 of the
+/// file's 590 lines of production. So the ring guard that keeps TX from going
+/// dead until reboot was decided by a tested helper and **asked for by
+/// nothing**, and the bring-up sequence -- the MAC split across two registers,
+/// the ring addresses split into halves, the words that enable transmit and
+/// receive -- had no test at all.
+///
+/// The seam is that the driver reaches its registers through `mmio_read` and
+/// `mmio_write`, which are `read_volatile`/`write_volatile` at
+/// `base + reg * 4` and nothing else: **a leaked window of zeroes IS the
+/// card** as far as they can tell, the same bench the UART and the PL011 use.
+/// The rings are real `DmaRegion`s, which the host shim serves.
+///
+/// What this bench cannot show: a register the driver only READS (the window
+/// does not count reads, and a real card self-clears its reset bit where the
+/// window keeps it), and the interior of the link-status branch, which only
+/// logs.
+#[cfg(test)]
+mod card_tests {
+    use super::*;
+    use crate::utils::host_hooks::alone_with_the_allocator;
+
+    /// One register past the highest index the driver touches.
+    const REGISTERS: usize = E1000_RAH + 1;
+
+    // The bits, by the name the 82540 manual gives them.
+    const RST: u32 = 1 << 26;
+    const SLU: u32 = 1 << 6;
+    const ASDE: u32 = 1 << 5;
+    const FD: u32 = 1 << 0;
+    const AV: u32 = 1 << 31;
+    const RXT0: u32 = 1 << 7;
+    const LSC: u32 = 1 << 2;
+    /// Descriptor Done, the ownership bit both rings are gated on.
+    const DD: u8 = 1;
+    /// A MAC with all six bytes different, so an endianness mistake shows.
+    const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+
+    /// The address of a leaked register window, which is all `mmio_read` and
+    /// `mmio_write` ever ask of a card. Only the address comes back, so
+    /// nothing here holds a reference to it.
+    fn a_window() -> usize {
+        let window: &'static mut [u32] = alloc::vec![0u32; REGISTERS].leak();
+        window.as_mut_ptr() as usize
+    }
+
+    fn reg(base: usize, at: usize) -> u32 {
+        // SAFETY: `base` came from `a_window`, which leaked REGISTERS words.
+        unsafe { core::ptr::read_volatile((base + at * 4) as *const u32) }
+    }
+
+    fn set_reg(base: usize, at: usize, value: u32) {
+        // SAFETY: as `reg`.
+        unsafe { core::ptr::write_volatile((base + at * 4) as *mut u32, value) }
+    }
+
+    /// The virtual clock has to move on its own. `E1000::new` waits ten
+    /// milliseconds for the reset to settle, and with the clock standing at
+    /// zero that wait runs to its ten-million-spin cap every time instead.
+    fn a_moving_clock() {
+        crate::nvme::nvme_queue::test_clock::set_auto_advance(1_000);
+    }
+
+    fn a_card(base: usize) -> E1000 {
+        a_moving_clock();
+        E1000::new(base, REGISTERS * 4, EthernetAddress(MAC)).expect("the shim serves the rings")
+    }
+
+    fn rx_desc(nic: &E1000, at: usize) -> E1000RecvDesc {
+        // SAFETY: the ring holds NUM_DESC descriptors and `at` is below it.
+        unsafe { core::ptr::read_volatile(nic.rx_ring.as_ptr::<E1000RecvDesc>().add(at)) }
+    }
+
+    fn tx_desc(nic: &E1000, at: usize) -> E1000SendDesc {
+        // SAFETY: as `rx_desc`.
+        unsafe { core::ptr::read_volatile(nic.tx_ring.as_ptr::<E1000SendDesc>().add(at)) }
+    }
+
+    /// What the card does when it has filled a receive descriptor: the bytes
+    /// in the buffer, the length and the done bit in the descriptor.
+    fn the_card_delivers(nic: &E1000, at: usize, frame: &[u8], reports: u16) {
+        let into = nic.rx_bufs[at].vaddr() as *mut u8;
+        // SAFETY: the buffer is RX_BUF_SIZE bytes and `frame` is shorter.
+        unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), into, frame.len()) };
+        let mut desc = rx_desc(nic, at);
+        desc.len = reports;
+        desc.status = DD;
+        // SAFETY: as `rx_desc`.
+        unsafe { core::ptr::write_volatile(nic.rx_ring.as_ptr::<E1000RecvDesc>().add(at), desc) };
+    }
+
+    /// Hand a transmit descriptor back to the card, or take it back.
+    fn the_card_owns_transmit_slot(nic: &E1000, at: usize, owns: bool) {
+        let mut desc = tx_desc(nic, at);
+        desc.status = if owns { 0 } else { DD };
+        // SAFETY: as `tx_desc`.
+        unsafe { core::ptr::write_volatile(nic.tx_ring.as_ptr::<E1000SendDesc>().add(at), desc) };
+    }
+
+    // --- bringing the card up ---------------------------------------------
+
+    /// The MAC goes out as two words, low four bytes then high two, each
+    /// little-endian. Get the order wrong and the card filters on an address
+    /// that is not ours: every unicast frame is dropped by the hardware, and
+    /// the only symptom is a link that is up and a stack that hears nothing.
+    #[test]
+    fn the_mac_goes_out_little_endian_in_two_registers_with_the_valid_bit() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let _nic = a_card(base);
+            assert_eq!(
+                reg(base, E1000_RAL),
+                0x1200_5452,
+                "RAL must be bytes 0..4 of the MAC, least significant first"
+            );
+            assert_eq!(
+                reg(base, E1000_RAH) & !AV,
+                0x0000_5634,
+                "RAH must be bytes 4..6 of the MAC, least significant first"
+            );
+            assert_ne!(
+                reg(base, E1000_RAH) & AV,
+                0,
+                "without AV the card ignores the address it was just given"
+            );
+        });
+    }
+
+    /// The reset is asked for, and the link bits are set AFTER it: a card still
+    /// in reset forgets whatever it was told. The window does not self-clear
+    /// RST the way a card does, so finding all four bits set is what says the
+    /// link word was written on top of the reset word and not before it.
+    #[test]
+    fn the_reset_is_asked_for_and_the_link_is_brought_up_on_top_of_it() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let _nic = a_card(base);
+            let ctrl = reg(base, E1000_CTRL);
+            assert_ne!(ctrl & RST, 0, "the card was never reset");
+            assert_ne!(
+                ctrl & SLU,
+                0,
+                "Set Link Up is clear, so the link stays down"
+            );
+            assert_ne!(ctrl & ASDE, 0, "Auto-Speed Detection is clear");
+            assert_ne!(ctrl & FD, 0, "Full Duplex is clear");
+        });
+    }
+
+    /// Interrupts are masked before anything else is touched, and the two the
+    /// driver actually handles are armed at the end. Arming more than those
+    /// two wakes the handler for causes it does not clear, which on a shared
+    /// line is an interrupt storm.
+    #[test]
+    fn interrupts_are_masked_first_and_only_the_two_wanted_are_armed() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let _nic = a_card(base);
+            assert_eq!(
+                reg(base, E1000_IMC),
+                0xffff_ffff,
+                "the mask-clear register must have been written with every cause"
+            );
+            assert_eq!(
+                reg(base, E1000_IMS),
+                RXT0 | LSC,
+                "only receive-timer and link-status-change may be armed"
+            );
+        });
+    }
+
+    /// Each ring is handed over as a physical address split into halves, plus
+    /// its length in BYTES. A high half dropped works on any machine whose DMA
+    /// memory happens to sit below 4 GiB and fails on the one that does not.
+    #[test]
+    fn each_ring_is_handed_over_as_a_split_physical_address_and_a_byte_length() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let nic = a_card(base);
+            let tx = nic.tx_ring.paddr() as u64;
+            let rx = nic.rx_ring.paddr() as u64;
+            assert_eq!(reg(base, E1000_TDBAL), tx as u32, "TDBAL");
+            assert_eq!(reg(base, E1000_TDBAH), (tx >> 32) as u32, "TDBAH");
+            assert_eq!(reg(base, E1000_RDBAL), rx as u32, "RDBAL");
+            assert_eq!(reg(base, E1000_RDBAH), (rx >> 32) as u32, "RDBAH");
+            assert_eq!(reg(base, E1000_TDLEN), 4096, "TDLEN is a byte count");
+            assert_eq!(reg(base, E1000_RDLEN), 4096, "RDLEN is a byte count");
+            assert_ne!(tx, rx, "the two rings cannot be the same memory");
+        });
+    }
+
+    /// The two rings start in OPPOSITE states, and both are right. Transmit is
+    /// empty, so head and tail agree. Receive is full: the tail is the last
+    /// descriptor the card may fill, so `NUM_DESC - 1` hands it every
+    /// descriptor but one -- a tail equal to the head would mean an empty ring
+    /// and the card would never receive anything.
+    #[test]
+    fn the_transmit_ring_starts_empty_and_the_receive_ring_starts_handed_over() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let _nic = a_card(base);
+            assert_eq!(reg(base, E1000_TDH), 0, "TDH");
+            assert_eq!(reg(base, E1000_TDT), 0, "TDT: an empty transmit ring");
+            assert_eq!(reg(base, E1000_RDH), 0, "RDH");
+            assert_eq!(
+                reg(base, E1000_RDT),
+                (NUM_DESC - 1) as u32,
+                "RDT: the card must own every receive descriptor but one"
+            );
+        });
+    }
+
+    /// The transmit control word, field by field. `EN` off sends nothing;
+    /// `PSP` off puts a runt on the wire that the peer discards; and the two
+    /// timings are what a half-duplex segment needs to back off correctly.
+    #[test]
+    fn the_transmit_control_word_enables_transmit_and_pads_short_frames() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let _nic = a_card(base);
+            let tctl = reg(base, E1000_TCTL);
+            assert_ne!(tctl & (1 << 1), 0, "TCTL: EN is clear, nothing is sent");
+            assert_ne!(tctl & (1 << 3), 0, "TCTL: PSP is clear, runts go out short");
+            assert_eq!((tctl >> 4) & 0x3FF, 0x10, "TCTL: CT is not the 802.3 16");
+            assert_eq!(
+                (tctl >> 12) & 0x3FF,
+                0x40,
+                "TCTL: COLD is not 64 byte times"
+            );
+            let tipg = reg(base, E1000_TIPG);
+            assert_eq!(tipg & 0x3FF, 0xa, "TIPG: IPGT");
+            assert_eq!((tipg >> 10) & 0x3FF, 0x8, "TIPG: IPGR1");
+            assert_eq!((tipg >> 20) & 0x3FF, 0xc, "TIPG: IPGR2");
+        });
+    }
+
+    /// The receive control word, the same way. The two promiscuous bits are
+    /// deliberate and the comment in `new` says why: a DHCP OFFER unicast to
+    /// our MAC gets its destination rewritten by some bridges, and without
+    /// them the frame never leaves the card. `SECRC` strips the CRC, which the
+    /// stack above does not expect to see.
+    #[test]
+    fn the_receive_control_word_enables_receive_and_keeps_the_promiscuous_bits() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let _nic = a_card(base);
+            let rctl = reg(base, E1000_RCTL);
+            assert_ne!(rctl & (1 << 1), 0, "RCTL: EN is clear, nothing is received");
+            assert_ne!(rctl & (1 << 3), 0, "RCTL: UPE, unicast promiscuous");
+            assert_ne!(rctl & (1 << 4), 0, "RCTL: MPE, multicast promiscuous");
+            assert_ne!(rctl & (1 << 15), 0, "RCTL: BAM, accept broadcast");
+            assert_ne!(rctl & (1 << 26), 0, "RCTL: SECRC, strip the ethernet CRC");
+            assert_eq!(
+                (rctl >> 16) & 0x3,
+                0,
+                "RCTL: BSIZE must stay 0, which with BSEX clear is 2048 bytes"
+            );
+        });
+    }
+
+    /// The multicast table is cleared, and the loop that clears it stops
+    /// BEFORE the address registers -- which were written just above it. An
+    /// inclusive end zeroes the MAC the driver had already programmed, and the
+    /// card then filters on nothing.
+    #[test]
+    fn the_multicast_table_is_cleared_without_running_into_the_address_registers() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            for at in E1000_MTA..REGISTERS {
+                set_reg(base, at, 0xffff_ffff);
+            }
+            let _nic = a_card(base);
+            for at in E1000_MTA..E1000_RAL {
+                assert_eq!(
+                    reg(base, at),
+                    0,
+                    "the multicast entry at {} was left set",
+                    at
+                );
+            }
+            assert_eq!(
+                reg(base, E1000_RAL),
+                0x1200_5452,
+                "the clearing loop ran over the address register"
+            );
+        });
+    }
+
+    /// Every receive descriptor points at ITS OWN buffer and starts not-done.
+    /// One index off and two descriptors share a buffer: the second frame
+    /// overwrites the first while the stack is still reading it.
+    #[test]
+    fn every_receive_descriptor_points_at_its_own_buffer() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let nic = a_card(base);
+            for at in 0..NUM_DESC {
+                let desc = rx_desc(&nic, at);
+                assert_eq!(
+                    desc.addr,
+                    nic.rx_bufs[at].paddr() as u64,
+                    "receive descriptor {} does not point at its own buffer",
+                    at
+                );
+                assert_eq!(desc.status, 0, "descriptor {} starts done", at);
+                assert_eq!(desc.len, 0, "descriptor {} starts with a length", at);
+            }
+        });
+    }
+
+    /// Every transmit descriptor starts marked DONE, which is what lets the
+    /// very first frame be posted against the real ownership bit. Starting
+    /// them clear forced a `first_trans` flag that skipped the ownership check
+    /// for the whole first lap of the ring, and that check is the only thing
+    /// standing between a frame and a descriptor the card is still reading.
+    #[test]
+    fn every_transmit_descriptor_starts_marked_done_so_the_first_frame_can_go() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let nic = a_card(base);
+            for at in 0..NUM_DESC {
+                let desc = tx_desc(&nic, at);
+                assert_eq!(
+                    desc.addr,
+                    nic.tx_bufs[at].paddr() as u64,
+                    "transmit descriptor {} does not point at its own buffer",
+                    at
+                );
+                assert_ne!(
+                    desc.status & DD,
+                    0,
+                    "transmit descriptor {} starts owned by the card",
+                    at
+                );
+                assert_eq!(desc.cmd, 0, "descriptor {} starts with a command", at);
+            }
+            assert!(nic.can_send(), "a card that has just come up cannot send");
+        });
+    }
+
+    // --- the interrupt ----------------------------------------------------
+
+    /// An interrupt with no cause is NOT claimed. The line is shared, so
+    /// claiming it means the device that really raised it never gets its
+    /// handler called.
+    #[test]
+    fn an_interrupt_with_no_cause_is_not_claimed() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut nic = a_card(base);
+            set_reg(base, E1000_ICR, 0);
+            assert!(!nic.handle_interrupt());
+        });
+    }
+
+    /// And one with any cause is claimed, link-status change included.
+    #[test]
+    fn an_interrupt_with_a_cause_is_claimed_whichever_cause_it_is() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut nic = a_card(base);
+            for cause in [LSC, RXT0, LSC | RXT0, 1 << 31] {
+                set_reg(base, E1000_ICR, cause);
+                set_reg(base, E1000_STATUS, 1 << 1);
+                assert!(nic.handle_interrupt(), "cause {:#x} was not claimed", cause);
+            }
+        });
+    }
+
+    // --- receiving --------------------------------------------------------
+
+    /// Nothing is received until the card marks the descriptor done, and the
+    /// tail is NOT moved: handing a descriptor back that the card never filled
+    /// loses the frame it is about to put there.
+    #[test]
+    fn nothing_is_received_until_the_card_marks_the_descriptor_done() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut nic = a_card(base);
+            assert!(nic.receive().is_none());
+            assert_eq!(
+                reg(base, E1000_RDT),
+                (NUM_DESC - 1) as u32,
+                "the tail moved for a descriptor the card had not filled"
+            );
+            assert_eq!(
+                nic.rx_next_to_clean, 0,
+                "the ring advanced over a live slot"
+            );
+        });
+    }
+
+    /// A delivered frame comes back byte for byte, and the descriptor goes
+    /// straight back to the card: status and errors cleared, and the tail
+    /// written with the slot just freed. A tail that is never written starves
+    /// the card of descriptors one frame at a time until it drops everything.
+    #[test]
+    fn a_received_frame_comes_back_and_its_descriptor_goes_back_to_the_card() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut nic = a_card(base);
+            let frame = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
+            the_card_delivers(&nic, 0, &frame, frame.len() as u16);
+            assert_eq!(
+                nic.receive().expect("a frame was waiting").as_slice(),
+                &frame[..],
+                "the frame did not come back as the card left it"
+            );
+            let desc = rx_desc(&nic, 0);
+            assert_eq!(desc.status, 0, "the descriptor was not handed back");
+            assert_eq!(desc.errors, 0, "the error byte was left set");
+            assert_eq!(
+                reg(base, E1000_RDT),
+                0,
+                "the tail was not given the free slot"
+            );
+            assert_eq!(nic.rx_next_to_clean, 1, "the ring did not advance");
+        });
+    }
+
+    /// The length is the CARD's word, so it is not ours to trust: a length past
+    /// the one-page buffer would have us hand the stack a slice over memory the
+    /// descriptor never owned. The helper that clamps it is tested; that the
+    /// body USES it is what this asks.
+    #[test]
+    fn a_length_the_card_reports_past_the_buffer_is_clamped_to_it() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut nic = a_card(base);
+            the_card_delivers(&nic, 0, &[0xa5], u16::MAX);
+            let frame = nic.receive().expect("a frame was waiting");
+            assert_eq!(
+                frame.len(),
+                RX_BUF_SIZE,
+                "a frame longer than the buffer it came in"
+            );
+            assert_eq!(frame[0], 0xa5, "and it still starts where the buffer does");
+        });
+    }
+
+    /// The ring wraps instead of running off the end. Without the wrap the
+    /// next read is one descriptor past the ring, which is whatever the
+    /// allocator put there.
+    #[test]
+    fn the_receive_ring_wraps_at_the_end_instead_of_running_off_it() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut nic = a_card(base);
+            nic.rx_next_to_clean = NUM_DESC - 1;
+            the_card_delivers(&nic, NUM_DESC - 1, &[0x7f], 1);
+            // So that finding the last slot in the tail says it was written.
+            set_reg(base, E1000_RDT, 0);
+            assert_eq!(
+                nic.receive().expect("a frame was waiting").as_slice(),
+                &[0x7f][..]
+            );
+            assert_eq!(nic.rx_next_to_clean, 0, "the ring did not wrap");
+            assert_eq!(
+                reg(base, E1000_RDT),
+                (NUM_DESC - 1) as u32,
+                "the freed slot is the last one"
+            );
+        });
+    }
+
+    // --- sending ----------------------------------------------------------
+
+    /// A posted frame lands in the slot's own buffer with the three command
+    /// bits the card needs, its status cleared so DD means something, and the
+    /// tail moved on. The tail write is the doorbell: without it the frame
+    /// sits in the ring and the card never looks.
+    #[test]
+    fn a_posted_frame_lands_in_its_buffer_with_the_command_bits_and_rings_the_bell() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut nic = a_card(base);
+            let frame = [0x11u8; 60];
+            assert!(nic.send(&frame), "a card that just came up refused a frame");
+            let desc = tx_desc(&nic, 0);
+            assert_eq!(desc.len, 60, "the descriptor does not carry the length");
+            assert_ne!(desc.cmd & (1 << 0), 0, "EOP is clear: the frame never ends");
+            assert_ne!(desc.cmd & (1 << 1), 0, "IFCS is clear: no CRC is appended");
+            assert_ne!(desc.cmd & (1 << 3), 0, "RS is clear: DD never comes back");
+            assert_eq!(desc.status & DD, 0, "the done bit was left set");
+            // SAFETY: the buffer is RX_BUF_SIZE bytes and 60 is less.
+            let sent =
+                unsafe { core::slice::from_raw_parts(nic.tx_bufs[0].vaddr() as *const u8, 60) };
+            assert_eq!(sent, &frame[..], "the bytes did not reach the buffer");
+            assert_eq!(nic.tx_next_to_use, 1, "the ring did not advance");
+            assert_eq!(reg(base, E1000_TDT), 1, "the doorbell was not rung");
+        });
+    }
+
+    /// A frame longer than a buffer is REFUSED, not clipped. Clipping put a
+    /// corrupt half-length packet on the wire while the caller was told the
+    /// whole length had been written, so it looked like data loss at the peer
+    /// rather than an error here.
+    #[test]
+    fn a_frame_longer_than_a_buffer_is_refused_instead_of_clipped() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut nic = a_card(base);
+            assert!(!nic.send(&[0x22u8; RX_BUF_SIZE + 1]), "it was accepted");
+            assert_eq!(tx_desc(&nic, 0).len, 0, "a descriptor was written anyway");
+            assert_eq!(reg(base, E1000_TDT), 0, "the doorbell was rung anyway");
+            assert_eq!(nic.tx_next_to_use, 0, "the ring advanced anyway");
+        });
+    }
+
+    /// And so is an empty one: a zero-length descriptor is not a frame, and
+    /// the card's behaviour on one is not defined.
+    #[test]
+    fn an_empty_frame_is_refused() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut nic = a_card(base);
+            assert!(!nic.send(&[]), "an empty frame was accepted");
+            assert_eq!(reg(base, E1000_TDT), 0, "the doorbell was rung anyway");
+        });
+    }
+
+    /// The tail slot has to be free, and so does THE ONE AFTER IT. That second
+    /// slot is the guard the hardware needs: the card works descriptors from
+    /// head up to -- but excluding -- tail, so a tail that catches up with the
+    /// head reads as an EMPTY ring. Post all 256 and the posted frames are
+    /// never fetched, their done bits never come back, and every later send
+    /// fails forever. Transmit is dead until reboot, with nothing to notice.
+    #[test]
+    fn a_frame_is_refused_when_the_guard_slot_after_the_tail_is_still_the_cards() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut nic = a_card(base);
+            the_card_owns_transmit_slot(&nic, 1, true);
+            assert!(!nic.can_send(), "the guard slot was not looked at");
+            assert!(
+                !nic.send(&[0x33u8; 60]),
+                "a frame went out over the guard slot"
+            );
+            assert_eq!(reg(base, E1000_TDT), 0, "the doorbell was rung anyway");
+            assert_eq!(tx_desc(&nic, 0).len, 0, "the descriptor was written anyway");
+        });
+    }
+
+    /// And the tail slot itself, which is the obvious half: a descriptor the
+    /// card still owns is one it may be DMA-reading right now.
+    #[test]
+    fn a_frame_is_refused_when_the_tail_slot_itself_is_still_the_cards() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut nic = a_card(base);
+            the_card_owns_transmit_slot(&nic, 0, true);
+            assert!(!nic.can_send(), "the tail slot was not looked at");
+            assert!(
+                !nic.send(&[0x44u8; 60]),
+                "a frame overwrote a live descriptor"
+            );
+            assert_eq!(reg(base, E1000_TDT), 0, "the doorbell was rung anyway");
+        });
+    }
+
+    /// The transmit ring wraps too, and the doorbell carries the WRAPPED tail:
+    /// a tail of 256 is outside a 256-descriptor ring, and the card would
+    /// reject it or fetch past the end.
+    #[test]
+    fn the_transmit_ring_wraps_and_the_doorbell_carries_the_wrapped_tail() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let mut nic = a_card(base);
+            // One ordinary frame first, so the tail is NOT already zero when
+            // the wrapping one is posted.
+            assert!(nic.send(&[0x55u8; 60]), "the first frame was refused");
+            assert_eq!(reg(base, E1000_TDT), 1, "the tail did not move");
+            // Slot 0 is the GUARD slot for a tail at the end of the ring, and
+            // the frame just posted left it owned by the card: until the card
+            // reports it done, the ring cannot wrap. That is the guard doing
+            // its job, so the card finishes it here.
+            the_card_owns_transmit_slot(&nic, 0, false);
+            nic.tx_next_to_use = NUM_DESC - 1;
+            assert!(
+                nic.send(&[0x66u8; 60]),
+                "the last slot of the ring was refused"
+            );
+            assert_eq!(nic.tx_next_to_use, 0, "the ring did not wrap");
+            assert_eq!(
+                reg(base, E1000_TDT),
+                0,
+                "the doorbell carries an index off the ring"
+            );
+            assert_eq!(
+                tx_desc(&nic, NUM_DESC - 1).len,
+                60,
+                "the frame went to another slot"
+            );
+        });
+    }
+}

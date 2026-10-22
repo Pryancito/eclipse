@@ -3953,3 +3953,13 @@ mod fcntl_families_tests;
 
 #[cfg(test)]
 mod read_write_refusal_tests;
+
+/// The syscall halves of the two pipe-write rules `pipe_write_tests` decides
+/// with pure helpers: the wait for room and the signal behind the `EPIPE`.
+#[cfg(test)]
+mod pipe_write_wiring_tests;
+
+/// What the positional calls answer when the file takes less than it was
+/// given, which nothing already in this tree does.
+#[cfg(test)]
+mod short_write_tests;
