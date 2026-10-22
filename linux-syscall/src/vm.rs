@@ -3929,3 +3929,8 @@ mod brk_wiring_tests;
 /// answers before a single mapping is consulted.
 #[cfg(test)]
 mod mprotect_mremap_tests;
+
+/// What `mmap` of a file hands back -- one object per inode for `MAP_SHARED`
+/// -- and the three refusals of `sys_mmap` that had never been asked for.
+#[cfg(test)]
+mod mmap_file_tests;
