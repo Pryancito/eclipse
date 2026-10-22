@@ -68,6 +68,36 @@ enum CqWait {
     Fatal,
 }
 
+#[cfg(test)]
+mod nvme_fake;
+
+/// El arranque del controlador: el reset, la cola de administracion, lo que
+/// dice el Identify y las colas de entrada y salida.
+#[cfg(test)]
+mod bringup_tests;
+
+/// Escribe un registro de 32 bits de la ventana del controlador.
+///
+/// Lo unico que una ventana de registros en memoria no puede dar es la
+/// REACCION a la escritura, y aqui esa reaccion es todo: CC.EN es lo que
+/// levanta CSTS.RDY, y el timbre de la cola es lo que hace que el controlador
+/// lea el comando y conteste. Esa es la costura `cfg(test)`, la misma que
+/// tienen el xHCI y el e1000e.
+#[inline]
+fn reg_write32(bar: usize, off: usize, v: u32) {
+    unsafe { write_volatile((bar + off) as *mut u32, v) };
+    #[cfg(test)]
+    nvme_fake::on_write(bar, off, v as u64);
+}
+
+/// [`reg_write32`] para los registros de 64 bits (ASQ y ACQ).
+#[inline]
+fn reg_write64(bar: usize, off: usize, v: u64) {
+    unsafe { write_volatile((bar + off) as *mut u64, v) };
+    #[cfg(test)]
+    nvme_fake::on_write(bar, off, v);
+}
+
 impl NvmeInterface {
     const ADMIN_TIMEOUT_US: u64 = 5_000_000;
     const IO_TIMEOUT_US: u64 = 5_000_000;
@@ -188,7 +218,7 @@ impl NvmeInterface {
                     queue.cq_head = 0;
                     queue.cq_phase ^= 1;
                 }
-                unsafe { write_volatile(cq_db as *mut u32, queue.cq_head as u32) }
+                reg_write32(bar, cq_db - bar, queue.cq_head as u32);
 
                 if entry.command_id != cid {
                     // A completion for a *different* CID than the one we're
@@ -295,7 +325,7 @@ impl NvmeInterface {
         // Make the SQ entry visible to the device before ringing the doorbell.
         clflush_range(&queue.sq[tail] as *const _ as usize, 64);
         fence(Ordering::SeqCst);
-        unsafe { write_volatile(sq_db as *mut u32, queue.sq_tail as u32) }
+        reg_write32(bar, sq_db - bar, queue.sq_tail as u32);
 
         let outcome = match Self::wait_cq(bar, cq_db, queue, cid, timeout_us, context) {
             CqWait::Done(result) => return Ok(result),
@@ -340,7 +370,7 @@ impl NvmeInterface {
         warn!("[nvme] Resetting controller...");
         unsafe {
             let cc = read_volatile((bar + NVME_REG_CC) as *const u32);
-            write_volatile((bar + NVME_REG_CC) as *mut u32, cc & !NVME_CC_ENABLE);
+            reg_write32(bar, NVME_REG_CC, cc & !NVME_CC_ENABLE);
         }
 
         // Wait for CSTS.RDY to become 0
@@ -361,11 +391,9 @@ impl NvmeInterface {
         let aqa_entries = (admin_queue.sq.len() - 1) as u32;
         let aqa = (aqa_entries << 16) | aqa_entries;
 
-        unsafe {
-            write_volatile((bar + NVME_REG_AQA) as *mut u32, aqa);
-            write_volatile((bar + NVME_REG_ASQ) as *mut u64, admin_queue.sq_pa as u64);
-            write_volatile((bar + NVME_REG_ACQ) as *mut u64, admin_queue.cq_pa as u64);
-        }
+        reg_write32(bar, NVME_REG_AQA, aqa);
+        reg_write64(bar, NVME_REG_ASQ, admin_queue.sq_pa as u64);
+        reg_write64(bar, NVME_REG_ACQ, admin_queue.cq_pa as u64);
 
         // enable ctrl
         let mut ctrl_config = NVME_CC_ENABLE | NVME_CC_CSS_NVM;
@@ -373,7 +401,7 @@ impl NvmeInterface {
         ctrl_config |= NVME_CC_ARB_RR | NVME_CC_SHN_NONE;
         ctrl_config |= NVME_CC_IOSQES | NVME_CC_IOCQES;
 
-        unsafe { write_volatile((bar + NVME_REG_CC) as *mut u32, ctrl_config) }
+        reg_write32(bar, NVME_REG_CC, ctrl_config);
 
         // Wait for CSTS.RDY to become 1
         let start = timer_now_as_micros();
@@ -395,7 +423,7 @@ impl NvmeInterface {
         warn!("[nvme] Controller ready!");
 
         // We poll for completions; mask all controller interrupts.
-        unsafe { write_volatile((bar + NVME_REG_INTMS) as *mut u32, 0xffff_ffff) }
+        reg_write32(bar, NVME_REG_INTMS, 0xffff_ffff);
 
         let data_va = admin_queue.data_va;
         let data_pa = admin_queue.data_pa;
@@ -934,8 +962,9 @@ impl BlockScheme for NvmeInterface {
         let _ = self.flush();
         unsafe {
             let cc = read_volatile((self.bar + NVME_REG_CC) as *const u32);
-            write_volatile(
-                (self.bar + NVME_REG_CC) as *mut u32,
+            reg_write32(
+                self.bar,
+                NVME_REG_CC,
                 (cc & !(3 << 14)) | NVME_CC_SHN_NORMAL,
             );
         }
