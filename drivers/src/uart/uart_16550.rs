@@ -929,3 +929,423 @@ mod tests {
         );
     }
 }
+
+/// The MMIO driver and the two crash-path writes, over a register block in
+/// ordinary memory.
+///
+/// `mod tests` above drives `Uart16550Inner` through a fake `Io`, which is the
+/// whole driver for a port that answers. It cannot reach either of the two
+/// halves below.
+///
+/// `raw_send` and `raw_write_str` have **no `Io`**: the reason they exist is
+/// that the path they serve may not build a second reference to the register
+/// block, so they compute `base + n * size_of::<V>()` and go through raw
+/// pointers. Two tests up there check the constants they use -- by recomputing
+/// the offsets from the struct and comparing -- and neither one calls either
+/// function. A `raw_send` that polled the right register and then put the byte
+/// in the wrong one, or never wrote it at all, or never looked at the status
+/// bit, passes both: the last write the kernel makes once it has started to
+/// panic was held in place by arithmetic nothing ran.
+///
+/// And `Uart16550Mmio` itself -- the type the device tree builds, with the
+/// lock, the name the console registry matches on, and the interrupt that
+/// wakes a reader -- was never constructed by anything in the suite.
+///
+/// Volatile reads and writes at `base + offset` are all either half does, so a
+/// leaked block of zeroes IS a 16550 as far as they can tell: the same bench
+/// the PL011 driver next door uses.
+#[cfg(test)]
+mod mmio_tests {
+    use super::*;
+    use crate::scheme::EventScheme;
+    use alloc::{boxed::Box, sync::Arc, vec::Vec};
+    use core::cell::RefCell;
+    use core::convert::TryFrom;
+    use core::sync::atomic::AtomicBool;
+
+    /// A line status with room in the transmit holding register.
+    const READY: u8 = 1 << 5;
+    /// ...and with a byte waiting to be read.
+    const HAS_INPUT: u8 = 1;
+
+    /// The seven registers of the 16550 map, by index. Register *n* sits at
+    /// `base + n * size_of::<V>()`, which is the arithmetic under test.
+    const DATA: usize = 0;
+    const INT_EN: usize = 1;
+    const FIFO_CTRL: usize = 2;
+    const LINE_CTRL: usize = 3;
+    const MODEM_CTRL: usize = 4;
+    const LINE_STS: usize = 5;
+    const MODEM_STS: usize = 6;
+    /// How many of them there are.
+    const REGISTERS: usize = 7;
+
+    /// The address of a leaked block of seven units of `V`, which is all
+    /// `raw_send`, `raw_write_str` and `Mmio::from_base_as` ever ask of a
+    /// 16550.
+    ///
+    /// Leaked, and only the address comes back, so nothing in the test holds a
+    /// reference to memory the driver builds its own `&mut` over; every look
+    /// afterwards goes through a raw pointer, which is what the driver's own
+    /// crash path does and for the same reason.
+    fn a_block<V: Copy + 'static>(zero: V) -> usize {
+        let block: &'static mut [V; REGISTERS] = Box::leak(Box::new([zero; REGISTERS]));
+        block.as_mut_ptr() as usize
+    }
+
+    /// What register `n` of the block at `base` holds now.
+    fn reg<V: Copy>(base: usize, n: usize) -> V {
+        // SAFETY: `base` came from `a_block`, which leaked REGISTERS units.
+        unsafe { core::ptr::read_volatile((base + n * core::mem::size_of::<V>()) as *const V) }
+    }
+
+    /// Put `value` in register `n`, the way the port itself would.
+    fn set_reg<V: Copy>(base: usize, n: usize, value: V) {
+        // SAFETY: as `reg`.
+        unsafe {
+            core::ptr::write_volatile((base + n * core::mem::size_of::<V>()) as *mut V, value)
+        }
+    }
+
+    std::thread_local! {
+        /// Every byte the raw path handed to a register of THIS test's block,
+        /// in order. Thread-local because the harness runs tests in parallel
+        /// and a process-global list could not say which test wrote which
+        /// byte.
+        static HANDED_OVER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A register value type that records what was put in it.
+    ///
+    /// The raw path takes no `Io` -- that is the point of it -- so there is no
+    /// trait object to put in front of the registers, and a block of plain
+    /// memory keeps only the last byte written to the data register. What the
+    /// raw path does take is the bus width as a type parameter, and
+    /// `V::from(u8)` is called once per byte written and once per poll of the
+    /// status register, so the type itself is the seam: the order it records is
+    /// the order the bytes went out.
+    ///
+    /// One byte wide, like a 16550 register, so the block is laid out exactly
+    /// as an 8-bit port's.
+    #[repr(transparent)]
+    #[derive(Copy, Clone)]
+    struct Recorded(u8);
+
+    impl From<u8> for Recorded {
+        fn from(byte: u8) -> Self {
+            HANDED_OVER.with(|log| log.borrow_mut().push(byte));
+            Self(byte)
+        }
+    }
+
+    impl BitAnd for Recorded {
+        type Output = Self;
+
+        fn bitand(self, other: Self) -> Self {
+            Self(self.0 & other.0)
+        }
+    }
+
+    impl TryFrom<Recorded> for u8 {
+        type Error = core::convert::Infallible;
+
+        fn try_from(value: Recorded) -> Result<Self, Self::Error> {
+            Ok(value.0)
+        }
+    }
+
+    /// The bytes handed over since the last look, and clear.
+    fn handed_over() -> Vec<u8> {
+        HANDED_OVER.with(|log| core::mem::take(&mut *log.borrow_mut()))
+    }
+
+    /// The mask `raw_send` builds to keep the low byte of a status word, which
+    /// goes through the same `V::from` hook and so shows up in the log too --
+    /// one per byte, which is what says the status was asked each time.
+    const MASK: u8 = 0xFF;
+
+    // --- the crash path ---------------------------------------------------
+
+    /// The byte has to land in register 0 and nowhere else. `raw_send` names no
+    /// field, so a wrong `*mut V` sends the console's last words to the FIFO
+    /// control register -- which on a real port clears the queue the rest of
+    /// the banner is sitting in.
+    #[test]
+    fn the_crash_path_puts_the_byte_in_the_data_register_and_touches_nothing_else() {
+        let base = a_block(0u32);
+        set_reg(base, LINE_STS, u32::from(READY));
+        // SAFETY: `base` is a live seven-register block of 32-bit units.
+        unsafe { raw_send::<u32>(base, b'x') };
+        assert_eq!(
+            reg::<u32>(base, DATA),
+            u32::from(b'x'),
+            "the byte did not reach the data register"
+        );
+        for n in [INT_EN, FIFO_CTRL, LINE_CTRL, MODEM_CTRL, MODEM_STS] {
+            assert_eq!(
+                reg::<u32>(base, n),
+                0,
+                "the crash path wrote register {}",
+                n
+            );
+        }
+        assert_eq!(
+            reg::<u32>(base, LINE_STS),
+            u32::from(READY),
+            "the status register is read-only to the driver"
+        );
+    }
+
+    /// And the register it polls has to be register 5. Either neighbour reads
+    /// ready here and register 5 does not: a `REG_LINE_STS` off by one spins
+    /// out the whole bounded wait on every byte, and the console goes quiet on
+    /// the one path whose only job is to carry the evidence.
+    #[test]
+    fn the_crash_path_polls_the_status_register_and_not_one_beside_it() {
+        let base = a_block(0u32);
+        set_reg(base, MODEM_CTRL, u32::from(READY));
+        set_reg(base, MODEM_STS, u32::from(READY));
+        // SAFETY: as above.
+        unsafe { raw_send::<u32>(base, b'x') };
+        assert_eq!(
+            reg::<u32>(base, DATA),
+            0,
+            "the byte went out on a status bit read from the wrong register"
+        );
+    }
+
+    /// A port with no cable is the NORM on the bring-up box, and this path runs
+    /// from inside the panic handler: an unbounded wait here is the machine
+    /// halting with the report half out, which is the capture the whole escape
+    /// exists for. Returning at all is the assertion; the dropped byte is the
+    /// accepted cost.
+    #[test]
+    fn a_crash_path_write_to_a_port_that_never_drains_is_dropped_and_not_a_hang() {
+        let base = a_block(0u32);
+        // SAFETY: as above.
+        unsafe { raw_send::<u32>(base, b'x') };
+        assert_eq!(
+            reg::<u32>(base, DATA),
+            0,
+            "the byte cannot reach a port that never said it had room"
+        );
+    }
+
+    /// A 32-bit-wide 16550 answers a status read in the low byte and leaves the
+    /// other three undefined, so the driver masks before it truncates to `u8`.
+    /// Without the mask the `try_into` fails, `unwrap_or(0)` reports a port
+    /// with no room, and every byte of the banner is dropped -- on a port that
+    /// was ready the whole time.
+    #[test]
+    fn the_crash_path_masks_the_status_word_a_wide_port_reads_back() {
+        let base = a_block(0u32);
+        set_reg(base, LINE_STS, 0xDEAD_0000 | u32::from(READY));
+        // SAFETY: as above.
+        unsafe { raw_send::<u32>(base, b'x') };
+        assert_eq!(
+            reg::<u32>(base, DATA),
+            u32::from(b'x'),
+            "the junk in the upper bits of the status word stopped the byte"
+        );
+    }
+
+    /// One poll per byte, and the bytes in the order they were given: a loop
+    /// that stopped after the first byte, or wrote the string backwards, leaves
+    /// the same single byte in a block of plain memory.
+    #[test]
+    fn the_crash_path_asks_the_status_once_per_byte_and_sends_them_in_order() {
+        let base = a_block(Recorded(0));
+        set_reg(base, LINE_STS, Recorded(READY));
+        let _ = handed_over();
+        // SAFETY: `base` is a live seven-register block of one-byte units.
+        unsafe { raw_write_str::<Recorded>(base, "ab") };
+        assert_eq!(
+            handed_over().as_slice(),
+            &[MASK, b'a', MASK, b'b'][..],
+            "the crash path did not ask the status once per byte"
+        );
+    }
+
+    /// The carriage return is the byte a block of memory cannot show -- it is
+    /// always overwritten by the newline that follows it -- and it is the one
+    /// that keeps a panic banner from stairstepping down the terminal. The
+    /// recording type is what makes it visible, and the translation here is a
+    /// SECOND copy of the one `write_str` does, on the path that only runs when
+    /// the first copy's lock is unavailable.
+    #[test]
+    fn the_crash_path_turns_a_newline_into_a_carriage_return_and_a_newline() {
+        let base = a_block(Recorded(0));
+        set_reg(base, LINE_STS, Recorded(READY));
+        let _ = handed_over();
+        // SAFETY: as above.
+        unsafe { raw_write_str::<Recorded>(base, "a\nb") };
+        assert_eq!(
+            handed_over().as_slice(),
+            &[MASK, b'a', MASK, b'\r', MASK, b'\n', MASK, b'b'][..],
+            "the newline did not go out as carriage return then newline"
+        );
+    }
+
+    // --- the driver the device tree builds --------------------------------
+
+    /// `new` hands the block to `init` and keeps the address, and both halves
+    /// matter: the port cannot carry a byte until it has been told to, and the
+    /// address is the only thing the crash path has to reach the registers by.
+    #[test]
+    fn building_the_driver_initialises_the_port_and_remembers_its_address() {
+        let base = a_block(0u32);
+        set_reg(base, LINE_STS, u32::from(READY));
+        // SAFETY: `base` is a live seven-register block of 32-bit units.
+        let uart = unsafe { Uart16550Mmio::<u32>::new(base) };
+        assert_eq!(
+            uart.base, base,
+            "the crash path would write to some other address"
+        );
+        assert_eq!(reg::<u32>(base, INT_EN), 0x01, "interrupts were left off");
+        assert_eq!(reg::<u32>(base, FIFO_CTRL), 0xC7, "the FIFO was left alone");
+        assert_eq!(
+            reg::<u32>(base, MODEM_CTRL),
+            0x0B,
+            "the modem lines were left alone"
+        );
+        assert_eq!(
+            reg::<u32>(base, LINE_CTRL),
+            0,
+            "the word format is the firmware's, not ours"
+        );
+        assert_eq!(
+            reg::<u32>(base, DATA),
+            0,
+            "bringing the port up must not put a byte on the wire"
+        );
+    }
+
+    /// The 8-bit map is a different instantiation reached through a constructor
+    /// of its own, and it is the one an aarch64 board opens.
+    #[test]
+    fn an_eight_bit_wide_port_is_built_through_its_own_constructor() {
+        let base = a_block(0u8);
+        set_reg(base, LINE_STS, READY);
+        // SAFETY: `base` is a live seven-register block of one-byte units.
+        let uart = unsafe { Uart16550Mmio::<u8>::new(base) };
+        assert_eq!(uart.base, base);
+        assert_eq!(reg::<u8>(base, INT_EN), 0x01, "interrupts were left off");
+        assert_eq!(reg::<u8>(base, FIFO_CTRL), 0xC7, "the FIFO was left alone");
+        assert_eq!(
+            reg::<u8>(base, MODEM_CTRL),
+            0x0B,
+            "the modem lines were left alone"
+        );
+    }
+
+    /// The string the console registry matches a device-tree node against. A
+    /// change here is a console that is built and never opened.
+    #[test]
+    fn the_driver_answers_to_the_name_the_console_registry_matches_on() {
+        let base = a_block(0u32);
+        set_reg(base, LINE_STS, u32::from(READY));
+        // SAFETY: as above.
+        let uart = unsafe { Uart16550Mmio::<u32>::new(base) };
+        assert_eq!(uart.name(), "uart16550-mmio");
+    }
+
+    /// An interrupt has to reach the listener, because that is the whole of
+    /// what the serial console does to wake a reader: a `handle_irq` that
+    /// returned without triggering leaves a `read` on the console blocked with
+    /// the byte already in the port.
+    #[test]
+    fn an_interrupt_at_the_port_reaches_a_subscribed_handler() {
+        let base = a_block(0u32);
+        set_reg(base, LINE_STS, u32::from(READY));
+        // SAFETY: as above.
+        let uart = unsafe { Uart16550Mmio::<u32>::new(base) };
+        let woken = Arc::new(AtomicBool::new(false));
+        let flag = woken.clone();
+        uart.subscribe(
+            Box::new(move |_| flag.store(true, Ordering::Relaxed)),
+            false,
+        )
+        .expect("the first subscription cannot be refused");
+        uart.handle_irq(4);
+        assert!(
+            woken.load(Ordering::Relaxed),
+            "the interrupt did not reach the listener"
+        );
+    }
+
+    /// Sending through the scheme and sending through the crash escape put the
+    /// SAME byte in the SAME register and both answer `Ok(())`: what tells them
+    /// apart is whether the lock was taken, and the only witness to that is the
+    /// counter the escape bumps. An ordinary send must not bump it.
+    ///
+    /// A global counter in a parallel suite is usually a race, and this one is
+    /// read as a delta for that reason -- but it cannot move here at all: the
+    /// escape is reached only through `held_by_current_cpu`, which is a
+    /// constant `false` on a hosted build, so nothing in this binary can bump
+    /// it. Should a seam ever make the escape reachable, this assert has to
+    /// move to a witness local to this port.
+    #[test]
+    fn a_byte_sent_through_the_scheme_goes_out_through_the_lock_and_not_the_escape() {
+        let base = a_block(0u32);
+        set_reg(base, LINE_STS, u32::from(READY));
+        // SAFETY: as above.
+        let uart = unsafe { Uart16550Mmio::<u32>::new(base) };
+        let before = reentrant_console_writes();
+        uart.send(b'Z').unwrap();
+        assert_eq!(
+            reg::<u32>(base, DATA),
+            u32::from(b'Z'),
+            "the byte did not reach the port"
+        );
+        assert_eq!(
+            reentrant_console_writes(),
+            before,
+            "an ordinary send took the crash escape"
+        );
+    }
+
+    /// The same for a whole line, which is how every log record leaves: through
+    /// the lock, and translated on the way.
+    #[test]
+    fn a_line_written_through_the_scheme_ends_with_the_newline_it_translated() {
+        let base = a_block(0u32);
+        set_reg(base, LINE_STS, u32::from(READY));
+        // SAFETY: as above.
+        let uart = unsafe { Uart16550Mmio::<u32>::new(base) };
+        let before = reentrant_console_writes();
+        uart.write_str("hi\n").unwrap();
+        assert_eq!(
+            reg::<u32>(base, DATA),
+            u32::from(b'\n'),
+            "the line did not end with the newline the driver translates to"
+        );
+        assert_eq!(
+            reentrant_console_writes(),
+            before,
+            "an ordinary line took the crash escape"
+        );
+    }
+
+    /// Receiving is the half the escape declines, so the scheme's own path is
+    /// the only one there is: with nothing waiting it answers nothing, and with
+    /// a byte waiting it answers that byte.
+    #[test]
+    fn a_byte_waiting_at_the_port_is_received_through_the_scheme() {
+        let base = a_block(0u32);
+        set_reg(base, LINE_STS, u32::from(READY));
+        // SAFETY: as above.
+        let uart = unsafe { Uart16550Mmio::<u32>::new(base) };
+        assert_eq!(
+            uart.try_recv().unwrap(),
+            None,
+            "a byte was reported with the input bit clear"
+        );
+        set_reg(base, LINE_STS, u32::from(READY | HAS_INPUT));
+        set_reg(base, DATA, u32::from(b'q'));
+        assert_eq!(
+            uart.try_recv().unwrap(),
+            Some(b'q'),
+            "the waiting byte did not come back"
+        );
+    }
+}
