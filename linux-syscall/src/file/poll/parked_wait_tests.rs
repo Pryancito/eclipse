@@ -58,6 +58,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use linux_object::fs::{File, OpenFlags, Pipe};
 use linux_object::process::LinuxProcess;
+use linux_object::thread::ThreadExt;
 use rcore_fs::vfs::INode;
 use rcore_fs_ramfs::RamFS;
 use zircon_object::task::{Process, ROOT_JOB};
@@ -190,6 +191,173 @@ async fn select_them(
         UserInOutPtr::from(read.as_mut_ptr() as usize),
         UserInOutPtr::from(write.as_mut_ptr() as usize),
         UserInOutPtr::from(except.as_mut_ptr() as usize),
+        UserInOutPtr::from(&mut timeout as *mut TimeVal as usize),
+    )
+    .await
+}
+
+/// `sizeof(sigset_t)` as this kernel and every libc agree on it.
+const SIGSETSIZE: usize = 8;
+
+/// What the helpers below send to interrupt a park, and what the masks here
+/// deliberately do NOT block.
+const A_SIGNAL: linux_object::signal::Signal = linux_object::signal::Signal::SIGUSR1;
+
+/// A signal the tests never send, used only to make an installed mask
+/// recognisable: a mask that still contains it after the call is a mask that
+/// was kept rather than restored.
+const A_SIGNAL_NOBODY_SENDS: linux_object::signal::Signal = linux_object::signal::Signal::SIGUSR2;
+
+/// A host thread that waits for `parked` and then signals the process.
+///
+/// A SIGNAL and not `Process::exit`: an exit takes the process out from under
+/// the call, and one that lands before the park is reached answers for a
+/// process that is gone instead of being interrupted. A signal cannot lose
+/// that race in either direction -- queued before the park it is answered by
+/// the check at the top of the next pass, queued after, by the wake. The
+/// budget does NOTHING if it runs out: a helper that gives up and acts anyway
+/// interrupts whatever parks next.
+fn a_signaller(pid: usize, parked: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        for _ in 0..A_WAIT_BUDGET {
+            if parked.load(Ordering::SeqCst) {
+                std::thread::sleep(A_MOMENT);
+                linux_object::process::send_signal_to_process(pid, A_SIGNAL).unwrap();
+                return;
+            }
+            std::thread::sleep(A_MOMENT);
+        }
+    })
+}
+
+/// A mask that blocks one signal: non-null, so `install_temp_sigmask` makes a
+/// guard, and recognisable afterwards.
+fn a_mask(sig: linux_object::signal::Signal) -> Sigset {
+    let mut mask = Sigset::empty();
+    mask.insert(sig);
+    mask
+}
+
+/// This thread's signal mask right now, as the guard left it.
+fn the_mask_now(sys: &Syscall<'_>) -> Sigset {
+    // The same way `install_temp_sigmask` gets at it: `Syscall::thread` is a
+    // `CurrentThread`, and the Linux signal state hangs off the `Arc<Thread>`.
+    Arc::clone(sys.thread).lock_linux().signal_mask()
+}
+
+/// `ppoll(ufds, nfds, &timeout, &sigmask, sigsetsize)` by the syscall. A
+/// `None` timeout is the null pointer that means no limit, and a `None` mask
+/// the null pointer that means "leave mine alone".
+async fn ppoll(
+    sys: &Syscall<'_>,
+    set: &mut [PollFd],
+    timeout: Option<&TimeSpec>,
+    sigmask: Option<&Sigset>,
+) -> SysResult {
+    let mut own = Syscall {
+        thread: sys.thread,
+        thread_fn: sys.thread_fn,
+        syscall_entry: sys.syscall_entry,
+    };
+    let ts = match timeout {
+        Some(t) => t as *const TimeSpec as usize,
+        None => 0,
+    };
+    let mask = match sigmask {
+        Some(m) => m as *const Sigset as usize,
+        None => 0,
+    };
+    let nfds = set.len();
+    own.sys_ppoll(
+        UserInOutPtr::from(set.as_mut_ptr() as usize),
+        nfds,
+        UserInPtr::from(ts),
+        UserInPtr::from(mask),
+        SIGSETSIZE,
+    )
+    .await
+}
+
+/// `pselect6(nfds, &read, NULL, NULL, &timeout, sigset_arg)` by the syscall,
+/// with only the read set the tests here care about.
+async fn pselect6(
+    sys: &Syscall<'_>,
+    nfds: usize,
+    read: &mut [u32],
+    timeout: Option<&TimeSpec>,
+    sigmask: Option<&Sigset>,
+) -> SysResult {
+    let mut own = Syscall {
+        thread: sys.thread,
+        thread_fn: sys.thread_fn,
+        syscall_entry: sys.syscall_entry,
+    };
+    let at = match timeout {
+        Some(t) => t as *const TimeSpec as usize,
+        None => 0,
+    };
+    // The sixth argument is a pointer to `{ const sigset_t *ss; size_t
+    // ss_len; }`, not to the mask itself.
+    let arg = PSelectSigsetArg {
+        ss: match sigmask {
+            Some(m) => m as *const Sigset as usize,
+            None => 0,
+        },
+        ss_len: SIGSETSIZE,
+    };
+    own.sys_pselect6(
+        nfds,
+        UserInOutPtr::from(read.as_mut_ptr() as usize),
+        UserInOutPtr::from(0),
+        UserInOutPtr::from(0),
+        UserInOutPtr::from(at),
+        match sigmask {
+            Some(_) => &arg as *const PSelectSigsetArg as usize,
+            None => 0,
+        },
+    )
+    .await
+}
+
+/// `select(nfds, &read, NULL, NULL, NULL)`: no timeout at all, which is the
+/// null pointer that means "for ever".
+async fn select_for_ever(sys: &Syscall<'_>, nfds: usize, read: &mut [u32]) -> SysResult {
+    let mut own = Syscall {
+        thread: sys.thread,
+        thread_fn: sys.thread_fn,
+        syscall_entry: sys.syscall_entry,
+    };
+    own.sys_select(
+        nfds,
+        UserInOutPtr::from(read.as_mut_ptr() as usize),
+        UserInOutPtr::from(0),
+        UserInOutPtr::from(0),
+        UserInOutPtr::from(0),
+    )
+    .await
+}
+
+/// `select(nfds, NULL, &write, NULL, &timeout)`: the write set alone.
+async fn select_for_writing(
+    sys: &Syscall<'_>,
+    nfds: usize,
+    write: &mut [u32],
+    timeout_msecs: isize,
+) -> SysResult {
+    let mut own = Syscall {
+        thread: sys.thread,
+        thread_fn: sys.thread_fn,
+        syscall_entry: sys.syscall_entry,
+    };
+    let mut timeout = TimeVal {
+        sec: (timeout_msecs / 1000) as usize,
+        usec: (timeout_msecs % 1000) as usize * 1000,
+    };
+    own.sys_select(
+        nfds,
+        UserInOutPtr::from(0),
+        UserInOutPtr::from(write.as_mut_ptr() as usize),
+        UserInOutPtr::from(0),
         UserInOutPtr::from(&mut timeout as *mut TimeVal as usize),
     )
     .await
@@ -337,21 +505,11 @@ fn a_signal_ends_a_poll_that_is_parked_with_nothing_to_wake_it() {
     // The ceiling is five seconds and the pipe is never written, so the only
     // two ways out are the signal and a failure. The helper does nothing at
     // all if the park never happens, which is what keeps this test from
-    // interrupting whatever parks next.
+    // interrupting whatever parks next. What arrives is a signal and not the
+    // end of the process: see [`a_signaller`].
     let (proc, read_fd, _write_fd, _write) = a_process_with_a_pipe(49_303, "poll-eintr");
     let parked = Arc::new(AtomicBool::new(false));
-    let victim = proc.clone();
-    let flag = parked.clone();
-    std::thread::spawn(move || {
-        for _ in 0..A_WAIT_BUDGET {
-            if flag.load(Ordering::SeqCst) {
-                std::thread::sleep(A_MOMENT);
-                victim.exit(137);
-                return;
-            }
-            std::thread::sleep(A_MOMENT);
-        }
-    });
+    a_signaller(49_303, parked.clone());
     let got = on_a_thread(&proc, move |sys| {
         Box::pin(async move {
             let mut set = [an_entry(read_fd as i32, POLLIN)];
@@ -426,5 +584,225 @@ fn a_select_whose_timeout_runs_out_while_parked_hands_the_sets_back_cleared() {
         read[read_fd / FD_PER_ITEM],
         0,
         "a descriptor that never became ready came back set in the read set"
+    );
+}
+
+#[test]
+fn a_ppoll_that_a_signal_interrupts_keeps_the_mask_it_installed() {
+    // `ppoll`'s whole reason for existing: it installs the caller's mask for
+    // the duration of the wait, and when the wait ends in EINTR the mask has
+    // to STAY installed, because the handler is about to run and it must run
+    // under the mask the caller asked for. The guard that does that
+    // (`keep_for_signal`) sat at zero: every test of `ppoll` so far passed a
+    // null mask, which makes no guard at all, or finished on a ready
+    // descriptor, which is not EINTR.
+    //
+    // What makes it visible is a mask holding a signal nobody here sends.
+    // The guard is dropped when `sys_ppoll` returns, so by the time the mask
+    // is read back it has either been restored (the signal was never
+    // noticed) or kept (it was). The signal that does the interrupting is a
+    // different one, and deliberately not in the mask: a blocked signal is
+    // not deliverable and would not interrupt anything.
+    let (proc, read_fd, _write_fd, _write) = a_process_with_a_pipe(49_310, "ppoll-mask");
+    let parked = Arc::new(AtomicBool::new(false));
+    a_signaller(49_310, parked.clone());
+    let (got, mask) = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let mut set = [an_entry(read_fd as i32, POLLIN)];
+            let mask = a_mask(A_SIGNAL_NOBODY_SENDS);
+            let timeout = TimeSpec {
+                sec: (A_CEILING / 1000) as usize,
+                nsec: 0,
+            };
+            parked.store(true, Ordering::SeqCst);
+            let got = ppoll(sys, &mut set, Some(&timeout), Some(&mask)).await;
+            (got, the_mask_now(sys))
+        })
+    });
+    assert_eq!(
+        got,
+        Err(LxError::EINTR),
+        "a ppoll parked on an empty pipe did not come out on a signal"
+    );
+    assert!(
+        mask.contains(A_SIGNAL_NOBODY_SENDS),
+        "the mask ppoll installed was restored before the handler could run"
+    );
+}
+
+#[test]
+fn a_pselect6_that_a_signal_interrupts_keeps_the_mask_it_installed() {
+    // The same contract in `pselect6`, which is where it matters most: glibc
+    // routes plain `select()` through this syscall. It is written out
+    // separately there -- its own `install_temp_sigmask`, its own guard, and
+    // a sixth argument that is a pointer to a STRUCT holding the mask
+    // pointer rather than the mask itself -- so a fix in `ppoll` says
+    // nothing about it.
+    let (proc, read_fd, _write_fd, _write) = a_process_with_a_pipe(49_311, "pselect-mask");
+    let parked = Arc::new(AtomicBool::new(false));
+    a_signaller(49_311, parked.clone());
+    let (got, mask) = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let nfds = read_fd + 1;
+            let mut read = a_set(nfds, &[read_fd]);
+            let mask = a_mask(A_SIGNAL_NOBODY_SENDS);
+            let timeout = TimeSpec {
+                sec: (A_CEILING / 1000) as usize,
+                nsec: 0,
+            };
+            parked.store(true, Ordering::SeqCst);
+            let got = pselect6(sys, nfds, &mut read, Some(&timeout), Some(&mask)).await;
+            (got, the_mask_now(sys))
+        })
+    });
+    assert_eq!(
+        got,
+        Err(LxError::EINTR),
+        "a pselect6 parked on an empty pipe did not come out on a signal"
+    );
+    assert!(
+        mask.contains(A_SIGNAL_NOBODY_SENDS),
+        "the mask pselect6 installed was restored before the handler could run"
+    );
+}
+
+#[test]
+fn a_select_with_no_timeout_at_all_waits_until_something_happens() {
+    // A null timeout pointer is select(2)'s "block indefinitely", and it is a
+    // different arm from any finite one: the pair that carries the deadline
+    // and the time to write back is built as `(-1, None)` instead of from a
+    // `timeval`. Nothing had ever taken it -- a test cannot pass a null
+    // timeout and also know the call will come back, unless something ends
+    // the wait, which is what the pipe is for.
+    let (proc, read_fd, _write_fd, write) = a_process_with_a_pipe(49_312, "select-for-ever");
+    let parked = Arc::new(AtomicBool::new(false));
+    let writer = a_writer(write, parked.clone());
+    let (got, read) = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let nfds = read_fd + 1;
+            let mut read = a_set(nfds, &[read_fd]);
+            parked.store(true, Ordering::SeqCst);
+            let got = select_for_ever(sys, nfds, &mut read).await;
+            (got, read)
+        })
+    });
+    writer.join().unwrap();
+    assert_eq!(
+        got,
+        Ok(1),
+        "a select with no deadline did not come back on the write that fed it"
+    );
+    assert_eq!(
+        read[read_fd / FD_PER_ITEM] & (1 << (read_fd % FD_PER_ITEM)),
+        1 << (read_fd % FD_PER_ITEM),
+        "the descriptor that ended the wait came back clear in the read set"
+    );
+}
+
+#[test]
+fn a_pselect6_with_no_timeout_at_all_waits_until_something_happens() {
+    // `pselect6`'s own copy of the same arm, for the same reason the mask is
+    // tested twice: the two syscalls read their timeout through different
+    // calls and build the pair in different places.
+    let (proc, read_fd, _write_fd, write) = a_process_with_a_pipe(49_313, "pselect-for-ever");
+    let parked = Arc::new(AtomicBool::new(false));
+    let writer = a_writer(write, parked.clone());
+    let got = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let nfds = read_fd + 1;
+            let mut read = a_set(nfds, &[read_fd]);
+            parked.store(true, Ordering::SeqCst);
+            pselect6(sys, nfds, &mut read, None, None).await
+        })
+    });
+    writer.join().unwrap();
+    assert_eq!(
+        got,
+        Ok(1),
+        "a pselect6 with no deadline did not come back on the write that fed it"
+    );
+}
+
+#[test]
+fn a_signal_ends_a_select_that_is_parked_with_nothing_to_wake_it() {
+    // `select_core` keeps its own signal check, written out separately from
+    // `sys_poll`'s, and it was at zero for the same reason: nothing had ever
+    // parked here. A select that cannot be interrupted is the same bug as a
+    // poll that cannot be, and it is the one every shell's line editor sits
+    // in.
+    let (proc, read_fd, _write_fd, _write) = a_process_with_a_pipe(49_314, "select-eintr");
+    let parked = Arc::new(AtomicBool::new(false));
+    a_signaller(49_314, parked.clone());
+    let got = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let nfds = read_fd + 1;
+            let mut read = a_set(nfds, &[read_fd]);
+            parked.store(true, Ordering::SeqCst);
+            select_them(sys, nfds, &mut read, A_CEILING).await
+        })
+    });
+    assert_eq!(
+        got,
+        Err(LxError::EINTR),
+        "a select parked on a pipe nobody writes did not come out on a signal"
+    );
+}
+
+#[test]
+fn a_select_that_watches_no_descriptor_at_all_still_waits_out_its_timeout() {
+    // `select(1, &empty, &empty, &empty, &timeout)`: an `nfds` above zero
+    // with no bit set anywhere. That is a sleep, and it is the shape that
+    // makes `any_watched` false, which is the one way a parked select takes
+    // the re-scan interval instead of the stretched backstop -- the pass
+    // through `io_wait_interval` that a set with a subscribable descriptor
+    // never reaches.
+    let proc = a_process(49_315, "select-nothing");
+    let (got, waited) = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let mut read = a_set(1, &[]);
+            let began = mono_now();
+            let got = select_them(sys, 1, &mut read, A_SHORT_WAIT).await;
+            (got, mono_now() - began)
+        })
+    });
+    assert_eq!(
+        got,
+        Ok(0),
+        "a select watching nothing found a ready descriptor"
+    );
+    assert!(
+        waited >= Duration::from_millis(A_SHORT_WAIT as u64),
+        "a select watching nothing came back in {:?}, before its timeout",
+        waited
+    );
+}
+
+#[test]
+fn a_descriptor_that_will_never_be_writable_is_still_watched_for_writing() {
+    // The write set of a parked select. The read end of a pipe is never
+    // writable -- it does not write -- so asking about it in `writefds` is a
+    // wait that can only end on its timeout, and it is the one shape that
+    // puts `POLLOUT` into the interest a parked select subscribes with.
+    // Every select test before this one asked about reading.
+    let (proc, read_fd, _write_fd, _write) = a_process_with_a_pipe(49_316, "select-writefds");
+    let (got, waited, write) = on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let nfds = read_fd + 1;
+            let mut write = a_set(nfds, &[read_fd]);
+            let began = mono_now();
+            let got = select_for_writing(sys, nfds, &mut write, A_SHORT_WAIT).await;
+            (got, mono_now() - began, write)
+        })
+    });
+    assert_eq!(got, Ok(0), "the read end of a pipe was reported writable");
+    assert!(
+        waited >= Duration::from_millis(A_SHORT_WAIT as u64),
+        "the select came back in {:?}, before its timeout",
+        waited
+    );
+    assert_eq!(
+        write[read_fd / FD_PER_ITEM],
+        0,
+        "a descriptor that never became writable came back set in the write set"
     );
 }
