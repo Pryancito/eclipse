@@ -42,6 +42,29 @@ struct ShadowInner {
     prev_cursor: Option<DirtyRect>,
 }
 
+/// `held_by_current_cpu` is a constant `false` on the host (the vendored lock
+/// only tracks holders on `target_os = "none"`), so the re-entry arm of
+/// [`ShadowFramebuffer::lock_inner`] needs a seam the tests can set: a
+/// per-thread flag standing in for "this CPU is mid-draw and holds the lock".
+#[cfg(test)]
+extern crate std;
+#[cfg(test)]
+std::thread_local! {
+    // `true` = the current thread already holds the shadow lock.
+    static REENTRY_OVERRIDE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn reentered_for_test() -> bool {
+    REENTRY_OVERRIDE.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn reentered_for_test() -> bool {
+    false
+}
+
 /// A CPU-side shadow of the display framebuffer with dirty-region tracking.
 ///
 /// Interior mutability lets the glyph renderer (which only has shared access
@@ -149,7 +172,7 @@ impl ShadowFramebuffer {
     /// crash. Blocking costs the machine, and the crash report with it.
     #[inline]
     fn lock_inner(&self) -> Option<lock::MutexGuard<'_, ShadowInner>> {
-        if self.inner.held_by_current_cpu() {
+        if self.inner.held_by_current_cpu() || reentered_for_test() {
             return None;
         }
         Some(self.inner.lock())
@@ -751,6 +774,91 @@ mod tests {
     /// printing a crash report. It failed, and the OOM ate the report. The
     /// scratch buffers are now reused, so the allocation happens once and never
     /// again: same pointer, same capacity.
+    /// Makes [`ShadowFramebuffer::lock_inner`] answer as if this CPU already
+    /// held the shadow lock -- a panic taken mid-draw, printing to the
+    /// graphic console -- for as long as the guard lives.
+    struct Reentered;
+
+    impl Reentered {
+        fn on() -> Self {
+            REENTRY_OVERRIDE.with(|c| c.set(true));
+            Self
+        }
+    }
+
+    impl Drop for Reentered {
+        fn drop(&mut self) {
+            REENTRY_OVERRIDE.with(|c| c.set(false));
+        }
+    }
+
+    /// The deadlock the detector caught: a panic mid-draw comes back into
+    /// the shadow on the CPU that holds its lock. Every primitive declines
+    /// -- no pixel, no dirty mark, nothing to the device -- instead of
+    /// waiting, interrupts off, for a release only this CPU could make.
+    #[test]
+    fn a_draw_that_re_enters_the_shadow_lock_declines_instead_of_waiting() {
+        let fb = ShadowFramebuffer::new(16, 4);
+        let dev = Recorder::new(16, 4);
+        assert_eq!((fb.width(), fb.height()), (16, 4));
+        // What was drawn before the panic, still waiting to be presented.
+        fb.fill_rect(0, 0, 4, 1, 0x11);
+        {
+            let _mid_draw = Reentered::on();
+            fb.put_pixels(core::iter::once((1, 1, 0xff)));
+            fb.fill_rect(0, 0, 2, 2, 0xff);
+            fb.copy_rect(0, 0, 2, 2, 4, 2);
+            fb.clear(0xff);
+            fb.present(dev.as_ref());
+            fb.present_with_cursor(dev.as_ref(), Some((0, 0)), 8, 4);
+            assert!(
+                dev.rects().is_empty(),
+                "nothing reached the device mid-draw"
+            );
+        }
+        fb.present(dev.as_ref());
+        assert_eq!(
+            dev.rects(),
+            alloc::vec![(0, 0, 4, 1)],
+            "the region from before, and nothing was added to it"
+        );
+        let data = fb.inner.lock().data.clone();
+        assert!(data[..4].iter().all(|&p| p == 0x11) && data[4..].iter().all(|&p| p == 0));
+    }
+
+    /// A present that finds another in progress (the cursor blink from the
+    /// timer tick, on the CPU that is mid-blit) leaves the dirty region in
+    /// place: the next present takes it, nothing is lost and nobody spins.
+    #[test]
+    fn a_present_that_finds_a_blit_in_progress_leaves_the_region_for_the_next() {
+        let fb = ShadowFramebuffer::new(16, 4);
+        let dev = Recorder::new(16, 4);
+        fb.fill_rect(2, 1, 3, 2, 0x22);
+        {
+            let _blitting = fb.blit_lock.lock();
+            fb.present(dev.as_ref());
+            fb.present_with_cursor(dev.as_ref(), Some((0, 0)), 8, 4);
+            assert!(dev.rects().is_empty());
+            assert_eq!(fb.inner.lock().dirty, Some((2, 1, 5, 3)), "kept");
+        }
+        fb.present(dev.as_ref());
+        assert_eq!(dev.rects(), alloc::vec![(2, 1, 3, 2)]);
+    }
+
+    /// A dirty box with nothing in it -- empty, or entirely off the screen
+    /// -- is consumed and presents nothing.
+    #[test]
+    fn an_empty_dirty_box_is_consumed_and_presents_nothing() {
+        let fb = ShadowFramebuffer::new(16, 4);
+        let dev = Recorder::new(16, 4);
+        for empty in [(5, 2, 5, 2), (3, 3, 2, 4), (40, 1, 50, 2), (1, 9, 2, 10)] {
+            fb.inner.lock().dirty = Some(empty);
+            fb.present(dev.as_ref());
+            assert!(dev.rects().is_empty(), "{:?} blitted something", empty);
+            assert_eq!(fb.inner.lock().dirty, None, "{:?} was not consumed", empty);
+        }
+    }
+
     #[test]
     fn a_warm_present_reuses_its_scratch_instead_of_allocating() {
         let fb = ShadowFramebuffer::new(64, 8);

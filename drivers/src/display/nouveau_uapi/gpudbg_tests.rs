@@ -270,3 +270,31 @@ fn the_exec_profile_lists_only_the_ioctls_that_ran_with_their_average_and_max() 
     set_exec_fast_enabled(fast);
     clear_profile();
 }
+
+/// The trace names the whole `nouveau_drm.h` vocabulary, the ioctls this
+/// driver does not serve included, so a trace says what Mesa wanted.
+#[test]
+fn the_ioctls_this_driver_does_not_serve_are_still_named_in_a_trace() {
+    let name = |nr: u32| nouveau_ioctl_name(DRM_COMMAND_BASE + nr);
+    assert_eq!(name(0x01), "SETPARAM(deprecated)");
+    assert_eq!(name(0x07), "NVIF");
+    assert_eq!(name(0x08), "SVM_INIT");
+    assert_eq!(name(0x09), "SVM_BIND");
+    assert_eq!(name(0x3f), "unknown");
+    assert_eq!(
+        nouveau_ioctl_name(DRM_COMMAND_BASE.wrapping_sub(1)),
+        "unknown"
+    );
+}
+
+/// One profile slot: how many, how long in all, and the slowest.
+#[test]
+fn an_ioctl_stat_counts_sums_and_keeps_the_slowest() {
+    let st = IoctlStat::new();
+    for us in [7, 3, 5] {
+        st.add(us);
+    }
+    assert_eq!(st.count.load(Ordering::Relaxed), 3);
+    assert_eq!(st.total_us.load(Ordering::Relaxed), 15);
+    assert_eq!(st.max_us.load(Ordering::Relaxed), 7);
+}
