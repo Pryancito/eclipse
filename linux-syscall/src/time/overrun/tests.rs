@@ -130,7 +130,9 @@ fn settime_starts_the_count_again_even_in_a_signal_still_waiting() {
     settime(&proc, id, false, ms(10), ms(10), ms(1015));
     assert_eq!(getoverrun(&proc, id), 0, "timer_settime resets it");
 
-    // A signal of the old arming waits through the re-arm.
+    // A signal of the old arming that waits through the re-arm: the
+    // syscall throws it away first (`stale`), so only one queued while
+    // the setting is made gets this far, and it counts from the new arming.
     expires_at(id, &[1025, 1035]);
     settime(&proc, id, false, ms(10), ms(10), ms(1040));
     expires_at(id, &[1050, 1060]);

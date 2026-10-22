@@ -1191,6 +1191,13 @@ impl LinuxThread {
         info
     }
 
+    /// Throw `signal` away with its `siginfo_t`, without taking it: nothing
+    /// is handled, so what `sigreturn` compares against stays as it is.
+    pub fn discard_signal(&mut self, signal: Signal) {
+        self.signals.remove(signal);
+        self.pending_info.remove(&(signal as u8));
+    }
+
     /// The `siginfo_t` `signal` is pending with, to change in place: `None`
     /// when it is not pending, or came without one.
     pub fn pending_siginfo_mut(&mut self, signal: Signal) -> Option<&mut SigInfo> {
@@ -1300,6 +1307,22 @@ mod signal_delivery_tests {
         let mut t = thread();
         assert!(t.handle_signal().is_none());
         assert!(t.handling_signal.is_none());
+    }
+
+    #[test]
+    fn a_discarded_signal_is_gone_without_being_taken() {
+        // A timer's signal thrown away while another is being handled: the
+        // one being handled is still what `sigreturn` compares against.
+        let mut t = thread();
+        let usr1 = SigInfo::from_kernel(Signal::SIGUSR1);
+        t.queue_signal(Signal::SIGUSR1, Some(usr1));
+        t.take_siginfo(Signal::SIGUSR1);
+        let alarm = SigInfo::timer(Signal::SIGALRM, 7, 0, 0);
+        t.queue_signal(Signal::SIGALRM, Some(alarm));
+        t.discard_signal(Signal::SIGALRM);
+        assert!(!t.signals.contains(Signal::SIGALRM), "still pending");
+        assert!(t.pending_info.is_empty(), "its siginfo_t is still there");
+        assert!(t.handling_info == usr1, "it was taken, not thrown away");
     }
 
     #[test]

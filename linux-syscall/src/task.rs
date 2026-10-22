@@ -1634,8 +1634,9 @@ impl Syscall<'_> {
         // timer_create(2): POSIX timers are disarmed and deleted by an
         // execve. They fire at a pid, and this pid is a different program
         // now, so one left armed delivers its signal to an image that never
-        // asked for it. (`setitimer` timers survive, and are left alone.)
-        crate::time::drop_posix_timers_of(self.zircon_process().id());
+        // asked for it, and so does a signal one left waiting. (`setitimer`
+        // timers survive, and are left alone.)
+        crate::time::delete_posix_timers_at_exec(self.zircon_process().id());
         self.zircon_process().set_name(&comm);
         // And thread side: the alternate signal stack, the robust futex list,
         // the `set_tid_address` word and the in-handler state all name the

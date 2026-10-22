@@ -6254,7 +6254,7 @@ mod pending_timer;
 pub use job_stop::{complete_signal_for_job_control, wait_while_job_stopped};
 mod clone_parent;
 pub use clone_parent::give_to_callers_parent;
-pub use pending_timer::with_pending_timer_signal;
+pub use pending_timer::{drop_pending_timer_signal, with_pending_timer_signal};
 
 mod exit_path;
 use exit_path::ExitPathSummary;
