@@ -2365,6 +2365,27 @@ mod controller_tests {
     }
 
     #[test]
+    fn a_controller_with_no_transfer_limit_is_not_given_one() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let deadline = a_patient_clock();
+
+            let mut drive = a_drive_not_yet_brought_up(base);
+            the_controller_answers(&drive.admin_queue, &[OK, OK]);
+            an_identified_namespace(&drive.admin_queue, 1024, 9, 0);
+            let answered = a_controller_that_answers(base);
+
+            assert_eq!(drive.nvme_configure_admin_queue(deadline), Ok(()));
+            answered.join().expect("the controller thread lived");
+
+            // MDTS zero means no limit at all, not "no transfers". Read as a
+            // limit it would be a cap of zero bytes, which stalls the
+            // transfer loop and underflows the block count.
+            assert_eq!(drive.max_transfer, usize::MAX);
+        })
+    }
+
+    #[test]
     fn a_namespace_of_zero_size_is_refused() {
         alone_with_the_allocator(|| {
             let base = a_window();
@@ -2702,6 +2723,34 @@ mod controller_tests {
     }
 
     #[test]
+    fn a_read_of_exactly_two_pages_points_the_second_pointer_at_the_second_page() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let mut drive = a_drive(base);
+            drive.lba_shift = 12;
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[OK]);
+            let (data_pa, prp_list_va) = {
+                let q = io.lock();
+                (q.data_pa, q.prp_list_va)
+            };
+
+            let mut buf = alloc::vec![0u8; 2 * PAGE_SIZE];
+            assert_eq!(drive.read_block(0, &mut buf), Ok(()));
+
+            // With one page left over there is nothing to list, and a
+            // controller told to read a list would read the data itself as
+            // addresses.
+            let cmd = as_rw(sq_entry(&io, 0));
+            assert_eq!(cmd.prp2, (data_pa + PAGE_SIZE) as u64);
+            // SAFETY: the list is a whole page.
+            let list = unsafe { core::ptr::read_volatile(prp_list_va as *const u64) };
+            assert_eq!(list, 0, "and the list was left alone");
+        })
+    }
+
+    #[test]
     fn a_read_bigger_than_two_pages_hands_the_controller_a_list_of_them() {
         alone_with_the_allocator(|| {
             let base = a_window();
@@ -2770,6 +2819,34 @@ mod controller_tests {
             // Both halves came out of the bounce, so neither was skipped.
             assert_eq!(buf[..PAGE_SIZE].to_vec(), arrived);
             assert_eq!(buf[PAGE_SIZE..].to_vec(), arrived);
+        })
+    }
+
+    #[test]
+    fn an_error_completion_on_a_read_is_retried_after_a_settle() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            // Ten milliseconds a look, so the settle between attempts really
+            // has to go round rather than being over before it starts.
+            test_clock::set(0);
+            test_clock::set_auto_advance(10_000);
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            the_controller_answers(&io, &[FAILED, OK]);
+            let arrived: Vec<u8> = (0..512u32).map(|i| (i % 229) as u8).collect();
+            the_controller_leaves(&io, 0, &arrived);
+
+            let mut buf = alloc::vec![0u8; 512];
+            assert_eq!(drive.read_block(0, &mut buf), Ok(()));
+            // One transient hiccup should not fail the caller's read, which
+            // is why the error completion is retried at all.
+            assert_eq!(submitted(&io), 2);
+            assert_eq!(buf, arrived);
+            assert!(
+                clock_spent() >= 50_000,
+                "did not settle between the attempts: {} us",
+                clock_spent()
+            );
         })
     }
 
