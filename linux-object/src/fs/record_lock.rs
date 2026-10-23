@@ -176,6 +176,20 @@ pub fn release_owner(owner: KoID) {
     });
 }
 
+/// Release all locks held by `owner` on the file identified by `key`.
+///
+/// POSIX requires that closing ANY file descriptor referring to a file in a
+/// process releases all POSIX record locks held by that process on that file.
+pub fn release_file_owner(key: FileKey, owner: KoID) {
+    let mut table = LOCKS.lock();
+    if let Some(locks) = table.get_mut(&key) {
+        locks.retain(|l| l.owner != owner);
+        if locks.is_empty() {
+            table.remove(&key);
+        }
+    }
+}
+
 /// `F_GETLK`: describe the first lock blocking `req`, or `None` when the
 /// request would succeed.
 pub fn getlk(key: FileKey, req: &LockRequest) -> Option<ConflictInfo> {

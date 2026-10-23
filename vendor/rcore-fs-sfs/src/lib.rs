@@ -1210,6 +1210,7 @@ impl vfs::FileSystem for SimpleFileSystem {
             files: sb.blocks as usize,        // inaccurate
             ffree: sb.unused_blocks as usize, // inaccurate
             namemax: MAX_FNAME_LEN,
+            ftype: vfs::EXT4_SUPER_MAGIC,
         }
     }
 }

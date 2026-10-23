@@ -146,7 +146,8 @@ pub use dmabuf::{
 };
 pub use eclipsefs_ioctl::{
     eclipsefs_atomic_write_unit, eclipsefs_copy_reflink, eclipsefs_fallocate, eclipsefs_ioctl,
-    eclipsefs_seek, eclipsefs_xattr, FsIoctlContext, XattrReply, XattrRequest, EFS_IOC_RECEIVE,
+    eclipsefs_seek, eclipsefs_xattr, is_vfs_clone_ioctl, FsIoctlContext, XattrReply, XattrRequest,
+    EFS_IOC_RECEIVE, FICLONE, FICLONERANGE, FIDEDUPERANGE, FS_IOC_FIEMAP,
 };
 pub use epoll::{Epoll, EpollEvent};
 pub use proc_self::{fd_permission, FdObject};
@@ -1732,32 +1733,54 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         let n_input = devs.len();
         if n_input > 0 {
             let run_root = run_ramfs.root_inode();
-            let data_dir = run_root
-                .create("udev", FileType::Dir, 0o755)
-                .and_then(|udev| udev.create("data", FileType::Dir, 0o755));
-            if let Ok(data_dir) = data_dir {
+            let udev_dir = run_root.create("udev", FileType::Dir, 0o755);
+            let data_dir = udev_dir.as_ref().ok().and_then(|u| u.create("data", FileType::Dir, 0o755).ok());
+            let tags_dir = udev_dir.as_ref().ok().and_then(|u| u.create("tags", FileType::Dir, 0o755).ok());
+            let seat_tag_dir = tags_dir.as_ref().and_then(|t| t.create("seat", FileType::Dir, 0o755).ok());
+            let seat0_tag_dir = tags_dir.as_ref().and_then(|t| t.create("seat0", FileType::Dir, 0o755).ok());
+            if let Some(data_dir) = data_dir {
                 for (id, dev) in devs.iter().enumerate() {
                     // libinput's `evdev_configure_device` ignores any device
                     // tagged only `ID_INPUT` with no subtype ("not tagged as
                     // supported input device") — it assigns capabilities from
-                    // the udev `ID_INPUT_KEYBOARD` / `ID_INPUT_MOUSE` properties,
-                    // not from the evdev bits alone. With udevd absent we must
-                    // synthesise those tags, mirroring udev's `input_id` builtin:
-                    // a keyboard has KEY_ESC; a pointer has BTN_LEFT plus either
-                    // relative X/Y or absolute X/Y (USB tablet).
+                    // the udev `ID_INPUT_*` properties, not from the evdev bits
+                    // alone. Mirror udev's `input_id` builtin carefully:
+                    //
+                    // QEMU's `usb-tablet` is an *absolute mouse* (ABS_X/Y +
+                    // BTN_LEFT, no stylus). Tagging it `ID_INPUT_TABLET` sends
+                    // libinput down the digitizer path, which waits for
+                    // BTN_TOOL_PEN proximity that never arrives — pointer
+                    // dead while `/proc/usbhid` still shows reports. Real
+                    // tablets advertise BTN_TOOL_PEN (0x140); only those get
+                    // `ID_INPUT_TABLET`.
                     let keys = dev.capability(CapabilityType::Key);
                     let rel = dev.capability(CapabilityType::RelAxis);
                     let abs = dev.capability(CapabilityType::AbsAxis);
+                    let has_rel_xy = rel.contains(0) && rel.contains(1);
+                    let has_abs_xy = abs.contains(0) && abs.contains(1);
+                    let has_btn_left = keys.contains(0x110); // BTN_LEFT
+                    let has_tool_pen = keys.contains(0x140); // BTN_TOOL_PEN
                     let is_keyboard = keys.contains(1); // KEY_ESC
-                    let is_mouse = keys.contains(0x110) // BTN_LEFT
-                        && ((rel.contains(0) && rel.contains(1))
-                            || (abs.contains(0) && abs.contains(1)));
-                    let mut body = String::from("I:1\nE:ID_INPUT=1\n");
+                    let is_touch = has_abs_xy && keys.contains(0x14a) && !has_tool_pen; // BTN_TOUCH
+                    let is_tablet = has_abs_xy && has_tool_pen;
+                    // Relative mouse, or absolute mouse (QEMU usb-tablet).
+                    let is_mouse =
+                        has_rel_xy || (has_abs_xy && has_btn_left && !is_tablet && !is_touch);
+                    let mut body = String::from("I:1\nE:ID_INPUT=1\nE:ID_SEAT=seat0\n");
                     if is_keyboard {
-                        body.push_str("E:ID_INPUT_KEYBOARD=1\n");
+                        body.push_str("E:ID_INPUT_KEYBOARD=1\nE:ID_INPUT_KEY=1\n");
+                    }
+                    if is_tablet {
+                        body.push_str("E:ID_INPUT_TABLET=1\n");
                     }
                     if is_mouse {
                         body.push_str("E:ID_INPUT_MOUSE=1\n");
+                    }
+                    if is_touch {
+                        body.push_str("E:ID_INPUT_TOUCHSCREEN=1\n");
+                    }
+                    if !is_keyboard && !is_mouse && !is_tablet && !is_touch && keys.contains(1) {
+                        body.push_str("E:ID_INPUT_KEY=1\n");
                     }
                     body.push_str("G:seat\nQ:seat\nV:1\n");
                     let name = alloc::format!("c{}:{}", EVDEV_MAJOR, EVDEV_EVENT_MINOR_BASE + id);
@@ -1767,9 +1790,15 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                         }
                         Err(e) => warn!("[boot] udev db {}: {:?}", name, e),
                     }
+                    if let Some(ref tag) = seat_tag_dir {
+                        let _ = tag.create(&name, FileType::File, 0o644);
+                    }
+                    if let Some(ref tag) = seat0_tag_dir {
+                        let _ = tag.create(&name, FileType::File, 0o644);
+                    }
                     warn!(
-                        "[boot] udev db event{}: keyboard={} mouse={}",
-                        id, is_keyboard, is_mouse
+                        "[boot] udev db event{}: keyboard={} mouse={} tablet={} touch={}",
+                        id, is_keyboard, is_mouse, is_tablet, is_touch
                     );
                 }
                 warn!(

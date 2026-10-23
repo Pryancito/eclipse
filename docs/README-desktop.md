@@ -94,8 +94,8 @@ Alpine. Todos son opcionales — la sesión degrada con elegancia si falta
 alguno:
 
 ```sh
-apk add labwc seatd foot wayland-protocols font-dejavu adwaita-icon-theme
-apk add sdl2 sdl3 sdl12-compat sdl2_image sdl2_ttf sdl2_mixer sdl2_net libpng fluidsynth libdecor   # runtime SDL (ver "SDL")
+apt-get install labwc seatd foot wayland-protocols fonts-dejavu adwaita-icon-theme
+apt-get install libsdl2-2.0-0 libsdl3-0 libsdl1.2debian libsdl2-image-2.0-0 libsdl2-ttf-2.0-0 libsdl2-mixer-2.0-0 libsdl2-net-2.0-0 libpng16-16t64 libfluidsynth3 libdecor-0-0   # runtime SDL
 ```
 
 Desde `cargo xtask image` estos paquetes ya se instalan solos (ver
@@ -156,7 +156,7 @@ xterm                  # una terminal X11 clásica dentro del escritorio Wayland
 Si una app X11 falla con «can't open display» aun con `DISPLAY=:0`, revisa en
 la salida del build la línea `Xorg stack: Xwayland present …`: si dice que
 falta, `apk` no resolvió el paquete `xwayland` (lo más común, sin red al
-construir la imagen) y hay que reconstruir con red o `apk add xwayland` una vez.
+construir la imagen) y hay que reconstruir con red o `apt-get install xwayland` una vez.
 
 ## SDL (SDL 1.2 / SDL2 / SDL3)
 
@@ -247,8 +247,8 @@ Si hay instalado un motor por software (`chocolate-doom`, `crispy-doom`,
 llvmpipe, es el que va a velocidad completa.
 
 ```sh
-apk add chocolate-doom    # opcional; eclipse-freedoom lo usará solo
-apk add supertux          # binario: supertux2
+apt-get install chocolate-doom    # opcional; eclipse-freedoom lo usará solo
+apt-get install supertux          # binario: supertux2
 ```
 
 Los dos juegos fallaban en hardware real por causas distintas, y ambas están

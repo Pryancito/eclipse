@@ -801,9 +801,19 @@ impl Pty {
                 unsafe { *(data as *mut Termios) = self.inner.lock().termios };
                 Ok(0)
             }
+            TCGETS2 => {
+                let t = self.inner.lock().termios;
+                unsafe { *(data as *mut Termios2) = t.into() };
+                Ok(0)
+            }
             TCSETS | TCSETSW => {
                 let t = unsafe { *(data as *const Termios) };
                 self.inner.lock().termios = t;
+                Ok(0)
+            }
+            TCSETS2 | TCSETSW2 => {
+                let t2 = unsafe { *(data as *const Termios2) };
+                self.inner.lock().termios = t2.into();
                 Ok(0)
             }
             TCSETSF => {
@@ -821,6 +831,18 @@ impl Pty {
                 // `tcsetattr(TCSAFLUSH)` -- which is what every line editor
                 // does on the way out, and what `stty sane` is -- polling a
                 // hung-up terminal that never reported ready again.
+                if !self.slave_readable() {
+                    self.slave_bus.lock().clear(Event::READABLE);
+                }
+                Ok(0)
+            }
+            TCSETSF2 => {
+                let t2 = unsafe { *(data as *const Termios2) };
+                {
+                    let mut inner = self.inner.lock();
+                    inner.termios = t2.into();
+                    inner.flush_input();
+                }
                 if !self.slave_readable() {
                     self.slave_bus.lock().clear(Event::READABLE);
                 }

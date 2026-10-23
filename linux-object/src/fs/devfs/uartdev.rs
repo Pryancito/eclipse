@@ -7,7 +7,10 @@ use rcore_fs::vfs::{make_rdev, FileType, FsError, INode, Metadata, PollStatus, R
 use rcore_fs_devfs::DevFS;
 use zcore_drivers::{scheme::UartScheme, DeviceError};
 
-use crate::fs::ioctl::{Termios, TCFLSH, TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGWINSZ, TIOCSWINSZ};
+use crate::fs::ioctl::{
+    Termios, Termios2, TCFLSH, TCGETS, TCGETS2, TCSETS, TCSETS2, TCSETSF, TCSETSF2, TCSETSW,
+    TCSETSW2, TIOCGWINSZ, TIOCSWINSZ,
+};
 
 /// First minor of the serial range on major 4.
 ///
@@ -176,6 +179,11 @@ impl INode for UartDev {
                 copy(UserOutPtr::<Termios>::from(data).write(*self.termios.lock()))?;
                 Ok(0)
             }
+            TCGETS2 => {
+                let t = *self.termios.lock();
+                copy(UserOutPtr::<Termios2>::from(data).write(t.into()))?;
+                Ok(0)
+            }
             // A UART has no queue of its own to drain or discard, so the three
             // forms differ only in what `TCSETSF` throws away: the byte `poll`
             // peeked. Answering `ENOSYS` to these is what makes `stty` on a
@@ -185,6 +193,14 @@ impl INode for UartDev {
                 let t = copy(UserInPtr::<Termios>::from(data).read())?;
                 *self.termios.lock() = t;
                 if cmd as usize == TCSETSF {
+                    *self.pending.lock() = None;
+                }
+                Ok(0)
+            }
+            TCSETS2 | TCSETSW2 | TCSETSF2 => {
+                let t2: Termios2 = copy(UserInPtr::<Termios2>::from(data).read())?;
+                *self.termios.lock() = t2.into();
+                if cmd as usize == TCSETSF2 {
                     *self.pending.lock() = None;
                 }
                 Ok(0)

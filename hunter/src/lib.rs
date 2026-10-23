@@ -677,8 +677,8 @@ mod tests {
             assert!(!check_exec_path(p), "should be blocked: {}", p);
         }
         // A real program on the same boot still learns and still runs.
-        assert!(check_exec_path("/usr/bin/apk"));
-        assert!(policy::is_exec_listed("/usr/bin/apk"));
+        assert!(check_exec_path("/usr/bin/apt-get"));
+        assert!(policy::is_exec_listed("/usr/bin/apt-get"));
         policy::reset_for_test();
     }
 

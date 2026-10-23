@@ -607,6 +607,12 @@ fn user_stack_backtrace(vmar: &Arc<VmAddressRegion>, sp: usize) -> Vec<String> {
 /// loop:
 /// - wait for the thread to be ready
 /// - get user thread context
+#[inline]
+fn thread_should_stop(thread: &CurrentThread) -> bool {
+    matches!(thread.state(), ThreadState::Dying | ThreadState::Dead)
+        || thread.proc().exit_code().is_some()
+}
+
 /// - enter user mode
 /// - handle trap/interrupt/syscall according to the return value
 /// - return the context to the user thread
@@ -619,7 +625,7 @@ async fn run_user(thread: CurrentThread) {
     loop {
         // wait
         let mut ctx = thread.wait_for_run().await;
-        if thread.state() == ThreadState::Dying {
+        if thread_should_stop(&thread) {
             break;
         }
 
@@ -653,7 +659,7 @@ async fn run_user(thread: CurrentThread) {
         if let Some((signal, sigmask)) = pending_signal {
             ctx = handle_signal(&thread, ctx, signal, sigmask, &mut interrupted);
         }
-        if thread.state() == ThreadState::Dying {
+        if thread_should_stop(&thread) {
             break;
         }
         // Job-control stop: do not re-enter uspace until SIGCONT (or death).
@@ -676,7 +682,7 @@ async fn run_user(thread: CurrentThread) {
             // SIGTTIN/SIGTTOU can sit here for as long as the job is stopped.
             thread.put_context(ctx);
             linux_object::process::wait_while_job_stopped(thread.proc()).await;
-            if thread.state() == ThreadState::Dying {
+            if thread_should_stop(&thread) {
                 break;
             }
             // Drop into the next loop iteration so a pending SIGCONT handler
@@ -724,7 +730,7 @@ async fn run_user(thread: CurrentThread) {
             Ok(cut_short) => interrupted = cut_short,
             Err(err) => thread.exit_linux(err as i32),
         }
-        if thread.state() == ThreadState::Dying {
+        if thread_should_stop(&thread) {
             break;
         }
     }
@@ -1257,7 +1263,9 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal, info: SigInfo) {
             signal,
             signal as i32,
         );
-        thread.proc().exit(undeliverable_fault_exit_code(signal));
+        let exit_code = undeliverable_fault_exit_code(signal);
+        thread.proc().exit(exit_code);
+        thread.exit_linux(exit_code as i32);
     } else {
         // Deliverable custom handler: unblock so it cannot be deferred and queue
         // it for the next pass of the run loop, with where and why.

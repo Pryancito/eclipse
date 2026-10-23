@@ -459,6 +459,7 @@ impl VfsFileSystem for FatMountFs {
             files: 0,
             ffree: 0,
             namemax: 255,
+            ftype: rcore_fs::vfs::MSDOS_SUPER_MAGIC,
         };
         let fs = match guard.as_ref() {
             Some(fs) => fs,
@@ -475,6 +476,7 @@ impl VfsFileSystem for FatMountFs {
                 files: 0,
                 ffree: 0,
                 namemax: 255,
+                ftype: rcore_fs::vfs::MSDOS_SUPER_MAGIC,
             }
         } else {
             FsInfo {
@@ -486,6 +488,7 @@ impl VfsFileSystem for FatMountFs {
                 files: 0,
                 ffree: 0,
                 namemax: 255,
+                ftype: rcore_fs::vfs::MSDOS_SUPER_MAGIC,
             }
         }
     }

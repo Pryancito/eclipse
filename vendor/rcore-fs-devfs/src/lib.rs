@@ -43,6 +43,9 @@ impl FileSystem for DevFS {
             files: 0,
             ffree: 0,
             namemax: 0,
+            // Linux's real /dev is usually tmpfs/devtmpfs; report TMPFS_MAGIC
+            // so probes that distinguish "real" /dev from a plain directory pass.
+            ftype: rcore_fs::vfs::TMPFS_MAGIC,
         }
     }
 }

@@ -367,6 +367,7 @@ impl FileSystem for RamFS {
             files: 0,
             ffree: 0,
             namemax: 255,
+            ftype: rcore_fs::vfs::TMPFS_MAGIC,
         }
     }
 }

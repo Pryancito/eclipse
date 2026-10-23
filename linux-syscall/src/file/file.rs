@@ -12,7 +12,8 @@
 use super::*;
 use linux_object::error::LxResult;
 use linux_object::fs::ioctl::{
-    FIOASYNC, FIOCLEX, FIONBIO, FIONCLEX, FIONREAD, FIOQSIZE, TIOCGPTPEER, TIOCGWINSZ, TIOCSCTTY,
+    FIOASYNC, FIOCLEX, FIONBIO, FIONCLEX, FIONREAD, FIOQSIZE, TCGETS2, TCSETS2, TCSETSF2, TCSETSW2,
+    TIOCGPTPEER, TIOCGWINSZ, TIOCSCTTY,
 };
 use linux_object::{process::FsInfo, thread::ThreadExt, time::TimeSpec};
 use rcore_fs::vfs::INode;
@@ -257,7 +258,8 @@ mod setlkw_tests;
 /// `0x545E` -- a number `<asm-generic/ioctls.h>` has never assigned -- while
 /// the comment beside it called that arm `FIOQSIZE`, which is 0x5460.
 pub(crate) fn tty_block_wants_enotty(request: usize) -> bool {
-    (0x5400..=FIOQSIZE).contains(&request)
+    ((0x5400..=FIOQSIZE).contains(&request)
+        || matches!(request, TCGETS2 | TCSETS2 | TCSETSW2 | TCSETSF2))
         && !matches!(request, FIONREAD | FIONBIO | FIONCLEX | FIOCLEX | FIOASYNC)
 }
 
@@ -2211,6 +2213,14 @@ impl Syscall<'_> {
             if let Some(res) = linux_object::fs::eclipsefs_ioctl(file, request as u32, arg1, &ctx) {
                 return res;
             }
+            // FICLONE family and FS_IOC_FIEMAP are answered at the VFS layer on Linux.
+            // Without a supporting mount, falling through hits sfs's unknown-cmd
+            // → EINVAL, which `cp`/`apt`/`dpkg` do not treat as "copy instead" (they want EOPNOTSUPP).
+            if linux_object::fs::is_vfs_clone_ioctl(request as u32)
+                || request as u32 == linux_object::fs::FS_IOC_FIEMAP
+            {
+                return Err(LxError::EOPNOTSUPP);
+            }
         }
         // File ioctls served at the VFS layer, como en Linux (fs/ioctl.c
         // `do_vfs_ioctl`): they apply to EVERY fd kind — pipes, sockets,
@@ -2995,12 +3005,14 @@ static_assertions::const_assert_eq!(120, core::mem::size_of::<StatFs>());
 impl From<FsInfo> for StatFs {
     fn from(info: FsInfo) -> Self {
         StatFs {
-            // Linux `f_type` is the filesystem magic (`statfs(2)`). Until
-            // `FsInfo` carries a real type per mount, a non-zero placeholder
-            // beats `0` (which every userspace probe treats as "unknown" —
-            // `df -T`, busybox, etc.). EXT4_SUPER_MAGIC is the conventional
-            // stand-in the TODO above already contemplated.
-            f_type: 0xEF53,
+            // Linux `f_type` is the filesystem magic (`statfs(2)`). Each VFS
+            // fills `FsInfo::ftype`; a zero still falls back to EXT4 so
+            // `df -T` never sees "unknown".
+            f_type: if info.ftype != 0 {
+                info.ftype as i64
+            } else {
+                0xEF53
+            },
             f_bsize: info.bsize as _,
             f_blocks: info.blocks as _,
             f_bfree: info.bfree as _,

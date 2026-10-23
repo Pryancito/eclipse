@@ -182,14 +182,12 @@ Use the following command to build the image:
 cargo bin -m cr1825 -o z.bin
 ```
 
-## Package Management (APK Tools)
+## Package Management (apt / Ubuntu 26.10)
 
-zCore (Eclipse OS) uses `apk-tools` as its package manager. To build it and prepare the environment:
+Eclipse OS uses **apt/dpkg** with **Ubuntu 26.10 (stonking)** packages for userspace (not a full Ubuntu: init and core tools stay Eclipse-static).
 
-To install the Alpine trusted keys:
-```bash
-apk add -X https://dl-cdn.alpinelinux.org/alpine/v3.24/main -u alpine-keys
-```
+- Build knob: `ECLIPSE_PKG=apt` (default on x86_64/aarch64) or `ECLIPSE_PKG=apk` (legacy Alpine).
+- On the guest: `apt-get update && apt-get install <package>`.
 
 ## Documentation
 

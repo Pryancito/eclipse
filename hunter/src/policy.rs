@@ -1676,12 +1676,12 @@ mod exec_learning_tests {
             is_exec_allowed("/opt/anything"),
             "while inactive the allowlist permits everything, preserving boot"
         );
-        assert!(learn_exec_path("/usr/bin/apk"));
+        assert!(learn_exec_path("/usr/bin/apt-get"));
         assert!(
             exec_allowlist_active(),
             "a learned program activates it exactly like a configured one"
         );
-        assert!(is_exec_allowed("/usr/bin/apk"));
+        assert!(is_exec_allowed("/usr/bin/apt-get"));
         assert!(
             !is_exec_allowed("/opt/anything"),
             "once active, only what is listed runs"

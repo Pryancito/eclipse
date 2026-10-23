@@ -1,3 +1,4 @@
+mod apt_rootfs;
 mod btrfs_image;
 mod cuda_probe;
 mod desktop;
@@ -12,6 +13,7 @@ mod portal;
 mod signal_probe;
 mod test;
 mod tree_image;
+mod usb_probe;
 mod verify;
 mod xorg;
 
@@ -148,26 +150,17 @@ impl LinuxRootfs {
                 let _ = fs::copy(&eclipse_useradd, bin.join("eclipse-useradd"));
             }
             let eclipse_bench = self.eclipse_bench(&musl);
-            if eclipse_bench.is_file() {
-                let _ = fs::copy(&eclipse_bench, bin.join("eclipse-bench"));
-            }
+            if eclipse_bench.is_file() { let _ = fs::copy(&eclipse_bench, bin.join("eclipse-bench")); }
             let clock_probe = self.clock_probe(&musl);
-            if clock_probe.is_file() {
-                let _ = fs::copy(&clock_probe, bin.join("clock-probe"));
-            }
+            if clock_probe.is_file() { let _ = fs::copy(&clock_probe, bin.join("clock-probe")); }
             self.install_signal_probe(&musl, &bin);
+            self.install_usb_probe(&musl, &bin);
             let firefox_probe = self.firefox_probe(&musl);
-            if firefox_probe.is_file() {
-                let _ = fs::copy(&firefox_probe, bin.join("firefox-probe"));
-            }
+            if firefox_probe.is_file() { let _ = fs::copy(&firefox_probe, bin.join("firefox-probe")); }
             let audio_probe = self.audio_probe(&musl);
-            if audio_probe.is_file() {
-                let _ = fs::copy(&audio_probe, bin.join("audio-probe"));
-            }
+            if audio_probe.is_file() { let _ = fs::copy(&audio_probe, bin.join("audio-probe")); }
             let drm_probe = self.drm_probe(&musl);
-            if drm_probe.is_file() {
-                let _ = fs::copy(&drm_probe, bin.join("drm-probe"));
-            }
+            if drm_probe.is_file() { let _ = fs::copy(&drm_probe, bin.join("drm-probe")); }
             let gfx_probe = self.gfx_probe(&musl);
             if gfx_probe.is_file() {
                 let _ = fs::copy(&gfx_probe, bin.join("gfx-probe"));
@@ -215,22 +208,23 @@ impl LinuxRootfs {
             // build.
             Self::write_profile(&dir.join("etc"));
             Self::write_ntp(&dir);
-            // Before the desktop stack: `xorg::install` runs apk against this
-            // rootfs, and `/etc/apk/arch` is what decides which repository it
-            // reads. An incremental build never wrote it, so a rootfs built
-            // before this existed keeps resolving for the host's arch.
-            Self::write_apk_arch(&dir.join("etc"), self.0.name());
-            // Y las claves, por el mismo motivo: un rootfs construido antes de
-            // que hubiera claves por arco se queda sin las del objetivo, y
-            // entonces apk lee el APKINDEX, dice «UNTRUSTED signature» y no
-            // instala nada.
-            let keys = dir.join("etc").join("apk").join("keys");
-            let n = Self::install_apk_keys(&keys, self.0.name());
-            println!(
-                "apk keys: installed {n} key(s) into {} for {}",
-                keys.display(),
-                self.0.name()
-            );
+            // Package tap: Ubuntu apt (default on x86_64/aarch64) or Alpine apk.
+            if apt_rootfs::use_apt(self.0.name()) {
+                apt_rootfs::bootstrap(&dir, self.0.name());
+            } else {
+                // Before the desktop stack: `xorg::install` runs apk against this
+                // rootfs, and `/etc/apk/arch` is what decides which repository it
+                // reads. An incremental build never wrote it, so a rootfs built
+                // before this existed keeps resolving for the host's arch.
+                Self::write_apk_arch(&dir.join("etc"), self.0.name());
+                let keys = dir.join("etc").join("apk").join("keys");
+                let n = Self::install_apk_keys(&keys, self.0.name());
+                println!(
+                    "apk keys: installed {n} key(s) into {} for {}",
+                    keys.display(),
+                    self.0.name()
+                );
+            }
             self.install_desktop_stack(&dir);
             // After apk so we can see whether the PulseAudio plugin/binary
             // landed, and so /etc/pulse wins over anything the package dropped.
@@ -250,69 +244,66 @@ impl LinuxRootfs {
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(&lib).unwrap();
 
-        let apk = self.apk(&musl);
-        // El binario del objetivo es para el sistema instalado y es
-        // best-effort (aqui mismo, sin salida a repo.chimera-linux.org, el de
-        // aarch64 no se baja). La CONFIGURACION de apk — repositorios, arco,
-        // claves, bases de datos — no depende de que ese binario exista: la usa
-        // el apk del HOST para armar el cierre de paquetes del objetivo. Iban
-        // juntas dentro de este `if`, asi que un objetivo sin estatico salia
-        // ademas **sin `/etc/apk/repositories`**, y entonces `xorg::install`
-        // tambien se rendia.
-        if apk.is_file() {
-            fs::copy(&apk, bin.join("apk")).unwrap();
-        } else {
-            eprintln!(
-                "warning: no hay estatico de apk para {} ({}); el sistema instalado \
-                 saldra sin /bin/apk, pero el cierre de paquetes se arma igual con el \
-                 apk del host",
-                self.0.name(),
-                apk.display()
-            );
-        }
-        {
+        if apt_rootfs::use_apt(self.0.name()) {
             let etc = dir.join("etc");
-            let etc_apk = etc.join("apk");
-            fs::create_dir_all(&etc_apk).unwrap();
-            fs::write(
-                etc_apk.join("repositories"),
-                "http://dl-cdn.alpinelinux.org/alpine/v3.24/main\nhttp://dl-cdn.alpinelinux.org/alpine/v3.24/community\n",
-            )
-            .unwrap();
-            fs::write(etc_apk.join("world"), "").unwrap();
-            Self::write_apk_arch(&etc, self.0.name());
-
-            // Alpine repo signatures: without /etc/apk/keys/*.rsa.pub apk-tools
-            // 3 reports "UNTRUSTED signature" on APKINDEX and installs nothing.
-            // `prebuilt/` is gitignored (and invisible in some sandboxes), so
-            // the keys that actually ship live in `tools/apk/keys/` next to
-            // the apk binary. prebuilt is still scanned for extra keys.
-            let keys_dst = etc_apk.join("keys");
-            let n = Self::install_apk_keys(&keys_dst, self.0.name());
-            if n == 0 {
-                eprintln!(
-                    "warning: no Alpine apk keys found under tools/apk/keys or \
-                     prebuilt/alpine-apk-keys — apk add will use --allow-untrusted"
-                );
-            } else {
-                println!("apk keys: installed {n} key(s) into {}", keys_dst.display());
-            }
-
+            fs::create_dir_all(&etc).unwrap();
             Self::write_resolv_conf(&etc);
             Self::write_hosts(&etc);
-            let lib_apk = dir.join("lib").join("apk");
-            fs::create_dir_all(&lib_apk).unwrap();
-            let lib_apk_db = lib_apk.join("db");
-            fs::create_dir_all(&lib_apk_db).unwrap();
-            fs::write(lib_apk_db.join("installed"), "").unwrap();
+            apt_rootfs::bootstrap(&dir, self.0.name());
+        } else {
+            let apk = self.apk(&musl);
+            // El binario del objetivo es para el sistema instalado y es
+            // best-effort. La CONFIGURACION de apk la usa el apk del HOST.
+            if apk.is_file() {
+                fs::copy(&apk, bin.join("apk")).unwrap();
+            } else {
+                eprintln!(
+                    "warning: no hay estatico de apk para {} ({}); el sistema instalado \
+                     saldra sin /bin/apk, pero el cierre de paquetes se arma igual con el \
+                     apk del host",
+                    self.0.name(),
+                    apk.display()
+                );
+            }
+            {
+                let etc = dir.join("etc");
+                let etc_apk = etc.join("apk");
+                fs::create_dir_all(&etc_apk).unwrap();
+                fs::write(
+                    etc_apk.join("repositories"),
+                    "http://dl-cdn.alpinelinux.org/alpine/v3.24/main\nhttp://dl-cdn.alpinelinux.org/alpine/v3.24/community\n",
+                )
+                .unwrap();
+                fs::write(etc_apk.join("world"), "").unwrap();
+                Self::write_apk_arch(&etc, self.0.name());
 
-            let var_lib = dir.join("var").join("lib");
-            fs::create_dir_all(&var_lib).unwrap();
-            #[cfg(unix)]
-            let _ = unix::fs::symlink("../../lib/apk", var_lib.join("apk"));
+                let keys_dst = etc_apk.join("keys");
+                let n = Self::install_apk_keys(&keys_dst, self.0.name());
+                if n == 0 {
+                    eprintln!(
+                        "warning: no Alpine apk keys found under tools/apk/keys or \
+                         prebuilt/alpine-apk-keys — apk add will use --allow-untrusted"
+                    );
+                } else {
+                    println!("apk keys: installed {n} key(s) into {}", keys_dst.display());
+                }
 
-            let var_cache_apk = dir.join("var").join("cache").join("apk");
-            fs::create_dir_all(&var_cache_apk).unwrap();
+                Self::write_resolv_conf(&etc);
+                Self::write_hosts(&etc);
+                let lib_apk = dir.join("lib").join("apk");
+                fs::create_dir_all(&lib_apk).unwrap();
+                let lib_apk_db = lib_apk.join("db");
+                fs::create_dir_all(&lib_apk_db).unwrap();
+                fs::write(lib_apk_db.join("installed"), "").unwrap();
+
+                let var_lib = dir.join("var").join("lib");
+                fs::create_dir_all(&var_lib).unwrap();
+                #[cfg(unix)]
+                let _ = unix::fs::symlink("../../lib/apk", var_lib.join("apk"));
+
+                let var_cache_apk = dir.join("var").join("cache").join("apk");
+                fs::create_dir_all(&var_cache_apk).unwrap();
+            }
         }
 
         // 拷贝 busybox
@@ -752,6 +743,7 @@ impl LinuxRootfs {
 
         // signal-probe: whether a signal puts the program back as it found it.
         self.install_signal_probe(&musl, &bin);
+        self.install_usb_probe(&musl, &bin);
 
         // firefox-probe: the kernel interfaces Firefox depends on.
         let firefox_probe = self.firefox_probe(&musl);
@@ -866,7 +858,8 @@ impl LinuxRootfs {
             fs::write(
                 &passwd,
                 "root:x:0:0:root:/root:/bin/sh\n\
-                 nobody:x:65534:65534:nobody:/:/bin/false\n",
+                 nobody:x:65534:65534:nobody:/:/bin/false\n\
+                 _apt:x:100:65534:APT Sandbox User:/nonexistent:/bin/false\n",
             )
             .unwrap();
         }
@@ -1351,7 +1344,8 @@ impl LinuxRootfs {
             fs::write(
                 &passwd,
                 b"root:x:0:0:root:/root:/bin/sh\n\
-                  nobody:x:65534:65534:nobody:/:/sbin/nologin\n",
+                  nobody:x:65534:65534:nobody:/:/sbin/nologin\n\
+                  _apt:x:100:65534:APT Sandbox User:/nonexistent:/sbin/nologin\n",
             )
             .unwrap();
         }
@@ -1701,7 +1695,7 @@ impl LinuxRootfs {
         if !self.1.has_desktop() {
             println!(
                 "minimal variant: no desktop (no labwc/Xorg, none of the Mesa/Firefox/XFCE \
-                 apk closure); the session is a console plus install-eclipse"
+                 package closure); the session is a console plus install-eclipse"
             );
             // Keyboard, locale and timezone are NOT the desktop's: `eclipse-init`
             // runs `eclipse-kbd --boot` on every boot, compositor or not, and a
@@ -1727,10 +1721,16 @@ impl LinuxRootfs {
         // arco objetivo y en una compilacion cruzada no arranca. El arco
         // objetivo se le pasa aparte y viaja hasta el `--arch` de apk.
         if apk_closure_fits_image(self.0.name()) {
-            xorg::install(dir, &Self::apk_host(), self.0.name());
+            // Don't call apk_host() on the apt path — that wget's Chimera for nothing.
+            let apk = if apt_rootfs::use_apt(self.0.name()) {
+                PathBuf::new()
+            } else {
+                Self::apk_host()
+            };
+            xorg::install(dir, &apk, self.0.name());
         } else {
             println!(
-                "{}: sin el cierre de apk del escritorio (Mesa/Firefox/XFCE); no cabe en la \
+                "{}: sin el cierre de paquetes del escritorio (Mesa/Firefox/XFCE); no cabe en la \
                  imagen de este arco, ver apk_closure_fits_image",
                 self.0.name()
             );
@@ -3272,7 +3272,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         )
     }
 
-    fn write_asound_conf(rootfs: &Path) {
+    pub(super) fn write_asound_conf(rootfs: &Path) {
         let etc = rootfs.join("etc");
         let _ = fs::create_dir_all(&etc);
         let conf = etc.join("asound.conf");
@@ -3281,8 +3281,13 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
                 return; // user-customized: leave it alone
             }
         }
-        let pulse_pcm = rootfs.join("usr/lib/alsa-lib/libasound_module_pcm_pulse.so");
-        let have_pulse = rootfs.join("usr/bin/pulseaudio").is_file() && pulse_pcm.is_file();
+        let pulse_pcm = [
+            "usr/lib/alsa-lib/libasound_module_pcm_pulse.so",
+            "usr/lib/x86_64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so",
+            "usr/lib/aarch64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so",
+            "usr/lib/riscv64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so",
+        ].iter().any(|rel| rootfs.join(rel).is_file());
+        let have_pulse = rootfs.join("usr/bin/pulseaudio").is_file() && pulse_pcm;
         let body = if have_pulse {
             b"# eclipse-generated ALSA routing (delete this line to take ownership).\n\
               #\n\
@@ -3823,7 +3828,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
     /// starts and 162 seconds of console on a binary that is not there. So the
     /// variant is a parameter, and the table itself is what leaves such a row
     /// out.
-    fn write_init_services(svc_dir: &Path, has_desktop: bool) {
+    pub(super) fn write_init_services(svc_dir: &Path, has_desktop: bool) {
         fs::write(
             svc_dir.join("example.service.txt"),
             b"# Eclipse init service file. Copy to '<name>.service' to enable.\n\
@@ -4143,7 +4148,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
     /// ends up without its x bit -- `eclipse-oopslog` shipped 0644 once,
     /// `execve` answered EACCES, and init respawned it for the whole boot.
     /// Takes `svc_dir` because `write_oopslog` adds a service of its own.
-    fn write_init_wrappers(localbin: &Path, svc_dir: &Path) {
+    pub(super) fn write_init_wrappers(localbin: &Path, svc_dir: &Path) {
         fs::write(
             localbin.join("eclipse-boot-sound"),
             b"#!/bin/sh\n\
@@ -4164,8 +4169,16 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
               # answers EBUSY), so the chime would cost all later sound. The\n\
               # track is a few seconds long; anything past MAXPLAY is stuck.\n\
               MAXPLAY=20\n\
+              # Prefer the real binary. Wrappers like mpg123-pulse already pass\n\
+              # `-o pulse`; if we then add `-o alsa` the later flag wins, mpg123\n\
+              # grabs the exclusive PCM, hangs, and the chime (and session audio)\n\
+              # loops until the watchdog -- the \"final loop\" seen on Ubuntu.\n\
+              MPG123=\n\
+              for c in mpg123.bin mpg123; do\n\
+              \x20 command -v \"$c\" >/dev/null 2>&1 && { MPG123=$c; break; }\n\
+              done\n\
               play() {\n\
-              \x20 mpg123 \"$@\" &\n\
+              \x20 \"$MPG123\" \"$@\" &\n\
               \x20 p=$!\n\
               \x20 ( i=0\n\
               \x20\x20 while [ \"$i\" -lt \"$MAXPLAY\" ]; do\n\
@@ -4173,7 +4186,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
               \x20\x20\x20 i=$((i + 1))\n\
               \x20\x20\x20 sleep 1\n\
               \x20\x20 done\n\
-              \x20\x20 echo \"eclipse-boot-sound: mpg123 stuck after ${MAXPLAY}s; killing it\" >&2\n\
+              \x20\x20 echo \"eclipse-boot-sound: $MPG123 stuck after ${MAXPLAY}s; killing it\" >&2\n\
               \x20\x20 kill -TERM \"$p\" 2>/dev/null\n\
               \x20\x20 sleep 1\n\
               \x20\x20 kill -KILL \"$p\" 2>/dev/null ) &\n\
@@ -4214,23 +4227,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
               elif command -v amixer >/dev/null 2>&1; then\n\
               \x20 amixer -q set Master 70% unmute 2>/dev/null\n\
               fi\n\
-              if command -v mpg123 >/dev/null 2>&1; then\n\
+              if [ -n \"$MPG123\" ]; then\n\
               \x20 if [ -S /run/pulse/native ]; then\n\
-              \x20\x20 # Both invocations name their modules. With no -o at all,\n\
-              \x20\x20 # libout123 walks its built-in list and takes the first\n\
-              \x20\x20 # driver that opens, which is not necessarily this one.\n\
-              \x20\x20 play -q -o alsa --encoding s16 --no-gapless \"$MP3\" \\\n\
-              \x20\x20\x20 || play -q -o pulse,alsa,oss --encoding s16 --no-gapless \"$MP3\"\n\
-              \x20\x20 pactl drain 2>/dev/null || true\n\
-              \x20\x20 # Do NOT suspend the sink here: suspending it (this line used\n\
-              \x20\x20 # to `suspend-sink 1`) left the whole session on the broken\n\
-              \x20\x20 # cold-resume path, so every later mpg123/paplay went silent or\n\
-              \x20\x20 # hung. The stream cork already resets the ring in the kernel\n\
-              \x20\x20 # (PAUSE with an empty queue -> reset), so leaving the sink\n\
-              \x20\x20 # active does not loop the chime fragment.\n\
+              \x20\x20 # Pulse is up: ONLY use the pulse output. Opening ALSA here\n\
+              \x20\x20 # races Pulse for the exclusive PCM and wedges the player.\n\
+              \x20\x20 play -q -o pulse --encoding s16 --no-gapless \"$MP3\"\n\
+              \x20\x20 # drain can block forever if the sink is wedged; bound it.\n\
+              \x20\x20 if command -v pactl >/dev/null 2>&1; then\n\
+              \x20\x20\x20 pactl drain 2>/dev/null &\n\
+              \x20\x20\x20 d=$!\n\
+              \x20\x20\x20 ( sleep 5; kill \"$d\" 2>/dev/null ) &\n\
+              \x20\x20\x20 wait \"$d\" 2>/dev/null || true\n\
+              \x20\x20 fi\n\
               \x20 else\n\
-              \x20\x20 # No daemon socket: the pulse plugin cannot answer, so try\n\
-              \x20\x20 # a direct card and then the OSS shim.\n\
               \x20\x20 play -q -o alsa,oss --encoding s16 --no-gapless \"$MP3\"\n\
               \x20 fi\n\
               \x20 exit 0\n\
@@ -5524,7 +5533,7 @@ mod apk_arch_tests {
             .find("if apk.is_file() {")
             .expect("sigue habiendo una comprobacion del estatico");
         let bloque = &src[i..];
-        let fin = bloque.find("\n        }").unwrap_or(bloque.len());
+        let fin = bloque.find("\n            }").or_else(|| bloque.find("\n        }")).unwrap_or(bloque.len());
         let dentro = &bloque[..fin];
         for aguja in ["repositories", "write_apk_arch", "install_apk_keys"] {
             assert!(
@@ -6778,6 +6787,8 @@ mod rootfs_plumbing_tests {
             body.contains("[ -x \"$d/seatd\" ] && exec \"$d/seatd\" -l info"),
             "seatd no longer runs in the foreground with its log turned on"
         );
+        // Ubuntu ships seatd in /usr/sbin; the search order must include it.
+        assert!(body.contains("for d in /usr/bin /bin /usr/sbin /sbin; do"));
     }
 
     /// The wallpaper and the panel share one preamble, and they have to: it is
@@ -6907,8 +6918,22 @@ mod rootfs_plumbing_tests {
             }
         }
         assert!(
-            body.contains("play -q -o alsa ") && body.contains("play -q -o alsa,oss "),
-            "a playback path stopped going through the watchdog:\n{body}"
+            body.contains("play -q -o pulse ") && body.contains("play -q -o alsa,oss "),
+            "pulse path must use -o pulse (not alsa-first); bare PCM stays alsa,oss:\n{body}"
+        );
+        assert!(
+            !body.contains("play -q -o alsa --encoding"),
+            "with Pulse up, opening ALSA first wedges the exclusive PCM (audio loop):\n{body}"
+        );
+        assert!(
+            body.contains("mpg123.bin"),
+            "chime must prefer mpg123.bin so -o flags are not overridden by wrappers:\n{body}"
+        );
+        // pactl drain can hang forever on a wedged sink; the Ubuntu "final loop"
+        // was drain (or ALSA open) blocking after the track finished.
+        assert!(
+            body.contains("pactl drain") && body.contains("sleep 5; kill \"$d\""),
+            "pactl drain must be time-bounded:\n{body}"
         );
     }
 
@@ -7715,10 +7740,6 @@ mod apk_closure_tests {
             .into_iter()
             .filter(|a| !apk_closure_fits_image(a))
             .collect();
-        assert_eq!(
-            fuera,
-            vec!["riscv64"],
-            "solo riscv64 tiene techo de RAM; si aparece otro, que sea con su motivo escrito"
-        );
+        assert_eq!(fuera, vec!["riscv64"], "solo riscv64 tiene techo de RAM; si aparece otro, que sea con su motivo escrito");
     }
 }

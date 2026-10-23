@@ -163,6 +163,7 @@ impl FileSystem for CountedFs {
             files: 0,
             ffree: 0,
             namemax: 0,
+            ftype: 0xEF53,
         }
     }
 }

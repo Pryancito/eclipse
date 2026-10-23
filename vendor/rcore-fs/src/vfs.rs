@@ -527,6 +527,14 @@ pub enum FileType {
     Socket,
 }
 
+/// Linux `statfs.f_type` magics (`include/uapi/linux/magic.h`).
+pub const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+pub const SYSFS_MAGIC: u64 = 0x6265_6572;
+pub const TMPFS_MAGIC: u64 = 0x0102_1994;
+pub const EXT4_SUPER_MAGIC: u64 = 0xEF53;
+pub const BTRFS_SUPER_MAGIC: u64 = 0x9123_683E;
+pub const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
+
 /// Metadata of FileSystem
 ///
 /// Ref: [http://pubs.opengroup.org/onlinepubs/9699919799/]
@@ -548,6 +556,10 @@ pub struct FsInfo {
     pub ffree: usize,
     /// Maximum filename length
     pub namemax: usize,
+    /// Linux `statfs.f_type` filesystem magic. Userspace probes (systemd
+    /// `proc_mounted()`, `df -T`, …) key off this; a wrong value makes
+    /// `/proc` look unmounted even when it is present.
+    pub ftype: u64,
 }
 
 // Note: IOError/NoMemory always lead to a panic since it's hard to recover from it.
@@ -672,6 +684,7 @@ impl FileSystem for NoFileSystem {
             files: 0,
             ffree: 0,
             namemax: 255,
+            ftype: EXT4_SUPER_MAGIC,
         }
     }
 }
@@ -1356,6 +1369,7 @@ mod tests {
                 files: 0,
                 ffree: 0,
                 namemax: 255,
+                ftype: EXT4_SUPER_MAGIC,
             }
         }
     }

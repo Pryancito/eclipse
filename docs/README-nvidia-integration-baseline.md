@@ -158,7 +158,7 @@ soname. Tienen que ser **de la misma versión exacta que el RM**: abren con
 Salen del archivo de Ubuntu (`archive.ubuntu.com`, paquetes
 `libnvidia-compute-<rama>` y `nvidia-utils-<rama>`), que lleva los binarios
 de NVIDIA tal cual, los mismos del `.run`. Como son glibc y la imagen es
-musl, también se instala la glibc de Ubuntu 24.04 (`libc6` y `libgcc-s1`,
+musl, también se instala la glibc de Ubuntu 26.10 (`libc6` y `libgcc-s1`,
 fijados por nombre y SHA-256): el cargador en `/lib64/ld-linux-x86-64.so.2`
 y las bibliotecas en `/usr/lib/x86_64-linux-gnu`, que ese cargador mira
 antes que `/usr/lib`, donde están las de musl. Una raíz que ya trae su

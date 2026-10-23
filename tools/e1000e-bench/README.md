@@ -1,5 +1,10 @@
 # Banco de pruebas del driver e1000e (apk update bajo QEMU)
 
+**Legado Alpine:** este banco sigue usando un mirror **apk** firmado como
+carga de red reproducible. El guest de producto usa apt (Ubuntu 26.10); para
+correr el bench hace falta `ECLIPSE_PKG=apk` o una rootfs que aún lleve
+`/bin/apk`. Migrar el bench a `apt-get update` queda pendiente.
+
 Reproduce, de forma autocontenida y sin acceso a Internet, el escenario que
 estresa el driver `drivers/src/net/e1000e.rs`: la descarga del índice de
 paquetes por `apk update` y transferencias TCP de varios MB.

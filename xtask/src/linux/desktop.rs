@@ -18,7 +18,7 @@
 //!   is the only delivery that survives every launch path).
 //!
 //! Runtime packages:
-//! `apk add labwc foot xkeyboard-config font-dejavu adwaita-icon-theme`
+//! `apt-get install labwc foot xkb-data fonts-dejavu adwaita-icon-theme`
 //! (lunarbg/lunarbar are Eclipse's own binaries; swaybg/waybar are no longer
 //! used — the native clients replaced them).
 //!
@@ -1264,7 +1264,7 @@ fn write_x11_prepare(rootfs: &Path) {
           \x20  && ! ls -d /usr/lib/glycin-loaders/*/*svg* >/dev/null 2>&1; then\n\
           \x20 if command -v apk >/dev/null 2>&1 && have_default_route; then\n\
           \x20   echo '[prepare] no SVG pixbuf loader; fetching librsvg'\n\
-          \x20   apk add librsvg adwaita-icon-theme shared-mime-info > /tmp/apk-librsvg.out 2>&1\n\
+          \x20   apt-get install -y librsvg2-common adwaita-icon-theme shared-mime-info > /tmp/apt-librsvg.out 2>&1\n\
           \x20   rc=$?\n\
           \x20   rm -f /usr/lib/gdk-pixbuf-2.0/*/loaders.cache\n\
           \x20   tail -5 /tmp/apk-librsvg.out\n\
@@ -1272,7 +1272,7 @@ fn write_x11_prepare(rootfs: &Path) {
           \x20   # thing nobody can see from a `startx` paste, and it is the\n\
           \x20   # difference between \"the package name is wrong\" and \"there\n\
           \x20   # was no network yet\".\n\
-          \x20   echo \"[eclipse-x11] apk add librsvg rc=$rc: $(tail -1 /tmp/apk-librsvg.out)\" > /dev/console 2>/dev/null\n\
+          \x20   echo \"[eclipse-x11] apt-get install librsvg2-common rc=$rc: $(tail -1 /tmp/apt-librsvg.out)\" > /dev/console 2>/dev/null\n\
           \x20 else\n\
           \x20   echo '[prepare] no SVG pixbuf loader and no network to fetch one'\n\
           \x20   echo \"[eclipse-x11] SVG loader missing; apk=$(command -v apk >/dev/null 2>&1 && echo yes || echo no) default-route=$(have_default_route && echo yes || echo no)\" > /dev/console 2>/dev/null\n\
@@ -1282,7 +1282,7 @@ fn write_x11_prepare(rootfs: &Path) {
           #\n\
           # Regenerated UNCONDITIONALLY, not just when absent. A cache that\n\
           # exists is not a cache that is right: install a loader afterwards\n\
-          # (`apk add librsvg`) and the stale cache still lists only what was\n\
+          # (`apt-get install librsvg2-common`) and the stale cache still lists only what was\n\
           # there before, so the new loader is never registered and icons keep\n\
           # failing exactly as if it had not been installed. Rebuilding it is a\n\
           # scan of a handful of .so files -- milliseconds -- unlike the icon\n\
@@ -1532,8 +1532,8 @@ fn write_terminal_wrapper(rootfs: &Path) {
           \x20 echo \"[eclipse-terminal] alacritty exited rc=$rc\" >>\"$TLOG\"\n\
           \x20 exit \"$rc\"\n\
           fi\n\
-          echo 'eclipse-terminal: no terminal found (apk add foot)' >&2\n\
-          echo 'eclipse-terminal: no terminal found (apk add foot)' >>\"$TLOG\"\n\
+          echo 'eclipse-terminal: no terminal found (apt-get install foot)' >&2\n\
+          echo 'eclipse-terminal: no terminal found (apt-get install foot)' >>\"$TLOG\"\n\
           exit 127\n",
     )
     .unwrap();
@@ -1643,7 +1643,7 @@ fn write_firefox_wrapper(rootfs: &Path) {
           \x20 if command -v \"$c\" >/dev/null 2>&1; then FFBIN=$c; break; fi\n\
           done\n\
           if [ -z \"$FFBIN\" ]; then\n\
-          \x20 echo 'eclipse-firefox: firefox not found (apk add firefox)' >&2\n\
+          \x20 echo 'eclipse-firefox: firefox not found (apt-get install firefox)' >&2\n\
           \x20 echo 'eclipse-firefox: firefox not found' >>\"$FLOG\"\n\
           \x20 exit 127\n\
           fi\n\
@@ -1801,7 +1801,7 @@ const FIREFOX_PACKAGES: &[(&str, &str)] = &[
 /// One override per package that is actually in the rootfs, and the one for a
 /// package that is not there is removed, so an incremental build that switched
 /// packages does not keep a stale entry. With no Firefox installed at all (an
-/// offline build) the default package's entry is written, so a later `apk add`
+/// offline build) the default package's entry is written, so a later `apt-get install`
 /// is shadowed from the start. Runs after apk, next to
 /// [`write_firefox_default_prefs`], for that reason.
 pub fn write_firefox_desktop_override(rootfs: &Path) {
@@ -2410,7 +2410,7 @@ fn write_xorg_config(rootfs: &Path) {
           for t in xterm st urxvt rxvt; do\n\
           \x20 if command -v \"$t\" >/dev/null 2>&1; then echo \"[xinit] term=$t\"; exec \"$t\"; fi\n\
           done\n\
-          echo '[xinit] no X terminal found (apk add xterm); holding the server open'\n\
+          echo '[xinit] no X terminal found (apt-get install xterm); holding the server open'\n\
           exec sleep 2147483647\n",
     )
     .unwrap();
@@ -3052,7 +3052,7 @@ fn write_labwc_wrapper(rootfs: &Path) {
           export XDG_RUNTIME_DIR\n\
           [ -d \"$XDG_RUNTIME_DIR\" ] || { mkdir -p \"$XDG_RUNTIME_DIR\" && chmod 0700 \"$XDG_RUNTIME_DIR\"; }\n\
           # Software cursor needs an XCURSOR theme on disk; wlroots draws NO\n\
-          # pointer without one (apk add adwaita-icon-theme).\n\
+          # pointer without one (apt-get install adwaita-icon-theme).\n\
           : \"${XCURSOR_THEME:=Adwaita}\"; export XCURSOR_THEME\n\
           : \"${XCURSOR_SIZE:=24}\"; export XCURSOR_SIZE\n\
           # Do NOT set WLR_NO_HARDWARE_CURSORS: the kernel DRM scheme composites\n\
@@ -3221,20 +3221,17 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # never source -- that difference alone kept the boot session dead\n\
           # while a console-launched labwc worked.)\n\
           : \"${WLR_LIBINPUT_NO_DEVICES:=1}\"; export WLR_LIBINPUT_NO_DEVICES\n\
-          # Seat/session: wlroots opens DRM and input devices through libseat.\n\
-          # eclipse-init runs a seatd daemon (seatd.service); libseat auto-\n\
-          # detects it via the socket, so LIBSEAT_BACKEND stays UNSET here.\n\
-          # Do NOT set LIBSEAT_BACKEND=builtin: Alpine's libseat is built\n\
-          # without the daemonless builtin backend, so that only yields\n\
-          # 'No backend matched name builtin' and labwc aborts. A caller-set\n\
-          # LIBSEAT_BACKEND still wins if someone knows better.\n\
+          # Seat/session: wlroots opens DRM and input through libseat.\n\
+          # Ubuntu's libseat links libsystemd and may prefer the logind\n\
+          # backend; without logind, open_device fails with 'client is not\n\
+          # active' and input stays dead while the desktop still paints.\n\
+          # Pin seatd (eclipse-init runs seatd.service). Callers can still\n\
+          # override. Do NOT default to builtin - Alpine libseat lacks it.\n\
+          : \"${LIBSEAT_BACKEND:=seatd}\"; export LIBSEAT_BACKEND\n\
           # No wait loop here: eclipse-init already parks natively on\n\
-          # wait_socket=/run/seatd.sock before EVERY start of this service\n\
-          # (boot and crash-restarts alike). The old `sleep 0.1`-per-poll\n\
-          # shell loop forked a busybox per iteration for nothing; a manual\n\
-          # launch from a shell has seatd long since up. One-shot diagnose:\n\
+          # wait_socket=/run/seatd.sock before EVERY start of this service.\n\
           seatd_sock=\"${SEATD_SOCK:-/run/seatd.sock}\"\n\
-          if [ -z \"${LIBSEAT_BACKEND:-}\" ] && [ ! -S \"$seatd_sock\" ]; then\n\
+          if [ ! -S \"$seatd_sock\" ]; then\n\
           \x20 echo \"labwc: seatd socket $seatd_sock not up; libseat may fail\" >&2\n\
           fi\n\
           # XDG basedir a few clients read; harmless if already set.\n\
@@ -3323,7 +3320,7 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # write the reason into the log and onto the console as well.\n\
           MSG='labwc: the real labwc binary is NOT INSTALLED -- the Wayland\n\
           session cannot start, so lunarbg/lunarbar have nothing to connect to.\n\
-          Fix: apk add labwc seatd  (needs network at image-build time).'\n\
+          Fix: apt-get install labwc seatd  (needs network at image-build time).'\n\
           echo \"$MSG\" >>\"$LOG\" 2>/dev/null || true\n\
           echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
           echo \"$MSG\" >&2\n\

@@ -319,14 +319,13 @@ Usa el siguiente comando para construir la imagen:
 cargo bin -m cr1825 -o z.bin
 ```
 
-## Gestión de Paquetes (APK Tools)
+## Gestión de Paquetes (apt / Ubuntu 26.10)
 
-zCore (Eclipse OS) utiliza `apk-tools` como gestor de paquetes. Para compilarlo y preparar el entorno:
+Eclipse OS usa **apt/dpkg** con paquetes de **Ubuntu 26.10 (stonking)** como grifo del userspace (no es Ubuntu completo: init y tools propias siguen siendo estáticos).
 
-Para instalar las claves de confianza de Alpine:
-```bash
-apk add -X https://dl-cdn.alpinelinux.org/alpine/v3.24/main -u alpine-keys
-```
+- Knob de build: `ECLIPSE_PKG=apt` (por defecto en x86_64/aarch64) o `ECLIPSE_PKG=apk` (legado Alpine).
+- En el guest: `apt-get update && apt-get install <paquete>`.
+- El cierre de escritorio se arma en xtask desde el archive de Ubuntu (`xtask/src/linux/apt_rootfs.rs`).
 
 ## Documentación
 

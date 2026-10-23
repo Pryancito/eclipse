@@ -13,6 +13,11 @@ pub const TCSETS: usize = 0x5402;
 pub const TCSETSW: usize = 0x5403;
 pub const TCSETSF: usize = 0x5404;
 
+pub const TCGETS2: usize = 0x802c542a;
+pub const TCSETS2: usize = 0x402c542b;
+pub const TCSETSW2: usize = 0x402c542c;
+pub const TCSETSF2: usize = 0x402c542d;
+
 /// The Linux **kernel ABI** `struct termios` exchanged by `TCGETS`/`TCSETS`
 /// (asm-generic/termbits.h): `NCCS = 19`, no separate `c_ispeed`/`c_ospeed`
 /// (the line speed lives in the `CBAUD` bits of `c_cflag`). This is exactly 36
@@ -34,6 +39,49 @@ pub struct Termios {
     pub c_lflag: u32,
     pub c_line: u8,
     pub c_cc: [u8; 19],
+}
+
+/// The Linux **kernel ABI** `struct termios2` (asm-generic/termbits-common.h):
+/// 44 bytes, adds separate `c_ispeed` and `c_ospeed` fields to `termios`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Termios2 {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; 19],
+    pub c_ispeed: u32,
+    pub c_ospeed: u32,
+}
+
+impl From<Termios> for Termios2 {
+    fn from(t: Termios) -> Self {
+        Self {
+            c_iflag: t.c_iflag,
+            c_oflag: t.c_oflag,
+            c_cflag: t.c_cflag,
+            c_lflag: t.c_lflag,
+            c_line: t.c_line,
+            c_cc: t.c_cc,
+            c_ispeed: 38400,
+            c_ospeed: 38400,
+        }
+    }
+}
+
+impl From<Termios2> for Termios {
+    fn from(t: Termios2) -> Self {
+        Self {
+            c_iflag: t.c_iflag,
+            c_oflag: t.c_oflag,
+            c_cflag: t.c_cflag,
+            c_lflag: t.c_lflag,
+            c_line: t.c_line,
+            c_cc: t.c_cc,
+        }
+    }
 }
 
 impl Termios {
@@ -1782,6 +1830,10 @@ mod request_number_tests {
         // `'T'` is 0x54, and the command number is what the header writes
         // after it. These are the requests a libc terminal call sends.
         assert_eq!(TCGETS, io(b'T', 0x01), "tcgetattr");
+        assert_eq!(TCGETS2, ior(b'T', 0x2A, core::mem::size_of::<Termios2>()), "tcgetattr2");
+        assert_eq!(TCSETS2, iow(b'T', 0x2B, core::mem::size_of::<Termios2>()), "tcsetattr2");
+        assert_eq!(TCSETSW2, iow(b'T', 0x2C, core::mem::size_of::<Termios2>()));
+        assert_eq!(TCSETSF2, iow(b'T', 0x2D, core::mem::size_of::<Termios2>()));
         assert_eq!(TCSETS, io(b'T', 0x02), "tcsetattr TCSANOW");
         assert_eq!(TCSETSW, io(b'T', 0x03), "tcsetattr TCSADRAIN");
         assert_eq!(TCSETSF, io(b'T', 0x04), "tcsetattr TCSAFLUSH");

@@ -155,7 +155,7 @@ fn gtk_caches_and_firefox_wrappers_parse_and_cover_both_caches() {
         ff.contains("for c in firefox firefox-esr; do\n"),
         "the wrapper must try firefox before firefox-esr"
     );
-    assert!(ff.contains("(apk add firefox)"));
+    assert!(ff.contains("(apt-get install firefox)"));
     assert!(ff.contains("export MOZ_ENABLE_WAYLAND=1\n"));
     assert!(
         ff.contains("MOZ_ACCELERATED=1"),
@@ -294,7 +294,7 @@ fn firefox_desktop_override_follows_the_installed_package() {
     let entry = |id: &str| apps.join(format!("{id}.desktop"));
 
     // Nothing installed (an offline build): the default package's entry,
-    // so a later `apk add firefox` is shadowed from the start.
+    // so a later `apt-get install firefox` is shadowed from the start.
     fs::create_dir_all(&dir).unwrap();
     write_firefox_desktop_override(&dir);
     assert!(entry("firefox").is_file(), "default entry");

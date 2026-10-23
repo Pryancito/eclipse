@@ -35,7 +35,7 @@ esto hay que hacerlo a mano en una imagen construida con xtask
 manual sobre Alpine:
 
 ```sh
-apk add xorg-server xf86-video-fbdev xf86-input-libinput xinit mesa-dri-gallium
+apt-get install xserver-xorg-core xserver-xorg-video-fbdev xserver-xorg-input-libinput xinit libgl1-mesa-dri
 ```
 
 El fichero generado es `/etc/X11/xorg.conf.d/10-eclipse.conf`:
@@ -131,7 +131,7 @@ LD_TRACE_LOADED_OBJECTS=1 Xorg   # lista las .so que necesita y cuáles faltan
 ```
 
 Si `Xorg -version` falla con `Error loading shared library libfoo.so.N`,
-instala el paquete correspondiente (`apk add ...`) y reintenta. Cuando
+instala el paquete correspondiente (`apt-get install ...`) y reintenta. Cuando
 `Xorg -version` imprime la versión, el problema ya no es el enlazado y conviene
 mirar `/tmp/Xorg.log` (sección anterior) para el siguiente fallo.
 

@@ -11,7 +11,57 @@ use rcore_fs::vfs::{
     FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec, Walked,
 };
 
-use crate::fs::pseudo::Pseudo;
+use crate::fs::pseudo::Pseudo as BasePseudo;
+
+/// Distinct anonymous `dev_t` (`0:2`) for `/sys`.
+///
+/// The root filesystem (`/` on `RamFS` or `EclipseFS`) uses `dev = 0` and
+/// `inode = 1`. When `/sys` (`SysRootINode`) also reported `dev = 0, inode = 1`,
+/// systemd 261's `chaseat()` and `dir_fd_is_root()` (used by Ubuntu 26.10's
+/// `libudev.so.1`) compared `/sys` against `/` via `statx_inode_same()` and
+/// `statx_mount_same()` and concluded `/sys` WAS `/`. Giving sysfs its own
+/// anonymous device number separates both `(st_dev, st_ino)` and `stx_mnt_id`.
+const SYSFS_DEV: usize = 2;
+
+struct Pseudo(BasePseudo);
+
+impl Pseudo {
+    fn new(s: &str, type_: FileType) -> Self {
+        Self(BasePseudo::new(s, type_))
+    }
+
+    fn new_bytes(content: Vec<u8>, type_: FileType) -> Self {
+        Self(BasePseudo::new_bytes(content, type_))
+    }
+}
+
+impl INode for Pseudo {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        self.0.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
+        self.0.write_at(offset, buf)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        self.0.poll()
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        let mut md = self.0.metadata()?;
+        md.dev = SYSFS_DEV;
+        Ok(md)
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+}
 
 pub struct SysFS;
 
@@ -40,6 +90,7 @@ impl FileSystem for SysFS {
             files: 0,
             ffree: 0,
             namemax: 255,
+            ftype: rcore_fs::vfs::SYSFS_MAGIC,
         }
     }
 }
@@ -137,7 +188,7 @@ fn nth_entry<S: AsRef<str>>(id: usize, names: &[S]) -> Result<String> {
 
 fn dir_metadata(inode: usize) -> Metadata {
     Metadata {
-        dev: 0,
+        dev: SYSFS_DEV,
         inode,
         size: 0,
         blk_size: 0,
@@ -1962,17 +2013,25 @@ fn input_id_props(id: usize) -> String {
     let abs = dev.capability(CapabilityType::AbsAxis);
 
     // Linux input-event-codes: REL_X=0 REL_Y=1; BTN_LEFT=0x110 BTN_TOUCH=0x14a;
-    // KEY_ESC=1 KEY_SPACE=57; ABS_X=0.
-    let is_mouse = rel.contains(0)
-        || rel.contains(1)
-        || key.contains(0x110)
-        || (abs.contains(0) && abs.contains(1) && key.contains(0x110));
-    let is_touch = abs.contains(0) && key.contains(0x14a);
-    let is_keyboard = key.contains(1) && key.contains(57);
+    // KEY_ESC=1; ABS_X/Y=0/1. Keep in sync with the synthetic /run/udev/data
+    // writer in `create_root_fs` — libudev reads both uevent props and the db.
+    let has_rel_xy = rel.contains(0) && rel.contains(1);
+    let has_abs_xy = abs.contains(0) && abs.contains(1);
+    let has_btn_left = key.contains(0x110);
+    let has_tool_pen = key.contains(0x140); // BTN_TOOL_PEN
+    let is_keyboard = key.contains(1); // KEY_ESC (do not also require KEY_SPACE)
+    let is_touch = has_abs_xy && key.contains(0x14a) && !has_tool_pen;
+    // QEMU's `usb-tablet` is an *absolute mouse* (ABS_X/Y + BTN_LEFT, no stylus).
+    // Real tablets advertise BTN_TOOL_PEN (0x140); only those get ID_INPUT_TABLET.
+    let is_tablet = has_abs_xy && has_tool_pen;
+    let is_mouse = has_rel_xy || (has_btn_left && has_abs_xy && !is_tablet && !is_touch);
 
-    let mut s = String::from("ID_INPUT=1\n");
+    let mut s = String::from("ID_INPUT=1\nID_SEAT=seat0\n");
     if is_keyboard {
-        s.push_str("ID_INPUT_KEYBOARD=1\n");
+        s.push_str("ID_INPUT_KEYBOARD=1\nID_INPUT_KEY=1\n");
+    }
+    if is_tablet {
+        s.push_str("ID_INPUT_TABLET=1\n");
     }
     if is_mouse {
         s.push_str("ID_INPUT_MOUSE=1\n");
@@ -1982,7 +2041,7 @@ fn input_id_props(id: usize) -> String {
     }
     // If nothing matched but the device has keys, mark it a key device so
     // libinput still assigns it a capability instead of ignoring it.
-    if !is_keyboard && !is_mouse && !is_touch && key.contains(1) {
+    if !is_keyboard && !is_mouse && !is_tablet && !is_touch && key.contains(1) {
         s.push_str("ID_INPUT_KEY=1\n");
     }
     s
@@ -2378,7 +2437,7 @@ impl INode for ThermalAttrINode {
 
     fn metadata(&self) -> Result<Metadata> {
         Ok(Metadata {
-            dev: 0,
+            dev: SYSFS_DEV,
             inode: 0,
             size: self.value().len(),
             blk_size: 0,
@@ -2721,7 +2780,7 @@ impl INode for PmAttrINode {
 
     fn metadata(&self) -> Result<Metadata> {
         Ok(Metadata {
-            dev: 0,
+            dev: SYSFS_DEV,
             inode: 0,
             size: self.value().len(),
             blk_size: 0,
@@ -3798,5 +3857,21 @@ mod tree_tests {
             vec![String::from("."), String::from("..")]
         );
         assert!(whole_tree().len() > 30);
+    }
+
+    #[test]
+    fn sysfs_device_id_is_distinct_from_root_fs() {
+        let _bus = test_bus::with(test_bus::a_real_machine());
+        let root_md = SYS_ROOT.metadata().unwrap();
+        assert_eq!(root_md.dev, SYSFS_DEV);
+        assert_ne!(
+            (root_md.dev, root_md.inode),
+            (0, 1),
+            "/sys must not share (dev=0, ino=1) with / or systemd's chaseat/dir_fd_is_root mistakes /sys for /"
+        );
+        for node in whole_tree() {
+            let md = node.inode.metadata().unwrap();
+            assert_eq!(md.dev, SYSFS_DEV, "{} has dev={}", node.path, md.dev);
+        }
     }
 }

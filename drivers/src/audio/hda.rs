@@ -293,6 +293,37 @@ const LPIB_POLL_MIN_US: u64 = 250;
 /// rejects most of them and the time budget rejects the rest.
 const POS_SLACK: usize = BDL_SEGMENT;
 
+/// The most the controller's reported position may run ahead of the link
+/// clock before the clock is taken to be the one that is wrong.
+///
+/// The clock is the play floor because a reported position can run ahead of
+/// what the link has really played (prefetch: 15-27 KB on real hardware,
+/// up to 106 KB measured on QEMU). That is a BOUNDED lead. A lead that keeps
+/// growing is not prefetch but two clocks drifting apart: QEMU's `intel-hda`
+/// paces its DMA by its audio backend, and over a stream that never stops
+/// (PulseAudio keeps hw:0,0 open and writing silence while IDLE) it was seen
+/// to fetch ~18% faster than WALCLK -- 1.6 MB ahead after 47 s. The fill
+/// window is measured from the clock (`consumed + ring - guard`), so once
+/// the lead passed `ring - guard - depth` the window closed for good:
+/// `ahead=262144B window=0B`, no stream was pulled any more, every fill came
+/// in late, and the engine played a stale lap.
+///
+/// Prefetch and drift are told apart by size. A lead up to
+/// [`DRIFT_TRIGGER`] (the edge of the window the fill can use) is taken as
+/// prefetch and the clock stays the floor, exactly as before. A lead past it
+/// is more than the ring could be holding unplayed, so the clock is declared
+/// drifting for the rest of the stream and re-based onto the reported
+/// position, keeping the lead at this figure -- which leaves the window room
+/// for [`FILL_DEPTH`] and the silence band ahead of the engine.
+const MAX_POS_LEAD: usize = RING_PAGES * 4096 / 2;
+/// See [`MAX_POS_LEAD`]: the lead past which the clock counts as drifting.
+const DRIFT_TRIGGER: usize = RING_PAGES * 4096 - RING_GUARD - BDL_SEGMENT;
+const _: () = assert!(
+    MAX_POS_LEAD + FILL_DEPTH + SILENCE_AHEAD <= RING_PAGES * 4096 - RING_GUARD
+        && MAX_POS_LEAD < DRIFT_TRIGGER,
+    "the re-based clock must leave the fill a window"
+);
+
 /// Shortest interval between two presence-detect *triggers* on a digital pin.
 ///
 /// `GET_PIN_SENSE` on an HDMI/DP pin only reports what the last
@@ -387,6 +418,42 @@ fn fill_span(
     let window = consumed.saturating_add(ring.saturating_sub(guard) as u64);
     let target = ahead.min(window);
     (target.saturating_sub(fill_pos) as usize) / frame * frame
+}
+
+/// The link clock with its drift correction applied: `raw` plus `bias`.
+///
+/// Until `*drifting` is set, a lead of the reported position over the clock
+/// is prefetch and is left alone -- up to `trigger`, the edge of the window
+/// the fill can work with. A lead past `trigger` cannot be prefetch the
+/// ring can hold, so the clock is declared drifting (for the rest of the
+/// stream) and from then on `bias` grows, by whole frames, until `reported`
+/// is no more than `max_lead` ahead. Returns the corrected clock and the new
+/// bias. See [`MAX_POS_LEAD`].
+fn rebase_clock(
+    raw: u64,
+    bias: u64,
+    reported: u64,
+    trigger: u64,
+    max_lead: u64,
+    frame: u64,
+    drifting: &mut bool,
+) -> (u64, u64) {
+    let clock = raw.saturating_add(bias);
+    if frame == 0 {
+        return (clock, bias);
+    }
+    if !*drifting {
+        if reported <= clock.saturating_add(trigger) {
+            return (clock, bias);
+        }
+        *drifting = true;
+    }
+    let limit = clock.saturating_add(max_lead);
+    if reported <= limit {
+        return (clock, bias);
+    }
+    let shift = (reported - limit) / frame * frame;
+    (clock + shift, bias + shift)
 }
 
 /// One block of the mixer (SOF `mixer`, `mix_n_s16`): pull `out.len()`
@@ -559,6 +626,13 @@ struct HdaInner {
     /// running (pauses excluded, 32-bit wrap handled by polling often).
     wall_last: u32,
     wall_ticks: u64,
+    /// Bytes added to the link clock because the reported position ran
+    /// further ahead of it than [`MAX_POS_LEAD`] (clock drift, not prefetch).
+    /// Reset with the stream; the total is reported in `/proc/gpusnd`.
+    clock_bias: u64,
+    /// The reported position has run past [`DRIFT_TRIGGER`] on this stream:
+    /// from then on the clock follows it (see [`rebase_clock`]).
+    clock_drifting: bool,
     /// Accepted advance of each reported position since RUN, unwrapped.
     lpib_total: u64,
     dpib_total: u64,
@@ -1044,6 +1118,22 @@ impl HdaInner {
         self.lead_now = reported.saturating_sub(by_clock);
         self.stat_lead = self.stat_lead.max(self.lead_now);
 
+        // Re-base a drifting clock (see [`MAX_POS_LEAD`]). The lead stats
+        // above stay on the raw clock, so `/proc/gpusnd` still shows the
+        // drift; the play floor and the fill window follow the bias.
+        let mut drifting = self.clock_drifting;
+        let (by_clock, bias) = rebase_clock(
+            by_clock,
+            self.clock_bias,
+            reported,
+            DRIFT_TRIGGER as u64,
+            MAX_POS_LEAD as u64,
+            frame,
+            &mut drifting,
+        );
+        self.clock_drifting = drifting;
+        self.clock_bias = bias;
+
         // Consumed is the smaller of the two, and never goes backwards.
         self.consumed = self.consumed.max(by_clock.min(reported));
         self.fill_ring(now_us, reported);
@@ -1380,6 +1470,8 @@ impl HdaInner {
         self.stream_start_wall = mmio_r32(bar, REG_WALCLK);
         self.wall_last = self.stream_start_wall;
         self.wall_ticks = 0;
+        self.clock_bias = 0;
+        self.clock_drifting = false;
         self.lpib_total = 0;
         self.dpib_total = 0;
         self.consumed = 0;
@@ -2464,6 +2556,8 @@ impl HdaInner {
             consumed: 0,
             wall_last: 0,
             wall_ticks: 0,
+            clock_bias: 0,
+            clock_drifting: false,
             lpib_total: 0,
             dpib_total: 0,
             stat_lead: 0,
@@ -3232,7 +3326,7 @@ impl AudioScheme for HdaDevice {
             let engine_rate = (consumed * 1000).checked_div(wall_ms).unwrap_or(0);
             let _ = writeln!(
                 out,
-                "[gpusnd] clocks: stream age {} ms by kernel clock, {} ms by HDA wall clock (kernel/wall = {}.{:02}); link consumed {} B = {} B/s by wall clock (PCM rate {} B/s); reported position ran ahead of the link clock by up to {} B, now {} B (link start latency ~{} ms)",
+                "[gpusnd] clocks: stream age {} ms by kernel clock, {} ms by HDA wall clock (kernel/wall = {}.{:02}); link consumed {} B = {} B/s by wall clock (PCM rate {} B/s); reported position ran ahead of the link clock by up to {} B, now {} B (link start latency ~{} ms); clock re-based by {} B (drift past the {} B prefetch bound)",
                 kernel_ms,
                 wall_ms,
                 ratio_pct / 100,
@@ -3243,7 +3337,9 @@ impl AudioScheme for HdaDevice {
                 inner.stat_lead,
                 inner.lead_now,
                 (inner.stat_lead - inner.lead_now) * 1000
-                    / (inner.rate as u64 * inner.frame_bytes() as u64).max(1)
+                    / (inner.rate as u64 * inner.frame_bytes() as u64).max(1),
+                inner.clock_bias,
+                MAX_POS_LEAD
             );
         }
         // The last gaps, oldest first. wavplay's tone is 576000 B, so a gap
@@ -3378,17 +3474,28 @@ impl AudioScheme for HdaDevice {
             let pwr = inner
                 .diag_cmd(pin, VERB_GET_POWER_STATE, &mut budget)
                 .unwrap_or(0xffff_ffff);
+            let present = sense & (1 << 31) != 0;
+            let eld_valid = sense & (1 << 30) != 0;
             let _ = writeln!(
                 out,
                 "[gpusnd]   pin: ctl {:#x} (OUT_EN={}) sense {:#010x} (present={}, eld_valid={}) eapd {:#x} power {:#x}",
                 ctl,
                 (ctl & PIN_CTL_OUT_EN != 0) as u8,
                 sense,
-                (sense & (1 << 31) != 0) as u8,
-                (sense & (1 << 30) != 0) as u8,
+                present as u8,
+                eld_valid as u8,
                 eapd,
                 pwr
             );
+            // QEMU's hda-output does not implement GET_PIN_SENSE (always 0).
+            // That is not a mute and does not cause OSS EIO — only HDMI/DP
+            // cares about PD/ELD for routing.
+            if !present && !inner.digital {
+                let _ = writeln!(
+                    out,
+                    "[gpusnd]   note: present=0 on analog is normal under QEMU; playback does not require a jack"
+                );
+            }
         }
 
         if budget.dead {
@@ -3539,7 +3646,10 @@ mod dai_tests {
     //! ahead of the engine (audible), behind it (never heard), or over what
     //! is still playing (heard as a dropout).
 
-    use super::{fill_span, mix_streams, BDL_SEGMENT, FILL_DEPTH, RING_GUARD, RING_PAGES};
+    use super::{
+        fill_span, mix_streams, rebase_clock, BDL_SEGMENT, DRIFT_TRIGGER, FILL_DEPTH,
+        MAX_POS_LEAD, RING_GUARD, RING_PAGES,
+    };
     use crate::audio::pipeline::host::HostStream;
     use crate::nvme::nvme_queue::PAGE_SIZE;
     use alloc::vec;
@@ -3547,6 +3657,59 @@ mod dai_tests {
 
     const RING: usize = RING_PAGES * PAGE_SIZE;
     const FRAME: usize = 4;
+
+    fn rebase(raw: u64, bias: u64, reported: u64, drifting: &mut bool) -> (u64, u64) {
+        rebase_clock(
+            raw,
+            bias,
+            reported,
+            DRIFT_TRIGGER as u64,
+            MAX_POS_LEAD as u64,
+            FRAME as u64,
+            drifting,
+        )
+    }
+
+    /// The drift `audio-probe` caught on QEMU: after 47 s the reported
+    /// position was 1637308 B ahead of the link clock and the window was 0.
+    /// Re-based, the fill gets its full depth ahead of the engine again, and
+    /// a lead inside the prefetch envelope is left alone.
+    #[test]
+    fn a_drifting_clock_is_rebased_and_the_fill_window_reopens() {
+        let by_clock = 9_069_240u64;
+        let reported = by_clock + 1_637_308;
+        // Without the re-base: nothing can be written, ever again.
+        let consumed_raw = by_clock.min(reported);
+        assert_eq!(
+            fill_span(reported, consumed_raw, reported, RING, RING_GUARD, FILL_DEPTH, FRAME),
+            0
+        );
+        let mut drifting = false;
+        let (clock, bias) = rebase(by_clock, 0, reported, &mut drifting);
+        assert!(drifting);
+        assert!(reported - clock <= MAX_POS_LEAD as u64);
+        assert_eq!(bias % FRAME as u64, 0);
+        let consumed = clock.min(reported);
+        assert_eq!(
+            fill_span(reported, consumed, reported, RING, RING_GUARD, FILL_DEPTH, FRAME),
+            FILL_DEPTH
+        );
+        // The bias persists: the next poll keeps it and only grows it.
+        let (c2, b2) = rebase(by_clock + 4800, bias, reported + 4800, &mut drifting);
+        assert_eq!((c2, b2), (clock + 4800, bias));
+    }
+
+    /// Prefetch up to the edge of the window (QEMU measured 106 KB, the
+    /// engine tests drive it to `DRIFT_TRIGGER`) is not drift: the clock stays
+    /// the play floor and nothing is re-based.
+    #[test]
+    fn a_prefetch_lead_inside_the_window_leaves_the_clock_alone() {
+        let mut drifting = false;
+        for lead in [0u64, 106_000, MAX_POS_LEAD as u64 + 4, DRIFT_TRIGGER as u64] {
+            assert_eq!(rebase(1000, 0, 1000 + lead, &mut drifting), (1000, 0));
+        }
+        assert!(!drifting);
+    }
 
     #[test]
     fn a_fresh_ring_is_primed_to_the_fill_depth() {

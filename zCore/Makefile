@@ -514,6 +514,12 @@ ifeq ($(ARCH), x86_64)
   endif
   ifeq ($(AUDIODEV),wav)
     qemu_opts += -audiodev wav,id=snd0,path=$(AUDIOWAV)
+  else ifeq ($(AUDIODEV),pipewire)
+    # Default PW buffer is tiny; HDA + PW dropouts/silence are common without
+    # extra latency (see qemu-devel PipeWire backend threads).
+    qemu_opts += -audiodev pipewire,id=snd0,out.latency=100000
+  else ifeq ($(AUDIODEV),pa)
+    qemu_opts += -audiodev pa,id=snd0
   else
     qemu_opts += -audiodev $(AUDIODEV),id=snd0
   endif

@@ -813,6 +813,9 @@ impl Syscall<'_> {
         // closing card0 is normal application behavior (X and every DRM client
         // probe-and-close at startup); available under LOG=debug when hunting.
         if let Ok(f) = proc.get_file_like(fd) {
+            if let Ok(meta) = f.metadata() {
+                linux_object::fs::record_lock::release_file_owner((meta.dev, meta.inode), self.zircon_process().id());
+            }
             if let Some(desc) = linux_object::fs::drm_fd_desc(&f) {
                 debug!(
                     "[drm] pid={} close(fd={:?}) of {}",
@@ -842,6 +845,18 @@ impl Syscall<'_> {
             flags
         );
         let (action, first, last) = close_range_action(first, last, flags)?;
+        if action == CloseRangeAction::Close {
+            let pid = self.zircon_process().id();
+            if let Ok(files) = proc.get_files() {
+                for (fd, f) in files {
+                    if fd >= first && fd <= last {
+                        if let Ok(meta) = f.metadata() {
+                            linux_object::fs::record_lock::release_file_owner((meta.dev, meta.inode), pid);
+                        }
+                    }
+                }
+            }
+        }
         match action {
             CloseRangeAction::MarkCloexec => proc.set_range_cloexec(first, last),
             CloseRangeAction::Close => proc.close_range(first, last),
@@ -863,7 +878,12 @@ impl Syscall<'_> {
         // Install with CLOEXEC in the same table lock as the replace: a
         // separate `dup2` then `set_fd_cloexec` left a window where `execve`
         // on another thread kept the new fd despite `O_CLOEXEC`.
-        let _ = proc.replace_file(fd2, file_like, flags & ANON_CLOEXEC != 0)?;
+        let old = proc.replace_file(fd2, file_like, flags & ANON_CLOEXEC != 0)?;
+        if let Some(old) = old {
+            if let Ok(meta) = old.metadata() {
+                linux_object::fs::record_lock::release_file_owner((meta.dev, meta.inode), self.zircon_process().id());
+            }
+        }
         Ok(fd2.into())
     }
 
@@ -895,6 +915,9 @@ impl Syscall<'_> {
         // EBADF.
         let old = proc.replace_file(fd2, file_like, false)?;
         if let Some(old) = old {
+            if let Ok(meta) = old.metadata() {
+                linux_object::fs::record_lock::release_file_owner((meta.dev, meta.inode), self.zircon_process().id());
+            }
             if let Some(desc) = linux_object::fs::drm_fd_desc(&old) {
                 error!(
                     "[drm] pid={} dup2 clobbered fd={:?} ({})",

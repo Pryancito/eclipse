@@ -26,7 +26,7 @@
 //! The image is musl and NVIDIA's binaries are glibc. Their whole closure is
 //! `libc6` (libc, libm, libdl, libpthread, librt and the loader) plus
 //! `libgcc_s`, which glibc dlopens to unwind a cancelled thread. Both come
-//! from Ubuntu 24.04's release pocket, which never changes, pinned by name and
+//! from Ubuntu 26.10's (`stonking`) release pocket, pinned by name and
 //! SHA-256. The loader goes where the binaries' PT_INTERP names it,
 //! `/lib64/ld-linux-x86-64.so.2`, and the libraries go to
 //! `/usr/lib/x86_64-linux-gnu`, which that loader searches before `/usr/lib`,
@@ -129,13 +129,13 @@ fn plan(version: &str) -> Plan {
     };
     let glibc = Deb::Pinned {
         pool: "main/g/glibc",
-        file: "libc6_2.39-0ubuntu8_amd64.deb",
-        sha256: "af36c7ac770770fe3d3c10e85d6bc538e76e57570ba7db7d397fb9f654783ef3",
+        file: "libc6_2.44-1ubuntu2_amd64.deb",
+        sha256: "e4871fc9d5bf5fe0f384c6b90f70e64e9c9bbcb84927aa97c7f70ec6bf05b8c0",
     };
     let libgcc = Deb::Pinned {
-        pool: "main/g/gcc-14",
-        file: "libgcc-s1_14-20240412-0ubuntu1_amd64.deb",
-        sha256: "a39efdcaa2245f026dc3254ce14fcff255fc430a17064632b6ba7c5da974a912",
+        pool: "main/g/gcc-16",
+        file: "libgcc-s1_16.2.0-3ubuntu1_amd64.deb",
+        sha256: "6d0b3779d578ffc598c26678ea26228b20880044742f44dcd78b2556fdc97d07",
     };
     let mut libc = vec![Take {
         from: format!("{LIBDIR}/ld-linux-x86-64.so.2"),

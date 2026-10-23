@@ -386,7 +386,7 @@ amixer set Master mute
 `alsa-lib`, `alsa-utils`, `pulseaudio`, `pulseaudio-alsa`, `pulseaudio-utils`,
 `libpulse` and `alsa-plugins-pulse` are baked into the rootfs package set
 (`xtask/src/linux/xorg.rs`); anything missing can be added at runtime with
-`apk add`. Each card exposes a simple **Master** mixer (`amixer set Master 50%`,
+`apt-get install`. Each card exposes a simple **Master** mixer (`amixer set Master 50%`,
 `amixer set Master mute`) on the kernel node; with Pulse running, lunarbar and
 `pactl` adjust the sink volume instead.
 

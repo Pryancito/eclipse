@@ -675,6 +675,7 @@ const X_TREES: &[&str] = &[
     "usr/libexec",
     "usr/share",
     "etc/fonts",
+    "etc/alsa",
     "etc/X11",
     // XFCE/GTK: session defaults (xfce4/xfconf per-channel XML, autostart,
     // menus) and the D-Bus policy files.
@@ -682,12 +683,71 @@ const X_TREES: &[&str] = &[
     "etc/dbus-1",
 ];
 
+/// Desktop closure via Ubuntu 26.10 apt (staging extract + merge).
+fn install_via_apt(rootfs: &Path, arch: &str) {
+    let packages: Vec<String> = match std::env::var("ECLIPSE_XORG_PACKAGES") {
+        Ok(list) if !list.trim().is_empty() => {
+            list.split_whitespace().map(str::to_string).collect()
+        }
+        _ => super::apt_rootfs::desktop_packages_ubuntu(),
+    };
+    println!(
+        "Xorg stack: installing {} package(s) via apt (Ubuntu stonking) ...",
+        packages.len(),
+    );
+    super::apt_rootfs::install_packages(rootfs, arch, &packages);
+
+    // Shared post-merge polish (fonts, dirs) — same as the apk success path.
+    let _ = std::fs::create_dir_all(rootfs.join("var/log"));
+    let _ = std::fs::create_dir_all(rootfs.join("var/lib/dbus"));
+    let _ = std::fs::create_dir_all(rootfs.join("var/cache/fontconfig"));
+    let fc_confd = rootfs.join("etc/fonts/conf.d");
+    let _ = std::fs::create_dir_all(&fc_confd);
+    let _ = std::fs::write(
+        rootfs.join("etc/fonts/fonts.conf"),
+        b"<?xml version=\"1.0\"?>\n\
+          <!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n\
+          <fontconfig>\n\
+          \x20 <description>Eclipse: scan only scalable fonts the desktop uses</description>\n\
+          \x20 <dir>/usr/share/fonts/truetype/dejavu</dir>\n\
+          \x20 <dir>/usr/share/fonts/dejavu</dir>\n\
+          \x20 <dir>/usr/local/share/fonts</dir>\n\
+          \x20 <dir prefix=\"xdg\">fonts</dir>\n\
+          \x20 <cachedir>/var/cache/fontconfig</cachedir>\n\
+          \x20 <alias binding=\"strong\"><family>sans-serif</family><prefer><family>DejaVu Sans</family></prefer></alias>\n\
+          \x20 <alias binding=\"strong\"><family>serif</family><prefer><family>DejaVu Serif</family></prefer></alias>\n\
+          \x20 <alias binding=\"strong\"><family>monospace</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>\n\
+          \x20 <include ignore_missing=\"yes\">/etc/fonts/conf.d</include>\n\
+          </fontconfig>\n",
+    );
+    super::desktop::write_xfce_defaults(rootfs);
+    super::desktop::write_fallback_icons(rootfs);
+    let xok = rootfs.join("usr/bin/Xorg").is_file() || rootfs.join("usr/bin/X").is_file();
+    let startx = rootfs.join("usr/bin/startx").is_file();
+    println!(
+        "Xorg stack (apt): X server {}, startx {}, labwc {}.",
+        if xok { "present" } else { "MISSING" },
+        if startx { "present" } else { "MISSING" },
+        if rootfs.join("usr/bin/labwc").is_file() {
+            "present"
+        } else {
+            "MISSING"
+        }
+    );
+    report_freedoom(rootfs, "the rootfs");
+}
+
 /// Populate `rootfs` with the X.Org stack. `apk_bin` is the (host-runnable)
-/// apk binary already staged into the rootfs by `mod.rs`, `arch` the target
-/// arch name (e.g. "x86_64"). Best-effort: never panics, never fails the build.
+/// apk binary for the legacy Alpine path; ignored when `ECLIPSE_PKG=apt`
+/// (default on x86_64/aarch64). Best-effort: never panics, never fails the build.
 pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
     if !enabled() {
         println!("Xorg stack: skipped (ECLIPSE_XORG is off)");
+        return;
+    }
+
+    if super::apt_rootfs::use_apt(arch) {
+        install_via_apt(rootfs, arch);
         return;
     }
 
@@ -1331,7 +1391,8 @@ const LIVE_TREES: &[&str] = &[
     // costs nothing there.
     "lib64",
     "lib/x86_64-linux-gnu",
-    "usr/lib", // libX11/xcb/pixman/drm/input/xkbcommon + usr/lib/xorg modules (minus dri) + libvulkan*/NVK
+    "usr/lib",
+    "usr/lib64", // glibc ld-linux-x86-64.so.2 under Ubuntu's merged-/usr (lib64 -> usr/lib64)
     // Vulkan ICD manifests (usr/share/vulkan/icd.d/nouveau_icd.*.json for NVK,
     // lvp_icd.*.json for lavapipe). The loader (`libvulkan.so.1`, from usr/lib
     // above) finds each driver ONLY through its JSON; without it in the QEMU
@@ -1399,6 +1460,7 @@ const LIVE_TREES: &[&str] = &[
     "usr/share/games",
     "usr/share/doom",
     "etc/fonts",
+    "etc/alsa",
     "etc/libinput", // local-overrides.quirks (if present)
     // ── XFCE4 in QEMU ───────────────────────────────────────────────────────
     // The XFCE/GTK data the session reads at runtime. usr/bin and usr/lib
@@ -1421,6 +1483,18 @@ const LIVE_TREES: &[&str] = &[
     "usr/share/mime",
     "usr/share/applications",
     "usr/share/desktop-directories",
+    // dpkg architecture lookup tables (cputable, tupletable, ostable) and
+    // apt keyring / config data. Without these in the live root, `apt` fails
+    // immediately with "Error: Error reading the CPU table".
+    "usr/share/dpkg",
+    "usr/share/keyrings",
+    "usr/share/apt",
+    // Perl runtime & Debconf modules. Required by `debconf` and maintainer
+    // scripts when `apt install` or `dpkg --configure` runs.
+    "usr/share/debconf",
+    "usr/share/perl5",
+    "usr/share/perl",
+    "etc/perl",
     "etc/xdg",
     "etc/dbus-1",
 ];
@@ -1447,6 +1521,7 @@ fn copy_uncapped(src: &Path, dst: &Path, skip: &Path) {
             if let Some(parent) = dst.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
+            let _ = std::fs::remove_dir_all(dst);
             let _ = std::fs::remove_file(dst);
             let _ = std::os::unix::fs::symlink(target, dst);
         }
@@ -1651,11 +1726,11 @@ pub(super) fn copy_into_live(full: &Path, live: &Path) {
 
 /// Whether an ICU data blob is reachable under `root`, and how.
 ///
-/// ICU4C can be built two ways and Alpine's choice decides which tree carries
-/// the data: `--with-data-packaging=archive` writes
-/// `usr/share/icu/<ver>/icudt<maj>l.dat`, the default links it into
-/// `usr/lib/libicudata.so.<maj>`. Only the second is covered by the `usr/lib`
-/// entry in [`LIVE_TREES`], so report which layout this build actually has.
+/// ICU4C packaging differs by distro:
+/// - Alpine archive: `usr/share/icu/<ver>/icudt*.dat` (`icu-data-en` / `icu-data-full`)
+/// - Alpine/shared or Ubuntu: `libicudata.so.<maj>` (data linked into the .so).
+///   Ubuntu puts it under the multiarch dir
+///   `usr/lib/<triplet>/libicudata.so.*`, not bare `usr/lib/`.
 fn icu_data_layout(root: &Path) -> Option<String> {
     // Archive packaging: usr/share/icu/<ver>/*.dat.
     if let Ok(rd) = std::fs::read_dir(root.join("usr/share/icu")) {
@@ -1674,15 +1749,20 @@ fn icu_data_layout(root: &Path) -> Option<String> {
             }
         }
     }
-    // Shared-library packaging: usr/lib/libicudata.so.<maj>[.<min>].
-    if let Ok(rd) = std::fs::read_dir(root.join("usr/lib")) {
-        for e in rd.flatten() {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            // Skip the bare `libicudata.so` dev symlink: it carries no data of
-            // its own and is absent from the -libs package anyway.
-            if name.starts_with("libicudata.so.") {
-                return Some(format!("usr/lib/{name}"));
+    // Shared-library packaging: search usr/lib and multiarch subdirs.
+    for libdir in [
+        "usr/lib",
+        "usr/lib/x86_64-linux-gnu",
+        "usr/lib/aarch64-linux-gnu",
+    ] {
+        if let Ok(rd) = std::fs::read_dir(root.join(libdir)) {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                // Skip the bare `libicudata.so` dev symlink: it carries no data.
+                if name.starts_with("libicudata.so.") {
+                    return Some(format!("{libdir}/{name}"));
+                }
             }
         }
     }
@@ -1729,9 +1809,9 @@ fn audit_icu_data(full: &Path, live: &Path) {
             eprintln!(
                 "warning: no ICU data blob found in either root, yet Firefox is \
                  installed. SpiderMonkey's ICU4CLibrary::Initialize() will fail and \
-                 Firefox will abort before opening a window. Add an `icu-data-*` package \
-                 to the apk set (Alpine splits ICU into icu-libs and icu-data-en / \
-                 icu-data-full)."
+                 Firefox will abort before opening a window. On apt/Ubuntu add \
+                 `libicu78` (data lives in usr/lib/*/libicudata.so.*); on apk/Alpine \
+                 add `icu-data-en` or `icu-data-full`."
             );
         }
     }
@@ -2693,6 +2773,19 @@ mod tests {
             Some("usr/lib/libicudata.so.76.1")
         );
 
+        // Ubuntu/Debian multiarch: the .so lives under the triplet dir.
+        let multi = d.join("multi");
+        fs::create_dir_all(multi.join("usr/lib/x86_64-linux-gnu")).unwrap();
+        fs::write(
+            multi.join("usr/lib/x86_64-linux-gnu/libicudata.so.74.2"),
+            b"so",
+        )
+        .unwrap();
+        assert_eq!(
+            icu_data_layout(&multi).as_deref(),
+            Some("usr/lib/x86_64-linux-gnu/libicudata.so.74.2")
+        );
+
         assert_eq!(
             icu_data_layout(&d.join("neither")),
             None,
@@ -2806,6 +2899,7 @@ mod tests {
             "usr/bin",
             "usr/sbin",
             "usr/lib",
+            "usr/lib64",
             "usr/libexec",
             "lib64",
             "lib/x86_64-linux-gnu",

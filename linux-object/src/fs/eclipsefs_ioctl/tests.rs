@@ -170,6 +170,10 @@ fn the_ioctl_numbers_are_the_ones_linux_and_btrfs_progs_use() {
     assert_eq!(EFS_IOC_TIER_MIGRATE, ioc(R | W, 0x94, 0xf3, 32));
     assert!(is_fs_ioctl(FICLONE));
     assert!(!is_fs_ioctl(0x5401), "TCGETS is not ours");
+    assert!(is_vfs_clone_ioctl(FICLONE));
+    assert!(is_vfs_clone_ioctl(FICLONERANGE));
+    assert!(is_vfs_clone_ioctl(FIDEDUPERANGE));
+    assert!(!is_vfs_clone_ioctl(FS_IOC_GETFLAGS));
 }
 
 /// The request numbers the test above does not reach, same derivation.

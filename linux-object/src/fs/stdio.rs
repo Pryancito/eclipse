@@ -427,6 +427,11 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             user_copy(UserOutPtr::<Termios>::from(data).write(*tty_termios(vt).lock()))?;
             Ok(0)
         }
+        TCGETS2 => {
+            let t = *tty_termios(vt).lock();
+            user_copy(UserOutPtr::<Termios2>::from(data).write(t.into()))?;
+            Ok(0)
+        }
         TIOCSPGRP => {
             let pgid = unsafe { *(data as *const i32) };
             let vt_i = vt_clamp(vt);
@@ -456,8 +461,24 @@ fn tty_ioctl(vt: usize, cmd: u32, data: usize) -> Result<usize> {
             *tty_termios(vt).lock() = user_copy(UserInPtr::<Termios>::from(data).read())?;
             Ok(0)
         }
+        TCSETS2 | TCSETSW2 => {
+            let t2: Termios2 = user_copy(UserInPtr::<Termios2>::from(data).read())?;
+            *tty_termios(vt).lock() = t2.into();
+            Ok(0)
+        }
         TCSETSF => {
             *tty_termios(vt).lock() = user_copy(UserInPtr::<Termios>::from(data).read())?;
+            let sin = vt_stdin(vt);
+            sin.buf.lock().clear();
+            sin.canon_buf.lock().clear();
+            sin.eof_pending.store(false, Ordering::Release);
+            sin.vtime_deadline_ns.store(0, Ordering::Release);
+            sin.eventbus.lock().clear(Event::READABLE);
+            Ok(0)
+        }
+        TCSETSF2 => {
+            let t2: Termios2 = user_copy(UserInPtr::<Termios2>::from(data).read())?;
+            *tty_termios(vt).lock() = t2.into();
             let sin = vt_stdin(vt);
             sin.buf.lock().clear();
             sin.canon_buf.lock().clear();

@@ -73,10 +73,17 @@ const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
 const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
 const FS_IOC32_GETFLAGS: u32 = 0x8004_6601;
 const FS_IOC32_SETFLAGS: u32 = 0x4004_6602;
-const FICLONE: u32 = 0x4004_9409;
-const FICLONERANGE: u32 = 0x4020_940d;
-const FIDEDUPERANGE: u32 = 0xc018_9436;
-const FS_IOC_FIEMAP: u32 = 0xc020_660b;
+pub const FICLONE: u32 = 0x4004_9409;
+pub const FICLONERANGE: u32 = 0x4020_940d;
+pub const FIDEDUPERANGE: u32 = 0xc018_9436;
+
+/// `FICLONE` / `FICLONERANGE` / `FIDEDUPERANGE`: VFS ioctls. On a filesystem
+/// without clone support Linux answers `EOPNOTSUPP` so `cp --reflink=auto`
+/// and friends fall back to a byte copy — not `EINVAL`.
+pub fn is_vfs_clone_ioctl(cmd: u32) -> bool {
+    matches!(cmd, FICLONE | FICLONERANGE | FIDEDUPERANGE)
+}
+pub const FS_IOC_FIEMAP: u32 = 0xc020_660b;
 
 // fscrypt (`include/uapi/linux/fscrypt.h`). Only v2 policies (key
 // identifiers): v1 policies and keyring keys are deprecated on Linux.

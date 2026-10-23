@@ -1074,7 +1074,22 @@ fn alsa_ioctl_name(cmd: u32) -> Option<&'static str> {
         (b'U', 0xd0) => "CTL_POWER",
         (b'U', 0xd1) => "CTL_POWER_STATE",
         (b'U', _) => "CTL_?",
-        (b'T', _) => "TIMER_?",
+        (b'T', 0x00) => "TIMER_PVERSION",
+        (b'T', 0x01) => "TIMER_NEXT_DEVICE",
+        (b'T', 0x02) => "TIMER_TREAD",
+        (b'T', 0x03) => "TIMER_GINFO",
+        (b'T', 0x04) => "TIMER_GPARAMS",
+        (b'T', 0x05) => "TIMER_GSTATUS",
+        (b'T', 0x10) => "TIMER_SELECT",
+        (b'T', 0x11) => "TIMER_INFO",
+        (b'T', 0x12) => "TIMER_PARAMS",
+        (b'T', 0x14) => "TIMER_STATUS",
+        (b'T', 0xa0) => "TIMER_START",
+        (b'T', 0xa1) => "TIMER_STOP",
+        (b'T', 0xa2) => "TIMER_CONTINUE",
+        (b'T', 0xa3) => "TIMER_PAUSE",
+        (b'T', 0x00..=0x14) => "TIMER_?",
+        (b'T', _) => return None,
         _ => return None,
     })
 }
@@ -1305,6 +1320,11 @@ fn einval_hunt(pid: KoID, num: u32, args: &[usize; 6]) {
             if magic.read().ok() == Some(0) {
                 return;
             }
+        }
+        // FICLONE / FICLONERANGE / FIDEDUPERANGE: before the VFS EOPNOTSUPP
+        // path, unsupported mounts answered EINVAL and flooded this hunt.
+        if linux_object::fs::is_vfs_clone_ioctl(cmd) {
+            return;
         }
     }
     let watched = matches!(

@@ -3558,7 +3558,7 @@ int main(int argc, char **argv) {
         log(COLOR_GREEN COLOR_BOLD " *         ACTUALIZACIÓN COMPLETADA CON ÉXITO         *" COLOR_RESET);
         log(COLOR_GREEN COLOR_BOLD "========================================================" COLOR_RESET);
         log("Eclipse OS se ha actualizado correctamente en %s.", cfg.disk_path);
-        log("El resto del sistema puede actualizarse con apk (p. ej. apk update && apk upgrade).");
+        log("El resto del sistema puede actualizarse con apt (p. ej. apt-get update && apt-get upgrade).");
     } else {
         log(COLOR_GREEN COLOR_BOLD " *          INSTALACIÓN COMPLETADA CON ÉXITO          *" COLOR_RESET);
         log(COLOR_GREEN COLOR_BOLD "========================================================" COLOR_RESET);

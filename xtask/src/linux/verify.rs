@@ -156,12 +156,23 @@ impl LinuxRootfs {
 
         let mut problems = Vec::new();
         problems.extend(self.check_init(&root));
-        problems.extend(self.check_apk(&root));
+        if super::apt_rootfs::use_apt(self.0.name()) {
+            for msg in super::apt_rootfs::check_apt(&root, self.0.name()) {
+                problems.push(Problem(msg));
+            }
+        } else {
+            problems.extend(self.check_apk(&root));
+        }
         problems.extend(self.check_elf_machines(&root));
 
         if problems.is_empty() {
+            let tap = if super::apt_rootfs::use_apt(self.0.name()) {
+                "apt"
+            } else {
+                "apk"
+            };
             println!(
-                "rootfs verificada: PID 1, apk y los ELF cuadran con {}.",
+                "rootfs verificada: PID 1, {tap} y los ELF cuadran con {}.",
                 self.0.name()
             );
             return;

@@ -406,6 +406,10 @@ impl StatMode {
 }
 
 const STATX_BASIC_STATS: u32 = 0x07ff;
+/// `stx_mnt_id` (`__spare2[0]`) is valid.
+const STATX_MNT_ID: u32 = 0x0000_1000;
+/// `stx_mnt_id` (`__spare2[0]`) is the 64-bit unique mount ID.
+const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
 /// `stx_atomic_write_unit_min`/`_max`/`_segments_max` are valid.
 const STATX_WRITE_ATOMIC: u32 = 0x0001_0000;
 /// The file can take `RWF_ATOMIC` writes.
@@ -492,9 +496,17 @@ impl From<Metadata> for Statx {
         let dev_minor = (info.dev & 0xff) as u32;
         let rdev_major = ((info.rdev >> 8) & 0xfff) as u32;
         let rdev_minor = (info.rdev & 0xff) as u32;
+        let mut spare2 = [0; 14];
+        // `__spare2[0]` (offset 0x90) is `stx_mnt_id` (`include/uapi/linux/stat.h`).
+        // systemd 261+ (`libudev.so.1` on Ubuntu 26.10) calls `xstatx_full()` from
+        // `chaseat()` and `dir_fd_is_root()` with `XSTATX_MNT_ID_BEST` /
+        // `STATX_MNT_ID`, and fails with `-EUNATCH` ("statx() did not return either
+        // STATX_MNT_ID or STATX_MNT_ID_UNIQUE.") if neither bit is set in `stx_mask`,
+        // preventing `libinput` from discovering any mouse or keyboard in `/sys`.
+        spare2[0] = (info.dev as u64).wrapping_add(1);
 
         Statx {
-            stx_mask: STATX_BASIC_STATS,
+            stx_mask: STATX_BASIC_STATS | STATX_MNT_ID | STATX_MNT_ID_UNIQUE,
             stx_blksize: info.blk_size as u32,
             stx_attributes: 0,
             stx_nlink: info.nlinks as u32,
@@ -530,7 +542,7 @@ impl From<Metadata> for Statx {
             stx_rdev_minor: rdev_minor,
             stx_dev_major: dev_major,
             stx_dev_minor: dev_minor,
-            __spare2: [0; 14],
+            __spare2: spare2,
         }
     }
 }
@@ -981,10 +993,28 @@ mod stat_conversion_tests {
     fn statx_reports_the_basic_stats_and_no_birth_time() {
         const STATX_BTIME: u32 = 0x800;
         let x: Statx = meta().into();
-        assert_eq!(x.stx_mask, STATX_BASIC_STATS);
+        assert_eq!(
+            x.stx_mask,
+            STATX_BASIC_STATS | STATX_MNT_ID | STATX_MNT_ID_UNIQUE
+        );
         assert_eq!(x.stx_mask & STATX_BTIME, 0);
         assert_eq!(x.stx_attributes, 0);
         assert_eq!(x.stx_attributes_mask, 0);
+    }
+
+    /// systemd 261+ (`libudev.so.1`) calls `xstatx_full` inside `chaseat()` and
+    /// `dir_fd_is_root()` and rejects any `statx` buffer whose `stx_mask` lacks
+    /// `STATX_MNT_ID` / `STATX_MNT_ID_UNIQUE` with `-EUNATCH` (-49). Two filesystems
+    /// with distinct `Metadata::dev` values must also produce distinct `stx_mnt_id`
+    /// (`__spare2[0]`) so `statx_mount_same()` distinguishes `/sys` from `/`.
+    #[test]
+    fn statx_reports_mnt_id_for_systemd_chaseat() {
+        let root_x: Statx = Metadata { dev: 0, ..meta() }.into();
+        let sys_x: Statx = Metadata { dev: 2, ..meta() }.into();
+        assert_ne!(root_x.stx_mask & STATX_MNT_ID, 0);
+        assert_ne!(root_x.stx_mask & STATX_MNT_ID_UNIQUE, 0);
+        assert!(root_x.__spare2[0] > 0);
+        assert_ne!(root_x.__spare2[0], sys_x.__spare2[0]);
     }
 
     /// `stat`'s `tv_sec` used to be a `usize`, so this came back as
@@ -1037,10 +1067,10 @@ mod stat_conversion_tests {
         let x: Statx = m.into();
         assert_eq!(s._pad0, 0);
         assert_eq!(x.__spare0, [0; 1]);
-        // 112 bytes, which is the whole tail of the 256: `stx_mnt_id`,
-        // `stx_dio_mem_align`, `stx_dio_offset_align`, `stx_subvol` and the
-        // rest of what a newer kernel reports there.
-        assert_eq!(x.__spare2, [0u64; 14]);
+        // `__spare2[0]` is `stx_mnt_id`; the remaining 13 words (`stx_dio_mem_align`,
+        // `stx_dio_offset_align`, `stx_subvol` and the rest of the tail) are zero.
+        assert_eq!(x.__spare2[0], (DEV as u64) + 1);
+        assert_eq!(x.__spare2[1..], [0u64; 13]);
         // The reserved word of each timestamp, too.
         for (name, t) in [
             ("atime", x.stx_atime),

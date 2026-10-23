@@ -379,6 +379,7 @@ fn copy_tree_capped(src: &Path, dst: &Path) {
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent).unwrap();
         }
+        let _ = fs::remove_dir_all(dst);
         let _ = fs::remove_file(dst);
         #[cfg(unix)]
         std::os::unix::fs::symlink(target, dst).unwrap();
@@ -402,6 +403,7 @@ fn copy_tree_capped(src: &Path, dst: &Path) {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).unwrap();
     }
+    let _ = fs::remove_file(dst);
     fs::copy(src, dst).unwrap();
 }
 

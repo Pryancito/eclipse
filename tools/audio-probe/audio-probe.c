@@ -122,6 +122,7 @@ static void skip(const char *name, const char *why) {
 // now skip, and say who has the device.
 static int g_pcm_held_by_daemon;
 static long find_process(const char *name);
+static int device_mixes(void);
 
 static int pcm_held_by_daemon(int err) {
   int held = err == EBUSY && find_process("pulseaudio") > 0;
@@ -444,6 +445,13 @@ static void check_oss_yields_to_the_daemon(void) {
     skip("/dev/dsp yields to the daemon", "no pulseaudio process holds the PCM");
     return;
   }
+  if (device_mixes()) {
+    // The HDA driver mixes in the kernel (snd.rs/dsp.rs `open_client` get a
+    // stream of their own from `open_stream`): the claim is never taken and
+    // a second writer is a second mixed stream, not a writer in Pulse's ring.
+    skip("/dev/dsp is EBUSY while PulseAudio holds the PCM", "the device mixes: every open is its own stream");
+    return;
+  }
   int fd = open(dsp, O_WRONLY);
   int err = fd < 0 ? errno : 0;
   check(fd < 0 && err == EBUSY, "/dev/dsp is EBUSY while PulseAudio holds the PCM",
@@ -702,7 +710,7 @@ static void test_oss(void) {
   {
     char pcm[64];
     snprintf(pcm, sizeof pcm, "/dev/snd/pcmC%dD0p", g_card);
-    if (node_present(pcm, S_IFCHR)) {
+    if (node_present(pcm, S_IFCHR) && !device_mixes()) {
       int p = open(pcm, O_WRONLY | O_NONBLOCK);
       int err = p < 0 ? errno : 0;
       check(p < 0 && err == EBUSY, "the native PCM is EBUSY while /dev/dsp is open",
@@ -1516,7 +1524,12 @@ static void test_daemon(void) {
   // The chime is `mpg123 -o pulse`: libout123 dlopen()s output_pulse.so from
   // here. "Failed to open module pulse" in that log is this directory (or a
   // library the module links, libpulse-simple) -- not the server.
-  list_mpg123_modules("/usr/lib/mpg123");
+  if (access("/usr/lib/x86_64-linux-gnu/mpg123", R_OK) == 0)
+    list_mpg123_modules("/usr/lib/x86_64-linux-gnu/mpg123");
+  else if (access("/usr/lib/aarch64-linux-gnu/mpg123", R_OK) == 0)
+    list_mpg123_modules("/usr/lib/aarch64-linux-gnu/mpg123");
+  else
+    list_mpg123_modules("/usr/lib/mpg123");
   check_pulse_socket_config();
   check_oss_yields_to_the_daemon();
 }
@@ -1717,6 +1730,16 @@ static char *gpusnd_card_block(char *buf) {
   char *next = strstr(start + strlen(head), "[gpusnd] --- card ");
   if (next) *next = '\0';
   return start;
+}
+
+// Whether g_card mixes in the kernel: the HDA driver's ring line names its
+// stream count ("streams=N"). On such a device every open of hw:<card>,0 or
+// /dev/dsp is a stream of its own, so EBUSY is not what the kernel owes.
+static int device_mixes(void) {
+  static char buf[65536];
+  if (read_whole("/proc/gpusnd", buf, sizeof buf) < 0) return 0;
+  const char *blk = gpusnd_card_block(buf);
+  return blk && strstr(blk, " streams=") != NULL;
 }
 
 // "[gpusnd] events: D drains, U underruns, R stream restarts, ..." for g_card.

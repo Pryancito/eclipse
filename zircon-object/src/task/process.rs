@@ -746,15 +746,22 @@ impl Process {
         // very lock it is being run under.
         let (threads, handles) = {
             let mut inner = self.inner.lock();
-            if let Status::Exited(_) = inner.status {
-                return;
+            let already_exited = matches!(inner.status, Status::Exited(_));
+            if !already_exited {
+                inner.status = Status::Exited(retcode);
             }
-            inner.status = Status::Exited(retcode);
             // BEFORE the clone, which is a `lock incq` through every entry:
             // see `thread_entry_looks_live` for the capture that made this
             // the machine's last instruction.
             inner.sweep_corrupt_threads(self.base.id, "Process::exit");
-            (inner.threads.clone(), core::mem::take(&mut inner.handles))
+            (
+                inner.threads.clone(),
+                if already_exited {
+                    Default::default()
+                } else {
+                    core::mem::take(&mut inner.handles)
+                },
+            )
         };
         if threads.is_empty() {
             drop(handles);

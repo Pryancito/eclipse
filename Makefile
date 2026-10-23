@@ -98,7 +98,7 @@ other-test:
 	cargo other-test --arch $(ARCH)
 
 # build image from rootfs
-image: rootfs
+image:
 ifeq ($(XTASK), 1)
 	ECLIPSE_ROOTFS_FS=$(ROOTFS_FS) cargo image --arch $(ARCH) --variant $(VARIANT)
 else ifeq ($(ARCH), riscv64)

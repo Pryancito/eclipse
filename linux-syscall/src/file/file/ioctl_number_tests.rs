@@ -115,6 +115,7 @@ fn a_terminal_request_inside_the_block_is_normalised_to_enotty() {
     // errno-checking callers fail on a plain log file.
     for (name, request) in [
         ("TCGETS", 0x5401usize),
+        ("TCGETS2", TCGETS2),
         ("TIOCOUTQ", 0x5411),
         ("TIOCSCTTY", TIOCSCTTY),
         ("TIOCGWINSZ", TIOCGWINSZ),

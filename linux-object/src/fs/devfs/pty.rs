@@ -573,11 +573,26 @@ fn pty_ioctl(inner: &Arc<Mutex<PtyInner>>, master: bool, cmd: u32, data: usize) 
             unsafe { *(data as *mut Termios) = g.termios };
             Ok(0)
         }
+        TCGETS2 => {
+            if data == 0 {
+                return Err(FsError::InvalidParam);
+            }
+            unsafe { *(data as *mut Termios2) = g.termios.into() };
+            Ok(0)
+        }
         TCSETS | TCSETSW | TCSETSF => {
             if data == 0 {
                 return Err(FsError::InvalidParam);
             }
             g.termios = unsafe { *(data as *const Termios) };
+            Ok(0)
+        }
+        TCSETS2 | TCSETSW2 | TCSETSF2 => {
+            if data == 0 {
+                return Err(FsError::InvalidParam);
+            }
+            let t2 = unsafe { *(data as *const Termios2) };
+            g.termios = t2.into();
             Ok(0)
         }
         TIOCGWINSZ => {

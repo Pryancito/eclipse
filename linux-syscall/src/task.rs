@@ -1764,6 +1764,7 @@ impl Syscall<'_> {
         // covers every teardown path (signal-kill, exception, _exit), not just
         // exit_group — see zircon-object/src/task/process.rs.
         proc.exit(exit_code_of(exit_code));
+        self.thread.exit_linux(exit_code_of(exit_code) as i32);
         Ok(0)
     }
 

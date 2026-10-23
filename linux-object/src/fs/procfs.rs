@@ -672,6 +672,8 @@ impl FileSystem for ProcFS {
 
     fn info(&self) -> FsInfo {
         // Virtual FS: report conservative, non-zero values.
+        // ftype must be PROC_SUPER_MAGIC: systemd's proc_mounted() (and thus
+        // Ubuntu libseat/libsystemd) rejects any other magic as "not mounted".
         FsInfo {
             bsize: 4096,
             frsize: 4096,
@@ -681,6 +683,7 @@ impl FileSystem for ProcFS {
             files: 0,
             ffree: 0,
             namemax: 255,
+            ftype: rcore_fs::vfs::PROC_SUPER_MAGIC,
         }
     }
 }

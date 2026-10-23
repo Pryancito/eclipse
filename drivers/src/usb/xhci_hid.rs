@@ -2736,6 +2736,14 @@ struct HidDev {
     last_report_len: usize,
     /// Count of reports seen on this endpoint (0 = never delivered a report).
     report_count: u64,
+    /// Transfer completions that were neither Success nor Short Packet —
+    /// the usual reason a bound keyboard shows `reports=0` in `/proc/usbhid`.
+    cc_fail: u64,
+    /// Last completion code that counted as `cc_fail` (0 = none yet).
+    last_cc: u8,
+    /// Completions with Success/Short but `actual_len == 0` (legal NAK-like
+    /// empty interrupt IN; not counted as reports).
+    zero_len: u64,
     /// Count of reports that carried a non-zero wheel or pan delta, and the
     /// last such pair. Together with `report_count` this splits the one
     /// question a dead wheel always poses -- does the driver never decode a
@@ -2937,6 +2945,8 @@ impl XhciInner {
             {
                 let (ridx, blen, buf_phys) = {
                     let h = &mut self.hids[idx];
+                    h.cc_fail = h.cc_fail.saturating_add(1);
+                    h.last_cc = cc as u8;
                     // No report was dispatched for this transfer, so the
                     // dispatch head moves with the enqueue head below and the
                     // two stay in lockstep.
@@ -5574,6 +5584,9 @@ impl XhciInner {
             last_report: [0; 16],
             last_report_len: 0,
             report_count: 0,
+            cc_fail: 0,
+            last_cc: 0,
+            zero_len: 0,
             report_desc: report_desc.0,
             report_desc_len: report_desc.1,
             mouse_layout: parsed.mouse,
@@ -5702,6 +5715,7 @@ impl XhciInner {
         // means "nothing to report"; decoding it would read as every key and
         // every button released.
         if actual_len == 0 {
+            h.zero_len = h.zero_len.saturating_add(1);
             return;
         }
         let report_len = h.report_len.min(actual_len);
@@ -5751,10 +5765,18 @@ impl XhciInner {
         // every keyboard with a trackpad looks like -- but an interface used
         // to be pinned to a single role, so on those devices the keyboard was
         // simply never delivered.
+        //
+        // Never run this on a tablet/mouse protocol iface: byte 0 is buttons
+        // (often 0), which would match a `report_id: None` key layout and
+        // swallow absolute pointer reports as phantom key events.
         let rid = tmp.first().copied();
-        let key_match = h
-            .key_layout
-            .filter(|k| k.report_id.is_none() || k.report_id == rid);
+        let key_match = if matches!(h.protocol, HID_PROTO_KEY) {
+            h.key_layout
+                .filter(|k| k.report_id.is_none() || k.report_id == rid)
+        } else {
+            h.key_layout
+                .filter(|k| k.report_id.is_some() && k.report_id == rid)
+        };
         if let Some(kl) = key_match {
             let (mods, keys) = decode_keyboard(&tmp, &kl);
             h.last_keys = emit_keyboard_delta(lis, h.last_mods, mods, &h.last_keys, &keys);
@@ -7303,7 +7325,8 @@ impl InputScheme for XhciUsbHid {
             let _ = write!(
                 s,
                 "[usbhid] slot={} iface={} bInterfaceProtocol={} subclass={} {:04x}:{:04x} \
-                 role={} report_len={} reports={} wheel_events={} last_wheel={:?} last=[",
+                 role={} report_len={} reports={} cc_fail={} last_cc={} zero_len={} \
+                 wheel_events={} last_wheel={:?} last=[",
                 h.slot_id,
                 h.iface,
                 h.if_proto,
@@ -7313,6 +7336,9 @@ impl InputScheme for XhciUsbHid {
                 role,
                 h.report_len,
                 h.report_count,
+                h.cc_fail,
+                h.last_cc,
+                h.zero_len,
                 h.wheel_count,
                 h.last_wheel,
             );

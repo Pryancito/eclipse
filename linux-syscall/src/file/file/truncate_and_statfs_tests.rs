@@ -428,11 +428,10 @@ fn every_number_the_filesystem_reports_lands_in_its_own_field_of_statfs() {
         files: 300,
         ffree: 200,
         namemax: 255,
+        ftype: 0xEF53,
     }
     .into();
 
-    // `FsInfo` carries no filesystem type, and `0` is what every userspace
-    // probe reads as "unknown"; the stand-in is EXT4_SUPER_MAGIC.
     assert_eq!(statfs.f_type, 0xEF53);
     assert_eq!(statfs.f_bsize, 4096);
     assert_eq!(statfs.f_frsize, 512);

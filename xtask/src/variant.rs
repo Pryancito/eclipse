@@ -1,17 +1,17 @@
 //! Las dos variantes de imagen que `make release` publica.
 //!
 //! `desktop` es la Eclipse de siempre: la sesión labwc (o Xorg) con todo el
-//! cierre de paquetes que `xorg::install` baja a `apk` — Mesa, libLLVM, fuentes,
-//! Firefox, XFCE. `minimal` es el mismo sistema base sin nada de eso: consola,
-//! red, audio y `install-eclipse`, y `/etc/eclipse/desktop` puesto a `none` para
-//! que `eclipse-init` no arranque compositor alguno.
+//! cierre de paquetes que `xorg::install` baja vía apt (Ubuntu 26.10) — Mesa,
+//! libLLVM, fuentes, Firefox, XFCE. `minimal` es el mismo sistema base sin nada
+//! de eso: consola, red, audio y `install-eclipse`, y `/etc/eclipse/desktop`
+//! puesto a `none` para que `eclipse-init` no arranque compositor alguno.
 //!
 //! Son dos **rootfs distintos** (`rootfs/<arch>` y `rootfs/<arch>-minimal`), no
 //! un recorte posterior de uno solo: así la variante minimal nunca tiene en
 //! disco los ficheros del escritorio, y no hace falta mantener una lista de qué
 //! podar — algo que se desincroniza en silencio cada vez que se añade un
-//! paquete. Cuesta un segundo `apk add` (cacheado) y un segundo busybox, que es
-//! lo que vale una variante que de verdad no lleva el escritorio.
+//! paquete. Cuesta un segundo cierre apt (cacheado) y un segundo busybox, que
+//! es lo que vale una variante que de verdad no lleva el escritorio.
 //!
 //! El sufijo de `desktop` está VACÍO a propósito: `rootfs/x86_64`,
 //! `ignored/target/efi.img.gz`, `zCore/x86_64.img`… siguen donde estaban, así
@@ -24,7 +24,7 @@ use std::str::FromStr;
 /// Qué variante de imagen se está construyendo.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Variant {
-    /// Eclipse con escritorio (labwc/Xorg + el cierre de apk). El de siempre.
+    /// Eclipse con escritorio (labwc/Xorg + el cierre apt). El de siempre.
     Desktop,
     /// Eclipse de consola: sin escritorio, sin Mesa, sin Firefox.
     Minimal,

@@ -446,6 +446,7 @@ impl FileSystem for BtrfsMountFs {
             files: 0,
             ffree: 0,
             namemax: 255,
+            ftype: rcore_fs::vfs::BTRFS_SUPER_MAGIC,
         }
     }
 }

@@ -423,6 +423,7 @@ impl FileSystem for EclipseMountFs {
             files: 0,
             ffree: 0,
             namemax: 255,
+            ftype: rcore_fs::vfs::EXT4_SUPER_MAGIC,
         }
     }
 }
