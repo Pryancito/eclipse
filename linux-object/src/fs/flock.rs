@@ -246,7 +246,9 @@ impl Future for ChangeFuture {
         }
         let deadline =
             kernel_hal::timer::deadline_after(Duration::from_millis(FLOCK_INTERRUPT_CHECK_TICK_MS));
-        kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
+        if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
+            cx.waker().wake_by_ref();
+        }
         Poll::Pending
     }
 }

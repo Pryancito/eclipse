@@ -374,6 +374,9 @@ impl LinuxRootfs {
         // attach the filesystems there.
         let _ = fs::create_dir_all(dir.join("boot/efi"));
         let _ = fs::create_dir_all(dir.join("home"));
+        // Ollama pull target on the eventual /home mount (not /tmp tmpfs).
+        let _ = fs::create_dir_all(dir.join("home/moebius/.ollama/models"));
+        let _ = fs::create_dir_all(dir.join("home/moebius/.ollama/tmp"));
 
         // udhcpc / udhcpc6 scripts — apply leases via `ip` (no ifconfig/route)
         let udhcpc_dir = dir.join("usr/share/udhcpc");
@@ -1120,6 +1123,27 @@ impl LinuxRootfs {
               # its proven configuration; opt in per command if needed:\n\
               #   LD_PRELOAD=/lib/libeclipse_dns.so some-command\n\
               export HOME=/root\n\
+              # Ollama models must not land on tmpfs. A multi-GB ollama pull\n\
+              # into /tmp (or a home that is still ramfs) densified the kernel\n\
+              # heap until epoll_pwait panicked on a 96-byte timer cell.\n\
+              # Prefer /home/moebius on the installed disk; else /var/cache.\n\
+              if [ -d /home/moebius ]; then\n\
+              \x20 _ollama_root=/home/moebius/.ollama\n\
+              elif [ -d /var/cache ]; then\n\
+              \x20 _ollama_root=/var/cache/ollama\n\
+              else\n\
+              \x20 _ollama_root=/root/.ollama\n\
+              fi\n\
+              mkdir -p \"$_ollama_root/models\" \"$_ollama_root/tmp\" 2>/dev/null\n\
+              export OLLAMA_MODELS=\"$_ollama_root/models\"\n\
+              export OLLAMA_TMPDIR=\"$_ollama_root/tmp\"\n\
+              # If llama-server dies with SIGILL (illegal instruction), the\n\
+              # autodetection picked an AVX2/CUDA runner this CPU cannot run.\n\
+              # Uncomment one of these, slowest->fastest that still works:\n\
+              #   export OLLAMA_LLM_LIBRARY=cpu\n\
+              #   export OLLAMA_LLM_LIBRARY=cpu_avx\n\
+              #   export OLLAMA_LLM_LIBRARY=cpu_avx2\n\
+              unset _ollama_root\n\
               export TERM=xterm-256color\n\
               # UI language. /etc/eclipse/locale (lang=es|en); default es.\n\
               # Never export LC_ALL -- it would freeze LANG for gettext/GTK.\n\
@@ -3681,6 +3705,13 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         let _ = fs::create_dir_all(rootfs.join("var/lib/pulse"));
         // OpenNTPD's chroot directory (must exist, empty, root-owned).
         let _ = fs::create_dir_all(rootfs.join("var/empty"));
+        // Ollama model + temp dirs on the disk-backed tree (never /tmp).
+        // Profile/labwc/init export OLLAMA_MODELS/TMPDIR here; mkdir at image
+        // build so a fresh install does not race the first pull.
+        let _ = fs::create_dir_all(rootfs.join("home/moebius/.ollama/models"));
+        let _ = fs::create_dir_all(rootfs.join("home/moebius/.ollama/tmp"));
+        let _ = fs::create_dir_all(rootfs.join("var/cache/ollama/models"));
+        let _ = fs::create_dir_all(rootfs.join("var/cache/ollama/tmp"));
     }
 
     /// Cross-compile wavplay (`tools/wavplay`, Rust) as a static musl binary

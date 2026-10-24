@@ -420,7 +420,13 @@ impl<'a> Target<'a> {
             // (the flags it did not understand, for EBADR).
             let head = UserInPtr::<u8>::from(arg).read_array(FIEMAP_HEADER)?;
             let count = (get32(&head, 24) as usize).min(FIEMAP_MAX_EXTENTS);
-            let mut buf = vec![0u8; FIEMAP_HEADER + FIEMAP_EXTENT * count];
+            // Fallible: count from userspace can ask for ~3.5 MiB
+            // (`FIEMAP_MAX_EXTENTS` × 56). `vec![0; n]` panicked the machine.
+            let need = FIEMAP_HEADER + FIEMAP_EXTENT * count;
+            let mut buf = alloc::vec::Vec::new();
+            buf.try_reserve_exact(need)
+                .map_err(|_| LxError::ENOMEM)?;
+            buf.resize(need, 0);
             buf[..FIEMAP_HEADER].copy_from_slice(&head);
             let ret = self.fiemap(&mut buf);
             let mapped = get32(&buf, 20) as usize;

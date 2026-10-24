@@ -7,6 +7,8 @@ use core::time::Duration;
 
 use kernel_hal::timer_waker::{self, TimerWakerSlot};
 
+use crate::error::LxError;
+
 use super::{clear_io_wait_wakers_hid, register_io_wait_wakers_hid, retain_io_wait_wakers_hid};
 
 /// Fallback timer when no IRQ wakes a multiplex wait (poll/epoll/select).
@@ -114,7 +116,10 @@ impl Drop for IoMultiplexWait {
 }
 
 impl Future for IoMultiplexWait {
-    type Output = ();
+    /// `Ok(())` when woken (IRQ, timeout, or hid race). `Err(ENOMEM)` when the
+    /// fallback timer could not be armed — sleeping without one hangs forever
+    /// under heap pressure (Ollama multi-GB pulls used to panic here instead).
+    type Output = Result<(), LxError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(dl) = self.deadline {
@@ -127,7 +132,7 @@ impl Future for IoMultiplexWait {
                     self.watch_hid,
                 );
                 self.io_waker = None;
-                return Poll::Ready(());
+                return Poll::Ready(Ok(()));
             }
         }
         if self.armed {
@@ -150,7 +155,7 @@ impl Future for IoMultiplexWait {
                 self.watch_hid,
             );
             self.io_waker = None;
-            return Poll::Ready(());
+            return Poll::Ready(Ok(()));
         }
         register_io_wait_wakers_hid(
             cx.waker(),
@@ -171,7 +176,7 @@ impl Future for IoMultiplexWait {
                 self.watch_hid,
             );
             self.io_waker = None;
-            return Poll::Ready(());
+            return Poll::Ready(Ok(()));
         }
         self.io_waker = Some(cx.waker().clone());
         let tick = Duration::from_millis(self.tick_ms);
@@ -185,7 +190,16 @@ impl Future for IoMultiplexWait {
         } else {
             kernel_hal::timer::timer_now() + tick
         };
-        timer_waker::ensure_timer_waker(&mut self.timer, wake_at, cx);
+        if !timer_waker::ensure_timer_waker(&mut self.timer, wake_at, cx) {
+            clear_io_wait_wakers_hid(
+                cx.waker(),
+                self.watch_net,
+                self.watch_interactive,
+                self.watch_hid,
+            );
+            self.io_waker = None;
+            return Poll::Ready(Err(LxError::ENOMEM));
+        }
         self.armed = true;
         Poll::Pending
     }
@@ -219,7 +233,7 @@ mod hid_handshake_tests {
 
     /// `watch_hid`, a sequence read before the scan, and the first `poll` --
     /// everything the real callers do, with the frame injected where it hurts.
-    fn first_poll(watch_hid: bool, hid_seq: u64) -> Poll<()> {
+    fn first_poll(watch_hid: bool, hid_seq: u64) -> Poll<Result<(), LxError>> {
         let waker = nop_waker();
         let mut cx = Context::from_waker(&waker);
         let fut = IoMultiplexWait::with_tick_hid(1_000, false, false, watch_hid, hid_seq, 100);
@@ -236,7 +250,7 @@ mod hid_handshake_tests {
         wake_input_waiters();
         assert_eq!(
             first_poll(true, seq),
-            Poll::Ready(()),
+            Poll::Ready(Ok(())),
             "a frame that landed after the scan has to send the caller round \
              again now, not after the fallback tick"
         );

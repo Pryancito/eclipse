@@ -41,13 +41,14 @@ struct RawSocketInner {
 impl RawSocketState {
     /// missing documentation
     pub fn new(protocol: u8, ipv6: bool) -> LxResult<Self> {
+        // Fallible: 2×64 KiB + metadata rings.
         let rx_buffer = RawSocketBuffer::new(
-            vec![RawPacketMetadata::EMPTY; RAW_METADATA_BUF],
-            vec![0; RAW_RECVBUF],
+            super::kernel_vec_filled(RAW_METADATA_BUF, RawPacketMetadata::EMPTY)?,
+            super::kernel_vec_zeroed(RAW_RECVBUF)?,
         );
         let tx_buffer = RawSocketBuffer::new(
-            vec![RawPacketMetadata::EMPTY; RAW_METADATA_BUF],
-            vec![0; RAW_SENDBUF],
+            super::kernel_vec_filled(RAW_METADATA_BUF, RawPacketMetadata::EMPTY)?,
+            super::kernel_vec_zeroed(RAW_SENDBUF)?,
         );
         let socket = RawSocket::new(
             if ipv6 {
@@ -282,7 +283,7 @@ impl Socket for RawSocketState {
                 return Err(LxError::EMSGSIZE);
             }
             let len = data.len();
-            let mut buffer = vec![0u8; len + 40];
+            let mut buffer = super::kernel_vec_zeroed(len + 40)?;
             let mut packet = Ipv6Packet::new_unchecked(&mut buffer);
             let ip_repr = Ipv6Repr {
                 src_addr: src,
@@ -327,7 +328,7 @@ impl Socket for RawSocketState {
                 return Err(LxError::EMSGSIZE);
             }
             let len = data.len();
-            let mut buffer = vec![0u8; len + 20];
+            let mut buffer = super::kernel_vec_zeroed(len + 20)?;
             let mut packet = Ipv4Packet::new_unchecked(&mut buffer);
             packet.set_version(4);
             packet.set_header_len(20);

@@ -20,12 +20,16 @@ pub(super) const STATUS_PATH: &str = "usr/bin/cuda-status";
 /// Official Ollama tarball installer (CUDA runners).
 pub(super) const INSTALL_OLLAMA_PATH: &str = "usr/bin/install-ollama-cuda";
 
+/// Wrapper that prefers `cuda_v*` when `cuda-status` is green.
+pub(super) const ECLIPSE_OLLAMA_PATH: &str = "usr/bin/eclipse-ollama";
+
 /// Builds the probe and puts it in `rootfs`. Best-effort, like the rest of
 /// NVIDIA's userspace: a build machine that cannot make an x86_64 glibc
 /// program leaves the image without it.
 pub(super) fn install(rootfs: &Path) {
     install_shell(rootfs, "cuda-status.sh", STATUS_PATH);
     install_shell(rootfs, "install-ollama-cuda.sh", INSTALL_OLLAMA_PATH);
+    install_shell(rootfs, "eclipse-ollama.sh", ECLIPSE_OLLAMA_PATH);
     if !cfg!(all(
         target_os = "linux",
         target_arch = "x86_64",

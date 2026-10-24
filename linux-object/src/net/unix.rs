@@ -492,15 +492,8 @@ impl Future for UnixEventWait {
                 .unwrap_or(false);
             if !live {
                 this.sub_id = None;
-                let waker = cx.waker().clone();
-                let mask = this.mask;
-                this.sub_id = inner.eventbus.subscribe(Box::new(move |ev| {
-                    if (ev & mask).is_empty() {
-                        return false;
-                    }
-                    waker.wake_by_ref();
-                    true
-                }));
+                this.sub_id =
+                    crate::sync::subscribe_waker(&mut inner.eventbus, this.mask, cx.waker());
             }
         }
         // Nothing on the socket. Before parking again, ask whether this
@@ -523,7 +516,9 @@ impl Future for UnixEventWait {
         // every Pending (that was the churn behind the desktop null fn-ptr
         // #PF).
         let deadline = kernel_hal::timer::deadline_after(Duration::from_millis(20));
-        kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
+        if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
+            cx.waker().wake_by_ref();
+        }
         Poll::Pending
     }
 }
@@ -605,14 +600,8 @@ impl Future for UnixPollWait<'_> {
                     if want_write {
                         wake_mask |= Event::WRITABLE;
                     }
-                    let waker = cx.waker().clone();
-                    this.sub_id = inner.eventbus.subscribe(Box::new(move |ev| {
-                        if (ev & wake_mask).is_empty() {
-                            return false;
-                        }
-                        waker.wake_by_ref();
-                        true
-                    }));
+                    this.sub_id =
+                        crate::sync::subscribe_waker(&mut inner.eventbus, wake_mask, cx.waker());
                 }
             }
             let peer = if !ready && want_write {

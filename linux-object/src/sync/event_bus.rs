@@ -195,6 +195,11 @@ impl EventBus {
             let (_id, oldest) = self.callbacks.remove(0);
             let _ = oldest(self.event);
         }
+        // Fallible grow: under a densified heap the push itself was an
+        // `alloc_error` after the callback Box already succeeded.
+        if self.callbacks.try_reserve(1).is_err() {
+            return None;
+        }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         self.callbacks.push((id, callback));
@@ -606,16 +611,23 @@ impl Future for EventBusFuture {
                 .unwrap_or(false)
             {
                 this.sub_id = None;
-                let waker = cx.waker().clone();
-                let mask = this.mask;
-                let sub_id = lock.subscribe(Box::new(move |s| {
-                    if (s & mask).is_empty() {
-                        return false;
+                // Fallible Box via `subscribe_waker` — the old `Box::new` here
+                // was the same panic class as epoll under a densified heap.
+                this.sub_id = subscribe_waker(&mut lock, this.mask, cx.waker());
+                if this.sub_id.is_none() {
+                    // Already-ready (callback fired) or OOM. Events set →
+                    // resolve; empty → ENOMEM so the waiter does not sleep
+                    // forever without a parked callback.
+                    if !(lock.event & this.mask).is_empty() {
+                        let event = lock.event;
+                        drop(lock);
+                        kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                        return Poll::Ready(Ok(event));
                     }
-                    waker.wake_by_ref();
-                    true
-                }));
-                this.sub_id = sub_id;
+                    drop(lock);
+                    kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
+                    return Poll::Ready(Err(crate::error::LxError::ENOMEM));
+                }
             }
         }
         // The data is not there. Before parking again, ask whether this thread
@@ -635,7 +647,9 @@ impl Future for EventBusFuture {
         }
         let deadline =
             kernel_hal::timer::deadline_after(Duration::from_millis(INTERRUPT_CHECK_TICK_MS));
-        kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
+        if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
+            cx.waker().wake_by_ref();
+        }
         Poll::Pending
     }
 }

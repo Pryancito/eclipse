@@ -2,9 +2,8 @@
 //!
 //! Same as [std::sync::Semaphore at rust 1.7.0](https://docs.rs/std-semaphore/0.1.0/std_semaphore/)
 
-use super::{Event, EventBus};
+use super::{subscribe_waker, Event, EventBus};
 use crate::error::LxError;
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::future::Future;
 use core::ops::Deref;
@@ -160,11 +159,11 @@ impl Semaphore {
                         .unwrap_or(false)
                     {
                         this.sub_id = None;
-                        let waker = cx.waker().clone();
-                        this.sub_id = inner.eventbus.subscribe(Box::new(move |_| {
-                            waker.wake_by_ref();
-                            true
-                        }));
+                        this.sub_id = subscribe_waker(
+                            &mut inner.eventbus,
+                            Event::SEMAPHORE_CAN_ACQUIRE | Event::SEMAPHORE_REMOVED,
+                            cx.waker(),
+                        );
                     }
                 }
 
@@ -183,7 +182,9 @@ impl Semaphore {
                 let deadline = kernel_hal::timer::deadline_after(Duration::from_millis(
                     SEMOP_INTERRUPT_CHECK_TICK_MS,
                 ));
-                kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
+                if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
+                    cx.waker().wake_by_ref();
+                }
                 Poll::Pending
             }
         }
@@ -338,11 +339,11 @@ impl Semaphore {
                         .unwrap_or(false)
                     {
                         this.sub_id = None;
-                        let waker = cx.waker().clone();
-                        this.sub_id = inner.eventbus.subscribe(Box::new(move |_| {
-                            waker.wake_by_ref();
-                            true
-                        }));
+                        this.sub_id = subscribe_waker(
+                            &mut inner.eventbus,
+                            Event::SEMAPHORE_CAN_ACQUIRE | Event::SEMAPHORE_REMOVED,
+                            cx.waker(),
+                        );
                     }
                 }
                 // Same reason as `acquire`: the bus reports only what the
@@ -357,7 +358,9 @@ impl Semaphore {
                 let deadline = kernel_hal::timer::deadline_after(Duration::from_millis(
                     SEMOP_INTERRUPT_CHECK_TICK_MS,
                 ));
-                kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
+                if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
+                    cx.waker().wake_by_ref();
+                }
                 Poll::Pending
             }
         }

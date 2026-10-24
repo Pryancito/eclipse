@@ -392,6 +392,19 @@ pub fn kernel_vec_zeroed(len: usize) -> crate::error::LxResult<alloc::vec::Vec<u
     Ok(v)
 }
 
+/// Fallible `vec![fill; n]` for socket metadata rings (UDP/RAW). Same contract
+/// as [`kernel_vec_zeroed`]: `ENOMEM` instead of `alloc_error`.
+pub fn kernel_vec_filled<T: Clone>(
+    n: usize,
+    fill: T,
+) -> crate::error::LxResult<alloc::vec::Vec<T>> {
+    let mut v = alloc::vec::Vec::new();
+    v.try_reserve_exact(n)
+        .map_err(|_| crate::error::LxError::ENOMEM)?;
+    v.resize(n, fill);
+    Ok(v)
+}
+
 // ========RAW
 
 /// missing documentation

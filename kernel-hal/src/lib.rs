@@ -13,6 +13,8 @@
 // of these helpers. See `docs/README-benchmarks.md`.
 #![cfg_attr(test, feature(test))]
 #![feature(doc_cfg)]
+// `Arc::try_new` for fallible timer-waker cells (OOM → bool, not panic).
+#![feature(allocator_api)]
 // #![feature(core_intrinsics)]
 #![allow(clippy::uninit_vec)]
 #![deny(warnings)]

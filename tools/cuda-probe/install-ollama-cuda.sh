@@ -213,8 +213,12 @@ ls -d "$LIB"/cuda_v* 2>/dev/null || {
 ls "$LIB"/cuda_v*/libggml-cuda.so 2>/dev/null | head -5
 
 echo
-echo "Restart serve:"
-echo "  killall ollama 2>/dev/null; OLLAMA_DEBUG=1 $BIN serve"
-echo "Then: $BIN ps   # should not be 100% CPU"
+echo "Restart serve (GPU):"
+echo "  killall ollama 2>/dev/null"
+echo "  eclipse-ollama serve          # picks cuda_v* when cuda-status is OK"
+echo "  # or: OLLAMA_DEBUG=1 OLLAMA_LLM_LIBRARY=\$(basename $LIB/cuda_v*) $BIN serve"
+echo "Then: eclipse-ollama ps         # GPU load, not 100% CPU"
+echo "Check: cuda-status -p"
 echo
 echo "Do not use Alpine gcompat for ollama — use the Ubuntu glibc next to libcuda."
+echo "If llama-server dies with SIGILL on CUDA, AVX may be off — see dmesg | grep fpu."

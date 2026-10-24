@@ -10,7 +10,6 @@ use lock::Mutex;
 
 // alloc
 use alloc::boxed::Box;
-use alloc::vec;
 
 // smoltcp
 use smoltcp::socket::{SocketSet, TcpSocket, TcpSocketBuffer, TcpState};
@@ -245,8 +244,11 @@ fn adaptive_park_ms(consecutive_empty: u32) -> u64 {
 impl TcpSocketState {
     /// missing documentation
     pub fn new(ipv6: bool) -> LxResult<Self> {
-        let rx_buffer = TcpSocketBuffer::new(vec![0; TCP_RECVBUF]);
-        let tx_buffer = TcpSocketBuffer::new(vec![0; TCP_SENDBUF]);
+        // Fallible: ~1 MiB of heap. `accept` already used `kernel_vec_zeroed`;
+        // `socket()` did not, so a desktop under tmpfs pressure panicked on the
+        // next TCP connect instead of returning ENOMEM/ENOBUFS.
+        let rx_buffer = TcpSocketBuffer::new(super::kernel_vec_zeroed(TCP_RECVBUF)?);
+        let tx_buffer = TcpSocketBuffer::new(super::kernel_vec_zeroed(TCP_SENDBUF)?);
         let socket = new_tcp_socket(rx_buffer, tx_buffer);
         let handle = super::register_smoltcp_socket(socket)?;
 

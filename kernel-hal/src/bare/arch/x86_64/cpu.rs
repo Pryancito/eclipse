@@ -351,6 +351,10 @@ hal_fn_impl! {
             alloc::string::String::from(brand_str)
         }
 
+        fn cpuinfo_flags() -> alloc::string::String {
+            cpuinfo_flags_string()
+        }
+
         fn cpu_count() -> u8 {
             super::smp::cpu_count() as u8
         }
@@ -451,4 +455,165 @@ static GETCPU_UNENCODABLE: core::sync::atomic::AtomicBool =
 /// Whether userspace may answer `getcpu` from `RDTSCP` on this machine.
 pub fn getcpu_fastpath_ok() -> bool {
     rdtscp_supported() && !GETCPU_UNENCODABLE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Build the `flags` line for `/proc/cpuinfo`.
+///
+/// Tokens match Linux names that Ollama / golang.org/x/sys/cpu / userspace
+/// probe for. AVX and AVX2 are advertised **only** when the kernel enabled
+/// XSAVE+XCR.AVX at boot (`trapframe::xsave_avx_enabled`): CPUID alone is not
+/// enough to *use* YMM, and advertising them while XCR0 is clear is exactly
+/// how a runner picks `cpu_avx2` and dies with SIGILL.
+fn cpuinfo_flags_string() -> alloc::string::String {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    use core::fmt::Write as _;
+
+    let leaf1 = __cpuid(1);
+    let edx = leaf1.edx;
+    let ecx = leaf1.ecx;
+    let leaf7 = __cpuid_count(7, 0);
+    let ebx7 = leaf7.ebx;
+    let ecx7 = leaf7.ecx;
+
+    let avx_live = trapframe::xsave_avx_enabled();
+    let avx512_live = trapframe::xsave_avx512_enabled();
+
+    let mut s = alloc::string::String::new();
+    let mut push = |tok: &str| {
+        if !s.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(tok);
+    };
+
+    // EDX leaf 1
+    if edx & (1 << 0) != 0 {
+        push("fpu");
+    }
+    if edx & (1 << 4) != 0 {
+        push("tsc");
+    }
+    if edx & (1 << 5) != 0 {
+        push("msr");
+    }
+    if edx & (1 << 8) != 0 {
+        push("cx8");
+    }
+    if edx & (1 << 15) != 0 {
+        push("cmov");
+    }
+    if edx & (1 << 19) != 0 {
+        push("clflush");
+    }
+    if edx & (1 << 23) != 0 {
+        push("mmx");
+    }
+    if edx & (1 << 24) != 0 {
+        push("fxsr");
+    }
+    if edx & (1 << 25) != 0 {
+        push("sse");
+    }
+    if edx & (1 << 26) != 0 {
+        push("sse2");
+    }
+    // ECX leaf 1
+    if ecx & (1 << 0) != 0 {
+        push("sse3");
+    }
+    if ecx & (1 << 1) != 0 {
+        push("pclmulqdq");
+    }
+    if ecx & (1 << 9) != 0 {
+        push("ssse3");
+    }
+    if ecx & (1 << 12) != 0 {
+        push("fma");
+    }
+    if ecx & (1 << 13) != 0 {
+        push("cx16");
+    }
+    if ecx & (1 << 19) != 0 {
+        push("sse4_1");
+    }
+    if ecx & (1 << 20) != 0 {
+        push("sse4_2");
+    }
+    if ecx & (1 << 23) != 0 {
+        push("popcnt");
+    }
+    if ecx & (1 << 25) != 0 {
+        push("aes");
+    }
+    if ecx & (1 << 26) != 0 {
+        push("xsave");
+    }
+    if avx_live && ecx & (1 << 28) != 0 {
+        push("avx");
+    }
+    if ecx & (1 << 29) != 0 {
+        push("f16c");
+    }
+    if ecx & (1 << 30) != 0 {
+        push("rdrand");
+    }
+    // EBX leaf 7
+    if avx_live && ebx7 & (1 << 5) != 0 {
+        push("avx2");
+    }
+    if ebx7 & (1 << 3) != 0 {
+        push("bmi1");
+    }
+    if ebx7 & (1 << 8) != 0 {
+        push("bmi2");
+    }
+    if ebx7 & (1 << 18) != 0 {
+        push("rdseed");
+    }
+    if ebx7 & (1 << 29) != 0 {
+        push("sha_ni");
+    }
+
+    // AVX-512 (advertised only when XCR0 enables opmask + ZMM_Hi256 + Hi16_ZMM)
+    if avx512_live {
+        if ebx7 & (1 << 16) != 0 {
+            push("avx512f");
+        }
+        if ebx7 & (1 << 17) != 0 {
+            push("avx512dq");
+        }
+        if ebx7 & (1 << 21) != 0 {
+            push("avx512_ifma");
+        }
+        if ebx7 & (1 << 28) != 0 {
+            push("avx512cd");
+        }
+        if ebx7 & (1 << 30) != 0 {
+            push("avx512bw");
+        }
+        if ebx7 & (1 << 31) != 0 {
+            push("avx512vl");
+        }
+        if ecx7 & (1 << 1) != 0 {
+            push("avx512_vbmi");
+        }
+        if ecx7 & (1 << 6) != 0 {
+            push("avx512_vbmi2");
+        }
+        if ecx7 & (1 << 11) != 0 {
+            push("avx512_vnni");
+        }
+        if ecx7 & (1 << 12) != 0 {
+            push("avx512_bitalg");
+        }
+        if ecx7 & (1 << 14) != 0 {
+            push("avx512_vpopcntdq");
+        }
+    }
+
+    // Always useful baseline tokens tools expect even on sparse CPUs.
+    if s.is_empty() {
+        let _ = write!(s, "fpu tsc");
+    }
+    s
 }

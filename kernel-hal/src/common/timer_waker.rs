@@ -21,6 +21,7 @@
 //! slot cancels too, so a future that forgets to cancel in its own `Drop` still
 //! cannot leave a stale waker behind.
 
+use alloc::alloc::{alloc, Layout};
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Waker};
@@ -30,6 +31,28 @@ use lock::Mutex;
 
 /// The owned callback [`crate::timer::timer_set`] takes.
 type TimerCallback = Box<dyn FnOnce(Duration) + Send + Sync>;
+
+/// Fallible `Box::new` for a timer callback. A full kernel heap used to panic
+/// here on a ~96-byte `Arc`+`Box` inside `epoll_pwait` (Ollama pulling a
+/// multi-GB model into tmpfs until the buddy was gone).
+fn try_box_timer_callback<F: FnOnce(Duration) + Send + Sync + 'static>(
+    f: F,
+) -> Option<TimerCallback> {
+    let layout = Layout::new::<F>();
+    if layout.size() == 0 {
+        return Some(Box::new(f));
+    }
+    // SAFETY: layout is for `F`; null means OOM.
+    let raw = unsafe { alloc(layout) as *mut F };
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: raw is allocated for one `F` and not yet initialized.
+    unsafe {
+        raw.write(f);
+        Some(Box::from_raw(raw))
+    }
+}
 
 /// State shared between the armed timer callback and the owner's slot.
 struct TimerWakerInner {
@@ -98,13 +121,21 @@ impl Drop for TimerWakerSlot {
 
 /// Ensure `slot` holds a live wake-up for `deadline`, registering `cx`'s waker.
 ///
+/// Returns `false` when the heap cannot hold the timer cell / callback: the
+/// slot is left empty and the caller must not sleep forever waiting on it
+/// (epoll/poll answer `ENOMEM`; other waits re-wake and retry).
+///
 /// - Slot already armed for this exact deadline and still live: the stored
 ///   waker is replaced with `cx`'s. A future may be polled by a different task
 ///   context than the one that armed the timer, so refreshing is what keeps the
 ///   wake-up pointed at whoever is actually waiting.
 /// - Slot empty, already fired, or armed for a *different* deadline: the old
 ///   one is cancelled and a fresh timer is armed.
-pub fn ensure_timer_waker(slot: &mut Option<TimerWakerSlot>, deadline: Duration, cx: &Context<'_>) {
+pub fn ensure_timer_waker(
+    slot: &mut Option<TimerWakerSlot>,
+    deadline: Duration,
+    cx: &Context<'_>,
+) -> bool {
     ensure_timer_waker_with(slot, deadline, cx.waker(), |deadline, callback| {
         crate::timer::timer_set(deadline, callback)
     })
@@ -121,7 +152,7 @@ fn ensure_timer_waker_with(
     deadline: Duration,
     waker: &Waker,
     arm: impl FnOnce(Duration, TimerCallback),
-) {
+) -> bool {
     if let Some(existing) = slot.as_ref() {
         if !existing.is_done() && existing.inner.deadline == deadline {
             // Clone before taking the cell's lock: cloning a waker runs the
@@ -140,37 +171,40 @@ fn ensure_timer_waker_with(
                     orphan.wake();
                 }
             }
-            return;
+            return true;
         }
         // Fired, cancelled, or armed for another instant: let it go.
         kill_timer_waker(slot);
     }
 
-    let inner = Arc::new(TimerWakerInner {
+    let Ok(inner) = Arc::try_new(TimerWakerInner {
         deadline,
         done: AtomicBool::new(false),
         waker: Mutex::new(Some(waker.clone())),
-    });
+    }) else {
+        return false;
+    };
     let fired = inner.clone();
-    arm(
-        deadline,
-        Box::new(move |_now: Duration| {
-            // Lost the race against a cancel (or a duplicate fire): the waker
-            // is already gone and the owner is no longer interested.
-            if fired.done.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            // Take the waker out from under the lock before waking: `wake`
-            // runs scheduler code (and this callback runs in timer-IRQ
-            // context), so holding this cell's lock across it would widen the
-            // window for no reason.
-            let waker = fired.waker.lock().take();
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }),
-    );
+    let Some(callback) = try_box_timer_callback(move |_now: Duration| {
+        // Lost the race against a cancel (or a duplicate fire): the waker
+        // is already gone and the owner is no longer interested.
+        if fired.done.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // Take the waker out from under the lock before waking: `wake`
+        // runs scheduler code (and this callback runs in timer-IRQ
+        // context), so holding this cell's lock across it would widen the
+        // window for no reason.
+        let waker = fired.waker.lock().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }) else {
+        return false;
+    };
+    arm(deadline, callback);
     *slot = Some(TimerWakerSlot { inner });
+    true
 }
 
 /// Cancel the wake-up in `slot`, if any, and empty the slot.
@@ -307,18 +341,24 @@ mod tests {
         probe: &Arc<Probe>,
     ) -> TimerCallback {
         let mut armed = None;
-        ensure_timer_waker_with(slot, deadline, &waker_of(probe), |asked, callback| {
-            assert_eq!(asked, deadline, "armed for an instant nobody asked for");
-            armed = Some(callback);
-        });
+        assert!(
+            ensure_timer_waker_with(slot, deadline, &waker_of(probe), |asked, callback| {
+                assert_eq!(asked, deadline, "armed for an instant nobody asked for");
+                armed = Some(callback);
+            }),
+            "arming the timer must not OOM in these tests"
+        );
         armed.expect("no timer was armed")
     }
 
     /// Re-poll `slot` for `deadline`, asserting that no second timer is armed.
     fn refresh(slot: &mut Option<TimerWakerSlot>, deadline: Duration, probe: &Arc<Probe>) {
-        ensure_timer_waker_with(slot, deadline, &waker_of(probe), |_, _| {
-            panic!("a live slot for the same deadline must not arm a second timer")
-        });
+        assert!(
+            ensure_timer_waker_with(slot, deadline, &waker_of(probe), |_, _| {
+                panic!("a live slot for the same deadline must not arm a second timer")
+            }),
+            "refreshing the timer must not OOM in these tests"
+        );
     }
 
     #[test]

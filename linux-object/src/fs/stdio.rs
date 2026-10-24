@@ -2234,21 +2234,26 @@ impl INode for Stdin {
                         .unwrap_or(false);
                     if !live {
                         this.sub_id = None;
-                        let waker = cx.waker().clone();
-                        this.sub_id = this.stdin.eventbus.lock().subscribe(Box::new(move |_| {
-                            waker.wake_by_ref();
-                            true
-                        }));
+                        // Fallible Box via subscribe_waker (heap OOM → None).
+                        this.sub_id = crate::sync::subscribe_waker(
+                            &mut this.stdin.eventbus.lock(),
+                            crate::sync::Event::READABLE
+                                | crate::sync::Event::ERROR
+                                | crate::sync::Event::CLOSED,
+                            cx.waker(),
+                        );
                     }
                     // Cancellable VTIME timer so `dd`/`read` with min 0 time N
                     // return after N deciseconds instead of blocking forever.
                     let dl_ns = this.stdin.vtime_deadline_ns.load(Ordering::Acquire);
                     if dl_ns != 0 {
-                        kernel_hal::timer_waker::ensure_timer_waker(
+                        if !kernel_hal::timer_waker::ensure_timer_waker(
                             &mut this.timer,
                             Duration::from_nanos(dl_ns),
                             cx,
-                        );
+                        ) {
+                            cx.waker().wake_by_ref();
+                        }
                     }
                     this.armed = true;
                 }

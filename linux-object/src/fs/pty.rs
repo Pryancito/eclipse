@@ -1350,11 +1350,15 @@ impl Future for PtyReadFuture<'_> {
             .unwrap_or(false);
         if !live {
             this.sub_id = None;
-            let waker = cx.waker().clone();
-            this.sub_id = this.bus.lock().subscribe(Box::new(move |_| {
-                waker.wake_by_ref();
-                true
-            }));
+            // Fallible Box: same densify-then-panic class as epoll under OOM.
+            this.sub_id = crate::sync::subscribe_waker(
+                &mut this.bus.lock(),
+                crate::sync::Event::READABLE
+                    | crate::sync::Event::WRITABLE
+                    | crate::sync::Event::ERROR
+                    | crate::sync::Event::CLOSED,
+                cx.waker(),
+            );
         }
         // The bus reports what the PTY does and nothing that happens to the
         // READER, so without this a `read` on a pty nobody writes to could not
@@ -1387,7 +1391,9 @@ impl Future for PtyReadFuture<'_> {
         } else {
             backstop
         };
-        kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
+        if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
+            cx.waker().wake_by_ref();
+        }
         // Re-check after subscribing: data may have arrived in the window
         // between the first check and the subscription, which would otherwise
         // be a missed wakeup.

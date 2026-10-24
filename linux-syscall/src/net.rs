@@ -971,7 +971,9 @@ impl Syscall<'_> {
         }
         debug!("FileLike {} flags: {:?}", sockfd, file_like.flags());
         let cap_len = len.min(super::SYSCALL_IO_MAX);
-        let mut data = vec![0u8; cap_len];
+        // Fallible: same ceiling as `sys_read`. `vec![0; n]` here took the
+        // machine down under heap pressure from a multi-GB download.
+        let mut data = crate::try_zeroed_buf(cap_len)?;
         let socket = file_like.as_socket()?;
         let (result, endpoint) = if (flags & MSG_PEEK) != 0 {
             socket.peek(&mut data).await
@@ -1067,16 +1069,22 @@ impl Syscall<'_> {
         // the socket does not report a type (netlink is one), and guessing
         // "stream" there would silently split, say, a netlink dump. Erring
         // toward a clean error beats erring toward silent corruption.
-        let data = if total > super::SYSCALL_IO_MAX {
-            if !matches!(sock_type, Some(SocketType::SOCK_STREAM)) {
-                return Err(LxError::EMSGSIZE);
-            }
-            let mut buf = alloc::vec![0u8; super::SYSCALL_IO_MAX];
+        // Always through a fallible, capped buffer — `read_to_vec` was an
+        // infallible allocation of the full gather size (up to SYSCALL_IO_MAX
+        // for the stream short path, and that path used `vec![0; IO_MAX]` too).
+        let data = {
+            let want = if total > super::SYSCALL_IO_MAX {
+                if !matches!(sock_type, Some(SocketType::SOCK_STREAM)) {
+                    return Err(LxError::EMSGSIZE);
+                }
+                super::SYSCALL_IO_MAX
+            } else {
+                total
+            };
+            let mut buf = crate::try_zeroed_buf(want)?;
             let n = iovs.read_bytes_at(0, &mut buf)?;
             buf.truncate(n);
             buf
-        } else {
-            iovs.read_to_vec()?
         };
 
         // SCM_RIGHTS: resolve any attached fds before queueing the bytes.
@@ -1148,7 +1156,7 @@ impl Syscall<'_> {
         let iovlen = hdr.msg_iovlen;
         let mut iovs = iov_ptr.read_iovecs(iovlen)?;
         let total_len = iovs.total_len().min(super::SYSCALL_IO_MAX);
-        let mut data = vec![0u8; total_len];
+        let mut data = crate::try_zeroed_buf(total_len)?;
 
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let old_flags = file_like.flags();

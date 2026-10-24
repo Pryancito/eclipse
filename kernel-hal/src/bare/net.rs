@@ -188,7 +188,9 @@ fn arm_net_timeout_timer(
     deadline: core::time::Duration,
     cx: &mut core::task::Context<'_>,
 ) {
-    crate::timer_waker::ensure_timer_waker(slot, deadline, cx);
+    if !crate::timer_waker::ensure_timer_waker(slot, deadline, cx) {
+        cx.waker().wake_by_ref();
+    }
 }
 
 fn kill_timer(token: &mut Option<crate::timer_waker::TimerWakerSlot>) {

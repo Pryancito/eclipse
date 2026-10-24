@@ -70,6 +70,11 @@ pub(crate) static XSAVEOPT: core::sync::atomic::AtomicBool =
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 static AVX_DISABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Set by the kernel (before `init`) to disable AVX-512 while keeping AVX/AVX2 enabled.
+/// A boot-time escape hatch (e.g. `noavx512` on the kernel command line).
+#[cfg(any(target_os = "none", target_os = "uefi"))]
+static AVX512_DISABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Force the plain FXSAVE path (disable XSAVE/AVX enablement in `init_fpu`).
 /// Must be called before `init`/`init_ap` run on any CPU.
 #[cfg(any(target_os = "none", target_os = "uefi"))]
@@ -77,26 +82,40 @@ pub fn set_avx_disabled(disabled: bool) {
     AVX_DISABLED.store(disabled, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Force disabling AVX-512 while keeping AVX/AVX2 enabled.
+/// Must be called before `init`/`init_ap` run on any CPU.
+#[cfg(any(target_os = "none", target_os = "uefi"))]
+pub fn set_avx512_disabled(disabled: bool) {
+    AVX512_DISABLED.store(disabled, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Whether this CPU enabled XSAVE + AVX for user space (256-bit vector width for
 /// llvmpipe and other AVX code). False when the CPU lacks it or `set_avx_disabled`
 /// forced the FXSAVE path.
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 pub fn xsave_avx_enabled() -> bool {
-    XSAVE_MASK.load(core::sync::atomic::Ordering::Relaxed) != 0
+    (XSAVE_MASK.load(core::sync::atomic::Ordering::Relaxed) & (1 << 2)) != 0
 }
 
-/// Enable x87 + SSE (and AVX, when the CPU has it) on this CPU.
+/// Whether this CPU enabled XSAVE + AVX-512 for user space (512-bit vector width for
+/// Skylake-X/IceLake runners and other AVX-512 code). False when the CPU lacks it
+/// or `set_avx512_disabled` forced AVX2-only.
+#[cfg(any(target_os = "none", target_os = "uefi"))]
+pub fn xsave_avx512_enabled() -> bool {
+    const AVX512_MASK: u32 = (1 << 5) | (1 << 6) | (1 << 7);
+    (XSAVE_MASK.load(core::sync::atomic::Ordering::Relaxed) & AVX512_MASK) == AVX512_MASK
+}
+
+/// Enable x87 + SSE (and AVX / AVX-512, when the CPU has it) on this CPU.
 ///
 /// The BSP inherits a usable FPU state from the firmware; APs arrive from the
 /// INIT/SIPI trampoline with CR0.TS set, so the first SSE instruction in Rust
 /// kernel code raises #NM → unhandled trap in `trap_handler`.
 ///
-/// AVX needs one more step: the CPU advertising AVX in CPUID is not enough to
-/// USE it — the OS must set CR4.OSXSAVE, enable the AVX bit in XCR0 (XSETBV),
-/// and save/restore the YMM registers across the user/kernel boundary (see
-/// `run`). Without it, LLVM/Mesa (llvmpipe) detect AVX as unusable and fall
-/// back to 128-bit SSE. We enable x87+SSE+AVX here (not AVX-512, to keep the
-/// XSAVE area small) and switch `run` to XSAVE/XRSTOR.
+/// AVX and AVX-512 need more: the CPU advertising them in CPUID is not enough
+/// to USE them — the OS must set CR4.OSXSAVE, enable the AVX and AVX-512 bits in
+/// XCR0 (XSETBV), and save/restore the YMM/ZMM registers across the user/kernel
+/// boundary (see `run`).
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 fn init_fpu() {
     use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
@@ -119,8 +138,8 @@ fn init_fpu() {
             options(nostack, preserves_flags),
         );
 
-        // Enable XSAVE + AVX for user space when the CPU supports both. Order
-        // matters: CR4.OSXSAVE must be set before XSETBV (XCr0::write), which
+        // Enable XSAVE + AVX (and AVX-512 when the CPU supports it) for user space.
+        // Order matters: CR4.OSXSAVE must be set before XSETBV (XCr0::write), which
         // reads XCR0 first. Runs on the BSP and every AP, so every CPU ends up
         // with the same XCR0 and the same XSAVE_MASK.
         let leaf1 = core::arch::x86_64::__cpuid(1);
@@ -130,7 +149,20 @@ fn init_fpu() {
         if !disabled && has_xsave && has_avx {
             use x86_64::registers::xcontrol::{XCr0, XCr0Flags};
             Cr4::update(|cr4| cr4.insert(Cr4Flags::OSXSAVE));
-            let flags = XCr0Flags::X87 | XCr0Flags::SSE | XCr0Flags::AVX;
+            let mut flags = XCr0Flags::X87 | XCr0Flags::SSE | XCr0Flags::AVX;
+
+            // Probe for AVX-512 support
+            let leaf7 = core::arch::x86_64::__cpuid_count(7, 0);
+            let has_avx512f = leaf7.ebx & (1 << 16) != 0;
+            let leaf_d0 = core::arch::x86_64::__cpuid_count(0xd, 0);
+            const AVX512_XCR0_BITS: u32 = (1 << 5) | (1 << 6) | (1 << 7);
+            let has_xsave_avx512 = (leaf_d0.eax & AVX512_XCR0_BITS) == AVX512_XCR0_BITS;
+            let avx512_disabled = AVX512_DISABLED.load(core::sync::atomic::Ordering::Relaxed);
+
+            if !avx512_disabled && has_avx512f && has_xsave_avx512 {
+                flags |= XCr0Flags::OPMASK | XCr0Flags::ZMM_HI256 | XCr0Flags::HI16_ZMM;
+            }
+
             XCr0::write(flags);
             XSAVE_MASK.store(flags.bits() as u32, core::sync::atomic::Ordering::Relaxed);
             let leaf_d1 = core::arch::x86_64::__cpuid_count(0xd, 1);
@@ -203,14 +235,21 @@ pub struct UserContext {
 
 /// Extended-state save area for this thread (see `UserContext::fpstate`).
 ///
-/// 1024 bytes, 64-byte aligned: XSAVE requires 64-byte alignment, and 1024
-/// covers the legacy x87/SSE region (512) + the XSAVE header (64) + the AVX
-/// YMM_Hi component (256) with headroom. AVX-512 is intentionally not enabled
-/// (see `init_fpu`), so its far larger area is not needed. The FXSAVE fallback
-/// path (CPUs without XSAVE/AVX) uses only the first 512 bytes.
+/// 2688 bytes, 64-byte aligned: XSAVE requires 64-byte alignment, and 2688
+/// covers:
+/// - Legacy x87/SSE region: 512 bytes (bytes 0..511)
+/// - XSAVE header: 64 bytes (bytes 512..575)
+/// - AVX YMM_Hi: 256 bytes (bytes 576..831)
+/// - AVX-512 opmask: 64 bytes (bytes 1088..1151)
+/// - AVX-512 ZMM_Hi256: 512 bytes (bytes 1152..1663)
+/// - AVX-512 Hi16_ZMM: 1024 bytes (bytes 1664..2687)
+/// Total = 2688 bytes (64-byte aligned).
+///
+/// CPUs with only AVX/AVX2 use bytes 0..832; CPUs without XSAVE use only the
+/// legacy 512 bytes.
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(C, align(64))]
-pub struct FpState([u8; 1024]);
+pub struct FpState([u8; 2688]);
 
 impl core::fmt::Debug for FpState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -220,7 +259,7 @@ impl core::fmt::Debug for FpState {
 
 impl Default for FpState {
     fn default() -> Self {
-        let mut s = [0u8; 1024];
+        let mut s = [0u8; 2688];
         // Legacy area (read by FXRSTOR, and the legacy half of the XSAVE area):
         // FCW = 0x037F (default x87 control word).
         s[0] = 0x7F;
@@ -230,7 +269,7 @@ impl Default for FpState {
         s[25] = 0x1F;
         // The XSAVE header (bytes 512..576) stays zero: XSTATE_BV = 0 (every
         // component in its init state) and XCOMP_BV = 0 (standard, non-compacted
-        // format). A fresh thread's first XRSTOR then loads init x87/SSE/AVX.
+        // format). A fresh thread's first XRSTOR then loads init x87/SSE/AVX/AVX-512.
         FpState(s)
     }
 }
@@ -431,10 +470,11 @@ mod layout_tests {
             0,
             "xsave sobre este contexto lanza #GP"
         );
-        // Legacy x87/SSE region (512) + XSAVE header (64) + YMM_Hi (256).
+        // Legacy x87/SSE region (512) + XSAVE header (64) + YMM_Hi (256)
+        // + AVX-512 (opmask 64 + ZMM_Hi256 512 + Hi16_ZMM 1024) = 2688 bytes.
         assert!(
-            size_of::<FpState>() >= 512 + 64 + 256,
-            "el area no cubre los YMM altos y XSAVE escribe fuera"
+            size_of::<FpState>() >= 2688,
+            "el area no cubre AVX-512 y XSAVE escribe fuera"
         );
     }
 

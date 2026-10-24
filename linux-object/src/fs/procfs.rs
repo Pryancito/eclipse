@@ -3819,6 +3819,10 @@ fn proc_cpuinfo_content() -> String {
         brand = "Eclipse CPU".into();
     }
     let cpu_count = kernel_hal::cpu::cpu_count() as usize;
+    // Feature flags the kernel has made usable. Missing this line made Ollama
+    // (and anything that greps `flags`) guess wrong and load an AVX2/CUDA
+    // runner that then died with SIGILL (`illegal instruction`).
+    let flags = kernel_hal::cpu::cpuinfo_flags();
     let mut s = String::new();
     for i in 0..cpu_count {
         #[cfg(target_arch = "x86_64")]
@@ -3834,13 +3838,15 @@ fn proc_cpuinfo_content() -> String {
                  cache size\t: 4096 KB\n\
                  physical id\t: {}\n\
                  core id\t\t: {}\n\
-                 cpu cores\t: {}",
+                 cpu cores\t: {}\n\
+                 flags\t\t: {}",
                 i,
                 brand,
                 kernel_hal::cpu::cpu_frequency() as f64,
                 i,
                 i,
-                cpu_count
+                cpu_count,
+                flags
             );
         }
         #[cfg(not(target_arch = "x86_64"))]
@@ -3853,6 +3859,7 @@ fn proc_cpuinfo_content() -> String {
                  cpu cores\t: {}",
                 i, brand, cpu_count
             );
+            let _ = flags; // unused on non-x86 until we grow a flags path
         }
     }
     s

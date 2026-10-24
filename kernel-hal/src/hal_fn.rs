@@ -41,6 +41,13 @@ hal_fn_def! {
         /// Get the CPU brand/model name.
         pub fn cpu_brand() -> String { String::new() }
 
+        /// Space-separated `/proc/cpuinfo` `flags` tokens for this CPU: features
+        /// the hardware has **and** the kernel has made usable in userspace.
+        /// AVX/AVX2 appear only when XSAVE+XCR0 were enabled at boot (so a
+        /// runner that keys off this line — Ollama — does not pick `cpu_avx2`
+        /// and then die with SIGILL on a machine where YMM is not live).
+        pub fn cpuinfo_flags() -> String { String::new() }
+
         /// This CPU's temperature in milli-degrees Celsius, read from the digital
         /// thermal sensor, or `None` when the hardware doesn't expose it.
         pub fn cpu_temperature_mc() -> Option<i32> { None }

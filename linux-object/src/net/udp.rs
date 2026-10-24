@@ -3,7 +3,7 @@
 use crate::error::{LxError, LxResult};
 use crate::fs::{FileLike, OpenFlags, PollStatus};
 use crate::net::*;
-use alloc::{boxed::Box, sync::Arc, vec};
+use alloc::{boxed::Box, sync::Arc};
 use async_trait::async_trait;
 use kernel_hal::sync::Mutex;
 use smoltcp::socket::{SocketSet, UdpPacketMetadata, UdpSocket, UdpSocketBuffer};
@@ -142,13 +142,14 @@ impl UdpSocketState {
     /// missing documentation
     pub fn new(ipv6: bool) -> LxResult<Self> {
         info!("udp new");
+        // Fallible: ~128 KiB + metadata. Same densify-then-panic class as TCP.
         let rx_buffer = UdpSocketBuffer::new(
-            vec![UdpPacketMetadata::EMPTY; UDP_METADATA_BUF],
-            vec![0; UDP_RECVBUF],
+            super::kernel_vec_filled(UDP_METADATA_BUF, UdpPacketMetadata::EMPTY)?,
+            super::kernel_vec_zeroed(UDP_RECVBUF)?,
         );
         let tx_buffer = UdpSocketBuffer::new(
-            vec![UdpPacketMetadata::EMPTY; UDP_METADATA_BUF],
-            vec![0; UDP_SENDBUF],
+            super::kernel_vec_filled(UDP_METADATA_BUF, UdpPacketMetadata::EMPTY)?,
+            super::kernel_vec_zeroed(UDP_SENDBUF)?,
         );
         let socket = UdpSocket::new(rx_buffer, tx_buffer);
         let handle = super::register_smoltcp_socket(socket)?;

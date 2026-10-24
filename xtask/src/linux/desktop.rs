@@ -2893,6 +2893,11 @@ fn write_labwc_environment(rootfs: &Path) {
           # keybinds, autostart). /etc/profile and eclipse-init's CHILD_ENV\n\
           # carry the same pin; the eclipse-firefox wrapper re-asserts it.\n\
           MOZ_ENABLE_WAYLAND=1\n\
+          # Ollama: models on disk under /home (never /tmp tmpfs). Same policy\n\
+          # as /etc/profile and eclipse-init CHILD_ENV -- a 5 GiB pull into\n\
+          # ramfs used to OOM-panic the kernel inside epoll_pwait.\n\
+          OLLAMA_MODELS=/home/moebius/.ollama/models\n\
+          OLLAMA_TMPDIR=/home/moebius/.ollama/tmp\n\
           # Pin the D-Bus session address so libdbus never `autolaunch:`es\n\
           # (dbus-launch + X11 + dbus-daemon + babysitter behind pipes -- the\n\
           # chain SDL_Init walks first -- not what hung gzdoom, see\n\

@@ -71,6 +71,7 @@ fn apply_kernel_flags(build: &mut cc::Build) {
         .flag("-mno-sse")
         .flag("-mno-sse2")
         .flag("-msoft-float")
+        .flag("-w")
         .flag("-nostdlib");
 }
 

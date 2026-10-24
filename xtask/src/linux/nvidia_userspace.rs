@@ -449,7 +449,8 @@ pub(super) fn remove(root: &Path, why: &str) {
     };
     let probe = fs::remove_file(root.join(super::cuda_probe::PATH)).is_ok() as usize
         + fs::remove_file(root.join(super::cuda_probe::STATUS_PATH)).is_ok() as usize
-        + fs::remove_file(root.join(super::cuda_probe::INSTALL_OLLAMA_PATH)).is_ok() as usize;
+        + fs::remove_file(root.join(super::cuda_probe::INSTALL_OLLAMA_PATH)).is_ok() as usize
+        + fs::remove_file(root.join(super::cuda_probe::ECLIPSE_OLLAMA_PATH)).is_ok() as usize;
     let removed = remove_with(root, &plan(&version)) + probe;
     if removed > 0 {
         println!(

@@ -62,8 +62,8 @@ hal_fn_impl! {
         fn primary_init() {
             crate::klog_info!("Eclipse: primary CPU {} init", crate::cpu::cpu_id());
             // AVX/XSAVE escape hatch: `noavx` (or `avx=off`) on the kernel
-            // command line forces the FXSAVE path, for isolating AVX enablement
-            // on real hardware without a rebuild. Must run before trapframe::init
+            // command line forces the FXSAVE path; `noavx512` (or `avx512=off`)
+            // forces AVX2-only (256-bit). Must run before trapframe::init
             // (which sets XCR0), and it persists for the APs' init_ap too.
             #[cfg(target_arch = "x86_64")]
             {
@@ -71,13 +71,18 @@ hal_fn_impl! {
                 if cl.contains("noavx") || cl.contains("avx=off") {
                     trapframe::set_avx_disabled(true);
                 }
+                if cl.contains("noavx512") || cl.contains("avx512=off") {
+                    trapframe::set_avx512_disabled(true);
+                }
             }
             unsafe { trapframe::init() };
             #[cfg(target_arch = "x86_64")]
             crate::klog_info!(
                 "fpu: XSAVE/AVX {}",
-                if trapframe::xsave_avx_enabled() {
-                    "ENABLED (256-bit user vectors)"
+                if trapframe::xsave_avx512_enabled() {
+                    "ENABLED (512-bit user vectors, AVX-512)"
+                } else if trapframe::xsave_avx_enabled() {
+                    "ENABLED (256-bit user vectors, AVX2)"
                 } else {
                     "disabled (FXSAVE path)"
                 }

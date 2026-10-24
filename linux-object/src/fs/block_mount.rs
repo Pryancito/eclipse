@@ -255,6 +255,21 @@ struct CacheLine {
     tick: u64,
 }
 
+/// Fallible `Box::new([0u8; SECTOR])`. The first fill of a cold cache (and
+/// every fill when the recycle path has nothing to reuse) used to panic the
+/// kernel under heap pressure mid multi-GB write.
+fn try_sector_box() -> Option<Box<[u8; SECTOR]>> {
+    use core::alloc::Layout;
+    let layout = Layout::new::<[u8; SECTOR]>();
+    // SAFETY: layout is for one sector; null means OOM.
+    let raw = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: raw is a zeroed allocation of exactly `[u8; SECTOR]`.
+    Some(unsafe { Box::from_raw(raw as *mut [u8; SECTOR]) })
+}
+
 /// A write-through, sector-granular LRU buffer cache.
 ///
 /// Every on-disk filesystem in the kernel (ext2 via `Synced`/editor, btrfs via
@@ -367,7 +382,16 @@ impl BlockCache {
                 }
             }
         }
-        let mut boxed = recycled.unwrap_or_else(|| Box::new([0u8; SECTOR]));
+        let mut boxed = match recycled {
+            Some(b) => b,
+            None => match try_sector_box() {
+                Some(b) => b,
+                // Heap full: skip the cache line. Write-through already put
+                // the bytes on disk; the next read fetches them. Better than
+                // `alloc_error` mid-model-download (the Ollama OOM class).
+                None => return,
+            },
+        };
         boxed.copy_from_slice(data);
         self.lines.insert(
             sector,

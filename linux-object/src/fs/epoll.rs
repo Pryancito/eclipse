@@ -755,11 +755,17 @@ impl Epoll {
             //    alive for as long as we touch it.
             let (interest_list, edges): (Vec<Watched>, _) = {
                 let inner = self.inner.lock();
-                let list = inner
-                    .interest_list
-                    .iter()
-                    .map(|(fd, (event, file))| (*fd, *event, file.clone()))
-                    .collect();
+                let n = inner.interest_list.len();
+                let mut list = Vec::new();
+                // Fallible: a multi-GB download that densified the heap used
+                // to panic on the next `collect` / `grow_one` inside this wait.
+                if list.try_reserve_exact(n).is_err() {
+                    stats::returned_error();
+                    return Err(LxError::ENOMEM);
+                }
+                for (fd, (event, file)) in &inner.interest_list {
+                    list.push((*fd, *event, file.clone()));
+                }
                 (list, inner.edge.clone())
             };
             // Asked of the FILE and not of the fd number: a socket on a low
@@ -791,6 +797,15 @@ impl Epoll {
             let mut events = Vec::new();
             let mut delivered = Vec::new();
             let mut scanned_edges = Vec::new();
+            if events.try_reserve(maxevents.min(interest_list.len())).is_err()
+                || delivered
+                    .try_reserve(maxevents.min(interest_list.len()))
+                    .is_err()
+                || scanned_edges.try_reserve(interest_list.len()).is_err()
+            {
+                stats::returned_error();
+                return Err(LxError::ENOMEM);
+            }
             let now = kernel_hal::timer::timer_now();
             for (fd, event, file) in &interest_list {
                 let interest = PollEvents::from_bits_truncate(event.events as u16);
@@ -891,7 +906,11 @@ impl Epoll {
             // An edge-triggered entry parks on its file's next publication
             // instead: a level subscription fires at once on a flag that is
             // already up, and the level of a quiet entry is up by definition.
-            let mut subs = alloc::vec::Vec::with_capacity(interest_list.len());
+            let mut subs = alloc::vec::Vec::new();
+            if subs.try_reserve_exact(interest_list.len()).is_err() {
+                stats::returned_error();
+                return Err(LxError::ENOMEM);
+            }
             let mut covered = !interest_list.is_empty();
             for (fd, event, file) in &interest_list {
                 let interest = PollEvents::from_bits_truncate(event.events as u16);
@@ -924,7 +943,7 @@ impl Epoll {
             } else {
                 crate::net::wait::IO_WAIT_TICK_MS
             };
-            crate::net::wait::IoMultiplexWait::with_tick_hid(
+            if let Err(e) = crate::net::wait::IoMultiplexWait::with_tick_hid(
                 timeout_msecs,
                 watch_net,
                 watch_interactive,
@@ -932,7 +951,11 @@ impl Epoll {
                 hid_seq,
                 tick_ms,
             )
-            .await;
+            .await
+            {
+                stats::returned_error();
+                return Err(e);
+            }
             drop(subs);
         }
     }

@@ -408,7 +408,9 @@ impl Future for ChangeFuture<'_> {
         }
         let deadline =
             kernel_hal::timer::deadline_after(Duration::from_millis(MSG_INTERRUPT_CHECK_TICK_MS));
-        kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx);
+        if !kernel_hal::timer_waker::ensure_timer_waker(&mut this.timer, deadline, cx) {
+            cx.waker().wake_by_ref();
+        }
         Poll::Pending
     }
 }

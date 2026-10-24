@@ -52,11 +52,12 @@ fn schedule_poll_wakeup(
     cx: &mut Context,
     after: Duration,
     timer_token: &mut Option<kernel_hal::timer_waker::TimerWakerSlot>,
-) {
+) -> bool {
     let deadline = mono_now() + after;
     // Refresh in place while the previous tick is still pending; re-arm only
     // after it fired. Avoids AtomicBool TOCTOU + timer-heap churn.
-    kernel_hal::timer_waker::ensure_timer_waker(timer_token, deadline, cx);
+    // `false` = heap OOM arming the backstop; caller must not sleep forever.
+    kernel_hal::timer_waker::ensure_timer_waker(timer_token, deadline, cx)
 }
 
 fn kill_poll_timer(timer_token: &mut Option<kernel_hal::timer_waker::TimerWakerSlot>) {
@@ -692,7 +693,15 @@ impl Syscall<'_> {
                         if hid_frame_missed(cx, watch_hid, hid_seq) {
                             return Poll::Pending;
                         }
-                        schedule_poll_wakeup(cx, wake_in, &mut this.timer);
+                        if !schedule_poll_wakeup(cx, wake_in, &mut this.timer) {
+                            clear_poll_io(
+                                &mut this.timer,
+                                &mut this.io_waker,
+                                watch_net,
+                                watch_interactive,
+                            );
+                            return Poll::Ready(Err(LxError::ENOMEM));
+                        }
                     }
                 }
 
@@ -1128,7 +1137,15 @@ impl Syscall<'_> {
                         if hid_frame_missed(cx, watch_hid, hid_seq) {
                             return Poll::Pending;
                         }
-                        schedule_poll_wakeup(cx, wake_in, &mut this.timer);
+                        if !schedule_poll_wakeup(cx, wake_in, &mut this.timer) {
+                            clear_poll_io(
+                                &mut this.timer,
+                                &mut this.io_waker,
+                                watch_net,
+                                watch_interactive,
+                            );
+                            return Poll::Ready(Err(LxError::ENOMEM));
+                        }
                     }
                 }
                 Poll::Pending

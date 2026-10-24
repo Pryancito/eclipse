@@ -161,6 +161,38 @@ fn alloc_error(layout: Layout) -> ! {
 
     let heap_used = crate::memory::heap_used();
     let heap_total = crate::memory::heap_total();
+
+    // Claim the stop-screen FIRST with the used/total line. The `panic!` below
+    // calls `panic_banner`, which fills the glass blue on its first claim —
+    // that used to wipe every `emit` above and left only a blue rectangle in
+    // photographed OOMs (Ollama pull, 2026-10-23). Painting here makes the
+    // panic handler *append* instead of erase.
+    {
+        use core::fmt::Write as _;
+        let mut b = StackBuf::new();
+        let _ = write!(
+            &mut b,
+            "KERNEL OOM  cpu={}  [build {}]\nalloc {} bytes failed\nheap used {} / total {} MiB",
+            kernel_hal::cpu::cpu_id(),
+            env!("ECLIPSE_BUILD_ID"),
+            layout.size(),
+            heap_used / 1024 / 1024,
+            heap_total / 1024 / 1024,
+        );
+        #[cfg(feature = "linux")]
+        {
+            let (ram_live, ram_cap, ram_frames) = linux_object::fs::ramfs_oom_stats();
+            let _ = write!(
+                &mut b,
+                "\nramfs live {} / cap {} MiB  page_backend={}",
+                ram_live >> 20,
+                ram_cap >> 20,
+                ram_frames as u8,
+            );
+        }
+        kernel_hal::console::panic_banner(b.valid_str());
+    }
+
     emit(format_args!(
         "\nkernel OOM: alloc {} bytes failed (used {} / total {} MiB)\n",
         layout.size(),

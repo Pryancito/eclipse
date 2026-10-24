@@ -427,6 +427,11 @@ const CHILD_ENV: &[&str] = &[
     // the environment a menu-launched browser sees). /etc/profile and the
     // labwc environment file carry the same pin.
     "MOZ_ENABLE_WAYLAND=1",
+    // Ollama models on the installed /home disk — never tmpfs. A multi-GB
+    // pull into /tmp densified the kernel heap until epoll_pwait panicked.
+    // /etc/profile and labwc's environment file carry the same pair.
+    "OLLAMA_MODELS=/home/moebius/.ollama/models",
+    "OLLAMA_TMPDIR=/home/moebius/.ollama/tmp",
     // GTK from init-started children (a foot from the dock, and everything
     // typed into it): the gdk-pixbuf loader registry the gtk-caches oneshot
     // writes at boot, and no dconf. Only labwc's environment file carried

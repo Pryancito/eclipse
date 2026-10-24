@@ -209,7 +209,9 @@ impl Future for SleepFuture {
             }
             Sleep::Unreachable => Poll::Pending,
             Sleep::Arm(deadline) => {
-                timer_waker::ensure_timer_waker(&mut this.slot, deadline, cx);
+                if !timer_waker::ensure_timer_waker(&mut this.slot, deadline, cx) {
+                    cx.waker().wake_by_ref();
+                }
                 Poll::Pending
             }
         }
@@ -366,7 +368,9 @@ impl Future for DisplayFlushFuture {
         // task context otherwise leaves the timer pointing at whoever polled
         // last. `ensure_timer_waker` cancels the old cell itself when the
         // frame has moved on, and refreshes it in place when it has not.
-        timer_waker::ensure_timer_waker(&mut self.slot, deadline, cx);
+        if !timer_waker::ensure_timer_waker(&mut self.slot, deadline, cx) {
+            cx.waker().wake_by_ref();
+        }
         Poll::Pending
     }
 }

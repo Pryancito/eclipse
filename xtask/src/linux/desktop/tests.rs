@@ -198,6 +198,19 @@ fn firefox_runs_on_native_wayland_from_every_launch_path() {
         wrapper.contains("\nexport MOZ_ENABLE_WAYLAND=1\n"),
         "the wrapper must export MOZ_ENABLE_WAYLAND=1"
     );
+    // Models on disk, not tmpfs — same three launch paths as the Wayland pin.
+    assert!(
+        profile.contains("export OLLAMA_MODELS="),
+        "/etc/profile must export OLLAMA_MODELS away from /tmp"
+    );
+    assert!(
+        environment.contains("\nOLLAMA_MODELS=/home/moebius/.ollama/models\n"),
+        "labwc's environment file must pin OLLAMA_MODELS under /home"
+    );
+    assert!(
+        environment.contains("\nOLLAMA_TMPDIR=/home/moebius/.ollama/tmp\n"),
+        "labwc's environment file must pin OLLAMA_TMPDIR under /home"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
