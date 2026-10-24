@@ -278,7 +278,7 @@ fn a_forked_child_sees_its_parent_hole() {
         let forked = inner.forked_child(0, 0, 0);
         drop(inner);
         LinuxProcess {
-            root_inode: parent.root_inode().clone(),
+            root_inode: kernel_hal::sync::RwLock::new(parent.root_inode()),
             parent: Mutex::new(Weak::default()),
             vt: 0,
             // A fresh child: nothing is pending at the process level and it is

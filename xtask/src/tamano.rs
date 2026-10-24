@@ -87,11 +87,9 @@ const PASADOS: &[(&str, usize)] = &[
     ("drivers/src/usb/xhci_hid.rs", 7750),
     ("drivers/src/net/e1000e.rs", 7500),
     // 7750: lunarclip (el portapapeles) trajo aqui su servicio, su wrapper y
-    // su fila en los inventarios, y el fichero se paso a 7562. Partirlo es la
-    // tanda que dice el comentario de arriba -- tiene un `mod
-    // rootfs_plumbing_tests` de primer nivel enorme -- y no se hace a la vez
-    // que entra una aplicacion nueva.
-    ("xtask/src/linux/mod.rs", 7750),
+    // 8000: master llegó a 7776 con los cambios de CUDA/Ollama sobre el techo
+    // de 7750; sube al siguiente múltiplo de 250 según la regla del trinquete.
+    ("xtask/src/linux/mod.rs", 8000),
     // 7000: master llego a 6753 con el techo en 6750, asi que el trinquete
     // estaba rojo antes de esta tanda y no por ella.
     ("linux-object/src/fs/devfs/drm_scheme.rs", 7000),

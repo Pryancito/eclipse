@@ -79,7 +79,7 @@ impl INode for Log {
 
 pub(super) fn a_process() -> LinuxProcess {
     LinuxProcess {
-        root_inode: Log::new(),
+        root_inode: kernel_hal::sync::RwLock::new(Log::new()),
         parent: Mutex::new(Weak::default()),
         vt: 0,
         exit_path: Default::default(),

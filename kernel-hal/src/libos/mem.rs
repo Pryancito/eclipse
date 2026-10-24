@@ -34,6 +34,11 @@ hal_fn_impl! {
             MOCK_PHYS_MEM.phys_to_virt(paddr)
         }
 
+        fn virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
+            assert!(vaddr >= PMEM_MAP_VADDR && vaddr < PMEM_MAP_VADDR + PMEM_SIZE);
+            vaddr - PMEM_MAP_VADDR
+        }
+
         #[allow(clippy::single_range_in_vec_init)]
         fn free_pmem_regions() -> Vec<Range<PhysAddr>> {
             vec![PAGE_SIZE..PMEM_SIZE]

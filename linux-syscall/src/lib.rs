@@ -376,6 +376,7 @@ impl Syscall<'_> {
             Sys::GETCWD => self.sys_getcwd(a0.into(), a1),
             Sys::CHDIR => self.sys_chdir(a0.into()),
             Sys::FCHDIR => self.sys_fchdir(a0.into()),
+            Sys::CHROOT => self.sys_chroot(a0.into()),
             Sys::RENAMEAT => self.sys_renameat(a0.into(), a1.into(), a2.into(), a3.into()),
             Sys::RENAMEAT2 => self.sys_renameat2(a0.into(), a1.into(), a2.into(), a3.into(), a4),
             Sys::MKDIRAT => self.sys_mkdirat(a0.into(), a1.into(), a2),
@@ -385,9 +386,9 @@ impl Syscall<'_> {
             Sys::SYMLINKAT => self.sys_symlinkat(a0.into(), a1.into(), a2.into()),
             Sys::READLINKAT => self.sys_readlinkat(a0.into(), a1.into(), a2.into(), a3),
             Sys::FCHMOD => self.sys_fchmod(a0.into(), a1),
-            // `fchmodat` has no flags argument (`fchmodat2` would); neither
+            // `fchmodat` has no flags argument (`fchmodat2` does); neither
             // has `faccessat` (`faccessat2` does). See `at_flags_register`.
-            ref s @ Sys::FCHMODAT => {
+            ref s @ (Sys::FCHMODAT | Sys::FCHMODAT2) => {
                 let flags = at_flags_register(at_syscall_takes_flags(s), a3);
                 self.sys_fchmodat(a0.into(), a1.into(), a2, flags)
             }
@@ -1282,11 +1283,10 @@ fn failure_detail(num: u32, args: &[usize; 6], err: LxError) -> alloc::string::S
 
 /// Which of the `*at` syscalls dispatched with a flags word actually carry
 /// one. The dispatch asks this rather than deciding per arm, so the answer
-/// is one place and a test can read it. `fchmodat2` has no number in this
-/// table yet (it answers `ENOSYS`, and libc falls back), so `FCHMODAT` is the
-/// only spelling of that family here, and it is the three-argument one.
+/// is one place and a test can read it. `faccessat2` and `fchmodat2` carry
+/// flags, whereas `faccessat` and `fchmodat` are the three-argument ones.
 fn at_syscall_takes_flags(sys: &Sys) -> bool {
-    matches!(sys, Sys::FACCESSAT2)
+    matches!(sys, Sys::FACCESSAT2 | Sys::FCHMODAT2)
 }
 
 /// [einval-hunt] One budgeted `error!` line naming a syscall that returned
@@ -1396,7 +1396,7 @@ mod syscall_answer_tests {
             448,    // process_mrelease
             449,    // futex_waitv
             451,    // cachestat
-            452,    // fchmodat2
+            453,    // map_shadow_stack
             457,    // statmount
             1_000_000,
             u32::MAX,
@@ -1418,6 +1418,7 @@ mod syscall_answer_tests {
         assert_eq!(Sys::try_from(0), Ok(Sys::READ));
         assert_eq!(Sys::try_from(1), Ok(Sys::WRITE));
         assert!(Sys::try_from(435).is_ok(), "clone3 is in the table");
+        assert_eq!(Sys::try_from(452), Ok(Sys::FCHMODAT2));
     }
 
     #[test]
@@ -1472,6 +1473,7 @@ mod syscall_answer_tests {
         // three arguments, and whatever the stub left in the fourth register
         // used to arrive here as AT_ flags.
         assert!(!at_syscall_takes_flags(&Sys::FCHMODAT));
+        assert!(at_syscall_takes_flags(&Sys::FCHMODAT2));
     }
 
     /// The boot tracer records a failed open with its path already, so the

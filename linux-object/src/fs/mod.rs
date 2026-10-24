@@ -2534,7 +2534,8 @@ impl LinuxProcess {
     ) -> LxResult<Arc<dyn INode>> {
         // An absolute link starts over at this process's root, from `/proc`
         // or `/dev` as from anywhere.
-        walked.root = Some(self.root_inode().clone());
+        let root = self.root_inode();
+        walked.root = Some(root.clone());
         // The special paths below are each in `/proc/<pid>`, where `self` is
         // the calling process, as `fd` takes it.
         let in_proc_self = |walked: &mut Walked, rest: core::fmt::Arguments| {
@@ -2640,22 +2641,20 @@ impl LinuxProcess {
             // VFS walk (two String allocations + a directory scan per
             // component on SFS) before this.
             if follow {
-                if let Some(inode) = dcache::get(self.root_inode(), path, walked) {
+                if let Some(inode) = dcache::get(&root, path, walked) {
                     return Ok(inode);
                 }
             }
-            let inode = self
-                .root_inode()
-                .lookup_walked(path, follow_max_depth, Some(walked))?;
+            let inode = root.lookup_walked(path, follow_max_depth, Some(walked))?;
             if follow {
-                dcache::put(self.root_inode(), path, &inode, walked);
+                dcache::put(&root, path, &inode, walked);
             }
             return Ok(inode);
         }
         // The walk goes on from where the directory is, by its name.
         let (start, from) = if dirfd == FileDesc::CWD {
             let cwd = self.current_working_directory();
-            (self.root_inode().lookup(&cwd)?, cwd)
+            (root.lookup(&cwd)?, cwd)
         } else {
             let file = self.get_file(dirfd)?;
             (file.inode(), file.path().clone())

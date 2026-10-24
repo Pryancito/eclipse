@@ -601,7 +601,7 @@ impl NvidiaOpen {
                 }
                 escape_result(nr, status)
             }
-            esc::RM_ALLOC_MEMORY => {
+            esc::RM_ALLOC_MEMORY | esc::RM_VID_HEAP_CONTROL => {
                 if !nvctl::rm_up() {
                     no_rm_yet();
                     return Err(LxError::EINVAL);
@@ -611,7 +611,7 @@ impl NvidiaOpen {
                 // which takes them in `os_lock_user_pages`.
                 let pages = pin_os_descriptor(payload, self.is_ctl(), caller);
                 let status = nvctl::rm_escape_lending(nr, payload, &self.rm_caller(caller), pages);
-                if status == NV_OK {
+                if status == NV_OK && nr == esc::RM_ALLOC_MEMORY {
                     alloc_memory_refused(payload);
                 }
                 escape_result(nr, status)
@@ -620,7 +620,6 @@ impl NvidiaOpen {
             | esc::RM_CONTROL
             | esc::RM_DUP_OBJECT
             | esc::RM_SHARE
-            | esc::RM_VID_HEAP_CONTROL
             | esc::RM_UNMAP_MEMORY
             | esc::RM_UPDATE_DEVICE_MAPPING_INFO => {
                 if !nvctl::rm_up() {
@@ -874,30 +873,57 @@ const OS_DESCRIPTOR_CLASS: u32 = 0x71;
 /// `NVOS02_FLAGS_ALLOC_USER_READ_ONLY` (nvos.h, bit 21).
 const ALLOC_USER_READ_ONLY: u32 = 1 << 21;
 
-/// The pages an RM_ALLOC_MEMORY payload has the RM pin, as
-/// RmCreateOsDescriptor asks `os_lock_user_pages` for them: `(address,
+/// `NVOS32_PARAMETERS` layout for `RM_VID_HEAP_CONTROL`.
+const VID_HEAP_CONTROL_SIZE: usize = 184;
+const VID_HEAP_FUNCTION: usize = 8;
+const VID_HEAP_FUNCTION_ALLOC_OS_DESCRIPTOR: u32 = 27;
+const VID_HEAP_ATTR2: usize = 56;
+const VID_HEAP_DESCRIPTOR: usize = 64;
+const VID_HEAP_LIMIT: usize = 72;
+const VID_HEAP_ATTR2_PROTECTION_USER_RO: u32 = 0x400000;
+
+/// The pages an RM_ALLOC_MEMORY or RM_VID_HEAP_CONTROL payload has the RM pin,
+/// as RmCreateOsDescriptor asks `os_lock_user_pages` for them: `(address,
 /// pages, for writing)`. `None` for a call that never gets that far: a
-/// payload of the wrong size, the control device, another class, an address
-/// that is not page aligned, or a limit that overflows.
+/// payload of the wrong size, the control device, another class/function, an
+/// address that is not page aligned, or a limit that overflows.
 fn os_descriptor_pages(payload: &[u8], ctl: bool) -> Option<(usize, usize, bool)> {
-    if payload.len() != ALLOC_MEMORY_SIZE
-        || ctl
-        || u32_at(payload, ALLOC_MEMORY_CLASS) != OS_DESCRIPTOR_CLASS
+    if ctl {
+        return None;
+    }
+    if payload.len() == ALLOC_MEMORY_SIZE
+        && u32_at(payload, ALLOC_MEMORY_CLASS) == OS_DESCRIPTOR_CLASS
     {
-        return None;
+        let address = u64_at(payload, ALLOC_MEMORY_PMEMORY);
+        if !address.is_multiple_of(PAGE_SIZE as u64) {
+            return None;
+        }
+        let size = u64_at(payload, ALLOC_MEMORY_LIMIT).checked_add(1)?;
+        let count = 1 + (size - 1) / PAGE_SIZE as u64;
+        let write = u32_at(payload, ALLOC_MEMORY_FLAGS) & ALLOC_USER_READ_ONLY == 0;
+        return Some((
+            usize::try_from(address).ok()?,
+            usize::try_from(count).ok()?,
+            write,
+        ));
     }
-    let address = u64_at(payload, ALLOC_MEMORY_PMEMORY);
-    if !address.is_multiple_of(PAGE_SIZE as u64) {
-        return None;
+    if payload.len() == VID_HEAP_CONTROL_SIZE
+        && u32_at(payload, VID_HEAP_FUNCTION) == VID_HEAP_FUNCTION_ALLOC_OS_DESCRIPTOR
+    {
+        let address = u64_at(payload, VID_HEAP_DESCRIPTOR);
+        if !address.is_multiple_of(PAGE_SIZE as u64) {
+            return None;
+        }
+        let size = u64_at(payload, VID_HEAP_LIMIT).checked_add(1)?;
+        let count = 1 + (size - 1) / PAGE_SIZE as u64;
+        let write = u32_at(payload, VID_HEAP_ATTR2) & VID_HEAP_ATTR2_PROTECTION_USER_RO == 0;
+        return Some((
+            usize::try_from(address).ok()?,
+            usize::try_from(count).ok()?,
+            write,
+        ));
     }
-    let size = u64_at(payload, ALLOC_MEMORY_LIMIT).checked_add(1)?;
-    let count = 1 + (size - 1) / PAGE_SIZE as u64;
-    let write = u32_at(payload, ALLOC_MEMORY_FLAGS) & ALLOC_USER_READ_ONLY == 0;
-    Some((
-        usize::try_from(address).ok()?,
-        usize::try_from(count).ok()?,
-        write,
-    ))
+    None
 }
 
 /// The pages of the OS descriptor an RM_ALLOC_MEMORY payload names, pinned

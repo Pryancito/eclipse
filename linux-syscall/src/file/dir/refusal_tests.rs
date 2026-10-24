@@ -509,3 +509,36 @@ fn an_error_from_the_directory_that_is_not_the_end_comes_through() {
         })
     });
 }
+
+#[test]
+fn chroot_gates_and_updates_root() {
+    let proc = a_process(48_810, "dir-chroot");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let lp = sys.linux_process();
+            lp.root_inode().create("jail", FileType::Dir, 0o755).unwrap();
+            let jail_inode = lp.lookup_inode("/jail").unwrap();
+            jail_inode.create("inner_file", FileType::File, 0o644).unwrap();
+
+            let at = |s: &[u8]| UserInPtr::<u8>::from(s.as_ptr() as usize);
+
+            // 1. Non-existent path returns ENOENT
+            assert_eq!(sys.sys_chroot(at(b"/missing\0")), Err(LxError::ENOENT));
+
+            // 2. Regular file returns ENOTDIR
+            assert_eq!(sys.sys_chroot(at(b"/jail/inner_file\0")), Err(LxError::ENOTDIR));
+
+            // 3. Root can chroot into /jail
+            assert_eq!(sys.sys_chroot(at(b"/jail\0")), Ok(0));
+
+            // Inside the chroot, / is now /jail
+            assert!(lp.lookup_inode("/inner_file").is_ok());
+            // And outside path /jail no longer exists from inside
+            assert_eq!(lp.lookup_inode("/jail").err(), Some(LxError::ENOENT));
+
+            // 4. Once unprivileged, calling chroot returns EPERM
+            lp.set_resuid(1000, 1000, 1000).unwrap();
+            assert_eq!(sys.sys_chroot(at(b"/\0")), Err(LxError::EPERM));
+        })
+    });
+}

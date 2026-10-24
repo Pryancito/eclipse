@@ -1192,6 +1192,23 @@ fn an_os_descriptor_is_pinned_as_the_payload_asks() {
     assert_eq!(asked.borrow().len(), 1);
     let p = alloc_memory(OS_DESCRIPTOR_CLASS, 0, 0x7000_0000, 0xfff);
     assert!(pin_os_descriptor(&p, false, &caller_with_fd(&no_fds)).is_none());
+
+    // RM_VID_HEAP_CONTROL with NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR pins too.
+    let mut vid_heap = [0u8; VID_HEAP_CONTROL_SIZE];
+    vid_heap[VID_HEAP_FUNCTION..VID_HEAP_FUNCTION + 4]
+        .copy_from_slice(&VID_HEAP_FUNCTION_ALLOC_OS_DESCRIPTOR.to_ne_bytes());
+    vid_heap[VID_HEAP_DESCRIPTOR..VID_HEAP_DESCRIPTOR + 8]
+        .copy_from_slice(&0x8000_0000u64.to_ne_bytes());
+    vid_heap[VID_HEAP_LIMIT..VID_HEAP_LIMIT + 8].copy_from_slice(&0x1fffu64.to_ne_bytes());
+    let pages = pin_os_descriptor(&vid_heap, false, &caller).expect("pinned vid_heap");
+    assert_eq!(
+        (pages.va, pages.phys.len(), pages.writable),
+        (0x8000_0000, 2, true)
+    );
+    assert_eq!(
+        *asked.borrow(),
+        [(0x7000_0000, 3, false), (0x8000_0000, 2, true)]
+    );
 }
 
 #[test]

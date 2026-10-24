@@ -82,6 +82,33 @@ impl Syscall<'_> {
         Ok(0)
     }
 
+    /// Change the root directory.
+    /// - `path` – pointer to string with name of path
+    pub fn sys_chroot(&self, path: UserInPtr<u8>) -> SysResult {
+        let path = path.as_c_str()?;
+        info!("chroot: path={:?}", path);
+
+        let proc = self.linux_process();
+        if !proc.capable(linux_object::process::CAP_SYS_CHROOT) {
+            return Err(LxError::EPERM);
+        }
+
+        let inode = proc.lookup_inode(path)?;
+        let info = inode.metadata()?;
+        if info.type_ != FileType::Dir {
+            return Err(LxError::ENOTDIR);
+        }
+        let verdict = proc.check_access(&info, 0o1, true);
+        linux_object::fs::fd_permission(verdict, &inode, self.zircon_process())?;
+
+        proc.set_root_inode(inode);
+        if path == "." || proc.current_working_directory() == path {
+            proc.change_directory("/");
+        }
+        linux_object::fs::dcache_invalidate();
+        Ok(0)
+    }
+
     /// Make a directory.
     /// - path – pointer to string with directory name
     /// - mode – file system permissions mode

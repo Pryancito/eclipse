@@ -524,6 +524,21 @@ fn the_user_and_the_group_do_not_change_places() {
                 0o640,
                 "fchmodat took the wrong word as the mode"
             );
+            assert_eq!(
+                by_number(
+                    sys,
+                    Sys::FCHMODAT2,
+                    [AT_FDCWD, at(&path), 0o644, 0, 0, 0]
+                )
+                .await,
+                0,
+                "fchmodat2 failed"
+            );
+            assert_eq!(
+                who_owns(sys.linux_process(), "/args_own/f").2,
+                0o644,
+                "fchmodat2 took the wrong word as the mode"
+            );
 
             // The three `access` forms end the same way: `faccessat2` is the
             // only one of the three with a flag word, and the arm registers

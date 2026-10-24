@@ -20,7 +20,7 @@ use core::convert::TryFrom;
 use core::future::Future;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use hashbrown::{HashMap, HashSet};
-use kernel_hal::sync::{Mutex, MutexGuard};
+use kernel_hal::sync::{Mutex, MutexGuard, RwLock};
 use kernel_hal::VirtAddr;
 use rcore_fs::vfs::{FileSystem, FileType, INode, Metadata};
 
@@ -630,7 +630,7 @@ impl NewChild for Process {
             linux_parent_inner.sid
         };
         let new_linux_proc = LinuxProcess {
-            root_inode: linux_parent.root_inode.clone(),
+            root_inode: RwLock::new(linux_parent.root_inode()),
             parent: Mutex::new(Arc::downgrade(parent)),
             vt: linux_parent.vt,
             exit_path: ExitPathSummary::default(),
@@ -1176,7 +1176,7 @@ pub fn opened_cloexec(file: &Arc<dyn FileLike>) -> bool {
 /// Linux specific process information.
 pub struct LinuxProcess {
     /// The root INode of file system
-    root_inode: Arc<dyn INode>,
+    root_inode: RwLock<Arc<dyn INode>>,
     /// Parent process.
     ///
     /// MUTABLE, because a process can be re-parented: when its parent dies,
@@ -1805,7 +1805,7 @@ impl LinuxProcess {
         ensure_a_kill_wakes_the_waits();
         note_process_created();
         LinuxProcess {
-            root_inode,
+            root_inode: RwLock::new(root_inode),
             parent: Mutex::new(Weak::default()),
             vt,
             exit_path: ExitPathSummary::default(),
@@ -2878,8 +2878,13 @@ impl LinuxProcess {
     }
 
     /// Get root INode of the process.
-    pub fn root_inode(&self) -> &Arc<dyn INode> {
-        &self.root_inode
+    pub fn root_inode(&self) -> Arc<dyn INode> {
+        self.root_inode.read().clone()
+    }
+
+    /// Set root INode of the process (`chroot`).
+    pub fn set_root_inode(&self, root: Arc<dyn INode>) {
+        *self.root_inode.write() = root;
     }
 
     /// Get a snapshot of current credentials.

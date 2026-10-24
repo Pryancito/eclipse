@@ -47,6 +47,8 @@ pub const CAP_SETPCAP: u32 = 8;
 /// `CAP_LINUX_IMMUTABLE`: set the immutable and append-only flags. Here only
 /// for [`CAP_FS_SET`].
 pub const CAP_LINUX_IMMUTABLE: u32 = 9;
+/// `CAP_SYS_CHROOT`: use `chroot(2)`.
+pub const CAP_SYS_CHROOT: u32 = 18;
 /// `CAP_SYS_PTRACE`: trace, inspect or reach into the innards of a process
 /// that is not yours -- `pidfd_getfd(2)` included.
 pub const CAP_SYS_PTRACE: u32 = 19;

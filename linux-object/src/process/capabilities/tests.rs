@@ -60,6 +60,7 @@ fn the_capability_numbers_are_the_ones_capability_h_names() {
         (CAP_SETUID, 7),
         (CAP_SETPCAP, 8),
         (CAP_LINUX_IMMUTABLE, 9),
+        (CAP_SYS_CHROOT, 18),
         (CAP_SYS_PTRACE, 19),
         (CAP_SYS_ADMIN, 21),
         (CAP_SYS_BOOT, 22),
