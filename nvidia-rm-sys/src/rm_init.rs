@@ -360,12 +360,12 @@ pub const MAX_LADDER_GPUS: u32 = 8;
 
 extern "C" {
     fn eclipse_rm_step16(device_instance: NvU32, out: *mut GrAlloc) -> NV_STATUS;
-    fn eclipse_rm_gr_ready() -> NvBool;
+    fn eclipse_rm_gr_ready(device_instance: NvU32) -> NvBool;
 }
 
-/// Whether the step-16 ladder has been built: the shared client, device and
-/// VA space that context 0 IS and that every client context (`ctx_alloc`) is
-/// made out of.
+/// Whether the step-16 ladder has been built on `device_instance`: the client,
+/// device and VA space that context 0 IS and that every client context
+/// (`ctx_alloc`) on that card is made out of.
 ///
 /// This is what VA-space work needs, and it is STICKY: it stays true once the
 /// ladder is up, whoever ran it and whether or not anyone still holds a
@@ -374,9 +374,14 @@ extern "C" {
 /// frees it before `vkCreateDevice` binds anything, so the answer was "no" at
 /// exactly the moment the first real bind arrived.
 ///
-/// Reads one C global: no RM call, no lock, no `RmGate`.
-pub fn gr_ready() -> bool {
-    unsafe { eclipse_rm_gr_ready() != 0 }
+/// Per CARD, like the ladder itself: each GPU builds its own, so asking for
+/// the machine would tell a card with no ladder that it has one the moment
+/// another card built theirs. An instance with no slot
+/// (see [`MAX_LADDER_GPUS`]) answers `false`.
+///
+/// Reads one C array entry: no RM call, no lock, no `RmGate`.
+pub fn gr_ready(device_instance: NvU32) -> bool {
+    unsafe { eclipse_rm_gr_ready(device_instance) != 0 }
 }
 
 /// Runs the step-16 GR allocation ladder on a state-loaded GPU (idempotent:

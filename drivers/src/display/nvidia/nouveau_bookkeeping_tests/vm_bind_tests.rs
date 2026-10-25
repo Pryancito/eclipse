@@ -703,3 +703,27 @@ fn a_bind_needs_the_ladder_not_somebody_holding_a_channel_right_now() {
         Err(nv::ENODEV)
     );
 }
+
+#[test]
+fn the_ladder_a_bind_asks_about_is_the_one_on_its_own_card() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    // The second card of a two-card box: the RM gave it device instance 1.
+    *gpu.rm_device_instance.lock() = Some(1);
+    let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    with_uvmm(&gpu, A);
+    FAKE_RM.lock().gr_ready_asked_of = None;
+    assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, 1 << 40, 65536)]), Ok(0));
+    // The C flag is `g_grAllocDone[gpuInstance]`, one slot per card, because
+    // each card builds its own client, device and VA space. So the question
+    // has to name THIS card: hardcoding 0 reads the first card's ladder and
+    // is right only on a box with one GPU.
+    assert_eq!(
+        FAKE_RM.lock().gr_ready_asked_of,
+        Some(1),
+        "asked about the card doing the bind"
+    );
+}

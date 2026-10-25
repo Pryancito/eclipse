@@ -1574,15 +1574,23 @@ static NvBool eclipseDemoForeignGpu(NvU32 gpuInstance, const char *step)
     return NV_TRUE;
 }
 
-/* Whether the step16 ladder has been built: the shared client/device/VAS
- * every context (index 0 directly, every client index through ctx_alloc)
+/* Whether the step16 ladder has been built ON THIS CARD: the client/device/VAS
+ * every context on it (index 0 directly, every client index through ctx_alloc)
  * is made out of. This is the real precondition for VA-space work, and it
  * is STICKY -- it survives every channel being freed, which a live-channel
  * count does not. The Rust VM_BIND path reads it instead of asking whether
- * some client happens to hold a channel right now. */
-NvBool eclipse_rm_gr_ready(void)
+ * some client happens to hold a channel right now.
+ *
+ * Per-card, like the ladder it reports on: each GPU builds its own, so
+ * answering for the whole machine would tell a card with no ladder that it
+ * has one as soon as any other card did. */
+NvBool eclipse_rm_gr_ready(NvU32 gpuInstance)
 {
-    return g_grAllocDone;
+    if (!eclipseLadderSlot(gpuInstance, "gr_ready"))
+    {
+        return NV_FALSE;
+    }
+    return g_grAllocDone[gpuInstance];
 }
 
 NV_STATUS eclipse_rm_step16(NvU32 gpuInstance, EclipseGrAlloc *pOut)
