@@ -11,8 +11,27 @@
 //! ([`Process::leader_sched`]); this is the one type the calls ask.
 
 use super::*;
-use zircon_object::task::SchedSnapshot;
+use zircon_object::task::{SchedSnapshot, ThreadState};
 use zircon_object::ZxResult;
+
+/// Whether `thread` is on its way out, `PF_EXITING`: killed, exited, or
+/// gone. `do_exit` lets such a task's `io_context` go.
+fn exiting(thread: &Thread) -> bool {
+    matches!(thread.state(), ThreadState::Dying | ThreadState::Dead)
+}
+
+/// Whether `thread` is one `release_task` would have taken by now: one
+/// that is not the leader of a process whose exit is on file. Linux makes a
+/// thread group a zombie its parent can wait for only once every other
+/// thread of it has been released (`delay_group_leader`); `Process::exit`
+/// publishes the exit at once, while the threads it killed are still on
+/// their way out, and a thread parked in a `read` took its time. A tid
+/// already finds none of them: `find_task_by_tid` looks among the
+/// processes that have not exited.
+fn released(thread: &Thread) -> bool {
+    let proc = thread.proc();
+    thread.id() != proc.id() && proc.exit_code().is_some()
+}
 
 /// A task as `find_task_by_vpid()` finds it.
 pub(crate) enum SchedTask {
@@ -43,9 +62,15 @@ impl SchedTask {
     }
 
     /// The tasks of `proc` a walk over a group or a user visits: its
-    /// threads, and its leader when that is no longer one of them.
+    /// threads, and its leader when that is no longer one of them. A zombie
+    /// is its leader alone ([`released`]).
     pub(crate) fn all_of(proc: &Arc<Process>) -> Vec<Self> {
-        let mut tasks: Vec<Self> = proc.threads().into_iter().map(SchedTask::Thread).collect();
+        let mut tasks: Vec<Self> = proc
+            .threads()
+            .into_iter()
+            .filter(|t| !released(t))
+            .map(SchedTask::Thread)
+            .collect();
         if let Some(leader) = linux_object::process::exited_leader_of(proc) {
             tasks.push(SchedTask::Thread(leader));
         } else if !proc.thread_ids().contains(&proc.id()) && proc.leader_sched().is_some() {
@@ -134,18 +159,22 @@ impl SchedTask {
     }
 
     /// The I/O priority word as set, `IOPRIO_CLASS_NONE` when never set.
-    /// A gone leader has none: `do_exit` let its `io_context` go, and
-    /// `ioprio_get` reads that as never set.
+    /// A task on its way out has none, whether a gone leader, a leader that
+    /// exited before the rest of its group, or a thread a kill has reached:
+    /// `do_exit` let its `io_context` go, and `ioprio_get` reads that as
+    /// never set. A leader that exited first read the word it had set, and
+    /// so did a zombie until its leader was off the thread list.
     pub(crate) fn ioprio(&self) -> u16 {
         match self {
-            SchedTask::Thread(thread) => thread.lock_linux().ioprio,
-            SchedTask::Leader(_) => 0,
+            SchedTask::Thread(thread) if !exiting(thread) => thread.lock_linux().ioprio,
+            _ => 0,
         }
     }
 
     /// Record an I/O priority word. On a gone leader it does nothing, and
     /// says nothing: `set_task_ioprio` finds the task `PF_EXITING` and
-    /// returns 0.
+    /// returns 0. A thread on its way out keeps the word, which
+    /// [`ioprio`](Self::ioprio) no longer reads.
     pub(crate) fn set_ioprio(&self, ioprio: u16) {
         if let SchedTask::Thread(thread) = self {
             thread.lock_linux().ioprio = ioprio;
