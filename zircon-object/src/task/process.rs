@@ -118,6 +118,9 @@ pub struct Process {
     dead_threads_switches: super::thread::ContextSwitches,
     /// The minor page faults of threads that have already exited.
     dead_threads_faults: super::thread::MinorFaults,
+    /// What the leader had for the scheduler when it left the thread list.
+    /// See [`Process::leader_sched`].
+    leader_sched: Mutex<Option<SchedSnapshot>>,
     /// Exit code a thread asked to publish when it becomes the last one.
     ///
     /// `i64::MIN` means unset. Two concurrent `_exit` calls can both see
@@ -532,6 +535,7 @@ impl Process {
             dead_threads_sys_time: AtomicU64::new(0),
             dead_threads_switches: Default::default(),
             dead_threads_faults: Default::default(),
+            leader_sched: Mutex::new(None),
             exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
@@ -567,6 +571,7 @@ impl Process {
             dead_threads_sys_time: AtomicU64::new(0),
             dead_threads_switches: Default::default(),
             dead_threads_faults: Default::default(),
+            leader_sched: Mutex::new(None),
             exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
@@ -629,6 +634,7 @@ impl Process {
             dead_threads_sys_time: AtomicU64::new(0),
             dead_threads_switches: Default::default(),
             dead_threads_faults: Default::default(),
+            leader_sched: Mutex::new(None),
             exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
@@ -1316,6 +1322,7 @@ impl Process {
         // that takes it off the list, so `cpu_time_ns` sees them in exactly
         // one of the two places: credited outside it, a reader in between
         // counted them twice, and its next reading went backwards.
+        let mut leader = None;
         inner.threads.retain(|t| {
             if t.id() != tid {
                 return true;
@@ -1324,8 +1331,14 @@ impl Process {
             self.dead_threads_sys_time_add(t.get_sys_time());
             self.dead_threads_switches.add(t.context_switches());
             self.dead_threads_faults.add(t.minor_faults());
+            if tid == self.base.id {
+                leader = Some(SchedSnapshot::of(t));
+            }
             false
         });
+        if leader.is_some() {
+            *self.leader_sched.lock() = leader;
+        }
         if inner.threads.is_empty() {
             if !matches!(inner.status, Status::Exited(_)) {
                 let hint = self.exit_code_hint.load(Ordering::Acquire);
@@ -1628,6 +1641,9 @@ pub struct ProcessInfo {
     pub debugger_attached: bool,
     pub padding1: [u8; 5],
 }
+
+mod leader_sched;
+pub use self::leader_sched::SchedSnapshot;
 
 #[cfg(test)]
 mod shared_space_tests;
