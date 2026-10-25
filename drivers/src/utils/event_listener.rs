@@ -198,6 +198,15 @@ mod tests {
     /// Idle poll/epoll used to park a fresh once-waker every re-scan; without
     /// unsubscribe that filled the listener until trigger UAF'd freed tasks
     /// (~30–40 min desktop sessions). Cap + unsubscribe must keep growth flat.
+    /// `trigger` gives up without calling anybody when the process-wide heap
+    /// tripwire is latched, and the tests of `fat_ptr` and of the deferred job
+    /// queue latch it on purpose. Taking the same gate they take is how all of
+    /// them take turns: without it a `trigger` below silently does nothing a
+    /// few parallel runs in ten, and the test reads as a lost handler.
+    fn gate() -> crate::utils::fat_ptr::GateForTest {
+        crate::utils::fat_ptr::GateForTest::new()
+    }
+
     #[test]
     fn once_handlers_capped() {
         let listener = EventListener::<()>::new();
@@ -238,6 +247,7 @@ mod tests {
 
     #[test]
     fn trigger_removes_once_and_keeps_persistent() {
+        let _gate = gate();
         let hits = Arc::new(AtomicUsize::new(0));
         let listener = EventListener::<()>::new();
         let h = hits.clone();
@@ -273,6 +283,7 @@ mod tests {
     /// listener calls a waker whose task is gone, on every event, for good.
     #[test]
     fn a_handler_unsubscribed_while_the_listener_is_firing_does_not_come_back() {
+        let _gate = gate();
         let listener = Arc::new(EventListener::<()>::new());
         let hits = Arc::new(AtomicUsize::new(0));
 
@@ -312,6 +323,7 @@ mod tests {
     /// use-after-free the file's own docs describe, so it does not get called.
     #[test]
     fn a_handler_unsubscribed_before_its_turn_is_not_called_in_that_pass() {
+        let _gate = gate();
         let listener = Arc::new(EventListener::<()>::new());
         let hits = Arc::new(AtomicUsize::new(0));
 
@@ -350,6 +362,7 @@ mod tests {
     /// what matters is that it is not *called*.
     #[test]
     fn a_once_handler_unsubscribed_mid_pass_is_not_called() {
+        let _gate = gate();
         let listener = Arc::new(EventListener::<()>::new());
         let hits = Arc::new(AtomicUsize::new(0));
 
@@ -403,6 +416,7 @@ mod tests {
     /// ever closed.
     #[test]
     fn the_cancel_note_is_torn_down_with_the_trigger_that_needed_it() {
+        let _gate = gate();
         let listener = Arc::new(EventListener::<()>::new());
         let victim = listener.subscribe(Box::new(|_| {}), false).unwrap();
         let weak = Arc::downgrade(&listener);
@@ -427,6 +441,7 @@ mod tests {
     /// from under the pass that is still walking its own drained list.
     #[test]
     fn a_nested_trigger_does_not_throw_away_the_outer_passs_note() {
+        let _gate = gate();
         let listener = Arc::new(EventListener::<()>::new());
         let hits = Arc::new(AtomicUsize::new(0));
 
