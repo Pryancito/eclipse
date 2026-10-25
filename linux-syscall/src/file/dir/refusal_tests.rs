@@ -516,9 +516,13 @@ fn chroot_gates_and_updates_root() {
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
             let lp = sys.linux_process();
-            lp.root_inode().create("jail", FileType::Dir, 0o755).unwrap();
+            lp.root_inode()
+                .create("jail", FileType::Dir, 0o755)
+                .unwrap();
             let jail_inode = lp.lookup_inode("/jail").unwrap();
-            jail_inode.create("inner_file", FileType::File, 0o644).unwrap();
+            jail_inode
+                .create("inner_file", FileType::File, 0o644)
+                .unwrap();
 
             let at = |s: &[u8]| UserInPtr::<u8>::from(s.as_ptr() as usize);
 
@@ -526,7 +530,10 @@ fn chroot_gates_and_updates_root() {
             assert_eq!(sys.sys_chroot(at(b"/missing\0")), Err(LxError::ENOENT));
 
             // 2. Regular file returns ENOTDIR
-            assert_eq!(sys.sys_chroot(at(b"/jail/inner_file\0")), Err(LxError::ENOTDIR));
+            assert_eq!(
+                sys.sys_chroot(at(b"/jail/inner_file\0")),
+                Err(LxError::ENOTDIR)
+            );
 
             // 3. Root can chroot into /jail
             assert_eq!(sys.sys_chroot(at(b"/jail\0")), Ok(0));

@@ -352,3 +352,49 @@ fn the_eld_baseline_length_covers_the_bytes_written_into_it() {
     // past the end of the buffer.
     assert_eq!(build_eld_from_base_edid(&[0u8; 127], 0, false), [0u8; 96]);
 }
+
+/// The line the boot now prints for the GPU that stays cold because it scans
+/// out the console. It replaces printing nothing at all, which is how
+/// `2 GPU node(s), 1 with the RM up` became the whole of what a dual-card
+/// box's log said about the card that never attached. So what this pins is
+/// that the line carries the three facts that decided it -- the boot
+/// framebuffer address and the BAR1 window it landed in -- and names the
+/// hatch that brings the card up anyway.
+#[test]
+fn the_console_gpu_says_why_it_stayed_cold_and_what_lifts_it() {
+    let line = console_gpu_cold_line(
+        0x0a,
+        0,
+        "RTX 2060 SUPER",
+        0xd100_0000,
+        0xd000_0000,
+        256 << 20,
+    );
+    assert!(
+        line.starts_with("GPU 0a:00.0 RTX 2060 SUPER es la GPU de consola"),
+        "{}",
+        line
+    );
+    assert!(
+        line.contains("0xd100000"),
+        "the boot fb address is in it: {}",
+        line
+    );
+    assert!(
+        line.contains("0xd000000"),
+        "the BAR1 base is in it: {}",
+        line
+    );
+    assert!(
+        line.contains("0x10000000"),
+        "the BAR1 length is in it: {}",
+        line
+    );
+    assert!(
+        line.contains("nvidia.console_gpu"),
+        "the hatch that lifts it is named: {}",
+        line
+    );
+    // One line, no trailing newline: the caller logs it with klog_info!.
+    assert!(!line.contains('\n'), "{}", line);
+}

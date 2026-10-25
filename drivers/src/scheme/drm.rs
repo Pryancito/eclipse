@@ -479,8 +479,10 @@ pub trait DrmScheme: Scheme {
     /// after the GSP firmware is loaded and before any userspace runs, so
     /// there is no concurrent RM access. Systems with a single (console) GPU
     /// bring up nothing here and fall back to the CPU blit. General over 1, 2,
-    /// 3+ GPUs. Returns a SINGLE clean status line for a compute GPU (empty for
-    /// the console GPU and non-NVIDIA drivers) -- the verbose per-step
+    /// 3+ GPUs. Returns a SINGLE clean status line per NVIDIA GPU -- for a
+    /// compute GPU what its bring-up achieved, for the console GPU the reason
+    /// it was left cold and the hatch that lifts it (empty only for
+    /// non-NVIDIA drivers) -- the verbose per-step
     /// narration is discarded (still captured into `/proc/gpustep*`), and the
     /// caller suppresses the driver's own log output around this call, so the
     /// desktop console stays clean. Default: nothing.

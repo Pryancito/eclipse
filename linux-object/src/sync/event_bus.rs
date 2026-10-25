@@ -321,10 +321,7 @@ pub struct ReadinessSub {
 
 enum UnsubKind {
     Noop,
-    Bus {
-        bus: Arc<Mutex<EventBus>>,
-        id: u64,
-    },
+    Bus { bus: Arc<Mutex<EventBus>>, id: u64 },
     Boxed(alloc::boxed::Box<dyn FnOnce() + Send>),
 }
 

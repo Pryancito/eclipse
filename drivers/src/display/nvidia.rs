@@ -402,37 +402,13 @@ fn surfaceflip_stats_line() -> String {
     )
 }
 
-#[derive(Debug, Clone, Copy)]
-struct BootFbInfo {
-    phys: u64,
-    width: u32,
-    height: u32,
-    pitch: u32,
-}
-
-pub fn set_boot_fb_info(phys: u64, width: u32, height: u32, pitch: u32) {
-    *BOOT_FB_INFO.lock() = Some(BootFbInfo {
-        phys,
-        width,
-        height,
-        pitch,
-    });
-}
-
-/// Physical address of the boot (UEFI GOP) framebuffer, if known. The GPU whose
-/// BAR1 aperture contains this address is the one driving the console.
-fn boot_fb_phys() -> Option<u64> {
-    BOOT_FB_INFO.lock().map(|b| b.phys)
-}
-
-/// Byte size of the boot (UEFI GOP) framebuffer (`pitch * height`), if known.
-/// Used by the P2P CE path/tests, which run on the compute GPU and therefore
-/// cannot read the console FB geometry from their own `self.info`.
-fn boot_fb_size() -> Option<u64> {
-    BOOT_FB_INFO
-        .lock()
-        .map(|b| b.pitch as u64 * b.height as u64)
-}
+/// The boot (UEFI GOP) framebuffer: what it is, and what it decides. Which
+/// GPU's BAR1 contains it is the whole of `drives_boot_display`, so the facts
+/// and the line the boot prints about them live together. Out of this file
+/// for size only; a child module still reaches its private items.
+mod boot_fb;
+pub use boot_fb::set_boot_fb_info;
+use boot_fb::{boot_fb_phys, boot_fb_size, console_gpu_cold_line, BootFbInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaArchitecture {
@@ -4972,12 +4948,22 @@ impl DrmScheme for NvidiaGpu {
     /// unconditionally: its GSP-RM boot wedges at the SEC2 STARTCPU store
     /// (see `bringup_step6`), so it is never auto-booted; the compute GPU(s)
     /// are the reliable path and drive the console's scanout FB over PCIe P2P.
+    /// A skipped console GPU returns `console_gpu_cold_line` rather than an
+    /// empty string, so the boot log names the card that stayed cold.
     fn auto_bringup_compute(&self) -> String {
         // The console GPU is never auto-booted (its GSP boot wedges at the SEC2
         // STARTCPU store) and drives the display fine via the GOP framebuffer.
-        // Return nothing so the quiet boot path prints no line for it.
+        // It does get its own line: silence here is what made a dual-card box
+        // report one GPU up and give the log no way to say which card or why.
         if self.drives_boot_display() {
-            return String::new();
+            return console_gpu_cold_line(
+                self.pci_bus,
+                self.pci_device,
+                self.gpu_model,
+                boot_fb_phys().unwrap_or(0),
+                self.bar1_phys,
+                self.info.fb_size as u64,
+            );
         }
         // Run the proven state-load chain (the same sequence a user triggers as
         // `cat /proc/gpustep5;6;8;9`), executed once at boot before any

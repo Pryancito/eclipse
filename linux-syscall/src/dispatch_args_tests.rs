@@ -525,12 +525,7 @@ fn the_user_and_the_group_do_not_change_places() {
                 "fchmodat took the wrong word as the mode"
             );
             assert_eq!(
-                by_number(
-                    sys,
-                    Sys::FCHMODAT2,
-                    [AT_FDCWD, at(&path), 0o644, 0, 0, 0]
-                )
-                .await,
+                by_number(sys, Sys::FCHMODAT2, [AT_FDCWD, at(&path), 0o644, 0, 0, 0]).await,
                 0,
                 "fchmodat2 failed"
             );

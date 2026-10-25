@@ -195,7 +195,9 @@ fn ensure_archive(cache: &Path) -> Result<(PathBuf, Kind), String> {
 }
 
 fn file_big_enough(p: &Path) -> bool {
-    fs::metadata(p).map(|m| m.len() >= 1_000_000).unwrap_or(false)
+    fs::metadata(p)
+        .map(|m| m.len() >= 1_000_000)
+        .unwrap_or(false)
 }
 
 fn download(url: &str, dest: &Path) -> Result<(), String> {

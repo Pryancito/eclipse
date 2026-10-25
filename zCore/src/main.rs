@@ -1085,10 +1085,52 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             }
             // Either flag wants the console GPU up; the task runs once and
             // serves both (hardware cursor plane and/or local CE present).
-            let want_console_gpu = kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu");
+            //
+            // Linux attaches the RM to EVERY NVIDIA card at probe, the one
+            // scanning out the console included -- that is why `nvidia-smi`
+            // there lists both cards of a 1+1 box, graphics on one and
+            // compute on the other. Eclipse left the console card cold and
+            // the operator had to know about `nvidia.console_gpu` to get it,
+            // so a dual-card box reported `2 GPU node(s), 1 with the RM up`
+            // and NVML counted one GPU. On a MULTI-GPU box the bring-up is
+            // now the default: it is the difference between the split Linux
+            // gives and half a machine. What runs is the same deferred task
+            // as before -- after the desktop, with scanout paused, never on
+            // the boot progress path -- so the failure mode is unchanged and
+            // the compute card is already up by then either way. Opt out
+            // with `nvidia.noconsole_gpu`.
+            //
+            // A SINGLE-GPU box keeps the old default (off): there the console
+            // card is the only card, and the SEC2 STARTCPU store that can
+            // wedge takes the whole machine with no second card to fall back
+            // on. That box still opts in with `nvidia.console_gpu`.
+            let nvidia_cards = kernel_hal::drivers::all_drm().as_vec();
+            let console_cards = nvidia_cards.iter().filter(|d| d.is_console_gpu()).count();
+            let nvidia_cards = nvidia_cards
+                .iter()
+                .filter(|d| d.is_console_gpu() || d.is_compute_gpu())
+                .count();
+            let console_gpu_by_default = nvidia_cards > 1
+                && console_cards > 0
+                && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.noconsole_gpu");
+            if console_gpu_by_default
+                && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu")
+            {
+                klog_info!(
+                    "Eclipse: {} GPUs NVIDIA ({} de consola) — bring-up de la GPU de consola \
+                     por defecto, como en Linux (apagalo con nvidia.noconsole_gpu)",
+                    nvidia_cards,
+                    console_cards
+                );
+            }
+            let want_console_gpu = console_gpu_by_default
+                || kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu");
             if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.hwcursor") || want_console_gpu {
-                let reason = if want_console_gpu {
+                let reason = if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu") {
                     "nvidia.console_gpu"
+                } else if want_console_gpu {
+                    // Nobody asked by name: this is the multi-GPU default.
+                    "GPU de consola (por defecto, caja multi-GPU)"
                 } else {
                     "nvidia.hwcursor"
                 };
@@ -1256,12 +1298,20 @@ fn auto_bringup_compute_gpus() -> bool {
             .any(|d| d.ce_present_ready());
     }
     // Emit only the tidy summary (klog_emit bypasses the level filter).
-    if summaries.is_empty() {
+    // `summaries` now also carries the console GPU's "left cold, and here is
+    // the hatch" line, so "sin GPU de cómputo" is decided by counting compute
+    // GPUs, not by the summary being empty -- otherwise a box whose only
+    // NVIDIA card is the console one would claim a compute GPU it has not got.
+    let compute_gpus = kernel_hal::drivers::all_drm()
+        .as_vec()
+        .iter()
+        .filter(|d| d.is_compute_gpu())
+        .count();
+    for line in summaries {
+        klog_info!("Eclipse: NVIDIA {}", line);
+    }
+    if compute_gpus == 0 {
         klog_info!("Eclipse: NVIDIA — sin GPU de cómputo; present por CPU");
-    } else {
-        for line in summaries {
-            klog_info!("Eclipse: NVIDIA {}", line);
-        }
     }
     any_ce_ready
 }

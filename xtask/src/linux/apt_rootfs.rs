@@ -257,10 +257,7 @@ fn apt_suite_opts(cache: &Path, deb: &str) -> Vec<String> {
         // Critical on Pop/Ubuntu hosts: default status is /var/lib/dpkg/status,
         // so candidates become the host's Pop rebuilds (…pop0~24.04…) that the
         // Ubuntu archive cannot fetch.
-        format!(
-            "Dir::State::status={}",
-            state.join("dpkg/status").display()
-        ),
+        format!("Dir::State::status={}", state.join("dpkg/status").display()),
         format!("Dir::Cache={}", state.join("cache").display()),
         format!("APT::Architecture={deb}"),
         format!("APT::Architectures::={deb}"),
@@ -290,11 +287,8 @@ fn ensure_suite_index(cache: &Path, deb: &str) -> bool {
     let has_packages = fs::read_dir(&lists)
         .ok()
         .map(|it| {
-            it.flatten().any(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains("_Packages")
-            })
+            it.flatten()
+                .any(|e| e.file_name().to_string_lossy().contains("_Packages"))
         })
         .unwrap_or(false);
     if has_packages {
@@ -510,7 +504,9 @@ pub(super) fn bootstrap(root: &Path, arch: &str) {
     write_layout(root, arch);
     let cache = cache_dir(arch);
     let _ = fs::create_dir_all(&cache);
-    let stage = PROJECT_DIR.join("ignored").join(format!("apt-bootstrap-{arch}"));
+    let stage = PROJECT_DIR
+        .join("ignored")
+        .join(format!("apt-bootstrap-{arch}"));
     let _ = fs::remove_dir_all(&stage);
     let _ = fs::create_dir_all(&stage);
     write_layout(&stage, arch);
@@ -575,7 +571,10 @@ pub(super) fn bootstrap(root: &Path, arch: &str) {
              apt/dpkg may still be present."
         );
     }
-    println!("apt bootstrap: merged Ubuntu {DISTRO} runtime into {}", root.display());
+    println!(
+        "apt bootstrap: merged Ubuntu {DISTRO} runtime into {}",
+        root.display()
+    );
 }
 
 /// Debian/Ubuntu `update-alternatives` entries that never appear because we
@@ -702,7 +701,11 @@ pub(super) fn install_packages(root: &Path, arch: &str, packages: &[String]) {
         (ok, skip)
     };
     if !skipped_virtual.is_empty() {
-        let preview: Vec<_> = skipped_virtual.iter().take(12).map(String::as_str).collect();
+        let preview: Vec<_> = skipped_virtual
+            .iter()
+            .take(12)
+            .map(String::as_str)
+            .collect();
         println!(
             "apt install: skipping {} virtual/unresolvable name(s) (e.g. {})",
             skipped_virtual.len(),
@@ -915,10 +918,7 @@ fn deb_is_complete(cache: &Path, deb: &str, pkg: &str, path: &Path) -> bool {
         Ok(m) if m.len() > 0 => m.len(),
         _ => return false,
     };
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let Some(ver) = version_from_deb_name(pkg, name) else {
         return got > 0;
     };
@@ -944,10 +944,7 @@ fn purge_corrupt_debs_for(cache: &Path, deb: &str, pkg: &str) {
             let _ = fs::remove_file(&path);
             continue;
         }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let Some(ver) = version_from_deb_name(pkg, name) else {
             continue;
         };
@@ -955,9 +952,7 @@ fn purge_corrupt_debs_for(cache: &Path, deb: &str, pkg: &str) {
             continue;
         };
         if got < want {
-            eprintln!(
-                "apt cache: dropping truncated {name} (have {got} B, want {want} B)"
-            );
+            eprintln!("apt cache: dropping truncated {name} (have {got} B, want {want} B)");
             let _ = fs::remove_file(&path);
         }
     }
@@ -1375,7 +1370,9 @@ fn depends_recursive(cache: &Path, deb: &str, packages: &[String]) -> Option<Vec
     if !output.status.success() {
         return Some(out);
     }
-    out.extend(parse_depends_lines(&String::from_utf8_lossy(&output.stdout)));
+    out.extend(parse_depends_lines(&String::from_utf8_lossy(
+        &output.stdout,
+    )));
     out.sort();
     out.dedup();
     Some(out)
@@ -1484,9 +1481,7 @@ pub(super) fn check_apt(root: &Path, arch: &str) -> Vec<String> {
     let sources = root.join("etc/apt/sources.list");
     match fs::read_to_string(&sources) {
         Ok(s) if s.contains(DISTRO) => {}
-        Ok(_) => out.push(format!(
-            "/etc/apt/sources.list does not mention {DISTRO}"
-        )),
+        Ok(_) => out.push(format!("/etc/apt/sources.list does not mention {DISTRO}")),
         Err(_) => out.push("falta /etc/apt/sources.list".into()),
     }
     let arch_file = root.join("var/lib/dpkg/arch");
@@ -1610,9 +1605,15 @@ mod tests {
         assert!(s.contains("packages.mozilla.org"));
         assert!(s.contains("signed-by=/etc/apt/keyrings/packages.mozilla.org.asc"));
         assert!(dir.join("etc/apt/preferences.d/mozilla-firefox").is_file());
-        assert!(dir.join("etc/apt/keyrings/packages.mozilla.org.asc").is_file());
-        assert!(dir.join("etc/apt/keyrings/packages.mozilla.org.gpg").is_file());
-        assert!(dir.join("etc/apt/trusted.gpg.d/packages.mozilla.org.gpg").is_file());
+        assert!(dir
+            .join("etc/apt/keyrings/packages.mozilla.org.asc")
+            .is_file());
+        assert!(dir
+            .join("etc/apt/keyrings/packages.mozilla.org.gpg")
+            .is_file());
+        assert!(dir
+            .join("etc/apt/trusted.gpg.d/packages.mozilla.org.gpg")
+            .is_file());
         assert_eq!(
             fs::read_to_string(dir.join("var/lib/dpkg/arch"))
                 .unwrap()
@@ -1707,8 +1708,13 @@ libfluidsynth3\n\
             s.contains("packages.mozilla.org"),
             "Mozilla firefox repo missing:\n{s}"
         );
-        assert!(s.contains("signed-by="), "Mozilla repo must carry signed-by:\n{s}");
-        assert!(dir.join(".apt/etc/keyrings/packages.mozilla.org.asc").is_file());
+        assert!(
+            s.contains("signed-by="),
+            "Mozilla repo must carry signed-by:\n{s}"
+        );
+        assert!(dir
+            .join(".apt/etc/keyrings/packages.mozilla.org.asc")
+            .is_file());
         assert!(BOOTSTRAP_PKGS.contains(&"libapt-pkg7.0"));
         assert!(BOOTSTRAP_PKGS.contains(&"gpgv"));
         assert!(BOOTSTRAP_PKGS.contains(&"libattr1"));
@@ -1741,7 +1747,10 @@ libfluidsynth3\n\
     #[test]
     fn write_asound_conf_routes_to_pulse_on_both_alpine_and_ubuntu_multiarch_layouts() {
         for (tag, plugin_rel) in [
-            ("asound-alpine", "usr/lib/alsa-lib/libasound_module_pcm_pulse.so"),
+            (
+                "asound-alpine",
+                "usr/lib/alsa-lib/libasound_module_pcm_pulse.so",
+            ),
             (
                 "asound-ubuntu-amd64",
                 "usr/lib/x86_64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so",

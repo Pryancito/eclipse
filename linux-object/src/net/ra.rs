@@ -233,10 +233,7 @@ fn apply(router_ll: Ipv6Address, router_lifetime: u16, prefix: Option<PrefixInfo
     // ingress-interface information (frames are processed globally, as with
     // `ndp_cache`/`icmp_rx`), so on a multi-NIC host the RA is attributed to the
     // first Ethernet device — correct for the common single-NIC case.
-    let iface = match get_net_device()
-        .into_iter()
-        .find(|d| !d.is_loopback())
-    {
+    let iface = match get_net_device().into_iter().find(|d| !d.is_loopback()) {
         Some(d) => d,
         None => return,
     };

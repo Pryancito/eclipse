@@ -814,7 +814,10 @@ impl Syscall<'_> {
         // probe-and-close at startup); available under LOG=debug when hunting.
         if let Ok(f) = proc.get_file_like(fd) {
             if let Ok(meta) = f.metadata() {
-                linux_object::fs::record_lock::release_file_owner((meta.dev, meta.inode), self.zircon_process().id());
+                linux_object::fs::record_lock::release_file_owner(
+                    (meta.dev, meta.inode),
+                    self.zircon_process().id(),
+                );
             }
             if let Some(desc) = linux_object::fs::drm_fd_desc(&f) {
                 debug!(
@@ -851,7 +854,10 @@ impl Syscall<'_> {
                 for (fd, f) in files {
                     if fd >= first && fd <= last {
                         if let Ok(meta) = f.metadata() {
-                            linux_object::fs::record_lock::release_file_owner((meta.dev, meta.inode), pid);
+                            linux_object::fs::record_lock::release_file_owner(
+                                (meta.dev, meta.inode),
+                                pid,
+                            );
                         }
                     }
                 }
@@ -881,7 +887,10 @@ impl Syscall<'_> {
         let old = proc.replace_file(fd2, file_like, flags & ANON_CLOEXEC != 0)?;
         if let Some(old) = old {
             if let Ok(meta) = old.metadata() {
-                linux_object::fs::record_lock::release_file_owner((meta.dev, meta.inode), self.zircon_process().id());
+                linux_object::fs::record_lock::release_file_owner(
+                    (meta.dev, meta.inode),
+                    self.zircon_process().id(),
+                );
             }
         }
         Ok(fd2.into())
@@ -916,7 +925,10 @@ impl Syscall<'_> {
         let old = proc.replace_file(fd2, file_like, false)?;
         if let Some(old) = old {
             if let Ok(meta) = old.metadata() {
-                linux_object::fs::record_lock::release_file_owner((meta.dev, meta.inode), self.zircon_process().id());
+                linux_object::fs::record_lock::release_file_owner(
+                    (meta.dev, meta.inode),
+                    self.zircon_process().id(),
+                );
             }
             if let Some(desc) = linux_object::fs::drm_fd_desc(&old) {
                 error!(
