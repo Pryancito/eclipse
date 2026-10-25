@@ -120,3 +120,89 @@ fn a_thread_directed_one_is_looked_for_on_its_thread_only() {
         5
     );
 }
+
+/// Throw timer `timerid`'s `SIGALRM` away.
+fn drop_it(proc: &Process, tid: Option<&Thread>, timerid: i32) -> bool {
+    drop_pending_timer_signal(
+        proc.id() as usize,
+        tid.map(|t| t.id() as usize),
+        LinuxSignal::SIGALRM,
+        timerid,
+    )
+}
+
+#[test]
+fn dropped_from_the_thread_it_went_to_and_only_once() {
+    let (proc, thread) = a_process(46_711);
+    timer_7_fires(&proc, 0);
+    assert!(drop_it(&proc, None, 7), "not found on the thread");
+    assert!(
+        !thread.lock_linux().signals.contains(LinuxSignal::SIGALRM),
+        "still pending"
+    );
+    assert!(!drop_it(&proc, None, 7), "dropped twice");
+}
+
+#[test]
+fn dropped_from_the_process_while_every_thread_blocks_it() {
+    let (proc, thread) = a_process(46_712);
+    let mut blocked = Sigset::empty();
+    blocked.insert(LinuxSignal::SIGALRM);
+    thread.lock_linux().block_signals(&blocked);
+    timer_7_fires(&proc, 0);
+    assert!(drop_it(&proc, None, 7), "not found on the process");
+    let inner = proc.linux().inner.lock();
+    assert!(!inner.shared_pending.contains(LinuxSignal::SIGALRM));
+    assert!(!inner
+        .shared_pending_info
+        .contains_key(&(LinuxSignal::SIGALRM as u8)));
+    let bits = proc
+        .linux()
+        .exit_path
+        .shared_pending_bits
+        .load(core::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        bits,
+        inner.shared_pending.val(),
+        "the return to user mode would still look for it"
+    );
+    drop(inner);
+    thread.lock_linux().set_signal_mask(Sigset::empty());
+    proc.linux().pull_shared_pending_into(&thread);
+    assert!(
+        !thread.lock_linux().signals.contains(LinuxSignal::SIGALRM),
+        "it came back on the thread"
+    );
+}
+
+#[test]
+fn another_timer_s_signal_or_an_alarm_is_not_dropped() {
+    let (proc, thread) = a_process(46_713);
+    timer_7_fires(&proc, 0);
+    assert!(!drop_it(&proc, None, 8), "timer 8 dropped timer 7's signal");
+    assert!(thread.lock_linux().signals.contains(LinuxSignal::SIGALRM));
+    thread.lock_linux().take_siginfo(LinuxSignal::SIGALRM);
+    let info = SigInfo::from_kernel(LinuxSignal::SIGALRM);
+    send_signal_to_process_with_info(proc.id() as usize, LinuxSignal::SIGALRM, Some(info)).unwrap();
+    assert!(!drop_it(&proc, None, 0), "an alarm(2) is no timer's");
+    assert!(thread.lock_linux().signals.contains(LinuxSignal::SIGALRM));
+}
+
+#[test]
+fn a_thread_directed_one_is_dropped_from_its_thread_only() {
+    let (proc, first) = a_process(46_714);
+    let second = Thread::create_linux(&proc).unwrap();
+    let info = SigInfo::timer(LinuxSignal::SIGALRM, 7, 0, 0);
+    first
+        .lock_linux()
+        .queue_signal(LinuxSignal::SIGALRM, Some(info));
+    second
+        .lock_linux()
+        .queue_signal(LinuxSignal::SIGALRM, Some(info));
+    assert!(drop_it(&proc, Some(&second), 7));
+    assert!(!second.lock_linux().signals.contains(LinuxSignal::SIGALRM));
+    assert!(
+        first.lock_linux().signals.contains(LinuxSignal::SIGALRM),
+        "dropped from a thread it was not directed at"
+    );
+}

@@ -24,6 +24,8 @@ use zircon_object::task::{Process, Status, Thread, ROOT_JOB};
 
 mod overrun;
 use overrun::*;
+mod stale;
+pub use stale::delete_posix_timers_at_exec;
 
 const USEC_PER_TICK: usize = 10000;
 
@@ -978,6 +980,7 @@ impl Syscall<'_> {
         let now = kernel_hal::timer::timer_now();
         let now_wall = kernel_hal::timer::wall_clock_now();
         let (old, arm) = set_posix_timer(id, owner, base, abs, init, interval, now, now_wall)?;
+        stale::drop_signal_from_before(id, owner);
         // Same as `setitimer`: armed first, reported after. A faulting
         // `old_value` used to leave the timer recorded as due and never armed.
         commit_and_report_old(old, &mut old_value, || {
@@ -1031,17 +1034,11 @@ impl Syscall<'_> {
         Ok(0)
     }
 
-    /// `timer_delete`: destroy a timer (cancels any pending fire via generation).
+    /// `timer_delete`: destroy a timer (cancels any pending fire via
+    /// generation), and the signal it has waiting ([`stale`]).
     pub fn sys_timer_delete(&self, id: usize) -> SysResult {
-        let owner = self.zircon_process().id();
-        let mut timers = POSIX_TIMERS.lock();
-        match timers.get(&id) {
-            Some(t) if t.owner == owner => {
-                timers.remove(&id);
-                Ok(0)
-            }
-            _ => Err(LxError::EINVAL),
-        }
+        stale::delete_posix_timer(id, self.zircon_process().id())?;
+        Ok(0)
     }
 
     /// `timer_getoverrun`: what the last signal of the timer that was taken
@@ -1089,6 +1086,7 @@ impl Syscall<'_> {
         let owner = self.zircon_process().id();
         let (target, now) = cpu_timer_target(self.zircon_process(), cpu).ok_or(LxError::ESRCH)?;
         let old = set_cpu_timer(id, owner, &target, now, abs, init, interval)?;
+        stale::drop_signal_from_before(id, owner);
         commit_and_report_old(old, old_value, || Ok(()))?;
         run_cpu_timers(self.thread);
         Ok(0)
