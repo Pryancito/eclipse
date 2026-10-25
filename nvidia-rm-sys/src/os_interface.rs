@@ -733,9 +733,41 @@ static LOG_CAPTURE: Mutex<Option<String>> = Mutex::new(None);
 // chattier, non-crashing GSP-boot narration isn't dumped live every boot.
 static LIVE_ECHO: AtomicBool = AtomicBool::new(false);
 
+/// When set, the two narration taps below do nothing: `capture_begin` leaves
+/// no buffer for `capture_push` to fill, and `live_echo_begin` does not arm.
+///
+/// The taps exist for a person reading `cat /proc/gpustepN`, and they are
+/// worth what they cost there. The AUTOMATIC bring-up at boot has no such
+/// reader: it runs the very same step functions, folds their narration into a
+/// `String`, and drops it on the floor -- a mutex and a `String` push per RM
+/// line, a quarter of a megabyte of buffer, and then a second pass that
+/// reformats every line of it into a report nobody will ever read. On top of
+/// that, `live_echo_begin` lifts each line to ERROR, which outside the
+/// console-quiet window renders it on a framebuffer console that lives in the
+/// BAR1 of the very GPU being brought up.
+///
+/// So the automatic path arms this and pays none of it. A manual
+/// `/proc/gpustep*` read never arms it and narrates exactly as before, and
+/// `nvidia.gputrace` puts the boot narration back for a debugging boot.
+static NARRATION_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Suppress (or restore) the narration taps; returns the previous setting, so
+/// a caller can restore it and nesting works.
+pub fn narration_off_set(off: bool) -> bool {
+    NARRATION_OFF.swap(off, Ordering::Relaxed)
+}
+
+/// Whether the narration taps are currently suppressed.
+pub fn narration_is_off() -> bool {
+    NARRATION_OFF.load(Ordering::Relaxed)
+}
+
 /// Echo subsequent RM narration at ERROR level so it passes `LOG=error` and
 /// appears live on the console. Pair with `live_echo_end`.
 pub fn live_echo_begin() {
+    if narration_is_off() {
+        return;
+    }
     LIVE_ECHO.store(true, Ordering::Relaxed);
 }
 
@@ -859,6 +891,13 @@ const LOG_CAPTURE_CAP: usize = 256 * 1024;
 /// addition to the normal `log::warn!` sink.
 pub fn capture_begin() {
     CAPTURE_DROPPED.store(0, Ordering::Relaxed);
+    // Suppressed: leave NO buffer, so every `capture_push` after this is a
+    // lock and a branch instead of a copy, and `capture_take` answers `None`
+    // -- which is what makes the callers skip reformatting the whole thing.
+    if narration_is_off() {
+        *LOG_CAPTURE.lock() = None;
+        return;
+    }
     *LOG_CAPTURE.lock() = Some(String::new());
 }
 
@@ -1727,11 +1766,13 @@ mod interface_tests {
         let saved_capture = LOG_CAPTURE.lock().take();
         let saved_dropped = CAPTURE_DROPPED.swap(0, Ordering::Relaxed);
         let saved_echo = LIVE_ECHO.swap(false, Ordering::Relaxed);
+        let saved_narration = NARRATION_OFF.swap(false, Ordering::Relaxed);
         QUIET_SAVED_LEVEL.store(usize::MAX, Ordering::Relaxed);
         QUIET_LATCHED.store(false, Ordering::Relaxed);
         let outcome = catch_unwind(AssertUnwindSafe(f));
         QUIET_LATCHED.store(false, Ordering::Relaxed);
         QUIET_SAVED_LEVEL.store(usize::MAX, Ordering::Relaxed);
+        NARRATION_OFF.store(saved_narration, Ordering::Relaxed);
         LIVE_ECHO.store(saved_echo, Ordering::Relaxed);
         CAPTURE_DROPPED.store(saved_dropped, Ordering::Relaxed);
         *LOG_CAPTURE.lock() = saved_capture;
@@ -1739,6 +1780,76 @@ mod interface_tests {
         if let Err(payload) = outcome {
             resume_unwind(payload);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Narration suppression: what the automatic bring-up at boot does not pay.
+    // -----------------------------------------------------------------
+
+    /// The control. Without suppression the taps work exactly as they always
+    /// have -- which is what a `cat /proc/gpustepN` depends on, and what makes
+    /// the two tests after this one mean something.
+    #[test]
+    fn narrating_is_still_the_behaviour_a_proc_read_gets() {
+        with_globals(|| {
+            assert!(!narration_is_off());
+            capture_begin();
+            capture_line("[nvidia-rm] una linea del RM");
+            live_echo_begin();
+            assert!(live_echo_on(), "live echo should arm when not suppressed");
+            live_echo_end();
+            let taken = capture_take().expect("a capture was started");
+            assert!(
+                taken.contains("una linea del RM"),
+                "the captured line is missing: {:?}",
+                taken
+            );
+        });
+    }
+
+    /// Suppressed, `capture_begin` must leave NO buffer: that is what makes
+    /// every later push a branch instead of a copy, and what makes
+    /// `capture_take` answer `None` so the caller skips reformatting a quarter
+    /// of a megabyte of narration nobody asked for.
+    #[test]
+    fn suppressed_capture_keeps_nothing_and_hands_back_nothing() {
+        with_globals(|| {
+            narration_off_set(true);
+            capture_begin();
+            capture_line("[nvidia-rm] una linea del RM");
+            assert!(
+                capture_take().is_none(),
+                "a suppressed capture still produced a report"
+            );
+        });
+    }
+
+    /// Suppressed, `live_echo_begin` must not arm. Armed, every RM line is
+    /// lifted to ERROR and rendered on a console that lives in the BAR1 of the
+    /// GPU being brought up -- the cost this whole switch exists to avoid.
+    #[test]
+    fn suppressed_live_echo_does_not_arm() {
+        with_globals(|| {
+            narration_off_set(true);
+            live_echo_begin();
+            assert!(
+                !live_echo_on(),
+                "live echo armed while narration was suppressed"
+            );
+        });
+    }
+
+    /// `narration_off_set` answers with the PREVIOUS setting, which is what
+    /// lets the driver's guard put back what it found instead of assuming it
+    /// was the only one.
+    #[test]
+    fn the_switch_reports_what_it_replaced() {
+        with_globals(|| {
+            assert!(!narration_off_set(true), "started out suppressed");
+            assert!(narration_off_set(true), "the first call did not take");
+            assert!(narration_off_set(false), "the second call did not take");
+            assert!(!narration_is_off());
+        });
     }
 
     // -----------------------------------------------------------------

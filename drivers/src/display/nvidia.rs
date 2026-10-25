@@ -251,6 +251,11 @@ use vram_alloc::NvidiaVramAllocator;
 mod boot_edid;
 pub use boot_edid::{boot_edid, set_boot_edid};
 
+/// The bring-up narration switch; own file for the size ceiling, no logic
+/// change.
+mod quiet_bringup;
+use quiet_bringup::QuietBringup;
+
 /// The copy-engine bring-up plan; own file for the size ceiling, no logic
 /// change.
 mod bringup;
@@ -4991,10 +4996,11 @@ impl DrmScheme for NvidiaGpu {
         // `cat /proc/gpustep5;6;8;9`), executed once at boot before any
         // userspace or scanout touches RM (fixed RM thread-id 0, no concurrent
         // access -> no reentrancy hazard). The verbose per-step narration is
-        // DISCARDED here -- it still lands in the /proc/gpustep* capture buffers
-        // for debugging, but must not flood the desktop console. The caller
-        // suppresses the driver's own log output around this call; all this
-        // method emits is a single clean status line.
+        // not produced at all here (see `QuietBringup`): it was captured,
+        // reformatted and then discarded, because all this method emits is a
+        // single clean status line. A manual `/proc/gpustep*` read still
+        // narrates in full, and `nvidia.gputrace` puts it back at boot too.
+        let _quiet = QuietBringup::arm();
         let _ = self.bringup_step5();
         let _ = self.bringup_step6();
         let _ = self.bringup_step8();
@@ -5097,8 +5103,13 @@ impl DrmScheme for NvidiaGpu {
         if nvidia_rm_sys::rm_init::gr_ready(device_instance) {
             return String::new();
         }
-        let _ = self.bringup_step16();
-        let _ = self.bringup_step17();
+        {
+            // Silent, like every other automatic stage: nobody reads the two
+            // reports and the desktop is waiting on this ladder.
+            let _quiet = QuietBringup::arm();
+            let _ = self.bringup_step16();
+            let _ = self.bringup_step17();
+        }
         if !nvidia_rm_sys::rm_init::gr_ready(device_instance) {
             return alloc::format!(
                 "GPU consola {:02x}:{:02x}.0 {} — ladder GR NO construido: quien caiga al contexto 0 se queda en software",
@@ -8475,10 +8486,16 @@ impl NvidiaGpu {
              automatically on first GPU client (attach -> GSP boot -> state-load \
              -> CE) so EXEC works without `cat /proc/gpustep14`"
         );
-        // step14 self-guards to the console GPU and chains step5/boot/8/9/10; its
-        // internal live-echo streams each stage to the console, so a wedge leaves
-        // its last stage visible even though this call would then never return.
-        let report = self.bringup_step14();
+        // step14 self-guards to the console GPU and chains step5/boot/8/9/10.
+        // Silent: see `QuietBringup`. The stage trail it used to live-echo was
+        // for a wedge that never returns, and it cost every boot that DOES
+        // return the narration of the whole chain, rendered through the BAR1
+        // of the card being brought up. `nvidia.gputrace` brings it back for
+        // the boot where that matters.
+        let report = {
+            let _quiet = QuietBringup::arm();
+            self.bringup_step14()
+        };
         for line in report.lines() {
             crate::klog_warn!("[auto-bringup] {}", line);
         }

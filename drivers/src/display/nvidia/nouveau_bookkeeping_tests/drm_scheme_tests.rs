@@ -938,3 +938,45 @@ fn deferred_console_bringup_leaves_the_ladder_to_build_console_gr_ladder() {
     nv::set_chan_notifier_pa(0);
     *BOOT_FB_INFO.lock() = saved_fb;
 }
+
+/// Every automatic bring-up path silences the narration, and the manual one
+/// does not.
+///
+/// The `bringup_stepN` methods serve two readers with opposite interests. A
+/// person running `cat /proc/gpustepN` wants every RM line. The automatic
+/// path at boot calls the same methods and throws the result away: capturing
+/// it costs a mutex and a `String` push per RM line, reformatting it costs a
+/// second pass over a quarter of a megabyte, and `live_echo` lifts each line
+/// to ERROR so a framebuffer console living in the BAR1 of the GPU under
+/// bring-up renders it -- all of it on the path the desktop is waiting for.
+///
+/// This reads the live source, with comment lines dropped, so the paragraph
+/// above cannot satisfy it. Both halves are asserted: a guard that spread to
+/// the `/proc` readers would silently take away the only narration anyone
+/// ever reads.
+#[test]
+fn the_automatic_bring_up_paths_are_the_quiet_ones() {
+    for name in [
+        "auto_bringup_compute",
+        "ensure_console_gpu_brought_up",
+        "build_console_gr_ladder",
+    ] {
+        let body = live_method_lines(name);
+        assert!(
+            body.contains("QuietBringup::arm()"),
+            "`{}` runs at boot with nobody reading its narration, and producing \
+             it delays the card the desktop is waiting for",
+            name
+        );
+    }
+    // The counterpart: these exist to be read.
+    for name in ["bringup_step14", "bringup_step16", "bringup_step17"] {
+        let body = live_method_lines(name);
+        assert!(
+            !body.contains("QuietBringup"),
+            "`{}` is what a `cat /proc/gpustepN` runs: silencing it here would \
+             leave the one reader who asked for the narration without it",
+            name
+        );
+    }
+}
