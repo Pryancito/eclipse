@@ -4295,6 +4295,9 @@ mod mac_phy_tests;
 mod irq_tests;
 
 #[cfg(test)]
+mod ids_and_modes_tests;
+
+#[cfg(test)]
 mod rx_ring_tests {
     //! Host bench for the e1000e RX descriptor-ring state machine.
     //!
