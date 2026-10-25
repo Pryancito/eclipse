@@ -117,7 +117,7 @@ fn topology(c: &Client) -> (Vec<u32>, Vec<u32>) {
 
 /// `DRM_CLIENT_CAP_UNIVERSAL_PLANES` on or off for this client.
 fn universal_planes(c: &Client, on: bool) {
-    let mut cap: [u64; 2] = [DRM_CLIENT_CAP_UNIVERSAL_PLANES, on as u64];
+    let mut cap: [u64; 2] = [DRM_CLIENT_CAP_UNIVERSAL_PLANES, u64::from(on)];
     c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
         .expect("SET_CLIENT_CAP UNIVERSAL_PLANES");
 }
@@ -383,6 +383,85 @@ fn two_gpus_reporting_the_same_ids_are_each_reported_once() {
         alloc::vec![61],
         "a duplicate connector id reached userspace"
     );
+}
+
+/// `drm_mode_getplane_res` walks the plane list once. `GETPLANERESOURCES`
+/// took one snapshot of the driver list for the ids and then one more per
+/// plane, each a lookup across every driver, to learn its type; a lease
+/// did the same to find a CRTC's primary and cursor planes. Now both take
+/// the typed list in one pass -- one snapshot per query -- and a plane two
+/// cards list under the same id is still one plane: once in the list, and
+/// dragged into a lease once (twice would be the ENOSPC a repeated id is).
+#[test]
+fn the_plane_list_is_built_in_one_pass_over_the_drivers() {
+    let screen = kms_emu::attach(64, 16);
+    let _first = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-0").with_ids(60, 61, 62));
+    let _second = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-1").with_ids(70, 71, 72));
+    let _third = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-2").with_ids(60, 61, 62));
+    let c = Client::open(0);
+    universal_planes(&c, true);
+
+    drm::DRIVER_SNAPSHOTS.store(0, Ordering::Relaxed);
+    let mut all = planes(&c);
+    all.sort_unstable();
+    assert_eq!(all, alloc::vec![62, 72], "three cards, two planes");
+    assert_eq!(
+        drm::DRIVER_SNAPSHOTS.load(Ordering::Relaxed),
+        2,
+        "one snapshot per GETPLANERESOURCES (the probe and the fill), not one per plane"
+    );
+    let legacy = Client::open(0);
+    drm::DRIVER_SNAPSHOTS.store(0, Ordering::Relaxed);
+    assert_eq!(
+        planes(&legacy),
+        Vec::<u32>::new(),
+        "primaries are not overlays"
+    );
+    assert_eq!(drm::DRIVER_SNAPSHOTS.load(Ordering::Relaxed), 2);
+    // The typed list carries the core's scanout state, as `GETPLANE` on
+    // each id would: nothing on the pipe yet, so no CRTC and no fb -- not
+    // the driver's own fb id, which must not reach userspace.
+    for plane in drm::get_planes_typed() {
+        assert_eq!(
+            (plane.crtc_id, plane.fb_id),
+            (0, 0),
+            "plane {} leaks the driver's state",
+            plane.id
+        );
+    }
+
+    // A lease without universal planes drags the primaries of each CRTC in
+    // (the emulated planes all name CRTC slot 0, so CRTC 60 brings 62 and
+    // 72): once each, although two cards list plane 62. Only the master
+    // leases.
+    universal_planes(&c, false);
+    let lease = |ids: &[u32]| {
+        let mut req = DrmModeCreateLease {
+            object_ids: ids.as_ptr() as u64,
+            object_count: ids.len() as u32,
+            flags: 0,
+            lessee_id: 0,
+            fd: -1,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CREATE_LEASE, &mut req)
+            .map(|_| req.lessee_id)
+    };
+    assert_eq!(
+        lease(&[62, 60, 61]),
+        Err(FsError::NoDeviceSpace),
+        "naming the primary beside its CRTC is the id twice"
+    );
+    assert_eq!(
+        lease(&[60, 61]),
+        Ok(1),
+        "CRTC 60 brings planes 62 and 72 along, 62 once"
+    );
+    assert_eq!(
+        lease(&[72, 70, 71]),
+        Err(FsError::Busy),
+        "plane 72 left with the first lease"
+    );
+    assert_eq!(lease(&[70, 71]), Ok(2), "CRTC 70 has no plane of its own");
 }
 
 /// `GETCRTC` reports the framebuffer id in the DRM CORE's namespace, even

@@ -459,6 +459,12 @@ extern "C" fn eclipse_rm_step10(_a0: u32, _a1: *mut u8) -> u32 {
 extern "C" fn eclipse_rm_step15(_a0: u32, _a1: *mut u8) -> u32 {
     NV_ERR_NOT_SUPPORTED
 }
+/// Whether the ladder has been built, the C side's `g_grAllocDone`. Sticky:
+/// freeing every channel does not take it back down.
+#[no_mangle]
+extern "C" fn eclipse_rm_gr_ready() -> u8 {
+    u8::from(FAKE_RM.lock().ladder_built)
+}
 /// The VAS of the compositor's ladder: context 0's.
 pub(super) const LADDER_H_VAS: u32 = 0x5000;
 /// Step 16, the compositor's allocation ladder (client, device,
@@ -691,8 +697,11 @@ pub(super) struct FakeRm {
     pub fail_step17: bool,
     /// `step17` returns `NV_OK` with the channel never scheduled.
     pub incomplete_step17: bool,
-    /// Step 16 ran to the end (`g_grAllocDone`).
-    ladder_built: bool,
+    /// Step 16 ran to the end (`g_grAllocDone`). What `gr_ready` answers,
+    /// and so the precondition for VA-space work. STICKY: it does not care
+    /// how many channels are live, which is the whole point -- NVK frees its
+    /// enumeration channel before it binds anything.
+    pub ladder_built: bool,
     /// Step 17's channel stands (`g_grChanDone`): cleared by `ctx0_reset`.
     pub chan_built: bool,
     /// How many channels step 17 built behind index 0.

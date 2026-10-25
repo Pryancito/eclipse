@@ -2193,6 +2193,9 @@ pub(crate) mod fake {
 }
 
 #[cfg(test)]
+mod odd_states_tests;
+
+#[cfg(test)]
 mod tests {
     extern crate std;
 

@@ -360,6 +360,23 @@ pub const MAX_LADDER_GPUS: u32 = 8;
 
 extern "C" {
     fn eclipse_rm_step16(device_instance: NvU32, out: *mut GrAlloc) -> NV_STATUS;
+    fn eclipse_rm_gr_ready() -> NvBool;
+}
+
+/// Whether the step-16 ladder has been built: the shared client, device and
+/// VA space that context 0 IS and that every client context (`ctx_alloc`) is
+/// made out of.
+///
+/// This is what VA-space work needs, and it is STICKY: it stays true once the
+/// ladder is up, whoever ran it and whether or not anyone still holds a
+/// channel. Asking "is some RM-backed channel live right now?" instead is the
+/// bug this replaces -- NVK creates a throwaway channel during enumeration and
+/// frees it before `vkCreateDevice` binds anything, so the answer was "no" at
+/// exactly the moment the first real bind arrived.
+///
+/// Reads one C global: no RM call, no lock, no `RmGate`.
+pub fn gr_ready() -> bool {
+    unsafe { eclipse_rm_gr_ready() != 0 }
 }
 
 /// Runs the step-16 GR allocation ladder on a state-loaded GPU (idempotent:

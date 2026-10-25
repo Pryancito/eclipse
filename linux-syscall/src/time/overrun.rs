@@ -29,6 +29,10 @@ pub(super) struct Overrun {
     /// clock began, which `next` cannot go back to (see
     /// [`programmed_expiry`]): counted into the first expiry, once.
     pub(super) before_boot: u32,
+    /// How many times an expiry changed `last` or `queued`, so that
+    /// [`posix_timer_overrun`] can tell a timer that went through expiries
+    /// and came back to the same counts from one that did not move.
+    pub(super) settled: u64,
 }
 
 /// One expiry, as the timer's lock saw it.
@@ -113,6 +117,7 @@ fn settle(id: usize, gen: u64, change: impl FnOnce(&mut Overrun)) {
         .filter(|t| t.generation == gen)
     {
         change(&mut t.overrun);
+        t.overrun.settled = t.overrun.settled.wrapping_add(1);
     }
 }
 
@@ -120,25 +125,68 @@ fn settle(id: usize, gen: u64, change: impl FnOnce(&mut Overrun)) {
 /// that was taken carried in `si_overrun`, which is the one it queued last
 /// once that is no longer waiting. `EINVAL` if `owner` has no timer `id`.
 pub(super) fn posix_timer_overrun(id: usize, owner: KoID) -> Result<u32, LxError> {
-    let (notify, overrun) = POSIX_TIMERS
-        .lock()
-        .get(&id)
-        .filter(|t| t.owner == owner)
-        .map(|t| (t.notify, t.overrun))
-        .ok_or(LxError::EINVAL)?;
-    let (Some(queued), Some((signal, _))) =
-        (overrun.queued, posix_timer_expiry_signal(id, notify, 0))
-    else {
-        return Ok(overrun.last);
+    posix_timer_overrun_with(id, owner, |notify, signal| {
+        with_pending_timer_signal(
+            owner as usize,
+            notify.thread.map(|tid| tid as usize),
+            signal,
+            id as i32,
+            |_| {},
+        )
+    })
+}
+
+/// How many times [`posix_timer_overrun_with`] looks before it settles for
+/// an answer the timer moved under.
+pub(super) const OVERRUN_LOOKS: usize = 8;
+
+/// [`posix_timer_overrun`], asking `waiting` whether the timer's signal is
+/// still waiting to be taken.
+///
+/// The counts are behind the timers' lock and the signal behind the
+/// thread's or the process's, and an expiry can come in between: the signal
+/// just taken, `last` moved on to what it carried, and a new one queued.
+/// With the counts read before that expiry and the new signal found after
+/// it, the answer was the `last` from before: 0 where the signal just taken
+/// said 4 (`overrun-race`, 2 to 7 % of the takes of a 1 ms timer in QEMU;
+/// never in Linux 6.18, which fixes `it_overrun_last` when the signal is
+/// taken, under the lock that takes it). So an answer counts only if the
+/// timer did not change while the signal was looked at. One that changes at
+/// every look still gets the last answer, after [`OVERRUN_LOOKS`] looks.
+pub(super) fn posix_timer_overrun_with(
+    id: usize,
+    owner: KoID,
+    mut waiting: impl FnMut(TimerNotify, Signal) -> bool,
+) -> Result<u32, LxError> {
+    let read = || {
+        POSIX_TIMERS
+            .lock()
+            .get(&id)
+            .filter(|t| t.owner == owner)
+            .map(|t| (t.notify, t.generation, t.overrun))
+            .ok_or(LxError::EINVAL)
     };
-    let waiting = with_pending_timer_signal(
-        owner as usize,
-        notify.thread.map(|tid| tid as usize),
-        signal,
-        id as i32,
-        |_| {},
-    );
-    Ok(if waiting { overrun.last } else { queued })
+    let mut seen = read()?;
+    let mut looks = 1;
+    loop {
+        let (notify, _, overrun) = seen;
+        let (Some(queued), Some((signal, _))) =
+            (overrun.queued, posix_timer_expiry_signal(id, notify, 0))
+        else {
+            return Ok(overrun.last);
+        };
+        let answer = if waiting(notify, signal) {
+            overrun.last
+        } else {
+            queued
+        };
+        let now = read()?;
+        if now == seen || looks == OVERRUN_LOOKS {
+            return Ok(answer);
+        }
+        seen = now;
+        looks += 1;
+    }
 }
 
 /// Where the first expiry of an absolute periodic timer, `init` on `base`'s

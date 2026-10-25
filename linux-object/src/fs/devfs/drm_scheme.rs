@@ -2894,14 +2894,15 @@ impl DrmDev {
                 // cursor were not planes -- gets an empty list, not the
                 // scanout plane to drive as an overlay. The cap was accepted
                 // and ignored, and the list was the same for everyone.
+                // One pass over the drivers (`drm_mode_getplane_res` walks
+                // the plane list once): this asked `get_plane` per id, a
+                // snapshot of the driver list and a lookup across every
+                // driver for each plane.
                 let universal = self.file.universal_planes();
-                let planes: alloc::vec::Vec<u32> = drm::get_planes()
+                let planes: alloc::vec::Vec<u32> = drm::get_planes_typed()
                     .into_iter()
-                    .filter(|&id| {
-                        universal
-                            || drm::get_plane(id)
-                                .is_some_and(|p| p.plane_type == DRM_PLANE_TYPE_OVERLAY)
-                    })
+                    .filter(|p| universal || p.plane_type == DRM_PLANE_TYPE_OVERLAY)
+                    .map(|p| p.id)
                     .collect();
                 // Linux fills as many ids as the caller made room for and
                 // reports the full count; this arm filled all or nothing.
@@ -5816,11 +5817,7 @@ fn lease_objects(ids: &[u32], universal_planes: bool) -> Result<alloc::vec::Vec<
     let (crtcs, planes) = if universal_planes {
         (alloc::vec::Vec::new(), alloc::vec::Vec::new())
     } else {
-        let planes: alloc::vec::Vec<_> = drm::get_planes()
-            .into_iter()
-            .filter_map(drm::get_plane)
-            .collect();
-        (drm::get_resources().1, planes)
+        (drm::get_resources().1, drm::get_planes_typed())
     };
     let mut leased = alloc::vec::Vec::with_capacity(ids.len());
     let mut add = |id: u32| -> Result<()> {
