@@ -16,15 +16,86 @@
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(not(test))]
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering;
+#[cfg(not(test))]
 use lock::Mutex;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+/// The queue the whole kernel shares -- except under `cfg(test)`, where it is
+/// one queue **per thread**.
+///
+/// `cargo test` gives each test its own thread and runs many at once, so with a
+/// single queue every assertion about it -- "no poll was queued", "five
+/// requests collapsed into one" -- was really an assertion about what every
+/// other test in the binary happened to be doing at that instant. That is what
+/// made seven of the e1000/e1000e interrupt and watchdog tests fail a few runs
+/// in ten at `--test-threads=32`, a different one each time and never at
+/// `--test-threads=1`: the kind of red that costs a CI cycle and, worse, makes
+/// a mutation verdict mean nothing in either direction. The virtual clock those
+/// same tests pin is a thread-local for the same reason.
+///
+/// Per thread rather than behind a lock because a lock is a rule every future
+/// test has to remember; this way there is nothing to share.
+#[cfg(not(test))]
 static JOBS: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
 
 /// Jobs thrown away for want of queue space, since boot. See [`evict_tail_job`].
+#[cfg(not(test))]
 static EVICTED: AtomicUsize = AtomicUsize::new(0);
+
+// `ManuallyDrop` keeps the substitution faithful: a `static` is never dropped,
+// a thread-local is dropped when its thread ends, and a job left in the queue is
+// a `Box<dyn FnOnce>` whose fat pointer this module does not trust (see
+// `evict_tail_job`). The replacement must not be the one place that drops one.
+#[cfg(test)]
+std::thread_local! {
+    static JOBS: core::cell::RefCell<core::mem::ManuallyDrop<VecDeque<Job>>> =
+        core::cell::RefCell::new(core::mem::ManuallyDrop::new(VecDeque::new()));
+    static EVICTED: core::cell::Cell<usize> = core::cell::Cell::new(0);
+}
+
+/// The queue, for one operation at a time. The borrow ends before the closure's
+/// caller runs a job, which [`drain_deferred_jobs_max`] depends on.
+#[cfg(not(test))]
+fn with_jobs<R>(f: impl FnOnce(&mut VecDeque<Job>) -> R) -> R {
+    let mut q = JOBS.lock();
+    f(&mut q)
+}
+
+#[cfg(test)]
+fn with_jobs<R>(f: impl FnOnce(&mut VecDeque<Job>) -> R) -> R {
+    JOBS.with(|q| f(&mut **q.borrow_mut()))
+}
+
+#[cfg(not(test))]
+fn count_eviction() {
+    EVICTED.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn count_eviction() {
+    EVICTED.with(|n| n.set(n.get() + 1));
+}
+
+#[cfg(not(test))]
+fn evicted_count() -> usize {
+    EVICTED.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn evicted_count() -> usize {
+    EVICTED.with(|n| n.get())
+}
+
+/// Forget every eviction counted so far. Test-only: the counter is monotonic in
+/// a running kernel and `/proc/perf/kernel` reads it as such.
+#[cfg(test)]
+fn reset_evictions() {
+    EVICTED.with(|n| n.set(0));
+}
 
 /// Cap queued IRQ work — unbounded growth looks like a kernel leak.
 const MAX_DEFERRED_JOBS: usize = 256;
@@ -57,7 +128,7 @@ const MAX_JOBS_PER_DRAIN: usize = 8;
 /// cannot be the one place that skips it.
 fn evict_tail_job(q: &mut VecDeque<Job>) {
     if let Some(job) = q.pop_back() {
-        EVICTED.fetch_add(1, Ordering::Relaxed);
+        count_eviction();
         if !super::fat_ptr::dyn_fat_ptr_live(&job) {
             core::mem::forget(job);
         }
@@ -72,11 +143,12 @@ pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
     // Mutex::lock() uses push_off/pop_off which already handles interrupt
     // disabling. Manual intr_off/on here bypasses the noff accounting and
     // causes "RefCell already borrowed" panics under SMP.
-    let mut q = JOBS.lock();
-    if q.len() >= MAX_DEFERRED_JOBS {
-        evict_tail_job(&mut q);
-    }
-    q.push_back(Box::new(f));
+    with_jobs(|q| {
+        if q.len() >= MAX_DEFERRED_JOBS {
+            evict_tail_job(q);
+        }
+        q.push_back(Box::new(f));
+    })
 }
 
 /// Enqueue at the front so the next drain runs this job first.
@@ -86,11 +158,12 @@ pub fn push_deferred_job<F: FnOnce() + Send + 'static>(f: F) {
 /// tail goes, never the front: the front may itself be an urgent job that an
 /// earlier IRQ put there. See [`evict_tail_job`].
 pub fn push_deferred_job_front<F: FnOnce() + Send + 'static>(f: F) {
-    let mut q = JOBS.lock();
-    if q.len() >= MAX_DEFERRED_JOBS {
-        evict_tail_job(&mut q);
-    }
-    q.push_front(Box::new(f));
+    with_jobs(|q| {
+        if q.len() >= MAX_DEFERRED_JOBS {
+            evict_tail_job(q);
+        }
+        q.push_front(Box::new(f));
+    })
 }
 
 /// Execute all currently queued deferred jobs.
@@ -109,10 +182,7 @@ pub fn drain_deferred_jobs() {
 pub fn drain_deferred_jobs_max(max: usize) {
     let cap = max.max(1).min(MAX_DEFERRED_JOBS);
     for _ in 0..cap {
-        let job = {
-            let mut q = JOBS.lock();
-            q.pop_front()
-        };
+        let job = with_jobs(|q| q.pop_front());
         match job {
             Some(job) => {
                 // Same fat-ptr gate as IRQ handlers: a smashed Box<dyn FnOnce>
@@ -130,7 +200,7 @@ pub fn drain_deferred_jobs_max(max: usize) {
 
 /// Number of queued jobs (best-effort snapshot).
 pub fn pending_deferred_jobs() -> usize {
-    JOBS.lock().len()
+    with_jobs(|q| q.len())
 }
 
 /// Number of jobs thrown away, unexecuted, because the queue was full.
@@ -140,7 +210,7 @@ pub fn pending_deferred_jobs() -> usize {
 /// exists: it is the difference between "the NIC is slow" and "the NIC lost a
 /// bottom-half". Reported by `/proc/perf/kernel`; monotonic, never reset.
 pub fn evicted_deferred_jobs() -> usize {
-    EVICTED.load(Ordering::Relaxed)
+    evicted_count()
 }
 
 /// This queue sits under every NIC bottom-half, the e1000e link watchdog and the
@@ -148,32 +218,33 @@ pub fn evicted_deferred_jobs() -> usize {
 /// behind `required-features = ["mock"]` -- a feature that pulls in SDL2 and that
 /// no `cargo test` line in this repository or in CI enables, so they had not been
 /// compiled since the day they were written. They are below now, in the `--lib`
-/// target that every job runs, and exact rather than `>=`: as an integration test
-/// they had a private process, here they share a global queue with the e1000/
-/// e1000e tests, so they go through [`tests::alone_with_the_queue`].
+/// target that every job runs, and exact rather than `>=`: the queue is one per
+/// thread under `cfg(test)` (see [`JOBS`]), so an exact count is an answer about
+/// this test and nothing else. [`tests::alone_with_the_queue`] is still what two
+/// of them go through, for the process-wide heap tripwire they latch.
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::sync::Arc;
-    use core::sync::atomic::AtomicBool;
+    use core::sync::atomic::{AtomicBool, AtomicUsize};
 
-    /// Takes the queue's process-wide state for one test at a time and leaves it
-    /// empty on the way in and out. Whatever another test left queued is
-    /// **leaked**, not drained: running another module's bottom-half outside its
-    /// own test would poke at its fake MMIO after it is done with it.
+    /// Takes the heap tripwire for one test at a time, and leaves this thread's
+    /// queue empty on the way in and out. Whatever is left queued is **leaked**,
+    /// not drained: running a bottom-half outside its own test would poke at its
+    /// fake MMIO after it is done with it.
     fn alone_with_the_queue<R>(body: impl FnOnce() -> R) -> R {
         static TURNSTILE: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
         let _guard = TURNSTILE.lock();
         empty_the_queue();
-        EVICTED.store(0, Ordering::SeqCst);
+        reset_evictions();
         let out = body();
         empty_the_queue();
-        EVICTED.store(0, Ordering::SeqCst);
+        reset_evictions();
         out
     }
 
     fn empty_the_queue() {
-        let taken = core::mem::take(&mut *JOBS.lock());
+        let taken = with_jobs(core::mem::take);
         core::mem::forget(taken);
     }
 
@@ -493,7 +564,7 @@ mod tests {
         let _gate = crate::utils::fat_ptr::GateForTest::new();
         alone_with_the_queue(|| {
             fill_with_back_pushes(MAX_DEFERRED_JOBS - 1);
-            JOBS.lock().push_back(a_smashed_job());
+            with_jobs(|q| q.push_back(a_smashed_job()));
             assert_eq!(pending_deferred_jobs(), MAX_DEFERRED_JOBS);
 
             push_deferred_job(|| {});
@@ -513,7 +584,7 @@ mod tests {
         let _gate = crate::utils::fat_ptr::GateForTest::new();
         alone_with_the_queue(|| {
             let after = Arc::new(AtomicBool::new(false));
-            JOBS.lock().push_back(a_smashed_job());
+            with_jobs(|q| q.push_back(a_smashed_job()));
             push_deferred_job(marker(&after));
 
             drain_deferred_jobs();
