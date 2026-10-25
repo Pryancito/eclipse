@@ -134,7 +134,7 @@ fn build() -> Option<Vdso> {
         warn!("vdso: no se pudo marcar la imagen como cacheable: {:?}", e);
         return None;
     }
-    vmo.set_name("vdso");
+    vmo.set_name("[vdso]");
 
     let vdso = Vdso {
         vmo,
@@ -702,6 +702,15 @@ mod tests {
         init();
         init();
         assert_eq!(vdso().map(|v| v.data as usize), first);
+    }
+
+    /// `/proc/<pid>/maps` shows the object's name, and Linux calls this row
+    /// `[vdso]`, which is what a debugger or a sanitizer reading `maps`
+    /// looks for. It read `vdso`.
+    #[test]
+    fn maps_calls_the_image_what_linux_calls_it() {
+        let Some(vdso) = vdso() else { return };
+        assert_eq!(vdso.vmo.name(), "[vdso]");
     }
 
     /// A vDSO whose clock is off answers -ENOSYS for every call, so offering it

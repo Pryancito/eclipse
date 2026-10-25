@@ -25,6 +25,9 @@ mod cwd_tests;
 mod exited_leader_tests;
 #[cfg(test)]
 mod faults_tests;
+/// The addresses of `/proc/<pid>/stat` and the `[heap]` and `[stack]` of
+/// `maps`, in their own file for the size ratchet.
+mod layout;
 /// `/proc/<pid>/limits`, in its own file for the same reason.
 mod limits;
 pub(crate) mod owner;
@@ -164,7 +167,7 @@ fn current_process() -> Option<Arc<Process>> {
 /// With no current thread there is no caller to judge: that is the kernel
 /// reading its own procfs, never userspace, so it goes through. Refusing
 /// instead would make a kernel-side read of `/proc/self/exe` fail.
-fn may_read_innards_of(target: &Arc<Process>) -> bool {
+fn may_read_innards_of(target: &Process) -> bool {
     may_read_innards_between(current_process().as_ref(), target)
 }
 
@@ -175,7 +178,7 @@ fn may_read_innards_of(target: &Arc<Process>) -> bool {
 /// answer is the first `return true` and the two rules below it -- a process
 /// reading its own `/proc/<pid>/maps`, and the credential comparison -- are
 /// not decidable from a test at all.
-fn may_read_innards_between(caller: Option<&Arc<Process>>, target: &Arc<Process>) -> bool {
+fn may_read_innards_between(caller: Option<&Arc<Process>>, target: &Process) -> bool {
     let Some(caller) = caller else {
         return true;
     };
@@ -593,6 +596,7 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
     rest[39 - 5] = processor;
     rest[40 - 5] = rt_priority;
     rest[41 - 5] = policy;
+    layout::fill_stat(&mut rest, layout::Mm::of(proc), may_read_innards_of(proc));
 
     let mut out = format!("{} ({}) {} {}", pid, escaped_comm(&comm), state, ppid);
     for v in rest.iter() {
@@ -2571,6 +2575,7 @@ impl ProcPidFileKind {
 fn proc_pid_maps(proc: &Arc<Process>) -> String {
     use zircon_object::vm::MMUFlags;
     let mut s = String::new();
+    let mm = layout::Mm::of(proc);
     for m in proc.vmar().mappings_dump() {
         let r = if m.flags.contains(MMUFlags::READ) {
             'r'
@@ -2591,7 +2596,15 @@ fn proc_pid_maps(proc: &Arc<Process>) -> String {
         let _ = writeln!(
             s,
             "{:08x}-{:08x} {}{}{}{} {:08x} 00:00 {:<10} {}",
-            m.start, m.end, r, w, x, p, m.file_offset, m.vmo_id, m.name
+            m.start,
+            m.end,
+            r,
+            w,
+            x,
+            p,
+            m.file_offset,
+            m.vmo_id,
+            layout::row_name(&m, mm.as_ref())
         );
     }
     s

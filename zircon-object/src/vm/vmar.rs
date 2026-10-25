@@ -3387,6 +3387,11 @@ impl VmMapping {
             } else {
                 self.fork_eager_copy()?
             };
+            // The same memory under the same name: a fork child's
+            // `/proc/<pid>/maps` showed every private row as anonymous, its
+            // executable and libraries included, and at offset 0.
+            child.set_name(&self.vmo.name());
+            child.set_file_offset(self.vmo.file_offset());
             cow_cache.insert(self.vmo.id(), child.clone());
             child
         };
@@ -5301,3 +5306,6 @@ mod mapping_count_tests;
 
 #[cfg(test)]
 mod mapped_bytes_tests;
+
+#[cfg(test)]
+mod fork_name_tests;
