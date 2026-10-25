@@ -251,6 +251,10 @@ use vram_alloc::NvidiaVramAllocator;
 mod boot_edid;
 pub use boot_edid::{boot_edid, set_boot_edid};
 
+/// `/proc/gpuready`'s answer for this GPU; own file for the size ceiling, no
+/// logic change.
+mod gpu_ready;
+
 /// The bring-up narration switch; own file for the size ceiling, no logic
 /// change.
 mod quiet_bringup;
@@ -5091,6 +5095,10 @@ impl DrmScheme for NvidiaGpu {
             self.pci_device,
             self.gpu_model,
         )
+    }
+
+    fn console_gpu_ready(&self) -> Option<(bool, String)> {
+        gpu_ready::report(self)
     }
 
     fn build_console_gr_ladder(&self) -> String {

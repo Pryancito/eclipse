@@ -980,3 +980,66 @@ fn the_automatic_bring_up_paths_are_the_quiet_ones() {
         );
     }
 }
+
+/// `/proc/gpuready` only says yes once a client could actually use the card.
+///
+/// The file exists so a session can hold its compositor back instead of
+/// spending its two renderer tries on a card that is not there yet. That is
+/// only worth anything if "ready" means what a GL client needs: the RM
+/// attached AND the GR ladder standing, because a client that lands on
+/// context 0 without a ladder gets a channel with no GPFIFO and its first
+/// EXEC answers ENODEV -- which is exactly the session that ended up on
+/// pixman with a working GPU beside it.
+#[test]
+fn the_console_gpu_reports_itself_ready_only_once_a_client_could_use_it() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    let saved_fb = *BOOT_FB_INFO.lock();
+    set_boot_fb_info(0x1000, 1920, 1080, 1920 * 4);
+    {
+        let mut f = FAKE_RM.lock();
+        f.ladder = true;
+        f.ladder_built = false;
+        f.chan_built = false;
+        f.calls.clear();
+    }
+
+    let (ready, line) = gpu
+        .console_gpu_ready()
+        .expect("this GPU drives the boot display, so it has an answer");
+    assert!(!ready, "attached but with no ladder is NOT ready: {}", line);
+    assert!(line.contains("gr=no"), "{}", line);
+    let after_asking = FAKE_RM.lock().calls.clone();
+    assert!(
+        after_asking.is_empty(),
+        "asking must have no side effects -- a boot polls this in a loop: {:?}",
+        after_asking
+    );
+
+    let _ = gpu.build_console_gr_ladder();
+    let (ready, line) = gpu.console_gpu_ready().expect("still the console GPU");
+    assert!(ready, "with the ladder up a client can bind: {}", line);
+    assert!(
+        line.contains("rm=yes") && line.contains("gr=yes"),
+        "{}",
+        line
+    );
+
+    // And a card that does NOT scan out the screen says nothing at all. The
+    // secondary is state-loaded at boot by `auto_bringup_compute`, long before
+    // userspace; it is not what a session waits for, and answering for it
+    // would hold the compositor back on a card nobody asked about.
+    set_boot_fb_info(0xffff_0000_0000, 1920, 1080, 1920 * 4);
+    assert!(
+        !gpu.drives_boot_display(),
+        "the boot framebuffer is now somewhere else"
+    );
+    assert!(
+        gpu.console_gpu_ready().is_none(),
+        "only the console GPU has an answer to give"
+    );
+
+    nv::set_chan_notifier_pa(0);
+    *BOOT_FB_INFO.lock() = saved_fb;
+}

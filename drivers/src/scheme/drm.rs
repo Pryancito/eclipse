@@ -526,6 +526,27 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Read-only: can a GL/Vulkan client use this driver's console GPU yet?
+    ///
+    /// `None` from a driver with no console GPU of its own, so a caller can
+    /// loop over every registered driver and treat "nobody answered" as
+    /// "nothing to wait for". Otherwise `(ready, one status line)`.
+    ///
+    /// This exists because the console GPU now comes up in the MIDDLE of a
+    /// live session -- a deferred task, several seconds after userspace
+    /// starts -- and nothing told userspace when. A compositor that asks for
+    /// a GPU renderer gets two tries at its EGL stack and then falls back to
+    /// pixman for the rest of the boot; on real hardware its second and last
+    /// try failed less than a second before the GR ladder was ready, so the
+    /// desktop spent the whole session on the CPU with a working card beside
+    /// it. With this, the session can simply wait.
+    ///
+    /// It must have NO side effects: unlike `/proc/gpustep*`, which performs
+    /// its step when read, this is polled in a loop while a boot waits on it.
+    fn console_gpu_ready(&self) -> Option<(bool, alloc::string::String)> {
+        None
+    }
+
     /// Leave this GPU in a clean (cold) state before a system reboot. A GPU we
     /// brought up carries a live GSP-RM: WPR2 is locked in its VRAM and its
     /// SEC2/GSP falcons are running. Eclipse's `reboot` is a WARM reset -- it

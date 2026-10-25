@@ -2927,3 +2927,75 @@ fn una_linea_de_puro_control_no_gasta_una_de_las_ocho() {
     let out = tail_lines("\x07\x07\x00\nel error de verdad\n");
     assert_eq!(out, vec!["el error de verdad"]);
 }
+
+// ---------------------------------------------------------------------
+// La espera a que la GPU de consola este utilizable (`/proc/gpuready`).
+//
+// La tarjeta de consola la enciende una tarea diferida del kernel, varios
+// segundos dentro de una sesion ya viva, y hasta ahora nadie se lo decia a
+// userspace. wlroots le da dos intentos a su renderer y luego cae a pixman
+// PARA EL RESTO DEL ARRANQUE: en hardware real el segundo y ultimo intento
+// fallo menos de un segundo antes de que la escalera GR estuviera lista.
+// ---------------------------------------------------------------------
+
+/// El veredicto es la primera linea y nada mas que la primera linea: debajo
+/// va una linea por tarjeta, que es detalle para quien mire, no respuesta.
+#[test]
+fn el_veredicto_sale_solo_de_la_primera_linea() {
+    let texto = "gpuready: waiting\n17:00.0 GeForce RTX 2060 Super: rm=yes gr=no\n";
+    assert_eq!(gpuready_verdict(texto), Some("waiting"));
+}
+
+#[test]
+fn una_tarjeta_con_su_escalera_hecha_dice_ready() {
+    let texto = "gpuready: ready\n17:00.0 GeForce RTX 2060 Super: rm=yes gr=yes\n";
+    assert_eq!(gpuready_verdict(texto), Some("ready"));
+}
+
+/// Sin tarjeta de consola el veredicto es `none`, y quien espera tiene que
+/// leerlo como «arranca ya», nunca como «todavia no»: en QEMU o en una caja
+/// sin NVIDIA, confundirlos es un escritorio que no sale hasta que se agota
+/// el plazo entero.
+#[test]
+fn sin_tarjeta_de_consola_el_veredicto_es_none() {
+    assert_eq!(gpuready_verdict("gpuready: none\n"), Some("none"));
+}
+
+/// Un fichero que este init no entiende -- un kernel mas viejo, otra cosa
+/// montada ahi, basura -- no hace esperar a nadie. El fallo que se evita
+/// asi es un arranque que no saca escritorio nunca, que es peor que el que
+/// se permite, un escritorio en pixman.
+#[test]
+fn un_gpuready_que_no_se_entiende_no_hace_esperar() {
+    assert_eq!(gpuready_verdict(""), None);
+    assert_eq!(gpuready_verdict("otra cosa\n"), None);
+    assert_eq!(gpuready_verdict("gpuready: quien sabe\n"), None);
+    assert_eq!(
+        gpuready_verdict("17:00.0: rm=yes gr=no\ngpuready: ready\n"),
+        None,
+        "el veredicto no se busca por el fichero: la primera linea manda"
+    );
+}
+
+/// `nvidia.nogpuwait` devuelve el arranque de antes, sin espera ninguna.
+#[test]
+fn nogpuwait_apaga_la_espera() {
+    assert!(gpu_wait_disabled_in(
+        "LOG=error:nvidia.nogpuwait:ROOT=/dev/sdb2"
+    ));
+    assert!(!gpu_wait_disabled_in(
+        "LOG=error:nvidia.nouveau_uapi:ROOT=/dev/sdb2"
+    ));
+}
+
+/// Y una sesion que no pide GPU no espera por una GPU. La espera cuelga de
+/// `gpu_compositor_requested_in`, que es la misma pregunta que decide el
+/// `WLR_RENDERER` de la sesion: si ahi se dice pixman, aqui no hay nada que
+/// esperar.
+#[test]
+fn una_sesion_sin_gpu_no_espera_por_la_gpu() {
+    assert!(!gpu_compositor_requested_in(
+        "LOG=error:nvidia.nouveau_uapi:nvidia.wlr_pixman"
+    ));
+    assert!(gpu_compositor_requested_in("LOG=error:nvidia.nouveau_uapi"));
+}
