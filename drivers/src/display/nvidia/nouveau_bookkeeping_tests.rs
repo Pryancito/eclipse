@@ -9354,3 +9354,9 @@ mod probes_tests;
 /// The implicit-sync wait (`implicit_sync.rs`) arm by arm, on state built
 /// by hand: same harness, own file, same reason.
 mod implicit_sync_tests;
+
+/// The `DrmScheme` arms the desktop reaches without an ioctl (ADDFB, the
+/// PRIME import, the cursor, the legacy ioctls), the per-architecture
+/// tables and the context registry's fallbacks: same harness, own file,
+/// same reason.
+mod drm_scheme_tests;
