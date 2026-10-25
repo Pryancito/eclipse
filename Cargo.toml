@@ -121,6 +121,13 @@ rcore-fs-sfs = { path = "vendor/rcore-fs-sfs" }
 # rcore-fs-fuse, which xtask needs to build the rootfs image.
 rcore-fs-devfs = { path = "vendor/rcore-fs-devfs" }
 rcore-fs-sefs = { path = "vendor/rcore-fs-sefs" }
+# And a third time, same trap: 6839247 added `ftype` to vendor/rcore-fs's
+# FsInfo (Linux `statfs.f_type`), and -hostfs was the last member of this
+# repository still resolving to the upstream checkout, whose `info()` builds
+# FsInfo with a struct literal -- E0063, which is what turned the `test-libos`
+# job red: `loader` depends on it unconditionally. Vendored from rev 1a3246b
+# with that one field added.
+rcore-fs-hostfs = { path = "vendor/rcore-fs-hostfs" }
 
 [patch."https://github.com/rcore-os/rcore-console"]
 rcore-console = { path = "vendor/rcore-console" }
