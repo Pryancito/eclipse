@@ -401,9 +401,33 @@ extern "C" fn eclipse_rm_init_core() -> u32 {
 extern "C" fn eclipse_rm_init_gsp(_a0: u32, _a1: *const u8, _a2: u32) -> u32 {
     NV_ERR_NOT_SUPPORTED
 }
+/// The GSP's interrupt kernel table, as the `intr_table` knob says it:
+/// the control's own status and the rows, cut at the 128 the mirror
+/// holds. Without the knob, `NV_ERR_NOT_SUPPORTED`, like every other
+/// probe of a GPU this fake has no silicon for.
 #[no_mangle]
-extern "C" fn eclipse_rm_intr_table(_a0: u32, _a1: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_intr_table(_a0: u32, out: *mut nvidia_rm_sys::rm_init::IntrTable) -> u32 {
+    let f = FAKE_RM.lock();
+    f.narrate("intr_table");
+    let Some((ctrl_status, rows)) = f.intr_table.as_ref() else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    unsafe {
+        (*out).ctrl_status = *ctrl_status;
+        let n = rows.len().min((*out).entries.len());
+        (*out).table_len = n as u32;
+        for (slot, &(engine_idx, pmc_intr_mask, vector_stall, vector_non_stall)) in
+            (*out).entries.iter_mut().zip(rows.iter())
+        {
+            *slot = nvidia_rm_sys::rm_init::IntrTableEntry {
+                engine_idx,
+                pmc_intr_mask,
+                vector_stall,
+                vector_non_stall,
+            };
+        }
+    }
+    NV_OK
 }
 /// The consumer VAs `map_peer_fence` hands out start here: above every
 /// channel's own buffer, and each mapping ever made gets its own, so a
@@ -462,14 +486,36 @@ extern "C" fn eclipse_rm_step10(_a0: u32, _a1: *mut u8) -> u32 {
 extern "C" fn eclipse_rm_step15(_a0: u32, out: *mut nvidia_rm_sys::rm_init::GrProbe) -> u32 {
     // Not recorded in `calls`: a GRAPH_UNITS answer is no RM work the
     // tests count, and the ones that count calls ask for it in passing.
-    let Some((num_gpc, total_tpc)) = FAKE_RM.lock().gr_probe else {
+    let f = FAKE_RM.lock();
+    f.narrate("step15");
+    let Some((num_gpc, total_tpc)) = f.gr_probe else {
         return NV_ERR_NOT_SUPPORTED;
     };
+    // The mask names the first `num_gpc` GPCs and the TPCs split evenly
+    // across them, the remainder on the lowest: what `/proc/gpustep15`
+    // prints per GPC, which GRAPH_UNITS never looks at. A probe with no
+    // GPCs in it is a GPC-mask control that failed: the shape the C side
+    // has for "no answer", which both readers treat as none.
+    let gpc_mask = if num_gpc >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << num_gpc) - 1
+    };
     unsafe {
-        (*out).gpc_mask_status = 0;
+        (*out).gpc_mask_status = if num_gpc == 0 {
+            NV_ERR_INVALID_STATE
+        } else {
+            0
+        };
+        (*out).gpc_mask = gpc_mask;
         (*out).tpc_mask_status = 0;
         (*out).num_gpc = num_gpc;
         (*out).total_tpc = total_tpc;
+        (*out).per_gpc_tpc = [0; 8];
+        for g in 0..(num_gpc.min(8) as usize) {
+            (*out).per_gpc_tpc[g] =
+                total_tpc / num_gpc + u32::from((g as u32) < total_tpc % num_gpc);
+        }
     }
     NV_OK
 }
@@ -490,6 +536,7 @@ pub(super) const LADDER_H_VAS: u32 = 0x5000;
 extern "C" fn eclipse_rm_step16(_inst: u32, out: *mut GrAlloc) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("step16");
+    f.narrate("step16");
     if !f.ladder {
         return NV_ERR_NOT_SUPPORTED;
     }
@@ -527,6 +574,7 @@ extern "C" fn eclipse_rm_step16(_inst: u32, out: *mut GrAlloc) -> u32 {
 extern "C" fn eclipse_rm_step17(_inst: u32, out: *mut GrChannel) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("step17");
+    f.narrate("step17");
     if !f.ladder {
         return NV_ERR_NOT_SUPPORTED;
     }
@@ -772,6 +820,14 @@ pub(super) struct FakeRm {
     pub gr_probe: Option<(u32, u32)>,
     /// `ctx0_reset` refuses: the singleton stands, and the exit says so.
     pub fail_ctx0_reset: bool,
+    /// `intr_table` answers the GSP's interrupt kernel table instead of
+    /// `NV_ERR_NOT_SUPPORTED`: the control's status and the rows as
+    /// `(engine_idx, pmc_intr_mask, vector_stall, vector_non_stall)`.
+    pub intr_table: Option<(u32, Vec<(u32, u32, u32, u32)>)>,
+    /// The RM narrates: each bring-up probe leaves one line in the log
+    /// capture the proc readers fold into their output, as the real RM's
+    /// printf does between `capture_begin` and `capture_take`.
+    pub narrates: bool,
 }
 
 /// `ECLIPSE_CHAN_BUF_SIZE`: the channel's own buffer, pushbuffer and ring,
@@ -856,6 +912,8 @@ const EMPTY_RM: FakeRm = FakeRm {
     fail_map_cpu_call: false,
     gr_probe: None,
     fail_ctx0_reset: false,
+    intr_table: None,
+    narrates: false,
 };
 
 pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);
@@ -865,6 +923,13 @@ pub(super) fn reset_fake_rm() {
 }
 
 impl FakeRm {
+    /// One line of RM narration for `call`, when the knob says so.
+    fn narrate(&self, call: &str) {
+        if self.narrates {
+            nvidia_rm_sys::os_interface::capture_line(&alloc::format!("[fake-rm] {}", call));
+        }
+    }
+
     fn fresh(&mut self) -> u32 {
         self.next += 1;
         self.next
