@@ -27,6 +27,8 @@ const NOBODY: NvCaller<'static> = NvCaller {
     gpu_mask: &no_gpus,
     open_of_fd: &no_fds,
     pin_user_pages: &no_pins,
+    pid: 0,
+    name: [0; nvctl::CALLER_NAME_LEN],
 };
 
 fn ctl() -> NvidiaOpen {
@@ -356,10 +358,7 @@ fn a_payload_nobody_can_read_is_efault() {
 /// reads the failure, it does not take the fd for something else.
 #[test]
 fn escapes_not_served_are_einval() {
-    for nr in [
-        213, /* SET_NUMA_STATUS (not served) */
-        0x99,
-    ] {
+    for nr in [213 /* SET_NUMA_STATUS (not served) */, 0x99] {
         let mut p = [0u8; 16];
         assert_eq!(
             ioctl_on(&ctl(), nr, &mut p),
@@ -367,7 +366,11 @@ fn escapes_not_served_are_einval() {
             "{:#x}",
             nr
         );
-        assert!(logged_not_served(nr), "{:#x} must be logged as not served", nr);
+        assert!(
+            logged_not_served(nr),
+            "{:#x} must be logged as not served",
+            nr
+        );
     }
     // Hosted there is no RM behind the RM escapes either, but they are
     // served: refused for want of an RM, not logged as escapes to write.
@@ -414,6 +417,8 @@ fn caller_with_fd<'a>(fd_table: &'a dyn Fn(i32) -> Option<Arc<dyn INode>>) -> Nv
         gpu_mask: &no_gpus,
         open_of_fd: fd_table,
         pin_user_pages: &no_pins,
+        pid: 1234,
+        name: nvctl::Caller::name_of(b"ollama"),
     }
 }
 
@@ -454,6 +459,67 @@ fn a_linked_open_calls_the_rm_as_its_control_open() {
     );
     let ctl_open = target.downcast_ref::<NvidiaOpen>().unwrap();
     assert_eq!(ctl_open.rm_caller(&caller).os_info, ctl_os_info);
+}
+
+/// The calling process's pid and name reach the RM on every escape: that
+/// pid is what `client.c` files the client under (`RmClient::ProcID`) and
+/// the only thing `NV2080_CTRL_CMD_GPU_GET_PIDS` -- `nvidia-smi`'s
+/// "Processes" table -- can answer with. A close has no caller, so it names
+/// no process.
+#[test]
+fn every_escape_tells_the_rm_which_process_is_calling() {
+    let caller = caller_with_fd(&no_fds);
+    for open in [ctl(), gpu(0)] {
+        let rm = open.rm_caller(&caller);
+        assert_eq!(rm.pid, 1234);
+        assert_eq!(&rm.name[..6], b"ollama");
+        assert_eq!(rm.name[6], 0, "siempre terminado para el %s del RM");
+    }
+    assert_eq!(
+        ctl().rm_caller(&NOBODY).pid,
+        0,
+        "un cierre no es un proceso"
+    );
+    assert_eq!(
+        ctl().rm_caller(&NOBODY).name,
+        [0; nvctl::CALLER_NAME_LEN],
+        "ni tiene nombre"
+    );
+}
+
+/// The two controls behind `nvidia-smi`'s "Processes" table are recognised
+/// by their cmd and nothing else is, so one boot says whether NVML asks for
+/// them at all and whether the RM answers -- which is the only thing a
+/// machine with a GPU can tell us and this one cannot.
+#[test]
+fn the_process_table_controls_are_recognised_by_their_cmd() {
+    let control = |cmd: u32| {
+        let mut p = [0u8; CONTROL_SIZE];
+        p[CONTROL_CMD..CONTROL_CMD + 4].copy_from_slice(&cmd.to_ne_bytes());
+        p
+    };
+    assert_eq!(
+        process_query(&control(GPU_GET_PIDS)),
+        Some((0, "GPU_GET_PIDS"))
+    );
+    assert_eq!(
+        process_query(&control(GPU_GET_PID_INFO)),
+        Some((1, "GPU_GET_PID_INFO"))
+    );
+    // Every other control, and GET_GID_INFO next door, is left alone.
+    assert_eq!(process_query(&control(0x2080_018c)), None);
+    assert_eq!(process_query(&control(0x2080_02ff)), None);
+    assert_eq!(process_query(&control(0)), None);
+    // A payload too short to hold a cmd is never read for one.
+    assert_eq!(
+        process_query(&control(GPU_GET_PIDS)[..CONTROL_SIZE - 1]),
+        None
+    );
+    assert_eq!(process_query(&[]), None);
+    // And the name it logs is the caller's, without the padding.
+    let caller = caller_with_fd(&no_fds);
+    assert_eq!(caller_name_bytes(&ctl().rm_caller(&caller)), b"ollama");
+    assert_eq!(caller_name_bytes(&ctl().rm_caller(&NOBODY)), b"");
 }
 
 #[test]

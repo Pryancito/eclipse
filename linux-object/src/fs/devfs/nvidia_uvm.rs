@@ -540,6 +540,8 @@ impl CtlOpen {
             ctl: true,
             admin: who.admin,
             gpu_mask: who.gpu_mask,
+            pid: who.pid,
+            name: who.name,
         };
         Some((open, caller))
     }
@@ -551,6 +553,11 @@ struct Who {
     admin: bool,
     /// The RM GPU instances the caller has open.
     gpu_mask: u32,
+    /// The caller's pid, which every RM client UVM makes for it is filed
+    /// under, so `nvidia-smi` can name the process.
+    pid: u32,
+    /// The caller's name (`current->comm`).
+    name: [u8; nvctl::CALLER_NAME_LEN],
 }
 
 impl Who {
@@ -558,14 +565,19 @@ impl Who {
         Who {
             admin: caller.admin,
             gpu_mask: (caller.gpu_mask)(),
+            pid: caller.pid,
+            name: caller.name,
         }
     }
 
     /// The close, which has no caller to ask about, as `release` frees an
-    /// open's clients: nobody is an administrator and no GPU is open.
+    /// open's clients: nobody is an administrator, no GPU is open and there
+    /// is no process whose pid to file anything under.
     const NOBODY: Who = Who {
         admin: false,
         gpu_mask: 0,
+        pid: 0,
+        name: [0; nvctl::CALLER_NAME_LEN],
     };
 }
 

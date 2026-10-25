@@ -199,6 +199,8 @@ pub(super) fn with_fds(fds: &dyn Fn(i32) -> Option<Arc<dyn INode>>) -> NvCaller<
         gpu_mask: &both_gpus,
         open_of_fd: fds,
         pin_user_pages: &no_pins,
+        pid: 1234,
+        name: nvctl::Caller::name_of(b"ollama"),
     }
 }
 

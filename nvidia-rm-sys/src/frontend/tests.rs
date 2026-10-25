@@ -175,13 +175,25 @@ fn user_copies_are_refused_outside_a_call() {
     assert_eq!(dst, [0; 4]);
 }
 
+/// A caller for a scope that is only about the window, not about who.
+fn a_caller(gpu_mask: u32, admin: bool) -> Caller {
+    Caller {
+        os_info: 0x1000,
+        ctl: true,
+        admin,
+        gpu_mask,
+        pid: 0,
+        name: [0; CALLER_NAME_LEN],
+    }
+}
+
 #[test]
 fn user_copies_ask_the_kernel_inside_a_call() {
     let _t = turnstile();
     let src = [1u8, 2, 3, 4];
     let mut dst = [0u8; 4];
     {
-        let _scope = CallScope::enter(0, false);
+        let _scope = CallScope::enter(&a_caller(0, false));
         set_user_range_validator(refuse_all);
         assert_eq!(
             copy_from_user(dst.as_mut_ptr(), src.as_ptr(), 4),
@@ -213,7 +225,7 @@ fn the_call_scope_sets_and_clears_the_caller() {
     let _t = turnstile();
     assert!(!IN_CALL.load(Ordering::SeqCst));
     {
-        let _scope = CallScope::enter(0b101, true);
+        let _scope = CallScope::enter(&a_caller(0b101, true));
         assert!(IN_CALL.load(Ordering::SeqCst));
         assert_eq!(CALLER_GPUS.load(Ordering::SeqCst), 0b101);
         assert!(is_administrator());
@@ -225,9 +237,86 @@ fn the_call_scope_sets_and_clears_the_caller() {
         "nobody is an administrator outside a call"
     );
     {
-        let _scope = CallScope::enter(0, false);
+        let _scope = CallScope::enter(&a_caller(0, false));
         assert!(!is_administrator());
     }
+}
+
+/// The pid is the whole of the RM's per-process accounting: `client.c`
+/// files every client it makes under `osGetCurrentProcess()`, and
+/// `NV2080_CTRL_CMD_GPU_GET_PIDS` -- `nvidia-smi`'s "Processes" table --
+/// answers with nothing else. It must be the calling process's for the
+/// length of the call and 0 outside, which is what a close is.
+#[test]
+fn the_call_scope_names_the_calling_process_and_only_inside_the_call() {
+    let _t = turnstile();
+    let mut caller = a_caller(0, false);
+    caller.pid = 1234;
+    caller.name = Caller::name_of(b"ollama");
+    assert_eq!(crate::os_interface::os_get_current_process(), 0);
+    {
+        let _scope = CallScope::enter(&caller);
+        assert_eq!(crate::os_interface::os_get_current_process(), 1234);
+        assert_eq!(&current_name()[..6], b"ollama");
+        let mut buf = [0xffu8; 32];
+        crate::os_boundary::osGetCurrentProcessName(buf.as_mut_ptr() as *mut c_char, 32);
+        assert_eq!(&buf[..7], b"ollama\0");
+    }
+    assert_eq!(crate::os_interface::os_get_current_process(), 0);
+    assert_eq!(current_name(), [0; CALLER_NAME_LEN]);
+    // Outside a call the RM is asking about this kernel, and gets its name.
+    let mut buf = [0xffu8; 32];
+    crate::os_boundary::osGetCurrentProcessName(buf.as_mut_ptr() as *mut c_char, 32);
+    assert_eq!(&buf[..15], b"eclipse-kernel\0");
+    // A close names no process either.
+    {
+        let _scope = CallScope::enter_kernel();
+        assert_eq!(crate::os_interface::os_get_current_process(), 0);
+        let mut buf = [0xffu8; 32];
+        crate::os_boundary::osGetCurrentProcessName(buf.as_mut_ptr() as *mut c_char, 32);
+        assert_eq!(&buf[..15], b"eclipse-kernel\0");
+    }
+}
+
+/// A name longer than `current->comm` is cut, and a cut name still ends in
+/// the NUL the RM's `%s` needs -- `kernel_rc.c` prints `RmClient::name` out
+/// of a buffer nothing zeroed.
+#[test]
+fn a_caller_s_name_is_cut_to_comm_s_length_and_always_terminated() {
+    let name = Caller::name_of(b"un-nombre-larguisimo-de-proceso");
+    assert_eq!(name.len(), CALLER_NAME_LEN);
+    assert_eq!(&name[..CALLER_NAME_LEN - 1], b"un-nombre-largu");
+    assert_eq!(name[CALLER_NAME_LEN - 1], 0, "siempre queda el terminador");
+    assert_eq!(Caller::name_of(b""), [0; CALLER_NAME_LEN]);
+    // Exactly the room there is, terminator included.
+    assert_eq!(&Caller::name_of(b"quincecaracter")[..14], b"quincecaracter");
+}
+
+/// The RM's buffer is never overrun and never left unterminated, whatever
+/// room it has, and a one-byte buffer gets just the NUL.
+#[test]
+fn a_callers_name_never_overruns_the_rms_buffer() {
+    let _t = turnstile();
+    let mut caller = a_caller(0, false);
+    caller.name = Caller::name_of(b"ollama");
+    let _scope = CallScope::enter(&caller);
+    for room in 1..10usize {
+        let mut buf = [0xffu8; 16];
+        crate::os_interface::write_caller_name(buf.as_mut_ptr() as *mut c_char, room as NvU32);
+        // The name, cut to the room there is, and then the terminator.
+        let n = b"ollama".len().min(room - 1);
+        assert_eq!(&buf[..n], &b"ollama"[..n], "copiado con room={room}");
+        assert_eq!(buf[n], 0, "terminado con room={room}");
+        assert!(
+            buf[n + 1..].iter().all(|&b| b == 0xff),
+            "nada escrito mas alla del terminador con room={room}"
+        );
+    }
+    // A buffer of nothing is left alone, as `write_process_name` does.
+    let mut buf = [0xffu8; 4];
+    crate::os_interface::write_caller_name(buf.as_mut_ptr() as *mut c_char, 0);
+    assert_eq!(buf, [0xff; 4]);
+    crate::os_interface::write_caller_name(core::ptr::null_mut(), 4);
 }
 
 #[test]
@@ -235,7 +324,7 @@ fn no_gpu_is_accessible_outside_a_call() {
     let _t = turnstile();
     let mut fake = 0u8;
     assert!(!gpu_accessible(&mut fake as *mut u8 as *mut c_void));
-    let _scope = CallScope::enter(u32::MAX, true);
+    let _scope = CallScope::enter(&a_caller(u32::MAX, true));
     assert!(
         !gpu_accessible(core::ptr::null_mut()),
         "a null OBJGPU is never accessible"
@@ -253,6 +342,8 @@ fn hosted_escapes_are_refused() {
         ctl: true,
         admin: false,
         gpu_mask: 1,
+        pid: 0,
+        name: [0; CALLER_NAME_LEN],
     };
     assert_eq!(rm_escape(0x2A, &mut payload, &caller), NV_ERR_NOT_SUPPORTED);
     let nobody = Caller {
@@ -456,6 +547,8 @@ fn hosted_maps_are_refused() {
         ctl: true,
         admin: false,
         gpu_mask: 1,
+        pid: 0,
+        name: [0; CALLER_NAME_LEN],
     };
     assert_eq!(
         rm_map_memory(&mut payload, &caller),
@@ -489,6 +582,8 @@ fn a_record_that_does_not_hold_up_is_unmapped_at_once() {
         ctl: true,
         admin: false,
         gpu_mask: 1,
+        pid: 0,
+        name: [0; CALLER_NAME_LEN],
     };
     let good = system(0x1000, 0x2000);
     answer_map(NV_OK, good);

@@ -26,8 +26,8 @@ pub use nvidia_rm_sys::frontend::user_pages::UserPages;
 pub use nvidia_rm_sys::frontend::uvm::{ExternalMapping, Pages, SkedRange, NV_ERR_INVALID_CLIENT};
 pub use nvidia_rm_sys::frontend::{
     caching, copy_version, layout_mismatch, rm_version, set_user_range_validator, version_check,
-    Caller, CpuCaching, MmapContext, MmapMemory, GPU_UUID_LEN, LAYOUT, NV_ERR_STATE_IN_USE,
-    VERSION_CMD_QUERY, VERSION_REPLY_RECOGNIZED, VERSION_STRING_LENGTH,
+    Caller, CpuCaching, MmapContext, MmapMemory, CALLER_NAME_LEN, GPU_UUID_LEN, LAYOUT,
+    NV_ERR_STATE_IN_USE, VERSION_CMD_QUERY, VERSION_REPLY_RECOGNIZED, VERSION_STRING_LENGTH,
 };
 use nvidia_rm_sys::types::{NV_ERR_NOT_READY, NV_OK, NV_STATUS};
 
@@ -272,6 +272,8 @@ mod tests {
             ctl: true,
             admin: false,
             gpu_mask: 0,
+            pid: 4242,
+            name: Caller::name_of(b"nvidia-smi"),
         };
         assert_eq!(rm_escape(0x2A, &mut [0u8; 32], &caller), NV_ERR_NOT_READY);
         assert_eq!(
