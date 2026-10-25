@@ -2467,12 +2467,22 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         portMemCopy(pOut, sizeof(*pOut), &g_ctxAlloc[gpuInstance][ctxIdx], sizeof(g_ctxAlloc[gpuInstance][ctxIdx]));
         return NV_OK;
     }
-    if (!g_grAllocDone[gpuInstance])
-    {
-        /* The compositor's step16 must run first: it builds the shared
-         * client/device/subdevice this context reuses. */
-        return NV_ERR_INVALID_STATE;
-    }
+    /* No ladder precondition. That comment used to be true: this context was
+     * built on step16's shared client/device/subdevice. Since the per-process
+     * client landed it is not -- everything below hangs off
+     * `_eclipse_rm_ctx_client`'s OWN NV01_ROOT and NV01_DEVICE_0 (which is the
+     * whole point: a context filed under the caller's pid is the one
+     * `gpuGetProcWithObject` can name, so the process shows up in
+     * nvidia-smi), and `g_grAllocCache` is not read once in this function.
+     *
+     * Keeping the stale guard cost exactly what it was meant to protect: on
+     * the console GPU the ladder is built after the desktop is up, so every
+     * client that started before it -- the compositor first of all -- was
+     * refused its own context, fell back to the shared context 0, and from
+     * there could never appear in the process table. `gspRmInitialized` is
+     * still checked below, and that is the real precondition: a card whose
+     * GSP is not up cannot serve anybody, ladder or no ladder.
+     */
 
     portMemSet(pOut, 0, sizeof(*pOut));
     pOut->vasStatus = pOut->tsgStatus = pOut->ctxshareStatus = 0xFFFFFFFF;

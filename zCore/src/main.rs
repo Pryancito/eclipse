@@ -1494,6 +1494,7 @@ fn schedule_deferred_console_bringup(
         }
 
         linux_object::fs::devfs::drm::set_scanout_paused(false);
+
         // The other half of the pair above: the screen moves again, and this
         // says how long it did not.
         let held = timer_now().saturating_sub(paused_at);
@@ -1504,6 +1505,19 @@ fn schedule_deferred_console_bringup(
         ));
         kernel_hal::console::set_diag_present_over_graphics(over_graphics_was);
         kernel_hal::console::redraw_active_console();
+
+        // The GR ladder runs HERE, with the screen moving again, never inside
+        // the window above: step16/step17 drive the compute engine's cold
+        // golden-context load on the card that scans out, and doing that with
+        // the scanout parked is how a boot lost the monitor. Nothing waits on
+        // it -- a client whose context could not be built yet retries on its
+        // next ioctl.
+        for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+            let line = d.build_console_gr_ladder();
+            if !line.is_empty() {
+                kernel_hal::klog_info!("Eclipse: NVIDIA {}", line);
+            }
+        }
 
         // The boot-time CE decision was taken before this GPU existed as a
         // presenter, so re-take it now. On a single-GPU box this is the moment

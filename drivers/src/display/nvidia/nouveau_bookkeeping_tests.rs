@@ -2436,10 +2436,11 @@ fn vm_bind_and_exec_answer_enosys_until_the_client_ran_vm_init() {
     // space -- whether anyone happens to hold a channel is not the question.
     assert_eq!(init(A, END - 4096, 4096), Ok(0));
     assert_eq!(bind(A), Ok(0));
-    // Without a ladder there is genuinely nothing to bind into: ENODEV, and
-    // still BEHIND the ENOSYS gate.
+    // The ladder is CONTEXT 0's VA space. A has one of its own, built off
+    // its own client and device, so losing the ladder does not touch it --
+    // and the ENOSYS gate still comes first for B, which never ran VM_INIT.
     FAKE_RM.lock().ladder_built = false;
-    assert_eq!(bind(A), Err(nv::ENODEV));
+    assert_eq!(bind(A), Ok(0), "its own VA space does not depend on step16");
     assert_eq!(bind(B), Err(nv::ENOSYS), "B never ran VM_INIT");
     FAKE_RM.lock().ladder_built = true;
     // EXEC looks the channel up in the caller's list first, and A has
@@ -9375,5 +9376,3 @@ mod rm_edges_tests;
 /// The arms the fake RM reaches only when it fails as a call, the
 /// `Unknown` architecture, and the empty EXEC that rides the ring.
 mod rm_failures_tests;
-
-

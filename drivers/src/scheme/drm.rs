@@ -508,6 +508,24 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Build the console GPU's GR allocation ladder (step16 + step17), called
+    /// right AFTER `deferred_console_bringup` and after scanout has been
+    /// UNPAUSED. The ladder is what a client riding context 0 binds into, and
+    /// `auto_bringup_compute` builds it for every other card; the console GPU
+    /// skips that function for the SEC2 store, so it needs this.
+    ///
+    /// It is a separate call, outside the paused window, on purpose: the
+    /// ladder drives the compute engine's cold golden-context load on the very
+    /// card that scans out the screen, and doing that with the scanout parked
+    /// is how a boot lost the monitor. By here the card is state-loaded, the
+    /// screen is moving again, and a client that cannot bind yet simply
+    /// retries -- `ensure_ctx_for_pid` drops its reservation on failure, so
+    /// the next ioctl tries afresh. Returns one status line, empty when there
+    /// is nothing to say (no console GPU, no RM, ladder already built).
+    fn build_console_gr_ladder(&self) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Leave this GPU in a clean (cold) state before a system reboot. A GPU we
     /// brought up carries a live GSP-RM: WPR2 is locked in its VRAM and its
     /// SEC2/GSP falcons are running. Eclipse's `reboot` is a WARM reset -- it
