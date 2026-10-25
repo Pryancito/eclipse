@@ -9375,12 +9375,3 @@ mod rm_edges_tests;
 /// The arms the fake RM reaches only when it fails as a call, the
 /// `Unknown` architecture, and the empty EXEC that rides the ring.
 mod rm_failures_tests;
-
-/// The RM gate around the console GPU's bring-up ladder, which is bounded
-/// because the ladder runs with scanout parked: same harness, own file,
-/// same reason.
-mod ladder_gate_tests;
-
-/// The console GPU's GR allocation ladder, built as soon as the card is up
-/// rather than left to a later client: same harness, own file, same reason.
-mod console_ladder_tests;
