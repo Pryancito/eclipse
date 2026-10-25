@@ -305,18 +305,27 @@ fn build_first_real_nvidia_file() {
     // A compiler ignores a `-I` that does not exist, without a word, so this list
     // can drift away from the tree and nothing says so until a header turns up
     // missing somewhere else entirely. The entries are harmless; the silence is
-    // not. (At the pinned 580.178.04 four of them are already stale, among them
-    // `uproc/os/libos-v2.0.0/include`, where the tree now carries libos-v3.1.0.)
-    let stale = srcs_mk::missing_include_dirs(&include_dirs);
-    if !stale.is_empty() {
+    // not. The four `srcs_mk::UPSTREAM_STALE` paths are the exception: they are
+    // in NVIDIA's own `src/nvidia/Makefile` and in none of its released trees,
+    // nothing we compile needs a header from them, and naming them on every
+    // build is how a real one would get scrolled past.
+    let drift = srcs_mk::include_dir_drift(&include_dirs);
+    if !drift.missing.is_empty() {
         println!(
             "cargo:warning=nvidia-rm-sys: {} de los {} directorios de -I no existen en el \
              submodulo pinchado, asi que el compilador los ignora en silencio: {}",
-            stale.len(),
+            drift.missing.len(),
             include_dirs.len(),
-            stale.join(", ")
+            drift.missing.join(", ")
         );
     }
+    for back in &drift.back_again {
+        println!(
+            "cargo:warning=nvidia-rm-sys: {back} vuelve a existir en el submodulo; \
+             sobra de la tabla UPSTREAM_STALE de src/srcs_mk.rs"
+        );
+    }
+    srcs_mk::assert_leftovers_are_on_the_list(&include_dirs);
     for dir in &include_dirs {
         build.include(dir);
     }

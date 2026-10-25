@@ -42,6 +42,14 @@ pub fn boot_edid() -> Option<([u8; 128], u32)> {
     *BOOT_EDID.lock()
 }
 
+/// Tests only: put `edid` in the bootloader's place and hand back what was
+/// there, so a test that needs a boot EDID, or none, leaves the next test
+/// what it found.
+#[cfg(test)]
+pub(super) fn swap_boot_edid(edid: Option<([u8; 128], u32)>) -> Option<([u8; 128], u32)> {
+    core::mem::replace(&mut *BOOT_EDID.lock(), edid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -328,7 +328,7 @@ jobs:
           # thermal and battery files, the byte-rate formatter, and the
           # calendar the clock pill opens.
           cargo test --manifest-path tools/lunarbar/Cargo.toml
-          # eclipse-dbusd, the session message bus: the LAST standalone package
+          # eclipse-dbusd, the session message bus: another standalone package
           # in `tools/` that no cargo line named, and the one where it cost the
           # most -- it already had 34 tests and not one of them had ever run in
           # CI. `xtask` builds it best-effort too ("only dbus-daemon can serve
@@ -348,6 +348,22 @@ jobs:
           # /bin/sh (it is what unquotes the command line, and what the quoting
           # is tested against) and nothing else.
           cargo test --manifest-path tools/eclipse-dbusd/Cargo.toml
+          # eclipsefs-fuse, which mounts an EclipseFS image through FUSE so
+          # that fio can compare EclipseFS with ext4, xfs and btrfs through the
+          # same VFS (`scripts/eclipsefs-linux-bench.sh`). It keeps itself out
+          # of the kernel workspace on purpose, so that `fuser` and `libc` never
+          # reach the kernel build -- and that is exactly why no cargo line in
+          # this file reached it either: `default-members` does not cover it and
+          # neither does `-p`. It had no tests at all, and what it decides on
+          # its own is the whole translation a benchmark is read through: the
+          # errno a failure arrives as, the type `ls` prints, the inode number
+          # the kernel is told, and `st_blocks`. Reporting that last one in
+          # 4096-byte units instead of 512 would make every file look eight
+          # times smaller on disk, in the one tool whose output is a comparison
+          # against other filesystems. `fuser` is taken with
+          # `default-features = false`, so this builds and tests without libfuse
+          # present; only actually mounting needs it.
+          cargo test --manifest-path tools/eclipsefs-fuse/Cargo.toml
           # The kernel binary crate itself. Its `[[bin]]` section carried
           # `test = false`, so no job in this file ever compiled it as a test
           # target -- the same hole rboot was in, in the crate that owns the

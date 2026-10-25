@@ -206,6 +206,97 @@ fn gpu_compositor_requested_in(cmdline: &str) -> bool {
         || cmdline_has_in(cmdline, "nvidia.nouveau_uapi")
 }
 
+/// `/proc/gpuready` -- the kernel's read-only answer to "can a GL client use
+/// the console GPU yet?". Three answers: `ready`, `waiting`, `none`.
+const GPU_READY: &str = "/proc/gpuready";
+
+/// How long a GPU session is held back waiting for the console GPU. Generous
+/// because the thing being waited for is a GSP firmware boot, and cheap
+/// because it ends the instant the card is up -- the normal boot pays
+/// whatever is left of the bring-up, not this number.
+const GPU_READY_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// At most once per boot: a card that never comes up must not add this to
+/// every respawn of a compositor that is already failing.
+static GPU_WAITED: AtomicBool = AtomicBool::new(false);
+
+/// `nvidia.nogpuwait` -- start the compositor without waiting, the way every
+/// boot before this did.
+fn gpu_wait_disabled_in(cmdline: &str) -> bool {
+    cmdline_has_in(cmdline, "nvidia.nogpuwait")
+}
+
+/// What `/proc/gpuready`'s first line says, if the file is there at all.
+///
+/// `None` means there is nothing to wait for and the caller must start now:
+/// no such file (a kernel without it), an unreadable one, or a verdict this
+/// init does not know. Erring that way is deliberate -- the failure it
+/// prevents is a boot that never starts a desktop, which is worse than the
+/// one it allows, a desktop on pixman.
+fn gpuready_verdict(text: &str) -> Option<&str> {
+    let first = text.lines().next()?.trim();
+    let verdict = first.strip_prefix("gpuready:")?.trim();
+    match verdict {
+        "ready" | "waiting" | "none" => Some(verdict),
+        _ => None,
+    }
+}
+
+/// Hold a GPU-renderer session back until the console GPU can serve it.
+///
+/// The console GPU is brought up by a deferred kernel task, several seconds
+/// into a live session, and until this existed nothing told userspace when.
+/// wlroots gives its renderer two tries and then falls back to pixman FOR THE
+/// REST OF THE BOOT: on real hardware the second and last try failed less
+/// than a second before the GR ladder was ready, so a working card sat beside
+/// a desktop that had already given up on it. Waiting here costs a few
+/// seconds of boot once; not waiting costs the GPU for the whole session.
+fn wait_for_gpu_ready(name: &str) {
+    if GPU_WAITED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let cmdline = read_cmdline();
+    if gpu_wait_disabled_in(&cmdline) || !gpu_compositor_requested_in(&cmdline) {
+        return;
+    }
+    // Nothing to wait for: no file, or no console GPU on this box.
+    match fs::read_to_string(GPU_READY).ok().as_deref() {
+        Some(text) => match gpuready_verdict(text) {
+            None | Some("none") => return,
+            Some("ready") => return,
+            _ => {}
+        },
+        None => return,
+    }
+    let outcome = timed(
+        format!("{name}: wait for the console GPU to be usable"),
+        || {
+            wait_until(
+                GPU_READY_TIMEOUT,
+                || {
+                    fs::read_to_string(GPU_READY)
+                        .ok()
+                        .as_deref()
+                        .and_then(gpuready_verdict)
+                        .map(|v| v != "waiting")
+                        .unwrap_or(true)
+                },
+                shutdown_requested,
+            )
+        },
+    );
+    if outcome == Wait::TimedOut {
+        // Said once, because the consequence is a whole session on the CPU and
+        // the cause is in the kernel log, not here.
+        log(&format!(
+            "warning: {name}: the console GPU was still not usable after \
+             {GPU_READY_TIMEOUT:?} ({GPU_READY} says waiting); starting anyway, so \
+             the compositor will almost certainly fall back to pixman. See \
+             `dmesg | grep nouveau-uapi` and `cat {GPU_READY}`."
+        ));
+    }
+}
+
 /// Has a shutdown signal arrived? Every bounded wait polls this so a
 /// Ctrl-Alt-Del lands promptly: the handlers are installed WITHOUT `SA_RESTART`
 /// on purpose (see [`install_handler`]), and that only buys anything if the code
@@ -2137,6 +2228,12 @@ fn start_service(svc: &mut Service) {
                 wait_for_dir_settled(&path, Duration::from_secs(8), Duration::from_secs(1))
             });
         }
+    }
+    // Last of the waits, and the only one about the GPU: by here seatd and the
+    // input nodes are there, so the only thing left that the compositor needs
+    // and may not have yet is the card itself.
+    if matches!(svc.name.as_str(), "labwc" | "xorg") {
+        wait_for_gpu_ready(&svc.name);
     }
     // Name an unrunnable `exec =` on the console: the child that fails execve
     // cannot (see `exec_problem`). A missing x bit is also repaired in place,

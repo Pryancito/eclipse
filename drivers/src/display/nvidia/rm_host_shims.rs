@@ -232,13 +232,28 @@ extern "C" fn eclipse_rm_hdmi_audio(_a0: u32, _a1: u32, _a2: u32, _a3: u8, _a4: 
 extern "C" fn eclipse_rm_hwcursor_hide(_a0: u32) -> u32 {
     NV_ERR_NOT_SUPPORTED
 }
+/// The cursor image upload, as the `hwcursor` knob's third status says.
 #[no_mangle]
 extern "C" fn eclipse_rm_hwcursor_image(_a0: u32, _a1: *const u8, _a2: u32, _a3: u32) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+    let mut f = FAKE_RM.lock();
+    f.calls.push("hwcursor_image");
+    match f.hwcursor {
+        Some((_, _, image_status)) => image_status,
+        None => NV_ERR_NOT_SUPPORTED,
+    }
 }
+/// The display cursor ladder: the `hwcursor` knob's init status, and its
+/// head count written where `HwCursorInit::num_heads` is (the eleventh
+/// word; the ten status words before it are the caller's own fill).
 #[no_mangle]
-extern "C" fn eclipse_rm_hwcursor_init(_a0: u32, _a1: u32, _a2: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_hwcursor_init(_a0: u32, _a1: u32, out: *mut u8) -> u32 {
+    let mut f = FAKE_RM.lock();
+    f.calls.push("hwcursor_init");
+    let Some((init_status, num_heads, _)) = f.hwcursor else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    unsafe { (out as *mut u32).add(10).write_unaligned(num_heads) };
+    init_status
 }
 #[no_mangle]
 extern "C" fn eclipse_rm_hwcursor_move(_a0: i32, _a1: i32) -> u32 {
@@ -395,6 +410,7 @@ extern "C" fn eclipse_rm_hwflip_iso_builds() -> u64 {
 }
 #[no_mangle]
 extern "C" fn eclipse_rm_init_core() -> u32 {
+    FAKE_RM.lock().calls.push("init_core");
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
@@ -828,6 +844,9 @@ pub(super) struct FakeRm {
     /// capture the proc readers fold into their output, as the real RM's
     /// printf does between `capture_begin` and `capture_take`.
     pub narrates: bool,
+    /// The display cursor plane: `(init status, heads, image status)`;
+    /// `None` is a build without one (every call `NV_ERR_NOT_SUPPORTED`).
+    pub hwcursor: Option<(u32, u32, u32)>,
 }
 
 /// `ECLIPSE_CHAN_BUF_SIZE`: the channel's own buffer, pushbuffer and ring,
@@ -914,6 +933,7 @@ const EMPTY_RM: FakeRm = FakeRm {
     fail_ctx0_reset: false,
     intr_table: None,
     narrates: false,
+    hwcursor: None,
 };
 
 pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);

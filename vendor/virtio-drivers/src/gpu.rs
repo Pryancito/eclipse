@@ -1046,6 +1046,42 @@ mod tests {
         assert_eq!(flush[1].rect(), (0, 0, 320, 200));
     }
 
+    /// A transfer and a flush each carry the resource they act on, and the
+    /// device does nothing whatsoever for resource 0.
+    ///
+    /// Neither id was ever read back. The test above checks both rectangles
+    /// and the transfer's offset, and the rest of those two commands is bytes
+    /// nobody looked at -- including, in both structs, the padding word that
+    /// sits right after the id. Put the id behind that word and all 132 tests
+    /// still pass, with a driver that transfers the frame to nowhere and then
+    /// flushes nothing: a screen that never updates, which is the one fault
+    /// this driver exists to avoid.
+    #[test]
+    fn the_flush_pair_names_the_framebuffer_resource_and_not_resource_zero() {
+        let (mut gpu, control, cursor) = driver();
+        let screen = Screen::of(320, 200);
+        with_screen(&screen, control, cursor, || {
+            gpu.setup_framebuffer().expect("setup failed");
+            gpu.flush().expect("flush failed");
+        });
+        let seen = screen.requests();
+        let transfer = seen
+            .iter()
+            .find(|s| s.hdr_type == Command::TransferToHost2d as u32)
+            .expect("no transfer went out");
+        let flush = seen
+            .iter()
+            .find(|s| s.hdr_type == Command::ResourceFlush as u32)
+            .expect("no flush went out");
+        // TransferToHost2D: header, rect, offset (8 bytes), resource, pad.
+        assert_eq!(transfer.u32_at(48), RESOURCE_ID_FB, "transfer resource");
+        // ResourceFlush: header, rect, resource, pad.
+        assert_eq!(flush.u32_at(40), RESOURCE_ID_FB, "flush resource");
+        // And the word each id would land in with the two the other way round.
+        assert_eq!(transfer.u32_at(52), 0, "the transfer padding is not the id");
+        assert_eq!(flush.u32_at(44), 0, "the flush padding is not the id");
+    }
+
     #[test]
     fn a_damage_rectangle_transfers_from_where_it_starts_in_the_framebuffer() {
         // The offset is where the host reads the guest's pixels from, so getting
@@ -1151,5 +1187,43 @@ mod tests {
             QUEUE_CURSOR as u32,
             "the move was notified on the wrong queue"
         );
+    }
+
+    /// Nothing drove `setup_cursor` to the end: the only test that calls it
+    /// hands it an image of the wrong size and checks that the device was
+    /// never spoken to at all.
+    ///
+    /// So the three words that follow the position in `UpdateCursor` -- the
+    /// resource the shape lives in, and the two halves of the hot spot -- had
+    /// never reached a device in any test. Swapping the resource with `hot_x`
+    /// asks the device to draw the pointer from resource 4, which does not
+    /// exist, and leaves the hot spot at 0xdade; swapping the two halves of
+    /// the hot spot aims the pointer from the wrong pixel of its own image.
+    /// Both survive the whole suite, which is why the three numbers here are
+    /// deliberately different from one another.
+    #[test]
+    fn a_cursor_the_device_can_draw_carries_its_resource_and_its_hot_spot() {
+        let (mut gpu, control, cursor) = driver();
+        let screen = Screen::of(320, 200);
+        let shape = vec![0u8; (CURSOR_RECT.width * CURSOR_RECT.height * 4) as usize];
+        with_screen(&screen, control, cursor, || {
+            gpu.setup_cursor(&shape, 100, 50, 4, 12)
+                .expect("setup_cursor failed");
+        });
+        let seen = screen.requests();
+        let update = seen
+            .iter()
+            .find(|s| s.hdr_type == Command::UpdateCursor as u32)
+            .expect("no cursor update went out");
+        // UpdateCursor: header, CursorPos (scanout, x, y, pad), resource,
+        // hot x, hot y, pad.
+        assert_eq!(
+            (update.u32_at(28), update.u32_at(32)),
+            (100, 50),
+            "position"
+        );
+        assert_eq!(update.u32_at(40), RESOURCE_ID_CURSOR, "cursor resource");
+        assert_eq!(update.u32_at(44), 4, "hot x");
+        assert_eq!(update.u32_at(48), 12, "hot y");
     }
 }

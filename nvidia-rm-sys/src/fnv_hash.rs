@@ -6,8 +6,25 @@
 //! symbol, same as any other hard dependency on vendored code.
 use crate::types::{NvU32, NvU64, NvU8};
 
+#[cfg(target_os = "none")]
 extern "C" {
     fn fnv1Hash64(data: *const NvU8, data_len: NvU32) -> NvU64;
+}
+
+/// Hosted (libos) builds have no NVIDIA C to link (`build.rs` compiles it
+/// for `target_os = "none"` only), and `/proc/gpudbg` hashes two fixed
+/// strings through this on every read: the same FNV-1 (multiply, then
+/// xor; not FNV-1a) the vendored file computes, so the dump's "expect"
+/// line holds on a host test too.
+#[cfg(not(target_os = "none"))]
+#[allow(non_snake_case)]
+unsafe fn fnv1Hash64(data: *const NvU8, data_len: NvU32) -> NvU64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let bytes = core::slice::from_raw_parts(data, data_len as usize);
+    bytes
+        .iter()
+        .fold(OFFSET_BASIS, |h, b| h.wrapping_mul(PRIME) ^ u64::from(*b))
 }
 
 /// Safe wrapper around NVIDIA's real `fnv1Hash64`. Used as the first

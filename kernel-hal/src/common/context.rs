@@ -146,7 +146,12 @@ impl fmt::Display for X86TrapErrorCode {
             // register this time.
             if ec & 0b110 == 0b100 {
                 return f.write_str(
-                    " -- but this kernel never loads an LDT (no `lldt`, no                      `modify_ldt(2)`, so LDTR is null on every CPU and every                      selector it uses is a GDT one), so the error code itself                      is the evidence: the value the faulting instruction took                      as a segment selector was not one. Look for what wrote a                      segment register, or the stack slot a return reloads it                      from, rather than for a descriptor table entry",
+                    " -- but this kernel never loads an LDT (no `lldt`, no `modify_ldt(2)`, so \
+                     LDTR is null on every CPU and every selector it uses is a GDT one), so the \
+                     error code itself is the evidence: the value the faulting instruction took \
+                     as a segment selector was not one. Look for what wrote a segment register, \
+                     or the stack slot a return reloads it from, rather than for a descriptor \
+                     table entry",
                 );
             }
             return Ok(());
@@ -1178,6 +1183,94 @@ mod tests {
         assert!(!s.contains("no descriptor was involved"), "{}", s);
         let s = hint(11, 0);
         assert!(s.contains("not ruled out"), "{}", s);
+    }
+
+    /// Only the four vectors whose error code *is* a selector read it as one.
+    ///
+    /// That list is `SELECTOR_VECTORS`, and it is the manual's: #TS, #NP, #SS
+    /// and #GP. A #PF's code is a bitfield of its own and a #DF's is always
+    /// zero, so decoding either as a descriptor would invent a GDT entry out
+    /// of page-fault flags and send the reader looking for it.
+    #[test]
+    fn only_the_four_selector_vectors_read_their_code_as_a_descriptor() {
+        for vec in [10, 11, 12, 13] {
+            let s = hint(vec, 0x50);
+            assert!(s.contains("names a descriptor"), "vector {}: {}", vec, s);
+        }
+        // #DF, #PF, #CP, #CE, #VC and #SX: a code, but not a selector.
+        for vec in [8, 14, 17, 21, 29, 30] {
+            let s = hint(vec, 0x7);
+            assert!(!s.contains("names a descriptor"), "vector {}: {}", vec, s);
+            assert!(s.contains("error_code 0x7"), "vector {}: {}", vec, s);
+        }
+    }
+
+    /// Which table the code names, and that the IDT bit wins over the one
+    /// below it.
+    ///
+    /// bit1 (IDT) and bit2 (TI) are not independent: TI chooses between GDT
+    /// and LDT only *while IDT is clear*. A code with both set is an IDT
+    /// index, and reading it as an LDT one points at the wrong table.
+    #[test]
+    fn the_idt_bit_wins_over_the_table_indicator_below_it() {
+        let gdt = hint(13, 0x50);
+        assert!(gdt.contains("GDT index 10"), "{}", gdt);
+        let idt = hint(13, 0x1a);
+        assert!(idt.contains("IDT index 3"), "{}", idt);
+        // TI set as well: still the IDT, because IDT is read first.
+        let both = hint(13, 0x1e);
+        assert!(both.contains("IDT index 3"), "{}", both);
+        assert!(!both.contains("LDT"), "{}", both);
+    }
+
+    /// The index is the code with its three flag bits taken off, and bit 0 is
+    /// said out loud only when it is set.
+    #[test]
+    fn the_index_is_the_code_past_its_flags_and_ext_is_named_when_set() {
+        let plain = hint(11, 0x50);
+        assert!(plain.contains("GDT index 10"), "{}", plain);
+        assert!(!plain.contains("external"), "{}", plain);
+        // The same descriptor, this time refused over something outside the
+        // instruction stream.
+        let ext = hint(11, 0x51);
+        assert!(ext.contains("GDT index 10"), "{}", ext);
+        assert!(ext.contains("raised by an external event"), "{}", ext);
+    }
+
+    /// `0x4c` off the hardware: TI set with IDT clear is not a bad LDT entry,
+    /// because this kernel never loads an LDT, so the code itself is the
+    /// evidence that what the instruction took for a selector was not one.
+    ///
+    /// The verdict also has to read as prose. Its line continuations had been
+    /// flattened, and `\` is what eats the newline and the indentation after
+    /// it: without them the twenty spaces stayed *inside* the literal, so the
+    /// one message written to be read off a photograph of a panic screen
+    /// arrived with five holes in it. Nothing could notice, because nothing
+    /// had ever asked this branch for its text.
+    #[test]
+    fn a_table_indicator_is_read_as_a_wild_write_and_the_verdict_reads_as_prose() {
+        let s = hint(13, 0x4c);
+        assert!(s.contains("LDT index 9"), "{}", s);
+        assert!(s.contains("never loads an LDT"), "{}", s);
+        assert!(s.contains("was not one"), "{}", s);
+        assert!(
+            !s.contains("  "),
+            "a run of spaces where a line continuation belongs: {}",
+            s
+        );
+        // And it joins onto the decode above instead of running into it.
+        assert!(s.contains("index 9 -- but"), "{}", s);
+    }
+
+    /// A vector that pushes no code at all says so, instead of leaving a
+    /// reader to take the zero above for something the CPU supplied.
+    #[test]
+    fn a_vector_that_pushes_no_code_says_the_zero_is_a_placeholder() {
+        for vec in [0, 6, 7, 16, 19] {
+            let s = hint(vec, 0);
+            assert!(s.contains("pushes no error code"), "vector {}: {}", vec, s);
+            assert!(s.contains("placeholder"), "vector {}: {}", vec, s);
+        }
     }
 
     // ---- which register stopped being an address ---------------------------

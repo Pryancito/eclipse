@@ -31,6 +31,40 @@ extern crate std;
 // `rmapiLockAcquire` then always finds the lock free and its blocking
 // path stays unexercised.
 //
+// EVERY entry means every entry, bring-up included. The gate used to sit
+// only on the ioctl-time calls, and that was enough while the only RM work
+// outside them ran before userspace existed. It stopped being enough the
+// day the console GPU's bring-up moved into a deferred task: from the
+// desktop's point of view the card comes up in the MIDDLE of the session,
+// and for the ~8 s that takes, a compositor ioctl and the bring-up are two
+// threads inside the RM at once. With `os_get_current_thread` reporting the
+// same constant id for both -- which is deliberate, see
+// `set_rm_thread_id_provider`'s caller -- the RM reads the second caller as
+// the owner of the first one's locks and answers
+// `NV_ERR_INVALID_LOCK_STATE` (0x2f) to everything: a real boot had every
+// RM-backed ioctl between 11 s and 18 s fail that way, labwc gave up on its
+// renderer after two tries and spent the whole session on pixman.
+//
+// But the bring-up itself must never WAIT for the gate, and that asymmetry
+// is the design. Its early stages run inside a window the deferred task
+// opens by PARKING THE SCANOUT on a clock, and a wait in there -- of any
+// length, bounded or not -- pushes the ladder's SEC2 `STARTCPU` store out of
+// the hole that makes it safe. Two earlier attempts at this same fix did
+// exactly that, and both lost the monitor. So there are three kinds of entry
+// point here, and `tests/rm_gate.rs` holds the exact membership of each:
+//
+//   * `RmGate::lock()` -- waits. Everything that arrives from an ioctl or
+//     from a `/proc` read. The waiting IS the fix: it turns a 0x2f into a
+//     slow success while a bring-up stage is in flight.
+//   * `RmGate::try_lock()` -- never waits. The console bring-up chain, and
+//     only it. It takes the gate when free, which is the normal case and is
+//     what makes those ioctl callers wait at all; when it is not free it
+//     runs exactly as it ran before this gate existed. No worse than before
+//     is the floor here, not the goal.
+//   * neither -- the per-frame reads (`hwflip_ready`, `hwflip_pending`,
+//     `hwflip_iso_builds`, `gr_ready`) and the cursor move. None of them
+//     allocates, and a 0x2f from one of those costs a frame, not a session.
+//
 // NOT `lock::Mutex`: that is an IRQ-disabling spinlock, and RM calls can
 // legitimately take hundreds of milliseconds (`exec_submit_signaled`
 // polls its fence for up to 500 ms) -- holding an IRQ-off lock that long
@@ -72,6 +106,29 @@ impl RmGate {
         }
         RmGate
     }
+
+    /// Takes the gate ONLY if it is free. `None` means somebody else is
+    /// inside the RM right now and the caller must carry on WITHOUT it.
+    ///
+    /// This exists for one family of callers: the console GPU's bring-up
+    /// ladder, which runs inside a window the deferred task opens by PARKING
+    /// THE SCANOUT on a clock. Waiting in there -- for any length of time,
+    /// bounded or not -- is how two earlier attempts at this very fix lost
+    /// the monitor: the ladder reaches the SEC2 `STARTCPU` store outside the
+    /// hole that makes it safe. So the ladder never waits. It takes the gate
+    /// when it is free, which is the normal case and is what makes every
+    /// client ioctl of the next eight seconds WAIT instead of collecting
+    /// `NV_ERR_INVALID_LOCK_STATE`; and when it is not free it runs exactly
+    /// as it ran before this gate existed. Never better than the old
+    /// behaviour is the floor, not the goal.
+    pub(crate) fn try_lock() -> Option<RmGate> {
+        use core::sync::atomic::Ordering;
+        if RM_CALL_GATE.swap(true, Ordering::Acquire) {
+            None
+        } else {
+            Some(RmGate)
+        }
+    }
 }
 
 impl Drop for RmGate {
@@ -103,6 +160,7 @@ extern "C" {
 /// Constructs the real OBJSYS singleton and the RM resource server.
 /// Call exactly once, before the first `attach_gpu`.
 pub fn init_core() -> NV_STATUS {
+    let _gate = RmGate::try_lock();
     unsafe { eclipse_rm_init_core() }
 }
 
@@ -129,6 +187,7 @@ pub fn attach_gpu(
     bar2_phys: u64,
     bar2_len: u64,
 ) -> Result<u32, NV_STATUS> {
+    let _gate = RmGate::try_lock();
     let mut device_instance: NvU32 = 0;
     let status = unsafe {
         eclipse_rm_attach_gpu(
@@ -159,6 +218,7 @@ pub fn attach_gpu(
 /// from bindata already compiled into this crate). `device_instance` is
 /// the value returned by a prior successful `attach_gpu`.
 pub fn init_gsp(device_instance: u32, buf: &[u8]) -> Result<(), NV_STATUS> {
+    let _gate = RmGate::try_lock();
     let status = unsafe {
         eclipse_rm_init_gsp(
             device_instance,
@@ -197,6 +257,7 @@ extern "C" {
 
 /// Reads back the firmware-provided static config for an attached GPU.
 pub fn get_gsp_info(device_instance: u32) -> Result<GspInfo, NV_STATUS> {
+    let _gate = RmGate::try_lock();
     let mut info = GspInfo {
         gpu_name: [0; 64],
         gpu_short_name: [0; 64],
@@ -240,6 +301,7 @@ extern "C" {
 
 /// Runs the step-8 RM-API-control demo against the live GSP.
 pub fn rm_api_demo(device_instance: u32) -> Result<RmApiDemo, NV_STATUS> {
+    let _gate = RmGate::try_lock();
     let mut out = RmApiDemo {
         name_status: 0,
         name: [0; 64],
@@ -825,6 +887,7 @@ extern "C" {
 /// pushbuffer, submits via GP entry + GPPut + usermode doorbell, and
 /// CPU-polls both landing zones. Idempotent once fully successful.
 pub fn step18(device_instance: u32) -> Result<GrLaunch, NV_STATUS> {
+    let _gate = RmGate::lock();
     let mut out = GrLaunch {
         lookup_status: 0xFFFF_FFFF,
         map_status: 0xFFFF_FFFF,
@@ -880,6 +943,7 @@ extern "C" {
 /// SM75 EXIT kernel, submits it via SEND_PCAS on the step-17/18 channel, and
 /// CPU-polls the QMD RELEASE0 semaphore. Idempotent once the semaphore lands.
 pub fn step19(device_instance: u32) -> Result<GrCompute, NV_STATUS> {
+    let _gate = RmGate::lock();
     let mut out = GrCompute {
         lookup_status: 0xFFFF_FFFF,
         map_status: 0xFFFF_FFFF,
@@ -942,6 +1006,7 @@ extern "C" {
 /// immediates on the proven step-19 QMD harness. Idempotent once the
 /// RELEASE0 semaphore AND the stored value verify.
 pub fn step20(device_instance: u32) -> Result<GrStore, NV_STATUS> {
+    let _gate = RmGate::lock();
     let mut out = GrStore {
         lookup_status: 0xFFFF_FFFF,
         map_status: 0xFFFF_FFFF,
@@ -1011,6 +1076,7 @@ extern "C" {
 /// Runs step-21: 32-thread compute kernel with per-thread verification.
 /// Idempotent once RELEASE0 lands and all 32 slots verify.
 pub fn step21(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
+    let _gate = RmGate::lock();
     let mut out = GrThreads {
         lookup_status: 0xFFFF_FFFF,
         map_status: 0xFFFF_FFFF,
@@ -1056,6 +1122,7 @@ extern "C" {
 /// all 34 SMs), out[gid] = gid*3+7, CPU-verified per slot. Same result
 /// shape as step-21. Idempotent once RELEASE0 + all 2176 slots verify.
 pub fn step22(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
+    let _gate = RmGate::lock();
     let mut out = GrThreads {
         lookup_status: 0xFFFF_FFFF,
         map_status: 0xFFFF_FFFF,
@@ -1093,6 +1160,7 @@ pub fn step22(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
 /// real global loads (LDG), CPU-verified per element. Reuses the GrThreads
 /// result shape (matchCount over 32). Idempotent once release+verify pass.
 pub fn step23(device_instance: u32) -> Result<GrThreads, NV_STATUS> {
+    let _gate = RmGate::lock();
     let mut out = GrThreads {
         lookup_status: 0xFFFF_FFFF,
         map_status: 0xFFFF_FFFF,
@@ -1157,6 +1225,7 @@ extern "C" {
 /// chains, timed with the GPU PTIMER. Idempotent (cached after the first
 /// run). Requires step17 first.
 pub fn bench(device_instance: u32) -> Result<GrBench, NV_STATUS> {
+    let _gate = RmGate::lock();
     let mut out = GrBench {
         lookup_status: 0xFFFF_FFFF,
         map_status: 0xFFFF_FFFF,
@@ -1227,6 +1296,7 @@ unsafe fn eclipse_rm_edid(_device_instance: NvU32, _out: *mut GrEdid) -> NV_STAT
 /// EDID of the first connected one. Read-only (never programs the display
 /// engine). Requires step16 first.
 pub fn edid(device_instance: u32) -> Result<GrEdid, NV_STATUS> {
+    let _gate = RmGate::lock();
     let mut out = GrEdid {
         alloc_status: 0xFFFF_FFFF,
         supported_status: 0xFFFF_FFFF,
@@ -1305,6 +1375,7 @@ pub fn hdmi_audio(
     hdmi_mask: u32,
     force: bool,
 ) -> Result<HdmiAudioOut, NV_STATUS> {
+    let _gate = RmGate::lock();
     let mut out = HdmiAudioOut::default();
     let status = unsafe {
         eclipse_rm_hdmi_audio(
@@ -1324,6 +1395,7 @@ pub fn hdmi_audio(
 
 /// Fetches the GSP-reported interrupt kernel table (boxed: ~2 KiB).
 pub fn intr_table(device_instance: u32) -> Result<alloc::boxed::Box<IntrTable>, NV_STATUS> {
+    let _gate = RmGate::lock();
     let mut out = alloc::boxed::Box::new(IntrTable {
         ctrl_status: 0,
         table_len: 0,
@@ -1360,6 +1432,7 @@ extern "C" {
 /// Runs gpumgrStatePreInitGpu / StateInitGpu / StateLoadGpu on an attached,
 /// GSP-booted GPU -- the rest of the real RmInitAdapter sequence.
 pub fn state_init(device_instance: u32) -> Result<StateInitResult, NV_STATUS> {
+    let _gate = RmGate::try_lock();
     let mut out = StateInitResult {
         pre_init_status: 0xFFFF_FFFF,
         init_status: 0xFFFF_FFFF,
@@ -1746,6 +1819,7 @@ pub fn mark_console_gpu(
     console_size: u64,
     console_at_bar1_base: bool,
 ) -> Result<(), NV_STATUS> {
+    let _gate = RmGate::try_lock();
     let status = unsafe {
         eclipse_rm_mark_console_gpu(device_instance, console_size, console_at_bar1_base as u8)
     };
@@ -1759,6 +1833,7 @@ pub fn mark_console_gpu(
 /// Runs the step-10 CE memset/copy + readback-verify test against the
 /// state-loaded GPU (requires a successful `state_init` first).
 pub fn step10(device_instance: u32) -> Result<Step10Result, NV_STATUS> {
+    let _gate = RmGate::try_lock();
     let mut out = Step10Result {
         ce_utils_status: 0xFFFF_FFFF,
         alloc_a_status: 0xFFFF_FFFF,

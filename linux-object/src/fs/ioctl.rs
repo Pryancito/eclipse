@@ -905,6 +905,13 @@ pub const KDMKTONE: usize = 0x4B30;
 pub const KT_LATIN: u16 = 0;
 pub const KT_FN: u16 = 1;
 pub const KT_SPEC: u16 = 2;
+/// Cursor keys: the table `K_UP`, `K_DOWN`, `K_LEFT` and `K_RIGHT` live in.
+pub const KT_CUR: u16 = 6;
+/// Modifiers: the table `K_SHIFT`, `K_CTRL`, `K_ALT` and `K_ALTGR` live in.
+///
+/// These two were declared a fourth time inside `kdgkbent_value`, where no
+/// test could name them. They belong here with the rest of the family.
+pub const KT_SHIFT: u16 = 7;
 
 /// Linux `struct kbentry` — one keymap cell for `KDGKBENT`.
 #[repr(C)]
@@ -2047,6 +2054,8 @@ mod request_number_tests {
         assert_eq!(KT_LATIN, 0);
         assert_eq!(KT_FN, 1);
         assert_eq!(KT_SPEC, 2);
+        assert_eq!(KT_CUR, 6);
+        assert_eq!(KT_SHIFT, 7);
         // `VT_SETMODE` hands in a `vt_mode` whose first byte is one of these,
         // and `VT_RELDISP` answers an acquire with `VT_ACKACQ`.
         assert_eq!(VT_AUTO, 0x00);
