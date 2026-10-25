@@ -307,6 +307,10 @@ fn a_poll_with_the_watchdog_due_schedules_it() {
     empty_queue();
 }
 
+/// The `due` check in the poll is an optimisation, not a decision: it saves
+/// taking the hw lock a second time, and `schedule_watchdog` re-tests the very
+/// same predicate (`now < next` is the exact complement of `next <= now`). So
+/// what this holds is the behaviour, not that branch.
 #[test]
 fn a_poll_with_the_watchdog_not_due_leaves_it_alone() {
     let iface = at(1_000);
@@ -571,9 +575,31 @@ fn the_buffer_of_a_runt_is_too_small_to_be_worth_keeping() {
     );
 }
 
+/// The cap is a limit on how much RX memory the driver keeps idle, so it has
+/// to hold against a buffer that did NOT come out of the pool.
+///
+/// Delivering one frame into a full pool does not test it: `take_rx_frame`
+/// pops a buffer before the frame is built, so the pool is one short by the
+/// time the recycle comes back and the cap is never reached. Two frames are
+/// taken out first and the pool filled while both are still in flight, so
+/// each recycle really does arrive at a pool of `RX_FRAME_POOL_CAP`.
 #[test]
 fn a_full_pool_takes_no_more_buffers() {
     let iface = at(1_000);
+    let first = ipv4_udp_frame(&[0x5a; 64]);
+    let second = ipv4_udp_frame(&[0xa5; 64]);
+    {
+        let hw = iface.driver.hw.lock();
+        hw_deliver(&hw, 0, &first);
+    }
+    let mut driver = iface.driver.clone();
+    let (rx_a, _tx_a) = driver.receive().expect("the first frame did not come out");
+    {
+        let hw = iface.driver.hw.lock();
+        hw_deliver(&hw, 1, &second);
+    }
+    let (rx_b, _tx_b) = driver.receive().expect("the second frame did not come out");
+
     {
         let mut hw = iface.driver.hw.lock();
         hw.rx_frame_pool.clear();
@@ -581,8 +607,10 @@ fn a_full_pool_takes_no_more_buffers() {
             hw.rx_frame_pool.push(Vec::with_capacity(128));
         }
     }
-    let frame = ipv4_udp_frame(&[0x5a; 64]);
-    assert_eq!(round_trip_one_frame(&iface, 0, &frame), frame);
+    for rx in [rx_a, rx_b] {
+        rx.consume(Instant::from_micros(0), |_buf| Ok(()))
+            .expect("the stack refused the frame");
+    }
     assert_eq!(
         iface.driver.hw.lock().rx_frame_pool.len(),
         RX_FRAME_POOL_CAP,
@@ -590,10 +618,14 @@ fn a_full_pool_takes_no_more_buffers() {
     );
 }
 
-/// The other side of the pool: a recycled buffer is reused, and grown when the
-/// next frame is longer than the one it held.
+/// The other side of the pool: a recycled buffer is reused, and a longer frame
+/// still comes out whole out of a buffer that held a shorter one.
+///
+/// Not a test of `take_rx_frame`'s `reserve`: the `extend_from_slice` right
+/// after it reserves the same amount on an empty buffer, so that call is an
+/// allocation the Vec would make anyway.
 #[test]
-fn a_pooled_buffer_is_reused_and_grown_for_a_longer_frame() {
+fn a_pooled_buffer_is_reused_and_a_longer_frame_still_comes_out_whole() {
     let iface = at(1_000);
     iface.driver.hw.lock().rx_frame_pool.clear();
     let short = ipv4_udp_frame(&[0x11; 64]);
