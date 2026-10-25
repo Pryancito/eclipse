@@ -727,3 +727,80 @@ fn the_ladder_a_bind_asks_about_is_the_one_on_its_own_card() {
         "asked about the card doing the bind"
     );
 }
+
+/// The replace a MAP does is scoped to the VA SPACE, not to the pid -- and in
+/// a shared context 0 those are different sets.
+///
+/// Two processes whose `ctx_alloc` is refused both fall back to context 0, the
+/// shared boot ladder, so they share ONE VA space. Every Mesa VA heap starts
+/// at the same top address (`0x3ffffff000`), so the second one to bind asks
+/// for a page the first one is still holding. Filtering the replace by
+/// `owner_pid` skips that live mapping, the RM is then asked for a fixed-VA
+/// reservation over a live range, and its eheap answers `0x51`
+/// (`virtmemAllocResources: VA Space alloc failed!`) -- which the arm turns
+/// into EIO, which is `vm_bind failed: Input/output error` and a dead
+/// `vkCreateDevice`. The fake RM refuses an overlapping fixed VA in the same
+/// context exactly as the eheap does, so this test fails the same way.
+#[test]
+fn in_a_shared_context_a_map_replaces_the_other_processs_mapping_at_the_same_va() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    // No context of their own: both land on ctx 0, together.
+    FAKE_RM.lock().fail_ctx_alloc = true;
+    // The address every Mesa VA heap starts at, and the size NVK's first
+    // bind asks for.
+    const VA: u64 = 0x3f_ffff_f000;
+    const PAGE: u64 = 0x1000;
+
+    let ha = gem_new_rm(&gpu, PAGE, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, VA, PAGE)]), Ok(0));
+    assert_eq!(ctx_of(&gpu, A), None, "A fell back to ctx 0");
+    let (h_virt_a, h_mem_a) = {
+        let f = FAKE_RM.lock();
+        assert_eq!(f.maps.len(), 1);
+        assert_eq!(f.maps[0].1, 0, "ctx 0, the shared ladder's VA space");
+        (f.maps[0].0, f.maps[0].2)
+    };
+
+    // B, a different process in the SAME VA space, asks for the same page.
+    let hb = gem_new_rm(&gpu, PAGE, nv::NOUVEAU_GEM_DOMAIN_GART, B)
+        .unwrap()
+        .handle;
+    assert_eq!(
+        vm_bind_ops(&gpu, B, &mut [map(hb, VA, PAGE)]),
+        Ok(0),
+        "B's bind must replace A's, not die on the RM's 0x51"
+    );
+    assert_eq!(ctx_of(&gpu, B), None, "B fell back to ctx 0 too");
+    {
+        let f = FAKE_RM.lock();
+        assert_eq!(f.maps.len(), 1, "one reservation per VA per VA space");
+        assert_ne!(f.maps[0].0, h_virt_a, "A's range was released first");
+        assert_ne!(f.maps[0].2, h_mem_a, "B's object is the one mapped now");
+    }
+    {
+        let maps = gpu.nouveau_vm_mappings.lock();
+        let m = maps.iter().find(|m| m.va == VA).expect("recorded");
+        assert_eq!(m.owner_pid, B, "the last binder owns it");
+        assert_eq!(m.gem_handle, hb, "B's object");
+        assert_eq!(maps.iter().filter(|m| m.va == VA).count(), 1);
+    }
+
+    // The other direction: an explicit UNMAP is a statement about what THIS
+    // process bound, so A tearing that range down must not take B's live
+    // mapping with it.
+    assert_eq!(vm_bind_ops(&gpu, A, &mut [unmap(VA, PAGE)]), Ok(0));
+    {
+        let f = FAKE_RM.lock();
+        assert_eq!(f.maps.len(), 1, "B's mapping is still live");
+        assert_ne!(f.maps[0].2, h_mem_a);
+    }
+
+    gpu.nouveau_release_process(A);
+    gpu.nouveau_release_process(B);
+    assert!(FAKE_RM.lock().maps.is_empty());
+    assert_eq!(FAKE_RM.lock().bad, 0);
+}

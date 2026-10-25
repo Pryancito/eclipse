@@ -265,6 +265,24 @@ static BOOT_FB_INFO: Mutex<Option<BootFbInfo>> = Mutex::new(None);
 /// `NvidiaGpu::debug_dump()`; only the first call actually invokes RM.
 static RM_CORE_INIT_STATUS: Mutex<Option<u32>> = Mutex::new(None);
 
+/// Whose mappings a VA-range operation may take: the whole VA space, or only
+/// the calling process's.
+///
+/// The VA space is the CONTEXT, not the process. While every process has a
+/// context of its own the two coincide, and the fallback path is exactly
+/// where they do not -- a process whose `ctx_alloc` fails binds into context
+/// 0 alongside everyone else that fell back, and then "mine" by pid is a
+/// strictly smaller set than "mine" by VA space.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VaScope {
+    /// Everything live in this context's VA space, whoever bound it. What a
+    /// MAP's replace semantics mean: the RM holds one reservation per VA per
+    /// VA space, so that is the set that can collide with a new one.
+    WholeVaSpace,
+    /// Only what this process bound. What an explicit UNMAP means.
+    CallersOwn,
+}
+
 /// Set before invoking RM init, never cleared. If it's already set while
 /// `RM_CORE_INIT_STATUS` is still `None`, a previous attempt started and
 /// DIED mid-initialization (bring-up faults kill the reading task, not
@@ -8509,11 +8527,16 @@ impl NvidiaGpu {
         owner_pid: u64,
         addr: u64,
         range: u64,
+        scope: VaScope,
         context: &str,
     ) -> usize {
         let end = addr.wrapping_add(range);
         let taken = self.take_vm_mappings(|m| {
-            m.owner_pid == owner_pid && m.va < end && addr < m.va.wrapping_add(m.size)
+            let mine = match scope {
+                VaScope::WholeVaSpace => m.ctx_idx == ctx_idx,
+                VaScope::CallersOwn => m.owner_pid == owner_pid,
+            };
+            mine && m.va < end && addr < m.va.wrapping_add(m.size)
         });
         let count = taken.len();
         // (gem_handle, va, size, bo_offset, pte_kind) of every kept part.
@@ -8923,17 +8946,28 @@ impl NvidiaGpu {
                 // -13 in both labwc renderers). The displaced owner cannot
                 // be executing anyway: EXEC is restricted to the RM
                 // channel's owner, so the last binder is the one that runs.
-                // Scoped to THIS process's context: two clients each have
-                // their own VA space, so the SAME VA in a different context
-                // is not a conflict -- replacing it would corrupt the other
-                // client. Only the overlapped part of an old mapping goes;
-                // what lies outside the range stays mapped (gpuvm's REMAP).
+                // Scoped to the VA SPACE, which is the context -- NOT to
+                // the calling process. Those are the same thing only while
+                // every process has a context of its own, and the fallback
+                // path is precisely where they are not: a process whose
+                // `ctx_alloc` fails binds into context 0, the shared boot
+                // ladder, together with everyone else that fell back. Then
+                // the previous binder at this VA is a DIFFERENT pid in the
+                // SAME VA space, a pid filter skips it, and the RM refuses
+                // the fixed-VA reservation it is still holding -- which on
+                // real hardware is `virtmemAllocResources: VA Space alloc
+                // failed! Status Code: 0x51` for one page at 0x3ffffff000,
+                // over and over, because every Mesa VA heap starts at that
+                // same top address. Only the overlapped part of an old
+                // mapping goes; what lies outside the range stays mapped
+                // (gpuvm's REMAP).
                 let replaced = self.split_vm_mappings(
                     device_instance,
                     ctx_idx,
                     owner_pid,
                     op.addr,
                     op.range,
+                    VaScope::WholeVaSpace,
                     &alloc::format!(
                         "VM_BIND MAP replace VA={:#x}+{:#x} (this ctx, last binder wins)",
                         op.addr,
@@ -9043,12 +9077,18 @@ impl NvidiaGpu {
                 // VAs it never bound, and treats a refusal as "leak the VA".
                 // Only the range asked for goes: a mapping the range cuts
                 // through keeps its head and its tail (gpuvm's REMAP).
+                // An explicit UNMAP takes only the CALLER'S OWN mappings,
+                // unlike the replace above: tearing down a range is a
+                // statement about what this process bound, and in a shared
+                // context 0 another process's mapping at the same VA is
+                // still live for it.
                 self.split_vm_mappings(
                     device_instance,
                     ctx_idx,
                     owner_pid,
                     op.addr,
                     op.range,
+                    VaScope::CallersOwn,
                     &alloc::format!("VM_BIND UNMAP VA={:#x}+{:#x}", op.addr, op.range),
                 );
                 Ok(())
