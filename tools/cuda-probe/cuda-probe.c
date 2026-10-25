@@ -30,7 +30,8 @@
 //             memory mapped into it piece by piece (cuMemCreate, cuMemMap,
 //             cuMemSetAccess), written by a kernel across the pieces.
 //   kernels   elementwise over many blocks, a block reduction (shuffles and
-//             shared memory), 64 KiB of dynamic shared memory, int8 dot
+//             shared memory), 64 KiB of dynamic shared memory, local memory
+//             (a per-thread array indexed at run time), atomics, int8 dot
 //             products (dp4a, a decoded token), int8 and f16 tensor cores
 //             (mma, a prompt), and a CUDA graph (how llama.cpp decodes).
 //   latency   what a launch costs, and a launch and the wait for it.
@@ -652,6 +653,53 @@ static int deep_shared(struct deep *g, CUdevice dev)
     return 1;
 }
 
+// Local memory: a million threads, each through a 64-word array of its own
+// that the kernel indexes at run time.
+static int deep_local(struct deep *g)
+{
+    enum { N = 1 << 20 };
+    deep_begin("local");
+    CUfunction fn;
+    unsigned step = 5;
+    void *args[] = {&g->c, &step};
+    if (!deep_fn(g, "local_mem", &fn) || !deep_run(g, fn, N / DEEP_THREADS, DEEP_THREADS, 0, args, NULL) ||
+        !deep_call("DtoH", d_dtoh(g->hc, g->c, N * 4)))
+        return 0;
+    for (unsigned t = 0; t < N; t++) {
+        unsigned arr[64], sum = 0;
+        for (unsigned i = 0; i < 64; i++)
+            arr[(i * step) & 63] = t * 2654435761u + i;
+        for (unsigned i = 0; i < 64; i++)
+            sum = sum * 31u + arr[(i * 7u) & 63];
+        g->want[t] = sum;
+    }
+    if (!deep_same(g->hc, g->want, N))
+        return 0;
+    printf("  local      64 words per thread  ok\n");
+    return 1;
+}
+
+// A million atomic adds from every block into 64 counters.
+static int deep_atomics(struct deep *g)
+{
+    enum { N = DEEP_BLOCKS * DEEP_THREADS, BUCKETS = 64 };
+    deep_begin("atomics");
+    CUfunction fn;
+    unsigned buckets = BUCKETS;
+    void *args[] = {&g->c, &buckets};
+    memset(g->want, 0, BUCKETS * 4);
+    if (!deep_fn(g, "atomic_count", &fn) || !deep_call("HtoD", d_htod(g->c, g->want, BUCKETS * 4)) ||
+        !deep_run(g, fn, DEEP_BLOCKS, DEEP_THREADS, 0, args, NULL) ||
+        !deep_call("DtoH", d_dtoh(g->hc, g->c, BUCKETS * 4)))
+        return 0;
+    for (unsigned t = 0; t < N; t++)
+        g->want[t % BUCKETS] += (t & 0xff) + 1;
+    if (!deep_same(g->hc, g->want, BUCKETS))
+        return 0;
+    printf("  atomics    1M adds into 64 counters  ok\n");
+    return 1;
+}
+
 static int deep_dp4a(struct deep *g)
 {
     enum { N = 1 << 20 };
@@ -837,7 +885,7 @@ static int deep_gpu(CUdevice dev, int index, int sleeping)
     }
     ok = ok && deep_copy(&g) && deep_pinned(&g) && deep_registered(&g) && deep_file(&g) && deep_axpy(&g) &&
          deep_vmm(&g, dev) && deep_reduce(&g) &&
-         deep_shared(&g, dev) && deep_dp4a(&g) && deep_mma(&g, "mma_i8", "mma int8", 0) &&
+         deep_shared(&g, dev) && deep_local(&g) && deep_atomics(&g) && deep_dp4a(&g) && deep_mma(&g, "mma_i8", "mma int8", 0) &&
          deep_mma(&g, "mma_f16", "mma f16", 1) && deep_graph(&g) && deep_latency(&g) &&
          (!sleeping || deep_sleeping(&g));
     alarm(0);

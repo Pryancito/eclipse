@@ -67,6 +67,30 @@ extern "C" __global__ void big_shared(u32 *out, u32 words)
     out[block_id() * n + t] = sum;
 }
 
+// An array each thread indexes at run time, which the compiler cannot keep
+// in registers, so it lives in local memory: per-thread memory libcuda sets
+// up for each context. llama.cpp's larger kernels spill registers there.
+// `step` is odd, so the writes reach every element.
+extern "C" __global__ void local_mem(u32 *out, u32 step)
+{
+    u32 arr[64];
+    u32 t = block_id() * block_dim() + lane_id();
+    for (u32 i = 0; i < 64; i++)
+        arr[(i * step) & 63] = t * 2654435761u + i;
+    u32 sum = 0;
+    for (u32 i = 0; i < 64; i++)
+        sum = sum * 31u + arr[(i * 7u) & 63];
+    out[t] = sum;
+}
+
+// Every thread adds into one of a few counters in global memory: atomics,
+// which llama.cpp's argmax and its stream-k fix-up go through.
+extern "C" __global__ void atomic_count(u32 *counters, u32 buckets)
+{
+    u32 t = block_id() * block_dim() + lane_id();
+    __nvvm_atom_add_gen_i((int *)&counters[t % buckets], (int)(t & 0xff) + 1);
+}
+
 // Four int8 products and a sum in one instruction (dp4a): llama.cpp's
 // quantized matrix-vector kernels (mmvq), which every decoded token runs.
 extern "C" __global__ void dot_i8(int *out, const int *a, const int *b, u32 n)
