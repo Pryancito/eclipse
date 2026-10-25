@@ -9,6 +9,7 @@ use super::crtc_sequence_tests::{get_sequence, queue};
 use super::gl_client_sequence_tests::Client;
 use super::*;
 use crate::fs::devfs::kms_emu::{self, EmuGpu};
+use core::convert::TryInto;
 
 const RELATIVE: u32 = 0x1;
 
@@ -420,6 +421,68 @@ fn a_wait_the_crtc_goes_off_under_ends_with_the_count_there_is() {
     req.sequence = far;
     assert_eq!(
         c.ioctl(DRM_IOCTL_WAIT_VBLANK, &mut req),
+        Err(FsError::InvalidParam)
+    );
+    drop(off);
+    assert!(wait(&c, RELATIVE, 0).is_ok(), "on again");
+}
+
+/// The events queued for a vblank ahead -- `WAIT_VBLANK` in its event
+/// form and `CRTC_QUEUE_SEQUENCE` -- arrive the moment the CRTC goes
+/// off, each with the count there is, not with the vblank they named:
+/// `drm_crtc_vblank_off` sends them at once ("Sending premature vblank
+/// event on disable"), since a pipe that is off has no vblank coming.
+/// Here they kept waiting, and a client paced on the event waited with
+/// them for as long as the pipe stayed off.
+#[test]
+fn the_crtc_going_off_delivers_the_queued_events_at_once() {
+    let _screen = kms_emu::attach(32, 8);
+    let c = Client::open(0);
+    let crtc = drm::SYNTH_CRTC_ID;
+    let now = wait(&c, RELATIVE, 0).expect("now");
+    let asked = wait(&c, RELATIVE | _DRM_VBLANK_EVENT, 1_000).expect("the event form");
+    let queued = queue(&c, crtc, RELATIVE, 1_000, 0x5EC0_0FF0).expect("queued");
+    assert!(
+        (asked.wrapping_sub(now) as i32) >= 1_000 && queued >= asked as u64,
+        "both named a vblank far ahead: {} and {} at {}",
+        asked,
+        queued,
+        now
+    );
+    assert!(
+        !c.file_state().has_events(),
+        "an event before its vblank, the pipe on"
+    );
+    let off = CrtcOff::now();
+    let now2 = drm::vblank_seq_now();
+    let mut buf = [0u8; 96];
+    assert_eq!(
+        c.read_events(&mut buf),
+        Ok(64),
+        "the two events, at once, and nothing else"
+    );
+    let le32 = |at: usize| u32::from_ne_bytes(buf[at..at + 4].try_into().expect("4 bytes"));
+    let le64 = |at: usize| u64::from_ne_bytes(buf[at..at + 8].try_into().expect("8 bytes"));
+    assert_eq!(le32(0), 1, "DRM_EVENT_VBLANK");
+    let seq = le32(24);
+    assert!(
+        (seq.wrapping_sub(now) as i32) >= 0 && (now2.wrapping_sub(seq) as i32) >= 0,
+        "the vblank event carries {}, not a count in {}..{}",
+        seq,
+        now,
+        now2
+    );
+    assert!(
+        (asked.wrapping_sub(seq) as i32) > 0,
+        "the vblank asked for never came"
+    );
+    assert_eq!(le32(32), 3, "DRM_EVENT_CRTC_SEQUENCE");
+    assert_eq!(le64(40), 0x5EC0_0FF0, "its user_data");
+    assert_eq!(le64(56), seq as u64, "the same count");
+    // Nothing more comes: the pipe is off, and new requests are EINVAL.
+    assert!(!c.file_state().has_events());
+    assert_eq!(
+        wait(&c, RELATIVE | _DRM_VBLANK_EVENT, 1),
         Err(FsError::InvalidParam)
     );
     drop(off);

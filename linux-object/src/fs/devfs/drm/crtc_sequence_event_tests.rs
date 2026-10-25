@@ -97,3 +97,109 @@ fn the_event_names_the_vblank_in_nanoseconds_waits_for_it_and_dies_with_its_file
     assert_eq!(pending_sequence_jobs(), 0, "the job outlived its file");
     DRM_TIMER_ARMED.store(false, Ordering::Release);
 }
+
+/// The CRTC back on when dropped, panic or not: a failed assertion must
+/// not leave the next test on a dark pipe.
+struct CrtcOn;
+
+impl Drop for CrtcOn {
+    fn drop(&mut self) {
+        set_crtc_blanked(false);
+    }
+}
+
+fn pending_jobs() -> (usize, usize, usize) {
+    let q = PENDING_DRM_TIMERS.lock();
+    let count = |f: fn(&PendingDrmTimer) -> bool| q.iter().filter(|j| f(j)).count();
+    (
+        count(|j| matches!(j, PendingDrmTimer::Flip { .. })),
+        count(|j| matches!(j, PendingDrmTimer::Vblank { .. })),
+        count(|j| matches!(j, PendingDrmTimer::Sequence { .. })),
+    )
+}
+
+/// The CRTC going off (`drm_crtc_vblank_off`) sends the vblank and
+/// sequence events still waiting for their vblank, at once and with the
+/// count there is ("Sending premature vblank event on disable"), to the
+/// fd that queued each; a flip completion stays queued (the function
+/// walks only `vblank_event_list`). Only the transition sends: a pipe
+/// already off sends nothing more.
+#[test]
+fn the_crtc_going_off_sends_the_waiting_events_with_the_count_there_is() {
+    let _serialised = super::test_globals::lock();
+    PENDING_DRM_TIMERS.lock().clear();
+    set_crtc_blanked(false);
+    let _on_again = CrtcOn;
+    let file = DrmFileState::new();
+    let other = DrmFileState::new();
+    let seq_before = vblank_seq_now();
+    let far = seq_before.wrapping_add(1_000);
+    {
+        let mut q = PENDING_DRM_TIMERS.lock();
+        q.push_back(PendingDrmTimer::Vblank {
+            signal: 0x0FF0_0001,
+            due_seq: far,
+            file: Arc::downgrade(&file),
+        });
+        q.push_back(PendingDrmTimer::Flip {
+            crtc_id: SYNTH_CRTC_ID,
+            user_data: 0x0FF0_0002,
+            file: Arc::downgrade(&file),
+            event: true,
+            out_fence: None,
+        });
+        q.push_back(PendingDrmTimer::Sequence {
+            user_data: 0x0FF0_0003,
+            due_seq: far,
+            file: Arc::downgrade(&file),
+        });
+    }
+    assert_eq!(pending_jobs(), (1, 1, 1));
+
+    set_crtc_blanked(true);
+    let seq_after = vblank_seq_now();
+    assert_eq!(
+        pending_jobs(),
+        (1, 0, 0),
+        "the vblank and sequence jobs leave the queue, the flip stays"
+    );
+    assert!(!other.has_events(), "another file's fd got an event");
+    let mut buf = [0u8; 96];
+    let EventRead::Read(n) = file.read_events(&mut buf) else {
+        panic!("the events did not reach the fd");
+    };
+    assert_eq!(n, 64, "the vblank event and the sequence event, no flip");
+    // The vblank event, with the count there is.
+    assert_eq!(le32(&buf, 0), 1, "DRM_EVENT_VBLANK");
+    assert_eq!(le64(&buf, 8), 0x0FF0_0001, "its user_data");
+    let seq = le32(&buf, 24);
+    assert!(
+        (seq.wrapping_sub(seq_before) as i32) >= 0 && (seq_after.wrapping_sub(seq) as i32) >= 0,
+        "vblank sequence {} outside {}..{}",
+        seq,
+        seq_before,
+        seq_after
+    );
+    assert!(
+        (far.wrapping_sub(seq) as i32) > 0,
+        "the vblank asked for never came"
+    );
+    // The sequence event, with the same count.
+    assert_eq!(le32(&buf, 32), 3, "DRM_EVENT_CRTC_SEQUENCE");
+    assert_eq!(le64(&buf, 40), 0x0FF0_0003, "its user_data");
+    assert_eq!(le64(&buf, 56), seq as u64, "the same count");
+
+    // Already off: a job queued now waits for the pipe, and nothing sends it.
+    PENDING_DRM_TIMERS
+        .lock()
+        .push_back(PendingDrmTimer::Vblank {
+            signal: 0x0FF0_0005,
+            due_seq: far,
+            file: Arc::downgrade(&file),
+        });
+    set_crtc_blanked(true);
+    assert_eq!(pending_jobs(), (1, 1, 0), "no transition, nothing sent");
+    assert!(!file.has_events());
+    PENDING_DRM_TIMERS.lock().clear();
+    DRM_TIMER_ARMED.store(false, Ordering::Release);
+}
