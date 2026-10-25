@@ -73,8 +73,10 @@ Salida esperada al final: `OK: CUDA works on GPU 0 (init, memory, launch)`.
 
 `cuda-probe -d` va más allá, en cada GPU: lo que el runner de Ollama
 (llama.cpp) le pide, con la respuesta comprobada exacta y lo que cuesta. Copias
-de 64 MiB (memoria normal, `cuMemAllocHost` y `cuMemHostRegister` en un
-stream) con sus MB/s; kernels de muchos bloques, reducciones con shuffles y
+de 64 MiB (memoria normal, `cuMemAllocHost`, `cuMemHostRegister` en un
+stream y un fichero mapeado como llama.cpp mapea el modelo) con sus MB/s; el
+pool de llama.cpp (una reserva de 32 GiB con memoria mapeada a trozos por
+`cuMemCreate`/`cuMemMap`); kernels de muchos bloques, reducciones con shuffles y
 memoria compartida, 64 KiB de compartida dinámica, `dp4a`, tensor cores int8 y
 f16, un CUDA graph; y la latencia de lanzar un kernel y de esperarlo. Una
 respuesta mal dice dónde; una GPU que no termina se nombra a los 60 s en vez de

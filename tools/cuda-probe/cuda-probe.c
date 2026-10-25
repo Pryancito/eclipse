@@ -24,7 +24,11 @@
 //
 //   copy      64 MiB host to GPU and back from ordinary memory, from
 //             cuMemAllocHost memory, and from memory cuMemHostRegister pins
-//             (on a stream), with MB/s each way.
+//             (on a stream), with MB/s each way; and from a file mapped the
+//             way llama.cpp maps a model, untouched by the CPU.
+//   vmm       llama.cpp's buffer pool: a 32 GiB reservation with physical
+//             memory mapped into it piece by piece (cuMemCreate, cuMemMap,
+//             cuMemSetAccess), written by a kernel across the pieces.
 //   kernels   elementwise over many blocks, a block reduction (shuffles and
 //             shared memory), 64 KiB of dynamic shared memory, int8 dot
 //             products (dp4a, a decoded token), int8 and f16 tensor cores
@@ -54,6 +58,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -69,6 +74,27 @@ typedef void *CUevent;
 typedef void *CUgraph;
 typedef void *CUgraphExec;
 typedef unsigned long long CUdeviceptr;
+typedef unsigned long long CUmemGenericAllocationHandle;
+
+// cuda.h's CUmemLocation, CUmemAllocationProp and CUmemAccessDesc.
+typedef struct {
+    int type;
+    int id;
+} CUmemLocation;
+typedef struct {
+    int type;
+    int requestedHandleTypes;
+    CUmemLocation location;
+    void *win32HandleMetaData;
+    unsigned char compressionType;
+    unsigned char gpuDirectRDMACapable;
+    unsigned short usage;
+    unsigned char reserved[4];
+} CUmemAllocationProp;
+typedef struct {
+    CUmemLocation location;
+    int flags;
+} CUmemAccessDesc;
 
 // -d: the basic steps print only what fails, and the deep checks follow.
 static int quiet;
@@ -239,6 +265,14 @@ static CUresult (*d_graph_launch)(CUgraphExec, CUstream);
 static CUresult (*d_graph_exec_destroy)(CUgraphExec);
 static CUresult (*d_graph_destroy)(CUgraph);
 static CUresult (*d_can_peer)(int *, CUdevice, CUdevice);
+static CUresult (*d_granularity)(size_t *, const CUmemAllocationProp *, int);
+static CUresult (*d_reserve)(CUdeviceptr *, size_t, size_t, CUdeviceptr, unsigned long long);
+static CUresult (*d_address_free)(CUdeviceptr, size_t);
+static CUresult (*d_create)(CUmemGenericAllocationHandle *, size_t, const CUmemAllocationProp *, unsigned long long);
+static CUresult (*d_release)(CUmemGenericAllocationHandle);
+static CUresult (*d_map)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long);
+static CUresult (*d_unmap)(CUdeviceptr, size_t);
+static CUresult (*d_set_access)(CUdeviceptr, size_t, const CUmemAccessDesc *, size_t);
 
 #define DEEP_SYM(var, name) (var = (__typeof__(var))sym(name)) != NULL
 
@@ -261,7 +295,12 @@ static int deep_symbols(void)
            DEEP_SYM(d_capture_begin, "cuStreamBeginCapture_v2") && DEEP_SYM(d_capture_end, "cuStreamEndCapture") &&
            DEEP_SYM(d_graph_instantiate, "cuGraphInstantiateWithFlags") &&
            DEEP_SYM(d_graph_launch, "cuGraphLaunch") && DEEP_SYM(d_graph_exec_destroy, "cuGraphExecDestroy") &&
-           DEEP_SYM(d_graph_destroy, "cuGraphDestroy") && DEEP_SYM(d_can_peer, "cuDeviceCanAccessPeer");
+           DEEP_SYM(d_graph_destroy, "cuGraphDestroy") && DEEP_SYM(d_can_peer, "cuDeviceCanAccessPeer") &&
+           DEEP_SYM(d_granularity, "cuMemGetAllocationGranularity") &&
+           DEEP_SYM(d_reserve, "cuMemAddressReserve") && DEEP_SYM(d_address_free, "cuMemAddressFree") &&
+           DEEP_SYM(d_create, "cuMemCreate") && DEEP_SYM(d_release, "cuMemRelease") &&
+           DEEP_SYM(d_map, "cuMemMap") && DEEP_SYM(d_unmap, "cuMemUnmap") &&
+           DEEP_SYM(d_set_access, "cuMemSetAccess");
 }
 
 // The check under way, for the watchdog to name.
@@ -410,6 +449,109 @@ static int deep_registered(struct deep *g)
     if (registered)
         d_unregister(r);
     free(r);
+    return ok;
+}
+
+static int deep_fn(struct deep *g, const char *name, CUfunction *fn);
+static int deep_run(struct deep *g, CUfunction fn, unsigned blocks, unsigned threads, unsigned shared,
+                    void **args, float *ms);
+
+// A file mapped as llama.cpp maps a model (MAP_SHARED, PROT_READ) and
+// copied to the GPU before the CPU has touched a page of it: the weights
+// reach the GPU this way, from the page cache of the disk the file is on.
+static int deep_file(struct deep *g)
+{
+    enum { WORDS = 16 << 20, BYTES = WORDS * 4 };
+    deep_begin("file");
+    const char *home = getenv("HOME");
+    char path[512];
+    snprintf(path, sizeof path, "%s/.cuda-probe-file", home && *home ? home : "/tmp");
+    deep_fill(g->want, WORDS, 0xf11e);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    int ok = fd >= 0;
+    for (size_t done = 0; ok && done < BYTES;) {
+        ssize_t n = write(fd, (const char *)g->want + done, BYTES - done);
+        ok = n > 0;
+        done += ok ? (size_t)n : 0;
+    }
+    if (fd >= 0)
+        close(fd);
+    void *map = MAP_FAILED;
+    if (ok) {
+        fd = open(path, O_RDONLY);
+        map = fd >= 0 ? mmap(NULL, BYTES, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
+        if (fd >= 0)
+            close(fd);
+    }
+    if (!ok || map == MAP_FAILED) {
+        printf("  %-10s FAILED: could not write and map %s\n", deep_step, path);
+        unlink(path);
+        return 0;
+    }
+    double t0 = now_us();
+    ok = deep_call("HtoD", d_htod(g->c, map, BYTES));
+    double t1 = now_us();
+    munmap(map, BYTES);
+    unlink(path);
+    ok = ok && deep_call("DtoH", d_dtoh(g->hc, g->c, BYTES)) && deep_same(g->hc, g->want, WORDS);
+    if (ok)
+        printf("  file       64 MiB mapped  HtoD %5.0f MB/s  ok\n", mbps(BYTES, t1 - t0));
+    return ok;
+}
+
+// llama.cpp's buffer pool: a large reservation of addresses (it reserves
+// 32 GiB), physical memory made separately and mapped into it piece by
+// piece, then opened to the GPU with cuMemSetAccess. A kernel writes across
+// the two pieces.
+static int deep_vmm(struct deep *g, CUdevice dev)
+{
+    enum { RESERVE_GIB = 32 };
+    deep_begin("vmm");
+    CUfunction fn;
+    // CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_LOCATION_TYPE_DEVICE
+    CUmemAllocationProp prop;
+    memset(&prop, 0, sizeof prop);
+    prop.type = 1;
+    prop.location.type = 1;
+    prop.location.id = dev;
+    size_t chunk = 0;
+    CUdeviceptr base = 0;
+    size_t reserved = (size_t)RESERVE_GIB << 30;
+    CUmemGenericAllocationHandle h[2] = {0, 0};
+    int mapped = 0;
+    // CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
+    int ok = deep_fn(g, "axpy_u32", &fn) && deep_call("granularity", d_granularity(&chunk, &prop, 1)) &&
+             deep_call("cuMemAddressReserve 32 GiB", d_reserve(&base, reserved, 0, 0, 0));
+    if (!ok)
+        return 0;
+    for (int i = 0; ok && i < 2; i++) {
+        ok = deep_call("cuMemCreate", d_create(&h[i], chunk, &prop, 0)) &&
+             deep_call("cuMemMap", d_map(base + i * chunk, chunk, 0, h[i], 0));
+        mapped += ok;
+    }
+    // CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+    CUmemAccessDesc access = {{1, dev}, 3};
+    ok = ok && deep_call("cuMemSetAccess", d_set_access(base, 2 * chunk, &access, 1));
+    // The host buffers hold 64 MiB; a larger granularity is checked that far.
+    size_t bytes = 2 * chunk < DEEP_BYTES ? 2 * chunk : DEEP_BYTES;
+    unsigned n = (unsigned)(bytes / 4);
+    void *args[] = {&base, &g->a, &g->b, &n};
+    ok = ok && deep_run(g, fn, DEEP_BLOCKS, DEEP_THREADS, 0, args, NULL) &&
+         deep_call("DtoH", d_dtoh(g->hc, base, bytes));
+    if (ok) {
+        for (size_t i = 0; i < n; i++)
+            g->want[i] = g->ha[i] * 3u + g->hb[i];
+        ok = deep_same(g->hc, g->want, n);
+    }
+    for (int i = 0; i < mapped; i++)
+        d_unmap(base + i * chunk, chunk);
+    for (int i = 0; i < 2; i++) {
+        if (h[i])
+            d_release(h[i]);
+    }
+    d_address_free(base, reserved);
+    if (ok)
+        printf("  vmm        2 x %zu KiB in a 32 GiB reservation  ok\n", chunk >> 10);
     return ok;
 }
 
@@ -658,7 +800,8 @@ static int deep_gpu(CUdevice dev, int index)
         deep_begin("module");
         ok = deep_call("cuModuleLoadData", d_mod_load(&g.mod, kernels_ptx));
     }
-    ok = ok && deep_copy(&g) && deep_pinned(&g) && deep_registered(&g) && deep_axpy(&g) && deep_reduce(&g) &&
+    ok = ok && deep_copy(&g) && deep_pinned(&g) && deep_registered(&g) && deep_file(&g) && deep_axpy(&g) &&
+         deep_vmm(&g, dev) && deep_reduce(&g) &&
          deep_shared(&g, dev) && deep_dp4a(&g) && deep_mma(&g, "mma_i8", "mma int8", 0) &&
          deep_mma(&g, "mma_f16", "mma f16", 1) && deep_graph(&g) && deep_latency(&g);
     alarm(0);
