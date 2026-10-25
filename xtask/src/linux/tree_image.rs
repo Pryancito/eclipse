@@ -7,6 +7,9 @@ use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 
+#[cfg(test)]
+mod tests;
+
 /// Que se crea en la imagen.
 pub(super) enum Node {
     Dir,
@@ -91,8 +94,8 @@ pub(super) fn populate<F: TreeFs>(fs: &mut F, dir_ino: u64, dir: &Path) {
                         "write {:?} @ {} no avanzo: la imagen {} es demasiado pequena \
                          ({} bytes del fichero sin escribir)",
                         path,
-                        F::NAME,
                         off + done as u64,
+                        F::NAME,
                         data.len() as u64 - off - done as u64,
                     );
                     done += n;
