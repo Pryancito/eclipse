@@ -761,3 +761,138 @@ fn gem_pushbuf_refuses_what_it_cannot_map_place_or_push() {
         "no RM behind the GPU"
     );
 }
+
+/// What dmesg got since the last look.
+fn said() -> Vec<alloc::string::String> {
+    crate::utils::host_hooks::take_dmesg()
+        .into_iter()
+        .map(|(_, l)| l)
+        .collect()
+}
+
+/// What the ioctl arm has already checked never reaches the submission
+/// helpers through it, so their own refusals are reached directly: an
+/// object gone between the arm's validation and the mapping (a `GEM_CLOSE`
+/// from another thread) is ENOENT before the RM is asked, a push naming a
+/// buffer the list did not resolve is EINVAL, a channel the bookkeeping
+/// does not know is ENOENT, and a request with no buffers and no pushes is
+/// a submission of nothing.
+#[test]
+fn the_submission_helpers_refuse_what_the_arm_cannot_have_checked() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let _on = Submitting::on();
+    let gpu = gpu_rm();
+    let ch = channel_alloc(&gpu, A).unwrap().channel as u32;
+    let ctx = ctx_idx(&gpu, A);
+    let mine = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+
+    let before = FAKE_RM.lock().calls.len();
+    let _ = said();
+    assert_eq!(
+        gpu.pushbuf_resolve_bos(0, ctx, A, &[bo(0xdead_0001)])
+            .map(|v| v.len()),
+        Err(nv::ENOENT),
+        "an object gone since validation"
+    );
+    assert!(rm_calls_since(before).is_empty(), "before the RM");
+    let dmesg = said();
+    assert!(
+        dmesg
+            .iter()
+            .any(|l| l.contains("no such object") && l.contains("ENOENT")),
+        "{:?}",
+        dmesg
+    );
+
+    let resolved = gpu.pushbuf_resolve_bos(0, ctx, A, &[bo(mine)]).unwrap();
+    assert_eq!(resolved.len(), 1);
+    let before = FAKE_RM.lock().calls.len();
+    assert_eq!(
+        gpu.pushbuf_submit_pushes(0, ctx, &[push_of(3, 0, 0x20)], &resolved),
+        Err(nv::EINVAL),
+        "a push past the resolved list"
+    );
+    assert!(rm_calls_since(before).is_empty(), "nothing pushed");
+
+    let unknown = pushbuf_req(ch + 0x1000, 0, 0, 0, 0);
+    assert_eq!(
+        gpu.gem_pushbuf_submit(&unknown, &[], A),
+        Err(nv::ENOENT),
+        "a channel the bookkeeping never allocated"
+    );
+
+    let before = FAKE_RM.lock().calls.len();
+    let empty = pushbuf_req(ch, 0, 0, 0, 0);
+    assert_eq!(
+        gpu.gem_pushbuf_submit(&empty, &[], A),
+        Ok(()),
+        "nothing to map, nothing to push"
+    );
+    assert!(rm_calls_since(before).is_empty());
+}
+
+/// The RM can refuse a mapping as a CALL -- a status, not a `VmBind` with
+/// a refusal inside -- and the ring can refuse a push the same way. Both
+/// are EIO, each says which in dmesg, and a mapping the RM never made is
+/// not recorded while one it did make stays for the next frame.
+#[test]
+fn gem_pushbuf_turns_a_failed_rm_call_into_eio() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let _on = Submitting::on();
+    let gpu = gpu_rm();
+    let ch = channel_alloc(&gpu, A).unwrap().channel as u32;
+    let mine = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    let one = [push_of(0, 0, 0x20)];
+    let mut bos = [bo(mine)];
+
+    FAKE_RM.lock().fail_bind = true;
+    let _ = said();
+    let before = FAKE_RM.lock().calls.len();
+    assert_eq!(submit(&gpu, A, ch, &mut bos, &[], &one), Err(nv::EIO));
+    FAKE_RM.lock().fail_bind = false;
+    assert_eq!(
+        rm_calls_since(before),
+        ["vm_bind_map"],
+        "asked once, then stopped"
+    );
+    assert!(driver_maps(&gpu, A).is_empty(), "nothing recorded");
+    assert_eq!(presumed(&bos[0]).0, 0, "never placed: presumed untouched");
+    let dmesg = said();
+    assert!(
+        dmesg
+            .iter()
+            .any(|l| l.contains("the RM refused a mapping") && l.contains("EIO")),
+        "{:?}",
+        dmesg
+    );
+
+    FAKE_RM.lock().refuse_submit = true;
+    let before = FAKE_RM.lock().calls.len();
+    assert_eq!(submit(&gpu, A, ch, &mut bos, &[], &one), Err(nv::EIO));
+    FAKE_RM.lock().refuse_submit = false;
+    assert_eq!(
+        rm_calls_since(before),
+        ["vm_bind_map", "exec_submit"],
+        "mapped, then the ring refused"
+    );
+    assert_eq!(
+        driver_maps(&gpu, A).len(),
+        1,
+        "the mapping the RM did make stays for the next frame"
+    );
+    assert_eq!(presumed(&bos[0]).0, 1, "and Mesa is told where it is");
+    let dmesg = said();
+    assert!(
+        dmesg
+            .iter()
+            .any(|l| l.contains("the ring refused") && l.contains("EIO")),
+        "{:?}",
+        dmesg
+    );
+}

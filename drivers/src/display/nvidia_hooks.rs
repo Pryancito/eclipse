@@ -404,6 +404,9 @@ mod nvidia_hooks_tests {
             50_000,
             "a zero delay moved the clock, so it spun"
         );
+        // And the RM's `delay_us` hook is that delay, through the same clock.
+        EclipseNvrmHooks::new().delay_us(0);
+        assert_eq!(test_clock::now(), 50_000, "the hook spun on a zero delay");
         test_clock::set(0);
     }
 

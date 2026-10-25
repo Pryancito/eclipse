@@ -706,6 +706,10 @@ pub(super) struct FakeRm {
     /// `exec_submit` and `exec_submit_signaled` fail as calls, before any
     /// stage: what the Rust wrappers turn into `Err`.
     pub refuse_submit: bool,
+    /// `vm_bind_map` fails as a CALL, before the RM looks at the object or
+    /// the range: what the Rust wrapper turns into `Err`, as against the
+    /// `RM_VA_TAKEN` refusal `refuse_map` answers inside an `Ok`.
+    pub fail_bind: bool,
     /// The ring runs what it fetches: a signalled submit lands its wait
     /// (`fence_wait_status == 0`), and a push the fake can read -- the
     /// 6-dword host semaphore RELEASE, fetched through a binding of a
@@ -797,6 +801,7 @@ const EMPTY_RM: FakeRm = FakeRm {
     picked_va: RM_PICKS_FROM,
     fail_map_cpu: false,
     refuse_submit: false,
+    fail_bind: false,
     runs: false,
     vm_bind_invisible: false,
     writes_lost: false,
@@ -1144,6 +1149,9 @@ extern "C" fn eclipse_rm_vm_bind_map(
 ) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("vm_bind_map");
+    if f.fail_bind {
+        return NV_ERR_NOT_SUPPORTED;
+    }
     // `requested_va == 0` leaves the placement to the RM (what a legacy
     // `GEM_PUSHBUF` client's buffers get): the fake places it like one.
     let va = if requested_va == 0 {

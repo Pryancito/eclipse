@@ -550,4 +550,42 @@ mod tests {
         set_enabled(false);
         assert!(!enabled());
     }
+
+    /// The line is only our reading of what the RM will put in the PTEs, so
+    /// an object whose line cannot be derived here -- no FBMEM offset
+    /// recorded, or one past the address field -- is honoured all the same,
+    /// with a log line that says the line was not readable instead of a
+    /// number.
+    #[test]
+    fn a_bind_is_honoured_even_when_the_line_cannot_be_read_here() {
+        let _g = crate::test_globals::LOCK.lock();
+        let said = || -> alloc::vec::Vec<alloc::string::String> {
+            crate::utils::host_hooks::take_dmesg()
+                .into_iter()
+                .map(|(_, l)| l)
+                .collect()
+        };
+        set_caps(Some(caps_ok()));
+        set_enabled(true);
+        let _ = said();
+        for (offset, why) in [
+            (None, "no FBMEM offset"),
+            (Some(u64::MAX), "past the field"),
+        ] {
+            let mut obj = vram_obj();
+            obj.vram_offset = offset;
+            assert!(honour_for_bind(0x08, &obj), "{}", why);
+            let lines = said();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("comptag line not readable from here")),
+                "{}: {:?}",
+                why,
+                lines
+            );
+        }
+        set_enabled(false);
+        set_caps(None);
+    }
 }

@@ -261,4 +261,23 @@ mod tests {
         syncobj::destroy(export);
         syncobj::destroy(src);
     }
+
+    /// Forgetting one buffer is not forgetting the table: the other
+    /// buffers keep their fences.
+    #[test]
+    fn forgetting_a_buffer_leaves_the_other_buffers_fences_alone() {
+        let _g = lock();
+        let (mine, theirs) = (0x7_4000_0000, 0x7_4100_0000);
+        let a = syncobj::create(false);
+        let b = syncobj::create(false);
+        assert!(add_fence(mine, a, 1, true));
+        assert!(add_fence(theirs, b, 1, true));
+        forget(mine);
+        assert_eq!(count(mine), 0);
+        assert_eq!(count(theirs), 1, "the other buffer keeps its fence");
+        forget(theirs);
+        assert_eq!(count(theirs), 0);
+        syncobj::destroy(a);
+        syncobj::destroy(b);
+    }
 }

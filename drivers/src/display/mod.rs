@@ -155,3 +155,23 @@ pub fn hwflip_enabled() -> bool {
 pub fn surfaceflip_enabled() -> bool {
     false
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    /// The provider `zCore` installs at boot is what the RM's
+    /// `os_get_current_thread` answers with: the re-export reaches
+    /// `os_interface`, and the provider's number comes back as the id.
+    #[test]
+    fn the_thread_id_provider_reaches_the_rm() {
+        let _g = crate::test_globals::LOCK.lock();
+        super::set_rm_thread_id_provider(|| 0x5150);
+        let mut id: u64 = 0;
+        assert_eq!(
+            nvidia_rm_sys::os_interface::os_get_current_thread(&mut id),
+            nvidia_rm_sys::types::NV_OK
+        );
+        assert_eq!(id, 0x5150);
+        // Leave the RM a provider that answers like none was installed.
+        super::set_rm_thread_id_provider(|| 0);
+    }
+}

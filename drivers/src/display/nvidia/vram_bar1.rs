@@ -265,4 +265,64 @@ mod tests {
         set_enabled(false);
         assert!(!enabled());
     }
+
+    /// The GEM_NEW path, hatch and arithmetic together: a sysmem object is
+    /// never this path's and the hatch off answers nothing, both without a
+    /// word; an object the RM gave no FBMEM offset and one that does not fit
+    /// are each a warning naming the handle and no mapping; one that fits is
+    /// its address and no noise.
+    #[test]
+    fn the_gem_new_path_maps_only_a_fitting_vram_object_with_the_hatch_on() {
+        let _g = crate::test_globals::LOCK.lock();
+        let said = || -> alloc::vec::Vec<alloc::string::String> {
+            crate::utils::host_hooks::take_dmesg()
+                .into_iter()
+                .map(|(_, l)| l)
+                .collect()
+        };
+        let was = enabled();
+        let _ = said();
+        assert_eq!(
+            cpu_mapping_for_vram_gem(false, BASE, LEN, Some(0), 4096, 1),
+            None,
+            "hatch off"
+        );
+        set_enabled(true);
+        assert_eq!(
+            cpu_mapping_for_vram_gem(true, BASE, LEN, Some(0), 4096, 2),
+            None,
+            "sysmem"
+        );
+        assert!(said().is_empty(), "nothing to say about either");
+        assert_eq!(
+            cpu_mapping_for_vram_gem(false, BASE, LEN, None, 4096, 3),
+            None
+        );
+        let lines = said();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("handle=3") && l.contains("no FBMEM offset")),
+            "{:?}",
+            lines
+        );
+        assert_eq!(
+            cpu_mapping_for_vram_gem(false, BASE, LEN, Some(LEN - 4096), 8192, 4),
+            None
+        );
+        let lines = said();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("handle=4") && l.contains("does not fit the BAR1 aperture")),
+            "{:?}",
+            lines
+        );
+        assert_eq!(
+            cpu_mapping_for_vram_gem(false, BASE, LEN, Some(64 << 20), 1 << 20, 5),
+            Some(BASE + (64 << 20))
+        );
+        assert!(said().is_empty(), "a mapping is not news");
+        set_enabled(was);
+    }
 }
