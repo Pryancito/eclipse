@@ -1122,7 +1122,8 @@ impl LinuxRootfs {
               # labwc froze within seconds of starting. Keep the system on\n\
               # its proven configuration; opt in per command if needed:\n\
               #   LD_PRELOAD=/lib/libeclipse_dns.so some-command\n\
-              export HOME=/root; mkdir -p /root/.ollama 2>/dev/null\n\
+              export HOME=/root\n\
+              mkdir -p /root/.ollama 2>/dev/null\n\
               # Ollama models must not land on tmpfs. A multi-GB ollama pull\n\
               # into /tmp (or a home that is still ramfs) densified the kernel\n\
               # heap until epoll_pwait panicked on a 96-byte timer cell.\n\
