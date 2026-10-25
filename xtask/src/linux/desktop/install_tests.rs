@@ -221,12 +221,12 @@ fn every_look_the_switcher_offers_has_a_theme_and_a_palette() {
         let theme = theme_of(&themes, look);
         let rc = format!("usr/share/themes/{theme}/openbox-3/themerc");
         assert!(
-            d.files.iter().any(|f| *f == rc),
+            d.files.contains(&rc),
             "the {look} look asks for the {theme} theme and nothing installs {rc}"
         );
         let ini = format!("root/.config/foot/foot.{look}.ini");
         assert!(
-            d.files.iter().any(|f| *f == ini),
+            d.files.contains(&ini),
             "the {look} look has no terminal palette at {ini}"
         );
     }
@@ -521,10 +521,18 @@ fn every_program_the_desktop_names_by_its_path_is_one_the_image_installs() {
 }
 
 /// And the other way round: a wrapper nothing names is dead weight in the
-/// image, and usually a rename that only landed on one side. Three ways to be
+/// image, and usually a rename that only landed on one side. Four ways to be
 /// named count -- by path, by bare name on `PATH` (which is how `.xinitrc`
-/// starts the memory watch and the X cache warm-up), or from `mod.rs`, which
-/// writes the init services and the openers.
+/// starts the memory watch and the X cache warm-up), from `mod.rs`, which
+/// writes the init services and the openers, or from one of the two tables in
+/// another crate that run a wrapper directly: the panel's opener table and
+/// init's `BOOT_SETTINGS`, which is what applies the keyboard layout, the
+/// locale and the timezone at boot. Neither crate is in this workspace, so a
+/// rename on either side is caught by nothing but this.
+///
+/// The fourth one was found by moving a test module out of `mod.rs`: until
+/// then `eclipse-locale` was reached here only because `mod.rs` happened to
+/// name it in its own TEST text, which is not a caller at all.
 #[test]
 fn every_wrapper_the_desktop_installs_is_reached_from_somewhere() {
     let d = installed();
@@ -538,7 +546,9 @@ fn every_wrapper_the_desktop_installs_is_reached_from_somewhere() {
                 .map(|b| (rel.as_str(), b))
         })
         .collect();
-    let elsewhere = source("xtask/src/linux/mod.rs") + &source("tools/lunarbar/src/open.rs");
+    let elsewhere = source("xtask/src/linux/mod.rs")
+        + &source("tools/lunarbar/src/open.rs")
+        + &source("tools/eclipse-init/src/main.rs");
     for name in d.wrappers() {
         if by_path.contains_key(name) {
             continue;
@@ -557,8 +567,8 @@ fn every_wrapper_the_desktop_installs_is_reached_from_somewhere() {
         assert!(
             bare || elsewhere.contains(name),
             "nothing in the image runs /usr/local/bin/{name}: it is named by no \
-             file the desktop writes, by no service in mod.rs and by no row of \
-             the panel's opener table"
+             file the desktop writes, by no service in mod.rs, by no row of \
+             the panel's opener table and by no row of init's BOOT_SETTINGS"
         );
     }
 }
@@ -577,10 +587,7 @@ fn the_openers_table_in_the_panel_names_the_wrappers_the_desktop_writes() {
         let Some((_, rest)) = line.split_once("\", \"eclipse-") else {
             continue;
         };
-        let wrapper = rest
-            .split(|c: char| c == ' ' || c == '"')
-            .next()
-            .unwrap_or_default();
+        let wrapper = rest.split([' ', '"']).next().unwrap_or_default();
         let wrapper = format!("eclipse-{wrapper}");
         assert!(
             mine.contains(wrapper.as_str()),

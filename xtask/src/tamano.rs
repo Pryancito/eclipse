@@ -88,10 +88,15 @@ const PASADOS: &[(&str, usize)] = &[
     ("linux-object/src/fs/devfs/drm.rs", 8500),
     ("drivers/src/usb/xhci_hid.rs", 7750),
     ("drivers/src/net/e1000e.rs", 7500),
-    // 7750: lunarclip (el portapapeles) trajo aqui su servicio, su wrapper y
-    // 8000: master llegó a 7776 con los cambios de CUDA/Ollama sobre el techo
-    // de 7750; sube al siguiente múltiplo de 250 según la regla del trinquete.
-    ("xtask/src/linux/mod.rs", 8000),
+    // 6000: BAJADO el 25-oct-2026, que es para lo que está este test. El
+    // fichero llegó a 7965 con seis tests nuevos y 35 líneas de holgura, así
+    // que `rootfs_plumbing_tests` salió a `linux/rootfs_plumbing_tests.rs`
+    // (2181 líneas, ni una de producción) y quedó en 5786. El techo baja con
+    // él al siguiente múltiplo de 250. De paso la extracción destapó un
+    // cruce que pasaba en falso: `install_tests` leía este fichero buscando
+    // quién arranca cada wrapper, y lo que lo satisfacía era el texto de los
+    // tests que ahora están fuera.
+    ("xtask/src/linux/mod.rs", 6000),
     // 7000: master llego a 6753 con el techo en 6750, asi que el trinquete
     // estaba rojo antes de esta tanda y no por ella.
     ("linux-object/src/fs/devfs/drm_scheme.rs", 7000),
