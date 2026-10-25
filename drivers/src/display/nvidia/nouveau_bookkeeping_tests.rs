@@ -9377,6 +9377,11 @@ mod rm_edges_tests;
 /// `Unknown` architecture, and the empty EXEC that rides the ring.
 mod rm_failures_tests;
 
+/// The connectors, EDID, HDMI audio and hardware cursor of the GPU that
+/// drives the monitor, from the RM's snapshot and the fake RM.
+mod display_state_tests;
+/// `/proc/gpudbg` on a BAR0 the test writes, and the two PTOP readers.
+mod gpudbg_tests;
 /// The `/proc` readers of the bring-up ladder (`gpustep15/16/17`,
 /// `gpuedid`) on the fake RM, and the HDA driver's two questions.
 mod proc_steps_tests;
