@@ -34,7 +34,8 @@ fn a_child_that_called_exit_group_used_what_its_threads_did() {
 }
 
 /// A child's own reaped children are the child's too, in what its reaper is
-/// told and in what it adds up: `time sh -c make` is the compilers' time.
+/// told and in what it adds up: `time sh -c make` is the compilers' time, and
+/// their faults are the child's faults.
 #[test]
 fn a_child_hands_up_what_its_reaped_children_used() {
     let parent = Process::create_linux(&ROOT_JOB, RamFS::new(), 0, None, 45_122).unwrap();
@@ -48,6 +49,9 @@ fn a_child_hands_up_what_its_reaped_children_used() {
         grandchild_thread.note_context_switch(false);
     }
     grandchild_thread.note_context_switch(true);
+    for _ in 0..1_024 {
+        grandchild_thread.note_minor_fault();
+    }
     grandchild.exit(0);
     let (_, cpu) = block_on(wait_child(&child, grandchild.id(), true, true)).unwrap();
     grandchild_thread.terminate_abandoned();
@@ -56,6 +60,9 @@ fn a_child_hands_up_what_its_reaped_children_used() {
     child_thread.time_add(1_000_000);
     child_thread.note_context_switch(false);
     child_thread.note_context_switch(true);
+    for _ in 0..3 {
+        child_thread.note_minor_fault();
+    }
     child.exit(0);
     let (_, cpu) = block_on(wait_child(&parent, child.id(), true, true)).unwrap();
     child_thread.terminate_abandoned();
@@ -64,8 +71,12 @@ fn a_child_hands_up_what_its_reaped_children_used() {
         stime_ns: 20_000_000,
         voluntary_switches: 26,
         involuntary_switches: 2,
+        minor_faults: 1_027,
     };
-    assert_eq!(cpu, both, "wait4 left out the grandchild, or the switches");
+    assert_eq!(
+        cpu, both,
+        "wait4 left out the grandchild, the switches or the faults"
+    );
     assert_eq!(parent.linux().children_usage(), both);
     assert_eq!(parent.linux().children_cpu_ns(), (301_000_000, 20_000_000));
 }

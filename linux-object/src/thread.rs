@@ -399,12 +399,12 @@ impl ThreadExt for Thread {
         mut head_ptr: UserOutPtr<UserOutPtr<RobustList>>,
         mut len_ptr: UserOutPtr<usize>,
     ) -> SysResult {
-        let linux = self.lock_linux();
-        let head: UserOutPtr<RobustList> = linux.robust_list.as_addr().into();
-        let len = linux.robust_list_len;
-        drop(linux);
+        let head: UserOutPtr<RobustList> = self.lock_linux().robust_list.as_addr().into();
+        // `sizeof(*head)`, whatever was registered: Linux 6.18 answers 24
+        // for a thread that never called `set_robust_list` (musl, which
+        // only does for a robust mutex), and this answered 0.
         head_ptr.write(head)?;
-        len_ptr.write(len)?;
+        len_ptr.write(core::mem::size_of::<RobustList>())?;
         Ok(0)
     }
 
@@ -1198,6 +1198,25 @@ impl LinuxThread {
         self.pending_info.remove(&(signal as u8));
     }
 
+    /// [`Self::discard_signal`] for each of `set` that is pending: what a
+    /// discard of ignored signals and the stops a `SIGCONT` cancels throw
+    /// away (`flush_sigqueue_mask`). Clearing only the bits left their
+    /// `siginfo_t` behind, and the next signal of that number, finding one,
+    /// kept it: a `SIGCHLD` came with the child before it.
+    pub fn discard_signals(&mut self, set: Sigset) {
+        let mut rest = Sigset::new(self.signals.val() & set.val());
+        while let Some(signal) = rest.find_first_signal() {
+            rest.remove(signal);
+            self.discard_signal(signal);
+        }
+    }
+
+    /// The handler of the signal [`Self::handle_signal`] took is about to
+    /// run with `info`: what its `sigreturn` compares the frame against.
+    pub fn deliver_siginfo(&mut self, info: SigInfo) {
+        self.handling_info = info;
+    }
+
     /// The `siginfo_t` `signal` is pending with, to change in place: `None`
     /// when it is not pending, or came without one.
     pub fn pending_siginfo_mut(&mut self, signal: Signal) -> Option<&mut SigInfo> {
@@ -1220,7 +1239,16 @@ impl LinuxThread {
         self.signals.mask_with(&self.signal_mask).val()
     }
 
-    pub fn handle_signal(&mut self) -> Option<(Signal, Sigset)> {
+    /// Take the signal to deliver now out of the pending set, with its
+    /// `siginfo_t` ([`SigInfo::bare`] when the sender left none) and the
+    /// mask the frame is to restore.
+    ///
+    /// The information comes out with the signal, as `dequeue_signal()`
+    /// takes both. It used to stay behind for the delivery to pick up, which
+    /// did only when a handler ran: a signal taken by its default action --
+    /// an ignored `SIGCHLD`, a stop, a continue -- left it there, and the
+    /// next one of that number, finding one, kept it.
+    pub fn handle_signal(&mut self) -> Option<(Signal, Sigset, SigInfo)> {
         // The mask decides, and nothing else: a signal a handler blocked is
         // not in `mask_with`, and the signal being handled blocks itself
         // through `handler_mask`. There is NO "one handler at a time" gate --
@@ -1231,13 +1259,17 @@ impl LinuxThread {
             .find_first_signal()?;
         self.handling_signal = Some(signal as u32);
         self.signals.remove(signal);
+        let info = self
+            .pending_info
+            .remove(&(signal as u8))
+            .unwrap_or_else(|| SigInfo::bare(signal));
         // If a `rt_sigsuspend` (or similar) saved a mask to restore once
         // the handler returns, hand that mask to the signal frame so it
         // is reinstated on `sigreturn`. Otherwise keep the current mask --
         // which, for a handler entered from inside another handler, is the
         // OUTER handler's mask, so the inner `sigreturn` lands back in it.
         let restore_mask = self.saved_sigmask.take().unwrap_or(self.signal_mask);
-        Some((signal, restore_mask))
+        Some((signal, restore_mask, info))
     }
 
     /// The signal [`Self::handle_signal`] returned was taken with NO handler
@@ -1263,6 +1295,8 @@ mod deliverable_mirror_tests;
 mod robust_exit_tests;
 #[cfg(test)]
 mod successor_tests;
+#[cfg(test)]
+mod taken_siginfo_tests;
 
 #[cfg(test)]
 mod signal_delivery_tests {
@@ -1331,7 +1365,7 @@ mod signal_delivery_tests {
         // again on the next check, and the handler runs for ever.
         let mut t = thread();
         t.signals.insert(Signal::SIGINT);
-        let (sig, mask) = t.handle_signal().expect("SIGINT was pending");
+        let (sig, mask, _) = t.handle_signal().expect("SIGINT was pending");
         assert_eq!(sig, Signal::SIGINT);
         assert!(
             mask.is_empty(),
@@ -1350,14 +1384,14 @@ mod signal_delivery_tests {
         // changed. 97.6 % of a hung Firefox's `epoll_pwait` calls.
         let mut t = thread();
         t.signals.insert(Signal::SIGUSR1);
-        let (first, _) = t.handle_signal().expect("SIGUSR1 was pending");
+        let (first, _, _) = t.handle_signal().expect("SIGUSR1 was pending");
         assert_eq!(first, Signal::SIGUSR1);
         // What the loader does on handler entry (`handler_mask`): block the
         // signal being handled.
         t.block_signals(&one(Signal::SIGUSR1));
 
         t.signals.insert(Signal::SIGTERM);
-        let (second, _) = t
+        let (second, _, _) = t
             .handle_signal()
             .expect("a signal that arrives during a handler has to be delivered, as in Linux");
         assert_eq!(second, Signal::SIGTERM);
@@ -1396,7 +1430,7 @@ mod signal_delivery_tests {
         // mask from before any signal arrived.
         let mut t = thread();
         t.signals.insert(Signal::SIGUSR1);
-        let (_, outer_restore) = t.handle_signal().unwrap();
+        let (_, outer_restore, _) = t.handle_signal().unwrap();
         assert!(
             outer_restore.is_empty(),
             "nothing was blocked before the first signal"
@@ -1404,7 +1438,7 @@ mod signal_delivery_tests {
         t.block_signals(&one(Signal::SIGUSR1));
 
         t.signals.insert(Signal::SIGTERM);
-        let (_, inner_restore) = t.handle_signal().unwrap();
+        let (_, inner_restore, _) = t.handle_signal().unwrap();
         assert!(
             inner_restore.contains(Signal::SIGUSR1),
             "the inner sigreturn would drop the outer handler's sa_mask"
@@ -1417,7 +1451,7 @@ mod signal_delivery_tests {
         t.signals.insert(Signal::SIGWINCH);
         t.signals.insert(Signal::SIGTERM);
         t.signals.insert(Signal::SIGUSR1);
-        let (sig, _) = t.handle_signal().unwrap();
+        let (sig, _, _) = t.handle_signal().unwrap();
         assert_eq!(
             sig,
             Signal::SIGUSR1,
@@ -1447,7 +1481,7 @@ mod signal_delivery_tests {
 
         // Unblocking releases it, still pending, with no second `kill` needed.
         t.unblock_signals(&one(Signal::SIGINT));
-        let (sig, _) = t.handle_signal().expect("unblocking must release it");
+        let (sig, _, _) = t.handle_signal().expect("unblocking must release it");
         assert_eq!(sig, Signal::SIGINT);
     }
 
@@ -1460,7 +1494,7 @@ mod signal_delivery_tests {
         t.signals.insert(Signal::SIGINT);
         t.signals.insert(Signal::SIGTERM);
         t.block_signals(&one(Signal::SIGINT));
-        let (sig, _) = t.handle_signal().unwrap();
+        let (sig, _, _) = t.handle_signal().unwrap();
         assert_eq!(sig, Signal::SIGTERM, "the blocked SIGINT was delivered");
         assert!(
             t.signals.contains(Signal::SIGINT),
@@ -1509,7 +1543,7 @@ mod signal_delivery_tests {
         t.saved_sigmask = Some(original);
         t.signals.insert(Signal::SIGINT);
 
-        let (_, restore) = t.handle_signal().unwrap();
+        let (_, restore, _) = t.handle_signal().unwrap();
         assert!(
             restore.contains(Signal::SIGCHLD),
             "the mask to reinstate is the one sigsuspend saved, not the temporary one"
@@ -1521,7 +1555,7 @@ mod signal_delivery_tests {
         // nothing -- see the field.)
         t.block_signals(&one(Signal::SIGWINCH));
         t.signals.insert(Signal::SIGTERM);
-        let (_, restore) = t.handle_signal().unwrap();
+        let (_, restore, _) = t.handle_signal().unwrap();
         assert!(restore.contains(Signal::SIGWINCH));
         assert!(
             !restore.contains(Signal::SIGCHLD),
@@ -1541,7 +1575,7 @@ mod signal_delivery_tests {
         t.saved_sigmask = Some(original);
         t.signals.insert(Signal::SIGSTOP);
 
-        let (sig, restore) = t.handle_signal().unwrap();
+        let (sig, restore, _) = t.handle_signal().unwrap();
         assert_eq!(sig, Signal::SIGSTOP);
         t.taken_without_handler(restore);
         assert_eq!(
@@ -1559,7 +1593,7 @@ mod signal_delivery_tests {
         t.block_signals(&one(Signal::SIGWINCH));
         t.signals.insert(Signal::SIGCONT);
         let before = t.signal_mask();
-        let (_, restore) = t.handle_signal().unwrap();
+        let (_, restore, _) = t.handle_signal().unwrap();
         t.taken_without_handler(restore);
         assert_eq!(t.signal_mask().val(), before.val());
     }
@@ -1623,7 +1657,7 @@ mod signal_delivery_tests {
         let mut t = thread();
         t.set_signal_mask(wanted);
         t.signals.insert(Signal::SIGSTOP);
-        let (sig, _) = t
+        let (sig, _, _) = t
             .handle_signal()
             .expect("SIGSTOP was blocked, so the thread can never be stopped");
         assert_eq!(sig, Signal::SIGSTOP);
@@ -1811,7 +1845,7 @@ mod signal_delivery_tests {
             let sig = Signal::try_from(n).unwrap();
             let mut t = thread();
             t.signals.insert(sig);
-            let (got, _) = t
+            let (got, _, _) = t
                 .handle_signal()
                 .unwrap_or_else(|| panic!("{:?} was never delivered", sig));
             assert_eq!(got, sig);
@@ -2300,7 +2334,7 @@ mod exec_reset_tests {
         t.reset_for_exec();
         t.signals.insert(Signal::SIGINT);
         assert_eq!(
-            t.handle_signal().map(|(sig, _)| sig),
+            t.handle_signal().map(|(sig, _, _)| sig),
             Some(Signal::SIGINT),
             "the new program never got its signal"
         );
@@ -2315,7 +2349,7 @@ mod exec_reset_tests {
         let mut t = a_thread_in_full_swing();
         t.reset_for_exec();
         t.signals.insert(Signal::SIGINT);
-        let (_, restore) = t.handle_signal().expect("SIGINT is deliverable");
+        let (_, restore, _) = t.handle_signal().expect("SIGINT is deliverable");
         assert!(
             !restore.contains(Signal::SIGWINCH),
             "the frame carried the old program's suspend mask"
@@ -2452,7 +2486,10 @@ mod clone_inheritance_tests {
         // turn into inheriting a block on everything.
         let mut child = the_creating_thread().forked_child();
         child.signals.insert(Signal::SIGINT);
-        assert_eq!(child.handle_signal().map(|(s, _)| s), Some(Signal::SIGINT));
+        assert_eq!(
+            child.handle_signal().map(|(s, _, _)| s),
+            Some(Signal::SIGINT)
+        );
     }
 
     #[test]

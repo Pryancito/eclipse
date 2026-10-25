@@ -82,9 +82,11 @@ fn set_robust_list_takes_the_length_of_the_struct_and_nothing_else() {
                 sys.sys_get_robust_list(0, nothing_yet.head_ptr(), nothing_yet.len_ptr()),
                 Ok(0)
             );
+            // The length is the struct's whatever was registered, as on
+            // Linux: it is the head that says there is none.
             assert_eq!(
                 nothing_yet.read(),
-                (0, 0),
+                (0, right),
                 "a thread that never registered a list has one"
             );
 
@@ -106,7 +108,7 @@ fn set_robust_list_takes_the_length_of_the_struct_and_nothing_else() {
             );
             assert_eq!(
                 after.read(),
-                (0, 0),
+                (0, right),
                 "a refused set_robust_list registered the list anyway"
             );
 

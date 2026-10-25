@@ -713,10 +713,19 @@ impl Syscall<'_> {
         let usage = match getrusage_args(who, rusage.is_null())? {
             RusageWho::Process => {
                 let proc = self.zircon_process();
-                RUsage::of(proc.cpu_time_ns(), proc.context_switches())
+                RUsage::of(
+                    proc.cpu_time_ns(),
+                    proc.context_switches(),
+                    proc.minor_faults(),
+                )
             }
             RusageWho::Thread => {
-                RUsage::of(thread_cpu_ns(self.thread), self.thread.context_switches())
+                let thread = self.thread;
+                RUsage::of(
+                    thread_cpu_ns(thread),
+                    thread.context_switches(),
+                    thread.minor_faults(),
+                )
             }
             // Totals of children this process has reaped, accumulated at
             // wait4/waitid time exactly like Linux does.

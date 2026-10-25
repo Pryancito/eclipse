@@ -1,6 +1,10 @@
 /// The CPU time a thread hands its process; see the module notes.
 #[cfg(test)]
 mod cpu_time_tests;
+mod faults;
+/// What a resolved page fault counts; see the module notes.
+#[cfg(test)]
+mod faults_tests;
 mod published_state;
 /// That the word the return path reads is never wrong; see the module notes.
 #[cfg(test)]
@@ -28,6 +32,7 @@ mod sched_benches;
 #[cfg(test)]
 mod return_path_benches;
 
+pub(crate) use self::faults::MinorFaults;
 pub(crate) use self::switches::ContextSwitches;
 pub use self::thread_state::ThreadStateKind;
 
@@ -639,6 +644,9 @@ pub struct Thread {
     /// How often a poll of this thread has left the CPU; see
     /// [`ContextSwitches`].
     switches: ContextSwitches,
+    /// How often a fault on this thread's memory has been resolved; see
+    /// [`MinorFaults`].
+    minor_faults: MinorFaults,
     /// Logical CPU core this thread last ran on (field 39, `processor`, of
     /// `/proc/[pid]/stat`). Updated on every poll from `ThreadSwitchFuture`.
     last_cpu: AtomicU32,
@@ -806,6 +814,7 @@ impl Thread {
             time_ns: AtomicU64::new(0),
             sys_time_ns: AtomicU64::new(0),
             switches: ContextSwitches::default(),
+            minor_faults: MinorFaults::default(),
             last_cpu: AtomicU32::new(0),
         });
         thread.record_ext_birth();
@@ -1457,6 +1466,20 @@ impl Thread {
     /// crates that report the counts.
     pub fn note_context_switch(&self, runnable: bool) {
         self.switches.note(runnable);
+    }
+
+    /// This thread's minor page faults: what `getrusage(RUSAGE_THREAD)` and
+    /// its `/proc/<pid>/task/<tid>/stat` report.
+    pub fn minor_faults(&self) -> u64 {
+        self.minor_faults.get()
+    }
+
+    /// Count one fault on this thread's memory that its address space
+    /// resolved, taken in user mode or by the kernel touching that memory
+    /// for it. Public like [`Thread::note_context_switch`], for the trap
+    /// handlers that resolve it.
+    pub fn note_minor_fault(&self) {
+        self.minor_faults.note();
     }
 
     /// Set the logical CPU core this thread last ran on.

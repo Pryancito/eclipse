@@ -401,3 +401,107 @@ fn an_exec_wait_reached_only_by_a_timed_out_fence_is_eio_whichever_clock_ticks_f
     gpu.nouveau_release_process(B);
     assert_eq!(FAKE_RM.lock().bad, 0);
 }
+
+/// `nouveau_exec_ucopy` copies the three arrays, `nouveau_exec_job_init`
+/// measures every push while it builds the job, and only
+/// `nouveau_job_submit` looks the syncs up: a push that is empty, not a
+/// dword stream or longer than a GPFIFO entry can name is EINVAL ahead of
+/// a sig nobody owns (ENOENT) and of a wait of a type nobody knows
+/// (EOPNOTSUPP), and a count with no array is EFAULT ahead of both. This
+/// measured the pushes after the syncs, so a bad push behind a stranger's
+/// sig was ENOENT.
+#[test]
+fn exec_measures_the_pushes_before_it_looks_the_syncs_up() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    let ch = client_with_pushbuf(&gpu, A);
+    const NOBODYS: u32 = 0xdead_0138;
+    assert_eq!(syncobj::query(NOBODYS), None);
+    let mine = syncobj::create(false);
+    let odd = || nv::DrmNouveauSync {
+        flags: 0x7,
+        handle: mine,
+        timeline_value: 0,
+    };
+    let before = FAKE_RM.lock().calls.len();
+    for (len, why) in [
+        (0, "empty"),
+        (6, "not a dword stream"),
+        (
+            nv::EXEC_PUSH_MAX_LENGTH + 1,
+            "longer than a GPFIFO entry can name",
+        ),
+    ] {
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, len)], &[], &[sync(NOBODYS)]),
+            Err(nv::EINVAL),
+            "{why}: ahead of a sig nobody owns"
+        );
+        assert_eq!(
+            exec(&gpu, A, ch, &[push(PUSH_VA, len)], &[odd()], &[sync(mine)]),
+            Err(nv::EINVAL),
+            "{why}: ahead of a wait of an unknown type"
+        );
+        assert_eq!(
+            exec(
+                &gpu,
+                A,
+                ch,
+                &[push(PUSH_VA, 16), push(PUSH_VA, len)],
+                &[],
+                &[sync(NOBODYS)]
+            ),
+            Err(nv::EINVAL),
+            "{why}: as the second push, behind a sound one"
+        );
+    }
+    // The copy comes first: a count with no array faults before the bad
+    // push is measured, and before the stranger's sig is looked up.
+    let bad = [push(PUSH_VA, 0)];
+    let nobodys = [sync(NOBODYS)];
+    let mut r = nv::DrmNouveauExec {
+        channel: ch,
+        push_count: 1,
+        wait_count: 0,
+        sig_count: 1,
+        wait_ptr: 0,
+        sig_ptr: 0,
+        push_ptr: ptr_of(&bad),
+    };
+    assert_eq!(
+        exec_raw(&gpu, A, &mut r),
+        Err(nv::EFAULT),
+        "sigs with no array, ahead of the bad push"
+    );
+    let mut r = nv::DrmNouveauExec {
+        channel: ch,
+        push_count: 1,
+        wait_count: 0,
+        sig_count: 1,
+        wait_ptr: 0,
+        sig_ptr: ptr_of(&nobodys),
+        push_ptr: 0,
+    };
+    assert_eq!(
+        exec_raw(&gpu, A, &mut r),
+        Err(nv::EFAULT),
+        "pushes with no array, ahead of the sig nobody owns"
+    );
+    // With the pushes sound, the syncs decide as before.
+    assert_eq!(
+        exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[sync(NOBODYS)]),
+        Err(nv::ENOENT)
+    );
+    assert_eq!(
+        exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[odd()], &[sync(mine)]),
+        Err(nv::EOPNOTSUPP)
+    );
+    assert_eq!(
+        rm_calls_since(before),
+        [] as [&str; 0],
+        "nothing reached the ring"
+    );
+    assert_eq!(syncobj::query(mine), Some(0), "nothing signaled");
+    syncobj::destroy(mine);
+}

@@ -469,3 +469,202 @@ fn a_vm_bind_map_names_its_object_before_its_window_and_an_unknown_op_fails_afte
     gpu.nouveau_release_process(A);
     gpu.nouveau_release_process(B);
 }
+
+/// Each GPU context has its own RM client now, so a bind is no longer four
+/// handles in one client: the GEM object lives in the shared client (GEM_NEW
+/// knows nothing about contexts) and the VA space in the context's own. The RM
+/// bridges that by duping the object into the context's client and mapping the
+/// dup, and the unbind has to hand that dup back -- the handle exists in that
+/// one client, so a free naming any other frees nothing or frees the wrong
+/// thing. The fake RM counts either mistake as `bad`, which is what makes this
+/// test about the bookkeeping and not about the fake.
+#[test]
+fn a_bind_into_a_clients_own_context_dups_the_object_in_and_the_unbind_gives_it_back() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    channel_alloc(&gpu, A).unwrap();
+    let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    const VA: u64 = 0x3f_f000_0000;
+    assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, VA, 65536)]), Ok(0));
+    let ctx = ctx_of(&gpu, A).expect("A got a context of its own").0;
+    assert_ne!(ctx, 0, "A is not the compositor");
+
+    let (h_virt, h_dup) = {
+        let f = FAKE_RM.lock();
+        assert_eq!(f.maps.len(), 1);
+        assert_eq!(f.maps[0].1, ctx, "mapped in A's context");
+        (f.maps[0].0, f.maps[0].7)
+    };
+    assert_ne!(h_dup, 0, "the object was duped into A's client");
+    assert_ne!(h_dup, h_virt, "the dup is not the virtual range");
+
+    // The driver keeps both handles AND the context with the mapping, rather
+    // than deriving the context from the pid later: by teardown time the pid
+    // may have no context at all.
+    {
+        let maps = gpu.nouveau_vm_mappings.lock();
+        let m = maps.iter().find(|m| m.va == VA).expect("recorded");
+        assert_eq!((m.h_virt, m.h_dup, m.ctx_idx), (h_virt, h_dup, ctx));
+    }
+
+    gpu.nouveau_release_process(A);
+    assert!(FAKE_RM.lock().maps.is_empty(), "the mapping went with A");
+    assert_eq!(
+        FAKE_RM.lock().bad,
+        0,
+        "the unbind named A's context and its dup"
+    );
+}
+
+/// Under `nvidia.compositor_ctx0` the compositor stays on context 0 -- the
+/// boot ladder, on the shared kernel RM client -- so its bind crosses no
+/// client and needs no dup. That is the escape hatch, not the default: the
+/// compositor is the one process whose failure takes the desktop with it, so
+/// the old shape has to stay reachable without a rebuild, and this is what it
+/// does when it is asked for. (The price of it is in the hatch's own doc: on
+/// context 0 the compositor cannot appear in `nvidia-smi`'s process table.)
+#[test]
+fn under_the_hatch_a_compositor_bind_crosses_no_client_and_is_not_duped() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm_ladder();
+    // After the gpu: its setup clears the flag, so a panicking test cannot
+    // leave the hatch open for the next one.
+    nv::set_compositor_ctx0(true);
+    let comp = 70_001u64;
+    channel_alloc(&gpu, comp).unwrap();
+    assert_eq!(
+        ctx_of(&gpu, comp),
+        None,
+        "pinned to ctx 0: no context of its own"
+    );
+    let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, comp)
+        .unwrap()
+        .handle;
+    assert_eq!(
+        vm_bind_ops(&gpu, comp, &mut [map(h, 0x3f_f000_0000, 65536)]),
+        Ok(0)
+    );
+    {
+        let f = FAKE_RM.lock();
+        assert_eq!(f.maps.len(), 1);
+        assert_eq!(f.maps[0].1, 0, "context 0, the shared ladder's");
+        assert_eq!(f.maps[0].7, 0, "nothing to dup inside one client");
+    }
+    gpu.nouveau_release_process(comp);
+    assert_eq!(FAKE_RM.lock().bad, 0);
+    nv::set_compositor_ctx0(false);
+}
+
+/// And by default it is a client like any other: its own context, its own RM
+/// client under its own pid, so the GEM object -- which stays in the shared
+/// client that made it -- is duped in exactly as a GL client's is.
+#[test]
+fn a_compositor_bind_goes_into_its_own_client_and_is_duped_like_any_other() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm_ladder();
+    let comp = 70_001u64;
+    channel_alloc(&gpu, comp).unwrap();
+    let ctx = ctx_of(&gpu, comp).expect("a context of its own").0;
+    assert!(ctx >= 1, "never index 0: that is the boot ladder");
+    let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, comp)
+        .unwrap()
+        .handle;
+    assert_eq!(
+        vm_bind_ops(&gpu, comp, &mut [map(h, 0x3f_f000_0000, 65536)]),
+        Ok(0)
+    );
+    {
+        let f = FAKE_RM.lock();
+        assert_eq!(f.maps.len(), 1);
+        assert_eq!(f.maps[0].1, ctx, "its own context");
+        assert_ne!(f.maps[0].7, 0, "the GEM object duped into its client");
+    }
+    gpu.nouveau_release_process(comp);
+    assert!(
+        FAKE_RM.lock().maps.is_empty(),
+        "the mapping went with the compositor"
+    );
+    assert_eq!(
+        FAKE_RM.lock().bad,
+        0,
+        "the unbind named its context and its dup"
+    );
+}
+
+/// `nouveau_uvmm_vm_bind_ucopy` copies the op, wait and sig lists before
+/// `nouveau_uvmm_vm_bind` builds the job, and it is `nouveau_job_init`,
+/// building it, that refuses syncs on a synchronous bind (no RUN_ASYNC):
+/// a count with no array is EFAULT whether or not the bind is
+/// asynchronous, and the EINVAL comes once the lists are in. This applied
+/// the rule before the copy, so a synchronous bind naming a sync list it
+/// had no array for was EINVAL.
+#[test]
+fn vm_bind_copies_its_lists_before_the_rule_against_syncs_on_a_synchronous_bind() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    // A has an RM channel (or VM_BIND is ENODEV before anything) and one
+    // mapping of its own, which the binds below never add to.
+    let _ch = client_with_pushbuf(&gpu, A);
+    let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    // A wait the job could take (signaled) and a sig it could deliver: the
+    // rule, not the lookups, is what refuses them.
+    let done = syncobj::create(true);
+    let out = syncobj::create(false);
+    let waits = [sync(done)];
+    let sigs = [sync(out)];
+    let mut ops = [map(h, 0x2_0000_0000, 65536)];
+    let (ops_p, waits_p, sigs_p) = (ops.as_mut_ptr() as u64, ptr_of(&waits), ptr_of(&sigs));
+    let before = FAKE_RM.lock().calls.len();
+    let had = driver_maps(&gpu, A).len();
+    let raw = |op_ptr: u64, waits: (u32, u64), sigs: (u32, u64)| {
+        let mut r = nv::DrmNouveauVmBind {
+            op_count: 1,
+            flags: 0,
+            wait_count: waits.0,
+            sig_count: sigs.0,
+            wait_ptr: waits.1,
+            sig_ptr: sigs.1,
+            op_ptr,
+        };
+        call(&gpu, wr::<nv::DrmNouveauVmBind>(nv::NR_VM_BIND), &mut r, A)
+    };
+    assert_eq!(
+        raw(ops_p, (1, 0), (0, 0)),
+        Err(nv::EFAULT),
+        "waits with no array: the copy faults first"
+    );
+    assert_eq!(
+        raw(ops_p, (0, 0), (1, 0)),
+        Err(nv::EFAULT),
+        "sigs with no array"
+    );
+    assert_eq!(
+        raw(0, (1, waits_p), (0, 0)),
+        Err(nv::EFAULT),
+        "ops with no array, the waits with one"
+    );
+    assert_eq!(
+        raw(ops_p, (1, waits_p), (0, 0)),
+        Err(nv::EINVAL),
+        "the lists in: a synchronous bind carries no waits"
+    );
+    assert_eq!(raw(ops_p, (0, 0), (1, sigs_p)), Err(nv::EINVAL), "nor sigs");
+    assert_eq!(
+        raw(ops_p, (1, waits_p), (1, sigs_p)),
+        Err(nv::EINVAL),
+        "nor both"
+    );
+    assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+    assert_eq!(driver_maps(&gpu, A).len(), had, "nothing bound");
+    assert_eq!(syncobj::query(out), Some(0), "nothing signaled");
+    syncobj::destroy(done);
+    syncobj::destroy(out);
+}

@@ -656,8 +656,8 @@ async fn run_user(thread: CurrentThread) {
         } else {
             None
         };
-        if let Some((signal, sigmask)) = pending_signal {
-            ctx = handle_signal(&thread, ctx, signal, sigmask, &mut interrupted);
+        if let Some((signal, sigmask, info)) = pending_signal {
+            ctx = handle_signal(&thread, ctx, signal, sigmask, info, &mut interrupted);
         }
         if thread_should_stop(&thread) {
             break;
@@ -772,6 +772,7 @@ fn handle_signal(
     mut ctx: Box<UserContext>,
     signal: Signal,
     sigmask: Sigset,
+    signal_info: SigInfo,
     interrupted: &mut Option<Interrupted>,
 ) -> Box<UserContext> {
     let user_sp = ctx.get_field(UserContextField::StackPointer);
@@ -986,7 +987,8 @@ fn handle_signal(
     }
     // What the sender left for the handler: `si_pid`/`si_uid` of a `kill`,
     // the child and its status of a `SIGCHLD`. Bare (number only) otherwise.
-    let signal_info = thread.inner().lock_linux().take_siginfo(signal);
+    // `handle_signal` took it out with the signal.
+    thread.inner().lock_linux().deliver_siginfo(signal_info);
     // `uc_stack`: the alternate stack as it was, for `sigreturn` to put
     // back; taking it disarms an `SS_AUTODISARM` stack for the length of
     // the handler (`signal_delivered()`). It went to userspace as zeros.
@@ -1473,6 +1475,10 @@ async fn handle_user_trap(
                 .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                 .unwrap_or(0);
             let fault_result = vmar.handle_page_fault(vaddr, flags);
+            if fault_result.is_ok() {
+                // `ru_minflt`: every fault the address space resolves is one.
+                thread.note_minor_fault();
+            }
             if let Err(err) = fault_result {
                 if !fault_kills(thread, Signal::SIGSEGV) {
                     // The process asked for this fault: a handler is waiting

@@ -514,6 +514,8 @@ fn gem_pushbuf_maps_each_buffer_once_writes_presumed_back_and_pushes_in_order() 
         gpu.nouveau_vm_mappings.lock().push(nv::NouveauVmMapping {
             gem_handle: other,
             h_virt: 0xbeef,
+            h_dup: 0,
+            ctx_idx: 0,
             owner_pid: owner,
             va,
             size,

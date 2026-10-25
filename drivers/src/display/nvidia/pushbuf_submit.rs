@@ -163,6 +163,8 @@ impl super::NvidiaGpu {
             self.nouveau_vm_mappings.lock().push(nv::NouveauVmMapping {
                 gem_handle: bo.handle,
                 h_virt: bind.h_virt,
+                h_dup: bind.h_dup,
+                ctx_idx,
                 owner_pid,
                 va: bind.actual_va,
                 size,

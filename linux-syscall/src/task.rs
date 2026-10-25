@@ -41,6 +41,8 @@ mod kcmp;
 mod process_vm;
 /// `struct sched_attr` in and out.
 mod sched_attr;
+mod sched_task;
+use sched_task::SchedTask;
 /// `unshare(2)` without namespaces.
 mod unshare;
 use sched_attr::*;
@@ -1830,18 +1832,19 @@ impl Syscall<'_> {
     /// `getpriority` and `ioprio_get` calls made right after the `waitpid`
     /// found that thread, where Linux answers `ESRCH`. A zombie still has its
     /// thread while it is in the job, and is found, as on Linux; once it has
-    /// left, it has no thread to answer with.
-    fn find_thread_by_tid(&self, pid: usize) -> Option<Arc<Thread>> {
+    /// left, its leader answers with what it left on file, and a pid whose
+    /// leader exited before the rest of its group names that leader, not
+    /// whichever thread is left ([`SchedTask::of_process`]).
+    fn find_task_by_tid(&self, pid: usize) -> Option<SchedTask> {
         let id = pid as KoID;
         for proc in linux_object::process::all_live_processes() {
             if let Ok(obj) = proc.get_child(id) {
                 if let Ok(thread) = obj.downcast_arc::<Thread>() {
-                    return Some(thread);
+                    return Some(SchedTask::Thread(thread));
                 }
             }
         }
-        let proc = linux_object::process::find_task(id)?;
-        proc.threads().first().cloned()
+        SchedTask::of_process(linux_object::process::find_task(id)?, id)
     }
 
     /// `sched_setaffinity` sets the CPU affinity mask of the thread `pid`.
@@ -1920,9 +1923,7 @@ impl Syscall<'_> {
         let mask = if pid == 0 || pid as u64 == self.thread.id() {
             self.thread.affinity()
         } else {
-            self.find_thread_by_tid(pid)
-                .ok_or(LxError::ESRCH)?
-                .affinity()
+            self.find_task_by_tid(pid).ok_or(LxError::ESRCH)?.affinity()
         } & Self::online_cpu_mask();
         // The kernel cpumask is 8 bytes wide for up to 64 CPUs; copy out at most
         // that many (libc zero-fills any remaining bytes of its cpu_set_t).
@@ -1935,19 +1936,19 @@ impl Syscall<'_> {
     /// Resolve the thread targeted by a `sched_*` / `*priority` call.
     ///
     /// `pid == 0` (or the caller's own TID) selects the calling thread; any
-    /// other value is looked up with [`find_thread_by_tid`](Self::find_thread_by_tid),
+    /// other value is looked up with [`find_task_by_tid`](Self::find_task_by_tid),
     /// which also accepts a process id for single-threaded programs. Missing
     /// targets yield `ESRCH`, matching Linux.
-    fn sched_target(&self, pid: usize) -> Result<Arc<Thread>, LxError> {
+    fn sched_target(&self, pid: usize) -> Result<SchedTask, LxError> {
         // A `pid_t`: the low 32 bits of the register. The `sched_*` calls
         // that answer EINVAL for a negative one have already said so through
         // `intarg::sched_pid`; what reaches here negative is a task that
         // `find_task_by_vpid` does not find.
         let pid = crate::intarg::task_pid(pid)?;
         if pid == 0 || pid as u64 == self.thread.id() {
-            Ok(self.thread.inner())
+            Ok(SchedTask::Thread(self.thread.inner()))
         } else {
-            self.find_thread_by_tid(pid).ok_or(LxError::ESRCH)
+            self.find_task_by_tid(pid).ok_or(LxError::ESRCH)
         }
     }
 
@@ -1991,7 +1992,7 @@ impl Syscall<'_> {
     /// `EPERM` for one the caller may not make.
     fn check_sched_permission(
         &self,
-        thread: &Arc<Thread>,
+        thread: &SchedTask,
         policy: u8,
         nice: i8,
         rt_priority: u8,
@@ -2259,7 +2260,7 @@ impl Syscall<'_> {
     /// the looking up. An empty set is `ESRCH`, which is what Linux's
     /// `error = -ESRCH` before the walk amounts to when the walk visits
     /// nobody.
-    pub(crate) fn priority_targets(&self, which: usize, who: usize) -> LxResult<Vec<Arc<Thread>>> {
+    pub(crate) fn priority_targets(&self, which: usize, who: usize) -> LxResult<Vec<SchedTask>> {
         let target = prio_target(
             which,
             who,
@@ -2270,22 +2271,23 @@ impl Syscall<'_> {
         let targets = match target {
             // find_task_by_vpid(): a pid that names nothing simply leaves the
             // set empty, which is the same ESRCH by another road. sched_target
-            // and not find_thread_by_tid, so the caller's own id still short-
+            // and not find_task_by_tid, so the caller's own id still short-
             // circuits to the running thread instead of being searched for.
             PrioTarget::Thread(tid) => self
                 .sched_target(tid as usize)
                 .ok()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            PrioTarget::Group(pgid) => linux_object::process::all_live_processes()
+            // A zombie is in its group and its user's until it is reaped.
+            PrioTarget::Group(pgid) => linux_object::process::live_and_zombie_processes()
                 .iter()
                 .filter(|p| linux_object::process::effective_pgid(p) == pgid)
-                .flat_map(|p| p.threads())
+                .flat_map(SchedTask::all_of)
                 .collect(),
-            PrioTarget::User(uid) => linux_object::process::all_live_processes()
+            PrioTarget::User(uid) => linux_object::process::live_and_zombie_processes()
                 .iter()
                 .filter(|p| p.try_linux().map(|lp| lp.uid()) == Some(uid))
-                .flat_map(|p| p.threads())
+                .flat_map(SchedTask::all_of)
                 .collect(),
         };
         if targets.is_empty() {
@@ -2295,7 +2297,7 @@ impl Syscall<'_> {
     }
 
     /// `set_one_prio()`: the two gates, then the store.
-    fn renice_one(&self, caller: &Credentials, thread: &Arc<Thread>, nice: i8) -> LxResult<()> {
+    fn renice_one(&self, caller: &Credentials, thread: &SchedTask, nice: i8) -> LxResult<()> {
         let proc = thread.proc();
         // A task whose process is already tearing down has no credentials to
         // judge, and is gone as far as this call is concerned.
@@ -2363,22 +2365,36 @@ impl Syscall<'_> {
         Ok(tid as usize)
     }
 
-    /// Get robust list.
+    /// `get_robust_list(2)`: where task `pid` keeps the list of robust
+    /// mutexes it holds.
+    ///
+    /// Linux asks `ptrace_may_access(PTRACE_MODE_READ_REALCREDS)` of the
+    /// caller first, as `kcmp` does: the head is an address in the target's
+    /// thread-local storage. Anybody could read anybody's here, root's
+    /// included (Linux 6.18: `EPERM` for another user, `zsched-survey`).
     pub fn sys_get_robust_list(
         &self,
         pid: i32,
         head_ptr: UserOutPtr<UserOutPtr<RobustList>>,
         len_ptr: UserOutPtr<usize>,
     ) -> SysResult {
-        let thread = if pid == 0 {
-            self.thread.inner()
+        let task = if pid == 0 {
+            SchedTask::Thread(self.thread.inner())
         } else if pid < 0 {
             return Err(LxError::ESRCH);
         } else {
-            self.find_thread_by_tid(pid as usize)
-                .ok_or(LxError::ESRCH)?
+            self.find_task_by_tid(pid as usize).ok_or(LxError::ESRCH)?
         };
-        thread.get_robust_list(head_ptr, len_ptr)
+        let target = task.proc().try_linux().ok_or(LxError::ESRCH)?;
+        if !LinuxProcess::may_attach_to(
+            &self.linux_process().credentials(),
+            &target.credentials(),
+            task.proc().id() == self.zircon_process().id(),
+            target.dumpable(),
+        ) {
+            return Err(LxError::EPERM);
+        }
+        task.get_robust_list(head_ptr, len_ptr)
     }
 
     /// Set robust list.
@@ -3307,7 +3323,8 @@ mod waitid_report_tests {
     }
 
     /// A child found is a `SIGCHLD` `siginfo_t` with its pid where glibc
-    /// reads `si_pid`, and its CPU time and context switches in the `rusage`.
+    /// reads `si_pid`, and its CPU time, context switches and minor faults in
+    /// the `rusage`.
     #[test]
     fn a_reported_child_carries_its_pid_and_its_cpu_time() {
         let cpu = ChildCpu {
@@ -3315,6 +3332,7 @@ mod waitid_report_tests {
             stime_ns: 250_000,
             voluntary_switches: 26,
             involuntary_switches: 3,
+            minor_faults: 1_027,
         };
         let report = waitid_report(Some((4242, 1000, 7 << 8, cpu)));
         assert_eq!(report.info.signo, LinuxSignal::SIGCHLD as i32);
@@ -3325,7 +3343,8 @@ mod waitid_report_tests {
         assert_eq!((rusage.utime.sec, rusage.utime.usec), (1, 500_000));
         assert_eq!((rusage.stime.sec, rusage.stime.usec), (0, 250));
         assert_eq!((rusage.nvcsw, rusage.nivcsw), (26, 3));
-        assert_eq!((rusage.maxrss, rusage.minflt), (0, 0), "not kept");
+        assert_eq!(rusage.minflt, 1_027);
+        assert_eq!(rusage.maxrss, 0, "not kept");
     }
 
     /// The same struct `wait4` writes: `time(1)` over either call agrees.

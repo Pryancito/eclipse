@@ -144,7 +144,7 @@ pub(super) fn chan_notifier_pa_cached() -> Option<u64> {
 }
 
 /// Engine-class objects on a process's channel, keyed by `(channel_token,
-/// object_token, rm_handle, owner_pid, abi16)`. The channel token is the id
+/// object_token, rm_handle, owner_pid, abi16, ctx_idx)`. The channel token is the id
 /// CHANNEL_ALLOC handed back (and mesa echoes as NVIF `token`); draining by
 /// channel on `CHANNEL_FREE` reaps the throwaway-enumeration leak (NEW without
 /// DEL) without touching another live channel's classes. `abi16` marks an
@@ -154,7 +154,12 @@ pub(super) fn chan_notifier_pa_cached() -> Option<u64> {
 /// object is recorded only when it is backed by a REAL RM class object; an
 /// abi16 one always is, with `rm_handle` 0 when there is no RM behind it, so
 /// `GPUOBJ_FREE` can tell it from a handle never allocated (ENOENT).
-static CLASS_OBJECTS: lock::Mutex<alloc::vec::Vec<(u64, u64, u32, u64, bool)>> =
+/// `ctx_idx` is the GPU context the object was allocated in, recorded rather
+/// than looked up again at free time: the RM handle lives in THAT context's
+/// client and nowhere else, and by the time the object is freed the owning
+/// process may have been given a different context (a wedged rebuild) or
+/// none. It is returned alongside `rm_handle` by every remove/drain below.
+static CLASS_OBJECTS: lock::Mutex<alloc::vec::Vec<(u64, u64, u32, u64, bool, u32)>> =
     lock::Mutex::new(alloc::vec::Vec::new());
 
 pub(super) fn class_object_insert(
@@ -162,29 +167,54 @@ pub(super) fn class_object_insert(
     object_token: u64,
     rm_handle: u32,
     owner_pid: u64,
+    ctx_idx: u32,
 ) {
-    CLASS_OBJECTS
-        .lock()
-        .push((channel_token, object_token, rm_handle, owner_pid, false));
+    CLASS_OBJECTS.lock().push((
+        channel_token,
+        object_token,
+        rm_handle,
+        owner_pid,
+        false,
+        ctx_idx,
+    ));
 }
 
 /// An abi16 `GROBJ_ALLOC` object: `handle` is the 32-bit one the client chose.
-pub(super) fn abi16_object_insert(channel_token: u64, handle: u32, rm_handle: u32, owner_pid: u64) {
-    CLASS_OBJECTS
-        .lock()
-        .push((channel_token, handle as u64, rm_handle, owner_pid, true));
+pub(super) fn abi16_object_insert(
+    channel_token: u64,
+    handle: u32,
+    rm_handle: u32,
+    owner_pid: u64,
+    ctx_idx: u32,
+) {
+    CLASS_OBJECTS.lock().push((
+        channel_token,
+        handle as u64,
+        rm_handle,
+        owner_pid,
+        true,
+        ctx_idx,
+    ));
 }
 
 /// `GPUOBJ_FREE`'s lookup: the abi16 object `handle` of `channel_token`, the
 /// caller's, removed; its RM handle (0 when it had none). An NVIF object of the
-/// same cookie is not found (`chan->notifiers` does not list it).
-pub(super) fn abi16_object_remove(channel_token: u64, handle: u32, owner_pid: u64) -> Option<u32> {
+/// same cookie is not found (`chan->notifiers` does not list it). Returns
+/// `(rm_handle, ctx_idx)`.
+pub(super) fn abi16_object_remove(
+    channel_token: u64,
+    handle: u32,
+    owner_pid: u64,
+) -> Option<(u32, u32)> {
     let mut t = CLASS_OBJECTS.lock();
     t.iter()
-        .position(|(ch, obj, _, pid, abi16)| {
+        .position(|(ch, obj, _, pid, abi16, _)| {
             *abi16 && *ch == channel_token && *obj == handle as u64 && *pid == owner_pid
         })
-        .map(|i| t.remove(i).2)
+        .map(|i| {
+            let e = t.remove(i);
+            (e.2, e.5)
+        })
 }
 
 /// Removes and returns the RM handle for `object_token`, if it was RM-backed —
@@ -195,29 +225,33 @@ pub(super) fn abi16_object_remove(channel_token: u64, handle: u32, owner_pid: u6
 /// DEL free ANOTHER live client's (or the compositor's) engine-class object —
 /// tearing its 3D class out from under a running channel, whose next method
 /// of that class then MMU-faults. Match on (object_token, pid) so a DEL can
-/// only ever free the caller's own object.
-pub(super) fn class_object_remove(object_token: u64, owner_pid: u64) -> Option<u32> {
+/// only ever free the caller's own object. Returns `(rm_handle, ctx_idx)`.
+pub(super) fn class_object_remove(object_token: u64, owner_pid: u64) -> Option<(u32, u32)> {
     let mut t = CLASS_OBJECTS.lock();
     t.iter()
-        .position(|(_, obj, _, pid, abi16)| !*abi16 && *obj == object_token && *pid == owner_pid)
-        .map(|i| t.remove(i).2)
+        .position(|(_, obj, _, pid, abi16, _)| !*abi16 && *obj == object_token && *pid == owner_pid)
+        .map(|i| {
+            let e = t.remove(i);
+            (e.2, e.5)
+        })
 }
 
 /// Drains class objects bound to `channel_token` for `owner_pid` (a
 /// `CHANNEL_FREE` of that channel). Other channels' objects stay.
+/// Each entry is `(object_token, rm_handle, ctx_idx)`.
 pub(super) fn class_objects_drain_channel(
     channel_token: u64,
     owner_pid: u64,
-) -> alloc::vec::Vec<(u64, u32)> {
+) -> alloc::vec::Vec<(u64, u32, u32)> {
     let mut t = CLASS_OBJECTS.lock();
     let mut out = alloc::vec::Vec::new();
     let mut i = 0;
     while i < t.len() {
         if t[i].0 == channel_token && t[i].3 == owner_pid {
-            let (_ch, token, h, _, _) = t.remove(i);
+            let (_ch, token, h, _, _, ctx_idx) = t.remove(i);
             // An abi16 object without an RM handle has nothing to free.
             if h != 0 {
-                out.push((token, h));
+                out.push((token, h, ctx_idx));
             }
         } else {
             i += 1;
@@ -227,16 +261,17 @@ pub(super) fn class_objects_drain_channel(
 }
 
 /// Drains the class objects owned by `pid` (that process's exit / teardown),
-/// returning `(token, rm_handle)` for each. Other processes' objects stay.
-pub(super) fn class_objects_drain_pid(pid: u64) -> alloc::vec::Vec<(u64, u32)> {
+/// returning `(token, rm_handle, ctx_idx)` for each. Other processes' objects
+/// stay.
+pub(super) fn class_objects_drain_pid(pid: u64) -> alloc::vec::Vec<(u64, u32, u32)> {
     let mut t = CLASS_OBJECTS.lock();
     let mut out = alloc::vec::Vec::new();
     let mut i = 0;
     while i < t.len() {
         if t[i].3 == pid {
-            let (_ch, token, h, _, _) = t.remove(i);
+            let (_ch, token, h, _, _, ctx_idx) = t.remove(i);
             if h != 0 {
-                out.push((token, h));
+                out.push((token, h, ctx_idx));
             }
         } else {
             i += 1;
@@ -1548,6 +1583,18 @@ pub(super) struct NouveauVmMapping {
     /// RM's virtual-range object handle (`vm_bind_map`'s `h_virt`) -- needed
     /// to `Unmap`+`Free` it later.
     pub h_virt: u32,
+    /// The context client's own reference to the GEM object, from
+    /// `vm_bind_map`'s `h_dup`. A bind into a client's own context crosses RM
+    /// clients (the object is in the shared one, the VA space in the
+    /// context's), so the RM dups the object in and the mapping is made
+    /// through the dup; `vm_bind_unmap` needs it back to free it. 0 for a
+    /// compositor (ctx 0) bind, which needs no dup.
+    pub h_dup: u32,
+    /// The context this bind lives in, kept rather than re-derived from
+    /// `owner_pid`: `h_virt` and `h_dup` are handles in THAT context's client
+    /// and nowhere else, and by teardown time the pid may no longer have a
+    /// context to look up.
+    pub ctx_idx: u32,
     /// pid that created this mapping. With per-process GPU contexts each client
     /// has its OWN VA space, so a bind is meaningful ONLY within its owner's
     /// context: process-exit teardown and MAP/UNMAP overlap-replace must scope
@@ -2173,6 +2220,30 @@ pub fn set_exec_fast_enabled(v: bool) {
 
 pub fn exec_fast_enabled() -> bool {
     EXEC_FAST_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Whether the compositor keeps running on context 0 -- the singleton
+/// step16/step17 ladder on the shared boot-time RM client -- instead of
+/// getting a context of its own like every other DRM client.
+///
+/// Default OFF, which is the Linux shape: nouveau there opens an RM client
+/// per DRM file, there is no singleton, and so every graphics process -- the
+/// compositor included -- is a client the RM can name. Ours could not: the
+/// boot ladder's client is `RS_PRIV_LEVEL_KERNEL` + admin and
+/// `gpuGetProcWithObject_IMPL` skips exactly those, so the compositor never
+/// appeared in `nvidia-smi`'s process table however correct its pid was.
+///
+/// Set by the `nvidia.compositor_ctx0` cmdline flag to pin the old shape
+/// without a rebuild -- the compositor is the one process whose failure takes
+/// the desktop down with it.
+static COMPOSITOR_CTX0: AtomicBool = AtomicBool::new(false);
+
+pub fn set_compositor_ctx0(v: bool) {
+    COMPOSITOR_CTX0.store(v, Ordering::SeqCst);
+}
+
+pub fn compositor_ctx0() -> bool {
+    COMPOSITOR_CTX0.load(Ordering::Relaxed)
 }
 
 /// Per-context constants for a direct submit, derived from

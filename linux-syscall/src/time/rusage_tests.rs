@@ -1,8 +1,8 @@
 //! What `getrusage(2)` reports for each `who`: the calling thread's own, the
 //! process's with its exited threads, the reaped children's with theirs.
-//! The context switch counts were 0 for all three.
+//! The context switch counts and the minor faults were 0 for all three.
 //!
-//! Fixed pids live in 45_39x here.
+//! Fixed pids live in 45_39x here, and 47_11x.
 
 extern crate std;
 
@@ -76,4 +76,57 @@ fn each_who_reports_its_own_tasks_context_switches() {
         "RUSAGE_SELF: every thread, the one gone too"
     );
     assert_eq!((children.nvcsw, children.nivcsw), (8, 5), "RUSAGE_CHILDREN");
+}
+
+fn faults(thread: &Thread, faults: usize) {
+    for _ in 0..faults {
+        thread.note_minor_fault();
+    }
+}
+
+#[test]
+fn each_who_reports_its_own_tasks_minor_faults() {
+    let proc = Process::create_with_fixed_id_ext(
+        &ROOT_JOB,
+        47_111,
+        "rusage",
+        LinuxProcess::new(RamFS::new(), 0),
+    )
+    .unwrap();
+    // A thread still there, and one gone.
+    let other = Thread::create_linux(&proc).unwrap();
+    faults(&other, 2);
+    let gone = Thread::create_linux(&proc).unwrap();
+    faults(&gone, 4);
+    gone.terminate_abandoned();
+    // A child that has been reaped.
+    let child = Process::fork_from(&proc).unwrap();
+    let child_thread = Thread::create_linux(&child).unwrap();
+    faults(&child_thread, 1_024);
+    child.exit(0);
+    block_on(wait_child(&proc, child.id(), true, true)).unwrap();
+    child_thread.terminate_abandoned();
+
+    let (thread, process, children) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            faults(sys.thread, 16);
+            (
+                usage(sys, RUSAGE_THREAD),
+                usage(sys, RUSAGE_SELF),
+                usage(sys, RUSAGE_CHILDREN),
+            )
+        })
+    });
+    assert_eq!(thread.minflt, 16, "RUSAGE_THREAD");
+    assert_eq!(
+        process.minflt,
+        16 + 2 + 4,
+        "RUSAGE_SELF: every thread, the one gone too"
+    );
+    assert_eq!(children.minflt, 1_024, "RUSAGE_CHILDREN");
+    assert_eq!(
+        (thread.majflt, process.majflt, children.majflt),
+        (0, 0, 0),
+        "no fault here reads a disk"
+    );
 }

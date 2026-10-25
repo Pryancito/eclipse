@@ -484,6 +484,16 @@ pub fn set_exec_fast_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_exec_fast_enabled(_v: bool) {}
 
+/// Whether the compositor keeps context 0 (the singleton boot ladder on the
+/// shared kernel RM client) instead of a context -- and an RM client -- of its
+/// own. Default off, the Linux shape; `nvidia.compositor_ctx0` pins the old one.
+#[cfg(target_arch = "x86_64")]
+pub fn set_compositor_ctx0(v: bool) {
+    zcore_drivers::display::set_compositor_ctx0(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_compositor_ctx0(_v: bool) {}
+
 /// Opt-in CE present on DRM `page_flip` (`nvidia.hwflip`). Default off.
 #[cfg(target_arch = "x86_64")]
 pub fn set_hwflip_enabled(v: bool) {

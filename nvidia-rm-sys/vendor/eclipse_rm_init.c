@@ -1502,11 +1502,11 @@ static NvBool g_grAllocDone[ECLIPSE_MAX_GPUS];
  * card's numbers (see eclipseDemoForeignGpu).
  *
  * The ladder itself and the per-client contexts are no longer in that boat:
- * g_grAllocCache, g_grChanCache and g_ctxAlloc are indexed by gpuInstance, so
- * each card builds its own RM client, VA space, TSG and channel. That is what
- * lets a 1+1 split work -- graphics served by the RM on the card that scans
- * out the console, compute on the other -- instead of every client on the
- * second card being refused. */
+ * g_grAllocCache, g_grChanCache, g_ctxAlloc and the per-context client/device
+ * pair are all indexed by gpuInstance, so each card builds its own RM client,
+ * VA space, TSG and channel. That is what lets a 1+1 split work -- graphics
+ * served by the RM on the card that scans out the console, compute on the
+ * other -- instead of every client on the second card being refused. */
 static NvU32 g_demoOwnerGpu = 0xFFFFFFFF;
 /* VA space geometry RM actually GRANTED in step16 (the params are IN/OUT).
  * Kept out of EclipseGrAlloc so the Rust FFI struct keeps its ABI; printed on
@@ -1514,6 +1514,21 @@ static NvU32 g_demoOwnerGpu = 0xFFFFFFFF;
  * address apart from a badly-aligned one. */
 static NvU64 g_vasGrantedSize[ECLIPSE_MAX_GPUS];
 static NvU64 g_vasGrantedBase[ECLIPSE_MAX_GPUS];
+
+/* Whether `gpuInstance` has a ladder slot at all. Everything per-GPU in this
+ * file is a fixed array, so an instance past the end has to be refused by
+ * name: sharing another card's slot is how the bugs this file documents got
+ * made in the first place. */
+static NvBool eclipseLadderSlot(NvU32 gpuInstance, const char *what)
+{
+    if (gpuInstance < ECLIPSE_MAX_GPUS)
+    {
+        return NV_TRUE;
+    }
+    nv_printf(0, "[eclipse-rm-trace] %s on gpu%u refused: ECLIPSE_MAX_GPUS is %u\n",
+              what, gpuInstance, (NvU32)ECLIPSE_MAX_GPUS);
+    return NV_FALSE;
+}
 
 /* Whether `gpuInstance` is a card OTHER than the one holding the singleton
  * demo/bench caches.
@@ -1538,6 +1553,13 @@ static NvU64 g_vasGrantedBase[ECLIPSE_MAX_GPUS];
  * being refused. */
 static NvBool eclipseDemoForeignGpu(NvU32 gpuInstance, const char *step)
 {
+    /* A demo step reads this card's ladder slot like any other entry point,
+     * so an instance with no slot is foreign here too -- and is refused
+     * before it can be recorded as the owner of the demo caches. */
+    if (!eclipseLadderSlot(gpuInstance, step))
+    {
+        return NV_TRUE;
+    }
     if (g_demoOwnerGpu == 0xFFFFFFFF)
     {
         g_demoOwnerGpu = gpuInstance;
@@ -1550,21 +1572,6 @@ static NvBool eclipseDemoForeignGpu(NvU32 gpuInstance, const char *step)
     nv_printf(0, "[eclipse-rm-trace] %s on gpu%u rejected (demo caches belong to gpu%u)\n",
               step, gpuInstance, g_demoOwnerGpu);
     return NV_TRUE;
-}
-
-/* Whether `gpuInstance` has a ladder slot at all. Everything per-GPU in this
- * file is a fixed array, so an instance past the end has to be refused by
- * name: sharing another card's slot is how the bugs this file documents got
- * made in the first place. */
-static NvBool eclipseLadderSlot(NvU32 gpuInstance, const char *what)
-{
-    if (gpuInstance < ECLIPSE_MAX_GPUS)
-    {
-        return NV_TRUE;
-    }
-    nv_printf(0, "[eclipse-rm-trace] %s on gpu%u refused: ECLIPSE_MAX_GPUS is %u\n",
-              what, gpuInstance, (NvU32)ECLIPSE_MAX_GPUS);
-    return NV_FALSE;
 }
 
 NV_STATUS eclipse_rm_step16(NvU32 gpuInstance, EclipseGrAlloc *pOut)
@@ -2189,7 +2196,7 @@ unlock:
  * Sized 32 (was 8) after a real-RTX boot exhausted the slots. Contexts are
  * built lazily -- one per distinct client pid, freed on process exit
  * (eclipse_rm_ctx_free from nouveau_release_process) -- so this is a CAP, not a
- * preallocation: the g_ctxAlloc bookkeeping grows, but GPU resources are only
+ * preallocation: the g_ctxAlloc[gpuInstance] bookkeeping grows, but GPU resources are only
  * spent for contexts actually in use. A Turing runlist holds hundreds of
  * channels, so 32 is comfortable. The wider cap absorbs the labwc startup burst
  * and crash-loop respawn overlap (an old generation's teardown racing a new
@@ -2232,11 +2239,183 @@ static NvBool          g_ctxDone[ECLIPSE_MAX_GPUS][ECLIPSE_MAX_CTX];
  * Kept OUTSIDE EclipseCtxAlloc so the Rust FFI mirror keeps its ABI (the Rust
  * side never needs the handle). 0 = none. Freed in ctx_free / failure path. */
 static NvU32           g_ctx3dObj[ECLIPSE_MAX_GPUS][ECLIPSE_MAX_CTX];
+/* The RM client and device each per-process context is built under, so the
+ * RM can say WHICH process holds a channel on this GPU.
+ *
+ * They used to be the shared pair from step16, which is allocated through
+ * `rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL)` at boot: a client of
+ * RS_PRIV_LEVEL_KERNEL whose ProcID is whatever osGetCurrentProcess()
+ * answered then, which is 0. gpuGetProcWithObject -- the body of
+ * NV2080_CTRL_CMD_GPU_GET_PIDS, which is what NVML asks for nvidia-smi's
+ * "Processes" table -- walks the client list and skips exactly that:
+ *
+ *     if ((privLevel >= RS_PRIV_LEVEL_KERNEL) && rmclientIsAdmin(...))
+ *         continue;   // Skip reporting of kernel mode and internal RM clients
+ *
+ * So every GPU client on NVK -- the compositor, Xwayland, every GL app --
+ * held a real channel on a client the table discards by construction, and the
+ * desktop was invisible to nvidia-smi while CUDA (which opens /dev/nvidiactl
+ * and gets a user client of its own) was not.
+ *
+ * Only the CLIENT is allocated with a user-level security info; the ladder
+ * under it keeps running on the internal RM_API exactly as before. The
+ * privilege the RM checks for a privileged allocation comes from the call's
+ * secInfo, so nothing in the ladder loses rights; what changes is
+ * `cachedPrivilege` and `ProcID` on the owning client, which is what the
+ * table reads. 0 = none (the context is not built, or predates this). */
+static NvU32           g_ctxClient[ECLIPSE_MAX_GPUS][ECLIPSE_MAX_CTX];
+static NvU32           g_ctxDevice[ECLIPSE_MAX_GPUS][ECLIPSE_MAX_CTX];
+
+/* Security info for a per-context client: RS_PRIV_LEVEL_USER_ROOT, the same
+ * level the front end gives an ioctl from a root process, and below
+ * RS_PRIV_LEVEL_KERNEL so gpuGetProcWithObject reports it. Parameters are the
+ * kernel's own (PARAM_LOCATION_KERNEL): this is not a user call, there is no
+ * user pointer anywhere in it. clientOSInfo is NULL because no /dev/nvidiactl
+ * open owns this client -- eclipse_rm_ctx_free frees it explicitly. */
+static API_SECURITY_INFO _eclipse_rm_ctx_sec_info(void)
+{
+    API_SECURITY_INFO secInfo;
+    portMemSet(&secInfo, 0, sizeof(secInfo));
+    secInfo.privLevel = RS_PRIV_LEVEL_USER_ROOT;
+    secInfo.paramLocation = PARAM_LOCATION_KERNEL;
+    secInfo.pProcessToken = NULL;
+    secInfo.gpuOsInfo = NULL;
+    secInfo.clientOSInfo = NULL;
+    return secInfo;
+}
+
+/* Build the client + device a per-process context hangs off. The client is
+ * the one allocation that must carry the caller's identity: its ProcID comes
+ * from osGetCurrentProcess(), which the Rust side has pointed at the process
+ * whose DRM ioctl this is (frontend::AttributedTo). The device is an ordinary
+ * internal allocation under it -- gpuGetProcWithObject needs a Device on this
+ * GPU under the client (deviceGetByGpu) before it will look at its channels
+ * at all. On any failure nothing is left behind. */
+static NV_STATUS _eclipse_rm_ctx_client(NvU32 ctxIdx, NvU32 deviceInstance,
+                                        NvU32 *phClient, NvU32 *phDevice)
+{
+    /* The SAME interface the rest of this file uses: the API lock is already
+     * held here, so an external interface would deadlock re-taking it. Only
+     * the security info differs, and `AllocWithSecInfo` is where it is
+     * honoured -- the interface decides the LOCKING, the secInfo decides the
+     * privilege the new client caches. */
+    RM_API            *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+    API_SECURITY_INFO  secInfo = _eclipse_rm_ctx_sec_info();
+    NV0080_ALLOC_PARAMETERS devParams;
+    NvU32                   hClient = NV01_NULL_OBJECT;
+    NvU32                   hDevice = 0;
+    RsClient               *pRsClient = NULL;
+    NV_STATUS               status;
+
+    *phClient = 0;
+    *phDevice = 0;
+
+    status = pRmApi->AllocWithSecInfo(pRmApi, NV01_NULL_OBJECT, NV01_NULL_OBJECT,
+                                      &hClient, NV01_ROOT, NV_PTR_TO_NvP64(&hClient),
+                                      sizeof(hClient), RMAPI_ALLOC_FLAGS_NONE,
+                                      NvP64_NULL, &secInfo);
+    nv_printf(0, "[eclipse-rm-trace] ctx%u: NV01_ROOT (user) -> 0x%x hClient=0x%x pid=%u\n",
+              ctxIdx, status, hClient, osGetCurrentProcess());
+    if (status != NV_OK)
+    {
+        return status;
+    }
+
+    /* Handles out of our own range, as step16 does for the shared client. */
+    status = serverGetClientUnderLock(&g_resServ, hClient, &pRsClient);
+    if (status == NV_OK)
+    {
+        status = clientSetHandleGenerator(pRsClient, 1U, ~0U - 1U);
+    }
+    if (status != NV_OK)
+    {
+        goto free_client;
+    }
+
+    portMemSet(&devParams, 0, sizeof(devParams));
+    devParams.deviceId = deviceInstance;
+    devParams.hClientShare = hClient;
+    status = clientGenResourceHandle(pRsClient, &hDevice);
+    if (status != NV_OK)
+    {
+        goto free_client;
+    }
+    status = pRmApi->AllocWithHandle(pRmApi, hClient, hClient, hDevice,
+                                     NV01_DEVICE_0, &devParams, sizeof(devParams));
+    nv_printf(0, "[eclipse-rm-trace] ctx%u: NV01_DEVICE_0 (user client) -> 0x%x hDevice=0x%x\n",
+              ctxIdx, status, hDevice);
+    if (status != NV_OK)
+    {
+        goto free_client;
+    }
+
+    *phClient = hClient;
+    *phDevice = hDevice;
+    return NV_OK;
+
+free_client:
+    pRmApi->Free(pRmApi, hClient, hClient);
+    return status;
+}
 /* Cross-ctx fence semaphore mappings: consumer VAS VA of producer's channel
  * sysmem fence page. Indexed [consumer][producer]. Cleared in ctx_free /
  * ctx0_reset when either endpoint is torn down. */
 static NvU64           g_peerFenceVa[ECLIPSE_MAX_GPUS][ECLIPSE_MAX_CTX][ECLIPSE_MAX_CTX];
 static NvU32           g_peerFenceHVirt[ECLIPSE_MAX_GPUS][ECLIPSE_MAX_CTX][ECLIPSE_MAX_CTX];
+/* The consumer client's own dup of the producer's fence page. A cross-ctx
+ * mapping is no longer a mapping inside one client: the producer's sysmem
+ * lives under the producer's client, so the consumer gets a duped handle to
+ * it (kernel dup privilege, below) and maps THAT. Zero when both endpoints
+ * share a client, which is still the case whenever ctx0 is one of them. */
+static NvU32           g_peerFenceDup[ECLIPSE_MAX_GPUS][ECLIPSE_MAX_CTX][ECLIPSE_MAX_CTX];
+
+/* The client/device a context's objects hang off. ctx0 (the compositor's
+ * singleton, built by step16/step17) still lives on the shared ladder client;
+ * every other context owns the pair _eclipse_rm_ctx_client made for it. A
+ * context whose client allocation failed falls back to the shared pair too,
+ * so a partially-built context is still freeable. */
+static void _eclipse_rm_ctx_handles(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 *phClient, NvU32 *phDevice)
+{
+    if (ctxIdx != 0 && ctxIdx < ECLIPSE_MAX_CTX && g_ctxClient[gpuInstance][ctxIdx] != 0)
+    {
+        *phClient = g_ctxClient[gpuInstance][ctxIdx];
+        *phDevice = g_ctxDevice[gpuInstance][ctxIdx];
+    }
+    else
+    {
+        *phClient = g_grAllocCache[gpuInstance].hClient;
+        *phDevice = g_grAllocCache[gpuInstance].hDevice;
+    }
+}
+
+/* Drop one (consumer, producer) fence mapping. Everything freed here belongs
+ * to the CONSUMER's client: the virtual allocation that carries the mapping,
+ * and the dup through which that client reaches the producer's page. Freeing
+ * the dup drops a reference, never the page itself -- the producer's own
+ * handle keeps it alive. Idempotent. */
+static void _eclipse_rm_peer_fence_drop(RM_API *pRmApi, NvU32 gpuInstance, NvU32 consumerCtx, NvU32 producerCtx)
+{
+    NvU32 hClient = 0, hDevice = 0;
+
+    if (g_peerFenceHVirt[gpuInstance][consumerCtx][producerCtx] == 0 &&
+        g_peerFenceDup[gpuInstance][consumerCtx][producerCtx] == 0)
+    {
+        g_peerFenceVa[gpuInstance][consumerCtx][producerCtx] = 0;
+        return;
+    }
+    _eclipse_rm_ctx_handles(gpuInstance, consumerCtx, &hClient, &hDevice);
+    if (g_peerFenceHVirt[gpuInstance][consumerCtx][producerCtx] != 0)
+    {
+        pRmApi->Free(pRmApi, hClient, g_peerFenceHVirt[gpuInstance][consumerCtx][producerCtx]);
+        g_peerFenceHVirt[gpuInstance][consumerCtx][producerCtx] = 0;
+    }
+    if (g_peerFenceDup[gpuInstance][consumerCtx][producerCtx] != 0)
+    {
+        pRmApi->Free(pRmApi, hClient, g_peerFenceDup[gpuInstance][consumerCtx][producerCtx]);
+        g_peerFenceDup[gpuInstance][consumerCtx][producerCtx] = 0;
+    }
+    g_peerFenceVa[gpuInstance][consumerCtx][producerCtx] = 0;
+}
 
 NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc *pOut)
 {
@@ -2246,6 +2425,8 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
     THREAD_STATE_NODE threadState;
     RsClient *pRsClient = NULL;
     NvBool failed = NV_FALSE;
+    NvU32 hCtxClient = 0;
+    NvU32 hCtxDevice = 0;
 
     if (pOut == NULL || ctxIdx == 0 || ctxIdx >= ECLIPSE_MAX_CTX)
     {
@@ -2302,10 +2483,22 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         return status;
     }
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
-    status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pRsClient);
+    /* This context's OWN client and device, filed under the pid of the
+     * process whose DRM ioctl this is, so nvidia-smi can name it. Everything
+     * below hangs off these instead of the shared step-16 pair; see
+     * `_eclipse_rm_ctx_client` for why that pair could never be reported. */
+    status = _eclipse_rm_ctx_client(ctxIdx, gpuGetDeviceInstance(pGpu),
+                                    &g_ctxClient[gpuInstance][ctxIdx], &g_ctxDevice[gpuInstance][ctxIdx]);
     if (status != NV_OK)
     {
         goto unlock;
+    }
+    hCtxClient = g_ctxClient[gpuInstance][ctxIdx];
+    hCtxDevice = g_ctxDevice[gpuInstance][ctxIdx];
+    status = serverGetClientUnderLock(&g_resServ, hCtxClient, &pRsClient);
+    if (status != NV_OK)
+    {
+        goto free_ctx_client;
     }
 
     /* 1. Per-context VA space (fresh, same 1<<40 geometry as step16). */
@@ -2315,9 +2508,9 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         params.index = NV_VASPACE_ALLOCATION_INDEX_GPU_NEW;
         params.vaSize = 1ULL << 40;
         status = clientGenResourceHandle(pRsClient, &pOut->hVas);
-        if (status != NV_OK) goto unlock;
-        pOut->vasStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                  g_grAllocCache[gpuInstance].hDevice, pOut->hVas,
+        if (status != NV_OK) goto free_ctx_client;
+        pOut->vasStatus = pRmApi->AllocWithHandle(pRmApi, hCtxClient,
+                                                  hCtxDevice, pOut->hVas,
                                                   FERMI_VASPACE_A, &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] ctx%u: FERMI_VASPACE_A -> 0x%x hVas=0x%x\n",
                   ctxIdx, pOut->vasStatus, pOut->hVas);
@@ -2331,9 +2524,9 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         params.hVASpace = pOut->hVas;
         params.engineType = NV2080_ENGINE_TYPE_GRAPHICS;
         status = clientGenResourceHandle(pRsClient, &pOut->hTsg);
-        if (status != NV_OK) goto unlock;
-        pOut->tsgStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                  g_grAllocCache[gpuInstance].hDevice, pOut->hTsg,
+        if (status != NV_OK) goto free_ctx_client;
+        pOut->tsgStatus = pRmApi->AllocWithHandle(pRmApi, hCtxClient,
+                                                  hCtxDevice, pOut->hTsg,
                                                   KEPLER_CHANNEL_GROUP_A, &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] ctx%u: KEPLER_CHANNEL_GROUP_A -> 0x%x hTsg=0x%x\n",
                   ctxIdx, pOut->tsgStatus, pOut->hTsg);
@@ -2347,8 +2540,8 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         params.hVASpace = pOut->hVas;
         params.flags = NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_SYNC;
         status = clientGenResourceHandle(pRsClient, &pOut->hCtxShare);
-        if (status != NV_OK) goto unlock;
-        pOut->ctxshareStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
+        if (status != NV_OK) goto free_ctx_client;
+        pOut->ctxshareStatus = pRmApi->AllocWithHandle(pRmApi, hCtxClient,
                                                        pOut->hTsg, pOut->hCtxShare,
                                                        FERMI_CONTEXT_SHARE_A, &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] ctx%u: FERMI_CONTEXT_SHARE_A -> 0x%x hCtxShare=0x%x\n",
@@ -2370,9 +2563,9 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
                       DRF_DEF(OS32, _ATTR, _ALLOCATE_FROM_RESERVED_HEAP, _YES);
         params.flags = NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM;
         status = clientGenResourceHandle(pRsClient, &pOut->hUserd);
-        if (status != NV_OK) goto unlock;
-        pOut->userdStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                    g_grAllocCache[gpuInstance].hDevice, pOut->hUserd,
+        if (status != NV_OK) goto free_ctx_client;
+        pOut->userdStatus = pRmApi->AllocWithHandle(pRmApi, hCtxClient,
+                                                    hCtxDevice, pOut->hUserd,
                                                     NV01_MEMORY_LOCAL_USER, &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] ctx%u: USERD (%u B) -> 0x%x hUserd=0x%x\n",
                   ctxIdx, pOut->userdSize, pOut->userdStatus, pOut->hUserd);
@@ -2389,9 +2582,9 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         params.attr = DRF_DEF(OS32, _ATTR, _LOCATION, _PCI);
         params.attr2 = NVOS32_ATTR2_NONE;
         status = clientGenResourceHandle(pRsClient, &pOut->hPhysBuf);
-        if (status != NV_OK) goto unlock;
-        pOut->bufStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                  g_grAllocCache[gpuInstance].hDevice, pOut->hPhysBuf,
+        if (status != NV_OK) goto free_ctx_client;
+        pOut->bufStatus = pRmApi->AllocWithHandle(pRmApi, hCtxClient,
+                                                  hCtxDevice, pOut->hPhysBuf,
                                                   NV01_MEMORY_SYSTEM, &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] ctx%u: sysmem buf 64K -> 0x%x hPhysBuf=0x%x\n",
                   ctxIdx, pOut->bufStatus, pOut->hPhysBuf);
@@ -2410,9 +2603,9 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         params.flags = NVOS32_ALLOC_FLAGS_VIRTUAL;
         params.hVASpace = pOut->hVas;
         status = clientGenResourceHandle(pRsClient, &pOut->hVirtBuf);
-        if (status != NV_OK) goto unlock;
-        pOut->virtStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                   g_grAllocCache[gpuInstance].hDevice, pOut->hVirtBuf,
+        if (status != NV_OK) goto free_ctx_client;
+        pOut->virtStatus = pRmApi->AllocWithHandle(pRmApi, hCtxClient,
+                                                   hCtxDevice, pOut->hVirtBuf,
                                                    NV50_MEMORY_VIRTUAL, &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] ctx%u: virtual 64K -> 0x%x hVirtBuf=0x%x\n",
                   ctxIdx, pOut->virtStatus, pOut->hVirtBuf);
@@ -2421,7 +2614,7 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
 
     /* 7. Map physical into virtual: the channel buffer's GPU VA. */
     {
-        pOut->mapStatus = eclipseRmApiMapDma(pRmApi, g_grAllocCache[gpuInstance].hClient, g_grAllocCache[gpuInstance].hDevice,
+        pOut->mapStatus = eclipseRmApiMapDma(pRmApi, hCtxClient, hCtxDevice,
                                       pOut->hVirtBuf, pOut->hPhysBuf, 0, ECLIPSE_CHAN_BUF_SIZE,
                                       NV04_MAP_MEMORY_FLAGS_NONE, &pOut->bufGpuVA);
         nv_printf(0, "[eclipse-rm-trace] ctx%u: Map -> 0x%x GPU VA=0x%llx\n",
@@ -2439,9 +2632,9 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         params.attr = DRF_DEF(OS32, _ATTR, _LOCATION, _PCI);
         params.attr2 = NVOS32_ATTR2_NONE;
         status = clientGenResourceHandle(pRsClient, &pOut->hNotifier);
-        if (status != NV_OK) goto unlock;
-        pOut->notifStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                    g_grAllocCache[gpuInstance].hDevice, pOut->hNotifier,
+        if (status != NV_OK) goto free_ctx_client;
+        pOut->notifStatus = pRmApi->AllocWithHandle(pRmApi, hCtxClient,
+                                                    hCtxDevice, pOut->hNotifier,
                                                     NV01_MEMORY_SYSTEM, &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] ctx%u: notifier 4K -> 0x%x hNotifier=0x%x\n",
                   ctxIdx, pOut->notifStatus, pOut->hNotifier);
@@ -2465,8 +2658,8 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         params.engineType    = NV2080_ENGINE_TYPE_GRAPHICS;
         params.flags         = DRF_DEF(OS04, _FLAGS, _CHANNEL_SKIP_SCRUBBER, _TRUE);
         status = clientGenResourceHandle(pRsClient, &pOut->hChannel);
-        if (status != NV_OK) goto unlock;
-        pOut->chanStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
+        if (status != NV_OK) goto free_ctx_client;
+        pOut->chanStatus = pRmApi->AllocWithHandle(pRmApi, hCtxClient,
                                                    pOut->hTsg, pOut->hChannel,
                                                    pOut->channelClass, &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] ctx%u: GPFIFO channel class=0x%x -> 0x%x hChannel=0x%x\n",
@@ -2481,8 +2674,8 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         params.version = 2;
         params.size = sizeof(params);
         status = clientGenResourceHandle(pRsClient, &pOut->hCompute);
-        if (status != NV_OK) goto unlock;
-        pOut->computeStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
+        if (status != NV_OK) goto free_ctx_client;
+        pOut->computeStatus = pRmApi->AllocWithHandle(pRmApi, hCtxClient,
                                                       pOut->hChannel, pOut->hCompute,
                                                       TURING_COMPUTE_A, &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] ctx%u: TURING_COMPUTE_A -> 0x%x hCompute=0x%x\n",
@@ -2508,8 +2701,8 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         params.version = 2;
         params.size = sizeof(params);
         status = clientGenResourceHandle(pRsClient, &h3d);
-        if (status != NV_OK) goto unlock;
-        status = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
+        if (status != NV_OK) goto free_ctx_client;
+        status = pRmApi->AllocWithHandle(pRmApi, hCtxClient,
                                          pOut->hChannel, h3d,
                                          TURING_A, &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] ctx%u: TURING_A(3D) -> 0x%x h3d=0x%x\n",
@@ -2523,7 +2716,7 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS params;
         portMemSet(&params, 0, sizeof(params));
         params.bEnable = NV_TRUE;
-        pOut->schedStatus = pRmApi->Control(pRmApi, g_grAllocCache[gpuInstance].hClient, pOut->hChannel,
+        pOut->schedStatus = pRmApi->Control(pRmApi, hCtxClient, pOut->hChannel,
                                             NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] ctx%u: GPFIFO_SCHEDULE -> 0x%x\n", ctxIdx, pOut->schedStatus);
         if (pOut->schedStatus != NV_OK) { failed = NV_TRUE; goto done; }
@@ -2536,25 +2729,26 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
     goto unlock;
 
 done:
+    /* A stage failed: `pOut`'s per-stage status says which, and the call
+     * itself is NV_OK, as it always was. The whole ladder is this context's
+     * own client now, so freeing that client frees every handle under it in
+     * dependency order -- the unwind this used to do by hand, done by the
+     * RM. The shared step-16 ladder is untouched either way. */
+    g_ctx3dObj[gpuInstance][ctxIdx] = 0;
+    status = NV_OK;
     if (failed)
     {
-        /* Free the NEW handles (reverse order); the shared step-16 ladder stays. */
-        if (g_ctx3dObj[gpuInstance][ctxIdx] != 0)
-        {
-            pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, g_ctx3dObj[gpuInstance][ctxIdx]);
-            g_ctx3dObj[gpuInstance][ctxIdx] = 0;
-        }
-        if (pOut->hCompute != 0)  pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pOut->hCompute);
-        if (pOut->hChannel != 0)  pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pOut->hChannel);
-        if (pOut->hNotifier != 0) pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pOut->hNotifier);
-        if (pOut->hVirtBuf != 0)  pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pOut->hVirtBuf);
-        if (pOut->hPhysBuf != 0)  pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pOut->hPhysBuf);
-        if (pOut->hUserd != 0)    pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pOut->hUserd);
-        if (pOut->hCtxShare != 0) pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pOut->hCtxShare);
-        if (pOut->hTsg != 0)      pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pOut->hTsg);
-        if (pOut->hVas != 0)      pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pOut->hVas);
+        goto free_ctx_client;
     }
-    status = NV_OK; /* per-stage status carries the failure */
+    goto unlock;
+
+free_ctx_client:
+    if (hCtxClient != 0)
+    {
+        pRmApi->Free(pRmApi, hCtxClient, hCtxClient);
+    }
+    g_ctxClient[gpuInstance][ctxIdx] = 0;
+    g_ctxDevice[gpuInstance][ctxIdx] = 0;
 
 unlock:
     rmapiLockRelease();
@@ -2569,7 +2763,8 @@ unlock:
  * owning process's exit: without it a re-launched client would reuse the cached
  * (possibly RC-wedged) context, and the ECLIPSE_MAX_CTX slots would leak one per
  * launch. Frees the NEW handles in reverse dependency order (child before
- * parent); the shared step-16 ladder (client/device/subdevice) stays. ctxIdx 0
+ * parent) and then the context's OWN client, which is what takes the device
+ * with it; the shared step-16 ladder (client/device/subdevice) stays. ctxIdx 0
  * (the compositor's singleton) is never freed here. Idempotent: a no-op if the
  * index was never allocated. Same lock discipline as eclipse_rm_ctx_alloc.
  */
@@ -2580,6 +2775,8 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
     EclipseCtxAlloc *pCtx;
+    NvU32 hCtxClient = 0;
+    NvU32 hCtxDevice = 0;
 
     if (ctxIdx == 0 || ctxIdx >= ECLIPSE_MAX_CTX)
     {
@@ -2622,6 +2819,8 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
 
     pCtx = &g_ctxAlloc[gpuInstance][ctxIdx];
+    _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hCtxClient, &hCtxDevice);
+    (void)hCtxDevice;
     /* Deschedule before freeing: on a wedged channel this avoids freeing while
      * it is still considered runnable on the runlist. */
     if (pCtx->hChannel != 0)
@@ -2629,45 +2828,64 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
         NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS sched;
         portMemSet(&sched, 0, sizeof(sched));
         sched.bEnable = NV_FALSE;
-        (void)pRmApi->Control(pRmApi, g_grAllocCache[gpuInstance].hClient, pCtx->hChannel,
+        (void)pRmApi->Control(pRmApi, hCtxClient, pCtx->hChannel,
                               NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &sched, sizeof(sched));
     }
-    /* Reverse dependency order, matching ctx_alloc's failure cleanup: freeing
-     * the channel tears down its bound compute object and takes it off the
-     * runlist; freeing the VA space drops every VM_BIND mapping still in it. */
-    if (g_ctx3dObj[gpuInstance][ctxIdx] != 0)
-    {
-        pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, g_ctx3dObj[gpuInstance][ctxIdx]);
-        g_ctx3dObj[gpuInstance][ctxIdx] = 0;
-    }
-    if (pCtx->hCompute != 0)  pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pCtx->hCompute);
-    /* Drop peer-fence mappings that involve this ctx (as consumer or producer). */
+    /*
+     * Drop peer-fence mappings that involve this ctx, BEFORE anything of its
+     * own goes away. The two directions are not symmetric any more:
+     *
+     *  - as PRODUCER (`[i][ctxIdx]`), the mapping and the dup live in the
+     *    OTHER context's client, which survives us. Nobody else will ever
+     *    free them, so they have to be freed here, and they have to be freed
+     *    while our page is still around for the mapping to be unwound
+     *    against.
+     *  - as CONSUMER (`[ctxIdx][i]`), they live in OUR client, so freeing the
+     *    client at the end takes them. Freeing them explicitly first is still
+     *    the right order (child before parent) and keeps the arrays honest if
+     *    the client free is the one that fails.
+     */
     {
         NvU32 i;
         for (i = 0; i < ECLIPSE_MAX_CTX; i++)
         {
-            if (g_peerFenceHVirt[gpuInstance][ctxIdx][i] != 0)
-            {
-                pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, g_peerFenceHVirt[gpuInstance][ctxIdx][i]);
-                g_peerFenceHVirt[gpuInstance][ctxIdx][i] = 0;
-                g_peerFenceVa[gpuInstance][ctxIdx][i] = 0;
-            }
-            if (g_peerFenceHVirt[gpuInstance][i][ctxIdx] != 0)
-            {
-                pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, g_peerFenceHVirt[gpuInstance][i][ctxIdx]);
-                g_peerFenceHVirt[gpuInstance][i][ctxIdx] = 0;
-                g_peerFenceVa[gpuInstance][i][ctxIdx] = 0;
-            }
+            _eclipse_rm_peer_fence_drop(pRmApi, gpuInstance, i, ctxIdx);
+            _eclipse_rm_peer_fence_drop(pRmApi, gpuInstance, ctxIdx, i);
         }
     }
-    if (pCtx->hChannel != 0)  pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pCtx->hChannel);
-    if (pCtx->hNotifier != 0) pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pCtx->hNotifier);
-    if (pCtx->hVirtBuf != 0)  pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pCtx->hVirtBuf);
-    if (pCtx->hPhysBuf != 0)  pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pCtx->hPhysBuf);
-    if (pCtx->hUserd != 0)    pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pCtx->hUserd);
-    if (pCtx->hCtxShare != 0) pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pCtx->hCtxShare);
-    if (pCtx->hTsg != 0)      pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pCtx->hTsg);
-    if (pCtx->hVas != 0)      pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pCtx->hVas);
+    /* Reverse dependency order, matching ctx_alloc's failure cleanup: freeing
+     * the channel tears down its bound compute object and takes it off the
+     * runlist; freeing the VA space drops every VM_BIND mapping still in it.
+     * Freeing the client below would do all of this on its own, but doing it
+     * in order keeps the teardown identical to the one the shared client got,
+     * so a wedged channel still gets descheduled and unwound deliberately. */
+    if (g_ctx3dObj[gpuInstance][ctxIdx] != 0)
+    {
+        pRmApi->Free(pRmApi, hCtxClient, g_ctx3dObj[gpuInstance][ctxIdx]);
+        g_ctx3dObj[gpuInstance][ctxIdx] = 0;
+    }
+    if (pCtx->hCompute != 0)  pRmApi->Free(pRmApi, hCtxClient, pCtx->hCompute);
+    if (pCtx->hChannel != 0)  pRmApi->Free(pRmApi, hCtxClient, pCtx->hChannel);
+    if (pCtx->hNotifier != 0) pRmApi->Free(pRmApi, hCtxClient, pCtx->hNotifier);
+    if (pCtx->hVirtBuf != 0)  pRmApi->Free(pRmApi, hCtxClient, pCtx->hVirtBuf);
+    if (pCtx->hPhysBuf != 0)  pRmApi->Free(pRmApi, hCtxClient, pCtx->hPhysBuf);
+    if (pCtx->hUserd != 0)    pRmApi->Free(pRmApi, hCtxClient, pCtx->hUserd);
+    if (pCtx->hCtxShare != 0) pRmApi->Free(pRmApi, hCtxClient, pCtx->hCtxShare);
+    if (pCtx->hTsg != 0)      pRmApi->Free(pRmApi, hCtxClient, pCtx->hTsg);
+    if (pCtx->hVas != 0)      pRmApi->Free(pRmApi, hCtxClient, pCtx->hVas);
+
+    /* And last the context's own client, which takes its device with it. This
+     * is also what removes the process from nvidia-smi's table: the client is
+     * the thing that carried its pid. Only ever OUR client -- ctx0 and a
+     * context that never got one share the ladder's, which must survive. */
+    if (g_ctxClient[gpuInstance][ctxIdx] != 0)
+    {
+        NV_STATUS freeStatus = pRmApi->Free(pRmApi, g_ctxClient[gpuInstance][ctxIdx], g_ctxClient[gpuInstance][ctxIdx]);
+        nv_printf(0, "[eclipse-rm-trace] ctx%u: Free(hClient=0x%x) -> 0x%x\n",
+                  ctxIdx, g_ctxClient[gpuInstance][ctxIdx], freeStatus);
+        g_ctxClient[gpuInstance][ctxIdx] = 0;
+        g_ctxDevice[gpuInstance][ctxIdx] = 0;
+    }
 
     portMemSet(pCtx, 0, sizeof(*pCtx));
     g_ctxDone[gpuInstance][ctxIdx] = NV_FALSE;
@@ -2732,24 +2950,17 @@ NV_STATUS eclipse_rm_ctx0_reset(NvU32 gpuInstance)
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
 
     /* Drop peer-fence mappings that involve ctx0 (as consumer or producer)
-     * before freeing ctx0's hPhysBuf — otherwise other ctxs keep stale VAs. */
+     * before freeing ctx0's hPhysBuf — otherwise other ctxs keep stale VAs.
+     * As producer, ctx0's page is duped into each consumer's own client now,
+     * so the drop has to go through the consumer's handles; the helper does
+     * that from the index alone. */
     {
         NvU32 i;
         const NvU32 ctx0 = 0;
         for (i = 0; i < ECLIPSE_MAX_CTX; i++)
         {
-            if (g_peerFenceHVirt[gpuInstance][ctx0][i] != 0)
-            {
-                pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, g_peerFenceHVirt[gpuInstance][ctx0][i]);
-                g_peerFenceHVirt[gpuInstance][ctx0][i] = 0;
-                g_peerFenceVa[gpuInstance][ctx0][i] = 0;
-            }
-            if (g_peerFenceHVirt[gpuInstance][i][ctx0] != 0)
-            {
-                pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, g_peerFenceHVirt[gpuInstance][i][ctx0]);
-                g_peerFenceHVirt[gpuInstance][i][ctx0] = 0;
-                g_peerFenceVa[gpuInstance][i][ctx0] = 0;
-            }
+            _eclipse_rm_peer_fence_drop(pRmApi, gpuInstance, i, ctx0);
+            _eclipse_rm_peer_fence_drop(pRmApi, gpuInstance, ctx0, i);
         }
     }
 
@@ -8206,6 +8417,8 @@ NV_STATUS eclipse_rm_class_alloc(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 classId,
     THREAD_STATE_NODE threadState;
     RsClient *pRsClient = NULL;
     NvU32 hChannel;
+    NvU32 hCtxClient = 0;
+    NvU32 hCtxDevice = 0;
 
     if (pHObject == NULL || pAllocStatus == NULL)
     {
@@ -8277,7 +8490,14 @@ NV_STATUS eclipse_rm_class_alloc(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 classId,
     }
 
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
-    status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pRsClient);
+    /* The object is a child of the context's CHANNEL, so it is allocated in
+     * the client that owns that channel -- the context's own, except for ctx0,
+     * which is still the shared ladder's. This is also what makes the process
+     * visible as a graphics process: GPU_GET_PIDS reports a client that owns a
+     * ChannelDescendant of the queried class, and this is that object. */
+    _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hCtxClient, &hCtxDevice);
+    (void)hCtxDevice;
+    status = serverGetClientUnderLock(&g_resServ, hCtxClient, &pRsClient);
     if (status != NV_OK)
     {
         goto unlock;
@@ -8294,7 +8514,7 @@ NV_STATUS eclipse_rm_class_alloc(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 classId,
         portMemSet(&params, 0, sizeof(params));
         params.version = NVB0B5_ALLOCATION_PARAMETERS_VERSION_1;
         params.engineType = NV2080_ENGINE_TYPE_COPY0;
-        *pAllocStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
+        *pAllocStatus = pRmApi->AllocWithHandle(pRmApi, hCtxClient,
                                                 hChannel, *pHObject,
                                                 classId, &params, sizeof(params));
     }
@@ -8304,12 +8524,12 @@ NV_STATUS eclipse_rm_class_alloc(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 classId,
         portMemSet(&params, 0, sizeof(params));
         params.version = 2;
         params.size = sizeof(params);
-        *pAllocStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
+        *pAllocStatus = pRmApi->AllocWithHandle(pRmApi, hCtxClient,
                                                 hChannel, *pHObject,
                                                 classId, &params, sizeof(params));
     }
-    nv_printf(0, "[eclipse-rm-trace] class_alloc: 0x%x ctx%u on hChannel=0x%x -> 0x%x hObject=0x%x\n",
-              classId, ctxIdx, hChannel, *pAllocStatus, *pHObject);
+    nv_printf(0, "[eclipse-rm-trace] class_alloc: 0x%x ctx%u on hChannel=0x%x (client 0x%x) -> 0x%x hObject=0x%x\n",
+              classId, ctxIdx, hChannel, hCtxClient, *pAllocStatus, *pHObject);
     status = NV_OK; /* per-stage status carries the failure */
 
 unlock:
@@ -8320,15 +8540,20 @@ unlock:
     return status;
 }
 
-/* Free a class object allocated by eclipse_rm_class_alloc. */
-NV_STATUS eclipse_rm_class_free(NvU32 gpuInstance, NvU32 hObject)
+/* Free a class object allocated by eclipse_rm_class_alloc. `ctxIdx` has to be
+ * the one it was allocated for: the handle only exists in that context's
+ * client, and a Free against the wrong client is at best a no-op error and at
+ * worst hits an unrelated object that happens to share the number. */
+NV_STATUS eclipse_rm_class_free(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hObject)
 {
     OBJGPU *pGpu;
     RM_API *pRmApi;
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
+    NvU32 hCtxClient = 0;
+    NvU32 hCtxDevice = 0;
 
-    if (!g_grAllocDone[gpuInstance] || hObject == 0)
+    if (!g_grAllocDone[gpuInstance] || hObject == 0 || ctxIdx >= ECLIPSE_MAX_CTX)
     {
         return NV_ERR_INVALID_STATE;
     }
@@ -8365,8 +8590,11 @@ NV_STATUS eclipse_rm_class_free(NvU32 gpuInstance, NvU32 hObject)
         return status;
     }
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
-    status = pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, hObject);
-    nv_printf(0, "[eclipse-rm-trace] class_free: hObject=0x%x -> 0x%x\n", hObject, status);
+    _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hCtxClient, &hCtxDevice);
+    (void)hCtxDevice;
+    status = pRmApi->Free(pRmApi, hCtxClient, hObject);
+    nv_printf(0, "[eclipse-rm-trace] class_free: ctx%u hObject=0x%x (client 0x%x) -> 0x%x\n",
+              ctxIdx, hObject, hCtxClient, status);
 
     rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     rmapiLockRelease();
@@ -8380,6 +8608,12 @@ typedef struct EclipseVmBind
     NvU32 virtStatus;
     NvU32 mapStatus;
     NvU32 hVirt;
+    /* The context-side dup of `hMemory`, when the bind crossed clients (the
+     * usual case now: the GEM object lives in the shared client, the VA space
+     * in the context's own). The caller has to hand it back to
+     * eclipse_rm_vm_bind_unmap, which is where it is freed. 0 when no dup was
+     * needed, i.e. a ctx0 bind. */
+    NvU32 hDup;
     NvU64 actualVA;
 } EclipseVmBind;
 
@@ -8395,11 +8629,22 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
     RsClient *pRsClient = NULL;
+    RsClient *pGemClient = NULL;
     /* Per-process context: ctxIdx 0 is the compositor's singleton VA space
      * (the original behavior, unchanged); ctxIdx >= 1 is a GL client's OWN VA
-     * space built by eclipse_rm_ctx_alloc. The bind maps into that VAS; the
-     * memory object (hMemory) and the client/device are shared. */
+     * space built by eclipse_rm_ctx_alloc. The bind maps into that VAS.
+     *
+     * The memory object (hMemory) still lives in the SHARED client -- GEM_NEW
+     * knows nothing about contexts -- while the VA space now lives in the
+     * context's own, and MapDma needs all four of its handles in one client.
+     * The bind therefore dups hMemory into the context's client and maps the
+     * dup; a dup is a second reference to the same pages, so what the GPU
+     * ends up seeing is unchanged. `pOut->hDup` carries it back out, because
+     * unbinding has to free it. */
     NvU32 hVas;
+    NvU32 hCtxClient = 0;
+    NvU32 hCtxDevice = 0;
+    NvU32 hBindMem;
 
     if (pOut == NULL || ctxIdx >= ECLIPSE_MAX_CTX)
     {
@@ -8451,10 +8696,39 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
     }
 
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
-    status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pRsClient);
+    _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hCtxClient, &hCtxDevice);
+    status = serverGetClientUnderLock(&g_resServ, hCtxClient, &pRsClient);
     if (status != NV_OK)
     {
         goto unlock;
+    }
+    /* The GEM object's own client, for the memdesc lookup further down: the
+     * PTE kind is set on the memory DESCRIPTOR, which the dup shares, so it
+     * can be read and written through either handle. Going through the
+     * original keeps that step independent of whether a dup was needed. */
+    status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pGemClient);
+    if (status != NV_OK)
+    {
+        goto unlock;
+    }
+
+    hBindMem = hMemory;
+    if (hCtxClient != g_grAllocCache[gpuInstance].hClient)
+    {
+        pOut->hDup = 0; /* 0 = let the destination client assign the handle */
+        status = pRmApi->DupObject(pRmApi, hCtxClient, hCtxDevice, &pOut->hDup,
+                                   g_grAllocCache[gpuInstance].hClient, hMemory,
+                                   NV04_DUP_HANDLE_FLAGS_NONE);
+        if (status != NV_OK)
+        {
+            nv_printf(0, "[eclipse-rm-trace] vm_bind_map: dup hMemory=0x%x into ctx%u "
+                         "client 0x%x -> 0x%x\n", hMemory, ctxIdx, hCtxClient, status);
+            pOut->hDup = 0;
+            pOut->virtStatus = status;
+            status = NV_OK; /* per-stage status carries the failure */
+            goto unlock;
+        }
+        hBindMem = pOut->hDup;
     }
 
     /* 1. Reserve a fixed VA range in our VAS (mirrors step17 item 3, but at
@@ -8515,9 +8789,9 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
         params.hVASpace = hVas;
         params.offset = requestedVA;
         status = clientGenResourceHandle(pRsClient, &pOut->hVirt);
-        if (status != NV_OK) goto unlock;
-        pOut->virtStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                   g_grAllocCache[gpuInstance].hDevice, pOut->hVirt,
+        if (status != NV_OK) goto free_dup;
+        pOut->virtStatus = pRmApi->AllocWithHandle(pRmApi, hCtxClient,
+                                                   hCtxDevice, pOut->hVirt,
                                                    NV50_MEMORY_VIRTUAL,
                                                    &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] vm_bind_map: VA reserve @0x%llx (%llu B) "
@@ -8527,7 +8801,7 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
                   pOut->virtStatus, pOut->hVirt,
                   (unsigned long long)g_vasGrantedBase[gpuInstance],
                   (unsigned long long)g_vasGrantedSize[gpuInstance]);
-        if (pOut->virtStatus != NV_OK) { status = NV_OK; goto unlock; }
+        if (pOut->virtStatus != NV_OK) { status = NV_OK; goto free_dup; }
     }
 
     /* 1b. Program the client's requested PTE kind into the memory descriptor,
@@ -8573,7 +8847,7 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
         {
             kind = memmgrGetUncompressedKind_HAL(pGpu, pMemoryManager, kind, NV_FALSE);
         }
-        if (memGetByHandle(pRsClient, hMemory, &pMemory) == NV_OK &&
+        if (memGetByHandle(pGemClient, hMemory, &pMemory) == NV_OK &&
             pMemory->pMemDesc != NULL)
         {
             memdescSetPteKind(pMemory->pMemDesc, kind);
@@ -8669,9 +8943,9 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
          * 0, which maps the WRONG PAGES for any suballocated bind (every
          * observed bind so far had bo_offset=0, so this had not bitten yet
          * -- but it would have, silently, as corrupted rendering). */
-        pOut->mapStatus = eclipseRmApiMapDma(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                      g_grAllocCache[gpuInstance].hDevice,
-                                      pOut->hVirt, hMemory,
+        pOut->mapStatus = eclipseRmApiMapDma(pRmApi, hCtxClient,
+                                      hCtxDevice,
+                                      pOut->hVirt, hBindMem,
                                       boOffset, size,
                                       DRF_DEF(OS46, _FLAGS, _DMA_OFFSET_FIXED, _TRUE) |
                                       DRF_DEF(OS46, _FLAGS, _PAGE_SIZE, _4KB),
@@ -8682,9 +8956,9 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
         if (pOut->mapStatus != NV_OK)
         {
             pOut->actualVA = requestedVA;
-            pOut->mapStatus = eclipseRmApiMapDma(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                          g_grAllocCache[gpuInstance].hDevice,
-                                          pOut->hVirt, hMemory,
+            pOut->mapStatus = eclipseRmApiMapDma(pRmApi, hCtxClient,
+                                          hCtxDevice,
+                                          pOut->hVirt, hBindMem,
                                           boOffset, size,
                                           DRF_DEF(OS46, _FLAGS, _DMA_OFFSET_FIXED, _TRUE),
                                           &pOut->actualVA);
@@ -8706,16 +8980,29 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
                          "0x%llx but 0x%llx was requested\n",
                       (unsigned long long)pOut->actualVA,
                       (unsigned long long)requestedVA);
-            eclipseRmApiUnmapDma(pRmApi, g_grAllocCache[gpuInstance].hClient, g_grAllocCache[gpuInstance].hDevice,
+            eclipseRmApiUnmapDma(pRmApi, hCtxClient, hCtxDevice,
                           pOut->hVirt, NV04_MAP_MEMORY_FLAGS_NONE, pOut->actualVA, size);
             pOut->mapStatus = NV_ERR_INVALID_ADDRESS;
         }
         if (pOut->mapStatus != NV_OK)
         {
-            pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, pOut->hVirt);
+            pRmApi->Free(pRmApi, hCtxClient, pOut->hVirt);
+            pOut->hVirt = 0;
+            goto free_dup;
         }
     }
     status = NV_OK;
+    goto unlock;
+
+free_dup:
+    /* Nothing is mapped, so the context has no reason to keep a reference to
+     * the GEM object. The object itself is untouched: the shared client's
+     * handle is what owns it. */
+    if (pOut->hDup != 0)
+    {
+        pRmApi->Free(pRmApi, hCtxClient, pOut->hDup);
+        pOut->hDup = 0;
+    }
 
 unlock:
     rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
@@ -8725,14 +9012,22 @@ unlock:
     return status;
 }
 
-NV_STATUS eclipse_rm_vm_bind_unmap(NvU32 gpuInstance, NvU32 hVirt, NvU64 size, NvU64 va)
+/* Undo one eclipse_rm_vm_bind_map. `ctxIdx` and `hDup` have to be the ones
+ * that bind returned: `hVirt` and `hDup` exist only in that context's client,
+ * so a free against any other client would either miss or hit whatever else
+ * happens to carry the same handle number. `hDup` is 0 for a bind that needed
+ * no dup (ctx0). */
+NV_STATUS eclipse_rm_vm_bind_unmap(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hVirt,
+                                   NvU32 hDup, NvU64 size, NvU64 va)
 {
     OBJGPU *pGpu;
     RM_API *pRmApi;
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
+    NvU32 hCtxClient = 0;
+    NvU32 hCtxDevice = 0;
 
-    if (!g_grAllocDone[gpuInstance] || hVirt == 0)
+    if (!g_grAllocDone[gpuInstance] || hVirt == 0 || ctxIdx >= ECLIPSE_MAX_CTX)
     {
         return NV_ERR_INVALID_STATE;
     }
@@ -8770,9 +9065,10 @@ NV_STATUS eclipse_rm_vm_bind_unmap(NvU32 gpuInstance, NvU32 hVirt, NvU64 size, N
     }
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
 
-    status = eclipseRmApiUnmapDma(pRmApi, g_grAllocCache[gpuInstance].hClient, g_grAllocCache[gpuInstance].hDevice,
+    _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hCtxClient, &hCtxDevice);
+    status = eclipseRmApiUnmapDma(pRmApi, hCtxClient, hCtxDevice,
                            hVirt, NV04_MAP_MEMORY_FLAGS_NONE, va, size);
-    nv_printf(0, "[eclipse-rm-trace] vm_bind_unmap: Unmap -> 0x%x\n", status);
+    nv_printf(0, "[eclipse-rm-trace] vm_bind_unmap: ctx%u Unmap -> 0x%x\n", ctxIdx, status);
     /* Free the virtual allocation UNCONDITIONALLY. Freeing an
      * NV50_MEMORY_VIRTUAL tears down any mappings still under it, so this
      * is safe after a failed Unmap -- and gating it on Unmap's success is
@@ -8781,11 +9077,27 @@ NV_STATUS eclipse_rm_vm_bind_unmap(NvU32 gpuInstance, NvU32 hVirt, NvU64 size, N
      * NV_ERR_NO_MEMORY (0x51), and in a VAS shared by all clients that
      * condemned every Mesa device after the first (vkCreateDevice -13). */
     {
-        NV_STATUS freeStatus = pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, hVirt);
+        NV_STATUS freeStatus = pRmApi->Free(pRmApi, hCtxClient, hVirt);
         nv_printf(0, "[eclipse-rm-trace] vm_bind_unmap: Free hVirt -> 0x%x\n", freeStatus);
         if (status == NV_OK)
         {
             status = freeStatus;
+        }
+    }
+    /* And the context's reference to the GEM object, which only this bind
+     * held. Freed AFTER the virtual allocation, so the mapping is gone before
+     * the handle it was made through: the other order leaves the RM unwinding
+     * a mapping whose source handle has just been taken away. Dropping a dup
+     * never frees the memory -- GEM_FREE's handle in the shared client is
+     * what does that. */
+    if (hDup != 0)
+    {
+        NV_STATUS dupStatus = pRmApi->Free(pRmApi, hCtxClient, hDup);
+        nv_printf(0, "[eclipse-rm-trace] vm_bind_unmap: Free hDup=0x%x -> 0x%x\n",
+                  hDup, dupStatus);
+        if (status == NV_OK)
+        {
+            status = dupStatus;
         }
     }
 
@@ -8821,6 +9133,8 @@ NV_STATUS eclipse_rm_exec_submit(NvU32 gpuInstance, NvU32 ctxIdx, NvU64 pushVA, 
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
     RsClient *pRsClient = NULL;
+    NvU32 hCtxClient = 0;
+    NvU32 hCtxDevice = 0;
     KernelChannel *pKernelChannel = NULL;
     KernelFifo *pKernelFifo;
     MemoryManager *pMemoryManager;
@@ -8902,7 +9216,12 @@ NV_STATUS eclipse_rm_exec_submit(NvU32 gpuInstance, NvU32 ctxIdx, NvU64 pushVA, 
      *    only change what the ring's GP entry points at). */
     {
         NvU32 subdevInst;
-        status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pRsClient);
+        /* The objects looked up below are the CONTEXT's, so they are named
+         * under the context's own client; only ctx0 is still on the shared
+         * ladder's. */
+        _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hCtxClient, &hCtxDevice);
+        (void)hCtxDevice;
+        status = serverGetClientUnderLock(&g_resServ, hCtxClient, &pRsClient);
         if (status == NV_OK)
             status = CliGetKernelChannel(pRsClient, hChannel, &pKernelChannel);
         if (status == NV_OK)
@@ -9063,6 +9382,8 @@ NV_STATUS eclipse_rm_exec_submit_signaled(NvU32 gpuInstance, NvU32 ctxIdx, NvU64
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
     RsClient *pRsClient = NULL;
+    NvU32 hCtxClient = 0;
+    NvU32 hCtxDevice = 0;
     KernelChannel *pKernelChannel = NULL;
     KernelFifo *pKernelFifo;
     MemoryManager *pMemoryManager;
@@ -9143,7 +9464,12 @@ NV_STATUS eclipse_rm_exec_submit_signaled(NvU32 gpuInstance, NvU32 ctxIdx, NvU64
     /* 1+2. Same lookup + CPU mapping as eclipse_rm_exec_submit. */
     {
         NvU32 subdevInst;
-        status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pRsClient);
+        /* The objects looked up below are the CONTEXT's, so they are named
+         * under the context's own client; only ctx0 is still on the shared
+         * ladder's. */
+        _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hCtxClient, &hCtxDevice);
+        (void)hCtxDevice;
+        status = serverGetClientUnderLock(&g_resServ, hCtxClient, &pRsClient);
         if (status == NV_OK)
             status = CliGetKernelChannel(pRsClient, hChannel, &pKernelChannel);
         if (status == NV_OK)
@@ -9416,6 +9742,8 @@ NV_STATUS eclipse_rm_exec_fast_prepare(NvU32 gpuInstance, NvU32 ctxIdx, EclipseE
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
     RsClient *pRsClient = NULL;
+    NvU32 hCtxClient = 0;
+    NvU32 hCtxDevice = 0;
     KernelChannel *pKernelChannel = NULL;
     KernelFifo *pKernelFifo;
     Memory *pBufMemory = NULL;
@@ -9479,7 +9807,12 @@ NV_STATUS eclipse_rm_exec_fast_prepare(NvU32 gpuInstance, NvU32 ctxIdx, EclipseE
     /* 1. Same lookup as exec_submit. */
     {
         NvU32 subdevInst;
-        status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pRsClient);
+        /* The objects looked up below are the CONTEXT's, so they are named
+         * under the context's own client; only ctx0 is still on the shared
+         * ladder's. */
+        _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hCtxClient, &hCtxDevice);
+        (void)hCtxDevice;
+        status = serverGetClientUnderLock(&g_resServ, hCtxClient, &pRsClient);
         if (status == NV_OK)
             status = CliGetKernelChannel(pRsClient, hChannel, &pKernelChannel);
         if (status == NV_OK)
@@ -9677,6 +10010,8 @@ NV_STATUS eclipse_rm_ctx_prime(NvU32 gpuInstance, NvU32 ctxIdx)
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
     RsClient *pRsClient = NULL;
+    NvU32 hCtxClient = 0;
+    NvU32 hCtxDevice = 0;
     KernelChannel *pKernelChannel = NULL;
     KernelFifo *pKernelFifo;
     MemoryManager *pMemoryManager;
@@ -9743,7 +10078,12 @@ NV_STATUS eclipse_rm_ctx_prime(NvU32 gpuInstance, NvU32 ctxIdx)
     /* 1. Locate the context's channel + ring buffer + USERD. */
     {
         NvU32 subdevInst;
-        status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pRsClient);
+        /* The objects looked up below are the CONTEXT's, so they are named
+         * under the context's own client; only ctx0 is still on the shared
+         * ladder's. */
+        _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hCtxClient, &hCtxDevice);
+        (void)hCtxDevice;
+        status = serverGetClientUnderLock(&g_resServ, hCtxClient, &pRsClient);
         if (status == NV_OK)
             status = CliGetKernelChannel(pRsClient, hChannel, &pKernelChannel);
         if (status == NV_OK)
@@ -10460,6 +10800,18 @@ NV_STATUS eclipse_rm_hwcursor_hide(NvU32 gpuInstance)
  * VAS and return base+ECLIPSE_FAST_FENCE_SEM_OFF. Cached per (consumer,
  * producer) for the life of both contexts.
  * (g_peerFenceVa / g_peerFenceHVirt live with the other ctx globals above.)
+ *
+ * Since each context owns its RM client, the two endpoints of a cross-ctx
+ * mapping are usually in DIFFERENT clients, and a client cannot name another
+ * client's handle. So the producer's page is first duped into the consumer's
+ * client (NvRmDupObject, the same mechanism userspace uses for prime/fd
+ * sharing) and the consumer maps its OWN handle. The dup is duped by the
+ * kernel on the consumer's behalf, which is what makes it legal without the
+ * producer having published a share policy: the two clients are not two
+ * processes negotiating, they are two halves of one compositing pipeline the
+ * kernel built. Only ctx0 is still on the shared ladder client, so a mapping
+ * with ctx0 on both ends needs no dup at all -- that is what the
+ * `hConsumerClient == hProducerClient` branch is.
  */
 NV_STATUS eclipse_rm_map_peer_fence(
     NvU32 gpuInstance,
@@ -10474,6 +10826,9 @@ NV_STATUS eclipse_rm_map_peer_fence(
     THREAD_STATE_NODE threadState;
     RsClient *pRsClient = NULL;
     NvU32 hPhys = 0, hVas = 0, hVirt = 0;
+    NvU32 hConsumerClient = 0, hConsumerDevice = 0;
+    NvU32 hProducerClient = 0, hProducerDevice = 0;
+    NvU32 hDupPhys = 0;
     NvU64 mapVa = 0;
 
     if (pConsumerVa == NULL)
@@ -10541,9 +10896,32 @@ NV_STATUS eclipse_rm_map_peer_fence(
         return status;
     }
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
-    status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pRsClient);
+    _eclipse_rm_ctx_handles(gpuInstance, consumerCtx, &hConsumerClient, &hConsumerDevice);
+    _eclipse_rm_ctx_handles(gpuInstance, producerCtx, &hProducerClient, &hProducerDevice);
+    status = serverGetClientUnderLock(&g_resServ, hConsumerClient, &pRsClient);
     if (status != NV_OK)
         goto unlock;
+
+    /* Bring the producer's page into the consumer's client, so there is a
+     * handle the consumer can legally name in its own MapDma. The dup is a
+     * second reference to the same memory, not a copy: the fence word both
+     * ends poll is physically one word. NV04_DUP_HANDLE_FLAGS_NONE keeps the
+     * kernel dup privilege the internal RM_API's secInfo carries, which is
+     * what lets this happen without a share policy on the producer. */
+    if (hConsumerClient != hProducerClient)
+    {
+        hDupPhys = 0; /* 0 = let the destination client assign the handle */
+        status = pRmApi->DupObject(pRmApi, hConsumerClient, hConsumerDevice,
+                                   &hDupPhys, hProducerClient, hPhys,
+                                   NV04_DUP_HANDLE_FLAGS_NONE);
+        nv_printf(0,
+                  "[eclipse-rm-trace] map_peer_fence: dup producer hPhys=0x%x "
+                  "(client 0x%x) -> 0x%x into consumer client 0x%x as 0x%x\n",
+                  hPhys, hProducerClient, status, hConsumerClient, hDupPhys);
+        if (status != NV_OK)
+            goto unlock;
+        hPhys = hDupPhys;
+    }
 
     {
         NV_MEMORY_ALLOCATION_PARAMS params;
@@ -10557,31 +10935,41 @@ NV_STATUS eclipse_rm_map_peer_fence(
         params.hVASpace = hVas;
         status = clientGenResourceHandle(pRsClient, &hVirt);
         if (status != NV_OK)
-            goto unlock;
-        status = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                         g_grAllocCache[gpuInstance].hDevice, hVirt,
+            goto free_dup;
+        status = pRmApi->AllocWithHandle(pRmApi, hConsumerClient,
+                                         hConsumerDevice, hVirt,
                                          NV50_MEMORY_VIRTUAL,
                                          &params, sizeof(params));
         if (status != NV_OK)
-            goto unlock;
+            goto free_dup;
     }
 
-    status = eclipseRmApiMapDma(pRmApi, g_grAllocCache[gpuInstance].hClient, g_grAllocCache[gpuInstance].hDevice,
+    status = eclipseRmApiMapDma(pRmApi, hConsumerClient, hConsumerDevice,
                          hVirt, hPhys, 0, ECLIPSE_CHAN_BUF_SIZE,
                          NV04_MAP_MEMORY_FLAGS_NONE, &mapVa);
     if (status != NV_OK)
     {
-        pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, hVirt);
-        goto unlock;
+        pRmApi->Free(pRmApi, hConsumerClient, hVirt);
+        goto free_dup;
     }
 
     g_peerFenceHVirt[gpuInstance][consumerCtx][producerCtx] = hVirt;
+    g_peerFenceDup[gpuInstance][consumerCtx][producerCtx] = hDupPhys;
     g_peerFenceVa[gpuInstance][consumerCtx][producerCtx] = mapVa + ECLIPSE_FAST_FENCE_SEM_OFF;
     *pConsumerVa = g_peerFenceVa[gpuInstance][consumerCtx][producerCtx];
     nv_printf(0,
               "[eclipse-rm-trace] map_peer_fence: consumer=%u producer=%u "
               "-> VA=%llx (mapped producer hPhys=%#x)\n",
               consumerCtx, producerCtx, (unsigned long long)*pConsumerVa, hPhys);
+    goto unlock;
+
+free_dup:
+    /* The mapping never came up, so the consumer has no reason to keep a
+     * reference to the producer's page. Nothing has been recorded yet. */
+    if (hDupPhys != 0)
+    {
+        pRmApi->Free(pRmApi, hConsumerClient, hDupPhys);
+    }
 
 unlock:
     rmapiLockRelease();
@@ -10886,7 +11274,6 @@ NvBool eclipse_rm_hwflip_pending(void)
 static NV_STATUS hwflip_iso_ctxdma(RM_API *pRmApi, RsClient *pRsClient,
                                    NvU32 gpuInstance, NvU32 hMemory, NvU32 *phDma)
 {
-    const NvU32 hClient = g_grAllocCache[gpuInstance].hClient;
     NV_CONTEXT_DMA_ALLOCATION_PARAMS dp;
     Memory *pMemory = NULL;
     MEMORY_DESCRIPTOR *pMemDesc;
@@ -10946,7 +11333,7 @@ static NV_STATUS hwflip_iso_ctxdma(RM_API *pRmApi, RsClient *pRsClient,
          * can hold `newest`, so at least one is always evictable. */
         if (victim == ECLIPSE_HWFLIP_ISO_SLOTS)
             return NV_ERR_INVALID_STATE;
-        pRmApi->Free(pRmApi, hClient, g_hwflip.iso[victim].hDma);
+        pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, g_hwflip.iso[victim].hDma);
         g_hwflip.iso[victim].hDma = 0;
         g_hwflip.iso[victim].hMem = 0;
         g_hwflip.iso[victim].pMemDesc = NULL;
