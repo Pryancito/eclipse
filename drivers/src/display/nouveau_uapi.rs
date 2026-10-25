@@ -74,6 +74,24 @@ pub fn console_gsp_enabled() -> bool {
     CONSOLE_GSP.load(Ordering::Relaxed)
 }
 
+/// Put the AUTOMATIC bring-up's narration back (`nvidia.gputrace`).
+///
+/// Default **off**. The bring-up steps narrate for whoever reads
+/// `cat /proc/gpustepN`, and at boot nobody does: the automatic path captured
+/// every RM line into a 256 KiB buffer, reformatted all of it into a report,
+/// dropped the report, and echoed the lines at ERROR onto a console that
+/// lives in the BAR1 of the GPU being brought up. A manual `/proc/gpustep*`
+/// read is unaffected either way -- that reader asked for it.
+static GPU_TRACE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_gpu_trace_enabled(v: bool) {
+    GPU_TRACE.store(v, Ordering::Relaxed);
+}
+
+pub fn gpu_trace_enabled() -> bool {
+    GPU_TRACE.load(Ordering::Relaxed)
+}
+
 /// Escape hatch for the real `osInitMapping` (`nvidia.noosinitmapping`).
 /// The flag itself lives in `nvidia-rm-sys`, next to the hook it governs;
 /// this is only the cmdline-facing door, because `zCore` reaches the

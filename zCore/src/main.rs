@@ -928,6 +928,21 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // instead, once the pause is in place (see
             // `schedule_deferred_console_bringup`). Passing both flags is still
             // the way to ask for on-demand bring-up at the first client.
+            // Narración de los gpustep en el arranque AUTOMATICO. Apagada por
+            // defecto desde que se midió lo que cuesta: los pasos narran para
+            // quien lee `cat /proc/gpustepN`, y en el arranque no la lee nadie
+            // -- se capturaba cada línea del RM, se reformateaba entera y se
+            // tiraba, y encima el live-echo la subía a ERROR para pintarla en
+            // una consola que vive en el BAR1 de la tarjeta que se está
+            // encendiendo. Con esta bandera vuelve tal cual estaba, para el
+            // arranque en el que haga falta.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gputrace") {
+                kernel_hal::drivers::set_gpu_trace_enabled(true);
+                klog_info!(
+                    "Eclipse: nvidia.gputrace — narración completa de los gpustep en el \
+                     arranque automático (más lenta: la GPU tarda más en estar lista)"
+                );
+            }
             if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gsp") {
                 kernel_hal::drivers::set_console_gsp_enabled(true);
                 klog_info!(

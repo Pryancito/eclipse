@@ -426,6 +426,17 @@ pub fn set_nvidia_uvm_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_nvidia_uvm_enabled(_v: bool) {}
 
+/// Puts the automatic bring-up's narration back (`nvidia.gputrace`). Default
+/// off: at boot nobody reads it, and capturing + reformatting + echoing it is
+/// pure cost on the path that has to finish before the desktop can use the
+/// card. A manual `cat /proc/gpustepN` narrates either way.
+#[cfg(target_arch = "x86_64")]
+pub fn set_gpu_trace_enabled(v: bool) {
+    zcore_drivers::display::set_gpu_trace_enabled(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_gpu_trace_enabled(_v: bool) {}
+
 /// Enables on-demand console-GPU GSP bring-up (`nvidia.console_gsp`). Default off.
 #[cfg(target_arch = "x86_64")]
 pub fn set_console_gsp_enabled(v: bool) {

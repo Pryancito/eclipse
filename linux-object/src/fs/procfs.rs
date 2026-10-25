@@ -51,8 +51,9 @@ use present::proc_present_content;
 use smoltcp::wire::{IpAddress, IpCidr};
 use status::{proc_pid_status, proc_task_status};
 
-const PROC_ROOT_STATIC: [&str; 58] = [
+const PROC_ROOT_STATIC: [&str; 59] = [
     "net",
+    "gpuready",
     "present",
     "oops",
     "memhogs",
@@ -807,6 +808,7 @@ impl INode for ProcRootINode {
             "gpustep11" => Ok(PROC_GPUSTEP11.clone()),
             "gpustep12" => Ok(PROC_GPUSTEP12.clone()),
             "gpustep13" => Ok(PROC_GPUSTEP13.clone()),
+            "gpuready" => Ok(PROC_GPUREADY.clone()),
             "gpustep14" => Ok(PROC_GPUSTEP14.clone()),
             "gpustep15" => Ok(PROC_GPUSTEP15.clone()),
             "gpustep16" => Ok(PROC_GPUSTEP16.clone()),
@@ -3477,6 +3479,59 @@ fn proc_gpustep13_content() -> String {
     s
 }
 
+/// `/proc/gpuready` — is the console GPU usable by a GL/Vulkan client yet?
+///
+/// READ-ONLY, unlike every `/proc/gpustep*` beside it: those perform their
+/// step when read, and this one is polled in a loop by a boot that is waiting
+/// on it. First line is the verdict, on its own, so a shell can decide with
+/// one read:
+///
+/// ```text
+/// gpuready: waiting
+/// 17:00.0 GeForce RTX 2060 Super: rm=yes gr=no
+/// ```
+///
+/// `ready` when every console GPU is RM-attached with its GR ladder built,
+/// `waiting` while any of them is not there yet, and `none` when no driver
+/// has a console GPU to wait for (QEMU, virtio, a box with no NVIDIA card) --
+/// which a waiter must read as "stop waiting", never as "not yet".
+///
+/// It exists because the console GPU comes up in the MIDDLE of a live
+/// session and nothing told userspace when. See `console_gpu_ready`.
+fn proc_gpuready_content() -> String {
+    gpuready_report(
+        kernel_hal::drivers::all_drm()
+            .as_vec()
+            .iter()
+            .filter_map(|d| d.console_gpu_ready()),
+    )
+}
+
+/// The verdict and the detail, from whatever the drivers answered. Split out
+/// from the `/proc` read so the decision can be tested without a GPU: the one
+/// that matters is `none` vs `waiting`, because a waiter that confuses them
+/// either stalls a boot that has nothing to wait for, or gives up on a card
+/// that is seconds from being ready.
+fn gpuready_report(entries: impl Iterator<Item = (bool, String)>) -> String {
+    let mut detail = String::new();
+    let mut seen = false;
+    let mut ready = true;
+    for (ok, line) in entries {
+        seen = true;
+        ready &= ok;
+        detail.push_str(&line);
+        detail.push('\n');
+    }
+    let verdict = if !seen {
+        "none"
+    } else if ready {
+        "ready"
+    } else {
+        "waiting"
+    };
+    alloc::format!("gpuready: {}\n{}", verdict, detail)
+}
+
 /// `/proc/gpustep14` — CONSOLE GPU full bring-up chained in one shot (attach ->
 /// GSP boot with console SEC2 drain -> RM controls -> state-load -> CE),
 /// bringing the primary to the same state as the secondary. Capture with
@@ -4089,6 +4144,18 @@ lazy_static! {
     });
 }
 
+// Own block: `lazy_static!` expands one entry per recursion step and the block
+// below is already at the macro's limit, so a 60th entry there stops the crate
+// compiling. Splitting costs nothing and is what the next one should do too.
+lazy_static! {
+    /// `/proc/gpuready` -- read-only console-GPU readiness (see
+    /// proc_gpuready_content).
+    static ref PROC_GPUREADY: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 145,
+        generate: proc_gpuready_content,
+    });
+}
+
 lazy_static! {
     static ref PROC_ROOT: Arc<dyn INode> = Arc::new(ProcRootINode);
     static ref PROC_NET_DIR: Arc<dyn INode> = Arc::new(ProcNetDirINode);
@@ -4520,6 +4587,81 @@ lazy_static! {
         generate: proc_kbd_content,
         store: store_kbd,
     });
+}
+
+#[cfg(test)]
+mod gpuready_tests {
+    //! `/proc/gpuready` is read in a loop by a boot deciding whether to start
+    //! the compositor yet, so its first line has to be decidable on its own
+    //! and its three answers have to stay three.
+
+    use super::*;
+
+    fn line(name: &str) -> String {
+        String::from(name)
+    }
+
+    #[test]
+    fn no_console_gpu_at_all_says_none_and_not_waiting() {
+        let out = gpuready_report(core::iter::empty());
+        assert_eq!(
+            out, "gpuready: none\n",
+            "a box with no console GPU must not read as `waiting`: whoever is \
+             waiting would wait out its whole timeout for nothing"
+        );
+    }
+
+    #[test]
+    fn a_card_that_is_not_there_yet_says_waiting() {
+        let out = gpuready_report(
+            alloc::vec![(false, line("17:00.0 GeForce RTX 2060 Super: rm=yes gr=no"))].into_iter(),
+        );
+        assert!(
+            out.starts_with("gpuready: waiting\n"),
+            "the verdict has to be the whole first line: {:?}",
+            out
+        );
+        assert!(out.contains("rm=yes gr=no"), "{:?}", out);
+    }
+
+    #[test]
+    fn a_card_with_its_ladder_built_says_ready() {
+        let out = gpuready_report(
+            alloc::vec![(true, line("17:00.0 GeForce RTX 2060 Super: rm=yes gr=yes"))].into_iter(),
+        );
+        assert!(out.starts_with("gpuready: ready\n"), "{:?}", out);
+    }
+
+    #[test]
+    fn one_card_short_holds_the_whole_verdict_back() {
+        // Two cards is the configuration this was written for, and the
+        // verdict is about the console one being usable -- an `any` here
+        // instead of an `all` would call the box ready while the card that
+        // scans out the screen is still cold.
+        let out = gpuready_report(
+            alloc::vec![
+                (true, line("17:00.0 una: rm=yes gr=yes")),
+                (false, line("65:00.0 otra: rm=yes gr=no")),
+            ]
+            .into_iter(),
+        );
+        assert!(out.starts_with("gpuready: waiting\n"), "{:?}", out);
+        assert!(out.contains("una") && out.contains("otra"), "{:?}", out);
+    }
+
+    #[test]
+    fn the_detail_is_one_line_per_card_under_the_verdict() {
+        let out = gpuready_report(
+            alloc::vec![
+                (true, line("17:00.0 una: rm=yes gr=yes")),
+                (true, line("65:00.0 otra: rm=yes gr=yes")),
+            ]
+            .into_iter(),
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{:?}", out);
+        assert_eq!(lines[0], "gpuready: ready");
+    }
 }
 
 #[cfg(test)]
