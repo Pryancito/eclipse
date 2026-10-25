@@ -232,3 +232,161 @@ fn maps_names_the_heap_and_the_stack() {
     assert_eq!(name_of(stack), "[stack]", "{}", maps);
     assert_eq!(name_of(other), "", "{}", maps);
 }
+
+fn kind(start: usize, pages: usize, flags: MMUFlags, shared: bool, id: u64) -> MappingDump {
+    MappingDump {
+        flags,
+        shared,
+        vmo_id: id,
+        ..row(start, start + pages * PAGE_SIZE, "")
+    }
+}
+
+const R: MMUFlags = MMUFlags::READ;
+const RW: MMUFlags = MMUFlags::READ.union(MMUFlags::WRITE);
+const RX: MMUFlags = MMUFlags::READ.union(MMUFlags::EXECUTE);
+
+/// `vm_stat_account`: writable and private is data, executable and not
+/// writable is exec, the stack is the stack whatever its flags, and nothing
+/// else counts -- not a read-only row, not a shared writable one (executable
+/// or not), and not a writable and executable one as code.
+#[test]
+fn each_row_counts_where_vm_stat_account_puts_it() {
+    let s = LAYOUT.start_stack;
+    let rows = [
+        kind(0x1000_0000, 1, RW, false, 10),
+        kind(0x1100_0000, 2, RW, true, 11),
+        kind(0x1200_0000, 4, R, false, 12),
+        kind(0x1300_0000, 8, RX, false, 13),
+        kind(0x1400_0000, 16, RW | MMUFlags::EXECUTE, false, 14),
+        kind(0x1500_0000, 32, MMUFlags::EXECUTE, false, 15),
+        kind(0x1600_0000, 64, MMUFlags::empty(), false, 16),
+        kind(0x1700_0000, 128, RW | MMUFlags::EXECUTE, true, 18),
+        kind(s - 128 * PAGE_SIZE, 129, RW, false, 17),
+    ];
+    let sizes = Sizes::of(&rows, Some(&mm(LAYOUT.start_brk)));
+    assert_eq!(sizes.data, (1 + 16) * PAGE_SIZE, "{:?}", sizes);
+    assert_eq!(sizes.exec, (8 + 32) * PAGE_SIZE, "{:?}", sizes);
+    assert_eq!(sizes.stack, 129 * PAGE_SIZE, "{:?}", sizes);
+}
+
+/// The stack is every row of its object: split by an `mprotect` it is still
+/// the stack, as a `VM_GROWSDOWN` VMA is, and a row of another object next
+/// to it is not.
+#[test]
+fn the_stack_is_every_row_of_the_object_holding_the_first_stack_pointer() {
+    let s = LAYOUT.start_stack;
+    let base = s - 8 * PAGE_SIZE;
+    let rows = [
+        kind(base - PAGE_SIZE, 1, RW, false, 20),
+        kind(base, 1, R, false, 21),
+        kind(base + PAGE_SIZE, 9, RW, false, 21),
+    ];
+    let sizes = Sizes::of(&rows, Some(&mm(LAYOUT.start_brk)));
+    assert_eq!(sizes.stack, 10 * PAGE_SIZE, "{:?}", sizes);
+    assert_eq!(sizes.data, PAGE_SIZE, "{:?}", sizes);
+}
+
+/// `task_mem`: the text is `end_code` rounded up less `start_code` rounded
+/// down; `VmExe` is that but never more than what is executable, and
+/// `VmLib` the rest of it.
+#[test]
+fn vmexe_is_the_text_and_vmlib_the_rest_of_the_executable_memory() {
+    // 0x40_1000..0x40_9876 is nine pages once rounded.
+    let code = |pages| [kind(0x40_1000, pages, RX, false, 30)];
+    let sizes = Sizes::of(&code(14), Some(&mm(LAYOUT.start_brk)));
+    assert_eq!(sizes.text, 9 * PAGE_SIZE);
+    assert_eq!((sizes.exe(), sizes.lib()), (9 * PAGE_SIZE, 5 * PAGE_SIZE));
+    // Less executable memory than text: all of it is the executable's.
+    let sizes = Sizes::of(&code(3), Some(&mm(LAYOUT.start_brk)));
+    assert_eq!((sizes.exe(), sizes.lib()), (3 * PAGE_SIZE, 0));
+    assert_eq!(sizes.text, 9 * PAGE_SIZE, "statm's text is not clamped");
+    // A code segment that starts inside a page (as `lld` lays them out)
+    // counts from that page: 0x40_1234..0x40_2010 is two pages, not one.
+    let unaligned = Mm {
+        layout: Some(ImageLayout {
+            start_code: 0x40_1234,
+            end_code: 0x40_2010,
+            ..LAYOUT
+        }),
+        ..mm(LAYOUT.start_brk)
+    };
+    assert_eq!(Sizes::of(&[], Some(&unaligned)).text, 2 * PAGE_SIZE);
+}
+
+/// A zombie has nothing; a process with no record has no text and no stack,
+/// and its data and code still count.
+#[test]
+fn without_a_record_there_is_no_text_and_no_stack() {
+    let s = LAYOUT.start_stack;
+    let rows = [
+        kind(0x1000_0000, 2, RW, false, 40),
+        kind(0x1100_0000, 3, RX, false, 41),
+        kind(s - PAGE_SIZE, 2, RW, false, 42),
+    ];
+    assert_eq!(Sizes::of(&rows, None), Sizes::default());
+    let sizes = Sizes::of(&rows, Some(&Mm::default()));
+    assert_eq!(
+        sizes,
+        Sizes {
+            data: 4 * PAGE_SIZE,
+            stack: 0,
+            exec: 3 * PAGE_SIZE,
+            text: 0,
+        }
+    );
+}
+
+fn kb(status: &str, key: &str) -> usize {
+    let line = status
+        .lines()
+        .find(|l| l.starts_with(&alloc::format!("{}:\t", key)))
+        .unwrap_or_else(|| panic!("no {} in\n{}", key, status));
+    line[key.len() + 2..]
+        .trim()
+        .strip_suffix("kB")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// The whole way through, on a real address space: `status` and `statm`
+/// say what is mapped, kind by kind.
+#[test]
+fn status_and_statm_say_how_much_there_is_of_each_kind() {
+    let proc = a_process(49_403);
+    let map = |at: usize, pages: usize, flags: MMUFlags, share: bool| {
+        let vmo = VmObject::new_paged(pages);
+        if share {
+            vmo.set_share_on_fork();
+        }
+        let flags = flags | MMUFlags::USER;
+        proc.vmar()
+            .map(Some(at), vmo, 0, pages * PAGE_SIZE, flags)
+            .unwrap()
+    };
+    let code = map(0x40_0000, 3, RX, false);
+    map(0x60_0000, 4, RW, false);
+    map(0x70_0000, 8, RW, true);
+    map(0x7f00_0000, 5, RX, false);
+    let stack = map(0x7ff0_0000, 6, RW, false);
+    proc.linux().set_image_layout(Some(ImageLayout {
+        start_code: code,
+        end_code: code + 2 * PAGE_SIZE + 0x10,
+        start_stack: stack + 0x5ff0,
+        ..ImageLayout::default()
+    }));
+    let status = proc_pid_status(&proc);
+    let page_kb = PAGE_SIZE / 1024;
+    assert_eq!(kb(&status, "VmData"), 4 * page_kb, "{}", status);
+    assert_eq!(kb(&status, "VmStk"), 6 * page_kb, "{}", status);
+    assert_eq!(kb(&status, "VmExe"), 3 * page_kb, "{}", status);
+    assert_eq!(kb(&status, "VmLib"), 5 * page_kb, "{}", status);
+    assert_eq!(kb(&status, "VmSwap"), 0, "{}", status);
+    let statm: Vec<usize> = proc_pid_statm(&proc)
+        .split_whitespace()
+        .map(|f| f.parse().unwrap())
+        .collect();
+    assert_eq!((statm[3], statm[4], statm[5], statm[6]), (3, 0, 4 + 6, 0));
+}

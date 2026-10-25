@@ -2,11 +2,12 @@
 //! fields 26-28 and 45-51 of `stat`, and the `[heap]` and `[stack]` names of
 //! `maps`. Linux writes both from `mm_struct`; here they come from what the
 //! loader recorded ([`ImageLayout`], [`ArgArea`]) and the current break.
-//! Split out of `procfs.rs` for the size ratchet.
+//! And how much of it there is of each kind, as `status` and `statm` say it
+//! ([`Sizes`]). Split out of `procfs.rs` for the size ratchet.
 
 use super::*;
 use crate::loader::{ArgArea, ImageLayout};
-use zircon_object::vm::MappingDump;
+use zircon_object::vm::{round_down_pages, roundup_pages, MMUFlags, MappingDump};
 
 /// A process's `mm` as these two files read it. A zombie has none, and
 /// neither has a process no loader started; for that one `stat` reads 0 and
@@ -84,6 +85,68 @@ pub(super) fn row_name<'a>(row: &'a MappingDump, mm: Option<&Mm>) -> &'a str {
         "[stack]"
     } else {
         ""
+    }
+}
+
+/// The sizes Linux keeps per kind of mapping, which `status` writes as
+/// `VmData:`, `VmStk:`, `VmExe:` and `VmLib:` and `statm` as its text and
+/// data, in bytes. `vm_stat_account` sorts each VMA by its flags: the stack
+/// is `stack_vm`; otherwise writable and private is `data_vm`, and
+/// executable and not writable is `exec_vm`. Here a row is the stack if it
+/// is of the object [`row_name`] calls `[stack]`, so the stack stays the
+/// stack after an `mprotect` splits it, as `VM_GROWSDOWN` does in Linux.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Sizes {
+    /// `data_vm`: what a program's own allocations grow (`VmData`).
+    pub data: usize,
+    /// `stack_vm` (`VmStk`).
+    pub stack: usize,
+    /// `exec_vm`: the executable's code and every library's (`VmExe` plus
+    /// `VmLib`).
+    pub exec: usize,
+    /// `PAGE_ALIGN(end_code) - (start_code & PAGE_MASK)`: the executable's
+    /// own code, which `statm` writes as it is.
+    pub text: usize,
+}
+
+impl Sizes {
+    /// What `rows` hold, kind by kind. Without an `mm` (a zombie) there is
+    /// nothing, and without a record there is no code range and no stack.
+    pub fn of(rows: &[MappingDump], mm: Option<&Mm>) -> Self {
+        let Some(mm) = mm else {
+            return Self::default();
+        };
+        let l = mm.layout.unwrap_or_default();
+        let stack = rows
+            .iter()
+            .find(|r| row_name(r, Some(mm)) == "[stack]")
+            .map(|r| r.vmo_id);
+        let mut sizes = Sizes {
+            text: roundup_pages(l.end_code).saturating_sub(round_down_pages(l.start_code)),
+            ..Self::default()
+        };
+        for r in rows {
+            let len = r.end - r.start;
+            let write = r.flags.contains(MMUFlags::WRITE);
+            if Some(r.vmo_id) == stack {
+                sizes.stack += len;
+            } else if write && !r.shared {
+                sizes.data += len;
+            } else if !write && r.flags.contains(MMUFlags::EXECUTE) {
+                sizes.exec += len;
+            }
+        }
+        sizes
+    }
+
+    /// `VmExe`: the text, but never more than what is executable.
+    pub fn exe(&self) -> usize {
+        self.text.min(self.exec)
+    }
+
+    /// `VmLib`: the executable memory that is not the text.
+    pub fn lib(&self) -> usize {
+        self.exec - self.exe()
     }
 }
 
