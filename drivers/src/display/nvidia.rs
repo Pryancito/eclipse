@@ -8530,6 +8530,8 @@ impl NvidiaGpu {
                         .push(super::nouveau_uapi::NouveauVmMapping {
                             gem_handle,
                             h_virt: b.h_virt,
+                            h_dup: b.h_dup,
+                            ctx_idx,
                             owner_pid,
                             va: b.actual_va,
                             size,
@@ -8586,7 +8588,9 @@ impl NvidiaGpu {
             };
             let status = nvidia_rm_sys::rm_init::vm_bind_unmap(
                 device_instance,
+                mapping.ctx_idx,
                 mapping.h_virt,
+                mapping.h_dup,
                 mapping.size,
                 mapping.va,
             );
@@ -8941,6 +8945,8 @@ impl NvidiaGpu {
                         self.nouveau_vm_mappings.lock().push(nv::NouveauVmMapping {
                             gem_handle: op.handle,
                             h_virt: b.h_virt,
+                            h_dup: b.h_dup,
+                            ctx_idx,
                             owner_pid,
                             va: b.actual_va,
                             size: op.range,
@@ -9825,9 +9831,13 @@ impl NvidiaGpu {
             let leftovers = nv::class_objects_drain_pid(pid);
             if !leftovers.is_empty() {
                 if let Some(device_instance) = device_instance {
-                    for (_, h_object) in &leftovers {
+                    for (_, h_object, ctx_idx) in &leftovers {
                         lock::pump();
-                        let _ = nvidia_rm_sys::rm_init::class_free(device_instance, *h_object);
+                        let _ = nvidia_rm_sys::rm_init::class_free(
+                            device_instance,
+                            *ctx_idx,
+                            *h_object,
+                        );
                     }
                 }
                 log::info!(
@@ -11079,7 +11089,11 @@ impl NvidiaGpu {
                 m.remove(i);
             }
         };
-        let (ctx_idx, h_vas, h_notifier) = match nvidia_rm_sys::rm_init::ctx_alloc(dev, idx) {
+        let (ctx_idx, h_vas, h_notifier) = match nvidia_rm_sys::rm_init::ctx_alloc(
+            dev,
+            idx,
+            owner_pid as u32,
+        ) {
             Ok(c) if c.sched_status == 0 => {
                 // Fresh channel: clear any stale wedged latch from a prior
                 // tenant of this slot, so this client starts un-wedged.
@@ -11383,9 +11397,16 @@ impl NvidiaGpu {
                             object_token as u32,
                             h_object,
                             owner_pid,
+                            ctx_idx,
                         );
                     } else {
-                        nv::class_object_insert(channel_token, object_token, h_object, owner_pid);
+                        nv::class_object_insert(
+                            channel_token,
+                            object_token,
+                            h_object,
+                            owner_pid,
+                            ctx_idx,
+                        );
                     }
                     crate::klog_info!(
                         "[nouveau-uapi] engine object NEW oclass={:#06x} pid={} -> RM object \
@@ -11425,7 +11446,10 @@ impl NvidiaGpu {
                 channel_token
             );
             if abi16 {
-                nv::abi16_object_insert(channel_token, object_token as u32, 0, owner_pid);
+                // No RM object behind it, so no context either: the 0 below
+                // is never used as a client, `class_free` is never called for
+                // an rm_handle of 0.
+                nv::abi16_object_insert(channel_token, object_token as u32, 0, owner_pid, 0);
             }
         }
         Ok(())
@@ -11889,9 +11913,10 @@ impl NvidiaGpu {
                 self.nouveau_nvif_devices
                     .lock()
                     .retain(|d| *d != (owner_pid, hdr.object));
-                if let Some(h_object) = nv::class_object_remove(hdr.object, owner_pid) {
+                if let Some((h_object, ctx_idx)) = nv::class_object_remove(hdr.object, owner_pid) {
                     if let Some(device_instance) = *self.rm_device_instance.lock() {
-                        let status = nvidia_rm_sys::rm_init::class_free(device_instance, h_object);
+                        let status =
+                            nvidia_rm_sys::rm_init::class_free(device_instance, ctx_idx, h_object);
                         if status != 0 {
                             crate::klog_warn!(
                                 "[nouveau-uapi] NVIF DEL: class_free({:#010x}) -> NV_STATUS={:#x}",
@@ -12425,9 +12450,12 @@ impl NvidiaGpu {
                 let leftovers = nv::class_objects_drain_channel(channel_id as u64, owner_pid);
                 if was_rm_backed {
                     if let Some(device_instance) = *self.rm_device_instance.lock() {
-                        for (_token, h_object) in leftovers.iter() {
-                            let status =
-                                nvidia_rm_sys::rm_init::class_free(device_instance, *h_object);
+                        for (_token, h_object, ctx_idx) in leftovers.iter() {
+                            let status = nvidia_rm_sys::rm_init::class_free(
+                                device_instance,
+                                *ctx_idx,
+                                *h_object,
+                            );
                             if status != 0 {
                                 log::warn!(
                                     "[nouveau-uapi] CHANNEL_FREE channel={}: class_free \
@@ -14428,14 +14456,15 @@ impl NvidiaGpu {
                 if !self.nouveau_channel_is_callers(req.channel, owner_pid) {
                     return Err(nv::EINVAL);
                 }
-                let Some(h_object) =
+                let Some((h_object, ctx_idx)) =
                     nv::abi16_object_remove(req.channel as u64, req.handle, owner_pid)
                 else {
                     return Err(nv::ENOENT);
                 };
                 if h_object != 0 {
                     if let Some(device_instance) = *self.rm_device_instance.lock() {
-                        let status = nvidia_rm_sys::rm_init::class_free(device_instance, h_object);
+                        let status =
+                            nvidia_rm_sys::rm_init::class_free(device_instance, ctx_idx, h_object);
                         if status != 0 {
                             crate::klog_warn!(
                                 "[nouveau-uapi] GPUOBJ_FREE: class_free({:#010x}) -> NV_STATUS={:#x}",

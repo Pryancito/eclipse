@@ -321,6 +321,8 @@ fn mapping(gpu: &NvidiaGpu, owner: u64, gem_handle: u32, va: u64, size: u64) {
     gpu.nouveau_vm_mappings.lock().push(nv::NouveauVmMapping {
         gem_handle,
         h_virt: 0xbeef,
+        h_dup: 0,
+        ctx_idx: 0,
         owner_pid: owner,
         va,
         size,
@@ -1270,10 +1272,13 @@ fn nvif_new_of_a_subchannel_needs_the_callers_channel_and_records_nothing_withou
 fn nvif_del_and_the_class_registry_are_scoped_to_the_owner_and_the_channel() {
     let _g = LOCK.lock();
     let gpu = gpu();
-    nv::class_object_insert(3, 0x1000, 0x5a5a, A);
-    nv::class_object_insert(3, 0x1000, 0x6b6b, B);
-    nv::class_object_insert(4, 0x2000, 0x7c7c, A);
-    nv::class_object_insert(3, 0x3000, 0x8d8d, A);
+    // The ctx index each object was built in travels with it: the RM handle
+    // only exists in that context's client, so every remove/drain below has
+    // to hand it back for the free to name the right client.
+    nv::class_object_insert(3, 0x1000, 0x5a5a, A, 1);
+    nv::class_object_insert(3, 0x1000, 0x6b6b, B, 2);
+    nv::class_object_insert(4, 0x2000, 0x7c7c, A, 1);
+    nv::class_object_insert(3, 0x3000, 0x8d8d, A, 1);
     // A DEL names the object by the cookie mesa passed at NEW (a heap
     // pointer, so equal across processes): only the caller's goes.
     assert_eq!(
@@ -1288,28 +1293,28 @@ fn nvif_del_and_the_class_registry_are_scoped_to_the_owner_and_the_channel() {
     assert_eq!(nv::class_object_remove(0x1000, A), None, "gone");
     assert_eq!(
         nv::class_object_remove(0x1000, B),
-        Some(0x6b6b),
-        "B's survived A's DEL"
+        Some((0x6b6b, 2)),
+        "B's survived A's DEL, with B's own context"
     );
     // CHANNEL_FREE reaps what a process left on THAT channel.
     assert_eq!(nv::class_objects_drain_channel(3, B), alloc::vec![]);
     assert_eq!(
         nv::class_objects_drain_channel(3, A),
-        alloc::vec![(0x3000, 0x8d8d)]
+        alloc::vec![(0x3000, 0x8d8d, 1)]
     );
     assert_eq!(nv::class_objects_drain_channel(4, B), alloc::vec![]);
     // Process exit reaps everything of that pid, across channels.
-    nv::class_object_insert(5, 0x5000, 0x9e9e, A);
-    nv::class_object_insert(5, 0x6000, 0xafaf, B);
+    nv::class_object_insert(5, 0x5000, 0x9e9e, A, 1);
+    nv::class_object_insert(5, 0x6000, 0xafaf, B, 2);
     assert_eq!(
         nv::class_objects_drain_pid(A),
-        alloc::vec![(0x2000, 0x7c7c), (0x5000, 0x9e9e)],
+        alloc::vec![(0x2000, 0x7c7c, 1), (0x5000, 0x9e9e, 1)],
         "in insertion order"
     );
     assert_eq!(nv::class_objects_drain_pid(A), alloc::vec![]);
     assert_eq!(
         nv::class_objects_drain_pid(B),
-        alloc::vec![(0x6000, 0xafaf)]
+        alloc::vec![(0x6000, 0xafaf, 2)]
     );
 }
 
@@ -1660,11 +1665,15 @@ fn vm_bind_maps_into_the_callers_own_context_and_a_map_over_a_live_range_replace
     assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, VA, 65536)]), Ok(0));
     let f_maps = FAKE_RM.lock().maps.clone();
     assert_eq!(f_maps.len(), 1);
-    let (h_virt, ctx, h_mem, va, size, bo_offset, kind) = f_maps[0];
+    let (h_virt, ctx, h_mem, va, size, bo_offset, kind, h_dup) = f_maps[0];
     assert_eq!(
         (ctx, h_mem, va, size, bo_offset, kind),
         (1, h_mem_a, VA, 65536, 0, 0x06),
         "A's context, its memory, the kind verbatim"
+    );
+    assert_ne!(
+        h_dup, 0,
+        "a bind into A's own context crosses RM clients, so the object was duped in"
     );
     assert_eq!(
         driver_maps(&gpu, A),
@@ -9345,3 +9354,9 @@ mod probes_tests;
 /// The implicit-sync wait (`implicit_sync.rs`) arm by arm, on state built
 /// by hand: same harness, own file, same reason.
 mod implicit_sync_tests;
+
+/// The `DrmScheme` arms the desktop reaches without an ioctl (ADDFB, the
+/// PRIME import, the cursor, the legacy ioctls), the per-architecture
+/// tables and the context registry's fallbacks: same harness, own file,
+/// same reason.
+mod drm_scheme_tests;

@@ -99,7 +99,7 @@ fn the_selftest_names_the_layer_when_stage_a_fails() {
     let gpu = gpu_rm();
     // The channel stage B pushes from: ctx 0's own buffer, where the fake's
     // `ctx_alloc` places it.
-    nvidia_rm_sys::rm_init::ctx_alloc(INST, CTX).expect("ctx 0");
+    nvidia_rm_sys::rm_init::ctx_alloc(INST, CTX, 1).expect("ctx 0");
     let buf = chan_buf_va(CTX);
     let stage_b_va = buf + 0x9000;
     assert!(stage_b_va + 24 <= buf + CHAN_BUF_SIZE);

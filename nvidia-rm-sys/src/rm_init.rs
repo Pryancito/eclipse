@@ -478,9 +478,17 @@ extern "C" {
 /// `ctx_idx` is in `1..8` (index 0 is the compositor's singleton, served by
 /// step16/step17 and never routed here). See the C for why a second client
 /// cannot share the compositor's single channel/VA space. Idempotent per index.
-/// Serialized through `RmGate` like every other RM entry.
-pub fn ctx_alloc(device_instance: u32, ctx_idx: u32) -> Result<CtxAlloc, NV_STATUS> {
+/// `pid` is the process this context is being built for: the RM client it
+/// hangs off is filed under it, and that is what puts the process in
+/// `nvidia-smi`'s table. Serialized through `RmGate` like every other RM
+/// entry.
+pub fn ctx_alloc(device_instance: u32, ctx_idx: u32, pid: u32) -> Result<CtxAlloc, NV_STATUS> {
     let _gate = RmGate::lock();
+    // The RM client this context is built under is filed under `pid`
+    // (`RmClient::ProcID`), which is the whole of what
+    // `NV2080_CTRL_CMD_GPU_GET_PIDS` answers with. Entered inside the gate,
+    // which this already holds, and dropped with it.
+    let _who = crate::frontend::AttributedTo::enter(pid);
     let mut out = CtxAlloc {
         vas_status: 0xFFFF_FFFF,
         tsg_status: 0xFFFF_FFFF,
@@ -1911,7 +1919,7 @@ extern "C" {
         h_object: *mut NvU32,
         alloc_status: *mut NvU32,
     ) -> NV_STATUS;
-    fn eclipse_rm_class_free(device_instance: NvU32, h_object: NvU32) -> NV_STATUS;
+    fn eclipse_rm_class_free(device_instance: NvU32, ctx_idx: NvU32, h_object: NvU32) -> NV_STATUS;
     fn eclipse_rm_gem_alloc(
         device_instance: NvU32,
         size: u64,
@@ -1988,10 +1996,11 @@ pub fn class_alloc(
     }
 }
 
-/// Frees a class object from [`class_alloc`].
-pub fn class_free(device_instance: u32, h_object: u32) -> NV_STATUS {
+/// Frees a class object from [`class_alloc`]. `ctx_idx` must be the one it was
+/// allocated for: the handle lives in that context's client only.
+pub fn class_free(device_instance: u32, ctx_idx: u32, h_object: u32) -> NV_STATUS {
     let _gate = RmGate::lock();
-    unsafe { eclipse_rm_class_free(device_instance, h_object) }
+    unsafe { eclipse_rm_class_free(device_instance, ctx_idx, h_object) }
 }
 
 /// Physical address of the RM-backed channel's error notifier -- the 4 KiB
@@ -2082,6 +2091,12 @@ pub struct VmBind {
     pub virt_status: NvU32,
     pub map_status: NvU32,
     pub h_virt: NvU32,
+    /// The context client's own reference to the bound GEM object, when the
+    /// bind had to cross clients (every `ctx_idx >= 1` bind: the object lives
+    /// in the shared client, the VA space in the context's own). It has to be
+    /// handed back to [`vm_bind_unmap`], which frees it. 0 when no dup was
+    /// needed, i.e. a `ctx_idx == 0` bind.
+    pub h_dup: NvU32,
     pub actual_va: u64,
 }
 
@@ -2099,7 +2114,9 @@ extern "C" {
     ) -> NV_STATUS;
     fn eclipse_rm_vm_bind_unmap(
         device_instance: NvU32,
+        ctx_idx: NvU32,
         h_virt: NvU32,
+        h_dup: NvU32,
         size: u64,
         va: u64,
     ) -> NV_STATUS;
@@ -2130,6 +2147,7 @@ pub fn vm_bind_map(
         virt_status: 0xFFFF_FFFF,
         map_status: 0xFFFF_FFFF,
         h_virt: 0,
+        h_dup: 0,
         actual_va: 0,
     };
     let status = unsafe {
@@ -2152,11 +2170,22 @@ pub fn vm_bind_map(
     }
 }
 
-/// Unmaps and frees the VA range created by [`vm_bind_map`] (`h_virt` from
-/// its result, same `size`/`actual_va`).
-pub fn vm_bind_unmap(device_instance: u32, h_virt: u32, size: u64, va: u64) -> NV_STATUS {
+/// Unmaps and frees the VA range created by [`vm_bind_map`] (`h_virt` and
+/// `h_dup` from its result, same `ctx_idx`/`size`/`actual_va`).
+///
+/// `ctx_idx` is not optional: `h_virt` and `h_dup` are handles in THAT
+/// context's client and mean nothing in any other, so passing the wrong one
+/// frees the wrong object or nothing at all.
+pub fn vm_bind_unmap(
+    device_instance: u32,
+    ctx_idx: u32,
+    h_virt: u32,
+    h_dup: u32,
+    size: u64,
+    va: u64,
+) -> NV_STATUS {
     let _gate = RmGate::lock();
-    unsafe { eclipse_rm_vm_bind_unmap(device_instance, h_virt, size, va) }
+    unsafe { eclipse_rm_vm_bind_unmap(device_instance, ctx_idx, h_virt, h_dup, size, va) }
 }
 
 /// Mirror of `EclipseExecSubmit` (vendor/eclipse_rm_init.c).

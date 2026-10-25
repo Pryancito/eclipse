@@ -399,12 +399,12 @@ impl ThreadExt for Thread {
         mut head_ptr: UserOutPtr<UserOutPtr<RobustList>>,
         mut len_ptr: UserOutPtr<usize>,
     ) -> SysResult {
-        let linux = self.lock_linux();
-        let head: UserOutPtr<RobustList> = linux.robust_list.as_addr().into();
-        let len = linux.robust_list_len;
-        drop(linux);
+        let head: UserOutPtr<RobustList> = self.lock_linux().robust_list.as_addr().into();
+        // `sizeof(*head)`, whatever was registered: Linux 6.18 answers 24
+        // for a thread that never called `set_robust_list` (musl, which
+        // only does for a robust mutex), and this answered 0.
         head_ptr.write(head)?;
-        len_ptr.write(len)?;
+        len_ptr.write(core::mem::size_of::<RobustList>())?;
         Ok(0)
     }
 
