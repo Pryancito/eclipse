@@ -434,6 +434,41 @@ fn boot_fb_size() -> Option<u64> {
         .map(|b| b.pitch as u64 * b.height as u64)
 }
 
+/// The one line the boot prints for an NVIDIA GPU left cold because it is
+/// scanning out the console.
+///
+/// It used to print nothing at all, which is how a dual-card box came to
+/// report `2 GPU node(s), 1 with the RM up` with no way to tell from the log
+/// WHICH card stayed down or why: the attach never failed, it never ran. The
+/// line carries the three facts that decide it -- the boot framebuffer
+/// address and the BAR1 window it fell inside, which is the whole of
+/// `drives_boot_display` -- plus the hatch that brings the card up anyway
+/// (the deferred bring-up, which is the default on a multi-GPU box and
+/// `nvidia.console_gpu` on a single-GPU one; see
+/// `schedule_deferred_console_bringup`). Pure so it can be tested on a
+/// machine with no GPU, which is every machine here.
+fn console_gpu_cold_line(
+    bus: u8,
+    device: u8,
+    model: &str,
+    boot_fb_phys: u64,
+    bar1_phys: u64,
+    bar1_len: u64,
+) -> String {
+    alloc::format!(
+        "GPU {:02x}:{:02x}.0 {} es la GPU de consola (fb de arranque {:#x} dentro de BAR1 \
+         {:#x}+{:#x}) — fuera del bring-up de arranque: su GSP se cuelga en el store \
+         STARTCPU de SEC2 con el scanout vivo. Se sube despues, con el escritorio ya \
+         arriba y el scanout pausado (nvidia.console_gpu; nvidia.noconsole_gpu lo apaga)",
+        bus,
+        device,
+        model,
+        boot_fb_phys,
+        bar1_phys,
+        bar1_len,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaArchitecture {
     Unknown,
@@ -4972,12 +5007,22 @@ impl DrmScheme for NvidiaGpu {
     /// unconditionally: its GSP-RM boot wedges at the SEC2 STARTCPU store
     /// (see `bringup_step6`), so it is never auto-booted; the compute GPU(s)
     /// are the reliable path and drive the console's scanout FB over PCIe P2P.
+    /// A skipped console GPU returns `console_gpu_cold_line` rather than an
+    /// empty string, so the boot log names the card that stayed cold.
     fn auto_bringup_compute(&self) -> String {
         // The console GPU is never auto-booted (its GSP boot wedges at the SEC2
         // STARTCPU store) and drives the display fine via the GOP framebuffer.
-        // Return nothing so the quiet boot path prints no line for it.
+        // It does get its own line: silence here is what made a dual-card box
+        // report one GPU up and give the log no way to say which card or why.
         if self.drives_boot_display() {
-            return String::new();
+            return console_gpu_cold_line(
+                self.pci_bus,
+                self.pci_device,
+                self.gpu_model,
+                boot_fb_phys().unwrap_or(0),
+                self.bar1_phys,
+                self.info.fb_size as u64,
+            );
         }
         // Run the proven state-load chain (the same sequence a user triggers as
         // `cat /proc/gpustep5;6;8;9`), executed once at boot before any

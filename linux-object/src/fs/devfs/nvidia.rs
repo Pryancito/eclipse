@@ -1352,6 +1352,42 @@ pub fn create_nodes(root: &Arc<DevINode>) {
         ready,
         core::str::from_utf8(nvctl::rm_version()).unwrap_or("?"),
     );
+    // One line per node under the summary. The summary alone says how many
+    // cards came up, never WHICH: on a dual-card box `2 GPU node(s), 1 with
+    // the RM up` is the whole of what `dmesg | grep -i nvidia` had to say
+    // about the card that stayed down, and the node it belongs to (the one a
+    // client opens, and the one NVML numbers) was not in the log at all.
+    for card in cards.iter().filter(|card| card.minor <= GPU_MINOR_MAX) {
+        zcore_drivers::klog_warn!("[nvidiactl]   {}", card_roster_line(card));
+    }
+}
+
+/// The per-node line under the `create_nodes` summary: which `/dev/nvidia<N>`
+/// is which PCI card, and whether the RM is up on it. A card with no instance
+/// is one the RM never attached -- today that is the console GPU without
+/// `nvidia.console_gpu` -- and it is the node a client cannot open and NVML
+/// cannot count, so it is named as such rather than left out.
+fn card_roster_line(card: &nvctl::Card) -> alloc::string::String {
+    match card.instance {
+        Some(instance) => alloc::format!(
+            "/dev/nvidia{} {:04x}:{:02x}:{:02x}.0 id={:04x} RM instancia={}",
+            card.minor,
+            card.domain,
+            card.bus,
+            card.slot,
+            card.device_id,
+            instance,
+        ),
+        None => alloc::format!(
+            "/dev/nvidia{} {:04x}:{:02x}:{:02x}.0 id={:04x} RM sin subir: no se puede abrir \
+             ni la cuenta NVML; si es la GPU de consola, nvidia.console_gpu la sube",
+            card.minor,
+            card.domain,
+            card.bus,
+            card.slot,
+            card.device_id,
+        ),
+    }
 }
 
 mod pin;

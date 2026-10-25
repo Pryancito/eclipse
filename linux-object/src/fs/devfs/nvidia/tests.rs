@@ -1299,3 +1299,40 @@ fn nothing_is_pinned_while_there_is_no_rm() {
     );
     assert!(!asked.get());
 }
+
+/// The per-node roster line `create_nodes` prints under its summary. What it
+/// has to get right is the half that was missing from the log: a card with no
+/// RM instance must still be named, by the node a client would open, and must
+/// say so -- a dual-card box's `2 GPU node(s), 1 with the RM up` never said
+/// which of the two was down.
+#[test]
+fn the_roster_names_the_node_whose_rm_never_came_up() {
+    let cold = nvctl::Card {
+        minor: 0,
+        domain: 0,
+        bus: 0x0a,
+        slot: 0,
+        device_id: 0x1f06,
+        reg_address: 0,
+        reg_size: 0,
+        fb_address: 0,
+        fb_size: 0,
+        instance: None,
+    };
+    let up = nvctl::Card {
+        minor: 1,
+        instance: Some(0),
+        bus: 0x2d,
+        ..cold
+    };
+    let cold_line = card_roster_line(&cold);
+    assert!(
+        cold_line.starts_with("/dev/nvidia0 0000:0a:00.0 id=1f06 "),
+        "{}",
+        cold_line
+    );
+    assert!(cold_line.contains("RM sin subir"), "{}", cold_line);
+    assert!(cold_line.contains("nvidia.console_gpu"), "{}", cold_line);
+    let up_line = card_roster_line(&up);
+    assert_eq!(up_line, "/dev/nvidia1 0000:2d:00.0 id=1f06 RM instancia=0");
+}
