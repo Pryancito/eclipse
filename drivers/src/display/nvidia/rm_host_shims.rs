@@ -84,6 +84,9 @@ extern "C" fn eclipse_rm_chan_notifier_pa(_inst: u32, out: *mut u64) -> u32 {
 extern "C" fn eclipse_rm_ctx0_reset(_inst: u32) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("ctx0_reset");
+    if f.fail_ctx0_reset {
+        return NV_ERR_INVALID_STATE;
+    }
     if !f.chan_built {
         return NV_OK;
     }
@@ -456,8 +459,19 @@ extern "C" fn eclipse_rm_step10(_a0: u32, _a1: *mut u8) -> u32 {
     NV_ERR_NOT_SUPPORTED
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_step15(_a0: u32, _a1: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_step15(_a0: u32, out: *mut nvidia_rm_sys::rm_init::GrProbe) -> u32 {
+    // Not recorded in `calls`: a GRAPH_UNITS answer is no RM work the
+    // tests count, and the ones that count calls ask for it in passing.
+    let Some((num_gpc, total_tpc)) = FAKE_RM.lock().gr_probe else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    unsafe {
+        (*out).gpc_mask_status = 0;
+        (*out).tpc_mask_status = 0;
+        (*out).num_gpc = num_gpc;
+        (*out).total_tpc = total_tpc;
+    }
+    NV_OK
 }
 /// Whether the ladder has been built, the C side's `g_grAllocDone`. Sticky:
 /// freeing every channel does not take it back down.
@@ -746,6 +760,18 @@ pub(super) struct FakeRm {
     pub writes_lost: bool,
     /// Every semaphore RELEASE the ring executed: `(ctx, VA, payload)`.
     pub releases: Vec<(u32, u64, u32)>,
+    /// `gem_alloc` fails as a CALL, before it can report an `alloc_status`:
+    /// what the Rust wrapper turns into `Err`, as against the refusal
+    /// `fail_gem_alloc` answers inside an `Ok`.
+    pub fail_gem_alloc_call: bool,
+    /// `gem_map_cpu` fails as a CALL: the `Err` shape, as against the
+    /// `lookup_status` refusal `fail_map_cpu` answers inside an `Ok`.
+    pub fail_map_cpu_call: bool,
+    /// `step15` answers a GR probe of `(num_gpc, total_tpc)` instead of
+    /// `NV_ERR_NOT_SUPPORTED`: the floorswept truth GRAPH_UNITS reports.
+    pub gr_probe: Option<(u32, u32)>,
+    /// `ctx0_reset` refuses: the singleton stands, and the exit says so.
+    pub fail_ctx0_reset: bool,
 }
 
 /// `ECLIPSE_CHAN_BUF_SIZE`: the channel's own buffer, pushbuffer and ring,
@@ -826,6 +852,10 @@ const EMPTY_RM: FakeRm = FakeRm {
     vm_bind_invisible: false,
     writes_lost: false,
     releases: Vec::new(),
+    fail_gem_alloc_call: false,
+    fail_map_cpu_call: false,
+    gr_probe: None,
+    fail_ctx0_reset: false,
 };
 
 pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);
@@ -1038,6 +1068,9 @@ extern "C" fn eclipse_rm_ctx_free(_inst: u32, ctx_idx: u32) -> u32 {
 extern "C" fn eclipse_rm_gem_alloc(_inst: u32, size: u64, sysmem: u32, out: *mut GemAlloc) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("gem_alloc");
+    if f.fail_gem_alloc_call {
+        return NV_ERR_INVALID_STATE;
+    }
     if f.fail_gem_alloc {
         unsafe {
             *out = GemAlloc {
@@ -1065,6 +1098,9 @@ extern "C" fn eclipse_rm_gem_alloc(_inst: u32, size: u64, sysmem: u32, out: *mut
 extern "C" fn eclipse_rm_gem_map_cpu(_inst: u32, h_memory: u32, out: *mut GemMapCpu) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("gem_map_cpu");
+    if f.fail_map_cpu_call {
+        return NV_ERR_INVALID_STATE;
+    }
     let elsewhere = f.map_cpu_elsewhere;
     let refused = f.fail_map_cpu;
     let r = match f.gem(h_memory) {
