@@ -12667,8 +12667,16 @@ impl NvidiaGpu {
                 // pixman -- a desktop on the CPU with the GPU sitting idle.
                 //
                 // The ladder flag is the honest precondition: sticky, set by
-                // step16, and unaffected by channels coming and going.
-                if !nvidia_rm_sys::rm_init::gr_ready() {
+                // step16, and unaffected by channels coming and going. Asked
+                // of THIS card, because ladders are per-GPU: each builds its
+                // own client, device and VA space, so a card whose step16
+                // never ran has nothing to bind into however many ladders
+                // stand on the other card. A card the RM never attached has
+                // no ladder by the same token, and no instance to ask about.
+                if !(*self.rm_device_instance.lock())
+                    .map(nvidia_rm_sys::rm_init::gr_ready)
+                    .unwrap_or(false)
+                {
                     crate::klog_warn!(
                         "[nouveau-uapi] VM_BIND: the GR ladder (step16) has never been built on \
                          this GPU, so no VA space exists to bind into. Attach the RM \
