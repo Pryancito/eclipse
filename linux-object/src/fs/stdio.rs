@@ -1221,10 +1221,16 @@ fn linux_keycode_to_evdev(kc: u8) -> Option<u16> {
 /// Build the `kb_value` for a `KDGKBENT` query (kdrive/TinyX keymap loader).
 fn kdgkbent_value(keycode: u16, table: u8) -> u16 {
     use zcore_drivers::input::input_event_codes::key::*;
-    const KT_LATIN: u16 = 0;
-    const KT_SPEC: u16 = 2;
-    const KT_CUR: u16 = 6;
-    const KT_SHIFT: u16 = 7;
+    // `KT_LATIN`, `KT_SPEC`, `KT_CUR` and `KT_SHIFT` come in through
+    // `super::ioctl::*` with the rest of the family, where a test names each
+    // one. They used to be declared again right here, shadowing the two that
+    // already existed, and a constant declared in a function body has no name
+    // outside it: no test could reach these four.
+    //
+    // `NO_SYMBOL` stays local because it is this function's own answer and not
+    // a name from the headers. It is `K(KT_LATIN, 0)`, which spells "this key
+    // types NUL" rather than "this key is not bound" -- worth a look, but not
+    // changed here.
     const NO_SYMBOL: u16 = 0;
     const K_ENTER: u16 = (KT_SPEC << 8) | 1;
     const K_SHIFT: u16 = KT_SHIFT << 8;
@@ -3688,3 +3694,6 @@ mod stdout_node_tests {
 
 #[cfg(test)]
 mod terminal_readiness_tests;
+
+#[cfg(test)]
+mod tty_uapi_tests;
