@@ -14,6 +14,7 @@
 //! strongly, so both of those let it go.
 
 use super::*;
+use zircon_object::task::SchedSnapshot;
 
 /// The leader kept; see the module docs.
 #[derive(Default)]
@@ -32,8 +33,17 @@ impl LinuxProcess {
 
     /// Let it go: the process has died, or an exec from another thread
     /// made a new leader (`de_thread` releases the old one).
+    ///
+    /// What it has for the scheduler goes on file first
+    /// ([`Process::leader_sched`]): a `setpriority` or `sched_setaffinity`
+    /// aimed at it since it left the thread list changed this object, not
+    /// what was filed then, and the zombie answers with it.
     pub fn release_exited_leader(&self) -> Option<Arc<Thread>> {
-        self.exited_leader.0.lock().take()
+        let leader = self.exited_leader.0.lock().take();
+        if let Some(leader) = &leader {
+            leader.proc().set_leader_sched(SchedSnapshot::of(leader));
+        }
+        leader
     }
 }
 
