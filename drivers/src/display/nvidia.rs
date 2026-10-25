@@ -4949,6 +4949,15 @@ impl DrmScheme for NvidiaGpu {
         s.push_str("[gpustep14] --- stage 5: copy-engine data movement (gpustep10) ---\n");
         s.push_str(&self.bringup_step10());
         s.push_str(&self.dump_head_liveness("gpustep14", "post-stage5"));
+        s.push_str("[gpustep14] --- stage 6: GR allocation ladder (gpustep16) ---\n");
+        s.push_str(&self.bringup_step16());
+        s.push_str("[gpustep14] --- stage 7: compute channel on ladder (gpustep17) ---\n");
+        s.push_str(&self.bringup_step17());
+        if let Some(device_instance) = *self.rm_device_instance.lock() {
+            if let Ok(pa) = nvidia_rm_sys::rm_init::chan_notifier_pa(device_instance) {
+                super::nouveau_uapi::set_chan_notifier_pa(pa);
+            }
+        }
         s.push_str("[gpustep14] === console GPU bring-up chain complete (see per-stage results above) ===\n");
         s
     }
@@ -5059,31 +5068,35 @@ impl DrmScheme for NvidiaGpu {
         if !self.drives_boot_display() {
             return String::new();
         }
-        if self.rm_device_instance.lock().is_some() {
-            return alloc::format!(
-                "GPU consola {:02x}:{:02x}.0 {} ya state-loaded",
-                self.pci_bus,
-                self.pci_device,
-                self.gpu_model,
-            );
+        let already = self.rm_device_instance.lock().is_some();
+        if !already {
+            // One-shot: ensure_console_gpu_brought_up runs bringup_step14.
+            self.ensure_console_gpu_brought_up();
         }
-        // One-shot: ensure_console_gpu_brought_up runs bringup_step14.
-        self.ensure_console_gpu_brought_up();
-        if self.rm_device_instance.lock().is_some() {
-            alloc::format!(
-                "GPU consola {:02x}:{:02x}.0 {} lista (bring-up diferido) — present CE local y cursor HW",
-                self.pci_bus,
-                self.pci_device,
-                self.gpu_model,
-            )
-        } else {
-            alloc::format!(
+        let Some(device_instance) = *self.rm_device_instance.lock() else {
+            return alloc::format!(
                 "GPU consola {:02x}:{:02x}.0 {} sin RM tras bring-up diferido — se sigue con present por CPU y cursor software",
                 self.pci_bus,
                 self.pci_device,
                 self.gpu_model,
-            )
+            );
+        };
+        if !nvidia_rm_sys::rm_init::gr_ready(device_instance) {
+            let _ = self.bringup_step16();
+            let _ = self.bringup_step17();
         }
+        let ladder_built = nvidia_rm_sys::rm_init::gr_ready(device_instance);
+        alloc::format!(
+            "GPU consola {:02x}:{:02x}.0 {} lista (bring-up diferido) — present CE local, cursor HW y {}",
+            self.pci_bus,
+            self.pci_device,
+            self.gpu_model,
+            if ladder_built {
+                "ladder GR construido (clientes con contexto propio y en nvidia-smi)"
+            } else {
+                "ladder GR NO construido"
+            }
+        )
     }
 
     fn ce_present(&self, src_sysmem_pa: u64, size: u64) -> bool {
