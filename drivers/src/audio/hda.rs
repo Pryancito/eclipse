@@ -3647,8 +3647,8 @@ mod dai_tests {
     //! is still playing (heard as a dropout).
 
     use super::{
-        fill_span, mix_streams, rebase_clock, BDL_SEGMENT, DRIFT_TRIGGER, FILL_DEPTH,
-        MAX_POS_LEAD, RING_GUARD, RING_PAGES,
+        fill_span, mix_streams, rebase_clock, BDL_SEGMENT, DRIFT_TRIGGER, FILL_DEPTH, MAX_POS_LEAD,
+        RING_GUARD, RING_PAGES,
     };
     use crate::audio::pipeline::host::HostStream;
     use crate::nvme::nvme_queue::PAGE_SIZE;
@@ -3681,7 +3681,15 @@ mod dai_tests {
         // Without the re-base: nothing can be written, ever again.
         let consumed_raw = by_clock.min(reported);
         assert_eq!(
-            fill_span(reported, consumed_raw, reported, RING, RING_GUARD, FILL_DEPTH, FRAME),
+            fill_span(
+                reported,
+                consumed_raw,
+                reported,
+                RING,
+                RING_GUARD,
+                FILL_DEPTH,
+                FRAME
+            ),
             0
         );
         let mut drifting = false;

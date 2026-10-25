@@ -138,7 +138,10 @@ impl AllDeviceList {
                     list.push(d);
                 } else {
                     // Real NICs go before loopback so index 0 is first Ethernet.
-                    let pos = list.iter().position(|x| x.is_loopback()).unwrap_or(list.len());
+                    let pos = list
+                        .iter()
+                        .position(|x| x.is_loopback())
+                        .unwrap_or(list.len());
                     list.insert(pos, d);
                 }
             }

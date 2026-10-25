@@ -1830,8 +1830,16 @@ mod request_number_tests {
         // `'T'` is 0x54, and the command number is what the header writes
         // after it. These are the requests a libc terminal call sends.
         assert_eq!(TCGETS, io(b'T', 0x01), "tcgetattr");
-        assert_eq!(TCGETS2, ior(b'T', 0x2A, core::mem::size_of::<Termios2>()), "tcgetattr2");
-        assert_eq!(TCSETS2, iow(b'T', 0x2B, core::mem::size_of::<Termios2>()), "tcsetattr2");
+        assert_eq!(
+            TCGETS2,
+            ior(b'T', 0x2A, core::mem::size_of::<Termios2>()),
+            "tcgetattr2"
+        );
+        assert_eq!(
+            TCSETS2,
+            iow(b'T', 0x2B, core::mem::size_of::<Termios2>()),
+            "tcsetattr2"
+        );
         assert_eq!(TCSETSW2, iow(b'T', 0x2C, core::mem::size_of::<Termios2>()));
         assert_eq!(TCSETSF2, iow(b'T', 0x2D, core::mem::size_of::<Termios2>()));
         assert_eq!(TCSETS, io(b'T', 0x02), "tcsetattr TCSANOW");

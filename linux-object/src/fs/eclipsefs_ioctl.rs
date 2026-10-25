@@ -424,8 +424,7 @@ impl<'a> Target<'a> {
             // (`FIEMAP_MAX_EXTENTS` × 56). `vec![0; n]` panicked the machine.
             let need = FIEMAP_HEADER + FIEMAP_EXTENT * count;
             let mut buf = alloc::vec::Vec::new();
-            buf.try_reserve_exact(need)
-                .map_err(|_| LxError::ENOMEM)?;
+            buf.try_reserve_exact(need).map_err(|_| LxError::ENOMEM)?;
             buf.resize(need, 0);
             buf[..FIEMAP_HEADER].copy_from_slice(&head);
             let ret = self.fiemap(&mut buf);

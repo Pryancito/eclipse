@@ -1147,12 +1147,10 @@ pub extern "C" fn drivers_net_drain() {
 /// miss doc
 pub fn poll_ifaces() {
     NET_DRAIN_READY.store(true, Ordering::Relaxed);
-    kernel_hal::net::for_each_net_device(|iface| {
-        match iface.poll() {
-            Ok(_) => {}
-            Err(e) => {
-                warn!("error : {:?}", e)
-            }
+    kernel_hal::net::for_each_net_device(|iface| match iface.poll() {
+        Ok(_) => {}
+        Err(e) => {
+            warn!("error : {:?}", e)
         }
     });
     if zcore_drivers::net::loopback::take_loopback_moved() {
