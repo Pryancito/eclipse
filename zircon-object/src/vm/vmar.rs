@@ -1137,7 +1137,12 @@ impl VmAddressRegion {
                 // the process with a forced SIGSEGV. `/proc/<pid>/maps` was
                 // reporting the same wrong permissions.
                 let file_base = m.vmo_offset + map.vmo.file_offset();
-                let shared = map.vmo.share_count() > 1;
+                // `MAP_SHARED`, which is what the `s` of the perms column
+                // says in Linux (`VM_MAYSHARE`). It was "more than one
+                // mapper", so a shared mapping read `p` until the process
+                // forked, and a private one that an `munmap` cut in two
+                // (two mappings of one object) read `s`.
+                let shared = map.vmo.is_share_on_fork();
                 let vmo_id = map.vmo.id();
                 let name = map.vmo.name();
                 for (page, pages, flags) in m.flags.runs() {
@@ -2048,6 +2053,11 @@ impl VmAddressRegion {
         bytes
     }
 
+    /// Bytes of page tables this address space holds (`VmPTE`).
+    pub fn page_table_bytes(&self) -> usize {
+        self.page_table.lock().table_bytes()
+    }
+
     /// Returns statistics about memory used by a task.
     pub fn get_task_stats(&self) -> TaskStatsInfo {
         let mut task_stats = TaskStatsInfo::default();
@@ -2163,7 +2173,8 @@ pub struct MappingDump {
     /// `vmo_offset` (see `VmObject::file_offset`), so the two differ there.
     /// Equal to `vmo_offset` for anonymous memory.
     pub file_offset: usize,
-    /// Whether the backing VMO is shared with other mappers (MAP_SHARED-like).
+    /// Whether the mapping is `MAP_SHARED`: the backing VMO is shared with
+    /// every child rather than copied.
     pub shared: bool,
     /// Koid of the backing VMO — stands in for the inode column.
     pub vmo_id: u64,
@@ -4607,13 +4618,18 @@ mod tests {
         assert_eq!(rows[1].start, base + 0x3000);
         assert!(!rows[1].flags.contains(MMUFlags::WRITE));
 
-        // A shared VMO (second mapper) flips the shared bit.
+        // `MAP_SHARED` flips the shared bit; a second mapper of a private
+        // object (what an `munmap` of its middle makes) does not.
         let vmo = VmObject::new_paged(1);
         vmar.map_at(0x5000, vmo.clone(), 0, 0x1000, rw).unwrap();
         vmar.map_at(0x7000, vmo, 0, 0x1000, rw).unwrap();
+        let shared = VmObject::new_paged(1);
+        shared.set_share_on_fork();
+        vmar.map_at(0x9000, shared, 0, 0x1000, rw).unwrap();
         let rows = vmar.mappings_dump();
-        assert_eq!(rows.len(), 4);
-        assert!(rows[2].shared && rows[3].shared);
+        assert_eq!(rows.len(), 5);
+        assert!(!rows[2].shared && !rows[3].shared);
+        assert!(rows[4].shared);
     }
 
     #[test]

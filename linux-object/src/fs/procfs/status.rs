@@ -7,8 +7,9 @@
 //! `Cpus_allowed_list:` were missing, so a program asking whether it is being
 //! traced (`grep TracerPid`) found nothing to read, `ps s` had no masks to
 //! show, and a check of `CapEff:` before trying something privileged read an
-//! empty string. The memory lines Linux writes after `NSsid:` need numbers
-//! this kernel does not keep yet.
+//! empty string. Of the memory lines Linux writes after `NSsid:`, the peaks
+//! (`VmPeak:`, `VmHWM:`), the locked and pinned sizes and the split of the
+//! resident size need numbers this kernel does not keep yet.
 
 use super::*;
 use crate::fs::FileDesc;
@@ -102,13 +103,25 @@ pub(super) fn proc_task_status(proc: &Process, thread: Option<&Arc<Thread>>) -> 
     if alive {
         // VmSize = total mapped address space; VmRSS = committed (resident)
         // bytes, private + shared — the fields `ps`/`top`/OOM-watchers read.
-        let stats = proc.vmar().get_task_stats();
+        // Then the sizes by kind, in `task_mem`'s order; with no swap,
+        // `VmSwap:` is 0.
+        let vmar = proc.vmar();
+        let stats = vmar.get_task_stats();
         let vm_size_kb = stats.mapped_bytes() / 1024;
         let vm_rss_kb = (stats.private_bytes() + stats.shared_bytes()) / 1024;
+        let sizes = layout::Sizes::of(&vmar.mappings_dump(), layout::Mm::of(proc).as_ref());
         let _ = write!(
             out,
-            "VmSize:\t{:8} kB\nVmRSS:\t{:8} kB\n",
-            vm_size_kb, vm_rss_kb
+            "VmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nVmData:\t{:8} kB\nVmStk:\t{:8} kB\n\
+             VmExe:\t{:8} kB\nVmLib:\t{:8} kB\nVmPTE:\t{:8} kB\nVmSwap:\t{:8} kB\n",
+            vm_size_kb,
+            vm_rss_kb,
+            sizes.data / 1024,
+            sizes.stack / 1024,
+            sizes.exe() / 1024,
+            sizes.lib() / 1024,
+            vmar.page_table_bytes() / 1024,
+            0
         );
     }
     let _ = writeln!(out, "Threads:\t{}", crate::process::task_count(proc));

@@ -569,6 +569,13 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
         crate::common::ipi::remote_flush_tlb_aspace(None, self.aspace_filter());
     }
 
+    /// Every table allocated below the root, and they are only freed with
+    /// the whole table: an address space that unmapped a range still counts
+    /// the tables that held it, where Linux frees them (`free_pgtables`).
+    fn table_bytes(&self) -> usize {
+        self.intrm_tables.len() * crate::PAGE_SIZE
+    }
+
     fn set_gather(&mut self, on: bool) -> bool {
         if on {
             self.gather += 1;
@@ -927,6 +934,34 @@ mod walker_tests {
             Err(PagingError::AlreadyMapped)
         ));
         assert_eq!(pt.query(vaddr).unwrap(), (0x1000, rw(), PageSize::Size4K));
+    }
+
+    /// `VmPTE` counts the tables below the root: none for an empty space,
+    /// three for the first page of a four-level one (one each of P3, P2 and
+    /// P1), one more for a page under another P2 entry, and none for a page
+    /// beside the first.
+    #[test]
+    fn the_tables_below_the_root_are_what_vmpte_counts() {
+        let mut pt = a_table::<PageTableLevel4>();
+        assert_eq!(pt.table_bytes(), 0);
+        let vaddr = 0x2400_0000_0000;
+        pt.map(Page::new_aligned(vaddr, PageSize::Size4K), 0x1000, rw())
+            .unwrap();
+        assert_eq!(pt.table_bytes(), 3 * PAGE_SIZE);
+        pt.map(
+            Page::new_aligned(vaddr + 0x1000, PageSize::Size4K),
+            0x2000,
+            rw(),
+        )
+        .unwrap();
+        assert_eq!(pt.table_bytes(), 3 * PAGE_SIZE);
+        pt.map(
+            Page::new_aligned(vaddr + 0x20_0000, PageSize::Size4K),
+            0x3000,
+            rw(),
+        )
+        .unwrap();
+        assert_eq!(pt.table_bytes(), 4 * PAGE_SIZE);
     }
 
     /// `unmap` names the frame it released so the caller can free it, and the
