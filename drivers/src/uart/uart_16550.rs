@@ -485,10 +485,19 @@ mod pmio {
             let uart = driver(0x3F8);
 
             assert_eq!(uart.name(), "uart16550-Pmio");
+            // The MMIO twin's, spelled as that type spells it -- the two
+            // differ in more than the case of a letter, which a registry
+            // matching case-insensitively would collapse.
             assert_ne!(
                 uart.name(),
-                "uart16550-Mmio",
+                "uart16550-mmio",
                 "the two 16550 drivers answer to the same name"
+            );
+            assert_ne!(
+                uart.name().to_ascii_lowercase(),
+                "uart16550-mmio",
+                "they differ only in case, so a case-insensitive match \
+                 would hand over whichever registered first"
             );
         }
 
