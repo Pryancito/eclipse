@@ -69,8 +69,7 @@ pub(super) fn exec_target(
         // The descriptor itself; `AT_FDCWD` is the working directory, which
         // is no program (EACCES further on, as any directory).
         let (inode, opened_as) = if dirfd == FileDesc::CWD {
-            let cwd = proc.current_working_directory();
-            (proc.lookup_inode(&cwd)?, cwd)
+            proc.working_directory()?
         } else {
             // A socket or an eventfd is a descriptor but not a file: Linux
             // gets as far as `S_ISREG` with it, which says `EACCES`.

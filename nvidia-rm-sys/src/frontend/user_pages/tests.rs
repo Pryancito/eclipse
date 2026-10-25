@@ -45,6 +45,8 @@ fn caller() -> Caller {
         ctl: false,
         admin: false,
         gpu_mask: 0,
+        pid: 7,
+        name: Caller::name_of(b"cuda-probe"),
     }
 }
 

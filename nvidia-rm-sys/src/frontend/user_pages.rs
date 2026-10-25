@@ -56,7 +56,7 @@ pub fn rm_escape_lending(
         return NV_ERR_INVALID_ARGUMENT;
     }
     let (status, untaken) = {
-        let _scope = CallScope::enter(caller.gpu_mask, caller.admin);
+        let _scope = CallScope::enter(caller);
         *LENT.lock() = pages;
         let status = unsafe {
             super::eclipse_rm_frontend_escape(

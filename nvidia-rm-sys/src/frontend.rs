@@ -35,7 +35,7 @@
 //! mapping ([`rm_map_memory`]) for the kernel to record on the file the
 //! client will mmap.
 use crate::types::*;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 pub mod events;
 pub mod user_pages;
@@ -320,6 +320,19 @@ static IN_CALL: AtomicBool = AtomicBool::new(false);
 static CALLER_GPUS: AtomicU32 = AtomicU32::new(0);
 /// Whether the caller of the call in flight is an administrator.
 static CALLER_ADMIN: AtomicBool = AtomicBool::new(false);
+/// The pid of the caller of the call in flight, which is what the RM files
+/// every client it makes during the call under (`RmClient::ProcID`, set from
+/// `osGetCurrentProcess` in client.c). 0 = no user caller, which is what a
+/// close or a boot-time call is and what this port always answered.
+static CALLER_PID: AtomicU32 = AtomicU32::new(0);
+/// The caller's name, NUL-padded, for `osGetCurrentProcessName`
+/// (`RmClient::name`, and the Xid line's `name=`). Sixteen bytes because
+/// Linux answers out of `current->comm`, which is `TASK_COMM_LEN`. One byte
+/// per atomic: the whole call is inside the RM gate, so nothing else writes
+/// them, and this crate wants no lock below the kernel for sixteen bytes.
+static CALLER_NAME: [AtomicU8; CALLER_NAME_LEN] = [const { AtomicU8::new(0) }; CALLER_NAME_LEN];
+/// `TASK_COMM_LEN`: what Linux's `current->comm` holds, NUL included.
+pub const CALLER_NAME_LEN: usize = 16;
 /// `fn(addr, len) -> bool`, registered by the kernel: whether `len` bytes at
 /// `addr` are mapped user memory of the calling process. 0 = none yet, and
 /// then every user copy is refused.
@@ -350,10 +363,26 @@ struct CallScope {
 }
 
 impl CallScope {
-    fn enter(gpu_mask: u32, admin: bool) -> CallScope {
+    /// One escape of `caller`'s.
+    fn enter(caller: &Caller) -> CallScope {
+        CallScope::with(caller.gpu_mask, caller.admin, caller.pid, &caller.name)
+    }
+
+    /// A call with no user caller: a close, or the boot-time bring-up. Linux
+    /// makes these with `RS_PRIV_LEVEL_KERNEL`'s locks and nobody to ask
+    /// about, which is pid 0 and this kernel's own name.
+    fn enter_kernel() -> CallScope {
+        CallScope::with(0, false, 0, &[0u8; CALLER_NAME_LEN])
+    }
+
+    fn with(gpu_mask: u32, admin: bool, pid: u32, name: &[u8; CALLER_NAME_LEN]) -> CallScope {
         let gate = crate::rm_init::RmGate::lock();
         CALLER_GPUS.store(gpu_mask, Ordering::SeqCst);
         CALLER_ADMIN.store(admin, Ordering::SeqCst);
+        CALLER_PID.store(pid, Ordering::SeqCst);
+        for (slot, &byte) in CALLER_NAME.iter().zip(name.iter()) {
+            slot.store(byte, Ordering::SeqCst);
+        }
         IN_CALL.store(true, Ordering::SeqCst);
         CallScope { _gate: gate }
     }
@@ -365,7 +394,39 @@ impl Drop for CallScope {
         IN_CALL.store(false, Ordering::SeqCst);
         CALLER_GPUS.store(0, Ordering::SeqCst);
         CALLER_ADMIN.store(false, Ordering::SeqCst);
+        CALLER_PID.store(0, Ordering::SeqCst);
+        for slot in CALLER_NAME.iter() {
+            slot.store(0, Ordering::SeqCst);
+        }
     }
+}
+
+/// `osGetCurrentProcess`: during a front-end call, the pid of the process
+/// whose ioctl it is; 0 otherwise, which is what this port always answered.
+///
+/// This is the whole of per-process accounting in the RM. `client.c` stores
+/// it on every client it makes (`pClient->ProcID = osGetCurrentProcess()`),
+/// and `gpuGetProcWithObject` -- which serves
+/// `NV2080_CTRL_CMD_GPU_GET_PIDS`, the control NVML asks for `nvidia-smi`'s
+/// "Processes" table -- answers with the `ProcID` of every client that holds
+/// a channel on the GPU. With a constant 0 every client is the same nameless
+/// process, so the table had nothing to show.
+pub(crate) fn current_pid() -> u32 {
+    CALLER_PID.load(Ordering::SeqCst)
+}
+
+/// `osGetCurrentProcessName`: the caller's name during a front-end call,
+/// without its padding; empty outside one, and the caller then falls back to
+/// this kernel's own name.
+pub(crate) fn current_name() -> [u8; CALLER_NAME_LEN] {
+    let mut out = [0u8; CALLER_NAME_LEN];
+    if !IN_CALL.load(Ordering::SeqCst) {
+        return out;
+    }
+    for (slot, byte) in CALLER_NAME.iter().zip(out.iter_mut()) {
+        *byte = slot.load(Ordering::SeqCst);
+    }
+    out
 }
 
 /// `os_memcpy_from_user`: Linux's `copy_from_user`, answering
@@ -438,6 +499,23 @@ pub struct Caller {
     pub admin: bool,
     /// The RM GPU instances the calling process has open.
     pub gpu_mask: u32,
+    /// The calling process's pid, which every RM client made during the call
+    /// is filed under. 0 for a call with no user caller.
+    pub pid: u32,
+    /// The calling process's name, NUL-padded (Linux's `current->comm`).
+    pub name: [u8; CALLER_NAME_LEN],
+}
+
+impl Caller {
+    /// A caller's name from a byte string of any length: the first
+    /// [`CALLER_NAME_LEN`] minus one bytes, NUL-padded, so there is always a
+    /// terminator for the RM's `%s`.
+    pub fn name_of(name: &[u8]) -> [u8; CALLER_NAME_LEN] {
+        let mut out = [0u8; CALLER_NAME_LEN];
+        let n = name.len().min(CALLER_NAME_LEN - 1);
+        out[..n].copy_from_slice(&name[..n]);
+        out
+    }
 }
 
 /// One `NV_ESC_RM_*` escape, on the kernel copy of its payload. The return
@@ -459,7 +537,7 @@ pub fn rm_map_memory(payload: &mut [u8], caller: &Caller) -> (NV_STATUS, Option<
         return (NV_ERR_INVALID_ARGUMENT, None);
     }
     let mut raw = RawMmapContext::default();
-    let _scope = CallScope::enter(caller.gpu_mask, caller.admin);
+    let _scope = CallScope::enter(caller);
     let status = unsafe {
         eclipse_rm_frontend_escape(
             RM_MAP_MEMORY,
@@ -485,7 +563,7 @@ pub fn map_unrecorded(payload: &mut [u8], caller: &Caller, why: NV_STATUS) {
     if caller.os_info == 0 {
         return;
     }
-    let _scope = CallScope::enter(caller.gpu_mask, caller.admin);
+    let _scope = CallScope::enter(caller);
     unsafe { unrecorded(payload, caller, why) };
 }
 
@@ -509,8 +587,9 @@ pub fn release(os_info: usize) {
         return;
     }
     // Linux frees on close with `RS_PRIV_LEVEL_KERNEL`'s locks and no caller
-    // to ask about: no GPU is open and nobody is an administrator.
-    let _scope = CallScope::enter(0, false);
+    // to ask about: no GPU is open, nobody is an administrator and there is
+    // no process whose pid to file anything under.
+    let _scope = CallScope::enter_kernel();
     unsafe { eclipse_rm_frontend_release(os_info as *mut c_void) };
     events::free_open_events(os_info);
 }

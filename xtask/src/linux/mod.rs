@@ -1122,7 +1122,8 @@ impl LinuxRootfs {
               # labwc froze within seconds of starting. Keep the system on\n\
               # its proven configuration; opt in per command if needed:\n\
               #   LD_PRELOAD=/lib/libeclipse_dns.so some-command\n\
-              export HOME=/root; mkdir -p /root/.ollama 2>/dev/null\n\
+              export HOME=/root\n\
+              mkdir -p /root/.ollama 2>/dev/null\n\
               # Ollama models must not land on tmpfs. A multi-GB ollama pull\n\
               # into /tmp (or a home that is still ramfs) densified the kernel\n\
               # heap until epoll_pwait panicked on a 96-byte timer cell.\n\
@@ -7119,10 +7120,12 @@ mod rootfs_plumbing_tests {
     // ---- the renderer policy a login shell inherits -------------------
 
     /// The value a login shell ends up with, which is not always the rest of
-    /// the line: `export HOME=/root; mkdir -p /root/.ollama` assigns `/root`
-    /// and THEN runs a command, so the assignment ends at the first `;`.
-    /// Reading the rest of the line instead would read the command as part of
-    /// the value, and no exported value here contains a semicolon.
+    /// the line: `export HOME=/root; mkdir -p ...` assigns `/root` and THEN
+    /// runs a command, so the assignment ends at the first `;`. The profile no
+    /// longer chains anything onto an export -- that chaining is what broke this
+    /// module's own test -- but reading the rest of the line would read any
+    /// future command as part of the value, and no exported value here contains
+    /// a semicolon.
     fn export<'a>(block: &'a str, key: &str) -> Option<&'a str> {
         block
             .lines()

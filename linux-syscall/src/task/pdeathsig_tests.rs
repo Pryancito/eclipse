@@ -53,7 +53,7 @@ fn a_negative_argument_is_out_of_range() {
 fn a_fork_remembers_the_thread_it_came_from() {
     use crate::on_a_thread::on_a_thread;
     use alloc::boxed::Box;
-    use linux_object::process::{find_process, LinuxProcess};
+    use linux_object::process::{find_task, LinuxProcess};
     use rcore_fs_ramfs::RamFS;
     use zircon_object::task::ROOT_JOB;
 
@@ -67,7 +67,9 @@ fn a_fork_remembers_the_thread_it_came_from() {
     let (recorded, forker) = on_a_thread(&proc, |sys| {
         Box::pin(async move {
             let child = sys.sys_fork(0, 0).unwrap();
-            let child = find_process(child as KoID).unwrap();
+            // The child's thread has nothing to run here and may have
+            // exited already, so it can be a zombie its parent keeps.
+            let child = find_task(child as KoID).unwrap();
             (child.linux().forking_thread(), sys.thread.id())
         })
     });

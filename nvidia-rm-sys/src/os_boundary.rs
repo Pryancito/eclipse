@@ -1542,7 +1542,7 @@ fn hz_to_mhz(hz: NvU64) -> NvU32 {
 
 #[no_mangle]
 pub extern "C" fn osGetCurrentProcess() -> NvU32 {
-    0
+    crate::os_interface::os_get_current_process()
 }
 
 #[no_mangle]
@@ -1553,8 +1553,10 @@ pub extern "C" fn osGetCurrentProcessName(pName: *mut c_char, maxLength: NvU32) 
     // dead-channel boot that says what died -- so that name came out of
     // uninitialized kernel heap, and `%s` ran on until it found a zero byte,
     // which need not be inside the hundred bytes it was given. `client.c:118`
-    // fills every `RmClient::name` from here too.
-    crate::os_interface::write_process_name(pName, maxLength);
+    // fills every `RmClient::name` from here too -- which is the name
+    // `nvidia-smi` shows beside a pid, so during a front-end call this is
+    // the calling process's name and not this kernel's.
+    crate::os_interface::write_caller_name(pName, maxLength);
 }
 
 // osGetCurrentUidToken: real impl in vendor/eclipse_rm_frontend.c. This stub

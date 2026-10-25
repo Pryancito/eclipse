@@ -50,10 +50,11 @@ impl FileSystem for HostFS {
             files: statvfs.files() as _,
             ffree: statvfs.files_free() as _,
             namemax: statvfs.name_max() as _,
-            // `statvfs` carries no `f_type`, so the host's own magic cannot be
-            // passed through: a host directory is a real disk-backed tree from
-            // the guest's point of view, so it answers like the two on-disk
-            // file systems of this tree rather than like a tmpfs.
+            // `statvfs(3)` carries no filesystem magic, and the host's own
+            // `statfs(2)` would name the host's disk (ext4, btrfs, tmpfs on a
+            // CI runner), not what the kernel is serving. Report the stand-in
+            // every unnamed filesystem reports, so `df -T` on the libos sees
+            // the same answer as on a bare image.
             ftype: EXT4_SUPER_MAGIC,
         }
     }
@@ -170,7 +171,7 @@ impl INode for HNode {
 
     fn link(&self, name: &str, other: &Arc<dyn INode>) -> Result<()> {
         let other = other.downcast_ref::<Self>().ok_or(FsError::NotSameFs)?;
-        std::fs::hard_link(&other.path, &self.path.join(name))?;
+        std::fs::hard_link(&other.path, self.path.join(name))?;
         Ok(())
     }
 
@@ -255,6 +256,7 @@ impl HNode {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&self.path)?;
             *maybe_file = Some(file);
         }

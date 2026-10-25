@@ -6,6 +6,8 @@ fn caller(os_info: usize) -> Caller {
         ctl: true,
         admin: false,
         gpu_mask: 0b11,
+        pid: 7,
+        name: Caller::name_of(b"cuda-probe"),
     }
 }
 

@@ -28,6 +28,9 @@ members = [
     "vendor/rcore-fs-mountfs",
     "vendor/rcore-fs-ramfs",
     "vendor/rcore-fs-devfs",
+    # The libos root (`zCore/src/fs.rs`, `loader`): this tree's `FsInfo` grew
+    # `ftype` and the upstream checkout could no longer be built against it.
+    "vendor/rcore-fs-hostfs",
     # The virtio drivers: the disk, the GPU, the console and the input devices
     # of every QEMU boot, this tree's copy of them. It was not a member and had
     # no `[patch]` either, so `cargo` resolved `virtio-drivers` to the git rev
@@ -104,6 +107,12 @@ lock = { path = "vendor/kernel-sync" }
 rcore-fs = { path = "vendor/rcore-fs" }
 rcore-fs-mountfs = { path = "vendor/rcore-fs-mountfs" }
 rcore-fs-ramfs = { path = "vendor/rcore-fs-ramfs" }
+# And a third time, the same trap as -devfs and -sefs below: 6839247 added
+# `ftype` to vendor/rcore-fs's FsInfo (Linux `statfs.f_type`), and -hostfs was
+# the last member of this repository still resolving to the upstream checkout,
+# whose `info()` builds FsInfo with a struct literal -- E0063, which is what
+# turned the `test-libos` job red: `loader` depends on it unconditionally.
+rcore-fs-hostfs = { path = "vendor/rcore-fs-hostfs" }
 # rcore-fs-sfs was vendored in the same import as the three above (with
 # `alloc_block` returning `None` -> `FsError::NoDeviceSpace` instead of
 # `panic!`), but never listed here, so every build still linked the upstream
@@ -121,13 +130,6 @@ rcore-fs-sfs = { path = "vendor/rcore-fs-sfs" }
 # rcore-fs-fuse, which xtask needs to build the rootfs image.
 rcore-fs-devfs = { path = "vendor/rcore-fs-devfs" }
 rcore-fs-sefs = { path = "vendor/rcore-fs-sefs" }
-# And a third time, same trap: 6839247 added `ftype` to vendor/rcore-fs's
-# FsInfo (Linux `statfs.f_type`), and -hostfs was the last member of this
-# repository still resolving to the upstream checkout, whose `info()` builds
-# FsInfo with a struct literal -- E0063, which is what turned the `test-libos`
-# job red: `loader` depends on it unconditionally. Vendored from rev 1a3246b
-# with that one field added.
-rcore-fs-hostfs = { path = "vendor/rcore-fs-hostfs" }
 
 [patch."https://github.com/rcore-os/rcore-console"]
 rcore-console = { path = "vendor/rcore-console" }
