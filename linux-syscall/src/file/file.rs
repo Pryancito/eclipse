@@ -919,6 +919,16 @@ impl Syscall<'_> {
             let proc = self.linux_process();
             let file_like = proc.get_file_like(fd)?;
             let file = file_like.downcast_ref::<File>().ok_or(LxError::EINVAL)?;
+            // A pipe or a FIFO has no `llseek` at all, so `vfs_llseek` fails
+            // before the `whence` is looked at and all five answer ESPIPE.
+            // Asking the file where it is now is how `File::seek` already
+            // answers that, and it moves nothing. Without it these two
+            // whences computed a position from an inode size of zero, which
+            // puts every offset at or past the end, and answered ENXIO --
+            // which a caller reads as "this is a seekable file and there is
+            // no data from here on", so it treats the pipe as fully sparse
+            // and stops reading it.
+            file.seek(SeekFrom::Current(0))?;
             let pos = match linux_object::fs::eclipsefs_seek(file, whence, offset) {
                 Some(r) => r?,
                 None => seek_data_hole_generic(file.metadata()?.size as u64, whence, offset)?,
