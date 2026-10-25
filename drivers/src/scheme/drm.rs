@@ -1002,6 +1002,7 @@ mod tests {
         let dev = BareDrm::new();
         assert!(dev.render_fence_for_scanout(1, 100).is_none());
         assert!(dev.cpu_prep_fences(1, 100).is_empty());
+        assert!(dev.queued_fences(1).is_empty());
     }
 
     /// A handle this driver never allocated is not its to close: answering

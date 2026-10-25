@@ -1122,6 +1122,15 @@ mod tests {
         );
         assert!(block_valid(&finish_partial_block(&head).unwrap()));
     }
+
+    /// The decoder is only ever handed whole descriptors, and checks it: a
+    /// short slice is `None`, never a read past its end.
+    #[test]
+    fn a_descriptor_shorter_than_eighteen_bytes_decodes_to_nothing() {
+        let b = edid(|b| timing(b, 0, 1920, 1080, 600, 340));
+        assert!(decode_timing(&b[54..71]).is_none(), "17 bytes");
+        assert!(decode_timing(&b[54..72]).is_some(), "18 bytes");
+    }
 }
 
 /// Native `#[bench]` rows for the EDID decoder.

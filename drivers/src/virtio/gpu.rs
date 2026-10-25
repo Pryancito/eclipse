@@ -549,4 +549,63 @@ mod tests {
         assert_eq!(gpu.ioctl(0xc010_6443, 0), Ok(0));
         assert_eq!(gpu.ioctl(0xc010_6444, 0), Err(38));
     }
+
+    /// A GPU over a framebuffer of ours, the size of the mode.
+    fn gpu_over(buf: &'static mut [u8]) -> VirtIoGpu<'static> {
+        let (ptr, len) = (buf.as_mut_ptr() as usize, buf.len());
+        VirtIoGpu::new_modern(fake_common_cfg(), 0, 0, ptr, len).unwrap()
+    }
+
+    /// The framebuffer it hands out is the memory it was given, whole, and a
+    /// write through it lands there: host-shared RAM, not a WC BAR.
+    #[test]
+    fn the_framebuffer_it_hands_out_is_the_memory_it_was_given() {
+        let buf: &'static mut [u8] = alloc::vec![0u8; MODE_BYTES].leak();
+        let base = buf.as_ptr() as usize;
+        let gpu = gpu_over(buf);
+        assert_eq!(gpu.name(), "virtio-gpu");
+        assert_eq!(gpu.info().fb_base_vaddr, base);
+        {
+            let mut fb = gpu.fb();
+            assert_eq!(fb.len(), MODE_BYTES);
+            fb[0] = 0xAB;
+            fb[MODE_BYTES - 1] = 0xCD;
+        }
+        let first = unsafe { (base as *const u8).read_volatile() };
+        let last = unsafe { ((base + MODE_BYTES - 1) as *const u8).read_volatile() };
+        assert_eq!((first, last), (0xAB, 0xCD));
+        assert!(!gpu.fb_write_combining());
+    }
+
+    /// Modern bring-up has no virtqueue: an interrupt has nothing to
+    /// acknowledge, nothing needs a flush, and a flush sends nothing and
+    /// succeeds.
+    #[test]
+    fn without_a_virtqueue_an_irq_and_a_flush_are_no_ops() {
+        let gpu = gpu_up();
+        gpu.handle_irq(11);
+        assert!(!gpu.need_flush());
+        assert!(gpu.flush().is_ok());
+    }
+
+    /// The DRM arms a software-KMS device answers by construction: every
+    /// buffer imports, a framebuffer is its handle, and a flip, a cursor
+    /// move, a vblank wait and a plane update all succeed because the host
+    /// shows whatever the shared framebuffer holds.
+    #[test]
+    fn the_drm_arms_with_nothing_to_program_all_succeed() {
+        let gpu = gpu_up();
+        let h = GemHandle {
+            id: 7,
+            size: 4096,
+            phys_addr: 0,
+        };
+        assert!(gpu.import_buffer(h));
+        gpu.free_buffer(h);
+        assert_eq!(gpu.create_fb(7, 1024, 768, 4096), Some(7));
+        assert!(gpu.page_flip(7));
+        assert!(gpu.set_cursor(2000, 1, 2, 0, 0));
+        assert!(gpu.wait_vblank(2000));
+        assert!(gpu.set_plane(3000, 2000, 7, 0, 0, 1024, 768, 0, 0, 1024, 768));
+    }
 }

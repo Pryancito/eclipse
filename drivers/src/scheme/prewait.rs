@@ -296,4 +296,23 @@ mod tests {
             );
         }
     }
+
+    /// `STATS` is built with the `const fn`, and every `record` adds to what
+    /// it built: a table born with anything but zeros would misreport every
+    /// run since boot. `Stat::new()` is `Stat::default()`, number by number.
+    #[test]
+    fn a_stat_is_born_all_zeros() {
+        let numbers = |s: &Stat| {
+            [
+                s.calls.load(Ordering::Relaxed),
+                s.parked.load(Ordering::Relaxed),
+                s.parked_us.load(Ordering::Relaxed),
+                s.max_us.load(Ordering::Relaxed),
+                s.probes.load(Ordering::Relaxed),
+                s.timeouts.load(Ordering::Relaxed),
+            ]
+        };
+        assert_eq!(numbers(&Stat::new()), [0; 6]);
+        assert_eq!(numbers(&Stat::new()), numbers(&Stat::default()));
+    }
 }

@@ -9341,3 +9341,7 @@ mod pushbuf_tests;
 /// The channel self-test and the GR hang probe (`probes.rs`): same
 /// harness, own file, same reason.
 mod probes_tests;
+
+/// The implicit-sync wait (`implicit_sync.rs`) arm by arm, on state built
+/// by hand: same harness, own file, same reason.
+mod implicit_sync_tests;
