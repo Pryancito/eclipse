@@ -666,11 +666,10 @@ fn channels_without_the_rm_are_discovery_only_and_free_is_owner_scoped() {
     assert_eq!(c.nr_subchan, 0);
     assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 1);
     assert_eq!(channel_alloc(&gpu, B).unwrap().channel, 2);
-    assert!(!gpu.nouveau_rm_vas_ready());
     assert_eq!(
         vm_bind(&gpu, A),
         Err(nv::ENODEV),
-        "no VA space was ever built"
+        "the ladder was never built, so no VA space was either"
     );
     // `nouveau_abi16_chan` finds nothing: ENOENT, as EXEC answers.
     assert_eq!(channel_free(&gpu, 0, B), Err(nv::ENOENT), "not B's channel");
@@ -1338,6 +1337,12 @@ fn gpu_rm() -> NvidiaGpu {
     // into the next, not even when it panics before it can clear it.
     nv::set_compositor_ctx0(false);
     *gpu.rm_device_instance.lock() = Some(0);
+    // An attached GPU whose clients can get contexts has a built ladder, by
+    // the C side's own precondition: `eclipse_rm_ctx_alloc` is
+    // NV_ERR_INVALID_STATE while `g_grAllocDone` is false. (step16/17 stay
+    // unfaked -- `FakeRm::ladder` -- so the compositor's own ladder channel
+    // still answers ENODEV here.)
+    FAKE_RM.lock().ladder_built = true;
     gpu.ctx0_owner.store(COMP, Ordering::Release);
     gpu
 }
@@ -1493,7 +1498,6 @@ fn with_the_rm_a_clients_channel_builds_its_own_context_once_and_falls_back_when
     assert_eq!(FAKE_RM.lock().ctxs, [1], "still one context");
     assert_eq!(channel_alloc(&gpu, B).unwrap().notifier_handle, 0x6002);
     assert_eq!(ctx_of(&gpu, B), Some((2, true)));
-    assert!(gpu.nouveau_rm_vas_ready());
     // The compositor's own channel is the step16/17 ladder, which the
     // fake does not carry: the honest answer is ENODEV, not a client
     // context in disguise.
@@ -1655,10 +1659,13 @@ fn vm_bind_maps_into_the_callers_own_context_and_a_map_over_a_live_range_replace
     let _live = LiveBytes::hold();
     let gpu = gpu_rm();
     const VA: u64 = 0x3f_f000_0000;
+    // A bind BEFORE any CHANNEL_ALLOC is NVK's normal order, and it is
+    // served: the caller's own context is built here. The only thing wrong
+    // with this one is the GEM handle, which nobody ever handed out.
     assert_eq!(
         vm_bind_ops(&gpu, A, &mut [map(1, VA, 4096)]),
-        Err(nv::ENODEV),
-        "no RM-backed channel on this GPU: no VA space to bind into"
+        Err(nv::ENOENT),
+        "no such GEM object"
     );
     assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
     let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
@@ -2424,15 +2431,23 @@ fn vm_bind_and_exec_answer_enosys_until_the_client_ran_vm_init() {
     assert_eq!(init(A, 0, END + 1), Err(nv::EINVAL));
     assert_eq!(bind(A), Err(nv::ENOSYS), "a refused VM_INIT made no uvmm");
     assert_eq!(submit(A), Err(nv::ENOSYS));
-    // One ending exactly at the end fits: on to the next gates.
+    // One ending exactly at the end fits: on to the next gates. Past them
+    // the empty job simply runs (0): the ladder is up, so there IS a VA
+    // space -- whether anyone happens to hold a channel is not the question.
     assert_eq!(init(A, END - 4096, 4096), Ok(0));
+    assert_eq!(bind(A), Ok(0));
+    // Without a ladder there is genuinely nothing to bind into: ENODEV, and
+    // still BEHIND the ENOSYS gate.
+    FAKE_RM.lock().ladder_built = false;
     assert_eq!(bind(A), Err(nv::ENODEV));
+    assert_eq!(bind(B), Err(nv::ENOSYS), "B never ran VM_INIT");
+    FAKE_RM.lock().ladder_built = true;
     // EXEC looks the channel up in the caller's list first, and A has
     // none: ENOENT (`nouveau_exec_ioctl_exec`), whatever the GPU has.
     assert_eq!(submit(A), Err(nv::ENOENT));
     // Again is fine.
     assert_eq!(init(A, 0, 1 << 32), Ok(0));
-    assert_eq!(bind(A), Err(nv::ENODEV));
+    assert_eq!(bind(A), Ok(0));
     // It is this client's, not the GPU's.
     assert_eq!(bind(B), Err(nv::ENOSYS));
     assert_eq!(submit(B), Err(nv::ENOSYS));
@@ -2440,7 +2455,7 @@ fn vm_bind_and_exec_answer_enosys_until_the_client_ran_vm_init() {
     assert_eq!(init(B, 0, 1 << 32), Ok(0));
     gpu.nouveau_release_process(A);
     assert_eq!(bind(A), Err(nv::ENOSYS));
-    assert_eq!(bind(B), Err(nv::ENODEV));
+    assert_eq!(bind(B), Ok(0));
     // The normal order for a fresh client: VM_INIT, channel, object,
     // bind (`client_with_pushbuf` asserts the bind went through).
     with_uvmm(&gpu, STRANGER);

@@ -9116,19 +9116,6 @@ impl NvidiaGpu {
         }
     }
 
-    /// Whether the RM ladder actually ran, i.e. `step16`/`step17` built the
-    /// VA space and the GR channel.
-    ///
-    /// This is what VA-space work (`VM_BIND`) and VRAM allocation (`GEM_NEW`)
-    /// need: both operate on the VAS, which this driver models as a SINGLE
-    /// global object shared by every client, so it does not matter which
-    /// client's CHANNEL_ALLOC happened to run the ladder -- only that some did.
-    /// A boot where no client ever got an RM-backed channel still has no VAS,
-    /// and binding into it would be binding into nothing.
-    fn nouveau_rm_vas_ready(&self) -> bool {
-        self.nouveau_channels.lock().iter().any(|c| c.rm_backed)
-    }
-
     /// Whether this process ran `VM_INIT` (Linux: `nouveau_cli_uvmm(cli)`).
     fn nouveau_has_uvmm(&self, pid: u64) -> bool {
         self.nouveau_uvmm.lock().iter().any(|u| u.pid == pid)
@@ -12470,7 +12457,13 @@ impl NvidiaGpu {
                 req.notifier_handle = h_notifier;
                 req.pushbuf_domains = nv::NOUVEAU_CHANNEL_PUSHBUF_DOMAINS;
                 req.nr_subchan = 0;
-                log::info!(
+                // `klog_warn!`, not `log::info!`: real boots run at LOG=error,
+                // where an info line is dropped -- and this one is the whole
+                // answer to "did the compositor get a context of its own, or
+                // fall back to the shared ladder?", which is what decides
+                // whether it can appear in `nvidia-smi` at all. One line per
+                // compositor channel, not per frame.
+                crate::klog_warn!(
                     "[nouveau-uapi] CHANNEL_ALLOC owner_pid={} (compositor, sticky ctx0 owner) -> channel={} on CTX {} {} (hVas={:#010x} hNotifier={:#010x})",
                     owner_pid,
                     new_id,
@@ -12636,10 +12629,33 @@ impl NvidiaGpu {
                     // checked before the request is even read.
                     return Err(nv::ENOSYS);
                 }
-                if !self.nouveau_rm_vas_ready() {
+                // What a bind needs is a VA SPACE, and since contexts became
+                // per-process that is the caller's own context (built on first
+                // touch by `ensure_ctx_for_pid` further down) or, for whoever
+                // rides context 0, the step16 ladder. What it does NOT need is
+                // for somebody to be holding a channel at this instant -- and
+                // that is what this used to ask ("any rm_backed channel in the
+                // table"), a leftover of the one-global-VAS model.
+                //
+                // It made the FIRST real bind of a boot impossible. NVK's
+                // `nouveau_ws_device_new` creates a throwaway context during
+                // ENUMERATION just to read the engine classes and frees it
+                // again (CHANNEL_ALLOC -> CHANNEL_FREE), so by the time
+                // `vkCreateDevice` reaches `nvkmd_nouveau_alloc_va` -- which
+                // binds BEFORE the queue's channel is created -- the channel
+                // table is empty again and every VM_BIND answered ENODEV.
+                // NVK reports that as `vm_bind failed: No such device`, loses
+                // the device, and the whole stack falls back in cascade:
+                // vkCreateDevice fails, ZINK cannot choose a pdev, EGL fails
+                // to initialize, and labwc's GLES2 renderer gives up for
+                // pixman -- a desktop on the CPU with the GPU sitting idle.
+                //
+                // The ladder flag is the honest precondition: sticky, set by
+                // step16, and unaffected by channels coming and going.
+                if !nvidia_rm_sys::rm_init::gr_ready() {
                     crate::klog_warn!(
-                        "[nouveau-uapi] VM_BIND: no RM-backed channel exists on this GPU, so no \
-                         VA space was ever built -- nothing to bind into. Attach the RM \
+                        "[nouveau-uapi] VM_BIND: the GR ladder (step16) has never been built on \
+                         this GPU, so no VA space exists to bind into. Attach the RM \
                          (/proc/gpustep14) and CHANNEL_ALLOC again."
                     );
                     return Err(nv::ENODEV);
