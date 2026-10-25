@@ -142,17 +142,83 @@ fn assigns_to_srcs(line: &str) -> bool {
     }
 }
 
-/// One line for a `cargo:warning` when an `-I` directory is not there.
+/// The `-I` entries NVIDIA's own `src/nvidia/Makefile` still lists although the
+/// directory is in no released open tree we pin -- upstream leftovers, not our
+/// drift, verified against the submodule at several tags:
+///
+/// * `kernel/inc` -- a real directory up to 570.144, gone at 580.178.04.
+/// * `uproc/os/libos-v2.0.0/include` -- real at 515.43.04, gone by 570.144
+///   (the tree carries `libos-v3.1.0`, whose headers live in
+///   `uproc/os/common/include`, which is on the list already).
+/// * `sdk/nvidia/inc/hw` and `arch/nvalloc/common/inc/deprecated` -- in the
+///   Makefile at every tag checked and in none of their trees; internal-only
+///   paths in NVIDIA's own build. The one header spelled `deprecated/...`,
+///   `rmapi_deprecated.h`, lives under `interface/`, which is on the list.
+///
+/// Keeping them costs nothing and keeps this list a faithful transcription of
+/// the Makefile, so that bumping the submodule to a release where one of them
+/// comes back needs no edit here. What they must not do is drown out a path
+/// *we* got wrong, which is what [`include_dir_drift`] is for.
+const UPSTREAM_STALE: [&str; 4] = [
+    "src/nvidia/kernel/inc",
+    "src/common/sdk/nvidia/inc/hw",
+    "src/nvidia/arch/nvalloc/common/inc/deprecated",
+    "src/common/uproc/os/libos-v2.0.0/include",
+];
+
+/// Panics when a [`UPSTREAM_STALE`] entry matches no `-I` directory at all.
+///
+/// The table only ever silences paths that are on the list. An entry that
+/// matches nothing is a typo: it silences nothing, and the next reader believes
+/// a path is accounted for when it is not.
+pub fn assert_leftovers_are_on_the_list(dirs: &[PathBuf]) {
+    for stale in UPSTREAM_STALE {
+        assert!(
+            dirs.iter()
+                .any(|d| d.display().to_string().replace('\\', "/").ends_with(stale)),
+            // Not the captured-identifier form: in this crate's edition an
+            // `assert!` message without arguments is not a format string.
+            "nvidia-rm-sys: {} esta en UPSTREAM_STALE y en ningun -I de build.rs",
+            stale
+        );
+    }
+}
+
+/// What the `-I` list and the pinned submodule disagree about.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct IncludeDirDrift {
+    /// Not a directory in the submodule, and not a known upstream leftover: a
+    /// path this crate got wrong, or one a submodule bump moved.
+    pub missing: Vec<String>,
+    /// A [`UPSTREAM_STALE`] entry that *is* a directory again -- the note above
+    /// has gone out of date, which is worth one line when the submodule moves.
+    pub back_again: Vec<String>,
+}
+
+/// Lines for a `cargo:warning` when the `-I` list and the tree disagree.
 ///
 /// A compiler ignores a `-I` that does not exist, without a word, so the list
 /// can drift away from the tree and nothing says so until a header is missing
 /// somewhere else entirely. Naming them is the whole fix: the entries are
-/// harmless, the silence is not.
-pub fn missing_include_dirs(dirs: &[PathBuf]) -> Vec<String> {
-    dirs.iter()
-        .filter(|d| !d.is_dir())
-        .map(|d| d.display().to_string())
-        .collect()
+/// harmless, the silence is not. The four [`UPSTREAM_STALE`] entries are the
+/// exception -- they are upstream's own leftovers, they were named on every
+/// build, and a warning nobody can act on is how a real one gets ignored.
+pub fn include_dir_drift(dirs: &[PathBuf]) -> IncludeDirDrift {
+    let mut drift = IncludeDirDrift::default();
+    for dir in dirs {
+        let shown = dir.display().to_string();
+        // Suffix, not equality: `build.rs` builds these under a `vendor/`
+        // prefix whose spelling depends on where cargo runs from.
+        let expected = UPSTREAM_STALE
+            .iter()
+            .any(|s| shown.replace('\\', "/").ends_with(s));
+        match (dir.is_dir(), expected) {
+            (false, false) => drift.missing.push(shown),
+            (true, true) => drift.back_again.push(shown),
+            _ => {}
+        }
+    }
+    drift
 }
 
 #[cfg(test)]
@@ -397,10 +463,68 @@ mod tests {
     fn a_directory_that_is_not_there_is_reported_and_one_that_is_is_not() {
         let here = PathBuf::from("src");
         let nope = PathBuf::from("src/no-hay-tal-directorio");
-        assert_eq!(missing_include_dirs(&[here.clone()]), Vec::<String>::new());
         assert_eq!(
-            missing_include_dirs(&[here, nope.clone()]),
+            include_dir_drift(std::slice::from_ref(&here)),
+            IncludeDirDrift::default()
+        );
+        assert_eq!(
+            include_dir_drift(&[here, nope.clone()]).missing,
             vec![nope.display().to_string()]
         );
+    }
+
+    #[test]
+    fn an_upstream_leftover_is_not_reported_as_missing() {
+        // The spelling `build.rs` produces, under a prefix that is not there.
+        let stale = PathBuf::from(
+            "vendor/open-gpu-kernel-modules/src/common/uproc/os/libos-v2.0.0/include",
+        );
+        assert_eq!(include_dir_drift(&[stale]), IncludeDirDrift::default());
+    }
+
+    #[test]
+    fn an_upstream_leftover_that_came_back_is_reported() {
+        // A directory of our own under a path ending in one of the four, built
+        // in the temp dir rather than in the source tree: a sibling test
+        // running at the same time must not see it.
+        let root = std::env::temp_dir().join(format!(
+            "eclipse-srcs-mk-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let back = root.join("src/nvidia/kernel/inc");
+        std::fs::create_dir_all(&back).expect("no se pudo crear el directorio de prueba");
+        let drift = include_dir_drift(std::slice::from_ref(&back));
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(drift.missing, Vec::<String>::new());
+        assert_eq!(drift.back_again, vec![back.display().to_string()]);
+    }
+
+    #[test]
+    fn a_leftover_suffix_does_not_match_a_different_directory() {
+        // The suffix has to match whole path components: a directory merely
+        // ending in the same letters is still real drift.
+        let nope = PathBuf::from("vendor/x/src/nvidia/kernel/inc-no-hay-tal");
+        assert_eq!(
+            include_dir_drift(std::slice::from_ref(&nope)).missing,
+            vec![nope.display().to_string()]
+        );
+    }
+
+    #[test]
+    fn the_leftover_table_matches_the_real_include_list() {
+        // The check `build.rs` makes on every kernel build, against the list it
+        // really passes: each of the four has to be a path that is on it.
+        let dirs: Vec<PathBuf> = UPSTREAM_STALE
+            .iter()
+            .map(|s| PathBuf::from("vendor/open-gpu-kernel-modules").join(s))
+            .collect();
+        assert_leftovers_are_on_the_list(&dirs);
+    }
+
+    #[test]
+    #[should_panic(expected = "en ningun -I de build.rs")]
+    fn a_leftover_that_is_on_no_include_is_a_typo() {
+        assert_leftovers_are_on_the_list(&[PathBuf::from("vendor/x/src/nvidia/interface")]);
     }
 }
