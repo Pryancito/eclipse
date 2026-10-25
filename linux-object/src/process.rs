@@ -55,6 +55,9 @@ pub use orphan_group::*;
 mod capabilities;
 mod fd_table;
 pub use capabilities::*;
+/// `oom_score_adj` and its floor, for `/proc/<pid>/oom_score_adj`.
+mod oom;
+pub use oom::*;
 
 pub use rcore_fs::vfs::FsInfo;
 
@@ -1272,6 +1275,10 @@ struct LinuxProcessInner {
     arg_area: Option<crate::loader::ArgArea>,
     /// Where its code, data, break and stack start (`/proc/<pid>/stat`).
     image_layout: Option<crate::loader::ImageLayout>,
+    /// The auxiliary vector its image was handed (`/proc/<pid>/auxv`).
+    auxv: Arc<[usize]>,
+    /// What it asks of an OOM killer (`signal->oom_score_adj`).
+    oom: OomAdj,
     /// Current Working Directory
     ///
     /// Omit leading '/'. The path of [`Self::working_directory`], which is
@@ -4534,10 +4541,11 @@ impl LinuxProcessInner {
         // file table (minus close-on-exec, done by `remove_cloexec_files`),
         // the credentials, the working directory, the process group and
         // session, `no_new_privs`, the resource limits, and the `setitimer`
-        // interval timers, which setitimer(2) preserves across an exec.
+        // interval timers, which setitimer(2) preserves across an exec, and
+        // the OOM adjustment, which lives in `signal_struct` as they do.
         // `brk`/`mapped_brk`, `environ`, `cmdline`, `arg_area`, `image_layout`,
-        // `execute_path` and `abi` are all overwritten by the caller from the
-        // new image.
+        // `auxv`, `execute_path` and `abi` are all overwritten by the caller
+        // from the new image.
         old_attachments
     }
 
@@ -4558,6 +4566,9 @@ impl LinuxProcessInner {
             environ: self.environ.clone(),
             arg_area: self.arg_area,
             image_layout: self.image_layout,
+            auxv: self.auxv.clone(),
+            // `copy_signal` copies the adjustment and its floor.
+            oom: self.oom,
             current_working_directory: self.current_working_directory.clone(),
             working_directory: self.working_directory.clone(),
             files: self.files.clone(),

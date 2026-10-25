@@ -120,6 +120,7 @@ impl ProcInitInfo {
         table.push(0); // NULL
 
         // Auxv
+        let auxv_at = table.len();
         for (&type_, &value) in self.auxv.iter() {
             table.push(type_ as usize);
             table.push(value);
@@ -147,6 +148,7 @@ impl ProcInitInfo {
         // Push the table. Since push_usize_slice decrements sp first and then
         // copies the slice, table[0] (argc) will end up at the lowest address (the new sp).
         writer.push_usize_slice(&table);
+        writer.auxv = table.split_off(auxv_at);
 
         writer
     }
@@ -181,6 +183,10 @@ pub struct Stack {
     data: Vec<u8>,
     /// Where `push_at` put the argument and environment strings.
     arg_area: Option<ArgArea>,
+    /// The auxiliary vector `push_at` wrote, word by word and with its
+    /// `AT_NULL` pair: `mm->saved_auxv`, what `/proc/<pid>/auxv` reads.
+    /// `push_at_freebsd` leaves it empty; the file is Linux's.
+    auxv: Vec<usize>,
 }
 
 impl Stack {
@@ -202,6 +208,7 @@ impl Stack {
             stack_top: sp,
             data,
             arg_area: None,
+            auxv: Vec::new(),
         }
     }
 
@@ -209,6 +216,11 @@ impl Stack {
     /// one `push_at` built.
     pub fn arg_area(&self) -> Option<ArgArea> {
         self.arg_area
+    }
+
+    /// The auxiliary vector this image was handed, as it is on its stack.
+    pub fn auxv(&self) -> &[usize] {
+        &self.auxv
     }
     /// push slice into stack
     #[allow(unsafe_code)]
@@ -622,6 +634,31 @@ mod initial_stack_tests {
 
     fn auxv_of(pairs: &[(u8, usize)]) -> BTreeMap<u8, usize> {
         pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn the_auxiliary_vector_is_kept_as_it_was_written() {
+        // `/proc/<pid>/auxv` reads the kernel's copy, `mm->saved_auxv`:
+        // the very words on the stack, the `AT_NULL` pair included.
+        let info = ProcInitInfo {
+            args: vec!["/bin/true".to_string()],
+            envs: vec!["A=1".to_string()],
+            auxv: auxv_of(&[(AT_PAGESZ as u8, 4096), (AT_UID as u8, 1000)]),
+        };
+        let stack = info.push_at(TOP);
+        let img = Image {
+            sp: TOP - stack.len(),
+            bytes: stack.to_vec(),
+        };
+        let (_, _, _, pairs) = img.decode();
+        let mut words: Vec<usize> = pairs.iter().flat_map(|&(k, v)| [k, v]).collect();
+        words.extend([0, 0]);
+        assert_eq!(
+            words.len(),
+            2 * 4 + 2,
+            "two handed in, AT_RANDOM, AT_EXECFN"
+        );
+        assert_eq!(stack.auxv(), &words[..]);
     }
 
     #[test]

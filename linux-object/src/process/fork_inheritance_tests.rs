@@ -29,6 +29,8 @@ fn a_configured_parent() -> LinuxProcessInner {
             start_brk: 0x5555_0010_0000,
             start_stack: 0x7fff_e6f0,
         }),
+        auxv: alloc::vec![6, 4096, 25, 0x7fff_e800, 0, 0].into(),
+        oom: OomAdj { adj: 321, min: 123 },
         current_working_directory: String::from("/home/moebius"),
         limits: {
             let mut limits = RLimits::default();
@@ -166,6 +168,20 @@ fn the_child_has_the_layout_of_the_image_it_copied() {
     // `[stack]` of `maps` say the same of both until the child execs.
     let child = fork_of(&a_configured_parent());
     assert_eq!(child.image_layout, a_configured_parent().image_layout);
+}
+
+#[test]
+fn the_child_has_the_auxiliary_vector_of_the_image_it_copied() {
+    // `dup_mm` copies `saved_auxv` with the rest of the `mm`.
+    let child = fork_of(&a_configured_parent());
+    assert_eq!(child.auxv, a_configured_parent().auxv);
+}
+
+#[test]
+fn the_oom_adjustment_and_its_floor_survive_the_fork() {
+    // `copy_signal`; the survey's child reads what its parent wrote.
+    let child = fork_of(&a_configured_parent());
+    assert_eq!(child.oom, a_configured_parent().oom);
 }
 
 #[test]

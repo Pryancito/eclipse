@@ -214,3 +214,53 @@ fn a_zombie_s_cmdline_and_environ_are_empty() {
     block_on(wait_child(&parent, pid, true, true)).unwrap();
     parent.exit(0);
 }
+
+/// What a loader hands a process: two pairs, `AT_NULL`'s among them.
+const AUXV: [usize; 6] = [6, 4096, 25, 0x7fff_e800, 0, 0];
+
+fn auxv_bytes() -> Vec<u8> {
+    AUXV.iter().flat_map(|w| w.to_ne_bytes()).collect()
+}
+
+#[test]
+fn auxv_is_the_vector_the_image_was_handed_and_a_fork_s_too() {
+    let parent = a_process(49_551);
+    let pid = parent.id();
+    assert_eq!(read_file(pid, "auxv", 0), b"", "no loader said");
+    parent.linux().set_auxv(AUXV[..].into());
+    assert_eq!(read_file(pid, "auxv", 0), auxv_bytes());
+    assert_eq!(read_file(pid, "auxv", 40), &auxv_bytes()[40..]);
+    let child = Process::fork_from(&parent).unwrap();
+    assert_eq!(read_file(child.id(), "auxv", 0), auxv_bytes());
+    child.exit(0);
+    parent.exit(0);
+}
+
+#[test]
+fn a_zombie_and_a_leader_gone_first_have_no_auxv() {
+    let parent = a_process(49_552);
+    parent.linux().set_auxv(AUXV[..].into());
+    let child = Process::fork_from(&parent).unwrap();
+    let pid = child.id();
+    let _thread = Thread::create_linux(&child).unwrap();
+    child.exit(0);
+    assert_eq!(read_file(pid, "auxv", 0), b"", "a zombie");
+
+    let proc = Process::create_with_fixed_id_ext(
+        &ROOT_JOB,
+        49_553,
+        "lider",
+        LinuxProcess::new(RamFS::new(), 0),
+    )
+    .unwrap();
+    proc.linux().set_auxv(AUXV[..].into());
+    let leader = Thread::create_linux(&proc).unwrap();
+    let _worker = Thread::create_linux(&proc).unwrap();
+    assert_eq!(read_file(proc.id(), "auxv", 0), auxv_bytes());
+    proc.linux().keep_exited_leader(leader.clone());
+    leader.terminate_abandoned();
+    assert_eq!(read_file(proc.id(), "auxv", 0), b"", "its leader exited");
+    drop(proc.linux().release_exited_leader());
+    proc.exit(0);
+    parent.exit(0);
+}

@@ -1596,7 +1596,7 @@ impl Syscall<'_> {
         // the task with SIGSEGV here rather than returning; do the same, so
         // the parent sees a dead child instead of a live one wandering through
         // an empty address space.
-        let (entry, sp, initial_brk, loaded_path, abi, arg_area, layout) = match load {
+        let (entry, sp, initial_brk, loaded_path, abi, arg_area, layout, auxv) = match load {
             Ok(loaded) => loaded,
             Err(e) => {
                 error!(
@@ -1627,6 +1627,7 @@ impl Syscall<'_> {
         proc.set_environ(envs);
         proc.set_arg_area(arg_area);
         proc.set_image_layout(Some(layout));
+        proc.set_auxv(auxv);
         proc.set_brk(initial_brk);
         // CRUCIAL: reset the heap's *mapped* upper bound too. `execve` replaced
         // the whole address space (`vmar.clear()` above), so the previous image's
