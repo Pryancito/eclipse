@@ -1788,6 +1788,9 @@ fn syscall_args(ctx: &UserContext) -> [usize; 6] {
 }
 
 #[cfg(test)]
+mod fault_report_tests;
+
+#[cfg(test)]
 mod fault_signal_tests {
     //! What a process is told, or its parent, when the CPU faults it.
 
