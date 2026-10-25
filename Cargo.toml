@@ -28,6 +28,12 @@ members = [
     "vendor/rcore-fs-mountfs",
     "vendor/rcore-fs-ramfs",
     "vendor/rcore-fs-devfs",
+    # SEFS: in the `[patch]` below since the day it was vendored, so every
+    # build compiles it, but not a member -- so no `cargo test`, `cargo fmt`
+    # or `clippy` line in the tree ever named its 903 lines, and it had no
+    # tests at all. It is reached through `rcore-fs-fuse`, which `xtask` uses
+    # to build the rootfs image.
+    "vendor/rcore-fs-sefs",
     # The libos root (`zCore/src/fs.rs`, `loader`): this tree's `FsInfo` grew
     # `ftype` and the upstream checkout could no longer be built against it.
     "vendor/rcore-fs-hostfs",

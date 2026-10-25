@@ -26,6 +26,8 @@ use structs::*;
 
 pub mod dev;
 mod structs;
+#[cfg(test)]
+mod tests;
 
 /// Helper methods for `File`
 impl dyn File {
