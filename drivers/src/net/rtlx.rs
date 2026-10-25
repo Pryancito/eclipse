@@ -1626,4 +1626,535 @@ mod tests {
             "the descriptor announces a length the closure never wrote"
         );
     }
+
+    // ----------------------------------------------- the bring-up it survives
+    //
+    // `rtlx_init` is written to come back with an error rather than take the
+    // boot down, and the driver's own tests prove each failure happens --
+    // `a_gmac_whose_soft_reset_never_completes_fails_the_bring_up_not_the_boot`
+    // says in so many words that "`rtlx::init` propagates this error precisely
+    // so the board still boots without networking". Nothing proved that it
+    // does.
+
+    /// The second window is checked the same way as the first. Two guards that
+    /// read alike and only one of them exercised: swap the messages, or drop
+    /// the `?`, and nothing said so.
+    #[test]
+    fn the_second_window_that_could_not_be_mapped_stops_the_bring_up_too() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        assert_eq!(
+            rtlx_init(7, |paddr, _size| {
+                if paddr == rtl8211f::PINCTRL_GPIO_BASE as usize {
+                    Some(0)
+                } else {
+                    None
+                }
+            })
+            .err(),
+            Some(DeviceError::NoResources),
+            "the system-configuration window is as necessary as the pin controller"
+        );
+    }
+
+    /// A GMAC that never leaves soft reset is a clock or a power rail that is
+    /// not up yet. `open` says so, and the bring-up has to hand that on: an
+    /// `unwrap()` in here panicked the boot of a board whose networking was
+    /// the only thing wrong with it.
+    #[test]
+    fn a_gmac_that_will_not_reset_stops_the_bring_up_and_not_the_boot() {
+        let _dev = fake::with_phy(Phy::gigabit_partner()).with_mac_stuck_in_reset();
+        assert_eq!(
+            rtlx_init(7, |_paddr, _size| Some(0)).err(),
+            Some(DeviceError::IoError),
+            "a MAC that never leaves soft reset must come back as an error"
+        );
+    }
+
+    /// Negotiation failing is NOT one of those, and the difference is the
+    /// whole point: the speed and duplex are decided by the link partner, so a
+    /// failure there is a cable or a switch, not the board. The interface comes
+    /// up anyway and the link watchdog or the next cable insertion can still
+    /// bring the carrier up.
+    #[test]
+    fn a_link_that_will_not_negotiate_still_brings_the_interface_up() {
+        let mut phy = Phy::gigabit_partner();
+        // Master/slave resolution failed: the two ends could not agree who
+        // drives the clock, which `adjust_link` refuses to guess at.
+        phy.regs[crate::net::realtek::mii::MII_STAT1000 as usize] =
+            crate::net::realtek::mii::LPA_1000MSFAIL;
+        let _dev = fake::with_phy(phy);
+
+        let iface = rtlx_init(7, |_paddr, _size| Some(0))
+            .expect("a link that will not negotiate is not a reason to drop the NIC");
+
+        assert_eq!(iface.ifname(), "rtl8211f");
+    }
+
+    // ------------------------------------------------------------- the names
+
+    /// The kernel asks for three of these and used to be told none of them.
+    /// `Scheme::name` is the driver's name and `ifname` the interface's, which
+    /// on this board happen to read alike and are not the same thing;
+    /// `is_loopback` decides whether the stack bothers with an ARP cache for
+    /// it.
+    #[test]
+    fn the_interface_answers_to_the_names_the_kernel_asks_for() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        assert_eq!(Scheme::name(&iface), "rtl8211f");
+        assert_eq!(iface.ifname(), "rtl8211f");
+        assert_eq!(iface.ifname(), iface.get_ifname());
+        assert!(
+            !iface.is_loopback(),
+            "a NIC that says it is the loopback gets no neighbour resolution"
+        );
+    }
+
+    // ------------------------------- storage the board does not boot with
+    //
+    // `rtlx_init` builds four address slots, four route slots and an OWNED
+    // address list. Three paths cannot be reached through it: a list with no
+    // IPv4 slot, a list that cannot grow, and a routing table with no room for
+    // a default route. Each is a shape the same code has to handle, since
+    // nothing in `add_ip_address` or `add_route` knows which caller built the
+    // interface.
+
+    /// An interface over the faked GMAC with storage of this test's choosing.
+    fn interface_with(addrs: ManagedSlice<'static, IpCidr>, route_slots: usize) -> RTLxInterface {
+        let driver = RTLxDriver(Arc::new(Mutex::new(fake::driver())));
+        let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
+            Box::leak(vec![None; route_slots].into_boxed_slice());
+        let iface = InterfaceBuilder::new(driver.clone())
+            .ethernet_addr(EthernetAddress::from_bytes(&[2, 0, 0, 0, 0, 1]))
+            .neighbor_cache(NeighborCache::new(BTreeMap::new()))
+            .ip_addrs(addrs)
+            .routes(Routes::new(routes_storage))
+            .finalize();
+        RTLxInterface {
+            iface: Arc::new(Mutex::new(iface)),
+            driver,
+            routes: Arc::new(Mutex::new(Vec::new())),
+            name: String::from("rtl8211f"),
+            irq: 7,
+        }
+    }
+
+    /// A fixed-size list, the way storage that was not allocated for the
+    /// occasion arrives.
+    fn borrowed(addrs: Vec<IpCidr>) -> ManagedSlice<'static, IpCidr> {
+        ManagedSlice::Borrowed(Box::leak(addrs.into_boxed_slice()))
+    }
+
+    /// `set_ipv4_address` writes the primary address into the first IPv4 slot
+    /// it finds. An interface with no IPv4 slot at all -- an IPv6-only one, or
+    /// one whose storage the board filled with link-locals -- has to get the
+    /// address anyway, or `ip addr add` on it does nothing and says it worked.
+    #[test]
+    fn an_address_list_with_no_ipv4_slot_still_takes_the_primary_address() {
+        let link_local = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let iface = interface_with(
+            borrowed(vec![IpCidr::Ipv6(Ipv6Cidr::new(link_local, 64))]),
+            4,
+        );
+        let wanted = Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 7), 24);
+
+        iface.set_ipv4_address(wanted).unwrap();
+
+        assert_eq!(
+            iface.get_ip_address(),
+            alloc::vec![IpCidr::Ipv4(wanted)],
+            "the only slot there was did not take the address"
+        );
+    }
+
+    /// And with nowhere at all to put it, it is dropped rather than panicking.
+    /// `addrs.iter_mut().next()` on an empty list is `None`, and indexing it
+    /// instead would turn a misconfigured interface into a kernel panic.
+    #[test]
+    fn an_empty_address_list_has_nowhere_to_put_the_primary_address() {
+        let iface = interface_with(borrowed(Vec::new()), 4);
+
+        iface
+            .set_ipv4_address(Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 7), 24))
+            .expect("nowhere to put it is not an error");
+
+        assert!(iface.get_ip_address().is_empty());
+    }
+
+    /// `240.0.0.0/32` is the second sentinel the free-slot test knows, and the
+    /// four lines that know it are copied into three drivers. The loopback and
+    /// the e1000 each have a test for them; this one did not, so a sentinel
+    /// slot here was never reused and the address went to the fallback instead.
+    #[test]
+    fn the_other_free_slot_sentinel_is_reused_here_too() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let sentinel = IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32);
+        let iface = interface_with(
+            borrowed(vec![
+                IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24),
+                sentinel,
+            ]),
+            4,
+        );
+        let added = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
+
+        iface.add_ip_address(added).unwrap();
+
+        let after = iface.get_ip_address();
+        assert!(
+            after.contains(&added),
+            "the sentinel slot was not reused: {:?}",
+            after
+        );
+        assert!(!after.contains(&sentinel), "{:?}", after);
+        assert!(
+            after.contains(&IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24)),
+            "the configured address was taken instead: {:?}",
+            after
+        );
+    }
+
+    /// With every slot taken and no way to grow, the new address takes the
+    /// newest slot -- the best there is. The owned list grows instead, which
+    /// is the path `rtlx_init`'s own storage takes and the one already tested.
+    #[test]
+    fn an_address_list_that_cannot_grow_gives_up_its_newest_slot() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let oldest = IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24);
+        let newest = IpCidr::new(IpAddress::v4(192, 168, 1, 123), 24);
+        let iface = interface_with(borrowed(vec![oldest, newest]), 4);
+        let added = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
+
+        iface.add_ip_address(added).unwrap();
+
+        let after = iface.get_ip_address();
+        assert_eq!(after.len(), 2, "borrowed storage grew: {:?}", after);
+        assert!(after.contains(&oldest), "the oldest slot went: {:?}", after);
+        assert!(after.contains(&added), "{:?}", after);
+    }
+
+    /// Nowhere to put it and nothing to overwrite: the address is dropped and
+    /// the interface is left alone.
+    #[test]
+    fn an_empty_list_that_cannot_grow_takes_no_address_at_all() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface_with(borrowed(Vec::new()), 4);
+
+        iface
+            .add_ip_address(IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24))
+            .expect("nowhere to put it is not an error");
+
+        assert!(iface.get_ip_address().is_empty());
+    }
+
+    /// Removing an address the interface does not have takes nothing away.
+    /// `ip addr del` on a stale address is routine, and a run off the end of
+    /// the list that blanked a slot anyway would take the address the board
+    /// booted with.
+    #[test]
+    fn removing_an_address_that_is_not_there_changes_nothing() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let before = iface.get_ip_address();
+
+        iface
+            .remove_ip_address(IpCidr::new(IpAddress::v4(10, 9, 9, 9), 24))
+            .expect("removing an address that is not there is not an error");
+
+        assert_eq!(iface.get_ip_address(), before);
+    }
+
+    // --------------------------------------------------------------- routing
+
+    /// A routing table with no room says so instead of reporting a default
+    /// route it never installed. The kernel would then show a gateway smoltcp
+    /// does not route through, which is the hardest kind of networking bug to
+    /// read: every table agrees and no packet arrives.
+    #[test]
+    fn a_default_route_that_does_not_fit_is_reported_rather_than_swallowed() {
+        let iface = interface_with(
+            borrowed(vec![IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24)]),
+            0,
+        );
+
+        assert_eq!(
+            iface
+                .add_route(
+                    IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+                    Some(IpAddress::v4(192, 168, 0, 1)),
+                )
+                .err(),
+            Some(DeviceError::IoError),
+            "a default route that was not installed was reported as added"
+        );
+        assert!(
+            iface.get_routes().iter().all(|r| r.gateway.is_none()),
+            "the route was recorded although the stack refused it: {:?}",
+            iface.get_routes()
+        );
+    }
+
+    /// The same for IPv6, which has its own call and its own `?`.
+    #[test]
+    fn an_ipv6_default_route_that_does_not_fit_is_reported_too() {
+        let iface = interface_with(
+            borrowed(vec![IpCidr::Ipv6(Ipv6Cidr::new(
+                Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+                64,
+            ))]),
+            0,
+        );
+
+        assert_eq!(
+            iface
+                .add_route(
+                    IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0)),
+                    Some(IpAddress::Ipv6(Ipv6Address::new(
+                        0xfe80, 0, 0, 0, 0, 0, 0, 2
+                    ))),
+                )
+                .err(),
+            Some(DeviceError::IoError)
+        );
+    }
+
+    /// Only one default route of a family can be in force, so a new one
+    /// replaces the one before it -- and only that one. The purge used to run
+    /// for every gatewayed route, so the static route in a DHCP lease took
+    /// `0.0.0.0/0` out of the table the kernel reports while smoltcp went on
+    /// routing through it.
+    ///
+    /// The purge looks at the family too: an IPv6 default route sitting in the
+    /// table is not what a new IPv4 one replaces.
+    #[test]
+    fn a_new_default_route_replaces_only_the_one_of_its_own_family() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let v6_default = IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0));
+        let v6_gateway = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+        iface
+            .add_route(v6_default, Some(IpAddress::Ipv6(v6_gateway)))
+            .unwrap();
+
+        let v4_gateway = IpAddress::v4(192, 168, 0, 9);
+        iface
+            .add_route(IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0), Some(v4_gateway))
+            .unwrap();
+
+        let routes = iface.get_routes();
+        let defaults: alloc::vec::Vec<_> = routes
+            .iter()
+            .filter(|r| r.gateway.is_some() && r.dst.prefix_len() == 0)
+            .collect();
+        assert_eq!(
+            defaults.len(),
+            2,
+            "the new IPv4 default took the IPv6 one with it: {:?}",
+            routes
+        );
+        assert!(
+            defaults
+                .iter()
+                .any(|r| r.gateway == Some(IpAddress::Ipv6(v6_gateway))),
+            "{:?}",
+            routes
+        );
+        assert!(
+            defaults.iter().any(|r| r.gateway == Some(v4_gateway)),
+            "{:?}",
+            routes
+        );
+    }
+
+    /// And the IPv6 purge is the IPv4 one over again, with the families
+    /// swapped: a second IPv6 default route replaces the first and leaves the
+    /// IPv4 one where it is.
+    #[test]
+    fn a_new_ipv6_default_route_replaces_only_the_ipv6_one() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let v6_default = IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0));
+        let first = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+        let second = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 3);
+        iface
+            .add_route(v6_default, Some(IpAddress::Ipv6(first)))
+            .unwrap();
+
+        iface
+            .add_route(v6_default, Some(IpAddress::Ipv6(second)))
+            .unwrap();
+
+        let routes = iface.get_routes();
+        let gateways: alloc::vec::Vec<_> = routes.iter().filter_map(|r| r.gateway).collect();
+        assert!(
+            gateways.contains(&IpAddress::Ipv6(second)),
+            "the new IPv6 gateway is not in the table: {:?}",
+            routes
+        );
+        assert!(
+            !gateways.contains(&IpAddress::Ipv6(first)),
+            "two IPv6 default routes at once: {:?}",
+            routes
+        );
+        // The route the board booted with is IPv4 and has nothing to do with
+        // either of them.
+        assert!(
+            gateways.contains(&IpAddress::v4(192, 168, 0, 1)),
+            "the IPv6 purge took the IPv4 default route: {:?}",
+            routes
+        );
+    }
+
+    /// A gateway that is neither an IPv4 nor an IPv6 address is
+    /// `IpAddress::Unspecified`, the placeholder for storage whose address is
+    /// not assigned yet, and a route through it is dropped without a word --
+    /// it does not even reach the table the kernel reports. Worth holding:
+    /// this is the answer, and the arm below it in `del_route` looks like the
+    /// same thing and is not.
+    #[test]
+    fn a_route_through_an_unspecified_gateway_is_dropped() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let before = iface.get_routes().len();
+
+        iface
+            .add_route(
+                IpCidr::new(IpAddress::v4(10, 0, 0, 0), 8),
+                Some(IpAddress::Unspecified),
+            )
+            .expect("an unspecified gateway is not an error");
+
+        assert_eq!(
+            iface.get_routes().len(),
+            before,
+            "a route nobody can use was recorded"
+        );
+    }
+
+    /// `del_route` has to take an IPv6 default route out of the stack's own
+    /// table as well as out of the list the kernel reports. Only the IPv4 side
+    /// of that was tested, and the two are separate calls.
+    #[test]
+    fn deleting_the_ipv6_default_route_takes_it_out_of_the_stacks_table_too() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let v6_default = IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0));
+        let gateway = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+        iface
+            .add_route(v6_default, Some(IpAddress::Ipv6(gateway)))
+            .unwrap();
+        assert_eq!(
+            gateway_in_the_stack(&iface, v6_default),
+            Some(IpAddress::Ipv6(gateway)),
+            "the IPv6 default route never reached the stack"
+        );
+
+        iface.del_route(v6_default, None).unwrap();
+
+        assert_eq!(
+            gateway_in_the_stack(&iface, v6_default),
+            None,
+            "the stack still routes through a gateway the kernel has forgotten"
+        );
+        assert!(
+            !iface
+                .get_routes()
+                .iter()
+                .any(|r| r.gateway == Some(IpAddress::Ipv6(gateway))),
+            "the route is still in the list the kernel reports"
+        );
+    }
+
+    // ------------------------------------------- the poll and what it wakes
+
+    /// An ARP request for this interface's own address, as a whole Ethernet
+    /// frame. smoltcp answers one of these out of the interface itself, with
+    /// no socket in the set, which is what makes it the one frame that can
+    /// prove the poll moved something.
+    fn arp_request_for_us() -> Vec<u8> {
+        let asker = EthernetAddress([0x02, 0, 0, 0, 0, 0x11]);
+        let arp = ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Request,
+            source_hardware_addr: asker,
+            source_protocol_addr: Ipv4Address::new(192, 168, 0, 1),
+            target_hardware_addr: EthernetAddress::BROADCAST,
+            target_protocol_addr: Ipv4Address::new(192, 168, 0, 123),
+        };
+        let eth = EthernetRepr {
+            src_addr: asker,
+            dst_addr: EthernetAddress::BROADCAST,
+            ethertype: EthernetProtocol::Arp,
+        };
+        let mut bytes = alloc::vec![0u8; eth.buffer_len() + arp.buffer_len()];
+        let mut frame = EthernetFrame::new_unchecked(&mut bytes[..]);
+        eth.emit(&mut frame);
+        arp.emit(&mut ArpPacket::new_unchecked(frame.payload_mut()));
+        bytes
+    }
+
+    /// The counterpart of `a_received_frame_reaches_an_af_packet_tap`, which
+    /// holds that a frame smoltcp could make nothing of wakes nobody. A frame
+    /// it DID act on has to wake the readers, once: on this driver nothing else
+    /// tells a reader parked on its net-RX wait that its bytes arrived, so
+    /// before that call it waited out its fallback park timer on every hop.
+    #[test]
+    fn a_poll_that_moved_a_packet_wakes_the_readers_once() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        crate::net::tests::alone_with_the_statics(|| {
+            crate::utils::host_hooks::reset();
+            let iface = interface(7);
+            stage(&iface, &arp_request_for_us());
+
+            iface.poll().expect("an ARP request is not a poll error");
+
+            assert_eq!(
+                crate::utils::host_hooks::WAKE_CALLS.load(core::sync::atomic::Ordering::SeqCst),
+                1,
+                "the stack acted on the frame and no reader was woken for it"
+            );
+        })
+    }
+
+    /// A frame the GMAC refuses after the closure has already written it comes
+    /// back as `Exhausted`, not as sent. `geth_send` refuses anything shorter
+    /// than an Ethernet header: its descriptor fill loop is `while len != 0`,
+    /// so a zero-length frame leaves the previous frame's length bits in place
+    /// with OWN set and never advances `tx_dirty`, and the ring desynchronises
+    /// for good.
+    ///
+    /// The stack has to be told, because the ingress path emits the ACK for a
+    /// received segment through the TxToken paired with its RxToken, having
+    /// already advanced `remote_last_ack` -- so an ACK reported as sent is
+    /// never re-emitted and the peer waits on a window it believes is closed.
+    #[test]
+    fn a_frame_the_gmac_refuses_comes_back_as_exhausted_not_as_sent() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let (clean_before, dirty_before) = fake::tx_cursors(&iface.driver.0.lock());
+        let mut driver = iface.driver.clone();
+        let token = driver.transmit().expect("an empty ring has room");
+
+        let outcome = token.consume(at(0), 4, |buf| {
+            buf.fill(0xa5);
+            Ok(())
+        });
+
+        assert_eq!(
+            outcome.err(),
+            Some(smoltcp::Error::Exhausted),
+            "a frame the GMAC threw away was reported as sent"
+        );
+        assert_eq!(
+            fake::tx_cursors(&iface.driver.0.lock()),
+            (clean_before, dirty_before),
+            "the ring moved for a frame that never went out"
+        );
+    }
+
+    // The error arm of `iface.poll()` is left alone, in all three places it
+    // appears here (`poll`, `handle_irq` and the loopback's `poll`). smoltcp
+    // only returns `Err` out of `socket_egress`, which iterates the socket set
+    // and returns `Ok(false)` when it is empty; the process-wide `SOCKETS` this
+    // crate polls is empty in the test binary, and a test that added a socket
+    // to it would be adding one to every other test in the binary as well.
 }
