@@ -13067,6 +13067,19 @@ impl NvidiaGpu {
                     {
                         let probe_ctx = self.ctx_idx_for_pid(owner_pid);
                         if probe_ctx >= 1 && nv::ctx_is_wedged(probe_ctx) {
+                            // The one ENODEV in this arm that said nothing.
+                            // NVK turns it into VK_ERROR_DEVICE_LOST with no
+                            // kernel line beside it, so from the outside it
+                            // is indistinguishable from the other two (a
+                            // discovery channel, no RM) -- which is exactly
+                            // the question a boot log has to answer.
+                            crate::klog_warn!(
+                                "[nouveau-uapi] EXEC: empty health probe on ctx{} (pid={}), \
+                                 which is latched WEDGED -- answering ENODEV (channel killed), \
+                                 as nouveau does",
+                                probe_ctx,
+                                owner_pid
+                            );
                             return Err(nv::ENODEV);
                         }
                     }
