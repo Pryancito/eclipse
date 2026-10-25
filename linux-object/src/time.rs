@@ -1896,6 +1896,33 @@ mod time_tests {
 }
 
 #[cfg(test)]
+mod tms_layout_tests {
+    //! `struct tms` is read by offset by everything that calls `times(2)`, and
+    //! its four fields are four `clock_t` in a row: any two of them trade
+    //! places without a word of complaint, and a shell's `time` then reports
+    //! the system time as the user time.
+
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// The only thing holding this down was a `size_of` over in
+    /// `linux-syscall/src/dispatch_tests.rs`, and thirty-two bytes is
+    /// thirty-two bytes in whichever order the four of them come; the
+    /// `offset_of!` assertions in that file are all about `RUsage`.
+    /// `sys_times` writes the struct straight into a `UserOutPtr<Tms>`, so the
+    /// order here is the order user space reads.
+    #[test]
+    fn tms_is_linux_s_struct_tms() {
+        assert_eq!(size_of::<Tms>(), 32);
+        assert_eq!(align_of::<Tms>(), 8);
+        assert_eq!(offset_of!(Tms, tms_utime), 0);
+        assert_eq!(offset_of!(Tms, tms_stime), 8);
+        assert_eq!(offset_of!(Tms, tms_cutime), 16);
+        assert_eq!(offset_of!(Tms, tms_cstime), 24);
+    }
+}
+
+#[cfg(test)]
 mod rusage_layout_tests {
     //! `struct rusage` is read by offset: the switch counts are the last two
     //! of its sixteen longs, and a field one place off is another number.
