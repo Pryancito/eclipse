@@ -607,6 +607,25 @@ mod tests {
         }
     }
 
+    /// The one zero that is not a spelling of off, and the only way to reach
+    /// the clamp's lower bound at all.
+    ///
+    /// `smp=0` never gets there: `0` spells off, so the boolean read above
+    /// answers one CPU and returns before the clamp. `0x0` spells no boolean,
+    /// so it goes on to [`parse_number`], which reads it as zero -- and a
+    /// ceiling of zero CPUs is a machine that brings up none, on the one
+    /// architecture that asks this function for its count (`/chosen/bootargs`
+    /// on riscv64). The upper bound has a test of its own below; this end had
+    /// nothing, and `clamp(0, ..)` survived the whole suite.
+    #[test]
+    fn the_one_zero_that_is_not_a_boolean_is_still_one_cpu() {
+        assert_eq!(parse_bool("0x0"), None, "why this one reaches the clamp");
+        assert_eq!(parse_number("0x0"), Some(0));
+        assert_eq!(smp_limit("smp=0x0"), Some(1));
+        assert_eq!(smp_limit("smp=0X0"), Some(1));
+        assert_eq!(smp_limit("LOG=info:smp=0x0"), Some(1));
+    }
+
     #[test]
     fn a_ceiling_of_one_is_read_as_one_and_not_as_a_true_boolean() {
         // THE bug this function exists to not have: `parse_bool("1")` is

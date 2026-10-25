@@ -526,6 +526,11 @@ fn blending_with_no_alpha_keeps_what_was_there_and_full_alpha_replaces_it() {
 /// The star field is placed from `hash2`, so the wallpaper is the same file
 /// on every build only if the hash is. Both arguments have to matter: a hash
 /// that ignores one puts every star in a row.
+///
+/// What this does NOT hold is WHICH field: a hash with a different avalanche
+/// is still deterministic, still asymmetric and still spread, and it moves
+/// every star. That is
+/// `the_star_hash_still_answers_the_numbers_the_scene_was_drawn_with` below.
 #[test]
 fn the_star_hash_is_the_same_every_time_and_both_inputs_change_it() {
     assert_eq!(hash2(0, 0), hash2(0, 0), "not deterministic");
@@ -583,4 +588,59 @@ fn every_glyph_row_is_five_bits_wide_and_an_unknown_character_is_blank() {
     for c in ['\0', '\u{7f}', ' ', '@', '%', 'z', 'C', 'P'] {
         assert_eq!(glyph5x7(c), [0; 7], "{c:?} draws something");
     }
+}
+
+/// A span has to COVER the circle it was asked for, not merely stay inside the
+/// buffer: a span short on either end clips the glow of a star or the edge of
+/// the ring, and one too long costs a pass over pixels that cannot change.
+///
+/// Rounding the low end up instead of down survives all 448 tests of `xtask`.
+/// The wallpaper is only ever read back here as a decoded PNG, and one clipped
+/// pixel on the left of every disc moves no byte any of those assertions looks
+/// at. The same mutation dies in `tools/lunarbg`, which has this test, and the
+/// two copies of `span` are character for character the same.
+#[test]
+fn a_span_covers_its_radius_and_barely_more() {
+    for &(c, r) in &[
+        (10.0f32, 3.0f32),
+        (10.5, 3.25),
+        (0.4, 0.4),
+        (99.9, 0.1),
+        (50.0, 7.5),
+    ] {
+        let (lo, hi) = span(c, r, 1000);
+        assert!(lo as f32 <= c - r, "lo {lo} past {}", c - r);
+        assert!(hi as f32 >= c + r + 1.0, "hi {hi} short of {}", c + r + 1.0);
+        // Tight: one pixel of slack each way, no more.
+        assert!(lo as f32 + 1.0 > c - r, "lo {lo} too low");
+        assert!(hi as f32 <= c + r + 2.0, "hi {hi} too high");
+    }
+    // Clipped at the limit, and never backwards.
+    assert_eq!(span(995.0, 20.0, 1000).1, 1000);
+    assert_eq!(span(-50.0, 1.0, 1000).0, 0);
+}
+
+/// The star field has to be the SAME field every build: this wallpaper is a
+/// file the image ships, and a hash that drifts moves every star in it.
+///
+/// Nothing here held the avalanche. Changing its first shift survives all 448
+/// tests of `xtask`, because the tests above decode whatever was rendered
+/// rather than compare it against a known picture. These are the values the
+/// same function in `tools/lunarbg` is pinned to, so the two copies cannot
+/// drift apart without one of the two tests saying so.
+///
+/// The neighbour above is the one whose name sounds like this and is not:
+/// it asks that the hash be deterministic, asymmetric and spread, all three
+/// of which a different avalanche still is.
+#[test]
+fn the_star_hash_still_answers_the_numbers_the_scene_was_drawn_with() {
+    assert_eq!(hash2(0, 0), 0);
+    assert_eq!(hash2(1, 0), 520_022_130);
+    assert_eq!(hash2(0, 1), 1_641_512_162);
+    assert_eq!(hash2(1, 1), 2_772_236_498);
+    assert_eq!(hash2(7, 13), 553_458_987);
+    assert_eq!(hash2(1920, 1080), 2_592_556_348);
+    // The two arguments are not interchangeable: a square grid of stars would
+    // otherwise be mirrored about its diagonal.
+    assert_ne!(hash2(3, 5), hash2(5, 3));
 }
