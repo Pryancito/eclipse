@@ -816,4 +816,308 @@ mod tests {
             networks
         );
     }
+
+    // --- what the kernel calls on this interface
+    //
+    // Everything above drives the device and the address list directly. The
+    // kernel only ever reaches the loopback through `Scheme`/`NetScheme`, and
+    // that layer was untested: `poll` -- the only thing that moves a packet
+    // from one local socket to another, and the only thing that wakes the
+    // reader waiting for it -- had no test at all.
+
+    /// An ICMP echo request from `127.0.0.1` to itself, as the bytes a
+    /// `Medium::Ip` device carries: no Ethernet header, the IPv4 header first.
+    ///
+    /// smoltcp answers one of these out of the interface itself, with no socket
+    /// in the set, which is what makes it the one frame that can prove `poll`
+    /// moved something.
+    fn echo_request_to_itself() -> Vec<u8> {
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::Ipv4Repr;
+        use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, IpProtocol, Ipv4Address, Ipv4Packet};
+
+        let icmp = Icmpv4Repr::EchoRequest {
+            ident: 0x1234,
+            seq_no: 1,
+            data: b"loopback",
+        };
+        let ip = Ipv4Repr {
+            src_addr: Ipv4Address::new(127, 0, 0, 1),
+            dst_addr: Ipv4Address::new(127, 0, 0, 1),
+            protocol: IpProtocol::Icmp,
+            payload_len: icmp.buffer_len(),
+            hop_limit: 64,
+        };
+        let caps = ChecksumCapabilities::default();
+        let mut frame = alloc::vec![0u8; ip.buffer_len() + icmp.buffer_len()];
+        ip.emit(&mut Ipv4Packet::new_unchecked(&mut frame[..]), &caps);
+        icmp.emit(
+            &mut Icmpv4Packet::new_unchecked(&mut frame[ip.buffer_len()..]),
+            &caps,
+        );
+        frame
+    }
+
+    /// The closure smoltcp hands the buffer to can refuse, and then no frame
+    /// was transmitted. The counters are bumped after the closure, so a
+    /// refusal must leave them where they were -- otherwise `/proc/net/dev`
+    /// counts packets that never went anywhere.
+    #[test]
+    fn a_closure_that_refuses_the_frame_leaves_the_counters_alone() {
+        let stats = stats();
+        let mut dev = LoopbackDevice::new(Medium::Ip, stats.clone());
+        let token = dev.transmit().expect("the loopback always has room");
+
+        assert_eq!(
+            token
+                .consume(at(0), 40, |_buf| Err::<(), _>(
+                    smoltcp::Error::Unaddressable
+                ))
+                .err(),
+            Some(smoltcp::Error::Unaddressable),
+            "the closure's refusal must come back to smoltcp"
+        );
+
+        let s = stats.lock();
+        assert_eq!(
+            (s.tx_packets, s.tx_bytes, s.tx_errors, s.tx_dropped),
+            (0, 0, 0, 0),
+            "a frame that was never built was counted"
+        );
+        drop(s);
+        assert!(
+            dev.receive().is_none(),
+            "a refused frame still went on the queue"
+        );
+    }
+
+    /// The loopback has no interrupt line, so the handler the `Scheme` trait
+    /// requires is a no-op -- and it has to stay reachable and harmless, since
+    /// `handle_irq` is called by vector number and any device can be handed a
+    /// cause that is not its own.
+    #[test]
+    fn the_loopback_has_no_interrupt_to_handle() {
+        let stats = stats();
+        let iface = interface(stats.clone());
+        iface.send(b"a frame nobody will poll for").unwrap();
+        let before = stats.lock().clone();
+
+        iface.handle_irq(0);
+        iface.handle_irq(usize::MAX);
+
+        let after = stats.lock().clone();
+        assert_eq!(
+            (after.tx_packets, after.rx_packets),
+            (before.tx_packets, before.rx_packets),
+            "handling an interrupt moved a packet"
+        );
+    }
+
+    /// `NetScheme` asks for the name twice, through `ifname` and through
+    /// `get_ifname`, and only the second one was tested. The two have to agree:
+    /// `netdev_drain_rx` skips the loopback by comparing a name against the
+    /// literal "loopback", and it does not go through `get_ifname`.
+    #[test]
+    fn the_interface_answers_to_the_same_name_both_ways() {
+        let iface = interface(stats());
+        assert_eq!(iface.ifname(), "loopback");
+        assert_eq!(iface.ifname(), iface.get_ifname());
+        assert!(
+            iface.is_loopback(),
+            "the loopback that does not say it is one gets an ARP cache"
+        );
+    }
+
+    /// The statistics come out as a copy. A caller that was handed the
+    /// counters themselves could not read them without taking the lock the
+    /// receive path needs, which on this IRQ-off kernel is a deadlock rather
+    /// than a wait.
+    #[test]
+    fn the_statistics_come_out_as_a_snapshot() {
+        let stats = stats();
+        let iface = interface(stats.clone());
+        iface.send(b"four").unwrap();
+        let snapshot = iface.get_stats();
+        assert_eq!((snapshot.tx_packets, snapshot.tx_bytes), (1, 4));
+
+        iface.send(b"four more bytes").unwrap();
+        assert_eq!(
+            (snapshot.tx_packets, snapshot.tx_bytes),
+            (1, 4),
+            "the snapshot moved with the counters"
+        );
+        assert_eq!(iface.get_stats().tx_packets, 2);
+    }
+
+    /// A poll with an empty queue moves nothing, and the flag that wakes a
+    /// parked reader stays down.
+    ///
+    /// The flag is a process-wide `static`, so these three tests clear it on
+    /// the way in rather than assuming it starts down.
+    #[test]
+    fn a_poll_with_nothing_to_move_leaves_the_wake_up_flag_down() {
+        let iface = interface(stats());
+        take_loopback_moved();
+
+        iface.poll().expect("an idle poll must not fail");
+
+        assert!(
+            !take_loopback_moved(),
+            "an idle poll claimed it delivered something, so every reader wakes for nothing"
+        );
+    }
+
+    /// What the flag is for. The loopback has no interrupt, so nothing else
+    /// tells a reader parked on its net-RX wait that its bytes arrived: before
+    /// the flag existed it waited out its fallback timer, 1 ms, on every hop.
+    #[test]
+    fn a_poll_that_moved_a_packet_raises_the_flag_that_wakes_the_reader() {
+        let iface = interface(stats());
+        take_loopback_moved();
+        iface.send(&echo_request_to_itself()).unwrap();
+
+        iface
+            .poll()
+            .expect("the poll of a staged frame must not fail");
+
+        assert!(
+            take_loopback_moved(),
+            "the packet moved and nothing was woken for it"
+        );
+    }
+
+    /// The flag is a one-shot: it is read and cleared in the same breath, so
+    /// one delivery wakes the readers once. Reading it twice and getting true
+    /// twice would mean a poller that wakes every reader on the machine on
+    /// every pass for the rest of the boot.
+    #[test]
+    fn the_wake_up_flag_is_handed_out_exactly_once() {
+        let iface = interface(stats());
+        take_loopback_moved();
+        iface.send(&echo_request_to_itself()).unwrap();
+        iface.poll().unwrap();
+
+        assert!(take_loopback_moved(), "nothing to hand out");
+        assert!(
+            !take_loopback_moved(),
+            "the flag stayed up, so every later poll wakes every reader"
+        );
+    }
+
+    /// `poll` takes both locks with `try_lock` and gives up quietly on either.
+    /// A blocking acquire here is a deadlock, not a wait: this poll runs from a
+    /// deferred job, and a socket syscall drains that queue WHILE holding the
+    /// socket set, so on this IRQ-off kernel the same CPU would spin forever on
+    /// a lock it already owns. Nothing is lost by giving up, because whoever
+    /// holds the lock drives the poll on release.
+    #[test]
+    fn a_poll_gives_up_quietly_while_the_interface_is_locked() {
+        let iface = interface(stats());
+        take_loopback_moved();
+        iface.send(&echo_request_to_itself()).unwrap();
+
+        let held = iface.iface.lock();
+        let answer = iface.poll();
+        drop(held);
+
+        assert!(answer.is_ok(), "giving up is not an error");
+        assert!(
+            !take_loopback_moved(),
+            "the poll ran with the interface locked"
+        );
+        // And the frame is still there for the next poll.
+        iface.poll().unwrap();
+        assert!(take_loopback_moved(), "the staged frame was lost");
+    }
+
+    /// The same for the socket set. It is the process-wide `SOCKETS`, so this
+    /// holds a lock the whole binary shares; the suite runs
+    /// `--test-threads=1`, as CI does, and the lock is held across one call.
+    #[test]
+    fn a_poll_gives_up_quietly_while_the_socket_set_is_locked() {
+        let iface = interface(stats());
+        take_loopback_moved();
+        iface.send(&echo_request_to_itself()).unwrap();
+
+        let sockets = get_sockets();
+        let held = sockets.lock();
+        let answer = iface.poll();
+        drop(held);
+
+        assert!(answer.is_ok(), "giving up is not an error");
+        assert!(
+            !take_loopback_moved(),
+            "the poll ran with the socket set locked"
+        );
+        iface.poll().unwrap();
+        assert!(take_loopback_moved(), "the staged frame was lost");
+    }
+
+    /// The same interface over an address list that cannot grow.
+    ///
+    /// `kernel-hal` builds the loopback with an owned list, which
+    /// `add_ip_address` grows when every slot is taken. A borrowed list is
+    /// fixed-size storage: there is nothing to grow, and the fallback is the
+    /// newest slot.
+    fn interface_with_borrowed_addresses(stats: Arc<Mutex<NetStats>>) -> LoopbackInterface {
+        let device = LoopbackDevice::new(Medium::Ip, stats.clone());
+        let storage: &'static mut [IpCidr] = alloc::boxed::Box::leak(
+            alloc::vec![
+                IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8),
+                IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), 128),
+            ]
+            .into_boxed_slice(),
+        );
+        let seen = storage.to_vec();
+        let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
+            alloc::boxed::Box::leak(alloc::vec![None; 4].into_boxed_slice());
+        let iface = InterfaceBuilder::new(device)
+            .ip_addrs(storage)
+            .routes(Routes::new(routes_storage))
+            .finalize();
+        LoopbackInterface {
+            iface: Arc::new(Mutex::new(iface)),
+            name: String::from("loopback"),
+            stats,
+            routes: Arc::new(Mutex::new(Vec::new())),
+            ip_addrs: Arc::new(Mutex::new(seen)),
+        }
+    }
+
+    /// With both slots taken and no way to grow, the new address takes the
+    /// newest slot -- the best there is -- and the oldest one survives.
+    /// Overwriting the FIRST slot would take `127.0.0.1` away from a machine
+    /// whose every local connection goes through it.
+    #[test]
+    fn an_address_list_that_cannot_grow_gives_up_its_newest_slot() {
+        let iface = interface_with_borrowed_addresses(stats());
+        let added = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
+
+        iface.add_ip_address(added).unwrap();
+
+        let after = iface.get_ip_address();
+        assert_eq!(after.len(), 2, "borrowed storage grew: {:?}", after);
+        assert!(
+            after.contains(&IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)),
+            "127.0.0.1 was the slot given up: {:?}",
+            after
+        );
+        assert!(after.contains(&added), "{:?}", after);
+    }
+
+    /// Removing an address the interface does not have is not an error and
+    /// takes nothing away. `ip addr del` on a stale address is routine, and a
+    /// run off the end of the list that blanked a slot anyway would take the
+    /// loopback's own address.
+    #[test]
+    fn removing_an_address_that_is_not_there_changes_nothing() {
+        let iface = interface(stats());
+        let before = iface.get_ip_address();
+
+        iface
+            .remove_ip_address(IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24))
+            .expect("removing an address that is not there is not an error");
+
+        assert_eq!(iface.get_ip_address(), before);
+    }
 }
