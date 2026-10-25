@@ -1272,8 +1272,11 @@ struct LinuxProcessInner {
     arg_area: Option<crate::loader::ArgArea>,
     /// Current Working Directory
     ///
-    /// Omit leading '/'.
+    /// Omit leading '/'. The path of [`Self::working_directory`], which is
+    /// what it names when the two differ (see `cwd.rs`).
     current_working_directory: String,
+    /// The working directory itself, once a `chdir` has named one.
+    working_directory: Option<cwd::HeldDirectory>,
     /// The process's sixteen resource limits, `tsk->signal->rlim` indexed by
     /// resource number. Only [`RLIMIT_NOFILE`] is enforced (right below, on
     /// every descriptor this table grows by); the rest are the soft budgets
@@ -3793,11 +3796,6 @@ impl LinuxProcess {
         *self.parent.lock() = Arc::downgrade(parent);
     }
 
-    /// Get current working directory.
-    pub fn current_working_directory(&self) -> String {
-        String::from("/") + &self.inner.lock().current_working_directory
-    }
-
     /// Get absolute path from dirfd and relative path.
     pub fn get_absolute_path(&self, dirfd: FileDesc, path: &str) -> LxResult<String> {
         if path.is_empty() {
@@ -3806,7 +3804,7 @@ impl LinuxProcess {
         let base_path = if path.starts_with('/') {
             String::new()
         } else if dirfd == FileDesc::CWD {
-            self.inner.lock().current_working_directory.clone()
+            self.current_working_directory()
         } else {
             let file = self.get_file(dirfd)?;
             let file_path = file.path().clone();
@@ -3827,29 +3825,6 @@ impl LinuxProcess {
             }
         }
         Ok(String::from("/") + &cwd_vec.join("/"))
-    }
-
-    /// Change working directory.
-    pub fn change_directory(&self, path: &str) {
-        if path.is_empty() {
-            return;
-        }
-        let mut inner = self.inner.lock();
-        let cwd = match path.as_bytes()[0] {
-            b'/' => String::new(),
-            _ => inner.current_working_directory.clone(),
-        };
-        let mut cwd_vec: Vec<_> = cwd.split('/').filter(|x| !x.is_empty()).collect();
-        for seg in path.split('/') {
-            match seg {
-                ".." => {
-                    cwd_vec.pop();
-                }
-                "." | "" => {} // nothing to do here.
-                _ => cwd_vec.push(seg),
-            }
-        }
-        inner.current_working_directory = cwd_vec.join("/");
     }
 
     /// Get execute path.
@@ -4565,6 +4540,7 @@ impl LinuxProcessInner {
             environ: self.environ.clone(),
             arg_area: self.arg_area,
             current_working_directory: self.current_working_directory.clone(),
+            working_directory: self.working_directory.clone(),
             files: self.files.clone(),
             // The child's table is a copy of the parent's, so the parent's
             // lower bound on its lowest free descriptor holds for it too --

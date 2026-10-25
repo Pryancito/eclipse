@@ -2,7 +2,7 @@
 
 mod block_mount;
 mod btrfs_mount;
-mod dcache;
+pub(crate) mod dcache;
 pub mod devfs;
 mod dmabuf;
 mod eclipsefs_ioctl;
@@ -2494,7 +2494,8 @@ impl LinuxProcess {
         debug!(
             "lookup_inode_at: dirfd: {:?}, cwd: {:?}, path: {:?}, follow: {:?}",
             dirfd,
-            self.current_working_directory(),
+            // Not the checked path: checking it is a lookup of its own.
+            self.working_directory_as_entered(),
             path,
             follow
         );
@@ -2653,8 +2654,7 @@ impl LinuxProcess {
         }
         // The walk goes on from where the directory is, by its name.
         let (start, from) = if dirfd == FileDesc::CWD {
-            let cwd = self.current_working_directory();
-            (root.lookup(&cwd)?, cwd)
+            self.working_directory()?
         } else {
             let file = self.get_file(dirfd)?;
             (file.inode(), file.path().clone())
@@ -3423,7 +3423,7 @@ pub const FOLLOW_MAX_DEPTH: usize = 40;
 /// Avoids ext2 directory scans on every access (VBox AHCI can stall there).
 /// Which of the file systems that absolute paths reach without the mounts
 /// `path` is in.
-fn virtual_fs_top(path: &str) -> Option<&'static str> {
+pub(crate) fn virtual_fs_top(path: &str) -> Option<&'static str> {
     ["/proc", "/sys", "/dev"].iter().copied().find(|top| {
         path.strip_prefix(*top)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))

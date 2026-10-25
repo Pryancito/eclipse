@@ -62,9 +62,7 @@ impl Syscall<'_> {
         // it receives over its IPC channels.
         let stat = if flags.contains(AtFlags::EMPTY_PATH) && path.is_empty() {
             if dirfd == FileDesc::CWD {
-                proc.root_inode()
-                    .lookup(&proc.current_working_directory())?
-                    .metadata()?
+                proc.working_directory()?.0.metadata()?
             } else {
                 proc.get_file_like(dirfd)?.metadata()?
             }
@@ -98,9 +96,7 @@ impl Syscall<'_> {
             && (pathname.is_null() || pathname.as_c_str().map(|s| s.is_empty()).unwrap_or(false))
         {
             if dirfd == FileDesc::CWD {
-                let inode = proc
-                    .root_inode()
-                    .lookup(&proc.current_working_directory())?;
+                let inode = proc.working_directory()?.0;
                 (inode.metadata()?, Some(inode))
             } else {
                 // AT_EMPTY_PATH names the descriptor itself, whatever kind it
