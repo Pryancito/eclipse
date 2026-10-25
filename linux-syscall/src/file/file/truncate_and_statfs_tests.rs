@@ -35,6 +35,10 @@ const A_USER: u32 = 1000;
 
 /// A descriptor number this harness never hands out.
 const A_CLOSED_FD: usize = 100;
+/// What `statfs(2)` writes in `f_type` for the root of a test process: it is a
+/// `RamFS` (`a_process`), and ramfs reports tmpfs's magic since `FsInfo` grew
+/// `ftype`. A file and a directory of the same filesystem answer the same.
+const TMPFS_MAGIC: i64 = 0x0102_1994;
 
 /// A length userspace wrote as `-1`. It is `EINVAL`, not an order to grow
 /// the file to sixteen exabytes.
@@ -464,6 +468,10 @@ fn statfs_answers_for_any_file_in_the_filesystem_and_fstatfs_for_the_descriptor(
             let fd = a_file_named(&lp, &dir_path, "f", TEN_DIGITS, 0, 0o644);
             let dir_name = c(&dir_path);
             let file_name = c(&alloc::format!("{}/f", dir_path));
+            // The numbers the filesystem itself reports, through the same
+            // conversion: the test is that they reach the caller, whatever
+            // ramfs decides its block size or name limit is.
+            let want: StatFs = lp.root_inode().fs().info().into();
 
             for (what, name) in [("a file", &file_name), ("a directory", &dir_name)] {
                 let mut buf = an_unwritten_statfs();
@@ -474,23 +482,23 @@ fn statfs_answers_for_any_file_in_the_filesystem_and_fstatfs_for_the_descriptor(
                     "statfs refused {}",
                     what
                 );
-                assert_eq!(buf.f_type, 0xEF53, "statfs of {} wrote no type", what);
+                assert_eq!(buf.f_type, TMPFS_MAGIC, "statfs of {} wrote no type", what);
                 assert_eq!(
-                    buf.f_bsize, 0,
+                    (buf.f_bsize, buf.f_namelen),
+                    (want.f_bsize, want.f_namelen),
                     "statfs of {} left a field of the buffer alone",
                     what
                 );
-                assert_eq!(buf.f_namelen, 0);
             }
 
             let mut buf = an_unwritten_statfs();
             let addr = &mut buf as *mut StatFs as usize;
             assert_eq!(sys.sys_fstatfs(FileDesc::from(fd), addr.into()), Ok(0));
             assert_eq!(
-                buf.f_type, 0xEF53,
+                buf.f_type, TMPFS_MAGIC,
                 "fstatfs answered for a descriptor on the same filesystem with a different type"
             );
-            assert_eq!(buf.f_bsize, 0);
+            assert_eq!(buf.f_bsize, want.f_bsize);
         })
     });
 }

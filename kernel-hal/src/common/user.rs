@@ -139,7 +139,37 @@ fn in_user_half(addr: usize, bytes: usize) -> bool {
     // every configuration -- including the only one that builds on a
     // developer's host and in the unit-test job, which is `libos`. The
     // constant makes it fold away there.
-    in_user_half_with(cfg!(feature = "libos"), addr, bytes)
+    in_user_half_with(cfg!(feature = "libos") && !strict_user_half(), addr, bytes)
+}
+
+// `libos` only: the user-half bound applied on the calling thread as it is
+// on bare metal, so a host test can watch an ioctl refuse a kernel pointer
+// with EFAULT instead of reading through it. Off by default -- host
+// addresses are not user-half addresses -- and per thread, so a test that
+// turns it on changes nothing for the tests beside it. Seam BELOW what is
+// tested: the arms under test keep calling `user_range_ok`.
+#[cfg(feature = "libos")]
+std::thread_local! {
+    static STRICT_USER_HALF: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Apply (`true`) or lift (`false`) the user-half bound on the calling
+/// thread. `libos` only; see [`in_user_half`].
+#[cfg(feature = "libos")]
+pub fn set_strict_user_half(on: bool) {
+    STRICT_USER_HALF.with(|c| c.set(on));
+}
+
+#[cfg(feature = "libos")]
+#[inline]
+fn strict_user_half() -> bool {
+    STRICT_USER_HALF.with(|c| c.get())
+}
+
+#[cfg(not(feature = "libos"))]
+#[inline(always)]
+fn strict_user_half() -> bool {
+    false
 }
 
 /// [`in_user_half`] with the exemption as an argument rather than a `cfg!`.
@@ -688,6 +718,27 @@ mod tests {
             assert!(!user_range_ok(USER_MAX, 1));
             assert!(!user_range_ok(USER_MAX - 8, 9));
         }
+    }
+
+    /// Under `libos` the bound is lifted, so a kernel pointer passes; with
+    /// the strict switch on it is refused as on bare metal, on this thread
+    /// only, and the host's own buffers still pass. Off again, it passes.
+    #[cfg(feature = "libos")]
+    #[test]
+    fn the_strict_switch_applies_the_user_half_bound_on_this_thread_only() {
+        const KERNEL_PTR: usize = 0xffff_8000_0000_0000;
+        let buf = [0u8; 16];
+        assert!(user_range_ok(KERNEL_PTR, 8), "lifted by default");
+        set_strict_user_half(true);
+        assert!(!user_range_ok(KERNEL_PTR, 8));
+        assert!(!user_range_ok(USER_MAX - 8, 9));
+        assert!(user_range_ok(USER_MAX - 8, 8));
+        assert!(user_range_ok(buf.as_ptr() as usize, buf.len()));
+        assert!(user_range_ok(KERNEL_PTR, 0), "nothing to read: no bound");
+        let other = std::thread::spawn(|| user_range_ok(KERNEL_PTR, 8));
+        assert!(other.join().unwrap(), "another thread is not strict");
+        set_strict_user_half(false);
+        assert!(user_range_ok(KERNEL_PTR, 8));
     }
 
     #[test]
