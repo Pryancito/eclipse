@@ -474,9 +474,7 @@ impl Socket for PacketSocketState {
         let dev = if ifindex > 0 {
             crate::net::iface_by_linux_ifindex(ifindex).ok()
         } else {
-            get_net_device()
-                .into_iter()
-                .find(|n| !n.is_loopback())
+            get_net_device().into_iter().find(|n| !n.is_loopback())
         };
         let writable = dev.as_ref().is_some_and(|d| d.can_send());
         (readable, writable, false)

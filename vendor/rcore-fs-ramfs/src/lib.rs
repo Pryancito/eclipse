@@ -107,12 +107,8 @@ fn charge_block() -> Result<()> {
         if new > cap {
             return Err(FsError::NoDeviceSpace);
         }
-        match RAMFS_LIVE_BYTES.compare_exchange_weak(
-            cur,
-            new,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
+        match RAMFS_LIVE_BYTES.compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Relaxed)
+        {
             Ok(_) => return Ok(()),
             Err(actual) => cur = actual,
         }
@@ -266,9 +262,7 @@ impl PagedBytes {
             let bo = pos % BLOCK;
             let chunk = (BLOCK - bo).min(n - done);
             match self.blocks.get(bi).and_then(|b| b.as_ref()) {
-                Some(b) => {
-                    buf[done..done + chunk].copy_from_slice(&b.as_slice()[bo..bo + chunk])
-                }
+                Some(b) => buf[done..done + chunk].copy_from_slice(&b.as_slice()[bo..bo + chunk]),
                 // Hole: reads as zeros.
                 None => buf[done..done + chunk].fill(0),
             }
@@ -295,8 +289,7 @@ impl PagedBytes {
             let chunk = (BLOCK - bo).min(buf.len() - done);
             match &mut self.blocks[bi] {
                 Some(b) => {
-                    b.as_mut_slice()[bo..bo + chunk]
-                        .copy_from_slice(&buf[done..done + chunk]);
+                    b.as_mut_slice()[bo..bo + chunk].copy_from_slice(&buf[done..done + chunk]);
                 }
                 slot @ None => {
                     // First write materializes the block. A fully covered block
@@ -311,8 +304,7 @@ impl PagedBytes {
                         RamBlock::alloc_from(&buf[done..done + chunk])?
                     } else {
                         let mut b = RamBlock::alloc_zeroed()?;
-                        b.as_mut_slice()[bo..bo + chunk]
-                            .copy_from_slice(&buf[done..done + chunk]);
+                        b.as_mut_slice()[bo..bo + chunk].copy_from_slice(&buf[done..done + chunk]);
                         b
                     };
                     *slot = Some(b);

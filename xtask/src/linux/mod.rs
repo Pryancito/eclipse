@@ -150,17 +150,27 @@ impl LinuxRootfs {
                 let _ = fs::copy(&eclipse_useradd, bin.join("eclipse-useradd"));
             }
             let eclipse_bench = self.eclipse_bench(&musl);
-            if eclipse_bench.is_file() { let _ = fs::copy(&eclipse_bench, bin.join("eclipse-bench")); }
+            if eclipse_bench.is_file() {
+                let _ = fs::copy(&eclipse_bench, bin.join("eclipse-bench"));
+            }
             let clock_probe = self.clock_probe(&musl);
-            if clock_probe.is_file() { let _ = fs::copy(&clock_probe, bin.join("clock-probe")); }
+            if clock_probe.is_file() {
+                let _ = fs::copy(&clock_probe, bin.join("clock-probe"));
+            }
             self.install_signal_probe(&musl, &bin);
             self.install_usb_probe(&musl, &bin);
             let firefox_probe = self.firefox_probe(&musl);
-            if firefox_probe.is_file() { let _ = fs::copy(&firefox_probe, bin.join("firefox-probe")); }
+            if firefox_probe.is_file() {
+                let _ = fs::copy(&firefox_probe, bin.join("firefox-probe"));
+            }
             let audio_probe = self.audio_probe(&musl);
-            if audio_probe.is_file() { let _ = fs::copy(&audio_probe, bin.join("audio-probe")); }
+            if audio_probe.is_file() {
+                let _ = fs::copy(&audio_probe, bin.join("audio-probe"));
+            }
             let drm_probe = self.drm_probe(&musl);
-            if drm_probe.is_file() { let _ = fs::copy(&drm_probe, bin.join("drm-probe")); }
+            if drm_probe.is_file() {
+                let _ = fs::copy(&drm_probe, bin.join("drm-probe"));
+            }
             let gfx_probe = self.gfx_probe(&musl);
             if gfx_probe.is_file() {
                 let _ = fs::copy(&gfx_probe, bin.join("gfx-probe"));
@@ -3311,7 +3321,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
             "usr/lib/x86_64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so",
             "usr/lib/aarch64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so",
             "usr/lib/riscv64-linux-gnu/alsa-lib/libasound_module_pcm_pulse.so",
-        ].iter().any(|rel| rootfs.join(rel).is_file());
+        ]
+        .iter()
+        .any(|rel| rootfs.join(rel).is_file());
         let have_pulse = rootfs.join("usr/bin/pulseaudio").is_file() && pulse_pcm;
         let body = if have_pulse {
             b"# eclipse-generated ALSA routing (delete this line to take ownership).\n\
@@ -5565,7 +5577,10 @@ mod apk_arch_tests {
             .find("if apk.is_file() {")
             .expect("sigue habiendo una comprobacion del estatico");
         let bloque = &src[i..];
-        let fin = bloque.find("\n            }").or_else(|| bloque.find("\n        }")).unwrap_or(bloque.len());
+        let fin = bloque
+            .find("\n            }")
+            .or_else(|| bloque.find("\n        }"))
+            .unwrap_or(bloque.len());
         let dentro = &bloque[..fin];
         for aguja in ["repositories", "write_apk_arch", "install_apk_keys"] {
             assert!(
@@ -7772,6 +7787,10 @@ mod apk_closure_tests {
             .into_iter()
             .filter(|a| !apk_closure_fits_image(a))
             .collect();
-        assert_eq!(fuera, vec!["riscv64"], "solo riscv64 tiene techo de RAM; si aparece otro, que sea con su motivo escrito");
+        assert_eq!(
+            fuera,
+            vec!["riscv64"],
+            "solo riscv64 tiene techo de RAM; si aparece otro, que sea con su motivo escrito"
+        );
     }
 }

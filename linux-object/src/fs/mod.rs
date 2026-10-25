@@ -1196,10 +1196,7 @@ fn install_tmpfs_frame_backend() {
 
 /// Options string for a tmpfs mount, including the live size= cap.
 fn tmpfs_mount_opts() -> String {
-    alloc::format!(
-        "rw,nosuid,nodev,size={}",
-        rcore_fs_ramfs::bytes_cap()
-    )
+    alloc::format!("rw,nosuid,nodev,size={}", rcore_fs_ramfs::bytes_cap())
 }
 
 /// create root filesystem, mount DevFS and RamFS
@@ -1734,10 +1731,20 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         if n_input > 0 {
             let run_root = run_ramfs.root_inode();
             let udev_dir = run_root.create("udev", FileType::Dir, 0o755);
-            let data_dir = udev_dir.as_ref().ok().and_then(|u| u.create("data", FileType::Dir, 0o755).ok());
-            let tags_dir = udev_dir.as_ref().ok().and_then(|u| u.create("tags", FileType::Dir, 0o755).ok());
-            let seat_tag_dir = tags_dir.as_ref().and_then(|t| t.create("seat", FileType::Dir, 0o755).ok());
-            let seat0_tag_dir = tags_dir.as_ref().and_then(|t| t.create("seat0", FileType::Dir, 0o755).ok());
+            let data_dir = udev_dir
+                .as_ref()
+                .ok()
+                .and_then(|u| u.create("data", FileType::Dir, 0o755).ok());
+            let tags_dir = udev_dir
+                .as_ref()
+                .ok()
+                .and_then(|u| u.create("tags", FileType::Dir, 0o755).ok());
+            let seat_tag_dir = tags_dir
+                .as_ref()
+                .and_then(|t| t.create("seat", FileType::Dir, 0o755).ok());
+            let seat0_tag_dir = tags_dir
+                .as_ref()
+                .and_then(|t| t.create("seat0", FileType::Dir, 0o755).ok());
             if let Some(data_dir) = data_dir {
                 for (id, dev) in devs.iter().enumerate() {
                     // libinput's `evdev_configure_device` ignores any device
@@ -1844,7 +1851,13 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                     .expect("failed to mkdir /var/cache/apk")
             });
             if apk_cache.mount(RamFS::new()).is_ok() {
-                register_mount("tmpfs", "/var/cache/apk", "tmpfs", &tmpfs_mount_opts(), None);
+                register_mount(
+                    "tmpfs",
+                    "/var/cache/apk",
+                    "tmpfs",
+                    &tmpfs_mount_opts(),
+                    None,
+                );
             } else {
                 warn!("[boot] create_root_fs: mount /var/cache/apk failed");
             }

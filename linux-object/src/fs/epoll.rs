@@ -797,7 +797,9 @@ impl Epoll {
             let mut events = Vec::new();
             let mut delivered = Vec::new();
             let mut scanned_edges = Vec::new();
-            if events.try_reserve(maxevents.min(interest_list.len())).is_err()
+            if events
+                .try_reserve(maxevents.min(interest_list.len()))
+                .is_err()
                 || delivered
                     .try_reserve(maxevents.min(interest_list.len()))
                     .is_err()
