@@ -529,3 +529,228 @@ mod tests {
         assert_eq!(wire.rx_reads.get(), 1, "even when there is nothing to take");
     }
 }
+
+/// The wrapper the rest of the kernel actually holds.
+///
+/// `UartU740Inner` is covered next door over a recording [`Io`], byte by byte.
+/// This is the other half, and it was at zero. The recording port cannot reach
+/// it: `UartU740Mmio` holds an `UartU740Inner<Mmio<V>>` specifically, so the
+/// only device it accepts is ordinary memory -- which is all it needs, since
+/// `Mmio<V>` is `repr(transparent)` and the register map `repr(C)`, so
+/// register *n* is the *n*th word of a leaked block.
+///
+/// What was never called is the path from the kernel to that inner driver:
+/// `new`, and the `Scheme`/`UartScheme` methods. A `new` that forgot `init`,
+/// or a `try_recv` wired to the transmitter, leaves every test in `tests`
+/// green and the riscv64 board console dead.
+#[cfg(test)]
+mod wrapper_tests {
+    use super::*;
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+
+    /// Word indices into the register map, in `repr(C)` order.
+    const TXDATA: usize = 0;
+    const RXDATA: usize = 1;
+    const TXCTRL: usize = 2;
+    const RXCTRL: usize = 3;
+    const IE: usize = 4;
+
+    /// A bit of `txctrl` that belongs to whoever set the port up: the stop-bit
+    /// field. `init` means to set TXEN and leave this alone.
+    const NSTOP_LEFT_BY_FIRMWARE: u32 = TXCTRLFlags::NSTOP.bits();
+
+    /// A value no freshly leaked register can hold by accident.
+    const UNTOUCHED: u32 = 0x5EED_0000;
+
+    /// A leaked block of words, which is an FU740 UART as far as this driver
+    /// can tell. Eight words covers the seven registers and keeps the
+    /// alignment `Mmio::<u32>::from_base_as` needs.
+    struct Port {
+        base: usize,
+    }
+
+    impl Port {
+        fn new() -> Self {
+            let block: &'static mut [u32; 8] = Box::leak(Box::new([0u32; 8]));
+            Self {
+                base: block as *mut [u32; 8] as usize,
+            }
+        }
+
+        fn get(&self, word: usize) -> u32 {
+            unsafe { core::ptr::read_volatile((self.base + word * 4) as *const u32) }
+        }
+
+        fn set(&self, word: usize, value: u32) {
+            unsafe { core::ptr::write_volatile((self.base + word * 4) as *mut u32, value) }
+        }
+
+        fn uart(&self) -> UartU740Mmio<u32> {
+            unsafe { UartU740Mmio::<u32>::new(self.base) }
+        }
+
+        /// A byte is waiting: RXEMPTY clear is what `try_recv` asks about.
+        fn a_byte_is_waiting(&self, byte: u8) {
+            self.set(RXDATA, byte as u32);
+        }
+    }
+
+    /// Counts the events a subscriber is handed.
+    fn listening(uart: &UartU740Mmio<u32>) -> Arc<Mutex<usize>> {
+        let hits = Arc::new(Mutex::new(0usize));
+        let cloned = hits.clone();
+        crate::scheme::EventScheme::subscribe(uart, Box::new(move |_| *cloned.lock() += 1), false);
+        hits
+    }
+
+    // --- what `new` leaves behind ---------------------------------------------
+
+    /// `new` is the only caller of `init` there will ever be, and `init` is
+    /// what makes the port able to carry a byte at all. Drop that call and
+    /// every test in `tests` still passes, because they all call `init`
+    /// themselves.
+    #[test]
+    fn a_new_uart_has_had_its_port_set_up() {
+        let port = Port::new();
+        let _uart = port.uart();
+
+        assert_ne!(
+            port.get(TXCTRL) & TXCTRLFlags::TXEN.bits(),
+            0,
+            "without TXEN nothing the kernel prints leaves the chip"
+        );
+        assert_ne!(
+            port.get(RXCTRL) & RXCTRLFlags::RXEN.bits(),
+            0,
+            "without RXEN the port never receives"
+        );
+        let ie = port.get(IE);
+        assert_ne!(ie & IEFlags::TXWM.bits(), 0, "IE is missing TXWM");
+        assert_ne!(ie & IEFlags::RXWM.bits(), 0, "IE is missing RXWM");
+    }
+
+    /// `init` sets TXEN by reading the register and putting the bit back, so
+    /// the stop-bit and watermark fields the firmware chose survive. A write
+    /// of a bare `TXEN` would pass the test above and silently reset them.
+    #[test]
+    fn a_new_uart_keeps_the_transmit_settings_the_firmware_left() {
+        let port = Port::new();
+        port.set(TXCTRL, NSTOP_LEFT_BY_FIRMWARE);
+
+        let _uart = port.uart();
+
+        assert_eq!(
+            port.get(TXCTRL) & NSTOP_LEFT_BY_FIRMWARE,
+            NSTOP_LEFT_BY_FIRMWARE,
+            "the firmware's stop-bit setting was overwritten, txctrl is {:#x}",
+            port.get(TXCTRL)
+        );
+    }
+
+    // --- what reaches the inner driver ----------------------------------------
+
+    /// `try_recv` is the console's read path, and it has to route to the
+    /// RECEIVE register. Routed to the transmitter it would read back the last
+    /// byte printed, which looks like an echo and is not one.
+    #[test]
+    fn a_byte_waiting_in_the_port_comes_out_of_try_recv() {
+        let port = Port::new();
+        let uart = port.uart();
+        port.a_byte_is_waiting(b'q');
+        port.set(TXDATA, b'Z' as u32);
+
+        assert_eq!(
+            uart.try_recv().expect("a port with a byte is not an error"),
+            Some(b'q')
+        );
+    }
+
+    /// An empty port has to say so rather than hand over whatever bit pattern
+    /// the register happens to hold.
+    #[test]
+    fn an_empty_port_hands_back_no_byte_rather_than_a_stale_one() {
+        let port = Port::new();
+        let uart = port.uart();
+        port.set(RXDATA, RXDATAFlags::RXEMPTY.bits() | b'q' as u32);
+
+        assert_eq!(
+            uart.try_recv().expect("an empty port is not an error"),
+            None
+        );
+    }
+
+    /// `send` is the console's write path, and the one every panic banner
+    /// takes.
+    #[test]
+    fn send_puts_the_byte_in_the_port() {
+        let port = Port::new();
+        let uart = port.uart();
+
+        uart.send(b'Z')
+            .expect("a transmitter with room accepts a byte");
+
+        assert_eq!(port.get(TXDATA) & 0xFF, b'Z' as u32);
+    }
+
+    /// `write_str` is a loop, and the loop is the part worth pinning: one that
+    /// stopped after the first byte would still put a plausible-looking
+    /// character on screen. The register only keeps the LAST write, so this
+    /// says the loop reached the end of the string -- not that it wrote every
+    /// byte in between.
+    #[test]
+    fn a_string_leaves_the_port_through_to_its_last_byte() {
+        let port = Port::new();
+        let uart = port.uart();
+
+        uart.write_str("ABC")
+            .expect("a transmitter with room accepts a string");
+
+        let last = port.get(TXDATA) & 0xFF;
+        assert_ne!(last, b'A' as u32, "the loop stopped after the first byte");
+        assert_eq!(last, b'C' as u32);
+    }
+
+    /// The bound. This runs under the uart's IRQ-masking lock on the path
+    /// every panic banner takes, so a port that is not clocked -- TXFULL stuck
+    /// -- must not freeze the CPU. The wait gives up and the byte is lost.
+    #[test]
+    fn a_port_that_never_drains_does_not_hold_the_console_for_good() {
+        let port = Port::new();
+        let uart = port.uart();
+        port.set(TXDATA, TXDATAFlags::TXFULL.bits() | UNTOUCHED);
+
+        uart.send(b'Z')
+            .expect("giving up is not an error the caller sees");
+
+        assert_eq!(
+            port.get(TXDATA),
+            TXDATAFlags::TXFULL.bits() | UNTOUCHED,
+            "a byte was pushed at a transmitter that said it was full"
+        );
+    }
+
+    // --- what reaches a client ------------------------------------------------
+
+    /// `handle_irq` is the whole reason the listener exists: a handler that
+    /// triggers nothing leaves the console input-dead with every register
+    /// correctly programmed.
+    #[test]
+    fn an_interrupt_reaches_the_client_that_subscribed() {
+        let port = Port::new();
+        let uart = port.uart();
+        let hits = listening(&uart);
+        assert_eq!(*hits.lock(), 0, "nothing has happened yet");
+
+        uart.handle_irq(7);
+
+        assert_eq!(*hits.lock(), 1);
+    }
+
+    /// The name the device registry matches on. It used to say "UART 16550",
+    /// which is a different peripheral in a different file.
+    #[test]
+    fn the_uart_answers_to_the_name_the_registry_matches_on() {
+        assert_eq!(Port::new().uart().name(), "uart-u740-mmio");
+    }
+}
