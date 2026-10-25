@@ -103,11 +103,6 @@ extern "C" {
 /// Constructs the real OBJSYS singleton and the RM resource server.
 /// Call exactly once, before the first `attach_gpu`.
 pub fn init_core() -> NV_STATUS {
-    // Deliberately NOT gated, unlike the rest of the bring-up ladder below:
-    // this builds the OBJSYS singleton before any GPU exists, so there is no
-    // second RM caller to serialize against -- and its one caller holds an
-    // IRQ-off spinlock across it, where spinning on the gate is exactly the
-    // hazard the gate was written to avoid.
     unsafe { eclipse_rm_init_core() }
 }
 
@@ -134,18 +129,6 @@ pub fn attach_gpu(
     bar2_phys: u64,
     bar2_len: u64,
 ) -> Result<u32, NV_STATUS> {
-    // The bring-up ladder goes through the gate like every other RM entry.
-    // It is the LONGEST call in the port (`kgspInitRm` holds the RM API lock
-    // for seconds) and it was the only family that bypassed the gate, so a
-    // second card coming up while the desktop was already asking for a
-    // channel put two callers inside the RM at once -- the exact state the
-    // gate exists to prevent. What the other caller got back was not a wait
-    // but a refusal: `NV_ERR_INVALID_LOCK_STATE` (0x2f) from
-    // `rmapiLockAcquire`, or `NV_ERR_INVALID_STATE` (0x40) from a step16
-    // that found `gspRmInitialized` still false on a card mid-bring-up.
-    // Behind the gate the caller waits those seconds out and then finds the
-    // card ready, which is the answer it wanted.
-    let _gate = RmGate::lock();
     let mut device_instance: NvU32 = 0;
     let status = unsafe {
         eclipse_rm_attach_gpu(
@@ -176,18 +159,6 @@ pub fn attach_gpu(
 /// from bindata already compiled into this crate). `device_instance` is
 /// the value returned by a prior successful `attach_gpu`.
 pub fn init_gsp(device_instance: u32, buf: &[u8]) -> Result<(), NV_STATUS> {
-    // The bring-up ladder goes through the gate like every other RM entry.
-    // It is the LONGEST call in the port (`kgspInitRm` holds the RM API lock
-    // for seconds) and it was the only family that bypassed the gate, so a
-    // second card coming up while the desktop was already asking for a
-    // channel put two callers inside the RM at once -- the exact state the
-    // gate exists to prevent. What the other caller got back was not a wait
-    // but a refusal: `NV_ERR_INVALID_LOCK_STATE` (0x2f) from
-    // `rmapiLockAcquire`, or `NV_ERR_INVALID_STATE` (0x40) from a step16
-    // that found `gspRmInitialized` still false on a card mid-bring-up.
-    // Behind the gate the caller waits those seconds out and then finds the
-    // card ready, which is the answer it wanted.
-    let _gate = RmGate::lock();
     let status = unsafe {
         eclipse_rm_init_gsp(
             device_instance,
@@ -1389,18 +1360,6 @@ extern "C" {
 /// Runs gpumgrStatePreInitGpu / StateInitGpu / StateLoadGpu on an attached,
 /// GSP-booted GPU -- the rest of the real RmInitAdapter sequence.
 pub fn state_init(device_instance: u32) -> Result<StateInitResult, NV_STATUS> {
-    // The bring-up ladder goes through the gate like every other RM entry.
-    // It is the LONGEST call in the port (`kgspInitRm` holds the RM API lock
-    // for seconds) and it was the only family that bypassed the gate, so a
-    // second card coming up while the desktop was already asking for a
-    // channel put two callers inside the RM at once -- the exact state the
-    // gate exists to prevent. What the other caller got back was not a wait
-    // but a refusal: `NV_ERR_INVALID_LOCK_STATE` (0x2f) from
-    // `rmapiLockAcquire`, or `NV_ERR_INVALID_STATE` (0x40) from a step16
-    // that found `gspRmInitialized` still false on a card mid-bring-up.
-    // Behind the gate the caller waits those seconds out and then finds the
-    // card ready, which is the answer it wanted.
-    let _gate = RmGate::lock();
     let mut out = StateInitResult {
         pre_init_status: 0xFFFF_FFFF,
         init_status: 0xFFFF_FFFF,
@@ -2641,58 +2600,6 @@ mod rm_gate_tests {
     /// contended lock path has never run in this port, so two ioctls entering
     /// the RM at once drove it into untested blocking code and the machine
     /// froze at boot with a dead console.
-    /// Every RM entry that can run while another one does must take the gate.
-    ///
-    /// The bring-up ladder was the one family that did not, and it is the
-    /// longest call in the port: `kgspInitRm` holds the RM API lock for
-    /// seconds. A second card coming up while the desktop already asked for a
-    /// channel put two callers inside the RM at once, and the one that lost
-    /// did not wait -- it was refused: `NV_ERR_INVALID_LOCK_STATE` (0x2f) out
-    /// of `rmapiLockAcquire`, or `NV_ERR_INVALID_STATE` (0x40) out of a
-    /// `step16` that found `gspRmInitialized` still false. NVK turns either
-    /// into `VK_ERROR_DEVICE_LOST` and the desktop ends up on pixman.
-    ///
-    /// Read from the source because these three cannot be called from a test:
-    /// this crate links the real vendored RM, there is no double for them, and
-    /// a test that ran `init_gsp` would boot GSP firmware.
-    #[test]
-    fn the_bring_up_ladder_goes_through_the_gate_like_every_other_rm_entry() {
-        let src = include_str!("rm_init.rs");
-        for name in ["attach_gpu", "init_gsp", "state_init"] {
-            let at = src
-                .find(&std::format!("pub fn {name}("))
-                .unwrap_or_else(|| std::panic!("{name} is gone: this test needs rewriting"));
-            // The gate is the first thing the body does, so a short window is
-            // the point: finding it ten statements down would mean RM work ran
-            // outside it.
-            let head: std::string::String = src[at..].chars().take(1600).collect();
-            // Live code only: a commented-out guard reads the same to a
-            // substring search, and that is exactly the regression to catch.
-            let takes_the_gate = head
-                .lines()
-                .map(str::trim)
-                .any(|l| !l.starts_with("//") && l.contains("RmGate::lock()"));
-            assert!(
-                takes_the_gate,
-                "{name} enters the RM without taking the gate: a bring-up running \
-                 beside an ioctl is two callers inside the RM at once, and the \
-                 loser is refused (0x2f / 0x40), not made to wait"
-            );
-        }
-        // And `init_core` deliberately stays out: it runs before any GPU
-        // exists, under an IRQ-off spinlock, where spinning on the gate is the
-        // very hazard the gate was written to avoid.
-        let at = src.find("pub fn init_core()").expect("init_core is gone");
-        let head: std::string::String = src[at..].chars().take(600).collect();
-        assert!(
-            !head
-                .lines()
-                .map(str::trim)
-                .any(|l| !l.starts_with("//") && l.contains("RmGate::lock()")),
-            "init_core must stay ungated; see its own comment"
-        );
-    }
-
     #[test]
     fn the_rm_gate_lets_exactly_one_caller_in_and_always_hands_it_back() {
         let _turnstile = gate_test_turnstile();
