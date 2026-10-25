@@ -1789,6 +1789,9 @@ fn syscall_args(ctx: &UserContext) -> [usize; 6] {
 }
 
 #[cfg(test)]
+mod user_trap_tests;
+
+#[cfg(test)]
 mod fault_report_tests;
 
 #[cfg(test)]
@@ -2010,6 +2013,22 @@ mod loader_tests {
     }
 
     #[test]
+    fn a_frame_one_byte_past_its_mapping_is_refused() {
+        // Both tests above overshoot by 0x3f0 bytes, so an off-by-one in
+        // either bound passes them: the frame is still a long way outside.
+        // One byte is where `access_ok` is actually decided, and one byte
+        // past the top of the stack is one byte into the next mapping or
+        // into nothing at all.
+        let maps = [(STACK_BASE, STACK_TOP, true)];
+        assert!(!frame_fits_writable(&maps, STACK_TOP - 0x400 + 1, 0x400));
+        assert!(!frame_fits_writable(&maps, STACK_BASE - 1, 0x400));
+        // And one byte inside each bound still fits, so the refusals above
+        // are the bound and not a blanket no.
+        assert!(frame_fits_writable(&maps, STACK_TOP - 0x400, 0x400));
+        assert!(frame_fits_writable(&maps, STACK_BASE + 1, 0x400));
+    }
+
+    #[test]
     fn a_frame_in_a_read_only_mapping_is_refused() {
         // A program that points `sp` at its own text segment. The kernel
         // writes the frame through a raw pointer with the user page table
@@ -2159,7 +2178,7 @@ mod park_tests {
 
     use super::*;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    use zircon_object::task::Job;
+    use zircon_object::task::{Job, ThreadFn};
 
     fn noop_waker() -> Waker {
         unsafe fn clone(_: *const ()) -> RawWaker {
@@ -2299,6 +2318,141 @@ mod park_tests {
             "dos aparcadas seguidas dejan la marca puesta"
         );
         assert!(!t.tick_should_preempt());
+    }
+
+    // ---- and the other half: the state on the THREAD ---------------------
+    //
+    // Everything above drives `MarkBlocked` over a `New` thread, which is how
+    // the `parked` flag gets tested on its own: `set_blocked` refuses to move
+    // anything but `Running`, so the generic mark never takes and only the
+    // slice bookkeeping is left to look at. The cost is that nothing reached
+    // the other half of the same `poll` -- `ThreadState::Blocked`, the field
+    // `/proc/<pid>/status` and `ZX_INFO_THREAD` read. Mutation says so: the
+    // unmark on resume and the unmark in `Drop` can each be deleted whole and
+    // the four tests above stay green.
+
+    type Body = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    /// Run `body` on a thread that has been `start`ed, so it is `Running` and
+    /// the generic blocked marker DOES take on it.
+    ///
+    /// `start` stamps the thread `Running` and then calls `body`
+    /// SYNCHRONOUSLY, before the future it returns is spawned -- so the
+    /// assertions go inside `body`, where a panic is the test failing.
+    fn on_a_running_thread(body: ThreadFn) {
+        let proc = Process::create(&Job::root(), "proc").expect("un proceso");
+        Thread::create(&proc, "thread")
+            .expect("un hilo")
+            .start(body)
+            .expect("un hilo recien creado arranca");
+    }
+
+    /// Hand the `CurrentThread` back. Dropping one terminates its thread, so
+    /// it is kept alive until the body's own future runs.
+    fn gone(ct: CurrentThread) -> Body {
+        Box::pin(async move { drop(ct) })
+    }
+
+    /// A syscall that parks has to say so on the thread, and the poll that
+    /// answers has to take it back.
+    ///
+    /// Clearing only the local bool would leave the thread reading `Blocked`
+    /// while it is on the CPU: `S (sleeping)` in `/proc/<pid>/status` for a
+    /// task that is running, which is the exact confusion `set_blocked` was
+    /// added to end.
+    #[test]
+    fn a_thread_that_wakes_up_is_running_again_on_the_thread_itself() {
+        fn body(ct: CurrentThread) -> Body {
+            let t = ct.inner();
+            assert_eq!(t.state(), ThreadState::Running, "un hilo arrancado corre");
+
+            let mut fut = MarkBlocked::new(&t, ParksThenAnswers { pending: 1 });
+            let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+            assert_eq!(poll_once(fut.as_mut()), Poll::Pending);
+            assert_eq!(
+                t.state(),
+                ThreadState::Blocked,
+                "el hilo duerme en un syscall y sigue diciendo que corre"
+            );
+
+            assert_eq!(poll_once(fut.as_mut()), Poll::Ready(42));
+            assert_eq!(
+                t.state(),
+                ThreadState::Running,
+                "el hilo despierta y se queda bloqueado para siempre"
+            );
+            gone(ct)
+        }
+        on_a_running_thread(body);
+    }
+
+    /// The same unmark, owed by a syscall that never gets its second poll.
+    ///
+    /// A cancelled wait -- a `read` the thread is killed out of -- drops the
+    /// future while the mark is on the thread. The mark lives in the thread
+    /// and outlives the future, so `Drop` is the only thing that can give it
+    /// back, and a thread stuck at `Blocked` is one nothing will ever report
+    /// as running again.
+    #[test]
+    fn a_wait_cancelled_while_marked_gives_the_state_back() {
+        fn body(ct: CurrentThread) -> Body {
+            let t = ct.inner();
+            {
+                let mut fut = MarkBlocked::new(&t, ParksThenAnswers { pending: 1 });
+                let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+                assert_eq!(poll_once(fut.as_mut()), Poll::Pending);
+                assert_eq!(t.state(), ThreadState::Blocked);
+            }
+            assert_eq!(
+                t.state(),
+                ThreadState::Running,
+                "una espera cancelada deja el hilo bloqueado para siempre"
+            );
+            gone(ct)
+        }
+        on_a_running_thread(body);
+    }
+
+    /// Deferring is only half the contract: the marker must also not hand
+    /// back a state it never took.
+    ///
+    /// `set_blocked` answers whether it moved anything, and that answer is
+    /// what `marked` carries; a marker that assumes it took will unmark on the
+    /// way out and hand the thread to `Running` while whoever really owns the
+    /// wait is still in it.
+    ///
+    /// The owner is stood in for here by a bare `set_blocked(true)`, because
+    /// `Blocked` is the only state an unmark can actually move: a
+    /// `BlockedFutex` or `BlockedChannel` wait leaves a state `set_blocked`
+    /// refuses in both directions, so there the two guards hide each other.
+    /// What such a wait would lose is the `assert_eq!(inner.state, state)` on
+    /// the way out of `blocking_run`.
+    #[test]
+    fn a_marker_that_did_not_take_the_state_does_not_hand_it_back() {
+        fn body(ct: CurrentThread) -> Body {
+            let t = ct.inner();
+            // Somebody else is already waiting on this thread's behalf.
+            assert!(t.set_blocked(true), "el hilo corria, asi que la marca coge");
+
+            {
+                let mut fut = MarkBlocked::new(&t, ParksThenAnswers { pending: 1 });
+                let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+                assert_eq!(poll_once(fut.as_mut()), Poll::Pending);
+                assert_eq!(poll_once(fut.as_mut()), Poll::Ready(42));
+                assert_eq!(
+                    t.state(),
+                    ThreadState::Blocked,
+                    "el marcador generico devuelve un estado que no cogio"
+                );
+            }
+            assert_eq!(
+                t.state(),
+                ThreadState::Blocked,
+                "y su Drop lo devuelve igual"
+            );
+            gone(ct)
+        }
+        on_a_running_thread(body);
     }
 }
 
@@ -2663,5 +2817,76 @@ mod syscall_restart_tests {
         // `0f 05`; `svc #0` and `ecall` are one 32-bit word.
         let expected = if cfg!(target_arch = "x86_64") { 2 } else { 4 };
         assert_eq!(Interrupted::SYSCALL_INSN_LEN, expected);
+    }
+
+    // ---- the two registers readers everything above is fed from -----------
+    //
+    // `read_cut_short` fills three argument registers and leaves the other
+    // three at zero, which is enough to decide whether a `read` is made
+    // again but says nothing about WHICH register each argument came out of.
+    // Seven distinct values do.
+
+    /// Seven values that cannot be mistaken for one another: the syscall
+    /// number and its six arguments.
+    const NUM: usize = 0x77;
+    const SIX: [usize; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+
+    /// A context as a syscall arrives in it, with every register the two
+    /// readers look at holding a value of its own.
+    fn a_call_with_distinct_registers() -> UserContext {
+        let mut ctx = UserContext::default();
+        let regs = ctx.general_mut();
+        cfg_if! {
+            if #[cfg(target_arch = "x86_64")] {
+                regs.rax = NUM;
+                (regs.rdi, regs.rsi, regs.rdx) = (SIX[0], SIX[1], SIX[2]);
+                (regs.r10, regs.r8, regs.r9) = (SIX[3], SIX[4], SIX[5]);
+                // What the `syscall` instruction itself left in `rcx`: the
+                // address to come back to. Not an argument, and the value
+                // that gets read instead when the fourth one is taken from
+                // the C calling convention by mistake.
+                regs.rcx = 0x40_1002;
+            } else if #[cfg(target_arch = "aarch64")] {
+                regs.x8 = NUM;
+                (regs.x0, regs.x1, regs.x2) = (SIX[0], SIX[1], SIX[2]);
+                (regs.x3, regs.x4, regs.x5) = (SIX[3], SIX[4], SIX[5]);
+            } else if #[cfg(target_arch = "riscv64")] {
+                regs.a7 = NUM;
+                (regs.a0, regs.a1, regs.a2) = (SIX[0], SIX[1], SIX[2]);
+                (regs.a3, regs.a4, regs.a5) = (SIX[3], SIX[4], SIX[5]);
+            }
+        }
+        ctx
+    }
+
+    /// The number comes from a register of its own, not from an argument.
+    ///
+    /// On x86_64 that register is `rax`, which is also where the result goes
+    /// -- the reason `Interrupted` has to put the number back to make a call
+    /// again at all.
+    #[test]
+    fn the_syscall_number_comes_from_its_own_register() {
+        let ctx = a_call_with_distinct_registers();
+        assert_eq!(syscall_num(&ctx), NUM);
+        assert!(
+            !SIX.contains(&syscall_num(&ctx)),
+            "the number was read out of an argument register"
+        );
+    }
+
+    /// The six arguments, in order, each from the register the Linux syscall
+    /// ABI puts it in.
+    ///
+    /// On x86_64 the fourth travels in `r10`, NOT in `rcx`: the `syscall`
+    /// instruction overwrites `rcx` with the return address, which is why
+    /// Linux moves that one argument off the C calling convention. Reading
+    /// `rcx` here would hand every four-argument syscall -- `openat`,
+    /// `sendto`, `futex`, `ppoll` -- a code address where its fourth
+    /// argument belongs, and these are the values `Interrupted::after`
+    /// decides on.
+    #[test]
+    fn the_six_argument_registers_are_read_in_abi_order() {
+        let ctx = a_call_with_distinct_registers();
+        assert_eq!(syscall_args(&ctx), SIX);
     }
 }

@@ -690,6 +690,30 @@ impl UserContext {
         Self(context)
     }
 
+    /// An empty context that carries the raw x86 trap cause `trap_num` with
+    /// `error_code`, so [`Self::trap_reason`] reports the trap it names.
+    ///
+    /// x86_64 only, and that is the fact rather than an omission: here the
+    /// cause is saved in the frame by the trap entry, so it can be put there.
+    /// On RISC-V `trap_reason` reads `scause` -- a live CSR of the hart, not
+    /// anything the frame holds -- and on AArch64 the syndrome comes from
+    /// `ESR_EL1`, so neither has a frame to write the cause into.
+    ///
+    /// For the layers above, which read the reason off a context and route on
+    /// it: the trap router in `zcore-loader` turns each cause into a signal,
+    /// and there is no other way to hand it one to decide about.
+    /// `PAGE_FAULT_VECTOR` is the exception -- decoding it reads `CR2` for the
+    /// faulting address, which is the live register of whoever is running --
+    /// so a context built with vector 14 says nothing about any fault.
+    #[cfg(target_arch = "x86_64")]
+    pub fn with_raw_trap(trap_num: usize, error_code: usize) -> Self {
+        Self(UserContextInner {
+            trap_num,
+            error_code,
+            ..Default::default()
+        })
+    }
+
     /// Initialize the context for entry into userspace.
     /// Note: if the number of args < 3, please fill with zeros
     /// Eg: ctx.setup_uspace(pc_, sp_, &[arg1, arg2, 0])
