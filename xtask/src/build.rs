@@ -52,6 +52,9 @@ pub(crate) struct GdbArgs {
     port: u16,
 }
 
+#[cfg(test)]
+mod tests;
+
 static INNER: Lazy<PathBuf> = Lazy::new(|| PROJECT_DIR.join("zCore"));
 
 pub(crate) struct BuildConfig {

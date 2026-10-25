@@ -7,6 +7,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug)]
 pub struct MachineConfig {
     pub manufacturer: String,
