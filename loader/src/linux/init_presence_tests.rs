@@ -133,26 +133,43 @@ fn a_dangling_init_symlink_counts_as_not_installed() {
 /// The hop bound is reachable: a chain as long as the budget still
 /// resolves, so the bound is not spent before a real `/sbin/init` ->
 /// `/bin/busybox` -> ... chain is walked.
+///
+/// The counts here are written out as 8 and 9 rather than taken from
+/// `FOLLOW_LINK_DEPTH`, on purpose: a test that derives both sides from the
+/// constant pins only that the call site passes the constant, and goes on
+/// passing when the constant itself changes. Spelled out, the pair pins the
+/// number a boot really gets -- and a deliberate change to the bound is
+/// meant to show up here.
 #[test]
-fn a_chain_of_links_up_to_the_hop_bound_resolves() {
-    let fs = a_chain_of(FOLLOW_LINK_DEPTH);
+fn a_chain_of_eight_links_resolves() {
+    let fs = a_chain_of(8);
     assert!(
         program_exists("/l0", &None, &fs),
-        "{} hops is within the budget",
-        FOLLOW_LINK_DEPTH
+        "eight hops is what FOLLOW_LINK_DEPTH budgets for"
     );
 }
 
-/// And it binds: one hop more is not followed. Together with the test above
-/// this pins `FOLLOW_LINK_DEPTH` to a number the walk really uses, rather
-/// than to a constant nobody reads.
+/// And it binds: one hop more is not followed.
 #[test]
-fn a_chain_one_hop_longer_than_the_bound_does_not_resolve() {
-    let fs = a_chain_of(FOLLOW_LINK_DEPTH + 1);
+fn a_chain_of_nine_links_does_not_resolve() {
+    let fs = a_chain_of(9);
     assert!(
         !program_exists("/l0", &None, &fs),
-        "{} hops is one too many",
-        FOLLOW_LINK_DEPTH + 1
+        "nine hops is one past the budget"
+    );
+}
+
+/// And the call site passes the bound rather than some other number, which
+/// is the half the two counts above cannot see.
+#[test]
+fn the_bound_the_exec_lookup_spends_is_the_one_named_for_it() {
+    assert!(
+        program_exists("/l0", &None, &a_chain_of(FOLLOW_LINK_DEPTH)),
+        "a chain of FOLLOW_LINK_DEPTH hops resolves"
+    );
+    assert!(
+        !program_exists("/l0", &None, &a_chain_of(FOLLOW_LINK_DEPTH + 1)),
+        "and one more does not"
     );
 }
 
@@ -164,6 +181,23 @@ fn a_symlink_loop_answers_no_instead_of_walking_forever() {
     symlink(&fs, "init", "/sbin-init");
     symlink(&fs, "sbin-init", "/init");
     assert!(!program_exists("/init", &None, &fs));
+}
+
+/// An empty program name resolves to the root directory, not to nothing.
+///
+/// That is why `run_init_if_present` checks it by hand rather than leaning
+/// on the lookup: without the guard, `INIT=` with nothing after it in
+/// `rboot.conf` reaches `spawn`, which initialises the network and the
+/// hunter policy and creates pid 1 before it discovers that the "binary" is
+/// a directory.
+#[test]
+fn an_empty_program_name_resolves_to_the_root_and_not_to_nothing() {
+    let fs = an_fs();
+    file(&fs, "bin", "busybox");
+    assert!(
+        program_exists("", &None, &fs),
+        "the empty path is the root, and the root exists"
+    );
 }
 
 /// An empty command line is no init at all, and the refusal comes before
