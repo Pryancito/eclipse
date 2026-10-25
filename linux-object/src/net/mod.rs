@@ -94,7 +94,7 @@ pub fn ipv6_link_local_from_mac(mac: &EthernetAddress) -> smoltcp::wire::Ipv6Add
 
 /// Ensure every Ethernet iface has a link-local IPv6 address (required by DHCPv6).
 pub fn ensure_ipv6_link_local(iface: &dyn zcore_drivers::scheme::NetScheme) {
-    if iface.get_ifname() == "loopback" {
+    if iface.is_loopback() {
         return;
     }
     let expected = ipv6_link_local_from_mac(&iface.get_mac());
@@ -110,7 +110,7 @@ pub fn ensure_ipv6_link_local(iface: &dyn zcore_drivers::scheme::NetScheme) {
         info!(
             "[net] ensured link-local {} on {}",
             expected,
-            iface.get_ifname()
+            iface.ifname()
         );
     }
 }
@@ -118,7 +118,7 @@ pub fn ensure_ipv6_link_local(iface: &dyn zcore_drivers::scheme::NetScheme) {
 pub fn iface_by_name(ifname: &str) -> LxResult<Arc<dyn zcore_drivers::scheme::NetScheme>> {
     get_net_device()
         .into_iter()
-        .find(|iface| iface.get_ifname() == ifname)
+        .find(|iface| iface.ifname() == ifname)
         .ok_or(LxError::ENODEV)
 }
 
@@ -140,7 +140,7 @@ pub fn netdev_for_ipv4(
     use smoltcp::wire::IpCidr;
     let mut best: Option<(u8, Arc<dyn zcore_drivers::scheme::NetScheme>)> = None;
     for iface in get_net_device().iter() {
-        if iface.get_ifname() == "loopback" {
+        if iface.is_loopback() {
             continue;
         }
         for ip in iface.get_ip_address() {
@@ -165,7 +165,7 @@ pub fn netdev_for_ipv4(
         return Ok(dev);
     }
     for iface in get_net_device().iter() {
-        if iface.get_ifname() == "loopback" {
+        if iface.is_loopback() {
             continue;
         }
         let has_v4 = iface.get_ip_address().iter().any(|ip| {
@@ -189,7 +189,7 @@ pub fn netdev_for_ipv6(
     use smoltcp::wire::IpCidr;
     let mut best: Option<(u8, Arc<dyn zcore_drivers::scheme::NetScheme>)> = None;
     for iface in get_net_device().iter() {
-        if iface.get_ifname() == "loopback" {
+        if iface.is_loopback() {
             continue;
         }
         for ip in iface.get_ip_address() {
@@ -209,7 +209,7 @@ pub fn netdev_for_ipv6(
         return Ok(dev);
     }
     for iface in get_net_device().iter() {
-        if iface.get_ifname() == "loopback" {
+        if iface.is_loopback() {
             continue;
         }
         let has_v6 = iface.get_ip_address().iter().any(|ip| {
@@ -818,7 +818,7 @@ pub fn prepare_ipv4_stack() {
         return;
     }
     for dev in get_net_device().iter() {
-        if dev.get_ifname() != "loopback" {
+        if !dev.is_loopback() {
             ensure_ipv4_default_route(dev.as_ref());
         }
     }
@@ -1147,14 +1147,14 @@ pub extern "C" fn drivers_net_drain() {
 /// miss doc
 pub fn poll_ifaces() {
     NET_DRAIN_READY.store(true, Ordering::Relaxed);
-    for iface in get_net_device().iter() {
+    kernel_hal::net::for_each_net_device(|iface| {
         match iface.poll() {
             Ok(_) => {}
             Err(e) => {
                 warn!("error : {:?}", e)
             }
         }
-    }
+    });
     if zcore_drivers::net::loopback::take_loopback_moved() {
         kernel_hal::net::wake_net_rx_waiters_now();
     }
@@ -1171,11 +1171,11 @@ pub fn poll_netdev(dev: &dyn zcore_drivers::scheme::NetScheme) {
 /// Pull RX from every non-loopback NIC into `push_packet` / `icmp_rx` (no throttle).
 pub fn drain_all_nic_rx() {
     kernel_hal::deferred_job::drain_deferred_jobs();
-    for dev in get_net_device().iter() {
-        if dev.get_ifname() != "loopback" {
-            netdev_drain_rx(dev.as_ref());
+    kernel_hal::net::for_each_net_device(|dev| {
+        if !dev.is_loopback() {
+            netdev_drain_rx(dev);
         }
-    }
+    });
 }
 
 /// Copy RX frames from the NIC ring into AF_PACKET (`push_packet`).
@@ -1868,7 +1868,7 @@ pub fn handle_net_ioctl(
             let ifname = ifreq_name(&ifr.ifr_name)?;
             let ifaces = get_net_device();
             for (i, iface) in ifaces.iter().enumerate() {
-                if iface.get_ifname() == ifname {
+                if iface.ifname() == ifname {
                     ifr.ifr_ifru = IfReqUnion {
                         ifindex: (i + 1) as i32,
                     };

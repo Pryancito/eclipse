@@ -272,7 +272,7 @@ impl Socket for PacketSocketState {
                     }
                 } else {
                     for net in get_net_device().iter() {
-                        if net.get_ifname() != "loopback" {
+                        if !net.is_loopback() {
                             poll_net(net.as_ref());
                         }
                     }
@@ -341,7 +341,7 @@ impl Socket for PacketSocketState {
             crate::net::netdev_for_ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED).or_else(|_| {
                 get_net_device()
                     .into_iter()
-                    .find(|n| n.get_ifname() != "loopback")
+                    .find(|n| !n.is_loopback())
                     .ok_or(LxError::ENODEV)
             })?
         };
@@ -465,7 +465,7 @@ impl Socket for PacketSocketState {
             }
         } else {
             for net in get_net_device().iter() {
-                if net.get_ifname() != "loopback" {
+                if !net.is_loopback() {
                     drive_packet_rx(net.as_ref());
                 }
             }
@@ -476,7 +476,7 @@ impl Socket for PacketSocketState {
         } else {
             get_net_device()
                 .into_iter()
-                .find(|n| n.get_ifname() != "loopback")
+                .find(|n| !n.is_loopback())
         };
         let writable = dev.as_ref().is_some_and(|d| d.can_send());
         (readable, writable, false)

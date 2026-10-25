@@ -235,7 +235,7 @@ fn apply(router_ll: Ipv6Address, router_lifetime: u16, prefix: Option<PrefixInfo
     // first Ethernet device — correct for the common single-NIC case.
     let iface = match get_net_device()
         .into_iter()
-        .find(|d| d.get_ifname() != "loopback")
+        .find(|d| !d.is_loopback())
     {
         Some(d) => d,
         None => return,

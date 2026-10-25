@@ -374,6 +374,12 @@ mod tests {
         fn get_mac(&self) -> smoltcp::wire::EthernetAddress {
             smoltcp::wire::EthernetAddress([0; 6])
         }
+        fn ifname(&self) -> &str {
+            "stub0"
+        }
+        fn is_loopback(&self) -> bool {
+            false
+        }
         fn get_ifname(&self) -> String {
             String::from("stub0")
         }

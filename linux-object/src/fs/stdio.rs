@@ -2246,14 +2246,14 @@ impl INode for Stdin {
                     // Cancellable VTIME timer so `dd`/`read` with min 0 time N
                     // return after N deciseconds instead of blocking forever.
                     let dl_ns = this.stdin.vtime_deadline_ns.load(Ordering::Acquire);
-                    if dl_ns != 0 {
-                        if !kernel_hal::timer_waker::ensure_timer_waker(
+                    if dl_ns != 0
+                        && !kernel_hal::timer_waker::ensure_timer_waker(
                             &mut this.timer,
                             Duration::from_nanos(dl_ns),
                             cx,
-                        ) {
-                            cx.waker().wake_by_ref();
-                        }
+                        )
+                    {
+                        cx.waker().wake_by_ref();
                     }
                     this.armed = true;
                 }

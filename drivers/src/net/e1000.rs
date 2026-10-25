@@ -616,6 +616,14 @@ impl NetScheme for E1000Interface {
         self.iface.lock().ethernet_addr()
     }
 
+    fn ifname(&self) -> &str {
+        &self.name
+    }
+
+    fn is_loopback(&self) -> bool {
+        false
+    }
+
     fn get_ifname(&self) -> String {
         self.name.clone()
     }

@@ -3904,7 +3904,7 @@ fn proc_net_arp_content() -> String {
         } else {
             kernel_hal::net::get_net_device()
                 .iter()
-                .find(|d| d.get_ifname() != "loopback")
+                .find(|d| !d.is_loopback())
                 .map(|d| d.get_ifname())
                 .unwrap_or_else(|| "eth0".into())
         };

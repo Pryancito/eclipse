@@ -35,7 +35,7 @@ hal_fn_impl! {
         }
 
         fn virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
-            assert!(vaddr >= PMEM_MAP_VADDR && vaddr < PMEM_MAP_VADDR + PMEM_SIZE);
+            assert!((PMEM_MAP_VADDR..PMEM_MAP_VADDR + PMEM_SIZE).contains(&vaddr));
             vaddr - PMEM_MAP_VADDR
         }
 

@@ -33,7 +33,17 @@ pub trait NetScheme: Scheme {
         true
     }
     fn get_mac(&self) -> EthernetAddress;
-    fn get_ifname(&self) -> String;
+    /// Returns the interface name as a string slice without allocating heap memory.
+    fn ifname(&self) -> &str {
+        ""
+    }
+    /// Returns whether this interface is loopback without allocating heap memory.
+    fn is_loopback(&self) -> bool {
+        self.ifname() == "loopback"
+    }
+    fn get_ifname(&self) -> String {
+        self.ifname().into()
+    }
     fn get_ip_address(&self) -> Vec<IpCidr>;
     fn set_ipv4_address(&self, _cidr: Ipv4Cidr) -> DeviceResult {
         Err(DeviceError::NotSupported)
@@ -121,6 +131,12 @@ mod tests {
         }
         fn get_mac(&self) -> EthernetAddress {
             EthernetAddress([0x02, 0, 0, 0, 0, 1])
+        }
+        fn ifname(&self) -> &str {
+            "bare0"
+        }
+        fn is_loopback(&self) -> bool {
+            false
         }
         fn get_ifname(&self) -> String {
             String::from("bare0")
@@ -254,5 +270,77 @@ mod tests {
         let c = r.clone();
         assert!(c.gateway.is_none());
         assert_eq!(c.dst, v4(192, 168, 1, 0, 24));
+    }
+
+    struct DefaultNic;
+    impl Scheme for DefaultNic {
+        fn name(&self) -> &str {
+            "default-nic"
+        }
+    }
+    impl NetScheme for DefaultNic {
+        fn recv(&self, _buf: &mut [u8]) -> DeviceResult<usize> {
+            Ok(0)
+        }
+        fn send(&self, _buf: &[u8]) -> DeviceResult<usize> {
+            Ok(0)
+        }
+        fn get_mac(&self) -> EthernetAddress {
+            EthernetAddress::default()
+        }
+        fn get_ip_address(&self) -> Vec<IpCidr> {
+            Vec::new()
+        }
+        fn poll(&self) -> DeviceResult {
+            Ok(())
+        }
+    }
+
+    struct MockLoopback;
+    impl Scheme for MockLoopback {
+        fn name(&self) -> &str {
+            "loopback"
+        }
+    }
+    impl NetScheme for MockLoopback {
+        fn recv(&self, _buf: &mut [u8]) -> DeviceResult<usize> {
+            Ok(0)
+        }
+        fn send(&self, _buf: &[u8]) -> DeviceResult<usize> {
+            Ok(0)
+        }
+        fn get_mac(&self) -> EthernetAddress {
+            EthernetAddress::default()
+        }
+        fn ifname(&self) -> &str {
+            "loopback"
+        }
+        fn is_loopback(&self) -> bool {
+            true
+        }
+        fn get_ip_address(&self) -> Vec<IpCidr> {
+            Vec::new()
+        }
+        fn poll(&self) -> DeviceResult {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ifname_and_is_loopback_contract() {
+        let bare = BareNic;
+        assert_eq!(bare.ifname(), "bare0");
+        assert_eq!(bare.get_ifname(), "bare0");
+        assert!(!bare.is_loopback());
+
+        let lo = MockLoopback;
+        assert_eq!(lo.ifname(), "loopback");
+        assert_eq!(lo.get_ifname(), "loopback");
+        assert!(lo.is_loopback());
+
+        let def = DefaultNic;
+        assert_eq!(def.ifname(), "");
+        assert_eq!(def.get_ifname(), "");
+        assert!(!def.is_loopback());
     }
 }

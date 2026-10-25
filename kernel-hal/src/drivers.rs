@@ -132,7 +132,16 @@ impl AllDeviceList {
             Device::Display(d) => self.display.add(d),
             Device::Input(d) => self.input.add(d),
             Device::Irq(d) => self.irq.add(d),
-            Device::Net(d) => self.net.add(d),
+            Device::Net(d) => {
+                let mut list = self.net.0.write();
+                if d.is_loopback() {
+                    list.push(d);
+                } else {
+                    // Real NICs go before loopback so index 0 is first Ethernet.
+                    let pos = list.iter().position(|x| x.is_loopback()).unwrap_or(list.len());
+                    list.insert(pos, d);
+                }
+            }
             Device::Uart(d) => self.uart.add(d),
             Device::Drm(d) => self.drm.add(d),
             Device::DrmDisplay(drm, display) => {
@@ -1310,6 +1319,53 @@ mod registry_tests {
         }
     }
 
+    struct FakeNet {
+        name: String,
+        is_loopback: bool,
+    }
+    impl Scheme for FakeNet {
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+    impl NetScheme for FakeNet {
+        fn recv(&self, _buf: &mut [u8]) -> DeviceResult<usize> {
+            Ok(0)
+        }
+        fn send(&self, _buf: &[u8]) -> DeviceResult<usize> {
+            Ok(0)
+        }
+        fn get_mac(&self) -> smoltcp::wire::EthernetAddress {
+            smoltcp::wire::EthernetAddress::default()
+        }
+        fn ifname(&self) -> &str {
+            &self.name
+        }
+        fn is_loopback(&self) -> bool {
+            self.is_loopback
+        }
+        fn get_ip_address(&self) -> Vec<smoltcp::wire::IpCidr> {
+            Vec::new()
+        }
+        fn poll(&self) -> DeviceResult {
+            Ok(())
+        }
+    }
+
+    fn net_nic(name: &str) -> Arc<dyn NetScheme> {
+        Arc::new(FakeNet {
+            name: String::from(name),
+            is_loopback: false,
+        })
+    }
+
+    fn net_loopback() -> Arc<dyn NetScheme> {
+        Arc::new(FakeNet {
+            name: String::from("loopback"),
+            is_loopback: true,
+        })
+    }
+
     // ── DeviceList, on lists of its own ─────────────────────────────────────
 
     #[test]
@@ -1483,6 +1539,47 @@ mod registry_tests {
         assert!(all.remove_device(&Device::Block(disk)));
         assert!(all.block.as_vec().is_empty());
         assert_eq!(all.display.as_vec().len(), 1);
+    }
+
+    #[test]
+    fn orden_dispositivos_red_reales_primero_loopback_al_final() {
+        // Caso 1: Registrar loopback primero, luego NICs reales
+        let all1 = AllDeviceList::default();
+        all1.add_device(Device::Net(net_loopback()));
+        all1.add_device(Device::Net(net_nic("eth0")));
+        all1.add_device(Device::Net(net_nic("eth1")));
+
+        let devs1 = all1.net.as_vec();
+        assert_eq!(devs1.len(), 3);
+        assert_eq!(devs1[0].ifname(), "eth0");
+        assert_eq!(devs1[1].ifname(), "eth1");
+        assert_eq!(devs1[2].ifname(), "loopback");
+        drop(devs1);
+
+        // Caso 2: Registrar NICs reales primero, luego loopback
+        let all2 = AllDeviceList::default();
+        all2.add_device(Device::Net(net_nic("eth0")));
+        all2.add_device(Device::Net(net_nic("eth1")));
+        all2.add_device(Device::Net(net_loopback()));
+
+        let devs2 = all2.net.as_vec();
+        assert_eq!(devs2.len(), 3);
+        assert_eq!(devs2[0].ifname(), "eth0");
+        assert_eq!(devs2[1].ifname(), "eth1");
+        assert_eq!(devs2[2].ifname(), "loopback");
+        drop(devs2);
+
+        // Caso 3: Intercalados (eth0, loopback, eth1)
+        let all3 = AllDeviceList::default();
+        all3.add_device(Device::Net(net_nic("eth0")));
+        all3.add_device(Device::Net(net_loopback()));
+        all3.add_device(Device::Net(net_nic("eth1")));
+
+        let devs3 = all3.net.as_vec();
+        assert_eq!(devs3.len(), 3);
+        assert_eq!(devs3[0].ifname(), "eth0");
+        assert_eq!(devs3[1].ifname(), "eth1");
+        assert_eq!(devs3[2].ifname(), "loopback");
     }
 
     // ── primary_irq's one-shot cache ────────────────────────────────────────

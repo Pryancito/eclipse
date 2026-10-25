@@ -85,9 +85,16 @@ pub fn wake_net_rx_waiters() {}
 pub fn wake_net_rx_waiters_now() {}
 
 pub fn get_net_device() -> Vec<Arc<dyn NetScheme>> {
-    let mut devices = all_net().as_vec().clone();
-    devices.sort_by_key(|d| if d.get_ifname() == "loopback" { 1 } else { 0 });
-    devices
+    all_net().as_vec().clone()
+}
+
+/// Run a closure over every network device without allocating a `Vec` on the heap.
+/// Real NICs are visited first, loopback last.
+pub fn for_each_net_device<F: FnMut(&dyn NetScheme)>(mut f: F) {
+    let devices = all_net().as_vec();
+    for dev in devices.iter() {
+        f(dev.as_ref());
+    }
 }
 
 pub struct NetRxOrTimeoutFuture {

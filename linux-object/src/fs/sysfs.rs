@@ -2262,7 +2262,7 @@ impl INode for SysNetIfaceINode {
             "address" => {
                 let mac = get_net_device()
                     .iter()
-                    .find(|i| i.get_ifname() == self.name)
+                    .find(|i| i.ifname() == self.name)
                     .map(|i| i.get_mac())
                     .unwrap_or_default();
                 let bytes = mac.as_bytes();

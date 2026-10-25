@@ -264,7 +264,7 @@ impl Socket for NetlinkSocketState {
                         };
                         msg.push_ext(new_header);
 
-                        let is_loopback = iface.get_ifname() == "loopback";
+                        let is_loopback = iface.is_loopback();
                         let ifi_type = if is_loopback {
                             ARPHRD_LOOPBACK
                         } else {
