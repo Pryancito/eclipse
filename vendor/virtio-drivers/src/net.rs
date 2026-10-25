@@ -281,6 +281,38 @@ mod tests {
         )
     }
 
+    /// The driver's acknowledgement has to reach the DEVICE's register, not
+    /// just answer the caller.
+    ///
+    /// `VirtIONet::ack_interrupt` is one line over the header's, and the
+    /// header's own is already under test -- but the line in between is what
+    /// the interrupt handler calls, and a wrapper that returned the right
+    /// `bool` without writing `InterruptACK` would leave the device's line
+    /// asserted for ever. On a level-triggered interrupt that is the machine
+    /// re-entering the handler until it stops doing anything else, and every
+    /// test of the receive path still passes, because they complete descriptors
+    /// by hand and never raise the line.
+    #[test]
+    fn acknowledging_an_interrupt_reaches_the_devices_own_register() {
+        let (mut net, _ring) = driver();
+
+        assert!(
+            !net.ack_interrupt(),
+            "it acknowledged an interrupt nobody raised"
+        );
+        assert_eq!(net.header.fake_interrupt_ack(), 0);
+
+        // Both bits a virtio device has: a used-ring notification and a
+        // configuration change.
+        net.header.fake_raise_interrupt(0b11);
+        assert!(net.ack_interrupt(), "it did not see the interrupt");
+        assert_eq!(
+            net.header.fake_interrupt_ack(),
+            0b11,
+            "the acknowledgement did not reach the device, or dropped a bit"
+        );
+    }
+
     /// The device side of one receive: wait for the driver to offer a chain,
     /// write `frame` into it after the 10-byte header, and complete it with a
     /// length of the device's choosing.
