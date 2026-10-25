@@ -160,7 +160,7 @@ pub fn va_space_device(
         return Err(NV_ERR_INVALID_ARGUMENT);
     }
     let mut h_device = 0;
-    let _scope = CallScope::enter(caller.gpu_mask, caller.admin);
+    let _scope = CallScope::enter(caller);
     let status = unsafe {
         eclipse_rm_frontend_uvm_va_space(
             caller.os_info as *mut c_void,
@@ -201,7 +201,7 @@ pub fn map_external(caller: &Caller, m: &ExternalMapping) -> Result<u32, NV_STAT
         return Err(NV_ERR_INVALID_ARGUMENT);
     }
     let mut h_virtual = 0;
-    let _scope = CallScope::enter(caller.gpu_mask, caller.admin);
+    let _scope = CallScope::enter(caller);
     let status = unsafe {
         eclipse_rm_frontend_uvm_map(
             caller.os_info as *mut c_void,
@@ -230,7 +230,7 @@ pub fn free(caller: &Caller, h_client: u32, h_object: u32) -> NV_STATUS {
     if caller.os_info == 0 {
         return NV_ERR_INVALID_ARGUMENT;
     }
-    let _scope = CallScope::enter(caller.gpu_mask, caller.admin);
+    let _scope = CallScope::enter(caller);
     unsafe {
         eclipse_rm_frontend_uvm_free(
             caller.os_info as *mut c_void,
@@ -262,7 +262,7 @@ pub fn sked_reflected(caller: &Caller, r: &SkedRange) -> Result<(u32, u32), NV_S
         return Err(NV_ERR_INVALID_ARGUMENT);
     }
     let (mut h_memory, mut h_virtual) = (0, 0);
-    let _scope = CallScope::enter(caller.gpu_mask, caller.admin);
+    let _scope = CallScope::enter(caller);
     let status = unsafe {
         eclipse_rm_frontend_uvm_sked(
             caller.os_info as *mut c_void,
@@ -307,7 +307,7 @@ pub fn pages(
     }
     let _lent = Lent::new(pages);
     let mut h_memory = 0;
-    let _scope = CallScope::enter(caller.gpu_mask, caller.admin);
+    let _scope = CallScope::enter(caller);
     let status = unsafe {
         eclipse_rm_frontend_uvm_pages(
             caller.os_info as *mut c_void,

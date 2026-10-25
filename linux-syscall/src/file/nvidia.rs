@@ -7,11 +7,18 @@
 //! effective uid of 0 makes the caller `RS_PRIV_LEVEL_USER_ROOT`. Everything
 //! else is `linux_object::fs::devfs::nvidia`, but for the one thing mmap
 //! needs to know here: whether the mapping is read-only.
+//!
+//! The caller's pid and name come from here too, and go all the way into the
+//! RM: `client.c` files every client it makes under
+//! `osGetCurrentProcess()`, and that pid is the whole of what
+//! `NV2080_CTRL_CMD_GPU_GET_PIDS` -- the control NVML asks for
+//! `nvidia-smi`'s "Processes" table -- has to answer with.
 
 use super::*;
-use linux_object::fs::devfs::nvidia::{gpu_mask, pin_user_pages, NvCaller};
+use linux_object::fs::devfs::nvidia::{caller_name, gpu_mask, pin_user_pages, NvCaller};
 use linux_object::fs::devfs::nvidia_uvm::UvmOpen;
 use linux_object::fs::devfs::NvidiaOpen;
+use linux_object::thread::ThreadExt;
 
 impl Syscall<'_> {
     /// `Some` when `file_like` is an open of an NVIDIA node, with the ioctl's
@@ -42,11 +49,19 @@ impl Syscall<'_> {
         let open_of_fd = |fd: i32| Some(proc.get_file(fd.into()).ok()?.inode());
         let vmar = self.zircon_process().vmar();
         let pin = |va: usize, count: usize, write: bool| pin_user_pages(&vmar, va, count, write);
+        let zircon = self.zircon_process();
+        // `current->comm` when the process set one (`prctl(PR_SET_NAME)`, or
+        // the exec that cut it from the name it ran), and the process's own
+        // name otherwise, which is what /proc falls back to.
+        let comm = self.thread.lock_linux().comm.clone();
+        let name = if comm.is_empty() { zircon.name() } else { comm };
         let caller = NvCaller {
             admin: proc.euid() == 0,
             gpu_mask: &mask,
             open_of_fd: &open_of_fd,
             pin_user_pages: &pin,
+            pid: zircon.id() as u32,
+            name: caller_name(&name),
         };
         match (uvm, open) {
             (Some(uvm), _) => {

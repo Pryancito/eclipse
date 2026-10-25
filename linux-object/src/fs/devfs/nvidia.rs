@@ -59,7 +59,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::Waker;
 
 use kernel_hal::user::{UserInPtr, UserOutPtr};
@@ -105,6 +105,17 @@ pub mod esc {
     pub const SYS_PARAMS: u32 = 214;
     pub const NUMA_INFO: u32 = 215;
     pub const WAIT_OPEN_COMPLETE: u32 = 218;
+}
+
+/// `TASK_COMM_LEN`: the room a caller's name has, NUL included, which is
+/// what Linux's `os_get_current_process_name` answers out of
+/// `current->comm`.
+pub use nvctl::CALLER_NAME_LEN;
+
+/// A caller's name for [`NvCaller::name`], cut to the room there is and
+/// NUL-padded, so the RM's `%s` always finds a terminator.
+pub fn caller_name(name: &str) -> [u8; CALLER_NAME_LEN] {
+    nvctl::Caller::name_of(name.as_bytes())
 }
 
 /// `NV_ABSOLUTE_MAX_IOCTL_SIZE` (nv.h): the largest payload XFER may name.
@@ -317,6 +328,14 @@ pub struct NvCaller<'a> {
     /// `(address, pages, for writing)` of the caller's memory, pinned
     /// ([`pin_user_pages`]), for RM_ALLOC_MEMORY of an OS descriptor.
     pub pin_user_pages: &'a dyn Fn(usize, usize, bool) -> LxResult<nvctl::UserPages>,
+    /// The calling process's pid. The RM files every client it makes during
+    /// the call under it (`RmClient::ProcID`), and that is the only thing
+    /// `NV2080_CTRL_CMD_GPU_GET_PIDS` -- `nvidia-smi`'s "Processes" table --
+    /// has to answer with.
+    pub pid: u32,
+    /// The calling process's name (`current->comm`), which the RM keeps on
+    /// the client beside the pid.
+    pub name: [u8; nvctl::CALLER_NAME_LEN],
 }
 
 /// Serialises REGISTER_FD's check-and-link, which Linux runs under the RM
@@ -626,7 +645,12 @@ impl NvidiaOpen {
                     no_rm_yet();
                     return Err(LxError::EINVAL);
                 }
-                escape_result(nr, nvctl::rm_escape(nr, payload, &self.rm_caller(caller)))
+                let rm_caller = self.rm_caller(caller);
+                let status = nvctl::rm_escape(nr, payload, &rm_caller);
+                if nr == esc::RM_CONTROL {
+                    note_process_query(payload, &rm_caller, status);
+                }
+                escape_result(nr, status)
             }
             esc::RM_MAP_MEMORY => self.map_memory(payload, caller),
             esc::ALLOC_OS_EVENT | esc::FREE_OS_EVENT | esc::RM_GET_EVENT_DATA => {
@@ -686,6 +710,8 @@ impl NvidiaOpen {
             ctl: self.is_ctl(),
             admin: caller.admin,
             gpu_mask: (caller.gpu_mask)(),
+            pid: caller.pid,
+            name: caller.name,
         }
     }
 
@@ -1179,6 +1205,69 @@ fn status_code(payload: &mut [u8], cards: &[nvctl::Card]) -> LxResult<()> {
     };
     put_u32(payload, 8, status);
     Ok(())
+}
+
+/// `NVOS54_PARAMETERS` (nvos.h), RM_CONTROL's payload: `cmd` after the two
+/// handles, then the flags, the user pointer to the control's own
+/// parameters, their size and the status.
+const CONTROL_CMD: usize = 8;
+const CONTROL_SIZE: usize = 32;
+
+/// `NV2080_CTRL_CMD_GPU_GET_PIDS` and `NV2080_CTRL_CMD_GPU_GET_PID_INFO`
+/// (ctrl2080gpu.h): the two controls NVML asks for `nvidia-smi`'s
+/// "Processes" table. The first answers with the `ProcID` of every client
+/// that holds a channel on the GPU, the second with how much memory one of
+/// those pids has.
+const GPU_GET_PIDS: u32 = 0x2080_018d;
+const GPU_GET_PID_INFO: u32 = 0x2080_018e;
+
+/// One log line the first time each of the two process-table controls is
+/// asked for, and one more the first time each is refused. The table was
+/// empty on hardware for want of a pid -- every client the RM made was
+/// filed under 0, because `osGetCurrentProcess` answered 0 -- and this is
+/// how a boot says whether NVML asks these two at all and whether the RM
+/// answers them, which no amount of reading the port can say.
+fn note_process_query(payload: &[u8], caller: &nvctl::Caller, status: u32) {
+    let Some((which, name)) = process_query(payload) else {
+        return;
+    };
+    // Two bits per control: asked, and refused.
+    static SAID: AtomicU32 = AtomicU32::new(0);
+    let bit = which * 2 + usize::from(status != NV_OK);
+    if SAID.fetch_or(1 << bit, Ordering::Relaxed) & (1 << bit) != 0 {
+        return;
+    }
+    zcore_drivers::klog_warn!(
+        "[nvidiactl] {} from pid {} ({}): status {:#x}",
+        name,
+        caller.pid,
+        core::str::from_utf8(caller_name_bytes(caller)).unwrap_or("?"),
+        status
+    );
+}
+
+/// Which of the two process-table controls `payload` is, as
+/// `(index, name)`; `None` for every other RM_CONTROL and for a payload too
+/// short to hold a `cmd` at all.
+fn process_query(payload: &[u8]) -> Option<(usize, &'static str)> {
+    if payload.len() < CONTROL_SIZE {
+        return None;
+    }
+    match u32_at(payload, CONTROL_CMD) {
+        GPU_GET_PIDS => Some((0, "GPU_GET_PIDS")),
+        GPU_GET_PID_INFO => Some((1, "GPU_GET_PID_INFO")),
+        _ => None,
+    }
+}
+
+/// A caller's name without its NUL padding.
+fn caller_name_bytes(caller: &nvctl::Caller) -> &[u8] {
+    let end = caller
+        .name
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(caller.name.len());
+    &caller.name[..end]
 }
 
 /// The escapes [`not_served`] has logged, one bit per `_IOC_NR`.

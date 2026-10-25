@@ -233,14 +233,20 @@ pub extern "C" fn os_get_cpu_frequency() -> NvU64 {
 }
 
 // ---------------------------------------------------------------------
-// Process/thread queries (STUB) -- this driver runs entirely in kernel
-// context; there is no per-call "current userspace process" to report.
+// Process/thread queries. The RM runs in kernel context here, but a
+// front-end call is made on behalf of a process and the RM's whole
+// per-process accounting hangs off these two: see
+// `frontend::current_pid`.
 // ---------------------------------------------------------------------
+/// `os_get_current_process`: the pid of the process whose ioctl the RM is
+/// serving, and 0 when no front-end call is in flight (a close, a boot-time
+/// call, a worker), which is what this always answered.
 #[no_mangle]
 pub extern "C" fn os_get_current_process() -> NvU32 {
-    0
+    crate::frontend::current_pid()
 }
-/// The name this kernel answers with when the RM asks who is running.
+/// The name this kernel answers with when the RM asks who is running, and no
+/// front-end call is in flight to name a process instead.
 pub(crate) const PROCESS_NAME: &[u8] = b"eclipse-kernel";
 
 /// Copy [`PROCESS_NAME`] into a caller's buffer, **always NUL-terminated**.
@@ -265,9 +271,33 @@ pub(crate) fn write_process_name(buffer: *mut c_char, length: NvU32) {
     }
 }
 
+/// Copy a front-end caller's name into a caller's buffer, as
+/// [`write_process_name`] does with this kernel's own.
+pub(crate) fn write_caller_name(buffer: *mut c_char, length: NvU32) {
+    let name = crate::frontend::current_name();
+    let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+    if name.is_empty() {
+        // No call in flight, or a caller with no name: the RM is asking
+        // about this kernel.
+        write_process_name(buffer, length);
+        return;
+    }
+    if buffer.is_null() || length == 0 {
+        return;
+    }
+    let room = length as usize - 1;
+    let n = name.len().min(room);
+    // SAFETY: as in `write_process_name`: `n < length`, so the terminator
+    // written at `n` is inside the caller's buffer.
+    unsafe {
+        core::ptr::copy_nonoverlapping(name.as_ptr(), buffer as *mut u8, n);
+        *(buffer as *mut u8).add(n) = 0;
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn os_get_current_process_name(buffer: *mut c_char, length: NvU32) {
-    write_process_name(buffer, length);
+    write_caller_name(buffer, length);
 }
 /// Provider of per-thread identity for the RM (`set_thread_id_provider`).
 /// Stored as a raw fn pointer in an atomic so this leaf crate needs no
