@@ -346,8 +346,42 @@ pub struct GrAlloc {
     pub h_ctxshare: NvU32,
 }
 
+/// How many GPUs the C glue keeps a GR ladder for: `ECLIPSE_MAX_GPUS` in
+/// `vendor/eclipse_rm_init.c`, where every per-GPU cache (the step-16 ladder,
+/// the step-17 channel, the per-client contexts and their peer fences) is a
+/// fixed array indexed by RM device instance.
+///
+/// It is checked ONCE, where an instance first enters this port -- the
+/// `attach_gpu` that produced it -- rather than in each of the thirty-odd C
+/// entry points that index by it. A card whose instance has no slot is a card
+/// this port will not serve; sharing a slot is precisely the bug the per-GPU
+/// arrays exist to end.
+pub const MAX_LADDER_GPUS: u32 = 8;
+
 extern "C" {
     fn eclipse_rm_step16(device_instance: NvU32, out: *mut GrAlloc) -> NV_STATUS;
+    fn eclipse_rm_gr_ready(device_instance: NvU32) -> NvBool;
+}
+
+/// Whether the step-16 ladder has been built on `device_instance`: the client,
+/// device and VA space that context 0 IS and that every client context
+/// (`ctx_alloc`) on that card is made out of.
+///
+/// This is what VA-space work needs, and it is STICKY: it stays true once the
+/// ladder is up, whoever ran it and whether or not anyone still holds a
+/// channel. Asking "is some RM-backed channel live right now?" instead is the
+/// bug this replaces -- NVK creates a throwaway channel during enumeration and
+/// frees it before `vkCreateDevice` binds anything, so the answer was "no" at
+/// exactly the moment the first real bind arrived.
+///
+/// Per CARD, like the ladder itself: each GPU builds its own, so asking for
+/// the machine would tell a card with no ladder that it has one the moment
+/// another card built theirs. An instance with no slot
+/// (see [`MAX_LADDER_GPUS`]) answers `false`.
+///
+/// Reads one C array entry: no RM call, no lock, no `RmGate`.
+pub fn gr_ready(device_instance: NvU32) -> bool {
+    unsafe { eclipse_rm_gr_ready(device_instance) != 0 }
 }
 
 /// Runs the step-16 GR allocation ladder on a state-loaded GPU (idempotent:

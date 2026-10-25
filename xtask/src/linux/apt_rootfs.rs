@@ -1150,8 +1150,8 @@ fn record_deb_status(deb: &Path, status_file: &Path) {
     let mut inserted_status = false;
 
     for line in text.lines() {
-        if line.starts_with("Package: ") {
-            let name = line["Package: ".len()..].trim();
+        if let Some(rest) = line.strip_prefix("Package: ") {
+            let name = rest.trim();
             pkg_name = Some(name.to_string());
             lines.push(line.to_string());
             lines.push("Status: install ok installed".to_string());

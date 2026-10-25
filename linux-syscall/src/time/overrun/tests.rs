@@ -286,3 +286,199 @@ fn a_thread_directed_timer_counts_into_the_signal_on_its_thread() {
     assert_eq!(getoverrun(&proc, id), 2);
     drop_posix_timers_of(proc.id());
 }
+
+/// [`posix_timer_overrun`], with `before` run ahead of each look at the
+/// signal and `after` once it has been looked at, both told which look it
+/// is; and how many looks it took.
+fn getoverrun_while(
+    proc: &Process,
+    id: usize,
+    mut before: impl FnMut(usize),
+    mut after: impl FnMut(usize),
+) -> (u32, usize) {
+    let mut looks = 0;
+    let answer = posix_timer_overrun_with(id, proc.id(), |notify, signal| {
+        before(looks);
+        let waiting = with_pending_timer_signal(
+            proc.id() as usize,
+            notify.thread.map(|tid| tid as usize),
+            signal,
+            id as i32,
+            |_| {},
+        );
+        after(looks);
+        looks += 1;
+        waiting
+    })
+    .unwrap();
+    (answer, looks)
+}
+
+#[test]
+fn an_expiry_between_the_counts_and_the_signal_is_not_answered_for() {
+    // The counts read with the signal just taken, and the signal looked at
+    // once the next expiry had queued a new one.
+    let (proc, thread) = a_process(50_101);
+    let id = a_timer(proc.id(), TimerNotify::SIGALRM_TO_PROCESS);
+    expires_at(id, &[1000, 1010]);
+    assert_eq!(take(&thread), Some(1));
+    let (answer, _) = getoverrun_while(
+        &proc,
+        id,
+        |look| {
+            if look == 0 {
+                expires_at(id, &[1020]);
+            }
+        },
+        |_| {},
+    );
+    assert_eq!(answer, 1, "the last before the signal just taken");
+    assert_eq!(take(&thread), Some(0));
+    drop_posix_timers_of(proc.id());
+}
+
+#[test]
+fn a_signal_counted_into_and_taken_while_it_is_looked_for_answers_what_it_carried() {
+    let (proc, thread) = a_process(50_102);
+    let id = a_timer(proc.id(), TimerNotify::SIGALRM_TO_PROCESS);
+    expires_at(id, &[1000, 1010]);
+    let mut took = None;
+    let (answer, _) = getoverrun_while(
+        &proc,
+        id,
+        |look| {
+            if look == 0 {
+                expires_at(id, &[1020]);
+                took = take(&thread);
+            }
+        },
+        |_| {},
+    );
+    assert_eq!(took, Some(2));
+    assert_eq!(answer, 2, "what the signal carried before the last expiry");
+    drop_posix_timers_of(proc.id());
+}
+
+#[test]
+fn a_timer_that_went_through_expiries_back_to_the_same_counts_is_looked_at_again() {
+    // Read with the 1 taken and nothing waiting; looked at with a 0
+    // waiting; and before the counts are read again, the 0 taken and a 1
+    // queued and taken too. The counts read as they did at first.
+    let (proc, thread) = a_process(50_103);
+    let id = a_timer(proc.id(), TimerNotify::SIGALRM_TO_PROCESS);
+    expires_at(id, &[1000, 1010]);
+    assert_eq!(take(&thread), Some(1));
+    let mut took = vec![];
+    let (answer, looks) = getoverrun_while(
+        &proc,
+        id,
+        |look| {
+            if look == 0 {
+                expires_at(id, &[1020]);
+            }
+        },
+        |look| {
+            if look == 0 {
+                took.push(take(&thread));
+                // Due at 1030: one period late.
+                expires_at(id, &[1040]);
+                took.push(take(&thread));
+            }
+        },
+    );
+    assert_eq!(took, [Some(0), Some(1)]);
+    assert_eq!(answer, 1, "answered from a look the timer moved under");
+    assert_eq!(looks, 2);
+    drop_posix_timers_of(proc.id());
+}
+
+#[test]
+fn a_timer_that_moves_at_every_look_still_gets_an_answer() {
+    let (proc, thread) = a_process(50_104);
+    let id = a_timer(proc.id(), TimerNotify::SIGALRM_TO_PROCESS);
+    expires_at(id, &[1000, 1010]);
+    let (answer, looks) = getoverrun_while(
+        &proc,
+        id,
+        |look| {
+            // Every look finds one more expiry counted into the signal,
+            // for longer than the looks it is given.
+            if look < 4 * OVERRUN_LOOKS {
+                expires_at(id, &[1020 + 10 * look as u64]);
+            }
+        },
+        |_| {},
+    );
+    assert_eq!(looks, OVERRUN_LOOKS);
+    assert_eq!(answer, 0, "nothing taken yet");
+    assert_eq!(take(&thread), Some(1 + OVERRUN_LOOKS as u32));
+    drop_posix_timers_of(proc.id());
+}
+
+#[test]
+fn a_timer_that_holds_still_is_looked_at_once() {
+    let (proc, thread) = a_process(50_105);
+    let id = a_timer(proc.id(), TimerNotify::SIGALRM_TO_PROCESS);
+    expires_at(id, &[1000, 1010, 1020]);
+    assert_eq!(take(&thread), Some(2));
+    assert_eq!(getoverrun_while(&proc, id, |_| {}, |_| {}), (2, 1));
+    expires_at(id, &[1030]);
+    assert_eq!(getoverrun_while(&proc, id, |_| {}, |_| {}), (2, 1));
+    drop_posix_timers_of(proc.id());
+}
+
+#[test]
+fn a_timer_set_again_and_brought_back_to_the_same_counts_is_looked_at_again() {
+    // Read with a 2 waiting after a 1 was taken: 1. Before the look, set
+    // again (the 2 thrown away) and run up to a 1 taken, so nothing waits;
+    // after it, a 2 queued again. The counts, and how many times they
+    // changed, read as they did at first: only the generation tells.
+    let (proc, thread) = a_process(50_106);
+    let id = a_timer(proc.id(), TimerNotify::SIGALRM_TO_PROCESS);
+    expires_at(id, &[1000, 1010]);
+    assert_eq!(take(&thread), Some(1));
+    // Due at 1020: two periods late.
+    expires_at(id, &[1040]);
+    let mut took = None;
+    let (answer, looks) = getoverrun_while(
+        &proc,
+        id,
+        |look| {
+            if look == 0 {
+                // As `timer_settime` does it, the 2 thrown away first.
+                stale::drop_signal_from_before(id, proc.id());
+                settime(&proc, id, false, ms(10), ms(10), ms(2000));
+                expires_at(id, &[2010, 2020]);
+                took = take(&thread);
+            }
+        },
+        |look| {
+            if look == 0 {
+                // Due at 2030.
+                expires_at(id, &[2050]);
+            }
+        },
+    );
+    assert_eq!(took, Some(1));
+    assert_eq!(answer, 1, "the 2 waiting, never taken");
+    assert_eq!(looks, 2);
+    drop_posix_timers_of(proc.id());
+}
+
+#[test]
+fn between_moving_last_on_and_queuing_the_next_signal_the_answer_is_last() {
+    // An expiry that finds its signal taken moves `last` on to what that
+    // one carried, and only then queues the next one.
+    let (proc, thread) = a_process(50_107);
+    let id = a_timer(proc.id(), TimerNotify::SIGALRM_TO_PROCESS);
+    expires_at(id, &[1000, 1010]);
+    assert_eq!(take(&thread), Some(1));
+    let gen = POSIX_TIMERS.lock()[&id].generation;
+    settle(id, gen, |o| {
+        if let Some(taken) = o.queued.take() {
+            o.last = taken;
+        }
+    });
+    assert_eq!(getoverrun(&proc, id), 1);
+    drop_posix_timers_of(proc.id());
+}

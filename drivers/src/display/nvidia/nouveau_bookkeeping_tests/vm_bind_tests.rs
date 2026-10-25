@@ -668,3 +668,62 @@ fn vm_bind_copies_its_lists_before_the_rule_against_syncs_on_a_synchronous_bind(
     syncobj::destroy(done);
     syncobj::destroy(out);
 }
+
+#[test]
+fn a_bind_needs_the_ladder_not_somebody_holding_a_channel_right_now() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    // Exactly NVK's order at `vkCreateDevice`: `nouveau_ws_device_new`
+    // creates a throwaway context during ENUMERATION just to read the engine
+    // classes and frees it again, and only then does
+    // `nvkmd_nouveau_alloc_va` bind -- the queue's channel comes later still.
+    let throwaway = channel_alloc(&gpu, A).unwrap().channel;
+    assert_eq!(channel_free(&gpu, throwaway, A), Ok(0));
+    assert!(
+        gpu.nouveau_channels.lock().is_empty(),
+        "nobody holds a channel at the moment of the first real bind"
+    );
+    let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    with_uvmm(&gpu, A);
+    assert_eq!(
+        vm_bind_ops(&gpu, A, &mut [map(ha, 1 << 40, 65536)]),
+        Ok(0),
+        "the bind builds the caller's own context: asking whether some \
+         channel is live instead made every first bind of a boot ENODEV, \
+         which NVK reports as `vm_bind failed: No such device`"
+    );
+    assert_eq!(ctx_of(&gpu, A).map(|t| t.0), Some(1), "its own context");
+    // And without a ladder there is genuinely nothing to bind into.
+    FAKE_RM.lock().ladder_built = false;
+    assert_eq!(
+        vm_bind_ops(&gpu, A, &mut [map(ha, 2 << 40, 65536)]),
+        Err(nv::ENODEV)
+    );
+}
+
+#[test]
+fn the_ladder_a_bind_asks_about_is_the_one_on_its_own_card() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    // The second card of a two-card box: the RM gave it device instance 1.
+    *gpu.rm_device_instance.lock() = Some(1);
+    let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    with_uvmm(&gpu, A);
+    FAKE_RM.lock().gr_ready_asked_of = None;
+    assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, 1 << 40, 65536)]), Ok(0));
+    // The C flag is `g_grAllocDone[gpuInstance]`, one slot per card, because
+    // each card builds its own client, device and VA space. So the question
+    // has to name THIS card: hardcoding 0 reads the first card's ladder and
+    // is right only on a box with one GPU.
+    assert_eq!(
+        FAKE_RM.lock().gr_ready_asked_of,
+        Some(1),
+        "asked about the card doing the bind"
+    );
+}
