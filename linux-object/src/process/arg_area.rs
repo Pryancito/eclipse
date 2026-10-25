@@ -8,7 +8,7 @@
 //! script showed the script's argument vector instead of its interpreter's.
 
 use super::*;
-use crate::loader::ArgArea;
+use crate::loader::{ArgArea, ImageLayout};
 
 impl LinuxProcess {
     /// Record where the image just loaded put its argument and environment
@@ -22,5 +22,16 @@ impl LinuxProcess {
     /// at `execve` instead.
     pub fn arg_area(&self) -> Option<ArgArea> {
         self.inner.lock().arg_area
+    }
+
+    /// Record where the image just loaded put its code, data, break and
+    /// stack.
+    pub fn set_image_layout(&self, layout: Option<ImageLayout>) {
+        self.inner.lock().image_layout = layout;
+    }
+
+    /// Where the image's parts are, when a loader said.
+    pub fn image_layout(&self) -> Option<ImageLayout> {
+        self.inner.lock().image_layout
     }
 }
