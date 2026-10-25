@@ -211,6 +211,60 @@ fn a_mapped_page_reports_the_record_and_the_page_table_separately() {
     );
 }
 
+/// The two halves have to be able to DISAGREE, which is the only reason
+/// there are two of them.
+///
+/// `a_mapped_page_reports_the_record_and_the_page_table_separately` above
+/// reads a page that is mapped and present, so the record and the page
+/// table agree and reading the record twice passes it -- which is what
+/// mutation says: swapping the page-table half for a second read of the
+/// record kept the whole file green.
+///
+/// A page the VMO has dropped is the case the line was added for. After a
+/// `MADV_DONTNEED` or an `ftruncate` the record still promises the write the
+/// `mmap` asked for and the page table has nothing, because the next access
+/// is meant to fault a fresh page in. That is the shape of the bug the line
+/// tells apart from a wrong `mprotect` -- a fault path that did not install
+/// what the record promised -- and a reader who saw the record printed in
+/// both halves would conclude the page table was right and go looking in the
+/// wrong place.
+#[test]
+fn a_page_the_object_dropped_reports_a_record_the_page_table_does_not_have() {
+    let vmar = aspace();
+    let vmo = VmObject::new_paged(1);
+    let at = vmar
+        .map(None, vmo.clone(), 0, PAGE_SIZE, RW)
+        .expect("the mapping fits in a fresh address space");
+    let before = describe_fault_perms(&vmar, at);
+    let (perm, pte) = halves(&before);
+    assert_eq!(
+        perm, pte,
+        "while the page is there the two agree: {}",
+        before
+    );
+
+    vmo.decommit(0, PAGE_SIZE)
+        .expect("the page is ours to drop");
+
+    let line = describe_fault_perms(&vmar, at);
+    let (perm, pte) = halves(&line);
+    assert!(
+        perm.contains("WRITE"),
+        "the record still carries the write the mapping was made with: {}",
+        line
+    );
+    assert_ne!(
+        perm, pte,
+        "the page table half is the record read a second time: {}",
+        line
+    );
+    assert!(
+        !pte.contains("WRITE"),
+        "the page is gone, so the page table grants nothing on it: {}",
+        line
+    );
+}
+
 /// On a page nobody mapped, neither half may claim an access right: a
 /// reader who saw `perm=READ` there would go looking for a fault path that
 /// dropped a page, and there is no page.

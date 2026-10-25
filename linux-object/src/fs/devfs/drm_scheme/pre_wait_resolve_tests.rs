@@ -144,10 +144,21 @@ fn every_pre_wait_can_be_interrupted_by_a_signal() {
             "{} sleeps somewhere a signal cannot reach",
             name
         );
+        // `WAIT_VBLANK` parks on the CRTC's off-queue as well as the clock
+        // (`until_vblank_or_crtc_off`, a `sleep_until` inside), under the
+        // same `interruptible`.
         assert!(
             code.contains("interruptible(kernel_hal::thread::sleep_until(")
+                || code.contains("interruptible(until_vblank_or_crtc_off(")
                 || code.contains("fence_poll_wait(acct.probes, deadline).await?"),
             "{} waits without ever asking whether a signal arrived",
+            name
+        );
+        assert_eq!(
+            code.matches("until_vblank_or_crtc_off(").count(),
+            code.matches("interruptible(until_vblank_or_crtc_off(")
+                .count(),
+            "{} parks on the CRTC's queue somewhere a signal cannot reach",
             name
         );
     }

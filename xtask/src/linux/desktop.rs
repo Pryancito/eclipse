@@ -887,7 +887,8 @@ fn write_eclipse_look(rootfs: &Path) {
     fs::write(
         &script,
         b"#!/bin/sh\n\
-          # Eclipse OS: desktop look (kde = KDE Breeze Dark, eclipse = violet).\n\
+          # Eclipse OS: desktop look (win11 = Windows 11 dark, kde = KDE\n\
+          # Breeze Dark, eclipse = the violet original).\n\
           CONF=/etc/eclipse/look\n\
           CFG=\"${HOME:-/root}/.config\"\n\
           RC=\"$CFG/labwc/rc.xml\"\n\
@@ -2974,8 +2975,8 @@ fn write_gtk_settings(rootfs: &Path) {
 fn write_foot_config(rootfs: &Path) {
     let dir = rootfs.join("root/.config/foot");
     let _ = fs::create_dir_all(&dir);
-    // Both palettes ship; `eclipse-look` copies the active one over foot.ini
-    // (a running foot keeps its colours until restarted).
+    // All three palettes ship; `eclipse-look` copies the active one over
+    // foot.ini (a running foot keeps its colours until restarted).
     fs::write(dir.join("foot.eclipse.ini"), foot_ini(FOOT_ECLIPSE)).unwrap();
     fs::write(dir.join("foot.kde.ini"), foot_ini(FOOT_BREEZE)).unwrap();
     fs::write(dir.join("foot.win11.ini"), foot_ini(FOOT_CAMPBELL)).unwrap();
@@ -3010,8 +3011,8 @@ bright4=3b78ff\nbright5=b4009e\nbright6=61d6d6\nbright7=f2f2f2\n";
 fn foot_ini(colors: &str) -> String {
     format!(
         "# Eclipse OS - foot terminal theme (written by xtask; pick the look\n\
-         # with `eclipse-look kde|eclipse`, which copies foot.kde.ini or\n\
-         # foot.eclipse.ini over this file).\n\
+         # with `eclipse-look win11|kde|eclipse`, which copies the matching\n\
+         # foot.<look>.ini over this file).\n\
          # Name a real monospace family first: the bare 'monospace' alias\n\
          # can resolve to a non-mono font (DejaVuMathTeXGyre) on a minimal\n\
          # fontconfig, which foot warns about on every start.\n\
@@ -3339,6 +3340,9 @@ fn write_labwc_wrapper(rootfs: &Path) {
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
+
+#[cfg(test)]
+mod install_tests;
 
 #[cfg(test)]
 mod tests;
