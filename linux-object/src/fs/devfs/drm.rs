@@ -7789,8 +7789,15 @@ pub fn gem_close(handle_id: u32) -> bool {
 /// events) up behind it, each also spinning with interrupts off: the whole
 /// machine freezes. Same rule `alloc_buffer` already documents.
 fn snapshot_drivers() -> Vec<Arc<dyn DrmScheme>> {
+    #[cfg(test)]
+    DRIVER_SNAPSHOTS.fetch_add(1, Ordering::Relaxed);
     DRM_STATE.lock().drivers.clone()
 }
+
+/// Trips through `DRM_STATE` for the driver list, for the tests that hold
+/// a query to one pass (`get_resources` clones under its own lock: not one).
+#[cfg(test)]
+pub(crate) static DRIVER_SNAPSHOTS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let (fbs, drivers) = {
@@ -8045,18 +8052,18 @@ pub fn crtc_count() -> usize {
     get_resources().1.len()
 }
 
-pub fn get_planes() -> Vec<u32> {
-    if software_kms_active() {
-        // One synthetic primary plane bound to the synthetic CRTC.
-        return vec![SYNTH_PLANE_ID];
-    }
-    // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
-    // Mirror the get_resources() filter: when a hardware-KMS driver exists,
-    // only expose its planes to avoid a mixed 2-plane topology.
+/// The planes the drivers list, each with the driver that listed it, from
+/// ONE snapshot of the driver list: the walk `get_planes` and
+/// `get_planes_typed` share.
+///
+/// Driver calls run with DRM_STATE released — see `snapshot_drivers`.
+/// Mirrors the `get_resources` filter: when a hardware-KMS driver exists,
+/// only its planes are exposed, to avoid a mixed 2-plane topology.
+fn listed_planes() -> Vec<(Arc<dyn DrmScheme>, u32)> {
     let drivers = snapshot_drivers();
     let has_hardware_kms = drivers.iter().any(|d| d.has_hardware_kms());
-    let mut planes: Vec<u32> = Vec::new();
-    for driver in &drivers {
+    let mut planes: Vec<(Arc<dyn DrmScheme>, u32)> = Vec::new();
+    for driver in drivers {
         if !has_hardware_kms || driver.has_hardware_kms() {
             // De-duplicate, for the same reason `get_resources` does it with
             // CRTCs and connectors: two cards of the same model return the
@@ -8065,8 +8072,8 @@ pub fn get_planes() -> Vec<u32> {
             // make sense of -- `drmModeGetPlane` on either entry answers with
             // the one plane, so index 1 contradicts index 0.
             for id in driver.get_planes() {
-                if !planes.contains(&id) {
-                    planes.push(id);
+                if !planes.iter().any(|(_, listed)| *listed == id) {
+                    planes.push((driver.clone(), id));
                 }
             }
         }
@@ -8074,12 +8081,37 @@ pub fn get_planes() -> Vec<u32> {
     planes
 }
 
+pub fn get_planes() -> Vec<u32> {
+    if software_kms_active() {
+        // One synthetic primary plane bound to the synthetic CRTC.
+        return vec![SYNTH_PLANE_ID];
+    }
+    listed_planes().into_iter().map(|(_, id)| id).collect()
+}
+
+/// Every listed plane with its state, as `get_planes` then `get_plane` on
+/// each id would give it, in ONE pass: one snapshot of the driver list and
+/// each plane asked of the driver that listed it. `GETPLANERESOURCES` (the
+/// type, to filter overlays for a legacy client) and `CREATE_LEASE` (a
+/// CRTC's primary and cursor) used `get_plane` per id, each a snapshot and
+/// a lookup across every driver; `drm_mode_getplane_res` walks once.
+pub fn get_planes_typed() -> Vec<DrmPlane> {
+    if software_kms_active() {
+        return get_plane(SYNTH_PLANE_ID).into_iter().collect();
+    }
+    listed_planes()
+        .into_iter()
+        .filter_map(|(driver, id)| driver.get_plane(id))
+        .map(with_core_scanout_state)
+        .collect()
+}
+
 pub fn get_plane(id: u32) -> Option<DrmPlane> {
     // Keyed on the ID, not on the live scanout path -- see `get_connector`
     // for why asking `software_kms_active()` here made advertised ids come
     // back EINVAL mid-probe. The synthetic id is still served without
     // touching a driver.
-    let mut plane = if id != SYNTH_PLANE_ID {
+    let plane = if id != SYNTH_PLANE_ID {
         // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
         snapshot_drivers()
             .into_iter()
@@ -8099,13 +8131,17 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
             plane_type: 1,     // DRM_PLANE_TYPE_PRIMARY
         }
     };
-    // `drm_mode_getplane` reports `plane->state->crtc` and `->fb`, both NULL
-    // once the pipe is disabled (a `SETCRTC` without a mode, an `RMFB` of the
-    // scanout) and both kept under DPMS off. The core's `crtc_fb` is the
-    // framebuffer on the one primary plane, in the DRM id namespace: the
-    // driver's own fb id (its own namespace) must not reach userspace, and
-    // the synthetic plane used to report no framebuffer at all and a CRTC
-    // even with nothing on it.
+    Some(with_core_scanout_state(plane))
+}
+
+/// `drm_mode_getplane` reports `plane->state->crtc` and `->fb`, both NULL
+/// once the pipe is disabled (a `SETCRTC` without a mode, an `RMFB` of the
+/// scanout) and both kept under DPMS off. The core's `crtc_fb` is the
+/// framebuffer on the one primary plane, in the DRM id namespace: the
+/// driver's own fb id (its own namespace) must not reach userspace, and
+/// the synthetic plane used to report no framebuffer at all and a CRTC
+/// even with nothing on it.
+fn with_core_scanout_state(mut plane: DrmPlane) -> DrmPlane {
     if plane.plane_type == 1 {
         let crtc_fb = DRM_STATE.lock().crtc_fb;
         plane.fb_id = crtc_fb;
@@ -8113,7 +8149,7 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
             plane.crtc_id = 0;
         }
     }
-    Some(plane)
+    plane
 }
 
 /// Put the process-wide output state a present depends on back to its defaults.
@@ -8191,28 +8227,7 @@ pub(crate) fn reset_output_state_for_test() {
 }
 
 #[cfg(test)]
-pub(super) mod test_globals {
-    extern crate std;
-
-    /// `DRM_STATE`, the GEM table, `gem_mmap` and the CRTC's current fb are
-    /// process-wide, and cargo runs a crate's tests in threads. Every test
-    /// module that touches them takes this first, so one test's framebuffers
-    /// are not another's.
-    ///
-    /// Without it the suite failed about one run in two with a different test
-    /// each time -- `crtc_fb` still holding a neighbour's framebuffer, or an
-    /// `ADDFB2` refused because a neighbour had filled the table. That reads
-    /// as a real regression and is not one, which is the worst kind of noise
-    /// to leave in a suite people are meant to trust.
-    static LOCK: self::std::sync::Mutex<()> = self::std::sync::Mutex::new(());
-
-    pub(crate) fn lock() -> self::std::sync::MutexGuard<'static, ()> {
-        // A test that panics while holding this poisons it. The poison is not
-        // a failure for the tests that follow, so step over it -- the panicking
-        // test has already been reported.
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
+pub(super) mod test_globals;
 
 #[cfg(test)]
 mod release_tests;
