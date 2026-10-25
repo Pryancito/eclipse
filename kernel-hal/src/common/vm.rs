@@ -151,6 +151,13 @@ pub trait GenericPageTable: Sync + Send {
         false
     }
 
+    /// Bytes of the tables below the root that hold this address space's
+    /// entries: Linux's `mm_pgtables_bytes`, the `VmPTE` of
+    /// `/proc/<pid>/status`. 0 where the tables are not this crate's to count.
+    fn table_bytes(&self) -> usize {
+        0
+    }
+
     fn map_cont(
         &mut self,
         start_vaddr: VirtAddr,

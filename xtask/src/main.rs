@@ -8,6 +8,8 @@ mod dump;
 
 mod arch;
 mod build;
+#[cfg(test)]
+mod cli_tests;
 mod commands;
 mod errors;
 #[cfg(test)]
@@ -82,7 +84,7 @@ enum Commands {
     /// ## Example
     ///
     /// ```bash
-    /// cargo dump
+    /// cargo xtask dump
     /// ```
     #[cfg(not(target_arch = "riscv64"))]
     Dump,
@@ -127,7 +129,7 @@ enum Commands {
     /// # Example
     ///
     /// ```bash
-    /// cargo asm --arch riscv64 --output riscv64.asm
+    /// cargo asm --machine virt-riscv64 --output riscv64.asm
     /// ```
     Asm(OutArgs),
 
@@ -140,7 +142,7 @@ enum Commands {
     /// # Example
     ///
     /// ```bash
-    /// cargo bin --arch riscv64 --output zcore.bin
+    /// cargo bin --machine virt-riscv64 --output zcore.bin
     /// ```
     Bin(OutArgs),
 

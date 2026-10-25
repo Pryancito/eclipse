@@ -629,14 +629,25 @@ fn stat_memory_fields(mapped_bytes: u64, resident_bytes: u64) -> (i64, i64) {
 }
 
 /// `/proc/<pid>/statm`: memory usage in PAGES — "size resident shared text
-/// lib data dt" per proc.rst. text/lib/data/dt read zero (Linux itself zeroes
-/// lib and dt); `ps` computes RSS from field 2.
+/// lib data dt" per proc.rst. Linux zeroes lib and dt; text is the code's
+/// range, not clamped as `VmExe:` is, and data is `data_vm + stack_vm`
+/// (`task_statm`). `ps` computes RSS from field 2.
 fn proc_pid_statm(proc: &Process) -> String {
-    let stats = proc.vmar().get_task_stats();
+    let vmar = proc.vmar();
+    let stats = vmar.get_task_stats();
     let size = stats.mapped_bytes() / PROC_PAGE_SIZE;
     let shared = stats.shared_bytes() / PROC_PAGE_SIZE;
     let resident = stats.private_bytes() / PROC_PAGE_SIZE + shared;
-    alloc::format!("{} {} {} 0 0 0 0\n", size, resident, shared)
+    let sizes = layout::Sizes::of(&vmar.mappings_dump(), layout::Mm::of(proc).as_ref());
+    let (text, data) = (sizes.text as u64, (sizes.data + sizes.stack) as u64);
+    alloc::format!(
+        "{} {} {} {} 0 {} 0\n",
+        size,
+        resident,
+        shared,
+        text / PROC_PAGE_SIZE,
+        data / PROC_PAGE_SIZE
+    )
 }
 
 fn proc_pid_cmdline(proc: &Process) -> Vec<u8> {
@@ -4601,7 +4612,8 @@ mod pid_stat_tests {
         assert_eq!(field(&line, 24), 3, "{:?}", line);
         // And they agree with `statm`, which `top` reads: size and resident
         // there are both in pages.
-        assert_eq!(proc_pid_statm(&proc), "3 3 0 0 0 0 0\n");
+        // Private and writable, so data too (`data_vm`).
+        assert_eq!(proc_pid_statm(&proc), "3 3 0 0 0 3 0\n");
         // Mapped a second time the pages are shared, and shared pages are
         // resident too: `get_mm_rss` is file + anon + shmem, and `ps` would
         // otherwise show RSS 0 for a process that lives on shared memory.
@@ -4611,7 +4623,7 @@ mod pid_stat_tests {
         let line = proc_pid_stat(&proc);
         assert_eq!(field(&line, 23), (6 * PAGE_SIZE) as i64, "{:?}", line);
         assert_eq!(field(&line, 24), 6, "{:?}", line);
-        assert_eq!(proc_pid_statm(&proc), "6 6 6 0 0 0 0\n");
+        assert_eq!(proc_pid_statm(&proc), "6 6 6 0 0 6 0\n");
     }
 
     #[test]

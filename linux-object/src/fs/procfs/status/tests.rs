@@ -146,6 +146,12 @@ fn the_file_has_linux_s_lines_in_linux_s_order() {
             "Kthread",
             "VmSize",
             "VmRSS",
+            "VmData",
+            "VmStk",
+            "VmExe",
+            "VmLib",
+            "VmPTE",
+            "VmSwap",
             "Threads",
             "SigQ",
             "SigPnd",
@@ -209,6 +215,8 @@ fn a_zombie_has_no_umask_no_descriptor_table_and_no_memory() {
     assert_eq!(line(&status, "FDSize"), Some("0"), "{:?}", status);
     assert_eq!(line(&status, "VmSize"), None, "{:?}", status);
     assert_eq!(line(&status, "VmRSS"), None, "{:?}", status);
+    assert_eq!(line(&status, "VmData"), None, "{:?}", status);
+    assert_eq!(line(&status, "VmSwap"), None, "{:?}", status);
     assert_eq!(line(&status, "Threads"), Some("1"), "{:?}", status);
 }
 
