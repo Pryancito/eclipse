@@ -1789,6 +1789,9 @@ fn syscall_args(ctx: &UserContext) -> [usize; 6] {
 }
 
 #[cfg(test)]
+mod user_trap_tests;
+
+#[cfg(test)]
 mod fault_report_tests;
 
 #[cfg(test)]
