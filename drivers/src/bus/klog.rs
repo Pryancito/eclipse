@@ -267,6 +267,61 @@ mod tests {
         assert_eq!(line::<3>(format_args!("{InThreeGoes}")), "a\n");
     }
 
+    /// Neither caller can reach the `at >= buf.len()` guard, and it is what
+    /// keeps the one that comes closest from reading a byte past the end:
+    /// `finish` asks about `pos - 1`, and `write_str` only asks when the bytes
+    /// do NOT fit, so both hand it an `at` below the length. Deleting it
+    /// survives every other test in this file; from here it panics, which is
+    /// the out-of-bounds read itself.
+    #[test]
+    fn asking_about_the_byte_after_the_buffer_answers_with_the_buffer() {
+        let buf = "ab\u{2014}".as_bytes();
+        assert_eq!(buf.len(), 5, "two ASCII plus a three-byte character");
+        assert_eq!(floor_char_boundary(buf, buf.len()), buf.len());
+        assert_eq!(floor_char_boundary(buf, buf.len() + 7), buf.len());
+        assert_eq!(floor_char_boundary(&[], 0), 0);
+        // One before the end still walks back out of the character.
+        assert_eq!(floor_char_boundary(buf, 4), 2);
+    }
+
+    /// A line whose FIRST character is multi-byte, cut inside it: the walk back
+    /// has to reach index 0 and give the whole character up. Stopping one short
+    /// leaves the leading byte of a character with the terminator glued behind
+    /// it -- two bytes nothing decodes, at the very front of the line, where
+    /// every reader starts, and `from_utf8` then fails and the line vanishes
+    /// the way it used to. Every other cut test here starts with ASCII, so the
+    /// walk never travels that far.
+    #[test]
+    fn a_line_that_begins_with_a_multibyte_character_gives_all_of_it_up() {
+        // Three bytes of character and three of buffer: the terminator has to
+        // come out of the character, and half of one is not a line.
+        assert_eq!(line::<3>(format_args!("\u{2014}x")), "\n");
+        // Four bytes wide, so the walk travels three steps rather than two.
+        assert_eq!(line::<4>(format_args!("\u{1f600}y")), "\n");
+        // And with room for the whole character the line keeps it.
+        assert_eq!(line::<4>(format_args!("\u{2014}x")), "\u{2014}\n");
+    }
+
+    /// Two writes where the first fits and the second does not: the room left
+    /// is counted from where the first ended, not from the buffer's length.
+    /// Counting it from the length copies past the end of the slice.
+    ///
+    /// Every other test here writes once -- `format_args!` folds adjacent
+    /// literals into one piece -- or gives up on the first write and latches
+    /// `full`, so none of them asks twice with the buffer part full, which is
+    /// the only moment the two quantities differ.
+    #[test]
+    fn the_room_left_is_counted_from_where_the_last_piece_ended() {
+        struct InTwoGoes;
+        impl fmt::Display for InTwoGoes {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("abc")?;
+                f.write_str("defghij")
+            }
+        }
+        assert_eq!(line::<8>(format_args!("{InTwoGoes}")), "abcdefg\n");
+    }
+
     #[test]
     fn the_syslog_priorities_are_the_ones_from_syslog_h() {
         assert_eq!((LOG_ERR, LOG_WARNING, LOG_INFO), (3, 4, 6));
