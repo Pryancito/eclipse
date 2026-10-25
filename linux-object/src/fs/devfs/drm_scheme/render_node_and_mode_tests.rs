@@ -377,6 +377,110 @@ fn the_panels_sync_polarity_and_interlace_reach_the_flags() {
 }
 
 #[test]
+fn the_modeinfo_struct_is_the_uapi_layout() {
+    // `struct drm_mode_modeinfo` is 68 bytes with every field at the uapi
+    // offset, so a mode built by offset (`make_modeinfo_with` still packs
+    // bytes) reads back by name as the same mode, and a mode built by name
+    // packs to the bytes a client would have written.
+    assert_eq!(core::mem::size_of::<DrmModeModeinfo>(), 68);
+    assert_eq!(core::mem::align_of::<DrmModeModeinfo>(), 4);
+
+    let mut name = [0u8; 32];
+    name[..8].copy_from_slice(b"by-name!");
+    name[31] = b'~';
+    let m = DrmModeModeinfo {
+        clock: 0x0101_0102,
+        hdisplay: 0x0201,
+        hsync_start: 0x0302,
+        hsync_end: 0x0403,
+        htotal: 0x0504,
+        hskew: 0x0605,
+        vdisplay: 0x0706,
+        vsync_start: 0x0807,
+        vsync_end: 0x0908,
+        vtotal: 0x0a09,
+        vscan: 0x0b0a,
+        vrefresh: 0x0c0c_0c0b,
+        flags: 0x0d0d_0d0c,
+        type_: 0x0e0e_0e0d,
+        name,
+    };
+    let b = m.to_bytes();
+    let u16_at = |o: usize| u16::from_ne_bytes([b[o], b[o + 1]]);
+    let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    assert_eq!(u32_at(0), m.clock, "clock @0");
+    assert_eq!(u16_at(4), m.hdisplay, "hdisplay @4");
+    assert_eq!(u16_at(6), m.hsync_start, "hsync_start @6");
+    assert_eq!(u16_at(8), m.hsync_end, "hsync_end @8");
+    assert_eq!(u16_at(10), m.htotal, "htotal @10");
+    assert_eq!(u16_at(12), m.hskew, "hskew @12");
+    assert_eq!(u16_at(14), m.vdisplay, "vdisplay @14");
+    assert_eq!(u16_at(16), m.vsync_start, "vsync_start @16");
+    assert_eq!(u16_at(18), m.vsync_end, "vsync_end @18");
+    assert_eq!(u16_at(20), m.vtotal, "vtotal @20");
+    assert_eq!(u16_at(22), m.vscan, "vscan @22");
+    assert_eq!(u32_at(24), m.vrefresh, "vrefresh @24");
+    assert_eq!(u32_at(28), m.flags, "flags @28");
+    assert_eq!(u32_at(32), m.type_, "type @32");
+    assert_eq!(b[36..68], name, "name @36, all 32 bytes");
+    assert_eq!(
+        DrmModeModeinfo::from_bytes(&b),
+        m,
+        "the round trip is exact"
+    );
+
+    // The mode packed by offset, read by name: the same numbers `timings`
+    // decodes by offset, and the refresh the helpers derive from them.
+    let packed = make_modeinfo_with(1920, 1080, Some(&dmt_1080p(60)));
+    let (clock, horiz, vert, vrefresh) = timings(&packed);
+    let r = DrmModeModeinfo::from_bytes(&packed);
+    assert_eq!(r.clock, clock);
+    assert_eq!([r.hdisplay, r.hsync_start, r.hsync_end, r.htotal], horiz);
+    assert_eq!([r.vdisplay, r.vsync_start, r.vsync_end, r.vtotal], vert);
+    assert_eq!((r.hskew, r.vscan), (0, 0));
+    assert_eq!(r.vrefresh, vrefresh);
+    assert_eq!(r.type_, 0x48, "DRIVER | PREFERRED");
+    assert_eq!(&r.name[..9], b"1920x1080");
+    assert_eq!(r.to_bytes(), packed, "and packs back to the same bytes");
+    assert_eq!(modeinfo_vrefresh(&r), 60);
+    assert_eq!(modeinfo_active_area(&r), Ok((1920, 1080)));
+    // The timing checks are the kernel's strict ones: a sync pulse that
+    // starts on the last active pixel (no front porch) is still a mode.
+    let mut z = r;
+    z.hsync_start = z.hdisplay;
+    z.vsync_start = z.vdisplay;
+    assert_eq!(modeinfo_active_area(&z), Ok((1920, 1080)));
+    z.hsync_start -= 1;
+    assert_eq!(modeinfo_active_area(&z), Err(FsError::InvalidParam));
+    z.hsync_start = z.hdisplay;
+    z.vsync_start -= 1;
+    assert_eq!(modeinfo_active_area(&z), Err(FsError::InvalidParam));
+    // INTERLACE (bit 4) is a field rate: the same timings, twice the Hz.
+    let mut i = r;
+    i.flags |= 1 << 4;
+    assert_eq!(modeinfo_vrefresh(&i), 120);
+    // And the bytes are the client's own: a `SETCRTC` that hands these in
+    // comes back from `GETCRTC` with the refresh recomputed, the type
+    // masked and the name NUL-padded, nothing else touched.
+    i.vrefresh = 7;
+    i.type_ = u32::MAX;
+    i.name = name;
+    let back = DrmModeModeinfo::from_bytes(&committed_umode(&i.to_bytes(), true));
+    assert_eq!((back.vrefresh, back.type_), (120, 0x68));
+    assert_eq!(&back.name[..8], b"by-name!");
+    assert_eq!(back.name[8..], [0; 24], "31 bytes then NULs: the 32nd goes");
+    assert_eq!(
+        DrmModeModeinfo {
+            vrefresh: 7,
+            type_: u32::MAX,
+            name,
+            ..back
+        },
+        i
+    );
+}
+
+#[test]
 fn a_panel_timing_is_still_a_legal_mode_by_the_rule_the_nominal_one_keeps() {
     // The porch invariant the nominal mode is held to, applied to the
     // other source. Non-strict here, because a real panel is allowed a
