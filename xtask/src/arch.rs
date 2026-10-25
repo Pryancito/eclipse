@@ -61,6 +61,9 @@ impl Arch {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 impl FromStr for Arch {
     type Err = XError;
 
