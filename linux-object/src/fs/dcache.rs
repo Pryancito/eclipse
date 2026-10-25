@@ -82,6 +82,11 @@ pub fn invalidate() {
     EPOCH.fetch_add(1, Ordering::Release);
 }
 
+/// The epoch now: while it stays the same, no name has changed.
+pub fn epoch() -> u64 {
+    EPOCH.load(Ordering::Acquire)
+}
+
 /// The inode `path` leads to from `root`, with `walked` at it.
 pub fn get(root: &Arc<dyn INode>, path: &str, walked: &mut Walked) -> Option<Arc<dyn INode>> {
     let mut c = CACHE.lock();

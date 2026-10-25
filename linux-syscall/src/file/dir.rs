@@ -58,10 +58,8 @@ impl Syscall<'_> {
         info!("getcwd: buf={:?}, len={:#x}", buf, len);
         let proc = self.linux_process();
         // `if (!d_unlinked(pwd.dentry)) ... else error = -ENOENT;`
-        if proc.working_directory_removed() {
-            return Err(LxError::ENOENT);
-        }
-        getcwd_into(&proc.current_working_directory(), buf, len)
+        let cwd = proc.working_directory_path().ok_or(LxError::ENOENT)?;
+        getcwd_into(&cwd, buf, len)
     }
 
     /// Change the current directory.
@@ -78,7 +76,7 @@ impl Syscall<'_> {
         }
         let verdict = proc.check_access(&info, 0o1, true);
         linux_object::fs::fd_permission(verdict, &inode, self.zircon_process())?;
-        proc.change_directory(&cwd::physical_dir(proc, path));
+        proc.enter_directory(inode, &cwd::physical_dir(proc, path));
         Ok(0)
     }
 
@@ -230,6 +228,11 @@ impl Syscall<'_> {
         let info = file.metadata()?;
         if info.type_ != FileType::Dir {
             return Err(LxError::ENOTDIR);
+        }
+        // `iterate_dir`: a directory that has been removed lists nothing, not
+        // even `.` and `..`, and says `ENOENT` (`IS_DEADDIR`).
+        if info.nlinks == 0 {
+            return Err(LxError::ENOENT);
         }
         let cap_size = buf_size.min(256 * 1024);
         let mut kbuf = crate::try_zeroed_buf(cap_size)?;
@@ -505,7 +508,9 @@ impl Syscall<'_> {
         }
         let verdict = proc.check_access(&info, 0o1, true);
         linux_object::fs::fd_permission(verdict, &file.inode(), self.zircon_process())?;
-        proc.change_directory(&cwd::physical_dir(proc, file.path()));
+        // The directory the descriptor holds, even one that has been removed
+        // since, which its path no longer leads to.
+        proc.enter_directory(file.inode(), &cwd::physical_dir(proc, file.path()));
         Ok(0)
     }
 

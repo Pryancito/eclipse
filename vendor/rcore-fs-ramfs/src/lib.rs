@@ -518,6 +518,10 @@ impl LockedINode {
         } else {
             let mut to = guards.next().unwrap();
             let mut moved = guards.next().unwrap();
+            // A directory that has been removed takes nothing in; see `create2`.
+            if to.extra.nlinks == 0 {
+                return Err(FsError::DirRemoved);
+            }
             if to.children.contains_key(new_name) {
                 return Err(FsError::EntryExist);
             }
@@ -636,6 +640,13 @@ impl INode for LockedINode {
             if name == "." || name == ".." {
                 return Err(FsError::EntryExist);
             }
+            // A directory that has been removed takes nothing in (`ENOENT`,
+            // Linux's `IS_DEADDIR`), as SFS refuses with the same error. A
+            // process can still be in one, or hold it open, and anything made
+            // there would be a file no name leads to.
+            if file.extra.nlinks == 0 {
+                return Err(FsError::DirRemoved);
+            }
             if file.children.contains_key(name) {
                 return Err(FsError::EntryExist);
             }
@@ -713,6 +724,10 @@ impl INode for LockedINode {
         }
         if other_l.extra.type_ == FileType::Dir {
             return Err(FsError::IsDir);
+        }
+        // Nor a link; see `create2`.
+        if file.extra.nlinks == 0 {
+            return Err(FsError::DirRemoved);
         }
         if file.children.contains_key(name) {
             return Err(FsError::EntryExist);
@@ -1525,6 +1540,50 @@ mod tests {
         assert_eq!(root.unlink("d").err(), Some(FsError::DirNotEmpty));
         d.unlink("inside").unwrap();
         root.unlink("d").unwrap();
+    }
+
+    /// A directory that has been removed takes nothing in: not a new file,
+    /// not a new directory, not a link, not a file or a directory moved in.
+    /// Whoever is still in it, or holds it open, finds `DirRemoved`
+    /// (`ENOENT`), as Linux answers for a dead directory.
+    #[test]
+    fn a_removed_directory_takes_nothing_in() {
+        let fs = RamFS::new();
+        let root = fs.root_inode();
+        let gone = dir_at(&root, "gone");
+        let f = file_at(&root, "f");
+        dir_at(&root, "d");
+        root.unlink("gone").unwrap();
+        assert_eq!(gone.metadata().unwrap().nlinks, 0);
+        let refused = Some(FsError::DirRemoved);
+        assert_eq!(gone.create("new", FileType::File, 0o644).err(), refused);
+        assert_eq!(gone.create("sub", FileType::Dir, 0o755).err(), refused);
+        assert_eq!(gone.create("l", FileType::SymLink, 0o777).err(), refused);
+        assert_eq!(gone.link("f2", &f).err(), refused);
+        assert_eq!(root.move_("f", &gone, "f3").err(), refused);
+        assert_eq!(root.move_("d", &gone, "d").err(), refused);
+        assert!(gone.get_entry(2).is_err(), "nothing went in");
+        // What was refused stayed where it was.
+        assert!(root.find("f").is_ok() && root.find("d").is_ok());
+        assert_eq!(f.metadata().unwrap().nlinks, 1);
+    }
+
+    /// The same calls on a directory that is still there all succeed, so
+    /// the refusal above is the removal's and not the calls'.
+    #[test]
+    fn a_directory_that_is_there_takes_all_of_it() {
+        let fs = RamFS::new();
+        let root = fs.root_inode();
+        let here = dir_at(&root, "here");
+        let f = file_at(&root, "f");
+        dir_at(&root, "d");
+        file_at(&root, "g");
+        here.create("new", FileType::File, 0o644).unwrap();
+        here.create("sub", FileType::Dir, 0o755).unwrap();
+        here.link("f2", &f).unwrap();
+        root.move_("g", &here, "g3").unwrap();
+        root.move_("d", &here, "d").unwrap();
+        assert!(here.find("d").is_ok() && here.find("g3").is_ok());
     }
 
     #[test]

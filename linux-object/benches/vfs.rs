@@ -154,6 +154,40 @@ fn lookup_inode_at_dirfd(b: &mut Bencher) {
     b.iter(|| test::black_box(proc.lookup_inode_at(fd, "leaf", true).expect("it is there")));
 }
 
+/// A relative name from the working directory, one directory down and nine
+/// down. The working directory is held, so the depth it is at costs
+/// nothing; when it was only a path, every relative lookup walked that path
+/// from the root first, and these two rows had the slope of the cold ones.
+#[bench]
+fn lookup_inode_relative_cwd_1_deep(b: &mut Bencher) {
+    let (proc, path) = with_depth(1);
+    proc.change_directory(path.trim_end_matches("/leaf"));
+    let _ = proc.current_working_directory();
+    b.iter(|| test::black_box(proc.lookup_inode("leaf").expect("it is there")));
+}
+
+#[bench]
+fn lookup_inode_relative_cwd_9_deep(b: &mut Bencher) {
+    let (proc, path) = with_depth(9);
+    proc.change_directory(path.trim_end_matches("/leaf"));
+    let _ = proc.current_working_directory();
+    b.iter(|| test::black_box(proc.lookup_inode("leaf").expect("it is there")));
+}
+
+/// The same nine down, after a namespace mutation each time: the path of the
+/// working directory is looked up once again to see that it still names
+/// it. This is the worst case the held directory pays, and it is what every
+/// relative lookup paid before.
+#[bench]
+fn lookup_inode_relative_cwd_9_deep_cold(b: &mut Bencher) {
+    let (proc, path) = with_depth(9);
+    proc.change_directory(path.trim_end_matches("/leaf"));
+    b.iter(|| {
+        linux_object::fs::dcache_invalidate();
+        test::black_box(proc.lookup_inode("leaf").expect("it is there"))
+    });
+}
+
 /// Open a descriptor and give it back: the table bookkeeping behind every
 /// `open`/`close` pair, with no filesystem work in the loop (the inode is
 /// resolved once, before the clock starts).

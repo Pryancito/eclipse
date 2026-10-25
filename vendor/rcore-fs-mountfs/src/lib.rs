@@ -372,6 +372,17 @@ impl MNode {
         }
     }
 
+    /// Whether `self` and `other` are one node: the same inode of the same
+    /// mounted filesystem. An inode number alone names a node only within its
+    /// filesystem, and every filesystem here reports `dev` 0.
+    pub fn is_same_node(&self, other: &MNode) -> bool {
+        Arc::ptr_eq(&self.vfs, &other.vfs)
+            && matches!(
+                (self.inode.metadata(), other.inode.metadata()),
+                (Ok(a), Ok(b)) if a.inode == b.inode
+            )
+    }
+
     pub fn find_name_by_child(&self, child: &Arc<MNode>) -> Result<String> {
         for index in 0.. {
             let name = self.inode.get_entry(index)?;
@@ -1218,6 +1229,36 @@ mod tests {
         // And the same rule on the path every lookup takes.
         let found = root.find(false, "elsewhere").unwrap();
         assert!(Arc::ptr_eq(&found.vfs, &top));
+    }
+
+    #[test]
+    fn is_same_node_is_the_same_inode_however_it_was_reached() {
+        let (_top, root) = tree();
+        let a = dir_at(&root, "a");
+        let b = dir_at(&a, "b");
+        let again = root.find(false, "a").unwrap().find(false, "b").unwrap();
+        assert!(!Arc::ptr_eq(&again, &b), "two lookups, two nodes");
+        assert!(again.is_same_node(&b));
+        assert!(b.find(false, "..").unwrap().is_same_node(&a));
+        assert!(!a.is_same_node(&b));
+    }
+
+    #[test]
+    fn is_same_node_tells_apart_two_filesystems_with_the_same_numbers() {
+        let (_a, root_a) = tree();
+        let x = dir_at(&root_a, "x");
+        let other = FlakyFS::new(RamFS::new());
+        let top_b = MountFS::new(other.clone());
+        let root_b = top_b.mountpoint_root_inode();
+        let impostor = dir_at(&root_b, "impostor");
+        other.report_as(ino(&impostor), ino(&x));
+        assert_eq!(ino(&impostor), ino(&x));
+        assert!(!impostor.is_same_node(&x));
+        // Nor is a mount point the root of what is mounted on it.
+        let mnt = dir_at(&root_a, "mnt");
+        mnt.mount(RamFS::new()).unwrap();
+        let guest_root = root_a.find(false, "mnt").unwrap();
+        assert!(!guest_root.is_same_node(&mnt));
     }
 
     #[test]

@@ -75,3 +75,41 @@ fn a_zombie_has_neither() {
     assert!(link(pid, "root").is_err());
     block_on(wait_child(&parent, pid, true, true)).unwrap();
 }
+
+/// `cwd` follows a rename of the working directory, and going through it
+/// leads to the directory itself, removed or not: `ls /proc/<pid>/cwd/` of a
+/// process whose directory was removed is that empty directory on Linux, not
+/// `ENOENT`.
+#[test]
+fn cwd_follows_a_rename_and_leads_to_the_directory_even_once_it_has_gone() {
+    let proc = Process::create_with_fixed_id_ext(
+        &ROOT_JOB,
+        45_423,
+        "cwd",
+        LinuxProcess::new(RamFS::new(), 0),
+    )
+    .unwrap();
+    let lp = proc.linux();
+    let top = lp
+        .root_inode()
+        .create("pcwd_c", FileType::Dir, 0o755)
+        .unwrap();
+    let d = top.create("d", FileType::Dir, 0o755).unwrap();
+    lp.change_directory("/pcwd_c/d");
+    let pid = proc.id();
+
+    top.move_("d", &top, "e").unwrap();
+    crate::fs::dcache_invalidate();
+    assert_eq!(link(pid, "cwd").unwrap(), "/pcwd_c/e");
+
+    top.unlink("e").unwrap();
+    crate::fs::dcache_invalidate();
+    let held = ProcPidDirINode { pid }.find("cwd").unwrap();
+    let (led_to, name) = held.jump().unwrap().unwrap();
+    assert_eq!(
+        led_to.metadata().unwrap().inode,
+        d.metadata().unwrap().inode
+    );
+    assert_eq!(name, "/pcwd_c/e");
+    assert_eq!(link(pid, "cwd").unwrap(), "/pcwd_c/e (deleted)");
+}

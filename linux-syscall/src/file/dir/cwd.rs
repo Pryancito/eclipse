@@ -24,3 +24,8 @@ pub(super) fn physical_dir(proc: &LinuxProcess, path: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// The working directory renamed or removed under a process, through the
+/// syscalls that name it.
+#[cfg(test)]
+mod held_tests;

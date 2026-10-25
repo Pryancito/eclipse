@@ -301,7 +301,11 @@ impl ProcessLink {
         let root = lp.root_inode();
         let path = match self.held {
             Held::Root => return Ok((root.clone(), String::from("/"))),
-            Held::WorkingDirectory => lp.current_working_directory(),
+            // The directory itself, by whatever name it has now, and still
+            // there for whoever is in it once it has been removed.
+            Held::WorkingDirectory => {
+                return lp.working_directory().map_err(|_| FsError::EntryNotFound)
+            }
             // No program is in `/proc`: one recorded there would lead back
             // here, and a kernel task has none.
             Held::Program => match lp.execute_path() {
