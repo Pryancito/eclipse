@@ -34,6 +34,9 @@
 //             products (dp4a, a decoded token), int8 and f16 tensor cores
 //             (mma, a prompt), and a CUDA graph (how llama.cpp decodes).
 //   latency   what a launch costs, and a launch and the wait for it.
+//   sleeping  a launch and a wait that sleeps (CU_EVENT_BLOCKING_SYNC)
+//             instead of spinning: the wake needs the GPU's interrupt. Last
+//             GPU only, at the very end.
 //
 // A wrong answer prints where it went wrong; a GPU that never finishes is
 // named after 60 s instead of hanging the probe. Its kernels are
@@ -762,9 +765,41 @@ static int deep_latency(struct deep *g)
     return 1;
 }
 
+// The other way a host thread waits: on an event made with
+// CU_EVENT_BLOCKING_SYNC the waiter sleeps until the driver wakes it, where
+// every wait above spins on memory. The wake comes from the GPU's
+// interrupt, so this is the one wait that needs the interrupt to reach the
+// driver. The very last check, on the last GPU only, since a wake that never
+// comes ends the run.
+static int deep_sleeping(struct deep *g)
+{
+    enum { ROUNDS = 10 };
+    deep_begin("sleeping wait");
+    CUfunction fn;
+    CUevent ev = NULL;
+    // CU_EVENT_BLOCKING_SYNC | CU_EVENT_DISABLE_TIMING
+    if (!deep_fn(g, "empty", &fn) || !deep_call("cuEventCreate", d_event_create(&ev, 1 | 2)))
+        return 0;
+    double total = 0, worst = 0;
+    int ok = 1;
+    for (int i = 0; ok && i < ROUNDS; i++) {
+        double t0 = now_us();
+        ok = deep_call("cuLaunchKernel", d_launch(fn, 1, 1, 1, 1, 1, 1, 0, g->stream, NULL, NULL)) &&
+             deep_call("cuEventRecord", d_event_record(ev, g->stream)) &&
+             deep_call("cuEventSynchronize", d_event_sync(ev));
+        double t = now_us() - t0;
+        total += t;
+        worst = t > worst ? t : worst;
+    }
+    d_event_destroy(ev);
+    if (ok)
+        printf("  sleeping   launch+wait %.1f us (worst %.1f us)\n", total / ROUNDS, worst);
+    return ok;
+}
+
 // Every check on one GPU, in the order llama.cpp needs them; the first that
 // fails ends that GPU's run.
-static int deep_gpu(CUdevice dev, int index)
+static int deep_gpu(CUdevice dev, int index, int sleeping)
 {
     struct deep g;
     memset(&g, 0, sizeof g);
@@ -803,7 +838,8 @@ static int deep_gpu(CUdevice dev, int index)
     ok = ok && deep_copy(&g) && deep_pinned(&g) && deep_registered(&g) && deep_file(&g) && deep_axpy(&g) &&
          deep_vmm(&g, dev) && deep_reduce(&g) &&
          deep_shared(&g, dev) && deep_dp4a(&g) && deep_mma(&g, "mma_i8", "mma int8", 0) &&
-         deep_mma(&g, "mma_f16", "mma f16", 1) && deep_graph(&g) && deep_latency(&g);
+         deep_mma(&g, "mma_f16", "mma f16", 1) && deep_graph(&g) && deep_latency(&g) &&
+         (!sleeping || deep_sleeping(&g));
     alarm(0);
     if (g.mod)
         d_mod_unload(g.mod);
@@ -830,18 +866,18 @@ static int deep_all(int gpus, CUresult (*get)(CUdevice *, int))
         return 1;
     }
     signal(SIGALRM, deep_hung);
-    int failed = 0;
-    for (int i = 0; i < gpus; i++) {
-        CUdevice dev;
-        deep_step = "device";
-        if (!deep_call("cuDeviceGet", get(&dev, i)) || !deep_gpu(dev, i))
-            failed++;
-    }
     if (gpus > 1) {
         CUdevice d0, d1;
         int peer = 0;
         if (get(&d0, 0) == 0 && get(&d1, 1) == 0 && d_can_peer(&peer, d0, d1) == 0)
             printf("[peer] GPU 0 -> GPU 1 direct access: %s\n", peer ? "yes" : "no (copies go through the host)");
+    }
+    int failed = 0;
+    for (int i = 0; i < gpus; i++) {
+        CUdevice dev;
+        deep_step = "device";
+        if (!deep_call("cuDeviceGet", get(&dev, i)) || !deep_gpu(dev, i, i == gpus - 1))
+            failed++;
     }
     if (failed) {
         printf("DEEP FAILED on %d of %d GPU(s); the line above each FAILED names the check\n", failed, gpus);
