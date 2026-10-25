@@ -357,3 +357,164 @@ mod exit_status_tests {
         assert_eq!(exit_status(Some(i32::MAX as i64 + 1)), i32::MAX);
     }
 }
+
+/// The two kernel command line parsers, asked the same questions.
+///
+/// `boot_options` above reads the real line with `kernel_hal::cmdline`. The
+/// `zcore-boot-opts` crate exists so the same rules can be unit-tested on the
+/// host without dragging in the kernel's dependency graph -- `tlb_hammer`
+/// re-exports its `parse_tlbhammer` -- and it pays for that with a copy:
+/// `pairs`, `value` and `parse_number` are character for character the ones in
+/// `kernel_hal::cmdline`, and nothing held the two sides together.
+///
+/// Two copies with no test between them drift the first time somebody fixes
+/// one of them, and the drift is silent: each crate keeps passing its own
+/// tests while a boot hatch comes to mean one thing to the kernel and another
+/// to the crate that documents the kernel's rules. That had already happened
+/// once, to the fourth function: `parse_cmdline` kept the LAST of a repeated
+/// key where every lookup in the kernel keeps the first.
+///
+/// `zcore` is the only crate that depends on both, so the comparison can only
+/// live here.
+#[cfg(test)]
+mod cmdline_mirror_tests {
+    use kernel_hal::cmdline as kernel;
+    use zcore_boot_opts as host;
+
+    /// Lines a boot can actually hand over, plus the shapes that tell the two
+    /// copies apart if they ever stop agreeing: a repeated key, a bare key, an
+    /// empty key, a value carrying its own `=`, the spaces a person leaves
+    /// around either half, and the empty pieces a stray colon leaves behind.
+    const LINES: &[&str] = &[
+        "",
+        ":",
+        "::",
+        "LOG=error:TERM=xterm-256color:console.shell=true:ROOT=/dev/sda2",
+        "LOG=info",
+        "LOG=",
+        "LOG=info:LOG=error",
+        "ROOT=/dev/sda2:LOG=warn:ROOT=/dev/vda:LOG=off",
+        "solo",
+        "solo:KEY=val:another",
+        "=novalue",
+        "KEY=a=b",
+        " LOG = info ",
+        "eclipse.tlbhammer=6:LOG=error",
+        "eclipse.tlbhammer=0",
+        "xeclipse.tlbhammer=6",
+        "NOTE=eclipse.tlbhammer=6",
+        "smp=off:nvidia.hwcursor=0:FB_ROT180=0",
+    ];
+
+    /// Every spelling of a number either parser is asked for, and the ones
+    /// that are not numbers at all.
+    const SPELLINGS: &[&str] = &[
+        "",
+        "0",
+        "1",
+        "3",
+        "6",
+        "0x0",
+        "0x8",
+        "0X10",
+        "0x",
+        "0xg",
+        "0xffffffffffffffff",
+        "0x10000000000000000",
+        "18446744073709551615",
+        "18446744073709551616",
+        "6spins",
+        "+6",
+        "-1",
+        "0b101",
+        " 6",
+        "6 ",
+    ];
+
+    /// The keys worth looking up: the ones the lines above write, the ones
+    /// that only look like them, and one nobody wrote.
+    const KEYS: &[&str] = &[
+        "LOG",
+        "log",
+        "ROOT",
+        "TERM",
+        "KEY",
+        "solo",
+        "another",
+        "eclipse.tlbhammer",
+        "ECLIPSE.TLBHAMMER",
+        "smp",
+        "nvidia.hwcursor",
+        "unwritten",
+    ];
+
+    #[test]
+    fn the_two_pair_splitters_agree_on_every_line() {
+        for line in LINES {
+            assert_eq!(
+                host::pairs(line).collect::<alloc::vec::Vec<_>>(),
+                kernel::pairs(line).collect::<alloc::vec::Vec<_>>(),
+                "pairs disagree on {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_key_lookups_agree_on_every_line() {
+        for line in LINES {
+            for key in KEYS {
+                assert_eq!(
+                    host::value(line, key),
+                    kernel::value(line, key),
+                    "value({line:?}, {key:?}) disagrees"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_number_parsers_agree_on_every_spelling() {
+        for spelled in SPELLINGS {
+            assert_eq!(
+                host::parse_number(spelled),
+                kernel::parse_number(spelled),
+                "parse_number({spelled:?}) disagrees"
+            );
+        }
+    }
+
+    /// The map the host crate builds and the lookup the kernel does have to
+    /// answer the same for every key the map holds. This is the one that was
+    /// red before `parse_cmdline` stopped keeping the last of a repeated key.
+    #[test]
+    fn the_map_and_the_kernel_lookup_agree_on_every_key_the_map_holds() {
+        for line in LINES {
+            for (key, written) in host::parse_cmdline(line) {
+                assert_eq!(
+                    kernel::value(line, key),
+                    Some(written),
+                    "the map says {line:?} writes {key:?}={written:?}"
+                );
+            }
+        }
+    }
+
+    /// Where the map deliberately does NOT answer like the lookup, written
+    /// down so the next reader does not take it for drift. Both differences
+    /// are in `parse_cmdline`'s own documentation; neither is in the three
+    /// mirrored functions above.
+    #[test]
+    fn the_map_drops_a_bare_key_and_cares_about_case() {
+        // A bare key is present with an empty value to the kernel, and is not
+        // in the map at all: the map is `key=value` pairs only.
+        assert_eq!(kernel::value("solo", "solo"), Some(""));
+        assert_eq!(host::parse_cmdline("solo").get("solo"), None);
+
+        // Every lookup in the kernel is case-insensitive on the key. A
+        // `BTreeMap<&str, &str>` cannot be, so the map is keyed as written.
+        assert_eq!(kernel::value("log=info", "LOG"), Some("info"));
+        let m = host::parse_cmdline("log=info");
+        assert_eq!(m.get("LOG"), None);
+        assert_eq!(m.get("log"), Some(&"info"));
+    }
+}
