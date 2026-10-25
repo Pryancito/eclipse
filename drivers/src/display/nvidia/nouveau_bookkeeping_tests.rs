@@ -3913,139 +3913,6 @@ fn a_full_ring_waits_for_the_gpu_and_one_that_never_drains_is_eio_and_wedges_the
     assert_eq!(FAKE_RM.lock().bad, 0);
 }
 
-/// NVK batches up to 256 waits and 256 signals per EXEC and 64 pushes
-/// (`GETPARAM_EXEC_PUSH_MAX`), and every same-channel wait is a GPFIFO
-/// ACQUIRE entry here, next to the pushes and the fence. The ring has
-/// 128 entries with one kept free, so a batch of 64 pushes with 63 or
-/// more such waits asked for room the ring never has: `fast_submit`
-/// spun 10 s, latched the channel WEDGED and every EXEC after it was
-/// EIO (VK_ERROR_DEVICE_LOST) until the process died. Linux has no such
-/// ceiling: its waits are scheduler dependencies, not ring entries.
-#[test]
-fn an_exec_with_more_acquires_than_the_ring_holds_waits_for_the_rest_on_the_cpu_and_is_not_a_hang()
-{
-    let _g = LOCK.lock();
-    let _live = LiveBytes::hold();
-    let gpu = gpu_rm_fast();
-    let ch = client_with_pushbuf(&gpu, A);
-    // One submit signals 100 semaphores with its one fence (65 or more
-    // was EOPNOTSUPP before): 100 waits on them are 100 ACQUIREs.
-    let sems: Vec<u32> = (0..100).map(|_| syncobj::create(false)).collect();
-    let sigs: Vec<_> = sems.iter().map(|&s| sync(s)).collect();
-    assert_eq!(
-        exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &sigs),
-        Ok(0),
-        "100 signals in one EXEC"
-    );
-    let c = chan(1);
-    assert_eq!(userd(&c), (0, 2));
-    assert!(sems.iter().all(|&s| syncobj::query(s) == Some(0)));
-    // 100 waits + 64 pushes + the fence would be 165 entries.
-    let waits: Vec<_> = sems.iter().map(|&s| sync(s)).collect();
-    let pushes: Vec<_> = (0..64)
-        .map(|i| push(PUSH_VA + 0x100 + i * 16, 16))
-        .collect();
-    let out = syncobj::create(false);
-    let now = test_clock::now();
-    let tick = AutoAdvance::of(1);
-    let fetched = std::thread::scope(|s| {
-        // The GPU runs on its own: it lands the first fence, which
-        // satisfies the waits that did not fit as ACQUIREs, and drains
-        // the ring for the submission itself.
-        let t = s.spawn(move || {
-            test_clock::set(now);
-            let mut got = Vec::new();
-            let start = std::time::Instant::now();
-            while got.len() < 2 + 127 && start.elapsed() < Duration::from_secs(30) {
-                std::thread::sleep(Duration::from_millis(5));
-                got.extend(run_gpu(1));
-            }
-            got
-        });
-        assert_eq!(
-            exec(&gpu, A, ch, &pushes, &waits, &[sync(out)]),
-            Ok(0),
-            "62 ACQUIREs in the ring, 38 waits on the CPU"
-        );
-        t.join().unwrap()
-    });
-    drop(tick);
-    assert!(!nv::ctx_is_wedged(1));
-    assert_eq!(fetched.len(), 2 + 127);
-    let acquires = fetched
-        .iter()
-        .filter(|f| matches!(f, Fetched::Acquire { payload: 1, .. }))
-        .count();
-    assert_eq!(
-        acquires,
-        127 - 64 - 1,
-        "as many ACQUIREs as the ring holds next to 64 pushes and the fence"
-    );
-    assert_eq!(
-        fetched
-            .iter()
-            .filter(|f| matches!(f, Fetched::Push { .. }))
-            .count(),
-        65
-    );
-    assert_eq!(
-        fetched
-            .iter()
-            .filter(|f| matches!(f, Fetched::Release { .. }))
-            .count(),
-        2
-    );
-    assert!(
-        matches!(fetched[2], Fetched::Acquire { .. }),
-        "ACQUIREs first"
-    );
-    assert!(
-        matches!(fetched[128], Fetched::Release { .. }),
-        "the fence last"
-    );
-    assert_eq!(syncobj::query(out), Some(1));
-    assert!(sems.iter().all(|&s| syncobj::query(s) == Some(1)));
-    assert_eq!(userd(&c), (1, 1), "129 entries: wrapped once");
-    // Not wedged: the channel goes on.
-    assert_eq!(exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
-    // A submission larger than the ring on its own is refused at once,
-    // not after 10 s, and does not wedge the channel either.
-    let big: Vec<_> = (0..128).map(|i| push(PUSH_VA + i * 16, 16)).collect();
-    // (1 ms per clock read: a submit that still spun would give up
-    // after its 10 s instead of hanging the test.)
-    let tick = AutoAdvance::of(1000);
-    assert!(matches!(
-        gpu.fast_submit(1, &big, false, &[]),
-        Err(nv::FastSubmitError::TooLarge {
-            needed: 128,
-            entries: 128
-        })
-    ));
-    assert!(!nv::ctx_is_wedged(1));
-    // Through EXEC's direct path the answer is EINVAL, and still no
-    // WEDGED latch: the next submission is welcome.
-    let r = nv::DrmNouveauExec {
-        channel: ch,
-        push_count: big.len() as u32,
-        wait_count: 0,
-        sig_count: 0,
-        wait_ptr: 0,
-        sig_ptr: 0,
-        push_ptr: big.as_ptr() as u64,
-    };
-    assert_eq!(gpu.exec_fast(1, A, &r, &big, &[]), Err(nv::EINVAL));
-    drop(tick);
-    assert!(!nv::ctx_is_wedged(1));
-    assert_eq!(userd(&c), (1, 2), "nothing was written over the ring");
-    assert_eq!(run_gpu(1).len(), 1);
-    for s in sems {
-        assert!(syncobj::destroy(s));
-    }
-    assert!(syncobj::destroy(out));
-    gpu.nouveau_release_process(A);
-    assert_eq!(FAKE_RM.lock().bad, 0);
-}
-
 #[test]
 fn exit_releases_the_window_before_freeing_the_context_and_lets_go_of_the_fences_in_flight() {
     let _g = LOCK.lock();
@@ -9498,3 +9365,9 @@ mod implicit_sync_tests;
 /// tables and the context registry's fallbacks: same harness, own file,
 /// same reason.
 mod drm_scheme_tests;
+
+/// The RM-side edges the fake RM reaches (a full channel table under the
+/// compositor, an empty EXEC whose wait never lands, a `GPUOBJ_FREE` the
+/// RM no longer has, a GPU the id table cannot size): same harness, own
+/// file, same reason.
+mod rm_edges_tests;
