@@ -23,6 +23,8 @@ pub struct ChildCpu {
     pub voluntary_switches: u64,
     /// Context switches made runnable: preempted, or yielding (`ru_nivcsw`).
     pub involuntary_switches: u64,
+    /// Faults on its memory resolved without a disk (`ru_minflt`).
+    pub minor_faults: u64,
 }
 
 impl ChildCpu {
@@ -32,6 +34,7 @@ impl ChildCpu {
         self.stime_ns += other.stime_ns;
         self.voluntary_switches += other.voluntary_switches;
         self.involuntary_switches += other.involuntary_switches;
+        self.minor_faults += other.minor_faults;
     }
 }
 
@@ -48,6 +51,7 @@ pub(super) fn child_cpu(child: &Arc<Process>) -> ChildCpu {
         stime_ns,
         voluntary_switches,
         involuntary_switches,
+        minor_faults: child.minor_faults(),
     };
     if let Some(lp) = child.try_linux() {
         cpu.add(lp.children_usage());

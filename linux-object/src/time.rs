@@ -347,8 +347,8 @@ impl From<TimeSpec> for TimeVal {
 
 /// RUsage for sys_getrusage() — full Linux `struct rusage` layout.
 ///
-/// The two times and the two context switch counts carry data; the other
-/// fields read as zero, which is also how Linux reports the ones it does not
+/// The two times, the minor faults and the two context switch counts carry
+/// data; the other fields read as zero, which is also how Linux reports the ones it does not
 /// maintain. Carrying them in the struct still matters: when only the two
 /// timevals were written, the tail of the caller's buffer kept whatever
 /// garbage was on the stack, and rusage consumers (`time(1)`, libuv's
@@ -368,7 +368,7 @@ pub struct RUsage {
     pub idrss: i64,
     /// `ru_isrss`, which Linux does not keep either
     pub isrss: i64,
-    /// `ru_minflt`, not kept: 0
+    /// `ru_minflt`: faults on the task's memory resolved without a disk
     pub minflt: i64,
     /// `ru_majflt`, not kept: 0
     pub majflt: i64,
@@ -391,12 +391,17 @@ pub struct RUsage {
 }
 
 impl RUsage {
-    /// What this kernel keeps: CPU time, `(user, kernel)` nanoseconds, and
-    /// context switches, `(voluntary, nonvoluntary)`.
-    pub fn of((user_ns, kernel_ns): (u64, u64), (voluntary, involuntary): (u64, u64)) -> Self {
+    /// What this kernel keeps: CPU time, `(user, kernel)` nanoseconds,
+    /// context switches, `(voluntary, nonvoluntary)`, and minor faults.
+    pub fn of(
+        (user_ns, kernel_ns): (u64, u64),
+        (voluntary, involuntary): (u64, u64),
+        minor_faults: u64,
+    ) -> Self {
         Self {
             utime: Duration::from_nanos(user_ns).into(),
             stime: Duration::from_nanos(kernel_ns).into(),
+            minflt: minor_faults as i64,
             nvcsw: voluntary as i64,
             nivcsw: involuntary as i64,
             ..Self::default()
@@ -409,6 +414,7 @@ impl From<crate::process::ChildCpu> for RUsage {
         Self::of(
             (cpu.utime_ns, cpu.stime_ns),
             (cpu.voluntary_switches, cpu.involuntary_switches),
+            cpu.minor_faults,
         )
     }
 }
@@ -1907,22 +1913,23 @@ mod rusage_layout_tests {
     }
 
     #[test]
-    fn a_reaped_child_s_usage_is_its_times_and_switches_and_nothing_else() {
+    fn a_reaped_child_s_usage_is_its_times_switches_and_faults_and_nothing_else() {
         let ru = RUsage::from(crate::process::ChildCpu {
             utime_ns: 1_500_000_000,
             stime_ns: 250_000,
             voluntary_switches: 26,
             involuntary_switches: 3,
+            minor_faults: 1_027,
         });
         assert_eq!((ru.utime.sec, ru.utime.usec), (1, 500_000));
         assert_eq!((ru.stime.sec, ru.stime.usec), (0, 250));
         assert_eq!((ru.nvcsw, ru.nivcsw), (26, 3));
+        assert_eq!(ru.minflt, 1_027);
         let rest = [
             ru.maxrss,
             ru.ixrss,
             ru.idrss,
             ru.isrss,
-            ru.minflt,
             ru.majflt,
             ru.nswap,
             ru.inblock,
@@ -1931,6 +1938,6 @@ mod rusage_layout_tests {
             ru.msgrcv,
             ru.nsignals,
         ];
-        assert_eq!(rest, [0; 12]);
+        assert_eq!(rest, [0; 11]);
     }
 }

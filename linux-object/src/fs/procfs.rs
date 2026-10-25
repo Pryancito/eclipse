@@ -23,6 +23,8 @@ mod comm_tests;
 mod cwd_tests;
 #[cfg(test)]
 mod exited_leader_tests;
+#[cfg(test)]
+mod faults_tests;
 /// `/proc/<pid>/limits`, in its own file for the same reason.
 mod limits;
 pub(crate) mod owner;
@@ -498,6 +500,12 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
     };
     let utime = (utime_ns / NS_PER_TICK) as i64;
     let stime = (stime_ns / NS_PER_TICK) as i64;
+    // Fields 10/11 (minflt/cminflt): the same split, and the reaped
+    // children's for the whole group even on a thread's own `stat`.
+    let minflt = thread.map_or_else(|| proc.minor_faults(), |t| t.minor_faults()) as i64;
+    let cminflt = proc
+        .try_linux()
+        .map_or(0, |lp| lp.children_usage().minor_faults) as i64;
 
     // Fields 16/17 (cutime/cstime), 22 (starttime), 23 (vsize) and 24 (rss):
     // `do_task_stat` publishes the reaped children's times, the task's
@@ -569,6 +577,8 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
     rest[6 - 5] = session;
     rest[7 - 5] = tty_nr;
     rest[8 - 5] = tpgid;
+    rest[10 - 5] = minflt;
+    rest[11 - 5] = cminflt;
     rest[14 - 5] = utime;
     rest[15 - 5] = stime;
     rest[16 - 5] = cutime;

@@ -107,10 +107,12 @@ fn a_mode_outside_rwx_is_rejected_instead_of_masked() {
     assert_eq!(Syscall::access_mode(usize::MAX), Err(LxError::EINVAL));
 }
 
-/// `SEEK_SET`, `SEEK_CUR`, `SEEK_DATA` and `SEEK_HOLE` as userspace writes
-/// them. Spelled out rather than taken from the constants inside
-/// `sys_lseek`, which are private to it and are half of what is under test.
+/// All five `whence` values as userspace writes them. Spelled out rather
+/// than taken from the constants inside `sys_lseek`, which are private to it
+/// and are half of what is under test.
+const SEEK_SET: usize = 0;
 const SEEK_CUR: usize = 1;
+const SEEK_END: usize = 2;
 const SEEK_DATA: usize = 3;
 const SEEK_HOLE: usize = 4;
 
@@ -272,41 +274,43 @@ fn a_seek_to_data_on_something_that_is_not_a_file_is_refused() {
 }
 
 #[test]
-fn a_seek_to_data_on_a_pipe_answers_a_different_errno_from_every_other_whence() {
-    // A DIVERGENCE, recorded here rather than fixed, because fixing it
-    // changes behaviour and this is a test batch:
-    //
+fn a_seek_to_data_on_a_pipe_is_espipe_like_every_other_whence() {
     // A pipe IS wrapped in a `File`, so it gets past the EINVAL above and
-    // reaches the generic answer -- computed from an inode size of zero,
-    // which puts every position at or past the end. So `SEEK_DATA` on a pipe
-    // answers ENXIO, while SEEK_SET, SEEK_CUR and SEEK_END on the same
-    // descriptor answer ESPIPE, which is what Linux answers for all five
-    // (a pipe has no `llseek` at all, so the whence is never looked at).
+    // used to reach the generic answer -- computed from an inode size of
+    // zero, which puts every position at or past the end, so these two
+    // whences answered ENXIO while SEEK_SET, SEEK_CUR and SEEK_END on the
+    // same descriptor answered ESPIPE.
     //
-    // It matters to a caller that tells the two apart: ESPIPE means "this is
-    // a stream, read it as one", and ENXIO means "this is a seekable file
-    // and there is no data from here on". A program handed ENXIO for a pipe
-    // concludes the pipe is a fully sparse file and stops reading it.
+    // Linux answers ESPIPE to all five, and the difference matters to a
+    // caller that tells the two apart: ESPIPE means "this is a stream, read
+    // it as one", and ENXIO means "this is a seekable file and there is no
+    // data from here on". A program handed ENXIO for a pipe concludes the
+    // pipe is a fully sparse file and stops reading it.
     //
-    // The fix is one line -- ask the file whether it can seek at all, which
-    // `File::seek` already answers, before computing a position from its
-    // size -- and it belongs in a change of its own.
+    // All five are asked here, so the answer cannot drift apart again.
     let (proc, fd) = a_process_with_a_pipe(49_345, "seek-pipe");
-    let (data, hole, plain) = on_a_thread(&proc, move |sys| {
+    let answers = on_a_thread(&proc, move |sys| {
         Box::pin(async move {
-            let data = sys.sys_lseek(FileDesc::from(fd), 0, SEEK_DATA);
-            let hole = sys.sys_lseek(FileDesc::from(fd), 0, SEEK_HOLE);
-            let plain = sys.sys_lseek(FileDesc::from(fd), 0, SEEK_CUR);
-            (data, hole, plain)
+            [
+                sys.sys_lseek(FileDesc::from(fd), 0, SEEK_SET),
+                sys.sys_lseek(FileDesc::from(fd), 0, SEEK_CUR),
+                sys.sys_lseek(FileDesc::from(fd), 0, SEEK_END),
+                sys.sys_lseek(FileDesc::from(fd), 0, SEEK_DATA),
+                sys.sys_lseek(FileDesc::from(fd), 0, SEEK_HOLE),
+            ]
         })
     });
-    assert_eq!(data, Err(LxError::ENXIO), "what the tree does today");
-    assert_eq!(hole, Err(LxError::ENXIO), "what the tree does today");
-    assert_eq!(
-        plain,
-        Err(LxError::ESPIPE),
-        "and what every other whence on the same descriptor says"
-    );
+    for (whence, answer) in [SEEK_SET, SEEK_CUR, SEEK_END, SEEK_DATA, SEEK_HOLE]
+        .iter()
+        .zip(answers.iter())
+    {
+        assert_eq!(
+            *answer,
+            Err(LxError::ESPIPE),
+            "a pipe is not seekable, whichever whence asks: {:?}",
+            whence
+        );
+    }
 }
 
 #[test]

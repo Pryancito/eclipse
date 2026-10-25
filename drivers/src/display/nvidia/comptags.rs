@@ -480,6 +480,7 @@ mod tests {
 
     #[test]
     fn a_bind_is_refused_without_both_the_hatch_and_the_caps() {
+        let _g = crate::test_globals::LOCK.lock();
         let obj = vram_obj();
         set_caps(None);
         set_enabled(false);
@@ -510,6 +511,7 @@ mod tests {
     /// object's, not the hatch's.
     #[test]
     fn a_sysmem_object_is_refused_with_the_hatch_on_and_the_caps_good() {
+        let _g = crate::test_globals::LOCK.lock();
         let mut obj = vram_obj();
         obj.domain = super::super::super::nouveau_uapi::NOUVEAU_GEM_DOMAIN_GART;
         set_enabled(true);
@@ -541,6 +543,7 @@ mod tests {
 
     #[test]
     fn the_flag_is_off_until_the_cmdline_turns_it_on() {
+        let _g = crate::test_globals::LOCK.lock();
         // `ENABLED` is a static shared by the whole test binary, so this
         // asserts the initial value and puts it back rather than leaving the
         // flag on for whatever runs next.

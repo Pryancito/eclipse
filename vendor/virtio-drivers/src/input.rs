@@ -461,6 +461,29 @@ mod tests {
         let (mut input, _ring) = driver();
         assert!(input.pop_pending_event().is_none());
     }
+
+    #[test]
+    fn acknowledging_an_interrupt_reaches_the_devices_own_register() {
+        // One forwarding line, and a wrapper that forwards nothing looks
+        // exactly like one that does: the keyboard and the mouse of a virtio
+        // machine go through this, and an acknowledgement that never reaches
+        // the device leaves the cause asserted and the line screaming.
+        let (mut input, _ring) = driver();
+        assert!(
+            !input.ack_interrupt(),
+            "it acknowledged an interrupt nobody raised"
+        );
+        assert_eq!(input.header.fake_interrupt_ack(), 0);
+        // Both bits a virtio device has: a used-ring notification and a
+        // configuration change.
+        input.header.fake_raise_interrupt(0b11);
+        assert!(input.ack_interrupt(), "it did not see the interrupt");
+        assert_eq!(
+            input.header.fake_interrupt_ack(),
+            0b11,
+            "the acknowledgement did not reach the device, or dropped a bit"
+        );
+    }
 }
 
 #[cfg(test)]
