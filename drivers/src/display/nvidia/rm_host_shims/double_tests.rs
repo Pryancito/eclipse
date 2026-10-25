@@ -168,10 +168,10 @@ fn freeing_or_unmapping_something_the_fake_never_handed_out_is_refused_and_count
 
     assert_eq!(eclipse_rm_gem_free(0, 0xdead), NV_ERR_OBJECT_NOT_FOUND);
     assert_eq!(
-        eclipse_rm_vm_bind_unmap(0, 0xdead, 4096, 0),
+        eclipse_rm_vm_bind_unmap(0, 1, 0xdead, 0, 4096, 0),
         NV_ERR_OBJECT_NOT_FOUND
     );
-    assert_eq!(eclipse_rm_class_free(0, 0xdead), NV_ERR_OBJECT_NOT_FOUND);
+    assert_eq!(eclipse_rm_class_free(0, 1, 0xdead), NV_ERR_OBJECT_NOT_FOUND);
     let f = FAKE_RM.lock();
     assert_eq!(f.bad, 3, "a refusal was not counted");
     assert_eq!(f.gem_frees, 0, "a stranger counted as a free");
@@ -312,7 +312,7 @@ fn unmapping_frees_the_va_it_held_and_nothing_else() {
 
     assert_eq!(bind(1, h, 0x30_0000, 0x1000).map_status, RM_VA_TAKEN);
     assert_eq!(
-        eclipse_rm_vm_bind_unmap(0, first.h_virt, 0x1000, 0x30_0000),
+        eclipse_rm_vm_bind_unmap(0, 1, first.h_virt, first.h_dup, 0x1000, 0x30_0000),
         NV_OK
     );
     assert_eq!(

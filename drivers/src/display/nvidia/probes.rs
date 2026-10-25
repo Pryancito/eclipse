@@ -168,7 +168,14 @@ impl NvidiaGpu {
                 }
             }
         }
-        let _ = rm::vm_bind_unmap(device_instance, bind.h_virt, TEST_SIZE, TEST_VA);
+        let _ = rm::vm_bind_unmap(
+            device_instance,
+            0,
+            bind.h_virt,
+            bind.h_dup,
+            TEST_SIZE,
+            TEST_VA,
+        );
         rm::gem_free(device_instance, alloc.h_memory);
     }
 

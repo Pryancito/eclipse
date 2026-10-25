@@ -415,6 +415,43 @@ pub(crate) fn current_pid() -> u32 {
     CALLER_PID.load(Ordering::SeqCst)
 }
 
+/// Names the process a **kernel-side** RM call is made on behalf of, for as
+/// long as the value lives, so the clients the RM makes during it carry that
+/// pid (`RmClient::ProcID`) instead of 0.
+///
+/// This is the DRM half of what [`CallScope`] does for an escape. A GPU
+/// client on NVK never opens `/dev/nvidiactl`: it arrives on `/dev/dri/card0`
+/// and the kernel builds its GR context for it, so there is no front-end call
+/// in flight and nothing would name the process. Without this every graphics
+/// context would be the RM's own, and `NV2080_CTRL_CMD_GPU_GET_PIDS` --
+/// `nvidia-smi`'s "Processes" table -- would have nothing to report for the
+/// desktop, which is exactly what it had.
+///
+/// Unlike `CallScope` this takes **no** gate and does **not** open the
+/// user-copy window: the caller already holds the RM gate (`ctx_alloc`), and
+/// a kernel-side call has no user memory to copy. Nesting one inside a
+/// `CallScope` would lose the escape's own pid on the way out, so it restores
+/// whatever it found rather than clearing.
+pub struct AttributedTo {
+    was: u32,
+}
+
+impl AttributedTo {
+    /// # Panics
+    /// Never. A pid of 0 is allowed and means "nobody", as outside a call.
+    pub fn enter(pid: u32) -> AttributedTo {
+        AttributedTo {
+            was: CALLER_PID.swap(pid, Ordering::SeqCst),
+        }
+    }
+}
+
+impl Drop for AttributedTo {
+    fn drop(&mut self) {
+        CALLER_PID.store(self.was, Ordering::SeqCst);
+    }
+}
+
 /// `osGetCurrentProcessName`: the caller's name during a front-end call,
 /// without its padding; empty outside one, and the caller then falls back to
 /// this kernel's own name.

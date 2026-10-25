@@ -70,15 +70,17 @@ const AJENOS: &[&str] = &["vendor/", "smoltcp/", "nvidia-rm-sys/vendor/"];
 /// `#[cfg(test)] mod X { ... }` de primer nivel a `file/X.rs` lo dejo en 3860
 /// sin tocar una linea de produccion. Ya no puede volver.
 const PASADOS: &[(&str, usize)] = &[
-    // 15250: subido el 18-oct-2026 por la tanda de comptags, que añade dos
-    // declaraciones de modulo y la decision de si se honra un kind comprimido
-    // en el lookup de VM_BIND -- 17 lineas sobre un techo que estaba a 6 de
-    // distancia. Las dos partes gordas (la aritmetica y la llamada al RM) ya
-    // salieron a `nvidia/comptags.rs` y `nvidia/comptag_caps.rs`, asi que esto
-    // es lo que no se puede sacar: el sitio donde se decide. **Lo que toca es
-    // partir el fichero**, como dice el comentario de arriba, y no es la tanda
-    // que mete una escotilla nueva.
-    ("drivers/src/display/nvidia.rs", 14750),
+    // 15000: subido el 25-oct-2026 por la tanda del cliente del RM por
+    // contexto, que lleva el `ctx_idx` a los ocho sitios que liberan un handle
+    // del RM (un handle solo existe en SU cliente, asi que el contexto viaja
+    // con el). Son 29 lineas de hilvanado de argumentos sobre un techo que
+    // estaba a 0 de distancia -- master llego justo a 14750. El 18-oct ya
+    // paso lo mismo con los comptags, por lo mismo: aqui ya no vale sacar un
+    // `#[cfg(test)] mod` de primer nivel, porque los diez que tiene son todos
+    // `mod X;` a ficheros aparte desde hace tandas. **Lo que toca es partir el
+    // fichero**, como dice el comentario de arriba, y no es la tanda que
+    // hilvana un argumento.
+    ("drivers/src/display/nvidia.rs", 15000),
     (
         "drivers/src/display/nvidia/nouveau_bookkeeping_tests.rs",
         9500,
