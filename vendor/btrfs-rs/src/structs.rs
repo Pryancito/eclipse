@@ -1111,3 +1111,221 @@ impl Superblock {
         put_u32(&mut self.raw, 0, sum);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// What this file decides on its own.
+///
+/// The integration suite mounts and walks real images, so most of this module
+/// is pinned by rebound: a wide lot of sixteen mutations over the key
+/// ordering, the item table, the little-endian readers and the tree-block
+/// checksum left twelve of them dead without a single test here. The four
+/// that lived are what no image walk looks at, and they are what is below.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A leaf holding `sizes.len()` items, laid out the way `write_leaf`
+    /// fills one: the item table grows up from the end of the header and each
+    /// item's data is packed down from the end of the block.
+    fn leaf_of(nodesize: usize, sizes: &[usize]) -> alloc::vec::Vec<u8> {
+        let mut b = alloc::vec![0u8; nodesize];
+        header::set_nritems(&mut b, sizes.len() as u32);
+        let mut off = nodesize - HEADER_SIZE;
+        for (slot, &size) in sizes.iter().enumerate() {
+            off -= size;
+            leaf::set_data_off(&mut b, slot, off);
+            leaf::set_data_size(&mut b, slot, size);
+        }
+        b
+    }
+
+    /// Every kind of file keeps its own on-disk directory-entry type, and the
+    /// trip through the stored inode mode brings back the same kind.
+    ///
+    /// `fs.rs` writes `kind.dir_type()` into each directory entry and reads a
+    /// kind back with `InodeItem::kind()`, which is `from_mode` over the
+    /// stored mode. Both halves had to agree and nothing checked either: a
+    /// symlink whose entry says fifo is reported as a fifo by `readdir`, and a
+    /// program that trusts `d_type` -- `find`, `ls`, `rsync`, the loader of
+    /// any shared library -- opens it and blocks instead of following it.
+    ///
+    /// The seven numbers are pinned as literals on purpose. They are Linux's
+    /// own `BTRFS_FT_*` and the other implementation of this format reads
+    /// them, so nothing in this crate can derive them; and because the mapping
+    /// assertions name the same constants on both sides, this line is the only
+    /// one that falls if a value is renumbered.
+    #[test]
+    fn every_file_kind_keeps_its_on_disk_type_through_the_mode() {
+        let table = [
+            (S_IFREG, FileKind::Regular, FT_REG_FILE),
+            (S_IFDIR, FileKind::Dir, FT_DIR),
+            (S_IFLNK, FileKind::Symlink, FT_SYMLINK),
+            (S_IFCHR, FileKind::CharDevice, FT_CHRDEV),
+            (S_IFBLK, FileKind::BlockDevice, FT_BLKDEV),
+            (S_IFIFO, FileKind::Fifo, FT_FIFO),
+            (S_IFSOCK, FileKind::Socket, FT_SOCK),
+        ];
+        assert_eq!(
+            [
+                FT_REG_FILE,
+                FT_DIR,
+                FT_CHRDEV,
+                FT_BLKDEV,
+                FT_FIFO,
+                FT_SOCK,
+                FT_SYMLINK
+            ],
+            [1u8, 2, 3, 4, 5, 6, 7],
+            "the BTRFS_FT_* values are Linux's, not ours to renumber"
+        );
+        for (ifmt, kind, ft) in table {
+            assert_eq!(FileKind::from_mode(ifmt | 0o755), kind, "{:#o}", ifmt);
+            assert_eq!(kind.dir_type(), ft, "{:?}", kind);
+            assert_eq!(kind.mode_bits(), ifmt, "{:?}", kind);
+            // The round trip `fs.rs` makes: a mode stored on disk comes back
+            // as the same kind and so as the same entry type.
+            assert_eq!(FileKind::from_mode(kind.mode_bits()).dir_type(), ft);
+            // And `mode_bits` is only the type, because `fs.rs` composes it
+            // with the permission bits as `kind.mode_bits() | (mode & !S_IFMT)`.
+            assert_eq!(kind.mode_bits() & !S_IFMT, 0, "{:?}", kind);
+        }
+        // No two kinds collapse onto one entry type.
+        for (i, (_, _, a)) in table.iter().enumerate() {
+            for (_, _, b) in &table[i + 1..] {
+                assert_ne!(a, b, "two kinds share one BTRFS_FT_* value");
+            }
+        }
+        // A mode with no type bits, which a foreign image can hold, is read as
+        // a regular file rather than refused.
+        assert_eq!(FileKind::from_mode(0o644), FileKind::Regular);
+    }
+
+    /// The free room in a leaf is what is left between the item table and the
+    /// data area, and an empty leaf has all of it.
+    ///
+    /// `tree.rs` grows an item in place when `data.len() - old_size <= free`
+    /// and falls back to delete-then-insert otherwise. `write_leaf` refuses an
+    /// overflowing leaf with `Error::Corrupt("leaf overflow")`, so a
+    /// `free_space` that reports more room than there is turns a write on a
+    /// healthy filesystem into a corruption error. Reporting less only costs
+    /// the slower path, which is why the mutation that over-counted survived
+    /// the whole integration suite.
+    #[test]
+    fn the_free_room_in_a_leaf_is_what_lies_between_the_table_and_the_data() {
+        const NODE: usize = 4096;
+        let empty = leaf_of(NODE, &[]);
+        assert_eq!(leaf::data_start(&empty, NODE), NODE - HEADER_SIZE);
+        assert_eq!(leaf::free_space(&empty, NODE), NODE - HEADER_SIZE);
+
+        let b = leaf_of(NODE, &[100, 200, 300]);
+        assert_eq!(leaf::data_start(&b, NODE), NODE - HEADER_SIZE - 600);
+        assert_eq!(
+            leaf::free_space(&b, NODE),
+            NODE - HEADER_SIZE - 600 - 3 * ITEM_SIZE,
+            "each item costs its data plus its row in the table"
+        );
+
+        // `data_start` is the lowest offset in use, not the last slot's: the
+        // tree rewrites a leaf's items in key order, which is not the order
+        // their data sits in.
+        let mut mixed = leaf_of(NODE, &[64, 64]);
+        let low = leaf::data_off(&mixed, 1);
+        let high = leaf::data_off(&mixed, 0);
+        leaf::set_data_off(&mut mixed, 0, low);
+        leaf::set_data_off(&mut mixed, 1, high);
+        assert_eq!(leaf::data_start(&mixed, NODE), low);
+
+        // And a leaf whose table has already eaten past the data in use
+        // answers zero instead of wrapping around, which is what the
+        // `saturating_sub` is there for.
+        let mut tight = leaf_of(NODE, &[16; 20]);
+        for slot in 0..20 {
+            leaf::set_data_off(&mut tight, slot, 8);
+        }
+        assert_eq!(leaf::data_start(&tight, NODE), 8);
+        // The premise, which both sides of know at compile time: twenty rows
+        // of the table reach past the offset every item's data was put at.
+        const { assert!(20 * ITEM_SIZE > 8) };
+        assert_eq!(leaf::free_space(&tight, NODE), 0);
+    }
+
+    /// An item's data offset is counted from the end of the header, not from
+    /// the start of the block.
+    ///
+    /// Taken as absolute it lands `HEADER_SIZE` bytes early, which in a full
+    /// leaf is inside the item table: the read returns the bytes of some
+    /// item's key instead of the item's own data, and a write puts the data
+    /// over the table.
+    #[test]
+    fn an_items_data_starts_past_the_header_not_at_the_block() {
+        const NODE: usize = 4096;
+        let mut b = leaf_of(NODE, &[8]);
+        let off = HEADER_SIZE + leaf::data_off(&b, 0);
+        b[off..off + 8].copy_from_slice(b"on-disk!");
+        assert_eq!(leaf::data(&b, 0), b"on-disk!");
+        assert_eq!(leaf::data(&b, 0).len(), 8);
+
+        // Same bytes, read from the offset as if it were absolute: not this.
+        let raw = leaf::data_off(&b, 0);
+        assert_ne!(&b[raw..raw + 8], b"on-disk!");
+
+        // `data_mut` writes through the same window.
+        leaf::data_mut(&mut b, 0).copy_from_slice(b"rewritt!");
+        assert_eq!(&b[off..off + 8], b"rewritt!");
+    }
+
+    /// The incompat features this reader claims are the ones it can read.
+    ///
+    /// `volume.rs` refuses to mount an image carrying any incompat bit outside
+    /// `INCOMPAT_SUPPORTED`, so this constant is the whole mount policy. A bit
+    /// added to it mounts a filesystem whose layout this code does not
+    /// implement, and the first read of a compressed extent or of a RAID-5
+    /// stripe returns something that is not the file. A bit dropped from it
+    /// refuses an image that is perfectly readable.
+    #[test]
+    fn the_incompat_features_this_reader_claims_are_the_ones_it_can_read() {
+        for (flag, name) in [
+            (INCOMPAT_MIXED_BACKREF, "mixed-backref"),
+            (INCOMPAT_DEFAULT_SUBVOL, "default-subvol"),
+            (INCOMPAT_MIXED_GROUPS, "mixed-groups"),
+            (INCOMPAT_BIG_METADATA, "big-metadata"),
+            (INCOMPAT_EXTENDED_IREF, "extended-iref"),
+            (INCOMPAT_SKINNY_METADATA, "skinny-metadata"),
+            (INCOMPAT_NO_HOLES, "no-holes"),
+        ] {
+            assert_ne!(
+                INCOMPAT_SUPPORTED & flag,
+                0,
+                "{} is no longer claimed, so images that have it are refused",
+                name
+            );
+        }
+        for (flag, name) in [
+            (INCOMPAT_COMPRESS_LZO, "compress-lzo"),
+            (INCOMPAT_COMPRESS_ZSTD, "compress-zstd"),
+            (INCOMPAT_RAID56, "raid56"),
+        ] {
+            assert_eq!(
+                INCOMPAT_SUPPORTED & flag,
+                0,
+                "{} is claimed and this crate has no code for it",
+                name
+            );
+        }
+        // Nothing outside the ten flags the format defines.
+        let defined = INCOMPAT_MIXED_BACKREF
+            | INCOMPAT_DEFAULT_SUBVOL
+            | INCOMPAT_MIXED_GROUPS
+            | INCOMPAT_COMPRESS_LZO
+            | INCOMPAT_COMPRESS_ZSTD
+            | INCOMPAT_BIG_METADATA
+            | INCOMPAT_EXTENDED_IREF
+            | INCOMPAT_RAID56
+            | INCOMPAT_SKINNY_METADATA
+            | INCOMPAT_NO_HOLES;
+        assert_eq!(INCOMPAT_SUPPORTED & !defined, 0);
+    }
+}
