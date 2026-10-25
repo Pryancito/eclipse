@@ -12537,15 +12537,10 @@ impl NvidiaGpu {
                 // Refusing any sync list with EOPNOTSUPP (as this arm did)
                 // failed every sparse bind that had a fence, that is every
                 // one NVK sends, and the queue was lost with it.
-                let run_async = req.flags & nv::VM_BIND_RUN_ASYNC != 0;
-                if !run_async && (req.wait_count != 0 || req.sig_count != 0) {
-                    // `nouveau_job_init`: a synchronous job takes no syncs.
-                    log::warn!(
-                        "[nouveau-uapi] VM_BIND: a synchronous bind (no RUN_ASYNC) carries no syncs (got wait_count={} sig_count={})",
-                        req.wait_count, req.sig_count
-                    );
-                    return Err(nv::EINVAL);
-                }
+                // The rule that a synchronous bind carries no syncs is
+                // applied below, once the lists are copied: it is
+                // `nouveau_job_init`'s, and `nouveau_uvmm_vm_bind_ucopy`
+                // has copied the three lists by then.
                 // NVK batches up to 4096 ops and 256 syncs per call
                 // (`NVKMD_NOUVEAU_MAX_BINDS`, `NVKMD_NOUVEAU_MAX_SYNCS`).
                 const MAX_VM_BIND_OPS: u32 = 4096;
@@ -12578,6 +12573,21 @@ impl NvidiaGpu {
                     || !user_slice_ok::<nv::DrmNouveauSync>(req.sig_ptr, req.sig_count)
                 {
                     return Err(nv::EFAULT);
+                }
+                let run_async = req.flags & nv::VM_BIND_RUN_ASYNC != 0;
+                if !run_async && (req.wait_count != 0 || req.sig_count != 0) {
+                    // `nouveau_job_init`: a synchronous job takes no syncs.
+                    // AFTER the copy (`nouveau_uvmm_vm_bind_ucopy` runs
+                    // before `nouveau_uvmm_vm_bind` builds the job): a
+                    // count with no array is EFAULT whether or not the bind
+                    // is asynchronous. This applied the rule first, so a
+                    // synchronous bind naming a list it had no array for was
+                    // EINVAL.
+                    log::warn!(
+                        "[nouveau-uapi] VM_BIND: a synchronous bind (no RUN_ASYNC) carries no syncs (got wait_count={} sig_count={})",
+                        req.wait_count, req.sig_count
+                    );
+                    return Err(nv::EINVAL);
                 }
                 let ops = if req.op_count > 0 {
                     unsafe {
@@ -12791,6 +12801,50 @@ impl NvidiaGpu {
                     || !user_slice_ok::<nv::DrmNouveauSync>(req.sig_ptr, req.sig_count)
                 {
                     return Err(nv::EFAULT);
+                }
+                // The pushes are measured HERE, with the arrays copied and
+                // before the syncs are looked up: `nouveau_exec_job_init`
+                // measures every push while it builds the job, and only
+                // `nouveau_job_submit`, submitting it, looks the syncs up.
+                // So a push that is empty, not a dword stream or longer
+                // than one GPFIFO entry can name is EINVAL ahead of a sig
+                // that is not the caller's (ENOENT) and of a wait of a type
+                // nobody knows (EOPNOTSUPP), and a count with no array
+                // (EFAULT, above) is ahead of both. This measured the
+                // pushes after the syncs, so a bad push behind a stranger's
+                // sig answered ENOENT.
+                let pushes: &[nv::DrmNouveauExecPush] = if req.push_count > 0 {
+                    unsafe {
+                        core::slice::from_raw_parts(
+                            req.push_ptr as *const nv::DrmNouveauExecPush,
+                            req.push_count as usize,
+                        )
+                    }
+                } else {
+                    &[]
+                };
+                for push in pushes {
+                    if push.va_len == 0 || push.va_len % 4 != 0 {
+                        crate::klog_warn!(
+                            "[nouveau-uapi] EXEC: push va={:#x} va_len={} is empty or not a multiple of 4 (pushbuffers are dword streams)",
+                            push.va,
+                            push.va_len
+                        );
+                        return Err(nv::EINVAL);
+                    }
+                    // Longer than a GPFIFO entry's LENGTH can name: encoded
+                    // anyway, the field wrapped and the GPU ran a push of
+                    // `va_len mod 8 MiB`, the rest of the command buffer
+                    // silently skipped. Linux refuses it here too.
+                    if push.va_len > nv::EXEC_PUSH_MAX_LENGTH {
+                        crate::klog_warn!(
+                            "[nouveau-uapi] EXEC: push va={:#x} va_len={:#x} exceeds the {:#x} one GPFIFO entry can name",
+                            push.va,
+                            push.va_len,
+                            nv::EXEC_PUSH_MAX_LENGTH
+                        );
+                        return Err(nv::EINVAL);
+                    }
                 }
                 // Every sig handle must exist BEFORE anything happens, as in
                 // Linux, where `nouveau_job_submit` looks the whole list up
@@ -13053,35 +13107,7 @@ impl NvidiaGpu {
                     }
                     return Ok(0);
                 }
-                let pushes = unsafe {
-                    core::slice::from_raw_parts(
-                        req.push_ptr as *const nv::DrmNouveauExecPush,
-                        req.push_count as usize,
-                    )
-                };
-                for push in pushes {
-                    if push.va_len == 0 || push.va_len % 4 != 0 {
-                        crate::klog_warn!(
-                            "[nouveau-uapi] EXEC: push va={:#x} va_len={} is empty or not a multiple of 4 (pushbuffers are dword streams)",
-                            push.va,
-                            push.va_len
-                        );
-                        return Err(nv::EINVAL);
-                    }
-                    // Longer than a GPFIFO entry's LENGTH can name: encoded
-                    // anyway, the field wrapped and the GPU ran a push of
-                    // `va_len mod 8 MiB`, the rest of the command buffer
-                    // silently skipped. Linux refuses it here too.
-                    if push.va_len > nv::EXEC_PUSH_MAX_LENGTH {
-                        crate::klog_warn!(
-                            "[nouveau-uapi] EXEC: push va={:#x} va_len={:#x} exceeds the {:#x} one GPFIFO entry can name",
-                            push.va,
-                            push.va_len,
-                            nv::EXEC_PUSH_MAX_LENGTH
-                        );
-                        return Err(nv::EINVAL);
-                    }
-                }
+                // Measured above, before the syncs: every push is sound.
                 // One-shot: dump the head of the FIRST push Mesa ever submits.
                 // With the self-test proving (or disproving) the plumbing, the
                 // next question is what NVK's first methods ARE -- which

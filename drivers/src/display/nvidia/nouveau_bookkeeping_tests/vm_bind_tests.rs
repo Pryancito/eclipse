@@ -469,3 +469,76 @@ fn a_vm_bind_map_names_its_object_before_its_window_and_an_unknown_op_fails_afte
     gpu.nouveau_release_process(A);
     gpu.nouveau_release_process(B);
 }
+
+/// `nouveau_uvmm_vm_bind_ucopy` copies the op, wait and sig lists before
+/// `nouveau_uvmm_vm_bind` builds the job, and it is `nouveau_job_init`,
+/// building it, that refuses syncs on a synchronous bind (no RUN_ASYNC):
+/// a count with no array is EFAULT whether or not the bind is
+/// asynchronous, and the EINVAL comes once the lists are in. This applied
+/// the rule before the copy, so a synchronous bind naming a sync list it
+/// had no array for was EINVAL.
+#[test]
+fn vm_bind_copies_its_lists_before_the_rule_against_syncs_on_a_synchronous_bind() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    // A has an RM channel (or VM_BIND is ENODEV before anything) and one
+    // mapping of its own, which the binds below never add to.
+    let _ch = client_with_pushbuf(&gpu, A);
+    let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    // A wait the job could take (signaled) and a sig it could deliver: the
+    // rule, not the lookups, is what refuses them.
+    let done = syncobj::create(true);
+    let out = syncobj::create(false);
+    let waits = [sync(done)];
+    let sigs = [sync(out)];
+    let mut ops = [map(h, 0x2_0000_0000, 65536)];
+    let (ops_p, waits_p, sigs_p) = (ops.as_mut_ptr() as u64, ptr_of(&waits), ptr_of(&sigs));
+    let before = FAKE_RM.lock().calls.len();
+    let had = driver_maps(&gpu, A).len();
+    let raw = |op_ptr: u64, waits: (u32, u64), sigs: (u32, u64)| {
+        let mut r = nv::DrmNouveauVmBind {
+            op_count: 1,
+            flags: 0,
+            wait_count: waits.0,
+            sig_count: sigs.0,
+            wait_ptr: waits.1,
+            sig_ptr: sigs.1,
+            op_ptr,
+        };
+        call(&gpu, wr::<nv::DrmNouveauVmBind>(nv::NR_VM_BIND), &mut r, A)
+    };
+    assert_eq!(
+        raw(ops_p, (1, 0), (0, 0)),
+        Err(nv::EFAULT),
+        "waits with no array: the copy faults first"
+    );
+    assert_eq!(
+        raw(ops_p, (0, 0), (1, 0)),
+        Err(nv::EFAULT),
+        "sigs with no array"
+    );
+    assert_eq!(
+        raw(0, (1, waits_p), (0, 0)),
+        Err(nv::EFAULT),
+        "ops with no array, the waits with one"
+    );
+    assert_eq!(
+        raw(ops_p, (1, waits_p), (0, 0)),
+        Err(nv::EINVAL),
+        "the lists in: a synchronous bind carries no waits"
+    );
+    assert_eq!(raw(ops_p, (0, 0), (1, sigs_p)), Err(nv::EINVAL), "nor sigs");
+    assert_eq!(
+        raw(ops_p, (1, waits_p), (1, sigs_p)),
+        Err(nv::EINVAL),
+        "nor both"
+    );
+    assert_eq!(rm_calls_since(before), [] as [&str; 0]);
+    assert_eq!(driver_maps(&gpu, A).len(), had, "nothing bound");
+    assert_eq!(syncobj::query(out), Some(0), "nothing signaled");
+    syncobj::destroy(done);
+    syncobj::destroy(out);
+}
