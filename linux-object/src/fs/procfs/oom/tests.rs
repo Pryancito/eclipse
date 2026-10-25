@@ -211,8 +211,10 @@ fn the_files_are_written_through_the_directory() {
 
 #[test]
 fn the_memory_a_process_holds_counts() {
-    // 2 MiB of the host's 1 GiB is one thousandth of a point and a bit:
-    // enough to lift a process of no adjustment off 666.
+    // 2 MiB is two thousandths of the host's 1 GiB, one point of the
+    // badness's thousand: enough to lift a process of no adjustment off
+    // 666. At an address of its own, because `None` is page 0 on the host
+    // and only root may map that.
     use zircon_object::vm::{MMUFlags, VmObject, PAGE_SIZE};
     let proc = a_process(49_546);
     let pages = 512;
@@ -220,7 +222,7 @@ fn the_memory_a_process_holds_counts() {
     let at = proc
         .vmar()
         .map(
-            None,
+            Some(0x40_0000),
             VmObject::new_paged(pages),
             0,
             pages * PAGE_SIZE,
