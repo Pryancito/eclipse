@@ -752,6 +752,14 @@ static WAIT_TIMEOUTS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 /// the signalling side needs; that ratio is what [`wait_spin_backoff`] is
 /// there to keep down.
 static WAIT_TABLE_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many times a wait has looked at the table so far: a test that
+/// models the GPU on another thread reads it to know a wait has begun
+/// (and so the waiter has already decided what it waits on).
+#[cfg(test)]
+pub fn wait_table_probes() -> u64 {
+    WAIT_TABLE_PROBES.load(Ordering::Relaxed)
+}
 /// `spin_loop()` turns [`wait`] has burned between those looks -- the time
 /// it is NOT holding [`TABLE`]. Only the tests read it: a spin turn costs no
 /// time on the test clock, so this is the only way to see from a test that
