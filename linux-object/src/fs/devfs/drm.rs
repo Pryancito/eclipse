@@ -391,6 +391,10 @@ pub fn set_crtc_blanked(on: bool) {
         return;
     }
     if on {
+        // `drm_crtc_vblank_off` wakes `vblank->queue`: every blocking
+        // `WAIT_VBLANK` parked on this pipe ends now, with the count there
+        // is, instead of sleeping on to its cap on a pipe that is off.
+        wake_crtc_off_queue();
         if let Some(display) = primary_display() {
             display.clear(zcore_drivers::prelude::RgbColor::new(0, 0, 0));
             let _ = display.flush();
@@ -415,6 +419,34 @@ pub fn set_crtc_blanked(on: bool) {
 /// DPMS property, and gates the kernel's own repaints.
 pub fn crtc_blanked() -> bool {
     CRTC_BLANKED.load(Ordering::SeqCst)
+}
+
+/// `vblank->queue`: the wakers of the blocking `WAIT_VBLANK` sleeps parked
+/// on this pipe (`DrmDev::wait_vblank_sleep_capped`), which the CRTC going
+/// off wakes, as `drm_crtc_vblank_off` does.
+static CRTC_OFF_QUEUE: Mutex<Vec<core::task::Waker>> = Mutex::new(Vec::new());
+
+/// Park `waker` until the CRTC goes off. One entry per task: a sleep that
+/// is polled again does not queue twice.
+pub fn crtc_off_queue_add(waker: &core::task::Waker) {
+    let mut queue = CRTC_OFF_QUEUE.lock();
+    if !queue.iter().any(|w| w.will_wake(waker)) {
+        queue.push(waker.clone());
+    }
+}
+
+/// A sleep that ended on its own (its vblank came, or its cap) leaves the
+/// queue, or the queue would grow by one waker per wait between two blanks.
+pub fn crtc_off_queue_remove(waker: &core::task::Waker) {
+    CRTC_OFF_QUEUE.lock().retain(|w| !w.will_wake(waker));
+}
+
+fn wake_crtc_off_queue() {
+    // Taken out before waking: a woken sleep may queue itself again.
+    let woken = core::mem::take(&mut *CRTC_OFF_QUEUE.lock());
+    for waker in woken {
+        waker.wake();
+    }
 }
 
 /// Set or clear the CRTC's mode (see [`CRTC_ENABLED`]). A present turns it

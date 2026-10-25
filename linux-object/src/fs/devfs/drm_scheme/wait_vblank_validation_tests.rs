@@ -3,6 +3,9 @@
 //! the masks, and a pipe the card does not have, each EINVAL in
 //! `drm_wait_vblank_ioctl` before the sequence is even looked at. This
 //! arm answered all of them with pipe 0's counter.
+extern crate std;
+
+use super::crtc_sequence_tests::{get_sequence, queue};
 use super::gl_client_sequence_tests::Client;
 use super::*;
 use crate::fs::devfs::kms_emu::{self, EmuGpu};
@@ -248,4 +251,177 @@ fn a_blocking_wait_the_cap_stops_is_ebusy_with_the_count_there_is() {
         soon.sequence,
         now.wrapping_add(1)
     );
+}
+
+/// The CRTC off -- `set_crtc_blanked`, what DPMS off, SETCRTC without a
+/// mode and RMFB of the scanout do -- and back on when dropped, panic or
+/// not, so a failed assertion does not leave the next test on a dark pipe.
+struct CrtcOff;
+
+impl CrtcOff {
+    fn now() -> Self {
+        drm::set_crtc_blanked(true);
+        CrtcOff
+    }
+
+    /// The CRTC goes off from another thread `after` this call: a wait
+    /// parked in the sleep by then sees the pipe go off under it.
+    fn after(delay: Duration) -> (Self, std::thread::JoinHandle<()>) {
+        let off = std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            drm::set_crtc_blanked(true);
+        });
+        (CrtcOff, off)
+    }
+}
+
+impl Drop for CrtcOff {
+    fn drop(&mut self) {
+        drm::set_crtc_blanked(false);
+    }
+}
+
+/// With the CRTC off (DPMS off, SETCRTC without a mode, RMFB of its
+/// scanout: what `drm_crtc_vblank_off` turns off) `drm_vblank_get` is
+/// EINVAL: WAIT_VBLANK in both forms, after the type and pipe checks;
+/// CRTC_GET_SEQUENCE after its ENOENT; CRTC_QUEUE_SEQUENCE after ENOENT
+/// and the flags. All three served the counter here, so a client paced
+/// on a pipe that was off as if it were on. The sleep `sys_ioctl` awaits
+/// returns at once: there is nothing to wait for. On again, all three
+/// answer as ever, the counter not having stopped. (Xorg's modesetting
+/// driver probes GET_SEQUENCE once at start, with the CRTC on; told
+/// EINVAL later it stays on WAIT_VBLANK, as on Linux.)
+#[test]
+fn with_the_crtc_off_no_vblank_can_be_held() {
+    let _screen = kms_emu::attach(32, 8);
+    let c = Client::open(0);
+    let crtc = drm::SYNTH_CRTC_ID;
+    let now = wait(&c, RELATIVE, 0).expect("on: the counter");
+    let off = CrtcOff::now();
+    assert_eq!(
+        wait(&c, RELATIVE, 0),
+        Err(FsError::InvalidParam),
+        "the query"
+    );
+    assert_eq!(
+        wait(&c, RELATIVE | _DRM_VBLANK_EVENT, 1),
+        Err(FsError::InvalidParam),
+        "the event form"
+    );
+    assert_eq!(
+        wait(&c, RELATIVE | high_crtc(2), 0),
+        Err(FsError::InvalidParam),
+        "a missing pipe, still"
+    );
+    // The blocking form: the sleep returns at once, and the arm refuses.
+    let mut req = DrmWaitVblank {
+        typ: 0,
+        sequence: now.wrapping_add(1000),
+        val1: 0,
+        val2: 0,
+    };
+    let before = kernel_hal::timer::timer_now();
+    let cap = before + Duration::from_secs(1);
+    let data = &mut req as *mut DrmWaitVblank as usize;
+    async_std::task::block_on(c.dev().wait_vblank_sleep_capped(data, cap))
+        .expect("no signal can reach this sleep");
+    assert!(
+        kernel_hal::timer::timer_now() < before + Duration::from_millis(500),
+        "the sleep parked on a pipe that is off"
+    );
+    assert_eq!(
+        c.ioctl(DRM_IOCTL_WAIT_VBLANK, &mut req),
+        Err(FsError::InvalidParam)
+    );
+    // GET_SEQUENCE: the lookup first, then the pipe.
+    assert_eq!(get_sequence(&c, 0xC0FFEE), Err(FsError::EntryNotFound));
+    assert_eq!(get_sequence(&c, crtc), Err(FsError::InvalidParam));
+    // QUEUE_SEQUENCE: the lookup, the flags, then the pipe.
+    assert_eq!(
+        queue(&c, 0xC0FFEE, RELATIVE, 1, 0),
+        Err(FsError::EntryNotFound)
+    );
+    assert_eq!(
+        queue(&c, crtc, RELATIVE, 1, 0xabc),
+        Err(FsError::InvalidParam)
+    );
+    drop(off);
+    let later = wait(&c, RELATIVE, 0).expect("on again");
+    assert!(
+        (later.wrapping_sub(now) as i32) >= 0,
+        "the counter ran backwards: {} after {}",
+        later,
+        now
+    );
+    assert_eq!(wait(&c, RELATIVE | _DRM_VBLANK_EVENT, 1), Ok(later + 1));
+    assert_eq!(
+        get_sequence(&c, crtc).map(|(active, _, _)| active),
+        Ok(1),
+        "the mode is still up"
+    );
+    assert!(queue(&c, crtc, RELATIVE, 1, 0).is_ok());
+}
+
+/// A blocking wait parked when the CRTC goes off ends there and then with
+/// 0 and the count there is, ahead of the cap: `drm_crtc_vblank_off`
+/// wakes the waiters and `wait_event_interruptible_timeout` ends on
+/// `!vblank->enabled`. The mark is the request's own and taken before the
+/// arm looks at the CRTC: a query another thread makes in between is the
+/// EINVAL an off pipe gets, and the same struct asked again, the pipe
+/// still off, is EINVAL too.
+#[test]
+fn a_wait_the_crtc_goes_off_under_ends_with_the_count_there_is() {
+    let _screen = kms_emu::attach(32, 8);
+    let c = Client::open(0);
+    let now = wait(&c, RELATIVE, 0).expect("now");
+    let far = now.wrapping_add(1000);
+    let mut req = DrmWaitVblank {
+        typ: 0,
+        sequence: far,
+        val1: 0,
+        val2: 0,
+    };
+    let before = kernel_hal::timer::timer_now();
+    let cap = before + Duration::from_secs(1);
+    let (off, going_off) = CrtcOff::after(Duration::from_millis(5));
+    let data = &mut req as *mut DrmWaitVblank as usize;
+    async_std::task::block_on(c.dev().wait_vblank_sleep_capped(data, cap))
+        .expect("no signal can reach this sleep");
+    let ended = kernel_hal::timer::timer_now();
+    going_off
+        .join()
+        .expect("the thread that turned the CRTC off");
+    assert!(drm::crtc_blanked(), "the CRTC went off under the wait");
+    assert!(
+        ended < before + Duration::from_millis(500),
+        "the wait ran on after the CRTC went off: {:?}",
+        ended - before
+    );
+    // Another request in between: an off pipe's EINVAL, the mark not its.
+    assert_eq!(wait(&c, RELATIVE, 0), Err(FsError::InvalidParam));
+    // The wait that was cut short: 0, with the count there is.
+    assert_eq!(c.ioctl(DRM_IOCTL_WAIT_VBLANK, &mut req), Ok(0));
+    let now2 = drm::vblank_seq_now();
+    assert_eq!(req.typ, 0, "_DRM_VBLANK_ABSOLUTE");
+    assert!(
+        (req.sequence.wrapping_sub(now) as i32) >= 0
+            && (now2.wrapping_sub(req.sequence) as i32) >= 0,
+        "replied {} at {}..{}",
+        req.sequence,
+        now,
+        now2
+    );
+    assert!(
+        (far.wrapping_sub(req.sequence) as i32) > 0,
+        "the vblank asked for never came"
+    );
+    // Taken once: the same struct again, the pipe still off, is EINVAL.
+    req.typ = 0;
+    req.sequence = far;
+    assert_eq!(
+        c.ioctl(DRM_IOCTL_WAIT_VBLANK, &mut req),
+        Err(FsError::InvalidParam)
+    );
+    drop(off);
+    assert!(wait(&c, RELATIVE, 0).is_ok(), "on again");
 }

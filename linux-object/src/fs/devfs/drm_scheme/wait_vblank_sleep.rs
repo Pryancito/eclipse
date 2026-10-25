@@ -5,6 +5,52 @@
 
 use super::*;
 
+/// Sleep until `deadline`, or until the CRTC goes off, whichever comes
+/// first: the sleep parked on `vblank->queue`, which `drm_crtc_vblank_off`
+/// wakes. Without the queue the sleep would run on to the vblank asked for
+/// -- or its 3 s cap -- on a pipe that is off.
+fn until_vblank_or_crtc_off(deadline: Duration) -> UntilVblankOrCrtcOff<impl Future<Output = ()>> {
+    UntilVblankOrCrtcOff {
+        sleep: Box::pin(kernel_hal::thread::sleep_until(deadline)),
+        queued: None,
+    }
+}
+
+struct UntilVblankOrCrtcOff<F> {
+    sleep: Pin<Box<F>>,
+    /// The waker this sleep parked on the CRTC's queue, taken back when
+    /// the sleep ends on its own.
+    queued: Option<core::task::Waker>,
+}
+
+impl<F: Future<Output = ()>> Future for UntilVblankOrCrtcOff<F> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<()> {
+        if drm::crtc_blanked() {
+            return TaskPoll::Ready(());
+        }
+        // Queued BEFORE the sleep is polled and the flag read again after:
+        // a blank that lands between the read above and the queueing wakes
+        // nobody, and is caught by the read below.
+        drm::crtc_off_queue_add(cx.waker());
+        self.queued = Some(cx.waker().clone());
+        let slept = self.sleep.as_mut().poll(cx);
+        if drm::crtc_blanked() {
+            return TaskPoll::Ready(());
+        }
+        slept
+    }
+}
+
+impl<F> Drop for UntilVblankOrCrtcOff<F> {
+    fn drop(&mut self) {
+        if let Some(waker) = self.queued.take() {
+            drm::crtc_off_queue_remove(&waker);
+        }
+    }
+}
+
 impl DrmDev {
     /// Sleep until the vblank a blocking `DRM_IOCTL_WAIT_VBLANK` asked for.
     ///
@@ -49,6 +95,9 @@ impl DrmDev {
         if req.typ & _DRM_VBLANK_EVENT != 0 {
             return Ok(()); // event form: delivered by the timer queue, never blocks
         }
+        if drm::crtc_blanked() {
+            return Ok(()); // a CRTC that is off holds no vblank: the sync arm answers EINVAL
+        }
         const _DRM_VBLANK_RELATIVE: u32 = 0x1;
         const _DRM_VBLANK_NEXTONMISS: u32 = 0x1000_0000;
         // Resolve the target exactly as the sync arm does, or the two would
@@ -80,7 +129,13 @@ impl DrmDev {
             };
             acct.probe();
             if deadline >= cap {
-                crate::process::interruptible(kernel_hal::thread::sleep_until(cap)).await?;
+                crate::process::interruptible(until_vblank_or_crtc_off(cap)).await?;
+                if drm::crtc_blanked() {
+                    // The CRTC went off under the sleep, and woke it: as on
+                    // Linux, ahead of the cap, with the count there is.
+                    self.file.note_vblank_wait_cut_short(data);
+                    break;
+                }
                 // Stopped by the cap, not by the vblank asked for: the sync
                 // arm is to say so (EBUSY), not report the count as the one
                 // the caller waited for.
@@ -88,7 +143,17 @@ impl DrmDev {
                 self.file.note_vblank_wait_timed_out(data);
                 break;
             }
-            crate::process::interruptible(kernel_hal::thread::sleep_until(deadline)).await?;
+            crate::process::interruptible(until_vblank_or_crtc_off(deadline)).await?;
+            // The CRTC went off under the wait: `drm_crtc_vblank_off` wakes
+            // the waiters and `wait_event_interruptible_timeout` ends on
+            // `!vblank->enabled`, with 0 and the count there is, ahead of
+            // the cap. The sync arm takes the mark before it looks at the
+            // CRTC, or this wait would be the EINVAL a fresh request on a
+            // pipe that is off gets.
+            if drm::crtc_blanked() {
+                self.file.note_vblank_wait_cut_short(data);
+                break;
+            }
         }
         Ok(())
     }

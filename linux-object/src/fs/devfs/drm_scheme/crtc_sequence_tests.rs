@@ -10,7 +10,7 @@ const RELATIVE: u32 = 0x1;
 const NEXT_ON_MISS: u32 = 0x2;
 
 /// `drmCrtcGetSequence`: (active, sequence, sequence_ns).
-fn get_sequence(c: &Client, crtc_id: u32) -> Result<(u32, u64, i64)> {
+pub(super) fn get_sequence(c: &Client, crtc_id: u32) -> Result<(u32, u64, i64)> {
     let mut req = DrmCrtcGetSequence {
         crtc_id,
         active: 0xdead_beef,
@@ -23,7 +23,13 @@ fn get_sequence(c: &Client, crtc_id: u32) -> Result<(u32, u64, i64)> {
 }
 
 /// `drmCrtcQueueSequence`: the sequence the event was queued for.
-fn queue(c: &Client, crtc_id: u32, flags: u32, sequence: u64, user_data: u64) -> Result<u64> {
+pub(super) fn queue(
+    c: &Client,
+    crtc_id: u32,
+    flags: u32,
+    sequence: u64,
+    user_data: u64,
+) -> Result<u64> {
     let mut req = DrmCrtcQueueSequence {
         crtc_id,
         flags,
@@ -110,15 +116,25 @@ fn get_sequence_reports_the_counter_the_vblanks_time_and_whether_the_pipe_is_on(
     assert_eq!(mode_valid(&c, crtc), 1, "a fresh panel has its mode up");
     assert_eq!(active, 1, "`active` is `crtc_state->enable`");
 
-    // The pipe off: `active` follows; the counter does not stop.
+    // The pipe off: `drm_crtc_vblank_off` ran, and `drm_crtc_vblank_get`
+    // is EINVAL from then on. `active = 0` with the counter, which this
+    // answered, is not a reply Linux gives (`disable_outputs` checks the
+    // driver turned the vblank off). The counter itself does not stop:
+    // lit again (DPMS on, the mode still gone), it is ahead.
     set_crtc_off(&c, crtc);
     assert_eq!(mode_valid(&c, crtc), 0, "the pipe is off");
-    let (active, seq_off, _) = get_sequence(&c, crtc).expect("GET_SEQUENCE, pipe off");
-    assert_eq!(active, 0, "`active` with the pipe off");
+    assert_eq!(
+        get_sequence(&c, crtc),
+        Err(FsError::InvalidParam),
+        "`drm_vblank_get` with the pipe off"
+    );
+    drm::set_crtc_blanked(false);
+    let (active, seq_on, _) = get_sequence(&c, crtc).expect("GET_SEQUENCE, lit again");
+    assert_eq!(active, 0, "`active` is the mode, which SETCRTC took away");
     assert!(
-        ((seq_off as u32).wrapping_sub(seq as u32) as i32) >= 0,
+        ((seq_on as u32).wrapping_sub(seq as u32) as i32) >= 0,
         "the counter ran backwards: {} after {}",
-        seq_off,
+        seq_on,
         seq
     );
 }
