@@ -3,6 +3,15 @@
 /// `#[cfg(test)]` cannot delimit them: the first one in this file is on
 /// line 10, so splitting there would leave nothing to look at and the
 /// test would pass on anything.
+/// Where the pre-waits live: `drm_scheme.rs`, and the file the `WAIT_VBLANK`
+/// sleep moved to for the size ceiling.
+fn sources() -> &'static str {
+    concat!(
+        include_str!("../drm_scheme.rs"),
+        include_str!("wait_vblank_sleep.rs")
+    )
+}
+
 fn body<'a>(src: &'a str, signature: &str) -> &'a str {
     let after = src
         .split_once(signature)
@@ -14,7 +23,7 @@ fn body<'a>(src: &'a str, signature: &str) -> &'a str {
 
 #[test]
 fn a_pre_wait_does_not_resolve_the_table_twice_per_look() {
-    let src = include_str!("../drm_scheme.rs");
+    let src = sources();
     for name in [
         "pub async fn syncobj_wait_sleep(",
         "pub async fn atomic_in_fence_sleep(",
@@ -53,7 +62,7 @@ fn a_pre_wait_does_not_resolve_the_table_twice_per_look() {
 /// `a_list_of_fences_reads_each_landing_zone_once_and_answers_like_all`.
 #[test]
 fn a_pre_wait_on_a_list_of_fences_reads_each_landing_zone_once() {
-    let src = include_str!("../drm_scheme.rs");
+    let src = sources();
     for name in [
         "pub async fn cpu_prep_sleep(",
         "pub async fn present_fence_sleep(",
@@ -104,9 +113,9 @@ fn a_pre_wait_on_a_list_of_fences_reads_each_landing_zone_once() {
 /// and a GPU), so the guard is on the shape, like the two above.
 #[test]
 fn every_pre_wait_can_be_interrupted_by_a_signal() {
-    let src = include_str!("../drm_scheme.rs");
+    let src = sources();
     for name in [
-        "pub async fn wait_vblank_sleep(",
+        "pub async fn wait_vblank_sleep_capped(",
         "pub async fn syncobj_wait_sleep(",
         "pub async fn atomic_in_fence_sleep(",
         "pub async fn cpu_prep_sleep(",
@@ -191,9 +200,9 @@ fn only_a_wait_that_looked_twice_reports_parked_time() {
 /// GPU), so the guard is on the shape.
 #[test]
 fn every_pre_wait_accounts_its_parking() {
-    let src = include_str!("../drm_scheme.rs");
+    let src = sources();
     for (name, kind) in [
-        ("pub async fn wait_vblank_sleep(", "Kind::WaitVblank"),
+        ("pub async fn wait_vblank_sleep_capped(", "Kind::WaitVblank"),
         ("pub async fn syncobj_wait_sleep(", "Kind::SyncobjWait"),
         ("pub async fn atomic_in_fence_sleep(", "Kind::AtomicInFence"),
         ("pub async fn cpu_prep_sleep(", "Kind::CpuPrep"),
