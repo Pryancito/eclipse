@@ -133,42 +133,73 @@ struct Fuse {
     gone: HashMap<u64, FileAttr>,
 }
 
+/// FUSE calls the root inode 1; EclipseFS has its own number for it.
+///
+/// The swap is safe in both directions only because **no inode EclipseFS can
+/// hand out is 1**: the lowest it allocates is `cowfmt::FIRST_INO` (256, the
+/// root directory of every subvolume) and `cow.rs` refuses a handle below it,
+/// while the classic format numbers its root 1 and the swap is then the
+/// identity. If anything ever lowered `FIRST_INO` to 1, a file of subvolume 5
+/// would reach the kernel wearing `FUSE_ROOT_ID` and every operation on it
+/// would be redirected to the root directory. `to_fs_ino` and `to_fuse_ino`
+/// are a bijection on what the filesystem can produce, and `mapping_tests`
+/// holds that premise rather than the conclusion alone.
+fn to_fs_ino(root: u64, fuse_ino: u64) -> u64 {
+    if fuse_ino == fuser::FUSE_ROOT_ID {
+        root
+    } else {
+        fuse_ino
+    }
+}
+
+/// The inverse of [`to_fs_ino`].
+fn to_fuse_ino(root: u64, ino: u64) -> u64 {
+    if ino == root {
+        fuser::FUSE_ROOT_ID
+    } else {
+        ino
+    }
+}
+
+/// The attributes FUSE gets for an inode.
+///
+/// `perm` is masked because `FileAttr::perm` is twelve bits and `st.mode`
+/// carries the file type above them: unmasked, a directory's `S_IFDIR` would
+/// land in the permission bits. `blocks` is in **512-byte** units whatever
+/// `blksize` says, which is what `stat(2)` specifies and what `du` divides by.
+/// `crtime` has no EclipseFS field behind it and reports `ctime`, which is the
+/// closest thing on disk; only macOS asks for it.
+fn attr_of(root: u64, st: &InodeStat) -> FileAttr {
+    FileAttr {
+        ino: to_fuse_ino(root, st.ino),
+        size: st.size,
+        blocks: st.nbytes.div_ceil(512),
+        atime: time(st.atime),
+        mtime: time(st.mtime),
+        ctime: time(st.ctime),
+        crtime: time(st.ctime),
+        kind: file_type(st.kind),
+        perm: (st.mode & 0o7777) as u16,
+        nlink: st.nlink,
+        uid: st.uid,
+        gid: st.gid,
+        rdev: st.rdev as u32,
+        blksize: 4096,
+        flags: 0,
+    }
+}
+
 impl Fuse {
-    /// FUSE calls the root inode 1; EclipseFS has its own number for it.
     fn ino(&self, fuse_ino: u64) -> u64 {
-        if fuse_ino == fuser::FUSE_ROOT_ID {
-            self.root
-        } else {
-            fuse_ino
-        }
+        to_fs_ino(self.root, fuse_ino)
     }
 
     fn fuse_ino(&self, ino: u64) -> u64 {
-        if ino == self.root {
-            fuser::FUSE_ROOT_ID
-        } else {
-            ino
-        }
+        to_fuse_ino(self.root, ino)
     }
 
     fn attr(&self, st: &InodeStat) -> FileAttr {
-        FileAttr {
-            ino: self.fuse_ino(st.ino),
-            size: st.size,
-            blocks: st.nbytes.div_ceil(512),
-            atime: time(st.atime),
-            mtime: time(st.mtime),
-            ctime: time(st.ctime),
-            crtime: time(st.ctime),
-            kind: file_type(st.kind),
-            perm: (st.mode & 0o7777) as u16,
-            nlink: st.nlink,
-            uid: st.uid,
-            gid: st.gid,
-            rdev: st.rdev as u32,
-            blksize: 4096,
-            flags: 0,
-        }
+        attr_of(self.root, st)
     }
 
     fn stat(&self, fs: &mut EclipseFS, ino: u64) -> Result<FileAttr, i32> {
@@ -716,3 +747,6 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests;
