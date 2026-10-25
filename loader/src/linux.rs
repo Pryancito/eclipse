@@ -1473,6 +1473,10 @@ async fn handle_user_trap(
                 .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
                 .unwrap_or(0);
             let fault_result = vmar.handle_page_fault(vaddr, flags);
+            if fault_result.is_ok() {
+                // `ru_minflt`: every fault the address space resolves is one.
+                thread.note_minor_fault();
+            }
             if let Err(err) = fault_result {
                 if !fault_kills(thread, Signal::SIGSEGV) {
                     // The process asked for this fault: a handler is waiting

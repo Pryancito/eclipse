@@ -471,6 +471,9 @@ impl KernelHandler for ZcoreKernelHandler {
                         // case. Return WITHOUT touching the diagnosis latch, so
                         // concurrent legitimate faults on other CPUs are never
                         // serialized behind it or turned into false halts.
+                        // It is the thread's minor fault, as Linux counts the
+                        // one a `copy_to_user` takes for the task.
+                        thread.note_minor_fault();
                         return;
                     }
                 }

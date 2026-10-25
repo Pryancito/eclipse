@@ -49,6 +49,7 @@ fn a_configured_parent() -> LinuxProcessInner {
             stime_ns: 222,
             voluntary_switches: 333,
             involuntary_switches: 444,
+            minor_faults: 555,
         },
         pdeathsig: 15,
         child_subreaper: true,
