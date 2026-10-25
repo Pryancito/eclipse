@@ -263,7 +263,8 @@ pub use layout::{rename_images, ImageLayout};
 
 /// What [`LinuxElfLoader::load`] hands back: the entry point, the stack
 /// pointer, the initial break, the path of the image that runs, its ABI,
-/// where its argument and environment strings are, and where its parts are.
+/// where its argument and environment strings are, where its parts are, and
+/// the auxiliary vector on its stack.
 pub type Loaded = (
     VirtAddr,
     VirtAddr,
@@ -272,6 +273,7 @@ pub type Loaded = (
     Abi,
     Option<ArgArea>,
     ImageLayout,
+    Arc<[usize]>,
 );
 
 /// How many symbolic links an interpreter's path may go through, a `#!`
@@ -745,6 +747,7 @@ impl LinuxElfLoader {
                 abi,
                 init_stack.arg_area(),
                 layout,
+                init_stack.auxv().into(),
             ));
         }
 
@@ -913,6 +916,7 @@ impl LinuxElfLoader {
             abi,
             init_stack.arg_area(),
             layout,
+            init_stack.auxv().into(),
         ))
     }
 }

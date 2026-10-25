@@ -34,4 +34,16 @@ impl LinuxProcess {
     pub fn image_layout(&self) -> Option<ImageLayout> {
         self.inner.lock().image_layout
     }
+
+    /// Record the auxiliary vector the image just loaded was handed.
+    pub fn set_auxv(&self, auxv: Arc<[usize]>) {
+        self.inner.lock().auxv = auxv;
+    }
+
+    /// The auxiliary vector, `AT_NULL` pair included: empty when no loader
+    /// started this process's image, and copied by a fork as Linux copies
+    /// `mm->saved_auxv` with the rest of the `mm`.
+    pub fn auxv(&self) -> Arc<[usize]> {
+        self.inner.lock().auxv.clone()
+    }
 }

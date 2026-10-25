@@ -104,5 +104,28 @@ pub(super) fn read(proc: &Process, environ: bool) -> Option<Vec<u8>> {
     }
 }
 
+/// `auxv_read`: the auxiliary vector `proc`'s image was handed, word by
+/// word in the machine's byte order with its `AT_NULL` pair, as
+/// `getauxval` reads it off the stack. It was not there.
+///
+/// A process with no memory has none: a zombie, and a leader that has
+/// exited while the rest of its group runs on. Linux 6.18 refuses the open
+/// of either with `ESRCH`; here it reads empty, as a zombie's `environ`
+/// does.
+pub(super) fn auxv(proc: &Process) -> Vec<u8> {
+    let Some(lp) = proc.try_linux() else {
+        return Vec::new();
+    };
+    if matches!(proc.status(), Status::Exited(_))
+        || crate::process::exited_leader_of(proc).is_some()
+    {
+        return Vec::new();
+    }
+    lp.auxv()
+        .iter()
+        .flat_map(|word| word.to_ne_bytes())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;
