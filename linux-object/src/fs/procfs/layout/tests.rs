@@ -197,14 +197,23 @@ fn stat_prints_what_the_loader_recorded() {
 fn maps_names_the_heap_and_the_stack() {
     let proc = a_process(49_402);
     let rw = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
-    let map = |pages: usize| {
+    // At fixed addresses: `None` is page 0 in a Linux address space, which
+    // under libos only root may map (see
+    // `vsize_is_in_bytes_and_rss_in_pages_of_what_is_mapped_and_resident`).
+    let map = |at: usize, pages: usize| {
         proc.vmar()
-            .map(None, VmObject::new_paged(pages), 0, pages * PAGE_SIZE, rw)
+            .map(
+                Some(at),
+                VmObject::new_paged(pages),
+                0,
+                pages * PAGE_SIZE,
+                rw,
+            )
             .unwrap()
     };
-    let heap = map(4);
-    let stack = map(2);
-    let other = map(1);
+    let heap = map(0x1000_0000, 4);
+    let stack = map(0x2000_0000, 2);
+    let other = map(0x3000_0000, 1);
     proc.linux().set_image_layout(Some(ImageLayout {
         start_brk: heap,
         start_stack: stack + 0x10f0,

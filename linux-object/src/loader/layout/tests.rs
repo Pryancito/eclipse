@@ -1,5 +1,6 @@
 use super::*;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use zircon_object::vm::{MMUFlags, VmObject};
 
@@ -76,19 +77,26 @@ fn no_executable_segment_is_no_code() {
 fn renaming_gives_each_named_row_the_path_its_name_resolves_to() {
     let vmar = VmAddressRegion::new_root();
     let rw = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+    // At fixed addresses and not `None`: a Linux root VMAR starts at 0, so
+    // the first free area is page 0, and under libos that is a host
+    // `MAP_FIXED` at 0, which only root may do. It passed as root and failed
+    // for anyone else (`EPERM`), as CI runs it.
+    let next = core::cell::Cell::new(0x1000_0000);
+    let map = |vmo: Arc<VmObject>| {
+        let at = next.replace(next.get() + 2 * PAGE_SIZE);
+        vmar.map(Some(at), vmo, 0, PAGE_SIZE, rw).unwrap()
+    };
     let named = |name: &str| {
         let vmo = VmObject::new_paged(1);
         vmo.set_name(name);
-        vmar.map(None, vmo, 0, PAGE_SIZE, rw).unwrap()
+        map(vmo)
     };
     let text = named("./survey");
     let data = named("./survey");
     let interp = named("/lib64/ld-linux-x86-64.so.2");
     let same = named("/lib/ld-musl-x86_64.so.1");
     let vdso = named("[vdso]");
-    let anon = vmar
-        .map(None, VmObject::new_paged(1), 0, PAGE_SIZE, rw)
-        .unwrap();
+    let anon = map(VmObject::new_paged(1));
 
     let asked = core::cell::RefCell::new(Vec::new());
     rename_images(&vmar, |name| {
