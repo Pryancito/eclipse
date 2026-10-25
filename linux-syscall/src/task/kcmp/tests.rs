@@ -507,3 +507,21 @@ fn looking_at_a_task_is_the_ptrace_read_check() {
         p.exit(0);
     }
 }
+
+/// `struct kcmp_epoll_slot` comes from user space through a `UserInPtr`, and
+/// its three fields are three `u32` in a row. `efd` and `tfd` are both file
+/// descriptors, so swapping them does not fail cleanly: `kcmp` looks the epoll
+/// up under the watched fd and answers about whatever it finds there, or says
+/// `EINVAL` because that is not an epoll. The tests above cannot see it --
+/// they build the slot field by field by name, so they read the same in
+/// whichever order the three are declared.
+#[test]
+fn the_epoll_slot_is_linux_s_struct_kcmp_epoll_slot() {
+    use core::mem::{align_of, offset_of, size_of};
+
+    assert_eq!(size_of::<KcmpEpollSlot>(), 12);
+    assert_eq!(align_of::<KcmpEpollSlot>(), 4);
+    assert_eq!(offset_of!(KcmpEpollSlot, efd), 0);
+    assert_eq!(offset_of!(KcmpEpollSlot, tfd), 4);
+    assert_eq!(offset_of!(KcmpEpollSlot, toff), 8);
+}

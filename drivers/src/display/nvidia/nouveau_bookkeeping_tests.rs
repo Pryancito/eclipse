@@ -9376,3 +9376,7 @@ mod rm_edges_tests;
 /// The arms the fake RM reaches only when it fails as a call, the
 /// `Unknown` architecture, and the empty EXEC that rides the ring.
 mod rm_failures_tests;
+
+/// The `/proc` readers of the bring-up ladder (`gpustep15/16/17`,
+/// `gpuedid`) on the fake RM, and the HDA driver's two questions.
+mod proc_steps_tests;
