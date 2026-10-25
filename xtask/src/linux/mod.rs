@@ -7118,6 +7118,11 @@ mod rootfs_plumbing_tests {
 
     // ---- the renderer policy a login shell inherits -------------------
 
+    /// The value a login shell ends up with, which is not always the rest of
+    /// the line: `export HOME=/root; mkdir -p /root/.ollama` assigns `/root`
+    /// and THEN runs a command, so the assignment ends at the first `;`.
+    /// Reading the rest of the line instead would read the command as part of
+    /// the value, and no exported value here contains a semicolon.
     fn export<'a>(block: &'a str, key: &str) -> Option<&'a str> {
         block
             .lines()
@@ -7125,7 +7130,10 @@ mod rootfs_plumbing_tests {
             .filter_map(|l| l.strip_prefix("export "))
             .filter_map(|l| l.split_once('='))
             .find(|(k, _)| *k == key)
-            .map(|(_, v)| v)
+            .map(|(_, v)| match v.split_once(';') {
+                Some((value, _)) => value.trim_end(),
+                None => v,
+            })
     }
 
     fn profile_text(tag: &str) -> String {
