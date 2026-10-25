@@ -4155,10 +4155,26 @@ impl DrmScheme for NvidiaGpu {
                     self.bar2_phys,
                     self.bar2_len,
                 ) {
-                    Ok(device_instance) => {
+                    Ok(device_instance)
+                        if device_instance < nvidia_rm_sys::rm_init::MAX_LADDER_GPUS =>
+                    {
                         *self.rm_device_instance.lock() = Some(device_instance);
                         alloc::format!("gpumgrAttachGpu OK, deviceInstance={}", device_instance)
                     }
+                    // The one place an RM device instance enters this port, and
+                    // so the one place to check it has a per-GPU slot in the C
+                    // glue (see `MAX_LADDER_GPUS`). Refusing here, loudly, beats
+                    // thirty-odd entry points indexing an array by it: the
+                    // instance is never stored, so nothing downstream can reach
+                    // a slot that is not this card's. A desktop box never gets
+                    // here; a machine that does needs the constant raised, not
+                    // a card quietly sharing another card's ladder.
+                    Ok(device_instance) => alloc::format!(
+                        "gpumgrAttachGpu OK, deviceInstance={} -- REFUSED: este puerto \
+                         guarda ladder para {} GPUs; sube ECLIPSE_MAX_GPUS",
+                        device_instance,
+                        nvidia_rm_sys::rm_init::MAX_LADDER_GPUS,
+                    ),
                     Err(status) => {
                         alloc::format!("gpumgrAttachGpu FAILED, NV_STATUS={:#x}", status)
                     }
