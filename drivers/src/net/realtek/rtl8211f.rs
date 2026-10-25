@@ -1985,6 +1985,10 @@ pub(crate) mod fake {
     /// The MAC's `SOFT_RST` never clears: EMAC clock or power not up yet.
     static MAC_RESET_STICKS: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
+    /// The MDIO bus never clears `MII_BUSY`: a PHY with no clock behind it,
+    /// or a management bus held by something else.
+    static MDIO_STICKS_BUSY: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
     /// Which interrupt bits the last acknowledgement named.
     static LAST_INT_ACK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -2091,6 +2095,13 @@ pub(crate) mod fake {
         if cmd & MII_BUSY == 0 {
             return;
         }
+        if MDIO_STICKS_BUSY.load(Ordering::SeqCst) {
+            // Left busy, and the register transfer left undone with it. This
+            // is the only way to reach the driver's bounded wait on the bus,
+            // which a passive fake never does because plain memory reads back
+            // the zero the window starts at.
+            return;
+        }
         let reg = ((cmd & 0x0000_07F0) >> 4) as usize;
         {
             let mut guard = PHY.lock();
@@ -2126,6 +2137,7 @@ pub(crate) mod fake {
         *PHY.lock() = Some(phy);
         PHY_RESET_STICKS.store(false, Ordering::SeqCst);
         MAC_RESET_STICKS.store(false, Ordering::SeqCst);
+        MDIO_STICKS_BUSY.store(false, Ordering::SeqCst);
         LAST_INT_ACK.store(0, Ordering::SeqCst);
         Guard {
             _turnstile: turnstile,
@@ -2149,6 +2161,14 @@ pub(crate) mod fake {
             self
         }
 
+        /// The MDIO bus never clears `MII_BUSY`, and the register transfer
+        /// behind it never happens either. That pair is what tells a bus that
+        /// answered late from one that never answered at all.
+        pub fn with_mdio_stuck_busy(self) -> Self {
+            MDIO_STICKS_BUSY.store(true, core::sync::atomic::Ordering::SeqCst);
+            self
+        }
+
         /// Start recording cache and fence operations, from empty.
         pub fn record_cache(&self) {
             super::super::utils::host::begin();
@@ -2166,6 +2186,7 @@ pub(crate) mod fake {
             *PHY.lock() = None;
             PHY_RESET_STICKS.store(false, Ordering::SeqCst);
             MAC_RESET_STICKS.store(false, Ordering::SeqCst);
+            MDIO_STICKS_BUSY.store(false, Ordering::SeqCst);
             super::super::utils::host::end();
         }
     }
@@ -3490,5 +3511,119 @@ mod tests {
             RX_INT | TX_UNF_INT,
             "nothing is disarmed on the way through"
         );
+    }
+
+    // --------------------------------------------- when nothing answers back
+
+    /// A management bus that never clears `MII_BUSY` is a PHY with no clock
+    /// behind it, and `adjust_link` runs before anything else on this card: a
+    /// wait with no bound there is a boot that never finishes, with no console
+    /// message to say why.
+    ///
+    /// What the test cannot assert is an error, because there is nowhere to put
+    /// one: `mdio_read` returns `u32` and hands back whatever the data register
+    /// holds. That is the limitation being pinned -- a read off a dead bus comes
+    /// back as the PREVIOUS transaction's data and the caller cannot tell.
+    #[test]
+    fn a_management_bus_that_never_answers_does_not_wedge_a_register_read() {
+        let _dev = fake::with_phy(Phy::gigabit_partner()).with_mdio_stuck_busy();
+        let mut nic = driver();
+        fake::write(GMAC_BASE + GETH_MDIO_DATA, 0xdead);
+
+        let got = nic.mdio_read(0, MII_BMSR);
+
+        assert_eq!(
+            got, 0xdead,
+            "the wait is bounded, so the read returns -- with the stale contents \
+             of the data register, which is all there is to return"
+        );
+        assert_ne!(
+            fake::read(GMAC_BASE + GETH_MDIO_ADDR) & MII_BUSY,
+            0,
+            "and the bus is still busy afterwards: the driver gave up on it \
+             rather than the transaction having quietly completed"
+        );
+    }
+
+    #[test]
+    fn a_management_bus_that_never_answers_does_not_wedge_a_register_write() {
+        let _dev = fake::with_phy(Phy::gigabit_partner()).with_mdio_stuck_busy();
+        let mut nic = driver();
+        let before = fake::phy_reg(MII_BMCR);
+
+        nic.mdio_write(0, MII_BMCR, 0x1234);
+
+        assert_eq!(
+            fake::phy_reg(MII_BMCR),
+            before,
+            "nothing reached the PHY, which is the point: a write the bus never \
+             carried must not look like one it did"
+        );
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_MDIO_DATA),
+            0x1234,
+            "the data register is loaded before the command, so the byte the \
+             driver meant to send is there even though the bus never took it"
+        );
+    }
+
+    /// A partner that answers but never finishes negotiating: the cable is in,
+    /// `BMSR_ANEGCOMPLETE` never arrives. The wait for it is the second
+    /// unbounded loop this driver used to have.
+    #[test]
+    fn a_partner_that_never_finishes_negotiating_does_not_wedge_the_boot() {
+        let mut phy = Phy::gigabit_partner();
+        phy.regs[MII_BMSR as usize] &= !BMSR_ANEGCOMPLETE;
+        let _dev = fake::with_phy(phy);
+        let mut nic = driver();
+
+        nic.phy_restart_aneg();
+
+        assert_eq!(
+            fake::phy_reg(MII_BMCR) & (BMCR_ANENABLE | BMCR_ANRESTART),
+            BMCR_ANENABLE | BMCR_ANRESTART,
+            "it did ask for a negotiation before giving up on waiting for one"
+        );
+        assert_eq!(
+            fake::phy_reg(MII_BMCR) & BMCR_ISOLATE,
+            0,
+            "and it took the PHY out of isolation, or the negotiation it just \
+             asked for cannot reach the wire"
+        );
+    }
+
+    // ------------------------------------------------- the interface it drives
+
+    /// The PHY interface decides the clock the MAC drives, and getting it wrong
+    /// is a link that comes up and carries nothing. `EMAC_EPHY_CLK_REG0` lives
+    /// in the system-control block, not in the GMAC's own.
+    #[test]
+    fn each_phy_interface_gets_its_own_clock_setting() {
+        // (mode, the clock register it must leave behind)
+        //
+        // Bit 2 is RGMII, bit 0 and 1 are ETCS, bit 13 is RMII_EN, and the
+        // transmit delay sits at bits 10-12: TX_DELAY is 3, so 0x0C00 is in
+        // every answer and RX_DELAY of 0 adds nothing at bits 5-9.
+        let esperado = [
+            (RGMII, 0x04 | 0x02 | 0x0C00),
+            (GMII, 0x02 | 0x0C00),
+            (RMII, 0x2001 | 0x0C00),
+            (MII, 0x0C00),
+        ];
+
+        for (mode, clk) in esperado.iter() {
+            let _dev = fake::with_phy(Phy::gigabit_partner());
+            let mut nic = driver();
+            nic.phy_mode = *mode;
+            nic.clk_enable();
+
+            assert_eq!(
+                fake::read(SYS_CFG_BASE + EMAC_EPHY_CLK_REG0),
+                *clk as u32,
+                "the clock setting for PHY interface {:?} is not the one the \
+                 reference driver programs",
+                mode
+            );
+        }
     }
 }
