@@ -395,6 +395,10 @@ pub fn set_crtc_blanked(on: bool) {
         // `WAIT_VBLANK` parked on this pipe ends now, with the count there
         // is, instead of sleeping on to its cap on a pipe that is off.
         wake_crtc_off_queue();
+        // And it sends every event still waiting for a vblank of this
+        // pipe, now, with the count there is: a pipe that is off has no
+        // vblank to wait for.
+        send_pending_vblank_events_on_off();
         if let Some(display) = primary_display() {
             display.clear(zcore_drivers::prelude::RgbColor::new(0, 0, 0));
             let _ = display.flush();
@@ -6169,6 +6173,48 @@ pub fn cancel_pending_events() {
     DRM_TIMER_ARMED.store(false, Ordering::Release);
     FLIPS_IN_FLIGHT.store(0, Ordering::Release);
     FLIP_EVENT_PENDING.store(false, Ordering::Release);
+}
+
+/// The CRTC going off sends the vblank and sequence events still waiting
+/// for their vblank, now and with the count there is, as
+/// `drm_crtc_vblank_off` does ("Sending premature vblank event on
+/// disable"): a pipe that is off has no vblank coming, and a client that
+/// paced itself on the event would wait on it for as long as the pipe
+/// stayed off. Flip completions stay: `drm_crtc_vblank_off` walks only
+/// `vblank_event_list`, and the flip's own completion is the CRTC's.
+/// The jobs leave the queue under its lock and are delivered outside it,
+/// since delivery takes the file's event lock and wakes its pollers.
+fn send_pending_vblank_events_on_off() {
+    let taken: Vec<PendingDrmTimer> = {
+        let mut q = PENDING_DRM_TIMERS.lock();
+        let (taken, kept): (Vec<_>, Vec<_>) = q
+            .drain(..)
+            .partition(|job| !matches!(job, PendingDrmTimer::Flip { .. }));
+        q.extend(kept);
+        taken
+    };
+    if taken.is_empty() {
+        return;
+    }
+    let now_seq = vblank_seq_now();
+    for job in taken {
+        match job {
+            PendingDrmTimer::Vblank { signal, file, .. } => {
+                if let Some(file) = file.upgrade() {
+                    queue_vblank_event(&file, now_seq, signal);
+                }
+            }
+            PendingDrmTimer::Sequence {
+                user_data, file, ..
+            } => {
+                if let Some(file) = file.upgrade() {
+                    queue_crtc_sequence_event(&file, now_seq, user_data);
+                }
+            }
+            // Kept in the queue above.
+            PendingDrmTimer::Flip { .. } => {}
+        }
+    }
 }
 
 /// Drain timer jobs that target a closing drm_file (by raw pointer identity).
