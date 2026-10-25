@@ -371,26 +371,29 @@ fn the_terminal_palettes_fill_the_same_slots_with_colours_of_their_own() {
             .collect()
     };
     let looks = looks_accepted(&script);
-    let first = read(&looks[0]);
+    let palettes: Vec<(&String, BTreeMap<String, String>)> =
+        looks.iter().map(|l| (l, read(l))).collect();
     assert_eq!(
-        first.len(),
+        palettes[0].1.len(),
         18,
-        "a palette is 16 ANSI colours plus a background and a foreground: {first:?}"
+        "a palette is 16 ANSI colours plus a background and a foreground: {:?}",
+        palettes[0].1
     );
-    for look in &looks[1..] {
-        let got = read(look);
-        assert_eq!(
-            got.keys().collect::<Vec<_>>(),
-            first.keys().collect::<Vec<_>>(),
-            "the {look} palette does not fill the same slots as the {} one",
-            looks[0]
-        );
-        assert_ne!(
-            got, first,
-            "the {look} palette is the same colours as the {} one, so the \
-             terminal does not follow the look",
-            looks[0]
-        );
+    // Pairwise, not each against the first: two looks that end up sharing a
+    // palette are only noticed from the first one if one of them IS the first.
+    for (i, (look, got)) in palettes.iter().enumerate() {
+        for (other, want) in &palettes[..i] {
+            assert_eq!(
+                got.keys().collect::<Vec<_>>(),
+                want.keys().collect::<Vec<_>>(),
+                "the {look} palette does not fill the same slots as the {other} one"
+            );
+            assert_ne!(
+                got, want,
+                "the {look} palette is the same colours as the {other} one, so \
+                 the terminal does not follow the look"
+            );
+        }
     }
 }
 
