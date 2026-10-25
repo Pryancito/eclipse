@@ -458,6 +458,82 @@ mod tests {
         }
     }
 
+    /// And the whole table, every id the specification assigns, each one to a
+    /// type of its own.
+    ///
+    /// The six above are a spot check; what this one adds is that no two ids
+    /// land on the SAME variant. The table is twenty-five arms written out by
+    /// hand, so the mistake it invites is not a wrong number -- that the spot
+    /// check would catch -- but a copied line: `12 => RprocSerial` under
+    /// `11 => RprocSerial`. The kernel picks a driver off this answer, so a
+    /// duplicate hands a device to the driver for a different one, and the
+    /// first thing that driver does is program registers that are not there.
+    #[test]
+    fn no_two_device_ids_answer_with_the_same_type() {
+        let table = [
+            (1u32, DeviceType::Network),
+            (2, DeviceType::Block),
+            (3, DeviceType::Console),
+            (4, DeviceType::EntropySource),
+            (5, DeviceType::MemoryBallooning),
+            (6, DeviceType::IoMemory),
+            (7, DeviceType::Rpmsg),
+            (8, DeviceType::ScsiHost),
+            (9, DeviceType::_9P),
+            (10, DeviceType::Mac80211),
+            (11, DeviceType::RprocSerial),
+            (12, DeviceType::VirtioCAIF),
+            (13, DeviceType::MemoryBalloon),
+            (16, DeviceType::GPU),
+            (17, DeviceType::Timer),
+            (18, DeviceType::Input),
+            (19, DeviceType::Socket),
+            (20, DeviceType::Crypto),
+            (21, DeviceType::SignalDistributionModule),
+            (22, DeviceType::Pstore),
+            (23, DeviceType::IOMMU),
+            (24, DeviceType::Memory),
+        ];
+        let total = table.len();
+        let mut seen: Vec<String> = Vec::new();
+        for (id, expected) in table {
+            let got = fake_header(id, 16).device_type();
+            assert_eq!(got, expected, "id {}", id);
+            let name = format!("{:?}", got);
+            assert!(
+                !seen.contains(&name),
+                "id {} answers {:?}, which another id already answered",
+                id,
+                got
+            );
+            seen.push(name);
+        }
+        assert_eq!(seen.len(), total);
+    }
+
+    /// The vendor id is its own register, two words after the device id, and
+    /// nothing else in the window reads back as it.
+    ///
+    /// It is what names the implementation in the boot log, so a wrong offset
+    /// does not stop anything working -- it reports the device id, or the
+    /// version, as the vendor, and the one place that would show is a log
+    /// nobody reads twice. QEMU's is the four bytes of "QEMU".
+    #[test]
+    fn the_vendor_id_comes_off_its_own_register() {
+        let header = fake_header(2, 16);
+
+        assert_eq!(header.vendor_id(), 0x554d_4551, "not QEMU's vendor id");
+        assert_eq!(
+            &header.vendor_id().to_le_bytes(),
+            b"QEMU",
+            "the four bytes are not QEMU's, so the offset is wrong"
+        );
+        // And it is not any of its neighbours in the window.
+        assert_ne!(header.vendor_id(), 2, "it is reading the device id");
+        assert_ne!(header.vendor_id(), 1, "it is reading the version");
+        assert_ne!(header.vendor_id(), 0x7472_6976, "it is reading the magic");
+    }
+
     #[test]
     fn an_id_with_no_variant_is_invalid_rather_than_transmuted() {
         // `device_type` transmutes the id into the enum, so the gaps matter:

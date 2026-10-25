@@ -514,6 +514,304 @@ fn un_puerto_cuyo_enlace_no_se_establece_no_se_enumera() {
     assert_eq!(hw.commands(), 0, "ha sometido un comando sin enlace");
 }
 
+// --- el disco 4Kn, sector a sector ----------------------------------------
+
+/// Un HBA con un puerto y un disco 4Kn de `sectors` sectores de 4096 bytes.
+fn con_disco_4kn(sectors: usize) -> (Hw, Vec<AhciInterface>) {
+    reloj();
+    let hw = Hw::new(1, Some(Disk::of_4kn(sectors)), true);
+    let disks = AhciInterface::new_all(hw.base(), 0).expect("el HBA enumera su disco 4Kn");
+    (hw, disks)
+}
+
+/// Deja en cada trozo de 512 bytes del disco un patrón distinto, para que un
+/// error de un solo trozo en la aritmética salga.
+fn patron_por_trozos(hw: &Hw, trozos: usize) {
+    for t in 0..trozos {
+        hw.fill_disk(t * 512, &[(t as u8).wrapping_add(1); 512]);
+    }
+}
+
+/// `BlockScheme` habla en bloques de 512 y el aparato sólo sabe direccionar
+/// sus sectores de 4096: ocho bloques de la interfaz caben en uno del disco,
+/// y leer el cuarto significa traerse el sector entero y sacar de dentro el
+/// trozo que se pidió. La aritmética está en dos sitios —el LBA que se
+/// somete y el desplazamiento dentro del rebote— y equivocar cualquiera de
+/// los dos devuelve `Ok(())` con los bytes de al lado.
+#[test]
+fn una_lectura_de_512_de_un_disco_4kn_sale_de_dentro_de_su_sector() {
+    let (hw, disks) = con_disco_4kn(4);
+    patron_por_trozos(&hw, 32);
+    let antes = hw.commands();
+
+    let mut buf = [0u8; 512];
+    disks[0].read_block(3, &mut buf).expect("la lectura va");
+
+    assert_eq!(buf, [4u8; 512], "ha traído otro trozo del sector");
+    assert_eq!(
+        hw.commands() - antes,
+        1,
+        "un trozo de un sector es un solo comando"
+    );
+    assert_eq!(
+        hw.opcodes().last(),
+        Some(&ATA_CMD_READ_DMA_EXT),
+        "{:?}",
+        hw.opcodes()
+    );
+}
+
+/// Y una lectura que empieza en un sector del aparato y acaba en el siguiente
+/// se parte en dos, cada mitad con su LBA. Es el caso que una partición mal
+/// alineada produce en cada acceso.
+#[test]
+fn una_lectura_a_caballo_de_dos_sectores_4kn_trae_las_dos_mitades() {
+    let (hw, disks) = con_disco_4kn(4);
+    patron_por_trozos(&hw, 32);
+    let antes = hw.commands();
+
+    // Bloques 7 y 8: el 7 es el último trozo del sector 0 y el 8 el primero
+    // del sector 1.
+    let mut buf = [0u8; 1024];
+    disks[0].read_block(7, &mut buf).expect("la lectura va");
+
+    assert_eq!(
+        &buf[..512],
+        &[8u8; 512][..],
+        "la primera mitad ha venido mal"
+    );
+    assert_eq!(
+        &buf[512..],
+        &[9u8; 512][..],
+        "la segunda mitad ha venido mal"
+    );
+    assert_eq!(
+        hw.commands() - antes,
+        2,
+        "no ha pedido un sector del aparato por cada mitad"
+    );
+}
+
+/// Lo que de verdad importa del camino parcial: una escritura de 512 bytes en
+/// un disco 4Kn **no puede** someter el sector sin haberlo leído antes, o se
+/// lleva por delante los otros 3.584 bytes. Un sistema de ficheros que
+/// actualiza un inodo escribe así todo el rato.
+#[test]
+fn una_escritura_de_512_en_un_disco_4kn_no_pisa_el_resto_del_sector() {
+    let (hw, disks) = con_disco_4kn(4);
+    hw.fill_disk(0, &[0xee; 4096]);
+
+    disks[0]
+        .write_block(2, &[0xab; 512])
+        .expect("la escritura va");
+
+    assert_eq!(
+        hw.disk_bytes(2 * 512, 512),
+        alloc::vec![0xab; 512],
+        "los bytes no han llegado a su trozo"
+    );
+    assert_eq!(
+        hw.disk_bytes(0, 2 * 512),
+        alloc::vec![0xee; 2 * 512],
+        "ha pisado lo que había delante en el mismo sector"
+    );
+    assert_eq!(
+        hw.disk_bytes(3 * 512, 5 * 512),
+        alloc::vec![0xee; 5 * 512],
+        "ha pisado lo que había detrás en el mismo sector"
+    );
+}
+
+/// Y se ve en el orden de los comandos: leer y luego escribir. Sin el primero
+/// el disco queda consistente con lo que el llamante pidió y mal en todo lo
+/// demás, que es un estropicio que ningún `Err` anuncia.
+#[test]
+fn una_escritura_parcial_lee_el_sector_antes_de_pisarlo() {
+    let (hw, disks) = con_disco_4kn(4);
+    let antes = hw.opcodes().len();
+
+    disks[0]
+        .write_block(5, &[0x5a; 512])
+        .expect("la escritura va");
+
+    assert_eq!(
+        &hw.opcodes()[antes..],
+        &[ATA_CMD_READ_DMA_EXT, ATA_CMD_WRITE_DMA_EXT][..],
+        "la lectura-modificación-escritura no está"
+    );
+}
+
+/// El control del par anterior: un sector del aparato entero y alineado **no**
+/// se lee antes. Si se leyera, cada escritura grande costaría el doble de
+/// comandos, y es la condición del camino parcial la que lo decide.
+#[test]
+fn una_escritura_de_un_sector_4kn_entero_y_alineado_no_lo_lee_antes() {
+    let (hw, disks) = con_disco_4kn(4);
+    let antes = hw.opcodes().len();
+
+    // Bloque 8 = byte 4096 = principio del sector 1 del aparato, y 4096 bytes
+    // justos.
+    disks[0]
+        .write_block(8, &[0x77; 4096])
+        .expect("la escritura va");
+
+    assert_eq!(
+        &hw.opcodes()[antes..],
+        &[ATA_CMD_WRITE_DMA_EXT][..],
+        "ha leído un sector que iba a sobrescribir entero"
+    );
+    assert_eq!(hw.disk_bytes(4096, 4096), alloc::vec![0x77; 4096]);
+}
+
+// --- el vaciado de caché que falla ----------------------------------------
+
+/// El vaciado tiene dos opcodes como la lectura y la escritura, y el aparato
+/// antiguo no entiende el de 48 bits: contestaría con error en el `fsync` de
+/// cada fichero.
+#[test]
+fn un_disco_sin_lba48_vacia_la_cache_con_el_opcode_antiguo() {
+    reloj();
+    let mut d = Disk::of_512(64);
+    d.lba48 = false;
+    let hw = Hw::new(1, Some(d), true);
+    let disks = AhciInterface::new_all(hw.base(), 0).expect("enumera");
+    let antes = hw.opcodes().len();
+
+    disks[0].flush().expect("el flush va");
+
+    assert_eq!(
+        &hw.opcodes()[antes..],
+        &[ATA_CMD_FLUSH_CACHE][..],
+        "{:?}",
+        hw.opcodes()
+    );
+}
+
+/// Un vaciado que falla una vez se reintenta, y por eso existe: `apk` hace un
+/// `fsync` por fichero extraído, y el de los 130 MiB de `libLLVM.so` deja la
+/// caché del aparato llena; un solo tropiezo sin reintentar abortaba la
+/// extracción entera con EIO mientras los paquetes pequeños entraban todos.
+#[test]
+fn un_vaciado_que_falla_una_vez_se_reintenta_y_acaba_pasando() {
+    let (hw, disks) = con_disco(64);
+    let antes = hw.commands();
+    hw.faults(Faults {
+        tfes_commands: 1,
+        ..Default::default()
+    });
+
+    disks[0]
+        .flush()
+        .expect("el flush no ha sobrevivido al tropiezo");
+
+    assert_eq!(
+        hw.commands() - antes,
+        2,
+        "no ha reintentado exactamente una vez"
+    );
+}
+
+/// Y uno que no deja de fallar se rinde con error en vez de reintentar para
+/// siempre: un `fsync` que no vuelve cuelga al proceso que lo pidió.
+#[test]
+fn un_vaciado_que_no_deja_de_fallar_se_rinde_con_error() {
+    let (hw, disks) = con_disco(64);
+    let antes = hw.commands();
+    hw.faults(Faults {
+        tfes_commands: u32::MAX,
+        ..Default::default()
+    });
+
+    assert_eq!(
+        disks[0].flush().err(),
+        Some(DeviceError::IoError),
+        "un vaciado que nunca pasa ha salido bueno"
+    );
+    // Sin bajarse a contar `RW_RETRIES`, que es lo que se está probando: lo
+    // que se exige es que reintentara al menos una vez y que el bucle acabe,
+    // y acabar es que este test termine.
+    assert!(
+        hw.commands() - antes >= 2,
+        "se ha rendido sin reintentar: {} comandos",
+        hw.commands() - antes
+    );
+}
+
+// --- un IDENTIFY que no se puede creer ------------------------------------
+
+/// Las palabras 117-118 del IDENTIFY traen el tamaño de sector en palabras, y
+/// un aparato puede marcarlas válidas y poner dentro algo imposible. El driver
+/// se queda en 512 en vez de creérselo: con un tamaño de sector que no es
+/// potencia de dos toda la aritmética de arriba parte los comandos donde no
+/// debe, y la alternativa sería no montar el disco.
+#[test]
+fn un_identify_que_declara_un_sector_imposible_se_queda_en_512() {
+    reloj();
+    let mut d = Disk::of_512(64);
+    // Bit 14 «válido» y bit 12 «pasa de 256 palabras», y luego 1.500 palabras
+    // = 3.000 bytes, que no es potencia de dos.
+    d.word106 = Some((1 << 14) | (1 << 12));
+    d.words117_118 = Some(1_500);
+    let hw = Hw::new(1, Some(d), true);
+    let disks = AhciInterface::new_all(hw.base(), 0).expect("enumera");
+
+    assert_eq!(
+        disks[0].logical_block_size(),
+        512,
+        "se ha creído un sector de 3.000 bytes"
+    );
+    // Y el disco sigue sirviendo: la cuenta de bloques es la de 512 bytes.
+    assert_eq!(disks[0].block_count(), 64);
+    disks[0].read_block(1, &mut [0u8; 512]).expect("lee");
+}
+
+// --- lo que no debe tocar nada --------------------------------------------
+
+/// El `handle_irq` de este driver no hace nada a propósito: la espera de cada
+/// comando sondea `PxIS` y `PxCI` ella misma, así que un manejador que
+/// limpiara `PxIS` se llevaría por delante el aviso que la espera está a punto
+/// de leer. Lo que se afirma es que no toca el puerto.
+#[test]
+fn una_interrupcion_en_el_puerto_no_se_lleva_el_aviso_que_el_comando_espera() {
+    let (hw, disks) = con_disco(64);
+    hw.poke_port(0, PORT_IS, 0x1);
+    let comandos = hw.commands();
+
+    disks[0].handle_irq(11);
+
+    assert_eq!(
+        hw.peek_port(0, PORT_IS),
+        0x1,
+        "el manejador ha limpiado el aviso del puerto"
+    );
+    assert_eq!(hw.commands(), comandos, "ha sometido un comando");
+}
+
+// --- el PRDT con la traducción de verdad ----------------------------------
+
+/// `build_prds` es la única llamada que usa la traducción de direcciones de
+/// verdad en vez de una puesta por el test, y la unidad en la que parte es la
+/// página de 4 KiB. Aquí la traducción es la identidad, así que un trozo de
+/// montón de dos páginas tiene que salir en un solo rango coalescido: si
+/// partiera por otra unidad saldrían dos, y si la traducción fallara, `None`.
+#[test]
+fn el_prdt_de_un_buffer_del_anfitrion_sale_de_la_traduccion_de_verdad() {
+    let buf = alloc::vec![0u8; 3 * 4096];
+    // Alineado a página dentro del trozo, para que el primer rango empiece en
+    // un borde y los dos siguientes se puedan coalescer.
+    let va = (buf.as_ptr() as usize + 4095) & !4095;
+    let mut prds = [(0u64, 0usize); PRDT_MAX];
+
+    let n = build_prds(va, 2 * 4096, &mut prds).expect("la traducción es la identidad");
+
+    assert_eq!(
+        n, 1,
+        "dos páginas contiguas no se han coalescido: {:?}",
+        prds
+    );
+    assert_eq!(prds[0], (va as u64, 2 * 4096));
+}
+
 // --- a quién reconoce el driver ------------------------------------------
 
 /// El driver se queda con los controladores en modo AHCI, y el modo es el

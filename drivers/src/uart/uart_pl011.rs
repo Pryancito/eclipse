@@ -437,3 +437,241 @@ mod tests {
         assert_eq!(seen.as_slice(), b"panic!");
     }
 }
+
+/// The wrapper the rest of the kernel actually holds.
+///
+/// `Pl011Inner` is covered next door, register by register. This is the other
+/// half, and it was at zero: `Pl011Uart::new` and the `Scheme`/`UartScheme`
+/// methods are the only path by which a console byte, a console interrupt or
+/// the port's own set-up reaches that inner driver, and none of them had ever
+/// been called. A `try_recv` wired to the wrong half, a `new` that forgot to
+/// call `init`, or a `write_str` that stopped after one byte would leave every
+/// test in `tests` green and the aarch64 console broken.
+#[cfg(test)]
+mod wrapper_tests {
+    use super::*;
+    use crate::sync::Mutex;
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+
+    const UARTDR: u8 = 0x00;
+    const UARTFR: u8 = 0x18;
+    const UARTLCRH: u8 = 0x2c;
+    const UARTCR: u8 = 0x30;
+    const UARTIMSC: u8 = 0x38;
+    const UARTICR: u8 = 0x44;
+
+    /// UARTLCR_H bits that belong to whoever set the port up.
+    const WLEN_8BIT: u16 = 0b11 << 5;
+
+    /// A value no register of a freshly leaked block can hold by accident, so
+    /// "the driver wrote nothing here" is distinguishable from "it wrote zero".
+    const UNTOUCHED: u16 = 0xBEEF;
+
+    /// A leaked block of zeroes, which is a PL011 as far as this driver can
+    /// tell: it reaches its registers with `read_volatile`/`write_volatile` at
+    /// `base + offset` and nothing else.
+    struct Port {
+        base: usize,
+    }
+
+    impl Port {
+        fn new() -> Self {
+            let block: &'static mut [u32; 0x20] = Box::leak(Box::new([0u32; 0x20]));
+            Self {
+                base: block as *mut [u32; 0x20] as usize,
+            }
+        }
+
+        fn get(&self, off: u8) -> u16 {
+            unsafe { ptr::read_volatile((self.base + off as usize) as *const u16) }
+        }
+
+        fn set(&self, off: u8, value: u16) {
+            unsafe { ptr::write_volatile((self.base + off as usize) as *mut u16, value) }
+        }
+
+        fn uart(&self) -> Pl011Uart {
+            Pl011Uart::new(self.base)
+        }
+
+        /// The transmitter is empty, so `putchar` writes on its first look.
+        fn the_transmitter_is_ready(&self) {
+            self.set(UARTFR, UartFrFlags::TXFE.bits());
+        }
+
+        /// A byte is waiting: RXFE (receive FIFO EMPTY) clear is what `getchar`
+        /// asks about.
+        fn a_byte_is_waiting(&self, byte: u8) {
+            self.set(UARTFR, 0);
+            self.set(UARTDR, byte as u16);
+        }
+    }
+
+    /// Counts the events a subscriber is handed.
+    fn listening(uart: &Pl011Uart) -> Arc<Mutex<usize>> {
+        let hits = Arc::new(Mutex::new(0usize));
+        let cloned = hits.clone();
+        crate::scheme::EventScheme::subscribe(uart, Box::new(move |_| *cloned.lock() += 1), false);
+        hits
+    }
+
+    // --- what `new` leaves behind ---------------------------------------------
+
+    /// `new` is the only caller of `init` there will ever be, and `init` is
+    /// what makes the port able to carry a byte at all. Drop that call and
+    /// every test in `tests` still passes, because they all call `init`
+    /// themselves.
+    #[test]
+    fn a_new_uart_has_had_its_port_set_up() {
+        let port = Port::new();
+        let _uart = port.uart();
+
+        assert_eq!(
+            port.get(UARTICR),
+            0x7ff,
+            "the firmware's pending interrupts have to be cleared, and FIRST"
+        );
+        let cr = port.get(UARTCR);
+        for (bit, name) in &[
+            (UartCrFlags::RXE, "RXE"),
+            (UartCrFlags::TXE, "TXE"),
+            (UartCrFlags::UARTEN, "UARTEN"),
+        ] {
+            assert_ne!(cr & bit.bits(), 0, "UARTCR is missing {}", name);
+        }
+        assert_ne!(
+            port.get(UARTIMSC) & UartImscFlags::RXIM.bits(),
+            0,
+            "without RXIM no received byte ever raises an interrupt"
+        );
+    }
+
+    /// The same bug `tests` pins on `init`, pinned through the constructor:
+    /// the word length, parity and stop bits in UARTLCR_H belong to whoever
+    /// set the port up, and only the FIFO-enable bit is `init`'s to clear.
+    #[test]
+    fn a_new_uart_keeps_the_word_format_the_firmware_left() {
+        let port = Port::new();
+        port.set(UARTLCRH, WLEN_8BIT | UartLcrhFlags::FEN.bits());
+
+        let _uart = port.uart();
+
+        let lcrh = port.get(UARTLCRH);
+        assert_eq!(
+            lcrh & WLEN_8BIT,
+            WLEN_8BIT,
+            "eight data bits went in and {:#x} came out",
+            lcrh
+        );
+        assert_eq!(lcrh & UartLcrhFlags::FEN.bits(), 0, "the FIFOs stay off");
+    }
+
+    // --- what reaches the inner driver ----------------------------------------
+
+    /// `try_recv` is the console's read path. It has to route to `getchar`,
+    /// which asks whether a byte is there before handing one over.
+    #[test]
+    fn a_byte_waiting_in_the_port_comes_out_of_try_recv() {
+        let port = Port::new();
+        let uart = port.uart();
+        port.a_byte_is_waiting(b'q');
+
+        assert_eq!(
+            uart.try_recv().expect("a port with a byte is not an error"),
+            Some(b'q')
+        );
+    }
+
+    /// An empty port has to say so. The data register still holds the last
+    /// byte that arrived, so a `try_recv` that skipped the flag check would
+    /// hand that stale byte over again, once per call, for ever.
+    #[test]
+    fn an_empty_port_hands_back_no_byte_rather_than_a_stale_one() {
+        let port = Port::new();
+        let uart = port.uart();
+        port.set(UARTDR, b'q' as u16);
+        port.set(UARTFR, UartFrFlags::RXFE.bits());
+
+        assert_eq!(
+            uart.try_recv().expect("an empty port is not an error"),
+            None
+        );
+    }
+
+    /// `send` is the console's write path, and the one every panic banner
+    /// takes.
+    #[test]
+    fn send_puts_the_byte_in_the_port() {
+        let port = Port::new();
+        let uart = port.uart();
+        port.the_transmitter_is_ready();
+
+        uart.send(b'Z').expect("a ready transmitter accepts a byte");
+
+        assert_eq!(port.get(UARTDR), b'Z' as u16);
+    }
+
+    /// `write_str` is a loop over `send`, and the loop is the part worth
+    /// pinning: one that stopped after the first byte would still put a
+    /// plausible-looking character on screen. The data register only keeps the
+    /// LAST write, so this says the loop reached the end of the string -- not
+    /// that it wrote every byte in between.
+    #[test]
+    fn a_string_leaves_the_port_through_to_its_last_byte() {
+        let port = Port::new();
+        let uart = port.uart();
+        port.the_transmitter_is_ready();
+
+        uart.write_str("ABC")
+            .expect("a ready transmitter accepts a string");
+
+        let last = port.get(UARTDR);
+        assert_ne!(last, b'A' as u16, "the loop stopped after the first byte");
+        assert_eq!(last, b'C' as u16);
+    }
+
+    /// The bound. This is the path a panic banner takes, with interrupts
+    /// masked, so a port that is not clocked must not freeze the CPU: the wait
+    /// gives up and the byte is lost. Losing serial bytes beats hanging the
+    /// machine with nothing on screen to say why.
+    #[test]
+    fn a_port_that_never_drains_does_not_hold_the_console_for_good() {
+        let port = Port::new();
+        let uart = port.uart();
+        port.set(UARTFR, 0);
+        port.set(UARTDR, UNTOUCHED);
+
+        uart.send(b'Z')
+            .expect("giving up is not an error the caller sees");
+
+        assert_eq!(
+            port.get(UARTDR),
+            UNTOUCHED,
+            "a byte was pushed at a transmitter that never said it was ready"
+        );
+    }
+
+    // --- what reaches a client ------------------------------------------------
+
+    /// `handle_irq` is the whole reason the listener exists: the received byte
+    /// is announced to whoever subscribed, and a handler that triggers nothing
+    /// leaves the console input-dead with every register correctly programmed.
+    #[test]
+    fn an_interrupt_reaches_the_client_that_subscribed() {
+        let port = Port::new();
+        let uart = port.uart();
+        let hits = listening(&uart);
+        assert_eq!(*hits.lock(), 0, "nothing has happened yet");
+
+        uart.handle_irq(7);
+
+        assert_eq!(*hits.lock(), 1);
+    }
+
+    /// The name the device registry matches on.
+    #[test]
+    fn the_uart_answers_to_the_name_the_registry_matches_on() {
+        assert_eq!(Port::new().uart().name(), "Pl011 ARM series uart");
+    }
+}

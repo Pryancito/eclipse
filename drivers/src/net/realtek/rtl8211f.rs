@@ -1985,6 +1985,10 @@ pub(crate) mod fake {
     /// The MAC's `SOFT_RST` never clears: EMAC clock or power not up yet.
     static MAC_RESET_STICKS: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
+    /// The MDIO bus never clears `MII_BUSY`: a PHY with no clock behind it,
+    /// or a management bus held by something else.
+    static MDIO_STICKS_BUSY: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
     /// Which interrupt bits the last acknowledgement named.
     static LAST_INT_ACK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -2091,6 +2095,13 @@ pub(crate) mod fake {
         if cmd & MII_BUSY == 0 {
             return;
         }
+        if MDIO_STICKS_BUSY.load(Ordering::SeqCst) {
+            // Left busy, and the register transfer left undone with it. This
+            // is the only way to reach the driver's bounded wait on the bus,
+            // which a passive fake never does because plain memory reads back
+            // the zero the window starts at.
+            return;
+        }
         let reg = ((cmd & 0x0000_07F0) >> 4) as usize;
         {
             let mut guard = PHY.lock();
@@ -2126,6 +2137,7 @@ pub(crate) mod fake {
         *PHY.lock() = Some(phy);
         PHY_RESET_STICKS.store(false, Ordering::SeqCst);
         MAC_RESET_STICKS.store(false, Ordering::SeqCst);
+        MDIO_STICKS_BUSY.store(false, Ordering::SeqCst);
         LAST_INT_ACK.store(0, Ordering::SeqCst);
         Guard {
             _turnstile: turnstile,
@@ -2149,6 +2161,14 @@ pub(crate) mod fake {
             self
         }
 
+        /// The MDIO bus never clears `MII_BUSY`, and the register transfer
+        /// behind it never happens either. That pair is what tells a bus that
+        /// answered late from one that never answered at all.
+        pub fn with_mdio_stuck_busy(self) -> Self {
+            MDIO_STICKS_BUSY.store(true, core::sync::atomic::Ordering::SeqCst);
+            self
+        }
+
         /// Start recording cache and fence operations, from empty.
         pub fn record_cache(&self) {
             super::super::utils::host::begin();
@@ -2166,6 +2186,7 @@ pub(crate) mod fake {
             *PHY.lock() = None;
             PHY_RESET_STICKS.store(false, Ordering::SeqCst);
             MAC_RESET_STICKS.store(false, Ordering::SeqCst);
+            MDIO_STICKS_BUSY.store(false, Ordering::SeqCst);
             super::super::utils::host::end();
         }
     }
@@ -3174,5 +3195,435 @@ mod tests {
             ADVERTISE_PAUSE_CAP,
             "in the value: set"
         );
+    }
+
+    // ------------------------------------------- negotiation that goes wrong
+
+    /// A gigabit PHY whose `MII_STAT1000` carries `LPA_1000MSFAIL`: the two ends
+    /// of the link never agreed which of them clocks it.
+    fn master_slave_failure() -> Phy {
+        let mut phy = Phy::gigabit_partner();
+        phy.regs[MII_STAT1000 as usize] = LPA_1000MSFAIL;
+        phy
+    }
+
+    #[test]
+    fn a_master_slave_failure_refuses_the_link_rather_than_programming_a_guess() {
+        let _dev = fake::with_phy(master_slave_failure());
+        let mut nic = driver();
+        let outcome = nic.adjust_link();
+
+        assert!(
+            outcome.is_err(),
+            "with master/slave resolution failed there is no agreed speed to \
+             program, so the only honest answer is no link: {:?}",
+            outcome.ok()
+        );
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_BASIC_CTL0) & 0x0f,
+            0,
+            "nothing may reach the MAC's speed and duplex bits on a link that \
+             never came up: half of a resolution failure is that neither end \
+             knows what the other settled on"
+        );
+    }
+
+    /// The driver's own advertisement names only the two 1000 bits in its mask
+    /// (`ADVERTISE_1000FULL | ADVERTISE_1000HALF`, 0x0300), and the manual
+    /// master bit is 0x1000, so a setting made by hand survives it. That is what
+    /// lets the failure be reported as a conflict with a manual setting instead
+    /// of as a plain fault, and it is the difference between the handler's two
+    /// arms.
+    #[test]
+    fn a_master_slave_failure_leaves_the_manual_setting_it_blames_in_place() {
+        let mut phy = master_slave_failure();
+        phy.regs[MII_CTRL1000 as usize] = CTL1000_ENABLE_MASTER;
+        let _dev = fake::with_phy(phy);
+        let mut nic = driver();
+
+        assert!(
+            nic.adjust_link().is_err(),
+            "a forced master that could not be resolved is still no link"
+        );
+        assert_ne!(
+            fake::phy_reg(MII_CTRL1000) & CTL1000_ENABLE_MASTER,
+            0,
+            "the driver cleared the manual master setting on its way past, so \
+             the conflict it is about to report can no longer be seen in the \
+             register that caused it"
+        );
+        assert_ne!(
+            fake::phy_reg(MII_CTRL1000) & ADVERTISE_1000FULL,
+            0,
+            "and the gigabit advertisement still has to land: the mask owns \
+             those two bits whatever else is in the register"
+        );
+    }
+
+    #[test]
+    fn a_partner_that_can_only_do_a_hundred_half_is_programmed_half_duplex() {
+        let mut phy = Phy::fast_ethernet_only();
+        phy.regs[MII_LPA as usize] = LPA_100HALF;
+        let _dev = fake::with_phy(phy);
+        let mut nic = driver();
+        nic.adjust_link()
+            .expect("100M half duplex is a perfectly good link");
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_BASIC_CTL0) & 0x0f,
+            0x08 | 0x04,
+            "a hundred rather than ten, and the duplex bit CLEAR: a MAC left in \
+             full duplex against a half-duplex partner transmits into its \
+             replies and collides on every one"
+        );
+    }
+
+    #[test]
+    fn a_partner_that_can_only_do_ten_full_is_programmed_at_ten() {
+        let mut phy = Phy::fast_ethernet_only();
+        phy.regs[MII_LPA as usize] = LPA_10FULL;
+        let _dev = fake::with_phy(phy);
+        let mut nic = driver();
+        nic.adjust_link().expect("10M full duplex is still a link");
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_BASIC_CTL0) & 0x0f,
+            CTL0_DM | 0x08,
+            "the duplex bit and the not-gigabit bit, with the hundred bit CLEAR: \
+             a MAC clocked at a hundred against a ten-megabit partner puts \
+             nothing intelligible on the wire"
+        );
+    }
+
+    /// `lpa &= adv` is the intersection of what the partner offers and what we
+    /// advertise, so a partner with nothing in common leaves it empty. There is
+    /// no "unknown" to program, and the ladder's last rung is what gets used.
+    #[test]
+    fn a_partner_with_nothing_in_common_falls_back_to_the_slowest_link() {
+        let mut phy = Phy::fast_ethernet_only();
+        phy.regs[MII_LPA as usize] = 0;
+        let _dev = fake::with_phy(phy);
+        let mut nic = driver();
+        nic.adjust_link()
+            .expect("the cable is plugged in, so the link is up whatever it carries");
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_BASIC_CTL0) & 0x0f,
+            0x08,
+            "ten megabit, half duplex: the one setting every 802.3 partner can \
+             be relied on to understand"
+        );
+    }
+
+    /// With negotiation off the driver forces a setting on the PHY instead of
+    /// asking it what the other end offered, so the partner's `MII_LPA` must
+    /// make no difference at all.
+    #[test]
+    fn with_negotiation_off_the_link_is_forced_and_the_partner_is_never_asked() {
+        let mut phy = Phy::gigabit_partner();
+        phy.regs[MII_LPA as usize] = LPA_10HALF;
+        let _dev = fake::with_phy(phy);
+        let mut nic = driver();
+        nic.autoneg = AUTONEG_DISABLE;
+        nic.adjust_link()
+            .expect("a forced link needs nobody's agreement");
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_BASIC_CTL0) & 0x0f,
+            CTL0_DM | 0x08 | 0x04,
+            "the forced setting is a hundred full duplex, and a partner offering \
+             ten half must not drag it down to what it says"
+        );
+        assert_eq!(
+            fake::phy_reg(MII_BMCR) & (BMCR_SPEED100 | BMCR_FULLDPLX),
+            BMCR_SPEED100 | BMCR_FULLDPLX,
+            "the forcing has to reach the PHY too, or the MAC and the PHY are \
+             clocked differently and the link carries nothing"
+        );
+        assert_eq!(
+            fake::phy_reg(MII_ADVERTISE),
+            0,
+            "with negotiation off there is nothing to advertise: the whole \
+             advertisement belongs inside the branch that negotiates"
+        );
+    }
+
+    // ------------------------------------------------------- the off switches
+
+    #[test]
+    fn turning_the_mac_off_leaves_every_other_bit_of_the_two_registers_alone() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        // Bit 31 is the enable in both; everything below it is the configuration
+        // the MAC was set up with, which switching off must not take with it.
+        fake::write(GMAC_BASE + GETH_TX_CTL0, 0x9234_5678);
+        fake::write(GMAC_BASE + GETH_RX_CTL0, 0x8765_4321);
+        nic.mac_disable();
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_TX_CTL0),
+            0x1234_5678,
+            "the transmitter's enable bit is the only one switching off owns"
+        );
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_RX_CTL0),
+            0x0765_4321,
+            "and the receiver's: the flow-control and filter bits here survive \
+             a disable, or bringing the MAC back up needs the whole setup again"
+        );
+    }
+
+    #[test]
+    fn stopping_the_receive_dma_leaves_the_rest_of_its_register_alone() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        fake::write(GMAC_BASE + GETH_RX_CTL1, 0x4000_0abc);
+        nic.stop_rx();
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_RX_CTL1),
+            0x0abc,
+            "0x4000_0000 is the receive-DMA start bit and the only one stopping \
+             owns; the threshold bits beside it are not a stop setting"
+        );
+    }
+
+    #[test]
+    fn stopping_the_transmit_dma_leaves_the_rest_of_its_register_alone() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        fake::write(GMAC_BASE + GETH_TX_CTL1, 0x4000_0abc);
+        nic.stop_tx();
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_TX_CTL1),
+            0x0abc,
+            "0x4000_0000 is the transmit-DMA start bit; bit 31 beside it is the \
+             poll-demand doorbell, which stopping must not ring"
+        );
+    }
+
+    #[test]
+    fn the_mac_loopback_switch_is_one_bit_and_goes_both_ways() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        // A link already programmed: loopback is turned on over a running MAC,
+        // so it has to leave the speed and duplex bits where they were.
+        fake::write(GMAC_BASE + GETH_BASIC_CTL0, CTL0_DM | 0x08 | 0x04);
+
+        nic.mac_loopback(1);
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_BASIC_CTL0),
+            CTL0_DM | 0x02 | 0x08 | 0x04,
+            "loopback is bit 1 and nothing else moves with it"
+        );
+
+        nic.mac_loopback(0);
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_BASIC_CTL0),
+            CTL0_DM | 0x08 | 0x04,
+            "and switching it off puts the register back exactly as it was, \
+             rather than leaving the MAC talking to itself"
+        );
+    }
+
+    // --------------------------------------------------- the interrupt handler
+
+    #[test]
+    fn a_received_frame_reaches_the_receive_path_and_the_line_is_armed_again() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        stage_rx_frame(&mut nic, 0, &[0xaau8; 64]);
+        assert!(nic.can_recv(), "the frame is staged and waiting");
+        fake::raise_rx_interrupt();
+
+        assert_eq!(
+            nic.interrupt_handle(0, &0),
+            Ok(1),
+            "the handler reports it dealt with the interrupt"
+        );
+        assert!(
+            !nic.can_recv(),
+            "the frame is still in the ring: the handler acknowledged a receive \
+             interrupt without running the receive path, so the frame waits for \
+             an interrupt that will never come again"
+        );
+        assert_eq!(
+            fake::interrupts_armed(),
+            RX_INT | TX_UNF_INT,
+            "the handler disarms the line before polling and has to arm it \
+             again under budget, or this is the last frame the card ever takes"
+        );
+    }
+
+    /// `TX_STOP_INT` is the transmit DMA having stopped, which is reported and
+    /// nothing else. What matters is that it is not mistaken for the receive
+    /// path: the two arms are told apart by one `==` on a status code.
+    #[test]
+    fn a_stopped_transmit_dma_does_not_consume_a_waiting_frame() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        nic.int_enable();
+        stage_rx_frame(&mut nic, 0, &[0xbbu8; 64]);
+        fake::raise_tx_stopped();
+
+        assert_eq!(nic.interrupt_handle(0, &0), Ok(1), "the handler answers");
+        assert!(
+            nic.can_recv(),
+            "a transmit error took the receive path with it and swallowed a \
+             frame nobody had asked about"
+        );
+        assert_eq!(
+            fake::interrupts_armed(),
+            RX_INT | TX_UNF_INT,
+            "and the line stays armed: the handler only disarms it for the \
+             polling it does on the receive arm"
+        );
+    }
+
+    /// `TX_UNF_INT` maps to `TxHardErrorBumpTc`, which is neither of the two
+    /// codes the handler tests for, so it lands in the arm that only logs --
+    /// even though it is one of the two interrupts `int_enable` arms. Pinned as
+    /// it stands: the underrun is acknowledged (so the line does not stay up)
+    /// and nothing else happens. The reference driver bumps the transmit
+    /// threshold here; this one does not.
+    #[test]
+    fn a_transmit_underrun_is_acknowledged_and_otherwise_let_be() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+        nic.int_enable();
+        stage_rx_frame(&mut nic, 0, &[0xccu8; 64]);
+        fake::raise_tx_underflow();
+
+        assert_eq!(nic.interrupt_handle(0, &0), Ok(1), "the handler answers");
+        assert_ne!(
+            fake::last_interrupt_ack() & TX_UNF_INT,
+            0,
+            "an underrun that is never cleared keeps the line asserted and the \
+             handler is re-entered for ever"
+        );
+        assert!(
+            nic.can_recv(),
+            "the waiting frame belongs to the receive arm, not to this one"
+        );
+        assert_eq!(
+            fake::interrupts_armed(),
+            RX_INT | TX_UNF_INT,
+            "nothing is disarmed on the way through"
+        );
+    }
+
+    // --------------------------------------------- when nothing answers back
+
+    /// A management bus that never clears `MII_BUSY` is a PHY with no clock
+    /// behind it, and `adjust_link` runs before anything else on this card: a
+    /// wait with no bound there is a boot that never finishes, with no console
+    /// message to say why.
+    ///
+    /// What the test cannot assert is an error, because there is nowhere to put
+    /// one: `mdio_read` returns `u32` and hands back whatever the data register
+    /// holds. That is the limitation being pinned -- a read off a dead bus comes
+    /// back as the PREVIOUS transaction's data and the caller cannot tell.
+    #[test]
+    fn a_management_bus_that_never_answers_does_not_wedge_a_register_read() {
+        let _dev = fake::with_phy(Phy::gigabit_partner()).with_mdio_stuck_busy();
+        let mut nic = driver();
+        fake::write(GMAC_BASE + GETH_MDIO_DATA, 0xdead);
+
+        let got = nic.mdio_read(0, MII_BMSR);
+
+        assert_eq!(
+            got, 0xdead,
+            "the wait is bounded, so the read returns -- with the stale contents \
+             of the data register, which is all there is to return"
+        );
+        assert_ne!(
+            fake::read(GMAC_BASE + GETH_MDIO_ADDR) & MII_BUSY,
+            0,
+            "and the bus is still busy afterwards: the driver gave up on it \
+             rather than the transaction having quietly completed"
+        );
+    }
+
+    #[test]
+    fn a_management_bus_that_never_answers_does_not_wedge_a_register_write() {
+        let _dev = fake::with_phy(Phy::gigabit_partner()).with_mdio_stuck_busy();
+        let mut nic = driver();
+        let before = fake::phy_reg(MII_BMCR);
+
+        nic.mdio_write(0, MII_BMCR, 0x1234);
+
+        assert_eq!(
+            fake::phy_reg(MII_BMCR),
+            before,
+            "nothing reached the PHY, which is the point: a write the bus never \
+             carried must not look like one it did"
+        );
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_MDIO_DATA),
+            0x1234,
+            "the data register is loaded before the command, so the byte the \
+             driver meant to send is there even though the bus never took it"
+        );
+    }
+
+    /// A partner that answers but never finishes negotiating: the cable is in,
+    /// `BMSR_ANEGCOMPLETE` never arrives. The wait for it is the second
+    /// unbounded loop this driver used to have.
+    #[test]
+    fn a_partner_that_never_finishes_negotiating_does_not_wedge_the_boot() {
+        let mut phy = Phy::gigabit_partner();
+        phy.regs[MII_BMSR as usize] &= !BMSR_ANEGCOMPLETE;
+        let _dev = fake::with_phy(phy);
+        let mut nic = driver();
+
+        nic.phy_restart_aneg();
+
+        assert_eq!(
+            fake::phy_reg(MII_BMCR) & (BMCR_ANENABLE | BMCR_ANRESTART),
+            BMCR_ANENABLE | BMCR_ANRESTART,
+            "it did ask for a negotiation before giving up on waiting for one"
+        );
+        assert_eq!(
+            fake::phy_reg(MII_BMCR) & BMCR_ISOLATE,
+            0,
+            "and it took the PHY out of isolation, or the negotiation it just \
+             asked for cannot reach the wire"
+        );
+    }
+
+    // ------------------------------------------------- the interface it drives
+
+    /// The PHY interface decides the clock the MAC drives, and getting it wrong
+    /// is a link that comes up and carries nothing. `EMAC_EPHY_CLK_REG0` lives
+    /// in the system-control block, not in the GMAC's own.
+    #[test]
+    fn each_phy_interface_gets_its_own_clock_setting() {
+        // (mode, the clock register it must leave behind)
+        //
+        // Bit 2 is RGMII, bit 0 and 1 are ETCS, bit 13 is RMII_EN, and the
+        // transmit delay sits at bits 10-12: TX_DELAY is 3, so 0x0C00 is in
+        // every answer and RX_DELAY of 0 adds nothing at bits 5-9.
+        let esperado = [
+            (RGMII, 0x04 | 0x02 | 0x0C00),
+            (GMII, 0x02 | 0x0C00),
+            (RMII, 0x2001 | 0x0C00),
+            (MII, 0x0C00),
+        ];
+
+        for (mode, clk) in esperado.iter() {
+            let _dev = fake::with_phy(Phy::gigabit_partner());
+            let mut nic = driver();
+            nic.phy_mode = *mode;
+            nic.clk_enable();
+
+            assert_eq!(
+                fake::read(SYS_CFG_BASE + EMAC_EPHY_CLK_REG0),
+                *clk as u32,
+                "the clock setting for PHY interface {:?} is not the one the \
+                 reference driver programs",
+                mode
+            );
+        }
     }
 }

@@ -160,10 +160,52 @@ bitflags! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_dev::{fake_header, Ring};
+    use crate::test_dev::{fake_header, set_config_u64, Ring};
 
     /// virtio-console, from the device-id table (5.3: console device).
     const DEVICE_ID_CONSOLE: u32 = 3;
+
+    /// `new` runs `info!("Config: {:?}", config)` on every bring-up, and what
+    /// that may NOT do is read `emerg_wr`. That register is write-only: the
+    /// specification gives a device no reason to put anything readable behind
+    /// it, so printing it reports whatever the window happens to hold. The
+    /// `Debug` impl is written out by hand for that one reason, and a
+    /// `#[derive(Debug)]` put there later -- which is what anyone tidying up
+    /// would reach for -- would read all four.
+    ///
+    /// The same test pins the three offsets, because `Config` is `repr(C)` over
+    /// the device's config space: a field inserted or widened above `rows`
+    /// slides it, and the console then reports someone else's number as the
+    /// terminal size.
+    #[test]
+    fn the_config_is_printed_from_the_three_readable_fields_and_not_the_write_only_one() {
+        let header = fake_header(DEVICE_ID_CONSOLE, 16);
+        // cols = 80 in bytes 0-1, rows = 24 in bytes 2-3, max_nr_ports = 1 in
+        // bytes 4-7, all little-endian.
+        set_config_u64(header, 0x0000_0001_0018_0050);
+        // SAFETY: the config space of the fake window is ordinary memory, and
+        // `Config` is `repr(C)` over it -- the same cast `new` does.
+        let config = unsafe { &*(header.config_space() as *const Config) };
+
+        assert_eq!(config.cols.read(), 80, "cols is not at offset 0");
+        assert_eq!(config.rows.read(), 24, "rows is not at offset 2");
+        assert_eq!(config.max_nr_ports.read(), 1, "max_nr_ports is not at 4");
+
+        let printed = format!("{:?}", config);
+        for field in ["cols", "rows", "max_nr_ports"] {
+            assert!(printed.contains(field), "{} is missing: {}", field, printed);
+        }
+        assert!(
+            printed.contains("80") && printed.contains("24"),
+            "the values are not the ones in config space: {}",
+            printed
+        );
+        assert!(
+            !printed.contains("emerg_wr"),
+            "the write-only register was read in order to print it: {}",
+            printed
+        );
+    }
 
     /// The queue size `new` asks for.
     const QUEUE_SIZE: u16 = 2;

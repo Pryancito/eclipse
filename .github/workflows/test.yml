@@ -207,6 +207,16 @@ jobs:
           # is gated on `any(test, feature = "std")` but its `libc` dependency
           # only arrived with the feature, so the test target did not compile.
           cargo test -p rcore-fs --lib
+          # SEFS, the last of the vendored filesystems with no line here.
+          # It is in the `[patch]` table, so every build of the tree
+          # compiles its 903 lines, and it is reached through
+          # `rcore-fs-fuse`, which `xtask` builds the rootfs image with --
+          # but it was not a workspace member either, so nothing named it
+          # and it had no tests at all. The suite runs the filesystem on a
+          # `Storage` of ordinary memory, which is the seam the crate's own
+          # traits already offer, and once over a real directory through
+          # the `StdStorage` it shipped with.
+          cargo test -p rcore-fs-sefs --lib
           # The virtio drivers themselves: the virtqueue every one of those
           # devices talks through. The tree vendored them and then built the
           # git revision anyway -- there was no `[patch]` for this one -- so

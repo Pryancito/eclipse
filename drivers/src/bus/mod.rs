@@ -88,6 +88,7 @@ pub fn read<T>(addr: usize) -> T {
 mod tests {
     use super::*;
     use crate::builder::IoMapper;
+    use alloc::boxed::Box;
     use alloc::sync::Arc;
 
     /// A mapper that hands out a base of its own, the way riscv's does for a
@@ -138,5 +139,71 @@ mod tests {
             resolve_window(&None, 0xfd00_0000, 0x1000, 0x40),
             phys_to_virt(0xfd00_0040)
         );
+    }
+
+    // --- the two primitives every non-x86 MMIO path is built on ---------------
+
+    /// `read` and `write` are the whole of how the mips, riscv64 and aarch64
+    /// `PortOps` reach config space, and on x86_64 nothing instantiates them,
+    /// so they had never run. The address arithmetic is the caller's; what
+    /// these two owe is to touch the address they were handed and no other.
+    #[test]
+    fn a_word_written_to_a_register_reads_back_from_that_same_register() {
+        let block: &'static mut [u32; 4] = Box::leak(Box::new([0u32; 4]));
+        let base = block as *mut [u32; 4] as usize;
+
+        write::<u32>(base + 4, 0xDEAD_BEEF);
+
+        assert_eq!(read::<u32>(base + 4), 0xDEAD_BEEF);
+        assert_eq!(read::<u32>(base), 0, "the register below was written to");
+        assert_eq!(
+            read::<u32>(base + 8),
+            0,
+            "the register above was written to"
+        );
+    }
+
+    /// The width is the type, not the pointer. A `write::<u16>` that stored a
+    /// whole word would clobber the register next to the one asked for -- and
+    /// on a peripheral whose registers are packed two to a word, that is the
+    /// neighbouring register, in silence.
+    #[test]
+    fn the_width_of_an_access_is_the_type_it_is_asked_for() {
+        let block: &'static mut [u32; 2] = Box::leak(Box::new([0xFFFF_FFFFu32; 2]));
+        let base = block as *mut [u32; 2] as usize;
+
+        write::<u16>(base, 0);
+
+        assert_eq!(
+            read::<u32>(base),
+            0xFFFF_0000,
+            "a 16-bit write reached outside its own half of the word"
+        );
+        assert_eq!(
+            read::<u32>(base + 4),
+            0xFFFF_FFFF,
+            "the next word was touched"
+        );
+    }
+
+    /// `dma_dealloc` hands the kernel a PAGE count, and the unit is the part
+    /// worth pinning: a driver that passed bytes here would ask the allocator
+    /// to free four thousand times the memory it owns.
+    #[test]
+    fn freeing_dma_pages_tells_the_kernel_how_many() {
+        use crate::utils::host_hooks::{alone_with_the_allocator, DEALLOC_CALLS, DEALLOC_PAGES};
+        use core::sync::atomic::Ordering;
+
+        alone_with_the_allocator(|| {
+            let rc = unsafe { dma_dealloc(0x1000, 3) };
+
+            assert_eq!(rc, 0);
+            assert_eq!(
+                DEALLOC_CALLS.load(Ordering::SeqCst),
+                1,
+                "the kernel was never told"
+            );
+            assert_eq!(DEALLOC_PAGES.load(Ordering::SeqCst), 3, "pages, not bytes");
+        });
     }
 }

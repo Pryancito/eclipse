@@ -448,6 +448,114 @@ mod pmio {
     #[cfg(test)]
     mod pmio_tests {
         use super::*;
+        use crate::scheme::EventScheme;
+        use alloc::{boxed::Box, sync::Arc};
+        use core::sync::atomic::AtomicBool;
+
+        /// A driver over the ports at `base`, built WITHOUT `new`.
+        ///
+        /// `new` goes straight on to `init`, which issues `out`: a privileged
+        /// instruction, so in a hosted test process it is a fault and not a
+        /// register write. Everything below `init` in this type is reachable
+        /// without it, and this is how: the three fields are private to
+        /// `mod pmio`, and `pmio_tests` is its child.
+        ///
+        /// The ports themselves are never touched. A `Pmio` is a port
+        /// *number*, not a reference, so building the map costs nothing and
+        /// reads nothing; what the tests ask of it is which numbers it holds.
+        fn driver(base: u16) -> Uart16550Pmio {
+            Uart16550Pmio {
+                inner: Mutex::new(ports(base)),
+                base,
+                listener: EventListener::new(),
+            }
+        }
+
+        /// The name is what the console registry matches on, so it is ABI
+        /// between this driver and whoever opens the console: a rename that
+        /// looks like tidying up leaves the kernel without a serial console on
+        /// the one architecture where this type is the console, and nothing
+        /// fails -- the device is simply not found.
+        ///
+        /// It is also deliberately not the MMIO twin's name: both exist on
+        /// x86_64, and a registry that matched one string would hand over
+        /// whichever was registered first.
+        #[test]
+        fn the_port_mapped_driver_answers_to_its_own_name() {
+            let uart = driver(0x3F8);
+
+            assert_eq!(uart.name(), "uart16550-Pmio");
+            // The MMIO twin's, spelled as that type spells it -- the two
+            // differ in more than the case of a letter, which a registry
+            // matching case-insensitively would collapse.
+            assert_ne!(
+                uart.name(),
+                "uart16550-mmio",
+                "the two 16550 drivers answer to the same name"
+            );
+            assert_ne!(
+                uart.name().to_ascii_lowercase(),
+                "uart16550-mmio",
+                "they differ only in case, so a case-insensitive match \
+                 would hand over whichever registered first"
+            );
+        }
+
+        /// An interrupt has to reach the listener, which is the whole of what
+        /// the serial console does to wake a reader. This is the x86_64
+        /// console: a `handle_irq` that returned without triggering leaves a
+        /// `read` on it blocked with the byte already in the port.
+        #[test]
+        fn an_interrupt_at_the_port_mapped_console_reaches_a_subscribed_handler() {
+            let uart = driver(0x3F8);
+            let woken = Arc::new(AtomicBool::new(false));
+            let flag = woken.clone();
+            uart.subscribe(
+                Box::new(move |_| flag.store(true, Ordering::Relaxed)),
+                false,
+            )
+            .expect("the first subscription cannot be refused");
+
+            uart.handle_irq(4);
+
+            assert!(
+                woken.load(Ordering::Relaxed),
+                "the interrupt did not reach the listener"
+            );
+        }
+
+        /// `with_regs` is the one place this driver decides between the lock
+        /// and the crash escape, and on an ordinary call it has to take the
+        /// lock and NOT bump the escape's counter -- the counter is how a live
+        /// machine reports that the escape ran, so an ordinary write bumping it
+        /// would make the report meaningless.
+        ///
+        /// The closure reads port numbers and no ports, which is what makes
+        /// this callable at all: the map `with_regs` hands over is a map of
+        /// port numbers, and every method on it that reaches the device issues
+        /// `out`. So what is under test here is the choice, not the transfer.
+        ///
+        /// The escape's own branch cannot be reached from a hosted build:
+        /// `held_by_current_cpu` is a constant `false` there. Should a seam
+        /// ever make it reachable, this delta has to become a witness local to
+        /// this port.
+        #[test]
+        fn an_ordinary_call_runs_through_the_lock_and_not_the_crash_escape() {
+            let uart = driver(0x2F8);
+            let before = super::super::reentrant_console_writes();
+
+            let data_port = uart.with_regs(|regs| regs.data.port());
+
+            assert_eq!(
+                data_port, 0x2F8,
+                "the map it handed over is not the one at this base"
+            );
+            assert_eq!(
+                super::super::reentrant_console_writes(),
+                before,
+                "an ordinary call took the crash escape"
+            );
+        }
 
         /// The MMIO map has `every_register_sits_at_its_own_offset_in_the_16550_map`
         /// to hold its addresses in place; the PMIO map had nothing, and it is the
