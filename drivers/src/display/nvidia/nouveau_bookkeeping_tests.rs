@@ -1334,6 +1334,9 @@ const COMP2: u64 = 66_004;
 fn gpu_rm() -> NvidiaGpu {
     let gpu = gpu();
     reset_fake_rm();
+    // A global flag: one test pinning the compositor to ctx 0 must not leak
+    // into the next, not even when it panics before it can clear it.
+    nv::set_compositor_ctx0(false);
     *gpu.rm_device_instance.lock() = Some(0);
     gpu.ctx0_owner.store(COMP, Ordering::Release);
     gpu
@@ -3296,6 +3299,22 @@ fn has_chan(ctx: u32) -> bool {
     FAKE_RM.lock().fast_ctxs.iter().any(|c| c.ctx == ctx)
 }
 
+/// The direct-submit channel behind the context `pid` owns. Which index that
+/// is belongs to the registry, not to a test: the compositor is a DRM client
+/// like every other one now (its own RM client, under its own pid, so
+/// `nvidia-smi` can name it) and holds no fixed index any more.
+fn chan_of(gpu: &NvidiaGpu, pid: u64) -> FastChan {
+    chan(
+        ctx_of(gpu, pid)
+            .expect("this pid has no context of its own")
+            .0,
+    )
+}
+
+fn has_chan_of(gpu: &NvidiaGpu, pid: u64) -> bool {
+    ctx_of(gpu, pid).is_some_and(|t| has_chan(t.0))
+}
+
 fn peek(addr: usize) -> u32 {
     unsafe { core::ptr::read_volatile(addr as *const u32) }
 }
@@ -4345,6 +4364,9 @@ fn cpu_prep_waits_for_every_channel_whose_vm_maps_the_buffer_not_only_the_caller
     let ch_c = client_with_pushbuf(&gpu, COMP);
     assert_eq!(ctx0_owner(&gpu), COMP);
     let ch_a = client_with_pushbuf(&gpu, A);
+    // Which index each context got is the registry's business; the rings
+    // are named here by the process that owns them.
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
     // The client's frame: bound in its own VAS, then imported over PRIME
     // and bound by the compositor, which samples it from its own ring.
     const FRAME_VA: u64 = PUSH_VA + 0x10_0000;
@@ -4373,9 +4395,12 @@ fn cpu_prep_waits_for_every_channel_whose_vm_maps_the_buffer_not_only_the_caller
     // blocks shows up as virtual time and one for a GPU that never
     // comes ends (EBUSY after 10 s virtual) instead of hanging.
     assert_eq!(exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
-    let c1 = chan(1);
+    let c1 = chan_of(&gpu, A);
     assert_eq!(userd(&c1), (0, 1));
-    assert!(!has_chan(0), "the compositor has submitted nothing yet");
+    assert!(
+        !has_chan_of(&gpu, COMP),
+        "the compositor has submitted nothing yet"
+    );
     test_clock::set_auto_advance(1);
     let t0 = test_clock::now();
     // The compositor about to read the frame with the CPU: busy, because
@@ -4393,7 +4418,7 @@ fn cpu_prep_waits_for_every_channel_whose_vm_maps_the_buffer_not_only_the_caller
         "the probe went behind the producer's push"
     );
     assert!(
-        !has_chan(0),
+        !has_chan_of(&gpu, COMP),
         "no channel is prepared for the caller just to find that out"
     );
     assert_eq!(
@@ -4418,7 +4443,7 @@ fn cpu_prep_waits_for_every_channel_whose_vm_maps_the_buffer_not_only_the_caller
             assert_eq!(userd(&c1), (0, 3), "the blocking prep queued its probe");
             let mut fetched = Vec::new();
             for _ in 0..5_000 {
-                fetched.extend(run_gpu(1));
+                fetched.extend(run_gpu(a_ctx));
                 if fetched.contains(&Fetched::Release {
                     sem_va: sem,
                     payload: 2,
@@ -4449,7 +4474,7 @@ fn cpu_prep_waits_for_every_channel_whose_vm_maps_the_buffer_not_only_the_caller
         );
     });
     assert_eq!(userd(&c1), (3, 3));
-    assert!(!has_chan(0));
+    assert!(!has_chan_of(&gpu, COMP));
     // The other way round: the compositor sampling the frame is a
     // reader the client must wait for before it writes the buffer
     // again. Its own ring is idle and gets no probe.
@@ -4457,7 +4482,7 @@ fn cpu_prep_waits_for_every_channel_whose_vm_maps_the_buffer_not_only_the_caller
         exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[]),
         Ok(0)
     );
-    let c0 = chan(0);
+    let c0 = chan_of(&gpu, COMP);
     assert_eq!(userd(&c0), (0, 1));
     assert_eq!(
         cpu_prep_nowait(&gpu, h, A),
@@ -4474,7 +4499,7 @@ fn cpu_prep_waits_for_every_channel_whose_vm_maps_the_buffer_not_only_the_caller
     // mapper at once, and one probe on its channel.
     assert_eq!(cpu_prep_nowait(&gpu, h, COMP), Err(nv::EBUSY));
     assert_eq!(userd(&c0), (0, 3), "one probe, not one per role");
-    assert_eq!(run_gpu(0).len(), 3, "push and both probes");
+    assert_eq!(run_gpu(c_ctx).len(), 3, "push and both probes");
     assert_eq!(cpu_prep_nowait(&gpu, h, A), Ok(0));
     assert_eq!(cpu_prep_nowait(&gpu, h, COMP), Ok(0));
     test_clock::set_auto_advance(0);
@@ -4505,6 +4530,7 @@ fn the_pre_waits_fences_land_exactly_when_the_blocking_cpu_prep_returns() {
     let gpu = gpu_rm_ladder();
     let _ch_c = client_with_pushbuf(&gpu, COMP);
     let ch_a = client_with_pushbuf(&gpu, A);
+    let a_ctx = ctx_of(&gpu, A).unwrap().0;
     const FRAME_VA: u64 = PUSH_VA + 0x10_0000;
     // The client's frame, bound in its own VAS and imported and bound by
     // the compositor: the producer is A, the caller below is COMP.
@@ -4536,7 +4562,7 @@ fn the_pre_waits_fences_land_exactly_when_the_blocking_cpu_prep_returns() {
 
     // The client renders the frame: queued on its ring, not fetched.
     assert_eq!(exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
-    let c1 = chan(1);
+    let c1 = chan_of(&gpu, A);
     let fences = DrmScheme::cpu_prep_fences(&gpu, h, COMP);
     assert!(
         !fences.is_empty(),
@@ -4560,7 +4586,7 @@ fn the_pre_waits_fences_land_exactly_when_the_blocking_cpu_prep_returns() {
         "the producer's channel still has the frame queued"
     );
     assert!(!landed(&fences), "landed before the GPU ran");
-    let fetched = run_gpu(1);
+    let fetched = run_gpu(a_ctx);
     assert!(
         fetched.iter().any(|f| matches!(f, Fetched::Release { .. })),
         "the probe left no fence on the producer's ring ({:?})",
@@ -4603,6 +4629,7 @@ fn cpu_prep_waits_for_a_zombies_ring_that_still_writes_the_buffer() {
     FAKE_RM.lock().peer = true;
     let ch_c = client_with_pushbuf(&gpu, COMP);
     let ch_a = client_with_pushbuf(&gpu, A);
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
     const FRAME_VA: u64 = PUSH_VA + 0x10_0000;
     let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
         .unwrap()
@@ -4633,15 +4660,15 @@ fn cpu_prep_waits_for_a_zombies_ring_that_still_writes_the_buffer() {
         ),
         Ok(0)
     );
-    let (c0, c1) = (chan(0), chan(1));
+    let (c0, c1) = (chan(c_ctx), chan(a_ctx));
     assert_eq!(userd(&c1), (0, 2), "the frame and its fence, not fetched");
     // The client exits before its ring ran: a zombie, its ring still
     // to run. Its last payload landed at the park, so the compositor
     // passes its ACQUIRE and drains its own ring.
     gpu.nouveau_release_process(A);
     assert_eq!(gpu.nouveau_zombies.lock().len(), 1, "a zombie");
-    assert!(has_chan(1));
-    assert_eq!(run_gpu(0).len(), 3, "the compositor passes its acquire");
+    assert!(has_chan(a_ctx));
+    assert_eq!(run_gpu(c_ctx).len(), 3, "the compositor passes its acquire");
     assert_eq!(userd(&c0), (3, 3));
     assert_eq!(userd(&c1), (0, 2), "the zombie's ring has not moved");
     test_clock::set_auto_advance(1);
@@ -4686,7 +4713,7 @@ fn cpu_prep_waits_for_a_zombies_ring_that_still_writes_the_buffer() {
             assert_eq!(userd(&c1), (0, 5), "the blocking prep queued its probe");
             let mut fetched = Vec::new();
             for _ in 0..5_000 {
-                fetched.extend(run_gpu(1));
+                fetched.extend(run_gpu(a_ctx));
                 if fetched.contains(&Fetched::Release {
                     sem_va: sem,
                     payload: 4,
@@ -4734,7 +4761,7 @@ fn cpu_prep_waits_for_a_zombies_ring_that_still_writes_the_buffer() {
     // channel to probe.
     gpu.reap_zombie_contexts();
     assert!(gpu.nouveau_zombies.lock().is_empty());
-    assert!(!has_chan(1), "the zombie's channel is freed");
+    assert!(!has_chan(a_ctx), "the zombie's channel is freed");
     assert_eq!(cpu_prep_nowait(&gpu, h, COMP), Ok(0));
     assert_eq!(userd(&c0), (3, 3), "no probe on the compositor's idle ring");
     test_clock::set_auto_advance(0);
@@ -5020,6 +5047,7 @@ fn gem_close_of_a_buffer_a_ring_still_reads_frees_it_once_the_ring_has_passed() 
     let gpu = gpu_rm_ladder();
     let ch_c = client_with_pushbuf(&gpu, COMP);
     let ch_a = client_with_pushbuf(&gpu, A);
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
     const FRAME_VA: u64 = PUSH_VA + 0x10_0000;
     let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
         .unwrap()
@@ -5037,7 +5065,7 @@ fn gem_close_of_a_buffer_a_ring_still_reads_frees_it_once_the_ring_has_passed() 
         exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[]),
         Ok(0)
     );
-    let c0 = chan(0);
+    let c0 = chan(c_ctx);
     assert_eq!(userd(&c0), (0, 1));
     let (frees, unmaps) = {
         let f = FAKE_RM.lock();
@@ -5067,13 +5095,16 @@ fn gem_close_of_a_buffer_a_ring_still_reads_frees_it_once_the_ring_has_passed() 
         "and so does its place in the VAS"
     );
     assert_eq!(userd(&c0), (0, 2), "a probe fence behind the blit");
-    assert!(!has_chan(1), "the client's idle ring was not even prepared");
+    assert!(
+        !has_chan(a_ctx),
+        "the client's idle ring was not even prepared"
+    );
     // A submit is a reap point, but the ring has not moved.
     assert_eq!(exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
     assert_eq!(FAKE_RM.lock().gem_frees, frees);
     // The ring passes the blit and the probe: the next reap frees.
     assert_eq!(
-        run_gpu(0),
+        run_gpu(c_ctx),
         [
             Fetched::Push {
                 va: PUSH_VA,
@@ -5112,12 +5143,12 @@ fn gem_close_of_a_buffer_a_ring_still_reads_frees_it_once_the_ring_has_passed() 
     let h_own = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, A)
         .unwrap()
         .handle;
-    let c1 = chan(1);
+    let c1 = chan(a_ctx);
     assert_eq!(userd(&c1), (0, 2), "A's two submits, unfetched");
     assert!(gpu.nouveau_gem_close(h_own, A));
     assert_eq!(userd(&c1), (0, 3), "a probe behind them");
     assert_eq!(FAKE_RM.lock().gem_frees, frees + 2);
-    assert_eq!(run_gpu(1).len(), 3);
+    assert_eq!(run_gpu(a_ctx).len(), 3);
     assert!(
         !gpu.nouveau_gem_close(h + 1000, A),
         "no such handle, but a close is a reap point too"
@@ -5163,7 +5194,7 @@ fn gem_close_of_a_buffer_a_ring_still_reads_frees_it_once_the_ring_has_passed() 
     assert_eq!(userd(&c1), (3, 6));
     assert_eq!(FAKE_RM.lock().gem_frees, frees + 4);
     gpu.nouveau_release_process(A);
-    assert!(!has_chan(1));
+    assert!(!has_chan(a_ctx));
     {
         let f = FAKE_RM.lock();
         assert_eq!(f.gem_frees, frees + 5, "freed with the ring");
@@ -5187,6 +5218,7 @@ fn a_closed_buffer_of_a_zombie_waits_for_the_zombies_ring_not_for_its_parked_pay
     FAKE_RM.lock().peer = true;
     let ch_c = client_with_pushbuf(&gpu, COMP);
     let ch_a = client_with_pushbuf(&gpu, A);
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
     const FRAME_VA: u64 = PUSH_VA + 0x10_0000;
     let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
         .unwrap()
@@ -5214,7 +5246,7 @@ fn a_closed_buffer_of_a_zombie_waits_for_the_zombies_ring_not_for_its_parked_pay
         ),
         Ok(0)
     );
-    let (c0, c1) = (chan(0), chan(1));
+    let (c0, c1) = (chan(c_ctx), chan(a_ctx));
     assert_eq!(userd(&c1), (0, 2));
     assert_eq!(userd(&c0), (0, 3), "acquire, push, fence");
     let (frees, unmaps) = {
@@ -5252,7 +5284,7 @@ fn a_closed_buffer_of_a_zombie_waits_for_the_zombies_ring_not_for_its_parked_pay
         frees,
         "nobody has passed anything"
     );
-    assert_eq!(run_gpu(0).len(), 5, "the compositor passes its acquire");
+    assert_eq!(run_gpu(c_ctx).len(), 5, "the compositor passes its acquire");
     // The consumer passed: the zombie is torn down, ring, VAS and all,
     // whether or not its ring ran (that is what a zombie is for) -- and
     // with the ring gone the close has nothing left to wait for. Its
@@ -5262,7 +5294,7 @@ fn a_closed_buffer_of_a_zombie_waits_for_the_zombies_ring_not_for_its_parked_pay
         Ok(0)
     );
     assert!(gpu.nouveau_zombies.lock().is_empty(), "reaped");
-    assert!(!has_chan(1));
+    assert!(!has_chan(a_ctx));
     assert_eq!(
         exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[]),
         Ok(0)
@@ -7114,60 +7146,73 @@ fn the_compositor_claims_ctx0_through_the_ladder_once_and_keeps_it_across_its_th
     assert_eq!(ctx0_owner(&gpu), 0, "nothing claimed");
     assert_eq!(rm_backed_channels(&gpu, COMP), 0);
     assert_eq!(step17_builds(), 0);
-    assert!(!FAKE_RM.lock().ctxs.contains(&0));
-    // The first compositor channel: the ladder, the singleton channel,
-    // the notifier cached for the failure path, and the sticky claim.
+    assert_eq!(ctx_of(&gpu, COMP), None);
+    // The first compositor channel: the ladder (context 0 stays the boot
+    // compute channel, and the compositor's safety net), the notifier
+    // cached for the failure path, the sticky claim -- and a context of
+    // the compositor's OWN, which is what makes it a process the RM can
+    // name in `nvidia-smi`. Context 0's client is KERNEL + admin, and the
+    // RM skips exactly those when it answers GPU_GET_PIDS, so for as long
+    // as the compositor ran on it no pid could have made it appear.
     nv::set_chan_notifier_pa(0);
     assert_eq!(nv::chan_notifier_pa_cached(), None);
     let before = FAKE_RM.lock().calls.len();
     let c = channel_alloc(&gpu, COMP).unwrap();
     assert_eq!(c.channel, 0);
+    assert_eq!(ctx0_owner(&gpu), COMP, "the sticky role is still its own");
+    let comp_ctx = ctx_of(&gpu, COMP);
     assert_eq!(
-        c.notifier_handle, 0x6000,
-        "the singleton channel's notifier"
+        comp_ctx,
+        Some((1, true)),
+        "a context of its own, like every other DRM client"
     );
+    assert_ne!(
+        c.notifier_handle, 0x6000,
+        "its own context's notifier, not the shared ladder's"
+    );
+    assert_eq!(c.notifier_handle, 0x6001);
     assert_eq!(
         c.pushbuf_domains,
         nv::NOUVEAU_GEM_DOMAIN_VRAM | nv::NOUVEAU_GEM_DOMAIN_GART,
-        "the ladder channel reports the same domains"
-    );
-    assert_eq!(ctx0_owner(&gpu), COMP);
-    assert_eq!(
-        ctx_of(&gpu, COMP),
-        None,
-        "no client context: the compositor IS context 0"
+        "the same domains either way"
     );
     assert_eq!(rm_backed_channels(&gpu, COMP), 1);
     let calls = rm_calls_since(before);
     assert_eq!(&calls[..2], ["step16", "step17"]);
     assert!(calls.contains(&"chan_notifier_pa"));
-    assert!(!calls.contains(&"ctx_alloc"), "no client context built");
+    assert!(
+        calls.contains(&"ctx_alloc"),
+        "and its own context behind that channel"
+    );
     assert_eq!(nv::chan_notifier_pa_cached(), Some(notifier_pa()));
     // labwc runs two Vulkan instances: the second channel of the same
-    // pid rides the cached ladder.
+    // pid rides the context the first one built, and the ladder behind
+    // index 0 is still built once.
     assert_eq!(channel_alloc(&gpu, COMP).unwrap().channel, 1);
     assert_eq!(step17_builds(), 1, "the ladder is a singleton");
+    assert_eq!(ctx_of(&gpu, COMP), comp_ctx, "the same context");
     assert_eq!(rm_backed_channels(&gpu, COMP), 2);
-    // A client meanwhile is a client: a context of its own.
-    assert_eq!(channel_alloc(&gpu, A).unwrap().notifier_handle, 0x6001);
-    assert_eq!(ctx_of(&gpu, A), Some((1, true)));
+    // A client meanwhile is a client: a context of its own too, the next
+    // index along.
+    assert_eq!(channel_alloc(&gpu, A).unwrap().notifier_handle, 0x6002);
+    assert_eq!(ctx_of(&gpu, A), Some((2, true)));
     // The compositor freeing every channel it has (NVK's throwaway
-    // enumeration context, in both instances) keeps the sticky role:
-    // the next client is still a client, and the compositor's next
-    // channel is still ctx 0, on the same singleton channel.
+    // enumeration context, in both instances) keeps the sticky role AND
+    // its context: the next client is still a client, and the
+    // compositor's next channel is its own context's again.
     assert_eq!(channel_free(&gpu, 0, COMP), Ok(0));
     assert_eq!(channel_free(&gpu, 1, COMP), Ok(0));
     assert_eq!(rm_backed_channels(&gpu, COMP), 0);
     assert_eq!(ctx0_owner(&gpu), COMP, "sticky");
-    assert_eq!(channel_alloc(&gpu, B).unwrap().notifier_handle, 0x6002);
-    assert_eq!(ctx_of(&gpu, B), Some((2, true)));
+    assert_eq!(channel_alloc(&gpu, B).unwrap().notifier_handle, 0x6003);
+    assert_eq!(ctx_of(&gpu, B), Some((3, true)));
     let again = channel_alloc(&gpu, COMP).unwrap();
-    assert_eq!(again.notifier_handle, 0x6000);
-    assert_eq!(ctx_of(&gpu, COMP), None);
+    assert_eq!(again.notifier_handle, 0x6001);
+    assert_eq!(ctx_of(&gpu, COMP), comp_ctx);
     assert_eq!(step17_builds(), 1);
     assert_eq!(ctx0_resets(), 0, "a CHANNEL_FREE is not an exit");
-    // And its submits go down the singleton's own ring, direct, from a
-    // buffer bound in the ladder's VAS.
+    // And its submits go down its own ring, direct, from a buffer bound
+    // in its own VAS -- not in the shared ladder's.
     let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, COMP)
         .unwrap()
         .handle;
@@ -7178,12 +7223,16 @@ fn the_compositor_claims_ctx0_through_the_ladder_once_and_keeps_it_across_its_th
     assert_eq!(
         FAKE_RM
             .lock()
-            .maps_of_ctx(0)
+            .maps_of_ctx(1)
             .iter()
             .map(|m| (m.0, m.1))
             .collect::<Vec<_>>(),
         [(PUSH_VA, 65536)],
-        "bound in context 0"
+        "bound in its own context"
+    );
+    assert!(
+        FAKE_RM.lock().maps_of_ctx(0).is_empty(),
+        "and nothing of its own in the boot ladder's VAS"
     );
     let out = syncobj::create(false);
     assert_eq!(
@@ -7197,7 +7246,7 @@ fn the_compositor_claims_ctx0_through_the_ladder_once_and_keeps_it_across_its_th
         ),
         Ok(0)
     );
-    let ring = run_gpu(0);
+    let ring = run_gpu(1);
     assert_eq!(ring.len(), 2, "the push and its fence");
     assert_eq!(
         ring[0],
@@ -7227,6 +7276,9 @@ fn the_compositors_exit_gives_ctx0_back_and_the_respawn_gets_a_fresh_channel_and
     let ch_c = client_with_pushbuf(&gpu, COMP);
     assert_eq!(ctx0_owner(&gpu), COMP);
     let ch_a = client_with_pushbuf(&gpu, A);
+    // Which index each context got belongs to the registry; the rings and
+    // the peer mappings are named here by the process that owns them.
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
     // A frame each way: the compositor waits on the client's, and the
     // client on the compositor's (the buffer's release).
     let out = syncobj::create(false);
@@ -7251,12 +7303,12 @@ fn the_compositors_exit_gives_ctx0_back_and_the_respawn_gets_a_fresh_channel_and
         Ok(0)
     );
     assert_eq!(peer_maps_made(), 2, "one mapping each way");
-    let (_, stale) = peer_map(0, 1).unwrap();
-    let (_, stale_a) = peer_map(1, 0).unwrap();
-    assert_eq!(run_gpu(1).len(), 2);
-    assert_eq!(run_gpu(0).len(), 3, "acquire, push, fence");
-    assert_eq!(run_gpu(1).len(), 2, "acquire, push");
-    let old = chan(0);
+    let (_, stale) = peer_map(c_ctx, a_ctx).unwrap();
+    let (_, stale_a) = peer_map(a_ctx, c_ctx).unwrap();
+    assert_eq!(run_gpu(a_ctx).len(), 2);
+    assert_eq!(run_gpu(c_ctx).len(), 3, "acquire, push, fence");
+    assert_eq!(run_gpu(a_ctx).len(), 2, "acquire, push");
+    let old = chan(c_ctx);
     // The compositor dies mid-session. Its window is released before
     // the channel behind it, the singleton is torn down, the role is
     // free, and the RM has dropped every mapping context 0 took part
@@ -7275,9 +7327,9 @@ fn the_compositors_exit_gives_ctx0_back_and_the_respawn_gets_a_fresh_channel_and
         .expect("the singleton reset");
     assert!(released < reset, "the window before the channel behind it");
     assert_eq!(ctx0_resets(), 1);
-    assert!(!has_chan(0));
-    assert_eq!(peer_map(0, 1), None);
-    assert_eq!(peer_map(1, 0), None);
+    assert!(!has_chan(c_ctx));
+    assert_eq!(peer_map(c_ctx, a_ctx), None);
+    assert_eq!(peer_map(a_ctx, c_ctx), None);
     // The RM dropped both mappings with the channel; so must the driver's
     // cache, or a client that outlives the compositor is waited on --
     // and waits -- through the VAs the RM has already freed.
@@ -7285,7 +7337,7 @@ fn the_compositors_exit_gives_ctx0_back_and_the_respawn_gets_a_fresh_channel_and
         gpu.nouveau_peer_fence
             .lock()
             .keys()
-            .all(|&(consumer, producer)| consumer != 0 && producer != 0),
+            .all(|&(consumer, producer)| consumer != c_ctx && producer != c_ctx),
         "no mapping of context 0 is remembered past its reset"
     );
     // The clients go with it (their socket is gone)...
@@ -7303,7 +7355,8 @@ fn the_compositors_exit_gives_ctx0_back_and_the_respawn_gets_a_fresh_channel_and
     assert_eq!(ctx0_owner(&gpu), COMP2);
     assert_eq!(step17_builds(), 2, "a new channel behind index 0");
     let ch_b = client_with_pushbuf(&gpu, B);
-    assert_eq!(ctx_of(&gpu, B), Some((1, true)), "the dead client's index");
+    let (c2_ctx, b_ctx) = (ctx_of(&gpu, COMP2).unwrap().0, ctx_of(&gpu, B).unwrap().0);
+    assert_eq!(b_ctx, a_ctx, "the dead client's index");
     let out3 = syncobj::create(false);
     let out4 = syncobj::create(false);
     assert_eq!(
@@ -7322,13 +7375,13 @@ fn the_compositors_exit_gives_ctx0_back_and_the_respawn_gets_a_fresh_channel_and
         ),
         Ok(0)
     );
-    assert_ne!(chan(0).buf, old.buf, "a fresh window");
+    assert_ne!(chan(c2_ctx).buf, old.buf, "a fresh window");
     assert!(
         rm_calls_since(before).contains(&"map_peer_fence"),
         "the client's fence mapped into the new compositor's VAS"
     );
-    let (producer_va, fresh) = peer_map(0, 1).expect("a mapping the RM holds");
-    assert_eq!(producer_va, sem_va(&chan(1)));
+    let (producer_va, fresh) = peer_map(c2_ctx, b_ctx).expect("a mapping the RM holds");
+    assert_eq!(producer_va, sem_va(&chan(b_ctx)));
     assert_ne!(fresh, stale);
     let before = FAKE_RM.lock().calls.len();
     assert_eq!(
@@ -7339,18 +7392,22 @@ fn the_compositors_exit_gives_ctx0_back_and_the_respawn_gets_a_fresh_channel_and
         rm_calls_since(before).contains(&"map_peer_fence"),
         "and the new compositor's fence into the client's"
     );
-    let (producer_va, fresh_a) = peer_map(1, 0).expect("a mapping the RM holds");
-    assert_eq!(producer_va, sem_va(&chan(0)), "of the NEW channel's fence");
+    let (producer_va, fresh_a) = peer_map(b_ctx, c2_ctx).expect("a mapping the RM holds");
+    assert_eq!(
+        producer_va,
+        sem_va(&chan(c2_ctx)),
+        "of the NEW channel's fence"
+    );
     assert_ne!(fresh_a, stale_a);
-    assert_eq!(run_gpu(1).len(), 2);
-    let ring = run_gpu(0);
+    assert_eq!(run_gpu(b_ctx).len(), 2);
+    let ring = run_gpu(c2_ctx);
     assert_eq!(ring.len(), 3, "acquire, push, fence: no fault");
     assert!(
         matches!(ring[0], Fetched::Acquire { sem_va, .. } if sem_va == fresh),
         "the acquire resolves on the client's landing zone: {:?}",
         ring[0]
     );
-    let ring = run_gpu(1);
+    let ring = run_gpu(b_ctx);
     assert_eq!(ring.len(), 2, "acquire, push: no fault");
     assert!(
         matches!(ring[0], Fetched::Acquire { sem_va, .. } if sem_va == fresh_a),
@@ -7395,9 +7452,16 @@ fn a_compositor_that_freed_its_channels_before_exiting_still_gives_ctx0_back() {
     // not a GL client on a context of its own beside a singleton the
     // dead one still holds.
     let c2 = channel_alloc(&gpu, COMP2).unwrap();
-    assert_eq!(c2.notifier_handle, 0x6000);
     assert_eq!(ctx0_owner(&gpu), COMP2);
-    assert_eq!(ctx_of(&gpu, COMP2), None);
+    assert_ne!(
+        c2.notifier_handle, 0x6000,
+        "its own context's notifier, not the shared boot ladder's"
+    );
+    assert_eq!(
+        ctx_of(&gpu, COMP2).map(|t| t.1),
+        Some(true),
+        "the respawn is the compositor, on a context of its own"
+    );
     assert_eq!(step17_builds(), 2);
     // A stranger's exit, or the same exit twice, resets nothing more.
     gpu.nouveau_release_process(STRANGER);
@@ -7430,7 +7494,10 @@ fn a_client_that_exits_with_the_compositors_acquire_queued_keeps_its_fence_page_
     let ch_c = client_with_pushbuf(&gpu, COMP);
     assert_eq!(ctx0_owner(&gpu), COMP);
     let ch_a = client_with_pushbuf(&gpu, A);
-    assert_eq!(ctx_of(&gpu, A), Some((1, true)));
+    // Named by the process that owns each ring: which index the registry
+    // handed out is its own business.
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
+    assert!(ctx_of(&gpu, A).unwrap().1);
     let out = syncobj::create(false);
     let out2 = syncobj::create(false);
     assert_eq!(
@@ -7448,10 +7515,11 @@ fn a_client_that_exits_with_the_compositors_acquire_queued_keeps_its_fence_page_
         ),
         Ok(0)
     );
-    let (producer_va, _) = peer_map(0, 1).expect("the client's semaphore in the compositor's VAS");
-    assert_eq!(producer_va, sem_va(&chan(1)));
+    let (producer_va, _) =
+        peer_map(c_ctx, a_ctx).expect("the client's semaphore in the compositor's VAS");
+    assert_eq!(producer_va, sem_va(&chan(a_ctx)));
     assert_eq!(
-        userd(&chan(0)),
+        userd(&chan(c_ctx)),
         (0, 3),
         "acquire, push, release: queued, not fetched"
     );
@@ -7468,26 +7536,27 @@ fn a_client_that_exits_with_the_compositors_acquire_queued_keeps_its_fence_page_
         "the channel is NOT freed while the compositor's ACQUIRE is queued: {:?}",
         rm_calls_since(before)
     );
-    assert!(has_chan(1));
-    assert!(peer_map(0, 1).is_some(), "the compositor's mapping stays");
+    assert!(has_chan(a_ctx));
+    assert!(
+        peer_map(c_ctx, a_ctx).is_some(),
+        "the compositor's mapping stays"
+    );
     assert_eq!(
         syncobj::query(out),
         Some(1),
         "the CPU side of the client's fence is released at once, as a killed channel's"
     );
     assert_eq!(
-        landing_zone(&chan(1)),
+        landing_zone(&chan(a_ctx)),
         1,
         "the landing zone carries the last payload the client issued, written by the CPU"
     );
     // A new client does not get the zombie's index: its page is still
     // the one the compositor's ring is about to read.
     let ch_b = client_with_pushbuf(&gpu, B);
-    assert_eq!(
-        ctx_of(&gpu, B),
-        Some((2, true)),
-        "the zombie's index is not reused"
-    );
+    let b_ctx = ctx_of(&gpu, B).unwrap().0;
+    assert!(ctx_of(&gpu, B).unwrap().1);
+    assert_ne!(b_ctx, a_ctx, "the zombie's index is not reused");
     // The compositor queues its next frame before its ring has moved:
     // still nothing freed, the ACQUIRE is still ahead of GPGet.
     let before = FAKE_RM.lock().calls.len();
@@ -7496,11 +7565,11 @@ fn a_client_that_exits_with_the_compositors_acquire_queued_keeps_its_fence_page_
         Ok(0)
     );
     assert!(!rm_calls_since(before).contains(&"ctx_free"));
-    assert!(has_chan(1));
+    assert!(has_chan(a_ctx));
     // The compositor's ring runs: the ACQUIRE passes on the page the
     // dead client's ring never wrote (its own ring never ran), and no
     // entry faults.
-    let fetched = run_gpu(0);
+    let fetched = run_gpu(c_ctx);
     assert_eq!(
         fetched.len(),
         4,
@@ -7508,7 +7577,7 @@ fn a_client_that_exits_with_the_compositors_acquire_queued_keeps_its_fence_page_
         fetched
     );
     assert!(
-        matches!(fetched[0], Fetched::Acquire { sem_va, payload: 1 } if sem_va == peer_map(0, 1).unwrap().1),
+        matches!(fetched[0], Fetched::Acquire { sem_va, payload: 1 } if sem_va == peer_map(c_ctx, a_ctx).unwrap().1),
         "the ACQUIRE on the dead client's page passed: {:?}",
         fetched[0]
     );
@@ -7529,19 +7598,19 @@ fn a_client_that_exits_with_the_compositors_acquire_queued_keeps_its_fence_page_
         "the dead client's channel freed once the compositor passed: {:?}",
         rm_calls_since(before)
     );
-    assert!(!has_chan(1));
-    assert_eq!(peer_map(0, 1), None);
+    assert!(!has_chan(a_ctx));
+    assert_eq!(peer_map(c_ctx, a_ctx), None);
     assert!(gpu.nouveau_zombies.lock().is_empty());
     assert_eq!(
-        run_gpu(0).len(),
+        run_gpu(c_ctx).len(),
         1,
         "and the compositor's ring is none the worse"
     );
     gpu.nouveau_release_process(B);
     let _ = ch_b;
     gpu.nouveau_release_process(COMP);
-    assert!(!has_chan(0));
-    assert!(!has_chan(2));
+    assert!(!has_chan(c_ctx));
+    assert!(!has_chan(b_ctx));
     assert_eq!(FAKE_RM.lock().bad, 0);
 }
 
@@ -7564,6 +7633,7 @@ fn a_recycled_pid_owns_nothing_of_the_zombie_and_the_zombie_still_waits_for_its_
     test_clock::set_auto_advance(1_000);
     let ch_c = client_with_pushbuf(&gpu, COMP);
     let ch_a = channel_alloc(&gpu, A).unwrap().channel as u32;
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
     let h_a = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
         .unwrap()
         .handle;
@@ -7584,13 +7654,14 @@ fn a_recycled_pid_owns_nothing_of_the_zombie_and_the_zombie_still_waits_for_its_
     );
     gpu.nouveau_release_process(A);
     assert_eq!(gpu.nouveau_zombies.lock().len(), 1, "a zombie");
-    let old = chan(1);
+    let old = chan(a_ctx);
     // The pid comes back as a new process and allocates a channel: the
     // zombie is not torn down (its consumer has not passed), and the new
     // process owns nothing of it.
     let before = FAKE_RM.lock().calls.len();
     let bytes_before = NOUVEAU_GEM_BYTES.load(Ordering::Relaxed);
     let ch_a2 = client_with_pushbuf(&gpu, A);
+    let a2_ctx = ctx_of(&gpu, A).unwrap().0;
     let calls = rm_calls_since(before);
     assert!(
         !calls.contains(&"ctx_free") && !calls.contains(&"class_free"),
@@ -7598,13 +7669,13 @@ fn a_recycled_pid_owns_nothing_of_the_zombie_and_the_zombie_still_waits_for_its_
         calls
     );
     assert_eq!(gpu.nouveau_zombies.lock().len(), 1);
-    assert_eq!(
-        ctx_of(&gpu, A),
-        Some((2, true)),
+    assert!(ctx_of(&gpu, A).unwrap().1);
+    assert_ne!(
+        a2_ctx, a_ctx,
         "a context of its own, not the zombie's index"
     );
     assert!(
-        peer_map(0, 1).is_some(),
+        peer_map(c_ctx, a_ctx).is_some(),
         "the compositor's mapping of the zombie's page stays"
     );
     assert_eq!(
@@ -7633,14 +7704,14 @@ fn a_recycled_pid_owns_nothing_of_the_zombie_and_the_zombie_still_waits_for_its_
         Ok(0)
     );
     assert_eq!(
-        run_gpu(2).len(),
+        run_gpu(a2_ctx).len(),
         2,
         "push and fence on a channel of its own"
     );
-    assert_ne!(chan(2).buf, old.buf);
+    assert_ne!(chan(a2_ctx).buf, old.buf);
     // The zombie's ring and its consumer run: the compositor passes its
     // ACQUIRE on a page that is still there.
-    let zombie_ran = run_gpu(1);
+    let zombie_ran = run_gpu(a_ctx);
     assert_eq!(zombie_ran.len(), 2, "the zombie's push and fence");
     assert!(
         !zombie_ran
@@ -7649,7 +7720,7 @@ fn a_recycled_pid_owns_nothing_of_the_zombie_and_the_zombie_still_waits_for_its_
         "its pushbuf is still mapped in its VAS: {:?}",
         zombie_ran
     );
-    assert_eq!(run_gpu(0).len(), 2, "acquire and push, no fault");
+    assert_eq!(run_gpu(c_ctx).len(), 2, "acquire and push, no fault");
     // Now the zombie is due. Its teardown takes its own state -- the
     // channel, the pushbuf, the mapping, the class object -- and nothing
     // of the new process's.
@@ -7669,10 +7740,13 @@ fn a_recycled_pid_owns_nothing_of_the_zombie_and_the_zombie_still_waits_for_its_
         65536,
         "the zombie's pushbuf went, and only it"
     );
-    assert_eq!(peer_map(0, 1), None);
-    assert!(!has_chan(1));
+    assert_eq!(peer_map(c_ctx, a_ctx), None);
+    assert!(!has_chan(a_ctx));
     assert!(
-        !gpu.nouveau_channels.lock().iter().any(|c| c.ctx_idx == 1),
+        !gpu.nouveau_channels
+            .lock()
+            .iter()
+            .any(|c| c.ctx_idx == a_ctx),
         "the zombie's channel entry went with it"
     );
     assert_eq!(
@@ -7685,18 +7759,18 @@ fn a_recycled_pid_owns_nothing_of_the_zombie_and_the_zombie_still_waits_for_its_
         "the new process's mapping; the zombie's is gone"
     );
     assert_eq!(
-        ctx_of(&gpu, A),
-        Some((2, true)),
+        ctx_of(&gpu, A).map(|t| t.0),
+        Some(a2_ctx),
         "the new process keeps its context"
     );
-    assert!(has_chan(2));
+    assert!(has_chan(a2_ctx));
     let out3 = syncobj::create(false);
     assert_eq!(
         exec(&gpu, A, ch_a2, &[push(PUSH_VA, 16)], &[], &[sync(out3)]),
         Ok(0),
         "and renders on"
     );
-    assert_eq!(run_gpu(2).len(), 2);
+    assert_eq!(run_gpu(a2_ctx).len(), 2);
     assert!(syncobj::destroy(out));
     assert!(syncobj::destroy(out2));
     assert!(syncobj::destroy(out3));
@@ -7720,6 +7794,9 @@ fn a_wedged_context_a_consumer_waits_on_is_a_zombie_while_its_process_renders_on
     test_clock::set_auto_advance(1_000);
     let ch_c = client_with_pushbuf(&gpu, COMP);
     let ch_a = channel_alloc(&gpu, A).unwrap().channel as u32;
+    // Named by the process that owns each ring; the indices are the
+    // registry's business.
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
     let h_a = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
         .unwrap()
         .handle;
@@ -7738,6 +7815,7 @@ fn a_wedged_context_a_consumer_waits_on_is_a_zombie_while_its_process_renders_on
     // mappings -- A's in the VAS about to go among them -- wait for
     // B's ring.
     let ch_b = client_with_pushbuf(&gpu, B);
+    let b_ctx = ctx_of(&gpu, B).unwrap().0;
     const FRAME_VA: u64 = PUSH_VA + 0x10_0000;
     let h2 = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
         .unwrap()
@@ -7751,14 +7829,15 @@ fn a_wedged_context_a_consumer_waits_on_is_a_zombie_while_its_process_renders_on
     assert_eq!(gpu.nouveau_deferred_frees.lock().len(), 1);
     // A's fence never lands: the timeout's upcall latches its context.
     let (fence_va, _, payload, ctx) = pending_hw_fence(out, 1).unwrap();
-    assert_eq!(ctx, 1);
-    gpu.fast_fence_timeout(1, fence_va, payload, out, 1);
-    assert!(nv::ctx_is_wedged(1));
+    assert_eq!(ctx, a_ctx);
+    gpu.fast_fence_timeout(a_ctx, fence_va, payload, out, 1);
+    assert!(nv::ctx_is_wedged(a_ctx));
     assert_eq!(channel_free(&gpu, ch_a as i32, A), Ok(0));
     // The compositor's ACQUIRE is still queued: the context is kept.
     let before = FAKE_RM.lock().calls.len();
     let bytes = NOUVEAU_GEM_BYTES.load(Ordering::Relaxed);
     let ch_a2 = client_with_pushbuf(&gpu, A);
+    let a2_ctx = ctx_of(&gpu, A).unwrap().0;
     let calls = rm_calls_since(before);
     assert!(
         !calls.contains(&"ctx_free"),
@@ -7766,11 +7845,12 @@ fn a_wedged_context_a_consumer_waits_on_is_a_zombie_while_its_process_renders_on
         calls
     );
     assert_eq!(gpu.nouveau_zombies.lock().len(), 1);
-    assert_eq!(ctx_of(&gpu, A), Some((3, true)), "a fresh context");
-    assert!(!nv::ctx_is_wedged(3));
-    assert!(nv::ctx_is_wedged(1), "the zombie keeps its verdict");
+    assert!(ctx_of(&gpu, A).unwrap().1, "a fresh context");
+    assert_ne!(a2_ctx, a_ctx);
+    assert!(!nv::ctx_is_wedged(a2_ctx));
+    assert!(nv::ctx_is_wedged(a_ctx), "the zombie keeps its verdict");
     assert!(
-        peer_map(0, 1).is_some(),
+        peer_map(c_ctx, a_ctx).is_some(),
         "the compositor's mapping of its page stays"
     );
     assert_eq!(
@@ -7794,11 +7874,11 @@ fn a_wedged_context_a_consumer_waits_on_is_a_zombie_while_its_process_renders_on
         Ok(0),
         "renders on"
     );
-    assert_eq!(run_gpu(3).len(), 2);
+    assert_eq!(run_gpu(a2_ctx).len(), 2);
     assert_eq!(syncobj::query(out2), Some(1));
     // The compositor passes its ACQUIRE on a page that is still there,
     // and the zombie is due.
-    assert_eq!(run_gpu(0).len(), 2);
+    assert_eq!(run_gpu(c_ctx).len(), 2);
     let before = FAKE_RM.lock().calls.len();
     let bytes = NOUVEAU_GEM_BYTES.load(Ordering::Relaxed);
     gpu.reap_zombie_contexts();
@@ -7806,7 +7886,7 @@ fn a_wedged_context_a_consumer_waits_on_is_a_zombie_while_its_process_renders_on
     assert!(calls.contains(&"ctx_free"), "its context: {:?}", calls);
     assert!(!calls.contains(&"gem_free"), "nothing of A's: {:?}", calls);
     assert!(gpu.nouveau_zombies.lock().is_empty());
-    assert!(!nv::ctx_is_wedged(1));
+    assert!(!nv::ctx_is_wedged(a_ctx));
     // The closed buffer still waits for B's ring, with B's mapping
     // only: A's went with the VAS, and unmapping it later would be a
     // stale handle in the RM.
@@ -7817,8 +7897,8 @@ fn a_wedged_context_a_consumer_waits_on_is_a_zombie_while_its_process_renders_on
         assert_eq!(deferred[0].mappings[0].owner_pid, B);
     }
     assert_eq!(NOUVEAU_GEM_BYTES.load(Ordering::Relaxed), bytes);
-    assert_eq!(peer_map(0, 1), None);
-    assert!(!has_chan(1));
+    assert_eq!(peer_map(c_ctx, a_ctx), None);
+    assert!(!has_chan(a_ctx));
     assert_eq!(
         gpu.nouveau_vm_mappings
             .lock()
@@ -7828,17 +7908,17 @@ fn a_wedged_context_a_consumer_waits_on_is_a_zombie_while_its_process_renders_on
         1,
         "A's mapping in its new VAS; the zombie's is gone"
     );
-    assert_eq!(ctx_of(&gpu, A), Some((3, true)));
+    assert_eq!(ctx_of(&gpu, A).map(|t| t.0), Some(a2_ctx));
     assert_eq!(
         exec(&gpu, A, ch_a2, &[push(PUSH_VA, 16)], &[], &[]),
         Ok(0),
         "and on"
     );
-    assert_eq!(run_gpu(3).len(), 1);
+    assert_eq!(run_gpu(a2_ctx).len(), 1);
     // B's ring passes the closed buffer; A's exit takes A's: both
     // pushbufs, and the closed buffer, B's mapping of it unmapped and
     // nothing of the VAS that is gone.
-    assert_eq!(run_gpu(2).len(), 2, "B's push and the probe");
+    assert_eq!(run_gpu(b_ctx).len(), 2, "B's push and the probe");
     let before = FAKE_RM.lock().calls.len();
     gpu.nouveau_release_process(A);
     let calls = rm_calls_since(before);
@@ -7865,6 +7945,7 @@ fn a_recycled_pid_that_exits_without_a_channel_leaves_the_zombie_to_its_consumer
     test_clock::set_auto_advance(1_000);
     let ch_c = client_with_pushbuf(&gpu, COMP);
     let ch_a = client_with_pushbuf(&gpu, A);
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
     let out = syncobj::create(false);
     assert_eq!(
         exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
@@ -7875,7 +7956,7 @@ fn a_recycled_pid_that_exits_without_a_channel_leaves_the_zombie_to_its_consumer
         Ok(0)
     );
     gpu.nouveau_release_process(A);
-    assert!(has_chan(1), "a zombie");
+    assert!(has_chan(a_ctx), "a zombie");
     let before = FAKE_RM.lock().calls.len();
     gpu.nouveau_release_process(A);
     assert!(
@@ -7883,12 +7964,12 @@ fn a_recycled_pid_that_exits_without_a_channel_leaves_the_zombie_to_its_consumer
         "the zombie is its consumer's to release, not this exit's: {:?}",
         rm_calls_since(before)
     );
-    assert!(has_chan(1));
+    assert!(has_chan(a_ctx));
     assert_eq!(gpu.nouveau_zombies.lock().len(), 1);
-    assert_eq!(run_gpu(1).len(), 2);
-    assert_eq!(run_gpu(0).len(), 2, "the compositor passes, no fault");
+    assert_eq!(run_gpu(a_ctx).len(), 2);
+    assert_eq!(run_gpu(c_ctx).len(), 2, "the compositor passes, no fault");
     gpu.reap_zombie_contexts();
-    assert!(!has_chan(1), "freed once the consumer passed");
+    assert!(!has_chan(a_ctx), "freed once the consumer passed");
     assert!(gpu.nouveau_zombies.lock().is_empty());
     assert!(syncobj::destroy(out));
     gpu.nouveau_release_process(COMP);
@@ -7928,23 +8009,24 @@ fn a_wedged_clients_fence_releases_the_compositors_acquire_too() {
         ),
         Ok(0)
     );
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
     let (fence_va, _, payload, ctx) =
         pending_hw_fence(out, 1).expect("the client's fence is pending on its ring");
-    assert_eq!((ctx, payload), (1, 1));
+    assert_eq!((ctx, payload), (a_ctx, 1));
     // The compositor's ring is behind the client's fence: it fetches
     // nothing while the zone is unwritten.
-    assert!(run_gpu(0).is_empty(), "stalled on the ACQUIRE");
-    assert_eq!(userd(&chan(0)).0, 0);
+    assert!(run_gpu(c_ctx).is_empty(), "stalled on the ACQUIRE");
+    assert_eq!(userd(&chan(c_ctx)).0, 0);
     // The client's ring never runs. syncobj gives up on the fence...
     test_clock::advance(syncobj::FENCE_TIMEOUT_US);
     assert_eq!(syncobj::poll_pending(), 0);
     assert_eq!(syncobj::query(out), Some(1), "the CPU side is released");
-    assert_eq!(landing_zone(&chan(1)), 0);
+    assert_eq!(landing_zone(&chan(a_ctx)), 0);
     // ...and the upcall lands it on the GPU side too.
     gpu.fast_fence_timeout(ctx, fence_va, payload, out, 1);
-    assert!(nv::ctx_is_wedged(1));
-    assert_eq!(landing_zone(&chan(1)), 1, "written by the CPU");
-    let fetched = run_gpu(0);
+    assert!(nv::ctx_is_wedged(a_ctx));
+    assert_eq!(landing_zone(&chan(a_ctx)), 1, "written by the CPU");
+    let fetched = run_gpu(c_ctx);
     assert_eq!(fetched.len(), 3, "acquire, push, release: {:?}", fetched);
     assert!(matches!(fetched[0], Fetched::Acquire { payload: 1, .. }));
     assert_eq!(syncobj::poll_pending(), 0);
@@ -7958,7 +8040,7 @@ fn a_wedged_clients_fence_releases_the_compositors_acquire_too() {
         exec(&gpu, COMP, ch_c, &[push(PUSH_VA + 0x100, 16)], &[], &[]),
         Ok(0)
     );
-    assert_eq!(run_gpu(0).len(), 1);
+    assert_eq!(run_gpu(c_ctx).len(), 1);
     for h in [out, out2] {
         assert!(syncobj::destroy(h));
     }
@@ -7990,16 +8072,24 @@ fn the_compositors_own_fence_timing_out_releases_a_clients_acquire_on_it() {
         exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[sync(out2)], &[]),
         Ok(0)
     );
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
     let (fence_va, _, payload, ctx) =
-        pending_hw_fence(out2, 1).expect("the compositor's fence is pending on ring 0");
-    assert_eq!((ctx, payload), (0, 1));
-    assert!(run_gpu(1).is_empty(), "the client is behind the compositor");
+        pending_hw_fence(out2, 1).expect("the compositor's fence is pending on its own ring");
+    assert_eq!((ctx, payload), (c_ctx, 1));
+    assert!(
+        run_gpu(a_ctx).is_empty(),
+        "the client is behind the compositor"
+    );
     test_clock::advance(syncobj::FENCE_TIMEOUT_US);
     assert_eq!(syncobj::poll_pending(), 0);
     gpu.fast_fence_timeout(ctx, fence_va, payload, out2, 1);
-    assert!(!nv::ctx_is_wedged(0), "context 0 is never latched");
-    assert_eq!(landing_zone(&chan(0)), 1, "but its zone is landed");
-    assert_eq!(run_gpu(1).len(), 2, "acquire, push");
+    assert!(
+        !nv::ctx_is_wedged(c_ctx),
+        "the compositor's context is never latched -- a latch would be the desktop, \
+         and that exemption follows the sticky role now, not the index 0"
+    );
+    assert_eq!(landing_zone(&chan(c_ctx)), 1, "but its zone is landed");
+    assert_eq!(run_gpu(a_ctx).len(), 2, "acquire, push");
     assert!(syncobj::destroy(out2));
     gpu.nouveau_release_process(A);
     gpu.nouveau_release_process(COMP);
@@ -8021,6 +8111,7 @@ fn the_compositors_exit_lets_its_clients_pass_their_acquires_before_its_page_goe
     test_clock::set_auto_advance(1_000);
     let ch_c = client_with_pushbuf(&gpu, COMP);
     let ch_a = client_with_pushbuf(&gpu, A);
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
     let out2 = syncobj::create(false);
     assert_eq!(
         exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
@@ -8031,25 +8122,29 @@ fn the_compositors_exit_lets_its_clients_pass_their_acquires_before_its_page_goe
         Ok(0)
     );
     assert!(
-        peer_map(1, 0).is_some(),
+        peer_map(a_ctx, c_ctx).is_some(),
         "the compositor's semaphore in the client's VAS"
     );
-    assert!(run_gpu(1).is_empty(), "the client sits on the ACQUIRE");
-    assert_eq!(userd(&chan(1)), (0, 2));
+    assert!(run_gpu(a_ctx).is_empty(), "the client sits on the ACQUIRE");
+    assert_eq!(userd(&chan(a_ctx)), (0, 2));
     // The compositor dies with its ring never run. While its exit
     // waits, the client's PBDMA keeps fetching (the hook is the GPU).
     let fetched: std::sync::Arc<std::sync::Mutex<Vec<Fetched>>> = Default::default();
     let sink = fetched.clone();
     *GPU_SPIN_HOOK.lock() = Some(alloc::boxed::Box::new(move || {
-        sink.lock().unwrap().extend(run_gpu(1));
+        sink.lock().unwrap().extend(run_gpu(a_ctx));
     }));
     let t0 = test_clock::now();
     gpu.nouveau_release_process(COMP);
     *GPU_SPIN_HOOK.lock() = None;
     let elapsed = test_clock::now().wrapping_sub(t0);
     assert_eq!(ctx0_owner(&gpu), 0);
-    assert!(!has_chan(0));
-    assert_eq!(peer_map(1, 0), None, "the mapping went with the page");
+    assert!(!has_chan(c_ctx));
+    assert_eq!(
+        peer_map(a_ctx, c_ctx),
+        None,
+        "the mapping went with the page"
+    );
     let fetched = fetched.lock().unwrap();
     assert_eq!(
         fetched.len(),
@@ -8062,15 +8157,15 @@ fn the_compositors_exit_lets_its_clients_pass_their_acquires_before_its_page_goe
         "{:?}",
         fetched[0]
     );
-    assert!(has_chan(1), "the client's channel is intact");
-    assert_eq!(userd(&chan(1)).0, 2);
+    assert!(has_chan(a_ctx), "the client's channel is intact");
+    assert_eq!(userd(&chan(a_ctx)).0, 2);
     assert!(
         elapsed < CTX0_EXIT_GRACE_US,
         "the wait ended when the client passed, not on the budget ({} us)",
         elapsed
     );
     // Nothing is left on the client's ring to fault.
-    assert!(run_gpu(1).is_empty());
+    assert!(run_gpu(a_ctx).is_empty());
     assert!(syncobj::destroy(out2));
     gpu.nouveau_release_process(A);
     assert_eq!(FAKE_RM.lock().bad, 0);
@@ -8088,6 +8183,7 @@ fn a_client_that_does_not_move_holds_the_compositors_exit_only_for_the_grace_per
     test_clock::set_auto_advance(1_000);
     let ch_c = client_with_pushbuf(&gpu, COMP);
     let ch_a = client_with_pushbuf(&gpu, A);
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
     let out2 = syncobj::create(false);
     assert_eq!(
         exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
@@ -8110,20 +8206,21 @@ fn a_client_that_does_not_move_holds_the_compositors_exit_only_for_the_grace_per
         "and not much more ({} us)",
         elapsed
     );
-    assert!(!has_chan(0), "the reset went through");
-    assert_eq!(peer_map(1, 0), None);
-    assert_eq!(userd(&chan(1)).0, 0, "the client never moved");
+    assert!(!has_chan(c_ctx), "the reset went through");
+    assert_eq!(peer_map(a_ctx, c_ctx), None);
+    assert_eq!(userd(&chan(a_ctx)).0, 0, "the client never moved");
     // The client goes (its socket is gone) and the respawn is not held
     // up: a fresh channel behind index 0.
     assert!(syncobj::destroy(out2));
     gpu.nouveau_release_process(A);
     let ch_c2 = client_with_pushbuf(&gpu, COMP2);
+    let c2_ctx = ctx_of(&gpu, COMP2).unwrap().0;
     assert_eq!(ctx0_owner(&gpu), COMP2);
     assert_eq!(
         exec(&gpu, COMP2, ch_c2, &[push(PUSH_VA, 16)], &[], &[]),
         Ok(0)
     );
-    assert_eq!(run_gpu(0).len(), 1);
+    assert_eq!(run_gpu(c2_ctx).len(), 1);
     gpu.nouveau_release_process(COMP2);
     assert_eq!(FAKE_RM.lock().bad, 0);
 }
@@ -8141,6 +8238,8 @@ fn the_compositors_exit_waits_for_every_client_not_the_first_to_pass() {
     let ch_c = client_with_pushbuf(&gpu, COMP);
     let ch_a = client_with_pushbuf(&gpu, A);
     let ch_b = client_with_pushbuf(&gpu, B);
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
+    let b_ctx = ctx_of(&gpu, B).unwrap().0;
     let out2 = syncobj::create(false);
     assert_eq!(
         exec(&gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
@@ -8154,23 +8253,23 @@ fn the_compositors_exit_waits_for_every_client_not_the_first_to_pass() {
         exec(&gpu, B, ch_b, &[push(PUSH_VA, 16)], &[sync(out2)], &[]),
         Ok(0)
     );
-    assert!(run_gpu(1).is_empty() && run_gpu(2).is_empty());
+    assert!(run_gpu(a_ctx).is_empty() && run_gpu(b_ctx).is_empty());
     // A's PBDMA runs during the exit; B's is stuck.
-    *GPU_SPIN_HOOK.lock() = Some(alloc::boxed::Box::new(|| {
-        let _ = run_gpu(1);
+    *GPU_SPIN_HOOK.lock() = Some(alloc::boxed::Box::new(move || {
+        let _ = run_gpu(a_ctx);
     }));
     let t0 = test_clock::now();
     gpu.nouveau_release_process(COMP);
     *GPU_SPIN_HOOK.lock() = None;
     let elapsed = test_clock::now().wrapping_sub(t0);
-    assert_eq!(userd(&chan(1)).0, 2, "A passed");
-    assert_eq!(userd(&chan(2)).0, 0, "B did not");
+    assert_eq!(userd(&chan(a_ctx)).0, 2, "A passed");
+    assert_eq!(userd(&chan(b_ctx)).0, 0, "B did not");
     assert!(
         elapsed >= CTX0_EXIT_GRACE_US,
         "A passing did not end the wait for B ({} us)",
         elapsed
     );
-    assert!(!has_chan(0));
+    assert!(!has_chan(c_ctx));
     assert!(syncobj::destroy(out2));
     gpu.nouveau_release_process(A);
     gpu.nouveau_release_process(B);
@@ -8191,11 +8290,12 @@ fn the_compositors_respawn_claims_ctx0_while_a_client_of_the_dead_one_is_still_a
     let _ch_c = client_with_pushbuf(&gpu, COMP);
     assert_eq!(ctx0_owner(&gpu), COMP);
     let ch_a = client_with_pushbuf(&gpu, A);
-    assert_eq!(
-        ctx_of(&gpu, A),
-        Some((1, true)),
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
+    assert!(
+        ctx_of(&gpu, A).unwrap().1,
         "the client is RM-backed, on its own context"
     );
+    assert_ne!(a_ctx, c_ctx, "and not on the compositor's");
     gpu.nouveau_release_process(COMP);
     assert_eq!(ctx0_owner(&gpu), 0, "the role is free");
     // The respawn, with A still alive.
@@ -8205,16 +8305,17 @@ fn the_compositors_respawn_claims_ctx0_while_a_client_of_the_dead_one_is_still_a
         COMP2,
         "the respawn is the compositor, not a client"
     );
-    assert_eq!(step17_builds(), 2, "on a fresh singleton channel");
-    assert_eq!(ctx_of(&gpu, COMP2), None, "no client context for it");
+    assert_eq!(step17_builds(), 2, "the boot ladder rebuilt behind index 0");
+    let c2_ctx = ctx_of(&gpu, COMP2).expect("a context of its own").0;
+    assert_ne!(c2_ctx, a_ctx, "not the live client's");
     assert_eq!(
         exec(&gpu, COMP2, ch_c2, &[push(PUSH_VA, 16)], &[], &[]),
         Ok(0)
     );
-    assert_eq!(run_gpu(0).len(), 1);
+    assert_eq!(run_gpu(c2_ctx).len(), 1);
     // And the client is none the worse.
     assert_eq!(exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[]), Ok(0));
-    assert_eq!(run_gpu(1).len(), 1);
+    assert_eq!(run_gpu(a_ctx).len(), 1);
     gpu.nouveau_release_process(A);
     gpu.nouveau_release_process(COMP2);
     assert_eq!(FAKE_RM.lock().bad, 0);
@@ -8240,6 +8341,7 @@ fn a_respawn_that_arrives_during_the_dead_compositors_teardown_waits_for_it_and_
     test_clock::set_auto_advance(1_000);
     let ch_c = client_with_pushbuf(gpu, COMP);
     let ch_a = client_with_pushbuf(gpu, A);
+    let a_ctx = ctx_of(gpu, A).unwrap().0;
     let out2 = syncobj::create(false);
     assert_eq!(
         exec(gpu, COMP, ch_c, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
@@ -8249,7 +8351,7 @@ fn a_respawn_that_arrives_during_the_dead_compositors_teardown_waits_for_it_and_
         exec(gpu, A, ch_a, &[push(PUSH_VA, 16)], &[sync(out2)], &[]),
         Ok(0)
     );
-    assert!(run_gpu(1).is_empty(), "the client sits on the ACQUIRE");
+    assert!(run_gpu(a_ctx).is_empty(), "the client sits on the ACQUIRE");
     // The compositor dies. Its exit waits for the client to pass; while
     // it waits (the hook is the GPU's turn), the respawn arrives: its
     // CHANNEL_ALLOC starts on another thread, and the hook returns only
@@ -8269,7 +8371,7 @@ fn a_respawn_that_arrives_during_the_dead_compositors_teardown_waits_for_it_and_
             std::thread::yield_now();
         }
         *slot.lock().unwrap() = Some(handle);
-        let _ = run_gpu(1);
+        let _ = run_gpu(a_ctx);
     }));
     gpu.nouveau_release_process(COMP);
     *GPU_SPIN_HOOK.lock() = None;
@@ -8288,20 +8390,18 @@ fn a_respawn_that_arrives_during_the_dead_compositors_teardown_waits_for_it_and_
     // torn down -- not the dead one's, freed under it.
     assert_eq!(ctx0_owner(gpu), COMP2);
     assert_eq!(ctx0_resets(), 1);
-    assert_eq!(
-        step17_builds(),
-        2,
-        "a fresh singleton channel, not the dead compositor's"
-    );
-    assert_eq!(ctx_of(gpu, COMP2), None, "no client context");
-    assert!(has_chan(1), "the client's channel is intact");
+    assert_eq!(step17_builds(), 2, "the boot ladder rebuilt behind index 0");
+    let c2_ctx = ctx_of(gpu, COMP2)
+        .expect("the respawn has a context of its own")
+        .0;
+    assert!(has_chan(a_ctx), "the client's channel is intact");
     let out3 = syncobj::create(false);
     assert_eq!(
         exec(gpu, COMP2, ch_c2, &[push(PUSH_VA, 16)], &[], &[sync(out3)]),
         Ok(0),
         "the respawn renders on its channel"
     );
-    assert_eq!(run_gpu(0).len(), 2, "push and fence on the new ring");
+    assert_eq!(run_gpu(c2_ctx).len(), 2, "push and fence on the new ring");
     assert!(syncobj::destroy(out2));
     assert!(syncobj::destroy(out3));
     gpu.nouveau_release_process(A);
@@ -8385,7 +8485,8 @@ fn a_zombies_index_is_not_handed_to_the_next_client_while_its_teardown_runs() {
     test_clock::set_auto_advance(1_000);
     let ch_c = client_with_pushbuf(gpu, COMP);
     let ch_a = client_with_pushbuf(gpu, A);
-    assert_eq!(ctx_of(gpu, A), Some((1, true)));
+    let (c_ctx, a_ctx) = (ctx_of(gpu, COMP).unwrap().0, ctx_of(gpu, A).unwrap().0);
+    assert!(ctx_of(gpu, A).unwrap().1);
     let out = syncobj::create(false);
     assert_eq!(
         exec(gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
@@ -8400,8 +8501,8 @@ fn a_zombies_index_is_not_handed_to_the_next_client_while_its_teardown_runs() {
     // arrives inside the reap's teardown of it.
     gpu.nouveau_release_process(A);
     assert_eq!(gpu.nouveau_zombies.lock().len(), 1);
-    assert_eq!(run_gpu(1).len(), 2, "the dead client's push and fence");
-    assert_eq!(run_gpu(0).len(), 2, "the compositor passes its acquire");
+    assert_eq!(run_gpu(a_ctx).len(), 2, "the dead client's push and fence");
+    assert_eq!(run_gpu(c_ctx).len(), 2, "the compositor passes its acquire");
     let newcomer: std::sync::Arc<std::sync::Mutex<Option<(u32, Option<(u32, bool)>)>>> =
         Default::default();
     let sink = newcomer.clone();
@@ -8423,17 +8524,23 @@ fn a_zombies_index_is_not_handed_to_the_next_client_while_its_teardown_runs() {
         .unwrap()
         .take()
         .expect("the newcomer came during the zombie's teardown");
-    assert_eq!(ctx_b, Some((2, true)), "not the zombie's index");
+    let b_ctx = ctx_b.expect("a context of its own").0;
+    assert!(ctx_b.unwrap().1);
+    assert_ne!(b_ctx, a_ctx, "not the zombie's index");
     assert_eq!(FAKE_RM.lock().ctx_frees, 1);
-    assert!(FAKE_RM.lock().ctxs.contains(&2));
+    assert!(FAKE_RM.lock().ctxs.contains(&b_ctx));
     let out2 = syncobj::create(false);
     assert_eq!(
         exec(gpu, B, ch_b, &[push(PUSH_VA, 16)], &[], &[sync(out2)]),
         Ok(0)
     );
-    assert_eq!(run_gpu(2).len(), 2);
+    assert_eq!(run_gpu(b_ctx).len(), 2);
     let _ = client_with_pushbuf(gpu, STRANGER);
-    assert_eq!(ctx_of(gpu, STRANGER), Some((1, true)), "free once freed");
+    assert_eq!(
+        ctx_of(gpu, STRANGER).map(|t| t.0),
+        Some(a_ctx),
+        "free once freed"
+    );
     assert!(syncobj::destroy(out));
     assert!(syncobj::destroy(out2));
     gpu.nouveau_release_process(B);
@@ -8455,6 +8562,7 @@ fn a_zombie_whose_consumer_never_moves_is_freed_after_the_fence_timeout() {
     test_clock::set_auto_advance(1_000);
     let ch_c = client_with_pushbuf(&gpu, COMP);
     let ch_a = client_with_pushbuf(&gpu, A);
+    let (c_ctx, a_ctx) = (ctx_of(&gpu, COMP).unwrap().0, ctx_of(&gpu, A).unwrap().0);
     let out = syncobj::create(false);
     assert_eq!(
         exec(&gpu, A, ch_a, &[push(PUSH_VA, 16)], &[], &[sync(out)]),
@@ -8465,13 +8573,16 @@ fn a_zombie_whose_consumer_never_moves_is_freed_after_the_fence_timeout() {
         Ok(0)
     );
     gpu.nouveau_release_process(A);
-    assert!(has_chan(1), "a zombie: the compositor's ACQUIRE is queued");
+    assert!(
+        has_chan(a_ctx),
+        "a zombie: the compositor's ACQUIRE is queued"
+    );
     assert_eq!(gpu.nouveau_zombies.lock().len(), 1);
     // Short of the timeout, another process's exit reaps nothing.
     test_clock::advance(syncobj::FENCE_TIMEOUT_US / 2);
     gpu.nouveau_release_process(STRANGER);
-    assert!(has_chan(1));
-    assert!(peer_map(0, 1).is_some());
+    assert!(has_chan(a_ctx));
+    assert!(peer_map(c_ctx, a_ctx).is_some());
     // Past it, the next event that runs the reaper frees it, with the
     // compositor's ring still where it was.
     test_clock::advance(syncobj::FENCE_TIMEOUT_US / 2);
@@ -8482,10 +8593,14 @@ fn a_zombie_whose_consumer_never_moves_is_freed_after_the_fence_timeout() {
         "freed on the timeout: {:?}",
         rm_calls_since(before)
     );
-    assert!(!has_chan(1));
-    assert_eq!(peer_map(0, 1), None);
+    assert!(!has_chan(a_ctx));
+    assert_eq!(peer_map(c_ctx, a_ctx), None);
     assert!(gpu.nouveau_zombies.lock().is_empty());
-    assert_eq!(userd(&chan(0)).0, 0, "the compositor's ring never moved");
+    assert_eq!(
+        userd(&chan(c_ctx)).0,
+        0,
+        "the compositor's ring never moved"
+    );
     gpu.nouveau_release_process(COMP);
     assert_eq!(FAKE_RM.lock().bad, 0);
 }
@@ -8602,6 +8717,10 @@ mod glxgears_vblank_mode {
         gpu: &'a NvidiaGpu,
         ch_client: u32,
         ch_comp: u32,
+        /// The context index each of the two holds. The compositor is a DRM
+        /// client like the other one now, so neither has a fixed one.
+        ctx_client: u32,
+        ctx_comp: u32,
         render_us: u64,
         composite_us: u64,
         swap: Swap,
@@ -8681,11 +8800,15 @@ mod glxgears_vblank_mode {
         fn new(gpu: &'a NvidiaGpu, swap: Swap) -> Self {
             let ch_comp = client_with_pushbuf(gpu, COMP);
             let ch_client = client_with_pushbuf(gpu, A);
+            let ctx_comp = ctx_of(gpu, COMP).unwrap().0;
+            let ctx_client = ctx_of(gpu, A).unwrap().0;
             let now = test_clock::now();
             Desktop {
                 gpu,
                 ch_client,
                 ch_comp,
+                ctx_client,
+                ctx_comp,
                 render_us: RENDER_US,
                 composite_us: COMPOSITE_US,
                 swap,
@@ -8798,7 +8921,7 @@ mod glxgears_vblank_mode {
                     break;
                 }
                 self.client_queue.pop_front();
-                let fetched = run_gpu_frames(1, 1);
+                let fetched = run_gpu_frames(self.ctx_client, 1);
                 assert!(
                     fetched.iter().any(|f| matches!(f, Fetched::Release { .. })),
                     "frame {}: no fence behind it on the client's ring ({:?})",
@@ -8809,7 +8932,7 @@ mod glxgears_vblank_mode {
                 self.client_landed = point;
             }
             if self.pass.as_ref().is_some_and(|p| p.lands_at <= now) {
-                let fetched = run_gpu_frames(0, 1);
+                let fetched = run_gpu_frames(self.ctx_comp, 1);
                 assert!(
                     fetched.iter().any(|f| matches!(f, Fetched::Release { .. })),
                     "the compositor's pass left no fence on its ring ({:?})",

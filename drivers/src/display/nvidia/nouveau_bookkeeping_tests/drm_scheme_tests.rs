@@ -419,21 +419,29 @@ fn every_architecture_answers_with_its_own_chip_classes_topology_and_floor() {
     }
 }
 
-/// `ensure_ctx_for_pid`: the compositor is context 0 without a lookup; a
-/// client finds no free slot when every index 1..MAX_CTX is registered, or
-/// reserved by a teardown still running, and falls back to software
-/// without an RM call; a second thread of a pid whose build is in flight
-/// waits for it -- and takes the built context, or the fallback when the
-/// build failed (reservation gone) or three seconds passed.
+/// `ensure_ctx_for_pid`: the compositor is context 0 without a lookup only
+/// under `nvidia.compositor_ctx0` (by default it is a DRM client like any
+/// other and gets a context of its own, which is what lets `nvidia-smi` name
+/// it); a client finds no free slot when every index 1..MAX_CTX is
+/// registered, or reserved by a teardown still running, and falls back to
+/// software without an RM call; a second thread of a pid whose build is in
+/// flight waits for it -- and takes the built context, or the fallback when
+/// the build failed (reservation gone) or three seconds passed.
 #[test]
 fn a_client_without_a_free_context_slot_or_with_a_build_in_flight_falls_back() {
     let _g = LOCK.lock();
     let gpu = gpu_rm();
     let before = FAKE_RM.lock().calls.len();
+    nv::set_compositor_ctx0(true);
     assert_eq!(
         gpu.ensure_ctx_for_pid(COMP, true),
         (0, 0, 0),
-        "the compositor"
+        "the compositor, pinned to ctx 0 by the hatch"
+    );
+    nv::set_compositor_ctx0(false);
+    assert!(
+        rm_calls_since(before).is_empty(),
+        "and without a lookup either way"
     );
     {
         let mut map = gpu.nouveau_pid_ctx.lock();
@@ -556,8 +564,10 @@ fn an_rm_backed_channel_without_its_device_refuses_engine_objects_and_says_so_at
     assert!(gpu.nouveau_channels.lock().is_empty(), "the channels went");
     assert_eq!(
         ctx0_owner(&gpu),
-        COMP,
-        "the claim is the RM reset's to release, and there is no RM to run it"
+        0,
+        "and the seat comes free anyway: there is nothing to tear down, but a \
+         claim left on a dead pid makes the respawn a GL client for the rest of \
+         its life"
     );
 }
 

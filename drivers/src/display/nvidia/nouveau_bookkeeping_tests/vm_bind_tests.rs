@@ -519,18 +519,28 @@ fn a_bind_into_a_clients_own_context_dups_the_object_in_and_the_unbind_gives_it_
     );
 }
 
-/// The compositor is the one context still on the shared ladder client, so a
-/// ctx-0 bind crosses no client and needs no dup. Keeping that case dup-free
-/// is not an optimisation: ctx 0 is the context whose failure takes the
-/// desktop with it, and it is left exactly as it was.
+/// Under `nvidia.compositor_ctx0` the compositor stays on context 0 -- the
+/// boot ladder, on the shared kernel RM client -- so its bind crosses no
+/// client and needs no dup. That is the escape hatch, not the default: the
+/// compositor is the one process whose failure takes the desktop with it, so
+/// the old shape has to stay reachable without a rebuild, and this is what it
+/// does when it is asked for. (The price of it is in the hatch's own doc: on
+/// context 0 the compositor cannot appear in `nvidia-smi`'s process table.)
 #[test]
-fn a_compositor_bind_crosses_no_client_and_is_not_duped() {
+fn under_the_hatch_a_compositor_bind_crosses_no_client_and_is_not_duped() {
     let _g = LOCK.lock();
     let _live = LiveBytes::hold();
     let gpu = gpu_rm_ladder();
+    // After the gpu: its setup clears the flag, so a panicking test cannot
+    // leave the hatch open for the next one.
+    nv::set_compositor_ctx0(true);
     let comp = 70_001u64;
     channel_alloc(&gpu, comp).unwrap();
-    assert_eq!(ctx_of(&gpu, comp), None, "the compositor owns ctx 0 itself");
+    assert_eq!(
+        ctx_of(&gpu, comp),
+        None,
+        "pinned to ctx 0: no context of its own"
+    );
     let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, comp)
         .unwrap()
         .handle;
@@ -541,11 +551,49 @@ fn a_compositor_bind_crosses_no_client_and_is_not_duped() {
     {
         let f = FAKE_RM.lock();
         assert_eq!(f.maps.len(), 1);
-        assert_eq!(f.maps[0].1, 0, "the compositor's context");
+        assert_eq!(f.maps[0].1, 0, "context 0, the shared ladder's");
         assert_eq!(f.maps[0].7, 0, "nothing to dup inside one client");
     }
     gpu.nouveau_release_process(comp);
     assert_eq!(FAKE_RM.lock().bad, 0);
+    nv::set_compositor_ctx0(false);
+}
+
+/// And by default it is a client like any other: its own context, its own RM
+/// client under its own pid, so the GEM object -- which stays in the shared
+/// client that made it -- is duped in exactly as a GL client's is.
+#[test]
+fn a_compositor_bind_goes_into_its_own_client_and_is_duped_like_any_other() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm_ladder();
+    let comp = 70_001u64;
+    channel_alloc(&gpu, comp).unwrap();
+    let ctx = ctx_of(&gpu, comp).expect("a context of its own").0;
+    assert!(ctx >= 1, "never index 0: that is the boot ladder");
+    let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, comp)
+        .unwrap()
+        .handle;
+    assert_eq!(
+        vm_bind_ops(&gpu, comp, &mut [map(h, 0x3f_f000_0000, 65536)]),
+        Ok(0)
+    );
+    {
+        let f = FAKE_RM.lock();
+        assert_eq!(f.maps.len(), 1);
+        assert_eq!(f.maps[0].1, ctx, "its own context");
+        assert_ne!(f.maps[0].7, 0, "the GEM object duped into its client");
+    }
+    gpu.nouveau_release_process(comp);
+    assert!(
+        FAKE_RM.lock().maps.is_empty(),
+        "the mapping went with the compositor"
+    );
+    assert_eq!(
+        FAKE_RM.lock().bad,
+        0,
+        "the unbind named its context and its dup"
+    );
 }
 
 /// `nouveau_uvmm_vm_bind_ucopy` copies the op, wait and sig lists before

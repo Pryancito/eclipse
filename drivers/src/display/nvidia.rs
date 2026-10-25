@@ -8313,10 +8313,29 @@ impl DrmScheme for NvidiaGpu {
         // queued (`reap_zombie_contexts`), or the fence timeout.
         if let Some(ctx_idx) = my_ctx.filter(|&c| c >= 1) {
             if self.rm_device_instance.lock().is_some() {
-                let waiters = self.channels_waiting_on(ctx_idx);
-                if !waiters.is_empty() {
-                    self.park_zombie(pid, ctx_idx, waiters);
-                    return;
+                if self.ctx0_is_owner(pid) {
+                    // The compositor's context is never parked as a zombie,
+                    // exactly as context 0 never was when it ran there: a
+                    // zombie holds its index AND -- through the sticky role
+                    // released at the end of this exit -- the compositor seat
+                    // itself until its consumers pass, so the respawn that
+                    // arrives meanwhile would be made a GL client for the
+                    // rest of its life. Its clients get the same bounded
+                    // grace to pass their ACQUIREs that `reset_ctx0_singleton`
+                    // gives them, and then it is torn down here and now.
+                    //
+                    // `ctx0_resetting` goes up BEFORE that teardown, not
+                    // inside `reset_ctx0_singleton` at the end of it: a
+                    // respawn's `CHANNEL_ALLOC` in between would otherwise
+                    // read the dead pid in `ctx0_owner` and turn client.
+                    self.ctx0_resetting.store(true, Ordering::Release);
+                    self.let_consumers_pass(ctx_idx, CTX0_EXIT_GRACE_US);
+                } else {
+                    let waiters = self.channels_waiting_on(ctx_idx);
+                    if !waiters.is_empty() {
+                        self.park_zombie(pid, ctx_idx, waiters);
+                        return;
+                    }
                 }
             }
         }
@@ -9848,8 +9867,8 @@ impl NvidiaGpu {
             }
         }
         // 2. Take the channel off the runlist (and drop its VAS) BEFORE any
-        //    GEM/VM_BIND teardown. ctx 0 is the compositor singleton and is
-        //    never freed here.
+        //    GEM/VM_BIND teardown. Index 0 is the boot compute ladder (a
+        //    singleton the compositor falls back to) and is never freed here.
         let ctx_freed = if let (Some(ctx_idx), Some(device_instance)) = (my_ctx, device_instance) {
             if ctx_idx >= 1 {
                 self.fast_release(device_instance, ctx_idx);
@@ -10082,6 +10101,11 @@ impl NvidiaGpu {
             if let Some(device_instance) = device_instance {
                 self.reset_ctx0_singleton(device_instance, "process exit", pid);
             } else {
+                // No RM: nothing to tear down, but the seat must still come
+                // free (and the bound above cleared), or the respawn is a
+                // client for the rest of its life.
+                self.ctx0_release(pid);
+                self.ctx0_resetting.store(false, Ordering::Release);
                 crate::klog_warn!(
                     "[nouveau-uapi] ctx0 reset: process exit pid={} but no RM device instance is attached",
                     pid
@@ -10477,7 +10501,7 @@ impl NvidiaGpu {
             Err(nv::FastSubmitError::RingFull { put, get, needed }) => {
                 // GPGet froze for a full second: the channel is wedged, the
                 // same condition the RM path reported as BUSY_RETRY.
-                if ctx_idx >= 1 {
+                if self.ctx_is_latchable(ctx_idx) {
                     nv::ctx_set_wedged(ctx_idx);
                 }
                 crate::klog_warn!(
@@ -10518,7 +10542,7 @@ impl NvidiaGpu {
             }
         };
         let current = unsafe { core::ptr::read_volatile(fence_va as *const u32) };
-        if ctx_idx >= 1 {
+        if self.ctx_is_latchable(ctx_idx) {
             nv::ctx_set_wedged(ctx_idx);
         }
         // syncobj has just released this fence's CPU-side waiters: the point
@@ -10558,10 +10582,10 @@ impl NvidiaGpu {
         crate::klog_warn!(
             "[nouveau-uapi] fence TIMEOUT: ctx{}: landing zone written so the queued ACQUIREs pass, syncobj point released so its waiter can fail; {}",
             ctx_idx,
-            if ctx_idx >= 1 {
+            if self.ctx_is_latchable(ctx_idx) {
                 "context latched WEDGED (next submit EIO -> device-lost)"
             } else {
-                "ctx 0 (compositor) is never latched"
+                "not latchable (the compositor's context, or the boot ladder)"
             }
         );
         self.gr_hang_probe(ctx_idx, 0, token, runlist, 1000);
@@ -10703,6 +10727,26 @@ impl NvidiaGpu {
             Ok(_) => true,
             Err(cur) => cur == pid,
         }
+    }
+
+    /// Whether a frozen ring or a timed-out fence may latch `ctx_idx` wedged
+    /// for the life of its process. A latch fast-fails every submit on that
+    /// context until the process exits and rebuilds it: for a GL client that
+    /// is the device-lost NVK recovers from, for the compositor it is the
+    /// desktop. Context 0 was exempt for exactly that reason; the compositor
+    /// has a context of its own like every other DRM client now, so the
+    /// exemption follows the sticky role instead of the index.
+    fn ctx_is_latchable(&self, ctx_idx: u32) -> bool {
+        if ctx_idx < 1 {
+            return false;
+        }
+        let comp = self.ctx0_owner.load(Ordering::Acquire);
+        comp == 0
+            || !self
+                .nouveau_pid_ctx
+                .lock()
+                .iter()
+                .any(|t| t.0 == comp && t.1 == ctx_idx)
     }
 
     /// Drop sticky ctx-0 ownership when `pid` is the current owner.
@@ -10998,13 +11042,17 @@ impl NvidiaGpu {
     ///
     /// `is_compositor` is passed by the caller (rather than derived here) so this
     /// can run while `CHANNEL_ALLOC` holds the `nouveau_channels` lock without a
-    /// re-entrant deadlock: the compositor owns context 0 and never gets a
-    /// client context. On any failure (no free slot, `ctx_alloc` error) it
-    /// returns context 0 -- the client then falls back to software (llvmpipe),
-    /// never worse than before.
+    /// re-entrant deadlock. It only matters under `nvidia.compositor_ctx0`:
+    /// by default the compositor is a DRM client like any other and gets a
+    /// context -- and an RM client of its own, under its own pid -- the same
+    /// way, which is what makes it nameable in `nvidia-smi`'s process table.
+    /// On any failure (no free slot, `ctx_alloc` error) it returns context 0 --
+    /// the client then falls back to software (llvmpipe), never worse than
+    /// before; for the compositor the caller falls back to ctx 0's own channel
+    /// instead, so the desktop keeps its acceleration either way.
     fn ensure_ctx_for_pid(&self, owner_pid: u64, is_compositor: bool) -> (u32, u32, u32) {
         use super::nouveau_uapi as nv;
-        if is_compositor {
+        if is_compositor && nv::compositor_ctx0() {
             return (0, 0, 0);
         }
         let dev = match *self.rm_device_instance.lock() {
@@ -12357,6 +12405,44 @@ impl NvidiaGpu {
                     );
                     return self.channel_alloc_client(owner_pid, arg);
                 }
+                // The compositor gets a context of its OWN -- its own RM client
+                // filed under its own pid, its own VA space, its own GPFIFO
+                // channel -- exactly like every other DRM client. That is what
+                // Linux does (nouveau opens an RM client per DRM file; there is
+                // no singleton) and it is the only way the compositor can show
+                // up in `nvidia-smi`'s process table at all: the shared boot
+                // ladder's client is `RS_PRIV_LEVEL_KERNEL` + admin, and the RM
+                // skips exactly those clients when it answers GPU_GET_PIDS, so
+                // no pid fix could ever have made labwc appear while its
+                // channel hung off that one.
+                //
+                // Context 0 stays what it really is -- the boot compute ladder
+                // that `ecl-compute saxpy`/`bench` and the selftest above run
+                // on -- and it is also the safety net: the compositor is the
+                // one process whose failure takes the desktop down with it, so
+                // if its own context cannot be built (no free slot, ctx_alloc
+                // error) its channel is ctx 0's, byte for byte what it was
+                // before this. `nvidia.compositor_ctx0` pins that old shape.
+                //
+                // The sticky claim above is untouched: `ctx0_owner` still means
+                // "who is the compositor", which is what the exit path, the
+                // VM_BIND route and the EXEC warning read it for. It just no
+                // longer decides which ring the compositor runs on.
+                //
+                // Both calls below need `nouveau_channels` RELEASED -- a first
+                // touch ends in the ~500 ms golden-context prime and that lock
+                // is on EXEC's hot path -- so they go before it is taken.
+                self.retire_wedged_ctx_of(owner_pid);
+                let own = if nv::compositor_ctx0() {
+                    (0u32, 0u32, 0u32)
+                } else {
+                    self.ensure_ctx_for_pid(owner_pid, false)
+                };
+                let (ctx_idx, h_vas, h_notifier) = if own.0 != 0 {
+                    own
+                } else {
+                    (0, ladder.h_vas, channel.h_notifier)
+                };
                 let mut chan = self.nouveau_channels.lock();
                 if chan.len() >= nv::MAX_CHANNELS {
                     // Sticky claim already taken; release so a later compositor
@@ -12373,25 +12459,29 @@ impl NvidiaGpu {
                     .unwrap_or(0);
                 chan.push(nv::NouveauChannelState {
                     id: new_id,
-                    h_vas: ladder.h_vas,
-                    notifier_handle: channel.h_notifier,
+                    h_vas,
+                    notifier_handle: h_notifier,
                     rm_backed: true,
-                    // The sticky compositor owner is context 0 -- the singleton
-                    // step16/step17 ladder.
-                    ctx_idx: 0,
+                    ctx_idx,
                     owner_pid,
                 });
                 drop(chan);
                 req.channel = new_id;
-                req.notifier_handle = channel.h_notifier;
+                req.notifier_handle = h_notifier;
                 req.pushbuf_domains = nv::NOUVEAU_CHANNEL_PUSHBUF_DOMAINS;
                 req.nr_subchan = 0;
                 log::info!(
-                    "[nouveau-uapi] CHANNEL_ALLOC owner_pid={} -> channel={} ctx0 sticky (hVas={:#010x} hNotifier={:#010x})",
+                    "[nouveau-uapi] CHANNEL_ALLOC owner_pid={} (compositor, sticky ctx0 owner) -> channel={} on CTX {} {} (hVas={:#010x} hNotifier={:#010x})",
                     owner_pid,
                     new_id,
-                    ladder.h_vas,
-                    channel.h_notifier
+                    ctx_idx,
+                    if ctx_idx == 0 {
+                        "-- the shared boot ladder (own context unavailable, or nvidia.compositor_ctx0); it will NOT appear in nvidia-smi"
+                    } else {
+                        "-- its own RM client, under its own pid"
+                    },
+                    h_vas,
+                    h_notifier
                 );
                 Ok(0)
             }
@@ -13575,7 +13665,7 @@ impl NvidiaGpu {
                         // `fence_wait_status != 0`, and latching on that turned
                         // one transient full ring into a permanent device-lost
                         // for the client.
-                        if ctx_idx >= 1
+                        if self.ctx_is_latchable(ctx_idx)
                             && r.submit_status == 0
                             && r.fence_submit_status == 0
                             && r.fence_wait_status != 0

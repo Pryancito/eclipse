@@ -2222,6 +2222,30 @@ pub fn exec_fast_enabled() -> bool {
     EXEC_FAST_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Whether the compositor keeps running on context 0 -- the singleton
+/// step16/step17 ladder on the shared boot-time RM client -- instead of
+/// getting a context of its own like every other DRM client.
+///
+/// Default OFF, which is the Linux shape: nouveau there opens an RM client
+/// per DRM file, there is no singleton, and so every graphics process -- the
+/// compositor included -- is a client the RM can name. Ours could not: the
+/// boot ladder's client is `RS_PRIV_LEVEL_KERNEL` + admin and
+/// `gpuGetProcWithObject_IMPL` skips exactly those, so the compositor never
+/// appeared in `nvidia-smi`'s process table however correct its pid was.
+///
+/// Set by the `nvidia.compositor_ctx0` cmdline flag to pin the old shape
+/// without a rebuild -- the compositor is the one process whose failure takes
+/// the desktop down with it.
+static COMPOSITOR_CTX0: AtomicBool = AtomicBool::new(false);
+
+pub fn set_compositor_ctx0(v: bool) {
+    COMPOSITOR_CTX0.store(v, Ordering::SeqCst);
+}
+
+pub fn compositor_ctx0() -> bool {
+    COMPOSITOR_CTX0.load(Ordering::Relaxed)
+}
+
 /// Per-context constants for a direct submit, derived from
 /// `nvidia_rm_sys::rm_init::ExecFast` with every physical page already
 /// turned into a kernel virtual address.
