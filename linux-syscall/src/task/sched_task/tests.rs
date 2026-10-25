@@ -402,3 +402,98 @@ fn a_process_with_no_leader_on_file_is_no_task() {
     reap(&parent, pid);
     parent.exit(0);
 }
+
+/// A leader that exited before the rest of its group has no I/O priority:
+/// `do_exit` let its `io_context` go. It read the word it had set, and a
+/// group walk served the group at that word instead of at its nice.
+#[test]
+fn a_leader_that_exited_first_has_no_io_priority() {
+    let parent = a_process_of(48_112, 0);
+    let child = Process::fork_from(&parent).unwrap();
+    let leader = Thread::create_linux(&child).unwrap();
+    let worker = Thread::create_linux(&child).unwrap();
+    leader.set_sched(SCHED_BATCH, 7, 0);
+    worker.set_sched(SCHED_BATCH, 7, 0);
+    leader.lock_linux().ioprio = best_effort(2);
+    child.linux().keep_exited_leader(leader.clone());
+    leader.terminate_abandoned();
+    drop(leader);
+    // A group of its own, so that the parent's thread is not in it.
+    child.linux().set_pgid_raw(child.id());
+    let pid = child.id() as usize;
+
+    let got = on_a_thread(&parent, move |sys| {
+        Box::pin(async move {
+            (
+                sys.sys_ioprio_get(IOPRIO_WHO_PROCESS, pid),
+                sys.sys_ioprio_get(IOPRIO_WHO_PGRP, pid),
+                sys.sys_ioprio_set(IOPRIO_WHO_PROCESS, pid, best_effort(1) as usize),
+                sys.sys_ioprio_get(IOPRIO_WHO_PROCESS, pid),
+            )
+        })
+    });
+    assert_eq!(
+        got,
+        (Ok(0), Ok(best_effort(5) as usize), Ok(0), Ok(0)),
+        "none, the group at nice 7's level, a set that does nothing"
+    );
+    worker.terminate_abandoned();
+    reap(&parent, pid as KoID);
+    parent.exit(0);
+}
+
+/// From the moment its exit is on file, a process is its leader alone:
+/// Linux lets its parent wait for it only once every other thread has been
+/// released. Here those threads were still on the list while they died,
+/// and a group walk counted them, a tid found them, and the leader read the
+/// I/O priority word it had set.
+#[test]
+fn a_zombie_is_its_leader_alone_while_its_other_threads_die() {
+    let parent = a_process_of(48_113, 0);
+    let child = Process::fork_from(&parent).unwrap();
+    let leader = Thread::create_linux(&child).unwrap();
+    let worker = Thread::create_linux(&child).unwrap();
+    leader.set_sched(SCHED_BATCH, 7, 0);
+    leader.lock_linux().ioprio = best_effort(2);
+    worker.set_sched(SCHED_BATCH, 3, 0);
+    worker.lock_linux().ioprio = best_effort(1);
+    child.linux().set_pgid_raw(child.id());
+    // Both threads killed and still on the list: the window.
+    child.exit(0);
+    let (pid, tid) = (child.id() as usize, worker.id() as usize);
+
+    let got = on_a_thread(&parent, move |sys| {
+        Box::pin(async move {
+            (
+                sys.sys_getpriority(PRIO_PGRP, pid),
+                sys.sys_ioprio_get(IOPRIO_WHO_PGRP, pid),
+                sys.sys_ioprio_get(IOPRIO_WHO_PROCESS, pid),
+                sys.sys_getpriority(PRIO_PROCESS, pid),
+                sys.sys_getpriority(PRIO_PROCESS, tid),
+                sys.sys_ioprio_get(IOPRIO_WHO_PROCESS, tid),
+            )
+        })
+    });
+    assert_eq!(
+        got,
+        (
+            Ok(20 - 7),
+            Ok(best_effort(5) as usize),
+            Ok(0),
+            Ok(20 - 7),
+            Err(LxError::ESRCH),
+            Err(LxError::ESRCH),
+        ),
+        "the leader's nice and level, no word of its own, and no worker"
+    );
+    let ids: Vec<KoID> = SchedTask::all_of(&child)
+        .iter()
+        .map(SchedTask::id)
+        .collect();
+    assert_eq!(ids, [pid as KoID]);
+    worker.terminate_abandoned();
+    leader.terminate_abandoned();
+    drop(child);
+    reap(&parent, pid as KoID);
+    parent.exit(0);
+}
