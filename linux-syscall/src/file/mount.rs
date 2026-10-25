@@ -37,9 +37,21 @@ impl Syscall<'_> {
         flags: usize,
         data: UserInPtr<u8>,
     ) -> SysResult {
-        let source = source.as_c_str()?;
+        // `copy_mount_string`: a NULL source or type is no string, not a bad
+        // address. A remount, a bind, a move and a change of propagation are
+        // asked for that way (busybox's `mount --bind` passes no type), and
+        // every one of them was `EFAULT`.
+        let source = if source.is_null() {
+            None
+        } else {
+            Some(source.as_c_str()?)
+        };
         let target = target.as_c_str()?;
-        let fstype = fstype.as_c_str()?;
+        let fstype = if fstype.is_null() {
+            ""
+        } else {
+            fstype.as_c_str()?
+        };
         let data = if data.is_null() { "" } else { data.as_c_str()? };
         info!(
             "mount: source={:?}, target={:?}, fstype={:?}, flags={:#x}",
@@ -256,5 +268,48 @@ mod tests {
             Err(LxError::EPERM),
             "an unknown umount flag answered EINVAL to a caller that may not mount"
         );
+    }
+
+    /// What Linux 6.18 answered to the same calls, each with NULL where a
+    /// string goes. Every one was `EFAULT` here, so busybox's `mount --bind`
+    /// failed with "Bad address".
+    #[test]
+    fn a_null_source_or_type_is_no_string_not_a_bad_address() {
+        const MS_REMOUNT: usize = 32;
+        const MS_BIND: usize = 4096;
+        const MS_MOVE: usize = 8192;
+        let proc = a_root_process(45_545, "mount-null");
+        let (target, fstype, source) = (c("/mount-null-probe"), c("tmpfs"), c("/tmp"));
+        let (slash, vfat) = (c("/"), c("vfat"));
+        let null = || UserInPtr::<u8>::from(0);
+        let got = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                [
+                    // `do_loopback` and `do_move_mount_old` want a name.
+                    sys.sys_mount(null(), at(&target), null(), MS_BIND, null()),
+                    sys.sys_mount(null(), at(&target), null(), MS_MOVE, null()),
+                    // A new mount with no type at all.
+                    sys.sys_mount(at(&source), at(&target), null(), 0, null()),
+                    // A remount reads neither; this target is mounted nowhere.
+                    sys.sys_mount(null(), at(&target), null(), MS_REMOUNT, null()),
+                    // And the type of a bind is not looked at.
+                    sys.sys_mount(at(&source), at(&target), null(), MS_BIND, null()),
+                    // A pseudo-filesystem with no source, which Linux shows as
+                    // `none`; the target is not looked up, so it registers.
+                    sys.sys_mount(null(), at(&target), at(&fstype), 0, null()),
+                    // A filesystem on a device with none named: "No source
+                    // specified" (`get_tree_bdev`), not a lookup of "".
+                    sys.sys_mount(null(), at(&slash), at(&vfat), 0, null()),
+                ]
+            })
+        });
+        let einval: SysResult = Err(LxError::EINVAL);
+        assert_eq!(
+            got[..4],
+            [einval.clone(), einval.clone(), einval.clone(), einval]
+        );
+        assert_ne!(got[4], Err(LxError::EFAULT), "a bind with no type");
+        assert_eq!(got[5], Ok(0), "a tmpfs with no source");
+        assert_eq!(got[6], Err(LxError::EINVAL), "a vfat with no source");
     }
 }

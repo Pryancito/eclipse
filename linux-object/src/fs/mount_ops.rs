@@ -156,9 +156,13 @@ pub(crate) fn prepare_fs(
 }
 
 /// Mount a block device or loop image at `target`.
+///
+/// `source` is `None` when the caller passed no string at all, which a
+/// remount ignores, a bind and a move refuse (`EINVAL`, as an empty one), a
+/// pseudo-filesystem shows as `none` and a filesystem on a device refuses.
 pub fn mount_fs(
     proc: &LinuxProcess,
-    source: &str,
+    source: Option<&str>,
     target: &str,
     fstype: &str,
     flags: usize,
@@ -170,11 +174,15 @@ pub fn mount_fs(
         return super::remount_flags(&target_norm, flags, data);
     }
 
+    // `do_move_mount_old` and `do_loopback`: what is moved or bound has to
+    // be named. An empty name is refused further in, as the root, which is
+    // neither movable nor a mount to bind.
     if flags & MS_MOVE != 0 {
-        return mount_move(source, &target_norm);
+        return mount_move(source.ok_or(LxError::EINVAL)?, &target_norm);
     }
 
     if flags & MS_BIND != 0 {
+        let source = source.ok_or(LxError::EINVAL)?;
         let source_node = resolve_mnode(source)?;
         if !source_node.is_mountpoint() {
             return Err(LxError::EINVAL);
@@ -187,7 +195,13 @@ pub fn mount_fs(
         let (fs, state) = prepare_fs(inner, flags, data);
         mount_node.mount(fs).map_err(LxError::from)?;
         let opts = build_options_string(flags, data);
-        super::register_mount(source, &target_norm, "none", &opts, Some(state));
+        // The filesystem under it is the source's, so the line names the
+        // device and type the source's line does, not the path it was
+        // reached by and "none": Linux copies `mnt_devname` and keeps the
+        // superblock.
+        let (origin, fstype) = super::mount_origin(source)
+            .unwrap_or_else(|| (String::from(source), String::from("none")));
+        super::register_mount(&origin, &target_norm, &fstype, &opts, Some(state));
         return Ok(());
     }
 
@@ -200,6 +214,7 @@ pub fn mount_fs(
     // "mounting proc on /proc failed: No such device".
     if is_virtual_fstype(fstype) {
         let opts = build_options_string(flags, data);
+        let source = source.unwrap_or("none");
         super::register_mount(source, &target_norm, fstype, &opts, None);
         return Ok(());
     }
@@ -209,6 +224,7 @@ pub fn mount_fs(
     if mount_node.is_mountpoint() {
         return Err(LxError::EBUSY);
     }
+    let source = source.ok_or(LxError::EINVAL)?;
     let source_inode = proc.lookup_inode(source)?;
     let backend = MountBackend::from_inode(source_inode).map_err(|_| LxError::ENOTBLK)?;
     let read_only = flags_read_only(flags, data);

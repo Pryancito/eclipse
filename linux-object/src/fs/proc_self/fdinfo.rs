@@ -122,8 +122,8 @@ impl INode for ProcFdInfoDir {
 /// `F_GETFL` flags, with `O_CLOEXEC` if the descriptor has it), `mnt_id`,
 /// `ino`, and then the lines of the descriptor's kind.
 ///
-/// `mnt_id` is always 0: there are no mount ids here, and no
-/// `/proc/<pid>/mountinfo` to look one up in.
+/// `mnt_id` is always 0: a descriptor does not keep the mount it was opened
+/// on, so it cannot name one of the numbers in `/proc/<pid>/mountinfo`.
 pub struct FdInfo {
     process: Arc<Process>,
     fd: FileDesc,
