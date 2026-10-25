@@ -294,80 +294,6 @@ impl DrmDev {
         Ok(0)
     }
 
-    /// Sleep until the vblank a blocking `DRM_IOCTL_WAIT_VBLANK` asked for.
-    ///
-    /// Called from `sys_ioctl` (async) *before* the request reaches
-    /// `io_control` (sync), which then reports the sequence that has by then
-    /// genuinely completed. Splitting it this way keeps the whole `FileLike`
-    /// stack synchronous while still giving this one ioctl real blocking
-    /// semantics.
-    ///
-    /// It must not spin: an earlier implementation busy-waited the 16.7 ms and
-    /// starved every other coroutine on the CPU, which looked like the machine
-    /// freezing. The synthetic vblank counter is a pure function of the clock,
-    /// so there is an exact deadline to sleep to and no need to poll at all.
-    ///
-    /// Requests that asked for an event instead of blocking are left alone —
-    /// that path already defers correctly through the timer queue.
-    pub async fn wait_vblank_sleep(&self, data: usize) -> LxResult<()> {
-        // Linux caps this wait at 3 seconds (`DRM_WAIT_ON(..., 3 * HZ, ...)`).
-        // Match it: a target far in the future must not park a thread forever,
-        // and the sync arm reporting the current sequence after the cap is the
-        // same answer Linux's timeout path gives.
-        const MAX_WAIT: Duration = Duration::from_secs(3);
-
-        if ucheck(data, core::mem::size_of::<DrmWaitVblank>()).is_err() {
-            return Ok(()); // io_control will reject it with EFAULT in a moment
-        }
-        let req = unsafe { *(data as *const DrmWaitVblank) };
-        if wait_vblank_check(req.typ).is_err() {
-            return Ok(()); // the sync arm refuses it at once; nothing to sleep for
-        }
-        if req.typ & _DRM_VBLANK_EVENT != 0 {
-            return Ok(()); // event form: delivered by the timer queue, never blocks
-        }
-        const _DRM_VBLANK_RELATIVE: u32 = 0x1;
-        const _DRM_VBLANK_NEXTONMISS: u32 = 0x1000_0000;
-        // Resolve the target exactly as the sync arm does, or the two would
-        // disagree about which vblank was asked for.
-        let now_seq = drm::vblank_seq_now();
-        let mut target = if req.typ & _DRM_VBLANK_RELATIVE != 0 {
-            now_seq.wrapping_add(req.sequence)
-        } else {
-            req.sequence
-        };
-        if (target.wrapping_sub(now_seq) as i32) <= 0 {
-            if req.typ & _DRM_VBLANK_NEXTONMISS == 0 {
-                return Ok(()); // already reached: nothing to wait for
-            }
-            target = now_seq.wrapping_add(1);
-        }
-        let cap = kernel_hal::timer::timer_now() + MAX_WAIT;
-        // Re-check after sleeping instead of trusting one deadline. A wake-up
-        // that lands even a nanosecond before the lattice boundary leaves the
-        // counter one short, and the sync arm would then report `target - 1`;
-        // the caller's next relative request resolves to a vblank that has
-        // just passed, returns instantly, and the frame after it waits a full
-        // period. That alternation is not a slow kernel -- it is measured as
-        // jitter, and it is exactly what a client pacing on this ioctl would
-        // see as stutter. The loop is bounded by the same 3 s cap.
-        let mut acct = PreWaitAccount::new(zcore_drivers::scheme::prewait::Kind::WaitVblank);
-        while (target.wrapping_sub(drm::vblank_seq_now()) as i32) > 0 {
-            let Some(deadline) = drm::vblank_deadline_for_seq(target) else {
-                break;
-            };
-            acct.probe();
-            if deadline >= cap {
-                crate::process::interruptible(kernel_hal::thread::sleep_until(cap)).await?;
-                // Stopped by the 3 s cap, not by the vblank asked for.
-                acct.timed_out();
-                break;
-            }
-            crate::process::interruptible(kernel_hal::thread::sleep_until(deadline)).await?;
-        }
-        Ok(())
-    }
-
     /// Sleep until a blocking `SYNCOBJ_WAIT` / `TIMELINE_WAIT` would succeed
     /// (or its absolute deadline passes).
     ///
@@ -2063,6 +1989,16 @@ impl DrmDev {
                     req.sequence = now_seq;
                     req.val1 = now.as_secs(); // tval_sec
                     req.val2 = now.subsec_micros() as u64; // tval_usec
+
+                    // Unless the sleep ran out of its 3 s cap before that
+                    // vblank came: then the count is only what there is,
+                    // and `drm_wait_vblank_ioctl` says so with EBUSY, the
+                    // reply filled all the same (`drm_ioctl` copies it out
+                    // whatever the code). This answered 0, and a client
+                    // pacing on the ioctl took the stall for its vblank.
+                    if self.file.take_vblank_wait_timed_out(data) {
+                        return Err(FsError::Busy);
+                    }
                 }
                 Ok(0)
             }
@@ -3862,6 +3798,8 @@ fn next_poll_wake(now: Duration, deadline: Duration, tick: Duration) -> Option<D
 
 mod pre_wait_account;
 use pre_wait_account::PreWaitAccount;
+/// The sleep behind a blocking `WAIT_VBLANK`; own file for the size ceiling.
+mod wait_vblank_sleep;
 use present_failed::{present_failed, PRESENT_FAIL_TRACED};
 
 /// The parked microseconds a pre-wait reports, from how long it was alive and

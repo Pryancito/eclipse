@@ -158,3 +158,94 @@ fn a_second_head_makes_pipe_one_a_real_pipe_and_pipe_two_still_not() {
         assert_eq!(wait(&c, typ, 0), Err(FsError::InvalidParam), "{typ:#x}");
     }
 }
+
+/// A blocking wait whose vblank does not come within the cap (Linux's 3 s,
+/// `DRM_WAIT_ON`) answers EBUSY with the count there is, as
+/// `drm_wait_vblank_ioctl` does -- the reply filled all the same, since
+/// `drm_ioctl` copies it out whatever the code. This arm answered 0 with
+/// that count, so a client pacing on the ioctl (X's Present, SDL) took the
+/// stall for its vblank and paced on from a sequence it never reached.
+///
+/// The mark is the request's own: a query another thread of the same open
+/// makes in between is not the wait that was stopped, and the same struct
+/// asked again is a fresh wait. The sleep is the one `sys_ioctl` awaits,
+/// run here with its cap brought down to 40 ms.
+#[test]
+fn a_blocking_wait_the_cap_stops_is_ebusy_with_the_count_there_is() {
+    let _screen = kms_emu::attach(32, 8);
+    let c = Client::open(0);
+    let within = |lo: u32, got: u32, hi: u32| {
+        (got.wrapping_sub(lo) as i32) >= 0 && (hi.wrapping_sub(got) as i32) >= 0
+    };
+    let sleep = |req: &mut DrmWaitVblank, cap: Duration| {
+        let data = req as *mut DrmWaitVblank as usize;
+        async_std::task::block_on(c.dev().wait_vblank_sleep_capped(data, cap))
+            .expect("no signal can reach this sleep");
+    };
+    let now = wait(&c, RELATIVE, 0).expect("now");
+    // Absolute, a thousand vblanks out: sixteen seconds, past any cap.
+    let far = now.wrapping_add(1000);
+    let mut req = DrmWaitVblank {
+        typ: 0,
+        sequence: far,
+        val1: 0,
+        val2: 0,
+    };
+    let before = kernel_hal::timer::timer_now();
+    let cap = before + Duration::from_millis(40);
+    sleep(&mut req, cap);
+    assert!(
+        kernel_hal::timer::timer_now() >= cap,
+        "the sleep ended before its cap"
+    );
+    // Another thread's query in between: answered as ever, mark untouched.
+    assert!(wait(&c, RELATIVE, 0).is_ok());
+    // The stopped request: EBUSY, the reply filled with the count there is
+    // and the time, exactly as the plain answer would be.
+    assert_eq!(c.ioctl(DRM_IOCTL_WAIT_VBLANK, &mut req), Err(FsError::Busy));
+    let after = kernel_hal::timer::timer_now();
+    let now2 = wait(&c, RELATIVE, 0).expect("now");
+    assert_eq!(req.typ, 0, "_DRM_VBLANK_ABSOLUTE");
+    assert!(
+        within(now, req.sequence, now2),
+        "replied {} at {}..{}",
+        req.sequence,
+        now,
+        now2
+    );
+    let stamp = Duration::new(req.val1, 0) + Duration::from_micros(req.val2);
+    assert!(
+        stamp >= before.saturating_sub(Duration::from_micros(1)) && stamp <= after,
+        "stamped {:?} outside {:?}..{:?}",
+        stamp,
+        before,
+        after
+    );
+    // Taken once: the same struct asked again (its target still ahead) is
+    // the plain answer.
+    req.typ = 0;
+    req.sequence = far;
+    assert!(c.ioctl(DRM_IOCTL_WAIT_VBLANK, &mut req).is_ok());
+    // A wait the vblank ends in time leaves no mark: one vblank ahead
+    // (16.7 ms) under a cap of a second.
+    let now = wait(&c, RELATIVE, 0).expect("now");
+    let mut soon = DrmWaitVblank {
+        typ: 0,
+        sequence: now.wrapping_add(1),
+        val1: 0,
+        val2: 0,
+    };
+    let cap = kernel_hal::timer::timer_now() + Duration::from_secs(1);
+    sleep(&mut soon, cap);
+    assert!(
+        kernel_hal::timer::timer_now() < cap,
+        "slept to the cap, not to the vblank"
+    );
+    assert!(c.ioctl(DRM_IOCTL_WAIT_VBLANK, &mut soon).is_ok());
+    assert!(
+        (soon.sequence.wrapping_sub(now.wrapping_add(1)) as i32) >= 0,
+        "the vblank asked for had not come: {} < {}",
+        soon.sequence,
+        now.wrapping_add(1)
+    );
+}
