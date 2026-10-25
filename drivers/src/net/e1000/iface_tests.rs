@@ -129,12 +129,24 @@ fn the_name_the_probe_was_given_is_the_one_it_answers_with() {
 #[test]
 fn setting_the_primary_address_keeps_one_and_blanks_the_other_v4_slots() {
     let (_base, iface) = interface(0);
+    // Two v4 addresses in force first: the blanking has nothing to do on a
+    // freshly probed interface, whose other slots are already blank.
+    iface.add_ip_address(v4(172, 16, 0, 1, 16)).unwrap();
+    iface.add_ip_address(v4(172, 17, 0, 1, 16)).unwrap();
     iface
         .set_ipv4_address(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24))
         .unwrap();
     let addrs = iface.get_ip_address();
     assert_eq!(addrs.len(), 4, "a slot was added or lost");
     assert_eq!(addrs[0], v4(10, 0, 2, 15, 24), "the first slot takes it");
+    for gone in [v4(172, 16, 0, 1, 16), v4(172, 17, 0, 1, 16)] {
+        assert!(
+            !addrs.contains(&gone),
+            "{:?} is still in force next to the new primary: {:?}",
+            gone,
+            addrs
+        );
+    }
     // The remaining v4 slots are blanked rather than left as they were, so the
     // interface answers on exactly one v4 address.
     assert_eq!(
@@ -228,13 +240,16 @@ fn removing_an_address_blanks_its_slot_and_leaves_the_others_alone() {
     let (_base, iface) = interface(0);
     iface.add_ip_address(v4(10, 0, 0, 1, 24)).unwrap();
     iface.add_ip_address(v4(10, 0, 1, 1, 24)).unwrap();
-    iface.remove_ip_address(v4(10, 0, 0, 1, 24)).unwrap();
+    // The one removed is deliberately NOT the first slot: a removal that
+    // blanks whatever it finds first looks right when the target happens to be
+    // there, and takes the wrong address off the interface when it is not.
+    iface.remove_ip_address(v4(10, 0, 1, 1, 24)).unwrap();
     let addrs = iface.get_ip_address();
     assert_eq!(addrs.len(), 4, "the slot was removed instead of blanked");
-    assert!(!addrs.contains(&v4(10, 0, 0, 1, 24)));
+    assert!(!addrs.contains(&v4(10, 0, 1, 1, 24)));
     assert!(
-        addrs.contains(&v4(10, 0, 1, 1, 24)),
-        "the other address went with it: {:?}",
+        addrs.contains(&v4(10, 0, 0, 1, 24)),
+        "the address in the first slot went with it: {:?}",
         addrs
     );
     // Removing something that is not there changes nothing.
