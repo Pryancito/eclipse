@@ -1595,16 +1595,11 @@ pub(super) struct NouveauVmMapping {
     /// and nowhere else, and by teardown time the pid may no longer have a
     /// context to look up.
     pub ctx_idx: u32,
-    /// pid that created this mapping. Process-exit teardown and an explicit
-    /// UNMAP scope to it: both are statements about what THIS process bound,
-    /// and a client's exit must not tear down another's mapping.
-    ///
-    /// A MAP's overlap-replace does NOT: there the scope is the VA space,
-    /// which is `ctx_idx`. The two coincide only while every process has a
-    /// context of its own, and processes whose `ctx_alloc` is refused all
-    /// share context 0 -- where a pid-scoped replace leaves the previous
-    /// binder's reservation live and the RM refuses the new fixed VA (0x51).
-    /// See `VaScope` in the parent module.
+    /// pid that created this mapping. With per-process GPU contexts each client
+    /// has its OWN VA space, so a bind is meaningful ONLY within its owner's
+    /// context: process-exit teardown and MAP/UNMAP overlap-replace must scope
+    /// to `owner_pid`, or a client's exit (or a same-VA bind in a DIFFERENT
+    /// context) would tear down the compositor's or another client's mapping.
     pub owner_pid: u64,
     pub va: u64,
     pub size: u64,
