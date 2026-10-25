@@ -207,7 +207,7 @@ fn two_architectures_do_not_read_the_same_object_file() {
 fn every_architecture_has_the_target_spec_the_build_names() {
     for (machine, arch) in PURE {
         let built = config_for(machine, false);
-        let spec = INNER.join(format!("{}.json", built.arch.name()));
+        let spec = built.target_spec();
         assert!(
             spec.is_file(),
             "{machine} is built against {}, which is not there",

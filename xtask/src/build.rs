@@ -99,6 +99,14 @@ impl BuildConfig {
         }
     }
 
+    /// The target spec cargo is pointed at. In one place, so that the test
+    /// that checks the file is really there is checking the path the build
+    /// really uses, and not a second copy of the same string.
+    #[inline]
+    fn target_spec(&self) -> PathBuf {
+        INNER.join(format!("{}.json", self.arch.name()))
+    }
+
     #[inline]
     fn target_file_path(&self) -> PathBuf {
         PROJECT_DIR
@@ -113,7 +121,7 @@ impl BuildConfig {
         cargo
             .package("zcore")
             .features(false, &self.features)
-            .target(INNER.join(format!("{}.json", self.arch.name())))
+            .target(self.target_spec())
             .args(["-Z", "json-target-spec"])
             .args(["-Z", "build-std=core,alloc"])
             .args(["-Z", "build-std-features=compiler-builtins-mem"])
