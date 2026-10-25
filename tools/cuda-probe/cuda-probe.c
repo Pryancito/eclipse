@@ -18,6 +18,23 @@
 //   launch    load a tiny PTX kernel, cuLaunchKernel, sync, and check a
 //             device store (what Ollama's runner needs beyond alloc).
 //
+// `cuda-probe -d` (deep) runs those steps quietly and then, on every GPU,
+// the kinds of work llama.cpp's CUDA backend (Ollama's runner) gives it,
+// each with an answer checked exactly, plus what each costs:
+//
+//   copy      64 MiB host to GPU and back from ordinary memory, from
+//             cuMemAllocHost memory, and from memory cuMemHostRegister pins
+//             (on a stream), with MB/s each way.
+//   kernels   elementwise over many blocks, a block reduction (shuffles and
+//             shared memory), 64 KiB of dynamic shared memory, int8 dot
+//             products (dp4a, a decoded token), int8 and f16 tensor cores
+//             (mma, a prompt), and a CUDA graph (how llama.cpp decodes).
+//   latency   what a launch costs, and a launch and the wait for it.
+//
+// A wrong answer prints where it went wrong; a GPU that never finishes is
+// named after 60 s instead of hanging the probe. Its kernels are
+// kernels.cu, carried as PTX in kernels_ptx.h.
+//
 // When a step fails, `dmesg | grep -E 'nvidia|mmap'` names the NVIDIA call
 // the kernel does not serve yet, if that is what failed, or the mmap it
 // refused: CUDA_ERROR_OUT_OF_MEMORY (2) from cuInit is libcuda failing to
@@ -33,20 +50,39 @@
 // CUDA headers.
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+
+#include "kernels_ptx.h"
 
 typedef int CUresult;
 typedef int CUdevice;
 typedef void *CUcontext;
 typedef void *CUmodule;
 typedef void *CUfunction;
+typedef void *CUstream;
+typedef void *CUevent;
+typedef void *CUgraph;
+typedef void *CUgraphExec;
 typedef unsigned long long CUdeviceptr;
+
+// -d: the basic steps print only what fails, and the deep checks follow.
+static int quiet;
 
 static void *cuda;
 static int (*get_error_name)(CUresult, const char **);
 static int (*get_error_string)(CUresult, const char **);
+
+// What a basic step prints when it goes right: nothing under -d.
+static void say(const char *line)
+{
+    if (!quiet)
+        fputs(line, stdout);
+}
 
 static void *sym(const char *name)
 {
@@ -61,7 +97,8 @@ static int report(const char *step, CUresult r)
 {
     const char *name = "?", *text = "";
     if (r == 0) {
-        printf("  %-12s ok\n", step);
+        if (!quiet)
+            printf("  %-12s ok\n", step);
         return 1;
     }
     if (get_error_name)
@@ -106,33 +143,33 @@ static int cmdline_has(const char *needle)
 static int preflight(void)
 {
     int ok = 1;
-    printf("[preflight]\n");
+    say("[preflight]\n");
     int hatch = cmdline_has("nvidia.cuda");
     int ctl = cmdline_has("nvidia.nvidiactl");
     int uvm_flag = cmdline_has("nvidia.uvm");
     if (hatch < 0) {
-        printf("  cmdline     (no /proc/cmdline)\n");
+        say("  cmdline     (no /proc/cmdline)\n");
     } else if (hatch) {
-        printf("  cmdline     nvidia.cuda\n");
+        say("  cmdline     nvidia.cuda\n");
     } else if (ctl && uvm_flag) {
-        printf("  cmdline     nvidia.nvidiactl + nvidia.uvm\n");
+        say("  cmdline     nvidia.nvidiactl + nvidia.uvm\n");
     } else {
         printf("  cmdline     (no nvidia.cuda in /proc/cmdline — enable it on the ESP if nodes are missing)\n");
     }
     if (exists("/dev/nvidiactl"))
-        printf("  /dev/nvidiactl ok\n");
+        say("  /dev/nvidiactl ok\n");
     else {
         printf("  /dev/nvidiactl MISSING\n");
         ok = 0;
     }
     if (exists("/dev/nvidia-uvm"))
-        printf("  /dev/nvidia-uvm ok\n");
+        say("  /dev/nvidia-uvm ok\n");
     else {
         printf("  /dev/nvidia-uvm MISSING\n");
         ok = 0;
     }
     if (exists("/dev/nvidia0"))
-        printf("  /dev/nvidia0 ok\n");
+        say("  /dev/nvidia0 ok\n");
     else {
         printf("  /dev/nvidia0  MISSING (no GPU attached to the RM?)\n");
         ok = 0;
@@ -141,7 +178,7 @@ static int preflight(void)
         printf("[preflight] FAILED. Need /dev/nvidia* (boot with nvidia.cuda on the ESP); see docs/README-cuda.md\n");
         return 0;
     }
-    printf("  devices     ok\n");
+    say("  devices     ok\n");
     return 1;
 }
 
@@ -165,19 +202,537 @@ static const char write_byte_ptx[] =
     "  ret;\n"
     "}\n";
 
-int main(void)
+// ---- Deep checks (-d) ------------------------------------------------------
+
+static CUresult (*d_ctx_create)(CUcontext *, unsigned, CUdevice);
+static CUresult (*d_ctx_destroy)(CUcontext);
+static CUresult (*d_ctx_sync)(void);
+static CUresult (*d_attribute)(int *, int, CUdevice);
+static CUresult (*d_alloc)(CUdeviceptr *, size_t);
+static CUresult (*d_free)(CUdeviceptr);
+static CUresult (*d_htod)(CUdeviceptr, const void *, size_t);
+static CUresult (*d_dtoh)(void *, CUdeviceptr, size_t);
+static CUresult (*d_alloc_host)(void **, size_t);
+static CUresult (*d_free_host)(void *);
+static CUresult (*d_register)(void *, size_t, unsigned);
+static CUresult (*d_unregister)(void *);
+static CUresult (*d_stream_create)(CUstream *, unsigned);
+static CUresult (*d_stream_destroy)(CUstream);
+static CUresult (*d_stream_sync)(CUstream);
+static CUresult (*d_htod_async)(CUdeviceptr, const void *, size_t, CUstream);
+static CUresult (*d_dtoh_async)(void *, CUdeviceptr, size_t, CUstream);
+static CUresult (*d_mod_load)(CUmodule *, const void *);
+static CUresult (*d_mod_get)(CUfunction *, CUmodule, const char *);
+static CUresult (*d_mod_unload)(CUmodule);
+static CUresult (*d_func_attr)(CUfunction, int, int);
+static CUresult (*d_launch)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
+                            unsigned, CUstream, void **, void **);
+static CUresult (*d_event_create)(CUevent *, unsigned);
+static CUresult (*d_event_record)(CUevent, CUstream);
+static CUresult (*d_event_sync)(CUevent);
+static CUresult (*d_event_elapsed)(float *, CUevent, CUevent);
+static CUresult (*d_event_destroy)(CUevent);
+static CUresult (*d_capture_begin)(CUstream, int);
+static CUresult (*d_capture_end)(CUstream, CUgraph *);
+static CUresult (*d_graph_instantiate)(CUgraphExec *, CUgraph, unsigned long long);
+static CUresult (*d_graph_launch)(CUgraphExec, CUstream);
+static CUresult (*d_graph_exec_destroy)(CUgraphExec);
+static CUresult (*d_graph_destroy)(CUgraph);
+static CUresult (*d_can_peer)(int *, CUdevice, CUdevice);
+
+#define DEEP_SYM(var, name) (var = (__typeof__(var))sym(name)) != NULL
+
+static int deep_symbols(void)
 {
+    return DEEP_SYM(d_ctx_create, "cuCtxCreate_v2") && DEEP_SYM(d_ctx_destroy, "cuCtxDestroy_v2") &&
+           DEEP_SYM(d_ctx_sync, "cuCtxSynchronize") && DEEP_SYM(d_attribute, "cuDeviceGetAttribute") &&
+           DEEP_SYM(d_alloc, "cuMemAlloc_v2") && DEEP_SYM(d_free, "cuMemFree_v2") &&
+           DEEP_SYM(d_htod, "cuMemcpyHtoD_v2") && DEEP_SYM(d_dtoh, "cuMemcpyDtoH_v2") &&
+           DEEP_SYM(d_alloc_host, "cuMemAllocHost_v2") && DEEP_SYM(d_free_host, "cuMemFreeHost") &&
+           DEEP_SYM(d_register, "cuMemHostRegister_v2") && DEEP_SYM(d_unregister, "cuMemHostUnregister") &&
+           DEEP_SYM(d_stream_create, "cuStreamCreate") && DEEP_SYM(d_stream_destroy, "cuStreamDestroy_v2") &&
+           DEEP_SYM(d_stream_sync, "cuStreamSynchronize") &&
+           DEEP_SYM(d_htod_async, "cuMemcpyHtoDAsync_v2") && DEEP_SYM(d_dtoh_async, "cuMemcpyDtoHAsync_v2") &&
+           DEEP_SYM(d_mod_load, "cuModuleLoadData") && DEEP_SYM(d_mod_get, "cuModuleGetFunction") &&
+           DEEP_SYM(d_mod_unload, "cuModuleUnload") && DEEP_SYM(d_func_attr, "cuFuncSetAttribute") &&
+           DEEP_SYM(d_launch, "cuLaunchKernel") && DEEP_SYM(d_event_create, "cuEventCreate") &&
+           DEEP_SYM(d_event_record, "cuEventRecord") && DEEP_SYM(d_event_sync, "cuEventSynchronize") &&
+           DEEP_SYM(d_event_elapsed, "cuEventElapsedTime") && DEEP_SYM(d_event_destroy, "cuEventDestroy_v2") &&
+           DEEP_SYM(d_capture_begin, "cuStreamBeginCapture_v2") && DEEP_SYM(d_capture_end, "cuStreamEndCapture") &&
+           DEEP_SYM(d_graph_instantiate, "cuGraphInstantiateWithFlags") &&
+           DEEP_SYM(d_graph_launch, "cuGraphLaunch") && DEEP_SYM(d_graph_exec_destroy, "cuGraphExecDestroy") &&
+           DEEP_SYM(d_graph_destroy, "cuGraphDestroy") && DEEP_SYM(d_can_peer, "cuDeviceCanAccessPeer");
+}
+
+// The check under way, for the watchdog to name.
+static const char *volatile deep_step = "";
+
+static void deep_hung(int sig)
+{
+    static const char a[] = "  ";
+    static const char b[] = " HUNG: the GPU never finished it in 60 s. dmesg | grep -E 'nvidia|NVRM'\n";
+    (void)sig;
+    if (write(1, a, sizeof a - 1) < 0 || write(1, deep_step, strlen(deep_step)) < 0 ||
+        write(1, b, sizeof b - 1) < 0)
+        _exit(4);
+    _exit(3);
+}
+
+static void deep_begin(const char *step)
+{
+    deep_step = step;
+    alarm(60);
+}
+
+static double now_us(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e6 + t.tv_nsec / 1e3;
+}
+
+// A failed call during a deep check: its name, and CUDA's for the error.
+static int deep_call(const char *what, CUresult r)
+{
+    const char *name = "?";
+    if (r == 0)
+        return 1;
+    if (get_error_name)
+        get_error_name(r, &name);
+    printf("  %-10s FAILED: %s: %d %s\n", deep_step, what, r, name ? name : "?");
+    return 0;
+}
+
+static void deep_fill(unsigned *p, size_t n, unsigned seed)
+{
+    unsigned x = seed | 1;
+    for (size_t i = 0; i < n; i++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        p[i] = x;
+    }
+}
+
+// The first word that differs, as a failure line; whether all matched.
+static int deep_same(const unsigned *got, const unsigned *want, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (got[i] != want[i]) {
+            printf("  %-10s FAILED: word %zu of %zu is %#x, want %#x\n", deep_step, i, n, got[i], want[i]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static double mbps(size_t bytes, double us)
+{
+    return us > 0 ? bytes / us : 0;
+}
+
+enum { DEEP_WORDS = 16 << 20, DEEP_BYTES = DEEP_WORDS * 4, DEEP_BLOCKS = 4096, DEEP_THREADS = 256 };
+
+struct deep {
+    CUdeviceptr a, b, c;
+    unsigned *ha, *hb, *hc, *want;
+    CUstream stream;
+    CUmodule mod;
+};
+
+static int deep_copy(struct deep *g)
+{
+    deep_begin("copy");
+    double t0 = now_us();
+    if (!deep_call("HtoD", d_htod(g->a, g->ha, DEEP_BYTES)))
+        return 0;
+    double t1 = now_us();
+    if (!deep_call("DtoH", d_dtoh(g->hc, g->a, DEEP_BYTES)))
+        return 0;
+    double t2 = now_us();
+    if (!deep_same(g->hc, g->ha, DEEP_WORDS))
+        return 0;
+    printf("  copy       64 MiB  HtoD %5.0f MB/s  DtoH %5.0f MB/s  ok\n", mbps(DEEP_BYTES, t1 - t0),
+           mbps(DEEP_BYTES, t2 - t1));
+    return 1;
+}
+
+static int deep_pinned(struct deep *g)
+{
+    deep_begin("pinned");
+    void *p = NULL, *q = NULL;
+    int ok = deep_call("cuMemAllocHost", d_alloc_host(&p, DEEP_BYTES)) &&
+             deep_call("cuMemAllocHost", d_alloc_host(&q, DEEP_BYTES));
+    double t0 = 0, t1 = 0, t2 = 0;
+    if (ok) {
+        memcpy(p, g->hb, DEEP_BYTES);
+        memset(q, 0, DEEP_BYTES);
+        t0 = now_us();
+        ok = deep_call("HtoD", d_htod(g->b, p, DEEP_BYTES));
+        t1 = now_us();
+        ok = ok && deep_call("DtoH", d_dtoh(q, g->b, DEEP_BYTES));
+        t2 = now_us();
+        ok = ok && deep_same(q, g->hb, DEEP_WORDS);
+    }
+    if (ok)
+        printf("  pinned     64 MiB  HtoD %5.0f MB/s  DtoH %5.0f MB/s  ok\n", mbps(DEEP_BYTES, t1 - t0),
+               mbps(DEEP_BYTES, t2 - t1));
+    if (p)
+        d_free_host(p);
+    if (q)
+        d_free_host(q);
+    return ok;
+}
+
+// Memory of the program's own, pinned by cuMemHostRegister, copied on a
+// stream: the OS descriptor path.
+static int deep_registered(struct deep *g)
+{
+    enum { WORDS = 4 << 20, BYTES = WORDS * 4 };
+    deep_begin("registered");
+    unsigned *r = aligned_alloc(4096, BYTES);
+    if (!r) {
+        printf("  %-10s FAILED: no host memory\n", deep_step);
+        return 0;
+    }
+    deep_fill(r, WORDS, 0x5eed);
+    deep_fill(g->want, WORDS, 0x5eed);
+    int registered = deep_call("cuMemHostRegister", d_register(r, BYTES, 0));
+    int ok = registered && deep_call("HtoDAsync", d_htod_async(g->c, r, BYTES, g->stream)) &&
+             deep_call("sync", d_stream_sync(g->stream));
+    if (ok) {
+        memset(r, 0, BYTES);
+        ok = deep_call("DtoHAsync", d_dtoh_async(r, g->c, BYTES, g->stream)) &&
+             deep_call("sync", d_stream_sync(g->stream)) && deep_same(r, g->want, WORDS);
+    }
+    if (ok)
+        printf("  registered 16 MiB on a stream  ok\n");
+    if (registered)
+        d_unregister(r);
+    free(r);
+    return ok;
+}
+
+static int deep_fn(struct deep *g, const char *name, CUfunction *fn)
+{
+    return deep_call(name, d_mod_get(fn, g->mod, name));
+}
+
+// Launches on the probe's stream and waits, timing the GPU with events.
+static int deep_run(struct deep *g, CUfunction fn, unsigned blocks, unsigned threads, unsigned shared,
+                    void **args, float *ms)
+{
+    CUevent e0 = NULL, e1 = NULL;
+    int ok = deep_call("cuEventCreate", d_event_create(&e0, 0)) &&
+             deep_call("cuEventCreate", d_event_create(&e1, 0)) &&
+             deep_call("cuEventRecord", d_event_record(e0, g->stream)) &&
+             deep_call("cuLaunchKernel", d_launch(fn, blocks, 1, 1, threads, 1, 1, shared, g->stream, args, NULL)) &&
+             deep_call("cuEventRecord", d_event_record(e1, g->stream)) &&
+             deep_call("sync", d_stream_sync(g->stream));
+    if (ok && ms)
+        ok = deep_call("cuEventElapsedTime", d_event_elapsed(ms, e0, e1));
+    if (e0)
+        d_event_destroy(e0);
+    if (e1)
+        d_event_destroy(e1);
+    return ok;
+}
+
+static int deep_axpy(struct deep *g)
+{
+    deep_begin("axpy");
+    CUfunction fn;
+    unsigned n = DEEP_WORDS;
+    void *args[] = {&g->c, &g->a, &g->b, &n};
+    float ms = 0;
+    if (!deep_fn(g, "axpy_u32", &fn) || !deep_run(g, fn, DEEP_BLOCKS, DEEP_THREADS, 0, args, &ms) ||
+        !deep_call("DtoH", d_dtoh(g->hc, g->c, DEEP_BYTES)))
+        return 0;
+    for (size_t i = 0; i < DEEP_WORDS; i++)
+        g->want[i] = g->ha[i] * 3u + g->hb[i];
+    if (!deep_same(g->hc, g->want, DEEP_WORDS))
+        return 0;
+    printf("  axpy       16M words  GPU %.2f ms (%.0f GB/s)  ok\n", ms, ms > 0 ? 3.0 * DEEP_BYTES / (ms * 1e6) : 0);
+    return 1;
+}
+
+static int deep_reduce(struct deep *g)
+{
+    deep_begin("reduce");
+    CUfunction fn;
+    void *args[] = {&g->c, &g->a};
+    if (!deep_fn(g, "block_sum", &fn) || !deep_run(g, fn, DEEP_BLOCKS, DEEP_THREADS, 0, args, NULL) ||
+        !deep_call("DtoH", d_dtoh(g->hc, g->c, DEEP_BLOCKS * 4)))
+        return 0;
+    for (size_t b = 0; b < DEEP_BLOCKS; b++) {
+        unsigned s = 0;
+        for (size_t t = 0; t < DEEP_THREADS; t++)
+            s += g->ha[b * DEEP_THREADS + t];
+        g->want[b] = s;
+    }
+    if (!deep_same(g->hc, g->want, DEEP_BLOCKS))
+        return 0;
+    printf("  reduce     shuffles + shared memory  ok\n");
+    return 1;
+}
+
+static int deep_shared(struct deep *g, CUdevice dev)
+{
+    enum { BLOCKS = 64 };
+    deep_begin("shared");
+    CUfunction fn;
+    int optin = 0;
+    // CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN
+    if (!deep_call("attribute", d_attribute(&optin, 97, dev)) || !deep_fn(g, "big_shared", &fn))
+        return 0;
+    unsigned bytes = optin > 65536 ? 65536 : (unsigned)optin;
+    unsigned words = bytes / 4;
+    void *args[] = {&g->c, &words};
+    // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+    if (!deep_call("cuFuncSetAttribute", d_func_attr(fn, 8, (int)bytes)) ||
+        !deep_run(g, fn, BLOCKS, DEEP_THREADS, bytes, args, NULL) ||
+        !deep_call("DtoH", d_dtoh(g->hc, g->c, BLOCKS * DEEP_THREADS * 4)))
+        return 0;
+    for (unsigned b = 0; b < BLOCKS; b++) {
+        for (unsigned t = 0; t < DEEP_THREADS; t++) {
+            unsigned s = 0;
+            for (unsigned i = (t + 1) % DEEP_THREADS; i < words; i += DEEP_THREADS)
+                s += i * 2654435761u + b;
+            g->want[b * DEEP_THREADS + t] = s;
+        }
+    }
+    if (!deep_same(g->hc, g->want, BLOCKS * DEEP_THREADS))
+        return 0;
+    printf("  shared     %u KiB dynamic  ok\n", bytes >> 10);
+    return 1;
+}
+
+static int deep_dp4a(struct deep *g)
+{
+    enum { N = 1 << 20 };
+    deep_begin("dp4a");
+    CUfunction fn;
+    unsigned n = N;
+    void *args[] = {&g->c, &g->a, &g->b, &n};
+    if (!deep_fn(g, "dot_i8", &fn) || !deep_run(g, fn, N / DEEP_THREADS, DEEP_THREADS, 0, args, NULL) ||
+        !deep_call("DtoH", d_dtoh(g->hc, g->c, N * 4)))
+        return 0;
+    for (unsigned i = 0; i < N; i++) {
+        int acc = (int)i;
+        for (int k = 0; k < 4; k++)
+            acc += (signed char)(g->ha[i] >> (8 * k)) * (signed char)(g->hb[i] >> (8 * k));
+        g->want[i] = (unsigned)acc;
+    }
+    if (!deep_same(g->hc, g->want, N))
+        return 0;
+    printf("  dp4a       int8 dot products  ok\n");
+    return 1;
+}
+
+// One warp of tensor cores: each answer is its accumulator plus K * 1 * 2.
+static int deep_mma(struct deep *g, const char *name, const char *step, int f16)
+{
+    deep_begin(step);
+    CUfunction fn;
+    void *args[] = {&g->c};
+    unsigned words = f16 ? 128 : 64;
+    if (!deep_fn(g, name, &fn) || !deep_run(g, fn, 1, 32, 0, args, NULL) ||
+        !deep_call("DtoH", d_dtoh(g->hc, g->c, words * 4)))
+        return 0;
+    for (unsigned lane = 0; lane < 32; lane++) {
+        if (f16) {
+            for (unsigned j = 0; j < 4; j++) {
+                float want = (float)lane + 0.5f * j + 16.0f;
+                memcpy(&g->want[lane * 4 + j], &want, 4);
+            }
+        } else {
+            g->want[lane * 2] = lane + 32;
+            g->want[lane * 2 + 1] = lane + 100 + 32;
+        }
+    }
+    if (!deep_same(g->hc, g->want, words))
+        return 0;
+    printf("  %-10s tensor cores  ok\n", step);
+    return 1;
+}
+
+// llama.cpp decodes a token as one CUDA graph: capture, instantiate, launch.
+static int deep_graph(struct deep *g)
+{
+    deep_begin("graph");
+    CUfunction fn;
+    unsigned n = DEEP_WORDS;
+    void *args[] = {&g->c, &g->b, &g->a, &n};
+    CUgraph graph = NULL;
+    CUgraphExec exec = NULL;
+    if (!deep_fn(g, "axpy_u32", &fn))
+        return 0;
+    // CU_STREAM_CAPTURE_MODE_RELAXED, as llama.cpp captures.
+    int ok = deep_call("cuStreamBeginCapture", d_capture_begin(g->stream, 2));
+    if (ok) {
+        int launched = deep_call("cuLaunchKernel", d_launch(fn, DEEP_BLOCKS, 1, 1, DEEP_THREADS, 1, 1, 0, g->stream,
+                                                            args, NULL));
+        ok = deep_call("cuStreamEndCapture", d_capture_end(g->stream, &graph)) && launched;
+    }
+    ok = ok && deep_call("cuGraphInstantiate", d_graph_instantiate(&exec, graph, 0)) &&
+         deep_call("cuGraphLaunch", d_graph_launch(exec, g->stream)) &&
+         deep_call("sync", d_stream_sync(g->stream)) && deep_call("DtoH", d_dtoh(g->hc, g->c, DEEP_BYTES));
+    if (ok) {
+        for (size_t i = 0; i < DEEP_WORDS; i++)
+            g->want[i] = g->hb[i] * 3u + g->ha[i];
+        ok = deep_same(g->hc, g->want, DEEP_WORDS);
+    }
+    if (exec)
+        d_graph_exec_destroy(exec);
+    if (graph)
+        d_graph_destroy(graph);
+    if (ok)
+        printf("  graph      captured and replayed  ok\n");
+    return ok;
+}
+
+// What a launch costs, and a launch with the wait for it: llama.cpp waits
+// for the GPU after every token.
+static int deep_latency(struct deep *g)
+{
+    enum { WAITED = 200, QUEUED = 1000 };
+    deep_begin("latency");
+    CUfunction fn;
+    if (!deep_fn(g, "empty", &fn) || !deep_call("sync", d_ctx_sync()))
+        return 0;
+    double t0 = now_us();
+    for (int i = 0; i < WAITED; i++) {
+        if (!deep_call("cuLaunchKernel", d_launch(fn, 1, 1, 1, 1, 1, 1, 0, NULL, NULL, NULL)) ||
+            !deep_call("sync", d_ctx_sync()))
+            return 0;
+    }
+    double t1 = now_us();
+    for (int i = 0; i < QUEUED; i++) {
+        if (!deep_call("cuLaunchKernel", d_launch(fn, 1, 1, 1, 1, 1, 1, 0, NULL, NULL, NULL)))
+            return 0;
+    }
+    double t2 = now_us();
+    if (!deep_call("sync", d_ctx_sync()))
+        return 0;
+    double t3 = now_us();
+    printf("  latency    launch %.1f us  launch+wait %.1f us  1000 queued drain %.1f ms\n", (t2 - t1) / QUEUED,
+           (t1 - t0) / WAITED, (t3 - t1) / 1e3);
+    return 1;
+}
+
+// Every check on one GPU, in the order llama.cpp needs them; the first that
+// fails ends that GPU's run.
+static int deep_gpu(CUdevice dev, int index)
+{
+    struct deep g;
+    memset(&g, 0, sizeof g);
+    CUcontext ctx = NULL;
+    int major = 0, minor = 0;
+    printf("[deep GPU %d]\n", index);
+    deep_step = "context";
+    if (!deep_call("capability", d_attribute(&major, 75, dev)) ||
+        !deep_call("capability", d_attribute(&minor, 76, dev)))
+        return 0;
+    if (major * 10 + minor < 75) {
+        printf("  compute %d.%d: the deep checks need 7.5 (Turing) or newer\n", major, minor);
+        return 1;
+    }
+    if (!deep_call("cuCtxCreate", d_ctx_create(&ctx, 0, dev)))
+        return 0;
+    g.ha = malloc(DEEP_BYTES);
+    g.hb = malloc(DEEP_BYTES);
+    g.hc = malloc(DEEP_BYTES);
+    g.want = malloc(DEEP_BYTES);
+    int ok = g.ha && g.hb && g.hc && g.want;
+    if (!ok)
+        printf("  no host memory for the deep checks\n");
+    if (ok) {
+        deep_fill(g.ha, DEEP_WORDS, 0x1234 + index);
+        deep_fill(g.hb, DEEP_WORDS, 0xabcd + index);
+        deep_step = "alloc";
+        ok = deep_call("cuMemAlloc", d_alloc(&g.a, DEEP_BYTES)) && deep_call("cuMemAlloc", d_alloc(&g.b, DEEP_BYTES)) &&
+             deep_call("cuMemAlloc", d_alloc(&g.c, DEEP_BYTES)) &&
+             deep_call("cuStreamCreate", d_stream_create(&g.stream, 0));
+    }
+    if (ok) {
+        deep_begin("module");
+        ok = deep_call("cuModuleLoadData", d_mod_load(&g.mod, kernels_ptx));
+    }
+    ok = ok && deep_copy(&g) && deep_pinned(&g) && deep_registered(&g) && deep_axpy(&g) && deep_reduce(&g) &&
+         deep_shared(&g, dev) && deep_dp4a(&g) && deep_mma(&g, "mma_i8", "mma int8", 0) &&
+         deep_mma(&g, "mma_f16", "mma f16", 1) && deep_graph(&g) && deep_latency(&g);
+    alarm(0);
+    if (g.mod)
+        d_mod_unload(g.mod);
+    if (g.stream)
+        d_stream_destroy(g.stream);
+    if (g.a)
+        d_free(g.a);
+    if (g.b)
+        d_free(g.b);
+    if (g.c)
+        d_free(g.c);
+    free(g.ha);
+    free(g.hb);
+    free(g.hc);
+    free(g.want);
+    d_ctx_destroy(ctx);
+    return ok;
+}
+
+static int deep_all(int gpus, CUresult (*get)(CUdevice *, int))
+{
+    if (!deep_symbols()) {
+        printf("[deep] FAILED: libcuda is missing an entry point\n");
+        return 1;
+    }
+    signal(SIGALRM, deep_hung);
+    int failed = 0;
+    for (int i = 0; i < gpus; i++) {
+        CUdevice dev;
+        deep_step = "device";
+        if (!deep_call("cuDeviceGet", get(&dev, i)) || !deep_gpu(dev, i))
+            failed++;
+    }
+    if (gpus > 1) {
+        CUdevice d0, d1;
+        int peer = 0;
+        if (get(&d0, 0) == 0 && get(&d1, 1) == 0 && d_can_peer(&peer, d0, d1) == 0)
+            printf("[peer] GPU 0 -> GPU 1 direct access: %s\n", peer ? "yes" : "no (copies go through the host)");
+    }
+    if (failed) {
+        printf("DEEP FAILED on %d of %d GPU(s); the line above each FAILED names the check\n", failed, gpus);
+        return 1;
+    }
+    printf("DEEP OK on %d GPU(s)\n", gpus);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--deep") == 0) {
+            quiet = 1;
+        } else {
+            printf("usage: cuda-probe [-d|--deep]\n"
+                   "  -d  the basic steps print only failures; then every GPU gets the\n"
+                   "      deep checks (copies, kernels, tensor cores, graphs, latency)\n");
+            return 2;
+        }
+    }
+    // Line by line, so a check the watchdog names follows the lines before it.
+    setvbuf(stdout, NULL, _IOLBF, 0);
     if (!preflight())
         return 1;
 
-    printf("[init]\n");
+    say("[init]\n");
     cuda = dlopen("libcuda.so.1", RTLD_NOW);
     if (!cuda) {
         printf("  dlopen      FAILED: %s\n", dlerror());
         printf("              need libcuda 580 from NVIDIA userspace in the rootfs\n");
         return fail("init");
     }
-    printf("  dlopen      ok\n");
+    say("  dlopen      ok\n");
     get_error_name = (int (*)(CUresult, const char **))dlsym(cuda, "cuGetErrorName");
     get_error_string = (int (*)(CUresult, const char **))dlsym(cuda, "cuGetErrorString");
 
@@ -212,7 +767,7 @@ int main(void)
     if (!report("cuInit", init(0)))
         return fail("init");
 
-    printf("[devices]\n");
+    say("[devices]\n");
     int n = 0;
     if (!report("count", count(&n)))
         return fail("devices");
@@ -234,13 +789,13 @@ int main(void)
         return 1;
     }
 
-    printf("[context]\n");
+    say("[context]\n");
     CUdevice dev;
     CUcontext ctx = 0;
     if (!report("get", get(&dev, 0)) || !report("cuCtxCreate", ctx_create(&ctx, 0, dev)))
         return fail("context");
 
-    printf("[memory]\n");
+    say("[memory]\n");
     enum { SIZE = 1 << 20 };
     static unsigned char back[SIZE];
     CUdeviceptr p = 0;
@@ -262,9 +817,9 @@ int main(void)
         report("cuCtxDestroy", ctx_destroy(ctx));
         return fail("memory");
     }
-    printf("  pattern     ok\n");
+    say("  pattern     ok\n");
 
-    printf("[launch]\n");
+    say("[launch]\n");
     CUmodule mod = 0;
     CUfunction fn = 0;
     int launch_ok = report("loadPTX", mod_load(&mod, write_byte_ptx));
@@ -280,7 +835,7 @@ int main(void)
             printf("  store       FAILED: first byte %#x, want 0x5a\n", back[0]);
             launch_ok = 0;
         } else if (launch_ok) {
-            printf("  store       ok\n");
+            say("  store       ok\n");
         }
     }
     if (mod)
@@ -292,5 +847,8 @@ int main(void)
         return fail("launch");
 
     printf("OK: CUDA works on GPU 0 (init, memory, launch)\n");
+    if (quiet)
+        return deep_all(n, get);
+    printf("Deeper (every GPU, what Ollama's runner does, with timings): cuda-probe -d\n");
     return 0;
 }
