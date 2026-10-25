@@ -1788,14 +1788,14 @@ mod tests {
     #[test]
     fn the_other_free_slot_sentinel_is_reused_here_too() {
         let _dev = fake::with_phy(Phy::gigabit_partner());
+        // The sentinel FIRST and two real addresses after it. With it last, the
+        // fallback for storage that cannot grow takes the newest slot and
+        // overwrites it anyway, so the test could not tell "the sentinel was
+        // recognised" from "the last slot was taken".
         let sentinel = IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32);
-        let iface = interface_with(
-            borrowed(vec![
-                IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24),
-                sentinel,
-            ]),
-            4,
-        );
+        let kept = IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24);
+        let newest = IpCidr::new(IpAddress::v4(192, 168, 1, 123), 24);
+        let iface = interface_with(borrowed(vec![sentinel, kept, newest]), 4);
         let added = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
 
         iface.add_ip_address(added).unwrap();
@@ -1808,10 +1808,44 @@ mod tests {
         );
         assert!(!after.contains(&sentinel), "{:?}", after);
         assert!(
-            after.contains(&IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24)),
-            "the configured address was taken instead: {:?}",
+            after.contains(&kept) && after.contains(&newest),
+            "a configured address was taken instead of the sentinel: {:?}",
             after
         );
+    }
+
+    /// `240.0.0.0` is only a free slot at `/32`. With any other prefix it is an
+    /// address somebody configured in `240.0.0.0/4`, and the next
+    /// `add_ip_address` must not write over it -- the same thing
+    /// `an_address_with_a_zero_prefix_is_still_an_address` holds for the other
+    /// sentinel. None of the three drivers that carry these four lines tested
+    /// it, which is what let the lot keep a mutant that dropped the prefix
+    /// check alive.
+    #[test]
+    fn the_sentinel_with_any_other_prefix_is_still_an_address() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        // First, not last: with no slot free the fallback takes the NEWEST one,
+        // so a sentinel sitting last would be overwritten either way and the
+        // two readings could not be told apart.
+        let configured = IpCidr::new(IpAddress::v4(240, 0, 0, 0), 8);
+        let iface = interface_with(
+            borrowed(vec![
+                configured,
+                IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24),
+            ]),
+            4,
+        );
+        let added = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
+
+        iface.add_ip_address(added).unwrap();
+
+        let after = iface.get_ip_address();
+        assert!(
+            after.contains(&configured),
+            "240.0.0.0/8 was taken for a free slot: {:?}",
+            after
+        );
+        assert!(after.contains(&added), "{:?}", after);
     }
 
     /// With every slot taken and no way to grow, the new address takes the
