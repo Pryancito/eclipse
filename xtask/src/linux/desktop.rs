@@ -3765,6 +3765,9 @@ mod wallpaper {
         }
     }
 
+    #[cfg(test)]
+    mod png_tests;
+
     fn adler32(data: &[u8]) -> u32 {
         const MOD: u32 = 65521;
         let (mut a, mut b) = (1u32, 0u32);
