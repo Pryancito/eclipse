@@ -883,6 +883,21 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     "Eclipse: nvidia.exec_rm -- EXEC direct-submit path DISABLED (RM per-submit path, synchronous fence poll)"
                 );
             }
+            // `nvidia.compositor_ctx0`: keep the compositor on context 0 --
+            // the singleton step16/step17 ladder, on the shared boot-time RM
+            // client -- instead of giving it a context and a client of its own
+            // like every other DRM client. Default off, which is what Linux
+            // does and what lets `nvidia-smi` name the compositor at all: the
+            // boot client is KERNEL + admin and the RM skips those when it
+            // answers GPU_GET_PIDS. This flag is the way back without a
+            // rebuild, because the compositor is the one process whose failure
+            // takes the desktop down with it.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.compositor_ctx0") {
+                kernel_hal::drivers::set_compositor_ctx0(true);
+                klog_info!(
+                    "Eclipse: nvidia.compositor_ctx0 -- el compositor se queda en el contexto 0 (cliente del RM compartido; no saldra en la tabla de procesos de nvidia-smi)"
+                );
+            }
             if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nouveau_uapi") {
                 let capable = kernel_hal::drivers::all_drm()
                     .as_vec()
