@@ -191,25 +191,35 @@ pub fn klog_size() -> usize {
 /// Write a kernel message into the dmesg ring buffer only (not echoed to the graphic/serial console).
 /// `priority` follows syslog(3): 3=err, 4=warn, 6=info, 7=debug.
 pub fn klog_emit(priority: u8, msg: &str) {
-    let now = kernel_hal::timer::timer_now();
-    let micros = now.as_micros();
+    let micros = kernel_hal::timer::timer_now().as_micros();
     let mut line = [0u8; 512];
+    let pos = klog_line(priority, micros, msg, &mut line);
+    klog_write(&line[..pos]);
+}
+
+/// Lay one stamped record into `line` and return its length, newline
+/// included.
+///
+/// Split out of [`klog_emit`] so the stamp can be read back against a time of
+/// our own choosing rather than the clock's. The microsecond field is padded
+/// to six digits, and a clock sampled at an arbitrary moment already has six
+/// of them nine times out of ten -- a test that takes the time from the clock
+/// therefore does not hold the padding at all, it only notices it is gone on
+/// one run in ten.
+fn klog_line(priority: u8, micros: u128, msg: &str, line: &mut [u8]) -> usize {
     // `write!`, not `writeln!`: the terminator is `LineBuf::finish`'s job, so
     // that a message which fills the buffer loses a character of itself rather
     // than the newline that separates it from the next record.
-    let pos = {
-        let mut w = LineBuf::new(&mut line);
-        let _ = write!(
-            w,
-            "<{prio}>[{s:>3}.{us:06}] {msg}",
-            prio = priority,
-            s = micros / 1_000_000,
-            us = micros % 1_000_000,
-            msg = msg.trim_end_matches('\n'),
-        );
-        w.finish()
-    };
-    klog_write(&line[..pos]);
+    let mut w = LineBuf::new(line);
+    let _ = write!(
+        w,
+        "<{prio}>[{s:>3}.{us:06}] {msg}",
+        prio = priority,
+        s = micros / 1_000_000,
+        us = micros % 1_000_000,
+        msg = msg.trim_end_matches('\n'),
+    );
+    w.finish()
 }
 
 /// Initialize logging with the default max log level (WARN).
@@ -726,5 +736,160 @@ mod klog_tests {
             // "last".
             alloc::vec!["first", "0123456789a", "last"],
         );
+    }
+
+    // --- the boundary helper ----------------------------------------------
+
+    /// Its contract at `at == buf.len()`, which neither caller reaches today:
+    /// `write_str` only ever asks about a cut it has to make, and `finish`
+    /// asks about `pos - 1`. The guard is what keeps the loop from reading
+    /// `buf[at]` one past the end, so it is worth holding here rather than
+    /// leaving a third caller to find out.
+    #[test]
+    fn the_end_of_a_buffer_is_a_boundary() {
+        assert_eq!(floor_char_boundary(b"ab", 2), 2);
+        assert_eq!(floor_char_boundary(b"", 0), 0);
+        // Even when the last character is multi-byte: asking about the end is
+        // asking about a place no character straddles.
+        let dash = "a\u{2014}".as_bytes();
+        assert_eq!(dash.len(), 4);
+        assert_eq!(floor_char_boundary(dash, 4), 4);
+    }
+
+    /// What the `i > 0` guard is for: when the FIRST character of the line is
+    /// multi-byte and the newline has to come out of it, backing up has to
+    /// reach index 0. Stopping one short leaves the character's lead byte in
+    /// the ring with the terminator glued to it -- two bytes no reader can
+    /// decode, in the one place every reader starts.
+    #[test]
+    fn giving_up_the_only_character_in_a_line_gives_up_all_of_it() {
+        // Two bytes of buffer and one two-byte character: it fits exactly, so
+        // `finish` has to take it back again to make room for the terminator.
+        let mut buf = [0u8; 2];
+        let n = line(&mut buf, "\u{00e9}");
+        core::str::from_utf8(&buf[..n]).expect("the ring must hold valid UTF-8");
+        assert_eq!(&buf[..n], b"\n");
+    }
+
+    /// The room left for a later piece is what is left after the earlier one,
+    /// not the whole buffer. Every other cut test here writes once, or gives
+    /// up on its first piece and latches `full`, so none of them asks a
+    /// second time with the buffer part full -- which is the only moment the
+    /// two quantities differ.
+    #[test]
+    fn the_room_for_a_later_piece_starts_where_the_earlier_one_ended() {
+        let mut buf = [0u8; 8];
+        let mut w = LineBuf::new(&mut buf);
+        w.write_str("0123").unwrap();
+        w.write_str("456789").unwrap();
+        let n = w.finish();
+        assert_eq!(&buf[..n], b"0123456\n");
+    }
+
+    // --- the stamp --------------------------------------------------------
+
+    /// The shape every reader of this log parses: a syslog priority in angle
+    /// brackets, then seconds right-aligned in three columns and
+    /// microseconds in exactly six of them, then the message. Nothing held
+    /// the padding of the fraction, and without it `[  1.5]` means one and a
+    /// half seconds to a person and five microseconds to the clock.
+    #[test]
+    fn the_stamp_pads_the_microseconds_to_six_digits() {
+        let mut line = [0u8; 64];
+        let n = klog_line(6, 42, "hi", &mut line);
+        assert_eq!(
+            core::str::from_utf8(&line[..n]).unwrap(),
+            "<6>[  0.000042] hi\n"
+        );
+    }
+
+    /// And the two halves of the stamp are the seconds and the remainder of
+    /// the same microsecond count, so an uptime wider than its three columns
+    /// widens the field rather than losing a digit.
+    #[test]
+    fn the_stamp_splits_the_clock_into_seconds_and_the_rest() {
+        let mut line = [0u8; 64];
+        let n = klog_line(3, 12_345_678_901, "oops", &mut line);
+        assert_eq!(
+            core::str::from_utf8(&line[..n]).unwrap(),
+            "<3>[12345.678901] oops\n"
+        );
+    }
+
+    /// A caller whose message already ends in a newline would otherwise get
+    /// two, and `dmesg` would show a blank line between every record. The
+    /// `klog_*!` macros are handed `format!` output, so this is the common
+    /// case rather than the odd one.
+    #[test]
+    fn a_message_that_ends_in_newlines_still_makes_one_line() {
+        let mut line = [0u8; 64];
+        let n = klog_line(6, 1_000_000, "done\n\n", &mut line);
+        assert_eq!(
+            core::str::from_utf8(&line[..n]).unwrap(),
+            "<6>[  1.000000] done\n"
+        );
+    }
+
+    /// The two halves joined up. `klog_emit` is what every `klog_*!` macro
+    /// expands to and the ring it writes into is the one `dmesg` reads, and
+    /// nothing crossed that join: the tests above drive `KlogBuf` and
+    /// `LineBuf` directly, each with a buffer of its own.
+    #[test]
+    fn an_emitted_message_lands_in_the_ring_that_dmesg_reads() {
+        klog_emit(4, "emitted-by-its-own-test\n");
+        let mut all = alloc::vec![0u8; klog_size()];
+        let n = klog_read_all(&mut all);
+        // Lossy because other tests in this binary log too and the ring is
+        // free to have wrapped across a character; the line we just wrote is
+        // the last one either way.
+        let text = alloc::string::String::from_utf8_lossy(&all[..n]);
+        let last = text.lines().last().expect("the ring cannot be empty now");
+        assert!(last.starts_with("<4>["), "no stamp on {last:?}");
+        assert!(
+            last.ends_with("] emitted-by-its-own-test"),
+            "the message did not arrive whole: {last:?}"
+        );
+    }
+
+    // --- the log level ----------------------------------------------------
+
+    /// The fallback decides more than it looks: `set_max_level` is handed the
+    /// string straight off the kernel cmdline (`LOG=...`), so a typo there
+    /// decides how much of the log a person sees. Falling back to `Off`
+    /// answers a misspelled level by turning the log off, which is the one
+    /// answer nobody can debug.
+    #[test]
+    fn a_level_the_cmdline_misspells_leaves_the_log_at_warn() {
+        let saved = log::max_level();
+        set_max_level("warning"); // not a name `log` knows
+        assert_eq!(log::max_level(), LevelFilter::Warn);
+        set_max_level("");
+        assert_eq!(log::max_level(), LevelFilter::Warn);
+        // And a name it does know is honoured, so the fallback is a fallback
+        // rather than the only answer.
+        set_max_level("trace");
+        assert_eq!(log::max_level(), LevelFilter::Trace);
+        set_max_level("off");
+        assert_eq!(log::max_level(), LevelFilter::Off);
+        log::set_max_level(saved);
+    }
+
+    /// The GPU bring-up runs inside this, and the desktop console depends on
+    /// getting its level back: leaving it at `Off` silences every warning for
+    /// the rest of the boot, quietly, on the one path where the narration was
+    /// turned down on purpose.
+    #[test]
+    fn suppressed_output_comes_back_at_the_level_it_found() {
+        let saved = log::max_level();
+        log::set_max_level(LevelFilter::Info);
+        let mut inside = LevelFilter::Error;
+        with_output_suppressed(|| inside = log::max_level());
+        assert_eq!(inside, LevelFilter::Off, "nothing is logged inside");
+        assert_eq!(
+            log::max_level(),
+            LevelFilter::Info,
+            "and the level before it is the level after it"
+        );
+        log::set_max_level(saved);
     }
 }

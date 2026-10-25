@@ -1521,3 +1521,49 @@ mod exception_context_layout_tests {
         assert_eq!(offset_of!(ExceptionContext, synth_data), 28);
     }
 }
+
+/// The layout of the exception info: the twenty-four bytes a debugger reads
+/// off the exception channel ahead of the report itself.
+#[cfg(test)]
+mod exception_info_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `pid` and `tid` are two `KoID` in a row, so they trade places without
+    /// a word of complaint and a debugger attaches to the process whose koid
+    /// is really the thread's. The size assertion next door cannot see it:
+    /// twenty-four bytes is twenty-four bytes in whichever order they come.
+    #[test]
+    fn the_info_is_the_process_then_the_thread_then_the_type() {
+        assert_eq!(size_of::<ExceptionInfo>(), 24);
+        assert_eq!(align_of::<ExceptionInfo>(), 8);
+        assert_eq!(offset_of!(ExceptionInfo, pid), 0);
+        assert_eq!(offset_of!(ExceptionInfo, tid), 8);
+        assert_eq!(offset_of!(ExceptionInfo, type_), 16);
+        assert_eq!(offset_of!(ExceptionInfo, padding), 20);
+    }
+
+    /// What reaches the channel is `pack`'s `transmute_copy`, so the bytes are
+    /// worth reading back rather than inferring from the offsets: this holds
+    /// the little-endian width of each field as well as its place, pins the
+    /// wire value of the type, and is the one assertion here that would notice
+    /// the `repr(C)` going missing.
+    #[test]
+    fn pack_writes_the_fields_little_endian_in_that_order() {
+        let info = ExceptionInfo {
+            pid: 0x1122_3344_5566_7788,
+            tid: 0x99aa_bbcc_ddee_ff00,
+            type_: ExceptionType::FatalPageFault,
+            padding: Default::default(),
+        };
+        assert_eq!(
+            info.pack(),
+            alloc::vec![
+                0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // pid
+                0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, // tid
+                0x08, 0x01, 0x00, 0x00, // ZX_EXCP_FATAL_PAGE_FAULT
+                0x00, 0x00, 0x00, 0x00, // padding
+            ],
+        );
+    }
+}

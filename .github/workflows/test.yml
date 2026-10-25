@@ -65,6 +65,18 @@ jobs:
           # nothing. Only `fncall.rs` and the structs compile for a host
           # target; pinning that layout is what `layout_tests` does.
           cargo test --manifest-path vendor/trapframe/Cargo.toml
+          # The same `default-members = ["xtask"]` hole as the block below,
+          # and these two fell straight through it with their tests already
+          # written: `z-config` holds the machine table that decides what an
+          # image is built for, and `zcore-boot-opts` parses the kernel
+          # command line the boot hatches arrive on -- `tlbhammer` among them,
+          # and the colon-separated `key=value` form a device tree hands over.
+          # Seventeen tests between them, every one of them passing, and not
+          # one of them had ever run here. A test nobody runs is worse than no
+          # test: it rots without saying so, and it is counted as cover all
+          # the while.
+          cargo test -p z-config
+          cargo test -p zcore-boot-opts
           # `default-members = ["xtask"]` in the workspace manifest means the
           # bare `cargo test` above builds ONLY xtask, so these two crates'
           # unit tests -- the DRM/KMS present path, the NVIDIA decode helpers,

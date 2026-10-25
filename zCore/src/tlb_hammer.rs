@@ -43,12 +43,26 @@ static HOLD: Mutex<()> = Mutex::new(());
 /// Shared with the host-testable crate so the cmdline rules cannot drift.
 pub use zcore_boot_opts::parse_tlbhammer;
 
+/// The budget `start` settles on for a requested `asked` on `online` CPUs,
+/// and how many of it are mapper threads.
+///
+/// The hammer is three threads before it is a hammer at all -- one mapper, the
+/// IRQ-off holder and the process churn -- so a budget is never taken below
+/// three, not even on a machine with fewer CPUs than that, where the threads
+/// fighting over one CPU is the whole point. Above three the online count
+/// wins: arming more mappers than there are CPUs to run them shortens each
+/// mapper's turn instead of lengthening the convoy, which is the opposite of
+/// what the hammer is for.
+fn hammer_threads(asked: usize, online: usize) -> (usize, usize) {
+    let n = asked.min(online.max(3));
+    (n, n.saturating_sub(2).max(1))
+}
+
 /// Spawn the hammer. Call once after SMP is up and the executor is running
 /// (same window as other deferred boot tasks).
 pub fn start(n: usize) {
     let online = kernel_hal::online_cpu_count().max(1);
-    let n = n.min(online.max(3));
-    let mappers = n.saturating_sub(2).max(1);
+    let (n, mappers) = hammer_threads(n, online);
     hammer_log(format_args!(
         "Eclipse: TLB hammer ON (eclipse.tlbhammer={}) — {} mappers + 1 irq-off holder + 1 process churn",
         n, mappers
@@ -295,5 +309,42 @@ mod tests {
             parse_tlbhammer("LOG=error: eclipse.tlbhammer = 6 "),
             Some(6)
         );
+    }
+
+    // --- the thread budget ------------------------------------------------
+
+    #[test]
+    fn a_budget_larger_than_the_machine_is_cut_to_the_machine() {
+        // Four CPUs cannot run six mappers at once, and arming them anyway
+        // shortens each mapper's turn rather than lengthening the convoy.
+        assert_eq!(hammer_threads(6, 4), (4, 2));
+        assert_eq!(hammer_threads(6, 8), (6, 4));
+    }
+
+    #[test]
+    fn the_hammer_keeps_its_three_threads_on_a_machine_too_small_for_them() {
+        // One CPU is not a reason to disarm: three threads fighting over it is
+        // exactly the starvation window being hunted. `parse_tlbhammer`
+        // already refuses a budget below three, and this is the other end of
+        // the same floor -- the machine's.
+        assert_eq!(hammer_threads(3, 1), (3, 1));
+        assert_eq!(hammer_threads(6, 1), (3, 1));
+        assert_eq!(hammer_threads(6, 2), (3, 1));
+    }
+
+    #[test]
+    fn a_budget_of_three_arms_one_mapper_and_never_none() {
+        // Two of the budget are the holder and the churn, so at exactly three
+        // there is one mapper left.
+        assert_eq!(hammer_threads(3, 8), (3, 1));
+        assert_eq!(hammer_threads(4, 8), (4, 2));
+        // And below three the floor is what keeps a hammer with nothing
+        // mapping in it from being armed. The cmdline cannot ask for this --
+        // `parse_tlbhammer` raises anything below three before `start` sees
+        // it -- so the floor guards a direct caller of this `pub fn`, and
+        // measuring it took asking here: with only the two lines above,
+        // dropping the `.max(1)` changes no answer at all.
+        assert_eq!(hammer_threads(2, 8), (2, 1));
+        assert_eq!(hammer_threads(1, 8), (1, 1));
     }
 }
