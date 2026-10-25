@@ -1924,6 +1924,21 @@ impl DrmDev {
                 wait_vblank_check(req.typ)?;
                 let typ = req.typ;
                 let signal = req.val1;
+                // `drm_vblank_get`: a CRTC that is off (DPMS off, SETCRTC
+                // without a mode, RMFB of its scanout -- what
+                // `drm_crtc_vblank_off` turns off) holds no vblank: both
+                // forms are EINVAL, after the type and pipe checks. Unless
+                // this is the blocking wait that was parked when the CRTC
+                // went off: `wait_event_interruptible_timeout` ends on
+                // `!vblank->enabled` and the reply is 0 with the count there
+                // is, so its mark is taken BEFORE the CRTC is looked at.
+                // Both forms served the counter here, and a client paced on
+                // a pipe that was off as if it were on.
+                let cut_short =
+                    typ & _DRM_VBLANK_EVENT == 0 && self.file.take_vblank_wait_cut_short(data);
+                if !cut_short && drm::crtc_blanked() {
+                    return Err(FsError::InvalidParam);
+                }
                 // Only ask the driver for a real vblank when it has hardware
                 // KMS support. Without hardware KMS (e.g. the NVIDIA stub
                 // registers has_hardware_kms()=false) wait_vblank is
@@ -2014,6 +2029,13 @@ impl DrmDev {
                 if drm::get_crtc(req.crtc_id).is_none() {
                     return Err(FsError::EntryNotFound);
                 }
+                // `drm_crtc_vblank_get` on a CRTC that is off: EINVAL, after
+                // the lookup. This answered `active = 0` with the counter,
+                // a reply Linux never gives (`disable_outputs` checks the
+                // driver called `drm_crtc_vblank_off`).
+                if drm::crtc_blanked() {
+                    return Err(FsError::InvalidParam);
+                }
                 let (seq, ns) = drm::vblank_seq_and_time_now();
                 req.active = drm::crtc_enabled() as u32;
                 req.sequence = seq as u64;
@@ -2039,6 +2061,11 @@ impl DrmDev {
                     return Err(FsError::EntryNotFound);
                 }
                 if req.flags & !(DRM_CRTC_SEQUENCE_RELATIVE | DRM_CRTC_SEQUENCE_NEXT_ON_MISS) != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                // `drm_crtc_vblank_get`, after the flags: a CRTC that is off
+                // takes no event.
+                if drm::crtc_blanked() {
                     return Err(FsError::InvalidParam);
                 }
                 let now_seq = drm::vblank_seq_now();

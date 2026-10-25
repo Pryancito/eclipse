@@ -44,6 +44,13 @@ pub struct DrmFileState {
     /// makes in between is not the wait that was stopped and must not take
     /// the mark.
     vblank_wait_timed_out: AtomicUsize,
+    /// The address of the blocking `WAIT_VBLANK` request whose sleep ended
+    /// because the CRTC went off under it, or 0. `drm_crtc_vblank_off`
+    /// wakes the waiters and `wait_event_interruptible_timeout` ends on
+    /// `!vblank->enabled`: that wait answers 0 with the count there is,
+    /// where a request that arrives with the CRTC already off is EINVAL --
+    /// so the sync arm takes this mark BEFORE it looks at the CRTC.
+    vblank_wait_cut_short: AtomicUsize,
 }
 
 impl DrmFileState {
@@ -64,6 +71,7 @@ impl DrmFileState {
             minor,
             magic: AtomicU32::new(0),
             vblank_wait_timed_out: AtomicUsize::new(0),
+            vblank_wait_cut_short: AtomicUsize::new(0),
         });
         if minor != NO_MINOR {
             let owner = Arc::as_ptr(&file) as usize;
@@ -90,9 +98,29 @@ impl DrmFileState {
     /// Whether the sleep for the request at `req` was the one the cap
     /// stopped. Taken once, so the same struct asked again is a fresh wait.
     pub fn take_vblank_wait_timed_out(&self, req: usize) -> bool {
+        Self::take_vblank_wait_latch(&self.vblank_wait_timed_out, req)
+    }
+
+    /// `wait_vblank_sleep_capped` ended the sleep for the request at `req`
+    /// because the CRTC went off under it: the sync arm is to answer 0
+    /// with the count there is, not the EINVAL a CRTC that is off gets.
+    pub fn note_vblank_wait_cut_short(&self, req: usize) {
+        self.vblank_wait_cut_short.store(req, Ordering::Release);
+    }
+
+    /// Whether the sleep for the request at `req` was the one the CRTC
+    /// going off ended. Taken once, like the cap's mark.
+    pub fn take_vblank_wait_cut_short(&self, req: usize) -> bool {
+        Self::take_vblank_wait_latch(&self.vblank_wait_cut_short, req)
+    }
+
+    /// A mark left for one request: only that request takes it, and once,
+    /// so a query another thread of the same open makes in between is
+    /// not the wait that was stopped, and the same struct asked again is
+    /// a fresh wait.
+    fn take_vblank_wait_latch(latch: &AtomicUsize, req: usize) -> bool {
         req != 0
-            && self
-                .vblank_wait_timed_out
+            && latch
                 .compare_exchange(req, 0, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
     }
