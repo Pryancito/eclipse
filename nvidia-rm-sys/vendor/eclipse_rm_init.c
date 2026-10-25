@@ -2310,7 +2310,7 @@ static API_SECURITY_INFO _eclipse_rm_ctx_sec_info(void)
  * internal allocation under it -- gpuGetProcWithObject needs a Device on this
  * GPU under the client (deviceGetByGpu) before it will look at its channels
  * at all. On any failure nothing is left behind. */
-static NV_STATUS _eclipse_rm_ctx_client(NvU32 ctxIdx, NvU32 deviceInstance,
+static NV_STATUS _eclipse_rm_ctx_client(NvU32 ctxIdx, OBJGPU *pGpu, NvU32 deviceInstance,
                                         NvU32 *phClient, NvU32 *phDevice)
 {
     /* The SAME interface the rest of this file uses: the API lock is already
@@ -2366,6 +2366,40 @@ static NV_STATUS _eclipse_rm_ctx_client(NvU32 ctxIdx, NvU32 deviceInstance,
     if (status != NV_OK)
     {
         goto free_client;
+    }
+
+    /* NV20_SUBDEVICE_0. This client never touches it itself, and cannot do
+     * without it: `kgrobjPromoteContext` -- the LAST step of allocating
+     * TURING_COMPUTE_A / TURING_A on a channel -- opens with
+     * `subdeviceGetByDeviceAndGpu(RES_GET_CLIENT(obj), pDevice, pGpu, ...)`,
+     * which iterates the CHILDREN OF THIS DEVICE looking for a Subdevice and
+     * answers NV_ERR_OBJECT_NOT_FOUND when there is none.
+     *
+     * Without it every per-process context died exactly there -- channel OK,
+     * compute 0x57 -- so `ensure_ctx_for_pid` rejected it, the client fell
+     * back to the shared context 0, got a discovery channel with no GPFIFO,
+     * and its first EXEC answered ENODEV (NVK: VK_ERROR_DEVICE_LOST). Context
+     * 0 was the only one that ever worked because step16's shared client has
+     * had a subdevice from the start. */
+    {
+        NV2080_ALLOC_PARAMETERS subParams;
+        NvU32                   hSubdevice = 0;
+
+        portMemSet(&subParams, 0, sizeof(subParams));
+        subParams.subDeviceId = gpumgrGetSubDeviceInstanceFromGpu(pGpu);
+        status = clientGenResourceHandle(pRsClient, &hSubdevice);
+        if (status != NV_OK)
+        {
+            goto free_client;
+        }
+        status = pRmApi->AllocWithHandle(pRmApi, hClient, hDevice, hSubdevice,
+                                         NV20_SUBDEVICE_0, &subParams, sizeof(subParams));
+        nv_printf(0, "[eclipse-rm-trace] ctx%u: NV20_SUBDEVICE_0 (user client) -> 0x%x hSubdevice=0x%x\n",
+                  ctxIdx, status, hSubdevice);
+        if (status != NV_OK)
+        {
+            goto free_client;
+        }
     }
 
     *phClient = hClient;
@@ -2470,9 +2504,9 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
     /* No ladder precondition. That comment used to be true: this context was
      * built on step16's shared client/device/subdevice. Since the per-process
      * client landed it is not -- everything below hangs off
-     * `_eclipse_rm_ctx_client`'s OWN NV01_ROOT and NV01_DEVICE_0 (which is the
-     * whole point: a context filed under the caller's pid is the one
-     * `gpuGetProcWithObject` can name, so the process shows up in
+     * `_eclipse_rm_ctx_client`'s OWN NV01_ROOT / NV01_DEVICE_0 / NV20_SUBDEVICE_0
+     * (which is the whole point: a context filed under the caller's pid is the
+     * one `gpuGetProcWithObject` can name, so the process shows up in
      * nvidia-smi), and `g_grAllocCache` is not read once in this function.
      *
      * Keeping the stale guard cost exactly what it was meant to protect: on
@@ -2516,7 +2550,7 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
      * process whose DRM ioctl this is, so nvidia-smi can name it. Everything
      * below hangs off these instead of the shared step-16 pair; see
      * `_eclipse_rm_ctx_client` for why that pair could never be reported. */
-    status = _eclipse_rm_ctx_client(ctxIdx, gpuGetDeviceInstance(pGpu),
+    status = _eclipse_rm_ctx_client(ctxIdx, pGpu, gpuGetDeviceInstance(pGpu),
                                     &g_ctxClient[gpuInstance][ctxIdx], &g_ctxDevice[gpuInstance][ctxIdx]);
     if (status != NV_OK)
     {
