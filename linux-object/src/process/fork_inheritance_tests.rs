@@ -21,6 +21,14 @@ fn a_configured_parent() -> LinuxProcessInner {
             env_start: 0x7fff_0010,
             env_end: 0x7fff_0030,
         }),
+        image_layout: Some(crate::loader::ImageLayout {
+            start_code: 0x5555_0000_1000,
+            end_code: 0x5555_0000_9876,
+            start_data: 0x5555_0000_c000,
+            end_data: 0x5555_0000_d0a8,
+            start_brk: 0x5555_0010_0000,
+            start_stack: 0x7fff_e6f0,
+        }),
         current_working_directory: String::from("/home/moebius"),
         limits: {
             let mut limits = RLimits::default();
@@ -150,6 +158,14 @@ fn the_child_reads_its_arguments_where_the_parent_did() {
     // `/proc/<pid>/cmdline` is read from the same place until it execs.
     let child = fork_of(&a_configured_parent());
     assert_eq!(child.arg_area, a_configured_parent().arg_area);
+}
+
+#[test]
+fn the_child_has_the_layout_of_the_image_it_copied() {
+    // The same image at the same addresses: `stat` and the `[heap]` and
+    // `[stack]` of `maps` say the same of both until the child execs.
+    let child = fork_of(&a_configured_parent());
+    assert_eq!(child.image_layout, a_configured_parent().image_layout);
 }
 
 #[test]

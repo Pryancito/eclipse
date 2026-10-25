@@ -3169,6 +3169,7 @@ dependencies = [
  "linux-syscall",
  "log",
  "rcore-fs-hostfs",
+ "rcore-fs-ramfs",
  "xmas-elf 0.7.0",
  "zircon-object",
  "zircon-syscall",

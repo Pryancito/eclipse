@@ -626,3 +626,161 @@ fn the_surfaceflip_line_names_its_state_and_the_pci_driver_matches_nvidia() {
     assert!(!PciDriver::matched(&drv, 0x8086, 0x1f06));
     assert_eq!(Scheme::name(&gpu()), "nvidia-test");
 }
+
+/// The one plane this driver lists is 3001, the primary of CRTC 2001,
+/// and `GETPLANE` on it reports the framebuffer `set_plane` last put there
+/// (`plane_fb`); any other id is no plane. `set_plane` with no framebuffer
+/// clears the plane and succeeds; with one it presents it, which a
+/// framebuffer this driver never made, or one without a CPU-visible
+/// address (a dumb buffer before its first map), refuses -- the plane
+/// keeps what it showed.
+#[test]
+fn the_primary_plane_is_3001_and_set_plane_presents_or_clears_it() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu();
+    assert_eq!(DrmScheme::get_planes(&gpu), alloc::vec![3001]);
+    assert!(DrmScheme::get_plane(&gpu, 3002).is_none(), "not a plane");
+    gpu.kms_state.lock().plane_fb = 77;
+    let plane = DrmScheme::get_plane(&gpu, 3001).expect("the primary");
+    assert_eq!(
+        (
+            plane.id,
+            plane.crtc_id,
+            plane.fb_id,
+            plane.possible_crtcs,
+            plane.plane_type
+        ),
+        (3001, 2001, 77, 1, 1),
+        "the primary of CRTC 2001, showing what set_plane last put there"
+    );
+    let set = |plane_id: u32, fb_id: u32| {
+        DrmScheme::set_plane(
+            &gpu,
+            plane_id,
+            2001,
+            fb_id,
+            0,
+            0,
+            64,
+            64,
+            0,
+            0,
+            64 << 16,
+            64 << 16,
+        )
+    };
+    assert!(!set(3002, 0), "not a plane");
+    assert_eq!(gpu.kms_state.lock().plane_fb, 77, "nothing touched");
+    let h = object(&gpu, A, 16384, None);
+    let fb = framebuffer(&gpu, h);
+    assert!(!set(3001, fb + 100), "a framebuffer this driver never made");
+    assert!(
+        !set(3001, fb),
+        "a framebuffer without a CPU-visible address cannot be presented"
+    );
+    assert_eq!(
+        gpu.kms_state.lock().plane_fb,
+        77,
+        "the plane keeps what it showed"
+    );
+    assert!(set(3001, 0), "no framebuffer: the plane is cleared");
+    assert_eq!(gpu.kms_state.lock().plane_fb, 0);
+    assert_eq!(
+        DrmScheme::get_plane(&gpu, 3001).map(|p| p.fb_id),
+        Some(0),
+        "and GETPLANE says so"
+    );
+    gpu.nouveau_release_process(A);
+}
+
+/// `nvidia.hwflip` on: `page_flip` copies the framebuffer into the GOP
+/// scanout with the copy engine, pitched (a flat copy painted the
+/// diagonal-snow desktop). The copy wants a sysmem source with a
+/// geometry the engine can do: a framebuffer this driver never made, one
+/// without a physical address, a VRAM one (its address is not a CE sysmem
+/// PA), or one whose row does not fit its own pitch is refused without
+/// touching the scanout; and when the engine itself cannot run (no RM
+/// attached) the flip falls back to software and says so once. Nothing
+/// moves the CRTC's framebuffer.
+#[test]
+fn page_flip_with_hwflip_refuses_what_the_copy_engine_cannot_copy() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    struct HwflipOn;
+    impl Drop for HwflipOn {
+        fn drop(&mut self) {
+            nv::set_hwflip_enabled(false);
+        }
+    }
+    nv::set_hwflip_enabled(true);
+    let _on = HwflipOn;
+    let mut gpu = gpu();
+    // The scanout the copy lands in: a 64x64 panel with 256-byte rows
+    // (`for_test` has no GOP, so no geometry of its own).
+    gpu.info.width = 64;
+    gpu.info.height = 64;
+    gpu.info.pitch = 256;
+    let h = object(&gpu, A, 65536, Some(0x2000_0000));
+    let mut fbs = alloc::vec::Vec::new();
+    let mut fb = |phys_addr: u64, pitch: u32, vram_offset: Option<u64>| {
+        let id = gpu.next_kms_fb_id.fetch_add(1, Ordering::Relaxed);
+        gpu.kms_framebuffers.lock().push(NvidiaKmsFramebuffer {
+            id,
+            handle_id: h,
+            width: 64,
+            height: 64,
+            pitch,
+            phys_addr,
+            size: 65536,
+            h_memory: 0,
+            vram_offset,
+        });
+        fbs.push(id);
+        id
+    };
+    let unknown = fb(0, 256, None) + 1000;
+    let no_address = fb(0, 256, None);
+    let vram = fb(0x2000_0000, 256, Some(0x100_0000));
+    let narrow = fb(0x2000_0000, 128, None);
+    let good = fb(0x2000_0000, 256, None);
+    let crtc_fb = gpu.kms_state.lock().crtc_fb;
+    let said = |what: &str| take_dmesg().iter().any(|(_, l)| l.contains(what));
+    let _ = take_dmesg();
+    assert!(
+        !gpu.page_flip(unknown),
+        "a framebuffer this driver never made"
+    );
+    assert!(!gpu.page_flip(no_address), "no physical address");
+    assert!(!said("hwflip"), "refused without a word: nothing to copy");
+    assert!(
+        !gpu.page_flip(vram),
+        "a VRAM framebuffer is not a CE sysmem source"
+    );
+    assert!(said("hwflip: refusing VRAM GEM fb="), "and says why, once");
+    assert!(
+        !gpu.page_flip(narrow),
+        "a 256-byte row does not fit a 128-byte pitch"
+    );
+    assert!(
+        !said("hwflip"),
+        "a geometry the engine cannot do is refused in silence"
+    );
+    assert!(
+        !gpu.page_flip(good),
+        "the engine cannot run without the RM: software fallback"
+    );
+    assert!(
+        said("hwflip: CE 2D pitched failed for fb="),
+        "the fallback is said, once"
+    );
+    assert_eq!(
+        gpu.kms_state.lock().crtc_fb,
+        crtc_fb,
+        "the scanout did not move"
+    );
+    for id in fbs {
+        gpu.kms_framebuffers.lock().retain(|f| f.id != id);
+    }
+    gpu.nouveau_release_process(A);
+}

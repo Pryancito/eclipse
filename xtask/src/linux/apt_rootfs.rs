@@ -1515,6 +1515,12 @@ pub(super) fn check_apt(root: &Path, arch: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod suite_pin_tests;
+
+#[cfg(all(test, unix))]
+mod staging_merge_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

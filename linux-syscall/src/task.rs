@@ -1596,7 +1596,7 @@ impl Syscall<'_> {
         // the task with SIGSEGV here rather than returning; do the same, so
         // the parent sees a dead child instead of a live one wandering through
         // an empty address space.
-        let (entry, sp, initial_brk, execute_path, abi, arg_area) = match load {
+        let (entry, sp, initial_brk, loaded_path, abi, arg_area, layout) = match load {
             Ok(loaded) => loaded,
             Err(e) => {
                 error!(
@@ -1612,11 +1612,21 @@ impl Syscall<'_> {
         // The new image may speak a different ABI than the caller (e.g. a Linux
         // shell exec'ing a FreeBSD binary); adopt the freshly-detected one.
         proc.set_abi(abi);
-        let (execute_path, comm) = target.identity(proc, execute_path);
+        let (execute_path, comm) = target.identity(proc, loaded_path.clone());
+        // `maps` names the image's rows by the same path as `exe`, and the
+        // dynamic linker's by its own.
+        linux_object::loader::rename_images(&vmar, |name| {
+            if name == loaded_path {
+                execute_path.clone()
+            } else {
+                real_path(proc, name)
+            }
+        });
         proc.set_execute_path(&execute_path);
         proc.set_cmdline(args);
         proc.set_environ(envs);
         proc.set_arg_area(arg_area);
+        proc.set_image_layout(Some(layout));
         proc.set_brk(initial_brk);
         // CRUCIAL: reset the heap's *mapped* upper bound too. `execve` replaced
         // the whole address space (`vmar.clear()` above), so the previous image's

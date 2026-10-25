@@ -1270,6 +1270,8 @@ struct LinuxProcessInner {
     environ: Vec<String>,
     /// Where the image keeps both of those in its memory.
     arg_area: Option<crate::loader::ArgArea>,
+    /// Where its code, data, break and stack start (`/proc/<pid>/stat`).
+    image_layout: Option<crate::loader::ImageLayout>,
     /// Current Working Directory
     ///
     /// Omit leading '/'. The path of [`Self::working_directory`], which is
@@ -4533,8 +4535,9 @@ impl LinuxProcessInner {
         // the credentials, the working directory, the process group and
         // session, `no_new_privs`, the resource limits, and the `setitimer`
         // interval timers, which setitimer(2) preserves across an exec.
-        // `brk`/`mapped_brk`, `environ`, `cmdline`, `arg_area`, `execute_path`
-        // and `abi` are all overwritten by the caller from the new image.
+        // `brk`/`mapped_brk`, `environ`, `cmdline`, `arg_area`, `image_layout`,
+        // `execute_path` and `abi` are all overwritten by the caller from the
+        // new image.
         old_attachments
     }
 
@@ -4554,6 +4557,7 @@ impl LinuxProcessInner {
             // still reports the parent's environment.
             environ: self.environ.clone(),
             arg_area: self.arg_area,
+            image_layout: self.image_layout,
             current_working_directory: self.current_working_directory.clone(),
             working_directory: self.working_directory.clone(),
             files: self.files.clone(),

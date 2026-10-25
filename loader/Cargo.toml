@@ -35,6 +35,10 @@ libos = ["kernel-hal/libos", "zircon-object/libos", "zircon-object/aspace-separa
 env_logger = "0.9"
 async-std = { version = "1.10", features = ["attributes"] }
 rcore-fs-hostfs = { git = "https://github.com/rcore-os/rcore-fs", rev = "1a3246b" }
+# A filesystem the unit tests can build an initramfs out of, the way
+# `linux-object`'s own tests do. The workspace `[patch]` points it at
+# `vendor/`, so this is the same copy the kernel runs.
+rcore-fs-ramfs = { git = "https://github.com/rcore-os/rcore-fs", rev = "1a3246b" }
 
 [[example]]
 name = "linux-libos"

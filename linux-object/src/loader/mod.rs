@@ -255,14 +255,24 @@ const _: () = assert!(
 );
 
 mod abi;
+mod layout;
 mod preflight;
 
 pub use abi::{ArgArea, AuxIdentity};
+pub use layout::{rename_images, ImageLayout};
 
 /// What [`LinuxElfLoader::load`] hands back: the entry point, the stack
-/// pointer, the initial break, the path of the image that runs, its ABI, and
-/// where its argument and environment strings are.
-pub type Loaded = (VirtAddr, VirtAddr, usize, String, Abi, Option<ArgArea>);
+/// pointer, the initial break, the path of the image that runs, its ABI,
+/// where its argument and environment strings are, and where its parts are.
+pub type Loaded = (
+    VirtAddr,
+    VirtAddr,
+    usize,
+    String,
+    Abi,
+    Option<ArgArea>,
+    ImageLayout,
+);
 
 /// How many symbolic links an interpreter's path may go through, a `#!`
 /// one's or a `PT_INTERP`'s: as many as any other path, since `open_exec`
@@ -515,6 +525,7 @@ impl LinuxElfLoader {
             .inspect_err(|&e| {
                 error!("elf: load app from elf failed: {:?}", e);
             })?;
+            layout::name_segments(vmar, &elf, app_base, &path);
             let app_entry = entry_address(app_base, elf.header.pt2.entry_point())?;
 
             // Patch any in-binary syscall-entry trampoline present in the main program.
@@ -581,6 +592,7 @@ impl LinuxElfLoader {
                 .inspect_err(|&e| {
                     error!("elf: load interp {:?} from elf failed: {:?}", interp, e);
                 })?;
+            layout::name_segments(vmar, &interp_elf, interp_base, interp);
             let interp_entry = entry_address(interp_base, interp_elf.header.pt2.entry_point())?;
 
             match interp_elf.relocate(interp_vmar.clone(), vmar) {
@@ -724,6 +736,7 @@ impl LinuxElfLoader {
             // tree does not ship — so in practice only *static* FreeBSD binaries
             // (handled in the no-interpreter path below) get a FreeBSD stack.
             let initial_brk = heap_base(vmar);
+            let layout = ImageLayout::of_elf(&elf, app_base, initial_brk, sp);
             return Ok((
                 interp_entry,
                 sp,
@@ -731,6 +744,7 @@ impl LinuxElfLoader {
                 path,
                 abi,
                 init_stack.arg_area(),
+                layout,
             ));
         }
 
@@ -747,6 +761,7 @@ impl LinuxElfLoader {
         .inspect_err(|&e| {
             error!("elf: load_from_elf failed: {:?}", e);
         })?;
+        layout::name_segments(vmar, &elf, base, &path);
         let entry = entry_address(base, elf.header.pt2.entry_point())?;
 
         debug!(
@@ -889,7 +904,16 @@ impl LinuxElfLoader {
         // static binary has no interpreter mapping its own libraries, but it
         // still mmaps, and the collision is the same one.
         let initial_brk = heap_base(vmar);
-        Ok((entry, sp, initial_brk, path, abi, init_stack.arg_area()))
+        let layout = ImageLayout::of_elf(&elf, base, initial_brk, sp);
+        Ok((
+            entry,
+            sp,
+            initial_brk,
+            path,
+            abi,
+            init_stack.arg_area(),
+            layout,
+        ))
     }
 }
 
@@ -2467,6 +2491,44 @@ mod elf_bounds_tests {
         assert!(flags_of(0).contains(MMUFlags::USER));
         // A segment that asked for nothing gets nothing but that.
         assert_eq!(flags_of(0), user);
+    }
+
+    /// `maps` names each row of an image by its file and says where in the
+    /// file the row starts; the loader named none of them. A segment with
+    /// no file bytes is anonymous memory in Linux and keeps no name.
+    #[test]
+    fn each_segment_is_named_after_its_file_at_its_offset() {
+        let base = own_window();
+        let mut elf = Elf::new()
+            .phdr(Phdr {
+                p_type: 1,    // PT_LOAD
+                flags: 0b101, // R+X
+                offset: 0x2010,
+                virtual_addr: (base + 0x1010) as u64,
+                file_size: 0x40,
+                mem_size: 0x40,
+                ..Default::default()
+            })
+            .phdr(Phdr {
+                p_type: 1,    // PT_LOAD
+                flags: 0b110, // R+W
+                virtual_addr: (base + 0x8000) as u64,
+                mem_size: 0x1000,
+                ..Default::default()
+            });
+        elf.payload = vec![0x90u8; 0x2100];
+        let image = elf.build();
+        let elf = ElfFile::new(&image).unwrap();
+        let vmar = VmAddressRegion::new_root();
+        vmar.load_from_elf(&elf).unwrap();
+
+        layout::name_segments(&vmar, &elf, vmar.addr(), "/bin/survey");
+
+        let rows = vmar.mappings_dump();
+        let row = |at: usize| rows.iter().find(|m| m.start == vmar.addr() + at).unwrap();
+        assert_eq!(row(base + 0x1000).name, "/bin/survey");
+        assert_eq!(row(base + 0x1000).file_offset, 0x2000);
+        assert_eq!(row(base + 0x8000).name, "");
     }
 
     /// A relocation whose word straddles the end of its mapping. The fast path
