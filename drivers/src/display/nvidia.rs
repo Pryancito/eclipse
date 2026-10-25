@@ -265,24 +265,6 @@ static BOOT_FB_INFO: Mutex<Option<BootFbInfo>> = Mutex::new(None);
 /// `NvidiaGpu::debug_dump()`; only the first call actually invokes RM.
 static RM_CORE_INIT_STATUS: Mutex<Option<u32>> = Mutex::new(None);
 
-/// Whose mappings a VA-range operation may take: the whole VA space, or only
-/// the calling process's.
-///
-/// The VA space is the CONTEXT, not the process. While every process has a
-/// context of its own the two coincide, and the fallback path is exactly
-/// where they do not -- a process whose `ctx_alloc` fails binds into context
-/// 0 alongside everyone else that fell back, and then "mine" by pid is a
-/// strictly smaller set than "mine" by VA space.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum VaScope {
-    /// Everything live in this context's VA space, whoever bound it. What a
-    /// MAP's replace semantics mean: the RM holds one reservation per VA per
-    /// VA space, so that is the set that can collide with a new one.
-    WholeVaSpace,
-    /// Only what this process bound. What an explicit UNMAP means.
-    CallersOwn,
-}
-
 /// Set before invoking RM init, never cleared. If it's already set while
 /// `RM_CORE_INIT_STATUS` is still `None`, a previous attempt started and
 /// DIED mid-initialization (bring-up faults kill the reading task, not
@@ -425,11 +407,6 @@ fn surfaceflip_stats_line() -> String {
 /// and the line the boot prints about them live together. Out of this file
 /// for size only; a child module still reaches its private items.
 mod boot_fb;
-
-/// Bringing the console GPU up late, and the GR ladder its clients need
-/// afterwards. Out of this file for size only; a child module still reaches
-/// its private items.
-mod console_ladder;
 pub use boot_fb::set_boot_fb_info;
 use boot_fb::{boot_fb_phys, boot_fb_size, console_gpu_cold_line, BootFbInfo};
 
@@ -4872,21 +4849,6 @@ impl DrmScheme for NvidiaGpu {
         s.push_str(
             "[gpustep14] === CONSOLE GPU full bring-up: attach -> GSP boot (drain) -> RM controls -> state-load -> CE ===\n",
         );
-        // The whole ladder inside the RM gate, as ONE span taken by the
-        // ladder's caller -- `RmGate` is not reentrant and stage 5 reaches the
-        // gated `ce_*` wrappers, so it cannot be per-entry. Why at all, and
-        // why BOUNDED (the lesson of #2115), is in `rm_init::LadderGate` and
-        // in `ladder_gate_tests`.
-        const LADDER_GATE_BUDGET_NS: u64 = 5_000_000_000;
-        let Some(_ladder) = nvidia_rm_sys::rm_init::ladder_gate(LADDER_GATE_BUDGET_NS) else {
-            s.push_str(
-                "[gpustep14] ABORTED: another caller is still inside the RM after 5s; \
-                 the ladder is NOT started (it must not wait here -- scanout is parked \
-                 on a watchdog and the SEC2 STARTCPU store has to land inside that \
-                 window). Retry once the GPU is idle.\n",
-            );
-            return s;
-        };
         // 1. RM attach (sets rm_device_instance). bringup_step5 is idempotent
         //    (cached); safe to always call -- it no-ops if already attached.
         if self.rm_device_instance.lock().is_none() {
@@ -5097,31 +5059,31 @@ impl DrmScheme for NvidiaGpu {
         if !self.drives_boot_display() {
             return String::new();
         }
-        let already = self.rm_device_instance.lock().is_some();
-        if !already {
-            // One-shot: ensure_console_gpu_brought_up runs bringup_step14.
-            self.ensure_console_gpu_brought_up();
-        }
-        let Some(device_instance) = *self.rm_device_instance.lock() else {
+        if self.rm_device_instance.lock().is_some() {
             return alloc::format!(
-                "GPU consola {:02x}:{:02x}.0 {} sin RM tras bring-up diferido — se sigue con present por CPU y cursor software",
+                "GPU consola {:02x}:{:02x}.0 {} ya state-loaded",
                 self.pci_bus,
                 self.pci_device,
                 self.gpu_model,
             );
-        };
-        alloc::format!(
-            "GPU consola {:02x}:{:02x}.0 {} {} — present CE local y cursor HW; {}",
-            self.pci_bus,
-            self.pci_device,
-            self.gpu_model,
-            if already {
-                "ya state-loaded"
-            } else {
-                "lista (bring-up diferido)"
-            },
-            self.ensure_gr_ladder(device_instance),
-        )
+        }
+        // One-shot: ensure_console_gpu_brought_up runs bringup_step14.
+        self.ensure_console_gpu_brought_up();
+        if self.rm_device_instance.lock().is_some() {
+            alloc::format!(
+                "GPU consola {:02x}:{:02x}.0 {} lista (bring-up diferido) — present CE local y cursor HW",
+                self.pci_bus,
+                self.pci_device,
+                self.gpu_model,
+            )
+        } else {
+            alloc::format!(
+                "GPU consola {:02x}:{:02x}.0 {} sin RM tras bring-up diferido — se sigue con present por CPU y cursor software",
+                self.pci_bus,
+                self.pci_device,
+                self.gpu_model,
+            )
+        }
     }
 
     fn ce_present(&self, src_sysmem_pa: u64, size: u64) -> bool {
@@ -8455,6 +8417,49 @@ impl NvidiaGpu {
         }
     }
 
+    fn ensure_console_gpu_brought_up(&self) {
+        // Secondary GPUs are already state-loaded at boot by
+        // `auto_bringup_compute`; only the console GPU is skipped there, so it is
+        // the one that still needs this on-demand path.
+        if !self.drives_boot_display() {
+            return;
+        }
+        // Default OFF: safer boot. Opt in with `nvidia.console_gsp`.
+        if !super::nouveau_uapi::console_gsp_enabled() {
+            return;
+        }
+        // Already up — the steady-state fast path (brief lock, no boot).
+        if self.rm_device_instance.lock().is_some() {
+            return;
+        }
+        // One attempt, ever.
+        if self.auto_bringup_done.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        crate::klog_warn!(
+            "[auto-bringup] console GPU not attached; running the full bring-up \
+             automatically on first GPU client (attach -> GSP boot -> state-load \
+             -> CE) so EXEC works without `cat /proc/gpustep14`"
+        );
+        // step14 self-guards to the console GPU and chains step5/boot/8/9/10; its
+        // internal live-echo streams each stage to the console, so a wedge leaves
+        // its last stage visible even though this call would then never return.
+        let report = self.bringup_step14();
+        for line in report.lines() {
+            crate::klog_warn!("[auto-bringup] {}", line);
+        }
+        if self.rm_device_instance.lock().is_some() {
+            crate::klog_warn!(
+                "[auto-bringup] console GPU RM-attached and state-loaded — EXEC enabled"
+            );
+        } else {
+            crate::klog_warn!(
+                "[auto-bringup] console GPU bring-up did NOT attach the RM; \
+                 GEM/VM_BIND/EXEC stay ENODEV until reboot (see the stage trail above)"
+            );
+        }
+    }
+
     /// Drains every `nouveau_vm_mappings` entry for which `matches` returns
     /// true. When `rm_unmap` is set, each is `vm_bind_unmap`'d via RM -- the
     /// same real RM call VM_BIND's own UNMAP op uses. Pass `false` after
@@ -8504,16 +8509,11 @@ impl NvidiaGpu {
         owner_pid: u64,
         addr: u64,
         range: u64,
-        scope: VaScope,
         context: &str,
     ) -> usize {
         let end = addr.wrapping_add(range);
         let taken = self.take_vm_mappings(|m| {
-            let mine = match scope {
-                VaScope::WholeVaSpace => m.ctx_idx == ctx_idx,
-                VaScope::CallersOwn => m.owner_pid == owner_pid,
-            };
-            mine && m.va < end && addr < m.va.wrapping_add(m.size)
+            m.owner_pid == owner_pid && m.va < end && addr < m.va.wrapping_add(m.size)
         });
         let count = taken.len();
         // (gem_handle, va, size, bo_offset, pte_kind) of every kept part.
@@ -8923,28 +8923,17 @@ impl NvidiaGpu {
                 // -13 in both labwc renderers). The displaced owner cannot
                 // be executing anyway: EXEC is restricted to the RM
                 // channel's owner, so the last binder is the one that runs.
-                // Scoped to the VA SPACE, which is the context -- NOT to
-                // the calling process. Those are the same thing only while
-                // every process has a context of its own, and the fallback
-                // path is precisely where they are not: a process whose
-                // `ctx_alloc` fails binds into context 0, the shared boot
-                // ladder, together with everyone else that fell back. Then
-                // the previous binder at this VA is a DIFFERENT pid in the
-                // SAME VA space, a pid filter skips it, and the RM refuses
-                // the fixed-VA reservation it is still holding -- which on
-                // real hardware is `virtmemAllocResources: VA Space alloc
-                // failed! Status Code: 0x51` for one page at 0x3ffffff000,
-                // over and over, because every Mesa VA heap starts at that
-                // same top address. Only the overlapped part of an old
-                // mapping goes; what lies outside the range stays mapped
-                // (gpuvm's REMAP).
+                // Scoped to THIS process's context: two clients each have
+                // their own VA space, so the SAME VA in a different context
+                // is not a conflict -- replacing it would corrupt the other
+                // client. Only the overlapped part of an old mapping goes;
+                // what lies outside the range stays mapped (gpuvm's REMAP).
                 let replaced = self.split_vm_mappings(
                     device_instance,
                     ctx_idx,
                     owner_pid,
                     op.addr,
                     op.range,
-                    VaScope::WholeVaSpace,
                     &alloc::format!(
                         "VM_BIND MAP replace VA={:#x}+{:#x} (this ctx, last binder wins)",
                         op.addr,
@@ -9054,18 +9043,12 @@ impl NvidiaGpu {
                 // VAs it never bound, and treats a refusal as "leak the VA".
                 // Only the range asked for goes: a mapping the range cuts
                 // through keeps its head and its tail (gpuvm's REMAP).
-                // An explicit UNMAP takes only the CALLER'S OWN mappings,
-                // unlike the replace above: tearing down a range is a
-                // statement about what this process bound, and in a shared
-                // context 0 another process's mapping at the same VA is
-                // still live for it.
                 self.split_vm_mappings(
                     device_instance,
                     ctx_idx,
                     owner_pid,
                     op.addr,
                     op.range,
-                    VaScope::CallersOwn,
                     &alloc::format!("VM_BIND UNMAP VA={:#x}+{:#x}", op.addr, op.range),
                 );
                 Ok(())
