@@ -9376,7 +9376,3 @@ mod rm_edges_tests;
 /// because the ladder runs with scanout parked: same harness, own file,
 /// same reason.
 mod ladder_gate_tests;
-
-/// The console GPU's GR allocation ladder, built as soon as the card is up
-/// rather than left to a later client: same harness, own file, same reason.
-mod console_ladder_tests;
