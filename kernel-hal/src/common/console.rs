@@ -461,6 +461,13 @@ pub fn set_diag_present_over_graphics(on: bool) {
     DIAG_PRESENT_OVER_GRAPHICS.store(on, Ordering::Relaxed);
 }
 
+/// Whether that override is on. A caller that turns it on for the duration of
+/// one diagnostic needs this to put back what it found, rather than leaving the
+/// kernel log painted over the compositor for the rest of the boot.
+pub fn diag_present_over_graphics() -> bool {
+    DIAG_PRESENT_OVER_GRAPHICS.load(Ordering::Relaxed)
+}
+
 /// Whether a write to VT `vt` should be pushed to the display now: always in
 /// text mode, and in graphics mode only when the diagnostic override is on.
 #[inline]
@@ -1693,5 +1700,35 @@ mod next_console_row_tests {
     #[test]
     fn the_last_row_of_a_one_row_screen_is_the_first_one() {
         assert_eq!(next_console_row(0, 1), 0);
+    }
+}
+
+/// The one decision this file makes for the deferred console-GPU bring-up:
+/// whether a kernel notice is painted while a compositor holds the VT.
+#[cfg(test)]
+mod over_graphics_tests {
+    use super::*;
+
+    /// A VT in KD_GRAPHICS normally presents nothing -- that is how labwc owns
+    /// the display. The override is the exception, and the bring-up needs it:
+    /// during the pause labwc is deliberately not drawing, and the two notices
+    /// that say the still screen is not a wedge have to land on the monitor.
+    /// It is also why the caller must be able to READ the flag: leaving it on
+    /// would paint the kernel log over the desktop for the rest of the boot.
+    #[test]
+    fn the_override_is_what_puts_a_notice_on_a_compositor_held_vt() {
+        let vt = 0;
+        let was = diag_present_over_graphics();
+        set_diag_present_over_graphics(false);
+        set_kd_mode_vt(vt, KD_TEXT);
+        assert!(present_allowed(vt), "text mode always presents");
+        set_kd_mode_vt(vt, KD_GRAPHICS);
+        assert!(!present_allowed(vt), "KD_GRAPHICS suppresses by default");
+        set_diag_present_over_graphics(true);
+        assert!(present_allowed(vt), "the override is the exception");
+        assert!(diag_present_over_graphics(), "and it reads back");
+        // Put the VT and the flag back: both are process-wide statics.
+        set_diag_present_over_graphics(was);
+        set_kd_mode_vt(vt, KD_TEXT);
     }
 }
