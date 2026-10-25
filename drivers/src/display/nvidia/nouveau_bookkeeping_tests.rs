@@ -9365,3 +9365,9 @@ mod implicit_sync_tests;
 /// tables and the context registry's fallbacks: same harness, own file,
 /// same reason.
 mod drm_scheme_tests;
+
+/// The RM-side edges the fake RM reaches (a full channel table under the
+/// compositor, an empty EXEC whose wait never lands, a `GPUOBJ_FREE` the
+/// RM no longer has, a GPU the id table cannot size): same harness, own
+/// file, same reason.
+mod rm_edges_tests;
