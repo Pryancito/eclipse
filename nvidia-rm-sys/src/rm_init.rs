@@ -72,6 +72,66 @@ impl RmGate {
         }
         RmGate
     }
+
+    /// The same gate, but the caller gives up after `budget_ns` instead of
+    /// waiting however long it takes.
+    ///
+    /// Only for a caller that CANNOT afford an unbounded wait, which so far is
+    /// exactly one: the console GPU's bring-up ladder, which runs with scanout
+    /// parked under a watchdog. #2115 took the plain unbounded gate inside
+    /// `init_gsp`, which put that unbounded wait INSIDE the parked window --
+    /// and if anyone else held the gate, the ladder reached the SEC2 STARTCPU
+    /// store outside the window that makes it safe, so the box booted with no
+    /// monitor at all. A gate that serializes is still correct and still
+    /// breaks when it is taken inside a window somebody else opened on a
+    /// clock. Hence bounded: the ladder would rather not run than run late.
+    ///
+    /// The clock is `hooks::clock_ns`, whose unwired fallback still ADVANCES
+    /// (one tick per read), so the budget expires in a bounded number of polls
+    /// even on a build with no timer behind it -- never never.
+    pub(crate) fn lock_within(budget_ns: u64) -> Option<RmGate> {
+        use core::sync::atomic::Ordering;
+        let start = crate::hooks::clock_ns();
+        let mut spins = 0u32;
+        while RM_CALL_GATE.swap(true, Ordering::Acquire) {
+            if crate::hooks::clock_ns().wrapping_sub(start) > budget_ns {
+                return None;
+            }
+            spins = spins.wrapping_add(1);
+            if spins & 511 == 0 {
+                lock::pump();
+            }
+            core::hint::spin_loop();
+        }
+        Some(RmGate)
+    }
+}
+
+/// A whole bring-up ladder, held inside [`RmGate`].
+///
+/// The ladder -- `attach_gpu`, `init_gsp`, `rm_api_demo`, `state_init`,
+/// `step10` -- is the one family of RM entries that does NOT take the gate
+/// for itself, and it is also the longest-running: `kgspInitRm` keeps the RM's
+/// API lock for seconds. A client's `step16` or `ctx_alloc` landing in that
+/// stretch did not wait, it was REFUSED: `rmapiLockAcquire`'s two asserts
+/// answer `NV_ERR_INVALID_LOCK_STATE` (0x2f) rather than block, and a
+/// compositor whose `ctx_alloc` is refused falls back to context 0 and never
+/// appears in `nvidia-smi`'s process table. Holding this for the ladder's
+/// whole span makes the clients WAIT for it -- in our code, preemptible, with
+/// IRQs on -- which is what the gate is for.
+///
+/// It must stay a span held by the LADDER'S CALLER rather than something each
+/// of the five entries takes: `RmGate` is not reentrant, and `step10` reaches
+/// the gated `ce_*` wrappers.
+pub struct LadderGate {
+    _gate: RmGate,
+}
+
+/// Takes the RM gate for a whole bring-up ladder, waiting at most `budget_ns`.
+/// `None` means somebody else is still inside the RM and the caller must not
+/// start the ladder; see [`LadderGate`] and [`RmGate::lock_within`].
+pub fn ladder_gate(budget_ns: u64) -> Option<LadderGate> {
+    RmGate::lock_within(budget_ns).map(|g| LadderGate { _gate: g })
 }
 
 impl Drop for RmGate {
@@ -2682,6 +2742,53 @@ mod rm_gate_tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the waiter never got the gate after it was released");
         waiter.join().unwrap();
+
+        // The bounded acquire, which the console GPU's bring-up ladder uses
+        // because it CANNOT wait: it runs with scanout parked under a
+        // watchdog, and #2115 -- an unbounded wait inside that window -- cost
+        // a real box its monitor. So while somebody else is inside the RM,
+        // `ladder_gate` has to come back empty-handed rather than wait it out,
+        // and it must not take the gate on the way.
+        let (held_tx, held_rx) = mpsc::channel();
+        let (drop_tx, drop_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let _gate = RmGate::lock();
+            held_tx.send(()).unwrap();
+            drop_rx.recv().unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // In a thread with a deadline of its own: a budget that did not expire
+        // would hang the suite instead of failing it, and a hang is not a
+        // verdict.
+        let (gave_up_tx, gave_up_rx) = mpsc::channel();
+        let prober = thread::spawn(move || {
+            gave_up_tx.send(ladder_gate(1_000_000).is_none()).unwrap();
+        });
+        assert!(
+            gave_up_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the bounded acquire never gave up -- its budget does not expire"),
+            "the ladder gate was handed out while another caller was inside the RM"
+        );
+        prober.join().unwrap();
+        drop_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        // And with the RM idle it is the same gate, held for as long as the
+        // ladder holds the guard: that is what makes a client's step16 or
+        // ctx_alloc WAIT for the ladder instead of being refused 0x2f.
+        {
+            let ladder = ladder_gate(1_000_000).expect("the RM is idle; the ladder gets the gate");
+            assert!(
+                RM_CALL_GATE.load(Ordering::SeqCst),
+                "the ladder gate did not take the gate"
+            );
+            drop(ladder);
+        }
+        assert!(
+            !RM_CALL_GATE.load(Ordering::SeqCst),
+            "dropping the ladder gate must hand the gate back"
+        );
 
         assert!(
             !RM_CALL_GATE.load(Ordering::SeqCst),

@@ -4867,6 +4867,21 @@ impl DrmScheme for NvidiaGpu {
         s.push_str(
             "[gpustep14] === CONSOLE GPU full bring-up: attach -> GSP boot (drain) -> RM controls -> state-load -> CE ===\n",
         );
+        // The whole ladder inside the RM gate, as ONE span taken by the
+        // ladder's caller -- `RmGate` is not reentrant and stage 5 reaches the
+        // gated `ce_*` wrappers, so it cannot be per-entry. Why at all, and
+        // why BOUNDED (the lesson of #2115), is in `rm_init::LadderGate` and
+        // in `ladder_gate_tests`.
+        const LADDER_GATE_BUDGET_NS: u64 = 5_000_000_000;
+        let Some(_ladder) = nvidia_rm_sys::rm_init::ladder_gate(LADDER_GATE_BUDGET_NS) else {
+            s.push_str(
+                "[gpustep14] ABORTED: another caller is still inside the RM after 5s; \
+                 the ladder is NOT started (it must not wait here -- scanout is parked \
+                 on a watchdog and the SEC2 STARTCPU store has to land inside that \
+                 window). Retry once the GPU is idle.\n",
+            );
+            return s;
+        };
         // 1. RM attach (sets rm_device_instance). bringup_step5 is idempotent
         //    (cached); safe to always call -- it no-ops if already attached.
         if self.rm_device_instance.lock().is_none() {
