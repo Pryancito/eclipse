@@ -319,6 +319,66 @@ fn a_callers_name_never_overruns_the_rms_buffer() {
     crate::os_interface::write_caller_name(core::ptr::null_mut(), 4);
 }
 
+/// `AttributedTo` is the DRM half of the same accounting: a GR context is
+/// built by the kernel, with no front-end call in flight, so nothing else
+/// would name the process it is being built for. It names it for the length
+/// of the build and leaves nothing behind, so the next kernel-side RM work
+/// is nobody's again.
+#[test]
+fn the_drm_guard_names_a_process_for_a_kernel_side_call_and_leaves_nothing() {
+    let _t = turnstile();
+    assert_eq!(crate::os_interface::os_get_current_process(), 0);
+    {
+        let _who = AttributedTo::enter(4242);
+        assert_eq!(crate::os_interface::os_get_current_process(), 4242);
+        // It does NOT open the user-copy window: there is no user memory in
+        // a call the kernel makes on its own.
+        assert!(!IN_CALL.load(Ordering::SeqCst));
+        let mut dst = [0u8; 4];
+        let src = [1u8, 2, 3, 4];
+        set_user_range_validator(accept_all);
+        assert_eq!(
+            copy_from_user(dst.as_mut_ptr(), src.as_ptr(), 4),
+            NV_ERR_NOT_SUPPORTED,
+            "no user copies outside a front-end call, guard or no guard"
+        );
+    }
+    assert_eq!(crate::os_interface::os_get_current_process(), 0);
+}
+
+/// Nested, it RESTORES rather than clears. A guard taken inside a front-end
+/// call that then cleared the pid would leave the rest of that call -- and
+/// every client it still makes -- filed under nobody, which is the bug #2092
+/// fixed. Two guards nest the same way.
+#[test]
+fn the_drm_guard_gives_the_pid_back_to_whoever_had_it() {
+    let _t = turnstile();
+    let mut caller = a_caller(0, false);
+    caller.pid = 1234;
+    let _scope = CallScope::enter(&caller);
+    assert_eq!(crate::os_interface::os_get_current_process(), 1234);
+    {
+        let _who = AttributedTo::enter(7);
+        assert_eq!(crate::os_interface::os_get_current_process(), 7);
+        {
+            let _inner = AttributedTo::enter(8);
+            assert_eq!(crate::os_interface::os_get_current_process(), 8);
+        }
+        assert_eq!(crate::os_interface::os_get_current_process(), 7);
+    }
+    assert_eq!(
+        crate::os_interface::os_get_current_process(),
+        1234,
+        "the escape still names its own process"
+    );
+    // A pid of 0 is allowed and means nobody, as outside a call.
+    {
+        let _who = AttributedTo::enter(0);
+        assert_eq!(crate::os_interface::os_get_current_process(), 0);
+    }
+    assert_eq!(crate::os_interface::os_get_current_process(), 1234);
+}
+
 #[test]
 fn no_gpu_is_accessible_outside_a_call() {
     let _t = turnstile();

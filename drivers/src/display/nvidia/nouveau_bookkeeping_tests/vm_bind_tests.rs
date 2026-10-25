@@ -469,3 +469,81 @@ fn a_vm_bind_map_names_its_object_before_its_window_and_an_unknown_op_fails_afte
     gpu.nouveau_release_process(A);
     gpu.nouveau_release_process(B);
 }
+
+/// Each GPU context has its own RM client now, so a bind is no longer four
+/// handles in one client: the GEM object lives in the shared client (GEM_NEW
+/// knows nothing about contexts) and the VA space in the context's own. The RM
+/// bridges that by duping the object into the context's client and mapping the
+/// dup, and the unbind has to hand that dup back -- the handle exists in that
+/// one client, so a free naming any other frees nothing or frees the wrong
+/// thing. The fake RM counts either mistake as `bad`, which is what makes this
+/// test about the bookkeeping and not about the fake.
+#[test]
+fn a_bind_into_a_clients_own_context_dups_the_object_in_and_the_unbind_gives_it_back() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    channel_alloc(&gpu, A).unwrap();
+    let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    const VA: u64 = 0x3f_f000_0000;
+    assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, VA, 65536)]), Ok(0));
+    let ctx = ctx_of(&gpu, A).expect("A got a context of its own").0;
+    assert_ne!(ctx, 0, "A is not the compositor");
+
+    let (h_virt, h_dup) = {
+        let f = FAKE_RM.lock();
+        assert_eq!(f.maps.len(), 1);
+        assert_eq!(f.maps[0].1, ctx, "mapped in A's context");
+        (f.maps[0].0, f.maps[0].7)
+    };
+    assert_ne!(h_dup, 0, "the object was duped into A's client");
+    assert_ne!(h_dup, h_virt, "the dup is not the virtual range");
+
+    // The driver keeps both handles AND the context with the mapping, rather
+    // than deriving the context from the pid later: by teardown time the pid
+    // may have no context at all.
+    {
+        let maps = gpu.nouveau_vm_mappings.lock();
+        let m = maps.iter().find(|m| m.va == VA).expect("recorded");
+        assert_eq!((m.h_virt, m.h_dup, m.ctx_idx), (h_virt, h_dup, ctx));
+    }
+
+    gpu.nouveau_release_process(A);
+    assert!(FAKE_RM.lock().maps.is_empty(), "the mapping went with A");
+    assert_eq!(
+        FAKE_RM.lock().bad,
+        0,
+        "the unbind named A's context and its dup"
+    );
+}
+
+/// The compositor is the one context still on the shared ladder client, so a
+/// ctx-0 bind crosses no client and needs no dup. Keeping that case dup-free
+/// is not an optimisation: ctx 0 is the context whose failure takes the
+/// desktop with it, and it is left exactly as it was.
+#[test]
+fn a_compositor_bind_crosses_no_client_and_is_not_duped() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm_ladder();
+    let comp = 70_001u64;
+    channel_alloc(&gpu, comp).unwrap();
+    assert_eq!(ctx_of(&gpu, comp), None, "the compositor owns ctx 0 itself");
+    let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, comp)
+        .unwrap()
+        .handle;
+    assert_eq!(
+        vm_bind_ops(&gpu, comp, &mut [map(h, 0x3f_f000_0000, 65536)]),
+        Ok(0)
+    );
+    {
+        let f = FAKE_RM.lock();
+        assert_eq!(f.maps.len(), 1);
+        assert_eq!(f.maps[0].1, 0, "the compositor's context");
+        assert_eq!(f.maps[0].7, 0, "nothing to dup inside one client");
+    }
+    gpu.nouveau_release_process(comp);
+    assert_eq!(FAKE_RM.lock().bad, 0);
+}

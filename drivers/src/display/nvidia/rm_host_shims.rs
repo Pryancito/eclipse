@@ -626,8 +626,11 @@ pub(super) struct FakeRm {
     bufs: Vec<(u32, usize)>,
     /// Every submit, in order: `(ctx, push_va, push_len, fence payload)`.
     pub submits: Vec<(u32, u64, u32, Option<u32>)>,
-    /// `(h_virt, ctx, h_memory, va, size, bo_offset, pte_kind)`.
-    pub maps: Vec<(u32, u32, u32, u64, u64, u64, u32)>,
+    /// `(h_virt, ctx, h_memory, va, size, bo_offset, pte_kind, h_dup)`.
+    /// `h_dup` is the context client's reference to the object, which the
+    /// real RM dups in for any bind outside ctx 0 and which the unbind has to
+    /// hand back; 0 for a ctx-0 bind, which crosses no client.
+    pub maps: Vec<(u32, u32, u32, u64, u64, u64, u32, u32)>,
     /// `(h_object, ctx, class)`.
     pub classes: Vec<(u32, u32, u32)>,
     pub unmaps: usize,
@@ -1164,6 +1167,7 @@ extern "C" fn eclipse_rm_vm_bind_map(
             virt_status: 0,
             map_status: NV_ERR_OBJECT_NOT_FOUND,
             h_virt: 0,
+            h_dup: 0,
             actual_va: 0,
         }
     } else if f.refuse_map || f.va_taken(ctx_idx, va, size) {
@@ -1171,6 +1175,7 @@ extern "C" fn eclipse_rm_vm_bind_map(
             virt_status: RM_VA_TAKEN,
             map_status: RM_VA_TAKEN,
             h_virt: 0,
+            h_dup: 0,
             actual_va: 0,
         }
     } else {
@@ -1178,12 +1183,18 @@ extern "C" fn eclipse_rm_vm_bind_map(
             f.picked_va = va.wrapping_add((size + 0x1f_ffff) & !0x1f_ffff);
         }
         let h_virt = f.fresh();
-        f.maps
-            .push((h_virt, ctx_idx, h_memory, va, size, bo_offset, pte_kind));
+        // A bind outside ctx 0 crosses RM clients, so the real RM dups the
+        // object into the context's client and maps the dup. Model it, so a
+        // test can see the dup come back on the unbind.
+        let h_dup = if ctx_idx == 0 { 0 } else { f.fresh() };
+        f.maps.push((
+            h_virt, ctx_idx, h_memory, va, size, bo_offset, pte_kind, h_dup,
+        ));
         VmBind {
             virt_status: 0,
             map_status: 0,
             h_virt,
+            h_dup,
             actual_va: va,
         }
     };
@@ -1191,12 +1202,27 @@ extern "C" fn eclipse_rm_vm_bind_map(
     NV_OK
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_vm_bind_unmap(_inst: u32, h_virt: u32, _size: u64, _va: u64) -> u32 {
+extern "C" fn eclipse_rm_vm_bind_unmap(
+    _inst: u32,
+    ctx_idx: u32,
+    h_virt: u32,
+    h_dup: u32,
+    _size: u64,
+    _va: u64,
+) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("vm_bind_unmap");
     f.unmaps += 1;
     match f.maps.iter().position(|m| m.0 == h_virt) {
         Some(pos) => {
+            // The handles only exist in the context's own client, so a free
+            // naming the wrong context -- or forgetting the dup -- is the real
+            // RM freeing nothing, or the wrong object. Counted as bad rather
+            // than refused, so a caller that gets it wrong shows up in a test
+            // even though the status is still NV_OK.
+            if f.maps[pos].1 != ctx_idx || f.maps[pos].7 != h_dup {
+                f.bad += 1;
+            }
             f.maps.remove(pos);
             NV_OK
         }
@@ -1232,11 +1258,17 @@ extern "C" fn eclipse_rm_class_alloc(
     NV_OK
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_class_free(_inst: u32, h_object: u32) -> u32 {
+extern "C" fn eclipse_rm_class_free(_inst: u32, ctx_idx: u32, h_object: u32) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("class_free");
     match f.classes.iter().position(|c| c.0 == h_object) {
         Some(pos) => {
+            // Same as the unbind: the handle lives in the client of the
+            // context it was allocated for, so a free naming another context
+            // is a free in the wrong client.
+            if f.classes[pos].1 != ctx_idx {
+                f.bad += 1;
+            }
             f.classes.remove(pos);
             f.class_frees += 1;
             NV_OK
