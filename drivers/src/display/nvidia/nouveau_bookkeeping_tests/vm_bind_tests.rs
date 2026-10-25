@@ -696,27 +696,66 @@ fn a_bind_needs_the_ladder_not_somebody_holding_a_channel_right_now() {
          which NVK reports as `vm_bind failed: No such device`"
     );
     assert_eq!(ctx_of(&gpu, A).map(|t| t.0), Some(1), "its own context");
-    // And without a ladder there is genuinely nothing to bind into.
+    // And the ladder is not this caller's precondition either. It is context
+    // 0's VA space; context 1 has its own, built off its own client and
+    // device. Asking for it here was the next version of the same mistake:
+    // on the console GPU the ladder is built only after the desktop is up,
+    // so every client that started before it was refused.
     FAKE_RM.lock().ladder_built = false;
     assert_eq!(
         vm_bind_ops(&gpu, A, &mut [map(ha, 2 << 40, 65536)]),
-        Err(nv::ENODEV)
+        Ok(0),
+        "its own VA space does not depend on step16"
     );
+}
+
+/// The other half: the ladder IS context 0's VA space, so the one caller it
+/// is a precondition for is whoever really rides context 0. Without it that
+/// bind has nothing to bind into, and `ENODEV` is the honest answer.
+#[test]
+fn without_the_ladder_only_a_rider_of_context_0_is_refused() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm_ladder();
+    // After the gpu: its setup clears the flag, so a panicking test cannot
+    // leave the hatch open for the next one.
+    nv::set_compositor_ctx0(true);
+    let comp = 70_003u64;
+    channel_alloc(&gpu, comp).unwrap();
+    assert_eq!(ctx_of(&gpu, comp), None, "pinned to ctx 0");
+    let h = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, comp)
+        .unwrap()
+        .handle;
+    FAKE_RM.lock().ladder_built = false;
+    assert_eq!(
+        vm_bind_ops(&gpu, comp, &mut [map(h, 1 << 40, 65536)]),
+        Err(nv::ENODEV),
+        "context 0 has no VA space of its own without step16"
+    );
+    nv::set_compositor_ctx0(false);
 }
 
 #[test]
 fn the_ladder_a_bind_asks_about_is_the_one_on_its_own_card() {
     let _g = LOCK.lock();
     let _live = LiveBytes::hold();
-    let gpu = gpu_rm();
+    let gpu = gpu_rm_ladder();
     // The second card of a two-card box: the RM gave it device instance 1.
     *gpu.rm_device_instance.lock() = Some(1);
-    let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+    // Only a caller riding context 0 is asked about the ladder at all, so it
+    // is the one that can show WHICH card gets asked.
+    nv::set_compositor_ctx0(true);
+    let comp = 70_004u64;
+    channel_alloc(&gpu, comp).unwrap();
+    assert_eq!(ctx_of(&gpu, comp), None, "pinned to ctx 0");
+    let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, comp)
         .unwrap()
         .handle;
-    with_uvmm(&gpu, A);
     FAKE_RM.lock().gr_ready_asked_of = None;
-    assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, 1 << 40, 65536)]), Ok(0));
+    assert_eq!(
+        vm_bind_ops(&gpu, comp, &mut [map(ha, 1 << 40, 65536)]),
+        Ok(0)
+    );
     // The C flag is `g_grAllocDone[gpuInstance]`, one slot per card, because
     // each card builds its own client, device and VA space. So the question
     // has to name THIS card: hardcoding 0 reads the first card's ladder and
@@ -726,4 +765,5 @@ fn the_ladder_a_bind_asks_about_is_the_one_on_its_own_card() {
         Some(1),
         "asked about the card doing the bind"
     );
+    nv::set_compositor_ctx0(false);
 }

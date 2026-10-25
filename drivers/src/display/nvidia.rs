@@ -4949,15 +4949,12 @@ impl DrmScheme for NvidiaGpu {
         s.push_str("[gpustep14] --- stage 5: copy-engine data movement (gpustep10) ---\n");
         s.push_str(&self.bringup_step10());
         s.push_str(&self.dump_head_liveness("gpustep14", "post-stage5"));
-        s.push_str("[gpustep14] --- stage 6: GR allocation ladder (gpustep16) ---\n");
-        s.push_str(&self.bringup_step16());
-        s.push_str("[gpustep14] --- stage 7: compute channel on ladder (gpustep17) ---\n");
-        s.push_str(&self.bringup_step17());
-        if let Some(device_instance) = *self.rm_device_instance.lock() {
-            if let Ok(pa) = nvidia_rm_sys::rm_init::chan_notifier_pa(device_instance) {
-                super::nouveau_uapi::set_chan_notifier_pa(pa);
-            }
-        }
+        // The GR ladder (step16/step17) deliberately does NOT run here. This
+        // chain is what the deferred task drives with the scanout PARKED, and
+        // the ladder's golden-context load is minutes of GR work on the very
+        // card that scans out the screen. Building it inside that window cost
+        // the monitor once already; `build_console_gr_ladder` runs it after
+        // the pause lifts.
         s.push_str("[gpustep14] === console GPU bring-up chain complete (see per-stage results above) ===\n");
         s
     }
@@ -5081,21 +5078,45 @@ impl DrmScheme for NvidiaGpu {
                 self.gpu_model,
             );
         };
-        if !nvidia_rm_sys::rm_init::gr_ready(device_instance) {
-            let _ = self.bringup_step16();
-            let _ = self.bringup_step17();
-        }
-        let ladder_built = nvidia_rm_sys::rm_init::gr_ready(device_instance);
+        let _ = device_instance;
         alloc::format!(
-            "GPU consola {:02x}:{:02x}.0 {} lista (bring-up diferido) — present CE local, cursor HW y {}",
+            "GPU consola {:02x}:{:02x}.0 {} lista (bring-up diferido) — present CE local y cursor HW",
             self.pci_bus,
             self.pci_device,
             self.gpu_model,
-            if ladder_built {
-                "ladder GR construido (clientes con contexto propio y en nvidia-smi)"
-            } else {
-                "ladder GR NO construido"
-            }
+        )
+    }
+
+    fn build_console_gr_ladder(&self) -> String {
+        if !self.drives_boot_display() {
+            return String::new();
+        }
+        let Some(device_instance) = *self.rm_device_instance.lock() else {
+            return String::new();
+        };
+        if nvidia_rm_sys::rm_init::gr_ready(device_instance) {
+            return String::new();
+        }
+        let _ = self.bringup_step16();
+        let _ = self.bringup_step17();
+        if !nvidia_rm_sys::rm_init::gr_ready(device_instance) {
+            return alloc::format!(
+                "GPU consola {:02x}:{:02x}.0 {} — ladder GR NO construido: quien caiga al contexto 0 se queda en software",
+                self.pci_bus,
+                self.pci_device,
+                self.gpu_model,
+            );
+        }
+        // The ctx-0 channel's notifier page, which only exists once step17 has
+        // built that channel.
+        if let Ok(pa) = nvidia_rm_sys::rm_init::chan_notifier_pa(device_instance) {
+            super::nouveau_uapi::set_chan_notifier_pa(pa);
+        }
+        alloc::format!(
+            "GPU consola {:02x}:{:02x}.0 {} — ladder GR construido con el scanout ya corriendo",
+            self.pci_bus,
+            self.pci_device,
+            self.gpu_model,
         )
     }
 
@@ -12679,24 +12700,21 @@ impl NvidiaGpu {
                 // to initialize, and labwc's GLES2 renderer gives up for
                 // pixman -- a desktop on the CPU with the GPU sitting idle.
                 //
-                // The ladder flag is the honest precondition: sticky, set by
-                // step16, and unaffected by channels coming and going. Asked
-                // of THIS card, because ladders are per-GPU: each builds its
-                // own client, device and VA space, so a card whose step16
-                // never ran has nothing to bind into however many ladders
-                // stand on the other card. A card the RM never attached has
-                // no ladder by the same token, and no instance to ask about.
-                if !(*self.rm_device_instance.lock())
-                    .map(nvidia_rm_sys::rm_init::gr_ready)
-                    .unwrap_or(false)
-                {
-                    crate::klog_warn!(
-                        "[nouveau-uapi] VM_BIND: the GR ladder (step16) has never been built on \
-                         this GPU, so no VA space exists to bind into. Attach the RM \
-                         (/proc/gpustep14) and CHANNEL_ALLOC again."
-                    );
-                    return Err(nv::ENODEV);
-                }
+                // Asking for the LADDER here was the next version of the same
+                // mistake. The ladder is the VA space of context 0 only; a
+                // caller with its own context has its own, built off its own
+                // client and device, and needs nothing of step16's. On the
+                // console GPU the ladder is built after the desktop is up
+                // (`build_console_gr_ladder`, outside the scanout-paused
+                // window), so this guard refused every bind of every client
+                // that started before it -- the compositor included -- and the
+                // same cascade followed: ENODEV, VK_ERROR_DEVICE_LOST, pixman.
+                //
+                // The precondition that is actually true of both routes is
+                // that THIS card's RM is attached; it is checked where
+                // `device_instance` is taken, just below. The ladder is then
+                // required only of whoever really ends up on context 0, once
+                // the context is known.
                 let req = unsafe { &*(arg as *const nv::DrmNouveauVmBind) };
                 // NVK's bind context (`vkQueueBindSparse`) submits every
                 // sparse bind as an ASYNC VM_BIND carrying the semaphores
@@ -12882,6 +12900,18 @@ impl NvidiaGpu {
                 // the compositor or hand ctx 0's VAS to a stranger.
                 let is_compositor = self.ctx0_is_owner(owner_pid);
                 let (ctx_idx, _, _) = self.ensure_ctx_for_pid(owner_pid, is_compositor);
+                // Context 0's VA space IS the step16 ladder, so only a caller
+                // that ended up there needs it to exist. A caller with its own
+                // context binds into its own VA space and is not asked.
+                if ctx_idx == 0 && !nvidia_rm_sys::rm_init::gr_ready(device_instance) {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] VM_BIND: pid={} rides context 0 and this GPU's GR ladder \
+                         (step16) has never been built, so context 0 has no VA space to bind \
+                         into. Retry once the console GPU's ladder is up.",
+                        owner_pid
+                    );
+                    return Err(nv::ENODEV);
+                }
                 for (i, op) in ops.iter().enumerate() {
                     if let Err(e) = self.vm_bind_op(device_instance, ctx_idx, owner_pid, op) {
                         if req.op_count > 1 {

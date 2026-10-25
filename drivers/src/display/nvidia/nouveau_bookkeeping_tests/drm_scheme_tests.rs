@@ -784,3 +784,157 @@ fn page_flip_with_hwflip_refuses_what_the_copy_engine_cannot_copy() {
     }
     gpu.nouveau_release_process(A);
 }
+
+/// The live lines of one method of `nvidia.rs`: from its `fn` line to the
+/// next method at the same indentation, with comment lines dropped. The
+/// comments matter here -- the one that replaced the ladder inside
+/// `bringup_step14` names both steps it must not call, so a comment has to
+/// be unable to answer the question. Per method rather than a search of the
+/// whole file for the same reason three methods below mention the same two
+/// calls: only one of them may make them.
+fn live_method_lines(name: &str) -> String {
+    let src = include_str!("../../nvidia.rs");
+    let head = alloc::format!("    fn {}(", name);
+    let lines: alloc::vec::Vec<&str> = src.lines().collect();
+    let starts: alloc::vec::Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with(&head))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        starts.len(),
+        1,
+        "expected exactly one `fn {}` in nvidia.rs",
+        name
+    );
+    let start = starts[0];
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.starts_with("    fn ") || l.starts_with("    pub fn "))
+        .map(|p| start + 1 + p)
+        .unwrap_or(lines.len());
+    let mut out = String::new();
+    for line in &lines[start + 1..end] {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    assert!(!out.is_empty(), "`fn {}` has no body left to read", name);
+    out
+}
+
+/// WHERE the console GPU's GR ladder is built, which is the whole lesson of
+/// two lost monitors. `bringup_step14` is the chain the deferred task drives
+/// with the scanout PARKED by a timeout, and the ladder's cold
+/// golden-context load is GR work on the very card that scans out the
+/// screen: inside that window it took the display out twice and was
+/// reverted twice. It belongs in `build_console_gr_ladder`, which `zCore`
+/// calls after it has unpaused the scanout. `auto_bringup_compute` does
+/// build the ladder and that is fine -- it returns early for the console
+/// GPU, so it only ever runs on a card nobody is watching, which is why
+/// this test also checks that early return is still there.
+#[test]
+fn the_console_gr_ladder_is_built_outside_the_window_with_the_scanout_parked() {
+    for method in ["bringup_step14", "deferred_console_bringup"] {
+        let body = live_method_lines(method);
+        for call in [
+            "bringup_step16",
+            "bringup_step17",
+            "rm_init::step16",
+            "rm_init::step17",
+        ] {
+            assert!(
+                !body.contains(call),
+                "`{}` calls `{}`, and the scanout is parked in there",
+                method,
+                call
+            );
+        }
+    }
+    let ladder = live_method_lines("build_console_gr_ladder");
+    for call in ["bringup_step16", "bringup_step17"] {
+        assert!(
+            ladder.contains(call),
+            "`build_console_gr_ladder` no longer calls `{}`, so nothing builds \
+             the console GPU's ladder and every client falls to a context 0 \
+             with no VA space",
+            call
+        );
+    }
+    assert!(
+        live_method_lines("auto_bringup_compute").contains("drives_boot_display"),
+        "`auto_bringup_compute` builds the ladder too and must keep skipping \
+         the console GPU"
+    );
+}
+
+/// The same split, run rather than read: `deferred_console_bringup` brings
+/// the card up and builds no ladder, and `build_console_gr_ladder` builds
+/// one and caches the channel's notifier page. The second call does nothing
+/// -- `gr_ready` is the C side's own `g_grAllocDone`, so a ladder that
+/// stands is not rebuilt behind a live context 0.
+#[test]
+fn deferred_console_bringup_leaves_the_ladder_to_build_console_gr_ladder() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    let saved_fb = *BOOT_FB_INFO.lock();
+    set_boot_fb_info(0x1000, 1920, 1080, 1920 * 4);
+    assert!(
+        gpu.drives_boot_display(),
+        "this GPU's BAR1 holds the boot framebuffer"
+    );
+    {
+        let mut f = FAKE_RM.lock();
+        f.ladder = true;
+        f.ladder_built = false;
+        f.chan_built = false;
+        f.calls.clear();
+    }
+
+    let parked = gpu.deferred_console_bringup();
+    assert!(parked.contains("lista (bring-up diferido)"), "{}", parked);
+    let during = FAKE_RM.lock().calls.clone();
+    assert!(
+        !during.iter().any(|c| *c == "step16" || *c == "step17"),
+        "the ladder was built with the scanout parked: {:?}",
+        during
+    );
+    assert!(
+        !FAKE_RM.lock().ladder_built,
+        "and context 0 still has no VA space, by design"
+    );
+
+    let after = gpu.build_console_gr_ladder();
+    assert!(after.contains("ladder GR construido"), "{}", after);
+    let built = FAKE_RM.lock().calls.clone();
+    assert!(
+        built.contains(&"step16") && built.contains(&"step17"),
+        "{:?}",
+        built
+    );
+    assert!(
+        built.contains(&"chan_notifier_pa"),
+        "the EXEC failure path reads that page: {:?}",
+        built
+    );
+    assert!(
+        FAKE_RM.lock().ladder_built,
+        "now context 0 has a VA space to bind into"
+    );
+
+    FAKE_RM.lock().calls.clear();
+    assert_eq!(
+        gpu.build_console_gr_ladder(),
+        String::new(),
+        "a ladder that stands is not rebuilt"
+    );
+    let again = FAKE_RM.lock().calls.clone();
+    assert!(again.is_empty(), "{:?}", again);
+
+    nv::set_chan_notifier_pa(0);
+    *BOOT_FB_INFO.lock() = saved_fb;
+}
