@@ -78,7 +78,7 @@ fn what_the_word_sends_us_to_look_for_is_there() {
     assert!(thread.has_deliverable_signal());
     let got = thread.lock_linux().handle_signal();
     assert_eq!(
-        got.map(|(s, _)| s),
+        got.map(|(s, _, _)| s),
         Some(Signal::SIGINT),
         "the word promised a signal and the lock found none"
     );

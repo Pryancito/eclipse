@@ -3945,6 +3945,21 @@ impl LinuxProcess {
         self.refresh_exit_path(&inner);
     }
 
+    /// Throw away those of `set` waiting on the process, with their
+    /// `siginfo_t`: the stops a `SIGCONT` cancels, and the continue a stop
+    /// does (`prepare_signal` flushes `shared_pending` as well as each
+    /// thread's).
+    pub fn discard_shared_signals(&self, set: Sigset) {
+        let mut inner = self.inner.lock();
+        let mut rest = Sigset::new(inner.shared_pending.val() & set.val());
+        while let Some(signal) = rest.find_first_signal() {
+            rest.remove(signal);
+            inner.shared_pending.remove(signal);
+            inner.shared_pending_info.remove(&(signal as u8));
+        }
+        self.refresh_exit_path(&inner);
+    }
+
     /// Process-directed signals not yet pulled onto any thread (`shared_pending`).
     pub fn shared_pending(&self) -> Sigset {
         self.inner.lock().shared_pending
@@ -5565,7 +5580,7 @@ pub fn check_signals_of(thread: &Arc<Thread>) -> LxResult<()> {
                 }
                 if discard.is_not_empty() {
                     if let Some(mut linux_thread) = thread.try_lock_linux() {
-                        linux_thread.signals.remove_set(&discard);
+                        linux_thread.discard_signals(discard);
                     }
                 }
             }
@@ -6146,11 +6161,25 @@ pub fn pending_after_send(mut pending: Sigset, signal: LinuxSignal) -> Sigset {
 /// `SIGCONT` aimed at one thread flushes the pending stop of the whole group.
 /// The thread-directed path did not call this at all -- see
 /// [`complete_signal_for_job_control`].
+///
+/// The process's own pending set too, where a signal every thread blocks
+/// waits: only the threads' were flushed, so a `SIGTSTP` blocked when a
+/// `SIGCONT` came still stopped the process once it was unblocked. And each
+/// signal goes with its `siginfo_t`, which stayed behind for the next one
+/// of that number to be reported with.
 pub fn prepare_signal(process: &Arc<Process>, signal: LinuxSignal) {
     use crate::thread::ThreadExt;
+    let all = Sigset::new(u64::MAX);
+    let cancelled = Sigset::new(!pending_after_send(all, signal).val());
+    if cancelled.is_empty() {
+        return;
+    }
+    if let Some(lp) = process.try_linux() {
+        lp.discard_shared_signals(cancelled);
+    }
     for thread in process.threads() {
         if let Some(mut lt) = thread.try_lock_linux() {
-            lt.signals = pending_after_send(lt.signals, signal);
+            lt.discard_signals(cancelled);
         }
     }
 }
