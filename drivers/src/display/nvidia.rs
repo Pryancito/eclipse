@@ -425,6 +425,11 @@ fn surfaceflip_stats_line() -> String {
 /// and the line the boot prints about them live together. Out of this file
 /// for size only; a child module still reaches its private items.
 mod boot_fb;
+
+/// Bringing the console GPU up late, and the GR ladder its clients need
+/// afterwards. Out of this file for size only; a child module still reaches
+/// its private items.
+mod console_ladder;
 pub use boot_fb::set_boot_fb_info;
 use boot_fb::{boot_fb_phys, boot_fb_size, console_gpu_cold_line, BootFbInfo};
 
@@ -5092,31 +5097,31 @@ impl DrmScheme for NvidiaGpu {
         if !self.drives_boot_display() {
             return String::new();
         }
-        if self.rm_device_instance.lock().is_some() {
-            return alloc::format!(
-                "GPU consola {:02x}:{:02x}.0 {} ya state-loaded",
-                self.pci_bus,
-                self.pci_device,
-                self.gpu_model,
-            );
+        let already = self.rm_device_instance.lock().is_some();
+        if !already {
+            // One-shot: ensure_console_gpu_brought_up runs bringup_step14.
+            self.ensure_console_gpu_brought_up();
         }
-        // One-shot: ensure_console_gpu_brought_up runs bringup_step14.
-        self.ensure_console_gpu_brought_up();
-        if self.rm_device_instance.lock().is_some() {
-            alloc::format!(
-                "GPU consola {:02x}:{:02x}.0 {} lista (bring-up diferido) — present CE local y cursor HW",
-                self.pci_bus,
-                self.pci_device,
-                self.gpu_model,
-            )
-        } else {
-            alloc::format!(
+        let Some(device_instance) = *self.rm_device_instance.lock() else {
+            return alloc::format!(
                 "GPU consola {:02x}:{:02x}.0 {} sin RM tras bring-up diferido — se sigue con present por CPU y cursor software",
                 self.pci_bus,
                 self.pci_device,
                 self.gpu_model,
-            )
-        }
+            );
+        };
+        alloc::format!(
+            "GPU consola {:02x}:{:02x}.0 {} {} — present CE local y cursor HW; {}",
+            self.pci_bus,
+            self.pci_device,
+            self.gpu_model,
+            if already {
+                "ya state-loaded"
+            } else {
+                "lista (bring-up diferido)"
+            },
+            self.ensure_gr_ladder(device_instance),
+        )
     }
 
     fn ce_present(&self, src_sysmem_pa: u64, size: u64) -> bool {
@@ -8447,49 +8452,6 @@ impl NvidiaGpu {
                 Ok(_) => return Some(cur),
                 Err(actual) => cur = actual,
             }
-        }
-    }
-
-    fn ensure_console_gpu_brought_up(&self) {
-        // Secondary GPUs are already state-loaded at boot by
-        // `auto_bringup_compute`; only the console GPU is skipped there, so it is
-        // the one that still needs this on-demand path.
-        if !self.drives_boot_display() {
-            return;
-        }
-        // Default OFF: safer boot. Opt in with `nvidia.console_gsp`.
-        if !super::nouveau_uapi::console_gsp_enabled() {
-            return;
-        }
-        // Already up — the steady-state fast path (brief lock, no boot).
-        if self.rm_device_instance.lock().is_some() {
-            return;
-        }
-        // One attempt, ever.
-        if self.auto_bringup_done.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        crate::klog_warn!(
-            "[auto-bringup] console GPU not attached; running the full bring-up \
-             automatically on first GPU client (attach -> GSP boot -> state-load \
-             -> CE) so EXEC works without `cat /proc/gpustep14`"
-        );
-        // step14 self-guards to the console GPU and chains step5/boot/8/9/10; its
-        // internal live-echo streams each stage to the console, so a wedge leaves
-        // its last stage visible even though this call would then never return.
-        let report = self.bringup_step14();
-        for line in report.lines() {
-            crate::klog_warn!("[auto-bringup] {}", line);
-        }
-        if self.rm_device_instance.lock().is_some() {
-            crate::klog_warn!(
-                "[auto-bringup] console GPU RM-attached and state-loaded — EXEC enabled"
-            );
-        } else {
-            crate::klog_warn!(
-                "[auto-bringup] console GPU bring-up did NOT attach the RM; \
-                 GEM/VM_BIND/EXEC stay ENODEV until reboot (see the stage trail above)"
-            );
         }
     }
 
