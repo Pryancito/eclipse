@@ -30,6 +30,41 @@ const RX: MMUFlags = MMUFlags::READ
 /// Width of the words the backtrace scan walks in.
 const WORD: usize = core::mem::size_of::<usize>();
 
+/// A root address space that takes its mappings down before it is dropped.
+///
+/// A root VMAR hands its hosted address-space window back in its `Drop`,
+/// and `Drop::drop` runs BEFORE the fields it holds -- the mappings -- are
+/// dropped. So the window can be handed to another thread while this one's
+/// pages are still mapped in the host, and the new owner's `mmap` of them
+/// races our `munmap`: the mock memory then panics with
+/// `mprotect(EXECUTE) right after mmap found no mapping`. One red round in
+/// twelve at `--test-threads=32`, a different test each time.
+///
+/// Tearing the address space down inside the test closes that window, and
+/// it is what the rest of the tree's tests do already -- by way of
+/// `Process::exit`, which every test that borrows a process ends with. Here
+/// there is no process, so the teardown is the fixture's own.
+struct Aspace(Arc<VmAddressRegion>);
+
+impl Drop for Aspace {
+    fn drop(&mut self) {
+        self.0.destroy().expect("the root is ours and still usable");
+    }
+}
+
+impl core::ops::Deref for Aspace {
+    type Target = Arc<VmAddressRegion>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// An empty address space of its own, for one test.
+fn aspace() -> Aspace {
+    Aspace(VmAddressRegion::new_root())
+}
+
 /// Map `pages` pages of a VMO `vmo_pages` long, starting `vmo_offset` bytes
 /// into it, naming the VMO unless `name` is empty. Returns where it landed.
 ///
@@ -86,7 +121,7 @@ fn halves(line: &str) -> (&str, &str) {
 /// it rather than calling it an address nobody mapped.
 #[test]
 fn a_null_fault_is_named_null_and_not_unmapped() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let at = map(&vmar, "libc.so", 1, 0, 1, RX);
     assert_eq!(describe_addr(&vmar, 0), "null");
     assert_ne!(
@@ -102,7 +137,7 @@ fn a_null_fault_is_named_null_and_not_unmapped() {
 /// but the first -- is the whole reason the column exists.
 #[test]
 fn an_address_in_a_mapping_is_named_by_its_file_offset() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let at = map(&vmar, "libc.so", 2, PAGE_SIZE, 1, RX);
     assert_eq!(
         describe_addr(&vmar, at + 0x40),
@@ -120,7 +155,7 @@ fn an_address_in_a_mapping_is_named_by_its_file_offset() {
 /// the column empty.
 #[test]
 fn an_address_in_anonymous_memory_is_named_anon() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let at = a_stack(&vmar, 1);
     assert_eq!(
         describe_addr(&vmar, at + 8),
@@ -133,7 +168,7 @@ fn an_address_in_anonymous_memory_is_named_anon() {
 /// crash to the wrong library.
 #[test]
 fn the_last_byte_of_a_mapping_is_in_it_and_the_next_one_is_not() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let at = map(&vmar, "libc.so", 1, 0, 1, RX);
     assert!(
         describe_addr(&vmar, at + PAGE_SIZE - 1).starts_with("libc.so+"),
@@ -148,7 +183,7 @@ fn the_last_byte_of_a_mapping_is_in_it_and_the_next_one_is_not() {
 /// separates a wild pointer from a permission the mapping never carried.
 #[test]
 fn an_address_nobody_mapped_is_named_unmapped() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let at = map(&vmar, "libc.so", 1, 0, 1, RX);
     assert_eq!(describe_addr(&vmar, at + 0x1000_0000), "unmapped");
 }
@@ -160,7 +195,7 @@ fn an_address_nobody_mapped_is_named_unmapped() {
 /// not is ours. The two have opposite fixes.
 #[test]
 fn a_mapped_page_reports_the_record_and_the_page_table_separately() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let at = a_stack(&vmar, 1);
     let line = describe_fault_perms(&vmar, at);
     let (perm, pte) = halves(&line);
@@ -181,7 +216,7 @@ fn a_mapped_page_reports_the_record_and_the_page_table_separately() {
 /// dropped a page, and there is no page.
 #[test]
 fn a_hole_claims_no_access_right_in_either_half() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let at = a_stack(&vmar, 1);
     let line = describe_fault_perms(&vmar, at + 0x1000_0000);
     for right in ["READ", "WRITE", "EXECUTE"] {
@@ -200,7 +235,7 @@ fn a_hole_claims_no_access_right_in_either_half() {
 /// address, so writable data and unmapped holes have to answer no.
 #[test]
 fn only_a_mapped_executable_page_counts_as_executable() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let code = map(&vmar, "libc.so", 1, 0, 1, RX);
     let stack = a_stack(&vmar, 1);
     assert!(addr_is_executable(&vmar, code), "code is executable");
@@ -216,7 +251,7 @@ fn only_a_mapped_executable_page_counts_as_executable() {
 /// This is the shape musl builds every thread stack in.
 #[test]
 fn a_partial_mprotect_leaves_only_one_of_the_two_pages_executable() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let code = map(&vmar, "libc.so", 2, 0, 2, RX);
     vmar.protect(code, PAGE_SIZE, RW)
         .expect("the mapping was made with RXW permissions");
@@ -240,7 +275,7 @@ fn a_partial_mprotect_leaves_only_one_of_the_two_pages_executable() {
 /// itself, and the name and FILE offset of the mapping it points into.
 #[test]
 fn a_frame_names_the_word_the_address_and_the_file_offset() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let code = map(&vmar, "libc.so", 2, PAGE_SIZE, 1, RX);
     let stack = a_stack(&vmar, 1);
     put_word(&vmar, stack, 3, code + 0x40);
@@ -259,7 +294,7 @@ fn a_frame_names_the_word_the_address_and_the_file_offset() {
 /// An executable mapping with no name is rendered `anon`, like a data one.
 #[test]
 fn a_frame_in_unnamed_executable_memory_is_rendered_as_anon() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let code = map(&vmar, "", 1, 0, 1, RX);
     let stack = a_stack(&vmar, 1);
     put_word(&vmar, stack, 0, code + 0x10);
@@ -277,7 +312,7 @@ fn a_frame_in_unnamed_executable_memory_is_rendered_as_anon() {
 /// data: rendering either would bury the frames that are real.
 #[test]
 fn a_word_that_is_not_a_code_address_is_not_a_frame() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let code = map(&vmar, "libc.so", 1, 0, 1, RX);
     let stack = a_stack(&vmar, 1);
     put_word(&vmar, stack, 0, code + 0x1000_0000);
@@ -300,7 +335,7 @@ fn a_word_that_is_not_a_code_address_is_not_a_frame() {
 /// data too, even though its mapping began as code.
 #[test]
 fn a_word_pointing_into_the_unexecutable_half_of_a_mapping_is_not_a_frame() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let code = map(&vmar, "libc.so", 2, 0, 2, RX);
     let stack = a_stack(&vmar, 1);
     vmar.protect(code, PAGE_SIZE, RW).expect("RXW permissions");
@@ -325,7 +360,7 @@ fn a_word_pointing_into_the_unexecutable_half_of_a_mapping_is_not_a_frame() {
 /// stands, every word in the scan comes out shifted and no frame matches.
 #[test]
 fn an_unaligned_stack_pointer_is_read_from_the_word_below_it() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let code = map(&vmar, "libc.so", 1, 0, 1, RX);
     let stack = a_stack(&vmar, 1);
     put_word(&vmar, stack, 1, code + 0x10);
@@ -343,7 +378,7 @@ fn an_unaligned_stack_pointer_is_read_from_the_word_below_it() {
 /// found and the next one along is never read.
 #[test]
 fn the_scan_reads_the_last_word_of_its_budget_and_not_the_one_after() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let code = map(&vmar, "libc.so", 1, 0, 1, RX);
     let stack = a_stack(&vmar, 2);
     put_word(&vmar, stack, BACKTRACE_SCAN_WORDS - 1, code + 0x10);
@@ -362,7 +397,7 @@ fn the_scan_reads_the_last_word_of_its_budget_and_not_the_one_after() {
         trace[0]
     );
 
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let code = map(&vmar, "libc.so", 1, 0, 1, RX);
     let stack = a_stack(&vmar, 2);
     put_word(&vmar, stack, BACKTRACE_SCAN_WORDS, code + 0x10);
@@ -377,7 +412,7 @@ fn the_scan_reads_the_last_word_of_its_budget_and_not_the_one_after() {
 /// when the stack has more candidates than that.
 #[test]
 fn the_trace_stops_at_the_frames_a_console_can_show() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let code = map(&vmar, "libc.so", 1, 0, 1, RX);
     let stack = a_stack(&vmar, 2);
     for i in 0..BACKTRACE_MAX_FRAMES + 6 {
@@ -399,7 +434,7 @@ fn the_trace_stops_at_the_frames_a_console_can_show() {
 /// that left `sp` one word below the top still gets its one word read.
 #[test]
 fn a_scan_that_starts_one_word_from_the_top_reads_that_word_and_stops() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let code = map(&vmar, "libc.so", 1, 0, 1, RX);
     let stack = a_stack(&vmar, 1);
     let last = PAGE_SIZE / WORD - 1;
@@ -423,7 +458,7 @@ fn a_scan_that_starts_one_word_from_the_top_reads_that_word_and_stops() {
 /// faulting the kernel inside the report of a fault.
 #[test]
 fn a_stack_pointer_nobody_mapped_yields_no_trace() {
-    let vmar = VmAddressRegion::new_root();
+    let vmar = aspace();
     let code = map(&vmar, "libc.so", 1, 0, 1, RX);
     let stack = a_stack(&vmar, 1);
     put_word(&vmar, stack, 0, code + 0x10);
