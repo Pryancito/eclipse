@@ -1694,11 +1694,8 @@ impl DrmDev {
                 // such an x fell out of the viewport check (ENOSPC, only
                 // with a mode) and was not read at all without one.
                 if req.x & 0xffff_0000 != 0 || req.y & 0xffff_0000 != 0 {
-                    return Err(setcrtc_refused(
-                        "x/y above 16.16",
-                        req.crtc_id,
-                        FsError::OutOfRange,
-                    ));
+                    let e = FsError::OutOfRange;
+                    return Err(kms_refused("SETCRTC", req.crtc_id, "x/y above 16.16", e));
                 }
                 // `drm_mode_setcrtc` then finds the CRTC before anything else
                 // (ENOENT), refuses a connector list with no mode or no fb to
@@ -1708,9 +1705,11 @@ impl DrmDev {
                 // went to the one it has, and a connector list of any content
                 // was accepted unread.
                 let Some(crtc) = drm::get_crtc(req.crtc_id) else {
-                    return Err(setcrtc_refused(
-                        "no such CRTC (the synthetic one needs a primary display)",
+                    let why = "no such CRTC (the synthetic one needs a primary display)";
+                    return Err(kms_refused(
+                        "SETCRTC",
                         req.crtc_id,
+                        why,
                         FsError::EntryNotFound,
                     ));
                 };
@@ -1769,19 +1768,19 @@ impl DrmDev {
                 // the CRTC, so GETCRTC reported a mode the connector's
                 // CRTC_ID never had.
                 if req.count_connectors == 0 && req.mode_valid != 0 {
-                    return Err(setcrtc_refused(
-                        "a mode with no connectors",
+                    let e = FsError::InvalidParam;
+                    return Err(kms_refused(
+                        "SETCRTC",
                         req.crtc_id,
-                        FsError::InvalidParam,
+                        "a mode, no connectors",
+                        e,
                     ));
                 }
                 if req.count_connectors > 0 {
                     if req.mode_valid == 0 || fb_id == 0 {
-                        return Err(setcrtc_refused(
-                            "connectors with no mode or no fb",
-                            req.crtc_id,
-                            FsError::InvalidParam,
-                        ));
+                        let why = "connectors with no mode or no fb";
+                        let e = FsError::InvalidParam;
+                        return Err(kms_refused("SETCRTC", req.crtc_id, why, e));
                     }
                     let connectors = drm::get_resources().2;
                     if req.count_connectors as usize > connectors.len() {
@@ -1796,11 +1795,9 @@ impl DrmDev {
                         // answerable beside a card that owns the resource
                         // list, like its CRTC does.
                         if drm::get_connector(id).is_none() {
-                            return Err(setcrtc_refused(
-                                "no such connector in the list",
-                                req.crtc_id,
-                                FsError::EntryNotFound,
-                            ));
+                            let why = "no such connector in the list";
+                            let e = FsError::EntryNotFound;
+                            return Err(kms_refused("SETCRTC", req.crtc_id, why, e));
                         }
                     }
                 }
@@ -1842,7 +1839,7 @@ impl DrmDev {
                     // atomic client starting after this read a mode and an
                     // active CRTC the legacy readback said were gone.
                     drm::legacy_pipe_off();
-                    setcrtc_disabled(req.crtc_id);
+                    kms_disabled(req.crtc_id);
                 }
                 Ok(0)
             }
@@ -2199,7 +2196,8 @@ impl DrmDev {
                     // nothing to say the fb id was the problem -- the same
                     // unknown-fb id that `SETCRTC` was failing on, wearing a
                     // different errno.
-                    Err(FsError::EntryNotFound)
+                    let e = FsError::EntryNotFound;
+                    Err(kms_refused("GETFB", cmd.fb_id, "no such fb", e))
                 }
             }
             DRM_IOCTL_MODE_GETFB2 => {
@@ -2524,13 +2522,15 @@ impl DrmDev {
                 // success having done nothing, so a client whose request
                 // named no operation was never told.
                 if cur.flags == 0 || cur.flags & !DRM_MODE_CURSOR_FLAGS != 0 {
-                    return Err(FsError::InvalidParam);
+                    let e = FsError::InvalidParam;
+                    return Err(kms_refused("CURSOR", cur.crtc_id, "no/unknown flag", e));
                 }
                 // Then it finds the CRTC: "Unknown CRTC ID" is ENOENT. The
                 // id was not looked at, so a cursor aimed at a CRTC that does
                 // not exist moved the one that does.
                 if drm::get_crtc(cur.crtc_id).is_none() {
-                    return Err(FsError::EntryNotFound);
+                    let e = FsError::EntryNotFound;
+                    return Err(kms_refused("CURSOR", cur.crtc_id, "no such CRTC", e));
                 }
                 let mut changed = false;
                 if cur.flags & DRM_MODE_CURSOR_BO != 0 {
@@ -2548,7 +2548,8 @@ impl DrmDev {
                             || cur.width > drm::MAX_CURSOR_DIM
                             || cur.height > drm::MAX_CURSOR_DIM)
                     {
-                        return Err(FsError::InvalidParam);
+                        let e = FsError::InvalidParam;
+                        return Err(kms_refused("CURSOR", cur.crtc_id, "bad bitmap size", e));
                     }
                     // Linux builds a framebuffer over the handle
                     // (`drm_mode_cursor_universal`): a handle this file does
@@ -3846,8 +3847,8 @@ mod pre_wait_account;
 use pre_wait_account::PreWaitAccount;
 /// The sleep behind a blocking `WAIT_VBLANK`; own file for the size ceiling.
 mod wait_vblank_sleep;
+use legacy_disable_trace::{kms_disabled, kms_refused};
 use present_failed::{present_failed, PRESENT_FAIL_TRACED};
-use setcrtc_refused::{setcrtc_disabled, setcrtc_refused};
 
 /// The parked microseconds a pre-wait reports, from how long it was alive and
 /// how many times it looked.
@@ -3952,8 +3953,8 @@ pub const ATOMIC_IOCTL: u32 = DRM_IOCTL_MODE_ATOMIC;
 /// its modeset at ~8 Hz for minutes, and a console flood on a slow serial line
 /// has wedged spinlocks here before (see the EXEC dedup in `nouveau_uapi.rs`).
 const PRESENT_FAIL_TRACE_BUDGET: u32 = 8;
+mod legacy_disable_trace;
 mod present_failed;
-mod setcrtc_refused;
 
 /// True for any of the four `SYNCOBJ_WAIT` / `TIMELINE_WAIT` ioctl numbers
 /// (classic + deadline-sized). Used by `sys_ioctl` to run
