@@ -34,6 +34,8 @@ pub(super) fn canonical_drm_ioctl(nr: u32) -> Option<u32> {
         0x06 => DRM_IOCTL_GET_STATS,
         0x07 => DRM_IOCTL_SET_VERSION,
         0x09 => DRM_IOCTL_GEM_CLOSE,
+        0x0A => DRM_IOCTL_GEM_FLINK,
+        0x0B => DRM_IOCTL_GEM_OPEN,
         0x0C => DRM_IOCTL_GET_CAP,
         0x0D => DRM_IOCTL_SET_CLIENT_CAP,
         0x10 => DRM_IOCTL_SET_UNIQUE,
