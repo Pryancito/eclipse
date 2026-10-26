@@ -2563,7 +2563,15 @@ impl DrmDev {
                         let Some((_, size)) =
                             drm::resolve_gem_backing_for(cur.handle, drm::current_pid())
                         else {
-                            return Err(FsError::EntryNotFound);
+                            // The one refusal a GPU desktop can reach: the
+                            // cursor's pixels are read through the physmap
+                            // window, so a bitmap with no host address --
+                            // a VRAM-only nouveau object, which is what a
+                            // card with a live render path hands out -- has
+                            // nowhere to be read from and is refused here.
+                            let why = "cursor bitmap has no host address (VRAM-only?)";
+                            let e = FsError::EntryNotFound;
+                            return Err(kms_refused("CURSOR", cur.crtc_id, why, e));
                         };
                         // The cursor's pixels are read from the physmap
                         // window, so this object needs a host address even
@@ -2571,7 +2579,9 @@ impl DrmDev {
                         zcore_drivers::scheme::gem_mmap::note_host_pa_handed_out(cur.handle);
                         let bytes = (cur.width as usize) * (cur.height as usize) * 4;
                         if size < bytes {
-                            return Err(FsError::InvalidParam);
+                            let why = "cursor bitmap smaller than width x height x 4";
+                            let e = FsError::InvalidParam;
+                            return Err(kms_refused("CURSOR", cur.crtc_id, why, e));
                         }
                     }
                     changed |= drm::set_cursor_bo(cur.handle, cur.width, cur.height);
