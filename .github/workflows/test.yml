@@ -39,6 +39,13 @@ jobs:
           # turns `elf` on because `linux-object` asks for it.
           cargo test -p zircon-object --lib --features libos,aspace-separate,elf
           cargo test -p zircon-syscall --features libos,zircon-object/aspace-separate
+          # `zcore-loader` is not a default member either, so the workspace
+          # pass above compiles none of it: 112 unit tests, among them every
+          # one that covers how a user trap becomes a signal and how this
+          # kernel's command line reaches the guest, had never run in CI.
+          # `--lib` on purpose: `tests/zircon.rs` and `tests/linux.rs` boot a
+          # whole guest and belong to the QEMU jobs, not to this one.
+          cargo test -p zcore-loader --lib
           # The kernel links `vendor/PreemptiveScheduler` (`[patch]` →
           # `executor`). The old pristine `vendor/preemptive-scheduler` copy
           # was merged away; this is the only tree. Single-threaded because
