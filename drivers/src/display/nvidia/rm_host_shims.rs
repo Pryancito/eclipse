@@ -1,20 +1,57 @@
 const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
 
+/// `gpumgrAttachGpu` (`gpustep5`): with `attach = Some(di)` the card
+/// attaches as RM device instance `di` and what the driver told the RM
+/// about it -- PCI location, the three BARs, the VRAM size it passes as
+/// BAR1's length -- is kept in `attached`. Without the knob, the stub's
+/// refusal.
 #[no_mangle]
 extern "C" fn eclipse_rm_attach_gpu(
-    _a0: u32,
-    _a1: u8,
-    _a2: u8,
-    _a3: u64,
-    _a4: *mut u8,
-    _a5: u64,
-    _a6: u64,
-    _a7: u64,
-    _a8: u64,
-    _a9: u64,
-    _a10: *mut u8,
+    domain: u32,
+    bus: u8,
+    device: u8,
+    bar0_phys: u64,
+    _bar0_virt: *mut u8,
+    bar0_len: u64,
+    bar1_phys: u64,
+    bar1_len: u64,
+    bar2_phys: u64,
+    bar2_len: u64,
+    out_device_instance: *mut u32,
 ) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+    let mut f = FAKE_RM.lock();
+    f.calls.push("attach_gpu");
+    f.narrate("attach_gpu");
+    let Some(di) = f.attach else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    f.attached.push(Attached {
+        domain,
+        bus,
+        device,
+        bar0_phys,
+        bar0_len,
+        bar1_phys,
+        bar1_len,
+        bar2_phys,
+        bar2_len,
+    });
+    unsafe { *out_device_instance = di };
+    NV_OK
+}
+
+/// What one `eclipse_rm_attach_gpu` was told, field for field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct Attached {
+    pub domain: u32,
+    pub bus: u8,
+    pub device: u8,
+    pub bar0_phys: u64,
+    pub bar0_len: u64,
+    pub bar1_phys: u64,
+    pub bar1_len: u64,
+    pub bar2_phys: u64,
+    pub bar2_len: u64,
 }
 /// The GIOPS bench: 2176 threads of a million IMADs each, 435.2 ms on
 /// the PTIMER, which is 5.000 GIOPS; `bench_zero_time` is a grid that
@@ -258,10 +295,63 @@ extern "C" fn eclipse_rm_exec_fast_release(_inst: u32, ctx_idx: u32) -> u32 {
     }
     NV_OK
 }
+/// The GSP's static info (`gpustep7`): `gsp_info = Some(name)` is a card
+/// the firmware calls `name` -- cut at the 64 bytes the C struct holds,
+/// with no terminator when it fills them -- with the short name, VRAM,
+/// L2 and VBIOS identity of the fake's TU106 (`GSP_*`); an empty name is
+/// the all-zero struct the RPC leaves until step 6 ran. Without the knob,
+/// the stub's refusal.
 #[no_mangle]
-extern "C" fn eclipse_rm_get_gsp_info(_a0: u32, _a1: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_get_gsp_info(_a0: u32, out: *mut nvidia_rm_sys::rm_init::GspInfo) -> u32 {
+    let name = {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("get_gsp_info");
+        f.narrate("get_gsp_info");
+        f.gsp_info
+    };
+    let Some(name) = name else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    let mut info = nvidia_rm_sys::rm_init::GspInfo {
+        gpu_name: [0; 64],
+        gpu_short_name: [0; 64],
+        fb_length: 0,
+        fb_bus_width: 0,
+        fb_ram_type: 0,
+        l2_cache_size: 0,
+        vbios_valid: 0,
+        vbios_sub_vendor: 0,
+        vbios_sub_device: 0,
+    };
+    if !name.is_empty() {
+        let n = name.len().min(64);
+        info.gpu_name[..n].copy_from_slice(&name.as_bytes()[..n]);
+        info.gpu_short_name[..GSP_SHORT_NAME.len()].copy_from_slice(GSP_SHORT_NAME.as_bytes());
+        info.fb_length = GSP_FB_BYTES;
+        info.fb_bus_width = GSP_BUS_WIDTH;
+        info.fb_ram_type = GSP_RAM_TYPE;
+        info.l2_cache_size = GSP_L2_BYTES;
+        info.vbios_valid = 1;
+        info.vbios_sub_vendor = GSP_SUB_VENDOR;
+        info.vbios_sub_device = GSP_SUB_DEVICE;
+    }
+    unsafe { *out = info };
+    NV_OK
 }
+
+/// The fake's card as its firmware describes it: a TU106 with 8 GiB on a
+/// 256-bit bus, 4 MiB of L2, and a board vendor's VBIOS.
+const GSP_SHORT_NAME: &str = "TU106";
+const GSP_FB_BYTES: u64 = 8 << 30;
+const GSP_BUS_WIDTH: u32 = 256;
+/// The RM's own enum value; the printer passes it through as a number.
+const GSP_RAM_TYPE: u32 = 11;
+const GSP_L2_BYTES: u32 = 4 << 20;
+const GSP_SUB_VENDOR: u32 = 0x1458;
+const GSP_SUB_DEVICE: u32 = 0x3fe2;
+/// What `GET_NAME_STRING` answers, and the GID the firmware hands out.
+const RM_API_NAME: &str = "NVIDIA GeForce RTX 2060 SUPER";
+const RM_API_GID: &str = "GPU-6f3c9a1e-2b4d-4e8f-9a7c-0d1e2f3a4b5c";
 #[no_mangle]
 extern "C" fn eclipse_rm_hdmi_audio(_a0: u32, _a1: u32, _a2: u32, _a3: u8, _a4: *mut u8) -> u32 {
     NV_ERR_NOT_SUPPORTED
@@ -446,10 +536,20 @@ extern "C" fn eclipse_rm_hwflip_surface(
 extern "C" fn eclipse_rm_hwflip_iso_builds() -> u64 {
     FAKE_HWFLIP.lock().iso_mems.len() as u64
 }
+/// The RM core's construction: `core` says it stands; otherwise the
+/// stub's refusal. Either way it is asked at most once per process
+/// (`rm_core_init_once`), so a test that wants it asked again resets
+/// that cache itself.
 #[no_mangle]
 extern "C" fn eclipse_rm_init_core() -> u32 {
-    FAKE_RM.lock().calls.push("init_core");
-    NV_ERR_NOT_SUPPORTED
+    let mut f = FAKE_RM.lock();
+    f.calls.push("init_core");
+    f.narrate("init_core");
+    if f.core {
+        NV_OK
+    } else {
+        NV_ERR_NOT_SUPPORTED
+    }
 }
 #[no_mangle]
 extern "C" fn eclipse_rm_init_gsp(_a0: u32, _a1: *const u8, _a2: u32) -> u32 {
@@ -524,13 +624,45 @@ extern "C" fn eclipse_rm_map_peer_fence(
     unsafe { *out = local };
     NV_OK
 }
+/// The console-GPU declaration: `console_mark = Some(status)` answers
+/// `status` and keeps what was declared in `console_marks`; without the
+/// knob, the stub's refusal.
 #[no_mangle]
-extern "C" fn eclipse_rm_mark_console_gpu(_a0: u32, _a1: u64, _a2: u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_mark_console_gpu(di: u32, console_size: u64, at_bar1_base: u8) -> u32 {
+    let mut f = FAKE_RM.lock();
+    f.calls.push("mark_console_gpu");
+    f.narrate("mark_console_gpu");
+    let Some(status) = f.console_mark else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    f.console_marks.push((di, console_size, at_bar1_base != 0));
+    status
 }
+/// `gpuStatePreInit`/`StateInit`/`StateLoad` (`gpustep9`): `state_init =
+/// Some((pre, init, load))` is the status of each phase, `0xFFFF_FFFF`
+/// for one never reached; without the knob, the stub's refusal.
 #[no_mangle]
-extern "C" fn eclipse_rm_state_init(_a0: u32, _a1: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_state_init(
+    _a0: u32,
+    out: *mut nvidia_rm_sys::rm_init::StateInitResult,
+) -> u32 {
+    let phases = {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("state_init");
+        f.narrate("state_init");
+        f.state_init
+    };
+    let Some((pre_init_status, init_status, load_status)) = phases else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    unsafe {
+        *out = nvidia_rm_sys::rm_init::StateInitResult {
+            pre_init_status,
+            init_status,
+            load_status,
+        };
+    }
+    NV_OK
 }
 /// Step 10, the copy-engine test: two 1 MiB buffers, the memsets always
 /// land; `Submitted` is a copy that timed out, `Fenced`/`Completed` a
@@ -915,9 +1047,46 @@ extern "C" fn eclipse_rm_step23(_a0: u32, out: *mut nvidia_rm_sys::rm_init::GrTh
     unsafe { *out = threads(ran, 32, true) };
     NV_OK
 }
+/// Step 8's three controls: `rm_api = Some((name, gid, fb))` is the
+/// status of each, and a control that answers `NV_OK` fills its fields --
+/// the card's name, a 40-byte GID, a heap of 8 GiB with 7.5 GiB free on
+/// a 256-bit bus. Without the knob, the stub's refusal.
 #[no_mangle]
-extern "C" fn eclipse_rm_step8(_a0: u32, _a1: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_step8(_a0: u32, out: *mut nvidia_rm_sys::rm_init::RmApiDemo) -> u32 {
+    let statuses = {
+        let mut f = FAKE_RM.lock();
+        f.calls.push("step8");
+        f.narrate("step8");
+        f.rm_api
+    };
+    let Some((name_status, gid_status, fb_status)) = statuses else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    let mut demo = nvidia_rm_sys::rm_init::RmApiDemo {
+        name_status,
+        name: [0; 64],
+        gid_status,
+        gid_length: 0,
+        gid: [0; 136],
+        fb_status,
+        heap_size_kb: 0,
+        heap_free_kb: 0,
+        bus_width: 0,
+    };
+    if name_status == NV_OK {
+        demo.name[..RM_API_NAME.len()].copy_from_slice(RM_API_NAME.as_bytes());
+    }
+    if gid_status == NV_OK {
+        demo.gid[..RM_API_GID.len()].copy_from_slice(RM_API_GID.as_bytes());
+        demo.gid_length = RM_API_GID.len() as u32;
+    }
+    if fb_status == NV_OK {
+        demo.heap_size_kb = 8 << 20;
+        demo.heap_free_kb = 7680 << 10;
+        demo.bus_width = GSP_BUS_WIDTH;
+    }
+    unsafe { *out = demo };
+    NV_OK
 }
 
 // ----- A fake RM with state, for the arms that cannot run without one -----
@@ -1106,6 +1275,24 @@ pub(super) struct FakeRm {
     pub compute: Option<Ran>,
     /// The bench grid ran but the PTIMER read 0 both times.
     pub bench_zero_time: bool,
+    /// `init_core` constructs the RM core instead of refusing.
+    pub core: bool,
+    /// `attach_gpu` attaches the card as this RM device instance.
+    pub attach: Option<u32>,
+    /// What every attach was told, in order.
+    pub attached: Vec<Attached>,
+    /// `get_gsp_info` answers a card of this name (`""` is the all-zero
+    /// struct of a GSP that has not booted).
+    pub gsp_info: Option<&'static str>,
+    /// `step8`'s three control statuses: name, GID, FB info.
+    pub rm_api: Option<(u32, u32, u32)>,
+    /// `state_init`'s three phase statuses: pre-init, init, load.
+    pub state_init: Option<(u32, u32, u32)>,
+    /// What `mark_console_gpu` answers.
+    pub console_mark: Option<u32>,
+    /// Every console declaration: `(device instance, console bytes, at
+    /// BAR1 base)`.
+    pub console_marks: Vec<(u32, u64, bool)>,
 }
 
 /// `ECLIPSE_CHAN_BUF_SIZE`: the channel's own buffer, pushbuffer and ring,
@@ -1195,6 +1382,14 @@ const EMPTY_RM: FakeRm = FakeRm {
     hwcursor: None,
     compute: None,
     bench_zero_time: false,
+    core: false,
+    attach: None,
+    attached: Vec::new(),
+    gsp_info: None,
+    rm_api: None,
+    state_init: None,
+    console_mark: None,
+    console_marks: Vec::new(),
 };
 
 pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);

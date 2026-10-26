@@ -528,7 +528,7 @@ fn the_hardware_ladder_says_not_supported_and_never_ok() {
     let answers = [
         (
             "attach_gpu",
-            eclipse_rm_attach_gpu(0, 0, 0, 0, p, 0, 0, 0, 0, 0, p),
+            eclipse_rm_attach_gpu(0, 0, 0, 0, p, 0, 0, 0, 0, 0, p.cast()),
         ),
         ("bench", eclipse_rm_bench(0, p.cast())),
         ("ce_blit", eclipse_rm_ce_blit(0, 0, 0, 0, p)),
@@ -542,9 +542,13 @@ fn the_hardware_ladder_says_not_supported_and_never_ok() {
         ("ce_release_inflight", eclipse_rm_ce_release_inflight()),
         ("ce_wait", eclipse_rm_ce_wait(0, 0)),
         ("edid", eclipse_rm_edid(0, p)),
-        ("get_gsp_info", eclipse_rm_get_gsp_info(0, p)),
+        ("get_gsp_info", eclipse_rm_get_gsp_info(0, p.cast())),
         ("hdmi_audio", eclipse_rm_hdmi_audio(0, 0, 0, 0, p)),
         ("hwcursor_hide", eclipse_rm_hwcursor_hide(0)),
+        ("init_core", eclipse_rm_init_core()),
+        ("mark_console_gpu", eclipse_rm_mark_console_gpu(0, 0, 0)),
+        ("state_init", eclipse_rm_state_init(0, p.cast())),
+        ("step8", eclipse_rm_step8(0, p.cast())),
     ];
     for (name, got) in answers {
         assert_eq!(got, NV_ERR_NOT_SUPPORTED, "{name} did not refuse");
