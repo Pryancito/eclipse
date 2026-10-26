@@ -7,18 +7,74 @@ pub type HandleValue = u32;
 pub const INVALID_HANDLE: HandleValue = 0;
 
 /// A Handle is how a specific process refers to a specific kernel object.
-#[derive(Debug, Clone)]
+///
+/// Every live `Handle` counts in its object's handle census, and the last one
+/// to go away fires the object's `on_handle_lost` tokens -- which is how a
+/// parked `zx_channel_call` is told its channel was closed. That is why
+/// `Clone` and `Drop` are written out here instead of derived, and why the
+/// count follows the `Handle` value and not the handle-table entry: a handle
+/// moved out of a table into a channel message is still a live handle, and
+/// Zircon leaves a pending call on such a channel alone.
+#[derive(Debug)]
 pub struct Handle {
     /// The object referred to by the handle.
     pub object: Arc<dyn KernelObject>,
     /// The handle's associated rights.
     pub rights: Rights,
+    /// Set while this handle is out of every handle table: taken out of one
+    /// and not yet put into another, which is what a handle in a channel
+    /// message is. Installing such a handle is a RE-HOME, and that is the
+    /// other thing that ends a parked `zx_channel_call` -- see
+    /// [`KObjectBase::on_handle_lost`].
+    detached: bool,
+}
+
+impl Clone for Handle {
+    fn clone(&self) -> Self {
+        self.object.handle_opened();
+        // A clone is a NEW handle. It inherits nothing of the original's
+        // place in a table, so it is never a re-home.
+        Handle {
+            object: self.object.clone(),
+            rights: self.rights,
+            detached: false,
+        }
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.object.handle_closed();
+    }
 }
 
 impl Handle {
     /// Create a new handle referring to the given object with given rights.
     pub fn new(object: Arc<dyn KernelObject>, rights: Rights) -> Self {
-        Handle { object, rights }
+        object.handle_opened();
+        Handle {
+            object,
+            rights,
+            detached: false,
+        }
+    }
+
+    /// Mark this handle as no longer living in any handle table.
+    ///
+    /// Called by the handle table when it hands the handle out, so that
+    /// putting it back somewhere else can be told apart from a handle that was
+    /// freshly created.
+    pub fn detach(&mut self) {
+        self.detached = true;
+    }
+
+    /// Put this handle back in a handle table, telling the object if it is
+    /// arriving from somewhere else rather than being brand new.
+    pub(crate) fn attach(&mut self) {
+        if self.detached {
+            self.detached = false;
+            self.object.handle_rehomed();
+        }
     }
 
     /// Get information about the provided handle and the object the handle refers to.
@@ -406,5 +462,93 @@ mod tests {
         let narrow = Handle::new(obj, Rights::READ);
         assert_eq!(narrow.get_info().rights, Rights::READ.bits());
         assert_ne!(narrow.get_info().rights, Rights::DEFAULT_JOB.bits());
+    }
+
+    /// The census counts live `Handle` VALUES, which is the whole point: a
+    /// handle taken out of a handle table and moved somewhere else -- into a
+    /// channel message, say -- is still a live handle, and must not look like
+    /// a close.
+    #[test]
+    fn the_census_counts_live_handles_and_a_move_is_not_a_close() {
+        let object = DummyObject::new();
+        assert_eq!(object.base.handle_count(), 0);
+
+        let handle = Handle::new(object.clone() as Arc<dyn KernelObject>, Rights::READ);
+        assert_eq!(object.base.handle_count(), 1);
+
+        let peek = handle.clone();
+        assert_eq!(object.base.handle_count(), 2, "a clone is another handle");
+        drop(peek);
+        assert_eq!(object.base.handle_count(), 1);
+
+        // Moved, not closed: out of its binding, through a container, back
+        // out again. The count never moves.
+        let parked = alloc::vec![handle];
+        assert_eq!(object.base.handle_count(), 1);
+        let handle = parked.into_iter().next().unwrap();
+        assert_eq!(object.base.handle_count(), 1);
+
+        drop(handle);
+        assert_eq!(object.base.handle_count(), 0);
+    }
+
+    /// And the token: it fires on the close and stays quiet through the move.
+    #[test]
+    fn the_zero_handle_token_fires_on_the_last_close_only() {
+        let object = DummyObject::new();
+        let handle = Handle::new(object.clone() as Arc<dyn KernelObject>, Rights::READ);
+        let mut token = object.base.on_handle_lost();
+
+        let moved = alloc::vec![handle];
+        assert_eq!(token.try_recv(), Ok(None), "a move is not a close");
+
+        let handle = moved.into_iter().next().unwrap();
+        let second = handle.clone();
+        drop(handle);
+        assert_eq!(
+            token.try_recv(),
+            Ok(None),
+            "one of two handles closing is not the last one"
+        );
+
+        drop(second);
+        assert_eq!(token.try_recv(), Ok(Some(())), "that was the last handle");
+    }
+
+    /// Asking an object that already has no handles answers a token that has
+    /// already fired. Without this, a caller that looks an object up by some
+    /// other route and then asks would wait on a count that can never move
+    /// again -- forever, since the deadline of a `zx_channel_call` may be
+    /// infinite.
+    #[test]
+    fn a_token_asked_for_too_late_has_already_fired() {
+        let object = DummyObject::new();
+        drop(Handle::new(
+            object.clone() as Arc<dyn KernelObject>,
+            Rights::READ,
+        ));
+        assert_eq!(object.base.handle_count(), 0);
+        assert_eq!(object.base.on_handle_lost().try_recv(), Ok(Some(())));
+    }
+
+    /// Two objects keep two censuses: closing every handle to one says
+    /// nothing about the other.
+    #[test]
+    fn the_census_is_per_object() {
+        let first = DummyObject::new();
+        let second = DummyObject::new();
+        let keep = Handle::new(second.clone() as Arc<dyn KernelObject>, Rights::READ);
+        let mut token = second.base.on_handle_lost();
+
+        drop(Handle::new(
+            first.clone() as Arc<dyn KernelObject>,
+            Rights::READ,
+        ));
+        assert_eq!(first.base.handle_count(), 0);
+        assert_eq!(second.base.handle_count(), 1);
+        assert_eq!(token.try_recv(), Ok(None));
+
+        drop(keep);
+        assert_eq!(token.try_recv(), Ok(Some(())));
     }
 }

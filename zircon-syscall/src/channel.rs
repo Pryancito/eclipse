@@ -191,14 +191,22 @@ impl Syscall<'_> {
             args.wr_num_handles,
             true,
         )?;
-        // The call is cancellable through the handle it was made on, as
-        // `zx_object_wait_one` already was: Zircon answers `ZX_ERR_CANCELED`
-        // when that handle goes away while the call waits for its reply, and
-        // with `None` here nothing ever ended such a call. A thread that
-        // transferred or closed the endpoint it was calling on stayed parked
-        // for good -- `ChannelInternalTest.TransferChannelWithPendingCall`
-        // left two tasks parked and took the whole core-tests run with it.
-        let cancel_token = proc.get_cancel_token(handle_value)?;
+        // What ends a parked call is the channel running out of handles, not
+        // the handle value it was made on going away: that is Zircon's
+        // `ChannelDispatcher::on_zero_handles`, and it is the difference the
+        // whole of `ChannelInternalTest.TransferChannelWithPendingCall` turns
+        // on. The test **moves** the endpoint it is calling on into another
+        // channel, and then asks that the calling thread still be in
+        // `BLOCKED_CHANNEL` -- a moved handle is still a live handle, and
+        // Zircon leaves the pending call alone (`TODO(ZX-4233)`). The call
+        // ends later, when the handle the test read back out is closed and
+        // the census reaches zero.
+        //
+        // Waiting on the per-handle-value token instead (what
+        // `zx_object_wait_one` rightly uses) cancelled the call on the move as
+        // well as on the close, which made the test a coin flip decided by
+        // which of the two happened within the millisecond.
+        let cancel_token = channel.on_handle_lost();
         let future = channel.call(message);
         pin_mut!(future);
         let reply = self
@@ -207,7 +215,7 @@ impl Syscall<'_> {
                 future,
                 ThreadState::BlockedChannel,
                 deadline.into(),
-                Some(cancel_token),
+                cancel_token,
             )
             .await?;
         // Receive pointers are checked after sending the request and awaiting
@@ -250,14 +258,22 @@ impl Syscall<'_> {
             args.wr_num_handles,
             true,
         )?;
-        // The call is cancellable through the handle it was made on, as
-        // `zx_object_wait_one` already was: Zircon answers `ZX_ERR_CANCELED`
-        // when that handle goes away while the call waits for its reply, and
-        // with `None` here nothing ever ended such a call. A thread that
-        // transferred or closed the endpoint it was calling on stayed parked
-        // for good -- `ChannelInternalTest.TransferChannelWithPendingCall`
-        // left two tasks parked and took the whole core-tests run with it.
-        let cancel_token = proc.get_cancel_token(handle_value)?;
+        // What ends a parked call is the channel running out of handles, not
+        // the handle value it was made on going away: that is Zircon's
+        // `ChannelDispatcher::on_zero_handles`, and it is the difference the
+        // whole of `ChannelInternalTest.TransferChannelWithPendingCall` turns
+        // on. The test **moves** the endpoint it is calling on into another
+        // channel, and then asks that the calling thread still be in
+        // `BLOCKED_CHANNEL` -- a moved handle is still a live handle, and
+        // Zircon leaves the pending call alone (`TODO(ZX-4233)`). The call
+        // ends later, when the handle the test read back out is closed and
+        // the census reaches zero.
+        //
+        // Waiting on the per-handle-value token instead (what
+        // `zx_object_wait_one` rightly uses) cancelled the call on the move as
+        // well as on the close, which made the test a coin flip decided by
+        // which of the two happened within the millisecond.
+        let cancel_token = channel.on_handle_lost();
         let future = channel.call(message);
         pin_mut!(future);
         let reply = self
@@ -266,7 +282,7 @@ impl Syscall<'_> {
                 future,
                 ThreadState::BlockedChannel,
                 deadline.into(),
-                Some(cancel_token),
+                cancel_token,
             )
             .await?;
         // Receive pointers are checked after sending the request and awaiting

@@ -636,6 +636,7 @@
   ],
   "supported": [
     "ChannelCallEtcTest.*",
+    "ChannelInternalTest.*",
     "ChannelWriteEtcTest.*",
     "IOVecTest.*",
     "CounterTest.*",

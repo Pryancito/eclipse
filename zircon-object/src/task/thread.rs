@@ -2453,13 +2453,12 @@ mod tests {
         assert_eq!(thread.state(), ThreadState::New);
     }
 
-    /// The same cancellation, on the other syscall that waits with a handle
-    /// in hand: `zx_channel_call`. It used to wait with no cancel token at
-    /// all, so a thread that closed -- or transferred away -- the endpoint it
-    /// was calling on had nothing left to end its call and stayed parked for
-    /// good (`ChannelInternalTest.TransferChannelWithPendingCall`).
+    /// `zx_channel_call` waits on something else: not the handle value it was
+    /// made on, but the channel's handle CENSUS reaching zero -- Zircon's
+    /// `ChannelDispatcher::on_zero_handles`. Closing the only handle is
+    /// therefore still a cancel.
     #[async_std::test]
-    async fn a_channel_call_is_cancelled_by_its_handle_going_away() {
+    async fn a_channel_call_is_cancelled_when_its_channel_runs_out_of_handles() {
         let root_job = Job::root();
         let proc = Process::create(&root_job, "proc").expect("failed to create process");
         let thread = Thread::create(&proc, "thread").expect("failed to create thread");
@@ -2469,7 +2468,7 @@ mod tests {
         // endpoint dying, and `_peer` holds the request nobody answers.
         let (channel, _peer) = crate::ipc::Channel::create();
         let handle_value = proc.add_handle(Handle::new(channel.clone(), Rights::DEFAULT_CHANNEL));
-        let cancel_token = proc.get_cancel_token(handle_value).unwrap();
+        let cancel_token = channel.on_handle_lost();
 
         // Two seconds as a backstop only, as above: a cancel that never
         // arrives has to fail the test rather than hang it.
@@ -2487,15 +2486,89 @@ mod tests {
         });
         futures::pin_mut!(future);
         let result: ZxResult<crate::ipc::MessagePacket> = thread
-            .blocking_run(
-                future,
-                ThreadState::BlockedChannel,
-                deadline,
-                Some(cancel_token),
-            )
+            .blocking_run(future, ThreadState::BlockedChannel, deadline, cancel_token)
             .await;
         assert_eq!(result.err(), Some(ZxError::CANCELED));
         assert_eq!(thread.state(), ThreadState::New);
+    }
+
+    /// And the case the census exists for, which is
+    /// `ChannelInternalTest.TransferChannelWithPendingCall`: the endpoint the
+    /// call was made on is **moved** into a message on another channel and
+    /// then read back out into a fresh handle value. Traced in the guest, that
+    /// test asks for `ZX_THREAD_STATE_BLOCKED_CHANNEL` **after** the write, so
+    /// the write may not end the call; and it never closes the handle it reads
+    /// back, so a close is not available to end it either. The delivery is.
+    ///
+    /// Waiting on the handle value's own cancel token (what
+    /// `zx_object_wait_one` rightly uses) ended the call on the write, within
+    /// a millisecond of the test looking at the thread's state, so the test
+    /// was a coin flip; waiting only for the last close left it parked for
+    /// ever and the test's `join` with it.
+    #[async_std::test]
+    async fn a_channel_call_survives_its_handle_being_transferred() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+        let thread = CurrentThread(thread);
+
+        let (channel, _peer) = crate::ipc::Channel::create();
+        let (carrier, carrier_peer) = crate::ipc::Channel::create();
+        let handle_value = proc.add_handle(Handle::new(channel.clone(), Rights::DEFAULT_CHANNEL));
+        let cancel_token = channel.on_handle_lost();
+        assert_eq!(channel.handle_count(), 1);
+
+        let deadline = timer_now() + Duration::from_secs(2);
+        let moved = async_std::task::spawn({
+            let proc = proc.clone();
+            let caller = thread.0.clone();
+            let channel = channel.clone();
+            async move {
+                async_std::task::sleep(Duration::from_millis(10)).await;
+                assert_eq!(caller.state(), ThreadState::BlockedChannel);
+                // The transfer: out of the table and into a message. Nothing
+                // here may end the call.
+                let handle = proc.remove_handle(handle_value).unwrap();
+                carrier
+                    .write(crate::ipc::MessagePacket {
+                        data: alloc::vec![0, 0, 0, 0],
+                        handles: alloc::vec![handle],
+                    })
+                    .unwrap();
+                async_std::task::sleep(Duration::from_millis(10)).await;
+                // This is the assertion the whole census is for, and the one
+                // the per-handle token failed: the handle is gone from the
+                // table, it is sitting in a message, and the caller is STILL
+                // parked -- which is what the core test asks for right here.
+                assert_eq!(channel.handle_count(), 1, "a moved handle is live");
+                assert_eq!(
+                    caller.state(),
+                    ThreadState::BlockedChannel,
+                    "the transfer must not have ended the call"
+                );
+                // And the delivery, which is what ends the call: the handle
+                // the call was made on is now another handle value, in a
+                // table it did not come from.
+                let message = carrier_peer.read().unwrap();
+                proc.add_handles(message.handles);
+            }
+        });
+
+        let future = channel.call(crate::ipc::MessagePacket {
+            data: alloc::vec![0, 0, 0, 0],
+            handles: alloc::vec::Vec::new(),
+        });
+        futures::pin_mut!(future);
+        let result: ZxResult<crate::ipc::MessagePacket> = thread
+            .blocking_run(future, ThreadState::BlockedChannel, deadline, cancel_token)
+            .await;
+        moved.await;
+        // `CANCELED` and not `TIMED_OUT`: the delivery got there, and well
+        // inside the two-second backstop. And the handle is still live -- the
+        // test that this models never closes it, which is exactly why the
+        // delivery has to be what ends the call.
+        assert_eq!(result.err(), Some(ZxError::CANCELED));
+        assert_eq!(channel.handle_count(), 1);
     }
 
     #[test]

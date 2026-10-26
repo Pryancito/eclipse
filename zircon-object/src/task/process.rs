@@ -1106,8 +1106,12 @@ impl Process {
         }
         let handle = inner.remove_handle(handle_value)?;
         drop(inner);
+        // `.clone()` and not a move: a `Handle` counts in its object's handle
+        // census and so cannot be taken apart; the one here goes out of scope
+        // on the next line, which is the close the caller asked for.
         handle
             .object
+            .clone()
             .downcast_arc::<T>()
             .map_err(|_| ZxError::WRONG_TYPE)
     }
@@ -1208,7 +1212,7 @@ impl Process {
         if !handle.rights.contains(desired_rights) {
             return Err(ZxError::ACCESS_DENIED);
         }
-        Ok(handle.object)
+        Ok(handle.object.clone())
     }
 
     /// Get the kernel object corresponding to this `handle_value` and this handle's rights.
@@ -1217,7 +1221,7 @@ impl Process {
         handle_value: HandleValue,
     ) -> ZxResult<(Arc<dyn KernelObject>, Rights)> {
         let handle = self.get_handle(handle_value)?;
-        Ok((handle.object, handle.rights))
+        Ok((handle.object.clone(), handle.rights))
     }
 
     /// Get the kernel object corresponding to this `handle_value`
@@ -1225,6 +1229,7 @@ impl Process {
         let handle = self.get_handle(handle_value)?;
         let object = handle
             .object
+            .clone()
             .downcast_arc::<T>()
             .map_err(|_| ZxError::WRONG_TYPE)?;
         Ok(object)
@@ -1594,6 +1599,11 @@ impl ProcessInner {
             }
         };
         info!("add handle: {:#x}, {:?}", key, handle.object);
+        // Arriving from somewhere else rather than freshly created? Then this
+        // is the delivery of a transfer, and a call parked on the handle's old
+        // value ends here -- see `KObjectBase::on_handle_lost`.
+        let mut handle = handle;
+        handle.attach();
         self.handles.insert(key, (handle, Vec::new()));
         key
     }
@@ -1604,13 +1614,19 @@ impl ProcessInner {
     }
 
     fn remove_handle(&mut self, handle_value: HandleValue) -> ZxResult<Handle> {
-        let (handle, queue) = self
+        let (mut handle, queue) = self
             .handles
             .remove(&handle_value)
             .ok_or(ZxError::BAD_HANDLE)?;
+        // The per-handle-value tokens (`zx_object_wait_one`) go off here, as
+        // they always have: that wait is over the moment its handle value
+        // stops naming anything, closed or transferred.
         for sender in queue {
             let _ = sender.send(());
         }
+        // The handle itself lives on -- the caller may be moving it into a
+        // channel message -- so mark it as being between tables.
+        handle.detach();
         Ok(handle)
     }
 
@@ -1970,6 +1986,53 @@ mod tests {
                 .err(),
             Some(ZxError::BAD_HANDLE)
         );
+    }
+
+    /// A handle taken out of the table and put back into it is a RE-HOME, and
+    /// that is what ends a `zx_channel_call` parked on the value it used to
+    /// have. The three cases, in one test, because what matters is that they
+    /// are told apart:
+    ///
+    ///   * a freshly created handle being installed is **not** a re-home,
+    ///   * taking one out does not fire the token (it may be on its way into
+    ///     a channel message, and
+    ///     `ChannelInternalTest.TransferChannelWithPendingCall` asks for the
+    ///     call to still be parked right there),
+    ///   * putting it back somewhere does.
+    #[test]
+    fn a_handle_put_back_into_a_table_ends_a_call_parked_on_its_old_value() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let channel = crate::ipc::Channel::create().0;
+
+        let value = proc.add_handle(Handle::new(channel.clone(), Rights::DEFAULT_CHANNEL));
+        let mut token = channel.on_handle_lost().unwrap();
+        assert_eq!(
+            token.try_recv(),
+            Ok(None),
+            "installing a fresh handle is not a re-home"
+        );
+
+        let handle = proc.remove_handle(value).unwrap();
+        assert_eq!(channel.handle_count(), 1, "the handle is still live");
+        assert_eq!(
+            token.try_recv(),
+            Ok(None),
+            "a handle on its way into a message has not been lost yet"
+        );
+
+        let delivered = proc.add_handle(handle);
+        assert_ne!(delivered, value, "a different handle value");
+        assert_eq!(token.try_recv(), Ok(Some(())), "that is the re-home");
+
+        // And the close still counts, for a handle that was never moved.
+        let other = crate::ipc::Channel::create().0;
+        let value = proc.add_handle(Handle::new(other.clone(), Rights::DEFAULT_CHANNEL));
+        let mut token = other.on_handle_lost().unwrap();
+        proc.remove_handle(value).unwrap();
+        assert_eq!(token.try_recv(), Ok(Some(())));
+        assert_eq!(other.handle_count(), 0);
+        let _ = delivered;
     }
 
     #[test]
