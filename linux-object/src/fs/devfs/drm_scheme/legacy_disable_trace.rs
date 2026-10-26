@@ -10,17 +10,38 @@ use super::*;
 const TRACE_BUDGET: u32 = 48;
 static TRACED: AtomicU32 = AtomicU32::new(0);
 
-/// A cursor BITMAP change gets a budget of its own, and a small one.
+/// A cursor BITMAP line is spent on a CHANGE of state, never on a repeat.
 ///
-/// It is the only call here a running desktop repeats: the pointer shape
-/// changes whenever it crosses a window edge or a text field, so on the
-/// shared budget it would burn through the whole allowance long before the
-/// teardown this file exists to narrate. A separate counter means the
-/// `DPMS`/`SETCRTC`/`GETFB` lines of a disable can never be starved by
-/// pointer-shape churn, and the first few shapes are still shown -- which is
-/// what says whether a bitmap reaches us at all.
+/// Measured, in a QEMU boot of 26-oct: wlroots sends
+/// `drmModeSetCursor(crtc, 0, 0, 0)` -- "hide the pointer" -- about eight
+/// times a second, forever, because `drm_connector_is_cursor_visible` is
+/// false and the call sits at the end of every `legacy_crtc_commit`. A
+/// budget per CALL, even a separate one, was therefore spent in 1.6 s of
+/// boot, and the box this file was written for loses its desktop at 15 s:
+/// the one line the whole trace exists for would have been the first one
+/// dropped.
+///
+/// So the state is remembered and a repeat costs nothing -- no line, no
+/// budget. The count of collapsed repeats rides the NEXT change, which is
+/// what says the churn is there at all; the two timestamps bound its rate.
 const CURSOR_BO_BUDGET: u32 = 16;
 static CURSOR_BO_TRACED: AtomicU32 = AtomicU32::new(0);
+
+/// The last `(handle, width, height)` packed into one word, or [`NO_BO_YET`].
+static LAST_CURSOR_BO: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(NO_BO_YET);
+
+/// "No cursor bitmap has arrived yet". Not a state a caller can send: it
+/// would need a handle of `u32::MAX` with a 65535x65535 bitmap, which
+/// `MAX_CURSOR_DIM` refuses several arms earlier.
+const NO_BO_YET: u64 = u64::MAX;
+
+/// How many identical calls have arrived since the last line.
+static CURSOR_BO_REPEATS: AtomicU32 = AtomicU32::new(0);
+
+fn pack_bo(handle: u32, w: u32, h: u32) -> u64 {
+    u64::from(handle) | (u64::from(w & 0xffff) << 32) | (u64::from(h & 0xffff) << 48)
+}
 
 /// Say, at `error!`, which check refused a call of the legacy disable path.
 ///
@@ -119,16 +140,27 @@ pub(super) fn getfb_served(fb_id: u32, handle: u32) {
 /// sends; a non-zero one is a shape, and the line after it says whether its
 /// pixels could be reached.
 pub(super) fn cursor_bo_called(crtc_id: u32, handle: u32, w: u32, h: u32) {
+    let now = pack_bo(handle, w, h);
+    if LAST_CURSOR_BO.swap(now, Ordering::Relaxed) == now {
+        CURSOR_BO_REPEATS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let repeats = CURSOR_BO_REPEATS.swap(0, Ordering::Relaxed);
     let n = CURSOR_BO_TRACED.fetch_add(1, Ordering::Relaxed);
     if n < CURSOR_BO_BUDGET {
         log::error!(
-            "[drm] CURSOR crtc={} bitmap handle={} {}x{}{}",
+            "[drm] CURSOR crtc={} bitmap handle={} {}x{}{}{}",
             crtc_id,
             handle,
             w,
             h,
+            if repeats > 0 {
+                alloc::format!(" (the previous state arrived {} more times)", repeats)
+            } else {
+                alloc::string::String::new()
+            },
             if n + 1 == CURSOR_BO_BUDGET {
-                " [further cursor bitmaps not traced]"
+                " [further cursor bitmap CHANGES not traced]"
             } else {
                 ""
             }
@@ -141,5 +173,53 @@ fn tail(n: u32) -> &'static str {
         " [further legacy-disable outcomes not traced]"
     } else {
         ""
+    }
+}
+
+/// The one thing in this file that is not a klog line: whether two cursor
+/// states are the same state.
+///
+/// A klog line has no assertion, but this does, and getting it wrong is how
+/// the bug this collapse exists to fix comes back -- a pack that loses a
+/// field swallows a real change, silently, and the trace stops saying
+/// anything.
+#[cfg(test)]
+mod tests {
+    use super::{pack_bo, NO_BO_YET};
+
+    #[test]
+    fn el_mismo_estado_se_empaqueta_igual() {
+        assert_eq!(pack_bo(7, 64, 64), pack_bo(7, 64, 64));
+    }
+
+    #[test]
+    fn un_cambio_en_cualquier_campo_cambia_el_paquete() {
+        let base = pack_bo(7, 64, 64);
+        // One per field, because a pack that drops a field only shows it on
+        // that field: the hide/show pair differs in the handle alone, and a
+        // theme change can keep the handle and move the size.
+        assert_ne!(base, pack_bo(8, 64, 64));
+        assert_ne!(base, pack_bo(7, 32, 64));
+        assert_ne!(base, pack_bo(7, 64, 32));
+        // And "hide the pointer", which is the state wlroots repeats.
+        assert_ne!(base, pack_bo(0, 0, 0));
+    }
+
+    #[test]
+    fn ningun_estado_real_choca_con_el_centinela() {
+        // `NO_BO_YET` means "nothing has arrived yet". A real state reaching
+        // it would make the first bitmap of the boot go untraced -- the one
+        // line that says a bitmap gets here at all.
+        for (handle, w, h) in [
+            (0u32, 0u32, 0u32),
+            (u32::MAX, 256, 256),
+            (
+                1,
+                super::super::drm::MAX_CURSOR_DIM,
+                super::super::drm::MAX_CURSOR_DIM,
+            ),
+        ] {
+            assert_ne!(pack_bo(handle, w, h), NO_BO_YET);
+        }
     }
 }
