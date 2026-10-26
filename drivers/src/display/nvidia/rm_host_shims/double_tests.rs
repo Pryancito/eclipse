@@ -32,7 +32,7 @@ fn zeroed<T>() -> T {
 fn gem(size: u64, sysmem: bool) -> u32 {
     let mut out = zeroed::<GemAlloc>();
     assert_eq!(
-        eclipse_rm_gem_alloc(0, size, u32::from(sysmem), &mut out),
+        eclipse_rm_gem_alloc(0, 0, size, u32::from(sysmem), &mut out),
         NV_OK
     );
     assert_eq!(out.alloc_status, 0, "the fake refused an allocation");
@@ -43,7 +43,7 @@ fn gem(size: u64, sysmem: bool) -> u32 {
 fn bind(ctx: u32, h: u32, va: u64, size: u64) -> VmBind {
     let mut out = zeroed::<VmBind>();
     assert_eq!(
-        eclipse_rm_vm_bind_map(0, ctx, h, size, va, 0, 0, 0, &mut out),
+        eclipse_rm_vm_bind_map(0, ctx, 0, h, size, va, 0, 0, 0, &mut out),
         NV_OK
     );
     out
@@ -166,7 +166,7 @@ fn freeing_or_unmapping_something_the_fake_never_handed_out_is_refused_and_count
     let _g = LOCK.lock();
     reset_fake_rm();
 
-    assert_eq!(eclipse_rm_gem_free(0, 0xdead), NV_ERR_OBJECT_NOT_FOUND);
+    assert_eq!(eclipse_rm_gem_free(0, 0, 0xdead), NV_ERR_OBJECT_NOT_FOUND);
     assert_eq!(
         eclipse_rm_vm_bind_unmap(0, 1, 0xdead, 0, 4096, 0),
         NV_ERR_OBJECT_NOT_FOUND
@@ -194,7 +194,7 @@ fn a_sysmem_object_is_backed_by_real_zeroed_memory_at_the_address_it_reports() {
 
     let h = gem(256, true);
     let mut m = zeroed::<GemMapCpu>();
-    assert_eq!(eclipse_rm_gem_map_cpu(0, h, &mut m), NV_OK);
+    assert_eq!(eclipse_rm_gem_map_cpu(0, 0, h, &mut m), NV_OK);
     assert_eq!(m.lookup_status, 0);
     assert_eq!(m.address_space, ADDR_SYSMEM);
     assert_eq!(m.size, 256);
@@ -223,20 +223,20 @@ fn a_vidmem_object_has_no_cpu_mapping_and_its_offset_comes_from_fbmem() {
 
     let h = gem(MIB, false);
     let mut m = zeroed::<GemMapCpu>();
-    assert_eq!(eclipse_rm_gem_map_cpu(0, h, &mut m), NV_OK);
+    assert_eq!(eclipse_rm_gem_map_cpu(0, 0, h, &mut m), NV_OK);
     assert_eq!(m.lookup_status, 0, "the object exists");
     assert_eq!(m.address_space, 0, "vidmem is FBMEM");
     assert_eq!((m.phys_addr, m.size), (0, 0));
     assert_eq!(FAKE_RM.lock().pa_of(h), None);
 
     let mut off = 0u64;
-    assert_eq!(eclipse_rm_gem_fbmem_offset(0, h, &mut off), NV_OK);
+    assert_eq!(eclipse_rm_gem_fbmem_offset(0, 0, h, &mut off), NV_OK);
     assert_eq!(off, fake_fbmem_offset(h));
 
     // And a sysmem object has no FBMEM offset at all.
     let sys = gem(4096, true);
     assert_eq!(
-        eclipse_rm_gem_fbmem_offset(0, sys, &mut off),
+        eclipse_rm_gem_fbmem_offset(0, 0, sys, &mut off),
         NV_ERR_NOT_SUPPORTED
     );
 }
@@ -249,7 +249,7 @@ fn mapping_an_object_the_fake_does_not_hold_says_not_found() {
     let _g = LOCK.lock();
     reset_fake_rm();
     let mut m = zeroed::<GemMapCpu>();
-    assert_eq!(eclipse_rm_gem_map_cpu(0, 0xbeef, &mut m), NV_OK);
+    assert_eq!(eclipse_rm_gem_map_cpu(0, 0, 0xbeef, &mut m), NV_OK);
     assert_eq!(m.lookup_status, NV_ERR_OBJECT_NOT_FOUND);
 }
 
@@ -775,7 +775,7 @@ fn the_call_trail_records_refusals_too_and_keeps_the_order() {
     reset_fake_rm();
     ctx(1);
     eclipse_rm_ctx_prime(0, 1);
-    eclipse_rm_gem_free(0, 0xdead); // refused
+    eclipse_rm_gem_free(0, 0, 0xdead); // refused
     let h = gem(4096, true);
     bind(1, h, 0xb0_0000, 4096);
     submit(1, 0xb0_0000, 16);
@@ -804,7 +804,7 @@ fn the_address_space_of_a_context_is_its_own_bindings_with_the_kind_asked_for() 
     let h = gem(0x1000, true);
     let mut out = zeroed::<VmBind>();
     assert_eq!(
-        eclipse_rm_vm_bind_map(0, 1, h, 0x1000, 0xc0_0000, 0, 0x06, 0, &mut out),
+        eclipse_rm_vm_bind_map(0, 1, 0, h, 0x1000, 0xc0_0000, 0, 0x06, 0, &mut out),
         NV_OK
     );
     bind(2, h, 0xc1_0000, 0x1000);
@@ -1027,7 +1027,7 @@ fn a_cpu_mapping_the_rm_refuses_says_not_found_for_an_object_it_holds() {
     let h = gem(0x1000, true);
     let map = |h: u32| {
         let mut out = zeroed::<GemMapCpu>();
-        assert_eq!(eclipse_rm_gem_map_cpu(0, h, &mut out), NV_OK);
+        assert_eq!(eclipse_rm_gem_map_cpu(0, 0, h, &mut out), NV_OK);
         out
     };
     FAKE_RM.lock().fail_map_cpu = true;

@@ -137,25 +137,6 @@ struct RingProbe {
     entries_put: u64,
 }
 
-/// A GEM object its last holder closed while a ring still had work queued
-/// that may read it. Linux frees a BO only once the fences on its
-/// reservation have signaled (`ttm_bo_release` waits, or defers the
-/// delete); here the close appended a probe to every such ring, and the
-/// object's RM memory and VAS mappings go once each probe has passed, or
-/// once the fence timeout has (a ring that has not moved in that long is
-/// wedged). The handle itself went at the close.
-struct DeferredGemFree {
-    handle: u32,
-    h_memory: u32,
-    size: u64,
-    /// Where the dma-buf reservation of the buffer is keyed, if it was ever
-    /// exportable ([`crate::scheme::resv`]).
-    phys: Option<u64>,
-    mappings: Vec<super::nouveau_uapi::NouveauVmMapping>,
-    probes: Vec<RingProbe>,
-    born_us: u64,
-}
-
 /// How many GP entries a direct-submit channel has consumed: everything ever
 /// put, less what still sits between `GPGet` and `GPPut`.
 fn ring_consumed(f: &super::nouveau_uapi::FastCtx) -> u64 {
@@ -244,6 +225,7 @@ pub mod frontend;
 /// all unless both sides spoke `linux-drm-syncobj-v1`. Own file for the size
 /// ceiling; the hatch is `nvidia.implicit_sync=off`.
 pub(super) mod implicit_sync;
+use gem_free_queue::DeferredGemFree;
 use vram_alloc::NvidiaVramAllocator;
 
 /// The EDID the UEFI bootloader captured; own file for the size ceiling,
@@ -253,6 +235,7 @@ pub use boot_edid::{boot_edid, set_boot_edid};
 
 /// `/proc/gpuready`'s answer for this GPU; own file for the size ceiling, no
 /// logic change.
+mod gem_free_queue;
 mod gpu_ready;
 
 /// The bring-up narration switch; own file for the size ceiling, no logic
@@ -7573,7 +7556,7 @@ impl DrmScheme for NvidiaGpu {
 
     fn nouveau_gem_close(&self, handle: u32, owner_pid: u64) -> bool {
         // A close is where an earlier close's ring may have passed.
-        self.reap_deferred_frees();
+        gem_free_queue::reap_deferred_frees(self);
         // PRIME share-count gate. A swapchain buffer is referenced by more than
         // one holder at once: the compositor's original GEM_NEW owner plus every
         // PRIME self-import NVK/EGL made of the same buffer (each handed back
@@ -7670,6 +7653,7 @@ impl DrmScheme for NvidiaGpu {
             self.nouveau_deferred_frees.lock().push(DeferredGemFree {
                 handle,
                 h_memory: obj.h_memory,
+                owner_ctx: obj.owner_ctx,
                 size: obj.size,
                 phys: obj.phys_addr,
                 mappings,
@@ -7693,8 +7677,9 @@ impl DrmScheme for NvidiaGpu {
             crate::scheme::resv::forget(phys);
         }
         NOUVEAU_GEM_BYTES.fetch_sub(obj.size, Ordering::Relaxed);
-        let status = (*self.rm_device_instance.lock())
-            .map(|device_instance| nvidia_rm_sys::rm_init::gem_free(device_instance, obj.h_memory));
+        let status = (*self.rm_device_instance.lock()).map(|device_instance| {
+            nvidia_rm_sys::rm_init::gem_free(device_instance, obj.owner_ctx, obj.h_memory)
+        });
         log::info!(
             "[nouveau-uapi] GEM_CLOSE handle={} h_memory={:#010x} -> gem_free status={:?}",
             handle,
@@ -8553,17 +8538,20 @@ impl NvidiaGpu {
         }
         self.rm_unmap_mappings(context, taken);
         for (gem_handle, va, size, bo_offset, pte_kind) in kept {
+            // The owning context rides with the handle: the rebind's dup has
+            // to source from the client that actually holds the object.
             let h_memory = self
                 .nouveau_gem
                 .lock()
                 .iter()
                 .find(|o| o.handle == gem_handle)
-                .map(|o| o.h_memory);
+                .map(|o| (o.h_memory, o.owner_ctx));
             let mapped = h_memory
-                .and_then(|h| {
+                .and_then(|(h, owner_ctx)| {
                     nvidia_rm_sys::rm_init::vm_bind_map(
                         device_instance,
                         ctx_idx,
+                        owner_ctx,
                         h,
                         size,
                         va,
@@ -8920,7 +8908,12 @@ impl NvidiaGpu {
                 // SAME lock: the compressed-kind decision reads the object's
                 // domain and page-rounded size, and reading those separately
                 // would race a concurrent GEM_FREE.
-                let (h_memory, honour_compressed) = {
+                // `owner_ctx` comes from the object, not from `owner_pid`:
+                // a buffer bound here may have been allocated by ANOTHER
+                // process (an imported dma-buf, or the compositor binding a
+                // client's scanout), and the dup has to source from whichever
+                // client actually holds it.
+                let (h_memory, owner_ctx, honour_compressed) = {
                     let gem = self.nouveau_gem.lock();
                     let Some(obj) = gem
                         .iter()
@@ -8928,7 +8921,11 @@ impl NvidiaGpu {
                     else {
                         return Err(nv::ENOENT);
                     };
-                    (obj.h_memory, comptags::honour_for_bind(rm_pte_kind, obj))
+                    (
+                        obj.h_memory,
+                        obj.owner_ctx,
+                        comptags::honour_for_bind(rm_pte_kind, obj),
+                    )
                 };
                 // REPLACE semantics, like Linux's gpuvm: a MAP over an
                 // already-mapped range unmaps the old mapping first instead
@@ -8978,6 +8975,7 @@ impl NvidiaGpu {
                 let rm_result = nvidia_rm_sys::rm_init::vm_bind_map(
                     device_instance,
                     ctx_idx,
+                    owner_ctx,
                     h_memory,
                     op.range,
                     op.addr,
@@ -9925,7 +9923,7 @@ impl NvidiaGpu {
         // this ring (`DeferredGemFree`) keeps its mappings of that VAS, and
         // unmapping them later would be the same stale-h_virt unmap.
         if ctx_freed {
-            let dropped = self.forget_deferred_mappings_of(pid);
+            let dropped = gem_free_queue::forget_deferred_mappings_of(self, pid);
             if dropped > 0 {
                 log::info!(
                     "[nouveau-uapi] {}: dropped {} mapping(s) of closed objects still waiting on its ring (VAS freed)",
@@ -10007,13 +10005,23 @@ impl NvidiaGpu {
             // for entries actually removed here -- a racing GEM_CLOSE that
             // already reaped one leaves it absent, so it is never double-freed.
             // (handle, h_memory, size, phys)
-            let mut to_free_mem: Vec<(u32, u32, u64, Option<u64>)> = Vec::new();
+            // (handle, h_memory, owner_ctx, size, phys_addr): `owner_ctx` rides
+            // along because the object's client is the only one holding
+            // `h_memory`, and this runs while the process's context is being
+            // torn down -- asking the pid table for it here can already answer 0.
+            let mut to_free_mem: Vec<(u32, u32, u32, u64, Option<u64>)> = Vec::new();
             {
                 let mut gem = self.nouveau_gem.lock();
                 for handle in &to_free {
                     if let Some(pos) = gem.iter().position(|o| o.handle == *handle) {
                         let obj = gem.remove(pos);
-                        to_free_mem.push((obj.handle, obj.h_memory, obj.size, obj.phys_addr));
+                        to_free_mem.push((
+                            obj.handle,
+                            obj.h_memory,
+                            obj.owner_ctx,
+                            obj.size,
+                            obj.phys_addr,
+                        ));
                     }
                 }
                 for handle in &to_orphan {
@@ -10034,7 +10042,7 @@ impl NvidiaGpu {
             // `gem_free` has already returned to the allocator. This path is
             // the likelier way to hit that -- a client killed or crashed
             // mid-session never issues the GEM_CLOSE that would have cleaned up.
-            for (handle, _, _, _) in &to_free_mem {
+            for (handle, _, _, _, _) in &to_free_mem {
                 let dropped = self.drop_kms_fbs_for_handle(*handle);
                 if !dropped.is_empty() {
                     log::info!(
@@ -10047,13 +10055,14 @@ impl NvidiaGpu {
                 }
             }
             let mut bytes = 0u64;
-            for (handle, h_memory, size, phys) in &to_free_mem {
+            for (handle, h_memory, owner_ctx, size, phys) in &to_free_mem {
                 lock::pump();
                 if let Some(phys) = phys {
                     crate::scheme::resv::forget(*phys);
                 }
                 if let Some(device_instance) = device_instance {
-                    let status = nvidia_rm_sys::rm_init::gem_free(device_instance, *h_memory);
+                    let status =
+                        nvidia_rm_sys::rm_init::gem_free(device_instance, *owner_ctx, *h_memory);
                     if status != 0 {
                         log::warn!(
                             "[nouveau-uapi] process exit pid={}: gem_free handle={} h_memory={:#010x} failed, NV_STATUS={:#x}",
@@ -10323,7 +10332,7 @@ impl NvidiaGpu {
     /// new context being allocated.
     fn reap_zombie_contexts(&self) {
         // The same events move rings past a closed object's probes.
-        self.reap_deferred_frees();
+        gem_free_queue::reap_deferred_frees(self);
         let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
         let due: Vec<ZombieCtx> = {
             let mut zombies = self.nouveau_zombies.lock();
@@ -10353,71 +10362,6 @@ impl NvidiaGpu {
             );
             self.release_process_finish(z.pid, Some(z.ctx_idx));
         }
-    }
-
-    /// Free every closed object (`DeferredGemFree`) whose rings have passed
-    /// their probes, or that has waited the fence timeout: a ring that has
-    /// not moved in that long is wedged, and its own fence timeout is
-    /// latching it. Called wherever a zombie is reaped -- a submit, a
-    /// process exit, a context allocation -- and at every close.
-    fn reap_deferred_frees(&self) {
-        let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
-        let due: Vec<DeferredGemFree> = {
-            let mut list = self.nouveau_deferred_frees.lock();
-            if list.is_empty() {
-                return;
-            }
-            let mut due = Vec::new();
-            let mut i = 0;
-            while i < list.len() {
-                let d = &list[i];
-                let expired =
-                    now.wrapping_sub(d.born_us) >= crate::scheme::syncobj::FENCE_TIMEOUT_US;
-                if expired || d.probes.iter().all(|p| self.ring_probe_passed(p)) {
-                    due.push(list.swap_remove(i));
-                } else {
-                    i += 1;
-                }
-            }
-            due
-        };
-        for d in due {
-            let DeferredGemFree {
-                handle,
-                h_memory,
-                size,
-                phys,
-                mappings,
-                ..
-            } = d;
-            let context = alloc::format!("deferred GEM_CLOSE handle={}", handle);
-            if let Some(phys) = phys {
-                crate::scheme::resv::forget(phys);
-            }
-            self.rm_unmap_mappings(&context, mappings);
-            NOUVEAU_GEM_BYTES.fetch_sub(size, Ordering::Relaxed);
-            let status = (*self.rm_device_instance.lock())
-                .map(|device_instance| nvidia_rm_sys::rm_init::gem_free(device_instance, h_memory));
-            log::info!(
-                "[nouveau-uapi] {}: its ring(s) passed (or timed out) -> gem_free h_memory={:#010x} status={:?}",
-                context,
-                h_memory,
-                status
-            );
-        }
-    }
-
-    /// Drop, without an RM unmap, the mappings owned by `pid` that closed
-    /// objects still waiting on a ring carry: `pid`'s VAS has just been
-    /// freed with its context.
-    fn forget_deferred_mappings_of(&self, pid: u64) -> usize {
-        let mut n = 0;
-        for d in self.nouveau_deferred_frees.lock().iter_mut() {
-            let before = d.mappings.len();
-            d.mappings.retain(|m| m.owner_pid != pid);
-            n += before - d.mappings.len();
-        }
-        n
     }
 
     /// Whether the ring behind `probe` has passed it: the probe landed and
@@ -14091,7 +14035,19 @@ impl NvidiaGpu {
                     );
                     return Err(nv::ENOMEM);
                 };
-                let alloc = match nvidia_rm_sys::rm_init::gem_alloc(device_instance, size, sysmem) {
+                // The context of the process asking, which decides the RM
+                // client the object is allocated under -- and therefore which
+                // process `nvidia-smi` bills the memory to. 0 (no context yet)
+                // keeps the old shared-client behaviour for that object: a
+                // buffer allocated before its process has a context stays
+                // unattributed, which is the one gap this does not close.
+                let owner_ctx = self.ctx_idx_for_pid(owner_pid);
+                let alloc = match nvidia_rm_sys::rm_init::gem_alloc(
+                    device_instance,
+                    owner_ctx,
+                    size,
+                    sysmem,
+                ) {
                     Ok(a) if a.alloc_status == 0 => a,
                     Ok(a) => {
                         crate::klog_warn!(
@@ -14126,7 +14082,11 @@ impl NvidiaGpu {
                 // because memdescGetPhysAddr(AT_CPU) is a VRAM offset, not BAR1.
                 // Skipping the lookup avoids a NOT_SUPPORTED trace per LOCAL BO.
                 let phys_addr = if sysmem {
-                    match nvidia_rm_sys::rm_init::gem_map_cpu(device_instance, alloc.h_memory) {
+                    match nvidia_rm_sys::rm_init::gem_map_cpu(
+                        device_instance,
+                        owner_ctx,
+                        alloc.h_memory,
+                    ) {
                         Ok(m)
                             if m.lookup_status == 0
                                 && m.address_space == nvidia_rm_sys::rm_init::ADDR_SYSMEM =>
@@ -14159,7 +14119,12 @@ impl NvidiaGpu {
                 // lookup fails this stays None and the VRAM GEM remains usable
                 // for VM_BIND/EXEC without a CPU mapping or scanout-by-offset.
                 let vram_offset = if !sysmem {
-                    nvidia_rm_sys::rm_init::gem_fbmem_offset(device_instance, alloc.h_memory).ok()
+                    nvidia_rm_sys::rm_init::gem_fbmem_offset(
+                        device_instance,
+                        owner_ctx,
+                        alloc.h_memory,
+                    )
+                    .ok()
                 } else {
                     None
                 };
@@ -14194,6 +14159,7 @@ impl NvidiaGpu {
                     handle,
                     h_memory: alloc.h_memory,
                     owner_pid,
+                    owner_ctx,
                     size,
                     phys_addr,
                     vram_offset,

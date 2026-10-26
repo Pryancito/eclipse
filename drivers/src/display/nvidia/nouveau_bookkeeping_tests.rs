@@ -256,6 +256,7 @@ fn object(gpu: &NvidiaGpu, owner: u64, size: u64, phys: Option<u64>) -> u32 {
         handle,
         h_memory: 0xcafe_0000 | (handle & 0xffff),
         owner_pid: owner,
+        owner_ctx: 0,
         size,
         phys_addr: phys,
         vram_offset: None,

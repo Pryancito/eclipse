@@ -1150,7 +1150,13 @@ extern "C" fn eclipse_rm_ctx_free(_inst: u32, ctx_idx: u32) -> u32 {
     NV_OK
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_gem_alloc(_inst: u32, size: u64, sysmem: u32, out: *mut GemAlloc) -> u32 {
+extern "C" fn eclipse_rm_gem_alloc(
+    _inst: u32,
+    _ctx_idx: u32,
+    size: u64,
+    sysmem: u32,
+    out: *mut GemAlloc,
+) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("gem_alloc");
     if f.fail_gem_alloc_call {
@@ -1180,7 +1186,12 @@ extern "C" fn eclipse_rm_gem_alloc(_inst: u32, size: u64, sysmem: u32, out: *mut
     NV_OK
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_gem_map_cpu(_inst: u32, h_memory: u32, out: *mut GemMapCpu) -> u32 {
+extern "C" fn eclipse_rm_gem_map_cpu(
+    _inst: u32,
+    _ctx_idx: u32,
+    h_memory: u32,
+    out: *mut GemMapCpu,
+) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("gem_map_cpu");
     if f.fail_map_cpu_call {
@@ -1230,7 +1241,12 @@ pub(super) fn fake_fbmem_offset(h_memory: u32) -> u64 {
     u64::from(h_memory) << 20
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_gem_fbmem_offset(_inst: u32, h_memory: u32, p_offset: *mut u64) -> u32 {
+extern "C" fn eclipse_rm_gem_fbmem_offset(
+    _inst: u32,
+    _ctx_idx: u32,
+    h_memory: u32,
+    p_offset: *mut u64,
+) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("gem_fbmem_offset");
     match f.gem(h_memory) {
@@ -1242,7 +1258,7 @@ extern "C" fn eclipse_rm_gem_fbmem_offset(_inst: u32, h_memory: u32, p_offset: *
     }
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_gem_free(_inst: u32, h_memory: u32) -> u32 {
+extern "C" fn eclipse_rm_gem_free(_inst: u32, _ctx_idx: u32, h_memory: u32) -> u32 {
     let mut f = FAKE_RM.lock();
     f.calls.push("gem_free");
     match f.gems.iter().position(|g| g.0 == h_memory) {
@@ -1280,6 +1296,7 @@ extern "C" fn eclipse_rm_comptag_caps(_inst: u32, out: *mut RmComptagCaps) -> u3
 extern "C" fn eclipse_rm_vm_bind_map(
     _inst: u32,
     ctx_idx: u32,
+    _owner_ctx_idx: u32,
     h_memory: u32,
     size: u64,
     requested_va: u64,
