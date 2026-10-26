@@ -26,9 +26,14 @@ fn built() -> Vec<(u32, Option<(u32, u8, u8, u8)>)> {
 }
 
 /// The two-card box this is all about: one RTX drives the screen, the other
-/// is headless. Both have to be nameable -- `vulkaninfo` reported a single
-/// card because `card0` and `card1` were two views of the compute card and
-/// the console card had no node at all.
+/// is headless. **Two cards, two node pairs, and nothing named twice.**
+///
+/// This has been wrong twice in opposite directions. First the console card
+/// got no node at all, so `vulkaninfo` reported a single card while `card0`
+/// and `card1` were two views of the compute one. Then it got `card2`, and
+/// `card1` stayed a second view of `card0` -- so the obvious
+/// `WLR_DRM_DEVICES=/dev/dri/card0:/dev/dri/card1` named ONE card twice and
+/// could never reach the second monitor. Now a pair is a card, as in Linux.
 #[test]
 fn the_console_card_gets_a_node_of_its_own_on_a_two_card_box() {
     let screen = kms_emu::attach(64, 16);
@@ -42,8 +47,8 @@ fn the_console_card_gets_a_node_of_its_own_on_a_two_card_box() {
     let nodes = built();
     assert_eq!(
         nodes.len(),
-        3,
-        "expected card0/card1 for the compute card and card2 for the console one, got {:x?}",
+        2,
+        "two cards, two pairs: card0 for the compute card and card1 for the console one, got {:x?}",
         nodes
     );
     let compute = Some((0, 0x65, 0x00, 0));
@@ -51,13 +56,13 @@ fn the_console_card_gets_a_node_of_its_own_on_a_two_card_box() {
     assert_eq!(nodes[0], (0, compute), "card0 must stay the primary GPU");
     assert_eq!(
         nodes[1],
-        (1, compute),
-        "card1 is still the headless compute view of card0's card"
+        (1, console),
+        "card1 is the OTHER card, not a second view of card0's"
     );
-    assert_eq!(
-        nodes[2],
-        (2, console),
-        "the card driving the screen got no node"
+    assert!(
+        nodes[0].1 != nodes[1].1,
+        "no card may be named twice: {:x?}",
+        nodes
     );
 }
 
@@ -92,7 +97,7 @@ fn a_single_card_still_gets_exactly_one_pair() {
 }
 
 /// Past the head, the order is the PCI address, not the registration
-/// order: `card2` has to name the same card after a reboot.
+/// order: `card1` has to name the same card after a reboot.
 #[test]
 fn the_cards_past_the_head_are_sorted_by_pci_address() {
     let screen = kms_emu::attach(64, 16);
@@ -104,21 +109,26 @@ fn the_cards_past_the_head_are_sorted_by_pci_address() {
     let _compute = screen.attach_gpu(EmuGpu::new("emu-compute").compute_at(0x0b, 0x00));
 
     let nodes = built();
-    assert_eq!(nodes.len(), 4, "got {:x?}", nodes);
+    assert_eq!(nodes.len(), 3, "three cards, three pairs, got {:x?}", nodes);
     assert_eq!(
-        (nodes[2].1, nodes[3].1),
+        (nodes[1].1, nodes[2].1),
         (Some((0, 0x01, 0x00, 0)), Some((0, 0x65, 0x00, 0))),
-        "card2/card3 are not in PCI order: {:x?}",
+        "card1/card2 are not in PCI order: {:x?}",
         nodes
     );
 }
 
 /// The identity of every node of a two-card box, which is what decides how
-/// many Vulkan devices NVK enumerates. `card1` is the same card as `card0`
-/// and must stay `eclipse-compute` however ready that card is; the second
-/// card is nouveau once its RM is up, and `eclipse-compute` while it is
-/// cold -- a node that enumerated as nouveau and died on the first EXEC
-/// would be worse than no node.
+/// many Vulkan devices NVK enumerates. The second card is nouveau once its
+/// RM is up, and `eclipse-compute` while it is cold -- a node that
+/// enumerated as nouveau and died on the first EXEC would be worse than no
+/// node.
+///
+/// There is no third node any more: `card1` used to be a second view of
+/// `card0`'s card, pinned to `eclipse-compute` however ready that card was,
+/// and the real second card sat on `card2`. Now `card1` IS the second card,
+/// so the readiness question moved from minor 2 to minor 1 and the alias
+/// assertions are gone with the alias.
 #[test]
 fn the_second_card_is_a_nouveau_device_only_once_its_rm_is_up() {
     let screen = kms_emu::attach(64, 16);
@@ -139,24 +149,19 @@ fn the_second_card_is_a_nouveau_device_only_once_its_rm_is_up() {
     // Cold console card: one nouveau device, as today.
     assert_eq!(id(0), NodeDriverId::Nouveau, "card0");
     assert_eq!(id(128), NodeDriverId::Nouveau, "renderD128");
-    assert_eq!(id(1), NodeDriverId::Compute, "card1 is card0's own card");
-    assert_eq!(id(129), NodeDriverId::Compute, "renderD129");
-    assert_eq!(
-        id(2),
-        NodeDriverId::Compute,
-        "a cold card was offered to NVK"
-    );
-    assert_eq!(id(130), NodeDriverId::Compute, "renderD130");
-
-    // `nvidia.console_gpu` attaches its RM: now it is a real second device.
-    console.set_nouveau_ready(true);
-    assert_eq!(id(2), NodeDriverId::Nouveau, "card2");
-    assert_eq!(id(130), NodeDriverId::Nouveau, "renderD130");
     assert_eq!(
         id(1),
         NodeDriverId::Compute,
-        "the alias node turned into a second nouveau device for card0's card"
+        "a cold card was offered to NVK"
     );
+    assert_eq!(id(129), NodeDriverId::Compute, "renderD129");
+    // And there is no node past the two cards to ask about.
+    assert_eq!(built().len(), 2, "two cards, two pairs");
+
+    // `nvidia.console_gpu` attaches its RM: now it is a real second device.
+    console.set_nouveau_ready(true);
+    assert_eq!(id(1), NodeDriverId::Nouveau, "card1");
+    assert_eq!(id(129), NodeDriverId::Nouveau, "renderD129");
     assert_eq!(id(0), NodeDriverId::Nouveau, "card0 moved");
 }
 
@@ -179,7 +184,7 @@ fn no_node_is_nouveau_while_the_flag_is_off() {
     build_gpu_nodes();
 
     assert_eq!(node_driver_id(0, false), NodeDriverId::Software, "card0");
-    assert_eq!(node_driver_id(2, false), NodeDriverId::Compute, "card2");
+    assert_eq!(node_driver_id(1, false), NodeDriverId::Compute, "card1");
 }
 
 /// A second card that does NOT serve the uAPI stays a compute node even
@@ -196,7 +201,44 @@ fn a_second_card_without_the_uapi_is_never_nouveau() {
     );
     build_gpu_nodes();
 
-    assert_eq!(node_driver_id(2, true), NodeDriverId::Compute, "card2");
+    assert_eq!(node_driver_id(1, true), NodeDriverId::Compute, "card1");
+}
+
+/// The invariant the collapse exists for, asked of every card at once: **no
+/// card is named twice.**
+///
+/// The two-card test above checks the shape it should have; this checks the
+/// property that makes the shape right, whatever the roles and however many
+/// cards. A `card1` that is a second view of `card0` is what made
+/// `WLR_DRM_DEVICES=/dev/dri/card0:/dev/dri/card1` name one card twice, and
+/// the failure it hides is silent: every ioctl works, the second monitor
+/// simply never lights.
+#[test]
+fn no_card_is_ever_named_by_two_node_pairs() {
+    let screen = kms_emu::attach(64, 16);
+    let _table = NodeTable;
+    // The order matters, and getting it wrong is how this test first passed
+    // without testing anything. `register_driver` inserts at 0, so the card
+    // attached LAST is the primary -- and the duplicate only ever appeared
+    // when the primary was also `get_compute_driver`'s pick. So the single
+    // headless card goes last: primary and pick are the same card, which is
+    // exactly the two-RTX box.
+    let _console = screen.attach_gpu(EmuGpu::hardware_kms("emu-console").console_at(0x01, 0x00));
+    let _third = screen.attach_gpu(EmuGpu::hardware_kms("emu-third").console_at(0x0b, 0x00));
+    let _compute = screen.attach_gpu(EmuGpu::new("emu-compute").compute_at(0x65, 0x00));
+
+    let nodes = built();
+    assert_eq!(nodes.len(), 3, "three cards, three pairs: {:x?}", nodes);
+    let mut seen: Vec<Option<(u32, u8, u8, u8)>> = Vec::new();
+    for (index, bdf) in &nodes {
+        assert!(
+            !seen.contains(bdf),
+            "card{} names a card an earlier node already named: {:x?}",
+            index,
+            nodes
+        );
+        seen.push(*bdf);
+    }
 }
 
 #[test]
