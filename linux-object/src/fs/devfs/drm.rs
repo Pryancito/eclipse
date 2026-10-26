@@ -2269,6 +2269,9 @@ pub use prime_import::{
     card_index_holding_gem, card_index_of_minor, prime_import_for, PrimeImport,
 };
 
+mod topology;
+pub use topology::{resources_for_node, topology_for, NodeFacts, NodeTopology};
+
 /// Base minor of the render-node range, as Linux allocates them: primary
 /// nodes are `card0..card63`, render nodes `renderD128..renderD191`.
 pub const RENDER_MINOR_BASE: u32 = 128;
@@ -2385,9 +2388,9 @@ static GPU_NODES: Mutex<Vec<GpuNode>> = Mutex::new(Vec::new());
 ///   became `card2` would be an accident that could differ between boots. A
 ///   BDF sort is stable, so a node names the same card every time.
 ///
-/// Nothing needed the duplicate. [`is_compute_minor`]'s only caller is the
-/// `GETRESOURCES` filter, which answers for "not index 0" and so still leaves
-/// the compositor on `card0`; `ECLIPSE_COMPUTE` routes by the node's OWN card
+/// Nothing needed the duplicate. The `GETRESOURCES` answer is per node and
+/// comes from what the node's card can do ([`topology::topology_for`]), not
+/// from its index; `ECLIPSE_COMPUTE` routes by the node's OWN card
 /// (`driver_for_minor`), not by which minor is "the" compute one; and
 /// [`node_driver_id`] already decides by driver identity
 /// (`first_node_of_this_card`), which is why a second view answered
@@ -2433,7 +2436,7 @@ pub fn build_gpu_nodes() {
     // NO `/dev/dri` node at all, while `card1` was a second view of the card
     // `card0` already named: two node pairs, one GPU, and `vulkaninfo` could
     // only ever report one card on a two-card box. A role is a reason to label
-    // a node (index 1 and up answer `eclipse-compute`, see `is_compute_minor`),
+    // a node (index 1 and up answer `eclipse-compute`, see `node_driver_id`),
     // never a reason to leave a card unnameable.
     let drivers = kernel_hal::drivers::all_drm();
     let list = drivers.as_vec();
@@ -2508,21 +2511,6 @@ pub(crate) fn table_sizes_for_test() -> (usize, usize) {
 #[cfg(test)]
 pub(crate) fn clear_gpu_nodes_for_test() {
     *GPU_NODES.lock() = Vec::new();
-}
-
-/// Whether `minor` is one of the nodes past index 0. Those report no CRTCs, so
-/// Mesa's KMS probe and wlroots leave them alone and the desktop stays on
-/// `card0` whatever else is plugged in.
-///
-/// This is about KMS topology ONLY. Which driver name a node answers with is a
-/// separate question -- see [`node_driver_id`] -- because a second NVIDIA card
-/// should be a nouveau render device while still not being a card the
-/// compositor may wander onto.
-pub fn is_compute_minor(minor: u32) -> bool {
-    GPU_NODES
-        .lock()
-        .iter()
-        .any(|n| n.index > 0 && n.owns_minor(minor))
 }
 
 /// Which driver a node says it is, which is what Mesa selects its userspace

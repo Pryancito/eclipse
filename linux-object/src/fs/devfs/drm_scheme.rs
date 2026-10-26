@@ -2606,17 +2606,12 @@ impl DrmDev {
             DRM_IOCTL_GEM_OPEN => gem_name::gem_open(self, data),
             DRM_IOCTL_MODE_GETRESOURCES => {
                 let res = unsafe { &mut *(data as *mut DrmModeCardRes) };
-                if drm::is_compute_minor(self.minor) {
-                    // Headless compute node: not a KMS card. drmIsKMS sees
-                    // zero CRTCs/connectors and leaves this node alone, so
-                    // labwc stays on card0 even without WLR_DRM_DEVICES.
-                    res.count_fbs = 0;
-                    res.count_crtcs = 0;
-                    res.count_connectors = 0;
-                    res.count_encoders = 0;
-                    return Ok(0);
-                }
-                let (_, crtcs, connectors) = drm::get_resources();
+                // This node's own card, as `drm_mode_getresources` answers out
+                // of one device's `mode_config`. A card that cannot scan out
+                // lists nothing and `drmIsKMS` fails on it, which is what the
+                // index-based "headless compute node" special case here used to
+                // do to every node past 0 -- see `drm::topology`.
+                let (crtcs, connectors) = drm::resources_for_node(self.minor);
                 // The caller's framebuffers, as `drm_mode_getresources` walks
                 // `file_priv->fbs`; the whole table went to everyone.
                 let fbs = drm::framebuffer_ids_for(drm::current_pid());
@@ -6734,6 +6729,9 @@ mod kms_scanout_tests;
 /// failed flip leaves the panel dark.
 #[cfg(test)]
 mod hw_kms_tests;
+
+#[cfg(test)]
+mod node_topology_tests;
 
 #[cfg(test)]
 mod property_table_tests;

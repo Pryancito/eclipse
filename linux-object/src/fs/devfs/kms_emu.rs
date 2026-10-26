@@ -536,6 +536,16 @@ impl EmuGpu {
         self
     }
 
+    /// The CRTC and connector ids this GPU lists, so a test with two cards can
+    /// tell WHICH card's topology came back rather than only how much of it.
+    /// Every `EmuGpu` lists the same pair by default, which cannot distinguish
+    /// "its own card" from "some card".
+    pub(crate) fn with_topology(mut self, crtcs: &[u32], connectors: &[u32]) -> EmuGpu {
+        self.crtcs = crtcs.to_vec();
+        self.connectors = connectors.to_vec();
+        self
+    }
+
     /// The panel limits this GPU reports, so a test can tell which card the
     /// core asked for its capabilities.
     pub(crate) fn with_caps(mut self, max_width: u32, max_height: u32) -> EmuGpu {
