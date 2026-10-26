@@ -366,7 +366,9 @@ pub fn format(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
         ),
     ];
 
-    // Zero the reserved first MiB (except where the superblock will go).
+    // Zero the reserved first MiB, the superblock mirror inside it included:
+    // the mirror loop at the end of this function writes it afterwards, so
+    // the order is what keeps it, not an exception here.
     let zeros = alloc::vec![0u8; 65536];
     let mut off = 0u64;
     while off < SYS_CHUNK_START {
