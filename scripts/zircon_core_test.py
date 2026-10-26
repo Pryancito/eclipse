@@ -28,17 +28,53 @@ GROUPS = {
 }
 
 
-def check_output(output, expected=()):
-    """Require every requested case, a complete summary and successful guest exit."""
-    summary = re.search(r"\[==========\] (\d+) tests? from \d+ test cases? ran ", output)
-    started = re.findall(r"\[ RUN      \] (\S+)", output)
-    completed = [name for name in re.findall(r"\[(?:       OK |  SKIPPED )\] (\S+)", output) if name in started]
-    return bool(
-        summary and started and int(summary[1]) == len(started)
-        and started == completed and not set(expected).difference(started)
-        and "[  FAILED  ]" not in output
-        and ("*** Exit status 0 ***" in output or "userboot: finished!" in output)
-    )
+# The longest value a kernel option carries into the guest. Measured, not
+# guessed: a `--gtest_filter=` 257 characters long arrived as 187. What is past
+# it is cut off without a word of warning, and a cut-off pattern matches
+# nothing at all -- which is half of why no selection ever took effect.
+MAX_OPTION_VALUE = 187
+
+
+def outcomes(output):
+    """What the guest said about each test it started.
+
+    A test that was started and never reported is `DID-NOT-FINISH`: the process
+    died inside it. That is a result too, and the one that matters most, so it
+    is named rather than counted as absent.
+    """
+    results = {name: "DID-NOT-FINISH" for name in re.findall(r"\[ RUN      \] (\S+)", output)}
+    for status, name in re.findall(r"\[(       OK |  FAILED  |  SKIPPED )\] (\S+\.\S+)", output):
+        if name in results:
+            results[name] = status.strip()
+    return results
+
+
+def unmet(expected, results):
+    """The requested tests that did not come back passing, in order."""
+    return [name for name in expected if results.get(name) not in ("OK", "SKIPPED")]
+
+
+def guest_filters(patterns):
+    """One `--gtest_filter` pattern per run, because the guest takes ONE.
+
+    `--gtest_filter` is a single pattern there: a comma does not separate
+    patterns (measured -- a comma-joined list of 40 real test names matched
+    nothing), and a colon, which is what gtest itself separates with, cannot
+    travel because this kernel's command line separates its own options with
+    colons. So a batch of individual names cannot be expressed at all. What can
+    is one wildcard per test case, which is what this returns.
+    """
+    suites = []
+    for pattern in patterns:
+        suite = pattern.split(".", 1)[0]
+        if not suite.replace("_", "").isalnum():
+            # A pattern with no literal test case to stand on (`*` among them):
+            # nothing narrower is expressible, so ask for everything and let
+            # the host sort the answers out.
+            return ["*"]
+        if suite not in suites:
+            suites.append(suite)
+    return [suite + ".*" for suite in suites] or ["*"]
 
 
 def discovered_tests(output):
@@ -96,30 +132,29 @@ class Runner:
         label = re.sub(r"[^a-zA-Z0-9_.-]", "_", selection)[:100]
         prefix = self.log_dir / f"{number:04}-{label}"
         kernel_log = str(prefix) + ".kernel.log"
-        # `VDSOFORCE=1` is not a tuning knob here, it is what makes the clock
-        # exist. QEMU cannot advertise an invariant TSC under TCG, so without
-        # it the kernel finds no usable TSC ratio and says so
-        # ("vdso: no usable TSC ratio; leaving DATA_TIME_VALUES as shipped") --
-        # and what the prebuilt vDSO shipped is uninitialised, so
-        # `zx_clock_get_monotonic()` in the guest answers with a poisoned high
-        # word (`0xdeadbf09_xxxxxxxx`), i.e. a NEGATIVE time. Every deadline
-        # computed from it is in the past: in one `port-smp2` boot all 2245
-        # `zx_futex_wait` deadlines and all 158k `zx_nanosleep` deadlines
-        # arrived as "no wait" and not one as a real instant. That is what
-        # `FutexTest.WaitTimeoutElapsed` reports as "wait returned early", and
-        # it is what hung the whole run: `FutexTest.RequeueUnqueuedOnTimeout`
-        # waits for its helper thread to PARK in the futex
-        # (`ZX_THREAD_STATE_BLOCKED_FUTEX`), the wait returned instantly
-        # instead, the thread exited, and the test polled a state that could
-        # never come until the 90 s timeout killed the tirada.
-        # Sound here and only here: this driver only ever runs QEMU, where
-        # every vCPU's `rdtsc` comes from one host clock. See the long comment
-        # on the flag in `zCore/src/main.rs` for why it must not be set on
-        # hardware that declines to advertise an invariant TSC.
-        cmdline = (
-            "VDSOFORCE=1:LOG=info:userboot=test/core-standalone-test:"
-            "userboot.shutdown:core-tests=" + selection
-        )
+        # The option the test program actually reads. Its `main` never looks at
+        # `argc`/`argv` -- disassembled: it touches neither `edi` nor `rsi` --
+        # and instead looks up five flag NAMES (`--gtest_filter=`,
+        # `--gtest_repeat=`, `--gtest_list_tests`, `--gtest_shuffle`,
+        # `--gtest_also_run_disabled_tests`) among the boot options and builds
+        # its own argument list from them. So the selection travels as a kernel
+        # option spelled exactly like the gtest flag.
+        #
+        # What was here before was `core-tests=<selection>`, a key that does not
+        # occur anywhere in the test binary, so every run of this driver ran the
+        # whole suite whatever was asked for -- the listing included.
+        #
+        # `VDSOFORCE=1` used to be here as well, because the vDSO clock came out
+        # negative under TCG and hung the run. The kernel now routes the time
+        # calls through itself when it cannot publish an honest scale, so the
+        # flag is no longer load-bearing: three boots with it and four without
+        # stop at the same test with the same code. `userboot=` went too; it
+        # named a program that does not exist and the guest warned about it on
+        # every boot.
+        option = "--gtest_list_tests" if selection == "-l" else "--gtest_filter=" + selection
+        if len(option) > MAX_OPTION_VALUE:
+            raise ValueError(f"the guest would cut this option off: {option}")
+        cmdline = "LOG=info:userboot.shutdown:" + option
         env = dict(os.environ, ZCORE_KERNEL_LOG=kernel_log)
         if self.args.libos:
             zircon_arch = {"x86_64": "x64", "aarch64": "arm64", "riscv64": "riscv64"}[self.args.arch]
@@ -127,13 +162,27 @@ class Runner:
         else:
             command = self.make + [f"KERNEL_LOG={kernel_log}", f"CMDLINE={cmdline}", "justrun"]
         start = time.monotonic()
+        results, missing = {}, list(expected)
         with open(str(prefix) + ".host.log", "wb") as errors:
             proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=errors, start_new_session=True)
             try:
-                limit = max(self.args.timeout, 300) if "PortStressTest." in selection else self.args.timeout
+                # A wildcard run is a different animal from the old one-name
+                # batches: `PortStressTest.*` took 511 s here in one boot, so
+                # the floor is set well clear of that rather than at it.
+                slow = selection in ("-l", "*") or "PortStressTest." in selection
+                limit = max(self.args.timeout, 1200) if slow else self.args.timeout
                 output, _ = proc.communicate(timeout=limit)
                 text = output.decode(errors="replace")
-                complete = bool(discovered_tests(text)) and "*** Exit status 0 ***" in text if selection == "-l" else check_output(text, expected)
+                if selection == "-l":
+                    complete = bool(discovered_tests(text)) and "*** Exit status 0 ***" in text
+                else:
+                    # The verdict is per requested test, not per boot: with one
+                    # wildcard per run the guest also runs tests nobody asked
+                    # for, and whether THOSE fail is the expectations file's
+                    # business, not this run's.
+                    results = outcomes(text)
+                    missing = unmet(expected, results)
+                    complete = not missing
                 status = "OK" if proc.returncode == 0 and complete else "FAILED"
             except subprocess.TimeoutExpired:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -141,10 +190,30 @@ class Runner:
                 status = "TIMEOUT"
         self.output = output.decode(errors="replace")
         Path(str(prefix) + ".guest.log").write_bytes(output)
-        record = {"selection": selection, "status": status, "seconds": round(time.monotonic() - start, 3), "returncode": proc.returncode, "passed": len(re.findall(r"\[       OK \]", self.output)) if status == "OK" else 0, "guest_skipped": re.findall(r"\[  SKIPPED \] (\S+\.\S+)", self.output), "log": str(prefix)}
+        record = {
+            "selection": selection,
+            "status": status,
+            "seconds": round(time.monotonic() - start, 3),
+            "returncode": proc.returncode,
+            "requested": len(expected),
+            "passed": len(expected) - len(missing),
+            "unmet": {name: results.get(name, "NOT-RUN") for name in missing},
+            "guest_skipped": re.findall(r"\[  SKIPPED \] (\S+\.\S+)", self.output),
+            "log": str(prefix),
+        }
         self.results.append(record)
-        print(f"{status}: {selection} ({record['seconds']}s, exit={proc.returncode})", flush=True)
+        print(
+            f"{status}: {selection} ({record['seconds']}s, exit={proc.returncode}, "
+            f"{record['passed']}/{record['requested']} requested passed)",
+            flush=True,
+        )
         if status != "OK":
+            # Name what was asked for and did not come back, which is the whole
+            # point of asking. The tail of the log follows for the rest.
+            for name, outcome in list(record["unmet"].items())[:20]:
+                print(f"  {outcome}: {name}", flush=True)
+            if len(missing) > 20:
+                print(f"  ... and {len(missing) - 20} more", flush=True)
             print(output.decode(errors="replace")[-5000:], flush=True)
             print(f"Diagnostics: {prefix}.kernel.log and {prefix}.host.log", flush=True)
         return status == "OK"
@@ -152,7 +221,12 @@ class Runner:
     def finish(self, skipped):
         (self.log_dir / "results.json").write_text(json.dumps({"skipped": skipped, "runs": self.results}, indent=2) + "\n")
         failures = sum(result["status"] != "OK" for result in self.results)
-        print(f"{sum(result['passed'] for result in self.results)} tests passed; {len(self.results)} runs, {failures} failed; {len(skipped)} explicitly skipped. Logs: {self.log_dir}")
+        passed = sum(result["passed"] for result in self.results)
+        requested = sum(result.get("requested", 0) for result in self.results)
+        print(
+            f"{passed}/{requested} requested tests passed; {len(self.results)} runs, "
+            f"{failures} failed; {len(skipped)} explicitly skipped. Logs: {self.log_dir}"
+        )
         return failures == 0 and bool(self.results)
 
 
@@ -171,10 +245,7 @@ def main():
     parser.add_argument("--x64-cpu")
     parser.add_argument("--qemu")
     parser.add_argument("--log-dir")
-    parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
-    if args.batch_size < 1:
-        parser.error("batch size must be positive")
     runner = Runner(args)
     if not args.skip_build:
         subprocess.run(runner.make + ["build"], check=True)
@@ -201,22 +272,15 @@ def main():
         print("No runnable tests matched the selection", file=sys.stderr)
         runner.finish(skipped)
         return 1
-    # Userboot's test filter is bounded. Keep batches below its command-line
-    # limit, and verify every exact name to detect truncation or missing cases.
-    batch = []
-    for name in selected:
-        if name.startswith("PortStressTest."):
-            if batch:
-                runner.run(",".join(batch), expected=batch)
-                batch = []
-            runner.run(name, expected=[name])
-            continue
-        if batch and (len(batch) >= args.batch_size or len(",".join(batch + [name])) > 180):
-            runner.run(",".join(batch), expected=batch)
-            batch = []
-        batch.append(name)
-    if batch:
-        runner.run(",".join(batch), expected=batch)
+    # One run per wildcard, and the wildcards come from the test cases the
+    # selection names. Individual names cannot be batched into one run (see
+    # `guest_filters`), so each run also sweeps up tests nobody asked for; they
+    # are reported but they do not decide the run.
+    for pattern in guest_filters(selection.split(",")):
+        prefix = pattern[:-1] if pattern.endswith(".*") else ""
+        covered = [name for name in selected if name.startswith(prefix)]
+        if covered:
+            runner.run(pattern, expected=covered)
     return 0 if runner.finish(skipped) else 1
 
 
