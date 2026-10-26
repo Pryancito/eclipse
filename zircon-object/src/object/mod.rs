@@ -105,6 +105,7 @@ use {
         task::{Context, Poll},
     },
     downcast_rs::{impl_downcast, DowncastSync},
+    futures::channel::oneshot::{self, Receiver as OneshotReceiver, Sender as OneshotSender},
     kernel_hal::sync::{HeldByCurrentCpu, Mutex},
 };
 
@@ -185,6 +186,36 @@ pub trait KernelObject: DowncastSync + Debug {
     fn allowed_signals(&self) -> Signal {
         Signal::USER_ALL
     }
+    /// One more [`Handle`] now refers to this object.
+    ///
+    /// Called by `Handle`'s constructor and its `Clone`, never by hand: the
+    /// census counts live `Handle` values, not handle-table entries, so a
+    /// handle in flight inside a channel message still counts.
+    fn handle_opened(&self) {}
+    /// One fewer [`Handle`] refers to this object, because one was dropped.
+    ///
+    /// Called by `Handle`'s `Drop`, never by hand. Reaching zero fires every
+    /// token [`Self::on_handle_lost`] handed out.
+    fn handle_closed(&self) {}
+    /// A handle to this object has been delivered into a handle table it did
+    /// not come from. Called by the handle table, never by hand.
+    fn handle_rehomed(&self) {}
+    /// A token that fires when the handle a wait was made on is gone for good:
+    /// see [`KObjectBase::on_handle_lost`].
+    ///
+    /// `None` means this object keeps no census -- only an implementation that
+    /// does not go through [`impl_kobject`] -- and a wait holding such a token
+    /// is simply never cancelled this way.
+    ///
+    /// [`impl_kobject`]: impl_kobject
+    fn on_handle_lost(&self) -> Option<OneshotReceiver<()>> {
+        None
+    }
+    /// How many live [`Handle`]s refer to this object. `0` from an object
+    /// with no census; for tests and diagnostics.
+    fn handle_count(&self) -> usize {
+        0
+    }
 }
 
 impl_downcast!(sync KernelObject);
@@ -199,6 +230,17 @@ pub struct KObjectBase {
     /// high monotonic ids are never fed back into the pool.
     pooled: bool,
     inner: Mutex<KObjectBaseInner>,
+    /// How many live [`Handle`]s refer to this object, and who asked to be
+    /// told when that reaches zero. Its own lock, never taken with `inner`
+    /// held: the senders go off after it is let go.
+    handles: Mutex<HandleCensus>,
+}
+
+/// The handle census of one object: see [`KObjectBase::on_handle_lost`].
+#[derive(Default)]
+struct HandleCensus {
+    count: usize,
+    on_lost: Vec<OneshotSender<()>>,
 }
 
 /// Recycling allocator for the ids userspace sees as Linux pids/tids.
@@ -297,6 +339,7 @@ impl Default for KObjectBase {
             id: Self::new_koid(),
             pooled: false,
             inner: Default::default(),
+            handles: Default::default(),
         }
     }
 }
@@ -327,6 +370,7 @@ impl KObjectBase {
                 signal,
                 ..Default::default()
             }),
+            handles: Default::default(),
         };
         watch_name_if_requested(&base.inner.lock().name);
         base
@@ -342,6 +386,7 @@ impl KObjectBase {
                 signal,
                 ..Default::default()
             }),
+            handles: Default::default(),
         }
     }
 
@@ -360,6 +405,7 @@ impl KObjectBase {
                     name: String::from(name),
                     ..Default::default()
                 }),
+                handles: Default::default(),
             };
             watch_name_if_requested(&base.inner.lock().name);
             return base;
@@ -433,6 +479,86 @@ impl KObjectBase {
     /// Get the signal status.
     pub fn signal(&self) -> Signal {
         self.inner.lock().signal
+    }
+
+    /// Count one more live [`Handle`] to this object.
+    pub fn handle_opened(&self) {
+        self.handles.lock().count += 1;
+    }
+
+    /// Count one fewer live [`Handle`], and, if that was the last one, tell
+    /// everybody who asked.
+    ///
+    /// The senders go off **after** the census lock is let go: sending on a
+    /// `oneshot` wakes the waiting task, and waking runs the executor's own
+    /// code, which has no business running under one of this object's locks.
+    pub fn handle_closed(&self) {
+        let waiters = {
+            let mut census = self.handles.lock();
+            census.count = census.count.saturating_sub(1);
+            if census.count == 0 {
+                core::mem::take(&mut census.on_lost)
+            } else {
+                Vec::new()
+            }
+        };
+        for sender in waiters {
+            let _ = sender.send(());
+        }
+    }
+
+    /// A handle to this object has been put into a handle table it did not
+    /// come from: it was transferred and has now been delivered.
+    ///
+    /// The count does not change -- a handle in flight was always live -- but
+    /// the handle a parked call was made on is now somebody else's handle
+    /// value, so the call can never be completed by the caller that made it,
+    /// and the tokens go off.
+    pub fn handle_rehomed(&self) {
+        let waiters = core::mem::take(&mut self.handles.lock().on_lost);
+        for sender in waiters {
+            let _ = sender.send(());
+        }
+    }
+
+    /// A token that fires when the handle a wait was made on is gone for good:
+    /// when the last [`Handle`] to this object is closed, or when a
+    /// transferred handle is delivered into another handle table.
+    ///
+    /// The first half is Zircon's `Dispatcher::on_zero_handles`, and it is
+    /// what `zx_channel_call` documents: the call ends with `ZX_ERR_CANCELED`
+    /// when the channel it was made on is closed.
+    ///
+    /// The second half is this kernel's answer to a case Zircon leaves
+    /// **undefined** (`TODO(ZX-4233)`: transferring a channel with a pending
+    /// call "does not interrupt the pending calls"). Cancelling on the
+    /// `zx_channel_write` that takes the handle away makes the thread's state
+    /// right after that write a race -- measured as a coin flip inside one
+    /// millisecond -- so the cancel waits for the delivery instead. Between
+    /// the write and the read the call is still parked, which is what
+    /// `ChannelInternalTest.TransferChannelWithPendingCall` looks at, and the
+    /// delivery is what releases it: that test never closes the handle it
+    /// transfers, so a close is not available to end it.
+    ///
+    /// A census that is already at zero answers a token that has fired, so a
+    /// caller that looks the object up and then asks cannot be left waiting
+    /// on a count that will never move again.
+    pub fn on_handle_lost(&self) -> OneshotReceiver<()> {
+        let (sender, receiver) = oneshot::channel();
+        let mut census = self.handles.lock();
+        if census.count == 0 {
+            drop(census);
+            let _ = sender.send(());
+        } else {
+            census.on_lost.push(sender);
+        }
+        receiver
+    }
+
+    /// How many live [`Handle`]s refer to this object. For tests and
+    /// diagnostics.
+    pub fn handle_count(&self) -> usize {
+        self.handles.lock().count
     }
 
     /// Change signal status: first `clear` then `set` indicated bits.
@@ -728,6 +854,23 @@ macro_rules! impl_kobject {
             }
             fn add_signal_callback(&self, callback: $crate::object::SignalHandler) {
                 self.base.add_signal_callback(callback);
+            }
+            fn handle_opened(&self) {
+                self.base.handle_opened();
+            }
+            fn handle_closed(&self) {
+                self.base.handle_closed();
+            }
+            fn handle_rehomed(&self) {
+                self.base.handle_rehomed();
+            }
+            fn on_handle_lost(
+                &self,
+            ) -> Option<futures::channel::oneshot::Receiver<()>> {
+                Some(self.base.on_handle_lost())
+            }
+            fn handle_count(&self) -> usize {
+                self.base.handle_count()
             }
             $( $fn )*
         }

@@ -350,10 +350,10 @@ impl ExceptionObject {
 
     /// Create a handle for the exception's thread.
     pub fn get_thread_handle(&self) -> Handle {
-        Handle {
-            object: self.exception.thread.clone(),
-            rights: self.rights & Rights::DEFAULT_THREAD,
-        }
+        Handle::new(
+            self.exception.thread.clone(),
+            self.rights & Rights::DEFAULT_THREAD,
+        )
     }
 
     /// Create a handle for the exception's process.
@@ -361,10 +361,10 @@ impl ExceptionObject {
         if self.exception.current_channel_type() == ExceptionChannelType::Thread {
             return Err(ZxError::ACCESS_DENIED);
         }
-        Ok(Handle {
-            object: self.exception.thread.proc().clone(),
-            rights: self.rights & Rights::DEFAULT_PROCESS,
-        })
+        Ok(Handle::new(
+            self.exception.thread.proc().clone(),
+            self.rights & Rights::DEFAULT_PROCESS,
+        ))
     }
 
     /// Get what closing the exception handle will do, as a
