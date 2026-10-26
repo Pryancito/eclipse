@@ -64,6 +64,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --package zcore --features "${{ matrix.mode }} libos"
 
+      # Nothing else in this workflow compiles the Zircon personality on its
+      # own. `cargo build --all-features` turns BOTH personalities on, and
+      # `zCore/src/main.rs` rejects that combination at run time instead of
+      # compiling one of them out, so every `#[cfg(feature = "linux")]` item
+      # is live in that build and an item that only the Linux branch calls
+      # looks used. The only job that builds `zircon` alone is the Zircon
+      # QEMU suite in `test.yml`, which first links a kernel and boots it, so
+      # a `deny(warnings)` dead-code error in that configuration reached
+      # master and sat there unseen. This catches it in half a minute.
+      - name: Build the Zircon personality
+        run: cargo build --package zcore --features "zircon libos"
+
   test-bare-metal:
     runs-on: ubuntu-latest
     strategy:

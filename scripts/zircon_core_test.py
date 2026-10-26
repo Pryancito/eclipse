@@ -96,7 +96,30 @@ class Runner:
         label = re.sub(r"[^a-zA-Z0-9_.-]", "_", selection)[:100]
         prefix = self.log_dir / f"{number:04}-{label}"
         kernel_log = str(prefix) + ".kernel.log"
-        cmdline = "LOG=info:userboot=test/core-standalone-test:userboot.shutdown:core-tests=" + selection
+        # `VDSOFORCE=1` is not a tuning knob here, it is what makes the clock
+        # exist. QEMU cannot advertise an invariant TSC under TCG, so without
+        # it the kernel finds no usable TSC ratio and says so
+        # ("vdso: no usable TSC ratio; leaving DATA_TIME_VALUES as shipped") --
+        # and what the prebuilt vDSO shipped is uninitialised, so
+        # `zx_clock_get_monotonic()` in the guest answers with a poisoned high
+        # word (`0xdeadbf09_xxxxxxxx`), i.e. a NEGATIVE time. Every deadline
+        # computed from it is in the past: in one `port-smp2` boot all 2245
+        # `zx_futex_wait` deadlines and all 158k `zx_nanosleep` deadlines
+        # arrived as "no wait" and not one as a real instant. That is what
+        # `FutexTest.WaitTimeoutElapsed` reports as "wait returned early", and
+        # it is what hung the whole run: `FutexTest.RequeueUnqueuedOnTimeout`
+        # waits for its helper thread to PARK in the futex
+        # (`ZX_THREAD_STATE_BLOCKED_FUTEX`), the wait returned instantly
+        # instead, the thread exited, and the test polled a state that could
+        # never come until the 90 s timeout killed the tirada.
+        # Sound here and only here: this driver only ever runs QEMU, where
+        # every vCPU's `rdtsc` comes from one host clock. See the long comment
+        # on the flag in `zCore/src/main.rs` for why it must not be set on
+        # hardware that declines to advertise an invariant TSC.
+        cmdline = (
+            "VDSOFORCE=1:LOG=info:userboot=test/core-standalone-test:"
+            "userboot.shutdown:core-tests=" + selection
+        )
         env = dict(os.environ, ZCORE_KERNEL_LOG=kernel_log)
         if self.args.libos:
             zircon_arch = {"x86_64": "x64", "aarch64": "arm64", "riscv64": "riscv64"}[self.args.arch]

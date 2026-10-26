@@ -7,6 +7,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use x86_64::instructions::tables::{lgdt, load_tss};
+use x86_64::registers::control::{Cr4, Cr4Flags};
 use x86_64::registers::model_specific::{GsBase, KernelGsBase, Star};
 use x86_64::structures::gdt::{Descriptor, SegmentSelector};
 use x86_64::structures::DescriptorTablePointer;
@@ -45,7 +46,12 @@ struct CpuLocalRegion {
     /// Dense logical CPU id (0..NCPU), valid once [`write_logical_cpu_id`] runs.
     logical_cpu_id: u8,
     logical_cpu_valid: u8,
-    _pad: [u8; 6],
+    /// Non-zero once this CPU runs with `CR4.FSGSBASE` set, i.e. once ring 3
+    /// can move its own `FS`/`GS` base without going through the kernel. The
+    /// entry stubs read it to decide whether the two base slots in the saved
+    /// context still hold what `syscall_return` loaded. See `syscall.S`.
+    user_fsgsbase: u8,
+    _pad: [u8; 5],
     /// DEBUG: dirección base donde `trap_syscall_entry` guardó el último
     /// `GeneralRegs` en ESTA CPU (escrita por el asm vía `gs:`).
     dbg_save: usize,
@@ -65,6 +71,62 @@ const UNKNOWN_BASE: u64 = u64::MAX;
 /// Offsets of the base caches in [`CpuLocalRegion`], for the asm.
 pub const USER_FSBASE_GS_OFFSET: usize = core::mem::offset_of!(CpuLocalRegion, user_fsbase);
 pub const USER_GSBASE_GS_OFFSET: usize = core::mem::offset_of!(CpuLocalRegion, user_gsbase);
+/// Offset of [`CpuLocalRegion::user_fsgsbase`], for the asm.
+pub const USER_FSGSBASE_GS_OFFSET: usize = core::mem::offset_of!(CpuLocalRegion, user_fsgsbase);
+
+/// Let ring 3 move its own `FS`/`GS` base, as Linux does on a CPU that has the
+/// feature. Per-CPU: `CR4` is per-CPU, so every AP calls this for itself.
+///
+/// The two halves must not be separated. `CR4.FSGSBASE` alone stops
+/// `RDFSBASE`/`WRFSBASE` raising `#UD` in ring 3 -- which is what a userspace
+/// that read `CPUID.(EAX=7,ECX=0):EBX[0]` already expects, and the kernel does
+/// not intercept `CPUID`, so on a CPU that reports the feature the choice is
+/// between honouring it and lying by omission -- but it also breaks the
+/// invariant the entry stubs were written on: that nothing but a syscall
+/// writing the saved context can move a base, so the context's two base slots
+/// can be left alone on the way in. A thread that called `WRFSBASE` would come
+/// back from its next trap with whatever base the kernel last loaded, i.e.
+/// silently without its TLS pointer. The per-CPU flag that tells the stubs to
+/// read the live bases back is therefore set here, in the same call.
+///
+/// Returns false and changes nothing when the CPU does not report the feature.
+pub unsafe fn enable_user_fsgsbase() -> bool {
+    if !raw_cpuid::CpuId::new()
+        .get_extended_feature_info()
+        .is_some_and(|info| info.has_fsgsbase())
+    {
+        return false;
+    }
+    // `CR4` first, then the flag, and the order matters in exactly one
+    // direction: the flag is what makes the entry stub execute `RDFSBASE`, and
+    // that instruction raises `#UD` while `CR4.FSGSBASE` is clear -- in ring 0,
+    // on the entry path, with no way to report it. The reverse window is
+    // vacuous: this runs during per-CPU bring-up, before this CPU has ever
+    // entered ring 3, so there is no user base yet that could have moved and
+    // nothing for the stub to miss.
+    Cr4::update(|f| f.insert(Cr4Flags::FSGSBASE));
+    asm!(
+        "mov byte ptr gs:[{off}], 1",
+        off = const core::mem::offset_of!(CpuLocalRegion, user_fsgsbase),
+        options(nostack, preserves_flags),
+    );
+    true
+}
+
+/// Whether [`enable_user_fsgsbase`] has run on this CPU.
+#[inline]
+pub fn user_fsgsbase_enabled() -> bool {
+    let flag: u8;
+    unsafe {
+        asm!(
+            "mov {flag}, byte ptr gs:[{off}]",
+            flag = out(reg_byte) flag,
+            off = const core::mem::offset_of!(CpuLocalRegion, user_fsgsbase),
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    flag != 0
+}
 
 /// The one field of [`CpuLocalRegion`] whose offset is hardcoded elsewhere.
 ///
@@ -92,6 +154,18 @@ const _: () = {
         core::mem::offset_of!(CpuLocalRegion, tss) == 0,
         "the entry stubs read gs:4 and gs:12 as offsets into the TSS, so it has to come first"
     );
+    // The three words the entry stubs reach by `gs:[const]` must be three
+    // distinct words. They are only distinct because they are distinct fields,
+    // which is exactly the kind of thing a later `#[repr(packed)]` or a
+    // hand-written offset would break silently: an aliased FS/GS cache makes
+    // `syscall_return` skip a WRMSR it owed, so a thread returns to ring 3
+    // with another thread's TLS base.
+    assert!(USER_FSBASE_GS_OFFSET != USER_GSBASE_GS_OFFSET);
+    assert!(USER_FSGSBASE_GS_OFFSET != USER_FSBASE_GS_OFFSET);
+    assert!(USER_FSGSBASE_GS_OFFSET != USER_GSBASE_GS_OFFSET);
+    // And the flag byte must not land inside the TSS, which the CPU writes
+    // behind the kernel's back on every ring transition.
+    assert!(USER_FSGSBASE_GS_OFFSET >= size_of::<TSS>());
 };
 
 /// DEBUG: offset de `dbg_save` dentro de [`CpuLocalRegion`], para el asm.
@@ -206,7 +280,8 @@ pub fn init() {
         cpu_local: 0,
         logical_cpu_id: 0,
         logical_cpu_valid: 0,
-        _pad: [0; 6],
+        user_fsgsbase: 0,
+        _pad: [0; 5],
         dbg_save: 0,
         user_fsbase: UNKNOWN_BASE,
         user_gsbase: UNKNOWN_BASE,
@@ -323,7 +398,8 @@ pub fn init_ap() {
         cpu_local: 0,
         logical_cpu_id: 0,
         logical_cpu_valid: 0,
-        _pad: [0; 6],
+        user_fsgsbase: 0,
+        _pad: [0; 5],
         dbg_save: 0,
         user_fsbase: UNKNOWN_BASE,
         user_gsbase: UNKNOWN_BASE,

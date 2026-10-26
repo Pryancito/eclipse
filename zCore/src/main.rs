@@ -224,6 +224,12 @@ enum MultiGpu {
     Single,
 }
 
+// Only the Linux personality asks this, and the tests. The `allow(dead_code)`
+// on the enum above does NOT reach an inherent method, so without this the
+// Zircon build fails outright on `deny(warnings)` -- which is how master
+// stopped compiling its Zircon kernel for several hours. Same gate as
+// `multigpu_verdict`, which builds this value.
+#[cfg(any(feature = "linux", test))]
 impl MultiGpu {
     /// Whether the card that scans out the console is brought up by default.
     ///
@@ -501,6 +507,19 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         if kernel_hal::cmdline::flag(&options.cmdline, "VDSOFORCE") {
             kernel_hal::timer::set_force_tsc_invariant(true);
             klog_info!("Eclipse: vDSO forced on despite CPUID (VDSOFORCE=1)");
+        }
+        // `FSGSBASE=0` takes `RD/WRFSBASE` and `RD/WRGSBASE` away from user
+        // mode again. Default on, because the kernel does not intercept
+        // `CPUID` and so cannot hide the feature from a userspace that reads
+        // it -- see `kernel_hal::cpu::init_user_fsgsbase`. The hatch is here
+        // because turning it on also puts an MSR read on every entry from user
+        // mode (the entry stubs have to read back a base ring 3 can now move),
+        // so a suspected regression in either direction can be bisected by
+        // rebooting instead of by rebuilding.
+        #[cfg(target_arch = "x86_64")]
+        if kernel_hal::cmdline::is_off(&options.cmdline, "FSGSBASE") {
+            kernel_hal::cpu::set_user_fsgsbase_allowed(false);
+            klog_info!("Eclipse: user-mode FSGSBASE DISABLED (FSGSBASE=0)");
         }
         // SMP master switch. Default ON; `smp=off` forces a single-core boot.
         //

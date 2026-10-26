@@ -15,6 +15,7 @@ global_asm!(
     DBG_OFF = const super::gdt::DBG_SAVE_GS_OFFSET,
     FS_CACHE = const super::gdt::USER_FSBASE_GS_OFFSET,
     GS_CACHE = const super::gdt::USER_GSBASE_GS_OFFSET,
+    FSGS_FLAG = const super::gdt::USER_FSGSBASE_GS_OFFSET,
 );
 
 pub fn init() {

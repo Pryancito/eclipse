@@ -446,6 +446,47 @@ pub fn init_tsc_aux() {
     }
 }
 
+/// The `FSGSBASE=0` hatch. Default on: a CPU that reports the feature in
+/// `CPUID.(EAX=7,ECX=0):EBX[0]` gets it, because the kernel does not intercept
+/// `CPUID` and userspace reads that bit for itself.
+static USER_FSGSBASE_ALLOWED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Turn the `FSGSBASE` feature off for user mode before the CPUs are brought
+/// up. Read once per CPU by [`init_user_fsgsbase`], so it must be called
+/// before `primary_init`.
+pub fn set_user_fsgsbase_allowed(allowed: bool) {
+    USER_FSGSBASE_ALLOWED.store(allowed, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Let ring 3 use `RD/WRFSBASE` and `RD/WRGSBASE` on this CPU.
+///
+/// Per-CPU, like [`init_tsc_aux`]: `CR4` is per-CPU and so is the flag the
+/// entry stubs read, so every AP runs this for itself from `secondary_init`.
+///
+/// Why it is on by default: `CPUID` is not intercepted here, so on a CPU that
+/// reports `FSGSBASE` every userspace already believes it can use the
+/// instructions -- and Zircon's own `Property.RegisterFs` core-test does, with
+/// a helper thread that reads its base back and takes a `#UD` instead. Linux
+/// enables it the same way, on the same CPUID bit.
+///
+/// Returns whether it is on, which is false on a CPU without the feature and
+/// on a boot with `FSGSBASE=0`.
+pub fn init_user_fsgsbase() -> bool {
+    if !USER_FSGSBASE_ALLOWED.load(core::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    // SAFETY: per-CPU, and the call sets the entry stubs' flag together with
+    // `CR4` -- see `trapframe`'s `enable_user_fsgsbase`, where the two halves
+    // and the reason they cannot be separated are written down.
+    unsafe { trapframe::enable_user_fsgsbase() }
+}
+
+/// Whether user mode may move its own `FS`/`GS` base on this CPU.
+pub fn user_fsgsbase_enabled() -> bool {
+    trapframe::user_fsgsbase_enabled()
+}
+
 /// Set by any CPU whose logical id the `getcpu` encoding cannot hold, which
 /// disables the userspace fast path for everyone: a reader cannot know which
 /// CPU it is on, so it must not believe any of them.
@@ -560,6 +601,13 @@ fn cpuinfo_flags_string() -> alloc::string::String {
     // EBX leaf 7
     if avx_live && ebx7 & (1 << 5) != 0 {
         push("avx2");
+    }
+    // Advertised only when the kernel actually set `CR4.FSGSBASE`, by the same
+    // rule as `avx` above: a reader that sees this token and executes
+    // `WRFSBASE` must not take a `#UD` for it. The CPUID bit says the CPU has
+    // the instructions, not that ring 3 may run them.
+    if ebx7 & (1 << 0) != 0 && user_fsgsbase_enabled() {
+        push("fsgsbase");
     }
     if ebx7 & (1 << 3) != 0 {
         push("bmi1");

@@ -138,6 +138,11 @@ pub fn primary_init() {
     // `RDTSCP` instead of trapping. Every AP does the same from
     // `secondary_init`.
     cpu::init_tsc_aux();
+    // Per-CPU too, and before anything can reach ring 3: see
+    // `cpu::init_user_fsgsbase`.
+    if cpu::init_user_fsgsbase() {
+        info!("[boot] user-mode FSGSBASE enabled");
+    }
     // Before drivers init so the first scanout can use CLFLUSHOPT / MOVNTDQA.
     zcore_drivers::utils::dma_sync::probe_cpu_features();
     drivers::init().unwrap();
@@ -189,6 +194,9 @@ pub fn secondary_init() {
     // Only after that: `IA32_TSC_AUX` carries the id userspace will read, and
     // before this point `cpu_id()` could only see the provisional xAPIC one.
     cpu::init_tsc_aux();
+    // `CR4.FSGSBASE` and the entry stubs' flag are per-CPU, so this AP has to
+    // set them for itself or ring 3 on this core alone takes a `#UD`.
+    cpu::init_user_fsgsbase();
     // The LAPIC timer's mode/divide/initial-count registers are per-CPU and are
     // only programmed on the BSP (in `drivers.rs`). Replicate that here so this
     // AP actually receives the 250 Hz scheduler tick; without it the AP's timer
