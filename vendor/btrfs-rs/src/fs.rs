@@ -2238,7 +2238,7 @@ mod compressed_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    fn tmpfile(name: &str, size: u64) -> PathBuf {
+    pub(super) fn tmpfile(name: &str, size: u64) -> PathBuf {
         let path =
             std::env::temp_dir().join(std::format!("btrfs-zlib-{}-{}", std::process::id(), name));
         let f = std::fs::OpenOptions::new()
@@ -2252,7 +2252,7 @@ mod compressed_tests {
         path
     }
 
-    fn open_dev(path: &Path) -> Arc<dyn BlockDevice> {
+    pub(super) fn open_dev(path: &Path) -> Arc<dyn BlockDevice> {
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -2261,7 +2261,7 @@ mod compressed_tests {
         Arc::new(FileDevice::open(f).unwrap())
     }
 
-    fn opts() -> mkfs::MkfsOptions {
+    pub(super) fn opts() -> mkfs::MkfsOptions {
         let mut seed = 0x0bad_c0de_dead_beefu64;
         let mut uuid = || {
             let mut u = [0u8; 16];
@@ -2562,6 +2562,125 @@ mod compressed_tests {
                 dump
             );
         }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+// The other half of the B-tree engine's contract, the half that has to write.
+// `tests/btree_contract.rs` asks the engine everything that can be asked of a
+// tree someone else built; these two cannot be asked from there, because
+// inserting needs an allocator that knows where the free space is and the
+// scan that loads one is private to `Btrfs`. So they mount a real image and
+// borrow the pieces `Tree` wants, which is what every write in this file
+// already does.
+#[cfg(all(test, feature = "std"))]
+mod tree_contract_tests {
+    use super::compressed_tests::{open_dev, opts, tmpfile};
+    use super::*;
+    use crate::mkfs;
+
+    /// An item type nothing in this driver interprets. The engine does not
+    /// look at item types at all -- it orders keys and moves bytes -- and
+    /// these images are never mounted again after the test, so the items below
+    /// need not be anything a filesystem would recognise.
+    const SYNTHETIC: u8 = 254;
+
+    #[test]
+    fn the_largest_item_the_format_allows_is_accepted_and_one_byte_more_is_not() {
+        let path = tmpfile("biggest", 24 * 1024 * 1024);
+        let dev = open_dev(&path);
+        mkfs::format(&*dev, &opts()).unwrap();
+        drop(dev);
+        let mut fs = Btrfs::mount(open_dev(&path), false).unwrap();
+
+        // What a leaf has room for once its header is paid for, and what is
+        // left of that after the item's own row in the table.
+        let nodesize = fs.vol.nodesize;
+        let biggest = nodesize - HEADER_SIZE - ITEM_SIZE;
+
+        // Above every key mkfs wrote, so the insert appends and the split
+        // leaves this item a leaf of its own rather than trying to pack it
+        // next to something else.
+        let key = Key::new(LAST_FREE_OBJECTID, SYNTHETIC, 0);
+        let data = alloc::vec![0xa5u8; biggest];
+        fs.tree().insert(FS_TREE, key, &data).unwrap_or_else(|e| {
+            panic!(
+                "the largest item a {}-byte leaf can hold is {} bytes, and it \
+                 was refused with {:?}",
+                nodesize, biggest, e
+            )
+        });
+        assert_eq!(
+            fs.tree().get(FS_TREE, key).unwrap().as_deref(),
+            Some(&data[..]),
+            "the item that fills a leaf exactly has to read back whole"
+        );
+
+        // One byte more does not fit in any leaf, so it is refused outright
+        // instead of being split into halves that still will not hold it.
+        let one_more = alloc::vec![0xa5u8; biggest + 1];
+        assert_eq!(
+            fs.tree().insert(
+                FS_TREE,
+                Key::new(LAST_FREE_OBJECTID, SYNTHETIC, 1),
+                &one_more
+            ),
+            Err(Error::Invalid),
+            "an item one byte past what a leaf can hold"
+        );
+
+        fs.sync().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_node_fills_to_the_capacity_its_format_allows_before_the_tree_grows() {
+        let path = tmpfile("capacity", 64 * 1024 * 1024);
+        let dev = open_dev(&path);
+        mkfs::format(&*dev, &opts()).unwrap();
+        drop(dev);
+        let mut fs = Btrfs::mount(open_dev(&path), false).unwrap();
+
+        let capacity = fs.vol.nodesize - HEADER_SIZE;
+        let room = node::max_items(fs.vol.nodesize);
+        // One item per leaf: each insert fills a leaf exactly, so it splits
+        // and the root gains exactly one pointer. That walks a node up to its
+        // last slot in as few writes as the format allows.
+        let data = alloc::vec![0x5au8; capacity - ITEM_SIZE];
+
+        let mut widest = 0usize;
+        let mut i = 0u64;
+        let grown = loop {
+            fs.tree()
+                .insert(FS_TREE, Key::new(LAST_FREE_OBJECTID, SYNTHETIC, i), &data)
+                .unwrap_or_else(|e| panic!("insert #{} failed with {:?}", i, e));
+            let (root, level) = fs.tree().root(FS_TREE).unwrap();
+            if level > 1 {
+                break level;
+            }
+            if level == 1 {
+                let block = fs.vol.read_block(root).unwrap();
+                widest = widest.max(header::nritems(&block) as usize);
+            }
+            i += 1;
+            assert!(
+                (i as usize) < room * 4,
+                "the root is still at level {} after {} leaves, so it is not \
+                 splitting where it should",
+                level,
+                i
+            );
+        };
+
+        assert_eq!(grown, 2, "the root grew straight past level 2");
+        assert_eq!(
+            widest, room,
+            "a node of this size holds {} pointers, and the tree grew a level \
+             with only {} in the root",
+            room, widest
+        );
+
+        fs.sync().unwrap();
         let _ = std::fs::remove_file(&path);
     }
 }
