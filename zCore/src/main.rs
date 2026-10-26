@@ -1155,6 +1155,23 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             }
             let want_console_gpu = console_gpu_by_default
                 || kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu");
+            // `/proc/gpuready` answers for the console card, and that card only
+            // becomes usable because the task below brings it up. Tell the
+            // reader whether anyone scheduled it: without this a box booted
+            // with `nvidia.noconsole_gpu` answered `waiting` forever, and init
+            // held the session back for its whole timeout on a bring-up nobody
+            // had asked for.
+            // `nvidia.nodispoff` keeps the console card's display engine
+            // running across its own GSP boot, the way every boot before this
+            // did. The default is to hand the display over for that window,
+            // like Linux: see `boot_window`.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nodispoff") {
+                kernel_hal::drivers::set_display_off_for_gsp(false);
+                klog_info!(
+                    "Eclipse: nvidia.nodispoff — el motor de display sigue encendido durante el arranque del GSP de consola"
+                );
+            }
+            linux_object::fs::devfs::drm::set_console_bringup_expected(want_console_gpu);
             if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.hwcursor") || want_console_gpu {
                 let reason = if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu") {
                     "nvidia.console_gpu"
@@ -1418,14 +1435,30 @@ fn schedule_deferred_console_bringup(
         // sets KD_GRAPHICS). Poll every 500ms so we do not busy-spin.
         let deadline = timer_now() + Duration::from_secs(45);
         let mut saw_graphics = false;
+        let mut asked = false;
         while timer_now() < deadline {
             if kd_mode() == KD_GRAPHICS {
                 saw_graphics = true;
                 break;
             }
+            // ...or userspace asked whether this card is usable yet, which is
+            // the same news arriving earlier. Init holds a GPU compositor back
+            // until `/proc/gpuready` says the card serves, so waiting here for
+            // a present that cannot happen until we run is a wait on
+            // ourselves: both ends only ended on their timeouts, and the
+            // session started on pixman anyway. See `drm::gpu_ready_was_read`.
+            if linux_object::fs::devfs::drm::gpu_ready_was_read() {
+                asked = true;
+                break;
+            }
             kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(500)).await;
         }
-        if saw_graphics {
+        if asked {
+            kernel_hal::klog_info!(
+                "Eclipse: {} — userspace pregunto por /proc/gpuready; bring-up consola ya (scanout pausado)",
+                reason
+            );
+        } else if saw_graphics {
             // Let labwc finish its first few frames before freezing scanout.
             kernel_hal::thread::sleep_until(timer_now() + Duration::from_secs(3)).await;
             kernel_hal::klog_info!(
