@@ -9,6 +9,29 @@ use crate::device::BlockDevice;
 use crate::structs::*;
 use crate::{Error, Result};
 
+/// Whether a superblock whose checksum does not match its bytes is refused.
+///
+/// On by default, and the only reason it can be turned off is recovery: a
+/// volume whose superblock took a flipped bit is unmountable with the check
+/// on, and the machine it was the root of does not boot. The kernel clears
+/// this from `btrfs.sbcsum=off` on the command line so there is a way back in
+/// without rebuilding, and `Volume::open` then warns on every mount instead
+/// of refusing. Nothing in this crate writes a superblock without computing
+/// its checksum, so with the check on no volume this driver made is turned
+/// away.
+static SB_CSUM_ENFORCED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Refuse (`true`, the default) or merely warn about (`false`) a superblock
+/// whose checksum does not match. See [`SB_CSUM_ENFORCED`].
+pub fn set_superblock_csum_enforced(on: bool) {
+    SB_CSUM_ENFORCED.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`Volume::open`] currently refuses a bad superblock checksum.
+pub fn superblock_csum_enforced() -> bool {
+    SB_CSUM_ENFORCED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// One logical chunk and the physical stripes backing it. For SINGLE there is
 /// one stripe; for DUP two (reads use the first, writes hit all of them).
 #[derive(Debug, Clone)]
@@ -69,6 +92,31 @@ impl Volume {
         let sb = Superblock::parse(raw).ok_or(Error::BadSuperblock)?;
         if sb.csum_type() != 0 {
             return Err(Error::Unsupported("csum type != crc32c"));
+        }
+        // Every tree block is checked against its own checksum in
+        // `read_block`; the superblock was the one block that was not, even
+        // though `write_superblock` goes to the trouble of computing it. A
+        // flipped bit here is not a bad read, it is a volume whose root
+        // pointer, generation and chunk array are whatever the bit made them.
+        // The stored and computed values both go in the message, because the
+        // only thing the owner of an unmountable disk can do with this is tell
+        // one flipped bit from a superblock that was never a superblock.
+        let stored = get_u32(&sb.raw, 0);
+        let computed = crate::crc::checksum(&sb.raw[CSUM_SIZE..]);
+        if stored != computed {
+            if superblock_csum_enforced() {
+                error!(
+                    "btrfs: superblock checksum mismatch: stored {:#010x}, computed {:#010x} \
+                     (mount anyway with btrfs.sbcsum=off)",
+                    stored, computed
+                );
+                return Err(Error::Corrupt("superblock checksum"));
+            }
+            warn!(
+                "btrfs: superblock checksum mismatch: stored {:#010x}, computed {:#010x} \
+                 -- mounting anyway because btrfs.sbcsum=off",
+                stored, computed
+            );
         }
         if sb.incompat_flags() & !INCOMPAT_SUPPORTED != 0 {
             return Err(Error::Unsupported("unknown incompat flags"));
