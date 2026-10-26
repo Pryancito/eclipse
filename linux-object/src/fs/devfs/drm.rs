@@ -2365,15 +2365,28 @@ static GPU_NODES: Mutex<Vec<GpuNode>> = Mutex::new(Vec::new());
 ///   console GPU is cold unless `nvidia.console_gpu` brought it up, so every
 ///   nouveau ioctl on `card0` would start answering `ENODEV`.
 /// * Index 1 is [`get_compute_driver`], honouring an explicit
-///   `nvidia.compute=BB.DD.F` pin. On a two-card box that is the same driver
-///   as index 0, which is exactly the situation today: `card1` is a headless
-///   compute view of the same card, and `/sys/class/drm` gives it a distinct
-///   fake BDF so libdrm does not merge the two node pairs.
-/// * Indices 2.. are **every remaining card**, whatever its role, **sorted by
-///   PCI BDF**. Sorting rather than taking registration order is the point:
-///   that list is the reverse of the PCI probe order, so which card became
-///   `card2` would be an accident that could differ between boots. A BDF sort
-///   is stable, so a node names the same card every time.
+///   `nvidia.compute=BB.DD.F` pin -- **but only when that is a card index 0
+///   did not already name.** It used to be added unconditionally, and on a
+///   two-card box it was the same driver as index 0: `card1` was a second,
+///   headless view of `card0`'s card, with a fake BDF in `/sys/class/drm` so
+///   libdrm would not merge the pairs. That is the shape Moebius asked to
+///   retire -- in Linux **one card is one `card`+`renderD` pair** -- and it
+///   was actively misleading: the card driving the monitor landed on `card2`,
+///   so `WLR_DRM_DEVICES=/dev/dri/card0:/dev/dri/card1` named one card twice
+///   and never reached the second monitor.
+/// * The remaining indices are **every remaining card**, whatever its role,
+///   **sorted by PCI BDF**. Sorting rather than taking registration order is
+///   the point: that list is the reverse of the PCI probe order, so which card
+///   became `card2` would be an accident that could differ between boots. A
+///   BDF sort is stable, so a node names the same card every time.
+///
+/// Nothing needed the duplicate. [`is_compute_minor`]'s only caller is the
+/// `GETRESOURCES` filter, which answers for "not index 0" and so still leaves
+/// the compositor on `card0`; `ECLIPSE_COMPUTE` routes by the node's OWN card
+/// (`driver_for_minor`), not by which minor is "the" compute one; and
+/// [`node_driver_id`] already decides by driver identity
+/// (`first_node_of_this_card`), which is why a second view answered
+/// `Compute` rather than `Nouveau` and why removing it changes no answer.
 ///
 /// Every registered card ends up named. It used to be only the ones with
 /// [`DrmScheme::is_compute_gpu`], and on a two-card box that is not the
@@ -2394,11 +2407,16 @@ pub fn build_gpu_nodes() {
         driver: primary,
     }];
 
+    // One card, one node pair. The pin still gets to put its card at the
+    // lowest index after the primary, but a card already named is not named
+    // twice -- see this function's doc for what the second view cost.
     if let Some(compute) = get_compute_driver() {
-        nodes.push(GpuNode {
-            index: 1,
-            driver: compute,
-        });
+        if !nodes.iter().any(|n| Arc::ptr_eq(&n.driver, &compute)) {
+            nodes.push(GpuNode {
+                index: 1,
+                driver: compute,
+            });
+        }
     }
 
     // Every OTHER card, whatever its role. Not just the ones that can compute:
