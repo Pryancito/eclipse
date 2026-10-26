@@ -3014,7 +3014,9 @@ fn owned_by(owner: u64, pid: u64) -> bool {
 }
 
 /// The framebuffer ids `GETRESOURCES` lists for `pid`: the ones it may
-/// touch, by the same rule `RMFB` and `GETFB`'s handle use ([`owned_by`]).
+/// touch, by the same rule `RMFB` uses ([`owned_by`]). (`GETFB` answers the
+/// geometry of any of them to anyone and hands the backing handle to the
+/// master or root only, its own rule: `drm_scheme/getfb.rs`.)
 ///
 /// Linux walks `file_priv->fbs`, the framebuffers THIS file created, and
 /// nothing else: a client never learns another client's fb ids from the
