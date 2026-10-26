@@ -241,6 +241,8 @@ mod gpu_ready;
 /// The bring-up narration switch; own file for the size ceiling, no logic
 /// change.
 mod boot_window;
+mod bringup_all;
+mod pdisp_intr;
 mod quiet_bringup;
 use quiet_bringup::QuietBringup;
 
@@ -401,7 +403,7 @@ fn surfaceflip_stats_line() -> String {
 /// for size only; a child module still reaches its private items.
 mod boot_fb;
 pub use boot_fb::set_boot_fb_info;
-use boot_fb::{boot_fb_phys, boot_fb_size, console_gpu_cold_line, BootFbInfo};
+use boot_fb::{boot_fb_phys, boot_fb_size, BootFbInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaArchitecture {
@@ -1421,6 +1423,10 @@ impl NvidiaGpu {
             log::error!("{}", line);
             let _ = writeln!(s, "{}", line);
         }
+        // ...and what the display engine has PENDING, which the head state
+        // does not say. Same phases, same read-only rule, same PDISP gate:
+        // see `pdisp_intr` for why it cannot go near the STARTCPU store.
+        s.push_str(&pdisp_intr::dump(bar0, tag, phase));
         s
     }
 
@@ -3627,49 +3633,59 @@ impl DrmScheme for NvidiaGpu {
         !self.drives_boot_display()
     }
 
+    /// Two facts about this card, where there used to be a role.
+    ///
+    /// `role=console` / `role=compute` was the vocabulary Moebius asked to
+    /// retire: a card is not a kind of card, it either scans out the boot
+    /// console or it does not, and its RM either came up or did not. Those are
+    /// the two things a reader of `/proc/gpuroles` actually needs, and the
+    /// second one is the one that decides whether anything works on it.
+    ///
+    /// The node list is gone with the role. It was the constant
+    /// `card0,card1,renderD128,renderD129` for every non-scanout card and a
+    /// parenthesis for the other, derived from nothing: on a box where
+    /// `build_gpu_nodes` had named three cards it still printed two pairs, and
+    /// on a one-card box it claimed a `card1` that did not exist. `/dev/dri` is
+    /// enumerated a few lines further down the same file, from the node table
+    /// itself, so the lie was not even the only answer there.
     fn gpu_role_line(&self) -> String {
-        let role = if self.drives_boot_display() {
-            "console"
-        } else {
-            "compute"
-        };
-        let rm = if self.rm_device_instance.lock().is_some() {
-            "rm=ready"
-        } else {
-            "rm=cold"
-        };
-        let nodes = if self.drives_boot_display() {
-            "(GOP scanout; GSP not auto-booted)"
-        } else {
-            "nodes=/dev/dri/card0,/dev/dri/card1,/dev/dri/renderD128,/dev/dri/renderD129"
-        };
         alloc::format!(
-            "{:02x}:{:02x}.0 {} role={} {} {}\n",
+            "{:02x}:{:02x}.0 {} scanout={} rm={}\n",
             self.pci_bus,
             self.pci_device,
             self.gpu_model,
-            role,
-            rm,
-            nodes
+            if self.drives_boot_display() {
+                "boot-console"
+            } else {
+                "no"
+            },
+            if self.rm_device_instance.lock().is_some() {
+                "ready"
+            } else {
+                "cold"
+            },
         )
     }
 
+    /// Compute on this card, whichever card it is.
+    ///
+    /// The refusal that used to stand here -- `-ENODEV`, «is the console GPU
+    /// — compute lives on the secondary» -- was the split at its sharpest, and
+    /// on a one-card box it meant compute did not exist at all: the only card
+    /// scans out, so every op on every card answered `ENODEV` forever, even
+    /// after the deferred bring-up had the RM up and serving. Moebius asked
+    /// for that to go («nada de compute y console»), and his reason settles
+    /// what replaces it: Linux refuses compute for want of a device, never for
+    /// want of a *role*.
+    ///
+    /// So nothing stands here. Every op below already answers by readiness --
+    /// `INFO` reports `rm=cold` and `-ENODEV`, `SAXPY` and `BENCH` say
+    /// `skipped` -- which is the honest refusal and the same one any other
+    /// cold card gets.
     fn compute_launch(&self, op: u32) -> crate::scheme::drm::ComputeLaunchResult {
         use crate::scheme::drm::{
             ComputeLaunchResult, COMPUTE_OP_BENCH, COMPUTE_OP_INFO, COMPUTE_OP_SAXPY,
         };
-        if self.drives_boot_display() {
-            return ComputeLaunchResult {
-                status: -19, // -ENODEV: console GPU is not the compute device
-                elapsed_ns: 0,
-                grid_threads: 0,
-                report: alloc::format!(
-                    "GPU {:02x}:{:02x}.0 is the console GPU — compute lives on the secondary\n",
-                    self.pci_bus,
-                    self.pci_device
-                ),
-            };
-        }
         match op {
             COMPUTE_OP_INFO => {
                 let ready = self.rm_device_instance.lock().is_some();
@@ -4598,12 +4614,18 @@ impl DrmScheme for NvidiaGpu {
         // proven end-to-end and the console-GPU collision is isolated as the
         // remaining problem (likely fix: stop console rendering during its GSP
         // boot). If the secondary wedges identically, the console theory dies.
+        // No card is refused here any more: there is one bring-up for all of
+        // them (`bringup_all`). What the card that scans out gets EXTRA is
+        // what Linux gives its primary -- it says so to the RM, and its
+        // display is handed to the firmware for the boot -- not a path of its
+        // own. Whether it is brought up at all is policy, decided once by the
+        // caller (`nouveau_uapi::scanout_gpu_bringup`), not here.
         if self.drives_boot_display() {
-            return String::from(
-                "[gpustep6]  --- Real GSP-RM boot: SKIPPED on console GPU (SEC2 resume wedges its bus \
-                 while the console renders into its BAR1; use /proc/gpustep11, which freezes the \
-                 graphic console around the boot) ---\n",
-            );
+            s.push_str(&bringup_all::mark_primary_for_rm(self, "gpustep6"));
+            let window = boot_window::BootWindow::enter(self, "gpustep6", &mut s);
+            s.push_str(&self.gsp_boot_run("gpustep6", false));
+            window.leave(&mut s);
+            return s;
         }
 
         s.push_str(&self.gsp_boot_run("gpustep6", false));
@@ -4928,15 +4950,12 @@ impl DrmScheme for NvidiaGpu {
         // STARTCPU store) and drives the display fine via the GOP framebuffer.
         // It does get its own line: silence here is what made a dual-card box
         // report one GPU up and give the log no way to say which card or why.
-        if self.drives_boot_display() {
-            return console_gpu_cold_line(
-                self.pci_bus,
-                self.pci_device,
-                self.gpu_model,
-                boot_fb_phys().unwrap_or(0),
-                self.bar1_phys,
-                self.info.fb_size as u64,
-            );
+        // One chain for every card. The only question asked about this one is
+        // policy -- whether a card with a live raster is brought up at all on
+        // hardware whose GSP boot still wedges -- and it is a single line, not
+        // a second path. See `nouveau_uapi::scanout_gpu_bringup`.
+        if self.drives_boot_display() && !super::nouveau_uapi::scanout_gpu_bringup() {
+            return bringup_all::cold_line(self);
         }
         // Run the proven state-load chain (the same sequence a user triggers as
         // `cat /proc/gpustep5;6;8;9`), executed once at boot before any

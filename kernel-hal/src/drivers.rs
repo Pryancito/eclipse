@@ -437,6 +437,17 @@ pub fn set_gpu_trace_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_gpu_trace_enabled(_v: bool) {}
 
+/// Bring up the card that scans out the console like every other card
+/// (`nvidia.scanout_gpu`; `nvidia.noconsole_gpu` is the opt-OUT and the older
+/// spelling). There is one bring-up path either way -- this only decides
+/// whether that card is brought up at all while its GSP boot still wedges.
+#[cfg(target_arch = "x86_64")]
+pub fn set_scanout_gpu_bringup(v: bool) {
+    zcore_drivers::display::set_scanout_gpu_bringup(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_scanout_gpu_bringup(_v: bool) {}
+
 /// Hand the console GPU's display engine over to its firmware across the SEC2
 /// window of its own GSP boot (`nvidia.dispoff`). **Off by default**: coming
 /// back out of PDISP reset restores `NV_PMC_ENABLE` and not the scanout state
