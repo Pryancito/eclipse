@@ -448,6 +448,18 @@ pub fn set_scanout_gpu_bringup(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_scanout_gpu_bringup(_v: bool) {}
 
+/// Declare the scanout card as the RM's primary device, with its console
+/// reserved, before its own GSP boot (`nvidia.console_preserve`). **Off by
+/// default**: the measurement that removed it found it correlated with the
+/// SEC2 `STARTCPU` wedge, but that measurement predates the display
+/// hand-over. See `console_preserve`.
+#[cfg(target_arch = "x86_64")]
+pub fn set_console_preserve(v: bool) {
+    zcore_drivers::display::set_console_preserve(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_console_preserve(_v: bool) {}
+
 /// Hand the console GPU's display engine over to its firmware across the SEC2
 /// window of its own GSP boot (`nvidia.dispoff`). **Off by default**: coming
 /// back out of PDISP reset restores `NV_PMC_ENABLE` and not the scanout state

@@ -1294,6 +1294,17 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // the VBIOS programmed. See `display_off_for_gsp`.
             // `nvidia.nodispoff` still turns it off, so a cmdline written
             // against the old default keeps meaning what it meant.
+            // Tell the RM this card is the primary and its console must be
+            // reserved, before its own GSP boot -- what Linux does, and what
+            // `bringup_step14` took out because it correlated with the SEC2
+            // wedge on boots that had no display hand-over. See
+            // `console_preserve` for why the comparison is worth re-running.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_preserve") {
+                kernel_hal::drivers::set_console_preserve(true);
+                klog_info!(
+                    "Eclipse: nvidia.console_preserve — se declara la consola al RM antes del arranque del GSP (reserva la region de consola; puede devolver el cuelgue del STARTCPU)"
+                );
+            }
             if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.dispoff")
                 && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nodispoff")
             {

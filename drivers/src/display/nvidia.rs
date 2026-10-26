@@ -4917,6 +4917,16 @@ impl DrmScheme for NvidiaGpu {
         //    carving demonstrably left the scanout surface intact on the
         //    successful full-chain run). Revisit console preservation later,
         //    post-boot, if FB carving ever eats the console.
+        // 1.5, back under a flag. The removal above was measured WITHOUT the
+        //    display hand-over, and its own last line says to revisit console
+        //    preservation if FB carving ever eats the console. It has: a boot
+        //    that survived STARTCPU came out with the raster still ADVANCING
+        //    and no picture. Default off, so the arrangement that survives
+        //    keeps surviving; `nvidia.console_preserve` runs the comparison
+        //    again on the hardware where the premise changed.
+        if super::nouveau_uapi::console_preserve() {
+            s.push_str(&bringup_all::mark_primary_for_rm(self, "gpustep14"));
+        }
         // 2. GSP-RM boot. gsp_boot_run arms the console SEC2 drain internally
         //    now, so this is the proven path; cached after the first boot.
         s.push_str("[gpustep14] --- stage 2: GSP-RM boot (kgspInitRm, console-SILENT, Linux-parity STARTCPU, VGA decode off, PBUS pre-clear) ---\n");
