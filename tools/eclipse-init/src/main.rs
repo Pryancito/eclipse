@@ -2631,6 +2631,40 @@ fn cmdline_value<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
+/// NVK's Vulkan ICD manifest (`/usr/share/vulkan/icd.d/nouveau_icd.<arch>.json`),
+/// or `None` when Mesa's nouveau Vulkan driver is not installed.
+///
+/// Why the loader has to be pinned to this one file on the Vulkan compositor
+/// path: `mesa-vulkan-drivers` also installs **lavapipe**, the CPU Vulkan
+/// driver, as the floor under Xwayland's glamor. wlroots' native Vulkan
+/// renderer enumerates EVERY physical device the loader offers and keeps the
+/// one whose `VK_EXT_physical_device_drm` major:minor matches the DRM fd it
+/// opened (`/dev/dri/card0`) — lavapipe has no DRM device at all, so it can
+/// never be that match and the session cannot silently end up on the CPU. What
+/// an unpinned loader DOES cost is the diagnosis: every way the enumeration can
+/// go wrong arrives as the one line `Could not match drm and vulkan device`,
+/// with lavapipe sitting in the list looking like a device. Pinning the ICD is
+/// the same measure `eclipse-firefox` already takes for the same reason (see
+/// `xtask::write_firefox_wrapper`), and it keeps the GL clients of this session
+/// off `zink` on `lavapipe` as well.
+///
+/// Deliberately NOT applied to the default GLES2/zink session: that stack is
+/// the one that works on Moebius' hardware today and this leaves its
+/// environment byte for byte as it was.
+fn nvk_icd_path() -> Option<String> {
+    let dir = fs::read_dir("/usr/share/vulkan/icd.d").ok()?;
+    let mut found: Vec<String> = dir
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("nouveau_icd.") && n.ends_with(".json"))
+        .map(|n| format!("/usr/share/vulkan/icd.d/{n}"))
+        .collect();
+    // `read_dir` gives no order and a box can carry more than one arch
+    // manifest; sort so the pin is the same string on every boot.
+    found.sort();
+    found.into_iter().next()
+}
+
 /// The environment handed to every spawned service: the static [`CHILD_ENV`]
 /// base plus the renderer pin. Pixman (CPU software) is the default because with
 /// no working GL driver wlroots' GLES2 path leaves the desktop black — exactly
@@ -2638,11 +2672,13 @@ fn cmdline_value<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
 fn build_child_env() -> Vec<CString> {
     let cmdline = read_cmdline();
     let vendor = card0_vendor();
+    let icd = nvk_icd_path();
     let mut env = child_env_for(
         renderer_mode_from(&cmdline, vendor.as_deref()),
         vendor.as_deref(),
         &cmdline,
         COMPOSITOR_DEGRADED.load(Ordering::Relaxed),
+        icd.as_deref(),
     );
     overlay_locale(&mut env);
     overlay_tz(&mut env);
@@ -2660,6 +2696,7 @@ fn child_env_for(
     vendor: Option<&str>,
     cmdline: &str,
     degraded: bool,
+    nvk_icd: Option<&str>,
 ) -> Vec<CString> {
     let mut env: Vec<CString> = CHILD_ENV
         .iter()
@@ -2688,6 +2725,21 @@ fn child_env_for(
                     let wlr = if want_vulkan { "vulkan" } else { "gles2" };
                     env.push(CString::new(format!("WLR_RENDERER={wlr}")).unwrap());
                     env.push(CString::new("WLR_DRM_NO_MODIFIERS=1").unwrap());
+                    // Vulkan compositor only: pin the loader to NVK's ICD, so
+                    // the physical-device list wlroots walks holds the GPU and
+                    // nothing else. See `nvk_icd_path` for why, and why the
+                    // GLES2 default is left alone. Both spellings: the modern
+                    // loader reads VK_DRIVER_FILES, older ones VK_ICD_FILENAMES.
+                    if want_vulkan {
+                        if let Some(icd) = nvk_icd {
+                            env.push(CString::new(format!("VK_DRIVER_FILES={icd}")).unwrap());
+                            env.push(CString::new(format!("VK_ICD_FILENAMES={icd}")).unwrap());
+                        } else {
+                            let _ = log_renderer(
+                                "renderer=gl: nvidia.wlr_vulkan asked for but NO NVK ICD in /usr/share/vulkan/icd.d (nouveau_icd.*.json) -- wlroots will find no Vulkan device for card0 and the session falls back to GLES2/zink. Fix: install mesa-vulkan-drivers",
+                            );
+                        }
+                    }
                     let _ = log_renderer(&format!(
                         "renderer=gl: NVIDIA GPU -> WLR_RENDERER={wlr} (zink+NVK{}; degrade with nvidia.wlr_pixman)",
                         if want_vulkan {

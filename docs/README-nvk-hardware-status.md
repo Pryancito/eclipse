@@ -1524,6 +1524,22 @@ renderizador **Vulkan nativo de wlroots** queda como opt-in por cmdline
 **`nvidia.wlr_vulkan`**, para retomarlo cuando se cablee la capacidad de
 semáforo externo de NVK.
 
+> **Caducado.** Este motivo ya no vale: el renderizador Vulkan de wlroots **no
+> crea ni un semáforo** — espera en un `VkFence` corriente con
+> `vkWaitForFences`, o sea que la rama de «interoperabilidad con sincronización
+> implícita» que pedía `VK_KHR_external_semaphore_fd` desapareció de
+> `render/vulkan/`. Lo que wlroots sí exige, y el único requisito que el camino
+> GLES2 no tiene, es que algún dispositivo físico publique por
+> `VK_EXT_physical_device_drm` el **mismo `major:minor` que `/dev/dri/card0`**;
+> cuando eso falla imprime exactamente la línea de arriba, «Could not match drm
+> and vulkan device», y es la misma línea para cualquier otro fallo de la
+> enumeración. Los cuatro requisitos reales, la escalera
+> `vulkan -> gles2 -> pixman` y el pre-vuelo
+> `/tmp/labwc-vulkan-preflight.log` están en
+> [README-desktop.md](README-desktop.md), «El renderizador Vulkan nativo». Las
+> dos consecuencias que se describen más abajo también están tapadas:
+> `MAX_CHANNELS` es 64 (era 16) y `MAX_CTX` 32 (era 8).
+
 Blindaje: `MAX_CHANNELS` sube de 16 a 64 para absorber cualquier ráfaga de
 enumeración (los contextos RM reales siguen acotados por `MAX_CTX`). En la ruta
 GLES2/zink no hay churn, así que es cinturón y tirantes.

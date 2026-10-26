@@ -1200,7 +1200,8 @@ fn run_wrapper_with_fake_labwc(dir: &Path, renderer: &str, fail_on: &str) -> Opt
          echo \"$WLR_RENDERER ${{GALLIUM_DRIVER:-none}}\" >> {d}/calls\n\
          echo x >> {d}/starts\n\
          if [ \"$WLR_RENDERER\" = {fail_on} ] || \\\n\
-         \x20 {{ [ {fail_on} = first ] && [ \"$(wc -l < {d}/starts)\" -eq 1 ]; }}; then\n\
+         \x20 {{ [ {fail_on} = first ] && [ \"$(wc -l < {d}/starts)\" -eq 1 ]; }} || \\\n\
+         \x20 {{ [ {fail_on} = gpu ] && [ \"$WLR_RENDERER\" != pixman ]; }}; then\n\
          \x20 echo '[../src/server.c:532] unable to create renderer'\n\
          \x20 exit 1\n\
          fi\n\
@@ -1272,6 +1273,48 @@ fn a_gpu_renderer_that_fails_to_init_is_retried_then_falls_back_to_pixman() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The Vulkan session has a rung below it that is STILL the GPU.
+///
+/// wlroots falls back from nothing on its own, so every rung is this wrapper's.
+/// Before this, asking for `nvidia.wlr_vulkan` and having wlroots refuse cost
+/// the whole GPU session and put the desktop on the CPU -- which is why trying
+/// the flag was never free. GLES2 on zink+NVK is the stack that works on
+/// hardware, so it goes between vulkan and pixman, and the
+/// `/run/labwc-renderer-fallback` marker -- which is how `eclipse-firefox`
+/// learns this session has no GPU path -- is written ONLY when we land on
+/// pixman.
+#[test]
+fn a_vulkan_session_that_cannot_init_drops_to_gles2_before_pixman() {
+    let dir = std::env::temp_dir().join(format!("eclipse-labwc-vk-fb-{}", std::process::id()));
+    // Vulkan refuses, GLES2 comes up: two vulkan attempts, then the GPU
+    // session on zink. No marker, because the GPU path is alive.
+    let Some(calls) = run_wrapper_with_fake_labwc(&dir, "vulkan", "vulkan") else {
+        return; // no host sh
+    };
+    assert_eq!(calls, "vulkan zink\nvulkan zink\ngles2 zink\n");
+    assert!(!dir.join("fallback").exists(), "GLES2 came up: no marker");
+    assert!(fs::read_to_string(dir.join("labwc-vulkan-2.log"))
+        .unwrap()
+        .contains("unable to create renderer"));
+
+    // Neither GPU renderer comes up: both rungs get their two attempts and
+    // only then does the desktop go to the CPU.
+    let calls = run_wrapper_with_fake_labwc(&dir, "vulkan", "gpu").unwrap();
+    assert_eq!(
+        calls,
+        "vulkan zink\nvulkan zink\ngles2 zink\ngles2 zink\npixman none\n"
+    );
+    assert_eq!(fs::read_to_string(dir.join("fallback")).unwrap(), "gles2\n");
+    assert!(dir.join("labwc-vulkan-2.log").exists());
+    assert!(dir.join("labwc-gles2-2.log").exists());
+
+    // And a Vulkan renderer that works is run once, like any other.
+    let calls = run_wrapper_with_fake_labwc(&dir, "vulkan", "never").unwrap();
+    assert_eq!(calls, "vulkan zink\n");
+    assert!(!dir.join("fallback").exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A caller's own choice survives the gate: every assignment is `:=`, so
 /// what `eclipse-init` already exported (or a person debugging by hand) wins
 /// instead of being overwritten by the default for the machine.
@@ -1296,6 +1339,93 @@ fn a_renderer_the_caller_already_chose_is_not_overwritten() {
         Some("0x10de\n"),
     );
     assert_eq!(gate_var(&env, "WLR_RENDERER").as_deref(), Some("pixman"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Only the Vulkan session pins the Vulkan loader to NVK's ICD, and both
+/// shell sources do it the same way.
+///
+/// wlroots' native Vulkan renderer enumerates EVERY physical device the loader
+/// offers and keeps the one whose `VK_EXT_physical_device_drm` primary OR
+/// render major:minor equals the `st_rdev` of the DRM fd it opened (card0).
+/// `mesa-vulkan-drivers` also installs lavapipe, which has no DRM device of its
+/// own: it can never BE that match, so it cannot make the session go software,
+/// but it does sit in the list that one error line is about ("Could not match
+/// drm and vulkan device"). The GLES2/zink default is the stack that works on
+/// hardware and its environment stays untouched.
+#[test]
+fn only_the_vulkan_session_pins_the_vulkan_loader_to_nvk() {
+    let dir = std::env::temp_dir().join(format!("eclipse-vk-icd-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    write_labwc_wrapper(&dir);
+    let etc = dir.join("etc");
+    let _ = fs::create_dir_all(&etc);
+    super::super::LinuxRootfs::write_profile(&etc);
+
+    let icd_dir = dir.join("icd.d");
+    fs::create_dir_all(&icd_dir).unwrap();
+    let icd = icd_dir.join("nouveau_icd.x86_64.json");
+    fs::write(&icd, b"{}\n").unwrap();
+    let empty = dir.join("icd.d-empty");
+    fs::create_dir_all(&empty).unwrap();
+
+    const NVIDIA: Option<&str> = Some("0x10de\n");
+    let gates = [
+        (
+            "wrapper",
+            renderer_gate(&fs::read_to_string(dir.join("usr/local/bin/labwc")).unwrap()),
+        ),
+        (
+            "/etc/profile",
+            renderer_gate(&fs::read_to_string(etc.join("profile")).unwrap()),
+        ),
+    ];
+    for (what, gate) in &gates {
+        // With NVK installed, the Vulkan session names its manifest -- both
+        // spellings, because the modern loader reads VK_DRIVER_FILES and
+        // older ones VK_ICD_FILENAMES.
+        let found = gate.replace("/usr/share/vulkan/icd.d", &icd_dir.display().to_string());
+        let env = run_gate(&found, "nvidia.nouveau_uapi:nvidia.wlr_vulkan", NVIDIA);
+        assert_eq!(gate_var(&env, "WLR_RENDERER").as_deref(), Some("vulkan"));
+        for key in ["VK_DRIVER_FILES", "VK_ICD_FILENAMES"] {
+            assert_eq!(
+                gate_var(&env, key).as_deref(),
+                Some(icd.display().to_string().as_str()),
+                "{what}: {key} on the vulkan session"
+            );
+        }
+
+        // The GLES2 default and the pixman kill-switch leave the loader alone.
+        for cmdline in [
+            "nvidia.nouveau_uapi",
+            "nvidia.nouveau_uapi:nvidia.wlr_gles2",
+            "nvidia.nouveau_uapi:nvidia.wlr_vulkan:nvidia.wlr_pixman",
+        ] {
+            let env = run_gate(&found, cmdline, NVIDIA);
+            for key in ["VK_DRIVER_FILES", "VK_ICD_FILENAMES"] {
+                assert_eq!(
+                    gate_var(&env, key),
+                    None,
+                    "{what}: {cmdline} must not pin {key}"
+                );
+            }
+        }
+
+        // No NVK on the box: ask for Vulkan without pinning anything. An
+        // UNMATCHED glob is left literal by the shell, and pinning the loader
+        // at a path that does not exist makes it find NOTHING -- strictly
+        // worse than letting it look.
+        let none = gate.replace("/usr/share/vulkan/icd.d", &empty.display().to_string());
+        let env = run_gate(&none, "nvidia.nouveau_uapi:nvidia.wlr_vulkan", NVIDIA);
+        assert_eq!(gate_var(&env, "WLR_RENDERER").as_deref(), Some("vulkan"));
+        for key in ["VK_DRIVER_FILES", "VK_ICD_FILENAMES"] {
+            assert_eq!(
+                gate_var(&env, key),
+                None,
+                "{what}: {key} must stay unset with no NVK manifest"
+            );
+        }
+    }
     let _ = fs::remove_dir_all(&dir);
 }
 

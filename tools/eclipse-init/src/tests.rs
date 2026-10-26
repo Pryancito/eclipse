@@ -1561,9 +1561,15 @@ fn the_settle_wait_gives_up_on_a_machine_with_no_input_at_all() {
 const NVIDIA: Option<&str> = Some("0x10de\n");
 const VIRTIO: Option<&str> = Some("0x1af4\n");
 
+/// The NVK ICD manifest a box with `mesa-vulkan-drivers` has. The tests pass it
+/// explicitly rather than reading `/usr/share/vulkan/icd.d`, which does not
+/// exist on the build host: `nvk_icd_path` is what reads the disk, and
+/// `child_env_for` is the pure policy underneath it.
+const NVK_ICD: Option<&str> = Some("/usr/share/vulkan/icd.d/nouveau_icd.x86_64.json");
+
 fn renderer_env(cmdline: &str, vendor: Option<&str>, degraded: bool) -> Vec<String> {
     let r = renderer_mode_from(cmdline, vendor);
-    as_strings(&child_env_for(r, vendor, cmdline, degraded))
+    as_strings(&child_env_for(r, vendor, cmdline, degraded, NVK_ICD))
 }
 
 fn var<'a>(env: &'a [String], key: &str) -> Option<&'a str> {
@@ -1686,6 +1692,56 @@ fn the_gpu_session_defaults_to_gles2_and_pins_clients_to_the_same_stack() {
     assert_eq!(var(&env, "WLR_RENDERER"), Some("pixman"), "{env:?}");
     assert_eq!(var(&env, "GALLIUM_DRIVER"), None, "{env:?}");
     assert_eq!(var(&env, "LIBGL_ALWAYS_SOFTWARE"), Some("1"), "{env:?}");
+}
+
+/// The Vulkan compositor pins the loader to NVK's ICD; the GLES2 default does
+/// NOT. wlroots' native Vulkan renderer walks EVERY physical device the loader
+/// offers and keeps the one whose `VK_EXT_physical_device_drm` major:minor
+/// matches `/dev/dri/card0`, so lavapipe -- installed as the floor under
+/// Xwayland's glamor, and with no DRM device of its own -- can only ever be
+/// noise in that list and in the one error line wlroots prints about it.
+/// The GLES2 session is the stack that works on hardware today and its
+/// environment is deliberately left alone.
+#[test]
+fn only_the_vulkan_session_pins_the_vulkan_loader_to_nvk() {
+    let vk = renderer_env("renderer=gl:nvidia.wlr_vulkan", NVIDIA, false);
+    assert_eq!(var(&vk, "WLR_RENDERER"), Some("vulkan"), "{vk:?}");
+    assert_eq!(var(&vk, "VK_DRIVER_FILES"), NVK_ICD, "{vk:?}");
+    // Both spellings: the modern loader reads the first, older ones the second.
+    assert_eq!(var(&vk, "VK_ICD_FILENAMES"), NVK_ICD, "{vk:?}");
+
+    for asked in [
+        "renderer=gl:nvidia.nouveau_uapi",
+        "renderer=gl:nvidia.wlr_gles2",
+    ] {
+        let gles2 = renderer_env(asked, NVIDIA, false);
+        assert_eq!(var(&gles2, "WLR_RENDERER"), Some("gles2"), "{gles2:?}");
+        assert_eq!(var(&gles2, "VK_DRIVER_FILES"), None, "{asked}: {gles2:?}");
+        assert_eq!(var(&gles2, "VK_ICD_FILENAMES"), None, "{asked}: {gles2:?}");
+    }
+
+    // The kill-switch wins over the pin, like it wins over the renderer.
+    let pixman = renderer_env(
+        "renderer=gl:nvidia.wlr_vulkan:nvidia.wlr_pixman",
+        NVIDIA,
+        false,
+    );
+    assert_eq!(var(&pixman, "WLR_RENDERER"), Some("pixman"), "{pixman:?}");
+    assert_eq!(var(&pixman, "VK_DRIVER_FILES"), None, "{pixman:?}");
+
+    // And a box with no NVK installed asks for Vulkan without pinning a
+    // manifest that is not there -- an empty pin would make the loader find
+    // NOTHING, which is worse than letting it look.
+    let no_icd = as_strings(&child_env_for(
+        renderer_mode_from("renderer=gl:nvidia.wlr_vulkan", NVIDIA),
+        NVIDIA,
+        "renderer=gl:nvidia.wlr_vulkan",
+        false,
+        None,
+    ));
+    assert_eq!(var(&no_icd, "WLR_RENDERER"), Some("vulkan"), "{no_icd:?}");
+    assert_eq!(var(&no_icd, "VK_DRIVER_FILES"), None, "{no_icd:?}");
+    assert_eq!(var(&no_icd, "VK_ICD_FILENAMES"), None, "{no_icd:?}");
 }
 
 #[test]
@@ -2468,7 +2524,7 @@ fn the_sdl_render_path_follows_the_compositor_renderer() {
 /// compositor told to use pixman and not told it may would not start.
 #[test]
 fn a_pixman_session_names_pixman_and_allows_software() {
-    let env = child_env_for(Renderer::Pixman, None, "", false);
+    let env = child_env_for(Renderer::Pixman, None, "", false, NVK_ICD);
     let have: Vec<String> = env
         .iter()
         .map(|e| e.to_str().unwrap().to_string())
