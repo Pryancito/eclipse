@@ -9383,6 +9383,9 @@ mod rm_failures_tests;
 mod display_state_tests;
 /// `/proc/gpudbg` on a BAR0 the test writes, and the two PTOP readers.
 mod gpudbg_tests;
+/// The first three rungs of the copy-engine ladder (`gpustep2/3/4`) and
+/// the compute dispatcher, on a BAR0 the test writes and the spin hook plays.
+mod ladder_mmio_tests;
 /// The `/proc` readers of the bring-up ladder (`gpustep15/16/17`,
 /// `gpuedid`) on the fake RM, and the HDA driver's two questions.
 mod proc_steps_tests;
