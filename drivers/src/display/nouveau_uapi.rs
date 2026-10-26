@@ -116,6 +116,35 @@ pub fn scanout_gpu_bringup() -> bool {
     SCANOUT_GPU_BRINGUP.load(Ordering::Relaxed)
 }
 
+/// Declare the scanout card's identity to the RM before its own GSP boot, the
+/// way Linux does (`bIsPrimary=true` plus the console size, so GSP-RM's FB
+/// layout reserves the console region). **Default OFF**, opt in with
+/// `nvidia.console_preserve`.
+///
+/// It was taken OUT of `bringup_step14` on the numbers: with it, 0 boots out
+/// of 9+ survived the SEC2 `STARTCPU` store; without it, 2 of 3 did. The model
+/// was that declaring a primary makes the CORE_RESUME payload run its
+/// display/console-preservation path, which is display-domain PRI traffic
+/// against a live head -- the wedge.
+///
+/// **That measurement predates `boot_window`.** Every one of those boots ran
+/// without the hand-over, and the step14 comment that removed it ends
+/// "revisit console preservation later, post-boot, if FB carving ever eats the
+/// console". It now has: a boot that survived STARTCPU came out of it with the
+/// raster still `ADVANCING`, `FB_GET_INFO_V2` reporting 40 MiB free of 8021,
+/// and no picture -- which is what carving over an unreserved console looks
+/// like. So the flag exists to re-run that comparison on the hardware where
+/// the premise changed, not to flip a default on a story.
+static CONSOLE_PRESERVE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_console_preserve(v: bool) {
+    CONSOLE_PRESERVE.store(v, Ordering::Relaxed);
+}
+
+pub fn console_preserve() -> bool {
+    CONSOLE_PRESERVE.load(Ordering::Relaxed)
+}
+
 /// Hold the console GPU's display engine in reset across the SEC2 HS-resume
 /// window of its own GSP boot. **Default OFF**, opt in with `nvidia.dispoff`
 /// (`nvidia.nodispoff` also still turns it off, so old cmdlines keep working).
