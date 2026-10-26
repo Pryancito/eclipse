@@ -63,3 +63,46 @@ fn no_flag_means_no_pin() {
     assert_eq!(parse_compute_bdf_in("LOG=warn smp=off"), None);
     assert_eq!(parse_compute_bdf_in(""), None);
 }
+
+/// The pin names a card that **scans out the boot console**, and it is
+/// obeyed.
+///
+/// This is the one that changed. The old code found the card, saw it was the
+/// console GPU, logged «ignoring pin» and fell through to the automatic
+/// choice -- so the knob that exists for when the automatic choice went wrong
+/// deferred to the automatic choice. On a one-card box the pin could never
+/// name anything else, which made it unusable rather than merely overridden.
+#[test]
+fn a_pin_on_the_card_that_scans_out_is_obeyed() {
+    // One card, at 65:00.0, and it is the one scanning out.
+    let cards = [(Some((0u32, 0x65u8, 0x00u8, 0u8)), true)];
+    assert_eq!(resolve_compute_pin(&cards, (0x65, 0x00, 0)), Some(0));
+}
+
+/// The flag is not a tie-break either: with two cards, the pin picks the one
+/// it names, scanning out or not.
+#[test]
+fn the_pin_picks_the_card_it_names_whichever_one_that_is() {
+    let cards = [
+        (Some((0u32, 0x01u8, 0x00u8, 0u8)), false),
+        (Some((0u32, 0x65u8, 0x00u8, 0u8)), true),
+    ];
+    assert_eq!(resolve_compute_pin(&cards, (0x65, 0x00, 0)), Some(1));
+    assert_eq!(resolve_compute_pin(&cards, (0x01, 0x00, 0)), Some(0));
+}
+
+/// A pin that matches nothing is still nothing: the caller says so and falls
+/// back, rather than picking a neighbour.
+#[test]
+fn a_pin_that_matches_no_card_resolves_to_nothing() {
+    let cards = [
+        (Some((0u32, 0x01u8, 0x00u8, 0u8)), false),
+        (Some((0u32, 0x65u8, 0x00u8, 0u8)), true),
+    ];
+    assert_eq!(resolve_compute_pin(&cards, (0x42, 0x00, 0)), None);
+    // The function field is part of the match, not decoration.
+    assert_eq!(resolve_compute_pin(&cards, (0x65, 0x00, 1)), None);
+    // A driver with no BDF at all (not a PCI GPU) is never the pin's card.
+    assert_eq!(resolve_compute_pin(&[(None, false)], (0x65, 0x00, 0)), None);
+    assert_eq!(resolve_compute_pin(&[], (0x65, 0x00, 0)), None);
+}

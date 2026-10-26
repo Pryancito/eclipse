@@ -1224,6 +1224,10 @@ fn the_hand_over_actually_takes_the_display_away() {
 /// the log on. That is why it is pinned rather than left to a comment.
 #[test]
 fn the_display_is_only_handed_over_when_someone_asks() {
+    // Process-wide switch, and `cargo test` runs these in parallel: without
+    // the lock this asserts on a default another test is mid-way through
+    // flipping, which is how a suite fails one run in three.
+    let _s = crate::test_globals::LOCK.lock();
     assert!(
         !crate::display::nouveau_uapi::display_off_for_gsp(),
         "handing the console GPU's display over is OFF by default: the one boot that ran          with it on never got its picture back. `nvidia.dispoff` is the opt-IN"
@@ -1234,4 +1238,87 @@ fn the_display_is_only_handed_over_when_someone_asks() {
         "`nvidia.dispoff` must still reach the boot path"
     );
     crate::display::nouveau_uapi::set_display_off_for_gsp(false);
+}
+
+/// The GSP boot no longer refuses the card that scans out.
+///
+/// That refusal -- `SKIPPED on console GPU` -- WAS the split: one card got the
+/// chain and the other got a sentence. Moebius asked for it gone («nada de
+/// compute y console, va a ser como en linux»), and it reverts to one `return`
+/// that compiles, passes every other test here, and quietly restores two paths.
+#[test]
+fn the_gsp_boot_does_not_refuse_the_card_that_scans_out() {
+    let body = live_method_lines("bringup_step6");
+    assert!(
+        !body.contains("SKIPPED on console GPU"),
+        "`bringup_step6` must not refuse a card by role any more: {}",
+        body
+    );
+    let mark = body.find("mark_primary_for_rm").expect(
+        "the card that scans out must still declare itself PRIMARY to the RM, where Linux does",
+    );
+    let boot = body
+        .find("gsp_boot_run(")
+        .expect("`bringup_step6` must still boot the GSP");
+    assert!(
+        mark < boot,
+        "the primary mark goes BEFORE the boot -- after it, GSP-RM has already \
+         decided it reserves no console region (mark {} / boot {})",
+        mark,
+        boot
+    );
+    assert!(
+        body.contains("BootWindow::enter("),
+        "the card with a live raster still gets the hand-over window around its boot: {}",
+        body
+    );
+}
+
+/// Only ONE question about role survives in the automatic bring-up, and it is
+/// policy, not a second chain.
+///
+/// The failure this pins is a re-split: an edit that puts the scanout card
+/// back on a branch of its own reads as a small change and gives Eclipse two
+/// bring-ups again.
+#[test]
+fn the_automatic_bring_up_asks_about_the_card_once_and_only_about_policy() {
+    let body = live_method_lines("auto_bringup_compute");
+    let asks: alloc::vec::Vec<&str> = body
+        .lines()
+        .filter(|l| l.contains("drives_boot_display()"))
+        .collect();
+    assert_eq!(
+        asks.len(),
+        1,
+        "exactly one question about the card's role belongs here, the policy one; \
+         found {:?}",
+        asks
+    );
+    assert!(
+        asks[0].contains("scanout_gpu_bringup()"),
+        "...and that question must be the policy hatch, not a branch into a \
+         different chain: {:?}",
+        asks[0]
+    );
+}
+
+/// Bringing the scanout card up is an opt-in while its GSP boot still wedges.
+///
+/// A wedge at boot is not a degraded desktop, it is a machine that does not
+/// come back: no session, no console, nothing to read a log on. The default
+/// flips when a boot survives the SEC2 store, and this test is the reminder
+/// that flipping it is a decision, not a typo.
+#[test]
+fn the_scanout_card_is_brought_up_only_when_asked() {
+    let _s = crate::test_globals::LOCK.lock();
+    assert!(
+        !crate::display::nouveau_uapi::scanout_gpu_bringup(),
+        "default OFF while the GSP boot of a live-raster card wedges at STARTCPU"
+    );
+    crate::display::nouveau_uapi::set_scanout_gpu_bringup(true);
+    assert!(
+        crate::display::nouveau_uapi::scanout_gpu_bringup(),
+        "`nvidia.scanout_gpu` must reach the bring-up path"
+    );
+    crate::display::nouveau_uapi::set_scanout_gpu_bringup(false);
 }

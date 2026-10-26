@@ -362,7 +362,7 @@ fn the_eld_baseline_length_covers_the_bytes_written_into_it() {
 /// hatch that brings the card up anyway.
 #[test]
 fn the_console_gpu_says_why_it_stayed_cold_and_what_lifts_it() {
-    let line = console_gpu_cold_line(
+    let line = boot_fb::console_gpu_cold_line(
         0x0a,
         0,
         "RTX 2060 SUPER",
@@ -391,8 +391,8 @@ fn the_console_gpu_says_why_it_stayed_cold_and_what_lifts_it() {
         line
     );
     assert!(
-        line.contains("nvidia.console_gpu"),
-        "the hatch that lifts it is named: {}",
+        line.contains("nvidia.scanout_gpu"),
+        "the hatch that lifts it is named, and it is the one that exists: {}",
         line
     );
     // One line, no trailing newline: the caller logs it with klog_info!.

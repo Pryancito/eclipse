@@ -111,42 +111,86 @@ fn parse_compute_bdf_in(cmdline: &str) -> Option<(u8, u8, u8)> {
     None
 }
 
+/// A GPU's PCI address as [`DrmScheme::pci_bdf`] reports it: domain, bus,
+/// device, function.
+type PciBdf = (u32, u8, u8, u8);
+
+/// One card as [`resolve_compute_pin`] sees it: where it is, and whether it
+/// scans out the boot console.
+type PinnableCard = (Option<PciBdf>, bool);
+
 #[cfg(test)]
 mod compute_bdf_tests;
 
 /// The NVIDIA GPU that owns compute (SAXPY, NVK EXEC, CE-present): either
 /// the `nvidia.compute=BB.DD.F` pin, or the first driver with
-/// [`DrmScheme::is_compute_gpu`]. Never the console GPU — its GSP resume
-/// can wedge the bus.
+/// [`DrmScheme::is_compute_gpu`].
+///
+/// **The pin is obeyed, including when it names the card that scans out.**
+/// It used to be dropped in that case, with a klog line, and the automatic
+/// choice taken instead. That is the defect [`parse_compute_bdf_in`] already
+/// argues against one screen up — *"a pin is exactly the knob someone reaches
+/// for when the automatic choice already went wrong, so it has to either mean
+/// what it says or say nothing"* — and refusing by role was the automatic
+/// choice overruling the operator about the one thing only the operator knows.
+/// On a one-card box it was not even a choice: the only card scans out, so the
+/// pin could never name anything else.
+///
+/// What it cost is real and it is the operator's to spend: that card's GSP
+/// boot can wedge the bus, so the klog says plainly what was asked for.
+/// Without the pin nothing changes — the automatic fallback below still skips
+/// the card that scans out, so a box that asks for nothing gets exactly the
+/// node map it got before.
 pub fn get_compute_driver() -> Option<Arc<dyn DrmScheme>> {
     let drivers = kernel_hal::drivers::all_drm();
     let list = drivers.as_vec();
     if let Some((bus, dev, func)) = parse_nvidia_compute_bdf() {
-        if let Some(d) = list.iter().find(|d| {
-            matches!(
-                d.pci_bdf(),
-                Some((_, b, dv, f)) if b == bus && dv == dev && f == func
-            )
-        }) {
-            if d.is_console_gpu() {
+        let cards: Vec<PinnableCard> = list
+            .iter()
+            .map(|d| (d.pci_bdf(), d.is_console_gpu()))
+            .collect();
+        match resolve_compute_pin(&cards, (bus, dev, func)) {
+            Some(i) => {
+                if cards[i].1 {
+                    kernel_hal::klog_info!(
+                        "[drm] nvidia.compute={:02x}.{:02x}.{:x} is the card that scans out the \
+                         console -- obeying the pin anyway (its GSP boot can wedge the bus; \
+                         that is what was asked for)",
+                        bus,
+                        dev,
+                        func
+                    );
+                }
+                return list.get(i).cloned();
+            }
+            None => {
                 kernel_hal::klog_info!(
-                    "[drm] nvidia.compute={:02x}.{:02x}.{:x} is the console GPU — ignoring pin \
-                     (GSP on the GOP card can wedge the bus)",
+                    "[drm] nvidia.compute={:02x}.{:02x}.{:x} does not match any DRM GPU",
                     bus,
                     dev,
                     func
                 );
-            } else {
-                return Some(d.clone());
             }
-        } else {
-            kernel_hal::klog_info!(
-                "[drm] nvidia.compute={:02x}.{:02x}.{:x} does not match any DRM GPU",
-                bus,
-                dev,
-                func
-            );
         }
     }
     list.iter().find(|d| d.is_compute_gpu()).cloned()
+}
+
+/// Which card in `cards` the `nvidia.compute=BB.DD.F` pin names, by index.
+///
+/// `cards` is each registered driver's PCI BDF paired with whether it scans
+/// out the boot console. Separate from [`get_compute_driver`] because that
+/// reads the real driver registry and the real kernel command line, neither of
+/// which a test here can set: this half is the decision, and the decision is
+/// what changed.
+///
+/// **A card that scans out is matched like any other.** The flag is in the
+/// list only so the caller can say in the klog what it is about to do; it is
+/// not a reason to look past the card the operator named. See
+/// [`get_compute_driver`] for why.
+fn resolve_compute_pin(cards: &[PinnableCard], pin: (u8, u8, u8)) -> Option<usize> {
+    let (bus, dev, func) = pin;
+    cards.iter().position(|(bdf, _scans_out)| {
+        matches!(bdf, Some((_, b, dv, f)) if *b == bus && *dv == dev && *f == func)
+    })
 }

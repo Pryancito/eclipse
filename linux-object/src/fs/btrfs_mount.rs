@@ -6,7 +6,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::convert::{TryFrom, TryInto};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use btrfs::{Btrfs, Error as BtrfsError, FileKind};
 use lock::Mutex;
@@ -302,8 +302,28 @@ struct CachedDirEntry {
     ino: u64,
 }
 
+/// Apply `btrfs.sbcsum=off` once, before the first mount reads a superblock.
+///
+/// The crate refuses a superblock whose checksum does not match its bytes.
+/// That is the right default and nothing this tree writes trips it, but a disk
+/// that took a flipped bit there is then unmountable, so the machine it was the
+/// root of does not boot and has no way back in without a rebuilt kernel. This
+/// is that way back: the volume still mounts, with the stored and computed
+/// checksums warned on every mount.
+fn apply_sb_csum_option() {
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if ONCE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if kernel_hal::cmdline::is_off(&kernel_hal::boot::cmdline(), "btrfs.sbcsum") {
+        btrfs::volume::set_superblock_csum_enforced(false);
+        warn!("btrfs: btrfs.sbcsum=off -- a bad superblock checksum will warn, not refuse");
+    }
+}
+
 impl BtrfsMountFs {
     pub fn open(backend: &MountBackend, read_only: bool) -> Result<Arc<Self>> {
+        apply_sb_csum_option();
         let size = backend_size(backend)?;
         let device = device_from_backend(backend)?;
         let adapter: Arc<dyn btrfs::BlockDevice> = Arc::new(DevAdapter::new(device, size));
