@@ -2264,6 +2264,11 @@ pub use driver_registry::*;
 mod gem_names;
 pub use gem_names::{forget_gem_name_of_driver_handle, gem_flink, gem_open};
 
+mod prime_import;
+pub use prime_import::{
+    card_index_holding_gem, card_index_of_minor, prime_import_for, PrimeImport,
+};
+
 /// Base minor of the render-node range, as Linux allocates them: primary
 /// nodes are `card0..card63`, render nodes `renderD128..renderD191`.
 pub const RENDER_MINOR_BASE: u32 = 128;
@@ -2766,14 +2771,10 @@ pub fn export_handle_for(
     Ok((phys_addr, size as usize, vmo))
 }
 
-/// Reverse lookup for PRIME self-import: the nouveau-uAPI GEM handle whose
-/// backing starts at `phys_addr`, if any. Thin re-export of
-/// `gem_mmap::lookup_by_phys` so `linux-syscall` (which has no
-/// `zcore-drivers` dependency of its own) can resolve a dma-buf back to the
-/// original driver-private handle -- see `sys_drm_prime`'s import arm.
-pub fn nouveau_handle_for_phys(phys_addr: u64) -> Option<u32> {
-    zcore_drivers::scheme::gem_mmap::lookup_by_phys(phys_addr).map(|(handle, _)| handle)
-}
+// The reverse lookup a PRIME import does (`gem_mmap::lookup_by_phys`) is in
+// [`prime_import`], which asks the importing node's card about the object it
+// finds: by physical address alone it answered another card's handle. See
+// that module's doc.
 
 /// Take a PRIME reference on a driver-private GEM handle resolved by a
 /// self-import (see `sys_drm_prime`). Thin re-export of `gem_mmap::add_ref` so
@@ -8276,6 +8277,12 @@ mod gem_ownership_tests;
 /// reference on the original.
 #[cfg(test)]
 mod prime_import_chain_tests;
+
+/// Which card a `PRIME_FD_TO_HANDLE` resolves against: the reverse lookup
+/// knows the memory, and the importing node's card decides whose handle that
+/// is. The hole under one desktop across two cards.
+#[cfg(test)]
+mod prime_import_card_tests;
 
 /// Turning a screen off, and a commit that fails leaving nothing behind.
 #[cfg(test)]
