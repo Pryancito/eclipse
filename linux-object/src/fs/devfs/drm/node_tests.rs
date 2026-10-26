@@ -2,8 +2,9 @@ use super::*;
 use crate::fs::devfs::kms_emu::{self, EmuGpu};
 
 /// Leaves `GPU_NODES` empty however the test ends. A table left behind
-/// holds an `Arc` to a dead emulated GPU and makes `is_compute_minor`
-/// answer true for minors a later test expects to be plain KMS cards.
+/// holds an `Arc` to a dead emulated GPU and makes the per-node
+/// `GETRESOURCES` answer ([`topology::resources_for_node`]) come out of that
+/// dead card for minors a later test expects to be plain KMS cards.
 ///
 /// Declare it AFTER the [`kms_emu::Screen`], so it drops BEFORE it: the
 /// `Screen` holds the DRM test lock, and a reset that ran after the lock
