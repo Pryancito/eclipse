@@ -241,6 +241,7 @@ mod gpu_ready;
 /// The bring-up narration switch; own file for the size ceiling, no logic
 /// change.
 mod boot_window;
+mod pdisp_intr;
 mod quiet_bringup;
 use quiet_bringup::QuietBringup;
 
@@ -1421,6 +1422,10 @@ impl NvidiaGpu {
             log::error!("{}", line);
             let _ = writeln!(s, "{}", line);
         }
+        // ...and what the display engine has PENDING, which the head state
+        // does not say. Same phases, same read-only rule, same PDISP gate:
+        // see `pdisp_intr` for why it cannot go near the STARTCPU store.
+        s.push_str(&pdisp_intr::dump(bar0, tag, phase));
         s
     }
 
