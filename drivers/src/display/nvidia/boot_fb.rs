@@ -45,10 +45,9 @@ pub(super) fn boot_fb_size() -> Option<u64> {
 /// line carries the three facts that decide it -- the boot framebuffer
 /// address and the BAR1 window it fell inside, which is the whole of
 /// `drives_boot_display` -- plus the hatch that brings the card up anyway
-/// (the deferred bring-up, which is the default on a multi-GPU box and
-/// `nvidia.console_gpu` on a single-GPU one; see
-/// `schedule_deferred_console_bringup`). Pure so it can be tested on a
-/// machine with no GPU, which is every machine here.
+/// (`nvidia.scanout_gpu`, which puts it through the same chain as every other
+/// card; see `bringup_all`). Pure so it can be tested on a machine with no
+/// GPU, which is every machine but Moebius's.
 pub(super) fn console_gpu_cold_line(
     bus: u8,
     device: u8,
@@ -60,8 +59,8 @@ pub(super) fn console_gpu_cold_line(
     format!(
         "GPU {:02x}:{:02x}.0 {} es la GPU de consola (fb de arranque {:#x} dentro de BAR1 \
          {:#x}+{:#x}) — fuera del bring-up de arranque: su GSP se cuelga en el store \
-         STARTCPU de SEC2 con el scanout vivo. Se sube despues, con el escritorio ya \
-         arriba y el scanout pausado (nvidia.console_gpu; nvidia.noconsole_gpu lo apaga)",
+         STARTCPU de SEC2 con el scanout vivo. nvidia.scanout_gpu la arranca en la \
+         misma cadena que las demas, como en Linux; nvidia.noconsole_gpu lo apaga",
         bus, device, model, boot_fb_phys, bar1_phys, bar1_len,
     )
 }

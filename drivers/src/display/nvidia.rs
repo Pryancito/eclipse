@@ -241,6 +241,7 @@ mod gpu_ready;
 /// The bring-up narration switch; own file for the size ceiling, no logic
 /// change.
 mod boot_window;
+mod bringup_all;
 mod pdisp_intr;
 mod quiet_bringup;
 use quiet_bringup::QuietBringup;
@@ -402,7 +403,7 @@ fn surfaceflip_stats_line() -> String {
 /// for size only; a child module still reaches its private items.
 mod boot_fb;
 pub use boot_fb::set_boot_fb_info;
-use boot_fb::{boot_fb_phys, boot_fb_size, console_gpu_cold_line, BootFbInfo};
+use boot_fb::{boot_fb_phys, boot_fb_size, BootFbInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvidiaArchitecture {
@@ -4603,12 +4604,18 @@ impl DrmScheme for NvidiaGpu {
         // proven end-to-end and the console-GPU collision is isolated as the
         // remaining problem (likely fix: stop console rendering during its GSP
         // boot). If the secondary wedges identically, the console theory dies.
+        // No card is refused here any more: there is one bring-up for all of
+        // them (`bringup_all`). What the card that scans out gets EXTRA is
+        // what Linux gives its primary -- it says so to the RM, and its
+        // display is handed to the firmware for the boot -- not a path of its
+        // own. Whether it is brought up at all is policy, decided once by the
+        // caller (`nouveau_uapi::scanout_gpu_bringup`), not here.
         if self.drives_boot_display() {
-            return String::from(
-                "[gpustep6]  --- Real GSP-RM boot: SKIPPED on console GPU (SEC2 resume wedges its bus \
-                 while the console renders into its BAR1; use /proc/gpustep11, which freezes the \
-                 graphic console around the boot) ---\n",
-            );
+            s.push_str(&bringup_all::mark_primary_for_rm(self, "gpustep6"));
+            let window = boot_window::BootWindow::enter(self, "gpustep6", &mut s);
+            s.push_str(&self.gsp_boot_run("gpustep6", false));
+            window.leave(&mut s);
+            return s;
         }
 
         s.push_str(&self.gsp_boot_run("gpustep6", false));
@@ -4933,15 +4940,12 @@ impl DrmScheme for NvidiaGpu {
         // STARTCPU store) and drives the display fine via the GOP framebuffer.
         // It does get its own line: silence here is what made a dual-card box
         // report one GPU up and give the log no way to say which card or why.
-        if self.drives_boot_display() {
-            return console_gpu_cold_line(
-                self.pci_bus,
-                self.pci_device,
-                self.gpu_model,
-                boot_fb_phys().unwrap_or(0),
-                self.bar1_phys,
-                self.info.fb_size as u64,
-            );
+        // One chain for every card. The only question asked about this one is
+        // policy -- whether a card with a live raster is brought up at all on
+        // hardware whose GSP boot still wedges -- and it is a single line, not
+        // a second path. See `nouveau_uapi::scanout_gpu_bringup`.
+        if self.drives_boot_display() && !super::nouveau_uapi::scanout_gpu_bringup() {
+            return bringup_all::cold_line(self);
         }
         // Run the proven state-load chain (the same sequence a user triggers as
         // `cat /proc/gpustep5;6;8;9`), executed once at boot before any

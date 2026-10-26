@@ -1155,6 +1155,17 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             }
             let want_console_gpu = console_gpu_by_default
                 || kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu");
+            // One bring-up path for every card now; this only says whether the
+            // card that scans out is brought up at all, while its GSP boot
+            // still wedges at the SEC2 store. `nvidia.scanout_gpu` is the
+            // name, `nvidia.console_gpu` the older spelling of the same thing,
+            // and `nvidia.noconsole_gpu` beats both so a cmdline written
+            // against the old default still leaves that card cold.
+            kernel_hal::drivers::set_scanout_gpu_bringup(
+                (kernel_hal::cmdline::flag(&options.cmdline, "nvidia.scanout_gpu")
+                    || kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu"))
+                    && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.noconsole_gpu"),
+            );
             // `/proc/gpuready` answers for the console card, and that card only
             // becomes usable because the task below brings it up. Tell the
             // reader whether anyone scheduled it: without this a box booted
