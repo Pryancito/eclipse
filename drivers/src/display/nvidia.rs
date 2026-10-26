@@ -3633,49 +3633,59 @@ impl DrmScheme for NvidiaGpu {
         !self.drives_boot_display()
     }
 
+    /// Two facts about this card, where there used to be a role.
+    ///
+    /// `role=console` / `role=compute` was the vocabulary Moebius asked to
+    /// retire: a card is not a kind of card, it either scans out the boot
+    /// console or it does not, and its RM either came up or did not. Those are
+    /// the two things a reader of `/proc/gpuroles` actually needs, and the
+    /// second one is the one that decides whether anything works on it.
+    ///
+    /// The node list is gone with the role. It was the constant
+    /// `card0,card1,renderD128,renderD129` for every non-scanout card and a
+    /// parenthesis for the other, derived from nothing: on a box where
+    /// `build_gpu_nodes` had named three cards it still printed two pairs, and
+    /// on a one-card box it claimed a `card1` that did not exist. `/dev/dri` is
+    /// enumerated a few lines further down the same file, from the node table
+    /// itself, so the lie was not even the only answer there.
     fn gpu_role_line(&self) -> String {
-        let role = if self.drives_boot_display() {
-            "console"
-        } else {
-            "compute"
-        };
-        let rm = if self.rm_device_instance.lock().is_some() {
-            "rm=ready"
-        } else {
-            "rm=cold"
-        };
-        let nodes = if self.drives_boot_display() {
-            "(GOP scanout; GSP not auto-booted)"
-        } else {
-            "nodes=/dev/dri/card0,/dev/dri/card1,/dev/dri/renderD128,/dev/dri/renderD129"
-        };
         alloc::format!(
-            "{:02x}:{:02x}.0 {} role={} {} {}\n",
+            "{:02x}:{:02x}.0 {} scanout={} rm={}\n",
             self.pci_bus,
             self.pci_device,
             self.gpu_model,
-            role,
-            rm,
-            nodes
+            if self.drives_boot_display() {
+                "boot-console"
+            } else {
+                "no"
+            },
+            if self.rm_device_instance.lock().is_some() {
+                "ready"
+            } else {
+                "cold"
+            },
         )
     }
 
+    /// Compute on this card, whichever card it is.
+    ///
+    /// The refusal that used to stand here -- `-ENODEV`, «is the console GPU
+    /// — compute lives on the secondary» -- was the split at its sharpest, and
+    /// on a one-card box it meant compute did not exist at all: the only card
+    /// scans out, so every op on every card answered `ENODEV` forever, even
+    /// after the deferred bring-up had the RM up and serving. Moebius asked
+    /// for that to go («nada de compute y console»), and his reason settles
+    /// what replaces it: Linux refuses compute for want of a device, never for
+    /// want of a *role*.
+    ///
+    /// So nothing stands here. Every op below already answers by readiness --
+    /// `INFO` reports `rm=cold` and `-ENODEV`, `SAXPY` and `BENCH` say
+    /// `skipped` -- which is the honest refusal and the same one any other
+    /// cold card gets.
     fn compute_launch(&self, op: u32) -> crate::scheme::drm::ComputeLaunchResult {
         use crate::scheme::drm::{
             ComputeLaunchResult, COMPUTE_OP_BENCH, COMPUTE_OP_INFO, COMPUTE_OP_SAXPY,
         };
-        if self.drives_boot_display() {
-            return ComputeLaunchResult {
-                status: -19, // -ENODEV: console GPU is not the compute device
-                elapsed_ns: 0,
-                grid_threads: 0,
-                report: alloc::format!(
-                    "GPU {:02x}:{:02x}.0 is the console GPU — compute lives on the secondary\n",
-                    self.pci_bus,
-                    self.pci_device
-                ),
-            };
-        }
         match op {
             COMPUTE_OP_INFO => {
                 let ready = self.rm_device_instance.lock().is_some();

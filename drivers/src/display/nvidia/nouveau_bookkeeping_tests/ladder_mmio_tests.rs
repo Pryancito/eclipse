@@ -697,28 +697,52 @@ fn step4_waits_out_the_bind_the_commit_the_retry_and_the_fetch() {
     assert_eq!(rd32(&gpu, 0x2b8c), 0, "the commit went through");
 }
 
-/// The compute ioctl's dispatcher: the console GPU is not the compute
-/// device (ENODEV, whatever the op), INFO is the role line plus the two
-/// switches and is ready only with the RM attached, SAXPY runs the GR
-/// ladder up to step 23 and BENCH the benchmark (both say skipped on a
-/// cold GPU and FAILED on the fake RM, status 5 either way), and an op
-/// nobody defined is EINVAL.
+/// The compute ioctl's dispatcher answers by **readiness**, never by role:
+/// INFO is the card's two facts plus the two switches and is ready only with
+/// the RM attached, SAXPY runs the GR ladder up to step 23 and BENCH the
+/// benchmark (both say skipped on a cold GPU and FAILED on the fake RM,
+/// status 5 either way), and an op nobody defined is EINVAL.
+///
+/// What this test used to pin, and no longer does, is the refusal by role:
+/// `-ENODEV` and «is the console GPU — compute lives on the secondary» for
+/// every op on the card that scans out, whatever state it was in. On a
+/// one-card box that was all of compute, for ever, including after the
+/// deferred bring-up had the RM up and serving.
 #[test]
-fn compute_launch_answers_by_role_and_readiness_and_runs_the_ladders() {
+fn compute_launch_answers_by_readiness_and_never_by_role() {
     use crate::scheme::drm::{COMPUTE_OP_BENCH, COMPUTE_OP_INFO, COMPUTE_OP_SAXPY};
     let _g = LOCK.lock();
     let console = BootFb::console();
     let gpu = super::gpu();
+    // Scans out AND cold: refused, but for the reason that is true -- and the
+    // refusal is the readiness one every other cold card gets, with the card's
+    // own line rather than a sentence about roles.
     let r = DrmScheme::compute_launch(&gpu, COMPUTE_OP_INFO);
     assert_eq!((r.status, r.elapsed_ns, r.grid_threads), (-19, 0, 0));
-    assert_eq!(
-        r.report,
-        "GPU 00:00.0 is the console GPU — compute lives on the secondary\n"
+    assert!(
+        r.report
+            .starts_with("00:00.0 GeForce RTX 2060 Super scanout=boot-console rm=cold\n"),
+        "{}",
+        r.report
     );
-    assert_eq!(
-        DrmScheme::compute_launch(&gpu, COMPUTE_OP_BENCH).status,
-        -19
+    assert!(
+        !r.report.contains("compute lives on the secondary"),
+        "the refusal by role is gone: {}",
+        r.report
     );
+    // The one that matters: the SAME card, scanning out, with its RM up. This
+    // answered -ENODEV for ever before, which is why a one-card box had no
+    // compute at all.
+    let ready_console = super::gpu_rm();
+    let r = DrmScheme::compute_launch(&ready_console, COMPUTE_OP_INFO);
+    assert_eq!(r.status, 0, "{}", r.report);
+    assert!(
+        r.report
+            .starts_with("00:00.0 GeForce RTX 2060 Super scanout=boot-console rm=ready\n"),
+        "{}",
+        r.report
+    );
+    drop(ready_console);
     drop(console);
     let _no_boot_fb = BootFb::none();
 
@@ -727,7 +751,7 @@ fn compute_launch_answers_by_role_and_readiness_and_runs_the_ladders() {
     assert_eq!(r.status, -19, "cold");
     assert_eq!(
         r.report,
-        "00:00.0 GeForce RTX 2060 Super role=compute rm=cold nodes=/dev/dri/card0,/dev/dri/card1,/dev/dri/renderD128,/dev/dri/renderD129\n\
+        "00:00.0 GeForce RTX 2060 Super scanout=no rm=cold\n\
          nouveau_uapi=on\nexec_fast=off\n\
          nvk_compute=/dev/dri/card0 (nouveau); this ioctl is eclipse-compute (Mesa skips card1)\n"
     );
@@ -753,7 +777,7 @@ fn compute_launch_answers_by_role_and_readiness_and_runs_the_ladders() {
     assert_eq!(r.status, 0);
     assert!(
         r.report
-            .starts_with("00:00.0 GeForce RTX 2060 Super role=compute rm=ready nodes="),
+            .starts_with("00:00.0 GeForce RTX 2060 Super scanout=no rm=ready\n"),
         "{}",
         r.report
     );

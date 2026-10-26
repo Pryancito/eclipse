@@ -103,6 +103,64 @@ fn deadlock_spins(cmdline: &str) -> Option<Result<u64, &str>> {
     Some(kernel_hal::cmdline::parse_number(spelled).ok_or(spelled))
 }
 
+/// What the command line and the enumerated cards say between them about this
+/// being a multi-GPU box.
+#[cfg_attr(not(any(feature = "linux", test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultiGpu {
+    /// `nvidia.multigpu` is on the command line and more than one NVIDIA card
+    /// enumerated. The declaration and the hardware agree.
+    Declared,
+    /// `nvidia.multigpu` is on the command line and exactly one NVIDIA card
+    /// enumerated. The declaration is about hardware that is not there, so the
+    /// box is treated as what it turned out to be.
+    DeclaredButOneCard,
+    /// More than one NVIDIA card enumerated and nothing declared.
+    SeveralCardsUndeclared,
+    /// One NVIDIA card, or none, and nothing declared.
+    Single,
+}
+
+impl MultiGpu {
+    /// Whether the card that scans out the console is brought up by default.
+    ///
+    /// True for both of the several-card cases, including the undeclared one.
+    /// Moebius's convention is that a multi-GPU box says so --
+    /// `nvidia.multigpu` -- and the log says as much when it did not; but
+    /// *behaving* as a one-card box because the flag is missing would quietly
+    /// halve a machine that enumerated two cards, so the cards win where they
+    /// are the stronger evidence.
+    ///
+    /// On a declaration with one card the hardware wins the other way, and for
+    /// a sharper reason: there the only card is the one scanning out, so the
+    /// SEC2 `STARTCPU` store that can wedge takes the whole machine, with no
+    /// second card to fall back on. `nvidia.scanout_gpu` and
+    /// `nvidia.console_gpu` still ask for it by name.
+    fn is_multigpu(self) -> bool {
+        matches!(self, MultiGpu::Declared | MultiGpu::SeveralCardsUndeclared)
+    }
+}
+
+/// [`MultiGpu`] from a command line and the card counts, which is the only way
+/// to ask it in a test: the real counts come from the driver registry and the
+/// real line from the bootloader.
+#[cfg(any(feature = "linux", test))]
+fn multigpu_verdict(cmdline: &str, nvidia_cards: usize, scanout_cards: usize) -> MultiGpu {
+    let declared = kernel_hal::cmdline::flag(cmdline, "nvidia.multigpu");
+    // No card scanning out means no card to bring up by default, whatever was
+    // declared and however many cards there are: the question this answers is
+    // about the card that holds the console.
+    if scanout_cards == 0 {
+        return MultiGpu::Single;
+    }
+    match (declared, nvidia_cards > 1) {
+        (true, true) => MultiGpu::Declared,
+        (true, false) => MultiGpu::DeclaredButOneCard,
+        (false, true) => MultiGpu::SeveralCardsUndeclared,
+        (false, false) => MultiGpu::Single,
+    }
+}
+
 /// Whether the command line asks for the card that scans out to go through the
 /// boot-time bring-up, the same one every other card goes through.
 ///
@@ -1161,18 +1219,33 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 .iter()
                 .filter(|d| d.is_console_gpu() || d.is_compute_gpu())
                 .count();
-            let console_gpu_by_default = nvidia_cards > 1
-                && console_cards > 0
+            let verdict = multigpu_verdict(&options.cmdline, nvidia_cards, console_cards);
+            let console_gpu_by_default = verdict.is_multigpu()
                 && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.noconsole_gpu");
-            if console_gpu_by_default
-                && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu")
-            {
-                klog_info!(
-                    "Eclipse: {} GPUs NVIDIA ({} de consola) — bring-up de la GPU de consola \
-                     por defecto, como en Linux (apagalo con nvidia.noconsole_gpu)",
+            match verdict {
+                MultiGpu::Declared => klog_info!(
+                    "Eclipse: nvidia.multigpu — caja multi-GPU declarada, {} GPUs NVIDIA ({} \
+                     escanean la consola); bring-up de la que escanea por defecto, como en \
+                     Linux (apagalo con nvidia.noconsole_gpu)",
                     nvidia_cards,
                     console_cards
-                );
+                ),
+                MultiGpu::DeclaredButOneCard => klog_warn!(
+                    "Eclipse: nvidia.multigpu declarado pero sólo se enumeró {} GPU NVIDIA — se \
+                     trata como caja de una tarjeta. Con una sola, el store STARTCPU de SEC2 que \
+                     puede colgar se lleva la máquina entera y no hay segunda a la que caer. \
+                     Para subirla igual: nvidia.scanout_gpu (en el arranque) o nvidia.console_gpu \
+                     (diferido)",
+                    nvidia_cards
+                ),
+                MultiGpu::SeveralCardsUndeclared => klog_info!(
+                    "Eclipse: {} GPUs NVIDIA ({} escanean la consola) y nvidia.multigpu NO está \
+                     en la cmdline — se trata como multi-GPU igual, por lo que se enumeró. Lo \
+                     normal es declararlo con nvidia.multigpu",
+                    nvidia_cards,
+                    console_cards
+                ),
+                MultiGpu::Single => {}
             }
             let want_console_gpu = console_gpu_by_default
                 || kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu");
@@ -1667,7 +1740,7 @@ fn secondary_main() -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{deadlock_spins, scanout_gpu_bringup_asked};
+    use super::{deadlock_spins, multigpu_verdict, scanout_gpu_bringup_asked, MultiGpu};
 
     /// The line a live Eclipse boots with, which mentions no threshold.
     const REAL: &str = "LOG=error:TERM=xterm-256color:console.shell=true:ROOT=/dev/sda2";
@@ -1801,5 +1874,58 @@ mod tests {
         assert!(!scanout_gpu_bringup_asked(
             "nvidia.noconsole_gpu:nvidia.scanout_gpu"
         ));
+    }
+
+    /// What Moebius says a multi-GPU box does: it declares itself.
+    #[test]
+    fn a_multigpu_box_declares_itself_and_is_taken_at_its_word() {
+        assert_eq!(
+            multigpu_verdict("LOG=error:nvidia.multigpu", 2, 1),
+            MultiGpu::Declared
+        );
+        assert!(multigpu_verdict("nvidia.multigpu", 2, 1).is_multigpu());
+        assert!(multigpu_verdict("nvidia.multigpu", 4, 1).is_multigpu());
+    }
+
+    /// Two cards and nobody said so: still two cards.
+    ///
+    /// The log says that declaring it is the convention, but behaving as a
+    /// one-card box over a missing flag would quietly halve a machine that
+    /// enumerated two.
+    #[test]
+    fn several_cards_without_the_flag_are_still_several_cards() {
+        assert_eq!(
+            multigpu_verdict(REAL, 2, 1),
+            MultiGpu::SeveralCardsUndeclared
+        );
+        assert!(multigpu_verdict(REAL, 2, 1).is_multigpu());
+    }
+
+    /// The declaration is about hardware. With one card it loses, because
+    /// there the wedge takes the whole machine.
+    #[test]
+    fn the_flag_does_not_invent_a_second_card() {
+        assert_eq!(
+            multigpu_verdict("nvidia.multigpu", 1, 1),
+            MultiGpu::DeclaredButOneCard
+        );
+        assert!(!multigpu_verdict("nvidia.multigpu", 1, 1).is_multigpu());
+    }
+
+    /// One card and nothing said: the ordinary desktop, and the default stays
+    /// off there.
+    #[test]
+    fn one_card_and_no_flag_is_a_single_gpu_box() {
+        assert_eq!(multigpu_verdict(REAL, 1, 1), MultiGpu::Single);
+        assert!(!multigpu_verdict(REAL, 1, 1).is_multigpu());
+    }
+
+    /// No card holds the console, so there is no card for this question to be
+    /// about -- however many there are and whatever was declared.
+    #[test]
+    fn no_card_scanning_out_is_not_a_multigpu_question() {
+        assert_eq!(multigpu_verdict("nvidia.multigpu", 2, 0), MultiGpu::Single);
+        assert_eq!(multigpu_verdict(REAL, 3, 0), MultiGpu::Single);
+        assert_eq!(multigpu_verdict(REAL, 0, 0), MultiGpu::Single);
     }
 }
