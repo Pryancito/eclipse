@@ -30,6 +30,8 @@ mod faults_tests;
 mod layout;
 /// `/proc/<pid>/limits`, in its own file for the same reason.
 mod limits;
+#[cfg(test)]
+mod mounts_tests;
 /// `/proc/<pid>/oom_score_adj`, `oom_adj` and `oom_score`.
 mod oom;
 pub(crate) mod owner;
@@ -931,7 +933,7 @@ impl ProcPidDirINode {
         }
     }
 
-    fn entries() -> [&'static str; 22] {
+    fn entries() -> [&'static str; 24] {
         [
             ".",
             "..",
@@ -955,6 +957,8 @@ impl ProcPidDirINode {
             "oom_score_adj",
             "oom_adj",
             "oom_score",
+            "mounts",
+            "mountinfo",
         ]
     }
 }
@@ -1091,6 +1095,23 @@ impl INode for ProcPidDirINode {
                     _ => ProcPidFileKind::OomScore,
                 },
             })),
+            // `mounts_open_common`: a process that has left its namespace
+            // (`exit_task_namespaces`), a zombie or a leader gone before its
+            // threads, has nothing to list, and the open is `EINVAL`.
+            "mounts" | "mountinfo" => {
+                let proc = self.process().ok_or(FsError::EntryNotFound)?;
+                let gone = crate::process::exited_leader_of(&proc).is_some();
+                if gone || matches!(proc.status(), Status::Exited(_)) {
+                    return Err(FsError::InvalidParam);
+                }
+                Ok(Arc::new(ProcPidFileINode {
+                    pid: self.pid,
+                    kind: match name {
+                        "mounts" => ProcPidFileKind::Mounts,
+                        _ => ProcPidFileKind::MountInfo,
+                    },
+                }))
+            }
             "task" => Ok(Arc::new(ProcPidTaskDirINode { pid: self.pid })),
             "exe" => {
                 self.check_read_innards()?;
@@ -2599,6 +2620,8 @@ enum ProcPidFileKind {
     OomScoreAdj,
     OomAdj,
     OomScore,
+    Mounts,
+    MountInfo,
 }
 
 impl ProcPidFileKind {
@@ -2622,6 +2645,8 @@ impl ProcPidFileKind {
             Self::OomScoreAdj => 18,
             Self::OomAdj => 19,
             Self::OomScore => 20,
+            Self::Mounts => 21,
+            Self::MountInfo => 22,
         }
     }
 
@@ -2715,6 +2740,9 @@ impl ProcPidFileINode {
             ProcPidFileKind::OomScoreAdj => oom::adj_text(&proc).into_bytes(),
             ProcPidFileKind::OomAdj => oom::legacy_text(&proc).into_bytes(),
             ProcPidFileKind::OomScore => oom::score_text(&proc).into_bytes(),
+            // One namespace: every process's is the machine's.
+            ProcPidFileKind::Mounts => super::proc_mounts_content().into_bytes(),
+            ProcPidFileKind::MountInfo => super::mountinfo::content(proc.try_linux()).into_bytes(),
         })
     }
 }

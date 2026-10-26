@@ -206,9 +206,8 @@ pub fn build_options_string(flags: usize, data: &str) -> alloc::string::String {
     if flags_noexec(flags, data) {
         opts.push_str(",noexec");
     }
-    if flags & MS_BIND != 0 {
-        opts.push_str(",bind");
-    }
+    // `MS_BIND` is what a call does, not what a mount is: Linux keeps no
+    // word for it, and the line of a bind is the line of what it took.
     // The caller's own option string last, minus anything already said. The
     // flag-derived half above and `data` are two spellings of one request --
     // `mount -o ro,nosuid` arrives with both set -- so appending `data` whole
