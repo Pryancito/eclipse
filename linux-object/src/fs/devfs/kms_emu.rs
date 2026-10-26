@@ -440,6 +440,11 @@ pub(crate) struct EmuGpu {
     /// `gem_mmap` (no host address): what `gem_aperture` answers `Vram` for,
     /// `(handle, owner pid)`, owner 0 being nobody's in particular.
     vram_objects: Vec<(u32, u64)>,
+    /// Driver-private GEM objects this GPU keeps in host RAM (GART), the way
+    /// nouveau's sysmem `GEM_NEW` ones do: a host physical address, so
+    /// `gem_mmap` has them and `gem_aperture` answers `Sysmem`. What a PRIME
+    /// import resolves to, and the only kind a second card can scan out of.
+    sysmem_objects: Vec<(u32, u64)>,
     calls: Mutex<GpuCalls>,
 }
 
@@ -464,6 +469,7 @@ impl EmuGpu {
             nouveau_capable: false,
             nouveau_ready: AtomicBool::new(false),
             vram_objects: Vec::new(),
+            sysmem_objects: Vec::new(),
             calls: Mutex::new(GpuCalls::default()),
         }
     }
@@ -481,6 +487,16 @@ impl EmuGpu {
     /// NVIDIA driver answers for an object the asker may not touch.
     pub(crate) fn with_vram_object_of(mut self, handle: u32, pid: u64) -> EmuGpu {
         self.vram_objects.push((handle, pid));
+        self
+    }
+
+    /// One more GEM object of this GPU that lives in host RAM: `gem_aperture`
+    /// answers `Sysmem` for it, which is how a card says "that object is
+    /// mine, and it has an address the CPU can read". Nobody's in particular
+    /// (owner 0), so any pid asking is told the truth -- the card question
+    /// and the owner question are separate ones.
+    pub(crate) fn with_sysmem_object(mut self, handle: u32) -> EmuGpu {
+        self.sysmem_objects.push((handle, 0));
         self
     }
 
@@ -583,12 +599,14 @@ impl DrmScheme for EmuGpu {
     }
 
     fn gem_aperture(&self, handle_id: u32, pid: u64) -> GemAperture {
-        let mine = self
-            .vram_objects
-            .iter()
-            .any(|&(h, owner)| h == handle_id && (pid == 0 || owner == 0 || owner == pid));
-        if mine {
+        let mine = |list: &Vec<(u32, u64)>| {
+            list.iter()
+                .any(|&(h, owner)| h == handle_id && (pid == 0 || owner == 0 || owner == pid))
+        };
+        if mine(&self.vram_objects) {
             GemAperture::Vram
+        } else if mine(&self.sysmem_objects) {
+            GemAperture::Sysmem
         } else {
             GemAperture::Unknown
         }

@@ -1693,9 +1693,23 @@ impl Syscall<'_> {
                         // import died, and the desktop fell over at
                         // "createImageFromDmaBufs failed" / zink "couldn't
                         // allocate memory".
-                        let (handle_id, kind) = match drm::nouveau_handle_for_phys(dmabuf.phys_addr)
-                        {
-                            Some(nouveau_handle) => {
+                        // ...and the card behind THIS node decides, because an
+                        // import is per device: `drm_gem_prime_fd_to_handle`
+                        // resolves against the importing device's prime table
+                        // and sends anything else to that device's own importer
+                        // (`nouveau_gem_prime_import_sg_table`). The reverse
+                        // lookup here is by physical address, with no card in
+                        // the key, so importing a card0 buffer through `card1`
+                        // used to answer card0's HANDLE: an id out of the other
+                        // card's slice, handed out through this node, whose
+                        // GEM_CLOSE drops a reference on the other card's
+                        // object and whose GEM_INFO/VM_BIND name an object of
+                        // the other card's RM. See `drm::prime_import`.
+                        let (handle_id, kind) = match drm::prime_import_for(
+                            dmabuf.phys_addr,
+                            drm_file.minor(),
+                        ) {
+                            drm::PrimeImport::SameCard(nouveau_handle) => {
                                 // Take a PRIME reference: the importer will GEM_CLOSE
                                 // this handle when done, but the exporter (wlroots)
                                 // still owns the same nouveau handle. Without this
@@ -1736,7 +1750,37 @@ impl Syscall<'_> {
                                 }
                                 (nouveau_handle, "self-import(nouveau)")
                             }
-                            None => (
+                            // The object is another card's. A GEM handle names
+                            // an object of ONE device's driver, so this node
+                            // imports the pages as an object of its own --
+                            // which is what wlroots' secondary card does with
+                            // the composed frame under
+                            // `WLR_DRM_DEVICES=/dev/dri/card0:/dev/dri/card1`.
+                            // A core handle, not a driver-private one: the
+                            // buffer is foreign memory with a host physical
+                            // address, which is exactly what the CPU present
+                            // path reads, and the importing card runs no
+                            // driver-private ioctl on a frame it only scans
+                            // out. Not a miss, so not the loud line below.
+                            drm::PrimeImport::OtherCard(theirs) => {
+                                let mine =
+                                    drm::import_dmabuf(dmabuf.phys_addr, dmabuf.size, dmabuf.vmo());
+                                log::info!(
+                                    "[drm] PRIME cross-card import fd={} phys={:#x} size={}: \
+                                     card{:?} object handle={:#x} imported on card{:?} as \
+                                     handle={:#x} (a handle is one card's; the other card's id \
+                                     is not handed out here)",
+                                    h.fd,
+                                    dmabuf.phys_addr,
+                                    dmabuf.size,
+                                    drm::card_index_holding_gem(theirs),
+                                    theirs,
+                                    drm::card_index_of_minor(drm_file.minor()),
+                                    mine,
+                                );
+                                (mine, "cross-card")
+                            }
+                            drm::PrimeImport::Untracked => (
                                 drm::import_dmabuf(dmabuf.phys_addr, dmabuf.size, dmabuf.vmo()),
                                 "generic",
                             ),
