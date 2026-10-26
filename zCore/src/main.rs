@@ -224,6 +224,12 @@ enum MultiGpu {
     Single,
 }
 
+// Only the Linux personality asks this, and the tests. The `allow(dead_code)`
+// on the enum above does NOT reach an inherent method, so without this the
+// Zircon build fails outright on `deny(warnings)` -- which is how master
+// stopped compiling its Zircon kernel for several hours. Same gate as
+// `multigpu_verdict`, which builds this value.
+#[cfg(any(feature = "linux", test))]
 impl MultiGpu {
     /// Whether the card that scans out the console is brought up by default.
     ///
