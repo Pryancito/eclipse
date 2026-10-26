@@ -122,14 +122,14 @@ impl Syscall<'_> {
             #[cfg(target_arch = "x86_64")]
             Property::RegisterFs => {
                 let thread = proc.get_object::<Thread>(handle_value)?;
-                let fsbase = thread_segbase_get(&self.thread, &thread, SegBase::Fs)?;
+                let fsbase = thread_segbase_get(self.thread, &thread, SegBase::Fs)?;
                 UserOutPtr::<usize>::from_addr_size(buffer, buffer_size)?.write(fsbase)?;
                 Ok(())
             }
             #[cfg(target_arch = "x86_64")]
             Property::RegisterGs => {
                 let thread = proc.get_object::<Thread>(handle_value)?;
-                let gsbase = thread_segbase_get(&self.thread, &thread, SegBase::Gs)?;
+                let gsbase = thread_segbase_get(self.thread, &thread, SegBase::Gs)?;
                 UserOutPtr::<usize>::from_addr_size(buffer, buffer_size)?.write(gsbase)?;
                 Ok(())
             }
@@ -171,13 +171,13 @@ impl Syscall<'_> {
             Property::RegisterFs => {
                 let thread = proc.get_object::<Thread>(handle_value)?;
                 let fsbase = UserInPtr::<usize>::from_addr_size(buffer, buffer_size)?.read()?;
-                thread_segbase_set(&self.thread, &thread, SegBase::Fs, fsbase)
+                thread_segbase_set(self.thread, &thread, SegBase::Fs, fsbase)
             }
             #[cfg(target_arch = "x86_64")]
             Property::RegisterGs => {
                 let thread = proc.get_object::<Thread>(handle_value)?;
                 let gsbase = UserInPtr::<usize>::from_addr_size(buffer, buffer_size)?.read()?;
-                thread_segbase_set(&self.thread, &thread, SegBase::Gs, gsbase)
+                thread_segbase_set(self.thread, &thread, SegBase::Gs, gsbase)
             }
             Property::ProcessBreakOnLoad => {
                 let addr = UserInPtr::<usize>::from_addr_size(buffer, buffer_size)?.read()?;

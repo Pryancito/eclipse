@@ -346,15 +346,24 @@ impl Syscall<'_> {
             return Err(ZxError::ACCESS_DENIED);
         }
         let object = match object.downcast_arc::<Job>() {
-            Ok(job) => return Ok(job.kill()),
+            Ok(job) => {
+                job.kill();
+                return Ok(());
+            }
             Err(object) => object,
         };
         let object = match object.downcast_arc::<Process>() {
-            Ok(process) => return Ok(process.kill()),
+            Ok(process) => {
+                process.kill();
+                return Ok(());
+            }
             Err(object) => object,
         };
         match object.downcast_arc::<Thread>() {
-            Ok(thread) => Ok(thread.kill()),
+            Ok(thread) => {
+                thread.kill();
+                Ok(())
+            }
             Err(_) => Err(ZxError::WRONG_TYPE),
         }
     }

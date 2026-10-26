@@ -45,6 +45,7 @@ mod resource;
 mod signal;
 mod socket;
 mod stream;
+mod syscall_test;
 mod system;
 mod task;
 mod time;
@@ -88,6 +89,25 @@ impl Syscall<'_> {
         // `ZX_ERR_NOT_SUPPORTED` from the fallback arm below, which is what the
         // previous shape (a length transmuted into a `ZxError`) traded for
         // undefined behaviour.
+        // The test-only syscalls that answer with a NUMBER: a sum, which can
+        // be negative (the wrapper's errors) and can be wider than the
+        // positive half of a status word (the widening ones). `syscall_status`
+        // would turn both into a lie, so they bypass it the way
+        // `zx_debuglog_read` does -- except that these return the register
+        // raw, with no sign convention of their own to apply.
+        if let Some(ret) = self.syscall_test_value(&sys_type, &args) {
+            info!("{}|{} {:?} <= {}", proc_name, thread_name, sys_type, ret);
+            return ret;
+        }
+        // Another answer that is not a status: the caller of
+        // `zx_syscall_test_handle_create` picks the word that comes back.
+        if sys_type == Sys::SYSCALL_TEST_HANDLE_CREATE {
+            let ret = self
+                .sys_syscall_test_handle_create(a0 as _, a1.into())
+                .await;
+            info!("{}|{} {:?} <= {}", proc_name, thread_name, sys_type, ret);
+            return ret;
+        }
         if sys_type == Sys::DEBUGLOG_READ {
             let ret = self.sys_debuglog_read(a0 as _, a1 as _, a2.into(), a3 as _);
             info!("{}|{} {:?} <= {:?}", proc_name, thread_name, sys_type, ret);
@@ -111,6 +131,10 @@ impl Syscall<'_> {
             Sys::OBJECT_SET_PROPERTY => {
                 self.sys_object_set_property(a0 as _, a1 as _, a2 as _, a3 as _)
             }
+            Sys::SYSCALL_TEST_RUST_HANDLE => self.sys_syscall_test_rust_handle(a0 as _, a1.into()),
+            Sys::SYSCALL_TEST_RUST_INPTR => self.sys_syscall_test_rust_inptr(a0.into(), a1.into()),
+            Sys::SYSCALL_TEST_RUST_INOUTPTR => self.sys_syscall_test_rust_inoutptr(a0.into()),
+            Sys::SYSCALL_TEST_RUST_OUTPTR => self.sys_syscall_test_rust_outptr(a0 as _, a1.into()),
             Sys::OBJECT_SIGNAL => self.sys_object_signal(a0 as _, a1 as _, a2 as _),
             Sys::OBJECT_SIGNAL_PEER => self.sys_object_signal_peer(a0 as _, a1 as _, a2 as _),
             Sys::OBJECT_WAIT_ONE => {

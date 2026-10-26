@@ -244,14 +244,15 @@ impl ExceptionReport {
         }
     }
 
-    /// A report for an exception the thread raised itself.
+    /// A report for an exception the kernel or the thread raised, rather than
+    /// the hardware.
     ///
     /// There is no trap frame behind it, so the architectural half stays zero
     /// and the two synthetic words are the caller's.
-    fn new_user(synth_code: u32, synth_data: u32) -> Self {
+    fn new_synth(type_: ExceptionType, synth_code: u32, synth_data: u32) -> Self {
         ExceptionReport {
             header: ExceptionHeader {
-                type_: ExceptionType::User,
+                type_,
                 size: core::mem::size_of::<ExceptionReport>() as u32,
             },
             context: ExceptionContext {
@@ -469,16 +470,22 @@ impl Exception {
         })
     }
 
-    /// Create an `Exception` the thread raised on itself.
+    /// Create an `Exception` that nothing trapped for: the kernel raised it
+    /// (`PolicyError`) or the thread raised it on itself (`User`).
     ///
-    /// `synth_code` and `synth_data` are the caller's `zx_exception_context_t`
+    /// `synth_code` and `synth_data` are the two `zx_exception_context_t`
     /// words, passed through untouched; nothing else about the thread is read,
     /// because there is no trap frame to read.
-    pub(super) fn new_user(thread: &Arc<Thread>, synth_code: u32, synth_data: u32) -> Arc<Self> {
+    pub(super) fn new_synth(
+        thread: &Arc<Thread>,
+        type_: ExceptionType,
+        synth_code: u32,
+        synth_data: u32,
+    ) -> Arc<Self> {
         Arc::new(Exception {
             thread: thread.clone(),
-            type_: ExceptionType::User,
-            report: ExceptionReport::new_user(synth_code, synth_data),
+            type_,
+            report: ExceptionReport::new_synth(type_, synth_code, synth_data),
             inner: Mutex::new(ExceptionInner {
                 current_channel_type: ExceptionChannelType::None,
                 state: ExceptionState::TryNext,
@@ -777,7 +784,7 @@ mod tests {
     /// a debugger a fault address for something that never faulted.
     #[test]
     fn a_user_report_carries_the_callers_words_and_no_trap_frame() {
-        let report = ExceptionReport::new_user(0x1234_5678, 0x9abc_def0);
+        let report = ExceptionReport::new_synth(ExceptionType::User, 0x1234_5678, 0x9abc_def0);
         assert_eq!(report.header.type_, ExceptionType::User);
         assert_eq!(report.context.synth_code, 0x1234_5678);
         assert_eq!(report.context.synth_data, 0x9abc_def0);
@@ -823,7 +830,9 @@ mod tests {
         let thread = a_thread();
         let proc = thread.proc().clone();
 
-        Exception::new_user(&thread, 1, 2).handle().await;
+        Exception::new_synth(&thread, ExceptionType::User, 1, 2)
+            .handle()
+            .await;
 
         assert_ne!(
             proc.status(),
@@ -1537,7 +1546,9 @@ mod tests {
         let second = a_handler(&proc.exceptionate(), 0, by_process.clone());
         let third = a_handler(&thread.exceptionate(), 0, by_thread.clone());
 
-        Exception::new_user(&thread, 1, 2).handle().await;
+        Exception::new_synth(&thread, ExceptionType::User, 1, 2)
+            .handle()
+            .await;
 
         job.debug_exceptionate().shutdown();
         proc.exceptionate().shutdown();
