@@ -311,6 +311,11 @@ fn read_only_mount_sees_the_log_without_writing() {
     {
         let mut ro = EclipseFS::mount(copy.clone(), true).unwrap();
         assert_eq!(read_all(&mut ro, f), want);
+        // fsck and scrub of what it shows (`fsck -n` after a crash): the
+        // replayed records were committed in memory, so the trees, the
+        // bitmaps and their checksums agree.
+        ro.check().unwrap();
+        assert!(ro.scrub().unwrap().is_clean());
     }
     let mut now = vec![0u8; copy.size() as usize];
     copy.read_at(0, &mut now).unwrap();

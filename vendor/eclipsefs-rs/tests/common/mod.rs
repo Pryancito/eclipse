@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 use eclipsefs::device::BlockDevice;
 use eclipsefs::{mkfs, EclipseFS, Error};
 
+pub mod frozen;
+
 pub const MIB: usize = 1024 * 1024;
 pub const BLOCK: usize = 4096;
 
@@ -43,6 +45,18 @@ impl MemDisk {
         Arc::new(Self {
             data: Mutex::new(vec![0xA5; size]),
         })
+    }
+
+    /// A disk holding `bytes`.
+    pub fn from_bytes(bytes: Vec<u8>) -> Arc<Self> {
+        trace_logs();
+        Arc::new(Self {
+            data: Mutex::new(bytes),
+        })
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        self.data.lock().unwrap().clone()
     }
 
     pub fn resize(&self, size: usize) {

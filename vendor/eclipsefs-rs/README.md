@@ -1,10 +1,20 @@
 # EclipseFS (`vendor/eclipsefs-rs`)
 
-Sistema de archivos en disco de Eclipse (formato v0.4), portado desde `eclipsefs-lib` (v0.3.0)
+Sistema de archivos en disco de Eclipse (**formato 1.0, congelado**; en el
+campo de versión pone v0.4), portado desde `eclipsefs-lib` (v0.3.0)
 de [eclipse-old](https://github.com/Pryancito/eclipse-old/tree/main/eclipsefs-lib)
 para el kernel nuevo. Es `no_std` + `alloc` y expone **la misma interfaz que
 `vendor/btrfs-rs`**, de modo que el kernel y `xtask` pueden usar uno u otro
 detrás del mismo adaptador.
+
+**Formato 1.0**: la especificación completa del formato en disco está en
+[FORMAT.md](FORMAT.md). El formato ya no cambia: solo crece con bits de
+funcionalidad incompatibles, compatibles en solo lectura o compatibles
+(un driver que no conoce un bit no monta, monta en solo lectura o lo
+ignora). `tests/format.rs` monta en cada cambio las imágenes que se
+escribieron el día de la congelación (`tests/format/`) y comprueba que se
+leen igual y aceptan escrituras; `tests/corruption.rs` las daña miles de
+veces y exige que ninguna haga entrar en pánico al driver.
 
 ## Interfaz (idéntica a `btrfs`)
 
