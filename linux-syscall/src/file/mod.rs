@@ -6,6 +6,7 @@ use linux_object::fs::vfs::{FileType, FsError};
 use linux_object::fs::*;
 
 mod dir;
+mod drm_prime;
 mod fd;
 /// Shared by `socket`/`socketpair` (and the anonymous-fd constructors in `fd`)
 /// so a stray bit is `EINVAL`, not a silently truncated `OpenFlags`.
