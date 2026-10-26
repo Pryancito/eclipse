@@ -365,7 +365,9 @@ impl CowFs {
         let mut sbs = Vec::new();
         for d in &devs {
             d.read_at(0, &mut buf)?;
-            sbs.push(SuperV4::decode(&buf)?);
+            let sb = SuperV4::decode(&buf)?;
+            sb.check_writable(read_only)?;
+            sbs.push(sb);
         }
         if sbs.is_empty() {
             return Err(Error::Invalid);
@@ -405,6 +407,14 @@ impl CowFs {
         if vol.is_none() && home.total_blocks > raw.size() / BS {
             return Err(Error::Corrupt("filesystem larger than device"));
         }
+        // A read-only mount writes nothing to its devices; what it has to
+        // commit to show the filesystem as it is (the fsync log, replayed)
+        // stays in memory, in front of them.
+        let raw: Arc<dyn BlockDevice> = if read_only {
+            Arc::new(Overlay::new(raw))
+        } else {
+            raw
+        };
         let journal = JournalArea {
             start: home.journal_start,
             blocks: home.journal_blocks as u64,
@@ -426,6 +436,7 @@ impl CowFs {
         };
         dev.read_at(0, &mut buf)?;
         let sb = SuperV4::decode(&buf)?;
+        sb.check_writable(read_only)?;
         let mut missing = Vec::new();
         if let Some(v) = &vol {
             let vs = sb.vol.as_ref().ok_or(Error::Corrupt("volume superblock"))?;
@@ -576,10 +587,8 @@ impl CowFs {
         let replayed = fs.replay_log()?;
         if replayed > 0 {
             warn!("eclipsefs: replayed {} fsync log records", replayed);
-            if !read_only {
-                fs.flush()?;
-                fs.raw.sync()?;
-            }
+            fs.flush()?;
+            fs.raw.sync()?;
         }
         if !read_only {
             fs.resync_stale()?;
@@ -4811,6 +4820,8 @@ pub(crate) fn format(
         default_subvol: FS_TREE,
         vol: None,
         bitmap_sums,
+        compat: 0,
+        ro_compat: 0,
     };
     let enc = sb.encode();
     for g in alloc.groups().iter().skip(1) {

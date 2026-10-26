@@ -1,0 +1,18 @@
+filesystem label="eclipse" version=0x4 block=4096 total=46047232
+subvolume 5 name="" root=256 parent=0 dir=0 ro=false snapshot_of=0 snapshot_gen=0 created=(1700000000, 0) uuid=2333bdb30b6d41ceb67f7e35a7456a30 parent_uuid=00000000000000000000000000000000 received_uuid=00000000000000000000000000000000
+== subvolume 5
+/ ino=256 dir mode=40755 uid=0 gid=0 nlink=3 size=226 nbytes=0 rdev=0 atime=(1700000000, 0) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/archivo-0 ino=257 file mode=100644 uid=0 gid=0 nlink=1 size=100 nbytes=100 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=e481ec26
+/archivo-1 ino=258 file mode=100644 uid=0 gid=0 nlink=1 size=9316 nbytes=12288 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=75cf6c81
+/archivo-10 ino=267 file mode=100644 uid=0 gid=0 nlink=1 size=92260 nbytes=94208 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=395da751
+/archivo-11 ino=268 file mode=100644 uid=0 gid=0 nlink=1 size=101476 nbytes=102400 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=6654cb92
+/archivo-2 ino=259 file mode=100644 uid=0 gid=0 nlink=1 size=18532 nbytes=20480 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=380d4c61
+/archivo-3 ino=260 file mode=100644 uid=0 gid=0 nlink=1 size=27748 nbytes=28672 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=39e8fb25
+/archivo-4 ino=261 file mode=100644 uid=0 gid=0 nlink=1 size=36964 nbytes=40960 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=f7e0ff5f
+/archivo-5 ino=262 file mode=100644 uid=0 gid=0 nlink=1 size=46180 nbytes=49152 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=d3131d0a
+/archivo-6 ino=263 file mode=100644 uid=0 gid=0 nlink=1 size=55396 nbytes=57344 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=9f410ba0
+/archivo-7 ino=264 file mode=100644 uid=0 gid=0 nlink=1 size=64612 nbytes=65536 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=5a2e5b3c
+/archivo-8 ino=265 file mode=100644 uid=0 gid=0 nlink=1 size=73828 nbytes=77824 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=a985e344
+/archivo-9 ino=266 file mode=100644 uid=0 gid=0 nlink=1 size=83044 nbytes=86016 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=ca582b41
+/dir ino=269 dir mode=40755 uid=0 gid=0 nlink=2 size=10 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/dir/texto ino=270 file mode=100644 uid=0 gid=0 nlink=1 size=92160 nbytes=94208 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=a0492bab

@@ -20,6 +20,8 @@ mod bitmap_sums;
 mod commit_interval;
 #[path = "../tests/compress.rs"]
 mod compress;
+#[path = "../tests/corruption.rs"]
+mod corruption;
 #[path = "../tests/cow.rs"]
 mod cow;
 #[path = "../tests/crash.rs"]
@@ -34,6 +36,8 @@ mod edge_cases;
 mod encrypt;
 #[path = "../tests/faults.rs"]
 mod faults;
+#[path = "../tests/format.rs"]
+mod format;
 #[path = "../tests/fsync_log.rs"]
 mod fsync_log;
 #[path = "../tests/full.rs"]

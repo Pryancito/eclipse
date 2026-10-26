@@ -1,0 +1,12 @@
+filesystem label="eclipse" version=0x4 block=4096 total=33554432
+subvolume 5 name="" root=256 parent=0 dir=0 ro=false snapshot_of=0 snapshot_gen=0 created=(1700000000, 0) uuid=2333bdb30b6d41ceb67f7e35a7456a30 parent_uuid=00000000000000000000000000000000 received_uuid=00000000000000000000000000000000
+== subvolume 5
+/ ino=256 dir mode=40755 uid=0 gid=0 nlink=3 size=122 nbytes=0 rdev=0 atime=(1700000000, 0) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/aleatorio ino=258 file mode=100644 uid=0 gid=0 nlink=1 size=143360 nbytes=143360 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=129f9b94
+/chattr-c ino=262 file mode=100644 uid=0 gid=0 nlink=1 size=133120 nbytes=135168 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x4 data=c0de64cb
+/lz4 ino=259 dir mode=40755 uid=0 gid=0 nlink=2 size=16 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x4 compression=lz4
+/lz4/heredado ino=260 file mode=100644 uid=0 gid=0 nlink=1 size=262144 nbytes=262144 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x4 compression=lz4 data=7db012cd
+/poco-a-poco ino=263 file mode=100644 uid=0 gid=0 nlink=1 size=192000 nbytes=192512 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x4 compression=zstd data=424d1ce4
+/sin-compresion ino=264 file mode=100644 uid=0 gid=0 nlink=1 size=65536 nbytes=65536 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x400 data=c50fb2a6
+/zlib-montaje ino=257 file mode=100644 uid=0 gid=0 nlink=1 size=307200 nbytes=307200 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=35004eeb
+/zstd ino=261 file mode=100644 uid=0 gid=0 nlink=1 size=524365 nbytes=528384 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x4 compression=zstd data=8f389928
