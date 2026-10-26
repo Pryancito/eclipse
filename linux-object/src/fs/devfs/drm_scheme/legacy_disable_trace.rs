@@ -107,6 +107,43 @@ pub(super) fn dpms_set(connector_id: u32, value: u64) {
     }
 }
 
+/// [`kms_refused`] for the five guards of `set_object_property`, which all
+/// name the same op and the same id. A wrapper so each call site stays one
+/// line: `drm_scheme.rs` is 15 lines under its ceiling.
+pub(super) fn setproperty_refused(obj_id: u32, why: &str, err: FsError) -> FsError {
+    kms_refused("SETPROPERTY", obj_id, why, err)
+}
+
+/// Call 1, AS IT ARRIVES -- ahead of every check that can refuse it.
+///
+/// [`dpms_set`] only fires once `set_object_property` has passed all four of
+/// its guards, and each of those guards refuses by returning an errno and
+/// nothing else. So a `DPMS = OFF` that is refused leaves NO line at all,
+/// which is indistinguishable from an ioctl that never arrived -- and those
+/// two have opposite culprits.
+///
+/// That is not a hypothesis: on the two-card box, 26-oct, labwc logged
+/// `Failed to disable CRTC 1` at 15.725 s and again at 18.809 s, and the
+/// kernel log has not one KMS line at either moment. The disable's FIRST
+/// ioctl is this one, so this is where the answer was missing.
+///
+/// No repeat-collapsing here, unlike [`cursor_bo_called`]: this call sits
+/// inside `if (state->modeset)`, so it runs at a modeset and not per frame.
+/// The shared budget is the whole guard it needs.
+pub(super) fn setproperty_called(obj_id: u32, obj_type: u32, prop_id: u32, value: u64) {
+    let n = TRACED.fetch_add(1, Ordering::Relaxed);
+    if n < TRACE_BUDGET {
+        log::error!(
+            "[drm] SETPROPERTY obj={} type={:#x} prop={} value={} arrived{}",
+            obj_id,
+            obj_type,
+            prop_id,
+            value,
+            tail(n)
+        );
+    }
+}
+
 /// Call 2, as it arrives. `mode_valid = 0` with `count_connectors = 0` is
 /// the disable; anything else is a modeset and not this path.
 pub(super) fn setcrtc_called(crtc_id: u32, fb_id: u32, mode_valid: u32, conns: u32) {
