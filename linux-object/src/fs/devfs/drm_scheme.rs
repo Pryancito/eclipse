@@ -2583,6 +2583,12 @@ impl DrmDev {
                         .unwrap_or(false);
                 if driver_closed {
                     drm::retire_framebuffers_for_handle(handle);
+                    // The object itself went with that close (no holder
+                    // left): its flink name goes too. A generic object's
+                    // name is pruned inside `gem_close`.
+                    if zcore_drivers::scheme::gem_mmap::lookup(handle).is_none() {
+                        drm::forget_gem_name_of_driver_handle(handle);
+                    }
                 }
                 if generic_closed || driver_closed {
                     // Drop the shared CPU-map cache entry; any live mmap Arc
@@ -2596,6 +2602,8 @@ impl DrmDev {
                     Err(FsError::InvalidParam)
                 }
             }
+            DRM_IOCTL_GEM_FLINK => gem_name::gem_flink(self, data),
+            DRM_IOCTL_GEM_OPEN => gem_name::gem_open(self, data),
             DRM_IOCTL_MODE_GETRESOURCES => {
                 let res = unsafe { &mut *(data as *mut DrmModeCardRes) };
                 if drm::is_compute_minor(self.minor) {
@@ -3993,6 +4001,8 @@ const OVERFLOW_UID: u64 = 65534;
 const DRM_IOCTL_GET_CAP: u32 = 0xC010640C;
 const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010640D;
 const DRM_IOCTL_GEM_CLOSE: u32 = 0x40086409;
+const DRM_IOCTL_GEM_FLINK: u32 = 0xC008640A;
+const DRM_IOCTL_GEM_OPEN: u32 = 0xC010640B;
 const DRM_IOCTL_SET_MASTER: u32 = 0x0000641E;
 const DRM_IOCTL_DROP_MASTER: u32 = 0x0000641F;
 /// `DRM_IOWR(DRM_COMMAND_BASE + DRM_NOUVEAU_SETPARAM, struct drm_nouveau_setparam)`
@@ -6734,6 +6744,9 @@ mod atomic_walk_tests;
 #[cfg(test)]
 mod syncobj_wait_routing_tests;
 
+mod gem_name;
+#[cfg(test)]
+mod gem_name_tests;
 mod getfb;
 #[cfg(test)]
 mod getfb_tests;

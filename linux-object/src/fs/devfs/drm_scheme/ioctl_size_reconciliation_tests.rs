@@ -12,6 +12,8 @@ fn every_canonical_command_round_trips_through_its_nr() {
         DRM_IOCTL_GET_MAGIC,
         DRM_IOCTL_SET_VERSION,
         DRM_IOCTL_GEM_CLOSE,
+        DRM_IOCTL_GEM_FLINK,
+        DRM_IOCTL_GEM_OPEN,
         DRM_IOCTL_GET_CAP,
         DRM_IOCTL_SET_CLIENT_CAP,
         DRM_IOCTL_AUTH_MAGIC,

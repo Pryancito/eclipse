@@ -1913,6 +1913,9 @@ struct DrmState {
     /// VMO of up to 64 MiB (`MAX_DUMB_SIZE`), and it belongs to no process's
     /// address space, so per-process accounting cannot see it either.
     handles: Vec<(GemHandle, Arc<VmObject>, u64)>,
+    /// `GEM_FLINK` names, `(name, object)`; see [`gem_names`].
+    names: Vec<(u32, gem_names::GemNamed)>,
+    next_name: u32,
     framebuffers: Vec<DrmFramebuffer>,
     /// The backing VMO of every framebuffer built on a dumb buffer, keyed by
     /// fb id. This is the framebuffer's *reference* on the GEM object: Linux
@@ -2139,6 +2142,8 @@ lazy_static::lazy_static! {
         drivers: Vec::new(),
         next_handle_id: 1,
         handles: Vec::new(),
+        names: Vec::new(),
+        next_name: 1,
         framebuffers: Vec::new(),
         fb_backing: Vec::new(),
         crtc_fb: 0,
@@ -2255,6 +2260,9 @@ pub fn nouveau_cpu_vmo_forget(handle: u32) {
 
 mod driver_registry;
 pub use driver_registry::*;
+
+mod gem_names;
+pub use gem_names::{forget_gem_name_of_driver_handle, gem_flink, gem_open};
 
 /// Base minor of the render-node range, as Linux allocates them: primary
 /// nodes are `card0..card63`, render nodes `renderD128..renderD191`.
@@ -7640,6 +7648,8 @@ pub fn release_process(pid: u64) -> usize {
         if !state.framebuffers.iter().any(|fb| fb.id == state.crtc_fb) {
             state.crtc_fb = 0;
         }
+        // Its flink names go with its last handles (`drm_gem_release`).
+        gem_names::prune_gem_names(&mut state);
         let driver = state.drivers.first().cloned();
         (doomed, driver)
     };
@@ -7669,6 +7679,7 @@ pub fn gem_close(handle_id: u32) -> bool {
         let (handle, _, _) = state.handles[pos];
         let driver = state.drivers.first().cloned();
         let _ = state.handles.remove(pos);
+        gem_names::prune_gem_names(&mut state);
         drop(state);
 
         if let Some(d) = driver {

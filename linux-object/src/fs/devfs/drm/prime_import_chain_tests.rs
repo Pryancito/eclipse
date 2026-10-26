@@ -136,3 +136,106 @@ fn two_importers_of_one_buffer_hold_independent_handles() {
 
     forget_handles(&[comp_handle]);
 }
+
+/// `drm_gem_open_ioctl` from ANOTHER process: a handle of that process's
+/// own over the same object, minted once (`drm_gem_handle_create_tail`),
+/// while FLINK by a process that does not hold the object is ENOENT. The
+/// name outlives the first handle as long as any handle stands
+/// (`drm_gem_object_handle_free` runs on the LAST one) and goes with the
+/// owner's exit (`drm_gem_release`). A nouveau object is named by its
+/// global handle and OPEN hands that handle out with a reference of the
+/// opener's, as `GETFB` does; once `gem_mmap` no longer tracks it the
+/// name is ENOENT and forgotten.
+#[test]
+fn a_name_opens_from_another_process_and_names_a_nouveau_object_by_its_global_handle() {
+    let _serialised = super::test_globals::lock();
+    let own = 9_921;
+    let vmo = VmObject::new_paged(1);
+    DRM_STATE.lock().handles.push((
+        GemHandle {
+            id: own,
+            size: 4096,
+            phys_addr: 0x9_0000,
+        },
+        vmo.clone(),
+        CLIENT,
+    ));
+    assert_eq!(
+        gem_names::gem_flink_for(own, STRANGER),
+        None,
+        "not the stranger's handle"
+    );
+    let name = gem_names::gem_flink_for(own, CLIENT).expect("the owner names it");
+    assert_ne!(name, 0, "0 is never a name (idr_alloc(.., 1, 0, ..))");
+    assert_eq!(gem_names::gem_flink_for(own, CLIENT), Some(name));
+
+    // Xwayland opens it: a handle of its own, the same one next time.
+    let (theirs, size) = gem_names::gem_open_for(name, XWAYLAND).unwrap();
+    assert_ne!(theirs, own);
+    assert_eq!(size, 4096);
+    assert_eq!(
+        gem_names::gem_open_for(name, XWAYLAND),
+        Some((theirs, 4096))
+    );
+    assert_eq!(
+        resolve_gem_backing_for(theirs, XWAYLAND),
+        Some((0x9_0000, 4096)),
+        "over the same frames"
+    );
+    assert_eq!(
+        gem_names::gem_flink_for(theirs, XWAYLAND),
+        Some(name),
+        "the object's one name, whichever handle"
+    );
+
+    // The owner's handle goes first: Xwayland's keeps the object, and the
+    // name with it, so a third process can still open it. Closing the
+    // last handle takes the name.
+    assert!(gem_close(own));
+    let (strangers, _) = gem_names::gem_open_for(name, STRANGER).expect("the name still stands");
+    assert_ne!(strangers, theirs, "a handle of the stranger's own");
+    assert!(gem_close(theirs));
+    assert_eq!(
+        gem_names::gem_open_for(name, XWAYLAND).map(|(h, _)| h != strangers),
+        Some(true),
+        "still standing on the stranger's handle"
+    );
+    let xwl_again = gem_names::gem_open_for(name, XWAYLAND).map(|(h, _)| h);
+    assert!(gem_close(strangers));
+    assert!(gem_close(xwl_again.unwrap()));
+    assert_eq!(
+        gem_names::gem_open_for(name, STRANGER),
+        None,
+        "the name died with the last handle"
+    );
+
+    // A process exiting with the only handle takes the name with it.
+    let exiting = import_dmabuf_for(0x9_0000, 4096, vmo.clone(), XWAYLAND);
+    let name = gem_names::gem_flink_for(exiting, XWAYLAND).unwrap();
+    assert!(release_process(XWAYLAND) >= 1);
+    assert_eq!(gem_names::gem_open_for(name, CLIENT), None);
+
+    // A nouveau object: the global handle, plus a reference.
+    use zcore_drivers::scheme::gem_mmap;
+    const H: u32 = 0x8A00_0001;
+    gem_mmap::register(H, 0x1000_0000, 8192, CLIENT);
+    assert_eq!(gem_names::gem_flink_for(H, STRANGER), None);
+    let name = gem_names::gem_flink_for(H, CLIENT).unwrap();
+    assert_eq!(gem_names::gem_open_for(name, CLIENT), Some((H, 8192)));
+    assert_eq!(
+        gem_mmap::ref_count(H),
+        Some(1),
+        "a holder gets no second reference"
+    );
+    assert_eq!(gem_names::gem_open_for(name, XWAYLAND), Some((H, 8192)));
+    assert!(gem_mmap::holds(H, XWAYLAND), "a new holder gets one");
+    assert_eq!(gem_mmap::ref_count(H), Some(2));
+    assert!(gem_mmap::unregister(H));
+    assert_eq!(gem_names::gem_open_for(name, STRANGER), None, "gone");
+    assert!(!forget_gem_name_of_driver_handle(H), "already forgotten");
+    // The handle id comes round again on a NEW object: the old name does
+    // not come back with it.
+    gem_mmap::register(H, 0x2000_0000, 8192, STRANGER);
+    assert_eq!(gem_names::gem_open_for(name, STRANGER), None, "forgotten");
+    assert!(gem_mmap::unregister(H));
+}
