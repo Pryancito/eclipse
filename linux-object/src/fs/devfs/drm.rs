@@ -235,77 +235,15 @@ fn pause_deadline_ns(now_ns: u64, max: core::time::Duration) -> u64 {
     now_ns.saturating_add(max_ns).max(1)
 }
 
-/// The framebuffer whose pixels the panel carries **in full**, or 0 for none.
-///
-/// Not `crtc_fb`, which is bookkeeping for `GETCRTC` and is bound by every
-/// present that returns `Ok` -- including one that only copied a damage box, and
-/// one a pause acknowledged without drawing anything at all. This is the
-/// narrower fact, and it is the only fact a damage box is meaningful against.
-///
-/// A damage box says "only these pixels changed **in the frame that is already
-/// on the panel**". A compositor with a swapchain presents a *different*
-/// framebuffer almost every frame, so the pixels outside the box come from the
-/// buffer presented before -- and a recycled swapchain buffer holds whatever
-/// frame it was last drawn into, which is not this one. Honouring the box then
-/// leaves the panel a collage of two frames, and the collage is invisible until
-/// something reads the panel back: [`repaint_for_cursor`] restores its two
-/// ~64x64 windows *from* `crtc_fb`, so a pointer move over a region the box did
-/// not touch pastes the new buffer's older content into the frame still up.
-/// That is garbage in a ring around the cursor, appearing exactly when a popup
-/// opens -- which is when a fresh buffer is presented with a box around the
-/// popup and nothing else.
-///
-/// This is the same rule Linux applies in `drm_atomic_helper_damage_iter_init`,
-/// which throws the clips away and declares a full update when
-/// `state->fb != old_state->fb`.
-///
-/// Cleared, not just rebound, wherever something OTHER than a present writes the
-/// panel: blanking paints it black, and a text VT in the foreground puts console
-/// output on it. An id can be reused after `RMFB`, so a retired framebuffer
-/// clears it too rather than letting a new one inherit "already on screen".
-static PANEL_FB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-/// The framebuffer the panel carries in full, or 0.
-fn panel_fb() -> u32 {
-    PANEL_FB.load(Ordering::SeqCst)
-}
-
-/// Record that the panel now carries `fb_id` in full; 0 means it carries no
-/// framebuffer (blanked, or a console VT has written over it).
-fn set_panel_fb(fb_id: u32) {
-    PANEL_FB.store(fb_id, Ordering::SeqCst);
-    // Every caller passing 0 is something OTHER than a present having written
-    // the panel -- a blank painting it black, a console VT printing over it --
-    // so the band skip's idea of what is up there stops being true at the same
-    // moment, and for the same reason. See [`PRESENT_SKIP`].
-    if fb_id == 0 {
-        panel_bands_reset();
-    }
-}
-
-/// [`PANEL_FB`] cleared for a framebuffer that no longer exists, so a reused id
-/// cannot inherit "the panel already carries this".
-fn forget_panel_fb(fb_id: u32) {
-    if PANEL_FB
-        .compare_exchange(fb_id, 0, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
-        // The framebuffer whose pixels the band hashes describe is gone, and its
-        // id can come back on a different buffer. Same rule as [`PANEL_FB`]'s
-        // own: a retired id inherits nothing.
-        panel_bands_reset();
-    }
-}
-
 /// The region a present may actually restrict itself to: the damage box when the
 /// panel already carries this framebuffer, and the whole frame otherwise.
 ///
 /// Pure, because which of the two it is decides whether the panel ends up
-/// holding one frame or two -- see [`PANEL_FB`] for what the second one looks
+/// holding one frame or two -- see [`panel_state`] for what the second one looks
 /// like on screen.
 ///
 /// `fb_id == 0` is never "the framebuffer the panel carries", even when
-/// [`PANEL_FB`] also reads 0: 0 is the absence of one on both sides, and letting
+/// [`panel_state`] also reads 0: 0 is the absence of one on both sides, and letting
 /// the two absences match would honour a damage box against a panel nobody has
 /// presented to.
 fn rect_for_present(
@@ -327,11 +265,6 @@ fn rect_for_present(
 const MAX_DAMAGE_PROMOTIONS_LOGGED: u32 = 4;
 static DAMAGE_PROMOTIONS_LOGGED: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
-
-#[cfg(test)]
-pub(crate) fn panel_fb_for_test() -> u32 {
-    panel_fb()
-}
 
 /// Whether a present left the WHOLE scanout carrying its framebuffer, so
 /// [`SCANOUT_STALE`] may be cleared.
@@ -405,7 +338,7 @@ pub fn set_crtc_blanked(on: bool) {
         }
         // Black pixels are not a framebuffer's pixels. Without this the present
         // that un-blanks honours its damage box and leaves a black screen with
-        // one rectangle of desktop in it. See [`PANEL_FB`].
+        // one rectangle of desktop in it. See [`panel_state`].
         set_panel_fb(0);
         // Nor is the pointer covering anything any more: this just painted over
         // whatever it was. Un-blanking normally puts a whole frame up before the
@@ -2301,6 +2234,14 @@ pub use prime_import::{
 mod topology;
 pub use topology::{resources_for_node, topology_for, NodeFacts, NodeTopology};
 
+mod panel_state;
+#[cfg(test)]
+pub(crate) use panel_state::panel_fb_for_test;
+pub use panel_state::{claim_panel_for, forget_panel_crtc, panel_crtc, PanelState};
+use panel_state::{forget_panel_fb, panel_fb, set_panel_fb};
+#[cfg(test)]
+pub(crate) use panel_state::{note_panel_bands_for_test, panel_bands_known_for_test};
+
 /// Base minor of the render-node range, as Linux allocates them: primary
 /// nodes are `card0..card63`, render nodes `renderD128..renderD191`.
 pub const RENDER_MINOR_BASE: u32 = 128;
@@ -3925,7 +3866,7 @@ fn note_fb_retired(state: &mut DrmState, fb_id: u32, why: FbRetired) {
     // `RMFB`, a GEM handle closing under a live fb, and a process exiting -- so
     // this is where "the panel carries this id" stops being true. Ids are handed
     // out again, and a new buffer landing on a retired number must not inherit
-    // it. See [`PANEL_FB`].
+    // it. See [`panel_state`].
     forget_panel_fb(fb_id);
 }
 
@@ -4076,7 +4017,7 @@ fn expand_x_for_wc(x: u32, w: u32, limit: u32) -> (u32, u32) {
 /// `drm_atomic_helper_damage_iter_next` gives for a clip whose intersection with
 /// the plane's source is empty; it is not a request to repaint the frame. The
 /// promotion of a box onto a framebuffer the panel does not carry happens before
-/// this, in [`present_now_checked`] -- see [`PANEL_FB`]. Horizontal edges are
+/// this, in [`present_now_checked`] -- see [`panel_state`]. Horizontal edges are
 /// expanded to 64-byte WC lines.
 pub fn scanout_region(fb_id: u32, rect: Option<(u32, u32, u32, u32)>) -> bool {
     scanout_region_checked(fb_id, rect).is_ok()
@@ -6584,9 +6525,16 @@ pub fn present_now_checked(
             _ => {}
         }
     }
+    // The panel state is one panel's worth, and since 26-oct-2026 there can be
+    // more than one CRTC to present to (each node answers `GETRESOURCES` for
+    // its own card, and each card advertises its own CRTC id). Claim it for
+    // this pipe first: a present to a pipe the state does not describe starts
+    // over instead of reading another monitor's frame out of it. See
+    // [`panel_owner`].
+    let _ = claim_panel_for(crtc_id);
     // A damage box is only meaningful against the framebuffer the panel already
     // carries; against any other one the pixels it leaves alone belong to a
-    // different frame. See [`PANEL_FB`], and `drm_atomic_helper_damage_iter_init`
+    // different frame. See [`panel_state`], and `drm_atomic_helper_damage_iter_init`
     // upstream, which does exactly this.
     let panel_before = panel_fb();
     let rect = rect_for_present(rect, panel_before, fb_id);
