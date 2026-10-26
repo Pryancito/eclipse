@@ -3862,6 +3862,8 @@ fn next_poll_wake(now: Duration, deadline: Duration, tick: Duration) -> Option<D
 
 mod pre_wait_account;
 use pre_wait_account::PreWaitAccount;
+/// The wait that keeps the console GPU's bring-up from costing the session.
+mod console_bringup_wait;
 /// The sleep behind a blocking `WAIT_VBLANK`; own file for the size ceiling.
 mod wait_vblank_sleep;
 use legacy_disable_trace::{

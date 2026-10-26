@@ -489,6 +489,58 @@ pub fn gpu_ready_was_read() -> bool {
     GPU_READY_WAS_READ.load(Ordering::Relaxed)
 }
 
+/// A GPU client is parked inside an ioctl waiting for the console GPU.
+/// See [`cold_client_waiting`].
+static COLD_CLIENT_WAITING: AtomicBool = AtomicBool::new(false);
+
+/// The deferred console-GPU bring-up has finished, whatever it achieved.
+static CONSOLE_BRINGUP_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Record that a GPU client is blocked waiting for the console GPU to attach.
+pub fn note_cold_client_waiting() {
+    COLD_CLIENT_WAITING.store(true, Ordering::Relaxed);
+}
+
+/// Is a GPU client blocked waiting for the console GPU?
+///
+/// The third and strongest of the deferred bring-up's "boot progress is over"
+/// signals, after `KD_GRAPHICS` and [`gpu_ready_was_read`], and the only one
+/// that cannot be wrong: a client asking this card for memory is not a guess
+/// about whether the session has started, it is the session stopped dead
+/// waiting for us. It also cancels the courtesy sleep that follows
+/// `KD_GRAPHICS` -- that sleep exists to let the compositor finish its first
+/// frames before scanout is parked, and a compositor blocked in `GEM_NEW` has
+/// no frames to finish.
+pub fn cold_client_waiting() -> bool {
+    COLD_CLIENT_WAITING.load(Ordering::Relaxed)
+}
+
+/// The deferred bring-up is over (attached or not): nothing is coming, so
+/// stop holding ioctls for it.
+pub fn note_console_bringup_done() {
+    CONSOLE_BRINGUP_DONE.store(true, Ordering::Relaxed);
+}
+
+/// Is a console-GPU bring-up still ahead of us? Scheduled this boot and not
+/// yet finished. Separate from [`console_bringup_expected`], which is latched
+/// once at boot and never cleared: a client must wait for a bring-up that is
+/// still coming, and must NOT wait for one that has already run and failed --
+/// there the card answers `rm=no` for the rest of the boot and every ioctl
+/// would pay the whole timeout.
+pub fn console_bringup_unfinished() -> bool {
+    bringup_still_coming(
+        console_bringup_expected(),
+        CONSOLE_BRINGUP_DONE.load(Ordering::Relaxed),
+    )
+}
+
+/// [`console_bringup_unfinished`]'s decision, split out so it can be tested
+/// without the two boot-wide latches it reads -- a test that drove those
+/// would race every other test in this crate for them.
+pub(crate) fn bringup_still_coming(expected: bool, done: bool) -> bool {
+    expected && !done
+}
+
 /// Pause/resume software+CE scanout. Used by deferred console-GPU GSP bring-up
 /// so labwc's frame loop does not write BAR1 during SEC2 STARTCPU.
 ///
