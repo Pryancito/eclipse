@@ -366,19 +366,16 @@ impl ExceptionObject {
         })
     }
 
-    /// Get whether closing the exception handle will
-    /// finish exception processing and resume the underlying thread.
+    /// Get what closing the exception handle will do, as a
+    /// `ZX_EXCEPTION_STATE_*` value.
     pub fn state(&self) -> u32 {
-        self.exception.inner.lock().handled as u32
+        self.exception.inner.lock().state as u32
     }
 
-    /// Set whether closing the exception handle will
-    /// finish exception processing and resume the underlying thread.
+    /// Set what closing the exception handle will do, from a
+    /// `ZX_EXCEPTION_STATE_*` value.
     pub fn set_state(&self, state: u32) -> ZxResult {
-        if state > 1 {
-            return Err(ZxError::INVALID_ARGS);
-        }
-        self.exception.inner.lock().handled = state == 1;
+        self.exception.inner.lock().state = ExceptionState::parse(state)?;
         Ok(())
     }
 
@@ -421,8 +418,40 @@ pub(super) struct Exception {
 
 struct ExceptionInner {
     current_channel_type: ExceptionChannelType,
-    handled: bool,
+    state: ExceptionState,
     second_chance: bool,
+}
+
+/// What closing the exception handle does: the `ZX_EXCEPTION_STATE_*` values.
+///
+/// This is three states and not a `handled` boolean because the state a
+/// handler sets is not only "did I deal with it". `ThreadExit` deals with it
+/// too, and asks for the opposite of a resume: there are faults that cannot be
+/// resumed from at all, and a handler that can only say `Handled` would put
+/// the thread back on the instruction that just faulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExceptionState {
+    /// `ZX_EXCEPTION_STATE_TRY_NEXT`: this handler declines; the exception
+    /// goes on to the next channel in the chain.
+    TryNext = 0,
+    /// `ZX_EXCEPTION_STATE_HANDLED`: the exception is resolved and the thread
+    /// resumes where it was.
+    Handled = 1,
+    /// `ZX_EXCEPTION_STATE_THREAD_EXIT`: the exception is resolved and the
+    /// thread exits instead of resuming.
+    ThreadExit = 2,
+}
+
+impl ExceptionState {
+    /// Read a `ZX_EXCEPTION_STATE_*` word, or `INVALID_ARGS`.
+    fn parse(state: u32) -> ZxResult<Self> {
+        match state {
+            0 => Ok(Self::TryNext),
+            1 => Ok(Self::Handled),
+            2 => Ok(Self::ThreadExit),
+            _ => Err(ZxError::INVALID_ARGS),
+        }
+    }
 }
 
 impl Exception {
@@ -434,7 +463,7 @@ impl Exception {
             report: ExceptionReport::new(type_, cx),
             inner: Mutex::new(ExceptionInner {
                 current_channel_type: ExceptionChannelType::None,
-                handled: false,
+                state: ExceptionState::TryNext,
                 second_chance: false,
             }),
         })
@@ -452,7 +481,7 @@ impl Exception {
             report: ExceptionReport::new_user(synth_code, synth_data),
             inner: Mutex::new(ExceptionInner {
                 current_channel_type: ExceptionChannelType::None,
-                handled: false,
+                state: ExceptionState::TryNext,
                 second_chance: false,
             }),
         })
@@ -486,9 +515,18 @@ impl Exception {
                     .await
             }
         };
-        if result == Err(ZxError::NEXT) && !self.type_.is_synth() {
-            // Nobody handled the exception, kill myself
-            self.thread.proc().exit(super::TASK_RETCODE_SYSCALL_KILL);
+        match result {
+            // A handler asked for `ZX_EXCEPTION_STATE_THREAD_EXIT`: the
+            // exception is resolved, but the thread must not go back to the
+            // instruction that raised it. Making it dying is what the kill
+            // path already does, so `run_user` leaves the loop on its next
+            // turn and runs the `ThreadExiting` exception as usual.
+            Ok(ExceptionState::ThreadExit) => self.thread.exit_from_exception(),
+            Err(ZxError::NEXT) if !self.type_.is_synth() => {
+                // Nobody handled the exception, kill myself
+                self.thread.proc().exit(super::TASK_RETCODE_SYSCALL_KILL);
+            }
+            _ => {}
         }
     }
 
@@ -525,7 +563,7 @@ impl Exception {
         self: &Arc<Self>,
         exceptionates: impl IntoIterator<Item = Arc<Exceptionate>>,
         first_only: bool,
-    ) -> ZxResult {
+    ) -> ZxResult<ExceptionState> {
         for exceptionate in exceptionates.into_iter() {
             let closed = match self.send_to(&exceptionate) {
                 // This channel is not available now!
@@ -534,13 +572,15 @@ impl Exception {
             };
             // If this error, the sender is dropped, and the handle should also be closed.
             closed.await.ok();
-            let handled = {
+            let state = {
                 let mut inner = self.inner.lock();
                 inner.current_channel_type = ExceptionChannelType::None;
-                inner.handled
+                inner.state
             };
-            if handled | first_only {
-                return Ok(());
+            // Anything but `TryNext` ends the chain: the handler resolved the
+            // exception, whether by resuming the thread or by ending it.
+            if state != ExceptionState::TryNext || first_only {
+                return Ok(state);
             }
         }
         Err(ZxError::NEXT)
@@ -1012,22 +1052,36 @@ mod tests {
     }
 
     #[test]
-    /// `zx_exception_set_state` and `zx_exception_set_strategy` are both
-    /// booleans on the wire, so anything else is an error rather than a
-    /// truncation to some bit of it.
-    fn the_state_and_the_strategy_only_take_a_zero_or_a_one() {
+    /// `zx_exception_set_state` takes the three `ZX_EXCEPTION_STATE_*` words
+    /// and nothing else, and `zx_exception_set_strategy` really is a boolean.
+    /// Anything outside each set is an error rather than a truncation to some
+    /// bit of it.
+    ///
+    /// The state used to be a boolean too, and `2` --
+    /// `ZX_EXCEPTION_STATE_THREAD_EXIT` -- was refused. That is the value
+    /// `Property.RegisterFsNonuser` sets on a fault it cannot resume from, so
+    /// the refusal left the exception unresolved and the whole core-tests
+    /// process was killed in the middle of the suite.
+    fn the_state_takes_the_three_zircon_words_and_the_strategy_a_boolean() {
         let thread = a_thread();
         let exception = page_fault(&thread);
         exception.inner.lock().current_channel_type = ExceptionChannelType::Debugger;
         let (object, _closed) = ExceptionObject::create(exception, Rights::DEFAULT_THREAD);
 
         assert_eq!(object.state(), 0);
-        assert_eq!(object.set_state(2).err(), Some(ZxError::INVALID_ARGS));
-        assert_eq!(object.state(), 0, "a refused set changes nothing");
-        object.set_state(1).unwrap();
-        assert_eq!(object.state(), 1);
-        object.set_state(0).unwrap();
-        assert_eq!(object.state(), 0);
+        for state in [1, 2, 0] {
+            object.set_state(state).unwrap();
+            assert_eq!(object.state(), state);
+        }
+        for refused in [3, 4, u32::MAX] {
+            assert_eq!(
+                object.set_state(refused).err(),
+                Some(ZxError::INVALID_ARGS),
+                "{}",
+                refused
+            );
+            assert_eq!(object.state(), 0, "a refused set changes nothing");
+        }
 
         assert_eq!(object.strategy(), 0);
         assert_eq!(object.set_strategy(2).err(), Some(ZxError::INVALID_ARGS));
@@ -1282,7 +1336,7 @@ mod tests {
     /// passed green.
     fn a_handler(
         exceptionate: &Arc<Exceptionate>,
-        handle_it: bool,
+        state: u32,
         reached: Arc<Mutex<bool>>,
     ) -> async_std::task::JoinHandle<()> {
         let channel = exceptionate
@@ -1305,8 +1359,10 @@ mod tests {
                 .clone()
                 .downcast_arc::<ExceptionObject>()
                 .unwrap();
-            if handle_it {
-                exception.set_state(1).unwrap();
+            // `TryNext` is the state an exception already carries, so a
+            // handler that declines sets nothing.
+            if state != 0 {
+                exception.set_state(state).unwrap();
             }
         })
     }
@@ -1332,8 +1388,8 @@ mod tests {
         // anyone listening, and it handles it.
         let thread_reached = Arc::new(Mutex::new(false));
         let after_reached = Arc::new(Mutex::new(false));
-        let first = a_handler(&thread.exceptionate(), true, thread_reached.clone());
-        let second = a_handler(&proc.exceptionate(), false, after_reached.clone());
+        let first = a_handler(&thread.exceptionate(), 1, thread_reached.clone());
+        let second = a_handler(&proc.exceptionate(), 0, after_reached.clone());
 
         exception.handle().await;
 
@@ -1380,6 +1436,49 @@ mod tests {
         );
     }
 
+    /// `ZX_EXCEPTION_STATE_THREAD_EXIT` resolves the exception the other way:
+    /// the thread ends rather than going back to the instruction that
+    /// faulted, and the process it lives in carries on.
+    ///
+    /// Both halves of that are what `Property.RegisterFsNonuser` needs.
+    /// Faulting on a `FS`-relative access to a kernel address is not
+    /// resumable -- `Handled` would put the thread straight back on the same
+    /// instruction -- and the test's own thread, which is in the same
+    /// process, has to live to read the result.
+    #[async_std::test]
+    async fn the_thread_exit_state_ends_the_thread_and_not_the_process() {
+        let thread = a_thread();
+        let proc = thread.proc().clone();
+
+        let reached = Arc::new(Mutex::new(false));
+        let after_reached = Arc::new(Mutex::new(false));
+        let first = a_handler(&thread.exceptionate(), 2, reached.clone());
+        let second = a_handler(&proc.exceptionate(), 0, after_reached.clone());
+
+        page_fault(&thread).handle().await;
+
+        thread.exceptionate().shutdown();
+        proc.exceptionate().shutdown();
+        first.await;
+        second.await;
+
+        assert!(*reached.lock(), "the thread handler never got it");
+        assert!(
+            !*after_reached.lock(),
+            "a handler asked for the thread to exit and the exception went on anyway"
+        );
+        assert_ne!(
+            proc.status(),
+            Status::Exited(TASK_RETCODE_SYSCALL_KILL),
+            "the thread was asked to exit and the whole process was killed"
+        );
+        assert_eq!(
+            thread.state(),
+            ThreadState::Dying,
+            "the thread was asked to exit and stayed runnable"
+        );
+    }
+
     /// The kind of channel the exception is on is only true while it is out
     /// with a handler. `zx_exception_get_process` and
     /// `zx_exception_set_strategy` both answer from it, so a stale kind left
@@ -1397,7 +1496,7 @@ mod tests {
         assert_eq!(exception.current_channel_type(), ExceptionChannelType::None);
 
         let reached = Arc::new(Mutex::new(false));
-        let handler = a_handler(&thread.exceptionate(), true, reached.clone());
+        let handler = a_handler(&thread.exceptionate(), 1, reached.clone());
         exception.handle().await;
         thread.exceptionate().shutdown();
         handler.await;
@@ -1434,9 +1533,9 @@ mod tests {
         let by_thread = Arc::new(Mutex::new(false));
         // None of the three handles it, so every one of them that is offered
         // the exception at all records that it was.
-        let first = a_handler(&job.debug_exceptionate(), false, debugger.clone());
-        let second = a_handler(&proc.exceptionate(), false, by_process.clone());
-        let third = a_handler(&thread.exceptionate(), false, by_thread.clone());
+        let first = a_handler(&job.debug_exceptionate(), 0, debugger.clone());
+        let second = a_handler(&proc.exceptionate(), 0, by_process.clone());
+        let third = a_handler(&thread.exceptionate(), 0, by_thread.clone());
 
         Exception::new_user(&thread, 1, 2).handle().await;
 
@@ -1464,8 +1563,8 @@ mod tests {
         let far = Arc::new(Mutex::new(false));
         // The nearest debugger takes it and does NOT handle it, which is the
         // only way the difference shows.
-        let first = a_handler(&job.debug_exceptionate(), false, near.clone());
-        let second = a_handler(&parent_job.debug_exceptionate(), false, far.clone());
+        let first = a_handler(&job.debug_exceptionate(), 0, near.clone());
+        let second = a_handler(&parent_job.debug_exceptionate(), 0, far.clone());
 
         exception.handle().await;
 

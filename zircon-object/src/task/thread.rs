@@ -1253,6 +1253,18 @@ impl Thread {
         )
     }
 
+    /// End the thread because a handler answered its exception with
+    /// `ZX_EXCEPTION_STATE_THREAD_EXIT`.
+    ///
+    /// Not a kill: the thread is ending the way `zx_thread_exit` ends it, so
+    /// `killed` stays false and the process keeps whatever return code it
+    /// already had. The thread does not stop here either, it only becomes
+    /// dying; `run_user` sees that on its next turn round the loop and runs
+    /// the `ThreadExiting` exception before terminating.
+    pub(super) fn exit_from_exception(&self) {
+        self.stop(false)
+    }
+
     /// Stop the thread. Internal implementation of `exit` and `kill`.
     ///
     /// The thread do not terminate immediately when stopped. It is just made dying.
