@@ -27,21 +27,26 @@ fn built() -> Vec<(u32, Option<(u32, u8, u8, u8)>)> {
 }
 
 /// The two-card box this is all about: one RTX drives the screen, the other
-/// is headless. **Two cards, two node pairs, and nothing named twice.**
+/// is headless. **Two cards, two node pairs, nothing named twice, and the one
+/// with the monitor on it is `card0`.**
 ///
-/// This has been wrong twice in opposite directions. First the console card
-/// got no node at all, so `vulkaninfo` reported a single card while `card0`
-/// and `card1` were two views of the compute one. Then it got `card2`, and
-/// `card1` stayed a second view of `card0` -- so the obvious
+/// This has been wrong three times. First the console card got no node at all,
+/// so `vulkaninfo` reported a single card while `card0` and `card1` were two
+/// views of the headless one. Then it got `card2`, and `card1` stayed a second
+/// view of `card0` -- so the obvious
 /// `WLR_DRM_DEVICES=/dev/dri/card0:/dev/dri/card1` named ONE card twice and
-/// could never reach the second monitor. Now a pair is a card, as in Linux.
+/// could never reach the second monitor. Then a pair was a card, as in Linux,
+/// but `card0` was still the last-probed card: once each node answered
+/// `GETRESOURCES` for its own card, `card0` had no CRTCs and labwc could not
+/// open it. Now `card0` is the card the panel goes through.
 #[test]
 fn the_console_card_gets_a_node_of_its_own_on_a_two_card_box() {
     let screen = kms_emu::attach(64, 16);
     let _table = NodeTable;
     // Registration order is the reverse of the PCI probe order
-    // (`insert(0)`), so the console card goes in first and the compute one
-    // ends up primary -- exactly the box under test.
+    // (`insert(0)`), so the console card goes in first and the headless one
+    // ends up primary -- exactly the box under test, and the reason the head
+    // is `get_display_driver` and not the primary.
     let _console = screen.attach_gpu(EmuGpu::hardware_kms("emu-console").console_at(0x01, 0x00));
     let _compute = screen.attach_gpu(EmuGpu::new("emu-compute").compute_at(0x65, 0x00));
 
@@ -49,15 +54,19 @@ fn the_console_card_gets_a_node_of_its_own_on_a_two_card_box() {
     assert_eq!(
         nodes.len(),
         2,
-        "two cards, two pairs: card0 for the compute card and card1 for the console one, got {:x?}",
+        "two cards, two pairs: card0 for the card with the monitor and card1 for the other, got {:x?}",
         nodes
     );
     let compute = Some((0, 0x65, 0x00, 0));
     let console = Some((0, 0x01, 0x00, 0));
-    assert_eq!(nodes[0], (0, compute), "card0 must stay the primary GPU");
+    assert_eq!(
+        nodes[0],
+        (0, console),
+        "card0 must be the card the panel goes through, not the primary"
+    );
     assert_eq!(
         nodes[1],
-        (1, console),
+        (1, compute),
         "card1 is the OTHER card, not a second view of card0's"
     );
     assert!(
@@ -97,24 +106,45 @@ fn a_single_card_still_gets_exactly_one_pair() {
     assert_eq!(nodes[0].0, 0);
 }
 
-/// Past the head, the order is the PCI address, not the registration
-/// order: `card1` has to name the same card after a reboot.
+/// Past the head and the compute pin, the order is the PCI address, not the
+/// registration order: `card2` has to name the same card after a reboot.
+///
+/// Four cards, because the first two indices are decided by name and not by
+/// address -- index 0 is [`get_display_driver`] and index 1 is
+/// [`get_compute_driver`] -- so a box has to have two cards left over before
+/// there is anything for the sort to get wrong.
 #[test]
 fn the_cards_past_the_head_are_sorted_by_pci_address() {
     let screen = kms_emu::attach(64, 16);
     let _table = NodeTable;
-    // Registered high BDF first, so registration order and BDF order
-    // disagree for the two cards that land past the head.
-    let _high = screen.attach_gpu(EmuGpu::hardware_kms("emu-high").console_at(0x65, 0x00));
+    // Registered low BDF first, so for the two cards that land past the pin
+    // (`low` and `high`) the registry order is the reverse of the BDF order
+    // and taking either one unsorted gives a different answer.
     let _low = screen.attach_gpu(EmuGpu::hardware_kms("emu-low").console_at(0x01, 0x00));
+    let _high = screen.attach_gpu(EmuGpu::hardware_kms("emu-high").console_at(0x65, 0x00));
     let _compute = screen.attach_gpu(EmuGpu::new("emu-compute").compute_at(0x0b, 0x00));
+    // Attached last, so `insert(0)` makes it the first non-compute card in the
+    // registry and therefore the head.
+    let _head = screen.attach_gpu(EmuGpu::hardware_kms("emu-head").console_at(0x7f, 0x00));
 
     let nodes = built();
-    assert_eq!(nodes.len(), 3, "three cards, three pairs, got {:x?}", nodes);
+    assert_eq!(nodes.len(), 4, "four cards, four pairs, got {:x?}", nodes);
     assert_eq!(
-        (nodes[1].1, nodes[2].1),
+        nodes[0].1,
+        Some((0, 0x7f, 0x00, 0)),
+        "card0 is the display card: {:x?}",
+        nodes
+    );
+    assert_eq!(
+        nodes[1].1,
+        Some((0, 0x0b, 0x00, 0)),
+        "card1 is the compute pick: {:x?}",
+        nodes
+    );
+    assert_eq!(
+        (nodes[2].1, nodes[3].1),
         (Some((0, 0x01, 0x00, 0)), Some((0, 0x65, 0x00, 0))),
-        "card1/card2 are not in PCI order: {:x?}",
+        "card2/card3 are not in PCI order: {:x?}",
         nodes
     );
 }
@@ -130,24 +160,28 @@ fn the_cards_past_the_head_are_sorted_by_pci_address() {
 /// and the real second card sat on `card2`. Now `card1` IS the second card,
 /// so the readiness question moved from minor 2 to minor 1 and the alias
 /// assertions are gone with the alias.
+///
+/// `card0` is the card with the monitor, so the cold one here is the headless
+/// card -- the other way round from how this box boots, which is the point:
+/// the readiness question belongs to the card and not to the minor.
 #[test]
 fn the_second_card_is_a_nouveau_device_only_once_its_rm_is_up() {
     let screen = kms_emu::attach(64, 16);
     let _table = NodeTable;
-    let console = screen.attach_gpu(
+    let _console = screen.attach_gpu(
         EmuGpu::hardware_kms("emu-console")
             .console_at(0x01, 0x00)
-            .with_nouveau_uapi(false),
+            .with_nouveau_uapi(true),
     );
-    let _compute = screen.attach_gpu(
+    let compute = screen.attach_gpu(
         EmuGpu::new("emu-compute")
             .compute_at(0x65, 0x00)
-            .with_nouveau_uapi(true),
+            .with_nouveau_uapi(false),
     );
     build_gpu_nodes();
     let id = |minor| node_driver_id(minor, true);
 
-    // Cold console card: one nouveau device, as today.
+    // The card with the monitor: one nouveau device, as today.
     assert_eq!(id(0), NodeDriverId::Nouveau, "card0");
     assert_eq!(id(128), NodeDriverId::Nouveau, "renderD128");
     assert_eq!(
@@ -159,8 +193,8 @@ fn the_second_card_is_a_nouveau_device_only_once_its_rm_is_up() {
     // And there is no node past the two cards to ask about.
     assert_eq!(built().len(), 2, "two cards, two pairs");
 
-    // `nvidia.console_gpu` attaches its RM: now it is a real second device.
-    console.set_nouveau_ready(true);
+    // Its RM attaches: now it is a real second device.
+    compute.set_nouveau_ready(true);
     assert_eq!(id(1), NodeDriverId::Nouveau, "card1");
     assert_eq!(id(129), NodeDriverId::Nouveau, "renderD129");
     assert_eq!(id(0), NodeDriverId::Nouveau, "card0 moved");
@@ -194,12 +228,13 @@ fn no_node_is_nouveau_while_the_flag_is_off() {
 fn a_second_card_without_the_uapi_is_never_nouveau() {
     let screen = kms_emu::attach(64, 16);
     let _table = NodeTable;
-    let _other = screen.attach_gpu(EmuGpu::hardware_kms("emu-other").console_at(0x01, 0x00));
-    let _compute = screen.attach_gpu(
-        EmuGpu::new("emu-compute")
-            .compute_at(0x65, 0x00)
+    let _console = screen.attach_gpu(
+        EmuGpu::hardware_kms("emu-console")
+            .console_at(0x01, 0x00)
             .with_nouveau_uapi(true),
     );
+    // No `with_nouveau_uapi` at all: this card does not serve the uAPI.
+    let _other = screen.attach_gpu(EmuGpu::new("emu-other").compute_at(0x65, 0x00));
     build_gpu_nodes();
 
     assert_eq!(node_driver_id(1, true), NodeDriverId::Compute, "card1");
@@ -240,6 +275,116 @@ fn no_card_is_ever_named_by_two_node_pairs() {
         );
         seen.push(*bdf);
     }
+}
+
+/// **If any card in the machine can scan out, `card0` can.**
+///
+/// This is the invariant whose violation took the desktop down, and it spans
+/// two modules that can each be right on their own: this file decides WHICH
+/// card is `card0` and [`topology`] decides what a node ADVERTISES. Both were
+/// correct and the pair was not -- `card0` was the last-probed card, the
+/// topology answer for it was honestly zero CRTCs, and labwc exited with
+/// "Unable to open /dev/dri/card0 as KMS device / Found 0 GPUs, cannot create
+/// backend".
+///
+/// There is no udevd here, so nothing enumerates the other nodes and finds the
+/// one with resources: the session names `card0` itself
+/// (`WLR_DRM_DEVICES=/dev/dri/card0`, hardcoded in four places). That is why
+/// this is an invariant here and not in Linux.
+///
+/// Asserted as "no node outranks node 0" rather than "node 0 has the panel",
+/// so it holds whatever the shape of the box: it is false exactly when some
+/// node could have been opened and the one userspace opens could not.
+fn no_node_outranks_card0() {
+    let nodes = gpu_nodes();
+    let scans_out = |minor: u32| !resources_for_node(minor).0.is_empty();
+    let someone = nodes.iter().any(|n| scans_out(n.card_minor()));
+    assert_eq!(
+        someone,
+        scans_out(0),
+        "a node can scan out and card0 cannot -- that is the desktop refusing to start: {:x?}",
+        nodes
+            .iter()
+            .map(|n| (n.card_minor(), resources_for_node(n.card_minor())))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The invariant on **his box**: two cards, neither with a surface-flip
+/// ladder, so the panel is the software blit through the card that is not the
+/// primary.
+#[test]
+fn node_zero_can_scan_out_whenever_any_card_can() {
+    let screen = kms_emu::attach(64, 16);
+    let _table = NodeTable;
+    let _console = screen.attach_gpu(EmuGpu::new("emu-console").console_at(0x01, 0x00));
+    let _compute = screen.attach_gpu(EmuGpu::new("emu-compute").compute_at(0x65, 0x00));
+    build_gpu_nodes();
+    assert!(
+        software_kms_active(),
+        "this is the box the desktop comes up on"
+    );
+    assert!(
+        !Arc::ptr_eq(
+            &get_primary_driver().expect("a primary"),
+            &get_display_driver().expect("a display driver")
+        ),
+        "the primary and the display card have to differ or this proves nothing"
+    );
+
+    no_node_outranks_card0();
+    assert_eq!(
+        resources_for_node(0),
+        (alloc::vec![SYNTH_CRTC_ID], alloc::vec![SYNTH_CONNECTOR_ID]),
+        "card0 is the node the session opens, so it is the one that carries the panel"
+    );
+}
+
+/// And with real hardware KMS, where the topology comes from the card rather
+/// than from the GOP: the same invariant, reached down the other branch of
+/// [`topology::topology_for`].
+#[test]
+fn node_zero_can_scan_out_with_hardware_kms_too() {
+    let screen = kms_emu::attach(64, 16);
+    let _table = NodeTable;
+    let _console = screen.attach_gpu(
+        EmuGpu::hardware_kms("emu-console")
+            .console_at(0x01, 0x00)
+            .with_topology(&[2101], &[2102]),
+    );
+    let _compute = screen.attach_gpu(EmuGpu::new("emu-compute").compute_at(0x65, 0x00));
+    build_gpu_nodes();
+
+    no_node_outranks_card0();
+    assert_eq!(
+        resources_for_node(0),
+        (alloc::vec![2101], alloc::vec![2102]),
+        "card0 answers with the ids of the card the monitor is on"
+    );
+}
+
+/// Three cards, one monitor, and the card with it registered in the middle --
+/// so neither "the first registered" nor "the last registered" is the right
+/// answer and only asking which card drives the display gives it.
+#[test]
+fn node_zero_can_scan_out_with_the_display_card_in_the_middle() {
+    let screen = kms_emu::attach(64, 16);
+    let _table = NodeTable;
+    let _a = screen.attach_gpu(EmuGpu::new("emu-a").compute_at(0x0b, 0x00));
+    let _console = screen.attach_gpu(
+        EmuGpu::hardware_kms("emu-console")
+            .console_at(0x01, 0x00)
+            .with_topology(&[2101], &[2102]),
+    );
+    let _b = screen.attach_gpu(EmuGpu::new("emu-b").compute_at(0x65, 0x00));
+    build_gpu_nodes();
+
+    no_node_outranks_card0();
+    assert_eq!(
+        resources_for_node(0),
+        (alloc::vec![2101], alloc::vec![2102]),
+        "card0 is neither the first nor the last card registered"
+    );
 }
 
 #[test]

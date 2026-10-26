@@ -2365,13 +2365,18 @@ static GPU_NODES: Mutex<Vec<GpuNode>> = Mutex::new(Vec::new());
 /// two entries are deliberately **exactly what this box already had** before
 /// the table existed:
 ///
-/// * Index 0 is [`get_primary_driver`] -- the node every KMS client opens.
-///   Note this is NOT necessarily the console GPU: `register_driver` does
-///   `insert(0)`, so on a dual-card box the primary is whichever card was
-///   probed last, which is the compute one. Pointing `card0` at the console
-///   GPU instead would be a policy change, and a breaking one today: the
-///   console GPU is cold unless `nvidia.console_gpu` brought it up, so every
-///   nouveau ioctl on `card0` would start answering `ENODEV`.
+/// * Index 0 is [`get_display_driver`] -- the card the panel goes through, and
+///   the node every KMS client opens. It used to be [`get_primary_driver`],
+///   which is **not** the card with the monitor on it, and that cost the
+///   desktop; [`get_display_driver`] has the whole story.
+///
+///   The one thing it does cost: `VERSION` on index 0 answers from the index
+///   and not from the card ([`node_driver_id`]), so with
+///   `nvidia.nouveau_uapi` on, `card0` claims `nouveau` whether or not that
+///   card's RM is up yet. That is not a new hazard -- a one-card box has
+///   always had the console card at index 0, and it is the only box NVK runs
+///   on at all (the GR ladder is per file and single-card) -- but moving that
+///   answer to the card is a change of its own and is deliberately not here.
 /// * Index 1 is [`get_compute_driver`], honouring an explicit
 ///   `nvidia.compute=BB.DD.F` pin -- **but only when that is a card index 0
 ///   did not already name.** It used to be added unconditionally, and on a
@@ -2398,7 +2403,7 @@ static GPU_NODES: Mutex<Vec<GpuNode>> = Mutex::new(Vec::new());
 ///
 /// Every registered card ends up named. It used to be only the ones with
 /// [`DrmScheme::is_compute_gpu`], and on a two-card box that is not the
-/// console GPU, nor the primary (which is the compute card), nor
+/// console GPU, nor the primary (which was the compute card), nor
 /// [`get_compute_driver`]'s pick (which refuses the console GPU) -- so the card
 /// driving the screen got no `/dev/dri` node, and the two pairs that did exist
 /// were both the same GPU.
@@ -2406,13 +2411,23 @@ static GPU_NODES: Mutex<Vec<GpuNode>> = Mutex::new(Vec::new());
 /// Only the first [`MAX_GPU_NODES`] GPUs get nodes: past that, `card{n}` would
 /// collide with the render range and two GPUs would answer to one minor.
 pub fn build_gpu_nodes() {
-    let Some(primary) = get_primary_driver() else {
+    // `card0` is the card the display goes through, not whichever card happens
+    // to be first in the registry. [`get_display_driver`] carries the why --
+    // in short, there is no udevd here, so `card0` is a name the session is
+    // hardcoded to open rather than one node among several it enumerates.
+    //
+    // Asking the same function the software blit asks is the point: node 0 and
+    // the panel agree by construction rather than by coincidence, which is
+    // what `no_node_outranks_card0` holds down. `get_display_driver` already
+    // falls back to the first driver, so the `or_else` only ever fires on an
+    // empty registry.
+    let Some(head) = get_display_driver().or_else(get_primary_driver) else {
         *GPU_NODES.lock() = Vec::new();
         return;
     };
     let mut nodes = vec![GpuNode {
         index: 0,
-        driver: primary,
+        driver: head,
     }];
 
     // One card, one node pair. The pin still gets to put its card at the
@@ -2428,16 +2443,16 @@ pub fn build_gpu_nodes() {
     }
 
     // Every OTHER card, whatever its role. Not just the ones that can compute:
-    // on a two-card box the console GPU is `is_compute_gpu() == false`, and the
-    // head above never names it either -- the primary is the last-probed card
-    // (the compute one, see `register_driver`'s `insert(0)`) and
-    // `get_compute_driver` deliberately refuses the console GPU. So filtering
-    // this list on `is_compute_gpu` left the card that drives the screen with
-    // NO `/dev/dri` node at all, while `card1` was a second view of the card
-    // `card0` already named: two node pairs, one GPU, and `vulkaninfo` could
-    // only ever report one card on a two-card box. A role is a reason to label
-    // a node (index 1 and up answer `eclipse-compute`, see `node_driver_id`),
-    // never a reason to leave a card unnameable.
+    // on a two-card box the console GPU is `is_compute_gpu() == false`, the
+    // head used to be the last-probed card (see `register_driver`'s
+    // `insert(0)`, so not the console one) and `get_compute_driver`
+    // deliberately refuses the console GPU. So filtering this list on
+    // `is_compute_gpu` left the card that drives the screen with NO `/dev/dri`
+    // node at all, while `card1` was a second view of the card `card0` already
+    // named: two node pairs, one GPU, and `vulkaninfo` could only ever report
+    // one card on a two-card box. A role is a reason to label a node (index 1
+    // and up answer `eclipse-compute`, see `node_driver_id`), never a reason to
+    // leave a card unnameable.
     let drivers = kernel_hal::drivers::all_drm();
     let list = drivers.as_vec();
     let mut rest: Vec<Arc<dyn DrmScheme>> = list
@@ -2460,6 +2475,11 @@ pub fn build_gpu_nodes() {
         }
         nodes.push(GpuNode { index, driver });
     }
+
+    // Said here and not in `get_display_driver`, which runs per ioctl: this
+    // runs once and already prints the node table the value is read off of
+    // (`dmesg | grep /dev/dri`).
+    log_monitor_pin();
 
     for n in &nodes {
         kernel_hal::klog_info!(

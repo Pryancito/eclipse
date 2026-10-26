@@ -1275,6 +1275,19 @@ impl PciIds {
     }
 }
 
+/// The driver that serves `/dev/dri/card0`'s ioctls, which is the card
+/// `/sys/class/drm/card0` has to describe.
+///
+/// The node table's head, or the primary driver when there is no table -- the
+/// pre-table rule the whole DRM core keeps, and the shape a framebuffer-only
+/// box is in. Asking by minor rather than for "the primary" is the point: the
+/// two were the same card until `card0` became the card the panel goes through
+/// (see `devfs::drm::build_gpu_nodes`), and nothing here should have to know
+/// which.
+fn card0_driver() -> Option<Arc<dyn zcore_drivers::scheme::DrmScheme>> {
+    crate::fs::devfs::drm::driver_for_minor(0).or_else(crate::fs::devfs::drm::get_primary_driver)
+}
+
 fn display_pci_index() -> Option<usize> {
     let devs = get_pci_devices();
     // With the nouveau uAPI enabled there is a real NVIDIA GPU the driver bound
@@ -1289,8 +1302,7 @@ fn display_pci_index() -> Option<usize> {
     // the node entirely and vkEnumeratePhysicalDevices returns 0 GPUs. Prefer
     // the NVIDIA display-class device so the render node advertises the RTX.
     // The node's identity must describe the SAME GPU that serves its ioctls.
-    // On a multi-GPU box those can disagree: the ioctl target is
-    // `devfs::drm::get_primary_driver()`, while this function used to pick the
+    // On a multi-GPU box those can disagree: this function used to pick the
     // first display-class device in PCI scan order. libdrm feeds NVK the sysfs
     // side (bus info from uevent's PCI_SLOT_NAME, ids from `config`) while
     // every GETPARAM/NVIF answer comes from the driver side, so a mismatch
@@ -1299,19 +1311,25 @@ fn display_pci_index() -> Option<usize> {
     // `-Db_ndebug=true`, so that check is compiled out and the inconsistency
     // is silent.)
     //
+    // So the card is asked for by MINOR: `card0_driver()` is whoever serves
+    // minor 0, which is the node table's head and only the primary driver on a
+    // box with no table. It used to ask `get_primary_driver()` directly, and
+    // that was the same card right up until `card0` stopped being the primary
+    // -- after which sysfs would have reported the headless card's PCI id for
+    // the node the compositor opens, which is the silent mismatch this comment
+    // is about.
+    //
     // Match on the BDF NUMBERS, never on the driver's display name: names
     // render the bus in DECIMAL ("nvidia-gpu-101:0.0") while sysfs paths use
     // HEX ("0000:65:00.0").
-    if let Some((_dom, bus, dev, func)) =
-        crate::fs::devfs::drm::get_primary_driver().and_then(|d| d.pci_bdf())
-    {
+    if let Some((_dom, bus, dev, func)) = card0_driver().and_then(|d| d.pci_bdf()) {
         let want = alloc::format!("0000:{:02x}:{:02x}.{:x}", bus, dev, func);
         if let Some(idx) = devs.iter().position(|d| d.name == want) {
             return Some(idx);
         }
         log::warn!(
-            "[drm] primary DRM driver reports PCI {} but the sysfs PCI scan has no such device -- \
-             falling back to scan order",
+            "[drm] the driver serving card0 reports PCI {} but the sysfs PCI scan has no such \
+             device -- falling back to scan order",
             want
         );
     }
@@ -1357,7 +1375,14 @@ fn pci_index_for_bdf(bus: u8, dev: u8, func: u8) -> Option<usize> {
 /// renderD128 (nouveau) with renderD129 and wlroots GLES2 dies with
 /// `Failed to get DRM device: No such device` / `Failed to create GBM device`.
 /// A distinct fake BDF keeps the pairs as two drmDevices. NVK filters the
-/// alias by vendor `0x0000`. Do not point card0 at the console GPU.
+/// alias by vendor `0x0000`.
+///
+/// This used to end "do not point card0 at the console GPU", which 26-oct
+/// reversed: `card0` is now exactly the console GPU, because with no udevd the
+/// session opens that node by name and so it has to be one that can scan out
+/// (`devfs::drm::get_display_driver`). The alias is unaffected either way --
+/// it exists for a node that would SHARE card0's PCI device, and two real
+/// cards never do.
 ///
 /// The alias is NOT a display controller. libdrm only needs its `config`
 /// (vendor/device/revision) and the `subsystem` link; it never reads the PCI
@@ -1428,8 +1453,9 @@ fn drm_minor_from_name(name: &str) -> Option<u32> {
 /// no node.
 ///
 /// `card0`/`renderD128` keep their own resolution ([`drm_card0_pci_index`],
-/// which prefers the primary driver's BDF and falls back to the display-class
-/// scan), because that is the node whose identity NVK filters on. Every other
+/// which prefers the BDF of the driver serving minor 0 ([`card0_driver`]) and
+/// falls back to the display-class scan), because that is the node whose
+/// identity NVK filters on. Every other
 /// node resolves through the `/dev/dri` table, so a node's sysfs identity and
 /// the GPU serving its ioctls can no longer name different cards.
 fn drm_node_pci_index(minor: u32) -> Option<usize> {
@@ -1555,14 +1581,15 @@ pub(crate) fn log_drm_pci_backing() {
     // Print the ioctl target next to the sysfs identity: on a multi-GPU box
     // these must name the SAME card, and that is exactly what a single boot
     // log can now confirm.
-    match crate::fs::devfs::drm::get_primary_driver() {
+    match card0_driver() {
         Some(d) => kernel_hal::klog_info!(
-            "[drm-probe] ioctl target (primary driver) = {:?} pci_bdf={:x?} console_gpu={}",
+            "[drm-probe] ioctl target (the driver serving card0) = {:?} pci_bdf={:x?} \
+             console_gpu={}",
             d.name(),
             d.pci_bdf(),
             d.is_console_gpu()
         ),
-        None => kernel_hal::klog_info!("[drm-probe] no primary DRM driver registered"),
+        None => kernel_hal::klog_info!("[drm-probe] no DRM driver serving card0"),
     }
     let idx = drm_card0_pci_index();
     match idx.and_then(|i| devs.get(i)) {
@@ -3206,6 +3233,9 @@ lazy_static! {
 /// `drm/` directory all resolve a lookup through this, so a name it accepts
 /// that `/dev/dri` never emits is a path that exists in one tree and not the
 /// other.
+#[cfg(test)]
+mod card0_identity_tests;
+
 #[cfg(test)]
 mod drm_name_tests {
     use super::*;

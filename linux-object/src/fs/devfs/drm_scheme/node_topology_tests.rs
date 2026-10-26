@@ -37,15 +37,18 @@ fn kms_counts(minor: u32) -> (u32, u32, u32) {
     (res.count_crtcs, res.count_connectors, res.count_encoders)
 }
 
-/// **The two-card box, end to end.** `card0` is the compute card -- card
-/// registration inserts at 0, so the card attached last is the primary -- and
-/// `card1` is the one with the monitor.
+/// **The two-card box, end to end.** `card0` is the card with the monitor and
+/// `card1` is the headless one, and each reports its own card.
 ///
-/// Before, it was the other way round and for the wrong reason: `card0`
-/// reported the whole machine's topology because it was index 0, and `card1`
+/// It used to be the other way round and for the wrong reason: `card0`
+/// reported the whole machine's topology because it was index 0 and `card1`
 /// reported zeros because it was not, so the compositor opened the card that
-/// cannot scan out and the kernel blitted to the other one underneath. Now the
-/// node that says it is a KMS card is the one whose card can scan out.
+/// cannot scan out and the kernel blitted to the other one underneath. Making
+/// each node answer for its own card fixed the answer and broke the desktop,
+/// because `card0` was still the last-probed card: the node the session opens
+/// then honestly reported no CRTCs and labwc exited. Both halves are here now
+/// -- the node that says it is a KMS card is the one whose card can scan out,
+/// and that node is the one userspace opens.
 #[test]
 fn getresources_answers_for_the_node_it_arrived_on() {
     let screen = kms_emu::attach(64, 16);
@@ -60,13 +63,13 @@ fn getresources_answers_for_the_node_it_arrived_on() {
 
     assert_eq!(
         kms_counts(0),
-        (0, 0, 0),
-        "card0 is the compute card: drmIsKMS has to fail here"
+        (1, 1, 1),
+        "card0 has the monitor: drmIsKMS has to pass here"
     );
     assert_eq!(
         kms_counts(1),
-        (1, 1, 1),
-        "card1 has the monitor: drmIsKMS has to pass here"
+        (0, 0, 0),
+        "card1 cannot scan out: drmIsKMS has to fail here"
     );
 }
 
