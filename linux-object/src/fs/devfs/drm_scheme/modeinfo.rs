@@ -69,3 +69,50 @@ pub(super) fn make_modeinfo_with(w: u32, h: u32, panel: Option<&edid::DetailedTi
     m[36..68].copy_from_slice(&name);
     m
 }
+
+/// `struct drm_mode_modeinfo` (`drm_mode.h`): the 68 bytes `SETCRTC`,
+/// `GETCRTC` and `GETCONNECTOR` carry, read and written by name rather than
+/// by offset. The layout is the uapi one, `repr(C)` with no padding (every
+/// `u16` run is even), which the `const` below pins to 68 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DrmModeModeinfo {
+    pub(super) clock: u32,
+    pub(super) hdisplay: u16,
+    pub(super) hsync_start: u16,
+    pub(super) hsync_end: u16,
+    pub(super) htotal: u16,
+    /// Carried through unread: nothing here skews a scanline.
+    #[allow(dead_code)]
+    pub(super) hskew: u16,
+    pub(super) vdisplay: u16,
+    pub(super) vsync_start: u16,
+    pub(super) vsync_end: u16,
+    pub(super) vtotal: u16,
+    pub(super) vscan: u16,
+    pub(super) vrefresh: u32,
+    pub(super) flags: u32,
+    pub(super) type_: u32,
+    pub(super) name: [u8; 32],
+}
+
+const _: () = assert!(core::mem::size_of::<DrmModeModeinfo>() == 68);
+
+impl DrmModeModeinfo {
+    /// The mode in the ioctl's 68 bytes, at whatever alignment they sit.
+    pub(super) fn from_bytes(m: &[u8; 68]) -> Self {
+        // SAFETY: the source is 68 readable bytes, the size of `Self`
+        // (pinned above), every field is plain data for which any bit
+        // pattern is a value, and `read_unaligned` asks no alignment of it.
+        unsafe { core::ptr::read_unaligned(m.as_ptr() as *const Self) }
+    }
+
+    /// The 68 bytes the ioctl carries for this mode.
+    pub(super) fn to_bytes(self) -> [u8; 68] {
+        let mut m = [0u8; 68];
+        // SAFETY: the destination is 68 writable bytes, the size of `Self`,
+        // and `write_unaligned` asks no alignment of it.
+        unsafe { core::ptr::write_unaligned(m.as_mut_ptr() as *mut Self, self) };
+        m
+    }
+}
