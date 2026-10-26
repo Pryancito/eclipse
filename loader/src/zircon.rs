@@ -3,6 +3,7 @@
 //! Reference: <https://fuchsia.googlesource.com/fuchsia/+/3c234f79f71/zircon/kernel/lib/userabi/userboot.cc>
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::convert::TryInto;
 use core::{future::Future, pin::Pin};
 
 use xmas_elf::ElfFile;
@@ -131,6 +132,101 @@ fn for_each_zbi_cmdline(zbi: &[u8], mut f: impl FnMut(&str)) {
     }
 }
 
+/// Item header fields an appended item needs, and the two flag bits.
+const ZBI_ITEM_MAGIC: u32 = 0xb578_1729;
+const ZBI_FLAGS_VERSION: u32 = 0x0001_0000;
+const ZBI_FLAGS_CRC32: u32 = 0x0002_0000;
+
+/// CRC-32 (reflected, polynomial `0xEDB88320`), which is the one a ZBI item
+/// carries. Spelled out here rather than pulled in as a dependency: it runs
+/// once per boot over a few hundred bytes.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let lsb = crc & 1;
+            crc >>= 1;
+            if lsb != 0 {
+                crc ^= 0xedb8_8320;
+            }
+        }
+    }
+    !crc
+}
+
+/// A copy of `zbi` with one more `CMDLINE` item, carrying `extra`.
+///
+/// This is how the kernel command line reaches the guest, and nothing else
+/// does. Measured, with five different values of `core-tests=` and with
+/// `userboot=`/`userboot.shutdown`: **not one option this kernel was given on
+/// its command line had any effect**, so every run of
+/// `scripts/zircon_core_test.py` ran the whole suite, listing nothing and
+/// filtering nothing, and the job could not count. The VMO named
+/// `boot-options.txt` that this loader also builds reaches the test process --
+/// the process even reads its name while enumerating its handles -- and is
+/// then never read; what the guest does read, at the exact offset of the
+/// prebuilt's own `CMDLINE` item, is the ZBI. The prebuilt's item is what tells
+/// it `kernel.select.userboot=userboot-test-rust` and
+/// `userboot.test.next=test/core-tests-standalone`, which is why the test ran
+/// at all and why it ran with its defaults.
+///
+/// Appending rather than rewriting in place: the prebuilt's item is followed
+/// immediately by the bootfs, with nothing but its 8-byte padding to spare.
+/// A ZBI may carry several `CMDLINE` items and their contents are taken
+/// together, which is what [`for_each_zbi_cmdline`] already assumes when it
+/// calls `f` once per item.
+///
+/// Returns `None` when `zbi` is not a container this function can extend, in
+/// which case the caller hands the guest the ZBI untouched -- the behaviour
+/// before this existed.
+fn zbi_with_extra_cmdline(zbi: &[u8], extra: &str) -> Option<Vec<u8>> {
+    if extra.is_empty() || zbi.len() < ZBI_HEADER_SIZE {
+        return None;
+    }
+    let word = |off: usize| {
+        let b: [u8; 4] = zbi[off..off + 4].try_into().unwrap();
+        u32::from_le_bytes(b)
+    };
+    // The items end where the container header says they do, which need not be
+    // the end of the file.
+    let payload_len = word(4) as usize;
+    let end = payload_len.checked_add(ZBI_HEADER_SIZE)?;
+    if end > zbi.len() || end % 8 != 0 {
+        return None;
+    }
+    // NUL-terminated, like the prebuilt's own item.
+    let mut item_payload = Vec::with_capacity(extra.len() + 1);
+    item_payload.extend_from_slice(extra.as_bytes());
+    item_payload.push(0);
+    fn put(header: &mut [u8; ZBI_HEADER_SIZE], off: usize, value: u32) {
+        header[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let mut header = [0u8; ZBI_HEADER_SIZE];
+    put(&mut header, 0, ZBI_TYPE_CMDLINE);
+    put(&mut header, 4, item_payload.len() as u32);
+    put(&mut header, 12, ZBI_FLAGS_VERSION | ZBI_FLAGS_CRC32);
+    put(&mut header, 24, ZBI_ITEM_MAGIC);
+    // The checksum covers the header with its own `crc32` field zeroed,
+    // followed by the unpadded payload. Verified against the prebuilt's item:
+    // over those exact bytes its stored `0x030983f8` comes back out.
+    let mut hasher_input = Vec::with_capacity(ZBI_HEADER_SIZE + item_payload.len());
+    hasher_input.extend_from_slice(&header);
+    hasher_input.extend_from_slice(&item_payload);
+    put(&mut header, 28, crc32(&hasher_input));
+
+    let mut out = Vec::with_capacity(end + ZBI_HEADER_SIZE + item_payload.len() + 8);
+    out.extend_from_slice(&zbi[..end]);
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&item_payload);
+    while out.len() % 8 != 0 {
+        out.push(0);
+    }
+    let grown = (out.len() - ZBI_HEADER_SIZE) as u32;
+    out[4..8].copy_from_slice(&grown.to_le_bytes());
+    Some(out)
+}
+
 /// Does this ZBI ask for the `userboot-test` build via `kernel.select.userboot=`?
 fn zbi_selects_test_userboot(zbi: &[u8]) -> bool {
     let mut selected = false;
@@ -240,9 +336,17 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     };
 
     // zbi
+    //
+    // Handed over with this kernel's own command line appended as one more
+    // `CMDLINE` item: see `zbi_with_extra_cmdline` for why that is the only
+    // route that reaches the guest. The kernel's separator is `:` and the
+    // ZBI's is a space.
+    let guest_cmdline = cmdline.replace(':', " ");
+    let extended_zbi = zbi_with_extra_cmdline(zbi, guest_cmdline.trim());
+    let zbi_bytes: &[u8] = extended_zbi.as_deref().unwrap_or(zbi);
     let zbi_vmo = {
-        let vmo = VmObject::new_paged(zbi.len() / PAGE_SIZE + 1);
-        vmo.write(0, zbi).unwrap();
+        let vmo = VmObject::new_paged(zbi_bytes.len() / PAGE_SIZE + 1);
+        vmo.write(0, zbi_bytes).unwrap();
         vmo.set_name("zbi");
         vmo
     };
@@ -682,5 +786,114 @@ fn write_vdso_time_values(vdso: &[u8], vdso_vmo: &Arc<VmObject>) {
             "vdso: time values set (offset={:#x}, {}/{} ns per tick, {} ticks/s)",
             offset, numerator, denominator, ticks_per_second
         );
+    }
+}
+
+#[cfg(test)]
+mod zbi_cmdline_tests {
+    use super::*;
+    use alloc::string::String;
+
+    /// The standard check value for CRC-32: `crc32("123456789")`.
+    #[test]
+    fn the_checksum_is_the_crc32_everyone_elses_is() {
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    /// A one-item container, built the way the prebuilt's own header is.
+    fn container(items: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut out = alloc::vec![0u8; ZBI_HEADER_SIZE];
+        let put = |buf: &mut [u8], off: usize, value: u32| {
+            buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put(&mut out, 0, 0x544f_4f42); // 'BOOT'
+        put(&mut out, 8, 0x868c_f7e6);
+        put(&mut out, 12, ZBI_FLAGS_VERSION);
+        put(&mut out, 24, ZBI_ITEM_MAGIC);
+        put(&mut out, 28, 0x4a87_e8d6);
+        for &(item_type, payload) in items {
+            let mut header = alloc::vec![0u8; ZBI_HEADER_SIZE];
+            put(&mut header, 0, item_type);
+            put(&mut header, 4, payload.len() as u32);
+            put(&mut header, 12, ZBI_FLAGS_VERSION);
+            put(&mut header, 24, ZBI_ITEM_MAGIC);
+            put(&mut header, 28, 0x4a87_e8d6);
+            out.extend_from_slice(&header);
+            out.extend_from_slice(payload);
+            while out.len() % 8 != 0 {
+                out.push(0);
+            }
+        }
+        let len = (out.len() - ZBI_HEADER_SIZE) as u32;
+        out[4..8].copy_from_slice(&len.to_le_bytes());
+        out
+    }
+
+    fn cmdlines(zbi: &[u8]) -> Vec<String> {
+        let mut seen = Vec::new();
+        for_each_zbi_cmdline(zbi, |line| seen.push(String::from(line)));
+        seen
+    }
+
+    /// This is the bug: what the kernel was given on its command line has to
+    /// come back out of the ZBI the guest reads, next to what the prebuilt
+    /// already carried -- not instead of it.
+    #[test]
+    fn the_appended_line_joins_the_one_already_there() {
+        let base = container(&[(ZBI_TYPE_CMDLINE, b"userboot.test.next=test/x\0")]);
+        assert_eq!(cmdlines(&base), ["userboot.test.next=test/x"]);
+        let grown = zbi_with_extra_cmdline(&base, "core-tests=FutexTest.WaitTimeout").unwrap();
+        assert_eq!(
+            cmdlines(&grown),
+            [
+                "userboot.test.next=test/x",
+                "core-tests=FutexTest.WaitTimeout"
+            ],
+            "the guest must see both items"
+        );
+    }
+
+    /// The appended item has to survive a reader that checks the checksum, and
+    /// the span it covers is the header with its own `crc32` field zeroed
+    /// followed by the unpadded payload.
+    #[test]
+    fn the_appended_item_carries_a_checksum_that_checks_out() {
+        let base = container(&[]);
+        let grown = zbi_with_extra_cmdline(&base, "k=v").unwrap();
+        let at = ZBI_HEADER_SIZE;
+        let word = |off: usize| u32::from_le_bytes(grown[off..off + 4].try_into().unwrap());
+        assert_eq!(word(at + 12) & ZBI_FLAGS_CRC32, ZBI_FLAGS_CRC32);
+        let len = word(at + 4) as usize;
+        assert_eq!(len, 4, "payload is `k=v` and a NUL");
+        let mut span = grown[at..at + ZBI_HEADER_SIZE].to_vec();
+        span[28..32].copy_from_slice(&[0; 4]);
+        span.extend_from_slice(&grown[at + ZBI_HEADER_SIZE..at + ZBI_HEADER_SIZE + len]);
+        assert_eq!(crc32(&span), word(at + 28));
+    }
+
+    /// The container's own length has to grow with it, and stay 8-aligned, or
+    /// every reader stops before the new item -- which is indistinguishable
+    /// from the bug this fixes.
+    #[test]
+    fn the_container_length_grows_to_cover_the_new_item() {
+        let base = container(&[]);
+        let grown = zbi_with_extra_cmdline(&base, "k=v").unwrap();
+        let len = u32::from_le_bytes(grown[4..8].try_into().unwrap()) as usize;
+        assert_eq!(len + ZBI_HEADER_SIZE, grown.len());
+        assert_eq!(grown.len() % 8, 0);
+    }
+
+    /// Nothing to add, or nothing that can be extended: the caller hands the
+    /// guest the ZBI untouched rather than a container it cannot parse.
+    #[test]
+    fn an_unusable_container_is_declined_instead_of_corrupted() {
+        assert!(zbi_with_extra_cmdline(&container(&[]), "").is_none());
+        assert!(zbi_with_extra_cmdline(&[], "k=v").is_none());
+        assert!(zbi_with_extra_cmdline(&[0u8; 8], "k=v").is_none());
+        // A container header whose length runs past the end of the buffer.
+        let mut truncated = container(&[(ZBI_TYPE_CMDLINE, b"k=v\0")]);
+        truncated[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(zbi_with_extra_cmdline(&truncated, "k=v").is_none());
     }
 }
