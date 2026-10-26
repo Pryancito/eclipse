@@ -530,7 +530,7 @@ fn the_hardware_ladder_says_not_supported_and_never_ok() {
             "attach_gpu",
             eclipse_rm_attach_gpu(0, 0, 0, 0, p, 0, 0, 0, 0, 0, p),
         ),
-        ("bench", eclipse_rm_bench(0, p)),
+        ("bench", eclipse_rm_bench(0, p.cast())),
         ("ce_blit", eclipse_rm_ce_blit(0, 0, 0, 0, p)),
         ("ce_blit_p2p", eclipse_rm_ce_blit_p2p(0, 0, 0, 0, p)),
         (

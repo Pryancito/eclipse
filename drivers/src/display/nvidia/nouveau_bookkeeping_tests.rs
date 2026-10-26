@@ -9378,6 +9378,9 @@ mod rm_edges_tests;
 /// `Unknown` architecture, and the empty EXEC that rides the ring.
 mod rm_failures_tests;
 
+/// The compute rungs (`gpustep18`..`gpustep23`), `gpubench` and the
+/// copy-engine test (`gpustep10`) on the fake RM, as far as each got.
+mod compute_steps_tests;
 /// The connectors, EDID, HDMI audio and hardware cursor of the GPU that
 /// drives the monitor, from the RM's snapshot and the fake RM.
 mod display_state_tests;
