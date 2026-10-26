@@ -303,6 +303,35 @@ impl Syscall<'_> {
             Err(ZxError::BAD_STATE)
         }
     }
+    /// Finish the call `zx_channel_call_etc` left interrupted.
+    ///
+    /// Same answers as [`Self::sys_channel_call_finish`], and the same gap
+    /// behind them. It had no arm in the dispatcher at all, so it fell
+    /// through to the fallback and answered `ZX_ERR_NOT_SUPPORTED` where the
+    /// non-etc call answers `ZX_ERR_BAD_STATE`: a caller that never made a
+    /// call cannot tell "you called this wrong" from "this kernel does not
+    /// have it".
+    pub fn sys_channel_call_etc_finish(
+        &self,
+        deadline: Deadline,
+        user_args: UserInPtr<ChannelCallEtcArgs>,
+        _actual_bytes: UserOutPtr<u32>,
+        _actual_handles: UserOutPtr<u32>,
+    ) -> ZxResult {
+        let args = user_args.read()?;
+        info!(
+            "channel.call_etc_finish: deadline={:?}, args={:#x?}",
+            deadline, args
+        );
+        if self.thread.state() == ThreadState::BlockedChannel {
+            // As in the non-etc finish: the reply path of an interrupted call
+            // is not wired yet.
+            Err(ZxError::NOT_SUPPORTED)
+        } else {
+            Err(ZxError::BAD_STATE)
+        }
+    }
+
     /// Write a message to a channel.
     pub fn sys_channel_write_etc(
         &self,
