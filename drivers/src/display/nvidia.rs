@@ -240,6 +240,7 @@ mod gpu_ready;
 
 /// The bring-up narration switch; own file for the size ceiling, no logic
 /// change.
+mod boot_window;
 mod quiet_bringup;
 use quiet_bringup::QuietBringup;
 
@@ -4868,65 +4869,23 @@ impl DrmScheme for NvidiaGpu {
         // 2. GSP-RM boot. gsp_boot_run arms the console SEC2 drain internally
         //    now, so this is the proven path; cached after the first boot.
         s.push_str("[gpustep14] --- stage 2: GSP-RM boot (kgspInitRm, console-SILENT, Linux-parity STARTCPU, VGA decode off, PBUS pre-clear) ---\n");
-        // Renounce legacy VGA decode for the boot, like Linux does at PCI
-        // probe (nv-pci.c:855-858: vga_tryget + vga_set_legacy_decoding
-        // VGA_RSRC_NONE): clear the function's I/O decode + every bridge VGA
-        // routing bit on the path. Restored after the boot. Console rendering
-        // is untouched (BAR1 is MEM space). With console-silence and the
-        // Linux-parity STARTCPU bracket this makes the boot environment
-        // converge on Linux's in every knob Linux is known to set.
-        let io_cmd_old = {
-            use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
-            use pci::Location;
-            let loc = Location {
-                bus: self.pci_bus,
-                device: self.pci_device,
-                function: 0,
-            };
-            let ops = &PortOpsImpl;
-            let cmd = unsafe { PCI_ACCESS.read16(ops, loc, 0x04) };
-            unsafe { PCI_ACCESS.write16(ops, loc, 0x04, cmd & !0x0001) };
-            s.push_str(&alloc::format!(
-                "[gpustep14] PCI I/O decode disabled for the boot (COMMAND {:#06x} -> {:#06x})\n",
-                cmd,
-                cmd & !0x0001
-            ));
-            cmd
-        };
-        let (bridge_log, bridges_changed) = self.set_path_vga_routing(true, &[]);
-        s.push_str(&bridge_log);
+        // The whole hand-over to the firmware -- display engine off, VGA
+        // decode renounced -- lives in `boot_window`, which also says why
+        // taking the display away is the piece Linux always had and this
+        // chain's long list of parches never did.
+        //
         // LOUD + the empirical 0058b6f4 bracket (tight leaf-W1C before the
-        // store, NO display/priv-ring reads). The falsification ladder is
-        // complete: console silence, PBUS unit clear, VGA decode off, MPS
-        // normalization and full Linux byte-parity (empty bracket) ALL
-        // wedged; the only two boots that ever survived STARTCPU ran the
-        // tight-W1C bracket without the EXP4 display-cluster reads (r13 on
-        // 359cef1e, full r14 chain on 0058b6f4). Mechanism is only partially
-        // understood (a hub-leaf W1C posted immediately before the store,
-        // plausibly flushing/fencing the PRI path across the SEC2 handoff),
-        // but the correlation is 2-for-3 vs 0-for-everything-else, so run
-        // the exact recipe with all the new pre-boot hygiene (console-mark,
-        // MPS normalize, PBUS clear, VGA off) layered on top. gsp_boot_run
-        // arms the drain for console GPUs when quiet=false.
+        // store, NO display/priv-ring reads), kept underneath: the two boots
+        // that ever survived STARTCPU ran it (r13 on 359cef1e, full r14 chain
+        // on 0058b6f4) and nothing else ever did. It is 2-for-3 and only
+        // partly understood, so it stays until the display hand-over is proven
+        // on hardware to make it unnecessary. `gsp_boot_run` arms the drain
+        // for console GPUs when quiet=false.
+        let window = boot_window::BootWindow::enter(self, "gpustep14", &mut s);
         nvidia_rm_sys::os_interface::live_echo_begin();
         s.push_str(&self.gsp_boot_run("gpustep14", false));
         nvidia_rm_sys::os_interface::live_echo_end();
-        let (restore_log, _) = self.set_path_vga_routing(false, &bridges_changed);
-        s.push_str(&restore_log);
-        {
-            use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
-            use pci::Location;
-            let loc = Location {
-                bus: self.pci_bus,
-                device: self.pci_device,
-                function: 0,
-            };
-            let ops = &PortOpsImpl;
-            // Restore the original COMMAND value, except INTx stays masked
-            // (gsp_boot_run masked it; Eclipse is fully polled).
-            unsafe { PCI_ACCESS.write16(ops, loc, 0x04, io_cmd_old | (1 << 10)) };
-            s.push_str("[gpustep14] PCI I/O decode restored after boot\n");
-        }
+        window.leave(&mut s);
         // 3-5. RM controls, state pre-init/init/load, CE data movement -- reuse
         //    the exact same code paths proven on the secondary GPU.
         s.push_str("[gpustep14] --- stage 3: RM API controls (gpustep8) ---\n");

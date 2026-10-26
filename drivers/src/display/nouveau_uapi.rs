@@ -92,6 +92,41 @@ pub fn gpu_trace_enabled() -> bool {
     GPU_TRACE.load(Ordering::Relaxed)
 }
 
+/// Hold the console GPU's display engine in reset across the SEC2 HS-resume
+/// window of its own GSP boot. **Default on**, hatch `nvidia.nodispoff`.
+///
+/// This is what Linux does and Eclipse did not. At PCI probe Linux calls
+/// `drm_aperture_remove_conflicting_pci_framebuffers`: the firmware
+/// framebuffer driver that owns the card's aperture is unbound and destroyed,
+/// so by the time `kgspInitRm` runs, nothing is scanning out of that card.
+///
+/// Eclipse instead "paused scanout", which is a software flag: it stops the
+/// CPU drawing and stops flips, and the display engine keeps fetching the same
+/// framebuffer out of BAR1 at 60 Hz for the whole boot. That isochronous fetch
+/// against the SEC2-RTOS HS payload is the wedge, and every parche layered on
+/// top of it -- console silence, PBUS unit clear, VGA decode off, MPS
+/// normalization, Linux byte-parity -- left it in place and failed. What
+/// finally survived was an empirical register bracket that worked 2 boots out
+/// of 3: a coin flip, which is exactly what losing the monitor on some boots
+/// and not others looks like.
+///
+/// The machinery to do it properly was written as EXP1c and wired only into
+/// the manual `/proc/gpustep12`, so it was never run together with the rest of
+/// the bring-up: PDISP (`NV_PMC_ENABLE` bit 30) is cleared the moment
+/// `kgspCalculateFbLayout` has consumed `NV_PDISP_VGA_WORKSPACE_BASE`, and
+/// restored on the RM's own "RISCV started" line -- past the wedge window, and
+/// before GSP-RM's init needs the display engine alive. The monitor loses
+/// signal for that stretch instead of showing a frozen picture.
+static DISPLAY_OFF_FOR_GSP: AtomicBool = AtomicBool::new(true);
+
+pub fn set_display_off_for_gsp(v: bool) {
+    DISPLAY_OFF_FOR_GSP.store(v, Ordering::Relaxed);
+}
+
+pub fn display_off_for_gsp() -> bool {
+    DISPLAY_OFF_FOR_GSP.load(Ordering::Relaxed)
+}
+
 /// Escape hatch for the real `osInitMapping` (`nvidia.noosinitmapping`).
 /// The flag itself lives in `nvidia-rm-sys`, next to the hook it governs;
 /// this is only the cmdline-facing door, because `zCore` reaches the

@@ -481,6 +481,52 @@ pub fn ce_present_enabled() -> bool {
     CE_PRESENT_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Set once at boot: is a deferred console-GPU bring-up actually going to run?
+///
+/// `/proc/gpuready` answers for the card that scans out the console, and that
+/// card only ever becomes usable because the deferred task brings it up. When
+/// the task is not scheduled -- a single-GPU box without `nvidia.console_gpu`,
+/// or any box booted with `nvidia.noconsole_gpu` -- the honest answer is
+/// `none` ("nothing to wait for"), not `waiting` forever. Saying `waiting`
+/// there cost every such boot the init-side timeout before the session
+/// started, waiting on something nobody had scheduled.
+static CONSOLE_BRINGUP_EXPECTED: AtomicBool = AtomicBool::new(false);
+
+/// Someone has read `/proc/gpuready`. See [`gpu_ready_was_read`].
+static GPU_READY_WAS_READ: AtomicBool = AtomicBool::new(false);
+
+/// Declare that the deferred console-GPU bring-up is scheduled for this boot.
+pub fn set_console_bringup_expected(on: bool) {
+    CONSOLE_BRINGUP_EXPECTED.store(on, Ordering::Relaxed);
+}
+
+/// Whether anything is going to bring the console GPU up this boot.
+pub fn console_bringup_expected() -> bool {
+    CONSOLE_BRINGUP_EXPECTED.load(Ordering::Relaxed)
+}
+
+/// Record that userspace asked whether the console GPU is usable yet.
+pub fn note_gpu_ready_read() {
+    GPU_READY_WAS_READ.store(true, Ordering::Relaxed);
+}
+
+/// Has userspace asked whether the console GPU is usable yet?
+///
+/// The deferred bring-up waits for the compositor to claim the VT
+/// (`KD_GRAPHICS`) before it parks scanout, so it never runs while the boot is
+/// still painting progress. Once init holds the compositor back until
+/// `/proc/gpuready` says the card is usable, those two waits point at each
+/// other: the compositor cannot present until the card is up, and the card is
+/// not brought up until the compositor presents. Both only ended on their
+/// timeouts -- 25 s of black screen, and then pixman anyway.
+///
+/// A read of `/proc/gpuready` breaks it, and is the better signal of the two:
+/// it means init has got as far as starting a GPU session, which is exactly
+/// the "boot progress is over" that the `KD_GRAPHICS` wait was approximating.
+pub fn gpu_ready_was_read() -> bool {
+    GPU_READY_WAS_READ.load(Ordering::Relaxed)
+}
+
 /// Pause/resume software+CE scanout. Used by deferred console-GPU GSP bring-up
 /// so labwc's frame loop does not write BAR1 during SEC2 STARTCPU.
 ///
@@ -8349,3 +8395,7 @@ mod damage_against_the_panel_tests;
 /// a two-card box is the compute card -- the one with no monitor on it.
 #[cfg(test)]
 mod display_driver_tests;
+
+/// Tests for the signals around the deferred console-GPU bring-up.
+#[cfg(test)]
+mod console_bringup_signal_tests;

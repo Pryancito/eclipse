@@ -437,6 +437,16 @@ pub fn set_gpu_trace_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_gpu_trace_enabled(_v: bool) {}
 
+/// Keep the console GPU's display engine running across its own GSP boot
+/// (`nvidia.nodispoff`), the way every boot before this did. Default is to
+/// turn it off for that window, like Linux: see `display_off_for_gsp`.
+#[cfg(target_arch = "x86_64")]
+pub fn set_display_off_for_gsp(v: bool) {
+    zcore_drivers::display::set_display_off_for_gsp(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_display_off_for_gsp(_v: bool) {}
+
 /// Enables on-demand console-GPU GSP bring-up (`nvidia.console_gsp`). Default off.
 #[cfg(target_arch = "x86_64")]
 pub fn set_console_gsp_enabled(v: bool) {

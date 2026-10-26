@@ -1703,9 +1703,9 @@ impl DrmDev {
                 // of it was read: a modeset on a CRTC the card does not have
                 // went to the one it has, and a connector list of any content
                 // was accepted unread.
-                if drm::get_crtc(req.crtc_id).is_none() {
+                let Some(crtc) = drm::get_crtc(req.crtc_id) else {
                     return Err(FsError::EntryNotFound);
-                }
+                };
                 // With a mode, `drm_mode_setcrtc` then looks the fb up
                 // (ENOENT; -1 names the fb already on the CRTC, EINVAL when
                 // there is none), runs the mode through
@@ -1722,7 +1722,7 @@ impl DrmDev {
                 let mut active_area = None;
                 if req.mode_valid != 0 {
                     if fb_id == u32::MAX {
-                        fb_id = drm::get_crtc(req.crtc_id).map_or(0, |c| c.fb_id);
+                        fb_id = crtc.fb_id;
                         if fb_id == 0 {
                             return Err(FsError::InvalidParam);
                         }
@@ -1738,16 +1738,11 @@ impl DrmDev {
                     // the code's range was checked here, so a client that
                     // knows nothing of the bits set them unknowingly and
                     // was shown them back by nobody.
-                    let mode_flags = u32::from_ne_bytes([
-                        req.mode[28],
-                        req.mode[29],
-                        req.mode[30],
-                        req.mode[31],
-                    ]);
-                    if !self.file.aspect_ratio() && mode_flags & DRM_MODE_FLAG_PIC_AR_MASK != 0 {
+                    let mode = DrmModeModeinfo::from_bytes(&req.mode);
+                    if !self.file.aspect_ratio() && mode.flags & DRM_MODE_FLAG_PIC_AR_MASK != 0 {
                         return Err(FsError::InvalidParam);
                     }
-                    let (w, h) = modeinfo_active_area(&req.mode)?;
+                    let (w, h) = modeinfo_active_area(&mode)?;
                     if w > fb.width
                         || req.x > fb.width - w
                         || h > fb.height
@@ -5490,20 +5485,17 @@ const DRM_MODE_TYPE_ALL: u32 = 0x08 | 0x20 | 0x40;
 /// `DBLSCAN` and divided by `vscan` past 1, rounded to the nearest
 /// (`DIV_ROUND_CLOSEST_ULL`); 0 without totals or when a product overflows
 /// an `unsigned int` (`check_mul_overflow`).
-fn modeinfo_vrefresh(m: &[u8; 68]) -> u32 {
-    let u16_at = |i: usize| u16::from_ne_bytes([m[i], m[i + 1]]) as u32;
-    let clock = u32::from_ne_bytes([m[0], m[1], m[2], m[3]]);
-    let (htotal, vtotal, vscan) = (u16_at(10), u16_at(20), u16_at(22));
-    let flags = u32::from_ne_bytes([m[28], m[29], m[30], m[31]]);
+fn modeinfo_vrefresh(m: &DrmModeModeinfo) -> u32 {
+    let (htotal, vtotal, vscan) = (m.htotal as u32, m.vtotal as u32, m.vscan as u32);
     if htotal == 0 || vtotal == 0 {
         return 0;
     }
-    let num = if flags & DRM_MODE_FLAG_INTERLACE != 0 {
+    let num = if m.flags & DRM_MODE_FLAG_INTERLACE != 0 {
         2
     } else {
         1
     };
-    let mut den = if flags & DRM_MODE_FLAG_DBLSCAN != 0 {
+    let mut den = if m.flags & DRM_MODE_FLAG_DBLSCAN != 0 {
         2
     } else {
         1
@@ -5511,7 +5503,7 @@ fn modeinfo_vrefresh(m: &[u8; 68]) -> u32 {
     if vscan > 1 {
         den *= vscan;
     }
-    let (Some(num), Some(den)) = (clock.checked_mul(num), (htotal * vtotal).checked_mul(den))
+    let (Some(num), Some(den)) = (m.clock.checked_mul(num), (htotal * vtotal).checked_mul(den))
     else {
         return 0;
     };
@@ -5527,24 +5519,20 @@ fn modeinfo_vrefresh(m: &[u8; 68]) -> u32 {
 /// `strscpy_pad` (31 bytes, then NULs) and the aspect-ratio bits only for a
 /// client with `DRM_CLIENT_CAP_ASPECT_RATIO`.
 fn committed_umode(stored: &[u8; 68], aspect_ratio_allowed: bool) -> [u8; 68] {
-    let mut m = *stored;
-    m[24..28].copy_from_slice(&modeinfo_vrefresh(stored).to_ne_bytes());
-    let mut flags = u32::from_ne_bytes([m[28], m[29], m[30], m[31]]);
+    let mut m = DrmModeModeinfo::from_bytes(stored);
+    m.vrefresh = modeinfo_vrefresh(&m);
     if !aspect_ratio_allowed {
-        flags &= !DRM_MODE_FLAG_PIC_AR_MASK;
+        m.flags &= !DRM_MODE_FLAG_PIC_AR_MASK;
     }
-    m[28..32].copy_from_slice(&flags.to_ne_bytes());
-    let ty = u32::from_ne_bytes([m[32], m[33], m[34], m[35]]) & DRM_MODE_TYPE_ALL;
-    m[32..36].copy_from_slice(&ty.to_ne_bytes());
-    let name = &stored[36..68];
-    let len = name
+    m.type_ &= DRM_MODE_TYPE_ALL;
+    let len = m
+        .name
         .iter()
         .position(|&b| b == 0)
-        .unwrap_or(name.len())
+        .unwrap_or(m.name.len())
         .min(31);
-    m[36..68].fill(0);
-    m[36..36 + len].copy_from_slice(&name[..len]);
-    m
+    m.name[len..].fill(0);
+    m.to_bytes()
 }
 
 /// The numbers that go into a `drm_mode_modeinfo`, from whichever source could
@@ -5625,17 +5613,11 @@ const DRM_MODE_FLAG_ALL: u32 =
 /// `drm_mode_validate_driver` runs the basic checks (EINVAL). A clock or
 /// vrefresh past `INT_MAX` was accepted here and the aspect-ratio code was
 /// checked first.
-fn modeinfo_active_area(m: &[u8; 68]) -> Result<(u32, u32)> {
-    let u16_at = |i: usize| u16::from_ne_bytes([m[i], m[i + 1]]);
-    let clock = u32::from_ne_bytes([m[0], m[1], m[2], m[3]]);
-    let vrefresh = u32::from_ne_bytes([m[24], m[25], m[26], m[27]]);
-    if clock > i32::MAX as u32 || vrefresh > i32::MAX as u32 {
+fn modeinfo_active_area(m: &DrmModeModeinfo) -> Result<(u32, u32)> {
+    if m.clock > i32::MAX as u32 || m.vrefresh > i32::MAX as u32 {
         return Err(FsError::OutOfRange);
     }
-    let (hdisplay, hsync_start, hsync_end, htotal) = (u16_at(4), u16_at(6), u16_at(8), u16_at(10));
-    let (vdisplay, vsync_start, vsync_end, vtotal) =
-        (u16_at(14), u16_at(16), u16_at(18), u16_at(20));
-    let flags = u32::from_ne_bytes([m[28], m[29], m[30], m[31]]);
+    let flags = m.flags;
     if (flags & DRM_MODE_FLAG_PIC_AR_MASK) >> DRM_MODE_FLAG_PIC_AR_SHIFT > DRM_MODE_FLAG_PIC_AR_MAX
     {
         return Err(FsError::InvalidParam);
@@ -5648,22 +5630,30 @@ fn modeinfo_active_area(m: &[u8; 68]) -> Result<(u32, u32)> {
     if flags & !DRM_MODE_FLAG_ALL != 0 || flags & DRM_MODE_FLAG_3D_MASK > DRM_MODE_FLAG_3D_MAX {
         return Err(FsError::InvalidParam);
     }
-    if clock == 0 {
+    if m.clock == 0 {
         return Err(FsError::InvalidParam);
     }
-    if hdisplay == 0 || hsync_start < hdisplay || hsync_end < hsync_start || htotal < hsync_end {
+    if m.hdisplay == 0
+        || m.hsync_start < m.hdisplay
+        || m.hsync_end < m.hsync_start
+        || m.htotal < m.hsync_end
+    {
         return Err(FsError::InvalidParam);
     }
-    if vdisplay == 0 || vsync_start < vdisplay || vsync_end < vsync_start || vtotal < vsync_end {
+    if m.vdisplay == 0
+        || m.vsync_start < m.vdisplay
+        || m.vsync_end < m.vsync_start
+        || m.vtotal < m.vsync_end
+    {
         return Err(FsError::InvalidParam);
     }
-    Ok((hdisplay as u32, vdisplay as u32))
+    Ok((m.hdisplay as u32, m.vdisplay as u32))
 }
 
 mod modeinfo;
-use modeinfo::make_modeinfo;
 #[cfg(test)]
 use modeinfo::make_modeinfo_with;
+use modeinfo::{make_modeinfo, DrmModeModeinfo};
 
 const I32_MIN_U64: u64 = i32::MIN as i64 as u64;
 const MINUS_ONE_U64: u64 = -1i64 as u64;

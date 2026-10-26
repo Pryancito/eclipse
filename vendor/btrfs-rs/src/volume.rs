@@ -153,12 +153,31 @@ impl Volume {
             [header::OFF_CHUNK_TREE_UUID..header::OFF_CHUNK_TREE_UUID + 16]
             .try_into()
             .unwrap();
-        self.load_chunk_node(root)
+        let level = header::level(&root_block);
+        drop(root_block);
+        self.load_chunk_node(root, level)
     }
 
-    fn load_chunk_node(&mut self, logical: u64) -> Result<()> {
+    /// `max_level` is the highest level this block is allowed to claim: the
+    /// root's own for the root, and the parent's minus one below it. Nothing
+    /// else bounded this descent, so a crafted chunk tree whose node points
+    /// back at itself recursed until the stack was gone -- and since
+    /// `read_block` caches, not even slowly. A dead stack in a kernel is
+    /// worse than a panic, because it leaves no message.
+    ///
+    /// The block's **own** level is what the walk then uses, and that is
+    /// deliberate: it is also what [`check_block_bounds`] measured the item
+    /// count against, so the two cannot disagree about which of the two
+    /// tables this block holds. Taking the parent's word for it instead would
+    /// let a block bounded as a node be read as a leaf, whose item extents
+    /// were never checked. `Tree::search` bounds its own descent the same way
+    /// and can afford the stricter `==` because it knows the level it wants.
+    fn load_chunk_node(&mut self, logical: u64, max_level: u8) -> Result<()> {
         let block = self.read_block(logical)?;
         let level = header::level(&block);
+        if level > max_level {
+            return Err(Error::Corrupt("chunk tree level out of order"));
+        }
         let n = header::nritems(&block) as usize;
         if level > 0 {
             let mut children = Vec::with_capacity(n);
@@ -167,7 +186,7 @@ impl Volume {
             }
             drop(block);
             for child in children {
-                self.load_chunk_node(child)?;
+                self.load_chunk_node(child, level - 1)?;
             }
         } else {
             let mut found = Vec::new();
@@ -289,6 +308,10 @@ impl Volume {
         if !header::csum_ok(&data) {
             return Err(Error::Corrupt("tree block checksum"));
         }
+        // What the header says about its own contents, before anything walks
+        // it: `nritems` and each item's extent come off the disk and index
+        // into this buffer. See `structs::check_block_bounds`.
+        check_block_bounds(&data, self.nodesize)?;
         let data = Arc::new(data);
         self.cache.insert(
             logical,

@@ -21,6 +21,7 @@ pub mod ioctl;
 mod kbd_layout;
 mod mount_ops;
 mod mount_state;
+mod mountinfo;
 mod perf;
 mod pidfd;
 mod pipe;
@@ -54,8 +55,7 @@ pub fn mock_block() -> mock::MockBlock {
 }
 
 use alloc::{
-    boxed::Box, collections::BTreeMap, fmt::Write as _, string::String, string::ToString,
-    sync::Arc, vec::Vec,
+    boxed::Box, collections::BTreeMap, string::String, string::ToString, sync::Arc, vec::Vec,
 };
 use core::convert::TryFrom;
 
@@ -194,6 +194,11 @@ pub use timerfd::TimerFd;
 
 #[derive(Clone)]
 struct MountEntry {
+    /// Its number in `/proc/<pid>/mountinfo`, given once when it is recorded
+    /// and never again to another mount.
+    id: usize,
+    /// The number of the mount it was put on: see [`mountinfo::parent_of`].
+    parent: usize,
     source: String,
     target: String,
     fstype: String,
@@ -665,9 +670,16 @@ pub(crate) fn register_mount(
     options: &str,
     state: Option<Arc<mount_state::MountState>>,
 ) {
-    MOUNT_TABLE
-        .lock()
-        .push(new_mount_entry(source, target, fstype, options, state));
+    record_mount(
+        &mut MOUNT_TABLE.lock(),
+        new_mount_entry(source, target, fstype, options, state),
+    );
+}
+
+/// Put `entry` in `mounts`, on the mount it goes on.
+fn record_mount(mounts: &mut Vec<MountEntry>, mut entry: MountEntry) {
+    entry.parent = mountinfo::parent_of(&entry.target, mounts.iter());
+    mounts.push(entry);
 }
 
 /// The entry `register_mount` records, built apart from the table so that the
@@ -681,12 +693,30 @@ fn new_mount_entry(
     state: Option<Arc<mount_state::MountState>>,
 ) -> MountEntry {
     MountEntry {
+        id: mountinfo::next_id(),
+        parent: mountinfo::ROOT_PARENT,
         source: source.to_string(),
         target: target.to_string(),
         fstype: fstype.to_string(),
         options: options.to_string(),
         state: state.unwrap_or_else(|| Arc::new(mount_state::MountState::from_options(0, options))),
     }
+}
+
+/// The source and type of the mount on top at `target`, which a bind of it
+/// shows as its own.
+pub(crate) fn mount_origin(target: &str) -> Option<(String, String)> {
+    origin_in(&MOUNT_TABLE.lock(), target)
+}
+
+/// [`mount_origin`] over the table it is given.
+fn origin_in(mounts: &[MountEntry], target: &str) -> Option<(String, String)> {
+    let target = normalize_mount_target(target);
+    mounts
+        .iter()
+        .rev()
+        .find(|m| m.target == target)
+        .map(|m| (m.source.clone(), m.fstype.clone()))
 }
 
 pub(crate) fn unregister_mount(target: &str) {
@@ -705,8 +735,13 @@ fn remount_entry(
     data: &str,
 ) -> LxResult<()> {
     let target = normalize_mount_target(target);
+    // The top one where several are stacked, as `do_remount` takes the mount
+    // the path leads to, and as the flags are read: init mounts `/proc`,
+    // `/sys`, `/dev`, `/run` and `/tmp` over the kernel's own, and a remount
+    // that went to the one underneath changed a line and nothing else.
     let entry = mounts
         .iter_mut()
+        .rev()
         .find(|m| m.target == target)
         .ok_or(LxError::EINVAL)?;
     // `do_remount()` sets the mount's attributes from the flags it was given,
@@ -719,14 +754,30 @@ fn remount_entry(
 }
 
 pub(crate) fn move_mount_entry(old_target: &str, new_target: &str) -> LxResult<()> {
+    move_entry(&mut MOUNT_TABLE.lock(), old_target, new_target)
+}
+
+/// `MS_MOVE`, over the table it is given.
+fn move_entry(mounts: &mut [MountEntry], old_target: &str, new_target: &str) -> LxResult<()> {
     let old_target = normalize_mount_target(old_target);
     let new_target = normalize_mount_target(new_target);
-    let mut mounts = MOUNT_TABLE.lock();
-    let entry = mounts
-        .iter_mut()
-        .find(|m| m.target == old_target)
+    let at = mounts
+        .iter()
+        .rposition(|m| m.target == old_target)
         .ok_or(LxError::EINVAL)?;
+    // It hangs from whatever is at its new place now (`attach_mnt`), and it
+    // cannot be its own parent.
+    let parent = mountinfo::parent_of(
+        &new_target,
+        mounts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != at)
+            .map(|(_, m)| m),
+    );
+    let entry = &mut mounts[at];
     entry.target = new_target;
+    entry.parent = parent;
     Ok(())
 }
 
@@ -815,17 +866,9 @@ fn path_is_under(path: &str, mount: &str) -> bool {
     path.len() > mount.len() && path.starts_with(mount) && path.as_bytes()[mount.len()] == b'/'
 }
 
+/// `/proc/mounts`, and every process's `mounts`: see [`mountinfo::mounts_text`].
 pub(crate) fn proc_mounts_content() -> String {
-    let mounts = MOUNT_TABLE.lock();
-    let mut out = String::new();
-    for m in mounts.iter() {
-        let _ = writeln!(
-            out,
-            "{} {} {} {} 0 0",
-            m.source, m.target, m.fstype, m.options
-        );
-    }
-    out
+    mountinfo::mounts_text(&MOUNT_TABLE.lock())
 }
 
 /// EventBus mask matching a poll interest set: readable/writable as
@@ -2794,6 +2837,38 @@ mod mount_lookup_tests {
             "nosuid outlived a remount that dropped it"
         );
         assert_eq!(table[0].options, "ro");
+    }
+
+    #[test]
+    fn a_remount_where_two_are_stacked_moves_the_top_one() {
+        // Linux 6.18, `mount -t tmpfs t1 c; mount -t tmpfs t2 c; mount -o
+        // remount,ro c`: `t2` read `ro`, `t1` stayed `rw`. Here init's own
+        // `mount -t tmpfs tmpfs /tmp` stacks one over the kernel's, and the
+        // flags are read off the top one.
+        let mut table = alloc::vec![
+            new_mount_entry("t1", "/tmp", "tmpfs", "rw", None),
+            new_mount_entry("t2", "/tmp", "tmpfs", "rw", None),
+        ];
+        remount_entry(&mut table, "/tmp", 0, "ro,noexec").unwrap();
+        assert_eq!(
+            (table[0].options.as_str(), table[1].options.as_str()),
+            ("rw", "ro,noexec")
+        );
+        assert!(table[1].state.is_noexec() && !table[0].state.is_noexec());
+        let flagged = table
+            .iter()
+            .map(|m| (m.target.as_str(), m.state.is_noexec()));
+        assert!(
+            mount_flag_from("/tmp/x", flagged),
+            "the remount did nothing"
+        );
+
+        // A move takes the top one too, as the path leads to it.
+        move_entry(&mut table, "/tmp", "/mnt").unwrap();
+        assert_eq!(
+            (table[0].target.as_str(), table[1].target.as_str()),
+            ("/tmp", "/mnt")
+        );
     }
 
     #[test]

@@ -1144,3 +1144,85 @@ fn the_deferred_free_keeps_the_owning_context() {
         ctor
     );
 }
+
+/// The console GPU's GSP boot runs with the card handed over to its firmware.
+///
+/// This is the fix for the wedge, and it is the kind that quietly rots: the
+/// hand-over is three calls around one `gsp_boot_run`, and an edit that moves
+/// the boot out of the window, or re-inlines the PCI/VGA restore the way it
+/// used to be, costs nothing visible here and the monitor on hardware. The
+/// 2-of-3 empirical bracket underneath hides it further, because the boot
+/// still usually works.
+#[test]
+fn the_console_gsp_boot_happens_inside_the_hand_over_window() {
+    let body = live_method_lines("bringup_step14");
+    let enter = body
+        .find("BootWindow::enter(")
+        .expect("the console GSP boot must take the card away from the display first");
+    let boot = body
+        .find("gsp_boot_run(")
+        .expect("`bringup_step14` must still boot the GSP");
+    let leave = body
+        .find(".leave(")
+        .expect("the window must be given back, or the console never comes home");
+    assert!(
+        enter < boot && boot < leave,
+        "the GSP boot must run INSIDE the hand-over window (enter {} / boot {} / leave {})",
+        enter,
+        boot,
+        leave
+    );
+    // The restore used to be open-coded after the boot. If it comes back here,
+    // the early-return and unwind paths lose it again.
+    assert!(
+        !body.contains("PCI I/O decode restored"),
+        "giving the card back belongs to `BootWindow`, which also does it on \
+         the paths that never reach the end of this function"
+    );
+}
+
+/// Taking the display away is what makes the hand-over a hand-over; the rest
+/// of the window (VGA decode, I/O decode) was already there while the monitor
+/// kept being scanned out, and that combination failed.
+#[test]
+fn the_hand_over_actually_takes_the_display_away() {
+    let src = include_str!("../boot_window.rs");
+    let live: alloc::string::String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("//!"))
+        .collect::<alloc::vec::Vec<&str>>()
+        .join("\n");
+    assert!(
+        live.contains("pdisp_kill_arm()"),
+        "without PDISP going into reset the display engine keeps fetching BAR1 \
+         through the SEC2 window, which is the wedge this window exists to avoid"
+    );
+    assert!(
+        live.contains("pdisp_kill_disarm()"),
+        "an arm that outlives its boot fires on somebody else's register read"
+    );
+    assert!(
+        live.contains("display_off_for_gsp()"),
+        "`nvidia.nodispoff` must still be able to restore the old behaviour"
+    );
+}
+
+/// Handing the display over is the DEFAULT, not an opt-in.
+///
+/// Every earlier attempt at this wedge shipped as a `/proc/gpustep` an
+/// operator had to know to run, so the one change that addressed the cause was
+/// never in the path that actually boots the card. A default of `false` here
+/// would reproduce that exactly, and silently.
+#[test]
+fn the_display_is_handed_over_unless_someone_asks_otherwise() {
+    assert!(
+        crate::display::nouveau_uapi::display_off_for_gsp(),
+        "the console GPU boots with its display handed over by default;          `nvidia.nodispoff` is the opt-OUT"
+    );
+    crate::display::nouveau_uapi::set_display_off_for_gsp(false);
+    assert!(
+        !crate::display::nouveau_uapi::display_off_for_gsp(),
+        "`nvidia.nodispoff` must still reach the boot path"
+    );
+    crate::display::nouveau_uapi::set_display_off_for_gsp(true);
+}
