@@ -2,6 +2,7 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use lazy_static::lazy_static;
 use lock::Mutex;
@@ -20,6 +21,10 @@ use super::mount_state::{
     self, build_options_string, flags_read_only, MNT_DETACH, MNT_FORCE, MS_BIND, MS_MOVE,
     MS_REMOUNT,
 };
+use super::{MountEntry, MOUNT_TABLE};
+
+/// The mount table, the kernel's or one a test built.
+type Table = Mutex<Vec<MountEntry>>;
 
 lazy_static! {
     static ref VFS_ROOT: Mutex<Option<Arc<MNode>>> = Mutex::new(None);
@@ -65,17 +70,48 @@ fn normalize_target(path: &str) -> String {
     out
 }
 
+/// The directory `target` shows: where a mount point is crossed, the root of
+/// the top filesystem mounted there.
 fn resolve_mnode(target: &str) -> LxResult<Arc<MNode>> {
-    let root = VFS_ROOT.lock().clone().ok_or(LxError::EINVAL)?;
-    let target = normalize_target(target);
-    if target == "/" {
-        return Ok(root);
-    }
-    let mut cur = root;
-    for comp in target.split('/').filter(|s| !s.is_empty()) {
+    resolve_from(&vfs_root().ok_or(LxError::EINVAL)?, target)
+}
+
+/// [`resolve_mnode`] from the root it is given.
+fn resolve_from(root: &Arc<MNode>, target: &str) -> LxResult<Arc<MNode>> {
+    let mut cur = root.clone();
+    for comp in normalize_target(target)
+        .split('/')
+        .filter(|s| !s.is_empty())
+    {
         cur = cur.find(false, comp).map_err(LxError::from)?;
     }
     Ok(cur)
+}
+
+/// The directory the top filesystem mounted at `target` is mounted on, or
+/// `None` where the kernel mounted none there.
+///
+/// [`resolve_from`] cannot answer it: a lookup crosses a mount point into
+/// what is mounted on it, so what it lands on is the mounted root, which is
+/// not a mount point itself. A bind, a move and an `umount` of anything the
+/// kernel had really mounted were `EINVAL` because they asked that root. This
+/// walks to the directory above, takes the last name without crossing, and
+/// climbs the stack mounted there to the top.
+fn mount_holder_from(root: &Arc<MNode>, target: &str) -> LxResult<Option<Arc<MNode>>> {
+    let target = normalize_target(target);
+    let (dir, name) = target.split_at(target.rfind('/').unwrap_or(0) + 1);
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let parent = resolve_from(root, dir)?;
+    let mut holder = parent.backing_find(name).map_err(LxError::from)?;
+    if !holder.is_mountpoint() {
+        return Ok(None);
+    }
+    while let Some(above) = holder.mounted_root().filter(|r| r.is_mountpoint()) {
+        holder = above;
+    }
+    Ok(Some(holder))
 }
 
 pub(crate) fn parse_fstype(fstype: &str) -> LxResult<&'static str> {
@@ -178,31 +214,15 @@ pub fn mount_fs(
     // be named. An empty name is refused further in, as the root, which is
     // neither movable nor a mount to bind.
     if flags & MS_MOVE != 0 {
-        return mount_move(source.ok_or(LxError::EINVAL)?, &target_norm);
+        let source = source.ok_or(LxError::EINVAL)?;
+        let root = vfs_root().ok_or(LxError::EINVAL)?;
+        return move_from(&root, &MOUNT_TABLE, source, &target_norm);
     }
 
     if flags & MS_BIND != 0 {
         let source = source.ok_or(LxError::EINVAL)?;
-        let source_node = resolve_mnode(source)?;
-        if !source_node.is_mountpoint() {
-            return Err(LxError::EINVAL);
-        }
-        let inner = source_node.mounted_inner_fs().ok_or(LxError::EINVAL)?;
-        let mount_node = resolve_mnode(&target_norm)?;
-        if mount_node.is_mountpoint() {
-            return Err(LxError::EBUSY);
-        }
-        let (fs, state) = prepare_fs(inner, flags, data);
-        mount_node.mount(fs).map_err(LxError::from)?;
-        let opts = build_options_string(flags, data);
-        // The filesystem under it is the source's, so the line names the
-        // device and type the source's line does, not the path it was
-        // reached by and "none": Linux copies `mnt_devname` and keeps the
-        // superblock.
-        let (origin, fstype) = super::mount_origin(source)
-            .unwrap_or_else(|| (String::from(source), String::from("none")));
-        super::register_mount(&origin, &target_norm, &fstype, &opts, Some(state));
-        return Ok(());
+        let root = vfs_root().ok_or(LxError::EINVAL)?;
+        return bind_from(&root, &MOUNT_TABLE, source, &target_norm, flags, data);
     }
 
     // Pseudo-filesystems the kernel already provides (procfs at /proc, sysfs at
@@ -215,15 +235,12 @@ pub fn mount_fs(
     if is_virtual_fstype(fstype) {
         let opts = build_options_string(flags, data);
         let source = source.unwrap_or("none");
-        super::register_mount(source, &target_norm, fstype, &opts, None);
+        super::register_line(source, &target_norm, fstype, &opts);
         return Ok(());
     }
 
     let fstype = parse_fstype(fstype)?;
     let mount_node = resolve_mnode(&target_norm)?;
-    if mount_node.is_mountpoint() {
-        return Err(LxError::EBUSY);
-    }
     let source = source.ok_or(LxError::EINVAL)?;
     let source_inode = proc.lookup_inode(source)?;
     let backend = MountBackend::from_inode(source_inode).map_err(|_| LxError::ENOTBLK)?;
@@ -236,7 +253,39 @@ pub fn mount_fs(
     Ok(())
 }
 
-fn mount_move(source: &str, target: &str) -> LxResult<()> {
+/// `mount --bind source target`, on the tree under `root` and the table
+/// `table`. A mount on a mount point goes on top of what is there, which is
+/// where [`resolve_from`] lands: the stack is how Linux takes it, not `EBUSY`.
+fn bind_from(
+    root: &Arc<MNode>,
+    table: &Table,
+    source: &str,
+    target: &str,
+    flags: usize,
+    data: &str,
+) -> LxResult<()> {
+    // A whole mount only: a directory inside one is not bound here.
+    let inner = mount_holder_from(root, source)?
+        .and_then(|holder| holder.mounted_inner_fs())
+        .ok_or(LxError::EINVAL)?;
+    let mount_node = resolve_from(root, target)?;
+    let (fs, state) = prepare_fs(inner, flags, data);
+    mount_node.mount(fs).map_err(LxError::from)?;
+    let opts = build_options_string(flags, data);
+    // The filesystem under it is the source's, so the line names the device
+    // and type the source's line does, not the path it was reached by and
+    // "none": Linux copies `mnt_devname` and keeps the superblock.
+    let mut mounts = table.lock();
+    let (origin, fstype) = super::origin_in(&mounts, source)
+        .unwrap_or_else(|| (String::from(source), String::from("none")));
+    let entry = super::new_mount_entry(&origin, target, &fstype, &opts, Some(state));
+    super::record_mount(&mut mounts, entry);
+    Ok(())
+}
+
+/// `mount --move source target`, on the tree under `root` and the table
+/// `table`.
+fn move_from(root: &Arc<MNode>, table: &Table, source: &str, target: &str) -> LxResult<()> {
     let source_norm = normalize_target(source);
     let target_norm = normalize_target(target);
     if source_norm == "/" {
@@ -248,36 +297,29 @@ fn mount_move(source: &str, target: &str) -> LxResult<()> {
     if target_norm.starts_with(&alloc::format!("{}/", source_norm)) {
         return Err(LxError::EINVAL);
     }
-    let source_node = resolve_mnode(&source_norm)?;
-    if !source_node.is_mountpoint() {
-        return Err(LxError::EINVAL);
+    resolve_from(root, &source_norm)?;
+    let backed = super::top_backed(&table.lock(), &source_norm).ok_or(LxError::EINVAL)?;
+    let target_node = resolve_from(root, &target_norm)?;
+    // A line with nothing mounted under it moves as a line.
+    if backed {
+        let holder = mount_holder_from(root, &source_norm)?.ok_or(LxError::EINVAL)?;
+        move_mount_between(&holder, &target_node)?;
     }
-    let target_node = resolve_mnode(&target_norm)?;
-    if target_node.is_mountpoint() {
-        return Err(LxError::EBUSY);
-    }
-    move_mount_between(&source_node, &target_node)?;
-    super::move_mount_entry(&source_norm, &target_norm)?;
-    Ok(())
+    super::move_entry(&mut table.lock(), &source_norm, &target_norm)
 }
 
-/// Detach the filesystem mounted at `source_node` and attach it at
-/// `target_node`, leaving it where it was if the destination refuses it.
+/// Move the filesystem mounted at `source_node`, with what is mounted inside
+/// it, onto `target_node`, leaving it where it was if the destination refuses
+/// it.
 ///
 /// A move that fails has to leave the mount alone. Detaching first and finding
 /// out afterwards left the filesystem mounted **nowhere** -- unreachable from
 /// any path, with `/proc/mounts` still naming the old one, and the caller told
-/// only that the move had failed. The checks in [`mount_move`] make a refusal
+/// only that the move had failed. The checks in [`move_from`] make a refusal
 /// rare, not impossible: `mount` also refuses a poisoned node and anything
 /// that is not a directory.
 fn move_mount_between(source_node: &Arc<MNode>, target_node: &Arc<MNode>) -> LxResult<()> {
-    let fs = source_node.mounted_inner_fs().ok_or(LxError::EINVAL)?;
-    source_node.umount().map_err(LxError::from)?;
-    if let Err(e) = target_node.mount(fs.clone()) {
-        let _ = source_node.mount(fs);
-        return Err(LxError::from(e));
-    }
-    Ok(())
+    source_node.move_mount(target_node).map_err(LxError::from)
 }
 
 /// Unmount a filesystem mounted at `target`.
@@ -287,16 +329,28 @@ pub fn umount_fs(target: &str, flags: usize) -> LxResult<()> {
     // `umount -l` succeeding while unmounting eagerly is worse than a refusal,
     // because the caller believes the mount was detached and it was not.
     mount_state::check_umount_flags(flags)?;
-    // MNT_FORCE and MNT_DETACH are accepted and then not acted on: an unmount
-    // here never reports EBUSY, so there is nothing for either to change.
-    let _ = flags & (MNT_FORCE | MNT_DETACH);
-    let target_norm = normalize_target(target);
-    let mount_node = resolve_mnode(&target_norm)?;
-    if !mount_node.is_mountpoint() {
-        return Err(LxError::EINVAL);
+    // MNT_FORCE is accepted and not acted on: no file open on a filesystem
+    // makes it busy here, so there is nothing for it to cut short.
+    let _ = flags & MNT_FORCE;
+    let root = vfs_root().ok_or(LxError::EINVAL)?;
+    umount_from(&root, &MOUNT_TABLE, target, flags & MNT_DETACH != 0)
+}
+
+/// `umount` of `target`, lazily (`MNT_DETACH`) if `detach`, on the tree under
+/// `root` and the table `table`.
+fn umount_from(root: &Arc<MNode>, table: &Table, target: &str, detach: bool) -> LxResult<()> {
+    let target = normalize_target(target);
+    resolve_from(root, &target)?;
+    let plan = super::unmount_in(&table.lock(), &target, detach)?;
+    if plan.backed {
+        // Whatever is mounted inside it goes with it, as a lazy unmount
+        // takes it on Linux. What they wrote reaches the device first, and if
+        // it cannot, nothing goes: not the mount, not its line.
+        if let Some(holder) = mount_holder_from(root, &target)? {
+            holder.umount().map_err(LxError::from)?;
+        }
     }
-    mount_node.umount().map_err(LxError::from)?;
-    super::unregister_mount(&target_norm);
+    table.lock().retain(|m| !plan.ids.contains(&m.id));
     Ok(())
 }
 
@@ -437,3 +491,6 @@ mod move_tests {
         assert!(!onto.is_mountpoint());
     }
 }
+
+#[cfg(test)]
+mod mount_tree_tests;
