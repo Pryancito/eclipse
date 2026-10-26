@@ -1947,6 +1947,29 @@ impl Syscall<'_> {
                 }
             }
         }
+        // And the one wait that is not about the GPU finishing something, but
+        // about it having STARTED: `GEM_NEW`/`VM_BIND`/`EXEC` on the card that
+        // scans out the console, while the deferred bring-up that attaches its
+        // RM is still to come. The sync arm can only answer ENODEV, and NVK
+        // turns one of those into `VK_ERROR_OUT_OF_DEVICE_MEMORY` and loses
+        // the renderer for the whole session. Gated before the two downcasts,
+        // like the waits above: this arm is on the path of every single ioctl,
+        // and the gate is one relaxed load that is false for every boot that
+        // schedules no console bring-up and for every ioctl after the one
+        // that did. The ioctl itself is recognised inside, by NR
+        // (`needs_rm_attached`), which lives in a crate this one only has as
+        // a dev-dependency.
+        if linux_object::fs::devfs::drm::console_bringup_unfinished() {
+            if let Some(file) = file_like.downcast_ref::<File>() {
+                if let Some(dev) = file
+                    .inode()
+                    .as_any_ref()
+                    .downcast_ref::<linux_object::fs::devfs::DrmDev>()
+                {
+                    dev.console_bringup_sleep(request as u32).await?;
+                }
+            }
+        }
         // And the implicit-sync half, for the legacy presents this kernel
         // actually runs (`drm.atomic` is opt-in, so wlroots drives SETCRTC and
         // PAGE_FLIP). Neither ioctl carries a fence, so the buffer used to be

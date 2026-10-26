@@ -25,10 +25,10 @@ pub use nouveau_uapi::nouveau_ioctl_name;
 #[cfg(target_arch = "x86_64")]
 pub use nouveau_uapi::{
     compositor_ctx0, console_gsp_enabled, display_off_for_gsp, exec_fast_enabled,
-    gpu_trace_enabled, hwflip_enabled, osinit_mapping_enabled, set_compositor_ctx0,
-    set_console_gsp_enabled, set_console_preserve, set_display_off_for_gsp, set_exec_fast_enabled,
-    set_gpu_trace_enabled, set_hwflip_enabled, set_osinit_mapping_enabled, set_scanout_gpu_bringup,
-    set_surfaceflip_enabled, surfaceflip_enabled,
+    gpu_trace_enabled, hwflip_enabled, needs_rm_attached, osinit_mapping_enabled,
+    set_compositor_ctx0, set_console_gsp_enabled, set_console_preserve, set_display_off_for_gsp,
+    set_exec_fast_enabled, set_gpu_trace_enabled, set_hwflip_enabled, set_osinit_mapping_enabled,
+    set_scanout_gpu_bringup, set_surfaceflip_enabled, surfaceflip_enabled,
 };
 /// `GEM_CPU_PREP`'s recogniser and request reader, for the async pre-wait in
 /// `linux-object`: that ioctl blocks, and `INode::io_control` is synchronous,
@@ -122,6 +122,19 @@ pub fn nouveau_uapi_enabled() -> bool {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn is_cpu_prep_ioctl(_request: u32) -> bool {
     false
+}
+
+/// No nouveau uAPI off x86_64, so no `GEM_NEW`/`VM_BIND`/`EXEC` that could
+/// ever find the RM cold.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn needs_rm_attached(_request: u32) -> bool {
+    false
+}
+
+/// Unreachable off x86_64: no driver-private ioctl is ever recognised there.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn nouveau_ioctl_name(_nr: u32) -> &'static str {
+    "ioctl"
 }
 
 /// Unreachable off x86_64, where nothing recognises the ioctl.

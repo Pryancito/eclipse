@@ -1063,6 +1063,29 @@ pub fn is_cpu_prep_ioctl(request: u32) -> bool {
         && size as usize >= CPU_PREP_REQUEST_BYTES
 }
 
+/// Whether `request` is one of the three driver ioctls that cannot be served
+/// at all until this card's RM is attached: `GEM_NEW`, `VM_BIND` and `EXEC`.
+///
+/// Linux never answers any of them `ENODEV`. `nouveau_drm_device_init` runs in
+/// `probe`, so by the time a client can `open` the node the device is there.
+/// Eclipse brings the card that scans out the console up in the MIDDLE of a
+/// live session, so the first client to ask arrives before it and gets
+/// refused -- and one refusal is the whole session: NVK turns a `GEM_NEW`
+/// `ENODEV` into `VK_ERROR_OUT_OF_DEVICE_MEMORY`, zink's `vkCreateDevice`
+/// fails, EGL reports `DRI2: failed to load driver`, and wlroots falls back to
+/// pixman. Measured on a dual-2060 box: refused at 10.050 s, the bring-up it
+/// was racing started 0.6 s later.
+///
+/// Exists for the async pre-wait in `linux-object`
+/// (`drm_scheme::console_bringup_wait`), which parks such a call for as long
+/// as that bring-up takes instead of refusing it. By NR alone, like
+/// [`is_cpu_prep_ioctl`], and with no size floor: the wait reads none of the
+/// request.
+pub fn needs_rm_attached(request: u32) -> bool {
+    let (_dir, nr, _size) = decode_ioc(request);
+    (request >> 8) & 0xff == 0x64 && matches!(nr, NR_GEM_NEW | NR_VM_BIND | NR_EXEC)
+}
+
 /// How many bytes of a `GEM_CPU_PREP` request the pre-wait reads, so its
 /// caller can check that many are readable without naming the struct.
 pub const CPU_PREP_REQUEST_BYTES: usize = core::mem::size_of::<DrmNouveauGemCpuPrep>();
@@ -2935,6 +2958,61 @@ mod gl_client_abi_tests {
         assert!(!is_cpu_prep_ioctl(ioc(RW, DRM, NR_GEM_CPU_FINI, full)));
         assert!(!is_cpu_prep_ioctl(ioc(RW, DRM, NR_GEM_PUSHBUF, full)));
         assert!(!is_cpu_prep_ioctl(ioc(RW, 0x65, NR_GEM_CPU_PREP, full)));
+    }
+
+    /// The three ioctls that cannot be served with the RM cold, and only
+    /// those three. Each one's absence is a whole session: a client refused
+    /// `GEM_NEW` reports `VK_ERROR_OUT_OF_DEVICE_MEMORY` and wlroots falls
+    /// back to pixman, and the two beside it are the next calls that would.
+    /// The ones deliberately NOT here are the discovery calls -- `GETPARAM`,
+    /// `CHANNEL_ALLOC`, `NVIF` -- which answer correctly on a cold card and
+    /// must not be held: NVK makes them while enumerating, before it has
+    /// decided to use the device at all.
+    #[test]
+    fn only_the_three_ioctls_that_need_the_rm_take_the_bring_up_wait() {
+        let ioc = |dir: u32, ty: u32, nr: u32, size: usize| -> u32 {
+            (dir << 30) | ((size as u32) << 16) | (ty << 8) | nr
+        };
+        const DRM: u32 = 0x64;
+        const RW: u32 = 0x3;
+        for (name, nr) in [
+            ("GEM_NEW", NR_GEM_NEW),
+            ("VM_BIND", NR_VM_BIND),
+            ("EXEC", NR_EXEC),
+        ] {
+            assert!(
+                needs_rm_attached(ioc(RW, DRM, nr, 48)),
+                "{} needs a live RM and must wait for one",
+                name
+            );
+            // No size floor: the wait reads none of the request, so a struct
+            // that grew a field is still this ioctl.
+            assert!(
+                needs_rm_attached(ioc(0, DRM, nr, 0)),
+                "{} by NR alone",
+                name
+            );
+            // Another subsystem's ioctl of the same NR is not ours.
+            assert!(
+                !needs_rm_attached(ioc(RW, 0x65, nr, 48)),
+                "{} outside the DRM type is somebody else's",
+                name
+            );
+        }
+        for (name, nr) in [
+            ("GETPARAM", NR_GETPARAM),
+            ("CHANNEL_ALLOC", NR_CHANNEL_ALLOC),
+            ("NVIF", NR_NVIF),
+            ("VM_INIT", NR_VM_INIT),
+            ("GEM_PUSHBUF", NR_GEM_PUSHBUF),
+            ("GEM_CPU_PREP", NR_GEM_CPU_PREP),
+        ] {
+            assert!(
+                !needs_rm_attached(ioc(RW, DRM, nr, 48)),
+                "{} is served on a cold card and must not be held",
+                name
+            );
+        }
     }
 
     /// NOWAIT promises not to block, so nothing may sleep ahead of it: the
