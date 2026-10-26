@@ -21,7 +21,9 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use log::warn;
 use rboot::config::{self, Resolution};
-use rboot::{cmdline, esp, fb, frames, logo, page_table, progress, video, BootInfo, GraphicInfo};
+use rboot::{
+    cmdline, esp, fb, frames, logo, page_table, progress, video, BootInfo, GopReport, GraphicInfo,
+};
 use uefi::proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat};
 use uefi::proto::media::file::*;
 use uefi::proto::media::fs::SimpleFileSystem;
@@ -83,7 +85,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         .address;
     debug!("acpi2 rsdp: {:?}", acpi2_addr);
 
-    let (graphic_info, edid, edid_size) = init_graphic(bs, config.resolution);
+    let (graphic_info, edid, edid_size, gop_report) = init_graphic(bs, config.resolution);
     // Boot progress is continuous across rboot (0..50) and kernel (50..100).
     if cmdline::has_flag(config.cmdline, "FB_ROT180") {
         fb::set_rot180(true);
@@ -265,6 +267,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         edid_size,
         // Filled in below, once the marks around `ExitBootServices` are in.
         loader_marks: [0; rboot::LOADER_MARKS],
+        gop: gop_report,
     });
 
     // On some real machines, ExitBootServices can be the point where things go wrong.
@@ -538,44 +541,111 @@ fn load_file_progress(
     &mut buf[..done]
 }
 
-/// Return the handle of the best GOP to use.
+/// Whether the firmware exposes a valid EDID on this handle, i.e. the monitor
+/// is plugged into *this* GPU's connector.
+///
+/// Only the header is checked, and deliberately: a block whose checksum is
+/// bad still means a sink answered on the DDC line, which is the question
+/// here. Picking the panel's timing out of it is [`read_active_edid`]'s job
+/// and has a stricter bar.
+fn handle_has_edid(bs: &BootServices, h: Handle) -> bool {
+    let has = |size: u32, ptr: *const u8| -> bool {
+        if ptr.is_null() || size == 0 {
+            return false;
+        }
+        let n = (size as usize).min(128);
+        let mut buf = [0u8; 128];
+        unsafe { core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), n) };
+        video::edid_header_ok(&buf[..n])
+    };
+    if let Ok(p) = bs.open_protocol_exclusive::<EdidActiveProtocol>(h) {
+        if has(p.size_of_edid, p.edid) {
+            return true;
+        }
+    }
+    if let Ok(p) = bs.open_protocol_exclusive::<EdidDiscoveredProtocol>(h) {
+        if has(p.size_of_edid, p.edid) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The GOP to boot with: its handle, its index in the firmware's list, how
+/// many handles there are, how many of them are distinct graphics cards, and
+/// whether a display is attached to the one chosen.
 ///
 /// On systems with multiple GPUs (e.g. dual NVIDIA RTX) UEFI exposes one GOP
-/// handle per GPU.  `locate_protocol` returns an arbitrary one which may be
-/// the inactive/secondary card.  We enumerate all handles and prefer the one
-/// with the largest accessible (non-BltOnly) framebuffer, which is
-/// consistently the active/connected display on tested systems.
-fn find_active_gop_handle(bs: &BootServices) -> Option<Handle> {
+/// handle per GPU and `locate_protocol` returns an arbitrary one, which may
+/// be the card with nothing plugged into it. The choice between them is
+/// [`video::pick_gop`]: the card the monitor is attached to first, largest
+/// framebuffer only as a tie-break.
+fn find_active_gop(bs: &BootServices) -> Option<(Handle, usize, usize, usize, bool)> {
     let handles = bs
         .locate_handle_buffer(SearchType::from_proto::<GraphicsOutput>())
         .ok()?;
 
-    let mut best: Option<Handle> = None;
-    let mut best_size: usize = 0;
-
+    let mut gops: Vec<video::Gop> = Vec::with_capacity(handles.len());
     for &h in handles.iter() {
+        let mut g = video::Gop::new(false, false, 0, 0);
         if let Ok(mut gop) = bs.open_protocol_exclusive::<GraphicsOutput>(h) {
             // BltOnly means there is no direct framebuffer.
-            if gop.current_mode_info().pixel_format() == PixelFormat::BltOnly {
-                continue;
-            }
-            let sz = gop.frame_buffer().size();
-            if sz > best_size {
-                best_size = sz;
-                best = Some(h);
+            if gop.current_mode_info().pixel_format() != PixelFormat::BltOnly {
+                let mut fb = gop.frame_buffer();
+                g.direct = true;
+                g.fb_size = fb.size();
+                g.fb_addr = fb.as_mut_ptr() as u64;
             }
         }
+        // After the GOP handle is closed again: one protocol at a time on a
+        // handle a console driver may also be holding.
+        if g.direct {
+            g.has_edid = handle_has_edid(bs, h);
+        }
+        gops.push(g);
     }
-
-    // If every handle was BltOnly (no direct framebuffer), return None so the
-    // caller can fall back to locate_protocol.
-    best
+    let i = video::pick_gop(&gops)?;
+    Some((
+        handles[i],
+        i,
+        handles.len(),
+        video::distinct_cards(&gops),
+        gops[i].has_edid,
+    ))
 }
 
-fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8; 128], u32) {
-    let gop_handle = find_active_gop_handle(bs)
-        .or_else(|| bs.get_handle_for_protocol::<GraphicsOutput>().ok())
-        .expect("failed to find GraphicsOutput handle");
+fn init_graphic(
+    bs: &BootServices,
+    resolution: Resolution,
+) -> (GraphicInfo, [u8; 128], u32, GopReport) {
+    let mut report = GopReport::empty();
+    report.asked_kind = match resolution {
+        Resolution::Keep => rboot::GOP_ASKED_KEEP,
+        Resolution::Auto => rboot::GOP_ASKED_AUTO,
+        Resolution::Exact(w, h) => {
+            report.asked_width = w as u32;
+            report.asked_height = h as u32;
+            rboot::GOP_ASKED_EXACT
+        }
+    };
+    let gop_handle = match find_active_gop(bs) {
+        Some((h, index, count, cards, has_edid)) => {
+            report.gop_index = index as u32;
+            report.gop_count = count as u32;
+            report.card_count = cards as u32;
+            report.gop_has_edid = has_edid;
+            h
+        }
+        None => {
+            // Every handle was `BltOnly` (or there are none to enumerate):
+            // take whatever `locate_protocol` hands back. Recorded as one
+            // handle because that is all this path knows about.
+            report.gop_count = 1;
+            report.card_count = 1;
+            bs.get_handle_for_protocol::<GraphicsOutput>()
+                .expect("failed to find GraphicsOutput handle")
+        }
+    };
     let mut gop = bs
         .open_protocol_exclusive::<GraphicsOutput>(gop_handle)
         .expect("failed to open GraphicsOutput protocol");
@@ -595,26 +665,50 @@ fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8;
         })
         .collect();
     let preferred = video::edid_preferred_resolution(&edid, edid_size);
+    report.offered_len = modes.len() as u32;
+    for (slot, m) in report
+        .offered
+        .iter_mut()
+        .zip(modes.iter().take(rboot::GOP_OFFERED_MAX))
+    {
+        *slot = rboot::OfferedMode {
+            width: m.width.min(u16::MAX as usize) as u16,
+            height: m.height.min(u16::MAX as usize) as u16,
+            direct: m.direct,
+        };
+    }
+    if let Some((w, h)) = preferred {
+        report.edid_width = w as u32;
+        report.edid_height = h as u32;
+    }
     match video::choose_mode(resolution, preferred, &modes).and_then(|i| gop.modes(bs).nth(i)) {
         Some(mode) => {
+            report.set_called = true;
             // A firmware may refuse to set a mode it listed. That is not worth
             // a panic: a panic here is a machine that does not boot because of
             // one line in rboot.conf, and it happens before the splash so the
             // message is wiped off the screen anyway. Keep the current mode.
             if let Err(e) = gop.set_mode(&mode) {
-                warn!(
+                // `error!` and not `warn!`: the shipped `cmdline=LOG=error`
+                // discards everything below it, and this is the one line that
+                // says the machine is NOT in the mode rboot.conf asked for.
+                error!(
                     "firmware refused graphic mode {:?} ({:?}); keeping current {:?}",
                     mode.info().resolution(),
                     e.status(),
                     gop.current_mode_info().resolution()
                 );
+            } else {
+                report.set_ok = true;
             }
         }
         None => {
             if resolution != Resolution::Keep {
                 // The offered list is the answer to "why did my resolution= do
                 // nothing": `Exact` only sets a mode the firmware enumerates.
-                warn!(
+                // `error!` for the same reason as above -- a `resolution=`
+                // that did nothing has to be visible at the shipped log level.
+                error!(
                     "no graphic mode matches {:?} (edid says {:?}); keeping current {:?}. firmware offers {:?}",
                     resolution,
                     preferred,
@@ -647,7 +741,10 @@ fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8;
         fb_addr,
         fb_size,
     };
-    (info, edid, edid_size)
+    let (fw, fh) = mode.resolution();
+    report.final_width = fw as u32;
+    report.final_height = fh as u32;
+    (info, edid, edid_size, report)
 }
 
 /// `EFI_EDID_ACTIVE_PROTOCOL` — the raw EDID of the currently-active display,
