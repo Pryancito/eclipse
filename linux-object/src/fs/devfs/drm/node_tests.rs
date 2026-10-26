@@ -455,3 +455,34 @@ fn the_cap_stays_inside_the_primary_minor_range() {
     // the cap exists at all.
     assert!(NodeMinors::new(0).owns(NodeMinors::new(RENDER_MINOR_BASE).card()));
 }
+
+/// The order between the kernel's GPU policy and init(1).
+///
+/// `set_console_bringup_expected` has to run before userspace is spawned,
+/// because `/proc/gpuready` answers `none` -- "start now" -- until it has, and
+/// a boot that reads that answer starts its compositor on a card whose RM is
+/// still cold. The ordering itself lives in `zCore/src/main.rs` and cannot be
+/// reached from here; what can be is the predicate that notices it went wrong,
+/// which is the only thing standing between the race coming back and nobody
+/// finding out.
+#[test]
+fn a_bring_up_declared_after_userspace_asked_is_late() {
+    assert!(
+        super::bringup_declared_too_late(true, true),
+        "a bring-up declared after /proc/gpuready was read is late: userspace has \
+         already been told `none`"
+    );
+    assert!(
+        !super::bringup_declared_too_late(true, false),
+        "declared before anyone asked is the correct order"
+    );
+}
+
+/// A box that schedules no bring-up answers `none` for the whole boot, so a
+/// read before the declaration told userspace the truth and nothing is late.
+/// Without this the check would cry wolf on every single-GPU boot.
+#[test]
+fn a_box_with_no_bring_up_is_never_late() {
+    assert!(!super::bringup_declared_too_late(false, true));
+    assert!(!super::bringup_declared_too_late(false, false));
+}

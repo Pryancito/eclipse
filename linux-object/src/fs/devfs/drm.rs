@@ -496,8 +496,37 @@ static CONSOLE_BRINGUP_EXPECTED: AtomicBool = AtomicBool::new(false);
 static GPU_READY_WAS_READ: AtomicBool = AtomicBool::new(false);
 
 /// Declare that the deferred console-GPU bring-up is scheduled for this boot.
+///
+/// This has to run BEFORE init(1) is spawned, and the warning below is how a
+/// boot says it did not. `/proc/gpuready` answers `none` -- which a waiter
+/// must read as "start now", never as "not yet" -- until this has been called,
+/// so a kernel that decides its GPU policy after spawning userspace hands
+/// init(1) the wrong answer to the one question it asks. On real hardware that
+/// cost a whole session: init read `none` 0.2 s before the kernel got here,
+/// started the compositor, NVK asked a card whose RM was still cold, got
+/// ENODEV, and wlroots fell back to pixman for good -- 3 s before that same
+/// card finished coming up. The order is not visible from either side alone,
+/// which is why it is checked here rather than left to a comment.
 pub fn set_console_bringup_expected(on: bool) {
+    if bringup_declared_too_late(on, gpu_ready_was_read()) {
+        kernel_hal::klog_warn!(
+            "[drm] /proc/gpuready was read BEFORE the console-GPU bring-up was declared: \
+             userspace has already been told `none` (\"start now\") and a GPU session \
+             started without waiting. Declare the bring-up before init(1) is spawned."
+        );
+    }
     CONSOLE_BRINGUP_EXPECTED.store(on, Ordering::Relaxed);
+}
+
+/// Is this declaration arriving after userspace already asked?
+///
+/// Its own function because the answer is the whole of the check and the
+/// caller only turns it into a klog line, which no test can read. `on` is
+/// false on a box that schedules no bring-up: there `/proc/gpuready` answers
+/// `none` for the whole boot, which is the truth whenever it is read, so a
+/// read before the declaration is not late.
+pub(crate) fn bringup_declared_too_late(on: bool, already_read: bool) -> bool {
+    on && already_read
 }
 
 /// Whether anything is going to bring the console GPU up this boot.

@@ -1191,112 +1191,20 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     "Eclipse: nvidia.gem_vram_bar1 -- VRAM GEM objects CPU-mapped through BAR1"
                 );
             }
-            kernel_hal::console::early_progress_bar(95);
-
-            // Whose exit takes the system down: INIT (PID 1) if present, else
-            // the primary terminal's shell.
-            let lifetime_proc = if !shell_args.is_empty() {
-                // Spawn the SHELL on each virtual terminal (tty1..ttyN, reachable
-                // via Ctrl+Alt+F1..F6) with a fixed PID 101.. — vt 0 is the
-                // primary terminal and does the one-time boot work; the others
-                // share its mounted root filesystem (by `Arc`, like `fork`).
-                let mut shared_root = None;
-                let mut primary_shell = None;
-                let mut shell_fallback = None;
-                for vt in 0..kernel_hal::console::NUM_VTS {
-                    // The LAST VT (tty7) is reserved for the graphical session:
-                    // no login shell there, so labwc/X11 owns it cleanly and the
-                    // kernel text console never fights the compositor for the
-                    // framebuffer. See `kernel_hal::console::GRAPHICS_VT`.
-                    if vt == kernel_hal::console::GRAPHICS_VT {
-                        continue;
-                    }
-                    let pid = (101 + vt) as u64;
-                    let proc = zcore_loader::linux::run_shell_on_vt(
-                        shell_args.clone(),
-                        envs.clone(),
-                        rootfs.clone(),
-                        vt,
-                        shared_root.clone(),
-                        pid,
-                    );
-                    if let Some(proc) = proc {
-                        if shell_fallback.is_none() {
-                            shell_fallback = Some(proc.clone());
-                        }
-                        if vt == 0 {
-                            shared_root = Some(proc.linux().root_inode().clone());
-                            primary_shell = Some(proc);
-                        }
-                    } else {
-                        warn!(
-                            "SHELL {:?} failed on vt {}; continuing boot",
-                            shell_args[0], vt
-                        );
-                    }
-                }
-                // Optionally run INIT as PID 1 (default /sbin/init -> eclipse-init,
-                // busybox init fallback), if it exists. The shells already did
-                // the boot work, so don't repeat.
-                let init = zcore_loader::linux::run_init_if_present(
-                    init_args,
-                    envs.clone(),
-                    rootfs.clone(),
-                    shared_root,
-                    primary_shell.is_none(),
-                );
-                init.or(primary_shell).or(shell_fallback)
-            } else if !init_args.is_empty() {
-                // No shells (e.g. libos): INIT is the single PID 1 program.
-                Some(zcore_loader::linux::run(init_args, envs.clone(), rootfs.clone()))
-            } else {
-                None
-            };
-            // Make the outcome of PID 1 / base-program startup observable: log
-            // which process the system's lifetime is now tied to (the PID 1
-            // init when it came up, otherwise the fallback terminal shell).
-            match &lifetime_proc {
-                Some(p) => klog_info!(
-                    "Eclipse: lifetime process pid={} name={:?}",
-                    p.id(),
-                    p.name()
-                ),
-                None => klog_info!("Eclipse: no lifetime process spawned"),
-            }
-            // Keep secondary CPUs idle until root is mounted and init is spawned.
-            STARTED.store(true, Ordering::SeqCst);
-            kernel_hal::console::early_progress_bar(100);
-            // The kernel half of the boot, as a timeline. Printed here because
-            // this is the last mark: by now init(1) is running, so the table is
-            // complete and nothing is waiting on it. `dmesg` timestamps every
-            // line it prints, which says when the kernel SPOKE; this says where
-            // it spent the silence between two lines, which is the only figure
-            // "make the boot faster" can start from.
-            // The loader's marks are raw TSC readings; name the frequency to
-            // divide them by now, not at `_start`, where the only figure
-            // available was a CPUID guess. By here the device probe has checked
-            // one against the ACPI PM timer.
-            // `not(libos)` as well as the architecture: `kernel_hal::cpu` is
-            // `bare/arch/x86_64/cpu.rs` on baremetal, which has `tsc_hz()`,
-            // but `libos/cpu.rs` under the `libos` feature, which does not --
-            // and a libos build on an x86_64 host satisfies `target_arch`
-            // alone, so the guard without this broke `cargo build --package
-            // zcore --features "linux libos"` outright.
-            #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
-            kernel_hal::boot_marks::set_loader_tsc_hz(kernel_hal::cpu::tsc_hz());
-            for line in kernel_hal::boot_marks::render().lines() {
-                // Both sinks, deliberately. `klog_info!` writes to the dmesg
-                // ring ONLY, which is where one reads it on a machine that is
-                // already up (`dmesg`, and the tail of `/proc/perf/kernel`);
-                // the direct serial write is what puts it in a captured boot
-                // log, which is the form a boot measurement is actually pasted
-                // in. It does not go through `log::`, so `LOG=warn` -- the
-                // level every image ships at -- cannot swallow it, the same
-                // reason the oops and `[ipi-watch]` diagnostics bypass it.
-                klog_info!("{}", line);
-                kernel_hal::console::serial_write_str(line);
-                kernel_hal::console::serial_write_str("\r\n");
-            }
+            // The GPU policy BEFORE init(1) is spawned, not after.
+            //
+            // `wait_for_gpu_ready` in eclipse-init holds a GPU session back
+            // until `/proc/gpuready` stops saying `waiting`, and that file
+            // answers `none` -- "start now" -- until
+            // `set_console_bringup_expected` has run. This block used to sit
+            // AFTER the spawn, so on real hardware init(1) read `none` at
+            // 4.5 s, 0.2 s before the kernel got here and scheduled the task:
+            // the compositor started, NVK asked a card whose RM was still
+            // cold, got ENODEV, and wlroots fell back to pixman FOR THE REST
+            // OF THE SESSION -- 3 s before that same card finished coming up.
+            // Nothing here touches the processes below, so the only thing the
+            // move changes is that userspace can no longer outrun the answer
+            // it is about to ask for.
             // Either flag wants the console GPU up; the task runs once and
             // serves both (hardware cursor plane and/or local CE present).
             //
@@ -1411,6 +1319,113 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     // gate shut at boot; the task opens it under the pause.
                     want_console_gpu && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gsp"),
                 );
+            }
+
+            kernel_hal::console::early_progress_bar(95);
+
+            // Whose exit takes the system down: INIT (PID 1) if present, else
+            // the primary terminal's shell.
+            let lifetime_proc = if !shell_args.is_empty() {
+                // Spawn the SHELL on each virtual terminal (tty1..ttyN, reachable
+                // via Ctrl+Alt+F1..F6) with a fixed PID 101.. — vt 0 is the
+                // primary terminal and does the one-time boot work; the others
+                // share its mounted root filesystem (by `Arc`, like `fork`).
+                let mut shared_root = None;
+                let mut primary_shell = None;
+                let mut shell_fallback = None;
+                for vt in 0..kernel_hal::console::NUM_VTS {
+                    // The LAST VT (tty7) is reserved for the graphical session:
+                    // no login shell there, so labwc/X11 owns it cleanly and the
+                    // kernel text console never fights the compositor for the
+                    // framebuffer. See `kernel_hal::console::GRAPHICS_VT`.
+                    if vt == kernel_hal::console::GRAPHICS_VT {
+                        continue;
+                    }
+                    let pid = (101 + vt) as u64;
+                    let proc = zcore_loader::linux::run_shell_on_vt(
+                        shell_args.clone(),
+                        envs.clone(),
+                        rootfs.clone(),
+                        vt,
+                        shared_root.clone(),
+                        pid,
+                    );
+                    if let Some(proc) = proc {
+                        if shell_fallback.is_none() {
+                            shell_fallback = Some(proc.clone());
+                        }
+                        if vt == 0 {
+                            shared_root = Some(proc.linux().root_inode().clone());
+                            primary_shell = Some(proc);
+                        }
+                    } else {
+                        warn!(
+                            "SHELL {:?} failed on vt {}; continuing boot",
+                            shell_args[0], vt
+                        );
+                    }
+                }
+                // Optionally run INIT as PID 1 (default /sbin/init -> eclipse-init,
+                // busybox init fallback), if it exists. The shells already did
+                // the boot work, so don't repeat.
+                let init = zcore_loader::linux::run_init_if_present(
+                    init_args,
+                    envs.clone(),
+                    rootfs.clone(),
+                    shared_root,
+                    primary_shell.is_none(),
+                );
+                init.or(primary_shell).or(shell_fallback)
+            } else if !init_args.is_empty() {
+                // No shells (e.g. libos): INIT is the single PID 1 program.
+                Some(zcore_loader::linux::run(init_args, envs.clone(), rootfs.clone()))
+            } else {
+                None
+            };
+            // Make the outcome of PID 1 / base-program startup observable: log
+            // which process the system's lifetime is now tied to (the PID 1
+            // init when it came up, otherwise the fallback terminal shell).
+            match &lifetime_proc {
+                Some(p) => klog_info!(
+                    "Eclipse: lifetime process pid={} name={:?}",
+                    p.id(),
+                    p.name()
+                ),
+                None => klog_info!("Eclipse: no lifetime process spawned"),
+            }
+            // Keep secondary CPUs idle until root is mounted and init is spawned.
+            STARTED.store(true, Ordering::SeqCst);
+            kernel_hal::console::early_progress_bar(100);
+            // The kernel half of the boot, as a timeline. Printed here because
+            // this is the last mark: by now init(1) is running, so the table is
+            // complete and nothing is waiting on it. `dmesg` timestamps every
+            // line it prints, which says when the kernel SPOKE; this says where
+            // it spent the silence between two lines, which is the only figure
+            // "make the boot faster" can start from.
+            // The loader's marks are raw TSC readings; name the frequency to
+            // divide them by now, not at `_start`, where the only figure
+            // available was a CPUID guess. By here the device probe has checked
+            // one against the ACPI PM timer.
+            // `not(libos)` as well as the architecture: `kernel_hal::cpu` is
+            // `bare/arch/x86_64/cpu.rs` on baremetal, which has `tsc_hz()`,
+            // but `libos/cpu.rs` under the `libos` feature, which does not --
+            // and a libos build on an x86_64 host satisfies `target_arch`
+            // alone, so the guard without this broke `cargo build --package
+            // zcore --features "linux libos"` outright.
+            #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+            kernel_hal::boot_marks::set_loader_tsc_hz(kernel_hal::cpu::tsc_hz());
+            for line in kernel_hal::boot_marks::render().lines() {
+                // Both sinks, deliberately. `klog_info!` writes to the dmesg
+                // ring ONLY, which is where one reads it on a machine that is
+                // already up (`dmesg`, and the tail of `/proc/perf/kernel`);
+                // the direct serial write is what puts it in a captured boot
+                // log, which is the form a boot measurement is actually pasted
+                // in. It does not go through `log::`, so `LOG=warn` -- the
+                // level every image ships at -- cannot swallow it, the same
+                // reason the oops and `[ipi-watch]` diagnostics bypass it.
+                klog_info!("{}", line);
+                kernel_hal::console::serial_write_str(line);
+                kernel_hal::console::serial_write_str("\r\n");
             }
             #[cfg(all(feature = "linux", not(feature = "libos")))]
             {
