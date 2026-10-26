@@ -1694,7 +1694,11 @@ impl DrmDev {
                 // such an x fell out of the viewport check (ENOSPC, only
                 // with a mode) and was not read at all without one.
                 if req.x & 0xffff_0000 != 0 || req.y & 0xffff_0000 != 0 {
-                    return Err(FsError::OutOfRange);
+                    return Err(setcrtc_refused(
+                        "x/y above 16.16",
+                        req.crtc_id,
+                        FsError::OutOfRange,
+                    ));
                 }
                 // `drm_mode_setcrtc` then finds the CRTC before anything else
                 // (ENOENT), refuses a connector list with no mode or no fb to
@@ -1704,7 +1708,11 @@ impl DrmDev {
                 // went to the one it has, and a connector list of any content
                 // was accepted unread.
                 let Some(crtc) = drm::get_crtc(req.crtc_id) else {
-                    return Err(FsError::EntryNotFound);
+                    return Err(setcrtc_refused(
+                        "no such CRTC (the synthetic one needs a primary display)",
+                        req.crtc_id,
+                        FsError::EntryNotFound,
+                    ));
                 };
                 // With a mode, `drm_mode_setcrtc` then looks the fb up
                 // (ENOENT; -1 names the fb already on the CRTC, EINVAL when
@@ -1761,11 +1769,19 @@ impl DrmDev {
                 // the CRTC, so GETCRTC reported a mode the connector's
                 // CRTC_ID never had.
                 if req.count_connectors == 0 && req.mode_valid != 0 {
-                    return Err(FsError::InvalidParam);
+                    return Err(setcrtc_refused(
+                        "a mode with no connectors",
+                        req.crtc_id,
+                        FsError::InvalidParam,
+                    ));
                 }
                 if req.count_connectors > 0 {
                     if req.mode_valid == 0 || fb_id == 0 {
-                        return Err(FsError::InvalidParam);
+                        return Err(setcrtc_refused(
+                            "connectors with no mode or no fb",
+                            req.crtc_id,
+                            FsError::InvalidParam,
+                        ));
                     }
                     let connectors = drm::get_resources().2;
                     if req.count_connectors as usize > connectors.len() {
@@ -1780,7 +1796,11 @@ impl DrmDev {
                         // answerable beside a card that owns the resource
                         // list, like its CRTC does.
                         if drm::get_connector(id).is_none() {
-                            return Err(FsError::EntryNotFound);
+                            return Err(setcrtc_refused(
+                                "no such connector in the list",
+                                req.crtc_id,
+                                FsError::EntryNotFound,
+                            ));
                         }
                     }
                 }
@@ -1822,6 +1842,7 @@ impl DrmDev {
                     // atomic client starting after this read a mode and an
                     // active CRTC the legacy readback said were gone.
                     drm::legacy_pipe_off();
+                    setcrtc_disabled(req.crtc_id);
                 }
                 Ok(0)
             }
@@ -3826,6 +3847,7 @@ use pre_wait_account::PreWaitAccount;
 /// The sleep behind a blocking `WAIT_VBLANK`; own file for the size ceiling.
 mod wait_vblank_sleep;
 use present_failed::{present_failed, PRESENT_FAIL_TRACED};
+use setcrtc_refused::{setcrtc_disabled, setcrtc_refused};
 
 /// The parked microseconds a pre-wait reports, from how long it was alive and
 /// how many times it looked.
@@ -3931,6 +3953,7 @@ pub const ATOMIC_IOCTL: u32 = DRM_IOCTL_MODE_ATOMIC;
 /// has wedged spinlocks here before (see the EXEC dedup in `nouveau_uapi.rs`).
 const PRESENT_FAIL_TRACE_BUDGET: u32 = 8;
 mod present_failed;
+mod setcrtc_refused;
 
 /// True for any of the four `SYNCOBJ_WAIT` / `TIMELINE_WAIT` ioctl numbers
 /// (classic + deadline-sized). Used by `sys_ioctl` to run
