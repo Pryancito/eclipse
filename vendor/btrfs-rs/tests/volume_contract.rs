@@ -360,6 +360,51 @@ fn a_flipped_byte_in_a_tree_block_is_caught_by_its_checksum() {
     let _ = std::fs::remove_file(&path);
 }
 
+#[test]
+fn a_superblock_whose_checksum_does_not_match_its_bytes_is_refused() {
+    // The superblock was the one block not checked against its own checksum,
+    // although `write_superblock` computes it on every commit and `read_block`
+    // checks every tree block. A flipped bit here is not a bad read: it is a
+    // volume whose root pointer, generation and chunk array are whatever the
+    // bit made them.
+    //
+    // The byte flipped is in the label, which nothing validates, so the only
+    // thing wrong with the image is the number -- and it is written back with
+    // the checksum it used to have, which is what a bad disk looks like rather
+    // than a forgery.
+    // On by default, and stated here because a default of off is a guard that
+    // is not there. This is also the only test in this binary that touches
+    // that flag: two would race, since the tests of one binary share it and
+    // run in parallel threads.
+    assert!(
+        btrfs::volume::superblock_csum_enforced(),
+        "the superblock checksum check has to be on unless something turns it off"
+    );
+    let path = fresh("sbcsum");
+    let dev = open_dev(&path);
+    let mut raw = vec![0u8; SUPERBLOCK_SIZE];
+    dev.read_at(SUPERBLOCK_OFFSETS[0], &mut raw).unwrap();
+    raw[sb::OFF_LABEL] ^= 0x20;
+    dev.write_at(SUPERBLOCK_OFFSETS[0], &raw).unwrap();
+    drop(dev);
+    refused(&path, Error::Corrupt("superblock checksum"));
+
+    // And the way back in, because a machine whose root disk took that bit has
+    // to boot before anyone can repair it. `btrfs.sbcsum=off` on the kernel
+    // command line clears this and the mount warns instead of refusing.
+    btrfs::volume::set_superblock_csum_enforced(false);
+    let err = mount(&path).err();
+    btrfs::volume::set_superblock_csum_enforced(true);
+    assert_eq!(
+        err, None,
+        "with the check off a bad superblock checksum has to mount anyway"
+    );
+    // Restored, or every test after this one in this binary would be measuring
+    // the wrong thing.
+    refused(&path, Error::Corrupt("superblock checksum"));
+    let _ = std::fs::remove_file(&path);
+}
+
 // -- what a format lays down ------------------------------------------------
 
 /// Read back every superblock mirror that fits on `path` and check each one
