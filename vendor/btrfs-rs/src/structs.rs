@@ -8,6 +8,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
+use crate::{Error, Result};
+
 pub const SUPERBLOCK_MAGIC: u64 = 0x4D5F53665248425F; // "_BHRfS_M" LE
 pub const SUPERBLOCK_OFFSETS: [u64; 3] = [0x1_0000, 0x400_0000, 0x40_0000_0000];
 pub const SUPERBLOCK_SIZE: usize = 4096;
@@ -444,6 +446,56 @@ pub mod node {
     pub fn max_items(nodesize: usize) -> usize {
         (nodesize - HEADER_SIZE) / KEY_PTR_SIZE
     }
+}
+
+/// Check what a tree block's header says about its own contents against the
+/// block it arrived in.
+///
+/// `nritems`, and in a leaf each item's `(data_off, data_size)`, come off the
+/// disk and decide a walk or a slice: every `0..nritems` in `tree.rs` and
+/// `volume.rs`, [`leaf::data_start`], and the `&b[off..off + size]` of
+/// [`leaf::data`]. Unchecked, a block whose `nritems` is larger than its table
+/// can hold indexes past the end of the buffer and **panics**, and an item
+/// whose extent runs off the block does the same. Random corruption does not
+/// reach that: `read_block` checks the crc32c first. But crc32c is not a MAC
+/// and this code mounts foreign disks, so a crafted image does, and a panic in
+/// a kernel is not a mount error.
+///
+/// So this is the bound, and it goes where every tree block already passes
+/// through -- `Volume::read_block`, next to the checksum -- rather than at each
+/// walk, because a walk added later would not know to ask.
+///
+/// The level needs no bound of its own: it only picks which of the two tables
+/// the block is read as, and `nritems` is checked against the stride that
+/// level implies, so both readings stay inside the block. The superblock's
+/// `sys_chunk_array` already clamps its own disk-given length the same way.
+pub fn check_block_bounds(b: &[u8], nodesize: usize) -> Result<()> {
+    if nodesize < HEADER_SIZE || b.len() < nodesize {
+        return Err(Error::Corrupt("tree block smaller than a header"));
+    }
+    let n = header::nritems(b) as usize;
+    let leaf_block = header::level(b) == 0;
+    let stride = if leaf_block { ITEM_SIZE } else { KEY_PTR_SIZE };
+    // The data area is the block past its header, and both the item table and
+    // every item's data have to fit in it. `nritems` is a u32 off the disk, so
+    // the product is saturated rather than added to anything: on a 32-bit host
+    // `n * stride` alone can wrap.
+    let room = nodesize - HEADER_SIZE;
+    if n.saturating_mul(stride) > room {
+        return Err(Error::Corrupt("tree block item count past its table"));
+    }
+    if leaf_block {
+        // The reads below are safe because the table itself has just been
+        // bounded and `KEY_SIZE + 4 + 4 == ITEM_SIZE`.
+        for slot in 0..n {
+            let off = leaf::data_off(b, slot);
+            let size = leaf::data_size(b, slot);
+            if off.checked_add(size).is_none_or(|end| end > room) {
+                return Err(Error::Corrupt("leaf item data past the block"));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1327,5 +1379,139 @@ mod tests {
             | INCOMPAT_SKINNY_METADATA
             | INCOMPAT_NO_HOLES;
         assert_eq!(INCOMPAT_SUPPORTED & !defined, 0);
+    }
+
+    /// A block with nothing in it but a header saying how many items it has.
+    fn header_only(nodesize: usize, level: u8, nritems: u32) -> alloc::vec::Vec<u8> {
+        let mut b = alloc::vec![0u8; nodesize];
+        header::set_level(&mut b, level);
+        header::set_nritems(&mut b, nritems);
+        b
+    }
+
+    /// The largest item count a block of `nodesize` can really hold, at each
+    /// of the two strides.
+    const NODE: usize = 4096;
+    const MAX_LEAF_ITEMS: usize = (NODE - HEADER_SIZE) / ITEM_SIZE;
+    const MAX_NODE_PTRS: usize = (NODE - HEADER_SIZE) / KEY_PTR_SIZE;
+
+    /// A tree block whose item count runs past its own table is refused, not
+    /// walked.
+    #[test]
+    fn a_block_whose_item_count_runs_past_its_table_is_refused() {
+        // What really fits is accepted, at both strides.
+        let leaf = leaf_of(NODE, &[16; 4]);
+        assert!(check_block_bounds(&leaf, NODE).is_ok());
+        assert!(check_block_bounds(&header_only(NODE, 0, MAX_LEAF_ITEMS as u32), NODE).is_ok());
+        assert!(check_block_bounds(&header_only(NODE, 1, MAX_NODE_PTRS as u32), NODE).is_ok());
+
+        // One more than fits is not.
+        for (level, max) in [(0u8, MAX_LEAF_ITEMS), (1, MAX_NODE_PTRS)] {
+            let b = header_only(NODE, level, max as u32 + 1);
+            assert!(
+                check_block_bounds(&b, NODE).is_err(),
+                "level {} took {} items",
+                level,
+                max + 1
+            );
+        }
+
+        // And the absurd value a crafted image would carry. `u32::MAX` items
+        // is what the saturating product is for: on a 32-bit host the stride
+        // multiplication alone wraps.
+        for n in [200u32, 60_000, u32::MAX] {
+            assert!(
+                check_block_bounds(&header_only(NODE, 0, n), NODE).is_err(),
+                "{}",
+                n
+            );
+        }
+
+        // A block shorter than its own header, which no walk could survive.
+        assert!(check_block_bounds(&[0u8; 8], NODE).is_err());
+        assert!(check_block_bounds(&[0u8; 8], 8).is_err());
+    }
+
+    /// The count is bounded by the stride its **level** implies, because the
+    /// level is what decides which of the two tables the block is read as.
+    ///
+    /// `tree.rs` branches on `header::level(&b) == 0` and then indexes with
+    /// `ITEM_SIZE` or `KEY_PTR_SIZE`. A count checked against the smaller
+    /// stride would let a block claiming to be a node walk off the end, which
+    /// is why the level needs no bound of its own and this one is not a
+    /// constant.
+    #[test]
+    fn the_item_count_is_bounded_by_the_stride_its_level_implies() {
+        // Both sides are consts, so this premise is asserted at compile time:
+        // were a key pointer ever to become no wider than an item row, there
+        // would be no count between the two strides and the crate would stop
+        // building here rather than leave this test passing vacuously.
+        const {
+            assert!(
+                MAX_NODE_PTRS < MAX_LEAF_ITEMS,
+                "a key pointer is wider than an item row, so the strides differ"
+            )
+        };
+        let between = MAX_NODE_PTRS as u32 + 1;
+        assert!(check_block_bounds(&header_only(NODE, 0, between), NODE).is_ok());
+        assert!(check_block_bounds(&header_only(NODE, 1, between), NODE).is_err());
+        // Every level above zero is a node, not just level one.
+        for level in [1u8, 2, 7, 255] {
+            assert!(
+                check_block_bounds(&header_only(NODE, level, between), NODE).is_err(),
+                "level {}",
+                level
+            );
+        }
+    }
+
+    /// An item whose data runs off the end of the block is refused.
+    ///
+    /// `leaf::data` slices `&b[HEADER_SIZE + off..][..size]` with both numbers
+    /// off the disk, so this is the other half of the same bound.
+    #[test]
+    fn an_item_whose_data_runs_off_the_block_is_refused() {
+        let room = NODE - HEADER_SIZE;
+
+        // Exactly filling the data area is fine; one byte more is not.
+        let mut edge = leaf_of(NODE, &[16]);
+        leaf::set_data_off(&mut edge, 0, room - 16);
+        assert!(check_block_bounds(&edge, NODE).is_ok());
+        leaf::set_data_off(&mut edge, 0, room - 15);
+        assert!(check_block_bounds(&edge, NODE).is_err());
+
+        // A size that alone overruns the block.
+        let mut big = leaf_of(NODE, &[16]);
+        leaf::set_data_off(&mut big, 0, 0);
+        leaf::set_data_size(&mut big, 0, room + 1);
+        assert!(check_block_bounds(&big, NODE).is_err());
+
+        // And the pair a crafted image would carry, where the sum is what
+        // overflows rather than either half.
+        let mut wild = leaf_of(NODE, &[16]);
+        leaf::set_data_off(&mut wild, 0, u32::MAX as usize);
+        leaf::set_data_size(&mut wild, 0, u32::MAX as usize);
+        assert!(check_block_bounds(&wild, NODE).is_err());
+
+        // The bad item is found wherever it sits, not only in slot 0.
+        let mut late = leaf_of(NODE, &[16; 8]);
+        leaf::set_data_off(&mut late, 7, room);
+        leaf::set_data_size(&mut late, 7, 1);
+        assert!(check_block_bounds(&late, NODE).is_err());
+    }
+
+    /// What the bound stands between the disk and.
+    ///
+    /// This is the walk that block would have been given: `data_start` reads
+    /// the table row of every slot `0..nritems`, so a count past the table
+    /// indexes past the end of the buffer. In a kernel that is not a mount
+    /// error. The test is here so that the reason the check exists cannot be
+    /// deleted along with it.
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn without_the_bound_that_same_block_would_walk_off_the_buffer() {
+        let b = header_only(NODE, 0, 200);
+        assert!(check_block_bounds(&b, NODE).is_err());
+        leaf::data_start(&b, NODE);
     }
 }
