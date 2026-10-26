@@ -1827,9 +1827,28 @@ impl CurrentThread {
     /// still be killed. The two words are the caller's, and no trap frame is
     /// read: there isn't one, because nothing trapped.
     pub async fn raise_user_exception(&self, synth_code: u32, synth_data: u32) {
+        self.raise_synth_exception(ExceptionType::User, synth_code, synth_data)
+            .await
+    }
+
+    /// Raise an exception nothing trapped for on this thread and wait for the
+    /// handling.
+    ///
+    /// Two kinds reach here: `ExceptionType::User`, from
+    /// `zx_thread_raise_exception`, and `ExceptionType::PolicyError`, which the
+    /// kernel raises when a syscall hits a job policy. They differ in where the
+    /// exception goes, and that is `Exception::handle`'s business, not this
+    /// one's: a `User` exception stops at the first job debugger, a policy one
+    /// walks the ordinary thread/process/job chain.
+    pub async fn raise_synth_exception(
+        &self,
+        type_: ExceptionType,
+        synth_code: u32,
+        synth_data: u32,
+    ) {
         let exception = {
             let mut inner = self.lock_inner();
-            let exception = Exception::new_user(&self.0, synth_code, synth_data);
+            let exception = Exception::new_synth(&self.0, type_, synth_code, synth_data);
             inner.exception = Some(exception.clone());
             exception
         };
