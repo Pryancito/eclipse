@@ -1636,6 +1636,23 @@ fn auto_bringup_compute_gpus() -> bool {
 /// ring, and never through `log::`, whose level `LOG=error` sets to filter
 /// everything below an error. Used by the deferred console-GPU bring-up to
 /// bracket the stretch where the screen deliberately stops moving.
+/// Ask every card for its display heads and put the answer in the klog.
+///
+/// One place, because the point is to read the SAME four lines at several
+/// points and compare them: a head that was `ADVANCING` before the unpause and
+/// is `SLEEP` after says the display engine was torn down, and one that is
+/// still `ADVANCING` says the raster survived and the fault is in what it
+/// reads or in the link. Neither is answerable from a log that stops before
+/// the unpause, which is where it stopped.
+#[cfg(feature = "linux")]
+fn log_scanout_liveness(phase: &str) {
+    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        for line in d.scanout_liveness(phase).lines() {
+            kernel_hal::klog_info!("{}", line);
+        }
+    }
+}
+
 #[cfg(feature = "linux")]
 fn console_notice(msg: &str) {
     use kernel_hal::console::{active_vt, serial_vt, vt_console_write_str};
@@ -1820,7 +1837,15 @@ fn schedule_deferred_console_bringup(
             held.subsec_millis(),
         ));
         kernel_hal::console::set_diag_present_over_graphics(over_graphics_was);
+        // No-op on a VT a compositor owns: the panel already got its frame
+        // back inside `set_scanout_paused(false)`, and painting the text
+        // console over it is what left the screen on the boot log with labwc
+        // running behind it. See `redraw_graphic_console_impl`.
         kernel_hal::console::redraw_active_console();
+        // The three reads nobody had. Every head dump the bring-up takes is
+        // from BEFORE this point, so when the screen went wrong here the log
+        // had nothing to say about it.
+        log_scanout_liveness("post-unpause");
 
         // The GR ladder runs HERE, with the screen moving again, never inside
         // the window above: step16/step17 drive the compute engine's cold
@@ -1834,6 +1859,7 @@ fn schedule_deferred_console_bringup(
                 kernel_hal::klog_info!("Eclipse: NVIDIA {}", line);
             }
         }
+        log_scanout_liveness("post-ladder");
 
         // The boot-time CE decision was taken before this GPU existed as a
         // presenter, so re-take it now. On a single-GPU box this is the moment

@@ -5097,6 +5097,13 @@ impl DrmScheme for NvidiaGpu {
         )
     }
 
+    fn scanout_liveness(&self, phase: &str) -> String {
+        if !self.drives_boot_display() {
+            return String::new();
+        }
+        self.dump_head_liveness("gpu-consola", phase)
+    }
+
     fn console_gpu_ready(&self) -> Option<(bool, String)> {
         gpu_ready::report(self)
     }

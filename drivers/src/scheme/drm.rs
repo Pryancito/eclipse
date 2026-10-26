@@ -526,6 +526,24 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// Read-only dump of this card's display heads at a named point, for the
+    /// one stretch of the deferred bring-up that has no narration at all.
+    ///
+    /// The bring-up already dumps head liveness before the GSP boot and twice
+    /// inside it, and on Moebius's box every one of those reads says
+    /// `ADVANCING`. The monitor dies AFTER them: his screen's last line is
+    /// `bring-up terminado ... el scanout vuelve`, and nothing is logged
+    /// between there and the next boot. So the three reads that would say
+    /// whether the raster survived the unpause, the console redraw and the GR
+    /// ladder are exactly the three that do not exist.
+    ///
+    /// Empty from a driver with no console GPU, so a caller can ask every
+    /// registered driver and print whatever comes back. Must have no side
+    /// effects: it runs on a card that is scanning out at the time.
+    fn scanout_liveness(&self, _phase: &str) -> alloc::string::String {
+        alloc::string::String::new()
+    }
+
     /// Read-only: can a GL/Vulkan client use this driver's console GPU yet?
     ///
     /// `None` from a driver with no console GPU of its own, so a caller can
