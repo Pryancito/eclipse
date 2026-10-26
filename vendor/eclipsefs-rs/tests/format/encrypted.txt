@@ -1,0 +1,13 @@
+filesystem label="eclipse" version=0x4 block=4096 total=16777216
+subvolume 5 name="" root=256 parent=0 dir=0 ro=false snapshot_of=0 snapshot_gen=0 created=(1700000000, 0) uuid=2333bdb30b6d41ceb67f7e35a7456a30 parent_uuid=00000000000000000000000000000000 received_uuid=00000000000000000000000000000000
+== subvolume 5
+/ ino=256 dir mode=40755 uid=0 gid=0 nlink=3 size=30 nbytes=0 rdev=0 atime=(1700000000, 0) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/en-claro ino=264 file mode=100644 uid=0 gid=0 nlink=1 size=10 nbytes=10 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=751f7196
+/secreto ino=257 dir mode=40755 uid=0 gid=0 nlink=3 size=704 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x800
+/secreto/corto ino=259 file mode=100644 uid=0 gid=0 nlink=1 size=1 nbytes=4096 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x800 data=a93c5f93
+/secreto/diario.txt ino=258 file mode=100644 uid=0 gid=0 nlink=2 size=20485 nbytes=24576 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x800 data=e41917f0
+/secreto/enlace ino=263 symlink mode=120777 uid=0 gid=0 nlink=1 size=10 nbytes=4096 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x800 target=10:3d35d305
+/secreto/largolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargolargo ino=260 file mode=100644 uid=0 gid=0 nlink=1 size=9000 nbytes=12288 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x800 data=556483e9
+/secreto/subdir ino=261 dir mode=40755 uid=0 gid=0 nlink=2 size=128 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x800
+/secreto/subdir/dentro ino=262 file mode=100644 uid=0 gid=0 nlink=1 size=12288 nbytes=12288 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x800 data=562ea45d
+/secreto/subdir/otro-nombre ino=258 file mode=100644 uid=0 gid=0 nlink=2 size=20485 nbytes=24576 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x800 data=e41917f0

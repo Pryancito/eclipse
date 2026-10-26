@@ -2623,6 +2623,54 @@ fn a_damage_box_on_a_fresh_buffer_puts_the_whole_frame_up() {
     c.destroy_dumb(b.handle).expect("DESTROY_DUMB b");
 }
 
+/// A damage box presented to ANOTHER CRTC is promoted to a whole frame, because
+/// the panel state the box would be measured against describes the first one.
+///
+/// Since 26-oct-2026 a box can have two CRTCs to present to: each DRM node
+/// answers `GETRESOURCES` for its own card, and each card advertises a CRTC id
+/// of its own. The panel state -- the framebuffer the panel carries and the
+/// band hashes of its pixels -- is one panel's worth, so a box aimed at the
+/// second pipe used to be honoured against what the FIRST pipe carries, and
+/// every pixel it left alone was another monitor's frame. See
+/// `drm::panel_state`.
+///
+/// Both ids go straight through [`drm::present_now_region`], not through
+/// `SETCRTC`: what is under test is the panel state, and giving the emulated
+/// box a second hardware-KMS pipe would move the present onto `page_flip`,
+/// where no CPU blit writes the pixels this asserts on.
+#[test]
+fn a_damage_box_aimed_at_another_crtc_puts_the_whole_frame_up() {
+    let screen = kms_emu::attach(64, 16);
+    let c = Client::open(0);
+
+    // One framebuffer all the way through, repainted in place: a box on the
+    // framebuffer the panel already carries is exactly the case
+    // `rect_for_present` honours, so nothing but the CRTC can promote it.
+    let a = c.create_dumb(64, 16);
+    paint(&a, |x, y| tag(0x00AA_0000, x, y));
+    let fb_a = c.addfb2(&a);
+    assert!(drm::present_now_region(fb_a, 2001, None), "present on 2001");
+    assert_eq!(drm::panel_fb_for_test(), fb_a);
+    assert_eq!(screen.pixel(40, 12), tag(0x00AA_0000, 40, 12));
+
+    // New pixels in the same buffer, and a box over a corner of them.
+    paint(&a, |x, y| tag(0x0011_0000, x, y));
+    assert!(
+        drm::present_now_region(fb_a, 5001, Some((8, 4, 16, 8))),
+        "present on 5001"
+    );
+
+    assert_eq!(
+        screen.pixel(40, 12),
+        tag(0x0011_0000, 40, 12),
+        "the box was honoured against a panel this CRTC does not describe, so \
+         outside it the panel is still holding the other pipe's frame"
+    );
+
+    c.rmfb(fb_a).expect("RMFB a");
+    c.destroy_dumb(a.handle).expect("DESTROY_DUMB a");
+}
+
 /// And the optimisation is still there for the case it exists for: the client
 /// re-presents the framebuffer the panel already carries, so the pixels
 /// outside the box really are the ones on screen. Copying the whole frame

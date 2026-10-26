@@ -175,10 +175,15 @@ fn each_node_answers_with_the_topology_of_its_own_card() {
     );
 }
 
-/// The two-card box this work is about: the compute card has no scanout of its
-/// own, the other drives the screen. The compute node lists nothing -- which
-/// is what the deleted special case achieved by index -- and the card with the
-/// monitor lists its own topology, which the machine-wide walk never let it do.
+/// The two-card box this work is about: the headless card has no scanout of
+/// its own, the other drives the screen. The headless node lists nothing --
+/// which is what the deleted special case achieved by index -- and the card
+/// with the monitor lists its own topology, which the machine-wide walk never
+/// let it do.
+///
+/// The card with the monitor is `card0`, because that is the node the session
+/// opens (see `build_gpu_nodes`); here that is a fact about the fixture, and
+/// `no_node_outranks_card0` is what holds it down.
 #[test]
 fn the_card_without_scanout_lists_nothing_and_the_other_lists_its_own() {
     let screen = kms_emu::attach(64, 16);
@@ -193,23 +198,28 @@ fn the_card_without_scanout_lists_nothing_and_the_other_lists_its_own() {
 
     assert_eq!(
         resources_for_node(0),
-        (Vec::new(), Vec::new()),
-        "card0 is the compute card: no CRTCs, so drmIsKMS fails on it"
+        (alloc::vec![2101], alloc::vec![2102]),
+        "card0 has the monitor and now says so"
     );
     assert_eq!(
         resources_for_node(1),
-        (alloc::vec![2101], alloc::vec![2102]),
-        "card1 has the monitor and now says so"
+        (Vec::new(), Vec::new()),
+        "card1 cannot scan out: no CRTCs, so drmIsKMS fails on it"
     );
 }
 
 /// **Under software KMS the panel goes to the card the blit goes through, and
 /// that is not the primary.** On a two-card box the primary is the card
-/// attached last, which is the compute one; the blit goes through
+/// attached last, which is the headless one; the blit goes through
 /// `get_display_driver()`, which is the card that is not a compute GPU. Asking
-/// the primary instead would put the panel back on `card0` and silence the
-/// card the monitor is on -- exactly the answer this module replaced, and on
-/// the path the real box is on today.
+/// the primary instead would hand the panel to the card with no monitor on it
+/// and silence the one that has it.
+///
+/// That the answer now lands on `card0` is not what this test is checking:
+/// `build_gpu_nodes` asks the same function, so both would move together. What
+/// it pins down is that the question asked is "which card does the blit go
+/// through" and not "which card is first in the registry" -- swap the two and
+/// this fixture's panel moves to the other node.
 ///
 /// Found by mutation: every other test here drives the hardware-KMS branch,
 /// where this question is never asked, so the mutant that swapped the two
@@ -234,15 +244,26 @@ fn under_software_kms_the_panel_follows_the_blit_and_not_the_primary() {
         "the two have to differ or the test proves nothing"
     );
 
+    let blit_node = gpu_nodes()
+        .iter()
+        .find(|n| Arc::ptr_eq(&n.driver, &display))
+        .map(|n| n.card_minor())
+        .expect("the display card has a node");
+    let other = gpu_nodes()
+        .iter()
+        .find(|n| Arc::ptr_eq(&n.driver, &primary))
+        .map(|n| n.card_minor())
+        .expect("the primary has a node");
+
     assert_eq!(
-        resources_for_node(0),
-        (Vec::new(), Vec::new()),
-        "card0 is the primary and the blit does NOT go through it"
+        resources_for_node(blit_node),
+        (alloc::vec![SYNTH_CRTC_ID], alloc::vec![SYNTH_CONNECTOR_ID]),
+        "the panel belongs to the card the blit goes through"
     );
     assert_eq!(
-        resources_for_node(1),
-        (alloc::vec![SYNTH_CRTC_ID], alloc::vec![SYNTH_CONNECTOR_ID]),
-        "card1 is the card the blit goes through, so it carries the panel"
+        resources_for_node(other),
+        (Vec::new(), Vec::new()),
+        "the primary is not the card the blit goes through, so it has no panel"
     );
 }
 

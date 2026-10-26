@@ -16,8 +16,17 @@
 //! 216 group 0's chunk (kind, profile, stripes, blocks, 4 x (device, block))
 //! with FEAT_BITMAP_CSUM:
 //! 288 bitmap checksum table block                 296 its length in blocks
+//! 304 compatible features   312 read-only compatible features
 //! 508 crc32c of bytes 0..508
 //! ```
+//!
+//! This is EclipseFS format 1.0 (`FORMAT.md` in the crate), frozen: the
+//! version field stays 0x0004_0000 and the format only grows through
+//! feature bits, in three classes as ext4 does. The bits at 56 are
+//! incompatible: a driver that finds one it does not know refuses to
+//! mount. Those at 312 are read-only compatible: an unknown one still
+//! mounts, read-only. Those at 304 are compatible: an unknown one is
+//! ignored and kept.
 //!
 //! Trees and item keys `(objectid, type, offset)`:
 //!
@@ -129,6 +138,21 @@ pub const FEAT_ENCRYPT: u64 = 16;
 pub const FEAT_RAID56: u64 = 1 << 8;
 /// Devices with a tier: the chunk map is version 2.
 pub const FEAT_TIERS: u64 = 1 << 9;
+/// Every incompatible feature (byte 56) this driver knows; any other bit
+/// there and the filesystem does not mount.
+pub const FEAT_KNOWN: u64 = FEAT_QUOTA
+    | FEAT_VOLUME
+    | FEAT_FIXED_SIZE
+    | FEAT_BITMAP_CSUM
+    | FEAT_ENCRYPT
+    | FEAT_RAID56
+    | FEAT_TIERS;
+/// Read-only compatible features (byte 312) this driver knows: none yet.
+/// An unknown one allows a read-only mount only.
+pub const RO_COMPAT_KNOWN: u64 = 0;
+/// Compatible features (byte 304) this driver knows: none yet. Unknown
+/// ones are ignored and written back as they were.
+pub const COMPAT_KNOWN: u64 = 0;
 
 /// Bitmap checksums per block of the table: the last 4 bytes are the
 /// CRC32C of the rest.
@@ -208,6 +232,10 @@ pub struct SuperV4 {
     /// With [`FEAT_BITMAP_CSUM`]: first block of the bitmap checksum table
     /// (in group 0) and its length in blocks.
     pub bitmap_sums: Option<(u64, u32)>,
+    /// Compatible features (byte 304), kept even when unknown.
+    pub compat: u64,
+    /// Read-only compatible features (byte 312).
+    pub ro_compat: u64,
 }
 
 impl SuperV4 {
@@ -253,6 +281,8 @@ impl SuperV4 {
             None => features & !FEAT_BITMAP_CSUM,
         };
         put64(&mut b, 56, features);
+        put64(&mut b, 304, self.compat);
+        put64(&mut b, 312, self.ro_compat);
         let c = crc32c(&b[..SB_CRC]);
         put32(&mut b, SB_CRC, c);
         b
@@ -274,6 +304,9 @@ impl SuperV4 {
         if b[180] != CSUM_CRC32C {
             return Err(Error::Unsupported("EclipseFS checksum type"));
         }
+        if le64(b, 56) & !FEAT_KNOWN != 0 {
+            return Err(Error::Unsupported("EclipseFS incompatible feature"));
+        }
         let sb = Self {
             total_blocks: le64(b, 24),
             free_blocks: le64(b, 32),
@@ -292,6 +325,8 @@ impl SuperV4 {
             default_subvol: le64(b, 184),
             vol: None,
             bitmap_sums: None,
+            compat: le64(b, 304),
+            ro_compat: le64(b, 312),
         };
         let mut sb = sb;
         if sb.features & FEAT_BITMAP_CSUM != 0 {
@@ -325,6 +360,15 @@ impl SuperV4 {
             return Err(Error::Corrupt("journal location"));
         }
         Ok(sb)
+    }
+
+    /// Whether this driver may write the filesystem: not with a read-only
+    /// compatible feature it does not know.
+    pub fn check_writable(&self, read_only: bool) -> Result<()> {
+        if !read_only && self.ro_compat & !RO_COMPAT_KNOWN != 0 {
+            return Err(Error::Unsupported("EclipseFS read-only feature"));
+        }
+        Ok(())
     }
 
     pub fn label(&self) -> &[u8] {
@@ -1042,6 +1086,8 @@ mod tests {
             default_subvol: FS_TREE,
             vol: None,
             bitmap_sums: None,
+            compat: 0,
+            ro_compat: 0,
         }
     }
 

@@ -1210,6 +1210,147 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     "Eclipse: nvidia.gem_vram_bar1 -- VRAM GEM objects CPU-mapped through BAR1"
                 );
             }
+            // The GPU policy BEFORE init(1) is spawned, not after.
+            //
+            // `wait_for_gpu_ready` in eclipse-init holds a GPU session back
+            // until `/proc/gpuready` stops saying `waiting`, and that file
+            // answers `none` -- "start now" -- until
+            // `set_console_bringup_expected` has run. This block used to sit
+            // AFTER the spawn, so on real hardware init(1) read `none` at
+            // 4.5 s, 0.2 s before the kernel got here and scheduled the task:
+            // the compositor started, NVK asked a card whose RM was still
+            // cold, got ENODEV, and wlroots fell back to pixman FOR THE REST
+            // OF THE SESSION -- 3 s before that same card finished coming up.
+            // Nothing here touches the processes below, so the only thing the
+            // move changes is that userspace can no longer outrun the answer
+            // it is about to ask for.
+            // Either flag wants the console GPU up; the task runs once and
+            // serves both (hardware cursor plane and/or local CE present).
+            //
+            // Linux attaches the RM to EVERY NVIDIA card at probe, the one
+            // scanning out the console included -- that is why `nvidia-smi`
+            // there lists both cards of a 1+1 box, graphics on one and
+            // compute on the other. Eclipse left the console card cold and
+            // the operator had to know about `nvidia.console_gpu` to get it,
+            // so a dual-card box reported `2 GPU node(s), 1 with the RM up`
+            // and NVML counted one GPU. On a MULTI-GPU box the bring-up is
+            // now the default: it is the difference between the split Linux
+            // gives and half a machine. What runs is the same deferred task
+            // as before -- after the desktop, with scanout paused, never on
+            // the boot progress path -- so the failure mode is unchanged and
+            // the compute card is already up by then either way. Opt out
+            // with `nvidia.noconsole_gpu`.
+            //
+            // A SINGLE-GPU box keeps the old default (off): there the console
+            // card is the only card, and the SEC2 STARTCPU store that can
+            // wedge takes the whole machine with no second card to fall back
+            // on. That box still opts in with `nvidia.console_gpu`.
+            let nvidia_cards = kernel_hal::drivers::all_drm().as_vec();
+            let console_cards = nvidia_cards.iter().filter(|d| d.is_console_gpu()).count();
+            let nvidia_cards = nvidia_cards
+                .iter()
+                .filter(|d| d.is_console_gpu() || d.is_compute_gpu())
+                .count();
+            let verdict = multigpu_verdict(&options.cmdline, nvidia_cards, console_cards);
+            let console_gpu_by_default = verdict.is_multigpu()
+                && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.noconsole_gpu");
+            match verdict {
+                MultiGpu::Declared => klog_info!(
+                    "Eclipse: nvidia.multigpu — caja multi-GPU declarada, {} GPUs NVIDIA ({} \
+                     escanean la consola); bring-up de la que escanea por defecto, como en \
+                     Linux (apagalo con nvidia.noconsole_gpu)",
+                    nvidia_cards,
+                    console_cards
+                ),
+                MultiGpu::DeclaredButOneCard => klog_warn!(
+                    "Eclipse: nvidia.multigpu declarado pero sólo se enumeró {} GPU NVIDIA — se \
+                     trata como caja de una tarjeta. Con una sola, el store STARTCPU de SEC2 que \
+                     puede colgar se lleva la máquina entera y no hay segunda a la que caer. \
+                     Para subirla igual: nvidia.scanout_gpu (en el arranque) o nvidia.console_gpu \
+                     (diferido)",
+                    nvidia_cards
+                ),
+                MultiGpu::SeveralCardsUndeclared => klog_info!(
+                    "Eclipse: {} GPUs NVIDIA ({} escanean la consola) y nvidia.multigpu NO está \
+                     en la cmdline — se trata como multi-GPU igual, por lo que se enumeró. Lo \
+                     normal es declararlo con nvidia.multigpu",
+                    nvidia_cards,
+                    console_cards
+                ),
+                MultiGpu::Single => {}
+            }
+            let want_console_gpu = console_gpu_by_default
+                || kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu");
+            // One bring-up path for every card now; this only says whether the
+            // card that scans out goes through it AT BOOT, while its GSP boot
+            // still wedges at the SEC2 store.
+            //
+            // `nvidia.console_gpu` is deliberately NOT accepted as a spelling
+            // of this. It already means something else and something that
+            // works: the deferred task below, which waits for the desktop,
+            // parks scanout and has finished with both cards up on real
+            // hardware. Taking it as a synonym here would run the boot-time
+            // attempt FIRST, wedge at `STARTCPU`, and the boot would never
+            // reach the desktop the deferred task waits for -- so the one
+            // recipe that works would be replaced by one that does not, under
+            // the flag that used to select it. `nvidia.noconsole_gpu` still
+            // beats this one too, so a cmdline written against the old default
+            // leaves that card cold either way.
+            kernel_hal::drivers::set_scanout_gpu_bringup(scanout_gpu_bringup_asked(
+                &options.cmdline,
+            ));
+            // `/proc/gpuready` answers for the console card, and that card only
+            // becomes usable because the task below brings it up. Tell the
+            // reader whether anyone scheduled it: without this a box booted
+            // with `nvidia.noconsole_gpu` answered `waiting` forever, and init
+            // held the session back for its whole timeout on a bring-up nobody
+            // had asked for.
+            // `nvidia.dispoff` hands the console card's display engine over
+            // to its firmware for the SEC2 window of its own GSP boot. OFF by
+            // default: the one hardware boot that ran it with the default on
+            // lost the monitor for the whole session, because coming out of
+            // PDISP reset restores `NV_PMC_ENABLE` and not the scanout state
+            // the VBIOS programmed. See `display_off_for_gsp`.
+            // `nvidia.nodispoff` still turns it off, so a cmdline written
+            // against the old default keeps meaning what it meant.
+            // Tell the RM this card is the primary and its console must be
+            // reserved, before its own GSP boot -- what Linux does, and what
+            // `bringup_step14` took out because it correlated with the SEC2
+            // wedge on boots that had no display hand-over. See
+            // `console_preserve` for why the comparison is worth re-running.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_preserve") {
+                kernel_hal::drivers::set_console_preserve(true);
+                klog_info!(
+                    "Eclipse: nvidia.console_preserve — se declara la consola al RM antes del arranque del GSP (reserva la region de consola; puede devolver el cuelgue del STARTCPU)"
+                );
+            }
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.dispoff")
+                && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nodispoff")
+            {
+                kernel_hal::drivers::set_display_off_for_gsp(true);
+                klog_info!(
+                    "Eclipse: nvidia.dispoff — el motor de display se apaga durante la ventana SEC2 del GSP de consola (la pantalla puede no volver hasta reiniciar)"
+                );
+            }
+            linux_object::fs::devfs::drm::set_console_bringup_expected(want_console_gpu);
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.hwcursor") || want_console_gpu {
+                let reason = if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu") {
+                    "nvidia.console_gpu"
+                } else if want_console_gpu {
+                    // Nobody asked by name: this is the multi-GPU default.
+                    "GPU de consola (por defecto, caja multi-GPU)"
+                } else {
+                    "nvidia.hwcursor"
+                };
+                schedule_deferred_console_bringup(
+                    reason,
+                    !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nocepresent"),
+                    // `nvidia.console_gpu` deliberately left the console-GSP
+                    // gate shut at boot; the task opens it under the pause.
+                    want_console_gpu && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gsp"),
+                );
+            }
+
             kernel_hal::console::early_progress_bar(95);
 
             // Whose exit takes the system down: INIT (PID 1) if present, else
@@ -1315,121 +1456,6 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 klog_info!("{}", line);
                 kernel_hal::console::serial_write_str(line);
                 kernel_hal::console::serial_write_str("\r\n");
-            }
-            // Either flag wants the console GPU up; the task runs once and
-            // serves both (hardware cursor plane and/or local CE present).
-            //
-            // Linux attaches the RM to EVERY NVIDIA card at probe, the one
-            // scanning out the console included -- that is why `nvidia-smi`
-            // there lists both cards of a 1+1 box, graphics on one and
-            // compute on the other. Eclipse left the console card cold and
-            // the operator had to know about `nvidia.console_gpu` to get it,
-            // so a dual-card box reported `2 GPU node(s), 1 with the RM up`
-            // and NVML counted one GPU. On a MULTI-GPU box the bring-up is
-            // now the default: it is the difference between the split Linux
-            // gives and half a machine. What runs is the same deferred task
-            // as before -- after the desktop, with scanout paused, never on
-            // the boot progress path -- so the failure mode is unchanged and
-            // the compute card is already up by then either way. Opt out
-            // with `nvidia.noconsole_gpu`.
-            //
-            // A SINGLE-GPU box keeps the old default (off): there the console
-            // card is the only card, and the SEC2 STARTCPU store that can
-            // wedge takes the whole machine with no second card to fall back
-            // on. That box still opts in with `nvidia.console_gpu`.
-            let nvidia_cards = kernel_hal::drivers::all_drm().as_vec();
-            let console_cards = nvidia_cards.iter().filter(|d| d.is_console_gpu()).count();
-            let nvidia_cards = nvidia_cards
-                .iter()
-                .filter(|d| d.is_console_gpu() || d.is_compute_gpu())
-                .count();
-            let verdict = multigpu_verdict(&options.cmdline, nvidia_cards, console_cards);
-            let console_gpu_by_default = verdict.is_multigpu()
-                && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.noconsole_gpu");
-            match verdict {
-                MultiGpu::Declared => klog_info!(
-                    "Eclipse: nvidia.multigpu — caja multi-GPU declarada, {} GPUs NVIDIA ({} \
-                     escanean la consola); bring-up de la que escanea por defecto, como en \
-                     Linux (apagalo con nvidia.noconsole_gpu)",
-                    nvidia_cards,
-                    console_cards
-                ),
-                MultiGpu::DeclaredButOneCard => klog_warn!(
-                    "Eclipse: nvidia.multigpu declarado pero sólo se enumeró {} GPU NVIDIA — se \
-                     trata como caja de una tarjeta. Con una sola, el store STARTCPU de SEC2 que \
-                     puede colgar se lleva la máquina entera y no hay segunda a la que caer. \
-                     Para subirla igual: nvidia.scanout_gpu (en el arranque) o nvidia.console_gpu \
-                     (diferido)",
-                    nvidia_cards
-                ),
-                MultiGpu::SeveralCardsUndeclared => klog_info!(
-                    "Eclipse: {} GPUs NVIDIA ({} escanean la consola) y nvidia.multigpu NO está \
-                     en la cmdline — se trata como multi-GPU igual, por lo que se enumeró. Lo \
-                     normal es declararlo con nvidia.multigpu",
-                    nvidia_cards,
-                    console_cards
-                ),
-                MultiGpu::Single => {}
-            }
-            let want_console_gpu = console_gpu_by_default
-                || kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu");
-            // One bring-up path for every card now; this only says whether the
-            // card that scans out goes through it AT BOOT, while its GSP boot
-            // still wedges at the SEC2 store.
-            //
-            // `nvidia.console_gpu` is deliberately NOT accepted as a spelling
-            // of this. It already means something else and something that
-            // works: the deferred task below, which waits for the desktop,
-            // parks scanout and has finished with both cards up on real
-            // hardware. Taking it as a synonym here would run the boot-time
-            // attempt FIRST, wedge at `STARTCPU`, and the boot would never
-            // reach the desktop the deferred task waits for -- so the one
-            // recipe that works would be replaced by one that does not, under
-            // the flag that used to select it. `nvidia.noconsole_gpu` still
-            // beats this one too, so a cmdline written against the old default
-            // leaves that card cold either way.
-            kernel_hal::drivers::set_scanout_gpu_bringup(scanout_gpu_bringup_asked(
-                &options.cmdline,
-            ));
-            // `/proc/gpuready` answers for the console card, and that card only
-            // becomes usable because the task below brings it up. Tell the
-            // reader whether anyone scheduled it: without this a box booted
-            // with `nvidia.noconsole_gpu` answered `waiting` forever, and init
-            // held the session back for its whole timeout on a bring-up nobody
-            // had asked for.
-            // `nvidia.dispoff` hands the console card's display engine over
-            // to its firmware for the SEC2 window of its own GSP boot. OFF by
-            // default: the one hardware boot that ran it with the default on
-            // lost the monitor for the whole session, because coming out of
-            // PDISP reset restores `NV_PMC_ENABLE` and not the scanout state
-            // the VBIOS programmed. See `display_off_for_gsp`.
-            // `nvidia.nodispoff` still turns it off, so a cmdline written
-            // against the old default keeps meaning what it meant.
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.dispoff")
-                && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nodispoff")
-            {
-                kernel_hal::drivers::set_display_off_for_gsp(true);
-                klog_info!(
-                    "Eclipse: nvidia.dispoff — el motor de display se apaga durante la ventana SEC2 del GSP de consola (la pantalla puede no volver hasta reiniciar)"
-                );
-            }
-            linux_object::fs::devfs::drm::set_console_bringup_expected(want_console_gpu);
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.hwcursor") || want_console_gpu {
-                let reason = if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu") {
-                    "nvidia.console_gpu"
-                } else if want_console_gpu {
-                    // Nobody asked by name: this is the multi-GPU default.
-                    "GPU de consola (por defecto, caja multi-GPU)"
-                } else {
-                    "nvidia.hwcursor"
-                };
-                schedule_deferred_console_bringup(
-                    reason,
-                    !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nocepresent"),
-                    // `nvidia.console_gpu` deliberately left the console-GSP
-                    // gate shut at boot; the task opens it under the pause.
-                    want_console_gpu && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gsp"),
-                );
             }
             #[cfg(all(feature = "linux", not(feature = "libos")))]
             {

@@ -1,0 +1,50 @@
+filesystem label="eclipse" version=0x4 block=4096 total=33554432
+subvolume 5 name="" root=256 parent=0 dir=0 ro=false snapshot_of=0 snapshot_gen=0 created=(1700000000, 0) uuid=2333bdb30b6d41ceb67f7e35a7456a30 parent_uuid=00000000000000000000000000000000 received_uuid=00000000000000000000000000000000
+subvolume 256 name="home" root=281474976710912 parent=5 dir=256 ro=false snapshot_of=0 snapshot_gen=0 created=(1800000000, 5) uuid=250b0bd6952b433aa7de5bbb4447a227 parent_uuid=00000000000000000000000000000000 received_uuid=00000000000000000000000000000000
+subvolume 257 name="anidado" root=282574488338688 parent=256 dir=281474976710912 ro=false snapshot_of=0 snapshot_gen=0 created=(1800000000, 5) uuid=c425d94d5baf48a5aba64a1ac4cfb19d parent_uuid=00000000000000000000000000000000 received_uuid=00000000000000000000000000000000
+subvolume 258 name="home-ro" root=283673999966464 parent=5 dir=257 ro=true snapshot_of=256 snapshot_gen=3 created=(1800000000, 5) uuid=6d2bf7e8398a4ad7b960206257afcad3 parent_uuid=250b0bd6952b433aa7de5bbb4447a227 received_uuid=00000000000000000000000000000000
+subvolume 259 name="home-rw" root=284773511594240 parent=5 dir=257 ro=false snapshot_of=256 snapshot_gen=4 created=(1800000000, 5) uuid=050520eec8bb44179c0c619abfe77c34 parent_uuid=250b0bd6952b433aa7de5bbb4447a227 received_uuid=00000000000000000000000000000000
+subvolume 260 name="home-ro" root=285873023222016 parent=5 dir=259 ro=true snapshot_of=0 snapshot_gen=0 created=(1800000000, 5) uuid=5eec043863fd44128a397056376221ea parent_uuid=00000000000000000000000000000000 received_uuid=6d2bf7e8398a4ad7b960206257afcad3
+qgroup QgroupInfo { id: 5, referenced: 65536, limit: None, disk_referenced: 65536, exclusive: 0 }
+qgroup QgroupInfo { id: 256, referenced: 679954, limit: Some(8388608), disk_referenced: 458752, exclusive: 253952 }
+qgroup QgroupInfo { id: 257, referenced: 18, limit: None, disk_referenced: 0, exclusive: 0 }
+qgroup QgroupInfo { id: 258, referenced: 204818, limit: None, disk_referenced: 204800, exclusive: 0 }
+qgroup QgroupInfo { id: 259, referenced: 204823, limit: None, disk_referenced: 204800, exclusive: 0 }
+qgroup QgroupInfo { id: 260, referenced: 204818, limit: None, disk_referenced: 204800, exclusive: 204800 }
+== subvolume 5
+/ ino=256 dir mode=40755 uid=0 gid=0 nlink=4 size=92 nbytes=0 rdev=0 atime=(1700000000, 0) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/copia-entre-subvolumenes ino=258 file mode=100644 uid=0 gid=0 nlink=1 size=65536 nbytes=65536 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=df7f46de
+/home -> subvolume 256
+/recibidos ino=259 dir mode=40755 uid=0 gid=0 nlink=2 size=14 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/recibidos/home-ro -> subvolume 260
+/snapshots ino=257 dir mode=40755 uid=0 gid=0 nlink=2 size=28 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/snapshots/home-ro -> subvolume 258
+/snapshots/home-rw -> subvolume 259
+== subvolume 256
+/ ino=281474976710912 dir mode=40755 uid=0 gid=0 nlink=3 size=28 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/anidado -> subvolume 257
+/moebius ino=281474976710913 dir mode=40755 uid=0 gid=0 nlink=2 size=56 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/moebius/a.bin ino=281474976710914 file mode=100644 uid=0 gid=0 nlink=1 size=204800 nbytes=204800 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=a730fe36
+/moebius/b.bin ino=281474976710916 file mode=100644 uid=0 gid=0 nlink=1 size=204800 nbytes=204800 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=a730fe36
+/moebius/c.bin ino=281474976710917 file mode=100644 uid=0 gid=0 nlink=1 size=65536 nbytes=65536 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=e1e23ae2
+/moebius/igual.bin ino=281474976710918 file mode=100644 uid=0 gid=0 nlink=1 size=204800 nbytes=204800 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=a5e3418f
+/moebius/nota ino=281474976710915 file mode=100644 uid=0 gid=0 nlink=1 size=18 nbytes=18 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=b4f2cc3f
+== subvolume 257
+/ ino=282574488338688 dir mode=40755 uid=0 gid=0 nlink=2 size=12 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/dentro ino=282574488338689 file mode=100644 uid=0 gid=0 nlink=1 size=18 nbytes=18 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=8343a8b7
+== subvolume 258
+/ ino=283673999966464 dir mode=40755 uid=0 gid=0 nlink=3 size=14 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/moebius ino=283673999966465 dir mode=40755 uid=0 gid=0 nlink=2 size=18 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/moebius/a.bin ino=283673999966466 file mode=100644 uid=0 gid=0 nlink=1 size=204800 nbytes=204800 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=a5e3418f
+/moebius/nota ino=283673999966467 file mode=100644 uid=0 gid=0 nlink=1 size=18 nbytes=18 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=12e75870
+== subvolume 259
+/ ino=284773511594240 dir mode=40755 uid=0 gid=0 nlink=3 size=14 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/moebius ino=284773511594241 dir mode=40755 uid=0 gid=0 nlink=2 size=38 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/moebius/a.bin ino=284773511594242 file mode=100644 uid=0 gid=0 nlink=1 size=204800 nbytes=204800 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=a5e3418f
+/moebius/nota ino=284773511594243 file mode=100644 uid=0 gid=0 nlink=1 size=18 nbytes=18 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=12e75870
+/moebius/solo-en-rw ino=284773511594244 file mode=100644 uid=0 gid=0 nlink=1 size=5 nbytes=5 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=fbf6c5f5
+== subvolume 260
+/ ino=285873023222016 dir mode=40755 uid=0 gid=0 nlink=3 size=14 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/moebius ino=285873023222017 dir mode=40755 uid=0 gid=0 nlink=2 size=18 nbytes=0 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0
+/moebius/a.bin ino=285873023222018 file mode=100644 uid=0 gid=0 nlink=1 size=204800 nbytes=204800 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=a5e3418f
+/moebius/nota ino=285873023222019 file mode=100644 uid=0 gid=0 nlink=1 size=18 nbytes=18 rdev=0 atime=(1800000000, 5) mtime=(1800000000, 5) ctime=(1800000000, 5) flags=0x0 data=12e75870
