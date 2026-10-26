@@ -1653,25 +1653,6 @@ fn log_scanout_liveness(phase: &str) {
     }
 }
 
-/// Is the courtesy window after `KD_GRAPHICS` over?
-///
-/// Either its three seconds are up, or a GPU client has parked on this card
-/// waiting for the bring-up, which cancels it: the window exists to let the
-/// compositor finish its first frames before scanout is parked, and a
-/// compositor blocked in `GEM_NEW` has no frames to finish. Its own function
-/// because the cancellation is the whole of this fix on the kernel side and a
-/// sleep has no assertion: on a dual-2060 box labwc set `KD_GRAPHICS` at
-/// 7.335 s, its first `GEM_NEW` was refused `ENODEV` at 10.050 s, and this
-/// window still had 0.6 s to run.
-#[cfg(any(feature = "linux", test))]
-fn courtesy_window_over(
-    now: core::time::Duration,
-    until: core::time::Duration,
-    client_blocked: bool,
-) -> bool {
-    client_blocked || now >= until
-}
-
 #[cfg(feature = "linux")]
 fn console_notice(msg: &str) {
     use kernel_hal::console::{active_vt, serial_vt, vt_console_write_str};
@@ -1740,16 +1721,7 @@ fn schedule_deferred_console_bringup(
         let deadline = timer_now() + Duration::from_secs(45);
         let mut saw_graphics = false;
         let mut asked = false;
-        let mut blocked = false;
         while timer_now() < deadline {
-            // FIRST, because it is the only one of the three that cannot be
-            // wrong: a client parked in `GEM_NEW` on this card is not a guess
-            // about whether boot progress is over, it is the session stopped
-            // waiting for us. See `drm::cold_client_waiting`.
-            if linux_object::fs::devfs::drm::cold_client_waiting() {
-                blocked = true;
-                break;
-            }
             if kd_mode() == KD_GRAPHICS {
                 saw_graphics = true;
                 break;
@@ -1766,38 +1738,36 @@ fn schedule_deferred_console_bringup(
             }
             kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(500)).await;
         }
-        if blocked {
-            kernel_hal::klog_info!(
-                "Eclipse: {} — un cliente GPU esta aparcado esperando esta tarjeta; bring-up ya, sin cortesia (scanout pausado)",
-                reason
-            );
-        } else if asked {
+        if asked {
             kernel_hal::klog_info!(
                 "Eclipse: {} — userspace pregunto por /proc/gpuready; bring-up consola ya (scanout pausado)",
                 reason
             );
         } else if saw_graphics {
-            // Let labwc finish its first few frames before freezing scanout --
-            // but CUT the moment a client parks on this card, because then
-            // there are no frames to protect. Three seconds of courtesy is
-            // what cost a dual-2060 box its desktop: labwc set KD_GRAPHICS at
-            // 7.335 s, its `GEM_NEW` was refused ENODEV at 10.050 s, and this
-            // sleep had 0.6 s left to run. Polled rather than slept whole, so
-            // the cut is immediate; a client that parks DURING the sleep is
-            // exactly the case the single sleep could not see.
-            let courtesy = timer_now() + Duration::from_secs(3);
-            loop {
-                blocked = linux_object::fs::devfs::drm::cold_client_waiting();
-                if courtesy_window_over(timer_now(), courtesy, blocked) {
-                    break;
-                }
-                kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(50)).await;
-            }
+            // Let labwc finish its first few frames before freezing scanout.
+            //
+            // This window is NOT cut short for a client parked on this card,
+            // although that client cannot draw anything and there are no
+            // frames left to protect. Cutting it was tried (#2186) and it
+            // cost a dual-2060 box its monitor: the parked client arrives
+            // before `KD_GRAPHICS`, so the bring-up started at 6.8 s instead
+            // of 10.7 s, and the SEC2 `STARTCPU` store that completed in
+            // 2.3 s at the later moment did not come back at all at the
+            // earlier one -- the watchdog lifted the pause 90 s later and the
+            // monitor never returned. What this window is really holding off
+            // is not understood well enough to move it, and the thing it
+            // guards is the one recipe that has ever finished with both cards
+            // up. The parked client costs nothing by waiting: it is asleep in
+            // its ioctl until the card attaches, which is the whole point of
+            // `DrmDev::console_bringup_sleep`. So this stays a plain sleep,
+            // and the line below only REPORTS whether anyone is parked, so
+            // the next boot's log says so.
+            kernel_hal::thread::sleep_until(timer_now() + Duration::from_secs(3)).await;
             kernel_hal::klog_info!(
                 "Eclipse: {} — desktop en KD_GRAPHICS{}; pausando scanout e iniciando bring-up consola",
                 reason,
-                if blocked {
-                    " (cortesia cortada: un cliente GPU espera)"
+                if linux_object::fs::devfs::drm::cold_client_waiting() {
+                    " (con un cliente GPU ya aparcado esperando esta tarjeta)"
                 } else {
                     ""
                 }
@@ -2162,37 +2132,5 @@ mod tests {
         assert_eq!(multigpu_verdict("nvidia.multigpu", 2, 0), MultiGpu::Single);
         assert_eq!(multigpu_verdict(REAL, 3, 0), MultiGpu::Single);
         assert_eq!(multigpu_verdict(REAL, 0, 0), MultiGpu::Single);
-    }
-}
-
-#[cfg(test)]
-mod courtesy_window_tests {
-    use super::courtesy_window_over;
-    use core::time::Duration;
-
-    /// The three seconds run out on their own when nothing is waiting: that
-    /// is the case the window was written for, a compositor drawing its first
-    /// frames before scanout is parked under it.
-    #[test]
-    fn with_nobody_waiting_the_window_runs_its_course() {
-        let until = Duration::from_secs(10);
-        assert!(!courtesy_window_over(Duration::from_secs(7), until, false));
-        assert!(!courtesy_window_over(Duration::from_secs(9), until, false));
-        assert!(courtesy_window_over(until, until, false));
-        assert!(courtesy_window_over(Duration::from_secs(11), until, false));
-    }
-
-    /// And a parked client cancels it outright, however much of it is left.
-    /// This is the fix: on a dual-2060 box 0.6 s of this window was the
-    /// difference between a GPU desktop and pixman for the session.
-    #[test]
-    fn a_parked_client_cancels_whatever_is_left_of_it() {
-        let until = Duration::from_secs(10);
-        assert!(
-            courtesy_window_over(Duration::ZERO, until, true),
-            "a client blocked in GEM_NEW has no frames to protect, so there is \
-             nothing left to be courteous about"
-        );
-        assert!(courtesy_window_over(Duration::from_secs(9), until, true));
     }
 }
