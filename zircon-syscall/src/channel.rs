@@ -191,11 +191,24 @@ impl Syscall<'_> {
             args.wr_num_handles,
             true,
         )?;
+        // The call is cancellable through the handle it was made on, as
+        // `zx_object_wait_one` already was: Zircon answers `ZX_ERR_CANCELED`
+        // when that handle goes away while the call waits for its reply, and
+        // with `None` here nothing ever ended such a call. A thread that
+        // transferred or closed the endpoint it was calling on stayed parked
+        // for good -- `ChannelInternalTest.TransferChannelWithPendingCall`
+        // left two tasks parked and took the whole core-tests run with it.
+        let cancel_token = proc.get_cancel_token(handle_value)?;
         let future = channel.call(message);
         pin_mut!(future);
         let reply = self
             .thread
-            .blocking_run(future, ThreadState::BlockedChannel, deadline.into(), None)
+            .blocking_run(
+                future,
+                ThreadState::BlockedChannel,
+                deadline.into(),
+                Some(cancel_token),
+            )
             .await?;
         // Receive pointers are checked after sending the request and awaiting
         // its reply, as required by channel-call semantics.
@@ -237,11 +250,24 @@ impl Syscall<'_> {
             args.wr_num_handles,
             true,
         )?;
+        // The call is cancellable through the handle it was made on, as
+        // `zx_object_wait_one` already was: Zircon answers `ZX_ERR_CANCELED`
+        // when that handle goes away while the call waits for its reply, and
+        // with `None` here nothing ever ended such a call. A thread that
+        // transferred or closed the endpoint it was calling on stayed parked
+        // for good -- `ChannelInternalTest.TransferChannelWithPendingCall`
+        // left two tasks parked and took the whole core-tests run with it.
+        let cancel_token = proc.get_cancel_token(handle_value)?;
         let future = channel.call(message);
         pin_mut!(future);
         let reply = self
             .thread
-            .blocking_run(future, ThreadState::BlockedChannel, deadline.into(), None)
+            .blocking_run(
+                future,
+                ThreadState::BlockedChannel,
+                deadline.into(),
+                Some(cancel_token),
+            )
             .await?;
         // Receive pointers are checked after sending the request and awaiting
         // its reply, as required by channel-call semantics.

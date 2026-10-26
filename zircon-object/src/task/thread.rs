@@ -2453,6 +2453,51 @@ mod tests {
         assert_eq!(thread.state(), ThreadState::New);
     }
 
+    /// The same cancellation, on the other syscall that waits with a handle
+    /// in hand: `zx_channel_call`. It used to wait with no cancel token at
+    /// all, so a thread that closed -- or transferred away -- the endpoint it
+    /// was calling on had nothing left to end its call and stayed parked for
+    /// good (`ChannelInternalTest.TransferChannelWithPendingCall`).
+    #[async_std::test]
+    async fn a_channel_call_is_cancelled_by_its_handle_going_away() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+        let thread = CurrentThread(thread);
+
+        // Both ends stay alive: what ends the call is the handle, not the
+        // endpoint dying, and `_peer` holds the request nobody answers.
+        let (channel, _peer) = crate::ipc::Channel::create();
+        let handle_value = proc.add_handle(Handle::new(channel.clone(), Rights::DEFAULT_CHANNEL));
+        let cancel_token = proc.get_cancel_token(handle_value).unwrap();
+
+        // Two seconds as a backstop only, as above: a cancel that never
+        // arrives has to fail the test rather than hang it.
+        let deadline = timer_now() + Duration::from_secs(2);
+        async_std::task::spawn({
+            let proc = proc.clone();
+            async move {
+                async_std::task::sleep(Duration::from_millis(10)).await;
+                proc.remove_handle(handle_value).unwrap();
+            }
+        });
+        let future = channel.call(crate::ipc::MessagePacket {
+            data: alloc::vec![0, 0, 0, 0],
+            handles: alloc::vec::Vec::new(),
+        });
+        futures::pin_mut!(future);
+        let result: ZxResult<crate::ipc::MessagePacket> = thread
+            .blocking_run(
+                future,
+                ThreadState::BlockedChannel,
+                deadline,
+                Some(cancel_token),
+            )
+            .await;
+        assert_eq!(result.err(), Some(ZxError::CANCELED));
+        assert_eq!(thread.state(), ThreadState::New);
+    }
+
     #[test]
     fn info() {
         let root_job = Job::root();
