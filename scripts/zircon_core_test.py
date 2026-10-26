@@ -35,6 +35,9 @@ GROUPS = {
 MAX_OPTION_VALUE = 187
 
 
+UNCLASSIFIED = "Not yet classified for this core-tests image"
+
+
 def outcomes(output):
     """What the guest said about each test it started.
 
@@ -52,6 +55,31 @@ def outcomes(output):
 def unmet(expected, results):
     """The requested tests that did not come back passing, in order."""
     return [name for name in expected if results.get(name) not in ("OK", "SKIPPED")]
+
+
+def verdict(selection, text, expected, returncode, timed_out):
+    """The status of one run, plus what came back and what did not.
+
+    Pure on purpose, and the reason is the bug it fixes: the verdict used to be
+    computed only on the path where the guest exited by itself. A run the
+    timeout killed reported `0/N requested passed` with every name `NOT-RUN`,
+    even with the whole log in hand -- 408 `[       OK ]` lines in the run that
+    made this obvious. A kill says the run did not *finish*; it says nothing
+    about the tests that did, and hiding them makes progress look like none.
+    """
+    results, missing = {}, list(expected)
+    if selection == "-l":
+        complete = bool(discovered_tests(text)) and "*** Exit status 0 ***" in text
+    else:
+        # The verdict is per requested test, not per boot: with one wildcard
+        # per run the guest also runs tests nobody asked for, and whether
+        # THOSE fail is the expectations file's business, not this run's.
+        results = outcomes(text)
+        missing = unmet(expected, results)
+        complete = not missing
+    if timed_out:
+        return "TIMEOUT", results, missing
+    return ("OK" if returncode == 0 and complete else "FAILED"), results, missing
 
 
 def guest_filters(patterns):
@@ -104,10 +132,56 @@ def load_expectations(arch, libos):
         for name in cases:
             if fnmatch.fnmatchcase(name, pattern):
                 cases[name] = None
-    for entry in overrides["skips"]:
-        if any(fnmatch.fnmatchcase(platform, pattern) for pattern in entry["platforms"]):
-            cases[entry["test"]] = entry["reason"]
-    return cases
+    cases.update(platform_entries(overrides["skips"], platform))
+    return cases, platform_entries(overrides.get("needs_hardware", []), platform)
+
+
+def platform_entries(entries, platform):
+    """The `{test, platforms, reason}` entries that apply to this platform."""
+    return {
+        entry["test"]: entry["reason"]
+        for entry in entries
+        if any(fnmatch.fnmatchcase(platform, pattern) for pattern in entry["platforms"])
+    }
+
+
+def triage(available, patterns, expectations, hardware, supported, include_skipped):
+    """Split the catalog into what this run asks the guest for, what it skips,
+    and what it cannot even attempt here.
+
+    A test in `hardware` is one measured to be unreachable on an emulated CPU,
+    not one that fails: it is never run and never counted as passed, but it
+    keeps its own name and reason so it does not vanish from the tally.
+    """
+    selected, skipped, needs_hardware = [], {}, {}
+    for name in sorted(available):
+        if not any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns):
+            continue
+        if name in hardware and not include_skipped:
+            needs_hardware[name] = hardware[name]
+            continue
+        reason = expectations.get(name, UNCLASSIFIED)
+        if name not in expectations and any(fnmatch.fnmatchcase(name, pattern) for pattern in supported):
+            reason = None
+        if reason and not include_skipped:
+            skipped[name] = reason
+        else:
+            selected.append(name)
+    return selected, skipped, needs_hardware
+
+
+def summary_line(passed, requested, runs, failures, skipped, needs_hardware, log_dir):
+    """The one line a reader takes the run's state from.
+
+    `requested` counts only what the guest was asked for, so the tests held
+    back for lack of hardware get their own number here instead of being
+    folded into either side of the ratio.
+    """
+    return (
+        f"{passed}/{requested} requested tests passed; {runs} runs, "
+        f"{failures} failed; {skipped} explicitly skipped; "
+        f"{needs_hardware} not run for lack of hardware. Logs: {log_dir}"
+    )
 
 
 class Runner:
@@ -162,33 +236,24 @@ class Runner:
         else:
             command = self.make + [f"KERNEL_LOG={kernel_log}", f"CMDLINE={cmdline}", "justrun"]
         start = time.monotonic()
-        results, missing = {}, list(expected)
+        # A wildcard run is a different animal from the old one-name batches:
+        # `PortStressTest.*` took 511 s here in one boot, so the floor is set
+        # well clear of that rather than at it.
+        slow = selection in ("-l", "*") or "PortStressTest." in selection
+        limit = max(self.args.timeout, 1200) if slow else self.args.timeout
         with open(str(prefix) + ".host.log", "wb") as errors:
             proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=errors, start_new_session=True)
             try:
-                # A wildcard run is a different animal from the old one-name
-                # batches: `PortStressTest.*` took 511 s here in one boot, so
-                # the floor is set well clear of that rather than at it.
-                slow = selection in ("-l", "*") or "PortStressTest." in selection
-                limit = max(self.args.timeout, 1200) if slow else self.args.timeout
                 output, _ = proc.communicate(timeout=limit)
-                text = output.decode(errors="replace")
-                if selection == "-l":
-                    complete = bool(discovered_tests(text)) and "*** Exit status 0 ***" in text
-                else:
-                    # The verdict is per requested test, not per boot: with one
-                    # wildcard per run the guest also runs tests nobody asked
-                    # for, and whether THOSE fail is the expectations file's
-                    # business, not this run's.
-                    results = outcomes(text)
-                    missing = unmet(expected, results)
-                    complete = not missing
-                status = "OK" if proc.returncode == 0 and complete else "FAILED"
+                timed_out = False
             except subprocess.TimeoutExpired:
                 os.killpg(proc.pid, signal.SIGKILL)
                 output, _ = proc.communicate()
-                status = "TIMEOUT"
+                timed_out = True
         self.output = output.decode(errors="replace")
+        status, results, missing = verdict(
+            selection, self.output, expected, proc.returncode, timed_out
+        )
         Path(str(prefix) + ".guest.log").write_bytes(output)
         record = {
             "selection": selection,
@@ -218,15 +283,19 @@ class Runner:
             print(f"Diagnostics: {prefix}.kernel.log and {prefix}.host.log", flush=True)
         return status == "OK"
 
-    def finish(self, skipped):
-        (self.log_dir / "results.json").write_text(json.dumps({"skipped": skipped, "runs": self.results}, indent=2) + "\n")
+    def finish(self, skipped, needs_hardware=None):
+        needs_hardware = needs_hardware or {}
+        (self.log_dir / "results.json").write_text(
+            json.dumps({"skipped": skipped, "needs_hardware": needs_hardware, "runs": self.results}, indent=2) + "\n"
+        )
         failures = sum(result["status"] != "OK" for result in self.results)
         passed = sum(result["passed"] for result in self.results)
         requested = sum(result.get("requested", 0) for result in self.results)
-        print(
-            f"{passed}/{requested} requested tests passed; {len(self.results)} runs, "
-            f"{failures} failed; {len(skipped)} explicitly skipped. Logs: {self.log_dir}"
-        )
+        # Named one by one, with the measurement next to each: a test nobody
+        # could run here is the one outcome a bare number would read as green.
+        for name, reason in sorted(needs_hardware.items()):
+            print(f"  NOT RUN (needs hardware): {name}: {reason}")
+        print(summary_line(passed, requested, len(self.results), failures, len(skipped), len(needs_hardware), self.log_dir))
         return failures == 0 and bool(self.results)
 
 
@@ -253,24 +322,19 @@ def main():
         runner.finish({})
         return 1
     available = discovered_tests(runner.output)
-    expectations = load_expectations(args.arch, args.libos)
+    expectations, hardware = load_expectations(args.arch, args.libos)
     config = json.loads((ROOT / "scripts/test_expectations/zircon.json").read_text())
     selection = args.test or (GROUPS[args.group] if args.group else "*")
-    selected, skipped = [], {}
-    for name in sorted(available):
-        if not any(fnmatch.fnmatchcase(name, pattern) for pattern in selection.split(",")):
-            continue
-        reason = expectations.get(name, "Not yet classified for this core-tests image")
-        if name not in expectations and any(fnmatch.fnmatchcase(name, pattern) for pattern in config.get("supported", [])):
-            reason = None
-        if reason and not args.include_skipped:
-            skipped[name] = reason
-            print(f"SKIP: {name}: {reason}")
-        else:
-            selected.append(name)
+    selected, skipped, needs_hardware = triage(
+        available, selection.split(","), expectations, hardware, config.get("supported", []), args.include_skipped
+    )
+    for name, reason in sorted(needs_hardware.items()):
+        print(f"NEEDS-HARDWARE: {name}: {reason}")
+    for name, reason in sorted(skipped.items()):
+        print(f"SKIP: {name}: {reason}")
     if not selected:
         print("No runnable tests matched the selection", file=sys.stderr)
-        runner.finish(skipped)
+        runner.finish(skipped, needs_hardware)
         return 1
     # One run per wildcard, and the wildcards come from the test cases the
     # selection names. Individual names cannot be batched into one run (see
@@ -281,7 +345,7 @@ def main():
         covered = [name for name in selected if name.startswith(prefix)]
         if covered:
             runner.run(pattern, expected=covered)
-    return 0 if runner.finish(skipped) else 1
+    return 0 if runner.finish(skipped, needs_hardware) else 1
 
 
 if __name__ == "__main__":

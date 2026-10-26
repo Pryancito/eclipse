@@ -6,6 +6,11 @@ spec = importlib.util.spec_from_file_location("zircon_runner", Path(__file__).pa
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
+outcomes, unmet, verdict = runner.outcomes, runner.unmet, runner.verdict
+triage, platform_entries, summary_line = runner.triage, runner.platform_entries, runner.summary_line
+
+HARDWARE = {"Property.RegisterFsNoncanonical": "QEMU TCG lets the non-canonical WRFSBASE through"}
+
 
 class PerTestOutcomes(unittest.TestCase):
     def test_a_passing_case_is_met_and_a_missing_one_is_not(self):
@@ -45,6 +50,89 @@ class PerTestOutcomes(unittest.TestCase):
             "[  FAILED  ] 1 test, listed below:\n[  FAILED  ] Unasked.Case\n"
         )
         self.assertEqual(runner.unmet(["Asked.Case"], runner.outcomes(output)), [])
+
+
+class Verdict(unittest.TestCase):
+    PASSES = (
+        "[ RUN      ] A.One\n[       OK ] A.One (1 ms)\n"
+        "[ RUN      ] A.Two\n[       OK ] A.Two (1 ms)\n"
+    )
+
+    def test_a_killed_run_still_counts_what_came_back(self):
+        """The bug this covers: a run the timeout killed reported every
+        requested test `NOT-RUN` and `0/N passed`, with the whole log in hand.
+        A kill says the run did not finish, not that nothing ran."""
+        status, results, missing = verdict(
+            "*", self.PASSES + "[ RUN      ] A.Hangs\n", ["A.One", "A.Two", "A.Hangs"], -9, True
+        )
+        self.assertEqual(status, "TIMEOUT")
+        self.assertEqual(missing, ["A.Hangs"])
+        self.assertEqual(results["A.One"], "OK")
+        self.assertEqual(results["A.Hangs"], "DID-NOT-FINISH")
+
+    def test_a_clean_run_with_everything_met_is_ok(self):
+        status, _, missing = verdict("*", self.PASSES, ["A.One", "A.Two"], 0, False)
+        self.assertEqual((status, missing), ("OK", []))
+
+    def test_a_clean_run_is_not_ok_if_the_guest_exited_badly(self):
+        """Both halves of the guard: a run can meet every name it was asked
+        for and still have taken the whole process down afterwards."""
+        status, _, missing = verdict("*", self.PASSES, ["A.One", "A.Two"], 1, False)
+        self.assertEqual((status, missing), ("FAILED", []))
+        status, _, missing = verdict("*", self.PASSES, ["A.One", "A.Three"], 0, False)
+        self.assertEqual((status, missing), ("FAILED", ["A.Three"]))
+
+    def test_the_listing_pass_is_judged_by_the_catalog_and_the_exit_line(self):
+        listing = "startup\nSuite\n  .One\n*** Exit status 0 ***"
+        self.assertEqual(verdict("-l", listing, [], 0, False)[0], "OK")
+        # A catalog that came back empty, or a boot that did not reach the exit
+        # line, is not a listing however clean the exit code looks.
+        self.assertEqual(verdict("-l", "*** Exit status 0 ***", [], 0, False)[0], "FAILED")
+        self.assertEqual(verdict("-l", "startup\nSuite\n  .One\n", [], 0, False)[0], "FAILED")
+        self.assertEqual(verdict("-l", listing, [], 0, True)[0], "TIMEOUT")
+
+
+class NeedsHardware(unittest.TestCase):
+    """A case measured to be unreachable on an emulated CPU is neither run nor
+    skipped quietly: it keeps its name, its reason and its own number."""
+
+    catalog = ["Property.RegisterFs", "Property.RegisterFsNoncanonical"]
+
+    def triage(self, include_skipped=False):
+        return triage(self.catalog, ["*"], {"Property.RegisterFs": None}, HARDWARE, [], include_skipped)
+
+    def test_it_is_never_asked_of_the_guest_and_never_counted_as_passed(self):
+        selected, skipped, needs_hardware = self.triage()
+        self.assertEqual(selected, ["Property.RegisterFs"])
+        self.assertEqual(needs_hardware, HARDWARE)
+        self.assertNotIn("Property.RegisterFsNoncanonical", skipped)
+
+    def test_the_reason_travels_with_the_name(self):
+        _, _, needs_hardware = self.triage()
+        self.assertIn("WRFSBASE", needs_hardware["Property.RegisterFsNoncanonical"])
+
+    def test_debugging_can_still_opt_into_running_it(self):
+        selected, _, needs_hardware = self.triage(include_skipped=True)
+        self.assertEqual(selected, self.catalog)
+        self.assertEqual(needs_hardware, {})
+
+    def test_it_is_not_swallowed_by_the_unclassified_bucket(self):
+        """Without the category it was one more `Not yet classified` line, which
+        reads as `we have not looked at it` rather than `it cannot run here`."""
+        _, skipped, needs_hardware = triage(self.catalog, ["*"], {}, {}, [], False)
+        self.assertEqual(skipped["Property.RegisterFsNoncanonical"], runner.UNCLASSIFIED)
+        self.assertEqual(needs_hardware, {})
+
+    def test_the_summary_line_gives_it_its_own_number(self):
+        line = summary_line(5, 20, 1, 0, 3, 1, "target/test-logs")
+        self.assertIn("5/20 requested tests passed", line)
+        self.assertIn("1 not run for lack of hardware", line)
+
+    def test_an_entry_only_applies_to_the_platforms_it_names(self):
+        entries = [{"test": "Suite.Case", "platforms": ["x86_64-bare"], "reason": "why"}]
+        self.assertEqual(platform_entries(entries, "x86_64-bare"), {"Suite.Case": "why"})
+        self.assertEqual(platform_entries(entries, "x86_64-libos"), {})
+        self.assertEqual(platform_entries([], "x86_64-bare"), {})
 
 
 class GuestFilters(unittest.TestCase):
