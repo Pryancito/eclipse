@@ -807,8 +807,21 @@ pub fn pdisp_kill_arm() {
     PDISP_KILL_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Disarm the PDISP experiment (boot returned or never triggered).
+/// Leave the PDISP window: give the display engine back if the trigger took
+/// it, then cancel an arm that never fired.
+///
+/// **The restore comes first and is the point of this call.** Clearing
+/// `PDISP_RESTORE_PENDING` on its own -- which is all this used to do --
+/// turns "the boot never reached its restore anchor" into "PDISP stays in
+/// engine reset until the next reboot", because `pdisp_restore` returns
+/// early unless that flag is set. From the outside that is a monitor that
+/// goes dark when the card is handed over and never comes back, which is
+/// exactly what the first hardware boot of the window reported. The order
+/// lives here rather than in the callers: both of them (`BootWindow` and
+/// `/proc/gpustep12`) had it wrong, and a caller that forgets costs a
+/// screen until reboot.
 pub fn pdisp_kill_disarm() {
+    pdisp_restore();
     PDISP_KILL_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
     PDISP_RESTORE_PENDING.store(false, core::sync::atomic::Ordering::Relaxed);
 }

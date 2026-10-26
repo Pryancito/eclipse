@@ -93,7 +93,8 @@ pub fn gpu_trace_enabled() -> bool {
 }
 
 /// Hold the console GPU's display engine in reset across the SEC2 HS-resume
-/// window of its own GSP boot. **Default on**, hatch `nvidia.nodispoff`.
+/// window of its own GSP boot. **Default OFF**, opt in with `nvidia.dispoff`
+/// (`nvidia.nodispoff` also still turns it off, so old cmdlines keep working).
 ///
 /// This is what Linux does and Eclipse did not. At PCI probe Linux calls
 /// `drm_aperture_remove_conflicting_pci_framebuffers`: the firmware
@@ -114,10 +115,34 @@ pub fn gpu_trace_enabled() -> bool {
 /// the manual `/proc/gpustep12`, so it was never run together with the rest of
 /// the bring-up: PDISP (`NV_PMC_ENABLE` bit 30) is cleared the moment
 /// `kgspCalculateFbLayout` has consumed `NV_PDISP_VGA_WORKSPACE_BASE`, and
-/// restored on the RM's own "RISCV started" line -- past the wedge window, and
-/// before GSP-RM's init needs the display engine alive. The monitor loses
-/// signal for that stretch instead of showing a frozen picture.
-static DISPLAY_OFF_FOR_GSP: AtomicBool = AtomicBool::new(true);
+/// restored once the SEC2 window is past, before GSP-RM's init needs the
+/// display engine alive. The monitor loses signal for that stretch instead of
+/// showing a frozen picture.
+///
+/// ## Why this ships OFF
+///
+/// It was on by default for exactly one hardware boot, and that boot never got
+/// its picture back: "al arrancar el entorno grafico el monitor pierde senal y
+/// no se recupera". Two things were wrong with it and only the first is fixed:
+///
+/// 1. Leaving the window CANCELLED the pending restore instead of running it
+///    (`pdisp_kill_disarm` cleared `PDISP_RESTORE_PENDING`, which is the very
+///    flag `pdisp_restore` early-returns on), so any boot that did not reach
+///    its restore anchor left PDISP in reset until the next reboot. That is
+///    now fixed in `pdisp_kill_disarm` itself.
+/// 2. **Coming out of engine-level reset is not the same as a picture.**
+///    `pdisp_restore` writes `NV_PMC_ENABLE` back and nothing else; the CRTC
+///    timings, the scanout surface address, the PLLs and the SOR link that the
+///    VBIOS programmed at POST are gone with the reset, and nothing in Eclipse
+///    reprograms them. Linux never has this problem because it does not reset
+///    PDISP at all: it unbinds the firmware framebuffer and then does a full
+///    modeset of its own. The original EXP1 comment says as much in writing --
+///    "one-way for the boot: the console goes dark until reboot".
+///
+/// So the hand-over stays available and off until a boot shows the monitor
+/// coming back, because the failure mode costs the screen for the whole
+/// session and there is no way to read a log without one.
+static DISPLAY_OFF_FOR_GSP: AtomicBool = AtomicBool::new(false);
 
 pub fn set_display_off_for_gsp(v: bool) {
     DISPLAY_OFF_FOR_GSP.store(v, Ordering::Relaxed);

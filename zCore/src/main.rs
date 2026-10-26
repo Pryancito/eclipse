@@ -1161,14 +1161,20 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // with `nvidia.noconsole_gpu` answered `waiting` forever, and init
             // held the session back for its whole timeout on a bring-up nobody
             // had asked for.
-            // `nvidia.nodispoff` keeps the console card's display engine
-            // running across its own GSP boot, the way every boot before this
-            // did. The default is to hand the display over for that window,
-            // like Linux: see `boot_window`.
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nodispoff") {
-                kernel_hal::drivers::set_display_off_for_gsp(false);
+            // `nvidia.dispoff` hands the console card's display engine over
+            // to its firmware for the SEC2 window of its own GSP boot. OFF by
+            // default: the one hardware boot that ran it with the default on
+            // lost the monitor for the whole session, because coming out of
+            // PDISP reset restores `NV_PMC_ENABLE` and not the scanout state
+            // the VBIOS programmed. See `display_off_for_gsp`.
+            // `nvidia.nodispoff` still turns it off, so a cmdline written
+            // against the old default keeps meaning what it meant.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.dispoff")
+                && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nodispoff")
+            {
+                kernel_hal::drivers::set_display_off_for_gsp(true);
                 klog_info!(
-                    "Eclipse: nvidia.nodispoff — el motor de display sigue encendido durante el arranque del GSP de consola"
+                    "Eclipse: nvidia.dispoff — el motor de display se apaga durante la ventana SEC2 del GSP de consola (la pantalla puede no volver hasta reiniciar)"
                 );
             }
             linux_object::fs::devfs::drm::set_console_bringup_expected(want_console_gpu);
