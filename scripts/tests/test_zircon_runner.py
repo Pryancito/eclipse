@@ -6,6 +6,8 @@ spec = importlib.util.spec_from_file_location("zircon_runner", Path(__file__).pa
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
+outcomes, unmet, verdict = runner.outcomes, runner.unmet, runner.verdict
+
 
 class PerTestOutcomes(unittest.TestCase):
     def test_a_passing_case_is_met_and_a_missing_one_is_not(self):
@@ -45,6 +47,46 @@ class PerTestOutcomes(unittest.TestCase):
             "[  FAILED  ] 1 test, listed below:\n[  FAILED  ] Unasked.Case\n"
         )
         self.assertEqual(runner.unmet(["Asked.Case"], runner.outcomes(output)), [])
+
+
+class Verdict(unittest.TestCase):
+    PASSES = (
+        "[ RUN      ] A.One\n[       OK ] A.One (1 ms)\n"
+        "[ RUN      ] A.Two\n[       OK ] A.Two (1 ms)\n"
+    )
+
+    def test_a_killed_run_still_counts_what_came_back(self):
+        """The bug this covers: a run the timeout killed reported every
+        requested test `NOT-RUN` and `0/N passed`, with the whole log in hand.
+        A kill says the run did not finish, not that nothing ran."""
+        status, results, missing = verdict(
+            "*", self.PASSES + "[ RUN      ] A.Hangs\n", ["A.One", "A.Two", "A.Hangs"], -9, True
+        )
+        self.assertEqual(status, "TIMEOUT")
+        self.assertEqual(missing, ["A.Hangs"])
+        self.assertEqual(results["A.One"], "OK")
+        self.assertEqual(results["A.Hangs"], "DID-NOT-FINISH")
+
+    def test_a_clean_run_with_everything_met_is_ok(self):
+        status, _, missing = verdict("*", self.PASSES, ["A.One", "A.Two"], 0, False)
+        self.assertEqual((status, missing), ("OK", []))
+
+    def test_a_clean_run_is_not_ok_if_the_guest_exited_badly(self):
+        """Both halves of the guard: a run can meet every name it was asked
+        for and still have taken the whole process down afterwards."""
+        status, _, missing = verdict("*", self.PASSES, ["A.One", "A.Two"], 1, False)
+        self.assertEqual((status, missing), ("FAILED", []))
+        status, _, missing = verdict("*", self.PASSES, ["A.One", "A.Three"], 0, False)
+        self.assertEqual((status, missing), ("FAILED", ["A.Three"]))
+
+    def test_the_listing_pass_is_judged_by_the_catalog_and_the_exit_line(self):
+        listing = "startup\nSuite\n  .One\n*** Exit status 0 ***"
+        self.assertEqual(verdict("-l", listing, [], 0, False)[0], "OK")
+        # A catalog that came back empty, or a boot that did not reach the exit
+        # line, is not a listing however clean the exit code looks.
+        self.assertEqual(verdict("-l", "*** Exit status 0 ***", [], 0, False)[0], "FAILED")
+        self.assertEqual(verdict("-l", "startup\nSuite\n  .One\n", [], 0, False)[0], "FAILED")
+        self.assertEqual(verdict("-l", listing, [], 0, True)[0], "TIMEOUT")
 
 
 class GuestFilters(unittest.TestCase):

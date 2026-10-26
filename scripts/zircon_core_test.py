@@ -54,6 +54,31 @@ def unmet(expected, results):
     return [name for name in expected if results.get(name) not in ("OK", "SKIPPED")]
 
 
+def verdict(selection, text, expected, returncode, timed_out):
+    """The status of one run, plus what came back and what did not.
+
+    Pure on purpose, and the reason is the bug it fixes: the verdict used to be
+    computed only on the path where the guest exited by itself. A run the
+    timeout killed reported `0/N requested passed` with every name `NOT-RUN`,
+    even with the whole log in hand -- 408 `[       OK ]` lines in the run that
+    made this obvious. A kill says the run did not *finish*; it says nothing
+    about the tests that did, and hiding them makes progress look like none.
+    """
+    results, missing = {}, list(expected)
+    if selection == "-l":
+        complete = bool(discovered_tests(text)) and "*** Exit status 0 ***" in text
+    else:
+        # The verdict is per requested test, not per boot: with one wildcard
+        # per run the guest also runs tests nobody asked for, and whether
+        # THOSE fail is the expectations file's business, not this run's.
+        results = outcomes(text)
+        missing = unmet(expected, results)
+        complete = not missing
+    if timed_out:
+        return "TIMEOUT", results, missing
+    return ("OK" if returncode == 0 and complete else "FAILED"), results, missing
+
+
 def guest_filters(patterns):
     """One `--gtest_filter` pattern per run, because the guest takes ONE.
 
@@ -162,33 +187,24 @@ class Runner:
         else:
             command = self.make + [f"KERNEL_LOG={kernel_log}", f"CMDLINE={cmdline}", "justrun"]
         start = time.monotonic()
-        results, missing = {}, list(expected)
+        # A wildcard run is a different animal from the old one-name batches:
+        # `PortStressTest.*` took 511 s here in one boot, so the floor is set
+        # well clear of that rather than at it.
+        slow = selection in ("-l", "*") or "PortStressTest." in selection
+        limit = max(self.args.timeout, 1200) if slow else self.args.timeout
         with open(str(prefix) + ".host.log", "wb") as errors:
             proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=errors, start_new_session=True)
             try:
-                # A wildcard run is a different animal from the old one-name
-                # batches: `PortStressTest.*` took 511 s here in one boot, so
-                # the floor is set well clear of that rather than at it.
-                slow = selection in ("-l", "*") or "PortStressTest." in selection
-                limit = max(self.args.timeout, 1200) if slow else self.args.timeout
                 output, _ = proc.communicate(timeout=limit)
-                text = output.decode(errors="replace")
-                if selection == "-l":
-                    complete = bool(discovered_tests(text)) and "*** Exit status 0 ***" in text
-                else:
-                    # The verdict is per requested test, not per boot: with one
-                    # wildcard per run the guest also runs tests nobody asked
-                    # for, and whether THOSE fail is the expectations file's
-                    # business, not this run's.
-                    results = outcomes(text)
-                    missing = unmet(expected, results)
-                    complete = not missing
-                status = "OK" if proc.returncode == 0 and complete else "FAILED"
+                timed_out = False
             except subprocess.TimeoutExpired:
                 os.killpg(proc.pid, signal.SIGKILL)
                 output, _ = proc.communicate()
-                status = "TIMEOUT"
+                timed_out = True
         self.output = output.decode(errors="replace")
+        status, results, missing = verdict(
+            selection, self.output, expected, proc.returncode, timed_out
+        )
         Path(str(prefix) + ".guest.log").write_bytes(output)
         record = {
             "selection": selection,
