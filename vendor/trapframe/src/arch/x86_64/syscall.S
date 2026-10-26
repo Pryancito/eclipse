@@ -32,11 +32,19 @@ syscall_return:
     # already holds (`gs:[FS_CACHE]`, `gs:[GS_CACHE]`). A thread going back to
     # the CPU it trapped on -- every syscall that does not block -- finds both
     # equal and pays for no WRMSR at all; it paid two on every return, and two
-    # RDMSRs on every entry to read back values that cannot have changed:
-    # CR4.FSGSBASE is clear, so ring 3 has no way to move either base except
-    # `arch_prctl`, which writes the saved context and so comes back through
-    # here. The entry paths therefore leave the two slots alone, and they still
-    # hold what was loaded from them.
+    # RDMSRs on every entry to read back values that cannot have changed.
+    #
+    # What makes the cache answerable is what the entry path does with the two
+    # slots, and that now depends on CR4.FSGSBASE:
+    #   - clear: ring 3 has no way to move either base except a syscall that
+    #     writes the saved context and so comes back through here, so the entry
+    #     paths leave the slots alone and they still hold what was loaded from
+    #     them.
+    #   - set: ring 3 can move them with WRFSBASE/WRGSBASE, so the entry path
+    #     reads the live bases back into the slots AND into this cache (see
+    #     trap_syscall_entry below). The compare then still decides correctly:
+    #     it is comparing against what the MSR really holds, which is the only
+    #     thing it ever claimed to be.
     #
     # The user GSBASE goes into KERNEL_GS_BASE while the kernel's GS is still
     # active (`gs:` is the per-CPU region until the `swapgs`), and the `swapgs`
@@ -168,7 +176,33 @@ trap_syscall_entry:
     # el GeneralRegs (rsp apunta ahora al slot de rax = base de GeneralRegs).
     mov gs:[{DBG_OFF}], rsp
 
-    # fsbase and gsbase are not read back: see `syscall_return`.
+    # Read the two user bases back, but only on a CPU where ring 3 can move
+    # them itself (CR4.FSGSBASE; per-CPU flag set by
+    # gdt::enable_user_fsgsbase). With the flag clear the slots already hold
+    # what syscall_return loaded, and this would be an RDFSBASE and an RDMSR on
+    # every single syscall for nothing, which is what the comment up in
+    # syscall_return is about. With the flag set they are the price of letting
+    # ring 3 move a base the kernel then has to find out about; FSGSBASE=0 on
+    # the kernel command line buys the old fixed cost back.
+    cmp byte ptr gs:[{FSGS_FLAG}], 0
+    je 7f
+    rdfsbase rax
+    mov [rsp + 18*8], rax
+    mov gs:[{FS_CACHE}], rax
+    # The user GSBASE is in KERNEL_GS_BASE, put there by the swapgs of the
+    # entry, so rdgsbase here would read the kernel's. Read the MSR rather than
+    # bracket a rdgsbase in a swapgs pair: an NMI or #MC taken inside that pair
+    # enters through __from_kernel, which does not swap, and would run the
+    # kernel handler with the user base loaded in GS.
+    mov ecx, 0xC0000102
+    rdmsr                   # edx:eax = user gsbase
+    shl rdx, 32
+    or rax, rdx
+    mov [rsp + 19*8], rax
+    mov gs:[{GS_CACHE}], rax
+7:
+    # rax, rcx and rdx are already saved in the frame above, so the block is
+    # free to use them.
 
     # restore callee-saved registers
     mov rsp, gs:4           # load kernel rsp <- TSS.sp0

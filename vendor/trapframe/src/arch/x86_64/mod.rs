@@ -16,8 +16,8 @@ mod trap;
 pub use fncall::syscall_fn_entry;
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 pub use gdt::{
-    logical_cpu_id_valid, read_cpu_local, read_logical_cpu_id, write_cpu_local,
-    write_logical_cpu_id,
+    enable_user_fsgsbase, logical_cpu_id_valid, read_cpu_local, read_logical_cpu_id,
+    user_fsgsbase_enabled, write_cpu_local, write_logical_cpu_id,
 };
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 pub use syscall::dbg_save_addr;

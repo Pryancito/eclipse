@@ -508,6 +508,19 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             kernel_hal::timer::set_force_tsc_invariant(true);
             klog_info!("Eclipse: vDSO forced on despite CPUID (VDSOFORCE=1)");
         }
+        // `FSGSBASE=0` takes `RD/WRFSBASE` and `RD/WRGSBASE` away from user
+        // mode again. Default on, because the kernel does not intercept
+        // `CPUID` and so cannot hide the feature from a userspace that reads
+        // it -- see `kernel_hal::cpu::init_user_fsgsbase`. The hatch is here
+        // because turning it on also puts an MSR read on every entry from user
+        // mode (the entry stubs have to read back a base ring 3 can now move),
+        // so a suspected regression in either direction can be bisected by
+        // rebooting instead of by rebuilding.
+        #[cfg(target_arch = "x86_64")]
+        if kernel_hal::cmdline::is_off(&options.cmdline, "FSGSBASE") {
+            kernel_hal::cpu::set_user_fsgsbase_allowed(false);
+            klog_info!("Eclipse: user-mode FSGSBASE DISABLED (FSGSBASE=0)");
+        }
         // SMP master switch. Default ON; `smp=off` forces a single-core boot.
         //
         // This used to default off because multi-core wedged real hardware at
