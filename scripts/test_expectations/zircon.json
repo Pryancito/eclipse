@@ -625,6 +625,15 @@
       "reason": "SMP child-process teardown can reboot the kernel after assertions pass (CI 34018139132; reproduced with InfoProcessBadAvailIsInvalidArg)."
     }
   ],
+  "needs_hardware": [
+    {
+      "test": "Property.RegisterFsNoncanonical",
+      "platforms": [
+        "*"
+      ],
+      "reason": "QEMU TCG does not #GP on the non-canonical WRFSBASE the test issues, so the write takes effect and the #GP arrives later on an FS-relative access: regs.rip is not the write instruction and the test's FATAL_PAGE_FAULT/cr2 assertions get General instead. Measured in the guest: both exceptions trap_num 0xd error_code 0x0, and the saved context already carries fsbase 0x1010101010101010 with no set_property in between. The kernel's own validation is correct and unit-tested (is_canonical_user_addr, zircon-syscall/src/object.rs). Needs real hardware."
+    }
+  ],
   "supported": [
     "ChannelCallEtcTest.*",
     "ChannelWriteEtcTest.*",
