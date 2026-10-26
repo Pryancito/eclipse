@@ -238,6 +238,10 @@ pub use boot_edid::{boot_edid, set_boot_edid};
 mod gem_free_queue;
 mod gpu_ready;
 
+/// The CRTC and plane ids a card advertises, which used to be the SAME two
+/// literals on every card; own file for the size ceiling.
+mod kms_ids;
+
 /// The bring-up narration switch; own file for the size ceiling, no logic
 /// change.
 mod boot_window;
@@ -562,6 +566,16 @@ pub struct NvidiaGpu {
     /// One past the last handle this GPU may hand out. `GEM_NEW` refuses
     /// instead of walking into the next card's slice.
     nouveau_gem_handle_end: u32,
+    /// This card's slot in the per-card DRM id space, reserved once at
+    /// construction, from which its CRTC and primary-plane ids are derived
+    /// ([`kms_ids`]). Same problem as the GEM handle slice above and the
+    /// same answer: the ids go into a table the DRM core keys by number
+    /// alone, so two cards counting from the same base collide -- and the
+    /// core de-duplicates, which made the second card's CRTC vanish. Not
+    /// the RM instance (`None` until bring-up, which is exactly when both
+    /// cards answered 2001) and not the `/dev/dri` minor (a card can own
+    /// more than one node).
+    kms_slot: u32,
     /// Active `VM_BIND` GPU-VA mappings, so `UNMAP` can find the RM handle
     /// to tear down.
     nouveau_vm_mappings: Mutex<Vec<super::nouveau_uapi::NouveauVmMapping>>,
@@ -913,6 +927,8 @@ impl NvidiaGpu {
         // the tables these handles key into are global and have no GPU in
         // their key (see drivers/src/scheme/gem_mmap.rs).
         let gem_handle_slice = crate::scheme::gem_mmap::alloc_handle_slice();
+        // And one slot of the per-card DRM id space, for the same reason.
+        let kms_slot = kms_ids::alloc_kms_slot();
 
         Ok(Self {
             name,
@@ -958,6 +974,7 @@ impl NvidiaGpu {
             // these ids are global. See drivers/src/scheme/gem_mmap.rs.
             nouveau_gem_next_handle: AtomicU32::new(gem_handle_slice.base()),
             nouveau_gem_handle_end: gem_handle_slice.end(),
+            kms_slot,
             nouveau_vm_mappings: Mutex::new(Vec::new()),
             nouveau_uvmm: Mutex::new(Vec::new()),
             nouveau_nvif_devices: Mutex::new(Vec::new()),
@@ -3169,6 +3186,18 @@ impl NvidiaGpu {
     /// the synthetic software-KMS ids (1..3) or the legacy fallback (1001).
     fn rm_connector_id(instance: u32, bit: u32) -> u32 {
         1001 + 100 * instance + bit
+    }
+
+    /// This card's DRM CRTC id. See [`kms_ids`] for why it comes from a slot
+    /// reserved at construction and not from the RM instance the connector
+    /// ids use.
+    fn kms_crtc_id(&self) -> u32 {
+        kms_ids::crtc_id(self.kms_slot)
+    }
+
+    /// This card's DRM primary-plane id. See [`Self::kms_crtc_id`].
+    fn kms_plane_id(&self) -> u32 {
+        kms_ids::plane_id(self.kms_slot)
     }
 
     /// Resolve a DRM connector id back to the RM output bit it names.
@@ -8116,14 +8145,20 @@ impl DrmScheme for NvidiaGpu {
         // GET_SUPPORTED): one connector per physical output bit. Until this
         // GPU's bring-up chain has run, fall back to the legacy synthetic
         // connector so pre-init userspace behaviour is unchanged.
+        // The CRTC is THIS card's (`kms_ids`), not the literal 2001 every
+        // card used to answer: the DRM core merges every card's topology
+        // into one list and de-duplicates by id, so two cards claiming 2001
+        // left the second card with no CRTC at all. A one-card box still
+        // sees 2001, which is slot 0.
+        let crtc = self.kms_crtc_id();
         if let Some((instance, d)) = self.rm_display_state() {
             let conns: Vec<u32> = (0..32u32)
                 .filter(|b| d.display_mask & (1 << b) != 0)
                 .map(|b| Self::rm_connector_id(instance, b))
                 .collect();
-            return (Vec::new(), alloc::vec![2001], conns);
+            return (Vec::new(), alloc::vec![crtc], conns);
         }
-        (Vec::new(), alloc::vec![2001], alloc::vec![1001])
+        (Vec::new(), alloc::vec![crtc], alloc::vec![1001])
     }
 
     fn get_connector(&self, id: u32) -> Option<DrmConnector> {
@@ -8175,7 +8210,7 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn get_crtc(&self, id: u32) -> Option<DrmCrtc> {
-        if id == 2001 {
+        if id == self.kms_crtc_id() {
             let state = self.kms_state.lock();
             Some(DrmCrtc {
                 id,
@@ -8189,11 +8224,11 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn get_plane(&self, id: u32) -> Option<DrmPlane> {
-        if id == 3001 {
+        if id == self.kms_plane_id() {
             let state = self.kms_state.lock();
             Some(DrmPlane {
                 id,
-                crtc_id: 2001,
+                crtc_id: self.kms_crtc_id(),
                 fb_id: state.plane_fb,
                 possible_crtcs: 1,
                 plane_type: 1,
@@ -8204,7 +8239,7 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn get_planes(&self) -> Vec<u32> {
-        alloc::vec![3001]
+        alloc::vec![self.kms_plane_id()]
     }
 
     fn set_plane(
@@ -8221,7 +8256,7 @@ impl DrmScheme for NvidiaGpu {
         _src_w: u32,
         _src_h: u32,
     ) -> bool {
-        if plane_id != 3001 {
+        if plane_id != self.kms_plane_id() {
             return false;
         }
         if fb_id == 0 {

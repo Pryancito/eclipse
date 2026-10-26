@@ -191,6 +191,76 @@ fn the_resources_before_the_rm_are_the_one_crtc_and_the_synthetic_connector() {
     assert!(DrmScheme::get_crtc(&gpu, 2002).is_none());
 }
 
+/// The CRTC and the primary plane a card advertises are **its own**, not the
+/// literals `2001` and `3001` every card used to answer.
+///
+/// That collision is invisible from one card and fatal from two: the DRM
+/// core merges every card's topology into one list and de-duplicates by id,
+/// so of two cards claiming CRTC 2001 the second simply had no CRTC, and a
+/// CRTC nobody can name cannot be given a framebuffer to scan out. The
+/// arithmetic has its own tests in `kms_ids`; what this pins down is that
+/// these four arms ask the card.
+#[test]
+fn a_second_card_advertises_its_own_crtc_and_plane_and_refuses_the_first_cards() {
+    let _g = LOCK.lock();
+    nv::set_enabled(true);
+    let second = NvidiaGpu::for_test_in_kms_slot(0x1f06, 8192, 1);
+    let (crtc, plane) = (
+        crate::display::nvidia::kms_ids::crtc_id(1),
+        crate::display::nvidia::kms_ids::plane_id(1),
+    );
+    assert_ne!(crtc, 2001);
+    assert_ne!(plane, 3001);
+
+    assert_eq!(
+        DrmScheme::get_resources(&second),
+        (Vec::new(), alloc::vec![crtc], alloc::vec![1001]),
+        "its own CRTC, so the core's de-duplication has nothing to drop"
+    );
+    assert_eq!(DrmScheme::get_planes(&second), alloc::vec![plane]);
+
+    second.kms_state.lock().crtc_fb = 91;
+    let c = DrmScheme::get_crtc(&second, crtc).expect("its own CRTC");
+    assert_eq!((c.id, c.fb_id), (crtc, 91));
+    assert!(
+        DrmScheme::get_crtc(&second, 2001).is_none(),
+        "2001 is the FIRST card's CRTC: this one must not answer for it"
+    );
+
+    second.kms_state.lock().plane_fb = 92;
+    let p = DrmScheme::get_plane(&second, plane).expect("its own plane");
+    assert_eq!(
+        (p.id, p.crtc_id, p.fb_id),
+        (plane, crtc, 92),
+        "and the plane names ITS card's CRTC, not the first card's"
+    );
+    assert!(
+        DrmScheme::get_plane(&second, 3001).is_none(),
+        "3001 is the first card's plane"
+    );
+
+    // `set_plane`'s gate is the same id, so the first card's plane id is not
+    // a way to drive this card's. Framebuffer 0 is the unlatch, which is the
+    // one case `set_plane` serves without a framebuffer this GPU owns:
+    // whether the plane came unlatched tells the refusal from the acceptance.
+    assert!(!DrmScheme::set_plane(
+        &second, 3001, crtc, 0, 0, 0, 16, 16, 0, 0, 0, 0
+    ));
+    assert_eq!(
+        second.kms_state.lock().plane_fb,
+        92,
+        "refused, so the plane still carries what it carried"
+    );
+    assert!(DrmScheme::set_plane(
+        &second, plane, crtc, 0, 0, 0, 16, 16, 0, 0, 0, 0
+    ));
+    assert_eq!(
+        second.kms_state.lock().plane_fb,
+        0,
+        "its own id unlatches it"
+    );
+}
+
 /// `pitch_pixels`: an explicit override wins; a mode with no size has
 /// no padding to infer; an aperture of 16 MiB or more is not the small
 /// mapping the inference is for; otherwise the aperture divided by the
