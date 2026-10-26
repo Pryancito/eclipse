@@ -395,9 +395,26 @@ cfg_if! {
         /// Repaint the active VT from its backing buffer.
         ///
         /// Used when returning from `KD_GRAPHICS` to `KD_TEXT`: a userspace
-        /// graphics server may have overwritten the framebuffer.
+        /// graphics server may have overwritten the framebuffer. By then the
+        /// mode is already `KD_TEXT`, so the gate below lets that case through
+        /// -- it only stops a repaint onto a VT a compositor still owns.
+        ///
+        /// That gate is the same one `scroll_active_vt` and `blink_active_vt`
+        /// carry, and this was the remaining hole. The deferred console-GPU
+        /// bring-up calls this to put the screen back when its window closes,
+        /// and on the graphics VT that painted the text console OVER a running
+        /// labwc: the pause had already told the compositor every flip
+        /// completed, so it had nothing to redraw and the console stayed up for
+        /// the rest of the session. The desktop was alive behind it the whole
+        /// time -- the frame it should have shown is the one
+        /// `repaint_if_scanout_stale` had just put back, a few microseconds
+        /// before this erased it.
         pub(crate) fn redraw_graphic_console_impl() {
-            let _ = with_vt_try(ACTIVE_VT.load(Ordering::SeqCst), |g| {
+            let vt = ACTIVE_VT.load(Ordering::SeqCst);
+            if !present_allowed(vt) {
+                return;
+            }
+            let _ = with_vt_try(vt, |g| {
                 g.repaint();
             });
         }
