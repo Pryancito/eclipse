@@ -1,5 +1,5 @@
-//! Why an ioctl of wlroots' legacy CRTC-disable was refused, and what the
-//! disable itself did. Out of `drm_scheme.rs` for its size ceiling.
+//! The four ioctls of wlroots' legacy CRTC-disable, as they arrive and as
+//! they end. Out of `drm_scheme.rs` for its size ceiling.
 
 use super::*;
 
@@ -7,8 +7,20 @@ use super::*;
 /// file watches belongs to a modeset or a cursor change at startup and
 /// teardown, not to a frame, so a handful covers a whole session of a
 /// compositor coming and going.
-const TRACE_BUDGET: u32 = 24;
+const TRACE_BUDGET: u32 = 48;
 static TRACED: AtomicU32 = AtomicU32::new(0);
+
+/// A cursor BITMAP change gets a budget of its own, and a small one.
+///
+/// It is the only call here a running desktop repeats: the pointer shape
+/// changes whenever it crosses a window edge or a text field, so on the
+/// shared budget it would burn through the whole allowance long before the
+/// teardown this file exists to narrate. A separate counter means the
+/// `DPMS`/`SETCRTC`/`GETFB` lines of a disable can never be starved by
+/// pointer-shape churn, and the first few shapes are still shown -- which is
+/// what says whether a bitmap reaches us at all.
+const CURSOR_BO_BUDGET: u32 = 16;
+static CURSOR_BO_TRACED: AtomicU32 = AtomicU32::new(0);
 
 /// Say, at `error!`, which check refused a call of the legacy disable path.
 ///
@@ -56,6 +68,70 @@ pub(super) fn kms_disabled(crtc_id: u32) {
             "[drm] SETCRTC crtc={} disable (no mode, no connectors) -> OK, pipe off{}",
             crtc_id,
             tail(n)
+        );
+    }
+}
+
+/// Call 1 of the disable: the connector's `DPMS` property. `off` is any
+/// value but `DRM_MODE_DPMS_ON`.
+pub(super) fn dpms_set(connector_id: u32, value: u64) {
+    let n = TRACED.fetch_add(1, Ordering::Relaxed);
+    if n < TRACE_BUDGET {
+        log::error!(
+            "[drm] SETPROPERTY connector={} DPMS={} -> OK{}",
+            connector_id,
+            value,
+            tail(n)
+        );
+    }
+}
+
+/// Call 2, as it arrives. `mode_valid = 0` with `count_connectors = 0` is
+/// the disable; anything else is a modeset and not this path.
+pub(super) fn setcrtc_called(crtc_id: u32, fb_id: u32, mode_valid: u32, conns: u32) {
+    let n = TRACED.fetch_add(1, Ordering::Relaxed);
+    if n < TRACE_BUDGET {
+        log::error!(
+            "[drm] SETCRTC crtc={} fb={} mode_valid={} connectors={}{}",
+            crtc_id,
+            fb_id,
+            mode_valid,
+            conns,
+            tail(n)
+        );
+    }
+}
+
+/// Call 3, once it has found the framebuffer: wlroots asks for the cursor
+/// buffer's GEM handle here, and a `handle = 0` is the answer a client that
+/// is not the master or root gets.
+pub(super) fn getfb_served(fb_id: u32, handle: u32) {
+    let n = TRACED.fetch_add(1, Ordering::Relaxed);
+    if n < TRACE_BUDGET {
+        log::error!("[drm] GETFB fb={} -> handle={}{}", fb_id, handle, tail(n));
+    }
+}
+
+/// Call 4, as it arrives, for a BITMAP change only (a pure `MOVE` is a
+/// pointer motion and is not part of a disable).
+///
+/// A `handle = 0` here is "hide the pointer", which is what the disable
+/// sends; a non-zero one is a shape, and the line after it says whether its
+/// pixels could be reached.
+pub(super) fn cursor_bo_called(crtc_id: u32, handle: u32, w: u32, h: u32) {
+    let n = CURSOR_BO_TRACED.fetch_add(1, Ordering::Relaxed);
+    if n < CURSOR_BO_BUDGET {
+        log::error!(
+            "[drm] CURSOR crtc={} bitmap handle={} {}x{}{}",
+            crtc_id,
+            handle,
+            w,
+            h,
+            if n + 1 == CURSOR_BO_BUDGET {
+                " [further cursor bitmaps not traced]"
+            } else {
+                ""
+            }
         );
     }
 }
