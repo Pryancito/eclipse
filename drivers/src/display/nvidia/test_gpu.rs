@@ -12,6 +12,19 @@ impl NvidiaGpu {
     /// RM never attached, and it is enough for every arm that is
     /// bookkeeping rather than hardware.
     pub(super) fn for_test(device_id: u16, vram_size_mb: u32) -> Self {
+        Self::for_test_in_kms_slot(device_id, vram_size_mb, super::kms_ids::test_kms_slot())
+    }
+
+    /// [`Self::for_test`] as a card that is NOT the first: the second (or
+    /// later) card of a box, with the KMS id slot such a card would have
+    /// reserved at construction.
+    ///
+    /// This exists because slot 0 cannot tell the arithmetic from the
+    /// plumbing. `kms_ids` has its own tests for `crtc_id(slot)`; what only
+    /// a second card can show is that `get_crtc`, `get_plane`, `get_planes`
+    /// and `set_plane` answer with **this card's** ids -- which is exactly
+    /// what the literals `2001` and `3001` in those four arms got wrong.
+    pub(super) fn for_test_in_kms_slot(device_id: u16, vram_size_mb: u32, kms_slot: u32) -> Self {
         // Zeros, 16 MiB of them: the GR hang probe reads BAR0 up to
         // 0x00bb_0090. `vec![0; n]` is `alloc_zeroed`, so the pages that are
         // never touched cost nothing.
@@ -65,6 +78,7 @@ impl NvidiaGpu {
             nouveau_gem: Mutex::new(Vec::new()),
             nouveau_gem_next_handle: AtomicU32::new(gem_handle_slice.base()),
             nouveau_gem_handle_end: gem_handle_slice.end(),
+            kms_slot,
             nouveau_vm_mappings: Mutex::new(Vec::new()),
             nouveau_uvmm: Mutex::new(Vec::new()),
             nouveau_nvif_devices: Mutex::new(Vec::new()),
