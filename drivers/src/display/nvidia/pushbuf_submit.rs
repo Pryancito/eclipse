@@ -120,9 +120,9 @@ impl super::NvidiaGpu {
                 let gem = self.nouveau_gem.lock();
                 gem.iter()
                     .find(|o| o.handle == bo.handle && super::gem_usable_by(o, owner_pid))
-                    .map(|o| (o.h_memory, o.size, o.vram_offset.is_some()))
+                    .map(|o| (o.h_memory, o.owner_ctx, o.size, o.vram_offset.is_some()))
             };
-            let Some((h_memory, size, in_vram)) = found else {
+            let Some((h_memory, owner_ctx, size, in_vram)) = found else {
                 crate::klog_warn!(
                     "[nouveau-uapi] GEM_PUSHBUF bo[{i}]: no such object (handle={}) -> ENOENT",
                     bo.handle
@@ -136,6 +136,7 @@ impl super::NvidiaGpu {
             let bind = nvidia_rm_sys::rm_init::vm_bind_map(
                 device_instance,
                 ctx_idx,
+                owner_ctx,
                 h_memory,
                 size,
                 0,

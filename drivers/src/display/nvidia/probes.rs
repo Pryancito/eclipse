@@ -44,7 +44,9 @@ impl NvidiaGpu {
         // SEC_OP=INC_METHOD (1<<29) | count<<16 | subch<<13 | mthd>>2.
         const HDR_SEM: u32 = (1 << 29) | (5 << 16) | (0x5c >> 2);
 
-        let alloc = match rm::gem_alloc(device_instance, TEST_SIZE, true) {
+        // The self-test belongs to no process: ctx 0, the shared ladder
+        // client, exactly as before the per-process ownership split.
+        let alloc = match rm::gem_alloc(device_instance, 0, TEST_SIZE, true) {
             Ok(a) if a.alloc_status == 0 => a,
             other => {
                 crate::klog_warn!(
@@ -54,16 +56,17 @@ impl NvidiaGpu {
                 return;
             }
         };
-        let pa = match rm::gem_map_cpu(device_instance, alloc.h_memory) {
+        let pa = match rm::gem_map_cpu(device_instance, 0, alloc.h_memory) {
             Ok(m) if m.lookup_status == 0 => m.phys_addr,
             _ => {
                 crate::klog_warn!("[nouveau-uapi] SELFTEST: gem_map_cpu failed -- cannot run");
-                rm::gem_free(device_instance, alloc.h_memory);
+                rm::gem_free(device_instance, 0, alloc.h_memory);
                 return;
             }
         };
         let bind = match rm::vm_bind_map(
             device_instance,
+            0,
             0,
             alloc.h_memory,
             TEST_SIZE,
@@ -77,7 +80,7 @@ impl NvidiaGpu {
                 crate::klog_warn!(
                     "[nouveau-uapi] SELFTEST: VM_BIND of the test page failed -- cannot run"
                 );
-                rm::gem_free(device_instance, alloc.h_memory);
+                rm::gem_free(device_instance, 0, alloc.h_memory);
                 return;
             }
         };
@@ -176,7 +179,7 @@ impl NvidiaGpu {
             TEST_SIZE,
             TEST_VA,
         );
-        rm::gem_free(device_instance, alloc.h_memory);
+        rm::gem_free(device_instance, 0, alloc.h_memory);
     }
 
     /// Whether THIS process owns the RM-backed channel.

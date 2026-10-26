@@ -1043,3 +1043,104 @@ fn the_console_gpu_reports_itself_ready_only_once_a_client_could_use_it() {
     nv::set_chan_notifier_pa(0);
     *BOOT_FB_INFO.lock() = saved_fb;
 }
+
+/// `GEM_NEW` allocates under the asking process's own context.
+///
+/// This is the whole point of the batch, and it reverts to a one-word edit:
+/// `let owner_ctx = 0;` compiles, every other test here still passes (the
+/// lifetime stays consistent -- consistently wrong), and `nvidia-smi` goes
+/// back to billing every buffer to nobody. The only thing that notices is a
+/// hardware boot, so it is pinned here.
+#[test]
+fn gem_new_allocates_under_the_context_of_the_process_that_asked() {
+    let src = include_str!("../../nvidia.rs");
+    let at = src
+        .find("rm_init::gem_alloc(")
+        .expect("GEM_NEW must still allocate through the RM");
+    let before = &src[at.saturating_sub(1200)..at];
+    assert!(
+        before.contains("let owner_ctx = self.ctx_idx_for_pid(owner_pid);"),
+        "the owning context must come from the pid that issued GEM_NEW; a constant \
+         here puts every process's buffers back on the shared ladder client, where \
+         nvidia-smi counts them for nobody"
+    );
+    let call = &src[at..at + src[at..].find(';').unwrap()];
+    assert!(
+        call.contains("owner_ctx"),
+        "...and it must be the value passed to the allocation: {:?}",
+        call
+    );
+}
+
+/// A GEM object's owning context is carried with it, never looked up again.
+///
+/// `h_memory` only exists in the client of the context that allocated it, so
+/// every later call has to name that same context. Re-deriving it from
+/// `owner_pid` reads the pid table as it is THEN -- and the two paths that
+/// free an object (process exit, and the deferred free that waits for the
+/// rings to drain) both run while, or after, that process's context is torn
+/// down. The lookup would answer 0, the free would go to the shared ladder
+/// client, the handle would not be there, and the VRAM would never come back.
+/// Nothing reports that: the RM returns a status nobody is in a position to
+/// act on, and the leak only shows up as a card that fills up.
+#[test]
+fn a_gem_object_is_freed_through_the_client_that_allocated_it() {
+    let src = include_str!("../../nvidia.rs");
+    let live: alloc::string::String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<alloc::vec::Vec<&str>>()
+        .join("\n");
+    let frees: alloc::vec::Vec<&str> = live
+        .match_indices("gem_free(")
+        .map(|(i, _)| {
+            let rest = &live[i..];
+            &rest[..rest.find(')').map(|p| p + 1).unwrap_or(rest.len())]
+        })
+        .collect();
+    assert!(
+        !frees.is_empty(),
+        "nvidia.rs must still free the objects it allocates"
+    );
+    for call in &frees {
+        assert!(
+            call.contains("owner_ctx"),
+            "`{}` must free through the object's own `owner_ctx`",
+            call
+        );
+        assert!(
+            !call.contains("ctx_idx_for_pid"),
+            "`{}` re-derives the context from the pid; by the time a free runs \
+             that table can already have forgotten the process",
+            call
+        );
+    }
+}
+
+/// The deferred free outlives the process, so it has to keep the context.
+#[test]
+fn the_deferred_free_keeps_the_owning_context() {
+    let queue = include_str!("../gem_free_queue.rs");
+    let start = queue
+        .find("struct DeferredGemFree {")
+        .expect("the deferred free record must still exist");
+    let decl = &queue[start..start + queue[start..].find('}').unwrap()];
+    assert!(
+        decl.contains("owner_ctx"),
+        "a free that runs after the process is gone cannot look its context up; \
+         it has to have been written down when the object was still alive"
+    );
+    // ...and written down from the OBJECT. A field that is declared and then
+    // filled with a constant is the same leak with a reassuring name on it.
+    let src = include_str!("../../nvidia.rs");
+    let built = src
+        .find("DeferredGemFree {\n                handle,")
+        .expect("the deferred free must still be built from a GEM object");
+    let ctor = &src[built..built + src[built..].find("});").unwrap()];
+    assert!(
+        ctor.contains("owner_ctx: obj.owner_ctx"),
+        "the deferred free must take the context from the object being freed, \
+         not fill the field with a constant: {:?}",
+        ctor
+    );
+}

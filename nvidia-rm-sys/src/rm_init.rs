@@ -2031,11 +2031,12 @@ extern "C" {
     fn eclipse_rm_class_free(device_instance: NvU32, ctx_idx: NvU32, h_object: NvU32) -> NV_STATUS;
     fn eclipse_rm_gem_alloc(
         device_instance: NvU32,
+        ctx_idx: NvU32,
         size: u64,
         b_sysmem: NvU32,
         out: *mut GemAlloc,
     ) -> NV_STATUS;
-    fn eclipse_rm_gem_free(device_instance: NvU32, h_memory: NvU32) -> NV_STATUS;
+    fn eclipse_rm_gem_free(device_instance: NvU32, ctx_idx: NvU32, h_memory: NvU32) -> NV_STATUS;
 }
 
 /// Backing store for the nouveau-uAPI `GEM_NEW`, in one of the two domains
@@ -2051,13 +2052,28 @@ extern "C" {
 ///
 /// Requires `step16` first (needs `hClient`/`hDevice`). Not idempotent or
 /// cached: every call allocates a new object.
-pub fn gem_alloc(device_instance: u32, size: u64, sysmem: bool) -> Result<GemAlloc, NV_STATUS> {
+///
+/// `ctx_idx` is the context of the process asking, and decides which RM client
+/// OWNS the object. That is what `nvidia-smi` reports per process: its FB
+/// column keeps only the memory whose `Memory->pDevice` is that client's
+/// device, so an object allocated under the shared ladder client counts for
+/// nobody. Every later call about this object -- [`gem_free`],
+/// [`gem_map_cpu`], [`gem_fbmem_offset`], and `vm_bind_map`'s dup source --
+/// has to name the SAME `ctx_idx`, or it looks the handle up in a client that
+/// does not have it.
+pub fn gem_alloc(
+    device_instance: u32,
+    ctx_idx: u32,
+    size: u64,
+    sysmem: bool,
+) -> Result<GemAlloc, NV_STATUS> {
     let _gate = RmGate::lock();
     let mut out = GemAlloc {
         alloc_status: 0xFFFF_FFFF,
         h_memory: 0,
     };
-    let status = unsafe { eclipse_rm_gem_alloc(device_instance, size, sysmem as NvU32, &mut out) };
+    let status =
+        unsafe { eclipse_rm_gem_alloc(device_instance, ctx_idx, size, sysmem as NvU32, &mut out) };
     if status == NV_OK {
         Ok(out)
     } else {
@@ -2133,10 +2149,11 @@ pub fn chan_notifier_pa(device_instance: u32) -> Result<u64, NV_STATUS> {
     }
 }
 
-/// Frees a GEM object allocated by [`gem_alloc`].
-pub fn gem_free(device_instance: u32, h_memory: u32) -> NV_STATUS {
+/// Frees a GEM object allocated by [`gem_alloc`]. `ctx_idx` must be the one
+/// the object was allocated with: the handle lives in that client.
+pub fn gem_free(device_instance: u32, ctx_idx: u32, h_memory: u32) -> NV_STATUS {
     let _gate = RmGate::lock();
-    unsafe { eclipse_rm_gem_free(device_instance, h_memory) }
+    unsafe { eclipse_rm_gem_free(device_instance, ctx_idx, h_memory) }
 }
 
 /// Mirror of `EclipseGemMapCpu` (vendor/eclipse_rm_init.c).
@@ -2155,6 +2172,7 @@ pub struct GemMapCpu {
 extern "C" {
     fn eclipse_rm_gem_map_cpu(
         device_instance: NvU32,
+        ctx_idx: NvU32,
         h_memory: NvU32,
         out: *mut GemMapCpu,
     ) -> NV_STATUS;
@@ -2177,7 +2195,11 @@ pub const ADDR_FBMEM: u32 = 2;
 /// (2) or `ADDR_SYSMEM` (1) -- NOT 0, which is `ADDR_UNKNOWN` -- before
 /// trusting `.phys_addr`. The C side refuses a non-contiguous sysmem object,
 /// since one physical address cannot describe a scattered allocation.
-pub fn gem_map_cpu(device_instance: u32, h_memory: u32) -> Result<GemMapCpu, NV_STATUS> {
+pub fn gem_map_cpu(
+    device_instance: u32,
+    ctx_idx: u32,
+    h_memory: u32,
+) -> Result<GemMapCpu, NV_STATUS> {
     let _gate = RmGate::lock();
     let mut out = GemMapCpu {
         lookup_status: 0xFFFF_FFFF,
@@ -2185,7 +2207,7 @@ pub fn gem_map_cpu(device_instance: u32, h_memory: u32) -> Result<GemMapCpu, NV_
         phys_addr: 0,
         size: 0,
     };
-    let status = unsafe { eclipse_rm_gem_map_cpu(device_instance, h_memory, &mut out) };
+    let status = unsafe { eclipse_rm_gem_map_cpu(device_instance, ctx_idx, h_memory, &mut out) };
     if status == NV_OK {
         Ok(out)
     } else {
@@ -2213,6 +2235,7 @@ extern "C" {
     fn eclipse_rm_vm_bind_map(
         device_instance: NvU32,
         ctx_idx: NvU32,
+        owner_ctx_idx: NvU32,
         h_memory: NvU32,
         size: u64,
         requested_va: u64,
@@ -2244,6 +2267,7 @@ extern "C" {
 pub fn vm_bind_map(
     device_instance: u32,
     ctx_idx: u32,
+    owner_ctx_idx: u32,
     h_memory: u32,
     size: u64,
     requested_va: u64,
@@ -2263,6 +2287,7 @@ pub fn vm_bind_map(
         eclipse_rm_vm_bind_map(
             device_instance,
             ctx_idx,
+            owner_ctx_idx,
             h_memory,
             size,
             requested_va,
@@ -2573,6 +2598,7 @@ extern "C" {
     ) -> NV_STATUS;
     fn eclipse_rm_gem_fbmem_offset(
         gpu_instance: NvU32,
+        ctx_idx: NvU32,
         h_memory: NvU32,
         p_offset: *mut NvU64,
     ) -> NV_STATUS;
@@ -2645,10 +2671,15 @@ pub fn comptag_caps(device_instance: u32) -> Result<RmComptagCaps, NV_STATUS> {
 
 /// FBMEM (VRAM) offset of a GEM object via `memdescGetPhysAddr(..., AT_GPU, 0)`.
 /// Only meaningful for `NV01_MEMORY_LOCAL_USER` allocations.
-pub fn gem_fbmem_offset(device_instance: u32, h_memory: u32) -> Result<u64, NV_STATUS> {
+pub fn gem_fbmem_offset(
+    device_instance: u32,
+    ctx_idx: u32,
+    h_memory: u32,
+) -> Result<u64, NV_STATUS> {
     let _gate = RmGate::lock();
     let mut offset: NvU64 = 0;
-    let status = unsafe { eclipse_rm_gem_fbmem_offset(device_instance, h_memory, &mut offset) };
+    let status =
+        unsafe { eclipse_rm_gem_fbmem_offset(device_instance, ctx_idx, h_memory, &mut offset) };
     if status == NV_OK {
         Ok(offset)
     } else {

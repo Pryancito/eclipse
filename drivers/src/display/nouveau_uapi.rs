@@ -1565,6 +1565,20 @@ pub(super) struct NouveauGemObject {
     /// (the old single-process assumption) would pull the compositor's buffers
     /// out from under it the moment a GL client closed.
     pub owner_pid: u64,
+    /// The context whose RM client OWNS this object, fixed at `GEM_NEW` and
+    /// never re-derived.
+    ///
+    /// `h_memory` is a handle in that client and in no other, so every later
+    /// call about this object -- free, CPU map, FBMEM offset, and the dup
+    /// `VM_BIND` makes when the binding context is a different one -- has to
+    /// name the same context. Re-deriving it from `owner_pid` would read the
+    /// table as it is THEN: a process whose context was torn down first would
+    /// answer 0, and the free would go to the shared client, which does not
+    /// hold the handle. That is a leak of real VRAM, and a silent one.
+    ///
+    /// 0 means the shared ladder client: the compositor's context, and any
+    /// object allocated before its process had a context of its own.
+    pub owner_ctx: u32,
     pub size: u64,
     /// BAR1-relative CPU physical address (`gem_map_cpu`'s `AT_CPU`
     /// offset), if resolving one succeeded at `GEM_NEW` time. `None` means

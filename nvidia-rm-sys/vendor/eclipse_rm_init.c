@@ -8079,9 +8079,26 @@ typedef struct EclipseGemAlloc
  * whole object, and that is only true of a contiguous allocation. Without it
  * a scattered buffer would resolve to its first page and userspace writes
  * past 4 KiB would land on unrelated memory. */
-NV_STATUS eclipse_rm_gem_alloc(NvU32 gpuInstance, NvU64 size, NvU32 bSysmem,
+/* The GEM object is allocated under the client of the context that asked for
+ * it (ctxIdx), not under the shared ladder client.
+ *
+ * nvidia-smi's per-process FB column walks that client's own resources and
+ * keeps only the ones whose Memory->pDevice is that client's device
+ * (gpu_rmapi.c `_gpuCollectMemInfo`, the `RES_GET_HANDLE(pMemory->pDevice) ==
+ * hDevice` test). Allocating every buffer under the shared ladder client made
+ * that test fail for every process: labwc and Xwayland appeared in the table
+ * -- they hold channels on their own client since the per-process client
+ * landed -- and both reported 0 MiB, because none of the memory was theirs.
+ *
+ * Duping into the context's client is NOT enough: a dup shares the Memory
+ * resource, so pMemory->pDevice stays the ladder's device and the same test
+ * still rejects it. The owner has to be the allocating client from the start,
+ * which is why the whole lifetime below takes ctxIdx. */
+NV_STATUS eclipse_rm_gem_alloc(NvU32 gpuInstance, NvU32 ctxIdx, NvU64 size, NvU32 bSysmem,
                                EclipseGemAlloc *pOut)
 {
+    NvU32 hOwnerClient = 0;
+    NvU32 hOwnerDevice = 0;
     OBJGPU *pGpu;
     RM_API *pRmApi;
     NV_STATUS status;
@@ -8140,7 +8157,8 @@ NV_STATUS eclipse_rm_gem_alloc(NvU32 gpuInstance, NvU64 size, NvU32 bSysmem,
     }
 
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
-    status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pRsClient);
+    _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hOwnerClient, &hOwnerDevice);
+    status = serverGetClientUnderLock(&g_resServ, hOwnerClient, &pRsClient);
     if (status != NV_OK)
     {
         goto unlock;
@@ -8164,14 +8182,14 @@ NV_STATUS eclipse_rm_gem_alloc(NvU32 gpuInstance, NvU64 size, NvU32 bSysmem,
         params.attr2 = NVOS32_ATTR2_NONE;
         status = clientGenResourceHandle(pRsClient, &pOut->hMemory);
         if (status != NV_OK) goto unlock;
-        pOut->allocStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                    g_grAllocCache[gpuInstance].hDevice, pOut->hMemory,
+        pOut->allocStatus = pRmApi->AllocWithHandle(pRmApi, hOwnerClient,
+                                                    hOwnerDevice, pOut->hMemory,
                                                     bSysmem ? NV01_MEMORY_SYSTEM
                                                             : NV01_MEMORY_LOCAL_USER,
                                                     &params, sizeof(params));
-        nv_printf(0, "[eclipse-rm-trace] gem_alloc(%s): %llu B -> 0x%x hMemory=0x%x\n",
+        nv_printf(0, "[eclipse-rm-trace] gem_alloc(%s): %llu B -> 0x%x hMemory=0x%x ctx%u client=0x%x\n",
                   bSysmem ? "sysmem/GART" : "vidmem/VRAM",
-                  size, pOut->allocStatus, pOut->hMemory);
+                  size, pOut->allocStatus, pOut->hMemory, ctxIdx, hOwnerClient);
     }
     status = NV_OK; /* per-stage status carries the failure */
 
@@ -8183,8 +8201,13 @@ unlock:
     return status;
 }
 
-NV_STATUS eclipse_rm_gem_free(NvU32 gpuInstance, NvU32 hMemory)
+/* Frees through the client that owns the object -- see eclipse_rm_gem_alloc.
+ * Freeing through the shared ladder client would not find the handle at all
+ * once the object belongs to a per-process client. */
+NV_STATUS eclipse_rm_gem_free(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory)
 {
+    NvU32 hOwnerClient = 0;
+    NvU32 hOwnerDevice = 0;
     OBJGPU *pGpu;
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
@@ -8227,7 +8250,9 @@ NV_STATUS eclipse_rm_gem_free(NvU32 gpuInstance, NvU32 hMemory)
     }
     {
         RM_API *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
-        status = pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, hMemory);
+        _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hOwnerClient, &hOwnerDevice);
+        (void) hOwnerDevice;
+        status = pRmApi->Free(pRmApi, hOwnerClient, hMemory);
         nv_printf(0, "[eclipse-rm-trace] gem_free: hMemory=0x%x -> 0x%x\n", hMemory, status);
     }
 
@@ -8272,8 +8297,12 @@ typedef struct EclipseGemMapCpu
  * internal memdescGetPhysAddr() this function uses instead has no such
  * caveat and is called this same way throughout RM's own kernel code.
  */
-NV_STATUS eclipse_rm_gem_map_cpu(NvU32 gpuInstance, NvU32 hMemory, EclipseGemMapCpu *pOut)
+/* Resolves the object through its owning client -- see eclipse_rm_gem_alloc. */
+NV_STATUS eclipse_rm_gem_map_cpu(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
+                                 EclipseGemMapCpu *pOut)
 {
+    NvU32 hOwnerClient = 0;
+    NvU32 hOwnerDevice = 0;
     OBJGPU *pGpu;
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
@@ -8315,7 +8344,9 @@ NV_STATUS eclipse_rm_gem_map_cpu(NvU32 gpuInstance, NvU32 hMemory, EclipseGemMap
         return status;
     }
 
-    status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pRsClient);
+    _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hOwnerClient, &hOwnerDevice);
+    (void) hOwnerDevice;
+    status = serverGetClientUnderLock(&g_resServ, hOwnerClient, &pRsClient);
     if (status == NV_OK)
         status = memGetByHandle(pRsClient, hMemory, &pMemory);
     if (status == NV_OK)
@@ -8683,10 +8714,20 @@ typedef struct EclipseVmBind
 /* Generalizes step17 items 3+4 (reserve a VA range in hVas, then map real
  * memory into it) for a caller-chosen handle/size/address instead of the
  * one hardcoded channel buffer. */
-NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory, NvU64 size,
+/* `ownerCtxIdx` is the context whose client OWNS hMemory (the one GEM_NEW ran
+ * under); `ctxIdx` is the context being bound into. They are the same for a
+ * process mapping its own buffer, and differ when a buffer crosses processes
+ * -- an imported dma-buf, or the compositor binding a client's scanout. The
+ * dup below exists for exactly that second case, and must now source from the
+ * owner rather than from the shared ladder client, which no longer holds
+ * anybody's GEM objects. */
+NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 ownerCtxIdx,
+                                  NvU32 hMemory, NvU64 size,
                                   NvU64 requestedVA, NvU64 boOffset, NvU32 pteKind,
                                   NvU32 bHonourCompressedKind, EclipseVmBind *pOut)
 {
+    NvU32 hOwnerClient = 0;
+    NvU32 hOwnerDevice = 0;
     OBJGPU *pGpu;
     RM_API *pRmApi;
     NV_STATUS status;
@@ -8768,19 +8809,25 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
     /* The GEM object's own client, for the memdesc lookup further down: the
      * PTE kind is set on the memory DESCRIPTOR, which the dup shares, so it
      * can be read and written through either handle. Going through the
-     * original keeps that step independent of whether a dup was needed. */
-    status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pGemClient);
+     * original keeps that step independent of whether a dup was needed --
+     * and the original is now the OWNER's client, not the ladder's. Looking
+     * it up in the ladder client would silently find nothing and drop the
+     * tile kind back to the default, which is a corrupted surface, not an
+     * error. */
+    _eclipse_rm_ctx_handles(gpuInstance, ownerCtxIdx, &hOwnerClient, &hOwnerDevice);
+    (void) hOwnerDevice;
+    status = serverGetClientUnderLock(&g_resServ, hOwnerClient, &pGemClient);
     if (status != NV_OK)
     {
         goto unlock;
     }
 
     hBindMem = hMemory;
-    if (hCtxClient != g_grAllocCache[gpuInstance].hClient)
+    if (hCtxClient != hOwnerClient)
     {
         pOut->hDup = 0; /* 0 = let the destination client assign the handle */
         status = pRmApi->DupObject(pRmApi, hCtxClient, hCtxDevice, &pOut->hDup,
-                                   g_grAllocCache[gpuInstance].hClient, hMemory,
+                                   hOwnerClient, hMemory,
                                    NV04_DUP_HANDLE_FLAGS_NONE);
         if (status != NV_OK)
         {
@@ -11045,8 +11092,12 @@ unlock:
  * FBMEM offset (AT_GPU) of a GEM_NEW VRAM object -- for scanout/CE present
  * bookkeeping. Pure memdesc query; no BAR touch.
  */
-NV_STATUS eclipse_rm_gem_fbmem_offset(NvU32 gpuInstance, NvU32 hMemory, NvU64 *pOffset)
+/* Resolves the object through its owning client -- see eclipse_rm_gem_alloc. */
+NV_STATUS eclipse_rm_gem_fbmem_offset(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
+                                      NvU64 *pOffset)
 {
+    NvU32 hOwnerClient = 0;
+    NvU32 hOwnerDevice = 0;
     OBJGPU *pGpu;
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
@@ -11083,7 +11134,9 @@ NV_STATUS eclipse_rm_gem_fbmem_offset(NvU32 gpuInstance, NvU32 hMemory, NvU64 *p
         return status;
     }
 
-    status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pRsClient);
+    _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hOwnerClient, &hOwnerDevice);
+    (void) hOwnerDevice;
+    status = serverGetClientUnderLock(&g_resServ, hOwnerClient, &pRsClient);
     if (status == NV_OK)
         status = memGetByHandle(pRsClient, hMemory, &pMemory);
     if (status == NV_OK)

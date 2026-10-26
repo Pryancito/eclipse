@@ -468,6 +468,7 @@ mod tests {
             handle: 1,
             h_memory: 2,
             owner_pid: 3,
+            owner_ctx: 0,
             size: BIG,
             phys_addr: None,
             vram_offset: Some(PA),
