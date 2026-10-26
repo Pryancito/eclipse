@@ -8,9 +8,12 @@ pub struct Counter {
 
 impl_kobject!(Counter
     fn allowed_signals(&self) -> Signal {
-        // USER_ALL only: SIGNALED is for Event/EventPair. COUNTER_POSITIVE /
-        // NON_POSITIVE are kernel-owned (via `signal_change`), not object_signal.
-        Signal::USER_ALL
+        // `ZX_COUNTER_SIGNALED` is `__ZX_OBJECT_SIGNAL_3`, the same bit as
+        // `SIGNALED`, and Zircon lets userspace assert and deassert it on a
+        // counter with `zx_object_signal` -- `CounterTest.Signal` does exactly
+        // that. What stays out is `COUNTER_POSITIVE` / `NON_POSITIVE`: those
+        // the kernel owns, it derives them from the value in `update_signals`.
+        Signal::USER_ALL | Signal::SIGNALED
     }
 );
 
@@ -105,13 +108,36 @@ mod tests {
             .intersects(Signal::COUNTER_POSITIVE | Signal::COUNTER_NON_POSITIVE));
     }
 
+    /// `ZX_COUNTER_SIGNALED` shares a bit with `SIGNALED`, and it is
+    /// user-assertable on a counter: `CounterTest.Signal` asserts it, reads it
+    /// back next to the kernel's own `COUNTER_NON_POSITIVE`, and deasserts it.
+    /// Leaving it out of `allowed_signals` made every one of those four steps
+    /// answer `ZX_ERR_INVALID_ARGS`.
     #[test]
-    fn object_signal_cannot_assert_signaled_on_a_counter() {
-        // SIGNALED used to be in allowed_signals (copied from Event).
+    fn object_signal_can_assert_counter_signaled() {
+        let allowed = Counter::new().allowed_signals();
         assert!(
-            !Counter::new().allowed_signals().contains(Signal::SIGNALED),
-            "SIGNALED is for Event, not Counter"
+            allowed.contains(Signal::SIGNALED),
+            "ZX_COUNTER_SIGNALED is user-assertable on a counter"
         );
+        assert!(allowed.contains(Signal::USER_SIGNAL_0));
+        assert!(
+            !allowed.intersects(Signal::COUNTER_POSITIVE | Signal::COUNTER_NON_POSITIVE),
+            "the value-derived signals stay the kernel's"
+        );
+    }
+
+    /// The whole sequence of `CounterTest.Signal`, in kernel terms: assert the
+    /// two, see them beside the kernel's `NON_POSITIVE`, deassert them, and be
+    /// left with `NON_POSITIVE` alone.
+    #[test]
+    fn asserting_and_deasserting_counter_signaled_leaves_the_kernel_signal() {
+        let counter = Counter::new();
+        let both = Signal::USER_SIGNAL_0 | Signal::SIGNALED;
+        counter.signal_set(both);
+        assert_eq!(counter.signal(), Signal::COUNTER_NON_POSITIVE | both);
+        counter.signal_clear(both);
+        assert_eq!(counter.signal(), Signal::COUNTER_NON_POSITIVE);
     }
 
     /// A counter starts at zero, zero is not positive, so a fresh counter
