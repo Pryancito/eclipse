@@ -16,6 +16,10 @@ pub extern "C" fn _start(boot_info: &'static BootInfo) -> ! {
     // `primary_main` names the frequency to divide them by once it has one worth
     // trusting. See `kernel_hal::boot_marks`.
     kernel_hal::boot_marks::set_loader_marks(&boot_info.loader_marks);
+    // The loader's graphic-mode decision, kept until the klog exists to print
+    // it: rboot's own `warn!` goes to the firmware console, which the splash
+    // wipes two calls later. See `crate::set_gop_report`.
+    crate::set_gop_report(boot_info.gop);
     let info = boot_info.graphic_info;
     // Paint 52% *before* heap / klog / PIT calibration. rboot leaves the bar
     // at 51%; a stall in `memory::init` used to look like a failed jump.

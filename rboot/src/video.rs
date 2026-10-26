@@ -86,6 +86,83 @@ impl Mode {
     }
 }
 
+/// One GOP handle, as the handle-picking policy sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gop {
+    /// Whether its *current* mode has a linear framebuffer (not `BltOnly`).
+    pub direct: bool,
+    /// Whether the firmware exposes an EDID on this handle, i.e. a display is
+    /// attached to *this* GPU.
+    pub has_edid: bool,
+    /// Size in bytes of its current framebuffer.
+    pub fb_size: usize,
+    /// Base address of its current framebuffer, or 0 when it has none.
+    ///
+    /// Only used to count cards: the firmware's own console GOP (EDK2's
+    /// ConSplitter) is a second handle over the *same* framebuffer, so
+    /// counting handles says "two GPUs" on a machine with one. Two distinct
+    /// bases are two cards.
+    pub fb_addr: u64,
+}
+
+impl Gop {
+    pub fn new(direct: bool, has_edid: bool, fb_size: usize, fb_addr: u64) -> Self {
+        Gop {
+            direct,
+            has_edid,
+            fb_size,
+            fb_addr,
+        }
+    }
+}
+
+/// How many graphics cards the firmware is really showing: distinct
+/// framebuffers among the handles we could draw on.
+///
+/// See [`Gop::fb_addr`] for why this is not `handles.len()`.
+pub fn distinct_cards(gops: &[Gop]) -> usize {
+    let mut n = 0;
+    for (i, g) in gops.iter().enumerate() {
+        if !g.direct {
+            continue;
+        }
+        if !gops[..i].iter().any(|o| o.direct && o.fb_addr == g.fb_addr) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Pick which GOP handle to set the mode on and hand to the kernel.
+///
+/// A machine with two GPUs (two RTX 2060 Super, say) exposes one GOP handle
+/// per card, and only one of them is driving the monitor. Setting the mode on
+/// the other one is exactly the "`resolution=` does nothing, the screen keeps
+/// the firmware's mode" symptom: `set_mode` succeeds, the panel never changes,
+/// and the kernel is handed a framebuffer nobody is looking at.
+///
+/// The firmware says which card has the display: `EFI_EDID_ACTIVE_PROTOCOL`
+/// (or `EFI_EDID_DISCOVERED_PROTOCOL`) hangs off the GOP handle of the GPU
+/// whose connector the monitor is plugged into. So an attached display wins
+/// over everything else, and only then does the largest framebuffer -- the
+/// old sole criterion -- break the tie. "Largest framebuffer" on its own picks
+/// whichever card happens to have booted in the bigger mode, which on two
+/// identical cards is a coin toss.
+///
+/// Modes with no linear framebuffer are not candidates at all (see
+/// [`Mode::direct`]); `None` means every handle was `BltOnly` and the caller
+/// should fall back to whatever `locate_protocol` hands it.
+pub fn pick_gop(gops: &[Gop]) -> Option<usize> {
+    gops.iter()
+        .enumerate()
+        .filter(|(_, g)| g.direct)
+        // `max_by_key` keeps the LAST maximum, and the first handle is the
+        // firmware's own preference among equals: reverse the index so a tie
+        // picks the earliest.
+        .max_by_key(|(i, g)| (g.has_edid, g.fb_size, core::cmp::Reverse(*i)))
+        .map(|(i, _)| i)
+}
+
 /// Pick the index in `modes` of the GOP mode to set, or `None` to keep the
 /// mode the firmware already selected.
 ///
@@ -157,6 +234,87 @@ fn auto_pick(modes: &[Mode], direct_only: bool) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_console_gop_over_the_same_framebuffer_is_not_a_second_card() {
+        // EDK2's ConSplitter publishes a GOP of its own over the active
+        // card's framebuffer: plain QEMU with one VGA already shows two
+        // drawable handles, and counting handles would report "two GPUs" on
+        // every single-card machine.
+        let gops = [
+            Gop::new(true, false, 4096, 0x8000_0000),
+            Gop::new(true, false, 4096, 0x8000_0000),
+        ];
+        assert_eq!(distinct_cards(&gops), 1);
+        let two = [
+            Gop::new(true, false, 4096, 0x8000_0000),
+            Gop::new(true, false, 4096, 0x8100_0000),
+        ];
+        assert_eq!(distinct_cards(&two), 2);
+        // A BltOnly handle is not a card we can boot on.
+        let blt = [
+            Gop::new(true, false, 4096, 0x8000_0000),
+            Gop::new(false, false, 0, 0),
+        ];
+        assert_eq!(distinct_cards(&blt), 1);
+        assert_eq!(distinct_cards(&[]), 0);
+    }
+
+    #[test]
+    fn the_only_drawable_gop_is_the_one_picked() {
+        assert_eq!(pick_gop(&[Gop::new(true, false, 1, 0)]), Some(0));
+        // Every handle BltOnly: the caller falls back to locate_protocol.
+        assert_eq!(pick_gop(&[Gop::new(false, true, 1 << 20, 0)]), None);
+        assert_eq!(pick_gop(&[]), None);
+    }
+
+    #[test]
+    fn the_gpu_with_the_monitor_wins_over_the_bigger_framebuffer() {
+        // The whole point: two cards, the monitor on the second one, whose
+        // framebuffer is smaller because its mode is smaller. Picking by size
+        // sets the mode on the card nobody is looking at.
+        let gops = [
+            Gop::new(true, false, 2560 * 1600 * 4, 0),
+            Gop::new(true, true, 1024 * 768 * 4, 0),
+        ];
+        assert_eq!(pick_gop(&gops), Some(1));
+    }
+
+    #[test]
+    fn a_bltonly_gop_with_an_edid_is_still_not_a_candidate() {
+        // An EDID says a monitor is attached, not that we can draw on it:
+        // choosing it hands the kernel `fb_addr = 0` and no graphic console.
+        let gops = [
+            Gop::new(true, false, 4096, 0),
+            Gop::new(false, true, 1 << 24, 0),
+        ];
+        assert_eq!(pick_gop(&gops), Some(0));
+    }
+
+    #[test]
+    fn with_no_edid_anywhere_the_largest_framebuffer_still_wins() {
+        // The old behaviour, kept for the single-GPU and no-EDID cases.
+        let gops = [
+            Gop::new(true, false, 1024 * 768 * 4, 0),
+            Gop::new(true, false, 1920 * 1080 * 4, 0),
+            Gop::new(true, false, 800 * 600 * 4, 0),
+        ];
+        assert_eq!(pick_gop(&gops), Some(1));
+    }
+
+    #[test]
+    fn equal_candidates_keep_the_first_handle_the_firmware_listed() {
+        // Two identical cards: the firmware's own order is the tie-break, and
+        // it must be stable -- a coin toss here is a boot that comes up on a
+        // different card than the last one.
+        let gops = [Gop::new(true, true, 4096, 0), Gop::new(true, true, 4096, 0)];
+        assert_eq!(pick_gop(&gops), Some(0));
+        let gops = [
+            Gop::new(true, false, 4096, 0),
+            Gop::new(true, false, 4096, 0),
+        ];
+        assert_eq!(pick_gop(&gops), Some(0));
+    }
 
     /// A well-formed EDID block 0 whose first detailed timing is `w × h`.
     fn edid_with_dtd(w: usize, h: usize) -> [u8; 128] {

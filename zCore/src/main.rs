@@ -103,6 +103,109 @@ fn deadlock_spins(cmdline: &str) -> Option<Result<u64, &str>> {
     Some(kernel_hal::cmdline::parse_number(spelled).ok_or(spelled))
 }
 
+/// The loader's record of the graphic-mode decision, from `_start` until the
+/// klog exists to print it. See [`klog_gop_report`] and `rboot::GopReport`.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static GOP_REPORT: spin::Mutex<rboot::GopReport> = spin::Mutex::new(rboot::GopReport::empty());
+
+/// Called from `_start` with what rboot handed over.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub fn set_gop_report(report: rboot::GopReport) {
+    *GOP_REPORT.lock() = report;
+}
+
+/// Print why the machine is in the graphic mode it is in.
+///
+/// "Changing the resolution in rboot.conf does nothing, it always keeps the
+/// GOP's" has three causes -- the firmware does not offer the mode, it offers
+/// it and refuses to set it, or the mode was set on a GPU with no monitor on
+/// it -- and the loader cannot report any of them where it happens: its log
+/// goes to the firmware's text console and the splash wipes the screen
+/// immediately after, and the shipped `cmdline=LOG=error` discards it before
+/// that. So the decision travels in `BootInfo` and comes out here, where
+/// `dmesg | grep "\[gop\]"` finds it after boot.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn klog_gop_report() {
+    let r = *GOP_REPORT.lock();
+    if r.gop_count == 0 {
+        // No GOP handle was enumerated at all, so there is nothing to report
+        // beyond what the "no framebuffer from bootloader" path already says.
+        return;
+    }
+    let asked = match r.asked_kind {
+        rboot::GOP_ASKED_AUTO => alloc::string::String::from("auto"),
+        rboot::GOP_ASKED_EXACT => alloc::format!("{}x{}", r.asked_width, r.asked_height),
+        _ => alloc::string::String::from("(absent: keep the firmware's mode)"),
+    };
+    klog_info!(
+        "[gop] rboot.conf resolution={} -> booted at {}x{}{}",
+        asked,
+        r.final_width,
+        r.final_height,
+        if r.set_called {
+            if r.set_ok {
+                " (SetMode ok)"
+            } else {
+                " (SetMode REFUSED by the firmware)"
+            }
+        } else {
+            " (no mode set: kept the firmware's)"
+        }
+    );
+    klog_info!(
+        "[gop] GOP {} of {} handle(s), {} card(s), display attached to it: {}, panel EDID says {}x{}",
+        r.gop_index,
+        r.gop_count,
+        r.card_count,
+        if r.gop_has_edid { "yes" } else { "no" },
+        r.edid_width,
+        r.edid_height
+    );
+    if let Some(why) = r.why_not() {
+        klog_info!("[gop] not the mode that was asked for: {}", why);
+        // The klog ring is unfiltered, so the lines above always reach
+        // `dmesg`; this one goes through the level filter on purpose, at
+        // `error` so that the shipped `cmdline=LOG=error` still shows it on
+        // the screen and the serial. A `resolution=` that did nothing has to
+        // be visible without anybody knowing to go looking for it.
+        log::error!(
+            "[gop] rboot.conf resolution={} but the machine booted at {}x{}: {} (full list: dmesg | grep gop)",
+            asked,
+            r.final_width,
+            r.final_height,
+            why
+        );
+        // The list is the evidence for the first of the three causes, and it
+        // is only worth its dmesg lines when something did go wrong.
+        let n = (r.offered_len as usize).min(rboot::GOP_OFFERED_MAX);
+        let mut line = alloc::string::String::new();
+        for m in &r.offered[..n] {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            let _ = core::fmt::write(
+                &mut line,
+                format_args!(
+                    "{}x{}{}",
+                    m.width,
+                    m.height,
+                    if m.direct { "" } else { "(blt)" }
+                ),
+            );
+        }
+        klog_info!(
+            "[gop] the firmware offers {} mode(s){}: {}",
+            r.offered_len,
+            if r.offered_len as usize > n {
+                " (first 48)"
+            } else {
+                ""
+            },
+            line
+        );
+    }
+}
+
 fn primary_main(config: kernel_hal::KernelConfig) {
     logging::init();
     kernel_hal::console::early_progress_bar(53);
@@ -135,6 +238,8 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     klog_info!(
         "Eclipse: diag rev 10 (isolation-first containment: kill the culprit, keep the kernel up)"
     );
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    klog_gop_report();
     // Scheduler/timer A-B switches. Both default on; `TIMERDEADLINE=0` and
     // `WAKEPREEMPT=0` on the kernel command line restore the pre-change
     // behaviour. They exist so a suspected regression can be bisected on ONE
