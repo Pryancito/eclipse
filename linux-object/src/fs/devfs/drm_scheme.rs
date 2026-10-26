@@ -255,6 +255,7 @@ impl DrmDev {
             // when the connector is routed, and DPMS on shows the plane's fb
             // again. This only blanked and un-blanked.
             drm::connector_commit_dpms(!off);
+            dpms_set(obj_id, value);
             return Ok(0);
         }
         // `drm_mode_obj_set_property_ioctl`: on an atomic driver every other
@@ -1687,6 +1688,7 @@ impl DrmDev {
             DRM_IOCTL_MODE_SETCRTC => {
                 // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
                 let req = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
+                setcrtc_called(req.crtc_id, req.fb_id, req.mode_valid, req.count_connectors);
                 // "Universal plane src offsets are only 16.16"
                 // (`drm_mode_setcrtc`, ERANGE): an x or y with a bit above
                 // the 16th is refused first of all, before the CRTC is
@@ -2188,6 +2190,7 @@ impl DrmDev {
                     // ids are sequential from 1, so handing it out further
                     // is an enumeration route to the compositor's pixels.
                     cmd.handle = self.fb_handle_for_caller(&fb);
+                    getfb_served(cmd.fb_id, cmd.handle);
                     Ok(0)
                 } else {
                     // ENOENT, like `drm_mode_getfb`'s framebuffer lookup. This
@@ -2534,6 +2537,7 @@ impl DrmDev {
                 }
                 let mut changed = false;
                 if cur.flags & DRM_MODE_CURSOR_BO != 0 {
+                    cursor_bo_called(cur.crtc_id, cur.handle, cur.width, cur.height);
                     // Linux wraps the handle in a framebuffer of `width x
                     // height` (`drm_internal_framebuffer_create`): a zero
                     // width or height is "bad framebuffer" EINVAL there, and
@@ -3857,7 +3861,9 @@ mod pre_wait_account;
 use pre_wait_account::PreWaitAccount;
 /// The sleep behind a blocking `WAIT_VBLANK`; own file for the size ceiling.
 mod wait_vblank_sleep;
-use legacy_disable_trace::{kms_disabled, kms_refused};
+use legacy_disable_trace::{
+    cursor_bo_called, dpms_set, getfb_served, kms_disabled, kms_refused, setcrtc_called,
+};
 use present_failed::{present_failed, PRESENT_FAIL_TRACED};
 
 /// The parked microseconds a pre-wait reports, from how long it was alive and
