@@ -13,7 +13,7 @@ junto con la uAPI.
 |---|---|
 | `nvidia.nouveau_uapi` | uAPI nouveau + **default GLES2/zink** + CE/surfaceflip/hwflip |
 | `nvidia.wlr_pixman` | Kill-switch: compositor y clientes en software |
-| `nvidia.wlr_vulkan` | Compositor Vulkan nativo (sigue experimental) |
+| `nvidia.wlr_vulkan` | Compositor Vulkan nativo. Fija el cargador Vulkan al ICD de NVK, y si no arranca cae a **GLES2/zink** (sigue siendo la GPU) antes que a pixman. Pre-vuelo en `/tmp/labwc-vulkan-preflight.log` |
 | `nvidia.wlr_gles2` | Igual que el default (aceptado por compat) |
 | `nvidia.nosurfaceflip` / `nvidia.nohwflip` / `nvidia.nocepresent` | Apagar present HW puntual |
 

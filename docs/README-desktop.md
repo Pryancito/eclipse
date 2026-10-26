@@ -181,7 +181,7 @@ que las copias generadas no se desalinean.
 |---|---|---|---|---|
 | pixman (por defecto) | `pixman` | `software` | `0` | Rasteriza en CPU. **SDL3** presenta por `wl_shm`, sin tocar GL (la misma ruta que foot/lunarbg). **SDL2** no tiene framebuffer shm en Wayland y presenta por EGL, que `LIBGL_ALWAYS_SOFTWARE=1` deja en llvmpipe. |
 | gles2 (`nvidia.wlr_gles2`, o `renderer=gl-sw`/`GL=1` en QEMU) | `gles2` | `opengles2` | `opengles2` | Renderer GLES2 sobre la misma pila GL que el compositor: zink+NVK en hardware, llvmpipe en software. |
-| vulkan (`nvidia.wlr_vulkan`) | `vulkan` | `opengles2` | `opengles2` | Igual que gles2: SDL2 no tiene renderer Vulkan, y GLES2 acaba en zink+NVK. |
+| vulkan (`nvidia.wlr_vulkan`) | `vulkan` | `opengles2` | `opengles2` | Igual que gles2: SDL2 no tiene renderer Vulkan, y GLES2 acaba en zink+NVK. El compositor (no sus clientes) va por el renderizador Vulkan nativo de wlroots sobre NVK; ver «El renderizador Vulkan nativo» mas abajo. |
 
 Independientes del renderer, en todas las sesiones:
 
@@ -213,6 +213,85 @@ eclipse-sdl-probe --sdl3 --surface   #   y "renderer 'software'" en pixman / 'op
 mide los fps de una animación sencilla; sale con `SDLPROBE: FAIL ...` y código
 1 si algo falla. Un `video driver in use: x11` con `WAYLAND_DISPLAY` presente
 significa que algo pisó `SDL_VIDEODRIVER`.
+
+## El renderizador Vulkan nativo (`nvidia.wlr_vulkan`)
+
+La sesion por defecto es **GLES2 sobre zink+NVK**: el compositor pide GL a Mesa,
+Mesa lo traduce a Vulkan con zink y NVK lo ejecuta en la tarjeta. Con
+`nvidia.wlr_vulkan` el compositor se salta zink y usa el **renderizador Vulkan
+nativo de wlroots**, que habla Vulkan directamente con NVK. Los clientes GL
+siguen en zink+NVK en los dos casos.
+
+### Lo que wlroots exige de verdad
+
+`vulkan_find_phdev` y `vulkan_device_create` (`render/vulkan/`) piden cuatro
+cosas, y ninguna es un semaforo:
+
+1. Una instancia Vulkan 1.1 y un dispositivo fisico con `apiVersion` >= 1.1.
+2. Un dispositivo fisico con **`VK_EXT_physical_device_drm`** cuyo par
+   `primaryMajor:primaryMinor` **o** `renderMajor:renderMinor` sea **igual al
+   `st_rdev` del fd DRM que wlroots abrio** — o sea el de `/dev/dri/card0`,
+   porque es lo que dice `WLR_DRM_DEVICES`. Es el unico requisito que no tiene
+   el camino GLES2, y el que produce la unica linea de error que wlroots
+   imprime cuando algo de la enumeracion falla: `Could not match drm and vulkan
+   device`.
+3. Cinco extensiones de dispositivo: `VK_KHR_external_memory_fd`,
+   `VK_KHR_image_format_list`, `VK_EXT_external_memory_dma_buf`,
+   `VK_EXT_queue_family_foreign` y `VK_EXT_image_drm_format_modifier`.
+4. Una cola con `VK_QUEUE_GRAPHICS_BIT`.
+
+**El bloqueo que archivo esta escotilla ya no existe.** Se archivo porque
+`vkCreateSemaphore` devolvia `ERROR_INVALID_EXTERNAL_HANDLE`: wlroots pedia un
+semaforo **externo y exportable** (`VK_KHR_external_semaphore_fd`, para la
+interoperabilidad con sincronizacion implicita) que NVK no exportaba sobre
+nuestra uAPI de syncobj. El renderizador Vulkan de wlroots **ya no crea ni un
+semaforo**: espera en un `VkFence` corriente con `vkWaitForFences`. Asi que ese
+motivo caduco, y de paso la uAPI de syncobj de este arbol crecio desde entonces
+(`DRM_CAP_SYNCOBJ` / `DRM_CAP_SYNCOBJ_TIMELINE`, `SYNCOBJ_HANDLE_TO_FD` /
+`FD_TO_HANDLE` con `EXPORT_SYNC_FILE` / `IMPORT_SYNC_FILE`, `SYNCOBJ_EVENTFD`).
+Las otras dos consecuencias que se vieron entonces tambien estan tapadas:
+`MAX_CHANNELS` paso de 16 a 64 y `MAX_CTX` de 8 a 32, que es lo que convertia
+una rafaga de enumeracion en `CHANNEL_ALLOC -> EBUSY`.
+
+### La escalera, y por que probar la escotilla ahora sale gratis
+
+wlroots **no cae de un renderizador a otro por su cuenta**: si el que le pides
+no arranca, sale con `unable to create renderer`. Toda la escalera la pone el
+envoltorio `/usr/local/bin/labwc`, dos intentos por peldaño:
+
+```
+vulkan  ->  gles2 (zink+NVK)  ->  pixman (CPU)
+```
+
+El peldaño de en medio es lo que hace que la escotilla sea barata: antes,
+pedir `nvidia.wlr_vulkan` y que wlroots lo rechazara costaba la **sesion de GPU
+entera** y dejaba el escritorio pintado por la CPU. `/run/labwc-renderer-fallback`
+— que es como `eclipse-firefox` se entera de que esta sesion no tiene camino de
+GPU — se escribe **solo** si se llega a pixman.
+
+### El pre-vuelo: `/tmp/labwc-vulkan-preflight.log`
+
+Solo en esta sesion, y **antes** del primer intento, el envoltorio apunta las
+entradas del requisito 2 y 3, porque wlroots las resume todas en una sola linea:
+
+- el ICD al que esta fijado el cargador (`VK_DRIVER_FILES`);
+- el `major:minor` de `/dev/dri/card0` y de `/dev/dri/renderD128`;
+- lo que `vulkaninfo` dice de `primaryMajor/Minor`, `renderMajor/Minor`, el
+  nombre del dispositivo y las cinco extensiones.
+
+Se lee comparando a ojo: si el par que NVK publica para la tarjeta **no** es el
+`major:minor` de `card0`, el fallo es el emparejamiento (requisito 2) y no el
+driver. Si falta una extension, es la 3.
+
+Por que el cargador se fija al ICD de NVK en esta sesion y **no** en la
+GLES2 por defecto: `mesa-vulkan-drivers` instala tambien **lavapipe**, el
+driver Vulkan de CPU, como suelo del glamor de Xwayland. lavapipe no tiene
+dispositivo DRM, asi que **no puede** ser nunca el emparejamiento del requisito
+2 — la sesion Vulkan no se puede ir a la CPU a escondidas. Lo que cuesta un
+cargador sin fijar es el diagnostico, porque lavapipe aparece en la lista con
+pinta de dispositivo. Es la misma medida que `eclipse-firefox` ya toma, por la
+misma razon. La sesion GLES2 es la que funciona hoy en el hardware de Moebius y
+su entorno se deja **byte por byte** como estaba.
 
 ## Juegos (freedoom, supertux2)
 

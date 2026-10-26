@@ -1207,6 +1207,19 @@ impl LinuxRootfs {
               \x20 elif grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
               \x20\x20 export WLR_RENDERER=vulkan\n\
               \x20\x20 export WLR_DRM_NO_MODIFIERS=1\n\
+              \x20\x20 # Vulkan compositor only: pin the loader to NVK's ICD.\n\
+              \x20\x20 # mesa-vulkan-drivers also installs lavapipe (the CPU\n\
+              \x20\x20 # driver, the floor under Xwayland's glamor); wlroots'\n\
+              \x20\x20 # native Vulkan renderer walks EVERY physical device the\n\
+              \x20\x20 # loader offers and keeps the one whose\n\
+              \x20\x20 # VK_EXT_physical_device_drm major:minor matches the DRM\n\
+              \x20\x20 # fd it opened. lavapipe has no DRM device, so it can\n\
+              \x20\x20 # never BE that match -- what it costs is the diagnosis,\n\
+              \x20\x20 # because every way the enumeration goes wrong arrives as\n\
+              \x20\x20 # the one line 'Could not match drm and vulkan device'.\n\
+              \x20\x20 for f in /usr/share/vulkan/icd.d/nouveau_icd.*.json; do\n\
+              \x20\x20\x20 [ -r \"$f\" ] && { export VK_DRIVER_FILES=\"$f\" VK_ICD_FILENAMES=\"$f\"; break; }\n\
+              \x20\x20 done\n\
               \x20\x20 export GALLIUM_DRIVER=zink\n\
               \x20\x20 export MESA_LOADER_DRIVER_OVERRIDE=zink\n\
               \x20\x20 export SDL_RENDER_DRIVER=opengles2\n\

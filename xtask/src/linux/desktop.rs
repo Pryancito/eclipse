@@ -3086,6 +3086,18 @@ fn write_labwc_wrapper(rootfs: &Path) {
           \x20 elif grep -q 'nvidia\\.wlr_vulkan' /proc/cmdline 2>/dev/null; then\n\
           \x20\x20 : \"${WLR_RENDERER:=vulkan}\"; export WLR_RENDERER\n\
           \x20\x20 : \"${WLR_DRM_NO_MODIFIERS:=1}\"; export WLR_DRM_NO_MODIFIERS\n\
+          \x20\x20 # Vulkan compositor only: pin the loader to NVK's ICD. See the\n\
+          \x20\x20 # matching block in /etc/profile and eclipse-init's\n\
+          \x20\x20 # `nvk_icd_path` -- mesa-vulkan-drivers also installs lavapipe,\n\
+          \x20\x20 # which has no DRM device and so can only be noise in the\n\
+          \x20\x20 # physical-device list wlroots walks looking for card0's\n\
+          \x20\x20 # major:minor. The GLES2 default is left alone on purpose.\n\
+          \x20\x20 for f in /usr/share/vulkan/icd.d/nouveau_icd.*.json; do\n\
+          \x20\x20\x20 [ -r \"$f\" ] || continue\n\
+          \x20\x20\x20 : \"${VK_DRIVER_FILES:=$f}\"; export VK_DRIVER_FILES\n\
+          \x20\x20\x20 : \"${VK_ICD_FILENAMES:=$f}\"; export VK_ICD_FILENAMES\n\
+          \x20\x20\x20 break\n\
+          \x20\x20 done\n\
           \x20\x20 : \"${GALLIUM_DRIVER:=zink}\"; export GALLIUM_DRIVER\n\
           \x20\x20 : \"${MESA_LOADER_DRIVER_OVERRIDE:=zink}\"; export MESA_LOADER_DRIVER_OVERRIDE\n\
           \x20\x20 : \"${SDL_RENDER_DRIVER:=opengles2}\"; export SDL_RENDER_DRIVER\n\
@@ -3291,6 +3303,43 @@ fn write_labwc_wrapper(rootfs: &Path) {
           \x20 gles2|vulkan)\n\
           \x20\x20 if [ -z \"${ECLIPSE_LABWC_NO_FALLBACK:-}\" ]; then\n\
           \x20\x20\x20 rm -f /run/labwc-renderer-fallback 2>/dev/null\n\
+          \x20\x20\x20 # Vulkan pre-flight, written BEFORE the first attempt. The\n\
+          \x20\x20\x20 # four things wlroots' Vulkan renderer needs of the driver\n\
+          \x20\x20\x20 # are all readable from here, and when it refuses it says\n\
+          \x20\x20\x20 # only 'Could not match drm and vulkan device' -- one line\n\
+          \x20\x20\x20 # for every way the enumeration can fail. So record the\n\
+          \x20\x20\x20 # inputs: card0's major:minor (wlroots fstats the DRM fd it\n\
+          \x20\x20\x20 # opened and keeps the physical device whose\n\
+          \x20\x20\x20 # VK_EXT_physical_device_drm primary OR render pair equals\n\
+          \x20\x20\x20 # it), the device NVK reports for those fields, and the five\n\
+          \x20\x20\x20 # device extensions vulkan_device_create requires.\n\
+          \x20\x20\x20 if [ \"$WLR_RENDERER\" = vulkan ]; then\n\
+          \x20\x20\x20\x20 PRE=/tmp/labwc-vulkan-preflight.log\n\
+          \x20\x20\x20\x20 { echo \"# labwc vulkan pre-flight\"\n\
+          \x20\x20\x20\x20\x20 echo \"VK_DRIVER_FILES=${VK_DRIVER_FILES:-<sin pin: NVK no instalado>}\"\n\
+          \x20\x20\x20\x20\x20 echo \"WLR_DRM_DEVICES=${WLR_DRM_DEVICES:-<unset>}\"\n\
+          \x20\x20\x20\x20\x20 for node in /dev/dri/card0 /dev/dri/renderD128; do\n\
+          \x20\x20\x20\x20\x20\x20 mj=$(stat -c '%t' \"$node\" 2>/dev/null) || continue\n\
+          \x20\x20\x20\x20\x20\x20 mn=$(stat -c '%T' \"$node\" 2>/dev/null) || continue\n\
+          \x20\x20\x20\x20\x20\x20 printf '%s = %d:%d\\n' \"$node\" \"0x$mj\" \"0x$mn\" 2>/dev/null ||\n\
+          \x20\x20\x20\x20\x20\x20\x20 echo \"$node = 0x$mj:0x$mn\"\n\
+          \x20\x20\x20\x20\x20 done\n\
+          \x20\x20\x20\x20\x20 if command -v vulkaninfo >/dev/null 2>&1; then\n\
+          \x20\x20\x20\x20\x20\x20 echo '--- vulkaninfo: dispositivo, pareja DRM y las cinco extensiones ---'\n\
+          \x20\x20\x20\x20\x20\x20 vulkaninfo 2>&1 | grep -E 'deviceName|driverName|apiVersion|primaryMajor|primaryMinor|renderMajor|renderMinor|VK_EXT_physical_device_drm|VK_KHR_external_memory_fd|VK_KHR_image_format_list|VK_EXT_external_memory_dma_buf|VK_EXT_queue_family_foreign|VK_EXT_image_drm_format_modifier' | sort -u\n\
+          \x20\x20\x20\x20\x20 else\n\
+          \x20\x20\x20\x20\x20\x20 echo 'vulkaninfo NO instalado (apt-get install vulkan-tools)'\n\
+          \x20\x20\x20\x20\x20 fi\n\
+          \x20\x20\x20\x20 } >\"$PRE\" 2>&1 || true\n\
+          \x20\x20\x20 fi\n\
+          \x20\x20\x20 # The ladder. wlroots falls back from NOTHING on its own, so\n\
+          \x20\x20\x20 # every rung is this wrapper's: two attempts per renderer,\n\
+          \x20\x20\x20 # then the next one down. vulkan -> gles2 matters because\n\
+          \x20\x20\x20 # GLES2 on zink+NVK is still the GPU: before this, asking for\n\
+          \x20\x20\x20 # nvidia.wlr_vulkan and having it refuse cost you the whole\n\
+          \x20\x20\x20 # GPU session and landed the desktop on the CPU, which is why\n\
+          \x20\x20\x20 # trying the flag was never free.\n\
+          \x20\x20\x20 while :; do\n\
           \x20\x20\x20 n=0\n\
           \x20\x20\x20 while :; do\n\
           \x20\x20\x20\x20 n=$((n + 1))\n\
@@ -3304,6 +3353,22 @@ fn write_labwc_wrapper(rootfs: &Path) {
           \x20\x20\x20\x20 echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
           \x20\x20\x20\x20 sleep \"${ECLIPSE_LABWC_RETRY_DELAY:-1}\"\n\
           \x20\x20\x20\x20 : > \"$LOG\" 2>/dev/null || true\n\
+          \x20\x20\x20 done\n\
+          \x20\x20\x20 # Out of attempts on this renderer. Vulkan has a rung below\n\
+          \x20\x20\x20 # it that is still the GPU; GLES2 does not.\n\
+          \x20\x20\x20 [ \"$WLR_RENDERER\" = vulkan ] || break\n\
+          \x20\x20\x20 MSG=\"labwc: the vulkan renderer failed to initialize twice (log: $FAILED); dropping to GLES2 on zink+NVK, which is STILL the GPU. Check: cat /tmp/labwc-vulkan-preflight.log\"\n\
+          \x20\x20\x20 echo \"$MSG\" >>\"$LOG\" 2>/dev/null || true\n\
+          \x20\x20\x20 echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+          \x20\x20\x20 # Forced, not `:=`: vulkan is what just failed. The zink\n\
+          \x20\x20\x20 # client pins and WLR_DRM_NO_MODIFIERS are already right for\n\
+          \x20\x20\x20 # GLES2; the Vulkan loader pin is NOT part of that session in\n\
+          \x20\x20\x20 # either of the other two env sources, so drop it and land on\n\
+          \x20\x20\x20 # the stack they describe, byte for byte.\n\
+          \x20\x20\x20 export WLR_RENDERER=gles2\n\
+          \x20\x20\x20 unset VK_DRIVER_FILES VK_ICD_FILENAMES\n\
+          \x20\x20\x20 sleep \"${ECLIPSE_LABWC_RETRY_DELAY:-1}\"\n\
+          \x20\x20\x20 : > \"$LOG\" 2>/dev/null || true\n\
           \x20\x20\x20 done\n\
           \x20\x20\x20 echo \"$WLR_RENDERER\" > /run/labwc-renderer-fallback 2>/dev/null || true\n\
           \x20\x20\x20 MSG=\"labwc: the $WLR_RENDERER renderer failed to initialize twice (log: $FAILED); falling back to pixman. Check: dmesg | grep nouveau-uapi\"\n\
