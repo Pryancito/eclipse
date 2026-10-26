@@ -66,7 +66,11 @@ impl<'a> BootWindow<'a> {
         let (bridge_log, bridges_changed) = gpu.set_path_vga_routing(true, &[]);
         log.push_str(&bridge_log);
 
-        // The piece Linux has and we did not. PDISP (`NV_PMC_ENABLE` bit 30)
+        // The piece Linux has and we did not -- and the piece that is NOT
+        // equivalent to it, which is why this is off unless asked for:
+        // Linux unbinds the firmware framebuffer and later does a full modeset
+        // of its own, while all we can undo is the `NV_PMC_ENABLE` write.
+        // PDISP (`NV_PMC_ENABLE` bit 30)
         // drops into engine-level reset the moment `kgspCalculateFbLayout` has
         // consumed `NV_PDISP_VGA_WORKSPACE_BASE` — the last thing in the boot
         // that needs the display — and comes back on the RM's own "RISCV
@@ -106,9 +110,14 @@ impl<'a> BootWindow<'a> {
         use pci::Location;
         let mut s = String::new();
         if self.display_off {
-            // Covers the boot that never reached the trigger at all. One that
-            // did has already consumed the arm, and `pdisp_restore` has either
-            // run or is still pending on the narration marker.
+            // Gives the display back AND cancels an arm that never fired, in
+            // that order -- `pdisp_kill_disarm` does both, because doing only
+            // the second (which is what this call used to mean) left PDISP in
+            // engine reset until reboot on any boot that did not reach its own
+            // restore anchor. Leaving this window is the deadline for getting
+            // the monitor back; nothing later is going to do it -- and a boot
+            // that wedges inside `gsp_boot_run` never leaves it at all, which
+            // is one of the reasons the hand-over is opt-in.
             nvidia_rm_sys::os_boundary::pdisp_kill_disarm();
             self.display_off = false;
         }

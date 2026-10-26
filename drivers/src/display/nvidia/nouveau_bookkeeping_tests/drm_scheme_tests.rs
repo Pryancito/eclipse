@@ -1207,22 +1207,31 @@ fn the_hand_over_actually_takes_the_display_away() {
     );
 }
 
-/// Handing the display over is the DEFAULT, not an opt-in.
+/// Handing the display over is an opt-in, and stays one until a boot shows
+/// the monitor coming back.
 ///
-/// Every earlier attempt at this wedge shipped as a `/proc/gpustep` an
-/// operator had to know to run, so the one change that addressed the cause was
-/// never in the path that actually boots the card. A default of `false` here
-/// would reproduce that exactly, and silently.
+/// It shipped on by default for exactly one hardware boot: "al arrancar el
+/// entorno grafico el monitor pierde senal y no se recupera". Part of that was
+/// a restore that got cancelled instead of run (now fixed in
+/// `pdisp_kill_disarm`), but the other part is not fixable from here --
+/// `pdisp_restore` writes `NV_PMC_ENABLE` back and nothing restores the
+/// scanout state the VBIOS programmed, which an engine-level reset wipes.
+/// Linux does not have the problem because it never resets PDISP; it unbinds
+/// the firmware framebuffer and does a modeset of its own.
+///
+/// Flipping this default back to `true` costs the screen for the whole session
+/// on a box where it does not come back, and there is no console left to read
+/// the log on. That is why it is pinned rather than left to a comment.
 #[test]
-fn the_display_is_handed_over_unless_someone_asks_otherwise() {
-    assert!(
-        crate::display::nouveau_uapi::display_off_for_gsp(),
-        "the console GPU boots with its display handed over by default;          `nvidia.nodispoff` is the opt-OUT"
-    );
-    crate::display::nouveau_uapi::set_display_off_for_gsp(false);
+fn the_display_is_only_handed_over_when_someone_asks() {
     assert!(
         !crate::display::nouveau_uapi::display_off_for_gsp(),
-        "`nvidia.nodispoff` must still reach the boot path"
+        "handing the console GPU's display over is OFF by default: the one boot that ran          with it on never got its picture back. `nvidia.dispoff` is the opt-IN"
     );
     crate::display::nouveau_uapi::set_display_off_for_gsp(true);
+    assert!(
+        crate::display::nouveau_uapi::display_off_for_gsp(),
+        "`nvidia.dispoff` must still reach the boot path"
+    );
+    crate::display::nouveau_uapi::set_display_off_for_gsp(false);
 }

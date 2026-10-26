@@ -437,9 +437,11 @@ pub fn set_gpu_trace_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_gpu_trace_enabled(_v: bool) {}
 
-/// Keep the console GPU's display engine running across its own GSP boot
-/// (`nvidia.nodispoff`), the way every boot before this did. Default is to
-/// turn it off for that window, like Linux: see `display_off_for_gsp`.
+/// Hand the console GPU's display engine over to its firmware across the SEC2
+/// window of its own GSP boot (`nvidia.dispoff`). **Off by default**: coming
+/// back out of PDISP reset restores `NV_PMC_ENABLE` and not the scanout state
+/// the VBIOS programmed, so the monitor can stay dark for the session. See
+/// `display_off_for_gsp`.
 #[cfg(target_arch = "x86_64")]
 pub fn set_display_off_for_gsp(v: bool) {
     zcore_drivers::display::set_display_off_for_gsp(v);
