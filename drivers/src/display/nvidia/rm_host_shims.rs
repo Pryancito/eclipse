@@ -16,9 +16,47 @@ extern "C" fn eclipse_rm_attach_gpu(
 ) -> u32 {
     NV_ERR_NOT_SUPPORTED
 }
+/// The GIOPS bench: 2176 threads of a million IMADs each, 435.2 ms on
+/// the PTIMER, which is 5.000 GIOPS; `bench_zero_time` is a grid that
+/// ran with both timestamps at 0.
 #[no_mangle]
-extern "C" fn eclipse_rm_bench(_a0: u32, _a1: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_bench(_a0: u32, out: *mut nvidia_rm_sys::rm_init::GrBench) -> u32 {
+    let Some(ran) = rung("bench") else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    let (_, sem) = waits(ran);
+    let sem = if sem == NOT_REACHED {
+        NV_ERR_TIMEOUT
+    } else {
+        sem
+    };
+    let zero = FAKE_RM.lock().bench_zero_time;
+    let t1 = if zero || sem != NV_OK {
+        0
+    } else {
+        1000 + 435_200_000
+    };
+    unsafe {
+        *out = nvidia_rm_sys::rm_init::GrBench {
+            lookup_status: NV_OK,
+            map_status: NV_OK,
+            token_status: NV_OK,
+            submit_status: NV_OK,
+            sem_status: sem,
+            num_threads: 2176,
+            imads_per_thread: 1_000_000,
+            push_dwords: 24,
+            sem_iters: 9,
+            reserved_pad: 0,
+            t0_ns: if t1 == 0 { 0 } else { 1000 },
+            t1_ns: t1,
+            elapsed_ns: t1.saturating_sub(1000),
+            total_ops: 2_176_000_000,
+            kernel_va: COMPUTE_KERNEL_VA,
+            qmd_va: COMPUTE_QMD_VA,
+        };
+    }
+    NV_OK
 }
 #[no_mangle]
 extern "C" fn eclipse_rm_ce_blit(_a0: u32, _a1: u64, _a2: u64, _a3: u64, _a4: *mut u8) -> u32 {
@@ -494,9 +532,41 @@ extern "C" fn eclipse_rm_mark_console_gpu(_a0: u32, _a1: u64, _a2: u8) -> u32 {
 extern "C" fn eclipse_rm_state_init(_a0: u32, _a1: *mut u8) -> u32 {
     NV_ERR_NOT_SUPPORTED
 }
+/// Step 10, the copy-engine test: two 1 MiB buffers, the memsets always
+/// land; `Submitted` is a copy that timed out, `Fenced`/`Completed` a
+/// copy whose readback has three wrong dwords, the first at index 7.
 #[no_mangle]
-extern "C" fn eclipse_rm_step10(_a0: u32, _a1: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_step10(_a0: u32, out: *mut nvidia_rm_sys::rm_init::Step10Result) -> u32 {
+    let Some(ran) = rung("step10") else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    let (copy, verify) = match ran {
+        Ran::Submitted => (NV_ERR_TIMEOUT, NOT_REACHED),
+        Ran::Fenced | Ran::Completed => (NV_OK, NV_ERR_INVALID_STATE),
+        Ran::Verified => (NV_OK, NV_OK),
+    };
+    let checked = verify != NOT_REACHED;
+    unsafe {
+        *out = nvidia_rm_sys::rm_init::Step10Result {
+            ce_utils_status: NV_OK,
+            alloc_a_status: NV_OK,
+            alloc_b_status: NV_OK,
+            poison_status: NV_OK,
+            memset_status: NV_OK,
+            copy_status: copy,
+            verify_status: verify,
+            buffer_size: 1 << 20,
+            pa_a: 0x1000_0000,
+            pa_b: 0x1010_0000,
+            pattern: 0xec11_05a5,
+            poison: 0xdead_beef,
+            dwords_checked: if checked { 262_144 } else { 0 },
+            mismatch_count: if verify == NV_ERR_INVALID_STATE { 3 } else { 0 },
+            first_mismatch_idx: if verify == NV_ERR_INVALID_STATE { 7 } else { 0 },
+            first_mismatch_val: 0,
+        };
+    }
+    NV_OK
 }
 #[no_mangle]
 extern "C" fn eclipse_rm_step15(_a0: u32, out: *mut nvidia_rm_sys::rm_init::GrProbe) -> u32 {
@@ -637,29 +707,213 @@ extern "C" fn eclipse_rm_step17(_inst: u32, out: *mut GrChannel) -> u32 {
     }
     NV_OK
 }
+// ----- The compute rungs (steps 18..23), the bench and step 10 -----
+//
+// One knob, `FakeRm::compute`, says how far each of them got; the per-stage
+// statuses the C side fills are derived from that, in the shape its
+// `EclipseGr*` structs have: `0xFFFF_FFFF` for a stage never reached,
+// `NV_ERR_TIMEOUT` for the wait that gave up, `NV_ERR_INVALID_STATE` for a
+// verification that found the wrong answer. `None` is the stub's refusal.
+
+/// How far a compute rung got. Each later state implies the earlier
+/// stages passed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Ran {
+    /// The doorbell rang and nothing landed: the first wait timed out.
+    Submitted,
+    /// The host side landed (the PBDMA semaphore, the post-PCAS fence,
+    /// step 10's copy) and the engine never answered: the second wait
+    /// timed out.
+    Fenced,
+    /// The engine answered and the result is wrong (the stored dword, a
+    /// thread's slot, a copied dword).
+    Completed,
+    /// Everything verified.
+    Verified,
+}
+
+const NOT_REACHED: u32 = 0xFFFF_FFFF;
+const NV_ERR_TIMEOUT: u32 = nvidia_rm_sys::types::NV_ERR_TIMEOUT;
+/// The work-submit token and the runlist the fake's channel sits on.
+const COMPUTE_TOKEN: u32 = 0x0008_0000;
+const COMPUTE_KERNEL_VA: u64 = 0x9_0000;
+const COMPUTE_QMD_VA: u64 = 0x9_1000;
+const COMPUTE_OUT_VA: u64 = 0x9_2000;
+
+/// Records and narrates the call, and answers the knob.
+fn rung(call: &'static str) -> Option<Ran> {
+    let mut f = FAKE_RM.lock();
+    f.calls.push(call);
+    f.narrate(call);
+    f.compute
+}
+
+/// `(first wait, second wait)` statuses for `ran`.
+fn waits(ran: Ran) -> (u32, u32) {
+    match ran {
+        Ran::Submitted => (NV_ERR_TIMEOUT, NOT_REACHED),
+        Ran::Fenced => (NV_OK, NV_ERR_TIMEOUT),
+        Ran::Completed | Ran::Verified => (NV_OK, NV_OK),
+    }
+}
+
+/// The verification status for `ran`: not reached until the engine
+/// answered, wrong on `Completed`, right on `Verified`.
+fn verdict(ran: Ran) -> u32 {
+    match ran {
+        Ran::Submitted | Ran::Fenced => NOT_REACHED,
+        Ran::Completed => NV_ERR_INVALID_STATE,
+        Ran::Verified => NV_OK,
+    }
+}
+
 #[no_mangle]
-extern "C" fn eclipse_rm_step18(_a0: u32, _a1: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_step18(_a0: u32, out: *mut nvidia_rm_sys::rm_init::GrLaunch) -> u32 {
+    let Some(ran) = rung("step18") else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    let (host, eng) = waits(ran);
+    unsafe {
+        *out = nvidia_rm_sys::rm_init::GrLaunch {
+            lookup_status: NV_OK,
+            map_status: NV_OK,
+            token_status: NV_OK,
+            submit_status: NV_OK,
+            host_sem_status: host,
+            eng_sem_status: eng,
+            work_token: COMPUTE_TOKEN,
+            runlist_id: 0,
+            host_sem_value: if host == NV_OK { 0x1818_0001 } else { 0 },
+            eng_sem_value: if eng == NV_OK { 0x1818_0002 } else { 0 },
+            host_poll_iters: 3,
+            eng_poll_iters: if eng == NOT_REACHED { 0 } else { 7 },
+            push_dwords: 12,
+        };
+    }
+    NV_OK
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_step19(_a0: u32, _a1: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_step19(_a0: u32, out: *mut nvidia_rm_sys::rm_init::GrCompute) -> u32 {
+    let Some(ran) = rung("step19") else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    let (fence, sem) = waits(ran);
+    unsafe {
+        *out = nvidia_rm_sys::rm_init::GrCompute {
+            lookup_status: NV_OK,
+            map_status: NV_OK,
+            token_status: NV_OK,
+            submit_status: NV_OK,
+            fence_status: fence,
+            sem_status: sem,
+            work_token: COMPUTE_TOKEN,
+            runlist_id: 0,
+            fence_value: if fence == NV_OK { 0x19 } else { 0 },
+            fence_iters: 2,
+            sem_value: if sem == NV_OK { 0x1919 } else { 0 },
+            poll_iters: if sem == NOT_REACHED { 0 } else { 5 },
+            push_dwords: 40,
+            reserved_pad: 0,
+            kernel_va: COMPUTE_KERNEL_VA,
+            qmd_va: COMPUTE_QMD_VA,
+        };
+    }
+    NV_OK
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_step20(_a0: u32, _a1: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_step20(_a0: u32, out: *mut nvidia_rm_sys::rm_init::GrStore) -> u32 {
+    let Some(ran) = rung("step20") else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    let (fence, sem) = waits(ran);
+    let store = verdict(ran);
+    unsafe {
+        *out = nvidia_rm_sys::rm_init::GrStore {
+            lookup_status: NV_OK,
+            map_status: NV_OK,
+            token_status: NV_OK,
+            submit_status: NV_OK,
+            fence_status: fence,
+            sem_status: sem,
+            store_status: store,
+            work_token: COMPUTE_TOKEN,
+            runlist_id: 0,
+            fence_value: if fence == NV_OK { 0x20 } else { 0 },
+            fence_iters: 2,
+            sem_value: if sem == NV_OK { 0x2020 } else { 0 },
+            sem_iters: if sem == NOT_REACHED { 0 } else { 5 },
+            store_value: if store == NV_OK { 0xec0d_e520 } else { 0 },
+            push_dwords: 44,
+            reserved_pad: 0,
+            kernel_va: COMPUTE_KERNEL_VA,
+            qmd_va: COMPUTE_QMD_VA,
+            dest_va: COMPUTE_OUT_VA,
+        };
+    }
+    NV_OK
+}
+
+/// Steps 21, 22 and 23 share `GrThreads`: `slots` results, slot 5 wrong on
+/// `Completed`. Step 23 also queries the MMU fault status, which it
+/// reports whenever the grid did not verify.
+fn threads(ran: Ran, slots: u32, faults: bool) -> nvidia_rm_sys::rm_init::GrThreads {
+    let (fence, sem) = waits(ran);
+    let verify = verdict(ran);
+    let wrong = verify == NV_ERR_INVALID_STATE;
+    let queried = faults && ran != Ran::Verified;
+    nvidia_rm_sys::rm_init::GrThreads {
+        lookup_status: NV_OK,
+        map_status: NV_OK,
+        token_status: NV_OK,
+        submit_status: NV_OK,
+        fence_status: fence,
+        sem_status: sem,
+        verify_status: verify,
+        work_token: COMPUTE_TOKEN,
+        runlist_id: 0,
+        fence_iters: 2,
+        sem_iters: if sem == NOT_REACHED { 0 } else { 5 },
+        match_count: match ran {
+            Ran::Verified => slots,
+            Ran::Completed => slots - 1,
+            _ => 0,
+        },
+        first_bad_idx: if wrong { 5 } else { NOT_REACHED },
+        first_bad_val: if wrong { 0xdead } else { 0 },
+        push_dwords: 48,
+        reserved_pad: 0,
+        kernel_va: COMPUTE_KERNEL_VA,
+        qmd_va: COMPUTE_QMD_VA,
+        out_va: COMPUTE_OUT_VA,
+        fault_ctrl_status: if queried { NV_OK } else { NOT_REACHED },
+        fault_addr_hi: if queried { 0x1 } else { 0 },
+        fault_addr_lo: if queried { 0x2000 } else { 0 },
+        fault_type: if queried { 0x3 } else { 0 },
+    }
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_step21(_a0: u32, _a1: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_step21(_a0: u32, out: *mut nvidia_rm_sys::rm_init::GrThreads) -> u32 {
+    let Some(ran) = rung("step21") else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    unsafe { *out = threads(ran, 32, false) };
+    NV_OK
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_step22(_a0: u32, _a1: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_step22(_a0: u32, out: *mut nvidia_rm_sys::rm_init::GrThreads) -> u32 {
+    let Some(ran) = rung("step22") else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    unsafe { *out = threads(ran, 2176, false) };
+    NV_OK
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_step23(_a0: u32, _a1: *mut u8) -> u32 {
-    NV_ERR_NOT_SUPPORTED
+extern "C" fn eclipse_rm_step23(_a0: u32, out: *mut nvidia_rm_sys::rm_init::GrThreads) -> u32 {
+    let Some(ran) = rung("step23") else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    unsafe { *out = threads(ran, 32, true) };
+    NV_OK
 }
 #[no_mangle]
 extern "C" fn eclipse_rm_step8(_a0: u32, _a1: *mut u8) -> u32 {
@@ -847,6 +1101,11 @@ pub(super) struct FakeRm {
     /// The display cursor plane: `(init status, heads, image status)`;
     /// `None` is a build without one (every call `NV_ERR_NOT_SUPPORTED`).
     pub hwcursor: Option<(u32, u32, u32)>,
+    /// How far the compute rungs (`step18`..`step23`, `bench`, `step10`)
+    /// get; `None` is the stub's `NV_ERR_NOT_SUPPORTED`. See [`Ran`].
+    pub compute: Option<Ran>,
+    /// The bench grid ran but the PTIMER read 0 both times.
+    pub bench_zero_time: bool,
 }
 
 /// `ECLIPSE_CHAN_BUF_SIZE`: the channel's own buffer, pushbuffer and ring,
@@ -934,6 +1193,8 @@ const EMPTY_RM: FakeRm = FakeRm {
     intr_table: None,
     narrates: false,
     hwcursor: None,
+    compute: None,
+    bench_zero_time: false,
 };
 
 pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);
