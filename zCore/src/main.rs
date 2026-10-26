@@ -103,6 +103,27 @@ fn deadlock_spins(cmdline: &str) -> Option<Result<u64, &str>> {
     Some(kernel_hal::cmdline::parse_number(spelled).ok_or(spelled))
 }
 
+/// Whether the command line asks for the card that scans out to go through the
+/// boot-time bring-up, the same one every other card goes through.
+///
+/// There is one bring-up path now, so this is not a choice of path: it is
+/// whether that card takes it AT BOOT, while its GSP boot still wedges at the
+/// SEC2 `STARTCPU` store.
+///
+/// **`nvidia.console_gpu` is not a spelling of this, on purpose.** It already
+/// selects the deferred task -- wait for the desktop, park scanout, then bring
+/// the card up -- and that is the one recipe that has finished with both cards
+/// up on real hardware. Accepting it here would run the boot-time attempt
+/// first, wedge, and never reach the desktop the deferred task waits for: the
+/// flag would keep its name and lose its meaning. `nvidia.noconsole_gpu` beats
+/// this one as well, so a cmdline written against the old default leaves that
+/// card cold whichever flag it used.
+#[cfg(any(feature = "linux", test))]
+fn scanout_gpu_bringup_asked(cmdline: &str) -> bool {
+    kernel_hal::cmdline::flag(cmdline, "nvidia.scanout_gpu")
+        && !kernel_hal::cmdline::flag(cmdline, "nvidia.noconsole_gpu")
+}
+
 fn primary_main(config: kernel_hal::KernelConfig) {
     logging::init();
     kernel_hal::console::early_progress_bar(53);
@@ -1156,16 +1177,23 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             let want_console_gpu = console_gpu_by_default
                 || kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu");
             // One bring-up path for every card now; this only says whether the
-            // card that scans out is brought up at all, while its GSP boot
-            // still wedges at the SEC2 store. `nvidia.scanout_gpu` is the
-            // name, `nvidia.console_gpu` the older spelling of the same thing,
-            // and `nvidia.noconsole_gpu` beats both so a cmdline written
-            // against the old default still leaves that card cold.
-            kernel_hal::drivers::set_scanout_gpu_bringup(
-                (kernel_hal::cmdline::flag(&options.cmdline, "nvidia.scanout_gpu")
-                    || kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu"))
-                    && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.noconsole_gpu"),
-            );
+            // card that scans out goes through it AT BOOT, while its GSP boot
+            // still wedges at the SEC2 store.
+            //
+            // `nvidia.console_gpu` is deliberately NOT accepted as a spelling
+            // of this. It already means something else and something that
+            // works: the deferred task below, which waits for the desktop,
+            // parks scanout and has finished with both cards up on real
+            // hardware. Taking it as a synonym here would run the boot-time
+            // attempt FIRST, wedge at `STARTCPU`, and the boot would never
+            // reach the desktop the deferred task waits for -- so the one
+            // recipe that works would be replaced by one that does not, under
+            // the flag that used to select it. `nvidia.noconsole_gpu` still
+            // beats this one too, so a cmdline written against the old default
+            // leaves that card cold either way.
+            kernel_hal::drivers::set_scanout_gpu_bringup(scanout_gpu_bringup_asked(
+                &options.cmdline,
+            ));
             // `/proc/gpuready` answers for the console card, and that card only
             // becomes usable because the task below brings it up. Tell the
             // reader whether anyone scheduled it: without this a box booted
@@ -1639,7 +1667,7 @@ fn secondary_main() -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::deadlock_spins;
+    use super::{deadlock_spins, scanout_gpu_bringup_asked};
 
     /// The line a live Eclipse boots with, which mentions no threshold.
     const REAL: &str = "LOG=error:TERM=xterm-256color:console.shell=true:ROOT=/dev/sda2";
@@ -1735,5 +1763,43 @@ mod tests {
             deadlock_spins("LOG=error: DEADLOCKSPINS = 20000000 "),
             Some(Ok(20_000_000))
         );
+    }
+
+    /// `nvidia.scanout_gpu` is the only flag that puts the card that scans out
+    /// through the boot-time bring-up.
+    #[test]
+    fn the_boot_time_bring_up_of_the_scanout_card_is_asked_for_by_one_name() {
+        assert!(scanout_gpu_bringup_asked("LOG=error:nvidia.scanout_gpu"));
+        assert!(!scanout_gpu_bringup_asked(REAL));
+        assert!(!scanout_gpu_bringup_asked(""));
+    }
+
+    /// The one that would have cost his desktop: `nvidia.console_gpu` must NOT
+    /// read as a synonym.
+    ///
+    /// It selects the deferred task -- wait for the desktop, park scanout,
+    /// bring the card up -- which is the only recipe that has ever finished
+    /// with both cards up. Read as a synonym, the boot-time attempt runs
+    /// first, wedges at the SEC2 `STARTCPU` store, and the boot never reaches
+    /// the desktop that the deferred task is waiting for. The flag would keep
+    /// its name and lose the behaviour it names.
+    #[test]
+    fn the_old_console_gpu_flag_does_not_turn_on_the_boot_time_attempt() {
+        assert!(!scanout_gpu_bringup_asked("LOG=error:nvidia.console_gpu"));
+        assert!(!scanout_gpu_bringup_asked(
+            "nvidia.console_gpu:nvidia.console_gsp"
+        ));
+    }
+
+    /// `nvidia.noconsole_gpu` still means "leave that card alone", whichever
+    /// flag asked for it.
+    #[test]
+    fn asking_for_the_card_to_be_left_cold_beats_asking_for_it_to_come_up() {
+        assert!(!scanout_gpu_bringup_asked(
+            "nvidia.scanout_gpu:nvidia.noconsole_gpu"
+        ));
+        assert!(!scanout_gpu_bringup_asked(
+            "nvidia.noconsole_gpu:nvidia.scanout_gpu"
+        ));
     }
 }
