@@ -230,18 +230,23 @@ impl DrmDev {
         prop_id: u32,
         value: u64,
     ) -> Result<usize> {
+        setproperty_called(obj_id, obj_type, prop_id, value);
         let Some((kind, props)) = find_mode_object(obj_id, obj_type, true) else {
-            return Err(propertyless_lookup_error(obj_id, obj_type));
+            let e = propertyless_lookup_error(obj_id, obj_type);
+            return Err(setproperty_refused(obj_id, "no object of that type", e));
         };
         // `drm_mode_obj_find_prop_id`.
         if !props.iter().any(|&(id, _)| id == prop_id) {
-            return Err(FsError::InvalidParam);
+            let why = "the object does not carry that property";
+            return Err(setproperty_refused(obj_id, why, FsError::InvalidParam));
         }
         let Some(spec) = prop_spec(prop_id) else {
-            return Err(FsError::InvalidParam);
+            let why = "unknown property";
+            return Err(setproperty_refused(obj_id, why, FsError::InvalidParam));
         };
         if !property_change_valid(&spec, value) {
-            return Err(FsError::InvalidParam);
+            let why = "value outside what the property admits";
+            return Err(setproperty_refused(obj_id, why, FsError::InvalidParam));
         }
         if prop_id == PROP_DPMS && kind == DRM_MODE_OBJECT_CONNECTOR {
             let off = value != DRM_MODE_DPMS_ON;
@@ -267,14 +272,12 @@ impl DrmDev {
         // value as a no-op, so a legacy client that moved the primary
         // plane's FB_ID here was told yes and kept scanning out the old one.
         if !drm::atomic_enabled() || !drm::software_kms_active() {
-            log::debug!(
-                "[drm] OBJ_SETPROPERTY obj={} type={:#x} prop={} val={} -> EINVAL (legacy KMS has no set_property)",
-                obj_id,
-                kind,
+            let why = alloc::format!(
+                "legacy KMS has no set_property for prop {} on type {:#x}",
                 prop_id,
-                value
+                kind
             );
-            return Err(FsError::InvalidParam);
+            return Err(setproperty_refused(obj_id, &why, FsError::InvalidParam));
         }
         let mut upd = drm::AtomicUpdate::default();
         atomic_stage(&mut upd, obj_id, prop_id, value)?;
@@ -3863,6 +3866,7 @@ use pre_wait_account::PreWaitAccount;
 mod wait_vblank_sleep;
 use legacy_disable_trace::{
     cursor_bo_called, dpms_set, getfb_served, kms_disabled, kms_refused, setcrtc_called,
+    setproperty_called, setproperty_refused,
 };
 use present_failed::{present_failed, PRESENT_FAIL_TRACED};
 
