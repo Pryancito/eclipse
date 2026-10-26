@@ -204,6 +204,11 @@ struct MountEntry {
     fstype: String,
     options: String,
     state: Arc<mount_state::MountState>,
+    /// Whether the kernel mounted a filesystem for it. A pseudo-filesystem
+    /// `mount(2)` acknowledges without mounting, and `/dev/shm`, which lives
+    /// inside devfs, are lines only: unmounting one takes the line and
+    /// touches no tree.
+    backed: bool,
 }
 
 lazy_static! {
@@ -676,6 +681,23 @@ pub(crate) fn register_mount(
     );
 }
 
+/// [`register_mount`] for a mount the kernel records and does not make: see
+/// [`MountEntry::backed`].
+pub(crate) fn register_line(source: &str, target: &str, fstype: &str, options: &str) {
+    record_mount(
+        &mut MOUNT_TABLE.lock(),
+        line_entry(source, target, fstype, options),
+    );
+}
+
+/// The entry [`register_line`] records.
+fn line_entry(source: &str, target: &str, fstype: &str, options: &str) -> MountEntry {
+    MountEntry {
+        backed: false,
+        ..new_mount_entry(source, target, fstype, options, None)
+    }
+}
+
 /// Put `entry` in `mounts`, on the mount it goes on.
 fn record_mount(mounts: &mut Vec<MountEntry>, mut entry: MountEntry) {
     entry.parent = mountinfo::parent_of(&entry.target, mounts.iter());
@@ -700,16 +722,12 @@ fn new_mount_entry(
         fstype: fstype.to_string(),
         options: options.to_string(),
         state: state.unwrap_or_else(|| Arc::new(mount_state::MountState::from_options(0, options))),
+        backed: true,
     }
 }
 
 /// The source and type of the mount on top at `target`, which a bind of it
 /// shows as its own.
-pub(crate) fn mount_origin(target: &str) -> Option<(String, String)> {
-    origin_in(&MOUNT_TABLE.lock(), target)
-}
-
-/// [`mount_origin`] over the table it is given.
 fn origin_in(mounts: &[MountEntry], target: &str) -> Option<(String, String)> {
     let target = normalize_mount_target(target);
     mounts
@@ -719,8 +737,66 @@ fn origin_in(mounts: &[MountEntry], target: &str) -> Option<(String, String)> {
         .map(|m| (m.source.clone(), m.fstype.clone()))
 }
 
-pub(crate) fn unregister_mount(target: &str) {
-    MOUNT_TABLE.lock().retain(|m| m.target != target);
+/// Whether a mount is recorded at `target`, and if so whether the top one
+/// there is [`MountEntry::backed`].
+fn top_backed(mounts: &[MountEntry], target: &str) -> Option<bool> {
+    let target = normalize_mount_target(target);
+    mounts
+        .iter()
+        .rev()
+        .find(|m| m.target == target)
+        .map(|m| m.backed)
+}
+
+/// What an `umount` of a point takes down: the top mount there and, for a
+/// lazy one, every mount under it.
+struct Unmount {
+    /// Whether the top one is [`MountEntry::backed`].
+    backed: bool,
+    /// The lines that go.
+    ids: Vec<usize>,
+}
+
+/// What an `umount` of `target` takes down, read off `mounts`.
+///
+/// It used to drop every line at the point, so where init had mounted over
+/// one of the kernel's, one `umount` took both lines and left a filesystem
+/// mounted with none.
+fn unmount_in(mounts: &[MountEntry], target: &str, detach: bool) -> LxResult<Unmount> {
+    let target = normalize_mount_target(target);
+    // Every process's root, whatever the table says: Linux answers `EBUSY`.
+    if target == "/" {
+        return Err(LxError::EBUSY);
+    }
+    let top = mounts
+        .iter()
+        .rev()
+        .find(|m| m.target == target)
+        .ok_or(LxError::EINVAL)?;
+    let mut ids = descendants(mounts, top.id);
+    // `do_umount`: a mount with others on it is busy, unless the caller asked
+    // for the lot to go (`MNT_DETACH`, `umount -l`).
+    if !ids.is_empty() && !detach {
+        return Err(LxError::EBUSY);
+    }
+    ids.push(top.id);
+    Ok(Unmount {
+        backed: top.backed,
+        ids,
+    })
+}
+
+/// The ids of every mount hung under the mount `id`, however deep.
+fn descendants(mounts: &[MountEntry], id: usize) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut parents = alloc::vec![id];
+    while let Some(parent) = parents.pop() {
+        for m in mounts.iter().filter(|m| m.parent == parent) {
+            found.push(m.id);
+            parents.push(m.id);
+        }
+    }
+    found
 }
 
 pub(crate) fn remount_flags(target: &str, flags: usize, data: &str) -> LxResult<()> {
@@ -753,10 +829,6 @@ fn remount_entry(
     Ok(())
 }
 
-pub(crate) fn move_mount_entry(old_target: &str, new_target: &str) -> LxResult<()> {
-    move_entry(&mut MOUNT_TABLE.lock(), old_target, new_target)
-}
-
 /// `MS_MOVE`, over the table it is given.
 fn move_entry(mounts: &mut [MountEntry], old_target: &str, new_target: &str) -> LxResult<()> {
     let old_target = normalize_mount_target(old_target);
@@ -775,6 +847,14 @@ fn move_entry(mounts: &mut [MountEntry], old_target: &str, new_target: &str) -> 
             .filter(|(i, _)| *i != at)
             .map(|(_, m)| m),
     );
+    // What hangs under it goes with it (`attach_recursive_mnt`), and keeps
+    // the place it had under it.
+    let below = descendants(mounts, mounts[at].id);
+    for m in mounts.iter_mut().filter(|m| below.contains(&m.id)) {
+        if let Some(rest) = m.target.strip_prefix(old_target.as_str()) {
+            m.target = alloc::format!("{}{}", new_target.trim_end_matches('/'), rest);
+        }
+    }
     let entry = &mut mounts[at];
     entry.target = new_target;
     entry.parent = parent;
@@ -1741,7 +1821,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // `add("shm", ...)` above); it is not a MountFS mount, because `/dev/*`
         // lookups bypass MountFS via the `lookup_virtual_fs` fast path. Register
         // it in the mount table only so `/proc/mounts` reflects reality.
-        register_mount("tmpfs", "/dev/shm", "tmpfs", &tmpfs_mount_opts(), None);
+        register_line("tmpfs", "/dev/shm", "tmpfs", &tmpfs_mount_opts());
     }
 
     // mount RamFS at /tmp — frame-backed pages, shared MemTotal/2 ceiling with
@@ -3751,3 +3831,6 @@ mod memfd_args_tests;
 
 #[cfg(test)]
 mod root_probe_tests;
+
+#[cfg(test)]
+mod unmount_tests;

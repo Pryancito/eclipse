@@ -21,8 +21,10 @@ pub struct MountFS {
     inner: Arc<dyn FileSystem>,
     /// All mounted children file systems
     mountpoints: RwLock<BTreeMap<INodeId, Arc<MountFS>>>,
-    /// The mount point of this file system
-    self_mountpoint: Option<Arc<MNode>>,
+    /// The mount point of this file system. Behind a lock because a move
+    /// takes the filesystem, with everything mounted inside it, to another
+    /// one: [`MNode::move_mount`].
+    self_mountpoint: RwLock<Option<Arc<MNode>>>,
     /// Weak reference to self
     self_ref: Weak<MountFS>,
 }
@@ -156,7 +158,7 @@ impl MountFS {
         MountFS {
             inner: fs,
             mountpoints: RwLock::new(BTreeMap::new()),
-            self_mountpoint: None,
+            self_mountpoint: RwLock::new(None),
             self_ref: Weak::default(),
         }
         .wrap()
@@ -183,6 +185,29 @@ impl MountFS {
         }
         .wrap()
     }
+
+    /// The root a lookup lands on at a mount point of this filesystem's: its
+    /// own, or the top one's where more were mounted on it.
+    ///
+    /// A second mount on a directory goes on the root of the first, so a
+    /// lookup that stopped at the first root never saw it: the mount was made,
+    /// listed, and hidden under the one it covered. Linux's `follow_mount`
+    /// climbs the same stack, so the last mount made on a directory is the one
+    /// its path shows.
+    fn top_root(self: &Arc<Self>) -> Arc<MNode> {
+        let mut fs = self.clone();
+        loop {
+            let root = fs.mountpoint_root_inode();
+            let above = match root.inode.metadata() {
+                Ok(metadata) => fs.mountpoints.read().get(&metadata.inode).cloned(),
+                Err(_) => None,
+            };
+            match above {
+                Some(up) => fs = up,
+                None => return root,
+            }
+        }
+    }
 }
 
 impl MNode {
@@ -208,7 +233,7 @@ impl MNode {
         let new_fs = MountFS {
             inner: fs,
             mountpoints: RwLock::new(BTreeMap::new()),
-            self_mountpoint: Some(self.self_ref.upgrade().unwrap()),
+            self_mountpoint: RwLock::new(Some(self.self_ref.upgrade().unwrap())),
             self_ref: Weak::default(),
         }
         .wrap();
@@ -246,11 +271,59 @@ impl MNode {
     }
 
     /// Unmount a filesystem previously mounted at this directory.
+    ///
+    /// What it, and everything mounted inside it, has written goes to the
+    /// device first, as Linux's `umount` syncs the filesystem it takes down. A
+    /// filesystem that holds writes back (btrfs) was otherwise dropped with
+    /// them. If they cannot be written it stays mounted, so they stay
+    /// reachable.
     pub fn umount(&self) -> Result<()> {
         let inode_id = self.inode.metadata()?.inode;
+        let fs = self.vfs.mountpoints.read().get(&inode_id).cloned();
+        fs.ok_or(FsError::InvalidParam)?.sync()?;
         if self.vfs.mountpoints.write().remove(&inode_id).is_none() {
             return Err(FsError::InvalidParam);
         }
+        Ok(())
+    }
+
+    /// The root of the filesystem mounted at this directory, if one is: the
+    /// next step up a stack of mounts.
+    pub fn mounted_root(&self) -> Option<Arc<MNode>> {
+        let inode_id = self.inode.metadata().ok()?.inode;
+        let fs = self.vfs.mountpoints.read().get(&inode_id).cloned()?;
+        Some(fs.mountpoint_root_inode())
+    }
+
+    /// Move the filesystem mounted at this directory onto `target`, and every
+    /// filesystem mounted inside it with it: they belong to it, not to the
+    /// path it was reached by, as a moved Linux mount takes its children.
+    ///
+    /// Nothing moves if `target` cannot take it. Mounting the filesystem
+    /// afresh at `target` instead would leave what was mounted inside it
+    /// behind, and `..` from a mount inside it climbing to where it was.
+    pub fn move_mount(&self, target: &MNode) -> Result<()> {
+        let target_meta = target.inode.metadata()?;
+        if target_meta.type_ != FileType::Dir {
+            return Err(FsError::NotDir);
+        }
+        if target
+            .vfs
+            .mountpoints
+            .read()
+            .contains_key(&target_meta.inode)
+        {
+            return Err(FsError::Busy);
+        }
+        let inode_id = self.inode.metadata()?.inode;
+        let fs = self
+            .vfs
+            .mountpoints
+            .write()
+            .remove(&inode_id)
+            .ok_or(FsError::InvalidParam)?;
+        *fs.self_mountpoint.write() = Some(target.self_ref.upgrade().unwrap());
+        target.vfs.mountpoints.write().insert(target_meta.inode, fs);
         Ok(())
     }
 
@@ -332,7 +405,8 @@ impl MNode {
                 if root {
                     Ok(self.self_ref.upgrade().unwrap())
                 } else if self.is_mountpoint_root() {
-                    match &self.vfs.self_mountpoint {
+                    let mountpoint = self.vfs.self_mountpoint.read().clone();
+                    match mountpoint {
                         Some(inode) => inode.find(root, ".."),
                         None => Ok(self.self_ref.upgrade().unwrap()),
                     }
@@ -363,10 +437,10 @@ impl MNode {
                     Ok(metadata) => metadata.inode,
                     Err(_) => return Ok(node),
                 };
-                if let Some(sub_vfs) = self.vfs.mountpoints.read().get(&inode_id) {
-                    Ok(sub_vfs.mountpoint_root_inode())
-                } else {
-                    Ok(node)
+                let sub_vfs = self.vfs.mountpoints.read().get(&inode_id).cloned();
+                match sub_vfs {
+                    Some(sub_vfs) => Ok(sub_vfs.top_root()),
+                    None => Ok(node),
                 }
             }
         }
@@ -417,7 +491,8 @@ impl FileSystem for MountFS {
     }
 
     fn root_inode(&self) -> Arc<dyn INode> {
-        match &self.self_mountpoint {
+        let mountpoint = self.self_mountpoint.read().clone();
+        match mountpoint {
             Some(inode) => inode.vfs.root_inode(),
             None => self.mountpoint_root_inode(),
         }
@@ -898,6 +973,49 @@ mod tests {
             "a `sync(2)` that stops at the top of the tree leaves every mounted \
              filesystem unflushed"
         );
+    }
+
+    #[test]
+    fn an_umount_writes_out_what_it_takes_down_first() {
+        let (_top, root) = tree();
+        let mnt = dir_at(&root, "mnt");
+        let outer = FlakyFS::new(RamFS::new());
+        mnt.mount(outer.clone()).unwrap();
+        let inside = dir_at(&root.find(false, "mnt").unwrap(), "in");
+        let inner = FlakyFS::new(RamFS::new());
+        inside.mount(inner.clone()).unwrap();
+        mnt.umount().unwrap();
+        assert_eq!(outer.syncs.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            inner.syncs.load(Ordering::SeqCst),
+            1,
+            "what was mounted inside it went unflushed"
+        );
+    }
+
+    /// A filesystem whose device is gone by the time it is synced.
+    struct Unsyncable(Arc<dyn FileSystem>);
+
+    impl FileSystem for Unsyncable {
+        fn sync(&self) -> Result<()> {
+            Err(FsError::DeviceError)
+        }
+        fn root_inode(&self) -> Arc<dyn INode> {
+            self.0.root_inode()
+        }
+        fn info(&self) -> FsInfo {
+            self.0.info()
+        }
+    }
+
+    #[test]
+    fn a_filesystem_that_cannot_be_written_out_stays_mounted() {
+        let (_top, root) = tree();
+        let mnt = dir_at(&root, "mnt");
+        mnt.mount(Arc::new(Unsyncable(fs_with("data")))).unwrap();
+        assert_eq!(mnt.umount(), Err(FsError::DeviceError));
+        assert!(mnt.is_mountpoint());
+        assert!(root.find(false, "mnt").unwrap().find(false, "data").is_ok());
     }
 
     // -------------------------------------------------------------- the dots
@@ -1438,5 +1556,107 @@ mod tests {
         });
         assert_eq!(got.0, Some(FsError::DeviceError));
         assert_eq!(got.1, Some(FsError::DeviceError));
+    }
+
+    // ------------------------------------------------- stacks and moves
+
+    /// A ramfs holding one empty file called `name`.
+    fn fs_with(name: &str) -> Arc<dyn FileSystem> {
+        let fs = RamFS::new();
+        fs.root_inode().create(name, FileType::File, 0o644).unwrap();
+        fs
+    }
+
+    #[test]
+    fn a_second_mount_on_a_directory_is_the_one_its_path_shows() {
+        let (_top, root) = tree();
+        let d = dir_at(&root, "d");
+        d.mount(fs_with("first")).unwrap();
+        // Through the path, as `mount` reaches its target: onto the first one.
+        let first = root.find(false, "d").unwrap();
+        first.mount(fs_with("second")).unwrap();
+        let shown = root.find(false, "d").unwrap();
+        assert!(
+            shown.find(false, "second").is_ok(),
+            "the top mount is hidden"
+        );
+        assert!(shown.find(false, "first").is_err());
+        assert_eq!(
+            entries(&root.find(false, "d").unwrap()),
+            ["second"],
+            "a listing is the top one's"
+        );
+        // Taking the top one down uncovers the first.
+        first.umount().unwrap();
+        let shown = root.find(false, "d").unwrap();
+        assert!(shown.find(false, "first").is_ok());
+        assert!(shown.find(false, "second").is_err());
+    }
+
+    #[test]
+    fn up_a_stack_is_one_step_at_a_time() {
+        let (_top, root) = tree();
+        let d = dir_at(&root, "d");
+        assert!(d.mounted_root().is_none());
+        d.mount(fs_with("first")).unwrap();
+        let first = d.mounted_root().unwrap();
+        assert!(first.find(false, "first").is_ok());
+        assert!(first.mounted_root().is_none());
+        first.mount(fs_with("second")).unwrap();
+        let second = first.mounted_root().unwrap();
+        assert!(second.find(false, "second").is_ok());
+        assert!(
+            d.mounted_root().unwrap().find(false, "first").is_ok(),
+            "the directory's own mount is still the first"
+        );
+    }
+
+    #[test]
+    fn a_moved_mount_takes_what_is_mounted_inside_it() {
+        let (_top, root) = tree();
+        let from = dir_at(&root, "from");
+        // Somewhere `..` from where it was does not also lead.
+        let elsewhere = dir_at(&root, "elsewhere");
+        let onto = dir_at(&elsewhere, "onto");
+        from.mount(RamFS::new()).unwrap();
+        let sub = dir_at(&root.find(false, "from").unwrap(), "sub");
+        sub.mount(fs_with("x")).unwrap();
+
+        from.move_mount(&onto).unwrap();
+        assert!(!from.is_mountpoint());
+        assert!(root
+            .find(false, "from")
+            .unwrap()
+            .find(false, "sub")
+            .is_err());
+        let moved = elsewhere.find(false, "onto").unwrap();
+        let inside = moved.find(false, "sub").unwrap();
+        assert!(
+            inside.find(false, "x").is_ok(),
+            "what was inside stayed behind"
+        );
+        // `..` climbs to where it is now, not to where it was.
+        let up = inside.find(false, "..").unwrap();
+        assert!(up.find(false, "sub").is_ok());
+        assert!(up.find(false, "..").unwrap().is_same_node(&elsewhere));
+    }
+
+    #[test]
+    fn a_move_onto_something_that_cannot_take_it_moves_nothing() {
+        let (_top, root) = tree();
+        let from = dir_at(&root, "from");
+        let file = file_at(&root, "file");
+        let busy = dir_at(&root, "busy");
+        from.mount(fs_with("x")).unwrap();
+        busy.mount(RamFS::new()).unwrap();
+        assert_eq!(from.move_mount(&file), Err(FsError::NotDir));
+        assert_eq!(from.move_mount(&busy), Err(FsError::Busy));
+        assert!(from.is_mountpoint());
+        assert!(root.find(false, "from").unwrap().find(false, "x").is_ok());
+        let plain = dir_at(&root, "plain");
+        assert_eq!(plain.move_mount(&file), Err(FsError::NotDir));
+        let other = dir_at(&root, "other");
+        assert_eq!(plain.move_mount(&other), Err(FsError::InvalidParam));
+        assert!(!other.is_mountpoint());
     }
 }

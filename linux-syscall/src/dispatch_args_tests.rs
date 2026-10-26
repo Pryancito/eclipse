@@ -1824,10 +1824,11 @@ fn the_pointer_words_of_a_mount_and_an_unmount() {
             // `umount2`'s two words are a pointer and a flag word, and the
             // one thing a swap cannot survive is the flag word being zero: a
             // null pointer is refused by the check that every user pointer
-            // goes through, before the path is read.
+            // goes through, before the path is read. Read the right way
+            // round, it asks to unmount the root, which is EBUSY.
             assert_eq!(
                 by_number(sys, Sys::UMOUNT2, [at(&slash), 0, 0, 0, 0, 0]).await,
-                errno(LxError::EINVAL),
+                errno(LxError::EBUSY),
                 "umount2 took its flag word as the path"
             );
             assert_eq!(
