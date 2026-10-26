@@ -394,9 +394,11 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     //   `userboot` with an invalid opcode instead of a wrong time.
     //
     // `vdso.time_values=off` leaves the page as the blob shipped it, which is
-    // the behaviour every build before this one had.
+    // the behaviour every build before this one had. `vdso.kernel_clock=off`
+    // is the narrower hatch: it keeps the page written whenever the TSC can
+    // carry it, and only declines the kernel-routed fallback below.
     if !kernel_hal::cmdline::is_off(cmdline, "vdso.time_values") {
-        write_vdso_time_values(vdso, &vdso_vmo);
+        write_vdso_time_values(vdso, &vdso_vmo, cmdline);
     }
     // Any VMO whose name starts with "vdso/" is a vDSO variant; the first one
     // is the one userboot maps into the programs it launches.
@@ -730,15 +732,183 @@ fn syscall_args(ctx: &UserContext) -> [usize; 8] {
     }
 }
 
+/// The seven vDSO entry points that build a time out of `DATA_TIME_VALUES`
+/// and the raw tick counter, each paired with the kernel-routed stub the same
+/// blob already ships for it.
+///
+/// The list is not a guess: it is every function in
+/// `prebuilt/zircon/x64/libzircon.so` whose disassembly references
+/// `DATA_TIME_VALUES`, minus `_zx_ticks_per_second` (which reads only the
+/// frequency word, and for which the blob ships no kernel-routed variant),
+/// plus `zx_deadline_after`, which reads nothing itself but `call`s
+/// `_zx_clock_get_monotonic` by address -- an internal call no amount of
+/// symbol rewriting would catch, which is exactly why the blob carries a
+/// `_via_kernel_mono` stub for it.
+///
+/// Each target was read instruction by instruction to confirm it reaches the
+/// kernel without touching the page: the two `_via_kernel_ticks` variants are
+/// deliberately NOT in this list, because they get the ticks from the kernel
+/// and then still scale them with the page's numerator and denominator -- and
+/// a zero denominator is the one value the blob answers with `ud2`.
+///
+/// This is Fuchsia's own mechanism under Fuchsia's own condition: its
+/// `VDso::Create` redirects these names when the platform's tick counter
+/// cannot be read from userspace. The stubs are the blob's; all we choose is
+/// which variant each public name resolves to.
+#[cfg(any(test, all(target_arch = "x86_64", not(feature = "libos"))))]
+const VDSO_KERNEL_CLOCK_REDIRECTS: [(&str, &str); 7] = [
+    (
+        "zx_clock_get_monotonic",
+        "CODE_SYSCALL_zx_clock_get_monotonic_via_kernel",
+    ),
+    (
+        "zx_clock_get_boot",
+        "CODE_SYSCALL_zx_clock_get_boot_via_kernel",
+    ),
+    ("zx_ticks_get", "CODE_SYSCALL_zx_ticks_get_via_kernel"),
+    (
+        "zx_ticks_get_boot",
+        "CODE_SYSCALL_zx_ticks_get_boot_via_kernel",
+    ),
+    ("zx_deadline_after", "CODE_deadline_after_via_kernel_mono"),
+    ("zx_clock_read_mapped", "CODE_clock_read_mapped_via_kernel"),
+    (
+        "zx_clock_get_details_mapped",
+        "CODE_clock_get_details_mapped_via_kernel",
+    ),
+];
+
+/// Where to write, and what, to point every entry point of
+/// [`VDSO_KERNEL_CLOCK_REDIRECTS`] at its kernel-routed stub: the file offset
+/// of the `st_value` of its `.dynsym` entry, and the stub's address.
+///
+/// Userboot resolves the vDSO's exports through `.dynsym`, so this is the
+/// whole of the redirect: the bytes of the functions are untouched and both
+/// the public `zx_` alias and the `_zx_` one move together, since a program
+/// can link either.
+///
+/// All or nothing, which is why the offsets are collected before any of them
+/// is used. A stub `resolve` cannot find, a `.dynsym` whose file offset is not
+/// its mapped address, an entry point the table does not carry twice: any of
+/// them answers `None`, so the caller keeps the old behaviour rather than a
+/// half-redirected vDSO where `zx_deadline_after` and
+/// `zx_clock_get_monotonic` disagree about which clock they are on.
+#[cfg(any(test, all(target_arch = "x86_64", not(feature = "libos"))))]
+fn vdso_time_redirect_writes(
+    vdso: &[u8],
+    resolve: impl Fn(&str) -> Option<u64>,
+) -> Option<Vec<(usize, u64)>> {
+    /// `Elf64_Sym` and the offset of `st_value` inside one.
+    const SYM_SIZE: usize = 24;
+    const SYM_VALUE_OFFSET: usize = 8;
+
+    let elf = ElfFile::new(vdso).ok()?;
+    let dynsym = elf.find_section_by_name(".dynsym")?;
+    let dynstr = elf.find_section_by_name(".dynstr")?;
+    // The VMO holds the file image and the mapping is by virtual address, so a
+    // write at the file offset is only visible to the guest while the two
+    // agree. They do in every vDSO in `prebuilt/` (the first `LOAD` segment
+    // starts at offset 0 and address 0), and this is the check that keeps a
+    // future blob that relaid them out from being silently half-patched.
+    if dynsym.offset() != dynsym.address() {
+        return None;
+    }
+    let (table_offset, table_size) = (dynsym.offset() as usize, dynsym.size() as usize);
+    let (names_offset, names_size) = (dynstr.offset() as usize, dynstr.size() as usize);
+    if table_offset.checked_add(table_size)? > vdso.len()
+        || names_offset.checked_add(names_size)? > vdso.len()
+    {
+        return None;
+    }
+    let names = &vdso[names_offset..names_offset + names_size];
+    let name_at = |index: usize| -> Option<&str> {
+        let rest = names.get(index..)?;
+        let end = rest.iter().position(|&b| b == 0)?;
+        core::str::from_utf8(&rest[..end]).ok()
+    };
+
+    let mut writes: Vec<(usize, u64)> = Vec::new();
+    for (public, target) in VDSO_KERNEL_CLOCK_REDIRECTS {
+        // The stubs are `LOCAL HIDDEN`, so they live in `.symtab` and not in
+        // `.dynsym`; the caller's `resolve` reads the former.
+        let address = match resolve(target) {
+            Some(address) => address,
+            None => {
+                warn!("vdso: no {} in the blob", target);
+                return None;
+            }
+        };
+        let mut found = 0;
+        for index in 0..table_size / SYM_SIZE {
+            let entry = table_offset + index * SYM_SIZE;
+            let name_index =
+                u32::from_ne_bytes(vdso[entry..entry + 4].try_into().unwrap()) as usize;
+            let Some(name) = name_at(name_index) else {
+                continue;
+            };
+            // Both aliases: the weak `zx_foo` and the strong `_zx_foo`.
+            if name == public || (name.starts_with('_') && &name[1..] == public) {
+                writes.push((entry + SYM_VALUE_OFFSET, address));
+                found += 1;
+            }
+        }
+        if found != 2 {
+            warn!("vdso: {} has {} dynsym entries, expected 2", public, found);
+            return None;
+        }
+    }
+    Some(writes)
+}
+
+/// Apply [`vdso_time_redirect_writes`] to the vDSO's image. `false` means
+/// nothing was written and the caller must keep the old behaviour.
+#[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+fn redirect_vdso_time_to_kernel(vdso: &[u8], vdso_vmo: &Arc<VmObject>) -> bool {
+    let Ok(elf) = ElfFile::new(vdso) else {
+        return false;
+    };
+    let Some(writes) = vdso_time_redirect_writes(vdso, |name| elf.get_symbol_address(name)) else {
+        return false;
+    };
+    for (offset, address) in writes {
+        // A failed write on a VMO this function created a moment ago means the
+        // object is unusable; there is no half-redirected vDSO to recover to
+        // and the boot is over either way.
+        vdso_vmo
+            .write(offset, &address.to_ne_bytes())
+            .expect("vdso: cannot rewrite the dynamic symbol table");
+    }
+    true
+}
+
 /// Fill the vDSO's `DATA_TIME_VALUES` page so userspace computes the same
 /// monotonic clock the kernel does. See the call site for the layout and for
 /// what shipping it unwritten did.
 ///
+/// Two regimes, and the page is honest in both:
+///
+/// - The TSC is fit for userspace to read directly. The page gets this boot's
+///   base and scale and the entry points are left as they are, so a clock read
+///   costs no syscall. This is the only case there used to be.
+/// - It is not (QEMU under TCG, where CPUID declines to call the TSC
+///   invariant). Then no scale can be published that stays true, so the time
+///   entry points are redirected to the stubs that ask the kernel -- and the
+///   tick becomes the nanosecond, which is the unit the kernel answers those
+///   syscalls in, so the page gets `1_000_000_000` ticks per second and the
+///   identity scale. Every field is then true of the clock the guest actually
+///   reads, instead of the `0xDEADBEEFDEADBEEF` marker the blob ships, which
+///   read as a NEGATIVE monotonic time and put every deadline in the past.
+///
+/// `vdso.kernel_clock=off` keeps the second case as it was before this change:
+/// the page stays on the blob's marker. It is the escape hatch for a machine
+/// where going through the kernel costs more than a wrong clock, and it is the
+/// only way back to that behaviour.
+///
 /// Writing nothing is always the safe outcome: the page then keeps the blob's
-/// own contents, so a missing symbol or an unusable TSC ratio costs the old
-/// behaviour rather than a wrong clock.
+/// own contents, so a missing symbol costs the old behaviour rather than a
+/// wrong clock.
 #[allow(unused_variables)]
-fn write_vdso_time_values(vdso: &[u8], vdso_vmo: &Arc<VmObject>) {
+fn write_vdso_time_values(vdso: &[u8], vdso_vmo: &Arc<VmObject>, cmdline: &str) {
     #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
     {
         /// Offsets within `DATA_TIME_VALUES`. See the call site for what each
@@ -749,16 +919,44 @@ fn write_vdso_time_values(vdso: &[u8], vdso_vmo: &Arc<VmObject>) {
         const OFF_NUMERATOR: usize = 0x20;
         const OFF_DENOMINATOR: usize = 0x24;
 
-        let Some((numerator, denominator, ticks_per_second)) = kernel_hal::timer::vdso_tsc_ratio()
-        else {
-            warn!("vdso: no usable TSC ratio; leaving DATA_TIME_VALUES as shipped");
-            return;
-        };
-        // The kernel's own monotonic time is `(tsc - base) * num / den`; the
-        // vDSO adds instead of subtracting, so what goes on the page is the
-        // negation. Wrapping is the point, not an accident: the vDSO adds the
-        // two as machine words and the sum is the small positive tick count.
-        let offset = 0u64.wrapping_sub(kernel_hal::timer::vdso_tsc_base());
+        let (numerator, denominator, ticks_per_second, offset) =
+            match kernel_hal::timer::vdso_tsc_ratio() {
+                // The kernel's own monotonic time is `(tsc - base) * num / den`;
+                // the vDSO adds instead of subtracting, so what goes on the page
+                // is the negation. Wrapping is the point, not an accident: the
+                // vDSO adds the two as machine words and the sum is the small
+                // positive tick count.
+                Some((numerator, denominator, ticks_per_second)) => (
+                    numerator,
+                    denominator,
+                    ticks_per_second,
+                    0u64.wrapping_sub(kernel_hal::timer::vdso_tsc_base()),
+                ),
+                None if kernel_hal::cmdline::is_off(cmdline, "vdso.kernel_clock") => {
+                    warn!(
+                        "vdso: no usable TSC ratio and vdso.kernel_clock=off; \
+                         leaving DATA_TIME_VALUES as shipped"
+                    );
+                    return;
+                }
+                None => {
+                    if !redirect_vdso_time_to_kernel(vdso, vdso_vmo) {
+                        warn!(
+                            "vdso: no usable TSC ratio and no kernel-routed stubs; \
+                             leaving DATA_TIME_VALUES as shipped"
+                        );
+                        return;
+                    }
+                    info!("vdso: no usable TSC ratio; time calls routed through the kernel");
+                    // The redirected stubs answer in nanoseconds, so that is
+                    // what a tick is now: rate 1e9, identity scale, no offset.
+                    // The identity also means the one reader left on the page,
+                    // `_zx_ticks_per_second`, agrees with `zx_ticks_get`, and
+                    // that a denominator of zero -- the blob's `ud2` -- can no
+                    // longer reach a guest from here.
+                    (1, 1, 1_000_000_000, 0)
+                }
+            };
         let elf = ElfFile::new(vdso).unwrap();
         let Some(base) = elf.get_symbol_address("DATA_TIME_VALUES") else {
             warn!("vdso: no DATA_TIME_VALUES symbol; leaving the clock as shipped");
@@ -895,5 +1093,175 @@ mod zbi_cmdline_tests {
         let mut truncated = container(&[(ZBI_TYPE_CMDLINE, b"k=v\0")]);
         truncated[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(zbi_with_extra_cmdline(&truncated, "k=v").is_none());
+    }
+}
+
+#[cfg(test)]
+mod vdso_time_redirect_tests {
+    use super::*;
+    use alloc::string::String;
+    use alloc::vec;
+
+    /// Offset of `st_value` inside an `Elf64_Sym`, and the entry's size.
+    const SYM_VALUE_OFFSET: usize = 8;
+    const SYM_SIZE: usize = 24;
+
+    /// The address `resolve` hands back for every stub, so that a write can be
+    /// recognised by its value alone.
+    const STUB: u64 = 0xc0de_0000;
+
+    /// Build a 64-bit shared object carrying nothing but a `.dynsym` holding
+    /// `names` in order, the `.dynstr` for it and a `.shstrtab`.
+    ///
+    /// `dynsym_address` is what the section header claims as the mapped
+    /// address, which the code under test requires to equal the file offset.
+    fn elf_with_dynsym(names: &[&str], same_address: bool) -> Vec<u8> {
+        const EHDR: usize = 64;
+        const SHDR: usize = 64;
+        let section_names = b"\0.shstrtab\0.dynstr\0.dynsym\0";
+        let (shstrtab_idx, dynstr_idx, dynsym_idx) = (1u32, 11u32, 19u32);
+
+        let mut dynstr = vec![0u8];
+        let mut name_offsets = Vec::new();
+        for name in names {
+            name_offsets.push(dynstr.len() as u32);
+            dynstr.extend_from_slice(name.as_bytes());
+            dynstr.push(0);
+        }
+        let mut dynsym = vec![0u8; SYM_SIZE]; // the mandatory null entry
+        for offset in &name_offsets {
+            let mut entry = [0u8; SYM_SIZE];
+            entry[..4].copy_from_slice(&offset.to_le_bytes());
+            entry[4] = 0x12; // GLOBAL FUNC
+            entry[6..8].copy_from_slice(&9u16.to_le_bytes());
+            dynsym.extend_from_slice(&entry);
+        }
+
+        // Layout: header, four section headers, then the three section bodies.
+        let shoff = EHDR;
+        let shstrtab_off = shoff + 4 * SHDR;
+        let dynstr_off = shstrtab_off + section_names.len();
+        let dynsym_off = dynstr_off + dynstr.len();
+        let total = dynsym_off + dynsym.len();
+
+        let mut out = vec![0u8; total];
+        out[..4].copy_from_slice(b"\x7fELF");
+        out[4] = 2; // ELFCLASS64
+        out[5] = 1; // ELFDATA2LSB
+        out[6] = 1; // EV_CURRENT
+        out[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        out[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // EM_X86_64
+        out[20..24].copy_from_slice(&1u32.to_le_bytes());
+        out[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+        out[54..56].copy_from_slice(&(EHDR as u16).to_le_bytes()); // e_ehsize
+        out[58..60].copy_from_slice(&(SHDR as u16).to_le_bytes()); // e_shentsize
+        out[60..62].copy_from_slice(&4u16.to_le_bytes()); // e_shnum
+        out[62..64].copy_from_slice(&1u16.to_le_bytes()); // e_shstrndx
+
+        let mut put_shdr =
+            |index: usize, name: u32, kind: u32, address: u64, offset: usize, size: usize| {
+                let base = shoff + index * SHDR;
+                out[base..base + 4].copy_from_slice(&name.to_le_bytes());
+                out[base + 4..base + 8].copy_from_slice(&kind.to_le_bytes());
+                out[base + 16..base + 24].copy_from_slice(&address.to_le_bytes());
+                out[base + 24..base + 32].copy_from_slice(&(offset as u64).to_le_bytes());
+                out[base + 32..base + 40].copy_from_slice(&(size as u64).to_le_bytes());
+            };
+        put_shdr(0, 0, 0, 0, 0, 0); // SHT_NULL
+        put_shdr(1, shstrtab_idx, 3, 0, shstrtab_off, section_names.len()); // STRTAB
+        put_shdr(2, dynstr_idx, 3, 0, dynstr_off, dynstr.len()); // STRTAB
+        put_shdr(
+            3,
+            dynsym_idx,
+            11, // SHT_DYNSYM
+            if same_address { dynsym_off as u64 } else { 0 },
+            dynsym_off,
+            dynsym.len(),
+        );
+        out[shstrtab_off..shstrtab_off + section_names.len()].copy_from_slice(section_names);
+        out[dynstr_off..dynstr_off + dynstr.len()].copy_from_slice(&dynstr);
+        out[dynsym_off..dynsym_off + dynsym.len()].copy_from_slice(&dynsym);
+        out
+    }
+
+    /// Both spellings of every entry point the redirect covers.
+    fn every_alias() -> Vec<String> {
+        let mut names = Vec::new();
+        for (public, _) in VDSO_KERNEL_CLOCK_REDIRECTS {
+            names.push(String::from(public));
+            names.push(String::from("_") + public);
+        }
+        names
+    }
+
+    fn writes_for(names: &[String], same_address: bool) -> Option<Vec<(usize, u64)>> {
+        let borrowed: Vec<&str> = names.iter().map(|name| name.as_str()).collect();
+        let image = elf_with_dynsym(&borrowed, same_address);
+        vdso_time_redirect_writes(&image, |_| Some(STUB))
+    }
+
+    /// One write per alias, each landing on that alias's `st_value` and
+    /// carrying the stub's address.
+    #[test]
+    fn every_alias_of_every_entry_point_gets_the_stub() {
+        let names = every_alias();
+        let writes = writes_for(&names, true).expect("the table has all of them");
+        assert_eq!(writes.len(), 14);
+        // Every write carries the stub and sits at the same place inside its
+        // own entry, which is `st_value` and not some byte next to it.
+        let residue = (writes[0].0 - SYM_VALUE_OFFSET) % SYM_SIZE;
+        for (offset, address) in &writes {
+            assert_eq!(*address, STUB);
+            assert_eq!(
+                (offset - SYM_VALUE_OFFSET) % SYM_SIZE,
+                residue,
+                "a write landed mid-entry"
+            );
+        }
+        let mut offsets: Vec<usize> = writes.iter().map(|(offset, _)| *offset).collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets.len(), 14, "two writes to the same place");
+    }
+
+    /// The whole point of returning a list rather than writing as it goes: one
+    /// missing stub and the vDSO is left alone, not half redirected.
+    #[test]
+    fn a_stub_the_blob_does_not_carry_cancels_the_whole_redirect() {
+        let names = every_alias();
+        let borrowed: Vec<&str> = names.iter().map(|name| name.as_str()).collect();
+        let image = elf_with_dynsym(&borrowed, true);
+        let missing = VDSO_KERNEL_CLOCK_REDIRECTS[3].1;
+        assert!(
+            vdso_time_redirect_writes(&image, |name| (name != missing).then_some(STUB)).is_none()
+        );
+    }
+
+    /// An entry point present under one spelling only. Redirecting just that
+    /// one would leave a program linking the other alias on the broken clock.
+    #[test]
+    fn an_entry_point_with_only_one_alias_cancels_the_whole_redirect() {
+        let mut names = every_alias();
+        let dropped = names
+            .iter()
+            .position(|name| name == "_zx_deadline_after")
+            .unwrap();
+        names.remove(dropped);
+        assert!(writes_for(&names, true).is_none());
+    }
+
+    /// A `.dynsym` whose file offset is not its mapped address: the write
+    /// would go somewhere the guest never reads.
+    #[test]
+    fn a_dynsym_mapped_elsewhere_is_declined() {
+        let names = every_alias();
+        assert!(writes_for(&names, true).is_some());
+        assert!(writes_for(&names, false).is_none());
+    }
+
+    /// Not an ELF at all.
+    #[test]
+    fn a_blob_that_is_not_an_elf_is_declined() {
+        assert!(vdso_time_redirect_writes(b"not an elf at all", |_| Some(STUB)).is_none());
     }
 }
