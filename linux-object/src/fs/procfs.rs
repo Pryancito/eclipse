@@ -3527,7 +3527,11 @@ fn proc_gpustep13_content() -> String {
 /// It exists because the console GPU comes up in the MIDDLE of a live
 /// session and nothing told userspace when. See `console_gpu_ready`.
 fn proc_gpuready_content() -> String {
+    // A read is the signal the deferred bring-up actually wanted: init has got
+    // as far as starting a GPU session. See `drm::gpu_ready_was_read`.
+    crate::fs::devfs::drm::note_gpu_ready_read();
     gpuready_report(
+        crate::fs::devfs::drm::console_bringup_expected(),
         kernel_hal::drivers::all_drm()
             .as_vec()
             .iter()
@@ -3540,7 +3544,19 @@ fn proc_gpuready_content() -> String {
 /// that matters is `none` vs `waiting`, because a waiter that confuses them
 /// either stalls a boot that has nothing to wait for, or gives up on a card
 /// that is seconds from being ready.
-fn gpuready_report(entries: impl Iterator<Item = (bool, String)>) -> String {
+fn gpuready_report(
+    bringup_expected: bool,
+    entries: impl Iterator<Item = (bool, String)>,
+) -> String {
+    // Nothing is going to bring the console GPU up this boot -- a single-GPU
+    // box without `nvidia.console_gpu`, or any box booted with
+    // `nvidia.noconsole_gpu`. The card is present and will answer `rm=no`
+    // forever, so reporting what it answers would promise a readiness nobody
+    // scheduled, and a waiter would sit out its whole timeout before starting
+    // the session. `none` is the honest answer and means "start now".
+    if !bringup_expected {
+        return String::from("gpuready: none\nno console-GPU bring-up is scheduled this boot\n");
+    }
     let mut detail = String::new();
     let mut seen = false;
     let mut ready = true;
@@ -4631,7 +4647,7 @@ mod gpuready_tests {
 
     #[test]
     fn no_console_gpu_at_all_says_none_and_not_waiting() {
-        let out = gpuready_report(core::iter::empty());
+        let out = gpuready_report(true, core::iter::empty());
         assert_eq!(
             out, "gpuready: none\n",
             "a box with no console GPU must not read as `waiting`: whoever is \
@@ -4639,9 +4655,33 @@ mod gpuready_tests {
         );
     }
 
+    /// A box where nobody scheduled a bring-up must not be told to wait for
+    /// one. The card is there and answers `rm=no` for the whole uptime, so
+    /// reporting what it answers held every `nvidia.noconsole_gpu` boot at a
+    /// black screen for the waiter's full timeout before the session started
+    /// -- waiting on something that was never going to happen.
+    #[test]
+    fn a_bring_up_nobody_scheduled_is_not_something_to_wait_for() {
+        let out = gpuready_report(
+            false,
+            alloc::vec![(false, line("17:00.0 GeForce RTX 2060 Super: rm=no gr=no"))].into_iter(),
+        );
+        assert!(
+            out.starts_with("gpuready: none\n"),
+            "a card nobody is bringing up is `none` (start now), never `waiting`: {:?}",
+            out
+        );
+        assert!(
+            !out.contains("rm=no"),
+            "reporting the card's state here invites a reader to poll it: {:?}",
+            out
+        );
+    }
+
     #[test]
     fn a_card_that_is_not_there_yet_says_waiting() {
         let out = gpuready_report(
+            true,
             alloc::vec![(false, line("17:00.0 GeForce RTX 2060 Super: rm=yes gr=no"))].into_iter(),
         );
         assert!(
@@ -4655,6 +4695,7 @@ mod gpuready_tests {
     #[test]
     fn a_card_with_its_ladder_built_says_ready() {
         let out = gpuready_report(
+            true,
             alloc::vec![(true, line("17:00.0 GeForce RTX 2060 Super: rm=yes gr=yes"))].into_iter(),
         );
         assert!(out.starts_with("gpuready: ready\n"), "{:?}", out);
@@ -4667,6 +4708,7 @@ mod gpuready_tests {
         // instead of an `all` would call the box ready while the card that
         // scans out the screen is still cold.
         let out = gpuready_report(
+            true,
             alloc::vec![
                 (true, line("17:00.0 una: rm=yes gr=yes")),
                 (false, line("65:00.0 otra: rm=yes gr=no")),
@@ -4680,6 +4722,7 @@ mod gpuready_tests {
     #[test]
     fn the_detail_is_one_line_per_card_under_the_verdict() {
         let out = gpuready_report(
+            true,
             alloc::vec![
                 (true, line("17:00.0 una: rm=yes gr=yes")),
                 (true, line("65:00.0 otra: rm=yes gr=yes")),
