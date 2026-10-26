@@ -4,7 +4,10 @@
 //! makes a process resets the table.
 
 use super::super::{line_entry, new_mount_entry, record_mount, MountEntry};
-use super::{bind_from, mount_holder_from, move_from, resolve_from, umount_from, MS_BIND};
+use super::{
+    bind_from, mount_holder_from, move_from, resolve_from, umount_from, MNT_DETACH, MNT_FORCE,
+    MS_BIND,
+};
 use crate::error::LxError;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -163,7 +166,7 @@ fn a_bind_of_a_mount_shows_its_files_and_umount_takes_it_down() {
     assert!(w.shows("/b", "x"));
     assert_eq!(w.at("/b"), ["srcA"], "the line names the origin's source");
 
-    umount_from(&w.root, &w.table, "/b", false).unwrap();
+    umount_from(&w.root, &w.table, "/b", 0).unwrap();
     assert!(!w.shows("/b", "x"), "the directory still shows the bind");
     assert!(w.at("/b").is_empty());
     assert!(w.shows("/a", "x"), "the origin went with it");
@@ -187,10 +190,10 @@ fn a_mount_on_a_mount_goes_on_top_and_umount_uncovers_the_one_below() {
         );
     }
 
-    umount_from(&w.root, &w.table, "/a", false).unwrap();
+    umount_from(&w.root, &w.table, "/a", 0).unwrap();
     assert!(w.shows("/a", "x") && !w.shows("/a", "y"));
     assert_eq!(w.at("/a"), ["first"]);
-    umount_from(&w.root, &w.table, "/a", false).unwrap();
+    umount_from(&w.root, &w.table, "/a", 0).unwrap();
     assert!(!w.shows("/a", "x"));
     assert!(w.at("/a").is_empty());
     assert!(w.shows("/c", "y"), "a bind's origin stays where it was");
@@ -215,12 +218,13 @@ impl FileSystem for Unsyncable {
 fn an_umount_that_cannot_write_out_leaves_the_mount_and_its_line() {
     let w = world();
     w.mount("disk", "/a", Arc::new(Unsyncable(fs_with("x"))));
-    assert_eq!(
-        umount_from(&w.root, &w.table, "/a", false),
-        Err(LxError::EIO)
-    );
+    assert_eq!(umount_from(&w.root, &w.table, "/a", 0), Err(LxError::EIO));
     assert!(w.shows("/a", "x"));
     assert_eq!(w.at("/a"), ["disk"], "the line went and the mount stayed");
+    // `umount -f` takes it down all the same, as Linux takes it without.
+    umount_from(&w.root, &w.table, "/a", MNT_FORCE).unwrap();
+    assert!(!w.shows("/a", "x"));
+    assert!(w.at("/a").is_empty());
 }
 
 /// `/a` with a directory `sub` in it and a mount on that.
@@ -238,17 +242,14 @@ fn nested() -> World {
 #[test]
 fn an_umount_with_a_mount_under_it_is_ebusy_and_a_lazy_one_takes_both() {
     let w = nested();
-    assert_eq!(
-        umount_from(&w.root, &w.table, "/a", false),
-        Err(LxError::EBUSY)
-    );
+    assert_eq!(umount_from(&w.root, &w.table, "/a", 0), Err(LxError::EBUSY));
     assert!(
         w.shows("/a/sub", "z"),
         "a refused umount took something down"
     );
     assert_eq!(w.at("/a"), ["outer"]);
 
-    umount_from(&w.root, &w.table, "/a", true).unwrap();
+    umount_from(&w.root, &w.table, "/a", MNT_DETACH).unwrap();
     assert!(!w.shows("/a", "sub"));
     assert!(w.at("/a").is_empty() && w.at("/a/sub").is_empty());
 }
@@ -280,11 +281,11 @@ fn a_mount_that_is_only_a_line_goes_as_a_line() {
     assert_eq!(w.at("/a"), ["kernel"]);
     assert_eq!(w.at("/c"), ["init"]);
     assert!(w.shows("/a", "x") && !w.shows("/c", "x"));
-    umount_from(&w.root, &w.table, "/c", false).unwrap();
+    umount_from(&w.root, &w.table, "/c", 0).unwrap();
     assert!(w.at("/c").is_empty());
     // And so does an umount.
     w.line("init", "/a");
-    umount_from(&w.root, &w.table, "/a", false).unwrap();
+    umount_from(&w.root, &w.table, "/a", 0).unwrap();
     assert_eq!(w.at("/a"), ["kernel"]);
     assert!(
         w.shows("/a", "x"),
@@ -295,7 +296,7 @@ fn a_mount_that_is_only_a_line_goes_as_a_line() {
     move_from(&w.root, &w.table, "/p", "/c").unwrap();
     assert!(w.at("/p").is_empty());
     assert_eq!(w.at("/c"), ["none"]);
-    umount_from(&w.root, &w.table, "/c", false).unwrap();
+    umount_from(&w.root, &w.table, "/c", 0).unwrap();
     assert!(w.at("/c").is_empty());
 }
 
@@ -310,7 +311,7 @@ fn what_is_not_a_mount_cannot_be_unmounted_moved_or_bound() {
     drop(inside);
     for path in ["/p", "/a/in"].iter() {
         assert_eq!(
-            umount_from(&w.root, &w.table, path, false),
+            umount_from(&w.root, &w.table, path, 0),
             Err(LxError::EINVAL)
         );
         assert_eq!(
@@ -323,12 +324,12 @@ fn what_is_not_a_mount_cannot_be_unmounted_moved_or_bound() {
         );
     }
     assert_eq!(
-        umount_from(&w.root, &w.table, "/", true),
+        umount_from(&w.root, &w.table, "/", MNT_DETACH),
         Err(LxError::EBUSY)
     );
     for path in ["/nowhere", "/nowhere/x"].iter() {
         assert_eq!(
-            umount_from(&w.root, &w.table, path, false),
+            umount_from(&w.root, &w.table, path, 0),
             Err(LxError::ENOENT)
         );
         assert_eq!(

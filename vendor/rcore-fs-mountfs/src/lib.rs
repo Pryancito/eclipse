@@ -287,6 +287,17 @@ impl MNode {
         Ok(())
     }
 
+    /// [`umount`](Self::umount) of a filesystem whose device may be gone:
+    /// what it wrote is still offered to the device, and lost if that fails,
+    /// as Linux's `umount` always does. Without it a disk that went away
+    /// could never be unmounted.
+    pub fn force_umount(&self) -> Result<()> {
+        let inode_id = self.inode.metadata()?.inode;
+        let fs = self.vfs.mountpoints.write().remove(&inode_id);
+        let _ = fs.ok_or(FsError::InvalidParam)?.sync();
+        Ok(())
+    }
+
     /// The root of the filesystem mounted at this directory, if one is: the
     /// next step up a stack of mounts.
     pub fn mounted_root(&self) -> Option<Arc<MNode>> {
@@ -1016,6 +1027,26 @@ mod tests {
         assert_eq!(mnt.umount(), Err(FsError::DeviceError));
         assert!(mnt.is_mountpoint());
         assert!(root.find(false, "mnt").unwrap().find(false, "data").is_ok());
+    }
+
+    #[test]
+    fn a_forced_umount_takes_it_down_all_the_same() {
+        let (_top, root) = tree();
+        let mnt = dir_at(&root, "mnt");
+        mnt.mount(Arc::new(Unsyncable(fs_with("data")))).unwrap();
+        mnt.force_umount().unwrap();
+        assert!(!mnt.is_mountpoint());
+        assert!(root
+            .find(false, "mnt")
+            .unwrap()
+            .find(false, "data")
+            .is_err());
+        assert_eq!(mnt.force_umount(), Err(FsError::InvalidParam));
+        // A filesystem that can be written out still is.
+        let guest = FlakyFS::new(RamFS::new());
+        mnt.mount(guest.clone()).unwrap();
+        mnt.force_umount().unwrap();
+        assert_eq!(guest.syncs.load(Ordering::SeqCst), 1);
     }
 
     // -------------------------------------------------------------- the dots

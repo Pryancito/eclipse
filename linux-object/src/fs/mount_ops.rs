@@ -329,25 +329,33 @@ pub fn umount_fs(target: &str, flags: usize) -> LxResult<()> {
     // `umount -l` succeeding while unmounting eagerly is worse than a refusal,
     // because the caller believes the mount was detached and it was not.
     mount_state::check_umount_flags(flags)?;
-    // MNT_FORCE is accepted and not acted on: no file open on a filesystem
-    // makes it busy here, so there is nothing for it to cut short.
-    let _ = flags & MNT_FORCE;
     let root = vfs_root().ok_or(LxError::EINVAL)?;
-    umount_from(&root, &MOUNT_TABLE, target, flags & MNT_DETACH != 0)
+    umount_from(&root, &MOUNT_TABLE, target, flags)
 }
 
-/// `umount` of `target`, lazily (`MNT_DETACH`) if `detach`, on the tree under
-/// `root` and the table `table`.
-fn umount_from(root: &Arc<MNode>, table: &Table, target: &str, detach: bool) -> LxResult<()> {
+/// `umount2` of `target` with `flags`, on the tree under `root` and the table
+/// `table`.
+///
+/// `MNT_DETACH` takes whatever is mounted on it too. `MNT_FORCE` unmounts a
+/// filesystem even when what it wrote cannot reach the device: without it
+/// that is `EIO` and the mount stays, where Linux unmounts and loses the
+/// writes. A disk that went away can still be taken down with `umount -f`.
+fn umount_from(root: &Arc<MNode>, table: &Table, target: &str, flags: usize) -> LxResult<()> {
     let target = normalize_target(target);
     resolve_from(root, &target)?;
-    let plan = super::unmount_in(&table.lock(), &target, detach)?;
+    let plan = super::unmount_in(&table.lock(), &target, flags & MNT_DETACH != 0)?;
     if plan.backed {
         // Whatever is mounted inside it goes with it, as a lazy unmount
         // takes it on Linux. What they wrote reaches the device first, and if
-        // it cannot, nothing goes: not the mount, not its line.
+        // it cannot, nothing goes, not the mount and not its line, unless
+        // `MNT_FORCE` asked for it to go anyway.
         if let Some(holder) = mount_holder_from(root, &target)? {
-            holder.umount().map_err(LxError::from)?;
+            if flags & MNT_FORCE != 0 {
+                holder.force_umount()
+            } else {
+                holder.umount()
+            }
+            .map_err(LxError::from)?;
         }
     }
     table.lock().retain(|m| !plan.ids.contains(&m.id));
