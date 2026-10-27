@@ -526,6 +526,21 @@ pub trait DrmScheme: Scheme {
         alloc::string::String::new()
     }
 
+    /// `nvidia.nvkms`: load nvidia-modeset and give it this card's display,
+    /// as `nvidia-drm.modeset=1` does in Linux. Called once per card, after
+    /// the deferred console bring-up, with no DRM lock held. Returns the lines
+    /// to log; empty for a card that is not NVIDIA's or is already nvkms's.
+    fn nvkms_load(&self) -> alloc::vec::Vec<alloc::string::String> {
+        alloc::vec::Vec::new()
+    }
+
+    /// Run nvidia-modeset's due timers (Linux runs them from a kthread).
+    /// Microseconds until the next one, `u64::MAX` for none queued; `None`
+    /// for a card nvkms does not hold.
+    fn nvkms_service(&self) -> Option<u64> {
+        None
+    }
+
     /// Read-only dump of this card's display heads at a named point, for the
     /// one stretch of the deferred bring-up that has no narration at all.
     ///

@@ -481,6 +481,119 @@ pub extern "C" fn nvkms_open_gpu(gpu_id: u32) -> u8 {
 #[no_mangle]
 pub extern "C" fn nvkms_close_gpu(_gpu_id: u32) {}
 
+/// One entry of `nv_gpu_info_t` (`nv-gpu-info.h`), the table
+/// [`nvkms_enumerate_gpus`] fills.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GpuInfo {
+    pub gpu_id: u32,
+    pub domain: u32,
+    pub bus: u8,
+    pub slot: u8,
+    pub function: u8,
+    pub needs_numa_setup: u8,
+    pub os_device_ptr: *mut c_void,
+}
+
+/// `NV_MAX_GPUS`: the room `nvkms_enumerate_gpus` is given.
+pub const MAX_GPUS: usize = 32;
+
+/// The RM's gpu id for the GPU at `domain:bus:slot`, which is what kapi's
+/// `allocateDevice` takes. `None` if the RM has not attached it.
+pub fn gpu_id_at(domain: u32, bus: u8, slot: u8) -> Option<u32> {
+    let mut table = [GpuInfo {
+        gpu_id: 0,
+        domain: 0,
+        bus: 0,
+        slot: 0,
+        function: 0,
+        needs_numa_setup: 0,
+        os_device_ptr: core::ptr::null_mut(),
+    }; MAX_GPUS];
+    let n = nvkms_enumerate_gpus(table.as_mut_ptr() as *mut c_void) as usize;
+    find_gpu_id(&table[..n.min(MAX_GPUS)], domain, bus, slot)
+}
+
+fn find_gpu_id(table: &[GpuInfo], domain: u32, bus: u8, slot: u8) -> Option<u32> {
+    table
+        .iter()
+        .find(|g| g.domain == domain && g.bus == bus && g.slot == slot)
+        .map(|g| g.gpu_id)
+}
+
+// ---------------------------------------------------------------------------
+// The boot console
+// ---------------------------------------------------------------------------
+
+/// The firmware (UEFI GOP) framebuffer: Linux's `screen_info`. The RM's
+/// `NV0080_CTRL_CMD_OS_UNIX_VT_GET_FB_INFO` answers with it on the GPU whose
+/// BAR1 it starts at (`vendor/eclipse_nvkms_rm.c`), and nvkms imports that
+/// memory as the console surface it can scan out and restore.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BootConsole {
+    pub phys: u64,
+    pub width: u32,
+    pub height: u32,
+    /// Bits per pixel, as `screen_info.lfb_depth`.
+    pub depth: u32,
+    pub pitch: u32,
+}
+
+static BOOT_CONSOLE: Mutex<Option<BootConsole>> = Mutex::new(None);
+
+/// Called once at boot by the driver, with what the bootloader handed over.
+pub fn set_boot_console(console: BootConsole) {
+    *BOOT_CONSOLE.lock() = Some(console);
+}
+
+#[no_mangle]
+pub extern "C" fn eclipse_boot_console(out: *mut BootConsole) -> u8 {
+    match *BOOT_CONSOLE.lock() {
+        Some(c) if c.phys != 0 && !out.is_null() => {
+            unsafe { out.write(c) };
+            1
+        }
+        _ => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loading nvkms
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "none")]
+extern "C" {
+    fn nvKmsModuleLoad() -> u8;
+}
+
+/// What the one `nvKmsModuleLoad` answered: 0 before it has run, then
+/// [`LOADED`] or [`LOAD_FAILED`]. Read and written under `nvkms_lock`, which
+/// is also what serialises the load against anything else entering nvkms --
+/// not a `lock::Mutex`, which would keep interrupts off for the whole load.
+static MODULE_STATE: AtomicU32 = AtomicU32::new(0);
+const LOADED: u32 = 1;
+const LOAD_FAILED: u32 = 2;
+
+/// `nvkms_init` of nvidia-modeset-linux.c, after its kthreads and chrdev:
+/// `nvKmsModuleLoad` under `nvkms_lock`, once per boot. It allocates nvkms's
+/// own RM client, so the RM must be up. Later calls answer the first one.
+pub fn module_load() -> bool {
+    NVKMS_LOCK.down();
+    let mut state = MODULE_STATE.load(Ordering::Relaxed);
+    if state == 0 {
+        #[cfg(target_os = "none")]
+        let ok = unsafe { nvKmsModuleLoad() } != 0;
+        // Hosted builds compile no nvkms.
+        #[cfg(not(target_os = "none"))]
+        let ok = false;
+        state = if ok { LOADED } else { LOAD_FAILED };
+        MODULE_STATE.store(state, Ordering::Relaxed);
+    }
+    NVKMS_LOCK.up();
+    state == LOADED
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +722,57 @@ mod tests {
         s.up();
         s.down();
         s.up();
+    }
+    fn gpu(gpu_id: u32, bus: u8, slot: u8) -> GpuInfo {
+        GpuInfo {
+            gpu_id,
+            domain: 0,
+            bus,
+            slot,
+            function: 0,
+            needs_numa_setup: 0,
+            os_device_ptr: core::ptr::null_mut(),
+        }
+    }
+
+    #[test]
+    fn gpu_info_is_laid_out_like_nv_gpu_info_t() {
+        // u32 gpu_id, {u32 domain; u8 bus, slot, function}, NvBool, void *.
+        assert_eq!(core::mem::size_of::<GpuInfo>(), 24);
+        assert_eq!(core::mem::offset_of!(GpuInfo, bus), 8);
+        assert_eq!(core::mem::offset_of!(GpuInfo, os_device_ptr), 16);
+    }
+
+    #[test]
+    fn each_gpu_is_found_by_its_own_pci_address() {
+        let table = [gpu(0x100, 0x01, 0), gpu(0x6500, 0x65, 0)];
+        assert_eq!(find_gpu_id(&table, 0, 0x65, 0), Some(0x6500));
+        assert_eq!(find_gpu_id(&table, 0, 0x01, 0), Some(0x100));
+        assert_eq!(find_gpu_id(&table, 0, 0x02, 0), None);
+        assert_eq!(find_gpu_id(&table, 1, 0x01, 0), None, "other domain");
+    }
+
+    #[test]
+    fn the_boot_console_is_handed_to_the_rm_once_registered() {
+        let mut out = BootConsole::default();
+        let console = BootConsole {
+            phys: 0xe000_0000,
+            width: 1920,
+            height: 1080,
+            depth: 32,
+            pitch: 7680,
+        };
+        set_boot_console(console);
+        assert_eq!(eclipse_boot_console(&mut out), 1);
+        assert_eq!(out, console);
+        assert_eq!(eclipse_boot_console(core::ptr::null_mut()), 0);
+        set_boot_console(BootConsole::default());
+        assert_eq!(eclipse_boot_console(&mut out), 0, "no framebuffer at 0");
+    }
+
+    #[test]
+    fn a_hosted_build_never_loads_nvkms_and_says_so_every_time() {
+        assert!(!module_load());
+        assert!(!module_load());
     }
 }

@@ -19,6 +19,15 @@ pub fn set_boot_fb_info(phys: u64, width: u32, height: u32, pitch: u32) {
         height,
         pitch,
     });
+    // Linux's `screen_info`, which the RM reads back for nvkms when it
+    // imports the console (`NV0080_CTRL_CMD_OS_UNIX_VT_GET_FB_INFO`).
+    nvidia_rm_sys::nvkms_os::set_boot_console(nvidia_rm_sys::nvkms_os::BootConsole {
+        phys,
+        width,
+        height,
+        depth: super::nvkms_takeover::console_depth(width, pitch),
+        pitch,
+    });
 }
 
 /// Physical address of the boot (UEFI GOP) framebuffer, if known. The GPU whose

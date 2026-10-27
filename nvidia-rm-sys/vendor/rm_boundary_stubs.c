@@ -78,20 +78,6 @@ NV_STATUS cliresCtrlCmdOsUnixImportObjectsFromFd_IMPL(struct RmClientResource *p
  * *_PARAMS types) do not exist in the 570.144 RM -- they were added later --
  * so there is nothing to stub for this vendored release. */
 
-NV_STATUS deviceCtrlCmdOsUnixVTGetFBInfo_IMPL(struct Device *pDevice, NV0080_CTRL_OS_UNIX_VT_GET_FB_INFO_PARAMS *pParams)
-{
-    (void)pDevice;
-    (void)pParams;
-    return NV_ERR_NOT_SUPPORTED;
-}
-
-NV_STATUS deviceCtrlCmdOsUnixVTSwitch_IMPL(struct Device *pDevice, NV0080_CTRL_OS_UNIX_VT_SWITCH_PARAMS *pParams)
-{
-    (void)pDevice;
-    (void)pParams;
-    return NV_ERR_NOT_SUPPORTED;
-}
-
 NV_STATUS hypervisorInjectInterrupt_IMPL(struct OBJHYPERVISOR *arg_this, VGPU_NS_INTR *arg2)
 {
     (void)arg_this;
@@ -765,13 +751,6 @@ NV_STATUS subdeviceCtrlCmdOsUnixAllowDisallowGcoff_IMPL(struct Subdevice *pSubde
 }
 
 NV_STATUS subdeviceCtrlCmdOsUnixAudioDynamicPower_IMPL(struct Subdevice *pSubdevice, NV2080_CTRL_OS_UNIX_AUDIO_DYNAMIC_POWER_PARAMS *pParams)
-{
-    (void)pSubdevice;
-    (void)pParams;
-    return NV_ERR_NOT_SUPPORTED;
-}
-
-NV_STATUS subdeviceCtrlCmdOsUnixGc6BlockerRefCnt_IMPL(struct Subdevice *pSubdevice, NV2080_CTRL_OS_UNIX_GC6_BLOCKER_REFCNT_PARAMS *pParams)
 {
     (void)pSubdevice;
     (void)pParams;
