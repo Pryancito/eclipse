@@ -653,6 +653,20 @@ extern "C" fn eclipse_rm_mark_console_gpu(di: u32, console_size: u64, at_bar1_ba
     f.console_marks.push((di, console_size, at_bar1_base != 0));
     status
 }
+/// The BAR1 console mapping asked for before `state_init`:
+/// `bar1_console = Some(status)` answers `status` and keeps the request in
+/// `bar1_consoles`; without the knob, the stub's refusal.
+#[no_mangle]
+extern "C" fn eclipse_rm_preserve_bar1_console(di: u32, console_size: u64) -> u32 {
+    let mut f = FAKE_RM.lock();
+    f.calls.push("preserve_bar1_console");
+    f.narrate("preserve_bar1_console");
+    let Some(status) = f.bar1_console else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    f.bar1_consoles.push((di, console_size));
+    status
+}
 /// `gpuStatePreInit`/`StateInit`/`StateLoad` (`gpustep9`): `state_init =
 /// Some((pre, init, load))` is the status of each phase, `0xFFFF_FFFF`
 /// for one never reached; without the knob, the stub's refusal.
@@ -1308,6 +1322,11 @@ pub(super) struct FakeRm {
     /// Every console declaration: `(device instance, console bytes, at
     /// BAR1 base)`.
     pub console_marks: Vec<(u32, u64, bool)>,
+    /// What `preserve_bar1_console` answers.
+    pub bar1_console: Option<u32>,
+    /// Every BAR1 console mapping asked for: `(device instance, console
+    /// bytes)`.
+    pub bar1_consoles: Vec<(u32, u64)>,
 }
 
 /// `ECLIPSE_CHAN_BUF_SIZE`: the channel's own buffer, pushbuffer and ring,
@@ -1405,6 +1424,8 @@ const EMPTY_RM: FakeRm = FakeRm {
     state_init: None,
     console_mark: None,
     console_marks: Vec::new(),
+    bar1_console: None,
+    bar1_consoles: Vec::new(),
 };
 
 pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);

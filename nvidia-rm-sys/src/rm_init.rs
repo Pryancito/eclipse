@@ -1481,6 +1481,8 @@ extern "C" {
         console_size: NvU64,
         console_at_bar1_base: u8,
     ) -> NV_STATUS;
+
+    fn eclipse_rm_preserve_bar1_console(device_instance: NvU32, console_size: NvU64) -> NV_STATUS;
 }
 
 // ---------------------------------------------------------------------
@@ -1825,6 +1827,21 @@ pub fn mark_console_gpu(
     let status = unsafe {
         eclipse_rm_mark_console_gpu(device_instance, console_size, console_at_bar1_base as u8)
     };
+    if status == NV_OK {
+        Ok(())
+    } else {
+        Err(status)
+    }
+}
+
+/// Keep the boot console mapped at the base of BAR1 when the state load puts
+/// BAR1 into virtual mode, as Linux's `bPreserveBar1ConsoleEnabled` does --
+/// without the identity declaration `mark_console_gpu` makes before the GSP
+/// boot. Must be called after the RM attach and BEFORE `state_init`; see
+/// `eclipse_rm_preserve_bar1_console` for why a console card needs it.
+pub fn preserve_bar1_console(device_instance: u32, console_size: u64) -> Result<(), NV_STATUS> {
+    let _gate = RmGate::try_lock();
+    let status = unsafe { eclipse_rm_preserve_bar1_console(device_instance, console_size) };
     if status == NV_OK {
         Ok(())
     } else {

@@ -547,6 +547,10 @@ fn the_hardware_ladder_says_not_supported_and_never_ok() {
         ("hwcursor_hide", eclipse_rm_hwcursor_hide(0)),
         ("init_core", eclipse_rm_init_core()),
         ("mark_console_gpu", eclipse_rm_mark_console_gpu(0, 0, 0)),
+        (
+            "preserve_bar1_console",
+            eclipse_rm_preserve_bar1_console(0, 0),
+        ),
         ("state_init", eclipse_rm_state_init(0, p.cast())),
         ("step8", eclipse_rm_step8(0, p.cast())),
     ];

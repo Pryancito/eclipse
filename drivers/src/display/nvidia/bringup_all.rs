@@ -14,12 +14,14 @@
 //! prepared for its own firmware boot. Those are two facts about a card, asked
 //! once inside one path -- not a second path.
 //!
-//! So what survives here is exactly those two facts:
+//! So what survives here is exactly those facts, and what they imply:
 //!
 //! * [`mark_primary_for_rm`] -- tell the RM this is the primary device with a
 //!   live console in its BAR1, which is what Linux does at the same point.
 //! * the `BootWindow` around the GSP boot, which only means anything on a card
 //!   with a live raster.
+//! * [`preserve_bar1_console`] -- keep that console mapped at the base of BAR1
+//!   when the state load makes BAR1 virtual, as Linux does for efifb.
 //!
 //! What does not survive is any question of the form "is this the console
 //! card, so do something else instead".
@@ -54,6 +56,38 @@ pub(super) fn mark_primary_for_rm(gpu: &NvidiaGpu, tag: &str) -> String {
             status
         ),
     }
+}
+
+/// Before the console card's state load: ask the RM to keep the boot
+/// console mapped at the base of BAR1 when it puts BAR1 into virtual
+/// mode, as Linux does for efifb (`bPreserveBar1ConsoleEnabled`).
+/// Without it nothing is mapped there, the kernel console's next write
+/// faults BAR1, and with no interrupt servicing to rebind it every BAR1
+/// access on the card reads `0xBAD0ACxx` from then on: the USERD of
+/// every channel (so NVK's channels never run) and nvkms's mappings.
+///
+/// `None` on a card that scans nothing out, or whose console does not
+/// start at the base of its BAR1; otherwise the line for the log.
+pub(super) fn preserve_bar1_console(gpu: &NvidiaGpu, device_instance: u32) -> Option<String> {
+    if !gpu.drives_boot_display() {
+        return None;
+    }
+    let (size, at_bar1_base) = console_params(*BOOT_FB_INFO.lock(), gpu.bar1_phys);
+    if size == 0 || !at_bar1_base {
+        return None;
+    }
+    Some(
+        match nvidia_rm_sys::rm_init::preserve_bar1_console(device_instance, size) {
+            Ok(()) => alloc::format!(
+                "[gpustep9]  consola de arranque ({} KiB de VRAM 0) mapeada en BAR1 0 para cuando BAR1 pase a virtual\n",
+                size / 1024
+            ),
+            Err(status) => alloc::format!(
+                "[gpustep9]  no se pudo mapear la consola en BAR1 0, NV_STATUS={:#x}: la primera escritura de la consola dejara BAR1 en fallo\n",
+                status
+            ),
+        },
+    )
 }
 
 /// The two numbers `mark_primary_for_rm` sends: how many bytes of console the
