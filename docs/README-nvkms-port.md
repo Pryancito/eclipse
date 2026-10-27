@@ -201,6 +201,14 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
     una llamada. La VRAM se compara con ese buffer y se repara desde él. Lo que
     lee la CPU solo se cuenta: cuántas palabras lee bien y cuántas como
     `0xffffffff`, para el siguiente arreglo, que es el mapeo BAR1 en sí.
+  - En tu hardware la referencia salió a ceros: el relleno de nvkms
+    (`EvoSetupIdentityBaseLutC5` y la de salida) se salta una LUT que ya está
+    marcada como identidad, y la por defecto lo está desde que se creó el
+    dispositivo. Ahora las marcas se quitan solo durante esa llamada y se
+    ponen otra vez después. El mismo log dio BAR1 virtual (`BAR1_BLOCK
+    0x801f74c0`) y 0/256 palabras de la consola iguales por la base de BAR1 y
+    en VRAM 0: la base de BAR1 ya no es la VRAM 0 que escanea la pantalla y
+    escribe el present por CE.
 - Objetivo: **paridad** con la escalera actual en una sola tarjeta (escritorio,
   cursor, flips sin tearing) con `nvidia.wlr_vulkan`/`wlr_gles2`/`wlr_pixman`.
 

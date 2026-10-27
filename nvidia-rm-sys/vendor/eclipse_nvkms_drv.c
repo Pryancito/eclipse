@@ -540,12 +540,24 @@ NvBool eclipse_kms_default_lut(struct NvKmsKapiDevice *device, struct EclipseKms
              */
             NVEvoLutDataRec *reference = nvCalloc(1, sizeof(NVEvoLutDataRec));
             void *mapped = pLut->cpuAddress[0];
+            enum NvKmsLUTState base = pDevEvo->lut.defaultBaseLUTState[0];
+            enum NvKmsLUTState output = pDevEvo->lut.defaultOutputLUTState[0];
 
             if (reference == NULL)
                 break;
+            /*
+             * The fill skips a LUT already marked identity, which this one
+             * is since device allocation: without clearing the marks the
+             * buffer stays all zeros. They are put back afterwards, since
+             * they describe the LUT nvkms wrote, not this copy.
+             */
+            pDevEvo->lut.defaultBaseLUTState[0] = NvKmsLUTStateUninitialized;
+            pDevEvo->lut.defaultOutputLUTState[0] = NvKmsLUTStateUninitialized;
             pLut->cpuAddress[0] = reference;
             pDevEvo->hal->InitDefaultLut(pDevEvo);
             pLut->cpuAddress[0] = mapped;
+            pDevEvo->lut.defaultBaseLUTState[0] = base;
+            pDevEvo->lut.defaultOutputLUTState[0] = output;
 
             out->cpu = (NvU64)(NvUPtr)mapped;
             out->reference = (NvU64)(NvUPtr)reference;
