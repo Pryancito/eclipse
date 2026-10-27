@@ -31,6 +31,7 @@ extern "C" {
     fn eclipse_kms_free_device(device: *mut c_void);
     fn eclipse_kms_probe(device: *mut c_void, info: *mut KmsInfo) -> u8;
     fn eclipse_kms_default_lut(device: *mut c_void, out: *mut KmsLut) -> u8;
+    fn eclipse_kms_default_lut_release(lut: *mut KmsLut);
     fn eclipse_kms_mode(device: *mut c_void, display: u32, index: u32, out: *mut KmsMode) -> i32;
     fn eclipse_kms_console_surface(
         device: *mut c_void,
@@ -251,6 +252,15 @@ impl KmsDevice {
             let _ = &mut lut;
             None
         }
+    }
+
+    /// Frees the reference [`Self::default_lut`] built.
+    pub fn release_default_lut(&self, lut: &mut KmsLut) {
+        #[cfg(target_os = "none")]
+        unsafe {
+            eclipse_kms_default_lut_release(lut)
+        };
+        lut.reference = 0;
     }
 
     /// Every mode nvkms lists for `display`, valid or not: a mode's position
@@ -517,19 +527,22 @@ pub struct KmsMode {
 const _: () = assert!(core::mem::size_of::<KmsMode>() == 4 * 4 + 4);
 
 /// The device's default LUT surface: `struct EclipseKmsLut`. Where nvkms
-/// writes it (`cpu`, a BAR1 mapping) and the RM object that holds it, for
+/// writes it (`cpu`, a BAR1 mapping), what it must hold (`reference`, kernel
+/// memory built by nvkms's own `InitDefaultLut`; give it back with
+/// [`KmsDevice::release_default_lut`]) and the RM object that holds it, for
 /// [`crate::nvkms_os::check_vidmem`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KmsLut {
     pub cpu: u64,
+    pub reference: u64,
     pub h_client: u32,
     pub h_memory: u32,
     pub size: u32,
     pub pad: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<KmsLut>() == 8 + 4 * 4);
+const _: () = assert!(core::mem::size_of::<KmsLut>() == 2 * 8 + 4 * 4);
 
 /// One head the console modeset lights: `struct EclipseKmsHeadSet`.
 #[repr(C)]

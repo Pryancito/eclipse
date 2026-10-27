@@ -324,17 +324,19 @@ struct EclipseVidmemCheck {
     NvU64 vramOffset;      /* where the object starts in VRAM */
     NvU32 bar1Block;       /* the BAR1 bind register, as the GPU has it */
     NvU32 words;           /* 32-bit words compared */
-    NvU32 badWords;        /* words whose VRAM differs from the CPU view */
+    NvU32 badWords;        /* words whose VRAM differs from the reference */
     NvU32 firstBad;        /* byte offset of the first of them, ~0 for none */
-    NvU32 cpuNonZero;      /* words of the CPU view that are not zero */
+    NvU32 refNonZero;      /* words of the reference that are not zero */
     NvU32 badAfterRepair;  /* bad words left after the repair, ~0 if none ran */
     NvU32 consoleWords;    /* console words sampled, 0 when there is none */
     NvU32 consoleSame;     /* of them, equal through BAR1 and in VRAM */
+    NvU32 cpuSame;         /* words the CPU mapping reads equal to the reference */
+    NvU32 cpuOnes;         /* words the CPU mapping reads as 0xffffffff */
     NvU8  bar1Physical;    /* the RM maps BAR1 as a linear window */
     NvU8  pad[7];
 };
 
-_Static_assert(sizeof(struct EclipseVidmemCheck) == 48,
+_Static_assert(sizeof(struct EclipseVidmemCheck) == 56,
                "EclipseVidmemCheck layout is shared with src/nvkms_os.rs");
 
 static NV_STATUS eclipse_vram_word(OBJGPU *pGpu, KernelBus *pKernelBus, NvU64 phys,
@@ -353,17 +355,21 @@ static NV_STATUS eclipse_vram_word(OBJGPU *pGpu, KernelBus *pKernelBus, NvU64 ph
  * display reading something else, and on Turing an all-zero input or output
  * LUT turns every pixel black while the signal stays up. Here the object is
  * read word by word through the BAR0 PRAMIN window, which reaches VRAM by
- * physical address without going through BAR1, and compared with what the
- * CPU sees at `cpu`. With `repair`, words that differ are written into the
- * VRAM through the same window, and read back.
+ * physical address without going through BAR1, and compared with `want`,
+ * what the object must hold, built in kernel memory. With `repair`, words
+ * that differ are written into the VRAM through the same window, and read
+ * back. Never from `cpu`: a BAR1 mapping that does not reach VRAM reads back
+ * all ones, and a LUT of all ones is a white screen. `cpu` (may be NULL) is
+ * only compared, to say whether the CPU mapping works.
  *
  * Also sampled, when this GPU drives the boot console: whether the firmware
  * framebuffer at the base of BAR1 is VRAM offset 0, which is what
  * eclipse_nvkms_describe_console and the nvkms console surface assume.
  */
 NV_STATUS eclipse_nvkms_check_vidmem(NvU32 gpuId, NvHandle hClient, NvHandle hMemory,
-                                     const volatile NvU32 *cpu, NvU32 size,
-                                     NvBool repair, struct EclipseVidmemCheck *pOut)
+                                     const NvU32 *want, const volatile NvU32 *cpu,
+                                     NvU32 size, NvBool repair,
+                                     struct EclipseVidmemCheck *pOut)
 {
     struct EclipseBootConsole con;
     THREAD_STATE_NODE threadState;
@@ -378,7 +384,7 @@ NV_STATUS eclipse_nvkms_check_vidmem(NvU32 gpuId, NvHandle hClient, NvHandle hMe
     portMemSet(pOut, 0, sizeof(*pOut));
     pOut->firstBad = ~0U;
     pOut->badAfterRepair = ~0U;
-    if (cpu == NULL || size < 4)
+    if (want == NULL || size < 4)
         return NV_ERR_INVALID_ARGUMENT;
     words = size / 4;
 
@@ -424,16 +430,23 @@ NV_STATUS eclipse_nvkms_check_vidmem(NvU32 gpuId, NvHandle hClient, NvHandle hMe
 
     for (i = 0; i < words; i++)
     {
-        NvU32 want = cpu[i];
+        if (want[i] != 0)
+            pOut->refNonZero++;
+        if (cpu != NULL)
+        {
+            NvU32 seen = cpu[i];
 
-        if (want != 0)
-            pOut->cpuNonZero++;
+            if (seen == want[i])
+                pOut->cpuSame++;
+            if (seen == ~0U)
+                pOut->cpuOnes++;
+        }
         status = eclipse_vram_word(pGpu, pKernelBus,
                                    memdescGetPhysAddr(pMemDesc, AT_GPU, (NvU64)i * 4),
                                    &value, NV_TRUE);
         if (status != NV_OK)
             goto done;
-        if (value != want)
+        if (value != want[i])
         {
             if (pOut->badWords == 0)
                 pOut->firstBad = i * 4;
@@ -447,16 +460,15 @@ NV_STATUS eclipse_nvkms_check_vidmem(NvU32 gpuId, NvHandle hClient, NvHandle hMe
         for (i = 0; i < words; i++)
         {
             NvU64 phys = memdescGetPhysAddr(pMemDesc, AT_GPU, (NvU64)i * 4);
-            NvU32 want = cpu[i];
 
             status = eclipse_vram_word(pGpu, pKernelBus, phys, &value, NV_TRUE);
-            if (status == NV_OK && value != want)
+            if (status == NV_OK && value != want[i])
             {
-                value = want;
+                value = want[i];
                 status = eclipse_vram_word(pGpu, pKernelBus, phys, &value, NV_FALSE);
                 if (status == NV_OK)
                     status = eclipse_vram_word(pGpu, pKernelBus, phys, &value, NV_TRUE);
-                if (status == NV_OK && value != want)
+                if (status == NV_OK && value != want[i])
                     pOut->badAfterRepair++;
             }
             if (status != NV_OK)
