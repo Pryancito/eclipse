@@ -1879,6 +1879,16 @@ fn schedule_deferred_console_bringup(
         linux_object::fs::devfs::drm::set_scanout_paused_for(
             linux_object::fs::devfs::drm::SCANOUT_PAUSE_MAX,
         );
+        // And the kernel console with it: the notice above is the last thing
+        // drawn until the window closes. The state load inside rebinds the
+        // console card's BAR1, which is its framebuffer, and a console present
+        // landing in the bind left BAR1 faulted for the rest of the boot (every
+        // channel on that card dead, nvkms's LUT unreadable). The RM's
+        // narration still goes to dmesg; the screen was going to stand still
+        // anyway. Pushed out first: a notice that fell inside the console's
+        // present throttle is still pending, and a hold drops pending presents.
+        kernel_hal::console::redraw_active_console();
+        kernel_hal::console::hold_presents_for(linux_object::fs::devfs::drm::SCANOUT_PAUSE_MAX);
         // Brief settle so in-flight blits/CE finish before SEC2.
         kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(200)).await;
 
@@ -1912,6 +1922,7 @@ fn schedule_deferred_console_bringup(
             );
         }
 
+        kernel_hal::console::release_presents();
         linux_object::fs::devfs::drm::set_scanout_paused(false);
 
         // The other half of the pair above: the screen moves again, and this

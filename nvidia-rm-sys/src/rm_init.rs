@@ -1488,7 +1488,8 @@ extern "C" {
 }
 
 /// What the MMU had latched for a BAR fault when [`bar1_recover`] looked,
-/// and whether BAR1 was rebound. Mirrors `EclipseBar1Fault`.
+/// whether BAR1 reached VRAM, and whether BAR1 was rebound. Mirrors
+/// `EclipseBar1Fault`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bar1Fault {
@@ -1504,41 +1505,128 @@ pub struct Bar1Fault {
     pub inst_lo: u32,
     /// `MMU_FAULT_INFO`: engine, client and access type.
     pub info: u32,
-    /// What the BAR1 rebind returned, [`NO_REBIND`] when nothing was
-    /// latched.
+    /// What the BAR1 rebind returned, [`NO_REBIND`] when none ran.
     pub rebind_status: u32,
-    pub pad: u32,
+    /// `NV_VIRTUAL_FUNCTION_PRIV_BIND_STATUS` before any rebind: bit 0 a
+    /// BAR1 bind waiting to be sent, bit 1 one outstanding to FB.
+    pub bind_status: u32,
+    /// The same after the rebind, [`NO_REBIND`] when none ran.
+    pub bind_status_after: u32,
+    /// `BAR1_*` flags.
+    pub flags: u32,
+    /// VRAM 0 read by the CPU through BAR1 0, before any rebind.
+    pub bar1_word: u32,
+    /// VRAM 0 read through the BAR0 PRAMIN window, which bypasses BAR1.
+    pub vram_word: u32,
+    /// VRAM 0 through BAR1 0 after the rebind, [`NO_REBIND`] when none ran.
+    pub bar1_word_after: u32,
+    pub pad: [u32; 3],
 }
 
-const _: () = assert!(core::mem::size_of::<Bar1Fault>() == 32);
+const _: () = assert!(core::mem::size_of::<Bar1Fault>() == 64);
 
-/// [`Bar1Fault::rebind_status`] when the MMU had nothing latched.
+/// [`Bar1Fault::rebind_status`] when no rebind ran.
 pub const NO_REBIND: u32 = u32::MAX;
 
+/// [`Bar1Fault::flags`]: the console was asked to be kept at BAR1 0.
+pub const BAR1_CONSOLE_REQUESTED: u32 = 0x1;
+/// [`Bar1Fault::flags`]: `kbusInitBar1` did map it there.
+pub const BAR1_CONSOLE_MAPPED: u32 = 0x2;
+/// [`Bar1Fault::flags`]: `bar1_word` and `vram_word` were read.
+pub const BAR1_PROBED: u32 = 0x4;
+/// [`Bar1Fault::flags`]: BAR1 is in physical mode.
+pub const BAR1_PHYSICAL: u32 = 0x8;
+
+/// What a BAR access answers when the GPU could not complete it.
+fn pri_error(v: u32) -> bool {
+    v & 0xFFFF_FF00 == 0xBAD0_AC00
+}
+
 impl Bar1Fault {
-    /// Whether the MMU had a fault latched, so BAR1 was rebound.
+    /// Whether BAR1 was rebound: the MMU had a fault latched, or BAR1 read
+    /// the GPU's error answer.
     pub fn faulted(&self) -> bool {
         self.rebind_status != NO_REBIND
     }
 
-    /// The log line for a found fault: what was latched and how the rebind
-    /// went. `tag` says where the check ran.
+    /// Whether BAR1 is fine as far as this check can tell: nothing needed a
+    /// rebind, and where it was read it gave what VRAM holds.
+    pub fn healthy(&self) -> bool {
+        !self.faulted() && (self.flags & BAR1_PROBED == 0 || self.bar1_word == self.vram_word)
+    }
+
+    /// One log line with everything the check saw. `tag` says where it ran.
     pub fn describe(&self, tag: &str) -> alloc::string::String {
-        alloc::format!(
-            "[{}] BAR1 en fallo de MMU: estado {:#010x}, direccion {:#x}, inst {:#010x}, info {:#010x} \
-             (BAR1_BLOCK {:#010x}); {}",
+        use core::fmt::Write;
+        let mut s = alloc::format!(
+            "[{}] BAR1: BAR1_BLOCK {:#010x} ({}), BIND_STATUS {:#x}; consola en BAR1 0: {}",
             tag,
-            self.status,
-            (u64::from(self.addr_hi) << 32) | u64::from(self.addr_lo),
-            self.inst_lo,
-            self.info,
             self.bar1_block,
-            if self.rebind_status == NV_OK {
-                alloc::string::String::from("BAR1 rebindeada")
+            if self.flags & BAR1_PHYSICAL != 0 {
+                "fisica"
             } else {
-                alloc::format!("el rebind de BAR1 fallo, NV_STATUS={:#x}", self.rebind_status)
+                "virtual"
+            },
+            self.bind_status,
+            match (
+                self.flags & BAR1_CONSOLE_REQUESTED != 0,
+                self.flags & BAR1_CONSOLE_MAPPED != 0
+            ) {
+                (_, true) => "mapeada",
+                (true, false) => "pedida pero el RM no la mapeo",
+                (false, false) => "no pedida",
             }
-        )
+        );
+        if self.flags & BAR1_PROBED != 0 {
+            let _ = write!(
+                s,
+                "; VRAM 0 por BAR1 {:#010x}, por PRAMIN {:#010x} ({})",
+                self.bar1_word,
+                self.vram_word,
+                if pri_error(self.bar1_word) {
+                    "BAR1 en fallo"
+                } else if self.bar1_word == self.vram_word {
+                    "coinciden"
+                } else {
+                    "BAR1 no llega a la VRAM"
+                }
+            );
+        }
+        if self.status != 0 || self.faulted() {
+            let _ = write!(
+                s,
+                "; fallo de MMU: estado {:#010x}, direccion {:#x}, inst {:#010x}, info {:#010x}",
+                self.status,
+                (u64::from(self.addr_hi) << 32) | u64::from(self.addr_lo),
+                self.inst_lo,
+                self.info
+            );
+        }
+        if self.faulted() {
+            if self.rebind_status == NV_OK {
+                s.push_str("; BAR1 rebindeada");
+            } else {
+                let _ = write!(
+                    s,
+                    "; el rebind de BAR1 fallo, NV_STATUS={:#x}",
+                    self.rebind_status
+                );
+            }
+            let _ = write!(s, ", BIND_STATUS despues {:#x}", self.bind_status_after);
+            if self.flags & BAR1_PROBED != 0 {
+                let _ = write!(
+                    s,
+                    ", BAR1 lee ahora {:#010x} ({})",
+                    self.bar1_word_after,
+                    if self.bar1_word_after == self.vram_word {
+                        "recuperada"
+                    } else {
+                        "sigue sin llegar a la VRAM"
+                    }
+                );
+            }
+        }
+        s
     }
 }
 
@@ -1551,6 +1639,8 @@ pub fn bar1_recover(device_instance: u32) -> Result<Bar1Fault, NV_STATUS> {
     let _gate = RmGate::try_lock();
     let mut out = Bar1Fault {
         rebind_status: NO_REBIND,
+        bind_status_after: NO_REBIND,
+        bar1_word_after: NO_REBIND,
         ..Default::default()
     };
     let status = unsafe { eclipse_rm_bar1_recover(device_instance, &mut out) };
@@ -3146,42 +3236,110 @@ mod ce_path_tests {
 mod bar1_fault_tests {
     use super::*;
 
-    #[test]
-    fn a_bar1_with_nothing_latched_was_not_rebound() {
-        let quiet = Bar1Fault {
+    fn quiet() -> Bar1Fault {
+        Bar1Fault {
+            bar1_block: 0x801f_74c0,
             rebind_status: NO_REBIND,
+            bind_status_after: NO_REBIND,
+            bar1_word_after: NO_REBIND,
+            flags: BAR1_CONSOLE_REQUESTED | BAR1_CONSOLE_MAPPED | BAR1_PROBED,
+            bar1_word: 0x0012_3456,
+            vram_word: 0x0012_3456,
             ..Default::default()
-        };
-        assert!(!quiet.faulted());
+        }
     }
 
     #[test]
-    fn a_found_fault_names_the_address_and_the_rebind() {
-        let fault = Bar1Fault {
-            bar1_block: 0x801f_74c0,
-            status: 0x8000_0001,
-            addr_lo: 0x0060_1000,
-            addr_hi: 0,
-            inst_lo: 0x1f74_c000,
-            info: 0x0004_0005,
-            rebind_status: NV_OK,
-            pad: 0,
-        };
-        assert!(fault.faulted());
-        let line = fault.describe("gpustep9");
+    fn a_bar1_that_reads_vram_was_not_rebound_and_is_healthy() {
+        let q = quiet();
+        assert!(!q.faulted());
+        assert!(q.healthy());
+        let line = q.describe("gpustep9");
         assert!(
-            line.starts_with("[gpustep9] BAR1 en fallo de MMU"),
+            line.starts_with("[gpustep9] BAR1: BAR1_BLOCK 0x801f74c0 (virtual)"),
             "{}",
             line
         );
-        assert!(line.contains("direccion 0x601000"), "{}", line);
-        assert!(line.contains("BAR1_BLOCK 0x801f74c0"), "{}", line);
-        assert!(line.ends_with("BAR1 rebindeada"), "{}", line);
+        assert!(line.contains("consola en BAR1 0: mapeada"), "{}", line);
+        assert!(line.ends_with("(coinciden)"), "{}", line);
+        assert!(!line.contains("fallo de MMU"), "{}", line);
+    }
+
+    #[test]
+    fn the_line_says_when_the_rm_did_not_map_the_console() {
+        let q = Bar1Fault {
+            flags: BAR1_CONSOLE_REQUESTED,
+            ..quiet()
+        };
+        let line = q.describe("x");
+        assert!(line.contains("pedida pero el RM no la mapeo"), "{}", line);
+        assert!(!line.contains("PRAMIN"), "unprobed: {}", line);
+        assert!(q.healthy(), "nothing read, nothing to blame");
+        let none = Bar1Fault {
+            flags: 0,
+            ..quiet()
+        };
+        assert!(none.describe("x").contains("no pedida"));
+    }
+
+    #[test]
+    fn a_bar1_reading_other_memory_is_not_healthy() {
+        let q = Bar1Fault {
+            bar1_word: 0,
+            ..quiet()
+        };
+        assert!(!q.healthy());
+        assert!(q.describe("x").contains("BAR1 no llega a la VRAM"));
+    }
+
+    #[test]
+    fn a_found_fault_names_the_address_the_bind_and_the_rebind() {
+        let fault = Bar1Fault {
+            status: 0x8000_0001,
+            addr_lo: 0x0008_0000,
+            inst_lo: 0xf74c_0080,
+            info: 0x0011_0802,
+            rebind_status: NV_OK,
+            bind_status: 0x3,
+            bind_status_after: 0,
+            bar1_word: 0xbad0_acf4,
+            bar1_word_after: 0x0012_3456,
+            ..quiet()
+        };
+        assert!(fault.faulted());
+        assert!(!fault.healthy());
+        let line = fault.describe("gpustep9");
+        assert!(line.contains("BIND_STATUS 0x3;"), "{}", line);
+        assert!(line.contains("(BAR1 en fallo)"), "{}", line);
+        assert!(line.contains("direccion 0x80000"), "{}", line);
+        assert!(
+            line.contains("; BAR1 rebindeada, BIND_STATUS despues 0x0"),
+            "{}",
+            line
+        );
+        assert!(line.ends_with("(recuperada)"), "{}", line);
 
         let failed = Bar1Fault {
-            rebind_status: 0x40,
+            rebind_status: 0x65,
+            bind_status_after: 0x2,
+            bar1_word_after: 0xbad0_acf4,
             ..fault
         };
-        assert!(failed.describe("x").contains("NV_STATUS=0x40"));
+        let line = failed.describe("x");
+        assert!(
+            line.contains("el rebind de BAR1 fallo, NV_STATUS=0x65"),
+            "{}",
+            line
+        );
+        assert!(line.contains("BIND_STATUS despues 0x2"), "{}", line);
+        assert!(line.ends_with("(sigue sin llegar a la VRAM)"), "{}", line);
+    }
+
+    #[test]
+    fn the_pri_error_sentinel_is_recognised() {
+        assert!(pri_error(0xbad0_ac00));
+        assert!(pri_error(0xbad0_acf4));
+        assert!(!pri_error(0xbad0_ad00));
+        assert!(!pri_error(0));
     }
 }

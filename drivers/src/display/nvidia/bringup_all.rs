@@ -22,8 +22,8 @@
 //!   with a live raster.
 //! * [`preserve_bar1_console`] -- keep that console mapped at the base of BAR1
 //!   when the state load makes BAR1 virtual, as Linux does for efifb.
-//! * [`recover_bar1`] -- rebind a BAR1 that took an MMU fault, as the RM's
-//!   interrupt handler does on Linux.
+//! * [`recover_bar1`] -- say where BAR1 stands, and rebind it when it took an
+//!   MMU fault, as the RM's interrupt handler does on Linux.
 //!
 //! What does not survive is any question of the form "is this the console
 //! card, so do something else instead".
@@ -92,16 +92,19 @@ pub(super) fn preserve_bar1_console(gpu: &NvidiaGpu, device_instance: u32) -> Op
     )
 }
 
-/// Look for a BAR1 fault the MMU latched and rebind BAR1 if there is one, as
-/// the RM's interrupt handler does on Linux (Eclipse services no GPU
-/// interrupts, so nothing else ever will). `Some(line)` names the faulting
-/// address when one was found; `None` when BAR1 was healthy or the RM could
-/// not be asked.
-pub(super) fn recover_bar1(device_instance: u32, tag: &str) -> Option<String> {
-    match nvidia_rm_sys::rm_init::bar1_recover(device_instance) {
-        Ok(fault) if fault.faulted() => Some(fault.describe(tag)),
-        _ => None,
-    }
+/// Check BAR1 and rebind it when it took an MMU fault, as the RM's interrupt
+/// handler does on Linux (Eclipse services no GPU interrupts, so nothing else
+/// ever will). A fault counts when the MMU latched one, or when VRAM 0 read
+/// through BAR1 comes back as the GPU's error answer: a GSP-RM that serviced
+/// the fault itself has already cleared what the MMU latched. `Some((healthy,
+/// line))` says everything the check saw -- the bind state, whether the RM
+/// mapped the console, BAR1 against VRAM, the rebind -- whether or not it
+/// found anything, so every boot's log answers where BAR1 stands; `None` when
+/// the RM could not be asked.
+pub(super) fn recover_bar1(device_instance: u32, tag: &str) -> Option<(bool, String)> {
+    nvidia_rm_sys::rm_init::bar1_recover(device_instance)
+        .ok()
+        .map(|check| (check.healthy(), check.describe(tag)))
 }
 
 /// The two numbers `mark_primary_for_rm` sends: how many bytes of console the
