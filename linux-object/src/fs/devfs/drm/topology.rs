@@ -106,7 +106,7 @@ pub fn topology_for(f: NodeFacts) -> NodeTopology {
 /// whole DRM core keeps -- so a one-card box reports the one card as driving
 /// the panel and as the first node, which is what makes [`resources_for_node`]
 /// answer exactly as the machine-wide walk did there.
-fn facts_for(minor: u32) -> NodeFacts {
+pub(super) fn facts_for(minor: u32) -> NodeFacts {
     let software_kms = software_kms_active();
     let display = get_display_driver();
     let drivers = snapshot_drivers();
@@ -191,7 +191,7 @@ pub fn resources_for_node(minor: u32) -> (Vec<u32>, Vec<u32>) {
 /// card means the compositor opens `card1` where it used to open `card0`. That
 /// is what Linux does and it is the point of the change, but it is also the one
 /// desktop that currently comes up, so it gets a one-word way back.
-fn panel_on_card0() -> bool {
+pub(super) fn panel_on_card0() -> bool {
     panel_on_card0_in(kernel_hal::boot::cmdline().as_str())
 }
 

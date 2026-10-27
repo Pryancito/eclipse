@@ -1709,7 +1709,7 @@ impl DrmDev {
                 // of it was read: a modeset on a CRTC the card does not have
                 // went to the one it has, and a connector list of any content
                 // was accepted unread.
-                let Some(crtc) = drm::get_crtc(req.crtc_id) else {
+                let Some(crtc) = drm::get_crtc_on(self.minor, req.crtc_id) else {
                     let why = "no such CRTC (the synthetic one needs a primary display)";
                     return Err(kms_refused(
                         "SETCRTC",
@@ -1799,7 +1799,7 @@ impl DrmDev {
                         // `get_crtc` above -- the synthetic connector stays
                         // answerable beside a card that owns the resource
                         // list, like its CRTC does.
-                        if drm::get_connector(id).is_none() {
+                        if drm::get_connector_on(self.minor, id).is_none() {
                             let why = "no such connector in the list";
                             let e = FsError::EntryNotFound;
                             return Err(kms_refused("SETCRTC", req.crtc_id, why, e));
@@ -1869,7 +1869,7 @@ impl DrmDev {
                 // and `drm_framebuffer_lookup` in that order. The CRTC id was
                 // never read, so a flip aimed at a CRTC the card does not have
                 // landed on the one it has.
-                let Some(crtc) = drm::get_crtc(flip.crtc_id) else {
+                let Some(crtc) = drm::get_crtc_on(self.minor, flip.crtc_id) else {
                     return Err(FsError::EntryNotFound);
                 };
                 let Some(fb) = drm::get_fb(flip.fb_id) else {
@@ -2044,7 +2044,7 @@ impl DrmDev {
                 // ENOTTY, fell back to WAIT_VBLANK for every MSC query:
                 // neither this nor QUEUE_SEQUENCE existed.
                 let req = unsafe { &mut *(data as *mut DrmCrtcGetSequence) };
-                if drm::get_crtc(req.crtc_id).is_none() {
+                if drm::get_crtc_on(self.minor, req.crtc_id).is_none() {
                     return Err(FsError::EntryNotFound);
                 }
                 // `drm_crtc_vblank_get` on a CRTC that is off: EINVAL, after
@@ -2075,7 +2075,7 @@ impl DrmDev {
                 const DRM_CRTC_SEQUENCE_RELATIVE: u32 = 0x1;
                 const DRM_CRTC_SEQUENCE_NEXT_ON_MISS: u32 = 0x2;
                 let req = unsafe { &mut *(data as *mut DrmCrtcQueueSequence) };
-                if drm::get_crtc(req.crtc_id).is_none() {
+                if drm::get_crtc_on(self.minor, req.crtc_id).is_none() {
                     return Err(FsError::EntryNotFound);
                 }
                 if req.flags & !(DRM_CRTC_SEQUENCE_RELATIVE | DRM_CRTC_SEQUENCE_NEXT_ON_MISS) != 0 {
@@ -2109,7 +2109,7 @@ impl DrmDev {
                 // and answers ENOENT for one that does not exist. The id was
                 // not read at all, so a stale or invented plane id presented
                 // the fb on the CRTC as if it named the primary plane.
-                let Some(plane) = drm::get_plane(req.plane_id) else {
+                let Some(plane) = drm::get_plane_on(self.minor, req.plane_id) else {
                     return Err(FsError::EntryNotFound);
                 };
                 if req.fb_id != 0 {
@@ -2119,7 +2119,7 @@ impl DrmDev {
                     let Some(fb) = drm::get_fb(req.fb_id) else {
                         return Err(FsError::EntryNotFound);
                     };
-                    if drm::get_crtc(req.crtc_id).is_none() {
+                    if drm::get_crtc_on(self.minor, req.crtc_id).is_none() {
                         return Err(FsError::EntryNotFound);
                     }
                     // `__setplane_check`: the plane has to be usable on this
@@ -2388,7 +2388,7 @@ impl DrmDev {
                 // Both `drm_mode_gamma_{get,set}_ioctl` look the CRTC up
                 // first and answer ENOENT for one that does not exist.
                 let lut = unsafe { &*(data as *const DrmModeCrtcLut) };
-                if drm::get_crtc(lut.crtc_id).is_none() {
+                if drm::get_crtc_on(self.minor, lut.crtc_id).is_none() {
                     return Err(FsError::EntryNotFound);
                 }
                 // The CRTC has no gamma store (GETCRTC reports `gamma_size`
@@ -2534,7 +2534,7 @@ impl DrmDev {
                 // Then it finds the CRTC: "Unknown CRTC ID" is ENOENT. The
                 // id was not looked at, so a cursor aimed at a CRTC that does
                 // not exist moved the one that does.
-                if drm::get_crtc(cur.crtc_id).is_none() {
+                if drm::get_crtc_on(self.minor, cur.crtc_id).is_none() {
                     let e = FsError::EntryNotFound;
                     return Err(kms_refused("CURSOR", cur.crtc_id, "no such CRTC", e));
                 }
@@ -2692,7 +2692,7 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_GETCONNECTOR => {
                 let conn_res = unsafe { &mut *(data as *mut DrmModeGetConnector) };
-                if let Some(conn) = drm::get_connector(conn_res.connector_id) {
+                if let Some(conn) = drm::get_connector_on(self.minor, conn_res.connector_id) {
                     conn_res.connection = if conn.connected { 1 } else { 2 };
                     // Physical dimensions, best source first:
                     //  1. the connector's own values (NVIDIA RM data);
@@ -2704,7 +2704,7 @@ impl DrmDev {
                     //     every DPI-aware client);
                     //  3. a ~96 DPI guess from the resolution, so wlroots never
                     //     sees "Physical size: 0x0".
-                    let edid_mm = drm::get_connector_edid(conn_res.connector_id)
+                    let edid_mm = drm::get_connector_edid_on(self.minor, conn_res.connector_id)
                         .and_then(|e| zcore_drivers::display::edid::physical_size_mm(&e));
                     let (fallback_w, fallback_h) = edid_mm.unwrap_or_else(|| {
                         drm::display_mode()
@@ -2838,7 +2838,7 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_GETCRTC => {
                 let crtc_res = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
-                if let Some(crtc) = drm::get_crtc(crtc_res.crtc_id) {
+                if let Some(crtc) = drm::get_crtc_on(self.minor, crtc_res.crtc_id) {
                     // `drm_mode_getcrtc`: the primary plane's fb, and the
                     // mode only while `crtc_state->enable` -- a CRTC that
                     // `SETCRTC` disabled or whose scanout fb was removed has
@@ -2899,7 +2899,7 @@ impl DrmDev {
                 // snapshot of the driver list and a lookup across every
                 // driver for each plane.
                 let universal = self.file.universal_planes();
-                let planes: alloc::vec::Vec<u32> = drm::get_planes_typed()
+                let planes: alloc::vec::Vec<u32> = drm::get_planes_typed_on(self.minor)
                     .into_iter()
                     .filter(|p| universal || p.plane_type == DRM_PLANE_TYPE_OVERLAY)
                     .map(|p| p.id)
@@ -2912,7 +2912,7 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_GETPLANE => {
                 let res = unsafe { &mut *(data as *mut DrmModeGetPlane) };
-                if let Some(plane) = drm::get_plane(res.plane_id) {
+                if let Some(plane) = drm::get_plane_on(self.minor, res.plane_id) {
                     res.crtc_id = plane.crtc_id;
                     res.fb_id = plane.fb_id;
                     res.possible_crtcs = plane.possible_crtcs;
@@ -3048,7 +3048,7 @@ impl DrmDev {
                 }
                 let connector_id = connector_of_edid_blob(res.blob_id);
                 if let Some(conn_id) = connector_id {
-                    if let Some(edid) = drm::get_connector_edid(conn_id) {
+                    if let Some(edid) = drm::get_connector_edid_on(self.minor, conn_id) {
                         copy_out(res, &edid)
                     } else {
                         // The connector has no EDID, so no blob carries this
