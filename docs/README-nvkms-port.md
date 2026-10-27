@@ -245,6 +245,15 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
     RM mapeó la consola (`bBar1ConsolePreserved`) y la VRAM 0 leída por BAR1
     frente a PRAMIN, y rebindea también cuando BAR1 lee el centinela aunque la
     MMU no tenga nada latcheado.
+  - Con BAR1 sana, labwc con gles2 renderiza por GPU y presenta, pero el
+    escritorio no se ve: el present 2D por CE de la tarjeta de consola
+    (`eclipse_rm_ce_blit_p2p_2d`, pensado para el P2P desde la otra tarjeta)
+    escribía en la dirección PCIe de su propia BAR1, un peer-to-self que el
+    root complex no tiene por qué reenviar. Ahora un destino dentro de la
+    propia BAR1 y de la consola se escribe como `LOCAL_FB` en la VRAM de la
+    consola, como ya hacía la versión 1D (`eclipse_rm_ce_blit`). El "Failed to
+    disable CRTC 1" de wlroots no llega al kernel (ninguno de sus cuatro
+    ioctls aparece rechazado): sale al perder el seat en un cambio de VT.
 - Objetivo: **paridad** con la escalera actual en una sola tarjeta (escritorio,
   cursor, flips sin tearing) con `nvidia.wlr_vulkan`/`wlr_gles2`/`wlr_pixman`.
 

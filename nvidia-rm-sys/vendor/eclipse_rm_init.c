@@ -6901,6 +6901,7 @@ static NV_STATUS eclipse_ce_submit_pitched_2d(
     NvU64    srcPhys,
     NvU32    srcPitch,
     NvU64    dstPhys,
+    NvBool   bDstLocalFb,
     NvU32    dstPitch,
     NvU32    rowBytes,
     NvU32    lineCount,
@@ -6957,9 +6958,12 @@ static NV_STATUS eclipse_ce_submit_pitched_2d(
 
     NV_PUSH_INC_1U(RM_SUBCHANNEL, NV906F_SET_OBJECT, pChannel->classEngineID);
 
-    /* SRC: compositor dumb buffer (cached sysmem). DST: console BAR1 (uncached). */
+    /* SRC: compositor dumb buffer (cached sysmem). DST: this GPU's own VRAM
+     * (bDstLocalFb), or a peer GPU's BAR1 (uncached). */
     srcPhysMode = DRF_DEF(C5B5, _SET_SRC_PHYS_MODE, _TARGET, _COHERENT_SYSMEM);
-    dstPhysMode = DRF_DEF(C5B5, _SET_DST_PHYS_MODE, _TARGET, _NONCOHERENT_SYSMEM);
+    dstPhysMode = bDstLocalFb ?
+                  DRF_DEF(C5B5, _SET_DST_PHYS_MODE, _TARGET, _LOCAL_FB) :
+                  DRF_DEF(C5B5, _SET_DST_PHYS_MODE, _TARGET, _NONCOHERENT_SYSMEM);
     NV_PUSH_INC_2U(RM_SUBCHANNEL,
                    NVC5B5_SET_SRC_PHYS_MODE, srcPhysMode,
                    NVC5B5_SET_DST_PHYS_MODE, dstPhysMode);
@@ -7035,6 +7039,8 @@ static NV_STATUS eclipse_ce_submit_pitched_2d(
  * This eliminates the CPU staging repack: the CE reads directly from the
  * source buffer (fast cached PCIe DMA) and writes to the console GPU's BAR1
  * (fast GPU-initiated PCIe writes), even when src and dst pitches differ.
+ * When the console GPU runs it on itself, the destination is its own BAR1
+ * and is written as LOCAL_FB at the console's VRAM instead (see below).
  *
  * One ASYNC CE launch. Caller waits with eclipse_rm_ce_wait (100 ms
  * deadline) after dropping RM locks -- never a synchronous RM wait, never
@@ -7057,6 +7063,7 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
     THREAD_STATE_NODE  threadState;
     GPU_MASK           gpusLockedMask = 0;
     NvU64              lastWorkId     = 0;
+    NvBool             bDstLocalFb    = NV_FALSE;
 
     if (pWorkId == NULL)
         return NV_ERR_INVALID_ARGUMENT;
@@ -7112,11 +7119,35 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
         goto unlock;
     }
 
+    /*
+     * A destination inside this GPU's own BAR1 is its own VRAM: write it as
+     * LOCAL_FB. As a sysmem address the copy left the GPU, went up to the
+     * root complex and had to be routed back down into the same device's
+     * BAR1 -- PCIe peer-to-self, which root complexes need not forward. The
+     * copy engine still reported the posted writes done, so the console card
+     * presented "OK" frames that never reached the memory it scans. Only the
+     * console region is translated (BAR1 offset == VRAM offset there, the
+     * mapping eclipse_rm_preserve_bar1_console keeps); anything else in BAR1
+     * keeps the old path.
+     */
+    {
+        MEMORY_DESCRIPTOR *pConsole = memmgrGetReservedConsoleMemDesc(pGpu, pMemoryManager);
+        NvU64 bar1Base = gpumgrGetGpuPhysFbAddr(pGpu);
+        NvU64 extent = (NvU64)(lineCount - 1U) * dstPitch + rowBytes;
+
+        if (pConsole != NULL && dstHostPa >= bar1Base &&
+            dstHostPa - bar1Base + extent <= memdescGetSize(pConsole))
+        {
+            dstHostPa = memdescGetPhysAddr(pConsole, AT_GPU, dstHostPa - bar1Base);
+            bDstLocalFb = NV_TRUE;
+        }
+    }
+
     osFlushCpuWriteCombineBuffer();
 
     status = eclipse_ce_submit_pitched_2d(pMemoryManager->pCeUtils,
                                           srcSysmemPa, srcPitch,
-                                          dstHostPa, dstPitch,
+                                          dstHostPa, bDstLocalFb, dstPitch,
                                           rowBytes, lineCount,
                                           &lastWorkId);
     if (status == NV_OK)
@@ -7128,8 +7159,9 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
         static NvU32 s_n = 0;
         NvU32 n = ++s_n;
         if (status != NV_OK || n <= 2 || (n % 64U) == 0)
-            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: 1 launch rowBytes=%u lines=%u srcPitch=%u dstPitch=%u workId=%llu -> 0x%x\n",
-                      rowBytes, lineCount, srcPitch, dstPitch, lastWorkId, status);
+            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: 1 launch rowBytes=%u lines=%u srcPitch=%u dstPitch=%u dst=%s 0x%llx workId=%llu -> 0x%x\n",
+                      rowBytes, lineCount, srcPitch, dstPitch,
+                      bDstLocalFb ? "VRAM" : "peer BAR1", dstHostPa, lastWorkId, status);
     }
 
 unlock:
