@@ -14,6 +14,7 @@ extern crate alloc;
 pub mod fnv_hash;
 pub mod frontend;
 pub mod hooks;
+pub mod nvkms;
 pub mod os_boundary;
 pub mod os_interface;
 pub mod os_services;

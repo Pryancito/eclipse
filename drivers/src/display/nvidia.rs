@@ -297,6 +297,11 @@ fn rm_core_init_once() -> u32 {
     }
     let s = nvidia_rm_sys::rm_init::init_core();
     *status = Some(s);
+    // Compiled in and not loaded: docs/README-nvkms-port.md.
+    log::info!(
+        "[NVIDIA] nvkms (nvidia-modeset) linked={} -- not active yet",
+        nvidia_rm_sys::nvkms::linked()
+    );
     s
 }
 

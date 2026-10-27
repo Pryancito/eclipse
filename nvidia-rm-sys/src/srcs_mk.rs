@@ -221,11 +221,130 @@ pub fn include_dir_drift(dirs: &[PathBuf]) -> IncludeDirDrift {
     drift
 }
 
+/// The C++ half of a `srcs.mk`: `src/nvidia-modeset/srcs.mk` lists the
+/// DisplayPort library this way. The RM's own `srcs.mk` has none.
+const ASSIGN_CXX: &str = "SRCS_CXX += ";
+
+/// nvidia-modeset sources the RM already compiles into the same kernel, so the
+/// second copy would be a duplicate definition at link time. Checked by linking
+/// the whole nvidia-modeset set against the RM archive: `nvstatusToString`
+/// was the only symbol both defined.
+pub const MODESET_SHARED_WITH_RM: &[&str] = &["common/shared/nvstatus/nvstatus.c"];
+
+/// What [`parse_modeset`] made of `src/nvidia-modeset/srcs.mk`.
+pub struct ModesetSources {
+    /// C files, in the order `srcs.mk` lists them.
+    pub c: Vec<PathBuf>,
+    /// C++ files (`SRCS_CXX`), in order.
+    pub cxx: Vec<PathBuf>,
+    /// Entries left out because the RM already compiles them
+    /// ([`MODESET_SHARED_WITH_RM`]).
+    pub shared_with_rm: usize,
+}
+
+/// Turns `src/nvidia-modeset/srcs.mk` into the C and C++ files to compile.
+/// The paths in it are relative to `modeset_dir`, the submodule's
+/// `src/nvidia-modeset`.
+pub fn parse_modeset(text: &str, modeset_dir: &Path) -> ModesetSources {
+    let mut out = ModesetSources {
+        c: Vec::new(),
+        cxx: Vec::new(),
+        shared_with_rm: 0,
+    };
+    for line in text.lines() {
+        let (rel, cxx) = if let Some(rel) = line.strip_prefix(ASSIGN) {
+            (rel.trim(), false)
+        } else if let Some(rel) = line.strip_prefix(ASSIGN_CXX) {
+            (rel.trim(), true)
+        } else {
+            continue;
+        };
+        if MODESET_SHARED_WITH_RM.iter().any(|s| rel.ends_with(s)) {
+            out.shared_with_rm += 1;
+            continue;
+        }
+        let path = modeset_dir.join(rel);
+        if cxx {
+            out.cxx.push(path);
+        } else {
+            out.c.push(path);
+        }
+    }
+    out
+}
+
+/// [`unrecognised`] for nvidia-modeset's `srcs.mk`, where `SRCS_CXX` is ours
+/// too.
+pub fn unrecognised_modeset(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|line| {
+            let taken = line.starts_with(ASSIGN) || line.starts_with(ASSIGN_CXX);
+            !taken && (assigns_to_srcs(line) || assigns_to_srcs_cxx(line))
+        })
+        .collect()
+}
+
+/// [`assigns_to_srcs`] for `SRCS_CXX`.
+fn assigns_to_srcs_cxx(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("SRCS_CXX") else {
+        return false;
+    };
+    match rest.trim_start_matches([' ', '\t']).strip_prefix("+=") {
+        Some(value) => !value.trim().is_empty(),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const NVIDIA: &str = "vendor/open-gpu-kernel-modules/src/nvidia";
+
+    const MODESET: &str = "vendor/open-gpu-kernel-modules/src/nvidia-modeset";
+
+    #[test]
+    fn modeset_c_and_cxx_go_to_their_own_lists() {
+        let text = "SRCS ?=\nSRCS += src/nvkms.c\nSRCS_CXX += src/dp/nvdp-host.cpp\n";
+        let s = parse_modeset(text, Path::new("m"));
+        assert_eq!(s.c, vec![PathBuf::from("m/src/nvkms.c")]);
+        assert_eq!(s.cxx, vec![PathBuf::from("m/src/dp/nvdp-host.cpp")]);
+    }
+
+    #[test]
+    fn a_modeset_source_the_rm_already_has_is_left_out_and_counted() {
+        let text = "SRCS += ../common/shared/nvstatus/nvstatus.c\nSRCS += src/nvkms.c\n";
+        let s = parse_modeset(text, Path::new("m"));
+        assert_eq!(s.c, vec![PathBuf::from("m/src/nvkms.c")]);
+        assert_eq!(s.shared_with_rm, 1);
+    }
+
+    #[test]
+    fn a_cxx_spelling_the_modeset_parser_does_not_take_is_named() {
+        let text = "SRCS_CXX  += a.cpp\nSRCS_CXX += b.cpp\nSRCS += c.c\n";
+        assert_eq!(unrecognised_modeset(text), vec!["SRCS_CXX  += a.cpp"]);
+    }
+
+    /// Against the pinned submodule, when it is checked out.
+    #[test]
+    fn the_pinned_modeset_srcs_mk_parses_whole() {
+        let dir = Path::new(MODESET);
+        let Ok(text) = std::fs::read_to_string(dir.join("srcs.mk")) else {
+            return;
+        };
+        assert!(unrecognised_modeset(&text).is_empty());
+        let s = parse_modeset(&text, dir);
+        assert_eq!(s.shared_with_rm, MODESET_SHARED_WITH_RM.len());
+        assert!(s.c.len() > 150, "solo {} fuentes C de nvkms", s.c.len());
+        assert!(
+            s.cxx.len() > 30,
+            "solo {} fuentes C++ de DisplayPort",
+            s.cxx.len()
+        );
+        for f in s.c.iter().chain(&s.cxx) {
+            assert!(f.is_file(), "{} no existe", f.display());
+        }
+    }
 
     fn parse_str(text: &str) -> Sources {
         parse(text, Path::new(NVIDIA))
