@@ -82,7 +82,9 @@ fn main() {
     build.compile("nvrm_smoketest");
     println!("cargo:rerun-if-changed=vendor/smoketest.c");
 
-    build_first_real_nvidia_file();
+    if build_first_real_nvidia_file() {
+        build_nvkms();
+    }
 }
 
 /// Compiles the real NVIDIA RM source, which lives in the pinned
@@ -100,7 +102,7 @@ fn main() {
 /// Only for `target_os = "none"` (bare-metal kernel). Hosted builds skip the
 /// NVIDIA C entirely so host test binaries can supply `eclipse_rm_*` shims
 /// without colliding with `eclipse_rm_init.c`.
-fn build_first_real_nvidia_file() {
+fn build_first_real_nvidia_file() -> bool {
     // Hosted / libos builds must not compile the RM C objects. Host test
     // binaries (notably `zcore-drivers`) supply `#[no_mangle] eclipse_rm_*`
     // stand-ins in `rm_host_shims`; linking the real `eclipse_rm_init.c`
@@ -112,7 +114,7 @@ fn build_first_real_nvidia_file() {
             "cargo:warning=nvidia-rm-sys: skipping real NVIDIA C source for hosted build (os={})",
             std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "unknown".to_string())
         );
-        return;
+        return false;
     }
     // The real NVIDIA RM core is x86_64 hardware: skip C compilation for
     // non-x86_64 targets to avoid cross-compilation issues (wrong-arch
@@ -122,7 +124,7 @@ fn build_first_real_nvidia_file() {
             "cargo:warning=nvidia-rm-sys: skipping real NVIDIA C source for non-x86_64 target ({})",
             std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".to_string())
         );
-        return;
+        return false;
     }
     let vendor = std::path::Path::new("vendor/open-gpu-kernel-modules");
     let nvidia = vendor.join("src/nvidia");
@@ -143,7 +145,7 @@ fn build_first_real_nvidia_file() {
             "cargo:warning=nvidia-rm-sys: submodule not checked out ({} missing) -- skipping real NVIDIA source; fine for a host rlib build, but an x86_64 kernel link would fail",
             nvidia.join("srcs.mk").display()
         );
-        return;
+        return false;
     }
     // NVIDIA's own authoritative list of every .c file their build compiles
     // into the Resource Manager core, rather than hand-picking files and chasing
@@ -414,4 +416,192 @@ fn build_first_real_nvidia_file() {
     println!("cargo:rerun-if-changed=src/srcs_mk.rs");
     println!("cargo:rerun-if-changed=vendor/eclipse_rm_mem.c");
     println!("cargo:rerun-if-changed=vendor/eclipse_rm_frontend.c");
+    true
+}
+
+/// Compiles nvidia-modeset (nvkms), the code Linux's `nvidia-modeset.ko` is
+/// built from: modeset, DisplayPort, HDMI, flips. See
+/// `docs/README-nvkms-port.md`. Only after the RM, and only when the RM was
+/// compiled: nvkms is a client of it and shares its submodule.
+///
+/// Nothing calls it yet; the OS hooks in `vendor/eclipse_nvkms_os.c` only make
+/// it link.
+fn build_nvkms() {
+    let vendor = std::path::Path::new("vendor/open-gpu-kernel-modules");
+    let modeset = vendor.join("src/nvidia-modeset");
+    let common = vendor.join("src/common");
+    let srcs_mk_path = modeset.join("srcs.mk");
+    let text = std::fs::read_to_string(&srcs_mk_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", srcs_mk_path.display()));
+    let unrecognised = srcs_mk::unrecognised_modeset(&text);
+    assert!(
+        unrecognised.is_empty(),
+        "nvidia-rm-sys: {} asigna fuentes con una forma que el parser no se lleva: {:?}",
+        srcs_mk_path.display(),
+        unrecognised
+    );
+    let sources = srcs_mk::parse_modeset(&text, &modeset);
+    assert_eq!(
+        sources.shared_with_rm,
+        srcs_mk::MODESET_SHARED_WITH_RM.len(),
+        "nvidia-rm-sys: alguna fuente que el RM ya compila ya no esta en el srcs.mk \
+         de nvidia-modeset, o esta dos veces; revisa MODESET_SHARED_WITH_RM"
+    );
+
+    // Transcribed from src/nvidia-modeset/Makefile's `CFLAGS += -I ...`, in
+    // order, with $(SRC_COMMON) substituted.
+    let include_dirs = [
+        common.join("sdk/nvidia/inc"),
+        common.join("sdk/nvidia/inc/hw"),
+        common.join("shared/inc"),
+        common.join("inc"),
+        common.join("softfloat/nvidia"),
+        common.join("softfloat/source/include"),
+        common.join("softfloat/source/8086-SSE"),
+        common.join("unix/common/utils/interface"),
+        common.join("unix/common/inc"),
+        common.join("modeset"),
+        modeset.join("os-interface/include"),
+        modeset.join("kapi/interface"),
+        vendor.join("src/nvidia/arch/nvalloc/unix/include"),
+        modeset.join("interface"),
+        modeset.join("include"),
+        modeset.join("kapi/include"),
+        modeset.join("generated"),
+        common.join("displayport/inc"),
+        common.join("displayport/inc/dptestutil"),
+        common.join("inc/displayport"),
+        common.join("unix/nvidia-3d/interface"),
+        common.join("unix/nvidia-push/interface"),
+        common.join("unix/nvidia-3d/include"),
+        common.join("unix/nvidia-push/include"),
+        common.join("unix/xzminidec/interface"),
+        common.join("unix/nvidia-headsurface"),
+        modeset.join("src/shaders"),
+    ];
+    let defines = [
+        "NDEBUG",
+        "_LANGUAGE_C",
+        "__NO_CTYPE",
+        "NV_CPU_INTRINSICS_KERNEL",
+        "NVHDMIPKT_RM_CALLS_INTERNAL=0",
+        "NVHDMIPKT_NVKMS",
+        "SOFTFLOAT_ROUND_ODD",
+        "SOFTFLOAT_FAST_DIV32TO16",
+        "SOFTFLOAT_FAST_DIV64TO32",
+        "NVT_USE_NVKMS",
+        "NV_SMG_IN_NVKMS",
+        "NV_PUSH_IN_KERNEL",
+        "NV_XZ_CUSTOM_MEM_HOOKS",
+        "NV_XZ_USE_NVTYPES",
+        "XZ_DEC_SINGLE",
+    ];
+    let configure = |build: &mut cc::Build| {
+        for dir in &include_dirs {
+            build.include(dir);
+        }
+        for def in defines {
+            match def.split_once('=') {
+                Some((k, v)) => build.define(k, v),
+                None => build.define(def, None),
+            };
+        }
+        build.flag(&format!(
+            "-include{}",
+            common.join("sdk/nvidia/inc/cpuopsys.h").display()
+        ));
+        build.flag("-fno-common").flag("-fno-strict-aliasing");
+        apply_kernel_flags(build);
+    };
+
+    let mut c = cc::Build::new();
+    c.files(&sources.c);
+    c.file("vendor/eclipse_nvkms_os.c");
+    c.file(nvkms_shaders_asm());
+    c.flag("-std=gnu11");
+    configure(&mut c);
+    c.compile("nvkms");
+
+    // The DisplayPort library. The Makefile's CXX_ONLY_CFLAGS, plus
+    // -fno-threadsafe-statics: a function-local static would otherwise call
+    // `__cxa_guard_acquire`, which no kernel here provides. `operator
+    // new/delete` come from dp_object.h and `__cxa_pure_virtual` from
+    // nvkms-utils.c, and the set has no global constructors (no .init_array),
+    // so this needs no C++ runtime of its own.
+    let mut cxx = cc::Build::new();
+    cxx.cpp(true)
+        .cpp_link_stdlib(None)
+        .files(&sources.cxx)
+        .flag("-std=gnu++11")
+        .flag("-fno-operator-names")
+        .flag("-fno-rtti")
+        .flag("-fno-exceptions")
+        .flag("-fcheck-new")
+        .flag("-fno-threadsafe-statics");
+    configure(&mut cxx);
+    cxx.compile("nvkms_dp");
+
+    for f in sources.c.iter().chain(&sources.cxx) {
+        println!("cargo:rerun-if-changed={}", f.display());
+    }
+    println!("cargo:rerun-if-changed={}", srcs_mk_path.display());
+    println!("cargo:rerun-if-changed=vendor/eclipse_nvkms_os.c");
+}
+
+/// Headsurface's shader blobs, xz-compressed and embedded as the
+/// `_binary_<arch>_shaders_xz_{start,end}` symbols nvidia-3d-init.c looks up --
+/// what the nvidia-modeset Makefile's COMPRESS_SHADERS and
+/// READ_ONLY_OBJECT_FROM_FILE_RULE do with `xz` and `ld --format=binary`.
+/// Returns the generated assembly file.
+fn nvkms_shaders_asm() -> std::path::PathBuf {
+    const ARCHS: [&str; 8] = [
+        "maxwell",
+        "pascal",
+        "volta",
+        "turing",
+        "ampere",
+        "hopper",
+        "blackwell",
+        "gb20x",
+    ];
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let shaders =
+        std::path::Path::new("vendor/open-gpu-kernel-modules/src/nvidia-modeset/src/shaders");
+    let mut asm = String::from("\t.section .rodata\n");
+    for arch in ARCHS {
+        let src = shaders.join(format!("g_{arch}_shaders"));
+        let dst = out.join(format!("{arch}_shaders.xz"));
+        let input = std::fs::File::open(&src)
+            .unwrap_or_else(|e| panic!("failed to open {}: {e}", src.display()));
+        let output = std::fs::File::create(&dst)
+            .unwrap_or_else(|e| panic!("failed to create {}: {e}", dst.display()));
+        // `-C none`: xzminidec is built with XZ_DEC_SINGLE and no check, the
+        // same as the Makefile's `xz -ce -C none`.
+        let status = std::process::Command::new("xz")
+            .args(["-ce", "-C", "none"])
+            .stdin(input)
+            .stdout(output)
+            .status()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "nvidia-rm-sys: no se pudo ejecutar `xz` ({}); hace falta para \
+                     empaquetar los shaders de nvidia-modeset (paquete xz-utils)",
+                    e
+                )
+            });
+        assert!(status.success(), "xz failed on {}", src.display());
+        println!("cargo:rerun-if-changed={}", src.display());
+        asm.push_str(&format!(
+            "\t.global _binary_{arch}_shaders_xz_start\n\
+             \t.global _binary_{arch}_shaders_xz_end\n\
+             _binary_{arch}_shaders_xz_start:\n\
+             \t.incbin \"{}\"\n\
+             _binary_{arch}_shaders_xz_end:\n",
+            dst.display()
+        ));
+    }
+    asm.push_str("\t.section .note.GNU-stack,\"\",@progbits\n");
+    let path = out.join("nvkms_shaders.S");
+    std::fs::write(&path, asm).expect("write nvkms_shaders.S");
+    path
 }
