@@ -221,6 +221,18 @@ impl NvidiaGpu {
             release(self);
             return alloc::vec![format!("{}: el RM no lista esta GPU", tag)];
         };
+        // Before allocateDevice, which is where nvkms imports the console.
+        let console_note = if self.drives_boot_display() {
+            nvkms_os::describe_console(gpu_id).err().map(|status| {
+                format!(
+                    "{}: el RM no acepto la consola de arranque como su region de consola \
+                     ({:#x})",
+                    tag, status
+                )
+            })
+        } else {
+            None
+        };
         let Some(device) = KmsDevice::alloc(gpu_id) else {
             release(self);
             return alloc::vec![format!(
@@ -233,6 +245,7 @@ impl NvidiaGpu {
             "{}: nvkms tiene el display (gpu id {:#x})",
             tag, gpu_id
         )];
+        lines.extend(console_note);
         let info = device.probe();
         match &info {
             Some(info) => {
@@ -277,8 +290,8 @@ impl NvidiaGpu {
         };
         if info.vt_fb_size == 0 {
             lines.push(format!(
-                "{}: el RM no reservo la memoria de la consola; la pantalla se queda \
-                 como la dejo el firmware",
+                "{}: nvkms no tiene importada la consola de arranque; la pantalla se \
+                 queda como la dejo el firmware",
                 tag
             ));
             return None;

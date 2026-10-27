@@ -425,6 +425,7 @@ extern "C" {
     fn eclipse_rm_kernel_rmapi_op(ops: *mut c_void);
     fn eclipse_rm_enumerate_gpus(gpu_info: *mut c_void) -> u32;
     fn eclipse_rm_gpu_id_attached(gpu_id: u32) -> u8;
+    fn eclipse_nvkms_describe_console(gpu_id: u32) -> u32;
 }
 
 /// `nvkms_call_rm`: one `nvidia_kernel_rmapi_ops_t` into the RM, through
@@ -474,6 +475,28 @@ pub extern "C" fn nvkms_open_gpu(gpu_id: u32) -> u8 {
     {
         let _ = gpu_id;
         0
+    }
+}
+
+/// Give the RM the boot console of the GPU `gpu_id` as its reserved console
+/// region, the memory `NV01_MEMORY_FRAMEBUFFER_CONSOLE` and `VT_GET_FB_INFO`
+/// hand out, without reserving anything before the GSP boot
+/// (`vendor/eclipse_nvkms_rm.c` says why). Call it before kapi's
+/// `allocateDevice`, which is where nvkms imports the console. The RM status
+/// on failure; a GPU that already has a console region answers `Ok`.
+pub fn describe_console(gpu_id: u32) -> Result<(), u32> {
+    #[cfg(target_os = "none")]
+    {
+        let _gate = RmGate::lock();
+        match unsafe { eclipse_nvkms_describe_console(gpu_id) } {
+            0 => Ok(()),
+            status => Err(status),
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = gpu_id;
+        Err(0x56) // NV_ERR_NOT_SUPPORTED
     }
 }
 

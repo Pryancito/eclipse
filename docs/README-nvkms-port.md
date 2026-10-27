@@ -162,6 +162,18 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
     A8R8G8B8 en VRAM, reservada por kapi y escrita por la transferencia BAR1
     del RM. Cada movimiento es un flip que solo toca el cursor.
     `nvidia.nvkms` activa el camino de cursor por hardware de la capa DRM.
+- PR 4c: la región de consola se describe al RM después del arranque del GSP.
+  - En tu hardware el RM no tenía región de consola, así que
+    `NV01_MEMORY_FRAMEBUFFER_CONSOLE` fallaba y no había modeset.
+  - Reservarla antes del arranque, como Linux (`nvidia.console_preserve`), mueve
+    la ventana BAR1 por la que se pinta la consola. Sin nvkms la pantalla se
+    congela; con nvkms sale negra.
+  - Ahora, justo antes de `allocateDevice`, el shim describe el framebuffer de
+    la UEFI como el memdesc de consola reservado, igual que
+    `memmgrAllocateConsoleRegion`: VRAM desde el offset 0, porque sin la
+    reserva el BAR1 sigue siendo una ventana lineal. No cambia ni el reparto
+    del FB ni el BAR1.
+  - nvkms importa y escanea la misma memoria en la que pintan la CPU y el CE.
 - Objetivo: **paridad** con la escalera actual en una sola tarjeta (escritorio,
   cursor, flips sin tearing) con `nvidia.wlr_vulkan`/`wlr_gles2`/`wlr_pixman`.
 

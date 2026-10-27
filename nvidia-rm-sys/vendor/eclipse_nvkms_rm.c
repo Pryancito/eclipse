@@ -23,6 +23,9 @@
 #include <gpu/device/device.h>
 #include <gpu/subdevice/subdevice.h>
 #include <gpu/mem_mgr/mem_mgr.h>
+#include <gpu/mem_mgr/mem_desc.h>
+#include <rmapi/rmapi.h>
+#include <core/thread_state.h>
 #include <platform/sli/sli.h>
 
 /*
@@ -229,6 +232,84 @@ NV_STATUS deviceCtrlCmdOsUnixVTGetFBInfo_IMPL(Device *pDevice,
     }
 
     return NV_OK;
+}
+
+/*
+ * The console region, described after the GSP boot instead of reserved
+ * before it.
+ *
+ * Linux reserves the firmware framebuffer before kgspInitRm
+ * (osinit.c RmSetConsolePreservationParams): ReservedConsoleDispMemSize makes
+ * memmgrAllocateConsoleRegion describe FB region 0 as the console, and
+ * bPreserveBar1ConsoleEnabled keeps a BAR1 mapping on it. That is what
+ * nvidia.console_preserve does, and on a dual RTX 2060 SUPER it costs the
+ * picture: the BAR1 window the console is drawn through stops reaching the
+ * memory the firmware head scans, and that head freezes on its last frame.
+ *
+ * Without it the RM leaves BAR1 a linear window onto VRAM, so the firmware
+ * framebuffer, which starts at BAR1's base, is VRAM offset 0 (the same
+ * relationship eclipse_rm_ce_blit relies on), and every CPU and CE write
+ * lands where the head scans. Describing that range as the reserved console
+ * memdesc, exactly as memmgrAllocateConsoleRegion_GM107 does, is all
+ * NV01_MEMORY_FRAMEBUFFER_CONSOLE and VT_GET_FB_INFO need: nvkms then imports
+ * and scans out the memory being drawn, and nothing about the FB layout or
+ * BAR1 changes. A GPU that already has a console memdesc (the flag above) is
+ * left alone.
+ */
+NV_STATUS eclipse_nvkms_describe_console(NvU32 gpuId)
+{
+    struct EclipseBootConsole con;
+    THREAD_STATE_NODE threadState;
+    MemoryManager *pMemoryManager;
+    OBJGPU *pGpu;
+    NvU64 size;
+    NV_STATUS status;
+
+    if (!eclipse_boot_console(&con) || con.height == 0 || con.pitch == 0)
+        return NV_ERR_INVALID_STATE;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_FB);
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_FB);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpuFromId(gpuId);
+    pMemoryManager = (pGpu != NULL) ? GPU_GET_MEMORY_MANAGER(pGpu) : NULL;
+    if (pMemoryManager == NULL)
+        status = NV_ERR_INVALID_ARGUMENT;
+    else if (con.phys != gpumgrGetGpuPhysFbAddr(pGpu))
+        status = NV_ERR_NOT_SUPPORTED;
+    else if (memmgrGetReservedConsoleMemDesc(pGpu, pMemoryManager) == NULL)
+    {
+        /* osinit.c's NV_ALIGN_UP(fbConsoleSize, 0x10000). */
+        size = NV_ALIGN_UP((NvU64)con.height * (NvU64)con.pitch, 0x10000);
+        status = memdescCreate(&pMemoryManager->pReservedConsoleMemDesc, pGpu,
+                               size, RM_PAGE_SIZE_64K, NV_TRUE, ADDR_FBMEM,
+                               NV_MEMORY_UNCACHED,
+                               MEMDESC_FLAGS_SKIP_RESOURCE_COMPUTE);
+        if (status == NV_OK)
+        {
+            memdescDescribe(pMemoryManager->pReservedConsoleMemDesc, ADDR_FBMEM,
+                            0, size);
+            memdescSetPageSize(pMemoryManager->pReservedConsoleMemDesc,
+                               AT_GPU, RM_PAGE_SIZE);
+        }
+    }
+
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+    rmapiLockRelease();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
 }
 
 /*

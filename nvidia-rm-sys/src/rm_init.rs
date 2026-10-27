@@ -2174,6 +2174,7 @@ pub fn gem_free(device_instance: u32, ctx_idx: u32, h_memory: u32) -> NV_STATUS 
 /// client names as the source when it dups that GEM into its own (nvkms
 /// flipping to it). `None` before the context tables exist.
 pub fn gem_client(device_instance: u32, ctx_idx: u32) -> Option<u32> {
+    let _gate = RmGate::lock();
     let mut h_client = 0;
     let status = unsafe { eclipse_rm_gem_client(device_instance, ctx_idx, &mut h_client) };
     (status == NV_OK && h_client != 0).then_some(h_client)
