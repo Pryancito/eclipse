@@ -426,6 +426,15 @@ extern "C" {
     fn eclipse_rm_enumerate_gpus(gpu_info: *mut c_void) -> u32;
     fn eclipse_rm_gpu_id_attached(gpu_id: u32) -> u8;
     fn eclipse_nvkms_describe_console(gpu_id: u32) -> u32;
+    fn eclipse_nvkms_check_vidmem(
+        gpu_id: u32,
+        h_client: u32,
+        h_memory: u32,
+        cpu: *const u32,
+        size: u32,
+        repair: u8,
+        out: *mut VidmemCheck,
+    ) -> u32;
 }
 
 /// `nvkms_call_rm`: one `nvidia_kernel_rmapi_ops_t` into the RM, through
@@ -496,6 +505,172 @@ pub fn describe_console(gpu_id: u32) -> Result<(), u32> {
     #[cfg(not(target_os = "none"))]
     {
         let _ = gpu_id;
+        Err(0x56) // NV_ERR_NOT_SUPPORTED
+    }
+}
+
+/// What [`check_vidmem`] found: `struct EclipseVidmemCheck`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VidmemCheck {
+    /// Where the object starts in VRAM.
+    pub vram_offset: u64,
+    /// `NV_VIRTUAL_FUNCTION_PRIV_BAR1_BLOCK` as the GPU has it: bit 31 set is
+    /// a virtual BAR1 (translated by the RM's page tables), clear a linear one.
+    pub bar1_block: u32,
+    /// 32-bit words compared.
+    pub words: u32,
+    /// Words whose VRAM differed from what the CPU sees through its mapping.
+    pub bad_words: u32,
+    /// Byte offset of the first of them, `u32::MAX` for none.
+    pub first_bad: u32,
+    /// Words of the CPU view that are not zero.
+    pub cpu_non_zero: u32,
+    /// Bad words left after rewriting the VRAM, [`NOT_REPAIRED`] when no
+    /// repair ran.
+    pub bad_after_repair: u32,
+    /// Boot-console words sampled, 0 when this GPU has no boot console.
+    pub console_words: u32,
+    /// Of them, the ones equal through the base of BAR1 and in VRAM.
+    pub console_same: u32,
+    /// Whether the RM maps BAR1 as a linear window.
+    pub bar1_physical: u8,
+    pub pad: [u8; 7],
+}
+
+const _: () = assert!(core::mem::size_of::<VidmemCheck>() == 48);
+
+/// [`VidmemCheck::bad_after_repair`] when there was nothing to repair.
+pub const NOT_REPAIRED: u32 = u32::MAX;
+
+/// What a [`VidmemCheck`] means for the display reading that memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VidmemVerdict {
+    /// The VRAM holds what the CPU wrote.
+    Coherent,
+    /// It did not, and rewriting it through BAR0 fixed it.
+    Repaired,
+    /// The CPU reads zeros back from its own mapping: there is nothing to
+    /// repair the VRAM with.
+    CpuBlank,
+    /// The VRAM still differs.
+    Broken,
+}
+
+impl VidmemCheck {
+    pub fn verdict(&self) -> VidmemVerdict {
+        if self.words == 0 || self.cpu_non_zero == 0 {
+            VidmemVerdict::CpuBlank
+        } else if self.bad_words == 0 {
+            VidmemVerdict::Coherent
+        } else if self.bad_after_repair == 0 {
+            VidmemVerdict::Repaired
+        } else {
+            VidmemVerdict::Broken
+        }
+    }
+
+    /// Whether the display can be trusted with it.
+    pub fn usable(&self) -> bool {
+        matches!(
+            self.verdict(),
+            VidmemVerdict::Coherent | VidmemVerdict::Repaired
+        )
+    }
+
+    /// One line for the log, in the driver's language.
+    pub fn describe(&self) -> alloc::string::String {
+        let what = match self.verdict() {
+            VidmemVerdict::Coherent => alloc::format!(
+                "la VRAM coincide con lo que escribio la CPU ({} palabras)",
+                self.words
+            ),
+            VidmemVerdict::Repaired => alloc::format!(
+                "{} de {} palabras en VRAM no eran lo que escribio la CPU (la primera en \
+                 +{:#x}); reescritas por BAR0",
+                self.bad_words,
+                self.words,
+                self.first_bad
+            ),
+            VidmemVerdict::CpuBlank => alloc::format!(
+                "la CPU lee ceros de su propio mapeo ({} palabras): sus escrituras no llegan",
+                self.words
+            ),
+            VidmemVerdict::Broken => alloc::format!(
+                "{} de {} palabras en VRAM no son lo que escribio la CPU (la primera en \
+                 +{:#x}) y {} siguen mal tras reescribirlas",
+                self.bad_words,
+                self.words,
+                self.first_bad,
+                if self.bad_after_repair == NOT_REPAIRED {
+                    self.bad_words
+                } else {
+                    self.bad_after_repair
+                }
+            ),
+        };
+        let mut line = alloc::format!(
+            "LUT por defecto en VRAM {:#x}: {}; BAR1 {} (BAR1_BLOCK {:#x}), el RM la mapea como {}",
+            self.vram_offset,
+            what,
+            if self.bar1_block & (1 << 31) != 0 {
+                "virtual"
+            } else {
+                "lineal"
+            },
+            self.bar1_block,
+            if self.bar1_physical != 0 {
+                "lineal"
+            } else {
+                "virtual"
+            },
+        );
+        if self.console_words != 0 {
+            line.push_str(&alloc::format!(
+                "; consola: {}/{} palabras iguales por la base de BAR1 y en VRAM 0",
+                self.console_same,
+                self.console_words
+            ));
+        }
+        line
+    }
+}
+
+/// Whether what the CPU wrote into an RM video-memory object is what sits in
+/// VRAM, read through the BAR0 window instead of BAR1
+/// (`vendor/eclipse_nvkms_rm.c` says why). With `repair`, words that differ
+/// are rewritten through the same window. `cpu` must be a live mapping of at
+/// least `size` bytes of the object. The RM status on failure.
+pub fn check_vidmem(
+    gpu_id: u32,
+    h_client: u32,
+    h_memory: u32,
+    cpu: u64,
+    size: u32,
+    repair: bool,
+) -> Result<VidmemCheck, u32> {
+    #[cfg(target_os = "none")]
+    {
+        let mut out = VidmemCheck::default();
+        let _gate = RmGate::lock();
+        match unsafe {
+            eclipse_nvkms_check_vidmem(
+                gpu_id,
+                h_client,
+                h_memory,
+                cpu as usize as *const u32,
+                size,
+                repair as u8,
+                &mut out,
+            )
+        } {
+            0 => Ok(out),
+            status => Err(status),
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (gpu_id, h_client, h_memory, cpu, size, repair);
         Err(0x56) // NV_ERR_NOT_SUPPORTED
     }
 }
@@ -791,6 +966,70 @@ mod tests {
         assert_eq!(eclipse_boot_console(core::ptr::null_mut()), 0);
         set_boot_console(BootConsole::default());
         assert_eq!(eclipse_boot_console(&mut out), 0, "no framebuffer at 0");
+    }
+
+    fn lut_check(bad: u32, after: u32, cpu_non_zero: u32) -> VidmemCheck {
+        VidmemCheck {
+            vram_offset: 0x1_ffe0_0000,
+            bar1_block: 0x8000_0000 | 0x1234,
+            words: 4160,
+            bad_words: bad,
+            first_bad: if bad == 0 { u32::MAX } else { 0x20 },
+            cpu_non_zero,
+            bad_after_repair: after,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_lut_the_display_would_read_as_zeros_stops_the_modeset() {
+        let fine = lut_check(0, NOT_REPAIRED, 3000);
+        assert_eq!(fine.verdict(), VidmemVerdict::Coherent);
+        assert!(fine.usable());
+
+        let fixed = lut_check(4000, 0, 3000);
+        assert_eq!(fixed.verdict(), VidmemVerdict::Repaired);
+        assert!(fixed.usable());
+
+        let stuck = lut_check(4000, 12, 3000);
+        assert_eq!(stuck.verdict(), VidmemVerdict::Broken);
+        assert!(!stuck.usable());
+
+        // Zeros in VRAM and zeros through the CPU agree, and are still no
+        // LUT: an identity ramp is never all zeros.
+        let blank = lut_check(0, NOT_REPAIRED, 0);
+        assert_eq!(blank.verdict(), VidmemVerdict::CpuBlank);
+        assert!(!blank.usable());
+        assert_eq!(VidmemCheck::default().verdict(), VidmemVerdict::CpuBlank);
+    }
+
+    #[test]
+    fn the_lut_check_line_names_both_bar1_views_and_the_console_sample() {
+        let line = lut_check(4000, 0, 3000).describe();
+        assert!(line.contains("0x1ffe00000"), "{}", line);
+        assert!(line.contains("4000 de 4160"), "{}", line);
+        assert!(line.contains("+0x20"), "{}", line);
+        assert!(line.contains("BAR1 virtual"), "{}", line);
+        assert!(line.contains("el RM la mapea como virtual"), "{}", line);
+        assert!(!line.contains("consola"), "{}", line);
+
+        let mut sampled = lut_check(0, NOT_REPAIRED, 3000);
+        sampled.bar1_block = 0;
+        sampled.bar1_physical = 1;
+        sampled.console_words = 256;
+        sampled.console_same = 251;
+        let line = sampled.describe();
+        assert!(line.contains("BAR1 lineal"), "{}", line);
+        assert!(line.contains("el RM la mapea como lineal"), "{}", line);
+        assert!(line.contains("251/256"), "{}", line);
+
+        let line = lut_check(4000, NOT_REPAIRED, 3000).describe();
+        assert!(line.contains("y 4000 siguen mal"), "{}", line);
+    }
+
+    #[test]
+    fn checking_vram_needs_the_rm_a_hosted_build_does_not_have() {
+        assert_eq!(check_vidmem(0x1700, 1, 2, 0x1000, 64, true), Err(0x56));
     }
 
     #[test]

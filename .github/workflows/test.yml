@@ -28,6 +28,12 @@ jobs:
           toolchain: ${{ env.rust_toolchain }}
           components: rust-src, llvm-tools-preview
 
+      # `cargo test -p zcore-loader --lib` below builds the default
+      # (`zircon`) features, whose `include_bytes!` of the prebuilt userboot
+      # and vDSO blobs fails in a plain checkout.
+      - name: Pull prebuilt images
+        run: make zircon-init
+
       - name: Run unit test
         run: |
           python3 -m unittest discover -s scripts/tests

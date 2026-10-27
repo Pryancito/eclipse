@@ -30,6 +30,7 @@ extern "C" {
     fn eclipse_kms_alloc_device(gpu_id: u32) -> *mut c_void;
     fn eclipse_kms_free_device(device: *mut c_void);
     fn eclipse_kms_probe(device: *mut c_void, info: *mut KmsInfo) -> u8;
+    fn eclipse_kms_default_lut(device: *mut c_void, out: *mut KmsLut) -> u8;
     fn eclipse_kms_mode(device: *mut c_void, display: u32, index: u32, out: *mut KmsMode) -> i32;
     fn eclipse_kms_console_surface(
         device: *mut c_void,
@@ -229,6 +230,25 @@ impl KmsDevice {
         #[cfg(not(target_os = "none"))]
         {
             let _ = &mut info;
+            None
+        }
+    }
+
+    /// The default LUT surface (Turing and later): the input and output LUTs
+    /// every head uses while no client sets its own, which the console
+    /// modeset does not. `None` when the device has none.
+    pub fn default_lut(&self) -> Option<KmsLut> {
+        let mut lut = KmsLut::default();
+        #[cfg(target_os = "none")]
+        {
+            if unsafe { eclipse_kms_default_lut(self.0.as_ptr(), &mut lut) } == 0 {
+                return None;
+            }
+            Some(lut)
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = &mut lut;
             None
         }
     }
@@ -495,6 +515,21 @@ pub struct KmsMode {
 }
 
 const _: () = assert!(core::mem::size_of::<KmsMode>() == 4 * 4 + 4);
+
+/// The device's default LUT surface: `struct EclipseKmsLut`. Where nvkms
+/// writes it (`cpu`, a BAR1 mapping) and the RM object that holds it, for
+/// [`crate::nvkms_os::check_vidmem`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KmsLut {
+    pub cpu: u64,
+    pub h_client: u32,
+    pub h_memory: u32,
+    pub size: u32,
+    pub pad: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<KmsLut>() == 8 + 4 * 4);
 
 /// One head the console modeset lights: `struct EclipseKmsHeadSet`.
 #[repr(C)]

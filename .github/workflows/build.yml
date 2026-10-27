@@ -73,6 +73,11 @@ jobs:
       # QEMU suite in `test.yml`, which first links a kernel and boots it, so
       # a `deny(warnings)` dead-code error in that configuration reached
       # master and sat there unseen. This catches it in half a minute.
+      # The Zircon personality `include_bytes!`es the prebuilt userboot and
+      # vDSO blobs, which a plain checkout does not have.
+      - name: Pull prebuilt images
+        run: make zircon-init
+
       - name: Build the Zircon personality
         run: cargo build --package zcore --features "zircon libos"
 
