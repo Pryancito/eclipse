@@ -224,6 +224,9 @@ pub struct NvidiaParams {
     pub multigpu: bool,
     /// `nvidia.hwcursor`: the display engine's cursor plane draws the pointer.
     pub hwcursor: bool,
+    /// `nvidia.nvkms`: load nvidia-modeset and give it every RM-attached GPU,
+    /// as `nvidia-drm.modeset=1` does in Linux. See `docs/README-nvkms-port.md`.
+    pub nvkms: bool,
     /// `nvidia.monitor=BB.DD.F`: the card that drives the display (`card0`).
     pub monitor: Option<(u8, u8, u8)>,
     /// `nvidia.compute=BB.DD.F`: the card that owns compute.
@@ -243,6 +246,7 @@ impl NvidiaParams {
             nouveau_uapi: flag(cmdline, "nvidia.nouveau_uapi"),
             multigpu: flag(cmdline, "nvidia.multigpu"),
             hwcursor: flag(cmdline, "nvidia.hwcursor"),
+            nvkms: flag(cmdline, "nvidia.nvkms"),
             monitor: pci_bdf(cmdline, "nvidia.monitor"),
             compute: pci_bdf(cmdline, "nvidia.compute"),
             wlr_vulkan: flag(cmdline, "nvidia.wlr_vulkan"),
@@ -278,6 +282,13 @@ mod tests {
         assert_eq!(NvidiaParams::parse("LOG=warn"), NvidiaParams::default());
         let p = NvidiaParams::parse("nvidia.hwcursor=0:nvidia.cuda=off");
         assert!(!p.hwcursor && !p.cuda);
+    }
+
+    #[test]
+    fn nvkms_is_its_own_flag() {
+        assert!(NvidiaParams::parse("LOG=warn:nvidia.nvkms=1").nvkms);
+        assert!(!NvidiaParams::parse("nvidia.nvkms=0").nvkms);
+        assert!(!NvidiaParams::parse("nvidia.nvkmsx").nvkms);
     }
 
     #[test]

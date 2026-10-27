@@ -113,15 +113,36 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
   `kernel_hal::timer`, semáforos, `nvkms_get_usec`, log con `klog`.
 - Tests de host para la parte Rust (timers, refcount, copyin/out).
 
-**PR 3: nvkms toma la tarjeta de arranque (`nvidia.nvkms=1`).**
-- `nvidia.rs`: `allocateDevice` + `grabOwnership` por GPU, conectores y
-  modos desde kapi, `applyModeSetConfig` para SETCRTC/flip.
+**PR 3: `nvidia.nvkms` carga nvkms y le da cada GPU, sin modeset.**
+- Los tres controles `OS_UNIX` sin los que `nvAllocDevEvo` no reserva el
+  dispositivo, hasta ahora stubs con `NOT_SUPPORTED`, pasan al shim
+  (`vendor/eclipse_nvkms_rm.c`) como en `unix_console.c` y
+  `dynamic-power.c`: `VT_GET_FB_INFO` contesta con la consola de la UEFI
+  (el `screen_info` de Linux, que el driver registra al arrancar) en la GPU
+  cuyo BAR1 empieza en ella; `VT_SWITCH` y el refcount de GC6 aceptan sin
+  hacer nada, porque aquí no hay consola VGA que devolver ni GC6.
+- `nvKmsModuleLoad` una vez, bajo `nvkms_lock`.
+- Cliente kapi en C (`vendor/eclipse_nvkms_drv.c`, la mitad de
+  `nvidia-drm`): `allocateDevice` por GPU y una consulta de cabezas,
+  conectores, pantallas, EDID y modos que el driver escribe en el log.
+- Una tarea del arranque espera al bring-up diferido de la GPU de consola,
+  carga nvkms en cada tarjeta y después atiende sus timers.
+- nvkms y la escalera propia (`surfaceflip`/`hwcursor`) se excluyen por GPU:
+  quien llega primero se queda el canal core.
+- Como `nvidia-drm` antes de su primer commit, **la pantalla no cambia**:
+  nvkms sigue escaneando lo que dejó la UEFI hasta que se aplica un modo.
+
+**PR 4: modeset de la tarjeta de arranque.**
+- La memoria de la consola (`NV01_MEMORY_FRAMEBUFFER_CONSOLE`) como
+  superficie de kapi y `applyModeSetConfig` con el modo de la UEFI: el
+  escritorio sigue igual, pero ya lo escanea nvkms.
+- Después, flips de nvkms para los GEM en VRAM y cursor por kapi.
 - Objetivo: **paridad** con la escalera actual en una sola tarjeta (escritorio,
   cursor, flips sin tearing) con `nvidia.wlr_vulkan`/`wlr_gles2`/`wlr_pixman`.
-- Validación: QEMU (sin NVIDIA, no debe cambiar nada) y tu hardware.
 
-**PR 4: segunda tarjeta.**
-- La misma ruta para cada GPU con monitor: card1 enciende su pantalla.
+**PR 5: segunda tarjeta.**
+- La misma ruta para cada GPU con monitor, con una superficie en VRAM
+  reservada por kapi: card1 enciende su pantalla.
 - `GETRESOURCES`/`GETCRTC` de card1 desde su `NvKmsKapiDevice`.
 - Validación en tu hardware con un monitor en cada 2060 SUPER.
 

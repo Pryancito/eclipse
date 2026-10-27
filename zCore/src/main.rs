@@ -1354,6 +1354,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     want_console_gpu && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gsp"),
                 );
             }
+            if nv.nvkms {
+                schedule_nvkms();
+            }
 
             kernel_hal::console::early_progress_bar(95);
 
@@ -1705,6 +1708,48 @@ fn console_notice(msg: &str) {
 /// first-GPU-client bring-up in `CHANNEL_ALLOC`, so opening it at boot would
 /// let a client start SEC2 STARTCPU with scanout live -- exactly what this task
 /// exists to avoid. The task opens it itself, after the pause is in place.
+/// `nvidia.nvkms`: once every card that is coming up has its RM, load
+/// nvidia-modeset and give it each one, then run its timers for the rest of
+/// the boot -- Linux runs those from nvidia-modeset's kthread. The console
+/// card is RM-attached only after the deferred bring-up above, so this waits
+/// for it when one was scheduled; the other cards have theirs since boot.
+#[cfg(feature = "linux")]
+fn schedule_nvkms() {
+    klog_info!("Eclipse: nvidia.nvkms — nvkms se carga cuando las GPUs tengan el RM");
+    kernel_hal::thread::spawn(async move {
+        use core::time::Duration;
+        use kernel_hal::timer::timer_now;
+
+        let deadline = timer_now() + Duration::from_secs(180);
+        while linux_object::fs::devfs::drm::console_bringup_unfinished() && timer_now() < deadline {
+            kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(500)).await;
+        }
+        for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+            for line in d.nvkms_load() {
+                kernel_hal::klog_info!("Eclipse: [nvkms] {}", line);
+            }
+        }
+
+        // Between 1 ms and 100 ms: the cap is for a timer a later ioctl adds
+        // while this task sleeps, since nothing wakes it.
+        loop {
+            let mut owned = false;
+            let mut next_us = u64::MAX;
+            for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+                if let Some(us) = d.nvkms_service() {
+                    owned = true;
+                    next_us = next_us.min(us);
+                }
+            }
+            if !owned {
+                break;
+            }
+            let wait = Duration::from_micros(next_us.clamp(1_000, 100_000));
+            kernel_hal::thread::sleep_until(timer_now() + wait).await;
+        }
+    });
+}
+
 #[cfg(feature = "linux")]
 fn schedule_deferred_console_bringup(
     reason: &'static str,

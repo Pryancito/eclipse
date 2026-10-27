@@ -34,6 +34,7 @@ const NVIDIA_PARAMS: &[&str] = &[
     "monitor",
     "multigpu",
     "nouveau_uapi",
+    "nvkms",
     "wlr_gles2",
     "wlr_pixman",
     "wlr_vulkan",
@@ -76,6 +77,9 @@ impl NvidiaParamFiles {
             // for `/sys/class/drm`, not for a parameter.
             "multigpu" => yn(a.multigpu),
             "nouveau_uapi" => yn(self.nouveau_uapi),
+            // What was asked. Whether nvkms took a card is in the boot log,
+            // one `[nvkms]` block per GPU.
+            "nvkms" => yn(a.nvkms),
             "wlr_gles2" => yn(a.wlr_gles2),
             "wlr_pixman" => yn(a.wlr_pixman),
             "wlr_vulkan" => yn(a.wlr_vulkan),
@@ -223,6 +227,12 @@ mod tests {
         assert_eq!(files("").read("monitor").as_deref(), Some("(null)\n"));
         let p = files("LOG=warn:nvidia.monitor=65.00.0");
         assert_eq!(p.read("monitor").as_deref(), Some("65.00.0\n"));
+    }
+
+    #[test]
+    fn nvkms_has_a_file() {
+        assert_eq!(files("nvidia.nvkms").read("nvkms").as_deref(), Some("Y\n"));
+        assert_eq!(files("").read("nvkms").as_deref(), Some("N\n"));
     }
 
     #[test]

@@ -429,8 +429,8 @@ fn build_first_real_nvidia_file() -> bool {
 /// `docs/README-nvkms-port.md`. Only after the RM, and only when the RM was
 /// compiled: nvkms is a client of it and shares its submodule.
 ///
-/// Nothing calls it yet; the OS hooks in `vendor/eclipse_nvkms_os.c` only make
-/// it link.
+/// Loaded only with `nvidia.nvkms`: see `src/nvkms_os.rs` for the OS hooks and
+/// `src/nvkms.rs` for the kapi client the driver uses.
 fn build_nvkms() {
     let vendor = std::path::Path::new("vendor/open-gpu-kernel-modules");
     let modeset = vendor.join("src/nvidia-modeset");
@@ -522,6 +522,8 @@ fn build_nvkms() {
     let mut c = cc::Build::new();
     c.files(&sources.c);
     c.file("vendor/eclipse_nvkms_os.c");
+    // The kapi client: nvidia-drm's half, for src/nvkms.rs.
+    c.file("vendor/eclipse_nvkms_drv.c");
     c.file(nvkms_shaders_asm());
     c.flag("-std=gnu11");
     configure(&mut c);
@@ -551,6 +553,7 @@ fn build_nvkms() {
     }
     println!("cargo:rerun-if-changed={}", srcs_mk_path.display());
     println!("cargo:rerun-if-changed=vendor/eclipse_nvkms_os.c");
+    println!("cargo:rerun-if-changed=vendor/eclipse_nvkms_drv.c");
 }
 
 /// Headsurface's shader blobs, xz-compressed and embedded as the
