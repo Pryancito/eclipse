@@ -250,15 +250,16 @@ NV_STATUS deviceCtrlCmdOsUnixVTGetFBInfo_IMPL(Device *pDevice,
  * picture: the BAR1 window the console is drawn through stops reaching the
  * memory the firmware head scans, and that head freezes on its last frame.
  *
- * Without it the RM leaves BAR1 a linear window onto VRAM, so the firmware
- * framebuffer, which starts at BAR1's base, is VRAM offset 0 (the same
- * relationship eclipse_rm_ce_blit relies on), and every CPU and CE write
- * lands where the head scans. Describing that range as the reserved console
- * memdesc, exactly as memmgrAllocateConsoleRegion_GM107 does, is all
+ * The firmware framebuffer, which starts at BAR1's base while BAR1 is still
+ * the firmware's linear window, is VRAM offset 0 (the same relationship
+ * eclipse_rm_ce_blit relies on). Describing that range as the reserved
+ * console memdesc, exactly as memmgrAllocateConsoleRegion_GM107 does, is all
  * NV01_MEMORY_FRAMEBUFFER_CONSOLE and VT_GET_FB_INFO need: nvkms then imports
- * and scans out the memory being drawn, and nothing about the FB layout or
- * BAR1 changes. A GPU that already has a console memdesc (the flag above) is
- * left alone.
+ * and scans out the memory being drawn. The state load puts BAR1 into virtual
+ * mode, so the console card now gets this memdesc before it, from
+ * eclipse_rm_preserve_bar1_console, which also has kbusInitBar1 map it at
+ * BAR1 0; this is the fallback for a card that went without. A GPU that
+ * already has a console memdesc is left alone.
  */
 NV_STATUS eclipse_nvkms_describe_console(NvU32 gpuId)
 {
@@ -333,7 +334,8 @@ struct EclipseVidmemCheck {
     NvU32 cpuSame;         /* words the CPU mapping reads equal to the reference */
     NvU32 cpuOnes;         /* words the CPU mapping reads as 0xffffffff */
     NvU8  bar1Physical;    /* the RM maps BAR1 as a linear window */
-    NvU8  pad[7];
+    NvU8  pad[3];
+    NvU32 cpuFirst;        /* the first word as the CPU mapping reads it */
 };
 
 _Static_assert(sizeof(struct EclipseVidmemCheck) == 56,
@@ -440,6 +442,8 @@ NV_STATUS eclipse_nvkms_check_vidmem(NvU32 gpuId, NvHandle hClient, NvHandle hMe
                 pOut->cpuSame++;
             if (seen == ~0U)
                 pOut->cpuOnes++;
+            if (i == 0)
+                pOut->cpuFirst = seen;
         }
         status = eclipse_vram_word(pGpu, pKernelBus,
                                    memdescGetPhysAddr(pMemDesc, AT_GPU, (NvU64)i * 4),

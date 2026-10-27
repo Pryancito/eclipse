@@ -7325,6 +7325,85 @@ NV_STATUS eclipse_rm_mark_console_gpu(
     return NV_OK;
 }
 
+/*
+ * Keep the firmware console reachable at the base of BAR1 once the RM puts
+ * BAR1 into virtual mode -- the half of Linux's RmSetConsolePreservationParams
+ * that matters after the GSP boot, without the half that changes it.
+ *
+ * kbusInitBar1 (kbusStatePostLoad, i.e. inside gpuStateLoad) switches BAR1 to
+ * virtual mode. On Linux it first maps the console memdesc at BAR1 offset 0
+ * when bPreserveBar1ConsoleEnabled is set, because efifb keeps drawing at the
+ * base of BAR1. Eclipse never set it on the console card, so after the state
+ * load nothing was mapped there while the kernel console kept drawing there:
+ * a BAR1 MMU fault. Linux's RM answers that fault by rebinding BAR1
+ * (kern_gmmu_gv100.c); Eclipse services no GPU interrupts, so BAR1 stayed
+ * faulted and every later BAR1 access read 0xBAD0ACxx -- the USERD GPPut/GPGet
+ * of every channel on that card included, which is why its channels looked
+ * full and executed nothing, and why nvkms's LUT mapping read garbage.
+ *
+ * Only the BAR1 mapping is taken from Linux here: PRIMARY_DEVICE and
+ * ReservedConsoleDispMemSize, which eclipse_rm_mark_console_gpu sets before
+ * the GSP boot (nvidia.console_preserve), stay off. The console memdesc is
+ * described at VRAM offset 0, where the firmware framebuffer at the base of
+ * BAR1 lives while BAR1 is still the firmware's linear window, the same
+ * description memmgrAllocateConsoleRegion_GM107 makes and
+ * eclipse_nvkms_describe_console used to make later (it now finds this one).
+ * Must run after the RM attach and before gpuStateLoad.
+ */
+NV_STATUS eclipse_rm_preserve_bar1_console(NvU32 gpuInstance, NvU64 consoleSize)
+{
+    OBJGPU *pGpu;
+    KernelBus *pKernelBus;
+    MemoryManager *pMemoryManager;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    NvU64 size;
+
+    if (consoleSize == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    pKernelBus = (pGpu != NULL) ? GPU_GET_KERNEL_BUS(pGpu) : NULL;
+    pMemoryManager = (pGpu != NULL) ? GPU_GET_MEMORY_MANAGER(pGpu) : NULL;
+    if (pKernelBus == NULL || pMemoryManager == NULL)
+    {
+        status = NV_ERR_INVALID_ARGUMENT;
+    }
+    else if (memmgrGetReservedConsoleMemDesc(pGpu, pMemoryManager) == NULL)
+    {
+        /* osinit.c's NV_ALIGN_UP(fbConsoleSize, 0x10000). */
+        size = NV_ALIGN_UP(consoleSize, 0x10000);
+        status = memdescCreate(&pMemoryManager->pReservedConsoleMemDesc, pGpu,
+                               size, RM_PAGE_SIZE_64K, NV_TRUE, ADDR_FBMEM,
+                               NV_MEMORY_UNCACHED,
+                               MEMDESC_FLAGS_SKIP_RESOURCE_COMPUTE);
+        if (status == NV_OK)
+        {
+            memdescDescribe(pMemoryManager->pReservedConsoleMemDesc, ADDR_FBMEM,
+                            0, size);
+            memdescSetPageSize(pMemoryManager->pReservedConsoleMemDesc,
+                               AT_GPU, RM_PAGE_SIZE);
+        }
+    }
+    if (status == NV_OK)
+        pKernelBus->bPreserveBar1ConsoleEnabled = NV_TRUE;
+
+    nv_printf(0, "[eclipse-rm-trace] preserve_bar1_console: 0x%llx bytes of VRAM 0 at BAR1 0 -> 0x%x\n",
+              consoleSize, status);
+
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
 /* ===================================================================
  * DRM: real EDID / connector query via the RM's NV04_DISPLAY_COMMON.
  *

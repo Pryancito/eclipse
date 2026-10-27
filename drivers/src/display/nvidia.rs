@@ -4384,6 +4384,8 @@ impl DrmScheme for NvidiaGpu {
         let block = if let Some(cached) = cached {
             cached
         } else {
+            // Before BAR1 goes virtual; see `preserve_bar1_console`.
+            let bar1_console = bringup_all::preserve_bar1_console(self, device_instance);
             nvidia_rm_sys::os_interface::capture_begin();
             // Live-echo state-init narration at ERROR level so it survives the
             // default LOG=error filter and lands on the console AS IT RUNS.
@@ -4405,6 +4407,9 @@ impl DrmScheme for NvidiaGpu {
                     }
                     let _ = writeln!(block, "[gpustep9]  --- end narration ---");
                 }
+            }
+            if let Some(line) = bar1_console {
+                block.push_str(&line);
             }
             let early_err = result.is_err();
             match result {

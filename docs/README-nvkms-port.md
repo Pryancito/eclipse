@@ -209,6 +209,22 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
     0x801f74c0`) y 0/256 palabras de la consola iguales por la base de BAR1 y
     en VRAM 0: la base de BAR1 ya no es la VRAM 0 que escanea la pantalla y
     escribe el present por CE.
+  - Lo que explica las dos cosas, y que NVK no ejecute nada en esa tarjeta: el
+    mismo arranque con `nvidia.nouveau_uapi` leyó el USERD de sus canales como
+    `0xBAD0ACEF`/`0xBAD0ACF0`, el centinela de error de la GPU. Todo lo que
+    pasa por BAR1 en la tarjeta de consola devuelve eso: el canal parece
+    lleno (`NV_ERR_BUSY_RETRY` en el SELFTEST) y el contexto dorado caduca
+    (`0x65`). En Linux, `kbusInitBar1` mapea la consola en BAR1 0 antes de
+    poner BAR1 en virtual (`bPreserveBar1ConsoleEnabled`, para efifb); aquí
+    no se mapeaba nada ahí, la consola del kernel seguía escribiendo en la
+    base de BAR1, y el fallo de MMU de BAR1 que eso provoca solo se recupera
+    rebindeando BAR1 desde el manejador de fallos del RM, que Eclipse no
+    ejecuta. `eclipse_rm_preserve_bar1_console` describe la VRAM 0 como
+    consola y activa ese mapeo antes de `gpuStateLoad`, sin `PRIMARY_DEVICE`
+    ni la reserva previa al GSP de `nvidia.console_preserve`. El chequeo de la
+    LUT dice ahora la primera palabra que lee la CPU y si es ese centinela.
+    Con `nvidia.wlr_pixman` (sin nouveau_uapi) el escritorio ya sale por
+    nvkms en hardware.
 - Objetivo: **paridad** con la escalera actual en una sola tarjeta (escritorio,
   cursor, flips sin tearing) con `nvidia.wlr_vulkan`/`wlr_gles2`/`wlr_pixman`.
 

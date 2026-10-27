@@ -543,7 +543,10 @@ pub struct VidmemCheck {
     pub cpu_ones: u32,
     /// Whether the RM maps BAR1 as a linear window.
     pub bar1_physical: u8,
-    pub pad: [u8; 7],
+    pub pad: [u8; 3],
+    /// The first word as the CPU mapping reads it. `0xBAD0ACxx` is the
+    /// GPU's PRI-error sentinel: a BAR1 that faulted and was never rebound.
+    pub cpu_first: u32,
 }
 
 const _: () = assert!(core::mem::size_of::<VidmemCheck>() == 56);
@@ -565,6 +568,12 @@ pub enum VidmemVerdict {
 }
 
 impl VidmemCheck {
+    /// Whether the CPU mapping read the GPU's PRI-error sentinel, which is
+    /// what every BAR1 access returns after a BAR1 MMU fault nobody rebinds.
+    pub fn bar1_faulted(&self) -> bool {
+        self.cpu_first & 0xFFFF_FF00 == 0xBAD0_AC00
+    }
+
     pub fn verdict(&self) -> VidmemVerdict {
         if self.words == 0 || self.ref_non_zero == 0 {
             VidmemVerdict::NoReference
@@ -617,12 +626,18 @@ impl VidmemCheck {
         };
         let mut line = alloc::format!(
             "LUT por defecto en VRAM {:#x}: {}; el mapeo de la CPU lee {}/{} bien y {} a \
-             0xffffffff; BAR1 {} (BAR1_BLOCK {:#x}), el RM la mapea como {}",
+             0xffffffff (la primera {:#010x}{}); BAR1 {} (BAR1_BLOCK {:#x}), el RM la mapea como {}",
             self.vram_offset,
             what,
             self.cpu_same,
             self.words,
             self.cpu_ones,
+            self.cpu_first,
+            if self.bar1_faulted() {
+                ", error de la GPU: BAR1 en fallo"
+            } else {
+                ""
+            },
             if self.bar1_block & (1 << 31) != 0 {
                 "virtual"
             } else {
@@ -1049,6 +1064,15 @@ mod tests {
             "{}",
             line
         );
+        assert!(!line.contains("BAR1 en fallo"), "{}", line);
+
+        // A BAR1 that faulted reads the PRI-error sentinel, not ones.
+        let mut faulted = lut_check(4096, 0, 3000);
+        faulted.cpu_first = 0xbad0_acef;
+        let line = faulted.describe();
+        assert!(faulted.bar1_faulted());
+        assert!(line.contains("la primera 0xbad0acef"), "{}", line);
+        assert!(line.contains("BAR1 en fallo"), "{}", line);
     }
 
     #[test]
