@@ -1,23 +1,21 @@
 /*
  * Eclipse's side of nvidia-modeset's OS interface
- * (src/nvidia-modeset/os-interface/include/nvidia-modeset-os-interface.h).
+ * (src/nvidia-modeset/os-interface/include/nvidia-modeset-os-interface.h),
+ * which Linux implements in kernel-open/nvidia-modeset/nvidia-modeset-linux.c.
  *
- * In Linux these are kernel-open/nvidia-modeset/nvidia-modeset-linux.c.
- * Here, for now, they are what it takes for nvkms to LINK and nothing more:
- * nothing in Eclipse calls into nvkms yet (docs/README-nvkms-port.md, PR 1).
- * Every hook that would need the kernel -- memory, timers, semaphores, the
- * RM -- fails, so an accidental call comes back as an allocation failure
- * nvkms already knows how to unwind, never as a half-working device. The
- * string and memory helpers are real because they need nothing.
- *
- * PR 2 of the port replaces the failing ones with the real kernel services.
+ * Split in two. The hooks that need the kernel -- memory, time, semaphores,
+ * refcounted pointers, timers, nvkms_lock, the RM -- are Rust, in
+ * src/nvkms_os.rs. What is here needs nothing from it: module parameters,
+ * string and printf helpers, and the kapi open/ioctl/close glue with its
+ * event work. Hooks for things Eclipse does not have (user-space clients,
+ * syncpoints, backlight devices) answer that they are not there.
  */
 
 #include "nvidia-modeset-os-interface.h"
 
 /* The version banner nvkms prints when it loads ("Loading %s"). In Linux it
  * is generated into g_nvid_string.c by the Makefile. */
-const char *const pNV_KMS_ID = "NVIDIA nvidia-modeset (Eclipse port, not active)";
+const char *const pNV_KMS_ID = "NVIDIA nvidia-modeset (Eclipse port)";
 
 /* Module parameters: every one at its Linux default. */
 NvBool nvkms_test_fail_alloc_core_channel(enum FailAllocCoreChannelMethod method)
@@ -38,23 +36,6 @@ enum NvKmsDebugForceColorSpace nvkms_debug_force_color_space(void)
 }
 NvBool nvkms_enable_overlay_layers(void) { return NV_TRUE; }
 NvBool nvkms_debug_logging(void) { return NV_FALSE; }
-
-/* Not wired to the RM yet, and unreachable: nvKmsModuleLoad never runs, so no
- * device is allocated and nothing builds an RM call. PR 2 puts the real
- * rm_kernel_rmapi_op behind this. */
-void nvkms_call_rm(void *ops) { (void)ops; }
-
-void *nvkms_alloc(size_t size, NvBool zero)
-{
-    (void)size;
-    (void)zero;
-    return NULL;
-}
-void nvkms_free(void *ptr, size_t size)
-{
-    (void)ptr;
-    (void)size;
-}
 
 void *nvkms_memset(void *ptr, NvU8 c, size_t size)
 {
@@ -108,9 +89,6 @@ int nvkms_strcmp(const char *s1, const char *s2)
     return (int)(unsigned char)*s1 - (int)(unsigned char)*s2;
 }
 
-void nvkms_usleep(NvU64 usec) { (void)usec; }
-NvU64 nvkms_get_usec(void) { return 0; }
-
 /* No user pointers reach nvkms in Eclipse: kapi hands it kernel memory. */
 int nvkms_copyin(void *kptr, NvU64 uaddr, size_t n)
 {
@@ -127,7 +105,6 @@ int nvkms_copyout(NvU64 uaddr, const void *kptr, size_t n)
     return -1;
 }
 
-void nvkms_yield(void) {}
 void nvkms_dump_stack(void) {}
 
 NvBool nvkms_syncpt_op(enum NvKmsSyncPtOp op, NvKmsSyncPtOpParams *params)
@@ -137,13 +114,13 @@ NvBool nvkms_syncpt_op(enum NvKmsSyncPtOp op, NvKmsSyncPtOpParams *params)
     return NV_FALSE;
 }
 
+/* The RM's own printf (src/nvidia/src/kernel/core/printf.c), which handles
+ * every conversion nvkms formats with. */
+int nvDbgVsnprintf(char *dest, NvU32 destSize, const char *fmt, va_list args);
+
 int nvkms_vsnprintf(char *str, size_t size, const char *format, va_list ap)
 {
-    (void)format;
-    (void)ap;
-    if (size)
-        str[0] = '\0';
-    return 0;
+    return nvDbgVsnprintf(str, (NvU32)size, format, ap);
 }
 int nvkms_snprintf(char *str, size_t size, const char *format, ...)
 {
@@ -155,73 +132,15 @@ int nvkms_snprintf(char *str, size_t size, const char *format, ...)
     return ret;
 }
 
-void nvkms_log(const int level, const char *gpuPrefix, const char *msg)
-{
-    (void)level;
-    (void)gpuPrefix;
-    (void)msg;
-}
-
-struct nvkms_ref_ptr *nvkms_alloc_ref_ptr(void *ptr)
-{
-    (void)ptr;
-    return NULL;
-}
-void nvkms_free_ref_ptr(struct nvkms_ref_ptr *ref_ptr) { (void)ref_ptr; }
-void nvkms_inc_ref(struct nvkms_ref_ptr *ref_ptr) { (void)ref_ptr; }
-void *nvkms_dec_ref(struct nvkms_ref_ptr *ref_ptr)
-{
-    (void)ref_ptr;
-    return NULL;
-}
-
-nvkms_timer_handle_t *nvkms_alloc_timer(nvkms_timer_proc_t *proc, void *dataPtr,
-                                        NvU32 dataU32, NvU64 usec)
-{
-    (void)proc;
-    (void)dataPtr;
-    (void)dataU32;
-    (void)usec;
-    return NULL;
-}
-NvBool nvkms_alloc_timer_with_ref_ptr(nvkms_timer_proc_t *proc,
-                                      struct nvkms_ref_ptr *ref_ptr,
-                                      NvU32 dataU32, NvU64 usec)
-{
-    (void)proc;
-    (void)ref_ptr;
-    (void)dataU32;
-    (void)usec;
-    return NV_FALSE;
-}
-void nvkms_free_timer(nvkms_timer_handle_t *handle) { (void)handle; }
-
-void nvkms_event_queue_changed(nvkms_per_open_handle_t *pOpenKernel,
-                               NvBool eventsAvailable)
-{
-    (void)pOpenKernel;
-    (void)eventsAvailable;
-}
-
 void *nvkms_get_per_open_data(int fd)
 {
     (void)fd;
     return NULL;
 }
 
-NvBool nvkms_open_gpu(NvU32 gpuId)
-{
-    (void)gpuId;
-    return NV_FALSE;
-}
-void nvkms_close_gpu(NvU32 gpuId) { (void)gpuId; }
-NvU32 nvkms_enumerate_gpus(nv_gpu_info_t *gpu_info)
-{
-    (void)gpu_info;
-    return 0;
-}
-
-NvBool nvkms_allow_write_combining(void) { return NV_FALSE; }
+/* The boot framebuffer and BAR1 are mapped write-combined on this kernel
+ * (kernel_hal ensure_framebuffer_wc), which is what Linux reports on x86. */
+NvBool nvkms_allow_write_combining(void) { return NV_TRUE; }
 NvBool nvkms_kernel_supports_syncpts(void) { return NV_FALSE; }
 NvBool nvkms_fd_is_nvidia_chardev(int fd)
 {
@@ -230,27 +149,49 @@ NvBool nvkms_fd_is_nvidia_chardev(int fd)
 }
 
 /*
- * A kapi client's open of nvkms: nvkms_open_common / nvkms_ioctl_common /
- * nvkms_close_pm_locked of nvidia-modeset-linux.c, minus what this port does
- * not have yet. Missing until PR 2: the global nvkms_lock every entry into
- * nvkms takes, and the kthread queue that delivers kapi events. Today
- * nvkms_alloc fails, so no open ever gets as far as nvKmsOpen -- but these
- * are real calls, which is what makes the linker resolve the whole of nvkms
- * (nvKmsIoctl reaches EVO, modeset and DisplayPort) instead of the handful
- * of kapi functions the table points at.
+ * A kapi client's open of nvkms: nvkms_open_common, nvkms_ioctl_common and
+ * nvkms_close_pm_locked of nvidia-modeset-linux.c. Every entry takes
+ * nvkms_lock (src/nvkms_os.rs). There is no power management here, so the
+ * PM lock Linux also takes is always free.
  */
+void eclipse_nvkms_lock(void);
+void eclipse_nvkms_unlock(void);
+void eclipse_nvkms_schedule_work(void (*proc)(void *, NvU32), void *data);
+void eclipse_nvkms_cancel_work(void *data);
+
 struct nvkms_per_open {
     void *data;
+    struct NvKmsKapiDevice *device;
 };
+
+/* nvkms_kapi_event_kthread_q_callback: runs without nvkms_lock, because
+ * handling the events calls back into nvkms through ioctls. */
+static void eclipse_nvkms_kapi_event_work(void *arg, NvU32 unused)
+{
+    struct nvkms_per_open *popen = arg;
+
+    (void)unused;
+    nvKmsKapiHandleEventQueueChange(popen->device);
+}
+
+void nvkms_event_queue_changed(nvkms_per_open_handle_t *pOpenKernel,
+                               NvBool eventsAvailable)
+{
+    /* Only kernel (kapi) clients exist here. */
+    if (eventsAvailable)
+        eclipse_nvkms_schedule_work(eclipse_nvkms_kapi_event_work, pOpenKernel);
+}
 
 struct nvkms_per_open *nvkms_open_from_kapi(struct NvKmsKapiDevice *device)
 {
     struct nvkms_per_open *popen = nvkms_alloc(sizeof(*popen), NV_TRUE);
 
-    (void)device;
     if (popen == NULL)
         return NULL;
+    popen->device = device;
+    eclipse_nvkms_lock();
     popen->data = nvKmsOpen(0 /* pid: the kernel */, NVKMS_CLIENT_KERNEL_SPACE, popen);
+    eclipse_nvkms_unlock();
     if (popen->data == NULL) {
         nvkms_free(popen, sizeof(*popen));
         return NULL;
@@ -260,31 +201,34 @@ struct nvkms_per_open *nvkms_open_from_kapi(struct NvKmsKapiDevice *device)
 
 void nvkms_close_from_kapi(struct nvkms_per_open *popen)
 {
+    eclipse_nvkms_lock();
     nvKmsClose(popen->data);
     popen->data = NULL;
+    eclipse_nvkms_unlock();
+    /* After nvKmsClose no more event work can be queued for this open;
+     * drop what is queued, then free it (Linux flushes its kthread queue). */
+    eclipse_nvkms_cancel_work(popen);
     nvkms_free(popen, sizeof(*popen));
 }
 
 NvBool nvkms_ioctl_from_kapi(struct nvkms_per_open *popen, NvU32 cmd,
                              void *params_address, const size_t params_size)
 {
-    if (popen->data == NULL)
-        return NV_FALSE;
-    return nvKmsIoctl(popen->data, cmd, (NvU64)(NvUPtr)params_address, params_size);
+    NvBool ret = NV_FALSE;
+
+    eclipse_nvkms_lock();
+    if (popen->data != NULL)
+        ret = nvKmsIoctl(popen->data, cmd, (NvU64)(NvUPtr)params_address, params_size);
+    eclipse_nvkms_unlock();
+    return ret;
 }
 
-/* No power management here, so the PM lock never fails to be taken. */
 NvBool nvkms_ioctl_from_kapi_try_pmlock(struct nvkms_per_open *popen, NvU32 cmd,
                                         void *params_address,
                                         const size_t params_size)
 {
     return nvkms_ioctl_from_kapi(popen, cmd, params_address, params_size);
 }
-
-nvkms_sema_handle_t *nvkms_sema_alloc(void) { return NULL; }
-void nvkms_sema_free(nvkms_sema_handle_t *sema) { (void)sema; }
-void nvkms_sema_down(nvkms_sema_handle_t *sema) { (void)sema; }
-void nvkms_sema_up(nvkms_sema_handle_t *sema) { (void)sema; }
 
 struct nvkms_backlight_device *nvkms_register_backlight(NvU32 gpu_id,
                                                         NvU32 display_id,
