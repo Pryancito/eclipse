@@ -129,9 +129,16 @@ fn nvidia_monitor_pin() -> Option<(u8, u8, u8)> {
     if let Some(cached) = *PIN.lock() {
         return cached;
     }
-    let parsed = parse_bdf_flag_in(kernel_hal::boot::cmdline().as_str(), "nvidia.monitor");
+    let parsed = kernel_hal::cmdline::NvidiaParams::boot().monitor;
     *PIN.lock() = Some(parsed);
     parsed
+}
+
+/// The `nvidia.monitor=BB.DD.F` pin as the kernel parsed it, or `None` when
+/// it was not given or did not parse. What
+/// `/sys/module/nvidia/parameters/monitor` reads.
+pub fn monitor_pin() -> Option<(u8, u8, u8)> {
+    nvidia_monitor_pin()
 }
 
 /// Say in the klog what `nvidia.monitor=BB.DD.F` did, if it was given.
@@ -173,45 +180,7 @@ pub fn log_monitor_pin() {
 /// already uses `:` as its token separator, so a PCI BDF with colons cannot
 /// be a single token). Example: `nvidia.compute=65.00.0`.
 fn parse_nvidia_compute_bdf() -> Option<(u8, u8, u8)> {
-    parse_bdf_flag_in(kernel_hal::boot::cmdline().as_str(), "nvidia.compute")
-}
-
-/// A `<flag>=BB.DD.F` PCI address on a given cmdline, which is the only way to
-/// test it: the real one comes from the bootloader. `nvidia.compute` and
-/// `nvidia.monitor` share this so they cannot drift apart in what they accept.
-///
-/// `flag` is the name without the `=`, and it is matched as a whole token, so
-/// `nvidia.computed=1` is not `nvidia.compute` and neither flag can read the
-/// other's value.
-///
-/// The function field is optional (a GPU is function 0), but **an unparsable
-/// one is a rejection, not a default**. Falling back to 0 on anything that did
-/// not parse meant `nvidia.compute=65.00.zz` pinned compute to `65.00.0`
-/// without a word, which is a pin the user never asked for -- and a pin is
-/// exactly the knob someone reaches for when the automatic choice already went
-/// wrong, so it has to either mean what it says or say nothing. Extra
-/// dot-separated segments are a rejection for the same reason.
-fn parse_bdf_flag_in(cmdline: &str, flag: &str) -> Option<(u8, u8, u8)> {
-    for tok in cmdline.split([':', ' ', '\t', '\n']) {
-        let Some(rest) = tok.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) else {
-            continue;
-        };
-        if rest.is_empty() {
-            continue;
-        }
-        let mut parts = rest.split('.');
-        let bus = u8::from_str_radix(parts.next()?, 16).ok()?;
-        let dev = u8::from_str_radix(parts.next()?, 16).ok()?;
-        let func = match parts.next() {
-            Some(p) => u8::from_str_radix(p, 16).ok()?,
-            None => 0,
-        };
-        if parts.next().is_some() {
-            return None;
-        }
-        return Some((bus, dev, func));
-    }
-    None
+    kernel_hal::cmdline::NvidiaParams::boot().compute
 }
 
 /// A GPU's PCI address as [`DrmScheme::pci_bdf`] reports it: domain, bus,
@@ -229,7 +198,7 @@ mod monitor_pin_tests;
 ///
 /// **The pin is obeyed, including when it names the card that scans out.**
 /// It used to be dropped in that case, with a klog line, and the automatic
-/// choice taken instead. That is the defect [`parse_compute_bdf_in`] already
+/// choice taken instead. That is the defect [`kernel_hal::cmdline::pci_bdf`] already
 /// argues against one screen up — *"a pin is exactly the knob someone reaches
 /// for when the automatic choice already went wrong, so it has to either mean
 /// what it says or say nothing"* — and refusing by role was the automatic

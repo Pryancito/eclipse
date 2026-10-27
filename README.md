@@ -335,6 +335,7 @@ Eclipse OS usa **apt/dpkg** con paquetes de **Ubuntu 26.10 (stonking)** como gri
 ### Gráficos y entorno de escritorio
 - [DRM / KMS — conformidad con la UAPI de Linux](docs/README-drm.md)
 - [uAPI compatible con nouveau en la GPU NVIDIA (opt-in, `nvidia.nouveau_uapi`)](docs/README-nouveau-uapi.md)
+- [Parámetros de arranque NVIDIA (`nvidia.cuda`, `nvidia.monitor`, … y `/sys/module/nvidia/parameters`)](docs/README-nvidia-cmdline.md)
 - [Ejecutar un servidor X (`startx`)](docs/README-xorg.md)
 
 ### Compatibilidad de ABI

@@ -167,8 +167,141 @@ pub fn from_c_bytes(bytes: &[u8]) -> Option<&str> {
     core::str::from_utf8(&bytes[..end]).ok()
 }
 
+/// A `key=BB.DD.F` PCI address (hex, dots), or `None` when the key is absent
+/// or its value does not spell one.
+///
+/// Dots and not colons because `:` already separates the tokens of this line,
+/// so `0000:65:00.0` cannot be one of them: `nvidia.monitor=65.00.0` is what
+/// Linux writes `0000:65:00.0`. The function is optional (a GPU is function
+/// 0), but an unparsable one is a rejection, not a default, and so are extra
+/// segments: a pin that does not mean what it says must say nothing.
+///
+/// The first token whose key is exactly `key` answers, empty or not -- the
+/// same "first occurrence" rule as [`value`].
+pub fn pci_bdf(cmdline: &str, key: &str) -> Option<(u8, u8, u8)> {
+    for tok in cmdline.split([':', ' ', '\t', '\n']) {
+        let Some(rest) = tok.strip_prefix(key).and_then(|r| r.strip_prefix('=')) else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        let mut parts = rest.split('.');
+        let bus = u8::from_str_radix(parts.next()?, 16).ok()?;
+        let dev = u8::from_str_radix(parts.next()?, 16).ok()?;
+        let func = match parts.next() {
+            Some(p) => u8::from_str_radix(p, 16).ok()?,
+            None => 0,
+        };
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some((bus, dev, func));
+    }
+    None
+}
+
+/// The user-facing `nvidia.*` boot parameters, read in one place.
+///
+/// On Linux these would be the parameters of the `nvidia`/`nouveau` modules
+/// (`/sys/module/nvidia/parameters/`), each parsed once by `kernel/params.c`
+/// and then consulted as a variable. This is that: every subsystem asks this
+/// struct instead of growing its own `cmdline` lookup, so the DRM core, the
+/// boot path and `/sys/module` cannot disagree about what a flag means.
+///
+/// These are what the line *asked for*. What the kernel then managed to apply
+/// (a `nouveau_uapi` with no card able to serve it, say) is the subsystem's
+/// to answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NvidiaParams {
+    /// `nvidia.cuda`: every switch CUDA needs (`nvidiactl`, `uvm`), in one go.
+    pub cuda: bool,
+    /// `nvidia.nouveau_uapi`: the DRM node speaks nouveau's uAPI, so Mesa's
+    /// nouveau/NVK/zink drivers (and a labwc on top) run on the card.
+    pub nouveau_uapi: bool,
+    /// `nvidia.multigpu`: bring up every compatible NVIDIA card, not only the
+    /// one with the monitor.
+    pub multigpu: bool,
+    /// `nvidia.hwcursor`: the display engine's cursor plane draws the pointer.
+    pub hwcursor: bool,
+    /// `nvidia.monitor=BB.DD.F`: the card that drives the display (`card0`).
+    pub monitor: Option<(u8, u8, u8)>,
+    /// `nvidia.compute=BB.DD.F`: the card that owns compute.
+    pub compute: Option<(u8, u8, u8)>,
+    /// `nvidia.wlr_vulkan` / `wlr_gles2` / `wlr_pixman`: the wlroots renderer
+    /// the session picks. Read by the session scripts from `/proc/cmdline`;
+    /// here so `/sys/module` can show them too.
+    pub wlr_vulkan: bool,
+    pub wlr_gles2: bool,
+    pub wlr_pixman: bool,
+}
+
+impl NvidiaParams {
+    pub fn parse(cmdline: &str) -> Self {
+        Self {
+            cuda: flag(cmdline, "nvidia.cuda"),
+            nouveau_uapi: flag(cmdline, "nvidia.nouveau_uapi"),
+            multigpu: flag(cmdline, "nvidia.multigpu"),
+            hwcursor: flag(cmdline, "nvidia.hwcursor"),
+            monitor: pci_bdf(cmdline, "nvidia.monitor"),
+            compute: pci_bdf(cmdline, "nvidia.compute"),
+            wlr_vulkan: flag(cmdline, "nvidia.wlr_vulkan"),
+            wlr_gles2: flag(cmdline, "nvidia.wlr_gles2"),
+            wlr_pixman: flag(cmdline, "nvidia.wlr_pixman"),
+        }
+    }
+
+    /// The parameters of this boot. Parses on every call (the command line is
+    /// an allocated `String`), so a hot path latches the field it needs.
+    pub fn boot() -> Self {
+        Self::parse(&crate::boot::cmdline())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // ── NvidiaParams ────────────────────────────────────────────────────────
+
+    #[test]
+    fn nvidia_params_read_the_five_user_flags() {
+        let p = NvidiaParams::parse(
+            "LOG=warn:nvidia.cuda:nvidia.nouveau_uapi:nvidia.multigpu:\
+             nvidia.hwcursor=1:nvidia.monitor=65.00.0:ROOT=/dev/sda2",
+        );
+        assert!(p.cuda && p.nouveau_uapi && p.multigpu && p.hwcursor);
+        assert_eq!(p.monitor, Some((0x65, 0, 0)));
+        assert_eq!(p.compute, None);
+    }
+
+    #[test]
+    fn nvidia_params_default_to_off_and_honour_eq_zero() {
+        assert_eq!(NvidiaParams::parse("LOG=warn"), NvidiaParams::default());
+        let p = NvidiaParams::parse("nvidia.hwcursor=0:nvidia.cuda=off");
+        assert!(!p.hwcursor && !p.cuda);
+    }
+
+    #[test]
+    fn the_wlroots_renderer_flags_keep_working_alongside() {
+        let p = NvidiaParams::parse("nvidia.nouveau_uapi:nvidia.wlr_vulkan");
+        assert!(p.nouveau_uapi && p.wlr_vulkan && !p.wlr_gles2 && !p.wlr_pixman);
+    }
+
+    #[test]
+    fn a_pci_bdf_is_hex_with_an_optional_function() {
+        assert_eq!(
+            pci_bdf("nvidia.monitor=65.00.0", "nvidia.monitor"),
+            Some((0x65, 0, 0))
+        );
+        assert_eq!(
+            pci_bdf("nvidia.monitor=0a.1f", "nvidia.monitor"),
+            Some((0x0a, 0x1f, 0))
+        );
+        assert_eq!(pci_bdf("nvidia.monitor=65.00.zz", "nvidia.monitor"), None);
+        assert_eq!(pci_bdf("nvidia.monitor=65.00.0.1", "nvidia.monitor"), None);
+        assert_eq!(pci_bdf("nvidia.monitored=65.00.0", "nvidia.monitor"), None);
+        assert_eq!(pci_bdf("nvidia.monitor", "nvidia.monitor"), None);
+    }
+
     use super::*;
     use alloc::vec::Vec;
 

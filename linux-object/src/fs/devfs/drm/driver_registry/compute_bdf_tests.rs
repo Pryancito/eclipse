@@ -4,19 +4,19 @@ use super::*;
 #[test]
 fn a_full_bdf_pins_that_card() {
     assert_eq!(
-        parse_bdf_flag_in("LOG=warn nvidia.compute=65.00.0", "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf("LOG=warn nvidia.compute=65.00.0", "nvidia.compute"),
         Some((0x65, 0x00, 0))
     );
     // Hex, not decimal: bus 0x65 is 101, and reading it as decimal would name
     // a different slot.
     assert_eq!(
-        parse_bdf_flag_in("nvidia.compute=0b.00.0", "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf("nvidia.compute=0b.00.0", "nvidia.compute"),
         Some((0x0b, 0, 0))
     );
     // `:` is the cmdline's own separator, so the flag survives being wedged
     // between two others with no spaces.
     assert_eq!(
-        parse_bdf_flag_in("a=1:nvidia.compute=01.00.1:b=2", "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf("a=1:nvidia.compute=01.00.1:b=2", "nvidia.compute"),
         Some((0x01, 0x00, 1))
     );
 }
@@ -25,7 +25,7 @@ fn a_full_bdf_pins_that_card() {
 #[test]
 fn a_bdf_without_a_function_means_function_zero() {
     assert_eq!(
-        parse_bdf_flag_in("nvidia.compute=65.00", "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf("nvidia.compute=65.00", "nvidia.compute"),
         Some((0x65, 0, 0))
     );
 }
@@ -37,16 +37,16 @@ fn a_bdf_without_a_function_means_function_zero() {
 #[test]
 fn a_function_that_does_not_parse_is_a_rejection_not_a_zero() {
     assert_eq!(
-        parse_bdf_flag_in("nvidia.compute=65.00.zz", "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf("nvidia.compute=65.00.zz", "nvidia.compute"),
         None
     );
     assert_eq!(
-        parse_bdf_flag_in("nvidia.compute=65.00.", "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf("nvidia.compute=65.00.", "nvidia.compute"),
         None
     );
     // Out of range for a u8 is the same case, not a wrap.
     assert_eq!(
-        parse_bdf_flag_in("nvidia.compute=65.00.1ff", "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf("nvidia.compute=65.00.1ff", "nvidia.compute"),
         None
     );
 }
@@ -55,7 +55,7 @@ fn a_function_that_does_not_parse_is_a_rejection_not_a_zero() {
 #[test]
 fn an_extra_segment_is_a_rejection() {
     assert_eq!(
-        parse_bdf_flag_in("nvidia.compute=65.00.0.0", "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf("nvidia.compute=65.00.0.0", "nvidia.compute"),
         None
     );
 }
@@ -64,28 +64,31 @@ fn an_extra_segment_is_a_rejection() {
 #[test]
 fn a_bad_bus_or_device_is_still_a_rejection() {
     assert_eq!(
-        parse_bdf_flag_in("nvidia.compute=zz.00.0", "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf("nvidia.compute=zz.00.0", "nvidia.compute"),
         None
     );
     assert_eq!(
-        parse_bdf_flag_in("nvidia.compute=65.zz.0", "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf("nvidia.compute=65.zz.0", "nvidia.compute"),
         None
     );
     assert_eq!(
-        parse_bdf_flag_in("nvidia.compute=65", "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf("nvidia.compute=65", "nvidia.compute"),
         None
     );
-    assert_eq!(parse_bdf_flag_in("nvidia.compute=", "nvidia.compute"), None);
+    assert_eq!(
+        kernel_hal::cmdline::pci_bdf("nvidia.compute=", "nvidia.compute"),
+        None
+    );
 }
 
 /// No flag, no pin -- the overwhelmingly common boot.
 #[test]
 fn no_flag_means_no_pin() {
     assert_eq!(
-        parse_bdf_flag_in("LOG=warn smp=off", "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf("LOG=warn smp=off", "nvidia.compute"),
         None
     );
-    assert_eq!(parse_bdf_flag_in("", "nvidia.compute"), None);
+    assert_eq!(kernel_hal::cmdline::pci_bdf("", "nvidia.compute"), None);
 }
 
 /// The pin names a card that **scans out the boot console**, and it is
@@ -161,20 +164,20 @@ fn a_pin_that_matches_no_card_resolves_to_nothing() {
 fn the_two_pins_cannot_read_each_others_value() {
     let both = "nvidia.compute=65.00.0:nvidia.monitor=01.00.0";
     assert_eq!(
-        parse_bdf_flag_in(both, "nvidia.monitor"),
+        kernel_hal::cmdline::pci_bdf(both, "nvidia.monitor"),
         Some((0x01, 0x00, 0))
     );
     assert_eq!(
-        parse_bdf_flag_in(both, "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf(both, "nvidia.compute"),
         Some((0x65, 0x00, 0))
     );
     // One set and not the other is not a reason to borrow.
     assert_eq!(
-        parse_bdf_flag_in("nvidia.compute=65.00.0", "nvidia.monitor"),
+        kernel_hal::cmdline::pci_bdf("nvidia.compute=65.00.0", "nvidia.monitor"),
         None
     );
     assert_eq!(
-        parse_bdf_flag_in("nvidia.monitor=01.00.0", "nvidia.compute"),
+        kernel_hal::cmdline::pci_bdf("nvidia.monitor=01.00.0", "nvidia.compute"),
         None
     );
 }
@@ -184,15 +187,18 @@ fn the_two_pins_cannot_read_each_others_value() {
 #[test]
 fn a_flag_whose_name_is_only_a_prefix_is_a_different_flag() {
     assert_eq!(
-        parse_bdf_flag_in("nvidia.monitors=01.00.0", "nvidia.monitor"),
+        kernel_hal::cmdline::pci_bdf("nvidia.monitors=01.00.0", "nvidia.monitor"),
         None
     );
     assert_eq!(
-        parse_bdf_flag_in("nvidia.monitor_bdf=01.00.0", "nvidia.monitor"),
+        kernel_hal::cmdline::pci_bdf("nvidia.monitor_bdf=01.00.0", "nvidia.monitor"),
         None
     );
     // And the flag without a value at all is not the flag.
-    assert_eq!(parse_bdf_flag_in("nvidia.monitor", "nvidia.monitor"), None);
+    assert_eq!(
+        kernel_hal::cmdline::pci_bdf("nvidia.monitor", "nvidia.monitor"),
+        None
+    );
 }
 
 /// `nvidia.monitor=BB.DD.F` accepts exactly what `nvidia.compute=` accepts,
@@ -211,7 +217,7 @@ fn the_monitor_pin_accepts_and_rejects_the_same_shapes() {
         ("smp=off", None),
     ] {
         assert_eq!(
-            parse_bdf_flag_in(cmdline, "nvidia.monitor"),
+            kernel_hal::cmdline::pci_bdf(cmdline, "nvidia.monitor"),
             want,
             "cmdline {:?}",
             cmdline

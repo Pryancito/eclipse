@@ -131,6 +131,7 @@ mod ino {
     pub const FIRMWARE: usize = 24;
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub const FIRMWARE_EFI: usize = 25;
+    pub const MODULE: usize = 26;
 
     /// Plus the device's index on the bus.
     pub const PCI_DEV: usize = 0x1000;
@@ -154,7 +155,12 @@ mod ino {
     pub const PCI_DEV_COMPUTE_ALIAS: usize = 0x8000;
     /// The `drm` directory of that same alias device.
     pub const DRM_DIR_COMPUTE_ALIAS: usize = 0x8001;
+    /// Plus twice the module's index (its `parameters/` is one more).
+    pub const MODULE_DIR: usize = 0x9000;
 }
+
+/// `/sys/module`, the `nvidia.*` boot parameters as Linux publishes them.
+mod module;
 
 /// Where an interface sits in the list `/sys/class/net` shows, which is all
 /// the identity it has: the node carries the name, not a number.
@@ -259,9 +265,9 @@ fn block_size_sectors(index: usize) -> Option<usize> {
 struct SysRootINode;
 
 impl SysRootINode {
-    fn entries() -> [&'static str; 7] {
+    fn entries() -> [&'static str; 8] {
         [
-            "class", "block", "bus", "dev", "devices", "power", "firmware",
+            "class", "block", "bus", "dev", "devices", "power", "firmware", "module",
         ]
     }
 }
@@ -306,6 +312,7 @@ impl INode for SysRootINode {
             "devices" => Ok(Arc::new(SysDevicesDirINode)),
             "power" => Ok(Arc::new(SysPowerDirINode)),
             "firmware" => Ok(Arc::new(SysFirmwareDirINode)),
+            "module" => Ok(Arc::new(module::ModuleDirINode(module::ModuleDir::Root))),
             _ => Err(FsError::EntryNotFound),
         }
     }
