@@ -669,7 +669,7 @@ fn repaint_if_scanout_stale() {
     if crtc_blanked() {
         return;
     }
-    let fb_id = DRM_STATE.lock().crtc_fb;
+    let fb_id = DRM_STATE.lock().crtc_fb.panel();
     if fb_id == 0 {
         // Nothing was ever bound, so there is no stale frame to replace.
         SCANOUT_STALE.store(false, Ordering::SeqCst);
@@ -1940,8 +1940,9 @@ struct DrmState {
     /// CREATE_DUMB -> ADDFB -> SETCRTC -> DESTROY_DUMB left `scanout()` and
     /// every cursor move reading frames that had gone back to the allocator.
     fb_backing: Vec<(u32, Arc<VmObject>)>,
-    /// Framebuffer currently bound to the (synthetic) CRTC, reported by GETCRTC.
-    crtc_fb: u32,
+    /// Framebuffer bound to each card's CRTC, reported by GETCRTC. See
+    /// [`CardFbs`].
+    crtc_fb: CardFbs,
     /// The last few framebuffer ids that went away, and what took them —
     /// newest last, capped at [`FB_RETIRE_HISTORY`].
     ///
@@ -2160,7 +2161,7 @@ lazy_static::lazy_static! {
         next_name: 1,
         framebuffers: Vec::new(),
         fb_backing: Vec::new(),
-        crtc_fb: 0,
+        crtc_fb: CardFbs::new(),
         fb_retirements: VecDeque::new(),
         graphics_vt: None,
         next_vblank: Duration::ZERO,
@@ -2288,9 +2289,13 @@ pub use topology::{resources_for_node, topology_for, NodeFacts, NodeTopology};
 
 mod node_lookup;
 pub use node_lookup::{
-    crtc_count_on, get_connector_edid_on, get_connector_on, get_crtc_on, get_plane_on,
-    get_planes_typed_on,
+    card_of_minor, crtc_count_on, get_connector_edid_on, get_connector_on, get_crtc_on,
+    get_plane_on, get_planes_typed_on,
 };
+
+mod card_fbs;
+use card_fbs::CardFbs;
+pub use card_fbs::PANEL_CARD;
 
 mod panel_state;
 #[cfg(test)]
@@ -3478,9 +3483,12 @@ pub fn retire_framebuffers_for_handle(handle_id: u32) -> usize {
     }
     let live: Vec<u32> = state.framebuffers.iter().map(|fb| fb.id).collect();
     state.fb_backing.retain(|(id, _)| live.contains(id));
-    if !state.framebuffers.iter().any(|fb| fb.id == state.crtc_fb) {
-        state.crtc_fb = 0;
-    }
+    let DrmState {
+        framebuffers,
+        crtc_fb,
+        ..
+    } = &mut *state;
+    crtc_fb.retain_live(|id| framebuffers.iter().any(|fb| fb.id == id));
     drop(state);
     warn!(
         "[drm] handle {:#x} closed with {} framebuffer(s) still on it -- retired \
@@ -3527,7 +3535,7 @@ pub fn rmfb_disabling_for(fb_id: u32, pid: u64) -> bool {
 }
 
 /// The removal itself: `None` when `fb_id` is not a framebuffer of `pid`,
-/// else whether it was the CRTC's framebuffer at the time.
+/// else whether it was the panel CRTC's framebuffer at the time.
 fn remove_fb(fb_id: u32, pid: u64) -> Option<bool> {
     let (handle_id, on_crtc) = {
         let mut state = DRM_STATE.lock();
@@ -3537,10 +3545,10 @@ fn remove_fb(fb_id: u32, pid: u64) -> Option<bool> {
             .position(|f| f.id == fb_id && owned_by(f.owner, pid))?;
         let fb = state.framebuffers.remove(pos);
         state.fb_backing.retain(|(id, _)| *id != fb_id);
-        let on_crtc = state.crtc_fb == fb_id;
-        if on_crtc {
-            state.crtc_fb = 0;
-        }
+        // Off every card's CRTC; only the panel's has a pipe to turn off
+        // here, the way `atomic_remove_fb` turns off only the CRTCs of the
+        // device the framebuffer belongs to.
+        let on_crtc = state.crtc_fb.unbind(fb_id);
         note_fb_retired(&mut state, fb_id, FbRetired::Removed);
         (fb.gem_handle_id, on_crtc)
     };
@@ -3564,14 +3572,24 @@ pub fn display_mode() -> Option<(u32, u32, u32)> {
     Some((info.width, info.height, info.pitch()))
 }
 
-/// Bind a framebuffer to a CRTC (the value reported back by GETCRTC).
+/// Bind a framebuffer to the panel's CRTC (the value reported back by GETCRTC).
 pub fn set_crtc_fb(_crtc_id: u32, fb_id: u32) {
-    DRM_STATE.lock().crtc_fb = fb_id;
+    set_crtc_fb_on(PANEL_CARD, fb_id);
 }
 
 /// The framebuffer [`set_crtc_fb`] last bound — what `GETCRTC` reports.
 pub fn crtc_fb() -> u32 {
-    DRM_STATE.lock().crtc_fb
+    crtc_fb_on(PANEL_CARD)
+}
+
+/// [`set_crtc_fb`] on `card`'s CRTC.
+pub fn set_crtc_fb_on(card: u32, fb_id: u32) {
+    DRM_STATE.lock().crtc_fb.set(card, fb_id);
+}
+
+/// [`crtc_fb`] of `card`'s CRTC.
+pub fn crtc_fb_on(card: u32) -> u32 {
+    DRM_STATE.lock().crtc_fb.get(card)
 }
 
 /// Rows per [`blit_chunked`] band. 128 rows is ~2 MiB at 1920-wide ARGB —
@@ -5197,7 +5215,7 @@ pub fn repaint_for_cursor() {
         if st.cursor.hw {
             return;
         }
-        let fb_id = st.crtc_fb;
+        let fb_id = st.crtc_fb.panel();
         let old_rect = st.cursor.drawn;
         let c = &st.cursor;
         let new = if c.visible && c.w > 0 && c.h > 0 {
@@ -5841,6 +5859,33 @@ pub fn page_flip(
     want_event: bool,
     file: &Arc<DrmFileState>,
 ) -> Result<(), FlipError> {
+    flip_presenting(crtc_id, user_data, want_event, file, || {
+        present_now_checked(fb_id, crtc_id, None)
+    })
+}
+
+/// [`page_flip`] for a request that arrived on node `minor`: the frame goes to
+/// that node's card (see [`present_on_checked`]).
+pub fn page_flip_on(
+    minor: u32,
+    fb_id: u32,
+    crtc_id: u32,
+    user_data: u64,
+    want_event: bool,
+    file: &Arc<DrmFileState>,
+) -> Result<(), FlipError> {
+    flip_presenting(crtc_id, user_data, want_event, file, || {
+        present_on_checked(minor, fb_id, crtc_id, None)
+    })
+}
+
+fn flip_presenting(
+    crtc_id: u32,
+    user_data: u64,
+    want_event: bool,
+    file: &Arc<DrmFileState>,
+    present: impl FnOnce() -> Result<(), PresentError>,
+) -> Result<(), FlipError> {
     // One outstanding flip-complete per CRTC — same rule as Linux. The
     // coalesced timer keeps a *queue* (never an overwritten `Option`), so a
     // second flip / WAIT_VBLANK never silently drops the first completion — that
@@ -5859,7 +5904,7 @@ pub fn page_flip(
         // with FLIP_EVENT_PENDING still set risks a double-delivery.
         return Err(FlipError::Busy);
     }
-    let present = present_now_checked(fb_id, crtc_id, None);
+    let present = present();
     // A framebuffer that is not there is the one reason to fail the flip, and
     // it owes no completion. For the others the flip stands: the event MUST
     // still be queued, because a client that asked for one and does not get it
@@ -6451,7 +6496,7 @@ pub fn represent_if_owner_active() -> bool {
         if st.graphics_vt != Some(kernel_hal::console::active_vt()) {
             return false;
         }
-        st.crtc_fb
+        st.crtc_fb.panel()
     };
     if fb == 0 {
         return false;
@@ -6669,6 +6714,53 @@ pub fn present_now_checked(
     Ok(())
 }
 
+/// [`present_now_checked`] for a request that arrived on node `minor`.
+///
+/// The panel's card presents exactly as before. Any other card's frame goes to
+/// that card and nowhere else, as it would on its own `drm_device` in Linux:
+/// its CRTC records it, so `GETCRTC` there reads it back, and it never touches
+/// the panel, the VT ownership or the software cursor, which are all the
+/// panel's. A client on `card1` used to blit its frames over `card0`'s desktop.
+///
+/// Nothing is scanned out on that card yet: its engine has no modeset of its
+/// own (it only reuses the head the firmware lit, which only the boot card
+/// has), and the fb's `driver_fb_id` belongs to the panel driver's namespace
+/// (see `create_fb`), so offering it to this card's `page_flip` would name
+/// another card's object.
+pub fn present_on_checked(
+    minor: u32,
+    fb_id: u32,
+    crtc_id: u32,
+    rect: Option<(u32, u32, u32, u32)>,
+) -> Result<(), PresentError> {
+    let card = card_of_minor(minor);
+    if card == PANEL_CARD {
+        return present_now_checked(fb_id, crtc_id, rect);
+    }
+    if !DRM_STATE.lock().framebuffers.iter().any(|f| f.id == fb_id) {
+        return Err(PresentError::NoSuchFb);
+    }
+    set_crtc_fb_on(card, fb_id);
+    Ok(())
+}
+
+/// [`present_now_region`] for a request that arrived on node `minor`; see
+/// [`present_on_checked`].
+pub fn present_on_region(
+    minor: u32,
+    fb_id: u32,
+    crtc_id: u32,
+    rect: Option<(u32, u32, u32, u32)>,
+) -> bool {
+    present_on_checked(minor, fb_id, crtc_id, rect).is_ok()
+}
+
+/// Whether node `minor` is the panel's card, i.e. whether a modeset on it
+/// writes the panel's pipe state (mode, ACTIVE, blanking, plane rectangles).
+pub fn is_panel_node(minor: u32) -> bool {
+    card_of_minor(minor) == PANEL_CARD
+}
+
 /// Encode and enqueue a `struct drm_event_vblank` for the given card fd.
 ///
 /// Shared by page-flip completions (`DRM_EVENT_FLIP_COMPLETE`) and vblank waits
@@ -6849,7 +6941,7 @@ pub fn destroy_blob(id: u32, owner: usize) -> BlobDestroy {
 /// Snapshot `(atomic KMS state, current CRTC fb id)` for property readback.
 pub fn atomic_snapshot() -> (AtomicKmsState, u32) {
     let state = DRM_STATE.lock();
-    (state.atomic, state.crtc_fb)
+    (state.atomic, state.crtc_fb.panel())
 }
 
 /// Make `data` the CRTC's current mode, in the kernel-owned blob `MODE_ID`
@@ -7152,7 +7244,7 @@ fn restore_atomic_state(saved: (AtomicKmsState, u32, Option<(u32, Vec<u8>)>)) {
     let (atomic, crtc_fb, blob) = saved;
     let mut state = DRM_STATE.lock();
     state.atomic = atomic;
-    state.crtc_fb = crtc_fb;
+    state.crtc_fb.set(PANEL_CARD, crtc_fb);
     if let Some((id, data)) = blob {
         if let Some(existing) = state.blobs.iter_mut().find(|b| b.id == id) {
             existing.data = data;
@@ -7435,7 +7527,7 @@ pub fn atomic_commit(
             .iter()
             .find(|b| b.id == blob_id)
             .map(|b| (b.id, b.data.clone()));
-        (state.atomic, state.crtc_fb, blob)
+        (state.atomic, state.crtc_fb.panel(), blob)
     };
     {
         let mut state = DRM_STATE.lock();
@@ -7676,9 +7768,12 @@ pub fn release_process(pid: u64) -> usize {
         if state.framebuffers.len() != before {
             let live: Vec<u32> = state.framebuffers.iter().map(|fb| fb.id).collect();
             state.fb_backing.retain(|(id, _)| live.contains(id));
-            if !state.framebuffers.iter().any(|fb| fb.id == state.crtc_fb) {
-                state.crtc_fb = 0;
-            }
+            let DrmState {
+                framebuffers,
+                crtc_fb,
+                ..
+            } = &mut *state;
+            crtc_fb.retain_live(|id| framebuffers.iter().any(|fb| fb.id == id));
         }
         drop(state);
         // Outside the lock: these framebuffers are gone, so the references they
@@ -7711,9 +7806,12 @@ pub fn release_process(pid: u64) -> usize {
             .retain(|fb| !doomed.iter().any(|h| h.id == fb.gem_handle_id));
         let live_fbs: Vec<u32> = state.framebuffers.iter().map(|fb| fb.id).collect();
         state.fb_backing.retain(|(id, _)| live_fbs.contains(id));
-        if !state.framebuffers.iter().any(|fb| fb.id == state.crtc_fb) {
-            state.crtc_fb = 0;
-        }
+        let DrmState {
+            framebuffers,
+            crtc_fb,
+            ..
+        } = &mut *state;
+        crtc_fb.retain_live(|id| framebuffers.iter().any(|fb| fb.id == id));
         // Its flink names go with its last handles (`drm_gem_release`).
         gem_names::prune_gem_names(&mut state);
         let driver = state.drivers.first().cloned();
@@ -7999,11 +8097,15 @@ fn get_connector_edid_among(drivers: Vec<Arc<dyn DrmScheme>>, id: u32) -> Option
 }
 
 pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
-    get_crtc_among(snapshot_drivers, id)
+    get_crtc_among(snapshot_drivers, PANEL_CARD, id)
 }
 
 /// [`get_crtc`], asking only the drivers `drivers` hands back.
-fn get_crtc_among(drivers: impl FnOnce() -> Vec<Arc<dyn DrmScheme>>, id: u32) -> Option<DrmCrtc> {
+fn get_crtc_among(
+    drivers: impl FnOnce() -> Vec<Arc<dyn DrmScheme>>,
+    card: u32,
+    id: u32,
+) -> Option<DrmCrtc> {
     // Keyed on the ID, not on the live scanout path -- see `get_connector`
     // for why asking `software_kms_active()` here made advertised ids come
     // back EINVAL mid-probe. The synthetic id is still served without
@@ -8012,12 +8114,12 @@ fn get_crtc_among(drivers: impl FnOnce() -> Vec<Arc<dyn DrmScheme>>, id: u32) ->
         // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
         for driver in drivers() {
             if let Some(mut crtc) = driver.get_crtc(id) {
-                // Keep userspace-facing fb ids in the DRM core namespace.
-                // Read crtc_fb once (a second lock could observe a torn update).
-                let crtc_fb = DRM_STATE.lock().crtc_fb;
-                if crtc_fb != 0 {
-                    crtc.fb_id = crtc_fb;
-                }
+                // Keep userspace-facing fb ids in the DRM core namespace,
+                // nothing bound included: the driver's own id for what it
+                // scans out (the firmware console, say) is an id no `GETFB`
+                // on this fd can resolve, the same rule as
+                // `with_core_scanout_state` for the primary plane.
+                crtc.fb_id = DRM_STATE.lock().crtc_fb.get(card);
                 return Some(crtc);
             }
         }
@@ -8031,7 +8133,7 @@ fn get_crtc_among(drivers: impl FnOnce() -> Vec<Arc<dyn DrmScheme>>, id: u32) ->
     let state = DRM_STATE.lock();
     Some(DrmCrtc {
         id: SYNTH_CRTC_ID,
-        fb_id: state.crtc_fb,
+        fb_id: state.crtc_fb.panel(),
         x: state.atomic.src_x >> 16,
         y: state.atomic.src_y >> 16,
     })
@@ -8099,16 +8201,20 @@ pub fn get_planes_typed() -> Vec<DrmPlane> {
     listed_planes()
         .into_iter()
         .filter_map(|(driver, id)| driver.get_plane(id))
-        .map(with_core_scanout_state)
+        .map(|plane| with_core_scanout_state(PANEL_CARD, plane))
         .collect()
 }
 
 pub fn get_plane(id: u32) -> Option<DrmPlane> {
-    get_plane_among(snapshot_drivers, id)
+    get_plane_among(snapshot_drivers, PANEL_CARD, id)
 }
 
 /// [`get_plane`], asking only the drivers `drivers` hands back.
-fn get_plane_among(drivers: impl FnOnce() -> Vec<Arc<dyn DrmScheme>>, id: u32) -> Option<DrmPlane> {
+fn get_plane_among(
+    drivers: impl FnOnce() -> Vec<Arc<dyn DrmScheme>>,
+    card: u32,
+    id: u32,
+) -> Option<DrmPlane> {
     // Keyed on the ID, not on the live scanout path -- see `get_connector`
     // for why asking `software_kms_active()` here made advertised ids come
     // back EINVAL mid-probe. The synthetic id is still served without
@@ -8133,7 +8239,7 @@ fn get_plane_among(drivers: impl FnOnce() -> Vec<Arc<dyn DrmScheme>>, id: u32) -
             plane_type: 1,     // DRM_PLANE_TYPE_PRIMARY
         }
     };
-    Some(with_core_scanout_state(plane))
+    Some(with_core_scanout_state(card, plane))
 }
 
 /// `drm_mode_getplane` reports `plane->state->crtc` and `->fb`, both NULL
@@ -8143,9 +8249,9 @@ fn get_plane_among(drivers: impl FnOnce() -> Vec<Arc<dyn DrmScheme>>, id: u32) -
 /// driver's own fb id (its own namespace) must not reach userspace, and
 /// the synthetic plane used to report no framebuffer at all and a CRTC
 /// even with nothing on it.
-fn with_core_scanout_state(mut plane: DrmPlane) -> DrmPlane {
+fn with_core_scanout_state(card: u32, mut plane: DrmPlane) -> DrmPlane {
     if plane.plane_type == 1 {
-        let crtc_fb = DRM_STATE.lock().crtc_fb;
+        let crtc_fb = DRM_STATE.lock().crtc_fb.get(card);
         plane.fb_id = crtc_fb;
         if crtc_fb == 0 {
             plane.crtc_id = 0;
@@ -8221,7 +8327,7 @@ pub(crate) fn reset_output_state_for_test() {
     DRM_STATE.lock().graphics_vt = None;
     let mut st = DRM_STATE.lock();
     st.cursor = CursorState::default();
-    st.crtc_fb = 0;
+    st.crtc_fb.clear();
     // A committed atomic state outlives the test that committed it: the next
     // one's ACTIVE=0 then reads as a modeset (the CRTC is on) and is refused
     // for a reason that has nothing to do with what it was testing.

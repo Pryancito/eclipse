@@ -30,8 +30,8 @@ fn a_failed_commit_leaves_the_state_exactly_as_it_was() {
         let mut state = DRM_STATE.lock();
         state.atomic.active = true;
         state.atomic.crtc_w = 1920;
-        state.crtc_fb = 4242;
-        (state.atomic, state.crtc_fb)
+        state.crtc_fb.set(PANEL_CARD, 4242);
+        (state.atomic, state.crtc_fb.panel())
     };
 
     // Stand in for the commit phase having already run: mutate, then roll
@@ -40,19 +40,19 @@ fn a_failed_commit_leaves_the_state_exactly_as_it_was() {
         let mut state = DRM_STATE.lock();
         state.atomic.active = false;
         state.atomic.crtc_w = 640;
-        state.crtc_fb = 7;
+        state.crtc_fb.set(PANEL_CARD, 7);
     }
     restore_atomic_state((before.0, before.1, None));
 
     let after = {
         let state = DRM_STATE.lock();
-        (state.atomic, state.crtc_fb)
+        (state.atomic, state.crtc_fb.panel())
     };
     assert!(after.0.active, "ACTIVE must be what it was");
     assert_eq!(after.0.crtc_w, 1920, "and so must the plane geometry");
     assert_eq!(after.1, before.1, "and the CRTC's framebuffer");
 
     let mut state = DRM_STATE.lock();
-    state.crtc_fb = 0;
+    state.crtc_fb.set(PANEL_CARD, 0);
     state.atomic = AtomicKmsState::default();
 }

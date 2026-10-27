@@ -98,7 +98,7 @@ fn releasing_a_buffer_drops_the_framebuffer_built_on_it() {
             layout: ScanoutLayout::Linear,
             owner: 77_003,
         });
-        state.crtc_fb = 9299;
+        state.crtc_fb.set(PANEL_CARD, 9299);
     }
     assert_eq!(release_process(77_003), 1);
     let state = DRM_STATE.lock();
@@ -106,7 +106,11 @@ fn releasing_a_buffer_drops_the_framebuffer_built_on_it() {
         !state.framebuffers.iter().any(|fb| fb.id == 9299),
         "a framebuffer over a freed handle would scan out released memory"
     );
-    assert_eq!(state.crtc_fb, 0, "the CRTC must not point at a dropped fb");
+    assert_eq!(
+        state.crtc_fb.panel(),
+        0,
+        "the CRTC must not point at a dropped fb"
+    );
 }
 
 /// Linux semantics: closing the handle drops the *handle*, not the
@@ -133,7 +137,7 @@ fn gem_close_keeps_a_framebuffer_and_its_memory_alive() {
             owner: 77_004,
         });
         state.fb_backing.push((9399, vmo.clone()));
-        state.crtc_fb = 9399;
+        state.crtc_fb.set(PANEL_CARD, 9399);
     }
     // Two owners besides the handle table: the test's `vmo` and the fb.
     assert_eq!(Arc::strong_count(&vmo), 3);
@@ -146,7 +150,11 @@ fn gem_close_keeps_a_framebuffer_and_its_memory_alive() {
             state.framebuffers.iter().any(|fb| fb.id == 9399),
             "the fb outlives its handle"
         );
-        assert_eq!(state.crtc_fb, 9399, "and the CRTC still scans it out");
+        assert_eq!(
+            state.crtc_fb.panel(),
+            9399,
+            "and the CRTC still scans it out"
+        );
     }
     // Only the fb's reference dropped away with the handle table entry.
     assert_eq!(Arc::strong_count(&vmo), 2);
@@ -160,5 +168,5 @@ fn gem_close_keeps_a_framebuffer_and_its_memory_alive() {
     let state = DRM_STATE.lock();
     assert!(!state.framebuffers.iter().any(|fb| fb.id == 9399));
     assert!(!state.fb_backing.iter().any(|(id, _)| *id == 9399));
-    assert_eq!(state.crtc_fb, 0, "RMFB of the CRTC fb unbinds it");
+    assert_eq!(state.crtc_fb.panel(), 0, "RMFB of the CRTC fb unbinds it");
 }
