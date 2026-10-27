@@ -319,6 +319,16 @@ NV_STATUS eclipse_nvkms_describe_console(NvU32 gpuId)
 
 /* NV_VIRTUAL_FUNCTION_PRIV_BAR1_BLOCK (published/turing/tu102/dev_vm.h). */
 #define ECLIPSE_PRIV_BAR1_BLOCK 0x00000F40
+/* NV_VIRTUAL_FUNCTION_PRIV_MMU_FAULT_* (same header). */
+#define ECLIPSE_PRIV_MMU_FAULT_ADDR_LO 0x00003080
+#define ECLIPSE_PRIV_MMU_FAULT_ADDR_HI 0x00003084
+#define ECLIPSE_PRIV_MMU_FAULT_INST_LO 0x00003088
+#define ECLIPSE_PRIV_MMU_FAULT_INFO    0x00003090
+#define ECLIPSE_PRIV_MMU_FAULT_STATUS  0x00003094
+/* NV_PFB_PRI_MMU_FAULT_STATUS_VALID, 31:31, write 1 to clear. */
+#define ECLIPSE_MMU_FAULT_STATUS_VALID 0x80000000U
+/* The GPU's PRI-error sentinel, what a faulted BAR1 reads back. */
+#define ECLIPSE_PRI_ERROR(v) (((v) & 0xFFFFFF00U) == 0xBAD0AC00U)
 
 /* Mirrored by `VidmemCheck` in src/nvkms_os.rs. */
 struct EclipseVidmemCheck {
@@ -334,11 +344,18 @@ struct EclipseVidmemCheck {
     NvU32 cpuSame;         /* words the CPU mapping reads equal to the reference */
     NvU32 cpuOnes;         /* words the CPU mapping reads as 0xffffffff */
     NvU8  bar1Physical;    /* the RM maps BAR1 as a linear window */
-    NvU8  pad[3];
+    NvU8  bar1Rebound;     /* BAR1 was found faulted and rebound here */
+    NvU8  pad[2];
     NvU32 cpuFirst;        /* the first word as the CPU mapping reads it */
+    NvU32 faultStatus;     /* MMU_FAULT_STATUS when it was found faulted */
+    NvU32 faultAddrLo;     /* MMU_FAULT_ADDR_LO: the faulting VA, low half */
+    NvU32 faultAddrHi;     /* MMU_FAULT_ADDR_HI */
+    NvU32 faultInstLo;     /* MMU_FAULT_INST_LO: whose instance block */
+    NvU32 faultInfo;       /* MMU_FAULT_INFO: engine, client, access type */
+    NvU32 cpuAfterRebind;  /* the first word through the CPU mapping again */
 };
 
-_Static_assert(sizeof(struct EclipseVidmemCheck) == 56,
+_Static_assert(sizeof(struct EclipseVidmemCheck) == 80,
                "EclipseVidmemCheck layout is shared with src/nvkms_os.rs");
 
 static NV_STATUS eclipse_vram_word(OBJGPU *pGpu, KernelBus *pKernelBus, NvU64 phys,
@@ -456,6 +473,31 @@ NV_STATUS eclipse_nvkms_check_vidmem(NvU32 gpuId, NvHandle hClient, NvHandle hMe
                 pOut->firstBad = i * 4;
             pOut->badWords++;
         }
+    }
+
+    /*
+     * A CPU mapping that reads the PRI-error sentinel is a BAR1 that took an
+     * MMU fault nobody serviced. Record what the MMU latched -- the faulting
+     * address says which BAR1 offset was touched without a mapping -- and do
+     * what the RM's fault handler does on Linux (kern_gmmu_gv100.c): rebind
+     * BAR1 and clear the latched fault. Then read the first word again to
+     * say whether that brought BAR1 back.
+     */
+    if (cpu != NULL && ECLIPSE_PRI_ERROR(pOut->cpuFirst))
+    {
+        pOut->faultStatus = GPU_VREG_RD32(pGpu, ECLIPSE_PRIV_MMU_FAULT_STATUS);
+        pOut->faultAddrLo = GPU_VREG_RD32(pGpu, ECLIPSE_PRIV_MMU_FAULT_ADDR_LO);
+        pOut->faultAddrHi = GPU_VREG_RD32(pGpu, ECLIPSE_PRIV_MMU_FAULT_ADDR_HI);
+        pOut->faultInstLo = GPU_VREG_RD32(pGpu, ECLIPSE_PRIV_MMU_FAULT_INST_LO);
+        pOut->faultInfo = GPU_VREG_RD32(pGpu, ECLIPSE_PRIV_MMU_FAULT_INFO);
+        if (kbusBar1InstBlkBind_HAL(pGpu, pKernelBus) == NV_OK)
+        {
+            pOut->bar1Rebound = 1;
+            if (pOut->faultStatus & ECLIPSE_MMU_FAULT_STATUS_VALID)
+                GPU_VREG_WR32(pGpu, ECLIPSE_PRIV_MMU_FAULT_STATUS,
+                              pOut->faultStatus);
+        }
+        pOut->cpuAfterRebind = cpu[0];
     }
 
     if (repair && pOut->badWords != 0)

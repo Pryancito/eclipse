@@ -551,6 +551,7 @@ fn the_hardware_ladder_says_not_supported_and_never_ok() {
             "preserve_bar1_console",
             eclipse_rm_preserve_bar1_console(0, 0),
         ),
+        ("bar1_recover", eclipse_rm_bar1_recover(0, p.cast())),
         ("state_init", eclipse_rm_state_init(0, p.cast())),
         ("step8", eclipse_rm_step8(0, p.cast())),
     ];

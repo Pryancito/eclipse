@@ -667,6 +667,22 @@ extern "C" fn eclipse_rm_preserve_bar1_console(di: u32, console_size: u64) -> u3
     f.bar1_consoles.push((di, console_size));
     status
 }
+/// The BAR1 fault check: `bar1_recover = Some((status, fault))` answers
+/// `status` with `fault` filled in; without the knob, the stub's refusal.
+#[no_mangle]
+extern "C" fn eclipse_rm_bar1_recover(
+    _di: u32,
+    out: *mut nvidia_rm_sys::rm_init::Bar1Fault,
+) -> u32 {
+    let mut f = FAKE_RM.lock();
+    f.calls.push("bar1_recover");
+    f.narrate("bar1_recover");
+    let Some((status, fault)) = f.bar1_recover else {
+        return NV_ERR_NOT_SUPPORTED;
+    };
+    unsafe { *out = fault };
+    status
+}
 /// `gpuStatePreInit`/`StateInit`/`StateLoad` (`gpustep9`): `state_init =
 /// Some((pre, init, load))` is the status of each phase, `0xFFFF_FFFF`
 /// for one never reached; without the knob, the stub's refusal.
@@ -1327,6 +1343,8 @@ pub(super) struct FakeRm {
     /// Every BAR1 console mapping asked for: `(device instance, console
     /// bytes)`.
     pub bar1_consoles: Vec<(u32, u64)>,
+    /// What `bar1_recover` answers, and the fault it reports.
+    pub bar1_recover: Option<(u32, nvidia_rm_sys::rm_init::Bar1Fault)>,
 }
 
 /// `ECLIPSE_CHAN_BUF_SIZE`: the channel's own buffer, pushbuffer and ring,
@@ -1426,6 +1444,7 @@ const EMPTY_RM: FakeRm = FakeRm {
     console_marks: Vec::new(),
     bar1_console: None,
     bar1_consoles: Vec::new(),
+    bar1_recover: None,
 };
 
 pub(super) static FAKE_RM: lock::Mutex<FakeRm> = lock::Mutex::new(EMPTY_RM);

@@ -62,6 +62,7 @@ fn the_selftest_passes_stage_a_when_the_ring_runs_the_kernels_release() {
     assert_eq!(
         f.calls,
         [
+            "bar1_recover",
             "gem_alloc",
             "gem_map_cpu",
             "vm_bind_map",
@@ -220,7 +221,7 @@ fn the_selftest_cannot_run_without_a_page_a_cpu_mapping_or_a_binding() {
 
     FAKE_RM.lock().fail_gem_alloc = true;
     let lines = selftest(&gpu, 0);
-    assert_eq!(FAKE_RM.lock().calls, ["gem_alloc"]);
+    assert_eq!(FAKE_RM.lock().calls, ["bar1_recover", "gem_alloc"]);
     assert!(
         line(&lines, "SELFTEST: GART alloc failed").contains("(Ok(86)) -- cannot run"),
         "{:?}",
@@ -236,7 +237,7 @@ fn the_selftest_cannot_run_without_a_page_a_cpu_mapping_or_a_binding() {
     let lines = selftest(&gpu, 0);
     assert_eq!(
         FAKE_RM.lock().calls,
-        ["gem_alloc", "gem_map_cpu", "gem_free"]
+        ["bar1_recover", "gem_alloc", "gem_map_cpu", "gem_free"]
     );
     line(&lines, "SELFTEST: gem_map_cpu failed -- cannot run");
 
@@ -249,7 +250,13 @@ fn the_selftest_cannot_run_without_a_page_a_cpu_mapping_or_a_binding() {
     let lines = selftest(&gpu, 0);
     assert_eq!(
         FAKE_RM.lock().calls,
-        ["gem_alloc", "gem_map_cpu", "vm_bind_map", "gem_free"]
+        [
+            "bar1_recover",
+            "gem_alloc",
+            "gem_map_cpu",
+            "vm_bind_map",
+            "gem_free"
+        ]
     );
     line(
         &lines,
@@ -452,4 +459,39 @@ fn the_probe_names_a_context_switch_hang_and_the_contexts_prime_state() {
     bar0_write(&gpu, GP_PUT, 0);
     bar0_write(&gpu, GP_GET, 0);
     bar0_write(&gpu, FECS_MAILBOX0, 0);
+}
+
+/// A BAR1 the MMU had faulted is rebound before the self-test reads the
+/// ring, and the line names where it faulted: on the console card that
+/// fault is what made every USERD read `0xBAD0ACxx` and the ring look full.
+#[test]
+fn the_selftest_rebinds_a_faulted_bar1_first_and_says_where_it_faulted() {
+    let _g = LOCK.lock();
+    let gpu = gpu_rm();
+    {
+        let mut f = FAKE_RM.lock();
+        f.runs = true;
+        f.bar1_recover = Some((
+            0,
+            nvidia_rm_sys::rm_init::Bar1Fault {
+                status: 0x8000_0000,
+                addr_lo: 0x0060_0000,
+                rebind_status: 0,
+                ..Default::default()
+            },
+        ));
+    }
+
+    let lines = selftest(&gpu, 0x7_0000_0000);
+
+    assert_eq!(FAKE_RM.lock().calls[0], "bar1_recover");
+    let fault = line(&lines, "[nouveau-uapi] BAR1 en fallo de MMU");
+    assert!(fault.contains("direccion 0x600000"), "{}", fault);
+    assert!(
+        fault.contains("BAR1 rebindeada -- antes del SELFTEST"),
+        "{}",
+        fault
+    );
+    line(&lines, "SELFTEST stage A PASS");
+    FAKE_RM.lock().bar1_recover = None;
 }

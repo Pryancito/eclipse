@@ -1483,6 +1483,82 @@ extern "C" {
     ) -> NV_STATUS;
 
     fn eclipse_rm_preserve_bar1_console(device_instance: NvU32, console_size: NvU64) -> NV_STATUS;
+
+    fn eclipse_rm_bar1_recover(device_instance: NvU32, out: *mut Bar1Fault) -> NV_STATUS;
+}
+
+/// What the MMU had latched for a BAR fault when [`bar1_recover`] looked,
+/// and whether BAR1 was rebound. Mirrors `EclipseBar1Fault`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bar1Fault {
+    /// `NV_VIRTUAL_FUNCTION_PRIV_BAR1_BLOCK`.
+    pub bar1_block: u32,
+    /// `MMU_FAULT_STATUS`: bit 31 a latched fault, bits 3:0 BAR faults
+    /// dropped behind one.
+    pub status: u32,
+    /// The faulting virtual address, low and high halves.
+    pub addr_lo: u32,
+    pub addr_hi: u32,
+    /// `MMU_FAULT_INST_LO`: the instance block of the faulting context.
+    pub inst_lo: u32,
+    /// `MMU_FAULT_INFO`: engine, client and access type.
+    pub info: u32,
+    /// What the BAR1 rebind returned, [`NO_REBIND`] when nothing was
+    /// latched.
+    pub rebind_status: u32,
+    pub pad: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<Bar1Fault>() == 32);
+
+/// [`Bar1Fault::rebind_status`] when the MMU had nothing latched.
+pub const NO_REBIND: u32 = u32::MAX;
+
+impl Bar1Fault {
+    /// Whether the MMU had a fault latched, so BAR1 was rebound.
+    pub fn faulted(&self) -> bool {
+        self.rebind_status != NO_REBIND
+    }
+
+    /// The log line for a found fault: what was latched and how the rebind
+    /// went. `tag` says where the check ran.
+    pub fn describe(&self, tag: &str) -> alloc::string::String {
+        alloc::format!(
+            "[{}] BAR1 en fallo de MMU: estado {:#010x}, direccion {:#x}, inst {:#010x}, info {:#010x} \
+             (BAR1_BLOCK {:#010x}); {}",
+            tag,
+            self.status,
+            (u64::from(self.addr_hi) << 32) | u64::from(self.addr_lo),
+            self.inst_lo,
+            self.info,
+            self.bar1_block,
+            if self.rebind_status == NV_OK {
+                alloc::string::String::from("BAR1 rebindeada")
+            } else {
+                alloc::format!("el rebind de BAR1 fallo, NV_STATUS={:#x}", self.rebind_status)
+            }
+        )
+    }
+}
+
+/// The BAR fault handling the RM does from its interrupt handler on Linux,
+/// which Eclipse never runs: if the MMU latched a fault, rebind BAR1 and clear
+/// it. A BAR1 left faulted answers every access with `0xBAD0ACxx` -- on the
+/// console card, the USERD of every channel. Cheap; safe to call any time
+/// after the GSP boot.
+pub fn bar1_recover(device_instance: u32) -> Result<Bar1Fault, NV_STATUS> {
+    let _gate = RmGate::try_lock();
+    let mut out = Bar1Fault {
+        rebind_status: NO_REBIND,
+        ..Default::default()
+    };
+    let status = unsafe { eclipse_rm_bar1_recover(device_instance, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -3063,5 +3139,49 @@ mod ce_path_tests {
             ce_rm::calls()[0].args,
             alloc::vec![1, 0x10_0000, 0xBEEF_0000, 0x3F_C000]
         );
+    }
+}
+
+#[cfg(test)]
+mod bar1_fault_tests {
+    use super::*;
+
+    #[test]
+    fn a_bar1_with_nothing_latched_was_not_rebound() {
+        let quiet = Bar1Fault {
+            rebind_status: NO_REBIND,
+            ..Default::default()
+        };
+        assert!(!quiet.faulted());
+    }
+
+    #[test]
+    fn a_found_fault_names_the_address_and_the_rebind() {
+        let fault = Bar1Fault {
+            bar1_block: 0x801f_74c0,
+            status: 0x8000_0001,
+            addr_lo: 0x0060_1000,
+            addr_hi: 0,
+            inst_lo: 0x1f74_c000,
+            info: 0x0004_0005,
+            rebind_status: NV_OK,
+            pad: 0,
+        };
+        assert!(fault.faulted());
+        let line = fault.describe("gpustep9");
+        assert!(
+            line.starts_with("[gpustep9] BAR1 en fallo de MMU"),
+            "{}",
+            line
+        );
+        assert!(line.contains("direccion 0x601000"), "{}", line);
+        assert!(line.contains("BAR1_BLOCK 0x801f74c0"), "{}", line);
+        assert!(line.ends_with("BAR1 rebindeada"), "{}", line);
+
+        let failed = Bar1Fault {
+            rebind_status: 0x40,
+            ..fault
+        };
+        assert!(failed.describe("x").contains("NV_STATUS=0x40"));
     }
 }

@@ -44,6 +44,12 @@ impl NvidiaGpu {
         // SEC_OP=INC_METHOD (1<<29) | count<<16 | subch<<13 | mthd>>2.
         const HDR_SEM: u32 = (1 << 29) | (5 << 16) | (0x5c >> 2);
 
+        // A BAR1 that took an MMU fault reads every USERD as 0xBAD0ACxx and
+        // the ring looks full before anything is submitted: rebind it first,
+        // and say where it faulted.
+        if let Some(line) = bringup_all::recover_bar1(device_instance, "nouveau-uapi") {
+            crate::klog_warn!("{} -- antes del SELFTEST", line);
+        }
         // The self-test belongs to no process: ctx 0, the shared ladder
         // client, exactly as before the per-process ownership split.
         let alloc = match rm::gem_alloc(device_instance, 0, TEST_SIZE, true) {
