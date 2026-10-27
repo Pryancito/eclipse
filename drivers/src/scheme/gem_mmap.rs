@@ -165,6 +165,9 @@ struct MappedGem {
     /// the two atomics below, so an object that was used and then freed still
     /// counts.
     host_pa_given: bool,
+    /// The range is a GPU's VRAM seen through its BAR1 ([`register_device_memory`]),
+    /// not host RAM: mapped write-combining, never write-back.
+    device_memory: bool,
 }
 
 /// Outcome of [`dec_ref`], so `GEM_CLOSE` can tell "still shared, keep it" from
@@ -278,10 +281,24 @@ pub const DMABUF_HOLDER: u64 = u64::MAX - 1;
 /// only the physical range is updated -- the existing holders are preserved
 /// so a stray re-register can never resurrect a freed reference.
 pub fn register(handle: u32, phys_addr: u64, size: u64, owner_pid: u64) {
+    register_as(handle, phys_addr, size, owner_pid, false);
+}
+
+/// [`register`] for an object whose range is VRAM behind a GPU's BAR1 rather
+/// than host RAM. The address is as real as a sysmem one -- PRIME, ADDFB2 and
+/// mmap take it the same way -- but the CPU must reach it uncached or
+/// write-combining: a write-back mapping of device memory is undefined
+/// behaviour on x86. See [`is_device_memory`].
+pub fn register_device_memory(handle: u32, phys_addr: u64, size: u64, owner_pid: u64) {
+    register_as(handle, phys_addr, size, owner_pid, true);
+}
+
+fn register_as(handle: u32, phys_addr: u64, size: u64, owner_pid: u64, device_memory: bool) {
     let mut table = MAPPINGS.lock();
     if let Some(e) = table.iter_mut().find(|e| e.handle == handle) {
         e.phys_addr = phys_addr;
         e.size = size;
+        e.device_memory = device_memory;
     } else {
         table.push(MappedGem {
             handle,
@@ -289,8 +306,18 @@ pub fn register(handle: u32, phys_addr: u64, size: u64, owner_pid: u64) {
             size,
             holders: alloc::vec![owner_pid],
             host_pa_given: false,
+            device_memory,
         });
     }
+}
+
+/// Whether `handle`'s range is device memory (VRAM through BAR1), which a CPU
+/// mapping must not cache. False for an unknown handle.
+pub fn is_device_memory(handle: u32) -> bool {
+    MAPPINGS
+        .lock()
+        .iter()
+        .any(|e| e.handle == handle && e.device_memory)
 }
 
 /// Adds a PRIME reference to `handle` held by `pid` (a self-import resolved
@@ -554,6 +581,17 @@ pub fn lookup_by_phys(phys_addr: u64) -> Option<(u32, u64)> {
         .map(|e| (e.handle, e.size))
 }
 
+/// The handle whose range holds `phys_addr` anywhere inside it, not only at
+/// its start (that is [`lookup_by_phys`]): what a present needs to tell a
+/// row in the middle of a buffer from host RAM.
+pub fn lookup_by_phys_within(phys_addr: u64) -> Option<u32> {
+    MAPPINGS
+        .lock()
+        .iter()
+        .find(|e| phys_addr >= e.phys_addr && phys_addr - e.phys_addr < e.size)
+        .map(|e| e.handle)
+}
+
 #[cfg(test)]
 mod handle_slice_tests {
     use super::*;
@@ -679,6 +717,32 @@ mod bookkeeping_edge_tests {
         assert!(unregister(handle));
         assert!(!unregister(handle), "unregistered twice");
         assert_eq!(ref_count(handle), None);
+    }
+
+    /// A VRAM object behind BAR1 is a range like any other to the lookups,
+    /// and the one thing that differs -- it is device memory -- is said by
+    /// the handle, for every address inside it.
+    #[test]
+    fn device_memory_is_known_by_handle_and_by_any_address_inside_it() {
+        let _g = crate::test_globals::LOCK.lock();
+        let vram = DRIVER_HANDLE_BASE + 0x20_0002;
+        let host = DRIVER_HANDLE_BASE + 0x20_0003;
+        register_device_memory(vram, 0xd0_0100_0000, 0x40_0000, OWNER);
+        register(host, 0x5_0000_0000, 0x1000, OWNER);
+        assert!(is_device_memory(vram));
+        assert!(!is_device_memory(host), "host RAM is not device memory");
+        assert!(!is_device_memory(DRIVER_HANDLE_BASE + 0x20_0004), "unknown");
+        assert_eq!(lookup_for(vram, OWNER), Some((0xd0_0100_0000, 0x40_0000)));
+        assert_eq!(
+            lookup_by_phys_within(0xd0_0100_0000 + 0x3f_ffff),
+            Some(vram)
+        );
+        assert_eq!(lookup_by_phys_within(0xd0_0100_0000 + 0x40_0000), None);
+        assert_eq!(lookup_by_phys_within(0x5_0000_0800), Some(host));
+        // Re-registering says again what the range is.
+        register(vram, 0x6_0000_0000, 0x1000, OWNER);
+        assert!(!is_device_memory(vram));
+        assert!(unregister(vram) && unregister(host));
     }
 }
 

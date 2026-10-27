@@ -1122,8 +1122,8 @@ fn the_console_gpu_reports_itself_ready_only_once_a_client_could_use_it() {
 fn gem_new_allocates_under_the_context_of_the_process_that_asked() {
     let src = include_str!("../../nvidia.rs");
     let at = src
-        .find("rm_init::gem_alloc(")
-        .expect("GEM_NEW must still allocate through the RM");
+        .find("gem_vram::place(")
+        .expect("GEM_NEW must still allocate through `gem_vram::place`");
     let before = &src[at.saturating_sub(1200)..at];
     assert!(
         before.contains("let owner_ctx = self.ctx_idx_for_pid(owner_pid);"),
@@ -1131,11 +1131,29 @@ fn gem_new_allocates_under_the_context_of_the_process_that_asked() {
          here puts every process's buffers back on the shared ladder client, where \
          nvidia-smi counts them for nobody"
     );
-    let call = &src[at..at + src[at..].find(';').unwrap()];
+    let target = &before[before
+        .find("gem_vram::Target {")
+        .expect("the target it places")..];
     assert!(
-        call.contains("owner_ctx"),
-        "...and it must be the value passed to the allocation: {:?}",
-        call
+        target.contains("\n                    owner_ctx,\n"),
+        "...and it must be the context the target carries: {:?}",
+        target
+    );
+    // ...and every allocation `place` makes is under that context.
+    let place = include_str!("../gem_vram.rs");
+    let mut allocs = 0;
+    for (at, _) in place.match_indices("rm_init::gem_alloc") {
+        let call = &place[at..at + place[at..].find(')').unwrap()];
+        assert!(
+            call.contains("t.owner_ctx"),
+            "an allocation in `gem_vram` not under the target's context: {:?}",
+            call
+        );
+        allocs += 1;
+    }
+    assert_eq!(
+        allocs, 2,
+        "the sysmem/VRAM allocation and the mapped-VRAM one"
     );
 }
 

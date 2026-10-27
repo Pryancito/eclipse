@@ -2249,7 +2249,13 @@ pub fn nouveau_cpu_vmo(handle: u32, phys_addr: u64, size: usize) -> Arc<VmObject
         return v.clone();
     }
     let vmo = VmObject::new_physical(phys_addr as usize, pages(size));
-    if !GEM_MAP_UNCACHED.load(Ordering::Relaxed) {
+    if zcore_drivers::scheme::gem_mmap::is_device_memory(handle) {
+        // VRAM behind the card's BAR1 (`nvidia.gem_vram`): device memory,
+        // which x86 must not map write-back. Write-combining, as nouveau and
+        // nvidia-drm map a buffer in VRAM. Before the VMO is published, for
+        // the same reason as below.
+        let _ = vmo.set_cache_policy(kernel_hal::CachePolicy::WriteCombining);
+    } else if !GEM_MAP_UNCACHED.load(Ordering::Relaxed) {
         // Must happen before the VMO is handed out: `set_cache_policy`
         // refuses once a mapping exists. Nothing can have mapped it yet --
         // it was constructed on the line above and is still unpublished.
@@ -4202,6 +4208,10 @@ pub fn scanout_region_checked(
     let mut sync_elapsed = Duration::ZERO;
     let mut cpu_src_synced = false;
     let gem_cpu_mapped = zcore_drivers::scheme::gem_mmap::lookup(fb.gem_handle_id).is_some();
+    // A buffer in VRAM behind BAR1 (`nvidia.gem_vram`). Only the pitched
+    // copy below knows to read it as VRAM; the flat one would read the card's
+    // own BAR1 back over PCIe.
+    let in_vram = zcore_drivers::scheme::gem_mmap::is_device_memory(fb.gem_handle_id);
 
     // CE-offloaded present: copy the frame (sysmem) into the scanout FB (the
     // console GPU's VRAM) with a GPU copy engine instead of CPU stores over
@@ -4247,7 +4257,7 @@ pub fn scanout_region_checked(
             .saturating_add((blit_x as u64).saturating_mul(4));
         // The flat path has no stride and no destination offset, so it can
         // only serve a full frame with matching pitches.
-        let flat_ok = rect.is_none() && fb.pitch == info.pitch;
+        let flat_ok = rect.is_none() && fb.pitch == info.pitch && !in_vram;
         if !flat_ok {
             // Pitched 2D CE path: the GPU copy engine reads directly from the
             // source buffer at fb.pitch and writes into the scanout FB at

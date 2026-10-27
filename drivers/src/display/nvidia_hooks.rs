@@ -201,6 +201,37 @@ pub fn install(mapper: &Option<Arc<dyn IoMapper>>) {
     nvidia_rm_sys::hooks::register_hooks(&ECLIPSE_NVRM_HOOKS);
 }
 
+/// Make sure the kernel's own window onto `[phys, phys + len)` -- the
+/// `phys_to_virt` alias the present path, the cursor and PRIME read a buffer
+/// through -- is mapped, uncached, for a range of device memory (a VRAM
+/// object's BAR1 mapping). Whether it is.
+///
+/// The PCI scan maps a BAR through the same mapper, but only from its first
+/// page on and only if that page was not mapped already, and rboot's physmap
+/// covers the console card's BAR1 only as far as the boot framebuffer: past
+/// it, a read of a BAR1 address through `phys_to_virt` would fault. So every
+/// page is asked for, and an existing mapping (that framebuffer, or a whole
+/// BAR the PCI scan did map) is left as it is.
+pub fn map_device_window(phys: u64, len: u64) -> bool {
+    const PAGE: u64 = 4096;
+    let guard = ECLIPSE_NVRM_HOOKS.mapper.lock();
+    let Some(mapper) = guard.as_ref() else {
+        return false;
+    };
+    let Some(end) = phys.checked_add(len) else {
+        return false;
+    };
+    let mut pa = phys & !(PAGE - 1);
+    while pa < end {
+        match mapper.query_or_map(pa as usize, PAGE as usize) {
+            Some(va) if va == phys_to_virt(pa as usize) => {}
+            _ => return false,
+        }
+        pa += PAGE;
+    }
+    true
+}
+
 /// The port I/O double behind [`port_ops`] under test: every access lands in
 /// `log` as `(read, port, len, value)`, and every read answers `answer`.
 /// Process-global like the real ports, so a test that uses it holds

@@ -14,12 +14,13 @@
 //! the source because the crate links the real RM and there is no double to
 //! call these against.
 
-/// The four entry points that take a bare `hMemory` and must resolve it, plus
+/// The five entry points that take a bare `hMemory` and must resolve it, plus
 /// the bind that dups it across clients.
-const GEM_LIFETIME: [&str; 5] = [
+const GEM_LIFETIME: [&str; 6] = [
     "eclipse_rm_gem_alloc",
     "eclipse_rm_gem_free",
     "eclipse_rm_gem_map_cpu",
+    "eclipse_rm_gem_map_bar1",
     "eclipse_rm_gem_fbmem_offset",
     "eclipse_rm_vm_bind_map",
 ];

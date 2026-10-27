@@ -254,6 +254,18 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
     consola, como ya hacía la versión 1D (`eclipse_rm_ce_blit`). El "Failed to
     disable CRTC 1" de wlroots no llega al kernel (ninguno de sus cuatro
     ioctls aparece rechazado): sale al perder el seat en un cambio de VT.
+  - La ruta nueva, como en Linux (`nvidia.gem_vram`, apagada por defecto
+    hasta probarla): un `GEM_NEW` con `VRAM | GART` (lo que NVK pide para un
+    dma-buf que quiere en VRAM, y por tanto para los buffers de escaneo del
+    compositor) va a VRAM contigua y el RM lo mapea en BAR1
+    (`eclipse_rm_gem_map_bar1`, `kbusMapFbApertureSingle`). La dirección que
+    se publica es la base de BAR1 más el VA que eligió el RM: PRIME, `ADDFB2`
+    y mmap (write-combining) la usan como cualquier otra, y el fb lleva su
+    offset de VRAM, así que `nvkms_page_flip` voltea la pantalla a él sin
+    copias. `gem_free` devuelve el mapeo; con BAR1 llena (192 MiB de 256 para
+    los buffers) o cualquier fallo, el objeto va a memoria del sistema como
+    antes. Si un present aún copia uno de esos buffers, el CE lo lee como
+    `LOCAL_FB`. Sustituye a `vram_bar1.rs`, que suponía una BAR1 lineal.
 - Objetivo: **paridad** con la escalera actual en una sola tarjeta (escritorio,
   cursor, flips sin tearing) con `nvidia.wlr_vulkan`/`wlr_gles2`/`wlr_pixman`.
 

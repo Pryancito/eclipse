@@ -1150,8 +1150,8 @@ extern "C" fn eclipse_rm_step8(_a0: u32, out: *mut nvidia_rm_sys::rm_init::RmApi
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use nvidia_rm_sys::rm_init::{
-    CtxAlloc, ExecFast, ExecSignal, ExecSubmit, GemAlloc, GemMapCpu, GrAlloc, GrChannel,
-    RmComptagCaps, VmBind, ADDR_SYSMEM,
+    CtxAlloc, ExecFast, ExecSignal, ExecSubmit, GemAlloc, GemBar1, GemMapCpu, GrAlloc, GrChannel,
+    RmComptagCaps, VmBind, ADDR_SYSMEM, GEM_ALLOC_SYSMEM,
 };
 
 const NV_OK: u32 = 0;
@@ -1163,6 +1163,7 @@ const NV_ERR_BUSY_RETRY: u32 = nvidia_rm_sys::types::NV_ERR_BUSY_RETRY;
 static FENCE_SEM: AtomicU32 = AtomicU32::new(0);
 /// `NV_ERR_OBJECT_NOT_FOUND`.
 const NV_ERR_OBJECT_NOT_FOUND: u32 = 0x57;
+const NV_ERR_NO_MEMORY: u32 = nvidia_rm_sys::types::NV_ERR_NO_MEMORY;
 /// What the RM's eheap answers to a fixed-address allocation over a
 /// live range: the status the VM_BIND replace semantics were written for.
 const RM_VA_TAKEN: u32 = 0x51;
@@ -1268,6 +1269,13 @@ pub(super) struct FakeRm {
     /// `gem_map_cpu` answers `lookup_status` set for an object it holds:
     /// the C side's shape for a lookup the RM refused.
     pub fail_map_cpu: bool,
+    /// `gem_map_bar1` answers `NV_ERR_NO_MEMORY` in `.status`: BAR1 is full.
+    pub fail_map_bar1: bool,
+    /// The objects `gem_map_bar1` mapped and `gem_free` has not yet given
+    /// back, as the C's slot table holds them.
+    pub bar1_maps: Vec<u32>,
+    /// The flags each `gem_alloc` was asked with, by handle.
+    pub alloc_flags: Vec<(u32, u32)>,
     /// `exec_submit` and `exec_submit_signaled` fail as calls, before any
     /// stage: what the Rust wrappers turn into `Err`.
     pub refuse_submit: bool,
@@ -1419,6 +1427,9 @@ const EMPTY_RM: FakeRm = FakeRm {
     ctx0_resets: 0,
     picked_va: RM_PICKS_FROM,
     fail_map_cpu: false,
+    fail_map_bar1: false,
+    bar1_maps: Vec::new(),
+    alloc_flags: Vec::new(),
     refuse_submit: false,
     fail_bind: false,
     runs: false,
@@ -1683,6 +1694,8 @@ extern "C" fn eclipse_rm_gem_alloc(
         return NV_OK;
     }
     let h = f.fresh();
+    f.alloc_flags.push((h, sysmem));
+    let sysmem = sysmem & GEM_ALLOC_SYSMEM;
     f.gems.push((h, size, sysmem != 0));
     if sysmem != 0 {
         let buf = alloc::boxed::Box::leak(alloc::vec![0u8; size as usize].into_boxed_slice());
@@ -1746,6 +1759,44 @@ extern "C" fn eclipse_rm_gem_map_cpu(
     unsafe { *out = r };
     NV_OK
 }
+/// Where the fake's BAR1 sits on the host bus.
+pub(super) const FAKE_BAR1_BASE: u64 = 0xd0_0000_0000;
+#[no_mangle]
+extern "C" fn eclipse_rm_gem_map_bar1(
+    _inst: u32,
+    _ctx_idx: u32,
+    h_memory: u32,
+    _max_bytes: u64,
+    out: *mut GemBar1,
+) -> u32 {
+    let mut f = FAKE_RM.lock();
+    f.calls.push("gem_map_bar1");
+    let refused = f.fail_map_bar1;
+    let r = match f.gem(h_memory) {
+        Some((h, size, false)) if !refused => {
+            let off = fake_fbmem_offset(h);
+            f.bar1_maps.push(h);
+            GemBar1 {
+                status: NV_OK,
+                physical: 0,
+                bar1_offset: off,
+                length: size,
+                host_pa: FAKE_BAR1_BASE + off,
+                vram_offset: off,
+            }
+        }
+        Some(_) if refused => GemBar1 {
+            status: NV_ERR_NO_MEMORY,
+            ..GemBar1::default()
+        },
+        _ => GemBar1 {
+            status: NV_ERR_NOT_SUPPORTED,
+            ..GemBar1::default()
+        },
+    };
+    unsafe { *out = r };
+    NV_OK
+}
 /// The host PA the fake gives a sysmem object.
 /// The FBMEM offset the fake gives a vidmem object.
 pub(super) fn fake_fbmem_offset(h_memory: u32) -> u64 {
@@ -1775,6 +1826,8 @@ extern "C" fn eclipse_rm_gem_free(_inst: u32, _ctx_idx: u32, h_memory: u32) -> u
     match f.gems.iter().position(|g| g.0 == h_memory) {
         Some(pos) => {
             f.gems.remove(pos);
+            // The C gives the BAR1 mapping back before the memory goes.
+            f.bar1_maps.retain(|h| *h != h_memory);
             f.gem_frees += 1;
             NV_OK
         }
