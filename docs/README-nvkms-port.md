@@ -174,6 +174,24 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
     reserva el BAR1 sigue siendo una ventana lineal. No cambia ni el reparto
     del FB ni el BAR1.
   - nvkms importa y escanea la misma memoria en la que pintan la CPU y el CE.
+- PR 4d: la LUT por defecto se comprueba en VRAM antes del modeset.
+  - En tu hardware el modeset de la consola salía negro con señal, con 4c y
+    con `nvidia.console_preserve`, y sin pantalla no había forma de leer el
+    log.
+  - En Turing, mientras nadie fija una LUT (el primer commit de nvidia-drm no
+    lo hace, ni `show_console`), la ILUT de cada ventana y la OLUT de cada
+    cabeza salen de la superficie de LUT por defecto de nvkms
+    (`nvEvoInitDefaultLutC5`). nvkms la llena con rampas identidad a través de
+    la CPU, por BAR1. Si esas escrituras no llegan a la VRAM, todo píxel sale
+    negro.
+  - Ahora, justo antes del modeset, el shim (`eclipse_nvkms_check_vidmem`) lee
+    esa superficie por la ventana PRAMIN de BAR0, que no pasa por BAR1, y la
+    compara con lo que ve la CPU. Lo que no coincide se reescribe por la misma
+    ventana. Si la CPU lee ceros o la reescritura no lo arregla, no hay modeset
+    y la pantalla se queda como la dejó el firmware, con el motivo en el log.
+  - La línea del log da también el modo real de BAR1 (`BAR1_BLOCK`), cómo lo
+    trata el RM y una muestra de la consola leída por la base de BAR1 y en
+    VRAM 0.
 - Objetivo: **paridad** con la escalera actual en una sola tarjeta (escritorio,
   cursor, flips sin tearing) con `nvidia.wlr_vulkan`/`wlr_gles2`/`wlr_pixman`.
 

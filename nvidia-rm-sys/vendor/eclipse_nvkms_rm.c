@@ -27,6 +27,10 @@
 #include <rmapi/rmapi.h>
 #include <core/thread_state.h>
 #include <platform/sli/sli.h>
+#include <gpu/bus/kern_bus.h>
+#include <mem_mgr/mem.h>
+#include <resserv/rs_server.h>
+#include <resserv/rs_client.h>
 
 /*
  * rm_kernel_rmapi_op, verbatim apart from NV_ENTER/EXIT_RM_RUNTIME (the
@@ -306,6 +310,194 @@ NV_STATUS eclipse_nvkms_describe_console(NvU32 gpuId)
         }
     }
 
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+    rmapiLockRelease();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/* NV_VIRTUAL_FUNCTION_PRIV_BAR1_BLOCK (published/turing/tu102/dev_vm.h). */
+#define ECLIPSE_PRIV_BAR1_BLOCK 0x00000F40
+
+/* Mirrored by `VidmemCheck` in src/nvkms_os.rs. */
+struct EclipseVidmemCheck {
+    NvU64 vramOffset;      /* where the object starts in VRAM */
+    NvU32 bar1Block;       /* the BAR1 bind register, as the GPU has it */
+    NvU32 words;           /* 32-bit words compared */
+    NvU32 badWords;        /* words whose VRAM differs from the CPU view */
+    NvU32 firstBad;        /* byte offset of the first of them, ~0 for none */
+    NvU32 cpuNonZero;      /* words of the CPU view that are not zero */
+    NvU32 badAfterRepair;  /* bad words left after the repair, ~0 if none ran */
+    NvU32 consoleWords;    /* console words sampled, 0 when there is none */
+    NvU32 consoleSame;     /* of them, equal through BAR1 and in VRAM */
+    NvU8  bar1Physical;    /* the RM maps BAR1 as a linear window */
+    NvU8  pad[7];
+};
+
+_Static_assert(sizeof(struct EclipseVidmemCheck) == 48,
+               "EclipseVidmemCheck layout is shared with src/nvkms_os.rs");
+
+static NV_STATUS eclipse_vram_word(OBJGPU *pGpu, KernelBus *pKernelBus, NvU64 phys,
+                                   NvU32 *pData, NvBool bRead)
+{
+    return kbusMemAccessBar0Window_HAL(pGpu, pKernelBus, phys, pData, 4, bRead, ADDR_FBMEM);
+}
+
+/*
+ * Whether the CPU's writes into an RM video-memory object reach the VRAM
+ * behind it.
+ *
+ * nvkms writes its LUTs through the CPU mapping nvRmApiMapMemory gave it,
+ * which goes through BAR1, and the display engine reads them from VRAM. A
+ * BAR1 that does not translate to where the RM put the object leaves the
+ * display reading something else, and on Turing an all-zero input or output
+ * LUT turns every pixel black while the signal stays up. Here the object is
+ * read word by word through the BAR0 PRAMIN window, which reaches VRAM by
+ * physical address without going through BAR1, and compared with what the
+ * CPU sees at `cpu`. With `repair`, words that differ are written into the
+ * VRAM through the same window, and read back.
+ *
+ * Also sampled, when this GPU drives the boot console: whether the firmware
+ * framebuffer at the base of BAR1 is VRAM offset 0, which is what
+ * eclipse_nvkms_describe_console and the nvkms console surface assume.
+ */
+NV_STATUS eclipse_nvkms_check_vidmem(NvU32 gpuId, NvHandle hClient, NvHandle hMemory,
+                                     const volatile NvU32 *cpu, NvU32 size,
+                                     NvBool repair, struct EclipseVidmemCheck *pOut)
+{
+    struct EclipseBootConsole con;
+    THREAD_STATE_NODE threadState;
+    RsClient *pRsClient;
+    Memory *pMemory;
+    MEMORY_DESCRIPTOR *pMemDesc;
+    KernelBus *pKernelBus;
+    OBJGPU *pGpu;
+    NV_STATUS status;
+    NvU32 i, words, value;
+
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->firstBad = ~0U;
+    pOut->badAfterRepair = ~0U;
+    if (cpu == NULL || size < 4)
+        return NV_ERR_INVALID_ARGUMENT;
+    words = size / 4;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_FB);
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_FB);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pGpu = gpumgrGetGpuFromId(gpuId);
+    if (pGpu == NULL)
+    {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto done;
+    }
+    pKernelBus = GPU_GET_KERNEL_BUS(pGpu);
+    pOut->bar1Block = GPU_VREG_RD32(pGpu, ECLIPSE_PRIV_BAR1_BLOCK);
+    pOut->bar1Physical = kbusIsBar1PhysicalModeEnabled(pKernelBus) ? 1 : 0;
+
+    status = serverGetClientUnderLock(&g_resServ, hClient, &pRsClient);
+    if (status == NV_OK)
+        status = memGetByHandle(pRsClient, hMemory, &pMemory);
+    if (status != NV_OK)
+        goto done;
+    pMemDesc = memdescGetMemDescFromGpu(pMemory->pMemDesc, pGpu);
+    if (memdescGetAddressSpace(pMemDesc) != ADDR_FBMEM ||
+        memdescGetSize(pMemDesc) < (NvU64)words * 4)
+    {
+        status = NV_ERR_INVALID_ARGUMENT;
+        goto done;
+    }
+    pOut->vramOffset = memdescGetPhysAddr(pMemDesc, AT_GPU, 0);
+    pOut->words = words;
+
+    for (i = 0; i < words; i++)
+    {
+        NvU32 want = cpu[i];
+
+        if (want != 0)
+            pOut->cpuNonZero++;
+        status = eclipse_vram_word(pGpu, pKernelBus,
+                                   memdescGetPhysAddr(pMemDesc, AT_GPU, (NvU64)i * 4),
+                                   &value, NV_TRUE);
+        if (status != NV_OK)
+            goto done;
+        if (value != want)
+        {
+            if (pOut->badWords == 0)
+                pOut->firstBad = i * 4;
+            pOut->badWords++;
+        }
+    }
+
+    if (repair && pOut->badWords != 0)
+    {
+        pOut->badAfterRepair = 0;
+        for (i = 0; i < words; i++)
+        {
+            NvU64 phys = memdescGetPhysAddr(pMemDesc, AT_GPU, (NvU64)i * 4);
+            NvU32 want = cpu[i];
+
+            status = eclipse_vram_word(pGpu, pKernelBus, phys, &value, NV_TRUE);
+            if (status == NV_OK && value != want)
+            {
+                value = want;
+                status = eclipse_vram_word(pGpu, pKernelBus, phys, &value, NV_FALSE);
+                if (status == NV_OK)
+                    status = eclipse_vram_word(pGpu, pKernelBus, phys, &value, NV_TRUE);
+                if (status == NV_OK && value != want)
+                    pOut->badAfterRepair++;
+            }
+            if (status != NV_OK)
+                goto done;
+        }
+    }
+
+    /*
+     * The console sample: a quarter of the way down the screen, where a
+     * desktop has something drawn, read through the base of BAR1 and from
+     * VRAM. Informational only; the desktop may change between the two.
+     */
+    if (eclipse_boot_console(&con) && con.phys == gpumgrGetGpuPhysFbAddr(pGpu) &&
+        con.height != 0 && con.pitch != 0)
+    {
+        const NvU32 sample = 256;
+        NvU64 off = (NvU64)(con.height / 4) * con.pitch;
+        NvP64 va = NvP64_NULL;
+
+        if (off + (NvU64)sample * 4 <= (NvU64)con.height * con.pitch &&
+            osMapPciMemoryKernel64(pGpu, con.phys + off, (NvU64)sample * 4,
+                                   NV_PROTECT_READABLE, &va,
+                                   NV_MEMORY_WRITECOMBINED) == NV_OK && va != NvP64_NULL)
+        {
+            const volatile NvU32 *bar1 = KERNEL_POINTER_FROM_NvP64(const volatile NvU32 *, va);
+
+            for (i = 0; i < sample; i++)
+            {
+                if (eclipse_vram_word(pGpu, pKernelBus, off + (NvU64)i * 4, &value,
+                                      NV_TRUE) != NV_OK)
+                    break;
+                pOut->consoleWords++;
+                if (bar1[i] == value)
+                    pOut->consoleSame++;
+            }
+            osUnmapPciMemoryKernel64(pGpu, va);
+        }
+    }
+    status = NV_OK;
+
+done:
     rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     rmapiLockRelease();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);

@@ -20,6 +20,7 @@
 #include "nvkms-kapi.h"
 #include "nvkms-kapi-private.h"
 #include "nvkms-kapi-internal.h"
+#include "nvkms-types.h"          /* nvEvoGlobal, NVDevEvoRec: the default LUT */
 #include <class/cl0076.h> /* NV01_MEMORY_FRAMEBUFFER_CONSOLE */
 
 #define ECLIPSE_KMS_MAX_DISPLAYS 8
@@ -488,6 +489,56 @@ void eclipse_kms_surface_free(struct NvKmsKapiDevice *device, struct EclipseKmsS
     g_nvKms.destroySurface(device, s->surface);
     g_nvKms.freeMemory(device, s->memory);
     nvKmsKapiFree(s);
+}
+
+/* Mirrored by `KmsLut` in src/nvkms.rs. */
+struct EclipseKmsLut {
+    NvU64 cpu;      /* the CPU mapping nvkms writes it through */
+    NvU32 hClient;  /* the RM client and memory that hold it */
+    NvU32 hMemory;
+    NvU32 size;     /* bytes nvkms writes: one NVEvoLutDataRec */
+    NvU32 pad;
+};
+
+void eclipse_nvkms_lock(void);
+void eclipse_nvkms_unlock(void);
+
+/*
+ * The default LUT surface of the device: on Turing and later
+ * (needDefaultLutSurface) the ILUT that converts a window's pixels to FP16
+ * and the OLUT of every head come from it whenever the client sets none,
+ * which nvidia-drm's first commit and eclipse_kms_show_console never do.
+ * nvAllocLutSurfacesEvo fills it with identity ramps when the device is
+ * allocated, through the CPU, and then only rewrites it if a head changes
+ * transfer function. Its memory is in the RM client of nvkms itself, not
+ * kapi's. NV_FALSE when the device has none.
+ */
+NvBool eclipse_kms_default_lut(struct NvKmsKapiDevice *device, struct EclipseKmsLut *out)
+{
+    NVDevEvoPtr pDevEvo;
+    NvBool found = NV_FALSE;
+
+    nvkms_memset(out, 0, sizeof(*out));
+    if (device == NULL)
+        return NV_FALSE;
+    eclipse_nvkms_lock();
+    FOR_ALL_EVO_DEVS(pDevEvo) {
+        NVSurfaceEvoPtr pLut = pDevEvo->lut.defaultLut;
+
+        if (pDevEvo->numSubDevices != 1 || pDevEvo->pSubDevices[0] == NULL ||
+            pDevEvo->pSubDevices[0]->gpuId != device->gpuId)
+            continue;
+        if (pLut != NULL && pLut->cpuAddress[0] != NULL) {
+            out->cpu = (NvU64)(NvUPtr)pLut->cpuAddress[0];
+            out->hClient = nvEvoGlobal.clientHandle;
+            out->hMemory = pLut->planes[0].rmHandle;
+            out->size = sizeof(NVEvoLutDataRec);
+            found = NV_TRUE;
+        }
+        break;
+    }
+    eclipse_nvkms_unlock();
+    return found;
 }
 
 /* Mirrored by `KmsHeadSet` in src/nvkms.rs: one head lit by the modeset. */

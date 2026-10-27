@@ -257,7 +257,7 @@ impl NvidiaGpu {
         }
         let scanout = match info {
             Some(info) if self.drives_boot_display() => {
-                self.show_console(&device, &info, &tag, &mut lines)
+                self.show_console(&device, gpu_id, &info, &tag, &mut lines)
             }
             // The probe failure is already in `lines`.
             None if self.drives_boot_display() => None,
@@ -280,6 +280,7 @@ impl NvidiaGpu {
     fn show_console(
         &self,
         device: &KmsDevice,
+        gpu_id: u32,
         info: &KmsInfo,
         tag: &str,
         lines: &mut Vec<String>,
@@ -305,6 +306,9 @@ impl NvidiaGpu {
                 "{}: ningun monitor puede mostrar la consola de {}x{}; sin modeset",
                 tag, fb.width, fb.height
             ));
+            return None;
+        }
+        if !self.default_lut_reaches_vram(device, gpu_id, tag, lines) {
             return None;
         }
         let depth = console_depth(fb.width, fb.pitch);
@@ -339,6 +343,50 @@ impl NvidiaGpu {
                 ));
                 device.free_surface(console);
                 None
+            }
+        }
+    }
+
+    /// Whether the LUTs the console modeset will use are in VRAM.
+    ///
+    /// On Turing every head reads its input and output LUTs from nvkms's
+    /// default LUT surface while no client sets one, and nvkms fills that
+    /// surface through the CPU, across BAR1. If those writes do not reach the
+    /// VRAM the display reads, every pixel comes out black with the signal
+    /// up, and there is no screen left to read the log on. So the surface is
+    /// read back through the BAR0 window before anything is lit, rewritten
+    /// there when it differs, and the modeset is skipped when that does not
+    /// fix it. `false` leaves the screen as the firmware set it, and says why
+    /// in `lines`.
+    fn default_lut_reaches_vram(
+        &self,
+        device: &KmsDevice,
+        gpu_id: u32,
+        tag: &str,
+        lines: &mut Vec<String>,
+    ) -> bool {
+        let Some(lut) = device.default_lut() else {
+            return true;
+        };
+        match nvkms_os::check_vidmem(gpu_id, lut.h_client, lut.h_memory, lut.cpu, lut.size, true) {
+            Ok(check) => {
+                lines.push(format!("{}: {}", tag, check.describe()));
+                if !check.usable() {
+                    lines.push(format!(
+                        "{}: sin modeset: con esa LUT la pantalla saldria negra; se queda \
+                         como la dejo el firmware",
+                        tag
+                    ));
+                }
+                check.usable()
+            }
+            Err(status) => {
+                lines.push(format!(
+                    "{}: no se pudo leer la LUT por defecto en VRAM ({:#x}); sin modeset, la \
+                     pantalla se queda como la dejo el firmware",
+                    tag, status
+                ));
+                false
             }
         }
     }
