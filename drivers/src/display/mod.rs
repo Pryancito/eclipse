@@ -47,6 +47,9 @@ pub use nvidia::comptags::set_enabled as set_gem_comptags_enabled;
 /// (`nvidia.nvidiactl`), for the device nodes in `linux-object`.
 #[cfg(target_arch = "x86_64")]
 pub use nvidia::frontend as nvctl;
+/// The VRAM placement hatch (`nvidia.gem_vram`), reached from `zCore`'s
+/// cmdline parsing by way of `kernel_hal::drivers`.
+#[cfg(target_arch = "x86_64")]
 pub use nvidia::gem_vram::set_enabled as set_gem_vram_enabled;
 /// The implicit-sync hatch (`nvidia.implicit_sync=off`), for `zCore`'s
 /// cmdline parsing by way of `kernel_hal::drivers`.
