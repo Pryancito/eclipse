@@ -352,7 +352,7 @@ fn mapping_fits(t: &Target, host_pa: u64, length: u64) -> bool {
 pub(super) fn foreign_bar1_source(bar1_phys: u64, bar1_len: u64, pa: u64) -> bool {
     let own = pa >= bar1_phys && pa - bar1_phys < bar1_len;
     !own && crate::scheme::gem_mmap::lookup_by_phys_within(pa)
-        .is_some_and(|handle| crate::scheme::gem_mmap::is_device_memory(handle))
+        .is_some_and(crate::scheme::gem_mmap::is_device_memory)
 }
 
 #[cfg(test)]
