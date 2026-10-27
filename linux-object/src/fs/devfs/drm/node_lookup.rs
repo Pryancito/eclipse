@@ -74,5 +74,15 @@ pub fn get_planes_typed_on(minor: u32) -> Vec<DrmPlane> {
     }
 }
 
+/// [`crtc_count`] as node `minor` sees it: the CRTCs `GETRESOURCES` lists
+/// there, so a `WAIT_VBLANK` on pipe 1 of `card1` is measured against
+/// `card1`'s pipes and not the merged list.
+pub fn crtc_count_on(minor: u32) -> usize {
+    if software_kms_active() {
+        return 1;
+    }
+    resources_for_node(minor).0.len()
+}
+
 #[cfg(test)]
 mod tests;

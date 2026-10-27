@@ -96,3 +96,91 @@ fn two_cards_that_can_both_scan_out_each_report_their_own_ids() {
     assert_eq!(kms_counts(0), (2, 1, 1), "card0 lists its own two CRTCs");
     assert_eq!(kms_counts(1), (1, 1, 1), "card1 lists its own one");
 }
+
+/// Two cards that can both scan out, with ids that tell them apart: `card0`
+/// has CRTC 2001 / connector 2002 / plane 2003, `card1` the 21xx ones.
+fn two_scanout_cards(screen: &kms_emu::Screen) -> (kms_emu::Gpu, kms_emu::Gpu) {
+    let second = screen.attach_gpu(
+        EmuGpu::hardware_kms("emu-second")
+            .console_at(0x01, 0x00)
+            .with_ids(2101, 2102, 2103),
+    );
+    let first = screen.attach_gpu(
+        EmuGpu::hardware_kms("emu-first")
+            .console_at(0x65, 0x00)
+            .with_ids(2001, 2002, 2003),
+    );
+    drm::build_gpu_nodes();
+    (first, second)
+}
+
+/// **Properties, atomic objects and leases look in the node's own card**, as
+/// `drm_mode_object_find` looks in one device: `card1` does not find
+/// `card0`'s CRTC, connector or plane, and finds its own.
+#[test]
+fn object_lookups_behind_properties_atomic_and_leases_are_per_node() {
+    let screen = kms_emu::attach(64, 16);
+    let _table = NodeTable;
+    let _cards = two_scanout_cards(&screen);
+
+    for id in [2001, 2002, 2003] {
+        assert!(
+            mode_object_kind(0, id).is_some(),
+            "card0 lost its own {}",
+            id
+        );
+        assert!(
+            mode_object_kind(1, id).is_none(),
+            "card1 found card0's {}",
+            id
+        );
+        assert!(
+            atomic_object(1, id).is_none(),
+            "card1 staged card0's {}",
+            id
+        );
+        assert!(find_mode_object(1, id, DRM_MODE_OBJECT_ANY, true).is_none());
+    }
+    assert_eq!(mode_object_kind(1, 2101), Some(DRM_MODE_OBJECT_CRTC));
+    assert_eq!(mode_object_kind(1, 2102), Some(DRM_MODE_OBJECT_CONNECTOR));
+    assert_eq!(mode_object_kind(1, 2103), Some(DRM_MODE_OBJECT_PLANE));
+
+    assert!(
+        matches!(
+            lease_objects(1, &[2001, 2002], false),
+            Err(FsError::EntryNotFound)
+        ),
+        "card1 leased card0's CRTC and connector"
+    );
+    let leased = lease_objects(1, &[2101, 2102], false).expect("card1 leases its own pipe");
+    assert!(
+        leased.contains(&2103),
+        "the CRTC's primary plane comes along"
+    );
+}
+
+/// `WAIT_VBLANK` on a secondary pipe is measured against the node's own
+/// CRTCs: `card0` has two, `card1` one.
+#[test]
+fn a_secondary_vblank_pipe_is_counted_on_the_nodes_own_card() {
+    let screen = kms_emu::attach(64, 16);
+    let _table = NodeTable;
+    let _second = screen.attach_gpu(
+        EmuGpu::hardware_kms("emu-second")
+            .console_at(0x01, 0x00)
+            .with_topology(&[2101], &[2102]),
+    );
+    let _first = screen.attach_gpu(
+        EmuGpu::hardware_kms("emu-first")
+            .console_at(0x65, 0x00)
+            .with_topology(&[2001, 2003], &[2002]),
+    );
+    drm::build_gpu_nodes();
+
+    let secondary = 0x1 | _DRM_VBLANK_SECONDARY; // _DRM_VBLANK_RELATIVE
+    assert!(wait_vblank_check(0, secondary).is_ok());
+    assert!(
+        wait_vblank_check(1, secondary).is_err(),
+        "card1 has one pipe; pipe 1 was counted against the whole machine"
+    );
+}

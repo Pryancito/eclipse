@@ -26,7 +26,7 @@ fn active() -> u64 {
 }
 
 fn dpms_readback() -> u64 {
-    connector_props(CONN, true)
+    connector_props(0, CONN, true)
         .into_iter()
         .find(|&(id, _)| id == PROP_DPMS)
         .expect("DPMS")

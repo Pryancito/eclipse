@@ -89,7 +89,7 @@ impl DrmDev {
             return Ok(()); // io_control will reject it with EFAULT in a moment
         }
         let req = unsafe { *(data as *const DrmWaitVblank) };
-        if wait_vblank_check(req.typ).is_err() {
+        if wait_vblank_check(self.minor, req.typ).is_err() {
             return Ok(()); // the sync arm refuses it at once; nothing to sleep for
         }
         if req.typ & _DRM_VBLANK_EVENT != 0 {

@@ -13,7 +13,7 @@ const CRTC: u32 = drm::SYNTH_CRTC_ID;
 const CONN: u32 = drm::SYNTH_CONNECTOR_ID;
 
 fn connector_crtc() -> u64 {
-    connector_props(CONN, true)
+    connector_props(0, CONN, true)
         .into_iter()
         .find(|&(id, _)| id == PROP_CRTC_ID)
         .expect("the connector advertises CRTC_ID")

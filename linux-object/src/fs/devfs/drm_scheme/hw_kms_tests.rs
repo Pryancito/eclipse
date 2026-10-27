@@ -2530,7 +2530,7 @@ fn framebuffers_and_blobs_draw_their_ids_from_one_counter() {
         blob_b
     );
     for id in [fb_a, blob, fb_b, blob_b] {
-        assert!(mode_object_kind(id).is_none(), "{} is a KMS object", id);
+        assert!(mode_object_kind(0, id).is_none(), "{} is a KMS object", id);
         assert!(prop_spec(id).is_none(), "{} is a property", id);
     }
     assert!(drm::get_fb(blob).is_none(), "a blob id names no fb");
@@ -2583,7 +2583,7 @@ fn an_object_without_a_property_table_is_einval_not_enoent() {
     let blob = req.blob_id;
     let prop = PROP_DPMS;
     for id in [fb, blob, prop] {
-        assert!(mode_object_kind(id).is_none(), "{} is a KMS object", id);
+        assert!(mode_object_kind(0, id).is_none(), "{} is a KMS object", id);
     }
 
     let getprops = |obj_id: u32, obj_type: u32| {

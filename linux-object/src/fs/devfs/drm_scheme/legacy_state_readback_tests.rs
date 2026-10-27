@@ -34,7 +34,7 @@ fn plane_prop(id: u32) -> u64 {
 }
 
 fn connector_crtc() -> u64 {
-    prop(&connector_props(CONN, true), PROP_CRTC_ID)
+    prop(&connector_props(0, CONN, true), PROP_CRTC_ID)
 }
 
 fn plane_rects() -> [u64; 8] {

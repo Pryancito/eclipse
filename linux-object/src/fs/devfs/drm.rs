@@ -2288,7 +2288,8 @@ pub use topology::{resources_for_node, topology_for, NodeFacts, NodeTopology};
 
 mod node_lookup;
 pub use node_lookup::{
-    get_connector_edid_on, get_connector_on, get_crtc_on, get_plane_on, get_planes_typed_on,
+    crtc_count_on, get_connector_edid_on, get_connector_on, get_crtc_on, get_plane_on,
+    get_planes_typed_on,
 };
 
 mod panel_state;
