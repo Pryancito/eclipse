@@ -133,10 +133,18 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
   nvkms sigue escaneando lo que dejó la UEFI hasta que se aplica un modo.
 
 **PR 4: modeset de la tarjeta de arranque.**
-- La memoria de la consola (`NV01_MEMORY_FRAMEBUFFER_CONSOLE`) como
-  superficie de kapi y `applyModeSetConfig` con el modo de la UEFI: el
-  escritorio sigue igual, pero ya lo escanea nvkms.
-- Después, flips de nvkms para los GEM en VRAM y cursor por kapi.
+- PR 4a: la memoria de la consola (`NV01_MEMORY_FRAMEBUFFER_CONSOLE`, la
+  misma que nvkms usa para restaurar la consola en
+  `nvRmImportFbConsoleMemory`) como superficie de kapi, y el primer
+  `applyModeSetConfig`, como el primer commit atómico de `nvidia-drm`: cada
+  monitor conectado de la tarjeta de arranque, en su propia cabeza, a un modo
+  del tamaño de la consola (el preferido si cabe, si no el más cercano a
+  60 Hz), con la consola sin escalar como plano primario; las demás cabezas
+  se apagan. Se valida (`commit = false`) antes de aplicarlo. El escritorio
+  sigue igual, porque la CPU y el CE siguen pintando la misma memoria, pero
+  ya lo escanea nvkms. Un monitor sin modo de ese tamaño se queda apagado y
+  lo dice el log.
+- PR 4b: flips de nvkms para los GEM en VRAM y cursor por kapi.
 - Objetivo: **paridad** con la escalera actual en una sola tarjeta (escritorio,
   cursor, flips sin tearing) con `nvidia.wlr_vulkan`/`wlr_gles2`/`wlr_pixman`.
 

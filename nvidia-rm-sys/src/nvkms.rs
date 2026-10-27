@@ -8,6 +8,10 @@
 //! too full of bitfields to mirror here; this module gets back the flat
 //! [`KmsInfo`] and turns it into something to log.
 //!
+//! The first modeset keeps the firmware console on screen
+//! ([`KmsDevice::show_console`]): which display gets which head and mode is
+//! decided here ([`console_plan`]), where it can be tested.
+//!
 //! Loaded only with `nvidia.nvkms` ([`crate::nvkms_os::module_load`]).
 
 use alloc::boxed::Box;
@@ -25,6 +29,22 @@ extern "C" {
     fn eclipse_kms_alloc_device(gpu_id: u32) -> *mut c_void;
     fn eclipse_kms_free_device(device: *mut c_void);
     fn eclipse_kms_probe(device: *mut c_void, info: *mut KmsInfo) -> u8;
+    fn eclipse_kms_mode(device: *mut c_void, display: u32, index: u32, out: *mut KmsMode) -> i32;
+    fn eclipse_kms_console_surface(
+        device: *mut c_void,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        depth: u32,
+    ) -> *mut c_void;
+    fn eclipse_kms_console_free(device: *mut c_void, console: *mut c_void);
+    fn eclipse_kms_show_console(
+        device: *mut c_void,
+        console: *const c_void,
+        sets: *const KmsHeadSet,
+        num_sets: u32,
+        num_heads: u32,
+    ) -> i32;
 }
 
 /// Whether nvkms is in this kernel image.
@@ -187,6 +207,90 @@ impl KmsDevice {
         }
     }
 
+    /// Every mode nvkms lists for `display`, valid or not: a mode's position
+    /// here is the index [`KmsHeadSet::mode_index`] names.
+    pub fn modes(&self, display: u32) -> Vec<KmsMode> {
+        let mut modes = Vec::new();
+        #[cfg(target_os = "none")]
+        for index in 0..MAX_MODES as u32 {
+            let mut mode = KmsMode::default();
+            let more = unsafe { eclipse_kms_mode(self.0.as_ptr(), display, index, &mut mode) };
+            if more < 0 {
+                break;
+            }
+            modes.push(mode);
+            if more == 0 {
+                break;
+            }
+        }
+        #[cfg(not(target_os = "none"))]
+        let _ = (display, &mut modes);
+        modes
+    }
+
+    /// The firmware console (the VRAM the RM reserved for it) as a surface
+    /// nvkms can scan out. `None` when the RM or kapi refused; the reason is
+    /// in the NVKMS log.
+    pub fn console_surface(
+        &self,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        depth: u32,
+    ) -> Option<KmsConsole> {
+        #[cfg(target_os = "none")]
+        {
+            NonNull::new(unsafe {
+                eclipse_kms_console_surface(self.0.as_ptr(), width, height, pitch, depth)
+            })
+            .map(KmsConsole)
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = (width, height, pitch, depth);
+            None
+        }
+    }
+
+    /// The first modeset: light each head in `sets` with the console, and
+    /// darken the device's other heads. Takes modeset ownership, and gives it
+    /// back on failure.
+    pub fn show_console(
+        &self,
+        console: &KmsConsole,
+        sets: &[KmsHeadSet],
+        num_heads: u32,
+    ) -> Result<(), ShowError> {
+        #[cfg(target_os = "none")]
+        {
+            let code = unsafe {
+                eclipse_kms_show_console(
+                    self.0.as_ptr(),
+                    console.0.as_ptr(),
+                    sets.as_ptr(),
+                    sets.len() as u32,
+                    num_heads,
+                )
+            };
+            ShowError::from_code(code)
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = (console, sets, num_heads);
+            Err(ShowError::BadRequest)
+        }
+    }
+
+    /// Destroy the console surface. The screen keeps whatever it shows.
+    pub fn free_console(&self, console: KmsConsole) {
+        #[cfg(target_os = "none")]
+        unsafe {
+            eclipse_kms_console_free(self.0.as_ptr(), console.0.as_ptr())
+        };
+        #[cfg(not(target_os = "none"))]
+        let _ = console;
+    }
+
     /// kapi's `freeDevice`.
     pub fn free(self) {
         #[cfg(target_os = "none")]
@@ -194,6 +298,138 @@ impl KmsDevice {
             eclipse_kms_free_device(self.0.as_ptr())
         };
     }
+}
+
+/// The console as a kapi surface: `struct EclipseKmsConsole`.
+pub struct KmsConsole(#[cfg_attr(not(target_os = "none"), allow(dead_code))] NonNull<c_void>);
+
+// Like `KmsDevice`, only ever handed back to kapi.
+unsafe impl Send for KmsConsole {}
+unsafe impl Sync for KmsConsole {}
+
+/// Modes [`KmsDevice::modes`] asks about, as the probe does.
+pub const MAX_MODES: usize = 256;
+
+/// One mode of a display: `struct EclipseKmsMode`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KmsMode {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_millihz: u32,
+    pub pixel_clock_khz: u32,
+    pub valid: u8,
+    pub preferred: u8,
+    pub interlaced: u8,
+    pub pad: u8,
+}
+
+const _: () = assert!(core::mem::size_of::<KmsMode>() == 4 * 4 + 4);
+
+/// One head the console modeset lights: `struct EclipseKmsHeadSet`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KmsHeadSet {
+    pub head: u32,
+    pub display: u32,
+    /// Index into [`KmsDevice::modes`] for `display`.
+    pub mode_index: u32,
+}
+
+/// Why [`KmsDevice::show_console`] left the screen as it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShowError {
+    BadRequest,
+    NoOwnership,
+    ModeGone,
+    Refused,
+    CommitFailed,
+}
+
+impl ShowError {
+    #[cfg_attr(not(target_os = "none"), allow(dead_code))]
+    fn from_code(code: i32) -> Result<(), Self> {
+        match code {
+            0 => Ok(()),
+            2 => Err(Self::NoOwnership),
+            3 => Err(Self::ModeGone),
+            4 => Err(Self::Refused),
+            5 => Err(Self::CommitFailed),
+            _ => Err(Self::BadRequest),
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::BadRequest => "peticion mal formada",
+            Self::NoOwnership => "nvkms no dio la propiedad del modeset",
+            Self::ModeGone => "el modo ya no es valido",
+            Self::Refused => "nvkms rechazo la configuracion al validarla",
+            Self::CommitFailed => "el commit del modeset fallo",
+        }
+    }
+}
+
+/// The mode to show a `width`x`height` console at: one of exactly that size,
+/// so the console is shown unscaled, the way the firmware set it. The
+/// preferred mode if it is that size -- the one the UEFI picks -- else the
+/// one closest to 60 Hz. Never an interlaced mode.
+pub fn console_mode(modes: &[KmsMode], width: u32, height: u32) -> Option<usize> {
+    let fits =
+        |m: &KmsMode| m.valid != 0 && m.interlaced == 0 && m.width == width && m.height == height;
+    if let Some(i) = modes.iter().position(|m| fits(m) && m.preferred != 0) {
+        return Some(i);
+    }
+    modes
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| fits(m))
+        .min_by_key(|(_, m)| m.refresh_millihz.abs_diff(60_000))
+        .map(|(i, _)| i)
+}
+
+/// The console modeset for one GPU: which head and mode each connected
+/// display gets, and one line for each display left dark. Displays take the
+/// lowest free head they can be driven from, in nvkms's order, the way the
+/// firmware clones its console onto every monitor.
+pub fn console_plan(
+    info: &KmsInfo,
+    mut modes_of: impl FnMut(u32) -> Vec<KmsMode>,
+    width: u32,
+    height: u32,
+) -> (Vec<KmsHeadSet>, Vec<String>) {
+    let mut sets: Vec<KmsHeadSet> = Vec::new();
+    let mut dark = Vec::new();
+    let heads = if info.num_heads >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << info.num_heads) - 1
+    };
+    for d in info.displays().iter().filter(|d| d.connected != 0) {
+        let modes = modes_of(d.handle);
+        let Some(mode_index) = console_mode(&modes, width, height) else {
+            dark.push(format!(
+                "pantalla {:#x}: ningun modo de {}x{} para la consola; se queda apagada",
+                d.handle, width, height
+            ));
+            continue;
+        };
+        let used = sets.iter().fold(0u32, |m, s| m | (1 << s.head));
+        let free = d.head_mask & heads & !used;
+        if free == 0 {
+            dark.push(format!(
+                "pantalla {:#x}: sin cabeza libre (cabezas {:#x}); se queda apagada",
+                d.handle, d.head_mask
+            ));
+            continue;
+        }
+        sets.push(KmsHeadSet {
+            head: free.trailing_zeros(),
+            display: d.handle,
+            mode_index: mode_index as u32,
+        });
+    }
+    (sets, dark)
 }
 
 /// `NvKmsConnectorTypeString` of nvkms-api-types.h.
@@ -391,5 +627,138 @@ mod tests {
     #[test]
     fn a_hosted_build_allocates_no_device() {
         assert!(KmsDevice::alloc(0x100).is_none());
+    }
+
+    fn mode(width: u32, height: u32, hz: u32, preferred: bool) -> KmsMode {
+        KmsMode {
+            width,
+            height,
+            refresh_millihz: hz * 1000,
+            pixel_clock_khz: 0,
+            valid: 1,
+            preferred: preferred as u8,
+            interlaced: 0,
+            pad: 0,
+        }
+    }
+
+    #[test]
+    fn the_console_mode_is_the_preferred_one_when_it_fits() {
+        let modes = [
+            mode(2560, 1440, 144, false),
+            mode(1920, 1080, 144, false),
+            mode(1920, 1080, 60, true),
+        ];
+        assert_eq!(console_mode(&modes, 1920, 1080), Some(2));
+    }
+
+    #[test]
+    fn without_a_fitting_preferred_mode_the_console_runs_closest_to_60_hz() {
+        let mut interlaced = mode(1920, 1080, 60, false);
+        interlaced.interlaced = 1;
+        let mut invalid = mode(1920, 1080, 60, false);
+        invalid.valid = 0;
+        let modes = [
+            mode(3840, 2160, 60, true),
+            interlaced,
+            invalid,
+            mode(1920, 1080, 120, false),
+            mode(1920, 1080, 50, false),
+            mode(1920, 1080, 75, false),
+        ];
+        assert_eq!(console_mode(&modes, 1920, 1080), Some(4));
+        assert_eq!(console_mode(&modes, 1280, 720), None);
+    }
+
+    #[test]
+    fn the_console_plan_gives_each_monitor_its_own_head() {
+        let mut info = KmsInfo::zeroed();
+        info.num_heads = 4;
+        info.num_displays = 4;
+        for (i, d) in info.displays.iter_mut().take(4).enumerate() {
+            d.handle = 1 << i;
+            d.head_mask = 0xf;
+            d.connected = 1;
+        }
+        info.displays[1].connected = 0;
+        // Display 0x4 can only use head 0, which display 0x1 already took.
+        info.displays[2].head_mask = 0x1;
+        let (sets, dark) = console_plan(
+            &info,
+            |handle| match handle {
+                0x8 => alloc::vec![mode(1280, 1024, 60, true), mode(1920, 1080, 60, false)],
+                _ => alloc::vec![mode(1920, 1080, 60, true)],
+            },
+            1920,
+            1080,
+        );
+        assert_eq!(
+            sets,
+            [
+                KmsHeadSet {
+                    head: 0,
+                    display: 0x1,
+                    mode_index: 0
+                },
+                KmsHeadSet {
+                    head: 1,
+                    display: 0x8,
+                    mode_index: 1
+                },
+            ]
+        );
+        assert_eq!(
+            dark,
+            ["pantalla 0x4: sin cabeza libre (cabezas 0x1); se queda apagada"]
+        );
+    }
+
+    #[test]
+    fn a_monitor_without_the_console_size_stays_dark() {
+        let mut info = KmsInfo::zeroed();
+        info.num_heads = 2;
+        info.num_displays = 1;
+        info.displays[0].handle = 0x100;
+        info.displays[0].head_mask = 0x3;
+        info.displays[0].connected = 1;
+        let (sets, dark) = console_plan(
+            &info,
+            |_| alloc::vec![mode(1280, 1024, 60, true)],
+            1920,
+            1080,
+        );
+        assert!(sets.is_empty());
+        assert_eq!(
+            dark,
+            ["pantalla 0x100: ningun modo de 1920x1080 para la consola; se queda apagada"]
+        );
+    }
+
+    #[test]
+    fn heads_past_the_device_are_never_planned() {
+        let mut info = KmsInfo::zeroed();
+        info.num_heads = 1;
+        info.num_displays = 1;
+        info.displays[0].handle = 0x1;
+        info.displays[0].head_mask = 0x2;
+        info.displays[0].connected = 1;
+        let (sets, dark) = console_plan(
+            &info,
+            |_| alloc::vec![mode(1920, 1080, 60, true)],
+            1920,
+            1080,
+        );
+        assert!(sets.is_empty());
+        assert_eq!(dark.len(), 1);
+    }
+
+    #[test]
+    fn show_codes_match_the_c_side() {
+        assert_eq!(ShowError::from_code(0), Ok(()));
+        assert_eq!(ShowError::from_code(2), Err(ShowError::NoOwnership));
+        assert_eq!(ShowError::from_code(3), Err(ShowError::ModeGone));
+        assert_eq!(ShowError::from_code(4), Err(ShowError::Refused));
+        assert_eq!(ShowError::from_code(5), Err(ShowError::CommitFailed));
+        assert_eq!(ShowError::from_code(1), Err(ShowError::BadRequest));
     }
 }
