@@ -387,6 +387,21 @@ extern "C" fn eclipse_rm_hwcursor_init(_a0: u32, _a1: u32, out: *mut u8) -> u32 
 extern "C" fn eclipse_rm_hwcursor_move(_gpu: u32, _a0: i32, _a1: i32) -> u32 {
     NV_ERR_NOT_SUPPORTED
 }
+#[no_mangle]
+extern "C" fn eclipse_rm_gem_client(_gpu: u32, _ctx_idx: u32, h_client: *mut u32) -> u32 {
+    unsafe { *h_client = 0 };
+    NV_ERR_NOT_SUPPORTED
+}
+#[no_mangle]
+extern "C" fn eclipse_rm_write_memory(
+    _h_client: u32,
+    _h_memory: u32,
+    _offset: u64,
+    _src: *const u8,
+    _len: u64,
+) -> u32 {
+    NV_ERR_NOT_SUPPORTED
+}
 /// The NVC57E surface-flip ladder as the host sees it. The display front
 /// end's fetch of a flip is modelled in polls: each accepted flip leaves
 /// `fetch_polls` answers of "still pending" behind it, and the drain in

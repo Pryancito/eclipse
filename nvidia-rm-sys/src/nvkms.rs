@@ -10,7 +10,8 @@
 //!
 //! The first modeset keeps the firmware console on screen
 //! ([`KmsDevice::show_console`]): which display gets which head and mode is
-//! decided here ([`console_plan`]), where it can be tested.
+//! decided here ([`console_plan`]), where it can be tested. After it, the
+//! compositor's buffers are flipped to ([`KmsDevice::flip`]).
 //!
 //! Loaded only with `nvidia.nvkms` ([`crate::nvkms_os::module_load`]).
 
@@ -37,13 +38,38 @@ extern "C" {
         pitch: u32,
         depth: u32,
     ) -> *mut c_void;
-    fn eclipse_kms_console_free(device: *mut c_void, console: *mut c_void);
+    fn eclipse_kms_import_surface(
+        device: *mut c_void,
+        h_src_client: u32,
+        h_src_memory: u32,
+        size: u64,
+        width: u32,
+        height: u32,
+        pitch: u32,
+    ) -> *mut c_void;
+    fn eclipse_kms_surface_free(device: *mut c_void, surface: *mut c_void);
     fn eclipse_kms_show_console(
         device: *mut c_void,
         console: *const c_void,
         sets: *const KmsHeadSet,
         num_sets: u32,
         num_heads: u32,
+        out: *mut *mut c_void,
+    ) -> i32;
+    fn eclipse_kms_flip(device: *mut c_void, scanout: *mut c_void, surface: *const c_void) -> i32;
+    fn eclipse_kms_flip_pending(device: *mut c_void, scanout: *const c_void) -> i32;
+    fn eclipse_kms_cursor_surface(
+        device: *mut c_void,
+        h_client: *mut u32,
+        h_memory: *mut u32,
+    ) -> *mut c_void;
+    fn eclipse_kms_cursor(
+        device: *mut c_void,
+        scanout: *mut c_void,
+        surface: *const c_void,
+        x: i32,
+        y: i32,
+        surface_changed: u8,
     ) -> i32;
 }
 
@@ -237,13 +263,13 @@ impl KmsDevice {
         height: u32,
         pitch: u32,
         depth: u32,
-    ) -> Option<KmsConsole> {
+    ) -> Option<KmsSurface> {
         #[cfg(target_os = "none")]
         {
             NonNull::new(unsafe {
                 eclipse_kms_console_surface(self.0.as_ptr(), width, height, pitch, depth)
             })
-            .map(KmsConsole)
+            .map(KmsSurface)
         }
         #[cfg(not(target_os = "none"))]
         {
@@ -252,17 +278,53 @@ impl KmsDevice {
         }
     }
 
-    /// The first modeset: light each head in `sets` with the console, and
-    /// darken the device's other heads. Takes modeset ownership, and gives it
-    /// back on failure.
-    pub fn show_console(
+    /// A compositor's VRAM buffer (an XRGB8888 pitch-linear GEM, the RM
+    /// handle `h_memory` in the client `h_client`) as a surface to flip to.
+    /// `None` when the RM or kapi refused; the reason is in the NVKMS log.
+    pub fn import_surface(
         &self,
-        console: &KmsConsole,
-        sets: &[KmsHeadSet],
-        num_heads: u32,
-    ) -> Result<(), ShowError> {
+        h_client: u32,
+        h_memory: u32,
+        size: u64,
+        width: u32,
+        height: u32,
+        pitch: u32,
+    ) -> Option<KmsSurface> {
         #[cfg(target_os = "none")]
         {
+            NonNull::new(unsafe {
+                eclipse_kms_import_surface(
+                    self.0.as_ptr(),
+                    h_client,
+                    h_memory,
+                    size,
+                    width,
+                    height,
+                    pitch,
+                )
+            })
+            .map(KmsSurface)
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = (h_client, h_memory, size, width, height, pitch);
+            None
+        }
+    }
+
+    /// The first modeset: light each head in `sets` with the console, and
+    /// darken the device's other heads. Takes modeset ownership, and gives it
+    /// back on failure. The configuration it leaves on screen is what
+    /// [`Self::flip`] changes.
+    pub fn show_console(
+        &self,
+        console: &KmsSurface,
+        sets: &[KmsHeadSet],
+        num_heads: u32,
+    ) -> Result<KmsScanout, ShowError> {
+        #[cfg(target_os = "none")]
+        {
+            let mut out = core::ptr::null_mut();
             let code = unsafe {
                 eclipse_kms_show_console(
                     self.0.as_ptr(),
@@ -270,9 +332,13 @@ impl KmsDevice {
                     sets.as_ptr(),
                     sets.len() as u32,
                     num_heads,
+                    &mut out,
                 )
             };
-            ShowError::from_code(code)
+            ShowError::from_code(code)?;
+            NonNull::new(out)
+                .map(KmsScanout)
+                .ok_or(ShowError::BadRequest)
         }
         #[cfg(not(target_os = "none"))]
         {
@@ -281,14 +347,90 @@ impl KmsDevice {
         }
     }
 
-    /// Destroy the console surface. The screen keeps whatever it shows.
-    pub fn free_console(&self, console: KmsConsole) {
+    /// Flip every lit head to `surface` at the next vblank. Returns once the
+    /// flip is queued; [`ShowError::FlipPending`] while the previous one has
+    /// not landed, with nothing changed.
+    pub fn flip(&self, scanout: &KmsScanout, surface: &KmsSurface) -> Result<(), ShowError> {
+        #[cfg(target_os = "none")]
+        {
+            ShowError::from_code(unsafe {
+                eclipse_kms_flip(self.0.as_ptr(), scanout.0.as_ptr(), surface.0.as_ptr())
+            })
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = (scanout, surface);
+            Err(ShowError::BadRequest)
+        }
+    }
+
+    /// Whether a flip has yet to land on any lit head; `None` when kapi
+    /// could not say.
+    pub fn flip_pending(&self, scanout: &KmsScanout) -> Option<bool> {
+        #[cfg(target_os = "none")]
+        {
+            match unsafe { eclipse_kms_flip_pending(self.0.as_ptr(), scanout.0.as_ptr()) } {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            }
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = scanout;
+            None
+        }
+    }
+
+    /// The cursor plane's surface: [`CURSOR_SIZE`] square, A8R8G8B8, in
+    /// video memory, with the RM client and handle its image is written
+    /// through ([`crate::rm_init::write_memory`]).
+    pub fn cursor_surface(&self) -> Option<(KmsSurface, u32, u32)> {
+        #[cfg(target_os = "none")]
+        {
+            let (mut h_client, mut h_memory) = (0, 0);
+            let s = unsafe {
+                eclipse_kms_cursor_surface(self.0.as_ptr(), &mut h_client, &mut h_memory)
+            };
+            NonNull::new(s).map(|s| (KmsSurface(s), h_client, h_memory))
+        }
+        #[cfg(not(target_os = "none"))]
+        None
+    }
+
+    /// The cursor plane on every lit head: `surface` with its top-left at
+    /// `(x, y)`, or off for `None`. `changed` says the image in `surface` is
+    /// new. Never waits for a pending flip.
+    pub fn cursor(
+        &self,
+        scanout: &KmsScanout,
+        surface: Option<&KmsSurface>,
+        x: i32,
+        y: i32,
+        changed: bool,
+    ) -> Result<(), ShowError> {
+        #[cfg(target_os = "none")]
+        {
+            let s = surface.map_or(core::ptr::null(), |s| s.0.as_ptr() as *const c_void);
+            ShowError::from_code(unsafe {
+                eclipse_kms_cursor(self.0.as_ptr(), scanout.0.as_ptr(), s, x, y, changed as u8)
+            })
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = (scanout, surface, x, y, changed);
+            Err(ShowError::BadRequest)
+        }
+    }
+
+    /// Destroy a surface. It must not be on screen.
+    pub fn free_surface(&self, surface: KmsSurface) {
         #[cfg(target_os = "none")]
         unsafe {
-            eclipse_kms_console_free(self.0.as_ptr(), console.0.as_ptr())
+            eclipse_kms_surface_free(self.0.as_ptr(), surface.0.as_ptr())
         };
         #[cfg(not(target_os = "none"))]
-        let _ = console;
+        let _ = surface;
     }
 
     /// kapi's `freeDevice`.
@@ -300,12 +442,40 @@ impl KmsDevice {
     }
 }
 
-/// The console as a kapi surface: `struct EclipseKmsConsole`.
-pub struct KmsConsole(#[cfg_attr(not(target_os = "none"), allow(dead_code))] NonNull<c_void>);
+/// A kapi surface and its memory: `struct EclipseKmsSurface`.
+pub struct KmsSurface(#[cfg_attr(not(target_os = "none"), allow(dead_code))] NonNull<c_void>);
+
+/// The configuration nvkms scans out since the console modeset:
+/// `struct EclipseKmsScanout`. Lives as long as the device.
+pub struct KmsScanout(#[cfg_attr(not(target_os = "none"), allow(dead_code))] NonNull<c_void>);
 
 // Like `KmsDevice`, only ever handed back to kapi.
-unsafe impl Send for KmsConsole {}
-unsafe impl Sync for KmsConsole {}
+unsafe impl Send for KmsSurface {}
+unsafe impl Sync for KmsSurface {}
+unsafe impl Send for KmsScanout {}
+unsafe impl Sync for KmsScanout {}
+
+/// The cursor plane's width and height: `ECLIPSE_KMS_CURSOR`, the size the
+/// driver advertises.
+pub const CURSOR_SIZE: u32 = 64;
+
+/// A cursor image of `w`x`h` premultiplied ARGB pixels as the bytes of a
+/// [`CURSOR_SIZE`] square surface: the image at the top left, transparent
+/// around it. `None` for an image that does not fit.
+pub fn cursor_image(argb: &[u32], w: u32, h: u32) -> Option<Vec<u8>> {
+    if w == 0 || h == 0 || w > CURSOR_SIZE || h > CURSOR_SIZE || argb.len() < (w * h) as usize {
+        return None;
+    }
+    let side = CURSOR_SIZE as usize;
+    let mut out = alloc::vec![0u8; side * side * 4];
+    for row in 0..h as usize {
+        for col in 0..w as usize {
+            let at = (row * side + col) * 4;
+            out[at..at + 4].copy_from_slice(&argb[row * w as usize + col].to_le_bytes());
+        }
+    }
+    Some(out)
+}
 
 /// Modes [`KmsDevice::modes`] asks about, as the probe does.
 pub const MAX_MODES: usize = 256;
@@ -336,7 +506,8 @@ pub struct KmsHeadSet {
     pub mode_index: u32,
 }
 
-/// Why [`KmsDevice::show_console`] left the screen as it was.
+/// Why [`KmsDevice::show_console`] or [`KmsDevice::flip`] left the screen as
+/// it was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShowError {
     BadRequest,
@@ -344,6 +515,7 @@ pub enum ShowError {
     ModeGone,
     Refused,
     CommitFailed,
+    FlipPending,
 }
 
 impl ShowError {
@@ -355,6 +527,7 @@ impl ShowError {
             3 => Err(Self::ModeGone),
             4 => Err(Self::Refused),
             5 => Err(Self::CommitFailed),
+            6 => Err(Self::FlipPending),
             _ => Err(Self::BadRequest),
         }
     }
@@ -366,6 +539,7 @@ impl ShowError {
             Self::ModeGone => "el modo ya no es valido",
             Self::Refused => "nvkms rechazo la configuracion al validarla",
             Self::CommitFailed => "el commit del modeset fallo",
+            Self::FlipPending => "el flip anterior aun no ha llegado a la pantalla",
         }
     }
 }
@@ -753,12 +927,25 @@ mod tests {
     }
 
     #[test]
+    fn a_cursor_image_lands_top_left_in_a_transparent_square() {
+        let img = cursor_image(&[0xff11_2233, 0x8000_0000, 0, 0x0102_0304], 2, 2).unwrap();
+        assert_eq!(img.len(), 64 * 64 * 4);
+        assert_eq!(&img[..8], &[0x33, 0x22, 0x11, 0xff, 0x00, 0x00, 0x00, 0x80]);
+        let second_row = 64 * 4;
+        assert_eq!(&img[second_row..second_row + 8], &[0, 0, 0, 0, 4, 3, 2, 1]);
+        assert!(img[8..second_row].iter().all(|&b| b == 0));
+        assert!(cursor_image(&[0; 65 * 65], 65, 65).is_none());
+        assert!(cursor_image(&[0; 3], 2, 2).is_none(), "short image");
+    }
+
+    #[test]
     fn show_codes_match_the_c_side() {
         assert_eq!(ShowError::from_code(0), Ok(()));
         assert_eq!(ShowError::from_code(2), Err(ShowError::NoOwnership));
         assert_eq!(ShowError::from_code(3), Err(ShowError::ModeGone));
         assert_eq!(ShowError::from_code(4), Err(ShowError::Refused));
         assert_eq!(ShowError::from_code(5), Err(ShowError::CommitFailed));
+        assert_eq!(ShowError::from_code(6), Err(ShowError::FlipPending));
         assert_eq!(ShowError::from_code(1), Err(ShowError::BadRequest));
     }
 }

@@ -516,7 +516,7 @@ pub struct NvidiaGpu {
     /// holds the card.
     hwcur_state: core::sync::atomic::AtomicU8,
     /// The nvkms device and what it scans out, once `nvidia.nvkms` gave it this card.
-    nvkms_device: Mutex<Option<nvkms_takeover::NvkmsCard>>,
+    nvkms_device: spin::Mutex<Option<nvkms_takeover::NvkmsCard>>,
     /// Boot-stable KMS topology snapshot: the FIRST successful RM display
     /// query, frozen for the rest of the boot. Every KMS-visible fact
     /// (connector ids, supported/connected masks, EDID head) is served from
@@ -926,7 +926,7 @@ impl NvidiaGpu {
             rm_device_instance: Mutex::new(None),
             surfaceflip_state: core::sync::atomic::AtomicU8::new(0),
             hwcur_state: core::sync::atomic::AtomicU8::new(0),
-            nvkms_device: Mutex::new(None),
+            nvkms_device: spin::Mutex::new(None),
             rm_display_snap: Mutex::new(None),
             auto_bringup_done: AtomicBool::new(false),
             gsp_firmware: Mutex::new(None),
@@ -1179,6 +1179,7 @@ impl NvidiaGpu {
             fbs.retain(|fb| fb.handle_id != handle_id);
             ids
         };
+        self.nvkms_forget_fbs(&removed_ids);
         if !removed_ids.is_empty() {
             let mut state = self.kms_state.lock();
             if removed_ids.iter().any(|id| *id == state.crtc_fb) {
@@ -7875,6 +7876,9 @@ impl DrmScheme for NvidiaGpu {
         let Some(fb) = self.kms_fb(fb_id) else {
             return false;
         };
+        if let Some(flipped) = self.nvkms_page_flip(&fb) {
+            return flipped;
+        }
 
         // 1) NVC57E ISO surface flip (opt-in nvidia.surfaceflip) when we have
         //    a VRAM GEM. Bring the ladder up lazily on first flip.
@@ -8079,7 +8083,8 @@ impl DrmScheme for NvidiaGpu {
             return false;
         };
         match self.hwcur_state.load(Ordering::Relaxed) {
-            2 | nvkms_takeover::NVKMS_OWNS => return false,
+            2 => return false,
+            nvkms_takeover::NVKMS_OWNS => return self.nvkms_cursor_set(argb, w, h),
             1 => {}
             _ => {
                 let (status, st) = nvidia_rm_sys::rm_init::hwcursor_init(dev, 0);
@@ -8123,6 +8128,9 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn hw_cursor_move(&self, x: i32, y: i32) -> bool {
+        if let Some(moved) = self.nvkms_cursor_move(x, y) {
+            return moved;
+        }
         // Pure PIO into the cursor-immediate channel -- no RM entry, no gate.
         let Some(dev) = *self.rm_device_instance.lock() else {
             return false;
@@ -8131,6 +8139,9 @@ impl DrmScheme for NvidiaGpu {
     }
 
     fn hw_cursor_hide(&self) -> bool {
+        if let Some(hidden) = self.nvkms_cursor_hide() {
+            return hidden;
+        }
         let Some(dev) = *self.rm_device_instance.lock() else {
             return false;
         };

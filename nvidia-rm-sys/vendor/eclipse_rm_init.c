@@ -2441,6 +2441,23 @@ static void _eclipse_rm_ctx_handles(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 *phCl
     }
 }
 
+/* The RM client a context's GEM handles live in, for a kernel client that
+ * dups one into its own (nvkms flipping to a compositor's buffer: see
+ * eclipse_kms_import_surface). Only reads the context tables. */
+NV_STATUS eclipse_rm_gem_client(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 *phClient)
+{
+    NvU32 hDevice = 0;
+
+    if (phClient == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+    *phClient = 0;
+    if (gpuInstance >= ECLIPSE_MAX_GPUS || ctxIdx >= ECLIPSE_MAX_CTX ||
+        !g_grAllocDone[gpuInstance])
+        return NV_ERR_INVALID_STATE;
+    _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, phClient, &hDevice);
+    return *phClient != 0 ? NV_OK : NV_ERR_INVALID_STATE;
+}
+
 /* Drop one (consumer, producer) fence mapping. Everything freed here belongs
  * to the CONSUMER's client: the virtual allocation that carries the mapping,
  * and the dup through which that client reaches the producer's page. Freeing
@@ -10843,6 +10860,75 @@ NV_STATUS eclipse_rm_hwcursor_image(NvU32 gpuInstance, const NvU32 *pArgb,
     }
 
 out:
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/* CPU-write `len` bytes at `offset` into memory object hMemory of client
+ * hClient, through the same BAR1 transfer eclipse_rm_hwcursor_image uses.
+ * For a kernel client's small surfaces (nvkms's cursor image: see
+ * eclipse_kms_cursor_surface), which no CPU mapping is kept for. */
+NV_STATUS eclipse_rm_write_memory(NvU32 hClient, NvU32 hMemory, NvU64 offset,
+                                  const void *pSrc, NvU64 len)
+{
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    RsClient *pRsClient = NULL;
+    Memory *pMem = NULL;
+    NvU8 *pDst = NULL;
+    NvU32 xferFlags = TRANSFER_FLAGS_USE_BAR1 |
+                      TRANSFER_FLAGS_SHADOW_ALLOC |
+                      TRANSFER_FLAGS_SHADOW_INIT_MEM;
+
+    if (pSrc == NULL || len == 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = serverGetClientUnderLock(&g_resServ, hClient, &pRsClient);
+    if (status == NV_OK)
+        status = memGetByHandle(pRsClient, hMemory, &pMem);
+    if (status == NV_OK && (pMem->pMemDesc == NULL || pMem->pMemDesc->pGpu == NULL ||
+                            offset + len > memdescGetSize(pMem->pMemDesc)))
+        status = NV_ERR_INVALID_ARGUMENT;
+    if (status == NV_OK)
+    {
+        MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pMem->pMemDesc->pGpu);
+
+        pDst = memmgrMemDescBeginTransfer(pMemoryManager, pMem->pMemDesc, xferFlags);
+        if (pDst == NULL)
+        {
+            status = NV_ERR_GENERIC;
+        }
+        else
+        {
+            portMemCopy(pDst + offset, len, pSrc, len);
+            memmgrMemDescEndTransfer(pMemoryManager, pMem->pMemDesc, xferFlags);
+        }
+    }
     rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();

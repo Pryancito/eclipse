@@ -145,6 +145,23 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
   ya lo escanea nvkms. Un monitor sin modo de ese tamaño se queda apagado y
   lo dice el log.
 - PR 4b: flips de nvkms para los GEM en VRAM y cursor por kapi.
+  - Cada fb en VRAM del compositor pasa a ser una superficie de kapi: su GEM
+    se duplica (`NvRmDupObject`) del cliente RM del contexto que lo reservó
+    al cliente de kapi, que es en lo que acaba el import por fd de
+    `nvidia-drm`. Se envuelve como hace `ImportMemory`.
+  - `page_flip` es un flip de kapi sobre la configuración que dejó el modeset:
+    solo cambia la superficie del plano primario, y kapi lo convierte en
+    `NVKMS_IOCTL_FLIP`. Como `nvidia-drm`, no se encola un flip mientras el
+    anterior no ha llegado (`getFlipPendingStatus`); se espera hasta 50 ms.
+  - Un fb que nvkms no puede escanear (sysmem, PRIME) se sigue copiando a la
+    consola con la CPU o el CE, y antes se vuelve a poner la consola en
+    pantalla. Cuando se cierra el GEM de un fb que está en pantalla, se vuelve
+    a la consola y se espera a que ese flip llegue antes de soltar la
+    superficie.
+  - El cursor es el plano de cursor de nvkms: una superficie de 64x64
+    A8R8G8B8 en VRAM, reservada por kapi y escrita por la transferencia BAR1
+    del RM. Cada movimiento es un flip que solo toca el cursor.
+    `nvidia.nvkms` activa el camino de cursor por hardware de la capa DRM.
 - Objetivo: **paridad** con la escalera actual en una sola tarjeta (escritorio,
   cursor, flips sin tearing) con `nvidia.wlr_vulkan`/`wlr_gles2`/`wlr_pixman`.
 
