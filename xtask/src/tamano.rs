@@ -85,7 +85,11 @@ const PASADOS: &[(&str, usize)] = &[
         "drivers/src/display/nvidia/nouveau_bookkeeping_tests.rs",
         9500,
     ),
-    ("linux-object/src/fs/devfs/drm.rs", 8500),
+    // 8750: el trabajo multi-GPU (CRTC, framebuffer y presents por tarjeta)
+    // lo dejo en 8614 con el techo en 8500, y master estaba rojo por ello.
+    // Sus tests ya estan todos fuera; lo que toca es sacar produccion a
+    // submodulos, no volver a subir esto.
+    ("linux-object/src/fs/devfs/drm.rs", 8750),
     ("drivers/src/usb/xhci_hid.rs", 7750),
     ("drivers/src/net/e1000e.rs", 7500),
     // 6000: BAJADO el 25-oct-2026, que es para lo que está este test. El
@@ -98,8 +102,9 @@ const PASADOS: &[(&str, usize)] = &[
     // tests que ahora están fuera.
     ("xtask/src/linux/mod.rs", 6000),
     // 7000: master llego a 6753 con el techo en 6750, asi que el trinquete
-    // estaba rojo antes de esta tanda y no por ella.
-    ("linux-object/src/fs/devfs/drm_scheme.rs", 7000),
+    // estaba rojo antes de esta tanda y no por ella. 7250: la busqueda por
+    // tarjeta del nodo (multi-GPU) lo dejo en 7025; mismo caso que drm.rs.
+    ("linux-object/src/fs/devfs/drm_scheme.rs", 7250),
     ("linux-object/src/fs/procfs.rs", 6500),
     // Subido el 14-oct y otra vez el 16; lo que toca es partirlo, ver arriba.
     ("linux-object/src/process.rs", 6500),
