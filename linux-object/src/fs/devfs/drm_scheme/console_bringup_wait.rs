@@ -35,14 +35,21 @@
 //! the driver would peg a core for the length of a GSP boot *and* starve the
 //! very task it is waiting for when there is one CPU.
 //!
-//! Waiting is also what makes the bring-up's own timing right, which is the
-//! second half of the fix. The deferred task used to wait for `KD_GRAPHICS`
-//! and then sleep 3 s "to let labwc finish its first few frames" -- frames
-//! labwc cannot draw, because it needs memory from the card the task is about
-//! to bring up. A client parked here reports itself through
-//! [`drm::note_cold_client_waiting`], which both wakes that task and cancels
-//! the courtesy sleep: a compositor blocked in `GEM_NEW` has no frames to
-//! protect, and is the one moment when parking scanout costs nothing.
+//! Waiting here deliberately changes NOTHING about when the bring-up runs.
+//! The first version of this also cut the deferred task's 3-second courtesy
+//! window the moment a client parked -- the window is there "to let labwc
+//! finish its first few frames", frames labwc cannot draw without this very
+//! card, so cutting it looked free. It was not: the parked client arrives
+//! before `KD_GRAPHICS`, so on a dual-2060 box the bring-up started at 6.8 s
+//! instead of 10.7 s, the SEC2 `STARTCPU` store that had completed in 2.3 s
+//! at the later moment did not come back at all at the earlier one, and the
+//! monitor was gone for the session. A parked client costs nothing by
+//! waiting, and the old timing is the only recipe that has ever finished
+//! with both cards up, so it is left exactly as it was.
+//!
+//! [`drm::note_cold_client_waiting`] therefore only REPORTS: the deferred
+//! task names a parked client in its log line, and the lines below say which
+//! pid parked, when, and how long it waited.
 
 use super::*;
 use alloc::string::String;
@@ -115,21 +122,40 @@ impl DrmDev {
         // Before the first sleep, so the task we are waiting for sees it on
         // its very next look.
         drm::note_cold_client_waiting();
-        if !ANNOUNCED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        let began = kernel_hal::timer::timer_now();
+        let announce = !ANNOUNCED.swap(true, core::sync::atomic::Ordering::Relaxed);
+        if announce {
+            // pid and clock on purpose: the deferred task's own window is
+            // timed off `KD_GRAPHICS`, and which process parks here and WHEN
+            // is what says whether the two are about to collide. The boot
+            // that lost its monitor had something park before 6.6 s and no
+            // line named it.
             kernel_hal::klog_warn!(
-                "[drm] {} arrived on the console GPU before its RM is attached: holding the \
-                 call while the deferred bring-up runs, instead of ENODEV (a refusal here is \
-                 VK_ERROR_OUT_OF_DEVICE_MEMORY and pixman for the session) -- {}",
+                "[drm] {} from pid {} arrived on the console GPU at {}.{:03} s, before its RM \
+                 is attached: holding the call while the deferred bring-up runs, instead of \
+                 ENODEV (a refusal here is VK_ERROR_OUT_OF_DEVICE_MEMORY and pixman for the \
+                 session) -- {}",
                 zcore_drivers::display::nouveau_ioctl_name(cmd & 0xff),
+                drm::current_pid(),
+                began.as_secs(),
+                began.subsec_millis(),
                 detail.trim_end()
             );
         }
-        let deadline = kernel_hal::timer::timer_now() + Duration::from_micros(AWAIT_BRINGUP_US);
+        let deadline = began + Duration::from_micros(AWAIT_BRINGUP_US);
         loop {
             // Asked on every look: a `^C` landing in a 60 s wait must not
             // wait it out.
             crate::process::check_signals()?;
             if cold_console_card(self).is_none() || !drm::console_bringup_unfinished() {
+                if announce {
+                    let held = kernel_hal::timer::timer_now().saturating_sub(began);
+                    kernel_hal::klog_warn!(
+                        "[drm] console GPU ready; the parked call goes through after {}.{:03} s",
+                        held.as_secs(),
+                        held.subsec_millis()
+                    );
+                }
                 return Ok(());
             }
             let now = kernel_hal::timer::timer_now();
