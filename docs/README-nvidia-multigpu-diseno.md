@@ -206,7 +206,7 @@ escritorio actual funcionando en cada PR.
 1. ¿Qué fallos cosméticos ves exactamente (cursor, bandas, parpadeo,
    tearing, colores) y con qué `wlr_*`? Capturas o `dmesg` ayudan a
    priorizar el paso 3.
-2. ¿Quieres un monitor en cada 2060 SUPER a la vez, o un escritorio en una y
-   la otra para CUDA/Ollama? El diseño soporta las dos cosas, pero cambia el
-   orden: con «una para escritorio y otra para compute» el PR F es menos
-   urgente.
+2. ~~¿Un monitor en cada tarjeta o una para compute?~~ **Decidido
+   (27-oct): exactamente como en Linux.** Toda tarjeta con monitor hace KMS
+   a la vez, y cualquiera puede usarse para CUDA/Ollama aunque también lleve
+   pantalla. El PR F es parte del objetivo, no opcional.
