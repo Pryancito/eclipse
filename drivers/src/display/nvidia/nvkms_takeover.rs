@@ -365,15 +365,25 @@ impl NvidiaGpu {
         tag: &str,
         lines: &mut Vec<String>,
     ) -> bool {
-        let Some(lut) = device.default_lut() else {
+        let Some(mut lut) = device.default_lut() else {
             return true;
         };
-        match nvkms_os::check_vidmem(gpu_id, lut.h_client, lut.h_memory, lut.cpu, lut.size, true) {
+        let check = nvkms_os::check_vidmem(
+            gpu_id,
+            lut.h_client,
+            lut.h_memory,
+            lut.reference,
+            lut.cpu,
+            lut.size,
+            true,
+        );
+        device.release_default_lut(&mut lut);
+        match check {
             Ok(check) => {
                 lines.push(format!("{}: {}", tag, check.describe()));
                 if !check.usable() {
                     lines.push(format!(
-                        "{}: sin modeset: con esa LUT la pantalla saldria negra; se queda \
+                        "{}: sin modeset: con esa LUT la pantalla saldria negra o blanca; se queda \
                          como la dejo el firmware",
                         tag
                     ));

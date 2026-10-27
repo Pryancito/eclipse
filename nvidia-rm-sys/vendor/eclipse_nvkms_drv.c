@@ -21,6 +21,7 @@
 #include "nvkms-kapi-private.h"
 #include "nvkms-kapi-internal.h"
 #include "nvkms-types.h"          /* nvEvoGlobal, NVDevEvoRec: the default LUT */
+#include "nvkms-utils.h"          /* nvCalloc, nvFree */
 #include <class/cl0076.h> /* NV01_MEMORY_FRAMEBUFFER_CONSOLE */
 
 #define ECLIPSE_KMS_MAX_DISPLAYS 8
@@ -493,8 +494,9 @@ void eclipse_kms_surface_free(struct NvKmsKapiDevice *device, struct EclipseKmsS
 
 /* Mirrored by `KmsLut` in src/nvkms.rs. */
 struct EclipseKmsLut {
-    NvU64 cpu;      /* the CPU mapping nvkms writes it through */
-    NvU32 hClient;  /* the RM client and memory that hold it */
+    NvU64 cpu;       /* the CPU mapping nvkms writes it through */
+    NvU64 reference; /* what it must hold, built in kernel memory */
+    NvU32 hClient;   /* the RM client and memory that hold it */
     NvU32 hMemory;
     NvU32 size;     /* bytes nvkms writes: one NVEvoLutDataRec */
     NvU32 pad;
@@ -529,7 +531,24 @@ NvBool eclipse_kms_default_lut(struct NvKmsKapiDevice *device, struct EclipseKms
             pDevEvo->pSubDevices[0]->gpuId != device->gpuId)
             continue;
         if (pLut != NULL && pLut->cpuAddress[0] != NULL) {
-            out->cpu = (NvU64)(NvUPtr)pLut->cpuAddress[0];
+            /*
+             * What the LUT must hold, built by the same InitDefaultLut that
+             * filled it, pointed for one call at kernel memory. Reading it
+             * back through `cpu` is no reference: a BAR1 mapping that does
+             * not reach VRAM reads back all ones, and copying those into
+             * VRAM turns every pixel white.
+             */
+            NVEvoLutDataRec *reference = nvCalloc(1, sizeof(NVEvoLutDataRec));
+            void *mapped = pLut->cpuAddress[0];
+
+            if (reference == NULL)
+                break;
+            pLut->cpuAddress[0] = reference;
+            pDevEvo->hal->InitDefaultLut(pDevEvo);
+            pLut->cpuAddress[0] = mapped;
+
+            out->cpu = (NvU64)(NvUPtr)mapped;
+            out->reference = (NvU64)(NvUPtr)reference;
             out->hClient = nvEvoGlobal.clientHandle;
             out->hMemory = pLut->planes[0].rmHandle;
             out->size = sizeof(NVEvoLutDataRec);
@@ -539,6 +558,15 @@ NvBool eclipse_kms_default_lut(struct NvKmsKapiDevice *device, struct EclipseKms
     }
     eclipse_nvkms_unlock();
     return found;
+}
+
+/* Frees what eclipse_kms_default_lut built. */
+void eclipse_kms_default_lut_release(struct EclipseKmsLut *lut)
+{
+    if (lut != NULL && lut->reference != 0) {
+        nvFree((void *)(NvUPtr)lut->reference);
+        lut->reference = 0;
+    }
 }
 
 /* Mirrored by `KmsHeadSet` in src/nvkms.rs: one head lit by the modeset. */

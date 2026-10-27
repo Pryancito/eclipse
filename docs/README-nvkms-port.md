@@ -192,6 +192,15 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
   - La línea del log da también el modo real de BAR1 (`BAR1_BLOCK`), cómo lo
     trata el RM y una muestra de la consola leída por la base de BAR1 y en
     VRAM 0.
+- PR 4e: la LUT se repara desde una referencia, no desde lo que lee la CPU.
+  - Con 4d la pantalla pasó de negra a blanca. La reparación copiaba a VRAM lo
+    que la CPU leía de su mapeo BAR1. Una dirección de BAR1 sin nada detrás se
+    lee como `0xffffffff`, y una LUT así lleva cada píxel al máximo.
+  - Ahora `eclipse_kms_default_lut` genera la LUT correcta en memoria del
+    kernel con el propio `InitDefaultLut` de nvkms, apuntado a ese buffer para
+    una llamada. La VRAM se compara con ese buffer y se repara desde él. Lo que
+    lee la CPU solo se cuenta: cuántas palabras lee bien y cuántas como
+    `0xffffffff`, para el siguiente arreglo, que es el mapeo BAR1 en sí.
 - Objetivo: **paridad** con la escalera actual en una sola tarjeta (escritorio,
   cursor, flips sin tearing) con `nvidia.wlr_vulkan`/`wlr_gles2`/`wlr_pixman`.
 
