@@ -1792,8 +1792,19 @@ fn schedule_deferred_console_bringup(
             kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(500)).await;
         }
         if asked {
+            // The read arrives when init reaches the session, which is when
+            // labwc would have started -- about 4 s EARLIER than the bring-up
+            // started in the one recipe that has finished with both cards up
+            // (labwc at 6.9 s, KD_GRAPHICS at 7.3 s, the 3 s window below,
+            // STARTCPU back in 2.3 s at 10.7 s). Starting on the read itself
+            // put STARTCPU at 6.9 s, and on a dual-2060 box it never came back
+            // there, every boot: the same early hour #2186 reached by another
+            // route (see the window below). So the read wakes the task, but
+            // the bring-up keeps the hour that works. Init is waiting on
+            // `/proc/gpuready` meanwhile, so these seconds cost no frames.
+            kernel_hal::thread::sleep_until(timer_now() + Duration::from_secs(4)).await;
             kernel_hal::klog_info!(
-                "Eclipse: {} — userspace pregunto por /proc/gpuready; bring-up consola ya (scanout pausado)",
+                "Eclipse: {} — userspace pregunto por /proc/gpuready; bring-up consola a la hora de siempre (scanout pausado)",
                 reason
             );
         } else if saw_graphics {
