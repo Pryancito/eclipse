@@ -2039,6 +2039,18 @@ extern "C" {
         out: *mut GemAlloc,
     ) -> NV_STATUS;
     fn eclipse_rm_gem_free(device_instance: NvU32, ctx_idx: NvU32, h_memory: NvU32) -> NV_STATUS;
+    fn eclipse_rm_gem_client(
+        device_instance: NvU32,
+        ctx_idx: NvU32,
+        h_client: *mut NvU32,
+    ) -> NV_STATUS;
+    fn eclipse_rm_write_memory(
+        h_client: NvU32,
+        h_memory: NvU32,
+        offset: u64,
+        src: *const u8,
+        len: u64,
+    ) -> NV_STATUS;
 }
 
 /// Backing store for the nouveau-uAPI `GEM_NEW`, in one of the two domains
@@ -2156,6 +2168,31 @@ pub fn chan_notifier_pa(device_instance: u32) -> Result<u64, NV_STATUS> {
 pub fn gem_free(device_instance: u32, ctx_idx: u32, h_memory: u32) -> NV_STATUS {
     let _gate = RmGate::lock();
     unsafe { eclipse_rm_gem_free(device_instance, ctx_idx, h_memory) }
+}
+
+/// The RM client a GEM of context `ctx_idx` lives in -- the client a kernel
+/// client names as the source when it dups that GEM into its own (nvkms
+/// flipping to it). `None` before the context tables exist.
+pub fn gem_client(device_instance: u32, ctx_idx: u32) -> Option<u32> {
+    let mut h_client = 0;
+    let status = unsafe { eclipse_rm_gem_client(device_instance, ctx_idx, &mut h_client) };
+    (status == NV_OK && h_client != 0).then_some(h_client)
+}
+
+/// Write `bytes` at `offset` into the memory object `h_memory` of the RM
+/// client `h_client`, through the RM's BAR1 transfer. For a kernel client's
+/// small surface that keeps no CPU mapping (nvkms's cursor image).
+pub fn write_memory(h_client: u32, h_memory: u32, offset: u64, bytes: &[u8]) -> NV_STATUS {
+    let _gate = RmGate::lock();
+    unsafe {
+        eclipse_rm_write_memory(
+            h_client,
+            h_memory,
+            offset,
+            bytes.as_ptr(),
+            bytes.len() as u64,
+        )
+    }
 }
 
 /// Mirror of `EclipseGemMapCpu` (vendor/eclipse_rm_init.c).

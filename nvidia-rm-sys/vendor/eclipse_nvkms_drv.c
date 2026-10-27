@@ -317,13 +317,54 @@ int eclipse_kms_mode(struct NvKmsKapiDevice *device, NvU32 display, NvU32 index,
     return more;
 }
 
-/* The firmware console as a kapi surface, and the memory under it. */
-struct EclipseKmsConsole {
+/*
+ * A kapi surface and the memory under it: the firmware console, or a GEM
+ * the compositor flips to (nvidia-drm's nv_drm_framebuffer, which holds the
+ * same pair).
+ */
+struct EclipseKmsSurface {
     struct NvKmsKapiMemory *memory;
     struct NvKmsKapiSurface *surface;
     NvU32 width;
     NvU32 height;
 };
+
+/*
+ * A surface on `memory`, pitch-linear. Takes `memory`: on failure it is
+ * freed.
+ */
+static struct EclipseKmsSurface *eclipse_kms_wrap(struct NvKmsKapiDevice *device,
+                                                  struct NvKmsKapiMemory *memory,
+                                                  NvU32 width, NvU32 height,
+                                                  NvU32 pitch,
+                                                  enum NvKmsSurfaceMemoryFormat format)
+{
+    struct NvKmsKapiCreateSurfaceParams params = { };
+    struct EclipseKmsSurface *s = nvKmsKapiCalloc(1, sizeof(*s));
+
+    if (s == NULL) {
+        g_nvKms.freeMemory(device, memory);
+        return NULL;
+    }
+    params.planes[0].memory = memory;
+    params.planes[0].offset = 0;
+    params.planes[0].pitch = pitch;
+    params.width = width;
+    params.height = height;
+    params.format = format;
+    s->surface = g_nvKms.createSurface(device, &params);
+    if (s->surface == NULL) {
+        eclipse_kms_logf(NVKMS_LOG_LEVEL_ERROR,
+                         "createSurface refused %ux%u pitch %u", width, height, pitch);
+        g_nvKms.freeMemory(device, memory);
+        nvKmsKapiFree(s);
+        return NULL;
+    }
+    s->memory = memory;
+    s->width = width;
+    s->height = height;
+    return s;
+}
 
 /*
  * The console memory the firmware left scanning out, as a kapi memory object
@@ -337,13 +378,11 @@ struct EclipseKmsConsole {
  * RM client and wrapped the way ImportMemory wraps an imported one. kapi's
  * freeMemory frees it like any other.
  */
-struct EclipseKmsConsole *eclipse_kms_console_surface(struct NvKmsKapiDevice *device,
+struct EclipseKmsSurface *eclipse_kms_console_surface(struct NvKmsKapiDevice *device,
                                                       NvU32 width, NvU32 height,
                                                       NvU32 pitch, NvU32 depth)
 {
-    struct NvKmsKapiCreateSurfaceParams params = { };
-    struct EclipseKmsConsole *console = NULL;
-    struct NvKmsKapiMemory *memory = NULL;
+    struct NvKmsKapiMemory *memory;
     enum NvKmsSurfaceMemoryFormat format;
     NvU32 hMemory, ret;
 
@@ -367,21 +406,22 @@ struct EclipseKmsConsole *eclipse_kms_console_surface(struct NvKmsKapiDevice *de
         return NULL;
     }
 
-    console = nvKmsKapiCalloc(1, sizeof(*console));
     memory = nvKmsKapiCalloc(1, sizeof(*memory));
-    if (console == NULL || memory == NULL)
-        goto failed;
-
+    if (memory == NULL)
+        return NULL;
     hMemory = nvKmsKapiGenerateRmHandle(device);
-    if (hMemory == 0)
-        goto failed;
+    if (hMemory == 0) {
+        nvKmsKapiFree(memory);
+        return NULL;
+    }
     ret = nvRmApiAlloc(device->hRmClient, device->hRmDevice, hMemory,
                        NV01_MEMORY_FRAMEBUFFER_CONSOLE, NULL);
     if (ret != NVOS_STATUS_SUCCESS) {
         eclipse_kms_logf(NVKMS_LOG_LEVEL_ERROR,
                          "NV01_MEMORY_FRAMEBUFFER_CONSOLE refused (0x%x)", ret);
         nvKmsKapiFreeRmHandle(device, hMemory);
-        goto failed;
+        nvKmsKapiFree(memory);
+        return NULL;
     }
     memory->hRmHandle = hMemory;
     memory->size = (NvU64)pitch * height;
@@ -389,41 +429,65 @@ struct EclipseKmsConsole *eclipse_kms_console_surface(struct NvKmsKapiDevice *de
     memory->isVidmem = NV_TRUE;
     /* The CPU keeps drawing into it while it is on screen. */
     memory->noDisplayCaching = NV_TRUE;
-
-    params.planes[0].memory = memory;
-    params.planes[0].offset = 0;
-    params.planes[0].pitch = pitch;
-    params.width = width;
-    params.height = height;
-    params.format = format;
-    console->surface = g_nvKms.createSurface(device, &params);
-    if (console->surface == NULL) {
-        eclipse_kms_logf(NVKMS_LOG_LEVEL_ERROR,
-                         "createSurface refused the console (%ux%u pitch %u)",
-                         width, height, pitch);
-        g_nvKms.freeMemory(device, memory);
-        nvKmsKapiFree(console);
-        return NULL;
-    }
-    console->memory = memory;
-    console->width = width;
-    console->height = height;
-    return console;
-
-failed:
-    nvKmsKapiFree(memory);
-    nvKmsKapiFree(console);
-    return NULL;
+    return eclipse_kms_wrap(device, memory, width, height, pitch, format);
 }
 
-void eclipse_kms_console_free(struct NvKmsKapiDevice *device,
-                              struct EclipseKmsConsole *console)
+/*
+ * A compositor's VRAM GEM as a surface nvkms can flip to: XRGB8888,
+ * pitch-linear, the only kind the driver's ADDFB makes.
+ *
+ * nvidia-drm gets here through importMemory, which takes the GEM from the
+ * RM client of nvidia.ko's fd (NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD).
+ * Eclipse has no such fd: the GEM is a handle in the RM client of the
+ * context that allocated it, so it is duped into kapi's client instead --
+ * the same NvRmDupObject the fd import ends in -- and wrapped the way
+ * ImportMemory wraps what it imported.
+ */
+struct EclipseKmsSurface *eclipse_kms_import_surface(struct NvKmsKapiDevice *device,
+                                                     NvU32 hSrcClient, NvU32 hSrcMemory,
+                                                     NvU64 size, NvU32 width,
+                                                     NvU32 height, NvU32 pitch)
 {
-    if (device == NULL || console == NULL || !g_nvKmsValid)
+    struct NvKmsKapiMemory *memory;
+    NvU32 hMemory, ret;
+
+    if (device == NULL || !g_nvKmsValid || hSrcClient == 0 || hSrcMemory == 0 ||
+        width == 0 || height == 0 || (NvU64)pitch * height > size)
+        return NULL;
+
+    memory = nvKmsKapiCalloc(1, sizeof(*memory));
+    if (memory == NULL)
+        return NULL;
+    hMemory = nvKmsKapiGenerateRmHandle(device);
+    if (hMemory == 0) {
+        nvKmsKapiFree(memory);
+        return NULL;
+    }
+    ret = nvRmApiDupObject(device->hRmClient, device->hRmDevice, hMemory,
+                           hSrcClient, hSrcMemory, 0);
+    if (ret != NVOS_STATUS_SUCCESS) {
+        eclipse_kms_logf(NVKMS_LOG_LEVEL_ERROR,
+                         "dup of GEM 0x%x (client 0x%x) refused (0x%x)",
+                         hSrcMemory, hSrcClient, ret);
+        nvKmsKapiFreeRmHandle(device, hMemory);
+        nvKmsKapiFree(memory);
+        return NULL;
+    }
+    memory->hRmHandle = hMemory;
+    memory->size = size;
+    memory->surfaceParams.layout = NvKmsSurfaceMemoryLayoutPitch;
+    memory->isVidmem = NV_TRUE;
+    return eclipse_kms_wrap(device, memory, width, height, pitch,
+                            NvKmsSurfaceMemoryFormatX8R8G8B8);
+}
+
+void eclipse_kms_surface_free(struct NvKmsKapiDevice *device, struct EclipseKmsSurface *s)
+{
+    if (device == NULL || s == NULL || !g_nvKmsValid)
         return;
-    g_nvKms.destroySurface(device, console->surface);
-    g_nvKms.freeMemory(device, console->memory);
-    nvKmsKapiFree(console);
+    g_nvKms.destroySurface(device, s->surface);
+    g_nvKms.freeMemory(device, s->memory);
+    nvKmsKapiFree(s);
 }
 
 /* Mirrored by `KmsHeadSet` in src/nvkms.rs: one head lit by the modeset. */
@@ -433,7 +497,18 @@ struct EclipseKmsHeadSet {
     NvU32 modeIndex;
 };
 
-/* eclipse_kms_show_console's answers, mirrored by `ShowError`. */
+/*
+ * The device configuration nvkms is scanning out since the console modeset:
+ * nvidia-drm keeps it as the CRTC and plane states, and every flip is that
+ * configuration with one thing changed.
+ */
+struct EclipseKmsScanout {
+    struct NvKmsKapiRequestedModeSetConfig req;
+    NvU32 litMask;
+};
+
+/* The answers of eclipse_kms_show_console and eclipse_kms_flip, mirrored by
+ * `ShowError`. */
 enum {
     ECLIPSE_KMS_SHOWN = 0,
     ECLIPSE_KMS_BAD_REQUEST = 1,
@@ -441,6 +516,7 @@ enum {
     ECLIPSE_KMS_MODE_GONE = 3,
     ECLIPSE_KMS_REFUSED = 4,
     ECLIPSE_KMS_COMMIT_FAILED = 5,
+    ECLIPSE_KMS_FLIP_PENDING = 6,
 };
 
 /* nvidia-drm's plane_config_clear. */
@@ -450,6 +526,49 @@ static void eclipse_kms_layer_clear(struct NvKmsKapiLayerConfig *config)
     config->csc = NVKMS_IDENTITY_CSC_MATRIX;
 }
 
+/* plane_req_config_update for a primary plane showing `s` at the top left,
+ * unscaled and vsynced, cropped to the mode. */
+static void eclipse_kms_primary(struct NvKmsKapiHeadRequestedConfig *h,
+                                const struct EclipseKmsSurface *s)
+{
+    struct NvKmsKapiLayerRequestedConfig *primary =
+        &h->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX];
+    NvU32 w = s->width, hgt = s->height;
+
+    if (w > h->modeSetConfig.mode.timings.hVisible)
+        w = h->modeSetConfig.mode.timings.hVisible;
+    if (hgt > h->modeSetConfig.mode.timings.vVisible)
+        hgt = h->modeSetConfig.mode.timings.vVisible;
+    primary->config.surface = s->surface;
+    primary->config.compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE;
+    primary->flags.srcWHChanged = primary->config.srcWidth != w ||
+                                  primary->config.srcHeight != hgt;
+    primary->flags.dstWHChanged = primary->flags.srcWHChanged;
+    primary->config.srcWidth = w;
+    primary->config.srcHeight = hgt;
+    primary->config.dstWidth = w;
+    primary->config.dstHeight = hgt;
+    primary->config.minPresentInterval = 1;
+    primary->flags.surfaceChanged = NV_TRUE;
+}
+
+/* After a commit: nothing has changed since. */
+static void eclipse_kms_settled(struct NvKmsKapiRequestedModeSetConfig *req)
+{
+    NvU32 head, layer;
+
+    for (head = 0; head < NVKMS_KAPI_MAX_HEADS; head++) {
+        struct NvKmsKapiHeadRequestedConfig *h = &req->headRequestedConfig[head];
+
+        nvkms_memset(&h->flags, 0, sizeof(h->flags));
+        nvkms_memset(&h->cursorRequestedConfig.flags, 0,
+                     sizeof(h->cursorRequestedConfig.flags));
+        for (layer = 0; layer < NVKMS_KAPI_LAYER_MAX; layer++)
+            nvkms_memset(&h->layerRequestedConfig[layer].flags, 0,
+                         sizeof(h->layerRequestedConfig[layer].flags));
+    }
+}
+
 /*
  * The first modeset: each head in `sets` lights its display at its mode with
  * the console as the primary layer, unscaled, and every other head of the
@@ -457,27 +576,34 @@ static void eclipse_kms_layer_clear(struct NvKmsKapiLayerConfig *config)
  * CRTC. Validated first (commit = false, as atomic_check does), then
  * committed. Takes modeset ownership, as nvidia-drm does when a DRM master
  * appears, and gives it back if the modeset does not happen.
+ *
+ * On success *out is the configuration now on screen, for the flips.
  */
 int eclipse_kms_show_console(struct NvKmsKapiDevice *device,
-                             const struct EclipseKmsConsole *console,
+                             const struct EclipseKmsSurface *console,
                              const struct EclipseKmsHeadSet *sets, NvU32 numSets,
-                             NvU32 numHeads)
+                             NvU32 numHeads, struct EclipseKmsScanout **out)
 {
-    struct NvKmsKapiRequestedModeSetConfig *req = NULL;
+    struct EclipseKmsScanout *scanout = NULL;
+    struct NvKmsKapiRequestedModeSetConfig *req;
     struct NvKmsKapiModeSetReplyConfig *reply = NULL;
     int result = ECLIPSE_KMS_BAD_REQUEST;
     NvBool owned = NV_FALSE;
     NvU32 i, layer;
 
+    if (out != NULL)
+        *out = NULL;
     if (device == NULL || console == NULL || sets == NULL || numSets == 0 ||
-        !g_nvKmsValid || numHeads == 0 || numHeads > NVKMS_KAPI_MAX_HEADS)
+        out == NULL || !g_nvKmsValid || numHeads == 0 ||
+        numHeads > NVKMS_KAPI_MAX_HEADS)
         return ECLIPSE_KMS_BAD_REQUEST;
 
     /* Both are tens of kilobytes. */
-    req = nvkms_alloc(sizeof(*req), NV_TRUE);
+    scanout = nvkms_alloc(sizeof(*scanout), NV_TRUE);
     reply = nvkms_alloc(sizeof(*reply), NV_TRUE);
-    if (req == NULL || reply == NULL)
+    if (scanout == NULL || reply == NULL)
         goto done;
+    req = &scanout->req;
 
     /* nv_drm_crtc_state_alloc, for every head. */
     req->headsMask = (numHeads == 32) ? 0xffffffffu : ((1u << numHeads) - 1);
@@ -515,22 +641,14 @@ int eclipse_kms_show_console(struct NvKmsKapiDevice *device,
         h->modeSetConfig.displays[0] = set->display;
         h->flags.modeChanged = NV_TRUE;
 
-        /* plane_req_config_update for a primary plane showing the whole
-         * console at the top left, vsynced. */
+        eclipse_kms_primary(h, console);
         primary = &h->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX];
-        primary->config.surface = console->surface;
-        primary->config.compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE;
-        primary->config.srcWidth = console->width;
-        primary->config.srcHeight = console->height;
-        primary->config.dstWidth = console->width;
-        primary->config.dstHeight = console->height;
-        primary->config.minPresentInterval = 1;
-        primary->flags.surfaceChanged = NV_TRUE;
         primary->flags.srcXYChanged = NV_TRUE;
         primary->flags.srcWHChanged = NV_TRUE;
         primary->flags.dstXYChanged = NV_TRUE;
         primary->flags.dstWHChanged = NV_TRUE;
         primary->flags.cscChanged = NV_TRUE;
+        scanout->litMask |= 1u << set->head;
     }
 
     if (!g_nvKms.grabOwnership(device)) {
@@ -548,6 +666,9 @@ int eclipse_kms_show_console(struct NvKmsKapiDevice *device,
         result = ECLIPSE_KMS_COMMIT_FAILED;
         goto done;
     }
+    eclipse_kms_settled(req);
+    *out = scanout;
+    scanout = NULL;
     result = ECLIPSE_KMS_SHOWN;
 
 done:
@@ -555,7 +676,182 @@ done:
         g_nvKms.releaseOwnership(device);
     if (reply != NULL)
         nvkms_free(reply, sizeof(*reply));
-    if (req != NULL)
-        nvkms_free(req, sizeof(*req));
+    if (scanout != NULL)
+        nvkms_free(scanout, sizeof(*scanout));
+    return result;
+}
+
+/*
+ * Flip every lit head to `s`: the configuration on screen with only the
+ * primary layer's surface changed, which kapi turns into NVKMS_IOCTL_FLIP.
+ * The flip lands at the next vblank and this returns once it is queued.
+ *
+ * Like nvidia-drm, which waits for a CRTC's previous flip before committing
+ * the next one, a flip never goes in while one is still pending:
+ * ECLIPSE_KMS_FLIP_PENDING says so, and nothing was changed.
+ */
+int eclipse_kms_flip(struct NvKmsKapiDevice *device, struct EclipseKmsScanout *scanout,
+                     const struct EclipseKmsSurface *s)
+{
+    struct NvKmsKapiModeSetReplyConfig *reply;
+    struct NvKmsKapiRequestedModeSetConfig *req;
+    struct NvKmsKapiLayerConfig saved[NVKMS_KAPI_MAX_HEADS];
+    NvU32 head;
+    int result = ECLIPSE_KMS_SHOWN;
+
+    if (device == NULL || scanout == NULL || s == NULL || !g_nvKmsValid ||
+        scanout->litMask == 0)
+        return ECLIPSE_KMS_BAD_REQUEST;
+    req = &scanout->req;
+
+    for (head = 0; head < NVKMS_KAPI_MAX_HEADS; head++) {
+        NvBool pending = NV_FALSE;
+
+        if ((scanout->litMask & (1u << head)) == 0)
+            continue;
+        if (!g_nvKms.getFlipPendingStatus(device, head, NVKMS_KAPI_LAYER_PRIMARY_IDX,
+                                          &pending))
+            return ECLIPSE_KMS_REFUSED;
+        if (pending)
+            return ECLIPSE_KMS_FLIP_PENDING;
+    }
+
+    reply = nvkms_alloc(sizeof(*reply), NV_TRUE);
+    if (reply == NULL)
+        return ECLIPSE_KMS_BAD_REQUEST;
+    for (head = 0; head < NVKMS_KAPI_MAX_HEADS; head++) {
+        struct NvKmsKapiHeadRequestedConfig *h = &req->headRequestedConfig[head];
+
+        saved[head] = h->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX].config;
+        if (scanout->litMask & (1u << head))
+            eclipse_kms_primary(h, s);
+    }
+    if (!g_nvKms.applyModeSetConfig(device, req, reply, NV_TRUE)) {
+        /* What is on screen is still the old configuration. */
+        for (head = 0; head < NVKMS_KAPI_MAX_HEADS; head++)
+            req->headRequestedConfig[head]
+                .layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX].config = saved[head];
+        result = ECLIPSE_KMS_COMMIT_FAILED;
+    }
+    eclipse_kms_settled(req);
+    nvkms_free(reply, sizeof(*reply));
+    return result;
+}
+
+/* Whether a flip on any lit head has yet to land: 1 yes, 0 no, -1 unknown. */
+int eclipse_kms_flip_pending(struct NvKmsKapiDevice *device,
+                             const struct EclipseKmsScanout *scanout)
+{
+    NvU32 head;
+
+    if (device == NULL || scanout == NULL || !g_nvKmsValid)
+        return -1;
+    for (head = 0; head < NVKMS_KAPI_MAX_HEADS; head++) {
+        NvBool pending = NV_FALSE;
+
+        if ((scanout->litMask & (1u << head)) == 0)
+            continue;
+        if (!g_nvKms.getFlipPendingStatus(device, head, NVKMS_KAPI_LAYER_PRIMARY_IDX,
+                                          &pending))
+            return -1;
+        if (pending)
+            return 1;
+    }
+    return 0;
+}
+
+/* The cursor image is ECLIPSE_KMS_CURSOR x ECLIPSE_KMS_CURSOR, the size the
+ * driver advertises (DRM_CAP_CURSOR_WIDTH/HEIGHT); nvkms takes square
+ * power-of-two cursors. */
+#define ECLIPSE_KMS_CURSOR 64
+
+/*
+ * The cursor plane's surface: A8R8G8B8 in video memory, from kapi's own
+ * allocateMemory, as nvidia-drm's cursor framebuffers are. The image is
+ * written through the RM (eclipse_rm_write_memory), so the handles it lives
+ * under come back in *phClient / *phMemory.
+ */
+struct EclipseKmsSurface *eclipse_kms_cursor_surface(struct NvKmsKapiDevice *device,
+                                                     NvU32 *phClient, NvU32 *phMemory)
+{
+    struct NvKmsKapiAllocateMemoryParams params = { };
+    struct EclipseKmsSurface *s;
+    struct NvKmsKapiMemory *memory;
+    NvU8 compressible = 0;
+
+    if (device == NULL || phClient == NULL || phMemory == NULL || !g_nvKmsValid)
+        return NULL;
+    params.layout = NvKmsSurfaceMemoryLayoutPitch;
+    params.type = NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT;
+    params.size = ECLIPSE_KMS_CURSOR * ECLIPSE_KMS_CURSOR * 4;
+    params.useVideoMemory = NV_TRUE;
+    params.compressible = &compressible;
+    memory = g_nvKms.allocateMemory(device, &params);
+    if (memory == NULL) {
+        eclipse_kms_logf(NVKMS_LOG_LEVEL_ERROR, "cursor allocateMemory refused");
+        return NULL;
+    }
+    *phClient = device->hRmClient;
+    *phMemory = memory->hRmHandle;
+    s = eclipse_kms_wrap(device, memory, ECLIPSE_KMS_CURSOR, ECLIPSE_KMS_CURSOR,
+                         ECLIPSE_KMS_CURSOR * 4, NvKmsSurfaceMemoryFormatA8R8G8B8);
+    if (s == NULL) {
+        *phClient = 0;
+        *phMemory = 0;
+    }
+    return s;
+}
+
+/*
+ * The cursor plane on every lit head: `s` at (x, y), premultiplied (DRM's
+ * cursor plane, nvidia-drm's cursor default composition), or off for a NULL
+ * `s`. A cursor-only flip: nvkms moves the cursor through its immediate
+ * channel and never waits on the primary layer's pending flip.
+ */
+int eclipse_kms_cursor(struct NvKmsKapiDevice *device, struct EclipseKmsScanout *scanout,
+                       const struct EclipseKmsSurface *s, NvS32 x, NvS32 y,
+                       NvBool surfaceChanged)
+{
+    struct NvKmsKapiModeSetReplyConfig *reply;
+    struct NvKmsKapiRequestedModeSetConfig *req;
+    NvU32 head;
+    int result = ECLIPSE_KMS_SHOWN;
+
+    if (device == NULL || scanout == NULL || !g_nvKmsValid || scanout->litMask == 0)
+        return ECLIPSE_KMS_BAD_REQUEST;
+    req = &scanout->req;
+
+    /* The plane is 16-bit signed. */
+    if (x < -32768)
+        x = -32768;
+    if (x > 32767)
+        x = 32767;
+    if (y < -32768)
+        y = -32768;
+    if (y > 32767)
+        y = 32767;
+
+    reply = nvkms_alloc(sizeof(*reply), NV_TRUE);
+    if (reply == NULL)
+        return ECLIPSE_KMS_BAD_REQUEST;
+    for (head = 0; head < NVKMS_KAPI_MAX_HEADS; head++) {
+        struct NvKmsKapiCursorRequestedConfig *c =
+            &req->headRequestedConfig[head].cursorRequestedConfig;
+
+        if ((scanout->litMask & (1u << head)) == 0)
+            continue;
+        if (surfaceChanged || c->surface != (s != NULL ? s->surface : NULL)) {
+            c->surface = s != NULL ? s->surface : NULL;
+            c->compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_PREMULT_ALPHA;
+            c->flags.surfaceChanged = NV_TRUE;
+        }
+        c->dstX = (NvS16)x;
+        c->dstY = (NvS16)y;
+        c->flags.dstXYChanged = NV_TRUE;
+    }
+    if (!g_nvKms.applyModeSetConfig(device, req, reply, NV_TRUE))
+        result = ECLIPSE_KMS_COMMIT_FAILED;
+    eclipse_kms_settled(req);
+    nvkms_free(reply, sizeof(*reply));
     return result;
 }

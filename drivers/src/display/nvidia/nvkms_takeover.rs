@@ -8,6 +8,12 @@
 //! monitor to a mode of the console's size, so the screen shows the same
 //! pixels, now scanned out by nvkms instead of by what the firmware left.
 //!
+//! From then on the compositor's VRAM framebuffers are flipped to through
+//! kapi, and the pointer is nvkms's cursor plane, as with nvidia-drm. A frame
+//! nvkms cannot flip to (a sysmem or PRIME buffer) is copied into the console
+//! by the CPU or the copy engine as before, with the console put back on
+//! screen first.
+//!
 //! nvkms and this driver's own display ladder (the NVC57E surface flip and
 //! the NVC57A cursor) cannot share a card, because both allocate its core
 //! channel. Whichever comes first keeps it: nvkms claims both ladder states
@@ -15,23 +21,99 @@
 //!
 //! Own file for the size ceiling of `nvidia.rs`.
 
-use super::NvidiaGpu;
+use super::{NvidiaGpu, NvidiaKmsFramebuffer};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, Ordering};
-use nvidia_rm_sys::nvkms::{self, KmsConsole, KmsDevice, KmsInfo};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use nvidia_rm_sys::nvkms::{self, KmsDevice, KmsInfo, KmsScanout, KmsSurface, ShowError};
 use nvidia_rm_sys::nvkms_os;
 
 /// What nvkms holds of one card, for the rest of the boot: nvkms has its core
 /// channel, so nothing hands the card back.
 pub(super) struct NvkmsCard {
-    #[allow(dead_code)] // kept for the flips and the cursor of the next step
     device: KmsDevice,
-    /// The firmware console as nvkms's primary surface, on the card that
-    /// scans it out, once the console modeset is done.
-    #[allow(dead_code)]
-    console: Option<KmsConsole>,
+    /// What nvkms scans out, on the card that had the firmware console, once
+    /// the console modeset is done.
+    scanout: Option<Scanout>,
+}
+
+/// One card's screen since the console modeset: nvidia-drm's CRTC, plane and
+/// framebuffer state, reduced to one picture cloned on every lit head.
+struct Scanout {
+    state: KmsScanout,
+    console: KmsSurface,
+    /// The surfaces made for the compositor's framebuffers, by fb id. `None`
+    /// for one nvkms refused, so it is not asked again.
+    fbs: Vec<(u32, Option<KmsSurface>)>,
+    /// The fb on screen; 0 for the console.
+    on_screen: u32,
+    cursor: Option<Cursor>,
+}
+
+/// The cursor plane's surface, and where the pointer is.
+struct Cursor {
+    surface: KmsSurface,
+    h_client: u32,
+    h_memory: u32,
+    x: i32,
+    y: i32,
+    visible: bool,
+}
+
+/// How long a flip waits for the previous one to land: three frames at
+/// 60 Hz. A flip past it loses its frame, as `surfaceflip_drain` does.
+const FLIP_WAIT_US: u64 = 50_000;
+
+fn now_us() -> u64 {
+    unsafe { crate::bus::drivers_timer_now_as_micros() }
+}
+
+impl Scanout {
+    fn surface_of(&self, fb_id: u32) -> Option<&KmsSurface> {
+        if fb_id == 0 {
+            return Some(&self.console);
+        }
+        self.fbs
+            .iter()
+            .find(|(id, _)| *id == fb_id)
+            .and_then(|(_, s)| s.as_ref())
+    }
+
+    /// Put fb `fb_id` (0: the console) on every lit head at the next vblank,
+    /// waiting up to [`FLIP_WAIT_US`] for the previous flip to land first.
+    fn flip_to(&mut self, device: &KmsDevice, fb_id: u32) -> Result<(), ShowError> {
+        if self.on_screen == fb_id {
+            return Ok(());
+        }
+        let surface = self.surface_of(fb_id).ok_or(ShowError::BadRequest)?;
+        let start = now_us();
+        let result = loop {
+            match device.flip(&self.state, surface) {
+                Err(ShowError::FlipPending) if now_us().wrapping_sub(start) < FLIP_WAIT_US => {
+                    core::hint::spin_loop()
+                }
+                r => break r,
+            }
+        };
+        if result.is_ok() {
+            self.on_screen = fb_id;
+        }
+        result
+    }
+
+    /// Wait, up to [`FLIP_WAIT_US`], for the last flip to land: until then
+    /// the surface it flipped away from is still being read.
+    fn wait_landed(&self, device: &KmsDevice) -> bool {
+        let start = now_us();
+        while device.flip_pending(&self.state) == Some(true) {
+            if now_us().wrapping_sub(start) >= FLIP_WAIT_US {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        true
+    }
 }
 
 /// The value of `surfaceflip_state` and `hwcur_state` while nvkms owns the
@@ -70,6 +152,18 @@ pub(super) fn console_depth(width: u32, pitch: u32) -> u32 {
     }
 }
 
+static FIRST_FLIP: AtomicBool = AtomicBool::new(false);
+static FLIP_FAILED: AtomicBool = AtomicBool::new(false);
+static CONSOLE_BACK_FAILED: AtomicBool = AtomicBool::new(false);
+static CURSOR_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// One `[nvkms]` line per boot for a per-frame event.
+fn log_once(latch: &AtomicBool, line: impl FnOnce() -> String) {
+    if !latch.swap(true, Ordering::Relaxed) {
+        crate::klog_info!("[nvkms] {}", line());
+    }
+}
+
 impl NvidiaGpu {
     fn bdf_tag(&self) -> String {
         format!(
@@ -78,9 +172,12 @@ impl NvidiaGpu {
         )
     }
 
-    /// Whether nvkms holds this card's display.
+    /// Whether nvkms holds this card's display. Never waits: the card is only
+    /// ever busy (a flip, a cursor update) once nvkms holds it.
     pub(super) fn nvkms_owns_display(&self) -> bool {
-        self.nvkms_device.lock().is_some()
+        self.nvkms_device
+            .try_lock()
+            .is_none_or(|card| card.is_some())
     }
 
     /// Load nvkms (once per boot) and give it this GPU. One line per fact,
@@ -145,7 +242,7 @@ impl NvidiaGpu {
             }
             None => lines.push(format!("{}: no se pudo consultar el dispositivo", tag)),
         }
-        let console = match info {
+        let scanout = match info {
             Some(info) if self.drives_boot_display() => {
                 self.show_console(&device, &info, &tag, &mut lines)
             }
@@ -160,7 +257,7 @@ impl NvidiaGpu {
                 None
             }
         };
-        *self.nvkms_device.lock() = Some(NvkmsCard { device, console });
+        *self.nvkms_device.lock() = Some(NvkmsCard { device, scanout });
         lines
     }
 
@@ -173,7 +270,7 @@ impl NvidiaGpu {
         info: &KmsInfo,
         tag: &str,
         lines: &mut Vec<String>,
-    ) -> Option<KmsConsole> {
+    ) -> Option<Scanout> {
         let Some(fb) = *super::BOOT_FB_INFO.lock() else {
             lines.push(format!("{}: sin geometria de la consola de arranque", tag));
             return None;
@@ -206,14 +303,20 @@ impl NvidiaGpu {
             return None;
         };
         match device.show_console(&console, &sets, info.num_heads) {
-            Ok(()) => {
+            Ok(state) => {
                 for set in &sets {
                     lines.push(format!(
                         "{}: modeset hecho: pantalla {:#x} en la cabeza {} a {}x{}, escaneando la consola",
                         tag, set.display, set.head, fb.width, fb.height
                     ));
                 }
-                Some(console)
+                Some(Scanout {
+                    state,
+                    console,
+                    fbs: Vec::new(),
+                    on_screen: 0,
+                    cursor: None,
+                })
             }
             Err(e) => {
                 lines.push(format!(
@@ -221,10 +324,237 @@ impl NvidiaGpu {
                     tag,
                     e.describe()
                 ));
-                device.free_console(console);
+                device.free_surface(console);
                 None
             }
         }
+    }
+
+    /// `page_flip` through nvkms: `None` when nvkms does not scan out this
+    /// card, or cannot flip to `fb` (not in VRAM, or refused) -- then the
+    /// console is put back on screen for the CPU or CE copy that takes the
+    /// frame instead.
+    pub(super) fn nvkms_page_flip(&self, fb: &NvidiaKmsFramebuffer) -> Option<bool> {
+        let mut guard = self.nvkms_device.lock();
+        let card = guard.as_mut()?;
+        let device = &card.device;
+        let scanout = card.scanout.as_mut()?;
+        let in_vram = fb.h_memory != 0 && fb.vram_offset.is_some();
+        if !in_vram || !self.nvkms_import(device, scanout, fb) {
+            if scanout.flip_to(device, 0).is_err() {
+                log_once(&CONSOLE_BACK_FAILED, || {
+                    format!("{}: no se pudo volver a la consola", self.bdf_tag())
+                });
+            }
+            return None;
+        }
+        match scanout.flip_to(device, fb.id) {
+            Ok(()) => {
+                let mut kms = self.kms_state.lock();
+                kms.crtc_fb = fb.id;
+                kms.plane_fb = fb.id;
+                kms.last_vblank_us = now_us();
+                drop(kms);
+                log_once(&FIRST_FLIP, || {
+                    format!(
+                        "{}: primer flip de nvkms: fb {} {}x{} pitch {}",
+                        self.bdf_tag(),
+                        fb.id,
+                        fb.width,
+                        fb.height,
+                        fb.pitch
+                    )
+                });
+                Some(true)
+            }
+            Err(e) => {
+                log_once(&FLIP_FAILED, || {
+                    format!(
+                        "{}: flip de nvkms fallido (fb {}): {}",
+                        self.bdf_tag(),
+                        fb.id,
+                        e.describe()
+                    )
+                });
+                Some(false)
+            }
+        }
+    }
+
+    /// Make sure `fb` has its nvkms surface: its GEM duped into kapi's RM
+    /// client. Whether it has one.
+    fn nvkms_import(
+        &self,
+        device: &KmsDevice,
+        scanout: &mut Scanout,
+        fb: &NvidiaKmsFramebuffer,
+    ) -> bool {
+        if let Some((_, surface)) = scanout.fbs.iter().find(|(id, _)| *id == fb.id) {
+            return surface.is_some();
+        }
+        let dev = *self.rm_device_instance.lock();
+        let owner_ctx = self
+            .nouveau_gem
+            .lock()
+            .iter()
+            .find(|o| o.handle == fb.handle_id)
+            .map(|o| o.owner_ctx);
+        let surface = dev
+            .zip(owner_ctx)
+            .and_then(|(dev, ctx)| nvidia_rm_sys::rm_init::gem_client(dev, ctx))
+            .and_then(|h_client| {
+                device.import_surface(
+                    h_client,
+                    fb.h_memory,
+                    fb.size as u64,
+                    fb.width,
+                    fb.height,
+                    fb.pitch,
+                )
+            });
+        if surface.is_none() {
+            crate::klog_warn!(
+                "[nvkms] {}: nvkms no acepta el fb {} ({}x{} pitch {}, hMem {:#x}) como superficie; \
+                 ese fb se copia a la consola",
+                self.bdf_tag(),
+                fb.id,
+                fb.width,
+                fb.height,
+                fb.pitch,
+                fb.h_memory
+            );
+        }
+        let ok = surface.is_some();
+        scanout.fbs.push((fb.id, surface));
+        ok
+    }
+
+    /// The fbs in `ids` are gone: free their surfaces, after putting the
+    /// console back if one of them is on screen and letting that flip land.
+    pub(super) fn nvkms_forget_fbs(&self, ids: &[u32]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut guard = self.nvkms_device.lock();
+        let Some(card) = guard.as_mut() else {
+            return;
+        };
+        let device = &card.device;
+        let Some(scanout) = card.scanout.as_mut() else {
+            return;
+        };
+        if ids.contains(&scanout.on_screen)
+            && !(scanout.flip_to(device, 0).is_ok() && scanout.wait_landed(device))
+        {
+            // Still on screen: keep the surface (and the memory it holds a
+            // reference on) rather than have nvkms scan out freed VRAM.
+            crate::klog_warn!(
+                "[nvkms] {}: el fb {} sigue en pantalla; su superficie se queda",
+                self.bdf_tag(),
+                scanout.on_screen
+            );
+        }
+        let mut i = 0;
+        while i < scanout.fbs.len() {
+            let (id, _) = scanout.fbs[i];
+            if ids.contains(&id) && id != scanout.on_screen {
+                if let (_, Some(surface)) = scanout.fbs.swap_remove(i) {
+                    device.free_surface(surface);
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// `hw_cursor_set` on a card nvkms holds: the image into nvkms's cursor
+    /// plane, at the pointer's last position.
+    pub(super) fn nvkms_cursor_set(&self, argb: &[u32], w: u32, h: u32) -> bool {
+        let Some(image) = nvkms::cursor_image(argb, w, h) else {
+            return false;
+        };
+        let mut guard = self.nvkms_device.lock();
+        let Some(card) = guard.as_mut() else {
+            return false;
+        };
+        let device = &card.device;
+        let Some(scanout) = card.scanout.as_mut() else {
+            return false;
+        };
+        if scanout.cursor.is_none() {
+            let Some((surface, h_client, h_memory)) = device.cursor_surface() else {
+                log_once(&CURSOR_FAILED, || {
+                    format!(
+                        "{}: sin superficie para el cursor de nvkms; cursor software",
+                        self.bdf_tag()
+                    )
+                });
+                return false;
+            };
+            scanout.cursor = Some(Cursor {
+                surface,
+                h_client,
+                h_memory,
+                x: 0,
+                y: 0,
+                visible: false,
+            });
+        }
+        let Some(cursor) = scanout.cursor.as_mut() else {
+            return false;
+        };
+        if nvidia_rm_sys::rm_init::write_memory(cursor.h_client, cursor.h_memory, 0, &image) != 0 {
+            log_once(&CURSOR_FAILED, || {
+                format!(
+                    "{}: no se pudo escribir el cursor de nvkms; cursor software",
+                    self.bdf_tag()
+                )
+            });
+            return false;
+        }
+        let shown = device
+            .cursor(
+                &scanout.state,
+                Some(&cursor.surface),
+                cursor.x,
+                cursor.y,
+                true,
+            )
+            .is_ok();
+        cursor.visible = shown;
+        shown
+    }
+
+    /// `hw_cursor_move` on a card nvkms holds; `None` when it does not.
+    pub(super) fn nvkms_cursor_move(&self, x: i32, y: i32) -> Option<bool> {
+        let mut guard = self.nvkms_device.lock();
+        let card = guard.as_mut()?;
+        let scanout = card.scanout.as_mut()?;
+        let cursor = scanout.cursor.as_mut()?;
+        cursor.x = x;
+        cursor.y = y;
+        if !cursor.visible {
+            return Some(true);
+        }
+        Some(
+            card.device
+                .cursor(&scanout.state, Some(&cursor.surface), x, y, false)
+                .is_ok(),
+        )
+    }
+
+    /// `hw_cursor_hide` on a card nvkms holds; `None` when it does not.
+    pub(super) fn nvkms_cursor_hide(&self) -> Option<bool> {
+        let mut guard = self.nvkms_device.lock();
+        let card = guard.as_mut()?;
+        let scanout = card.scanout.as_mut()?;
+        let cursor = scanout.cursor.as_mut()?;
+        cursor.visible = false;
+        Some(
+            card.device
+                .cursor(&scanout.state, None, cursor.x, cursor.y, false)
+                .is_ok(),
+        )
     }
 
     /// Run nvkms's due timers, and say how many microseconds until the next
