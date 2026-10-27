@@ -9,7 +9,7 @@
 //! Through [`display_driver_pinned`] and not [`get_display_driver`], because
 //! the real pin comes off the bootloader's command line and `boot::cmdline()`
 //! is the empty string in a host test build. The split is the same one
-//! `parse_bdf_flag_in` already uses for the same reason.
+//! `kernel_hal::cmdline::pci_bdf` already uses for the same reason.
 
 use super::*;
 use crate::fs::devfs::kms_emu::{self, EmuGpu};

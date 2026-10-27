@@ -5010,15 +5010,17 @@ pub fn set_hw_cursor_enabled(v: bool) {
     HW_CURSOR.store(if v { 1 } else { 2 }, Ordering::Relaxed);
 }
 
-/// `true` when the display-engine hardware cursor is opted into.
-fn hw_cursor_wanted() -> bool {
+/// `true` when the display-engine hardware cursor is opted into. Also what
+/// `/sys/module/nvidia/parameters/hwcursor` reads.
+pub fn hw_cursor_wanted() -> bool {
     match HW_CURSOR.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         // Nobody called `set_hw_cursor_enabled`: fall back to the cmdline, so
         // the flag still works in a build whose boot path does not set it.
         _ => {
-            let yes = kernel_hal::boot::cmdline().contains("nvidia.hwcursor");
+            // A token, not `contains`: `nvidia.hwcursor=0` is off.
+            let yes = kernel_hal::cmdline::NvidiaParams::boot().hwcursor;
             HW_CURSOR.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
             yes
         }

@@ -255,7 +255,7 @@ impl MultiGpu {
 /// real line from the bootloader.
 #[cfg(any(feature = "linux", test))]
 fn multigpu_verdict(cmdline: &str, nvidia_cards: usize, scanout_cards: usize) -> MultiGpu {
-    let declared = kernel_hal::cmdline::flag(cmdline, "nvidia.multigpu");
+    let declared = kernel_hal::cmdline::NvidiaParams::parse(cmdline).multigpu;
     // No card scanning out means no card to bring up by default, whatever was
     // declared and however many cards there are: the question this answers is
     // about the card that holds the console.
@@ -862,6 +862,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 klog_info!("Eclipse: NVIDIA compute-GPU auto bring-up disabled (nvidia.noautoboot)");
                 false
             };
+            // The user-facing `nvidia.*` flags, read once and in one place
+            // (`kernel_hal::cmdline::NvidiaParams`, also behind
+            // `/sys/module/nvidia/parameters`).
+            let nv = kernel_hal::cmdline::NvidiaParams::parse(&options.cmdline);
             let cmdline_has = |token: &str| {
                 options
                     .cmdline
@@ -870,9 +874,9 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             };
             let ce_requested_by = if cmdline_has("nvidia.cepresent") {
                 Some("nvidia.cepresent")
-            } else if cmdline_has("nvidia.wlr_vulkan") {
+            } else if nv.wlr_vulkan {
                 Some("nvidia.wlr_vulkan")
-            } else if cmdline_has("nvidia.wlr_gles2") || cmdline_has("nvidia.nouveau_uapi") {
+            } else if nv.wlr_gles2 || nv.nouveau_uapi {
                 // GLES2/zink is the default session with nouveau_uapi; CE
                 // present avoids the CPU blit under that path.
                 Some("nvidia.nouveau_uapi (GPU compositor)")
@@ -892,7 +896,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // NOTE: do NOT auto-bring-up the CONSOLE GPU on the boot path.
             // Deferred bring-up is scheduled AFTER 100% (see
             // schedule_deferred_console_bringup) with scanout paused.
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.hwcursor") {
+            if nv.hwcursor {
                 linux_object::fs::devfs::drm::set_hw_cursor_enabled(true);
                 klog_info!(
                     "Eclipse: nvidia.hwcursor ON — bring-up diferido tras escritorio \
@@ -909,7 +913,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // auto-on with nouveau_uapi (GPU compositor default) unless
             // `nvidia.nohwflip`. Pair with CE present / dual-GPU bring-up.
             if cmdline_has("nvidia.hwflip")
-                || (cmdline_has("nvidia.nouveau_uapi") && !cmdline_has("nvidia.nohwflip"))
+                || (nv.nouveau_uapi && !cmdline_has("nvidia.nohwflip"))
             {
                 kernel_hal::drivers::set_hwflip_enabled(true);
                 klog_info!(
@@ -919,7 +923,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // NVC57E ISO surfaceflip: auto with nouveau_uapi (scanout from
             // VRAM without CPU blit) unless `nvidia.nosurfaceflip`.
             if cmdline_has("nvidia.surfaceflip")
-                || (cmdline_has("nvidia.nouveau_uapi") && !cmdline_has("nvidia.nosurfaceflip"))
+                || (nv.nouveau_uapi && !cmdline_has("nvidia.nosurfaceflip"))
             {
                 kernel_hal::drivers::set_surfaceflip_enabled(true);
                 klog_info!(
@@ -1101,7 +1105,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     "Eclipse: nvidia.compositor_ctx0 -- el compositor se queda en el contexto 0 (cliente del RM compartido; no saldra en la tabla de procesos de nvidia-smi)"
                 );
             }
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nouveau_uapi") {
+            if nv.nouveau_uapi {
                 let capable = kernel_hal::drivers::all_drm()
                     .as_vec()
                     .iter()
@@ -1182,7 +1186,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // `nvidia.cuda` turns on every hatch below that CUDA needs, in
             // one go; each one still works by its own name, and its own
             // `=0` keeps it off under the umbrella.
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.cuda") {
+            if nv.cuda {
                 klog_info!("Eclipse: nvidia.cuda -- nvidia.nvidiactl and nvidia.uvm");
             }
             // The device files NVIDIA's own user-mode driver opens
@@ -1333,7 +1337,7 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 );
             }
             linux_object::fs::devfs::drm::set_console_bringup_expected(want_console_gpu);
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.hwcursor") || want_console_gpu {
+            if nv.hwcursor || want_console_gpu {
                 let reason = if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu") {
                     "nvidia.console_gpu"
                 } else if want_console_gpu {
