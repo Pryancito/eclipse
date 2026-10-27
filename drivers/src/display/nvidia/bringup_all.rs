@@ -22,6 +22,8 @@
 //!   with a live raster.
 //! * [`preserve_bar1_console`] -- keep that console mapped at the base of BAR1
 //!   when the state load makes BAR1 virtual, as Linux does for efifb.
+//! * [`recover_bar1`] -- rebind a BAR1 that took an MMU fault, as the RM's
+//!   interrupt handler does on Linux.
 //!
 //! What does not survive is any question of the form "is this the console
 //! card, so do something else instead".
@@ -88,6 +90,18 @@ pub(super) fn preserve_bar1_console(gpu: &NvidiaGpu, device_instance: u32) -> Op
             ),
         },
     )
+}
+
+/// Look for a BAR1 fault the MMU latched and rebind BAR1 if there is one, as
+/// the RM's interrupt handler does on Linux (Eclipse services no GPU
+/// interrupts, so nothing else ever will). `Some(line)` names the faulting
+/// address when one was found; `None` when BAR1 was healthy or the RM could
+/// not be asked.
+pub(super) fn recover_bar1(device_instance: u32, tag: &str) -> Option<String> {
+    match nvidia_rm_sys::rm_init::bar1_recover(device_instance) {
+        Ok(fault) if fault.faulted() => Some(fault.describe(tag)),
+        _ => None,
+    }
 }
 
 /// The two numbers `mark_primary_for_rm` sends: how many bytes of console the

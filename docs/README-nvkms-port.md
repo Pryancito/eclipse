@@ -225,6 +225,14 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
     LUT dice ahora la primera palabra que lee la CPU y si es ese centinela.
     Con `nvidia.wlr_pixman` (sin nouveau_uapi) el escritorio ya sale por
     nvkms en hardware.
+  - Con ese mapeo la tarjeta de consola sigue igual: el SELFTEST que pasó fue
+    el de la otra tarjeta, y en la de consola el USERD se sigue leyendo como
+    `0xBAD0ACxx` en cuanto termina su bring-up. `eclipse_rm_bar1_recover` hace
+    la rama de fallos de BAR de `kgmmuServicePriFaults_GV100`: si la MMU tiene
+    un fallo latcheado (o uno de BAR descartado detrás), rebindea BAR1, lo
+    limpia y deja en el dmesg el estado, la dirección, el bloque de instancia y
+    el `FAULT_INFO`. Corre al final de `gpustep9` y antes del SELFTEST; el
+    chequeo de la LUT hace lo mismo y dice qué lee la CPU tras el rebind.
 - Objetivo: **paridad** con la escalera actual en una sola tarjeta (escritorio,
   cursor, flips sin tearing) con `nvidia.wlr_vulkan`/`wlr_gles2`/`wlr_pixman`.
 

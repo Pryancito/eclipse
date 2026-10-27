@@ -4411,6 +4411,10 @@ impl DrmScheme for NvidiaGpu {
             if let Some(line) = bar1_console {
                 block.push_str(&line);
             }
+            if let Some(line) = bringup_all::recover_bar1(device_instance, "gpustep9") {
+                block.push_str(&line);
+                block.push('\n');
+            }
             let early_err = result.is_err();
             match result {
                 Ok(r) => {

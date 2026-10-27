@@ -543,13 +543,26 @@ pub struct VidmemCheck {
     pub cpu_ones: u32,
     /// Whether the RM maps BAR1 as a linear window.
     pub bar1_physical: u8,
-    pub pad: [u8; 3],
+    /// BAR1 was found faulted and rebound by the check, as the RM's fault
+    /// handler does on Linux.
+    pub bar1_rebound: u8,
+    pub pad: [u8; 2],
     /// The first word as the CPU mapping reads it. `0xBAD0ACxx` is the
     /// GPU's PRI-error sentinel: a BAR1 that faulted and was never rebound.
     pub cpu_first: u32,
+    /// What the MMU latched when BAR1 was found faulted: `MMU_FAULT_STATUS`,
+    /// the faulting address (the BAR1 offset touched without a mapping),
+    /// `MMU_FAULT_INST_LO` and `MMU_FAULT_INFO`. Zero otherwise.
+    pub fault_status: u32,
+    pub fault_addr_lo: u32,
+    pub fault_addr_hi: u32,
+    pub fault_inst_lo: u32,
+    pub fault_info: u32,
+    /// The first word through the CPU mapping after the rebind.
+    pub cpu_after_rebind: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<VidmemCheck>() == 56);
+const _: () = assert!(core::mem::size_of::<VidmemCheck>() == 80);
 
 /// [`VidmemCheck::bad_after_repair`] when there was nothing to repair.
 pub const NOT_REPAIRED: u32 = u32::MAX;
@@ -650,6 +663,22 @@ impl VidmemCheck {
                 "virtual"
             },
         );
+        if self.bar1_faulted() {
+            line.push_str(&alloc::format!(
+                "; fallo de MMU: estado {:#010x}, direccion {:#x}, inst {:#010x}, info {:#010x}; \
+                 {} y la CPU lee {:#010x}",
+                self.fault_status,
+                (u64::from(self.fault_addr_hi) << 32) | u64::from(self.fault_addr_lo),
+                self.fault_inst_lo,
+                self.fault_info,
+                if self.bar1_rebound != 0 {
+                    "BAR1 rebindeada"
+                } else {
+                    "no se pudo rebindear BAR1"
+                },
+                self.cpu_after_rebind
+            ));
+        }
         if self.console_words != 0 {
             line.push_str(&alloc::format!(
                 "; consola: {}/{} palabras iguales por la base de BAR1 y en VRAM 0",
@@ -1073,6 +1102,23 @@ mod tests {
         assert!(faulted.bar1_faulted());
         assert!(line.contains("la primera 0xbad0acef"), "{}", line);
         assert!(line.contains("BAR1 en fallo"), "{}", line);
+
+        // What the MMU latched, and whether the rebind brought BAR1 back.
+        faulted.fault_status = 0x8000_0000;
+        faulted.fault_addr_lo = 0x0060_0000;
+        faulted.fault_addr_hi = 0x1;
+        faulted.bar1_rebound = 1;
+        faulted.cpu_after_rebind = 0x0123_4567;
+        let line = faulted.describe();
+        assert!(line.contains("direccion 0x100600000"), "{}", line);
+        assert!(
+            line.contains("BAR1 rebindeada y la CPU lee 0x01234567"),
+            "{}",
+            line
+        );
+        assert!(!lut_check(0, NOT_REPAIRED, 3000)
+            .describe()
+            .contains("fallo de MMU"));
     }
 
     #[test]

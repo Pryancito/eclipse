@@ -7404,6 +7404,107 @@ NV_STATUS eclipse_rm_preserve_bar1_console(NvU32 gpuInstance, NvU64 consoleSize)
     return status;
 }
 
+/*
+ * What the MMU latched for a BAR1 fault, and whether BAR1 was rebound.
+ * Mirrored by `Bar1Fault` in src/rm_init.rs.
+ */
+typedef struct EclipseBar1Fault
+{
+    NvU32 bar1Block;   /* NV_VIRTUAL_FUNCTION_PRIV_BAR1_BLOCK */
+    NvU32 status;      /* NV_VIRTUAL_FUNCTION_PRIV_MMU_FAULT_STATUS */
+    NvU32 addrLo;      /* ..._MMU_FAULT_ADDR_LO: the faulting VA */
+    NvU32 addrHi;      /* ..._MMU_FAULT_ADDR_HI */
+    NvU32 instLo;      /* ..._MMU_FAULT_INST_LO: whose instance block */
+    NvU32 info;        /* ..._MMU_FAULT_INFO: engine, client, access */
+    NvU32 rebindStatus;/* kbusBar1InstBlkBind; ~0 when no rebind was needed */
+    NvU32 pad;
+} EclipseBar1Fault;
+
+/* NV_VIRTUAL_FUNCTION_PRIV_* (published/turing/tu102/dev_vm.h). */
+#define ECLIPSE_VF_BAR1_BLOCK          0x00000F40
+#define ECLIPSE_VF_MMU_FAULT_ADDR_LO   0x00003080
+#define ECLIPSE_VF_MMU_FAULT_ADDR_HI   0x00003084
+#define ECLIPSE_VF_MMU_FAULT_INST_LO   0x00003088
+#define ECLIPSE_VF_MMU_FAULT_INFO      0x00003090
+#define ECLIPSE_VF_MMU_FAULT_STATUS    0x00003094
+/* MMU_FAULT_STATUS: VALID is 31:31; 3:0 are the DROPPED_BAR1/BAR2 _PHYS/_VIRT
+ * bits, set when a BAR fault arrived while one was already latched. All are
+ * write-1-to-clear (published/volta/gv100/dev_fb.h). */
+#define ECLIPSE_MMU_FAULT_VALID        0x80000000U
+#define ECLIPSE_MMU_FAULT_DROPPED_BARS 0x0000000FU
+
+/*
+ * The BAR fault branch of kgmmuServicePriFaults_GV100, which Eclipse never
+ * runs because it services no GPU interrupts: if the MMU has latched a fault
+ * (or dropped a BAR fault behind one), rebind BAR1 -- "BAR1 MMU Fault ... do a
+ * rebind of bar1" -- and clear what was latched. A BAR1 that took a fault
+ * keeps answering every access with the 0xBAD0ACxx PRI-error sentinel until
+ * it is rebound, and on the console card that is every channel's USERD.
+ * Always fills pOut, so a caller can log what the MMU held even when nothing
+ * needed doing.
+ */
+NV_STATUS eclipse_rm_bar1_recover(NvU32 gpuInstance, EclipseBar1Fault *pOut)
+{
+    OBJGPU *pGpu;
+    KernelBus *pKernelBus;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+
+    if (pOut == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->rebindStatus = 0xFFFFFFFF;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+        goto out_vis;
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+        goto out_api;
+
+    pGpu = gpumgrGetGpu(gpuInstance);
+    pKernelBus = (pGpu != NULL) ? GPU_GET_KERNEL_BUS(pGpu) : NULL;
+    if (pKernelBus == NULL || !pGpu->gspRmInitialized)
+    {
+        status = (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+        goto out_gpu;
+    }
+
+    pOut->bar1Block = GPU_VREG_RD32(pGpu, ECLIPSE_VF_BAR1_BLOCK);
+    pOut->status = GPU_VREG_RD32(pGpu, ECLIPSE_VF_MMU_FAULT_STATUS);
+    pOut->addrLo = GPU_VREG_RD32(pGpu, ECLIPSE_VF_MMU_FAULT_ADDR_LO);
+    pOut->addrHi = GPU_VREG_RD32(pGpu, ECLIPSE_VF_MMU_FAULT_ADDR_HI);
+    pOut->instLo = GPU_VREG_RD32(pGpu, ECLIPSE_VF_MMU_FAULT_INST_LO);
+    pOut->info = GPU_VREG_RD32(pGpu, ECLIPSE_VF_MMU_FAULT_INFO);
+
+    if (pOut->status & (ECLIPSE_MMU_FAULT_VALID | ECLIPSE_MMU_FAULT_DROPPED_BARS))
+    {
+        pOut->rebindStatus = kbusBar1InstBlkBind_HAL(pGpu, pKernelBus);
+        GPU_VREG_WR32(pGpu, ECLIPSE_VF_MMU_FAULT_STATUS,
+                      pOut->status & (ECLIPSE_MMU_FAULT_VALID | ECLIPSE_MMU_FAULT_DROPPED_BARS));
+        nv_printf(0, "[eclipse-rm-trace] bar1_recover: status=0x%x addr=0x%x%08x inst=0x%x "
+                     "info=0x%x -> rebind 0x%x\n",
+                  pOut->status, pOut->addrHi, pOut->addrLo, pOut->instLo, pOut->info,
+                  pOut->rebindStatus);
+    }
+
+out_gpu:
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+out_api:
+    rmapiLockRelease();
+out_vis:
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
 /* ===================================================================
  * DRM: real EDID / connector query via the RM's NV04_DISPLAY_COMMON.
  *
