@@ -66,6 +66,8 @@ impl NvidiaGpu {
             bringup: Mutex::new(None),
             rm_attach_result: Mutex::new(None),
             rm_device_instance: Mutex::new(None),
+            surfaceflip_state: core::sync::atomic::AtomicU8::new(0),
+            hwcur_state: core::sync::atomic::AtomicU8::new(0),
             rm_display_snap: Mutex::new(None),
             auto_bringup_done: AtomicBool::new(false),
             gsp_firmware: Mutex::new(None),

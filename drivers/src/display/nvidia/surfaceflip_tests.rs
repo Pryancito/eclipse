@@ -22,7 +22,6 @@ pub(super) const H_MEMORY: u32 = 0x1234;
 /// drift and end up pricing a different GPU.
 pub(super) fn console_gpu() -> NvidiaGpu {
     reset_fake_hwflip();
-    SURFACEFLIP_STATE.store(0, Ordering::Release);
     for c in [
         &SURFACEFLIP_FLIPS,
         &SURFACEFLIP_DRAIN_WAITS,
@@ -134,7 +133,7 @@ fn rotating_a_swapchain_builds_one_ctxdma_per_buffer_not_one_per_flip() {
         [H_MEMORY, H_MEMORY_B],
         "two buffers, whatever the frame count"
     );
-    let line = surfaceflip_stats_line();
+    let line = gpu.surfaceflip_stats_line();
     assert!(
         line.contains("iso-ctxdma-builds=2"),
         "the count has to be readable on a real machine: {}",
@@ -236,8 +235,34 @@ fn the_ladder_is_built_once_and_a_failed_build_is_latched() {
     assert_eq!(FAKE_HWFLIP.lock().init_calls, 1, "not retried");
     assert!(!gpu.has_hardware_kms());
     assert_eq!(surfaces(), 0);
-    assert_eq!(SURFACEFLIP_STATE.load(Ordering::Relaxed), 2);
-    assert!(surfaceflip_stats_line().contains("state=failed"));
+    assert_eq!(gpu.surfaceflip_state.load(Ordering::Relaxed), 2);
+    assert!(gpu.surfaceflip_stats_line().contains("state=failed"));
+}
+
+/// The latch is the GPU's own: one card failing its bring-up does not turn
+/// the other card's flips off. It was one static for the whole machine, so
+/// on a two-card box the first failure took both ladders down.
+#[test]
+fn a_failed_ladder_on_one_gpu_does_not_latch_the_other() {
+    let _g = SERIAL.lock();
+    let other = console_gpu();
+    let failing = console_gpu();
+    FAKE_HWFLIP.lock().init_ok = false;
+    assert!(!failing.page_flip(FB));
+    assert_eq!(failing.surfaceflip_state.load(Ordering::Relaxed), 2);
+
+    FAKE_HWFLIP.lock().init_ok = true;
+    assert!(
+        other.page_flip(FB),
+        "the other GPU must still build its own ladder"
+    );
+    assert_eq!(other.surfaceflip_state.load(Ordering::Relaxed), 1);
+    assert_eq!(FAKE_HWFLIP.lock().init_calls, 2, "one bring-up per GPU");
+    assert_eq!(
+        failing.surfaceflip_state.load(Ordering::Relaxed),
+        2,
+        "still latched"
+    );
 }
 
 /// `WAIT_VBLANK` used to busy-spin a whole frame here on top of the sleep
@@ -266,7 +291,7 @@ fn the_flip_counters_are_reported() {
     FAKE_HWFLIP.lock().fetch_polls = 2;
     assert!(gpu.page_flip(FB));
     assert!(gpu.page_flip(FB));
-    let line = surfaceflip_stats_line();
+    let line = gpu.surfaceflip_stats_line();
     assert!(line.contains("state=ready"), "{}", line);
     assert!(
         line.contains("flips=2 iso-ctxdma-builds=1 drain-waits=1"),

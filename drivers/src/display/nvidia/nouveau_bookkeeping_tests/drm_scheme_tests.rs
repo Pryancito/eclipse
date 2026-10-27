@@ -675,10 +675,8 @@ fn cpu_prep_is_done_at_once_without_a_registration_or_with_landed_fences() {
 #[test]
 fn the_surfaceflip_line_names_its_state_and_the_pci_driver_matches_nvidia() {
     let _g = LOCK.lock();
-    let was = SURFACEFLIP_STATE.load(Ordering::Relaxed);
     for (state, word) in [(0u8, "untried"), (1, "ready"), (2, "failed"), (9, "failed")] {
-        SURFACEFLIP_STATE.store(state, Ordering::Relaxed);
-        let line = surfaceflip_stats_line();
+        let line = surfaceflip_stats_line_for(state, None);
         assert!(
             line.starts_with(&alloc::format!(
                 "[gpudbg]  surfaceflip: state={} flips=",
@@ -688,7 +686,6 @@ fn the_surfaceflip_line_names_its_state_and_the_pci_driver_matches_nvidia() {
             line
         );
     }
-    SURFACEFLIP_STATE.store(was, Ordering::Relaxed);
     let drv = NvidiaGpuDriverPci;
     assert_eq!(PciDriver::name(&drv), "Nvidia GPU");
     assert!(PciDriver::matched(&drv, 0x10DE, 0x1f06));

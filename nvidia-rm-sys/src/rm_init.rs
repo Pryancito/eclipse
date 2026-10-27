@@ -700,7 +700,7 @@ extern "C" {
         w: NvU32,
         h: NvU32,
     ) -> NV_STATUS;
-    fn eclipse_rm_hwcursor_move(x: i32, y: i32) -> NV_STATUS;
+    fn eclipse_rm_hwcursor_move(gpuInstance: NvU32, x: i32, y: i32) -> NV_STATUS;
     fn eclipse_rm_hwcursor_hide(gpuInstance: NvU32) -> NV_STATUS;
 }
 
@@ -743,8 +743,8 @@ pub fn hwcursor_image(device_instance: u32, argb: &[u32], w: u32, h: u32) -> NV_
 /// Move the hardware cursor. Pure PIO into the NVC57A control region -- no RM
 /// entry, so deliberately NOT gated: this is the per-motion hot path and must
 /// never contend with submits.
-pub fn hwcursor_move(x: i32, y: i32) -> NV_STATUS {
-    unsafe { eclipse_rm_hwcursor_move(x, y) }
+pub fn hwcursor_move(device_instance: u32, x: i32, y: i32) -> NV_STATUS {
+    unsafe { eclipse_rm_hwcursor_move(device_instance, x, y) }
 }
 
 /// Disable the hardware cursor plane (userspace hid the cursor). Serialized
@@ -777,9 +777,9 @@ extern "C" {
         height: NvU32,
         pitchBytes: NvU32,
     ) -> NV_STATUS;
-    fn eclipse_rm_hwflip_ready() -> NvBool;
-    fn eclipse_rm_hwflip_pending() -> NvBool;
-    fn eclipse_rm_hwflip_iso_builds() -> NvU64;
+    fn eclipse_rm_hwflip_ready(gpuInstance: NvU32) -> NvBool;
+    fn eclipse_rm_hwflip_pending(gpuInstance: NvU32) -> NvBool;
+    fn eclipse_rm_hwflip_iso_builds(gpuInstance: NvU32) -> NvU64;
 }
 
 /// Bring up NVC57E window ISO flip (reuses/creates NVC570+NVC57D via hwcursor).
@@ -828,9 +828,11 @@ pub fn hwflip_surface(
     }
 }
 
-/// Whether the NVC57E surface-flip ladder is ready.
-pub fn hwflip_ready() -> bool {
-    unsafe { eclipse_rm_hwflip_ready() != 0 }
+/// Whether the NVC57E surface-flip ladder of GPU `device_instance` is ready.
+/// Each GPU has its own ladder (core channel, window, cursor), as each has its
+/// own `NVDevEvoRec` in nvkms.
+pub fn hwflip_ready(device_instance: u32) -> bool {
+    unsafe { eclipse_rm_hwflip_ready(device_instance) != 0 }
 }
 
 /// How many ISO context DMAs the flip path has allocated since boot.
@@ -840,8 +842,8 @@ pub fn hwflip_ready() -> bool {
 /// count that tracks the flip count means the ctxdma table is thrashing and
 /// every frame is paying an RM object free plus an RM object alloc inside the
 /// RM API lock. Reads one C global: no RM call, no lock, no `RmGate`.
-pub fn hwflip_iso_builds() -> u64 {
-    unsafe { eclipse_rm_hwflip_iso_builds() }
+pub fn hwflip_iso_builds(device_instance: u32) -> u64 {
+    unsafe { eclipse_rm_hwflip_iso_builds(device_instance) }
 }
 
 /// Whether the display front end is still fetching the last flip's methods
@@ -853,8 +855,8 @@ pub fn hwflip_iso_builds() -> u64 {
 /// the panel OUTSIDE the gate, where the wait used to live (inside
 /// `eclipse_rm_hwflip_surface`, 1 ms at a time, with the RM API and GPU
 /// locks held). Not ready = nothing pending.
-pub fn hwflip_pending() -> bool {
-    unsafe { eclipse_rm_hwflip_pending() != 0 }
+pub fn hwflip_pending(device_instance: u32) -> bool {
+    unsafe { eclipse_rm_hwflip_pending(device_instance) != 0 }
 }
 
 /// Mirror of `EclipseGrLaunch` (vendor/eclipse_rm_init.c): per-stage

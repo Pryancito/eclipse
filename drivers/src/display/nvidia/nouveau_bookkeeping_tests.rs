@@ -8647,7 +8647,6 @@ mod glxgears_vblank_mode {
         let gpu = gpu_rm_ladder();
         reset_fake_hwflip();
         FAKE_HWFLIP.lock().fetch_delay_us = FETCH_US;
-        SURFACEFLIP_STATE.store(0, Ordering::Release);
         for c in [
             &SURFACEFLIP_FLIPS,
             &SURFACEFLIP_DRAIN_WAITS,

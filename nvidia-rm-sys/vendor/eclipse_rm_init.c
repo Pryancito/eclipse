@@ -10413,7 +10413,7 @@ typedef struct EclipseHwCursorInit
 #define ECLIPSE_HWCUR_SURF_SIZE 65536 /* 64x64 ARGB = 16K; page-rounded */
 #define ECLIPSE_HWCUR_DIM       64
 
-static struct
+typedef struct EclipseHwCurState
 {
     NvU32 hDisp;
     NvU32 hPbMem;
@@ -10430,55 +10430,67 @@ static struct
     NvU32  pbPut;             /* byte offset of next method write */
     NvU32  head;
     NvBool ready;
-} g_hwcur;
+} EclipseHwCurState;
+
+/* One display-engine ladder per GPU, as nvkms keeps one NVDevEvoRec per
+ * device: two cards each drive their own core channel, cursor and window.
+ * This was a single struct, so the second card's bring-up found the first
+ * card's `ready` and drove the first card's channels. */
+static EclipseHwCurState g_hwcurAll[ECLIPSE_MAX_GPUS];
+
+static EclipseHwCurState *hwcur_of(NvU32 gpuInstance)
+{
+    return (gpuInstance < ECLIPSE_MAX_GPUS) ? &g_hwcurAll[gpuInstance] : NULL;
+}
 
 /* Append one method (header + args) to the core pushbuffer, wrapping with a
  * JUMP when fewer than 64 B remain. Caller kicks with hwcur_core_kick. */
-static void hwcur_core_method(NvU32 method, const NvU32 *args, NvU32 count)
+static void hwcur_core_method(EclipseHwCurState *hc, NvU32 method, const NvU32 *args, NvU32 count)
 {
     volatile NvU32 *pb;
     NvU32 i;
-    if ((g_hwcur.pbPut + 4 * (count + 2)) > (ECLIPSE_HWCUR_PB_SIZE - 8))
+    if ((hc->pbPut + 4 * (count + 2)) > (ECLIPSE_HWCUR_PB_SIZE - 8))
     {
         /* JUMP back to offset 0. */
-        pb = (volatile NvU32 *)(g_hwcur.pPbCpu + g_hwcur.pbPut);
+        pb = (volatile NvU32 *)(hc->pPbCpu + hc->pbPut);
         pb[0] = DRF_DEF(C37D, _DMA, _OPCODE, _JUMP) |
                 DRF_NUM(C37D, _DMA, _METHOD_OFFSET, 0);
-        g_hwcur.pbPut = 0;
+        hc->pbPut = 0;
     }
-    pb = (volatile NvU32 *)(g_hwcur.pPbCpu + g_hwcur.pbPut);
+    pb = (volatile NvU32 *)(hc->pPbCpu + hc->pbPut);
     pb[0] = DRF_DEF(C37D, _DMA, _OPCODE, _METHOD) |
             DRF_NUM(C37D, _DMA, _METHOD_COUNT, count) |
             DRF_NUM(C37D, _DMA, _METHOD_OFFSET, method >> 2);
     for (i = 0; i < count; i++)
         pb[1 + i] = args[i];
-    g_hwcur.pbPut += 4 * (count + 1);
+    hc->pbPut += 4 * (count + 1);
 }
 
 /* Ring the core channel (Put = new byte offset) and wait for the display FE
  * to fetch everything (Get catches up). Bounded; a timeout is reported, not
  * spun on forever. */
-static NV_STATUS hwcur_core_kick(NvU32 timeoutMs)
+static NV_STATUS hwcur_core_kick(EclipseHwCurState *hc, NvU32 timeoutMs)
 {
     NvU32 i;
     osFlushCpuWriteCombineBuffer();
-    g_hwcur.pCoreCtl->Put = g_hwcur.pbPut;
+    hc->pCoreCtl->Put = hc->pbPut;
     osFlushCpuWriteCombineBuffer();
     for (i = 0; i < timeoutMs; i++)
     {
-        if (g_hwcur.pCoreCtl->Get == g_hwcur.pbPut)
+        if (hc->pCoreCtl->Get == hc->pbPut)
             return NV_OK;
         os_delay_us(1000);
     }
     nv_printf(0, "[eclipse-rm-trace] hwcursor: core kick TIMEOUT Get=%u Put=%u\n",
-              g_hwcur.pCoreCtl->Get, g_hwcur.pbPut);
+              hc->pCoreCtl->Get, hc->pbPut);
     return NV_ERR_TIMEOUT;
 }
 
 /* Build the whole ladder. Any stage failing leaves its NV_STATUS in pOut and
- * the software cursor stays in charge (g_hwcur.ready never set). */
+ * the software cursor stays in charge (hc->ready never set). */
 NV_STATUS eclipse_rm_hwcursor_init(NvU32 gpuInstance, NvU32 head, EclipseHwCursorInit *pOut)
 {
+    EclipseHwCurState *hc = hwcur_of(gpuInstance);
     OBJGPU *pGpu;
     RM_API *pRmApi;
     NV_STATUS status;
@@ -10487,7 +10499,7 @@ NV_STATUS eclipse_rm_hwcursor_init(NvU32 gpuInstance, NvU32 head, EclipseHwCurso
     MemoryManager *pMemoryManager;
     Memory *pPbMemory = NULL;
 
-    if (pOut == NULL)
+    if (pOut == NULL || hc == NULL)
         return NV_ERR_INVALID_ARGUMENT;
     portMemSet(pOut, 0, sizeof(*pOut));
     pOut->dispStatus = pOut->pbMemStatus = pOut->pbDmaStatus = 0xFFFFFFFF;
@@ -10495,7 +10507,7 @@ NV_STATUS eclipse_rm_hwcursor_init(NvU32 gpuInstance, NvU32 head, EclipseHwCurso
     pOut->coreMapStatus = pOut->cursMemStatus = pOut->cursDmaStatus = 0xFFFFFFFF;
     pOut->cursChanStatus = 0xFFFFFFFF;
 
-    if (g_hwcur.ready)
+    if (hc->ready)
         return NV_OK; /* idempotent */
     if (!g_grAllocDone[gpuInstance])
         return NV_ERR_INVALID_STATE; /* needs the step-16 client/device */
@@ -10534,20 +10546,20 @@ NV_STATUS eclipse_rm_hwcursor_init(NvU32 gpuInstance, NvU32 head, EclipseHwCurso
     status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pRsClient);
     if (status != NV_OK)
         goto unlock;
-    g_hwcur.head = head;
+    hc->head = head;
 
     /* 1. NVC570 display parent under the shared device. */
     {
         NVC570_ALLOCATION_PARAMETERS params;
         portMemSet(&params, 0, sizeof(params));
-        status = clientGenResourceHandle(pRsClient, &g_hwcur.hDisp);
+        status = clientGenResourceHandle(pRsClient, &hc->hDisp);
         if (status != NV_OK) goto unlock;
         pOut->dispStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                   g_grAllocCache[gpuInstance].hDevice, g_hwcur.hDisp,
+                                                   g_grAllocCache[gpuInstance].hDevice, hc->hDisp,
                                                    NVC570_DISPLAY, &params, sizeof(params));
         pOut->numHeads = params.numHeads;
         nv_printf(0, "[eclipse-rm-trace] hwcursor: NVC570 -> 0x%x hDisp=0x%x heads=%u sors=%u\n",
-                  pOut->dispStatus, g_hwcur.hDisp, params.numHeads, params.numSors);
+                  pOut->dispStatus, hc->hDisp, params.numHeads, params.numSors);
         if (pOut->dispStatus != NV_OK) goto unlock;
     }
 
@@ -10563,26 +10575,26 @@ NV_STATUS eclipse_rm_hwcursor_init(NvU32 gpuInstance, NvU32 head, EclipseHwCurso
                   DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS) |
                   DRF_DEF(OS32, _ATTR, _COHERENCY, _CACHED);
         mp.attr2 = NVOS32_ATTR2_NONE;
-        status = clientGenResourceHandle(pRsClient, &g_hwcur.hPbMem);
+        status = clientGenResourceHandle(pRsClient, &hc->hPbMem);
         if (status != NV_OK) goto unlock;
         pOut->pbMemStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                    g_grAllocCache[gpuInstance].hDevice, g_hwcur.hPbMem,
+                                                    g_grAllocCache[gpuInstance].hDevice, hc->hPbMem,
                                                     NV01_MEMORY_SYSTEM, &mp, sizeof(mp));
         nv_printf(0, "[eclipse-rm-trace] hwcursor: pb sysmem -> 0x%x hPbMem=0x%x\n",
-                  pOut->pbMemStatus, g_hwcur.hPbMem);
+                  pOut->pbMemStatus, hc->hPbMem);
         if (pOut->pbMemStatus != NV_OK) goto unlock;
 
         portMemSet(&dp, 0, sizeof(dp));
-        dp.hMemory = g_hwcur.hPbMem;
+        dp.hMemory = hc->hPbMem;
         dp.offset = 0;
         dp.limit = ECLIPSE_HWCUR_PB_SIZE - 1;
-        status = clientGenResourceHandle(pRsClient, &g_hwcur.hPbDma);
+        status = clientGenResourceHandle(pRsClient, &hc->hPbDma);
         if (status != NV_OK) goto unlock;
         pOut->pbDmaStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                    g_grAllocCache[gpuInstance].hDevice, g_hwcur.hPbDma,
+                                                    g_grAllocCache[gpuInstance].hDevice, hc->hPbDma,
                                                     NV01_CONTEXT_DMA, &dp, sizeof(dp));
         nv_printf(0, "[eclipse-rm-trace] hwcursor: pb ctxdma -> 0x%x hPbDma=0x%x\n",
-                  pOut->pbDmaStatus, g_hwcur.hPbDma);
+                  pOut->pbDmaStatus, hc->hPbDma);
         if (pOut->pbDmaStatus != NV_OK) goto unlock;
     }
 
@@ -10598,10 +10610,10 @@ NV_STATUS eclipse_rm_hwcursor_init(NvU32 gpuInstance, NvU32 head, EclipseHwCurso
                   DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS) |
                   DRF_DEF(OS32, _ATTR, _COHERENCY, _CACHED);
         mp.attr2 = NVOS32_ATTR2_NONE;
-        status = clientGenResourceHandle(pRsClient, &g_hwcur.hNotMem);
+        status = clientGenResourceHandle(pRsClient, &hc->hNotMem);
         if (status != NV_OK) goto unlock;
         pOut->notMemStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                     g_grAllocCache[gpuInstance].hDevice, g_hwcur.hNotMem,
+                                                     g_grAllocCache[gpuInstance].hDevice, hc->hNotMem,
                                                      NV01_MEMORY_SYSTEM, &mp, sizeof(mp));
         if (pOut->notMemStatus != NV_OK)
         {
@@ -10609,13 +10621,13 @@ NV_STATUS eclipse_rm_hwcursor_init(NvU32 gpuInstance, NvU32 head, EclipseHwCurso
             goto unlock;
         }
         portMemSet(&dp, 0, sizeof(dp));
-        dp.hMemory = g_hwcur.hNotMem;
+        dp.hMemory = hc->hNotMem;
         dp.offset = 0;
         dp.limit = 4095;
-        status = clientGenResourceHandle(pRsClient, &g_hwcur.hNotDma);
+        status = clientGenResourceHandle(pRsClient, &hc->hNotDma);
         if (status != NV_OK) goto unlock;
         pOut->notDmaStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                     g_grAllocCache[gpuInstance].hDevice, g_hwcur.hNotDma,
+                                                     g_grAllocCache[gpuInstance].hDevice, hc->hNotDma,
                                                      NV01_CONTEXT_DMA, &dp, sizeof(dp));
         nv_printf(0, "[eclipse-rm-trace] hwcursor: notifier -> mem 0x%x ctxdma 0x%x\n",
                   pOut->notMemStatus, pOut->notDmaStatus);
@@ -10628,32 +10640,32 @@ NV_STATUS eclipse_rm_hwcursor_init(NvU32 gpuInstance, NvU32 head, EclipseHwCurso
         NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS cp;
         portMemSet(&cp, 0, sizeof(cp));
         cp.channelInstance = 0;
-        cp.hObjectBuffer = g_hwcur.hPbDma;
-        cp.hObjectNotify = g_hwcur.hNotDma;
+        cp.hObjectBuffer = hc->hPbDma;
+        cp.hObjectNotify = hc->hNotDma;
         cp.offset = 0;
         cp.channelPBSize = PB_SIZE_4KB;
         cp.subDeviceId = 1; /* one-hot: subdevice 0 */
-        status = clientGenResourceHandle(pRsClient, &g_hwcur.hCore);
+        status = clientGenResourceHandle(pRsClient, &hc->hCore);
         if (status != NV_OK) goto unlock;
         pOut->coreStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                   g_hwcur.hDisp, g_hwcur.hCore,
+                                                   hc->hDisp, hc->hCore,
                                                    NVC57D_CORE_CHANNEL_DMA, &cp, sizeof(cp));
-        g_hwcur.pCoreCtl = (volatile EclipseDispDmaControl *)(NvUPtr)cp.pControl;
+        hc->pCoreCtl = (volatile EclipseDispDmaControl *)(NvUPtr)cp.pControl;
         nv_printf(0, "[eclipse-rm-trace] hwcursor: NVC57D core -> 0x%x hCore=0x%x pControl=0x%llx\n",
-                  pOut->coreStatus, g_hwcur.hCore, (NvU64)(NvUPtr)cp.pControl);
-        if (pOut->coreStatus != NV_OK || g_hwcur.pCoreCtl == NULL) goto unlock;
+                  pOut->coreStatus, hc->hCore, (NvU64)(NvUPtr)cp.pControl);
+        if (pOut->coreStatus != NV_OK || hc->pCoreCtl == NULL) goto unlock;
     }
 
     /* 5. CPU map of the pushbuffer (sysmem, direct). */
     {
-        status = memGetByHandle(pRsClient, g_hwcur.hPbMem, &pPbMemory);
+        status = memGetByHandle(pRsClient, hc->hPbMem, &pPbMemory);
         if (status == NV_OK && pPbMemory->pMemDesc != NULL)
         {
-            g_hwcur.pPbCpu = memmgrMemDescBeginTransfer(pMemoryManager,
+            hc->pPbCpu = memmgrMemDescBeginTransfer(pMemoryManager,
                                                         pPbMemory->pMemDesc,
                                                         TRANSFER_FLAGS_NONE);
         }
-        pOut->coreMapStatus = (g_hwcur.pPbCpu != NULL) ? NV_OK : NV_ERR_GENERIC;
+        pOut->coreMapStatus = (hc->pPbCpu != NULL) ? NV_OK : NV_ERR_GENERIC;
         nv_printf(0, "[eclipse-rm-trace] hwcursor: pb CPU map -> 0x%x\n", pOut->coreMapStatus);
         if (pOut->coreMapStatus != NV_OK) goto unlock;
         /* Deliberately no EndTransfer: this map is a boot-lifetime singleton,
@@ -10673,26 +10685,26 @@ NV_STATUS eclipse_rm_hwcursor_init(NvU32 gpuInstance, NvU32 head, EclipseHwCurso
                   DRF_DEF(OS32, _ATTR, _ALLOCATE_FROM_RESERVED_HEAP, _YES);
         mp.flags = NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM;
         mp.internalflags = NVOS32_ALLOC_INTERNAL_FLAGS_SKIP_SCRUB;
-        status = clientGenResourceHandle(pRsClient, &g_hwcur.hCursMem);
+        status = clientGenResourceHandle(pRsClient, &hc->hCursMem);
         if (status != NV_OK) goto unlock;
         pOut->cursMemStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                      g_grAllocCache[gpuInstance].hDevice, g_hwcur.hCursMem,
+                                                      g_grAllocCache[gpuInstance].hDevice, hc->hCursMem,
                                                       NV01_MEMORY_LOCAL_USER, &mp, sizeof(mp));
         nv_printf(0, "[eclipse-rm-trace] hwcursor: cursor vidmem -> 0x%x hCursMem=0x%x\n",
-                  pOut->cursMemStatus, g_hwcur.hCursMem);
+                  pOut->cursMemStatus, hc->hCursMem);
         if (pOut->cursMemStatus != NV_OK) goto unlock;
 
         portMemSet(&dp, 0, sizeof(dp));
-        dp.hMemory = g_hwcur.hCursMem;
+        dp.hMemory = hc->hCursMem;
         dp.offset = 0;
         dp.limit = ECLIPSE_HWCUR_SURF_SIZE - 1;
-        status = clientGenResourceHandle(pRsClient, &g_hwcur.hCursDma);
+        status = clientGenResourceHandle(pRsClient, &hc->hCursDma);
         if (status != NV_OK) goto unlock;
         pOut->cursDmaStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                      g_grAllocCache[gpuInstance].hDevice, g_hwcur.hCursDma,
+                                                      g_grAllocCache[gpuInstance].hDevice, hc->hCursDma,
                                                       NV01_CONTEXT_DMA, &dp, sizeof(dp));
         nv_printf(0, "[eclipse-rm-trace] hwcursor: cursor ctxdma -> 0x%x hCursDma=0x%x\n",
-                  pOut->cursDmaStatus, g_hwcur.hCursDma);
+                  pOut->cursDmaStatus, hc->hCursDma);
         if (pOut->cursDmaStatus != NV_OK) goto unlock;
     }
 
@@ -10701,21 +10713,21 @@ NV_STATUS eclipse_rm_hwcursor_init(NvU32 gpuInstance, NvU32 head, EclipseHwCurso
         NV50VAIO_CHANNELPIO_ALLOCATION_PARAMETERS pp;
         portMemSet(&pp, 0, sizeof(pp));
         pp.channelInstance = head;
-        pp.hObjectNotify = g_hwcur.hNotDma;
-        status = clientGenResourceHandle(pRsClient, &g_hwcur.hCursChan);
+        pp.hObjectNotify = hc->hNotDma;
+        status = clientGenResourceHandle(pRsClient, &hc->hCursChan);
         if (status != NV_OK) goto unlock;
         pOut->cursChanStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                       g_hwcur.hDisp, g_hwcur.hCursChan,
+                                                       hc->hDisp, hc->hCursChan,
                                                        NVC57A_CURSOR_IMM_CHANNEL_PIO,
                                                        &pp, sizeof(pp));
-        g_hwcur.pCursCtl = (volatile NvU32 *)(NvUPtr)pp.pControl;
+        hc->pCursCtl = (volatile NvU32 *)(NvUPtr)pp.pControl;
         nv_printf(0, "[eclipse-rm-trace] hwcursor: NVC57A head %u -> 0x%x hCursChan=0x%x pControl=0x%llx\n",
-                  head, pOut->cursChanStatus, g_hwcur.hCursChan, (NvU64)(NvUPtr)pp.pControl);
-        if (pOut->cursChanStatus != NV_OK || g_hwcur.pCursCtl == NULL) goto unlock;
+                  head, pOut->cursChanStatus, hc->hCursChan, (NvU64)(NvUPtr)pp.pControl);
+        if (pOut->cursChanStatus != NV_OK || hc->pCursCtl == NULL) goto unlock;
     }
 
-    g_hwcur.pbPut = 0;
-    g_hwcur.ready = NV_TRUE;
+    hc->pbPut = 0;
+    hc->ready = NV_TRUE;
     nv_printf(0, "[eclipse-rm-trace] hwcursor: READY (head %u)\n", head);
 
 unlock:
@@ -10723,7 +10735,7 @@ unlock:
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
-    return g_hwcur.ready ? NV_OK : NV_ERR_GENERIC;
+    return hc->ready ? NV_OK : NV_ERR_GENERIC;
 }
 
 /* Upload a premultiplied-ARGB image (w x h <= 64x64) into the cursor surface
@@ -10731,6 +10743,7 @@ unlock:
 NV_STATUS eclipse_rm_hwcursor_image(NvU32 gpuInstance, const NvU32 *pArgb,
                                     NvU32 w, NvU32 h)
 {
+    EclipseHwCurState *hc = hwcur_of(gpuInstance);
     OBJGPU *pGpu;
     NV_STATUS status;
     THREAD_STATE_NODE threadState;
@@ -10743,7 +10756,7 @@ NV_STATUS eclipse_rm_hwcursor_image(NvU32 gpuInstance, const NvU32 *pArgb,
                       TRANSFER_FLAGS_SHADOW_INIT_MEM;
     NvU32 row, col;
 
-    if (!g_hwcur.ready)
+    if (hc == NULL || !hc->ready)
         return NV_ERR_INVALID_STATE;
     if (pArgb == NULL || w == 0 || h == 0 || w > ECLIPSE_HWCUR_DIM || h > ECLIPSE_HWCUR_DIM)
         return NV_ERR_INVALID_ARGUMENT;
@@ -10780,7 +10793,7 @@ NV_STATUS eclipse_rm_hwcursor_image(NvU32 gpuInstance, const NvU32 *pArgb,
     pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
     status = serverGetClientUnderLock(&g_resServ, g_grAllocCache[gpuInstance].hClient, &pRsClient);
     if (status == NV_OK)
-        status = memGetByHandle(pRsClient, g_hwcur.hCursMem, &pMem);
+        status = memGetByHandle(pRsClient, hc->hCursMem, &pMem);
     if (status == NV_OK && pMem->pMemDesc != NULL)
         pDst = memmgrMemDescBeginTransfer(pMemoryManager, pMem->pMemDesc, xferFlags);
     if (pDst == NULL)
@@ -10804,27 +10817,27 @@ NV_STATUS eclipse_rm_hwcursor_image(NvU32 gpuInstance, const NvU32 *pArgb,
      * 64x64), premultiplied-alpha blend, then UPDATE. */
     {
         NvU32 v;
-        NvU32 head = g_hwcur.head;
-        v = g_hwcur.hCursDma;
-        hwcur_core_method(NVC57D_HEAD_SET_CONTEXT_DMA_CURSOR(head, 0), &v, 1);
+        NvU32 head = hc->head;
+        v = hc->hCursDma;
+        hwcur_core_method(hc, NVC57D_HEAD_SET_CONTEXT_DMA_CURSOR(head, 0), &v, 1);
         v = 0;
-        hwcur_core_method(NVC57D_HEAD_SET_OFFSET_CURSOR(head, 0), &v, 1);
+        hwcur_core_method(hc, NVC57D_HEAD_SET_OFFSET_CURSOR(head, 0), &v, 1);
         v = DRF_DEF(C57D, _HEAD_SET_CONTROL_CURSOR, _ENABLE, _ENABLE) |
             DRF_DEF(C57D, _HEAD_SET_CONTROL_CURSOR, _FORMAT, _A8R8G8B8) |
             DRF_DEF(C57D, _HEAD_SET_CONTROL_CURSOR, _SIZE, _W64_H64) |
             DRF_NUM(C57D, _HEAD_SET_CONTROL_CURSOR, _HOT_SPOT_X, 0) |
             DRF_NUM(C57D, _HEAD_SET_CONTROL_CURSOR, _HOT_SPOT_Y, 0);
-        hwcur_core_method(NVC57D_HEAD_SET_CONTROL_CURSOR(head), &v, 1);
+        hwcur_core_method(hc, NVC57D_HEAD_SET_CONTROL_CURSOR(head), &v, 1);
         v = DRF_NUM(C57D, _HEAD_SET_CONTROL_CURSOR_COMPOSITION, _K1, 255) |
             DRF_DEF(C57D, _HEAD_SET_CONTROL_CURSOR_COMPOSITION,
                     _CURSOR_COLOR_FACTOR_SELECT, _K1) |
             DRF_DEF(C57D, _HEAD_SET_CONTROL_CURSOR_COMPOSITION,
                     _VIEWPORT_COLOR_FACTOR_SELECT, _NEG_K1_TIMES_SRC) |
             DRF_DEF(C57D, _HEAD_SET_CONTROL_CURSOR_COMPOSITION, _MODE, _BLEND);
-        hwcur_core_method(NVC57D_HEAD_SET_CONTROL_CURSOR_COMPOSITION(head), &v, 1);
+        hwcur_core_method(hc, NVC57D_HEAD_SET_CONTROL_CURSOR_COMPOSITION(head), &v, 1);
         v = 0;
-        hwcur_core_method(NVC57D_UPDATE, &v, 1);
-        status = hwcur_core_kick(200);
+        hwcur_core_method(hc, NVC57D_UPDATE, &v, 1);
+        status = hwcur_core_kick(hc, 200);
         nv_printf(0, "[eclipse-rm-trace] hwcursor: image %ux%u programmed -> 0x%x\n",
                   w, h, status);
     }
@@ -10841,13 +10854,13 @@ out:
  * in 5:0). Free is only ever 0 while the display FE is consuming a previous
  * method, so the first read succeeds in the steady state and the poll is
  * pure timeout insurance (nvkms WaitForFreeSpace, nvkms-cursor3.c). */
-static void hwcur_pio_wait_free(void)
+static void hwcur_pio_wait_free(EclipseHwCurState *hc)
 {
     static NvBool warned = NV_FALSE;
     NvU32 i;
     for (i = 0; i < 10000; i++)
     {
-        if ((g_hwcur.pCursCtl[NVC57A_FREE / 4] & 0x3F) != 0)
+        if ((hc->pCursCtl[NVC57A_FREE / 4] & 0x3F) != 0)
             return;
         os_delay_us(1);
     }
@@ -10871,15 +10884,16 @@ static void hwcur_pio_wait_free(void)
  * every mouse event burned the whole Free poll -- the pointer was paced to
  * the refresh rate and felt sluggish. Releasing ELV belongs to the modeset
  * interlock dance (nvkms ReleaseElvC3), never to a move. */
-NV_STATUS eclipse_rm_hwcursor_move(NvS32 x, NvS32 y)
+NV_STATUS eclipse_rm_hwcursor_move(NvU32 gpuInstance, NvS32 x, NvS32 y)
 {
-    if (!g_hwcur.ready || g_hwcur.pCursCtl == NULL)
+    EclipseHwCurState *hc = hwcur_of(gpuInstance);
+    if (hc == NULL || !hc->ready || hc->pCursCtl == NULL)
         return NV_ERR_INVALID_STATE;
-    hwcur_pio_wait_free();
-    g_hwcur.pCursCtl[NVC57A_SET_CURSOR_HOT_SPOT_POINT_OUT(0) / 4] =
+    hwcur_pio_wait_free(hc);
+    hc->pCursCtl[NVC57A_SET_CURSOR_HOT_SPOT_POINT_OUT(0) / 4] =
         ((NvU32)(NvU16)(NvS16)y << 16) | (NvU32)(NvU16)(NvS16)x;
-    hwcur_pio_wait_free();
-    g_hwcur.pCursCtl[NVC57A_UPDATE / 4] =
+    hwcur_pio_wait_free(hc);
+    hc->pCursCtl[NVC57A_UPDATE / 4] =
         DRF_DEF(C57A, _UPDATE, _FLIP_LOCK_PIN, _LOCK_PIN_NONE);
     return NV_OK;
 }
@@ -10887,16 +10901,16 @@ NV_STATUS eclipse_rm_hwcursor_move(NvS32 x, NvS32 y)
 /* Disable the cursor plane (core channel) -- used when userspace hides it. */
 NV_STATUS eclipse_rm_hwcursor_hide(NvU32 gpuInstance)
 {
+    EclipseHwCurState *hc = hwcur_of(gpuInstance);
     NvU32 v;
     NV_STATUS status;
-    (void)gpuInstance;
-    if (!g_hwcur.ready)
+    if (hc == NULL || !hc->ready)
         return NV_ERR_INVALID_STATE;
     v = DRF_DEF(C57D, _HEAD_SET_CONTROL_CURSOR, _ENABLE, _DISABLE);
-    hwcur_core_method(NVC57D_HEAD_SET_CONTROL_CURSOR(g_hwcur.head), &v, 1);
+    hwcur_core_method(hc, NVC57D_HEAD_SET_CONTROL_CURSOR(hc->head), &v, 1);
     v = 0;
-    hwcur_core_method(NVC57D_UPDATE, &v, 1);
-    status = hwcur_core_kick(200);
+    hwcur_core_method(hc, NVC57D_UPDATE, &v, 1);
+    status = hwcur_core_kick(hc, 200);
     nv_printf(0, "[eclipse-rm-trace] hwcursor: hide -> 0x%x\n", status);
     return status;
 }
@@ -11281,7 +11295,7 @@ typedef struct EclipseHwFlipInit
  * flip allocates nothing and frees nothing. */
 #define ECLIPSE_HWFLIP_ISO_SLOTS 4
 
-static struct
+typedef struct EclipseHwFlipState
 {
     NvU32  hWinPbMem;
     NvU32  hWinPbDma;
@@ -11304,26 +11318,34 @@ static struct
     NvU32  head;
     NvBool ownerProgrammed;
     NvBool ready;
-} g_hwflip;
+} EclipseHwFlipState;
 
-static void hwflip_win_method(NvU32 method, const NvU32 *args, NvU32 count)
+/* Per GPU, for the same reason as g_hwcurAll. */
+static EclipseHwFlipState g_hwflipAll[ECLIPSE_MAX_GPUS];
+
+static EclipseHwFlipState *hwflip_of(NvU32 gpuInstance)
+{
+    return (gpuInstance < ECLIPSE_MAX_GPUS) ? &g_hwflipAll[gpuInstance] : NULL;
+}
+
+static void hwflip_win_method(EclipseHwFlipState *hf, NvU32 method, const NvU32 *args, NvU32 count)
 {
     volatile NvU32 *pb;
     NvU32 i;
-    if ((g_hwflip.winPbPut + 4 * (count + 2)) > (ECLIPSE_HWFLIP_PB_SIZE - 8))
+    if ((hf->winPbPut + 4 * (count + 2)) > (ECLIPSE_HWFLIP_PB_SIZE - 8))
     {
-        pb = (volatile NvU32 *)(g_hwflip.pWinPbCpu + g_hwflip.winPbPut);
+        pb = (volatile NvU32 *)(hf->pWinPbCpu + hf->winPbPut);
         pb[0] = DRF_DEF(C57E, _DMA, _OPCODE, _JUMP) |
                 DRF_NUM(C57E, _DMA, _METHOD_OFFSET, 0);
-        g_hwflip.winPbPut = 0;
+        hf->winPbPut = 0;
     }
-    pb = (volatile NvU32 *)(g_hwflip.pWinPbCpu + g_hwflip.winPbPut);
+    pb = (volatile NvU32 *)(hf->pWinPbCpu + hf->winPbPut);
     pb[0] = DRF_DEF(C57E, _DMA, _OPCODE, _METHOD) |
             DRF_NUM(C57E, _DMA, _METHOD_COUNT, count) |
             DRF_NUM(C57E, _DMA, _METHOD_OFFSET, method >> 2);
     for (i = 0; i < count; i++)
         pb[1 + i] = args[i];
-    g_hwflip.winPbPut += 4 * (count + 1);
+    hf->winPbPut += 4 * (count + 1);
 }
 
 /* Ring the window channel (Put = new byte offset) and return. Nothing here
@@ -11335,19 +11357,19 @@ static void hwflip_win_method(NvU32 method, const NvU32 *args, NvU32 count)
  * UPDATE, and every other RM entry spun on the gate behind it. The pushbuffer
  * is protected instead at the START of the next flip: see
  * eclipse_rm_hwflip_pending() / the BUSY refusal in eclipse_rm_hwflip_surface(). */
-static void hwflip_win_kick_nowait(void)
+static void hwflip_win_kick_nowait(EclipseHwFlipState *hf)
 {
     osFlushCpuWriteCombineBuffer();
-    g_hwflip.pWinCtl->Put = g_hwflip.winPbPut;
+    hf->pWinCtl->Put = hf->winPbPut;
     osFlushCpuWriteCombineBuffer();
 }
 
 /* Same for the core channel, for the per-flip interlock UPDATE. The cursor
  * paths keep hwcur_core_kick(): a cursor image change is rare and may wait. */
-static void hwcur_core_kick_nowait(void)
+static void hwcur_core_kick_nowait(EclipseHwCurState *hc)
 {
     osFlushCpuWriteCombineBuffer();
-    g_hwcur.pCoreCtl->Put = g_hwcur.pbPut;
+    hc->pCoreCtl->Put = hc->pbPut;
     osFlushCpuWriteCombineBuffer();
 }
 
@@ -11355,13 +11377,17 @@ static void hwcur_core_kick_nowait(void)
  * (window or core Get behind Put). Reads two mapped control words and no RM
  * state: callable without RmGate, from a poll loop. Not ready = nothing
  * pending. */
-NvBool eclipse_rm_hwflip_pending(void)
+NvBool eclipse_rm_hwflip_pending(NvU32 gpuInstance)
 {
-    if (!g_hwflip.ready || g_hwflip.pWinCtl == NULL)
+    EclipseHwFlipState *hf = hwflip_of(gpuInstance);
+    EclipseHwCurState *hc = hwcur_of(gpuInstance);
+    if (hf == NULL || hc == NULL)
         return NV_FALSE;
-    if (g_hwflip.pWinCtl->Get != g_hwflip.winPbPut)
+    if (!hf->ready || hf->pWinCtl == NULL)
+        return NV_FALSE;
+    if (hf->pWinCtl->Get != hf->winPbPut)
         return NV_TRUE;
-    if (g_hwcur.pCoreCtl != NULL && g_hwcur.pCoreCtl->Get != g_hwcur.pbPut)
+    if (hc->pCoreCtl != NULL && hc->pCoreCtl->Get != hc->pbPut)
         return NV_TRUE;
     return NV_FALSE;
 }
@@ -11387,7 +11413,7 @@ NvBool eclipse_rm_hwflip_pending(void)
  * buffer can have its handle number recycled for a different one, and then the
  * handle alone would match a ctxdma covering memory that is no longer there.
  */
-static NV_STATUS hwflip_iso_ctxdma(RM_API *pRmApi, RsClient *pRsClient,
+static NV_STATUS hwflip_iso_ctxdma(EclipseHwFlipState *hf, RM_API *pRmApi, RsClient *pRsClient,
                                    NvU32 gpuInstance, NvU32 hMemory, NvU32 *phDma)
 {
     NV_CONTEXT_DMA_ALLOCATION_PARAMS dp;
@@ -11408,18 +11434,18 @@ static NV_STATUS hwflip_iso_ctxdma(RM_API *pRmApi, RsClient *pRsClient,
 
     for (i = 0; i < ECLIPSE_HWFLIP_ISO_SLOTS; i++)
     {
-        if (g_hwflip.iso[i].useSeq > newest)
-            newest = g_hwflip.iso[i].useSeq;
+        if (hf->iso[i].useSeq > newest)
+            newest = hf->iso[i].useSeq;
     }
 
     for (i = 0; i < ECLIPSE_HWFLIP_ISO_SLOTS; i++)
     {
-        if (g_hwflip.iso[i].hDma != 0 &&
-            g_hwflip.iso[i].hMem == hMemory &&
-            g_hwflip.iso[i].pMemDesc == pMemDesc)
+        if (hf->iso[i].hDma != 0 &&
+            hf->iso[i].hMem == hMemory &&
+            hf->iso[i].pMemDesc == pMemDesc)
         {
-            g_hwflip.iso[i].useSeq = ++g_hwflip.isoSeq;
-            *phDma = g_hwflip.iso[i].hDma;
+            hf->iso[i].useSeq = ++hf->isoSeq;
+            *phDma = hf->iso[i].hDma;
             return NV_OK;
         }
     }
@@ -11427,7 +11453,7 @@ static NV_STATUS hwflip_iso_ctxdma(RM_API *pRmApi, RsClient *pRsClient,
     victim = ECLIPSE_HWFLIP_ISO_SLOTS;
     for (i = 0; i < ECLIPSE_HWFLIP_ISO_SLOTS; i++)
     {
-        if (g_hwflip.iso[i].hDma == 0)
+        if (hf->iso[i].hDma == 0)
         {
             victim = i;
             break;
@@ -11439,21 +11465,21 @@ static NV_STATUS hwflip_iso_ctxdma(RM_API *pRmApi, RsClient *pRsClient,
         {
             /* The previous flip's surface: the front end may still be
              * scanning it out, so its ctxdma is not ours to free. */
-            if (g_hwflip.iso[i].useSeq == newest)
+            if (hf->iso[i].useSeq == newest)
                 continue;
             if (victim == ECLIPSE_HWFLIP_ISO_SLOTS ||
-                g_hwflip.iso[i].useSeq < g_hwflip.iso[victim].useSeq)
+                hf->iso[i].useSeq < hf->iso[victim].useSeq)
                 victim = i;
         }
         /* Unreachable while the table has more than one slot: at most one slot
          * can hold `newest`, so at least one is always evictable. */
         if (victim == ECLIPSE_HWFLIP_ISO_SLOTS)
             return NV_ERR_INVALID_STATE;
-        pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, g_hwflip.iso[victim].hDma);
-        g_hwflip.iso[victim].hDma = 0;
-        g_hwflip.iso[victim].hMem = 0;
-        g_hwflip.iso[victim].pMemDesc = NULL;
-        g_hwflip.iso[victim].useSeq = 0;
+        pRmApi->Free(pRmApi, g_grAllocCache[gpuInstance].hClient, hf->iso[victim].hDma);
+        hf->iso[victim].hDma = 0;
+        hf->iso[victim].hMem = 0;
+        hf->iso[victim].pMemDesc = NULL;
+        hf->iso[victim].useSeq = 0;
     }
 
     memSize = memdescGetSize(pMemDesc);
@@ -11472,17 +11498,19 @@ static NV_STATUS hwflip_iso_ctxdma(RM_API *pRmApi, RsClient *pRsClient,
     if (status != NV_OK)
         return status;
 
-    g_hwflip.iso[victim].hDma = hDma;
-    g_hwflip.iso[victim].hMem = hMemory;
-    g_hwflip.iso[victim].pMemDesc = pMemDesc;
-    g_hwflip.iso[victim].useSeq = ++g_hwflip.isoSeq;
-    g_hwflip.isoBuilds++;
+    hf->iso[victim].hDma = hDma;
+    hf->iso[victim].hMem = hMemory;
+    hf->iso[victim].pMemDesc = pMemDesc;
+    hf->iso[victim].useSeq = ++hf->isoSeq;
+    hf->isoBuilds++;
     *phDma = hDma;
     return NV_OK;
 }
 
 NV_STATUS eclipse_rm_hwflip_init(NvU32 gpuInstance, NvU32 head, EclipseHwFlipInit *pOut)
 {
+    EclipseHwFlipState *hf = hwflip_of(gpuInstance);
+    EclipseHwCurState *hc = hwcur_of(gpuInstance);
     OBJGPU *pGpu;
     RM_API *pRmApi;
     NV_STATUS status;
@@ -11492,19 +11520,19 @@ NV_STATUS eclipse_rm_hwflip_init(NvU32 gpuInstance, NvU32 head, EclipseHwFlipIni
     Memory *pPbMemory = NULL;
     EclipseHwCursorInit cursOut;
 
-    if (pOut == NULL)
+    if (pOut == NULL || hf == NULL || hc == NULL)
         return NV_ERR_INVALID_ARGUMENT;
     portMemSet(pOut, 0, sizeof(*pOut));
     pOut->coreEnsureStatus = pOut->winPbMemStatus = pOut->winPbDmaStatus = 0xFFFFFFFF;
     pOut->winChanStatus = pOut->winMapStatus = pOut->ownerStatus = 0xFFFFFFFF;
     pOut->windowIdx = head; /* one primary window per head for MVP */
 
-    if (g_hwflip.ready)
+    if (hf->ready)
     {
         pOut->coreEnsureStatus = NV_OK;
         pOut->winPbMemStatus = pOut->winPbDmaStatus = pOut->winChanStatus = NV_OK;
         pOut->winMapStatus = pOut->ownerStatus = NV_OK;
-        pOut->windowIdx = g_hwflip.windowIdx;
+        pOut->windowIdx = hf->windowIdx;
         return NV_OK;
     }
     if (!g_grAllocDone[gpuInstance])
@@ -11512,10 +11540,10 @@ NV_STATUS eclipse_rm_hwflip_init(NvU32 gpuInstance, NvU32 head, EclipseHwFlipIni
 
     /* Need NVC570 + NVC57D. Reuse hwcursor ladder (idempotent) — cursor plane
      * stays disabled until an explicit hwcursor_image. */
-    if (!g_hwcur.ready)
+    if (!hc->ready)
     {
         pOut->coreEnsureStatus = eclipse_rm_hwcursor_init(gpuInstance, head, &cursOut);
-        if (pOut->coreEnsureStatus != NV_OK || !g_hwcur.ready)
+        if (pOut->coreEnsureStatus != NV_OK || !hc->ready)
         {
             nv_printf(0, "[eclipse-rm-trace] hwflip: core ensure failed -> 0x%x\n",
                       pOut->coreEnsureStatus);
@@ -11560,8 +11588,8 @@ NV_STATUS eclipse_rm_hwflip_init(NvU32 gpuInstance, NvU32 head, EclipseHwFlipIni
     if (status != NV_OK)
         goto unlock;
 
-    g_hwflip.head = head;
-    g_hwflip.windowIdx = head;
+    hf->head = head;
+    hf->windowIdx = head;
 
     /* Window pushbuffer (separate from core PB). */
     {
@@ -11575,23 +11603,23 @@ NV_STATUS eclipse_rm_hwflip_init(NvU32 gpuInstance, NvU32 head, EclipseHwFlipIni
                   DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS) |
                   DRF_DEF(OS32, _ATTR, _COHERENCY, _CACHED);
         mp.attr2 = NVOS32_ATTR2_NONE;
-        status = clientGenResourceHandle(pRsClient, &g_hwflip.hWinPbMem);
+        status = clientGenResourceHandle(pRsClient, &hf->hWinPbMem);
         if (status != NV_OK) goto unlock;
         pOut->winPbMemStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                       g_grAllocCache[gpuInstance].hDevice, g_hwflip.hWinPbMem,
+                                                       g_grAllocCache[gpuInstance].hDevice, hf->hWinPbMem,
                                                        NV01_MEMORY_SYSTEM, &mp, sizeof(mp));
         nv_printf(0, "[eclipse-rm-trace] hwflip: win pb -> 0x%x hMem=0x%x\n",
-                  pOut->winPbMemStatus, g_hwflip.hWinPbMem);
+                  pOut->winPbMemStatus, hf->hWinPbMem);
         if (pOut->winPbMemStatus != NV_OK) goto unlock;
 
         portMemSet(&dp, 0, sizeof(dp));
-        dp.hMemory = g_hwflip.hWinPbMem;
+        dp.hMemory = hf->hWinPbMem;
         dp.offset = 0;
         dp.limit = ECLIPSE_HWFLIP_PB_SIZE - 1;
-        status = clientGenResourceHandle(pRsClient, &g_hwflip.hWinPbDma);
+        status = clientGenResourceHandle(pRsClient, &hf->hWinPbDma);
         if (status != NV_OK) goto unlock;
         pOut->winPbDmaStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                       g_grAllocCache[gpuInstance].hDevice, g_hwflip.hWinPbDma,
+                                                       g_grAllocCache[gpuInstance].hDevice, hf->hWinPbDma,
                                                        NV01_CONTEXT_DMA, &dp, sizeof(dp));
         if (pOut->winPbDmaStatus != NV_OK) goto unlock;
     }
@@ -11600,32 +11628,32 @@ NV_STATUS eclipse_rm_hwflip_init(NvU32 gpuInstance, NvU32 head, EclipseHwFlipIni
     {
         NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS cp;
         portMemSet(&cp, 0, sizeof(cp));
-        cp.channelInstance = g_hwflip.windowIdx;
-        cp.hObjectBuffer = g_hwflip.hWinPbDma;
-        cp.hObjectNotify = g_hwcur.hNotDma;
+        cp.channelInstance = hf->windowIdx;
+        cp.hObjectBuffer = hf->hWinPbDma;
+        cp.hObjectNotify = hc->hNotDma;
         cp.offset = 0;
         cp.channelPBSize = PB_SIZE_4KB;
         cp.subDeviceId = 1;
-        status = clientGenResourceHandle(pRsClient, &g_hwflip.hWin);
+        status = clientGenResourceHandle(pRsClient, &hf->hWin);
         if (status != NV_OK) goto unlock;
         pOut->winChanStatus = pRmApi->AllocWithHandle(pRmApi, g_grAllocCache[gpuInstance].hClient,
-                                                      g_hwcur.hDisp, g_hwflip.hWin,
+                                                      hc->hDisp, hf->hWin,
                                                       NVC57E_WINDOW_CHANNEL_DMA, &cp, sizeof(cp));
-        g_hwflip.pWinCtl = (volatile EclipseDispDmaControl *)(NvUPtr)cp.pControl;
+        hf->pWinCtl = (volatile EclipseDispDmaControl *)(NvUPtr)cp.pControl;
         nv_printf(0, "[eclipse-rm-trace] hwflip: NVC57E win%u -> 0x%x hWin=0x%x pCtl=0x%llx\n",
-                  g_hwflip.windowIdx, pOut->winChanStatus, g_hwflip.hWin,
+                  hf->windowIdx, pOut->winChanStatus, hf->hWin,
                   (NvU64)(NvUPtr)cp.pControl);
-        if (pOut->winChanStatus != NV_OK || g_hwflip.pWinCtl == NULL) goto unlock;
+        if (pOut->winChanStatus != NV_OK || hf->pWinCtl == NULL) goto unlock;
     }
 
-    status = memGetByHandle(pRsClient, g_hwflip.hWinPbMem, &pPbMemory);
+    status = memGetByHandle(pRsClient, hf->hWinPbMem, &pPbMemory);
     if (status == NV_OK && pPbMemory->pMemDesc != NULL)
     {
-        g_hwflip.pWinPbCpu = memmgrMemDescBeginTransfer(pMemoryManager,
+        hf->pWinPbCpu = memmgrMemDescBeginTransfer(pMemoryManager,
                                                         pPbMemory->pMemDesc,
                                                         TRANSFER_FLAGS_NONE);
     }
-    pOut->winMapStatus = (g_hwflip.pWinPbCpu != NULL) ? NV_OK : NV_ERR_GENERIC;
+    pOut->winMapStatus = (hf->pWinPbCpu != NULL) ? NV_OK : NV_ERR_GENERIC;
     if (pOut->winMapStatus != NV_OK) goto unlock;
 
     /* Own the window on this head + allow RGB packed 4 BPP (XRGB8888). */
@@ -11633,35 +11661,35 @@ NV_STATUS eclipse_rm_hwflip_init(NvU32 gpuInstance, NvU32 head, EclipseHwFlipIni
         NvU32 args[1];
         args[0] = DRF_NUM(C57D, _WINDOW_SET_CONTROL, _OWNER,
                           NVC57D_WINDOW_SET_CONTROL_OWNER_HEAD(head));
-        hwcur_core_method(NVC57D_WINDOW_SET_CONTROL(g_hwflip.windowIdx), args, 1);
+        hwcur_core_method(hc, NVC57D_WINDOW_SET_CONTROL(hf->windowIdx), args, 1);
         args[0] = DRF_DEF(C57D, _WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS,
                           _RGB_PACKED4BPP, _TRUE);
-        hwcur_core_method(NVC57D_WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS(g_hwflip.windowIdx),
+        hwcur_core_method(hc, NVC57D_WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS(hf->windowIdx),
                           args, 1);
         args[0] = DRF_NUM(C57D, _WINDOW_SET_WINDOW_USAGE_BOUNDS,
                           _MAX_PIXELS_FETCHED_PER_LINE, 0x7FFF) |
                   DRF_DEF(C57D, _WINDOW_SET_WINDOW_USAGE_BOUNDS,
                           _INPUT_SCALER_TAPS, _TAPS_2);
-        hwcur_core_method(NVC57D_WINDOW_SET_WINDOW_USAGE_BOUNDS(g_hwflip.windowIdx),
+        hwcur_core_method(hc, NVC57D_WINDOW_SET_WINDOW_USAGE_BOUNDS(hf->windowIdx),
                           args, 1);
         args[0] = 0;
-        hwcur_core_method(NVC57D_UPDATE, args, 1);
-        pOut->ownerStatus = hwcur_core_kick(200);
+        hwcur_core_method(hc, NVC57D_UPDATE, args, 1);
+        pOut->ownerStatus = hwcur_core_kick(hc, 200);
         if (pOut->ownerStatus != NV_OK) goto unlock;
-        g_hwflip.ownerProgrammed = NV_TRUE;
+        hf->ownerProgrammed = NV_TRUE;
     }
 
-    g_hwflip.winPbPut = 0;
-    g_hwflip.ready = NV_TRUE;
+    hf->winPbPut = 0;
+    hf->ready = NV_TRUE;
     nv_printf(0, "[eclipse-rm-trace] hwflip: READY (head %u window %u)\n",
-              head, g_hwflip.windowIdx);
+              head, hf->windowIdx);
 
 unlock:
     rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
-    return g_hwflip.ready ? NV_OK : NV_ERR_GENERIC;
+    return hf->ready ? NV_OK : NV_ERR_GENERIC;
 }
 
 /*
@@ -11676,6 +11704,8 @@ NV_STATUS eclipse_rm_hwflip_surface(
     NvU32 height,
     NvU32 pitchBytes)
 {
+    EclipseHwFlipState *hf = hwflip_of(gpuInstance);
+    EclipseHwCurState *hc = hwcur_of(gpuInstance);
     OBJGPU *pGpu;
     RM_API *pRmApi;
     NV_STATUS status;
@@ -11685,14 +11715,14 @@ NV_STATUS eclipse_rm_hwflip_surface(
     NvU32 pitchUnits;
     NvU32 hIsoDma = 0;
 
-    if (!g_hwflip.ready || hMemory == 0 || width == 0 || height == 0 || pitchBytes == 0)
+    if (hf == NULL || hc == NULL || !hf->ready || hMemory == 0 || width == 0 || height == 0 || pitchBytes == 0)
         return NV_ERR_INVALID_STATE;
     /* The previous flip's methods are still being fetched: writing more would
      * append behind an UPDATE the FE has not executed (and, 4 KiB later, wrap
      * onto methods it has not read). The caller drains with
      * eclipse_rm_hwflip_pending() first, outside every lock, so this is the
      * safety net, not the wait. Nothing has been written when it fires. */
-    if (eclipse_rm_hwflip_pending())
+    if (eclipse_rm_hwflip_pending(gpuInstance))
         return NV_ERR_BUSY_RETRY;
     if ((pitchBytes & 63) != 0)
         return NV_ERR_INVALID_ARGUMENT; /* must be 64 B aligned for ISO pitch units */
@@ -11740,7 +11770,7 @@ NV_STATUS eclipse_rm_hwflip_surface(
 
     /* The ISO ctxdma covering this framebuffer, built once per buffer and
      * then reused as the compositor rotates its swapchain. */
-    status = hwflip_iso_ctxdma(pRmApi, pRsClient, gpuInstance,
+    status = hwflip_iso_ctxdma(hf, pRmApi, pRsClient, gpuInstance,
                                hMemory, &hIsoDma);
     if (status != NV_OK)
         goto unlock;
@@ -11748,51 +11778,51 @@ NV_STATUS eclipse_rm_hwflip_surface(
     /* Window surface program (pitch-linear XRGB8888) — match nouveau wndwc57e. */
     args[0] = DRF_NUM(C57E, _SET_SIZE, _WIDTH, width) |
               DRF_NUM(C57E, _SET_SIZE, _HEIGHT, height);
-    hwflip_win_method(NVC57E_SET_SIZE, args, 1);
+    hwflip_win_method(hf, NVC57E_SET_SIZE, args, 1);
 
     args[0] = DRF_DEF(C57E, _SET_STORAGE, _MEMORY_LAYOUT, _PITCH);
-    hwflip_win_method(NVC57E_SET_STORAGE, args, 1);
+    hwflip_win_method(hf, NVC57E_SET_STORAGE, args, 1);
 
     args[0] = DRF_DEF(C57E, _SET_PARAMS, _FORMAT, _X8R8G8B8);
-    hwflip_win_method(NVC57E_SET_PARAMS, args, 1);
+    hwflip_win_method(hf, NVC57E_SET_PARAMS, args, 1);
 
     args[0] = DRF_NUM(C57E, _SET_PLANAR_STORAGE, _PITCH, pitchUnits);
-    hwflip_win_method(NVC57E_SET_PLANAR_STORAGE(0), args, 1);
+    hwflip_win_method(hf, NVC57E_SET_PLANAR_STORAGE(0), args, 1);
 
     args[0] = hIsoDma;
-    hwflip_win_method(NVC57E_SET_CONTEXT_DMA_ISO(0), args, 1);
+    hwflip_win_method(hf, NVC57E_SET_CONTEXT_DMA_ISO(0), args, 1);
 
     /* Origin in 256-byte units, relative to the ISO ctxdma (BO start = 0). */
     args[0] = (NvU32)(fbmemOffset >> 8);
-    hwflip_win_method(NVC57E_SET_OFFSET(0), args, 1);
+    hwflip_win_method(hf, NVC57E_SET_OFFSET(0), args, 1);
 
     args[0] = 0; /* point-in (0,0) */
-    hwflip_win_method(NVC57E_SET_POINT_IN(0), args, 1);
+    hwflip_win_method(hf, NVC57E_SET_POINT_IN(0), args, 1);
 
     args[0] = DRF_NUM(C57E, _SET_SIZE_IN, _WIDTH, width) |
               DRF_NUM(C57E, _SET_SIZE_IN, _HEIGHT, height);
-    hwflip_win_method(NVC57E_SET_SIZE_IN, args, 1);
+    hwflip_win_method(hf, NVC57E_SET_SIZE_IN, args, 1);
 
     args[0] = DRF_NUM(C57E, _SET_SIZE_OUT, _WIDTH, width) |
               DRF_NUM(C57E, _SET_SIZE_OUT, _HEIGHT, height);
-    hwflip_win_method(NVC57E_SET_SIZE_OUT, args, 1);
+    hwflip_win_method(hf, NVC57E_SET_SIZE_OUT, args, 1);
 
     args[0] = DRF_DEF(C57E, _SET_PRESENT_CONTROL, _BEGIN_MODE, _NON_TEARING);
-    hwflip_win_method(NVC57E_SET_PRESENT_CONTROL, args, 1);
+    hwflip_win_method(hf, NVC57E_SET_PRESENT_CONTROL, args, 1);
 
     args[0] = 0;
-    hwflip_win_method(NVC57E_UPDATE, args, 1);
-    hwflip_win_kick_nowait();
+    hwflip_win_method(hf, NVC57E_UPDATE, args, 1);
+    hwflip_win_kick_nowait(hf);
 
     /* Core interlock with this window + RELEASE_ELV so the FE latches. Kicked
      * without waiting as well: the flip completes at the panel's next vblank
      * on its own, and the next flip checks eclipse_rm_hwflip_pending() before
      * it writes. */
-    args[0] = (NvU32)(1u << (g_hwflip.windowIdx & 31));
-    hwcur_core_method(NVC57D_SET_WINDOW_INTERLOCK_FLAGS, args, 1);
+    args[0] = (NvU32)(1u << (hf->windowIdx & 31));
+    hwcur_core_method(hc, NVC57D_SET_WINDOW_INTERLOCK_FLAGS, args, 1);
     args[0] = DRF_DEF(C57D, _UPDATE, _RELEASE_ELV, _TRUE);
-    hwcur_core_method(NVC57D_UPDATE, args, 1);
-    hwcur_core_kick_nowait();
+    hwcur_core_method(hc, NVC57D_UPDATE, args, 1);
+    hwcur_core_kick_nowait(hc);
     status = NV_OK;
 
 unlock:
@@ -11803,15 +11833,17 @@ unlock:
     return status;
 }
 
-NvBool eclipse_rm_hwflip_ready(void)
+NvBool eclipse_rm_hwflip_ready(NvU32 gpuInstance)
 {
-    return g_hwflip.ready;
+    EclipseHwFlipState *hf = hwflip_of(gpuInstance);
+    return hf != NULL && hf->ready;
 }
 
 /* ISO ctxdmas allocated since boot. One per distinct framebuffer the
  * compositor ever flips is the healthy number; one per flip means the table
  * above is thrashing and every frame is paying an RM alloc. */
-NvU64 eclipse_rm_hwflip_iso_builds(void)
+NvU64 eclipse_rm_hwflip_iso_builds(NvU32 gpuInstance)
 {
-    return g_hwflip.isoBuilds;
+    EclipseHwFlipState *hf = hwflip_of(gpuInstance);
+    return (hf != NULL) ? hf->isoBuilds : 0;
 }
