@@ -2286,6 +2286,11 @@ pub use prime_import::{
 mod topology;
 pub use topology::{resources_for_node, topology_for, NodeFacts, NodeTopology};
 
+mod node_lookup;
+pub use node_lookup::{
+    get_connector_edid_on, get_connector_on, get_crtc_on, get_plane_on, get_planes_typed_on,
+};
+
 mod panel_state;
 #[cfg(test)]
 pub(crate) use panel_state::panel_fb_for_test;
@@ -7832,6 +7837,15 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
 }
 
 pub fn get_connector(id: u32) -> Option<DrmConnector> {
+    get_connector_among(snapshot_drivers, id)
+}
+
+/// [`get_connector`], asking only the drivers `drivers` hands back. Called
+/// lazily so the synthetic id is still answered without a snapshot.
+fn get_connector_among(
+    drivers: impl FnOnce() -> Vec<Arc<dyn DrmScheme>>,
+    id: u32,
+) -> Option<DrmConnector> {
     // Keyed on the ID, never on which scanout path happens to be active right
     // now. The synthetic id is still served without touching a driver -- that
     // is what this gate was for: `nvidia.get_connector` runs a live GSP/DDC
@@ -7853,7 +7867,7 @@ pub fn get_connector(id: u32) -> Option<DrmConnector> {
     // 1001+), so an id is enough to decide who owns it.
     if id != SYNTH_CONNECTOR_ID {
         // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
-        for driver in snapshot_drivers() {
+        for driver in drivers() {
             if let Some(conn) = driver.get_connector(id) {
                 return Some(conn);
             }
@@ -7941,8 +7955,13 @@ fn edid_refusal_reason(block: &[u8]) -> Option<&'static str> {
 }
 
 pub fn get_connector_edid(id: u32) -> Option<[u8; 128]> {
+    get_connector_edid_among(snapshot_drivers(), id)
+}
+
+/// [`get_connector_edid`], asking only `drivers`.
+fn get_connector_edid_among(drivers: Vec<Arc<dyn DrmScheme>>, id: u32) -> Option<[u8; 128]> {
     // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
-    for driver in snapshot_drivers() {
+    for driver in drivers {
         if let Some(edid) = driver.get_connector_edid(id) {
             // Validated here, not in the driver, and for the same reason Linux
             // validates in `drm_connector_update_edid_property` rather than in
@@ -7977,13 +7996,18 @@ pub fn get_connector_edid(id: u32) -> Option<[u8; 128]> {
 }
 
 pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
+    get_crtc_among(snapshot_drivers, id)
+}
+
+/// [`get_crtc`], asking only the drivers `drivers` hands back.
+fn get_crtc_among(drivers: impl FnOnce() -> Vec<Arc<dyn DrmScheme>>, id: u32) -> Option<DrmCrtc> {
     // Keyed on the ID, not on the live scanout path -- see `get_connector`
     // for why asking `software_kms_active()` here made advertised ids come
     // back EINVAL mid-probe. The synthetic id is still served without
     // touching a driver.
     if id != SYNTH_CRTC_ID {
         // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
-        for driver in snapshot_drivers() {
+        for driver in drivers() {
             if let Some(mut crtc) = driver.get_crtc(id) {
                 // Keep userspace-facing fb ids in the DRM core namespace.
                 // Read crtc_fb once (a second lock could observe a torn update).
@@ -8077,13 +8101,18 @@ pub fn get_planes_typed() -> Vec<DrmPlane> {
 }
 
 pub fn get_plane(id: u32) -> Option<DrmPlane> {
+    get_plane_among(snapshot_drivers, id)
+}
+
+/// [`get_plane`], asking only the drivers `drivers` hands back.
+fn get_plane_among(drivers: impl FnOnce() -> Vec<Arc<dyn DrmScheme>>, id: u32) -> Option<DrmPlane> {
     // Keyed on the ID, not on the live scanout path -- see `get_connector`
     // for why asking `software_kms_active()` here made advertised ids come
     // back EINVAL mid-probe. The synthetic id is still served without
     // touching a driver.
     let plane = if id != SYNTH_PLANE_ID {
         // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
-        snapshot_drivers()
+        drivers()
             .into_iter()
             .find_map(|driver| driver.get_plane(id))?
     } else {
