@@ -407,6 +407,17 @@ pub fn set_gem_vram_bar1_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_gem_vram_bar1_enabled(_v: bool) {}
 
+/// Puts a `VRAM | GART` `GEM_NEW` object (a compositor's scanout buffer) in
+/// VRAM, mapped for the CPU through BAR1 by the RM, so the display can flip to
+/// it with no copy (`nvidia.gem_vram`). Default off: see
+/// `drivers/src/display/nvidia/gem_vram.rs`.
+#[cfg(target_arch = "x86_64")]
+pub fn set_gem_vram_enabled(v: bool) {
+    zcore_drivers::display::set_gem_vram_enabled(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_gem_vram_enabled(_v: bool) {}
+
 /// Creates `/dev/nvidiactl` and `/dev/nvidia<N>` for NVIDIA's own user-mode
 /// driver (`nvidia.nvidiactl`). Default off: see
 /// `linux-object/src/fs/devfs/nvidia.rs`.

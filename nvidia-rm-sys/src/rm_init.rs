@@ -2264,13 +2264,30 @@ pub fn gem_alloc(
     size: u64,
     sysmem: bool,
 ) -> Result<GemAlloc, NV_STATUS> {
+    let flags = if sysmem { GEM_ALLOC_SYSMEM } else { 0 };
+    gem_alloc_with(device_instance, ctx_idx, size, flags)
+}
+
+/// [`gem_alloc`]'s `sysmem` as the flag the C takes it as.
+pub const GEM_ALLOC_SYSMEM: u32 = 1;
+/// VRAM in one physical run: what [`gem_map_bar1`] maps, and what the display
+/// can scan out from one offset.
+pub const GEM_ALLOC_VRAM_CONTIGUOUS: u32 = 2;
+
+/// [`gem_alloc`] with the C's flags: [`GEM_ALLOC_SYSMEM`], or
+/// [`GEM_ALLOC_VRAM_CONTIGUOUS`], or 0 for VRAM the RM may scatter.
+pub fn gem_alloc_with(
+    device_instance: u32,
+    ctx_idx: u32,
+    size: u64,
+    flags: u32,
+) -> Result<GemAlloc, NV_STATUS> {
     let _gate = RmGate::lock();
     let mut out = GemAlloc {
         alloc_status: 0xFFFF_FFFF,
         h_memory: 0,
     };
-    let status =
-        unsafe { eclipse_rm_gem_alloc(device_instance, ctx_idx, size, sysmem as NvU32, &mut out) };
+    let status = unsafe { eclipse_rm_gem_alloc(device_instance, ctx_idx, size, flags, &mut out) };
     if status == NV_OK {
         Ok(out)
     } else {
@@ -2431,6 +2448,58 @@ pub fn gem_map_cpu(
         size: 0,
     };
     let status = unsafe { eclipse_rm_gem_map_cpu(device_instance, ctx_idx, h_memory, &mut out) };
+    if status == NV_OK {
+        Ok(out)
+    } else {
+        Err(status)
+    }
+}
+
+/// Mirror of `EclipseGemBar1` (vendor/eclipse_rm_init.c).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GemBar1 {
+    /// `NV_OK` when `host_pa` maps the whole object.
+    pub status: NvU32,
+    /// BAR1 maps VRAM one to one on this GPU (no VA was allocated).
+    pub physical: NvU32,
+    pub bar1_offset: u64,
+    pub length: u64,
+    /// The CPU's address of the object's first byte: BAR1's base plus where
+    /// the RM mapped it.
+    pub host_pa: u64,
+    /// The object's VRAM offset (`AT_GPU`).
+    pub vram_offset: u64,
+}
+
+extern "C" {
+    fn eclipse_rm_gem_map_bar1(
+        device_instance: NvU32,
+        ctx_idx: NvU32,
+        h_memory: NvU32,
+        max_bytes: u64,
+        out: *mut GemBar1,
+    ) -> NV_STATUS;
+}
+
+/// Map the VRAM object `h_memory` (a [`GEM_ALLOC_VRAM_CONTIGUOUS`]
+/// allocation) into BAR1 for the CPU, through the RM, as Linux maps a buffer
+/// that lives in VRAM. [`gem_free`] gives the mapping back. `max_bytes` caps
+/// what this GPU's mappings hold together; over it `.status` is
+/// `NV_ERR_NO_MEMORY` and nothing is mapped.
+pub fn gem_map_bar1(
+    device_instance: u32,
+    ctx_idx: u32,
+    h_memory: u32,
+    max_bytes: u64,
+) -> Result<GemBar1, NV_STATUS> {
+    let _gate = RmGate::lock();
+    let mut out = GemBar1 {
+        status: 0xFFFF_FFFF,
+        ..GemBar1::default()
+    };
+    let status =
+        unsafe { eclipse_rm_gem_map_bar1(device_instance, ctx_idx, h_memory, max_bytes, &mut out) };
     if status == NV_OK {
         Ok(out)
     } else {

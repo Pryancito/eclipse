@@ -1214,6 +1214,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     "Eclipse: nvidia.gem_vram_bar1 -- VRAM GEM objects CPU-mapped through BAR1"
                 );
             }
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gem_vram") {
+                kernel_hal::drivers::set_gem_vram_enabled(true);
+                klog_info!(
+                    "Eclipse: nvidia.gem_vram -- buffers VRAM|GART en VRAM, mapeados por BAR1 \
+                     (flip de nvkms sin copias)"
+                );
+            }
             // The GPU policy BEFORE init(1) is spawned, not after.
             //
             // `wait_for_gpu_ready` in eclipse-init holds a GPU session back

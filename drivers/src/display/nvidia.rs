@@ -196,6 +196,9 @@ mod gmmu;
 /// ceiling, no logic change.
 mod vram_alloc;
 
+/// Where `GEM_NEW` puts an object; with `nvidia.gem_vram`, a scanout buffer
+/// in VRAM mapped through BAR1 by the RM (replaces `vram_bar1`).
+pub(super) mod gem_vram;
 /// CPU-mapping a VRAM `GEM_NEW` object through the BAR1 aperture: the
 /// arithmetic and the bounds check, own file for the size ceiling. The hatch
 /// is `nvidia.gem_vram_bar1`, default off.
@@ -5296,6 +5299,10 @@ impl DrmScheme for NvidiaGpu {
             return false;
         }
         if CE_PRESENT_WEDGED.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Another card's VRAM buffer: that card copies it (the C refuses it).
+        if gem_vram::foreign_bar1_source(self.bar1_phys, self.info.fb_size as u64, src_sysmem_pa) {
             return false;
         }
         let device_instance = match *self.rm_device_instance.lock() {
@@ -14011,14 +14018,12 @@ impl NvidiaGpu {
                 // `pte_kind_is_supported` in `nouveau_uapi.rs`.
                 // `record_gem_new` still notes the kind for
                 // /proc/gpudbg.
-                // Honour VRAM-only as true LOCAL (`NV01_MEMORY_LOCAL_USER`).
-                // GART, or GART|VRAM (NVK DEVICE_LOCAL|HOST_VISIBLE maps to
-                // that), stays sysmem so gem_map_cpu can publish a host PA.
-                // VRAM-only is DEVICE_LOCAL without HOST_VISIBLE: map_handle=0,
-                // never publish the FBMEM offset as a CPU address (that hole
-                // let userspace paint into low kernel RAM). Present/scanout
-                // stays on CREATE_DUMB sysmem; no BAR1 path is required here.
-                let sysmem = want_gart || !want_vram;
+                // VRAM-only is true LOCAL (`NV01_MEMORY_LOCAL_USER`) with no
+                // CPU mapping; GART stays sysmem; GART|VRAM (a dma-buf NVK
+                // wants device-local) is sysmem too, unless `nvidia.gem_vram`
+                // puts it in VRAM mapped through BAR1. See `gem_vram`.
+                let placement = gem_vram::placement(req.info.domain, gem_vram::enabled());
+                let sysmem = placement == gem_vram::Placement::Sysmem;
                 if req.info.size == 0 || req.info.size > u32::MAX as u64 {
                     return Err(nv::EINVAL);
                 }
@@ -14126,104 +14131,27 @@ impl NvidiaGpu {
                 // buffer allocated before its process has a context stays
                 // unattributed, which is the one gap this does not close.
                 let owner_ctx = self.ctx_idx_for_pid(owner_pid);
-                let alloc = match nvidia_rm_sys::rm_init::gem_alloc(
+                // Where it goes and what addresses it gets: see `gem_vram`.
+                let target = gem_vram::Target {
                     device_instance,
                     owner_ctx,
                     size,
-                    sysmem,
-                ) {
-                    Ok(a) if a.alloc_status == 0 => a,
-                    Ok(a) => {
-                        crate::klog_warn!(
-                            "[nouveau-uapi] GEM_NEW: RM alloc failed ({}), size={} status={:#x}",
-                            if sysmem { "sysmem/GART" } else { "vidmem/VRAM" },
-                            size,
-                            a.alloc_status
-                        );
-                        return Err(nv::ENOMEM);
-                    }
-                    Err(status) => {
-                        crate::klog_warn!(
-                            "[nouveau-uapi] GEM_NEW: gem_alloc ({}) failed, NV_STATUS={:#x}",
-                            if sysmem { "sysmem/GART" } else { "vidmem/VRAM" },
-                            status
-                        );
-                        return Err(nv::ENOMEM);
-                    }
+                    handle,
+                    bar1_phys: self.bar1_phys,
+                    bar1_len: self.info.fb_size as u64,
                 };
-                if !sysmem {
-                    static FIRST_VRAM_GEM: AtomicBool = AtomicBool::new(false);
-                    if !FIRST_VRAM_GEM.swap(true, Ordering::Relaxed) {
-                        crate::klog_info!(
-                            "[nouveau-uapi] GEM_NEW: first VRAM-only LOCAL alloc size={} hMemory={:#010x}",
-                            size,
-                            alloc.h_memory
-                        );
-                    }
-                }
-                // Real host physical address for sysmem/GART objects. VRAM-only
-                // (ADDR_FBMEM) is not CPU-mmap-able: gem_map_cpu refuses FBMEM
-                // because memdescGetPhysAddr(AT_CPU) is a VRAM offset, not BAR1.
-                // Skipping the lookup avoids a NOT_SUPPORTED trace per LOCAL BO.
-                let phys_addr = if sysmem {
-                    match nvidia_rm_sys::rm_init::gem_map_cpu(
-                        device_instance,
-                        owner_ctx,
-                        alloc.h_memory,
-                    ) {
-                        Ok(m)
-                            if m.lookup_status == 0
-                                && m.address_space == nvidia_rm_sys::rm_init::ADDR_SYSMEM =>
-                        {
-                            Some(m.phys_addr)
-                        }
-                        Ok(m) => {
-                            crate::klog_warn!(
-                            "[nouveau-uapi] GEM_NEW handle={}: gem_map_cpu lookup_status={:#x} address_space={} -- not CPU-mmap-able",
-                            handle, m.lookup_status, m.address_space
-                        );
-                            None
-                        }
-                        Err(status) => {
-                            crate::klog_warn!(
-                            "[nouveau-uapi] GEM_NEW handle={}: gem_map_cpu failed, NV_STATUS={:#x} -- not CPU-mmap-able",
-                            handle, status
-                        );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                // VRAM FBMEM offset (AT_GPU) for CE/scanout, and -- with
-                // `nvidia.gem_vram_bar1` -- for the object's CPU mapping. The
-                // offset itself is still never published as a host PA: BAR1's
-                // base is added to it and the result is bounds-checked against
-                // the aperture, which is what `vram_bar1` is for. If the AT_GPU
-                // lookup fails this stays None and the VRAM GEM remains usable
-                // for VM_BIND/EXEC without a CPU mapping or scanout-by-offset.
-                let vram_offset = if !sysmem {
-                    nvidia_rm_sys::rm_init::gem_fbmem_offset(
-                        device_instance,
-                        owner_ctx,
-                        alloc.h_memory,
-                    )
-                    .ok()
-                } else {
-                    None
-                };
-                let phys_addr = phys_addr.or_else(|| {
-                    vram_bar1::cpu_mapping_for_vram_gem(
-                        sysmem,
-                        self.bar1_phys,
-                        self.info.fb_size as u64,
-                        vram_offset,
-                        size,
-                        handle,
-                    )
-                });
+                let placed =
+                    gem_vram::place(&target, placement, super::nvidia_hooks::map_device_window)?;
+                let (alloc, sysmem) = (placed.alloc, placed.sysmem);
+                let (phys_addr, vram_offset) = (placed.phys_addr, placed.vram_offset);
                 let map_handle = if let Some(pa) = phys_addr {
-                    crate::scheme::gem_mmap::register(handle, pa, size, owner_pid);
+                    if placed.device_memory {
+                        crate::scheme::gem_mmap::register_device_memory(
+                            handle, pa, size, owner_pid,
+                        );
+                    } else {
+                        crate::scheme::gem_mmap::register(handle, pa, size, owner_pid);
+                    }
                     (handle as u64) << 12
                 } else {
                     0

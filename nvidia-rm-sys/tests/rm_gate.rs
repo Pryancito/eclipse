@@ -78,6 +78,10 @@ const BRINGUP: &[&str] = &[
     "state_init",       // bringup_step9
     "step10",           // bringup_step10
     "init_gsp",         // gsp_boot_run, from bringup_step14
+    // bringup_step9, between state_init and the state load: the console's
+    // BAR1 mapping and the probe that checks it.
+    "preserve_bar1_console",
+    "bar1_recover",
 ];
 
 /// `SRC` with `//` comments blanked, line structure kept. This file's own

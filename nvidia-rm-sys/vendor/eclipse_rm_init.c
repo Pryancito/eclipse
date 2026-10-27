@@ -2441,6 +2441,107 @@ static void _eclipse_rm_ctx_handles(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 *phCl
     }
 }
 
+/*
+ * VRAM GEM objects the CPU reaches through BAR1, the way nouveau and
+ * nvidia-drm map a buffer that lives in VRAM (eclipse_rm_gem_map_bar1).
+ *
+ * BAR1 is a virtual aperture on Turing: an address in it is a BAR1 VA the
+ * RM maps onto VRAM pages, not VRAM offset + BAR1 base. So each object gets
+ * its own mapping from kbusMapFbApertureSingle, and it has to be given back
+ * before the memory goes (eclipse_rm_gem_free), because BAR1 is only
+ * 256 MiB and an unmapped VA left behind would point at whatever VRAM is
+ * allocated there next.
+ *
+ * The table is also how the copy engine tells such an object from host RAM:
+ * a present that names one by its host address (bar1 base + VA) is copied
+ * as LOCAL_FB at its VRAM offset (eclipse_rm_ce_blit_p2p_2d), not read back
+ * over PCIe from the card's own BAR1. Read and written under the API lock.
+ */
+#define ECLIPSE_GEM_BAR1_SLOTS 512
+
+typedef struct
+{
+    NvU32 gpuInstance;
+    NvU32 hClient;
+    NvU32 hMemory;     /* 0: free slot */
+    NvU32 bPhysical;   /* BAR1 in physical mode: nothing to unmap */
+    NvU64 aperOffset;  /* BAR1 VA (or VRAM offset when bPhysical) */
+    NvU64 length;
+    NvU64 hostPa;      /* gpumgrGetGpuPhysFbAddr + aperOffset */
+    MEMORY_DESCRIPTOR *pMemDesc;
+} EclipseGemBar1Slot;
+
+static EclipseGemBar1Slot g_gemBar1[ECLIPSE_GEM_BAR1_SLOTS];
+static NvU64 g_gemBar1Bytes[ECLIPSE_MAX_GPUS];
+
+/* The slot whose host range holds [hostPa, hostPa + extent), and the offset
+ * of hostPa inside it. NULL when the range is not (wholly) one object's. */
+static EclipseGemBar1Slot *_eclipse_gem_bar1_find(NvU64 hostPa, NvU64 extent, NvU64 *pDelta)
+{
+    NvU32 i;
+
+    for (i = 0; i < ECLIPSE_GEM_BAR1_SLOTS; i++)
+    {
+        EclipseGemBar1Slot *s = &g_gemBar1[i];
+        if (s->hMemory == 0 || hostPa < s->hostPa || hostPa - s->hostPa >= s->length)
+            continue;
+        if (extent > s->length - (hostPa - s->hostPa))
+            return NULL;
+        *pDelta = hostPa - s->hostPa;
+        return s;
+    }
+    return NULL;
+}
+
+/* Give back one object's BAR1 mapping. Needs the API lock and this GPU's
+ * lock (the unmap rewrites BAR1 PTEs and invalidates the BAR1 TLB). */
+static void _eclipse_gem_bar1_release_slot(OBJGPU *pGpu, EclipseGemBar1Slot *s)
+{
+    NV_STATUS status = NV_OK;
+
+    if (!s->bPhysical)
+    {
+        status = kbusUnmapFbApertureSingle(pGpu, GPU_GET_KERNEL_BUS(pGpu), s->pMemDesc,
+                                           s->aperOffset, s->length,
+                                           BUS_MAP_FB_FLAGS_MAP_UNICAST);
+    }
+    nv_printf(0, "[eclipse-rm-trace] gem_bar1: unmap hMemory=0x%x BAR1 0x%llx+0x%llx -> 0x%x\n",
+              s->hMemory, s->aperOffset, s->length, status);
+    if (s->gpuInstance < ECLIPSE_MAX_GPUS && g_gemBar1Bytes[s->gpuInstance] >= s->length)
+        g_gemBar1Bytes[s->gpuInstance] -= s->length;
+    portMemSet(s, 0, sizeof(*s));
+}
+
+/* Every mapping of hMemory (0: of any object) in hClient on this GPU. */
+static void _eclipse_gem_bar1_release(OBJGPU *pGpu, NvU32 gpuInstance, NvU32 hClient,
+                                      NvU32 hMemory)
+{
+    NvU32 i;
+
+    for (i = 0; i < ECLIPSE_GEM_BAR1_SLOTS; i++)
+    {
+        EclipseGemBar1Slot *s = &g_gemBar1[i];
+        if (s->hMemory != 0 && s->gpuInstance == gpuInstance && s->hClient == hClient &&
+            (hMemory == 0 || s->hMemory == hMemory))
+        {
+            _eclipse_gem_bar1_release_slot(pGpu, s);
+        }
+    }
+}
+
+static NvBool _eclipse_gem_bar1_any(NvU32 gpuInstance, NvU32 hClient)
+{
+    NvU32 i;
+
+    for (i = 0; i < ECLIPSE_GEM_BAR1_SLOTS; i++)
+    {
+        if (g_gemBar1[i].hMemory != 0 && g_gemBar1[i].gpuInstance == gpuInstance &&
+            g_gemBar1[i].hClient == hClient)
+            return NV_TRUE;
+    }
+    return NV_FALSE;
+}
+
 /* The RM client a context's GEM handles live in, for a kernel client that
  * dups one into its own (nvkms flipping to a compositor's buffer: see
  * eclipse_kms_import_surface). Only reads the context tables. */
@@ -2932,6 +3033,17 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
             _eclipse_rm_peer_fence_drop(pRmApi, gpuInstance, i, ctxIdx);
             _eclipse_rm_peer_fence_drop(pRmApi, gpuInstance, ctxIdx, i);
         }
+    }
+    /* A BAR1 mapping of one of this client's objects that GEM_CLOSE never
+     * gave back: the client free below takes the memory, and the mapping
+     * would go on pointing at it. The unmap needs the GPU lock, which the
+     * frees below must not hold, so it is taken for this alone. */
+    if (hCtxClient != g_grAllocCache[gpuInstance].hClient &&
+        _eclipse_gem_bar1_any(gpuInstance, hCtxClient) &&
+        rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT) == NV_OK)
+    {
+        _eclipse_gem_bar1_release(pGpu, gpuInstance, hCtxClient, 0);
+        rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     }
     /* Reverse dependency order, matching ctx_alloc's failure cleanup: freeing
      * the channel tears down its bound compute object and takes it off the
@@ -6899,6 +7011,7 @@ unlock:
 static NV_STATUS eclipse_ce_submit_pitched_2d(
     CeUtils *pCeUtils,
     NvU64    srcPhys,
+    NvBool   bSrcLocalFb,
     NvU32    srcPitch,
     NvU64    dstPhys,
     NvBool   bDstLocalFb,
@@ -6958,9 +7071,12 @@ static NV_STATUS eclipse_ce_submit_pitched_2d(
 
     NV_PUSH_INC_1U(RM_SUBCHANNEL, NV906F_SET_OBJECT, pChannel->classEngineID);
 
-    /* SRC: compositor dumb buffer (cached sysmem). DST: this GPU's own VRAM
-     * (bDstLocalFb), or a peer GPU's BAR1 (uncached). */
-    srcPhysMode = DRF_DEF(C5B5, _SET_SRC_PHYS_MODE, _TARGET, _COHERENT_SYSMEM);
+    /* SRC: compositor dumb buffer (cached sysmem), or a buffer in this GPU's
+     * own VRAM (bSrcLocalFb). DST: this GPU's own VRAM (bDstLocalFb), or a
+     * peer GPU's BAR1 (uncached). */
+    srcPhysMode = bSrcLocalFb ?
+                  DRF_DEF(C5B5, _SET_SRC_PHYS_MODE, _TARGET, _LOCAL_FB) :
+                  DRF_DEF(C5B5, _SET_SRC_PHYS_MODE, _TARGET, _COHERENT_SYSMEM);
     dstPhysMode = bDstLocalFb ?
                   DRF_DEF(C5B5, _SET_DST_PHYS_MODE, _TARGET, _LOCAL_FB) :
                   DRF_DEF(C5B5, _SET_DST_PHYS_MODE, _TARGET, _NONCOHERENT_SYSMEM);
@@ -7064,6 +7180,7 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
     GPU_MASK           gpusLockedMask = 0;
     NvU64              lastWorkId     = 0;
     NvBool             bDstLocalFb    = NV_FALSE;
+    NvBool             bSrcLocalFb    = NV_FALSE;
 
     if (pWorkId == NULL)
         return NV_ERR_INVALID_ARGUMENT;
@@ -7143,10 +7260,35 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
         }
     }
 
+    /*
+     * A source that is a VRAM GEM object's BAR1 mapping (eclipse_rm_gem_map_bar1)
+     * is read as LOCAL_FB at its VRAM offset, for the same reason: as a
+     * sysmem address it would be a read of this card's own BAR1 over PCIe.
+     * One that lives on another card is refused -- that would be a peer read
+     * of the other card's BAR1, which root complexes need not forward
+     * either -- and the next card in line (the one that owns it) takes it.
+     */
+    {
+        NvU64 srcExtent = (NvU64)(lineCount - 1U) * srcPitch + rowBytes;
+        NvU64 delta = 0;
+        EclipseGemBar1Slot *pSrc = _eclipse_gem_bar1_find(srcSysmemPa, srcExtent, &delta);
+
+        if (pSrc != NULL && pSrc->gpuInstance != gpuInstance)
+        {
+            status = NV_ERR_NOT_SUPPORTED;
+            goto unlock;
+        }
+        if (pSrc != NULL)
+        {
+            srcSysmemPa = memdescGetPhysAddr(pSrc->pMemDesc, AT_GPU, delta);
+            bSrcLocalFb = NV_TRUE;
+        }
+    }
+
     osFlushCpuWriteCombineBuffer();
 
     status = eclipse_ce_submit_pitched_2d(pMemoryManager->pCeUtils,
-                                          srcSysmemPa, srcPitch,
+                                          srcSysmemPa, bSrcLocalFb, srcPitch,
                                           dstHostPa, bDstLocalFb, dstPitch,
                                           rowBytes, lineCount,
                                           &lastWorkId);
@@ -7159,8 +7301,9 @@ NV_STATUS eclipse_rm_ce_blit_p2p_2d(
         static NvU32 s_n = 0;
         NvU32 n = ++s_n;
         if (status != NV_OK || n <= 2 || (n % 64U) == 0)
-            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: 1 launch rowBytes=%u lines=%u srcPitch=%u dstPitch=%u dst=%s 0x%llx workId=%llu -> 0x%x\n",
+            nv_printf(0, "[eclipse-rm-trace] ce_blit_p2p_2d: 1 launch rowBytes=%u lines=%u srcPitch=%u dstPitch=%u src=%s 0x%llx dst=%s 0x%llx workId=%llu -> 0x%x\n",
                       rowBytes, lineCount, srcPitch, dstPitch,
+                      bSrcLocalFb ? "VRAM" : "sysmem", srcSysmemPa,
                       bDstLocalFb ? "VRAM" : "peer BAR1", dstHostPa, lastWorkId, status);
     }
 
@@ -8387,6 +8530,10 @@ typedef struct EclipseGemAlloc
  * resource, so pMemory->pDevice stays the ladder's device and the same test
  * still rejects it. The owner has to be the allocating client from the start,
  * which is why the whole lifetime below takes ctxIdx. */
+/* `bSysmem` is a set of flags, of which 1 (ECLIPSE_GEM_ALLOC_SYSMEM) is the
+ * old boolean; 2 asks for contiguous VRAM. */
+#define ECLIPSE_GEM_ALLOC_SYSMEM          1U
+#define ECLIPSE_GEM_ALLOC_VRAM_CONTIGUOUS 2U
 NV_STATUS eclipse_rm_gem_alloc(NvU32 gpuInstance, NvU32 ctxIdx, NvU64 size, NvU32 bSysmem,
                                EclipseGemAlloc *pOut)
 {
@@ -8467,21 +8614,30 @@ NV_STATUS eclipse_rm_gem_alloc(NvU32 gpuInstance, NvU32 ctxIdx, NvU64 size, NvU3
          * caches (same attr as the hwcursor path below). Without it, No-Snoop
          * TLPs left mild static on client dmabufs (Firefox GPU WebRender)
          * that a CPU-written software path never showed. VRAM stays VIDMEM. */
-        params.attr = bSysmem
+        params.attr = (bSysmem & ECLIPSE_GEM_ALLOC_SYSMEM)
             ? (DRF_DEF(OS32, _ATTR, _LOCATION, _PCI) |
                DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS) |
                DRF_DEF(OS32, _ATTR, _COHERENCY, _CACHED))
             : DRF_DEF(OS32, _ATTR, _LOCATION, _VIDMEM);
+        /* A VRAM object the CPU will map through BAR1 and the display may
+         * scan out (eclipse_rm_gem_map_bar1): one run of VRAM, so that one
+         * VRAM offset describes all of it for the display's context DMA and
+         * for a pitched copy-engine read. */
+        if (bSysmem == ECLIPSE_GEM_ALLOC_VRAM_CONTIGUOUS)
+            params.attr |= DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS);
         params.attr2 = NVOS32_ATTR2_NONE;
         status = clientGenResourceHandle(pRsClient, &pOut->hMemory);
         if (status != NV_OK) goto unlock;
         pOut->allocStatus = pRmApi->AllocWithHandle(pRmApi, hOwnerClient,
                                                     hOwnerDevice, pOut->hMemory,
-                                                    bSysmem ? NV01_MEMORY_SYSTEM
-                                                            : NV01_MEMORY_LOCAL_USER,
+                                                    (bSysmem & ECLIPSE_GEM_ALLOC_SYSMEM)
+                                                        ? NV01_MEMORY_SYSTEM
+                                                        : NV01_MEMORY_LOCAL_USER,
                                                     &params, sizeof(params));
         nv_printf(0, "[eclipse-rm-trace] gem_alloc(%s): %llu B -> 0x%x hMemory=0x%x ctx%u client=0x%x\n",
-                  bSysmem ? "sysmem/GART" : "vidmem/VRAM",
+                  (bSysmem & ECLIPSE_GEM_ALLOC_SYSMEM) ? "sysmem/GART" :
+                  (bSysmem == ECLIPSE_GEM_ALLOC_VRAM_CONTIGUOUS) ? "vidmem/VRAM contiguous" :
+                  "vidmem/VRAM",
                   size, pOut->allocStatus, pOut->hMemory, ctxIdx, hOwnerClient);
     }
     status = NV_OK; /* per-stage status carries the failure */
@@ -8545,6 +8701,9 @@ NV_STATUS eclipse_rm_gem_free(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory)
         RM_API *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
         _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hOwnerClient, &hOwnerDevice);
         (void) hOwnerDevice;
+        /* Its BAR1 mapping first, while the memory it points at is still
+         * this object's (see g_gemBar1). */
+        _eclipse_gem_bar1_release(pGpu, gpuInstance, hOwnerClient, hMemory);
         status = pRmApi->Free(pRmApi, hOwnerClient, hMemory);
         nv_printf(0, "[eclipse-rm-trace] gem_free: hMemory=0x%x -> 0x%x\n", hMemory, status);
     }
@@ -8704,6 +8863,179 @@ NV_STATUS eclipse_rm_gem_map_cpu(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
     return NV_OK; /* per-stage status (pOut->lookupStatus) carries the failure */
+}
+
+typedef struct EclipseGemBar1
+{
+    NvU32 status;      /* NV_OK: hostPa maps the whole object */
+    NvU32 bPhysical;   /* BAR1 in physical mode (no VA was allocated) */
+    NvU64 bar1Offset;  /* where in BAR1 the object starts */
+    NvU64 length;      /* bytes mapped: the object's size */
+    NvU64 hostPa;      /* the CPU's address for byte 0 of the object */
+    NvU64 vramOffset;  /* the object's VRAM offset (AT_GPU) */
+} EclipseGemBar1;
+
+/*
+ * Map a VRAM GEM object into BAR1 for the CPU, as RmMapMemory does for an
+ * FBMEM object (rmapi/mapping_cpu.c: kbusMapFbAperture_HAL with
+ * BUS_MAP_FB_FLAGS_MAP_UNICAST), and hand back the host physical address of
+ * the mapping: BAR1's base plus the VA the RM picked. That address is what
+ * GEM_NEW publishes for mmap and PRIME; it is the VRAM itself, seen through
+ * the aperture, which is how nouveau and nvidia-drm map a buffer that lives
+ * in VRAM.
+ *
+ * This is the path eclipse_rm_gem_map_cpu refuses to fake: there an FBMEM
+ * object's VRAM offset was once published as if it were a host address, and
+ * userspace painted over low kernel RAM. Here the address is a real BAR1
+ * mapping, made by the RM and given back by eclipse_rm_gem_free.
+ *
+ * Only for a contiguous object (ECLIPSE_GEM_ALLOC_VRAM_CONTIGUOUS), so that
+ * vramOffset describes all of it. `maxBytes` caps what all of this GPU's
+ * mappings may hold together, leaving the rest of BAR1 to the RM (the
+ * console, USERD, the RM's own transfers): over it this returns
+ * NV_ERR_NO_MEMORY in pOut->status and the caller puts the object in host
+ * memory instead.
+ */
+NV_STATUS eclipse_rm_gem_map_bar1(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
+                                  NvU64 maxBytes, EclipseGemBar1 *pOut)
+{
+    NvU32 hOwnerClient = 0;
+    NvU32 hOwnerDevice = 0;
+    OBJGPU *pGpu;
+    KernelBus *pKernelBus;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    RsClient *pRsClient = NULL;
+    Memory *pMemory = NULL;
+    MEMORY_DESCRIPTOR *pMemDesc = NULL;
+    EclipseGemBar1Slot *pSlot = NULL;
+    NvU64 size = 0;
+    NvU32 i;
+
+    if (pOut == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+    portMemSet(pOut, 0, sizeof(*pOut));
+    pOut->status = NV_ERR_GENERIC;
+    if (gpuInstance >= ECLIPSE_MAX_GPUS || !g_grAllocDone[gpuInstance] || hMemory == 0)
+        return NV_ERR_INVALID_STATE;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL || !pGpu->gspRmInitialized || !pGpu->bStateLoaded)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
+    }
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    /* kbusMapFbAperture asserts the GPU lock (it writes BAR1 PTEs); API lock
+     * first, then the GPU lock, as everywhere else. */
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pKernelBus = GPU_GET_KERNEL_BUS(pGpu);
+    _eclipse_rm_ctx_handles(gpuInstance, ctxIdx, &hOwnerClient, &hOwnerDevice);
+    (void) hOwnerDevice;
+    status = serverGetClientUnderLock(&g_resServ, hOwnerClient, &pRsClient);
+    if (status == NV_OK)
+        status = memGetByHandle(pRsClient, hMemory, &pMemory);
+    if (status == NV_OK && (pMemory->pMemDesc == NULL || pKernelBus == NULL))
+        status = NV_ERR_INVALID_STATE;
+    if (status != NV_OK)
+        goto done;
+
+    pMemDesc = memdescGetMemDescFromGpu(pMemory->pMemDesc, pGpu);
+    size = memdescGetSize(pMemDesc);
+    if (memdescGetAddressSpace(pMemDesc) != ADDR_FBMEM ||
+        !memdescGetContiguity(pMemDesc, AT_GPU) || size == 0)
+    {
+        status = NV_ERR_NOT_SUPPORTED;
+        goto done;
+    }
+    if (g_gemBar1Bytes[gpuInstance] + size > maxBytes)
+    {
+        status = NV_ERR_NO_MEMORY;
+        goto done;
+    }
+    for (i = 0; i < ECLIPSE_GEM_BAR1_SLOTS && pSlot == NULL; i++)
+    {
+        if (g_gemBar1[i].hMemory == 0)
+            pSlot = &g_gemBar1[i];
+    }
+    if (pSlot == NULL)
+    {
+        status = NV_ERR_INSUFFICIENT_RESOURCES;
+        goto done;
+    }
+
+    pOut->vramOffset = memdescGetPhysAddr(pMemDesc, AT_GPU, 0);
+    if (kbusIsBar1PhysicalModeEnabled(pKernelBus))
+    {
+        /* BAR1 maps VRAM one to one: nothing to allocate or give back. */
+        pOut->bPhysical = NV_TRUE;
+        pOut->bar1Offset = pOut->vramOffset;
+        pOut->length = size;
+    }
+    else
+    {
+        NvU64 aperOffset = 0;
+        NvU64 length = size;
+
+        status = kbusMapFbApertureSingle(pGpu, pKernelBus, pMemDesc, 0, &aperOffset, &length,
+                                         BUS_MAP_FB_FLAGS_MAP_UNICAST, NULL);
+        if (status != NV_OK)
+            goto done;
+        if (length < size)
+        {
+            (void) kbusUnmapFbApertureSingle(pGpu, pKernelBus, pMemDesc, aperOffset, length,
+                                             BUS_MAP_FB_FLAGS_MAP_UNICAST);
+            status = NV_ERR_INSUFFICIENT_RESOURCES;
+            goto done;
+        }
+        pOut->bar1Offset = aperOffset;
+        pOut->length = length;
+    }
+    pOut->hostPa = gpumgrGetGpuPhysFbAddr(pGpu) + pOut->bar1Offset;
+
+    pSlot->gpuInstance = gpuInstance;
+    pSlot->hClient = hOwnerClient;
+    pSlot->hMemory = hMemory;
+    pSlot->bPhysical = pOut->bPhysical;
+    pSlot->aperOffset = pOut->bar1Offset;
+    pSlot->length = pOut->length;
+    pSlot->hostPa = pOut->hostPa;
+    pSlot->pMemDesc = pMemDesc;
+    g_gemBar1Bytes[gpuInstance] += pOut->length;
+
+done:
+    pOut->status = status;
+    nv_printf(0, "[eclipse-rm-trace] gem_bar1: map hMemory=0x%x %llu B -> 0x%x BAR1 0x%llx host 0x%llx "
+                 "VRAM 0x%llx (%llu B mapped on this GPU)\n",
+              hMemory, size, status, pOut->bar1Offset, pOut->hostPa, pOut->vramOffset,
+              g_gemBar1Bytes[gpuInstance]);
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return NV_OK; /* pOut->status carries the failure */
 }
 
 /* Physical address of the RM-backed channel's error notifier (the 4 KiB
