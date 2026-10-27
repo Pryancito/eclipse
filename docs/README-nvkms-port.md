@@ -233,6 +233,18 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
     limpia y deja en el dmesg el estado, la dirección, el bloque de instancia y
     el `FAULT_INFO`. Corre al final de `gpustep9` y antes del SELFTEST; el
     chequeo de la LUT hace lo mismo y dice qué lee la CPU tras el rebind.
+  - Con eso el dmesg mostró un fallo de escritura de la CPU en BAR1 0x80000
+    (dentro de la consola) que el GSP ya había limpiado, y un rebind que no
+    termina. El hardware pide que no llegue ningún acceso a BAR1 mientras se
+    completa el bind (`kbusBar1InstBlkBind_TU102`), y durante el bring-up
+    diferido la consola del kernel seguía pintando en BAR1 (la narración del
+    RM con `console.overgraphics`, y los presents pendientes desde el tick de
+    250 Hz). `kernel_hal::console::hold_presents_for` deja la consola en su
+    búfer sombra durante esa ventana, con el mismo límite que la pausa del
+    scanout. `eclipse_rm_bar1_recover` dice ahora siempre `BIND_STATUS`, si el
+    RM mapeó la consola (`bBar1ConsolePreserved`) y la VRAM 0 leída por BAR1
+    frente a PRAMIN, y rebindea también cuando BAR1 lee el centinela aunque la
+    MMU no tenga nada latcheado.
 - Objetivo: **paridad** con la escalera actual en una sola tarjeta (escritorio,
   cursor, flips sin tearing) con `nvidia.wlr_vulkan`/`wlr_gles2`/`wlr_pixman`.
 

@@ -46,9 +46,11 @@ impl NvidiaGpu {
 
         // A BAR1 that took an MMU fault reads every USERD as 0xBAD0ACxx and
         // the ring looks full before anything is submitted: rebind it first,
-        // and say where it faulted.
-        if let Some(line) = bringup_all::recover_bar1(device_instance, "nouveau-uapi") {
-            crate::klog_warn!("{} -- antes del SELFTEST", line);
+        // and say where BAR1 stands either way.
+        match bringup_all::recover_bar1(device_instance, "nouveau-uapi") {
+            Some((true, line)) => crate::klog_info!("{} -- antes del SELFTEST", line),
+            Some((false, line)) => crate::klog_warn!("{} -- antes del SELFTEST", line),
+            None => {}
         }
         // The self-test belongs to no process: ctx 0, the shared ladder
         // client, exactly as before the per-process ownership split.

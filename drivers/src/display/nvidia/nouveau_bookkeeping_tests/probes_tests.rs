@@ -477,6 +477,8 @@ fn the_selftest_rebinds_a_faulted_bar1_first_and_says_where_it_faulted() {
                 status: 0x8000_0000,
                 addr_lo: 0x0060_0000,
                 rebind_status: 0,
+                bind_status_after: 0,
+                bar1_word_after: nvidia_rm_sys::rm_init::NO_REBIND,
                 ..Default::default()
             },
         ));
@@ -485,13 +487,47 @@ fn the_selftest_rebinds_a_faulted_bar1_first_and_says_where_it_faulted() {
     let lines = selftest(&gpu, 0x7_0000_0000);
 
     assert_eq!(FAKE_RM.lock().calls[0], "bar1_recover");
-    let fault = line(&lines, "[nouveau-uapi] BAR1 en fallo de MMU");
+    let fault = line(&lines, "[nouveau-uapi] BAR1: BAR1_BLOCK");
     assert!(fault.contains("direccion 0x600000"), "{}", fault);
     assert!(
-        fault.contains("BAR1 rebindeada -- antes del SELFTEST"),
+        fault.contains("BAR1 rebindeada, BIND_STATUS despues 0x0 -- antes del SELFTEST"),
         "{}",
         fault
     );
     line(&lines, "SELFTEST stage A PASS");
+    FAKE_RM.lock().bar1_recover = None;
+}
+
+/// A healthy BAR1 is still reported before the self-test, so a boot whose
+/// channel fails says whether BAR1 was the reason.
+#[test]
+fn the_selftest_says_where_a_healthy_bar1_stands() {
+    let _g = LOCK.lock();
+    let gpu = gpu_rm();
+    {
+        let mut f = FAKE_RM.lock();
+        f.runs = true;
+        f.bar1_recover = Some((
+            0,
+            nvidia_rm_sys::rm_init::Bar1Fault {
+                rebind_status: nvidia_rm_sys::rm_init::NO_REBIND,
+                flags: nvidia_rm_sys::rm_init::BAR1_CONSOLE_MAPPED
+                    | nvidia_rm_sys::rm_init::BAR1_PROBED,
+                bar1_word: 7,
+                vram_word: 7,
+                ..Default::default()
+            },
+        ));
+    }
+
+    let lines = selftest(&gpu, 0x7_0000_0000);
+
+    let bar1 = line(&lines, "[nouveau-uapi] BAR1: BAR1_BLOCK");
+    assert!(bar1.contains("consola en BAR1 0: mapeada"), "{}", bar1);
+    assert!(
+        bar1.contains("(coinciden) -- antes del SELFTEST"),
+        "{}",
+        bar1
+    );
     FAKE_RM.lock().bar1_recover = None;
 }

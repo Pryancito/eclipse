@@ -3,7 +3,8 @@
 use crate::common::panic_lock::{ConsoleLock, PANIC_SPIN_BUDGET};
 use crate::drivers;
 use core::fmt::{Arguments, Result, Write};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Kernel log (dmesg) callback
@@ -286,7 +287,9 @@ cfg_if! {
         }
 
         fn maybe_clear_graphic_before_write(vt: usize) {
-            if !CLEAR_ON_NEXT_GRAPHIC_WRITE.swap(false, Ordering::SeqCst) {
+            // A held display takes no clear either: keep the request for the
+            // first write after the hold.
+            if presents_held() || !CLEAR_ON_NEXT_GRAPHIC_WRITE.swap(false, Ordering::SeqCst) {
                 return;
             }
             if let (Some(display), Some(cons)) = (GRAPHIC_DISPLAY.try_get(), vt_mutex(vt)) {
@@ -485,12 +488,51 @@ pub fn diag_present_over_graphics() -> bool {
     DIAG_PRESENT_OVER_GRAPHICS.load(Ordering::Relaxed)
 }
 
+/// Timer time (ns) until which no kernel console write reaches the display;
+/// 0 when nothing holds it. See [`hold_presents_for`].
+static PRESENTS_HELD_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Keep every kernel console write in its VT's shadow buffer, off the
+/// display, for at most `max`, or until [`release_presents`].
+///
+/// The console GPU's framebuffer is its BAR1, and its state load rebinds BAR1
+/// from the firmware's linear window to the RM's page tables. The hardware
+/// asks software to issue no BAR1 request until that bind completes
+/// (kern_bus_tu102.c, kbusBar1InstBlkBind_TU102): a console present landing
+/// in it -- the 250 Hz tick flushes pending ones from IRQ context, and the
+/// override above paints the RM's own narration while it runs -- left BAR1
+/// faulted for the rest of the boot. Bounded like the scanout pause, so a
+/// bring-up that never comes back cannot keep the console dark for good.
+pub fn hold_presents_for(max: Duration) {
+    let now = crate::hal_fn::timer::timer_now().as_nanos() as u64;
+    let until = now.saturating_add(max.as_nanos() as u64).max(1);
+    PRESENTS_HELD_UNTIL_NS.store(until, Ordering::SeqCst);
+}
+
+/// End a [`hold_presents_for`]. The caller repaints what was held back.
+pub fn release_presents() {
+    PRESENTS_HELD_UNTIL_NS.store(0, Ordering::SeqCst);
+}
+
+/// Whether a hold that ends at `until_ns` (0: none) still holds at `now_ns`.
+fn held_at(until_ns: u64, now_ns: u64) -> bool {
+    until_ns != 0 && now_ns < until_ns
+}
+
+/// Whether kernel console writes are being kept off the display.
+pub fn presents_held() -> bool {
+    let until = PRESENTS_HELD_UNTIL_NS.load(Ordering::SeqCst);
+    until != 0 && held_at(until, crate::hal_fn::timer::timer_now().as_nanos() as u64)
+}
+
 /// Whether a write to VT `vt` should be pushed to the display now: always in
-/// text mode, and in graphics mode only when the diagnostic override is on.
+/// text mode, and in graphics mode only when the diagnostic override is on;
+/// never while [`hold_presents_for`] holds the display.
 #[inline]
 #[allow(dead_code)]
 fn present_allowed(vt: usize) -> bool {
-    kd_mode_vt(vt) == KD_TEXT || DIAG_PRESENT_OVER_GRAPHICS.load(Ordering::Relaxed)
+    (kd_mode_vt(vt) == KD_TEXT || DIAG_PRESENT_OVER_GRAPHICS.load(Ordering::Relaxed))
+        && !presents_held()
 }
 
 /// Set the KD mode of a specific VT (`KD_TEXT` or `KD_GRAPHICS`; the obsolete
@@ -1167,6 +1209,18 @@ mod kd_mode_tests {
         set_diag_present_over_graphics(false);
         assert!(!present_allowed(GRAPHICS_VT));
         reset();
+    }
+
+    /// A hold keeps the console off the display until it ends or is released,
+    /// and a hold of 0 is none: `hold_presents_for` never stores 0 for a hold.
+    /// Tested on the pure function so no other test sees a held display.
+    #[test]
+    fn a_hold_ends_at_its_deadline() {
+        assert!(!held_at(0, 0), "nothing held");
+        assert!(!held_at(0, u64::MAX), "nothing held, whenever");
+        assert!(held_at(100, 99), "inside the hold");
+        assert!(!held_at(100, 100), "the hold ends at its deadline");
+        assert!(!held_at(100, 5_000), "and stays ended");
     }
 
     /// The graphics VT is the last one, and `zCore/src/main.rs` spawns no login

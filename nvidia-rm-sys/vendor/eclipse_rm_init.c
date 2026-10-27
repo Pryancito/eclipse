@@ -7417,8 +7417,20 @@ typedef struct EclipseBar1Fault
     NvU32 instLo;      /* ..._MMU_FAULT_INST_LO: whose instance block */
     NvU32 info;        /* ..._MMU_FAULT_INFO: engine, client, access */
     NvU32 rebindStatus;/* kbusBar1InstBlkBind; ~0 when no rebind was needed */
-    NvU32 pad;
+    NvU32 bindStatus;  /* NV_VIRTUAL_FUNCTION_PRIV_BIND_STATUS, before any rebind */
+    NvU32 bindStatusAfter; /* the same after the rebind; ~0 when none ran */
+    NvU32 flags;       /* ECLIPSE_BAR1_* below */
+    NvU32 bar1Word;    /* VRAM 0 read by the CPU through BAR1 0, before any rebind */
+    NvU32 vramWord;    /* VRAM 0 read through the BAR0 PRAMIN window */
+    NvU32 bar1WordAfter; /* through BAR1 0 again after the rebind; ~0 when none */
+    NvU32 pad[3];
 } EclipseBar1Fault;
+
+/* EclipseBar1Fault.flags. */
+#define ECLIPSE_BAR1_CONSOLE_REQUESTED 0x1U /* bPreserveBar1ConsoleEnabled */
+#define ECLIPSE_BAR1_CONSOLE_MAPPED    0x2U /* bBar1ConsolePreserved: kbusInitBar1 mapped it */
+#define ECLIPSE_BAR1_PROBED            0x4U /* bar1Word and vramWord were read */
+#define ECLIPSE_BAR1_PHYSICAL          0x8U /* BAR1 in physical mode */
 
 /* NV_VIRTUAL_FUNCTION_PRIV_* (published/turing/tu102/dev_vm.h). */
 #define ECLIPSE_VF_BAR1_BLOCK          0x00000F40
@@ -7432,6 +7444,28 @@ typedef struct EclipseBar1Fault
  * write-1-to-clear (published/volta/gv100/dev_fb.h). */
 #define ECLIPSE_MMU_FAULT_VALID        0x80000000U
 #define ECLIPSE_MMU_FAULT_DROPPED_BARS 0x0000000FU
+/* What a BAR access answers when the GPU could not complete it. */
+#define ECLIPSE_BAR1_PRI_ERROR(v)      (((v) & 0xFFFFFF00U) == 0xBAD0AC00U)
+
+/*
+ * VRAM offset 0 read by the CPU through BAR1 offset 0. Only called when
+ * kbusInitBar1 mapped the console there: anywhere unmapped, the read itself
+ * would fault BAR1.
+ */
+static NvU32 eclipse_bar1_word0(OBJGPU *pGpu)
+{
+    NvP64 va = NvP64_NULL;
+    NvU32 value = ~0U;
+
+    if (osMapPciMemoryKernel64(pGpu, gpumgrGetGpuPhysFbAddr(pGpu), 4,
+                               NV_PROTECT_READABLE, &va,
+                               NV_MEMORY_UNCACHED) == NV_OK && va != NvP64_NULL)
+    {
+        value = *KERNEL_POINTER_FROM_NvP64(const volatile NvU32 *, va);
+        osUnmapPciMemoryKernel64(pGpu, va);
+    }
+    return value;
+}
 
 /*
  * The BAR fault branch of kgmmuServicePriFaults_GV100, which Eclipse never
@@ -7454,6 +7488,8 @@ NV_STATUS eclipse_rm_bar1_recover(NvU32 gpuInstance, EclipseBar1Fault *pOut)
         return NV_ERR_INVALID_ARGUMENT;
     portMemSet(pOut, 0, sizeof(*pOut));
     pOut->rebindStatus = 0xFFFFFFFF;
+    pOut->bindStatusAfter = 0xFFFFFFFF;
+    pOut->bar1WordAfter = 0xFFFFFFFF;
 
     threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
     status = gpumgrThreadEnableExpandedGpuVisibility();
@@ -7483,16 +7519,44 @@ NV_STATUS eclipse_rm_bar1_recover(NvU32 gpuInstance, EclipseBar1Fault *pOut)
     pOut->addrHi = GPU_VREG_RD32(pGpu, ECLIPSE_VF_MMU_FAULT_ADDR_HI);
     pOut->instLo = GPU_VREG_RD32(pGpu, ECLIPSE_VF_MMU_FAULT_INST_LO);
     pOut->info = GPU_VREG_RD32(pGpu, ECLIPSE_VF_MMU_FAULT_INFO);
+    pOut->bindStatus = GPU_VREG_RD32(pGpu, NV_VIRTUAL_FUNCTION_PRIV_BIND_STATUS);
+    if (kbusIsPreserveBar1ConsoleEnabled(pKernelBus))
+        pOut->flags |= ECLIPSE_BAR1_CONSOLE_REQUESTED;
+    if (pKernelBus->bBar1ConsolePreserved)
+        pOut->flags |= ECLIPSE_BAR1_CONSOLE_MAPPED;
+    if (kbusIsBar1PhysicalModeEnabled(pKernelBus))
+        pOut->flags |= ECLIPSE_BAR1_PHYSICAL;
 
-    if (pOut->status & (ECLIPSE_MMU_FAULT_VALID | ECLIPSE_MMU_FAULT_DROPPED_BARS))
+    /*
+     * Whether BAR1 reaches VRAM at all: VRAM 0 through BAR1 0, where the
+     * console is mapped, against the same word through PRAMIN, which does not
+     * go through BAR1. A GSP-RM that serviced the fault itself has already
+     * cleared VALID, so a dead BAR1 can show up here and nowhere else.
+     */
+    if (pOut->flags & ECLIPSE_BAR1_CONSOLE_MAPPED)
+    {
+        pOut->bar1Word = eclipse_bar1_word0(pGpu);
+        if (kbusMemAccessBar0Window_HAL(pGpu, pKernelBus, 0, &pOut->vramWord, 4,
+                                        NV_TRUE, ADDR_FBMEM) != NV_OK)
+            pOut->vramWord = ~0U;
+        pOut->flags |= ECLIPSE_BAR1_PROBED;
+    }
+
+    if ((pOut->status & (ECLIPSE_MMU_FAULT_VALID | ECLIPSE_MMU_FAULT_DROPPED_BARS)) ||
+        ((pOut->flags & ECLIPSE_BAR1_PROBED) && ECLIPSE_BAR1_PRI_ERROR(pOut->bar1Word)))
     {
         pOut->rebindStatus = kbusBar1InstBlkBind_HAL(pGpu, pKernelBus);
-        GPU_VREG_WR32(pGpu, ECLIPSE_VF_MMU_FAULT_STATUS,
-                      pOut->status & (ECLIPSE_MMU_FAULT_VALID | ECLIPSE_MMU_FAULT_DROPPED_BARS));
+        pOut->bindStatusAfter = GPU_VREG_RD32(pGpu, NV_VIRTUAL_FUNCTION_PRIV_BIND_STATUS);
+        if (pOut->status & (ECLIPSE_MMU_FAULT_VALID | ECLIPSE_MMU_FAULT_DROPPED_BARS))
+            GPU_VREG_WR32(pGpu, ECLIPSE_VF_MMU_FAULT_STATUS,
+                          pOut->status & (ECLIPSE_MMU_FAULT_VALID | ECLIPSE_MMU_FAULT_DROPPED_BARS));
+        if (pOut->flags & ECLIPSE_BAR1_PROBED)
+            pOut->bar1WordAfter = eclipse_bar1_word0(pGpu);
         nv_printf(0, "[eclipse-rm-trace] bar1_recover: status=0x%x addr=0x%x%08x inst=0x%x "
-                     "info=0x%x -> rebind 0x%x\n",
+                     "info=0x%x bind=0x%x bar1=0x%x vram=0x%x -> rebind 0x%x bind=0x%x bar1=0x%x\n",
                   pOut->status, pOut->addrHi, pOut->addrLo, pOut->instLo, pOut->info,
-                  pOut->rebindStatus);
+                  pOut->bindStatus, pOut->bar1Word, pOut->vramWord, pOut->rebindStatus,
+                  pOut->bindStatusAfter, pOut->bar1WordAfter);
     }
 
 out_gpu:
