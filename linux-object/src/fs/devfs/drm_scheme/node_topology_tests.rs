@@ -184,3 +184,93 @@ fn a_secondary_vblank_pipe_is_counted_on_the_nodes_own_card() {
         "card1 has one pipe; pipe 1 was counted against the whole machine"
     );
 }
+
+/// `SETCRTC` with `fb_id` on `crtc`/`connector` of the node `c` has open.
+fn setcrtc(c: &Client, crtc: u32, connector: u32, fb_id: u32) -> Result<usize> {
+    let connectors = [connector];
+    let mut req = DrmModeGetCrtc {
+        set_connectors_ptr: connectors.as_ptr() as u64,
+        count_connectors: 1,
+        crtc_id: crtc,
+        fb_id,
+        x: 0,
+        y: 0,
+        gamma_size: 0,
+        mode_valid: 1,
+        mode: make_modeinfo(64, 16),
+    };
+    c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req)
+}
+
+/// The framebuffer `GETCRTC` on `crtc` reports through `c`.
+fn getcrtc_fb(c: &Client, crtc: u32) -> u32 {
+    let mut res = DrmModeGetCrtc {
+        set_connectors_ptr: 0,
+        count_connectors: 0,
+        crtc_id: crtc,
+        fb_id: 0,
+        x: 0,
+        y: 0,
+        gamma_size: 0,
+        mode_valid: 0,
+        mode: [0; 68],
+    };
+    c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut res).expect("GETCRTC");
+    res.fb_id
+}
+
+/// **Each card's CRTC has its own framebuffer**, as each `drm_device` has its
+/// own `crtc->primary->state->fb`. A frame set and flipped on `card1` is what
+/// `card1`'s `GETCRTC` reads back, and it is not on `card0`'s CRTC, not on the
+/// panel, and its `RMFB` does not turn the panel off. With one framebuffer for
+/// the machine, a client on the second card rebound `card0`'s CRTC and blitted
+/// over its desktop.
+#[test]
+fn a_frame_on_card1_stays_on_card1() {
+    let screen = kms_emu::attach(64, 16);
+    let _table = NodeTable;
+    let _cards = two_scanout_cards(&screen);
+    let c1 = Client::open(1);
+    let c0 = Client::open(0);
+
+    let buf = c1.create_dumb(64, 16);
+    let fb = c1.addfb2(&buf);
+    assert_eq!(setcrtc(&c1, 2101, 2102, fb), Ok(0), "SETCRTC on card1");
+    assert_eq!(getcrtc_fb(&c1, 2101), fb, "card1 reads its own frame back");
+    assert_ne!(getcrtc_fb(&c0, 2001), fb, "card0's CRTC took card1's frame");
+    assert_eq!(drm::crtc_fb_on(drm::PANEL_CARD), 0);
+    assert_ne!(
+        drm::panel_fb_for_test(),
+        fb,
+        "card1's frame was blitted onto the panel"
+    );
+
+    let back = c1.addfb2(&c1.create_dumb(64, 16));
+    c1.page_flip(2101, back, 7).expect("PAGE_FLIP on card1");
+    assert_eq!(getcrtc_fb(&c1, 2101), back);
+    assert_ne!(drm::panel_fb_for_test(), back, "and so was its flip");
+
+    let blanked = drm::crtc_blanked();
+    c1.rmfb(back).expect("RMFB");
+    assert_eq!(
+        getcrtc_fb(&c1, 2101),
+        0,
+        "RMFB of card1's scanout unbinds it"
+    );
+    assert_eq!(drm::crtc_blanked(), blanked, "and leaves the panel alone");
+}
+
+/// The other way round: the panel's frame is not what `card1` reports.
+#[test]
+fn a_frame_on_card0_is_not_card1s() {
+    let screen = kms_emu::attach(64, 16);
+    let _table = NodeTable;
+    let _cards = two_scanout_cards(&screen);
+    let c0 = Client::open(0);
+    let c1 = Client::open(1);
+
+    let fb = c0.addfb2(&c0.create_dumb(64, 16));
+    assert_eq!(setcrtc(&c0, 2001, 2002, fb), Ok(0), "SETCRTC on card0");
+    assert_eq!(getcrtc_fb(&c0, 2001), fb);
+    assert_eq!(getcrtc_fb(&c1, 2101), 0, "card1 reported card0's frame");
+}

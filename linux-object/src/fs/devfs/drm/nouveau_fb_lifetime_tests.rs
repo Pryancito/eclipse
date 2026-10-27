@@ -21,7 +21,7 @@ fn plant_nouveau_fb(fb_id: u32, handle: u32, pid: u64) {
         layout: ScanoutLayout::Linear,
         owner: pid,
     });
-    state.crtc_fb = fb_id;
+    state.crtc_fb.set(PANEL_CARD, fb_id);
 }
 
 fn fb_exists(fb_id: u32) -> bool {
@@ -55,7 +55,7 @@ fn closing_a_nouveau_handle_retires_the_framebuffer_over_it() {
     assert_eq!(retire_framebuffers_for_handle(handle), 1);
     assert!(!fb_exists(9501), "the fb outlived the memory it points at");
     assert_eq!(
-        DRM_STATE.lock().crtc_fb,
+        DRM_STATE.lock().crtc_fb.panel(),
         0,
         "the CRTC must not keep scanning out a retired fb"
     );
@@ -90,13 +90,13 @@ fn a_close_that_is_not_the_last_reference_leaves_the_framebuffer_alone() {
     );
     assert!(fb_exists(9505), "the scanout buffer was destroyed under it");
     assert_eq!(
-        DRM_STATE.lock().crtc_fb,
+        DRM_STATE.lock().crtc_fb.panel(),
         9505,
         "and the CRTC still scans it out"
     );
 
     DRM_STATE.lock().framebuffers.retain(|fb| fb.id != 9505);
-    DRM_STATE.lock().crtc_fb = 0;
+    DRM_STATE.lock().crtc_fb.set(PANEL_CARD, 0);
     gem_mmap::unregister(handle);
 }
 
@@ -151,7 +151,7 @@ fn a_process_exit_retires_the_nouveau_framebuffers_that_process_held() {
     // And the survivor goes when its own owner exits.
     release_process(78_102);
     assert!(!fb_exists(9504));
-    assert_eq!(DRM_STATE.lock().crtc_fb, 0);
+    assert_eq!(DRM_STATE.lock().crtc_fb.panel(), 0);
     gem_mmap::unregister(mine);
     gem_mmap::unregister(theirs);
 }
@@ -197,7 +197,7 @@ fn a_client_exiting_does_not_retire_the_compositor_framebuffer_over_its_buffer()
             layout: ScanoutLayout::Linear,
             owner: COMPOSITOR,
         });
-        state.crtc_fb = 9505;
+        state.crtc_fb.set(PANEL_CARD, 9505);
     }
 
     release_process(CLIENT);
@@ -208,7 +208,7 @@ fn a_client_exiting_does_not_retire_the_compositor_framebuffer_over_its_buffer()
     release_process(XWAYLAND);
     assert!(fb_exists(9505), "nor the hop in the middle exiting");
     assert_eq!(
-        DRM_STATE.lock().crtc_fb,
+        DRM_STATE.lock().crtc_fb.panel(),
         9505,
         "the scanout framebuffer must still be the one bound to the CRTC"
     );
@@ -216,6 +216,6 @@ fn a_client_exiting_does_not_retire_the_compositor_framebuffer_over_its_buffer()
     // The compositor's own exit is what retires it, as before.
     release_process(COMPOSITOR);
     assert!(!fb_exists(9505));
-    assert_eq!(DRM_STATE.lock().crtc_fb, 0);
+    assert_eq!(DRM_STATE.lock().crtc_fb.panel(), 0);
     gem_mmap::unregister(shared);
 }

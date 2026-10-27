@@ -1806,10 +1806,20 @@ impl DrmDev {
                         }
                     }
                 }
+                // The pipe state below (mode, ACTIVE, blanking, the vblank
+                // clock) is the panel's. Another card's CRTC keeps only its
+                // framebuffer for now, so a modeset there must not rewrite
+                // the panel's.
+                let panel = drm::is_panel_node(self.minor);
                 if let Some(area) = active_area {
-                    drm::set_vblank_period_from_modeinfo(&req.mode);
-                    if let Err(e) = drm::present_now_checked(fb_id, req.crtc_id, None) {
+                    if panel {
+                        drm::set_vblank_period_from_modeinfo(&req.mode);
+                    }
+                    if let Err(e) = drm::present_on_checked(self.minor, fb_id, req.crtc_id, None) {
                         present_failed("SETCRTC", fb_id, req.crtc_id, e)?;
+                    }
+                    if !panel {
+                        return Ok(0);
                     }
                     // `__drm_atomic_helper_set_config`: the mode, ACTIVE and
                     // the primary plane's rectangles are this call's to
@@ -1819,6 +1829,9 @@ impl DrmDev {
                     // still a config the client was told is set), so the
                     // readback agrees with the caller.
                     drm::legacy_set_config(&req.mode, area, (req.x, req.y));
+                } else if !panel {
+                    drm::set_crtc_fb_on(drm::card_of_minor(self.minor), 0);
+                    kms_disabled(req.crtc_id);
                 } else {
                     // `drm_mode_setcrtc` without a mode turns the pipe off
                     // (`set_config` with `.mode = NULL`), and only looks the
@@ -1914,7 +1927,8 @@ impl DrmDev {
                     }
                 }
                 let want_event = flip.flags & DRM_MODE_PAGE_FLIP_EVENT != 0;
-                match drm::page_flip(
+                match drm::page_flip_on(
+                    self.minor,
                     flip.fb_id,
                     flip.crtc_id,
                     flip.user_data,
@@ -2159,8 +2173,13 @@ impl DrmDev {
                     ) {
                         return Err(FsError::NoDeviceSpace);
                     }
-                    if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
+                    if let Err(e) =
+                        drm::present_on_checked(self.minor, req.fb_id, req.crtc_id, None)
+                    {
                         present_failed("SETPLANE", req.fb_id, req.crtc_id, e)?;
+                    }
+                    if !drm::is_panel_node(self.minor) {
+                        return Ok(0);
                     }
                     // `drm_atomic_helper_update_plane`: the plane state is
                     // the request's eight rectangles, which `GETCRTC` (x/y
@@ -2368,11 +2387,11 @@ impl DrmDev {
                     // the first failed would leave the screen half updated.
                     let mut ok = true;
                     for span in spans.iter().take(n) {
-                        ok &= drm::present_now_region(cmd.fb_id, 1, Some(*span));
+                        ok &= drm::present_on_region(self.minor, cmd.fb_id, 1, Some(*span));
                     }
                     ok
                 } else {
-                    drm::present_now_region(cmd.fb_id, 1, rect)
+                    drm::present_on_region(self.minor, cmd.fb_id, 1, rect)
                 };
                 if !presented {
                     // Best-effort: a damage flush that can't scan out (e.g. the

@@ -31,9 +31,22 @@ fn drivers_for_node(minor: u32) -> Vec<Arc<dyn DrmScheme>> {
     }
 }
 
+/// The card whose CRTC state a request on `minor` reads and writes: the
+/// node's own, or the panel's when there is no node table or the legacy
+/// machine-wide topology is on (every node then shows the panel's objects,
+/// so it must show the panel's framebuffer too).
+///
+/// Takes `GPU_NODES`, so never call it with `DRM_STATE` held.
+pub fn card_of_minor(minor: u32) -> u32 {
+    if panel_on_card0() {
+        return PANEL_CARD;
+    }
+    card_index_of_minor(minor).unwrap_or(PANEL_CARD)
+}
+
 /// [`get_crtc`] as node `minor` sees it.
 pub fn get_crtc_on(minor: u32, id: u32) -> Option<DrmCrtc> {
-    get_crtc_among(|| drivers_for_node(minor), id)
+    get_crtc_among(|| drivers_for_node(minor), card_of_minor(minor), id)
 }
 
 /// [`get_connector`] as node `minor` sees it.
@@ -48,7 +61,7 @@ pub fn get_connector_edid_on(minor: u32, id: u32) -> Option<[u8; 128]> {
 
 /// [`get_plane`] as node `minor` sees it.
 pub fn get_plane_on(minor: u32, id: u32) -> Option<DrmPlane> {
-    get_plane_among(|| drivers_for_node(minor), id)
+    get_plane_among(|| drivers_for_node(minor), card_of_minor(minor), id)
 }
 
 /// [`get_planes_typed`] as node `minor` sees it: the planes of the card whose
@@ -62,6 +75,7 @@ pub fn get_planes_typed_on(minor: u32) -> Vec<DrmPlane> {
     let Some(driver) = driver_for_minor(minor) else {
         return get_planes_typed();
     };
+    let card = card_of_minor(minor);
     match topology_for(facts_for(minor)) {
         NodeTopology::SoftwarePanel => get_planes_typed(),
         NodeTopology::RenderOnly => Vec::new(),
@@ -69,7 +83,7 @@ pub fn get_planes_typed_on(minor: u32) -> Vec<DrmPlane> {
             .get_planes()
             .into_iter()
             .filter_map(|id| driver.get_plane(id))
-            .map(with_core_scanout_state)
+            .map(|plane| with_core_scanout_state(card, plane))
             .collect(),
     }
 }
