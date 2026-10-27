@@ -265,7 +265,7 @@ fn advertised() -> alloc::vec::Vec<(AtomicObject, u32, u64)> {
     for (p, v) in crtc_props(true) {
         out.push((AtomicObject::Crtc, p, v));
     }
-    for (p, v) in connector_props(2, true) {
+    for (p, v) in connector_props(0, 2, true) {
         out.push((AtomicObject::Connector, p, v));
     }
     out
@@ -310,7 +310,7 @@ fn each_object_advertises_the_whole_set_of_properties_it_can_stage() {
 
     // EDID is only advertised when a display actually has one, which is
     // never on the host; everything else on the connector is fixed.
-    let mut conn: alloc::vec::Vec<u32> = connector_props(2, true)
+    let mut conn: alloc::vec::Vec<u32> = connector_props(0, 2, true)
         .into_iter()
         .map(|(p, _)| p)
         .filter(|p| *p != PROP_EDID)
@@ -332,7 +332,7 @@ fn a_non_atomic_client_is_shown_no_atomic_properties() {
     let legacy = plane_props(&a_plane(), false)
         .into_iter()
         .chain(crtc_props(false))
-        .chain(connector_props(2, false));
+        .chain(connector_props(0, 2, false));
     for (prop_id, _) in legacy {
         let s = spec(prop_id);
         assert_eq!(
@@ -479,9 +479,9 @@ fn an_atomic_property_stages_on_its_own_object_and_nowhere_else() {
 fn an_object_id_that_names_nothing_is_enoent() {
     let _serialised = drm::test_globals::lock();
     let mut upd = drm::AtomicUpdate::default();
-    assert_eq!(atomic_object(0xDEAD_BEEF), None);
+    assert_eq!(atomic_object(0, 0xDEAD_BEEF), None);
     assert_eq!(
-        atomic_stage(&mut upd, 0xDEAD_BEEF, PROP_FB_ID, 0),
+        atomic_stage(0, &mut upd, 0xDEAD_BEEF, PROP_FB_ID, 0),
         Err(FsError::EntryNotFound),
     );
 }

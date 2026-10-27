@@ -231,7 +231,7 @@ impl DrmDev {
         value: u64,
     ) -> Result<usize> {
         setproperty_called(obj_id, obj_type, prop_id, value);
-        let Some((kind, props)) = find_mode_object(obj_id, obj_type, true) else {
+        let Some((kind, props)) = find_mode_object(self.minor, obj_id, obj_type, true) else {
             let e = propertyless_lookup_error(obj_id, obj_type);
             return Err(setproperty_refused(obj_id, "no object of that type", e));
         };
@@ -280,7 +280,7 @@ impl DrmDev {
             return Err(setproperty_refused(obj_id, &why, FsError::InvalidParam));
         }
         let mut upd = drm::AtomicUpdate::default();
-        atomic_stage(&mut upd, obj_id, prop_id, value)?;
+        atomic_stage(self.minor, &mut upd, obj_id, prop_id, value)?;
         if let Some(fd) = upd.in_fence_fd {
             in_fence_of_fd(fd)?;
         }
@@ -1939,7 +1939,7 @@ impl DrmDev {
                 // deliver a DRM_EVENT_VBLANK on the card fd; otherwise fill the
                 // reply and return immediately instead of blocking.
                 let req = unsafe { &mut *(data as *mut DrmWaitVblank) };
-                wait_vblank_check(req.typ)?;
+                wait_vblank_check(self.minor, req.typ)?;
                 let typ = req.typ;
                 let signal = req.val1;
                 // `drm_vblank_get`: a CRTC that is off (DPMS off, SETCRTC
@@ -2431,7 +2431,7 @@ impl DrmDev {
                     let ids: alloc::vec::Vec<u32> = (0..count)
                         .map(|i| unsafe { uget::<u32>(req.object_ids, i) })
                         .collect();
-                    lease_objects(&ids, self.file.universal_planes())?
+                    lease_objects(self.minor, &ids, self.file.universal_planes())?
                 };
                 // `drm_lease_create`: an object a live lessee of this master
                 // still holds is EBUSY (`_drm_has_leased`), checked after the
@@ -2771,7 +2771,11 @@ impl DrmDev {
                     // `drm_mode_object_get_properties` does for this ioctl
                     // too (the modes and encoders above are all-or-nothing
                     // in Linux as well). This list was copied all or nothing.
-                    let props = connector_props(conn_res.connector_id, self.file.atomic_client());
+                    let props = connector_props(
+                        self.minor,
+                        conn_res.connector_id,
+                        self.file.atomic_client(),
+                    );
                     fill_prop_list(
                         conn_res.props_ptr,
                         conn_res.prop_values_ptr,
@@ -2954,7 +2958,9 @@ impl DrmDev {
                 // the CRTC's properties -- and copied the list all or
                 // nothing.
                 let atomic = self.file.atomic_client();
-                let Some((_, props)) = find_mode_object(res.obj_id, res.obj_type, atomic) else {
+                let Some((_, props)) =
+                    find_mode_object(self.minor, res.obj_id, res.obj_type, atomic)
+                else {
                     return Err(propertyless_lookup_error(res.obj_id, res.obj_type));
                 };
                 fill_prop_list(res.props_ptr, res.prop_values_ptr, res.count_props, &props)?;
@@ -3141,7 +3147,7 @@ impl DrmDev {
                     // [swapchain-diag] error!-visible at LOG=error: a wlroots
                     // "Swapchain failed test" can be an unknown/immutable prop
                     // rejected here, not just an atomic_commit check.
-                    atomic_stage(&mut upd, obj_id, prop_id, value).inspect_err(|e| {
+                    atomic_stage(self.minor, &mut upd, obj_id, prop_id, value).inspect_err(|e| {
                         log::error!(
                             "[drm] ATOMIC stage rejected: obj={:#x} prop={:#x} value={:#x} -> {:?}",
                             obj_id,
@@ -4312,7 +4318,7 @@ const _DRM_VBLANK_HIGH_CRTC_MASK: u32 = 0x1f << _DRM_VBLANK_HIGH_CRTC_SHIFT;
 /// NEXTONMISS and EVENT and answer the rest with pipe 0's counter, so a
 /// client waiting on the second head of a one-head card, or asking for a
 /// signal, got a vblank instead of the error Linux gives.
-fn wait_vblank_check(typ: u32) -> Result<()> {
+fn wait_vblank_check(minor: u32, typ: u32) -> Result<()> {
     if typ & _DRM_VBLANK_SIGNAL != 0 {
         return Err(FsError::InvalidParam);
     }
@@ -4327,7 +4333,7 @@ fn wait_vblank_check(typ: u32) -> Result<()> {
     } else {
         0
     };
-    if pipe_index != 0 && pipe_index >= drm::crtc_count() {
+    if pipe_index != 0 && pipe_index >= drm::crtc_count_on(minor) {
         return Err(FsError::InvalidParam);
     }
     Ok(())
@@ -5728,16 +5734,20 @@ struct PropSpec {
 /// none). `DRM_MODE_OBJECT_ANY` matches any type; any other type has to be
 /// the object's own.
 fn find_mode_object(
+    minor: u32,
     obj_id: u32,
     obj_type: u32,
     atomic: bool,
 ) -> Option<(u32, alloc::vec::Vec<(u32, u64)>)> {
-    let (kind, props) = if let Some(plane) = drm::get_plane(obj_id) {
+    let (kind, props) = if let Some(plane) = drm::get_plane_on(minor, obj_id) {
         (DRM_MODE_OBJECT_PLANE, plane_props(&plane, atomic))
-    } else if drm::get_crtc(obj_id).is_some() {
+    } else if drm::get_crtc_on(minor, obj_id).is_some() {
         (DRM_MODE_OBJECT_CRTC, crtc_props(atomic))
-    } else if drm::get_connector(obj_id).is_some() {
-        (DRM_MODE_OBJECT_CONNECTOR, connector_props(obj_id, atomic))
+    } else if drm::get_connector_on(minor, obj_id).is_some() {
+        (
+            DRM_MODE_OBJECT_CONNECTOR,
+            connector_props(minor, obj_id, atomic),
+        )
     } else if obj_id == drm::SYNTH_ENCODER_ID {
         (DRM_MODE_OBJECT_ENCODER, alloc::vec::Vec::new())
     } else {
@@ -5752,12 +5762,12 @@ fn find_mode_object(
 /// `drm_mode_object_find(dev, file, id, DRM_MODE_OBJECT_ANY)`, the type
 /// alone: what [`find_mode_object`] answers without building the property
 /// lists, for a caller that only wants to know what `obj_id` is.
-fn mode_object_kind(obj_id: u32) -> Option<u32> {
-    if drm::get_plane(obj_id).is_some() {
+fn mode_object_kind(minor: u32, obj_id: u32) -> Option<u32> {
+    if drm::get_plane_on(minor, obj_id).is_some() {
         Some(DRM_MODE_OBJECT_PLANE)
-    } else if drm::get_crtc(obj_id).is_some() {
+    } else if drm::get_crtc_on(minor, obj_id).is_some() {
         Some(DRM_MODE_OBJECT_CRTC)
-    } else if drm::get_connector(obj_id).is_some() {
+    } else if drm::get_connector_on(minor, obj_id).is_some() {
         Some(DRM_MODE_OBJECT_CONNECTOR)
     } else if obj_id == drm::SYNTH_ENCODER_ID {
         Some(DRM_MODE_OBJECT_ENCODER)
@@ -5802,10 +5812,10 @@ fn propertyless_lookup_error(obj_id: u32, obj_type: u32) -> FsError {
 /// and cursor planes along (`crtc->primary`, `crtc->cursor`: here the
 /// primary and cursor planes whose `possible_crtcs` has the CRTC's bit), and
 /// an id that lands in the set twice is the `idr_alloc` collision, ENOSPC.
-fn lease_objects(ids: &[u32], universal_planes: bool) -> Result<alloc::vec::Vec<u32>> {
+fn lease_objects(minor: u32, ids: &[u32], universal_planes: bool) -> Result<alloc::vec::Vec<u32>> {
     let mut kinds = alloc::vec::Vec::with_capacity(ids.len());
     for &id in ids {
-        let kind = mode_object_kind(id).ok_or(FsError::EntryNotFound)?;
+        let kind = mode_object_kind(minor, id).ok_or(FsError::EntryNotFound)?;
         if !matches!(
             kind,
             DRM_MODE_OBJECT_CRTC | DRM_MODE_OBJECT_CONNECTOR | DRM_MODE_OBJECT_PLANE
@@ -5823,7 +5833,10 @@ fn lease_objects(ids: &[u32], universal_planes: bool) -> Result<alloc::vec::Vec<
     let (crtcs, planes) = if universal_planes {
         (alloc::vec::Vec::new(), alloc::vec::Vec::new())
     } else {
-        (drm::get_resources().1, drm::get_planes_typed())
+        (
+            drm::resources_for_node(minor).0,
+            drm::get_planes_typed_on(minor),
+        )
     };
     let mut leased = alloc::vec::Vec::with_capacity(ids.len());
     let mut add = |id: u32| -> Result<()> {
@@ -6063,7 +6076,7 @@ fn prop_spec(prop_id: u32) -> Option<PropSpec> {
 /// `(prop_id, value)` pairs attached to the synthetic connector. Atomic
 /// properties (CRTC_ID) are only listed for clients that negotiated
 /// `DRM_CLIENT_CAP_ATOMIC`, mirroring Linux's atomic-property filtering.
-fn connector_props(connector_id: u32, atomic: bool) -> alloc::vec::Vec<(u32, u64)> {
+fn connector_props(minor: u32, connector_id: u32, atomic: bool) -> alloc::vec::Vec<(u32, u64)> {
     let mut props = alloc::vec::Vec::new();
     // DPMS reads back what the client last set, so a compositor that turned
     // the output off and re-reads the property sees "Off" rather than being
@@ -6078,7 +6091,7 @@ fn connector_props(connector_id: u32, atomic: bool) -> alloc::vec::Vec<(u32, u64
     ));
     props.push((PROP_LINK_STATUS, 0));
     props.push((PROP_NON_DESKTOP, 0));
-    if drm::get_connector_edid(connector_id).is_some() {
+    if drm::get_connector_edid_on(minor, connector_id).is_some() {
         props.push((PROP_EDID, edid_blob_id(connector_id) as u64));
     }
     if atomic {
@@ -6273,12 +6286,12 @@ fn atomic_errno(e: drm::AtomicError) -> FsError {
     }
 }
 
-fn atomic_object(obj_id: u32) -> Option<AtomicObject> {
-    if drm::get_plane(obj_id).is_some() {
+fn atomic_object(minor: u32, obj_id: u32) -> Option<AtomicObject> {
+    if drm::get_plane_on(minor, obj_id).is_some() {
         Some(AtomicObject::Plane)
-    } else if drm::get_crtc(obj_id).is_some() {
+    } else if drm::get_crtc_on(minor, obj_id).is_some() {
         Some(AtomicObject::Crtc)
-    } else if drm::get_connector(obj_id).is_some() {
+    } else if drm::get_connector_on(minor, obj_id).is_some() {
         Some(AtomicObject::Connector)
     } else {
         None
@@ -6289,8 +6302,14 @@ fn atomic_object(obj_id: u32) -> Option<AtomicObject> {
 /// request into the software-KMS update, with Linux's error contract: an
 /// unknown object or a property the object doesn't have is ENOENT; an illegal
 /// value or a legacy/immutable property in an atomic commit is EINVAL.
-fn atomic_stage(upd: &mut drm::AtomicUpdate, obj_id: u32, prop_id: u32, value: u64) -> Result<()> {
-    let obj = atomic_object(obj_id).ok_or(FsError::EntryNotFound)?;
+fn atomic_stage(
+    minor: u32,
+    upd: &mut drm::AtomicUpdate,
+    obj_id: u32,
+    prop_id: u32,
+    value: u64,
+) -> Result<()> {
+    let obj = atomic_object(minor, obj_id).ok_or(FsError::EntryNotFound)?;
     atomic_stage_on(upd, obj, prop_id, value)
 }
 
