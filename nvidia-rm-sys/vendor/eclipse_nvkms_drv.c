@@ -7,14 +7,20 @@
  *
  * PR 3 of docs/README-nvkms-port.md: allocate an nvkms device per GPU and
  * report what nvkms sees on it -- heads, connectors, displays, EDID and
- * modes. Like nvidia-drm before its first atomic commit, nothing here
- * changes what is on the screen: nvkms keeps scanning out whatever the
- * firmware left until a modeset is applied.
+ * modes. That much changes nothing on the screen: nvkms keeps scanning out
+ * whatever the firmware left until a modeset is applied.
+ *
+ * PR 4: the first modeset, the one nvidia-drm's first atomic commit makes,
+ * with the firmware console as the primary surface (eclipse_kms_show_console).
  */
 
 #include "nvUnixVersion.h"
 #include "nvidia-modeset-os-interface.h"
+#include "nvkms-rmapi.h"
 #include "nvkms-kapi.h"
+#include "nvkms-kapi-private.h"
+#include "nvkms-kapi-internal.h"
+#include <class/cl0076.h> /* NV01_MEMORY_FRAMEBUFFER_CONSOLE */
 
 #define ECLIPSE_KMS_MAX_DISPLAYS 8
 #define ECLIPSE_KMS_EDID_BYTES   128
@@ -267,4 +273,289 @@ done:
     if (res != NULL)
         nvkms_free(res, sizeof(*res));
     return ok;
+}
+
+/* Mirrored by `KmsMode` in src/nvkms.rs. */
+struct EclipseKmsMode {
+    NvU32 width;
+    NvU32 height;
+    NvU32 refreshMilliHz;
+    NvU32 pixelClockKHz;
+    NvU8  valid;
+    NvU8  preferred;
+    NvU8  interlaced;
+    NvU8  pad;
+};
+
+_Static_assert(sizeof(struct EclipseKmsMode) == 4 * 4 + 4,
+               "EclipseKmsMode layout is shared with src/nvkms.rs");
+
+/*
+ * Mode `index` of a display, the way nv_drm_connector_get_modes walks them.
+ * kapi's own answer: >0 more modes follow, 0 this was the last, <0 failure.
+ */
+int eclipse_kms_mode(struct NvKmsKapiDevice *device, NvU32 display, NvU32 index,
+                     struct EclipseKmsMode *out)
+{
+    struct NvKmsKapiDisplayMode mode;
+    NvBool valid = NV_FALSE, preferred = NV_FALSE;
+    int more;
+
+    nvkms_memset(out, 0, sizeof(*out));
+    if (device == NULL || !g_nvKmsValid)
+        return -1;
+    more = g_nvKms.getDisplayMode(device, display, index, &mode, &valid, &preferred);
+    if (more < 0)
+        return more;
+    out->width = mode.timings.hVisible;
+    out->height = mode.timings.vVisible;
+    out->refreshMilliHz = mode.timings.refreshRate;
+    out->pixelClockKHz = mode.timings.pixelClockHz / 1000;
+    out->valid = valid ? 1 : 0;
+    out->preferred = preferred ? 1 : 0;
+    out->interlaced = mode.timings.flags.interlaced ? 1 : 0;
+    return more;
+}
+
+/* The firmware console as a kapi surface, and the memory under it. */
+struct EclipseKmsConsole {
+    struct NvKmsKapiMemory *memory;
+    struct NvKmsKapiSurface *surface;
+    NvU32 width;
+    NvU32 height;
+};
+
+/*
+ * The console memory the firmware left scanning out, as a kapi memory object
+ * and a surface on it, so a modeset can keep showing exactly those pixels.
+ *
+ * nvkms does the same for its own console restore (nvRmImportFbConsoleMemory):
+ * NV01_MEMORY_FRAMEBUFFER_CONSOLE names the VRAM the RM reserved for the
+ * console, found through NV0080_CTRL_CMD_OS_UNIX_VT_GET_FB_INFO. kapi has no
+ * entry point for it -- nvidia-drm never scans out the firmware's memory, it
+ * has fbdev allocate new memory -- so the object is allocated in kapi's own
+ * RM client and wrapped the way ImportMemory wraps an imported one. kapi's
+ * freeMemory frees it like any other.
+ */
+struct EclipseKmsConsole *eclipse_kms_console_surface(struct NvKmsKapiDevice *device,
+                                                      NvU32 width, NvU32 height,
+                                                      NvU32 pitch, NvU32 depth)
+{
+    struct NvKmsKapiCreateSurfaceParams params = { };
+    struct EclipseKmsConsole *console = NULL;
+    struct NvKmsKapiMemory *memory = NULL;
+    enum NvKmsSurfaceMemoryFormat format;
+    NvU32 hMemory, ret;
+
+    if (device == NULL || !g_nvKmsValid || width == 0 || height == 0)
+        return NULL;
+
+    /* nvRmImportFbConsoleMemory's depth switch. */
+    switch (depth) {
+    case 15:
+        format = NvKmsSurfaceMemoryFormatX1R5G5B5;
+        break;
+    case 16:
+        format = NvKmsSurfaceMemoryFormatR5G6B5;
+        break;
+    case 24:
+    case 32:
+        format = NvKmsSurfaceMemoryFormatX8R8G8B8;
+        break;
+    default:
+        eclipse_kms_logf(NVKMS_LOG_LEVEL_ERROR, "console depth %u not supported", depth);
+        return NULL;
+    }
+
+    console = nvKmsKapiCalloc(1, sizeof(*console));
+    memory = nvKmsKapiCalloc(1, sizeof(*memory));
+    if (console == NULL || memory == NULL)
+        goto failed;
+
+    hMemory = nvKmsKapiGenerateRmHandle(device);
+    if (hMemory == 0)
+        goto failed;
+    ret = nvRmApiAlloc(device->hRmClient, device->hRmDevice, hMemory,
+                       NV01_MEMORY_FRAMEBUFFER_CONSOLE, NULL);
+    if (ret != NVOS_STATUS_SUCCESS) {
+        eclipse_kms_logf(NVKMS_LOG_LEVEL_ERROR,
+                         "NV01_MEMORY_FRAMEBUFFER_CONSOLE refused (0x%x)", ret);
+        nvKmsKapiFreeRmHandle(device, hMemory);
+        goto failed;
+    }
+    memory->hRmHandle = hMemory;
+    memory->size = (NvU64)pitch * height;
+    memory->surfaceParams.layout = NvKmsSurfaceMemoryLayoutPitch;
+    memory->isVidmem = NV_TRUE;
+    /* The CPU keeps drawing into it while it is on screen. */
+    memory->noDisplayCaching = NV_TRUE;
+
+    params.planes[0].memory = memory;
+    params.planes[0].offset = 0;
+    params.planes[0].pitch = pitch;
+    params.width = width;
+    params.height = height;
+    params.format = format;
+    console->surface = g_nvKms.createSurface(device, &params);
+    if (console->surface == NULL) {
+        eclipse_kms_logf(NVKMS_LOG_LEVEL_ERROR,
+                         "createSurface refused the console (%ux%u pitch %u)",
+                         width, height, pitch);
+        g_nvKms.freeMemory(device, memory);
+        nvKmsKapiFree(console);
+        return NULL;
+    }
+    console->memory = memory;
+    console->width = width;
+    console->height = height;
+    return console;
+
+failed:
+    nvKmsKapiFree(memory);
+    nvKmsKapiFree(console);
+    return NULL;
+}
+
+void eclipse_kms_console_free(struct NvKmsKapiDevice *device,
+                              struct EclipseKmsConsole *console)
+{
+    if (device == NULL || console == NULL || !g_nvKmsValid)
+        return;
+    g_nvKms.destroySurface(device, console->surface);
+    g_nvKms.freeMemory(device, console->memory);
+    nvKmsKapiFree(console);
+}
+
+/* Mirrored by `KmsHeadSet` in src/nvkms.rs: one head lit by the modeset. */
+struct EclipseKmsHeadSet {
+    NvU32 head;
+    NvU32 display;
+    NvU32 modeIndex;
+};
+
+/* eclipse_kms_show_console's answers, mirrored by `ShowError`. */
+enum {
+    ECLIPSE_KMS_SHOWN = 0,
+    ECLIPSE_KMS_BAD_REQUEST = 1,
+    ECLIPSE_KMS_NO_OWNERSHIP = 2,
+    ECLIPSE_KMS_MODE_GONE = 3,
+    ECLIPSE_KMS_REFUSED = 4,
+    ECLIPSE_KMS_COMMIT_FAILED = 5,
+};
+
+/* nvidia-drm's plane_config_clear. */
+static void eclipse_kms_layer_clear(struct NvKmsKapiLayerConfig *config)
+{
+    nvkms_memset(config, 0, sizeof(*config));
+    config->csc = NVKMS_IDENTITY_CSC_MATRIX;
+}
+
+/*
+ * The first modeset: each head in `sets` lights its display at its mode with
+ * the console as the primary layer, unscaled, and every other head of the
+ * device goes dark -- nvidia-drm's first atomic commit, which names every
+ * CRTC. Validated first (commit = false, as atomic_check does), then
+ * committed. Takes modeset ownership, as nvidia-drm does when a DRM master
+ * appears, and gives it back if the modeset does not happen.
+ */
+int eclipse_kms_show_console(struct NvKmsKapiDevice *device,
+                             const struct EclipseKmsConsole *console,
+                             const struct EclipseKmsHeadSet *sets, NvU32 numSets,
+                             NvU32 numHeads)
+{
+    struct NvKmsKapiRequestedModeSetConfig *req = NULL;
+    struct NvKmsKapiModeSetReplyConfig *reply = NULL;
+    int result = ECLIPSE_KMS_BAD_REQUEST;
+    NvBool owned = NV_FALSE;
+    NvU32 i, layer;
+
+    if (device == NULL || console == NULL || sets == NULL || numSets == 0 ||
+        !g_nvKmsValid || numHeads == 0 || numHeads > NVKMS_KAPI_MAX_HEADS)
+        return ECLIPSE_KMS_BAD_REQUEST;
+
+    /* Both are tens of kilobytes. */
+    req = nvkms_alloc(sizeof(*req), NV_TRUE);
+    reply = nvkms_alloc(sizeof(*reply), NV_TRUE);
+    if (req == NULL || reply == NULL)
+        goto done;
+
+    /* nv_drm_crtc_state_alloc, for every head. */
+    req->headsMask = (numHeads == 32) ? 0xffffffffu : ((1u << numHeads) - 1);
+    for (i = 0; i < numHeads; i++) {
+        struct NvKmsKapiHeadRequestedConfig *h = &req->headRequestedConfig[i];
+
+        h->modeSetConfig.olutFpNormScale = NVKMS_OLUT_FP_NORM_SCALE_DEFAULT;
+        for (layer = 0; layer < NVKMS_KAPI_LAYER_MAX; layer++)
+            eclipse_kms_layer_clear(&h->layerRequestedConfig[layer].config);
+        /* Dark unless a set below lights it. */
+        h->flags.activeChanged = NV_TRUE;
+        h->flags.displaysChanged = NV_TRUE;
+    }
+
+    for (i = 0; i < numSets; i++) {
+        const struct EclipseKmsHeadSet *set = &sets[i];
+        struct NvKmsKapiHeadRequestedConfig *h;
+        struct NvKmsKapiLayerRequestedConfig *primary;
+        NvBool valid = NV_FALSE, preferred = NV_FALSE;
+
+        if (set->head >= numHeads)
+            goto done;
+        h = &req->headRequestedConfig[set->head];
+        if (h->modeSetConfig.numDisplays != 0)
+            goto done; /* two sets for one head */
+
+        if (g_nvKms.getDisplayMode(device, set->display, set->modeIndex,
+                                   &h->modeSetConfig.mode, &valid, &preferred) < 0 ||
+            !valid) {
+            result = ECLIPSE_KMS_MODE_GONE;
+            goto done;
+        }
+        h->modeSetConfig.bActive = NV_TRUE;
+        h->modeSetConfig.numDisplays = 1;
+        h->modeSetConfig.displays[0] = set->display;
+        h->flags.modeChanged = NV_TRUE;
+
+        /* plane_req_config_update for a primary plane showing the whole
+         * console at the top left, vsynced. */
+        primary = &h->layerRequestedConfig[NVKMS_KAPI_LAYER_PRIMARY_IDX];
+        primary->config.surface = console->surface;
+        primary->config.compParams.compMode = NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE;
+        primary->config.srcWidth = console->width;
+        primary->config.srcHeight = console->height;
+        primary->config.dstWidth = console->width;
+        primary->config.dstHeight = console->height;
+        primary->config.minPresentInterval = 1;
+        primary->flags.surfaceChanged = NV_TRUE;
+        primary->flags.srcXYChanged = NV_TRUE;
+        primary->flags.srcWHChanged = NV_TRUE;
+        primary->flags.dstXYChanged = NV_TRUE;
+        primary->flags.dstWHChanged = NV_TRUE;
+        primary->flags.cscChanged = NV_TRUE;
+    }
+
+    if (!g_nvKms.grabOwnership(device)) {
+        result = ECLIPSE_KMS_NO_OWNERSHIP;
+        goto done;
+    }
+    owned = NV_TRUE;
+
+    if (!g_nvKms.applyModeSetConfig(device, req, reply, NV_FALSE)) {
+        result = ECLIPSE_KMS_REFUSED;
+        goto done;
+    }
+    nvkms_memset(reply, 0, sizeof(*reply));
+    if (!g_nvKms.applyModeSetConfig(device, req, reply, NV_TRUE)) {
+        result = ECLIPSE_KMS_COMMIT_FAILED;
+        goto done;
+    }
+    result = ECLIPSE_KMS_SHOWN;
+
+done:
+    if (owned && result != ECLIPSE_KMS_SHOWN)
+        g_nvKms.releaseOwnership(device);
+    if (reply != NULL)
+        nvkms_free(reply, sizeof(*reply));
+    if (req != NULL)
+        nvkms_free(req, sizeof(*req));
+    return result;
 }

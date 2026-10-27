@@ -515,8 +515,8 @@ pub struct NvidiaGpu {
     /// Both ladder states read `nvkms_takeover::NVKMS_OWNS` while nvkms
     /// holds the card.
     hwcur_state: core::sync::atomic::AtomicU8,
-    /// The nvkms device, once `nvidia.nvkms` gave nvkms this card.
-    nvkms_device: Mutex<Option<nvidia_rm_sys::nvkms::KmsDevice>>,
+    /// The nvkms device and what it scans out, once `nvidia.nvkms` gave it this card.
+    nvkms_device: Mutex<Option<nvkms_takeover::NvkmsCard>>,
     /// Boot-stable KMS topology snapshot: the FIRST successful RM display
     /// query, frozen for the rest of the boot. Every KMS-visible fact
     /// (connector ids, supported/connected masks, EDID head) is served from
