@@ -384,7 +384,7 @@ extern "C" fn eclipse_rm_hwcursor_init(_a0: u32, _a1: u32, out: *mut u8) -> u32 
     init_status
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_hwcursor_move(_a0: i32, _a1: i32) -> u32 {
+extern "C" fn eclipse_rm_hwcursor_move(_gpu: u32, _a0: i32, _a1: i32) -> u32 {
     NV_ERR_NOT_SUPPORTED
 }
 /// The NVC57E surface-flip ladder as the host sees it. The display front
@@ -465,11 +465,11 @@ extern "C" fn eclipse_rm_hwflip_init(_a0: u32, _a1: u32, out: *mut u8) -> u32 {
     0
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_hwflip_ready() -> u8 {
+extern "C" fn eclipse_rm_hwflip_ready(_gpu: u32) -> u8 {
     FAKE_HWFLIP.lock().ready as u8
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_hwflip_pending() -> u8 {
+extern "C" fn eclipse_rm_hwflip_pending(_gpu: u32) -> u8 {
     let mut f = FAKE_HWFLIP.lock();
     f.polls += 1;
     if !f.ready {
@@ -533,7 +533,7 @@ extern "C" fn eclipse_rm_hwflip_surface(
     0
 }
 #[no_mangle]
-extern "C" fn eclipse_rm_hwflip_iso_builds() -> u64 {
+extern "C" fn eclipse_rm_hwflip_iso_builds(_gpu: u32) -> u64 {
     FAKE_HWFLIP.lock().iso_mems.len() as u64
 }
 /// The RM core's construction: `core` says it stands; otherwise the

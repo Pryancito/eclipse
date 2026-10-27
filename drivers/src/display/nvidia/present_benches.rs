@@ -122,7 +122,7 @@ fn format_the_surfaceflip_stats_line(b: &mut Bencher) {
     let _g = SERIAL.lock();
     let gpu = console_gpu();
     assert!(gpu.page_flip(FB));
-    b.iter(|| black_box(surfaceflip_stats_line()));
+    b.iter(|| black_box(gpu.surfaceflip_stats_line()));
 }
 
 // --- the probe decodes, once per GPU rather than per frame ---

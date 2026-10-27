@@ -314,11 +314,6 @@ static CE_PRESENT_LOGGED: AtomicBool = AtomicBool::new(false);
 /// real-hardware test.
 static CE_PRESENT_WEDGED: AtomicBool = AtomicBool::new(false);
 
-/// NVC57E surface-flip ladder: 0 untried, 1 ready, 2 failed (latched for the
-/// boot, the CE/software present takes over). Module-level so a test can
-/// start it over.
-static SURFACEFLIP_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
 /// How long a flip may wait for the display front end to finish fetching the
 /// PREVIOUS flip before this one is dropped: three 60 Hz frames, enough for a
 /// 24 Hz panel's period plus slack. In steady state the wait is zero -- the
@@ -356,10 +351,10 @@ static SURFACEFLIP_BUSY_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// compositor sat in `PAGE_FLIP` for that long every frame, with every other
 /// RM entry spinning on the gate behind it; the fastest a client could go was
 /// the compositor's cadence.
-fn surfaceflip_drain() -> Option<u64> {
+fn surfaceflip_drain(dev: u32) -> Option<u64> {
     let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
     let mut waited = false;
-    while nvidia_rm_sys::rm_init::hwflip_pending() {
+    while nvidia_rm_sys::rm_init::hwflip_pending(dev) {
         waited = true;
         let now = unsafe { crate::bus::drivers_timer_now_as_micros() };
         if now.wrapping_sub(t0) >= SURFACEFLIP_DRAIN_TIMEOUT_US {
@@ -378,11 +373,13 @@ fn surfaceflip_drain() -> Option<u64> {
     Some(us)
 }
 
-/// One `/proc/gpudbg` line with the surface-flip counters.
-fn surfaceflip_stats_line() -> String {
+/// One `/proc/gpudbg` line with the surface-flip counters: the ladder state
+/// and ISO ctxdma count of the GPU `state` and `dev` describe, the flip
+/// counters for the whole machine.
+fn surfaceflip_stats_line_for(state: u8, dev: Option<u32>) -> String {
     alloc::format!(
         "[gpudbg]  surfaceflip: state={} flips={} iso-ctxdma-builds={} drain-waits={} drain-total={}us drain-max={}us submit-max={}us stuck-dropped={} busy-refused={}",
-        match SURFACEFLIP_STATE.load(Ordering::Relaxed) {
+        match state {
             0 => "untried",
             1 => "ready",
             _ => "failed",
@@ -391,7 +388,7 @@ fn surfaceflip_stats_line() -> String {
         // One per distinct framebuffer the compositor flips is healthy; a
         // number that tracks `flips` means every frame is paying an RM object
         // free plus an RM object alloc inside the RM API lock.
-        nvidia_rm_sys::rm_init::hwflip_iso_builds(),
+        dev.map_or(0, nvidia_rm_sys::rm_init::hwflip_iso_builds),
         SURFACEFLIP_DRAIN_WAITS.load(Ordering::Relaxed),
         SURFACEFLIP_DRAIN_US.load(Ordering::Relaxed),
         SURFACEFLIP_DRAIN_MAX_US.load(Ordering::Relaxed),
@@ -504,6 +501,13 @@ pub struct NvidiaGpu {
     /// Real RM device instance from a successful attach, needed to look the
     /// `OBJGPU*` back up (`gpumgrGetGpu`) for the GSP init step below.
     rm_device_instance: Mutex<Option<u32>>,
+    /// This GPU's NVC57E surface-flip ladder: 0 untried, 1 ready, 2 failed
+    /// (latched for the boot, the CE/software present takes over). Per GPU,
+    /// like the ladder itself in the RM shim: one card failing its bring-up
+    /// used to latch the other card's flips off too.
+    surfaceflip_state: core::sync::atomic::AtomicU8,
+    /// This GPU's display-engine cursor plane: 0 untried, 1 ready, 2 failed.
+    hwcur_state: core::sync::atomic::AtomicU8,
     /// Boot-stable KMS topology snapshot: the FIRST successful RM display
     /// query, frozen for the rest of the boot. Every KMS-visible fact
     /// (connector ids, supported/connected masks, EDID head) is served from
@@ -955,6 +959,8 @@ impl NvidiaGpu {
             bringup: Mutex::new(None),
             rm_attach_result: Mutex::new(None),
             rm_device_instance: Mutex::new(None),
+            surfaceflip_state: core::sync::atomic::AtomicU8::new(0),
+            hwcur_state: core::sync::atomic::AtomicU8::new(0),
             rm_display_snap: Mutex::new(None),
             auto_bringup_done: AtomicBool::new(false),
             gsp_firmware: Mutex::new(None),
@@ -1072,6 +1078,14 @@ impl NvidiaGpu {
     /// True if this GPU's BAR1 aperture contains the boot framebuffer — i.e. it
     /// is the GPU scanning out to the monitor. Such a GPU is spared from the
     /// copy-engine bring-up writes so a wedge can never blank the console.
+    /// [`surfaceflip_stats_line_for`] for this GPU's ladder.
+    fn surfaceflip_stats_line(&self) -> String {
+        surfaceflip_stats_line_for(
+            self.surfaceflip_state.load(Ordering::Relaxed),
+            *self.rm_device_instance.lock(),
+        )
+    }
+
     fn drives_boot_display(&self) -> bool {
         match boot_fb_phys() {
             Some(phys) if phys != 0 => {
@@ -4066,7 +4080,7 @@ impl DrmScheme for NvidiaGpu {
         s.push_str(&super::nouveau_uapi::format_exec_profile());
         // What a hardware page flip costs the compositor's thread, and how
         // often the panel was still latching the previous one.
-        s.push_str(&surfaceflip_stats_line());
+        s.push_str(&self.surfaceflip_stats_line());
         s.push('\n');
 
         s
@@ -7558,7 +7572,11 @@ impl DrmScheme for NvidiaGpu {
         // Claim hardware KMS only when NVC57E surface-flip is opted in AND the
         // ladder is READY. Until then software scanout (GOP blit) must remain
         // the path that lights the panel.
-        super::nouveau_uapi::surfaceflip_enabled() && nvidia_rm_sys::rm_init::hwflip_ready()
+        super::nouveau_uapi::surfaceflip_enabled()
+            && self
+                .rm_device_instance
+                .lock()
+                .is_some_and(nvidia_rm_sys::rm_init::hwflip_ready)
     }
 
     fn render_fence_for_scanout(&self, gem_handle: u32, owner_pid: u64) -> Option<(usize, u32)> {
@@ -7891,10 +7909,10 @@ impl DrmScheme for NvidiaGpu {
             // covers the BO from 0, so plane origin passed to RM is 0.
             if fb.vram_offset.is_some() && fb.h_memory != 0 && self.drives_boot_display() {
                 if let Some(dev) = *self.rm_device_instance.lock() {
-                    let mut state = SURFACEFLIP_STATE.load(Ordering::Acquire);
+                    let mut state = self.surfaceflip_state.load(Ordering::Acquire);
                     if state == 0 {
                         let (st, info) = nvidia_rm_sys::rm_init::hwflip_init(dev, 0);
-                        if st == 0 && nvidia_rm_sys::rm_init::hwflip_ready() {
+                        if st == 0 && nvidia_rm_sys::rm_init::hwflip_ready(dev) {
                             crate::klog_info!(
                                 "[NVIDIA] surfaceflip: READY win={} core=0x{:x} chan=0x{:x} owner=0x{:x}",
                                 info.window_idx,
@@ -7902,7 +7920,7 @@ impl DrmScheme for NvidiaGpu {
                                 info.win_chan_status,
                                 info.owner_status
                             );
-                            SURFACEFLIP_STATE.store(1, Ordering::Release);
+                            self.surfaceflip_state.store(1, Ordering::Release);
                             state = 1;
                         } else {
                             crate::klog_info!(
@@ -7912,7 +7930,7 @@ impl DrmScheme for NvidiaGpu {
                                 info.win_chan_status,
                                 info.owner_status
                             );
-                            SURFACEFLIP_STATE.store(2, Ordering::Release);
+                            self.surfaceflip_state.store(2, Ordering::Release);
                             state = 2;
                         }
                     }
@@ -7925,7 +7943,7 @@ impl DrmScheme for NvidiaGpu {
                         // still goes out, the compositor keeps running) and
                         // falls to the CE/software present below, as a
                         // refused flip always did.
-                        let Some(drained_us) = surfaceflip_drain() else {
+                        let Some(drained_us) = surfaceflip_drain(dev) else {
                             static SF_STUCK_LOG: AtomicBool = AtomicBool::new(false);
                             if !SF_STUCK_LOG.swap(true, Ordering::Relaxed) {
                                 crate::klog_warn!(
@@ -7977,7 +7995,7 @@ impl DrmScheme for NvidiaGpu {
                                 // no longer waits for the panel. `drain-max` is
                                 // how late the panel ever was; `submit-max` is
                                 // the RM entry itself.
-                                crate::klog_info!("[NVIDIA] {}", surfaceflip_stats_line());
+                                crate::klog_info!("[NVIDIA] {}", self.surfaceflip_stats_line());
                             }
                             return true;
                         }
@@ -8073,8 +8091,6 @@ impl DrmScheme for NvidiaGpu {
     /// plane. The caller (linux-object's MODE_CURSOR path) only tries this
     /// when the `nvidia.hwcursor` cmdline opt-in is present.
     fn hw_cursor_set(&self, argb: &[u32], w: u32, h: u32) -> bool {
-        use core::sync::atomic::AtomicU8;
-        static HWCUR_STATE: AtomicU8 = AtomicU8::new(0); // 0 untried, 1 ready, 2 failed
         if w == 0 || h == 0 || w > 64 || h > 64 {
             return false;
         }
@@ -8088,7 +8104,7 @@ impl DrmScheme for NvidiaGpu {
         let Some(dev) = *self.rm_device_instance.lock() else {
             return false;
         };
-        match HWCUR_STATE.load(Ordering::Relaxed) {
+        match self.hwcur_state.load(Ordering::Relaxed) {
             2 => return false,
             1 => {}
             _ => {
@@ -8111,14 +8127,14 @@ impl DrmScheme for NvidiaGpu {
                         st.curs_chan_status,
                         st.num_heads
                     );
-                    HWCUR_STATE.store(2, Ordering::Relaxed);
+                    self.hwcur_state.store(2, Ordering::Relaxed);
                     return false;
                 }
                 crate::klog_warn!(
                     "[nouveau-uapi] hwcursor: display cursor plane READY (heads={})",
                     st.num_heads
                 );
-                HWCUR_STATE.store(1, Ordering::Relaxed);
+                self.hwcur_state.store(1, Ordering::Relaxed);
             }
         }
         let s = nvidia_rm_sys::rm_init::hwcursor_image(dev, argb, w, h);
@@ -8134,7 +8150,10 @@ impl DrmScheme for NvidiaGpu {
 
     fn hw_cursor_move(&self, x: i32, y: i32) -> bool {
         // Pure PIO into the cursor-immediate channel -- no RM entry, no gate.
-        nvidia_rm_sys::rm_init::hwcursor_move(x, y) == 0
+        let Some(dev) = *self.rm_device_instance.lock() else {
+            return false;
+        };
+        nvidia_rm_sys::rm_init::hwcursor_move(dev, x, y) == 0
     }
 
     fn hw_cursor_hide(&self) -> bool {

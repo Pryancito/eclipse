@@ -1864,8 +1864,8 @@ fn primary_display() -> Option<Arc<dyn DisplayScheme>> {
 /// question about a card with no monitor on it. Both directions of that are
 /// wrong and visible to userspace, since this gates the CRTCs and encoders the
 /// compositor is shown and the atomic path: a compute card that claims
-/// hardware KMS (`hwflip_ready()` is one global for the whole box, not a
-/// per-card fact) hides a panel that the CPU blit is really painting, and a
+/// hardware KMS (`hwflip_ready()` was one global for the whole box before
+/// each GPU got its own display-engine ladder) hides a panel that the CPU blit is really painting, and a
 /// compute card that claims none hides real hardware scanout on the console
 /// card.
 pub fn software_kms_active() -> bool {
