@@ -291,3 +291,32 @@ fn the_phy_id_and_its_mask_are_the_published_ones() {
     assert_eq!(!BCM5421X_PHY_ID_MASK, 0xF);
     assert_eq!(BCM5421X_PHY_ID & !BCM5421X_PHY_ID_MASK, 0);
 }
+
+/// Los bits de estado de un descriptor de RECEPCION, tal y como los declara
+/// `bcmgenet.h` de Linux: `DMA_RX_LG` (1 << 4), `DMA_RX_NO` (1 << 3),
+/// `DMA_RX_RXER` (1 << 2), `DMA_RX_CRC_ERROR` (1 << 1) y `DMA_RX_OV`
+/// (1 << 0); y los dos que NO son errores, `DMA_RX_BRDCAST` (1 << 6) y
+/// `DMA_RX_MULT` (1 << 5).
+#[test]
+fn the_receive_status_bits_are_the_published_ones() {
+    assert_eq!(DMA_RX_LG, 1 << 4);
+    assert_eq!(DMA_RX_NO, 1 << 3);
+    assert_eq!(DMA_RX_RXER, 1 << 2);
+    assert_eq!(DMA_RX_CRC_ERROR, 1 << 1);
+    assert_eq!(DMA_RX_OV, 1 << 0);
+    assert_eq!(DMA_RX_BRDCAST, 1 << 6);
+    assert_eq!(DMA_RX_MULT, 1 << 5);
+    assert_eq!(DMA_RX_ERRORS, 0x1F);
+    // Los bits de error no pisan ni la clase de trama ni el estado del
+    // descriptor: si se solaparan, toda trama con SOP seria un error.
+    assert_eq!(DMA_RX_ERRORS & (DMA_RX_BRDCAST | DMA_RX_MULT), 0);
+    assert_eq!(
+        DMA_RX_ERRORS & (DMA_OWN | DMA_EOP | DMA_SOP | DMA_TX_APPEND_CRC),
+        0
+    );
+    // Y van en la mitad de abajo, debajo de la longitud.
+    assert_eq!(
+        DMA_RX_ERRORS & (DMA_BUFLENGTH_MASK << DMA_BUFLENGTH_SHIFT),
+        0
+    );
+}

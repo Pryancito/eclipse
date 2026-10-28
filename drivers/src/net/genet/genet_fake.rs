@@ -249,6 +249,13 @@ impl Hw {
     /// `slot` es el descriptor, que el test tiene que llevar por su cuenta
     /// porque el driver no lo publica.
     pub(super) fn deliver_frame(&self, slot: usize, frame: &[u8]) {
+        self.deliver_frame_with_status(slot, frame, 0);
+    }
+
+    /// Lo mismo, pero con los bits de estado que el MAC quiera poner: los de
+    /// error (`DMA_RX_CRC_ERROR` y companIa) y los de clase de trama
+    /// (`DMA_RX_BRDCAST`, `DMA_RX_MULT`).
+    pub(super) fn deliver_frame_with_status(&self, slot: usize, frame: &[u8], status: u32) {
         let desc = GENET_RX_OFF + slot * DMA_DESC_SIZE;
         let lo = self.peek(desc + DMA_DESC_ADDRESS_LO) as usize;
         let hi = self.peek(desc + DMA_DESC_ADDRESS_HI) as usize;
@@ -266,7 +273,7 @@ impl Hw {
         let declared = (frame.len() + RX_BUF_OFFSET) as u32;
         self.poke(
             desc + DMA_DESC_LENGTH_STATUS,
-            (declared << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP,
+            (declared << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP | status,
         );
         self.bump_rx_prod(1);
     }

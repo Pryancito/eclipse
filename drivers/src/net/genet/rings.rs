@@ -100,6 +100,29 @@ pub const DMA_OWN: u32 = 0x8000;
 pub const DMA_EOP: u32 = 0x4000;
 pub const DMA_SOP: u32 = 0x2000;
 pub const DMA_TX_APPEND_CRC: u32 = 0x0040;
+
+// Bits del estado de un descriptor de RECEPCION. El MAC marca aqui lo que le
+// paso a la trama, y **no mirarlos es entregar arriba una trama que el
+// hardware ya ha dicho que esta mal**: ni U-Boot ni esta tanda los miraban.
+/// La trama era mas larga de lo que el UMAC acepta.
+pub const DMA_RX_LG: u32 = 0x0010;
+/// Nibble impar: la trama no acabo en un byte entero.
+pub const DMA_RX_NO: u32 = 0x0008;
+/// El PHY levanto RX_ER en medio de la trama.
+pub const DMA_RX_RXER: u32 = 0x0004;
+pub const DMA_RX_CRC_ERROR: u32 = 0x0002;
+/// Se desbordo el buffer de recepcion del MAC.
+pub const DMA_RX_OV: u32 = 0x0001;
+/// Todo lo que hace de una trama una trama que no se entrega.
+pub const DMA_RX_ERRORS: u32 = DMA_RX_LG | DMA_RX_NO | DMA_RX_RXER | DMA_RX_CRC_ERROR | DMA_RX_OV;
+
+// Y dos bits que NO son errores, sino de que clase era la trama. Meterlos en
+// `DMA_RX_ERRORS` tirarIa **todo el broadcast y todo el multicast**, o sea
+// todo el ARP y todo el DHCP: la tarjeta pareceria viva y no hablaria con
+// nadie.
+pub const DMA_RX_BRDCAST: u32 = 0x0040;
+pub const DMA_RX_MULT: u32 = 0x0020;
+const _: () = assert!(DMA_RX_ERRORS & (DMA_RX_BRDCAST | DMA_RX_MULT) == 0);
 pub const DMA_TX_QTAG_SHIFT: u32 = 7;
 /// La etiqueta de cola que el UMAC espera de una trama que no lleva ninguna.
 pub const DMA_TX_QTAG_ALL: u32 = 0x3F;
@@ -119,6 +142,11 @@ const DMA_FC_THRESH_VALUE: u32 = (DMA_FC_THRESH_LO << 16) | DMA_FC_THRESH_HI;
 
 /// Los indices del hardware son contadores libres de **16 bits**: cuentan
 /// tramas, no huecos, y dan la vuelta en `0x10000`, que no es multiplo de 256.
+/// Y la mitad ALTA del `RDMA_PROD_INDEX` no es parte del indice: es el
+/// contador de tramas que el MAC descarto por no tener hueco
+/// (`DMA_P_INDEX_DISCARD_CNT`). Sin la mascara, una sola trama descartada
+/// haria que el driver creyera que tiene 65536 esperando y leyera el anillo
+/// entero de descriptores que el MAC no ha tocado.
 const INDEX_MASK: u32 = 0xFFFF;
 
 /// Trama Ethernet mas larga que se acepta transmitir, sin la FCS, que la pone
@@ -148,6 +176,9 @@ pub struct GenetRings {
     tx_slot: usize,
     /// El indice de 16 bits que el driver le ha anunciado al MAC.
     tx_prod: u32,
+    /// Tramas que llegaron marcadas como malas por el MAC, o con una longitud
+    /// imposible. Lo que `ethtool` llama `rx_errors`.
+    rx_errors: u64,
 }
 
 impl GenetRings {
@@ -168,6 +199,7 @@ impl GenetRings {
             rx_cons: 0,
             tx_slot: 0,
             tx_prod: 0,
+            rx_errors: 0,
         };
         rings.disable_dma();
         rings.rx_ring_init();
@@ -180,6 +212,19 @@ impl GenetRings {
     /// El MAC de debajo, para ajustar el enlace sin soltar los anillos.
     pub fn mac(&self) -> &GenetMac {
         &self.mac
+    }
+
+    /// Tramas descartadas por venir marcadas como malas o con una longitud
+    /// imposible.
+    pub fn rx_errors(&self) -> u64 {
+        self.rx_errors
+    }
+
+    /// Tramas que el MAC tiro por no tener hueco donde ponerlas, que es el
+    /// contador que lleva la mitad alta del `RDMA_PROD_INDEX`. Es un contador
+    /// del hardware: cuenta desde el arranque y da la vuelta a los 16 bits.
+    pub fn rx_discarded(&self) -> u32 {
+        (self.mac.read(RDMA_PROD_INDEX) >> 16) & 0xFFFF
     }
 
     // -----------------------------------------------------------------------
@@ -334,6 +379,25 @@ impl GenetRings {
 
         let desc = Self::rx_desc(self.rx_slot);
         let len_stat = self.mac.read(desc + DMA_DESC_LENGTH_STATUS);
+
+        // Lo primero, los bits de error. Entregar arriba una trama que el MAC
+        // ya ha marcado como mala --CRC roto, desbordamiento, RX_ER, nibble
+        // impar-- es darle basura a la pila IP, y con un cable marginal eso
+        // pasa a diario.
+        //
+        // Lo que de verdad obliga a mirarlos **aqui** y no mas abajo es el
+        // tamaño del buffer del llamante: una trama mala con sitio de sobra da
+        // igual donde se mire, pero una trama mala que no cabe se quedaria
+        // atascada en el anillo como `BufferTooSmall` para siempre. Respecto a
+        // la validacion de la longitud, en cambio, el orden no se nota desde
+        // fuera: las dos acaban en `IoError`, y ponerlo antes es solo para que
+        // la causa que se cuenta sea la que el hardware dio.
+        if len_stat & DMA_RX_ERRORS != 0 {
+            self.rx_errors += 1;
+            self.rx_release();
+            return Err(DeviceError::IoError);
+        }
+
         let declared = ((len_stat >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK) as usize;
 
         // La longitud declarada incluye los dos bytes que el MAC deja delante.
@@ -343,6 +407,7 @@ impl GenetRings {
             // Un descriptor con una longitud imposible no es una trama: se
             // suelta el hueco y se sigue, que es lo contrario de colgarse en
             // el.
+            self.rx_errors += 1;
             self.rx_release();
             return Err(DeviceError::IoError);
         }
