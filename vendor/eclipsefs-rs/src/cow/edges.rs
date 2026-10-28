@@ -1389,3 +1389,110 @@ fn metadata_migrates_to_the_fast_tier_when_it_can() {
     assert_eq!(on_slow(&fs), 1);
     fs.check().unwrap();
 }
+
+/// The smallest device that can be added has room for the blocks it
+/// reserves plus one smallest chunk, and that exact size is taken: one
+/// block less is refused.
+#[test]
+fn a_device_of_exactly_the_minimum_size_is_taken() {
+    let mut fs = CowFs::mount_devices(volume(), false, false).unwrap();
+    fs.set_clock(clock);
+    let min = (DEV_RESERVED + MIN_CHUNK) * BS;
+    assert_eq!(
+        fs.add_device(Ram::new((min - BS) as usize) as Arc<dyn BlockDevice>),
+        Err(Error::NoSpace)
+    );
+    assert_eq!(
+        fs.add_device(Ram::new(min as usize) as Arc<dyn BlockDevice>)
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        fs.vol.as_ref().unwrap().map().devices[&3],
+        DEV_RESERVED + MIN_CHUNK
+    );
+    fs.check().unwrap();
+}
+
+/// A device that reads back SMALLER than its map is not followed: the
+/// volume only ever grows, because shrinking has to move the chunks at the
+/// end first (`resize`), and a map that shrank on its own would leave them
+/// past the device's end.
+#[test]
+fn a_device_smaller_than_its_map_does_not_shrink_the_volume() {
+    let mut fs = CowFs::mount_devices(volume(), false, false).unwrap();
+    let vol = fs.vol.clone().unwrap();
+    let size = vol.map().devices[&1];
+    vol.with_map(|m| m.devices.insert(1, size + 1000));
+    assert!(!fs.grow_volume(&vol).unwrap());
+    assert_eq!(vol.map().devices[&1], size + 1000);
+}
+
+/// A data chunk goes down to the slow tier once less than an eighth of it
+/// is free. An eighth exactly is not less than an eighth, so that chunk
+/// stays, and so does one that is three quarters full.
+#[test]
+fn a_data_chunk_moves_down_once_less_than_an_eighth_of_it_is_free() {
+    let devs = devices(2);
+    mkfs::format_devices_tiered(
+        &devs,
+        &opts(),
+        Profile::Single,
+        Profile::Single,
+        &[Tier::Fast, Tier::Slow],
+    )
+    .unwrap();
+    let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+    fs.set_clock(clock);
+    assert!(fs.sp.grow_on(ChunkKind::Data, Some(Tier::Fast)));
+    fs.sync().unwrap();
+    let on_fast = |fs: &CowFs| -> Vec<u64> {
+        let map = fs.vol.as_ref().unwrap().map();
+        map.chunks
+            .iter()
+            .filter(|(_, c)| c.kind == ChunkKind::Data && map.chunk_tier(c) == Tier::Fast)
+            .map(|(&g, _)| g)
+            .collect()
+    };
+    let fast = on_fast(&fs);
+    assert_eq!(fast.len(), 1, "{fast:?}");
+    let g = fast[0] as usize;
+    let count = fs.sp.alloc.groups()[g].block_count;
+    // Three quarters full: nowhere near, whichever fraction is read.
+    fs.sp.alloc.groups_mut()[g].free_blocks = count / 4;
+    assert_eq!(fs.tier_migrate(false).unwrap().relocated, 0);
+    assert_eq!(on_fast(&fs).len(), 1);
+    // An eighth free is not LESS than an eighth, so it stays too.
+    fs.sp.alloc.groups_mut()[g].free_blocks = count / 8;
+    assert_eq!(fs.tier_migrate(false).unwrap().relocated, 0);
+    assert_eq!(on_fast(&fs).len(), 1);
+    // One block less, and it goes.
+    fs.sp.alloc.groups_mut()[g].free_blocks = count / 8 - 1;
+    assert_eq!(fs.tier_migrate(false).unwrap().relocated, 1);
+    assert!(on_fast(&fs).is_empty());
+}
+
+/// A parity chunk hands blocks out by parity row, so its group's row is
+/// the chunk's data column count: for RAID5, with its one parity column,
+/// as much as for RAID6.
+#[test]
+fn a_raid5_chunk_allocates_by_its_parity_row() {
+    let devs = devices(3);
+    mkfs::format_devices(&devs, &opts(), Profile::Raid5, Profile::Raid1).unwrap();
+    let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+    fs.set_clock(clock);
+    // Group 0 is forced to RAID1, so the RAID5 chunk is a later one.
+    assert!(fs.sp.grow_on(ChunkKind::Data, None));
+    let vol = fs.vol.clone().unwrap();
+    let (g, cols) = {
+        let map = vol.map();
+        map.chunks
+            .iter()
+            .find(|(_, c)| c.profile == Profile::Raid5)
+            .map(|(&g, c)| (g as usize, c.data_cols() as u64))
+            .expect("a raid5 chunk")
+    };
+    assert_eq!(cols, 2, "three devices, one of them parity");
+    fs.refresh_layouts();
+    assert_eq!(fs.sp.alloc.groups()[g].row(), cols);
+}

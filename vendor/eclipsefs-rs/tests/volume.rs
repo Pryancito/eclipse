@@ -752,3 +752,84 @@ fn probe_tells_which_device_of_which_volume_without_mounting() {
     one.write_at(0, &sb).unwrap();
     assert!(matches!(eclipsefs::probe(&*one), Err(Error::Corrupt(_))));
 }
+
+/// What a device reports as handed out is the room its chunks take, not
+/// the room left on it, so writing raises it. This is the number
+/// `BTRFS_IOC_DEV_INFO` returns, so reporting what is left would have
+/// `btrfs filesystem show` call a full device an empty one.
+#[test]
+fn a_device_reports_the_space_handed_out_not_the_space_left() {
+    let d = disks(2, 64 * MIB);
+    let mut fs = make(&d, Profile::Single, Profile::Single);
+    let handed_out =
+        |fs: &EclipseFS| -> u64 { fs.devices().iter().map(|x| x.allocated_bytes).sum() };
+    let total: u64 = fs.devices().iter().map(|x| x.size_bytes).sum();
+    assert_eq!(total, 128 * MIB as u64);
+    // A fresh filesystem has given out a little of it.
+    let before = handed_out(&fs);
+    assert!(
+        before > 0 && before < 16 * MIB as u64,
+        "{before} of {total}"
+    );
+    // Ten megabytes of files raise it, and it never passes the total.
+    let files = fill(&mut fs, 24, 400_000, 31);
+    fs.sync().unwrap();
+    let after = handed_out(&fs);
+    assert!(after >= before + 8 * MIB as u64, "{before} then {after}");
+    assert!(after <= total, "{after} of {total}");
+    same(&mut fs, &files);
+    clean(&mut fs);
+}
+
+/// A chunk's logical address is a byte offset into one address space, so
+/// no two chunks can cover the same logical byte.
+#[test]
+fn chunk_logical_ranges_do_not_overlap() {
+    let d = disks(2, 64 * MIB);
+    let mut fs = make(&d, Profile::Single, Profile::Dup);
+    let files = fill(&mut fs, 24, 400_000, 32);
+    fs.sync().unwrap();
+    let mut spans: Vec<(u64, u64)> = fs
+        .chunks()
+        .iter()
+        .map(|c| (c.logical, c.size_bytes))
+        .collect();
+    spans.sort();
+    assert!(spans.len() >= 2, "{spans:?}");
+    for w in spans.windows(2) {
+        assert!(w[0].0 + w[0].1 <= w[1].0, "{spans:?}");
+    }
+    same(&mut fs, &files);
+    clean(&mut fs);
+}
+
+/// The device that missed the commits is the one brought up to date, and
+/// the mount is what does it. The test above reads the same files but
+/// calls `clean()` first, and a scrub repairs a stale copy on its own, so
+/// it cannot tell the resync from the scrub.
+#[test]
+fn the_mount_alone_brings_the_stale_device_up_to_date() {
+    let d = disks(2, 32 * MIB);
+    let mut fs = make(&d, Profile::Raid1, Profile::Raid1);
+    // With both devices, because a degraded RAID1 cannot open a new chunk:
+    // what follows has to fit in the room these leave.
+    let files = fill(&mut fs, 6, 150_000, 33);
+    fs.sync().unwrap();
+    drop(fs);
+    // Device 2 is away while things change.
+    let mut fs = degraded(&d[..1]);
+    let root = fs.root_ino();
+    fs.unlink(root, &files[0].0).unwrap();
+    let more = fill(&mut fs, 5, 120_000, 34);
+    fs.sync().unwrap();
+    drop(fs);
+    // Both devices again: the mount resyncs device 2, and nothing else
+    // runs on this filesystem, so nothing else can repair it.
+    let fs = open(&d);
+    drop(fs);
+    // Device 2 on its own has to be current already.
+    let mut fs = EclipseFS::mount_degraded(devs(&d[1..]), true).unwrap();
+    same(&mut fs, &files[1..]);
+    same(&mut fs, &more);
+    assert!(fs.lookup(root, &files[0].0).is_err());
+}
