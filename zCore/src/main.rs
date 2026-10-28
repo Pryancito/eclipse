@@ -1208,12 +1208,6 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 kernel_hal::drivers::set_nvidia_uvm_enabled(true);
                 klog_info!("Eclipse: nvidia.uvm -- /dev/nvidia-uvm");
             }
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gem_vram_bar1") {
-                kernel_hal::drivers::set_gem_vram_bar1_enabled(true);
-                klog_info!(
-                    "Eclipse: nvidia.gem_vram_bar1 -- VRAM GEM objects CPU-mapped through BAR1"
-                );
-            }
             // labwc on Vulkan drives the card from two NVK devices at once;
             // each gets its own GPU context, as each file has its own VM in
             // Linux. GLES2 sessions keep one context per process unless asked.

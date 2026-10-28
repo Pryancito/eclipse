@@ -265,7 +265,7 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
     copias. `gem_free` devuelve el mapeo; con BAR1 llena (192 MiB de 256 para
     los buffers) o cualquier fallo, el objeto va a memoria del sistema como
     antes. Si un present aún copia uno de esos buffers, el CE lo lee como
-    `LOCAL_FB`. Sustituye a `vram_bar1.rs`, que suponía una BAR1 lineal.
+    `LOCAL_FB`.
 - Objetivo: **paridad** con la escalera actual en una sola tarjeta (escritorio,
   cursor, flips sin tearing) con `nvidia.wlr_vulkan`/`wlr_gles2`/`wlr_pixman`.
 

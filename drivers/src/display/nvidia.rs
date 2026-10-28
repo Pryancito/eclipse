@@ -197,16 +197,12 @@ mod gmmu;
 mod vram_alloc;
 
 /// Where `GEM_NEW` puts an object; with `nvidia.gem_vram`, a scanout buffer
-/// in VRAM mapped through BAR1 by the RM (replaces `vram_bar1`).
+/// in VRAM mapped through BAR1 by the RM.
 pub(super) mod gem_vram;
 
 /// A GPU context of its own for a second DRM file of the same process
 /// (`nvidia.ctx_per_file`): labwc on Vulkan has two NVK devices.
 pub(super) mod file_ctx;
-/// CPU-mapping a VRAM `GEM_NEW` object through the BAR1 aperture: the
-/// arithmetic and the bounds check, own file for the size ceiling. The hatch
-/// is `nvidia.gem_vram_bar1`, default off.
-pub(super) mod vram_bar1;
 
 mod comptag_caps;
 /// Honouring a compressed PTE kind instead of downgrading it, hatch

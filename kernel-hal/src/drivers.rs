@@ -397,16 +397,6 @@ pub fn set_gem_pushbuf_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_gem_pushbuf_enabled(_v: bool) {}
 
-/// Lets a VRAM `GEM_NEW` object be CPU-mapped through the BAR1 aperture
-/// (`nvidia.gem_vram_bar1`). Default off: see
-/// `drivers/src/display/nvidia/vram_bar1.rs`.
-#[cfg(target_arch = "x86_64")]
-pub fn set_gem_vram_bar1_enabled(v: bool) {
-    zcore_drivers::display::set_gem_vram_bar1_enabled(v);
-}
-#[cfg(not(target_arch = "x86_64"))]
-pub fn set_gem_vram_bar1_enabled(_v: bool) {}
-
 /// Gives a second DRM file of a process that drives the GPU from two at once
 /// (labwc on Vulkan: two NVK devices) a GPU context of its own, as Linux keeps
 /// a nouveau VM per file (`nvidia.ctx_per_file`; `nvidia.wlr_vulkan` turns it
