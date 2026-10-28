@@ -3118,3 +3118,332 @@ fn a_smaller_max_frame_moves_the_bands_with_it() {
     let frame = flow_control_align(1518);
     assert_eq!(small.rfa, flow_control_value(frame * 2 + FLOW_CONTROL_UNIT));
 }
+
+// ——— Tanda 16: who feeds whom ———
+
+#[test]
+fn the_leftovers_go_one_each_to_the_front_not_all_to_the_back() {
+    // Eleven queues over four classes is 3, 3, 3, 2.
+    let spans: Vec<(u32, u32)> = (0..4).map(|i| bucket_span(i, 11, 4)).collect();
+    assert_eq!(spans, [(0, 3), (3, 3), (6, 3), (9, 2)]);
+    // Not 2, 2, 2, 5: the classes are served in order, and piling the
+    // leftovers on one makes that one behave differently under load.
+    assert_ne!(spans[3].1, 5);
+    // The spans tile the range exactly, with no gap and no overlap.
+    let (last_start, last_len) = spans[3];
+    assert_eq!(last_start + last_len, 11);
+    for w in spans.windows(2) {
+        assert_eq!(w[0].0 + w[0].1, w[1].0);
+    }
+}
+
+#[test]
+fn an_exact_division_leaves_nothing_over() {
+    for i in 0..4u32 {
+        assert_eq!(bucket_span(i, 8, 4), (i * 2, 2));
+    }
+}
+
+#[test]
+fn every_transmit_queue_lands_in_exactly_one_class() {
+    for (queues, classes) in [(8u32, 4u32), (11, 4), (4, 4), (16, 3), (5, 2)] {
+        let mut seen = [0u32; 8];
+        for q in 0..queues {
+            let tc = tc_of_tx_queue(q, queues, classes).unwrap();
+            assert!(tc < classes, "{} queues {} classes", queues, classes);
+            seen[tc as usize] += 1;
+        }
+        // No class is left without a queue: a class with nowhere to put a
+        // frame is a class that drops it.
+        let seen = &seen[..classes as usize];
+        assert!(seen.iter().all(|&n| n > 0), "{:?}", seen);
+        assert_eq!(seen.iter().sum::<u32>(), queues);
+    }
+}
+
+#[test]
+fn fewer_queues_than_classes_is_refused() {
+    let fake = FakeXgmac::new();
+    assert!(map_tx_queues_to_tc(&fake, 2, 4).is_err());
+    assert!(map_tx_queues_to_tc(&fake, 4, 0).is_err());
+    assert!(map_tx_queues_to_tc(&fake, 4, 4).is_ok());
+}
+
+#[test]
+fn the_class_map_does_not_touch_the_fifo_size_in_the_same_register() {
+    let fake = FakeXgmac::new();
+    // The FIFO size of the batch before lives at index 16 of this same
+    // register; the class map is at index 8, width 3.
+    write_field(
+        &fake,
+        mtl_queue_reg(0, MTL_Q_TQOMR),
+        MTL_Q_TQOMR_TQS.0,
+        MTL_Q_TQOMR_TQS.1,
+        0x1ff,
+    );
+    map_tx_queues_to_tc(&fake, 4, 4).unwrap();
+    let word = fake.read32(mtl_queue_reg(0, MTL_Q_TQOMR));
+    assert_eq!(get_bits(word, MTL_Q_TQOMR_TQS.0, MTL_Q_TQOMR_TQS.1), 0x1ff);
+    assert_eq!(
+        get_bits(word, MTL_Q_TQOMR_Q2TCMAP.0, MTL_Q_TQOMR_Q2TCMAP.1),
+        0
+    );
+}
+
+#[test]
+fn the_priority_map_is_a_mask_per_queue_not_a_queue_per_priority() {
+    // Four priority queues over eight priorities: two priorities each, and
+    // what goes in the byte is the MASK of those priorities.
+    assert_eq!(prio_mask_for_queue(0, 4), 0b0000_0011);
+    assert_eq!(prio_mask_for_queue(1, 4), 0b0000_1100);
+    assert_eq!(prio_mask_for_queue(3, 4), 0b1100_0000);
+    // A queue number would be a small integer; these are not.
+    assert_ne!(prio_mask_for_queue(3, 4), 3);
+}
+
+#[test]
+fn every_priority_is_claimed_by_exactly_one_queue() {
+    for queues in 1..=8u32 {
+        let mut all = 0u32;
+        for q in 0..queues {
+            let mask = prio_mask_for_queue(q, queues);
+            assert_eq!(all & mask, 0, "{} queues: queue {} overlaps", queues, q);
+            all |= mask;
+        }
+        assert_eq!(all, 0xff, "{} queues left a priority unmapped", queues);
+    }
+}
+
+#[test]
+fn four_queues_share_one_register_one_byte_each() {
+    assert_eq!(packed_byte(MAC_RQC2R, MAC_RQC2_INC, 4, 0), (MAC_RQC2R, 0));
+    assert_eq!(packed_byte(MAC_RQC2R, MAC_RQC2_INC, 4, 3), (MAC_RQC2R, 24));
+    assert_eq!(
+        packed_byte(MAC_RQC2R, MAC_RQC2_INC, 4, 4),
+        (MAC_RQC2R + 4, 0)
+    );
+    assert_eq!(
+        packed_byte(MAC_RQC2R, MAC_RQC2_INC, 4, 9),
+        (MAC_RQC2R + 8, 8)
+    );
+}
+
+#[test]
+fn the_priority_map_goes_out_one_whole_register_at_a_time() {
+    let fake = FakeXgmac::new();
+    map_prios_to_rx_queues(&fake, 8).unwrap();
+    // Eight priority queues, one priority each: two registers, four bytes
+    // each.
+    let log = fake.log();
+    assert_eq!(log.len(), 2, "{:?}", log);
+    assert_eq!(log[0], Access::Write(MAC_RQC2R, 0x0804_0201));
+    assert_eq!(log[1], Access::Write(MAC_RQC2R + 4, 0x8040_2010));
+}
+
+#[test]
+fn a_partly_filled_last_register_is_still_written() {
+    let fake = FakeXgmac::new();
+    // Six queues: a full register and then a half-full one, whose unused
+    // bytes are zero rather than left behind.
+    map_prios_to_rx_queues(&fake, 6).unwrap();
+    let log = fake.log();
+    assert_eq!(log.len(), 2, "{:?}", log);
+    match log[1] {
+        Access::Write(reg, value) => {
+            assert_eq!(reg, MAC_RQC2R + 4);
+            assert_eq!(value >> 16, 0, "the unused bytes were not cleared");
+        }
+        ref other => panic!("not a write: {:?}", other),
+    }
+}
+
+#[test]
+fn the_channel_map_writes_a_mode_bit_and_not_a_channel_number() {
+    let fake = FakeXgmac::new();
+    map_rx_queues_to_channels(&fake, 4).unwrap();
+    let log = fake.log();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0], Access::Write(MTL_RQDCM0R, 0x8080_8080));
+    // 0x80 is the "map dynamically" bit, not channel 128. A channel index
+    // written here instead would leave that bit clear and nail every queue
+    // to one channel.
+    assert_eq!(RQDCM_DYNAMIC & 0x7f, 0);
+    assert_ne!(RQDCM_DYNAMIC, 0);
+}
+
+#[test]
+fn the_two_packed_maps_live_in_different_register_banks() {
+    // Same packing, different base: a helper pointed at the wrong bank would
+    // write a priority mask into the channel map, where 0x80 is the only bit
+    // that matters and the mask's bits are not it.
+    assert_ne!(MAC_RQC2R, MTL_RQDCM0R);
+    assert_eq!(MAC_RQC2_Q_PER_REG, MTL_RQDCM_Q_PER_REG);
+    assert_eq!(MAC_RQC2_INC, MTL_RQDCM_INC);
+}
+
+#[test]
+fn mapping_nothing_is_refused_rather_than_written_as_zero() {
+    let fake = FakeXgmac::new();
+    assert!(map_prios_to_rx_queues(&fake, 0).is_err());
+    assert!(map_rx_queues_to_channels(&fake, 0).is_err());
+    assert!(fake.log().is_empty());
+}
+
+// ——— Tanda 17: store and forward, and who goes first ———
+
+#[test]
+fn the_transmit_store_and_forward_bit_is_not_the_flush_bit() {
+    // Bit 0 of TQOMR is FTQ. A store-and-forward bit written from the bottom
+    // of the word empties the queue instead of configuring it.
+    assert_eq!(MTL_Q_TQOMR_TSF.0, 1);
+    assert_eq!(MTL_Q_TQOMR_FTQ.0, 0);
+    assert_ne!(MTL_Q_TQOMR_TSF.0, MTL_Q_TQOMR_FTQ.0);
+}
+
+#[test]
+fn the_two_store_and_forward_bits_are_four_apart() {
+    // Same name on the two sides, four bits apart.
+    assert_eq!(MTL_Q_TQOMR_TSF.0, 1);
+    assert_eq!(MTL_Q_RQOMR_RSF.0, 5);
+}
+
+#[test]
+fn the_two_thresholds_differ_in_index_and_in_width() {
+    assert_eq!(MTL_Q_TQOMR_TTC, (4, 3));
+    assert_eq!(MTL_Q_RQOMR_RTC, (0, 2));
+    // And the receive threshold sits where the transmit register keeps its
+    // flush bit, so the two registers cannot share a helper that takes the
+    // position as read.
+    assert_eq!(MTL_Q_RQOMR_RTC.0, MTL_Q_TQOMR_FTQ.0);
+}
+
+#[test]
+fn store_and_forward_sets_the_bit_and_clears_the_threshold() {
+    let fake = FakeXgmac::new();
+    config_tx_forwarding(&fake, 2, Forwarding::StoreAndForward);
+    for q in 0..2 {
+        let word = fake.read32(mtl_queue_reg(q, MTL_Q_TQOMR));
+        assert_eq!(get_bits(word, MTL_Q_TQOMR_TSF.0, MTL_Q_TQOMR_TSF.1), 1);
+        assert_eq!(get_bits(word, MTL_Q_TQOMR_TTC.0, MTL_Q_TQOMR_TTC.1), 0);
+        // And the flush bit was never touched.
+        assert_eq!(get_bits(word, MTL_Q_TQOMR_FTQ.0, MTL_Q_TQOMR_FTQ.1), 0);
+    }
+}
+
+#[test]
+fn the_threshold_is_written_even_though_store_and_forward_ignores_it() {
+    let fake = FakeXgmac::new();
+    // A stale threshold from a previous configuration must not survive.
+    write_field(
+        &fake,
+        mtl_queue_reg(0, MTL_Q_TQOMR),
+        MTL_Q_TQOMR_TTC.0,
+        MTL_Q_TQOMR_TTC.1,
+        7,
+    );
+    config_tx_forwarding(&fake, 1, Forwarding::StoreAndForward);
+    assert_eq!(
+        get_bits(
+            fake.read32(mtl_queue_reg(0, MTL_Q_TQOMR)),
+            MTL_Q_TQOMR_TTC.0,
+            MTL_Q_TQOMR_TTC.1
+        ),
+        0
+    );
+}
+
+#[test]
+fn cut_through_clears_the_bit_and_keeps_the_threshold() {
+    let fake = FakeXgmac::new();
+    config_rx_forwarding(&fake, 1, Forwarding::CutThrough { threshold: 3 });
+    let word = fake.read32(mtl_queue_reg(0, MTL_Q_RQOMR));
+    assert_eq!(get_bits(word, MTL_Q_RQOMR_RSF.0, MTL_Q_RQOMR_RSF.1), 0);
+    assert_eq!(get_bits(word, MTL_Q_RQOMR_RTC.0, MTL_Q_RQOMR_RTC.1), 3);
+}
+
+#[test]
+fn the_forwarding_mode_does_not_disturb_the_fifo_size_beside_it() {
+    let fake = FakeXgmac::new();
+    config_tx_fifo(&fake, 64 * 1024, 1).unwrap();
+    let before = get_bits(
+        fake.read32(mtl_queue_reg(0, MTL_Q_TQOMR)),
+        MTL_Q_TQOMR_TQS.0,
+        MTL_Q_TQOMR_TQS.1,
+    );
+    config_tx_forwarding(&fake, 1, Forwarding::StoreAndForward);
+    assert_eq!(
+        get_bits(
+            fake.read32(mtl_queue_reg(0, MTL_Q_TQOMR)),
+            MTL_Q_TQOMR_TQS.0,
+            MTL_Q_TQOMR_TQS.1
+        ),
+        before
+    );
+}
+
+#[test]
+fn both_scheduler_selections_are_zero() {
+    // A step whose whole visible effect is writing zeroes looks like a
+    // no-op and gets deleted. It is not: the register is not guaranteed to
+    // come up this way.
+    assert_eq!(MTL_ETSALG_WRR, 0);
+    assert_eq!(MTL_RAA_SP, 0);
+    let fake = FakeXgmac::new();
+    fake.preload(MTL_OMR, 0xffff_ffff);
+    config_mtl_scheduling(&fake);
+    let word = fake.read32(MTL_OMR);
+    assert_eq!(get_bits(word, MTL_OMR_ETSALG.0, MTL_OMR_ETSALG.1), 0);
+    assert_eq!(get_bits(word, MTL_OMR_RAA.0, MTL_OMR_RAA.1), 0);
+    // ... and the rest of a register full of ones is left as it was.
+    assert_eq!(word & 0b11, 0b11);
+}
+
+#[test]
+fn the_traffic_class_half_is_not_zero() {
+    let fake = FakeXgmac::new();
+    config_tc_weights(&fake, 2, 4).unwrap();
+    for tc in 0..2 {
+        assert_eq!(
+            get_bits(
+                fake.read32(mtl_tc_reg(tc, MTL_TC_ETSCR)),
+                MTL_TC_ETSCR_TSA.0,
+                MTL_TC_ETSCR_TSA.1
+            ),
+            MTL_TSA_ETS
+        );
+        assert_eq!(
+            get_bits(
+                fake.read32(mtl_tc_reg(tc, MTL_TC_QWR)),
+                MTL_TC_QWR_QW.0,
+                MTL_TC_QWR_QW.1
+            ),
+            1
+        );
+    }
+    assert_ne!(MTL_TSA_ETS, 0);
+}
+
+#[test]
+fn a_traffic_class_and_a_queue_share_one_register_block() {
+    // MTL_TC_BASE is MTL_Q_BASE and the stride is the same, so class N's
+    // registers are inside queue N's 0x80 block.
+    assert_eq!(mtl_tc_reg(0, MTL_TC_ETSCR), mtl_queue_reg(0, 0x10));
+    assert_eq!(mtl_tc_reg(3, MTL_TC_QWR), mtl_queue_reg(3, 0x18));
+    // The class registers do not collide with the queue ones in that block.
+    for tc in 0..4u32 {
+        for &tc_reg in &[MTL_TC_ETSCR, MTL_TC_QWR] {
+            assert_ne!(mtl_tc_reg(tc, tc_reg), mtl_queue_reg(tc, MTL_Q_TQOMR));
+            assert_ne!(mtl_tc_reg(tc, tc_reg), mtl_queue_reg(tc, MTL_Q_RQOMR));
+        }
+    }
+}
+
+#[test]
+fn a_class_above_the_queue_count_is_refused() {
+    let fake = FakeXgmac::new();
+    // It would land in another queue's block rather than failing loudly.
+    assert!(config_tc_weights(&fake, 5, 4).is_err());
+    assert!(config_tc_weights(&fake, 0, 4).is_err());
+    assert!(fake.log().is_empty());
+    assert!(config_tc_weights(&fake, 4, 4).is_ok());
+}
