@@ -15,10 +15,16 @@
 //! Three things are deliberately NOT like Linux, and each is a decision rather
 //! than an omission:
 //!
-//! 1. **No `kswapd`.** Reclaim here is direct only: it runs on the thread whose
-//!    allocation just failed, in front of the failure. A background reclaimer
-//!    needs a kernel thread and a watermark policy, and the failure path is
-//!    where the machine is lost today.
+//! 1. **`kswapd` is one worker, and it is the only thing that may be slow.**
+//!    Direct reclaim ([`shrink`]) runs on the thread whose allocation just
+//!    failed, and can therefore only ask caches that free memory without
+//!    allocating, waiting or writing to disk. The caches that cannot promise
+//!    that -- the page cache, whose eviction writes dirty pages back through
+//!    the filesystem -- register in the DEFERRED registry instead, which only
+//!    the reclaim worker walks ([`run_deferred`]). There is no per-node
+//!    `kswapd` and no watermark policy in here: the worker lives where the
+//!    free-memory figures live, and this module only holds the standing
+//!    demand it serves ([`request`]).
 //! 2. **No shrinker list in a `Vec`.** The registry is a fixed array of
 //!    `&'static` records, because its one caller is an allocation that has
 //!    already failed: a `Vec` push on that path is the allocation that cannot
@@ -254,12 +260,93 @@ pub fn reclaimable() -> usize {
 /// caller: it allocates nothing itself, and a shrinker whose own work lands
 /// back here gets a zero rather than a recursion.
 pub fn shrink(want: usize) -> usize {
-    REGISTRY.shrink_on(percpu_slot(crate::cpu::cpu_id() as usize), want)
+    let freed = REGISTRY.shrink_on(percpu_slot(crate::cpu::cpu_id() as usize), want);
+    // What the caches that may answer here could not give is what the worker
+    // is for. Raising the demand costs a store, which is all this path can
+    // afford, and the allocation in front of it still fails or does not on
+    // what `freed` says -- the worker is for the NEXT one.
+    request(want.saturating_sub(freed));
+    freed
 }
 
 /// Reclaim attempts, bytes freed, and attempts refused as re-entrant.
 pub fn stats() -> (u64, u64, u64) {
     REGISTRY.stats()
+}
+
+/// The caches whose reclaim cannot run in front of a failed allocation.
+///
+/// Same records, a separate registry, because the contract is the opposite
+/// one: a shrinker in here MAY allocate, take filesystem locks and write to
+/// disk. Evicting a page-cache entry writes its dirty pages back through
+/// `inode.write_at` -- a filesystem write, a `vec![0u8; PAGE_SIZE]`, and the
+/// page faults reading the VMO triggers -- which is exactly what an allocation
+/// that has already failed cannot do. Registering such a cache in [`REGISTRY`]
+/// would trade an OOM for a hang, so it goes here and only [`run_deferred`],
+/// on the reclaim worker, ever calls it.
+///
+/// Its own re-entrancy flags are what make that safe in the other direction
+/// too: a deferred scan whose own work fails an allocation lands in [`shrink`],
+/// which walks the OTHER registry and finds its flags free.
+static DEFERRED: Registry = Registry::new();
+
+/// Bytes the deferred caches have been asked for and have not yet been asked
+/// to give. Written by [`request`] and by the shortfall of a direct reclaim,
+/// read and cleared by [`run_deferred`].
+static DEMAND: AtomicUsize = AtomicUsize::new(0);
+
+/// Register a cache whose reclaim may allocate, wait or write to disk.
+/// `false` means the deferred registry is full: raise [`MAX_SHRINKERS`].
+pub fn register_deferred(s: &'static Shrinker) -> bool {
+    DEFERRED.register(s)
+}
+
+/// How many deferred caches are registered.
+pub fn registered_deferred() -> usize {
+    DEFERRED.registered()
+}
+
+/// Bytes the deferred caches say they could give back.
+///
+/// Runs their `count`, which in the deferred registry may be as slow as their
+/// `scan`: for the reclaim worker only.
+pub fn deferred_reclaimable() -> usize {
+    DEFERRED.reclaimable()
+}
+
+/// Ask the worker for `want` bytes, without doing any of the work.
+///
+/// This is the whole of waking `kswapd`: it stores a figure and returns, so it
+/// is safe from a failed allocation and from a frame allocator holding its own
+/// lock. The standing demand is the LARGEST request since the last pass, not
+/// their sum -- ten failures asking 4 MiB each mean 4 MiB are missing ten
+/// times over, not that 40 MiB are.
+pub fn request(want: usize) {
+    if want > 0 {
+        DEMAND.fetch_max(want, Ordering::Relaxed);
+    }
+}
+
+/// What the deferred caches are currently being asked for.
+pub fn pending() -> usize {
+    DEMAND.load(Ordering::Relaxed)
+}
+
+/// Serve the standing demand: the reclaim worker's one call.
+///
+/// Takes the demand before scanning, so a request that arrives while this runs
+/// is served by the next pass instead of being lost. Answers what was freed.
+pub fn run_deferred() -> usize {
+    let want = DEMAND.swap(0, Ordering::Relaxed);
+    if want == 0 {
+        return 0;
+    }
+    DEFERRED.shrink_on(percpu_slot(crate::cpu::cpu_id() as usize), want)
+}
+
+/// Deferred reclaim passes, bytes freed, and passes refused as re-entrant.
+pub fn deferred_stats() -> (u64, u64, u64) {
+    DEFERRED.stats()
 }
 
 #[cfg(test)]
