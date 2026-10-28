@@ -76,6 +76,18 @@ fn open_dev(path: &PathBuf) -> Arc<dyn BlockDevice> {
     open_dev_sized(path, MKFS_SIZE)
 }
 
+/// Read `buf.len()` bytes at `off` straight out of the image file, outside
+/// the driver. False means the file is shorter than that, which is how the
+/// absence of a superblock mirror shows up.
+fn read_exact_at(f: &std::fs::File, off: u64, buf: &mut [u8]) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = f;
+    if f.seek(SeekFrom::Start(off)).is_err() {
+        return false;
+    }
+    f.read_exact(buf).is_ok()
+}
+
 /// Format an image of `size` bytes and check it mounts, so a later refusal is
 /// the crafting and not the image.
 fn fresh_sized(name: &str, size: u64) -> PathBuf {
@@ -719,5 +731,198 @@ fn the_chunks_a_fresh_image_gets_are_the_ones_the_plan_promises() {
             }
         }
     }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn no_chunk_a_format_lays_down_reaches_past_the_end_of_the_device() {
+    // A device whose size is not a whole number of mebibytes is the ordinary
+    // case: a partition ends where the partition table says it does, not where
+    // the chunk alignment would prefer. The plan rounds the device size *down*
+    // to the alignment for exactly that reason, and rounding it up instead is
+    // invisible to everything else in this crate -- a format writes nothing
+    // out there (`fresh_sized` checks that), and a data write that lands past
+    // the end of an image *file* only extends the file. On the disk the
+    // installer writes to, those addresses belong to the next partition.
+    for (name, size) in [
+        ("tail0", MKFS_SIZE),
+        ("tail1", MKFS_SIZE + 1),
+        ("tailsector", MKFS_SIZE + 4096),
+        ("tailhalf", MKFS_SIZE + 512 * 1024),
+        ("tailalmost", MKFS_SIZE + MIB - 1),
+    ] {
+        let path = fresh_sized(name, size);
+        let vol = Volume::open(open_dev_sized(&path, size)).unwrap();
+        let total = vol.dev.size();
+        assert_eq!(total, size);
+        for c in vol.chunks() {
+            for s in &c.stripes {
+                assert!(
+                    s.offset + c.length <= total,
+                    "the chunk at {:#x} occupies [{:#x}, {:#x}) of a device that ends at {:#x}",
+                    c.logical,
+                    s.offset,
+                    s.offset + c.length,
+                    total
+                );
+            }
+        }
+        drop(vol);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn the_metadata_area_is_an_eighth_of_a_device_between_the_two_bounds() {
+    // The floor and the ceiling are each stated above, on the only device
+    // sizes that reach them. Neither says what the rule between them is, and
+    // the share is what decides every real image.
+    //
+    // 100 MiB on purpose: an eighth of it is 12.5 MiB, which is inside both
+    // bounds *and* not a whole number of mebibytes, so this states the
+    // rounding as well. A chunk has to start and end on the alignment, and
+    // rounding this one up instead takes the extra megabyte out of the data
+    // area -- where nothing else in this file is counting.
+    const SIZE: u64 = 100 * MIB;
+    const { assert!(SIZE / 8 > 8 * MIB && SIZE / 8 < 32 * MIB) };
+    const { assert!(SIZE / 8 / MIB * MIB != SIZE / 8) };
+    let path = fresh_sized("eighth", SIZE);
+    let vol = Volume::open(open_dev_sized(&path, SIZE)).unwrap();
+    let meta: u64 = vol
+        .chunks()
+        .iter()
+        .filter(|c| c.type_ & BLOCK_GROUP_METADATA != 0)
+        .map(|c| c.length)
+        .sum();
+    assert_eq!(
+        meta,
+        SIZE / 8 / MIB * MIB,
+        "a {} MiB device got {} bytes of metadata; an eighth of it is {} bytes, and a chunk ends \
+         on the alignment below that",
+        SIZE / MIB,
+        meta,
+        SIZE / 8
+    );
+    drop(vol);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_smallest_device_this_format_takes_still_has_room_for_a_file() {
+    // The minimum device size is the fixed layout plus four megabytes of
+    // data, and four megabytes is also the smallest gap the plan will turn
+    // into a data chunk. So at exactly the minimum the last gap is exactly
+    // the smallest acceptable chunk: the one device size where that bound is
+    // reachable from outside the allocator, and the only one where raising it
+    // leaves a filesystem that mounts, lists and refuses to store anything.
+    const SIZE: u64 = mkfs::MIN_DEVICE_SIZE;
+    let path = fresh_sized("smallest", SIZE);
+    let vol = Volume::open(open_dev_sized(&path, SIZE)).unwrap();
+    let data: u64 = vol
+        .chunks()
+        .iter()
+        .filter(|c| c.type_ & BLOCK_GROUP_DATA != 0)
+        .map(|c| c.length)
+        .sum();
+    assert_eq!(
+        data,
+        4 * MIB,
+        "a {} MiB device got {} bytes of data chunk; the gap left over after the fixed layout is \
+         exactly the 4 MiB minimum, so it is a chunk or there is none",
+        SIZE / MIB,
+        data
+    );
+    drop(vol);
+
+    // And the chunk is usable, not merely recorded.
+    let mut fs = Btrfs::mount(open_dev_sized(&path, SIZE), false).unwrap();
+    let root = fs.root_ino();
+    let ino = fs
+        .create(root, "f", btrfs::FileKind::Regular, 0o644, 0)
+        .unwrap();
+    let block = vec![0x3cu8; 64 * 1024];
+    assert_eq!(
+        fs.write(ino, 0, &block).unwrap(),
+        block.len(),
+        "the smallest filesystem this format makes could not store 64 KiB"
+    );
+    let mut got = vec![0u8; block.len()];
+    assert_eq!(fs.read(ino, 0, &mut got).unwrap(), got.len());
+    assert_eq!(got, block);
+    drop(fs);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_fresh_image_reports_the_blocks_its_own_trees_take() {
+    // df's "used" on a filesystem nobody has written to yet. The format lays
+    // down eight tree leaves and says so in the superblock; a mount adds its
+    // own delta to that number and nothing else sets the floor it starts
+    // from, so a wrong count here is a wrong number for the life of the
+    // filesystem.
+    let path = fresh_sized("used", MKFS_SIZE);
+    let fs = Btrfs::mount(open_dev_sized(&path, MKFS_SIZE), true).unwrap();
+    assert_eq!(
+        fs.fsinfo().bytes_used,
+        8 * mkfs::NODESIZE as u64,
+        "a fresh image accounts for something other than the eight leaves the format writes"
+    );
+    drop(fs);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_superblock_mirror_that_fits_by_one_sector_is_written() {
+    // The mirrors are what a filesystem is recovered from, and the second one
+    // sits at 64 MiB. A device of exactly 64 MiB plus the superblock has room
+    // for it to the byte, and a bound that asks for one byte more quietly
+    // leaves such a device with a single copy of its superblock.
+    const OFF: u64 = SUPERBLOCK_OFFSETS[1];
+    for (name, size, want) in [
+        ("fits", OFF + SUPERBLOCK_SIZE as u64, true),
+        ("short", OFF + SUPERBLOCK_SIZE as u64 - 1, false),
+    ] {
+        let path = fresh_sized(name, size);
+        let mut magic = [0u8; 8];
+        let f = std::fs::File::open(&path).unwrap();
+        let got = read_exact_at(&f, OFF + sb::OFF_MAGIC as u64, &mut magic);
+        let present = got && u64::from_le_bytes(magic) == SUPERBLOCK_MAGIC;
+        assert_eq!(
+            present, want,
+            "the mirror at {:#x} on a device of {} bytes: present={}, expected={}",
+            OFF, size, present, want
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn the_label_a_format_writes_stays_inside_the_field_it_lives_in() {
+    // The label field is 256 bytes and whoever reads it expects a C string:
+    // `btrfs filesystem label` prints up to the first NUL. Filling all 256
+    // leaves no terminator, and the reader walks on into the fsid that
+    // follows.
+    const FIELD: usize = 256;
+    let path = tmpfile("label");
+    let _ = std::fs::remove_file(&path);
+    let dev = open_dev_sized(&path, MKFS_SIZE);
+    let mut opts = opts();
+    opts.label = "l".repeat(FIELD + 44);
+    mkfs::format(&*dev, &opts).unwrap();
+    drop(dev);
+
+    let mut field = [0u8; FIELD];
+    let f = std::fs::File::open(&path).unwrap();
+    assert!(read_exact_at(
+        &f,
+        SUPERBLOCK_OFFSETS[0] + sb::OFF_LABEL as u64,
+        &mut field
+    ));
+    assert_eq!(
+        field.iter().position(|&b| b == 0),
+        Some(FIELD - 1),
+        "a label longer than the field left {} of its bytes and no terminator",
+        field.iter().filter(|&&b| b != 0).count()
+    );
     let _ = std::fs::remove_file(&path);
 }
