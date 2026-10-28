@@ -420,9 +420,16 @@ else ifeq ($(ARCH), aarch64)
 		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 endif
 
+# Which NIC model the guest sees. `e1000e` is the default because it is what
+# every log in the tree was taken against; `NIC=pcnet` is how the AMD
+# PCnet driver (`drivers/src/net/pcnet32.rs`) is exercised, since that chip
+# is the one AMD part QEMU emulates. Any `-device` name QEMU knows works:
+# `qemu-system-x86_64 -device help` lists them.
+NIC ?= e1000e
+
 qemu_opts += \
 	-netdev user,id=net1 \
-	-device e1000e,netdev=net1 \
+	-device $(NIC),netdev=net1 \
 	-object filter-dump,id=f0,netdev=net1,file=/tmp/eclipse.pcap \
 	-no-reboot
 
