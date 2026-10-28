@@ -58,7 +58,25 @@ const BUG_REPORT_URL: &str = "https://github.com/Pryancito/eclipse/issues";
 
 /// `ANSI_COLOR`: how a terminal should tint the logo/name. Magenta, as the
 /// boot console and the wallpaper already are.
-const ANSI_COLOR: &str = "0;35";
+pub(super) const ANSI_COLOR: &str = "0;35";
+
+/// `LOGO`: the name of an ICON, not of the distribution.
+///
+/// This is the one field whose value is not ours to choose. The spec says it
+/// names an icon "following the Icon Theme Specification", conventionally
+/// `distributor-logo-<LOGO>`, and readers resolve it through the installed
+/// icon theme: `fastfetch`, GTK's about dialogs and the desktop's own about
+/// pages all look up that name. So the value is only as true as the icon
+/// behind it: this said `linux` for as long as no theme in the image had an
+/// `eclipse` icon, because naming one that is not there buys a blank where
+/// the logo goes, not a logo.
+///
+/// [`logo`](super::logo) now installs
+/// `usr/share/icons/hicolor/scalable/apps/distributor-logo-eclipse.svg`, so
+/// `eclipse` resolves. The two are one decision: whoever stops shipping that
+/// icon has to bring this back to `linux` in the same change, and the test
+/// below is what makes that the only way out.
+const LOGO: &str = "eclipse";
 
 /// The value of `ARCHITECTURE`, in the spelling the spec prescribes (systemd's
 /// own architecture ids), not in ours.
@@ -127,7 +145,7 @@ fn parse_version(src: &str) -> Option<String> {
 /// version nobody shipped is worse than a build that stops and says why, and
 /// [`VERSION_SOURCE`] is a file git tracks -- it is missing only if the build
 /// is running somewhere it has no business running.
-fn eclipse_version() -> String {
+pub(super) fn eclipse_version() -> String {
     let path = PROJECT_DIR.join(VERSION_SOURCE);
     let src = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("os-release: cannot read {}: {e}", path.display()));
@@ -216,7 +234,7 @@ fn render(
     if let Some(a) = architecture(arch) {
         out.push_str(&line("ARCHITECTURE", a));
     }
-    out.push_str(&line("LOGO", ID));
+    out.push_str(&line("LOGO", LOGO));
     out.push_str(&line("ANSI_COLOR", ANSI_COLOR));
     out.push_str(&line("HOME_URL", HOME_URL));
     out.push_str(&line("DOCUMENTATION_URL", HOME_URL));
@@ -448,6 +466,27 @@ mod tests {
         let src =
             "//! docs\nconst OTHER: usize = 1;\npub const ECLIPSE_VERSION: &str = \"7.7.7\";\n";
         assert_eq!(parse_version(src).as_deref(), Some("7.7.7"));
+    }
+
+    /// `LOGO` names an icon, so it has to name one the image actually
+    /// INSTALLS. This is the test that ties the field to the file: it reads
+    /// the logo module for the icon it ships and asks that `LOGO` resolve to
+    /// it, so dropping the icon and leaving the field, or renaming either one
+    /// alone, fails here instead of in a reader that quietly draws a blank.
+    #[test]
+    fn the_logo_names_an_icon_the_image_installs() {
+        let body = sample();
+        let value = get(&body, "LOGO").unwrap();
+        // The whole literal, quotes included: a substring match would be
+        // satisfied by `distributor-logo-eclipseos`, which is a different icon
+        // and would leave this field naming one that does not exist.
+        let wanted = format!("\"distributor-logo-{value}\"");
+        let logo_rs = fs::read_to_string(PROJECT_DIR.join("xtask/src/linux/logo.rs")).unwrap();
+        assert!(
+            logo_rs.contains(&wanted),
+            "LOGO={value:?} needs an icon named distributor-logo-{value}, \
+             and logo.rs installs no such file"
+        );
     }
 
     /// The spec's spelling of the architecture, not the kernel's.

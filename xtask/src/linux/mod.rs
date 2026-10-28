@@ -4,6 +4,7 @@ mod cuda_probe;
 mod desktop;
 mod eclipsefs_image;
 mod image;
+mod logo;
 mod nvctl_probe;
 pub(crate) mod nvidia_firmware;
 mod nvidia_userspace;
@@ -244,6 +245,10 @@ impl LinuxRootfs {
             Self::ensure_var_run(&dir);
             Self::write_pulse_conf(&dir);
             Self::ensure_pulse_accounts(&dir);
+            // The icon has to be in the image before `os-release` claims
+            // `LOGO=eclipse`: that field names an icon, and naming one that is
+            // not there is what it said before this existed.
+            logo::install(&dir, self.0.name(), self.1);
             // LAST, and after the package tap: Ubuntu's `base-files` and
             // Alpine's `alpine-release` both carry an `/etc/os-release`, and
             // the last writer is the one the guest reads.
@@ -844,6 +849,7 @@ impl LinuxRootfs {
         Self::install_hunter(&dir);
         self.install_busybox_init(&dir);
         self.install_eclipse_init(&dir, &musl);
+        logo::install(&dir, self.0.name(), self.1);
         // LAST, for the same reason as on the incremental path above.
         os_release::install(&dir, self.0.name(), self.1);
     }
@@ -1156,9 +1162,14 @@ impl LinuxRootfs {
     }
 
     fn write_profile(etc: &Path) {
+        // La estrofa del logo va DETRAS de todo el profile, y por eso la
+        // salida se concatena en vez de escribirse de una pieza: la sonda de
+        // tamano del terminal acaba con un `\033[H` que lleva el cursor del
+        // console grafico al origen, asi que lo pintado antes se dibuja y se
+        // tapa. Ver `logo::profile_stanza`.
         fs::write(
             etc.join("profile"),
-            b"export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin\n\
+            [&b"export PATH=/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin\n\
               export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n\
               export SSL_CERT_DIR=/etc/ssl/certs\n\
               export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt\n\
@@ -1411,7 +1422,10 @@ impl LinuxRootfs {
               \x20 # replies and the installer would otherwise look like a hung black\n\
               \x20 # screen (prompt parked on the last cell of a 2560x1600 mode).\n\
               \x20 printf '\\033[H'\n\
-              fi\n",
+              fi\n"[..],
+                logo::profile_stanza().as_bytes(),
+            ]
+            .concat(),
         )
         .unwrap();
     }
