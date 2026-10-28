@@ -516,6 +516,7 @@ impl Run {
                 if let Err(e) = self.fs.check() {
                     panic!("{} check after the operation: {:?}", self.ctx(), e);
                 }
+                self.verify("after the operation");
             }
         }
         self.after_op();
@@ -622,7 +623,19 @@ impl Run {
                 );
             }
             match r {
-                Ok(n) if n > 0 => done += n,
+                Ok(n) if n > 0 => {
+                    let m = self.model.data_mut(f);
+                    let (from, end) = (off as usize + done, off as usize + done + n);
+                    if m.len() < end {
+                        m.resize(end, 0);
+                    }
+                    m[from..end].copy_from_slice(&data[done..done + n]);
+                    done += n;
+                    // Each call is a state of its own a power cut may show.
+                    if done < len {
+                        self.after_op();
+                    }
+                }
                 Ok(_) if self.full => break,
                 r if self.no_space(&r) => break,
                 r => panic!("{} write {}+{}: {:?}", self.ctx(), off, len, r),
@@ -644,14 +657,7 @@ impl Run {
                     );
                 }
             }
-            return;
         }
-        let m = self.model.data_mut(f);
-        let end = off as usize + done;
-        if m.len() < end {
-            m.resize(end, 0);
-        }
-        m[off as usize..end].copy_from_slice(&data[..done]);
     }
 
     fn op_atomic_write(&mut self) {

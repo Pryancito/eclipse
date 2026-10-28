@@ -4035,6 +4035,30 @@ impl CowFs {
         if edges > 0 && !self.sp.ensure_data_room(edges) {
             return Err(Error::NoSpace);
         }
+        // The tree nodes the first edge copies come out of the same free
+        // blocks: the second edge may dig into the reserve for its block,
+        // or the first would be zeroed and the call fail all the same.
+        self.sp.data_dig = true;
+        let r = self.punch_edges(ino, i, off, end, first, last);
+        self.sp.data_dig = false;
+        r?;
+        i.size = size;
+        if first < last {
+            self.unmap(ino, i, first, last)?;
+        }
+        Ok(())
+    }
+
+    /// Zeros in the partial blocks at the edges of a punched range.
+    fn punch_edges(
+        &mut self,
+        ino: u64,
+        i: &mut InodeItem,
+        off: u64,
+        end: u64,
+        first: u64,
+        last: u64,
+    ) -> Result<()> {
         let head_end = (first * BS).min(end);
         if off < head_end {
             let z = vec![0u8; (head_end - off) as usize];
@@ -4044,10 +4068,6 @@ impl CowFs {
         if tail_start < end {
             let z = vec![0u8; (end - tail_start) as usize];
             self.write_extents(ino, i, tail_start, &z)?;
-        }
-        i.size = size;
-        if first < last {
-            self.unmap(ino, i, first, last)?;
         }
         Ok(())
     }
