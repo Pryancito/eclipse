@@ -1496,3 +1496,187 @@ fn a_raid5_chunk_allocates_by_its_parity_row() {
     fs.refresh_layouts();
     assert_eq!(fs.sp.alloc.groups()[g].row(), cols);
 }
+
+/// A chunk is scrubbed before it moves, so the copies the move makes are of
+/// good blocks. `copy_between` takes the first copy that reads without an
+/// I/O error and never looks at its checksum, so without that scrub the
+/// move of a mirror with one rotten copy can write the rot over the good
+/// one. Removing a device is the worst place for that: the copy left
+/// behind is the only one there will be.
+#[test]
+fn a_rotten_copy_is_repaired_before_its_chunk_moves() {
+    let devs: Vec<Arc<dyn BlockDevice>> = (0..3)
+        .map(|_| Ram::new(32 * MIB) as Arc<dyn BlockDevice>)
+        .collect();
+    mkfs::format_devices(&devs, &opts(), Profile::Raid1, Profile::Raid1).unwrap();
+    let mut fs = CowFs::mount_devices(devs.clone(), false, false).unwrap();
+    fs.set_clock(clock);
+    let h = file(&mut fs, "f", &[7; 3 * BS as usize]);
+    fs.sync().unwrap();
+    let b = fs.fiemap(h, 0, 3 * BS).unwrap()[0].physical / BS;
+    let vol = fs.vol.clone().unwrap();
+
+    // The data chunk's two stripes are the block's two copies, in order.
+    let (g, away) = {
+        let map = vol.map();
+        let (&g, c) = map
+            .chunks
+            .iter()
+            .find(|(_, c)| c.kind == ChunkKind::Data)
+            .expect("a data chunk");
+        assert_eq!(c.stripes.len(), 2, "mirrored on two of the three devices");
+        (g, c.stripes[1].devid)
+    };
+
+    // Rot copy 0 and nothing else: copy 1 still holds the block. Reading it
+    // would repair it, so nothing reads it between here and the move.
+    vol.write_copy(b * BS, &[0xff; BS as usize], 0).unwrap();
+    fs.drop_caches();
+
+    // Take away the device copy 1 is on. The chunk has to move, because
+    // `place_moving` only keeps the stripes it is allowed to keep, and the
+    // copy it is made from is the one left: copy 0, the rotten one.
+    let before = vol.map().chunks.get(&g).cloned().expect("the data chunk");
+    fs.remove_device(away).unwrap();
+    let after = vol.map().chunks.get(&g).cloned().expect("the data chunk");
+    assert_ne!(after.stripes, before.stripes, "the chunk did not move");
+    assert_eq!(after.stripes.len(), 2, "still mirrored after the move");
+
+    // Both copies of the moved block have to hold the file. Read them one
+    // by one: `read_copy` has no fallback, so no read-repair can stand in
+    // for the scrub that should have run before the move.
+    for k in 0..2 {
+        let mut got = vec![0u8; BS as usize];
+        vol.read_copy(b * BS, &mut got, k).unwrap();
+        assert_eq!(got, vec![7u8; BS as usize], "copy {} of the moved block", k);
+    }
+}
+
+/// A disk that dies: every operation counts, and from `at` on they all fail.
+/// `at` is armed after the setup, so the failure lands in the work under
+/// test and not in getting there.
+struct Dying {
+    disk: Arc<Ram>,
+    ops: core::sync::atomic::AtomicU64,
+    at: core::sync::atomic::AtomicU64,
+}
+
+impl Dying {
+    fn new(disk: Arc<Ram>) -> Arc<Self> {
+        Arc::new(Self {
+            disk,
+            ops: 0.into(),
+            at: u64::MAX.into(),
+        })
+    }
+    fn arm(&self, at: u64) {
+        let o = core::sync::atomic::Ordering::Relaxed;
+        self.ops.store(0, o);
+        self.at.store(at, o);
+    }
+    fn used(&self) -> u64 {
+        self.ops.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    fn tick(&self) -> Result<()> {
+        let o = core::sync::atomic::Ordering::Relaxed;
+        if self.ops.fetch_add(1, o) >= self.at.load(o) {
+            return Err(Error::Io);
+        }
+        Ok(())
+    }
+}
+
+impl BlockDevice for Dying {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.tick()?;
+        self.disk.read_at(offset, buf)
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.tick()?;
+        self.disk.write_at(offset, buf)
+    }
+    fn sync(&self) -> Result<()> {
+        self.tick()?;
+        self.disk.sync()
+    }
+    fn size(&self) -> u64 {
+        self.disk.size()
+    }
+}
+
+/// Three devices, mirrored, with a file on them; `at` armed on every device.
+fn dying_volume(at: u64) -> (Vec<Arc<Dying>>, CowFs) {
+    let raw: Vec<Arc<Ram>> = (0..3).map(|_| Ram::new(32 * MIB)).collect();
+    let plain: Vec<Arc<dyn BlockDevice>> = raw
+        .iter()
+        .map(|d| d.clone() as Arc<dyn BlockDevice>)
+        .collect();
+    mkfs::format_devices(&plain, &opts(), Profile::Raid1, Profile::Raid1).unwrap();
+    let disks: Vec<Arc<Dying>> = raw.into_iter().map(Dying::new).collect();
+    let devs: Vec<Arc<dyn BlockDevice>> = disks
+        .iter()
+        .map(|d| d.clone() as Arc<dyn BlockDevice>)
+        .collect();
+    let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+    fs.set_clock(clock);
+    file(&mut fs, "f", &[7; 200_000]);
+    fs.sync().unwrap();
+    for d in &disks {
+        d.arm(at);
+    }
+    (disks, fs)
+}
+
+/// The stripes a chunk is moved away from stay held until the move commits,
+/// so a placement in the same transaction cannot land on the blocks that
+/// are still the committed state. The hold is released by the commit, which
+/// is why it can only be seen when the commit fails: the device dies part
+/// way through removing it, and what is held then has to be exactly the
+/// stripes on that device, where they were and as long as they were.
+#[test]
+fn a_failed_move_keeps_holding_the_stripes_it_moved_off() {
+    const AWAY: u32 = 2;
+    // What a whole removal costs, to know how far to sweep.
+    let (disks, mut fs) = dying_volume(u64::MAX);
+    fs.remove_device(AWAY).unwrap();
+    let cost = disks.iter().map(|d| d.used()).max().unwrap();
+    assert!(cost > 4, "a removal that cheap measures nothing: {}", cost);
+
+    let mut seen = 0;
+    for at in 1..=cost {
+        let (_disks, mut fs) = dying_volume(at);
+        let vol = fs.vol.clone().unwrap();
+        // Every stripe on the device being taken away, with the length its
+        // own chunk holds it by.
+        let want: Vec<(u32, u64, u64)> = vol
+            .map()
+            .chunks
+            .values()
+            .flat_map(|c| {
+                let len = c.stripe_len();
+                c.stripes
+                    .iter()
+                    .filter(|s| s.devid == AWAY)
+                    .map(move |s| (s.devid, s.phys, len))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let _ = fs.remove_device(AWAY);
+        let held = vol.held();
+        if held.is_empty() {
+            continue;
+        }
+        seen += 1;
+        for r in &held {
+            assert!(
+                want.contains(r),
+                "at {}: held {:?} is not a stripe of the device going away, \
+                 which are {:?}",
+                at,
+                r,
+                want
+            );
+        }
+    }
+    assert!(seen > 0, "no failure left anything held, so nothing was measured");
+}
