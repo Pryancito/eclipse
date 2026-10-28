@@ -26,7 +26,7 @@ use crate::{
     },
     Device, DeviceError, DeviceResult, PhysAddr, VirtAddr,
 };
-use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 
 const MODULE: &str = "device-tree";
 
@@ -48,6 +48,10 @@ struct Intc {
 pub struct DevicetreeDriverBuilder<M: IoMapper> {
     dt: Devicetree,
     io_mapper: M,
+    /// Controllers that were already brought up before the walk, by the
+    /// `compatible` of the node that describes them. See
+    /// [`DevicetreeDriverBuilder::adopt_intc`].
+    adopted_intc: Vec<(String, Arc<dyn crate::scheme::IrqScheme>)>,
 }
 
 impl<M: IoMapper> DevicetreeDriverBuilder<M> {
@@ -56,7 +60,37 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
         Ok(Self {
             dt: Devicetree::from(dtb_base_vaddr)?,
             io_mapper,
+            adopted_intc: Vec::new(),
         })
+    }
+
+    /// Hands the walk a controller that is **already running**, to be used for
+    /// the node whose `compatible` names it instead of building a new one.
+    ///
+    /// Without this, a tree that describes a controller the kernel has already
+    /// brought up would get a second driver for the same silicon, and the
+    /// second one's bring-up would undo the first's: the GIC-400's `init`
+    /// disables every SPI and rewrites the priorities, so the timer and the
+    /// console would go quiet the moment the device tree was walked. Which is
+    /// exactly the position aarch64 is in --- `init_early` sets up the GIC
+    /// from the bases in `KCONFIG`, long before there is a tree to read.
+    ///
+    /// What is **not** checked is that the node really describes the
+    /// controller handed over: there is no way to ask an `IrqScheme` what
+    /// address it was built with. The node's `reg` is logged so that a human
+    /// reading the boot can compare the two.
+    pub fn adopt_intc(mut self, compatible: &str, irq: Arc<dyn crate::scheme::IrqScheme>) -> Self {
+        self.adopted_intc.push((String::from(compatible), irq));
+        self
+    }
+
+    /// The controller handed over for this node, if any of its `compatible`
+    /// strings names one.
+    fn adopted(&self, comp: &StringList) -> Option<Arc<dyn crate::scheme::IrqScheme>> {
+        self.adopted_intc
+            .iter()
+            .find(|(c, _)| comp.contains(c))
+            .map(|(_, irq)| irq.clone())
     }
 
     /// Parse the device tree from root, and returns an array of [`Device`] it found.
@@ -315,6 +349,23 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
             .prop_u32("#interrupt-cells")
             .map_err(|_| DeviceError::InvalidParam)?;
         let interrupts = parse_interrupts(node, props)?;
+        // Before anything is mapped: an adopted controller needs no window of
+        // its own, and mapping one would be the only side effect of a walk
+        // that is otherwise just reading.
+        if let Some(irq) = self.adopted(comp) {
+            info!(
+                "{MODULE}: adopting the running controller for {:?}, whose reg is {:?}",
+                node.name,
+                parse_reg(node, props)
+            );
+            return Ok((
+                (Device::Irq(irq), interrupts),
+                IntcProps {
+                    phandle,
+                    interrupt_cells,
+                },
+            ));
+        }
         let base_vaddr =
             parse_reg(node, props).and_then(|(paddr, size)| self.mmap(paddr as _, size as _));
         use crate::irq::*;
@@ -751,7 +802,7 @@ mod tests {
         let dev_list = vec![
             (
                 Device::Uart(Arc::new(unsafe {
-                    crate::uart::Uart16550Mmio::<u8>::new(ram.0)
+                    crate::uart::Uart16550Mmio::<u8>::new(ram.page)
                 })),
                 InterruptsProp::default(),
             ),
@@ -820,16 +871,25 @@ mod tests {
 
     /// Hands out a page of ordinary memory for whatever the tree asks to map,
     /// so a driver that writes its registers at construction writes here.
-    struct RamMapper(usize);
+    struct RamMapper {
+        page: usize,
+        /// Every window the walk asked for, so a test can tell a walk that
+        /// only reads from one that touched the bus.
+        mapped: Mutex<Vec<(PhysAddr, usize)>>,
+    }
     impl RamMapper {
         fn new() -> Self {
             let page: Box<[u64; 512]> = Box::new([0; 512]);
-            Self(Box::leak(page).as_ptr() as usize)
+            Self {
+                page: Box::leak(page).as_ptr() as usize,
+                mapped: Mutex::new(Vec::new()),
+            }
         }
     }
     impl IoMapper for RamMapper {
-        fn query_or_map(&self, _paddr: PhysAddr, _size: usize) -> Option<VirtAddr> {
-            Some(self.0)
+        fn query_or_map(&self, paddr: PhysAddr, size: usize) -> Option<VirtAddr> {
+            self.mapped.lock().push((paddr, size));
+            Some(self.page)
         }
     }
 
@@ -874,11 +934,62 @@ mod tests {
     }
 
     fn build(root: Node) -> DeviceResult<Vec<Device>> {
+        builder(root, Vec::new()).build()
+    }
+
+    fn builder(
+        root: Node,
+        adopted_intc: Vec<(String, Arc<dyn IrqScheme>)>,
+    ) -> DevicetreeDriverBuilder<RamMapper> {
         DevicetreeDriverBuilder {
             dt: Devicetree::from_root(root),
             io_mapper: RamMapper::new(),
+            adopted_intc,
         }
-        .build()
+    }
+
+    /// A `ns16550a` with no interrupts, which the walk builds a driver for.
+    fn a_uart_node() -> Node {
+        leaf(
+            "serial@2500000",
+            vec![
+                prop("compatible", strs(&["ns16550a"])),
+                prop("reg", cells(&[0x0250_0000, 0x400])),
+            ],
+        )
+    }
+
+    /// The node of a GIC-400 as the `virt` machine and the Raspberry Pi 4
+    /// both write it: two `reg` ranges, three cells per specifier, and no
+    /// driver of its own on this host.
+    fn a_gic_node() -> Node {
+        leaf(
+            "interrupt-controller@8000000",
+            vec![
+                prop("compatible", strs(&["arm,gic-400", "arm,cortex-a15-gic"])),
+                prop("interrupt-controller", Vec::new()),
+                prop("#interrupt-cells", cells(&[3])),
+                prop("phandle", cells(&[1])),
+                prop(
+                    "reg",
+                    cells(&[0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000]),
+                ),
+            ],
+        )
+    }
+
+    /// A UART that asks for SPI 1 of that controller, the way the `virt`
+    /// machine's `pl011` does.
+    fn a_uart_under_the_gic() -> Node {
+        leaf(
+            "serial@9000000",
+            vec![
+                prop("compatible", strs(&["ns16550a"])),
+                prop("reg", cells(&[0x0900_0000, 0x1000])),
+                prop("interrupt-parent", cells(&[1])),
+                prop("interrupts", cells(&[0, 1, 4])),
+            ],
+        )
     }
 
     #[test]
@@ -916,6 +1027,93 @@ mod tests {
                 comp
             );
         }
+    }
+
+    // ---- adopting a controller that is already running --------------------
+
+    #[test]
+    fn a_tree_whose_controller_has_no_driver_here_cannot_be_walked_at_all() {
+        // The contrast for the test below, and the position aarch64 is in
+        // today: `parse_intc` has no arm for `arm,gic-400` on this host, so
+        // the node is turned down, nothing goes into the phandle map, and the
+        // UART that names phandle 1 takes the whole walk down with it. A tree
+        // of a real board is not partly usable: it is unusable.
+        let root = soc(vec![a_gic_node(), a_uart_under_the_gic()]);
+        assert_eq!(build(root).err(), Some(DeviceError::InvalidParam));
+    }
+
+    #[test]
+    fn an_adopted_controller_takes_the_interrupts_of_the_tree() {
+        let gic = FakeIntc::new();
+        let devs = builder(
+            soc(vec![a_gic_node(), a_uart_under_the_gic()]),
+            vec![("arm,gic-400".to_string(), gic.clone() as Arc<dyn IrqScheme>)],
+        )
+        .build()
+        .unwrap();
+        // The controller comes back in the list as itself, and the UART with
+        // it.
+        assert_eq!(devs.len(), 2);
+        assert!(matches!(devs[0], Device::Irq(_)));
+        assert!(matches!(devs[1], Device::Uart(_)));
+        // And its SPI 1 was registered as the GIC's own id 33, which is the
+        // three-cell reading of `<0 1 4>`.
+        assert_eq!(seen(&gic), (vec![33], vec![33]));
+    }
+
+    #[test]
+    fn adopting_is_by_compatible_and_any_of_the_strings_in_it_counts() {
+        // The Pi 4 writes `"arm,gic-400"` first and the `virt` machine of
+        // QEMU writes `"arm,cortex-a15-gic"`; a kernel that wants both says
+        // both, and a node that names neither is not adopted.
+        for named in ["arm,gic-400", "arm,cortex-a15-gic"] {
+            let gic = FakeIntc::new();
+            let devs = builder(
+                soc(vec![a_gic_node(), a_uart_under_the_gic()]),
+                vec![(named.to_string(), gic.clone() as Arc<dyn IrqScheme>)],
+            )
+            .build()
+            .unwrap();
+            assert_eq!(devs.len(), 2, "{named}");
+            assert_eq!(seen(&gic), (vec![33], vec![33]), "{named}");
+        }
+        let gic = FakeIntc::new();
+        let built = builder(
+            soc(vec![a_gic_node(), a_uart_under_the_gic()]),
+            vec![("arm,gic-600".to_string(), gic.clone() as Arc<dyn IrqScheme>)],
+        )
+        .build();
+        assert_eq!(built.err(), Some(DeviceError::InvalidParam));
+        assert_eq!(seen(&gic), (vec![], vec![]));
+    }
+
+    #[test]
+    fn adopting_maps_no_window_of_its_own() {
+        // The controller handed over is already running on a window somebody
+        // else mapped. Mapping its `reg` again would be the one side effect of
+        // a walk that is otherwise just reading, and on a board whose
+        // distributor and CPU interface are two ranges it would be the wrong
+        // one anyway: `parse_reg` only ever returns the first.
+        let gic = FakeIntc::new();
+        let b = builder(
+            soc(vec![a_gic_node()]),
+            vec![("arm,gic-400".to_string(), gic.clone() as Arc<dyn IrqScheme>)],
+        );
+        b.build().unwrap();
+        assert_eq!(b.io_mapper.mapped.lock().as_slice(), &[]);
+    }
+
+    #[test]
+    fn a_controller_that_was_not_adopted_still_maps_its_own_window() {
+        // The other side of the same claim: the walk does map for a node it
+        // builds a driver for, so the assertion above is about adoption and
+        // not about the walk having stopped doing anything.
+        let b = builder(soc(vec![a_uart_node()]), Vec::new());
+        b.build().unwrap();
+        assert_eq!(
+            b.io_mapper.mapped.lock().as_slice(),
+            &[(0x0250_0000, 0x400)]
+        );
     }
 
     #[test]
