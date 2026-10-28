@@ -11,6 +11,7 @@
 //! nombraba, y la alternativa --subir el numero-- es la que el trinquete esta
 //! escrito para que se vea en el diff en vez de pasar en silencio.
 
+use super::look::write_eclipse_look;
 use super::*;
 
 /// The desktop's connectivity probe was `ip route | grep -q default`,
@@ -1570,6 +1571,9 @@ fn look_rootfs(tag: &str) -> std::path::PathBuf {
     write_eclipse_look(&dir);
     write_theme(&dir);
     write_foot_config(&dir);
+    // The two imported labwc themes and the palettes for their looks; the
+    // table below holds them too, so without this half of it is missing.
+    super::upstream::install(&dir);
     write_labwc_rc(&dir);
     write_labwc_menu(&dir);
     write_kde_helpers(&dir);
@@ -1578,12 +1582,15 @@ fn look_rootfs(tag: &str) -> std::path::PathBuf {
 }
 
 /// `(look, labwc theme, the background its terminal palette uses)`. The
-/// three names are the ones `eclipse-look` accepts; everything the look
-/// touches has to agree on them, which is what the tests below check.
+/// names are the ones `eclipse-look` accepts, IN THE ORDER its `look_ok`
+/// lists them; everything the look touches has to agree on them, which is
+/// what the tests below check. The last two themes are not Eclipse's own
+/// (see [`super::upstream`]).
 const LOOKS: &[(&str, &str, &str)] = &[
     ("win11", "Win11-Dark", "background=0c0c0c"),
     ("kde", "Breeze-Dark", "background=232629"),
     ("eclipse", "Eclipse-Dark", "background=120f1c"),
+    ("gnome", "labAdwaita-dark-xbm", "background=1d1d1d"),
 ];
 
 /// `xml` with its comments taken out. rc.xml's comments name the very
@@ -1619,7 +1626,7 @@ fn themerc_key(rc: &str, key: &str) -> Option<String> {
         .map(|(_, v)| v.trim().to_string())
 }
 
-/// Every piece that names a look has to name the same three, and each
+/// Every piece that names a look has to name the same ones, and each
 /// one's theme and terminal palette have to be its own. A look that is
 /// accepted but has no theme leaves labwc on its built-in appearance;
 /// one whose palette is another look's gives a terminal that does not
@@ -1629,7 +1636,7 @@ fn every_look_has_a_theme_and_a_palette_of_its_own() {
     let dir = look_rootfs("table");
     let script = fs::read_to_string(dir.join("usr/local/bin/eclipse-look")).expect("eclipse-look");
 
-    // `look_ok` accepts exactly these three and nothing else: a look it
+    // `look_ok` accepts exactly these and nothing else: a look it
     // accepts without a theme leaves labwc on its built-in appearance.
     let accepted = script
         .split_once("case \"$1\" in ")
