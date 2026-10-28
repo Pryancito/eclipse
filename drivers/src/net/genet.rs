@@ -595,9 +595,12 @@ pub use rings::GenetRings;
 mod irq;
 pub use irq::*;
 
+/// Lo que el device tree dice del GENET.
+pub mod dt;
+
 /// smoltcp, el manejador de la interrupcion y `NetScheme`.
 mod glue;
-pub use glue::{genet_init, GenetDriver, GenetInterface, GENET_MTU};
+pub use glue::{genet_from_dt, genet_init, GenetDriver, GenetInterface, GENET_MTU};
 
 #[cfg(test)]
 mod genet_fake;
@@ -613,3 +616,6 @@ mod regmap_tests;
 
 #[cfg(test)]
 mod irq_tests;
+
+#[cfg(test)]
+mod dt_tests;

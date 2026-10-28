@@ -31,11 +31,13 @@ use smoltcp::time::Instant;
 use smoltcp::wire::*;
 use smoltcp::Result;
 
+use super::dt;
 use super::rings::RX_BUF_LENGTH;
 use super::*;
 use crate::net::get_sockets;
 use crate::net::{ip_cfg, timer_now_as_micros};
 use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme};
+use crate::utils::devicetree::Node;
 use crate::{DeviceError, DeviceResult};
 use core::sync::atomic::{AtomicBool, Ordering};
 use lock::Mutex;
@@ -479,6 +481,8 @@ impl NetScheme for GenetInterface {
 /// `base` es **virtual**: la ventana tiene que venir ya mapeada sin cache, que
 /// es lo que hace quien sonda el device tree. `phy_addr` es la direccion MDIO
 /// del PHY si el device tree la declara; con `None` se barre el bus.
+/// `dt_mac` es la MAC que trae el device tree, que manda sobre la que haya en
+/// los registros.
 ///
 /// # Safety
 ///
@@ -490,6 +494,7 @@ pub unsafe fn genet_init(
     irq: usize,
     phy_addr: Option<u8>,
     id_mode_dis: bool,
+    dt_mac: Option<[u8; 6]>,
 ) -> DeviceResult<GenetInterface> {
     let mac = GenetMac::new(base);
     mac.check_supported()?;
@@ -500,17 +505,30 @@ pub unsafe fn genet_init(
     // esta levantada antes de que exista el manejador.
     mac.irq_disable_all();
 
-    // La MAC se lee ANTES del reset: el reset del UMAC no la borra en este
-    // silicio, pero leerla primero es lo que hace que no dependa de eso.
+    // La MAC, por orden: la que trae el device tree, la que dejo el firmware
+    // en los registros, y una inventada.
+    //
+    // El arbol va primero porque es de donde la saca Linux y porque una placa
+    // cuyo firmware deja los registros a cero sigue teniendo la suya ahi. Se
+    // lee ANTES del reset: el reset del UMAC no la borra en este silicio, pero
+    // leerla primero es lo que hace que no dependa de eso.
     let board_mac = mac.read_mac_addr();
-    let hw_mac = if mac_is_usable(&board_mac) {
-        board_mac
-    } else {
-        warn!(
-            "genet: el firmware no dejo una MAC usable ({:02x?}), se inventa una local",
-            board_mac
-        );
-        MAC_FALLBACK
+    let hw_mac = match dt_mac {
+        Some(dt) if mac_is_usable(&dt) => dt,
+        otra => {
+            if let Some(mala) = otra {
+                warn!("genet: la MAC del device tree no sirve ({:02x?})", mala);
+            }
+            if mac_is_usable(&board_mac) {
+                board_mac
+            } else {
+                warn!(
+                    "genet: el firmware no dejo una MAC usable ({:02x?}), se inventa una local",
+                    board_mac
+                );
+                MAC_FALLBACK
+            }
+        }
     };
 
     mac.reset_umac();
@@ -621,3 +639,28 @@ pub unsafe fn genet_init(
 
 #[cfg(test)]
 mod glue_tests;
+
+/// Levanta el GENET que describe `node`, leyendole al device tree lo que sabe.
+///
+/// Es lo que la rama de `parse_ethernet` llama, y esta aqui y no alli para que
+/// se pueda probar: alli el `base` sale del mapeador y no hay forma de ponerle
+/// un MAC falso debajo.
+///
+/// # Safety
+///
+/// Lo mismo que [`genet_init`]: `base` tiene que ser la ventana del GENET.
+pub unsafe fn genet_from_dt(
+    name: String,
+    node: &Node,
+    base: usize,
+    irq: usize,
+) -> DeviceResult<GenetInterface> {
+    genet_init(
+        name,
+        base,
+        irq,
+        dt::phy_addr(node),
+        dt::id_mode_dis(node),
+        dt::mac_addr(node),
+    )
+}

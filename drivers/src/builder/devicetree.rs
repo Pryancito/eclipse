@@ -130,9 +130,7 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
                     #[cfg(feature = "virtio")]
                     c if c.contains("virtio,mmio") => self.parse_virtio(node, props),
                     #[cfg(not(feature = "loopback"))]
-                    c if c.contains("allwinner,sunxi-gmac") => {
-                        self.parse_ethernet(node, comp, props)
-                    }
+                    c if is_ethernet(c) => self.parse_ethernet(node, comp, props),
                     c if c.contains("ns16550a") || c.iter().any(|str| str.ends_with("uart")) => {
                         self.parse_uart(node, comp, props)
                     }
@@ -160,6 +158,25 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
             .query_or_map(phys_addr, len)
             .ok_or(DeviceError::NoResources)
     }
+}
+
+/// Cuales de los `compatible` de un nodo van al constructor de Ethernet.
+///
+/// Es una funcion y no una lista dentro del `match` de [`DevicetreeDriverBuilder::build`]
+/// porque **el `match` de fuera decide si `parse_ethernet` llega a correr**, y
+/// las ramas de dentro de `parse_ethernet` no lo dicen: el GENET entro con su
+/// rama ahi dentro y con el nodo de la Pi 4 delante nunca se llamaba, porque
+/// aqui solo estaba el GMAC del D1. Un driver asi no da ningun error: no se
+/// sonda, y el arbol parece no traerlo.
+///
+/// Con la escotilla `loopback` puesta no hay sonda de Ethernet y nadie la
+/// llama, pero los tests siguen comprobandola.
+#[cfg(any(not(feature = "loopback"), test))]
+fn is_ethernet(comp: &StringList) -> bool {
+    // El GMAC del Allwinner D1 (riscv64) y el GENET v5 del BCM2711 (la
+    // Raspberry Pi 4). Cada uno tiene su rama en `parse_ethernet`, detras del
+    // `target_arch` que lo compila.
+    comp.contains("allwinner,sunxi-gmac") || comp.contains("brcm,bcm2711-genet-v5")
 }
 
 /// Walks one device's interrupt list and registers every specifier in it
@@ -340,6 +357,28 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
                 Arc::new(rtlx_init(irq_num as usize, |paddr, size| {
                     self.io_mapper.query_or_map(paddr, size)
                 })?)
+            }
+            // El GENET v5 del BCM2711: la Raspberry Pi 4.
+            //
+            // Todo lo que el arbol sabe de el --la direccion MDIO del PHY, el
+            // modo del RGMII y la MAC de la placa-- lo lee
+            // [`genet_from_dt`](crate::net::genet_from_dt), que esta al lado
+            // del driver y no aqui porque aqui no hay forma de ponerle un MAC
+            // falso debajo para probarlo.
+            #[cfg(target_arch = "aarch64")]
+            c if c.contains("brcm,bcm2711-genet-v5") => {
+                // La ventana del GENET son 64 KiB y los descriptores viven
+                // DENTRO de ella: un mapeo mas corto no se nota al escribir
+                // los registros, se nota al usar los anillos.
+                let base = base_vaddr?;
+                Arc::new(unsafe {
+                    genet_from_dt(
+                        alloc::string::String::from("eth0"),
+                        node,
+                        base,
+                        irq_num as usize,
+                    )
+                }?)
             }
             _ => return Err(DeviceError::NotSupported),
         });
@@ -800,6 +839,43 @@ mod tests {
             io_mapper: RamMapper::new(),
         }
         .build()
+    }
+
+    #[test]
+    fn the_walk_sends_both_ethernet_macs_to_parse_ethernet() {
+        // El defecto que este test clava: el GENET de la Pi 4 entro con su
+        // rama DENTRO de `parse_ethernet` y el `match` de fuera seguia
+        // nombrando solo al GMAC del D1, asi que con el nodo de la Pi delante
+        // nunca se llamaba. No se puede comprobar de punta a punta aqui: la
+        // rama del GENET esta detras de `cfg(target_arch = "aarch64")`, asi
+        // que en el anfitrion un nodo no sondado y un nodo sondado-y-no-
+        // soportado dan los dos `NotSupported`. Lo que si se puede comprobar
+        // es el predicado que decide si se llama.
+        let gmac = strs(&["allwinner,sunxi-gmac"]);
+        assert!(is_ethernet(&StringList::new(&gmac)));
+        let genet = strs(&["brcm,bcm2711-genet-v5"]);
+        assert!(is_ethernet(&StringList::new(&genet)));
+        // Y con la lista entera del nodo de la Pi 4, que nombra el de su
+        // version y detras el generico de la familia.
+        let pi = strs(&["brcm,bcm2711-genet-v5", "brcm,genet-v5"]);
+        assert!(is_ethernet(&StringList::new(&pi)));
+    }
+
+    #[test]
+    fn the_walk_does_not_send_anything_else_to_parse_ethernet() {
+        for comp in [
+            "brcm,bcm2835-aux-uart",
+            "brcm,genet-mdio-v5",
+            "snps,dw-apb-uart",
+            "virtio,mmio",
+        ] {
+            let buf = strs(&[comp]);
+            assert!(
+                !is_ethernet(&StringList::new(&buf)),
+                "{} no es un MAC y no debe llegar a parse_ethernet",
+                comp
+            );
+        }
     }
 
     #[test]
