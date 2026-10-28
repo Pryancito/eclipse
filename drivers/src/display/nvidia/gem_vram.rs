@@ -22,8 +22,7 @@
 //! the framebuffer carries its VRAM offset, so `nvkms_page_flip` flips the
 //! display onto it with no copy at all.
 //!
-//! This replaces the arithmetic in `vram_bar1.rs` (`bar1_phys + offset`),
-//! which assumes BAR1 is a linear window onto VRAM. It is not, now: BAR1 is
+//! BAR1 is not a linear window onto VRAM (`bar1_phys + offset`): it is
 //! virtual, and only the console's first megabytes are mapped one to one.
 //!
 //! # What can go wrong, and what happens then
@@ -44,7 +43,6 @@
 //! [`placement`] answers what `GEM_NEW` always did.
 
 use super::super::nouveau_uapi as nv;
-use super::vram_bar1;
 use core::sync::atomic::{AtomicBool, Ordering};
 use nvidia_rm_sys::rm_init::{self, GemAlloc};
 
@@ -189,20 +187,12 @@ pub(super) fn place(
     // no CPU mapping and no scanout.
     let vram_offset =
         rm_init::gem_fbmem_offset(t.device_instance, t.owner_ctx, alloc.h_memory).ok();
-    // The old linear-BAR1 arithmetic, behind its own hatch
-    // (`nvidia.gem_vram_bar1`); kept until the cleanup.
-    let phys_addr = vram_bar1::cpu_mapping_for_vram_gem(
-        false,
-        t.bar1_phys,
-        t.bar1_len,
-        vram_offset,
-        t.size,
-        t.handle,
-    );
+    // No CPU mapping: only a `VRAM | GART` buffer under `nvidia.gem_vram`
+    // gets one, from the RM ([`vram_mapped`]).
     Ok(Placed {
         alloc,
         sysmem,
-        phys_addr,
+        phys_addr: None,
         vram_offset,
         device_memory: false,
     })
