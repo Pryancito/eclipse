@@ -1266,65 +1266,6 @@ fn the_console_gsp_boot_happens_inside_the_hand_over_window() {
     );
 }
 
-/// Taking the display away is what makes the hand-over a hand-over; the rest
-/// of the window (VGA decode, I/O decode) was already there while the monitor
-/// kept being scanned out, and that combination failed.
-#[test]
-fn the_hand_over_actually_takes_the_display_away() {
-    let src = include_str!("../boot_window.rs");
-    let live: alloc::string::String = src
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("//!"))
-        .collect::<alloc::vec::Vec<&str>>()
-        .join("\n");
-    assert!(
-        live.contains("pdisp_kill_arm()"),
-        "without PDISP going into reset the display engine keeps fetching BAR1 \
-         through the SEC2 window, which is the wedge this window exists to avoid"
-    );
-    assert!(
-        live.contains("pdisp_kill_disarm()"),
-        "an arm that outlives its boot fires on somebody else's register read"
-    );
-    assert!(
-        live.contains("display_off_for_gsp()"),
-        "`nvidia.nodispoff` must still be able to restore the old behaviour"
-    );
-}
-
-/// Handing the display over is an opt-in, and stays one until a boot shows
-/// the monitor coming back.
-///
-/// It shipped on by default for exactly one hardware boot: "al arrancar el
-/// entorno grafico el monitor pierde senal y no se recupera". Part of that was
-/// a restore that got cancelled instead of run (now fixed in
-/// `pdisp_kill_disarm`), but the other part is not fixable from here --
-/// `pdisp_restore` writes `NV_PMC_ENABLE` back and nothing restores the
-/// scanout state the VBIOS programmed, which an engine-level reset wipes.
-/// Linux does not have the problem because it never resets PDISP; it unbinds
-/// the firmware framebuffer and does a modeset of its own.
-///
-/// Flipping this default back to `true` costs the screen for the whole session
-/// on a box where it does not come back, and there is no console left to read
-/// the log on. That is why it is pinned rather than left to a comment.
-#[test]
-fn the_display_is_only_handed_over_when_someone_asks() {
-    // Process-wide switch, and `cargo test` runs these in parallel: without
-    // the lock this asserts on a default another test is mid-way through
-    // flipping, which is how a suite fails one run in three.
-    let _s = crate::test_globals::LOCK.lock();
-    assert!(
-        !crate::display::nouveau_uapi::display_off_for_gsp(),
-        "handing the console GPU's display over is OFF by default: the one boot that ran          with it on never got its picture back. `nvidia.dispoff` is the opt-IN"
-    );
-    crate::display::nouveau_uapi::set_display_off_for_gsp(true);
-    assert!(
-        crate::display::nouveau_uapi::display_off_for_gsp(),
-        "`nvidia.dispoff` must still reach the boot path"
-    );
-    crate::display::nouveau_uapi::set_display_off_for_gsp(false);
-}
-
 /// The GSP boot no longer refuses the card that scans out.
 ///
 /// That refusal -- `SKIPPED on console GPU` -- WAS the split: one card got the

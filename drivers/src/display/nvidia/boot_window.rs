@@ -20,9 +20,14 @@
 //! survived 2 boots out of 3, which is what losing the monitor on some boots
 //! and not others looks like from the outside.
 //!
-//! So this module is the whole window in one place: enter it, boot the
-//! firmware, drop it. [`BootWindow::enter`] takes the display away and
-//! renounces VGA; [`Drop`] gives both back.
+//! Taking the display away (PDISP into reset across the SEC2 window) was
+//! tried as an opt-in and cost the monitor for the whole session: an
+//! engine-level reset wipes the scanout state the VBIOS programmed, and
+//! nothing here reprograms it. The boot survives without it, so it is gone.
+//!
+//! So this module is the window in one place: enter it, boot the firmware,
+//! drop it. [`BootWindow::enter`] renounces VGA and I/O decode; [`Drop`]
+//! gives both back.
 
 use super::NvidiaGpu;
 use alloc::string::String;
@@ -40,8 +45,6 @@ pub(super) struct BootWindow<'a> {
     io_cmd_old: Option<u16>,
     /// Bridges whose VGA routing this window cleared.
     bridges_changed: Vec<(u8, u8, u8, u16)>,
-    /// Whether the display engine was handed over too.
-    display_off: bool,
 }
 
 impl<'a> BootWindow<'a> {
@@ -66,35 +69,11 @@ impl<'a> BootWindow<'a> {
         let (bridge_log, bridges_changed) = gpu.set_path_vga_routing(true, &[]);
         log.push_str(&bridge_log);
 
-        // The piece Linux has and we did not -- and the piece that is NOT
-        // equivalent to it, which is why this is off unless asked for:
-        // Linux unbinds the firmware framebuffer and later does a full modeset
-        // of its own, while all we can undo is the `NV_PMC_ENABLE` write.
-        // PDISP (`NV_PMC_ENABLE` bit 30)
-        // drops into engine-level reset the moment `kgspCalculateFbLayout` has
-        // consumed `NV_PDISP_VGA_WORKSPACE_BASE` — the last thing in the boot
-        // that needs the display — and comes back on the RM's own "RISCV
-        // started" line, past the wedge window and before GSP-RM's init wants
-        // the display engine alive (EXP1/EXP1b timed out in
-        // `kgspWaitForRmInitDone` precisely because they left it in reset for
-        // the whole run). The monitor loses signal for that stretch. A frozen
-        // picture is what it showed before, and that was not safer, only
-        // quieter.
-        let display_off = super::super::nouveau_uapi::display_off_for_gsp();
-        if display_off {
-            nvidia_rm_sys::os_boundary::pdisp_kill_arm();
-            log.push_str(&alloc::format!(
-                "[{}] display engine OFF for the SEC2 window (PDISP reset, restored at 'RISCV started') \
-                 -- como el remove_conflicting_framebuffers de Linux; nvidia.nodispoff lo desactiva\n",
-                tag
-            ));
-        }
         Self {
             gpu,
             tag,
             io_cmd_old: Some(io_cmd_old),
             bridges_changed,
-            display_off,
         }
     }
 
@@ -109,18 +88,6 @@ impl<'a> BootWindow<'a> {
         use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
         use pci::Location;
         let mut s = String::new();
-        if self.display_off {
-            // Gives the display back AND cancels an arm that never fired, in
-            // that order -- `pdisp_kill_disarm` does both, because doing only
-            // the second (which is what this call used to mean) left PDISP in
-            // engine reset until reboot on any boot that did not reach its own
-            // restore anchor. Leaving this window is the deadline for getting
-            // the monitor back; nothing later is going to do it -- and a boot
-            // that wedges inside `gsp_boot_run` never leaves it at all, which
-            // is one of the reasons the hand-over is opt-in.
-            nvidia_rm_sys::os_boundary::pdisp_kill_disarm();
-            self.display_off = false;
-        }
         let (restore_log, _) = self.gpu.set_path_vga_routing(false, &self.bridges_changed);
         s.push_str(&restore_log);
         self.bridges_changed.clear();

@@ -1970,26 +1970,6 @@ pub extern "C" fn osImexChannelIsSupported() -> NvBool {
     NV_FALSE
 }
 
-/// Set to false by `nvidia.noosinitmapping` on the kernel cmdline, which
-/// makes `osInitMapping` go back to returning `NV_ERR_NOT_SUPPORTED` the
-/// way it did before the real implementation existed. That is an escape
-/// hatch, not a mode: the hook runs on BOTH cards (the compute one that
-/// already works included), so there has to be a one-word way back if the
-/// two config-space writes turn out to disturb a path that works today.
-static OSINIT_MAPPING_ON: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
-
-/// Disable (or re-enable) Eclipse's real `osInitMapping`. Called from the
-/// display driver when the cmdline carries `nvidia.noosinitmapping`.
-pub fn set_osinit_mapping_enabled(on: bool) {
-    OSINIT_MAPPING_ON.store(on, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// Whether the real `osInitMapping` is in force.
-pub fn osinit_mapping_enabled() -> bool {
-    OSINIT_MAPPING_ON.load(core::sync::atomic::Ordering::Relaxed)
-}
-
 extern "C" {
     /// `vendor/eclipse_rm_init.c` -- the portable half of Linux's
     /// `osInitMapping` (osinit.c:1260): clears the expansion-ROM base
@@ -2005,9 +1985,6 @@ extern "C" {
 /// attached but with no RM state loaded at all.
 #[no_mangle]
 pub extern "C" fn osInitMapping(pGpu: *mut c_void) -> NV_STATUS {
-    if !osinit_mapping_enabled() {
-        return NV_ERR_NOT_SUPPORTED;
-    }
     unsafe { eclipse_rm_os_init_mapping(pGpu) }
 }
 

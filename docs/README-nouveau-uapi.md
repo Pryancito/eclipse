@@ -398,8 +398,7 @@ siguiente ioctl, y los de un proceso que sale, antes que el del pid.
   abortaba `gpuStatePreInit` en la etapa 4: la GPU de consola quedaba
   enganchada pero sin estado RM ninguno (`PFB_CSTATUS=0xbadf5040`, runlists a
   cero). Corre en **todas** las tarjetas que engancha el RM, también la de
-  cómputo, así que `nvidia.noosinitmapping` devuelve el stub viejo sin
-  recompilar.
+  cómputo.
 - **Prime GRAPHICS**: `ctx_prime` exige compute+3D; un fallo **descarta** el
   contexto (software fallback) en vez de publicar READY y colgar FECS en el
   primer draw. `step18` también prima GRAPHICS en ctx0. Timeout de prime =

@@ -246,7 +246,7 @@ NV_STATUS deviceCtrlCmdOsUnixVTGetFBInfo_IMPL(Device *pDevice,
  * (osinit.c RmSetConsolePreservationParams): ReservedConsoleDispMemSize makes
  * memmgrAllocateConsoleRegion describe FB region 0 as the console, and
  * bPreserveBar1ConsoleEnabled keeps a BAR1 mapping on it. That is what
- * nvidia.console_preserve does, and on a dual RTX 2060 SUPER it costs the
+ * nvidia.console_preserve did (since removed), and on a dual RTX 2060 SUPER it cost the
  * picture: the BAR1 window the console is drawn through stops reaching the
  * memory the firmware head scans, and that head freezes on its last frame.
  *

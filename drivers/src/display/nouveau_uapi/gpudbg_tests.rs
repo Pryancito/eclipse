@@ -1,9 +1,8 @@
 //! The `/proc/gpudbg` sections and the cmdline switches nothing exercised:
 //! `format_prime`, `format_gr_hang_probe`, `format_last_exec`,
 //! `format_client_mem` and `format_exec_profile` only ran on a real GPU
-//! with a terminal reading the file, and `nvidia.console_gsp`,
-//! `nvidia.hwflip` and `nvidia.noosinitmapping` only from `zCore`'s
-//! cmdline. Every static here is process-wide, so each test takes
+//! with a terminal reading the file, and `nvidia.console_gsp` and
+//! `nvidia.hwflip` only from `zCore`'s cmdline. Every static here is process-wide, so each test takes
 //! `crate::test_globals::LOCK`, starts from a known state and puts the
 //! switches back.
 
@@ -60,32 +59,22 @@ fn clear_profile() {
     }
 }
 
-/// Each switch answers what its setter was last told, and none of the
-/// three reads another's flag. `noosinitmapping` lives in `nvidia-rm-sys`
-/// and this is only its door, so it is put back exactly as found.
+/// Each switch answers what its setter was last told, and neither reads the
+/// other's flag.
 #[test]
 fn the_switches_answer_what_the_cmdline_last_said() {
     let _s = crate::test_globals::LOCK.lock();
-    let (gsp, flip, osinit) = (
-        console_gsp_enabled(),
-        hwflip_enabled(),
-        osinit_mapping_enabled(),
-    );
+    let (gsp, flip) = (console_gsp_enabled(), hwflip_enabled());
     set_console_gsp_enabled(true);
     set_hwflip_enabled(false);
-    set_osinit_mapping_enabled(false);
     assert!(console_gsp_enabled());
     assert!(!hwflip_enabled());
-    assert!(!osinit_mapping_enabled());
     set_console_gsp_enabled(false);
     set_hwflip_enabled(true);
-    set_osinit_mapping_enabled(true);
     assert!(!console_gsp_enabled());
     assert!(hwflip_enabled());
-    assert!(osinit_mapping_enabled());
     set_console_gsp_enabled(gsp);
     set_hwflip_enabled(flip);
-    set_osinit_mapping_enabled(osinit);
 }
 
 /// One line per primed context, a later prime of the same context

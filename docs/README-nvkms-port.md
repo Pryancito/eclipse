@@ -165,7 +165,7 @@ Cada uno pequeño, revisable y sin romper el escritorio que ya funciona.
 - PR 4c: la región de consola se describe al RM después del arranque del GSP.
   - En tu hardware el RM no tenía región de consola, así que
     `NV01_MEMORY_FRAMEBUFFER_CONSOLE` fallaba y no había modeset.
-  - Reservarla antes del arranque, como Linux (`nvidia.console_preserve`), mueve
+  - Reservarla antes del arranque, como Linux (`nvidia.console_preserve`, ya retirado), mueve
     la ventana BAR1 por la que se pinta la consola. Sin nvkms la pantalla se
     congela; con nvkms sale negra.
   - Ahora, justo antes de `allocateDevice`, el shim describe el framebuffer de

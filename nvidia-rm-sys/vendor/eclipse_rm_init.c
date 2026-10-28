@@ -7518,7 +7518,7 @@ NV_STATUS eclipse_rm_mark_console_gpu(
  *
  * Only the BAR1 mapping is taken from Linux here: PRIMARY_DEVICE and
  * ReservedConsoleDispMemSize, which eclipse_rm_mark_console_gpu sets before
- * the GSP boot (nvidia.console_preserve), stay off. The console memdesc is
+ * the GSP boot (the retired nvidia.console_preserve), stay off. The console memdesc is
  * described at VRAM offset 0, where the firmware framebuffer at the base of
  * BAR1 lives while BAR1 is still the firmware's linear window, the same
  * description memmgrAllocateConsoleRegion_GM107 makes and
