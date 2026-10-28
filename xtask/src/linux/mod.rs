@@ -9,6 +9,7 @@ pub(crate) mod nvidia_firmware;
 mod nvidia_userspace;
 mod ollama_cuda;
 mod opencv;
+mod os_release;
 mod portal;
 mod signal_probe;
 mod test;
@@ -242,6 +243,10 @@ impl LinuxRootfs {
             Self::ensure_var_run(&dir);
             Self::write_pulse_conf(&dir);
             Self::ensure_pulse_accounts(&dir);
+            // LAST, and after the package tap: Ubuntu's `base-files` and
+            // Alpine's `alpine-release` both carry an `/etc/os-release`, and
+            // the last writer is the one the guest reads.
+            os_release::install(&dir, self.0.name(), self.1);
             return;
         }
         // 准备最小系统需要的资源
@@ -837,6 +842,8 @@ impl LinuxRootfs {
         Self::install_base_accounts(&dir);
         self.install_busybox_init(&dir);
         self.install_eclipse_init(&dir, &musl);
+        // LAST, for the same reason as on the incremental path above.
+        os_release::install(&dir, self.0.name(), self.1);
     }
 
     /// Instala tests freestanding de multihilo (thr3: repro de la barrier de sysbench).
