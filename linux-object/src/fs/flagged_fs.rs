@@ -26,6 +26,18 @@ fn ro_err() -> FsError {
 }
 
 pub fn wrap_fs(inner: Arc<dyn FileSystem>, state: Arc<MountState>) -> Arc<dyn FileSystem> {
+    let root = inner.root_inode();
+    wrap_fs_at(inner, root, state)
+}
+
+/// [`wrap_fs`] of `inner` from its directory `root` down: what a bind of a
+/// directory inside a mount shows. Its root is `root`, so `..` there climbs
+/// out of the bind and not into the rest of `inner`.
+pub fn wrap_fs_at(
+    inner: Arc<dyn FileSystem>,
+    root: Arc<dyn INode>,
+    state: Arc<MountState>,
+) -> Arc<dyn FileSystem> {
     // `new_cyclic` so every inode can hold a way back to this wrapper, which is
     // what `INode::fs` owes its caller. The back-reference is weak and the root
     // inode is built once here: the strong direction is filesystem -> root, so
@@ -33,7 +45,7 @@ pub fn wrap_fs(inner: Arc<dyn FileSystem>, state: Arc<MountState>) -> Arc<dyn Fi
     // every time.
     Arc::new_cyclic(|me: &Weak<FlaggedFs>| {
         let root = Arc::new(FlaggedINode {
-            inner: inner.root_inode(),
+            inner: root,
             state: state.clone(),
             fs: me.clone(),
         });
@@ -398,6 +410,35 @@ mod chain_tests {
     fn the_root_of_a_mount_is_the_same_inode_every_time() {
         let fs = mount(0);
         assert!(Arc::ptr_eq(&fs.root_inode(), &fs.root_inode()));
+    }
+
+    #[test]
+    fn a_mount_of_a_directory_shows_that_directory_and_its_way_back_leads_there() {
+        let inner = RamFS::new();
+        let d = inner
+            .root_inode()
+            .create("d", FileType::Dir, 0o755)
+            .unwrap();
+        d.create("in", FileType::File, 0o644).unwrap();
+        inner
+            .root_inode()
+            .create("out", FileType::File, 0o644)
+            .unwrap();
+        let state = Arc::new(MountState::from_options(MS_RDONLY, ""));
+        let fs = wrap_fs_at(inner, d.clone(), state);
+        let root = fs.root_inode();
+        let d_ino = d.metadata().unwrap().inode;
+        assert_eq!(root.metadata().unwrap().inode, d_ino);
+        assert!(root.find("in").is_ok());
+        assert!(root.find("out").is_err(), "it shows the whole filesystem");
+        assert!(Arc::ptr_eq(&root, &fs.root_inode()));
+        // An inode's way back to its root is the directory, still wrapped.
+        let back = root.find("in").unwrap().fs().root_inode();
+        assert_eq!(back.metadata().unwrap().inode, d_ino);
+        assert_eq!(
+            back.create("x", FileType::File, 0o644).err(),
+            Some(FsError::ReadOnly)
+        );
     }
 
     #[test]

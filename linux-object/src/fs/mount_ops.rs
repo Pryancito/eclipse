@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use lazy_static::lazy_static;
 use lock::Mutex;
-use rcore_fs::vfs::FileSystem;
+use rcore_fs::vfs::{FileSystem, FileType, INode};
 use rcore_fs_mountfs::MNode;
 
 use crate::error::{LxError, LxResult};
@@ -16,7 +16,7 @@ use super::block_mount::MountBackend;
 use super::btrfs_mount::open_btrfs;
 use super::eclipsefs_mount::open_eclipsefs;
 use super::fat_mount::open_fat;
-use super::flagged_fs::wrap_fs;
+use super::flagged_fs::{wrap_fs, wrap_fs_at};
 use super::mount_state::{
     self, build_options_string, flags_read_only, MNT_DETACH, MNT_FORCE, MS_BIND, MS_MOVE,
     MS_REMOUNT,
@@ -256,6 +256,12 @@ pub fn mount_fs(
 /// `mount --bind source target`, on the tree under `root` and the table
 /// `table`. A mount on a mount point goes on top of what is there, which is
 /// where [`resolve_from`] lands: the stack is how Linux takes it, not `EBUSY`.
+///
+/// The source is any directory, as Linux binds one: at a mount point the
+/// root of the top filesystem there, anywhere else the directory itself.
+/// Only a whole mount was bound before, and a plain directory was `EINVAL`.
+/// Either way the bind shows what that filesystem has from there down and
+/// nothing mounted inside it, which only `MS_REC` would bring.
 fn bind_from(
     root: &Arc<MNode>,
     table: &Table,
@@ -264,21 +270,35 @@ fn bind_from(
     flags: usize,
     data: &str,
 ) -> LxResult<()> {
-    // A whole mount only: a directory inside one is not bound here.
-    let inner = mount_holder_from(root, source)?
-        .and_then(|holder| holder.mounted_inner_fs())
-        .ok_or(LxError::EINVAL)?;
     let mount_node = resolve_from(root, target)?;
-    let (fs, state) = prepare_fs(inner, flags, data);
+    let source_node = resolve_from(root, source)?;
+    if source_node.metadata()?.type_ != FileType::Dir {
+        return Err(LxError::ENOTDIR);
+    }
+    let state = Arc::new(mount_state::MountState::from_options(flags, data));
+    let fs = wrap_fs_at(
+        source_node.backing_fs(),
+        source_node.backing_inode(),
+        state.clone(),
+    );
     mount_node.mount(fs).map_err(LxError::from)?;
     let opts = build_options_string(flags, data);
     // The filesystem under it is the source's, so the line names the device
-    // and type the source's line does, not the path it was reached by and
-    // "none": Linux copies `mnt_devname` and keeps the superblock.
+    // and type of the mount the source is on, not the path it was reached by
+    // and "none", and the directory of it the bind shows: Linux copies
+    // `mnt_devname`, keeps the superblock and roots the mount at the dentry.
     let mut mounts = table.lock();
-    let (origin, fstype) = super::origin_in(&mounts, source)
-        .unwrap_or_else(|| (String::from(source), String::from("none")));
-    let entry = super::new_mount_entry(&origin, target, &fstype, &opts, Some(state));
+    let (origin, fstype, fs_root) = super::origin_in(&mounts, source).unwrap_or_else(|| {
+        (
+            String::from(source),
+            String::from("none"),
+            String::from("/"),
+        )
+    });
+    let entry = MountEntry {
+        root: fs_root,
+        ..super::new_mount_entry(&origin, target, &fstype, &opts, Some(state))
+    };
     super::record_mount(&mut mounts, entry);
     Ok(())
 }

@@ -388,6 +388,19 @@ impl MNode {
         ))
     }
 
+    /// The inode of the filesystem this node is, not what is mounted on it:
+    /// what a bind of this directory shows, as Linux roots a bind at the
+    /// dentry it was given.
+    pub fn backing_inode(&self) -> Arc<dyn INode> {
+        self.inode.clone()
+    }
+
+    /// The filesystem [`backing_inode`](Self::backing_inode) is in, without
+    /// what is mounted inside it: a plain bind does not carry those along.
+    pub fn backing_fs(&self) -> Arc<dyn FileSystem> {
+        self.vfs.inner_fs()
+    }
+
     /// Wrap a backing-store child inode without traversing mount overlays.
     pub fn from_backing(vfs: Arc<MountFS>, inode: Arc<dyn INode>) -> Arc<Self> {
         MNode {
@@ -1670,6 +1683,30 @@ mod tests {
         let up = inside.find(false, "..").unwrap();
         assert!(up.find(false, "sub").is_ok());
         assert!(up.find(false, "..").unwrap().is_same_node(&elsewhere));
+    }
+
+    #[test]
+    fn a_node_s_backing_parts_are_its_own_filesystem_s_and_nothing_mounted_on_it() {
+        let (top, root) = tree();
+        let d = dir_at(&root, "d");
+        file_at(&d, "under");
+        let mounted = fs_with("x");
+        d.mount(mounted.clone()).unwrap();
+        // The directory as its parent holds it: the one under the mount.
+        let held = root.backing_find("d").unwrap();
+        assert_eq!(held.backing_inode().metadata().unwrap().inode, ino(&d));
+        assert!(held.backing_inode().find("under").is_ok());
+        assert!(Arc::ptr_eq(&held.backing_fs(), &top.inner_fs()));
+        // Through its path: the root of what is mounted there.
+        let shown = root.find(false, "d").unwrap();
+        assert!(shown.backing_inode().find("x").is_ok());
+        assert!(Arc::ptr_eq(&shown.backing_fs(), &mounted));
+        // And no further: a mount inside that one is not in its filesystem.
+        let sub = dir_at(&shown, "sub");
+        sub.mount(fs_with("y")).unwrap();
+        let raw_sub = shown.backing_inode().find("sub").unwrap();
+        assert!(raw_sub.find("y").is_err(), "it crossed into the mount");
+        assert!(shown.find(false, "sub").unwrap().find(false, "y").is_ok());
     }
 
     #[test]
