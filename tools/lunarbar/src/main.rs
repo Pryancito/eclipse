@@ -56,7 +56,7 @@
 // The drawing stack, /proc readers, .desktop scanner and input tables live in
 // the `lunarbar` library next door, shared with `lunarrun` (see src/lib.rs).
 use lunarbar::look::Look;
-use lunarbar::{apps, draw, fill_guard, hunter, i18n, icons, sysinfo};
+use lunarbar::{apps, draw, fill_guard, hunter, i18n, icons, obmenu, sysinfo};
 
 mod hunter_menu;
 use lunarbar::keys::{
@@ -1266,19 +1266,12 @@ impl State {
                 name: "Terminal".into(),
                 exec: self.terminal.clone(),
                 icon: Some("utilities-terminal".into()),
+                ..apps::AppEntry::default()
             }];
             self.apps_cache.extend(apps::scan_apps(&self.terminal));
             self.apps_scanned = true;
         }
-        let all: Vec<apps::AppEntry> = self
-            .apps_cache
-            .iter()
-            .map(|e| apps::AppEntry {
-                name: e.name.clone(),
-                exec: e.exec.clone(),
-                icon: e.icon.clone(),
-            })
-            .collect();
+        let all: Vec<apps::AppEntry> = self.apps_cache.to_vec();
         let visible = (0..all.len()).collect();
         self.open_popup(
             qh,
@@ -4245,6 +4238,26 @@ fn kill_stale_instances() {
 }
 
 fn main() {
+    // `--labwc-menu` is not a panel at all: it prints labwc's application pipe
+    // menu on stdout and exits, so the compositor's right-click menu lists
+    // every installed program. Checked FIRST, before the crash handler and
+    // before killing a stale panel -- the right-click menu runs this while a
+    // panel is up, and SIGKILLing the live panel to print a menu would make
+    // opening the menu close the bar.
+    {
+        let mut args = std::env::args().skip(1);
+        if let Some(a) = args.next() {
+            if let Some(mode) = a.strip_prefix("--labwc-menu") {
+                let flat = matches!(mode, "=flat") || args.any(|a| a == "--flat");
+                let terminal = std::env::var("LUNARBAR_TERMINAL")
+                    .unwrap_or_else(|_| "/usr/local/bin/eclipse-terminal".into());
+                let menu =
+                    obmenu::pipemenu(&apps::scan_apps(&terminal), i18n::Lang::current(), flat);
+                print!("{menu}");
+                return;
+            }
+        }
+    }
     install_crash_handler();
     // Exactly one live panel: SIGKILL a stale predecessor before connecting to
     // the compositor. Skipped for the offline LUNARBAR_DUMP render, which is a
@@ -4390,13 +4403,17 @@ fn main() {
                     name: "Terminal".into(),
                     exec: terminal.clone(),
                     icon: Some("utilities-terminal".into()),
+                    ..apps::AppEntry::default()
                 }];
                 all.extend(apps::scan_apps(&terminal));
                 if all.len() == 1 {
                     // No .desktop files in this environment: show sample rows
                     // so the preview still demonstrates the menu.
                     for n in ["Ajustes", "Archivos", "Navegador web", "Editor de texto"] {
-                        all.push(apps::AppEntry { name: n.into(), exec: String::new(), icon: None });
+                        all.push(apps::AppEntry {
+                            name: n.into(),
+                            ..apps::AppEntry::default()
+                        });
                     }
                 }
                 let visible: Vec<usize> = (0..all.len()).collect();
