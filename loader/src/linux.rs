@@ -264,7 +264,9 @@ fn spawn(
     // rather than the old 4-byte magic-only check.
     let mut header = [0u8; 64];
     let _ = vmo.read(0, &mut header);
-    if !hunter::check_elf_binary(&path, &header) {
+    if !hunter::check_elf_binary(&path, &header)
+        || !linux_object::fs::hunter_config::appraise(&[path.as_str()], &vmo)
+    {
         warn!("spawn: binary {:?} blocked by hunter security policy", path);
         return None;
     }

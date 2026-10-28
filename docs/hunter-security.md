@@ -17,7 +17,10 @@ testable on the host.
 | Hook                       | Kernel call site                         | Domain          |
 |----------------------------|------------------------------------------|-----------------|
 | `check_syscall`            | `linux-syscall` dispatch                 | seccomp + IDS   |
-| `check_elf_binary`         | `sys_execve`                             | exec integrity  |
+| `check_exec_target`        | `sys_execve`                             | exec policy     |
+| `check_elf_binary`         | boot-time spawn (`loader`)               | exec policy     |
+| `check_exec_path`          | `PT_INTERP` / `#!` interpreters          | exec policy     |
+| `check_exec_integrity`     | `sys_execve`, interpreters, boot spawn   | exec integrity  |
 | `check_mmap`               | `sys_mmap`                               | W^X memory      |
 | `check_mprotect`           | `sys_mprotect`                           | W^X memory      |
 | `task_exit`                | `sys_exit_group`                         | state cleanup   |
@@ -38,6 +41,7 @@ There are three independently-tunable enforcement domains, each with its own
 | `wx`      | Write-xor-execute memory (`mmap` / `mprotect`)    | `Report`  |
 | `exec`    | Executable path policy (untrusted/world-writable) | `Report`  |
 | `anomaly` | Block (vs. only log) detected floods / fork bombs | `Report`  |
+| `integrity` | SHA-256 of the image vs. its pinned digest      | `Report`  |
 
 The defaults are deliberately conservative. The syscall domain is `Enforce`
 because whitelists are opt-in per process (no policy registered ⇒ permissive),
@@ -165,6 +169,8 @@ One directive per line; blank lines and `#` comments are ignored.
 | `trust <path>` / `trust <dir/>`        | add to the exec allowlist                           |
 | `deny <path>` / `deny <dir/>`          | add to the exec blacklist                           |
 | `untrusted <dir/>`                     | add a world-writable location                       |
+| `hash <sha256> <path>`                 | pin a program's SHA-256 (see below)                 |
+| `require-hash <on\|off>`               | an unpinned program is an integrity violation       |
 | `seal`                                 | engage the one-way tighten-only latch               |
 
 **All or nothing.** A script (a whole `policy.conf`, or one `write(2)` to
@@ -196,7 +202,10 @@ hunterctl trust|deny <path|dir/>
 hunterctl untrusted <dir/>
 hunterctl seal
 hunterctl apply <file>          send a whole script (e.g. a new policy.conf)
-hunterctl lockdown              mode exec enforce + learning off + seal
+hunterctl hash <file>...        pin SHA-256 digests (live, and in /etc/hunter/hashes)
+hunterctl require-hash <on|off>
+hunterctl verify                sha256sum -c /etc/hunter/hashes
+hunterctl lockdown              exec + integrity enforce, learning off, seal
 hunterctl save-learned          append learned programs to /etc/hunter/whitelist
 ```
 
@@ -209,6 +218,64 @@ alone on purpose: enforcing it breaks every JIT (Firefox, any JS engine).
 The image ships `/etc/hunter/policy.conf` as a fully commented example
 ([`tools/hunterctl/policy.conf`](../tools/hunterctl/policy.conf)), so it
 changes nothing until edited; a unit test keeps every line of it valid.
+
+## Exec integrity (SHA-256)
+
+The `exec` domain decides *where* a program may run from and *which names*
+are trusted. It cannot tell `/usr/bin/ssh` from a replacement that someone
+with write access to `/usr/bin` dropped in under the same name. The
+`integrity` domain ([`hunter::integrity`](../hunter/src/integrity.rs)) checks
+exactly that, IMA-style:
+
+- A program with a **pinned** SHA-256 runs only if the image about to be
+  mapped still hashes to that digest.
+- With `require-hash on`, a program with **no** pin is a violation too, which
+  makes integrity a deny-by-default allowlist.
+
+`Report` (the default) records a mismatch as a `WARN` event and lets the
+program run; `Enforce` blocks it with `EACCES` and a `CRIT` event. With
+nothing pinned, the domain checks nothing.
+
+**What is hashed** is the VMO the loader maps, not a second read of the file,
+so a writer racing the check cannot swap the bytes between hash and load. That
+covers the program, its `PT_INTERP` dynamic linker, `#!` interpreters, and
+the programs the kernel spawns at boot.
+
+**Names.** A program is looked up both by the name it was run by and by the
+path it resolves to through links, after canonicalization. Pinning
+`/bin/busybox` therefore covers every applet link to it. If both names are
+pinned, both pins must match.
+
+**Cost.** Only pinned images (or every image, under `require-hash`) are
+hashed, and each image only once: the digest is cached by the image's kernel
+object id, and the kernel's executable cache hands the same image to every
+exec of an unchanged file.
+
+**Pins** come from `/etc/hunter/hashes`, read at boot in `sha256sum` format
+(`<sha256>  <path>`), so `sha256sum /bin/* > /etc/hunter/hashes` is a valid
+file. A line that does not parse is skipped by name; the rest still load. Pins
+can also come from `hash` directives, or from `hunterctl hash`, which pins live
+and updates the file in one step.
+
+Pinning is a relaxation: under `require-hash` it admits a program, and a new
+digest admits new bytes under an old name. So the tighten-only latch refuses
+pins, and `require-hash off`, after `seal`. Once a system is sealed, a
+package update that changes a pinned binary stops that binary from running
+until reboot. That is the intended trade-off.
+
+### The `execve` gate is back
+
+While adding this domain it turned out that `sys_execve` had stopped calling
+hunter at all. The gate was dropped in "cache executable file images across
+execve" (June 2026), which replaced the block that called it. Since then,
+every runtime `execve` skipped the blacklist, the untrusted-location policy
+and the allowlist; only boot-time spawns and interpreters were still checked.
+The gate is restored as `check_exec_target`, after the ELF/`#!` preflight (so
+a file that is not a program is still `ENOEXEC` for the shell) and before
+the old image is torn down (so a refusal is an ordinary `EACCES`). Lists are
+asked of the name, and the resolved path is also checked against the
+blacklist and the untrusted locations. That means a symlink from a
+trusted-looking name to `/tmp/evil` no longer hides where the file is.
 
 ## Intrusion detection (heuristics)
 

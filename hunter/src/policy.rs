@@ -180,6 +180,9 @@ const DEFAULT_SYSCALL_MODE: Mode = Mode::Enforce;
 const DEFAULT_WX_MODE: Mode = Mode::Report;
 const DEFAULT_EXEC_MODE: Mode = Mode::Report;
 const DEFAULT_ANOMALY_MODE: Mode = Mode::Report;
+/// Integrity starts in `Report`: with no hashes registered it checks nothing,
+/// and once an operator pins some it says so loudly before it blocks.
+const DEFAULT_INTEGRITY_MODE: Mode = Mode::Report;
 /// Whether exec learning starts enabled (see [`EXEC_LEARN`]).
 const DEFAULT_EXEC_LEARN: bool = false;
 
@@ -187,6 +190,7 @@ static SYSCALL_MODE: AtomicU8 = AtomicU8::new(DEFAULT_SYSCALL_MODE.to_u8());
 static WX_MODE: AtomicU8 = AtomicU8::new(DEFAULT_WX_MODE.to_u8());
 static EXEC_MODE: AtomicU8 = AtomicU8::new(DEFAULT_EXEC_MODE.to_u8());
 static ANOMALY_MODE: AtomicU8 = AtomicU8::new(DEFAULT_ANOMALY_MODE.to_u8());
+static INTEGRITY_MODE: AtomicU8 = AtomicU8::new(DEFAULT_INTEGRITY_MODE.to_u8());
 
 /// One-way latch: once set, modes may only move towards stricter enforcement.
 static TIGHTEN_ONLY: AtomicBool = AtomicBool::new(false);
@@ -228,7 +232,7 @@ fn default_untrusted_prefixes() -> Vec<String> {
 /// Tightening changes (adding an untrusted or blacklisted location, disabling
 /// learning, raising a mode) are never gated, and neither is
 /// [`remove_policy`], which is process teardown rather than a policy change.
-fn allow_relaxing(what: &str) -> bool {
+pub(crate) fn allow_relaxing(what: &str) -> bool {
     if !TIGHTEN_ONLY.load(Ordering::SeqCst) {
         return true;
     }
@@ -320,6 +324,15 @@ pub fn anomaly_mode() -> Mode {
     Mode::from_u8(ANOMALY_MODE.load(Ordering::SeqCst))
 }
 
+/// Sets the enforcement mode for the exec-integrity (SHA-256) domain.
+pub fn set_integrity_mode(mode: Mode) {
+    apply_mode(&INTEGRITY_MODE, "integrity", mode);
+}
+/// Returns the current exec-integrity mode.
+pub fn integrity_mode() -> Mode {
+    Mode::from_u8(INTEGRITY_MODE.load(Ordering::SeqCst))
+}
+
 /// Engages the one-way tighten-only latch: after this, no domain can be
 /// relaxed (only moved towards `Enforce`). Typically called once boot is done.
 pub fn seal_tighten_only() {
@@ -348,6 +361,8 @@ pub(crate) fn reset_for_test() {
     WX_MODE.store(DEFAULT_WX_MODE.to_u8(), Ordering::SeqCst);
     EXEC_MODE.store(DEFAULT_EXEC_MODE.to_u8(), Ordering::SeqCst);
     ANOMALY_MODE.store(DEFAULT_ANOMALY_MODE.to_u8(), Ordering::SeqCst);
+    INTEGRITY_MODE.store(DEFAULT_INTEGRITY_MODE.to_u8(), Ordering::SeqCst);
+    crate::integrity::reset_for_test();
     EXEC_LEARN.store(DEFAULT_EXEC_LEARN, Ordering::SeqCst);
     TRUSTED_EXEC_PATHS.lock().clear();
     TRUSTED_EXEC_PREFIXES.lock().clear();

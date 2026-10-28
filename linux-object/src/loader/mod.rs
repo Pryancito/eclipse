@@ -464,6 +464,11 @@ impl LinuxElfLoader {
                 error!("shebang: read interp {:?} failed: {:?}", interp, e);
                 e
             })?;
+            // hunter: the interpreter runs too, so its bytes are appraised
+            // like the script's would be if it were a binary.
+            if !crate::fs::hunter_config::appraise(&[interp], &interp_vmo) {
+                return Err(ZxError::ACCESS_DENIED.into());
+            }
             let interp_size = zircon_object::vm::roundup_pages(interp_vmo.len());
             let interp_virt = zircon_object::vm::KERNEL_ASPACE.map(
                 None,
@@ -565,6 +570,12 @@ impl LinuxElfLoader {
                 error!("elf: read interp {:?} failed: {:?}", interp, e);
                 e
             })?;
+            // hunter: the dynamic linker runs inside every dynamically linked
+            // program, so a swapped `ld.so` is a swapped everything. Appraised
+            // on the image about to be mapped.
+            if !crate::fs::hunter_config::appraise(&[interp], &interp_vmo) {
+                return Err(ZxError::ACCESS_DENIED.into());
+            }
             let interp_size_aligned = zircon_object::vm::roundup_pages(interp_vmo.len());
             let interp_virt = zircon_object::vm::KERNEL_ASPACE.map(
                 None,

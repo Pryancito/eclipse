@@ -9,7 +9,7 @@
 #
 #   hunterctl [status]              modes, counters, lists (no event ring)
 #   hunterctl events                the full report, event ring included
-#   hunterctl mode <domain> <mode>  domain: syscall|wx|exec|anomaly
+#   hunterctl mode <domain> <mode>  domain: syscall|wx|exec|anomaly|integrity
 #                                   mode:   off|report|enforce
 #   hunterctl learning <on|off>
 #   hunterctl anomaly-detection <on|off>
@@ -19,11 +19,15 @@
 #   hunterctl untrusted <dir/>      add a world-writable location
 #   hunterctl seal                  one-way: from now on, only tighten
 #   hunterctl apply <file>          send a whole policy script (e.g. policy.conf)
-#   hunterctl lockdown              enforce exec, learning off, seal
+#   hunterctl hash <file>...        pin the SHA-256 of programs (live + /etc/hunter/hashes)
+#   hunterctl require-hash <on|off> unpinned programs are integrity violations
+#   hunterctl verify                check the files on disk against /etc/hunter/hashes
+#   hunterctl lockdown              enforce exec + integrity, learning off, seal
 #   hunterctl save-learned          append learned programs to the whitelist
 
 PROC=/proc/hunter
 WHITELIST=/etc/hunter/whitelist
+HASHES=/etc/hunter/hashes
 
 die() {
     echo "hunterctl: $*" >&2
@@ -42,12 +46,12 @@ usage() {
 # halves are two different scripts.
 send() {
     [ "$(id -u)" = 0 ] || die "must be root"
-    tmp=$(mktemp) || die "mktemp failed"
-    printf '%s\n' "$1" > "$tmp"
-    if dd if="$tmp" of="$PROC" bs=1048576 count=1 2>/dev/null; then
-        rm -f "$tmp"
+    msg=$(mktemp) || die "mktemp failed"
+    printf '%s\n' "$1" > "$msg"
+    if dd if="$msg" of="$PROC" bs=1048576 count=1 2>/dev/null; then
+        rm -f "$msg"
     else
-        rm -f "$tmp"
+        rm -f "$msg"
         die "hunter rejected the script; nothing was applied (see '$0 events')"
     fi
 }
@@ -72,7 +76,7 @@ mode)
     [ $# -eq 2 ] || usage 1
     send "mode $1 $2"
     ;;
-learning|anomaly-detection|privileged-deny|trust|deny|untrusted)
+learning|anomaly-detection|privileged-deny|require-hash|trust|deny|untrusted)
     [ $# -eq 1 ] || usage 1
     send "$cmd $1"
     ;;
@@ -84,12 +88,49 @@ apply)
     [ -r "$1" ] || die "cannot read $1"
     send "$(cat "$1")"
     ;;
+hash)
+    [ $# -ge 1 ] || usage 1
+    [ "$(id -u)" = 0 ] || die "must be root"
+    # Pinned by the file's real path: the kernel checks a program by its name
+    # AND by the path it resolves to, so pinning the target covers every link
+    # to it. One script for all of them, so the batch is all or nothing too.
+    script=""
+    mkdir -p "${HASHES%/*}"
+    touch "$HASHES"
+    tmp=$(mktemp) || die "mktemp failed"
+    trap 'rm -f "$tmp" "$tmp.new"' EXIT
+    cp "$HASHES" "$tmp"
+    for f in "$@"; do
+        real=$(readlink -f -- "$f") || die "cannot resolve $f"
+        [ -f "$real" ] || die "not a file: $f"
+        sum=$(sha256sum -- "$real" | cut -d' ' -f1) || die "cannot hash $real"
+        # Replace an earlier pin of the same file rather than stacking a
+        # second, stale line under it.
+        # (A sha256sum line is 64 hex digits, two spaces, then the path.)
+        awk -v p="$real" 'substr($0, 67) != p' "$tmp" > "$tmp.new"
+        printf '%s  %s\n' "$sum" "$real" >> "$tmp.new"
+        mv "$tmp.new" "$tmp"
+        script="${script}hash $sum  $real
+"
+    done
+    send "$script"
+    mv "$tmp" "$HASHES"
+    echo "hunterctl: pinned $# program(s); $(grep -c . "$HASHES") in $HASHES"
+    ;;
+verify)
+    [ -r "$HASHES" ] || die "no $HASHES"
+    sha256sum -c "$HASHES"
+    ;;
 lockdown)
-    # Exec only. W^X stays where it is because enforcing it breaks every JIT
-    # (Firefox, any JS engine), and the anomaly heuristics cost a lock on
-    # every syscall; both are a deliberate `mode` away. Whatever was learned
-    # so far stays trusted, so run save-learned first to keep it on reboot.
+    # Exec and integrity. W^X stays where it is because enforcing it breaks
+    # every JIT (Firefox, any JS engine), and the anomaly heuristics cost a
+    # lock on every syscall; both are a deliberate `mode` away. Whatever was
+    # learned or pinned so far stays trusted, so run save-learned (and hash)
+    # first. After this an updated binary whose pin no longer matches will
+    # not run until reboot: re-pinning is a relaxation, and the seal refuses
+    # it.
     send "mode exec enforce
+mode integrity enforce
 learning off
 seal"
     ;;

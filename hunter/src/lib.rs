@@ -13,6 +13,7 @@
 //! | [`check_syscall`]     | syscall dispatch            | seccomp + IDS   |
 //! | [`check_elf_binary`]  | `execve` / loader / interp  | exec integrity  |
 //! | [`check_mmap`]        | `mmap`                      | W^X memory      |
+//! | [`check_exec_integrity`] | `execve` / loader / interp | exec integrity (SHA-256) |
 //! | [`check_mprotect`]    | `mprotect`                  | W^X memory      |
 //! | [`check_munmap`]      | `munmap`                    | W^X bookkeeping |
 //! | [`task_fork`]         | `fork` / `clone`            | policy lifecycle|
@@ -42,6 +43,7 @@ pub mod clock;
 pub mod control;
 pub mod event_log;
 pub mod heuristics;
+pub mod integrity;
 pub mod policy;
 pub mod wx;
 
@@ -50,6 +52,7 @@ use alloc::string::String;
 
 pub use clock::set_time_source;
 pub use event_log::{set_sink, Severity};
+pub use integrity::check_exec_integrity;
 pub use policy::Mode;
 
 /// Reasons hunter rejects an operation.
@@ -145,6 +148,70 @@ pub fn check_syscall(pid: u64, num: u32, args: &[usize; 6]) -> Result<(), Securi
 /// `execve` / loader / interpreter hook. Validates ELF integrity and the
 /// executable-path policy. Returns `true` if execution may proceed.
 pub fn check_elf_binary(path: &str, elf_data: &[u8]) -> bool {
+    valid_image(path, elf_data) && check_exec_path(path)
+}
+
+/// The `execve` gate: [`check_elf_binary`] on the name the program was run by,
+/// plus the location checks on `resolved`, the file that name leads to through
+/// every link.
+///
+/// The lists are kept in names (the allowlist learns them, `/etc/hunter/*`
+/// spell them), so they are asked of the name. Where the file actually *is*
+/// cannot be asked of the name: `ln -s /tmp/evil ~/launch` names a file in
+/// `/tmp` without saying so, and a `deny` on `/usr/bin/nc` means nothing if
+/// `nc` is reached through another link to the same file. So a resolved path
+/// that is blacklisted is blocked, and one in an untrusted location is a
+/// violation of the exec mode, whatever the name looked like.
+pub fn check_exec_target(name: &str, resolved: &str, elf_data: &[u8]) -> bool {
+    if !check_elf_binary(name, elf_data) {
+        return false;
+    }
+    let mode = policy::exec_mode();
+    if mode == Mode::Off || policy::canonicalize(resolved) == policy::canonicalize(name) {
+        return true;
+    }
+    if policy::is_exec_blacklisted(resolved) {
+        event_log::record(
+            0,
+            Severity::Critical,
+            "EXEC",
+            "BLOCKED",
+            format!("blacklisted program: {} (run as {})", resolved, name),
+        );
+        warn!(
+            "hunter: BLOCKED blacklisted program: {} (as {})",
+            resolved, name
+        );
+        return false;
+    }
+    if !policy::is_untrusted_exec_path(resolved) {
+        return true;
+    }
+    let what = format!("untrusted path: {} (run as {})", resolved, name);
+    if mode == Mode::Enforce {
+        event_log::record(
+            0,
+            Severity::Critical,
+            "EXEC",
+            "BLOCKED",
+            format!("blocked exec ({})", what),
+        );
+        warn!("hunter: BLOCKED exec ({})", what);
+        return false;
+    }
+    event_log::record(
+        0,
+        Severity::Warning,
+        "EXEC",
+        "WARNING",
+        format!("exec policy violation ({})", what),
+    );
+    true
+}
+
+/// The format half of [`check_elf_binary`]: an ELF image for this machine or
+/// a `#!` script.
+fn valid_image(path: &str, elf_data: &[u8]) -> bool {
     // A valid executable is either an ELF image or a `#!` script (both of which
     // the loader knows how to run). Anything else is rejected — it would fail
     // to load anyway, and this records the attempt.
@@ -196,8 +263,7 @@ pub fn check_elf_binary(path: &str, elf_data: &[u8]) -> bool {
         }
     }
 
-    // Path policy: refuse / flag execution from untrusted locations.
-    check_exec_path(path)
+    true
 }
 
 /// Executable-path policy check only (no ELF integrity). Used for dynamic-linker
@@ -408,11 +474,12 @@ pub fn render_report() -> String {
         env!("CARGO_PKG_VERSION")
     ));
     out.push_str(&format!(
-        "enforcement: syscall={} wx={} exec={} anomaly={}{}\n",
+        "enforcement: syscall={} wx={} exec={} anomaly={} integrity={}{}\n",
         policy::syscall_mode().as_str(),
         policy::wx_mode().as_str(),
         policy::exec_mode().as_str(),
         policy::anomaly_mode().as_str(),
+        policy::integrity_mode().as_str(),
         if policy::is_tighten_only() {
             " [tighten-only]"
         } else {
@@ -451,6 +518,15 @@ pub fn render_report() -> String {
             "off"
         },
         if heuristics::privileged_deny_enabled() {
+            "on"
+        } else {
+            "off"
+        },
+    ));
+    out.push_str(&format!(
+        "integrity: pinned={} require-hash={}\n",
+        integrity::exec_hash_count(),
+        if integrity::require_hash() {
             "on"
         } else {
             "off"
@@ -1205,5 +1281,53 @@ mod benches {
                 black_box(&args),
             ))
         });
+    }
+}
+
+#[cfg(test)]
+mod exec_target_tests {
+    //! `check_exec_target` asks the lists of the name and the location of the
+    //! file the name resolves to.
+
+    use super::*;
+
+    /// A minimal x86-64-or-whatever ELF header that `valid_image` accepts.
+    fn elf() -> [u8; 64] {
+        let mut h = [0u8; 64];
+        h[..4].copy_from_slice(b"\x7fELF");
+        h[4] = 2; // ELFCLASS64
+        h[5] = 1; // little endian
+        h[6] = 1; // EV_CURRENT
+        h[16] = 2; // ET_EXEC
+        let m = EXPECTED_MACHINE.unwrap_or(0).to_le_bytes();
+        h[18] = m[0];
+        h[19] = m[1];
+        h
+    }
+
+    #[test]
+    fn a_link_into_tmp_is_judged_by_where_the_file_is() {
+        let _g = crate::test_globals::lock();
+        policy::reset_for_test();
+        policy::set_exec_mode(Mode::Enforce);
+        assert!(check_exec_target("/usr/bin/tool", "/usr/bin/tool", &elf()));
+        assert!(
+            !check_exec_target("/home/u/launch", "/tmp/evil", &elf()),
+            "a link from a trusted-looking name ran a file in /tmp"
+        );
+        policy::set_exec_mode(Mode::Report);
+        assert!(check_exec_target("/home/u/launch", "/tmp/evil", &elf()));
+        policy::reset_for_test();
+    }
+
+    #[test]
+    fn a_blacklisted_file_is_blocked_through_any_name() {
+        let _g = crate::test_globals::lock();
+        policy::reset_for_test();
+        policy::set_exec_mode(Mode::Report);
+        policy::add_blacklisted_exec_path(alloc::string::String::from("/bin/nc.real"));
+        assert!(!check_exec_target("/usr/bin/nc", "/bin/nc.real", &elf()));
+        assert!(check_exec_target("/usr/bin/cat", "/bin/cat.real", &elf()));
+        policy::reset_for_test();
     }
 }
