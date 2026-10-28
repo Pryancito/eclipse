@@ -68,6 +68,22 @@ fn fresh(name: &str, size: u64) -> (Btrfs, PathBuf) {
     (fs, path)
 }
 
+/// Present `path` as a device of exactly `size` bytes that has been used
+/// before: every byte of it set to `fill` first, the way a disk arrives with
+/// the last installation still on it.
+fn dirty_dev(path: &PathBuf, size: u64, fill: u8) -> Arc<dyn BlockDevice> {
+    let dev = open_dev(path, size);
+    let block = vec![fill; 64 * 1024];
+    let mut off = 0u64;
+    while off < size {
+        let take = block.len().min((size - off) as usize);
+        dev.write_at(off, &block[..take]).unwrap();
+        off += take as u64;
+    }
+    dev.sync().unwrap();
+    dev
+}
+
 #[test]
 fn a_filesystem_that_already_fills_its_device_reports_no_growth() {
     let (mut fs, path) = fresh("nogrow", MKFS_SIZE);
@@ -329,6 +345,116 @@ fn a_full_filesystem_writes_again_in_the_space_a_grow_added() {
     assert_eq!(
         got, block,
         "what came back out of the new chunk is not what went in"
+    );
+
+    drop(fs);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_fresh_extent_does_not_hand_back_what_the_disk_held_before() {
+    // mkfs zeroes the first MiB and writes its trees; from the data chunk
+    // onward the device keeps whatever it already had. So the driver is the
+    // only thing that zeroes a freshly allocated extent, and on a device that
+    // arrives full of zeros -- a sparse image file, which is every other test
+    // here -- skipping that work looks exactly like doing it.
+    //
+    // This device arrives full of something else.
+    const JUNK: u8 = 0xab;
+    let path = tmpfile("stale");
+    let _ = std::fs::remove_file(&path);
+    let dev = dirty_dev(&path, MKFS_SIZE, JUNK);
+    mkfs::format(&*dev, &opts()).unwrap();
+    drop(dev);
+    let mut fs = Btrfs::mount(open_dev(&path, MKFS_SIZE), false).unwrap();
+    let root = fs.root_ino();
+    let ino = fs
+        .create(root, "stale", FileKind::Regular, 0o644, 0)
+        .unwrap();
+
+    // A hundred bytes take a whole sector, so [100, 4096) of that extent is
+    // allocated and never written by the caller. A second write at the next
+    // sector puts i_size past it, which is what makes it readable.
+    let head = vec![0x11u8; 100];
+    assert_eq!(fs.write(ino, 0, &head).unwrap(), head.len());
+    let far = vec![0x22u8; 100];
+    assert_eq!(fs.write(ino, 4096, &far).unwrap(), far.len());
+
+    let mut got = vec![0xffu8; 4096 + 100];
+    assert_eq!(fs.read(ino, 0, &mut got).unwrap(), got.len());
+    assert_eq!(&got[..100], &head[..], "the first write did not read back");
+    assert_eq!(&got[4096..], &far[..], "the second write did not read back");
+
+    // The bytes between them belong to nobody and have to read as zeros. A
+    // clamp that lets the range the caller will write cover the rest of the
+    // extent leaves them as they were, and then this file hands out whatever
+    // the disk held before the filesystem existed.
+    let tail = &got[100..4096];
+    let dirty = tail.iter().filter(|&&b| b != 0).count();
+    assert_eq!(
+        dirty,
+        0,
+        "{} of the {} bytes between the two writes came back with what the \
+         device held before the format (the first of them at offset {})",
+        dirty,
+        tail.len(),
+        tail.iter().position(|&b| b != 0).unwrap_or(0) + 100
+    );
+
+    drop(fs);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_growing_file_preallocates_geometrically_and_stops_at_a_megabyte() {
+    const SECTOR: u64 = 4096;
+    let (mut fs, path) = fresh("prealloc", MKFS_SIZE);
+    let root = fs.root_ino();
+    let ino = fs
+        .create(root, "grow", FileKind::Regular, 0o644, 0)
+        .unwrap();
+    let byte = [0x7eu8];
+
+    // One byte takes one sector. The speculative run past the requested range
+    // grows with the file, so on a file that has nothing yet there is nothing
+    // to speculate: a floor under it instead would make every small file on
+    // the image claim a megabyte of blocks, and nbytes is what du prints.
+    assert_eq!(fs.write(ino, 0, &byte).unwrap(), 1);
+    assert_eq!(
+        fs.stat(ino).unwrap().nbytes,
+        SECTOR,
+        "a one-byte file does not account for exactly one sector"
+    );
+
+    // Appending at the end of the coverage doubles it, which is the point:
+    // the next few thousand small sequential writes land in space that is
+    // already covered and insert no extent at all.
+    let mut covered = SECTOR;
+    while covered < MIB {
+        assert_eq!(fs.write(ino, covered, &byte).unwrap(), 1);
+        covered *= 2;
+        assert_eq!(
+            fs.stat(ino).unwrap().nbytes,
+            covered,
+            "appending past {} bytes of coverage did not double it",
+            covered / 2
+        );
+    }
+
+    // And then it stops doubling. Past a megabyte the run is capped, so the
+    // growth turns linear and a file that is already big stops reserving as
+    // much again as it holds.
+    assert_eq!(fs.write(ino, MIB, &byte).unwrap(), 1);
+    assert_eq!(
+        fs.stat(ino).unwrap().nbytes,
+        2 * MIB,
+        "the first append past a megabyte did not add exactly a megabyte"
+    );
+    assert_eq!(fs.write(ino, 2 * MIB, &byte).unwrap(), 1);
+    assert_eq!(
+        fs.stat(ino).unwrap().nbytes,
+        3 * MIB,
+        "the cap on the speculative run did not hold at a megabyte"
     );
 
     drop(fs);

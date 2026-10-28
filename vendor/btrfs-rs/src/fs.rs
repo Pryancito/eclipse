@@ -2762,3 +2762,81 @@ mod tree_contract_tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Inline-extent tests
+// ---------------------------------------------------------------------------
+//
+// This driver never writes an inline extent for a regular file: `symlink` and
+// `write_symlink` are its only producers, and `truncate` only re-encodes one
+// that is already there. `mkfs.btrfs` does write them -- a file small enough
+// to fit in its own leaf is stored inline -- and the Eclipse installer mounts
+// images it did not create, so the conversion back to a regular extent runs on
+// real images and on none of ours. The item is therefore hand-built here, the
+// same way the compressed ones above are.
+#[cfg(all(test, feature = "std"))]
+mod inline_tests {
+    use super::compressed_tests::{open_dev, opts, tmpfile};
+    use super::*;
+    use crate::mkfs;
+
+    /// Give `name` one uncompressed inline extent holding `plain`, the way a
+    /// filesystem made by `mkfs.btrfs` arrives.
+    fn install_inline_file(fs: &mut Btrfs, name: &str, plain: &[u8]) -> u64 {
+        let root = fs.root_ino();
+        let ino = fs.create(root, name, FileKind::Regular, 0o644, 0).unwrap();
+        let item = FileExtent::encode_inline(fs.generation, plain);
+        fs.tree()
+            .insert(FS_TREE, Key::new(ino, EXTENT_DATA_KEY, 0), &item)
+            .unwrap();
+        fs.apply_pending().unwrap();
+        let mut inode = fs.read_inode(ino).unwrap();
+        inode.size = plain.len() as u64;
+        inode.nbytes = plain.len() as u64;
+        fs.write_inode(ino, &inode).unwrap();
+        fs.commit(true).unwrap();
+        ino
+    }
+
+    #[test]
+    fn a_write_past_a_small_inline_file_reserves_room_for_both() {
+        let path = tmpfile("inline-grow", 24 * 1024 * 1024);
+        let dev = open_dev(&path);
+        mkfs::format(&*dev, &opts()).unwrap();
+        drop(dev);
+        let mut fs = Btrfs::mount(open_dev(&path), false).unwrap();
+
+        let plain: Vec<u8> = (0..32u8).collect();
+        let ino = install_inline_file(&mut fs, "small", &plain);
+        assert_eq!(fs.stat(ino).unwrap().size, plain.len() as u64);
+
+        // The write starts past the sector the inline bytes occupy, so the
+        // conversion has to reserve the whole of [0, 4096+16) rounded up: what
+        // was inline, plus the range being written. Reserving only enough for
+        // the inline bytes leaves the coverage short of the offset, and a
+        // short write with nothing written is reported as a full disk -- on a
+        // filesystem with eleven megabytes free.
+        let far = [0x5au8; 16];
+        assert_eq!(
+            fs.write(ino, 4096, &far).unwrap(),
+            far.len(),
+            "writing past a 32-byte inline file did not write its bytes"
+        );
+
+        let mut got = alloc::vec![0u8; 4096 + far.len()];
+        assert_eq!(fs.read(ino, 0, &mut got).unwrap(), got.len());
+        assert_eq!(
+            &got[..plain.len()],
+            &plain[..],
+            "the bytes that were inline did not survive the conversion"
+        );
+        assert!(
+            got[plain.len()..4096].iter().all(|&b| b == 0),
+            "the gap between the inline bytes and the write is not zeroed"
+        );
+        assert_eq!(&got[4096..], &far[..], "the write did not read back");
+
+        fs.sync().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+}
