@@ -22,6 +22,16 @@ pub const MNT_DETACH: usize = 2;
 pub const MNT_EXPIRE: usize = 4;
 pub const UMOUNT_NOFOLLOW: usize = 8;
 
+/// `statfs(2)`'s `f_flags` bits (`include/linux/statfs.h`) for the four
+/// flags a [`MountState`] keeps.
+pub const ST_RDONLY: usize = 0x0001;
+pub const ST_NOSUID: usize = 0x0002;
+pub const ST_NODEV: usize = 0x0004;
+pub const ST_NOEXEC: usize = 0x0008;
+/// `f_flags` is filled in. Without it glibc's `statvfs` does not believe the
+/// word and looks for the mount's line in `/proc/mounts` instead.
+pub const ST_VALID: usize = 0x0020;
+
 /// Every `umount2(2)` flag this kernel will accept.
 pub const UMOUNT_KNOWN_FLAGS: usize = MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW;
 
@@ -121,6 +131,15 @@ impl MountState {
 
     pub fn set_nodev(&self, nodev: bool) {
         *self.nodev.lock() = nodev;
+    }
+
+    /// `flags_by_mnt()`: this mount's flags as `statfs(2)` reports them.
+    pub fn statfs_flags(&self) -> usize {
+        let bit = |set: bool, bit: usize| if set { bit } else { 0 };
+        bit(self.is_read_only(), ST_RDONLY)
+            | bit(self.is_nosuid(), ST_NOSUID)
+            | bit(self.is_nodev(), ST_NODEV)
+            | bit(self.is_noexec(), ST_NOEXEC)
     }
 
     /// Adopt a new set of options, the way `do_remount()` does: the flags it
