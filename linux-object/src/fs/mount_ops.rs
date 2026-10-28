@@ -222,7 +222,7 @@ pub fn mount_fs(
     if flags & MS_BIND != 0 {
         let source = source.ok_or(LxError::EINVAL)?;
         let root = vfs_root().ok_or(LxError::EINVAL)?;
-        return bind_from(&root, &MOUNT_TABLE, source, &target_norm, flags, data);
+        return bind_from(&root, &MOUNT_TABLE, source, &target_norm);
     }
 
     // Pseudo-filesystems the kernel already provides (procfs at /proc, sysfs at
@@ -262,44 +262,48 @@ pub fn mount_fs(
 /// Only a whole mount was bound before, and a plain directory was `EINVAL`.
 /// Either way the bind shows what that filesystem has from there down and
 /// nothing mounted inside it, which only `MS_REC` would bring.
-fn bind_from(
-    root: &Arc<MNode>,
-    table: &Table,
-    source: &str,
-    target: &str,
-    flags: usize,
-    data: &str,
-) -> LxResult<()> {
+///
+/// The bind takes its flags and its options from the mount the source is
+/// on, not from the call (`do_loopback` is handed no flags, and `clone_mnt`
+/// copies the old mount's): a bind of a directory in a `nosuid,nodev,noexec`
+/// mount is all three, and one of a read-only mount is read-only. They came
+/// from the call before, so a bind of a directory in `/tmp` lost its
+/// `nosuid` and `nodev`. Linux ignores the flags and the option string of a
+/// plain bind, and makes a bind read-only with a remount after it.
+fn bind_from(root: &Arc<MNode>, table: &Table, source: &str, target: &str) -> LxResult<()> {
     let mount_node = resolve_from(root, target)?;
     let source_node = resolve_from(root, source)?;
     if source_node.metadata()?.type_ != FileType::Dir {
         return Err(LxError::ENOTDIR);
     }
-    let state = Arc::new(mount_state::MountState::from_options(flags, data));
+    // The filesystem under it is the source's, so the line names the device
+    // and type of the mount the source is on, not the path it was reached by
+    // and "none", and the directory of it the bind shows: Linux copies
+    // `mnt_devname`, keeps the superblock and roots the mount at the dentry.
+    // Asked before anything is mounted, and with the table let go again: a
+    // mount takes the tree first and the table after it.
+    let origin = super::origin_in(&table.lock(), source);
+    let (origin, fstype, fs_root, opts) = origin.unwrap_or_else(|| {
+        (
+            String::from(source),
+            String::from("none"),
+            String::from("/"),
+            String::from("rw"),
+        )
+    });
+    // Its own copy: a remount of the bind changes the bind, not its source.
+    let state = Arc::new(mount_state::MountState::from_options(0, &opts));
     let fs = wrap_fs_at(
         source_node.backing_fs(),
         source_node.backing_inode(),
         state.clone(),
     );
     mount_node.mount(fs).map_err(LxError::from)?;
-    let opts = build_options_string(flags, data);
-    // The filesystem under it is the source's, so the line names the device
-    // and type of the mount the source is on, not the path it was reached by
-    // and "none", and the directory of it the bind shows: Linux copies
-    // `mnt_devname`, keeps the superblock and roots the mount at the dentry.
-    let mut mounts = table.lock();
-    let (origin, fstype, fs_root) = super::origin_in(&mounts, source).unwrap_or_else(|| {
-        (
-            String::from(source),
-            String::from("none"),
-            String::from("/"),
-        )
-    });
     let entry = MountEntry {
         root: fs_root,
         ..super::new_mount_entry(&origin, target, &fstype, &opts, Some(state))
     };
-    super::record_mount(&mut mounts, entry);
+    super::record_mount(&mut table.lock(), entry);
     Ok(())
 }
 

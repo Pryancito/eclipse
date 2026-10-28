@@ -730,12 +730,12 @@ fn new_mount_entry(
     }
 }
 
-/// The source, type and root a bind of `path` shows: the source and type of
-/// the mount `path` is on, the top one at the longest mount point holding it
-/// as [`mountinfo::parent_of`] finds it, and that mount's root with the rest
-/// of `path` after it: with `/tmp/d` bound at `/b`, a bind of `/b/x` shows
-/// `/d/x` of the filesystem at `/tmp`.
-fn origin_in(mounts: &[MountEntry], path: &str) -> Option<(String, String, String)> {
+/// The source, type, root and options a bind of `path` shows: the source,
+/// type and options of the mount `path` is on, the top one at the longest
+/// mount point holding it as [`mountinfo::parent_of`] finds it, and that
+/// mount's root with the rest of `path` after it: with `/tmp/d` bound at
+/// `/b`, a bind of `/b/x` shows `/d/x` of the filesystem at `/tmp`.
+fn origin_in(mounts: &[MountEntry], path: &str) -> Option<(String, String, String, String)> {
     let path = normalize_mount_target(path);
     let on = mounts
         .iter()
@@ -750,7 +750,12 @@ fn origin_in(mounts: &[MountEntry], path: &str) -> Option<(String, String, Strin
         _ if on.root == "/" => String::from(inside),
         _ => alloc::format!("{}{}", on.root, inside),
     };
-    Some((on.source.clone(), on.fstype.clone(), root))
+    Some((
+        on.source.clone(),
+        on.fstype.clone(),
+        root,
+        on.options.clone(),
+    ))
 }
 
 /// Whether a mount is recorded at `target`, and if so whether the top one

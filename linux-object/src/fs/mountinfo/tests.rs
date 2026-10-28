@@ -217,17 +217,28 @@ fn a_bind_shows_the_source_and_type_of_what_it_took() {
     // /tmp/p55/c /tmp/p55/e` over two mounts there showed `tmpfs2`.
     let t = table(&[
         ("tmpfs", "/tmp/p55/c", "tmpfs", "rw"),
-        ("tmpfs2", "/tmp/p55/c", "tmpfs", "rw"),
+        ("tmpfs2", "/tmp/p55/c", "tmpfs", "rw,nosuid"),
     ]);
+    // And its options, which are the bind's (SURVEY36 on Linux 6.18).
     assert_eq!(
         origin_in(&t, "/tmp/p55/c/"),
-        Some(("tmpfs2".into(), "tmpfs".into(), "/".into()))
+        Some((
+            "tmpfs2".into(),
+            "tmpfs".into(),
+            "/".into(),
+            "rw,nosuid".into()
+        ))
     );
     assert_eq!(origin_in(&t, "/tmp/p55"), None);
     // A directory inside it: the same mount, rooted at the directory.
     assert_eq!(
         origin_in(&t, "/tmp/p55/c/d/e"),
-        Some(("tmpfs2".into(), "tmpfs".into(), "/d/e".into()))
+        Some((
+            "tmpfs2".into(),
+            "tmpfs".into(),
+            "/d/e".into(),
+            "rw,nosuid".into()
+        ))
     );
     assert_eq!(origin_in(&t, "/tmp/p55/cd"), None, "not inside /tmp/p55/c");
     // And no word of its own: `bind` is what the call did.
@@ -245,10 +256,15 @@ fn a_bind_of_a_directory_inside_a_bind_has_the_two_roots_joined() {
     ]);
     assert_eq!(
         origin_in(&t, "/etc/x"),
-        Some(("/dev/vda".into(), "ext4".into(), "/etc/x".into()))
+        Some((
+            "/dev/vda".into(),
+            "ext4".into(),
+            "/etc/x".into(),
+            "rw".into()
+        ))
     );
     assert_eq!(origin_in(&t, "/").unwrap().2, "/");
-    let (source, fstype, root) = origin_in(&t, "/tmp/s59d").unwrap();
+    let (source, fstype, root, _) = origin_in(&t, "/tmp/s59d").unwrap();
     assert_eq!((source.as_str(), root.as_str()), ("s59a", "/s59d"));
     let bind = MountEntry {
         root,
@@ -257,7 +273,7 @@ fn a_bind_of_a_directory_inside_a_bind_has_the_two_roots_joined() {
     record_mount(&mut t, bind);
     assert_eq!(
         origin_in(&t, "/run/s59/b/x"),
-        Some(("s59a".into(), "tmpfs".into(), "/s59d/x".into()))
+        Some(("s59a".into(), "tmpfs".into(), "/s59d/x".into(), "rw".into()))
     );
     assert_eq!(origin_in(&t, "/run/s59/b").unwrap().2, "/s59d");
     // A move takes the root with it.

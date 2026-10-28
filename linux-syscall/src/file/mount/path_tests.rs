@@ -18,13 +18,13 @@ use rcore_fs_ramfs::RamFS;
 use zircon_object::task::{Process, ROOT_JOB};
 
 const MS_RDONLY: usize = 1;
-const MNT_DETACH: usize = 2;
+pub(super) const MNT_DETACH: usize = 2;
 const AN_UNKNOWN_UMOUNT_FLAG: usize = 0x8000;
 
 /// A root process whose root holds, under `/<top>`: `src/d/mark`, `run/b`,
 /// `run/c`, `run/link` -> `/<top>/run/b`, `run/rel` -> `b`, `run/srclink`
 /// -> `/<top>/src/d` and `run/dangling` -> `/<top>/run/nowhere`.
-fn a_process(pid: KoID, top: &str) -> Arc<Process> {
+pub(super) fn a_process(pid: KoID, top: &str) -> Arc<Process> {
     let lp = LinuxProcess::new(RamFS::new(), 0);
     let link = |dir: &Arc<dyn INode>, name: &str, to: &str| {
         let l = dir.create(name, FileType::SymLink, 0o777).unwrap();
@@ -45,15 +45,15 @@ fn a_process(pid: KoID, top: &str) -> Arc<Process> {
 }
 
 /// A NUL-terminated copy, and a pointer to it, or NULL for no string.
-fn c(s: &str) -> String {
+pub(super) fn c(s: &str) -> String {
     format!("{}\0", s)
 }
 
-fn at(s: &Option<String>) -> UserInPtr<u8> {
+pub(super) fn at(s: &Option<String>) -> UserInPtr<u8> {
     UserInPtr::from(s.as_ref().map_or(0, |s| s.as_ptr() as usize))
 }
 
-fn mount(
+pub(super) fn mount(
     sys: &Syscall<'_>,
     source: Option<&str>,
     target: &str,
@@ -70,11 +70,11 @@ fn mount(
     )
 }
 
-fn bind(sys: &Syscall<'_>, source: &str, target: &str) -> SysResult {
+pub(super) fn bind(sys: &Syscall<'_>, source: &str, target: &str) -> SysResult {
     mount(sys, Some(source), target, None, MS_BIND)
 }
 
-fn umount(sys: &Syscall<'_>, target: &str, flags: usize) -> SysResult {
+pub(super) fn umount(sys: &Syscall<'_>, target: &str, flags: usize) -> SysResult {
     sys.sys_umount2(at(&Some(c(target))), flags)
 }
 
@@ -82,17 +82,17 @@ fn chdir(sys: &Syscall<'_>, path: &str) {
     sys.sys_chdir(at(&Some(c(path)))).unwrap();
 }
 
-fn exists(sys: &Syscall<'_>, path: &str) -> bool {
+pub(super) fn exists(sys: &Syscall<'_>, path: &str) -> bool {
     sys.linux_process().lookup_inode(path).is_ok()
 }
 
 /// The roots of the lines `/proc/self/mountinfo` has at `point`, in order.
-fn roots_at(sys: &Syscall<'_>, point: &str) -> Vec<String> {
+pub(super) fn roots_at(sys: &Syscall<'_>, point: &str) -> Vec<String> {
     field_at(sys, point, 3)
 }
 
 /// The options of those lines.
-fn options_at(sys: &Syscall<'_>, point: &str) -> Vec<String> {
+pub(super) fn options_at(sys: &Syscall<'_>, point: &str) -> Vec<String> {
     field_at(sys, point, 5)
 }
 
