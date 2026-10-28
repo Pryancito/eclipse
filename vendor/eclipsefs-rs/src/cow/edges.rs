@@ -1679,7 +1679,10 @@ fn a_failed_move_keeps_holding_the_stripes_it_moved_off() {
             );
         }
     }
-    assert!(seen > 0, "no failure left anything held, so nothing was measured");
+    assert!(
+        seen > 0,
+        "no failure left anything held, so nothing was measured"
+    );
 }
 
 /// What is held is the stripe the chunk moved off, so the length it is held
