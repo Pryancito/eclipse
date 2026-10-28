@@ -640,6 +640,15 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // the corruption/triple-fault chain this caused).
     #[cfg(target_arch = "x86_64")]
     memory::reserve_active_page_table_frames();
+    // Reclaim: tell the allocator which caches can give memory back, now that
+    // it has its regions and before anything can fill them. Until this existed
+    // the only answer to a shortage was a bigger cap, which is why the kernel
+    // heap is 512 MiB. The answer says whether the registry took it; a `false`
+    // here means `shrinker::MAX_SHRINKERS` needs raising, and the only cost of
+    // missing it is that the cache stops being reclaimable.
+    if !linux_object::fs::register_shrinkers() {
+        log::error!("shrinker registry is full: the ELF image cache will not be reclaimed");
+    }
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
     // Bring up the hunter security subsystem. Register the monotonic clock
