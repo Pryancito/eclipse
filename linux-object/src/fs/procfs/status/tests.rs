@@ -144,6 +144,7 @@ fn the_file_has_linux_s_lines_in_linux_s_order() {
             "NSpgid",
             "NSsid",
             "Kthread",
+            "VmPeak",
             "VmSize",
             "VmRSS",
             "VmData",
