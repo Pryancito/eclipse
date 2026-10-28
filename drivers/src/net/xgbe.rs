@@ -2058,6 +2058,181 @@ pub const fn rx_is_tunnelled(desc2: u32) -> bool {
     get_bits(desc2, RX_DESC2_TNP.0, RX_DESC2_TNP.1) != 0
 }
 
+// ——— Interrupts: enabling them, and reading what fired ———
+
+/// `DMA_CH_IER_TIE`, index 0: a frame finished transmitting.
+pub const DMA_CH_IER_TIE: (u32, u32) = (0, 1);
+/// `DMA_CH_IER_TXSE`, index 1: the transmit process stopped.
+pub const DMA_CH_IER_TXSE: (u32, u32) = (1, 1);
+/// `DMA_CH_IER_TBUE`, index 2: the transmit ring ran out of descriptors.
+pub const DMA_CH_IER_TBUE: (u32, u32) = (2, 1);
+/// `DMA_CH_IER_RIE`, index 6: a frame arrived.
+pub const DMA_CH_IER_RIE: (u32, u32) = (6, 1);
+/// `DMA_CH_IER_RBUE`, index 7: the receive ring ran out of descriptors.
+pub const DMA_CH_IER_RBUE: (u32, u32) = (7, 1);
+/// `DMA_CH_IER_RSE`, index 8: the receive process stopped.
+pub const DMA_CH_IER_RSE: (u32, u32) = (8, 1);
+/// `DMA_CH_IER_FBEE`, index 12: a fatal bus error.
+pub const DMA_CH_IER_FBEE: (u32, u32) = (12, 1);
+
+/// `DMA_CH_IER_AIE`, index 14: the abnormal interrupt summary, on a core at
+/// [`FLUSH_MIN_SNPSVER`] or above.
+pub const DMA_CH_IER_AIE: (u32, u32) = (14, 1);
+/// `DMA_CH_IER_NIE`, index 15: the normal interrupt summary, on a core at
+/// [`FLUSH_MIN_SNPSVER`] or above.
+pub const DMA_CH_IER_NIE: (u32, u32) = (15, 1);
+/// `DMA_CH_IER_AIE20`, index 15: the abnormal summary on an older core.
+///
+/// The same bit 15 that is `NIE` above. The two summary bits shifted by one
+/// when the core moved to 0x21, so a mask built for the new layout and
+/// written to an old core enables the ABNORMAL summary where it meant the
+/// normal one, and leaves the normal one off --- an interface that reports
+/// bus errors and never reports a received frame.
+pub const DMA_CH_IER_AIE20: (u32, u32) = (15, 1);
+/// `DMA_CH_IER_NIE20`, index 16: the normal summary on an older core.
+pub const DMA_CH_IER_NIE20: (u32, u32) = (16, 1);
+
+/// `DMA_CH_SR_TI`, index 0.
+pub const DMA_CH_SR_TI: (u32, u32) = (0, 1);
+/// `DMA_CH_SR_TPS`, index 1.
+pub const DMA_CH_SR_TPS: (u32, u32) = (1, 1);
+/// `DMA_CH_SR_TBU`, index 2.
+pub const DMA_CH_SR_TBU: (u32, u32) = (2, 1);
+/// `DMA_CH_SR_RI`, index 6.
+pub const DMA_CH_SR_RI: (u32, u32) = (6, 1);
+/// `DMA_CH_SR_RBU`, index 7.
+pub const DMA_CH_SR_RBU: (u32, u32) = (7, 1);
+/// `DMA_CH_SR_RPS`, index 8.
+pub const DMA_CH_SR_RPS: (u32, u32) = (8, 1);
+/// `DMA_CH_SR_FBE`, index 12.
+pub const DMA_CH_SR_FBE: (u32, u32) = (12, 1);
+
+/// The two summary enables for a core of this version: `(normal, abnormal)`.
+/// Everything below bit 14 kept its place; only these two moved.
+#[inline]
+pub const fn summary_enables(snps_ver: u8) -> ((u32, u32), (u32, u32)) {
+    if snps_ver < FLUSH_MIN_SNPSVER {
+        (DMA_CH_IER_NIE20, DMA_CH_IER_AIE20)
+    } else {
+        (DMA_CH_IER_NIE, DMA_CH_IER_AIE)
+    }
+}
+
+/// Build a channel's interrupt enable mask. `xgbe_enable_dma_interrupts`'s
+/// `curr_ier`, for the case this driver has: one interrupt for the whole
+/// device, so both the transmit-complete and receive-complete enables are
+/// wanted.
+///
+/// `RBUE` goes on for a receive ring but there is no `TBUE` for a transmit
+/// one. A transmit ring running dry is the ordinary state of an idle
+/// interface and the driver refills it when it next sends; a receive ring
+/// running dry means frames are being dropped on the floor and somebody has
+/// to be told.
+#[inline]
+pub const fn channel_interrupt_mask(snps_ver: u8, has_tx: bool, has_rx: bool) -> u32 {
+    let (nie, aie) = summary_enables(snps_ver);
+    let mut ier = (1 << nie.0) | (1 << aie.0) | (1 << DMA_CH_IER_FBEE.0);
+    if has_tx {
+        ier |= 1 << DMA_CH_IER_TIE.0;
+    }
+    if has_rx {
+        ier |= (1 << DMA_CH_IER_RBUE.0) | (1 << DMA_CH_IER_RIE.0);
+    }
+    ier
+}
+
+/// Turn a channel's interrupts on: acknowledge whatever is already pending,
+/// then write the mask whole.
+///
+/// The order is not a style choice. A bit left standing in the status
+/// register from before the mask lands fires the instant it does, and the
+/// handler then runs for an event that happened while the interface was
+/// down. And the mask is written WHOLE rather than OR'd in, because the
+/// summary bits moved between core versions: a read-modify-write would
+/// preserve the other version's summary bit from whatever configuration ran
+/// before.
+pub fn enable_channel_interrupts(
+    acc: &dyn MmioAccess,
+    channel: u32,
+    snps_ver: u8,
+    has_tx: bool,
+    has_rx: bool,
+) {
+    ack_channel_interrupts(acc, channel);
+    acc.write32(
+        dma_channel_reg(channel, DMA_CH_IER),
+        channel_interrupt_mask(snps_ver, has_tx, has_rx),
+    );
+}
+
+/// Turn a channel's interrupts off. Zero is zero in either layout, so this
+/// one does not need the version.
+#[inline]
+pub fn disable_channel_interrupts(acc: &dyn MmioAccess, channel: u32) {
+    acc.write32(dma_channel_reg(channel, DMA_CH_IER), 0);
+}
+
+/// Acknowledge a channel's pending interrupts, and return what was pending.
+///
+/// The status register is write-one-to-clear, so it is cleared by writing
+/// back exactly what was read: writing a zero clears NOTHING, and writing all
+/// ones would acknowledge events that had not happened. Reading first is also
+/// what makes this the handler's one call --- the bits are gone after the
+/// write, so a second read would come back empty.
+pub fn ack_channel_interrupts(acc: &dyn MmioAccess, channel: u32) -> u32 {
+    let reg = dma_channel_reg(channel, DMA_CH_SR);
+    let status = acc.read32(reg);
+    acc.write32(reg, status);
+    status
+}
+
+/// What a channel's status register was reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DmaStatus {
+    /// `TI`: a frame went out.
+    pub tx_complete: bool,
+    /// `RI`: a frame came in.
+    pub rx_complete: bool,
+    /// `TBU`: the transmit ring is empty. Expected on an idle interface.
+    pub tx_buffer_unavailable: bool,
+    /// `RBU`: the receive ring is empty, and frames are being dropped.
+    pub rx_buffer_unavailable: bool,
+    /// `TPS`: the transmit process stopped.
+    pub tx_stopped: bool,
+    /// `RPS`: the receive process stopped.
+    pub rx_stopped: bool,
+    /// `FBE`: a fatal bus error. Nothing short of a reset recovers from this.
+    pub fatal_bus_error: bool,
+}
+
+/// Decode a channel status word.
+#[inline]
+pub const fn decode_dma_status(sr: u32) -> DmaStatus {
+    DmaStatus {
+        tx_complete: get_bits(sr, DMA_CH_SR_TI.0, DMA_CH_SR_TI.1) != 0,
+        rx_complete: get_bits(sr, DMA_CH_SR_RI.0, DMA_CH_SR_RI.1) != 0,
+        tx_buffer_unavailable: get_bits(sr, DMA_CH_SR_TBU.0, DMA_CH_SR_TBU.1) != 0,
+        rx_buffer_unavailable: get_bits(sr, DMA_CH_SR_RBU.0, DMA_CH_SR_RBU.1) != 0,
+        tx_stopped: get_bits(sr, DMA_CH_SR_TPS.0, DMA_CH_SR_TPS.1) != 0,
+        rx_stopped: get_bits(sr, DMA_CH_SR_RPS.0, DMA_CH_SR_RPS.1) != 0,
+        fatal_bus_error: get_bits(sr, DMA_CH_SR_FBE.0, DMA_CH_SR_FBE.1) != 0,
+    }
+}
+
+/// Whether anything in this status needs the driver to act. A status of all
+/// zeroes happens: on a shared line another device's interrupt brings the
+/// handler here too.
+#[inline]
+pub const fn dma_status_is_quiet(s: &DmaStatus) -> bool {
+    !(s.tx_complete
+        || s.rx_complete
+        || s.tx_buffer_unavailable
+        || s.rx_buffer_unavailable
+        || s.tx_stopped
+        || s.rx_stopped
+        || s.fatal_bus_error)
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
@@ -4860,5 +5035,200 @@ mod tests {
         // It is bit 11 of desc2, above the ten-bit header length, so a full
         // header length does not look like a tunnel.
         assert!(!rx_is_tunnelled(0x3ff));
+    }
+
+    // ——— Tanda 13: interrupts ———
+
+    #[test]
+    fn bit_fifteen_is_a_different_summary_on_each_core() {
+        // The headline trap. On a core below 0x21 bit 15 is the ABNORMAL
+        // summary; from 0x21 it is the NORMAL one.
+        let (old_n, old_a) = summary_enables(0x20);
+        let (new_n, new_a) = summary_enables(0x21);
+        assert_eq!(old_a.0, 15);
+        assert_eq!(new_n.0, 15);
+        assert_eq!(old_n.0, 16);
+        assert_eq!(new_a.0, 14);
+        // So the two layouts share no summary bit meaning at all.
+        assert_ne!(old_n.0, new_n.0);
+        assert_ne!(old_a.0, new_a.0);
+    }
+
+    #[test]
+    fn the_new_layout_written_to_an_old_core_would_enable_the_wrong_summary() {
+        // Spelled out, because this is what the version check buys. The new
+        // mask's "normal summary" bit is the old core's ABNORMAL one, and
+        // the old core's normal summary is left off entirely.
+        let new_mask = channel_interrupt_mask(0x21, true, true);
+        let (old_n, old_a) = summary_enables(0x20);
+        assert_ne!(new_mask & (1 << old_a.0), 0, "would enable the abnormal");
+        assert_eq!(new_mask & (1 << old_n.0), 0, "and never the normal");
+        // The right mask for that core has it the other way round.
+        let old_mask = channel_interrupt_mask(0x20, true, true);
+        assert_ne!(old_mask & (1 << old_n.0), 0);
+        assert_ne!(old_mask & (1 << old_a.0), 0);
+    }
+
+    #[test]
+    fn everything_below_the_summaries_stayed_put() {
+        // Only the two summary bits moved. A test that let the rest drift
+        // with them would hide the next version's change.
+        let old = channel_interrupt_mask(0x20, true, true);
+        let new = channel_interrupt_mask(0x21, true, true);
+        let below = (1 << 14) - 1;
+        assert_eq!(old & below, new & below);
+        assert_eq!(
+            old & below,
+            (1 << DMA_CH_IER_FBEE.0)
+                | (1 << DMA_CH_IER_TIE.0)
+                | (1 << DMA_CH_IER_RBUE.0)
+                | (1 << DMA_CH_IER_RIE.0)
+        );
+    }
+
+    #[test]
+    fn a_dry_receive_ring_is_reported_and_a_dry_transmit_ring_is_not() {
+        let mask = channel_interrupt_mask(0x21, true, true);
+        assert_ne!(mask & (1 << DMA_CH_IER_RBUE.0), 0);
+        // No TBUE: an idle interface's transmit ring is empty all the time,
+        // and an interrupt for it would fire forever.
+        assert_eq!(mask & (1 << DMA_CH_IER_TBUE.0), 0);
+    }
+
+    #[test]
+    fn a_channel_with_no_ring_gets_only_the_summaries_and_the_bus_error() {
+        let mask = channel_interrupt_mask(0x21, false, false);
+        let (nie, aie) = summary_enables(0x21);
+        assert_eq!(mask, (1 << nie.0) | (1 << aie.0) | (1 << DMA_CH_IER_FBEE.0));
+        // Transmit only, and receive only, each add just their own.
+        let tx = channel_interrupt_mask(0x21, true, false);
+        assert_eq!(tx, mask | (1 << DMA_CH_IER_TIE.0));
+        let rx = channel_interrupt_mask(0x21, false, true);
+        assert_eq!(
+            rx,
+            mask | (1 << DMA_CH_IER_RBUE.0) | (1 << DMA_CH_IER_RIE.0)
+        );
+    }
+
+    #[test]
+    fn the_fatal_bus_error_is_enabled_whatever_the_channel_carries() {
+        for (tx, rx) in [(false, false), (true, false), (false, true), (true, true)] {
+            for ver in [0x20u8, 0x21, 0x30] {
+                let mask = channel_interrupt_mask(ver, tx, rx);
+                assert_ne!(mask & (1 << DMA_CH_IER_FBEE.0), 0, "{} {} {}", ver, tx, rx);
+            }
+        }
+    }
+
+    #[test]
+    fn acknowledging_writes_back_exactly_what_it_read() {
+        let fake = FakeXgmac::new();
+        fake.preload(dma_channel_reg(2, DMA_CH_SR), 0x0000_1041);
+        let seen = ack_channel_interrupts(&fake, 2);
+        assert_eq!(seen, 0x0000_1041);
+        // Write-one-to-clear: a zero would clear nothing and all ones would
+        // acknowledge events that never happened.
+        let log = fake.log();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0], Access::Read(dma_channel_reg(2, DMA_CH_SR)));
+        assert_eq!(
+            log[1],
+            Access::Write(dma_channel_reg(2, DMA_CH_SR), 0x0000_1041)
+        );
+    }
+
+    #[test]
+    fn enabling_clears_the_stale_bits_before_it_arms_anything() {
+        let fake = FakeXgmac::new();
+        fake.preload(dma_channel_reg(0, DMA_CH_SR), 0x0000_0041);
+        enable_channel_interrupts(&fake, 0, 0x21, true, true);
+        let log = fake.log();
+        // Read status, clear it, THEN arm. The other order fires the handler
+        // the instant the mask lands, for an event from before the interface
+        // was up.
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0], Access::Read(dma_channel_reg(0, DMA_CH_SR)));
+        assert_eq!(
+            log[1],
+            Access::Write(dma_channel_reg(0, DMA_CH_SR), 0x0000_0041)
+        );
+        assert_eq!(
+            log[2],
+            Access::Write(
+                dma_channel_reg(0, DMA_CH_IER),
+                channel_interrupt_mask(0x21, true, true)
+            )
+        );
+    }
+
+    #[test]
+    fn the_mask_is_written_whole_and_not_merged_in() {
+        let fake = FakeXgmac::new();
+        // A configuration from before, with the OTHER version's summary bit
+        // set. A read-modify-write would keep it.
+        fake.preload(dma_channel_reg(1, DMA_CH_IER), 0xffff_ffff);
+        enable_channel_interrupts(&fake, 1, 0x21, true, true);
+        assert_eq!(
+            fake.reads_of(dma_channel_reg(1, DMA_CH_IER)),
+            0,
+            "the enable register must never be read"
+        );
+        let written = fake
+            .log()
+            .iter()
+            .filter_map(|a| match a {
+                Access::Write(off, v) if *off == dma_channel_reg(1, DMA_CH_IER) => Some(*v),
+                _ => None,
+            })
+            .last();
+        assert_eq!(written, Some(channel_interrupt_mask(0x21, true, true)));
+    }
+
+    #[test]
+    fn disabling_needs_no_version_because_zero_is_zero() {
+        let fake = FakeXgmac::new();
+        disable_channel_interrupts(&fake, 3);
+        let log = fake.log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0], Access::Write(dma_channel_reg(3, DMA_CH_IER), 0));
+    }
+
+    #[test]
+    fn the_status_bits_decode_one_at_a_time() {
+        // Each bit alone, so a wrong index shows up as the wrong flag rather
+        // than disappearing into a combination.
+        let cases: [(u32, fn(&DmaStatus) -> bool); 7] = [
+            (DMA_CH_SR_TI.0, |s| s.tx_complete),
+            (DMA_CH_SR_TPS.0, |s| s.tx_stopped),
+            (DMA_CH_SR_TBU.0, |s| s.tx_buffer_unavailable),
+            (DMA_CH_SR_RI.0, |s| s.rx_complete),
+            (DMA_CH_SR_RBU.0, |s| s.rx_buffer_unavailable),
+            (DMA_CH_SR_RPS.0, |s| s.rx_stopped),
+            (DMA_CH_SR_FBE.0, |s| s.fatal_bus_error),
+        ];
+        for (bit, get) in cases {
+            let s = decode_dma_status(1 << bit);
+            assert!(get(&s), "bit {} did not set its flag", bit);
+            assert!(!dma_status_is_quiet(&s));
+            // ... and nothing else came on with it.
+            let mut others = 0;
+            for (other, get_other) in cases {
+                if other != bit && get_other(&s) {
+                    others += 1;
+                }
+            }
+            assert_eq!(others, 0, "bit {} set more than its own flag", bit);
+        }
+    }
+
+    #[test]
+    fn a_status_of_nothing_is_a_real_case() {
+        // On a shared line another device's interrupt brings the handler
+        // here too, and the handler must not treat that as a received frame.
+        let s = decode_dma_status(0);
+        assert_eq!(s, DmaStatus::default());
+        assert!(dma_status_is_quiet(&s));
+        // Bits the driver does not decode do not make it noisy either.
+        assert!(dma_status_is_quiet(&decode_dma_status(1 << 20)));
     }
 }
