@@ -16,6 +16,7 @@ use super::super::rings::*;
 use super::*;
 use crate::net::get_sockets;
 use crate::utils::deferred_job::{drain_deferred_jobs, pending_deferred_jobs};
+use crate::utils::devicetree::Node;
 
 const IRQ: usize = 29;
 
@@ -28,6 +29,7 @@ fn interfaz(hw: &Hw) -> GenetInterface {
             IRQ,
             Some(DEFAULT_PHY_ADDR),
             true,
+            None,
         )
     }
     .expect("un GENET sano tiene que arrancar")
@@ -186,7 +188,7 @@ fn a_genet_that_is_not_a_v5_does_not_come_up() {
     // usarlo. La generacion es lo unico que se puede comprobar antes.
     let hw = Hw::new();
     hw.poke(SYS_REV_CTRL, 3 << 24);
-    let r = unsafe { genet_init(String::from("eth0"), hw.base(), IRQ, Some(1), true) };
+    let r = unsafe { genet_init(String::from("eth0"), hw.base(), IRQ, Some(1), true, None) };
     assert!(
         r.is_err(),
         "un GENET de otra generacion tiene que rechazarse"
@@ -199,7 +201,7 @@ fn a_phy_that_cannot_be_read_stops_the_bring_up() {
     // las pone en ningun cable.
     let hw = Hw::new();
     hw.faults(|f| f.mdio_read_fail = true);
-    let r = unsafe { genet_init(String::from("eth0"), hw.base(), IRQ, Some(1), true) };
+    let r = unsafe { genet_init(String::from("eth0"), hw.base(), IRQ, Some(1), true, None) };
     assert_eq!(r.err(), Some(DeviceError::NotReady));
 }
 
@@ -208,7 +210,7 @@ fn the_bus_is_scanned_when_the_device_tree_declares_no_address() {
     let hw = Hw::new();
     hw.set_phy_present(7);
     hw.faults(|f| f.mdio_mute = vec![DEFAULT_PHY_ADDR]);
-    let iface = unsafe { genet_init(String::from("eth0"), hw.base(), IRQ, None, true) }
+    let iface = unsafe { genet_init(String::from("eth0"), hw.base(), IRQ, None, true, None) }
         .expect("un PHY en otra direccion tiene que encontrarse");
     assert_eq!(iface.driver.phy_addr, 7);
 }
@@ -499,4 +501,125 @@ fn the_interface_answers_with_its_own_name() {
     assert_eq!(iface.ifname(), "eth0");
     assert!(!iface.is_loopback());
     assert_eq!(Scheme::name(&iface), "genet");
+}
+
+// ---------------------------------------------------------------------------
+// El arranque desde el device tree
+// ---------------------------------------------------------------------------
+
+/// El nodo del GENET de la Pi 4, con su bus MDIO y su PHY colgando.
+fn nodo_de_la_pi(phy: u32, mac: Option<Vec<u8>>, modo: Option<&str>) -> Node {
+    use alloc::string::ToString;
+    let cells = |v: u32| v.to_be_bytes().to_vec();
+    let strs = |s: &str| {
+        let mut out = s.as_bytes().to_vec();
+        out.push(0);
+        out
+    };
+    let mut props = vec![("compatible".to_string(), strs("brcm,bcm2711-genet-v5"))];
+    if let Some(modo) = modo {
+        props.push(("phy-mode".to_string(), strs(modo)));
+    }
+    if let Some(mac) = mac {
+        props.push(("local-mac-address".to_string(), mac));
+    }
+    Node {
+        name: "ethernet@7d580000".to_string(),
+        props,
+        children: vec![Node {
+            name: "mdio@e14".to_string(),
+            props: vec![],
+            children: vec![Node {
+                name: "ethernet-phy@1".to_string(),
+                props: vec![("reg".to_string(), cells(phy))],
+                children: vec![],
+            }],
+        }],
+    }
+}
+
+#[test]
+fn the_tree_says_which_phy_and_which_mac() {
+    // Es el camino que corre en el arranque de verdad: la sonda no sabe nada
+    // del GENET, solo le pasa el nodo.
+    let hw = Hw::new();
+    hw.set_phy_present(1);
+    let placa = vec![0xDC, 0xA6, 0x32, 0x11, 0x22, 0x33];
+    let nodo = nodo_de_la_pi(1, Some(placa.clone()), Some("rgmii-rxid"));
+    let iface = unsafe { genet_from_dt(String::from("eth0"), &nodo, hw.base(), IRQ) }
+        .expect("el nodo de la Pi 4 tiene que arrancar");
+
+    assert_eq!(iface.driver.phy_addr, 1);
+    assert_eq!(iface.get_mac().as_bytes(), &placa[..]);
+    assert!(
+        iface.driver.id_mode_dis,
+        "rgmii-rxid deja el retardo al PHY"
+    );
+}
+
+#[test]
+fn the_mac_from_the_tree_wins_over_the_one_in_the_registers() {
+    // En la Pi el firmware pone la misma en los dos sitios. Cuando no
+    // coinciden, la del arbol es la que Linux usa, y es la que el usuario ve
+    // en su configuracion de red.
+    let hw = Hw::new();
+    hw.mac().write_mac_addr(&[0xDC, 0xA6, 0x32, 0, 0, 0x11]);
+    let del_arbol = vec![0xDC, 0xA6, 0x32, 0, 0, 0x22];
+    let nodo = nodo_de_la_pi(1, Some(del_arbol.clone()), None);
+    let iface = unsafe { genet_from_dt(String::from("eth0"), &nodo, hw.base(), IRQ) }.unwrap();
+    assert_eq!(iface.get_mac().as_bytes(), &del_arbol[..]);
+    // Y queda escrita en los registros, que es lo que filtra las tramas.
+    assert_eq!(hw.mac().read_mac_addr(), [0xDC, 0xA6, 0x32, 0, 0, 0x22]);
+}
+
+#[test]
+fn a_tree_mac_that_cannot_be_a_source_address_falls_back_to_the_registers() {
+    // Un arbol con la MAC a ceros --o con el bit de multicast puesto-- no es
+    // motivo para tirar la que el firmware dejo en los registros.
+    let hw = Hw::new();
+    let buena = [0xDC, 0xA6, 0x32, 0, 0, 0x33];
+    hw.mac().write_mac_addr(&buena);
+    let nodo = nodo_de_la_pi(1, Some(vec![0; 6]), None);
+    let iface = unsafe { genet_from_dt(String::from("eth0"), &nodo, hw.base(), IRQ) }.unwrap();
+    assert_eq!(iface.get_mac().as_bytes(), &buena);
+}
+
+#[test]
+fn a_tree_that_declares_no_phy_makes_the_driver_scan_the_bus() {
+    use alloc::string::ToString;
+    let hw = Hw::new();
+    hw.set_phy_present(7);
+    hw.faults(|f| f.mdio_mute = vec![DEFAULT_PHY_ADDR]);
+    let nodo = Node {
+        name: "ethernet@7d580000".to_string(),
+        props: vec![],
+        children: vec![],
+    };
+    let iface = unsafe { genet_from_dt(String::from("eth0"), &nodo, hw.base(), IRQ) }
+        .expect("sin PHY en el arbol se barre el bus");
+    assert_eq!(iface.driver.phy_addr, 7);
+}
+
+#[test]
+fn the_rgmii_mode_of_the_tree_reaches_the_mac() {
+    // `rgmii-id` es el unico de los cuatro en el que el retardo lo pone el
+    // MAC, y eso es un bit del `EXT_RGMII_OOB_CTRL` que se escribe al ajustar
+    // el enlace. Equivocarlo da un enlace que sube y pierde tramas.
+    for (modo, espera_id_mode_dis) in [("rgmii-id", false), ("rgmii-rxid", true)] {
+        let hw = Hw::new();
+        let nodo = nodo_de_la_pi(1, None, Some(modo));
+        let iface = unsafe { genet_from_dt(String::from("eth0"), &nodo, hw.base(), IRQ) }.unwrap();
+        assert_eq!(
+            iface.driver.id_mode_dis, espera_id_mode_dis,
+            "modo {}",
+            modo
+        );
+        let oob = hw.peek(EXT_RGMII_OOB_CTRL);
+        assert_eq!(
+            oob & ID_MODE_DIS != 0,
+            espera_id_mode_dis,
+            "el modo {} no llego al EXT_RGMII_OOB_CTRL",
+            modo
+        );
+    }
 }

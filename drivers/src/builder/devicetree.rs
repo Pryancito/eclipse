@@ -341,6 +341,28 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
                     self.io_mapper.query_or_map(paddr, size)
                 })?)
             }
+            // El GENET v5 del BCM2711: la Raspberry Pi 4.
+            //
+            // Todo lo que el arbol sabe de el --la direccion MDIO del PHY, el
+            // modo del RGMII y la MAC de la placa-- lo lee
+            // [`genet_from_dt`](crate::net::genet_from_dt), que esta al lado
+            // del driver y no aqui porque aqui no hay forma de ponerle un MAC
+            // falso debajo para probarlo.
+            #[cfg(target_arch = "aarch64")]
+            c if c.contains("brcm,bcm2711-genet-v5") => {
+                // La ventana del GENET son 64 KiB y los descriptores viven
+                // DENTRO de ella: un mapeo mas corto no se nota al escribir
+                // los registros, se nota al usar los anillos.
+                let base = base_vaddr?;
+                Arc::new(unsafe {
+                    genet_from_dt(
+                        alloc::string::String::from("eth0"),
+                        node,
+                        base,
+                        irq_num as usize,
+                    )
+                }?)
+            }
             _ => return Err(DeviceError::NotSupported),
         });
 
