@@ -356,8 +356,36 @@ pub fn net_flush_deferred_packets() {
 }
 
 // 注意！这个容易出现死锁
+#[cfg(not(test))]
 pub fn get_sockets() -> Arc<Mutex<SocketSet<'static>>> {
     SOCKETS.clone()
+}
+
+/// Under test, the socket set is **per thread**.
+///
+/// `SOCKETS` is one set for the whole binary, and the harness runs the suite
+/// in parallel: a `poll` driven by one test takes that shared set and carries
+/// out the egress of sockets another test had just staged, so the other test's
+/// own `poll` reports it moved nothing. That is not a hypothetical -- two
+/// `net::loopback` tests failed one run in three (`the staged frame was lost`)
+/// and passed on their own, and the comment next to one of them claimed the
+/// suite ran `--test-threads=1`, which it does not.
+///
+/// A thread-local set is the same shape the rest of this crate already uses to
+/// stay honest under a parallel harness (`utils::dma_sync::test_flag`, every
+/// fake register window): nothing is shared, so nothing can be stolen. It
+/// changes no production path -- `cfg(not(test))` above is what the kernel
+/// links -- and it does not weaken what the tests check: a test that wants to
+/// see `poll` give up while the set is locked still locks its own set, and
+/// one that wants two interfaces over one set gets it as long as they live in
+/// the same test.
+#[cfg(test)]
+pub fn get_sockets() -> Arc<Mutex<SocketSet<'static>>> {
+    std::thread_local! {
+        static TEST_SOCKETS: Arc<Mutex<SocketSet<'static>>> =
+            Arc::new(Mutex::new(SocketSet::new(vec![])));
+    }
+    TEST_SOCKETS.with(|s| s.clone())
 }
 
 #[cfg(test)]
@@ -385,6 +413,35 @@ mod tests {
         MSI_PENDING.lock().clear();
         *MSI_IRQ_HOST.lock() = None;
         SEEN.lock().clear();
+    }
+
+    /// The socket set a test sees is **its own**, and the same one all the way
+    /// through the test.
+    ///
+    /// This is the fix for two `net::loopback` tests that failed one run in
+    /// three: with one set for the whole binary, a `poll` driven by another
+    /// thread carried out the egress of the socket this test had just staged,
+    /// and this test's own `poll` then reported it moved nothing. Nothing in
+    /// the suite shares the set, so nothing can take a packet out of it.
+    #[test]
+    fn under_test_each_thread_gets_its_own_socket_set() {
+        let mine = get_sockets();
+        assert!(
+            Arc::ptr_eq(&mine, &get_sockets()),
+            "the same thread has to get the same set, or a poll and the socket \
+             it staged would not even be in the same place"
+        );
+        let otro = std::thread::spawn(|| Arc::as_ptr(&get_sockets()) as usize)
+            .join()
+            .expect("the thread must not panic");
+        assert_ne!(
+            Arc::as_ptr(&mine) as usize,
+            otro,
+            "two threads share the socket set: one test's poll can empty another's"
+        );
+        // And the process-wide set the kernel links is still there, untouched:
+        // what changed is only which one `get_sockets` hands out under test.
+        assert!(SOCKETS.lock().iter().next().is_none());
     }
 
     /// The frames the tap was handed, in the order it got them.
