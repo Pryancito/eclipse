@@ -578,6 +578,10 @@ fn udelay(us: u64) {
     }
 }
 
+/// Los anillos DMA y el camino de las tramas.
+mod rings;
+pub use rings::GenetRings;
+
 #[cfg(test)]
 mod genet_fake;
 
@@ -586,3 +590,6 @@ mod umac_tests;
 
 #[cfg(test)]
 mod mdio_tests;
+
+#[cfg(test)]
+mod regmap_tests;
