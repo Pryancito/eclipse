@@ -2530,6 +2530,23 @@ lazy_static! {
     });
 }
 
+#[path = "elf_vmo_shrinker.rs"]
+mod elf_vmo_shrinker;
+
+#[cfg(test)]
+#[path = "elf_shrinker_tests.rs"]
+mod elf_shrinker_tests;
+
+/// Register the caches that can give memory back under pressure.
+///
+/// Called once from the kernel's boot path, after the allocator has its
+/// regions. Idempotent in the sense that matters: registering twice would
+/// take two of the registry's eight slots and ask the same cache twice, so
+/// this says in its answer whether the registration was taken.
+pub fn register_shrinkers() -> bool {
+    kernel_hal::shrinker::register(&elf_vmo_shrinker::SHRINKER)
+}
+
 /// extension for INode
 pub trait INodeExt {
     /// similar to read, but return a u8 vector
