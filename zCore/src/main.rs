@@ -45,13 +45,16 @@ mod fs;
 mod handler;
 mod invariants;
 mod platform;
+// `linux` only: the worker walks caches that belong to `linux_object`, which a
+// zircon-only kernel does not have.
+#[cfg(feature = "linux")]
+mod reclaimd;
 // `test` as well as the kernel build, and for the same reason `lang` and `oops`
 // above carry one: the hammer is gated to a bare kernel, so no job that runs
 // tests compiled a line of it -- and what it reads is the kernel command line,
 // which is a string, which is the one thing a host test answers for exactly as
 // a boot does. Nothing here calls it under `cfg(test)`; the crate-wide
 // `allow(dead_code)` at the top covers that.
-mod reclaimd;
 #[cfg(any(all(feature = "linux", not(feature = "libos")), test))]
 mod tlb_hammer;
 mod utils;
@@ -647,6 +650,11 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     // heap is 512 MiB. The answer says whether the registry took it; a `false`
     // here means `shrinker::MAX_SHRINKERS` needs raising, and the only cost of
     // missing it is that the cache stops being reclaimable.
+    // `linux` only: the caches that register are Linux's (`linux_object`), and
+    // a zircon-only kernel has no such crate to call -- the ungated version of
+    // this line is what broke `Zircon Core Test Baremetal` with E0433 on every
+    // PR, since the whole file is compiled for `LINUX=0` too.
+    #[cfg(feature = "linux")]
     if !linux_object::fs::register_shrinkers() {
         log::error!("shrinker registry is full: the ELF image cache will not be reclaimed");
     }
@@ -654,7 +662,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     kernel_hal::primary_init();
     // ... and start the worker that walks the caches direct reclaim may not:
     // evicting a page-cache entry writes its dirty pages back through the
-    // filesystem, which an allocation that has already failed cannot do.
+    // filesystem, which an allocation that has already failed cannot do. Also
+    // `linux` only, and for the same reason: every cache it walks is one of
+    // `linux_object`'s.
+    #[cfg(feature = "linux")]
     reclaimd::start();
     // Bring up the hunter security subsystem. Register the monotonic clock
     // first so the very first recorded event carries a real timestamp, then a
