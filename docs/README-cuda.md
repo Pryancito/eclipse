@@ -95,8 +95,16 @@ unos 10-20 µs.
 apt-get install -y curl zstd ca-certificates   # si aún no están
 install-ollama-cuda                 # → /usr/local (oficial .tar.zst + cuda_v*)
 cuda-status
-OLLAMA_DEBUG=1 /usr/local/bin/ollama serve
 ```
+
+El script deja además el servicio de eclipse-init
+`/etc/eclipse/services/ollama.service` (`eclipse-ollama serve`, `respawn`, log
+en `/tmp/ollama.log`): `ollama serve` se lanza en cada arranque y el init lo
+relanza si muere, así que `killall ollama` solo lo reinicia. El init lee sus
+servicios al arrancar, de modo que la primera vez es en el siguiente arranque;
+el script imprime cómo lanzarlo ya. `install-ollama-cuda --service` solo
+reescribe el servicio, sin descargar nada; `OLLAMA_SERVICE=0` no lo escribe;
+para quitarlo, borrar el fichero.
 
 El binario oficial es **glibc** (no musl). Usa el mismo runtime Ubuntu que
 `libcuda` (`/lib64/ld-linux-x86-64.so.2` + `libresolv` en
