@@ -464,6 +464,17 @@ impl<T, P: Write> UserPtr<T, P> {
         Ok(())
     }
 
+    /// The checks [`write`](Self::write) makes before its store, without the
+    /// store: whether one value could be written here now.
+    ///
+    /// For a word the caller must only find written once something exists
+    /// that is not cheap to take back, asked before making it: `clone`'s
+    /// pidfd word names a process that does not exist yet, and a word that
+    /// cannot be written must make no process at all.
+    pub fn check_writable(&self) -> Result<()> {
+        self.check_len_for(1, MMUFlags::WRITE)
+    }
+
     // 类似于写，
     // 但指针为空时返回 `Ok(())`。
     /// Same as [`write`](Self::write),

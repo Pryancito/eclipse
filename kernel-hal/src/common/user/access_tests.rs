@@ -28,6 +28,7 @@ fn a_write_into_a_page_that_may_only_be_read_is_refused_and_stores_nothing() {
     let at = pages(1, 0x5a);
     refuse_user_access(at, PAGE_SIZE, MMUFlags::WRITE);
     let mut word = UserOutPtr::<u32>::from(at);
+    assert_eq!(word.check_writable(), Err(Error::InvalidPointer));
     assert_eq!(word.write(7), Err(Error::InvalidPointer), "write");
     assert_eq!(word.write_if_not_null(7), Err(Error::InvalidPointer));
     let mut bytes = UserOutPtr::<u8>::from(at);
@@ -49,6 +50,7 @@ fn a_write_into_a_page_that_may_only_be_read_is_refused_and_stores_nothing() {
     assert_eq!(UserInPtr::<u32>::from(at).read(), Ok(0x5a5a_5a5a));
     assert_eq!(UserInOutPtr::<u32>::from(at).read(), Ok(0x5a5a_5a5a));
     allow_user_access(at, PAGE_SIZE, MMUFlags::WRITE);
+    assert_eq!(word.check_writable(), Ok(()));
     word.write(7).unwrap();
 }
 
@@ -71,6 +73,7 @@ fn a_read_from_a_page_that_may_not_be_read_is_refused() {
         "read_cstring_array"
     );
     // Writing it is still fine.
+    assert_eq!(UserOutPtr::<u8>::from(at).check_writable(), Ok(()));
     UserOutPtr::<u8>::from(at).write(b'y').unwrap();
     allow_user_access(at, PAGE_SIZE, MMUFlags::READ);
     assert_eq!(ptr.read(), Ok(b'y'));

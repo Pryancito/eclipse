@@ -2813,6 +2813,14 @@ impl LinuxProcess {
         self.inner.lock().files.len()
     }
 
+    /// Whether [`Self::add_file`] would find a descriptor now, as
+    /// `insert_file` judges it: what `clone` asks before making a child
+    /// whose pidfd must get one (Linux reserves it in `copy_process`).
+    pub fn can_add_file(&self) -> bool {
+        let mut inner = self.inner.lock();
+        usize::from(inner.get_free_fd()) < inner.nofile() && inner.files.len() < inner.nofile()
+    }
+
     /// Close file descriptor `fd`.
     ///
     /// The removed file is dropped AFTER `inner` is released. Dropping the

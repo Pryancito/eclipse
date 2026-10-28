@@ -475,6 +475,33 @@ enum ChildOf {
     CallersParent,
 }
 
+/// The words a fork-like clone writes into the caller's memory: the pidfd's
+/// number (`CLONE_PIDFD`) and the child's tid (`CLONE_PARENT_SETTID`).
+/// Linux writes both once the child exists and before it runs, in
+/// `copy_process` and `kernel_clone`, so a vfork child, which runs in that
+/// memory, finds both there.
+#[derive(Default)]
+struct ParentWords {
+    pidfd: Option<UserOutPtr<i32>>,
+    parent_tid: Option<UserOutPtr<i32>>,
+}
+
+impl ParentWords {
+    /// A pidfd that cannot be handed over makes no child: `copy_process`
+    /// reserves its descriptor (`EMFILE`) and writes its number (`EFAULT`)
+    /// before the child is anybody's to see. Here both come with the child,
+    /// so they are asked about first.
+    fn check(&self, proc: &LinuxProcess) -> LxResult<()> {
+        if let Some(slot) = &self.pidfd {
+            if !proc.can_add_file() {
+                return Err(LxError::EMFILE);
+            }
+            slot.check_writable()?;
+        }
+        Ok(())
+    }
+}
+
 /// [`ChildOf`] for a fork-like `clone` of flags word `flags`.
 ///
 /// `copy_process` gives a `CLONE_PARENT` child
@@ -686,15 +713,17 @@ impl Syscall<'_> {
         newtls: usize,
         ctid: ChildTidRequest,
         child_of: ChildOf,
+        words: ParentWords,
     ) -> LxResult<(Arc<Process>, KoID)> {
         info!("fork: newsp={:#x} newtls={:#x}", newsp, newtls);
         self.linux_process().may_start_task()?;
+        words.check(self.linux_process())?;
         let new_proc = Process::fork_from(self.zircon_process())?;
         let path = new_proc.linux().execute_path();
         if !path.is_empty() {
             new_proc.set_name(comm_from_path(&path));
         }
-        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid, child_of)?;
+        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid, child_of, words)?;
         info!("fork: {} -> {}", self.zircon_process().id(), new_proc.id());
         Ok((new_proc, tid))
     }
@@ -712,15 +741,17 @@ impl Syscall<'_> {
         ctid: ChildTidRequest,
         child_of: ChildOf,
         shares_memory: bool,
+        words: ParentWords,
     ) -> LxResult<(Arc<Process>, KoID)> {
         info!("vfork: newsp={:#x} newtls={:#x}", newsp, newtls);
         self.linux_process().may_start_task()?;
+        words.check(self.linux_process())?;
         let new_proc = if shares_memory {
             Process::vfork_from(self.zircon_process())?
         } else {
             Process::fork_from(self.zircon_process())?
         };
-        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid, child_of)?;
+        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid, child_of, words)?;
 
         let new_proc_obj: Arc<dyn KernelObject> = new_proc.clone();
         info!(
@@ -762,6 +793,7 @@ impl Syscall<'_> {
         newtls: usize,
         ctid: ChildTidRequest,
         child_of: ChildOf,
+        words: ParentWords,
     ) -> LxResult<KoID> {
         // What the child thread takes from this one -- the signal mask above
         // all, which a `fork` inherits (sigprocmask(2)). `false`: a fork does
@@ -821,7 +853,23 @@ impl Syscall<'_> {
         // credentials and seccomp filters in `copy_process`, before
         // `wake_up_new_task`, for the same reason.
         hunter::task_fork(self.zircon_process().id(), new_proc.id());
-        new_thread.start(self.thread_fn)?;
+        // The caller's words, last before `start` (see `ParentWords`). The
+        // pidfd's can still fail if another thread took the page's write
+        // permission away since `check`; the child then runs anyway, as
+        // every child did when its pidfd was handed out after it started.
+        let pidfd = words
+            .pidfd
+            .map(|slot| self.hand_out_pidfd(PidFd::new(new_proc.clone(), PIDFD_OPEN_FLAGS), slot))
+            .transpose();
+        if let Some(mut slot) = words.parent_tid {
+            let _ = slot.write_if_not_null(new_thread.id() as i32);
+        }
+        new_thread.start(self.thread_fn).inspect_err(|_| {
+            if let Ok(Some(fd)) = pidfd {
+                let _ = self.linux_process().close_file(fd);
+            }
+        })?;
+        pidfd?;
         Ok(new_thread.id())
     }
 
@@ -832,6 +880,7 @@ impl Syscall<'_> {
             newtls,
             ChildTidRequest::none(),
             ChildOf::Caller(linux_object::signal::Signal::SIGCHLD as u8),
+            ParentWords::default(),
         )
         .map(|(proc, _)| proc.id() as usize)
     }
@@ -844,6 +893,7 @@ impl Syscall<'_> {
             ChildTidRequest::none(),
             ChildOf::Caller(linux_object::signal::Signal::SIGCHLD as u8),
             true,
+            ParentWords::default(),
         )
         .await
         .map(|(proc, _)| proc.id() as usize)
@@ -882,7 +932,7 @@ impl Syscall<'_> {
         &self,
         flags: usize,
         newsp: usize,
-        mut parent_tid: UserOutPtr<i32>,
+        parent_tid: UserOutPtr<i32>,
         pidfd_slot: UserOutPtr<i32>,
         newtls: usize,
         child_tid: UserOutPtr<i32>,
@@ -987,32 +1037,28 @@ impl Syscall<'_> {
             // decides, in `child_death_policy`, whether the zombie is left at
             // all. `CLONE_PARENT` names no signal of its own: see `ChildOf`.
             let child_of = child_of_clone(clone_flags, flags);
-            let (process, tid) = if clone_flags.contains(CloneFlags::VFORK) {
+            // Written once the child exists and before it runs. A pidfd word
+            // that cannot be written makes no child; a `parent_tid` that
+            // cannot be written costs nothing, as `kernel_clone` does not
+            // look at what its `put_user` answers.
+            let words = ParentWords {
+                pidfd: clone_flags
+                    .contains(CloneFlags::PIDFD)
+                    .then_some(pidfd_slot),
+                parent_tid: clone_flags
+                    .contains(CloneFlags::PARENT_SETTID)
+                    .then_some(parent_tid),
+            };
+            let (process, _) = if clone_flags.contains(CloneFlags::VFORK) {
                 info!("sys_clone: dispatching to sys_vfork for flags {:#x}", flags);
                 let shares_memory = clone_flags.contains(CloneFlags::VM);
-                self.vfork_impl(newsp, tls, ctid, child_of, shares_memory)
+                self.vfork_impl(newsp, tls, ctid, child_of, shares_memory, words)
                     .await?
             } else {
                 info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
-                self.fork_impl(newsp, tls, ctid, child_of)?
+                self.fork_impl(newsp, tls, ctid, child_of, words)?
             };
-            let pid = process.id() as usize;
-            if clone_flags.contains(CloneFlags::PIDFD) {
-                // (Linux also unwinds the whole child when the pidfd's word
-                // faults; this one is already forked, so the child survives
-                // -- a divergence left alone on purpose, since undoing a live
-                // process is not something to bolt onto an error path.)
-                self.hand_out_pidfd(PidFd::new(process, PIDFD_OPEN_FLAGS), pidfd_slot)?;
-            }
-            // In the parent, once the child exists (Linux writes it before the
-            // child runs, but from the same clone_process, i.e. in the same
-            // window -- a caller that races its own child on this word gets
-            // the same answer there). A word it cannot write costs nothing:
-            // `kernel_clone` does not look at what its `put_user` answers.
-            if clone_flags.contains(CloneFlags::PARENT_SETTID) {
-                let _ = parent_tid.write_if_not_null(tid as i32);
-            }
-            return Ok(pid);
+            return Ok(process.id() as usize);
         }
         // Thread creation. Accept any CLONE_THREAD combination instead of the
         // two exact musl flag values: glibc's pthread_create passes 0x3d0f00
@@ -1043,9 +1089,9 @@ impl Syscall<'_> {
         // unprivileged line, and it loops.
         //
         // `terminate_abandoned` is the hook for exactly this: "this thread
-        // will never run, take it out of the list". The fork path above
-        // documents its own weaker divergence (a live child survives a
-        // faulting `parent_tid`); this one is not a divergence, it is a leak.
+        // will never run, take it out of the list". The fork path above asks
+        // about the pidfd's word before it forks, so it has no child to take
+        // back; a thread is cheap to make first and take back.
         match self.clone_start(
             &new_thread,
             tid,
@@ -3201,6 +3247,9 @@ mod clone3_tests;
 
 #[cfg(test)]
 mod clone_slots_tests;
+
+#[cfg(test)]
+mod fork_words_tests;
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod clone_tls_tests;
