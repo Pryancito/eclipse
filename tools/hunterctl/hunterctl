@@ -1,0 +1,115 @@
+#!/bin/sh
+# hunterctl — operator front end for hunter, Eclipse OS's in-kernel security
+# subsystem.
+#
+# Everything it changes goes through one door: a write to /proc/hunter, in
+# hunter's control language (see docs/hunter-security.md). The kernel checks
+# that the writer is root and applies each write all or nothing, so this
+# script holds no policy of its own -- it only spells the directives.
+#
+#   hunterctl [status]              modes, counters, lists (no event ring)
+#   hunterctl events                the full report, event ring included
+#   hunterctl mode <domain> <mode>  domain: syscall|wx|exec|anomaly
+#                                   mode:   off|report|enforce
+#   hunterctl learning <on|off>
+#   hunterctl anomaly-detection <on|off>
+#   hunterctl privileged-deny <on|off>
+#   hunterctl trust <path|dir/>     add to the exec allowlist
+#   hunterctl deny <path|dir/>      add to the exec blacklist
+#   hunterctl untrusted <dir/>      add a world-writable location
+#   hunterctl seal                  one-way: from now on, only tighten
+#   hunterctl apply <file>          send a whole policy script (e.g. policy.conf)
+#   hunterctl lockdown              enforce exec, learning off, seal
+#   hunterctl save-learned          append learned programs to the whitelist
+
+PROC=/proc/hunter
+WHITELIST=/etc/hunter/whitelist
+
+die() {
+    echo "hunterctl: $*" >&2
+    exit 1
+}
+
+usage() {
+    sed -n '/^#   hunterctl \[status\]/,/^#   hunterctl save-learned/p' "$0" | sed 's/^#//'
+    exit "${1:-0}"
+}
+
+# One write(2) per script: the kernel takes each write as a whole script, all
+# or nothing. The script goes through a regular file and a single dd block
+# larger than anything hunter accepts, because printf through stdio, or dd
+# reading a pipe, could hand a long script over in two pieces -- and two
+# halves are two different scripts.
+send() {
+    [ "$(id -u)" = 0 ] || die "must be root"
+    tmp=$(mktemp) || die "mktemp failed"
+    printf '%s\n' "$1" > "$tmp"
+    if dd if="$tmp" of="$PROC" bs=1048576 count=1 2>/dev/null; then
+        rm -f "$tmp"
+    else
+        rm -f "$tmp"
+        die "hunter rejected the script; nothing was applied (see '$0 events')"
+    fi
+}
+
+cmd=${1:-status}
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+-h|--help|help) usage 0 ;;
+esac
+
+[ -r "$PROC" ] || die "$PROC not found: is this an Eclipse OS kernel with hunter?"
+
+case "$cmd" in
+status)
+    sed '/^recent events/,$d' "$PROC"
+    ;;
+events)
+    cat "$PROC"
+    ;;
+mode)
+    [ $# -eq 2 ] || usage 1
+    send "mode $1 $2"
+    ;;
+learning|anomaly-detection|privileged-deny|trust|deny|untrusted)
+    [ $# -eq 1 ] || usage 1
+    send "$cmd $1"
+    ;;
+seal)
+    send "seal"
+    ;;
+apply)
+    [ $# -eq 1 ] || usage 1
+    [ -r "$1" ] || die "cannot read $1"
+    send "$(cat "$1")"
+    ;;
+lockdown)
+    # Exec only. W^X stays where it is because enforcing it breaks every JIT
+    # (Firefox, any JS engine), and the anomaly heuristics cost a lock on
+    # every syscall; both are a deliberate `mode` away. Whatever was learned
+    # so far stays trusted, so run save-learned first to keep it on reboot.
+    send "mode exec enforce
+learning off
+seal"
+    ;;
+save-learned)
+    [ "$(id -u)" = 0 ] || die "must be root"
+    mkdir -p "${WHITELIST%/*}"
+    touch "$WHITELIST"
+    tmp=$(mktemp) || die "mktemp failed"
+    sed -n '/^learned-programs/,/^$/{/^  /s/^  //p}' "$PROC" > "$tmp"
+    added=0
+    while IFS= read -r p; do
+        if ! grep -qxF -- "$p" "$WHITELIST"; then
+            printf '%s\n' "$p" >> "$WHITELIST"
+            added=$((added + 1))
+        fi
+    done < "$tmp"
+    rm -f "$tmp"
+    echo "hunterctl: $added program(s) added to $WHITELIST"
+    ;;
+*)
+    usage 1
+    ;;
+esac

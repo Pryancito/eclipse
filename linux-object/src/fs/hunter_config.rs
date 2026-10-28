@@ -1,10 +1,14 @@
 //! Boot-time loader for hunter's `/etc/hunter/` policy files.
 //!
-//! The kernel reads (never writes) two optional newline-delimited lists from
-//! the root filesystem at boot:
+//! The kernel reads (never writes) three optional files from the root
+//! filesystem at boot:
 //!
 //! * `/etc/hunter/whitelist` — trusted programs that may always run.
 //! * `/etc/hunter/blacklist` — denied programs that must never run.
+//! * `/etc/hunter/policy.conf` — a script in hunter's control language
+//!   (`mode exec enforce`, `learning off`, `seal`, ...; see
+//!   `hunter::control`), applied last so it can override the learning
+//!   default below and seal the result.
 //!
 //! Each non-empty, non-`#` line is one entry. A trailing `/` makes it a
 //! directory prefix (everything beneath it); otherwise it is an exact program
@@ -35,6 +39,65 @@ pub fn load(root: &Arc<dyn INode>) {
         n_white,
         n_black
     );
+    load_policy(root, POLICY_CONF);
+}
+
+/// The operator's stance: modes, learning, heuristics, extra entries, seal.
+const POLICY_CONF: &str = "/etc/hunter/policy.conf";
+
+/// Reads and applies `policy.conf`. A missing file leaves the defaults.
+///
+/// Unlike the lists, a policy that is not all there is not applied at all: a
+/// script is all or nothing (see `hunter::control`), and a cut one is a script
+/// nobody wrote. So a file over [`MAX_CONFIG_BYTES`], a short read, or bytes
+/// that are not UTF-8 are rejected whole -- recorded as a `Critical` hunter
+/// event, so the refusal is in `/proc/hunter` and on the console, not only in a
+/// boot log line nobody reads.
+fn load_policy(root: &Arc<dyn INode>, path: &str) {
+    let inode = match root.lookup(path) {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    let size = match inode.metadata() {
+        Ok(m) => m.size,
+        Err(_) => return,
+    };
+    if size > MAX_CONFIG_BYTES {
+        reject_policy(path, "larger than 1 MiB");
+        return;
+    }
+    let mut buf = vec![0u8; size];
+    if read_all(inode.as_ref(), &mut buf) < size {
+        reject_policy(path, "short read");
+        return;
+    }
+    let text = match core::str::from_utf8(&buf) {
+        Ok(t) => t,
+        Err(_) => {
+            reject_policy(path, "not UTF-8");
+            return;
+        }
+    };
+    match hunter::control::apply_script(text, path, 0) {
+        Ok(n) => kernel_hal::klog_info!("hunter: applied {} ({} directives)", path, n),
+        Err(e) => kernel_hal::klog_info!(
+            "hunter: {} REJECTED at line {}: {}",
+            path,
+            e.line,
+            e.message
+        ),
+    }
+}
+
+fn reject_policy(path: &str, why: &str) {
+    hunter::event_log::record(
+        0,
+        hunter::Severity::Critical,
+        "CONTROL",
+        "REJECTED",
+        alloc::format!("{}: {}; nothing applied", path, why),
+    );
+    kernel_hal::klog_info!("hunter: {} REJECTED: {}", path, why);
 }
 
 /// Reads one list file and registers its entries. Returns how many were added.
@@ -255,6 +318,49 @@ mod hunter_config_tests {
         assert!(hunter::policy::is_exec_listed("/a6/spaced"));
         assert!(hunter::policy::is_exec_listed("/a6/tree/anything"));
         assert!(!hunter::policy::is_exec_listed("/a6/a-comment"));
+    }
+
+    /// A root with `/etc/hunter/policy.conf` holding `text`. The filesystem
+    /// is leaked: a ramfs inode only holds it weakly, and the lookup path asks
+    /// for it.
+    fn root_with_policy(text: &[u8]) -> Arc<dyn INode> {
+        use rcore_fs::vfs::FileType;
+        let root = leaked_root();
+        let etc = root.create("etc", FileType::Dir, 0o755).unwrap();
+        let dir = etc.create("hunter", FileType::Dir, 0o755).unwrap();
+        let conf = dir.create("policy.conf", FileType::File, 0o644).unwrap();
+        conf.write_at(0, text).unwrap();
+        root
+    }
+
+    #[test]
+    fn policy_conf_is_applied_at_boot() {
+        // Tightening only, on paths of its own: the stance is global.
+        let root = root_with_policy(b"# boot policy\ndeny /a9/boot-denied\n");
+        load_policy(&root, POLICY_CONF);
+        assert!(hunter::policy::is_exec_blacklisted("/a9/boot-denied"));
+    }
+
+    #[test]
+    fn a_policy_conf_with_a_typo_applies_nothing() {
+        // The first line is fine and would be applied by a line-at-a-time
+        // reader; the second is a typo, and the whole file must be refused.
+        let root = root_with_policy(b"deny /a10/never\nmode exec enforcing\n");
+        load_policy(&root, POLICY_CONF);
+        assert!(!hunter::policy::is_exec_blacklisted("/a10/never"));
+    }
+
+    fn leaked_root() -> Arc<dyn INode> {
+        let fs = rcore_fs_ramfs::RamFS::new();
+        let root = rcore_fs::vfs::FileSystem::root_inode(&*fs);
+        core::mem::forget(fs);
+        root
+    }
+
+    #[test]
+    fn a_missing_policy_conf_is_not_an_error() {
+        let root = leaked_root();
+        load_policy(&root, POLICY_CONF);
     }
 
     /// An inode that answers every read with at most `chunk` bytes, which is

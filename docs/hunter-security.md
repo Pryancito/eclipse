@@ -48,7 +48,8 @@ variety of paths — blocking by default would risk breaking userspace. Operator
 opt into `Enforce` per domain (`policy::set_wx_mode`, `set_exec_mode`,
 `set_anomaly_mode`). The control plane can be sealed **tighten-only**
 (`policy::seal_tighten_only`) so that, after boot, no domain can be relaxed —
-only moved towards stricter enforcement.
+only moved towards stricter enforcement. Operators set all of this without
+touching kernel code through the [control plane](#control-plane-policyconf-proc-hunter-hunterctl).
 
 ### Hardening (v0.3.0)
 
@@ -123,7 +124,7 @@ lists stay empty). Example `/etc/hunter/whitelist`:
 
 Learned entries live in kernel memory and are surfaced at `/proc/hunter` under
 a `learned-programs (N):` block. The kernel deliberately does **not** write the
-filesystem; a userspace helper is expected to read that block and append new
+filesystem; `hunterctl save-learned` reads that block and appends new
 programs to `/etc/hunter/whitelist`, so the learned set survives a reboot.
 
 ### Programmatic control
@@ -136,6 +137,78 @@ policy::add_blacklisted_exec_prefix(String::from("/tmp/"));  // hard-deny a loca
 policy::add_trusted_exec_path(String::from("/srv/agent"));   // pre-trust a program
 policy::set_exec_mode(Mode::Enforce);                        // also deny non-trusted execs
 ```
+
+## Control plane: `policy.conf`, `/proc/hunter`, `hunterctl`
+
+Every knob above used to be a Rust function that only kernel code could call,
+and the kernel called none of the ones that tighten: a booted system ran
+`wx`, `exec` and `anomaly` in `Report` for good, and the tighten-only latch was
+never engaged. The control plane is one small language
+([`hunter::control`](../hunter/src/control.rs)) with three ways in:
+
+| Way in                     | When               | Who                  |
+|----------------------------|--------------------|----------------------|
+| `/etc/hunter/policy.conf`  | once, at boot, after the white/blacklists | the kernel |
+| write to `/proc/hunter`    | any time           | root (`euid 0`) only |
+| `/sbin/hunterctl`          | any time           | root; a front end for the write above |
+
+### Language
+
+One directive per line; blank lines and `#` comments are ignored.
+
+| Directive                              | Effect                                              |
+|----------------------------------------|-----------------------------------------------------|
+| `mode <domain> <off\|report\|enforce>` | `domain` is `syscall`, `wx`, `exec` or `anomaly`    |
+| `learning <on\|off>`                   | exec trust-on-first-use                             |
+| `anomaly-detection <on\|off>`          | per-process flood / fork-bomb counters              |
+| `privileged-deny <on\|off>`            | block module/ptrace/bpf/kexec under `anomaly=enforce` |
+| `trust <path>` / `trust <dir/>`        | add to the exec allowlist                           |
+| `deny <path>` / `deny <dir/>`          | add to the exec blacklist                           |
+| `untrusted <dir/>`                     | add a world-writable location                       |
+| `seal`                                 | engage the one-way tighten-only latch               |
+
+**All or nothing.** A script (a whole `policy.conf`, or one `write(2)` to
+`/proc/hunter`) is parsed in full before anything is applied; one bad line
+rejects all of it. The rejection is a `CRIT` event naming the line
+(`CONTROL REJECTED: /etc/hunter/policy.conf: line 7: unknown mode 'enforcing'`)
+and, for a write, `EINVAL`. A policy file that is larger than 1 MiB, not
+UTF-8 or comes back short is rejected the same way: half a policy is a stance
+nobody wrote.
+
+**The latch.** Directives run in order, so `seal` binds the lines after it.
+Once sealed, every relaxing directive is refused and recorded (`mode X` to a
+lower mode, `learning on`, `trust`, `anomaly-detection off`,
+`privileged-deny off`); tightening ones still apply. Only a reboot unseals.
+
+**Who may write.** `/proc/hunter` is mode `0644`, and the write handler checks
+the *effective* uid of the writing process, not just the open: a descriptor
+opened by root and inherited by an unprivileged child cannot drive hunter.
+Each applied script is recorded with the writer's pid.
+
+### `hunterctl`
+
+```
+hunterctl [status]              modes, counters, lists (no event ring)
+hunterctl events                the full report, event ring included
+hunterctl mode <domain> <mode>
+hunterctl learning|anomaly-detection|privileged-deny <on|off>
+hunterctl trust|deny <path|dir/>
+hunterctl untrusted <dir/>
+hunterctl seal
+hunterctl apply <file>          send a whole script (e.g. a new policy.conf)
+hunterctl lockdown              mode exec enforce + learning off + seal
+hunterctl save-learned          append learned programs to /etc/hunter/whitelist
+```
+
+A typical hardening pass on a running system: let it run with learning on
+while the usual workload executes, `hunterctl save-learned`, then
+`hunterctl lockdown`. From then on only allowlisted (configured or learned)
+programs run, and nothing can loosen that until reboot. `lockdown` leaves W^X
+alone on purpose: enforcing it breaks every JIT (Firefox, any JS engine).
+
+The image ships `/etc/hunter/policy.conf` as a fully commented example
+([`tools/hunterctl/policy.conf`](../tools/hunterctl/policy.conf)), so it
+changes nothing until edited; a unit test keeps every line of it valid.
 
 ## Intrusion detection (heuristics)
 
@@ -168,6 +241,7 @@ hunter security subsystem v0.4.0
 enforcement: syscall=enforce wx=report exec=report anomaly=report
 events: total=3 blocked=0 warnings=1 reported=1 critical=0 dropped=0 critical_dropped=0
 active syscall policies: 0
+heuristics: anomaly-detection=off privileged-deny=off
 trusted-program allowlist: inactive (0 entries)
 
 recent events (oldest first):

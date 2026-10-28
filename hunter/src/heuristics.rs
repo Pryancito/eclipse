@@ -390,6 +390,16 @@ pub fn set_anomaly_detection(enabled: bool) {
     ANOMALY_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// Whether the per-process rate heuristics are on.
+pub fn anomaly_detection_enabled() -> bool {
+    ANOMALY_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Whether the privileged-syscall deny latch is on.
+pub fn privileged_deny_enabled() -> bool {
+    PRIVILEGED_DENY.load(Ordering::Relaxed)
+}
+
 /// Enables/disables the privileged-syscall deny latch (only bites when the
 /// anomaly domain is also `Enforce`). Default off; opt-in only.
 pub fn set_privileged_deny(enabled: bool) {

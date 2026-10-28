@@ -25,6 +25,10 @@ mod cwd_tests;
 mod exited_leader_tests;
 #[cfg(test)]
 mod faults_tests;
+/// `/proc/hunter`, read and written: hunter's report and its control plane.
+mod hunter_proc;
+#[cfg(test)]
+mod hunter_proc_tests;
 /// The addresses of `/proc/<pid>/stat` and the `[heap]` and `[stack]` of
 /// `maps`, in their own file for the size ratchet.
 mod layout;
@@ -49,6 +53,7 @@ mod stat_tests;
 mod status;
 #[cfg(test)]
 mod zombie_tests;
+use hunter_proc::ProcHunterINode;
 use present::proc_present_content;
 use smoltcp::wire::{IpAddress, IpCidr};
 use status::{proc_pid_status, proc_task_status};
@@ -3054,12 +3059,6 @@ fn loadavg_text(load: [f64; 3], running: usize, total: usize, last_pid: u64) -> 
     format!("{l1:.2} {l5:.2} {l15:.2} {running}/{total} {last_pid}\n")
 }
 
-/// `/proc/hunter` — security subsystem status and recent intrusion-detection
-/// event ring, rendered on each read by the `hunter` crate.
-fn proc_hunter_content() -> String {
-    hunter::render_report()
-}
-
 fn proc_meminfo_content() -> String {
     let (used, total) = kernel_hal::mem::memory_usage();
     let (kheap_used, kheap_total) = kernel_hal::mem::kernel_heap_usage();
@@ -4328,10 +4327,7 @@ lazy_static! {
         inode: 49,
         generate: proc_filesystems_content,
     });
-    static ref PROC_HUNTER: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 17,
-        generate: proc_hunter_content,
-    });
+    static ref PROC_HUNTER: Arc<dyn INode> = Arc::new(ProcHunterINode);
     static ref PROC_NET_DEV: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 30,
         generate: proc_net_dev_content,

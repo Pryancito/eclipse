@@ -21,6 +21,8 @@
 //!
 //! Each enforcement domain has an independent [`policy::Mode`] (`Off` /
 //! `Report` / `Enforce`) and the control plane can be sealed tighten-only.
+//! Operators drive all of it through the [`control`] language, from
+//! `/etc/hunter/policy.conf` at boot or a root write to `/proc/hunter`.
 
 #![no_std]
 // `#[bench]` and `test::Bencher` are libtest's, and still unstable. The
@@ -37,6 +39,7 @@ extern crate test;
 extern crate log;
 
 pub mod clock;
+pub mod control;
 pub mod event_log;
 pub mod heuristics;
 pub mod policy;
@@ -435,6 +438,19 @@ pub fn render_report() -> String {
         policy::learned_exec_count(),
         policy::blacklisted_exec_count(),
         if policy::exec_learning_enabled() {
+            "on"
+        } else {
+            "off"
+        },
+    ));
+    out.push_str(&format!(
+        "heuristics: anomaly-detection={} privileged-deny={}\n",
+        if heuristics::anomaly_detection_enabled() {
+            "on"
+        } else {
+            "off"
+        },
+        if heuristics::privileged_deny_enabled() {
             "on"
         } else {
             "off"
