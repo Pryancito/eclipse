@@ -460,30 +460,6 @@ pub fn set_scanout_gpu_bringup(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_scanout_gpu_bringup(_v: bool) {}
 
-/// Declare the scanout card as the RM's primary device, with its console
-/// reserved, before its own GSP boot (`nvidia.console_preserve`). **Off by
-/// default**: the measurement that removed it found it correlated with the
-/// SEC2 `STARTCPU` wedge, but that measurement predates the display
-/// hand-over. See `console_preserve`.
-#[cfg(target_arch = "x86_64")]
-pub fn set_console_preserve(v: bool) {
-    zcore_drivers::display::set_console_preserve(v);
-}
-#[cfg(not(target_arch = "x86_64"))]
-pub fn set_console_preserve(_v: bool) {}
-
-/// Hand the console GPU's display engine over to its firmware across the SEC2
-/// window of its own GSP boot (`nvidia.dispoff`). **Off by default**: coming
-/// back out of PDISP reset restores `NV_PMC_ENABLE` and not the scanout state
-/// the VBIOS programmed, so the monitor can stay dark for the session. See
-/// `display_off_for_gsp`.
-#[cfg(target_arch = "x86_64")]
-pub fn set_display_off_for_gsp(v: bool) {
-    zcore_drivers::display::set_display_off_for_gsp(v);
-}
-#[cfg(not(target_arch = "x86_64"))]
-pub fn set_display_off_for_gsp(_v: bool) {}
-
 /// Enables on-demand console-GPU GSP bring-up (`nvidia.console_gsp`). Default off.
 #[cfg(target_arch = "x86_64")]
 pub fn set_console_gsp_enabled(v: bool) {
@@ -498,25 +474,6 @@ pub fn console_gsp_enabled() -> bool {
 }
 #[cfg(not(target_arch = "x86_64"))]
 pub fn console_gsp_enabled() -> bool {
-    false
-}
-
-/// Turns Eclipse's real `osInitMapping` off again (`nvidia.noosinitmapping`),
-/// putting back the `NV_ERR_NOT_SUPPORTED` that used to abort `kbifInit`.
-/// Default ON. No-op where the NVIDIA driver doesn't exist.
-#[cfg(target_arch = "x86_64")]
-pub fn set_osinit_mapping_enabled(v: bool) {
-    zcore_drivers::display::set_osinit_mapping_enabled(v);
-}
-#[cfg(not(target_arch = "x86_64"))]
-pub fn set_osinit_mapping_enabled(_v: bool) {}
-
-#[cfg(target_arch = "x86_64")]
-pub fn osinit_mapping_enabled() -> bool {
-    zcore_drivers::display::osinit_mapping_enabled()
-}
-#[cfg(not(target_arch = "x86_64"))]
-pub fn osinit_mapping_enabled() -> bool {
     false
 }
 

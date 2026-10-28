@@ -817,25 +817,6 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // stub is no longer a lie -- it is the truth of this port.
             // (`kernel_hal::drivers::set_rm_thread_id_provider` stays for
             // the day the gate is lifted and RM concurrency is done right.)
-            // Escape hatch for the real `osInitMapping` (the portable half of
-            // Linux's osinit.c:1260, implemented in `eclipse_rm_init.c`). It
-            // runs on EVERY GPU the RM attaches, the compute card included, so
-            // if those two config-space writes ever disturb a path that works
-            // today, this flag puts back the old `NV_ERR_NOT_SUPPORTED` without
-            // a rebuild. Expect `gpuStatePreInit` to fail at BIF when it is on.
-            //
-            // It has to be latched HERE, before `auto_bringup_compute_gpus()`
-            // below: that is the first RM attach of the boot, and its ladder
-            // reaches `gpuStatePreInit` -> `kbifInit` -> `osInitMapping`. A
-            // flag parsed after it would arrive too late to protect the
-            // compute card, which is the card it exists to protect.
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.noosinitmapping") {
-                kernel_hal::drivers::set_osinit_mapping_enabled(false);
-                klog_info!(
-                    "Eclipse: nvidia.noosinitmapping -- osInitMapping vuelve a NOT_SUPPORTED \
-                     (gpuStatePreInit fallara en kbifInit)"
-                );
-            }
             load_nvidia_gsp_firmware(&rootfs.root_inode());
             // Latch the nouveau GEM CPU-mapping cache policy before any GEM
             // object can be created (the first mmap fixes a VMO's policy for
@@ -1325,33 +1306,6 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // with `nvidia.noconsole_gpu` answered `waiting` forever, and init
             // held the session back for its whole timeout on a bring-up nobody
             // had asked for.
-            // `nvidia.dispoff` hands the console card's display engine over
-            // to its firmware for the SEC2 window of its own GSP boot. OFF by
-            // default: the one hardware boot that ran it with the default on
-            // lost the monitor for the whole session, because coming out of
-            // PDISP reset restores `NV_PMC_ENABLE` and not the scanout state
-            // the VBIOS programmed. See `display_off_for_gsp`.
-            // `nvidia.nodispoff` still turns it off, so a cmdline written
-            // against the old default keeps meaning what it meant.
-            // Tell the RM this card is the primary and its console must be
-            // reserved, before its own GSP boot -- what Linux does, and what
-            // `bringup_step14` took out because it correlated with the SEC2
-            // wedge on boots that had no display hand-over. See
-            // `console_preserve` for why the comparison is worth re-running.
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_preserve") {
-                kernel_hal::drivers::set_console_preserve(true);
-                klog_info!(
-                    "Eclipse: nvidia.console_preserve — se declara la consola al RM antes del arranque del GSP (reserva la region de consola; puede devolver el cuelgue del STARTCPU)"
-                );
-            }
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.dispoff")
-                && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nodispoff")
-            {
-                kernel_hal::drivers::set_display_off_for_gsp(true);
-                klog_info!(
-                    "Eclipse: nvidia.dispoff — el motor de display se apaga durante la ventana SEC2 del GSP de consola (la pantalla puede no volver hasta reiniciar)"
-                );
-            }
             linux_object::fs::devfs::drm::set_console_bringup_expected(want_console_gpu);
             if nv.hwcursor || want_console_gpu {
                 let reason = if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu") {
