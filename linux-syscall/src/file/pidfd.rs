@@ -505,6 +505,12 @@ mod self_tests;
 #[cfg(test)]
 mod wiring_tests;
 
+/// `PIDFD_GET_INFO`: the pid/tgid/ppid and credentials a pidfd reports, and
+/// `ESRCH`/`ENOTTY` for a gone pid and an unknown request. Fixed pids in
+/// 49_36x.
+#[cfg(test)]
+mod info_tests;
+
 /// `pidfd_send_signal(2)`'s `siginfo` argument, which was taken and dropped.
 #[cfg(test)]
 mod pidfd_siginfo_tests {
