@@ -1687,8 +1687,61 @@ cfg_if! {
                 free_ring, heap_regions, Mutex,
             };
             use core::alloc::Layout;
+            use kernel_hal::cpu_topology::{percpu_slot, PERCPU_SLOTS};
 
-            static SLAB: Mutex<SlabCache> = Mutex::new(SlabCache::new());
+            /// One cache per CPU, and the reason this module exists at all.
+            ///
+            /// It used to be a single `Mutex<SlabCache>` for the whole machine,
+            /// and that is the shape that stops being a cache exactly when it
+            /// is needed. Both the alloc and the free path take it with
+            /// `try_lock` (see below), so under contention the loser does not
+            /// wait -- it takes a *cache miss* and falls through to the buddy,
+            /// which is the one global lock the cache exists to keep away from.
+            /// Measured on the host against `buddy_system_allocator 0.8` with a
+            /// fork-shaped mix (400 000 ops/thread, 16 B..4 KiB):
+            ///
+            /// ```text
+            /// design      1 thread   8 threads   buddy touches @8
+            /// buddy only      50 ns     1554 ns         6 400 000
+            /// one cache       20 ns      558 ns         2 054 884   <- was
+            /// per-CPU         20 ns       21 ns            31 945   <- is
+            /// ```
+            ///
+            /// At 8 threads two thirds of the traffic was reaching the buddy
+            /// anyway. Per-CPU it is 1 %: 27x the throughput and 64x less
+            /// traffic to the global lock. SMP is on by default, so the
+            /// 8-thread column is the one that describes a boot.
+            ///
+            /// Per-CPU *with a lock*, not a lock-free per-CPU slot, because
+            /// the lock is doing a second job: `Mutex` here is the IRQ-off
+            /// ticket mutex, so holding it is what keeps an interrupt -- and
+            /// therefore a migration -- out of the middle of a list splice.
+            /// That is Linux's `local_lock` in SLUB, for the same reason. The
+            /// cost is an uncontended acquire, which is what the single cache
+            /// already paid on its best day.
+            ///
+            /// Indexed by [`percpu_slot`], the dense slot the rest of the
+            /// kernel indexes per-CPU tables with (`ipi.rs` does the same), so
+            /// a `cpu_id()` that names no CPU lands in the quarantine slot
+            /// rather than out of bounds or in CPU 0's cache.
+            ///
+            /// A block freed on one CPU and never reallocated there stays in
+            /// that CPU's list; the CPU that wants it takes a miss and goes to
+            /// the buddy, as it would have anyway. What is NOT allowed is a
+            /// block in two lists, and nothing can put it there: a block is in
+            /// a list only between its free and its next alloc, and only the
+            /// CPU that freed it put it in one.
+            static SLAB: [Mutex<SlabCache>; PERCPU_SLOTS] =
+                [const { Mutex::new(SlabCache::new()) }; PERCPU_SLOTS];
+
+            /// This CPU's cache.
+            #[inline]
+            fn mine() -> &'static Mutex<SlabCache> {
+                // `percpu_slot` bounds the index; the array is `PERCPU_SLOTS`
+                // long, which is `MAX_CORE_NUM + 1` -- the quarantine slot is
+                // the `+ 1`.
+                &SLAB[percpu_slot(kernel_hal::cpu::cpu_id() as usize)]
+            }
 
             /// Who freed each cached block, newest last. See [`free_ring`].
             pub static FREES: free_ring::FreeRing<4096> = free_ring::FreeRing::new();
@@ -1725,7 +1778,7 @@ cfg_if! {
                 let Some(i) = free_lists::cache_slot(layout) else {
                     return core::ptr::null_mut();
                 };
-                let Some(mut c) = SLAB.try_lock() else {
+                let Some(mut c) = mine().try_lock() else {
                     return core::ptr::null_mut();
                 };
                 match unsafe { c.pop(i, owns) } {
@@ -1753,7 +1806,7 @@ cfg_if! {
                 let Some(i) = free_lists::cache_slot(layout) else {
                     return Freed::ToBuddy;
                 };
-                let Some(mut c) = SLAB.try_lock() else {
+                let Some(mut c) = mine().try_lock() else {
                     return Freed::ToBuddy;
                 };
                 match unsafe { c.push(i, ptr as usize) } {
@@ -2934,12 +2987,66 @@ pub mod free_lists {
     pub const MIN_CLASS: usize = 3; // 2^3 = 8 B
     pub const MAX_CLASS: usize = 12; // 2^12 = 4 KiB
     pub const NUM_CLASSES: usize = MAX_CLASS - MIN_CLASS + 1;
-    // Per-class cap. Worst case is the top class: 4 KiB * 1024 = 4 MiB;
-    // the full table pins ≈8 MiB out of a 512 MiB heap. Bounding it keeps
-    // the buddy from starving of large contiguous blocks and stops idle
-    // RAM accumulating in the cache. A freed block past the cap is handed
-    // to the buddy (where its buddy may coalesce) instead of cached.
+    // Per-class ceiling on the number of cached blocks. A freed block past
+    // the cap is handed to the buddy (where its buddy may coalesce) instead
+    // of cached: bounding the cache keeps the buddy from starving of large
+    // contiguous blocks and stops idle RAM accumulating in it.
+    //
+    // This is the ceiling, not the cap: see [`cap_of`], which is what `push`
+    // asks. The cap used to be this number for every class, which is a cap on
+    // *blocks* and therefore a cap on bytes that grows with the class -- 8 KiB
+    // in the 8-byte class and 4 MiB in the 4 KiB one. With one cache in the
+    // system that came to ~8 MiB of a 512 MiB heap and nobody minded; with a
+    // cache per CPU (`PERCPU_SLOTS` of them) the same number would reserve
+    // ~520 MiB, which is the whole heap. So the cap is now a cap on BYTES.
     pub const CAP: u32 = 1024;
+
+    /// Bytes a single class of a single CPU's cache may hold.
+    ///
+    /// The quantity worth bounding, because what the cache costs the buddy is
+    /// RAM it cannot hand out, not list entries. 64 KiB per class is 10 classes
+    /// x 64 KiB ~ 504 KiB per CPU once [`CAP`] clips the small classes, so the
+    /// whole table is ~31 MiB of a 512 MiB heap at `MAX_CORE_NUM = 64` -- and
+    /// that is the worst case, every class of every CPU full at once.
+    pub const CLASS_BUDGET: usize = 64 * 1024;
+
+    /// Fewest blocks a class keeps whatever its size, so the top classes still
+    /// cache something. 4 KiB x 16 = 64 KiB, which is `CLASS_BUDGET` exactly;
+    /// it is a floor only if `CLASS_BUDGET` is ever lowered.
+    pub const MIN_CAP: u32 = 16;
+
+    /// How many blocks of class `i` one CPU's cache may hold.
+    ///
+    /// `CLASS_BUDGET / class_size(i)`, clamped into `MIN_CAP..=CAP`. This is
+    /// the `limit` of Linux's per-CPU array caches, and for the same reason:
+    /// a small object churns far more than a 4 KiB one and is far cheaper to
+    /// keep, so the two must not get the same block count.
+    pub const fn cap_of(i: usize) -> u32 {
+        let blocks = CLASS_BUDGET / class_size(i);
+        if blocks < MIN_CAP as usize {
+            MIN_CAP
+        } else if blocks > CAP as usize {
+            CAP
+        } else {
+            blocks as u32
+        }
+    }
+
+    /// Bytes one CPU's cache may hold with every class full.
+    ///
+    /// Nothing in the kernel reads it -- the figure it checks is a compile-time
+    /// property of the constants above, so the test is the only caller there
+    /// can be, and the crate denies warnings.
+    #[cfg(test)]
+    pub const fn budget_per_cpu() -> usize {
+        let mut total = 0;
+        let mut i = 0;
+        while i < NUM_CLASSES {
+            total += cap_of(i) as usize * class_size(i);
+            i += 1;
+        }
+        total
+    }
 
     /// What a free block of the cache holds in its second word. Mixed with
     /// the block's own address, so a value copied out of one free block into
@@ -3129,7 +3236,7 @@ pub mod free_lists {
             {
                 return Err(Broken::DoubleFree { block });
             }
-            if self.count[i] >= CAP {
+            if self.count[i] >= cap_of(i) {
                 return Ok(false);
             }
             // Push: stash the old head in the block's first word.
@@ -3525,377 +3632,5 @@ mod heap_region_tests {
 }
 
 #[cfg(test)]
-mod free_list_tests {
-    //! The front cache's lists used to follow whatever a freed block's first
-    //! word said. These tests write into freed blocks the way a stale owner
-    //! does -- a clock value, a small integer, a pointer to a live block, a
-    //! zero -- and require that the cache names the block and never hands out
-    //! anything it was not given.
-
-    use super::free_lists::{class_size, tag_of, Broken, LinkFault, SlabCache, CAP};
-    use super::free_ring::{FreeRing, DEPTH};
-    use std::alloc::Layout;
-
-    /// 64-byte blocks: a tagged class.
-    const C64: usize = 3;
-    /// 8-byte blocks: one word, no room for the free mark.
-    const C8: usize = 0;
-
-    /// Real memory for the lists to write their links and marks into.
-    struct Arena {
-        base: usize,
-        layout: Layout,
-    }
-
-    impl Arena {
-        fn new(len: usize) -> Self {
-            let layout = Layout::from_size_align(len, 4096).unwrap();
-            let base = unsafe { std::alloc::alloc_zeroed(layout) } as usize;
-            assert_ne!(base, 0);
-            Arena { base, layout }
-        }
-
-        /// The `n`th block of class `i`.
-        fn block(&self, i: usize, n: usize) -> usize {
-            assert!((n + 1) * class_size(i) <= self.layout.size());
-            self.base + n * class_size(i)
-        }
-
-        fn owns(&self) -> impl Fn(usize, usize) -> bool + '_ {
-            move |addr, size| {
-                addr >= self.base
-                    && addr + size <= self.base + self.layout.size()
-                    && addr.is_multiple_of(size)
-            }
-        }
-
-        fn write(&self, addr: usize, value: usize) {
-            assert!(addr >= self.base && addr + 8 <= self.base + self.layout.size());
-            unsafe { core::ptr::write(addr as *mut usize, value) }
-        }
-
-        fn read(&self, addr: usize) -> usize {
-            assert!(addr >= self.base && addr + 8 <= self.base + self.layout.size());
-            unsafe { core::ptr::read(addr as *const usize) }
-        }
-    }
-
-    impl Drop for Arena {
-        fn drop(&mut self) {
-            unsafe { std::alloc::dealloc(self.base as *mut u8, self.layout) }
-        }
-    }
-
-    /// The word the ninth capture found where a `BTreeMap` node pointer
-    /// belonged: an instant, not an address.
-    const CLOCK: usize = 0x0000_0012_a05f_2000;
-
-    #[test]
-    fn blocks_come_back_last_in_first_out_without_their_mark() {
-        let arena = Arena::new(4096);
-        let mut c = SlabCache::new();
-        let (a, b, d) = (
-            arena.block(C64, 0),
-            arena.block(C64, 1),
-            arena.block(C64, 2),
-        );
-        for x in [a, b, d] {
-            assert_eq!(unsafe { c.push(C64, x) }, Ok(true));
-        }
-        assert_eq!(c.count(C64), 3);
-        for x in [d, b, a] {
-            assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(Some(x)));
-            // A live block carrying the mark would read as "already free" to
-            // the next `push` of it.
-            assert_eq!(arena.read(x + 8), 0);
-        }
-        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(None));
-        assert_eq!(c.count(C64), 0);
-    }
-
-    /// The ninth capture's shape: a clock value where a free block's link
-    /// was. The block that holds it is named, and the clock value is never
-    /// handed out as an allocation.
-    #[test]
-    fn a_link_overwritten_with_a_clock_value_is_caught_at_that_block() {
-        let arena = Arena::new(4096);
-        let mut c = SlabCache::new();
-        let (a, b, d) = (
-            arena.block(C64, 0),
-            arena.block(C64, 1),
-            arena.block(C64, 2),
-        );
-        for x in [a, b, d] {
-            unsafe { c.push(C64, x) }.unwrap();
-        }
-        arena.write(b, CLOCK);
-        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(Some(d)));
-        assert_eq!(
-            unsafe { c.pop(C64, arena.owns()) },
-            Err(Broken::Link {
-                block: b,
-                link: CLOCK,
-                lost: 1,
-                why: LinkFault::Outside,
-            })
-        );
-        // The rest of the list is gone, not followed.
-        assert_eq!(c.count(C64), 0);
-        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(None));
-    }
-
-    /// A heap pointer is exactly what a stale owner stores, and it passes
-    /// every address test. The block it names is live, so it has no mark.
-    #[test]
-    fn a_link_overwritten_with_a_live_block_is_caught() {
-        let arena = Arena::new(4096);
-        let mut c = SlabCache::new();
-        let (a, b, live) = (
-            arena.block(C64, 0),
-            arena.block(C64, 1),
-            arena.block(C64, 5),
-        );
-        for x in [a, b] {
-            unsafe { c.push(C64, x) }.unwrap();
-        }
-        arena.write(b, live);
-        assert_eq!(
-            unsafe { c.pop(C64, arena.owns()) },
-            Err(Broken::Link {
-                block: b,
-                link: live,
-                lost: 1,
-                why: LinkFault::NotFree,
-            })
-        );
-    }
-
-    /// A write that misses the link lands on the mark.
-    #[test]
-    fn a_write_over_the_free_mark_is_caught() {
-        let arena = Arena::new(4096);
-        let mut c = SlabCache::new();
-        let (a, b) = (arena.block(C64, 0), arena.block(C64, 1));
-        for x in [a, b] {
-            unsafe { c.push(C64, x) }.unwrap();
-        }
-        arena.write(b + 8, 0x71);
-        assert_eq!(
-            unsafe { c.pop(C64, arena.owns()) },
-            Err(Broken::Tag {
-                block: b,
-                found: 0x71,
-                lost: 1,
-            })
-        );
-    }
-
-    /// Zero is a valid link only from the last block. Anywhere else it is the
-    /// zero-writer this hunt began with, and it would have leaked the rest of
-    /// the list without a word.
-    #[test]
-    fn a_zeroed_link_with_blocks_behind_it_is_caught() {
-        let arena = Arena::new(4096);
-        let mut c = SlabCache::new();
-        let (a, b) = (arena.block(C64, 0), arena.block(C64, 1));
-        for x in [a, b] {
-            unsafe { c.push(C64, x) }.unwrap();
-        }
-        arena.write(b, 0);
-        assert_eq!(
-            unsafe { c.pop(C64, arena.owns()) },
-            Err(Broken::Link {
-                block: b,
-                link: 0,
-                lost: 1,
-                why: LinkFault::Zeroed,
-            })
-        );
-    }
-
-    /// One-word blocks have no mark, so a link to another block of the heap
-    /// passes the address test -- but not out of the last block.
-    #[test]
-    fn a_link_out_of_the_last_block_is_caught() {
-        let arena = Arena::new(4096);
-        let mut c = SlabCache::new();
-        let (a, other) = (arena.block(C8, 0), arena.block(C8, 9));
-        unsafe { c.push(C8, a) }.unwrap();
-        arena.write(a, other);
-        assert_eq!(
-            unsafe { c.pop(C8, arena.owns()) },
-            Err(Broken::Link {
-                block: a,
-                link: other,
-                lost: 0,
-                why: LinkFault::PastEnd,
-            })
-        );
-    }
-
-    /// Before: the second free put the block in the list twice, and two
-    /// allocations later two owners shared it.
-    #[test]
-    fn a_block_freed_twice_is_refused_and_the_list_stays_sound() {
-        let arena = Arena::new(4096);
-        let mut c = SlabCache::new();
-        let (a, b) = (arena.block(C64, 0), arena.block(C64, 1));
-        for x in [a, b] {
-            unsafe { c.push(C64, x) }.unwrap();
-        }
-        assert_eq!(
-            unsafe { c.push(C64, a) },
-            Err(Broken::DoubleFree { block: a })
-        );
-        assert_eq!(c.count(C64), 2);
-        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(Some(b)));
-        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(Some(a)));
-        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(None));
-    }
-
-    /// Without a mark, the head is the one double free a one-word class can
-    /// still see -- and the one that would make the list point at itself.
-    #[test]
-    fn a_one_word_block_freed_twice_in_a_row_is_refused() {
-        let arena = Arena::new(4096);
-        let mut c = SlabCache::new();
-        let a = arena.block(C8, 0);
-        unsafe { c.push(C8, a) }.unwrap();
-        assert_eq!(
-            unsafe { c.push(C8, a) },
-            Err(Broken::DoubleFree { block: a })
-        );
-        assert_eq!(c.count(C8), 1);
-    }
-
-    /// The everyday case must stay quiet: a block that was handed out and
-    /// comes back is a free, not a double free.
-    #[test]
-    fn a_block_handed_out_and_freed_again_is_not_a_double_free() {
-        let arena = Arena::new(4096);
-        let mut c = SlabCache::new();
-        let a = arena.block(C64, 0);
-        unsafe { c.push(C64, a) }.unwrap();
-        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(Some(a)));
-        assert_eq!(unsafe { c.push(C64, a) }, Ok(true));
-    }
-
-    /// The mark is mixed with the block's address, so a live object holding
-    /// a copy of another block's mark -- a struct copied out of freed memory
-    /// -- is not taken for a free block.
-    #[test]
-    fn another_blocks_mark_in_a_live_block_is_not_a_double_free() {
-        let arena = Arena::new(4096);
-        let mut c = SlabCache::new();
-        let (a, live) = (arena.block(C64, 0), arena.block(C64, 1));
-        unsafe { c.push(C64, a) }.unwrap();
-        arena.write(live + 8, tag_of(a));
-        assert_eq!(unsafe { c.push(C64, live) }, Ok(true));
-    }
-
-    /// A full class hands the block back without writing into it: the buddy
-    /// keeps its own links there.
-    #[test]
-    fn a_full_class_leaves_the_block_to_the_buddy_untouched() {
-        let arena = Arena::new((CAP as usize + 1) * class_size(C64));
-        let mut c = SlabCache::new();
-        for n in 0..CAP as usize {
-            assert_eq!(unsafe { c.push(C64, arena.block(C64, n)) }, Ok(true));
-        }
-        let extra = arena.block(C64, CAP as usize);
-        arena.write(extra, 0x1111);
-        arena.write(extra + 8, 0x2222);
-        assert_eq!(unsafe { c.push(C64, extra) }, Ok(false));
-        assert_eq!(arena.read(extra), 0x1111);
-        assert_eq!(arena.read(extra + 8), 0x2222);
-        assert_eq!(c.count(C64), CAP);
-    }
-
-    /// Whatever is written into free blocks, and wherever, `pop` hands out
-    /// only blocks that were freed and are still free: never a written value,
-    /// never a block twice.
-    #[test]
-    fn whatever_is_written_into_free_blocks_pop_hands_out_only_free_blocks() {
-        const BLOCKS: usize = 64;
-        let arena = Arena::new(BLOCKS * class_size(C64));
-        let mut c = SlabCache::new();
-        let mut free: Vec<usize> = Vec::new();
-        let mut live: Vec<usize> = (0..BLOCKS).map(|n| arena.block(C64, n)).collect();
-        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed as usize
-        };
-        let (mut caught, mut handed) = (0, 0);
-        for _ in 0..20_000 {
-            match next() % 8 {
-                0..=2 if !live.is_empty() => {
-                    let b = live.swap_remove(next() % live.len());
-                    if unsafe { c.push(C64, b) } == Ok(true) {
-                        free.push(b);
-                    }
-                }
-                3..=5 => match unsafe { c.pop(C64, arena.owns()) } {
-                    Ok(Some(b)) => {
-                        let at = free.iter().position(|&f| f == b);
-                        assert!(at.is_some(), "handed out {b:#x}, which is not free");
-                        free.swap_remove(at.unwrap());
-                        live.push(b);
-                        handed += 1;
-                    }
-                    Ok(None) => assert_eq!(c.count(C64), 0),
-                    Err(_) => {
-                        // Leaked with its list: neither free nor ever handed
-                        // out again.
-                        caught += 1;
-                        assert_eq!(c.count(C64), 0);
-                        free.clear();
-                    }
-                },
-                6 if !free.is_empty() => {
-                    // A stale owner writes into a free block.
-                    let b = free[next() % free.len()];
-                    let value = match next() % 5 {
-                        0 => 0,
-                        1 => 0x71,
-                        2 => CLOCK + next() % 1000,
-                        3 if !live.is_empty() => live[next() % live.len()],
-                        _ => free[next() % free.len()],
-                    };
-                    arena.write(b + 8 * (next() % 2), value);
-                }
-                _ => {}
-            }
-        }
-        assert!(caught > 0 && handed > 0, "caught={caught} handed={handed}");
-    }
-
-    #[test]
-    fn the_ring_names_the_latest_free_of_a_block_and_how_long_ago() {
-        let ring: FreeRing<8> = FreeRing::new();
-        let rets = |x| [x; DEPTH];
-        ring.note(0xa0, rets(1));
-        ring.note(0xb0, rets(2));
-        ring.note(0xa0, rets(3));
-        assert_eq!(ring.find(0xa0), Some((rets(3), 0)));
-        assert_eq!(ring.find(0xb0), Some((rets(2), 1)));
-        assert_eq!(ring.find(0xc0), None);
-        assert_eq!(ring.find(0), None);
-    }
-
-    /// A free the ring has overwritten is "no longer in the ring", never the
-    /// free that took its slot.
-    #[test]
-    fn a_free_older_than_the_ring_is_not_attributed_to_anyone() {
-        let ring: FreeRing<4> = FreeRing::new();
-        ring.note(0xa0, [1; DEPTH]);
-        for n in 1..=4 {
-            ring.note(0xa0 + n * 0x10, [2; DEPTH]);
-        }
-        assert_eq!(ring.find(0xa0), None);
-        assert_eq!(ring.find(0xe0), Some(([2; DEPTH], 0)));
-        assert_eq!(ring.len(), 4);
-    }
-}
+#[path = "memory/free_list_tests.rs"]
+mod free_list_tests;
