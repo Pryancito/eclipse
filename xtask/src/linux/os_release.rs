@@ -58,24 +58,25 @@ const BUG_REPORT_URL: &str = "https://github.com/Pryancito/eclipse/issues";
 
 /// `ANSI_COLOR`: how a terminal should tint the logo/name. Magenta, as the
 /// boot console and the wallpaper already are.
-const ANSI_COLOR: &str = "0;35";
+pub(super) const ANSI_COLOR: &str = "0;35";
 
 /// `LOGO`: the name of an ICON, not of the distribution.
 ///
 /// This is the one field whose value is not ours to choose. The spec says it
 /// names an icon "following the Icon Theme Specification", conventionally
 /// `distributor-logo-<LOGO>`, and readers resolve it through the installed
-/// icon theme: `fastfetch`, GTK's about dialogs and the desktop's own
-/// about pages all look up that name. `eclipse` --- what this carried at
-/// first --- is not an icon any theme ships, so every one of those readers
-/// got a miss and fell back to a blank or a generic placeholder. `linux` is,
-/// in hicolor and in every theme downstream of it, and it is what a
-/// distribution with no icon of its own in the themes is expected to say.
+/// icon theme: `fastfetch`, GTK's about dialogs and the desktop's own about
+/// pages all look up that name. So the value is only as true as the icon
+/// behind it: this said `linux` for as long as no theme in the image had an
+/// `eclipse` icon, because naming one that is not there buys a blank where
+/// the logo goes, not a logo.
 ///
-/// So this is not `ID`, and it must not be "fixed" to follow it: the day
-/// Eclipse ships a `distributor-logo-eclipse` icon in the image's icon theme
-/// is the day this changes, and not before.
-const LOGO: &str = "linux";
+/// [`logo`](super::logo) now installs
+/// `usr/share/icons/hicolor/scalable/apps/distributor-logo-eclipse.svg`, so
+/// `eclipse` resolves. The two are one decision: whoever stops shipping that
+/// icon has to bring this back to `linux` in the same change, and the test
+/// below is what makes that the only way out.
+const LOGO: &str = "eclipse";
 
 /// The value of `ARCHITECTURE`, in the spelling the spec prescribes (systemd's
 /// own architecture ids), not in ours.
@@ -144,7 +145,7 @@ fn parse_version(src: &str) -> Option<String> {
 /// version nobody shipped is worse than a build that stops and says why, and
 /// [`VERSION_SOURCE`] is a file git tracks -- it is missing only if the build
 /// is running somewhere it has no business running.
-fn eclipse_version() -> String {
+pub(super) fn eclipse_version() -> String {
     let path = PROJECT_DIR.join(VERSION_SOURCE);
     let src = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("os-release: cannot read {}: {e}", path.display()));
@@ -467,21 +468,24 @@ mod tests {
         assert_eq!(parse_version(src).as_deref(), Some("7.7.7"));
     }
 
-    /// `LOGO` names an icon, so it has to name one that EXISTS. `eclipse` is
-    /// not an icon any theme ships, and a reader that looks up
-    /// `distributor-logo-eclipse` gets a miss and a blank where the logo goes;
-    /// `linux` resolves in hicolor and in everything downstream of it.
-    ///
-    /// Pinned against `ID` on purpose: the two look like they should agree,
-    /// and making them agree is exactly the change that breaks this field.
+    /// `LOGO` names an icon, so it has to name one the image actually
+    /// INSTALLS. This is the test that ties the field to the file: it reads
+    /// the logo module for the icon it ships and asks that `LOGO` resolve to
+    /// it, so dropping the icon and leaving the field, or renaming either one
+    /// alone, fails here instead of in a reader that quietly draws a blank.
     #[test]
-    fn the_logo_names_an_icon_that_exists_and_is_not_the_id() {
+    fn the_logo_names_an_icon_the_image_installs() {
         let body = sample();
-        assert_eq!(get(&body, "LOGO").unwrap(), "linux");
-        assert_ne!(
-            get(&body, "LOGO").unwrap(),
-            get(&body, "ID").unwrap(),
-            "LOGO has been made to follow ID again; it names an icon, not us"
+        let value = get(&body, "LOGO").unwrap();
+        // The whole literal, quotes included: a substring match would be
+        // satisfied by `distributor-logo-eclipseos`, which is a different icon
+        // and would leave this field naming one that does not exist.
+        let wanted = format!("\"distributor-logo-{value}\"");
+        let logo_rs = fs::read_to_string(PROJECT_DIR.join("xtask/src/linux/logo.rs")).unwrap();
+        assert!(
+            logo_rs.contains(&wanted),
+            "LOGO={value:?} needs an icon named distributor-logo-{value}, \
+             and logo.rs installs no such file"
         );
     }
 
