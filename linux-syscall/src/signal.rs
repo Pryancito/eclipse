@@ -637,6 +637,43 @@ impl Syscall<'_> {
         deliver_to_process(cx, process, info)
     }
 
+    /// The gate, then the delivery, for one thread of `process`:
+    /// `pidfd_send_signal(2)` through a `PIDFD_THREAD` pidfd or with
+    /// `PIDFD_SIGNAL_THREAD`, which is a `tgkill(2)` reached through a
+    /// descriptor. `thread` is `None` for the leader, found by its pid, and a
+    /// leader already gone takes nothing, as a zombie does. `info` is the
+    /// caller's `siginfo_t`, else a `tkill`'s (`prepare_kill_siginfo` with
+    /// `PIDTYPE_PID`: `SI_TKILL`).
+    ///
+    /// `SIGKILL` is the process's: `complete_signal()` takes it to the whole
+    /// group wherever it lands, and through one thread it would skip the
+    /// check that keeps it away from init.
+    pub(crate) fn signal_one_thread_with_info(
+        &self,
+        cx: &KillContext,
+        process: &Arc<zircon_object::task::Process>,
+        thread: Option<&Arc<Thread>>,
+        info: Option<SigInfo>,
+    ) -> LxResult<()> {
+        self.may_signal_process(cx, process)?;
+        let signal = match cx.signal {
+            None => return Ok(()),
+            Some(Signal::SIGKILL) => return deliver_to_process(cx, process, info),
+            Some(signal) => signal,
+        };
+        let leader = || {
+            process
+                .get_child(process.id())
+                .ok()
+                .and_then(|obj| obj.downcast_arc::<Thread>().ok())
+        };
+        if let Some(thread) = thread.cloned().or_else(leader) {
+            let info = info.unwrap_or_else(|| self.sent_by_me(signal, SignalCode::TKILL));
+            queue_signal_to_thread(&thread, signal, info);
+        }
+        Ok(())
+    }
+
     /// `kill(pid, sig)` with a positive pid.
     ///
     /// A zombie is a valid target until it is reaped, for whoever may signal
@@ -660,13 +697,21 @@ impl Syscall<'_> {
     /// same `effective_pgid`. The walk is written out again here rather than
     /// shared because a signal sent by a process has a sender to judge and
     /// one sent by a terminal has none.
-    fn signal_group(&self, cx: &KillContext, pgid: KoID) -> LxResult<()> {
+    ///
+    /// `info` is the caller's `siginfo_t` for `pidfd_send_signal(2)` with
+    /// `PIDFD_SIGNAL_PROCESS_GROUP`, `None` for a `kill(2)`.
+    pub(crate) fn signal_group(
+        &self,
+        cx: &KillContext,
+        pgid: KoID,
+        info: Option<SigInfo>,
+    ) -> LxResult<()> {
         let mut result: LxResult<()> = Err(LxError::ESRCH);
         for process in linux_object::process::all_live_processes() {
             if linux_object::process::effective_pgid(&process) != pgid {
                 continue;
             }
-            let one = self.signal_one_process(cx, &process);
+            let one = self.signal_one_process_with_info(cx, &process, info);
             result = LinuxProcess::fold_group_signal(result, one);
         }
         result
@@ -713,9 +758,9 @@ impl Syscall<'_> {
         match kill_target(pid_arg(pid)) {
             SendTarget::Pid(pid) => self.signal_pid(&cx, pid),
             SendTarget::EveryProcessInGroup => {
-                self.signal_group(&cx, linux_object::process::effective_pgid(&cx.caller))
+                self.signal_group(&cx, linux_object::process::effective_pgid(&cx.caller), None)
             }
-            SendTarget::EveryProcessInGroupByPID(pgid) => self.signal_group(&cx, pgid),
+            SendTarget::EveryProcessInGroupByPID(pgid) => self.signal_group(&cx, pgid, None),
             SendTarget::EveryProcess => self.signal_broadcast(&cx),
         }
         .map(|_| 0)

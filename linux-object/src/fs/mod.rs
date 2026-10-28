@@ -1063,6 +1063,11 @@ pub fn anon_metadata(type_: FileType, inode: usize) -> rcore_fs::vfs::Metadata {
 pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     /// Returns open flags.
     fn flags(&self) -> OpenFlags;
+    /// The flags as `F_GETFL` and `fdinfo` say them: `f_flags`, without what
+    /// only mattered while opening ([`OpenFlags::status`]).
+    fn status_flags(&self) -> OpenFlags {
+        self.flags().status()
+    }
     /// `fstat(2)` metadata. The default describes an anonymous kernel object,
     /// which is what `fstat` reports for eventfd/epoll/timerfd/signalfd on
     /// Linux; descriptors with something better to say (a file's inode, a
@@ -2570,7 +2575,14 @@ mod elf_shrinker_tests;
 /// take two of the registry's eight slots and ask the same cache twice, so
 /// this says in its answer whether the registration was taken.
 pub fn register_shrinkers() -> bool {
-    kernel_hal::shrinker::register(&elf_vmo_shrinker::SHRINKER)
+    // Two registries, and which one a cache goes in is its contract, not a
+    // preference: the ELF image cache frees by dropping an `Arc`, so direct
+    // reclaim may call it in front of a failed allocation; evicting a
+    // page-cache entry writes dirty pages back through the filesystem, so only
+    // the reclaim worker may.
+    let direct = kernel_hal::shrinker::register(&elf_vmo_shrinker::SHRINKER);
+    let deferred = kernel_hal::shrinker::register_deferred(&file::page_cache_reclaim::RECLAIMER);
+    direct && deferred
 }
 
 /// extension for INode

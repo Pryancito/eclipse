@@ -4,7 +4,7 @@
 //! bytes nobody freed. Each has a test here.
 
 use super::*;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// A cache of `held` bytes that frees exactly what it is asked for, and
 /// remembers what it was asked. Statics, because a `Shrinker` holds `fn`
@@ -299,4 +299,211 @@ fn a_slot_past_the_table_reclaims_nothing() {
     assert!(r.register(&big::SHRINKER));
     assert_eq!(r.shrink_on(PERCPU_SLOTS, 1 << 20), 0);
     assert_eq!(big::CALLS.load(Ordering::Relaxed), 0);
+}
+
+fake_cache!(deferred_one, "deferred-one");
+fake_cache!(direct_one, "direct-one");
+
+/// The turnstile for everything below, which drives the kernel's OWN statics
+/// (`DEMAND` and the deferred registry) rather than a registry of its own.
+/// Those cannot be built per test -- registration is irreversible and the
+/// demand is one figure for the machine -- so two of these tests in parallel
+/// would read each other's demand and blame whichever lost.
+static GLOBALS: lock::Mutex<()> = lock::Mutex::new(());
+
+/// Put the fake in the kernel's deferred registry, once per test binary.
+///
+/// It holds nothing unless a test gives it something, and the walk skips a
+/// cache holding nothing, so a test that does not care about it is unaffected.
+fn with_deferred_fake<T>(held: usize, body: impl FnOnce() -> T) -> T {
+    with_fakes(0, held, body)
+}
+
+/// The same, with a cache in the DIRECT registry too: `direct_held` bytes that
+/// direct reclaim can give, `deferred_held` that only the worker can.
+///
+/// Both are registered once per test binary and reset per test, rather than
+/// each test registering its own. Registration is irreversible, so a test that
+/// registered on its own path would change what every later test sees -- and a
+/// cache holding nothing is skipped by the walk, so a test that does not care
+/// about one is unaffected by it.
+fn with_fakes<T>(direct_held: usize, deferred_held: usize, body: impl FnOnce() -> T) -> T {
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+    let _g = GLOBALS.lock();
+    if !REGISTERED.swap(true, Ordering::Relaxed) {
+        assert!(
+            register_deferred(&deferred_one::SHRINKER),
+            "the deferred registry refused the fake"
+        );
+        assert!(
+            register(&direct_one::SHRINKER),
+            "the direct registry refused the fake"
+        );
+    }
+    direct_one::reset(direct_held);
+    deferred_one::reset(deferred_held);
+    DEMAND.store(0, Ordering::Relaxed);
+    let out = body();
+    direct_one::reset(0);
+    deferred_one::reset(0);
+    DEMAND.store(0, Ordering::Relaxed);
+    out
+}
+
+#[test]
+fn asking_the_worker_for_nothing_leaves_no_demand() {
+    with_deferred_fake(0, || {
+        request(0);
+        assert_eq!(pending(), 0, "a zero request became a standing demand");
+    });
+}
+
+/// The demand is the largest request since the last pass, not their sum: ten
+/// allocations failing on 4 MiB each mean 4 MiB are missing ten times over,
+/// and summing them sends the worker after 40 MiB that nobody wants.
+#[test]
+fn the_standing_demand_is_the_largest_request_and_not_their_sum() {
+    with_deferred_fake(0, || {
+        request(4 << 20);
+        request(1 << 20);
+        request(4 << 20);
+        assert_eq!(pending(), 4 << 20, "the requests were summed");
+    });
+}
+
+#[test]
+fn a_pass_with_no_demand_asks_nobody() {
+    with_deferred_fake(8 << 20, || {
+        assert_eq!(run_deferred(), 0);
+        assert_eq!(
+            deferred_one::CALLS.load(Ordering::Relaxed),
+            0,
+            "a deferred cache was walked with nothing to serve"
+        );
+    });
+}
+
+#[test]
+fn a_pass_serves_the_standing_demand_and_answers_what_was_freed() {
+    with_deferred_fake(8 << 20, || {
+        request(2 << 20);
+        assert_eq!(
+            run_deferred(),
+            2 << 20,
+            "the pass did not free what it said"
+        );
+        assert!(
+            deferred_one::CALLS.load(Ordering::Relaxed) > 0,
+            "the deferred cache was never asked"
+        );
+    });
+}
+
+/// The demand is taken before the walk, so what the walk itself requests is
+/// served by the next pass instead of being served twice -- and a second pass
+/// with nothing new to do asks nobody.
+#[test]
+fn a_pass_clears_the_demand_it_took() {
+    with_deferred_fake(8 << 20, || {
+        request(2 << 20);
+        assert_eq!(run_deferred(), 2 << 20);
+        assert_eq!(pending(), 0, "the demand outlived the pass that served it");
+        let calls = deferred_one::CALLS.load(Ordering::Relaxed);
+        assert_eq!(run_deferred(), 0, "the same demand was served twice");
+        assert_eq!(
+            deferred_one::CALLS.load(Ordering::Relaxed),
+            calls,
+            "the second pass walked the caches again"
+        );
+    });
+}
+
+/// What direct reclaim could not give is what the worker is for. Nothing is
+/// registered in the direct registry here, so the whole target is the
+/// shortfall.
+#[test]
+fn what_direct_reclaim_cannot_give_becomes_the_workers_demand() {
+    with_fakes(0, 0, || {
+        assert_eq!(shrink(3 << 20), 0, "a cache holding nothing gave something");
+        assert_eq!(
+            pending(),
+            3 << 20,
+            "the shortfall of a direct reclaim was dropped"
+        );
+    });
+}
+
+/// ... and a deferred cache is not asked by direct reclaim, however much it
+/// holds. This is the separation the whole split exists for: the caller of
+/// `shrink` is an allocation that has already failed, and this cache's scan
+/// writes to disk.
+#[test]
+fn direct_reclaim_never_walks_a_deferred_cache() {
+    with_deferred_fake(64 << 20, || {
+        assert_eq!(
+            shrink(1 << 20),
+            0,
+            "a deferred cache answered direct reclaim"
+        );
+        assert_eq!(
+            deferred_one::CALLS.load(Ordering::Relaxed),
+            0,
+            "direct reclaim walked a deferred cache"
+        );
+        assert_eq!(
+            reclaimable(),
+            0,
+            "a deferred cache was counted as directly reclaimable"
+        );
+        assert_eq!(
+            deferred_reclaimable(),
+            64 << 20,
+            "the deferred registry did not count its own cache"
+        );
+    });
+}
+
+#[test]
+fn the_worker_counts_its_passes_and_its_bytes() {
+    with_deferred_fake(8 << 20, || {
+        let (calls, freed, _) = deferred_stats();
+        request(1 << 20);
+        assert_eq!(run_deferred(), 1 << 20);
+        let (calls_after, freed_after, _) = deferred_stats();
+        assert_eq!(calls_after, calls + 1, "the pass was not counted");
+        assert_eq!(
+            freed_after - freed,
+            1 << 20,
+            "the bytes freed were not counted"
+        );
+    });
+}
+
+/// ... and only the shortfall. A direct reclaim that covered the whole target
+/// leaves the worker nothing to do: raising a demand there would walk the page
+/// cache -- a filesystem write per dirty page -- for memory that is already
+/// free.
+#[test]
+fn a_direct_reclaim_that_covered_its_target_leaves_no_demand() {
+    with_fakes(8 << 20, 0, || {
+        assert_eq!(shrink(2 << 20), 2 << 20, "the direct cache gave nothing");
+        assert_eq!(
+            pending(),
+            0,
+            "a target direct reclaim met in full still woke the worker"
+        );
+    });
+}
+
+/// Half covered is half asked for.
+#[test]
+fn the_demand_is_what_direct_reclaim_left_short() {
+    with_fakes(1 << 20, 0, || {
+        assert_eq!(shrink(3 << 20), 1 << 20);
+        assert_eq!(
+            pending(),
+            2 << 20,
+            "the demand is not what direct reclaim left short"
+        );
+    });
 }

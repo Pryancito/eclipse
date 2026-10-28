@@ -136,7 +136,7 @@ impl FdInfo {
         let file = linux
             .get_file_like(self.fd)
             .map_err(|_| FsError::EntryNotFound)?;
-        let mut flags = file.flags().status();
+        let mut flags = file.status_flags();
         flags.set(
             OpenFlags::CLOEXEC,
             linux.fd_cloexec(self.fd).unwrap_or(false),

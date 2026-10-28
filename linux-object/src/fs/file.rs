@@ -333,6 +333,9 @@ type SharedVmoMap = alloc::collections::BTreeMap<
     (Arc<VmObject>, alloc::sync::Weak<dyn INode>, bool),
 >;
 
+#[path = "page_cache_reclaim.rs"]
+pub(super) mod page_cache_reclaim;
+
 /// Registry key for a file: `(filesystem identity, inode number)`.
 ///
 /// The old key -- the inode ARC's data pointer -- deduplicated nothing across
@@ -394,6 +397,18 @@ lazy_static::lazy_static! {
     static ref SHARED_FILE_VMOS: lock::Mutex<SharedVmoMap> =
         lock::Mutex::new(alloc::collections::BTreeMap::new());
 }
+
+/// Serializes every test that drives the shared-VMO registry, in this module
+/// and in the page-cache reclaimer's.
+///
+/// They share ONE registry, and their assertions are about global state:
+/// `writes_under_lock` counts "somebody held the registry lock", which in a
+/// parallel run is as easily a neighbour test as the code under test, and a
+/// `take_prunable` from one test evicts the entry another one just registered.
+/// Between them they failed about one parallel run in three, always naming
+/// whichever test lost the race rather than anything that was broken.
+#[cfg(test)]
+pub(super) static REGISTRY_TEST_LOCK: lock::Mutex<()> = lock::Mutex::new(());
 
 /// Entry count and committed bytes held by the MAP_SHARED file-VMO registry.
 ///
@@ -3135,14 +3150,9 @@ mod shared_vmo_registry_tests {
     use rcore_fs::vfs::{FileSystem, FsError, Metadata, PollStatus};
     use rcore_fs_ramfs::RamFS;
 
-    /// Serializes the four tests of this module. They share ONE registry, and
-    /// two of their assertions are about global state: `writes_under_lock`
-    /// counts "somebody held the registry lock", which in a parallel run is
-    /// as easily a neighbour test as the code under test, and a `take_prunable`
-    /// from one test evicts the entry another one just registered. Between
-    /// them they failed about one parallel run in three, always naming
-    /// whichever test lost the race rather than anything that was broken.
-    static REGISTRY_TEST_LOCK: lock::Mutex<()> = lock::Mutex::new(());
+    /// Serializes the tests of this module, with the page-cache reclaimer's
+    /// (see [`super::REGISTRY_TEST_LOCK`]).
+    use super::REGISTRY_TEST_LOCK;
 
     /// What the probe saw, kept by the test: the probe inode itself must die
     /// with the registry entry, so it cannot hold the counters.
