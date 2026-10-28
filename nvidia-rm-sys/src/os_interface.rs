@@ -872,14 +872,15 @@ fn level_from_usize(saved: usize) -> Option<log::LevelFilter> {
 }
 
 /// Probe-diagnostic line: ALWAYS lands in the capture buffer (folded into the
-/// /proc output afterwards) and ALSO renders at ERROR level when rendering is
-/// on. Inside the console-quiet window the log macro short-circuits at
-/// `max_level` (Off) but the capture still records -- use this instead of a
-/// bare `log::error!` for any diagnostic that runs inside the GSP boot
-/// window, or quiet mode silently discards it (review finding).
+/// /proc output afterwards) and ALSO renders at INFO level when rendering is
+/// on (the GSP boot works now, so it no longer shouts at the default
+/// `LOG=error`). Inside the console-quiet window the log macro short-circuits
+/// at `max_level` (Off) but the capture still records -- use this instead of
+/// a bare log macro for any diagnostic that runs inside the GSP boot window,
+/// or quiet mode silently discards it (review finding).
 pub fn probe_line(s: &str) {
     capture_push(s);
-    log::error!("{}", s);
+    log::info!("{}", s);
 }
 // Generous cap: the GSP-RM boot path (gpustep6) narrates far more than the
 // attach path, and the whole buffer is folded into the /proc read (which is
@@ -1015,7 +1016,8 @@ fn log_raw_cstr(str_: *const c_char) {
                     core::sync::atomic::AtomicU64::new(0);
                 LAST_ASSERT_HASH.swap(h, Ordering::Relaxed) != h
             };
-            // Also always at ERROR: Eclipse's GR bring-up diagnostics, tagged
+            // Also always at INFO (was ERROR until GR worked on hardware):
+            // Eclipse's GR bring-up diagnostics, tagged
             // "ECLIPSE-GR" (golden-image creation in kernel_graphics.c, global
             // ctx-buffer mapping in kernel_graphics_context.c). Those fire during
             // GR StateLoad / the first client's PROMOTE_CTX -- outside any
@@ -1028,12 +1030,14 @@ fn log_raw_cstr(str_: *const c_char) {
             // lines: they are a handful per boot -- one golden verdict plus four
             // ctx-buffer map results per client -- not a flood.
             let eclipse_diag = s.contains("ECLIPSE-GR");
-            if LIVE_ECHO.load(Ordering::Relaxed) || xid || assert_fresh || eclipse_diag {
+            if LIVE_ECHO.load(Ordering::Relaxed) || xid || assert_fresh {
                 if assert_fresh {
                     log::error!("[nvidia-rm] {} (identical repeats suppressed)", s);
                 } else {
                     log::error!("[nvidia-rm] {}", s);
                 }
+            } else if eclipse_diag {
+                log::info!("[nvidia-rm] {}", s);
             } else {
                 log::debug!("[nvidia-rm] {}", s);
             }

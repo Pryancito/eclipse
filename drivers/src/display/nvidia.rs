@@ -1232,7 +1232,7 @@ impl NvidiaGpu {
         for (name, off) in regs {
             let v = rd(off);
             let line = alloc::format!("[{}] preboot {} ({:#08x}) = {:#010x}", tag, name, off, v);
-            log::error!("{}", line);
+            log::info!("{}", line);
             let _ = writeln!(s, "{}", line);
         }
         let cmd = {
@@ -1246,7 +1246,7 @@ impl NvidiaGpu {
             unsafe { PCI_ACCESS.read16(&PortOpsImpl, loc, 0x04) }
         };
         let line = alloc::format!("[{}] preboot PCI COMMAND = {:#06x}", tag, cmd);
-        log::error!("{}", line);
+        log::info!("{}", line);
         let _ = writeln!(s, "{}", line);
         // PCIe link config of this GPU and its root port: MPS (Max Payload
         // Size) and MRRS (Max Read Request Size) from the PCIe capability's
@@ -1298,7 +1298,7 @@ impl NvidiaGpu {
                 function: 0,
             };
             let line = pcie_dump(gpu_loc, "GPU");
-            log::error!("{}", line);
+            log::info!("{}", line);
             let _ = writeln!(s, "{}", line);
             if let Some((b, d, f)) = self.find_parent_bridge() {
                 let rp_loc = Location {
@@ -1307,7 +1307,7 @@ impl NvidiaGpu {
                     function: f,
                 };
                 let line = pcie_dump(rp_loc, "root-port");
-                log::error!("{}", line);
+                log::info!("{}", line);
                 let _ = writeln!(s, "{}", line);
             }
         }
@@ -1319,7 +1319,7 @@ impl NvidiaGpu {
             tag,
             flush
         );
-        log::error!("{}", line);
+        log::info!("{}", line);
         let _ = writeln!(s, "{}", line);
         // Display liveness: the scanout theory REQUIRES the primary's heads
         // to be AWAKE with an advancing raster before it can explain the
@@ -1366,7 +1366,7 @@ impl NvidiaGpu {
                 tag,
                 phase
             );
-            log::error!("{}", line);
+            log::info!("{}", line);
             let _ = writeln!(s, "{}", line);
             return s;
         }
@@ -1404,7 +1404,7 @@ impl NvidiaGpu {
                     "frozen"
                 }
             );
-            log::error!("{}", line);
+            log::info!("{}", line);
             let _ = writeln!(s, "{}", line);
         }
         // ...and what the display engine has PENDING, which the head state
@@ -1622,7 +1622,7 @@ impl NvidiaGpu {
             "[{}] PBUS alt regs: 0x1984={:#010x} 0x1988={:#010x} 0x198C={:#010x}; LEAF[4]={:#010x} PMC_INTR0={:#010x}",
             tag, lr_save0, lr_save1, lr_errc, leaf4, pmc0
         );
-        log::error!("{}", s.trim_end());
+        log::info!("{}", s.trim_end());
         // Retire at the unit: clear the fault latch, then W1C the status.
         if !is_badf(save0) {
             wr(0x9084, 0);
@@ -1656,7 +1656,7 @@ impl NvidiaGpu {
             pmc0_after,
             verdict
         );
-        log::error!("{}", tail);
+        log::info!("{}", tail);
         let _ = writeln!(s, "{}", tail);
         s
     }
@@ -1748,7 +1748,7 @@ impl NvidiaGpu {
             128u32 << ((new_devctl >> 5) & 0x7),
             128u32 << rp_mps
         );
-        log::error!("{}", line.trim_end());
+        log::info!("{}", line.trim_end());
         line
     }
 
@@ -1960,7 +1960,7 @@ impl NvidiaGpu {
                 // can interfere"). Everything is still captured and folded
                 // into this /proc read afterwards; only live rendering stops.
                 if quiet && drain_for_console {
-                    log::error!(
+                    log::info!(
                         "[NVIDIA] {}: entering console-silent GSP boot window (Linux console_lock equivalent) -- next render after kgspInitRm returns",
                         tag
                     );
@@ -2012,14 +2012,14 @@ impl NvidiaGpu {
                         }
                     });
                     let ok = crate::net::msi_register_and_unmask(msi_vec, handler);
-                    log::error!(
+                    log::info!(
                         "[NVIDIA] {}: MSI delivery ONLINE for the GSP boot (vector {}, registered={})",
                         tag,
                         msi_vec,
                         ok
                     );
                 } else {
-                    log::error!(
+                    log::info!(
                         "[NVIDIA] {}: NO MSI vector on this GPU (msi_vector unset) -- GSP boot runs INTx-masked as before; pci.rs found no legacy MSI cap (0x05). NVIDIA may expose only MSI-X (0x11).",
                         tag
                     );
@@ -2070,7 +2070,7 @@ impl NvidiaGpu {
                     crate::net::msi_mask_and_unregister(msi_vec);
                     let (_v, n) = nvidia_rm_sys::survival::msi_status();
                     nvidia_rm_sys::survival::msi_offline();
-                    log::error!(
+                    log::info!(
                         "[NVIDIA] {}: MSI delivery offline; {} MSI(s) serviced during the GSP boot{}",
                         tag,
                         n,
@@ -2083,7 +2083,7 @@ impl NvidiaGpu {
                 }
                 if quiet && drain_for_console {
                     nvidia_rm_sys::os_interface::console_quiet_end();
-                    log::error!(
+                    log::info!(
                         "[NVIDIA] {}: console-silent window exited (kgspInitRm returned)",
                         tag
                     );
