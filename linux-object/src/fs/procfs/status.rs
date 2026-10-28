@@ -7,9 +7,10 @@
 //! `Cpus_allowed_list:` were missing, so a program asking whether it is being
 //! traced (`grep TracerPid`) found nothing to read, `ps s` had no masks to
 //! show, and a check of `CapEff:` before trying something privileged read an
-//! empty string. Of the memory lines Linux writes after `NSsid:`, the peaks
-//! (`VmPeak:`, `VmHWM:`), the locked and pinned sizes and the split of the
-//! resident size need numbers this kernel does not keep yet.
+//! empty string. Of the memory lines Linux writes after `NSsid:`, `VmPeak:`
+//! (the `VmSize` high-water) is now kept incrementally by the VMAR; `VmHWM:`
+//! (the resident peak), the locked and pinned sizes and the split of the
+//! resident size still need numbers this kernel does not keep yet.
 
 use super::*;
 use crate::fs::FileDesc;
@@ -108,12 +109,17 @@ pub(super) fn proc_task_status(proc: &Process, thread: Option<&Arc<Thread>>) -> 
         let vmar = proc.vmar();
         let stats = vmar.get_task_stats();
         let vm_size_kb = stats.mapped_bytes() / 1024;
+        // VmPeak = hiwater of VmSize. The max() is a belt against the running
+        // peak ever reading below the live size (it never should): VmPeak is
+        // never less than VmSize in Linux.
+        let vm_peak_kb = vmar.peak_mapped_bytes().max(stats.mapped_bytes()) / 1024;
         let vm_rss_kb = (stats.private_bytes() + stats.shared_bytes()) / 1024;
         let sizes = layout::Sizes::of(&vmar.mappings_dump(), layout::Mm::of(proc).as_ref());
         let _ = write!(
             out,
-            "VmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nVmData:\t{:8} kB\nVmStk:\t{:8} kB\n\
+            "VmPeak:\t{:8} kB\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nVmData:\t{:8} kB\nVmStk:\t{:8} kB\n\
              VmExe:\t{:8} kB\nVmLib:\t{:8} kB\nVmPTE:\t{:8} kB\nVmSwap:\t{:8} kB\n",
+            vm_peak_kb,
             vm_size_kb,
             vm_rss_kb,
             sizes.data / 1024,
