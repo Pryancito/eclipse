@@ -57,7 +57,7 @@ extern crate self as eclipsefs;
 mod integration;
 
 pub use compress::Compression;
-pub use cow::{EncryptionPolicy, SendStats};
+pub use cow::{EncryptionPolicy, OpenCheck, SendStats};
 pub use device::BlockDevice;
 pub use format::FileKind;
 pub use fs::{
