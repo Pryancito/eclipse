@@ -1,5 +1,5 @@
 //! The `/proc` readers of the RM bring-up (`gpustep5` to `gpustep9`) on
-//! the fake RM, and the lines `gpustep6` and `gpustep11`..`gpustep14`
+//! the fake RM, and the lines `gpustep6` and `gpustep14`
 //! print before they would touch hardware: the BAR0 chip-ID probe, the
 //! core init that failed, the attach that landed (and what the RM was
 //! told about the card), the one refused for want of a ladder slot, the
@@ -74,18 +74,6 @@ fn every_reader_after_the_attach_says_skipped_without_a_device_instance() {
     assert_eq!(
         DrmScheme::bringup_step6(&gpu),
         "[gpustep6]  --- Real GSP-RM boot: skipped (run /proc/gpustep5 (RM attach) first) ---\n"
-    );
-    assert_eq!(
-        DrmScheme::bringup_step11(&gpu),
-        "[gpustep11] SKIPPED on secondary GPU (already boots via /proc/gpustep6)\n"
-    );
-    assert_eq!(
-        DrmScheme::bringup_step12(&gpu),
-        "[gpustep12] SKIPPED on secondary GPU (already boots via /proc/gpustep6)\n"
-    );
-    assert_eq!(
-        DrmScheme::bringup_step13(&gpu),
-        "[gpustep13] SKIPPED on secondary GPU (already boots via /proc/gpustep6)\n"
     );
     assert_eq!(
         DrmScheme::bringup_step14(&gpu),

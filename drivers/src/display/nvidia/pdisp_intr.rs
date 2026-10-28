@@ -134,7 +134,7 @@ pub(super) fn dump(bar0: usize, tag: &str, phase: &str) -> String {
     }
     let s = report(tag, phase, dispatch, ctrl_disp, &heads);
     for line in s.lines() {
-        log::error!("{}", line);
+        log::info!("{}", line);
     }
     s
 }

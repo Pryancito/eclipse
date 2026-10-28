@@ -6,7 +6,6 @@ use crate::bus::pci_drivers::PciDriver;
 use crate::prelude::{AccelCaps, ColorFormat, DisplayInfo, FrameBuffer};
 use crate::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemAperture, GemHandle};
 use crate::scheme::{DisplayScheme, DrmScheme, Scheme};
-use crate::utils::dma::DmaRegion;
 use crate::{builder::IoMapper, Device, DeviceError, DeviceResult};
 use alloc::sync::Arc;
 use lock::Mutex;
@@ -182,16 +181,6 @@ fn nouveau_fence_timeout_hook(
 #[allow(dead_code)]
 mod regs;
 
-/// TU106 (Turing) GMMU encode helpers — NV_MMU_VER2 page-table format.
-///
-/// Verified against nouveau `vmmgp100.c` / open-gpu `gp100/dev_mmu.h` (Turing
-/// reuses the gp100 VER2 VMM verbatim). These build page tables in *RAM only*;
-/// the GPU never sees them until the instance block is written and the GMMU is
-/// flushed (a later, riskier step). Critical fact: the leaf PTE address field
-/// is `phys >> 4` (the 53:8 field stores `phys>>12`, and `(phys>>12)<<8 ==
-/// phys>>4`); writing `phys>>12` directly hangs the GPU.
-mod gmmu;
-
 /// Bitmap VRAM allocator for the BAR1 aperture; own file for the size
 /// ceiling, no logic change.
 mod vram_alloc;
@@ -253,11 +242,7 @@ mod pdisp_intr;
 mod quiet_bringup;
 use quiet_bringup::QuietBringup;
 
-/// The copy-engine bring-up plan; own file for the size ceiling, no logic
-/// change.
-mod bringup;
 mod probes;
-use bringup::GpuBringup;
 
 static BOOT_FB_INFO: Mutex<Option<BootFbInfo>> = Mutex::new(None);
 
@@ -498,10 +483,6 @@ pub struct NvidiaGpu {
     pci_bus: u8,
     pci_device: u8,
     vram_allocator: Mutex<Option<NvidiaVramAllocator>>,
-    /// Copy-engine bring-up state (GMMU tables + channel structs). Built lazily
-    /// on the first `/proc/gpudbg` read so the memory plan is only allocated
-    /// when someone is actually debugging GPU bring-up.
-    bringup: Mutex<Option<GpuBringup>>,
     /// Result of the real RM attach attempt (nvidia_rm_sys::rm_init), cached
     /// after the first `/proc/gpudbg` read triggers it so repeated reads
     /// don't re-run RM's own object-construction logic.
@@ -926,7 +907,6 @@ impl NvidiaGpu {
                 fb_vaddr as u64,
                 fb_size as u64,
             ))),
-            bringup: Mutex::new(None),
             rm_attach_result: Mutex::new(None),
             rm_device_instance: Mutex::new(None),
             surfaceflip_state: core::sync::atomic::AtomicU8::new(0),
@@ -1252,7 +1232,7 @@ impl NvidiaGpu {
         for (name, off) in regs {
             let v = rd(off);
             let line = alloc::format!("[{}] preboot {} ({:#08x}) = {:#010x}", tag, name, off, v);
-            log::error!("{}", line);
+            log::info!("{}", line);
             let _ = writeln!(s, "{}", line);
         }
         let cmd = {
@@ -1266,7 +1246,7 @@ impl NvidiaGpu {
             unsafe { PCI_ACCESS.read16(&PortOpsImpl, loc, 0x04) }
         };
         let line = alloc::format!("[{}] preboot PCI COMMAND = {:#06x}", tag, cmd);
-        log::error!("{}", line);
+        log::info!("{}", line);
         let _ = writeln!(s, "{}", line);
         // PCIe link config of this GPU and its root port: MPS (Max Payload
         // Size) and MRRS (Max Read Request Size) from the PCIe capability's
@@ -1318,7 +1298,7 @@ impl NvidiaGpu {
                 function: 0,
             };
             let line = pcie_dump(gpu_loc, "GPU");
-            log::error!("{}", line);
+            log::info!("{}", line);
             let _ = writeln!(s, "{}", line);
             if let Some((b, d, f)) = self.find_parent_bridge() {
                 let rp_loc = Location {
@@ -1327,7 +1307,7 @@ impl NvidiaGpu {
                     function: f,
                 };
                 let line = pcie_dump(rp_loc, "root-port");
-                log::error!("{}", line);
+                log::info!("{}", line);
                 let _ = writeln!(s, "{}", line);
             }
         }
@@ -1339,7 +1319,7 @@ impl NvidiaGpu {
             tag,
             flush
         );
-        log::error!("{}", line);
+        log::info!("{}", line);
         let _ = writeln!(s, "{}", line);
         // Display liveness: the scanout theory REQUIRES the primary's heads
         // to be AWAKE with an advancing raster before it can explain the
@@ -1386,7 +1366,7 @@ impl NvidiaGpu {
                 tag,
                 phase
             );
-            log::error!("{}", line);
+            log::info!("{}", line);
             let _ = writeln!(s, "{}", line);
             return s;
         }
@@ -1424,7 +1404,7 @@ impl NvidiaGpu {
                     "frozen"
                 }
             );
-            log::error!("{}", line);
+            log::info!("{}", line);
             let _ = writeln!(s, "{}", line);
         }
         // ...and what the display engine has PENDING, which the head state
@@ -1455,16 +1435,6 @@ impl NvidiaGpu {
     /// valid-tag | bus<<16 | device<<8 | function).
     fn config_handle(&self) -> usize {
         0x8000_0000usize | ((self.pci_bus as usize) << 16) | ((self.pci_device as usize) << 8)
-    }
-
-    /// Packed config-space handle for the immediate upstream bridge, 0 if
-    /// none found.
-    fn parent_config_handle(&self) -> usize {
-        self.find_parent_bridge()
-            .map(|(b, d, f)| {
-                0x8000_0000usize | ((b as usize) << 16) | ((d as usize) << 8) | f as usize
-            })
-            .unwrap_or(0)
     }
 
     /// Immediate upstream bridge (the one whose secondary bus IS this GPU's
@@ -1503,80 +1473,6 @@ impl NvidiaGpu {
             }
         }
         None
-    }
-
-    /// Containment: program the root port's PCIe Completion Timeout so a
-    /// dead endpoint turns CPU reads into bounded all-ones completions
-    /// instead of an unbounded core stall. Best-effort -- logs what it
-    /// found; if the platform doesn't support CTO ranges (DevCap2[3:0]==0)
-    /// nothing is written.
-    fn arm_completion_timeout(&self) -> String {
-        use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
-        use core::fmt::Write;
-        use pci::Location;
-        let mut s = String::new();
-        let Some((b, d, f)) = self.find_parent_bridge() else {
-            let _ = writeln!(s, "[gpustep11] CTO: no parent bridge found");
-            return s;
-        };
-        let ops = &PortOpsImpl;
-        let loc = Location {
-            bus: b,
-            device: d,
-            function: f,
-        };
-        // Walk the capability list for the PCIe capability (ID 0x10).
-        let mut ptr = unsafe { PCI_ACCESS.read8(ops, loc, 0x34) };
-        let mut cap = 0u8;
-        for _ in 0..16 {
-            if ptr == 0 || ptr == 0xFF {
-                break;
-            }
-            let id = unsafe { PCI_ACCESS.read8(ops, loc, ptr as u16) };
-            if id == 0x10 {
-                cap = ptr;
-                break;
-            }
-            ptr = unsafe { PCI_ACCESS.read8(ops, loc, ptr as u16 + 1) };
-        }
-        if cap == 0 {
-            let _ = writeln!(
-                s,
-                "[gpustep11] CTO: root port {:02x}:{:02x}.{} has no PCIe cap?",
-                b, d, f
-            );
-            return s;
-        }
-        let devcap2 = unsafe { PCI_ACCESS.read32(ops, loc, cap as u16 + 0x24) };
-        let ranges = devcap2 & 0xF;
-        let dc2 = unsafe { PCI_ACCESS.read16(ops, loc, cap as u16 + 0x28) };
-        if ranges == 0 {
-            let _ = writeln!(
-                s,
-                "[gpustep11] CTO: root port {:02x}:{:02x}.{} supports no timeout ranges (DevCap2={:#010x}, DC2={:#06x}) -- containment unavailable",
-                b, d, f, devcap2, dc2
-            );
-            return s;
-        }
-        // Pick the shortest supported range: A(bit0)->0b0001, B->0b0101,
-        // C->0b1001, D->0b1101 (PCIe base spec encoding).
-        let val: u16 = if ranges & 1 != 0 {
-            0b0001
-        } else if ranges & 2 != 0 {
-            0b0101
-        } else if ranges & 4 != 0 {
-            0b1001
-        } else {
-            0b1101
-        };
-        let new_dc2 = (dc2 & !0x001F) | val; // clear CTO-disable (bit4) + set range
-        unsafe { PCI_ACCESS.write16(ops, loc, cap as u16 + 0x28, new_dc2) };
-        let _ = writeln!(
-            s,
-            "[gpustep11] CTO armed on root port {:02x}:{:02x}.{}: DevCap2={:#010x} DC2 {:#06x} -> {:#06x} (reads of a dead endpoint now complete all-ones instead of hanging, chipset permitting)",
-            b, d, f, devcap2, dc2, new_dc2
-        );
-        s
     }
 
     /// Disable (or restore) legacy VGA routing on every PCI bridge between
@@ -1631,7 +1527,7 @@ impl NvidiaGpu {
                             changed.push((bus, dev, func, bctl));
                             let _ = writeln!(
                                 s,
-                                "[gpustep11] bridge {:02x}:{:02x}.{} VGA routing disabled (BRIDGE_CTL {:#06x} -> {:#06x})",
+                                "[boot-window] bridge {:02x}:{:02x}.{} VGA routing disabled (BRIDGE_CTL {:#06x} -> {:#06x})",
                                 bus, dev, func, bctl, bctl & !(1 << 3)
                             );
                         }
@@ -1641,7 +1537,7 @@ impl NvidiaGpu {
             if changed.is_empty() {
                 let _ = writeln!(
                     s,
-                    "[gpustep11] no bridge on the path had VGA routing enabled"
+                    "[boot-window] no bridge on the path had VGA routing enabled"
                 );
             }
         } else {
@@ -1654,7 +1550,7 @@ impl NvidiaGpu {
                 unsafe { PCI_ACCESS.write16(ops, loc, 0x3E, old) };
                 let _ = writeln!(
                     s,
-                    "[gpustep11] bridge {:02x}:{:02x}.{} VGA routing restored",
+                    "[boot-window] bridge {:02x}:{:02x}.{} VGA routing restored",
                     bus, dev, func
                 );
             }
@@ -1662,11 +1558,6 @@ impl NvidiaGpu {
         (s, changed)
     }
 
-    /// Shared GSP-boot body used by `bringup_step6` (secondary GPU) and
-    /// `bringup_step11` (console GPU, with the graphic console frozen by the
-    /// /proc generator around this call): INTx mask, kgspInitRm, narration
-    /// capture, per-GPU result cache. `tag` labels the output lines
-    /// ("gpustep6"/"gpustep11") so each proc file reads naturally.
     /// PBUS PRI-error pre-boot diagnose + engine-level retire (console GPU).
     /// The workflow research identified the pre-STARTCPU pending LEAF[4] bit28
     /// (CPU vector 156, mirrored in legacy PMC_INTR0 bit 28) as PBUS -- the
@@ -1731,7 +1622,7 @@ impl NvidiaGpu {
             "[{}] PBUS alt regs: 0x1984={:#010x} 0x1988={:#010x} 0x198C={:#010x}; LEAF[4]={:#010x} PMC_INTR0={:#010x}",
             tag, lr_save0, lr_save1, lr_errc, leaf4, pmc0
         );
-        log::error!("{}", s.trim_end());
+        log::info!("{}", s.trim_end());
         // Retire at the unit: clear the fault latch, then W1C the status.
         if !is_badf(save0) {
             wr(0x9084, 0);
@@ -1765,7 +1656,7 @@ impl NvidiaGpu {
             pmc0_after,
             verdict
         );
-        log::error!("{}", tail);
+        log::info!("{}", tail);
         let _ = writeln!(s, "{}", tail);
         s
     }
@@ -1857,7 +1748,7 @@ impl NvidiaGpu {
             128u32 << ((new_devctl >> 5) & 0x7),
             128u32 << rp_mps
         );
-        log::error!("{}", line.trim_end());
+        log::info!("{}", line.trim_end());
         line
     }
 
@@ -1943,6 +1834,10 @@ impl NvidiaGpu {
         (true, s)
     }
 
+    /// Shared GSP-boot body used by `bringup_step6` (secondary GPU) and
+    /// `bringup_step14` (console GPU): INTx mask, kgspInitRm, narration
+    /// capture, per-GPU result cache. `tag` labels the output lines
+    /// ("gpustep6"/"gpustep14") so each proc file reads naturally.
     fn gsp_boot_run(&self, tag: &str, quiet: bool) -> String {
         use core::fmt::Write;
         let device_instance = *self.rm_device_instance.lock();
@@ -2065,7 +1960,7 @@ impl NvidiaGpu {
                 // can interfere"). Everything is still captured and folded
                 // into this /proc read afterwards; only live rendering stops.
                 if quiet && drain_for_console {
-                    log::error!(
+                    log::info!(
                         "[NVIDIA] {}: entering console-silent GSP boot window (Linux console_lock equivalent) -- next render after kgspInitRm returns",
                         tag
                     );
@@ -2117,14 +2012,14 @@ impl NvidiaGpu {
                         }
                     });
                     let ok = crate::net::msi_register_and_unmask(msi_vec, handler);
-                    log::error!(
+                    log::info!(
                         "[NVIDIA] {}: MSI delivery ONLINE for the GSP boot (vector {}, registered={})",
                         tag,
                         msi_vec,
                         ok
                     );
                 } else {
-                    log::error!(
+                    log::info!(
                         "[NVIDIA] {}: NO MSI vector on this GPU (msi_vector unset) -- GSP boot runs INTx-masked as before; pci.rs found no legacy MSI cap (0x05). NVIDIA may expose only MSI-X (0x11).",
                         tag
                     );
@@ -2175,7 +2070,7 @@ impl NvidiaGpu {
                     crate::net::msi_mask_and_unregister(msi_vec);
                     let (_v, n) = nvidia_rm_sys::survival::msi_status();
                     nvidia_rm_sys::survival::msi_offline();
-                    log::error!(
+                    log::info!(
                         "[NVIDIA] {}: MSI delivery offline; {} MSI(s) serviced during the GSP boot{}",
                         tag,
                         n,
@@ -2188,7 +2083,7 @@ impl NvidiaGpu {
                 }
                 if quiet && drain_for_console {
                     nvidia_rm_sys::os_interface::console_quiet_end();
-                    log::error!(
+                    log::info!(
                         "[NVIDIA] {}: console-silent window exited (kgspInitRm returned)",
                         tag
                     );
@@ -2247,272 +2142,6 @@ impl NvidiaGpu {
                 tag
             )
         }
-    }
-
-    /// Issue the tu102 GMMU invalidate for our channel's PDB and poll for
-    /// completion. Returns `(pre, post, ok)` — the trigger register before and
-    /// after, and whether bit31 cleared. Aborts (no write) if a flush is already
-    /// in flight. This is the only GPU register write of Step 2.
-    /// CPU-write a u32 into VRAM at raw VRAM offset `vram_off` via the PRAMIN
-    /// window: point the window base (BAR0+0x1700 = off>>16), then access
-    /// BAR0+0x700000+(off&0xFFFF). The window is 64 KiB; we re-point per access
-    /// for simplicity. This is how the CPU reaches instmem (BAR1 is GMMU-remapped
-    /// and cannot give a known VRAM-physical address).
-    fn pramin_w32(&self, vram_off: u64, val: u32) {
-        let bar0 = self._bar0;
-        unsafe {
-            core::ptr::write_volatile((bar0 + 0x1700) as *mut u32, (vram_off >> 16) as u32);
-            core::ptr::write_volatile(
-                (bar0 + 0x0070_0000 + (vram_off & 0xFFFF) as usize) as *mut u32,
-                val,
-            );
-        }
-    }
-
-    fn pramin_r32(&self, vram_off: u64) -> u32 {
-        let bar0 = self._bar0;
-        unsafe {
-            core::ptr::write_volatile((bar0 + 0x1700) as *mut u32, (vram_off >> 16) as u32);
-            core::ptr::read_volatile(
-                (bar0 + 0x0070_0000 + (vram_off & 0xFFFF) as usize) as *const u32,
-            )
-        }
-    }
-
-    fn pramin_zero(&self, vram_off: u64, len: usize) {
-        for i in (0..len).step_by(4) {
-            self.pramin_w32(vram_off + i as u64, 0);
-        }
-    }
-
-    /// Write the channel instance block into VRAM (via PRAMIN). The host reads it
-    /// as VRAM-physical. The PD-base at 0x200 points at the *sysmem* page tables
-    /// (target=2). USERD pointer is VRAM-physical; the GPFIFO base is a GPU VA
-    /// (GMMU-translated). Offsets per nouveau gv100_vmm_join / ramfc_write.
-    /// Write the Turing VER2 PDB join (gv100_vmm_join) into a VRAM instance
-    /// block via PRAMIN: PD-base @0x200, VA limit @0x208, and the 0x2a0
-    /// subcontext descriptor table (entry 0 = real PDB, 1..63 = 0x1/0x1/0).
-    /// Shared by the channel and BAR2 instance blocks. Assumes already zeroed.
-    fn write_pdb_join_vram(&self, inst: u64, root_phys: u64) {
-        let w32 = |off: u64, v: u32| self.pramin_w32(inst + off, v);
-        let base = gmmu::inst_pd_base(root_phys); // root | 0xC06 (sysmem target)
-        w32(0x200, base as u32);
-        w32(0x204, (base >> 32) as u32);
-        w32(0x208, ((1u64 << 49) - 1) as u32);
-        w32(0x20c, (((1u64 << 49) - 1) >> 32) as u32);
-        w32(0x21c, 0);
-        w32(0x2a0, base as u32);
-        w32(0x2a4, (base >> 32) as u32);
-        w32(0x2a8, 0);
-        for i in 1..64u64 {
-            let o = 0x2a0 + i * 0x10;
-            w32(o, 0x1);
-            w32(o + 4, 0x1);
-            w32(o + 8, 0);
-        }
-        w32(0x298, 0x1);
-        w32(0x29c, 0x0);
-    }
-
-    fn write_instance_block_vram(&self, b: &GpuBringup) {
-        let inst = b.inst_vram();
-        self.pramin_zero(inst, 0x1000);
-        let w32 = |off: u64, v: u32| self.pramin_w32(inst + off, v);
-        // PD-base + VA limit + Turing PDB descriptor table.
-        self.write_pdb_join_vram(inst, b.root.paddr() as u64);
-        // RAMFC: USERD (VRAM phys), GPFIFO (GPU VA), ids.
-        let userd = b.userd_vram();
-        let gpfifo_va = b.gpfifo_va();
-        let limit2 = (b.gpfifo.byte_len() as u64 / 8).trailing_zeros();
-        w32(0x008, userd as u32);
-        w32(0x00c, (userd >> 32) as u32);
-        w32(0x010, 0x0000_face);
-        w32(0x030, 0x7fff_f902);
-        w32(0x048, gpfifo_va as u32);
-        w32(0x04c, ((gpfifo_va >> 32) as u32) | (limit2 << 16));
-        w32(0x084, 0x2040_0000);
-        w32(0x094, 0x3000_0000 | 0xfff);
-        // Fetched the real source (nvkm subdev/fifo/gv100.c, gv100_chan_ramfc):
-        //   const struct nvkm_chan_func_ramfc gv100_chan_ramfc = {
-        //       .write = gv100_chan_ramfc_write, .devm = 0xfff, .priv = true,
-        //   };
-        // `priv` is a FIXED property of the ramfc func table for this chip
-        // generation, not a per-channel choice — EVERY gv100/tu102 channel
-        // (client or kernel) uses priv=true. A previous commit here reasoned
-        // priv should be false for a "normal client channel" and set
-        // 0x0e4=0/0x0f4=0x1000; that directly contradicts the real source,
-        // which always writes 0x0e4=(priv?0x20:0)=0x20 and
-        // 0x0f4=0x1000|(priv?0x100:0)=0x1100 for this ramfc variant. Fixing
-        // to match verbatim.
-        w32(0x0e4, 0x0000_0020);
-        w32(0x0e8, 0x0000_0000); // chan_id 0
-        w32(0x0f4, 0x0000_1100);
-        w32(0x0f8, 0x1000_3080);
-        // CE/GR engine-context pointers (0x210-0x224, arm bits 0x10000/0x20000
-        // at 0x0ac) are left ZERO: HOST never reads them during channel load —
-        // only the engine does, on a faulting method, which never happens before
-        // GP_GET advances. Arming a CE context with a BAR2 pointer is a red
-        // herring for the load-time fault, so we bring up HOST first.
-    }
-
-    /// Arm the HUB MMU non-replayable fault buffer (buffer 0) so the host will
-    /// schedule channels. NV_VIRTUAL_FUNCTION_PRIV_MMU_FAULT_BUFFER at 0xb83000:
-    /// LO = addr|aperture|mode, HI = addr_hi, SIZE = count|ENABLE. We use
-    /// PHYSICAL mode + SYS_COH aperture so the buffer is plain sysmem (no BAR2).
-    /// Returns (hw_count, lo, hi, size) for reporting.
-    fn setup_fault_buffer(&self, b: &GpuBringup) -> (u32, u32, u32, u32) {
-        let bar0 = self._bar0;
-        let rd =
-            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
-        let wr = |off: u32, v: u32| unsafe {
-            core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
-        };
-        // Latch + read the HW-reported entry count (set bit30, clear ENABLE).
-        wr(0x00b8_3010, (rd(0x00b8_3010) & !0xc000_0000) | 0x4000_0000);
-        let hw_count = rd(0x00b8_3010) & 0x000f_ffff;
-        // Our buffer holds at most 0x40000/32 = 0x2000 entries.
-        let cap = (b.fault_buf.byte_len() / 32) as u32;
-        let count = hw_count.min(cap);
-        let phys = b.fault_buf.paddr() as u64;
-        // LO: PHYSICAL(bit0=1) | PHYS_APERTURE SYS_COH(2<<1) | VOL(1<<3) | ADDR.
-        let lo = (phys as u32 & 0xffff_f000) | 0x1 | (2 << 1) | (1 << 3);
-        wr(0x00b8_3004, (phys >> 32) as u32);
-        wr(0x00b8_3000, lo);
-        // SIZE: entry count + ENABLE(bit31).
-        wr(0x00b8_3010, count | 0x8000_0000);
-        (hw_count, lo, (phys >> 32) as u32, rd(0x00b8_3010))
-    }
-
-    /// Set BAR2 live so the host can dereference the CE fault-method-buffer
-    /// pointer (read by the BAR2 MMU as engine_id=BAR2/client=HOST_CPU). The
-    /// BAR2 instance block (VRAM, via PRAMIN) points at the SAME page tables as
-    /// the channel, so BAR2 VA == channel VA. Register per tu102_bar_bar2_init.
-    fn setup_bar2(&self, b: &GpuBringup) -> (u32, u32, u32) {
-        // Build the BAR2 instance block in VRAM with the FULL Turing VER2 PDB
-        // join (PD-base + VA limit + the 0x2a0 descriptor table), same as a
-        // channel — on Turing even a BAR vmm uses the VER2 join. Shared root.
-        let bi = b.bar2_inst_vram();
-        self.pramin_zero(bi, 0x1000);
-        self.write_pdb_join_vram(bi, b.root.paddr() as u64);
-
-        let bar0 = self._bar0;
-        let rd =
-            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
-        let wr = |off: u32, v: u32| unsafe {
-            core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
-        };
-        let before = rd(0x00b8_0f48);
-        // 0xb80f48 = 0x80000000 | (bar2_inst_vram >> 12).
-        wr(0x00b8_0f48, 0x8000_0000 | (bi >> 12) as u32);
-        let after = rd(0x00b8_0f48);
-        // Wait for the BAR2 bind to settle (0xb80f50 bits 0xc).
-        let mut wait = 0;
-        for _ in 0..1_000_000u64 {
-            wait = rd(0x00b8_0f50);
-            if wait & 0x0000_000c == 0 {
-                break;
-            }
-            gpu_spin();
-        }
-        (before, after, wait)
-    }
-
-    /// Write the runlist into VRAM (via PRAMIN): cgrp entry + chan entry. The
-    /// USERD/inst pointers in the chan entry are VRAM-physical. Per nouveau
-    /// gv100_runl_insert_cgrp/chan (chan_id=0, cgrp_id=0, chan_nr=1, runq=0).
-    fn write_runlist_vram(&self, b: &GpuBringup) {
-        let rl = b.runlist_vram();
-        self.pramin_zero(rl, 0x20);
-        let w32 = |off: u64, v: u32| self.pramin_w32(rl + off, v);
-        let userd = b.userd_vram();
-        let inst = b.inst_vram();
-        w32(0x00, 0x8003_0001);
-        w32(0x04, 1); // chan_nr
-        w32(0x08, 0); // cgrp_id
-        w32(0x0c, 0);
-        w32(0x10, userd as u32); // | (runq<<1), runq=0
-        w32(0x14, (userd >> 32) as u32);
-        w32(0x18, inst as u32); // | chan_id, chan_id=0
-        w32(0x1c, (inst >> 32) as u32);
-    }
-
-    /// Global FIFO + per-PBDMA init — the bring-up nouveau does in the fifo
-    /// subdev BEFORE any channel commit, which we had skipped. Un-SUSPENDs the
-    /// PBDMAs so the host will load a committed channel onto one. Order &
-    /// values per nvkm fifo: tu102_fifo_init_pbdmas + gk208/gk104/gf100_runq_init
-    /// + gk104_fifo_init. Idempotent.
-    fn setup_fifo(&self) {
-        let bar0 = self._bar0;
-        let rd =
-            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
-        let wr = |off: u32, v: u32| unsafe {
-            core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
-        };
-        // (0) PMC reset pulse for FIFO (nvkm_mc_reset, gk104_mc_reset[]: FIFO =
-        // mask 0x00000100 at NV_PMC_ENABLE 0x000200). This is the FIRST thing
-        // nouveau does for any engine before touching its registers — disable
-        // then re-enable the bit, deasserting reset. We never did this: the
-        // register *file* tolerates R/W while clock/reset-gated (writes latch,
-        // reads echo them back), but the scheduler FSM that walks
-        // PENDING -> ON_PBDMA never actually runs while FIFO sits in reset,
-        // which matches every symptom seen so far (clean fault, clean writes,
-        // zero scheduling progress). Idempotent — safe to repeat.
-        wr(0x0000_0200, rd(0x0000_0200) & !0x0000_0100);
-        let _ = rd(0x0000_0200);
-        wr(0x0000_0200, rd(0x0000_0200) | 0x0000_0100);
-        let _ = rd(0x0000_0200);
-        // (A) doorbell-enable (tu102_fifo_init_pbdmas).
-        wr(0x00b6_5000, rd(0x00b6_5000) | 0x8000_0000);
-        // (B) per-PBDMA (runq) init, stride id*0x2000. NV_PFIFO_PBDMA_MAP has
-        // up to 12 entries (same __SIZE_1=12 as the PBDMA_MAP scan elsewhere
-        // in this file) -- 0..6 was NOT generous enough: a real-hardware run
-        // discovered our CE's runlist is served by PBDMA9, which this loop
-        // never touched. Its INTR_STALL/INTR_0/INTR_EN/TIMEOUT were left at
-        // whatever the hardware defaulted to, and its GET/GP_GET registers
-        // still held stale non-zero values from some prior context -- exactly
-        // consistent with SCHED_STATUS.runlist_fetch_busy staying stuck at 1
-        // forever and PBDMA9's CHANNEL register reading 0 (nothing ever
-        // loaded). Cover the full range; writes to absent PBDMAs are harmless.
-        for q in 0..12u32 {
-            let s = q * 0x2000;
-            // INTR_STALL: clear 0x10000100.
-            wr(0x0004_013c + s, rd(0x0004_013c + s) & !0x1000_0100);
-            wr(0x0004_0108 + s, 0xffff_ffff); // INTR_0   clear
-            wr(0x0004_010c + s, 0xffff_feff); // INTR_EN_0
-            wr(0x0004_0148 + s, 0xffff_ffff); // INTR_1   clear
-            wr(0x0004_014c + s, 0xffff_ffff); // INTR_EN_1
-            wr(0x0004_012c + s, 0x000f_4240); // TIMEOUT = 1000000
-        }
-        // (C) global fifo init (gk104_fifo_init).
-        wr(0x0000_2100, 0xffff_ffff); // PFIFO INTR_0     clear
-        wr(0x0000_2140, 0x7fff_ffff); // PFIFO INTR_EN_0
-    }
-
-    fn gmmu_flush(&self, root_phys: u64) -> (u32, u32, bool) {
-        let bar0 = self._bar0;
-        let rd =
-            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
-        let wr = |off: u32, v: u32| unsafe {
-            core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
-        };
-        let pre = rd(0x00b8_30b0);
-        if pre & 0x8000_0000 != 0 {
-            return (pre, pre, false); // flush already pending — never stack
-        }
-        wr(0x00b8_30a0, (root_phys >> 8) as u32);
-        wr(0x00b8_30a4, 0);
-        wr(0x00b8_30b0, 0x8000_0001); // trigger PAGE_ALL invalidate
-        let mut post = pre;
-        let mut ok = false;
-        for _ in 0..5_000_000u64 {
-            post = rd(0x00b8_30b0);
-            if post & 0x8000_0000 == 0 {
-                ok = true;
-                break;
-            }
-            gpu_spin();
-        }
-        (pre, post, ok)
     }
 
     /// Scan the PTOP device-info table (0x022700+i*4, 64 slots) for the copy
@@ -2601,146 +2230,6 @@ impl NvidiaGpu {
             }
         }
         standalone_ce.or(first_ce)
-    }
-
-    /// Same scan as `find_ce_runlist` but reports every finalized entry
-    /// (type, inst, runlist) as text, for hardware visibility — does this
-    /// chip even expose a runlist field for CE, and what does GR's look like
-    /// for comparison.
-    fn ptop_report(&self) -> alloc::string::String {
-        use core::fmt::Write;
-        let bar0 = self._bar0;
-        let rd =
-            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
-        let mut out = alloc::string::String::new();
-        let mut ty: u32 = !0;
-        let mut have_entry = false;
-        let mut runlist: u32 = 0;
-        let mut have_runlist = false;
-        for i in 0..64u32 {
-            if !have_entry {
-                ty = !0;
-                have_runlist = false;
-                have_entry = true;
-            }
-            let data = rd(0x0002_2700 + i * 4);
-            match data & 0x3 {
-                0 => continue,
-                1 => {}
-                2 => {
-                    if data & 0x10 != 0 {
-                        runlist = (data >> 21) & 0xf;
-                        have_runlist = true;
-                    }
-                }
-                3 => ty = (data >> 2) & 0x1fff_ffff,
-                _ => unreachable!(),
-            }
-            if data & 0x8000_0000 != 0 {
-                continue;
-            }
-            let name = match ty {
-                0x0 => "GR",
-                0x1 | 0x2 | 0x3 | 0x13 => "CE",
-                0x8 => "MSPDEC",
-                0x9 => "MSPPP",
-                0xa => "MSVLD",
-                0xb => "MSENC",
-                0xc => "VIC",
-                0xd => "SEC2",
-                0xe | 0xf => "NVENC",
-                0x10 => "NVDEC",
-                0x14 => "GSP",
-                0x15 => "NVJPG",
-                _ if ty == !0 => "?",
-                _ => "OTHER",
-            };
-            if ty != !0 {
-                let _ = write!(
-                    out,
-                    " {}(ty={:#x})/rl={}",
-                    name,
-                    ty,
-                    if have_runlist { runlist as i64 } else { -1 }
-                );
-            }
-            have_entry = false;
-        }
-        out
-    }
-
-    /// Idempotently bring the channel to the committed + enabled state (the
-    /// Step 3 end-state): instance block, GMMU flush, runlist commit, doorbell
-    /// and channel enable. Returns (commit_ok, runlist_id_used). Safe to
-    /// repeat — used by Step 4+ so each is self-contained across reboots.
-    fn setup_channel(&self, b: &GpuBringup) -> (bool, u32) {
-        let runl_id = self.find_ce_runlist().map(|(rl, _)| rl).unwrap_or(0);
-        const CHID: u32 = 0;
-        let bar0 = self._bar0;
-        let rd =
-            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
-        let wr = |off: u32, v: u32| unsafe {
-            core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
-        };
-
-        self.write_instance_block_vram(b);
-        self.write_runlist_vram(b);
-        // Arm the HUB MMU fault buffer — required before any channel can run.
-        let _ = self.setup_fault_buffer(b);
-        let _ = self.setup_bar2(b);
-        let _ = self.gmmu_flush(b.root.paddr() as u64);
-
-        // Global FIFO + PBDMA init (un-SUSPEND the PBDMAs) — must precede the
-        // runlist commit, else the host leaves the channel at STATUS=PENDING.
-        self.setup_fifo();
-
-        // Bind the channel's instance block in CHRAM so the host can find it
-        // (gk104_chan_bind_inst: 0x800000+chid*8 = BIND | inst>>12, VRAM target).
-        let inst_vram = b.inst_vram();
-        wr(
-            0x0080_0000 + CHID * 8,
-            0x8000_0000 | (inst_vram >> 12) as u32,
-        );
-
-        // Ensure runlist scheduling is allowed (NV_PFIFO_SCHED_DISABLE bit=runl
-        // id; gk104_runl_allow clears it). Default is 0, but clear it to be sure.
-        wr(0x0000_2630, rd(0x0000_2630) & !(1u32 << runl_id));
-
-        // Enable the channel BEFORE committing the runlist (nouveau order is
-        // bind -> start(enable) -> commit; the commit is what loads the channel,
-        // so it must see an enabled channel). gk104_chan_start: 0x800004 |= 0x400.
-        wr(
-            0x0080_0004 + CHID * 8,
-            rd(0x0080_0004 + CHID * 8) | 0x0000_0400,
-        );
-
-        // tu102_chan_start does MORE than gk104_chan_start: right after the
-        // PCCSR enable write it ALSO rings the doorbell immediately, with the
-        // SAME token a later GPFIFO push would use (runl_id<<16 | chid). This
-        // is the actual kick that wakes the HW scheduler to notice a freshly
-        // enabled channel and pull it off PENDING — without it the channel
-        // can sit at PENDING forever even after a clean runlist commit, which
-        // is exactly the symptom we hit. device->vfn->addr.user + 0x0090 ==
-        // BAR0 + 0xb80000(priv) + 0x030000(user) + 0x90 == 0xbb0090.
-        let token = (runl_id << 16) | CHID;
-        wr(0x00bb_0090, token);
-
-        // Runlist commit LAST (2 entries). The runlist lives in VRAM; the host
-        // reads it VRAM-physical, no target field needed (tu102_runl_commit).
-        let base = 0x0000_2b00 + runl_id * 0x10;
-        let runlist_vram = b.runlist_vram();
-        wr(base, runlist_vram as u32);
-        wr(base + 4, (runlist_vram >> 32) as u32);
-        wr(base + 8, 2);
-        let mut ok = false;
-        for _ in 0..5_000_000u64 {
-            if rd(base + 0xc) & 0x0000_8000 == 0 {
-                ok = true;
-                break;
-            }
-            gpu_spin();
-        }
-        (ok, runl_id)
     }
 
     pub fn fill_rect(&self, x: u32, y: u32, w: u32, h: u32, color: u32) {
@@ -3985,8 +3474,7 @@ impl DrmScheme for NvidiaGpu {
         // PBDMA0/1 above are not necessarily the PBDMA(s) that serve the CE's
         // runlist (discovered as PBDMA9 on the last real-hardware run). Dump
         // whichever PBDMA(s) NV_PFIFO_PBDMA_MAP actually routes the CE's
-        // runlist to, so a stuck/never-armed PBDMA is visible without needing
-        // the opt-in /proc/gpustep4.
+        // runlist to, so a stuck/never-armed PBDMA is visible.
         if let Some((ce_rl, _)) = self.find_ce_runlist() {
             for i in 0..12u32 {
                 if i < 2 {
@@ -4024,24 +3512,6 @@ impl DrmScheme for NvidiaGpu {
             }
         }
 
-        // --- Step 1: build the GMMU tables in RAM and dump them (no GPU writes) ---
-        {
-            let mut g = self.bringup.lock();
-            if g.is_none() {
-                // GPU VA base for the packed 2 MiB region (avoids null-VA).
-                *g = GpuBringup::build(0x0020_0000, 0x0300_0000);
-            }
-            match g.as_ref() {
-                Some(b) => s.push_str(&b.dump()),
-                None => {
-                    let _ = writeln!(
-                        s,
-                        "[gpudbg]  GMMU: alloc_coherent FAILED (DMA pool exhausted)"
-                    );
-                }
-            }
-        }
-
         // The last GL/Vulkan client draw-submit outcome, readable from the
         // terminal that launched the client (`cat /proc/gpudbg`) -- no dmesg.
         s.push_str(&super::nouveau_uapi::format_last_exec());
@@ -4066,7 +3536,7 @@ impl DrmScheme for NvidiaGpu {
     /// via NVOC). Moved out of `debug_dump` after it hung the machine on a
     /// plain `cat /proc/gpudbg` on real hardware -- this does real HAL
     /// bind/attach work, not a safe register read, so it gets its own
-    /// deliberate opt-in trigger like bringup_step2/3/4. Cached after the
+    /// deliberate opt-in trigger of its own. Cached after the
     /// first attempt so repeated reads don't re-run it.
     fn bringup_step5(&self) -> String {
         use core::fmt::Write;
@@ -4658,216 +4128,8 @@ impl DrmScheme for NvidiaGpu {
         s
     }
 
-    /// Step 11 (`/proc/gpustep11`): GSP-RM boot on the CONSOLE GPU -- the one
-    /// step 6 refuses to touch. The wedge theory, refined by the secondary
-    /// GPU booting flawlessly with byte-identical software: during the SEC2
-    /// GSP-RM resume window, CPU writes into this GPU's BAR1 (which is
-    /// exactly where the graphic console framebuffer lives -- and step 6's
-    /// RmMsg narration prints DOZENS of lines, each one drawing pixels) stall
-    /// the bus for good. NVIDIA's own driver avoids this class of collision
-    /// with os_disable_console_access() around init. Eclipse's equivalent:
-    /// the /proc/gpustep11 generator (linux-object procfs) puts the active VT
-    /// into KD_GRAPHICS around this call -- pixel presentation stops (the VT
-    /// shadow buffer keeps accumulating; serial/dmesg unaffected), and the
-    /// return to KD_TEXT repaints everything that happened meanwhile.
-    fn bringup_step11(&self) -> String {
-        if !self.drives_boot_display() {
-            return String::from(
-                "[gpustep11] SKIPPED on secondary GPU (already boots via /proc/gpustep6)\n",
-            );
-        }
-        let mut s = String::new();
-        // Declare this GPU's real identity to RM BEFORE the GSP boot, exactly
-        // where Linux does (RmDeterminePrimaryDevice /
-        // RmSetConsolePreservationParams right before kgspInitRm): it is the
-        // PRIMARY device with a live UEFI GOP console in its BAR1. Without
-        // this, the SET_GUEST_SYSTEM_INFO RPC told GSP-RM `bIsPrimary=false`
-        // and no console region was reserved -- the one remaining difference
-        // vs. the (working) secondary GPU after the console-freeze experiment
-        // exonerated CPU pixel writes. Idempotent: plain property/field
-        // writes, safe to repeat on a cached re-read.
-        if let Some(device_instance) = *self.rm_device_instance.lock() {
-            let (console_size, at_bar1_base) = match *BOOT_FB_INFO.lock() {
-                Some(fb) => (
-                    fb.pitch as u64 * fb.height as u64,
-                    fb.phys == self.bar1_phys,
-                ),
-                None => (0, false),
-            };
-            let mark = nvidia_rm_sys::rm_init::mark_console_gpu(
-                device_instance,
-                console_size,
-                at_bar1_base,
-            );
-            match mark {
-                Ok(()) => {
-                    s.push_str(&alloc::format!(
-                        "[gpustep11] console-GPU identity declared to RM (PRIMARY_DEVICE, console {} KiB, at BAR1 base: {})\n",
-                        console_size / 1024,
-                        at_bar1_base
-                    ));
-                }
-                Err(status) => {
-                    s.push_str(&alloc::format!(
-                        "[gpustep11] mark_console_gpu FAILED, NV_STATUS={:#x} (continuing to boot anyway)\n",
-                        status
-                    ));
-                }
-            }
-        }
-        // EXPERIMENT (SEC2-RTOS resume wedge, round 3): the live trace showed
-        // the console GPU boots GSP-RM fine all the way to the CPU sequencer's
-        // CORE_RESUME -- Booter Load clean, RISC-V started, RUN_CPU_SEQUENCER
-        // RPC received -- and then the FIRST BAR0 read after restarting SEC2
-        // (whose VBIOS SEC2-RTOS/BSI payload runs display/VGA restore phases
-        // on a PRIMARY device) never completes. NVIDIA's own primary-VGA
-        // detection keys on PCI I/O decode (kbifIsPciIoAccessEnabled,
-        // osinit.c:900) -- the one config-space difference vs. the (working)
-        // secondary GPU, and one the GPU firmware can see through its own
-        // config mirror. So: clear PCI COMMAND bit 0 (I/O Space Enable) for
-        // the duration of the boot, making the console GPU indistinguishable
-        // from a secondary to the SEC2-RTOS, and restore it afterwards.
-        // Console rendering is untouched (BAR1 is MEM space, bit 1).
-        let io_cmd_old = {
-            use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
-            use pci::Location;
-            let loc = Location {
-                bus: self.pci_bus,
-                device: self.pci_device,
-                function: 0,
-            };
-            let ops = &PortOpsImpl;
-            let cmd = unsafe { PCI_ACCESS.read16(ops, loc, 0x04) };
-            unsafe { PCI_ACCESS.write16(ops, loc, 0x04, cmd & !0x0001) };
-            s.push_str(&alloc::format!(
-                "[gpustep11] PCI I/O decode disabled for the boot (COMMAND {:#06x} -> {:#06x}; SEC2-RTOS should now see a non-primary GPU)\n",
-                cmd,
-                cmd & !0x0001
-            ));
-            cmd
-        };
-        // Full-chain legacy-VGA routing disable (device I/O decode above +
-        // every bridge on the path here): the SEC2-RTOS display/VGA handoff
-        // suspects legacy routing state; the earlier round only cleared the
-        // function-level bit. Restored after the boot returns.
-        let (bridge_log, bridges_changed) = self.set_path_vga_routing(true, &[]);
-        s.push_str(&bridge_log);
-        // Containment (root-port completion timeout) + post-STARTCPU bus
-        // autopsy instrumentation -- see their doc comments.
-        s.push_str(&self.arm_completion_timeout());
-        nvidia_rm_sys::os_boundary::autopsy_arm(self.config_handle(), self.parent_config_handle());
-        // Diagnostics stay on: live_echo lifts RM narration (and the
-        // sequencer register trace, armed inside gsp_boot_run) to ERROR so
-        // it renders live at LOG=error -- a wedge leaves the exact hanging
-        // register access as the last line on screen.
-        nvidia_rm_sys::os_interface::live_echo_begin();
-        let boot = self.gsp_boot_run("gpustep11", false);
-        nvidia_rm_sys::os_interface::live_echo_end();
-        nvidia_rm_sys::os_boundary::autopsy_disarm();
-        let (restore_log, _) = self.set_path_vga_routing(false, &bridges_changed);
-        s.push_str(&restore_log);
-        {
-            use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
-            use pci::Location;
-            let loc = Location {
-                bus: self.pci_bus,
-                device: self.pci_device,
-                function: 0,
-            };
-            let ops = &PortOpsImpl;
-            // Restore the original COMMAND value, except INTx stays masked
-            // (gsp_boot_run masked it; Eclipse is fully polled).
-            unsafe { PCI_ACCESS.write16(ops, loc, 0x04, io_cmd_old | (1 << 10)) };
-            s.push_str("[gpustep11] PCI I/O decode restored after boot\n");
-        }
-        s.push_str(&boot);
-        s
-    }
-
-    /// Step 12 (`/proc/gpustep12`): EXP 1 -- console-GPU GSP boot with the
-    /// DISPLAY ENGINE HELD IN RESET (PMC_ENABLE bit 30 cleared right after
-    /// kgspCalculateFbLayout consumes NV_PDISP_VGA_WORKSPACE_BASE, via the
-    /// register-shim trigger in os_boundary). Zero isochronous scanout
-    /// traffic during the SEC2-RTOS resume: if the wedge is live-display FB
-    /// fetch vs. the HS payload, this boot COMPLETES. THE SCREEN GOES DARK
-    /// at the trigger and stays dark until reboot -- run it blind:
-    ///   `cat /proc/gpustep12 > /r12.txt; sync`
-    /// then hard-reset and read /r12.txt. Skip this experiment entirely if
-    /// the step-11 preboot dump showed the primary's heads already
-    /// SLEEP/frozen (theory pre-falsified).
     fn hw_dump(&self) -> String {
         self.hw_dump_impl()
-    }
-
-    fn bringup_step12(&self) -> String {
-        if !self.drives_boot_display() {
-            return String::from(
-                "[gpustep12] SKIPPED on secondary GPU (already boots via /proc/gpustep6)\n",
-            );
-        }
-        let mut s = String::new();
-        s.push_str(
-            "[gpustep12] EXP1c: PDISP reset ONLY for the SEC2-resume window, then restored at 'RISCV started' -- screen blanks then comes back; capture with `cat /proc/gpustep12 > /r12.txt; sync`\n",
-        );
-        // EXP1c: EXP1b proved being non-primary doesn't fix the
-        // kgspWaitForRmInitDone timeout -- so PDISP-in-reset itself is what
-        // stalls GSP-RM's init (it touches the display engine before
-        // GSP_INIT_DONE). Fix: os_boundary holds PDISP in reset only across
-        // the SEC2 HS-resume (the wedge window) and restores it on the
-        // "RISCV started" narration marker, so GSP-RM finds the display alive.
-        // Still non-primary for now to isolate the timeout fix.
-        s.push_str(&self.arm_completion_timeout());
-        nvidia_rm_sys::os_boundary::autopsy_arm(self.config_handle(), self.parent_config_handle());
-        nvidia_rm_sys::os_boundary::pdisp_kill_arm();
-        nvidia_rm_sys::os_interface::live_echo_begin();
-        let boot = self.gsp_boot_run("gpustep12", false);
-        nvidia_rm_sys::os_interface::live_echo_end();
-        nvidia_rm_sys::os_boundary::pdisp_kill_disarm();
-        nvidia_rm_sys::os_boundary::autopsy_disarm();
-        s.push_str(&boot);
-        s
-    }
-
-    /// Step 13 (`/proc/gpustep13`): EXP2 -- console-GPU GSP boot with a
-    /// pre-STARTCPU interrupt-drain "pseudo-ISR service loop" (Copilot's
-    /// leading hypothesis). Eclipse is 100% polled with INTx masked and no RM
-    /// ISR, so during the SEC2 CORE_RESUME window a fabric/display interrupt
-    /// the GPU raises is never serviced -- the prime suspect for the STARTCPU
-    /// posted-write stall (flow-control credit exhaustion) that Linux, whose
-    /// ISR drains it, never hits. Right before the STARTCPU store, os_boundary
-    /// snapshots the CPU-facing top-level interrupt tree (ERROR level, survives
-    /// the wedge -> names the pending vector) and write-1-to-clears the leaves
-    /// until quiescent, then lets the store through. Unlike EXP1 it does NOT
-    /// touch PDISP, so it can't break GSP-RM's early boot. Two outcomes, both
-    /// useful in one boot: STARTCPU drains (autopsy runs, boot continues) =>
-    /// hypothesis confirmed, drain is the fix; still wedges => the snapshot
-    /// tells us exactly which interrupt Linux services in that window. The
-    /// screen is untouched (no display reset) -- but capture to a file anyway
-    /// in case STARTCPU still wedges:
-    ///   `cat /proc/gpustep13 > /r13.txt; sync` then read /r13.txt.
-    fn bringup_step13(&self) -> String {
-        if !self.drives_boot_display() {
-            return String::from(
-                "[gpustep13] SKIPPED on secondary GPU (already boots via /proc/gpustep6)\n",
-            );
-        }
-        let mut s = String::new();
-        s.push_str(
-            "[gpustep13] EXP3: pre-STARTCPU interrupt snapshot + UNCONDITIONAL W1C drain (classifies latched vs live-level source); no PDISP/display touch -- snapshot at ERROR survives a wedge; capture with `cat /proc/gpustep13 > /r13.txt; sync`\n",
-        );
-        // Same containment + autopsy instrumentation as step11/12 so the
-        // post-STARTCPU physics are classified either way. The ONLY new
-        // variable vs. a plain console boot is the interrupt drain armed below.
-        s.push_str(&self.arm_completion_timeout());
-        nvidia_rm_sys::os_boundary::autopsy_arm(self.config_handle(), self.parent_config_handle());
-        nvidia_rm_sys::os_boundary::sec2_drain_arm();
-        nvidia_rm_sys::os_interface::live_echo_begin();
-        let boot = self.gsp_boot_run("gpustep13", false);
-        nvidia_rm_sys::os_interface::live_echo_end();
-        nvidia_rm_sys::os_boundary::sec2_drain_disarm();
-        nvidia_rm_sys::os_boundary::autopsy_disarm();
-        s.push_str(&boot);
-        s
     }
 
     /// Step 14 (`/proc/gpustep14`): the CONSOLE GPU's full bring-up chained in
@@ -6861,685 +6123,6 @@ impl DrmScheme for NvidiaGpu {
                     status
                 );
             }
-        }
-        s
-    }
-
-    /// Step 2: instance block + GMMU flush — the first GPU register writes.
-    /// TEMPORARY: the secondary (non-console) GPU has its own unrelated
-    /// problems (USB breaks in Eclipse when it's made primary; likely never
-    /// got a VBIOS devinit replay since it's never POSTed), so for now we
-    /// target the ONLY GPU available — the one driving the console — and
-    /// skip the other one instead. This trades away the original safety net
-    /// (a hang here now means losing the only display and a hard reboot);
-    /// the user has explicitly accepted that risk. Opt-in (`/proc/gpustep2`).
-    fn bringup_step2(&self) -> String {
-        use core::fmt::Write;
-        let mut s = String::new();
-        if !self.drives_boot_display() {
-            let _ = writeln!(
-                s,
-                "[gpustep2] {} ({}) SKIPPED — not the console GPU (bar1_phys={:#x}); only testing the single available GPU",
-                self.name, self.gpu_model, self.bar1_phys
-            );
-            return s;
-        }
-
-        let mut g = self.bringup.lock();
-        if g.is_none() {
-            *g = GpuBringup::build(0x0020_0000, 0x0300_0000);
-        }
-        let b = match g.as_ref() {
-            Some(b) => b,
-            None => {
-                let _ = writeln!(s, "[gpustep2] {} alloc_coherent FAILED", self.name);
-                return s;
-            }
-        };
-
-        let _ = writeln!(
-            s,
-            "[gpustep2] === {} ({}) — Step 2: instance block + GMMU flush ===",
-            self.name, self.gpu_model
-        );
-
-        // Part 1: read-only PRAMIN accessibility ladder. PRAMIN works (rt@0
-        // round-tripped) but VRAM at 2 GiB read back the 0xBAD0ACxx PRI-error
-        // sentinel, so probe which offsets the window actually reaches. An
-        // inaccessible offset reads the sentinel; real VRAM does not. No writes.
-        let ladder = [
-            ("0", 0u64),
-            ("1M", 0x10_0000),
-            ("4M", 0x40_0000),
-            ("16M", 0x100_0000),
-            ("64M", 0x400_0000),
-            ("256M", 0x1000_0000),
-            ("512M", 0x2000_0000),
-            ("1G", 0x4000_0000),
-            ("2G", 0x8000_0000),
-        ];
-        let _ = write!(s, "[gpustep2]  PRAMIN ladder:");
-        let mut last_ok = 0u64;
-        for (name, off) in ladder {
-            let v = self.pramin_r32(off);
-            let bad = (v & 0xFFFF_FF00) == 0xBAD0_AC00;
-            if !bad {
-                last_ok = off;
-            }
-            let _ = write!(s, " {}={}", name, if bad { "BAD" } else { "ok" });
-        }
-        let _ = writeln!(s, " (highest ok={:#x})", last_ok);
-
-        let inst = b.inst_vram();
-        let st = self.pramin_r32(inst);
-        let pramin_ok = (st & 0xFFFF_FF00) != 0xBAD0_AC00;
-        self.write_instance_block_vram(b);
-        let rb = |off: u64| self.pramin_r32(inst + off);
-        let _ = writeln!(
-            s,
-            "[gpustep2]  PRAMIN self-test={} inst@VRAM {:#x}",
-            pramin_ok, inst
-        );
-        let _ = writeln!(
-            s,
-            "[gpustep2]  inst@0x200={:08x}{:08x} @0x208={:08x}{:08x} userd@0x008={:08x}{:08x}",
-            rb(0x204),
-            rb(0x200),
-            rb(0x20c),
-            rb(0x208),
-            rb(0x00c),
-            rb(0x008)
-        );
-        let _ = writeln!(
-            s,
-            "[gpustep2]  CE ctx (disarmed): inst@0x220={:08x}{:08x} @0x0ac={:08x}",
-            rb(0x224),
-            rb(0x220),
-            rb(0x0ac),
-        );
-        // Arm the HUB MMU fault buffer (the likely root cause) and report it.
-        let (fb_count, fb_lo, fb_hi, fb_size) = self.setup_fault_buffer(b);
-        let _ = writeln!(
-            s,
-            "[gpustep2]  FAULT_BUF: hw_count={:#x} buf_phys={:#x} LO(0xb83000)={:#010x} HI={:#010x} SIZE(0xb83010)={:#010x}",
-            fb_count,
-            b.fault_buf.paddr(),
-            fb_lo,
-            fb_hi,
-            fb_size
-        );
-        // Make BAR2 live and report the bind, plus the PCE map (CE buffer size).
-        let (b2_before, b2_after, b2_wait) = self.setup_bar2(b);
-        let pce_map = unsafe { core::ptr::read_volatile((self._bar0 + 0x0010_4028) as *const u32) };
-        let _ = writeln!(
-            s,
-            "[gpustep2]  BAR2(0xb80f48) {:#010x}->{:#010x} wait(0xb80f50)={:#010x} PCE_MAP(0x104028)={:#010x}",
-            b2_before, b2_after, b2_wait, pce_map
-        );
-
-        // Part 2: the only GPU register write — flush our PDB.
-        let root_phys = b.root.paddr() as u64;
-        let (pre, post, ok) = self.gmmu_flush(root_phys);
-        let _ = writeln!(
-            s,
-            "[gpustep2]  flush PDB=(root>>8)={:#x}  trigger(0xb830b0) pre={:#010x} post={:#010x} bit31_cleared={}",
-            root_phys >> 8,
-            pre,
-            post,
-            ok
-        );
-        if ok {
-            let _ = writeln!(
-                s,
-                "[gpustep2]  OK — GMMU accepted the PDB, MMU not wedged. Ready for Step 3 (runlist + doorbell)."
-            );
-        } else if pre & 0x8000_0000 != 0 {
-            let _ = writeln!(
-                s,
-                "[gpustep2]  ABORTED — a flush was already in flight (bit31 set); no write performed."
-            );
-        } else {
-            let _ = writeln!(
-                s,
-                "[gpustep2]  TIMEOUT — bit31 never cleared. Suspect bad PDB; inspect /proc/gpudbg fault regs (do NOT re-trigger)."
-            );
-        }
-        s
-    }
-
-    /// Step 3: doorbell-enable + runlist commit + channel enable (empty GPFIFO).
-    /// Auto-skips the console GPU. Opt-in (`/proc/gpustep3`). Requires Step 2 to
-    /// have built the instance block; runs it here if not already done.
-    fn bringup_step3(&self) -> String {
-        use core::fmt::Write;
-        // runlist 0 (GR/CE runlist) and channel 0.
-        const RUNL_ID: u32 = 0;
-        const CHID: u32 = 0;
-
-        let mut s = String::new();
-        // TEMPORARY: targeting the console GPU instead of skipping it — see
-        // the comment on bringup_step2 for why.
-        if !self.drives_boot_display() {
-            let _ = writeln!(
-                s,
-                "[gpustep3] {} SKIPPED — not the console GPU; only testing the single available GPU",
-                self.name
-            );
-            return s;
-        }
-
-        let mut g = self.bringup.lock();
-        if g.is_none() {
-            *g = GpuBringup::build(0x0020_0000, 0x0300_0000);
-        }
-        let b = match g.as_ref() {
-            Some(b) => b,
-            None => {
-                let _ = writeln!(s, "[gpustep3] {} alloc_coherent FAILED", self.name);
-                return s;
-            }
-        };
-
-        let _ = writeln!(
-            s,
-            "[gpustep3] === {} ({}) — Step 3: doorbell + runlist commit (empty GPFIFO) ===",
-            self.name, self.gpu_model
-        );
-
-        // Ensure the instance block + runlist exist in VRAM (idempotent).
-        self.write_instance_block_vram(b);
-        self.write_runlist_vram(b);
-        let runlist_vram = b.runlist_vram();
-
-        let bar0 = self._bar0;
-        let rd =
-            |off: u32| unsafe { core::ptr::read_volatile((bar0 + off as usize) as *const u32) };
-        let wr = |off: u32, v: u32| unsafe {
-            core::ptr::write_volatile((bar0 + off as usize) as *mut u32, v)
-        };
-
-        // 1) Enable the doorbell (mask bit31).
-        let db_before = rd(0x00b6_5000);
-        wr(0x00b6_5000, db_before | 0x8000_0000);
-        let db_after = rd(0x00b6_5000);
-        let _ = writeln!(
-            s,
-            "[gpustep3]  doorbell-en(0xb65000) {:#010x} -> {:#010x} (bit31={})",
-            db_before,
-            db_after,
-            db_after >> 31
-        );
-
-        // 2) Commit the runlist (base lo/hi + count=2 submits; poll bit15).
-        let base = 0x0000_2b00 + RUNL_ID * 0x10;
-        wr(base, runlist_vram as u32);
-        wr(base + 4, (runlist_vram >> 32) as u32);
-        wr(base + 8, 2); // 2 entries (cgrp + chan) — this write submits
-        let mut cfg_post = rd(base + 0xc);
-        let mut commit_ok = false;
-        for _ in 0..5_000_000u64 {
-            cfg_post = rd(base + 0xc);
-            if cfg_post & 0x0000_8000 == 0 {
-                commit_ok = true;
-                break;
-            }
-            gpu_spin();
-        }
-        let _ = writeln!(
-            s,
-            "[gpustep3]  runlist@{:#x} commit RUNL{} cfg(0x{:x})={:#010x} pending_cleared={}",
-            runlist_vram,
-            RUNL_ID,
-            base + 0xc,
-            cfg_post,
-            commit_ok
-        );
-
-        // 3) Enable the channel in the scheduler (mask 0x400).
-        let ce = 0x0080_0004 + CHID * 8;
-        let chan_before = rd(ce);
-        wr(ce, chan_before | 0x0000_0400);
-        let chan_after = rd(ce);
-        let _ = writeln!(
-            s,
-            "[gpustep3]  chan{}-cfg(0x{:x}) {:#010x} -> {:#010x}",
-            CHID, ce, chan_before, chan_after
-        );
-
-        if commit_ok {
-            let _ = writeln!(
-                s,
-                "[gpustep3]  OK — scheduler accepted the runlist, no fault. Ready for Step 4 (ring doorbell, empty PB)."
-            );
-        } else {
-            let _ = writeln!(
-                s,
-                "[gpustep3]  TIMEOUT — runlist pending bit never cleared. Inspect /proc/gpudbg; runl_id 0 may be wrong (do NOT re-commit)."
-            );
-        }
-        s
-    }
-
-    /// Step 4: ring the doorbell with a SET_OBJECT(0xC5B5) pushbuffer. Exercises
-    /// doorbell -> PBDMA -> GMMU-translated pushbuffer fetch -> method parse.
-    /// Auto-skips the console GPU. Opt-in (`/proc/gpustep4`).
-    fn bringup_step4(&self) -> String {
-        use core::fmt::Write;
-        const CHID: u32 = 0;
-
-        let mut s = String::new();
-        // TEMPORARY: targeting the console GPU instead of skipping it — see
-        // the comment on bringup_step2 for why.
-        if !self.drives_boot_display() {
-            let _ = writeln!(
-                s,
-                "[gpustep4] {} SKIPPED — not the console GPU; only testing the single available GPU",
-                self.name
-            );
-            return s;
-        }
-
-        let mut g = self.bringup.lock();
-        if g.is_none() {
-            *g = GpuBringup::build(0x0020_0000, 0x0300_0000);
-        }
-        let b = match g.as_ref() {
-            Some(b) => b,
-            None => {
-                let _ = writeln!(s, "[gpustep4] {} alloc_coherent FAILED", self.name);
-                return s;
-            }
-        };
-
-        let _ = writeln!(
-            s,
-            "[gpustep4] === {} ({}) — Step 4: ring doorbell with SET_OBJECT(0xC5B5) ===",
-            self.name, self.gpu_model
-        );
-
-        // PMC_ENABLE before/after: confirms whether FIFO (mask 0x100) was
-        // actually sitting in reset before setup_channel's reset pulse.
-        let pmc_pre = unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_0200) as *const u32) };
-
-        // Bring the channel live (idempotent; covers a fresh boot). Volta+
-        // gives every engine its OWN runlist id, discovered via PTOP — using
-        // a hardcoded runlist 0 was an unverified assumption (it might
-        // belong to GR instead of CE); setup_channel now discovers the
-        // actual CE runlist id and commits to that.
-        let (commit_ok, runl_id) = self.setup_channel(b);
-        let pmc_post =
-            unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_0200) as *const u32) };
-        let _ = writeln!(
-            s,
-            "[gpustep4]  PMC_ENABLE(0x200) pre={:#010x} post={:#010x} (FIFO bit 0x100: pre={} post={})",
-            pmc_pre,
-            pmc_post,
-            (pmc_pre >> 8) & 1,
-            (pmc_post >> 8) & 1
-        );
-        let ce = self.find_ce_runlist();
-        let engine_id = ce.map(|(_, e)| e).unwrap_or(u32::MAX);
-        let _ = writeln!(
-            s,
-            "[gpustep4]  PTOP-discovered CE runlist id={} engine_id={} (fallback-to-0={}) channel setup: runlist_commit={}",
-            runl_id,
-            engine_id,
-            ce.is_none(),
-            commit_ok
-        );
-        let _ = writeln!(s, "[gpustep4]  PTOP entries:{}", self.ptop_report());
-
-        // PCE_MAP (0x104028): maps each LOGICAL copy engine (what PTOP/runlist
-        // enumerate, e.g. our engine_id=8) to a PHYSICAL copy engine, or marks
-        // it unmapped. Already read in bringup_step2 but never shown here —
-        // across two real-hardware runs PBDMA9 (runl8's PBDMA) was COMPLETELY
-        // inert (its aggregate PFIFO_PBDMA_STATUS read bit-for-bit identical
-        // both times, unlike PBDMA0/1 which changed), i.e. the host scheduler
-        // never touched it even once. If engine_id=8's nibble here reads as
-        // the unmapped sentinel, that would explain why nothing ever gets
-        // scheduled regardless of how correctly the runlist/channel is set up.
-        let pce_map = unsafe { core::ptr::read_volatile((self._bar0 + 0x0010_4028) as *const u32) };
-        let _ = writeln!(
-            s,
-            "[gpustep4]  PCE_MAP(0x104028)={:#010x} (raw; per-LCE nibble layout not yet decoded)",
-            pce_map
-        );
-
-        // Real nouveau (nvkm subdev/devinit/tu102.c, tu102_devinit_wait): on
-        // Turing+, devinit's VBIOS init-table execution runs on a HARDWARE
-        // sequencer automatically at POST, before any OS/driver runs at all.
-        // The host driver's only job is to *wait* for it, checking exactly:
-        //   (rd(0x118128) & 1) != 0 && (rd(0x118234) & 0xff) == 0xff
-        // We have NEVER checked this. If it never completed (e.g. this OS's
-        // boot path skipped something a full firmware POST normally does),
-        // downstream engines could be left un-floorplanned/un-clocked —
-        // which would explain a logical CE that never faults, never shows
-        // scheduler activity, and whose PBDMA is never touched at all,
-        // regardless of how correctly we set up the channel/runlist on top.
-        // Read-only; safe to check every time.
-        let di_128 = unsafe { core::ptr::read_volatile((self._bar0 + 0x0011_8128) as *const u32) };
-        let di_234 = unsafe { core::ptr::read_volatile((self._bar0 + 0x0011_8234) as *const u32) };
-        let devinit_done = (di_128 & 1) != 0 && (di_234 & 0xff) == 0xff;
-        let _ = writeln!(
-            s,
-            "[gpustep4]  DEVINIT_WAIT: 0x118128={:#010x}(bit0={}) 0x118234={:#010x}(low8={:#04x}) devinit_done={}",
-            di_128,
-            di_128 & 1,
-            di_234,
-            di_234 & 0xff,
-            devinit_done
-        );
-
-        // NV_PFIFO_SCHED_STATUS (0x263c): global scheduler status — is the
-        // runlist-fetch unit even busy/idle, is a channel switch in
-        // progress. NV_PFIFO_ENGINE_STATUS(engine_id) (0x2640+id*8): the
-        // per-ENGINE (a third id space, distinct from runlist id and PBDMA
-        // index) scheduler status — CTX_STATUS, FAULTED, ENGINE busy/idle,
-        // currently-loaded ID. Neither had ever been read before.
-        let sched_status =
-            unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_263c) as *const u32) };
-        let _ = writeln!(
-            s,
-            "[gpustep4]  SCHED_STATUS(0x263c)={:#010x} chsw_in_progress={} runlist_fetch_busy={}",
-            sched_status,
-            (sched_status >> 1) & 1,
-            (sched_status >> 2) & 1
-        );
-        if engine_id != u32::MAX {
-            let eoff = engine_id as usize * 8;
-            let eng_status = unsafe {
-                core::ptr::read_volatile((self._bar0 + 0x0000_2640 + eoff) as *const u32)
-            };
-            let eng_debug = unsafe {
-                core::ptr::read_volatile((self._bar0 + 0x0000_2644 + eoff) as *const u32)
-            };
-            let _ = writeln!(
-                s,
-                "[gpustep4]  ENGINE_STATUS(engine{})={:#010x} ctx_status={} id={:#x} id_type={} engine_busy={} faulted={} eng_reload={}  DEBUG={:#010x}",
-                engine_id,
-                eng_status,
-                (eng_status >> 13) & 0x7,
-                eng_status & 0xfff,
-                (eng_status >> 12) & 1,
-                (eng_status >> 31) & 1,
-                (eng_status >> 30) & 1,
-                (eng_status >> 29) & 1,
-                eng_debug
-            );
-        }
-
-        // Build the method stream (sysmem pushbuffer) + a GPFIFO launch entry at
-        // the current PUT slot. The GPFIFO entry points at the pushbuffer GPU VA.
-        let n = b.write_setobject_pushbuffer();
-        let pb_va = b.va_base + 0x3000;
-        // USERD lives in VRAM — GP_PUT/GP_GET are accessed via PRAMIN.
-        let userd = b.userd_vram();
-        let put_before = self.pramin_r32(userd + 0x8c);
-        let get_before = self.pramin_r32(userd + 0x88);
-        let ring_entries = (b.gpfifo.byte_len() / 8) as u32;
-        let slot = (put_before % ring_entries) as usize;
-        b.write_gpfifo_entry(slot, pb_va, n);
-        let target = put_before + 1;
-
-        // Clear any latched MMU fault so the one we read after is OURS, not
-        // stale (write bit31 to the fault-clear reg 0xb83094).
-        unsafe { core::ptr::write_volatile((self._bar0 + 0x00b8_3094) as *mut u32, 0x8000_0000) };
-
-        // PFIFO_INTR_0 before the ring — did a prior interrupt condition
-        // latch (e.g. a scheduler/runlist-update completion) that we never
-        // acked, possibly stalling forward progress.
-        let intr0_pre =
-            unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_2100) as *const u32) };
-
-        // Advance GP_PUT (VRAM USERD, via PRAMIN), fence, ring the doorbell.
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        self.pramin_w32(userd + 0x8c, target);
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        let token = (runl_id << 16) | CHID;
-        unsafe { core::ptr::write_volatile((self._bar0 + 0x00bb_0090) as *mut u32, token) };
-
-        // Poll GP_GET (VRAM USERD) catching up to GP_PUT.
-        let mut get_after = get_before;
-        let mut advanced = false;
-        for _ in 0..5_000_000u64 {
-            get_after = self.pramin_r32(userd + 0x88);
-            if get_after == target {
-                advanced = true;
-                break;
-            }
-            gpu_spin();
-        }
-
-        let intr0_post =
-            unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_2100) as *const u32) };
-        let _ = writeln!(
-            s,
-            "[gpustep4]  PFIFO_INTR_0(0x2100) pre={:#010x} post={:#010x} (new bits={:#010x})",
-            intr0_pre,
-            intr0_post,
-            intr0_post & !intr0_pre
-        );
-
-        // Speculative retry: ack any latched interrupt, re-commit the
-        // runlist (idempotent), and ring the doorbell again — on the off
-        // chance the very first commit on a cold/never-scheduled-before
-        // FIFO needs a second nudge to actually wake the arbiter, even
-        // though the register-level sequence matches real driver source
-        // exactly. Cheap and safe (everything here is designed by NVIDIA
-        // to be re-entrant/idempotent); only attempted if the first try
-        // timed out.
-        let mut retried = false;
-        let mut retry_advanced = false;
-        if !advanced {
-            unsafe {
-                core::ptr::write_volatile((self._bar0 + 0x0000_2100) as *mut u32, intr0_post);
-            }
-            let (retry_commit_ok, _) = self.setup_channel(b);
-            unsafe { core::ptr::write_volatile((self._bar0 + 0x00bb_0090) as *mut u32, token) };
-            retried = true;
-            for _ in 0..2_000_000u64 {
-                get_after = self.pramin_r32(userd + 0x88);
-                if get_after == target {
-                    retry_advanced = true;
-                    advanced = true;
-                    break;
-                }
-                gpu_spin();
-            }
-            let _ = writeln!(
-                s,
-                "[gpustep4]  retry: ack_intr + re-commit({}) + re-ring -> advanced={}",
-                retry_commit_ok, retry_advanced
-            );
-        }
-        let _ = (retried, retry_advanced);
-
-        // SCHED_STATUS was sampled ONCE, before the ring (runlist_fetch_busy=1
-        // in the last real-hardware run). A single snapshot can't tell a
-        // fetch unit that is genuinely wedged apart from one merely caught
-        // mid-cycle — those point at different bugs (a broken runlist-fetch
-        // memory path vs. a fetch that completes fine but still never loads
-        // the channel). Poll it here so the next run distinguishes the two.
-        let mut fetch_busy_cleared = false;
-        let mut fetch_busy_iters = 0u64;
-        let mut sched_status_repoll = sched_status;
-        for i in 0..2_000_000u64 {
-            sched_status_repoll =
-                unsafe { core::ptr::read_volatile((self._bar0 + 0x0000_263c) as *const u32) };
-            if (sched_status_repoll >> 2) & 1 == 0 {
-                fetch_busy_cleared = true;
-                fetch_busy_iters = i;
-                break;
-            }
-            gpu_spin();
-        }
-        let _ = writeln!(
-            s,
-            "[gpustep4]  SCHED_STATUS re-poll(0x263c)={:#010x} runlist_fetch_busy_cleared={} after_iters={}",
-            sched_status_repoll, fetch_busy_cleared, fetch_busy_iters
-        );
-
-        // Read the MMU fault THIS step generated (cleared just before the ring).
-        let rd = |off: u32| unsafe {
-            core::ptr::read_volatile((self._bar0 + off as usize) as *const u32)
-        };
-        let f_info1 = rd(0x00b8_3090);
-        let f_alo = rd(0x00b8_3080);
-        let f_ahi = rd(0x00b8_3084);
-        let f_info0 = rd(0x00b8_3088);
-        let _ = writeln!(
-            s,
-            "[gpustep4]  fresh fault: INFO1={:#010x} valid={} access={} reason={} VA={:#x}{:08x} eng={:#x}",
-            f_info1,
-            f_info1 >> 31,
-            (f_info1 >> 16) & 0xf,
-            f_info1 & 0x1f,
-            f_ahi,
-            f_alo & 0xffff_f000,
-            f_info0 & 0xff,
-        );
-
-        let chan_cfg =
-            unsafe { core::ptr::read_volatile((self._bar0 + 0x0080_0004) as *const u32) };
-        let _ = writeln!(
-            s,
-            "[gpustep4]  pb_va={:#x} n={} slot={} GP_PUT {}->{} GP_GET {}->{} advanced={} doorbell=0xbb0090 token={:#x}",
-            pb_va, n, slot, put_before, target, get_before, get_after, advanced, token
-        );
-        let _ = writeln!(
-            s,
-            "[gpustep4]  chan{}-cfg(0x800004)={:#010x} status={}",
-            CHID,
-            chan_cfg,
-            (chan_cfg >> 24) & 0xf
-        );
-        // PBDMA state: did the init un-SUSPEND them (STATUS != 0x10011111), who
-        // serves runlist 0 (PBDMA_MAP RUNLISTS mask), is our channel loaded?
-        let _ = writeln!(
-            s,
-            "[gpustep4]  PBDMA0 st(0x40100)={:#010x} ch={:#010x}  PBDMA1 st(0x42100)={:#010x} ch={:#010x}",
-            rd(0x0004_0100),
-            rd(0x0004_0120),
-            rd(0x0004_2100),
-            rd(0x0004_2120)
-        );
-        // PBDMA0/1 above are stale from the runlist-0 era and, per the last
-        // real-hardware run, are NOT the PBDMA our channel goes through
-        // (PBDMA_MAP showed only p9 serving a runl_id=8). Their own block
-        // registers (STATUS/CHANNEL/GP_GET/GP_PUT/GET/INTR_0 — same offsets
-        // as debug_dump's Step-1 report) had never actually been read for
-        // whichever PBDMA(s) serve runl_id. Dump them here, dynamically.
-        let _ = write!(s, "[gpustep4]  PBDMA(runl{}'s, raw block):", runl_id);
-        for i in 0..12u32 {
-            let map = rd(0x0000_2390 + i * 4) & 0xffff;
-            if map & (1 << runl_id) == 0 {
-                continue;
-            }
-            let pb = 0x0004_0000 + i * 0x2000;
-            let _ = write!(
-                s,
-                " p{}[STATUS={:#010x} CHANNEL={:#010x} GP_GET={:#010x} GP_PUT={:#010x} GET={:#010x} INTR_0={:#010x}]",
-                i,
-                rd(pb + 0x100),
-                rd(pb + 0x120),
-                rd(pb + 0x14),
-                rd(pb),
-                rd(pb + 0x18),
-                rd(pb + 0x108),
-            );
-        }
-        let _ = writeln!(s);
-        // 0x040100 is NV_PPBDMA_STATUS — all-SUSPENDED (0x10011111) is just the
-        // idle/reset value, not a fault signal; nouveau's actual liveness check
-        // (gk104_runq_idle) polls NV_PFIFO_PBDMA_STATUS at 0x003080+id*4,
-        // CHAN_STATUS = bits 15:13 (0=INVALID/idle,1=VALID,5=LOAD,6=SAVE,7=SWITCH),
-        // ID = bits 11:0 (loaded chid).
-        let pfs0 = rd(0x0000_3080);
-        let pfs1 = rd(0x0000_3084);
-        let _ = writeln!(
-            s,
-            "[gpustep4]  PFIFO_PBDMA_STATUS q0(0x3080)={:#010x} chan_status={} id={:#x}  q1(0x3084)={:#010x} chan_status={} id={:#x}",
-            pfs0,
-            (pfs0 >> 13) & 0x7,
-            pfs0 & 0xfff,
-            pfs1,
-            (pfs1 >> 13) & 0x7,
-            pfs1 & 0xfff
-        );
-        // Same status register, but for whichever PBDMA index(es) actually
-        // serve our runl_id (may not be q0/q1 at all for a non-zero runlist).
-        let _ = write!(
-            s,
-            "[gpustep4]  PFIFO_PBDMA_STATUS(runl{}'s PBDMAs):",
-            runl_id
-        );
-        for i in 0..12u32 {
-            let m = rd(0x0000_2390 + i * 4) & 0xffff;
-            if m & (1 << runl_id) != 0 {
-                let v = rd(0x0000_3080 + i * 4);
-                let _ = write!(
-                    s,
-                    " q{}={:#010x}(chan_status={} id={:#x})",
-                    i,
-                    v,
-                    (v >> 13) & 0x7,
-                    v & 0xfff
-                );
-            }
-        }
-        let _ = writeln!(s);
-        // NV_PFIFO_PBDMA_MAP has up to 12 entries (__SIZE_1=12 per NVIDIA's
-        // manual) — we'd only ever looked at p0-p3. If our discovered
-        // runl_id (8/9/10, a standalone CE) isn't served by ANY of them,
-        // that's a dead end: no hardware PBDMA route exists for it at all.
-        let _ = write!(s, "[gpustep4]  PBDMA_MAP servers-of-runl{}:", runl_id);
-        let mut any_serves = false;
-        for i in 0..12u32 {
-            let m = rd(0x0000_2390 + i * 4) & 0xffff;
-            if m & (1 << runl_id) != 0 {
-                let _ = write!(s, " p{}", i);
-                any_serves = true;
-            }
-        }
-        if !any_serves {
-            let _ = write!(s, " NONE(!)");
-        }
-        let _ = write!(s, "  all-nonzero:");
-        for i in 0..12u32 {
-            let m = rd(0x0000_2390 + i * 4) & 0xffff;
-            if m != 0 {
-                let _ = write!(s, " p{}={:#06x}", i, m);
-            }
-        }
-        let _ = writeln!(s);
-        // Scheduler gate + the runlist entries as the host sees them in VRAM.
-        let rl = b.runlist_vram();
-        let _ = writeln!(
-            s,
-            "[gpustep4]  SCHED_DISABLE(0x2630)={:#010x} (runl{} bit={})  runlist@{:#x} cgrp[{:08x} {:08x} {:08x} {:08x}] chan[{:08x} {:08x} {:08x} {:08x}]",
-            rd(0x0000_2630),
-            runl_id,
-            (rd(0x0000_2630) >> runl_id) & 1,
-            rl,
-            self.pramin_r32(rl),
-            self.pramin_r32(rl + 0x4),
-            self.pramin_r32(rl + 0x8),
-            self.pramin_r32(rl + 0xc),
-            self.pramin_r32(rl + 0x10),
-            self.pramin_r32(rl + 0x14),
-            self.pramin_r32(rl + 0x18),
-            self.pramin_r32(rl + 0x1c)
-        );
-        if advanced {
-            let _ = writeln!(
-                s,
-                "[gpustep4]  OK — channel fetched the pushbuffer via GMMU and bound the copy class, no fault. Ready for Step 5 (real copy)."
-            );
-        } else {
-            let _ = writeln!(
-                s,
-                "[gpustep4]  TIMEOUT — GP_GET did not advance; PBDMA likely faulted (GPFIFO/pushbuffer mapping). Inspect /proc/gpudbg (do NOT re-ring)."
-            );
         }
         s
     }

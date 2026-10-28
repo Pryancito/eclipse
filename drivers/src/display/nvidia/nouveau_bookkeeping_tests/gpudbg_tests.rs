@@ -7,8 +7,6 @@
 //! because the parent is at its size ceiling (`xtask tamano`).
 
 use super::*;
-use crate::utils::host_hooks as shim;
-use core::sync::atomic::Ordering;
 
 fn wr32(gpu: &NvidiaGpu, off: usize, v: u32) {
     unsafe { core::ptr::write_volatile((gpu._bar0 + off) as *mut u32, v) }
@@ -55,23 +53,15 @@ impl Drop for BootFb {
     }
 }
 
-fn line_starting(s: &str, prefix: &str) -> Option<String> {
-    s.lines().find(|l| l.starts_with(prefix)).map(String::from)
-}
-
 /// On a chip that answers zero to everything the dump still says it all:
 /// the FFI smoke test and the vendored FNV hash (both run for real on the
 /// host), the chip id, the FIFO and MMU rows (no fault latched, so no
-/// fault address), the two PBDMAs and no third, an empty PTOP, and the
-/// GMMU plan it builds on the first read and keeps for the next. With
-/// the DMA pool exhausted the plan is a line saying so, and nothing is
-/// kept.
+/// fault address), the two PBDMAs and no third, and an empty PTOP.
 #[test]
-fn gpudbg_on_a_silent_chip_reads_zeros_builds_the_plan_once_and_says_when_it_cannot() {
+fn gpudbg_on_a_silent_chip_reads_zeros() {
     let _g = LOCK.lock();
     let _no_boot_fb = BootFb::none();
     let gpu = super::gpu();
-    assert!(gpu.bringup.lock().is_none());
     let s = DrmScheme::debug_dump(&gpu);
     let has = |needle: &str| s.contains(needle);
     assert!(
@@ -119,21 +109,13 @@ fn gpudbg_on_a_silent_chip_reads_zeros_builds_the_plan_once_and_says_when_it_can
         "[gpudbg]  PCCSR0_INST(0x800000)=0x00000000",
         "[gpudbg]  PBDMA0 STATUS(0x40100)=0x00000000 CHANNEL=0x00000000 GP_GET=0x00000000 GP_PUT=0x00000000 GET=0x00000000 INTR_0=0x00000000",
         "[gpudbg]  PBDMA1 STATUS(0x42100)=0x00000000 CHANNEL=0x00000000 GP_GET=0x00000000 GP_PUT=0x00000000 GET=0x00000000 INTR_0=0x00000000",
-        "[gpudbg]  --- PTOP device-info (0x022700, non-zero) ---\n[gpudbg]  --- GMMU tables (Step 1, built in RAM; GPU not yet pointed at them) ---",
+        "[gpudbg]  --- PTOP device-info (0x022700, non-zero) ---\n",
     ] {
         assert!(has(row), "missing {:?} in {}", row, s);
     }
-    for absent in [
-        "(CE)",
-        "FAULT_VA",
-        "serves CE",
-        "DEVINFO[",
-        "alloc_coherent FAILED",
-    ] {
+    for absent in ["(CE)", "FAULT_VA", "serves CE", "DEVINFO["] {
         assert!(!has(absent), "{:?} in {}", absent, s);
     }
-    let plan = line_starting(&s, "[gpudbg]  PD  phys: root=").expect("the plan's tables");
-    assert!(gpu.bringup.lock().is_some(), "the plan is kept");
     let last = s.trim_end().lines().last().expect("a last line");
     assert!(
         last.starts_with("[gpudbg]  surfaceflip: state="),
@@ -141,33 +123,6 @@ fn gpudbg_on_a_silent_chip_reads_zeros_builds_the_plan_once_and_says_when_it_can
         last
     );
     assert!(s.ends_with('\n'));
-
-    // The second read finds the plan already built: the same tables, and
-    // not one DMA page asked for.
-    let again = shim::alone_with_the_allocator(|| {
-        let again = DrmScheme::debug_dump(&gpu);
-        assert_eq!(shim::ALLOC_CALLS.load(Ordering::SeqCst), 0, "rebuilt");
-        again
-    });
-    assert_eq!(
-        line_starting(&again, "[gpudbg]  PD  phys: root="),
-        Some(plan),
-        "the plan was rebuilt"
-    );
-
-    // No DMA pages for it: the dump says so and keeps nothing.
-    *gpu.bringup.lock() = None;
-    let starved = shim::alone_with_the_allocator(|| {
-        shim::FAIL_ALLOC.store(true, Ordering::SeqCst);
-        DrmScheme::debug_dump(&gpu)
-    });
-    assert!(
-        starved.contains("[gpudbg]  GMMU: alloc_coherent FAILED (DMA pool exhausted)"),
-        "{}",
-        starved
-    );
-    assert!(!starved.contains("PD  phys"));
-    assert!(gpu.bringup.lock().is_none(), "a plan that was not built");
 }
 
 /// A latched non-replayable fault is decoded field by field and its
@@ -209,7 +164,7 @@ fn gpudbg_with_a_latched_fault_and_a_copy_engine_of_its_own_prints_the_fault_and
         "[gpudbg]  FAULT_VA=0x112345000 engine_id=0x7 inst=0x200001000",
         "[gpudbg]  RUNL8(CE) base_lo(0x2b80)=0xdead0000 base_hi=0x00000000 submit=0x00000000 cfg(0x2b8c)=0x000000c0",
         "[gpudbg]  PBDMA9(serves CE runl8) STATUS(0x52100)=0x00000a0a CHANNEL=0x00000000 GP_GET=0x00000000 GP_PUT=0x00000000 GET=0x00000000 INTR_0=0x00000000",
-        "[gpudbg]  DEVINFO[ 0]=0x80000003\n[gpudbg]  DEVINFO[ 1]=0x00000012\n[gpudbg]  DEVINFO[ 2]=0x8000004f\n[gpudbg]  DEVINFO[ 3]=0x15000032\n[gpudbg]  --- GMMU",
+        "[gpudbg]  DEVINFO[ 0]=0x80000003\n[gpudbg]  DEVINFO[ 1]=0x00000012\n[gpudbg]  DEVINFO[ 2]=0x8000004f\n[gpudbg]  DEVINFO[ 3]=0x15000032\n",
     ] {
         assert!(has(row), "missing {:?} in {}", row, s);
     }
@@ -220,30 +175,23 @@ fn gpudbg_with_a_latched_fault_and_a_copy_engine_of_its_own_prints_the_fault_and
         s
     );
     assert!(!has("PBDMA1(serves"), "{}", s);
-    assert_eq!(
-        gpu.ptop_report(),
-        " GR(ty=0x0)/rl=0 CE(ty=0x13)/rl=8",
-        "the report of the same table"
-    );
     // The last word a CE scan reads is still the 64th: the fault registers
     // live elsewhere and were not disturbed by the table.
     assert_eq!(rd32(&gpu, 0x00b8_3090), 0x8012_3a0a);
 }
 
-/// The two PTOP readers: a CE whose runlist is GR's own does not count
-/// as standalone even when the table lists it before GR (the re-check
-/// after the pass), a CE with no engine field reports `u32::MAX`, a
-/// standalone CE wins over the first one, the words that are not entries
-/// (NOT_VALID, DATA, an ENUM with neither field, a type with no runlist)
-/// are stepped over, and the report names every engine type it knows,
-/// with `-1` for an entry whose runlist the table does not give.
+/// The PTOP reader: a CE whose runlist is GR's own does not count as
+/// standalone even when the table lists it before GR (the re-check after
+/// the pass), a CE with no engine field reports `u32::MAX`, a standalone CE
+/// wins over the first one, and the words that are not entries (NOT_VALID,
+/// DATA, an ENUM with neither field, a type with no runlist) are stepped
+/// over.
 #[test]
-fn the_ptop_scan_picks_the_copy_engines_runlist_and_the_report_names_every_engine() {
+fn the_ptop_scan_picks_the_copy_engines_runlist() {
     let _g = LOCK.lock();
-    // Nothing: no CE, no report.
+    // Nothing: no CE.
     let gpu = super::gpu();
     assert_eq!(gpu.find_ce_runlist(), None);
-    assert_eq!(gpu.ptop_report(), "");
 
     // CE before GR, on GR's runlist: the pass thought it standalone; the
     // re-check knows better and the answer is the first CE, same thing.
@@ -257,10 +205,6 @@ fn the_ptop_scan_picks_the_copy_engines_runlist_and_the_report_names_every_engin
         Some((8, 3)),
         "the first CE, GR's runlist being no one's own"
     );
-    assert_eq!(
-        gpu.ptop_report(),
-        " CE(ty=0x1)/rl=8 GR(ty=0x0)/rl=8 CE(ty=0x2)/rl=1"
-    );
 
     // GR first, a CE on its runlist, then a CE of its own with no engine
     // field: the standalone one, engine unknown.
@@ -271,7 +215,8 @@ fn the_ptop_scan_picks_the_copy_engines_runlist_and_the_report_names_every_engin
     ptop_entry(&gpu, &mut i, 0x13, Some(5), None);
     assert_eq!(gpu.find_ce_runlist(), Some((5, u32::MAX)));
 
-    // The words that are not an engine on a runlist, and every name.
+    // The words that are not an engine on a runlist, and no CE among the
+    // other engines.
     let gpu = super::gpu();
     let mut i = 0;
     // A NOT_VALID word, a chained DATA word, then an ENUM with neither
@@ -304,10 +249,4 @@ fn the_ptop_scan_picks_the_copy_engines_runlist_and_the_report_names_every_engin
     }
     assert!(i <= 64);
     assert_eq!(gpu.find_ce_runlist(), None, "no CE among them");
-    assert_eq!(
-        gpu.ptop_report(),
-        " VIC(ty=0xc)/rl=-1 MSPDEC(ty=0x8)/rl=2 MSPPP(ty=0x9)/rl=2 MSVLD(ty=0xa)/rl=2 \
-         MSENC(ty=0xb)/rl=3 SEC2(ty=0xd)/rl=4 NVENC(ty=0xe)/rl=5 NVENC(ty=0xf)/rl=5 \
-         NVDEC(ty=0x10)/rl=6 GSP(ty=0x14)/rl=7 NVJPG(ty=0x15)/rl=7 OTHER(ty=0x7)/rl=9"
-    );
 }

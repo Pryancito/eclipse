@@ -469,8 +469,8 @@ pub extern "C" fn osDetachFromProcess(arg0: *mut c_void) {
 /// doorbell) that the machine now freezes on.
 static GSP_PROBE_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Console-GPU SEC2-resume register trace (step 11 diagnostics). Armed by
-/// `seq_trace_arm()` (bringup_step11) before the console GPU's GSP boot;
+/// Console-GPU SEC2-resume register trace. Armed by `seq_trace_arm()`
+/// before a GSP boot that asks for it;
 /// goes LIVE at that boot's own SEC2 STARTCPU write (the point after which
 /// the machine has always wedged on this GPU). From then on EVERY BAR0
 /// register access logs at ERROR level (passes LOG=error, renders live),
@@ -500,35 +500,6 @@ pub fn seq_trace_disarm() {
     SEQ_TRACE_LIVE.store(false, Ordering::Relaxed);
 }
 
-/// Post-STARTCPU bus autopsy (EXP 2 of the SEC2-resume investigation).
-/// Config-space cycles are completed by the root complex even when the
-/// endpoint's host interface is priv-locked (a failed config read returns
-/// all-ones instead of hanging the core, unlike a MMIO read), so a paced
-/// config poll right after the STARTCPU write classifies the failure
-/// physics without risking the machine: (a) config alive + BAR0 dead =
-/// HS-payload priv holdoff; (b) config dead / ID=0xFFFF = device fell off
-/// the bus; (c) everything alive after ~2s = race, not a wedge. Armed by
-/// bringup_step11/12 with the GPU's and its root port's packed config
-/// handles (same 0x8000_0000|bus<<16|dev<<8|fn packing as
-/// os_pci_init_handle).
-static AUTOPSY_GPU_HANDLE: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-static AUTOPSY_RP_HANDLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// Arm the post-STARTCPU autopsy. `rp_handle` may be 0 (no root port found).
-pub fn autopsy_arm(gpu_handle: usize, rp_handle: usize) {
-    use core::sync::atomic::Ordering;
-    AUTOPSY_GPU_HANDLE.store(gpu_handle, Ordering::Relaxed);
-    AUTOPSY_RP_HANDLE.store(rp_handle, Ordering::Relaxed);
-}
-
-/// Disarm the post-STARTCPU autopsy.
-pub fn autopsy_disarm() {
-    use core::sync::atomic::Ordering;
-    AUTOPSY_GPU_HANDLE.store(0, Ordering::Relaxed);
-    AUTOPSY_RP_HANDLE.store(0, Ordering::Relaxed);
-}
-
 /// EXP 2 (pre-STARTCPU interrupt drain -- the Copilot "pseudo-ISR service
 /// loop" hypothesis). Eclipse is 100% polled with INTx masked and NO RM ISR,
 /// so during the SEC2 CORE_RESUME window a fabric/display interrupt the GPU
@@ -540,10 +511,9 @@ pub fn autopsy_disarm() {
 /// (survives a wedge -> names the exact pending vector), then (2) a bounded
 /// write-1-to-clear service loop draining the leaf-pending registers until the
 /// top register quiesces. If the wedge is unserviced-interrupt backpressure
-/// this makes STARTCPU drain and the autopsy then runs; if not, the snapshot
+/// this makes STARTCPU drain; if not, the snapshot
 /// still tells us which source Linux's ISR services in that window. Does NOT
-/// touch PDISP (unlike EXP1), so it can't break GSP-RM's early boot. Armed
-/// only by bringup_step13.
+/// touch PDISP, so it can't break GSP-RM's early boot.
 static SEC2_DRAIN_ARMED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -780,77 +750,6 @@ unsafe fn sec2_intr_snapshot_and_drain(base: *mut u8) {
     ));
 }
 
-/// EXP 1 (PDISP hold-in-reset): when armed, the first completed read of
-/// NV_PDISP_VGA_WORKSPACE_BASE (0x625F04 -- kgspCalculateFbLayout's read,
-/// i.e. "after the FB-layout code consumed the register, before Booter/
-/// bootstrap") triggers clearing NV_PMC_ENABLE bit 30 (PDISP,
-/// tu102/dev_boot.h:116) with the same clear+2-readback propagation
-/// sequence kbifDoFullChipReset_GM107 uses. Engine-level reset = zero
-/// isochronous display FB fetch during the SEC2-RTOS resume. One-way for
-/// the boot: the console goes dark (scanout stops) until reboot. Armed
-/// only by /proc/gpustep12.
-static PDISP_KILL_ARMED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-// EXP1c: PDISP is held in reset only for the SEC2 HS-resume window (which
-// wedges the bus on live scanout), then RESTORED once the RM narrates
-// "RISCV started" -- past the wedge, GSP-RM about to run its own init, which
-// timed out in EXP1/EXP1b because it touches the display engine we'd left in
-// reset. Restoring here mirrors Linux (scanout live throughout GSP-RM run).
-static PDISP_SAVED_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static PDISP_SAVED_PMC: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static PDISP_RESTORE_PENDING: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Arm the PDISP hold-in-reset experiment for the next GSP boot.
-pub fn pdisp_kill_arm() {
-    PDISP_KILL_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// Leave the PDISP window: give the display engine back if the trigger took
-/// it, then cancel an arm that never fired.
-///
-/// **The restore comes first and is the point of this call.** Clearing
-/// `PDISP_RESTORE_PENDING` on its own -- which is all this used to do --
-/// turns "the boot never reached its restore anchor" into "PDISP stays in
-/// engine reset until the next reboot", because `pdisp_restore` returns
-/// early unless that flag is set. From the outside that is a monitor that
-/// goes dark when the card is handed over and never comes back, which is
-/// exactly what the first hardware boot of the window reported. The order
-/// lives here rather than in the callers: both of them (`BootWindow` and
-/// `/proc/gpustep12`) had it wrong, and a caller that forgets costs a
-/// screen until reboot.
-pub fn pdisp_kill_disarm() {
-    pdisp_restore();
-    PDISP_KILL_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
-    PDISP_RESTORE_PENDING.store(false, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// Restore PDISP (re-set NV_PMC_ENABLE bit 30) if the kill experiment armed
-/// it. Called from the RM narration hook the moment "RISCV started" is seen
-/// -- the SEC2 HS-resume window is over, so scanout can safely come back and
-/// GSP-RM finds the display engine alive for its own init.
-pub fn pdisp_restore() {
-    use core::sync::atomic::Ordering;
-    if !PDISP_RESTORE_PENDING.swap(false, Ordering::Relaxed) {
-        return;
-    }
-    let base = PDISP_SAVED_BASE.load(Ordering::Relaxed);
-    let pmc = PDISP_SAVED_PMC.load(Ordering::Relaxed);
-    if base != 0 {
-        unsafe {
-            let p = (base + 0x200) as *mut NvU32;
-            core::ptr::write_volatile(p, pmc);
-            let _ = core::ptr::read_volatile(p);
-            let _ = core::ptr::read_volatile(p);
-        }
-        seq_trace_emit(&alloc::format!(
-            "[nvidia-rm] EXP1c: PDISP restored (PMC_ENABLE <- {:#010x}) after RISCV start -- past the wedge window, scanout back for GSP-RM init",
-            pmc
-        ));
-    }
-}
-
 /// Switch the armed trace live. Called by os_interface's narration hook the
 /// moment the RM logs receiving the GSP_RUN_CPU_SEQUENCER RPC, so the trace
 /// covers the entire sequencer buffer execution, and (belt-and-braces) by
@@ -1021,39 +920,6 @@ pub extern "C" fn osDevReadReg032(
             this_address,
             v
         ));
-    }
-    // EXP 1 trigger: kgspCalculateFbLayout has just consumed
-    // NV_PDISP_VGA_WORKSPACE_BASE -- from here to bootstrap nothing else
-    // needs the display engine, so hold PDISP in engine-level reset
-    // (NV_PMC_ENABLE bit 30 clear + two propagation readbacks, the
-    // kbifDoFullChipReset_GM107 sequence). Scanout DMA stops dead; the
-    // console goes dark until reboot. Only /proc/gpustep12 arms this.
-    if this_address == 0x0062_5F04
-        && PDISP_KILL_ARMED.swap(false, core::sync::atomic::Ordering::Relaxed)
-    {
-        if let Some(base) = dev_mapping_base(pMapping) {
-            unsafe {
-                let pmc = base.add(0x200) as *mut NvU32;
-                let old = core::ptr::read_volatile(pmc);
-                core::ptr::write_volatile(pmc, old & !(1u32 << 30));
-                let rb1 = core::ptr::read_volatile(pmc);
-                let rb2 = core::ptr::read_volatile(pmc);
-                // Stash the original PMC_ENABLE and this GPU's BAR0 base so
-                // pdisp_restore() (fired from the "RISCV started" narration
-                // marker, i.e. AFTER the SEC2 HS resume window that wedges on
-                // live scanout) can bring PDISP back before GSP-RM needs it.
-                PDISP_SAVED_BASE.store(base as usize, core::sync::atomic::Ordering::Relaxed);
-                PDISP_SAVED_PMC.store(old, core::sync::atomic::Ordering::Relaxed);
-                PDISP_RESTORE_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
-                seq_trace_emit(&alloc::format!(
-                    "[nvidia-rm] EXP1: PDISP held in reset (PMC_ENABLE {:#010x} -> {:#010x}, readbacks {:#010x}/{:#010x}); screen goes dark now, boot continues",
-                    old,
-                    old & !(1u32 << 30),
-                    rb1,
-                    rb2
-                ));
-            }
-        }
     }
     if is_sec2 || is_bsi {
         use core::sync::atomic::{AtomicU32, Ordering};
@@ -1243,21 +1109,11 @@ pub extern "C" fn osDevWriteReg032(
                     );
                     crate::survival::checkpoint(crate::survival::milestone::STARTCPU_POST);
                 }
-                // EXP1d: CPU-side re-anchor of the EXP1c PDISP restore. The
-                // old trigger ("RISCV started" narration) NEVER fired -- that
-                // NV_PRINTF is LEVEL_INFO and info is filtered before the
-                // narration hook -- so PDISP stayed in reset through all of
-                // GSP-RM's init: its display StateInit failed, display
-                // classes were pruned, and NV04_DISPLAY_COMMON allocs
-                // returned 0x22 INVALID_CLASS (run r19). Restore here
-                // instead: 15 ms after the STARTCPU store the SEC2 HS
-                // CORE_RESUME payload (microseconds-scale) is over with
-                // margin, while GSP-RM's libos hasn't even loaded the RM
-                // image yet -- so its display init finds PDISP alive. The
-                // 400 ms fabric watch below then doubles as containment if
-                // resuming scanout at +15 ms re-triggers the hazard.
+                // 15 ms past the STARTCPU store the SEC2 HS CORE_RESUME
+                // payload is over with margin. This pause used to anchor the
+                // retired PDISP hold-in-reset experiment's restore; every
+                // hardware boot since has run with it, so it stays.
                 crate::hooks::with_hooks((), |h| h.delay_us(15_000));
-                pdisp_restore();
                 crate::survival::checkpoint(crate::survival::milestone::PDISP_RESTORE);
                 // Post-store SILENT fabric watch (wedge containment). ZERO
                 // MMIO and ZERO logging here -- if the fabric wedged, any
@@ -1325,12 +1181,10 @@ pub extern "C" fn osDevWriteReg032(
                 crate::survival::checkpoint(crate::survival::milestone::STARTCPU_POST);
             }
         }
-        // EXP1d for the non-drain STARTCPU paths (parity mode etc.): same
-        // CPU-side restore anchor; pdisp_restore() is a no-op unless the
-        // EXP1 kill armed it (PDISP_RESTORE_PENDING swap).
+        // Same 15 ms pause on the non-drain STARTCPU paths (parity mode
+        // etc.), kept for the same reason.
         if is_sec2_startcpu {
             crate::hooks::with_hooks((), |h| h.delay_us(15_000));
-            pdisp_restore();
         }
     }
     // The old post-STARTCPU "500ms silent window + raw BSI readback" bracket
@@ -1339,58 +1193,6 @@ pub extern "C" fn osDevWriteReg032(
     // resume handling, and both wedge rounds proved silence changes nothing.
     // The per-access seq_trace above now narrates the RM's own immediate
     // BSI polling instead -- higher fidelity AND better diagnostics.
-    //
-    // EXP 2 (post-STARTCPU bus autopsy): when armed, spend ~2s after the
-    // STARTCPU write reading ONLY config space (root-complex-completed, so a
-    // dead endpoint yields all-ones instead of a hang), logging transitions;
-    // then attempt exactly one BAR0 read. Every outcome classifies the
-    // failure physics -- see autopsy_arm's doc comment.
-    if is_sec2_startcpu {
-        let gpu_h = AUTOPSY_GPU_HANDLE.load(core::sync::atomic::Ordering::Relaxed);
-        if gpu_h != 0 {
-            let rp_h = AUTOPSY_RP_HANDLE.load(core::sync::atomic::Ordering::Relaxed);
-            let mut last_gpu_id = 0xDEAD_BEEFu32;
-            let mut last_gpu_cs = 0xDEAD_BEEFu32;
-            let mut last_rp_id = 0xDEAD_BEEFu32;
-            log::error!(
-                "[nvidia-rm] AUTOPSY: config-space watch begins (2s @ 1ms; transitions only)"
-            );
-            for ms in 0..2000u32 {
-                crate::hooks::with_hooks((), |h| h.delay_us(1_000));
-                let gpu_id =
-                    crate::hooks::with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(gpu_h, 0, 4));
-                let gpu_cs =
-                    crate::hooks::with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(gpu_h, 4, 4));
-                let rp_id = if rp_h != 0 {
-                    crate::hooks::with_hooks(0xFFFF_FFFF, |h| h.pci_config_read(rp_h, 0, 4))
-                } else {
-                    0
-                };
-                if gpu_id != last_gpu_id || gpu_cs != last_gpu_cs || rp_id != last_rp_id {
-                    log::error!(
-                        "[nvidia-rm] AUTOPSY t={}ms: GPU id={:#010x} cmd/status={:#010x} RP id={:#010x}",
-                        ms, gpu_id, gpu_cs, rp_id
-                    );
-                    last_gpu_id = gpu_id;
-                    last_gpu_cs = gpu_cs;
-                    last_rp_id = rp_id;
-                }
-            }
-            log::error!(
-                "[nvidia-rm] AUTOPSY t=2000ms final: GPU id={:#010x} cmd/status={:#010x} RP id={:#010x}; now ONE BAR0 read of 0x1180f8 (about to)",
-                last_gpu_id, last_gpu_cs, last_rp_id
-            );
-            if let Some(base) = base_for_bracket {
-                let bsi =
-                    unsafe { core::ptr::read_volatile(base.add(0x0011_80F8) as *const NvU32) };
-                log::error!(
-                    "[nvidia-rm] AUTOPSY: BAR0 read RETURNED = {:#010x} (bit26 DONE={}) -- bus alive",
-                    bsi,
-                    (bsi >> 26) & 1
-                );
-            }
-        }
-    }
 }
 
 /// Extracts `DEVICE_MAPPING::gpuNvAddr` (the first field) without needing
