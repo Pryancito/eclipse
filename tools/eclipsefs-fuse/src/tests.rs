@@ -3,7 +3,8 @@
 //! Everything this driver decides on its own is in four pure functions and
 //! nothing read any of them: the errno a failure reaches the program as, the
 //! type `ls` prints, the inode number the kernel is told, and the attributes
-//! `stat(2)` returns. The rest of the file is the socket and the device.
+//! `stat(2)` returns. The rest of the file is the socket and the device,
+//! and the reader threads, tested at the end on a filesystem in memory.
 //!
 //! It matters here more than it looks, because this binary exists to produce
 //! numbers: `scripts/eclipsefs-linux-bench.sh` runs fio through it to compare
@@ -219,4 +220,161 @@ fn a_timestamp_survives_the_trip_and_a_pre_epoch_one_becomes_the_epoch() {
 #[test]
 fn the_attribute_timeout_is_the_one_the_module_documents() {
     assert_eq!(TTL, Duration::from_secs(60));
+}
+
+/// A device in memory, for the tests that mount a filesystem.
+struct MemDev(Mutex<Vec<u8>>);
+
+impl BlockDevice for MemDev {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> eclipsefs::Result<()> {
+        let d = self.0.lock().unwrap();
+        let at = offset as usize;
+        buf.copy_from_slice(d.get(at..at + buf.len()).ok_or(Error::Io)?);
+        Ok(())
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> eclipsefs::Result<()> {
+        let mut d = self.0.lock().unwrap();
+        let at = offset as usize;
+        d.get_mut(at..at + buf.len())
+            .ok_or(Error::Io)?
+            .copy_from_slice(buf);
+        Ok(())
+    }
+    fn sync(&self) -> eclipsefs::Result<()> {
+        Ok(())
+    }
+    fn size(&self) -> u64 {
+        self.0.lock().unwrap().len() as u64
+    }
+}
+
+/// A fresh filesystem holding one plain and one compressed file of `data`.
+fn two_files(data: &[u8]) -> (Arc<RwLock<EclipseFS>>, u64, u64) {
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemDev(Mutex::new(vec![0; 64 << 20])));
+    let opts = eclipsefs::mkfs::MkfsOptions {
+        label: "t".into(),
+        fsid: [1; 16],
+        chunk_uuid: [2; 16],
+        dev_uuid: [3; 16],
+        subvol_uuid: [4; 16],
+        now: (0, 0),
+    };
+    eclipsefs::mkfs::format(&dev, &opts).unwrap();
+    let mut fs = EclipseFS::mount(dev, false).unwrap();
+    let root = fs.root_ino();
+    let plain = fs
+        .create(root, "plain", FileKind::Regular, 0o644, 0)
+        .unwrap();
+    let packed = fs
+        .create(root, "packed", FileKind::Regular, 0o644, 0)
+        .unwrap();
+    fs.set_compression(packed, Some(eclipsefs::Compression::Zlib))
+        .unwrap();
+    for ino in [plain, packed] {
+        fs.write(ino, 0, data).unwrap();
+    }
+    fs.sync().unwrap();
+    (Arc::new(RwLock::new(fs)), plain, packed)
+}
+
+/// What the reader threads exist for: a plain file is read holding the
+/// filesystem only shared, so reads run at once. It is read here while
+/// another reader holds the lock; were it to ask for it exclusively, it
+/// would wait for ever, and the test gives up after ten seconds.
+#[test]
+fn a_plain_file_is_read_holding_the_filesystem_only_shared() {
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let (fs, plain, _) = two_files(&data);
+    let held = fs.read().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let other = fs.clone();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 256 << 10];
+        let n = read_file(&other, plain, 4096, &mut buf);
+        tx.send((n, buf)).unwrap();
+    });
+    let (n, buf) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the read waited for the exclusive lock");
+    assert_eq!(n.unwrap(), 256 << 10);
+    assert_eq!(buf, data[4096..4096 + (256 << 10)]);
+    drop(held);
+    // Past the end: the rest, then nothing.
+    let mut buf = vec![0u8; 8192];
+    assert_eq!(read_file(&fs, plain, 296_000, &mut buf).unwrap(), 4000);
+    assert_eq!(buf[..4000], data[296_000..]);
+    assert_eq!(read_file(&fs, plain, 400_000, &mut buf).unwrap(), 0);
+}
+
+/// A read the shared path cannot serve (a compressed file decompresses into
+/// a cache only the exclusive path may fill) still gets the right bytes,
+/// through the exclusive lock; and an error is an error, not a fallback.
+#[test]
+fn a_read_the_shared_path_declines_takes_the_exclusive_one() {
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i / 1000) as u8).collect();
+    let (fs, _, packed) = two_files(&data);
+    let mut buf = vec![0u8; 200_000];
+    assert_eq!(
+        fs.read()
+            .unwrap()
+            .read_shared(packed, 1000, &mut buf)
+            .unwrap(),
+        None
+    );
+    assert_eq!(read_file(&fs, packed, 1000, &mut buf).unwrap(), 200_000);
+    assert_eq!(buf, data[1000..201_000]);
+    let root = fs.read().unwrap().root_ino();
+    assert_eq!(read_file(&fs, root, 0, &mut buf), Err(Error::IsDir));
+}
+
+/// The reader threads take jobs off one queue, several at a time, and end
+/// when the queue goes away.
+#[test]
+fn the_reader_threads_run_jobs_side_by_side() {
+    let readers = spawn_readers();
+    // Every job waits until all READERS have started one: only threads
+    // running side by side get past it.
+    let gate = Arc::new(std::sync::Barrier::new(READERS));
+    let (tx, rx) = mpsc::channel();
+    for k in 0..READERS * 3 {
+        let (gate, tx) = (gate.clone(), tx.clone());
+        readers
+            .send(Box::new(move || {
+                if k < READERS {
+                    gate.wait();
+                }
+                tx.send(std::thread::current().id()).unwrap();
+            }))
+            .unwrap();
+    }
+    let ids: std::collections::HashSet<_> = (0..READERS * 3)
+        .map(|_| rx.recv_timeout(Duration::from_secs(10)).unwrap())
+        .collect();
+    assert_eq!(ids.len(), READERS);
+    assert!(!ids.contains(&std::thread::current().id()));
+    drop(readers);
+}
+
+/// The knob is the one FUSE gives the mount: named after the major and
+/// minor of the anonymous device the mount gets.
+#[test]
+fn the_readahead_knob_is_named_after_the_mounts_device() {
+    assert_eq!(
+        readahead_knob(libc::makedev(0, 42)),
+        Path::new("/sys/class/bdi/0:42/read_ahead_kb")
+    );
+    assert_eq!(
+        readahead_knob(libc::makedev(259, 3)),
+        Path::new("/sys/class/bdi/259:3/read_ahead_kb")
+    );
+}
+
+/// A mountpoint that is not there is an error the caller reports, not a
+/// panic. The other paths write a real knob of this machine (a first try
+/// of this test set the window of the disk `/tmp` is on), so they are
+/// checked on a real mount: `cat /sys/class/bdi/$(mountpoint -d MNT)/read_ahead_kb`.
+#[test]
+fn setting_the_readahead_of_a_missing_mountpoint_fails_cleanly() {
+    let missing = Path::new("/nonexistent/eclipsefs-fuse-test");
+    assert!(set_readahead(missing, 0, 2048).is_err());
 }
