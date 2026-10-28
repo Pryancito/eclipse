@@ -1,6 +1,7 @@
 //! mount(2) and umount2(2)
 
 use super::*;
+use alloc::string::String;
 use linux_object::fs::{mount_fs, umount_fs};
 use linux_object::process::CAP_SYS_ADMIN;
 
@@ -58,7 +59,25 @@ impl Syscall<'_> {
             source, target, fstype, flags
         );
         may_mount(self)?;
-        mount_fs(self.linux_process(), source, target, fstype, flags, data)?;
+        let proc = self.linux_process();
+        // `do_mount` looks the target up before anything else is read.
+        let target = mount_path(proc, target, true)?;
+        // What a bind or a move takes is a path too (`do_loopback`,
+        // `do_move_mount_old`), and an empty one is no name at all. A device
+        // is opened from the caller's directory further in, and its line
+        // keeps the name it was given, as Linux keeps `fc->source`.
+        let path_source;
+        let source = match source {
+            Some(name) if flags & MS_REMOUNT == 0 && flags & (MS_BIND | MS_MOVE) != 0 => {
+                if name.is_empty() {
+                    return Err(LxError::EINVAL);
+                }
+                path_source = mount_path(proc, name, true)?;
+                Some(path_source.as_str())
+            }
+            source => source,
+        };
+        mount_fs(proc, source, &target, fstype, flags, data)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
     }
@@ -68,11 +87,37 @@ impl Syscall<'_> {
         let target = target.as_c_str()?;
         info!("umount2: target={:?}, flags={:#x}", target, flags);
         may_mount(self)?;
-        umount_fs(target, flags)?;
+        // `ksys_umount`: the word before the path, so an option this kernel
+        // does not know is `EINVAL` whether or not the path is there.
+        check_umount_flags(flags)?;
+        let follow = flags & UMOUNT_NOFOLLOW == 0;
+        let target = mount_path(self.linux_process(), target, follow)?;
+        umount_fs(&target, flags)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
     }
 }
+
+/// The path `mount(2)` and `umount2(2)` act on, as `user_path_at` finds it:
+/// from the caller's working directory when it is relative, through the
+/// symbolic links on the way (and the last one only when `follow`), and
+/// named from the root by the directories the walk really entered, which is
+/// how the mount table names a mount point (`d_path`).
+///
+/// Both took the string as it came, from the kernel's root: a relative path
+/// was looked up from `/`, a link was not followed, and a `..` stayed in the
+/// name. So `mount --bind dir b` run in `/run` looked for `/b`, a bind onto
+/// or of a link was `ENOTDIR`, `umount` through one was `EINVAL`, a tmpfs on
+/// `c` was listed as `/c`, and a bind onto `c/../b` under that name.
+fn mount_path(proc: &LinuxProcess, path: &str, follow: bool) -> LxResult<String> {
+    let (_, walked) = proc.lookup_inode_walked(FileDesc::CWD, path, follow)?;
+    Ok(walked.path())
+}
+
+/// Where `mount(2)` and `umount2(2)` find the paths they are given, and in
+/// what order they look at them.
+#[cfg(test)]
+mod path_tests;
 
 #[cfg(test)]
 mod tests {
@@ -279,6 +324,12 @@ mod tests {
         const MS_BIND: usize = 4096;
         const MS_MOVE: usize = 8192;
         let proc = a_root_process(45_545, "mount-null");
+        // The target is looked up first, as `do_mount` does, so it has to be
+        // there for the rest of each request to be read.
+        proc.linux()
+            .root_inode()
+            .create("mount-null-probe", rcore_fs::vfs::FileType::Dir, 0o755)
+            .unwrap();
         let (target, fstype, source) = (c("/mount-null-probe"), c("tmpfs"), c("/tmp"));
         let (slash, vfat) = (c("/"), c("vfat"));
         let null = || UserInPtr::<u8>::from(0);
@@ -295,7 +346,7 @@ mod tests {
                     // And the type of a bind is not looked at.
                     sys.sys_mount(at(&source), at(&target), null(), MS_BIND, null()),
                     // A pseudo-filesystem with no source, which Linux shows as
-                    // `none`; the target is not looked up, so it registers.
+                    // `none`.
                     sys.sys_mount(null(), at(&target), at(&fstype), 0, null()),
                     // A filesystem on a device with none named: "No source
                     // specified" (`get_tree_bdev`), not a lookup of "".
