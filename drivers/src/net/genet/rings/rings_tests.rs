@@ -548,3 +548,134 @@ fn a_frame_in_and_a_frame_out_do_not_disturb_each_other() {
     assert_eq!(&buf[..TRAMA.len()], TRAMA);
     assert_eq!(hw.sent_frame(0), [0xCD; 100]);
 }
+
+// ---------------------------------------------------------------------------
+// Los bits de error del descriptor de recepcion
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_frame_the_mac_marked_as_bad_is_not_handed_up() {
+    // Cada bit, por separado. El MAC pone aqui lo que le paso a la trama, y
+    // una con el CRC malo o cortada por un desbordamiento llega con una
+    // longitud perfectamente creible: si no se miran estos bits, la pila IP
+    // recibe basura que el hardware ya habia dicho que estaba mal, y el
+    // sintoma no es un contador de errores sino conexiones que se caen.
+    for (bit, nombre) in [
+        (DMA_RX_LG, "DMA_RX_LG"),
+        (DMA_RX_NO, "DMA_RX_NO"),
+        (DMA_RX_RXER, "DMA_RX_RXER"),
+        (DMA_RX_CRC_ERROR, "DMA_RX_CRC_ERROR"),
+        (DMA_RX_OV, "DMA_RX_OV"),
+    ] {
+        let hw = Hw::new();
+        let mut anillos = anillos(&hw);
+        hw.deliver_frame_with_status(0, TRAMA, bit);
+        assert_eq!(
+            anillos.recv(&mut [0u8; 128]),
+            Err(DeviceError::IoError),
+            "{} tenia que rechazar la trama",
+            nombre
+        );
+        assert_eq!(anillos.rx_errors(), 1, "{} no se conto", nombre);
+    }
+}
+
+#[test]
+fn a_bad_frame_releases_its_slot_and_the_next_one_still_arrives() {
+    // Quedarse en el descriptor malo es dejar la recepcion parada para
+    // siempre por una trama con el CRC roto, que es justo la que llega sola
+    // con un cable marginal.
+    let hw = Hw::new();
+    let mut anillos = anillos(&hw);
+    hw.deliver_frame_with_status(0, TRAMA, DMA_RX_CRC_ERROR);
+    assert_eq!(anillos.recv(&mut [0u8; 128]), Err(DeviceError::IoError));
+    // El hueco vuelve al MAC con su buffer entero y el consumidor avanza.
+    assert_eq!(
+        hw.rx_len_stat(0),
+        ((RX_BUF_LENGTH as u32) << DMA_BUFLENGTH_SHIFT) | DMA_OWN
+    );
+    assert_eq!(hw.peek(RDMA_CONS_INDEX), 1);
+    assert_eq!(anillos.rx_pending(), 0);
+
+    hw.deliver_frame(1, TRAMA);
+    let mut buf = [0u8; 128];
+    assert_eq!(anillos.recv(&mut buf), Ok(TRAMA.len()));
+    assert_eq!(&buf[..TRAMA.len()], TRAMA);
+}
+
+#[test]
+fn several_bad_bits_at_once_count_as_one_frame() {
+    // El MAC puede marcar varias cosas de la misma trama. Es una trama
+    // perdida, no cinco.
+    let hw = Hw::new();
+    let mut anillos = anillos(&hw);
+    hw.deliver_frame_with_status(0, TRAMA, DMA_RX_CRC_ERROR | DMA_RX_OV | DMA_RX_RXER);
+    assert_eq!(anillos.recv(&mut [0u8; 128]), Err(DeviceError::IoError));
+    assert_eq!(anillos.rx_errors(), 1);
+}
+
+#[test]
+fn a_broadcast_or_multicast_frame_is_not_an_error() {
+    // Estos dos bits dicen de que clase era la trama, no que este mal.
+    // Meterlos en `DMA_RX_ERRORS` tira todo el ARP y todo el DHCP: la tarjeta
+    // parece viva, cuenta errores y no habla con nadie.
+    for (bit, nombre) in [
+        (DMA_RX_BRDCAST, "DMA_RX_BRDCAST"),
+        (DMA_RX_MULT, "DMA_RX_MULT"),
+        (DMA_RX_BRDCAST | DMA_RX_MULT, "los dos"),
+    ] {
+        let hw = Hw::new();
+        let mut anillos = anillos(&hw);
+        hw.deliver_frame_with_status(0, TRAMA, bit);
+        let mut buf = [0u8; 128];
+        assert_eq!(
+            anillos.recv(&mut buf),
+            Ok(TRAMA.len()),
+            "{} se trato como un error",
+            nombre
+        );
+        assert_eq!(&buf[..TRAMA.len()], TRAMA);
+        assert_eq!(anillos.rx_errors(), 0, "{} se conto como error", nombre);
+    }
+}
+
+#[test]
+fn a_bad_frame_does_not_need_room_in_the_callers_buffer() {
+    // Un buffer pequeño no descarta una trama buena (eso lo fija
+    // `a_buffer_too_small_does_not_eat_the_frame`), pero una trama que el MAC
+    // ya dio por mala hay que soltarla aunque el llamante no tenga sitio: si
+    // no, un buffer corto la deja atascada en el anillo.
+    //
+    // Este es tambien el unico test que fija el ORDEN de la comprobacion: si
+    // los bits de error se miraran despues del tamaño del buffer, esto
+    // devolveria `BufferTooSmall` y la trama mala se quedaria en el anillo.
+    // Respecto a la validacion de la longitud el orden no se nota desde
+    // fuera, y por eso no hay test que lo pida.
+    let hw = Hw::new();
+    let mut anillos = anillos(&hw);
+    hw.deliver_frame_with_status(0, TRAMA, DMA_RX_CRC_ERROR);
+    assert_eq!(anillos.recv(&mut [0u8; 4]), Err(DeviceError::IoError));
+    assert_eq!(
+        anillos.rx_pending(),
+        0,
+        "la trama mala se quedo en el anillo"
+    );
+}
+
+#[test]
+fn the_discard_counter_does_not_inflate_the_pending_count() {
+    // La mitad de arriba de `RDMA_PROD_INDEX` es `DMA_P_INDEX_DISCARD_CNT`:
+    // las tramas que el MAC tiro por no tener hueco. Leer el registro entero
+    // como indice da miles de tramas pendientes que no existen y el driver se
+    // pone a entregar descriptores vacios.
+    let hw = Hw::new();
+    let mut anillos = anillos(&hw);
+    hw.deliver_frame(0, TRAMA);
+    // 7 descartes contados por el MAC, en la mitad de arriba.
+    hw.poke(RDMA_PROD_INDEX, hw.peek(RDMA_PROD_INDEX) | (7 << 16));
+    assert_eq!(anillos.rx_pending(), 1);
+    assert_eq!(anillos.rx_discarded(), 7);
+    let mut buf = [0u8; 128];
+    assert_eq!(anillos.recv(&mut buf), Ok(TRAMA.len()));
+    assert_eq!(anillos.rx_pending(), 0);
+}
