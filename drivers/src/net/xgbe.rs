@@ -973,6 +973,188 @@ pub fn flush_tx_queues(
     Ok(())
 }
 
+// ——— The system bus mode ———
+//
+// `DMA_SBMR` is the register that says how the engine may behave on the bus:
+// how long a burst it may issue, whether it must keep its transfers aligned,
+// how many reads and writes it may have outstanding, and whether descriptor
+// addresses are 32 or 64 bits wide.
+//
+// `xgbe_config_dma_bus` (`xgbe-dev.c`) builds it in a way worth copying
+// exactly: ONE read, five fields set in the local copy, ONE write. Not five
+// read-modify-writes. The difference is not style --- a field-by-field
+// version publishes four intermediate states to a live bus master, each a
+// combination the driver never intended, and bit 0 of this register is a
+// "set this" bit whose meaning the datasheet does not spell out, which is
+// exactly the kind of thing that must not be observed half-applied.
+
+/// `DMA_SBMR_UNDEF`, index 0, width 1.
+///
+/// Linux sets it to one, under the comment "Set the System Bus mode", and the
+/// field's own name in `xgbe-common.h` is `UNDEF`. So: a bit that must be
+/// one, that nobody has documented. It is copied here because the alternative
+/// is diverging from the one driver known to work on this controller on a bit
+/// whose effect is unknown.
+pub const DMA_SBMR_UNDEF: (u32, u32) = (0, 1);
+/// `DMA_SBMR_BLEN`, index 1, width 7: the permitted burst lengths.
+pub const DMA_SBMR_BLEN: (u32, u32) = (1, 7);
+/// `DMA_SBMR_EAME`, index 11, width 1: enhanced addressing mode, i.e. the
+/// engine may use descriptor addresses wider than 32 bits. Linux sets it
+/// unconditionally.
+pub const DMA_SBMR_EAME: (u32, u32) = (11, 1);
+/// `DMA_SBMR_AAL`, index 12, width 1: address-aligned beats.
+pub const DMA_SBMR_AAL: (u32, u32) = (12, 1);
+/// `DMA_SBMR_RD_OSR_LMT`, index 16, width 6: outstanding read requests.
+pub const DMA_SBMR_RD_OSR_LMT: (u32, u32) = (16, 6);
+/// `DMA_SBMR_WR_OSR_LMT`, index 24, width 6: outstanding write requests.
+pub const DMA_SBMR_WR_OSR_LMT: (u32, u32) = (24, 6);
+
+/// Turn a burst length in beats into the `BLEN` field value, the way Linux's
+/// `blen >> 2` does.
+///
+/// That shift looks like a unit conversion and is not. `BLEN` is a **bitmap**:
+/// its seven bits are one each for bursts of 4, 8, 16, 32, 64, 128 and 256
+/// beats, so dividing the beat count by four lands exactly on that length's
+/// own bit. Which means the field can legitimately carry several lengths at
+/// once --- Linux happens to set one.
+///
+/// Returns `None` for anything that is not one of those seven lengths, rather
+/// than shifting it into a neighbouring length's bit.
+#[inline]
+pub const fn blen_field(beats: u32) -> Option<u32> {
+    match beats {
+        4 | 8 | 16 | 32 | 64 | 128 | 256 => Some(beats >> 2),
+        _ => None,
+    }
+}
+
+/// How the bus should be configured. Every member is a decision, which is
+/// why there is no `Default`: see [`system_bus_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BusConfig {
+    /// Burst length in beats: 4, 8, 16, 32, 64, 128 or 256.
+    pub burst_beats: u32,
+    /// Whether to require address-aligned beats (`AAL`).
+    pub aligned_beats: bool,
+    /// How many reads may be outstanding, counted from one.
+    pub read_outstanding: u32,
+    /// How many writes may be outstanding, counted from one.
+    pub write_outstanding: u32,
+}
+
+/// Build the value for `DMA_SBMR` from `sbmr` as the chip currently has it.
+///
+/// Three of these fields are **not** written as the number they represent,
+/// and all three are the sort of mistake that produces a working-but-wrong
+/// bus master:
+///
+/// * `BLEN` takes the burst length's own bit, not the length (see
+///   [`blen_field`]).
+/// * `RD_OSR_LMT` and `WR_OSR_LMT` are written as **limit minus one**: the
+///   field counts from zero, so writing the limit itself permits one more
+///   request than intended, and writing zero as a limit underflows to 63.
+///   Hence [`DeviceError::InvalidParam`] on a zero limit instead of the
+///   wraparound Linux would produce from an unset platform property.
+/// * `EAME` must be on before a descriptor address above 4 GiB is programmed,
+///   and the high half of the list address register is written regardless ---
+///   so without this bit the engine takes the low half and the ring is
+///   fetched from the wrong place with nothing reported.
+pub fn system_bus_mode(sbmr: u32, cfg: BusConfig) -> DeviceResult<u32> {
+    let blen = blen_field(cfg.burst_beats).ok_or(DeviceError::InvalidParam)?;
+    if cfg.read_outstanding == 0 || cfg.write_outstanding == 0 {
+        return Err(DeviceError::InvalidParam);
+    }
+    let max = 1 << DMA_SBMR_RD_OSR_LMT.1;
+    if cfg.read_outstanding > max || cfg.write_outstanding > max {
+        return Err(DeviceError::InvalidParam);
+    }
+
+    let mut v = sbmr;
+    v = set_bits(v, DMA_SBMR_EAME.0, DMA_SBMR_EAME.1, 1);
+    v = set_bits(v, DMA_SBMR_UNDEF.0, DMA_SBMR_UNDEF.1, 1);
+    v = set_bits(v, DMA_SBMR_BLEN.0, DMA_SBMR_BLEN.1, blen);
+    v = set_bits(v, DMA_SBMR_AAL.0, DMA_SBMR_AAL.1, cfg.aligned_beats as u32);
+    v = set_bits(
+        v,
+        DMA_SBMR_RD_OSR_LMT.0,
+        DMA_SBMR_RD_OSR_LMT.1,
+        cfg.read_outstanding - 1,
+    );
+    v = set_bits(
+        v,
+        DMA_SBMR_WR_OSR_LMT.0,
+        DMA_SBMR_WR_OSR_LMT.1,
+        cfg.write_outstanding - 1,
+    );
+    Ok(v)
+}
+
+/// Apply [`system_bus_mode`] to the device: one read, one write.
+///
+/// Note what is *not* here: a default `BusConfig`. The burst length and the
+/// outstanding-request limits are platform properties in Linux --- read from
+/// the device tree or ACPI --- and the PCI probe in the sources read here
+/// does not set them at all, which leaves them zero in a freshly allocated
+/// `pdata`. Inheriting that would mean a burst field of zero and an
+/// outstanding limit that underflowed to 63. So the caller must choose, and
+/// nothing is chosen here on a controller nobody has run: picking numbers for
+/// a bus whose behaviour cannot be measured would be a guess dressed up as a
+/// default.
+pub fn config_dma_bus(acc: &dyn MmioAccess, cfg: BusConfig) -> DeviceResult<()> {
+    let value = system_bus_mode(acc.read32(DMA_SBMR), cfg)?;
+    acc.write32(DMA_SBMR, value);
+    Ok(())
+}
+
+// ——— The station address ———
+
+/// `MAC_MACA0HR`: the high half of MAC address 0 --- the primary address.
+pub const MAC_MACA0HR: usize = 0x0300;
+/// `MAC_MACA0LR`: its low half.
+pub const MAC_MACA0LR: usize = 0x0304;
+/// `MAC_MACA1HR`: the high half of MAC address 1, the first of the additional
+/// addresses whose count `ADDMACADRSEL` reports.
+pub const MAC_MACA1HR: usize = 0x0308;
+
+/// `MAC_MACA1HR_AE`, index 31, width 1: address enable.
+///
+/// Defined in `xgbe-common.h` for `MACA1HR` and **not** for `MACA0HR`.
+/// Address 0 is the station address and is always enabled; the additional
+/// addresses each have this bit. Setting it on `MACA0HR` would put a one into
+/// a bit the primary address register does not define, in the same write that
+/// carries two bytes of the address.
+pub const MAC_MACA1HR_AE: (u32, u32) = (31, 1);
+
+/// Split a station address into the `(high, low)` register values, as
+/// `xgbe_set_mac_address` does.
+///
+/// The halves are not symmetric: the low word takes **four** bytes and the
+/// high word **two**, both little-endian within their word. So the high
+/// register is a half-filled word whose top sixteen bits stay zero on address
+/// 0 --- which is also why the `AE` bit of the additional addresses has
+/// somewhere to live.
+#[inline]
+pub const fn mac_to_regs(mac: [u8; 6]) -> (u32, u32) {
+    let hi = ((mac[5] as u32) << 8) | (mac[4] as u32);
+    let lo = ((mac[3] as u32) << 24)
+        | ((mac[2] as u32) << 16)
+        | ((mac[1] as u32) << 8)
+        | (mac[0] as u32);
+    (hi, lo)
+}
+
+/// Program the station address into address slot 0.
+///
+/// High half first, then low, which is the order Linux writes them. Keep it:
+/// on this family of MACs the low word is the one that latches the pair, so
+/// writing low first leaves the chip briefly filtering on an address whose
+/// top two bytes are whatever was there before.
+pub fn set_mac_address(acc: &dyn MmioAccess, mac: [u8; 6]) {
+    let (hi, lo) = mac_to_regs(mac);
+    acc.write32(MAC_MACA0HR, hi);
+    acc.write32(MAC_MACA0LR, lo);
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
@@ -2335,5 +2517,252 @@ mod tests {
         // Queue 3 is never polled, because queue 2 failed first --- and all
         // four were still kicked before any poll.
         assert_eq!(fake.writes_to(mtl_queue_reg(3, MTL_Q_TQOMR)), 1);
+    }
+
+    // ——— The system bus mode ———
+
+    #[test]
+    fn every_sbmr_field_is_at_its_linux_index() {
+        assert_eq!(DMA_SBMR_UNDEF, (0, 1));
+        assert_eq!(DMA_SBMR_BLEN, (1, 7));
+        assert_eq!(DMA_SBMR_EAME, (11, 1));
+        assert_eq!(DMA_SBMR_AAL, (12, 1));
+        assert_eq!(DMA_SBMR_RD_OSR_LMT, (16, 6));
+        assert_eq!(DMA_SBMR_WR_OSR_LMT, (24, 6));
+        // BLEN runs from 1 to 7 inclusive, so it stops short of EAME at 11
+        // with a gap, and does NOT start at 0 where UNDEF is.
+        assert_eq!(DMA_SBMR_BLEN.0 + DMA_SBMR_BLEN.1, 8);
+        assert!(DMA_SBMR_BLEN.0 > DMA_SBMR_UNDEF.0);
+    }
+
+    #[test]
+    fn the_burst_length_field_is_a_bitmap_of_lengths_not_a_number() {
+        // `blen >> 2` in xgbe_config_dma_bus looks like a unit conversion and
+        // is not: each of BLEN's seven bits is one burst length, so dividing
+        // the beat count by four lands on that length's own bit.
+        for (beats, bit) in [
+            (4u32, 0u32),
+            (8, 1),
+            (16, 2),
+            (32, 3),
+            (64, 4),
+            (128, 5),
+            (256, 6),
+        ] {
+            assert_eq!(
+                blen_field(beats),
+                Some(1 << bit),
+                "{} beats should be bit {} of BLEN",
+                beats,
+                bit
+            );
+        }
+        // Each one is a single bit, which is what proves it is a bitmap.
+        for beats in [4u32, 8, 16, 32, 64, 128, 256] {
+            assert_eq!(blen_field(beats).unwrap().count_ones(), 1);
+        }
+        // And every length fits in the seven-bit field.
+        assert!(blen_field(256).unwrap() < (1 << DMA_SBMR_BLEN.1));
+    }
+
+    #[test]
+    fn a_burst_length_that_is_not_one_of_the_seven_is_refused() {
+        // Shifting, say, 100 beats would land on bit 25 of the field, which
+        // is outside it --- or worse, on a different length's bit.
+        for beats in [0u32, 1, 2, 3, 5, 100, 512, 1024] {
+            assert_eq!(blen_field(beats), None, "{} beats was accepted", beats);
+        }
+    }
+
+    #[test]
+    fn the_outstanding_limits_are_written_one_less_than_they_are() {
+        // `RD_OSR_LMT, pdata->rd_osr_limit - 1`. The field counts from zero.
+        let cfg = BusConfig {
+            burst_beats: 256,
+            aligned_beats: false,
+            read_outstanding: 8,
+            write_outstanding: 4,
+        };
+        let v = system_bus_mode(0, cfg).unwrap();
+        assert_eq!(get_bits(v, DMA_SBMR_RD_OSR_LMT.0, DMA_SBMR_RD_OSR_LMT.1), 7);
+        assert_eq!(get_bits(v, DMA_SBMR_WR_OSR_LMT.0, DMA_SBMR_WR_OSR_LMT.1), 3);
+        // One request outstanding is a zero in the field, not a one.
+        let one = BusConfig {
+            read_outstanding: 1,
+            write_outstanding: 1,
+            ..cfg
+        };
+        let v = system_bus_mode(0, one).unwrap();
+        assert_eq!(get_bits(v, DMA_SBMR_RD_OSR_LMT.0, DMA_SBMR_RD_OSR_LMT.1), 0);
+    }
+
+    #[test]
+    fn a_zero_outstanding_limit_is_refused_instead_of_underflowing_to_sixty_three() {
+        // This is the one that a missing platform property produces in Linux:
+        // `0 - 1` in an `unsigned int`, masked to six bits, is 63 --- the
+        // most permissive setting there is, from a value nobody set.
+        let cfg = BusConfig {
+            burst_beats: 256,
+            aligned_beats: false,
+            read_outstanding: 0,
+            write_outstanding: 8,
+        };
+        assert_eq!(system_bus_mode(0, cfg), Err(DeviceError::InvalidParam));
+        let cfg = BusConfig {
+            write_outstanding: 0,
+            read_outstanding: 8,
+            ..cfg
+        };
+        assert_eq!(system_bus_mode(0, cfg), Err(DeviceError::InvalidParam));
+        // And a limit above what six bits can hold is refused too, rather
+        // than silently truncated to something smaller than asked for.
+        let cfg = BusConfig {
+            read_outstanding: 65,
+            write_outstanding: 8,
+            ..cfg
+        };
+        assert_eq!(system_bus_mode(0, cfg), Err(DeviceError::InvalidParam));
+    }
+
+    #[test]
+    fn enhanced_addressing_and_the_undocumented_bit_are_always_set() {
+        // EAME must be on before any descriptor address above 4 GiB is
+        // programmed: the high half of the list address register gets written
+        // regardless, so without it the engine fetches the ring from the
+        // wrong place and reports nothing. UNDEF is set because Linux sets
+        // it and nobody has documented what it does.
+        let cfg = BusConfig {
+            burst_beats: 32,
+            aligned_beats: true,
+            read_outstanding: 2,
+            write_outstanding: 2,
+        };
+        let v = system_bus_mode(0, cfg).unwrap();
+        assert_eq!(get_bits(v, DMA_SBMR_EAME.0, DMA_SBMR_EAME.1), 1);
+        assert_eq!(get_bits(v, DMA_SBMR_UNDEF.0, DMA_SBMR_UNDEF.1), 1);
+        assert_eq!(get_bits(v, DMA_SBMR_AAL.0, DMA_SBMR_AAL.1), 1);
+        let v = system_bus_mode(
+            0,
+            BusConfig {
+                aligned_beats: false,
+                ..cfg
+            },
+        )
+        .unwrap();
+        assert_eq!(get_bits(v, DMA_SBMR_AAL.0, DMA_SBMR_AAL.1), 0);
+    }
+
+    #[test]
+    fn the_bus_mode_is_one_read_and_one_write_not_five() {
+        // The point of building the word locally. Five read-modify-writes
+        // would publish four intermediate states to a live bus master, each
+        // a combination the driver never intended --- including, briefly,
+        // a burst length with EAME already on and the limits still at
+        // whatever the chip had.
+        let fake = FakeXgmac::new();
+        fake.preload(DMA_SBMR, 0x0000_0e00);
+        let cfg = BusConfig {
+            burst_beats: 256,
+            aligned_beats: false,
+            read_outstanding: 8,
+            write_outstanding: 8,
+        };
+        assert!(config_dma_bus(&fake, cfg).is_ok());
+        let log = fake.log();
+        assert_eq!(log.len(), 2, "{:?}", log);
+        assert_eq!(log[0], Access::Read(DMA_SBMR));
+        assert!(matches!(log[1], Access::Write(DMA_SBMR, _)));
+    }
+
+    #[test]
+    fn the_bits_the_driver_does_not_claim_survive_the_bus_mode_write() {
+        // Bits 13..15 and 22..23 belong to no field above, so whatever the
+        // chip reports there has to come back out untouched.
+        let preserved = (1 << 13) | (1 << 15) | (1 << 22) | (1 << 23);
+        let cfg = BusConfig {
+            burst_beats: 4,
+            aligned_beats: false,
+            read_outstanding: 1,
+            write_outstanding: 1,
+        };
+        let v = system_bus_mode(preserved, cfg).unwrap();
+        assert_eq!(v & preserved, preserved);
+    }
+
+    #[test]
+    fn a_refused_bus_config_writes_nothing() {
+        let fake = FakeXgmac::new();
+        let cfg = BusConfig {
+            burst_beats: 100,
+            aligned_beats: false,
+            read_outstanding: 8,
+            write_outstanding: 8,
+        };
+        assert_eq!(config_dma_bus(&fake, cfg), Err(DeviceError::InvalidParam));
+        assert_eq!(fake.writes_to(DMA_SBMR), 0);
+    }
+
+    // ——— The station address ———
+
+    #[test]
+    fn the_address_registers_are_where_linux_says() {
+        assert_eq!(MAC_MACA0HR, 0x0300);
+        assert_eq!(MAC_MACA0LR, 0x0304);
+        assert_eq!(MAC_MACA1HR, 0x0308);
+        // Each address slot is a pair of words, so slot 1 starts one pair on.
+        assert_eq!(MAC_MACA1HR - MAC_MACA0HR, 8);
+        assert_eq!(MAC_MACA1HR_AE, (31, 1));
+    }
+
+    #[test]
+    fn the_address_halves_are_four_bytes_and_two_not_three_and_three() {
+        // `xgbe_set_mac_address`: the low word takes bytes 0..3 and the high
+        // word bytes 4..5, each little-endian within its word. Splitting it
+        // evenly --- the obvious guess --- puts byte 3 in the wrong register
+        // and the card answers to an address nobody assigned it.
+        let (hi, lo) = mac_to_regs([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        assert_eq!(lo, 0x3322_1100);
+        assert_eq!(hi, 0x0000_5544);
+    }
+
+    #[test]
+    fn the_high_word_of_address_zero_leaves_room_for_the_enable_bit() {
+        // The high register is a half-filled word: its top sixteen bits stay
+        // zero, which is where the additional addresses' AE bit lives. So a
+        // station address can never set AE by accident, and address 0 --- the
+        // one slot whose HR has no AE defined --- must not have it set.
+        let (hi, _) = mac_to_regs([0xff; 6]);
+        assert_eq!(hi, 0x0000_ffff);
+        assert_eq!(hi >> 16, 0);
+        assert_eq!(hi & (1 << MAC_MACA1HR_AE.0), 0);
+    }
+
+    #[test]
+    fn the_station_address_is_written_high_half_first() {
+        // The order Linux uses, kept because the low word is the one that
+        // latches the pair: writing low first leaves the chip briefly
+        // filtering on an address whose top two bytes are stale.
+        let fake = FakeXgmac::new();
+        set_mac_address(&fake, [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+        assert_eq!(
+            fake.log(),
+            alloc::vec![
+                Access::Write(MAC_MACA0HR, 0x0000_5634),
+                Access::Write(MAC_MACA0LR, 0x1200_5452),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_address_read_from_the_port_properties_survives_the_round_trip() {
+        // The two halves this batch writes and the two the probe reads are
+        // different registers with different layouts, so the only way to know
+        // they agree is to put a MAC through both.
+        let mac = [0x02, 0xde, 0xad, 0xbe, 0xef, 0x10];
+        let (hi, lo) = mac_to_regs(mac);
+        // `mac_from_prop` wants the port-property layout, which carries the
+        // valid bit in the high word --- the MAC registers have no such bit,
+        // which is the difference worth noticing.
+        assert_eq!(mac_from_prop(lo, hi | (1 << 31)), Some(mac));
     }
 }
