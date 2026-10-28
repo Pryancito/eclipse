@@ -1849,6 +1849,215 @@ pub const fn desc_paddr(ring_paddr: u64, index: usize) -> u64 {
     ring_paddr + (index as u64) * core::mem::size_of::<Desc>() as u64
 }
 
+// ——— Reading back what the chip received ———
+
+/// `RX_NORMAL_DESC0_OVT`, index 0, width 16: the outer VLAN tag.
+///
+/// On the way IN, `desc0` was the low half of the header buffer's address.
+/// The chip overwrites the address words with results, so every field below
+/// is only meaningful once `OWN` has gone back to the driver.
+pub const RX_DESC0_OVT: (u32, u32) = (0, 16);
+/// `RX_NORMAL_DESC2_TNP`, index 11, width 1: the frame arrived tunnelled.
+pub const RX_DESC2_TNP: (u32, u32) = (11, 1);
+/// `RX_NORMAL_DESC3_ETLT`, index 16, width 4: "error type / length type".
+/// One field, two jobs, told apart by [`RX_DESC3_ES`] --- and not the way
+/// round the name suggests. See [`rx_frame_verdict`].
+pub const RX_DESC3_ETLT: (u32, u32) = (16, 4);
+/// `RX_NORMAL_DESC3_ES`, index 15, width 1: the error summary.
+pub const RX_DESC3_ES: (u32, u32) = (15, 1);
+/// `RX_NORMAL_DESC3_L34T`, index 20, width 4: which layer-3 and layer-4
+/// protocols the chip recognised.
+pub const RX_DESC3_L34T: (u32, u32) = (20, 4);
+/// `RX_NORMAL_DESC3_RSV`, index 26, width 1: `desc1` holds an RSS hash.
+pub const RX_DESC3_RSV: (u32, u32) = (26, 1);
+/// `RX_NORMAL_DESC3_CDA`, index 27, width 1: a context descriptor follows
+/// this one.
+pub const RX_DESC3_CDA: (u32, u32) = (27, 1);
+
+/// `ETLT` 0x09 with no error: the frame carried a VLAN tag, and `desc0`'s
+/// [`RX_DESC0_OVT`] holds it. A value in the field named for error types
+/// that is not an error at all.
+pub const ETLT_VLAN_TAG: u32 = 0x09;
+/// `ETLT` 0x05 with an error: the IP header checksum was wrong.
+pub const ETLT_IP_HEADER_CSUM: u32 = 0x05;
+/// `ETLT` 0x06 with an error: the payload checksum was wrong.
+pub const ETLT_PAYLOAD_CSUM: u32 = 0x06;
+
+/// `RX_DESC3_L34T_IPV4_TCP`.
+pub const L34T_IPV4_TCP: u32 = 1;
+/// `RX_DESC3_L34T_IPV4_UDP`.
+pub const L34T_IPV4_UDP: u32 = 2;
+/// `RX_DESC3_L34T_IPV6_TCP`.
+pub const L34T_IPV6_TCP: u32 = 9;
+/// `RX_DESC3_L34T_IPV6_UDP`.
+pub const L34T_IPV6_UDP: u32 = 10;
+
+/// Whether the RSS hash covers layer 4 as well as layer 3, from `L34T`. The
+/// four values that name a transport protocol hash over the ports too;
+/// everything else, ICMP and the two "unknown"s included, hashes over the
+/// addresses alone.
+#[inline]
+pub const fn rss_hash_covers_ports(l34t: u32) -> bool {
+    matches!(
+        l34t,
+        L34T_IPV4_TCP | L34T_IPV4_UDP | L34T_IPV6_TCP | L34T_IPV6_UDP
+    )
+}
+
+/// What the chip thought of a received frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RxVerdict {
+    /// Nothing wrong with it.
+    Clean,
+    /// A checksum was wrong, but the frame itself arrived intact. Linux hands
+    /// this one up the stack with the hardware-checksum flag cleared, rather
+    /// than dropping it: the frame is real and something above may still want
+    /// it.
+    ChecksumBad,
+    /// The frame is damaged. Drop it.
+    FrameBad,
+}
+
+/// Read `ES` and `ETLT` together and say what happened.
+///
+/// The trap is the condition Linux writes as `if (!err || !etlt)`: a frame is
+/// fine when the error summary is clear **OR** when the error type is zero.
+/// An error summary on its own is NOT an error --- `ETLT` has to name one
+/// too. Reading `ES` alone, which is what its name invites, drops good
+/// frames.
+///
+/// This driver has no tunnelling support, so the two `ETLT` values that only
+/// mean a tunnel checksum error on a tunnelled frame (0x09 and 0x0a) land in
+/// [`RxVerdict::FrameBad`] here, which is exactly where Linux puts them when
+/// the frame is not tunnelled.
+#[inline]
+pub const fn rx_frame_verdict(desc3: u32) -> RxVerdict {
+    let err = get_bits(desc3, RX_DESC3_ES.0, RX_DESC3_ES.1);
+    let etlt = get_bits(desc3, RX_DESC3_ETLT.0, RX_DESC3_ETLT.1);
+    if err == 0 || etlt == 0 {
+        return RxVerdict::Clean;
+    }
+    match etlt {
+        ETLT_IP_HEADER_CSUM | ETLT_PAYLOAD_CSUM => RxVerdict::ChecksumBad,
+        _ => RxVerdict::FrameBad,
+    }
+}
+
+/// Everything a written-back normal receive descriptor says.
+///
+/// The `Option`s are not politeness: each of those fields is only meaningful
+/// on one end of a multi-descriptor frame, and the header length and the
+/// packet length sit in the *same descriptor* under opposite conditions. A
+/// struct of plain integers would invite reading a length off the middle of a
+/// frame, where the field holds whatever the chip last left there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RxDescriptor {
+    /// `FD`: the frame starts here.
+    pub first: bool,
+    /// `LD`: the frame ends here.
+    pub last: bool,
+    /// `HL`, valid on the first descriptor only: how many bytes went into the
+    /// header buffer when split-header receive is on. Zero means the whole
+    /// frame went into the payload buffer.
+    pub header_len: Option<u32>,
+    /// `PL`, valid on the last descriptor only: the length of the whole
+    /// frame.
+    pub packet_len: Option<u32>,
+    /// Valid on the last descriptor only, for the same reason.
+    pub verdict: Option<RxVerdict>,
+    /// The outer VLAN tag, when the frame carried one.
+    pub vlan_tag: Option<u16>,
+    /// `desc1`, when `RSV` says it is a hash rather than the address half it
+    /// used to be.
+    pub rss_hash: Option<u32>,
+    /// Whether that hash covers the layer-4 ports.
+    pub rss_covers_ports: bool,
+    /// `CDA`: the next descriptor is a context descriptor, not another
+    /// fragment.
+    pub context_next: bool,
+}
+
+/// What came back in a receive descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RxRead {
+    /// `OWN` is still set: the chip has not finished with this descriptor and
+    /// nothing in it may be read. `xgbe_dev_read` returning 1.
+    NotYours,
+    /// A context descriptor, which carries a timestamp rather than a frame.
+    Context,
+    /// A normal descriptor.
+    Normal(RxDescriptor),
+}
+
+/// Parse a written-back receive descriptor. `xgbe_dev_read`.
+///
+/// The caller issues its read barrier between seeing `OWN` clear and using
+/// anything else, which is why the `OWN` test comes first and alone: every
+/// other word of the descriptor was written by the chip and is only settled
+/// once ownership has come back.
+pub fn read_rx_desc(desc: &Desc) -> RxRead {
+    if desc_owned_by_dma(desc.desc3) {
+        return RxRead::NotYours;
+    }
+    if desc_is_context(desc.desc3) {
+        return RxRead::Context;
+    }
+
+    let first = desc.desc3 & DESC3_FD != 0;
+    let last = desc.desc3 & DESC3_LD != 0;
+    let verdict = if last {
+        Some(rx_frame_verdict(desc.desc3))
+    } else {
+        None
+    };
+    let vlan_tag = match verdict {
+        Some(RxVerdict::Clean)
+            if get_bits(desc.desc3, RX_DESC3_ETLT.0, RX_DESC3_ETLT.1) == ETLT_VLAN_TAG =>
+        {
+            Some(get_bits(desc.desc0, RX_DESC0_OVT.0, RX_DESC0_OVT.1) as u16)
+        }
+        _ => None,
+    };
+    let rss_hash = if get_bits(desc.desc3, RX_DESC3_RSV.0, RX_DESC3_RSV.1) != 0 {
+        Some(desc.desc1)
+    } else {
+        None
+    };
+
+    RxRead::Normal(RxDescriptor {
+        first,
+        last,
+        header_len: if first {
+            Some(rx_header_len(desc.desc2))
+        } else {
+            None
+        },
+        packet_len: if last {
+            Some(rx_packet_len(desc.desc3))
+        } else {
+            None
+        },
+        verdict,
+        vlan_tag,
+        rss_hash,
+        rss_covers_ports: rss_hash.is_some()
+            && rss_hash_covers_ports(get_bits(desc.desc3, RX_DESC3_L34T.0, RX_DESC3_L34T.1)),
+        context_next: get_bits(desc.desc3, RX_DESC3_CDA.0, RX_DESC3_CDA.1) != 0,
+    })
+}
+
+/// Whether the frame arrived through a tunnel. `RX_NORMAL_DESC2_TNP`.
+///
+/// Nothing in this driver acts on it yet --- tunnel offload needs the two
+/// `ETLT` values that only mean a checksum error on a tunnelled frame, and
+/// those are deliberately left as [`RxVerdict::FrameBad`] above. It is named
+/// so that the bit does not look free when somebody comes to use `desc2` for
+/// something else.
+#[inline]
+pub const fn rx_is_tunnelled(desc2: u32) -> bool {
+    get_bits(desc2, RX_DESC2_TNP.0, RX_DESC2_TNP.1) != 0
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
@@ -4395,5 +4604,261 @@ mod tests {
             log[0],
             Access::Write(dma_channel_reg(1, DMA_CH_TDTR_LO), 0x1234_5678)
         );
+    }
+
+    // ——— Tanda 12: reading a received frame back ———
+
+    /// A written-back descriptor: desc3 assembled from flags, the rest zero
+    /// unless a test puts something there.
+    fn written_back(desc3: u32) -> Desc {
+        Desc {
+            desc0: 0,
+            desc1: 0,
+            desc2: 0,
+            desc3,
+        }
+    }
+
+    fn whole_frame(extra: u32) -> Desc {
+        written_back(DESC3_FD | DESC3_LD | extra)
+    }
+
+    #[test]
+    fn a_descriptor_the_chip_still_owns_yields_nothing() {
+        // Every other word was written by the chip and is not settled until
+        // OWN comes back, so the OWN test comes first and alone.
+        let d = written_back(DESC3_OWN | DESC3_FD | DESC3_LD | 1500);
+        assert_eq!(read_rx_desc(&d), RxRead::NotYours);
+    }
+
+    #[test]
+    fn a_context_descriptor_is_not_a_frame() {
+        let d = written_back(DESC3_CTXT);
+        assert_eq!(read_rx_desc(&d), RxRead::Context);
+        // And CTXT is only read once OWN is clear: with OWN set it is still
+        // the chip's.
+        let busy = written_back(DESC3_OWN | DESC3_CTXT);
+        assert_eq!(read_rx_desc(&busy), RxRead::NotYours);
+    }
+
+    #[test]
+    fn an_error_summary_on_its_own_is_not_an_error() {
+        // This is the one that costs good frames. Linux: "no error if err is
+        // 0 OR etlt is 0". ES set with ETLT zero is a CLEAN frame.
+        let d = set_bits(0, RX_DESC3_ES.0, RX_DESC3_ES.1, 1);
+        assert_eq!(rx_frame_verdict(d), RxVerdict::Clean);
+        // And an ETLT on its own, with no error summary, likewise.
+        let e = set_bits(0, RX_DESC3_ETLT.0, RX_DESC3_ETLT.1, 0x0c);
+        assert_eq!(rx_frame_verdict(e), RxVerdict::Clean);
+        // It takes both.
+        assert_eq!(rx_frame_verdict(d | e), RxVerdict::FrameBad);
+    }
+
+    #[test]
+    fn a_bad_checksum_is_not_a_bad_frame() {
+        let err = set_bits(0, RX_DESC3_ES.0, RX_DESC3_ES.1, 1);
+        for etlt in [ETLT_IP_HEADER_CSUM, ETLT_PAYLOAD_CSUM] {
+            let d = err | set_bits(0, RX_DESC3_ETLT.0, RX_DESC3_ETLT.1, etlt);
+            assert_eq!(
+                rx_frame_verdict(d),
+                RxVerdict::ChecksumBad,
+                "etlt {:#04x}",
+                etlt
+            );
+        }
+        // 0x09 and 0x0a only mean a TUNNEL checksum error on a tunnelled
+        // frame; with no tunnel support they are damage, which is where
+        // Linux puts them too.
+        for etlt in [0x09u32, 0x0a] {
+            let d = err | set_bits(0, RX_DESC3_ETLT.0, RX_DESC3_ETLT.1, etlt);
+            assert_eq!(
+                rx_frame_verdict(d),
+                RxVerdict::FrameBad,
+                "etlt {:#04x}",
+                etlt
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_etlt_value_is_a_vlan_tag_or_damage_depending_on_the_error_bit() {
+        let etlt = set_bits(0, RX_DESC3_ETLT.0, RX_DESC3_ETLT.1, ETLT_VLAN_TAG);
+        // Without the error summary: a VLAN tag, and desc0 carries it.
+        let mut tagged = whole_frame(etlt);
+        tagged.desc0 = 0xffff_0123;
+        match read_rx_desc(&tagged) {
+            RxRead::Normal(d) => {
+                assert_eq!(d.verdict, Some(RxVerdict::Clean));
+                // OVT is the low SIXTEEN bits of desc0, not all of it.
+                assert_eq!(d.vlan_tag, Some(0x0123));
+            }
+            other => panic!("not a normal descriptor: {:?}", other),
+        }
+        // With it: damage, and no tag is reported.
+        let mut bad = whole_frame(etlt | set_bits(0, RX_DESC3_ES.0, RX_DESC3_ES.1, 1));
+        bad.desc0 = 0xffff_0123;
+        match read_rx_desc(&bad) {
+            RxRead::Normal(d) => {
+                assert_eq!(d.verdict, Some(RxVerdict::FrameBad));
+                assert_eq!(d.vlan_tag, None);
+            }
+            other => panic!("not a normal descriptor: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn the_two_lengths_are_valid_at_opposite_ends_of_the_frame() {
+        // Same descriptor word layout, opposite conditions: HL only on the
+        // first, PL only on the last. A middle descriptor has neither, and
+        // whatever sits in those bits is leftover.
+        let mut middle = written_back(0x3fff);
+        middle.desc2 = 0x03ff;
+        match read_rx_desc(&middle) {
+            RxRead::Normal(d) => {
+                assert!(!d.first);
+                assert!(!d.last);
+                assert_eq!(d.header_len, None);
+                assert_eq!(d.packet_len, None);
+                assert_eq!(d.verdict, None);
+            }
+            other => panic!("not a normal descriptor: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn the_first_descriptor_carries_the_header_length_and_the_last_the_frame_length() {
+        let mut first = written_back(DESC3_FD | 1234);
+        first.desc2 = 54;
+        match read_rx_desc(&first) {
+            RxRead::Normal(d) => {
+                assert_eq!(d.header_len, Some(54));
+                // 1234 is sitting in PL's bits, but this is not the last
+                // descriptor, so it is not a frame length.
+                assert_eq!(d.packet_len, None);
+            }
+            other => panic!("not a normal descriptor: {:?}", other),
+        }
+        let mut last = written_back(DESC3_LD | 1234);
+        last.desc2 = 54;
+        match read_rx_desc(&last) {
+            RxRead::Normal(d) => {
+                assert_eq!(d.packet_len, Some(1234));
+                assert_eq!(d.header_len, None);
+            }
+            other => panic!("not a normal descriptor: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn the_header_length_field_is_ten_bits_not_fourteen() {
+        // desc2's length field on the way back is TEN bits wide, while the
+        // transmit side's length in the same word is fourteen.
+        let mut d = written_back(DESC3_FD);
+        d.desc2 = 0xffff_ffff;
+        match read_rx_desc(&d) {
+            RxRead::Normal(r) => assert_eq!(r.header_len, Some(0x3ff)),
+            other => panic!("not a normal descriptor: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn desc1_is_a_hash_only_when_the_chip_says_so() {
+        // On the way in, desc1 was the high half of the header address. The
+        // chip overwrites it, but only RSV says the new value means
+        // anything.
+        let mut quiet = whole_frame(0);
+        quiet.desc1 = 0xdead_beef;
+        match read_rx_desc(&quiet) {
+            RxRead::Normal(d) => {
+                assert_eq!(d.rss_hash, None);
+                assert!(!d.rss_covers_ports);
+            }
+            other => panic!("not a normal descriptor: {:?}", other),
+        }
+        let mut hashed = whole_frame(set_bits(0, RX_DESC3_RSV.0, RX_DESC3_RSV.1, 1));
+        hashed.desc1 = 0xdead_beef;
+        match read_rx_desc(&hashed) {
+            RxRead::Normal(d) => assert_eq!(d.rss_hash, Some(0xdead_beef)),
+            other => panic!("not a normal descriptor: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn only_the_four_transport_types_hash_over_the_ports() {
+        for l34t in [L34T_IPV4_TCP, L34T_IPV4_UDP, L34T_IPV6_TCP, L34T_IPV6_UDP] {
+            assert!(rss_hash_covers_ports(l34t), "l34t {}", l34t);
+        }
+        // ICMP (3, 11) and the two "unknown"s (7, 15) hash over the
+        // addresses alone, as does anything else the field can hold.
+        for l34t in [0u32, 3, 7, 11, 15, 4, 8, 12] {
+            assert!(!rss_hash_covers_ports(l34t), "l34t {}", l34t);
+        }
+    }
+
+    #[test]
+    fn the_l34_type_is_only_read_when_there_is_a_hash() {
+        // L34T holds a protocol whether or not RSV is set, so reading it
+        // unconditionally would report a port hash on a frame that has no
+        // hash at all.
+        let l34t = set_bits(0, RX_DESC3_L34T.0, RX_DESC3_L34T.1, L34T_IPV4_TCP);
+        match read_rx_desc(&whole_frame(l34t)) {
+            RxRead::Normal(d) => {
+                assert_eq!(d.rss_hash, None);
+                assert!(!d.rss_covers_ports);
+            }
+            other => panic!("not a normal descriptor: {:?}", other),
+        }
+        let rsv = set_bits(0, RX_DESC3_RSV.0, RX_DESC3_RSV.1, 1);
+        match read_rx_desc(&whole_frame(l34t | rsv)) {
+            RxRead::Normal(d) => assert!(d.rss_covers_ports),
+            other => panic!("not a normal descriptor: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_context_descriptor_is_announced_a_descriptor_ahead() {
+        let cda = set_bits(0, RX_DESC3_CDA.0, RX_DESC3_CDA.1, 1);
+        match read_rx_desc(&whole_frame(cda)) {
+            RxRead::Normal(d) => assert!(d.context_next),
+            other => panic!("not a normal descriptor: {:?}", other),
+        }
+        match read_rx_desc(&whole_frame(0)) {
+            RxRead::Normal(d) => assert!(!d.context_next),
+            other => panic!("not a normal descriptor: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn the_flag_bits_do_not_collide_with_each_other() {
+        // FD, LD, CDA, RSV, CTXT and OWN all live in desc3's top byte, and
+        // ETLT, ES and L34T below them. Setting each alone must leave the
+        // rest of the reading unchanged.
+        let fields = [
+            RX_DESC3_ES,
+            RX_DESC3_ETLT,
+            RX_DESC3_L34T,
+            RX_DESC3_RSV,
+            RX_DESC3_CDA,
+        ];
+        for (i, a) in fields.iter().enumerate() {
+            let word = set_bits(0, a.0, a.1, (1 << a.1) - 1);
+            for (j, b) in fields.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                assert_eq!(get_bits(word, b.0, b.1), 0, "{:?} bleeds into {:?}", a, b);
+            }
+            // ... and none of them reaches OWN, CTXT, FD or LD.
+            assert_eq!(word & (DESC3_OWN | DESC3_CTXT | DESC3_FD | DESC3_LD), 0);
+        }
+    }
+
+    #[test]
+    fn the_tunnel_bit_is_named_but_not_acted_on() {
+        assert!(rx_is_tunnelled(1 << 11));
+        assert!(!rx_is_tunnelled(0));
+        // It is bit 11 of desc2, above the ten-bit header length, so a full
+        // header length does not look like a tunnel.
+        assert!(!rx_is_tunnelled(0x3ff));
     }
 }
