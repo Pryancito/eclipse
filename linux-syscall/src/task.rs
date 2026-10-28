@@ -1314,7 +1314,11 @@ impl Syscall<'_> {
                 }
             }
             P_PIDFD => {
-                let pidfd = PidFd::from_file_like(self.linux_process().get_file_like(id.into())?)?;
+                // `if (upid < 0) return -EINVAL;`, before the descriptor is
+                // looked up: -1, and `PIDFD_SELF_THREAD` (-10000), which no
+                // `waitid` takes, were `EBADF`.
+                let fd = crate::intarg::waitid_id(id, true)?;
+                let pidfd = PidFd::from_file_like(self.linux_process().get_file_like(fd.into())?)?;
                 let target = pidfd.target();
                 // A thread that is not a leader is nobody's child.
                 if pidfd.thread().is_some() || !is_child_process(caller, target) {

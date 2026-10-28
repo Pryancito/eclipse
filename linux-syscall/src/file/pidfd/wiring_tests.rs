@@ -29,6 +29,7 @@ use super::*;
 use crate::on_a_thread::on_a_thread;
 use alloc::boxed::Box;
 use linux_object::signal::SignalCode;
+use linux_object::thread::ThreadExt;
 use rcore_fs_ramfs::RamFS;
 use zircon_object::task::{Process, ROOT_JOB};
 
@@ -222,10 +223,11 @@ fn pidfd_getfd_is_not_a_way_into_another_users_process() {
     // it. The proof that the question comes before the lookup is a
     // descriptor the target does not have open: `EPERM`, not `EBADF`.
     let target = a_process(49_106, "pidfd-perm-target");
+    // Its leader, which `pidfd_getfd` takes the descriptor out of.
+    let leader = Thread::create_linux(&target).unwrap();
     let proc = a_process(49_107, "pidfd-perm");
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
-            let _ = &target;
             let fd = FileDesc::from(
                 sys.sys_pidfd_open(49_106, 0)
                     .expect("a pidfd on a live process"),
@@ -255,4 +257,6 @@ fn pidfd_getfd_is_not_a_way_into_another_users_process() {
             );
         })
     });
+    target.exit(0);
+    leader.terminate_abandoned();
 }
