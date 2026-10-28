@@ -27,7 +27,7 @@
 
 use std::os::fd::AsFd;
 
-use lunarbar::apps::{norm_key, scan_apps, AppEntry};
+use lunarbar::apps::{norm_key, scan_apps};
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
 use lunarbar::i18n::Lang;
@@ -189,8 +189,8 @@ impl Item {
 /// Applications, plus the handful of rows KRunner has that are not programs.
 fn build_items(terminal: &str) -> Vec<Item> {
     let mut items = builtin_items(terminal, Lang::current());
-    for AppEntry { name, exec, icon } in scan_apps(terminal) {
-        items.push(Item::new(name, exec, icon, Kind::App));
+    for app in scan_apps(terminal) {
+        items.push(Item::new(app.name, app.exec, app.icon, Kind::App));
     }
     items
 }

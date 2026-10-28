@@ -2776,6 +2776,10 @@ const MENU_ES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
     <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>
     <item label="Monitor (top)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal top</command></action></item>
     <separator/>
+    <!-- Every installed program, as a labwc PIPE MENU (run on first open, so
+         it cannot go stale): see `obmenu` in tools/lunarbar. -->
+    <menu id="lunar-apps" label="Aplicaciones" execute="/usr/local/bin/lunarbar --labwc-menu"/>
+    <separator/>
     <item label="Prueba SDL2 (renderer)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --hold</command></action></item>
     <item label="Prueba SDL3 (wl_shm)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --sdl3 --surface --hold</command></action></item>
     <item label="Prueba SDL2 (por subsistema)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --steps</command></action></item>
@@ -2801,6 +2805,8 @@ const MENU_EN: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
     <item label="Firefox"><action name="Execute"><command>/usr/local/bin/eclipse-firefox</command></action></item>
     <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>
     <item label="Monitor (top)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal top</command></action></item>
+    <separator/>
+    <menu id="lunar-apps" label="Applications" execute="/usr/local/bin/lunarbar --labwc-menu"/>
     <separator/>
     <item label="SDL2 test (renderer)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --hold</command></action></item>
     <item label="SDL3 test (wl_shm)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal /bin/eclipse-sdl-probe --sdl3 --surface --hold</command></action></item>

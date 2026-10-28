@@ -1685,6 +1685,35 @@ fn every_look_has_a_theme_and_a_palette_of_its_own() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Both menus list the installed programs through lunarbar's pipe menu, and
+/// nothing else does: the rest of `menu.xml` is hand-written, so a program
+/// installed after the image was built can only appear through this one
+/// entry. The command has to be the binary the image really installs
+/// (`/usr/local/bin/lunarbar`, see `LinuxRootfs::lunar_tools`) -- labwc
+/// reports a pipe menu whose command does not exist as an EMPTY submenu, with
+/// no error anywhere.
+#[test]
+fn the_application_menu_is_a_pipe_menu_in_both_languages() {
+    let dir = look_rootfs("pipemenu");
+    let menu = dir.join("root/.config/labwc");
+    for (file, label) in [
+        ("menu.es.xml", "Aplicaciones"),
+        ("menu.en.xml", "Applications"),
+    ] {
+        let xml = fs::read_to_string(menu.join(file)).unwrap();
+        assert!(
+            xml.contains(&format!(
+                "<menu id=\"lunar-apps\" label=\"{label}\" execute=\"/usr/local/bin/lunarbar --labwc-menu\"/>"
+            )),
+            "{file} has no application pipe menu:\n{xml}"
+        );
+        // One entry, not two: a duplicate id is a menu labwc may or may not
+        // show, depending on which definition it keeps.
+        assert_eq!(xml.matches("id=\"lunar-apps\"").count(), 1, "{file}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The look a fresh image comes up in is written in four places, and a
 /// disagreement between them shows as a session that half-changes: the
 /// panel in one look, the window frames in another.
