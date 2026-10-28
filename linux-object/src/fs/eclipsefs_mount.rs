@@ -117,6 +117,12 @@ pub struct EclipseMountFs {
     /// Directory listings by inode, so `getdents` over a big directory is not
     /// one full listing per entry. Dropped on any change to that directory.
     dir_cache: Mutex<BTreeMap<u64, Listing>>,
+    /// How many `EclipseMountINode`s of each inode are alive: an open file
+    /// holds one. The filesystem asks before freeing a file whose last name
+    /// goes (`EclipseFS::set_open_check`), and keeps a held one to its last
+    /// close, as Linux does. Locked with `inner` held, never the other way
+    /// round, so an inode may drop anywhere.
+    live: Arc<Mutex<BTreeMap<u64, usize>>>,
 }
 
 /// Block devices the kernel found at boot, by name (`sda2`), for the
@@ -310,6 +316,9 @@ impl EclipseMountFs {
             }
         }
         let root = mount_root(&mut fs, opts)?;
+        let live: Arc<Mutex<BTreeMap<u64, usize>>> = Arc::default();
+        let held = live.clone();
+        fs.set_open_check(Some(Arc::new(move |h| held.lock().contains_key(&h))));
         if !read_only {
             fs.set_commit_interval(Some(opts.commit.unwrap_or(DEFAULT_COMMIT_SECS)));
             match fs.grow_to_device() {
@@ -324,6 +333,7 @@ impl EclipseMountFs {
             root,
             this: Mutex::new(Weak::new()),
             dir_cache: Mutex::new(BTreeMap::new()),
+            live,
         });
         *arc.this.lock() = Arc::downgrade(&arc);
         #[cfg(not(test))]
@@ -343,8 +353,11 @@ impl EclipseMountFs {
                 let tick = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(1);
                 kernel_hal::thread::sleep_until(tick).await;
                 let Some(fs) = fs.upgrade() else { break };
-                let r = fs.inner.lock().commit_if_due();
-                if let Err(e) = r {
+                let mut inner = fs.inner.lock();
+                if let Err(e) = inner.purge_orphans() {
+                    warn!("eclipsefs: freeing closed unlinked files failed: {:?}", e);
+                }
+                if let Err(e) = inner.commit_if_due() {
                     warn!("eclipsefs: periodic commit failed: {:?}", e);
                 }
             }
@@ -352,6 +365,7 @@ impl EclipseMountFs {
     }
 
     pub(crate) fn inode(&self, ino: u64) -> Arc<EclipseMountINode> {
+        *self.live.lock().entry(ino).or_default() += 1;
         Arc::new(EclipseMountINode {
             fs: self.this.lock().upgrade().expect("EclipseMountFs dropped"),
             ino,
@@ -403,7 +417,9 @@ fn mount_root(fs: &mut EclipseFS, opts: &EfsOptions) -> Result<u64> {
 
 impl FileSystem for EclipseMountFs {
     fn sync(&self) -> Result<()> {
-        self.inner.lock().sync().map_err(map_err)
+        let mut inner = self.inner.lock();
+        inner.purge_orphans().map_err(map_err)?;
+        inner.sync().map_err(map_err)
     }
 
     fn root_inode(&self) -> Arc<dyn INode> {
@@ -431,6 +447,21 @@ impl FileSystem for EclipseMountFs {
 pub(crate) struct EclipseMountINode {
     pub(crate) fs: Arc<EclipseMountFs>,
     pub(crate) ino: u64,
+}
+
+impl Drop for EclipseMountINode {
+    /// Gives back what `EclipseMountFs::inode` counted. A file this was the
+    /// last holder of after its last name went is freed by the committer or
+    /// the next `sync`, not here: this can run with `inner` held.
+    fn drop(&mut self) {
+        let mut live = self.fs.live.lock();
+        if let Some(n) = live.get_mut(&self.ino) {
+            *n -= 1;
+            if *n == 0 {
+                live.remove(&self.ino);
+            }
+        }
+    }
 }
 
 fn vfs_type(kind: FileKind) -> FileType {
@@ -893,6 +924,45 @@ mod tests {
             .read_at(0, &mut back)
             .unwrap();
         assert_eq!(&back[..n], b"v0.3");
+    }
+
+    /// ollama's readline history: open `history`, read it, and on every
+    /// line write `history.tmp` and rename it over `history`, then read on
+    /// to EOF through the fd still open. On Linux that fd is the old file
+    /// to its last close; here the rename freed it, and the next read gave
+    /// "read /root/.ollama/history: no such file or directory".
+    #[test]
+    fn a_file_renamed_over_while_open_reads_on_to_its_end() {
+        let disk = formatted(16 * 1024 * 1024);
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let root = fs.root_inode();
+        let old = b"first line\nsecond line\n";
+        root.create("history", FileType::File, 0o600)
+            .unwrap()
+            .write_at(0, old)
+            .unwrap();
+        let open = root.find("history").unwrap();
+        let mut buf = [0u8; 4096];
+        assert_eq!(open.read_at(0, &mut buf).unwrap(), old.len());
+        let tmp = root.create("history.tmp", FileType::File, 0o600).unwrap();
+        tmp.write_at(0, b"first line\n").unwrap();
+        drop(tmp);
+        root.move_("history.tmp", &root, "history").unwrap();
+        // What bufio asks for next: EOF, not ENOENT.
+        assert_eq!(open.read_at(old.len(), &mut buf).unwrap(), 0);
+        assert_eq!(open.read_at(0, &mut buf).unwrap(), old.len());
+        assert_eq!(&buf[..old.len()], old);
+        assert_eq!(open.metadata().unwrap().nlinks, 0);
+        let n = root.find("history").unwrap().read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"first line\n");
+        // Closed, the next sync frees it.
+        let gone = open.downcast_ref::<EclipseMountINode>().unwrap().ino;
+        fs.sync().unwrap();
+        assert_eq!(fs.inner.lock().stat(gone).unwrap().nlink, 0, "still open");
+        drop(open);
+        fs.sync().unwrap();
+        assert_eq!(fs.inner.lock().stat(gone).err(), Some(EfsError::NotFound));
+        fs.inner.lock().check().unwrap();
     }
 
     #[test]

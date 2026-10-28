@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 
 use crate::compress::Compression;
 use crate::cow::EncryptionPolicy;
-use crate::cow::{CowFs, SendStats};
+use crate::cow::{CowFs, OpenCheck, SendStats};
 use crate::device::BlockDevice;
 use crate::format::{FileKind, BLOCK_SIZE, MAGIC};
 use crate::v3::EclipseFsV3;
@@ -491,6 +491,25 @@ impl EclipseFS {
     pub fn set_commit_interval(&mut self, secs: Option<u64>) {
         if let Driver::V4(fs) = &mut self.driver {
             fs.set_commit_interval(secs);
+        }
+    }
+
+    /// Who has which files open (v0.4; see [`OpenCheck`]): a file whose
+    /// last name goes while it is open stays readable and writable until
+    /// [`purge_orphans`](Self::purge_orphans) finds it closed. v0.3 frees
+    /// it at once.
+    pub fn set_open_check(&mut self, f: Option<OpenCheck>) {
+        if let Driver::V4(fs) = &mut self.driver {
+            fs.set_open_check(f);
+        }
+    }
+
+    /// Free the files left without a name while open that are now closed;
+    /// returns how many.
+    pub fn purge_orphans(&mut self) -> Result<usize> {
+        match &mut self.driver {
+            Driver::V3(_) => Ok(0),
+            Driver::V4(fs) => fs.purge_orphans(),
         }
     }
 

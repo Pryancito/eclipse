@@ -7,7 +7,7 @@ use linux_object::fs::{OpenFlags, PidFd, PIDFD_THREAD};
 use linux_object::process::LinuxProcess;
 use linux_object::signal::{SigInfo, Signal};
 use zircon_object::object::{KernelObject, KoID};
-use zircon_object::task::Status;
+use zircon_object::task::{Status, Thread};
 
 /// Reduce `pidfd_open(2)`'s flag word to the open flags the new fd carries.
 ///
@@ -18,34 +18,70 @@ fn pidfd_open_flags(flags: u32) -> linux_object::error::LxResult<OpenFlags> {
     if flags & !(NONBLOCK | PIDFD_THREAD) != 0 {
         return Err(LxError::EINVAL);
     }
-    // PIDFD_THREAD would make the fd refer to one thread; `PidFd` holds a
-    // process, so accepting it would hand back an fd that waits on the wrong
-    // thing and reports the wrong exit.
-    if flags & PIDFD_THREAD != 0 {
-        return Err(LxError::EINVAL);
-    }
     // pidfd_open(2): the fd is always close-on-exec, whatever the caller
-    // asked, and open for reading and writing.
+    // asked, and open for reading and writing. `PIDFD_THREAD` stays in it, as
+    // `O_EXCL`, the way Linux keeps it in `f_flags`.
     let mut open_flags = OpenFlags::CLOEXEC | OpenFlags::RDWR;
     if flags & NONBLOCK != 0 {
         open_flags |= OpenFlags::NON_BLOCK;
     }
+    if flags & PIDFD_THREAD != 0 {
+        open_flags |= OpenFlags::EXCLUSIVE;
+    }
     Ok(open_flags)
 }
 
-/// The process `pidfd_open(pid, 0)` gives a descriptor on.
+/// The process `pidfd_open(pid, flags)` gives a descriptor on, and the
+/// thread when `pid` names one that is not its process's leader.
 ///
 /// A zombie too: its pidfd is readable at once, and `waitid(P_PIDFD)`
 /// collects it. A thread that is not its group's leader is there, but is not
 /// a process: `pidfd_prepare()` says `ENOENT` for it without `PIDFD_THREAD`
 /// (measured on Linux 6.18), where this said `ESRCH`, "no such process", to
-/// a caller that had just read the tid out of `/proc/<pid>/task`.
-fn pidfd_open_target(pid: KoID) -> LxResult<Arc<zircon_object::task::Process>> {
-    use linux_object::process::{find_task, process_of_thread};
+/// a caller that had just read the tid out of `/proc/<pid>/task`. With
+/// `PIDFD_THREAD` it is that thread's.
+#[allow(clippy::type_complexity)]
+fn pidfd_open_target(
+    pid: KoID,
+    thread: bool,
+) -> LxResult<(Arc<zircon_object::task::Process>, Option<Arc<Thread>>)> {
+    use linux_object::process::{find_task, find_thread};
     match find_task(pid) {
-        Some(process) => Ok(process),
-        None if process_of_thread(pid).is_some() => Err(LxError::ENOENT),
-        None => Err(LxError::ESRCH),
+        Some(process) => Ok((process, None)),
+        None => match find_thread(pid) {
+            Some((process, found)) if thread => Ok((process, Some(found))),
+            Some(_) => Err(LxError::ENOENT),
+            None => Err(LxError::ESRCH),
+        },
+    }
+}
+
+/// `pidfd_send_signal(2)`'s scope flags (Linux 6.9): the thread the pid
+/// names, its thread group, or the process group it leads.
+const PIDFD_SIGNAL_THREAD: u32 = 1 << 0;
+const PIDFD_SIGNAL_THREAD_GROUP: u32 = 1 << 1;
+const PIDFD_SIGNAL_PROCESS_GROUP: u32 = 1 << 2;
+
+/// Whom a `pidfd_send_signal` reaches: `PIDTYPE_PID`, `PIDTYPE_TGID` or
+/// `PIDTYPE_PGID`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    Thread,
+    Process,
+    ProcessGroup,
+}
+
+/// The scope `flags` asks for, or `None` for the pidfd's own: a thread's
+/// for a `PIDFD_THREAD` pidfd, a process's for any other. Decided before the
+/// descriptor is looked at, so two scopes or an unknown bit are `EINVAL`
+/// even on a descriptor nobody opened.
+fn pidfd_signal_scope(flags: u32) -> LxResult<Option<Scope>> {
+    match flags {
+        0 => Ok(None),
+        PIDFD_SIGNAL_THREAD => Ok(Some(Scope::Thread)),
+        PIDFD_SIGNAL_THREAD_GROUP => Ok(Some(Scope::Process)),
+        PIDFD_SIGNAL_PROCESS_GROUP => Ok(Some(Scope::ProcessGroup)),
+        _ => Err(LxError::EINVAL),
     }
 }
 
@@ -107,13 +143,17 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         let open_flags = pidfd_open_flags(flags)?;
-        let process = pidfd_open_target(pid as KoID)?;
-        let pidfd = PidFd::new(process, open_flags);
+        let pidfd = match pidfd_open_target(pid as KoID, open_flags.contains(OpenFlags::EXCLUSIVE))?
+        {
+            (process, None) => PidFd::new(process, open_flags),
+            (process, Some(thread)) => PidFd::of_thread(process, thread, open_flags),
+        };
         let fd = self.linux_process().add_file(pidfd)?;
         Ok(fd.into())
     }
 
-    /// Send `sig` to the process referred to by `pidfd`.
+    /// Send `sig` to the thread, the process or the process group `pidfd`
+    /// and `flags` name.
     ///
     /// `kill_pid_info()` is where this ends in Linux -- the same function
     /// `kill(2)` reaches -- so it asks the same two questions: may the caller
@@ -131,27 +171,40 @@ impl Syscall<'_> {
         info: UserInPtr<SigInfo>,
         flags: u32,
     ) -> SysResult {
-        if flags != 0 {
-            return Err(LxError::EINVAL);
-        }
-        let signal = Signal::from_syscall_arg(signum)?;
+        // Linux's order: the flag word, the descriptor, the `siginfo`, then
+        // whether anybody is there, and only then the signal number
+        // (`check_kill_permission`'s `valid_signal`), so signal 999 at
+        // `/dev/null` is `EBADF`, not `EINVAL`.
+        let scope = pidfd_signal_scope(flags)?;
         let pidfd = PidFd::from_file_like(self.linux_process().get_file_like(pidfd)?)?;
-        let target = pidfd.target().clone();
-        // Until it is reaped, a dead process is a zombie that takes nothing
-        // and answers 0, as through `kill(2)`; reaped, the pid is gone.
-        if target.try_linux().is_some_and(|linux| linux.is_reaped()) {
-            return Err(LxError::ESRCH);
-        }
+        let scope = scope.unwrap_or(if pidfd.is_thread() {
+            Scope::Thread
+        } else {
+            Scope::Process
+        });
         let user = if info.is_null() {
             None
         } else {
             Some(info.read()?)
         };
+        // "Only allow sending arbitrary signals to yourself":
+        // `task_pid(current) != pid || type > PIDTYPE_TGID`. Yourself is the
+        // calling THREAD, as for `rt_tgsigqueueinfo`, so a thread that is not
+        // the leader may not forge a code at its own process's pidfd; and a
+        // process group is never yourself.
         check_pidfd_siginfo(
             signum,
             user.as_ref().map(SigInfoHead::of),
-            target.id() == self.zircon_process().id(),
+            pidfd.task_id() == self.thread.id() && scope != Scope::ProcessGroup,
         )?;
+        // Until it is reaped, a dead process is a zombie that takes nothing
+        // and answers 0, as through `kill(2)`; reaped, or a thread that has
+        // exited, the pid is gone. Not for a process group, which outlives
+        // the pid that names it as long as it has members.
+        if scope != Scope::ProcessGroup && pidfd.gone() {
+            return Err(LxError::ESRCH);
+        }
+        let signal = Signal::from_syscall_arg(signum)?;
         // Including `pidfd_send_signal(fd, 0, ...)`, which is a permission
         // probe and not just a liveness one: answering from the status alone
         // told a caller that a process it may not touch is alive.
@@ -159,9 +212,16 @@ impl Syscall<'_> {
         // The caller's `siginfo_t`, when it gave one, is what gets delivered:
         // `pidfd_send_signal` is the pidfd form of `rt_sigqueueinfo`, and a
         // sender that filled in `si_value` expects the handler to read it.
+        let cx = self.kill_context(signal);
         let info = signal.and_then(|sig| user.map(|u| queued_from_user(sig, u)));
-        self.signal_one_process_with_info(&self.kill_context(signal), &target, info)
-            .map(|_| 0)
+        match scope {
+            Scope::Process => self.signal_one_process_with_info(&cx, pidfd.target(), info),
+            Scope::Thread => {
+                self.signal_one_thread_with_info(&cx, pidfd.target(), pidfd.thread(), info)
+            }
+            Scope::ProcessGroup => self.signal_group(&cx, pidfd.task_id(), info),
+        }
+        .map(|_| 0)
     }
 
     /// Duplicate `targetfd` from the process referred to by `pidfd`.
@@ -234,15 +294,16 @@ mod pidfd_open_flag_tests {
     }
 
     #[test]
-    fn pidfd_thread_is_refused_rather_than_ignored() {
-        // Accepting it would hand back a process pidfd to a caller that asked
-        // for a thread one, and it would look like it worked until the fd
-        // reported the wrong exit.
-        assert_eq!(pidfd_open_flags(PIDFD_THREAD), Err(LxError::EINVAL));
-        assert_eq!(
-            pidfd_open_flags(PIDFD_THREAD | OpenFlags::NON_BLOCK.bits() as u32),
-            Err(LxError::EINVAL)
-        );
+    fn pidfd_thread_stays_in_the_flags_as_o_excl() {
+        // Where `F_GETFL` shows it and `pidfd_send_signal` reads it: on
+        // Linux 6.18 a thread pidfd says 0o202, and 0o4202 with
+        // `PIDFD_NONBLOCK`. It used to be refused with `EINVAL`.
+        let flags = pidfd_open_flags(PIDFD_THREAD).unwrap();
+        assert!(flags.contains(OpenFlags::EXCLUSIVE | OpenFlags::CLOEXEC));
+        assert!(!flags.contains(OpenFlags::NON_BLOCK));
+        let flags = pidfd_open_flags(PIDFD_THREAD | OpenFlags::NON_BLOCK.bits() as u32).unwrap();
+        assert!(flags.contains(OpenFlags::EXCLUSIVE | OpenFlags::NON_BLOCK));
+        assert!(!pidfd_open_flags(0).unwrap().contains(OpenFlags::EXCLUSIVE));
     }
 
     #[test]
@@ -272,11 +333,15 @@ mod pidfd_open_target_tests {
             LinuxProcess::new(RamFS::new(), 0),
         )
         .unwrap();
-        assert!(Arc::ptr_eq(&pidfd_open_target(49_001).unwrap(), &proc));
+        for thread in [false, true] {
+            let (found, of) = pidfd_open_target(49_001, thread).unwrap();
+            assert!(Arc::ptr_eq(&found, &proc));
+            assert!(of.is_none(), "a pid is its process, PIDFD_THREAD or not");
+        }
     }
 
     #[test]
-    fn a_thread_that_is_not_the_leader_is_enoent() {
+    fn a_thread_that_is_not_the_leader_is_enoent_without_pidfd_thread() {
         let proc = zircon_object::task::Process::create_with_fixed_id_ext(
             &ROOT_JOB,
             49_002,
@@ -288,15 +353,76 @@ mod pidfd_open_target_tests {
         let worker = Thread::create_linux(&proc).unwrap();
         assert_eq!(leader.id(), 49_002);
         assert_ne!(worker.id(), 49_002);
-        assert_eq!(pidfd_open_target(worker.id()).err(), Some(LxError::ENOENT));
-        assert!(Arc::ptr_eq(&pidfd_open_target(leader.id()).unwrap(), &proc));
+        assert_eq!(
+            pidfd_open_target(worker.id(), false).err(),
+            Some(LxError::ENOENT)
+        );
+        let (found, of) = pidfd_open_target(worker.id(), true).unwrap();
+        assert!(Arc::ptr_eq(&found, &proc), "the thread's own process");
+        assert!(Arc::ptr_eq(&of.unwrap(), &worker), "and the thread itself");
+        assert!(Arc::ptr_eq(
+            &pidfd_open_target(leader.id(), false).unwrap().0,
+            &proc
+        ));
+        worker.terminate_abandoned();
+        assert_eq!(
+            pidfd_open_target(worker.id(), true).err(),
+            Some(LxError::ESRCH),
+            "an exited thread is nobody"
+        );
     }
 
     #[test]
     fn a_pid_nobody_has_is_esrch() {
-        assert_eq!(pidfd_open_target(49_099).err(), Some(LxError::ESRCH));
+        for thread in [false, true] {
+            assert_eq!(
+                pidfd_open_target(49_099, thread).err(),
+                Some(LxError::ESRCH)
+            );
+        }
     }
 }
+
+/// `pidfd_send_signal(2)`'s flag word (Linux 6.9): one scope or none.
+#[cfg(test)]
+mod pidfd_signal_scope_tests {
+    use super::*;
+
+    #[test]
+    fn the_three_scopes_are_linux_s_bits() {
+        // `include/uapi/linux/pidfd.h`.
+        assert_eq!(
+            [
+                PIDFD_SIGNAL_THREAD,
+                PIDFD_SIGNAL_THREAD_GROUP,
+                PIDFD_SIGNAL_PROCESS_GROUP
+            ],
+            [1, 2, 4]
+        );
+    }
+
+    #[test]
+    fn each_bit_alone_names_its_scope_and_none_is_the_pidfd_s_own() {
+        assert_eq!(pidfd_signal_scope(0), Ok(None));
+        assert_eq!(pidfd_signal_scope(1), Ok(Some(Scope::Thread)));
+        assert_eq!(pidfd_signal_scope(2), Ok(Some(Scope::Process)));
+        assert_eq!(pidfd_signal_scope(4), Ok(Some(Scope::ProcessGroup)));
+    }
+
+    #[test]
+    fn two_scopes_or_a_bit_nobody_has_is_einval() {
+        // `hweight32(flags & PIDFD_SEND_SIGNAL_FLAGS) > 1`, and
+        // `flags & ~PIDFD_SEND_SIGNAL_FLAGS`.
+        for bad in [3u32, 5, 6, 7, 8, 1 << 31] {
+            assert_eq!(pidfd_signal_scope(bad), Err(LxError::EINVAL), "{bad:#x}");
+        }
+    }
+}
+
+/// `PIDFD_THREAD` pidfds through the syscalls, and the scopes of
+/// `pidfd_send_signal`. Fixed pids in 49_2xx.
+#[cfg(test)]
+mod thread_tests;
 
 /// The three through the syscall: that `pidfd_getfd` asks whether the caller
 /// may attach at all, that the caller's `siginfo_t` reaches the check, and
@@ -438,9 +564,9 @@ mod pidfd_siginfo_tests {
 
 #[cfg(test)]
 mod benches {
-    //! The two decisions `pidfd_open` and `pidfd_send_signal` make before
-    //! they need a live process. Both are small, and both are here because
-    //! they were missing: `pidfd_open` accepted flags it then ignored, and
+    //! The decisions `pidfd_open` and `pidfd_send_signal` make before they
+    //! need a live process. All are small, and all are here because they
+    //! were missing: `pidfd_open` accepted flags it then ignored, and
     //! `pidfd_send_signal` took its `siginfo` and dropped it with
     //! `let _ = info`, which is the one shape of bug that looks exactly like
     //! correct code.
@@ -467,17 +593,31 @@ mod benches {
         b.iter(|| black_box(pidfd_open_flags(black_box(NONBLOCK))));
     }
 
-    /// `PIDFD_THREAD`, which is refused rather than ignored: a `PidFd` holds
-    /// a process, so accepting it would hand back an fd that waits on the
-    /// wrong thing and reports the wrong exit.
+    /// `PIDFD_THREAD`, which stays in the flags as `O_EXCL`.
     #[bench]
-    fn pidfd_open_flags_thread_refused(b: &mut Bencher) {
+    fn pidfd_open_flags_thread(b: &mut Bencher) {
         b.iter(|| black_box(pidfd_open_flags(black_box(PIDFD_THREAD))));
     }
 
     #[bench]
     fn pidfd_open_flags_unknown_bit(b: &mut Bencher) {
         b.iter(|| black_box(pidfd_open_flags(black_box(1 << 20))));
+    }
+
+    /// `pidfd_send_signal`'s flag word: none, the commonest call.
+    #[bench]
+    fn pidfd_signal_scope_of_zero(b: &mut Bencher) {
+        b.iter(|| black_box(pidfd_signal_scope(black_box(0))));
+    }
+
+    /// Two scopes at once, which is `EINVAL` before the descriptor is read.
+    #[bench]
+    fn pidfd_signal_scope_two_at_once(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(pidfd_signal_scope(black_box(
+                PIDFD_SIGNAL_THREAD | PIDFD_SIGNAL_PROCESS_GROUP,
+            )))
+        });
     }
 
     /// `pidfd_send_signal(fd, sig, NULL, 0)`: the common case, where the

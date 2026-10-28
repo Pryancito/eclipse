@@ -104,10 +104,19 @@ fn the_two_flag_words_are_read_before_the_descriptor() {
     on_a_thread(&proc, |sys| {
         Box::pin(async move {
             let nobodys = FileDesc::from(A_FD_OF_NOBODY);
+            // Two scopes at once, and a bit nobody has.
+            for flags in [3, 8] {
+                assert_eq!(
+                    sys.sys_pidfd_send_signal(nobodys, SIGTERM, UserInPtr::from(0), flags),
+                    Err(LxError::EINVAL),
+                    "pidfd_send_signal flags {flags:#x}"
+                );
+            }
+            // One scope is a flag word it has: the descriptor is next.
             assert_eq!(
                 sys.sys_pidfd_send_signal(nobodys, SIGTERM, UserInPtr::from(0), 1),
-                Err(LxError::EINVAL),
-                "pidfd_send_signal takes no flags"
+                Err(LxError::EBADF),
+                "PIDFD_SIGNAL_THREAD is a flag pidfd_send_signal knows"
             );
             assert_eq!(
                 sys.sys_pidfd_getfd(nobodys, 0, 1),

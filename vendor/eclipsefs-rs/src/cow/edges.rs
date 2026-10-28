@@ -1496,3 +1496,128 @@ fn a_raid5_chunk_allocates_by_its_parity_row() {
     fs.refresh_layouts();
     assert_eq!(fs.sp.alloc.groups()[g].row(), cols);
 }
+
+// ---------------------------------------------------------------------------
+// Files unlinked while open
+// ---------------------------------------------------------------------------
+
+/// An open check that says yes to one handle (0: none), and the handle.
+fn open_one(fs: &mut CowFs, h: u64) -> Arc<core::sync::atomic::AtomicU64> {
+    let open = Arc::new(core::sync::atomic::AtomicU64::new(h));
+    let seen = open.clone();
+    fs.set_open_check(Some(Arc::new(move |h| {
+        seen.load(core::sync::atomic::Ordering::Relaxed) == h
+    })));
+    open
+}
+
+/// A rename over an open file leaves that file to its last close, as on
+/// Linux (ollama reads `history` and renames a new one over it as it goes).
+/// Until then fsck takes it, and closed, it goes.
+#[test]
+fn a_file_renamed_over_while_open_stays_until_closed() {
+    let (_d, mut fs) = mounted();
+    let root = fs.root_ino();
+    let big: Vec<u8> = (0..3 * BS as usize + 7).map(|i| i as u8).collect();
+    let old = file(&mut fs, "history", &big);
+    let open = open_one(&mut fs, old);
+    let new = file(&mut fs, "history.tmp", b"one\n");
+    fs.rename(root, "history.tmp", root, "history").unwrap();
+    // Before: NotFound, both.
+    let mut back = vec![0u8; big.len()];
+    assert_eq!(fs.read(old, 0, &mut back).unwrap(), big.len());
+    assert_eq!(back, big);
+    assert_eq!(fs.read(old, big.len() as u64, &mut back).unwrap(), 0);
+    assert_eq!(fs.write(old, 0, b"still mine").unwrap(), 10);
+    assert_eq!(fs.stat(old).unwrap().nlink, 0);
+    assert_eq!(fs.lookup(root, "history").unwrap(), new);
+    fs.check().unwrap();
+    assert_eq!(fs.purge_orphans().unwrap(), 0, "still open");
+    open.store(0, core::sync::atomic::Ordering::Relaxed);
+    fs.sync().unwrap();
+    let used = fs.fsinfo().bytes_used;
+    assert_eq!(fs.purge_orphans().unwrap(), 1);
+    assert_eq!(fs.stat(old).err(), Some(Error::NotFound));
+    fs.sync().unwrap();
+    assert!(fs.fsinfo().bytes_used < used, "its blocks are free");
+    assert!(fs.orphan_items().unwrap().is_empty());
+    fs.check().unwrap();
+    // Unlink goes the same way.
+    let x = file(&mut fs, "x", b"x");
+    open.store(x, core::sync::atomic::Ordering::Relaxed);
+    fs.unlink(root, "x").unwrap();
+    assert_eq!(fs.read(x, 0, &mut back).unwrap(), 1);
+}
+
+/// With no open check, or the file closed, the last name going frees the
+/// inode at once, as it always did.
+#[test]
+fn a_closed_file_goes_with_its_last_name() {
+    let (_d, mut fs) = mounted();
+    let root = fs.root_ino();
+    let a = file(&mut fs, "a", b"a");
+    fs.unlink(root, "a").unwrap();
+    assert_eq!(fs.stat(a).err(), Some(Error::NotFound));
+    let _open = open_one(&mut fs, 0);
+    let b = file(&mut fs, "b", b"b");
+    fs.unlink(root, "b").unwrap();
+    assert_eq!(fs.stat(b).err(), Some(Error::NotFound));
+    assert!(fs.orphan_items().unwrap().is_empty());
+    assert_eq!(fs.purge_orphans().unwrap(), 0);
+}
+
+/// A crash with a file unlinked but open leaves it on disk with its orphan
+/// item; the next read-write mount frees it (fsck takes the image before
+/// and after), and a read-only one leaves it.
+#[test]
+fn a_crash_leaves_orphans_to_the_next_mount() {
+    let (d, mut fs) = mounted();
+    let root = fs.root_ino();
+    let x = file(&mut fs, "x", &vec![7u8; 2 * BS as usize]);
+    open_one(&mut fs, x);
+    fs.unlink(root, "x").unwrap();
+    fs.sync().unwrap();
+    // The crash: the file was never closed.
+    drop(fs);
+    let mut ro = CowFs::mount(d.clone(), true).unwrap();
+    assert_eq!(ro.stat(x).unwrap().nlink, 0);
+    ro.check().unwrap();
+    drop(ro);
+    let mut fs = remount(&d).unwrap();
+    assert_eq!(fs.stat(x).err(), Some(Error::NotFound));
+    assert!(fs.orphan_items().unwrap().is_empty());
+    fs.check().unwrap();
+    drop(fs);
+    remount(&d).unwrap().check().unwrap();
+}
+
+/// A snapshot does not take the files its source has open but no longer
+/// names: nothing has them open there.
+#[test]
+fn a_snapshot_leaves_out_the_orphans_of_its_source() {
+    let (_d, mut fs) = mounted();
+    let root = fs.root_ino();
+    let x = file(&mut fs, "x", b"x");
+    let open = open_one(&mut fs, x);
+    fs.unlink(root, "x").unwrap();
+    let snap = fs.snapshot(root, root, "snap", true).unwrap();
+    let (sv, _) = split(snap);
+    assert_eq!(fs.stat(handle(sv, split(x).1)).err(), Some(Error::NotFound));
+    assert_eq!(fs.stat(x).unwrap().nlink, 0, "the source keeps it");
+    fs.check().unwrap();
+    open.store(0, core::sync::atomic::Ordering::Relaxed);
+    assert_eq!(fs.purge_orphans().unwrap(), 1);
+    fs.check().unwrap();
+}
+
+/// What fsck says to an orphan item of no file.
+#[test]
+fn fsck_of_an_orphan_item_of_no_file() {
+    let (_d, mut fs) = mounted();
+    fs.insert(Key::new(ORPHAN_OBJECTID, ORPHAN_ITEM, 4000), Vec::new())
+        .unwrap();
+    assert_eq!(
+        fs.check().err(),
+        Some(Error::Corrupt("fsck: orphan item of no file"))
+    );
+}
