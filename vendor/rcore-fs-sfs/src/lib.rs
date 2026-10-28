@@ -518,7 +518,7 @@ impl vfs::INode for INodeImpl {
     fn metadata(&self) -> vfs::Result<vfs::Metadata> {
         let disk_inode = self.disk_inode.read();
         Ok(vfs::Metadata {
-            dev: 0,
+            dev: self.fs.dev,
             inode: self.id,
             size: match disk_inode.type_ {
                 FileType::File | FileType::SymLink => disk_inode.size as usize,
@@ -886,6 +886,10 @@ pub struct SimpleFileSystem {
     inodes: RwLock<BTreeMap<INodeId, Weak<INodeImpl>>>,
     /// device
     device: Arc<dyn Device>,
+    /// What every inode of it reports as `st_dev`: [`vfs::anon_dev`], since
+    /// the device under it is a memory buffer or a disk this tree gives no
+    /// number of its own.
+    dev: usize,
     /// Pointer to self, used by INodes
     self_ptr: Weak<SimpleFileSystem>,
     /// device inode
@@ -930,6 +934,7 @@ impl SimpleFileSystem {
             free_map: RwLock::new(Dirty::new(BitVec::from_vec(freemap_disk))),
             inodes: RwLock::new(BTreeMap::new()),
             device,
+            dev: vfs::anon_dev(),
             self_ptr: Weak::default(),
             device_inodes: RwLock::new(BTreeMap::new()),
             namespace: Mutex::new(()),
@@ -963,6 +968,7 @@ impl SimpleFileSystem {
             free_map: RwLock::new(Dirty::new_dirty(free_map)),
             inodes: RwLock::new(BTreeMap::new()),
             device,
+            dev: vfs::anon_dev(),
             self_ptr: Weak::default(),
             device_inodes: RwLock::new(BTreeMap::new()),
             namespace: Mutex::new(()),

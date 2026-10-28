@@ -486,12 +486,20 @@ impl Statx {
     }
 }
 
+/// A packed device number taken apart as glibc's `major()` and `minor()` do,
+/// so `statx` says what `stat` does: an anonymous device can have a minor
+/// past 255 ([`rcore_fs::vfs::anon_dev`]), which goes above the major.
+fn split_dev(dev: usize) -> (u32, u32) {
+    let dev = dev as u64;
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    (major as u32, minor as u32)
+}
+
 impl From<Metadata> for Statx {
     fn from(info: Metadata) -> Self {
-        let dev_major = ((info.dev >> 8) & 0xfff) as u32;
-        let dev_minor = (info.dev & 0xff) as u32;
-        let rdev_major = ((info.rdev >> 8) & 0xfff) as u32;
-        let rdev_minor = (info.rdev & 0xff) as u32;
+        let (dev_major, dev_minor) = split_dev(info.dev);
+        let (rdev_major, rdev_minor) = split_dev(info.rdev);
         let mut spare2 = [0; 14];
         // `__spare2[0]` (offset 0x90) is `stx_mnt_id` (`include/uapi/linux/stat.h`).
         // systemd 261+ (`libudev.so.1` on Ubuntu 26.10) calls `xstatx_full()` from
@@ -552,6 +560,8 @@ mod pipe_tests;
 #[cfg(test)]
 mod fd_link_tests;
 
+#[cfg(test)]
+mod dev_tests;
 #[cfg(test)]
 mod empty_path_tests;
 #[cfg(test)]
@@ -1110,10 +1120,8 @@ mod stat_conversion_tests {
     /// either mask changes nothing. Both masks are exercised here to their
     /// own width, so a mask that loses a nibble shows up.
     ///
-    /// The eight bits the packing gives the minor are this tree's own limit
-    /// (`Metadata::dev` is `(major << 8) | minor`), not `statx`'s: the uapi
-    /// has twenty bits of minor, and nothing here can carry a minor above
-    /// `0xff` to split in the first place.
+    /// A minor above `0xff` is packed above the major, as glibc's `makedev`
+    /// packs it, and an anonymous device can have one.
     #[test]
     fn a_wide_major_and_a_wide_minor_survive_the_split() {
         let m = Metadata {
@@ -1126,6 +1134,20 @@ mod stat_conversion_tests {
         assert_eq!(x.stx_dev_minor, 0x5a);
         assert_eq!(x.stx_rdev_major, 0xabc);
         assert_eq!(x.stx_rdev_minor, 0xde, "the minor lost its top nibble");
+        let wide = Metadata {
+            // Minor 0x12345: 0x45 at the bottom, 0x123 above the major.
+            dev: 0x1230_0045,
+            ..meta()
+        };
+        let x: Statx = wide.into();
+        assert_eq!((x.stx_dev_major, x.stx_dev_minor), (0, 0x12345));
+        let wide = Metadata {
+            // Major 0x1234: 0x234 above the low minor, 0x1000 shifted up 32.
+            dev: 0x1000_0002_3456,
+            ..meta()
+        };
+        let x: Statx = wide.into();
+        assert_eq!((x.stx_dev_major, x.stx_dev_minor), (0x1234, 0x56));
     }
 
     /// `stx_btime` carries a copy of `ctime`, and that is a decision, not an

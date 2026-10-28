@@ -42,7 +42,7 @@ impl INode for NullINode {
 
     fn metadata(&self) -> Result<Metadata> {
         Ok(Metadata {
-            dev: 1,
+            dev: DEVFS_DEV,
             inode: self.inode_id,
             size: 0,
             blk_size: 0,
