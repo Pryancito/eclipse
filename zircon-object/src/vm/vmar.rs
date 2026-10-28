@@ -1,4 +1,7 @@
 use super::page_flags::PageFlags;
+#[path = "vmar_vm_size.rs"]
+mod vmar_vm_size;
+use vmar_vm_size::VmSizeMeter;
 use {
     super::*,
     crate::object::*,
@@ -303,59 +306,49 @@ struct VmarInner {
     recent_unmaps: [(VirtAddr, usize, &'static str); UNMAP_HISTORY],
     /// Next slot to write in `recent_unmaps` (wraps).
     unmap_head: usize,
-    /// Total bytes of this region's own mappings — the sum of every
-    /// `VmMapping::size()` in `mappings`, kept in step with it by
-    /// [`insert_mapping`](VmarInner::insert_mapping) /
-    /// [`remove_mapping`](VmarInner::remove_mapping) /
-    /// [`take_mappings`](VmarInner::take_mappings) so it never walks the map.
-    own_mapped: usize,
-    /// High-water mark of `own_mapped`: the largest it has ever been. It only
-    /// rises, on a mapping inserted, never on one removed — Linux's `VmPeak:`
-    /// (`hiwater_vm`), which a `munmap` leaves at the peak. A Linux process's
-    /// address space is flat (nothing under it creates sub-regions), so the
-    /// root region's `own_mapped` is the whole `VmSize` and this is its peak.
-    peak_mapped: usize,
+    /// This address space's mapped-size meter — live `VmSize` and high-water
+    /// `VmPeak:`. Shared by `Arc` across the whole VMAR tree (a root gets a
+    /// fresh one from `Default`; `allocate` hands each child the parent's), so
+    /// it spans the executable and vDSO the loader puts in child VMARs. Kept in
+    /// step with `mappings` by `insert_mapping` / `remove_mapping` /
+    /// `take_mappings` so it never walks the tree.
+    vm_size: Arc<VmSizeMeter>,
 }
 
 impl VmarInner {
-    /// Record that the mapped total grew by `delta` bytes, raising
-    /// [`peak_mapped`](Self::peak_mapped) if it is now the largest it has been.
-    /// Both the insert path and mremap's grow-in-place (which stretches a
-    /// mapping already in the map) go through here.
+    /// Record that the address space grew by `delta` bytes. The insert path and
+    /// mremap's grow-in-place (which stretches a mapping already in the map)
+    /// both go through here.
     fn note_grown(&mut self, delta: usize) {
-        self.own_mapped += delta;
-        if self.own_mapped > self.peak_mapped {
-            self.peak_mapped = self.own_mapped;
-        }
+        self.vm_size.grew(delta);
     }
 
-    /// Insert a mapping and add its size to [`own_mapped`](Self::own_mapped),
-    /// raising [`peak_mapped`](Self::peak_mapped) if the total grew past it.
-    /// Every site that adds a mapping goes through here so the running total
-    /// cannot drift from the map.
+    /// Insert a mapping, adding its size to the `vm_size` meter. Every site
+    /// that adds a mapping goes through here so the total cannot drift.
     fn insert_mapping(&mut self, mapping: Arc<VmMapping>) {
         self.note_grown(mapping.size());
         self.mappings.insert(mapping.addr(), mapping);
     }
 
-    /// Remove the mapping at `key`, subtracting its size from `own_mapped`.
-    /// `peak_mapped` is deliberately left where it is.
+    /// Remove the mapping at `key`, subtracting its size from the live total.
+    /// The peak is deliberately left where it is.
     fn remove_mapping(&mut self, key: VirtAddr) -> Option<Arc<VmMapping>> {
         let mapping = self.mappings.remove(&key)?;
-        self.own_mapped -= mapping.size();
+        self.vm_size.shrank(mapping.size());
         Some(mapping)
     }
 
-    /// Take every mapping out, zeroing both `own_mapped` and `peak_mapped`.
-    /// This is the wholesale-empty path — region teardown, and `execve`'s
-    /// `vmar.clear()` on the reused address space — never a user `munmap`
-    /// (which goes through [`remove_mapping`](Self::remove_mapping) and keeps
-    /// the peak). `execve` gives Linux a fresh `mm`, so `VmPeak:` must start
-    /// over from the new image rather than carry the old one's high-water.
+    /// Take every mapping out, subtracting their total from the live `VmSize`.
+    /// Region teardown and `execve`'s `vmar.clear()` use this, never a user
+    /// `munmap` (which goes through [`remove_mapping`](Self::remove_mapping)).
+    /// It never touches the peak: a child torn down leaves the process's
+    /// high-water standing, and `execve` resets the peak in
+    /// [`clear`](VmAddressRegion::clear) once the whole tree is emptied.
     fn take_mappings(&mut self) -> BTreeMap<VirtAddr, Arc<VmMapping>> {
-        self.own_mapped = 0;
-        self.peak_mapped = 0;
-        core::mem::take(&mut self.mappings)
+        let taken = core::mem::take(&mut self.mappings);
+        let freed: usize = taken.values().map(|m| m.size()).sum();
+        self.vm_size.shrank(freed);
+        taken
     }
 }
 
@@ -561,6 +554,12 @@ impl VmAddressRegion {
         // No floor: the ELF loader's app sub-VMAR must land at offset 0 for
         // non-PIE binaries (see determine_offset).
         let offset = self.determine_offset(inner, offset, len, align, 0)?;
+        // Share the parent's meter so this child's mappings count toward the one
+        // `VmSize`/`VmPeak:` of the whole tree (the loader maps the vDSO here).
+        let child_inner = VmarInner {
+            vm_size: inner.vm_size.clone(),
+            ..Default::default()
+        };
         let child = Arc::new(VmAddressRegion {
             flags,
             base: KObjectBase::new(),
@@ -570,7 +569,7 @@ impl VmAddressRegion {
             parent: Some(self.clone()),
             page_table: self.page_table.clone(),
             max_height: self.max_height - 1,
-            inner: Mutex::new(Some(VmarInner::default())),
+            inner: Mutex::new(Some(child_inner)),
         });
         inner.children.push(child.clone());
         Ok(child)
@@ -826,11 +825,11 @@ impl VmAddressRegion {
                 Ok(None) => {}
                 Err(err) => {
                     // Rollback of the `remove_mapping` above: the same map goes
-                    // back under its original key (`cut` only fails on the
-                    // split allocation, leaving `map` untouched). Net change is
-                    // zero, so `peak_mapped` must not move — restore the size
-                    // directly rather than through `insert_mapping`.
-                    inner.own_mapped += map.size();
+                    // back under its original key (`cut` only fails on the split
+                    // allocation, leaving `map` untouched). The size restored is
+                    // one just subtracted, so the live total returns to a value
+                    // it already held (at or below the peak) and the peak stays.
+                    inner.note_grown(map.size());
                     inner.mappings.insert(key, map);
                     return Err(err);
                 }
@@ -1265,6 +1264,11 @@ impl VmAddressRegion {
     /// that panics on glxgears window-close (`DIAG: shootdown starvation`).
     /// Drain the tree under the lock, then unmap with a single gathered
     /// shootdown after the lock is gone.
+    ///
+    /// This is `execve`'s path on the reused address space (the root is kept
+    /// alive — [`destroy`](Self::destroy) is the permanent teardown), so once
+    /// the subtree is empty the `VmPeak:` high-water resets to the live total:
+    /// Linux's new image gets a fresh `mm` whose peak starts over.
     pub fn clear(&self) -> ZxResult {
         let (children, mappings) = {
             let mut guard = self.inner.lock();
@@ -1274,6 +1278,10 @@ impl VmAddressRegion {
             (children, mappings)
         };
         self.destroy_taken_subtree(children, mappings);
+        // Tree emptied; reset the peak to the live total for the next image.
+        if let Some(inner) = self.inner.lock().as_ref() {
+            inner.vm_size.reset_peak_to_live();
+        }
         Ok(())
     }
 
@@ -2183,18 +2191,16 @@ impl VmAddressRegion {
         task_stats
     }
 
-    /// High-water mark of this region's mapped bytes — Linux's `VmPeak:`
-    /// (`hiwater_vm`), the largest `VmSize` the address space has ever had.
-    ///
-    /// Maintained incrementally as mappings are added, so it never walks the
-    /// address space. For a Linux process the root region holds every mapping
-    /// (the address space is flat), so this is the whole process's peak. A
-    /// destroyed region reports 0.
+    /// High-water mark of the address space's mapped bytes — Linux's `VmPeak:`
+    /// (`hiwater_vm`), the largest `VmSize` it has ever had. Maintained
+    /// incrementally, never a walk; the meter is shared across the VMAR tree,
+    /// so a read on the root spans the executable and vDSO the loader places in
+    /// child regions. A destroyed region reports 0.
     pub fn peak_mapped_bytes(&self) -> u64 {
         self.inner
             .lock()
             .as_ref()
-            .map_or(0, |inner| inner.peak_mapped as u64)
+            .map_or(0, |inner| inner.vm_size.peak() as u64)
     }
 
     /// Read from address space.
