@@ -301,7 +301,7 @@ fn a_mount_that_is_only_a_line_goes_as_a_line() {
 }
 
 #[test]
-fn what_is_not_a_mount_cannot_be_unmounted_moved_or_bound() {
+fn what_is_not_a_mount_cannot_be_unmounted_or_moved() {
     let w = world();
     w.mount("srcA", "/a", RamFS::new());
     let inside = resolve_from(&w.root, "/a")
@@ -316,10 +316,6 @@ fn what_is_not_a_mount_cannot_be_unmounted_moved_or_bound() {
         );
         assert_eq!(
             move_from(&w.root, &w.table, path, "/c"),
-            Err(LxError::EINVAL)
-        );
-        assert_eq!(
-            bind_from(&w.root, &w.table, path, "/c", MS_BIND, ""),
             Err(LxError::EINVAL)
         );
     }
@@ -355,4 +351,165 @@ fn what_is_not_a_mount_cannot_be_unmounted_moved_or_bound() {
     assert!(w.shows("/a", "in"));
     assert_eq!(w.at("/a"), ["srcA"]);
     assert!(w.at("/c").is_empty());
+}
+
+/// The line at `at`, the top one.
+fn line_at(w: &World, at: &str) -> MountEntry {
+    let table = w.table.lock();
+    table.iter().rev().find(|m| m.target == at).unwrap().clone()
+}
+
+/// `/a` mounted with a file `out` and a directory `d` holding `x` and the
+/// directory `e`.
+fn with_d() -> World {
+    let w = world();
+    w.mount("srcA", "/a", fs_with("out"));
+    let d = resolve_from(&w.root, "/a")
+        .unwrap()
+        .create("d", FileType::Dir, 0o755)
+        .unwrap();
+    d.create("x", FileType::File, 0o644).unwrap();
+    d.create("e", FileType::Dir, 0o755).unwrap();
+    w
+}
+
+#[test]
+fn a_bind_of_a_plain_directory_shows_it_and_nothing_else_of_its_mount() {
+    let w = with_d();
+    bind_from(&w.root, &w.table, "/a/d", "/b", MS_BIND, "").unwrap();
+    assert!(w.shows("/b", "x") && w.shows("/b", "e"));
+    assert!(!w.shows("/b", "out"), "it shows the whole mount");
+    let line = line_at(&w, "/b");
+    assert_eq!(
+        (
+            line.source.as_str(),
+            line.fstype.as_str(),
+            line.root.as_str()
+        ),
+        ("srcA", "tmpfs", "/d")
+    );
+    // One directory, two paths: what is made through one is in the other.
+    resolve_from(&w.root, "/b")
+        .unwrap()
+        .create("viab", FileType::File, 0o644)
+        .unwrap();
+    assert!(w.shows("/a/d", "viab"));
+    resolve_from(&w.root, "/a/d/e")
+        .unwrap()
+        .create("made", FileType::File, 0o644)
+        .unwrap();
+    assert!(w.shows("/b/e", "made"));
+}
+
+#[test]
+fn dot_dot_from_a_bind_of_a_directory_is_where_it_is_mounted() {
+    let w = with_d();
+    bind_from(&w.root, &w.table, "/a/d", "/b", MS_BIND, "").unwrap();
+    for up in ["/b/..", "/b/e/../.."].iter() {
+        let at = resolve_from(&w.root, up).unwrap();
+        assert!(at.is_same_node(&w.root), "{} is not /", up);
+    }
+    let b = resolve_from(&w.root, "/b").unwrap();
+    assert_eq!(w.root.find_name_by_child(&b).unwrap(), "b");
+    let e = resolve_from(&w.root, "/b/e").unwrap();
+    assert_eq!(b.find_name_by_child(&e).unwrap(), "e");
+}
+
+#[test]
+fn a_bind_of_a_directory_inside_a_bind_has_the_two_roots_joined() {
+    let w = with_d();
+    bind_from(&w.root, &w.table, "/a/d", "/b", MS_BIND, "").unwrap();
+    bind_from(&w.root, &w.table, "/b/e", "/c", MS_BIND, "").unwrap();
+    let line = line_at(&w, "/c");
+    assert_eq!((line.source.as_str(), line.root.as_str()), ("srcA", "/d/e"));
+    resolve_from(&w.root, "/c")
+        .unwrap()
+        .create("deep", FileType::File, 0o644)
+        .unwrap();
+    assert!(w.shows("/a/d/e", "deep"));
+}
+
+#[test]
+fn a_plain_bind_does_not_carry_the_mounts_inside_the_directory() {
+    let w = with_d();
+    w.mount("inner", "/a/d/e", fs_with("z"));
+    bind_from(&w.root, &w.table, "/a/d", "/b", MS_BIND, "").unwrap();
+    assert!(w.shows("/b", "e"));
+    assert!(!w.shows("/b/e", "z"), "the mount at /a/d/e came along");
+    assert!(w.shows("/a/d/e", "z"));
+}
+
+#[test]
+fn umount_of_a_bind_of_a_directory_leaves_the_directory() {
+    let w = with_d();
+    bind_from(&w.root, &w.table, "/a/d", "/b", MS_BIND, "").unwrap();
+    umount_from(&w.root, &w.table, "/b", 0).unwrap();
+    assert!(!w.shows("/b", "x"));
+    assert!(w.at("/b").is_empty());
+    assert!(w.shows("/a/d", "x") && w.shows("/a", "out"));
+}
+
+#[test]
+fn a_moved_bind_of_a_directory_keeps_its_root() {
+    let w = with_d();
+    bind_from(&w.root, &w.table, "/a/d", "/b", MS_BIND, "").unwrap();
+    move_from(&w.root, &w.table, "/b", "/c").unwrap();
+    assert!(w.shows("/c", "x") && !w.shows("/b", "x"));
+    assert_eq!(line_at(&w, "/c").root, "/d");
+}
+
+#[test]
+fn the_root_itself_can_be_bound_and_shows_nothing_mounted_in_it() {
+    let w = with_d();
+    bind_from(&w.root, &w.table, "/", "/p", MS_BIND, "").unwrap();
+    assert!(w.shows("/p", "a") && w.shows("/p", "b"));
+    assert!(!w.shows("/p/a", "out"), "the mount at /a came along");
+    let line = line_at(&w, "/p");
+    assert_eq!((line.source.as_str(), line.root.as_str()), ("rootfs", "/"));
+    assert!(resolve_from(&w.root, "/p/p/..")
+        .unwrap()
+        .is_same_node(&resolve_from(&w.root, "/p").unwrap()));
+}
+
+#[test]
+fn a_directory_bound_onto_itself_becomes_a_mount_point_and_shows_the_same() {
+    // `mount --bind dir dir`, the usual way to make a directory a mount point.
+    let w = with_d();
+    bind_from(&w.root, &w.table, "/a/d", "/a/d", MS_BIND, "").unwrap();
+    assert!(w.shows("/a/d", "x"));
+    assert!(mount_holder_from(&w.root, "/a/d").unwrap().is_some());
+    assert_eq!(line_at(&w, "/a/d").root, "/d");
+    assert!(resolve_from(&w.root, "/a/d/..")
+        .unwrap()
+        .find(false, "out")
+        .is_ok());
+    umount_from(&w.root, &w.table, "/a/d", 0).unwrap();
+    assert!(w.shows("/a/d", "x"));
+    assert!(mount_holder_from(&w.root, "/a/d").unwrap().is_none());
+}
+
+#[test]
+fn a_bind_needs_a_directory_on_both_sides() {
+    let w = with_d();
+    let f = resolve_from(&w.root, "/p")
+        .unwrap()
+        .create("f", FileType::File, 0o644)
+        .unwrap();
+    drop(f);
+    assert_eq!(
+        bind_from(&w.root, &w.table, "/a/d/x", "/b", MS_BIND, ""),
+        Err(LxError::ENOTDIR),
+        "a file bound onto a directory"
+    );
+    assert_eq!(
+        bind_from(&w.root, &w.table, "/a/d", "/p/f", MS_BIND, ""),
+        Err(LxError::ENOTDIR),
+        "a directory bound onto a file"
+    );
+    assert_eq!(
+        bind_from(&w.root, &w.table, "/a/d/nowhere", "/b", MS_BIND, ""),
+        Err(LxError::ENOENT)
+    );
+    assert!(!w.shows("/b", "x"));
+    assert!(w.at("/b").is_empty() && w.at("/p/f").is_empty());
 }

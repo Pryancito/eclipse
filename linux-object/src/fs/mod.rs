@@ -201,6 +201,9 @@ struct MountEntry {
     parent: usize,
     source: String,
     target: String,
+    /// The directory of its filesystem it shows, `/` for the whole of it: a
+    /// bind of a directory inside a mount shows only that directory.
+    root: String,
     fstype: String,
     options: String,
     state: Arc<mount_state::MountState>,
@@ -719,6 +722,7 @@ fn new_mount_entry(
         parent: mountinfo::ROOT_PARENT,
         source: source.to_string(),
         target: target.to_string(),
+        root: String::from("/"),
         fstype: fstype.to_string(),
         options: options.to_string(),
         state: state.unwrap_or_else(|| Arc::new(mount_state::MountState::from_options(0, options))),
@@ -726,15 +730,27 @@ fn new_mount_entry(
     }
 }
 
-/// The source and type of the mount on top at `target`, which a bind of it
-/// shows as its own.
-fn origin_in(mounts: &[MountEntry], target: &str) -> Option<(String, String)> {
-    let target = normalize_mount_target(target);
-    mounts
+/// The source, type and root a bind of `path` shows: the source and type of
+/// the mount `path` is on, the top one at the longest mount point holding it
+/// as [`mountinfo::parent_of`] finds it, and that mount's root with the rest
+/// of `path` after it: with `/tmp/d` bound at `/b`, a bind of `/b/x` shows
+/// `/d/x` of the filesystem at `/tmp`.
+fn origin_in(mounts: &[MountEntry], path: &str) -> Option<(String, String, String)> {
+    let path = normalize_mount_target(path);
+    let on = mounts
         .iter()
-        .rev()
-        .find(|m| m.target == target)
-        .map(|m| (m.source.clone(), m.fstype.clone()))
+        .filter(|m| path_is_under(&path, &m.target))
+        .max_by_key(|m| m.target.len())?;
+    let inside = match on.target.as_str() {
+        "/" => path.as_str(),
+        target => &path[target.len()..],
+    };
+    let root = match inside {
+        "" | "/" => on.root.clone(),
+        _ if on.root == "/" => String::from(inside),
+        _ => alloc::format!("{}{}", on.root, inside),
+    };
+    Some((on.source.clone(), on.fstype.clone(), root))
 }
 
 /// Whether a mount is recorded at `target`, and if so whether the top one

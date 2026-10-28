@@ -8,8 +8,8 @@
 //! ```
 //!
 //! Its number; the number of the mount it is on; the `st_dev` of its root;
-//! the directory of its filesystem it shows, always `/` because a bind here
-//! takes a whole mount; where it is; the options of the mount itself; the
+//! the directory of its filesystem it shows, `/` unless it is a bind of a
+//! directory inside a mount; where it is; the options of the mount itself; the
 //! propagation fields, none because nothing here propagates, and the `-`
 //! that ends them; the type; the source; and the options of the filesystem.
 //!
@@ -139,11 +139,12 @@ fn render(mounts: &[MountEntry], dev_of: impl Fn(&str) -> u64) -> String {
         let (mount, filesystem) = split_options(&m.options);
         let _ = writeln!(
             out,
-            "{} {} {}:{} / {} {} - {} {} {}",
+            "{} {} {}:{} {} {} {} - {} {} {}",
             m.id,
             m.parent,
             major,
             minor,
+            escape(&m.root),
             escape(&m.target),
             escape(&mount),
             m.fstype,
