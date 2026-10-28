@@ -925,6 +925,19 @@ pub fn path_is_nodev(path: &str) -> bool {
     mount_flag_at(path, |s| s.is_nodev())
 }
 
+/// `statfs(2)`'s `f_flags` for the mount `path` is on: `calculate_f_flags()`,
+/// `ST_VALID` and that mount's flags.
+///
+/// Asked of the table, by the rule [`path_is_nosuid`] and its neighbours use,
+/// so that what `statfs` says of a mount is what the kernel enforces on it.
+/// The filesystem cannot answer: one filesystem can be mounted, or bound, in
+/// two places with different flags.
+pub fn statfs_flags_at(path: &str) -> usize {
+    let mounts = MOUNT_TABLE.lock();
+    let on = mount_at(path, mounts.iter().map(|m| (m.target.as_str(), &m.state)));
+    mount_state::ST_VALID | on.map_or(0, |state| state.statfs_flags())
+}
+
 /// Ask one mount flag of the mount `path` is on.
 ///
 /// One implementation for the three questions, because the part that can be
@@ -942,17 +955,22 @@ fn mount_flag_at(path: &str, flag: impl Fn(&mount_state::MountState) -> bool) ->
 /// points it is given rather than over the one live table -- so the part that
 /// can be wrong (which mount a path is on) can be tested without a test having
 /// to mount anything.
+fn mount_flag_from<'a>(path: &str, mounts: impl Iterator<Item = (&'a str, bool)>) -> bool {
+    mount_at(path, mounts).unwrap_or(false)
+}
+
+/// What goes with the mount `path` is on, of the mount points it is given.
 ///
 /// Longest match wins, which is what makes a mount inside another mount mean
 /// anything at all; and when two entries name the same mount point, the last
 /// registered one does, because that is the one whose filesystem a lookup
 /// reaches.
-fn mount_flag_from<'a>(path: &str, mounts: impl Iterator<Item = (&'a str, bool)>) -> bool {
+fn mount_at<'a, T>(path: &str, mounts: impl Iterator<Item = (&'a str, T)>) -> Option<T> {
     let path = normalize_mount_target(path);
     mounts
         .filter(|(target, _)| path_is_under(&path, target))
         .max_by_key(|(target, _)| target.len())
-        .is_some_and(|(_, set)| set)
+        .map(|(_, it)| it)
 }
 
 /// Whether `path` is `mount` itself or something inside it.

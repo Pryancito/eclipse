@@ -2740,9 +2740,12 @@ impl Syscall<'_> {
         let path = path.as_c_str()?;
         info!("statfs: path={:?}, buf={:?}", path, buf);
 
-        let inode = self.linux_process().lookup_inode(path)?;
-        let info = inode.fs().info();
-        buf.write(info.into())?;
+        // `user_path_at(AT_FDCWD, pathname, LOOKUP_FOLLOW)`, and where the walk
+        // ended, which is what decides the mount.
+        let (inode, walked) =
+            self.linux_process()
+                .lookup_inode_walked(FileDesc::CWD, path, true)?;
+        buf.write(statfs_at(&inode, &walked.path()))?;
         Ok(0)
     }
 
@@ -2755,9 +2758,19 @@ impl Syscall<'_> {
     pub fn sys_fstatfs(&self, fd: FileDesc, mut buf: UserOutPtr<StatFs>) -> SysResult {
         info!("statfs: fd={:?}, buf={:?}", fd, buf);
 
-        let info = self.linux_process().get_file(fd)?.inode().fs().info();
-        buf.write(info.into())?;
+        let file = self.linux_process().get_file(fd)?;
+        buf.write(statfs_at(&file.inode(), file.path()))?;
         Ok(0)
+    }
+}
+
+/// What `statfs(2)` and `fstatfs(2)` say of `inode`, a file at `path`: its
+/// filesystem's numbers, and the flags of the mount `path` is on, which the
+/// filesystem cannot know (`calculate_f_flags()`).
+fn statfs_at(inode: &Arc<dyn INode>, path: &str) -> StatFs {
+    StatFs {
+        f_flags: linux_object::fs::statfs_flags_at(path) as isize,
+        ..inode.fs().info().into()
     }
 }
 
@@ -2805,7 +2818,8 @@ impl From<FsInfo> for StatFs {
             f_fsid: (0, 0),
             f_namelen: info.namemax as _,
             f_frsize: info.frsize as _,
-            // TODO 需要先实现挂载
+            // The mount's flags, which the filesystem does not know: see
+            // `statfs_at`.
             f_flags: 0,
             f_spare: [0; 4],
         }
@@ -2831,6 +2845,9 @@ fn setfl_pipe_direct(file_like: &Arc<dyn FileLike>, next: OpenFlags) -> LxResult
 
 #[cfg(test)]
 mod setfl_pipe_direct_tests;
+
+#[cfg(test)]
+mod statfs_flags_tests;
 
 #[cfg(test)]
 mod statfs_type_tests;
