@@ -60,6 +60,23 @@ const BUG_REPORT_URL: &str = "https://github.com/Pryancito/eclipse/issues";
 /// boot console and the wallpaper already are.
 const ANSI_COLOR: &str = "0;35";
 
+/// `LOGO`: the name of an ICON, not of the distribution.
+///
+/// This is the one field whose value is not ours to choose. The spec says it
+/// names an icon "following the Icon Theme Specification", conventionally
+/// `distributor-logo-<LOGO>`, and readers resolve it through the installed
+/// icon theme: `fastfetch`, GTK's about dialogs and the desktop's own
+/// about pages all look up that name. `eclipse` --- what this carried at
+/// first --- is not an icon any theme ships, so every one of those readers
+/// got a miss and fell back to a blank or a generic placeholder. `linux` is,
+/// in hicolor and in every theme downstream of it, and it is what a
+/// distribution with no icon of its own in the themes is expected to say.
+///
+/// So this is not `ID`, and it must not be "fixed" to follow it: the day
+/// Eclipse ships a `distributor-logo-eclipse` icon in the image's icon theme
+/// is the day this changes, and not before.
+const LOGO: &str = "linux";
+
 /// The value of `ARCHITECTURE`, in the spelling the spec prescribes (systemd's
 /// own architecture ids), not in ours.
 ///
@@ -216,7 +233,7 @@ fn render(
     if let Some(a) = architecture(arch) {
         out.push_str(&line("ARCHITECTURE", a));
     }
-    out.push_str(&line("LOGO", ID));
+    out.push_str(&line("LOGO", LOGO));
     out.push_str(&line("ANSI_COLOR", ANSI_COLOR));
     out.push_str(&line("HOME_URL", HOME_URL));
     out.push_str(&line("DOCUMENTATION_URL", HOME_URL));
@@ -448,6 +465,24 @@ mod tests {
         let src =
             "//! docs\nconst OTHER: usize = 1;\npub const ECLIPSE_VERSION: &str = \"7.7.7\";\n";
         assert_eq!(parse_version(src).as_deref(), Some("7.7.7"));
+    }
+
+    /// `LOGO` names an icon, so it has to name one that EXISTS. `eclipse` is
+    /// not an icon any theme ships, and a reader that looks up
+    /// `distributor-logo-eclipse` gets a miss and a blank where the logo goes;
+    /// `linux` resolves in hicolor and in everything downstream of it.
+    ///
+    /// Pinned against `ID` on purpose: the two look like they should agree,
+    /// and making them agree is exactly the change that breaks this field.
+    #[test]
+    fn the_logo_names_an_icon_that_exists_and_is_not_the_id() {
+        let body = sample();
+        assert_eq!(get(&body, "LOGO").unwrap(), "linux");
+        assert_ne!(
+            get(&body, "LOGO").unwrap(),
+            get(&body, "ID").unwrap(),
+            "LOGO has been made to follow ID again; it names an icon, not us"
+        );
     }
 
     /// The spec's spelling of the architecture, not the kernel's.
