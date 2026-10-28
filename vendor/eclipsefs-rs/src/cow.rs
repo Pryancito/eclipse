@@ -214,7 +214,18 @@ pub struct CowFs {
     commit_interval: Option<u64>,
     /// Clock time of the last commit (seconds).
     last_commit: u64,
+    /// Whether whoever mounted has handle `h` open (see [`OpenCheck`]).
+    open_check: Option<OpenCheck>,
+    /// Handles of the orphans (see [`ORPHAN_ITEM`]) made since mount, for
+    /// [`purge_orphans`](Self::purge_orphans) to free once closed.
+    orphans: BTreeSet<u64>,
 }
+
+/// Asks whoever mounted whether a handle is open (a file of a process, or
+/// anything else that will still read or write it). A file whose last name
+/// goes while it is is kept to its last close, as Linux keeps an unlinked
+/// inode; without one, nothing is ever open and the inode goes at once.
+pub type OpenCheck = Arc<dyn Fn(u64) -> bool + Send + Sync>;
 
 /// File blocks among `from..to` that `exts` map.
 /// The counts of `refs` with neighbouring entries of the same count
@@ -593,6 +604,8 @@ impl CowFs {
             log: Default::default(),
             commit_interval: None,
             last_commit: 0,
+            open_check: None,
+            orphans: BTreeSet::new(),
             sb,
         };
         fs.refresh_layouts();
@@ -618,6 +631,7 @@ impl CowFs {
         if !read_only {
             fs.resync_stale()?;
             fs.drop_unfinished_receives()?;
+            fs.drop_orphans()?;
         }
         Ok(fs)
     }
@@ -2282,9 +2296,108 @@ impl CowFs {
                 }
             }
             self.put_inode(ino, i)
+        } else if self.is_open(self.out(ino)) {
+            // The open file goes on reading and writing it (ollama renames
+            // a new `history` over the one it is still reading).
+            i.nlink = 0;
+            i.ctime = self.now();
+            self.put_inode(ino, i)?;
+            self.upsert(Key::new(ORPHAN_OBJECTID, ORPHAN_ITEM, ino), Vec::new())?;
+            self.orphans.insert(self.out(ino));
+            Ok(())
         } else {
             self.purge(ino)
         }
+    }
+
+    fn is_open(&self, h: u64) -> bool {
+        self.open_check.as_ref().is_some_and(|f| f(h))
+    }
+
+    pub fn set_open_check(&mut self, f: Option<OpenCheck>) {
+        self.open_check = f;
+    }
+
+    /// Free the orphans made since mount that are no longer open; returns
+    /// how many. Whoever mounted calls it after files close (the kernel,
+    /// from its commit timer).
+    pub fn purge_orphans(&mut self) -> Result<usize> {
+        if self.read_only {
+            return Ok(0);
+        }
+        let closed: Vec<u64> = self
+            .orphans
+            .iter()
+            .copied()
+            .filter(|&h| !self.is_open(h))
+            .collect();
+        let back = self.subvol;
+        let mut r = Ok(closed.len());
+        for &h in &closed {
+            self.orphans.remove(&h);
+            // One that fails stays on disk, for the next mount to free.
+            if let Err(e) = self.at(h).and_then(|ino| self.free_orphan(ino)) {
+                r = Err(e);
+                break;
+            }
+        }
+        self.enter(back)?;
+        r
+    }
+
+    /// The orphans of the current subvolume.
+    fn orphan_items(&mut self) -> Result<Vec<u64>> {
+        let lo = Key::new(ORPHAN_OBJECTID, ORPHAN_ITEM, 0);
+        let hi = Key::new(ORPHAN_OBJECTID, ORPHAN_ITEM, u64::MAX);
+        let items = self.st.range(&self.fs_root, &lo, &hi, usize::MAX)?;
+        Ok(items.into_iter().map(|(k, _)| k.offset).collect())
+    }
+
+    /// Orphan `ino` of the current subvolume is closed: free it, unless it
+    /// has a name again, and drop its item.
+    fn free_orphan(&mut self, ino: u64) -> Result<()> {
+        match self.inode(ino) {
+            Ok(i) if i.nlink == 0 => self.purge(ino)?,
+            Ok(_) | Err(Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        match self.delete(Key::new(ORPHAN_OBJECTID, ORPHAN_ITEM, ino)) {
+            Ok(_) | Err(Error::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Free the orphans of the current subvolume; returns how many.
+    fn drop_orphans_here(&mut self) -> Result<usize> {
+        let inos = self.orphan_items()?;
+        for &ino in &inos {
+            self.free_orphan(ino)?;
+        }
+        Ok(inos.len())
+    }
+
+    /// Free the orphans a crash left, in every subvolume (what btrfs's
+    /// orphan cleanup does at mount): nothing has them open any more. A
+    /// subvolume whose tree cannot be read keeps its own, and still mounts,
+    /// for `repair` to see.
+    fn drop_orphans(&mut self) -> Result<()> {
+        let back = self.subvol;
+        let mut freed = 0;
+        for (id, _) in self.root_items()? {
+            match self.enter(id).and_then(|()| self.drop_orphans_here()) {
+                Ok(n) => freed += n,
+                Err(e) => warn!(
+                    "eclipsefs: subvolume {}: files unlinked while open stay: {:?}",
+                    id, e
+                ),
+            }
+        }
+        self.enter(back)?;
+        if freed == 0 {
+            return Ok(());
+        }
+        warn!("eclipsefs: freed {} files unlinked while open", freed);
+        self.flush()
     }
 
     // -----------------------------------------------------------------------
@@ -2913,6 +3026,10 @@ impl CowFs {
                 self.remove_entry(e.ino, &e.name)?;
             }
         }
+        // Nor are the source's open files without a name: nothing has them
+        // open in the snapshot.
+        self.enter(id)?;
+        self.drop_orphans_here()?;
         if read_only {
             self.enter(id)?;
             self.fs_item.flags |= ROOT_FLAG_RDONLY;
@@ -4532,6 +4649,8 @@ impl CowFs {
         let mut contexts: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
         // Inodes with inline or compressed data.
         let mut packed: BTreeSet<u64> = BTreeSet::new();
+        // Open files without a name (see ORPHAN_ITEM).
+        let mut orphans: BTreeSet<u64> = BTreeSet::new();
         // A batch of items at a time: a file of tens of GB has millions.
         let mut next = Some(Key::MIN);
         while let Some(lo) = next {
@@ -4634,6 +4753,9 @@ impl CowFs {
                         }
                         xattr_owners.insert(k.objectid);
                     }
+                    ORPHAN_ITEM if k.objectid == ORPHAN_OBJECTID && d.is_empty() => {
+                        orphans.insert(k.offset);
+                    }
                     _ => return Err(Error::Corrupt("fsck: unknown item")),
                 }
             }
@@ -4644,6 +4766,12 @@ impl CowFs {
         }
         if xattr_owners.iter().any(|o| !inodes.contains_key(o)) {
             return Err(Error::Corrupt("fsck: xattr of a missing inode"));
+        }
+        if orphans
+            .iter()
+            .any(|o| inodes.get(o).is_none_or(|i| i.kind() == FileKind::Dir))
+        {
+            return Err(Error::Corrupt("fsck: orphan item of no file"));
         }
         let root = item.root_dir;
         for (&ino, i) in &inodes {
@@ -4656,7 +4784,7 @@ impl CowFs {
                 n == u32::from(ino != root)
                     && i.nlink == 2 + subdirs.get(&ino).copied().unwrap_or(0)
             } else {
-                n > 0 && i.nlink == n
+                (n > 0 || orphans.contains(&ino)) && i.nlink == n
             };
             if !ok || r != n {
                 return Err(Error::Corrupt("fsck: link count"));

@@ -108,6 +108,14 @@ pub fn is_link(ino: u64) -> bool {
 pub const INODE_ITEM: u8 = 1;
 pub const INODE_REF: u8 = 12;
 pub const XATTR_ITEM: u8 = 24;
+/// `(ORPHAN_OBJECTID, ORPHAN_ITEM, inode)` in a subvolume's tree, no value:
+/// the inode's last name went while it was open, so it stays (with no
+/// links) until the last close, or the next read-write mount after a crash
+/// frees it. btrfs's orphan item, same type number.
+pub const ORPHAN_ITEM: u8 = 48;
+/// Object of the orphan items: above every inode number, as btrfs's
+/// `BTRFS_ORPHAN_OBJECTID` (-5).
+pub const ORPHAN_OBJECTID: u64 = u64::MAX - 4;
 /// `(inode, ENC_CONTEXT, 0)` -> the encryption context of an encrypted
 /// inode (`fscrypt_context_v2` layout: policy and a 16-byte nonce).
 pub const ENC_CONTEXT: u8 = 26;
