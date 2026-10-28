@@ -711,6 +711,19 @@ impl KernelHandler for ZcoreKernelHandler {
         };
         thread.proc().vmar().range_is_mapped(vaddr, len)
     }
+
+    /// See [`KernelHandler::check_user_access`]: does the current process map
+    /// `[vaddr, vaddr + len)` with every page allowing `access`? Whose range it
+    /// is, as for [`Self::check_user_range`].
+    fn check_user_access(&self, vaddr: usize, len: usize, access: MMUFlags) -> bool {
+        let Some(thread) = kernel_hal::thread::get_current_thread() else {
+            return true;
+        };
+        let Ok(thread) = thread.downcast::<Thread>() else {
+            return true;
+        };
+        thread.proc().vmar().range_allows(vaddr, len, access)
+    }
 }
 
 /// One line saying whether this CPU was inside the kernel heap's critical
@@ -1734,6 +1747,27 @@ mod check_user_range_tests {
             let (_vmar, base) = a_process_with_a_hole_in_its_address_space();
             assert!(!ZcoreKernelHandler.check_user_range(base, usize::MAX));
             assert!(!ZcoreKernelHandler.check_user_range(usize::MAX, 2));
+        });
+    }
+
+    /// `check_user_access` asks the pages' flags, through
+    /// `VmAddressRegion::range_allows`: a read-only page of the current
+    /// process may be read and not written, and with no current thread there
+    /// is nothing to refuse, as for the mapping check.
+    #[test]
+    fn a_read_only_page_may_be_read_and_not_written() {
+        assert!(ZcoreKernelHandler.check_user_access(0xdead_beef, 8, MMUFlags::WRITE));
+        in_a_task(|| {
+            let (vmar, base) = a_process_with_a_hole_in_its_address_space();
+            vmar.protect(base, 0x1000, MMUFlags::READ | MMUFlags::USER)
+                .unwrap();
+            assert!(ZcoreKernelHandler.check_user_access(base, 8, MMUFlags::READ));
+            assert!(
+                !ZcoreKernelHandler.check_user_access(base, 8, MMUFlags::WRITE),
+                "a write into a read-only page got a green light"
+            );
+            assert!(ZcoreKernelHandler.check_user_access(base + 0x2000, 8, MMUFlags::WRITE));
+            assert!(!ZcoreKernelHandler.check_user_access(base + 0x1000, 1, MMUFlags::READ));
         });
     }
 
