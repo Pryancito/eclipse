@@ -179,6 +179,45 @@ fn is_ethernet(comp: &StringList) -> bool {
     comp.contains("allwinner,sunxi-gmac") || comp.contains("brcm,bcm2711-genet-v5")
 }
 
+/// The interrupt number one specifier names, as the controller's own driver
+/// counts them.
+///
+/// **It is not always the first cell.** How a specifier reads is part of the
+/// controller's binding, and `#interrupt-cells` is what tells the two shapes
+/// Eclipse has apart:
+///
+/// - **one cell** is the number itself. That is the RISC-V PLIC and the
+///   `riscv,cpu-intc`, which is all that reached this code until now.
+/// - **three cells** are `<type number flags>`, which is the ARM GIC. The
+///   first cell is the TYPE, 0 for an SPI and 1 for a PPI, and taking it for
+///   the number would register every shared interrupt in the tree as IRQ 0.
+///   The number in the specifier is relative to its bank, and the GIC's own
+///   IDs are absolute: an SPI starts at 32 and a PPI at 16, which is the
+///   offset `irq_of_parse_and_map` adds in Linux.
+///
+/// Anything else is a controller whose binding nobody here has read, and a
+/// guess would silently wire the device to the wrong line. `None` says so.
+fn irq_number(cells: usize, spec: &[u32]) -> Option<u32> {
+    match (cells, spec) {
+        (1, [number, ..]) => Some(*number),
+        (3, [kind, number, _flags, ..]) => match kind {
+            // GIC_SPI / GIC_PPI of the binding's own header.
+            0 => number.checked_add(32),
+            1 => number.checked_add(16),
+            // 2 and 3 are the extended SPI and PPI banks of a GICv3, whose
+            // bases this builder has no controller for yet.
+            _ => {
+                warn!("{MODULE}: interrupt type {kind} in a 3-cell specifier is not supported");
+                None
+            }
+        },
+        (cells, _) => {
+            warn!("{MODULE}: a specifier of {cells} cell(s) has no known shape");
+            None
+        }
+    }
+}
+
 /// Walks one device's interrupt list and registers every specifier in it
 /// with the controller it names.
 fn register_interrupts(
@@ -219,8 +258,7 @@ fn register_interrupts(
             }
         };
         let irq_num = match rest.get(args_at..step) {
-            // The interrupt number is the first argument of the specifier.
-            Some(spec) => spec.first().copied(),
+            Some(spec) => irq_number(*cells, spec),
             None => {
                 // A tail too short for one more specifier. Everything ahead
                 // of it is registered already, so stop at this device
@@ -577,17 +615,19 @@ mod tests {
     #[test]
     fn a_specifier_is_as_long_as_its_controller_says() {
         let intc = FakeIntc::new();
-        // Three cells per specifier, first one the number: two interrupts.
+        // Three cells per specifier, la forma del GIC `<tipo numero flags>`:
+        // dos interrupciones, y el numero de cada una es la segunda celda
+        // mas los 32 de los SPI.
         let (dev_list, intc_map) = one_controller(
             intc.clone(),
             3,
             InterruptsProp {
                 parent: Some(7),
-                specs: vec![35, 0, 4, 36, 0, 4],
+                specs: vec![0, 35, 4, 0, 36, 4],
             },
         );
         assert_eq!(run(&dev_list, &intc_map), Ok(()));
-        assert_eq!(seen(&intc).0, vec![35, 36]);
+        assert_eq!(seen(&intc).0, vec![35 + 32, 36 + 32]);
     }
 
     #[test]
@@ -635,18 +675,18 @@ mod tests {
     #[test]
     fn a_list_that_stops_mid_specifier_keeps_what_came_before_it() {
         let intc = FakeIntc::new();
-        // Two cells per specifier and five cells of list: the last one is not
-        // a specifier. Slicing past the end panicked the kernel.
+        // Tres celdas por especificador y siete de lista: la ultima no es un
+        // especificador. Cortar mas alla del final colgaba el kernel.
         let (dev_list, intc_map) = one_controller(
             intc.clone(),
-            2,
+            3,
             InterruptsProp {
                 parent: Some(7),
-                specs: vec![35, 4, 36, 4, 37],
+                specs: vec![0, 35, 4, 0, 36, 4, 0],
             },
         );
         assert_eq!(run(&dev_list, &intc_map), Ok(()));
-        assert_eq!(seen(&intc).0, vec![35, 36]);
+        assert_eq!(seen(&intc).0, vec![35 + 32, 36 + 32]);
     }
 
     #[test]
@@ -876,6 +916,49 @@ mod tests {
                 comp
             );
         }
+    }
+
+    #[test]
+    fn a_one_cell_specifier_is_the_number_itself() {
+        // El PLIC de riscv y el `riscv,cpu-intc`, que es lo unico que llegaba
+        // aqui antes. La celda de mas esta para comprobar que no se mira.
+        assert_eq!(irq_number(1, &[36]), Some(36));
+        assert_eq!(irq_number(1, &[36, 99]), Some(36));
+    }
+
+    #[test]
+    fn a_three_cell_specifier_is_a_gic_one_and_the_first_cell_is_the_type() {
+        // El defecto que esto arregla: con `<0 29 4>` --un SPI, el numero 29,
+        // flanco-- tomar la primera celda por el numero registraba el
+        // dispositivo en la IRQ 0. El GIC cuenta los SPI desde 32 y los PPI
+        // desde 16, que es el desplazamiento que pone Linux.
+        assert_eq!(irq_number(3, &[0, 29, 4]), Some(29 + 32));
+        assert_eq!(irq_number(3, &[1, 13, 8]), Some(13 + 16));
+        // El GENET de la Pi 4 nombra `<0 157 4>` y `<0 158 4>`.
+        assert_eq!(irq_number(3, &[0, 157, 4]), Some(189));
+        assert_eq!(irq_number(3, &[0, 158, 4]), Some(190));
+    }
+
+    #[test]
+    fn a_specifier_shape_nobody_here_has_read_is_refused_not_guessed() {
+        // Los bancos extendidos de un GICv3, para los que no hay controlador.
+        assert_eq!(irq_number(3, &[2, 0, 4]), None);
+        assert_eq!(irq_number(3, &[3, 0, 4]), None);
+        // Un numero de celdas sin forma conocida. Antes se cogia la primera
+        // celda igualmente, que es adivinar.
+        assert_eq!(irq_number(2, &[7, 4]), None);
+        assert_eq!(irq_number(4, &[0, 0, 7, 4]), None);
+        // Y un especificador mas corto de lo que dice su cuenta de celdas.
+        assert_eq!(irq_number(3, &[0, 29]), None);
+        assert_eq!(irq_number(1, &[]), None);
+    }
+
+    #[test]
+    fn a_number_at_the_top_of_the_range_does_not_wrap_round() {
+        // `checked_add`: un numero absurdo en el arbol no debe dar una IRQ
+        // pequeña y valida por desbordamiento.
+        assert_eq!(irq_number(3, &[0, u32::MAX, 4]), None);
+        assert_eq!(irq_number(3, &[1, u32::MAX - 10, 4]), None);
     }
 
     #[test]
