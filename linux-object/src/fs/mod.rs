@@ -2570,7 +2570,14 @@ mod elf_shrinker_tests;
 /// take two of the registry's eight slots and ask the same cache twice, so
 /// this says in its answer whether the registration was taken.
 pub fn register_shrinkers() -> bool {
-    kernel_hal::shrinker::register(&elf_vmo_shrinker::SHRINKER)
+    // Two registries, and which one a cache goes in is its contract, not a
+    // preference: the ELF image cache frees by dropping an `Arc`, so direct
+    // reclaim may call it in front of a failed allocation; evicting a
+    // page-cache entry writes dirty pages back through the filesystem, so only
+    // the reclaim worker may.
+    let direct = kernel_hal::shrinker::register(&elf_vmo_shrinker::SHRINKER);
+    let deferred = kernel_hal::shrinker::register_deferred(&file::page_cache_reclaim::RECLAIMER);
+    direct && deferred
 }
 
 /// extension for INode

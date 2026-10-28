@@ -51,6 +51,7 @@ mod platform;
 // which is a string, which is the one thing a host test answers for exactly as
 // a boot does. Nothing here calls it under `cfg(test)`; the crate-wide
 // `allow(dead_code)` at the top covers that.
+mod reclaimd;
 #[cfg(any(all(feature = "linux", not(feature = "libos")), test))]
 mod tlb_hammer;
 mod utils;
@@ -651,6 +652,10 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     }
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
+    // ... and start the worker that walks the caches direct reclaim may not:
+    // evicting a page-cache entry writes its dirty pages back through the
+    // filesystem, which an allocation that has already failed cannot do.
+    reclaimd::start();
     // Bring up the hunter security subsystem. Register the monotonic clock
     // first so the very first recorded event carries a real timestamp, then a
     // durable sink that streams high-severity (Warning+) events to the kernel
