@@ -227,6 +227,41 @@ The image ships `/etc/hunter/policy.conf` as a fully commented example
 ([`tools/hunterctl/policy.conf`](../tools/hunterctl/policy.conf)), so it
 changes nothing until edited; a unit test keeps every line of it valid.
 
+### From the desktop: lunarbar's shield
+
+The bottom bar ([`tools/lunarbar`](../tools/lunarbar)) carries a shield next to
+the keyboard pill, read from `/proc/hunter` every three seconds:
+
+| Shield | Meaning |
+|---|---|
+| solid, accent colour | every domain at least reports |
+| outline, dim | some domain is `off` |
+| solid, red | a critical event arrived that nobody has looked at yet |
+
+Clicking it opens hunter's menu, which also clears the red (opening the menu is
+what "looked at" means). The menu has:
+
+- the seal (`sellado` / `sealed`) and the counters (blocked, criticals,
+  signatures);
+- one row per domain with `off / report / enforce` (`off / aviso / bloqueo` in
+  Spanish), plus `learning off / on`. A click sends `mode <domain> <mode>` or
+  `learning <on|off>`. Once sealed, the relaxing segments are dimmed and not
+  clickable; should a relaxation still be refused (hunter accepts the write
+  and only says so in its ring), the menu re-reads the modes and says so;
+- the newest four warnings and criticals;
+- four buttons: **scan** (`hunterctl scan --quarantine $HOME` in a terminal),
+  **signatures** (`hunterctl update-signatures` in a terminal), **log**
+  (`hunterctl events`), and **lockdown**, which takes a second click to
+  confirm and then sends exactly what `hunterctl lockdown` does (a unit test
+  compares the two).
+
+The bar holds no policy of its own: it reads the same report and sends the
+same directives as `hunterctl`, through the same root-only `/proc/hunter`
+(the desktop session runs as root). A kernel without hunter has no
+`/proc/hunter`, and then there is no shield. `LUNARBAR_DUMP=/path:WxH
+LUNARBAR_DUMP_HUNTER=1 lunarbar` renders the menu to a file without a
+compositor.
+
 ## Exec integrity (SHA-256)
 
 The `exec` domain decides *where* a program may run from and *which names*

@@ -357,6 +357,25 @@ impl Canvas {
         }
     }
 
+    /// Vector shield (hunter's indicator): an outline, filled when `solid`.
+    pub fn shield_icon(&mut self, x: i32, y: i32, s: i32, c: Rgb, solid: bool) {
+        let (x, y, s) = (x as f32, y as f32, s as f32);
+        let mut pb = PathBuilder::new();
+        pb.move_to(x + s * 0.5, y + s * 0.05);
+        pb.line_to(x + s * 0.9, y + s * 0.2);
+        pb.cubic_to(x + s * 0.9, y + s * 0.6, x + s * 0.75, y + s * 0.82, x + s * 0.5, y + s * 0.97);
+        pb.cubic_to(x + s * 0.25, y + s * 0.82, x + s * 0.1, y + s * 0.6, x + s * 0.1, y + s * 0.2);
+        pb.close();
+        if let Some(p) = pb.finish() {
+            if solid {
+                self.fill(&p, c, 1.0);
+            } else {
+                let stroke = Stroke { width: 1.5, ..Stroke::default() };
+                self.pix.stroke_path(&p, &Self::paint(c, 1.0), &stroke, Transform::identity(), None);
+            }
+        }
+    }
+
     /// Vector logout icon (🚪 / ➔)
     pub fn exit_icon(&mut self, x: i32, y: i32, s: i32, c: Rgb) {
         let (x, y, s) = (x as f32, y as f32, s as f32);

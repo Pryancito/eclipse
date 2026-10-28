@@ -25,6 +25,7 @@ pub mod apps;
 pub mod clip;
 pub mod draw;
 pub mod files;
+pub mod hunter;
 pub mod fill_guard;
 pub mod i18n;
 pub mod icons;

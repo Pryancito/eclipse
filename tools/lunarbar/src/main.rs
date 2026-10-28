@@ -50,12 +50,15 @@
 //! - `LUNARBAR_DUMP=/path:WxH` — render both bars (top + bottom, wallpaper gap
 //!   between) to a raw XRGB8888 file and exit, for offline verification.
 //!   `LUNARBAR_DUMP_MENU=1` composites the open app menu over the preview;
-//!   `LUNARBAR_DUMP_CAL=1` composites the calendar popup instead.
+//!   `LUNARBAR_DUMP_CAL=1` composites the calendar popup instead, and
+//!   `LUNARBAR_DUMP_HUNTER=1` hunter's menu.
 
 // The drawing stack, /proc readers, .desktop scanner and input tables live in
 // the `lunarbar` library next door, shared with `lunarrun` (see src/lib.rs).
 use lunarbar::look::Look;
-use lunarbar::{apps, draw, fill_guard, i18n, icons, sysinfo};
+use lunarbar::{apps, draw, fill_guard, hunter, i18n, icons, sysinfo};
+
+mod hunter_menu;
 use lunarbar::keys::{
     key_char, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ENTER_WL,
     KEY_ESC_WL, KEY_KPENTER_WL, KEY_LEFT_WL, KEY_PGDN_WL, KEY_PGUP_WL, KEY_RIGHT_WL, KEY_TAB_WL,
@@ -359,6 +362,8 @@ enum Hover {
     Power,
     /// Keyboard layout pill (bottom bar); click cycles es/us.
     Kbd,
+    /// hunter's shield (bottom bar); click for its menu.
+    Hunter,
 }
 
 /// Click/hover target for one taskbar button.
@@ -420,6 +425,8 @@ struct Bar {
     power_hit: (i32, i32),
     /// x-range [x0,x1) of the keyboard-layout pill.
     kbd_hit: (i32, i32),
+    /// x-range [x0,x1) of hunter's shield.
+    hunter_hit: (i32, i32),
     /// Click targets for each window button (Task bars).
     task_hits: Vec<TaskHit>,
 }
@@ -470,6 +477,8 @@ enum PopupKind {
     TaskMenu { tid: u32, title: String },
     /// Volume control popup slider.
     Volume { level: u32 },
+    /// hunter's menu: modes, alerts and actions.
+    Hunter(hunter_menu::Menu),
 }
 
 /// Which side of the panel the popup's shadow occupies, in surface pixels.
@@ -497,6 +506,14 @@ enum Action {
     TaskClose(u32),
     /// Click anywhere on the volume gauge; percent derived from x.
     VolumeGauge,
+    /// hunter: set a domain (index into `hunter::DOMAINS`) to a mode.
+    HunterMode(u8, hunter::Mode),
+    HunterLearning(bool),
+    HunterScan,
+    HunterUpdate,
+    HunterLog,
+    /// Armed by the first click, sent by the second.
+    HunterLockdown,
 }
 
 /// A menu: an ARGB xdg_popup parented to the bar's layer surface, holding the
@@ -626,6 +643,8 @@ struct Metrics {
     vol: Option<u32>,
     /// Console/labwc layout, uppercase (`ES` / `US`), from `/proc/kbd`.
     kbd: String,
+    /// hunter's shield; None (no hunter in this kernel) hides it.
+    hunter: Option<hunter::Shield>,
 }
 
 #[derive(Default)]
@@ -685,6 +704,10 @@ struct State {
     ptr_bar: Option<u32>,  // layer id the pointer is over
     ptr_on_popup: bool,    // pointer is over the popup overlay
     scroll_acc: f64,       // accumulated wheel distance until one notch
+    /// Last status read from /proc/hunter, and the critical count the user
+    /// has seen by opening its menu.
+    hunter: Option<hunter::Status>,
+    hunter_seen: u64,
 }
 
 impl State {
@@ -706,7 +729,11 @@ impl State {
             // the slider.
             vol: self.vol,
             kbd: sysinfo::kbd_layout(),
+            hunter: self.metrics.hunter,
         };
+        if self.tick.is_multiple_of(hunter_menu::REFRESH_TICKS) {
+            self.refresh_hunter();
+        }
     }
 
     fn ensure_surfaces(&mut self, qh: &QueueHandle<State>) {
@@ -785,6 +812,7 @@ impl State {
                     vol_hit: (0, 0),
                     power_hit: (0, 0),
                     kbd_hit: (0, 0),
+                    hunter_hit: (0, 0),
                     task_hits: Vec::new(),
                 };
                 if !fill_guard::try_push_bounded(&mut self.bars, bar, fill_guard::MAX_BARS) {
@@ -952,6 +980,7 @@ impl State {
             bar.vol_hit = (0, 0);
             bar.power_hit = (0, 0);
             bar.kbd_hit = (0, 0);
+            bar.hunter_hit = (0, 0);
             bar.hover = Hover::None;
             bar.width = w;
             bar.height = h;
@@ -1060,7 +1089,7 @@ impl State {
                     bar.busy[i] = false;
                     return;
                 };
-                let (launcher_hit, hits, clock_hit, vol_hit, power_hit, kbd_hit) =
+                let (launcher_hit, hits, clock_hit, vol_hit, power_hit, kbd_hit, hunter_hit) =
                     draw_task(&mut cv, w, h, &items, &m, hover, &mut self.icons);
                 let bar = &mut self.bars[idx];
                 let data: &mut [u8] = unsafe {
@@ -1075,6 +1104,7 @@ impl State {
                 bar.vol_hit = vol_hit;
                 bar.power_hit = power_hit;
                 bar.kbd_hit = kbd_hit;
+                bar.hunter_hit = hunter_hit;
                 bar.task_hits = hits;
                 commit_bar(bar, i);
             }
@@ -1319,6 +1349,7 @@ impl State {
             PopupKind::Calendar { .. } => bar.clock_hit,
             PopupKind::PowerMenu => bar.power_hit,
             PopupKind::Volume { .. } => bar.vol_hit,
+            PopupKind::Hunter(_) => bar.hunter_hit,
             PopupKind::TaskMenu { tid, .. } => bar
                 .task_hits
                 .iter()
@@ -1750,6 +1781,12 @@ impl State {
                 self.render_popup(qh);
                 self.render_all();
             }
+            Some(a @ (Action::HunterMode(..)
+            | Action::HunterLearning(_)
+            | Action::HunterScan
+            | Action::HunterUpdate
+            | Action::HunterLog
+            | Action::HunterLockdown)) => self.hunter_click(qh, a),
             None => {
                 let (px, py, pw, ph) = panel;
                 if !(x >= px && x < px + pw && y >= py && y < py + ph) {
@@ -1942,6 +1979,8 @@ impl State {
             Hover::Power
         } else if x >= bar.kbd_hit.0 && x < bar.kbd_hit.1 {
             Hover::Kbd
+        } else if x >= bar.hunter_hit.0 && x < bar.hunter_hit.1 {
+            Hover::Hunter
         } else if let Some(h) = bar.task_hits.iter().find(|h| x >= h.x0 && x < h.x1) {
             Hover::Task(h.tid)
         } else {
@@ -2311,6 +2350,7 @@ fn draw_task(
     (i32, i32),
     (i32, i32),
     (i32, i32),
+    (i32, i32),
 ) {
     clear_bar(cv, w, h);
     // border-top: 2px solid #6b5aa8
@@ -2336,6 +2376,7 @@ fn draw_task(
     let mut vol_hit = (0, 0);
     let mut power_hit = (0, 0);
     let mut kbd_hit = (0, 0);
+    let mut hunter_hit = (0, 0);
 
     {
         // Power button: far right
@@ -2386,6 +2427,11 @@ fn draw_task(
             cv.text_bold(kbd, rx + 8, ty, pal().text);
             kbd_hit = (rx, rx + kw);
             rx -= 10;
+        }
+
+        if let Some(s) = m.hunter {
+            let hovered = hover == Hover::Hunter;
+            hunter_hit = hunter_menu::draw_badge(cv, &mut rx, left_min, btn_y, btn_h, hovered, s);
         }
 
         // Volume module
@@ -2533,7 +2579,7 @@ fn draw_task(
         x += bw + 4;
     }
 
-    (launcher_hit, hits, clock_hit, vol_hit, power_hit, kbd_hit)
+    (launcher_hit, hits, clock_hit, vol_hit, power_hit, kbd_hit, hunter_hit)
 }
 
 // ── Top bar: system info ─────────────────────────────────────────────────────
@@ -2779,6 +2825,7 @@ fn popup_size(kind: &PopupKind, oh: i32, bar_h: i32) -> (i32, i32) {
         PopupKind::PowerMenu => (180, 160),
         PopupKind::TaskMenu { .. } => (200, 130),
         PopupKind::Volume { .. } => (180, 80),
+        PopupKind::Hunter(_) => hunter_menu::size(),
     }
 }
 
@@ -2841,6 +2888,7 @@ fn draw_popup(
         PopupKind::PowerMenu => draw_power_menu(cv, px, py, pw, ph),
         PopupKind::TaskMenu { tid, title } => draw_task_menu(cv, px, py, pw, ph, *tid, title),
         PopupKind::Volume { level } => draw_volume_menu(cv, px, py, pw, ph, *level),
+        PopupKind::Hunter(m) => hunter_menu::draw(cv, px, py, pw, ph, m),
     }
 }
 
@@ -3533,6 +3581,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 let (vx0, vx1) = state.bars[idx].vol_hit;
                 let (px0, px1) = state.bars[idx].power_hit;
                 let (kx0, kx1) = state.bars[idx].kbd_hit;
+                let (hx0, hx1) = state.bars[idx].hunter_hit;
                 if button == BTN_LEFT && x >= lx0 && x < lx1 {
                     state.toggle_apps(qh, role == Role::Info);
                 } else if button == BTN_LEFT && x >= cx0 && x < cx1 {
@@ -3543,6 +3592,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     state.toggle_power(qh, role == Role::Info);
                 } else if button == BTN_LEFT && x >= kx0 && x < kx1 {
                     state.toggle_kbd();
+                } else if button == BTN_LEFT && x >= hx0 && x < hx1 {
+                    state.toggle_hunter(qh, role == Role::Info);
                 } else if role == Role::Task {
                     let hit = state.bars[idx]
                         .task_hits
@@ -4263,6 +4314,8 @@ fn main() {
             batt: sysinfo::battery(),
             vol: sysinfo::volume(),
             kbd: sysinfo::kbd_layout(),
+            // Shown even off Eclipse OS, so the preview has the shield in it.
+            hunter: Some(hunter::read().map_or(hunter::Shield::Guarded, |s| s.shield(s.criticals))),
         };
 
         // Top info bar occupies rows [0, bh) — in the KDE look there is no
@@ -4308,7 +4361,8 @@ fn main() {
         let want_menu = std::env::var("LUNARBAR_DUMP_MENU").is_ok();
         let want_cal = std::env::var("LUNARBAR_DUMP_CAL").is_ok();
         let want_power = std::env::var("LUNARBAR_DUMP_POWER").is_ok();
-        if want_menu || want_cal || want_power {
+        let want_hunter = std::env::var("LUNARBAR_DUMP_HUNTER").is_ok();
+        if want_menu || want_cal || want_power || want_hunter {
             let mut cv = Canvas::new(w, full_h);
             // The compositor places the real thing; here the preview has to,
             // so it hangs the panel off the bottom bar the way the positioner
@@ -4327,6 +4381,10 @@ fn main() {
                 let k = PopupKind::PowerMenu;
                 let (px, py, pw, ph) = place(&k, false);
                 draw_power_menu(&mut cv, px, py, pw, ph);
+            } else if want_hunter {
+                let m = hunter_menu::preview();
+                let (px, py, pw, ph) = place(&PopupKind::Hunter(hunter_menu::preview()), false);
+                hunter_menu::draw(&mut cv, px, py, pw, ph, &m);
             } else if want_menu {
                 let mut all = vec![apps::AppEntry {
                     name: "Terminal".into(),
@@ -4510,732 +4568,9 @@ fn main() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn apps(n: usize) -> PopupKind {
-        PopupKind::Apps {
-            all: (0..n)
-                .map(|i| apps::AppEntry {
-                    name: format!("app {i}"),
-                    exec: String::new(),
-                    icon: None,
-                })
-                .collect(),
-            filter: String::new(),
-            visible: (0..n).collect(),
-            sel: 0,
-            scroll: 0,
-        }
-    }
-
-    const KINDS: [fn() -> PopupKind; 4] = [
-        || PopupKind::Calendar { year: 2026, month: 8 },
-        || PopupKind::PowerMenu,
-        || PopupKind::TaskMenu { tid: 1, title: String::new() },
-        || PopupKind::Volume { level: 50 },
-    ];
-
-    /// The panel is sized from the result list, and the scroll clamp, the
-    /// keyboard navigation and the drawing all re-derive the row count from
-    /// the panel HEIGHT. If those two disagree the menu scrolls past its own
-    /// last row, or hides one.
-    #[test]
-    fn panel_height_and_row_count_agree() {
-        for oh in [600, 768, 1080, 1440, 2160] {
-            let fits = apps_rows_fit(oh, 34);
-            for n in [0, 1, 2, 7, 40, 500] {
-                let (_, ph) = popup_size(&apps(n), oh, 34);
-                let shown = n.clamp(1, fits);
-                assert_eq!(
-                    panel_rows_fit(ph),
-                    shown,
-                    "oh={oh} n={n}: panel {ph}px was sized for {shown} rows"
-                );
-            }
-        }
-    }
-
-    /// An empty result list still needs a row to say so in.
-    #[test]
-    fn an_empty_result_list_still_gets_a_row() {
-        let (_, ph) = popup_size(&apps(0), 1080, 34);
-        assert_eq!(panel_rows_fit(ph), 1);
-        assert!(ph > APPS_HEADER_H + APPS_SEARCH_H);
-    }
-
-    /// The app menu must fit between the two bars: it is an xdg_popup now, so
-    /// a panel taller than the output is one the compositor has to slide or
-    /// flip, and either way the user loses rows off an edge.
-    #[test]
-    fn the_app_menu_fits_between_the_bars() {
-        for oh in [480, 600, 768, 1080, 1440] {
-            let bar_h = 34;
-            let (_, ph) = popup_size(&apps(10_000), oh, bar_h);
-            let span = (oh - bar_h - 6) - (bar_h + 8);
-            assert!(ph <= span.max(1), "oh={oh}: panel {ph}px over a {span}px gap");
-        }
-    }
-
-    /// Every kind must ask for a positive size: `xdg_positioner.set_size`
-    /// rejects zero, and a rejected positioner is a protocol error, which this
-    /// event loop exits on.
-    #[test]
-    fn every_popup_asks_for_a_positive_size() {
-        for oh in [0, 1, 100, 1080] {
-            for bar_h in [0, 34, 4096] {
-                for mk in KINDS {
-                    let (w, h) = popup_size(&mk(), oh, bar_h);
-                    assert!(w > 0 && h > 0, "{w}x{h} at oh={oh} bar_h={bar_h}");
-                }
-                for n in [0, 3, 900] {
-                    let (w, h) = popup_size(&apps(n), oh, bar_h);
-                    assert!(w > 0 && h > 0, "apps({n}) {w}x{h} at oh={oh} bar_h={bar_h}");
-                }
-            }
-        }
-    }
-
-    /// A shorter output means fewer rows, never more — the scroll window is
-    /// sized from this and a non-monotonic count would make it jump.
-    #[test]
-    fn a_shorter_output_never_fits_more_rows() {
-        let mut last = usize::MAX;
-        for oh in (200..=2160).rev().step_by(37) {
-            let fits = apps_rows_fit(oh, 34);
-            assert!(fits <= last, "oh={oh} fits {fits} > {last}");
-            assert!(fits >= 1);
-            last = fits;
-        }
-    }
-
-    /// The search field's character cap is what the field can actually show.
-    /// If the cap were the larger of the two, typing would silently vanish.
-    #[test]
-    fn the_filter_cap_fits_the_search_field() {
-        let field_px = APPS_PW - 20 - 24;
-        assert!(APPS_FILTER_MAX as i32 * GLYPH_W <= field_px);
-    }
-
-    /// The drop shadow replaced the full-output scrim, so it has to actually
-    /// be there: alpha outside the panel that falls off with distance, and an
-    /// opaque panel inside. Alpha 0 all round would mean the menu floats with
-    /// nothing separating it from what is behind.
-    #[test]
-    fn the_panel_draws_a_shadow_that_fades_outward() {
-        let (pw, ph) = (60, 40);
-        let (px, py) = (POPUP_SHADOW, POPUP_SHADOW);
-        let (w, h) = ((pw + 2 * POPUP_SHADOW) as usize, (ph + 2 * POPUP_SHADOW) as usize);
-        let mut cv = Canvas::try_new(w, h).unwrap();
-        draw_panel(&mut cv, px, py, pw, ph, 10);
-        let mut buf = vec![0u8; w * h * 4];
-        assert!(cv.blit_argb(&mut buf));
-        let alpha = |x: i32, y: i32| buf[((y as usize * w) + x as usize) * 4 + 3];
-
-        // Inside the panel: effectively opaque.
-        assert!(alpha(px + pw / 2, py + ph / 2) > 240);
-        // Just outside its left edge: the shadow's dark core.
-        let near = alpha(px - 2, py + ph / 2);
-        // Out at the margin: still shadow, but faint.
-        let far = alpha(px - POPUP_SHADOW, py + ph / 2);
-        assert!(near > 0, "no shadow beside the panel");
-        assert!(far > 0, "no shadow at the margin");
-        assert!(near > far, "shadow does not fade outward: {near} then {far}");
-        // The very corner of the surface is past the shadow: clear.
-        assert_eq!(alpha(0, 0), 0);
-    }
-
-    /// Every hit rect a popup returns has to land inside the panel it was
-    /// drawn in. A hit outside is one the pointer can never reach, because
-    /// the popup's input region stops at the panel.
-    #[test]
-    fn popup_hits_stay_inside_the_panel() {
-        let (px, py) = (POPUP_SHADOW, POPUP_SHADOW);
-        let mut icons = IconCache::default();
-        let mut kinds: Vec<PopupKind> = KINDS.iter().map(|mk| mk()).collect();
-        kinds.push(apps(6));
-        for kind in kinds.iter_mut() {
-            let (pw, ph) = popup_size(kind, 1080, 34);
-            let (w, h) = ((pw + 2 * POPUP_SHADOW) as usize, (ph + 2 * POPUP_SHADOW) as usize);
-            let mut cv = Canvas::try_new(w, h).unwrap();
-            let hits = draw_popup(&mut cv, px, py, pw, ph, kind, &mut icons);
-            assert!(!hits.is_empty(), "a popup with nothing to click");
-            for (x0, y0, x1, y1, _) in hits {
-                assert!(x1 > x0 && y1 > y0, "empty hit {x0},{y0}..{x1},{y1}");
-                assert!(
-                    x0 >= px && y0 >= py && x1 <= px + pw && y1 <= py + ph,
-                    "hit {x0},{y0}..{x1},{y1} outside the {pw}x{ph} panel at {px},{py}"
-                );
-            }
-        }
-    }
-
-    /// A title is mapped onto the bitmap font's repertoire: titles arrive as
-    /// arbitrary UTF-8 and every glyph the font does not have would otherwise
-    /// render as a full-width '?', one per codepoint.
-    #[test]
-    fn every_glyph_a_title_can_carry_is_mapped_or_dropped() {
-        // The dashes Firefox and every other browser put in a title.
-        assert_eq!(sanitize_title("page \u{2014} browser"), "page - browser");
-        assert_eq!(
-            sanitize_title("\u{2010}\u{2011}\u{2012}\u{2013}\u{2014}\u{2015}"),
-            "------"
-        );
-        // Curly quotes, both pairs, and the ellipsis that is one codepoint.
-        assert_eq!(sanitize_title("\u{2018}a\u{2019}"), "'a'");
-        assert_eq!(sanitize_title("\u{201c}a\u{201d}"), "\"a\"");
-        assert_eq!(sanitize_title("Saving\u{2026}"), "Saving...");
-        // Invisible: zero-width marks, variation selectors, combining marks.
-        assert_eq!(sanitize_title("a\u{200b}b\u{200f}c"), "abc");
-        assert_eq!(sanitize_title("a\u{fe00}b\u{fe0f}c"), "abc");
-        assert_eq!(sanitize_title("a\u{0300}b\u{036f}c"), "abc");
-        // A control character becomes a space: a stray newline would draw a
-        // second line of text bleeding out of the button.
-        assert_eq!(sanitize_title("a\nb\tc"), "a b c");
-        // Latin-1 has a glyph; anything above it collapses into ONE '?' per
-        // run, so a CJK title is one mark and not one per character.
-        assert_eq!(sanitize_title("café ñ"), "café ñ");
-        assert_eq!(sanitize_title("\u{4e2d}\u{6587}\u{6587}"), "?");
-        assert_eq!(sanitize_title("a\u{4e2d}b\u{6587}"), "a?b?");
-        assert_eq!(sanitize_title("\u{1f600}\u{1f600}x"), "?x");
-    }
-
-    /// The button label: the window's own title where it has one, the app_id
-    /// otherwise, capped to what keeps a button a sane width, and the flag
-    /// that tells the hover tooltip there is more to show.
-    #[test]
-    fn a_button_is_labelled_by_its_title_and_capped_where_it_says_it_is() {
-        assert_eq!(short_label("Title", "app.id"), ("Title".into(), false));
-        // A title of spaces is no title: the app_id is the fallback.
-        assert_eq!(short_label("   ", "app.id"), ("app.id".into(), false));
-        assert_eq!(short_label("", "app.id"), ("app.id".into(), false));
-        // Neither: a window still needs a word on it.
-        assert_eq!(short_label("", ""), ("window".into(), false));
-        assert_eq!(short_label("\u{200b}", ""), ("window".into(), false));
-        // Exactly eighteen characters is not capped; nineteen is, and the cap
-        // keeps eighteen of them plus the mark that says so.
-        let (s, long) = short_label(&"x".repeat(18), "");
-        assert_eq!((s.as_str(), long), (&*"x".repeat(18), false));
-        let (s, long) = short_label(&"x".repeat(19), "");
-        assert_eq!((s.as_str(), long), (&*format!("{}.", "x".repeat(18)), true));
-        // The title is sanitized BEFORE it is capped, so the count is of
-        // glyphs the font can draw and not of codepoints that vanish.
-        assert_eq!(short_label("a\u{2014}b", "").0, "a-b");
-        // A title made of nothing but invisible characters is a title as far
-        // as the fallback is concerned -- `trim` does not strip a zero-width
-        // space -- so what is left after sanitizing is the generic word, not
-        // the app_id.
-        assert_eq!(short_label(&"\u{200b}".repeat(40), "app").0, "window");
-        // The source is the title whole, not trimmed into the label.
-        assert_eq!(short_label("  spaced  ", "").0, "spaced");
-    }
-
-    /// A metric with no reading shows that it has none, rather than an empty
-    /// gap the eye reads as a zero.
-    #[test]
-    fn a_metric_with_no_reading_says_so() {
-        assert_eq!(opt(Some(0)), "0");
-        assert_eq!(opt(Some(97)), "97");
-        assert_eq!(opt(None), "--");
-    }
-
-    /// The menu filter matches anywhere in the name and ignores case and the
-    /// accents a Spanish menu has, because that is how someone types.
-    #[test]
-    fn the_menu_filter_matches_the_way_someone_types_it() {
-        let all: Vec<apps::AppEntry> = ["Calculadora", "Música", "Firefox"]
-            .iter()
-            .map(|n| apps::AppEntry {
-                name: (*n).into(),
-                exec: String::new(),
-                icon: None,
-            })
-            .collect();
-        // An empty filter is every app, in order.
-        assert_eq!(filter_apps(&all, ""), [0, 1, 2]);
-        // A filter of spaces is not an empty filter: the field's text is
-        // matched as typed, so it matches no name at all.
-        assert!(filter_apps(&all, "   ").is_empty());
-        // Case and accents are ignored, on both sides.
-        assert_eq!(filter_apps(&all, "MUSICA"), [1]);
-        assert_eq!(filter_apps(&all, "músi"), [1]);
-        // And it matches inside the name, not only at its start.
-        assert_eq!(filter_apps(&all, "fox"), [2]);
-        assert_eq!(filter_apps(&all, "cula"), [0]);
-        assert!(filter_apps(&all, "zz").is_empty());
-    }
-
-    /// The app menu's panel is sized from its result list, and an empty list
-    /// still gets a row to say so in -- the row the drawing code then draws
-    /// the "no results" line into.
-    #[test]
-    fn an_empty_app_menu_is_still_a_row_tall() {
-        let (_, ph) = popup_size(&apps(0), 1080, 34);
-        assert!(
-            ph >= APPS_HEADER_H + APPS_SEARCH_H + APPS_ROW_H + APPS_PAD,
-            "a {ph}px panel has no room for a row"
-        );
-        // Every panel carries the padding below its last row.
-        for n in [0, 1, 5] {
-            let (_, ph) = popup_size(&apps(n), 1080, 34);
-            let rows = panel_rows_fit(ph) as i32;
-            assert_eq!(
-                ph,
-                APPS_HEADER_H + APPS_SEARCH_H + rows * APPS_ROW_H + APPS_PAD,
-                "n={n}"
-            );
-        }
-    }
-
-    /// The row count a panel height yields has to be rows that FIT. The
-    /// client asks for a size, but the compositor configures the one it gives,
-    /// and the drawing, the scroll clamp and the keyboard navigation all
-    /// re-derive the count from whatever height arrived.
-    #[test]
-    fn a_panel_only_counts_the_rows_that_fit_inside_it() {
-        for ph in 0..400 {
-            let rows = panel_rows_fit(ph) as i32;
-            // One row always, even where there is no room: there has to be
-            // somewhere to say that nothing matched.
-            assert!(rows >= 1, "ph={ph} counted no rows at all");
-            if rows > 1 {
-                let needed = APPS_HEADER_H + APPS_SEARCH_H + rows * APPS_ROW_H + APPS_PAD;
-                assert!(needed <= ph, "ph={ph}: {rows} rows need {needed}px");
-            }
-        }
-    }
-
-    /// The calendar panel holds the grid it draws: seven columns and the six
-    /// rows it always draws, plus the padding around them. A panel short of a
-    /// row drops the last days of a month that needs it off the bottom.
-    #[test]
-    fn the_calendar_panel_holds_seven_columns_and_six_rows() {
-        let (pw, ph) = popup_size(
-            &PopupKind::Calendar {
-                year: 2021,
-                month: 0,
-            },
-            1080,
-            34,
-        );
-        assert_eq!(pw, 7 * CAL_CELL_W + 2 * CAL_PAD);
-        assert_eq!(ph, CAL_HEADER_H + CAL_WKD_H + 6 * CAL_CELL_H + CAL_PAD);
-        // Six rows is the most any month needs, and every month there is
-        // needs no more: the grid is drawn at a fixed six, so the panel
-        // height does not change as the user walks through the months.
-        for year in 2024..2032 {
-            for month in 0..12 {
-                let first = sysinfo::first_weekday_mon0(year, month) as i32;
-                let last = first + sysinfo::days_in_month(year, month) as i32 - 1;
-                assert!(last / 7 < 6, "{year}-{month} needs {} rows", last / 7 + 1);
-            }
-        }
-    }
-
-    /// The pixels of a popup panel, as the compositor would get them.
-    fn painted(w: usize, h: usize, f: impl FnOnce(&mut Canvas)) -> Vec<u8> {
-        let mut cv = Canvas::try_new(w, h).expect("canvas");
-        f(&mut cv);
-        let mut buf = vec![0u8; w * h * 4];
-        assert!(cv.blit_argb(&mut buf));
-        buf
-    }
-
-    /// The drop shadow is offset downward, so the panel reads as lit from
-    /// above, and it surrounds the panel on every side. The existing shadow
-    /// test covers the left edge and the fade; these are the other three
-    /// things the concentric rects are shaped by.
-    #[test]
-    fn the_panel_shadow_falls_downward_and_on_every_side() {
-        let (pw, ph) = (60, 40);
-        let (px, py) = (POPUP_SHADOW, POPUP_SHADOW);
-        let (w, h) = (
-            (pw + 2 * POPUP_SHADOW) as usize,
-            (ph + 2 * POPUP_SHADOW) as usize,
-        );
-        let buf = painted(w, h, |cv| draw_panel(cv, px, py, pw, ph, 10));
-        let alpha = |x: i32, y: i32| buf[((y as usize * w) + x as usize) * 4 + 3];
-
-        // Every side has shadow beside it, the right one included: the rects
-        // grow by the same amount on both axes.
-        assert!(
-            alpha(px + pw + 3, py + ph / 2) > 0,
-            "no shadow to the right"
-        );
-        assert!(alpha(px + pw / 2, py + ph + 3) > 0, "no shadow below");
-        assert!(alpha(px + pw / 2, py - 3) > 0, "no shadow above");
-        // And more of it below than above: that offset is the light.
-        assert!(
-            alpha(px + pw / 2, py + ph + 3) > alpha(px + pw / 2, py - 3),
-            "the shadow does not fall downward"
-        );
-        // The rects are rounded more the further out they are, so the shadow
-        // is never stronger at a corner than along the edge beside it, and it
-        // runs out at the corner first. A shadow drawn at one radius would
-        // reach the same distance all the way round.
-        for d in 1..POPUP_SHADOW {
-            let (corner, edge) = (alpha(px - d, py - d), alpha(px + pw / 2, py - d));
-            assert!(
-                corner <= edge,
-                "{d}px out: corner {corner} over edge {edge}"
-            );
-        }
-        let d = POPUP_SHADOW / 2;
-        assert_eq!(alpha(px - d, py - d), 0, "the shadow's corner is square");
-        assert!(alpha(px + pw / 2, py - d) > 0, "the shadow's edge is short");
-    }
-
-    /// The colours drawn inside one grid cell, one entry per distinct colour
-    /// that is not the panel's own ground.
-    type Ink = Vec<[u8; 3]>;
-
-    /// The hit rects a popup returns, as `draw_popup` returns them.
-    type Hits = Vec<(i32, i32, i32, i32, Action)>;
-
-    /// The calendar grid, as cells that have something drawn in them. January
-    /// 2021 began on a Friday, so the first four cells of the first row are
-    /// empty and the 31st lands in the last column of the fifth row -- a month
-    /// that pins the row, the column and both ends of the range at once.
-    fn cal_cells(year: i32, month: u32) -> (Vec<Vec<Ink>>, Hits) {
-        let kind = PopupKind::Calendar { year, month };
-        let (pw, ph) = popup_size(&kind, 1080, 34);
-        let (px, py) = (POPUP_SHADOW, POPUP_SHADOW);
-        let (w, h) = (
-            (pw + 2 * POPUP_SHADOW) as usize,
-            (ph + 2 * POPUP_SHADOW) as usize,
-        );
-        let mut cv = Canvas::try_new(w, h).expect("canvas");
-        let hits = draw_calendar(&mut cv, px, py, pw, ph, year, month);
-        let mut buf = vec![0u8; w * h * 4];
-        assert!(cv.blit_argb(&mut buf));
-        let at = |x: i32, y: i32| {
-            let i = ((y as usize * w) + x as usize) * 4;
-            [buf[i + 2], buf[i + 1], buf[i]]
-        };
-        // The ground is the panel left of the grid's own padding.
-        let gy = py + CAL_HEADER_H + CAL_WKD_H;
-        let ground = at(px + 2, gy + CAL_CELL_H);
-        let mut rows = Vec::new();
-        for row in 0..6 {
-            let mut cols = Vec::new();
-            for col in 0..7 {
-                let x0 = px + CAL_PAD + col * CAL_CELL_W;
-                let y0 = gy + row * CAL_CELL_H;
-                let mut ink: Ink = Vec::new();
-                for y in (y0 + 3)..(y0 + CAL_CELL_H - 3) {
-                    for x in (x0 + 4)..(x0 + CAL_CELL_W - 4) {
-                        let c = at(x, y);
-                        if c != ground && !ink.contains(&c) {
-                            ink.push(c);
-                        }
-                    }
-                }
-                cols.push(ink);
-            }
-            rows.push(cols);
-        }
-        (rows, hits)
-    }
-
-    /// Every day of a month lands in the cell its weekday says, and nothing
-    /// lands anywhere else. The grid is the one place in the panel where an
-    /// off-by-one is a wrong answer and not a wrong pixel.
-    #[test]
-    fn every_day_of_a_month_lands_under_its_own_weekday() {
-        let (year, month) = (2021, 0);
-        let first = sysinfo::first_weekday_mon0(year, month) as i32;
-        let ndays = sysinfo::days_in_month(year, month) as i32;
-        assert_eq!((first, ndays), (4, 31), "January 2021 began on a Friday");
-        let (cells, _) = cal_cells(year, month);
-        for (row, cols) in cells.iter().enumerate() {
-            for (col, ink) in cols.iter().enumerate() {
-                let day = (row as i32 * 7 + col as i32) - first + 1;
-                let wanted = (1..=ndays).contains(&day);
-                assert_eq!(
-                    !ink.is_empty(),
-                    wanted,
-                    "row {row} col {col} should {} hold a day",
-                    if wanted { "" } else { "not" }
-                );
-            }
-        }
-    }
-
-    /// The two weekend columns are drawn dimmer than the five weekdays, the
-    /// way every other desktop calendar draws them. Saturday is one of the
-    /// two, which is what the comparison is for.
-    #[test]
-    fn the_weekend_columns_are_drawn_dimmer_than_the_weekdays() {
-        let (cells, _) = cal_cells(2021, 0);
-        // The first row holds Friday the 1st through Sunday the 3rd.
-        let friday = &cells[0][4];
-        let saturday = &cells[0][5];
-        let sunday = &cells[0][6];
-        assert!(!friday.is_empty() && !saturday.is_empty() && !sunday.is_empty());
-        assert_ne!(friday, saturday, "Saturday is drawn as a weekday");
-        assert_eq!(saturday, sunday, "the two weekend days differ");
-    }
-
-    /// The month is named in full over the grid. The short form is the date
-    /// pill's, where there is no room, and it is three letters where this has
-    /// room for the word.
-    #[test]
-    fn the_calendar_names_its_month_in_full() {
-        let (year, month) = (2021, 0);
-        let kind = PopupKind::Calendar { year, month };
-        let (pw, ph) = popup_size(&kind, 1080, 34);
-        let (px, py) = (POPUP_SHADOW, POPUP_SHADOW);
-        let (w, h) = (
-            (pw + 2 * POPUP_SHADOW) as usize,
-            (ph + 2 * POPUP_SHADOW) as usize,
-        );
-        let buf = painted(w, h, |cv| {
-            let _ = draw_calendar(cv, px, py, pw, ph, year, month);
-        });
-        let at = |x: i32, y: i32| {
-            let i = ((y as usize * w) + x as usize) * 4;
-            [buf[i + 2], buf[i + 1], buf[i]]
-        };
-        // Between the two arrows, the width of what is written there.
-        let ground = at(px + pw / 2, py + 2);
-        let (mut lo, mut hi) = (i32::MAX, i32::MIN);
-        for x in (px + 44)..(px + pw - 44) {
-            for y in py..(py + CAL_HEADER_H - 1) {
-                if at(x, y) != ground {
-                    lo = lo.min(x);
-                    hi = hi.max(x);
-                }
-            }
-        }
-        let title = format!(
-            "{} {}",
-            i18n::Lang::current().month_full()[month as usize],
-            year
-        );
-        let want = Canvas::text_width(&title);
-        assert!(hi > lo, "nothing written over the grid");
-        assert!(
-            (hi - lo + 1 - want).abs() <= 2,
-            "{}px of title where {want}px was expected",
-            hi - lo + 1
-        );
-    }
-
-    /// The arrow on the left goes back a month and the one on the right goes
-    /// forward. Swapped, the calendar walks the wrong way under the pointer.
-    #[test]
-    fn the_calendars_arrows_go_the_way_they_point() {
-        let (_, hits) = cal_cells(2021, 0);
-        let prev = hits
-            .iter()
-            .find(|h| h.4 == Action::PrevMonth)
-            .expect("no way back");
-        let next = hits
-            .iter()
-            .find(|h| h.4 == Action::NextMonth)
-            .expect("no way forward");
-        assert!(prev.0 < next.0, "the arrows are the wrong way round");
-    }
-}
+#[path = "main_tests/tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod look_wiring_tests {
-    use super::*;
-
-    /// Every look, so a row added to `Look` without a row here fails to compile
-    /// rather than quietly inheriting whatever the `_` arm says.
-    const LOOKS: [Look; 3] = [Look::Eclipse, Look::Kde, Look::Win11];
-
-    #[test]
-    fn each_look_wears_its_own_palette() {
-        // A row wired to the wrong palette dresses the panel as another
-        // desktop, which reads as a setting that did not take rather than as a
-        // bug anyone reports. By value and not by pointer: `PAL_*` are `const`,
-        // so each `&PAL_ECLIPSE` is promoted separately and `ptr::eq` against
-        // one from here is false even when the arm is right. The pairwise check
-        // below is what rules out two arms reaching one palette.
-        assert_eq!(*pal_of(Look::Eclipse), PAL_ECLIPSE);
-        assert_eq!(*pal_of(Look::Kde), PAL_KDE);
-        assert_eq!(*pal_of(Look::Win11), PAL_WIN11);
-        // And no two looks share one, which is what a copy-pasted arm leaves
-        // behind: with `Kde => &PAL_WIN11` the panel comes up grey-less and
-        // nothing above would have caught it from a single row.
-        for (i, a) in LOOKS.iter().enumerate() {
-            for b in &LOOKS[i + 1..] {
-                assert_ne!(pal_of(*a), pal_of(*b), "{a:?} and {b:?} share one palette");
-            }
-        }
-        // The default look reaches the palette the image is built around: the
-        // wallpaper, the icon theme and the accent are all drawn for this one.
-        assert_eq!(*pal_of(Look::default()), PAL_ECLIPSE);
-    }
-
-    #[test]
-    fn a_palette_keeps_the_colours_its_comment_cites() {
-        // The hexes each palette's doc comment quotes from the desktop it
-        // imitates. A changed constant here moves the whole bar's hue, and a
-        // screenshot is the only place it shows -- which is nowhere in CI.
-        assert_eq!(PAL_KDE.bar_bg, (0x2a, 0x2e, 0x32), "Breeze window");
-        assert_eq!(PAL_KDE.pill, (0x1b, 0x1e, 0x20), "Breeze view");
-        assert_eq!(PAL_KDE.text, (0xfc, 0xfc, 0xfc), "Breeze text");
-        assert_eq!(PAL_KDE.dim, (0x7f, 0x8c, 0x8d), "Breeze inactive text");
-        assert_eq!(PAL_KDE.accent, (0x3d, 0xae, 0xe9), "Breeze selection");
-        assert_eq!(PAL_KDE.warn, (0xda, 0x44, 0x53), "Breeze negative");
-        assert_eq!(PAL_WIN11.bar_bg, (0x20, 0x20, 0x20), "Win11 taskbar");
-        assert_eq!(PAL_WIN11.menu_panel, (0x2b, 0x2b, 0x2b), "Win11 flyout");
-        assert_eq!(PAL_WIN11.accent, (0x00, 0x78, 0xd4), "Win11 accent");
-        assert_eq!(PAL_WIN11.muted, (0xc5, 0xc5, 0xc5), "Win11 secondary text");
-        assert_eq!(PAL_WIN11.warn, (0xe8, 0x11, 0x23), "Win11 critical");
-    }
-
-    #[test]
-    fn no_palette_hides_one_of_its_roles_behind_another() {
-        // The invariants that hold whatever the hues are, because the drawing
-        // code leans on them: a swap inside one palette does not change any
-        // single colour, so nothing above this catches it, and the result is
-        // text that cannot be read rather than a bar in the wrong colour.
-        for look in LOOKS {
-            let p = pal_of(look);
-            let lum = |(r, g, b): Rgb| 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
-            // Live text over muted over dim: three tiers the bar uses to say
-            // what is running, what is a reading and what is minimised.
-            assert!(
-                lum(p.text) > lum(p.muted),
-                "{look:?}: primary text is not brighter than module text"
-            );
-            assert!(
-                lum(p.muted) > lum(p.dim),
-                "{look:?}: module text is not brighter than the dim text"
-            );
-            // Every text tier has to come off the ground it is painted on, or
-            // the bar reads as blank. 40 levels of luminance is about where a
-            // reading stops being legible on a dark panel.
-            for (name, c) in [("text", p.text), ("muted", p.muted), ("dim", p.dim)] {
-                assert!(
-                    (lum(c) - lum(p.bar_bg)).abs() > 40.0,
-                    "{look:?}: {name} does not come off the bar ground"
-                );
-            }
-            // A hover has to be visible against what it hovers over, in both
-            // the pill and the menu: equal colours mean no hover feedback at
-            // all, which is exactly what a copy-paste leaves behind.
-            assert_ne!(p.pill, p.pill_hover, "{look:?}: the pill has no hover");
-            assert_ne!(
-                p.menu_panel, p.menu_hover,
-                "{look:?}: the menu rows have no hover"
-            );
-            // The active taskbar button has to be told from the bar itself,
-            // otherwise nothing on screen says which window has the focus.
-            assert_ne!(
-                p.btn_active, p.bar_bg,
-                "{look:?}: the active button is the bar ground"
-            );
-            // `white` is the text drawn over `btn_active` and over the accent,
-            // so it is the brightest thing in the palette, not a hue.
-            let (r, g, b) = p.white;
-            assert!(
-                r > 0xf0 && g > 0xf0 && b > 0xf0,
-                "{look:?}: the active-button text is not a white"
-            );
-        }
-        // The accent carries a hue in all three: it is the one coloured thing
-        // on an otherwise grey bar, and a grey accent loses the launcher glyph.
-        for look in LOOKS {
-            let (r, g, b) = pal_of(look).accent;
-            let spread = r.max(g).max(b) - r.min(g).min(b);
-            assert!(spread > 0x30, "{look:?}: the accent has no hue");
-        }
-    }
-
-    #[test]
-    fn the_single_bar_looks_are_the_ones_with_a_bottom_panel_only() {
-        // Eclipse's layout is a top info bar PLUS a bottom taskbar; KDE and
-        // Windows both have one bottom panel. Getting this wrong leaves a bar
-        // drawn over the top of the screen that the look has no room for, or
-        // loses the clock entirely.
-        assert!(!single_bar_of(Look::Eclipse));
-        assert!(single_bar_of(Look::Kde));
-        assert!(single_bar_of(Look::Win11));
-        // Windows 11, and only Windows 11, centres its taskbar buttons: that
-        // one detail is most of what makes the screenshot read as Windows.
-        assert!(centered_tasks_of(Look::Win11));
-        assert!(!centered_tasks_of(Look::Kde));
-        assert!(!centered_tasks_of(Look::Eclipse));
-        // Centred buttons only make sense on a single bar -- the taskbar is the
-        // bar being centred -- so the one implies the other.
-        for look in LOOKS {
-            assert!(
-                !centered_tasks_of(look) || single_bar_of(look),
-                "{look:?} centres its tasks without having a taskbar to centre"
-            );
-        }
-    }
-
-    #[test]
-    fn only_the_win11_bar_is_translucent_and_the_two_flags_agree() {
-        // `translucent()` is what decides between an ARGB and an XRGB buffer in
-        // `configure`, while `bar_alpha()` is what `clear_bar` fills with: the
-        // two disagreeing means either a bar filled with alpha onto an opaque
-        // buffer (a black bar) or an ARGB buffer filled opaque (a wasted
-        // format change), so they are derived from one another and checked
-        // together.
-        assert_eq!(bar_alpha_of(Look::Win11), 0.85, "Win11 acrylic");
-        assert_eq!(bar_alpha_of(Look::Kde), 1.0);
-        assert_eq!(bar_alpha_of(Look::Eclipse), 1.0);
-        assert!(translucent_of(Look::Win11));
-        assert!(!translucent_of(Look::Kde));
-        assert!(!translucent_of(Look::Eclipse));
-        for look in LOOKS {
-            let a = bar_alpha_of(look);
-            assert_eq!(
-                translucent_of(look),
-                a < 1.0,
-                "{look:?}: the buffer format and the fill alpha disagree"
-            );
-            // An alpha outside (0, 1] is a bar that is either invisible or an
-            // out-of-range fill: `fill_rect_a` takes it as a fraction.
-            assert!(a > 0.0 && a <= 1.0, "{look:?}: alpha {a} is out of range");
-        }
-    }
-
-    #[test]
-    fn a_translucent_bar_is_filled_in_a_way_that_keeps_its_alpha() {
-        // `clear_bar` picks between `fill_rect_a` and `clear`, and only one of
-        // the two honours the alpha. The bug it exists for is `Canvas::clear`
-        // being unconditionally opaque and so silently defeating the ARGB
-        // buffer `configure` asked the compositor for -- a bar that reads as
-        // solid black over the wallpaper. What shows it is the alpha channel
-        // of the blitted pixels, which is the only place the fill differs.
-        let bg = pal_of(Look::Win11).bar_bg;
-        let (w, h) = (8usize, 4usize);
-        let fill = |alpha: f32| -> Vec<u8> {
-            let mut cv = Canvas::try_new(w, h).expect("canvas");
-            clear_bar_with(&mut cv, w, h, bg, alpha);
-            let mut buf = vec![0u8; w * h * 4];
-            assert!(cv.blit_argb(&mut buf));
-            buf
-        };
-        let opaque = fill(1.0);
-        let acrylic = fill(bar_alpha_of(Look::Win11));
-        // An opaque bar is the ground itself, every pixel of it.
-        for px in opaque.chunks(4) {
-            assert_eq!(px[3], 0xff, "an opaque fill left a see-through pixel");
-        }
-        // The translucent one carries the alpha it was given, and not 0xff:
-        // 0.85 of 255 rounds to 217.
-        let want = (bar_alpha_of(Look::Win11) * 255.0).round() as u8;
-        for px in acrylic.chunks(4) {
-            assert_eq!(
-                px[3], want,
-                "the alpha never reached the pixels: the ARGB buffer is wasted"
-            );
-        }
-        // Both fills cover the WHOLE bar: a rect short by a row leaves the
-        // last line of the panel transparent, which on an ARGB surface is a
-        // see-through strip along the screen edge.
-        assert!(
-            acrylic.chunks(4).all(|px| px[3] > 0),
-            "the fill did not reach every pixel of the bar"
-        );
-    }
-}
+#[path = "main_tests/look_wiring.rs"]
+mod look_wiring_tests;
