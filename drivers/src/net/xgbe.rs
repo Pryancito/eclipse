@@ -2643,6 +2643,155 @@ fn write_packed_bytes(
     }
 }
 
+// ——— Store and forward, and who goes first ———
+
+/// `MTL_Q_TQOMR_TSF`, index **1**, width 1: store the whole frame before
+/// starting to transmit it.
+///
+/// Index 1, not 0. Bit 0 of this register is `FTQ`, the flush of batch six:
+/// a store-and-forward bit written from the bottom of the word empties the
+/// queue instead.
+pub const MTL_Q_TQOMR_TSF: (u32, u32) = (1, 1);
+/// `MTL_Q_TQOMR_TTC`, index 4, width **3**: how much of a frame to collect
+/// before starting, when store-and-forward is off.
+pub const MTL_Q_TQOMR_TTC: (u32, u32) = (4, 3);
+/// `MTL_Q_RQOMR_RSF`, index **5**, width 1: the receive side's
+/// store-and-forward.
+///
+/// Not index 1. The two store-and-forward bits carry the same name and sit
+/// four bits apart in the two matching registers.
+pub const MTL_Q_RQOMR_RSF: (u32, u32) = (5, 1);
+/// `MTL_Q_RQOMR_RTC`, index 0, width **2**: the receive threshold. Different
+/// index and different width from the transmit one.
+pub const MTL_Q_RQOMR_RTC: (u32, u32) = (0, 2);
+
+/// `MTL_OMR`: the MTL's own operating mode, one register for the block.
+pub const MTL_OMR: usize = 0x1000;
+/// `MTL_OMR_RAA`, index 2, width 1: the receive arbitration algorithm.
+pub const MTL_OMR_RAA: (u32, u32) = (2, 1);
+/// `MTL_OMR_ETSALG`, index 5, width 2: the transmit scheduling algorithm.
+pub const MTL_OMR_ETSALG: (u32, u32) = (5, 2);
+/// `MTL_ETSALG_WRR`: weighted round robin. **Zero.**
+pub const MTL_ETSALG_WRR: u32 = 0x00;
+/// `MTL_RAA_SP`: strict priority. **Also zero.**
+///
+/// Both scheduler selections are zero, so the whole of
+/// [`config_mtl_scheduling`]'s first half writes nothing but zeroes. That
+/// reads like dead code and is not: the register is not guaranteed to come
+/// up this way, and the traffic-class half below is not zero at all.
+pub const MTL_RAA_SP: u32 = 0x00;
+
+/// `MTL_TC_ETSCR`, inside the same per-index block as the queue registers.
+pub const MTL_TC_ETSCR: usize = 0x10;
+/// `MTL_TC_QWR`, likewise.
+pub const MTL_TC_QWR: usize = 0x18;
+/// `MTL_TC_ETSCR_TSA`, index 0, width 2.
+pub const MTL_TC_ETSCR_TSA: (u32, u32) = (0, 2);
+/// `MTL_TC_QWR_QW`, index 0, width 21.
+pub const MTL_TC_QWR_QW: (u32, u32) = (0, 21);
+/// `MTL_TSA_ETS`: enhanced transmission selection.
+pub const MTL_TSA_ETS: u32 = 0x02;
+
+/// A traffic class's register block. `MTL_TC_BASE` **is** `MTL_Q_BASE` and
+/// `MTL_TC_INC` **is** `MTL_Q_INC`: traffic class N and queue N share one
+/// 0x80 block, with the queue registers at 0x00 and 0x40 and the class
+/// registers at 0x10 and 0x18 inside it.
+///
+/// So there is no separate base to get wrong --- but a class index above the
+/// queue count lands squarely in some other queue's block, which is why
+/// [`config_tc_weights`] refuses one.
+#[inline]
+pub const fn mtl_tc_reg(tc: u32, reg: usize) -> usize {
+    mtl_queue_reg(tc, reg)
+}
+
+/// Whether a queue holds a whole frame before moving it on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forwarding {
+    /// Wait for the whole frame. What this driver wants: a frame that
+    /// under-runs halfway out of the port is a frame on the wire with a bad
+    /// CRC.
+    StoreAndForward,
+    /// Start once `threshold` units have arrived. The threshold is the raw
+    /// `TTC`/`RTC` value, which means different byte counts on the two
+    /// sides.
+    CutThrough { threshold: u32 },
+}
+
+/// Set the transmit queues' forwarding mode and threshold.
+///
+/// The threshold is written even in store-and-forward, where the hardware
+/// ignores it, which is what Linux does. It is not dead: it is what the
+/// queue falls back to if store-and-forward is ever turned off, and leaving
+/// it at whatever the last configuration set is worse than setting it.
+pub fn config_tx_forwarding(acc: &dyn MmioAccess, queues: u32, mode: Forwarding) {
+    let (sf, ttc) = match mode {
+        Forwarding::StoreAndForward => (1, 0),
+        Forwarding::CutThrough { threshold } => (0, threshold),
+    };
+    for q in 0..queues {
+        let reg = mtl_queue_reg(q, MTL_Q_TQOMR);
+        write_field(acc, reg, MTL_Q_TQOMR_TSF.0, MTL_Q_TQOMR_TSF.1, sf);
+        write_field(acc, reg, MTL_Q_TQOMR_TTC.0, MTL_Q_TQOMR_TTC.1, ttc);
+    }
+}
+
+/// The same for the receive queues, with the other register's other
+/// positions.
+pub fn config_rx_forwarding(acc: &dyn MmioAccess, queues: u32, mode: Forwarding) {
+    let (sf, rtc) = match mode {
+        Forwarding::StoreAndForward => (1, 0),
+        Forwarding::CutThrough { threshold } => (0, threshold),
+    };
+    for q in 0..queues {
+        let reg = mtl_queue_reg(q, MTL_Q_RQOMR);
+        write_field(acc, reg, MTL_Q_RQOMR_RSF.0, MTL_Q_RQOMR_RSF.1, sf);
+        write_field(acc, reg, MTL_Q_RQOMR_RTC.0, MTL_Q_RQOMR_RTC.1, rtc);
+    }
+}
+
+/// Pick the two scheduling algorithms. The first half of
+/// `xgbe_config_mtl_mode`.
+pub fn config_mtl_scheduling(acc: &dyn MmioAccess) {
+    write_field(
+        acc,
+        MTL_OMR,
+        MTL_OMR_ETSALG.0,
+        MTL_OMR_ETSALG.1,
+        MTL_ETSALG_WRR,
+    );
+    write_field(acc, MTL_OMR, MTL_OMR_RAA.0, MTL_OMR_RAA.1, MTL_RAA_SP);
+}
+
+/// Give every traffic class the same weight. The second half.
+///
+/// Equal weights, so the classes share the link evenly, which is the only
+/// honest default for a driver that has no idea what the classes are for.
+pub fn config_tc_weights(acc: &dyn MmioAccess, tc_count: u32, queues: u32) -> DeviceResult<()> {
+    if tc_count == 0 || tc_count > queues {
+        // A class above the queue count would write into another queue's
+        // block, since the two share one.
+        return Err(DeviceError::InvalidParam);
+    }
+    for tc in 0..tc_count {
+        write_field(
+            acc,
+            mtl_tc_reg(tc, MTL_TC_ETSCR),
+            MTL_TC_ETSCR_TSA.0,
+            MTL_TC_ETSCR_TSA.1,
+            MTL_TSA_ETS,
+        );
+        write_field(
+            acc,
+            mtl_tc_reg(tc, MTL_TC_QWR),
+            MTL_TC_QWR_QW.0,
+            MTL_TC_QWR_QW.1,
+            1,
+        );
+    }
+    Ok(())
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
