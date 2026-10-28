@@ -3260,33 +3260,19 @@ impl LinuxRootfs {
         let runner = out.join("lunarrun");
         let browser = out.join("lunarfile");
         let clipboard = out.join("lunarclip");
-        // Rebuild when any source file is newer than the binaries. Every
-        // module is listed: a stale entry here means a source change that
-        // silently does not reach the image.
+        // Rebuild when any source file is newer than the binaries. The whole
+        // `src/` tree is walked rather than listed: the list this replaced
+        // missed `hunter.rs` and `hunter_menu.rs` the day they arrived, and a
+        // module missing from it is a source change that silently never
+        // reaches the image.
         let newest_src = [
-            "src/main.rs",
-            "src/bin/lunarrun.rs",
-            "src/bin/lunarfile.rs",
-            "src/bin/lunarclip.rs",
-            "src/lib.rs",
-            "src/apps.rs",
-            "src/clip.rs",
-            "src/draw.rs",
-            "src/fill_guard.rs",
-            "src/files.rs",
-            "src/i18n.rs",
-            "src/icons.rs",
-            "src/keys.rs",
-            "src/list.rs",
-            "src/look.rs",
-            "src/open.rs",
-            "src/par.rs",
-            "src/proc.rs",
-            "src/sysinfo.rs",
-            "Cargo.toml",
+            newest_mtime_under(&dir.join("src")),
+            fs::metadata(dir.join("Cargo.toml"))
+                .ok()
+                .and_then(|m| m.modified().ok()),
         ]
-        .iter()
-        .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
+        .into_iter()
+        .flatten()
         .max();
         // ALL FOUR must exist and be current: a tree built before lunarclip
         // existed has an up-to-date lunarbar, lunarrun and lunarfile and no
@@ -5834,5 +5820,58 @@ mod apk_closure_tests {
             vec!["riscv64"],
             "solo riscv64 tiene techo de RAM; si aparece otro, que sea con su motivo escrito"
         );
+    }
+}
+
+/// The newest modification time of any file under `dir`, recursively.
+fn newest_mtime_under(dir: &Path) -> Option<std::time::SystemTime> {
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let ty = e.file_type().ok()?;
+            if ty.is_dir() {
+                newest_mtime_under(&e.path())
+            } else {
+                e.metadata().ok()?.modified().ok()
+            }
+        })
+        .max()
+}
+
+#[cfg(test)]
+mod newest_mtime_tests {
+    use super::newest_mtime_under;
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+
+    /// A file in a subdirectory counts: `main_tests/` and any future
+    /// submodule directory must trigger a rebuild like `src/` itself.
+    #[test]
+    fn a_nested_file_is_found_and_the_newest_wins() {
+        let root = std::env::temp_dir().join(format!("newest-mtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        let old = root.join("top.rs");
+        let new = root.join("a/b/deep.rs");
+        fs::write(&old, "").unwrap();
+        fs::write(&new, "").unwrap();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let t1 = t0 + Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(t0)
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&new)
+            .unwrap()
+            .set_modified(t1)
+            .unwrap();
+        assert_eq!(newest_mtime_under(&root), Some(t1));
+        assert_eq!(newest_mtime_under(&root.join("missing")), None);
+        fs::remove_dir_all(&root).unwrap();
     }
 }
