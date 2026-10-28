@@ -1133,7 +1133,8 @@ fn gem_new_allocates_under_the_context_of_the_process_that_asked() {
     );
     // And `gem_owner_ctx` answers from that pid: its ready context, or the
     // one it builds for it -- never a constant.
-    let f = &src[src
+    let owner = include_str!("../gem_owner.rs");
+    let f = &owner[owner
         .find("fn gem_owner_ctx(&self, owner_pid: u64) -> u32 {")
         .expect("gem_owner_ctx")..];
     let f = &f[..f.find("\n    }\n").expect("its end")];

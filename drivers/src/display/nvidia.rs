@@ -199,6 +199,11 @@ mod vram_alloc;
 /// Where `GEM_NEW` puts an object; with `nvidia.gem_vram`, a scanout buffer
 /// in VRAM mapped through BAR1 by the RM (replaces `vram_bar1`).
 pub(super) mod gem_vram;
+
+/// Which process's RM client a `GEM_NEW` object is allocated under, so
+/// `nvidia-smi` bills it to that process; own file for the size ceiling.
+mod gem_owner;
+
 /// CPU-mapping a VRAM `GEM_NEW` object through the BAR1 aperture: the
 /// arithmetic and the bounds check, own file for the size ceiling. The hatch
 /// is `nvidia.gem_vram_bar1`, default off.
@@ -11385,88 +11390,6 @@ impl NvidiaGpu {
     /// on this GPU, every client's included, like Linux's
     /// `ttm_resource_manager_usage(vram_mgr)`. GART objects live in system
     /// memory and do not count.
-    /// The context a new GEM object of `owner_pid` is allocated under: its
-    /// ready context, or, for a uvmm client, the one built now. See the
-    /// `GEM_NEW` arm. 0 is the shared kernel client, whose memory no process
-    /// is billed for; the first such VRAM object of a pid says so.
-    fn gem_owner_ctx(&self, owner_pid: u64) -> u32 {
-        let ready = self.ctx_idx_for_pid(owner_pid);
-        if ready != 0 || !super::nouveau_uapi::gem_owner_early() {
-            return ready;
-        }
-        if !self.nouveau_has_uvmm(owner_pid) {
-            return 0;
-        }
-        let is_compositor = self.ctx0_is_owner(owner_pid);
-        let (ctx_idx, _, _) = self.ensure_ctx_for_pid(owner_pid, is_compositor);
-        if ctx_idx != 0 {
-            crate::klog_info!(
-                "[nouveau-uapi] GEM_NEW: pid={} had no context yet -> built CTX {} so its memory is billed to it",
-                owner_pid,
-                ctx_idx
-            );
-        } else {
-            crate::klog_warn!(
-                "[nouveau-uapi] GEM_NEW: pid={} has no context of its own -> object on the shared client, \
-                 nvidia-smi bills it to no process",
-                owner_pid
-            );
-        }
-        ctx_idx
-    }
-
-    /// `/proc/gpudbg`: the live GEM objects of this GPU by process, VRAM and
-    /// host memory apart. Only VRAM shows in `nvidia-smi` (as on Linux), and
-    /// only an object with its own context (`ctx` not 0) shows under its
-    /// process; `ctx0` is VRAM the total counts and no process does.
-    fn format_gem_by_pid(&self) -> String {
-        use super::nouveau_uapi::NOUVEAU_GEM_DOMAIN_VRAM;
-        use core::fmt::Write;
-        // (pid, vram, sysmem, vram in ctx 0, objects)
-        let mut rows: Vec<(u64, u64, u64, u64, u32)> = Vec::new();
-        for o in self.nouveau_gem.lock().iter() {
-            let i = match rows.iter().position(|r| r.0 == o.owner_pid) {
-                Some(i) => i,
-                None => {
-                    rows.push((o.owner_pid, 0, 0, 0, 0));
-                    rows.len() - 1
-                }
-            };
-            let r = &mut rows[i];
-            if o.domain & NOUVEAU_GEM_DOMAIN_VRAM != 0 {
-                r.1 += o.size;
-                if o.owner_ctx == 0 {
-                    r.3 += o.size;
-                }
-            } else {
-                r.2 += o.size;
-            }
-            r.4 += 1;
-        }
-        let kib = |b: u64| b / 1024;
-        let mut s = String::new();
-        let _ = writeln!(
-            s,
-            "[gpudbg] --- live GEM by process (nvidia-smi bills VRAM only) ---"
-        );
-        if rows.is_empty() {
-            let _ = writeln!(s, "[gpudbg]  (no live GEM objects on this GPU)");
-        }
-        for (pid, vram, sys, ctx0, n) in rows {
-            let _ = writeln!(
-                s,
-                "[gpudbg]  pid={} ctx={} objects={} vram={} KiB (ctx0, unbilled: {} KiB) sysmem={} KiB",
-                pid,
-                self.ctx_idx_for_pid(pid),
-                n,
-                kib(vram),
-                kib(ctx0),
-                kib(sys)
-            );
-        }
-        s
-    }
-
     fn nouveau_vram_used(&self) -> u64 {
         self.nouveau_gem
             .lock()
