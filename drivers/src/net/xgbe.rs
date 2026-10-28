@@ -1547,6 +1547,308 @@ pub fn disable_rx(
     }
 }
 
+// ——— Handing the chip its rings ———
+//
+// The last configuration step before anything moves: telling each channel
+// where its descriptor ring is, how long it is, and --- for receive only ---
+// how far into it the driver has filled.
+
+/// `DMA_CH_RCR_RBSZ`, index **1**, width 14: the receive buffer size.
+///
+/// Index 1, not 0, so the value sits shifted by one bit in the register. The
+/// bottom bit belongs to `SR` (start receive), which is why a buffer size
+/// written at index 0 would start the engine as a side effect of being an odd
+/// number of bytes.
+pub const DMA_CH_RCR_RBSZ: (u32, u32) = (1, 14);
+
+/// Program a transmit ring into its channel.
+///
+/// `ring_paddr` is the physical address of descriptor 0, `count` the number
+/// of descriptors.
+///
+/// Two things to get right, and neither reports anything when wrong:
+///
+/// * The length register takes **`count - 1`**: it is a last index, not a
+///   count. Writing the count gives the engine one descriptor more than
+///   exists, which it will happily fetch from whatever follows the ring.
+/// * The address halves go in **high first** (see [`DMA_CH_TDLR`]).
+///
+/// There is deliberately **no tail pointer** here. A transmit ring starts
+/// empty: the driver has nothing for the engine to fetch, and the tail is
+/// written later, when a frame is queued. Writing one now would point the
+/// engine at descriptors the driver has not filled in.
+pub fn program_tx_ring(
+    acc: &dyn MmioAccess,
+    channel: u32,
+    ring_paddr: u64,
+    count: u32,
+) -> DeviceResult<()> {
+    if count == 0 {
+        return Err(DeviceError::InvalidParam);
+    }
+    let (hi, lo) = split_ring_addr(ring_paddr);
+
+    acc.write32(dma_channel_reg(channel, DMA_CH_TDRLR), count - 1);
+    acc.write32(dma_channel_reg(channel, DMA_CH_TDLR_HI), hi);
+    acc.write32(dma_channel_reg(channel, DMA_CH_TDLR_LO), lo);
+    Ok(())
+}
+
+/// Program a receive ring into its channel, and set the buffer size.
+///
+/// Same two rules as [`program_tx_ring`], plus the one that makes receive
+/// different: it **does** get a tail pointer, and the tail points at the
+/// address of the **last descriptor**, not one past the end.
+///
+/// That is the opposite of the usual convention and the reason it is spelled
+/// out here. The tail is "the last descriptor the driver owns"; a receive
+/// ring starts with every descriptor handed to the engine, so the tail is the
+/// last one. One past the end would be `ring_paddr + count * 16`, an address
+/// outside the ring, and the engine would fetch a descriptor from whatever
+/// the allocator put there next.
+pub fn program_rx_ring(
+    acc: &dyn MmioAccess,
+    channel: u32,
+    ring_paddr: u64,
+    count: u32,
+    buffer_size: u32,
+) -> DeviceResult<()> {
+    if count == 0 || buffer_size == 0 || buffer_size >= (1 << DMA_CH_RCR_RBSZ.1) {
+        return Err(DeviceError::InvalidParam);
+    }
+    let (hi, lo) = split_ring_addr(ring_paddr);
+
+    write_field(
+        acc,
+        dma_channel_reg(channel, DMA_CH_RCR),
+        DMA_CH_RCR_RBSZ.0,
+        DMA_CH_RCR_RBSZ.1,
+        buffer_size,
+    );
+
+    acc.write32(dma_channel_reg(channel, DMA_CH_RDRLR), count - 1);
+    acc.write32(dma_channel_reg(channel, DMA_CH_RDLR_HI), hi);
+    acc.write32(dma_channel_reg(channel, DMA_CH_RDLR_LO), lo);
+
+    let last = ring_paddr + ((count - 1) as u64) * core::mem::size_of::<Desc>() as u64;
+    acc.write32(dma_channel_reg(channel, DMA_CH_RDTR_LO), last as u32);
+    Ok(())
+}
+
+/// Whether descriptor `index` should ask for an interrupt, given the receive
+/// coalescing settings. `xgbe_rx_desc_reset`.
+///
+/// With no coalescing at all, every descriptor interrupts. With a frame count
+/// set, every `rx_frames`-th one does --- counted on `index + 1`, so the
+/// *last* descriptor of each group carries the flag and not the first.
+#[inline]
+pub const fn rx_desc_wants_interrupt(index: u32, rx_usecs: u32, rx_frames: u32) -> bool {
+    if rx_usecs == 0 && rx_frames == 0 {
+        return true;
+    }
+    rx_frames != 0 && (index + 1).is_multiple_of(rx_frames)
+}
+
+/// Build a receive descriptor, ready except for its `OWN` bit.
+///
+/// A receive descriptor carries **two** buffers: the header buffer in
+/// `desc0`/`desc1` and the payload buffer in `desc2`/`desc3`, each as a full
+/// 64-bit address in low-then-high order. Which means all four words are
+/// address --- and `desc3`, the high half of the payload address, is **also**
+/// where `OWN` and `INTE` live.
+///
+/// So the control bits are OR'd into an address word. It works because a
+/// physical address has nothing in its top bits, but it has two consequences
+/// worth stating: writing `desc3` as "just the address" clears `OWN`, and
+/// writing it as "just the flags" destroys the payload address.
+///
+/// The `OWN` bit is left off here on purpose. Linux sets it in a separate
+/// write with a barrier either side, because the receive engine may already
+/// be running over this ring: everything else must be visible before the
+/// descriptor is handed over, and the handover must be visible before
+/// anything else happens. Returning the descriptor without `OWN` makes that
+/// ordering the caller's explicit step instead of a detail buried in here.
+#[inline]
+pub fn rx_desc_init(hdr_dma: u64, buf_dma: u64, wants_interrupt: bool) -> Desc {
+    let (hdr_hi, hdr_lo) = split_ring_addr(hdr_dma);
+    let (buf_hi, buf_lo) = split_ring_addr(buf_dma);
+    let mut desc3 = buf_hi;
+    if wants_interrupt {
+        desc3 |= DESC3_CTXT; // RX_NORMAL_DESC3_INTE, the same bit 30.
+    }
+    Desc {
+        desc0: hdr_lo,
+        desc1: hdr_hi,
+        desc2: buf_lo,
+        desc3,
+    }
+}
+
+// ——— Putting a frame into the transmit ring ———
+
+/// `TX_NORMAL_DESC2_HL_B1L`, index 0, width 14: the length of *this*
+/// fragment. See [`TX_DESC3_FL`] for the other length in the same
+/// descriptor.
+pub const TX_DESC2_HL_B1L: (u32, u32) = (0, 14);
+/// `TX_NORMAL_DESC2_VTIR`, index 14, width 2: what to do with a VLAN tag.
+pub const TX_DESC2_VTIR: (u32, u32) = (14, 2);
+/// `TX_NORMAL_DESC2_VLAN_INSERT`, the `VTIR` value that inserts the tag the
+/// context descriptor carried.
+pub const TX_DESC2_VLAN_INSERT: u32 = 0x2;
+/// `TX_NORMAL_DESC2_TTSE`, index 30, width 1: take a transmit timestamp.
+pub const TX_DESC2_TTSE: (u32, u32) = (30, 1);
+/// `TX_NORMAL_DESC2_IC`, index 31, width 1: raise an interrupt once this
+/// descriptor completes.
+///
+/// Bit 31 of `desc2`, which is not bit 31 of `desc3`: that one is `OWN`. The
+/// two words put entirely unrelated meanings in the same position, so a field
+/// written into the wrong word still lands on a real bit and the chip obeys
+/// it.
+pub const TX_DESC2_IC: (u32, u32) = (31, 1);
+
+/// `TX_NORMAL_DESC3_FL`, index 0, width 15: the length of the WHOLE frame,
+/// written on the first descriptor only. Already masked by
+/// [`tx_desc3_frame_len`].
+pub const TX_DESC3_FL: (u32, u32) = (0, 15);
+/// `TX_NORMAL_DESC3_CIC`, index 16, width 2: checksum insertion control.
+pub const TX_DESC3_CIC: (u32, u32) = (16, 2);
+/// `TX_NORMAL_DESC3_CIC` fully on: header and payload checksums both.
+pub const TX_DESC3_CIC_FULL: u32 = 0x3;
+/// `TX_NORMAL_DESC3_CPC`, index 26, width 2: CRC and pad control. Zero means
+/// insert both, which is what an ordinary frame wants, so this driver never
+/// writes anything else --- but the field is named here because a zero is
+/// only obviously right once you know the field exists.
+pub const TX_DESC3_CPC: (u32, u32) = (26, 2);
+
+/// One fragment of an outgoing frame: a bus address and how many bytes live
+/// at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxFragment {
+    /// The address the engine will read from.
+    pub dma: u64,
+    /// How many bytes to read. Must fit [`TX_DESC2_HL_B1L`] and not be zero.
+    pub len: u32,
+}
+
+/// A frame about to be handed to the transmit engine.
+#[derive(Debug, Clone, Copy)]
+pub struct TxFrame<'a> {
+    /// The fragments, in wire order. The first becomes the first descriptor.
+    pub fragments: &'a [TxFragment],
+    /// The total length of the frame, for [`TX_DESC3_FL`]. Kept separate from
+    /// the sum of the fragment lengths because the engine reads it from one
+    /// place and the fragments from another, and
+    /// [`build_tx_frame`] checks that the two agree rather than deriving one
+    /// from the other.
+    pub total_len: u32,
+    /// Ask the chip to compute the checksums.
+    pub checksum_offload: bool,
+    /// Raise an interrupt when the frame has gone out.
+    pub wants_interrupt: bool,
+}
+
+/// Write a frame's descriptors into `ring`, starting at `start` and wrapping,
+/// and return the index of the next free descriptor. `xgbe_dev_xmit` for an
+/// ordinary frame: no segmentation offload, no VLAN insertion, no timestamp,
+/// so no context descriptor and no second pass over `desc3`'s bottom bits.
+///
+/// The first descriptor comes back WITHOUT its `OWN` bit, on purpose. Handing
+/// it over is [`hand_tx_frame_to_dma`]'s job, after the caller's barrier: an
+/// engine that is already running would otherwise be free to start on a frame
+/// whose later fragments have not been written yet. Every other descriptor is
+/// handed over as it is built, because none of them means anything until the
+/// first one says so.
+pub fn build_tx_frame(ring: &mut [Desc], start: usize, frame: &TxFrame) -> DeviceResult<usize> {
+    let count = frame.fragments.len();
+    if count == 0 || count > ring.len() || start >= ring.len() {
+        return Err(DeviceError::InvalidParam);
+    }
+    if frame.total_len == 0 || frame.total_len >= (1 << TX_DESC3_FL.1) {
+        return Err(DeviceError::InvalidParam);
+    }
+    let mut summed: u32 = 0;
+    for fragment in frame.fragments {
+        if fragment.len == 0 || fragment.len >= (1 << TX_DESC2_HL_B1L.1) {
+            return Err(DeviceError::InvalidParam);
+        }
+        summed = summed
+            .checked_add(fragment.len)
+            .ok_or(DeviceError::InvalidParam)?;
+    }
+    if summed != frame.total_len {
+        return Err(DeviceError::InvalidParam);
+    }
+
+    let len = ring.len();
+    let csum = if frame.checksum_offload {
+        set_bits(0, TX_DESC3_CIC.0, TX_DESC3_CIC.1, TX_DESC3_CIC_FULL)
+    } else {
+        0
+    };
+
+    for (i, fragment) in frame.fragments.iter().enumerate() {
+        let (hi, lo) = split_ring_addr(fragment.dma);
+        let mut desc2 = set_bits(0, TX_DESC2_HL_B1L.0, TX_DESC2_HL_B1L.1, fragment.len);
+        let mut desc3 = csum;
+        if i == 0 {
+            // FL and FD go on the first descriptor only: FL is the whole
+            // frame, while desc2's length is just this fragment.
+            desc3 |= DESC3_FD | tx_desc3_frame_len(frame.total_len);
+        } else {
+            // ... and OWN goes on every descriptor BUT the first.
+            desc3 |= DESC3_OWN;
+        }
+        if i == count - 1 {
+            desc3 |= DESC3_LD;
+            if frame.wants_interrupt {
+                // IC rides the LAST descriptor, and it lives in desc2.
+                desc2 = set_bits(desc2, TX_DESC2_IC.0, TX_DESC2_IC.1, 1);
+            }
+        }
+        ring[(start + i) % len] = Desc {
+            desc0: lo,
+            desc1: hi,
+            desc2,
+            desc3,
+        };
+    }
+
+    Ok((start + count) % len)
+}
+
+/// Set `OWN` on the frame's first descriptor, which is what actually hands the
+/// frame to the engine. The caller issues its write barrier between
+/// [`build_tx_frame`] and this call; nothing here can do it for them, because
+/// the ring is ordinary memory and the ordering that matters is the one the
+/// caller's CPU publishes.
+#[inline]
+pub fn hand_tx_frame_to_dma(ring: &mut [Desc], start: usize) {
+    ring[start].desc3 |= DESC3_OWN;
+}
+
+/// Poke the transmit engine by writing the address of the next FREE
+/// descriptor to the tail pointer. `xgbe_tx_start_xmit`.
+///
+/// Note which descriptor that is: the one AFTER the frame, not the frame's
+/// last. The transmit tail is a stop sign --- the engine runs up to it and
+/// halts --- while the receive tail of [`program_rx_ring`] points at the last
+/// descriptor the driver owns. Same register name on two rings, opposite
+/// convention.
+#[inline]
+pub fn kick_tx(acc: &dyn MmioAccess, channel: u32, next_free_paddr: u64) {
+    acc.write32(
+        dma_channel_reg(channel, DMA_CH_TDTR_LO),
+        next_free_paddr as u32,
+    );
+}
+
+/// The bus address of descriptor `index` in a ring that starts at
+/// `ring_paddr`. Both tail pointers want an address, not an index.
+#[inline]
+pub const fn desc_paddr(ring_paddr: u64, index: usize) -> u64 {
+    ring_paddr + (index as u64) * core::mem::size_of::<Desc>() as u64
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
@@ -3659,6 +3961,439 @@ mod tests {
         assert_eq!(
             *down_offsets.last().unwrap(),
             dma_channel_reg(1, DMA_CH_RCR)
+        );
+    }
+
+    // ——— Handing the chip its rings ———
+
+    #[test]
+    fn the_receive_buffer_size_field_does_not_start_at_bit_zero() {
+        // RBSZ is at index 1. Bit 0 is SR, start-receive --- so a buffer
+        // size written at index 0 would start the engine as a side effect of
+        // being an odd number of bytes.
+        assert_eq!(DMA_CH_RCR_RBSZ, (1, 14));
+        assert_eq!(DMA_CH_RCR_RBSZ.0, DMA_CH_RCR_SR.0 + DMA_CH_RCR_SR.1);
+        let fake = FakeXgmac::new();
+        program_rx_ring(&fake, 0, 0x1000, 4, 2048).unwrap();
+        let rcr = fake.read32(dma_channel_reg(0, DMA_CH_RCR));
+        assert_eq!(get_bits(rcr, DMA_CH_RCR_RBSZ.0, DMA_CH_RCR_RBSZ.1), 2048);
+        // And the engine was NOT started by writing the size.
+        assert_eq!(get_bits(rcr, DMA_CH_RCR_SR.0, DMA_CH_RCR_SR.1), 0);
+    }
+
+    #[test]
+    fn the_ring_length_register_takes_a_last_index_not_a_count() {
+        // `ring->rdesc_count - 1`. Writing the count gives the engine one
+        // descriptor more than exists, which it fetches from whatever the
+        // allocator put after the ring.
+        let fake = FakeXgmac::new();
+        program_tx_ring(&fake, 0, 0x2000, 32).unwrap();
+        assert_eq!(fake.read32(dma_channel_reg(0, DMA_CH_TDRLR)), 31);
+
+        let fake = FakeXgmac::new();
+        program_rx_ring(&fake, 1, 0x3000, 64, 2048).unwrap();
+        assert_eq!(fake.read32(dma_channel_reg(1, DMA_CH_RDRLR)), 63);
+    }
+
+    #[test]
+    fn an_empty_ring_is_refused_rather_than_written_as_minus_one() {
+        // `count - 1` on zero wraps to 0xffffffff: a ring of four billion
+        // descriptors, which is the worst possible thing to hand a bus
+        // master.
+        let fake = FakeXgmac::new();
+        assert_eq!(
+            program_tx_ring(&fake, 0, 0x2000, 0),
+            Err(DeviceError::InvalidParam)
+        );
+        assert_eq!(
+            program_rx_ring(&fake, 0, 0x2000, 0, 2048),
+            Err(DeviceError::InvalidParam)
+        );
+        // A buffer size that does not fit the field is refused too, rather
+        // than truncated to something smaller than the buffers actually are
+        // --- which would overrun nothing, but would silently split every
+        // frame.
+        assert_eq!(
+            program_rx_ring(&fake, 0, 0x2000, 4, 1 << 14),
+            Err(DeviceError::InvalidParam)
+        );
+        assert_eq!(
+            program_rx_ring(&fake, 0, 0x2000, 4, 0),
+            Err(DeviceError::InvalidParam)
+        );
+        assert!(fake.log().is_empty());
+    }
+
+    #[test]
+    fn the_ring_address_goes_in_high_half_first() {
+        let fake = FakeXgmac::new();
+        program_tx_ring(&fake, 0, 0x0000_0007_dead_0000, 16).unwrap();
+        assert_eq!(
+            written_offsets(&fake),
+            alloc::vec![
+                dma_channel_reg(0, DMA_CH_TDRLR),
+                dma_channel_reg(0, DMA_CH_TDLR_HI),
+                dma_channel_reg(0, DMA_CH_TDLR_LO),
+            ]
+        );
+        assert_eq!(fake.read32(dma_channel_reg(0, DMA_CH_TDLR_HI)), 7);
+        assert_eq!(fake.read32(dma_channel_reg(0, DMA_CH_TDLR_LO)), 0xdead_0000);
+    }
+
+    #[test]
+    fn a_transmit_ring_gets_no_tail_pointer_and_a_receive_ring_does() {
+        // A transmit ring starts EMPTY: the driver has nothing for the
+        // engine to fetch, and the tail is written later when a frame is
+        // queued. Writing one now would point the engine at descriptors
+        // nobody has filled in.
+        let fake = FakeXgmac::new();
+        program_tx_ring(&fake, 0, 0x2000, 16).unwrap();
+        assert_eq!(fake.writes_to(dma_channel_reg(0, DMA_CH_TDTR_LO)), 0);
+
+        let fake = FakeXgmac::new();
+        program_rx_ring(&fake, 0, 0x2000, 16, 2048).unwrap();
+        assert_eq!(fake.writes_to(dma_channel_reg(0, DMA_CH_RDTR_LO)), 1);
+    }
+
+    #[test]
+    fn the_receive_tail_points_at_the_last_descriptor_not_past_the_end() {
+        // The opposite of the usual convention: the tail is "the last
+        // descriptor the driver owns", and a receive ring starts with every
+        // descriptor handed over. One past the end would be an address
+        // OUTSIDE the ring, and the engine would fetch a descriptor from
+        // whatever the allocator put there next.
+        let base = 0x0000_0001_0000_0000u64;
+        let count = 8u32;
+        let fake = FakeXgmac::new();
+        program_rx_ring(&fake, 0, base, count, 2048).unwrap();
+
+        let tail = fake.read32(dma_channel_reg(0, DMA_CH_RDTR_LO));
+        let last = base + (count as u64 - 1) * 16;
+        assert_eq!(tail, last as u32);
+        // Explicitly NOT one past the end.
+        assert_ne!(tail, (base + count as u64 * 16) as u32);
+        // And it is inside the ring.
+        assert!((tail as u64) < base as u32 as u64 + count as u64 * 16);
+    }
+
+    #[test]
+    fn the_tail_is_the_low_half_only() {
+        // There is no RDTR_HI: the engine takes the high half from the list
+        // address register. So the tail write is one word.
+        let base = 0x0000_0009_8000_0000u64;
+        let fake = FakeXgmac::new();
+        program_rx_ring(&fake, 0, base, 2, 2048).unwrap();
+        let expect = (base + 16) as u32;
+        assert_eq!(fake.read32(dma_channel_reg(0, DMA_CH_RDTR_LO)), expect);
+        // The high half appears only in RDLR_HI.
+        assert_eq!(fake.read32(dma_channel_reg(0, DMA_CH_RDLR_HI)), 9);
+    }
+
+    #[test]
+    fn interrupt_coalescing_marks_the_last_descriptor_of_each_group() {
+        // With nothing set, every descriptor interrupts.
+        for i in 0..4u32 {
+            assert!(rx_desc_wants_interrupt(i, 0, 0));
+        }
+        // With a frame count, `(index + 1) % rx_frames` --- so the LAST
+        // descriptor of each group carries the flag, not the first. Marking
+        // index 0 instead would interrupt one descriptor early, every time.
+        assert!(!rx_desc_wants_interrupt(0, 0, 4));
+        assert!(!rx_desc_wants_interrupt(1, 0, 4));
+        assert!(!rx_desc_wants_interrupt(2, 0, 4));
+        assert!(rx_desc_wants_interrupt(3, 0, 4));
+        assert!(rx_desc_wants_interrupt(7, 0, 4));
+        // With only a time budget set, no descriptor is marked: the timer
+        // does the work.
+        for i in 0..4u32 {
+            assert!(!rx_desc_wants_interrupt(i, 50, 0));
+        }
+    }
+
+    #[test]
+    fn a_receive_descriptor_carries_two_buffers_in_four_words() {
+        // Header buffer in desc0/desc1, payload buffer in desc2/desc3, each
+        // low-then-high. All four words are address.
+        let hdr = 0x0000_0002_1111_0000u64;
+        let buf = 0x0000_0003_2222_0000u64;
+        let d = rx_desc_init(hdr, buf, false);
+        assert_eq!(d.desc0, 0x1111_0000);
+        assert_eq!(d.desc1, 2);
+        assert_eq!(d.desc2, 0x2222_0000);
+        assert_eq!(d.desc3, 3);
+    }
+
+    #[test]
+    fn the_control_bits_live_inside_an_address_word() {
+        // desc3 is the high half of the payload address AND where OWN and
+        // INTE live. It works because a physical address has nothing in its
+        // top bits, but writing desc3 as "just the address" clears OWN, and
+        // writing it as "just the flags" destroys the address.
+        let buf = 0x0000_0003_2222_0000u64;
+        let plain = rx_desc_init(0, buf, false);
+        let with_inte = rx_desc_init(0, buf, true);
+        assert_eq!(with_inte.desc3, plain.desc3 | DESC3_CTXT);
+        // The address half survives the flag.
+        assert_eq!(with_inte.desc3 & 0x0000_ffff, 3);
+        assert!(rx_desc3_inte(with_inte.desc3));
+        assert!(!rx_desc3_inte(plain.desc3));
+    }
+
+    #[test]
+    fn the_descriptor_is_not_handed_over_by_this_function() {
+        // OWN is left off on purpose: Linux sets it in a separate write with
+        // a barrier either side, because the receive engine may already be
+        // running over this ring. Returning the descriptor without OWN makes
+        // that ordering the caller's explicit step.
+        let d = rx_desc_init(0x1000, 0x2000, true);
+        assert!(!desc_owned_by_dma(d.desc3));
+        // And handing it over is then one OR, which is what the caller does
+        // after its barrier.
+        assert!(desc_owned_by_dma(d.desc3 | DESC3_OWN));
+    }
+
+    // ——— Tanda 11: a frame in the transmit ring ———
+
+    fn fragment(dma: u64, len: u32) -> TxFragment {
+        TxFragment { dma, len }
+    }
+
+    fn one_frame(fragments: &[TxFragment]) -> TxFrame<'_> {
+        TxFrame {
+            fragments,
+            total_len: fragments.iter().map(|f| f.len).sum(),
+            checksum_offload: false,
+            wants_interrupt: false,
+        }
+    }
+
+    #[test]
+    fn the_first_descriptor_is_the_only_one_left_unowned() {
+        let frags = [
+            fragment(0x1000, 100),
+            fragment(0x2000, 200),
+            fragment(0x3000, 300),
+        ];
+        let mut ring = [Desc::default(); 8];
+        let next = build_tx_frame(&mut ring, 0, &one_frame(&frags)).unwrap();
+        assert_eq!(next, 3);
+        // Every descriptor but the first is handed over as it is built; the
+        // first waits for the caller's barrier.
+        assert!(!desc_owned_by_dma(ring[0].desc3));
+        assert!(desc_owned_by_dma(ring[1].desc3));
+        assert!(desc_owned_by_dma(ring[2].desc3));
+    }
+
+    #[test]
+    fn handing_the_frame_over_touches_only_the_first_descriptor() {
+        let frags = [fragment(0x1000, 100), fragment(0x2000, 200)];
+        let mut ring = [Desc::default(); 8];
+        build_tx_frame(&mut ring, 0, &one_frame(&frags)).unwrap();
+        let before = ring;
+        hand_tx_frame_to_dma(&mut ring, 0);
+        assert_eq!(ring[0].desc3, before[0].desc3 | DESC3_OWN);
+        assert_eq!(ring[1], before[1]);
+        // And the rest of the first descriptor is untouched: OWN is an OR,
+        // not a rewrite of the word.
+        assert_eq!(ring[0].desc0, before[0].desc0);
+        assert_eq!(ring[0].desc2, before[0].desc2);
+    }
+
+    #[test]
+    fn first_and_last_are_different_descriptors_and_different_bits() {
+        let frags = [
+            fragment(0x1000, 100),
+            fragment(0x2000, 200),
+            fragment(0x3000, 300),
+        ];
+        let mut ring = [Desc::default(); 8];
+        build_tx_frame(&mut ring, 0, &one_frame(&frags)).unwrap();
+        assert_eq!(ring[0].desc3 & DESC3_FD, DESC3_FD);
+        assert_eq!(ring[0].desc3 & DESC3_LD, 0);
+        assert_eq!(ring[1].desc3 & (DESC3_FD | DESC3_LD), 0);
+        assert_eq!(ring[2].desc3 & DESC3_LD, DESC3_LD);
+        assert_eq!(ring[2].desc3 & DESC3_FD, 0);
+    }
+
+    #[test]
+    fn a_frame_of_one_fragment_is_both_first_and_last() {
+        let frags = [fragment(0x1000, 60)];
+        let mut ring = [Desc::default(); 8];
+        build_tx_frame(&mut ring, 0, &one_frame(&frags)).unwrap();
+        assert_eq!(ring[0].desc3 & (DESC3_FD | DESC3_LD), DESC3_FD | DESC3_LD);
+        // Still unowned: a one-fragment frame is handed over the same way.
+        assert!(!desc_owned_by_dma(ring[0].desc3));
+    }
+
+    #[test]
+    fn the_two_lengths_have_different_scopes() {
+        let frags = [fragment(0x1000, 100), fragment(0x2000, 200)];
+        let mut ring = [Desc::default(); 8];
+        build_tx_frame(&mut ring, 0, &one_frame(&frags)).unwrap();
+        // desc2 holds THIS fragment's length, on every descriptor.
+        assert_eq!(
+            get_bits(ring[0].desc2, TX_DESC2_HL_B1L.0, TX_DESC2_HL_B1L.1),
+            100
+        );
+        assert_eq!(
+            get_bits(ring[1].desc2, TX_DESC2_HL_B1L.0, TX_DESC2_HL_B1L.1),
+            200
+        );
+        // desc3 holds the WHOLE frame's length, on the first only.
+        assert_eq!(get_bits(ring[0].desc3, TX_DESC3_FL.0, TX_DESC3_FL.1), 300);
+        assert_eq!(get_bits(ring[1].desc3, TX_DESC3_FL.0, TX_DESC3_FL.1), 0);
+    }
+
+    #[test]
+    fn the_interrupt_bit_is_in_desc2_not_desc3() {
+        let frags = [fragment(0x1000, 100), fragment(0x2000, 200)];
+        let mut frame = one_frame(&frags);
+        frame.wants_interrupt = true;
+        let mut ring = [Desc::default(); 8];
+        build_tx_frame(&mut ring, 0, &frame).unwrap();
+        // IC is bit 31 of desc2. Bit 31 of desc3 is OWN, and the last
+        // descriptor has that too, so the test pins the WORD, not just the
+        // position.
+        assert_eq!(ring[1].desc2 & (1 << 31), 1 << 31);
+        assert_eq!(ring[0].desc2 & (1 << 31), 0);
+        // And without it asked for, nothing sets bit 31 of desc2 anywhere.
+        let mut quiet = [Desc::default(); 8];
+        build_tx_frame(&mut quiet, 0, &one_frame(&frags)).unwrap();
+        assert_eq!(quiet[0].desc2 & (1 << 31), 0);
+        assert_eq!(quiet[1].desc2 & (1 << 31), 0);
+    }
+
+    #[test]
+    fn the_checksum_bits_ride_every_descriptor() {
+        let frags = [fragment(0x1000, 100), fragment(0x2000, 200)];
+        let mut frame = one_frame(&frags);
+        frame.checksum_offload = true;
+        let mut ring = [Desc::default(); 8];
+        build_tx_frame(&mut ring, 0, &frame).unwrap();
+        // Linux sets CIC on the first descriptor and again in the loop over
+        // the rest: it is not a per-frame flag that the first carries.
+        for d in &ring[..2] {
+            assert_eq!(
+                get_bits(d.desc3, TX_DESC3_CIC.0, TX_DESC3_CIC.1),
+                TX_DESC3_CIC_FULL
+            );
+        }
+    }
+
+    #[test]
+    fn the_crc_and_pad_field_is_left_at_zero() {
+        let frags = [fragment(0x1000, 100)];
+        let mut ring = [Desc::default(); 8];
+        build_tx_frame(&mut ring, 0, &one_frame(&frags)).unwrap();
+        // Zero is "insert CRC and pad", which is what an ordinary frame
+        // wants. A stray one here would send frames without a CRC.
+        assert_eq!(get_bits(ring[0].desc3, TX_DESC3_CPC.0, TX_DESC3_CPC.1), 0);
+    }
+
+    #[test]
+    fn the_address_is_split_low_half_first() {
+        let frags = [fragment(0x0000_0001_dead_beef, 64)];
+        let mut ring = [Desc::default(); 8];
+        build_tx_frame(&mut ring, 0, &one_frame(&frags)).unwrap();
+        assert_eq!(ring[0].desc0, 0xdead_beef);
+        assert_eq!(ring[0].desc1, 1);
+    }
+
+    #[test]
+    fn the_ring_wraps_and_the_next_index_wraps_with_it() {
+        let frags = [
+            fragment(0x1000, 100),
+            fragment(0x2000, 200),
+            fragment(0x3000, 300),
+        ];
+        let mut ring = [Desc::default(); 4];
+        let next = build_tx_frame(&mut ring, 3, &one_frame(&frags)).unwrap();
+        assert_eq!(next, 2);
+        // Index 3 is the first, then 0 and 1.
+        assert_eq!(ring[3].desc3 & DESC3_FD, DESC3_FD);
+        assert!(!desc_owned_by_dma(ring[3].desc3));
+        assert_eq!(ring[1].desc3 & DESC3_LD, DESC3_LD);
+        // Descriptor 2 was never touched.
+        assert_eq!(ring[2], Desc::default());
+    }
+
+    #[test]
+    fn a_frame_that_does_not_fit_the_ring_is_refused() {
+        let frags = [
+            fragment(0x1000, 10),
+            fragment(0x2000, 10),
+            fragment(0x3000, 10),
+        ];
+        let mut ring = [Desc::default(); 2];
+        assert!(build_tx_frame(&mut ring, 0, &one_frame(&frags)).is_err());
+        // Nothing was written before the refusal.
+        assert_eq!(ring[0], Desc::default());
+    }
+
+    #[test]
+    fn the_lengths_must_agree_with_each_other() {
+        let frags = [fragment(0x1000, 100), fragment(0x2000, 200)];
+        let mut ring = [Desc::default(); 8];
+        let mut frame = one_frame(&frags);
+        frame.total_len = 299;
+        // A frame length that disagrees with the fragments would make the
+        // engine send 299 bytes out of 300 handed to it, silently.
+        assert!(build_tx_frame(&mut ring, 0, &frame).is_err());
+        frame.total_len = 300;
+        assert!(build_tx_frame(&mut ring, 0, &frame).is_ok());
+    }
+
+    #[test]
+    fn an_empty_frame_and_an_empty_fragment_are_both_refused() {
+        let mut ring = [Desc::default(); 8];
+        assert!(build_tx_frame(&mut ring, 0, &one_frame(&[])).is_err());
+        let frags = [fragment(0x1000, 0)];
+        assert!(build_tx_frame(&mut ring, 0, &one_frame(&frags)).is_err());
+    }
+
+    #[test]
+    fn a_length_too_big_for_its_field_is_refused_not_truncated() {
+        let mut ring = [Desc::default(); 8];
+        // A fragment of exactly 1 << 14 would be written as zero.
+        let frags = [fragment(0x1000, 1 << TX_DESC2_HL_B1L.1)];
+        assert!(build_tx_frame(&mut ring, 0, &one_frame(&frags)).is_err());
+        // And a frame length of 1 << 15 likewise, even split across
+        // fragments that each fit.
+        let big = [fragment(0x1000, 16383), fragment(0x2000, 16385)];
+        assert!(build_tx_frame(&mut ring, 0, &one_frame(&big)).is_err());
+    }
+
+    #[test]
+    fn the_transmit_tail_points_past_the_frame_not_at_it() {
+        let fake = FakeXgmac::new();
+        let ring_paddr = 0x10_0000u64;
+        let frags = [fragment(0x1000, 100), fragment(0x2000, 200)];
+        let mut ring = [Desc::default(); 8];
+        let next = build_tx_frame(&mut ring, 0, &one_frame(&frags)).unwrap();
+        kick_tx(&fake, 0, desc_paddr(ring_paddr, next));
+        // Two descriptors used, so the tail is descriptor 2: one PAST the
+        // last one written. The receive tail of program_rx_ring points AT
+        // its last descriptor instead.
+        let expected = ring_paddr + 2 * core::mem::size_of::<Desc>() as u64;
+        let log = fake.log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            log[0],
+            Access::Write(dma_channel_reg(0, DMA_CH_TDTR_LO), expected as u32)
+        );
+    }
+
+    #[test]
+    fn the_transmit_tail_is_the_low_half_only() {
+        let fake = FakeXgmac::new();
+        // There is no TDTR_HI: the ring lives wholly inside the window the
+        // TDLR pair established, so only the low half moves.
+        kick_tx(&fake, 1, 0x0000_0007_1234_5678);
+        let log = fake.log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            log[0],
+            Access::Write(dma_channel_reg(1, DMA_CH_TDTR_LO), 0x1234_5678)
         );
     }
 }
