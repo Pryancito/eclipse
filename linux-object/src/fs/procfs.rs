@@ -980,7 +980,7 @@ impl INode for ProcPidDirINode {
         Ok(owner::of_pid(
             self.pid,
             Metadata {
-                dev: 0,
+                dev: dev(),
                 inode: pid_inode(self.pid, 0),
                 size: 0,
                 blk_size: BLOCK_SIZE,
@@ -2035,7 +2035,7 @@ fn proc_sys_inotify_max_queued_events_content() -> String {
 /// the parent, and one per child directory's `..`.
 fn dir_metadata(inode: usize, subdirs: usize) -> Metadata {
     Metadata {
-        dev: 0,
+        dev: dev(),
         inode,
         size: 0,
         blk_size: BLOCK_SIZE,
@@ -2056,6 +2056,16 @@ fn dir_metadata(inode: usize, subdirs: usize) -> Metadata {
 /// `s_blocksize` to 1024), where nothing takes up a block.
 pub(crate) const BLOCK_SIZE: usize = 1024;
 
+/// The `st_dev` of everything in `/proc`: a device of its own, as procfs's
+/// superblock is. It was 0, which is what `/` said, so `mountpoint /proc`
+/// answered that it was not one.
+pub(crate) fn dev() -> usize {
+    lazy_static! {
+        static ref DEV: usize = rcore_fs::vfs::anon_dev();
+    }
+    *DEV
+}
+
 /// A file of `/proc`, which is written out when it is read and says size 0
 /// until then, as in Linux. The files of `/proc/<pid>` used to say how long
 /// they were, so finding that out wrote each one out whole at every `stat`,
@@ -2073,7 +2083,7 @@ fn file_metadata(inode: usize, mode: u16) -> Metadata {
 /// and `stat` never does).
 pub(crate) fn link_metadata(inode: usize, size: usize) -> Metadata {
     Metadata {
-        dev: 0,
+        dev: dev(),
         inode,
         size,
         blk_size: BLOCK_SIZE,

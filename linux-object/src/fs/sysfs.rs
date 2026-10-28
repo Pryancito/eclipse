@@ -15,13 +15,14 @@ use crate::fs::pseudo::Pseudo as BasePseudo;
 
 /// Distinct anonymous `dev_t` (`0:2`) for `/sys`.
 ///
-/// The root filesystem (`/` on `RamFS` or `EclipseFS`) uses `dev = 0` and
-/// `inode = 1`. When `/sys` (`SysRootINode`) also reported `dev = 0, inode = 1`,
+/// The root filesystem reported `dev = 0` and `inode = 1`, and one on
+/// EclipseFS still does. When `/sys` (`SysRootINode`) also reported `dev = 0, inode = 1`,
 /// systemd 261's `chaseat()` and `dir_fd_is_root()` (used by Ubuntu 26.10's
 /// `libudev.so.1`) compared `/sys` against `/` via `statx_inode_same()` and
 /// `statx_mount_same()` and concluded `/sys` WAS `/`. Giving sysfs its own
 /// anonymous device number separates both `(st_dev, st_ino)` and `stx_mnt_id`.
-const SYSFS_DEV: usize = 2;
+/// It is kept apart from the ones [`rcore_fs::vfs::anon_dev`] hands out.
+const SYSFS_DEV: usize = rcore_fs::vfs::SYSFS_DEV;
 
 struct Pseudo(BasePseudo);
 
