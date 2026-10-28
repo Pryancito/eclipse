@@ -2350,6 +2350,121 @@ pub fn config_rx_fifo(acc: &dyn MmioAccess, total_bytes: u32, queues: u32) -> De
     Ok(())
 }
 
+// ——— When to ask the other end to stop ———
+
+/// `MTL_Q_RQFCR`: a receive queue's flow-control thresholds.
+pub const MTL_Q_RQFCR: usize = 0x50;
+/// `MTL_Q_RQFCR_RFA`, index **1**, width 6. Not index 0: bit 0 of this
+/// register is not part of the field, so a threshold written from the bottom
+/// of the word comes out halved.
+pub const MTL_Q_RQFCR_RFA: (u32, u32) = (1, 6);
+/// `MTL_Q_RQFCR_RFD`, index 17, width 6.
+pub const MTL_Q_RQFCR_RFD: (u32, u32) = (17, 6);
+
+/// `XGMAC_FLOW_CONTROL_UNIT`: the granularity of a threshold.
+///
+/// Note it is NOT [`FIFO_UNIT`], and the bias below is not the FIFO's
+/// either. Two neighbouring quantities in the same driver, both "units minus
+/// a bias", with different units and different biases.
+pub const FLOW_CONTROL_UNIT: u32 = 512;
+
+/// `XGMAC_FLOW_CONTROL_ALIGN`: round up to a whole [`FLOW_CONTROL_UNIT`].
+#[inline]
+pub const fn flow_control_align(bytes: u32) -> u32 {
+    bytes.div_ceil(FLOW_CONTROL_UNIT) * FLOW_CONTROL_UNIT
+}
+
+/// `XGMAC_FLOW_CONTROL_VALUE`: bytes to the register's units, which are
+/// [`FLOW_CONTROL_UNIT`] minus **two**.
+#[inline]
+pub const fn flow_control_value(bytes: u32) -> u32 {
+    if bytes < 2 * FLOW_CONTROL_UNIT {
+        0
+    } else {
+        bytes / FLOW_CONTROL_UNIT - 2
+    }
+}
+
+/// A receive queue's two water marks, as the register takes them.
+///
+/// Both are measured from FULL, backwards: a threshold of zero means "when
+/// 1024 bytes of room are left", and a BIGGER number means the chip asks the
+/// other end to stop EARLIER, not later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FlowControl {
+    /// `RFA`: start asking the other end to pause.
+    pub rfa: u32,
+    /// `RFD`: stop asking.
+    ///
+    /// Always above [`FlowControl::rfa`], and because both count backwards
+    /// from full that means the queue has to drain FURTHER before the pause
+    /// is lifted. Swapping the two gives a pause that is lifted the instant
+    /// it is raised, which on a loaded link is a storm of pause frames
+    /// rather than no flow control at all.
+    pub rfd: u32,
+}
+
+/// Whether flow control is off for this queue.
+///
+/// It is `rfd` that says so, not `rfa`: a zero in `rfa` is a perfectly real
+/// threshold --- it is what a queue between 2 and 4 KiB gets --- and reading
+/// "off" off it would silently disable flow control on exactly the queues
+/// that were configured for it.
+#[inline]
+pub const fn flow_control_is_off(fc: &FlowControl) -> bool {
+    fc.rfd == 0
+}
+
+/// The water marks for a receive queue of `q_fifo_bytes`, given the largest
+/// frame the interface accepts. `xgbe_queue_flow_control_threshold` without
+/// priority-based flow control.
+///
+/// Four bands, and the first three are constants out of Linux rather than
+/// anything derived: under 2 KiB there is no room to pause in at all, and
+/// between 2 KiB and a frame the fixed answers are what fits.
+pub fn queue_flow_control(q_fifo_bytes: u32, max_frame: u32) -> FlowControl {
+    let frame_fifo = flow_control_align(max_frame);
+
+    if q_fifo_bytes <= 2048 {
+        // No room to pause in: a queue this small cannot hold what is still
+        // in flight by the time the other end sees the pause.
+        return FlowControl { rfa: 0, rfd: 0 };
+    }
+    if q_fifo_bytes <= 4096 {
+        // Full - 1024 bytes, and full - 1536.
+        return FlowControl { rfa: 0, rfd: 1 };
+    }
+    if q_fifo_bytes <= frame_fifo {
+        // Full - 2048 bytes, and full - 3584.
+        return FlowControl { rfa: 2, rfd: 5 };
+    }
+    if q_fifo_bytes <= frame_fifo * 3 {
+        // Pause once just over a frame has arrived; resume with just under
+        // half a frame of room left.
+        let rfa = q_fifo_bytes - frame_fifo;
+        let rfd = rfa + frame_fifo / 2;
+        return FlowControl {
+            rfa: flow_control_value(rfa),
+            rfd: flow_control_value(rfd),
+        };
+    }
+    // Room for more than three frames: pause with just over two frames of
+    // space still free.
+    let rfa = frame_fifo * 2 + FLOW_CONTROL_UNIT;
+    let rfd = rfa + frame_fifo;
+    FlowControl {
+        rfa: flow_control_value(rfa),
+        rfd: flow_control_value(rfd),
+    }
+}
+
+/// Write a queue's water marks. `xgbe_config_flow_control_threshold`.
+pub fn config_flow_control(acc: &dyn MmioAccess, queue: u32, fc: &FlowControl) {
+    let reg = mtl_queue_reg(queue, MTL_Q_RQFCR);
+    write_field(acc, reg, MTL_Q_RQFCR_RFA.0, MTL_Q_RQFCR_RFA.1, fc.rfa);
+    write_field(acc, reg, MTL_Q_RQFCR_RFD.0, MTL_Q_RQFCR_RFD.1, fc.rfd);
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.

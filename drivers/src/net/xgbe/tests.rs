@@ -2968,3 +2968,153 @@ fn every_transmit_queue_is_a_priority_queue() {
         );
     }
 }
+
+// ——— Tanda 15: the flow-control water marks ———
+
+/// A jumbo frame plus headers, which is the largest this driver would take.
+const JUMBO: u32 = 9018;
+
+#[test]
+fn the_threshold_field_does_not_start_at_bit_zero() {
+    // Bit 0 of RQFCR is not part of RFA. A threshold written from the bottom
+    // of the word comes out halved.
+    assert_eq!(MTL_Q_RQFCR_RFA.0, 1);
+    assert_eq!(MTL_Q_RQFCR_RFA.1, 6);
+    assert_eq!(MTL_Q_RQFCR_RFD.0, 17);
+}
+
+#[test]
+fn the_unit_and_the_bias_are_not_the_fifos() {
+    // Two neighbouring quantities in the same driver, both "units minus a
+    // bias", with different units and different biases. Borrowing either
+    // one's helper for the other is off by a factor of two and a constant.
+    assert_eq!(FLOW_CONTROL_UNIT, 2 * FIFO_UNIT);
+    assert_eq!(flow_control_value(1024), 0);
+    assert_eq!(flow_control_value(1536), 1);
+    assert_eq!(flow_control_value(2048), 2);
+    // ... whereas the FIFO's bias is one over a 256-byte unit.
+    assert_eq!(fifo_units(1024), 3);
+}
+
+#[test]
+fn anything_under_two_units_is_the_bottom_of_the_scale() {
+    for bytes in [0u32, 1, 511, 512, 1023] {
+        assert_eq!(flow_control_value(bytes), 0, "{} bytes", bytes);
+    }
+    assert_eq!(flow_control_value(1024), 0);
+}
+
+#[test]
+fn rounding_up_is_to_the_flow_control_unit_not_the_fifo_unit() {
+    assert_eq!(flow_control_align(1), FLOW_CONTROL_UNIT);
+    assert_eq!(flow_control_align(512), 512);
+    assert_eq!(flow_control_align(513), 1024);
+    assert_eq!(flow_control_align(9018), 9216);
+    assert_eq!(flow_control_align(0), 0);
+}
+
+#[test]
+fn a_queue_too_small_to_pause_in_gets_no_flow_control() {
+    for size in [256u32, 1024, 2048] {
+        let fc = queue_flow_control(size, JUMBO);
+        assert_eq!(fc, FlowControl { rfa: 0, rfd: 0 }, "{} bytes", size);
+        assert!(flow_control_is_off(&fc));
+    }
+}
+
+#[test]
+fn a_zero_in_rfa_is_a_real_threshold_and_only_rfd_means_off() {
+    // The queue between 2 and 4 KiB has rfa == 0 and flow control very much
+    // ON. Reading "off" off rfa would disable it on exactly the queues that
+    // were configured for it.
+    let fc = queue_flow_control(4096, JUMBO);
+    assert_eq!(fc.rfa, 0);
+    assert_eq!(fc.rfd, 1);
+    assert!(!flow_control_is_off(&fc));
+}
+
+#[test]
+fn resuming_always_waits_for_more_room_than_pausing() {
+    // Both marks count backwards from full, so rfd above rfa means the queue
+    // must drain FURTHER before the pause is lifted. The other way round is
+    // a pause lifted the instant it is raised: a storm of pause frames.
+    for size in [4096u32, 8192, 9216, 16384, 32768, 65536, 131072] {
+        let fc = queue_flow_control(size, JUMBO);
+        if flow_control_is_off(&fc) {
+            continue;
+        }
+        assert!(fc.rfd > fc.rfa, "{} bytes: {:?}", size, fc);
+    }
+}
+
+#[test]
+fn the_four_bands_are_where_linux_puts_them() {
+    let frame = flow_control_align(JUMBO);
+    // Band two and three are fixed answers, not derived.
+    assert_eq!(
+        queue_flow_control(4096, JUMBO),
+        FlowControl { rfa: 0, rfd: 1 }
+    );
+    assert_eq!(
+        queue_flow_control(4097, JUMBO),
+        FlowControl { rfa: 2, rfd: 5 }
+    );
+    assert_eq!(
+        queue_flow_control(frame, JUMBO),
+        FlowControl { rfa: 2, rfd: 5 }
+    );
+    // Band four is derived from the queue size, so neighbouring sizes differ.
+    let a = queue_flow_control(frame + 1024, JUMBO);
+    let b = queue_flow_control(frame * 2, JUMBO);
+    assert_ne!(a, b);
+    // Band five stops depending on the queue size: two frames plus a unit.
+    let c = queue_flow_control(frame * 3 + 1, JUMBO);
+    let d = queue_flow_control(frame * 10, JUMBO);
+    assert_eq!(c, d);
+    assert_eq!(c.rfa, flow_control_value(frame * 2 + FLOW_CONTROL_UNIT));
+}
+
+#[test]
+fn the_thresholds_never_overflow_their_six_bit_fields() {
+    // Linux leans on jumbo frames being the ceiling to skip the clamp, so
+    // the test has to be the thing that checks it.
+    let limit = 1u32 << MTL_Q_RQFCR_RFA.1;
+    for size in [2049u32, 4096, 9216, 16384, 32768, 65536, 262144] {
+        let fc = queue_flow_control(size, JUMBO);
+        assert!(fc.rfa < limit, "{} bytes: rfa {}", size, fc.rfa);
+        assert!(fc.rfd < limit, "{} bytes: rfd {}", size, fc.rfd);
+    }
+}
+
+#[test]
+fn both_marks_go_into_the_same_register_without_touching_each_other() {
+    let fake = FakeXgmac::new();
+    config_flow_control(
+        &fake,
+        2,
+        &FlowControl {
+            rfa: 0x3f,
+            rfd: 0x2a,
+        },
+    );
+    let word = fake.read32(mtl_queue_reg(2, MTL_Q_RQFCR));
+    assert_eq!(get_bits(word, MTL_Q_RQFCR_RFA.0, MTL_Q_RQFCR_RFA.1), 0x3f);
+    assert_eq!(get_bits(word, MTL_Q_RQFCR_RFD.0, MTL_Q_RQFCR_RFD.1), 0x2a);
+    // Bit 0 is below RFA and must be left alone.
+    assert_eq!(word & 1, 0);
+}
+
+#[test]
+fn a_smaller_max_frame_moves_the_bands_with_it() {
+    // The bands are measured in frames, so a 1518-byte interface pauses on
+    // queue sizes a jumbo one would not even reach the third band at.
+    let small = queue_flow_control(8192, 1518);
+    let jumbo = queue_flow_control(8192, JUMBO);
+    assert_ne!(small, jumbo);
+    // 8 KiB is under a jumbo frame's aligned size, so the jumbo interface is
+    // still on the fixed answer.
+    assert_eq!(jumbo, FlowControl { rfa: 2, rfd: 5 });
+    // ... while the small one has room for more than three frames.
+    let frame = flow_control_align(1518);
+    assert_eq!(small.rfa, flow_control_value(frame * 2 + FLOW_CONTROL_UNIT));
+}
