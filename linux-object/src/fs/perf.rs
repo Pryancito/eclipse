@@ -543,7 +543,14 @@ impl FileLike for PerfEvent {
     }
 
     fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {
-        match request {
+        // Match on the low 32 bits: the Linux ioctl command is a 32-bit
+        // `unsigned int`, and `PERF_EVENT_IOC_ID` (`_IOR`) has bit 31 set, so a
+        // musl caller — which types `ioctl`'s request `int` — sends it
+        // sign-extended to `0xffff_ffff_8008_2407`. Linux truncates to 32 bits
+        // and sees one command; without masking, the full 64-bit value would
+        // miss the arm and `PERF_EVENT_IOC_ID` would be `ENOTTY` for every musl
+        // program (the same reason `sys_ioctl`'s DRM dispatch masks to `u32`).
+        match request & 0xFFFF_FFFF {
             PERF_EVENT_IOC_ENABLE => {
                 self.inner.lock().set_enabled(true);
                 ANY_ENABLED.store(true, Ordering::Relaxed);
@@ -1188,6 +1195,34 @@ mod tests {
         let period = ev.inner.lock().period;
         assert_ne!(period, 0);
         assert_eq!(ev.ioctl(0x1234, 0, 0, 0), Err(LxError::ENOTTY));
+    }
+
+    /// A musl caller types `ioctl`'s request `int`, so a command with bit 31
+    /// set (`PERF_EVENT_IOC_ID`, `_IOR`) arrives sign-extended to
+    /// `0xffff_ffff_8008_2407`. The handler masks to the low 32 bits, so it
+    /// still reaches the ID arm: a null arg is `EFAULT` (the write it tried),
+    /// which is the proof it was recognised — without the mask the whole
+    /// 64-bit value misses every arm and the answer is `ENOTTY`. A
+    /// sign-extended value that is no perf ioctl stays `ENOTTY`.
+    #[test]
+    fn a_sign_extended_command_still_reaches_its_arm() {
+        let _turn = SAMPLER_TURN.lock();
+        let ev = mapped(PERF_SAMPLE_IP, 1);
+        const ID_SIGN_EXTENDED: usize = 0xffff_ffff_8008_2407;
+        assert_eq!(
+            ID_SIGN_EXTENDED as u32, PERF_EVENT_IOC_ID as u32,
+            "the sign-extended command truncates to PERF_EVENT_IOC_ID"
+        );
+        assert_eq!(
+            ev.ioctl(ID_SIGN_EXTENDED, 0, 0, 0),
+            Err(LxError::EFAULT),
+            "ID sign-extended reaches the ID arm (EFAULT on null, not ENOTTY)"
+        );
+        assert_eq!(
+            ev.ioctl(0xffff_ffff_0000_1234, 0, 0, 0),
+            Err(LxError::ENOTTY),
+            "a sign-extended value that is no perf ioctl is still ENOTTY"
+        );
     }
 
     /// An event bound to one pid and cpu, with `data_pages` data pages.
