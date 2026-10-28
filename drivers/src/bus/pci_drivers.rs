@@ -81,6 +81,11 @@ pub fn init_all() {
     register(&crate::net::e1000::E1000DriverPci);
     register(&crate::net::e1000e::E1000eDriverPci);
 
+    // Ethernet AMD PCnet-PCI II / PCnet-FAST III (`pcnet32`). x86-only: the
+    // part is programmed through PCI I/O ports.
+    #[cfg(target_arch = "x86_64")]
+    register(&crate::net::pcnet32::Pcnet32DriverPci);
+
     // GPU Nvidia (scaffolding) — x86_64-only (nvidia-rm-sys shim).
     //
     // Out of the host test build: its `init` reaches `nvidia-rm-sys`, whose
