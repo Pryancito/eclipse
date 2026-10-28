@@ -2414,6 +2414,21 @@ pub fn compositor_ctx0() -> bool {
     COMPOSITOR_CTX0.load(Ordering::Relaxed)
 }
 
+/// Whether `GEM_NEW` builds a uvmm client's context when it has none yet, so
+/// the object is allocated under that process's RM client and `nvidia-smi`
+/// bills it to the process (`NvidiaGpu::gem_owner_ctx`). Default on;
+/// `nvidia.gem_ctx_late` turns it off, and the context is built at the
+/// client's first `VM_BIND` or `CHANNEL_ALLOC` as before.
+static GEM_OWNER_EARLY: AtomicBool = AtomicBool::new(true);
+
+pub fn set_gem_owner_early(v: bool) {
+    GEM_OWNER_EARLY.store(v, Ordering::SeqCst);
+}
+
+pub fn gem_owner_early() -> bool {
+    GEM_OWNER_EARLY.load(Ordering::Relaxed)
+}
+
 /// Per-context constants for a direct submit, derived from
 /// `nvidia_rm_sys::rm_init::ExecFast` with every physical page already
 /// turned into a kernel virtual address.

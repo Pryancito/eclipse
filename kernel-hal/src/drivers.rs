@@ -551,6 +551,16 @@ pub fn set_compositor_ctx0(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_compositor_ctx0(_v: bool) {}
 
+/// Whether `GEM_NEW` builds a uvmm client's context first, so the object is
+/// billed to the process in `nvidia-smi`. Default on; `nvidia.gem_ctx_late`
+/// turns it off.
+#[cfg(target_arch = "x86_64")]
+pub fn set_gem_owner_early(v: bool) {
+    zcore_drivers::display::set_gem_owner_early(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_gem_owner_early(_v: bool) {}
+
 /// Opt-in CE present on DRM `page_flip` (`nvidia.hwflip`). Default off.
 #[cfg(target_arch = "x86_64")]
 pub fn set_hwflip_enabled(v: bool) {

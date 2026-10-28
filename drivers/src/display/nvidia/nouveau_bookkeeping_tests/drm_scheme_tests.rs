@@ -1126,10 +1126,23 @@ fn gem_new_allocates_under_the_context_of_the_process_that_asked() {
         .expect("GEM_NEW must still allocate through `gem_vram::place`");
     let before = &src[at.saturating_sub(1200)..at];
     assert!(
-        before.contains("let owner_ctx = self.ctx_idx_for_pid(owner_pid);"),
+        before.contains("let owner_ctx = self.gem_owner_ctx(owner_pid);"),
         "the owning context must come from the pid that issued GEM_NEW; a constant \
          here puts every process's buffers back on the shared ladder client, where \
          nvidia-smi counts them for nobody"
+    );
+    // And `gem_owner_ctx` answers from that pid: its ready context, or the
+    // one it builds for it -- never a constant.
+    let f = &src[src
+        .find("fn gem_owner_ctx(&self, owner_pid: u64) -> u32 {")
+        .expect("gem_owner_ctx")..];
+    let f = &f[..f.find("\n    }\n").expect("its end")];
+    assert!(
+        f.contains("self.ctx_idx_for_pid(owner_pid)")
+            && f.contains("self.ensure_ctx_for_pid(owner_pid, is_compositor)")
+            && f.contains("self.nouveau_has_uvmm(owner_pid)"),
+        "gem_owner_ctx must take the asking pid's context: {}",
+        f
     );
     let target = &before[before
         .find("gem_vram::Target {")

@@ -1105,6 +1105,16 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     "Eclipse: nvidia.compositor_ctx0 -- el compositor se queda en el contexto 0 (cliente del RM compartido; no saldra en la tabla de procesos de nvidia-smi)"
                 );
             }
+            // `nvidia.gem_ctx_late`: build a client's context at its first
+            // VM_BIND, as before, not at its first GEM_NEW. With it, NVK's
+            // first buffers stay on the shared kernel client and nvidia-smi
+            // bills them to no process.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gem_ctx_late") {
+                kernel_hal::drivers::set_gem_owner_early(false);
+                klog_info!(
+                    "Eclipse: nvidia.gem_ctx_late -- el contexto de un cliente se crea en su primer VM_BIND (sus primeros buffers no cuentan para su proceso en nvidia-smi)"
+                );
+            }
             if nv.nouveau_uapi {
                 let capable = kernel_hal::drivers::all_drm()
                     .as_vec()
