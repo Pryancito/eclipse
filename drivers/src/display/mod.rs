@@ -43,6 +43,10 @@ pub use nouveau_uapi::{enabled as nouveau_uapi_enabled, set_enabled as set_nouve
 /// reached from `zCore`'s cmdline parsing by way of `kernel_hal::drivers`.
 #[cfg(target_arch = "x86_64")]
 pub use nvidia::comptags::set_enabled as set_gem_comptags_enabled;
+/// A GPU context per DRM file (`nvidia.ctx_per_file`, and `nvidia.wlr_vulkan`),
+/// reached from `zCore`'s cmdline parsing by way of `kernel_hal::drivers`.
+#[cfg(target_arch = "x86_64")]
+pub use nvidia::file_ctx::set_enabled as set_ctx_per_file_enabled;
 /// The GPU side of `/dev/nvidiactl` and `/dev/nvidia<N>`
 /// (`nvidia.nvidiactl`), for the device nodes in `linux-object`.
 #[cfg(target_arch = "x86_64")]

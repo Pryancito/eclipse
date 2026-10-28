@@ -3669,7 +3669,7 @@ impl DrmDev {
                 }
                 if let Some(driver) = self.driver() {
                     driver
-                        .ioctl_owned(cmd, data, drm::current_pid())
+                        .ioctl_file(cmd, data, drm::current_pid(), self.file_owner())
                         // Map the driver's errno through instead of folding it
                         // all into DeviceError(EIO): mesa distinguishes them
                         // (e.g. `nouveau_ws_context_killed` tests specifically

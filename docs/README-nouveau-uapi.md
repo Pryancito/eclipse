@@ -328,6 +328,34 @@ escalera compartida `step16` (client/device/subdevice) se construyen hasta
   pid dueño — el estado de un cliente nunca toca el del compositor ni el de
   otro cliente.
 
+### Un contexto por fichero DRM (`nvidia.ctx_per_file`)
+
+Linux no tiene un VM por proceso sino por fichero: cada `open()` del nodo
+tiene su `nouveau_cli`, y `VM_INIT`, `VM_BIND`, `EXEC` y los canales viven
+en él. Aquí todo eso va por pid, y es lo mismo mientras el proceso tenga un
+solo dispositivo NVK (un cliente GL, labwc con GLES2). labwc con Vulkan
+tiene dos vivos a la vez: el `VkDevice` de wlroots y el que zink crea bajo
+GBM para el allocator. NVK reparte las VAs desde su propio heap (las mismas
+direcciones en los dos dispositivos) y guarda su estado de canal por
+dispositivo, así que compartiendo un contexto el segundo pisaba los mapeos
+y el estado de GR del primero, y el primer frame de wlroots era
+`VK_ERROR_DEVICE_LOST`.
+
+Con `nvidia.ctx_per_file` (lo enciende también `nvidia.wlr_vulkan`;
+`nvidia.ctx_per_file=0` lo apaga) los ioctls del VM (`VM_INIT`, `VM_BIND`,
+`EXEC`, `CHANNEL_ALLOC`/`FREE`, `NVIF`) corren bajo una **clave** por fichero
+(`drivers/src/display/nvidia/file_ctx.rs`). El primer fichero activo del
+proceso toma el pid como clave, así que un proceso con un solo dispositivo
+funciona exactamente igual que antes; otro fichero activo a la vez recibe una
+clave propia (el pid con el bit 61 y un serial) y con ella su propio
+contexto, VAS y anillo. Los objetos GEM, los syncobjs y los holds de PRIME
+siguen siendo del proceso (`file_ctx::pid_of`), y la memoria de un GEM se
+asigna en el contexto del pid, de modo que cerrar el fichero de un segundo
+dispositivo nunca se lleva memoria que otro siga usando. El fichero con que
+NVK enumera (un canal de usar y tirar, y ningún bind) devuelve su clave al
+liberar ese canal; el contexto de un fichero cerrado se libera en el
+siguiente ioctl, y los de un proceso que sale, antes que el del pid.
+
 ## Huecos conocidos y qué se necesita para cerrarlos
 
 - **`EXEC` con `wait_count > 0`**: same-ctx usa **ACQUIRE HW** en el

@@ -1214,6 +1214,21 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     "Eclipse: nvidia.gem_vram_bar1 -- VRAM GEM objects CPU-mapped through BAR1"
                 );
             }
+            // labwc on Vulkan drives the card from two NVK devices at once;
+            // each gets its own GPU context, as each file has its own VM in
+            // Linux. GLES2 sessions keep one context per process unless asked.
+            // `nvidia.ctx_per_file=0` keeps the old shape under Vulkan too.
+            if kernel_hal::cmdline::grouped_flag(
+                &options.cmdline,
+                "nvidia.wlr_vulkan",
+                "nvidia.ctx_per_file",
+            ) {
+                kernel_hal::drivers::set_ctx_per_file_enabled(true);
+                klog_info!(
+                    "Eclipse: nvidia.ctx_per_file -- un contexto de GPU por fichero DRM \
+                     (dos dispositivos NVK en un proceso ya no comparten VM ni anillo)"
+                );
+            }
             if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gem_vram") {
                 kernel_hal::drivers::set_gem_vram_enabled(true);
                 klog_info!(
