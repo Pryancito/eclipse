@@ -56,6 +56,44 @@ fn pidfd_open_target(
     }
 }
 
+/// `PIDFD_SELF_THREAD` and `PIDFD_SELF_THREAD_GROUP` (Linux 6.15): numbers
+/// no descriptor has, which `pidfd_send_signal` takes as a pidfd of the
+/// calling thread and one of its process, with nothing opened. `pidfd_getfd`
+/// and `waitid` take them as no descriptor at all (measured on Linux 6.18).
+const PIDFD_SELF_THREAD: i32 = -10000;
+const PIDFD_SELF_THREAD_GROUP: i32 = -10001;
+
+/// What `pidfd_send_signal` was pointed at, before its flags say how far it
+/// reaches: Linux's `pid` and `type`.
+struct Named {
+    process: Arc<zircon_object::task::Process>,
+    /// Its thread, when that is not its process's leader.
+    thread: Option<Arc<Thread>>,
+    /// The pid: a thread's, or a process's.
+    id: KoID,
+    /// The scope with no flag: a thread's for a `PIDFD_THREAD` pidfd and for
+    /// `PIDFD_SELF_THREAD`, a process's for the others.
+    own: Scope,
+    /// Whether that pid is gone. The caller's never is.
+    gone: bool,
+}
+
+impl Named {
+    fn of(pidfd: &PidFd) -> Self {
+        Named {
+            process: pidfd.target().clone(),
+            thread: pidfd.thread().cloned(),
+            id: pidfd.task_id(),
+            own: if pidfd.is_thread() {
+                Scope::Thread
+            } else {
+                Scope::Process
+            },
+            gone: pidfd.gone(),
+        }
+    }
+}
+
 /// `pidfd_send_signal(2)`'s scope flags (Linux 6.9): the thread the pid
 /// names, its thread group, or the process group it leads.
 const PIDFD_SIGNAL_THREAD: u32 = 1 << 0;
@@ -176,12 +214,8 @@ impl Syscall<'_> {
         // (`check_kill_permission`'s `valid_signal`), so signal 999 at
         // `/dev/null` is `EBADF`, not `EINVAL`.
         let scope = pidfd_signal_scope(flags)?;
-        let pidfd = PidFd::from_file_like(self.linux_process().get_file_like(pidfd)?)?;
-        let scope = scope.unwrap_or(if pidfd.is_thread() {
-            Scope::Thread
-        } else {
-            Scope::Process
-        });
+        let named = self.pidfd_named(pidfd)?;
+        let scope = scope.unwrap_or(named.own);
         let user = if info.is_null() {
             None
         } else {
@@ -195,13 +229,13 @@ impl Syscall<'_> {
         check_pidfd_siginfo(
             signum,
             user.as_ref().map(SigInfoHead::of),
-            pidfd.task_id() == self.thread.id() && scope != Scope::ProcessGroup,
+            named.id == self.thread.id() && scope != Scope::ProcessGroup,
         )?;
         // Until it is reaped, a dead process is a zombie that takes nothing
         // and answers 0, as through `kill(2)`; reaped, or a thread that has
         // exited, the pid is gone. Not for a process group, which outlives
         // the pid that names it as long as it has members.
-        if scope != Scope::ProcessGroup && pidfd.gone() {
+        if scope != Scope::ProcessGroup && named.gone {
             return Err(LxError::ESRCH);
         }
         let signal = Signal::from_syscall_arg(signum)?;
@@ -215,13 +249,41 @@ impl Syscall<'_> {
         let cx = self.kill_context(signal);
         let info = signal.and_then(|sig| user.map(|u| queued_from_user(sig, u)));
         match scope {
-            Scope::Process => self.signal_one_process_with_info(&cx, pidfd.target(), info),
+            Scope::Process => self.signal_one_process_with_info(&cx, &named.process, info),
             Scope::Thread => {
-                self.signal_one_thread_with_info(&cx, pidfd.target(), pidfd.thread(), info)
+                self.signal_one_thread_with_info(&cx, &named.process, named.thread.as_ref(), info)
             }
-            Scope::ProcessGroup => self.signal_group(&cx, pidfd.task_id(), info),
+            Scope::ProcessGroup => self.signal_group(&cx, named.id, info),
         }
         .map(|_| 0)
+    }
+
+    /// The pid and type `pidfd_send_signal` starts from: the pidfd's, or the
+    /// caller's for `PIDFD_SELF_THREAD` (`get_task_pid(current,
+    /// PIDTYPE_PID)`) and `PIDFD_SELF_THREAD_GROUP` (`PIDTYPE_TGID`). Any
+    /// other descriptor that is not a pidfd is `EBADF`.
+    fn pidfd_named(&self, pidfd: FileDesc) -> LxResult<Named> {
+        let process = self.zircon_process();
+        match i32::from(pidfd) {
+            PIDFD_SELF_THREAD => Ok(Named {
+                process: process.clone(),
+                thread: (self.thread.id() != process.id()).then(|| self.thread.inner()),
+                id: self.thread.id(),
+                own: Scope::Thread,
+                gone: false,
+            }),
+            PIDFD_SELF_THREAD_GROUP => Ok(Named {
+                process: process.clone(),
+                thread: None,
+                id: process.id(),
+                own: Scope::Process,
+                gone: false,
+            }),
+            _ => {
+                let pidfd = PidFd::from_file_like(self.linux_process().get_file_like(pidfd)?)?;
+                Ok(Named::of(&pidfd))
+            }
+        }
     }
 
     /// Duplicate `targetfd` from the process referred to by `pidfd`.
@@ -232,7 +294,15 @@ impl Syscall<'_> {
         let caller = self.linux_process();
         let pidfd = PidFd::from_file_like(caller.get_file_like(pidfd)?)?;
         let target_proc = pidfd.target();
-        if matches!(target_proc.status(), Status::Exited(_)) {
+        // The descriptor comes out of the task the pid names
+        // (`get_pid_task(pid, PIDTYPE_PID)`): a thread pidfd's thread, a
+        // process pidfd's leader. Once that one has exited it has no table
+        // to take it from, and that is `ESRCH`, as for a zombie, even with
+        // the process still running. Only the process was looked at, so a
+        // thread pidfd whose thread was gone, and the pidfd of a process
+        // whose leader had left with `SYS_exit`, still handed descriptors
+        // out (Linux 6.18 says `ESRCH` to both).
+        if matches!(target_proc.status(), Status::Exited(_)) || pidfd.task().is_none() {
             return Err(LxError::ESRCH);
         }
         // `__pidfd_fget()` asks `ptrace_may_access(task,
@@ -423,6 +493,11 @@ mod pidfd_signal_scope_tests {
 /// `pidfd_send_signal`. Fixed pids in 49_2xx.
 #[cfg(test)]
 mod thread_tests;
+
+/// `PIDFD_SELF_THREAD` and `PIDFD_SELF_THREAD_GROUP`, and what `pidfd_getfd`
+/// and `waitid` take from a pidfd. Fixed pids in 49_22x.
+#[cfg(test)]
+mod self_tests;
 
 /// The three through the syscall: that `pidfd_getfd` asks whether the caller
 /// may attach at all, that the caller's `siginfo_t` reaches the check, and

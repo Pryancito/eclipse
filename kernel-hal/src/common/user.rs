@@ -1,7 +1,7 @@
 // 来自用户空间的裸指针
 //! Raw pointer from user land.
 
-use crate::VirtAddr;
+use crate::{MMUFlags, VirtAddr, PAGE_SIZE};
 use alloc::{string::String, vec::Vec};
 use core::{
     fmt::{Debug, Formatter},
@@ -259,6 +259,33 @@ impl<T, P: Policy> UserPtr<T, P> {
     /// slice that STARTS in the user half cannot run off its top end into the
     /// kernel.
     pub fn check_len(&self, count: usize) -> Result<()> {
+        let bytes = self.user_bytes(count)?;
+        // Being in the user half says nothing about anything being mapped
+        // there, and this pointer is about to be dereferenced with no fault
+        // fixup behind it. Ask the address space. See
+        // `KernelHandler::check_user_range` for why an unmapped range here
+        // used to kill the machine rather than return EFAULT.
+        if !crate::KHANDLER.check_user_range(self.0 as usize, bytes) {
+            return Err(Error::InvalidPointer);
+        }
+        Ok(())
+    }
+
+    /// [`check_len`](Self::check_len) for a copy that is about to `access`
+    /// the run: `READ` from the user, `WRITE` to it. Mapped is not enough,
+    /// the pages must allow the access too; see
+    /// `KernelHandler::check_user_access`.
+    fn check_len_for(&self, count: usize, access: MMUFlags) -> Result<()> {
+        let bytes = self.user_bytes(count)?;
+        if !crate::KHANDLER.check_user_access(self.0 as usize, bytes, access) {
+            return Err(Error::InvalidPointer);
+        }
+        Ok(())
+    }
+
+    /// The bytes `count` elements from here take, when the pointer is
+    /// neither null nor unaligned and they all lie in the user half.
+    fn user_bytes(&self, count: usize) -> Result<usize> {
         let bytes = count
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(Error::InvalidLength)?;
@@ -266,18 +293,17 @@ impl<T, P: Policy> UserPtr<T, P> {
             && (self.0 as usize).is_multiple_of(core::mem::align_of::<T>())
             && in_user_half(self.0 as usize, bytes)
         {
-            // Being in the user half says nothing about anything being mapped
-            // there, and this pointer is about to be dereferenced with no fault
-            // fixup behind it. Ask the address space. See
-            // `KernelHandler::check_user_range` for why an unmapped range here
-            // used to kill the machine rather than return EFAULT.
-            if !crate::KHANDLER.check_user_range(self.0 as usize, bytes) {
-                return Err(Error::InvalidPointer);
-            }
-            Ok(())
+            Ok(bytes)
         } else {
             Err(Error::InvalidPointer)
         }
+    }
+
+    /// Whether this element starts a page the run has not been checked on:
+    /// the first one, or one at a page boundary. A scan that does not know
+    /// its length checks each page as it reaches it.
+    fn starts_a_page(&self, index: usize) -> bool {
+        index == 0 || (self.0 as usize).is_multiple_of(PAGE_SIZE)
     }
 }
 
@@ -294,7 +320,7 @@ impl<T, P: Read> UserPtr<T, P> {
     /// Reads the value from `self` without moving it.
     /// This leaves the memory in self unchanged.
     pub fn read(&self) -> Result<T> {
-        self.check()?;
+        self.check_len_for(1, MMUFlags::READ)?;
         Ok(unsafe { self.0.read() })
     }
 
@@ -316,7 +342,7 @@ impl<T, P: Read> UserPtr<T, P> {
         if len == 0 {
             Ok(&[])
         } else {
-            self.check_len(len)?;
+            self.check_len_for(len, MMUFlags::READ)?;
             Ok(unsafe { core::slice::from_raw_parts(self.0, len) })
         }
     }
@@ -332,7 +358,7 @@ impl<T, P: Read> UserPtr<T, P> {
         if len == 0 {
             Ok(Vec::default())
         } else {
-            self.check_len(len)?;
+            self.check_len_for(len, MMUFlags::READ)?;
             // The total number of bytes to copy must not overflow `usize`,
             // otherwise the allocation would be smaller than `set_len` claims
             // and the following copy would write out of bounds.
@@ -362,12 +388,24 @@ impl<P: Read> UserPtr<u8, P> {
     /// malicious or buggy user pointer that is not null-terminated cannot make
     /// the kernel walk an unbounded amount of memory (and the previous
     /// `unwrap()` could panic the kernel).
+    ///
+    /// The scan does not know how far it goes, so it checks each page as it
+    /// reaches it. Checking only the first byte, it walked off the end of a
+    /// mapping into whatever came next, and a name that ran into a hole (or a
+    /// `PROT_NONE` page) without its `'\0'` was a kernel page fault: an
+    /// `open` of it took the machine. Linux's `strncpy_from_user` answers
+    /// `EFAULT` there.
     pub fn as_c_str(&self) -> Result<&'static str> {
-        self.check()?;
-        let len = (0..MAX_C_STR_LEN)
-            .find(|&i| unsafe { *self.0.add(i) == 0 })
-            .ok_or(Error::InvalidLength)?;
-        self.as_str(len)
+        for i in 0..MAX_C_STR_LEN {
+            let at = self.add(i);
+            if at.starts_a_page(i) {
+                at.check_len_for(1, MMUFlags::READ)?;
+            }
+            if unsafe { *at.0 } == 0 {
+                return self.as_str(i);
+            }
+        }
+        Err(Error::InvalidLength)
     }
 }
 
@@ -383,17 +421,22 @@ impl<P: 'static + Read> UserPtr<UserPtr<u8, P>, P> {
     // 并收集到一个 `Vec` 中。
     /// Copies a group of zero-terminated string into [`String`]s,
     /// and collect them into a [`Vec`].
+    ///
+    /// Each page of the array is checked as the walk reaches it, as in
+    /// [`as_c_str`](UserPtr::as_c_str): an `argv` with no `NULL` before the
+    /// end of its mapping used to be read on past it.
     pub fn read_cstring_array(&self) -> Result<Vec<String>> {
-        self.check()?;
         let mut result = Vec::new();
-        let mut pptr = self.0;
-        for _ in 0..MAX_C_STR_ARRAY_LEN {
-            let sptr = unsafe { pptr.read() };
+        for i in 0..MAX_C_STR_ARRAY_LEN {
+            let at = self.add(i);
+            if at.starts_a_page(i) {
+                at.check_len_for(1, MMUFlags::READ)?;
+            }
+            let sptr = unsafe { at.0.read() };
             if sptr.is_null() {
                 return Ok(result);
             }
             result.push(sptr.as_c_str()?.into());
-            pptr = unsafe { pptr.add(1) };
         }
         Err(Error::InvalidLength)
     }
@@ -405,7 +448,7 @@ impl<T, P: Write> UserPtr<T, P> {
     /// Overwrites a memory location with the given `value`
     /// **without** reading or dropping the old value.
     pub fn write(&mut self, value: T) -> Result<()> {
-        self.check()?;
+        self.check_len_for(1, MMUFlags::WRITE)?;
         #[cfg(all(not(feature = "libos"), feature = "uleak-scan"))]
         dbg_scan_physmap_leak(
             unsafe {
@@ -419,6 +462,17 @@ impl<T, P: Write> UserPtr<T, P> {
         );
         unsafe { self.0.write(value) };
         Ok(())
+    }
+
+    /// The checks [`write`](Self::write) makes before its store, without the
+    /// store: whether one value could be written here now.
+    ///
+    /// For a word the caller must only find written once something exists
+    /// that is not cheap to take back, asked before making it: `clone`'s
+    /// pidfd word names a process that does not exist yet, and a word that
+    /// cannot be written must make no process at all.
+    pub fn check_writable(&self) -> Result<()> {
+        self.check_len_for(1, MMUFlags::WRITE)
     }
 
     // 类似于写，
@@ -439,7 +493,7 @@ impl<T, P: Write> UserPtr<T, P> {
     /// The source and destination may not overlap.
     pub fn write_array(&mut self, values: &[T]) -> Result<()> {
         if !values.is_empty() {
-            self.check_len(values.len())?;
+            self.check_len_for(values.len(), MMUFlags::WRITE)?;
             #[cfg(all(not(feature = "libos"), feature = "uleak-scan"))]
             dbg_scan_physmap_leak(
                 unsafe {
@@ -466,7 +520,7 @@ impl<P: Write> UserPtr<u8, P> {
     pub fn write_cstring(&mut self, s: &str) -> Result<()> {
         let bytes = s.as_bytes();
         // +1: the NUL below is written past the array, so it must be bounded too.
-        self.check_len(bytes.len() + 1)?;
+        self.check_len_for(bytes.len() + 1, MMUFlags::WRITE)?;
         self.write_array(bytes)?;
         unsafe { self.0.add(bytes.len()).write(0) };
         Ok(())
@@ -1076,6 +1130,9 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod access_tests;
 
 #[cfg(test)]
 mod benches {

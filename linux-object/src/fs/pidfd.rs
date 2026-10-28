@@ -90,6 +90,22 @@ impl PidFd {
         self.thread.as_ref().map_or(self.process.id(), |t| t.id())
     }
 
+    /// The task its pid names, while that runs: its thread, or its process's
+    /// leader (`get_pid_task(pid, PIDTYPE_PID)`). `None` once that one has
+    /// exited, even with other threads of the process still running.
+    pub fn task(&self) -> Option<Arc<Thread>> {
+        let thread = match &self.thread {
+            Some(thread) => thread.clone(),
+            None => self
+                .process
+                .get_child(self.process.id())
+                .ok()?
+                .downcast_arc::<Thread>()
+                .ok()?,
+        };
+        (thread.state() != ThreadState::Dead).then_some(thread)
+    }
+
     /// Whether what it follows has exited: its thread, or its whole process.
     pub(crate) fn exited(&self) -> bool {
         match &self.thread {

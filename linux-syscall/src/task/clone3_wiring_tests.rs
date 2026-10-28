@@ -251,7 +251,8 @@ fn the_flags_word_reaches_sys_clone_which_refuses_a_namespace_this_kernel_has_no
         Ok(Clone3Args {
             flags: A_NAMESPACE as usize,
             newsp: 0,
-            parent_slot: 0,
+            parent_tid: 0,
+            pidfd: 0,
             tls: 0,
             child_tid: 0,
         }),
@@ -309,7 +310,8 @@ fn the_tls_word_reaches_sys_clone_as_the_tls_and_answers_an_errno_only_it_can_gi
         Ok(Clone3Args {
             flags: SETTLS as usize,
             newsp: 0,
-            parent_slot: 0,
+            parent_tid: 0,
+            pidfd: 0,
             tls: outside,
             child_tid: 0,
         }),
@@ -409,13 +411,13 @@ fn the_pidfd_slot_is_its_own_field_and_the_descriptor_lands_in_it() {
     // The third difference `clone3` exists for, after the separate exit
     // signal and the stack given as base plus length: the pidfd gets a field
     // of its own, where legacy `clone` has to report it through the
-    // `parent_tid` slot. So the decode moves word 1 into the argument legacy
-    // `clone` calls `parent_tid`, and only when `CLONE_PIDFD` is set.
+    // `parent_tid` slot. So the decode carries word 1 apart from word 3, to
+    // where the descriptor is handed over.
     //
-    // Which makes this the one test that pins word 1, the `parent_slot`
-    // argument, and the move between them: taking word 3 instead -- the
-    // obvious mistake, since that is the word legacy `clone` would have read
-    // -- is a write to a null pointer, i.e. EFAULT instead of a child.
+    // Which makes this the one test that pins word 1, the `pidfd` argument:
+    // taking word 3 instead -- the obvious mistake, since that is the word
+    // legacy `clone` would have read -- is a write to a null pointer, i.e.
+    // EFAULT instead of a child.
     let proc = a_process(47_186, "clone3-pidfd");
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
@@ -429,7 +431,8 @@ fn the_pidfd_slot_is_its_own_field_and_the_descriptor_lands_in_it() {
                 Ok(Clone3Args {
                     flags: PIDFD as usize,
                     newsp: 0,
-                    parent_slot: at,
+                    parent_tid: 0,
+                    pidfd: at,
                     tls: 0,
                     child_tid: 0,
                 }),
@@ -487,7 +490,8 @@ fn the_child_tid_word_reaches_sys_clone_and_the_new_task_writes_its_tid_there() 
                 Ok(Clone3Args {
                     flags: A_THREAD_ASKING_FOR_ITS_TID as usize,
                     newsp: 0,
-                    parent_slot: 0,
+                    parent_tid: 0,
+                    pidfd: 0,
                     tls: 0,
                     child_tid: at,
                 }),

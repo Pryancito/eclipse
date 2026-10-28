@@ -1429,6 +1429,60 @@ impl VmAddressRegion {
         }
     }
 
+    /// [`Self::range_is_mapped`], and every page of the range allows `access`
+    /// the way a fault on it would be asked: `VmMapping::handle_page_fault`
+    /// refuses a page whose flags do not grant the access ([`fault_grants`]:
+    /// a writable page may be read), so this does too.
+    ///
+    /// For a copy to or from user memory, which faults like the user would
+    /// and has no fixup when the mapping refuses: a `PROT_NONE` page read, or
+    /// a `PROT_READ` one written, was a kernel page fault, and with a lock
+    /// held, the machine. Walked by mapping and then by run of uniform flags,
+    /// so a buffer in one mapping with one protection is one lookup and one
+    /// run, as for [`Self::range_is_mapped`]. Like it, it asks about
+    /// mappings and not about present pages: an uncommitted page of a
+    /// writable mapping, or one shared copy-on-write, answers `true` and
+    /// faults in as usual.
+    pub fn range_allows(&self, addr: usize, len: usize, access: MMUFlags) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(end) = addr.checked_add(len - 1) else {
+            return false;
+        };
+        let mut at = addr;
+        loop {
+            let Some(mapping) = self.find_mapping(at) else {
+                return false;
+            };
+            let inner = mapping.inner.lock();
+            let mapping_end = inner.end_addr();
+            if mapping_end <= at || at < inner.addr {
+                // Not the mapping it was found for: refuse, as above.
+                return false;
+            }
+            // The pages of this mapping the range covers, and every run of
+            // flags that meets them. The runs come in order, so none after
+            // the last page is looked at.
+            let first = (at - inner.addr) / PAGE_SIZE;
+            let last = (end.min(mapping_end - 1) - inner.addr) / PAGE_SIZE;
+            let refused = inner
+                .flags
+                .runs()
+                .take_while(|&(start, _, _)| start <= last)
+                .any(|(start, count, flags)| {
+                    first < start + count && !fault_grants(flags).contains(access)
+                });
+            if refused {
+                return false;
+            }
+            if mapping_end > end {
+                return true;
+            }
+            at = mapping_end;
+        }
+    }
+
     /// Validate that a complete user address range is mapped with `access` permissions.
     pub fn check_user_range(&self, addr: usize, len: usize, access: MMUFlags) -> ZxResult {
         if len == 0 {
@@ -2317,6 +2371,27 @@ fn fault_publish_hook(vaddr: VirtAddr) {
 #[inline(always)]
 fn fault_publish_hook(_vaddr: VirtAddr) {}
 
+/// What a page whose mapping records `flags` may be touched with: the flags,
+/// and `READ` wherever there is `WRITE`.
+///
+/// Write implies read, as Linux has it on x86_64, aarch64 and riscv64: none
+/// of their page tables can say "written and not read" (riscv64 reserves the
+/// encoding), and their fault handlers take a read of a `PROT_WRITE` page
+/// (`access_error`, arm64's `do_page_fault`). So a program reads such a page,
+/// and `write(2)` copies from it. The mapping keeps the flags it was given,
+/// which is what `/proc/self/maps` shows (`-w-p`).
+///
+/// [`VmMapping::handle_page_fault`] and [`VmAddressRegion::range_allows`]
+/// both ask this, so the check before a copy and the fault the copy takes
+/// cannot disagree.
+fn fault_grants(flags: MMUFlags) -> MMUFlags {
+    if flags.contains(MMUFlags::WRITE) {
+        flags | MMUFlags::READ
+    } else {
+        flags
+    }
+}
+
 /// Pages a fault makes resident and maps, including the faulting one: the
 /// window `VmMapping::handle_page_fault` prefills with one source read and
 /// `fault_around` then maps read-only (Linux's default `fault_around_bytes`
@@ -3020,6 +3095,10 @@ impl VmMapping {
         if self.permissions.contains(MMUFlags::USER) {
             flags.insert(MMUFlags::USER);
         }
+        // Into the flags the page is mapped with, not only into the check: a
+        // read of a `PROT_WRITE` page drops `WRITE` below, and without `READ`
+        // it would be mapped granting nothing and fault again for ever.
+        flags = fault_grants(flags);
         // error!("page fault: addr = {:x}, access_flag = {:?}, flags = {:?}", vaddr, access_flags, flags);
         if !flags.contains(access_flags) {
             return Err(ZxError::ACCESS_DENIED);
@@ -5325,3 +5404,9 @@ mod mapped_bytes_tests;
 
 #[cfg(test)]
 mod fork_name_tests;
+
+#[cfg(test)]
+mod range_allows_tests;
+
+#[cfg(test)]
+mod range_allows_benches;

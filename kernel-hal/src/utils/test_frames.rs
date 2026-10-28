@@ -16,7 +16,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::sync::Mutex;
-use crate::{kernel_handler::KernelHandler, PhysAddr, PAGE_SIZE};
+use crate::{kernel_handler::KernelHandler, MMUFlags, PhysAddr, PAGE_SIZE};
 
 /// First frame handed out. The mock physical memory is 1 GiB; the half above
 /// 512 MiB is not used by anything else in this crate's tests.
@@ -69,6 +69,26 @@ pub(crate) fn allow_user_range(addr: usize, len: usize) {
     REFUSED.lock().retain(|&r| r != (addr, len));
 }
 
+/// Ranges this handler answers `check_user_access` with `false` for, when the
+/// access asked for is the one given: a page that is mapped and may be read
+/// but not written, or the other way round.
+static REFUSED_ACCESS: Mutex<Vec<(usize, usize, MMUFlags)>> = Mutex::new(Vec::new());
+
+/// Make this handler refuse `access` to `[addr, addr + len)` until
+/// [`allow_user_access`] takes it back. The range stays mapped.
+pub(crate) fn refuse_user_access(addr: usize, len: usize, access: MMUFlags) {
+    REFUSED_ACCESS.lock().push((addr, len, access));
+}
+
+/// Undo one [`refuse_user_access`].
+pub(crate) fn allow_user_access(addr: usize, len: usize, access: MMUFlags) {
+    REFUSED_ACCESS.lock().retain(|&r| r != (addr, len, access));
+}
+
+fn overlaps(vaddr: usize, len: usize, base: usize, n: usize) -> bool {
+    vaddr < base.saturating_add(n) && base < vaddr.saturating_add(len)
+}
+
 pub(crate) struct TestKernelHandler;
 
 impl KernelHandler for TestKernelHandler {
@@ -76,7 +96,14 @@ impl KernelHandler for TestKernelHandler {
         !REFUSED
             .lock()
             .iter()
-            .any(|&(base, n)| vaddr < base.saturating_add(n) && base < vaddr.saturating_add(len))
+            .any(|&(base, n)| overlaps(vaddr, len, base, n))
+    }
+
+    fn check_user_access(&self, vaddr: crate::VirtAddr, len: usize, access: MMUFlags) -> bool {
+        self.check_user_range(vaddr, len)
+            && !REFUSED_ACCESS.lock().iter().any(|&(base, n, refused)| {
+                refused.intersects(access) && overlaps(vaddr, len, base, n)
+            })
     }
 
     fn frame_alloc(&self) -> Option<PhysAddr> {

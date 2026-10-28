@@ -77,6 +77,29 @@ pub trait KernelHandler: Send + Sync + 'static {
     fn check_user_range(&self, _vaddr: VirtAddr, _len: usize) -> bool {
         true
     }
+
+    /// [`check_user_range`](KernelHandler::check_user_range), and every page
+    /// of the range also allows `access` (`READ` for a copy from the user,
+    /// `WRITE` for a copy to it).
+    ///
+    /// Being mapped is not enough to be touched. A `write(2)` from a
+    /// `PROT_NONE` page, or a `clock_gettime` into a `PROT_READ` one, passed
+    /// the mapping check, and the copy took a page fault the user's address
+    /// space refuses to resolve. Linux turns that fault into `EFAULT` through
+    /// its exception table; this kernel has none, so it either killed the
+    /// caller as an oops or, with a lock held, halted:
+    ///
+    /// ```text
+    /// [KERNEL PAGE FAULT] vaddr=0x608000 ... flags=READ rip=<memcpy+0x30>
+    /// [oops] kernel #PF unresolved by user vmar NOT contained
+    ///        (the CPU holds 1 kernel lock(s)) — halting
+    /// ```
+    ///
+    /// Defaults to the mapping check alone, so a handler that knows nothing
+    /// about permissions answers as before.
+    fn check_user_access(&self, vaddr: VirtAddr, len: usize, _access: MMUFlags) -> bool {
+        self.check_user_range(vaddr, len)
+    }
 }
 
 #[allow(dead_code)]
