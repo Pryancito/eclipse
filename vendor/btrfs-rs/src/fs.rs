@@ -2564,6 +2564,84 @@ mod compressed_tests {
         }
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn an_extent_claiming_exactly_the_inflate_ceiling_still_reads() {
+        let path = tmpfile("ceiling", 64 * 1024 * 1024);
+        let dev = open_dev(&path);
+        mkfs::format(&*dev, &opts()).unwrap();
+        let mut fs = Btrfs::mount(dev, false).unwrap();
+        let root = fs.root_ino();
+
+        // MAX_COMPRESSED_EXTENT is the largest result this driver will
+        // allocate for, taken from a field it reads straight off the disk.
+        // It is a ceiling, not the first size refused: an extent whose item
+        // claims exactly that much is legal and has to come back whole.
+        let plain = payload(MAX_COMPRESSED_EXTENT as usize);
+        let ino = install_zlib_file(&mut fs, "atcap", &plain);
+
+        // Lay a second stream down by hand, so its item can claim a
+        // ram_bytes the stream does not have. Its COMPRESSED length stays
+        // well under the ceiling, which is checked separately before the
+        // read even looks at the stream: what is on trial here is the claim.
+        let small = payload(8192);
+        let z = zlib(&small);
+        let sector = fs.vol.sectorsize as u64;
+        let disk_len = (z.len() as u64).div_ceil(sector) * sector;
+        assert!(
+            disk_len < MAX_COMPRESSED_EXTENT,
+            "the stream itself is too big"
+        );
+        fs.ensure_data_space(disk_len).unwrap();
+        let (bytenr, got) = fs.alloc.alloc_data(disk_len).unwrap();
+        assert_eq!(got, disk_len, "allocator split the extent");
+        let mut sectors = alloc::vec![0u8; disk_len as usize];
+        sectors[..z.len()].copy_from_slice(&z);
+        fs.vol.write_logical(bytenr, &sectors).unwrap();
+        fs.alloc.note_data_extent(bytenr, disk_len, FS_TREE, 0, 0);
+        let over = fs
+            .create(root, "overcap", FileKind::Regular, 0o644, 0)
+            .unwrap();
+        let item = encode_compressed_regular(
+            fs.generation,
+            bytenr,
+            disk_len,
+            0,
+            small.len() as u64,
+            MAX_COMPRESSED_EXTENT + 1,
+        );
+        fs.tree()
+            .insert(FS_TREE, Key::new(over, EXTENT_DATA_KEY, 0), &item)
+            .unwrap();
+        fs.apply_pending().unwrap();
+        install_csums(&mut fs, bytenr, &sectors);
+        let mut inode = fs.read_inode(over).unwrap();
+        inode.size = small.len() as u64;
+        inode.nbytes = small.len() as u64;
+        inode.flags &= !(INODE_NODATASUM | INODE_NODATACOW);
+        fs.write_inode(over, &inode).unwrap();
+        fs.commit(true).unwrap();
+        drop(fs);
+
+        // Re-mount so nothing is served out of a cache built while writing.
+        let mut fs = Btrfs::mount(open_dev(&path), true).unwrap();
+        let mut back = alloc::vec![0u8; plain.len()];
+        assert_eq!(
+            fs.read(ino, 0, &mut back).unwrap(),
+            plain.len(),
+            "an extent at the ceiling was not read whole"
+        );
+        assert_eq!(back, plain, "an extent at the ceiling did not read back");
+
+        let mut back = alloc::vec![0u8; small.len()];
+        assert_eq!(
+            fs.read(over, 0, &mut back),
+            Err(Error::Corrupt("compressed extent too large")),
+            "an extent claiming one byte past the ceiling was inflated anyway"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 // The other half of the B-tree engine's contract, the half that has to write.
