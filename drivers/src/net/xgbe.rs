@@ -777,6 +777,202 @@ pub const fn tx_desc3_frame_len(len: u32) -> u32 {
 /// `desc3` as a TCP payload length.
 pub const TX_DESC3_TSE: u32 = 1 << 18;
 
+// ——— Reaching the registers ———
+//
+// The batches so far were pure arithmetic over values read in one place. From
+// here on there are *sequences*: an order of writes, a bit polled until it
+// clears, a step that must not happen on an older core. Those are exactly the
+// parts that cannot be checked by reading the code back, and exactly the
+// parts that leave no trace when they are wrong --- a reset that was never
+// waited for does not report anything, it just hands over a chip that is
+// still resetting.
+//
+// So the same shape as `pcnet32` next door: the register access goes through
+// a trait, the real implementation is volatile MMIO, and the tests drive the
+// genuine sequence against an in-memory XGMAC. That is the only way anything
+// here can be exercised at all, since QEMU does not emulate this controller.
+
+/// Access to the XGMAC register block. Offsets are relative to the base of
+/// BAR0, so the constants above can be passed straight in.
+pub trait MmioAccess: Send + Sync {
+    /// Read one 32-bit register.
+    fn read32(&self, off: usize) -> u32;
+    /// Write one 32-bit register.
+    fn write32(&self, off: usize, value: u32);
+}
+
+/// Volatile MMIO against a mapped BAR0.
+pub struct Bar0 {
+    base: usize,
+}
+
+impl Bar0 {
+    /// Wrap a mapped BAR0 base address.
+    ///
+    /// # Safety
+    /// `base` must be a mapping of the device's BAR0 that stays valid for the
+    /// lifetime of this value, and at least [`MIN_XGMAC_BAR_LEN`] long.
+    pub const unsafe fn new(base: usize) -> Self {
+        Self { base }
+    }
+}
+
+impl MmioAccess for Bar0 {
+    fn read32(&self, off: usize) -> u32 {
+        // Safety: the constructor's contract covers the whole BAR.
+        unsafe { core::ptr::read_volatile((self.base + off) as *const u32) }
+    }
+
+    fn write32(&self, off: usize, value: u32) {
+        unsafe { core::ptr::write_volatile((self.base + off) as *mut u32, value) }
+    }
+}
+
+/// Linux's `SET_BITS`: replace `width` bits of `reg` at `index` with `value`.
+#[inline]
+pub const fn set_bits(reg: u32, index: u32, width: u32, value: u32) -> u32 {
+    let mask = ((1u32 << width) - 1) << index;
+    (reg & !mask) | ((value << index) & mask)
+}
+
+/// Linux's `XGMAC_IOWRITE_BITS`: read the register, replace one field, write
+/// it back.
+///
+/// Read-modify-write and not a bare write, which matters: every register
+/// touched below shares its word with fields that must survive the change.
+#[inline]
+pub fn write_field(acc: &dyn MmioAccess, off: usize, index: u32, width: u32, value: u32) {
+    let reg = acc.read32(off);
+    acc.write32(off, set_bits(reg, index, width, value));
+}
+
+/// Linux's `XGMAC_IOREAD_BITS`.
+#[inline]
+pub fn read_field(acc: &dyn MmioAccess, off: usize, index: u32, width: u32) -> u32 {
+    get_bits(acc.read32(off), index, width)
+}
+
+// ——— The DMA mode register, and the software reset ———
+
+/// `DMA_MR`: the DMA mode register.
+pub const DMA_MR: usize = 0x3000;
+/// `DMA_SBMR`: the system bus mode register.
+pub const DMA_SBMR: usize = 0x3004;
+
+/// `DMA_MR_SWR`, index 0, width 1: write one to start a software reset. The
+/// chip clears it when the reset is done, so this is both the command and the
+/// completion flag.
+pub const DMA_MR_SWR: (u32, u32) = (0, 1);
+
+/// `MTL_Q_BASE`: where queue 0's MTL registers start inside BAR0.
+pub const MTL_Q_BASE: usize = 0x1100;
+/// `MTL_Q_INC`: the stride between queues --- the same `0x80` as the DMA
+/// channels, and just as much of a trap, since the registers in a queue's
+/// block do not fill it.
+pub const MTL_Q_INC: usize = 0x80;
+/// `MTL_Q_TQOMR`: a transmit queue's operation mode register.
+pub const MTL_Q_TQOMR: usize = 0x00;
+/// `MTL_Q_RQOMR`: a receive queue's operation mode register.
+pub const MTL_Q_RQOMR: usize = 0x40;
+/// `MTL_Q_TQOMR_FTQ`, index 0, width 1: flush this transmit queue. Like
+/// `SWR`, the chip clears it when it is done.
+pub const MTL_Q_TQOMR_FTQ: (u32, u32) = (0, 1);
+
+/// The offset of per-queue register `reg` for queue `n`. Linux's
+/// `XGMAC_MTL_IOREAD`.
+#[inline]
+pub const fn mtl_queue_reg(n: u32, reg: usize) -> usize {
+    MTL_Q_BASE + MTL_Q_INC * n as usize + reg
+}
+
+/// How many times Linux polls a self-clearing bit before giving up
+/// (`count = 2000` in `__xgbe_exit` and `xgbe_flush_tx_queues`).
+pub const POLL_LIMIT: u32 = 2000;
+
+/// The core revision below which the transmit queues must not be flushed.
+/// `xgbe_flush_tx_queues` returns immediately when `SNPSVER < 0x21`.
+pub const FLUSH_MIN_SNPSVER: u8 = 0x21;
+
+/// Issue one software reset and wait for the chip to clear `SWR`.
+///
+/// `wait` is called between polls; the caller decides what a delay means
+/// here, which is also what lets a test run the sequence with no delay at
+/// all. Linux sleeps 10--15 us after the write and 500--600 us per poll.
+///
+/// Returns [`DeviceError::NotReady`] if the bit is still set after
+/// [`POLL_LIMIT`] polls --- Linux's `-EBUSY`.
+pub fn software_reset_once(acc: &dyn MmioAccess, wait: &mut dyn FnMut()) -> DeviceResult<()> {
+    let (index, width) = DMA_MR_SWR;
+    write_field(acc, DMA_MR, index, width, 1);
+    wait();
+
+    let mut count = POLL_LIMIT;
+    while count > 0 && read_field(acc, DMA_MR, index, width) != 0 {
+        count -= 1;
+        wait();
+    }
+    if count == 0 {
+        warn!("[xgbe] the controller did not come out of software reset");
+        return Err(DeviceError::NotReady);
+    }
+    Ok(())
+}
+
+/// Reset the controller, the way `xgbe_exit` does: **twice**.
+///
+/// Not a belt-and-braces flourish. Linux's own comment says it: "To guard
+/// against possible incorrectly generated interrupts, issue the software
+/// reset twice." A single reset can leave an interrupt pending that was
+/// raised while the engine was coming down, and the second one clears it.
+/// Dropping the second reset is the sort of change that looks like a
+/// simplification and shows up a week later as an interrupt storm at boot.
+pub fn software_reset(acc: &dyn MmioAccess, wait: &mut dyn FnMut()) -> DeviceResult<()> {
+    software_reset_once(acc, wait)?;
+    software_reset_once(acc, wait)
+}
+
+/// Flush every transmit queue, as `xgbe_flush_tx_queues` does.
+///
+/// Two things that are easy to get wrong and leave no trace:
+///
+/// * The whole step is **skipped** on a core older than
+///   [`FLUSH_MIN_SNPSVER`]. `FTQ` does not exist there, so writing it sets a
+///   reserved bit in a register that also holds the queue size and the
+///   store-and-forward mode.
+/// * All the queues are kicked **first**, and only then are they polled.
+///   Flushing one at a time and waiting for each serialises what the hardware
+///   does in parallel, and on eight queues that is eight timeouts' worth of
+///   worst case instead of one.
+pub fn flush_tx_queues(
+    acc: &dyn MmioAccess,
+    snps_ver: u8,
+    tx_queues: u32,
+    wait: &mut dyn FnMut(),
+) -> DeviceResult<()> {
+    if snps_ver < FLUSH_MIN_SNPSVER {
+        return Ok(());
+    }
+    let (index, width) = MTL_Q_TQOMR_FTQ;
+
+    for q in 0..tx_queues {
+        write_field(acc, mtl_queue_reg(q, MTL_Q_TQOMR), index, width, 1);
+    }
+
+    for q in 0..tx_queues {
+        let off = mtl_queue_reg(q, MTL_Q_TQOMR);
+        let mut count = POLL_LIMIT;
+        while count > 0 && read_field(acc, off, index, width) != 0 {
+            count -= 1;
+            wait();
+        }
+        if count == 0 {
+            warn!("[xgbe] transmit queue {} did not finish flushing", q);
+            return Err(DeviceError::NotReady);
+        }
+    }
+    Ok(())
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
@@ -1858,5 +2054,286 @@ mod tests {
         // The frame length can never set TSE by itself, which is what makes
         // the non-TSO path safe.
         assert_eq!(tx_desc3_frame_len(0xffff_ffff) & TX_DESC3_TSE, 0);
+    }
+
+    // ——— The sequences, against a fake XGMAC ———
+    //
+    // These are the first tests here that run real driver code rather than
+    // checking a number. The fake is deliberately not a stub that returns
+    // zero: a self-clearing bit that clears immediately would pass a reset
+    // routine that never polls at all, so the fake clears `SWR` and `FTQ`
+    // only after a configurable number of reads, and records every access in
+    // order.
+
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
+    /// Every register touch, in order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Access {
+        Read(usize),
+        Write(usize, u32),
+    }
+
+    struct FakeXgmac {
+        /// Sparse register file.
+        regs: RefCell<alloc::collections::BTreeMap<usize, u32>>,
+        log: RefCell<Vec<Access>>,
+        /// How many reads a self-clearing bit survives before the fake
+        /// clears it. 0 means it clears on the first read.
+        clear_after: RefCell<alloc::collections::BTreeMap<usize, u32>>,
+        /// Never clear these, to exercise the timeout.
+        stuck: RefCell<alloc::collections::BTreeSet<usize>>,
+    }
+
+    // The fake is only ever touched from the test thread; `MmioAccess`
+    // requires Send + Sync because a real driver holds one across CPUs.
+    unsafe impl Send for FakeXgmac {}
+    unsafe impl Sync for FakeXgmac {}
+
+    impl FakeXgmac {
+        fn new() -> Self {
+            Self {
+                regs: RefCell::new(alloc::collections::BTreeMap::new()),
+                log: RefCell::new(Vec::new()),
+                clear_after: RefCell::new(alloc::collections::BTreeMap::new()),
+                stuck: RefCell::new(alloc::collections::BTreeSet::new()),
+            }
+        }
+
+        /// Preload a register, as a chip with other fields already set would
+        /// present it. Not logged: this is the chip's state, not an access.
+        fn preload(&self, off: usize, value: u32) {
+            self.regs.borrow_mut().insert(off, value);
+        }
+
+        /// Make `off`'s bit 0 survive `n` reads before clearing.
+        fn clear_bit0_after(&self, off: usize, n: u32) {
+            self.clear_after.borrow_mut().insert(off, n);
+        }
+
+        /// Make `off`'s bit 0 never clear.
+        fn stick_bit0(&self, off: usize) {
+            self.stuck.borrow_mut().insert(off);
+        }
+
+        fn log(&self) -> Vec<Access> {
+            self.log.borrow().clone()
+        }
+
+        fn writes_to(&self, off: usize) -> usize {
+            self.log()
+                .iter()
+                .filter(|a| matches!(a, Access::Write(o, _) if *o == off))
+                .count()
+        }
+
+        fn reads_of(&self, off: usize) -> usize {
+            self.log()
+                .iter()
+                .filter(|a| matches!(a, Access::Read(o) if *o == off))
+                .count()
+        }
+    }
+
+    impl MmioAccess for FakeXgmac {
+        fn read32(&self, off: usize) -> u32 {
+            self.log.borrow_mut().push(Access::Read(off));
+            let mut regs = self.regs.borrow_mut();
+            let value = *regs.get(&off).unwrap_or(&0);
+            if value & 1 != 0 && !self.stuck.borrow().contains(&off) {
+                let mut after = self.clear_after.borrow_mut();
+                match after.get_mut(&off) {
+                    Some(0) | None => {
+                        regs.insert(off, value & !1);
+                    }
+                    Some(left) => *left -= 1,
+                }
+            }
+            value
+        }
+
+        fn write32(&self, off: usize, value: u32) {
+            self.log.borrow_mut().push(Access::Write(off, value));
+            self.regs.borrow_mut().insert(off, value);
+        }
+    }
+
+    /// A delay that counts how often it was called.
+    fn counting_wait(n: &core::cell::Cell<u32>) -> impl FnMut() + '_ {
+        move || n.set(n.get() + 1)
+    }
+
+    #[test]
+    fn set_bits_replaces_only_its_own_field() {
+        // Linux's `SET_BITS`.
+        assert_eq!(set_bits(0, 0, 1, 1), 1);
+        assert_eq!(set_bits(0xffff_ffff, 0, 1, 0), 0xffff_fffe);
+        assert_eq!(set_bits(0, 16, 10, 0x3ff), 0x3ff << 16);
+        // A value wider than the field cannot spill into the next one.
+        assert_eq!(set_bits(0, 4, 3, 0xff), 0x7 << 4);
+        // And the rest of the word survives.
+        assert_eq!(set_bits(0xdead_0000, 0, 1, 1), 0xdead_0001);
+    }
+
+    #[test]
+    fn writing_a_field_is_a_read_modify_write() {
+        // This is why `write_field` exists rather than a bare store: every
+        // register the sequences touch shares its word with fields that must
+        // survive. `MTL_Q_TQOMR` holds the queue size and the
+        // store-and-forward mode alongside `FTQ`.
+        let fake = FakeXgmac::new();
+        fake.preload(MTL_Q_TQOMR, 0x0123_0000);
+        write_field(&fake, MTL_Q_TQOMR, 0, 1, 1);
+        assert_eq!(fake.log()[0], Access::Read(MTL_Q_TQOMR));
+        assert_eq!(fake.log()[1], Access::Write(MTL_Q_TQOMR, 0x0123_0001));
+    }
+
+    #[test]
+    fn the_dma_mode_and_mtl_queue_registers_are_where_linux_says() {
+        assert_eq!(DMA_MR, 0x3000);
+        assert_eq!(DMA_SBMR, 0x3004);
+        assert_eq!(MTL_Q_BASE, 0x1100);
+        assert_eq!(MTL_Q_INC, 0x80);
+        assert_eq!(MTL_Q_TQOMR, 0x00);
+        assert_eq!(MTL_Q_RQOMR, 0x40);
+        assert_eq!(DMA_MR_SWR, (0, 1));
+        assert_eq!(MTL_Q_TQOMR_FTQ, (0, 1));
+        assert_eq!(POLL_LIMIT, 2000);
+        // The MTL block sits below the DMA block, and neither reaches the
+        // other: MTL queue 15's last register is still under DMA_MR.
+        assert!(mtl_queue_reg(15, MTL_Q_RQOMR) < DMA_MR);
+    }
+
+    #[test]
+    fn a_queues_registers_are_its_index_times_the_stride() {
+        assert_eq!(mtl_queue_reg(0, MTL_Q_TQOMR), 0x1100);
+        assert_eq!(mtl_queue_reg(1, MTL_Q_TQOMR), 0x1180);
+        assert_eq!(mtl_queue_reg(1, MTL_Q_RQOMR), 0x11c0);
+        assert_eq!(mtl_queue_reg(7, MTL_Q_TQOMR), 0x1100 + 7 * 0x80);
+    }
+
+    #[test]
+    fn the_reset_is_issued_twice_on_purpose() {
+        // Linux's comment in `xgbe_exit`: "To guard against possible
+        // incorrectly generated interrupts, issue the software reset twice."
+        // Collapsing it to one looks like a simplification and shows up as
+        // an interrupt storm at boot, so the count is the test.
+        let fake = FakeXgmac::new();
+        let n = core::cell::Cell::new(0);
+        assert!(software_reset(&fake, &mut counting_wait(&n)).is_ok());
+        assert_eq!(fake.writes_to(DMA_MR), 2);
+        for a in fake.log() {
+            if let Access::Write(off, value) = a {
+                assert_eq!(off, DMA_MR);
+                assert_eq!(value & 1, 1, "the write must set SWR");
+            }
+        }
+    }
+
+    #[test]
+    fn the_reset_waits_for_the_chip_instead_of_assuming() {
+        // A chip that holds SWR for a while must be polled until it clears.
+        // A routine that wrote the bit and returned would pass a "reset"
+        // chip that is still resetting --- and nothing would report it.
+        let fake = FakeXgmac::new();
+        fake.clear_bit0_after(DMA_MR, 5);
+        let n = core::cell::Cell::new(0);
+        assert!(software_reset_once(&fake, &mut counting_wait(&n)).is_ok());
+        // One read per poll until it cleared, so more than one read.
+        assert!(
+            fake.reads_of(DMA_MR) > 2,
+            "polled {} times",
+            fake.reads_of(DMA_MR)
+        );
+        // And the delay was actually used: once after the write, once per
+        // poll that found the bit still set.
+        assert!(n.get() >= 2, "waited {} times", n.get());
+    }
+
+    #[test]
+    fn a_chip_stuck_in_reset_is_reported_not_waited_on_forever() {
+        // Linux's `-EBUSY` after 2000 polls.
+        let fake = FakeXgmac::new();
+        fake.stick_bit0(DMA_MR);
+        let n = core::cell::Cell::new(0);
+        assert_eq!(
+            software_reset_once(&fake, &mut counting_wait(&n)),
+            Err(DeviceError::NotReady)
+        );
+        // POLL_LIMIT polls, plus the one read of the read-modify-write that
+        // issued the reset in the first place.
+        assert_eq!(fake.reads_of(DMA_MR), POLL_LIMIT as usize + 1);
+    }
+
+    #[test]
+    fn a_failed_first_reset_does_not_issue_the_second() {
+        let fake = FakeXgmac::new();
+        fake.stick_bit0(DMA_MR);
+        let n = core::cell::Cell::new(0);
+        assert!(software_reset(&fake, &mut counting_wait(&n)).is_err());
+        assert_eq!(fake.writes_to(DMA_MR), 1);
+    }
+
+    #[test]
+    fn an_older_core_is_not_asked_to_flush_its_queues() {
+        // `xgbe_flush_tx_queues` returns immediately below SNPSVER 0x21,
+        // because FTQ does not exist there --- writing it would set a
+        // reserved bit in a register that also holds the queue size and the
+        // store-and-forward mode.
+        assert_eq!(FLUSH_MIN_SNPSVER, 0x21);
+        for ver in [0x00u8, 0x10, 0x20] {
+            let fake = FakeXgmac::new();
+            let n = core::cell::Cell::new(0);
+            assert!(flush_tx_queues(&fake, ver, 8, &mut counting_wait(&n)).is_ok());
+            assert!(fake.log().is_empty(), "core {:#04x} was touched", ver);
+        }
+    }
+
+    #[test]
+    fn every_queue_is_kicked_before_any_is_polled() {
+        // The order is the point. Flushing one queue at a time and waiting
+        // for each serialises what the hardware does in parallel: on eight
+        // queues that is eight timeouts' worth of worst case instead of one.
+        let fake = FakeXgmac::new();
+        for q in 0..4 {
+            fake.clear_bit0_after(mtl_queue_reg(q, MTL_Q_TQOMR), 3);
+        }
+        let n = core::cell::Cell::new(0);
+        assert!(flush_tx_queues(&fake, 0x30, 4, &mut counting_wait(&n)).is_ok());
+
+        let log = fake.log();
+        let last_write = log
+            .iter()
+            .rposition(|a| matches!(a, Access::Write(..)))
+            .expect("there must be writes");
+        let first_poll_read = log
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| matches!(a, Access::Read(..)))
+            // The read-modify-write of each kick reads too, so the polls are
+            // the reads that come after the last write.
+            .map(|(i, _)| i)
+            .find(|i| *i > last_write)
+            .expect("there must be polls");
+        assert!(first_poll_read > last_write);
+        // All four queues were kicked, each exactly once.
+        for q in 0..4 {
+            assert_eq!(fake.writes_to(mtl_queue_reg(q, MTL_Q_TQOMR)), 1);
+        }
+    }
+
+    #[test]
+    fn a_queue_that_will_not_flush_is_reported_with_its_number() {
+        let fake = FakeXgmac::new();
+        fake.stick_bit0(mtl_queue_reg(2, MTL_Q_TQOMR));
+        let n = core::cell::Cell::new(0);
+        assert_eq!(
+            flush_tx_queues(&fake, 0x30, 4, &mut counting_wait(&n)),
+            Err(DeviceError::NotReady)
+        );
+        // Queue 3 is never polled, because queue 2 failed first --- and all
+        // four were still kicked before any poll.
+        assert_eq!(fake.writes_to(mtl_queue_reg(3, MTL_Q_TQOMR)), 1);
     }
 }
