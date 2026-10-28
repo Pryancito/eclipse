@@ -119,6 +119,10 @@ fn mount_path(proc: &LinuxProcess, path: &str, follow: bool) -> LxResult<String>
 #[cfg(test)]
 mod path_tests;
 
+/// What a bind takes from the call that makes it.
+#[cfg(test)]
+mod bind_tests;
+
 #[cfg(test)]
 mod tests {
     //! The privilege gate of the mount table, which had no test of its own.

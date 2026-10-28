@@ -3,10 +3,10 @@
 //! here: the kernel's are one each for the whole process, and every test that
 //! makes a process resets the table.
 
-use super::super::{line_entry, new_mount_entry, record_mount, MountEntry};
+use super::super::mount_state::{MS_BIND, MS_RDONLY, MS_REMOUNT};
+use super::super::{line_entry, new_mount_entry, record_mount, remount_entry, MountEntry};
 use super::{
     bind_from, mount_holder_from, move_from, resolve_from, umount_from, MNT_DETACH, MNT_FORCE,
-    MS_BIND,
 };
 use crate::error::LxError;
 use alloc::string::String;
@@ -130,8 +130,13 @@ fn world() -> World {
 impl World {
     /// Mount `fs` at `at` as the kernel does, and list it as `source`.
     fn mount(&self, source: &str, at: &str, fs: Arc<dyn FileSystem>) {
+        self.mount_as(source, at, fs, "rw");
+    }
+
+    /// [`Self::mount`], with `options` in its line and its flags.
+    fn mount_as(&self, source: &str, at: &str, fs: Arc<dyn FileSystem>, options: &str) {
         resolve_from(&self.root, at).unwrap().mount(fs).unwrap();
-        let entry = new_mount_entry(source, at, "tmpfs", "rw", None);
+        let entry = new_mount_entry(source, at, "tmpfs", options, None);
         record_mount(&mut self.table.lock(), entry);
     }
 
@@ -162,7 +167,7 @@ impl World {
 fn a_bind_of_a_mount_shows_its_files_and_umount_takes_it_down() {
     let w = world();
     w.mount("srcA", "/a", fs_with("x"));
-    bind_from(&w.root, &w.table, "/a", "/b", MS_BIND, "").unwrap();
+    bind_from(&w.root, &w.table, "/a", "/b").unwrap();
     assert!(w.shows("/b", "x"));
     assert_eq!(w.at("/b"), ["srcA"], "the line names the origin's source");
 
@@ -178,7 +183,7 @@ fn a_mount_on_a_mount_goes_on_top_and_umount_uncovers_the_one_below() {
     let w = world();
     w.mount("first", "/a", fs_with("x"));
     w.mount("second", "/c", fs_with("y"));
-    bind_from(&w.root, &w.table, "/c", "/a", MS_BIND, "").unwrap();
+    bind_from(&w.root, &w.table, "/c", "/a").unwrap();
     assert!(w.shows("/a", "y") && !w.shows("/a", "x"));
     assert_eq!(w.at("/a"), ["first", "second"]);
     {
@@ -333,7 +338,7 @@ fn what_is_not_a_mount_cannot_be_unmounted_or_moved() {
             Err(LxError::ENOENT)
         );
         assert_eq!(
-            bind_from(&w.root, &w.table, path, "/c", MS_BIND, ""),
+            bind_from(&w.root, &w.table, path, "/c"),
             Err(LxError::ENOENT)
         );
     }
@@ -376,7 +381,7 @@ fn with_d() -> World {
 #[test]
 fn a_bind_of_a_plain_directory_shows_it_and_nothing_else_of_its_mount() {
     let w = with_d();
-    bind_from(&w.root, &w.table, "/a/d", "/b", MS_BIND, "").unwrap();
+    bind_from(&w.root, &w.table, "/a/d", "/b").unwrap();
     assert!(w.shows("/b", "x") && w.shows("/b", "e"));
     assert!(!w.shows("/b", "out"), "it shows the whole mount");
     let line = line_at(&w, "/b");
@@ -404,7 +409,7 @@ fn a_bind_of_a_plain_directory_shows_it_and_nothing_else_of_its_mount() {
 #[test]
 fn dot_dot_from_a_bind_of_a_directory_is_where_it_is_mounted() {
     let w = with_d();
-    bind_from(&w.root, &w.table, "/a/d", "/b", MS_BIND, "").unwrap();
+    bind_from(&w.root, &w.table, "/a/d", "/b").unwrap();
     for up in ["/b/..", "/b/e/../.."].iter() {
         let at = resolve_from(&w.root, up).unwrap();
         assert!(at.is_same_node(&w.root), "{} is not /", up);
@@ -418,8 +423,8 @@ fn dot_dot_from_a_bind_of_a_directory_is_where_it_is_mounted() {
 #[test]
 fn a_bind_of_a_directory_inside_a_bind_has_the_two_roots_joined() {
     let w = with_d();
-    bind_from(&w.root, &w.table, "/a/d", "/b", MS_BIND, "").unwrap();
-    bind_from(&w.root, &w.table, "/b/e", "/c", MS_BIND, "").unwrap();
+    bind_from(&w.root, &w.table, "/a/d", "/b").unwrap();
+    bind_from(&w.root, &w.table, "/b/e", "/c").unwrap();
     let line = line_at(&w, "/c");
     assert_eq!((line.source.as_str(), line.root.as_str()), ("srcA", "/d/e"));
     resolve_from(&w.root, "/c")
@@ -433,7 +438,7 @@ fn a_bind_of_a_directory_inside_a_bind_has_the_two_roots_joined() {
 fn a_plain_bind_does_not_carry_the_mounts_inside_the_directory() {
     let w = with_d();
     w.mount("inner", "/a/d/e", fs_with("z"));
-    bind_from(&w.root, &w.table, "/a/d", "/b", MS_BIND, "").unwrap();
+    bind_from(&w.root, &w.table, "/a/d", "/b").unwrap();
     assert!(w.shows("/b", "e"));
     assert!(!w.shows("/b/e", "z"), "the mount at /a/d/e came along");
     assert!(w.shows("/a/d/e", "z"));
@@ -442,7 +447,7 @@ fn a_plain_bind_does_not_carry_the_mounts_inside_the_directory() {
 #[test]
 fn umount_of_a_bind_of_a_directory_leaves_the_directory() {
     let w = with_d();
-    bind_from(&w.root, &w.table, "/a/d", "/b", MS_BIND, "").unwrap();
+    bind_from(&w.root, &w.table, "/a/d", "/b").unwrap();
     umount_from(&w.root, &w.table, "/b", 0).unwrap();
     assert!(!w.shows("/b", "x"));
     assert!(w.at("/b").is_empty());
@@ -452,7 +457,7 @@ fn umount_of_a_bind_of_a_directory_leaves_the_directory() {
 #[test]
 fn a_moved_bind_of_a_directory_keeps_its_root() {
     let w = with_d();
-    bind_from(&w.root, &w.table, "/a/d", "/b", MS_BIND, "").unwrap();
+    bind_from(&w.root, &w.table, "/a/d", "/b").unwrap();
     move_from(&w.root, &w.table, "/b", "/c").unwrap();
     assert!(w.shows("/c", "x") && !w.shows("/b", "x"));
     assert_eq!(line_at(&w, "/c").root, "/d");
@@ -461,7 +466,7 @@ fn a_moved_bind_of_a_directory_keeps_its_root() {
 #[test]
 fn the_root_itself_can_be_bound_and_shows_nothing_mounted_in_it() {
     let w = with_d();
-    bind_from(&w.root, &w.table, "/", "/p", MS_BIND, "").unwrap();
+    bind_from(&w.root, &w.table, "/", "/p").unwrap();
     assert!(w.shows("/p", "a") && w.shows("/p", "b"));
     assert!(!w.shows("/p/a", "out"), "the mount at /a came along");
     let line = line_at(&w, "/p");
@@ -475,7 +480,7 @@ fn the_root_itself_can_be_bound_and_shows_nothing_mounted_in_it() {
 fn a_directory_bound_onto_itself_becomes_a_mount_point_and_shows_the_same() {
     // `mount --bind dir dir`, the usual way to make a directory a mount point.
     let w = with_d();
-    bind_from(&w.root, &w.table, "/a/d", "/a/d", MS_BIND, "").unwrap();
+    bind_from(&w.root, &w.table, "/a/d", "/a/d").unwrap();
     assert!(w.shows("/a/d", "x"));
     assert!(mount_holder_from(&w.root, "/a/d").unwrap().is_some());
     assert_eq!(line_at(&w, "/a/d").root, "/d");
@@ -497,19 +502,121 @@ fn a_bind_needs_a_directory_on_both_sides() {
         .unwrap();
     drop(f);
     assert_eq!(
-        bind_from(&w.root, &w.table, "/a/d/x", "/b", MS_BIND, ""),
+        bind_from(&w.root, &w.table, "/a/d/x", "/b"),
         Err(LxError::ENOTDIR),
         "a file bound onto a directory"
     );
     assert_eq!(
-        bind_from(&w.root, &w.table, "/a/d", "/p/f", MS_BIND, ""),
+        bind_from(&w.root, &w.table, "/a/d", "/p/f"),
         Err(LxError::ENOTDIR),
         "a directory bound onto a file"
     );
     assert_eq!(
-        bind_from(&w.root, &w.table, "/a/d/nowhere", "/b", MS_BIND, ""),
+        bind_from(&w.root, &w.table, "/a/d/nowhere", "/b"),
         Err(LxError::ENOENT)
     );
     assert!(!w.shows("/b", "x"));
     assert!(w.at("/b").is_empty() && w.at("/p/f").is_empty());
+}
+
+/// `/a` mounted with `options`, with the directory `d` in it.
+fn with_d_as(options: &str) -> World {
+    let w = world();
+    w.mount_as("srcA", "/a", fs_with("out"), options);
+    resolve_from(&w.root, "/a")
+        .unwrap()
+        .create("d", FileType::Dir, 0o755)
+        .unwrap();
+    w
+}
+
+/// SURVEY36 on Linux 6.18: a bind of a directory in a `nosuid,nodev,noexec`
+/// tmpfs is all three, and its line has that mount's options.
+#[test]
+fn a_bind_is_what_the_mount_it_is_taken_from_is() {
+    let w = with_d_as("rw,nosuid,nodev,noexec,size=1m");
+    bind_from(&w.root, &w.table, "/a/d", "/b").unwrap();
+    let line = line_at(&w, "/b");
+    assert_eq!(line.options, "rw,nosuid,nodev,noexec,size=1m");
+    assert!(line.state.is_nosuid(), "nosuid");
+    assert!(line.state.is_nodev(), "nodev");
+    assert!(line.state.is_noexec(), "noexec");
+    assert!(!line.state.is_read_only(), "read-only");
+}
+
+#[test]
+fn a_bind_of_a_read_only_mount_cannot_be_written_through() {
+    let w = with_d_as("ro");
+    bind_from(&w.root, &w.table, "/a/d", "/b").unwrap();
+    assert_eq!(line_at(&w, "/b").options, "ro");
+    let b = resolve_from(&w.root, "/b").unwrap();
+    assert_eq!(
+        b.create("new", FileType::File, 0o644).err(),
+        Some(FsError::ReadOnly)
+    );
+}
+
+/// The bind has flags of its own: `mount -o remount,bind,ro` on it leaves
+/// the mount it was taken from as it was.
+#[test]
+fn a_remount_of_a_bind_changes_the_bind_and_not_its_mount() {
+    let w = with_d_as("rw,nosuid");
+    bind_from(&w.root, &w.table, "/a/d", "/b").unwrap();
+    remount_entry(
+        &mut w.table.lock(),
+        "/b",
+        MS_REMOUNT | MS_BIND | MS_RDONLY,
+        "",
+    )
+    .unwrap();
+    assert!(line_at(&w, "/b").state.is_read_only());
+    let a = line_at(&w, "/a");
+    assert!(!a.state.is_read_only(), "the remount reached the mount");
+    assert_eq!(a.options, "rw,nosuid");
+    let made = resolve_from(&w.root, "/b")
+        .unwrap()
+        .create("new", FileType::File, 0o644);
+    assert_eq!(made.err(), Some(FsError::ReadOnly));
+}
+
+#[test]
+fn a_bind_of_a_bind_takes_the_flags_on() {
+    let w = with_d_as("rw,noexec");
+    bind_from(&w.root, &w.table, "/a/d", "/b").unwrap();
+    bind_from(&w.root, &w.table, "/b", "/c").unwrap();
+    let line = line_at(&w, "/c");
+    assert_eq!(
+        (line.options.as_str(), line.root.as_str()),
+        ("rw,noexec", "/d")
+    );
+    assert!(line.state.is_noexec());
+}
+
+#[test]
+fn a_bind_of_a_whole_mount_takes_its_flags() {
+    let w = with_d_as("rw,nosuid,nodev");
+    bind_from(&w.root, &w.table, "/a", "/b").unwrap();
+    let line = line_at(&w, "/b");
+    assert_eq!(line.options, "rw,nosuid,nodev");
+    assert!(line.state.is_nosuid() && line.state.is_nodev());
+}
+
+/// With no line for the mount the source is on, the bind names the path it
+/// took, `none` and a plain `rw`.
+#[test]
+fn a_bind_from_where_no_mount_is_listed_is_a_plain_one() {
+    let w = with_d();
+    w.table.lock().clear();
+    bind_from(&w.root, &w.table, "/a/d", "/b").unwrap();
+    let line = line_at(&w, "/b");
+    assert_eq!(
+        (
+            line.source.as_str(),
+            line.fstype.as_str(),
+            line.root.as_str(),
+            line.options.as_str()
+        ),
+        ("/a/d", "none", "/", "rw")
+    );
+    assert!(!line.state.is_read_only() && !line.state.is_noexec());
 }
