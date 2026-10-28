@@ -8,8 +8,7 @@ fn apps(n: usize) -> PopupKind {
         all: (0..n)
             .map(|i| apps::AppEntry {
                 name: format!("app {i}"),
-                exec: String::new(),
-                icon: None,
+                ..apps::AppEntry::default()
             })
             .collect(),
         filter: String::new(),
@@ -237,8 +236,7 @@ fn the_menu_filter_matches_the_way_someone_types_it() {
         .iter()
         .map(|n| apps::AppEntry {
             name: (*n).into(),
-            exec: String::new(),
-            icon: None,
+            ..apps::AppEntry::default()
         })
         .collect();
     // An empty filter is every app, in order.

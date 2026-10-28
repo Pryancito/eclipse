@@ -1155,6 +1155,398 @@ pub fn set_mac_address(acc: &dyn MmioAccess, mac: [u8; 6]) {
     acc.write32(MAC_MACA0LR, lo);
 }
 
+// ——— Turning the thing on ———
+//
+// Three layers sit between a descriptor and the wire: the DMA channel that
+// fetches it, the MTL queue that buffers the frame, and the MAC that puts it
+// on the line. Bringing them up means enabling all three, and the order is
+// **inside out** --- channel, then queue, then MAC --- in both directions.
+//
+// That order is the whole content of these two functions, and it is not
+// arbitrary. Enabling the MAC first would open the line into a path whose
+// queues and channels are not running yet: on receive that is frames arriving
+// at a queue that cannot drain, and the chip's answer to that is to drop them
+// and raise an overflow. Enabling inside out means every stage downstream of
+// the one being switched on is already able to move data.
+//
+// What is NOT here is the matching disable, and that is deliberate rather
+// than unfinished: **the disable is not this sequence reversed**, and the two
+// directions do not even disable the same way as each other.
+//
+//   * `xgbe_disable_tx` goes inside out *again* --- channels, then queues,
+//     then the MAC last --- with a wait for the DMA to finish its pending
+//     descriptors before it starts and a wait for each MTL queue to drain in
+//     the middle. The MAC stays up until the end precisely so that what is
+//     already queued can still get out.
+//   * `xgbe_disable_rx` goes the other way, outside in: the MAC first, then
+//     the queues, then the channels. Nothing new must be accepted before the
+//     path behind it is torn down.
+//
+// So "disable is enable backwards" is wrong for transmit, and "transmit and
+// receive are symmetric" is wrong for disable. Both are exactly the kind of
+// tidying-up a later reader would apply, which is why the asymmetry is
+// written down here before the code that depends on it exists. The two
+// disable paths need the drain loops, so they come in their own batch.
+
+/// `MAC_TCR`: the MAC's transmit configuration.
+pub const MAC_TCR: usize = 0x0000;
+/// `MAC_RCR`: the MAC's receive configuration.
+pub const MAC_RCR: usize = 0x0004;
+/// `MAC_RQC0R`: receive queue control 0 --- which receive queues are enabled.
+pub const MAC_RQC0R: usize = 0x00a0;
+
+/// `MAC_TCR_TE`, index 0, width 1: transmitter enable.
+pub const MAC_TCR_TE: (u32, u32) = (0, 1);
+/// `MAC_RCR_RE`, index 0, width 1: receiver enable.
+pub const MAC_RCR_RE: (u32, u32) = (0, 1);
+/// `MAC_RCR_ACS`, index 1, width 1: strip the pad and FCS from a received
+/// frame.
+pub const MAC_RCR_ACS: (u32, u32) = (1, 1);
+/// `MAC_RCR_CST`, index 2, width 1: CRC stripping for type frames.
+pub const MAC_RCR_CST: (u32, u32) = (2, 1);
+/// `MAC_RCR_DCRCC`, index 3, width 1: do **not** check the received CRC.
+/// Linux clears it, so the MAC does check.
+pub const MAC_RCR_DCRCC: (u32, u32) = (3, 1);
+
+/// `MTL_Q_TQOMR_TXQEN`, index 2, width **2**.
+pub const MTL_Q_TQOMR_TXQEN: (u32, u32) = (2, 2);
+/// `MTL_Q_ENABLED`: the value that enables a queue, which is **2 and not 1**.
+/// `TXQEN` is two bits wide and 1 means "enabled for average-bit-rate
+/// scheduling", a different mode. Writing a boolean into it is the mistake
+/// the field's width invites.
+pub const MTL_Q_ENABLED: u32 = 0x02;
+/// `MTL_Q_DISABLED`.
+pub const MTL_Q_DISABLED: u32 = 0x00;
+
+/// The offset of per-channel register `reg` for channel `n`, relative to the
+/// base of BAR0 --- i.e. what [`MmioAccess`] wants, where [`channel_regs`]
+/// takes a mapped address. Same arithmetic, different starting point, and
+/// mixing them up is an access at a wild address.
+#[inline]
+pub const fn dma_channel_reg(n: u32, reg: usize) -> usize {
+    channel_regs(0, n) + reg
+}
+
+/// `DMA_CH_TCR_ST`, index 0, width 1: start this channel's transmit engine.
+pub const DMA_CH_TCR_ST: (u32, u32) = (0, 1);
+/// `DMA_CH_RCR_SR`, index 0, width 1: start this channel's receive engine.
+pub const DMA_CH_RCR_SR: (u32, u32) = (0, 1);
+
+/// The value for `MAC_RQC0R` that enables the first `queues` receive queues.
+///
+/// Linux builds it as `reg_val |= (0x02 << (i << 1))`: two bits per queue,
+/// and the enabled value in those two bits is **2**, the same `MTL_Q_ENABLED`
+/// as the transmit side. So eight queues is `0xaaaa`, not `0xff`.
+///
+/// The register is written **whole**, not read-modify-written, which is also
+/// how a queue gets disabled: `xgbe_disable_rx` writes a bare zero. That
+/// means any queue not named here is switched off by the same write.
+#[inline]
+pub const fn rx_queue_enable_map(queues: u32) -> u32 {
+    let mut map = 0u32;
+    let mut i = 0;
+    while i < queues && i < 16 {
+        map |= MTL_Q_ENABLED << (i << 1);
+        i += 1;
+    }
+    map
+}
+
+/// Enable transmit: every channel, then every queue, then the MAC.
+///
+/// `channels` and `queues` come from [`HwFeatures`], not from a guess.
+pub fn enable_tx(acc: &dyn MmioAccess, channels: u32, queues: u32) {
+    for ch in 0..channels {
+        let off = dma_channel_reg(ch, DMA_CH_TCR);
+        write_field(acc, off, DMA_CH_TCR_ST.0, DMA_CH_TCR_ST.1, 1);
+    }
+    for q in 0..queues {
+        write_field(
+            acc,
+            mtl_queue_reg(q, MTL_Q_TQOMR),
+            MTL_Q_TQOMR_TXQEN.0,
+            MTL_Q_TQOMR_TXQEN.1,
+            MTL_Q_ENABLED,
+        );
+    }
+    write_field(acc, MAC_TCR, MAC_TCR_TE.0, MAC_TCR_TE.1, 1);
+}
+
+/// Enable receive: every channel, then the queue map, then the MAC.
+///
+/// The MAC's receive configuration is set in the order Linux uses, and the
+/// enable is **last of the four** writes to `MAC_RCR`. Setting `RE` before
+/// `ACS` and `CST` would open the line for the window in between, during
+/// which frames are delivered with their padding and FCS still attached ---
+/// which is not an error anywhere, just a handful of frames that arrive four
+/// bytes too long at the very start of the link.
+pub fn enable_rx(acc: &dyn MmioAccess, channels: u32, queues: u32) {
+    for ch in 0..channels {
+        let off = dma_channel_reg(ch, DMA_CH_RCR);
+        write_field(acc, off, DMA_CH_RCR_SR.0, DMA_CH_RCR_SR.1, 1);
+    }
+
+    acc.write32(MAC_RQC0R, rx_queue_enable_map(queues));
+
+    write_field(acc, MAC_RCR, MAC_RCR_DCRCC.0, MAC_RCR_DCRCC.1, 0);
+    write_field(acc, MAC_RCR, MAC_RCR_CST.0, MAC_RCR_CST.1, 1);
+    write_field(acc, MAC_RCR, MAC_RCR_ACS.0, MAC_RCR_ACS.1, 1);
+    write_field(acc, MAC_RCR, MAC_RCR_RE.0, MAC_RCR_RE.1, 1);
+}
+
+// ——— Turning it off ———
+//
+// The counterpart to [`enable_tx`] and [`enable_rx`], and the batch that
+// shows why they could not share a function with a boolean. Transmit comes
+// down inside out, like it went up, with two waits; receive comes down
+// outside in, with one. The reasoning is in the comment above `enable_tx`.
+//
+// Both waits are for the hardware to go quiet, and both are bounded: Linux
+// gives each one `XGBE_DMA_STOP_TIMEOUT` seconds and then logs and carries on
+// rather than returning an error. Carrying on is the right call --- the
+// caller is tearing the interface down, and refusing to finish because the
+// chip is wedged leaves it half-up.
+
+/// `XGBE_DMA_STOP_TIMEOUT`, in seconds: how long Linux waits for each stage
+/// to go quiet before giving up on it and continuing anyway.
+pub const DMA_STOP_TIMEOUT_SECS: u32 = 1;
+
+/// `DMA_DSR0`: DMA debug status 0, which holds the engine state of the first
+/// three queues.
+pub const DMA_DSR0: usize = 0x3020;
+/// `DMA_DSR1`: and of the ones after that.
+pub const DMA_DSR1: usize = 0x3024;
+/// `DMA_DSR_RPS_WIDTH` / `DMA_DSR_TPS_WIDTH`: four bits each.
+pub const DMA_DSR_TPS_WIDTH: u32 = 4;
+/// `DMA_DSR_Q_WIDTH`: receive state plus transmit state, so eight bits per
+/// queue.
+pub const DMA_DSR_Q_WIDTH: u32 = 8;
+/// `DMA_DSR0_TPS_START`: where queue 0's transmit state begins in `DSR0`.
+pub const DMA_DSR0_TPS_START: u32 = 12;
+/// `DMA_DSRX_FIRST_QUEUE`: the first queue that lives outside `DSR0`.
+pub const DMA_DSRX_FIRST_QUEUE: u32 = 3;
+/// `DMA_DSRX_INC`: the stride from `DSR1` to the next status register.
+pub const DMA_DSRX_INC: usize = 4;
+/// `DMA_DSRX_QPR`: queues per status register, from `DSR1` on.
+pub const DMA_DSRX_QPR: u32 = 4;
+/// `DMA_DSRX_TPS_START`: where the first transmit state begins in `DSR1` and
+/// later --- **4**, not the 12 of `DSR0`.
+pub const DMA_DSRX_TPS_START: u32 = 4;
+
+/// `DMA_TPS_STOPPED`.
+pub const DMA_TPS_STOPPED: u32 = 0x00;
+/// `DMA_TPS_SUSPENDED`. Note it is **6**, not 1: the transmit-process state
+/// is a four-bit enumeration, and "stopped enough to proceed" is two
+/// particular values out of sixteen, not a flag.
+pub const DMA_TPS_SUSPENDED: u32 = 0x06;
+
+/// Where queue `queue`'s transmit engine state lives: `(register offset, bit
+/// index)`.
+///
+/// This mapping is the trap of the batch, because it looks like it should be
+/// `DSR0 + queue * something` and is not. Queues 0 to 2 live in `DSR0`
+/// starting at bit 12; from queue 3 on they live in `DSR1` and the registers
+/// after it, **four to a register**, starting at bit 4 instead. So queue 3 is
+/// not "queue 2 plus eight bits": it is a different register at a different
+/// starting offset. A linear reading puts queue 3's state where queue 0's
+/// receive state is and waits for a stop that will never be reported.
+#[inline]
+pub const fn tx_dma_status_pos(queue: u32) -> (usize, u32) {
+    if queue < DMA_DSRX_FIRST_QUEUE {
+        (DMA_DSR0, queue * DMA_DSR_Q_WIDTH + DMA_DSR0_TPS_START)
+    } else {
+        let qidx = queue - DMA_DSRX_FIRST_QUEUE;
+        let reg = DMA_DSR1 + (qidx / DMA_DSRX_QPR) as usize * DMA_DSRX_INC;
+        let pos = (qidx % DMA_DSRX_QPR) * DMA_DSR_Q_WIDTH + DMA_DSRX_TPS_START;
+        (reg, pos)
+    }
+}
+
+/// Whether a transmit-process state means the engine is quiet enough to be
+/// switched off.
+#[inline]
+pub const fn tx_dma_is_quiet(state: u32) -> bool {
+    state == DMA_TPS_STOPPED || state == DMA_TPS_SUSPENDED
+}
+
+/// `MTL_Q_TQDR`: a transmit queue's debug register.
+pub const MTL_Q_TQDR: usize = 0x08;
+/// `MTL_Q_RQDR`: a receive queue's debug register.
+pub const MTL_Q_RQDR: usize = 0x48;
+/// `MTL_Q_TQDR_TRCSTS`, index 1, width 2: the read-controller state.
+pub const MTL_Q_TQDR_TRCSTS: (u32, u32) = (1, 2);
+/// `MTL_Q_TQDR_TXQSTS`, index 4, width 1: whether the queue holds anything.
+pub const MTL_Q_TQDR_TXQSTS: (u32, u32) = (4, 1);
+/// `MTL_Q_RQDR_RXQSTS`, index 4, width 2: the receive queue's fill state.
+pub const MTL_Q_RQDR_RXQSTS: (u32, u32) = (4, 2);
+/// `MTL_Q_RQDR_PRXQ`, index 16, width 14: how many bytes are still in it.
+pub const MTL_Q_RQDR_PRXQ: (u32, u32) = (16, 14);
+
+/// Whether a transmit queue has drained, from its debug register.
+///
+/// The read-controller test is `!= 1`, not `== 0`: `TRCSTS` is a two-bit
+/// state and 1 is the one that means "reading a frame out right now". The
+/// other three, zero among them, are all fine to stop on.
+#[inline]
+pub const fn tx_queue_drained(tqdr: u32) -> bool {
+    get_bits(tqdr, MTL_Q_TQDR_TRCSTS.0, MTL_Q_TQDR_TRCSTS.1) != 1
+        && get_bits(tqdr, MTL_Q_TQDR_TXQSTS.0, MTL_Q_TQDR_TXQSTS.1) == 0
+}
+
+/// Whether a receive queue has drained: nothing in its FIFO and no bytes
+/// left to hand over.
+#[inline]
+pub const fn rx_queue_drained(rqdr: u32) -> bool {
+    get_bits(rqdr, MTL_Q_RQDR_PRXQ.0, MTL_Q_RQDR_PRXQ.1) == 0
+        && get_bits(rqdr, MTL_Q_RQDR_RXQSTS.0, MTL_Q_RQDR_RXQSTS.1) == 0
+}
+
+/// How a bounded wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drained {
+    /// The hardware went quiet.
+    Yes,
+    /// It did not, within the budget. The caller carries on regardless: see
+    /// the module comment.
+    TimedOut,
+    /// Nothing was waited for, because there is no link and so nothing can
+    /// complete.
+    NoLink,
+}
+
+/// Wait for one transmit queue to go quiet before its channel is stopped.
+///
+/// Two paths, chosen by the core revision, and they read entirely different
+/// registers:
+///
+/// * Above `SNPSVER 0x20`, the queue's own `MTL_Q_TQDR`.
+/// * At `0x20` and below, the DMA debug status register for that queue, found
+///   through [`tx_dma_status_pos`].
+///
+/// `has_link` is not a convenience. With no link the transmit path never
+/// completes, so waiting is a guaranteed timeout on every queue in turn ---
+/// one second each, on a path whose whole job is to bring the interface down.
+/// Linux skips it for exactly that reason.
+pub fn prepare_tx_stop(
+    acc: &dyn MmioAccess,
+    snps_ver: u8,
+    queue: u32,
+    has_link: bool,
+    poll: &mut dyn FnMut() -> bool,
+) -> Drained {
+    if !has_link {
+        return Drained::NoLink;
+    }
+    if snps_ver > 0x20 {
+        while poll() {
+            if tx_queue_drained(acc.read32(mtl_queue_reg(queue, MTL_Q_TQDR))) {
+                return Drained::Yes;
+            }
+        }
+        return Drained::TimedOut;
+    }
+
+    let (reg, pos) = tx_dma_status_pos(queue);
+    while poll() {
+        let state = get_bits(acc.read32(reg), pos, DMA_DSR_TPS_WIDTH);
+        if tx_dma_is_quiet(state) {
+            return Drained::Yes;
+        }
+    }
+    Drained::TimedOut
+}
+
+/// Wait for one receive queue's FIFO to empty before its channel is stopped.
+///
+/// No link check here, and that asymmetry is Linux's: a receive queue drains
+/// on its own whether or not the link is up, because what is in it came from
+/// the wire already.
+pub fn prepare_rx_stop(
+    acc: &dyn MmioAccess,
+    queue: u32,
+    poll: &mut dyn FnMut() -> bool,
+) -> Drained {
+    while poll() {
+        if rx_queue_drained(acc.read32(mtl_queue_reg(queue, MTL_Q_RQDR))) {
+            return Drained::Yes;
+        }
+    }
+    Drained::TimedOut
+}
+
+/// Bring transmit down: channels, then queues, then the MAC **last**.
+///
+/// The MAC stays up to the end on purpose, so that frames already in the
+/// queues can still reach the wire. `tx_complete` is the caller's check that
+/// the rings have been consumed --- the driver knows its own producer and
+/// consumer indices, the chip does not report them --- and it is skipped
+/// without a link for the same reason as above.
+pub fn disable_tx(
+    acc: &dyn MmioAccess,
+    snps_ver: u8,
+    channels: u32,
+    queues: u32,
+    has_link: bool,
+    tx_complete: &mut dyn FnMut() -> bool,
+    poll: &mut dyn FnMut() -> bool,
+) {
+    if has_link {
+        while poll() && !tx_complete() {}
+    }
+
+    for ch in 0..channels {
+        let off = dma_channel_reg(ch, DMA_CH_TCR);
+        write_field(acc, off, DMA_CH_TCR_ST.0, DMA_CH_TCR_ST.1, 0);
+    }
+
+    for q in 0..queues {
+        if prepare_tx_stop(acc, snps_ver, q, has_link, poll) == Drained::TimedOut {
+            warn!("[xgbe] timed out waiting for transmit queue {} to empty", q);
+        }
+    }
+
+    for q in 0..queues {
+        write_field(
+            acc,
+            mtl_queue_reg(q, MTL_Q_TQOMR),
+            MTL_Q_TQOMR_TXQEN.0,
+            MTL_Q_TQOMR_TXQEN.1,
+            MTL_Q_DISABLED,
+        );
+    }
+
+    write_field(acc, MAC_TCR, MAC_TCR_TE.0, MAC_TCR_TE.1, 0);
+}
+
+/// Bring receive down: the MAC **first**, then the queues, then the channels.
+///
+/// The opposite direction to [`disable_tx`], and to [`enable_rx`]. Nothing
+/// new may be accepted while the path behind it is being torn down, so the
+/// receiver is shut before anything else moves.
+pub fn disable_rx(
+    acc: &dyn MmioAccess,
+    channels: u32,
+    queues: u32,
+    poll: &mut dyn FnMut() -> bool,
+) {
+    write_field(acc, MAC_RCR, MAC_RCR_CST.0, MAC_RCR_CST.1, 0);
+    write_field(acc, MAC_RCR, MAC_RCR_ACS.0, MAC_RCR_ACS.1, 0);
+    write_field(acc, MAC_RCR, MAC_RCR_RE.0, MAC_RCR_RE.1, 0);
+
+    for q in 0..queues {
+        if prepare_rx_stop(acc, q, poll) == Drained::TimedOut {
+            warn!("[xgbe] timed out waiting for receive queue {} to empty", q);
+        }
+    }
+
+    acc.write32(MAC_RQC0R, 0);
+
+    for ch in 0..channels {
+        let off = dma_channel_reg(ch, DMA_CH_RCR);
+        write_field(acc, off, DMA_CH_RCR_SR.0, DMA_CH_RCR_SR.1, 0);
+    }
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
@@ -2764,5 +3156,509 @@ mod tests {
         // valid bit in the high word --- the MAC registers have no such bit,
         // which is the difference worth noticing.
         assert_eq!(mac_from_prop(lo, hi | (1 << 31)), Some(mac));
+    }
+
+    // ——— Turning the thing on ———
+
+    /// The offsets a write landed on, in order, ignoring the reads of each
+    /// read-modify-write.
+    fn written_offsets(fake: &FakeXgmac) -> alloc::vec::Vec<usize> {
+        fake.log()
+            .iter()
+            .filter_map(|a| match a {
+                Access::Write(off, _) => Some(*off),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_mac_control_registers_are_where_linux_says() {
+        assert_eq!(MAC_TCR, 0x0000);
+        assert_eq!(MAC_RCR, 0x0004);
+        assert_eq!(MAC_RQC0R, 0x00a0);
+        assert_eq!(MAC_TCR_TE, (0, 1));
+        assert_eq!(MAC_RCR_RE, (0, 1));
+        assert_eq!(MAC_RCR_ACS, (1, 1));
+        assert_eq!(MAC_RCR_CST, (2, 1));
+        assert_eq!(MAC_RCR_DCRCC, (3, 1));
+        assert_eq!(DMA_CH_TCR_ST, (0, 1));
+        assert_eq!(DMA_CH_RCR_SR, (0, 1));
+    }
+
+    #[test]
+    fn the_queue_enable_value_is_two_not_one() {
+        // TXQEN is TWO bits wide, and 1 in those two bits is
+        // "enabled for average-bit-rate scheduling" --- a different mode, not
+        // "on". Writing a boolean into it is what the field's width invites.
+        assert_eq!(MTL_Q_TQOMR_TXQEN, (2, 2));
+        assert_eq!(MTL_Q_ENABLED, 0x02);
+        assert_eq!(MTL_Q_DISABLED, 0x00);
+        assert_ne!(MTL_Q_ENABLED, 1);
+    }
+
+    #[test]
+    fn the_receive_queue_map_is_two_bits_per_queue() {
+        // `reg_val |= (0x02 << (i << 1))` in xgbe_enable_rx.
+        assert_eq!(rx_queue_enable_map(0), 0x0000_0000);
+        assert_eq!(rx_queue_enable_map(1), 0x0000_0002);
+        assert_eq!(rx_queue_enable_map(2), 0x0000_000a);
+        assert_eq!(rx_queue_enable_map(4), 0x0000_00aa);
+        // Eight queues is 0xaaaa, NOT 0xff: a one-bit-per-queue reading of
+        // this register enables half the queues it meant to and puts the
+        // other half into the wrong mode.
+        assert_eq!(rx_queue_enable_map(8), 0x0000_aaaa);
+        assert_ne!(rx_queue_enable_map(8), 0xff);
+        assert_eq!(rx_queue_enable_map(16), 0xaaaa_aaaa);
+    }
+
+    #[test]
+    fn transmit_comes_up_from_the_inside_out() {
+        // Channels, then queues, then the MAC. Enabling the MAC first opens
+        // the line into a path that cannot move anything yet.
+        let fake = FakeXgmac::new();
+        enable_tx(&fake, 2, 3);
+        assert_eq!(
+            written_offsets(&fake),
+            alloc::vec![
+                dma_channel_reg(0, DMA_CH_TCR),
+                dma_channel_reg(1, DMA_CH_TCR),
+                mtl_queue_reg(0, MTL_Q_TQOMR),
+                mtl_queue_reg(1, MTL_Q_TQOMR),
+                mtl_queue_reg(2, MTL_Q_TQOMR),
+                MAC_TCR,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_transmit_enable_writes_the_right_values() {
+        let fake = FakeXgmac::new();
+        // A queue register that already carries its size and mode, so a
+        // bare write instead of a read-modify-write would show up.
+        fake.preload(mtl_queue_reg(0, MTL_Q_TQOMR), 0x01f0_0002);
+        enable_tx(&fake, 1, 1);
+
+        let tqomr = fake.read32(mtl_queue_reg(0, MTL_Q_TQOMR));
+        assert_eq!(
+            get_bits(tqomr, MTL_Q_TQOMR_TXQEN.0, MTL_Q_TQOMR_TXQEN.1),
+            MTL_Q_ENABLED
+        );
+        assert_eq!(tqomr & 0x01f0_0000, 0x01f0_0000, "the queue size survived");
+
+        assert_eq!(
+            get_bits(
+                fake.read32(dma_channel_reg(0, DMA_CH_TCR)),
+                DMA_CH_TCR_ST.0,
+                DMA_CH_TCR_ST.1
+            ),
+            1
+        );
+        assert_eq!(
+            get_bits(fake.read32(MAC_TCR), MAC_TCR_TE.0, MAC_TCR_TE.1),
+            1
+        );
+    }
+
+    #[test]
+    fn receive_comes_up_from_the_inside_out_too() {
+        let fake = FakeXgmac::new();
+        enable_rx(&fake, 2, 2);
+        assert_eq!(
+            written_offsets(&fake),
+            alloc::vec![
+                dma_channel_reg(0, DMA_CH_RCR),
+                dma_channel_reg(1, DMA_CH_RCR),
+                MAC_RQC0R,
+                MAC_RCR, // DCRCC
+                MAC_RCR, // CST
+                MAC_RCR, // ACS
+                MAC_RCR, // RE
+            ]
+        );
+    }
+
+    #[test]
+    fn the_receiver_is_enabled_after_the_frame_trimming_not_before() {
+        // RE is the LAST of the four writes to MAC_RCR. Enabling it before
+        // ACS and CST opens the line for the window in between, during which
+        // frames arrive with their padding and FCS still attached --- not an
+        // error anywhere, just a handful of over-long frames at the very
+        // start of the link.
+        let fake = FakeXgmac::new();
+        enable_rx(&fake, 1, 1);
+        let rcr_writes: alloc::vec::Vec<u32> = fake
+            .log()
+            .iter()
+            .filter_map(|a| match a {
+                Access::Write(off, v) if *off == MAC_RCR => Some(*v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rcr_writes.len(), 4);
+        // RE is off for the first three writes and on only in the last.
+        for v in &rcr_writes[..3] {
+            assert_eq!(get_bits(*v, MAC_RCR_RE.0, MAC_RCR_RE.1), 0);
+        }
+        let last = rcr_writes[3];
+        assert_eq!(get_bits(last, MAC_RCR_RE.0, MAC_RCR_RE.1), 1);
+        // And by then the trimming is already on and CRC checking is not
+        // disabled.
+        assert_eq!(get_bits(last, MAC_RCR_ACS.0, MAC_RCR_ACS.1), 1);
+        assert_eq!(get_bits(last, MAC_RCR_CST.0, MAC_RCR_CST.1), 1);
+        assert_eq!(get_bits(last, MAC_RCR_DCRCC.0, MAC_RCR_DCRCC.1), 0);
+    }
+
+    #[test]
+    fn a_chip_that_came_up_with_crc_checking_disabled_has_it_turned_back_on() {
+        // DCRCC is "do NOT check the CRC", so Linux clearing it is the
+        // meaningful direction. A chip, or a previous driver, that left it
+        // set would otherwise keep delivering frames with bad CRCs.
+        let fake = FakeXgmac::new();
+        fake.preload(MAC_RCR, 1 << MAC_RCR_DCRCC.0);
+        enable_rx(&fake, 1, 1);
+        assert_eq!(
+            get_bits(fake.read32(MAC_RCR), MAC_RCR_DCRCC.0, MAC_RCR_DCRCC.1),
+            0
+        );
+    }
+
+    #[test]
+    fn the_queue_map_is_written_whole_not_merged() {
+        // `XGMAC_IOWRITE(pdata, MAC_RQC0R, reg_val)`: no read first. That is
+        // also how a queue gets disabled --- xgbe_disable_rx writes a bare
+        // zero --- so any queue not in the map is switched off by this same
+        // write, whatever it was doing before.
+        let fake = FakeXgmac::new();
+        fake.preload(MAC_RQC0R, 0xaaaa_aaaa);
+        enable_rx(&fake, 1, 2);
+        assert_eq!(fake.read32(MAC_RQC0R), rx_queue_enable_map(2));
+        // Exactly one write, and no read of it at all.
+        assert_eq!(fake.writes_to(MAC_RQC0R), 1);
+    }
+
+    #[test]
+    fn a_channel_register_offset_is_not_a_channel_address() {
+        // `dma_channel_reg` is relative to BAR0 for MmioAccess;
+        // `channel_regs` takes a mapped address. Same arithmetic, different
+        // starting point, and mixing them up is an access at a wild address.
+        assert_eq!(dma_channel_reg(0, DMA_CH_TCR), DMA_CH_BASE + DMA_CH_TCR);
+        assert_eq!(dma_channel_reg(3, DMA_CH_SR), DMA_CH_BASE + 3 * 0x80 + 0x60);
+        let base = 0xffff_8000_0000_0000usize;
+        assert_eq!(channel_regs(base, 3), base + dma_channel_reg(3, 0));
+    }
+
+    #[test]
+    fn no_channels_and_no_queues_still_leaves_the_mac_consistent() {
+        // The geometry comes from MAC_HWF2R, which always reports at least
+        // one of each, so zero is not a real chip --- but a caller that
+        // passed zero must not end up with a MAC enabled over nothing.
+        let fake = FakeXgmac::new();
+        enable_tx(&fake, 0, 0);
+        assert_eq!(written_offsets(&fake), alloc::vec![MAC_TCR]);
+        let fake = FakeXgmac::new();
+        enable_rx(&fake, 0, 0);
+        // The queue map written is empty, so no receive queue is enabled
+        // even though RE ends up set.
+        assert_eq!(fake.read32(MAC_RQC0R), 0);
+    }
+
+    // ——— Turning it off ———
+
+    /// A poll budget: returns true while there is time left.
+    fn budget(n: &core::cell::Cell<u32>) -> impl FnMut() -> bool + '_ {
+        move || {
+            if n.get() == 0 {
+                false
+            } else {
+                n.set(n.get() - 1);
+                true
+            }
+        }
+    }
+
+    #[test]
+    fn the_debug_status_constants_are_where_linux_says() {
+        assert_eq!(DMA_DSR0, 0x3020);
+        assert_eq!(DMA_DSR1, 0x3024);
+        assert_eq!(DMA_DSR_TPS_WIDTH, 4);
+        // DMA_DSR_Q_WIDTH is RPS_WIDTH + TPS_WIDTH, both 4.
+        assert_eq!(DMA_DSR_Q_WIDTH, 8);
+        assert_eq!(DMA_DSR0_TPS_START, 12);
+        assert_eq!(DMA_DSRX_FIRST_QUEUE, 3);
+        assert_eq!(DMA_DSRX_INC, 4);
+        assert_eq!(DMA_DSRX_QPR, 4);
+        assert_eq!(DMA_DSRX_TPS_START, 4);
+        assert_eq!(MTL_Q_TQDR, 0x08);
+        assert_eq!(MTL_Q_RQDR, 0x48);
+        assert_eq!(DMA_STOP_TIMEOUT_SECS, 1);
+    }
+
+    #[test]
+    fn the_queue_to_status_mapping_is_not_linear() {
+        // Queues 0..2 are in DSR0 from bit 12, eight bits apart.
+        assert_eq!(tx_dma_status_pos(0), (DMA_DSR0, 12));
+        assert_eq!(tx_dma_status_pos(1), (DMA_DSR0, 20));
+        assert_eq!(tx_dma_status_pos(2), (DMA_DSR0, 28));
+        // And then it JUMPS: queue 3 is a different register at a different
+        // starting offset, not "queue 2 plus eight bits". A linear reading
+        // would say (DMA_DSR0, 36), which is not even inside the register.
+        assert_eq!(tx_dma_status_pos(3), (DMA_DSR1, 4));
+        assert_ne!(tx_dma_status_pos(3), (DMA_DSR0, 36));
+        assert_eq!(tx_dma_status_pos(4), (DMA_DSR1, 12));
+        assert_eq!(tx_dma_status_pos(6), (DMA_DSR1, 28));
+        // Four queues to a register from DSR1 on, then the next register.
+        assert_eq!(tx_dma_status_pos(7), (DMA_DSR1 + 4, 4));
+        assert_eq!(tx_dma_status_pos(10), (DMA_DSR1 + 4, 28));
+        assert_eq!(tx_dma_status_pos(11), (DMA_DSR1 + 8, 4));
+    }
+
+    #[test]
+    fn every_status_field_stays_inside_its_register() {
+        for q in 0..16u32 {
+            let (_, pos) = tx_dma_status_pos(q);
+            assert!(
+                pos + DMA_DSR_TPS_WIDTH <= 32,
+                "queue {} runs past the end of its register",
+                q
+            );
+        }
+    }
+
+    #[test]
+    fn stopped_and_suspended_are_two_values_of_sixteen_not_a_flag() {
+        // TPS is a four-bit enumeration. "Quiet enough to switch off" is
+        // exactly 0 and 6; everything else, 1 among them, is not.
+        assert_eq!(DMA_TPS_STOPPED, 0x00);
+        assert_eq!(DMA_TPS_SUSPENDED, 0x06);
+        assert!(tx_dma_is_quiet(0));
+        assert!(tx_dma_is_quiet(6));
+        for state in [1u32, 2, 3, 4, 5, 7, 8, 15] {
+            assert!(!tx_dma_is_quiet(state), "{} was treated as quiet", state);
+        }
+    }
+
+    #[test]
+    fn a_transmit_queue_is_drained_when_it_is_not_reading_a_frame_out() {
+        // `TRCSTS != 1 && TXQSTS == 0`. The read-controller test is NOT
+        // `== 0`: TRCSTS is two bits and only the value 1 means "reading a
+        // frame out right now".
+        assert!(tx_queue_drained(0));
+        // TRCSTS == 1: busy.
+        assert!(!tx_queue_drained(1 << 1));
+        // TRCSTS == 2 or 3: not busy, so drained as far as this test goes.
+        assert!(tx_queue_drained(2 << 1));
+        assert!(tx_queue_drained(3 << 1));
+        // TXQSTS set: the queue still holds something.
+        assert!(!tx_queue_drained(1 << 4));
+        assert!(!tx_queue_drained((2 << 1) | (1 << 4)));
+    }
+
+    #[test]
+    fn a_receive_queue_is_drained_when_it_is_empty_in_both_senses() {
+        assert!(rx_queue_drained(0));
+        // PRXQ: bytes still in the FIFO.
+        assert!(!rx_queue_drained(1 << 16));
+        // RXQSTS: the fill state, two bits.
+        assert!(!rx_queue_drained(1 << 4));
+        assert!(!rx_queue_drained(3 << 4));
+        // A bit outside both fields does not make a drained queue look busy.
+        assert!(rx_queue_drained(1 << 7));
+    }
+
+    #[test]
+    fn a_newer_core_waits_on_the_queue_and_an_older_one_on_the_dma_status() {
+        // The two paths read entirely different registers, so which one ran
+        // is visible in the access log.
+        let fake = FakeXgmac::new();
+        let n = core::cell::Cell::new(10);
+        assert_eq!(
+            prepare_tx_stop(&fake, 0x30, 1, true, &mut budget(&n)),
+            Drained::Yes
+        );
+        assert!(fake.reads_of(mtl_queue_reg(1, MTL_Q_TQDR)) > 0);
+        assert_eq!(fake.reads_of(DMA_DSR0), 0);
+
+        let fake = FakeXgmac::new();
+        let n = core::cell::Cell::new(10);
+        assert_eq!(
+            prepare_tx_stop(&fake, 0x20, 1, true, &mut budget(&n)),
+            Drained::Yes
+        );
+        assert!(fake.reads_of(DMA_DSR0) > 0);
+        assert_eq!(fake.reads_of(mtl_queue_reg(1, MTL_Q_TQDR)), 0);
+    }
+
+    #[test]
+    fn with_no_link_nothing_is_waited_for() {
+        // With no link the transmit path never completes, so waiting is a
+        // guaranteed timeout on every queue in turn --- one second each, on
+        // the path whose whole job is to bring the interface down.
+        let fake = FakeXgmac::new();
+        let n = core::cell::Cell::new(10);
+        assert_eq!(
+            prepare_tx_stop(&fake, 0x30, 0, false, &mut budget(&n)),
+            Drained::NoLink
+        );
+        assert!(fake.log().is_empty());
+        // And the budget was not spent either.
+        assert_eq!(n.get(), 10);
+    }
+
+    #[test]
+    fn a_queue_that_never_drains_times_out_instead_of_spinning() {
+        let fake = FakeXgmac::new();
+        // TXQSTS stuck set: the queue always holds something.
+        fake.preload(mtl_queue_reg(0, MTL_Q_TQDR), 1 << 4);
+        let n = core::cell::Cell::new(5);
+        assert_eq!(
+            prepare_tx_stop(&fake, 0x30, 0, true, &mut budget(&n)),
+            Drained::TimedOut
+        );
+        assert_eq!(n.get(), 0, "the whole budget was used");
+
+        let fake = FakeXgmac::new();
+        fake.preload(mtl_queue_reg(0, MTL_Q_RQDR), 1 << 16);
+        let n = core::cell::Cell::new(5);
+        assert_eq!(
+            prepare_rx_stop(&fake, 0, &mut budget(&n)),
+            Drained::TimedOut
+        );
+    }
+
+    #[test]
+    fn a_receive_queue_is_drained_even_with_no_link() {
+        // Linux's asymmetry, kept: what is in a receive queue came off the
+        // wire already, so it drains whether or not the link is still up.
+        // `prepare_rx_stop` has no link parameter at all, which is the
+        // clearest way to say it.
+        let fake = FakeXgmac::new();
+        let n = core::cell::Cell::new(5);
+        assert_eq!(prepare_rx_stop(&fake, 0, &mut budget(&n)), Drained::Yes);
+        assert!(fake.reads_of(mtl_queue_reg(0, MTL_Q_RQDR)) > 0);
+    }
+
+    #[test]
+    fn transmit_goes_down_inside_out_with_the_mac_last() {
+        let fake = FakeXgmac::new();
+        let n = core::cell::Cell::new(100);
+        let mut complete = || true;
+        disable_tx(&fake, 0x30, 2, 2, true, &mut complete, &mut budget(&n));
+        assert_eq!(
+            written_offsets(&fake),
+            alloc::vec![
+                dma_channel_reg(0, DMA_CH_TCR),
+                dma_channel_reg(1, DMA_CH_TCR),
+                mtl_queue_reg(0, MTL_Q_TQOMR),
+                mtl_queue_reg(1, MTL_Q_TQOMR),
+                MAC_TCR,
+            ]
+        );
+        // The MAC was disabled last of all, after both queues.
+        assert_eq!(*written_offsets(&fake).last().unwrap(), MAC_TCR);
+        assert_eq!(
+            get_bits(fake.read32(MAC_TCR), MAC_TCR_TE.0, MAC_TCR_TE.1),
+            0
+        );
+        assert_eq!(
+            get_bits(
+                fake.read32(mtl_queue_reg(0, MTL_Q_TQOMR)),
+                MTL_Q_TQOMR_TXQEN.0,
+                MTL_Q_TQOMR_TXQEN.1
+            ),
+            MTL_Q_DISABLED
+        );
+    }
+
+    #[test]
+    fn transmit_waits_for_its_rings_before_it_stops_the_channels() {
+        // The ring check is the driver's own: the chip does not report the
+        // producer and consumer indices. It has to happen before the first
+        // channel is switched off, or descriptors already handed over are
+        // abandoned.
+        let fake = FakeXgmac::new();
+        let n = core::cell::Cell::new(100);
+        let calls = core::cell::Cell::new(0u32);
+        let mut complete = || {
+            calls.set(calls.get() + 1);
+            calls.get() >= 3
+        };
+        disable_tx(&fake, 0x30, 1, 1, true, &mut complete, &mut budget(&n));
+        assert_eq!(calls.get(), 3);
+        // And it was called before anything was written.
+        assert!(!fake.log().is_empty());
+    }
+
+    #[test]
+    fn with_no_link_transmit_does_not_wait_for_rings_that_cannot_drain() {
+        let fake = FakeXgmac::new();
+        let n = core::cell::Cell::new(100);
+        let calls = core::cell::Cell::new(0u32);
+        let mut complete = || {
+            calls.set(calls.get() + 1);
+            false
+        };
+        disable_tx(&fake, 0x30, 1, 1, false, &mut complete, &mut budget(&n));
+        assert_eq!(calls.get(), 0, "the ring check ran without a link");
+        assert_eq!(n.get(), 100, "the budget was spent without a link");
+        // The interface still came all the way down.
+        assert_eq!(*written_offsets(&fake).last().unwrap(), MAC_TCR);
+    }
+
+    #[test]
+    fn receive_goes_down_outside_in_with_the_mac_first() {
+        // The opposite direction to disable_tx AND to enable_rx. Nothing new
+        // may be accepted while the path behind it is torn down.
+        let fake = FakeXgmac::new();
+        let n = core::cell::Cell::new(100);
+        disable_rx(&fake, 2, 2, &mut budget(&n));
+        assert_eq!(
+            written_offsets(&fake),
+            alloc::vec![
+                MAC_RCR, // CST
+                MAC_RCR, // ACS
+                MAC_RCR, // RE
+                MAC_RQC0R,
+                dma_channel_reg(0, DMA_CH_RCR),
+                dma_channel_reg(1, DMA_CH_RCR),
+            ]
+        );
+        assert_eq!(fake.read32(MAC_RQC0R), 0);
+        assert_eq!(
+            get_bits(fake.read32(MAC_RCR), MAC_RCR_RE.0, MAC_RCR_RE.1),
+            0
+        );
+    }
+
+    #[test]
+    fn disabling_is_not_enabling_reversed_for_transmit() {
+        // The claim the module comment makes, as a test: both orders start
+        // at the channels and end at the MAC.
+        let up = FakeXgmac::new();
+        enable_tx(&up, 2, 2);
+        let down = FakeXgmac::new();
+        let n = core::cell::Cell::new(100);
+        let mut complete = || true;
+        disable_tx(&down, 0x30, 2, 2, true, &mut complete, &mut budget(&n));
+        assert_eq!(written_offsets(&up), written_offsets(&down));
+
+        // Receive, by contrast, really is reversed.
+        let up = FakeXgmac::new();
+        enable_rx(&up, 2, 2);
+        let down = FakeXgmac::new();
+        let n = core::cell::Cell::new(100);
+        disable_rx(&down, 2, 2, &mut budget(&n));
+        // What reverses is the order of the LAYERS, not the iteration
+        // within one: both still walk their channels 0, 1, .... So the
+        // claim to check is which layer each sequence starts and ends on.
+        let up_offsets = written_offsets(&up);
+        let down_offsets = written_offsets(&down);
+        assert_eq!(*up_offsets.first().unwrap(), dma_channel_reg(0, DMA_CH_RCR));
+        assert_eq!(*up_offsets.last().unwrap(), MAC_RCR);
+        assert_eq!(*down_offsets.first().unwrap(), MAC_RCR);
+        assert_eq!(
+            *down_offsets.last().unwrap(),
+            dma_channel_reg(1, DMA_CH_RCR)
+        );
     }
 }

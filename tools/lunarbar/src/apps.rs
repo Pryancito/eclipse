@@ -29,11 +29,16 @@ const MAX_WALK: usize = 8_000;
 const MAX_DEPTH: u32 = 8;
 const MAX_DESKTOP_BYTES: u64 = 256 * 1024;
 
+#[derive(Default, Clone)]
 pub struct AppEntry {
     pub name: String,
     pub exec: String,
     /// `Icon=` value (name or absolute path), resolved by icons::IconCache.
     pub icon: Option<String>,
+    /// `Categories=` as written, ';'-separated list split, unfiltered. The
+    /// launcher ignores it; labwc's pipe menu files entries by it
+    /// ([`crate::obmenu`]).
+    pub categories: Vec<String>,
 }
 
 /// Scan the XDG applications directories for launchable entries. `terminal`
@@ -225,6 +230,7 @@ pub fn parse_desktop_text(
     let mut in_entry = false;
     let (mut name, mut name_loc, mut exec, mut try_exec) = (None, None, None, None);
     let mut icon = None;
+    let mut categories: Vec<String> = Vec::new();
     let (mut is_app, mut hidden, mut wants_term) = (false, false, false);
     let (mut only_show, mut not_show) = (Vec::new(), Vec::new());
 
@@ -254,6 +260,7 @@ pub fn parse_desktop_text(
             "Type" => is_app = v == "Application",
             "Exec" => exec = Some(v.to_string()),
             "Icon" if !v.is_empty() => icon = Some(v.to_string()),
+            "Categories" => categories = split_raw_list(v),
             "TryExec" => try_exec = Some(v.to_string()),
             "NoDisplay" | "Hidden" if v == "true" => hidden = true,
             "Terminal" if v == "true" => wants_term = true,
@@ -301,7 +308,24 @@ pub fn parse_desktop_text(
     } else {
         exec
     };
-    Some(AppEntry { name, exec, icon })
+    Some(AppEntry {
+        name,
+        exec,
+        icon,
+        categories,
+    })
+}
+
+/// `Categories=` is ';'-separated like the show-in lists, but its values are
+/// compared against the freedesktop registry CASE-SENSITIVELY (`AudioVideo`,
+/// not `audiovideo`), so it gets its own splitter rather than reusing the one
+/// that lowercases.
+fn split_raw_list(v: &str) -> Vec<String> {
+    v.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// `OnlyShowIn`/`NotShowIn` are ';'-separated, lowercased for comparison.
@@ -447,7 +471,7 @@ mod tests {
             .map(|n| AppEntry {
                 name: (*n).to_string(),
                 exec: "x".into(),
-                icon: None,
+                ..AppEntry::default()
             })
             .collect();
         sort_menu(&mut v);
