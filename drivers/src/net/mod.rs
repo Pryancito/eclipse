@@ -1,4 +1,4 @@
-//! LAN drivers: Intel e1000/e1000e, Realtek, AMD PCnet and loopback.
+//! LAN drivers: Intel e1000/e1000e, Realtek, AMD PCnet and XGMAC, loopback.
 #![allow(unused)]
 
 use crate::sync::Mutex;
@@ -18,6 +18,9 @@ pub mod mii;
 /// x86 has, so the module is not built elsewhere.
 #[cfg(target_arch = "x86_64")]
 pub mod pcnet32;
+/// AMD XGMAC 10GbE (`amd-xgbe`). MMIO, so it builds everywhere; see the
+/// module docs for what it does and does not do.
+pub mod xgbe;
 pub use isomorphic_drivers::provider::Provider;
 pub use loopback::{LoopbackDevice, LoopbackInterface};
 
