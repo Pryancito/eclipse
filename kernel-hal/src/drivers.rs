@@ -407,6 +407,17 @@ pub fn set_gem_vram_bar1_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_gem_vram_bar1_enabled(_v: bool) {}
 
+/// Gives a second DRM file of a process that drives the GPU from two at once
+/// (labwc on Vulkan: two NVK devices) a GPU context of its own, as Linux keeps
+/// a nouveau VM per file (`nvidia.ctx_per_file`; `nvidia.wlr_vulkan` turns it
+/// on too). See `drivers/src/display/nvidia/file_ctx.rs`.
+#[cfg(target_arch = "x86_64")]
+pub fn set_ctx_per_file_enabled(v: bool) {
+    zcore_drivers::display::set_ctx_per_file_enabled(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_ctx_per_file_enabled(_v: bool) {}
+
 /// Puts a `VRAM | GART` `GEM_NEW` object (a compositor's scanout buffer) in
 /// VRAM, mapped for the CPU through BAR1 by the RM, so the display can flip to
 /// it with no copy (`nvidia.gem_vram`). Default off: see

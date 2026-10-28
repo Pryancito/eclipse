@@ -84,6 +84,7 @@ impl NvidiaGpu {
             kms_slot,
             nouveau_vm_mappings: Mutex::new(Vec::new()),
             nouveau_uvmm: Mutex::new(Vec::new()),
+            file_ctx: super::file_ctx::Registry::new(),
             nouveau_nvif_devices: Mutex::new(Vec::new()),
             nouveau_pid_ctx: Mutex::new(Vec::new()),
             nouveau_fast: Mutex::new((0..nv::MAX_CTX).map(|_| FastSlot::Unprepared).collect()),

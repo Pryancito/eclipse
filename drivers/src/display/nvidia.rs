@@ -199,6 +199,10 @@ mod vram_alloc;
 /// Where `GEM_NEW` puts an object; with `nvidia.gem_vram`, a scanout buffer
 /// in VRAM mapped through BAR1 by the RM (replaces `vram_bar1`).
 pub(super) mod gem_vram;
+
+/// A GPU context of its own for a second DRM file of the same process
+/// (`nvidia.ctx_per_file`): labwc on Vulkan has two NVK devices.
+pub(super) mod file_ctx;
 /// CPU-mapping a VRAM `GEM_NEW` object through the BAR1 aperture: the
 /// arithmetic and the bounds check, own file for the size ceiling. The hatch
 /// is `nvidia.gem_vram_bar1`, default off.
@@ -604,6 +608,8 @@ pub struct NvidiaGpu {
     /// because every other nouveau-uAPI state here is keyed by pid too
     /// (`nouveau_pid_ctx`); cleared in `nouveau_release_process`.
     nouveau_uvmm: Mutex<Vec<NouveauUvmm>>,
+    /// Which key each DRM file's VM ioctls run under (`file_ctx`).
+    file_ctx: file_ctx::Registry,
     /// NVIF device objects, `(pid, cookie)`: what a `NEW` of `NV_DEVICE`
     /// on route 0 created (`nouveau_abi16_obj_new(DEVICE)`), which is the
     /// only object a `MTHD` may name and what a route-0 `DEL` removes.
@@ -952,6 +958,7 @@ impl NvidiaGpu {
             kms_slot,
             nouveau_vm_mappings: Mutex::new(Vec::new()),
             nouveau_uvmm: Mutex::new(Vec::new()),
+            file_ctx: file_ctx::Registry::new(),
             nouveau_nvif_devices: Mutex::new(Vec::new()),
             nouveau_pid_ctx: Mutex::new(Vec::new()),
             nouveau_fast: Mutex::new(
@@ -3503,6 +3510,7 @@ fn rekey_owners<T>(
 /// and write. An object with no phys mapping was never exportable, so only
 /// its creator can hold it.
 fn gem_usable_by(o: &super::nouveau_uapi::NouveauGemObject, pid: u64) -> bool {
+    let pid = file_ctx::pid_of(pid);
     pid == 0
         || o.owner_pid == pid
         || (o.phys_addr.is_some() && crate::scheme::gem_mmap::holds(o.handle, pid))
@@ -3546,7 +3554,7 @@ fn nouveau_syncs_ok(
     // the entry the walk stops at, since every entry before it holds a
     // usable one.
     let first_bad = crate::scheme::syncobj::first_unusable_by(
-        owner_pid,
+        file_ctx::pid_of(owner_pid),
         waits.iter().chain(sigs.iter()).map(|s| s.handle),
     );
     // `nouveau_job_add_deps` looks a wait up with
@@ -8317,6 +8325,14 @@ impl DrmScheme for NvidiaGpu {
         self.ioctl_owned(request, arg, 0)
     }
 
+    fn ioctl_file(&self, request: u32, arg: usize, pid: u64, file: usize) -> Result<usize, i32> {
+        self.ioctl_for_file(request, arg, pid, file)
+    }
+
+    fn nouveau_file_closed(&self, file: usize) {
+        self.file_ctx_closed(file);
+    }
+
     fn ioctl_owned(&self, request: u32, arg: usize, owner_pid: u64) -> Result<usize, i32> {
         match request {
             0x10DE0001 => {
@@ -8381,6 +8397,7 @@ impl DrmScheme for NvidiaGpu {
         if pid == 0 {
             return;
         }
+        self.release_file_keys(pid);
         // Its uvmm goes with it (`nouveau_uvmm_fini` from the file's
         // postclose): a recycled pid starts over at `VM_INIT`.
         self.nouveau_uvmm.lock().retain(|u| u.pid != pid);

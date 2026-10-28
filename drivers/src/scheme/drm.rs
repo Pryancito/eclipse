@@ -818,6 +818,25 @@ pub trait DrmScheme: Scheme {
         self.ioctl(request, arg)
     }
 
+    /// Same as [`ioctl_owned`](DrmScheme::ioctl_owned), but also given the
+    /// DRM file the ioctl came on (the address of its `DrmFileState`, alive
+    /// as long as the open): Linux keeps a nouveau VM per file, and a driver
+    /// that does the same needs to tell two files of one process apart.
+    /// Default: ignore it.
+    fn ioctl_file(
+        &self,
+        request: u32,
+        arg: usize,
+        owner_pid: u64,
+        _file: usize,
+    ) -> Result<usize, i32> {
+        self.ioctl_owned(request, arg, owner_pid)
+    }
+
+    /// The DRM file at `file` (as [`ioctl_file`](DrmScheme::ioctl_file)
+    /// names it) closed. Default: nothing kept per file.
+    fn nouveau_file_closed(&self, _file: usize) {}
+
     /// Release every driver-private resource (currently: the nouveau-uAPI
     /// channel and everything bound in it) owned by `pid`, e.g. because
     /// the process exited without an explicit `CHANNEL_FREE`/`GEM_CLOSE`.

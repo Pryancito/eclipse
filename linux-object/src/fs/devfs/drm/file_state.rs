@@ -283,5 +283,12 @@ impl Drop for DrmFileState {
         // and so does the magic it minted.
         master_release(self.minor, self as *const DrmFileState as usize);
         super::super::drm_scheme::master_check::forget(self as *const DrmFileState as usize);
+        // And its nouveau VM (`nouveau_cli`), for a driver that keeps one per
+        // file. Only marked here: the teardown runs on the next ioctl.
+        if self.minor != NO_MINOR {
+            if let Some(driver) = driver_for_minor(self.minor) {
+                driver.nouveau_file_closed(self as *const DrmFileState as usize);
+            }
+        }
     }
 }
