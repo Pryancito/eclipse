@@ -314,6 +314,13 @@ impl Hw {
         self.peek(GENET_TX_OFF + slot * DMA_DESC_SIZE + DMA_DESC_LENGTH_STATUS)
     }
 
+    /// Levanta interrupciones como las levantaria el hardware: pone los bits
+    /// en el `CPU_STAT` del bloque 0, sin tocar la mascara.
+    pub(super) fn raise_irq(&self, bits: u32) {
+        let off = GENET_INTRL2_0_OFF + INTRL2_CPU_STAT;
+        self.poke(off, self.peek(off) | bits);
+    }
+
     /// El estado y la longitud de un descriptor de recepcion.
     pub(super) fn rx_len_stat(&self, slot: usize) -> u32 {
         self.peek(GENET_RX_OFF + slot * DMA_DESC_SIZE + DMA_DESC_LENGTH_STATUS)
@@ -344,12 +351,48 @@ pub(super) fn on_write(base: usize, off: usize, val: u32) {
             UMAC_CMD => st.umac_cmd_writes.push(val),
             SYS_RBUF_FLUSH_CTRL => st.rbuf_flush_writes.push(val),
             UMAC_MDIO_CMD => st.mdio_cmd(val),
-            _ => {}
+            _ => st.intrl2_cmd(off, val),
         }
     });
 }
 
 impl State {
+    /// Atiende una escritura en uno de los dos bloques `INTRL2`.
+    ///
+    /// Los seis registros no son seis palabras de memoria: cuatro de ellos son
+    /// ordenes. `MASK_SET` y `MASK_CLEAR` ponen y quitan bits del
+    /// `MASK_STATUS` (y no se guardan ellos mismos), `CPU_CLEAR` quita bits
+    /// del `CPU_STAT`, y `CPU_SET` los pone. Un falso que los guardara como
+    /// registros normales dejaria pasar un driver que escribe la mascara que
+    /// quiere donde hay que escribir la que no quiere.
+    fn intrl2_cmd(&mut self, off: usize, val: u32) {
+        for bloque in [GENET_INTRL2_0_OFF, GENET_INTRL2_1_OFF] {
+            let reg = match off.checked_sub(bloque) {
+                Some(reg) if reg <= INTRL2_CPU_MASK_CLEAR => reg,
+                _ => continue,
+            };
+            let stat = bloque + INTRL2_CPU_STAT;
+            let mask = bloque + INTRL2_CPU_MASK_STATUS;
+            match reg {
+                INTRL2_CPU_SET => self.regs[stat / 4] |= val,
+                INTRL2_CPU_CLEAR => self.regs[stat / 4] &= !val,
+                INTRL2_CPU_MASK_SET => {
+                    self.regs[mask / 4] |= val;
+                    // La orden no se guarda: `MASK_SET` leido devuelve basura
+                    // en el hardware, y un driver que lo leyera para saber la
+                    // mascara se llevaria lo ultimo que el mismo escribio.
+                    self.regs[off / 4] = 0;
+                }
+                INTRL2_CPU_MASK_CLEAR => {
+                    self.regs[mask / 4] &= !val;
+                    self.regs[off / 4] = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+    }
+
     /// Atiende una escritura de `UMAC_MDIO_CMD`.
     ///
     /// Sin `START_BUSY` el driver solo esta cargando la transaccion, y el

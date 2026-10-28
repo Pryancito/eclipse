@@ -187,6 +187,15 @@ impl Link {
 /// La base es **virtual**: la trae ya mapeada quien sondea el device tree, que
 /// es el unico que sabe traducir una direccion fisica en esta maquina. Bajo
 /// test es la direccion del `Vec` del MAC falso.
+///
+/// Es `Copy` a proposito: la ventana se mira desde dos sitios a la vez --los
+/// anillos y el manejador de la interrupcion-- y lo que hay que serializar es
+/// el **estado de los anillos** (los cursores), no los accesos a la ventana,
+/// que son escrituras sueltas de una palabra. Un manejador que tuviera que
+/// coger el cerrojo de los anillos para enmascarar la tarjeta se quedaria
+/// esperando al trabajo diferido que esta usando los anillos, con la linea de
+/// interrupcion levantada.
+#[derive(Clone, Copy)]
 pub struct GenetMac {
     base: usize,
 }
@@ -582,6 +591,14 @@ fn udelay(us: u64) {
 mod rings;
 pub use rings::GenetRings;
 
+/// Los dos bloques `INTRL2`: las interrupciones.
+mod irq;
+pub use irq::*;
+
+/// smoltcp, el manejador de la interrupcion y `NetScheme`.
+mod glue;
+pub use glue::{genet_init, GenetDriver, GenetInterface, GENET_MTU};
+
 #[cfg(test)]
 mod genet_fake;
 
@@ -593,3 +610,6 @@ mod mdio_tests;
 
 #[cfg(test)]
 mod regmap_tests;
+
+#[cfg(test)]
+mod irq_tests;
