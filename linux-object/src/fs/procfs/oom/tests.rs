@@ -145,7 +145,7 @@ fn the_score_is_the_share_of_memory_held_plus_the_adjustment() {
         (-1000, total, 0),
     ] {
         assert_eq!(
-            score(2, adj, held, total),
+            crate::process::oom_badness(2, adj, held, total),
             want,
             "adj {} held {}",
             adj,
@@ -153,11 +153,15 @@ fn the_score_is_the_share_of_memory_held_plus_the_adjustment() {
         );
     }
     assert_eq!(
-        score(INIT_PID, 1000, total, total),
+        crate::process::oom_badness(crate::process::INIT_PID, 1000, total, total),
         0,
         "init is never picked"
     );
-    assert_eq!(score(2, 0, 3, 0), (1000 + 3000) * 2 / 3, "no memory at all");
+    assert_eq!(
+        crate::process::oom_badness(2, 0, 3, 0),
+        (1000 + 3000) * 2 / 3,
+        "no memory at all"
+    );
 }
 
 #[test]

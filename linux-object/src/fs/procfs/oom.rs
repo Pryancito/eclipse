@@ -7,10 +7,9 @@
 
 use super::*;
 use crate::process::{
-    LinuxProcess, OomAdj, CAP_SYS_RESOURCE, INIT_PID, OOM_SCORE_ADJ_MAX, OOM_SCORE_ADJ_MIN,
+    LinuxProcess, OomAdj, CAP_SYS_RESOURCE, OOM_SCORE_ADJ_MAX, OOM_SCORE_ADJ_MIN,
 };
 use core::convert::TryFrom;
-use zircon_object::object::KoID;
 
 /// `OOM_DISABLE`: the bottom of `oom_adj`'s scale, and `-OOM_DISABLE` the
 /// number of its steps above 0 that make `OOM_SCORE_ADJ_MAX`.
@@ -173,7 +172,7 @@ fn score_of(proc: &Process) -> u64 {
     let stats = vmar.get_task_stats();
     let held = stats.private_bytes() + stats.shared_bytes() + vmar.page_table_bytes() as u64;
     let (_, total) = kernel_hal::mem::memory_usage();
-    score(
+    crate::process::oom_badness(
         proc.id(),
         adj_of(proc).adj,
         held / PROC_PAGE_SIZE,
@@ -181,22 +180,10 @@ fn score_of(proc: &Process) -> u64 {
     )
 }
 
-/// `oom_badness` as `proc_oom_score` scales it. The pages a process holds
-/// (resident, swapped out and in page tables) plus `adj` thousandths of all
-/// memory, as a share of all memory, on a scale where a process of no size
-/// and no adjustment is 666 and the top is 2000. 0 for `init` and for
-/// `OOM_SCORE_ADJ_MIN`, which an OOM killer never picks.
-///
-/// Never below 0: `adj` thousandths of `total_pages`, thousands taken
-/// whole, are less than all of it.
-fn score(pid: KoID, adj: i16, held_pages: u64, total_pages: u64) -> u64 {
-    if pid == INIT_PID || adj == OOM_SCORE_ADJ_MIN {
-        return 0;
-    }
-    let total = total_pages.max(1) as i64;
-    let badness = held_pages as i64 + i64::from(adj) * (total / 1000);
-    ((1000 + badness * 1000 / total) * 2 / 3) as u64
-}
+// `oom_badness` lives with the killer that reads it (`process/oom_kill.rs`)
+// the way Linux's lives in `mm/oom_kill.c`: this file is `proc_oom_score`, one
+// of its readers, and a second copy of the formula here would be a score
+// `/proc` reports and the killer does not use.
 
 #[cfg(test)]
 mod tests;

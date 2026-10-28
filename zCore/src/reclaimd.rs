@@ -38,6 +38,12 @@ const PERIOD_MS: u64 = 200;
 /// 200 ms.
 const LOW_WATERMARK_PCT: usize = 5;
 
+/// Under this share of the total, with nothing left to reclaim, the worker
+/// kills instead. A fifth of the low watermark: at the watermark itself there
+/// is still a watermark's worth of memory to allocate from, and killing there
+/// would kill a process the machine did not need to lose.
+const OOM_WATERMARK_DIV: usize = 5;
+
 /// The watermark never goes below this, however small the machine: 5 % of a
 /// 128 MiB box is 6 MiB, which one `fork` of a desktop client spends.
 const WATERMARK_FLOOR: usize = 8 * 1024 * 1024;
@@ -78,6 +84,22 @@ fn pass(used: usize, total: usize) -> usize {
     shrinker::run_deferred()
 }
 
+/// Whether the machine is out of memory: under the OOM watermark, and the
+/// caches that could have helped gave `freed` bytes.
+///
+/// Both halves, in Linux's order: the OOM killer runs after reclaim has
+/// failed, never instead of it. A pass that freed something has made progress,
+/// and the next pass 200 ms later will ask again -- reclaiming a cache costs
+/// nobody their process.
+fn out_of_memory(used: usize, total: usize, freed: usize) -> bool {
+    if freed > 0 {
+        return false;
+    }
+    let free = total.saturating_sub(used);
+    let floor = watermark(total) / OOM_WATERMARK_DIV;
+    floor > 0 && free < floor
+}
+
 /// Start the worker. Called once, during boot.
 pub fn start() {
     kernel_hal::thread::spawn(async {
@@ -93,6 +115,14 @@ pub fn start() {
             kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(PERIOD_MS)).await;
             let (used, total) = crate::memory::stats();
             let freed = pass(used, total);
+            if out_of_memory(used, total, freed) {
+                // Nothing left to reclaim and nothing left to allocate from.
+                // This is where Linux's OOM killer runs, and it is the only
+                // place one can: `#[alloc_error_handler]` is `-> !` and runs
+                // on a heap that is already gone, so from there the machine is
+                // lost and every process dies rather than the worst one.
+                linux_object::process::kill_worst("reclaim gave nothing");
+            }
             if freed > 0 {
                 // warn, not info: a pass that freed something means the
                 // machine was under the watermark or an allocation had already

@@ -21,6 +21,13 @@ static FRAMES_USED: AtomicUsize = AtomicUsize::new(0);
 /// Bytes parked in the per-CPU frame lists: taken from the bitmap, held by
 /// nobody. Deliberately NOT part of `FRAMES_USED`, which answers what callers
 /// hold; see [`pcp`].
+///
+/// Gated like the lists themselves: `mem-debug` switches `pcp` off (every
+/// frame has to go straight back to the bitmap for the double-use bitset to
+/// mean anything), and then nothing reads or writes this -- a `never used`
+/// error under the crate's `deny(warnings)`, which is what the `mem-debug` CI
+/// job exists to catch.
+#[cfg(not(feature = "mem-debug"))]
 static FRAMES_CACHED: AtomicUsize = AtomicUsize::new(0);
 
 type FrameAlloc = bitmap_allocator::BitAlloc16M; // max 64G
