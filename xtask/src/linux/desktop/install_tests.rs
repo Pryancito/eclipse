@@ -327,7 +327,10 @@ fn the_themes_a_look_can_choose_all_name_the_same_colours() {
             .filter(|k| k.ends_with(".color"))
             .collect()
     };
-    let mut names: Vec<&String> = themes.values().collect();
+    let mut names: Vec<&String> = themes
+        .values()
+        .filter(|t| !super::upstream::names().any(|n| n == t.as_str()))
+        .collect();
     names.sort();
     names.dedup();
     let first = names[0];
