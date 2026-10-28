@@ -52,8 +52,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Per-CPU sticky "the heap is no longer trustworthy" flags. A smash on one
-/// core must not disable dyn dispatch on every other core.
+/// Cuantas CPUs tiene un slot en [`Flags::suspected`].
 ///
 /// Sized from `lock`'s own constant rather than a repeated `64`: it is the
 /// single source of truth for every array indexed by the dense logical cpu id,
@@ -61,26 +60,101 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// drop the reports of every core above this one, which is the one thing this
 /// module cannot afford (see [`note_on`]).
 const MAX_CPU: usize = lock::MAX_CORE_NUM;
-static HEAP_SMASH_SUSPECTED: [AtomicBool; MAX_CPU] = [const { AtomicBool::new(false) }; MAX_CPU];
 
-/// A smash reported by a CPU that could not name itself.
+/// The gate's whole state: the per-CPU sticky flags, the unplaceable-CPU flag
+/// and the vtable ceiling.
 ///
-/// `lock::current_cpu_id` answers `NO_CPU` (255), *not* 0, when it cannot
-/// resolve this core -- deliberately, and its own comment says why: "a wrong 0
-/// does not lose the answer, it silently nests this CPU's interrupt-disable
-/// depth in the BSP's slot". This module used to drop that answer on the floor:
-/// `if cpu < MAX_CPU` made both halves **fail open**, so a core that cannot be
-/// identified reported corruption to nobody and kept dispatching through dyn
-/// pointers -- and the window where a core has no logical id yet (early AP
-/// boot, or a bogus published id) is not a quiet one.
+/// Together in one struct so that there is **one** decision about where they
+/// live, taken right below, instead of three statics that a test build has to
+/// remember to treat alike.
+struct Flags {
+    /// Per-CPU sticky "the heap is no longer trustworthy" flags. A smash on one
+    /// core must not disable dyn dispatch on every other core.
+    suspected: [AtomicBool; MAX_CPU],
+
+    /// A smash reported by a CPU that could not name itself ([`Flags::unplaceable`]).
+    ///
+    /// `lock::current_cpu_id` answers `NO_CPU` (255), *not* 0, when it cannot
+    /// resolve this core -- deliberately, and its own comment says why: "a wrong 0
+    /// does not lose the answer, it silently nests this CPU's interrupt-disable
+    /// depth in the BSP's slot". This module used to drop that answer on the floor:
+    /// `if cpu < MAX_CPU` made both halves **fail open**, so a core that cannot be
+    /// identified reported corruption to nobody and kept dispatching through dyn
+    /// pointers -- and the window where a core has no logical id yet (early AP
+    /// boot, or a bogus published id) is not a quiet one.
+    ///
+    /// Both callers of [`note_heap_smash_suspected`] have already *proved* the
+    /// corruption: a fat pointer that cannot be live, or a `fn()` slot that is not
+    /// in `.text`. Losing that is the unrecoverable cascade this file exists to
+    /// prevent, so an unplaceable report counts for **every** CPU: we cannot rule
+    /// any of them out. That is the module's own stated policy for an ambiguous
+    /// shape -- "corruption that may be spreading, so stay conservative and latch".
+    unplaceable: AtomicBool,
+
+    /// First address of the kernel heap, or `0` until the boot code registers it.
+    ///
+    /// The kernel image links `.rodata` (where every real vtable lives) below
+    /// `.bss` (where the `static mut HEAP` sits), so **no genuine vtable is ever at
+    /// or above the heap base**. A fat pointer whose vtable word lands inside the
+    /// heap is therefore corruption by construction — most often a
+    /// use-after-free that has had a live `dyn` object's vtable slot overwritten
+    /// with a heap pointer (a freed BTree node, another allocation's payload, …).
+    ///
+    /// Zero means "not registered" — hosted/libos builds and early boot leave the
+    /// heap-range test disabled and fall back to the address-half test alone.
+    /// Lives in [`Flags::vtable_max`].
+    vtable_max: AtomicUsize,
+}
+
+impl Flags {
+    const fn new() -> Self {
+        Self {
+            suspected: [const { AtomicBool::new(false) }; MAX_CPU],
+            unplaceable: AtomicBool::new(false),
+            vtable_max: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(not(test))]
+static FLAGS: Flags = Flags::new();
+
+/// The gate's state. One for the system on bare metal; **one per thread under
+/// test**.
 ///
-/// Both callers of [`note_heap_smash_suspected`] have already *proved* the
-/// corruption: a fat pointer that cannot be live, or a `fn()` slot that is not
-/// in `.text`. Losing that is the unrecoverable cascade this file exists to
-/// prevent, so an unplaceable report counts for **every** CPU: we cannot rule
-/// any of them out. That is the module's own stated policy for an ambiguous
-/// shape -- "corruption that may be spreading, so stay conservative and latch".
-static SMASH_ON_UNPLACEABLE_CPU: AtomicBool = AtomicBool::new(false);
+/// The flags are sticky by design and every dispatch path in the crate reads
+/// them -- `irq_manager::run_irq_handler`, `event_listener::trigger`, the
+/// deferred-job queue -- so with one set for the whole binary, a test of THIS
+/// module that proves the gate latches makes a test of one of those modules,
+/// running at the same time on another thread, find a handler the gate refuses
+/// to call. That is the intermittent
+/// `a_lookup_that_finds_nothing_and_one_that_finds_a_handler_are_the_only_two_answers`:
+/// red once in a few full-suite runs, green on its own, and nothing wrong with
+/// either test.
+///
+/// [`GateForTest`] takes a turnstile and resets the flags, and the tests of
+/// this module take it -- but a test of another module has no reason to know
+/// that it must, and three of them did not. Per-thread state is the same answer
+/// the rest of the crate already gives to this question (`net::get_sockets`,
+/// `utils::dma_sync::test_flag`, every fake register window): nothing is
+/// shared, so nothing can be poisoned.
+///
+/// `cfg(not(test))` above is what the kernel links, and there it **has** to be
+/// one for the system: a smash is noted from the CPU that found it and read by
+/// whoever dispatches next, which is another thread of execution on purpose.
+#[cfg(test)]
+fn flags() -> &'static Flags {
+    std::thread_local! {
+        static FLAGS: &'static Flags = alloc::boxed::Box::leak(alloc::boxed::Box::new(Flags::new()));
+    }
+    FLAGS.with(|f| *f)
+}
+
+#[cfg(not(test))]
+#[inline]
+fn flags() -> &'static Flags {
+    &FLAGS
+}
 
 /// Record that kernel memory corruption is suspected on **this** CPU.
 /// Idempotent and lock-free: callable from any context, including a hard IRQ.
@@ -98,34 +172,24 @@ pub fn heap_smash_suspected() -> bool {
 fn note_on(cpu: u8) {
     // `get`, not `if cpu < MAX_CPU`: the same lookup, but with nowhere for an
     // out-of-range id to fall through unnoticed.
-    match HEAP_SMASH_SUSPECTED.get(cpu as usize) {
+    let flags = flags();
+    match flags.suspected.get(cpu as usize) {
         Some(flag) => flag.store(true, Ordering::SeqCst),
-        None => SMASH_ON_UNPLACEABLE_CPU.store(true, Ordering::SeqCst),
+        None => flags.unplaceable.store(true, Ordering::SeqCst),
     }
 }
 
 /// See [`note_on`].
 fn suspected_on(cpu: u8) -> bool {
-    if SMASH_ON_UNPLACEABLE_CPU.load(Ordering::Relaxed) {
+    let flags = flags();
+    if flags.unplaceable.load(Ordering::Relaxed) {
         return true;
     }
-    HEAP_SMASH_SUSPECTED
+    flags
+        .suspected
         .get(cpu as usize)
         .is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
-
-/// First address of the kernel heap, or `0` until the boot code registers it.
-///
-/// The kernel image links `.rodata` (where every real vtable lives) below
-/// `.bss` (where the `static mut HEAP` sits), so **no genuine vtable is ever at
-/// or above the heap base**. A fat pointer whose vtable word lands inside the
-/// heap is therefore corruption by construction — most often a
-/// use-after-free that has had a live `dyn` object's vtable slot overwritten
-/// with a heap pointer (a freed BTree node, another allocation's payload, …).
-///
-/// Zero means "not registered" — hosted/libos builds and early boot leave the
-/// heap-range test disabled and fall back to the address-half test alone.
-static VTABLE_MAX: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the kernel heap base so [`dyn_fat_ptr_live`] can reject vtables that
 /// point into the heap. Call once, from bare-metal heap init, with the heap's
@@ -153,7 +217,7 @@ pub fn set_vtable_max(heap_start: usize) {
         );
         return;
     }
-    VTABLE_MAX.store(heap_start, Ordering::SeqCst);
+    flags().vtable_max.store(heap_start, Ordering::SeqCst);
 }
 
 /// The vtable word of a `dyn` pointer built right here, i.e. an address the
@@ -172,7 +236,7 @@ fn a_genuine_vtable() -> usize {
 /// live. Returns `false` when the bound is unregistered so the test is inert.
 #[inline]
 fn vtable_in_heap(vtable: usize) -> bool {
-    let max = VTABLE_MAX.load(Ordering::Relaxed);
+    let max = flags().vtable_max.load(Ordering::Relaxed);
     max != 0 && vtable >= max
 }
 
@@ -296,11 +360,12 @@ pub fn dyn_fat_ptr_live<P>(p: &P) -> bool {
 /// while sitting under every IRQ, timer and event dispatch in the system.
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
-    for flag in HEAP_SMASH_SUSPECTED.iter() {
+    let flags = flags();
+    for flag in flags.suspected.iter() {
         flag.store(false, Ordering::SeqCst);
     }
-    SMASH_ON_UNPLACEABLE_CPU.store(false, Ordering::SeqCst);
-    VTABLE_MAX.store(0, Ordering::SeqCst);
+    flags.unplaceable.store(false, Ordering::SeqCst);
+    flags.vtable_max.store(0, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -406,6 +471,28 @@ mod fat_ptr_tests {
     }
 
     #[test]
+    fn a_latch_does_not_leak_out_of_the_thread_that_tripped_it_under_test() {
+        // The gate is sticky on purpose and every dispatch path in the crate
+        // reads it, so one set of flags for the whole binary makes a test that
+        // proves the latch work turn another module's test red on another
+        // thread. Here the flags are per thread; on bare metal they are one for
+        // the system, which is what `cfg(not(test))` links.
+        let _gate = GateForTest::new();
+        note_on(0);
+        assert!(suspected_on(0), "the latch has to latch");
+        let otro = std::thread::spawn(|| suspected_on(0))
+            .join()
+            .expect("the thread must not panic");
+        assert!(!otro, "the latch leaked into another thread's gate");
+        // And the ceiling with it: the same statics, the same question.
+        set_vtable_max(usize::MAX);
+        let suyo = std::thread::spawn(|| flags().vtable_max.load(Ordering::SeqCst))
+            .join()
+            .unwrap();
+        assert_eq!(suyo, 0, "the vtable ceiling leaked into another thread");
+    }
+
+    #[test]
     fn a_misaligned_vtable_is_dead() {
         // A vtable is an array of pointers and is never misaligned, so an
         // off-by-a-byte word is corruption however plausible its magnitude.
@@ -462,7 +549,11 @@ mod fat_ptr_tests {
                 ceiling
             );
         }
-        assert_eq!(VTABLE_MAX.load(Ordering::SeqCst), 0, "the bound was taken");
+        assert_eq!(
+            flags().vtable_max.load(Ordering::SeqCst),
+            0,
+            "the bound was taken"
+        );
     }
 
     #[test]

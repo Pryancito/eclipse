@@ -434,6 +434,32 @@ mod irq_manager_tests {
     }
 
     #[test]
+    fn a_smash_another_thread_reported_does_not_stop_this_ones_handlers() {
+        // This is the test above's own trap, seen from the other side, and it
+        // is why `a_lookup_that_finds_nothing_and_one_that_finds_a_handler_are_the_only_two_answers`
+        // went red once in a few full-suite runs and green on its own: the gate
+        // used to be one latch for the whole binary, so the test above --
+        // running on another thread, as the harness does -- left every handler
+        // in this one refused.
+        //
+        // Under test the gate's state is per thread (`fat_ptr::flags`), so a
+        // smash reported elsewhere is somebody else's. On bare metal it is
+        // deliberately the opposite: one latch, read by whoever dispatches
+        // next.
+        let _gate = super::super::fat_ptr::GateForTest::new();
+        let (handler, hits) = counting();
+        std::thread::spawn(super::super::fat_ptr::note_heap_smash_suspected)
+            .join()
+            .expect("the thread must not panic");
+        assert!(run_irq_handler(1, Some(handler)).is_ok());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "another thread's smash stopped this thread's handler"
+        );
+    }
+
+    #[test]
     fn a_handler_whose_fat_pointer_is_dead_is_leaked_rather_than_called() {
         // The only way a test can put a smashed handler in front of the gate:
         // the two words a smash leaves. Nothing ever dereferences it -- the
