@@ -318,6 +318,263 @@ pub const fn port_speeds(pp0: u32) -> u32 {
     (pp0 >> 22) & 0x1f
 }
 
+// ——— What the MAC says about itself ———
+//
+// The port property block read above is the *board's* description of the
+// port, written by firmware. These four registers are the *controller's*
+// description of itself, hardwired at synthesis time: which version of the
+// Synopsys XGMAC core this is, and which of its optional blocks were built
+// in. Linux reads them in `xgbe_get_all_hw_features` (`xgbe-drv.c`) before it
+// configures anything, and then branches on them for the rest of bring-up ---
+// `xgbe-dev.c` alone gates on `SNPSVER` in six places, against `0x20`, `0x21`
+// and `0x30`.
+//
+// They matter here for the same reason, one batch early: a datapath written
+// without them has to assume a geometry (how many channels, how wide a DMA
+// address, how big a FIFO to split between the queues) and assume a feature
+// set (whether there is a checksum engine, whether TSO exists, whether the
+// hash filter has a table at all). Each of those assumptions is a silent
+// wrong answer on a chip that reports otherwise. Read and logged now, they
+// are a fact about the card in Moebius's machine instead.
+//
+// All four are read-only, and reading them changes nothing: this batch adds
+// no write to the device.
+
+/// `MAC_VR`: the core's version triple.
+pub const MAC_VR: usize = 0x0110;
+/// `MAC_HWF0R`: optional-feature register 0 --- the offload and filter blocks.
+pub const MAC_HWF0R: usize = 0x011c;
+/// `MAC_HWF1R`: optional-feature register 1 --- FIFO sizes, DMA width, TSO/RSS.
+pub const MAC_HWF1R: usize = 0x0120;
+/// `MAC_HWF2R`: optional-feature register 2 --- the queue and channel counts.
+pub const MAC_HWF2R: usize = 0x0124;
+
+/// Linux's `XGMAC_GET_BITS`: `width` bits of `reg` starting at `index`.
+///
+/// Spelled out rather than hidden in a macro, because every call below quotes
+/// the `_INDEX`/`_WIDTH` pair from `xgbe-common.h` as its two arguments, and
+/// that is exactly what the tests check.
+#[inline]
+pub const fn get_bits(reg: u32, index: u32, width: u32) -> u32 {
+    (reg >> index) & ((1u32 << width) - 1)
+}
+
+/// The three bytes of `MAC_VR`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacVersion {
+    /// `MAC_VR_SNPSVER`: the Synopsys core revision. This is the one Linux
+    /// branches on; `0x30` and above is the generation that needs the newer
+    /// sequences, below `0x21` the older ones.
+    pub snps: u8,
+    /// `MAC_VR_DEVID`: the device identity byte.
+    pub dev_id: u8,
+    /// `MAC_VR_USERVER`: the integrator's own revision, free for AMD to set.
+    pub user: u8,
+}
+
+/// Decode `MAC_VR`.
+#[inline]
+pub const fn decode_mac_version(mac_vr: u32) -> MacVersion {
+    MacVersion {
+        snps: get_bits(mac_vr, 0, 8) as u8,
+        dev_id: get_bits(mac_vr, 8, 8) as u8,
+        user: get_bits(mac_vr, 16, 8) as u8,
+    }
+}
+
+/// Linux's `XGBE_MAX_PPS_OUT` (`xgbe.h`). A chip reporting more than this is
+/// clamped rather than believed: the driver has storage for four.
+pub const MAX_PPS_OUT: u32 = 4;
+/// Linux's `XGBE_MAX_AUX_SNAP` (`xgbe.h`).
+pub const MAX_AUX_SNAP: u32 = 4;
+
+/// What the controller reports it was built with: Linux's
+/// `struct xgbe_hw_features`, field for field and in its order, with the
+/// same post-processing applied.
+///
+/// "Post-processing" is not cosmetic. Four of these fields are *not* the raw
+/// register value: the counts are zero-based and get incremented, the hash
+/// table size is an index into {0, 64, 128, 256}, the DMA width is an index
+/// into {32, 40, 48} bits, and the FIFO sizes are a log2 biased by 7. A
+/// datapath that read the raw bits would size its rings for one channel when
+/// the chip has eight, and its FIFO split for 128 bytes when the chip has
+/// 128 KiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HwFeatures {
+    // HWF0R: what blocks exist.
+    /// `GMIISEL`: 1000 Mbps support.
+    pub gmii: bool,
+    /// `VLHASH`: VLAN hash filter.
+    pub vlan_hash: bool,
+    /// `SMASEL`: the SMA (MDIO) interface.
+    pub sma: bool,
+    /// `RWKSEL`: PMT remote wake-up packet.
+    pub remote_wake: bool,
+    /// `MGKSEL`: PMT magic packet.
+    pub magic_packet: bool,
+    /// `MMCSEL`: the RMON/MMC counter block.
+    pub mmc: bool,
+    /// `ARPOFFSEL`: ARP offload.
+    pub arp_offload: bool,
+    /// `TSSEL`: IEEE 1588-2008 advanced timestamping.
+    pub timestamp: bool,
+    /// `EEESEL`: Energy Efficient Ethernet.
+    pub eee: bool,
+    /// `TXCOESEL`: transmit checksum offload.
+    pub tx_coe: bool,
+    /// `RXCOESEL`: receive checksum offload.
+    pub rx_coe: bool,
+    /// `ADDMACADRSEL`: how many additional MAC addresses the filter holds.
+    pub addn_mac: u32,
+    /// `TSSTSSEL`: the timestamp source.
+    pub ts_src: u32,
+    /// `SAVLANINS`: source-address or VLAN insertion.
+    pub sa_vlan_ins: bool,
+    /// `VXN`: VXLAN/NVGRE awareness.
+    pub vxn: bool,
+
+    // HWF1R: sizes and the heavier offloads.
+    /// `RXFIFOSIZE`, translated to bytes.
+    pub rx_fifo_size: u32,
+    /// `TXFIFOSIZE`, translated to bytes.
+    pub tx_fifo_size: u32,
+    /// `ADVTHWORD`: the advanced-timestamp high word.
+    pub adv_ts_hi: bool,
+    /// `ADDR64`, translated to a number of address bits (32, 40 or 48).
+    pub dma_width: u32,
+    /// `DCBEN`: the DCB block.
+    pub dcb: bool,
+    /// `SPHEN`: split-header receive.
+    pub split_header: bool,
+    /// `TSOEN`: TCP segmentation offload.
+    pub tso: bool,
+    /// `DBGMEMA`: the DMA debug registers.
+    pub dma_debug: bool,
+    /// `RSSEN`: receive-side scaling.
+    pub rss: bool,
+    /// `NUMTC`, incremented: the number of traffic classes.
+    pub tc_count: u32,
+    /// `HASHTBLSZ`, translated: 0, 64, 128 or 256 entries.
+    pub hash_table_size: u32,
+    /// `L3L4FNUM`: how many L3/L4 filters there are.
+    pub l3l4_filters: u32,
+
+    // HWF2R: the geometry.
+    /// `RXQCNT`, incremented.
+    pub rx_queues: u32,
+    /// `TXQCNT`, incremented.
+    pub tx_queues: u32,
+    /// `RXCHCNT`, incremented.
+    pub rx_channels: u32,
+    /// `TXCHCNT`, incremented.
+    pub tx_channels: u32,
+    /// `PPSOUTNUM`, clamped to [`MAX_PPS_OUT`].
+    pub pps_outputs: u32,
+    /// `AUXSNAPNUM`, clamped to [`MAX_AUX_SNAP`].
+    pub aux_snapshots: u32,
+}
+
+/// `1 << (field + 7)`: the FIFO-size translation of
+/// `xgbe_get_all_hw_features`, saturating instead of overflowing.
+///
+/// A deliberate divergence from Linux, and the only one in this function. The
+/// field is five bits wide, so a register can claim 2^38 bytes of FIFO; Linux
+/// shifts into an `unsigned int` and wraps, which in Rust is a panic in a
+/// debug build. No real part reports above 11 (256 KiB), and the caller caps
+/// the result by the variant's ceiling in any case, so saturating is the
+/// honest reading of a value that cannot be true.
+#[inline]
+const fn fifo_bytes(field: u32) -> u32 {
+    match 1u32.checked_shl(field + 7) {
+        Some(bytes) => bytes,
+        None => u32::MAX,
+    }
+}
+
+/// Decode the three feature registers, in the order and with the translations
+/// of `xgbe_get_all_hw_features` (`xgbe-drv.c`).
+pub fn decode_hw_features(hfr0: u32, hfr1: u32, hfr2: u32) -> HwFeatures {
+    // Each `get_bits` argument pair below is the `_INDEX`/`_WIDTH` pair of
+    // the same name in `xgbe-common.h`.
+    let mut f = HwFeatures {
+        gmii: get_bits(hfr0, 1, 1) != 0,
+        vlan_hash: get_bits(hfr0, 4, 1) != 0,
+        sma: get_bits(hfr0, 5, 1) != 0,
+        remote_wake: get_bits(hfr0, 6, 1) != 0,
+        magic_packet: get_bits(hfr0, 7, 1) != 0,
+        mmc: get_bits(hfr0, 8, 1) != 0,
+        arp_offload: get_bits(hfr0, 9, 1) != 0,
+        timestamp: get_bits(hfr0, 12, 1) != 0,
+        eee: get_bits(hfr0, 13, 1) != 0,
+        tx_coe: get_bits(hfr0, 14, 1) != 0,
+        rx_coe: get_bits(hfr0, 16, 1) != 0,
+        addn_mac: get_bits(hfr0, 18, 5),
+        ts_src: get_bits(hfr0, 25, 2),
+        sa_vlan_ins: get_bits(hfr0, 27, 1) != 0,
+        vxn: get_bits(hfr0, 29, 1) != 0,
+
+        rx_fifo_size: get_bits(hfr1, 0, 5),
+        tx_fifo_size: get_bits(hfr1, 6, 5),
+        adv_ts_hi: get_bits(hfr1, 13, 1) != 0,
+        dma_width: get_bits(hfr1, 14, 2),
+        dcb: get_bits(hfr1, 16, 1) != 0,
+        split_header: get_bits(hfr1, 17, 1) != 0,
+        tso: get_bits(hfr1, 18, 1) != 0,
+        dma_debug: get_bits(hfr1, 19, 1) != 0,
+        rss: get_bits(hfr1, 20, 1) != 0,
+        tc_count: get_bits(hfr1, 21, 3),
+        hash_table_size: get_bits(hfr1, 24, 3),
+        l3l4_filters: get_bits(hfr1, 27, 4),
+
+        rx_queues: get_bits(hfr2, 0, 4),
+        tx_queues: get_bits(hfr2, 6, 4),
+        rx_channels: get_bits(hfr2, 12, 4),
+        tx_channels: get_bits(hfr2, 18, 4),
+        pps_outputs: get_bits(hfr2, 24, 3),
+        aux_snapshots: get_bits(hfr2, 28, 3),
+    };
+
+    // Linux clamps these two instead of trusting them, because it has room
+    // for four of each and a larger number would index off the end.
+    f.pps_outputs = f.pps_outputs.min(MAX_PPS_OUT);
+    f.aux_snapshots = f.aux_snapshots.min(MAX_AUX_SNAP);
+
+    // An index, not a count. 0 means there is no hash filter table at all,
+    // which `xgbe-dev.c` checks for before it programs one.
+    f.hash_table_size = match f.hash_table_size {
+        1 => 64,
+        2 => 128,
+        3 => 256,
+        _ => 0,
+    };
+
+    // An index into address widths. Linux's `default` arm folds every
+    // undefined encoding (3) back to 32, which is the safe direction: a
+    // descriptor address that fits in 32 bits fits in 48 as well.
+    f.dma_width = match f.dma_width {
+        1 => 40,
+        2 => 48,
+        _ => 32,
+    };
+
+    // Zero-based counts.
+    f.rx_queues += 1;
+    f.tx_queues += 1;
+    f.rx_channels += 1;
+    f.tx_channels += 1;
+    f.tc_count += 1;
+
+    // log2 of the size, biased by 7, so 0 is 128 bytes and 11 is 256 KiB.
+    // Note this is the FIFO the *controller* has; what the driver may use is
+    // this capped by the variant's ceiling (`xgbe_get_tx_fifo_size` in
+    // `xgbe-dev.c` takes the `min` of the two), which is why
+    // [`Variant::max_fifo_size`] exists next door.
+    f.rx_fifo_size = fifo_bytes(f.rx_fifo_size);
+    f.tx_fifo_size = fifo_bytes(f.tx_fifo_size);
+
+    f
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
@@ -382,6 +639,19 @@ impl PciDriver for XgbeDriverPci {
             )
         };
 
+        // What the core says about itself. Read-only, and read before
+        // anything is written, exactly as `xgbe_get_all_hw_features` does.
+        let (mac_vr, hfr0, hfr1, hfr2) = unsafe {
+            (
+                read32(xgmac, MAC_VR),
+                read32(xgmac, MAC_HWF0R),
+                read32(xgmac, MAC_HWF1R),
+                read32(xgmac, MAC_HWF2R),
+            )
+        };
+        let version = decode_mac_version(mac_vr);
+        let feat = decode_hw_features(hfr0, hfr1, hfr2);
+
         let counts = decode_counts(pp1);
         let (tx_fifo, rx_fifo) = decode_fifo_sizes(pp2, variant);
 
@@ -409,6 +679,52 @@ impl PciDriver for XgbeDriverPci {
                 "through the BAR1 window"
             }
         );
+        // The core's own account of itself. Two lines, because this is the
+        // input the datapath batches need and a log line that scrolled past
+        // without the numbers is no use to anyone.
+        info!(
+            "[xgbe] XGMAC core {:#04x} (dev id {:#04x}, integrator rev {:#04x}), \
+             {}-bit DMA addresses",
+            version.snps, version.dev_id, version.user, feat.dma_width
+        );
+        info!(
+            "[xgbe] the core reports {} tx / {} rx channels, {} tx / {} rx queues, \
+             {} traffic classes, {} B tx FIFO / {} B rx FIFO",
+            feat.tx_channels,
+            feat.rx_channels,
+            feat.tx_queues,
+            feat.rx_queues,
+            feat.tc_count,
+            feat.tx_fifo_size,
+            feat.rx_fifo_size
+        );
+        info!(
+            "[xgbe] built with: tx csum {}, rx csum {}, TSO {}, RSS {}, DCB {}, \
+             split header {}, VLAN hash {}, MDIO {}, 1GbE {}, timestamping {}",
+            feat.tx_coe,
+            feat.rx_coe,
+            feat.tso,
+            feat.rss,
+            feat.dcb,
+            feat.split_header,
+            feat.vlan_hash,
+            feat.sma,
+            feat.gmii,
+            feat.timestamp
+        );
+        info!(
+            "[xgbe] filters: {} extra MAC addresses, {} L3/L4 filters, \
+             hash table of {} entries ({})",
+            feat.addn_mac,
+            feat.l3l4_filters,
+            feat.hash_table_size,
+            if feat.hash_table_size == 0 {
+                "no hash filter"
+            } else {
+                "hash filtering available"
+            }
+        );
+
         match mac_from_prop(lo, hi) {
             Some(mac) => info!(
                 "[xgbe] station address {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -740,5 +1056,437 @@ mod tests {
         let between = 0x003f_f000;
         assert_eq!(port_mode(between), 0);
         assert_eq!(port_speeds(between), 0);
+    }
+
+    // ——— What the MAC says about itself ———
+    //
+    // These registers cannot be read here, so the only thing worth testing is
+    // the decode, and the only way a decode test has any value is if it
+    // pins the field's POSITION rather than repeating the arithmetic. So each
+    // case below sets exactly one field in an otherwise zero register and
+    // compares the whole structure against the all-zero decode with that one
+    // field changed. A field written one bit off, or two fields overlapping,
+    // fails --- which a per-field `assert_eq!` on its own value would not
+    // catch.
+
+    #[test]
+    fn the_four_self_description_registers_are_where_xgbe_common_h_says() {
+        assert_eq!(MAC_VR, 0x0110);
+        assert_eq!(MAC_HWF0R, 0x011c);
+        assert_eq!(MAC_HWF1R, 0x0120);
+        assert_eq!(MAC_HWF2R, 0x0124);
+        // And they are inside BAR0, well below the port property block, so
+        // the BAR length the probe already insists on covers them.
+        assert!(MAC_HWF2R < MAC_PROP_OFFSET);
+    }
+
+    #[test]
+    fn get_bits_is_xgmac_get_bits() {
+        // Linux: `(((var) >> (prefix##_##field##_INDEX)) & ...)`.
+        assert_eq!(get_bits(0xffff_ffff, 0, 1), 1);
+        assert_eq!(get_bits(0xffff_ffff, 18, 5), 0x1f);
+        assert_eq!(get_bits(0x1234_5678, 16, 8), 0x34);
+        assert_eq!(get_bits(0b1010_0000, 5, 1), 1);
+        assert_eq!(get_bits(0b1010_0000, 6, 1), 0);
+    }
+
+    #[test]
+    fn mac_vr_is_three_bytes_in_order() {
+        // MAC_VR_SNPSVER index 0, DEVID index 8, USERVER index 16, all 8 wide.
+        let v = decode_mac_version(0x00ab_cd30);
+        assert_eq!(v.snps, 0x30);
+        assert_eq!(v.dev_id, 0xcd);
+        assert_eq!(v.user, 0xab);
+        // The top byte of the register is not part of any of the three.
+        assert_eq!(decode_mac_version(0xff00_0000), decode_mac_version(0));
+    }
+
+    #[test]
+    fn the_snps_version_the_rest_of_the_driver_will_branch_on() {
+        // `xgbe-dev.c` compares SNPSVER against exactly these three values,
+        // so the byte has to come out of bit 0 and not bit 8.
+        assert_eq!(decode_mac_version(0x0000_0030).snps, 0x30);
+        assert_eq!(decode_mac_version(0x0000_0021).snps, 0x21);
+        assert_eq!(decode_mac_version(0x0000_0020).snps, 0x20);
+    }
+
+    /// The all-zero decode: no optional block present, every zero-based count
+    /// at one, the smallest FIFO, the narrowest DMA, no hash table.
+    fn zeroed() -> HwFeatures {
+        decode_hw_features(0, 0, 0)
+    }
+
+    #[test]
+    fn an_all_zero_chip_still_has_one_of_each_zero_based_thing() {
+        let f = zeroed();
+        assert_eq!(f.rx_queues, 1);
+        assert_eq!(f.tx_queues, 1);
+        assert_eq!(f.rx_channels, 1);
+        assert_eq!(f.tx_channels, 1);
+        assert_eq!(f.tc_count, 1);
+        // `1 << (0 + 7)`.
+        assert_eq!(f.rx_fifo_size, 128);
+        assert_eq!(f.tx_fifo_size, 128);
+        // ADDR64 == 0 is 32 bits, HASHTBLSZ == 0 is no table.
+        assert_eq!(f.dma_width, 32);
+        assert_eq!(f.hash_table_size, 0);
+        assert!(!f.tso && !f.rss && !f.tx_coe && !f.rx_coe);
+    }
+
+    #[test]
+    fn every_field_of_hwf0r_sits_at_its_linux_index() {
+        let z = zeroed();
+        // MAC_HWF0R_GMIISEL_INDEX 1, _WIDTH 1
+        assert_eq!(
+            decode_hw_features(1 << 1, 0, 0),
+            HwFeatures { gmii: true, ..z }
+        );
+        // VLHASH 4/1
+        assert_eq!(
+            decode_hw_features(1 << 4, 0, 0),
+            HwFeatures {
+                vlan_hash: true,
+                ..z
+            }
+        );
+        // SMASEL 5/1
+        assert_eq!(
+            decode_hw_features(1 << 5, 0, 0),
+            HwFeatures { sma: true, ..z }
+        );
+        // RWKSEL 6/1
+        assert_eq!(
+            decode_hw_features(1 << 6, 0, 0),
+            HwFeatures {
+                remote_wake: true,
+                ..z
+            }
+        );
+        // MGKSEL 7/1
+        assert_eq!(
+            decode_hw_features(1 << 7, 0, 0),
+            HwFeatures {
+                magic_packet: true,
+                ..z
+            }
+        );
+        // MMCSEL 8/1
+        assert_eq!(
+            decode_hw_features(1 << 8, 0, 0),
+            HwFeatures { mmc: true, ..z }
+        );
+        // ARPOFFSEL 9/1
+        assert_eq!(
+            decode_hw_features(1 << 9, 0, 0),
+            HwFeatures {
+                arp_offload: true,
+                ..z
+            }
+        );
+        // TSSEL 12/1
+        assert_eq!(
+            decode_hw_features(1 << 12, 0, 0),
+            HwFeatures {
+                timestamp: true,
+                ..z
+            }
+        );
+        // EEESEL 13/1
+        assert_eq!(
+            decode_hw_features(1 << 13, 0, 0),
+            HwFeatures { eee: true, ..z }
+        );
+        // TXCOESEL 14/1
+        assert_eq!(
+            decode_hw_features(1 << 14, 0, 0),
+            HwFeatures { tx_coe: true, ..z }
+        );
+        // RXCOESEL 16/1 --- note 15 is NOT a feature bit, and a decode that
+        // read "the bit after TXCOESEL" would be wrong here.
+        assert_eq!(
+            decode_hw_features(1 << 16, 0, 0),
+            HwFeatures { rx_coe: true, ..z }
+        );
+        assert_eq!(decode_hw_features(1 << 15, 0, 0), z);
+        // ADDMACADRSEL 18/5
+        assert_eq!(
+            decode_hw_features(0x1f << 18, 0, 0),
+            HwFeatures { addn_mac: 31, ..z }
+        );
+        // TSSTSSEL 25/2 --- two bits, and 25 is inside the 18/5 field's
+        // neighbourhood, so an off-by-one on either shows up here.
+        assert_eq!(
+            decode_hw_features(0b11 << 25, 0, 0),
+            HwFeatures { ts_src: 3, ..z }
+        );
+        // SAVLANINS 27/1
+        assert_eq!(
+            decode_hw_features(1 << 27, 0, 0),
+            HwFeatures {
+                sa_vlan_ins: true,
+                ..z
+            }
+        );
+        // VXN 29/1
+        assert_eq!(
+            decode_hw_features(1 << 29, 0, 0),
+            HwFeatures { vxn: true, ..z }
+        );
+    }
+
+    #[test]
+    fn every_field_of_hwf1r_sits_at_its_linux_index() {
+        let z = zeroed();
+        // RXFIFOSIZE 0/5, translated: `1 << (11 + 7)` is 256 KiB.
+        assert_eq!(
+            decode_hw_features(0, 11, 0),
+            HwFeatures {
+                rx_fifo_size: 256 * 1024,
+                ..z
+            }
+        );
+        // TXFIFOSIZE 6/5
+        assert_eq!(
+            decode_hw_features(0, 11 << 6, 0),
+            HwFeatures {
+                tx_fifo_size: 256 * 1024,
+                ..z
+            }
+        );
+        // ADVTHWORD 13/1
+        assert_eq!(
+            decode_hw_features(0, 1 << 13, 0),
+            HwFeatures {
+                adv_ts_hi: true,
+                ..z
+            }
+        );
+        // ADDR64 14/2, translated to a width in bits.
+        assert_eq!(
+            decode_hw_features(0, 1 << 14, 0),
+            HwFeatures { dma_width: 40, ..z }
+        );
+        // DCBEN 16/1
+        assert_eq!(
+            decode_hw_features(0, 1 << 16, 0),
+            HwFeatures { dcb: true, ..z }
+        );
+        // SPHEN 17/1
+        assert_eq!(
+            decode_hw_features(0, 1 << 17, 0),
+            HwFeatures {
+                split_header: true,
+                ..z
+            }
+        );
+        // TSOEN 18/1
+        assert_eq!(
+            decode_hw_features(0, 1 << 18, 0),
+            HwFeatures { tso: true, ..z }
+        );
+        // DBGMEMA 19/1
+        assert_eq!(
+            decode_hw_features(0, 1 << 19, 0),
+            HwFeatures {
+                dma_debug: true,
+                ..z
+            }
+        );
+        // RSSEN 20/1
+        assert_eq!(
+            decode_hw_features(0, 1 << 20, 0),
+            HwFeatures { rss: true, ..z }
+        );
+        // NUMTC 21/3, incremented: 7 encodes eight traffic classes.
+        assert_eq!(
+            decode_hw_features(0, 0b111 << 21, 0),
+            HwFeatures { tc_count: 8, ..z }
+        );
+        // HASHTBLSZ 24/3, translated.
+        assert_eq!(
+            decode_hw_features(0, 3 << 24, 0),
+            HwFeatures {
+                hash_table_size: 256,
+                ..z
+            }
+        );
+        // L3L4FNUM 27/4
+        assert_eq!(
+            decode_hw_features(0, 0xf << 27, 0),
+            HwFeatures {
+                l3l4_filters: 15,
+                ..z
+            }
+        );
+    }
+
+    #[test]
+    fn every_field_of_hwf2r_sits_at_its_linux_index() {
+        let z = zeroed();
+        // RXQCNT 0/4, incremented.
+        assert_eq!(
+            decode_hw_features(0, 0, 0xf),
+            HwFeatures { rx_queues: 16, ..z }
+        );
+        // TXQCNT 6/4 --- bits 4 and 5 belong to nobody, so a packed-fields
+        // reading of this register would put it at 4 and be wrong.
+        assert_eq!(
+            decode_hw_features(0, 0, 0xf << 6),
+            HwFeatures { tx_queues: 16, ..z }
+        );
+        assert_eq!(decode_hw_features(0, 0, 0b11 << 4), z);
+        // RXCHCNT 12/4
+        assert_eq!(
+            decode_hw_features(0, 0, 0xf << 12),
+            HwFeatures {
+                rx_channels: 16,
+                ..z
+            }
+        );
+        // TXCHCNT 18/4
+        assert_eq!(
+            decode_hw_features(0, 0, 0xf << 18),
+            HwFeatures {
+                tx_channels: 16,
+                ..z
+            }
+        );
+        // PPSOUTNUM 24/3, clamped to XGBE_MAX_PPS_OUT.
+        assert_eq!(
+            decode_hw_features(0, 0, 1 << 24),
+            HwFeatures {
+                pps_outputs: 1,
+                ..z
+            }
+        );
+        // AUXSNAPNUM 28/3, clamped to XGBE_MAX_AUX_SNAP.
+        assert_eq!(
+            decode_hw_features(0, 0, 1 << 28),
+            HwFeatures {
+                aux_snapshots: 1,
+                ..z
+            }
+        );
+    }
+
+    #[test]
+    fn the_hash_table_size_is_an_index_not_a_count() {
+        // `switch (hw_feat->hash_table_size)` in xgbe_get_all_hw_features.
+        for (encoded, entries) in [(0u32, 0u32), (1, 64), (2, 128), (3, 256)] {
+            assert_eq!(
+                decode_hw_features(0, encoded << 24, 0).hash_table_size,
+                entries,
+                "HASHTBLSZ {} should mean {} entries",
+                encoded,
+                entries
+            );
+        }
+        // Five, six and seven have no meaning; Linux's switch leaves them as
+        // the raw value, which would be read as a table of five entries. We
+        // read them as no table, which is the arm that makes `xgbe-dev.c`
+        // skip hash filtering altogether instead of programming nonsense.
+        for encoded in [4u32, 5, 6, 7] {
+            assert_eq!(decode_hw_features(0, encoded << 24, 0).hash_table_size, 0);
+        }
+    }
+
+    #[test]
+    fn the_dma_width_is_an_index_into_three_widths() {
+        // `switch (hw_feat->dma_width)`: 0 -> 32, 1 -> 40, 2 -> 48,
+        // default -> 32.
+        for (encoded, bits) in [(0u32, 32u32), (1, 40), (2, 48), (3, 32)] {
+            assert_eq!(decode_hw_features(0, encoded << 14, 0).dma_width, bits);
+        }
+    }
+
+    #[test]
+    fn more_pps_outputs_than_the_driver_has_room_for_are_clamped() {
+        // Linux warns and clamps to XGBE_MAX_PPS_OUT / XGBE_MAX_AUX_SNAP = 4.
+        assert_eq!(MAX_PPS_OUT, 4);
+        assert_eq!(MAX_AUX_SNAP, 4);
+        let f = decode_hw_features(0, 0, (0b111 << 24) | (0b111 << 28));
+        assert_eq!(f.pps_outputs, 4);
+        assert_eq!(f.aux_snapshots, 4);
+        // Four itself is not clamped away.
+        let f = decode_hw_features(0, 0, (4 << 24) | (4 << 28));
+        assert_eq!(f.pps_outputs, 4);
+        assert_eq!(f.aux_snapshots, 4);
+    }
+
+    #[test]
+    fn an_impossible_fifo_size_saturates_instead_of_wrapping() {
+        // The field is 5 bits, so a chip can claim `1 << 38` bytes. Linux
+        // wraps it in an `unsigned int`; in a debug build the same shift
+        // panics, which would turn a bad register read into a dead boot.
+        assert_eq!(fifo_bytes(0), 128);
+        assert_eq!(fifo_bytes(11), 256 * 1024);
+        assert_eq!(fifo_bytes(24), 1 << 31);
+        assert_eq!(fifo_bytes(25), u32::MAX);
+        assert_eq!(fifo_bytes(31), u32::MAX);
+        // Which is what the register path must do too, in both directions.
+        let f = decode_hw_features(0, 0x1f | (0x1f << 6), 0);
+        assert_eq!(f.rx_fifo_size, u32::MAX);
+        assert_eq!(f.tx_fifo_size, u32::MAX);
+    }
+
+    #[test]
+    fn a_plausible_v2a_report_decodes_whole() {
+        // Not a reading from a chip --- nobody here has one. It is the three
+        // registers a part with eight channels, eight queues, eight traffic
+        // classes, 128 KiB of FIFO each way, 40-bit DMA and the usual
+        // offloads would present, assembled field by field from the indices
+        // above. Its value is that it exercises every field at once: a decode
+        // where two fields overlap can pass each single-field case and still
+        // fail here.
+        let hfr0 = (1 << 1)      // GMIISEL
+            | (1 << 4)           // VLHASH
+            | (1 << 5)           // SMASEL
+            | (1 << 8)           // MMCSEL
+            | (1 << 12)          // TSSEL
+            | (1 << 14)          // TXCOESEL
+            | (1 << 16)          // RXCOESEL
+            | (31 << 18)         // ADDMACADRSEL
+            | (1 << 27); // SAVLANINS
+        let hfr1 = 10            // RXFIFOSIZE -> 128 KiB
+            | (10 << 6)          // TXFIFOSIZE -> 128 KiB
+            | (1 << 14)          // ADDR64 -> 40 bits
+            | (1 << 16)          // DCBEN
+            | (1 << 17)          // SPHEN
+            | (1 << 18)          // TSOEN
+            | (1 << 20)          // RSSEN
+            | (7 << 21)          // NUMTC -> 8
+            | (3 << 24)          // HASHTBLSZ -> 256
+            | (8 << 27); // L3L4FNUM
+        let hfr2 = 7             // RXQCNT -> 8
+            | (7 << 6)           // TXQCNT -> 8
+            | (7 << 12)          // RXCHCNT -> 8
+            | (7 << 18); // TXCHCNT -> 8
+
+        let f = decode_hw_features(hfr0, hfr1, hfr2);
+        assert_eq!(f.tx_channels, 8);
+        assert_eq!(f.rx_channels, 8);
+        assert_eq!(f.tx_queues, 8);
+        assert_eq!(f.rx_queues, 8);
+        assert_eq!(f.tc_count, 8);
+        assert_eq!(f.tx_fifo_size, 128 * 1024);
+        assert_eq!(f.rx_fifo_size, 128 * 1024);
+        assert_eq!(f.dma_width, 40);
+        assert_eq!(f.hash_table_size, 256);
+        assert_eq!(f.addn_mac, 31);
+        assert_eq!(f.l3l4_filters, 8);
+        assert!(f.gmii && f.vlan_hash && f.sma && f.mmc && f.timestamp);
+        assert!(f.tx_coe && f.rx_coe && f.tso && f.rss && f.dcb && f.split_header);
+        assert!(f.sa_vlan_ins);
+        // And what such a part does NOT have, so the all-ones mistake fails.
+        assert!(!f.eee && !f.arp_offload && !f.remote_wake && !f.magic_packet);
+        assert!(!f.vxn && !f.adv_ts_hi && !f.dma_debug);
+        assert_eq!(f.ts_src, 0);
+        assert_eq!(f.pps_outputs, 0);
+        assert_eq!(f.aux_snapshots, 0);
+
+        // The FIFO the core has is not necessarily the FIFO the driver may
+        // use: a V2a's ceiling is larger than this, a V2b's is smaller.
+        assert!(f.tx_fifo_size <= Variant::V2a.max_fifo_size());
+        assert!(f.tx_fifo_size > Variant::V2b.max_fifo_size());
     }
 }
