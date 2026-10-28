@@ -1223,6 +1223,7 @@ dependencies = [
  "lazy_static",
  "lock",
  "log",
+ "sha2",
 ]
 
 [[package]]

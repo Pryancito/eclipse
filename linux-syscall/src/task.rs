@@ -1518,6 +1518,29 @@ impl Syscall<'_> {
         // `bprm` is fully built before `begin_new_exec` commits.
         let past_every_check = execve_preflight(inode, self.syscall_entry, self.zircon_process())?;
 
+        // hunter: the exec gate and the integrity appraisal, on the image that
+        // is about to be mapped (the same VMO, so a writer racing the check
+        // cannot swap the bytes between the two) and while a refusal can still
+        // come back to the caller as EACCES. After the preflight, so a file
+        // that is not a program is still ENOEXEC -- the shell runs it as a
+        // script on that -- and not a hunter refusal.
+        //
+        // This gate went missing in "cache executable file images across
+        // execve", which replaced the block that called it; every runtime exec
+        // has passed unchecked since, blacklist included.
+        {
+            let mut header = [0u8; 64];
+            let _ = vmo.read(0, &mut header);
+            if !hunter::check_exec_target(&target.name, absolute, &header)
+                || !linux_object::fs::hunter_config::appraise(
+                    &[target.name.as_str(), absolute.as_str()],
+                    &vmo,
+                )
+            {
+                return Err(LxError::EACCES);
+            }
+        }
+
         // POSIX/Linux: execve in a multithreaded process kills every other
         // thread in the group before the address space is replaced. Leaving
         // them alive ran the old RIP/stack against the new image. Wait until

@@ -11,17 +11,20 @@
 //!
 //! ## Language
 //!
-//! One directive per line; blank lines and `#` comments are ignored.
+//! One directive per line; blank lines and `#` comments (whole-line, or
+//! trailing after whitespace) are ignored.
 //!
 //! | Directive                               | Effect                                        |
 //! |-----------------------------------------|-----------------------------------------------|
-//! | `mode <domain> <off\|report\|enforce>`  | domain is `syscall`, `wx`, `exec`, `anomaly`  |
+//! | `mode <domain> <off\|report\|enforce>`  | domain is `syscall`, `wx`, `exec`, `anomaly`, `integrity` |
 //! | `learning <on\|off>`                    | exec trust-on-first-use                       |
 //! | `anomaly-detection <on\|off>`           | per-process flood / fork-bomb heuristics      |
 //! | `privileged-deny <on\|off>`             | block module/ptrace/bpf/... under `anomaly=enforce` |
 //! | `trust <path>` / `trust <dir/>`         | add to the exec allowlist                     |
 //! | `deny <path>` / `deny <dir/>`           | add to the exec blacklist                     |
 //! | `untrusted <dir/>`                      | add a world-writable location                 |
+//! | `hash <sha256> <path>`                  | pin a program's SHA-256 (see [`crate::integrity`]) |
+//! | `require-hash <on\|off>`                | an unpinned program is an integrity violation |
 //! | `seal`                                  | engage the one-way tighten-only latch         |
 //!
 //! A trailing `/` makes `trust` / `deny` a directory prefix, exactly as in
@@ -53,6 +56,7 @@ use alloc::vec::Vec;
 
 use crate::event_log::{record, Severity};
 use crate::heuristics;
+use crate::integrity::{self, Digest};
 use crate::policy::{self, Mode};
 
 /// An enforcement domain a `mode` directive can name.
@@ -62,6 +66,7 @@ pub enum Domain {
     Wx,
     Exec,
     Anomaly,
+    Integrity,
 }
 
 /// One parsed line of the control language.
@@ -74,6 +79,8 @@ pub enum Directive {
     Trust(String),
     Deny(String),
     Untrusted(String),
+    Hash(Digest, String),
+    RequireHash(bool),
     Seal,
 }
 
@@ -86,7 +93,7 @@ pub struct ParseError {
 
 /// Parses one line. `Ok(None)` for a blank line or a comment.
 pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
-    let line = line.trim();
+    let line = strip_comment(line).trim();
     if line.is_empty() || line.starts_with('#') {
         return Ok(None);
     }
@@ -139,6 +146,19 @@ pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
             }
             Directive::Untrusted(p)
         }
+        "hash" => {
+            // The rest of the line is one `sha256sum` line, so a path with a
+            // space in it pins the same here as in `/etc/hunter/hashes`.
+            let rest = line["hash".len()..].trim_start();
+            match integrity::parse_sums_line(rest)? {
+                Some((digest, path)) => Directive::Hash(digest, path),
+                None => return Err(String::from("'hash' takes '<sha256> <path>'")),
+            }
+        }
+        "require-hash" => {
+            arity(2)?;
+            Directive::RequireHash(parse_switch(words[1])?)
+        }
         "seal" => {
             arity(1)?;
             Directive::Seal
@@ -148,14 +168,29 @@ pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
     Ok(Some(directive))
 }
 
+/// Cuts a trailing comment: a `#` at the start of the line or after
+/// whitespace, so `mode wx report  # JITs` is `mode wx report` while a `#`
+/// inside a word (a path) is kept. The shipped example annotates its lines
+/// this way, and uncommenting one of them must give a line that parses.
+fn strip_comment(line: &str) -> &str {
+    let b = line.as_bytes();
+    for i in 0..b.len() {
+        if b[i] == b'#' && (i == 0 || b[i - 1].is_ascii_whitespace()) {
+            return &line[..i];
+        }
+    }
+    line
+}
+
 fn parse_domain(word: &str) -> Result<Domain, String> {
     match word {
         "syscall" => Ok(Domain::Syscall),
         "wx" => Ok(Domain::Wx),
         "exec" => Ok(Domain::Exec),
         "anomaly" => Ok(Domain::Anomaly),
+        "integrity" => Ok(Domain::Integrity),
         other => Err(format!(
-            "unknown domain '{}' (syscall, wx, exec, anomaly)",
+            "unknown domain '{}' (syscall, wx, exec, anomaly, integrity)",
             other
         )),
     }
@@ -215,6 +250,7 @@ pub fn apply(d: &Directive) {
         Directive::Mode(Domain::Wx, m) => policy::set_wx_mode(*m),
         Directive::Mode(Domain::Exec, m) => policy::set_exec_mode(*m),
         Directive::Mode(Domain::Anomaly, m) => policy::set_anomaly_mode(*m),
+        Directive::Mode(Domain::Integrity, m) => policy::set_integrity_mode(*m),
         Directive::Learning(on) => policy::set_exec_learning(*on),
         Directive::AnomalyDetection(on) => {
             if gate_switch("anomaly-detection", *on) {
@@ -231,6 +267,8 @@ pub fn apply(d: &Directive) {
         Directive::Deny(p) if p.ends_with('/') => policy::add_blacklisted_exec_prefix(p.clone()),
         Directive::Deny(p) => policy::add_blacklisted_exec_path(p.clone()),
         Directive::Untrusted(p) => policy::add_untrusted_exec_prefix(p.clone()),
+        Directive::Hash(d, p) => integrity::add_exec_hash(p, *d),
+        Directive::RequireHash(on) => integrity::set_require_hash(*on),
         Directive::Seal => policy::seal_tighten_only(),
     }
 }
@@ -323,6 +361,9 @@ mod tests {
             trust /opt/app/agent\n\
             deny /srv/evil\n\
             untrusted /run/user/\n\
+            mode integrity enforce\n\
+            hash ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  /usr/bin/my tool\n\
+            require-hash on\n\
             seal\n";
         assert_eq!(
             parse_script(script).unwrap(),
@@ -338,6 +379,15 @@ mod tests {
                 Directive::Trust(String::from("/opt/app/agent")),
                 Directive::Deny(String::from("/srv/evil")),
                 Directive::Untrusted(String::from("/run/user/")),
+                Directive::Mode(Domain::Integrity, Mode::Enforce),
+                Directive::Hash(
+                    integrity::parse_hex(
+                        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                    )
+                    .unwrap(),
+                    String::from("/usr/bin/my tool")
+                ),
+                Directive::RequireHash(true),
                 Directive::Seal,
             ]
         );
@@ -350,7 +400,7 @@ mod tests {
     fn the_shipped_example_is_inert_and_every_line_of_it_parses() {
         let example = include_str!("../../tools/hunterctl/policy.conf");
         assert_eq!(parse_script(example).unwrap(), vec![]);
-        const VERBS: [&str; 8] = [
+        const VERBS: [&str; 10] = [
             "mode",
             "learning",
             "anomaly-detection",
@@ -358,19 +408,34 @@ mod tests {
             "trust",
             "deny",
             "untrusted",
+            "hash",
+            "require-hash",
             "seal",
         ];
-        // `# mode wx report   # note` -> `mode wx report`; prose lines skipped.
+        // `# mode wx report   # note` -> `mode wx report   # note`, which must
+        // parse as it stands; prose lines skipped.
         let uncommented = example
             .lines()
             .filter_map(|l| l.strip_prefix("# "))
             .filter(|l| VERBS.contains(&l.split_whitespace().next().unwrap_or("")))
-            .map(|l| l.split('#').next().unwrap())
             .collect::<Vec<_>>()
             .join("\n");
         let parsed = parse_script(&uncommented).unwrap();
         assert!(parsed.len() >= 10, "{:?}", parsed);
         assert_eq!(parsed.last(), Some(&Directive::Seal));
+    }
+
+    #[test]
+    fn trailing_comments_are_cut_but_a_hash_inside_a_path_is_kept() {
+        assert_eq!(
+            parse_line("mode wx report   # JITs").unwrap(),
+            Some(Directive::Mode(Domain::Wx, Mode::Report))
+        );
+        assert_eq!(
+            parse_line("deny /opt/c#/tool\t# why").unwrap(),
+            Some(Directive::Deny(String::from("/opt/c#/tool")))
+        );
+        assert!(parse_line("mode wx report extra # comment").is_err());
     }
 
     #[test]
@@ -386,6 +451,9 @@ mod tests {
             "trust relative/path",
             "untrusted /run/user",
             "seal now",
+            "hash deadbeef /bin/x",
+            "hash",
+            "require-hash",
             "frobnicate",
         ] {
             assert!(parse_line(bad).is_err(), "accepted: {}", bad);

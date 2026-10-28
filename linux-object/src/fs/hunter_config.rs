@@ -5,6 +5,8 @@
 //!
 //! * `/etc/hunter/whitelist` — trusted programs that may always run.
 //! * `/etc/hunter/blacklist` — denied programs that must never run.
+//! * `/etc/hunter/hashes` — pinned SHA-256 digests, in `sha256sum` format
+//!   (`<sha256>  <path>`), so `sha256sum /bin/* > /etc/hunter/hashes` writes it.
 //! * `/etc/hunter/policy.conf` — a script in hunter's control language
 //!   (`mode exec enforce`, `learning off`, `seal`, ...; see
 //!   `hunter::control`), applied last so it can override the learning
@@ -39,7 +41,64 @@ pub fn load(root: &Arc<dyn INode>) {
         n_white,
         n_black
     );
+    let n_hash = load_hashes(root, HASHES_FILE);
+    if n_hash > 0 {
+        kernel_hal::klog_info!("hunter: pinned {} SHA-256 digests", n_hash);
+    }
     load_policy(root, POLICY_CONF);
+}
+
+/// The operator's pinned digests (see `hunter::integrity`).
+const HASHES_FILE: &str = "/etc/hunter/hashes";
+
+/// Reads `/etc/hunter/hashes` and pins every digest in it. Returns how many.
+///
+/// Line by line, like the lists and unlike `policy.conf`: a pin is a check,
+/// so a line that does not parse leaves one program unpinned -- which is what
+/// it would be with no file at all -- and is said by name. A file cut at
+/// [`MAX_CONFIG_BYTES`] drops its last line, as the lists do.
+fn load_hashes(root: &Arc<dyn INode>, path: &str) -> usize {
+    let inode = match root.lookup(path) {
+        Ok(i) => i,
+        Err(_) => return 0,
+    };
+    let full_size = match inode.metadata() {
+        Ok(m) => m.size,
+        Err(_) => return 0,
+    };
+    let size = full_size.min(MAX_CONFIG_BYTES);
+    let mut buf = vec![0u8; size];
+    let n = read_all(inode.as_ref(), &mut buf);
+    let mut lines: alloc::vec::Vec<&[u8]> = buf[..n].split(|b| *b == b'\n').collect();
+    if (full_size > n) && lines.last().map(|l| !l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    let mut count = 0;
+    for (i, raw) in lines.into_iter().enumerate() {
+        let parsed = core::str::from_utf8(raw)
+            .map_err(|_| alloc::string::String::from("not UTF-8"))
+            .and_then(hunter::integrity::parse_sums_line);
+        match parsed {
+            Ok(Some((digest, program))) => {
+                hunter::integrity::add_exec_hash(&program, digest);
+                count += 1;
+            }
+            Ok(None) => {}
+            Err(e) => kernel_hal::klog_info!("hunter: {}:{}: skipped: {}", path, i + 1, e),
+        }
+    }
+    count
+}
+
+/// Appraises an image about to be executed against the pinned digests:
+/// `names` are the program's paths, `vmo` the image the loader maps. Shared by
+/// `execve`, the `PT_INTERP` / `#!` interpreters and the boot-time spawn, so
+/// all of them hash the bytes that will actually run.
+pub fn appraise(names: &[&str], vmo: &zircon_object::vm::VmObject) -> bool {
+    use zircon_object::object::KernelObject;
+    hunter::check_exec_integrity(names, vmo.id(), vmo.content_size(), &mut |off, buf| {
+        vmo.read(off, buf).is_ok()
+    })
 }
 
 /// The operator's stance: modes, learning, heuristics, extra entries, seal.
@@ -355,6 +414,27 @@ mod hunter_config_tests {
         let root = rcore_fs::vfs::FileSystem::root_inode(&*fs);
         core::mem::forget(fs);
         root
+    }
+
+    #[test]
+    fn hashes_load_line_by_line_in_sha256sum_format() {
+        use rcore_fs::vfs::FileType;
+        let root = leaked_root();
+        let etc = root.create("etc", FileType::Dir, 0o755).unwrap();
+        let dir = etc.create("hunter", FileType::Dir, 0o755).unwrap();
+        let file = dir.create("hashes", FileType::File, 0o644).unwrap();
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let text = alloc::format!("# pinned\n{abc}  /a11/one\nnot a line\n{abc} */a11/two\n");
+        file.write_at(0, text.as_bytes()).unwrap();
+        // Nothing in this crate's tests seals hunter, so the pins are taken.
+        assert_eq!(
+            load_hashes(&root, HASHES_FILE),
+            2,
+            "the bad line, and only it, skipped"
+        );
+        let d = hunter::integrity::parse_hex(abc);
+        assert_eq!(hunter::integrity::pinned("/a11/one"), d);
+        assert_eq!(hunter::integrity::pinned("/a11/two"), d);
     }
 
     #[test]
