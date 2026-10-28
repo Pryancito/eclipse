@@ -1547,6 +1547,143 @@ pub fn disable_rx(
     }
 }
 
+// ——— Handing the chip its rings ———
+//
+// The last configuration step before anything moves: telling each channel
+// where its descriptor ring is, how long it is, and --- for receive only ---
+// how far into it the driver has filled.
+
+/// `DMA_CH_RCR_RBSZ`, index **1**, width 14: the receive buffer size.
+///
+/// Index 1, not 0, so the value sits shifted by one bit in the register. The
+/// bottom bit belongs to `SR` (start receive), which is why a buffer size
+/// written at index 0 would start the engine as a side effect of being an odd
+/// number of bytes.
+pub const DMA_CH_RCR_RBSZ: (u32, u32) = (1, 14);
+
+/// Program a transmit ring into its channel.
+///
+/// `ring_paddr` is the physical address of descriptor 0, `count` the number
+/// of descriptors.
+///
+/// Two things to get right, and neither reports anything when wrong:
+///
+/// * The length register takes **`count - 1`**: it is a last index, not a
+///   count. Writing the count gives the engine one descriptor more than
+///   exists, which it will happily fetch from whatever follows the ring.
+/// * The address halves go in **high first** (see [`DMA_CH_TDLR`]).
+///
+/// There is deliberately **no tail pointer** here. A transmit ring starts
+/// empty: the driver has nothing for the engine to fetch, and the tail is
+/// written later, when a frame is queued. Writing one now would point the
+/// engine at descriptors the driver has not filled in.
+pub fn program_tx_ring(
+    acc: &dyn MmioAccess,
+    channel: u32,
+    ring_paddr: u64,
+    count: u32,
+) -> DeviceResult<()> {
+    if count == 0 {
+        return Err(DeviceError::InvalidParam);
+    }
+    let (hi, lo) = split_ring_addr(ring_paddr);
+
+    acc.write32(dma_channel_reg(channel, DMA_CH_TDRLR), count - 1);
+    acc.write32(dma_channel_reg(channel, DMA_CH_TDLR_HI), hi);
+    acc.write32(dma_channel_reg(channel, DMA_CH_TDLR_LO), lo);
+    Ok(())
+}
+
+/// Program a receive ring into its channel, and set the buffer size.
+///
+/// Same two rules as [`program_tx_ring`], plus the one that makes receive
+/// different: it **does** get a tail pointer, and the tail points at the
+/// address of the **last descriptor**, not one past the end.
+///
+/// That is the opposite of the usual convention and the reason it is spelled
+/// out here. The tail is "the last descriptor the driver owns"; a receive
+/// ring starts with every descriptor handed to the engine, so the tail is the
+/// last one. One past the end would be `ring_paddr + count * 16`, an address
+/// outside the ring, and the engine would fetch a descriptor from whatever
+/// the allocator put there next.
+pub fn program_rx_ring(
+    acc: &dyn MmioAccess,
+    channel: u32,
+    ring_paddr: u64,
+    count: u32,
+    buffer_size: u32,
+) -> DeviceResult<()> {
+    if count == 0 || buffer_size == 0 || buffer_size >= (1 << DMA_CH_RCR_RBSZ.1) {
+        return Err(DeviceError::InvalidParam);
+    }
+    let (hi, lo) = split_ring_addr(ring_paddr);
+
+    write_field(
+        acc,
+        dma_channel_reg(channel, DMA_CH_RCR),
+        DMA_CH_RCR_RBSZ.0,
+        DMA_CH_RCR_RBSZ.1,
+        buffer_size,
+    );
+
+    acc.write32(dma_channel_reg(channel, DMA_CH_RDRLR), count - 1);
+    acc.write32(dma_channel_reg(channel, DMA_CH_RDLR_HI), hi);
+    acc.write32(dma_channel_reg(channel, DMA_CH_RDLR_LO), lo);
+
+    let last = ring_paddr + ((count - 1) as u64) * core::mem::size_of::<Desc>() as u64;
+    acc.write32(dma_channel_reg(channel, DMA_CH_RDTR_LO), last as u32);
+    Ok(())
+}
+
+/// Whether descriptor `index` should ask for an interrupt, given the receive
+/// coalescing settings. `xgbe_rx_desc_reset`.
+///
+/// With no coalescing at all, every descriptor interrupts. With a frame count
+/// set, every `rx_frames`-th one does --- counted on `index + 1`, so the
+/// *last* descriptor of each group carries the flag and not the first.
+#[inline]
+pub const fn rx_desc_wants_interrupt(index: u32, rx_usecs: u32, rx_frames: u32) -> bool {
+    if rx_usecs == 0 && rx_frames == 0 {
+        return true;
+    }
+    rx_frames != 0 && (index + 1).is_multiple_of(rx_frames)
+}
+
+/// Build a receive descriptor, ready except for its `OWN` bit.
+///
+/// A receive descriptor carries **two** buffers: the header buffer in
+/// `desc0`/`desc1` and the payload buffer in `desc2`/`desc3`, each as a full
+/// 64-bit address in low-then-high order. Which means all four words are
+/// address --- and `desc3`, the high half of the payload address, is **also**
+/// where `OWN` and `INTE` live.
+///
+/// So the control bits are OR'd into an address word. It works because a
+/// physical address has nothing in its top bits, but it has two consequences
+/// worth stating: writing `desc3` as "just the address" clears `OWN`, and
+/// writing it as "just the flags" destroys the payload address.
+///
+/// The `OWN` bit is left off here on purpose. Linux sets it in a separate
+/// write with a barrier either side, because the receive engine may already
+/// be running over this ring: everything else must be visible before the
+/// descriptor is handed over, and the handover must be visible before
+/// anything else happens. Returning the descriptor without `OWN` makes that
+/// ordering the caller's explicit step instead of a detail buried in here.
+#[inline]
+pub fn rx_desc_init(hdr_dma: u64, buf_dma: u64, wants_interrupt: bool) -> Desc {
+    let (hdr_hi, hdr_lo) = split_ring_addr(hdr_dma);
+    let (buf_hi, buf_lo) = split_ring_addr(buf_dma);
+    let mut desc3 = buf_hi;
+    if wants_interrupt {
+        desc3 |= DESC3_CTXT; // RX_NORMAL_DESC3_INTE, the same bit 30.
+    }
+    Desc {
+        desc0: hdr_lo,
+        desc1: hdr_hi,
+        desc2: buf_lo,
+        desc3,
+    }
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
@@ -3660,5 +3797,193 @@ mod tests {
             *down_offsets.last().unwrap(),
             dma_channel_reg(1, DMA_CH_RCR)
         );
+    }
+
+    // ——— Handing the chip its rings ———
+
+    #[test]
+    fn the_receive_buffer_size_field_does_not_start_at_bit_zero() {
+        // RBSZ is at index 1. Bit 0 is SR, start-receive --- so a buffer
+        // size written at index 0 would start the engine as a side effect of
+        // being an odd number of bytes.
+        assert_eq!(DMA_CH_RCR_RBSZ, (1, 14));
+        assert_eq!(DMA_CH_RCR_RBSZ.0, DMA_CH_RCR_SR.0 + DMA_CH_RCR_SR.1);
+        let fake = FakeXgmac::new();
+        program_rx_ring(&fake, 0, 0x1000, 4, 2048).unwrap();
+        let rcr = fake.read32(dma_channel_reg(0, DMA_CH_RCR));
+        assert_eq!(get_bits(rcr, DMA_CH_RCR_RBSZ.0, DMA_CH_RCR_RBSZ.1), 2048);
+        // And the engine was NOT started by writing the size.
+        assert_eq!(get_bits(rcr, DMA_CH_RCR_SR.0, DMA_CH_RCR_SR.1), 0);
+    }
+
+    #[test]
+    fn the_ring_length_register_takes_a_last_index_not_a_count() {
+        // `ring->rdesc_count - 1`. Writing the count gives the engine one
+        // descriptor more than exists, which it fetches from whatever the
+        // allocator put after the ring.
+        let fake = FakeXgmac::new();
+        program_tx_ring(&fake, 0, 0x2000, 32).unwrap();
+        assert_eq!(fake.read32(dma_channel_reg(0, DMA_CH_TDRLR)), 31);
+
+        let fake = FakeXgmac::new();
+        program_rx_ring(&fake, 1, 0x3000, 64, 2048).unwrap();
+        assert_eq!(fake.read32(dma_channel_reg(1, DMA_CH_RDRLR)), 63);
+    }
+
+    #[test]
+    fn an_empty_ring_is_refused_rather_than_written_as_minus_one() {
+        // `count - 1` on zero wraps to 0xffffffff: a ring of four billion
+        // descriptors, which is the worst possible thing to hand a bus
+        // master.
+        let fake = FakeXgmac::new();
+        assert_eq!(
+            program_tx_ring(&fake, 0, 0x2000, 0),
+            Err(DeviceError::InvalidParam)
+        );
+        assert_eq!(
+            program_rx_ring(&fake, 0, 0x2000, 0, 2048),
+            Err(DeviceError::InvalidParam)
+        );
+        // A buffer size that does not fit the field is refused too, rather
+        // than truncated to something smaller than the buffers actually are
+        // --- which would overrun nothing, but would silently split every
+        // frame.
+        assert_eq!(
+            program_rx_ring(&fake, 0, 0x2000, 4, 1 << 14),
+            Err(DeviceError::InvalidParam)
+        );
+        assert_eq!(
+            program_rx_ring(&fake, 0, 0x2000, 4, 0),
+            Err(DeviceError::InvalidParam)
+        );
+        assert!(fake.log().is_empty());
+    }
+
+    #[test]
+    fn the_ring_address_goes_in_high_half_first() {
+        let fake = FakeXgmac::new();
+        program_tx_ring(&fake, 0, 0x0000_0007_dead_0000, 16).unwrap();
+        assert_eq!(
+            written_offsets(&fake),
+            alloc::vec![
+                dma_channel_reg(0, DMA_CH_TDRLR),
+                dma_channel_reg(0, DMA_CH_TDLR_HI),
+                dma_channel_reg(0, DMA_CH_TDLR_LO),
+            ]
+        );
+        assert_eq!(fake.read32(dma_channel_reg(0, DMA_CH_TDLR_HI)), 7);
+        assert_eq!(fake.read32(dma_channel_reg(0, DMA_CH_TDLR_LO)), 0xdead_0000);
+    }
+
+    #[test]
+    fn a_transmit_ring_gets_no_tail_pointer_and_a_receive_ring_does() {
+        // A transmit ring starts EMPTY: the driver has nothing for the
+        // engine to fetch, and the tail is written later when a frame is
+        // queued. Writing one now would point the engine at descriptors
+        // nobody has filled in.
+        let fake = FakeXgmac::new();
+        program_tx_ring(&fake, 0, 0x2000, 16).unwrap();
+        assert_eq!(fake.writes_to(dma_channel_reg(0, DMA_CH_TDTR_LO)), 0);
+
+        let fake = FakeXgmac::new();
+        program_rx_ring(&fake, 0, 0x2000, 16, 2048).unwrap();
+        assert_eq!(fake.writes_to(dma_channel_reg(0, DMA_CH_RDTR_LO)), 1);
+    }
+
+    #[test]
+    fn the_receive_tail_points_at_the_last_descriptor_not_past_the_end() {
+        // The opposite of the usual convention: the tail is "the last
+        // descriptor the driver owns", and a receive ring starts with every
+        // descriptor handed over. One past the end would be an address
+        // OUTSIDE the ring, and the engine would fetch a descriptor from
+        // whatever the allocator put there next.
+        let base = 0x0000_0001_0000_0000u64;
+        let count = 8u32;
+        let fake = FakeXgmac::new();
+        program_rx_ring(&fake, 0, base, count, 2048).unwrap();
+
+        let tail = fake.read32(dma_channel_reg(0, DMA_CH_RDTR_LO));
+        let last = base + (count as u64 - 1) * 16;
+        assert_eq!(tail, last as u32);
+        // Explicitly NOT one past the end.
+        assert_ne!(tail, (base + count as u64 * 16) as u32);
+        // And it is inside the ring.
+        assert!((tail as u64) < base as u32 as u64 + count as u64 * 16);
+    }
+
+    #[test]
+    fn the_tail_is_the_low_half_only() {
+        // There is no RDTR_HI: the engine takes the high half from the list
+        // address register. So the tail write is one word.
+        let base = 0x0000_0009_8000_0000u64;
+        let fake = FakeXgmac::new();
+        program_rx_ring(&fake, 0, base, 2, 2048).unwrap();
+        let expect = (base + 16) as u32;
+        assert_eq!(fake.read32(dma_channel_reg(0, DMA_CH_RDTR_LO)), expect);
+        // The high half appears only in RDLR_HI.
+        assert_eq!(fake.read32(dma_channel_reg(0, DMA_CH_RDLR_HI)), 9);
+    }
+
+    #[test]
+    fn interrupt_coalescing_marks_the_last_descriptor_of_each_group() {
+        // With nothing set, every descriptor interrupts.
+        for i in 0..4u32 {
+            assert!(rx_desc_wants_interrupt(i, 0, 0));
+        }
+        // With a frame count, `(index + 1) % rx_frames` --- so the LAST
+        // descriptor of each group carries the flag, not the first. Marking
+        // index 0 instead would interrupt one descriptor early, every time.
+        assert!(!rx_desc_wants_interrupt(0, 0, 4));
+        assert!(!rx_desc_wants_interrupt(1, 0, 4));
+        assert!(!rx_desc_wants_interrupt(2, 0, 4));
+        assert!(rx_desc_wants_interrupt(3, 0, 4));
+        assert!(rx_desc_wants_interrupt(7, 0, 4));
+        // With only a time budget set, no descriptor is marked: the timer
+        // does the work.
+        for i in 0..4u32 {
+            assert!(!rx_desc_wants_interrupt(i, 50, 0));
+        }
+    }
+
+    #[test]
+    fn a_receive_descriptor_carries_two_buffers_in_four_words() {
+        // Header buffer in desc0/desc1, payload buffer in desc2/desc3, each
+        // low-then-high. All four words are address.
+        let hdr = 0x0000_0002_1111_0000u64;
+        let buf = 0x0000_0003_2222_0000u64;
+        let d = rx_desc_init(hdr, buf, false);
+        assert_eq!(d.desc0, 0x1111_0000);
+        assert_eq!(d.desc1, 2);
+        assert_eq!(d.desc2, 0x2222_0000);
+        assert_eq!(d.desc3, 3);
+    }
+
+    #[test]
+    fn the_control_bits_live_inside_an_address_word() {
+        // desc3 is the high half of the payload address AND where OWN and
+        // INTE live. It works because a physical address has nothing in its
+        // top bits, but writing desc3 as "just the address" clears OWN, and
+        // writing it as "just the flags" destroys the address.
+        let buf = 0x0000_0003_2222_0000u64;
+        let plain = rx_desc_init(0, buf, false);
+        let with_inte = rx_desc_init(0, buf, true);
+        assert_eq!(with_inte.desc3, plain.desc3 | DESC3_CTXT);
+        // The address half survives the flag.
+        assert_eq!(with_inte.desc3 & 0x0000_ffff, 3);
+        assert!(rx_desc3_inte(with_inte.desc3));
+        assert!(!rx_desc3_inte(plain.desc3));
+    }
+
+    #[test]
+    fn the_descriptor_is_not_handed_over_by_this_function() {
+        // OWN is left off on purpose: Linux sets it in a separate write with
+        // a barrier either side, because the receive engine may already be
+        // running over this ring. Returning the descriptor without OWN makes
+        // that ordering the caller's explicit step.
+        let d = rx_desc_init(0x1000, 0x2000, true);
+        assert!(!desc_owned_by_dma(d.desc3));
+        // And handing it over is then one OR, which is what the caller does
+        // after its barrier.
+        assert!(desc_owned_by_dma(d.desc3 | DESC3_OWN));
     }
 }
