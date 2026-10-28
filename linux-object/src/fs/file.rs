@@ -2677,7 +2677,7 @@ mod async_poll_tests {
     /// actually holds.
     fn a_terminal() -> Arc<dyn FileLike> {
         use crate::fs::pty::{alloc_ptmx, open_pts, PtyMaster};
-        let master = alloc_ptmx();
+        let master = alloc_ptmx(0);
         let id = master
             .downcast_ref::<PtyMaster>()
             .expect("alloc_ptmx gives a master")
