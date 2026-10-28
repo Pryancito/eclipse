@@ -3075,4 +3075,124 @@ mod controller_tests {
             );
         })
     }
+
+    // --- the verdict a completion carries ---
+
+    /// The sixteen bits a controller writes as its verdict, laid out as NVM
+    /// Express 1.4 figure 126 has them: the phase at bit 0, then the status
+    /// code, then its type, then three modifiers above both.
+    ///
+    /// The driver reads the code and the type and fails the command if either
+    /// is not zero, so the two tests below are about where each of those two
+    /// fields ends.
+    fn a_verdict(sc: u16, sct: u16, above: u16) -> u16 {
+        1 | (sc << 1) | (sct << 9) | (above << 12)
+    }
+
+    #[test]
+    fn a_completion_whose_type_is_set_but_whose_code_is_zero_is_a_failure() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            // Status code type 4 with a status code of zero. The type is the
+            // top three of the twelve bits the two fields share, so this is
+            // the verdict that says where the type starts: read one bit
+            // lower and the only bit set falls outside it, leaving code and
+            // type both zero, which is exactly what a success looks like.
+            the_controller_answers(&io, &[a_verdict(0, 4, 0), OK]);
+
+            // The command is over either way, so the retry is what tells the
+            // two readings apart. Taken for a success, the command would be
+            // reported done without the controller having carried it out.
+            assert_eq!(drive.flush(), Ok(()));
+            assert_eq!(
+                submitted(&io),
+                2,
+                "the failure was read as a success and never retried"
+            );
+        })
+    }
+
+    #[test]
+    fn the_bits_above_the_status_type_are_not_part_of_it() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            a_quick_clock();
+            let drive = a_drive(base);
+            let io = drive.io_queues[0].clone();
+            // Above the type sit the command retry delay and two flags. They
+            // qualify a failure rather than being one, so a verdict whose
+            // code and type are both zero is a success however they are set.
+            // Read the type one bit too wide and this completion turns into
+            // an error, and a command that did succeed goes out again.
+            the_controller_answers(&io, &[a_verdict(0, 0, 0b11)]);
+
+            assert_eq!(drive.flush(), Ok(()));
+            assert_eq!(
+                submitted(&io),
+                1,
+                "a success was read as a failure and submitted twice"
+            );
+        })
+    }
+
+    // --- the format a namespace is in ---
+
+    /// An Identify Namespace payload whose format in use is not the first
+    /// one: every LBA format descriptor says `others`, and the one `index`
+    /// points at says `lbads`.
+    fn an_identified_namespace_in_format(
+        queue: &Queue,
+        nsze: u64,
+        index: usize,
+        lbads: u8,
+        others: u8,
+        mdts: u8,
+    ) {
+        an_identified_namespace(queue, nsze, others, mdts);
+        let q = queue.lock();
+        // SAFETY: as `an_identified_namespace`.
+        let data = unsafe { core::slice::from_raw_parts_mut(q.data_va as *mut u8, 4096) };
+        // FLBAS, byte 26, whose low four bits are the index of the format in
+        // use. It is the third character of the model string as well, and the
+        // model is only ever logged.
+        data[26] = index as u8;
+        // Sixteen descriptors of four bytes each from byte 128, so a wrong
+        // base or a wrong stride lands on a different descriptor instead of
+        // outside the payload.
+        for slot in 0..16 {
+            let shift = if slot == index { lbads } else { others };
+            let at = 128 + slot * 4;
+            data[at..at + 4].copy_from_slice(&((shift as u32) << 16).to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn the_namespace_is_read_in_the_lba_format_its_flbas_points_at() {
+        alone_with_the_allocator(|| {
+            let base = a_window();
+            let deadline = a_patient_clock();
+
+            let mut drive = a_drive_not_yet_brought_up(base);
+            the_controller_answers(&drive.admin_queue, &[OK, OK]);
+            // 4 KiB blocks in the third descriptor, 512 bytes in every other
+            // one. A namespace in a format past the first is ordinary -- it
+            // is what formatting a disk to another block size leaves behind
+            // -- and every test here so far has used the first.
+            an_identified_namespace_in_format(&drive.admin_queue, 1024, 2, 12, 9, 5);
+            let answered = a_controller_that_answers(base);
+
+            assert_eq!(drive.nvme_configure_admin_queue(deadline), Ok(()));
+            answered.join().expect("the controller thread lived");
+
+            // Land on another descriptor and the driver finds 512 bytes
+            // here, and from then on every address it computes is eight
+            // times too small: a read of the last sector would come back
+            // with the first eighth of the disk, and no error anywhere.
+            assert_eq!(drive.logical_block_size(), 4096);
+            assert_eq!(drive.block_count(), 1024 * 8);
+        })
+    }
 }
