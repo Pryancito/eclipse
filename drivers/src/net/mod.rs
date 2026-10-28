@@ -10,6 +10,10 @@ pub mod e1000e;
 pub mod ip_cfg;
 // pub mod ixgbe;
 pub mod loopback;
+// Los registros MII/MDIO genericos (el papel de `include/uapi/linux/mii.h`):
+// ni el GMAC del D1 ni el GENET de la Raspberry Pi son sus dueños, los dos los
+// usan para hablar con su PHY.
+pub mod mii;
 /// AMD PCnet-PCI II / PCnet-FAST III. Driven through PCI I/O ports, which only
 /// x86 has, so the module is not built elsewhere.
 #[cfg(target_arch = "x86_64")]
@@ -152,6 +156,22 @@ mod rtlx;
 cfg_if::cfg_if! {
     if #[cfg(target_arch = "riscv64")] {
 pub use rtlx::*;
+    }
+}
+
+// El GENET v5 del BCM2711 (la Raspberry Pi 4). Como el driver del D1, se abre
+// al build de test: el fichero no lleva ni una instruccion de ARM --solo lee y
+// escribe una ventana de registros-- asi que detras de un `target_arch` pelado
+// ningun `cargo test` compilaria una linea y nadie podria probarlo.
+cfg_if::cfg_if! {
+    if #[cfg(any(target_arch = "aarch64", test))] {
+mod genet;
+    }
+}
+
+cfg_if::cfg_if! {
+    if #[cfg(target_arch = "aarch64")] {
+pub use genet::*;
     }
 }
 
