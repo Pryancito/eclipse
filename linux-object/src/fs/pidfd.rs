@@ -14,6 +14,56 @@ use zircon_object::task::{Process, Status, Thread, ThreadState};
 /// it, as Linux keeps it in `f_flags`.
 pub const PIDFD_THREAD: u32 = OpenFlags::EXCLUSIVE.bits() as u32;
 
+/// `PIDFD_GET_INFO`, the one ioctl a pidfd answers: `_IOWR(0xff, 11, struct
+/// pidfd_info)`, where the 72-byte struct makes the size field `0x48`. The
+/// number encodes that size, so a call with a struct of another length is a
+/// different number and falls through to `ENOTTY`, which is what Linux 6.18
+/// answers for it (a 24-byte `0xc018ff0b` was `ENOTTY` when measured there),
+/// and what any fd that is not a pidfd answers too.
+///
+/// A `u32`, matched against `request as u32`: the Linux ioctl command is a
+/// 32-bit `unsigned int`, and bit 31 is set here (direction `_IOC_READ |
+/// _IOC_WRITE`). musl types `ioctl`'s request `int`, so the command
+/// sign-extends to `0xffff_ffff_c048_ff0b` on the way in, while glibc's
+/// `unsigned long` keeps it clean; Linux truncates to 32 bits and sees both
+/// as the same command, so matching the low 32 bits is what lets a musl
+/// caller reach this ioctl at all (the DRM dispatch in `sys_ioctl` masks the
+/// same way for the same reason).
+const PIDFD_GET_INFO: u32 = 0xc048_ff0b;
+
+/// The `mask` bits of `struct pidfd_info`, the groups of fields a reply
+/// fills. Linux 6.18 ignores the mask the caller passes in and sets this to
+/// what it provided. Two more bits exist and are deliberately never set
+/// here: `PIDFD_INFO_CGROUPID` (`1 << 2`), because Eclipse has no cgroups,
+/// and `PIDFD_INFO_EXIT` (`1 << 3`), because this kernel keeps no stash of a
+/// task's exit code (a reaped pid is `ESRCH`, as on Linux for a child reaped
+/// with `waitpid`, and a zombie's code is not yet available).
+const PIDFD_INFO_PID: u64 = 1 << 0;
+const PIDFD_INFO_CREDS: u64 = 1 << 1;
+
+/// Linux's `struct pidfd_info` (72 bytes), the layout `PIDFD_GET_INFO`
+/// fills. `#[repr(C)]` so each field lands where userspace reads it.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PidfdInfo {
+    mask: u64,
+    cgroupid: u64,
+    pid: u32,
+    tgid: u32,
+    ppid: u32,
+    ruid: u32,
+    rgid: u32,
+    euid: u32,
+    egid: u32,
+    suid: u32,
+    sgid: u32,
+    fsuid: u32,
+    fsgid: u32,
+    exit_code: i32,
+    coredump_mask: u32,
+    spare1: u32,
+}
+
 /// Anonymous fd referring to a live or zombie process, or to one of its
 /// threads (pollable on exit).
 pub struct PidFd {
@@ -126,6 +176,49 @@ impl PidFd {
             }
         }
     }
+
+    /// `PIDFD_GET_INFO`: the pid/tgid/ppid the pidfd names and the target's
+    /// credentials, written into the `struct pidfd_info` at `arg`.
+    ///
+    /// Measured on Linux 6.18: the `mask` the caller passes in is ignored —
+    /// the kernel fills every field it can and sets the output `mask` to what
+    /// it provided — so nothing is read from the struct first and the whole of
+    /// it is written (a writable page is readable too, so an unreadable or
+    /// unwritable one is `EFAULT` either way). A pid that is gone — a
+    /// non-leader thread that has exited, a process that has been reaped — no
+    /// longer names a task, so the answer is `ESRCH`.
+    ///
+    /// The reply here sets `PIDFD_INFO_PID | PIDFD_INFO_CREDS` and leaves the
+    /// cgroup-id and exit-code fields zero, with their `mask` bits clear (see
+    /// [`PIDFD_INFO_PID`]). A zombie that has not been reaped is answered from
+    /// its process, which still exists: its pid and credentials, as on Linux.
+    fn get_info(&self, arg: usize) -> LxResult<usize> {
+        use crate::process::ProcessExt;
+        if self.gone() {
+            return Err(LxError::ESRCH);
+        }
+        let linux = self.process.try_linux().ok_or(LxError::ESRCH)?;
+        let c = linux.credentials();
+        let info = PidfdInfo {
+            mask: PIDFD_INFO_PID | PIDFD_INFO_CREDS,
+            pid: self.task_id() as u32,
+            tgid: self.process.id() as u32,
+            ppid: linux.parent().map_or(0, |p| p.id()) as u32,
+            ruid: c.ruid,
+            rgid: c.rgid,
+            euid: c.euid,
+            egid: c.egid,
+            suid: c.suid,
+            sgid: c.sgid,
+            fsuid: c.fsuid,
+            fsgid: c.fsgid,
+            ..PidfdInfo::default()
+        };
+        kernel_hal::user::UserOutPtr::<PidfdInfo>::from(arg)
+            .write(info)
+            .map_err(|_| LxError::EFAULT)?;
+        Ok(0)
+    }
 }
 
 #[async_trait]
@@ -213,6 +306,21 @@ impl FileLike for PidFd {
         }
         self.eventbus.lock().set(Event::READABLE);
         self.poll(events)
+    }
+
+    /// A pidfd answers exactly one ioctl, `PIDFD_GET_INFO`. Anything else —
+    /// another request, or `PIDFD_GET_INFO` with a struct of some other size,
+    /// which is a different number — is unknown to a pidfd and is `ENOTTY`, as
+    /// Linux answers it (`-ENOIOCTLCMD`, which the vfs turns into `-ENOTTY`).
+    ///
+    /// Matched on the low 32 bits (`request as u32`): the command is a 32-bit
+    /// value that a musl caller sign-extends to 64 bits, so the full `request`
+    /// would miss it (see [`PIDFD_GET_INFO`]).
+    fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {
+        match request as u32 {
+            PIDFD_GET_INFO => self.get_info(arg1),
+            _ => Err(LxError::ENOTTY),
+        }
     }
 }
 
