@@ -113,7 +113,10 @@ const PASADOS: &[(&str, usize)] = &[
     // Subido el 14-oct y otra vez el 16; lo que toca es partirlo, ver arriba.
     ("linux-object/src/process.rs", 6500),
     ("zircon-object/src/vm/vmar.rs", 5500),
-    ("tools/lunarbar/src/main.rs", 5250),
+    // 4750 desde el 28-oct-2026: sus dos `mod tests` salieron a
+    // `main_tests/` (730 líneas, ni una de producción) para que cupiera el
+    // menú de hunter, y quedó en 4576.
+    ("tools/lunarbar/src/main.rs", 4750),
     (
         "linux-object/src/fs/devfs/drm_scheme/kms_scanout_tests.rs",
         4750,
