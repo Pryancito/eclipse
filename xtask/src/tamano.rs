@@ -80,7 +80,11 @@ const PASADOS: &[(&str, usize)] = &[
     // `mod X;` a ficheros aparte desde hace tandas. **Lo que toca es partir el
     // fichero**, como dice el comentario de arriba, y no es la tanda que
     // hilvana un argumento.
-    ("drivers/src/display/nvidia.rs", 15000),
+    //
+    // 13500: BAJADO el 28-oct-2026 por la limpieza del codigo muerto (los
+    // pasos gpustep2-4 y 11-13, la rama quiet del arranque del GSP), que lo
+    // dejo en 13472.
+    ("drivers/src/display/nvidia.rs", 13500),
     (
         "drivers/src/display/nvidia/nouveau_bookkeeping_tests.rs",
         9500,
