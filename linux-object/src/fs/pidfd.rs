@@ -5,20 +5,25 @@ use crate::sync::{Event, EventBus};
 use alloc::sync::Arc;
 use lock::Mutex;
 use zircon_object::object::*;
-use zircon_object::task::{Process, Status};
+use zircon_object::task::{Process, Status, Thread, ThreadState};
 
-/// Linux `PIDFD_THREAD` (unsupported here — pid must name a process).
+/// Linux `PIDFD_THREAD`: a pidfd of one thread rather than of its process.
 ///
-/// The kernel spells it `O_EXCL`, so it is `1 << 7`, not 2. Both values end in
-/// EINVAL from `pidfd_open` today — 2 because it is not a flag we know, 128
-/// because it is one we refuse — so this is the number being right rather than
-/// a behaviour change; it stops being harmless the day thread pidfds work.
+/// The kernel spells it `O_EXCL`, so it is `1 << 7`, not 2. It stays in the
+/// descriptor's flags, where `F_GETFL` shows it and `pidfd_send_signal` reads
+/// it, as Linux keeps it in `f_flags`.
 pub const PIDFD_THREAD: u32 = OpenFlags::EXCLUSIVE.bits() as u32;
 
-/// Anonymous fd referring to a live or zombie process (pollable on exit).
+/// Anonymous fd referring to a live or zombie process, or to one of its
+/// threads (pollable on exit).
 pub struct PidFd {
     base: KObjectBase,
     process: Arc<Process>,
+    /// What a `PIDFD_THREAD` pidfd of a thread that is not its process's
+    /// leader follows instead of the process: that thread, gone once it has
+    /// exited, since nothing waits for it. A leader's is followed as its
+    /// process is (`delay_group_leader`), so it has none here.
+    thread: Option<Arc<Thread>>,
     open_flags: Mutex<OpenFlags>,
     eventbus: Arc<Mutex<EventBus>>,
 }
@@ -26,23 +31,41 @@ pub struct PidFd {
 impl_kobject!(PidFd);
 
 impl PidFd {
-    /// Create a pidfd for `process`. `open_flags` may include `O_NONBLOCK` / `O_CLOEXEC`.
+    /// Create a pidfd for `process`. `open_flags` may include `O_NONBLOCK` /
+    /// `O_CLOEXEC`, and `PIDFD_THREAD` for a pidfd of its leader.
     pub fn new(process: Arc<Process>, open_flags: OpenFlags) -> Arc<Self> {
-        let eventbus = EventBus::new();
-        if matches!(process.status(), Status::Exited(_)) {
-            eventbus.lock().set(Event::READABLE);
-        }
-        Arc::new(Self {
-            base: KObjectBase::new(),
-            process,
-            open_flags: Mutex::new(open_flags),
-            eventbus,
-        })
+        Self::of(process, None, open_flags)
     }
 
-    /// Resolve a pidfd from the caller's fd table.
+    /// A `PIDFD_THREAD` pidfd of `thread`, a thread of `process` that is not
+    /// its leader.
+    pub fn of_thread(
+        process: Arc<Process>,
+        thread: Arc<Thread>,
+        open_flags: OpenFlags,
+    ) -> Arc<Self> {
+        let thread = (thread.id() != process.id()).then_some(thread);
+        Self::of(process, thread, open_flags | OpenFlags::EXCLUSIVE)
+    }
+
+    fn of(process: Arc<Process>, thread: Option<Arc<Thread>>, open_flags: OpenFlags) -> Arc<Self> {
+        let this = Self {
+            base: KObjectBase::new(),
+            process,
+            thread,
+            open_flags: Mutex::new(open_flags),
+            eventbus: EventBus::new(),
+        };
+        if this.exited() {
+            this.eventbus.lock().set(Event::READABLE);
+        }
+        Arc::new(this)
+    }
+
+    /// Resolve a pidfd from the caller's fd table. Any other descriptor is
+    /// `EBADF`, as `pidfd_pid()` answers.
     pub fn from_file_like(file: Arc<dyn FileLike>) -> LxResult<Arc<Self>> {
-        file.downcast_arc::<Self>().map_err(|_| LxError::EINVAL)
+        file.downcast_arc::<Self>().map_err(|_| LxError::EBADF)
     }
 
     /// Target process.
@@ -50,8 +73,42 @@ impl PidFd {
         &self.process
     }
 
+    /// The thread a `PIDFD_THREAD` pidfd of a thread that is not the leader
+    /// follows.
+    pub fn thread(&self) -> Option<&Arc<Thread>> {
+        self.thread.as_ref()
+    }
+
+    /// Whether this is a `PIDFD_THREAD` pidfd, of the leader or of another
+    /// thread: what it says by itself is the thread's, not the process's.
+    pub fn is_thread(&self) -> bool {
+        self.flags().contains(OpenFlags::EXCLUSIVE)
+    }
+
+    /// The pid this pidfd names: its thread's, or its process's.
+    pub fn task_id(&self) -> KoID {
+        self.thread.as_ref().map_or(self.process.id(), |t| t.id())
+    }
+
+    /// Whether what it follows has exited: its thread, or its whole process.
     pub(crate) fn exited(&self) -> bool {
-        matches!(self.process.status(), Status::Exited(_))
+        match &self.thread {
+            Some(thread) => thread.state() == ThreadState::Dead,
+            None => matches!(self.process.status(), Status::Exited(_)),
+        }
+    }
+
+    /// Whether the pid it names is gone: a thread that is not a leader once
+    /// it has exited, a process once it is reaped. `pidfd_poll` says
+    /// `POLLHUP` from then on, and `fdinfo` says -1.
+    pub fn gone(&self) -> bool {
+        match &self.thread {
+            Some(_) => self.exited(),
+            None => {
+                use crate::process::ProcessExt;
+                self.process.try_linux().is_some_and(|l| l.is_reaped())
+            }
+        }
     }
 }
 
@@ -59,6 +116,13 @@ impl PidFd {
 impl FileLike for PidFd {
     fn flags(&self) -> OpenFlags {
         *self.open_flags.lock()
+    }
+
+    /// With `PIDFD_THREAD`, which is `O_EXCL` and stays in a pidfd's
+    /// `f_flags` (`pidfs_alloc_file`): Linux 6.18 says 0o202 to `F_GETFL`.
+    fn status_flags(&self) -> OpenFlags {
+        let flags = self.flags();
+        flags.status() | (flags & OpenFlags::EXCLUSIVE)
     }
 
     /// pidfs keeps the name pidfds had as anonymous inodes (`pidfs_dname`).
@@ -69,9 +133,11 @@ impl FileLike for PidFd {
     /// `pidfd_show_fdinfo`: the pid, a zombie's included, and -1 once a
     /// `wait` has reaped it and the pid names nothing.
     fn fdinfo(&self) -> String {
-        use crate::process::ProcessExt;
-        let reaped = self.process.try_linux().is_some_and(|l| l.is_reaped());
-        let pid = if reaped { -1 } else { self.process.id() as i64 };
+        let pid = if self.gone() {
+            -1
+        } else {
+            self.task_id() as i64
+        };
         alloc::format!("Pid:\t{pid}\nNSpid:\t{pid}\n")
     }
 
@@ -100,13 +166,15 @@ impl FileLike for PidFd {
         Err(LxError::EINVAL)
     }
 
+    /// `pidfd_poll`: readable once what it follows has exited, and hung up
+    /// too once its pid is gone, asked for or not.
     fn poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let exited = self.exited();
         Ok(PollStatus {
             read: exited && events.wants_read(),
             write: false,
             error: false,
-            hangup: false,
+            hangup: self.gone(),
         })
     }
 
@@ -117,8 +185,16 @@ impl FileLike for PidFd {
         if self.open_flags.lock().non_block() {
             return Ok(PollStatus::default());
         }
-        let proc_obj: Arc<dyn KernelObject> = self.process.clone();
-        proc_obj.wait_signal(Signal::PROCESS_TERMINATED).await;
+        match &self.thread {
+            Some(thread) => {
+                let thread: Arc<dyn KernelObject> = thread.clone();
+                thread.wait_signal(Signal::THREAD_TERMINATED).await;
+            }
+            None => {
+                let process: Arc<dyn KernelObject> = self.process.clone();
+                process.wait_signal(Signal::PROCESS_TERMINATED).await;
+            }
+        }
         self.eventbus.lock().set(Event::READABLE);
         self.poll(events)
     }

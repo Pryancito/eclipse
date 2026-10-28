@@ -1063,6 +1063,11 @@ pub fn anon_metadata(type_: FileType, inode: usize) -> rcore_fs::vfs::Metadata {
 pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     /// Returns open flags.
     fn flags(&self) -> OpenFlags;
+    /// The flags as `F_GETFL` and `fdinfo` say them: `f_flags`, without what
+    /// only mattered while opening ([`OpenFlags::status`]).
+    fn status_flags(&self) -> OpenFlags {
+        self.flags().status()
+    }
     /// `fstat(2)` metadata. The default describes an anonymous kernel object,
     /// which is what `fstat` reports for eventfd/epoll/timerfd/signalfd on
     /// Linux; descriptors with something better to say (a file's inode, a
