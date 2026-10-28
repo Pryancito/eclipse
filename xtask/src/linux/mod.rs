@@ -202,6 +202,7 @@ impl LinuxRootfs {
             // then repoints it at `eclipse-init` when its (best-effort) build is
             // available.
             Self::install_base_accounts(&dir);
+            Self::install_hunter(&dir);
             self.install_busybox_init(&dir);
             self.install_eclipse_init(&dir, &musl);
             // Incremental builds (`make image` -> make(false)) take this early
@@ -840,6 +841,7 @@ impl LinuxRootfs {
         // (+ inittab + rcS) first, then `install_eclipse_init` repoints
         // `/sbin/init` -> `eclipse-init` when its (best-effort) build succeeds.
         Self::install_base_accounts(&dir);
+        Self::install_hunter(&dir);
         self.install_busybox_init(&dir);
         self.install_eclipse_init(&dir, &musl);
         // LAST, for the same reason as on the incremental path above.
@@ -860,6 +862,30 @@ impl LinuxRootfs {
                     fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
                 }
             }
+        }
+    }
+
+    /// hunter's operator side: `/sbin/hunterctl` (refreshed on every build, so
+    /// it never lags the kernel's control language) and an example
+    /// `/etc/hunter/policy.conf`, written only when absent so an operator's
+    /// policy survives a rebuild. Every line of the example is commented out:
+    /// an image that boots with it behaves exactly as one without it.
+    fn install_hunter(rootfs: &Path) {
+        let sbin = rootfs.join("sbin");
+        fs::create_dir_all(&sbin).unwrap();
+        let dst = sbin.join("hunterctl");
+        let _ = dir::rm(&dst);
+        fs::copy(PROJECT_DIR.join("tools/hunterctl/hunterctl"), &dst).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let etc_hunter = rootfs.join("etc/hunter");
+        fs::create_dir_all(&etc_hunter).unwrap();
+        let conf = etc_hunter.join("policy.conf");
+        if !conf.exists() {
+            fs::copy(PROJECT_DIR.join("tools/hunterctl/policy.conf"), &conf).unwrap();
         }
     }
 
