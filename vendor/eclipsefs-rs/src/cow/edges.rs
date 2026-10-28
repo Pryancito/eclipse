@@ -1604,14 +1604,15 @@ impl BlockDevice for Dying {
     }
 }
 
-/// Three devices, mirrored, with a file on them; `at` armed on every device.
-fn dying_volume(at: u64) -> (Vec<Arc<Dying>>, CowFs) {
+/// Three devices with `data` for the data and mirrored metadata, with a
+/// file on them; `at` armed on every device.
+fn dying_volume(data: Profile, at: u64) -> (Vec<Arc<Dying>>, CowFs) {
     let raw: Vec<Arc<Ram>> = (0..3).map(|_| Ram::new(32 * MIB)).collect();
     let plain: Vec<Arc<dyn BlockDevice>> = raw
         .iter()
         .map(|d| d.clone() as Arc<dyn BlockDevice>)
         .collect();
-    mkfs::format_devices(&plain, &opts(), Profile::Raid1, Profile::Raid1).unwrap();
+    mkfs::format_devices(&plain, &opts(), data, Profile::Raid1).unwrap();
     let disks: Vec<Arc<Dying>> = raw.into_iter().map(Dying::new).collect();
     let devs: Vec<Arc<dyn BlockDevice>> = disks
         .iter()
@@ -1637,14 +1638,14 @@ fn dying_volume(at: u64) -> (Vec<Arc<Dying>>, CowFs) {
 fn a_failed_move_keeps_holding_the_stripes_it_moved_off() {
     const AWAY: u32 = 2;
     // What a whole removal costs, to know how far to sweep.
-    let (disks, mut fs) = dying_volume(u64::MAX);
+    let (disks, mut fs) = dying_volume(Profile::Raid1, u64::MAX);
     fs.remove_device(AWAY).unwrap();
     let cost = disks.iter().map(|d| d.used()).max().unwrap();
     assert!(cost > 4, "a removal that cheap measures nothing: {}", cost);
 
     let mut seen = 0;
     for at in 1..=cost {
-        let (_disks, mut fs) = dying_volume(at);
+        let (_disks, mut fs) = dying_volume(Profile::Raid1, at);
         let vol = fs.vol.clone().unwrap();
         // Every stripe on the device being taken away, with the length its
         // own chunk holds it by.
@@ -1679,4 +1680,94 @@ fn a_failed_move_keeps_holding_the_stripes_it_moved_off() {
         }
     }
     assert!(seen > 0, "no failure left anything held, so nothing was measured");
+}
+
+/// What is held is the stripe the chunk moved off, so the length it is held
+/// by is the length that stripe had, not the one the new layout uses. A
+/// mirrored move cannot tell those apart, because a mirror's stripe is the
+/// whole chunk either way; a move that changes the width of a chunk can.
+/// Striped over three devices, one taken away, and the same blocks come
+/// back in two stripes that are each longer than the three were.
+#[test]
+fn a_failed_move_holds_the_stripes_at_the_length_they_had() {
+    const AWAY: u32 = 2;
+    // A whole removal first: what it costs, and that it really does change
+    // the width, without which this test measures nothing.
+    let (disks, mut fs) = dying_volume(Profile::Raid0, u64::MAX);
+    let vol = fs.vol.clone().unwrap();
+    let shape = |v: &Volume| {
+        let map = v.map();
+        let c = map
+            .chunks
+            .values()
+            .find(|c| c.kind == ChunkKind::Data)
+            .expect("a data chunk");
+        (c.stripes.len(), c.stripe_len())
+    };
+    let before = shape(&vol);
+    fs.remove_device(AWAY).unwrap();
+    let after = shape(&vol);
+    assert_eq!(before.0, 3, "striped over the three devices");
+    assert_eq!(after.0, 2, "striped over the two that are left");
+    assert_ne!(
+        before.1, after.1,
+        "the stripes have to change length, or the two lengths are the same \
+         number and nothing is being measured"
+    );
+    let cost = disks.iter().map(|d| d.used()).max().unwrap();
+    assert!(cost > 4, "a removal that cheap measures nothing: {}", cost);
+
+    let mut seen = 0;
+    for at in 1..=cost {
+        let (_disks, mut fs) = dying_volume(Profile::Raid0, at);
+        let vol = fs.vol.clone().unwrap();
+        // Every stripe there is, at the length its own chunk has it, and
+        // separately the data chunk's, whose length is the one that moves.
+        let (want, striped) = {
+            let map = vol.map();
+            let want: Vec<(u32, u64, u64)> = map
+                .chunks
+                .values()
+                .flat_map(|c| {
+                    let len = c.stripe_len();
+                    c.stripes
+                        .iter()
+                        .map(move |s| (s.devid, s.phys, len))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let striped: Vec<(u32, u64)> = map
+                .chunks
+                .values()
+                .filter(|c| c.kind == ChunkKind::Data)
+                .flat_map(|c| {
+                    c.stripes
+                        .iter()
+                        .map(|s| (s.devid, s.phys))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            (want, striped)
+        };
+        let _ = fs.remove_device(AWAY);
+        let held = vol.held();
+        if !held.iter().any(|r| striped.contains(&(r.0, r.1))) {
+            continue;
+        }
+        seen += 1;
+        for r in &held {
+            assert!(
+                want.contains(r),
+                "at {}: held {:?} is not a stripe as it stood, which are {:?}",
+                at,
+                r,
+                want
+            );
+        }
+    }
+    assert!(
+        seen > 0,
+        "no failure left the data chunk's stripes held, so their length was \
+         never measured"
+    );
 }
