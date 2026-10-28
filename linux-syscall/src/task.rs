@@ -55,6 +55,11 @@ const P_PGID: i32 = 2;
 // returned EINVAL).
 const P_PIDFD: i32 = 3;
 
+/// A `CLONE_PIDFD` pidfd, a fork's or a thread's: what `pidfd_open(2)`
+/// gives, close-on-exec and open for reading and writing.
+const PIDFD_OPEN_FLAGS: linux_object::fs::OpenFlags =
+    linux_object::fs::OpenFlags::CLOEXEC.union(linux_object::fs::OpenFlags::RDWR);
+
 /// Empty `waitid(P_PIDFD)` after the pidfd's `O_NONBLOCK` forced a non-blocking
 /// wait: explicit `WNOHANG` stays success-with-no-child; otherwise `EAGAIN`
 /// (`kernel_waitid`).
@@ -865,9 +870,6 @@ impl Syscall<'_> {
             "clone: flags={:#x}, newsp={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x}",
             flags, newsp, parent_tid, child_tid, newtls
         );
-        if clone_flags.contains(CloneFlags::PIDFD) && clone_flags.contains(CloneFlags::THREAD) {
-            return Err(LxError::EINVAL);
-        }
         // Legacy clone reports the pidfd through the parent_tid slot, so the
         // two cannot both be asked for (`legacy_clone_args_valid`).
         if clone_flags.contains(CloneFlags::PIDFD)
@@ -989,25 +991,11 @@ impl Syscall<'_> {
             }
 
             if clone_flags.contains(CloneFlags::PIDFD) {
-                use linux_object::fs::OpenFlags;
-                let pidfd =
-                    linux_object::fs::PidFd::new(process, OpenFlags::CLOEXEC | OpenFlags::RDWR);
-                let fd = self.linux_process().add_file(pidfd)?;
-                // Taken back if the caller never gets the number. (Linux also
-                // unwinds the whole child here; this one is already forked, so
-                // the child survives a faulting `parent_tid` — a divergence
-                // left alone on purpose, since undoing a live process is not
-                // something to bolt onto an error path.)
-                hand_out_one(
-                    fd,
-                    |fd| {
-                        parent_tid.write(fd.into())?;
-                        Ok(())
-                    },
-                    |fd| {
-                        let _ = self.linux_process().close_file(fd);
-                    },
-                )?;
+                // (Linux also unwinds the whole child when `parent_tid`
+                // faults; this one is already forked, so the child survives
+                // -- a divergence left alone on purpose, since undoing a live
+                // process is not something to bolt onto an error path.)
+                self.hand_out_pidfd(PidFd::new(process, PIDFD_OPEN_FLAGS), parent_tid)?;
             }
             return Ok(pid);
         }
@@ -1110,8 +1098,41 @@ impl Syscall<'_> {
         if clone_flags.contains(CloneFlags::CHILD_CLEARTID) {
             new_thread.set_tid_address(child_tid);
         }
-        new_thread.start(self.thread_fn)?;
+        // `CLONE_PIDFD` with `CLONE_THREAD` (Linux 6.9): a `PIDFD_THREAD`
+        // pidfd of the new thread, where a fork's would go.
+        let pidfd = if clone_flags.contains(CloneFlags::PIDFD) {
+            let pidfd = PidFd::of_thread(
+                self.zircon_process().clone(),
+                new_thread.clone(),
+                PIDFD_OPEN_FLAGS,
+            );
+            Some(self.hand_out_pidfd(pidfd, parent_tid)?)
+        } else {
+            None
+        };
+        new_thread.start(self.thread_fn).inspect_err(|_| {
+            if let Some(fd) = pidfd {
+                let _ = self.linux_process().close_file(fd);
+            }
+        })?;
         Ok(tid as usize)
+    }
+
+    /// Install a `CLONE_PIDFD` pidfd and write its number to `slot`; taken
+    /// back if the caller never gets the number.
+    fn hand_out_pidfd(&self, pidfd: Arc<PidFd>, mut slot: UserOutPtr<i32>) -> LxResult<FileDesc> {
+        let fd = self.linux_process().add_file(pidfd)?;
+        hand_out_one(
+            fd,
+            |fd| {
+                slot.write(fd.into())?;
+                Ok(())
+            },
+            |fd| {
+                let _ = self.linux_process().close_file(fd);
+            },
+        )?;
+        Ok(fd)
     }
 
     /// `clone3` — the extensible successor of `clone`. glibc ≥ 2.34 tries it
@@ -1295,7 +1316,8 @@ impl Syscall<'_> {
             P_PIDFD => {
                 let pidfd = PidFd::from_file_like(self.linux_process().get_file_like(id.into())?)?;
                 let target = pidfd.target();
-                if !is_child_process(caller, target) {
+                // A thread that is not a leader is nobody's child.
+                if pidfd.thread().is_some() || !is_child_process(caller, target) {
                     return Err(LxError::ECHILD);
                 }
                 // `kernel_waitid`: `O_NONBLOCK` on the pidfd forces `WNOHANG`

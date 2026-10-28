@@ -194,6 +194,7 @@ hijo.
 | 12 | `INODE_REF` | `(ino, 12, ref_hash(dir, índice))` | `(dir, índice, tipo, nombre)` |
 | 24 | `XATTR_ITEM` | `(ino, 24, name_hash(nombre))` | lista de atributos |
 | 26 | `ENC_CONTEXT` | `(ino, 26, 0)` | contexto de cifrado, 40 bytes |
+| 48 | `ORPHAN_ITEM` | `(2^64 - 5, 48, ino)` | nada: inodo sin nombre aún abierto |
 | 84 | `DIR_ITEM` | `(dir, 84, name_hash(nombre))` | lista de entradas |
 | 96 | `DIR_INDEX` | `(dir, 96, índice)` | `(ino, 0, tipo, nombre)` |
 | 108 | `EXTENT_DATA` | `(ino, 108, byte del archivo)` | extent |
@@ -249,6 +250,14 @@ son el directorio y el índice). Nombres de 1 a 255 bytes, sin `/` ni NUL.
 Cada nombre existe tres veces: `DIR_ITEM` para buscar, `DIR_INDEX` para
 listar en orden de creación e `INODE_REF` en el inodo (un enlace duro más
 es un `INODE_REF` más).
+
+**Huérfanos**: cuando el último nombre de un archivo desaparece
+(`unlink`, o un `rename` encima) mientras alguien lo tiene abierto, el
+inodo se queda con 0 enlaces hasta el último cierre, como en Linux, y un
+`ORPHAN_ITEM` lo apunta. Al cerrarse se libera y el ítem se va; si el
+sistema cae antes, el siguiente montaje de lectura y escritura libera
+cada inodo que su `ORPHAN_ITEM` apunte. Un snapshot no se lleva los
+huérfanos de su origen.
 
 **Subvolúmenes en directorios**: la entrada que nombra un subvolumen
 apunta a un *handle*, `id << 40 | 256`, con tipo directorio. El árbol
