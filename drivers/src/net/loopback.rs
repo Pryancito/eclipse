@@ -167,11 +167,41 @@ impl<'a> phy::TxToken for LoopbackTxToken<'a> {
 /// net-RX wait that its bytes arrived: it waited out its fallback timer, 1 ms,
 /// on every hop. The drivers crate cannot reach the kernel's wakers directly,
 /// so the poller that drove this one ([`take_loopback_moved`]) does the wake.
+#[cfg(not(test))]
 static LOOPBACK_MOVED: AtomicBool = AtomicBool::new(false);
+
+/// Under test the flag is **per thread**.
+///
+/// It is read with a take: whoever reads it clears it. With one flag for the
+/// whole binary and a harness that runs the suite in parallel, the test next
+/// door takes the flag this test's own `poll` had just raised, and this test
+/// fails with `the staged frame was lost` -- one run in three, and never when
+/// the file is run on its own. Nothing in the suite needs to see another
+/// thread's wake, so there is nothing to share.
+///
+/// `cfg(not(test))` above is what the kernel links: there the flag has to be
+/// one for the whole system, because the poller that raises it and the waker
+/// that takes it are different threads on purpose.
+#[cfg(test)]
+std::thread_local! {
+    static LOOPBACK_MOVED: AtomicBool = const { AtomicBool::new(false) };
+}
 
 /// Whether a loopback `poll` delivered anything since the last call.
 pub fn take_loopback_moved() -> bool {
-    LOOPBACK_MOVED.load(Ordering::Relaxed) && LOOPBACK_MOVED.swap(false, Ordering::AcqRel)
+    with_moved(|flag| flag.load(Ordering::Relaxed) && flag.swap(false, Ordering::AcqRel))
+}
+
+#[cfg(not(test))]
+#[inline]
+fn with_moved<R>(body: impl FnOnce(&AtomicBool) -> R) -> R {
+    body(&LOOPBACK_MOVED)
+}
+
+#[cfg(test)]
+#[inline]
+fn with_moved<R>(body: impl FnOnce(&AtomicBool) -> R) -> R {
+    LOOPBACK_MOVED.with(body)
 }
 
 #[derive(Clone)]
@@ -235,7 +265,7 @@ impl NetScheme for LoopbackInterface {
         match iface.poll(&mut sockets, timestamp) {
             Ok(moved) => {
                 if moved {
-                    LOOPBACK_MOVED.store(true, Ordering::Release);
+                    with_moved(|flag| flag.store(true, Ordering::Release));
                 }
                 Ok(())
             }
@@ -1030,9 +1060,13 @@ mod tests {
         assert!(take_loopback_moved(), "the staged frame was lost");
     }
 
-    /// The same for the socket set. It is the process-wide `SOCKETS`, so this
-    /// holds a lock the whole binary shares; the suite runs
-    /// `--test-threads=1`, as CI does, and the lock is held across one call.
+    /// The same for the socket set.
+    ///
+    /// Under test the set is this thread's own (see
+    /// [`get_sockets`](crate::net::get_sockets)), so holding it locks nobody
+    /// else out. It used to be the process-wide one, and the comment here said
+    /// the suite runs `--test-threads=1` -- it does not, and this test and the
+    /// one above it failed one run in three because of it.
     #[test]
     fn a_poll_gives_up_quietly_while_the_socket_set_is_locked() {
         let iface = interface(stats());
