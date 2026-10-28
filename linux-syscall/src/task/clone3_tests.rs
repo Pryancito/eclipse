@@ -149,23 +149,31 @@ fn a_signal_number_that_does_not_exist_is_refused() {
 }
 
 #[test]
-fn the_pidfd_travels_in_the_parent_tid_slot_only_when_asked_for() {
+fn the_pidfd_and_the_parent_tid_each_keep_their_own_field() {
     let pidfd_flag = CloneFlags::PIDFD.bits() as u64;
-    let a = ok(args(pidfd_flag, 0xfd00, 0, 0xba5e, 0, 0, 0, 0));
-    assert_eq!(a.parent_slot, 0xfd00, "CLONE_PIDFD uses its own field");
-    let a = ok(args(0, 0xfd00, 0, 0xba5e, 0, 0, 0, 0));
-    assert_eq!(a.parent_slot, 0xba5e, "without it, parent_tid as usual");
+    for flags in [pidfd_flag, 0] {
+        let a = ok(args(flags, 0xfd00, 0, 0xba5e, 0, 0, 0, 0));
+        assert_eq!((a.pidfd, a.parent_tid), (0xfd00, 0xba5e), "{flags:#x}");
+    }
 }
 
 #[test]
-fn asking_for_a_pidfd_and_a_parent_tid_at_once_is_refused_not_guessed() {
-    // The legacy entry point has one slot for both, so one of the two
-    // would be written to the other's pointer.
-    let both = (CloneFlags::PIDFD.bits() | CloneFlags::PARENT_SETTID.bits()) as u64;
+fn a_pidfd_and_a_parent_tid_can_both_be_asked_for_but_not_at_one_word() {
+    // Linux 6.18 takes the two together from `clone3`, where each has a
+    // field, and refuses them at one address (`kernel_clone`), where one
+    // would land on the other.
+    let pidfd = CloneFlags::PIDFD.bits() as u64;
+    let settid = CloneFlags::PARENT_SETTID.bits() as u64;
+    let a = ok(args(pidfd | settid, 0x1000, 0, 0x2000, 0, 0, 0, 0));
+    assert_eq!((a.pidfd, a.parent_tid), (0x1000, 0x2000));
     assert_eq!(
-        clone3_to_clone(args(both, 0x1000, 0, 0x2000, 0, 0, 0, 0)),
+        clone3_to_clone(args(pidfd | settid, 0x1000, 0, 0x1000, 0, 0, 0, 0)),
         Err(LxError::EINVAL)
     );
+    // One word is only a clash when both are asked for.
+    for flags in [pidfd, settid, 0] {
+        assert!(clone3_to_clone(args(flags, 0x1000, 0, 0x1000, 0, 0, 0, 0)).is_ok());
+    }
 }
 
 #[test]
@@ -173,7 +181,7 @@ fn the_remaining_fields_are_passed_through_untouched() {
     let a = ok(args(0x0001_0000, 0, 0xc71d, 0xba5e, 0, 0, 0, 0x715));
     assert_eq!(a.child_tid, 0xc71d);
     assert_eq!(a.tls, 0x715);
-    assert_eq!(a.parent_slot, 0xba5e);
+    assert_eq!(a.parent_tid, 0xba5e);
 }
 
 #[test]

@@ -861,7 +861,29 @@ impl Syscall<'_> {
         &self,
         flags: usize,
         newsp: usize,
+        parent_tid: UserOutPtr<i32>,
+        newtls: usize,
+        child_tid: UserOutPtr<i32>,
+    ) -> SysResult {
+        // Legacy clone reports the pidfd through the parent_tid slot, so the
+        // two cannot both be asked for (`kernel_clone`: one word for both).
+        let clone_flags = clone_flags_from_word(flags)?;
+        if clone_flags.contains(CloneFlags::PIDFD | CloneFlags::PARENT_SETTID) {
+            return Err(LxError::EINVAL);
+        }
+        let pidfd_slot = UserOutPtr::from(parent_tid.as_addr());
+        self.clone_with(flags, newsp, parent_tid, pidfd_slot, newtls, child_tid)
+            .await
+    }
+
+    /// [`Self::sys_clone`] with the pidfd's word apart from `parent_tid`, as
+    /// `clone3` gives it.
+    async fn clone_with(
+        &self,
+        flags: usize,
+        newsp: usize,
         mut parent_tid: UserOutPtr<i32>,
+        pidfd_slot: UserOutPtr<i32>,
         newtls: usize,
         child_tid: UserOutPtr<i32>,
     ) -> SysResult {
@@ -870,13 +892,6 @@ impl Syscall<'_> {
             "clone: flags={:#x}, newsp={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x}",
             flags, newsp, parent_tid, child_tid, newtls
         );
-        // Legacy clone reports the pidfd through the parent_tid slot, so the
-        // two cannot both be asked for (`legacy_clone_args_valid`).
-        if clone_flags.contains(CloneFlags::PIDFD)
-            && clone_flags.contains(CloneFlags::PARENT_SETTID)
-        {
-            return Err(LxError::EINVAL);
-        }
         // This kernel has no namespaces. `from_bits_truncate` silently DROPPED
         // the CLONE_NEW* bits, so a caller asking for a new mount/user/pid
         // namespace got a plain fork and was told it succeeded -- a lie with
@@ -982,20 +997,20 @@ impl Syscall<'_> {
                 self.fork_impl(newsp, tls, ctid, child_of)?
             };
             let pid = process.id() as usize;
-            // In the parent, once the child exists (Linux writes it before the
-            // child runs, but from the same clone_process, i.e. in the same
-            // window -- a caller that races its own child on this word gets
-            // the same answer there).
-            if clone_flags.contains(CloneFlags::PARENT_SETTID) {
-                parent_tid.write_if_not_null(tid as i32)?;
-            }
-
             if clone_flags.contains(CloneFlags::PIDFD) {
-                // (Linux also unwinds the whole child when `parent_tid`
+                // (Linux also unwinds the whole child when the pidfd's word
                 // faults; this one is already forked, so the child survives
                 // -- a divergence left alone on purpose, since undoing a live
                 // process is not something to bolt onto an error path.)
-                self.hand_out_pidfd(PidFd::new(process, PIDFD_OPEN_FLAGS), parent_tid)?;
+                self.hand_out_pidfd(PidFd::new(process, PIDFD_OPEN_FLAGS), pidfd_slot)?;
+            }
+            // In the parent, once the child exists (Linux writes it before the
+            // child runs, but from the same clone_process, i.e. in the same
+            // window -- a caller that races its own child on this word gets
+            // the same answer there). A word it cannot write costs nothing:
+            // `kernel_clone` does not look at what its `put_user` answers.
+            if clone_flags.contains(CloneFlags::PARENT_SETTID) {
+                let _ = parent_tid.write_if_not_null(tid as i32);
             }
             return Ok(pid);
         }
@@ -1023,9 +1038,9 @@ impl Syscall<'_> {
         // when `threads.is_empty()` -- never releases the address space. The
         // process publishes its exit status, so `wait4` works and `ps` shows
         // nothing, and its whole VMAR stays alive for as long as the machine
-        // does. `clone(CLONE_THREAD | CLONE_VM | CLONE_SIGHAND |
-        // CLONE_PARENT_SETTID)` with `parent_tid` pointing at an unmapped page
-        // is that leak in one unprivileged line, and it loops.
+        // does. `clone3(CLONE_THREAD | CLONE_VM | CLONE_SIGHAND | CLONE_PIDFD)`
+        // with the pidfd's word on an unmapped page is that leak in one
+        // unprivileged line, and it loops.
         //
         // `terminate_abandoned` is the hook for exactly this: "this thread
         // will never run, take it out of the list". The fork path above
@@ -1038,6 +1053,7 @@ impl Syscall<'_> {
             newsp,
             newtls,
             parent_tid,
+            pidfd_slot,
             child_tid,
         ) {
             Ok(tid) => Ok(tid),
@@ -1062,6 +1078,7 @@ impl Syscall<'_> {
         newsp: usize,
         newtls: usize,
         mut parent_tid: UserOutPtr<i32>,
+        pidfd_slot: UserOutPtr<i32>,
         mut child_tid: UserOutPtr<i32>,
     ) -> LxResult<usize> {
         let mut new_ctx = self.thread.context_cloned()?;
@@ -1083,33 +1100,37 @@ impl Syscall<'_> {
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
 
         info!("clone: {} -> {}", self.thread.id(), tid);
-        // Honor the TID bookkeeping flags BEFORE the thread starts running:
-        // the child and the parent's pthread library may read these
-        // immediately. In particular, ctid must only be written here when
-        // CLONE_CHILD_SETTID is set — musl points ctid at its global
-        // __thread_list_lock (for the CLONE_CHILD_CLEARTID exit wake), and
-        // unconditionally storing the TID there corrupts that lock.
-        if clone_flags.contains(CloneFlags::PARENT_SETTID) {
-            parent_tid.write_if_not_null(tid as i32)?;
-        }
-        if clone_flags.contains(CloneFlags::CHILD_SETTID) {
-            child_tid.write_if_not_null(tid as i32)?;
-        }
-        if clone_flags.contains(CloneFlags::CHILD_CLEARTID) {
-            new_thread.set_tid_address(child_tid);
-        }
         // `CLONE_PIDFD` with `CLONE_THREAD` (Linux 6.9): a `PIDFD_THREAD`
-        // pidfd of the new thread, where a fork's would go.
+        // pidfd of the new thread, where a fork's would go. First, as in
+        // `copy_process`: a word it cannot be handed over in undoes the
+        // clone, and then nothing else has been written.
         let pidfd = if clone_flags.contains(CloneFlags::PIDFD) {
             let pidfd = PidFd::of_thread(
                 self.zircon_process().clone(),
                 new_thread.clone(),
                 PIDFD_OPEN_FLAGS,
             );
-            Some(self.hand_out_pidfd(pidfd, parent_tid)?)
+            Some(self.hand_out_pidfd(pidfd, pidfd_slot)?)
         } else {
             None
         };
+        // Honor the TID bookkeeping flags BEFORE the thread starts running:
+        // the child and the parent's pthread library may read these
+        // immediately. In particular, ctid must only be written here when
+        // CLONE_CHILD_SETTID is set — musl points ctid at its global
+        // __thread_list_lock (for the CLONE_CHILD_CLEARTID exit wake), and
+        // unconditionally storing the TID there corrupts that lock. A word
+        // that cannot be written costs the clone nothing, as on Linux:
+        // `kernel_clone` and `schedule_tail` drop what `put_user` answers.
+        if clone_flags.contains(CloneFlags::PARENT_SETTID) {
+            let _ = parent_tid.write_if_not_null(tid as i32);
+        }
+        if clone_flags.contains(CloneFlags::CHILD_SETTID) {
+            let _ = child_tid.write_if_not_null(tid as i32);
+        }
+        if clone_flags.contains(CloneFlags::CHILD_CLEARTID) {
+            new_thread.set_tid_address(child_tid);
+        }
         new_thread.start(self.thread_fn).inspect_err(|_| {
             if let Some(fd) = pidfd {
                 let _ = self.linux_process().close_file(fd);
@@ -1151,7 +1172,7 @@ impl Syscall<'_> {
     ///    computes the initial SP as `stack + stack_size` (legacy passes the
     ///    top directly);
     ///  * the pidfd (CLONE_PIDFD) has its own output pointer instead of
-    ///    sharing `parent_tid`.
+    ///    sharing `parent_tid`, so the two can both be asked for.
     ///
     /// Everything else is delegated to [`sys_clone`](Self::sys_clone).
     pub async fn sys_clone3(&self, uargs: UserInPtr<u64>, size: usize) -> SysResult {
@@ -1173,10 +1194,11 @@ impl Syscall<'_> {
             "clone3: flags={:#x} exit_signal={} stack={:#x} stack_size={:#x}",
             words[0], words[4], words[5], words[6]
         );
-        self.sys_clone(
+        self.clone_with(
             args.flags,
             args.newsp,
-            args.parent_slot.into(),
+            args.parent_tid.into(),
+            args.pidfd.into(),
             args.tls,
             args.child_tid.into(),
         )
@@ -3021,8 +3043,10 @@ pub(crate) struct Clone3Args {
     pub flags: usize,
     /// Initial stack pointer for the child (0 = share the caller's).
     pub newsp: usize,
-    /// What legacy `clone` calls `parent_tid`: the pidfd slot under `CLONE_PIDFD`.
-    pub parent_slot: usize,
+    /// `parent_tid`, for `CLONE_PARENT_SETTID`.
+    pub parent_tid: usize,
+    /// The pidfd's word, for `CLONE_PIDFD`.
+    pub pidfd: usize,
     /// New TLS base.
     pub tls: usize,
     /// `child_tid` pointer.
@@ -3138,21 +3162,16 @@ pub(crate) fn clone3_to_clone(words: [u64; 8]) -> LxResult<Clone3Args> {
     }
     let clone_flags = CloneFlags::from_bits_truncate(flags as usize);
     // Legacy clone reports the pidfd through the parent_tid slot; clone3
-    // gives it a dedicated field. PARENT_SETTID and PIDFD together can't
-    // be expressed through the legacy entry point — glibc never combines
-    // them, so reject rather than misdeliver one of the two.
-    let parent_slot = if clone_flags.contains(CloneFlags::PIDFD) {
-        if clone_flags.contains(CloneFlags::PARENT_SETTID) {
-            return Err(LxError::EINVAL);
-        }
-        pidfd
-    } else {
-        parent_tid
-    };
+    // gives it a field of its own, so both can be asked for -- only not at
+    // one word, where one would land on the other (`kernel_clone`).
+    if clone_flags.contains(CloneFlags::PIDFD | CloneFlags::PARENT_SETTID) && pidfd == parent_tid {
+        return Err(LxError::EINVAL);
+    }
     Ok(Clone3Args {
         flags: flags as usize | exit_signal as usize,
         newsp: newsp as usize,
-        parent_slot: parent_slot as usize,
+        parent_tid: parent_tid as usize,
+        pidfd: pidfd as usize,
         tls: tls as usize,
         child_tid: child_tid as usize,
     })
@@ -3179,6 +3198,9 @@ mod pdeathsig_tests;
 
 #[cfg(test)]
 mod clone3_tests;
+
+#[cfg(test)]
+mod clone_slots_tests;
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod clone_tls_tests;
