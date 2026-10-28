@@ -1,4 +1,4 @@
-//! LAN driver, only for Realtek currently.
+//! LAN drivers: Intel e1000/e1000e, Realtek, AMD PCnet and loopback.
 #![allow(unused)]
 
 use crate::sync::Mutex;
@@ -7,8 +7,13 @@ use smoltcp::socket::SocketSet;
 
 pub mod e1000;
 pub mod e1000e;
+pub mod ip_cfg;
 // pub mod ixgbe;
 pub mod loopback;
+/// AMD PCnet-PCI II / PCnet-FAST III. Driven through PCI I/O ports, which only
+/// x86 has, so the module is not built elsewhere.
+#[cfg(target_arch = "x86_64")]
+pub mod pcnet32;
 pub use isomorphic_drivers::provider::Provider;
 pub use loopback::{LoopbackDevice, LoopbackInterface};
 
