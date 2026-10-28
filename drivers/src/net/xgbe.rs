@@ -575,6 +575,208 @@ pub fn decode_hw_features(hfr0: u32, hfr1: u32, hfr2: u32) -> HwFeatures {
     f
 }
 
+// ——— The per-channel DMA register map ———
+//
+// The XGMAC's DMA engine is a bank of identical channels. Each one owns a
+// transmit ring and a receive ring, and each one has its own copy of the same
+// register set at a fixed stride inside BAR0. `MAC_HWF2R` above says how many
+// there are; this says where they live.
+//
+// Linux never adds these offsets to a base by hand: it works out
+// `channel->dma_regs` once per channel in `xgbe_alloc_channels`
+// (`xgbe-drv.c`) ---
+//
+//     channel->dma_regs = pdata->xgmac_regs + DMA_CH_BASE +
+//                         (DMA_CH_INC * i);
+//
+// --- and every later access goes through `XGMAC_DMA_IOREAD(channel, reg)`.
+// Same shape here, for the same reason: the channel index is then applied in
+// exactly one place, and a register offset can never accidentally be read
+// against the wrong channel's base.
+//
+// Still read-only in this batch. Nothing below is written to a device yet;
+// the probe continues to decline.
+
+/// `DMA_CH_BASE`: where channel 0's registers start inside BAR0.
+pub const DMA_CH_BASE: usize = 0x3100;
+/// `DMA_CH_INC`: the stride from one channel's register block to the next.
+///
+/// Note this is larger than the highest register below (`DMA_CH_SR` at
+/// `0x60`): there is a hole at the end of each channel's block. A loop that
+/// assumed the blocks were packed end to end would land one channel's
+/// registers on another's.
+pub const DMA_CH_INC: usize = 0x80;
+
+/// `DMA_CH_CR`: the channel's control register.
+pub const DMA_CH_CR: usize = 0x00;
+/// `DMA_CH_TCR`: transmit control.
+pub const DMA_CH_TCR: usize = 0x04;
+/// `DMA_CH_RCR`: receive control.
+pub const DMA_CH_RCR: usize = 0x08;
+/// `DMA_CH_TDLR_HI`: the high half of the transmit descriptor list address.
+pub const DMA_CH_TDLR_HI: usize = 0x10;
+/// `DMA_CH_TDLR_LO`: the low half.
+pub const DMA_CH_TDLR_LO: usize = 0x14;
+/// `DMA_CH_RDLR_HI`: the high half of the receive descriptor list address.
+pub const DMA_CH_RDLR_HI: usize = 0x18;
+/// `DMA_CH_RDLR_LO`: the low half.
+pub const DMA_CH_RDLR_LO: usize = 0x1c;
+/// `DMA_CH_TDTR_LO`: the transmit tail pointer. There is no `_HI`: the tail
+/// is written as a low word only, and the engine takes the high half from the
+/// list address.
+pub const DMA_CH_TDTR_LO: usize = 0x24;
+/// `DMA_CH_RDTR_LO`: the receive tail pointer, likewise.
+pub const DMA_CH_RDTR_LO: usize = 0x2c;
+/// `DMA_CH_TDRLR`: transmit ring length, as a last-index.
+pub const DMA_CH_TDRLR: usize = 0x30;
+/// `DMA_CH_RDRLR`: receive ring length, as a last-index.
+pub const DMA_CH_RDRLR: usize = 0x34;
+/// `DMA_CH_IER`: this channel's interrupt enables.
+pub const DMA_CH_IER: usize = 0x38;
+/// `DMA_CH_RIWT`: the receive interrupt watchdog timer, for coalescing.
+pub const DMA_CH_RIWT: usize = 0x3c;
+/// `DMA_CH_SR`: this channel's status, and where an interrupt is acked.
+pub const DMA_CH_SR: usize = 0x60;
+
+/// Where channel `index`'s register block sits, given the mapped base of
+/// BAR0. Linux's `xgbe_alloc_channels`.
+#[inline]
+pub const fn channel_regs(xgmac_base: usize, index: u32) -> usize {
+    xgmac_base + DMA_CH_BASE + DMA_CH_INC * index as usize
+}
+
+// The two register pairs that carry a 64-bit address are stored HIGH HALF
+// FIRST: `TDLR_HI` is at 0x10 and `TDLR_LO` at 0x14. That is the opposite of
+// what writing a `u64` as two consecutive words would produce, and getting it
+// wrong points the engine's descriptor fetch at an address with its halves
+// swapped --- which on a 32-bit-addressed ring means a fetch from zero, and
+// on a wider one a fetch from somewhere else entirely. Hence a named pair
+// instead of arithmetic at each call site.
+
+/// The two register offsets that together hold the transmit descriptor list
+/// address, in `(high, low)` order --- which is also their order in memory.
+pub const DMA_CH_TDLR: (usize, usize) = (DMA_CH_TDLR_HI, DMA_CH_TDLR_LO);
+/// The same for the receive descriptor list.
+pub const DMA_CH_RDLR: (usize, usize) = (DMA_CH_RDLR_HI, DMA_CH_RDLR_LO);
+
+/// Split a descriptor-ring address into the halves those two registers want.
+#[inline]
+pub const fn split_ring_addr(paddr: u64) -> (u32, u32) {
+    ((paddr >> 32) as u32, paddr as u32)
+}
+
+// ——— The descriptor ———
+//
+// Linux's `struct xgbe_ring_desc` (`xgbe.h`): four little-endian words, and
+// nothing else. The same four words mean different things depending on
+// direction, on whether the descriptor is a normal or a context one, and ---
+// for two fields --- on who wrote it last. That last part is the trap, and
+// the reason the accessors below are named for their direction rather than
+// for the word they read.
+
+/// A ring descriptor: `struct xgbe_ring_desc`, four 32-bit words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct Desc {
+    /// `desc0`
+    pub desc0: u32,
+    /// `desc1`
+    pub desc1: u32,
+    /// `desc2`
+    pub desc2: u32,
+    /// `desc3` --- the word that carries `OWN`, and the one both sides race
+    /// over.
+    pub desc3: u32,
+}
+
+/// `DESC3`'s `OWN` bit, at index 31 in both the transmit and the receive
+/// normal descriptor. Set means the engine owns the descriptor; cleared means
+/// the driver does.
+pub const DESC3_OWN: u32 = 1 << 31;
+/// `CTXT`, index 30 --- but only on a descriptor the *chip* wrote back. On a
+/// receive descriptor the *driver* is handing over, bit 30 is `INTE`
+/// (interrupt on completion). One bit, two meanings, chosen by who wrote it
+/// last; see [`rx_desc3_inte`].
+pub const DESC3_CTXT: u32 = 1 << 30;
+/// `FD`, index 29: this descriptor holds the first fragment of a frame.
+pub const DESC3_FD: u32 = 1 << 29;
+/// `LD`, index 28: ... and the last.
+pub const DESC3_LD: u32 = 1 << 28;
+
+/// Whether the DMA engine still owns this descriptor, so the driver must not
+/// touch it. `RX_NORMAL_DESC3_OWN` / `TX_NORMAL_DESC3_OWN`, index 31.
+#[inline]
+pub const fn desc_owned_by_dma(desc3: u32) -> bool {
+    desc3 & DESC3_OWN != 0
+}
+
+/// Whether a written-back descriptor is a context descriptor rather than a
+/// normal one. `RX_NORMAL_DESC3_CTXT`, index 30.
+#[inline]
+pub const fn desc_is_context(desc3: u32) -> bool {
+    desc3 & DESC3_CTXT != 0
+}
+
+/// `RX_NORMAL_DESC3_INTE`, index 30: the same bit as [`DESC3_CTXT`], as the
+/// driver sets it when handing a receive descriptor to the engine.
+///
+/// Two functions over one bit on purpose. The bit is only `INTE` on the way
+/// in and only `CTXT` on the way back, so a single accessor would read
+/// "interrupt wanted" off a descriptor the chip filled in, which is
+/// meaningless, or test for a context descriptor on one the driver is still
+/// building, which is always false.
+#[inline]
+pub const fn rx_desc3_inte(desc3: u32) -> bool {
+    desc3 & DESC3_CTXT != 0
+}
+
+/// The received frame's length in bytes. `RX_NORMAL_DESC3_PL`, index 0,
+/// width 14.
+#[inline]
+pub const fn rx_packet_len(desc3: u32) -> u32 {
+    get_bits(desc3, 0, 14)
+}
+
+/// Whether the engine flagged an error on the frame.
+/// `RX_NORMAL_DESC3_ES`, index 15, width 1.
+#[inline]
+pub const fn rx_error_summary(desc3: u32) -> bool {
+    get_bits(desc3, 15, 1) != 0
+}
+
+/// The header length a split-header receive put in `desc2`.
+/// `RX_NORMAL_DESC2_HL`, index 0, width 10. Note this is TEN bits, not the
+/// fourteen that the transmit side's length field in the same word uses.
+#[inline]
+pub const fn rx_header_len(desc2: u32) -> u32 {
+    get_bits(desc2, 0, 10)
+}
+
+/// The buffer length the driver puts in a transmit descriptor's `desc2`.
+/// `TX_NORMAL_DESC2_HL_B1L`, index 0, width 14.
+#[inline]
+pub const fn tx_desc2_buffer_len(len: u32) -> u32 {
+    len & ((1 << 14) - 1)
+}
+
+/// The total frame length the driver puts in the first transmit descriptor.
+/// `TX_NORMAL_DESC3_FL`, index 0, width 15.
+///
+/// Fifteen bits, and they overlap `TCPPL` (index 0, width **18**), which is
+/// what the same bits mean when `TSE` (index 18) is set for segmentation
+/// offload. So this field cannot be written without knowing whether the
+/// descriptor is a TSO one: with `TSE` set, bit 18 is the bottom of the
+/// payload length, and a frame length masked to fifteen bits would be read as
+/// part of it.
+#[inline]
+pub const fn tx_desc3_frame_len(len: u32) -> u32 {
+    len & ((1 << 15) - 1)
+}
+
+/// `TX_NORMAL_DESC3_TSE`, index 18: the bit that re-reads the bottom of
+/// `desc3` as a TCP payload length.
+pub const TX_DESC3_TSE: u32 = 1 << 18;
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
@@ -1488,5 +1690,173 @@ mod tests {
         // use: a V2a's ceiling is larger than this, a V2b's is smaller.
         assert!(f.tx_fifo_size <= Variant::V2a.max_fifo_size());
         assert!(f.tx_fifo_size > Variant::V2b.max_fifo_size());
+    }
+
+    // ——— The per-channel DMA register map ———
+
+    #[test]
+    fn the_channel_block_is_where_xgbe_common_h_says() {
+        assert_eq!(DMA_CH_BASE, 0x3100);
+        assert_eq!(DMA_CH_INC, 0x80);
+        // Inside BAR0 and well below the port property block, like the MAC
+        // registers.
+        assert!(DMA_CH_BASE < MAC_PROP_OFFSET);
+    }
+
+    #[test]
+    fn every_per_channel_register_is_at_its_linux_offset() {
+        for (name, off, want) in [
+            ("DMA_CH_CR", DMA_CH_CR, 0x00),
+            ("DMA_CH_TCR", DMA_CH_TCR, 0x04),
+            ("DMA_CH_RCR", DMA_CH_RCR, 0x08),
+            ("DMA_CH_TDLR_HI", DMA_CH_TDLR_HI, 0x10),
+            ("DMA_CH_TDLR_LO", DMA_CH_TDLR_LO, 0x14),
+            ("DMA_CH_RDLR_HI", DMA_CH_RDLR_HI, 0x18),
+            ("DMA_CH_RDLR_LO", DMA_CH_RDLR_LO, 0x1c),
+            ("DMA_CH_TDTR_LO", DMA_CH_TDTR_LO, 0x24),
+            ("DMA_CH_RDTR_LO", DMA_CH_RDTR_LO, 0x2c),
+            ("DMA_CH_TDRLR", DMA_CH_TDRLR, 0x30),
+            ("DMA_CH_RDRLR", DMA_CH_RDRLR, 0x34),
+            ("DMA_CH_IER", DMA_CH_IER, 0x38),
+            ("DMA_CH_RIWT", DMA_CH_RIWT, 0x3c),
+            ("DMA_CH_SR", DMA_CH_SR, 0x60),
+        ] {
+            assert_eq!(off, want, "{} moved", name);
+        }
+    }
+
+    #[test]
+    fn the_channel_stride_leaves_a_hole_at_the_end_of_each_block() {
+        // The highest register in a channel's block is DMA_CH_SR at 0x60, but
+        // the stride is 0x80. Packing the blocks end to end --- the obvious
+        // mistake --- would put channel 1's registers inside channel 0's
+        // reach and read the wrong engine's status.
+        assert!(DMA_CH_SR < DMA_CH_INC);
+        assert_ne!(DMA_CH_SR + 4, DMA_CH_INC);
+    }
+
+    #[test]
+    fn a_channels_block_is_its_index_times_the_stride() {
+        // `channel->dma_regs = xgmac_regs + DMA_CH_BASE + DMA_CH_INC * i`.
+        let base = 0xffff_8000_0000_0000usize;
+        assert_eq!(channel_regs(base, 0), base + 0x3100);
+        assert_eq!(channel_regs(base, 1), base + 0x3180);
+        assert_eq!(channel_regs(base, 7), base + 0x3100 + 7 * 0x80);
+        // And the blocks do not overlap, for the largest geometry HWF2R can
+        // report (sixteen channels).
+        for i in 0..16u32 {
+            assert_eq!(
+                channel_regs(base, i + 1) - channel_regs(base, i),
+                DMA_CH_INC
+            );
+        }
+    }
+
+    #[test]
+    fn the_list_address_registers_hold_the_high_half_first() {
+        // This is the one that bites: TDLR_HI is at the LOWER address. A
+        // `u64` written as two consecutive words would land the halves
+        // swapped and point the descriptor fetch somewhere else.
+        assert_eq!(DMA_CH_TDLR, (0x10, 0x14));
+        assert_eq!(DMA_CH_RDLR, (0x18, 0x1c));
+        assert!(DMA_CH_TDLR.0 < DMA_CH_TDLR.1);
+        assert!(DMA_CH_RDLR.0 < DMA_CH_RDLR.1);
+    }
+
+    #[test]
+    fn splitting_a_ring_address_puts_the_halves_in_register_order() {
+        assert_eq!(split_ring_addr(0x0000_0001_dead_b000), (1, 0xdead_b000));
+        assert_eq!(split_ring_addr(0x8000_0000), (0, 0x8000_0000));
+        // A 32-bit-addressed ring has nothing in the high word, which is the
+        // case where a swap would write the ring address into _HI and zero
+        // into _LO --- a fetch from near zero, with no error reported.
+        let (hi, lo) = split_ring_addr(0x1000_0000);
+        assert_eq!(hi, 0);
+        assert_eq!(lo, 0x1000_0000);
+    }
+
+    #[test]
+    fn the_tail_pointers_have_no_high_half() {
+        // Linux defines only `_LO` for both tail registers, and the gaps at
+        // 0x20 and 0x28 where a `_HI` would sit stay undefined. So a tail
+        // write is one word, not two.
+        assert_eq!(DMA_CH_TDTR_LO, 0x24);
+        assert_eq!(DMA_CH_RDTR_LO, 0x2c);
+        assert_eq!(DMA_CH_TDTR_LO - DMA_CH_TDLR_LO, 0x10);
+    }
+
+    // ——— The descriptor ———
+
+    #[test]
+    fn a_descriptor_is_four_words_and_sixteen_bytes() {
+        // `struct xgbe_ring_desc`: four `__le32`, nothing else. The engine
+        // indexes the ring by this size, so a padded or reordered struct
+        // would desynchronise driver and chip after the first entry.
+        assert_eq!(core::mem::size_of::<Desc>(), 16);
+        assert_eq!(core::mem::align_of::<Desc>(), 4);
+    }
+
+    #[test]
+    fn the_desc3_flags_are_at_their_linux_indices() {
+        // OWN 31, CTXT 30, FD 29, LD 28, in both directions.
+        assert_eq!(DESC3_OWN, 1 << 31);
+        assert_eq!(DESC3_CTXT, 1 << 30);
+        assert_eq!(DESC3_FD, 1 << 29);
+        assert_eq!(DESC3_LD, 1 << 28);
+        assert!(desc_owned_by_dma(DESC3_OWN));
+        assert!(!desc_owned_by_dma(0));
+        assert!(!desc_owned_by_dma(DESC3_CTXT | DESC3_FD | DESC3_LD));
+        assert!(desc_is_context(DESC3_CTXT));
+        assert!(!desc_is_context(DESC3_OWN));
+    }
+
+    #[test]
+    fn bit_thirty_is_inte_going_out_and_ctxt_coming_back() {
+        // One bit, two meanings, chosen by who wrote the descriptor last:
+        // RX_NORMAL_DESC3_INTE_INDEX and RX_NORMAL_DESC3_CTXT_INDEX are both
+        // 30. The two accessors read the same bit; the point is that the
+        // caller has to say which direction it is asking about.
+        let d = DESC3_CTXT;
+        assert!(rx_desc3_inte(d));
+        assert!(desc_is_context(d));
+        assert!(!rx_desc3_inte(0));
+    }
+
+    #[test]
+    fn the_received_length_and_error_come_out_of_desc3() {
+        // RX_NORMAL_DESC3_PL index 0 width 14, ES index 15 width 1.
+        let d = DESC3_OWN | DESC3_FD | DESC3_LD | 1514;
+        assert_eq!(rx_packet_len(d), 1514);
+        assert!(!rx_error_summary(d));
+        assert!(rx_error_summary(d | (1 << 15)));
+        // Fourteen bits, so the field tops out at 16383 and the bit above it
+        // is the error summary --- a length read fifteen bits wide would
+        // report an errored 1514-byte frame as a 34282-byte one.
+        assert_eq!(rx_packet_len(0x3fff), 0x3fff);
+        assert_eq!(rx_packet_len(1514 | (1 << 15)), 1514);
+    }
+
+    #[test]
+    fn the_split_header_length_is_narrower_than_the_transmit_length() {
+        // RX_NORMAL_DESC2_HL is 10 bits; TX_NORMAL_DESC2_HL_B1L in the same
+        // word on the other side is 14. Same word, same index, different
+        // width.
+        assert_eq!(rx_header_len(0x3ff), 0x3ff);
+        assert_eq!(rx_header_len(0xffff_ffff), 0x3ff);
+        assert_eq!(tx_desc2_buffer_len(0x3fff), 0x3fff);
+        assert_eq!(tx_desc2_buffer_len(1514), 1514);
+    }
+
+    #[test]
+    fn the_transmit_frame_length_shares_its_bits_with_the_tso_payload() {
+        // TX_NORMAL_DESC3_FL is index 0 width 15; TCPPL is index 0 width 18;
+        // TSE is index 18. So bit 18 is simultaneously "this is a TSO
+        // descriptor" and the bottom of the payload length it selects.
+        assert_eq!(tx_desc3_frame_len(1514), 1514);
+        assert_eq!(tx_desc3_frame_len(0x7fff), 0x7fff);
+        assert_eq!(TX_DESC3_TSE, 1 << 18);
+        // The frame length can never set TSE by itself, which is what makes
+        // the non-TSO path safe.
+        assert_eq!(tx_desc3_frame_len(0xffff_ffff) & TX_DESC3_TSE, 0);
     }
 }
