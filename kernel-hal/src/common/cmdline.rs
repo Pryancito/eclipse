@@ -201,6 +201,38 @@ pub fn pci_bdf(cmdline: &str, key: &str) -> Option<(u8, u8, u8)> {
     None
 }
 
+/// The physical address of a device tree blob to probe, from `dtb=0x…`.
+///
+/// This is a hatch, and it exists because of what the aarch64 boot does not
+/// have. `rayboot`, the UEFI loader, is a precompiled binary whose
+/// `Aarch64BootInfo` carries a command line, a firmware type, a UART base, a
+/// GIC base and an offset --- and **no device tree pointer**. The firmware of
+/// a Raspberry Pi does load a blob into memory and the `virt` machine of QEMU
+/// puts one at the bottom of RAM, but nothing passes either address on, so the
+/// only way in is for whoever knows where it was left to say so.
+///
+/// Three things are refused rather than taken:
+///
+/// - **zero**, which is what an address nobody filled in reads as;
+/// - an address **not aligned to 8**, because the spec requires the blob to be
+///   8-byte aligned and the reservation block in it is read as pairs of `u64`;
+/// - anything `parse_number` does not read as a whole number --- see the long
+///   note on it about what a truncating parser does to a knob.
+///
+/// A number that passes is still only a number. Nothing here says it is
+/// mapped, let alone that a blob is there: that is
+/// `zcore_drivers::utils::devicetree::check_fdt_header`'s job, and it is why
+/// that check exists.
+pub fn dtb_paddr(cmdline: &str) -> Option<usize> {
+    let spelled = value(cmdline, "dtb")?;
+    let paddr = core::convert::TryFrom::try_from(parse_number(spelled)?).ok()?;
+    let paddr: usize = paddr;
+    if paddr == 0 || !paddr.is_multiple_of(8) {
+        return None;
+    }
+    Some(paddr)
+}
+
 /// The user-facing `nvidia.*` boot parameters, read in one place.
 ///
 /// On Linux these would be the parameters of the `nvidia`/`nouveau` modules
@@ -615,6 +647,58 @@ mod tests {
         assert_eq!(parse_number("3"), Some(3));
         assert_eq!(parse_number("20000000"), Some(20_000_000));
         assert_eq!(parse_number("18446744073709551615"), Some(u64::MAX));
+    }
+
+    #[test]
+    fn dtb_reads_the_address_a_blob_was_left_at() {
+        // The bottom of RAM on the `virt` machine, and where the firmware of
+        // a Pi 4 puts it.
+        // The options of this command line are separated by `:`, not by
+        // spaces --- see the note on `pairs`.
+        assert_eq!(dtb_paddr("LOG=info:dtb=0x40000000"), Some(0x4000_0000));
+        assert_eq!(dtb_paddr("dtb=0x2eff7800"), Some(0x2eff_7800));
+        // Decimal too, because `parse_number` takes both and a knob written
+        // by hand is written either way.
+        assert_eq!(dtb_paddr("dtb=1073741824"), Some(0x4000_0000));
+        // Order and neighbours do not matter: it is a key lookup, not a
+        // `contains`.
+        assert_eq!(dtb_paddr("dtb=0x40000008:smp=off"), Some(0x4000_0008));
+        assert_eq!(dtb_paddr("nodtb=0x40000000"), None);
+        // And a value with a space in it is one value, not two options, so a
+        // command line written the wrong way reads as nothing rather than as
+        // an address somebody did not mean.
+        assert_eq!(dtb_paddr("dtb=0x40000000 smp=off"), None);
+    }
+
+    #[test]
+    fn dtb_refuses_an_address_nobody_filled_in() {
+        // Zero is what an unset field reads as, and the one value that is
+        // certainly not a blob. Taking it would hand `check_fdt_header` a
+        // null pointer to read 40 bytes from.
+        assert_eq!(dtb_paddr("dtb=0"), None);
+        assert_eq!(dtb_paddr("dtb=0x0"), None);
+        // And an absent or empty value is not an address either.
+        assert_eq!(dtb_paddr("LOG=info"), None);
+        assert_eq!(dtb_paddr("dtb"), None);
+        assert_eq!(dtb_paddr("dtb="), None);
+    }
+
+    #[test]
+    fn dtb_refuses_an_address_a_blob_cannot_sit_at() {
+        // The spec requires the blob to be 8-byte aligned, and the
+        // reservation block inside it is read as pairs of `u64`.
+        assert_eq!(dtb_paddr("dtb=0x40000004"), None);
+        assert_eq!(dtb_paddr("dtb=0x40000001"), None);
+        assert_eq!(dtb_paddr("dtb=0x40000008"), Some(0x4000_0008));
+    }
+
+    #[test]
+    fn dtb_refuses_what_is_not_a_number_rather_than_truncating_it() {
+        // `0x40000000bananas` read as `0x40000000` would be an address the
+        // user never wrote, and one that happens to look right.
+        assert_eq!(dtb_paddr("dtb=0x40000000bananas"), None);
+        assert_eq!(dtb_paddr("dtb=bottom-of-ram"), None);
+        assert_eq!(dtb_paddr("dtb=0x"), None);
     }
 
     #[test]

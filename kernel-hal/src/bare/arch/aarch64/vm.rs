@@ -137,6 +137,10 @@ fn init_kernel_page_table() -> PagingResult<PageTable> {
     Ok(pt)
 }
 
+pub(super) fn kernel_page_table() -> &'static Mutex<PageTable> {
+    &KERNEL_PT
+}
+
 pub fn init() {
     let mut pt = KERNEL_PT.lock();
     info!("initialized kernel page table @ {:#x}", pt.table_phys());
