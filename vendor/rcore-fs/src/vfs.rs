@@ -714,6 +714,36 @@ pub fn make_rdev(major: usize, minor: usize) -> usize {
     ((major & 0xfff) << 8) | (minor & 0xff)
 }
 
+/// `st_dev` of `/dev`, which its device nodes already report.
+pub const DEVFS_DEV: usize = 1;
+/// `st_dev` of `/sys`.
+pub const SYSFS_DEV: usize = 2;
+
+/// `get_anon_bdev()`: the device number of a filesystem with no disk under
+/// it, major 0 and a minor no other filesystem has, packed as glibc's
+/// `makedev` packs it.
+///
+/// On Linux every superblock has one (`s_dev`) and every file on it reports
+/// it as `st_dev`, so a filesystem is a device of its own and
+/// (`st_dev`, `st_ino`) names one file. Every filesystem here said 0, so `/`,
+/// `/dev`, `/dev/shm` and `/proc` were one device to `find`, `du -x`,
+/// `mountpoint` and `df`, and two files of two filesystems with one inode
+/// number were one file to every lookup keyed by the pair. `/dev` and `/sys`
+/// keep the numbers they already had; the rest come after them. Linux gives a
+/// minor back when its filesystem goes away, which nothing here does often
+/// enough to need.
+pub fn anon_dev() -> usize {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(SYSFS_DEV + 1);
+    anon_minor(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Major 0 and `minor`, as `makedev` packs them: the low eight bits of the
+/// minor at the bottom and the rest above the major's twelve.
+fn anon_minor(minor: usize) -> usize {
+    (minor & 0xff) | ((minor & !0xff) << 12)
+}
+
 #[cfg(test)]
 mod lookup_tests {
     use super::*;
@@ -2012,5 +2042,36 @@ mod tests {
     fn a_device_error_becomes_a_file_system_error() {
         let e: FsError = DevError.into();
         assert_eq!(e, FsError::DeviceError);
+    }
+
+    /// glibc's `major()` and `minor()`, written out.
+    fn split(dev: usize) -> (usize, usize) {
+        let dev = dev as u64;
+        let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+        let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+        (major as usize, minor as usize)
+    }
+
+    #[test]
+    fn every_anonymous_device_is_major_0_and_a_minor_of_its_own() {
+        let devs: Vec<usize> = (0..300).map(|_| anon_dev()).collect();
+        let mut minors = alloc::collections::BTreeSet::new();
+        for &dev in &devs {
+            let (major, minor) = split(dev);
+            assert_eq!(major, 0, "{:#x}", dev);
+            assert!(minor > SYSFS_DEV, "{:#x} is minor {}", dev, minor);
+            assert!(minors.insert(minor), "minor {} twice", minor);
+        }
+        assert!(!devs.contains(&DEVFS_DEV) && !devs.contains(&SYSFS_DEV));
+    }
+
+    #[test]
+    fn a_minor_past_255_does_not_reach_the_major() {
+        assert_eq!(split(anon_minor(0xff)), (0, 0xff));
+        assert_eq!(split(anon_minor(0x100)), (0, 0x100));
+        assert_eq!(split(anon_minor(0xf_ffff)), (0, 0xf_ffff));
+        // The two fixed ones are small enough to be their own packing.
+        assert_eq!(anon_minor(DEVFS_DEV), DEVFS_DEV);
+        assert_eq!(anon_minor(SYSFS_DEV), SYSFS_DEV);
     }
 }

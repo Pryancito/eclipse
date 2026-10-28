@@ -60,7 +60,7 @@ impl INode for ProcSelfFdDir {
     /// [`fd_permission`] lets the process itself in whoever that is.
     fn metadata(&self) -> Result<Metadata> {
         let metadata = Metadata {
-            dev: 0,
+            dev: super::procfs::dev(),
             inode: super::procfs::pid_inode(self.process.id(), super::procfs::PID_FD_DIR_SLOT),
             size: self.process.try_linux().map_or(0, |lp| lp.file_count()),
             blk_size: super::procfs::BLOCK_SIZE,

@@ -62,6 +62,7 @@ impl INode for ProcFdInfoDir {
     }
     fn metadata(&self) -> Result<Metadata> {
         let metadata = Metadata {
+            dev: crate::fs::procfs::dev(),
             inode: crate::fs::procfs::pid_inode(
                 self.process.id(),
                 crate::fs::procfs::PID_FDINFO_DIR_SLOT,
@@ -180,6 +181,7 @@ impl INode for FdInfo {
     /// Never looks at the descriptor: the listing calls this.
     fn metadata(&self) -> Result<Metadata> {
         let metadata = Metadata {
+            dev: crate::fs::procfs::dev(),
             inode: fdinfo_inode(self.process.id(), self.fd),
             size: 0,
             blk_size: crate::fs::procfs::BLOCK_SIZE,

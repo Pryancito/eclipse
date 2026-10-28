@@ -9,20 +9,28 @@ use rcore_fs::vfs::*;
 pub struct Pseudo {
     content: Vec<u8>,
     type_: FileType,
+    dev: usize,
 }
 
 impl Pseudo {
     /// create a Pseudo INode
     pub fn new(s: &str, type_: FileType) -> Self {
-        Pseudo {
-            content: Vec::from(s.as_bytes()),
-            type_,
-        }
+        Self::new_bytes(Vec::from(s.as_bytes()), type_)
     }
 
     /// create a Pseudo INode with binary content
     pub fn new_bytes(content: Vec<u8>, type_: FileType) -> Self {
-        Pseudo { content, type_ }
+        Pseudo {
+            content,
+            type_,
+            dev: 0,
+        }
+    }
+
+    /// This node, reporting `dev` as the device it is on: the one of the
+    /// filesystem it was put in.
+    pub fn on(self, dev: usize) -> Self {
+        Pseudo { dev, ..self }
     }
 }
 
@@ -48,7 +56,7 @@ impl INode for Pseudo {
     }
     fn metadata(&self) -> Result<Metadata> {
         Ok(Metadata {
-            dev: 0,
+            dev: self.dev,
             inode: 0,
             size: self.content.len(),
             blk_size: 0,

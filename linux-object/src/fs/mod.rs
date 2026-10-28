@@ -1018,10 +1018,26 @@ pub fn poll_events_to_bus_mask(events: PollEvents) -> crate::sync::Event {
 /// a small gap -- musl implements `fstat` as `fstatat(fd, "", AT_EMPTY_PATH)`,
 /// so it makes `fstat` fail on any socket, and Firefox stats the descriptors it
 /// receives over its IPC channels before using them.
+///
+/// Its `st_dev` is that of the filesystem Linux keeps the object on: pipefs
+/// for a pipe, sockfs for a socket, anon_inodefs for the rest. It was 0, the
+/// device `/` was on.
 pub fn anon_metadata(type_: FileType, inode: usize) -> rcore_fs::vfs::Metadata {
     use rcore_fs::vfs::Timespec;
+    lazy_static! {
+        static ref PIPEFS_SOCKFS_ANON_INODEFS: [usize; 3] = [
+            rcore_fs::vfs::anon_dev(),
+            rcore_fs::vfs::anon_dev(),
+            rcore_fs::vfs::anon_dev(),
+        ];
+    }
+    let [pipefs, sockfs, anon_inodefs] = *PIPEFS_SOCKFS_ANON_INODEFS;
     rcore_fs::vfs::Metadata {
-        dev: 0,
+        dev: match type_ {
+            FileType::NamedPipe => pipefs,
+            FileType::Socket => sockfs,
+            _ => anon_inodefs,
+        },
         inode,
         size: 0,
         blk_size: 0,
@@ -1418,7 +1434,10 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         ("stdout", "/proc/self/fd/1"),
         ("stderr", "/proc/self/fd/2"),
     ] {
-        if let Err(e) = devfs_root.add(name, Arc::new(Pseudo::new(to, FileType::SymLink))) {
+        if let Err(e) = devfs_root.add(
+            name,
+            Arc::new(Pseudo::new(to, FileType::SymLink).on(rcore_fs::vfs::DEVFS_DEV)),
+        ) {
             warn!("failed to link /dev/{}: {:?}", name, e);
         }
     }

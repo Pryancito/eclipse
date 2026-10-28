@@ -152,6 +152,22 @@ fn moving_directory_into_descendant_keeps_tree_reachable() -> Result<()> {
     Ok(())
 }
 
+/// Each SFS is a device of its own, and everything in it is on it: `/` was
+/// device 0, as `/proc` and `/dev` were.
+#[test]
+fn an_sfs_is_a_device_of_its_own() -> Result<()> {
+    let (one, two) = (_create_new_sfs(), _create_new_sfs());
+    let root = one.root_inode();
+    let dev = root.metadata()?.dev;
+    assert_ne!(dev, 0);
+    assert_ne!(dev, two.root_inode().metadata()?.dev);
+    let dir = root.create("d", FileType::Dir, 0o755)?;
+    let file = dir.create("f", FileType::File, 0o644)?;
+    assert_eq!(dir.metadata()?.dev, dev);
+    assert_eq!(file.metadata()?.dev, dev);
+    Ok(())
+}
+
 #[test]
 fn create_file() -> Result<()> {
     let sfs = _create_new_sfs();
@@ -173,7 +189,8 @@ fn create_file() -> Result<()> {
             ctime: Timespec { sec: 0, nsec: 0 },
             gid: 0,
             blk_size: 4096,
-            dev: 0,
+            // The filesystem's, which every inode of it reports.
+            dev: root.metadata()?.dev,
             rdev: 100, // dummo why 100 here, maybe legacy data?
         }
     );

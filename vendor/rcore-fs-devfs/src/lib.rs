@@ -151,7 +151,7 @@ impl INode for DevINode {
 
     fn metadata(&self) -> Result<Metadata> {
         Ok(Metadata {
-            dev: 0,
+            dev: DEVFS_DEV,
             inode: self.inode_id,
             size: self.children.read().len(),
             blk_size: 0,
@@ -279,6 +279,23 @@ mod tests {
         fs.root().add("null", null()).unwrap();
         fs.root().add("zero", zero()).unwrap();
         fs
+    }
+
+    /// `/dev` is one device: its directories, and the nodes in it, which say
+    /// so themselves. Its directories said 0, the device `/` was on.
+    #[test]
+    fn everything_in_dev_is_on_its_device() {
+        let fs = dev();
+        let input = fs.root().add_dir("input").unwrap() as Arc<dyn INode>;
+        let root = fs.root_inode();
+        for (what, node) in [
+            ("the root", root.clone()),
+            ("a directory", input),
+            ("null", root.find("null").unwrap()),
+            ("zero", root.find("zero").unwrap()),
+        ] {
+            assert_eq!(node.metadata().unwrap().dev, DEVFS_DEV, "{}", what);
+        }
     }
 
     // ----------------------------------------------------------- the registry

@@ -372,7 +372,8 @@ impl RamFS {
             children: BTreeMap::new(),
             content: PagedBytes::default(),
             extra: Metadata {
-                dev: 0,
+                // A ramfs is a device of its own, like every tmpfs.
+                dev: anon_dev(),
                 inode: new_inode_id(),
                 size: 0,
                 blk_size: 0,
@@ -648,7 +649,7 @@ impl INode for LockedINode {
                 children: BTreeMap::new(),
                 content: PagedBytes::default(),
                 extra: Metadata {
-                    dev: 0,
+                    dev: file.extra.dev,
                     inode: new_inode_id(),
                     size: 0,
                     blk_size: 0,
@@ -700,10 +701,9 @@ impl INode for LockedINode {
         // filesystem's inode into another's directory. Its `fs` back-pointer
         // still named the filesystem it was born in, which is a `Weak`: once
         // that ramfs was unmounted and dropped, `fs()` on the surviving name
-        // unwrapped a dead `Weak` and took the kernel down. Nor does `dev`
-        // distinguish them -- every ramfs inode reports `dev: 0`.
+        // unwrapped a dead `Weak` and took the kernel down.
         //
-        // What does distinguish them is exactly that back-pointer.
+        // What names the filesystem an inode is in is that back-pointer.
         check_same_fs(self, other)?;
         // to make sure locking order.
         let mut locks = lock_multiple(&[&self.0, &other.0]).into_iter();
@@ -1395,6 +1395,27 @@ mod tests {
         assert_eq!(now.mtime, Timespec { sec: 42, nsec: 7 });
         assert_eq!(now.type_, FileType::File, "a chmod cannot change the type");
         assert_ne!(now.inode, 0xdead, "nor the inode number");
+    }
+
+    /// Each ramfs is a device of its own, like each tmpfs, and everything
+    /// made in it is on it: `/tmp`, `/run` and `/dev/shm` were all device 0.
+    #[test]
+    fn a_ramfs_is_a_device_of_its_own_and_all_of_it_is_on_it() {
+        let (one, two) = (RamFS::new(), RamFS::new());
+        let root = one.root_inode();
+        let dev = root.metadata().unwrap().dev;
+        assert_ne!(dev, 0);
+        assert_ne!(dev, two.root_inode().metadata().unwrap().dev);
+        let d = dir_at(&root, "d");
+        let f = file_at(&d, "f");
+        for (what, node) in [("a directory", &d), ("a file in it", &f)] {
+            assert_eq!(node.metadata().unwrap().dev, dev, "{}", what);
+        }
+        // A chmod hands `set_metadata` a whole `Metadata`, `dev` and all.
+        let mut other = f.metadata().unwrap();
+        other.dev = dev + 1;
+        f.set_metadata(&other).unwrap();
+        assert_eq!(f.metadata().unwrap().dev, dev, "a chmod moved the file");
     }
 
     // ------------------------------------------------------------------ link
