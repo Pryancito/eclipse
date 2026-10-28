@@ -117,9 +117,243 @@ pub const LPA_1000HALF: u32 = 0x0400;
 pub const FLOW_CTRL_TX: u32 = 0x01;
 pub const FLOW_CTRL_RX: u32 = 0x02;
 
+// ---------------------------------------------------------------------------
+// El enlace, como lo cuenta un PHY de clausula 22
+// ---------------------------------------------------------------------------
+//
+// Esto no es de ningun MAC: los registros de arriba los define el 802.3 y los
+// contesta el PHY igual tenga delante un GENET de Broadcom o un GEM de
+// Cadence. Estaba escrito dentro del driver del GENET y lo usa tambien el del
+// `macb`, asi que vive aqui, que es donde ya estan sus registros.
+
+/// La velocidad negociada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkSpeed {
+    Mbps10,
+    Mbps100,
+    Mbps1000,
+}
+
+impl LinkSpeed {
+    /// Megabits por segundo, para los logs y para `ethtool`.
+    pub fn mbps(self) -> u32 {
+        match self {
+            LinkSpeed::Mbps10 => 10,
+            LinkSpeed::Mbps100 => 100,
+            LinkSpeed::Mbps1000 => 1000,
+        }
+    }
+}
+
+/// El estado del enlace leido del PHY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Link {
+    /// Hay portadora y la autonegociacion termino.
+    pub up: bool,
+    pub speed: LinkSpeed,
+    pub full_duplex: bool,
+}
+
+impl Link {
+    /// El enlace caido. La velocidad no significa nada con `up` a false, pero
+    /// un `Option` aqui obligaria a cada llamante a desenvolverlo para nada.
+    pub const DOWN: Link = Link {
+        up: false,
+        speed: LinkSpeed::Mbps10,
+        full_duplex: false,
+    };
+}
+
+/// Lo que el PHY contesta de un enlace que esta arriba, ya leido.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LinkRegs {
+    pub ctrl1000: u32,
+    pub stat1000: u32,
+    pub advertise: u32,
+    pub lpa: u32,
+}
+
+/// La velocidad y el duplex que salen de lo que anuncia cada lado.
+///
+/// Lo negociado es la **interseccion**: lo que este lado anuncia
+/// (`ADVERTISE`/`CTRL1000`) y lo que contesta el otro (`LPA`/`STAT1000`). Se
+/// baja de gigabit a 10 megabits, que es el orden en el que el 802.3 resuelve
+/// la negociacion, y el ultimo caso es 10 half, que es el unico modo que todo
+/// PHY tiene que saber hacer.
+pub fn negotiated(regs: &LinkRegs) -> (LinkSpeed, bool) {
+    if regs.ctrl1000 & ADVERTISE_1000FULL != 0 && regs.stat1000 & LPA_1000FULL != 0 {
+        (LinkSpeed::Mbps1000, true)
+    } else if regs.ctrl1000 & ADVERTISE_1000HALF != 0 && regs.stat1000 & LPA_1000HALF != 0 {
+        (LinkSpeed::Mbps1000, false)
+    } else if regs.advertise & ADVERTISE_100FULL != 0 && regs.lpa & LPA_100FULL != 0 {
+        (LinkSpeed::Mbps100, true)
+    } else if regs.advertise & ADVERTISE_100HALF != 0 && regs.lpa & LPA_100HALF != 0 {
+        (LinkSpeed::Mbps100, false)
+    } else if regs.advertise & ADVERTISE_10FULL != 0 && regs.lpa & LPA_10FULL != 0 {
+        (LinkSpeed::Mbps10, true)
+    } else {
+        (LinkSpeed::Mbps10, false)
+    }
+}
+
+/// Lee del PHY el estado del enlace, como `genphy_read_status`.
+///
+/// `read` es el acceso MDIO del MAC que tenga delante: el unico que cambia de
+/// un driver a otro.
+///
+/// Sin portadora (`BMSR_LSTATUS`) o sin autonegociacion terminada
+/// (`BMSR_ANEGCOMPLETE`) el enlace esta caido y la velocidad no se mira: lo
+/// que diga `STAT1000`/`LPA` mientras negocia es de la vuelta anterior.
+///
+/// `BMSR` latcha `LSTATUS`: una lectura devuelve el estado desde la lectura
+/// anterior, asi que se lee **dos veces** y vale la segunda. Sin eso, un
+/// enlace que se cayo y volvio se leeria caido.
+pub fn read_link_with<E>(mut read: impl FnMut(u32) -> Result<u16, E>) -> Result<Link, E> {
+    let _ = read(MII_BMSR)?;
+    let bmsr = read(MII_BMSR)? as u32;
+    if bmsr & BMSR_LSTATUS == 0 || bmsr & BMSR_ANEGCOMPLETE == 0 {
+        return Ok(Link::DOWN);
+    }
+
+    let regs = LinkRegs {
+        ctrl1000: read(MII_CTRL1000)? as u32,
+        stat1000: read(MII_STAT1000)? as u32,
+        advertise: read(MII_ADVERTISE)? as u32,
+        lpa: read(MII_LPA)? as u32,
+    };
+    let (speed, full_duplex) = negotiated(&regs);
+
+    Ok(Link {
+        up: true,
+        speed,
+        full_duplex,
+    })
+}
+
+/// Si un identificador de PHY es de un PHY que esta de verdad.
+///
+/// El bus MDIO sin nadie en esa direccion devuelve todo unos o todo ceros, y
+/// las dos cosas se leen como un identificador.
+pub fn phy_id_is_present(id: u32) -> bool {
+    id != 0 && id != 0xFFFF_FFFF && id != 0x0000_FFFF && id != 0xFFFF_0000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lo negociado es la INTERSECCION de lo que anuncia cada lado. Mirar solo
+    /// un lado es el error que da un enlace a gigabit sobre un cable que el
+    /// otro extremo negocio a 100, y ahi no pasa ni una trama.
+    #[test]
+    fn a_mode_only_one_side_offers_is_not_the_negotiated_one() {
+        // Este lado ofrece gigabit full, el otro no contesta gigabit.
+        let solo_yo = LinkRegs {
+            ctrl1000: ADVERTISE_1000FULL,
+            stat1000: 0,
+            advertise: ADVERTISE_100FULL,
+            lpa: LPA_100FULL,
+        };
+        assert_eq!(negotiated(&solo_yo), (LinkSpeed::Mbps100, true));
+
+        // Y al contrario: el otro ofrece gigabit y este lado no.
+        let solo_el = LinkRegs {
+            ctrl1000: 0,
+            stat1000: LPA_1000FULL,
+            advertise: ADVERTISE_100FULL,
+            lpa: LPA_100FULL,
+        };
+        assert_eq!(negotiated(&solo_el), (LinkSpeed::Mbps100, true));
+    }
+
+    /// Se baja de gigabit a 10, que es el orden en el que el 802.3 resuelve la
+    /// negociacion: con los dos lados ofreciendo de todo, sale lo mas rapido.
+    #[test]
+    fn with_everything_on_offer_the_fastest_mode_wins() {
+        let todo = LinkRegs {
+            ctrl1000: ADVERTISE_1000FULL | ADVERTISE_1000HALF,
+            stat1000: LPA_1000FULL | LPA_1000HALF,
+            advertise: ADVERTISE_ALL,
+            lpa: LPA_100FULL | LPA_100HALF | LPA_10FULL | LPA_10HALF,
+        };
+        assert_eq!(negotiated(&todo), (LinkSpeed::Mbps1000, true));
+
+        // Y full gana a half a la misma velocidad.
+        let gigabit_half = LinkRegs {
+            ctrl1000: ADVERTISE_1000HALF,
+            stat1000: LPA_1000HALF,
+            ..todo
+        };
+        assert_eq!(negotiated(&gigabit_half), (LinkSpeed::Mbps1000, false));
+    }
+
+    /// Dos lados que no tienen ni un modo en comun caen en 10 half, que es el
+    /// unico modo que todo PHY tiene que saber hacer.
+    #[test]
+    fn nothing_in_common_falls_back_to_the_one_mode_every_phy_has() {
+        assert_eq!(negotiated(&LinkRegs::default()), (LinkSpeed::Mbps10, false));
+    }
+
+    /// El `BMSR` latcha `LSTATUS`, asi que se lee DOS veces y vale la segunda:
+    /// sin eso, un enlace que se cayo y volvio se leeria caido.
+    #[test]
+    fn the_status_register_is_read_twice_and_the_second_read_is_the_one() {
+        let arriba = (BMSR_LSTATUS | BMSR_ANEGCOMPLETE) as u16;
+        let mut lecturas = alloc::vec::Vec::new();
+        let link: Result<Link, ()> = read_link_with(|reg| {
+            lecturas.push(reg);
+            Ok(match reg {
+                // La primera lectura del BMSR da el estado viejo.
+                MII_BMSR if lecturas.iter().filter(|r| **r == MII_BMSR).count() == 1 => 0,
+                MII_BMSR => arriba,
+                MII_CTRL1000 => ADVERTISE_1000FULL as u16,
+                MII_STAT1000 => LPA_1000FULL as u16,
+                _ => 0,
+            })
+        });
+        assert_eq!(
+            lecturas.iter().filter(|r| **r == MII_BMSR).count(),
+            2,
+            "no releyo el BMSR"
+        );
+        assert_eq!(
+            link,
+            Ok(Link {
+                up: true,
+                speed: LinkSpeed::Mbps1000,
+                full_duplex: true,
+            })
+        );
+    }
+
+    /// Sin portadora o sin negociacion terminada el enlace esta caido, y no se
+    /// lee ni un registro mas: lo que digan mientras negocia es de la vuelta
+    /// anterior.
+    #[test]
+    fn a_link_that_is_not_up_yet_is_down_and_nothing_else_is_read() {
+        for bmsr in [0, BMSR_LSTATUS as u16, BMSR_ANEGCOMPLETE as u16] {
+            let mut lecturas = alloc::vec::Vec::new();
+            let link: Result<Link, ()> = read_link_with(|reg| {
+                lecturas.push(reg);
+                Ok(bmsr)
+            });
+            assert_eq!(link, Ok(Link::DOWN));
+            assert!(
+                lecturas.iter().all(|reg| *reg == MII_BMSR),
+                "leyo algo mas que el BMSR con el enlace caido"
+            );
+        }
+    }
+
+    /// Un identificador de un PHY que no esta: el bus en reposo deja las
+    /// lineas arriba, y una mitad a unos tambien es nada.
+    #[test]
+    fn an_id_that_is_what_an_empty_bus_returns_is_not_a_phy() {
+        for id in [0, 0xFFFF_FFFF, 0x0000_FFFF, 0xFFFF_0000] {
+            assert!(!phy_id_is_present(id), "{:#x}", id);
+        }
+        assert!(phy_id_is_present(0x600D_84A2));
+    }
 
     /// These are register bit positions copied from Linux, and the single
     /// register this file is most used for is the basic mode control one: a

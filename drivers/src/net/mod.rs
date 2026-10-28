@@ -178,6 +178,20 @@ pub use genet::*;
     }
 }
 
+// El Cadence GEM (`cdns,macb`), que es el Ethernet de la Raspberry Pi 5: el
+// RP1 lo lleva dentro. Se abre al build de test por lo mismo que el GENET.
+cfg_if::cfg_if! {
+    if #[cfg(any(target_arch = "aarch64", test))] {
+mod macb;
+    }
+}
+
+cfg_if::cfg_if! {
+    if #[cfg(target_arch = "aarch64")] {
+pub use macb::*;
+    }
+}
+
 /*
 /// External functions that drivers must use
 pub trait Provider {
