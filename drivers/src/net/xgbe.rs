@@ -2465,6 +2465,184 @@ pub fn config_flow_control(acc: &dyn MmioAccess, queue: u32, fc: &FlowControl) {
     write_field(acc, reg, MTL_Q_RQFCR_RFD.0, MTL_Q_RQFCR_RFD.1, fc.rfd);
 }
 
+// ——— Who feeds whom: the three mappings ———
+
+/// `MTL_Q_TQOMR_Q2TCMAP`, index 8, width 3: which traffic class a transmit
+/// queue belongs to. Same register as the FIFO size of the batch before,
+/// well clear of it.
+pub const MTL_Q_TQOMR_Q2TCMAP: (u32, u32) = (8, 3);
+
+/// `MAC_RQC2R`: the first of the registers mapping VLAN priorities to
+/// receive queues.
+pub const MAC_RQC2R: usize = 0x00a8;
+/// `MAC_RQC2_INC` / `MAC_RQC2_Q_PER_REG`: four queues per register, one byte
+/// each.
+pub const MAC_RQC2_INC: usize = 4;
+/// How many queues share one `MAC_RQC2R` register.
+pub const MAC_RQC2_Q_PER_REG: u32 = 4;
+
+/// `MTL_RQDCM0R`: the first of the registers mapping receive queues to DMA
+/// channels.
+pub const MTL_RQDCM0R: usize = 0x1030;
+/// `MTL_RQDCM_INC`.
+pub const MTL_RQDCM_INC: usize = 4;
+/// `MTL_RQDCM_Q_PER_REG`.
+pub const MTL_RQDCM_Q_PER_REG: u32 = 4;
+
+/// The value Linux writes in a queue's `MTL_RQDCM0R` byte.
+///
+/// It is NOT a channel number, which is what a byte in a queue-to-channel
+/// map looks like it should hold. It is the bit that says "map this queue to
+/// a channel dynamically". A channel index written here --- 0 for the first
+/// channel, say --- would read as that bit clear and nail every queue to
+/// channel zero, which works right up until the second channel is used.
+pub const RQDCM_DYNAMIC: u32 = 0x80;
+
+/// Where index `n`'s byte lives when a map is packed four to a register:
+/// the register's offset and the shift within it.
+#[inline]
+pub const fn packed_byte(base: usize, inc: usize, per_reg: u32, n: u32) -> (usize, u32) {
+    let reg = base + (n / per_reg) as usize * inc;
+    let shift = (n % per_reg) * 8;
+    (reg, shift)
+}
+
+/// Which of `buckets` buckets gets item range `(start, len)` for bucket
+/// `index`, spreading `total` items as evenly as they go.
+///
+/// The remainder is NOT all given to the last bucket: it goes one item each
+/// to the first few. Eleven queues over four classes is 3, 3, 3, 2 --- not
+/// 2, 2, 2, 5. That matters because the classes are served in order, so
+/// piling the leftovers on one of them makes that one behave differently
+/// under load.
+#[inline]
+pub const fn bucket_span(index: u32, total: u32, buckets: u32) -> (u32, u32) {
+    let base = total / buckets;
+    let extra = total % buckets;
+    let len = if index < extra { base + 1 } else { base };
+    let start = index * base + if index < extra { index } else { extra };
+    (start, len)
+}
+
+/// Which traffic class a transmit queue belongs to.
+#[inline]
+pub fn tc_of_tx_queue(queue: u32, tx_queues: u32, tc_count: u32) -> Option<u32> {
+    if tc_count == 0 || queue >= tx_queues {
+        return None;
+    }
+    for tc in 0..tc_count {
+        let (start, len) = bucket_span(tc, tx_queues, tc_count);
+        if queue >= start && queue < start + len {
+            return Some(tc);
+        }
+    }
+    None
+}
+
+/// Map the transmit queues onto the traffic classes. The first part of
+/// `xgbe_config_queue_mapping`.
+pub fn map_tx_queues_to_tc(
+    acc: &dyn MmioAccess,
+    tx_queues: u32,
+    tc_count: u32,
+) -> DeviceResult<()> {
+    if tc_count == 0 || tx_queues < tc_count {
+        // A class with no queue has nowhere to put a frame.
+        return Err(DeviceError::InvalidParam);
+    }
+    for queue in 0..tx_queues {
+        let tc = tc_of_tx_queue(queue, tx_queues, tc_count).ok_or(DeviceError::InvalidParam)?;
+        write_field(
+            acc,
+            mtl_queue_reg(queue, MTL_Q_TQOMR),
+            MTL_Q_TQOMR_Q2TCMAP.0,
+            MTL_Q_TQOMR_Q2TCMAP.1,
+            tc,
+        );
+    }
+    Ok(())
+}
+
+/// The bitmask of VLAN priorities a receive queue is to accept.
+///
+/// A byte per queue holding a mask of priorities --- not, as the name
+/// "priority to queue map" suggests, a byte per priority holding a queue
+/// number. The direction is the other way round from the way it is
+/// described, and a map written the described way would put queue numbers
+/// where the hardware reads priority bits.
+#[inline]
+pub fn prio_mask_for_queue(queue: u32, prio_queue_count: u32) -> u32 {
+    if prio_queue_count == 0 || queue >= prio_queue_count {
+        return 0;
+    }
+    let (start, len) = bucket_span(queue, MAX_PRIO_QUEUES, prio_queue_count);
+    let mut mask = 0;
+    for prio in start..start + len {
+        mask |= 1 << prio;
+    }
+    mask
+}
+
+/// Spread the eight VLAN priorities over the receive queues. The second part
+/// of `xgbe_config_queue_mapping`.
+pub fn map_prios_to_rx_queues(acc: &dyn MmioAccess, rx_queues: u32) -> DeviceResult<()> {
+    let prio = prio_queues(rx_queues);
+    if prio == 0 {
+        return Err(DeviceError::InvalidParam);
+    }
+    write_packed_bytes(
+        acc,
+        MAC_RQC2R,
+        MAC_RQC2_INC,
+        MAC_RQC2_Q_PER_REG,
+        prio,
+        |q| prio_mask_for_queue(q, prio),
+    );
+    Ok(())
+}
+
+/// Hand every receive queue to the dynamic channel mapping. The third part
+/// of `xgbe_config_queue_mapping`.
+pub fn map_rx_queues_to_channels(acc: &dyn MmioAccess, rx_queues: u32) -> DeviceResult<()> {
+    if rx_queues == 0 {
+        return Err(DeviceError::InvalidParam);
+    }
+    write_packed_bytes(
+        acc,
+        MTL_RQDCM0R,
+        MTL_RQDCM_INC,
+        MTL_RQDCM_Q_PER_REG,
+        rx_queues,
+        |_| RQDCM_DYNAMIC,
+    );
+    Ok(())
+}
+
+/// Write a byte-packed map, one whole register at a time.
+///
+/// Whole registers, not fields: these maps have no other tenants, and a
+/// read-modify-write per byte would keep a mapping left behind by whatever
+/// configuration ran before. The last register is written even when it is
+/// only partly filled, with its unused bytes zero.
+fn write_packed_bytes(
+    acc: &dyn MmioAccess,
+    base: usize,
+    inc: usize,
+    per_reg: u32,
+    count: u32,
+    mut byte_for: impl FnMut(u32) -> u32,
+) {
+    let mut value = 0u32;
+    for n in 0..count {
+        let (reg, shift) = packed_byte(base, inc, per_reg, n);
+        value |= (byte_for(n) & 0xff) << shift;
+        if (n + 1) % per_reg == 0 || n + 1 == count {
+            acc.write32(reg, value);
+            value = 0;
+        }
+    }
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
