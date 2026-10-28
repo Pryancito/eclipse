@@ -86,6 +86,10 @@ pub fn init_all() {
     #[cfg(target_arch = "x86_64")]
     register(&crate::net::pcnet32::Pcnet32DriverPci);
 
+    // Ethernet AMD XGMAC 10GbE (`amd-xgbe`). Identifies the controller and
+    // logs its geometry; it has no datapath yet and declines the device.
+    register(&crate::net::xgbe::XgbeDriverPci);
+
     // GPU Nvidia (scaffolding) — x86_64-only (nvidia-rm-sys shim).
     //
     // Out of the host test build: its `init` reaches `nvidia-rm-sys`, whose

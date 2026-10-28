@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 extern crate std;
 
+use super::rings::*;
 use super::*;
 use crate::net::mii::*;
 
@@ -56,6 +57,13 @@ struct State {
     rbuf_flush_writes: Vec<u32>,
     /// Cuantas transacciones MDIO se han arrancado.
     mdio_starts: u32,
+    /// Toda escritura del driver, en orden: (offset, valor).
+    ///
+    /// No es decoracion. Lo unico que importa de completar un descriptor es
+    /// **cuando** se escribe el estado respecto a la direccion, y un registro
+    /// en memoria no deja rastro de eso: solo queda el ultimo valor. Esta es
+    /// la unica forma de comprobar una ordenacion desde el anfitrion.
+    writes: Vec<(usize, u32)>,
 }
 
 std::thread_local! {
@@ -93,6 +101,7 @@ impl Hw {
             umac_cmd_writes: Vec::new(),
             rbuf_flush_writes: Vec::new(),
             mdio_starts: 0,
+            writes: Vec::new(),
         };
         // Un BCM2711 pone un 6 en el nibble de la generacion, que el driver
         // traduce a v5.
@@ -209,6 +218,106 @@ impl Hw {
     pub(super) fn mdio_starts(&self) -> u32 {
         self.with(|st| st.mdio_starts)
     }
+
+    /// Toda escritura del driver, en orden.
+    pub(super) fn writes(&self) -> Vec<(usize, u32)> {
+        self.with(|st| st.writes.clone())
+    }
+
+    /// Los offsets escritos desde ahora, en orden, para medir una secuencia
+    /// sin arrastrar la del arranque.
+    pub(super) fn writes_since(&self, marca: usize) -> Vec<usize> {
+        self.with(|st| st.writes[marca..].iter().map(|(off, _)| *off).collect())
+    }
+
+    /// Cuantas escrituras se han visto, para usarlo como marca.
+    pub(super) fn write_mark(&self) -> usize {
+        self.with(|st| st.writes.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// El DMA del falso
+// ---------------------------------------------------------------------------
+
+impl Hw {
+    /// Mete una trama en el anillo de recepcion como lo haria el MAC: la copia
+    /// en el buffer al que apunta el descriptor, le pone la longitud (con los
+    /// dos bytes de alineacion delante, que es como llega de verdad) y sube el
+    /// indice del productor.
+    ///
+    /// `slot` es el descriptor, que el test tiene que llevar por su cuenta
+    /// porque el driver no lo publica.
+    pub(super) fn deliver_frame(&self, slot: usize, frame: &[u8]) {
+        self.deliver_frame_with_status(slot, frame, 0);
+    }
+
+    /// Lo mismo, pero con los bits de estado que el MAC quiera poner: los de
+    /// error (`DMA_RX_CRC_ERROR` y companIa) y los de clase de trama
+    /// (`DMA_RX_BRDCAST`, `DMA_RX_MULT`).
+    pub(super) fn deliver_frame_with_status(&self, slot: usize, frame: &[u8], status: u32) {
+        let desc = GENET_RX_OFF + slot * DMA_DESC_SIZE;
+        let lo = self.peek(desc + DMA_DESC_ADDRESS_LO) as usize;
+        let hi = self.peek(desc + DMA_DESC_ADDRESS_HI) as usize;
+        let paddr = lo | (hi << 32);
+        assert_ne!(paddr, 0, "el descriptor {} no apunta a ningun buffer", slot);
+        // `phys_to_virt` es la identidad en el anfitrion.
+        unsafe {
+            core::ptr::write_bytes((paddr + RX_BUF_OFFSET) as *mut u8, 0, frame.len());
+            core::ptr::copy_nonoverlapping(
+                frame.as_ptr(),
+                (paddr + RX_BUF_OFFSET) as *mut u8,
+                frame.len(),
+            );
+        }
+        let declared = (frame.len() + RX_BUF_OFFSET) as u32;
+        self.poke(
+            desc + DMA_DESC_LENGTH_STATUS,
+            (declared << DMA_BUFLENGTH_SHIFT) | DMA_SOP | DMA_EOP | status,
+        );
+        self.bump_rx_prod(1);
+    }
+
+    /// Sube el indice del productor de recepcion, sin tocar ningun
+    /// descriptor: asi se llega a la vuelta de los 16 bits sin tener que
+    /// entregar 65536 tramas.
+    pub(super) fn bump_rx_prod(&self, n: u32) {
+        let prod = self.peek(RDMA_PROD_INDEX).wrapping_add(n) & 0xFFFF;
+        self.poke(RDMA_PROD_INDEX, prod);
+    }
+
+    /// Da por terminadas `n` transmisiones.
+    pub(super) fn complete_tx(&self, n: u32) {
+        let cons = self.peek(TDMA_CONS_INDEX).wrapping_add(n) & 0xFFFF;
+        self.poke(TDMA_CONS_INDEX, cons);
+    }
+
+    /// La trama que el driver dejo en un descriptor de transmision, leida por
+    /// donde el MAC la leeria.
+    pub(super) fn sent_frame(&self, slot: usize) -> Vec<u8> {
+        let desc = GENET_TX_OFF + slot * DMA_DESC_SIZE;
+        let len_stat = self.peek(desc + DMA_DESC_LENGTH_STATUS);
+        let len = ((len_stat >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK) as usize;
+        let lo = self.peek(desc + DMA_DESC_ADDRESS_LO) as usize;
+        let hi = self.peek(desc + DMA_DESC_ADDRESS_HI) as usize;
+        let paddr = lo | (hi << 32);
+        if paddr == 0 || len == 0 {
+            return Vec::new();
+        }
+        let mut out = vec![0u8; len];
+        unsafe { core::ptr::copy_nonoverlapping(paddr as *const u8, out.as_mut_ptr(), len) };
+        out
+    }
+
+    /// El estado y la longitud de un descriptor de transmision.
+    pub(super) fn tx_len_stat(&self, slot: usize) -> u32 {
+        self.peek(GENET_TX_OFF + slot * DMA_DESC_SIZE + DMA_DESC_LENGTH_STATUS)
+    }
+
+    /// El estado y la longitud de un descriptor de recepcion.
+    pub(super) fn rx_len_stat(&self, slot: usize) -> u32 {
+        self.peek(GENET_RX_OFF + slot * DMA_DESC_SIZE + DMA_DESC_LENGTH_STATUS)
+    }
 }
 
 impl Drop for Hw {
@@ -230,6 +339,7 @@ pub(super) fn on_write(base: usize, off: usize, val: u32) {
         if st.base != base {
             return;
         }
+        st.writes.push((off, val));
         match off {
             UMAC_CMD => st.umac_cmd_writes.push(val),
             SYS_RBUF_FLUSH_CTRL => st.rbuf_flush_writes.push(val),
