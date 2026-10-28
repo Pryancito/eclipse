@@ -62,11 +62,111 @@ pub struct InheritProps {
     pub interrupt_parent: u32,
 }
 
+/// The magic number at the start of every flattened device tree.
+pub const FDT_MAGIC: u32 = 0xd00d_feed;
+
+/// The size of the v17 FDT header, which is the whole of what
+/// [`check_fdt_header`] needs to look at.
+pub const FDT_HEADER_SIZE: usize = 40;
+
+/// The largest blob this kernel will try to walk.
+///
+/// The `virt` machine of QEMU hands over a few KiB and the firmware of a
+/// Raspberry Pi 4 about 50 KiB, so this is wide by two orders of magnitude.
+/// It is here because `totalsize` decides how much memory gets read, and a
+/// number read out of the wrong place is as likely to be 3 GiB as 3 KiB.
+pub const FDT_MAX_SIZE: usize = 4 << 20;
+
+/// The last structure version whose layout this reader knows.
+const FDT_SUPPORTED_VERSION: u32 = 17;
+
+/// Checks the header of a flattened device tree, and returns its `totalsize`.
+///
+/// **This is what makes an address from outside safe to walk.** The loader of
+/// `device_tree` reads `totalsize` out of the second word and builds a slice
+/// that long *before* it looks at the magic number, so an address that is not
+/// a blob at all --- a bootloader field that was never filled in, a `dtb=`
+/// written wrong on the command line --- turns into a slice of up to 4 GiB
+/// over whatever happens to follow. Reading the 40 bytes of the header first
+/// and refusing anything that does not add up keeps that to one bounded read.
+///
+/// What it cannot do is make the address itself safe: the header has to be
+/// read to be checked, so a caller still owes us an address that is mapped.
+/// Everything past the header is checked here instead of trusted.
+pub fn check_fdt_header(header: &[u8]) -> DeviceResult<usize> {
+    let word = |at: usize| -> DeviceResult<usize> {
+        let bytes: &[u8] = header.get(at..at + 4).ok_or(DeviceError::InvalidParam)?;
+        let bytes: [u8; 4] =
+            core::convert::TryInto::try_into(bytes).map_err(|_| DeviceError::InvalidParam)?;
+        Ok(u32::from_be_bytes(bytes) as usize)
+    };
+
+    if word(0)? != FDT_MAGIC as usize {
+        warn!("device-tree: no FDT magic, got {:#x}", word(0)?);
+        return Err(DeviceError::InvalidParam);
+    }
+    let totalsize = word(4)?;
+    if !(FDT_HEADER_SIZE..=FDT_MAX_SIZE).contains(&totalsize) {
+        warn!("device-tree: totalsize {totalsize:#x} is not a size a blob can have");
+        return Err(DeviceError::InvalidParam);
+    }
+    // `version` is what the blob is, `last_comp_version` the oldest reader it
+    // still works with. A newer blob is fine as long as it says so; one whose
+    // floor is above us is not, and reading it would mean guessing a layout.
+    let last_comp_version = word(24)?;
+    if last_comp_version > FDT_SUPPORTED_VERSION as usize {
+        warn!("device-tree: the blob needs a reader of version {last_comp_version} or newer");
+        return Err(DeviceError::InvalidParam);
+    }
+    // Each block has to lie inside the blob. The additions are checked
+    // because an offset near `usize::MAX` plus a size wraps round into a
+    // range that looks perfectly reasonable.
+    for (name, off_at, size_at, align) in [
+        ("struct", 8, Some(36), 4),
+        ("strings", 12, Some(32), 1),
+        // The reservation block has no size of its own: it ends at its
+        // terminator, somewhere inside the blob.
+        ("memory reservations", 16, None, 8),
+    ] {
+        let off = word(off_at)?;
+        if off % align != 0 {
+            warn!("device-tree: the {name} block at {off:#x} is not aligned to {align}");
+            return Err(DeviceError::InvalidParam);
+        }
+        let size = match size_at {
+            Some(at) => word(at)?,
+            None => 0,
+        };
+        match off.checked_add(size) {
+            Some(end) if end <= totalsize => {}
+            _ => {
+                warn!("device-tree: the {name} block ({off:#x}+{size:#x}) is not inside the blob");
+                return Err(DeviceError::InvalidParam);
+            }
+        }
+    }
+    Ok(totalsize)
+}
+
 impl Devicetree {
     /// Load the device tree blob from the given virtual address.
+    ///
+    /// The address has to be mapped and readable for at least
+    /// [`FDT_HEADER_SIZE`] bytes; everything beyond that is decided by the
+    /// header, after [`check_fdt_header`] has agreed with it.
     pub fn from(dtb_base_vaddr: VirtAddr) -> DeviceResult<Self> {
         info!("Loading device tree blob from {:#x}", dtb_base_vaddr);
-        match unsafe { DeviceTreeInner::load_from_raw_pointer(dtb_base_vaddr as *const _) } {
+        // SAFETY: the caller owes us a mapped address, and this is the one
+        // read made on its word alone. Its result bounds every other.
+        let header =
+            unsafe { core::slice::from_raw_parts(dtb_base_vaddr as *const u8, FDT_HEADER_SIZE) };
+        let totalsize = check_fdt_header(header).inspect_err(|_| {
+            warn!("device-tree: refusing the blob @ {dtb_base_vaddr:#x}");
+        })?;
+        // SAFETY: `totalsize` came out of a header that agreed with itself,
+        // and is at most `FDT_MAX_SIZE`.
+        let blob = unsafe { core::slice::from_raw_parts(dtb_base_vaddr as *const u8, totalsize) };
+        match DeviceTreeInner::load(blob) {
             Ok(dt) => Ok(Self(dt)),
             Err(err) => {
                 warn!(
@@ -245,6 +345,212 @@ mod tests {
         vec,
     };
 
+    /// The ten words of a v17 FDT header that agrees with itself.
+    ///
+    /// The numbers are those of the `virt` machine's own blob, scaled down:
+    /// a header, then the reservation block, the struct block and the string
+    /// table, in the order `dtc` emits them.
+    fn a_header() -> Vec<u32> {
+        vec![
+            FDT_MAGIC, // 0: magic
+            0x200,     // 4: totalsize
+            0x48,      // 8: off_dt_struct
+            0x180,     // 12: off_dt_strings
+            0x28,      // 16: off_mem_rsvmap
+            17,        // 20: version
+            16,        // 24: last_comp_version
+            0,         // 28: boot_cpuid_phys
+            0x40,      // 32: size_dt_strings
+            0x138,     // 36: size_dt_struct
+        ]
+    }
+
+    fn bytes_of(words: &[u32]) -> Vec<u8> {
+        cells(words)
+    }
+
+    /// `a_header` with one word replaced, which is how every refusal below is
+    /// built: one field wrong and nothing else.
+    fn header_with(at: usize, value: u32) -> Vec<u8> {
+        let mut words = a_header();
+        words[at / 4] = value;
+        bytes_of(&words)
+    }
+
+    #[test]
+    fn a_header_that_agrees_with_itself_gives_its_totalsize() {
+        assert_eq!(check_fdt_header(&bytes_of(&a_header())), Ok(0x200));
+        // And trailing bytes are ignored: the caller hands over a whole blob,
+        // not just the header.
+        let mut blob = bytes_of(&a_header());
+        blob.extend_from_slice(&[0xAA; 0x100]);
+        assert_eq!(check_fdt_header(&blob), Ok(0x200));
+    }
+
+    #[test]
+    fn an_address_that_is_not_a_blob_is_refused_whatever_its_size_word_says() {
+        // This is the whole point of the check. `load_from_raw_pointer` reads
+        // `totalsize` first and builds a slice that long, so an address that
+        // is not a blob gives a slice of up to 4 GiB over whatever follows.
+        // The order *inside* this function is not what saves us --- reading a
+        // word is harmless --- it is that `Devicetree::from` does not touch
+        // `totalsize` until this has agreed with the magic.
+        let not_a_blob = header_with(0, 0x1234_5678);
+        assert_eq!(
+            check_fdt_header(&not_a_blob),
+            Err(DeviceError::InvalidParam)
+        );
+        // And an address of noise is refused on the magic, before the 3 GiB
+        // in its second word is ever used as a length.
+        let mut words = a_header();
+        words[0] = 0x1234_5678;
+        words[1] = 0xC000_0000;
+        assert_eq!(
+            check_fdt_header(&bytes_of(&words)),
+            Err(DeviceError::InvalidParam)
+        );
+    }
+
+    #[test]
+    fn a_size_a_blob_cannot_have_is_refused() {
+        // Zero, which is what an unfilled bootloader field reads as.
+        assert_eq!(
+            check_fdt_header(&header_with(4, 0)),
+            Err(DeviceError::InvalidParam)
+        );
+        // Smaller than its own header.
+        assert_eq!(
+            check_fdt_header(&header_with(4, FDT_HEADER_SIZE as u32 - 1)),
+            Err(DeviceError::InvalidParam)
+        );
+        // And the 3 GiB that a word of noise is as likely to be as 3 KiB.
+        assert_eq!(
+            check_fdt_header(&header_with(4, 0xC000_0000)),
+            Err(DeviceError::InvalidParam)
+        );
+        // Exactly the ceiling still passes: it is a limit, not a margin.
+        let mut words = a_header();
+        words[1] = FDT_MAX_SIZE as u32;
+        assert_eq!(check_fdt_header(&bytes_of(&words)), Ok(FDT_MAX_SIZE));
+    }
+
+    #[test]
+    fn a_blob_that_needs_a_newer_reader_is_refused_and_a_newer_blob_is_not() {
+        // `last_comp_version` is the oldest reader the blob still works with.
+        assert_eq!(
+            check_fdt_header(&header_with(24, 18)),
+            Err(DeviceError::InvalidParam)
+        );
+        // 17 is the layout this reader knows, so a blob whose floor is 17 is
+        // fine --- and so is one that calls itself version 99 as long as its
+        // floor is not above us, which is what the spec promises.
+        assert_eq!(check_fdt_header(&header_with(24, 17)), Ok(0x200));
+        assert_eq!(check_fdt_header(&header_with(20, 99)), Ok(0x200));
+    }
+
+    #[test]
+    fn a_block_that_falls_outside_the_blob_is_refused() {
+        // The struct block starting past the end.
+        assert_eq!(
+            check_fdt_header(&header_with(8, 0x400)),
+            Err(DeviceError::InvalidParam)
+        );
+        // The struct block starting inside but ending past it.
+        assert_eq!(
+            check_fdt_header(&header_with(36, 0x1F0)),
+            Err(DeviceError::InvalidParam)
+        );
+        // And the string table, which has its own pair of words.
+        assert_eq!(
+            check_fdt_header(&header_with(32, 0x1000)),
+            Err(DeviceError::InvalidParam)
+        );
+        assert_eq!(
+            check_fdt_header(&header_with(12, 0x400)),
+            Err(DeviceError::InvalidParam)
+        );
+        // The reservation block has no size, so only its offset is checked.
+        assert_eq!(
+            check_fdt_header(&header_with(16, 0x400)),
+            Err(DeviceError::InvalidParam)
+        );
+    }
+
+    #[test]
+    fn a_block_near_the_top_of_the_range_is_refused() {
+        // On a 32-bit target `off + size` here wraps into a range that looks
+        // perfectly reasonable, which is why the addition is checked; on this
+        // 64-bit host it cannot, because both words came from a `u32`. What
+        // the test can prove is that such an offset is refused either way.
+        assert_eq!(
+            check_fdt_header(&header_with(8, 0xFFFF_FFFC)),
+            Err(DeviceError::InvalidParam)
+        );
+    }
+
+    #[test]
+    fn a_header_whose_blocks_are_all_empty_still_has_to_be_big_enough() {
+        // The floor on `totalsize` is the only thing that catches this one: a
+        // header of zeros with the magic patched in passes every containment
+        // check, because nothing is anywhere and nothing has a size.
+        let mut words = vec![0u32; 10];
+        words[0] = FDT_MAGIC;
+        words[1] = 4;
+        assert_eq!(
+            check_fdt_header(&bytes_of(&words)),
+            Err(DeviceError::InvalidParam)
+        );
+        // With a size a blob can have, the same header is accepted: whether
+        // its blocks say anything is for the parser to find out.
+        words[1] = FDT_HEADER_SIZE as u32;
+        assert_eq!(check_fdt_header(&bytes_of(&words)), Ok(FDT_HEADER_SIZE));
+    }
+
+    #[test]
+    fn the_reservation_block_may_sit_at_the_very_end_because_it_has_no_size() {
+        // It ends at its terminator, so only its offset is checked. Giving it
+        // the struct block's size by mistake would refuse this header.
+        let mut words = a_header();
+        words[4] = 0x1F8;
+        assert_eq!(check_fdt_header(&bytes_of(&words)), Ok(0x200));
+        // One word further and it is outside the blob.
+        words[4] = 0x200;
+        assert_eq!(check_fdt_header(&bytes_of(&words)), Ok(0x200));
+        words[4] = 0x208;
+        assert_eq!(
+            check_fdt_header(&bytes_of(&words)),
+            Err(DeviceError::InvalidParam)
+        );
+    }
+
+    #[test]
+    fn a_misaligned_block_is_refused() {
+        // Every word of the struct block is read as a big-endian `u32`, and
+        // the reservation entries as pairs of `u64`.
+        assert_eq!(
+            check_fdt_header(&header_with(8, 0x49)),
+            Err(DeviceError::InvalidParam)
+        );
+        assert_eq!(
+            check_fdt_header(&header_with(16, 0x24)),
+            Err(DeviceError::InvalidParam)
+        );
+        // The string table is a run of bytes, so it has no alignment to meet.
+        assert_eq!(check_fdt_header(&header_with(12, 0x181)), Ok(0x200));
+    }
+
+    #[test]
+    fn a_buffer_too_short_to_hold_a_header_is_refused_not_read_past() {
+        let whole = bytes_of(&a_header());
+        for len in 0..FDT_HEADER_SIZE {
+            assert_eq!(
+                check_fdt_header(&whole[..len]),
+                Err(DeviceError::InvalidParam),
+                "{len} bytes"
+            );
+        }
+    }
+
     /// A `<u32 u32 ...>` property value, in the blob's big-endian order.
     fn cells(v: &[u32]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -278,6 +584,182 @@ mod tests {
 
     fn leaf(name: &str, props: Vec<(String, Vec<u8>)>) -> Node {
         node(name, props, Vec::new())
+    }
+
+    /// A minimal flattened device tree, written by hand.
+    ///
+    /// `DeviceTree::store` of the vendored `device_tree` cannot be used for
+    /// this: the blob it emits comes back out of its own `load` as
+    /// `UnexpectedEndOfInput`, padded or not, so it is no use as a reference
+    /// emitter. Writing the bytes here instead is also the point --- a
+    /// hand-made *header* only proves the check agrees with itself, while a
+    /// whole blob laid out the way the spec says proves the ten words are
+    /// where this reader looks for them.
+    struct Fdt {
+        structs: Vec<u8>,
+        strings: Vec<u8>,
+    }
+
+    impl Fdt {
+        const BEGIN_NODE: u32 = 1;
+        const END_NODE: u32 = 2;
+        const PROP: u32 = 3;
+        const END: u32 = 9;
+
+        fn new() -> Self {
+            Self {
+                structs: Vec::new(),
+                strings: Vec::new(),
+            }
+        }
+
+        fn token(&mut self, t: u32) {
+            self.structs.extend_from_slice(&t.to_be_bytes());
+        }
+
+        /// Appends to the string table and returns the offset into it, reusing
+        /// a name that is already there, the way `dtc` does.
+        fn name_off(&mut self, name: &str) -> u32 {
+            let wanted = strs(&[name]);
+            if let Some(at) = self
+                .strings
+                .windows(wanted.len())
+                .position(|w| w == wanted.as_slice())
+            {
+                return at as u32;
+            }
+            let at = self.strings.len() as u32;
+            self.strings.extend_from_slice(&wanted);
+            at
+        }
+
+        fn pad_structs(&mut self) {
+            while !self.structs.len().is_multiple_of(4) {
+                self.structs.push(0);
+            }
+        }
+
+        fn begin_node(&mut self, name: &str) -> &mut Self {
+            self.token(Self::BEGIN_NODE);
+            self.structs.extend_from_slice(name.as_bytes());
+            self.structs.push(0);
+            self.pad_structs();
+            self
+        }
+
+        fn end_node(&mut self) -> &mut Self {
+            self.token(Self::END_NODE);
+            self
+        }
+
+        fn prop(&mut self, name: &str, value: &[u8]) -> &mut Self {
+            let off = self.name_off(name);
+            self.token(Self::PROP);
+            self.structs
+                .extend_from_slice(&(value.len() as u32).to_be_bytes());
+            self.structs.extend_from_slice(&off.to_be_bytes());
+            self.structs.extend_from_slice(value);
+            self.pad_structs();
+            self
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            self.token(Self::END);
+            // Header, then the reservation block at an 8-byte boundary, then
+            // the struct block and the string table, in the order `dtc`
+            // emits them.
+            let off_mem_rsvmap = FDT_HEADER_SIZE;
+            let rsvmap = [0u8; 16]; // one entry of two zero `u64`s: the end
+            let off_dt_struct = off_mem_rsvmap + rsvmap.len();
+            let off_dt_strings = off_dt_struct + self.structs.len();
+            let totalsize = off_dt_strings + self.strings.len();
+
+            let mut blob = cells(&[
+                FDT_MAGIC,
+                totalsize as u32,
+                off_dt_struct as u32,
+                off_dt_strings as u32,
+                off_mem_rsvmap as u32,
+                17,
+                16,
+                0,
+                self.strings.len() as u32,
+                self.structs.len() as u32,
+            ]);
+            assert_eq!(blob.len(), FDT_HEADER_SIZE);
+            blob.extend_from_slice(&rsvmap);
+            blob.extend_from_slice(&self.structs);
+            blob.extend_from_slice(&self.strings);
+            assert_eq!(blob.len(), totalsize);
+            blob
+        }
+    }
+
+    /// The shape of the `virt` machine's own blob, cut down to two nodes.
+    fn a_real_blob() -> Vec<u8> {
+        let mut fdt = Fdt::new();
+        fdt.begin_node("")
+            .prop("#address-cells", &cells(&[2]))
+            .prop("#size-cells", &cells(&[2]))
+            .prop("compatible", &strs(&["linux,dummy-virt"]))
+            .begin_node("chosen")
+            .prop("bootargs", &strs(&["LOG=info smp=off"]))
+            .end_node()
+            .begin_node("pl011@9000000")
+            .prop("compatible", &strs(&["arm,pl011", "arm,primecell"]))
+            .prop("reg", &cells(&[0, 0x0900_0000, 0, 0x1000]))
+            .prop("interrupts", &cells(&[0, 1, 4]))
+            .end_node()
+            .end_node();
+        fdt.finish()
+    }
+
+    #[test]
+    fn a_whole_blob_laid_out_the_way_the_spec_says_passes_the_check() {
+        // Hand-made headers only prove the check is self-consistent. This one
+        // proves the ten words are where I think they are: if any offset were
+        // wrong, every real DTB --- the one the riscv boot already reads ---
+        // would start being refused.
+        let blob = a_real_blob();
+        assert_eq!(check_fdt_header(&blob), Ok(blob.len()));
+    }
+
+    #[test]
+    fn a_blob_in_memory_loads_through_the_same_path_the_kernel_takes() {
+        // `Devicetree::from` and its two raw slices, run on an address that
+        // really is a blob. It is the only test that covers the unsafe code.
+        let blob = a_real_blob();
+        let dt = Devicetree::from(blob.as_ptr() as VirtAddr).unwrap();
+        assert_eq!(dt.bootargs(), Some("LOG=info smp=off"));
+        let mut uarts = Vec::new();
+        dt.walk(&mut |node, comp, _| {
+            if comp.contains("arm,pl011") {
+                uarts.push(node.name.clone());
+            }
+        });
+        assert_eq!(uarts, vec!["pl011@9000000".to_string()]);
+    }
+
+    #[test]
+    fn an_address_whose_header_does_not_add_up_is_refused_before_anything_is_read() {
+        // The same path with one field broken: `Devicetree::from` must come
+        // back with an error instead of building a slice out of the second
+        // word. The blob is a full one, so the only thing stopping it is the
+        // check.
+        let mut blob = a_real_blob();
+        blob[0..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            Devicetree::from(blob.as_ptr() as VirtAddr).err(),
+            Some(DeviceError::InvalidParam)
+        );
+        // And a `totalsize` of 3 GiB, which is what the old loader would have
+        // taken as the length of a slice.
+        let mut blob = a_real_blob();
+        blob[4..8].copy_from_slice(&0xC000_0000u32.to_be_bytes());
+        assert_eq!(
+            Devicetree::from(blob.as_ptr() as VirtAddr).err(),
+            Some(DeviceError::InvalidParam)
+        );
     }
 
     // ---- `interrupts` vs `interrupts-extended` -----------------------------
