@@ -2233,6 +2233,123 @@ pub const fn dma_status_is_quiet(s: &DmaStatus) -> bool {
         || s.fatal_bus_error)
 }
 
+// ——— Sharing the FIFO out between the queues ———
+
+/// `XGMAC_FIFO_UNIT`: the granularity the FIFO is handed out in. Everything
+/// below is counted in these, never in bytes.
+pub const FIFO_UNIT: u32 = 256;
+/// `XGMAC_FIFO_MIN_ALLOC`: what a non-priority receive queue gets.
+pub const FIFO_MIN_ALLOC: u32 = 2048;
+/// `IEEE_8021QAZ_MAX_TCS`: how many receive queues carry ordinary traffic.
+/// Receive queues 9 and up (index 8 and up) carry PTP and DCB control frames
+/// and do not need a large FIFO.
+pub const MAX_PRIO_QUEUES: u32 = 8;
+
+/// `MTL_Q_TQOMR_TQS`, index 16, width **10**.
+pub const MTL_Q_TQOMR_TQS: (u32, u32) = (16, 10);
+/// `MTL_Q_RQOMR_RQS`, index 16, width **9**.
+///
+/// One bit narrower than the transmit side's field at the same index of the
+/// matching register. A helper that took the width as read from either side
+/// would silently halve, or overflow, the other's largest queue.
+pub const MTL_Q_RQOMR_RQS: (u32, u32) = (16, 9);
+
+/// Turn a per-queue size in bytes into the value the register takes:
+/// units of [`FIFO_UNIT`], minus one, because zero there means ONE unit.
+///
+/// Note where the asymmetry is. A queue of 256 bytes and a queue of 511
+/// bytes both come out as zero, which is right --- the hardware cannot
+/// express the difference. But a queue of *less* than 256 bytes also comes
+/// out as zero, which grants it 256 bytes it was never given. Linux does the
+/// same (`if (p_fifo) p_fifo--`), because the alternative is a queue with no
+/// FIFO at all, and that does not work either.
+#[inline]
+pub const fn fifo_units(bytes: u32) -> u32 {
+    let units = bytes / FIFO_UNIT;
+    if units > 0 {
+        units - 1
+    } else {
+        0
+    }
+}
+
+/// The register value every queue gets when the FIFO is split equally.
+/// `xgbe_calculate_equal_fifo`.
+///
+/// The remainder of the division is dropped rather than handed to queue
+/// zero. A few hundred spare bytes are worth less than every queue behaving
+/// the same way under load.
+pub fn equal_fifo_share(total_bytes: u32, queues: u32) -> DeviceResult<u32> {
+    if queues == 0 {
+        return Err(DeviceError::InvalidParam);
+    }
+    Ok(fifo_units(total_bytes / queues))
+}
+
+/// How many of `queues` are priority queues, i.e. get a share of the FIFO
+/// rather than the fixed minimum. `XGMAC_PRIO_QUEUES`.
+#[inline]
+pub const fn prio_queues(queues: u32) -> u32 {
+    if queues < MAX_PRIO_QUEUES {
+        queues
+    } else {
+        MAX_PRIO_QUEUES
+    }
+}
+
+/// Program the transmit FIFO split. `xgbe_config_tx_fifo_size`.
+///
+/// Every transmit queue is a priority queue: the non-priority rule below is
+/// a receive-side thing only.
+pub fn config_tx_fifo(acc: &dyn MmioAccess, total_bytes: u32, queues: u32) -> DeviceResult<()> {
+    let share = equal_fifo_share(total_bytes, queues)?;
+    for q in 0..queues {
+        write_field(
+            acc,
+            mtl_queue_reg(q, MTL_Q_TQOMR),
+            MTL_Q_TQOMR_TQS.0,
+            MTL_Q_TQOMR_TQS.1,
+            share,
+        );
+    }
+    Ok(())
+}
+
+/// Program the receive FIFO split. `xgbe_config_rx_fifo_size` without DCB:
+/// the queues above [`MAX_PRIO_QUEUES`] take [`FIFO_MIN_ALLOC`] each off the
+/// top, and what is left is split equally among the rest.
+///
+/// The subtraction comes FIRST. Splitting the whole FIFO and then carving
+/// the minimum out of it would promise the priority queues more than exists,
+/// and the overrun does not show up as an error --- it shows up as frames
+/// dropped under load on whichever queue the hardware runs out on.
+pub fn config_rx_fifo(acc: &dyn MmioAccess, total_bytes: u32, queues: u32) -> DeviceResult<()> {
+    let prio = prio_queues(queues);
+    if prio == 0 {
+        return Err(DeviceError::InvalidParam);
+    }
+    let nonprio = queues - prio;
+    let reserved = nonprio
+        .checked_mul(FIFO_MIN_ALLOC)
+        .ok_or(DeviceError::InvalidParam)?;
+    if reserved >= total_bytes {
+        return Err(DeviceError::InvalidParam);
+    }
+    let share = equal_fifo_share(total_bytes - reserved, prio)?;
+    let minimum = fifo_units(FIFO_MIN_ALLOC);
+    for q in 0..queues {
+        let value = if q < prio { share } else { minimum };
+        write_field(
+            acc,
+            mtl_queue_reg(q, MTL_Q_RQOMR),
+            MTL_Q_RQOMR_RQS.0,
+            MTL_Q_RQOMR_RQS.1,
+            value,
+        );
+    }
+    Ok(())
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.

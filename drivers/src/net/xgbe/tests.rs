@@ -2818,3 +2818,153 @@ fn a_status_of_nothing_is_a_real_case() {
     // Bits the driver does not decode do not make it noisy either.
     assert!(dma_status_is_quiet(&decode_dma_status(1 << 20)));
 }
+
+// ——— Tanda 14: sharing the FIFO out ———
+
+#[test]
+fn the_two_size_fields_are_different_widths_at_the_same_index() {
+    // TQS is ten bits and RQS is nine, both at index 16 of their own
+    // register. A helper that read the width off either side would halve or
+    // overflow the other's largest queue.
+    assert_eq!(MTL_Q_TQOMR_TQS.0, MTL_Q_RQOMR_RQS.0);
+    assert_eq!(MTL_Q_TQOMR_TQS.1, 10);
+    assert_eq!(MTL_Q_RQOMR_RQS.1, 9);
+}
+
+#[test]
+fn zero_in_the_register_means_one_unit_not_none() {
+    // 256 bytes and 511 bytes are the same value, which is right: the
+    // hardware cannot express the difference.
+    assert_eq!(fifo_units(256), 0);
+    assert_eq!(fifo_units(511), 0);
+    assert_eq!(fifo_units(512), 1);
+    assert_eq!(fifo_units(FIFO_MIN_ALLOC), 7);
+}
+
+#[test]
+fn less_than_a_unit_still_comes_out_as_one_unit() {
+    // The asymmetry worth naming: under 256 bytes the value is still zero,
+    // which grants the queue 256 bytes it was never given. Linux does the
+    // same, because a queue with no FIFO does not work either.
+    assert_eq!(fifo_units(0), 0);
+    assert_eq!(fifo_units(255), 0);
+    assert_eq!(fifo_units(1), 0);
+}
+
+#[test]
+fn the_remainder_of_the_split_is_dropped_not_given_to_queue_zero() {
+    let fake = FakeXgmac::new();
+    // 10 KiB over three queues is 3413 bytes each, which is 13 units and a
+    // bit; the bit goes nowhere.
+    config_tx_fifo(&fake, 10 * 1024, 3).unwrap();
+    let values: Vec<u32> = (0..3)
+        .map(|q| fake.read32(mtl_queue_reg(q, MTL_Q_TQOMR)))
+        .map(|v| get_bits(v, MTL_Q_TQOMR_TQS.0, MTL_Q_TQOMR_TQS.1))
+        .collect();
+    assert_eq!(values, [12, 12, 12]);
+    // Queue zero is not special.
+    assert_eq!(values[0], values[2]);
+}
+
+#[test]
+fn a_fifo_split_over_no_queues_is_refused() {
+    let fake = FakeXgmac::new();
+    assert!(equal_fifo_share(65536, 0).is_err());
+    assert!(config_tx_fifo(&fake, 65536, 0).is_err());
+    assert!(config_rx_fifo(&fake, 65536, 0).is_err());
+}
+
+#[test]
+fn only_the_size_field_of_the_queue_register_is_touched() {
+    let fake = FakeXgmac::new();
+    // The queue operation registers hold other things; the size is written
+    // as a field, not as the whole word.
+    fake.preload(mtl_queue_reg(0, MTL_Q_TQOMR), 0x0000_0003);
+    config_tx_fifo(&fake, 64 * 1024, 1).unwrap();
+    let word = fake.read32(mtl_queue_reg(0, MTL_Q_TQOMR));
+    assert_eq!(word & 0xffff, 0x0003, "the low half was clobbered");
+    assert_eq!(get_bits(word, MTL_Q_TQOMR_TQS.0, MTL_Q_TQOMR_TQS.1), 255);
+}
+
+#[test]
+fn the_prio_queue_count_saturates_at_eight() {
+    assert_eq!(prio_queues(0), 0);
+    assert_eq!(prio_queues(4), 4);
+    assert_eq!(prio_queues(8), 8);
+    assert_eq!(prio_queues(16), 8);
+}
+
+#[test]
+fn the_control_queues_take_their_minimum_off_the_top_first() {
+    let fake = FakeXgmac::new();
+    // 16 receive queues on a 64 KiB FIFO: eight control queues take 2 KiB
+    // each, leaving 48 KiB for the eight priority ones.
+    config_rx_fifo(&fake, 64 * 1024, 16).unwrap();
+    let value = |q| {
+        get_bits(
+            fake.read32(mtl_queue_reg(q, MTL_Q_RQOMR)),
+            MTL_Q_RQOMR_RQS.0,
+            MTL_Q_RQOMR_RQS.1,
+        )
+    };
+    // 48 KiB / 8 = 6 KiB = 24 units, minus one.
+    for q in 0..8 {
+        assert_eq!(value(q), 23, "priority queue {}", q);
+    }
+    for q in 8..16 {
+        assert_eq!(value(q), 7, "control queue {}", q);
+    }
+    // And splitting the whole FIFO first would have promised each priority
+    // queue 8 KiB, which is more FIFO than exists once the control queues
+    // have taken theirs.
+    assert_ne!(value(0), equal_fifo_share(64 * 1024, 8).unwrap());
+}
+
+#[test]
+fn with_eight_queues_or_fewer_nothing_is_reserved() {
+    let fake = FakeXgmac::new();
+    config_rx_fifo(&fake, 64 * 1024, 8).unwrap();
+    let share = equal_fifo_share(64 * 1024, 8).unwrap();
+    for q in 0..8 {
+        assert_eq!(
+            get_bits(
+                fake.read32(mtl_queue_reg(q, MTL_Q_RQOMR)),
+                MTL_Q_RQOMR_RQS.0,
+                MTL_Q_RQOMR_RQS.1,
+            ),
+            share
+        );
+    }
+}
+
+#[test]
+fn a_fifo_the_control_queues_would_swallow_whole_is_refused() {
+    let fake = FakeXgmac::new();
+    // Sixteen queues means 16 KiB reserved. An 8 KiB FIFO cannot pay it, and
+    // the priority queues would come out at zero units, which reads as 256
+    // bytes each rather than as the error it is.
+    assert!(config_rx_fifo(&fake, 8 * 1024, 16).is_err());
+    assert!(config_rx_fifo(&fake, 16 * 1024, 16).is_err());
+    assert!(config_rx_fifo(&fake, 17 * 1024, 16).is_ok());
+}
+
+#[test]
+fn every_transmit_queue_is_a_priority_queue() {
+    let fake = FakeXgmac::new();
+    // The non-priority rule is receive-side only: sixteen transmit queues
+    // all get an equal share, with nothing reserved.
+    config_tx_fifo(&fake, 64 * 1024, 16).unwrap();
+    let share = equal_fifo_share(64 * 1024, 16).unwrap();
+    for q in 0..16 {
+        assert_eq!(
+            get_bits(
+                fake.read32(mtl_queue_reg(q, MTL_Q_TQOMR)),
+                MTL_Q_TQOMR_TQS.0,
+                MTL_Q_TQOMR_TQS.1,
+            ),
+            share,
+            "queue {}",
+            q
+        );
+    }
+}
