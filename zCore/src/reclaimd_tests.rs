@@ -148,3 +148,56 @@ fn a_pass_under_the_watermark_asks_the_deferred_caches_for_the_shortfall() {
     );
     fake_cache::HELD.store(0, Ordering::Relaxed);
 }
+
+/// The OOM test is two halves, and both have to hold. A pass that freed
+/// something has made progress, so nobody is killed for it: reclaiming a cache
+/// costs nobody their process, and the next pass asks again 200 ms later.
+#[test]
+fn a_pass_that_freed_something_never_kills() {
+    let total = 1024 * MIB;
+    assert!(
+        !out_of_memory(total, total, 1),
+        "a single byte of progress still killed a process"
+    );
+}
+
+/// Under the OOM watermark with nothing freed is the one case that kills.
+#[test]
+fn nothing_left_to_reclaim_and_nothing_to_allocate_from_is_an_oom() {
+    let total = 1024 * MIB;
+    assert!(
+        out_of_memory(total, total, 0),
+        "an empty machine was not an OOM"
+    );
+}
+
+/// At the low watermark there is still a watermark's worth of memory to
+/// allocate from: killing there would cost a process the machine did not need
+/// to lose, which is why the OOM floor is a fifth of it.
+#[test]
+fn being_under_the_low_watermark_is_not_yet_an_oom() {
+    let total = 1024 * MIB;
+    let wm = watermark(total);
+    assert!(
+        target(total - wm / 2, total) > 0,
+        "this test needs reclaim to be due"
+    );
+    assert!(
+        !out_of_memory(total - wm / 2, total, 0),
+        "a machine merely under the low watermark was killed for"
+    );
+    // Just under the OOM floor, it is.
+    let floor = wm / OOM_WATERMARK_DIV;
+    assert!(
+        out_of_memory(total - floor / 2, total, 0),
+        "a machine under the OOM floor was not an OOM"
+    );
+}
+
+/// Before the allocator has any memory there is no shortage to speak of: a
+/// total of zero makes every figure derived from it meaningless, and killing
+/// `init` during boot is not a recovery.
+#[test]
+fn an_allocator_with_no_memory_yet_is_not_an_oom() {
+    assert!(!out_of_memory(0, 0, 0), "boot was declared out of memory");
+}

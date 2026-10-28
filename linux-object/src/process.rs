@@ -58,6 +58,8 @@ pub use capabilities::*;
 /// `oom_score_adj` and its floor, for `/proc/<pid>/oom_score_adj`.
 mod oom;
 pub use oom::*;
+mod oom_kill;
+pub use oom_kill::*;
 
 pub use rcore_fs::vfs::FsInfo;
 

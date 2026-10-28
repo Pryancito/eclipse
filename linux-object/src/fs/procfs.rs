@@ -115,27 +115,12 @@ const PROC_ROOT_STATIC: [&str; 54] = [
     "kbd",
 ];
 
-fn collect_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
-    for id in job.process_ids() {
-        if let Some(proc) = job.find_process(id) {
-            if !matches!(proc.status(), Status::Exited(_)) {
-                out.push(proc);
-            }
-        }
-    }
-    for child_id in job.children_ids() {
-        if let Ok(child) = job.get_child(child_id) {
-            if let Ok(child_job) = child.downcast_arc::<Job>() {
-                collect_processes(&child_job, out);
-            }
-        }
-    }
-}
-
+/// The machine's live processes. The census itself is
+/// `process::live_processes` (`for_each_process`), which the OOM killer walks
+/// too: two walks of the job tree would drift, and the one that drifted would
+/// be whichever had no reader watching it.
 fn all_processes() -> Vec<Arc<Process>> {
-    let mut out = Vec::new();
-    collect_processes(&ROOT_JOB, &mut out);
-    out
+    crate::process::live_processes()
 }
 
 /// The processes `/proc` has a directory for: the live ones and the zombies
