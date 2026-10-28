@@ -186,6 +186,9 @@ pub struct CowFs {
     default_subvol: u64,
     read_only: bool,
     nested: bool,
+    /// A write that must not stop short ([`write_atomic`](Self::write_atomic)
+    /// checked the room up front, and its size is bounded).
+    atomic: bool,
     pending_ops: u32,
     clock: Option<fn() -> (u64, u32)>,
     /// `compress=`: what new data of every file is compressed with.
@@ -576,6 +579,7 @@ impl CowFs {
             default_subvol: subvol,
             read_only,
             nested: false,
+            atomic: false,
             pending_ops: 0,
             clock: None,
             compress: None,
@@ -1735,7 +1739,7 @@ impl CowFs {
             // Every run takes tree items (and checksums at the commit); the
             // commit needs nodes of its own to free anything again, so a
             // write that has run the metadata reserve down stops short.
-            if written_to > off && !self.sp.meta_headroom() {
+            if !self.atomic && written_to > off && !self.sp.meta_headroom() {
                 break;
             }
             let chunk_end = (lb + WRITE_CHUNK).min(last);
@@ -1842,7 +1846,7 @@ impl CowFs {
                 let at = (lb * BS - off) as usize;
                 // As in `write_plain`: stop short before the metadata
                 // reserve runs out.
-                if lb * BS > off && !self.sp.meta_headroom() {
+                if !self.atomic && lb * BS > off && !self.sp.meta_headroom() {
                     inode.size = inode.size.max(lb * BS);
                     return Ok(at);
                 }
@@ -2674,7 +2678,11 @@ impl CowFs {
     }
 
     fn truncate_l(&mut self, ino: u64, new_size: u64) -> Result<()> {
-        self.writable()?;
+        // A truncate to the same size changes nothing, so it works on a
+        // full disk too.
+        if self.read_only {
+            return Err(Error::Unsupported("read-only filesystem"));
+        }
         let mut i = self.inode(ino)?;
         match i.kind() {
             FileKind::Dir => return Err(Error::IsDir),
@@ -2686,6 +2694,7 @@ impl CowFs {
             return Ok(());
         }
         crate::file_end(new_size, 0)?;
+        self.writable()?;
         let r = self.truncate_data(ino, &mut i, new_size);
         let now = self.now();
         i.mtime = now;
@@ -4242,8 +4251,14 @@ impl CowFs {
         if !self.sp.ensure_data_room(need) {
             return Err(Error::NoSpace);
         }
-        let n = self.write_l(ino, offset, data)?;
-        // The space was there a moment ago and nothing else ran since, so
+        self.atomic = true;
+        self.sp.data_dig = true;
+        let n = self.write_l(ino, offset, data);
+        self.atomic = false;
+        self.sp.data_dig = false;
+        let n = n?;
+        // The data room was there a moment ago, and the tree nodes the
+        // write copies come out of the half of the reserve it may take, so
         // a short write is a failing device.
         (n == data.len()).then_some(n).ok_or(Error::Io)
     }

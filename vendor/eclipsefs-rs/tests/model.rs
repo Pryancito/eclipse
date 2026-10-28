@@ -476,6 +476,14 @@ impl Run {
             77 => {
                 if let Some(f) = self.some_file() {
                     self.fs.fsync(f).unwrap();
+                    if tracing() {
+                        eprintln!(
+                            "{} fsync {} ({} bytes)",
+                            self.step,
+                            f,
+                            self.model.data(f).len()
+                        );
+                    }
                     self.fsynced = true;
                     let h = hash(self.model.data(f));
                     self.fsync_seen.insert(f, h);
@@ -1418,13 +1426,16 @@ impl Run {
                 }
             }
             _ => {
-                let r = self
-                    .fs
-                    .repair()
-                    .unwrap_or_else(|e| panic!("{} repair: {:?}", ctx, e));
+                let r = self.fs.repair();
                 if tracing() {
                     eprintln!("{} repair -> {:?}", self.step, r);
                 }
+                // Repair copies tree nodes too, so a full disk whose
+                // snapshots keep everything refuses it like any other change.
+                if self.no_space_held(&r) {
+                    return;
+                }
+                let r = r.unwrap_or_else(|e| panic!("{} repair: {:?}", ctx, e));
                 assert!(
                     r.is_clean() && !r.changed(),
                     "{} repair of a healthy fs: {:?}",
@@ -1441,6 +1452,9 @@ impl Run {
     /// must pass the full check and hold one of the states since the last
     /// sync (or, after an fsync, anything that passes the check).
     fn power_cut(&mut self) {
+        if tracing() {
+            eprintln!("{} power cut", self.step);
+        }
         let copies: Vec<Arc<MemDisk>> = self.disks.iter().map(|d| d.copy()).collect();
         let mut fs = EclipseFS::mount_devices(devs(&copies), false)
             .unwrap_or_else(|e| panic!("{} mount after power cut: {:?}", self.ctx(), e));

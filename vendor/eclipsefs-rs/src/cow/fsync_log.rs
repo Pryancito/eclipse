@@ -433,6 +433,11 @@ impl CowFs {
         if inode.kind() != FileKind::Regular {
             return Ok(false);
         }
+        // A chunk made since the last commit is not in the chunk map on
+        // disk, so data in it is nowhere after a power cut.
+        if self.sp.chunks_dirty {
+            return Ok(false);
+        }
         // fsync saw the area and the inode's changes.
         let (area, area_n) = self.log_area()?.ok_or(Error::Corrupt("fsync log area"))?;
         let ranges = self.log.inodes[&(sv, ino)].ranges.clone();
