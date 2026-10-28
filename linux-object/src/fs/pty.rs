@@ -30,6 +30,8 @@ use lazy_static::lazy_static;
 use lock::Mutex;
 use rcore_fs::vfs::*;
 
+pub mod devpts;
+
 // termios c_iflag bits
 /// How often a blocking read of a pty wakes up just to ask whether it should
 /// still be waiting. Same figure and same reasoning as every other
@@ -156,6 +158,8 @@ pub struct Pty {
     /// that wakes the reader sees the queue but not the buffer, so the read
     /// leaves the number behind for it.
     slave_need: AtomicUsize,
+    /// Who `/dev/pts/N` belongs to, and its mode.
+    owner: Mutex<devpts::Owner>,
 }
 
 impl Pty {
@@ -1140,8 +1144,9 @@ lazy_static! {
 static NEXT_PTY: AtomicU32 = AtomicU32::new(0);
 
 /// Allocate a fresh PTY pair and return the master INode. Called from the open
-/// path when a process opens `/dev/ptmx`.
-pub fn alloc_ptmx() -> Arc<dyn INode> {
+/// path when a process opens `/dev/ptmx`; `uid` is its fsuid, and the slave
+/// belongs to it (`devpts_pty_new`).
+pub fn alloc_ptmx(uid: u32) -> Arc<dyn INode> {
     let id = NEXT_PTY.fetch_add(1, Ordering::Relaxed);
     let pty = Arc::new(Pty {
         id,
@@ -1174,20 +1179,21 @@ pub fn alloc_ptmx() -> Arc<dyn INode> {
         locked: AtomicBool::new(false),
         vtime_deadline_ns: AtomicU64::new(0),
         slave_need: AtomicUsize::new(0),
+        owner: Mutex::new(devpts::Owner::of(uid)),
     });
     PTYS.lock().insert(id, pty.clone());
     Arc::new(PtyMaster { pty })
-}
-
-/// Parse the slave number from a `/dev/pts/N` path.
-pub fn pts_id_from_path(path: &str) -> Option<u32> {
-    path.strip_prefix("/dev/pts/")?.parse::<u32>().ok()
 }
 
 /// Open the slave `/dev/pts/N`. Returns `None` if the pair no longer exists
 /// (its master was closed).
 pub fn open_pts(id: u32) -> Option<Arc<dyn INode>> {
     let pty = PTYS.lock().get(&id).cloned()?;
+    open_slave(pty)
+}
+
+/// Open the slave of `pty`, unless its master is closed.
+fn open_slave(pty: Arc<Pty>) -> Option<Arc<dyn INode>> {
     if pty.master_closed.load(Ordering::Relaxed) {
         return None;
     }
@@ -1503,13 +1509,23 @@ impl INode for PtySlave {
         self.pty.ioctl(cmd, data, false)
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(pty_metadata(make_rdev(136, self.pty.id as usize)))
+        Ok(devpts::slave_metadata(&self.pty))
+    }
+    fn set_metadata(&self, metadata: &Metadata) -> Result<()> {
+        devpts::set_slave_metadata(&self.pty, metadata)
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(devpts::DevPtsFs)
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
     }
 }
 
+/// `/dev/ptmx`, and the master an open of it makes, which `fstat` says is
+/// `/dev/ptmx`: `crw-rw-rw-` as devtmpfs makes it (`tty_devnode`), since
+/// anybody may make a pair. It said `0620` of root's, so a user opening it by
+/// any name but the exact string `/dev/ptmx` was `EACCES`.
 fn pty_metadata(rdev: usize) -> Metadata {
     Metadata {
         dev: 1,
@@ -1521,7 +1537,7 @@ fn pty_metadata(rdev: usize) -> Metadata {
         mtime: Timespec { sec: 0, nsec: 0 },
         ctime: Timespec { sec: 0, nsec: 0 },
         type_: FileType::CharDevice,
-        mode: 0o620,
+        mode: 0o666,
         nlinks: 1,
         uid: 0,
         gid: 0,
@@ -1669,6 +1685,7 @@ mod tests {
             locked: AtomicBool::new(false),
             vtime_deadline_ns: AtomicU64::new(0),
             slave_need: AtomicUsize::new(0),
+            owner: Mutex::new(devpts::Owner::of(0)),
         };
         p
     }
@@ -2978,20 +2995,6 @@ mod tests {
         let n = p.master_read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"ultimas palabras\r\n");
         assert_eq!(p.master_read(&mut buf).unwrap(), 0);
-    }
-
-    // ---- path parsing ---------------------------------------------------
-
-    #[test]
-    fn pts_paths_parse_only_when_they_name_a_number() {
-        assert_eq!(pts_id_from_path("/dev/pts/0"), Some(0));
-        assert_eq!(pts_id_from_path("/dev/pts/42"), Some(42));
-        assert_eq!(pts_id_from_path("/dev/pts/"), None);
-        assert_eq!(pts_id_from_path("/dev/pts/ptmx"), None);
-        assert_eq!(pts_id_from_path("/dev/pts/-1"), None);
-        assert_eq!(pts_id_from_path("/dev/pts/1/2"), None);
-        assert_eq!(pts_id_from_path("/dev/tty0"), None);
-        assert_eq!(pts_id_from_path("pts/0"), None);
     }
 
     // ---- flow control: both queues are bounded --------------------------

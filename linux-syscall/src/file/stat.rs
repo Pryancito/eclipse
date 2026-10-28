@@ -563,6 +563,8 @@ mod fd_link_tests;
 #[cfg(test)]
 mod dev_tests;
 #[cfg(test)]
+mod devpts_tests;
+#[cfg(test)]
 mod empty_path_tests;
 #[cfg(test)]
 mod fdinfo_tests;

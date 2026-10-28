@@ -99,9 +99,10 @@ fn everything_in_dev_is_on_its_device_but_what_is_mounted_there() {
     let (top, each) = got;
     for (name, dev) in each {
         let dev = dev.unwrap();
-        if name == "shm" {
-            // A tmpfs of its own on Linux, and a ramfs of its own here.
-            assert_ne!(dev, top, "/dev/shm is on /dev's device");
+        if name == "shm" || name == "pts" {
+            // A tmpfs of its own on Linux, and a ramfs of its own here; and
+            // devpts.
+            assert_ne!(dev, top, "/dev/{} is on /dev's device", name);
         } else {
             assert_eq!(dev, top, "/dev/{} is not on /dev's device", name);
         }

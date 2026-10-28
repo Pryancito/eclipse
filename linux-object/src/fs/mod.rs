@@ -1465,15 +1465,15 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             warn!("failed to mknod /dev/{}: {:?}", name, e);
         }
     }
-    // Pseudo-terminals (`fs/pty.rs`). Absolute opens of `/dev/ptmx` and
-    // `/dev/pts/N` are special-cased in `openat` against that registry. The
-    // VFS nodes exist for `stat`/`ls`; do not also register `devfs::PtmxINode`
-    // / `PtsDir` (different registry + EntryExist left `/dev/pts` empty).
+    // Pseudo-terminals (`fs/pty.rs`). An absolute open of `/dev/ptmx` is
+    // special-cased in `openat`; `/dev/pts` is devpts, which lists and finds
+    // the slaves of the live pairs. Do not also register `devfs::PtmxINode` /
+    // `PtsDir` (a different registry).
     if let Err(e) = devfs_root.add("ptmx", Arc::new(pty::PtmxINode)) {
         warn!("failed to mknod /dev/ptmx: {:?}", e);
     }
-    if let Err(e) = devfs_root.add_dir("pts") {
-        warn!("failed to mkdir /dev/pts: {:?}", e);
+    if let Err(e) = devfs_root.add("pts", pty::devpts::root()) {
+        warn!("failed to mount /dev/pts: {:?}", e);
     }
     if let Some(display) = drivers::all_display().first() {
         use devfs::FbDev;
@@ -1880,6 +1880,13 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // lookups bypass MountFS via the `lookup_virtual_fs` fast path. Register
         // it in the mount table only so `/proc/mounts` reflects reality.
         register_line("tmpfs", "/dev/shm", "tmpfs", &tmpfs_mount_opts());
+        // The same for `/dev/pts`, with the options it behaves as having.
+        register_line(
+            "devpts",
+            "/dev/pts",
+            "devpts",
+            "rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000",
+        );
     }
 
     // mount RamFS at /tmp — frame-backed pages, shared MemTotal/2 ceiling with

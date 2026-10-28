@@ -48,7 +48,8 @@ impl ITimerSpec {
     }
 }
 
-fn prepare_open_inode(inode: Arc<dyn INode>) -> LxResult<Arc<dyn INode>> {
+/// `owner` is the fsuid of whoever opens: a new pty pair is theirs.
+fn prepare_open_inode(inode: Arc<dyn INode>, owner: u32) -> LxResult<Arc<dyn INode>> {
     // A socket or an anonymous object reached through `/proc/<pid>/fd/N`
     // has no open to call again: `sock_no_open` and the anonymous inodes
     // answer `ENXIO`.
@@ -72,7 +73,13 @@ fn prepare_open_inode(inode: Arc<dyn INode>) -> LxResult<Arc<dyn INode>> {
             .downcast_ref::<linux_object::fs::pty::PtmxINode>()
             .is_some()
         {
-            linux_object::fs::pty::alloc_ptmx()
+            linux_object::fs::pty::alloc_ptmx(owner)
+        } else if let Some(pts) = inode.downcast_ref::<linux_object::fs::pty::devpts::PtsNode>() {
+            // `/dev/pts/N`, by whatever name it was reached: its slave; or,
+            // reached through a descriptor of the name once its master is
+            // closed, `EIO`, as `pts_unix98_lookup` says ("Master must be
+            // open before slave").
+            pts.open().ok_or(LxError::EIO)?
         } else if let Some(ptmx) = inode.downcast_ref::<linux_object::fs::devfs::PtmxINode>() {
             ptmx.open_master().map_err(LxError::from)?
         } else if let Some(pcm) = inode.downcast_ref::<linux_object::fs::devfs::PcmDev>() {
@@ -493,9 +500,9 @@ impl Syscall<'_> {
         // no allocation, no extra work, just structure.
         let ret: SysResult = (|| {
             // Pseudo-terminals. Opening `/dev/ptmx` mints a brand-new master (each
-            // open must yield an independent PTY pair, which the generic INode open
-            // path cannot express), and `/dev/pts/N` resolves to the matching slave
-            // from the live PTY registry rather than a static device node.
+            // open must yield an independent PTY pair). `/dev/pts/N` is not
+            // special: devpts finds it, and the open below checks who may
+            // open it, as for any other node.
             // Every path handled specially below hands back a character
             // device, so an `O_DIRECTORY` over one of them is answered before
             // the work of minting a PTY starts.
@@ -504,22 +511,12 @@ impl Syscall<'_> {
             // PTY and claims no single-client device. The generic path below
             // hands back the node itself, which is what a path descriptor is.
             let open_file = !flags.is_path();
-            if open_file
-                && (path == "/dev/ptmx"
-                    || path == "/dev/tty"
-                    || pty::pts_id_from_path(path).is_some())
-            {
+            if open_file && (path == "/dev/ptmx" || path == "/dev/tty") {
                 open_resolved_type(flags, FileType::CharDevice)?;
             }
             if open_file && path == "/dev/ptmx" {
-                let inode = pty::alloc_ptmx();
+                let inode = pty::alloc_ptmx(proc.fsuid());
                 let file = File::new(inode, flags, String::from("/dev/ptmx"));
-                let fd = proc.add_file(file)?;
-                return Ok(fd.into());
-            }
-            if let Some(id) = pty::pts_id_from_path(path).filter(|_| open_file) {
-                let inode = pty::open_pts(id).ok_or(LxError::ENXIO)?;
-                let file = File::new(inode, flags, String::from(path));
                 let fd = proc.add_file(file)?;
                 return Ok(fd.into());
             }
@@ -760,7 +757,7 @@ impl Syscall<'_> {
             let inode = if flags.is_path() {
                 inode
             } else {
-                prepare_open_inode(inode)?
+                prepare_open_inode(inode, proc.fsuid())?
             };
             // A pipe reopened through `/proc/<pid>/fd/N` (or `/dev/stdin`) is
             // the same pipe, under the same name; so is the object an
@@ -1613,14 +1610,14 @@ mod open_inode_tests {
     #[test]
     fn pcm_inode_open_and_close_enforce_exclusivity() {
         let inode: Arc<dyn INode> = Arc::new(PcmDev::new(Arc::new(FakeAudio::new(4096)), 0));
-        let first = prepare_open_inode(inode.clone()).unwrap();
+        let first = prepare_open_inode(inode.clone(), 0).unwrap();
         let file = File::new(first, OpenFlags::RDONLY, String::from("/dev/snd/pcmC0D0p"));
         assert!(matches!(
-            prepare_open_inode(inode.clone()),
+            prepare_open_inode(inode.clone(), 0),
             Err(LxError::EBUSY)
         ));
         drop(file);
-        assert!(prepare_open_inode(inode).is_ok());
+        assert!(prepare_open_inode(inode, 0).is_ok());
     }
 }
 
