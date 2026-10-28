@@ -2949,6 +2949,24 @@ impl CowFs {
             return Err(Error::Invalid);
         }
         permit(frozen(&self.inode(d)?))?;
+        // The commit after it changes the reference and checksum trees for
+        // every block the snapshot alone held: if it could not find the
+        // nodes for that, nothing could ever be committed again. Each node
+        // is copied once at most, which bounds what it takes.
+        if self.sp.node_free() < self.sp.reserve / 2 {
+            let cap = self.sp.reserve / 2;
+            let (refs, csum, roots) = (self.refs_root, self.csum_root, self.root_tree);
+            let mut need = 0;
+            for t in [refs, csum, roots] {
+                need += self.st.cow_cost(&self.sp, &t, cap)?;
+            }
+            // The entry's path in the parent, and splits in the
+            // reference tree (a count that changes inside a run).
+            need += 2 * (self.fs_root.level as u64 + 1) + refs.level as u64 + 2;
+            if self.sp.node_free() < need.min(cap) {
+                return Err(Error::NoSpace);
+            }
+        }
         self.drop_subvol(d, name, split(e.ino).0)?;
         if !self.sp.meta_headroom() {
             self.flush()?;

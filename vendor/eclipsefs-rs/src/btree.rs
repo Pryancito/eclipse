@@ -655,6 +655,28 @@ impl Store {
         Ok(new)
     }
 
+    /// How many new blocks copying every node of the tree would take (the
+    /// most a transaction can spend on it: a node is copied once), counting
+    /// up to `cap`.
+    pub fn cow_cost(&mut self, sp: &dyn Space, root: &Root, cap: u64) -> Result<u64> {
+        let mut n = 0;
+        let mut todo = vec![(root.bytenr, root.level)];
+        while let Some((b, level)) = todo.pop() {
+            if n >= cap {
+                break;
+            }
+            self.load(b, level, None)?;
+            if !self.dirty.contains(&b) || sp.refs(b) > 1 {
+                n += 1;
+            }
+            if let Body::Internal(ptrs) = &self.cache[&b].body {
+                let level = level.checked_sub(1).ok_or(Error::Corrupt("tree level"))?;
+                todo.extend(ptrs.iter().map(|p| (p.bytenr, level)));
+            }
+        }
+        Ok(n.min(cap))
+    }
+
     /// Drop one reference to a whole tree (deleting a snapshot), freeing
     /// whatever no other tree shares.
     pub fn release(&mut self, sp: &mut dyn Space, root: Root) -> Result<()> {

@@ -470,12 +470,16 @@ impl Run {
             73 => self.op_compression(),
             74..=75 => self.op_dedupe(),
             76 => {
-                self.fs.sync().unwrap();
+                self.fs
+                    .sync()
+                    .unwrap_or_else(|e| panic!("{} sync: {:?}", ctx, e));
                 self.durable();
             }
             77 => {
                 if let Some(f) = self.some_file() {
-                    self.fs.fsync(f).unwrap();
+                    self.fs
+                        .fsync(f)
+                        .unwrap_or_else(|e| panic!("{} fsync: {:?}", ctx, e));
                     if tracing() {
                         eprintln!(
                             "{} fsync {} ({} bytes)",
@@ -1365,6 +1369,21 @@ impl Run {
             });
         self.received.push((got, self.model.clone()));
         self.last_sent = Some(snap);
+        // The receiving side keeps the last few, as a backup would, or a
+        // long run fills it.
+        let ctx = self.ctx();
+        let (_, rfs, _) = self.recv.as_mut().unwrap();
+        while self.received.len() > 4 {
+            let (old, _) = self.received.remove(0);
+            let info = rfs
+                .list_subvolumes()
+                .unwrap()
+                .into_iter()
+                .find(|i| i.root == old)
+                .expect("received snapshot listed");
+            rfs.delete_subvolume(info.dir, &info.name)
+                .unwrap_or_else(|e| panic!("{} delete received: {:?}", ctx, e));
+        }
     }
 
     fn op_delete_snapshot(&mut self) {
