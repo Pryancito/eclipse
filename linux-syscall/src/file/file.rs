@@ -2758,9 +2758,70 @@ impl Syscall<'_> {
     pub fn sys_fstatfs(&self, fd: FileDesc, mut buf: UserOutPtr<StatFs>) -> SysResult {
         info!("statfs: fd={:?}, buf={:?}", fd, buf);
 
-        let file = self.linux_process().get_file(fd)?;
-        buf.write(statfs_at(&file.inode(), file.path()))?;
+        // Every descriptor is on a filesystem: one with no path, a pipe, a
+        // socket or an anonymous object, is on the pseudo filesystem its
+        // name says. Only a `File` used to answer, so a socket or an eventfd
+        // was `EBADF` and a pipe said whatever its inode's filesystem was.
+        let file_like = self.linux_process().get_file_like(fd)?;
+        let statfs = match pseudo_fs_of(&file_like.link_name()) {
+            Some(magic) => pseudo_statfs(magic),
+            None => match file_like.downcast_arc::<File>() {
+                Ok(file) => {
+                    // An end of a FIFO is on no filesystem; its node is,
+                    // and the path it was opened by names that node.
+                    let inode = file.inode();
+                    let node = inode.downcast_ref::<Pipe>().and_then(Pipe::fifo_node);
+                    statfs_at(&node.unwrap_or(inode), file.path())
+                }
+                Err(_) => pseudo_statfs(ANON_INODE_FS_MAGIC),
+            },
+        };
+        buf.write(statfs)?;
         Ok(0)
+    }
+}
+
+/// `include/uapi/linux/magic.h`: the pseudo filesystems a descriptor with no
+/// path is kept on.
+const PIPEFS_MAGIC: u64 = 0x5049_5045;
+const SOCKFS_MAGIC: u64 = 0x534F_434B;
+const ANON_INODE_FS_MAGIC: u64 = 0x0904_1934;
+const DMA_BUF_MAGIC: u64 = 0x444D_4142;
+
+/// The pseudo filesystem a descriptor is on, read from the name Linux gives
+/// it (`d_dname`), which each of them makes up: `pipe:[N]` on pipefs,
+/// `socket:[N]` on sockfs, `anon_inode:...` on anon_inodefs and `/dmabuf:`
+/// on dma-buf's. Anything else has a path, and is on what the path is on.
+fn pseudo_fs_of(link_name: &str) -> Option<u64> {
+    [
+        ("pipe:[", PIPEFS_MAGIC),
+        ("socket:[", SOCKFS_MAGIC),
+        ("anon_inode:", ANON_INODE_FS_MAGIC),
+        ("/dmabuf:", DMA_BUF_MAGIC),
+    ]
+    .iter()
+    .find(|(prefix, _)| link_name.starts_with(prefix))
+    .map(|&(_, magic)| magic)
+}
+
+/// `simple_statfs()`, which is all a pseudo filesystem answers: its magic, a
+/// page for the block and fragment sizes, `NAME_MAX`, and nothing counted.
+/// Mounted by the kernel with no flags, so `f_flags` is `ST_VALID` alone.
+fn pseudo_statfs(magic: u64) -> StatFs {
+    let info = FsInfo {
+        bsize: kernel_hal::PAGE_SIZE,
+        frsize: kernel_hal::PAGE_SIZE,
+        blocks: 0,
+        bfree: 0,
+        bavail: 0,
+        files: 0,
+        ffree: 0,
+        namemax: 255,
+        ftype: magic,
+    };
+    StatFs {
+        f_flags: linux_object::fs::ST_VALID as isize,
+        ..info.into()
     }
 }
 
@@ -2848,6 +2909,9 @@ mod setfl_pipe_direct_tests;
 
 #[cfg(test)]
 mod statfs_flags_tests;
+
+#[cfg(test)]
+mod statfs_pseudo_tests;
 
 #[cfg(test)]
 mod statfs_type_tests;

@@ -2457,7 +2457,9 @@ fn efi_dev_from_root_cmdline() -> Option<String> {
 }
 
 pub use mount_ops::{mount_fs, umount_fs};
-pub use mount_state::{check_umount_flags, MS_BIND, MS_MOVE, MS_REMOUNT, UMOUNT_NOFOLLOW};
+pub use mount_state::{
+    check_umount_flags, MS_BIND, MS_MOVE, MS_REMOUNT, ST_VALID, UMOUNT_NOFOLLOW,
+};
 
 /// VFS root for kernel services that need to read `/etc/*` (e.g. DNS/hosts).
 pub fn dns_vfs_root() -> Option<Arc<dyn INode>> {
