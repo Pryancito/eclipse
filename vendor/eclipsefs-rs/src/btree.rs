@@ -324,6 +324,12 @@ pub trait Space {
     /// One owner fewer for every block of a data range; blocks left without
     /// owners are freed.
     fn decref_data(&mut self, start: u64, len: u64) -> Result<()>;
+    /// Whether `n` more nodes can be allocated now (making room for them
+    /// if that is possible). A modification checks this first, so that it
+    /// fails on a full device before it changes anything.
+    fn node_room(&mut self, _n: u64) -> bool {
+        true
+    }
 }
 
 /// The data blocks a leaf item references, if any (`(first block, count)`).
@@ -1204,11 +1210,21 @@ impl Store {
             }
         }
         // Fail before copying anything when the key says so.
-        let present = self.get(root, &key)?.is_some();
-        match (&op, present) {
-            (Op::Insert(_), true) => return Err(Error::Exists),
-            (Op::Update(_) | Op::Delete, false) => return Err(Error::NotFound),
+        let old_len = self.get(root, &key)?.map(|d| d.len());
+        match (&op, old_len) {
+            (Op::Insert(_), Some(_)) => return Err(Error::Exists),
+            (Op::Update(_) | Op::Delete, None) => return Err(Error::NotFound),
             _ => {}
+        }
+        // Or when the device cannot hold the nodes it may take: a split
+        // that fails half-way would leave the change in an overfull node.
+        let grows = match (&op, old_len) {
+            (Op::Delete, _) => false,
+            (Op::Insert(d) | Op::Update(d) | Op::Upsert(d), old) => old.is_none_or(|l| d.len() > l),
+        };
+        let need = self.nodes_needed(sp, root, &key, grows)?;
+        if !sp.node_room(need) {
+            return Err(Error::NoSpace);
         }
         let new_root = self.cow(sp, root.bytenr, root.level)?;
         // The copied path is a valid tree even if the change below fails.
@@ -1263,6 +1279,35 @@ impl Store {
             }
         }
         Ok(out.old)
+    }
+
+    /// Most nodes a modification at `key` allocates: a copy of each node on
+    /// the path that is not already a private copy of this transaction,
+    /// plus, when the item grows, a split at every level and a new root.
+    /// (Merges after a shrink are skipped when there is no room for them.)
+    fn nodes_needed(&mut self, sp: &dyn Space, root: &Root, key: &Key, grows: bool) -> Result<u64> {
+        let mut need = 0;
+        let (mut b, mut level, mut gen) = (root.bytenr, root.level, None);
+        loop {
+            self.load(b, level, gen)?;
+            if !self.dirty.contains(&b) || sp.refs(b) > 1 {
+                need += 1;
+            }
+            match &self.cache[&b].body {
+                Body::Leaf(_) => break,
+                Body::Internal(ptrs) => {
+                    let i = ptrs.partition_point(|p| p.key <= *key).saturating_sub(1);
+                    b = ptrs[i].bytenr;
+                    gen = Some(ptrs[i].gen);
+                    level = level.checked_sub(1).ok_or(Error::Corrupt("tree level"))?;
+                }
+            }
+        }
+        let levels = root.level as u64 + 1;
+        if grows {
+            need += levels + 1;
+        }
+        Ok(need)
     }
 
     /// The pointers of the cached internal node `b`, which the caller has
@@ -1322,7 +1367,12 @@ impl Store {
             }
         }
         if out.underfull {
-            self.merge_child(sp, b, level, idx)?;
+            // Merging copies the sibling first, before it changes anything:
+            // on a full device the node just stays underfull.
+            match self.merge_child(sp, b, level, idx) {
+                Err(Error::NoSpace) => {}
+                r => r?,
+            }
         }
         let node = &self.cache[&b];
         let split = if node.fits() {

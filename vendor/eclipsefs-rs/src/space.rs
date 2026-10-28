@@ -264,9 +264,12 @@ pub struct BlockSpace {
 }
 
 /// Blocks kept back for metadata on a filesystem of `total` blocks: 1/64 of
-/// it, between 16 and 8192 (32 MiB).
+/// it, between 16 and 8192 (32 MiB). Small filesystems keep at least 64
+/// (or an eighth of themselves): a quarter of the reserve is what a commit
+/// has left on a full device, and a commit copies a few nodes of every
+/// tree it touches.
 pub fn metadata_reserve(total: u64) -> u64 {
-    (total / 64).clamp(16, 8192)
+    (total / 64).max(64.min(total / 8)).clamp(16, 8192)
 }
 
 impl BlockSpace {
@@ -411,6 +414,15 @@ impl BlockSpace {
         }
     }
 
+    /// Free blocks a new tree node may take now (any free block on one
+    /// device, the metadata chunks' on a volume).
+    pub fn node_free(&self) -> u64 {
+        match self.vol {
+            None => self.alloc.free_blocks(),
+            Some(_) => self.meta_free(),
+        }
+    }
+
     /// Free blocks metadata may take.
     pub fn meta_free(&self) -> u64 {
         self.alloc.free_in(ChunkKind::Metadata) + self.alloc.free_in(ChunkKind::Mixed)
@@ -547,6 +559,18 @@ impl Space for BlockSpace {
 
     fn refs(&self, bytenr: u64) -> u32 {
         self.refs.get(bytenr)
+    }
+
+    fn node_room(&mut self, n: u64) -> bool {
+        loop {
+            if self.node_free() >= n {
+                return true;
+            }
+            if !self.grow_on(ChunkKind::Metadata, self.target()) && !self.grow(ChunkKind::Metadata)
+            {
+                return false;
+            }
+        }
     }
 
     fn incref(&mut self, start: u64, len: u64) -> Result<()> {

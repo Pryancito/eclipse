@@ -214,6 +214,27 @@ pub struct CowFs {
 }
 
 /// File blocks among `from..to` that `exts` map.
+/// The counts of `refs` with neighbouring entries of the same count
+/// joined: the form the reference tree holds them in.
+fn merged_refs(refs: &RefMap) -> BTreeMap<u64, (u64, u32)> {
+    let mut out: BTreeMap<u64, (u64, u32)> = BTreeMap::new();
+    let mut last: Option<(u64, u64, u32)> = None;
+    for (s, l, c) in refs.entries() {
+        match &mut last {
+            Some((ls, ll, lc)) if *ls + *ll == s && *lc == c => *ll += l,
+            _ => {
+                if let Some((ls, ll, lc)) = last.replace((s, l, c)) {
+                    out.insert(ls, (ll, lc));
+                }
+            }
+        }
+    }
+    if let Some((s, l, c)) = last {
+        out.insert(s, (l, c));
+    }
+    out
+}
+
 fn covered(exts: &[Ext], from: u64, to: u64) -> u64 {
     exts.iter()
         .map(|e| (e.lblk + e.blocks).min(to).saturating_sub(e.lblk.max(from)))
@@ -706,6 +727,12 @@ impl CowFs {
 
     /// Start of every mutating call.
     fn writable(&mut self) -> Result<()> {
+        self.writable_to(self.sp.reserve / 4)
+    }
+
+    /// [`writable`](Self::writable), leaving `keep` free blocks for tree
+    /// nodes to the commit.
+    fn writable_to(&mut self, keep: u64) -> Result<()> {
         if self.read_only {
             return Err(Error::Unsupported("read-only filesystem"));
         }
@@ -715,6 +742,18 @@ impl CowFs {
             && self.sp.alloc.free_blocks() < deferred.max(self.sp.alloc.total_blocks() / 16)
         {
             self.flush()?;
+        }
+        // The last quarter of the metadata reserve is the commit's: an
+        // operation that frees nothing (blocks a snapshot still holds) or
+        // frees only at the commit copies tree nodes all the same, and once
+        // a commit has no nodes left nothing can be freed ever again.
+        if !self.nested && self.sp.node_free() < keep && !self.sp.meta_headroom() {
+            if self.sp.alloc.deferred_blocks() > 0 {
+                self.flush()?;
+            }
+            if self.sp.node_free() < keep {
+                return Err(Error::NoSpace);
+            }
         }
         Ok(())
     }
@@ -757,34 +796,34 @@ impl CowFs {
         self.store_csums()?;
         // Reference counts into the reference tree.
         if self.sp.refs_dirty {
-            let old: BTreeMap<u64, (u64, u32)> = self
+            // `refs_on_disk` is exactly what the tree holds, entry for
+            // entry; the tree gets the counts in merged form. Updating the
+            // tree copies and frees its nodes, and a count changed next to
+            // a run splits or joins entries of `sp.refs`, so its form may
+            // move under the loop: go again until the tree has caught up
+            // (it did not, and the next commit found entries the tree did
+            // not have, or missed ones it did: `Exists`/`NotFound` from
+            // every commit from then on).
+            let mut written: BTreeMap<u64, (u64, u32)> = self
                 .refs_on_disk
                 .entries()
                 .map(|(s, l, c)| (s, (l, c)))
                 .collect();
-            let new: BTreeMap<u64, (u64, u32)> = self
-                .sp
-                .refs
-                .entries()
-                .map(|(s, l, c)| (s, (l, c)))
-                .collect();
-            for (s, v) in &old {
-                if new.get(s) != Some(v) {
-                    self.st
-                        .delete(&mut self.sp, &mut self.refs_root, Key::new(*s, REF_ITEM, 0))?;
+            for round in 0.. {
+                let new = merged_refs(&self.sp.refs);
+                if new == written {
+                    break;
                 }
-            }
-            for (s, (l, c)) in &new {
-                if old.get(s) != Some(&(*l, *c)) {
-                    self.st.insert(
-                        &mut self.sp,
-                        &mut self.refs_root,
-                        Key::new(*s, REF_ITEM, 0),
-                        encode_ref(*l, *c),
-                    )?;
+                if round == 8 {
+                    return Err(Error::Corrupt("reference counts keep changing"));
                 }
+                // `written` follows the tree item by item, so that a commit
+                // failing in here leaves `refs_on_disk` true to the tree.
+                let r = self.sync_refs(&mut written, &new);
+                self.refs_on_disk =
+                    RefMap::from_entries(written.iter().map(|(&s, &(l, c))| (s, l, c)))?;
+                r?;
             }
-            self.refs_on_disk = self.sp.refs.clone();
         }
         self.store_chunk_map()?;
         // Tree roots into the root tree.
@@ -866,6 +905,36 @@ impl CowFs {
             }
         }
         r
+    }
+
+    /// Make the reference tree, which holds `written`, hold `new`.
+    fn sync_refs(
+        &mut self,
+        written: &mut BTreeMap<u64, (u64, u32)>,
+        new: &BTreeMap<u64, (u64, u32)>,
+    ) -> Result<()> {
+        let stale: Vec<u64> = written
+            .iter()
+            .filter(|(s, v)| new.get(s) != Some(v))
+            .map(|(&s, _)| s)
+            .collect();
+        for s in stale {
+            self.st
+                .delete(&mut self.sp, &mut self.refs_root, Key::new(s, REF_ITEM, 0))?;
+            written.remove(&s);
+        }
+        for (&s, &(l, c)) in new {
+            if let alloc::collections::btree_map::Entry::Vacant(e) = written.entry(s) {
+                self.st.insert(
+                    &mut self.sp,
+                    &mut self.refs_root,
+                    Key::new(s, REF_ITEM, 0),
+                    encode_ref(l, c),
+                )?;
+                e.insert((l, c));
+            }
+        }
+        Ok(())
     }
 
     /// The chunk map into group 0 (through the journal, with the
@@ -967,20 +1036,23 @@ impl CowFs {
     /// of tens of GB holds millions of freed blocks, and the copy alone was
     /// a contiguous allocation of tens of MiB.
     fn store_csums(&mut self) -> Result<()> {
-        let freed = core::mem::take(&mut self.sp.csums_freed);
-        for (start, len) in freed.iter() {
+        // A range leaves `csums_freed` once its buckets are edited, so a
+        // commit that fails part-way (no node left) does the rest the next
+        // time instead of leaving checksums of freed blocks behind.
+        loop {
+            let first = self.sp.csums_freed.iter().next();
+            let Some((start, len)) = first else {
+                break;
+            };
             let end = start + len;
-            let mut bucket = start / CSUM_BUCKET * CSUM_BUCKET;
-            while bucket < end {
-                let from = start.max(bucket);
-                let to = end.min(bucket + CSUM_BUCKET);
-                self.edit_csum_bucket(bucket, |cb| {
-                    for b in from..to {
-                        cb.0[(b - bucket) as usize] = None;
-                    }
-                })?;
-                bucket += CSUM_BUCKET;
-            }
+            let bucket = start / CSUM_BUCKET * CSUM_BUCKET;
+            let to = end.min(bucket + CSUM_BUCKET);
+            self.edit_csum_bucket(bucket, |cb| {
+                for b in start..to {
+                    cb.0[(b - bucket) as usize] = None;
+                }
+            })?;
+            self.sp.csums_freed.remove(start, to - start);
         }
         while let Some(&first) = self.sp.csums.keys().next() {
             let bucket = first / CSUM_BUCKET * CSUM_BUCKET;
@@ -1660,6 +1732,12 @@ impl CowFs {
         let nocow = inode.flags & FL_NOCOW as u64 != 0;
         let keys = self.file_keys(ino, inode)?;
         while lb < last {
+            // Every run takes tree items (and checksums at the commit); the
+            // commit needs nodes of its own to free anything again, so a
+            // write that has run the metadata reserve down stops short.
+            if written_to > off && !self.sp.meta_headroom() {
+                break;
+            }
             let chunk_end = (lb + WRITE_CHUNK).min(last);
             let exts = self.extents(ino, lb, chunk_end)?;
             // The extent covering `lb`, if any.
@@ -1762,6 +1840,12 @@ impl CowFs {
             let mut lb = first;
             while end / BS >= lb + ZCHUNK {
                 let at = (lb * BS - off) as usize;
+                // As in `write_plain`: stop short before the metadata
+                // reserve runs out.
+                if lb * BS > off && !self.sp.meta_headroom() {
+                    inode.size = inode.size.max(lb * BS);
+                    return Ok(at);
+                }
                 let chunk = &data[at..at + (ZCHUNK * BS) as usize];
                 if !self.write_packed(ino, inode, lb, chunk, algo)? {
                     // Incompressible: as it is.
@@ -1925,13 +2009,27 @@ impl CowFs {
         let Some(d) = self.inline_data(ino)? else {
             return Ok(());
         };
-        self.delete(Self::ext_key(ino, 0))?;
-        inode.nbytes = 0;
+        // The block goes where the inline item is now (same key), so the
+        // item is deleted first: check the block is there before that, and
+        // put the item back if the write fails all the same, or a full
+        // device turns the file's first bytes into a hole.
+        if !d.is_empty() && !self.sp.ensure_data_room(1) {
+            return Err(Error::NoSpace);
+        }
+        let key = Self::ext_key(ino, 0);
+        let item = self.delete(key)?;
+        let nbytes = core::mem::replace(&mut inode.nbytes, 0);
         if !d.is_empty() {
             let size = inode.size;
-            let n = self.write_extents(ino, inode, 0, &d)?;
+            let r = self.write_extents(ino, inode, 0, &d);
             inode.size = size;
-            (n == d.len()).then_some(()).ok_or(Error::NoSpace)?;
+            if !matches!(r, Ok(n) if n == d.len()) {
+                if self.items_of(ino, EXTENT_DATA, 1)?.is_empty() {
+                    self.insert(key, item)?;
+                    inode.nbytes = nbytes;
+                }
+                return Err(r.err().unwrap_or(Error::NoSpace));
+            }
         }
         Ok(())
     }
@@ -2320,9 +2418,21 @@ impl CowFs {
         let mut i = self.inode(ino)?;
         let r = self.write_data(ino, &mut i, 0, target);
         self.put_inode(ino, i)?;
-        let n = r?;
-        self.commit()?;
-        (n == target.len()).then_some(ino).ok_or(Error::NoSpace)
+        match r {
+            Ok(n) if n == target.len() => {
+                self.commit()?;
+                Ok(ino)
+            }
+            r => {
+                // Out of space part-way: the link must not stay behind
+                // with its target cut short (or empty).
+                let disk = self.disk_name(dir, name, encrypt::NameUse::Find)?;
+                self.remove_entry(dir, &disk)?;
+                self.drop_link(dir, ino)?;
+                self.commit()?;
+                Err(r.err().unwrap_or(Error::NoSpace))
+            }
+        }
     }
 
     fn write_symlink_l(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
@@ -2543,9 +2653,7 @@ impl CowFs {
             FileKind::Regular => {}
             _ => return Err(Error::Invalid),
         }
-        offset
-            .checked_add(data.len() as u64)
-            .ok_or(Error::Invalid)?;
+        crate::file_end(offset, data.len() as u64)?;
         // Append-only files only grow at the end.
         permit(immutable(&i) || frozen(&i) && offset != i.size)?;
         let (from, to) = (offset / BS, (offset + data.len() as u64).div_ceil(BS));
@@ -2577,6 +2685,7 @@ impl CowFs {
         if i.size == new_size {
             return Ok(());
         }
+        crate::file_end(new_size, 0)?;
         let r = self.truncate_data(ino, &mut i, new_size);
         let now = self.now();
         i.mtime = now;
@@ -2822,13 +2931,20 @@ impl CowFs {
     pub fn delete_subvolume(&mut self, dir: u64, name: &str) -> Result<()> {
         let name = check_name(name)?;
         let d = self.at_rw(dir)?;
-        self.writable()?;
+        // Deleting a snapshot is how a device full of shared blocks gets
+        // space back: it may dig further into the commit's nodes than other
+        // calls, and commits at once when space is short.
+        self.writable_to(self.sp.reserve / 8)?;
         let e = self.dir_lookup(d, name)?.ok_or(Error::NotFound)?;
         if !is_link(e.ino) {
             return Err(Error::Invalid);
         }
         permit(frozen(&self.inode(d)?))?;
-        self.drop_subvol(d, name, split(e.ino).0)
+        self.drop_subvol(d, name, split(e.ino).0)?;
+        if !self.sp.meta_headroom() {
+            self.flush()?;
+        }
+        Ok(())
     }
 
     /// Remove entry `dir`/`name` of the current subvolume, which names
@@ -2960,7 +3076,7 @@ impl CowFs {
             len
         };
         let s_end = src_off.checked_add(len).ok_or(Error::Invalid)?;
-        let d_end = dst_off.checked_add(len).ok_or(Error::Invalid)?;
+        let d_end = crate::file_end(dst_off, len)?;
         if s_end > si.size || !src_off.is_multiple_of(BS) || !dst_off.is_multiple_of(BS) {
             return Err(Error::Invalid);
         }
@@ -3841,7 +3957,7 @@ impl CowFs {
         if len == 0 || punch && (!keep || zero) {
             return Err(Error::Invalid);
         }
-        let end = offset.checked_add(len).ok_or(Error::Invalid)?;
+        let end = crate::file_end(offset, len)?;
         let ino = self.at_rw(h)?;
         // Punching a hole gives space back, so it may use the last of it.
         if punch {
@@ -3860,6 +3976,15 @@ impl CowFs {
             let (from, to) = (offset / BS, end.div_ceil(BS));
             let holes = to - from - self.mapped(ino, from, to)?;
             self.charge(holes)?;
+            // Zeroing punches the range first and then preallocates all of
+            // it again (freed blocks only come back at the commit): without
+            // room for that, it must fail before the data is gone.
+            if !self
+                .sp
+                .ensure_data_room(if zero { to - from + 2 } else { holes })
+            {
+                return Err(Error::NoSpace);
+            }
         }
         let r = (|| {
             if self.inline_data(ino)?.is_some() {
@@ -3894,7 +4019,13 @@ impl CowFs {
         let first = off.div_ceil(BS);
         let last = end / BS;
         let size = i.size;
-        // Partial blocks at the edges get zeros written.
+        // Partial blocks at the edges get zeros written, each to a new
+        // block: check those are there before changing anything.
+        let edges = u64::from(!off.is_multiple_of(BS))
+            + u64::from(!end.is_multiple_of(BS) && end / BS != off / BS);
+        if edges > 0 && !self.sp.ensure_data_room(edges) {
+            return Err(Error::NoSpace);
+        }
         let head_end = (first * BS).min(end);
         if off < head_end {
             let z = vec![0u8; (head_end - off) as usize];
@@ -4104,9 +4235,7 @@ impl CowFs {
         }
         let ino = self.at_rw(h)?;
         self.growable()?;
-        let end = offset
-            .checked_add(data.len() as u64)
-            .ok_or(Error::Invalid)?;
+        let end = crate::file_end(offset, data.len() as u64)?;
         // Every block of the range is rewritten, plus the inline data a
         // small file may have to move out.
         let need = end.div_ceil(BS) - offset / BS + 1;

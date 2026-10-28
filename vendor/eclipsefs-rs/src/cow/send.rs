@@ -601,7 +601,7 @@ impl CowFs {
                 let off = r.u64()?;
                 let data = r.rest();
                 let mut i = self.file(ino)?;
-                off.checked_add(data.len() as u64).ok_or(BAD)?;
+                crate::file_end(off, data.len() as u64).map_err(|_| BAD)?;
                 let n = self.write_data(ino, &mut i, off, data)?;
                 self.put_inode(ino, i)?;
                 (n == data.len()).then_some(()).ok_or(Error::NoSpace)?;
@@ -615,6 +615,8 @@ impl CowFs {
                 if [off, len, src_off].iter().any(|v| v % BS != 0) || len == 0 {
                     return Err(BAD);
                 }
+                crate::file_end(off, len).map_err(|_| BAD)?;
+                crate::file_end(src_off, len).map_err(|_| BAD)?;
                 let (d0, s0, n) = (off / BS, src_off / BS, len / BS);
                 if src == ino && d0 < s0 + n && s0 < d0 + n {
                     return Err(BAD);
@@ -643,7 +645,7 @@ impl CowFs {
                         i.nbytes = 0;
                     }
                 } else {
-                    let end = off.checked_add(len).ok_or(BAD)?;
+                    let end = crate::file_end(off, len).map_err(|_| BAD)?;
                     self.unmap(ino, &mut i, off / BS, end.div_ceil(BS))?;
                 }
                 self.put_inode(ino, i)?;
@@ -652,7 +654,7 @@ impl CowFs {
                 let ino = r.ino()?;
                 let off = r.u64()?;
                 let len = r.u64()?;
-                let end = off.checked_add(len).ok_or(BAD)?;
+                let end = crate::file_end(off, len).map_err(|_| BAD)?;
                 let mut i = self.file(ino)?;
                 if self.inline_data(ino)?.is_some() {
                     self.uninline(ino, &mut i)?;
@@ -695,6 +697,7 @@ impl CowFs {
                 if new.kind() != i.kind() {
                     return Err(BAD);
                 }
+                crate::file_end(new.size, 0).map_err(|_| BAD)?;
                 if i.kind() == FileKind::Regular || i.kind() == FileKind::Symlink {
                     self.truncate_data(ino, &mut i, new.size)?;
                 }
