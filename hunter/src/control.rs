@@ -16,7 +16,7 @@
 //!
 //! | Directive                               | Effect                                        |
 //! |-----------------------------------------|-----------------------------------------------|
-//! | `mode <domain> <off\|report\|enforce>`  | domain is `syscall`, `wx`, `exec`, `anomaly`, `integrity` |
+//! | `mode <domain> <off\|report\|enforce>`  | domain is `syscall`, `wx`, `exec`, `anomaly`, `integrity`, `av` |
 //! | `learning <on\|off>`                    | exec trust-on-first-use                       |
 //! | `anomaly-detection <on\|off>`           | per-process flood / fork-bomb heuristics      |
 //! | `privileged-deny <on\|off>`             | block module/ptrace/bpf/... under `anomaly=enforce` |
@@ -25,6 +25,7 @@
 //! | `untrusted <dir/>`                      | add a world-writable location                 |
 //! | `hash <sha256> <path>`                  | pin a program's SHA-256 (see [`crate::integrity`]) |
 //! | `require-hash <on\|off>`                | an unpinned program is an integrity violation |
+//! | `signature <hash\|bytes>:<data>:<Name>` | add an antivirus signature (see [`crate::av`]) |
 //! | `seal`                                  | engage the one-way tighten-only latch         |
 //!
 //! A trailing `/` makes `trust` / `deny` a directory prefix, exactly as in
@@ -54,6 +55,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::av;
 use crate::event_log::{record, Severity};
 use crate::heuristics;
 use crate::integrity::{self, Digest};
@@ -67,6 +69,7 @@ pub enum Domain {
     Exec,
     Anomaly,
     Integrity,
+    Av,
 }
 
 /// One parsed line of the control language.
@@ -81,6 +84,7 @@ pub enum Directive {
     Untrusted(String),
     Hash(Digest, String),
     RequireHash(bool),
+    Signature(av::Signature),
     Seal,
 }
 
@@ -155,6 +159,18 @@ pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
                 None => return Err(String::from("'hash' takes '<sha256> <path>'")),
             }
         }
+        "signature" => {
+            // The rest of the line is one `/etc/hunter/signatures` line.
+            let rest = line["signature".len()..].trim_start();
+            match av::parse_signature(rest)? {
+                Some(sig) => Directive::Signature(sig),
+                None => {
+                    return Err(String::from(
+                        "'signature' takes '<hash|bytes>:<data>:<Name>'",
+                    ))
+                }
+            }
+        }
         "require-hash" => {
             arity(2)?;
             Directive::RequireHash(parse_switch(words[1])?)
@@ -189,8 +205,9 @@ fn parse_domain(word: &str) -> Result<Domain, String> {
         "exec" => Ok(Domain::Exec),
         "anomaly" => Ok(Domain::Anomaly),
         "integrity" => Ok(Domain::Integrity),
+        "av" => Ok(Domain::Av),
         other => Err(format!(
-            "unknown domain '{}' (syscall, wx, exec, anomaly, integrity)",
+            "unknown domain '{}' (syscall, wx, exec, anomaly, integrity, av)",
             other
         )),
     }
@@ -251,6 +268,7 @@ pub fn apply(d: &Directive) {
         Directive::Mode(Domain::Exec, m) => policy::set_exec_mode(*m),
         Directive::Mode(Domain::Anomaly, m) => policy::set_anomaly_mode(*m),
         Directive::Mode(Domain::Integrity, m) => policy::set_integrity_mode(*m),
+        Directive::Mode(Domain::Av, m) => policy::set_av_mode(*m),
         Directive::Learning(on) => policy::set_exec_learning(*on),
         Directive::AnomalyDetection(on) => {
             if gate_switch("anomaly-detection", *on) {
@@ -269,6 +287,17 @@ pub fn apply(d: &Directive) {
         Directive::Untrusted(p) => policy::add_untrusted_exec_prefix(p.clone()),
         Directive::Hash(d, p) => integrity::add_exec_hash(p, *d),
         Directive::RequireHash(on) => integrity::set_require_hash(*on),
+        Directive::Signature(sig) => {
+            if av::add_signature(sig.clone()) {
+                record(
+                    0,
+                    Severity::Notice,
+                    "CONTROL",
+                    "CONFIG",
+                    format!("av signature added: {}", sig.name()),
+                );
+            }
+        }
         Directive::Seal => policy::seal_tighten_only(),
     }
 }
@@ -400,7 +429,7 @@ mod tests {
     fn the_shipped_example_is_inert_and_every_line_of_it_parses() {
         let example = include_str!("../../tools/hunterctl/policy.conf");
         assert_eq!(parse_script(example).unwrap(), vec![]);
-        const VERBS: [&str; 10] = [
+        const VERBS: [&str; 11] = [
             "mode",
             "learning",
             "anomaly-detection",
@@ -410,6 +439,7 @@ mod tests {
             "untrusted",
             "hash",
             "require-hash",
+            "signature",
             "seal",
         ];
         // `# mode wx report   # note` -> `mode wx report   # note`, which must

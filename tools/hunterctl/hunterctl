@@ -9,7 +9,7 @@
 #
 #   hunterctl [status]              modes, counters, lists (no event ring)
 #   hunterctl events                the full report, event ring included
-#   hunterctl mode <domain> <mode>  domain: syscall|wx|exec|anomaly|integrity
+#   hunterctl mode <domain> <mode>  domain: syscall|wx|exec|anomaly|integrity|av
 #                                   mode:   off|report|enforce
 #   hunterctl learning <on|off>
 #   hunterctl anomaly-detection <on|off>
@@ -22,12 +22,26 @@
 #   hunterctl hash <file>...        pin the SHA-256 of programs (live + /etc/hunter/hashes)
 #   hunterctl require-hash <on|off> unpinned programs are integrity violations
 #   hunterctl verify                check the files on disk against /etc/hunter/hashes
-#   hunterctl lockdown              enforce exec + integrity, learning off, seal
+#   hunterctl scan [--quarantine] <path>...
+#                                   antivirus scan of files/trees (exit 1 if infected)
+#   hunterctl quarantine <file>...  move files into the quarantine and deny their paths
+#   hunterctl quarantined           list the quarantine
+#   hunterctl restore <sha256>      put a quarantined file back where it was
+#   hunterctl update-signatures     download the feeds in /etc/hunter/feeds
+#   hunterctl lockdown              enforce exec + integrity + av, learning off, seal
 #   hunterctl save-learned          append learned programs to the whitelist
 
 PROC=/proc/hunter
 WHITELIST=/etc/hunter/whitelist
 HASHES=/etc/hunter/hashes
+SCAN=/proc/hunter_scan
+QDIR=/var/lib/hunter/quarantine
+FEEDS=/etc/hunter/feeds
+SIGDIR=/etc/hunter/signatures.d
+# Paths per write to /proc/hunter_scan: each batch is scanned before the
+# write returns, and 256 paths stay well under the 1 MiB a write may carry.
+BATCH=256
+TAB=$(printf '\t')
 
 die() {
     echo "hunterctl: $*" >&2
@@ -131,8 +145,125 @@ lockdown)
     # it.
     send "mode exec enforce
 mode integrity enforce
+mode av enforce
 learning off
 seal"
+    ;;
+scan)
+    [ "$(id -u)" = 0 ] || die "must be root"
+    quarantine=0
+    if [ "${1:-}" = "--quarantine" ]; then
+        quarantine=1
+        shift
+    fi
+    [ $# -ge 1 ] || usage 1
+    [ -w "$SCAN" ] || die "$SCAN not found: this kernel's hunter has no antivirus"
+    list=$(mktemp) && out=$(mktemp) && batch=$(mktemp) || die "mktemp failed"
+    trap 'rm -f "$list" "$out" "$batch"' EXIT
+    find "$@" -type f > "$list" 2>/dev/null
+    total=$(wc -l < "$list")
+    i=1
+    while [ "$i" -le "$total" ]; do
+        sed -n "${i},$((i + BATCH - 1))p" "$list" > "$batch"
+        dd if="$batch" of="$SCAN" bs=1048576 count=1 2>/dev/null || die "scan write failed"
+        cat "$SCAN" >> "$out"
+        i=$((i + BATCH))
+    done
+    grep -E ' FOUND$|: ERROR ' "$out"
+    infected=$(grep -c ' FOUND$' "$out")
+    echo "hunterctl: scanned $total file(s), $infected infected"
+    if [ "$infected" -gt 0 ] && [ "$quarantine" = 1 ]; then
+        sed -n 's/: [^ ]* FOUND$//p' "$out" | while IFS= read -r f; do
+            "$0" quarantine "$f"
+        done
+    fi
+    [ "$infected" -eq 0 ]
+    ;;
+quarantine)
+    [ $# -ge 1 ] || usage 1
+    [ "$(id -u)" = 0 ] || die "must be root"
+    mkdir -p "$QDIR" && chmod 700 "$QDIR" || die "cannot create $QDIR"
+    for f in "$@"; do
+        real=$(readlink -f -- "$f") || die "cannot resolve $f"
+        [ -f "$real" ] || die "not a file: $f"
+        sum=$(sha256sum -- "$real" | cut -d' ' -f1)
+        mode=$(stat -c %a -- "$real")
+        mv -- "$real" "$QDIR/$sum" || die "cannot move $real"
+        chmod 000 "$QDIR/$sum"
+        printf '%s\t%s\t%s\t%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$sum" "$mode" "$real" >> "$QDIR/index"
+        # A copy dropped at the same path again must not run either. The
+        # blacklist lasts until reboot (hunter never forgets a deny).
+        send "deny $real"
+        echo "hunterctl: quarantined $real ($sum)"
+    done
+    ;;
+quarantined)
+    [ -r "$QDIR/index" ] || { echo "hunterctl: quarantine is empty"; exit 0; }
+    cat "$QDIR/index"
+    ;;
+restore)
+    [ $# -eq 1 ] || usage 1
+    [ "$(id -u)" = 0 ] || die "must be root"
+    line=$(grep -F "$TAB$1$TAB" "$QDIR/index" 2>/dev/null | tail -n 1)
+    [ -n "$line" ] && [ -e "$QDIR/$1" ] || die "no quarantined file $1"
+    mode=$(printf '%s\n' "$line" | cut -f3)
+    dest=$(printf '%s\n' "$line" | cut -f4-)
+    [ -e "$dest" ] && die "$dest exists; not overwriting it"
+    mv -- "$QDIR/$1" "$dest" && chmod "$mode" "$dest" || die "cannot restore to $dest"
+    grep -vF "$TAB$1$TAB" "$QDIR/index" > "$QDIR/index.new"; mv "$QDIR/index.new" "$QDIR/index"
+    echo "hunterctl: restored $dest (its path stays denied until reboot)"
+    ;;
+update-signatures)
+    [ "$(id -u)" = 0 ] || die "must be root"
+    [ -r "$FEEDS" ] || die "no $FEEDS"
+    mkdir -p "$SIGDIR"
+    raw=$(mktemp) && sigs=$(mktemp) && part=$(mktemp) || die "mktemp failed"
+    trap 'rm -f "$raw" "$sigs" "$part"' EXIT
+    # `<format> <name> <url>`: format `sigs` is hunter's own signature lines,
+    # `sha256` a list with one SHA-256 per line (first field), as abuse.ch's
+    # MalwareBazaar exports are.
+    grep -v '^[[:space:]]*\(#\|$\)' "$FEEDS" | while read -r format name url; do
+        case "$name" in
+            ''|*/*|.*) echo "hunterctl: bad feed name '$name'" >&2; continue ;;
+        esac
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --max-time 300 -o "$raw" "$url"
+        else
+            wget -q -T 300 -O "$raw" "$url"
+        fi || { echo "hunterctl: $name: download failed: $url" >&2; continue; }
+        case "$format" in
+            sigs)
+                grep -E '^(hash|bytes):' "$raw" > "$sigs" ;;
+            sha256)
+                awk -v n="$name" '!/^#/ && length($1) == 64 && $1 ~ /^[0-9a-fA-F]+$/ { print "hash:" tolower($1) ":" n }' "$raw" > "$sigs" ;;
+            *)
+                echo "hunterctl: $name: unknown feed format '$format'" >&2; continue ;;
+        esac
+        count=$(wc -l < "$sigs")
+        # An empty or broken download must not replace a feed that worked.
+        if [ "$count" -eq 0 ]; then
+            echo "hunterctl: $name: no signatures in the download; keeping the old feed" >&2
+            continue
+        fi
+        # Live, in batches the kernel takes whole: a batch with a line it
+        # cannot parse is refused entirely, and the feed is not installed.
+        ok=1
+        total=$count
+        i=1
+        while [ "$i" -le "$total" ]; do
+            sed -n "${i},$((i + 4999))p" "$sigs" | sed 's/^/signature /' > "$part"
+            dd if="$part" of="$PROC" bs=4194304 count=1 2>/dev/null || { ok=0; break; }
+            i=$((i + 5000))
+        done
+        if [ "$ok" = 1 ]; then
+            # Into a dot-file first (the kernel skips those), then renamed:
+            # a reboot halfway through finds the old feed or the new one.
+            cp "$sigs" "$SIGDIR/.$name.new" && mv "$SIGDIR/.$name.new" "$SIGDIR/$name"
+            echo "hunterctl: $name: $count signature(s)"
+        else
+            echo "hunterctl: $name: hunter rejected the feed; not installed" >&2
+        fi
+    done
     ;;
 save-learned)
     [ "$(id -u)" = 0 ] || die "must be root"

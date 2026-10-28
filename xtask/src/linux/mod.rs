@@ -866,10 +866,10 @@ impl LinuxRootfs {
     }
 
     /// hunter's operator side: `/sbin/hunterctl` (refreshed on every build, so
-    /// it never lags the kernel's control language) and an example
-    /// `/etc/hunter/policy.conf`, written only when absent so an operator's
-    /// policy survives a rebuild. Every line of the example is commented out:
-    /// an image that boots with it behaves exactly as one without it.
+    /// it never lags the kernel's control language), an example
+    /// `/etc/hunter/policy.conf` (every line commented out: an image that boots
+    /// with it behaves exactly as one without it), the antivirus database and
+    /// its feeds.
     fn install_hunter(rootfs: &Path) {
         let sbin = rootfs.join("sbin");
         fs::create_dir_all(&sbin).unwrap();
@@ -883,10 +883,16 @@ impl LinuxRootfs {
         }
         let etc_hunter = rootfs.join("etc/hunter");
         fs::create_dir_all(&etc_hunter).unwrap();
-        let conf = etc_hunter.join("policy.conf");
-        if !conf.exists() {
-            fs::copy(PROJECT_DIR.join("tools/hunterctl/policy.conf"), &conf).unwrap();
+        // Each written only when absent, so an operator's edits survive a
+        // rebuild: the example policy, the antivirus database (EICAR, so the
+        // scanner can be tested) and the signature feeds.
+        for name in ["policy.conf", "signatures", "feeds"] {
+            let dst = etc_hunter.join(name);
+            if !dst.exists() {
+                fs::copy(PROJECT_DIR.join("tools/hunterctl").join(name), &dst).unwrap();
+            }
         }
+        fs::create_dir_all(etc_hunter.join("signatures.d")).unwrap();
     }
 
     /// Lay down the base `/etc/passwd` and `/etc/group` so name lookups resolve.

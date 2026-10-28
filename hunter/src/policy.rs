@@ -183,6 +183,9 @@ const DEFAULT_ANOMALY_MODE: Mode = Mode::Report;
 /// Integrity starts in `Report`: with no hashes registered it checks nothing,
 /// and once an operator pins some it says so loudly before it blocks.
 const DEFAULT_INTEGRITY_MODE: Mode = Mode::Report;
+/// Antivirus starts in `Report`: a detection is recorded, not blocked, until
+/// the operator has seen what the signatures match on their system.
+const DEFAULT_AV_MODE: Mode = Mode::Report;
 /// Whether exec learning starts enabled (see [`EXEC_LEARN`]).
 const DEFAULT_EXEC_LEARN: bool = false;
 
@@ -191,6 +194,7 @@ static WX_MODE: AtomicU8 = AtomicU8::new(DEFAULT_WX_MODE.to_u8());
 static EXEC_MODE: AtomicU8 = AtomicU8::new(DEFAULT_EXEC_MODE.to_u8());
 static ANOMALY_MODE: AtomicU8 = AtomicU8::new(DEFAULT_ANOMALY_MODE.to_u8());
 static INTEGRITY_MODE: AtomicU8 = AtomicU8::new(DEFAULT_INTEGRITY_MODE.to_u8());
+static AV_MODE: AtomicU8 = AtomicU8::new(DEFAULT_AV_MODE.to_u8());
 
 /// One-way latch: once set, modes may only move towards stricter enforcement.
 static TIGHTEN_ONLY: AtomicBool = AtomicBool::new(false);
@@ -333,6 +337,15 @@ pub fn integrity_mode() -> Mode {
     Mode::from_u8(INTEGRITY_MODE.load(Ordering::SeqCst))
 }
 
+/// Sets the enforcement mode for the antivirus (signature scanning) domain.
+pub fn set_av_mode(mode: Mode) {
+    apply_mode(&AV_MODE, "av", mode);
+}
+/// Returns the current antivirus mode.
+pub fn av_mode() -> Mode {
+    Mode::from_u8(AV_MODE.load(Ordering::SeqCst))
+}
+
 /// Engages the one-way tighten-only latch: after this, no domain can be
 /// relaxed (only moved towards `Enforce`). Typically called once boot is done.
 pub fn seal_tighten_only() {
@@ -363,6 +376,7 @@ pub(crate) fn reset_for_test() {
     ANOMALY_MODE.store(DEFAULT_ANOMALY_MODE.to_u8(), Ordering::SeqCst);
     INTEGRITY_MODE.store(DEFAULT_INTEGRITY_MODE.to_u8(), Ordering::SeqCst);
     crate::integrity::reset_for_test();
+    AV_MODE.store(DEFAULT_AV_MODE.to_u8(), Ordering::SeqCst);
     EXEC_LEARN.store(DEFAULT_EXEC_LEARN, Ordering::SeqCst);
     TRUSTED_EXEC_PATHS.lock().clear();
     TRUSTED_EXEC_PREFIXES.lock().clear();
