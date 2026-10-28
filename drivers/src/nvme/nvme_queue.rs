@@ -579,4 +579,140 @@ mod queue_tests {
             assert_eq!(queue.next_cid(), 0);
         });
     }
+
+    // ── rings that do not fit in one page ───────────────────────────────────
+
+    #[test]
+    fn a_completion_ring_too_big_for_one_page_is_still_inside_what_was_taken() {
+        alone_with_the_allocator(|| {
+            // Both ring lengths are written out by hand -- 64 bytes per
+            // submission entry, 16 per completion -- and then rounded up to
+            // whole pages. Every queue in the suite until now was 128 entries
+            // or fewer, and there a completion ring is at most 2048 bytes:
+            // 8, 16 or 32 bytes per entry all round to the same single page,
+            // so the 16 could not be measured at all. The driver asks for 128
+            // today, but `new` is public and `MQES` may advertise far more.
+            let queue = NvmeQueue::<ProviderImpl>::new(1, 512).expect("a queue");
+            assert!(
+                queue.sq.len() * 64 <= queue.sq_len,
+                "the submission ring runs past the memory taken for it"
+            );
+            assert!(
+                queue.cq.len() * 16 <= queue.cq_len,
+                "the completion ring runs past the memory taken for it"
+            );
+            // And no more than those rings need: a ring sized too generously
+            // is contiguous DMA held per queue and never used.
+            assert_eq!(pages_asked(), pages_for(512));
+        });
+    }
+
+    // ── each region with its own length ─────────────────────────────────────
+
+    /// A `Provider` that remembers the address and the byte length of every
+    /// region it hands out and of every one it is given back, and is otherwise
+    /// [`ProviderImpl`].
+    ///
+    /// The counters in `host_hooks` sum PAGES, and the deallocation hook is
+    /// handed no address at all, so nothing in the suite could tell a region
+    /// freed with another region's length from a correct one as long as the
+    /// totals matched. The trait's contract is per region -- `size` is the
+    /// byte length that was asked for -- so the double records it per region.
+    struct Recording;
+
+    std::thread_local! {
+        static TAKEN: core::cell::RefCell<alloc::vec::Vec<(usize, usize)>> =
+            const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+        static GIVEN_BACK: core::cell::RefCell<alloc::vec::Vec<(usize, usize)>> =
+            const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+    }
+
+    impl Provider for Recording {
+        const PAGE_SIZE: usize = PAGE_SIZE;
+
+        fn alloc_dma(size: usize) -> (usize, usize) {
+            let answer = ProviderImpl::alloc_dma(size);
+            TAKEN.with(|t| t.borrow_mut().push((answer.0, size)));
+            answer
+        }
+
+        fn dealloc_dma(vaddr: usize, size: usize) {
+            GIVEN_BACK.with(|g| g.borrow_mut().push((vaddr, size)));
+            ProviderImpl::dealloc_dma(vaddr, size);
+        }
+    }
+
+    /// What the double has recorded on this thread since the last call, both
+    /// records emptied: a test reads its own calls whatever ran before it on
+    /// the same thread.
+    fn taken_and_given_back() -> (
+        alloc::vec::Vec<(usize, usize)>,
+        alloc::vec::Vec<(usize, usize)>,
+    ) {
+        (
+            TAKEN.with(|t| core::mem::take(&mut *t.borrow_mut())),
+            GIVEN_BACK.with(|g| core::mem::take(&mut *g.borrow_mut())),
+        )
+    }
+
+    #[test]
+    fn every_region_goes_back_with_the_address_and_the_length_it_came_with() {
+        alone_with_the_allocator(|| {
+            let _ = taken_and_given_back();
+            // 100 entries, so neither ring ends on a page boundary: the
+            // submission ring is 6400 bytes inside two pages and the
+            // completion ring 1600 inside one. A queue of 128 hides both
+            // halves of this -- there 64 bytes an entry comes to exactly two
+            // pages, and the two rings are then the same length as each other.
+            let queue = NvmeQueue::<Recording>::new(1, 100).expect("a queue");
+            let (mut took, nothing) = taken_and_given_back();
+            assert!(nothing.is_empty(), "nothing goes back while it is alive");
+            assert_eq!(took.len(), 4, "the bounce, the list and the two rings");
+            // Which region is which, and not merely four of them: the bounce
+            // buffer is 128 KiB and the PRP list one page, and a queue that
+            // took them the other way round would DMA 128 KiB of read-ahead
+            // through a single page.
+            assert!(
+                took.contains(&(queue.data_va, PAGE_SIZE * 32)),
+                "the bounce buffer is the 128 KiB region"
+            );
+            assert!(
+                took.contains(&(queue.prp_list_va, PAGE_SIZE)),
+                "the PRP list is the one-page region"
+            );
+
+            drop(queue);
+            let (nothing, mut gave) = taken_and_given_back();
+            assert!(nothing.is_empty(), "nothing is taken on the way out");
+            took.sort_unstable();
+            gave.sort_unstable();
+            assert_eq!(
+                gave, took,
+                "every region goes back at the address and the length it came with"
+            );
+        });
+    }
+
+    // ── what a caller is handed ─────────────────────────────────────────────
+
+    #[test]
+    fn the_whole_page_a_caller_is_given_comes_back_clean() {
+        alone_with_the_allocator(|| {
+            // Half a page costs a whole page, so what the caller is handed is
+            // a page -- and the zeroing has to cover the page, not the
+            // request. The only test that poisons a region until now asked for
+            // two pages exactly, where the two lengths are the same number.
+            // A ring that ends mid-page leaves the rest of that page readable
+            // by the device, and a completion queue is read by phase bit: one
+            // stale byte there is a completion the controller never posted.
+            shim::POISON_ALLOC.store(true, Ordering::SeqCst);
+            let (va, pa) = ProviderImpl::alloc_dma(PAGE_SIZE / 2);
+            assert_ne!(pa, 0, "a page is available");
+            let page = unsafe { core::slice::from_raw_parts(va as *const u8, PAGE_SIZE) };
+            assert!(
+                page.iter().all(|b| *b == 0),
+                "the tail of the page kept what its last owner left there"
+            );
+        });
+    }
 }
