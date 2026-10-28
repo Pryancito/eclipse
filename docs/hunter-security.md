@@ -21,6 +21,7 @@ testable on the host.
 | `check_elf_binary`         | boot-time spawn (`loader`)               | exec policy     |
 | `check_exec_path`          | `PT_INTERP` / `#!` interpreters          | exec policy     |
 | `check_exec_integrity`     | `sys_execve`, interpreters, boot spawn   | exec integrity  |
+| `check_exec_av`            | `sys_execve`, interpreters, boot spawn   | antivirus       |
 | `check_mmap`               | `sys_mmap`                               | W^X memory      |
 | `check_mprotect`           | `sys_mprotect`                           | W^X memory      |
 | `task_exit`                | `sys_exit_group`                         | state cleanup   |
@@ -42,6 +43,7 @@ There are three independently-tunable enforcement domains, each with its own
 | `exec`    | Executable path policy (untrusted/world-writable) | `Report`  |
 | `anomaly` | Block (vs. only log) detected floods / fork bombs | `Report`  |
 | `integrity` | SHA-256 of the image vs. its pinned digest      | `Report`  |
+| `av`      | Antivirus signatures matched on the image          | `Report`  |
 
 The defaults are deliberately conservative. The syscall domain is `Enforce`
 because whitelists are opt-in per process (no policy registered ⇒ permissive),
@@ -171,6 +173,7 @@ One directive per line; blank lines and `#` comments are ignored.
 | `untrusted <dir/>`                     | add a world-writable location                       |
 | `hash <sha256> <path>`                 | pin a program's SHA-256 (see below)                 |
 | `require-hash <on\|off>`               | an unpinned program is an integrity violation       |
+| `signature <hash\|bytes>:<data>:<Name>` | add an antivirus signature (never removable)       |
 | `seal`                                 | engage the one-way tighten-only latch               |
 
 **All or nothing.** A script (a whole `policy.conf`, or one `write(2)` to
@@ -205,7 +208,12 @@ hunterctl apply <file>          send a whole script (e.g. a new policy.conf)
 hunterctl hash <file>...        pin SHA-256 digests (live, and in /etc/hunter/hashes)
 hunterctl require-hash <on|off>
 hunterctl verify                sha256sum -c /etc/hunter/hashes
-hunterctl lockdown              exec + integrity enforce, learning off, seal
+hunterctl scan [--quarantine] <path>...   antivirus scan (exit 1 if infected)
+hunterctl quarantine <file>...  move into /var/lib/hunter/quarantine, deny the path
+hunterctl quarantined           list the quarantine
+hunterctl restore <sha256>      put a quarantined file back
+hunterctl update-signatures     download the feeds in /etc/hunter/feeds
+hunterctl lockdown              exec + integrity + av enforce, learning off, seal
 hunterctl save-learned          append learned programs to /etc/hunter/whitelist
 ```
 
@@ -276,6 +284,56 @@ the old image is torn down (so a refusal is an ordinary `EACCES`). Lists are
 asked of the name, and the resolved path is also checked against the
 blacklist and the untrusted locations. That means a symlink from a
 trusted-looking name to `/tmp/evil` no longer hides where the file is.
+
+## Antivirus (signatures)
+
+[`hunter::av`](../hunter/src/av.rs) is a classic signature engine. A
+signature is either the SHA-256 of a whole known-bad file
+(`hash:<sha256>:<Name>`) or a byte pattern found inside one
+(`bytes:<hex>:<Name>`). In a byte pattern `??` matches any byte; a pattern
+needs at least 4 fixed bytes and must start with one.
+
+**On access.** Every image the kernel is about to run is scanned before it is
+mapped: `execve`, the `PT_INTERP` dynamic linker, `#!` interpreters and
+boot-time spawns. The scan runs on the same VMO the loader maps, next to the
+integrity check. A match is a `WARN` under `mode av report` (the default) and
+a blocked exec (`EACCES`, `CRIT AV BLOCKED`) under `enforce`. With an empty
+database nothing is scanned. Verdicts are cached per image together with the
+database generation, so an unchanged binary is scanned once and scanned again
+after the database grows.
+
+**On demand.** `/proc/hunter_scan` (root only): write paths, one per line;
+each write is scanned before it returns, then reading gives `clamscan`-style
+results (`path: OK`, `path: <Name> FOUND`, `path: ERROR …`). `hunterctl scan
+/home /tmp` walks the trees and feeds it in batches. It prints only detections
+and errors plus a summary, and exits 1 if anything was found. A detection is
+also recorded as an `AV DETECT` event.
+
+**Quarantine.** `hunterctl quarantine <file>` (or `scan --quarantine`) moves
+the file to `/var/lib/hunter/quarantine/<sha256>` with mode `000`, logs its
+original path and mode in `index`, and adds the path to the exec blacklist, so
+a fresh copy dropped there will not run. `hunterctl restore <sha256>` puts the
+file back with its mode. The path stays denied until reboot, because hunter
+never forgets a deny.
+
+**Database and updates.** `/etc/hunter/signatures` (local; ships with the
+EICAR test signature) and every file in `/etc/hunter/signatures.d/` are
+loaded at boot. `hunterctl update-signatures` downloads each feed in
+`/etc/hunter/feeds` (`<format> <name> <url>`; formats `sha256` and `sigs`)
+with curl or wget. It loads the new signatures into the running kernel and,
+only if hunter accepted all of them, installs the feed as
+`signatures.d/<name>` (written to a dot-file, then renamed). An empty or
+failed download keeps the previous feed. The default feed is abuse.ch
+MalwareBazaar's list of malware SHA-256s from the last 48 hours. Schedule it
+with crond, e.g. `0 */6 * * * /sbin/hunterctl update-signatures`. Adding a
+signature only ever makes hunter stricter, so the tighten-only latch does not
+block updates.
+
+**Limits.** Hashes cover the whole file. Byte patterns are searched in the
+first 128 MiB of an image, and each pattern is a separate anchored pass, which
+fits the hundreds of patterns an operator curates rather than a commercial
+database. Shared libraries loaded later with `mmap(PROT_EXEC)` are not scanned
+yet; their bytes are only scanned on demand.
 
 ## Intrusion detection (heuristics)
 

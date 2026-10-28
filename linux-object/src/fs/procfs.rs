@@ -53,12 +53,12 @@ mod stat_tests;
 mod status;
 #[cfg(test)]
 mod zombie_tests;
-use hunter_proc::ProcHunterINode;
+use hunter_proc::{ProcHunterINode, ProcHunterScanINode};
 use present::proc_present_content;
 use smoltcp::wire::{IpAddress, IpCidr};
 use status::{proc_pid_status, proc_task_status};
 
-const PROC_ROOT_STATIC: [&str; 53] = [
+const PROC_ROOT_STATIC: [&str; 54] = [
     "net",
     "gpuready",
     "present",
@@ -81,6 +81,7 @@ const PROC_ROOT_STATIC: [&str; 53] = [
     "version",
     "perf",
     "hunter",
+    "hunter_scan",
     "filesystems",
     "gpudbg",
     "stalls",
@@ -792,6 +793,7 @@ impl INode for ProcRootINode {
             "version" => Ok(PROC_VERSION.clone()),
             "perf" => Ok(PROC_PERF_DIR.clone()),
             "hunter" => Ok(PROC_HUNTER.clone()),
+            "hunter_scan" => Ok(PROC_HUNTER_SCAN.clone()),
             "filesystems" => Ok(PROC_FILESYSTEMS.clone()),
             "gpudbg" => Ok(PROC_GPUDBG.clone()),
             "stalls" => Ok(PROC_STALLS.clone()),
@@ -4328,6 +4330,7 @@ lazy_static! {
         generate: proc_filesystems_content,
     });
     static ref PROC_HUNTER: Arc<dyn INode> = Arc::new(ProcHunterINode);
+    static ref PROC_HUNTER_SCAN: Arc<dyn INode> = Arc::new(ProcHunterScanINode);
     static ref PROC_NET_DEV: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 30,
         generate: proc_net_dev_content,

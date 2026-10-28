@@ -14,6 +14,7 @@
 //! | [`check_elf_binary`]  | `execve` / loader / interp  | exec integrity  |
 //! | [`check_mmap`]        | `mmap`                      | W^X memory      |
 //! | [`check_exec_integrity`] | `execve` / loader / interp | exec integrity (SHA-256) |
+//! | [`check_exec_av`]     | `execve` / loader / interp  | antivirus (signatures) |
 //! | [`check_mprotect`]    | `mprotect`                  | W^X memory      |
 //! | [`check_munmap`]      | `munmap`                    | W^X bookkeeping |
 //! | [`task_fork`]         | `fork` / `clone`            | policy lifecycle|
@@ -39,6 +40,7 @@ extern crate test;
 #[macro_use]
 extern crate log;
 
+pub mod av;
 pub mod clock;
 pub mod control;
 pub mod event_log;
@@ -50,6 +52,7 @@ pub mod wx;
 use alloc::format;
 use alloc::string::String;
 
+pub use av::check_exec_av;
 pub use clock::set_time_source;
 pub use event_log::{set_sink, Severity};
 pub use integrity::check_exec_integrity;
@@ -474,12 +477,13 @@ pub fn render_report() -> String {
         env!("CARGO_PKG_VERSION")
     ));
     out.push_str(&format!(
-        "enforcement: syscall={} wx={} exec={} anomaly={} integrity={}{}\n",
+        "enforcement: syscall={} wx={} exec={} anomaly={} integrity={} av={}{}\n",
         policy::syscall_mode().as_str(),
         policy::wx_mode().as_str(),
         policy::exec_mode().as_str(),
         policy::anomaly_mode().as_str(),
         policy::integrity_mode().as_str(),
+        policy::av_mode().as_str(),
         if policy::is_tighten_only() {
             " [tighten-only]"
         } else {
@@ -531,6 +535,14 @@ pub fn render_report() -> String {
         } else {
             "off"
         },
+    ));
+    let (av_hashes, av_patterns, av_hits) = av::stats();
+    out.push_str(&format!(
+        "av: signatures={} (hash={} bytes={}) detections={}\n",
+        av_hashes + av_patterns,
+        av_hashes,
+        av_patterns,
+        av_hits
     ));
     // Machine-readable dump of learned programs so a userspace helper can
     // persist them to /etc/hunter/whitelist (kernel never writes the FS).

@@ -7,6 +7,9 @@
 //! * `/etc/hunter/blacklist` — denied programs that must never run.
 //! * `/etc/hunter/hashes` — pinned SHA-256 digests, in `sha256sum` format
 //!   (`<sha256>  <path>`), so `sha256sum /bin/* > /etc/hunter/hashes` writes it.
+//! * `/etc/hunter/signatures` and `/etc/hunter/signatures.d/*` — the
+//!   antivirus database (`hash:<sha256>:<Name>` / `bytes:<hex>:<Name>`); the
+//!   directory is where `hunterctl update-signatures` puts its feeds.
 //! * `/etc/hunter/policy.conf` — a script in hunter's control language
 //!   (`mode exec enforce`, `learning off`, `seal`, ...; see
 //!   `hunter::control`), applied last so it can override the learning
@@ -45,7 +48,68 @@ pub fn load(root: &Arc<dyn INode>) {
     if n_hash > 0 {
         kernel_hal::klog_info!("hunter: pinned {} SHA-256 digests", n_hash);
     }
+    let mut n_sig = load_signatures(root, SIGNATURES_FILE);
+    // Downloaded feeds (`hunterctl update-signatures`), one file each.
+    if let Ok(dir) = root.lookup(SIGNATURES_DIR) {
+        let mut names = dir.list().unwrap_or_default();
+        names.sort();
+        for name in names.iter().filter(|n| !n.starts_with('.')) {
+            n_sig += load_signatures(root, &alloc::format!("{}/{}", SIGNATURES_DIR, name));
+        }
+    }
+    if n_sig > 0 {
+        kernel_hal::klog_info!("hunter: loaded {} antivirus signatures", n_sig);
+    }
     load_policy(root, POLICY_CONF);
+}
+
+/// The antivirus database (see `hunter::av`).
+const SIGNATURES_FILE: &str = "/etc/hunter/signatures";
+/// Downloaded signature feeds, one file per feed.
+const SIGNATURES_DIR: &str = "/etc/hunter/signatures.d";
+
+/// Reads `/etc/hunter/signatures` into the antivirus database, line by line:
+/// a bad line loses one signature, said by name, not the database.
+fn load_signatures(root: &Arc<dyn INode>, path: &str) -> usize {
+    let mut count = 0;
+    for_each_line(root, path, |i, line| {
+        match hunter::av::parse_signature(line) {
+            Ok(Some(sig)) => {
+                if hunter::av::add_signature(sig) {
+                    count += 1;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => kernel_hal::klog_info!("hunter: {}:{}: skipped: {}", path, i, e),
+        }
+    });
+    count
+}
+
+/// Calls `f(line_number, line)` for each UTF-8 line of the file at `path`
+/// (up to [`MAX_CONFIG_BYTES`]; a cut last line is dropped, a line that is not
+/// UTF-8 is skipped by number). A missing file has no lines.
+fn for_each_line(root: &Arc<dyn INode>, path: &str, mut f: impl FnMut(usize, &str)) {
+    let inode = match root.lookup(path) {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    let full_size = match inode.metadata() {
+        Ok(m) => m.size,
+        Err(_) => return,
+    };
+    let mut buf = vec![0u8; full_size.min(MAX_CONFIG_BYTES)];
+    let n = read_all(inode.as_ref(), &mut buf);
+    let mut lines: alloc::vec::Vec<&[u8]> = buf[..n].split(|b| *b == b'\n').collect();
+    if full_size > n && lines.last().map(|l| !l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    for (i, raw) in lines.into_iter().enumerate() {
+        match core::str::from_utf8(raw) {
+            Ok(line) => f(i + 1, line),
+            Err(_) => kernel_hal::klog_info!("hunter: {}:{}: skipped: not UTF-8", path, i + 1),
+        }
+    }
 }
 
 /// The operator's pinned digests (see `hunter::integrity`).
@@ -94,11 +158,14 @@ fn load_hashes(root: &Arc<dyn INode>, path: &str) -> usize {
 /// `names` are the program's paths, `vmo` the image the loader maps. Shared by
 /// `execve`, the `PT_INTERP` / `#!` interpreters and the boot-time spawn, so
 /// all of them hash the bytes that will actually run.
+///
+/// Two questions of the same bytes: is it the program that was pinned
+/// (`integrity`), and is it malware (`av`).
 pub fn appraise(names: &[&str], vmo: &zircon_object::vm::VmObject) -> bool {
     use zircon_object::object::KernelObject;
-    hunter::check_exec_integrity(names, vmo.id(), vmo.content_size(), &mut |off, buf| {
-        vmo.read(off, buf).is_ok()
-    })
+    let mut read = |off: usize, buf: &mut [u8]| vmo.read(off, buf).is_ok();
+    hunter::check_exec_integrity(names, vmo.id(), vmo.content_size(), &mut read)
+        && hunter::check_exec_av(names, vmo.id(), vmo.content_size(), &mut read)
 }
 
 /// The operator's stance: modes, learning, heuristics, extra entries, seal.
@@ -435,6 +502,29 @@ mod hunter_config_tests {
         let d = hunter::integrity::parse_hex(abc);
         assert_eq!(hunter::integrity::pinned("/a11/one"), d);
         assert_eq!(hunter::integrity::pinned("/a11/two"), d);
+    }
+
+    #[test]
+    fn signatures_load_from_the_file_and_from_every_feed() {
+        use rcore_fs::vfs::FileType;
+        let root = leaked_root();
+        let etc = root.create("etc", FileType::Dir, 0o755).unwrap();
+        let dir = etc.create("hunter", FileType::Dir, 0o755).unwrap();
+        let own = dir.create("signatures", FileType::File, 0o644).unwrap();
+        own.write_at(
+            0,
+            b"# local\nbytes:a12a12a12a12:Test.Local\nnot a signature\n",
+        )
+        .unwrap();
+        let feeds = dir.create("signatures.d", FileType::Dir, 0o755).unwrap();
+        let feed = feeds.create("bazaar", FileType::File, 0o644).unwrap();
+        feed.write_at(0, b"bytes:a12a12a12a13:Test.Feed\n").unwrap();
+        let before = hunter::av::stats().1;
+        let mut n = load_signatures(&root, SIGNATURES_FILE);
+        assert_eq!(n, 1, "the bad line, and only it, skipped");
+        n += load_signatures(&root, "/etc/hunter/signatures.d/bazaar");
+        assert_eq!(n, 2);
+        assert_eq!(hunter::av::stats().1, before + 2);
     }
 
     #[test]
