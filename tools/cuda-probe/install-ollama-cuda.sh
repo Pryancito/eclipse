@@ -12,11 +12,32 @@
 # gcompat: it replaces that loader and then fails with
 #   Error relocating …: fcntl64: symbol not found
 #
+# Also writes an eclipse-init service, /etc/eclipse/services/ollama.service,
+# so `ollama serve` starts at boot and init restarts it if it dies.
+#
+# Usage: install-ollama-cuda            download, install, write the service
+#        install-ollama-cuda --service  only (re)write the service
+#
 # Env: OLLAMA_URL=…  override full URL
 #      DEST=/usr/local
+#      OLLAMA_SERVICE=0  do not write the init service
+#      SERVICE_DIR=/etc/eclipse/services
 set -eu
 
+SERVICE_ONLY=0
+case "${1:-}" in
+  "") ;;
+  --service) SERVICE_ONLY=1 ;;
+  *)
+    echo "usage: $0 [--service]" >&2
+    exit 2
+    ;;
+esac
+
 DEST=${DEST:-/usr/local}
+BIN="$DEST/bin/ollama"
+LIB="$DEST/lib/ollama"
+SERVICE_DIR=${SERVICE_DIR:-/etc/eclipse/services}
 # Prefer the GitHub release asset name; ollama.com/download redirects here.
 URL=${OLLAMA_URL:-https://ollama.com/download/ollama-linux-amd64.tar.zst}
 
@@ -49,6 +70,58 @@ ARCHIVE=$TMP/ollama-linux-amd64.tar.zst
 
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
+
+# eclipse-init reads its services only at boot, so this one first runs at the
+# next boot. eclipse-ollama picks the cuda_v* runner (init has no env key to
+# set OLLAMA_LLM_LIBRARY), but it looks in /usr/local, so any other DEST runs
+# the binary directly. A respawn service: `killall ollama` gets it restarted.
+write_service() {
+  exec_line="$BIN serve"
+  if [ "$BIN" = /usr/local/bin/ollama ] && [ -x /usr/bin/eclipse-ollama ]; then
+    exec_line="/usr/bin/eclipse-ollama serve"
+  fi
+  if [ "${OLLAMA_SERVICE:-1}" = 0 ] || [ ! -d "$SERVICE_DIR" ]; then
+    if [ "${OLLAMA_SERVICE:-1}" = 0 ]; then
+      echo "OLLAMA_SERVICE=0: no init service written."
+    else
+      echo "No $SERVICE_DIR (not eclipse-init?): no init service written."
+    fi
+    echo "Start serve (GPU):"
+    echo "  killall ollama 2>/dev/null"
+    echo "  $exec_line"
+    return 0
+  fi
+  svc=$SERVICE_DIR/ollama.service
+  fresh=1
+  [ -e "$svc" ] && fresh=0
+  cat >"$svc.tmp" <<EOF
+# ollama serve, written by install-ollama-cuda. Delete this file to stop
+# starting it at boot (OLLAMA_SERVICE=0 install-ollama-cuda skips writing it).
+exec = $exec_line
+type = respawn
+log = /tmp/ollama.log
+EOF
+  mv -f "$svc.tmp" "$svc"
+  echo "Init service: $svc"
+  echo "  exec = $exec_line"
+  echo "  Starts ollama serve at boot; init restarts it if it dies."
+  echo "  Log: /tmp/ollama.log"
+  if [ "$fresh" = 1 ]; then
+    echo "Init reads it at the next boot. To start serve now:"
+    echo "  killall ollama 2>/dev/null; $exec_line >/tmp/ollama.log 2>&1 &"
+  else
+    echo "If init already runs it, killall ollama restarts it on the new binary."
+  fi
+}
+
+if [ "$SERVICE_ONLY" = 1 ]; then
+  if [ ! -x "$BIN" ]; then
+    echo "no $BIN: run install-ollama-cuda without --service first" >&2
+    exit 1
+  fi
+  write_service
+  exit 0
+fi
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -189,8 +262,6 @@ fi
 echo "Extracting into $DEST ..."
 zstd -d -c "$ARCHIVE" | tar -xf - -C "$DEST"
 
-BIN="$DEST/bin/ollama"
-LIB="$DEST/lib/ollama"
 if [ ! -x "$BIN" ]; then
   echo "extract failed: no $BIN" >&2
   exit 1
@@ -213,10 +284,7 @@ ls -d "$LIB"/cuda_v* 2>/dev/null || {
 ls "$LIB"/cuda_v*/libggml-cuda.so 2>/dev/null | head -5
 
 echo
-echo "Restart serve (GPU):"
-echo "  killall ollama 2>/dev/null"
-echo "  eclipse-ollama serve          # picks cuda_v* when cuda-status is OK"
-echo "  # or: OLLAMA_DEBUG=1 OLLAMA_LLM_LIBRARY=\$(basename $LIB/cuda_v*) $BIN serve"
+write_service
 echo "Then: eclipse-ollama ps         # GPU load, not 100% CPU"
 echo "Check: cuda-status -p"
 echo

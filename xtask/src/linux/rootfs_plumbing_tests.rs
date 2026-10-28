@@ -887,16 +887,9 @@ fn nothing_on_the_boot_path_waits_for_a_sound_card() {
 /// makes it part of the same invariant.
 #[test]
 fn every_key_a_service_uses_is_parsed_by_the_init_and_documented_in_the_example() {
-    const INIT: &str = include_str!("../../../tools/eclipse-init/src/main.rs");
     let rootfs = init_rootfs("keys");
-    let example =
-        fs::read_to_string(rootfs.join("etc/eclipse/services/example.service.txt")).unwrap();
-    let documented: Vec<&str> = example
-        .lines()
-        .filter_map(|l| l.trim_start().strip_prefix("# "))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, _)| k.trim())
-        .collect();
+    let example = example_service(&rootfs);
+    let documented = documented_keys(&example);
     for (name, body) in services(&rootfs) {
         for (key, _) in fields(&body) {
             assert!(
@@ -915,6 +908,71 @@ fn every_key_a_service_uses_is_parsed_by_the_init_and_documented_in_the_example(
             "the example documents `{key}`, which the init does not parse"
         );
     }
+}
+
+const INIT: &str = include_str!("../../../tools/eclipse-init/src/main.rs");
+
+fn example_service(rootfs: &Path) -> String {
+    fs::read_to_string(rootfs.join("etc/eclipse/services/example.service.txt")).unwrap()
+}
+
+/// The keys `example.service.txt` documents, one `# key = ...` line each.
+fn documented_keys(example: &str) -> Vec<&str> {
+    example
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("# "))
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, _)| k.trim())
+        .collect()
+}
+
+/// `install-ollama-cuda` writes `ollama.service` on the user's machine, after
+/// the image is built, so it is in none of the tables the tests above walk.
+/// This runs the script's `--service` mode against a scratch root and holds
+/// the file to the same rules: keys the init parses and the example
+/// documents, supervised, and exec'ing the binary the install put in DEST.
+#[test]
+fn the_ollama_service_install_ollama_cuda_writes_follows_the_table_rules() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch("ollama-service");
+    let bin = dir.join("dest/bin/ollama");
+    let svc = dir.join("services");
+    fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    fs::create_dir_all(&svc).unwrap();
+    fs::write(&bin, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    let st = std::process::Command::new("sh")
+        .arg(PROJECT_DIR.join("tools/cuda-probe/install-ollama-cuda.sh"))
+        .arg("--service")
+        .env("DEST", dir.join("dest"))
+        .env("SERVICE_DIR", &svc)
+        .env_remove("OLLAMA_SERVICE")
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(st.success(), "install-ollama-cuda --service failed");
+
+    let body = fs::read_to_string(svc.join("ollama.service")).unwrap();
+    let example = example_service(&init_rootfs("ollama-keys"));
+    let documented = documented_keys(&example);
+    for (key, _) in fields(&body) {
+        assert!(
+            INIT.contains(&format!("\"{key}\" =>")),
+            "ollama.service: `{key}` is not a key tools/eclipse-init parses"
+        );
+        assert!(
+            documented.contains(&key),
+            "ollama.service: `{key}` is documented nowhere"
+        );
+    }
+    assert_eq!(field(&body, "type"), Some("respawn"));
+    let exec = format!("{} serve", bin.display());
+    assert_eq!(field(&body, "exec"), Some(exec.as_str()));
+    assert!(
+        !svc.join("ollama.service.tmp").exists(),
+        "the temporary file was left behind"
+    );
 }
 
 /// `desktop =` is what keeps the two sessions apart, and the interesting
