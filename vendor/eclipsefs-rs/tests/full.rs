@@ -209,3 +209,38 @@ fn a_full_volume_still_commits() {
         small_files_leave_room_to_commit(&mut fs);
     }
 }
+
+/// Growing a small file past the inline limit moves its bytes to a block.
+/// On a full device that used to delete the inline item and then fail to
+/// write the block, so the refused write left the file's bytes as zeros.
+/// Symlinks whose target could not be stored stayed behind, cut short.
+#[test]
+fn refused_writes_keep_inline_data_and_leave_no_half_symlinks() {
+    let (disk, mut fs) = fresh(4 * MIB);
+    let root = fs.root_ino();
+    let small = fs
+        .create(root, "small", FileKind::Regular, 0o644, 0)
+        .unwrap();
+    write_all(&mut fs, small, 0, b"eclipsefs ecl");
+    fill(&mut fs, "f", 64 * 1024, None);
+    fill(&mut fs, "g", 4096, None);
+    match fs.write(small, 0, &[7; 2576]) {
+        Err(Error::NoSpace) => {}
+        r => panic!("expected NoSpace, got {:?}", r),
+    }
+    assert_eq!(read_all(&mut fs, small), b"eclipsefs ecl");
+    for i in 0..64 {
+        let name = format!("l{}", i);
+        match fs.symlink(root, &name, &[b'x'; 4000]) {
+            Ok(l) => assert_eq!(fs.read_link(l).unwrap(), vec![b'x'; 4000]),
+            Err(Error::NoSpace) => {
+                assert_eq!(fs.lookup(root, &name), Err(Error::NotFound))
+            }
+            Err(e) => panic!("symlink: {:?}", e),
+        }
+    }
+    fs.check().unwrap();
+    let mut fs = remount(&disk, fs);
+    assert_eq!(read_all(&mut fs, small), b"eclipsefs ecl");
+    fs.check().unwrap();
+}

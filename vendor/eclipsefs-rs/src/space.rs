@@ -236,6 +236,10 @@ pub struct BlockSpace {
     /// Free blocks file data may not take, so that tree updates (which
     /// allocate as they copy) still find room on a full device.
     pub reserve: u64,
+    /// Data may take the first half of the reserve too: set for the length
+    /// of an atomic write, whose room was checked up front but whose tree
+    /// updates take blocks from the same pool as it goes.
+    pub data_dig: bool,
     /// Data checksum changes not yet in the checksum tree: the CRC32C of a
     /// block just written (`None`: written without one, no-COW).
     pub csums: BTreeMap<u64, Option<u32>>,
@@ -264,9 +268,12 @@ pub struct BlockSpace {
 }
 
 /// Blocks kept back for metadata on a filesystem of `total` blocks: 1/64 of
-/// it, between 16 and 8192 (32 MiB).
+/// it, between 16 and 8192 (32 MiB). Small filesystems keep at least 64
+/// (or an eighth of themselves): a quarter of the reserve is what a commit
+/// has left on a full device, and a commit copies a few nodes of every
+/// tree it touches.
 pub fn metadata_reserve(total: u64) -> u64 {
-    (total / 64).clamp(16, 8192)
+    (total / 64).max(64.min(total / 8)).clamp(16, 8192)
 }
 
 impl BlockSpace {
@@ -278,6 +285,7 @@ impl BlockSpace {
             fresh: RangeSet::default(),
             meta_goal: 0,
             reserve: 0,
+            data_dig: false,
             csums: BTreeMap::new(),
             csums_freed: RangeSet::default(),
             vol: None,
@@ -304,13 +312,16 @@ impl BlockSpace {
 
     /// Free blocks file data may take now.
     pub(crate) fn data_room(&self) -> u64 {
+        let reserve = if self.data_dig {
+            self.reserve.div_ceil(2)
+        } else {
+            self.reserve
+        };
         if self.vol.is_none() {
-            return self.alloc.free_blocks().saturating_sub(self.reserve);
+            return self.alloc.free_blocks().saturating_sub(reserve);
         }
         // Metadata chunks hold the reserve first; mixed groups the rest.
-        let need = self
-            .reserve
-            .saturating_sub(self.alloc.free_in(ChunkKind::Metadata));
+        let need = reserve.saturating_sub(self.alloc.free_in(ChunkKind::Metadata));
         self.alloc.free_in(ChunkKind::Data)
             + self.alloc.free_in(ChunkKind::Mixed).saturating_sub(need)
     }
@@ -408,6 +419,15 @@ impl BlockSpace {
             {
                 return false;
             }
+        }
+    }
+
+    /// Free blocks a new tree node may take now (any free block on one
+    /// device, the metadata chunks' on a volume).
+    pub fn node_free(&self) -> u64 {
+        match self.vol {
+            None => self.alloc.free_blocks(),
+            Some(_) => self.meta_free(),
         }
     }
 
@@ -547,6 +567,18 @@ impl Space for BlockSpace {
 
     fn refs(&self, bytenr: u64) -> u32 {
         self.refs.get(bytenr)
+    }
+
+    fn node_room(&mut self, n: u64) -> bool {
+        loop {
+            if self.node_free() >= n {
+                return true;
+            }
+            if !self.grow_on(ChunkKind::Metadata, self.target()) && !self.grow(ChunkKind::Metadata)
+            {
+                return false;
+            }
+        }
     }
 
     fn incref(&mut self, start: u64, len: u64) -> Result<()> {

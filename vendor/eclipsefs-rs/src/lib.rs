@@ -66,6 +66,19 @@ pub use fs::{
 };
 pub use volume::{ChunkKind, Profile, Tier};
 
+/// Largest file size (Linux's `MAX_LFS_FILESIZE` on 64-bit, as on btrfs):
+/// a write, truncate, `fallocate` or reflink that would end past it fails
+/// with [`Error::Invalid`] (`EFBIG` on Linux). It keeps every byte offset
+/// of a file block, `(block + 1) * 4096` included, inside `u64`.
+pub const MAX_FILE_SIZE: u64 = i64::MAX as u64;
+
+/// End of the byte range `off..off+len`, if a file may reach it.
+pub(crate) fn file_end(off: u64, len: u64) -> Result<u64> {
+    off.checked_add(len)
+        .filter(|&end| end <= MAX_FILE_SIZE)
+        .ok_or(Error::Invalid)
+}
+
 /// Version of the on-disk format new filesystems get (v0.4.0).
 pub const ECLIPSEFS_VERSION: u32 = cowfmt::VERSION4;
 

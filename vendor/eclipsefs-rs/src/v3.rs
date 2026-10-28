@@ -1246,9 +1246,7 @@ impl EclipseFsV3 {
             FileKind::Regular => {}
             _ => return Err(Error::Invalid),
         }
-        offset
-            .checked_add(data.len() as u64)
-            .ok_or(Error::Invalid)?;
+        crate::file_end(offset, data.len() as u64)?;
         let mut inode = self.take(ino)?;
         // File data bypasses the overlay (ordered mode).
         let raw = self.dev.inner().clone();
@@ -1276,6 +1274,7 @@ impl EclipseFsV3 {
         if self.inodes[&ino].size == new_size {
             return Ok(());
         }
+        crate::file_end(new_size, 0)?;
         let mut inode = self.take(ino)?;
         let raw = self.dev.inner().clone();
         let r = truncate_inode(&*raw, &mut self.alloc, &mut inode, new_size);

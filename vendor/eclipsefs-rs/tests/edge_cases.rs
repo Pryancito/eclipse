@@ -589,8 +589,9 @@ fn space_freed_by_an_open_transaction_is_reused_after_commit() {
     let root = fs.root_ino();
     let f = fs.create(root, "big", FileKind::Regular, 0o644, 0).unwrap();
     let free = fs.fsinfo().total_bytes - fs.fsinfo().bytes_used;
-    // Leave room for the metadata reserve and the checksum tree.
-    let data = vec![1u8; free as usize - 128 * 1024];
+    // Leave room for the metadata reserve (64 blocks on a device this
+    // small) and the checksum tree.
+    let data = vec![1u8; free as usize - 384 * 1024];
     write_all(&mut fs, f, 0, &data);
     fs.unlink(root, "big").unwrap();
     // The device is nearly full on disk until the unlink commits; the next
@@ -875,4 +876,166 @@ fn a_file_with_more_extents_than_one_purge_batch_is_deleted_whole() {
         after,
         before
     );
+}
+
+/// Offsets near the top of `u64` used to wrap the byte offset of the last
+/// block (`(block + 1) * 4096`) and panic while copying the write into it:
+/// `write(f, u64::MAX - 4095, b"hello")` brought the kernel down. Files now
+/// stop at `MAX_FILE_SIZE` (2^63 - 1, as on Linux and btrfs), past which
+/// every call that would grow a file says `Invalid`; right below it they
+/// work and survive a remount and the check.
+#[test]
+fn files_end_at_the_maximum_size_without_wrapping() {
+    for v3 in [false, true] {
+        let (disk, mut fs) = if v3 {
+            fresh_v3(16 * MIB)
+        } else {
+            fresh(16 * MIB)
+        };
+        let root = fs.root_ino();
+        let f = fs.create(root, "f", FileKind::Regular, 0o644, 0).unwrap();
+        let max = eclipsefs::MAX_FILE_SIZE;
+        for off in [u64::MAX, u64::MAX - 4095, max - 4, 1 << 63] {
+            assert_eq!(
+                fs.write(f, off, b"hello"),
+                Err(Error::Invalid),
+                "write at {:#x}",
+                off
+            );
+        }
+        for size in [u64::MAX, max + 1] {
+            assert_eq!(
+                fs.truncate(f, size),
+                Err(Error::Invalid),
+                "truncate to {:#x}",
+                size
+            );
+        }
+        assert_eq!(fs.stat(f).unwrap().size, 0);
+
+        // The last bytes a file may hold.
+        write_all(&mut fs, f, max - 5, b"hello");
+        assert_eq!(fs.stat(f).unwrap().size, max);
+        let mut buf = [0u8; 16];
+        assert_eq!(fs.read(f, max - 5, &mut buf).unwrap(), 5);
+        assert_eq!(&buf[..5], b"hello");
+        assert_eq!(fs.read(f, max, &mut buf).unwrap(), 0);
+        let mut fs = remount(&disk, fs);
+        assert_eq!(fs.read(f, max - 5, &mut buf).unwrap(), 5);
+        assert_eq!(&buf[..5], b"hello");
+        fs.check().unwrap();
+        fs.truncate(f, 1).unwrap();
+        fs.check().unwrap();
+        if v3 {
+            continue;
+        }
+
+        use eclipsefs::cowfmt::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE};
+        assert_eq!(fs.fallocate(f, 0, max - 4095, 4096), Err(Error::Invalid));
+        assert_eq!(
+            fs.fallocate(f, FALLOC_FL_KEEP_SIZE, u64::MAX - 4095, 4096),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            fs.fallocate(
+                f,
+                FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                u64::MAX - 4095,
+                4096
+            ),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            fs.write_atomic(f, u64::MAX - 2, b"abc"),
+            Err(Error::Invalid)
+        );
+        let g = fs.create(root, "g", FileKind::Regular, 0o644, 0).unwrap();
+        write_all(&mut fs, g, 0, &[1; 3 * BLOCK]);
+        assert_eq!(
+            fs.clone_range(g, 0, f, u64::MAX - 4095, 4096),
+            Err(Error::Invalid)
+        );
+        assert_eq!(fs.clone_range(g, 0, f, 1 << 63, 0), Err(Error::Invalid));
+        fs.clone_range(g, 0, f, (max / 4096 - 3) * 4096, 3 * BLOCK as u64)
+            .unwrap();
+        fs.check().unwrap();
+    }
+}
+
+/// Names whose directory hash (CRC32C | CRC32 << 32) is the same share one
+/// DIR_ITEM. These four were solved for over GF(2) (both CRCs are linear),
+/// so every operation that finds, adds or drops a name in a shared bucket
+/// is driven through the public API with real names.
+#[test]
+fn names_with_the_same_hash_are_kept_apart() {
+    const NAMES: [&str; 4] = [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "caaaccacaaccacccaccaaacacccaacaaacaacaacccaccacaacccaccacacccacccaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ccaacacccacaccaaccacaacccaacaccaaccaccacaaccacccacaaccaccccaaccaacaaaaaaaaaaaaaaaaaaaaaaaa",
+        "acaaaccacaaccacccaccaaacacccaacaaacaacaacccaccacaacccaccacacccacccaaaaaaaaaaaaaaaaaaaaaaaa",
+    ];
+    let h = eclipsefs::cowfmt::name_hash(NAMES[0].as_bytes());
+    for n in NAMES {
+        assert_eq!(eclipsefs::cowfmt::name_hash(n.as_bytes()), h);
+    }
+    let (disk, mut fs) = fresh(16 * MIB);
+    let root = fs.root_ino();
+    let d = fs.create(root, "d", FileKind::Dir, 0o755, 0).unwrap();
+    let mut inos = Vec::new();
+    for (i, n) in NAMES.iter().enumerate().take(3) {
+        let f = fs.create(d, n, FileKind::Regular, 0o644, 0).unwrap();
+        write_all(&mut fs, f, 0, &[i as u8 + 1; 100]);
+        inos.push(f);
+        assert_eq!(
+            fs.create(d, n, FileKind::Regular, 0o644, 0),
+            Err(Error::Exists)
+        );
+    }
+    assert_eq!(fs.lookup(d, NAMES[3]), Err(Error::NotFound));
+    assert_eq!(fs.unlink(d, NAMES[3]), Err(Error::NotFound));
+    for (i, n) in NAMES.iter().enumerate().take(3) {
+        assert_eq!(fs.lookup(d, n).unwrap(), inos[i]);
+    }
+    assert_eq!(fs.readdir(d).unwrap().len(), 3);
+
+    // A hard link and a directory into the same bucket.
+    fs.link(d, NAMES[3], inos[0]).unwrap();
+    assert_eq!(fs.stat(inos[0]).unwrap().nlink, 2);
+    assert_eq!(fs.link(d, NAMES[1], inos[0]), Err(Error::Exists));
+    // Drop the middle one of the bucket; the others stay.
+    fs.unlink(d, NAMES[1]).unwrap();
+    assert_eq!(fs.lookup(d, NAMES[1]), Err(Error::NotFound));
+    assert_eq!(fs.lookup(d, NAMES[2]).unwrap(), inos[2]);
+    assert_eq!(fs.lookup(d, NAMES[3]).unwrap(), inos[0]);
+    let sub = fs.create(d, NAMES[1], FileKind::Dir, 0o755, 0).unwrap();
+    // Rename within the bucket, over a name of the same bucket.
+    fs.rename(d, NAMES[2], d, NAMES[0]).unwrap();
+    assert_eq!(fs.lookup(d, NAMES[0]).unwrap(), inos[2]);
+    assert_eq!(fs.lookup(d, NAMES[2]), Err(Error::NotFound));
+    assert_eq!(fs.stat(inos[0]).unwrap().nlink, 1);
+    assert_eq!(fs.rename(d, NAMES[0], d, NAMES[1]), Err(Error::IsDir));
+    // Out of the bucket into another directory and back under a third name.
+    fs.rename(d, NAMES[3], sub, NAMES[3]).unwrap();
+    fs.rename(sub, NAMES[3], d, NAMES[2]).unwrap();
+    assert_eq!(fs.lookup(d, NAMES[2]).unwrap(), inos[0]);
+    fs.check().unwrap();
+
+    let mut fs = remount(&disk, fs);
+    let mut names: Vec<String> = fs.readdir(d).unwrap().into_iter().map(|e| e.name).collect();
+    names.sort();
+    let mut want = vec![
+        NAMES[0].to_string(),
+        NAMES[1].to_string(),
+        NAMES[2].to_string(),
+    ];
+    want.sort();
+    assert_eq!(names, want);
+    assert_eq!(read_all(&mut fs, inos[2]), vec![3; 100]);
+    assert_eq!(read_all(&mut fs, inos[0]), vec![1; 100]);
+    for n in &NAMES[..3] {
+        fs.unlink(d, n).unwrap();
+    }
+    assert!(fs.readdir(d).unwrap().is_empty());
+    fs.unlink(root, "d").unwrap();
+    fs.check().unwrap();
 }

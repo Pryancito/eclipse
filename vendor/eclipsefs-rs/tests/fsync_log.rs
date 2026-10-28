@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use common::*;
 use eclipsefs::cowfmt::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FL_NOCOW};
 use eclipsefs::device::BlockDevice;
-use eclipsefs::{mkfs, Compression, EclipseFS, Error, FileKind};
+use eclipsefs::{mkfs, Compression, EclipseFS, Error, FileKind, Profile};
 
 fn fresh(size: usize) -> (Arc<MemDisk>, EclipseFS) {
     let disk = MemDisk::new(size);
@@ -746,4 +746,41 @@ fn crash_at_every_point_of_a_workload_with_timed_commits() {
 #[test]
 fn crash_at_every_point_of_another_workload_with_timed_commits() {
     crash_everywhere(41, 300, true);
+}
+
+#[test]
+fn data_in_a_chunk_made_since_the_commit_survives_the_crash() {
+    // On a volume, data that a write puts in a new chunk is in no chunk
+    // map on disk until the commit: the log cannot point at it.
+    let d: Vec<Arc<MemDisk>> = (0..2).map(|_| MemDisk::new(24 * MIB)).collect();
+    let devs = || -> Vec<Arc<dyn BlockDevice>> {
+        d.iter()
+            .map(|x| x.clone() as Arc<dyn BlockDevice>)
+            .collect()
+    };
+    mkfs::format_devices(&devs(), &opts(), Profile::Raid1, Profile::Raid1).unwrap();
+    let mut fs = EclipseFS::mount_devices(devs(), false).unwrap();
+    fs.set_clock(clock);
+    let f = committed_file(&mut fs, "f", &pattern(1, 4096));
+    let chunk = pattern(2, MIB);
+    let mut want = 4096;
+    for i in 0..16 {
+        match fs.write(f, (i * MIB) as u64, &chunk) {
+            Ok(n) => want = want.max(i * MIB + n),
+            Err(Error::NoSpace) => break,
+            Err(e) => panic!("{:?}", e),
+        }
+        fs.fsync(f).unwrap();
+        let copies: Vec<Arc<dyn BlockDevice>> =
+            d.iter().map(|x| x.copy() as Arc<dyn BlockDevice>).collect();
+        let mut after = EclipseFS::mount_devices(copies, false).unwrap();
+        assert_eq!(
+            after.stat(f).unwrap().size,
+            want as u64,
+            "after write {}",
+            i
+        );
+        assert_eq!(read_all(&mut after, f), read_all(&mut fs, f));
+        after.check().unwrap();
+    }
 }
