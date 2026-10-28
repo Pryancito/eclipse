@@ -1899,3 +1899,151 @@ fn a_failed_move_holds_the_stripes_at_the_length_they_had() {
          never measured"
     );
 }
+
+// ---------------------------------------------------------------------------
+// What the rest of `volume_ops.rs` promises: the conversion of a one-device
+// filesystem into a volume, tiers marked on a mounted one, a replace that
+// cannot finish, and the space a dropped chunk hands back.
+// ---------------------------------------------------------------------------
+
+/// A filesystem that becomes a volume keeps writing back the good copy of a
+/// tree node it had to read from somewhere else: the mount is writable, so
+/// the copies that failed to verify are repaired on the way. `set_volume`
+/// is the only place that says so after the conversion, and nothing else
+/// says it again for the rest of the mount.
+#[test]
+fn a_converted_volume_repairs_the_nodes_it_reads() {
+    let (_d, mut fs) = mounted();
+    file(&mut fs, "f", &[3; 20_000]);
+    fs.sync().unwrap();
+    // No volume yet: `add_device` is what turns this filesystem's groups
+    // into chunks, and mirroring the metadata is what gives a tree node a
+    // second copy to be read from.
+    fs.add_device(Ram::new(32 * MIB) as Arc<dyn BlockDevice>)
+        .unwrap();
+    fs.balance(None, Some(Profile::Raid1)).unwrap();
+    fs.sync().unwrap();
+    let vol = fs.vol.clone().unwrap();
+    let b = fs.fs_root.bytenr;
+    assert_eq!(
+        vol.copies(b),
+        2,
+        "the node needs a second copy, or there is nothing to repair it from"
+    );
+    let mut good = vec![0u8; BS as usize];
+    vol.read_copy(b * BS, &mut good, 1).unwrap();
+    vol.write_copy(b * BS, &[0xff; BS as usize], 0).unwrap();
+    fs.drop_caches();
+    // A plain read, not a scrub: the node comes from copy 1, and copy 0 is
+    // written back while it is there.
+    fs.lookup(fs.root_ino(), "f").unwrap();
+    let mut got = vec![0u8; BS as usize];
+    vol.read_copy(b * BS, &mut got, 0).unwrap();
+    assert_eq!(got, good, "the bad copy of the tree node was left bad");
+}
+
+/// Marking a device fast or slow takes effect at once: placement starts
+/// looking at tiers and every group follows the tier of its chunk's
+/// devices, without waiting for a remount or for another device operation.
+/// The tier tests above set the tiers at mkfs time, so none of them marks
+/// one on a filesystem that is already mounted.
+#[test]
+fn a_tier_marked_on_a_live_volume_reaches_the_groups_at_once() {
+    let devs = devices(2);
+    mkfs::format_devices(&devs, &opts(), Profile::Single, Profile::Single).unwrap();
+    let mut fs = CowFs::mount_devices(devs, false, false).unwrap();
+    fs.set_clock(clock);
+    file(&mut fs, "f", &[6; 200_000]);
+    fs.sync().unwrap();
+    assert!(!fs.sp.tiered, "no device is marked yet");
+    fs.set_device_tier(1, Tier::Fast).unwrap();
+    fs.set_device_tier(2, Tier::Slow).unwrap();
+    // `Space::target` hands out the fast tier only while this is set, so
+    // without it new data and new nodes would ignore the tiers just given.
+    assert!(fs.sp.tiered, "placement is still not looking at tiers");
+    let vol = fs.vol.clone().unwrap();
+    let map = vol.map();
+    let mut seen = 0;
+    for (&g, c) in &map.chunks {
+        let want = map.chunk_tier(c);
+        if want == Tier::Any {
+            continue;
+        }
+        assert_eq!(fs.sp.alloc.groups()[g as usize].tier, want, "group {}", g);
+        seen += 1;
+    }
+    assert!(
+        seen > 0,
+        "no chunk sits on one tier, so no group's tier was measured"
+    );
+}
+
+/// A filesystem that is not a volume has no tiers at all: its one device is
+/// neither the fast one nor the slow one, which is what the ioctl reporting
+/// it has to say.
+#[test]
+fn a_filesystem_that_is_not_a_volume_has_no_tier() {
+    let (_d, fs) = mounted();
+    assert!(fs.vol.is_none(), "this filesystem is not a volume");
+    assert_eq!(fs.device_tier(1), Tier::Any);
+}
+
+/// A replace that cannot move the old device's chunks leaves the filesystem
+/// as it was, the device it added on the way included.
+#[test]
+fn a_replace_that_cannot_move_the_chunks_takes_its_device_back_out() {
+    let mut fs = CowFs::mount_devices(volume(), false, false).unwrap();
+    fs.set_clock(clock);
+    file(&mut fs, "f", &[9; 200_000]);
+    fs.sync().unwrap();
+    let before: Vec<u32> = fs.devices().iter().map(|d| d.devid).collect();
+    // Big enough to be taken (DEV_RESERVED + MIN_CHUNK), too small to hold
+    // a mirror of what device 2 has on it.
+    let small = Ram::new(2 * MIB) as Arc<dyn BlockDevice>;
+    assert_eq!(fs.replace_device(2, small), Err(Error::NoSpace));
+    let after: Vec<u32> = fs.devices().iter().map(|d| d.devid).collect();
+    assert_eq!(
+        after, before,
+        "the device added for the replace was left in the volume"
+    );
+}
+
+/// The stripes of a chunk that is given back stay held until the commit
+/// giving them back is on disk: every one of them, and as long as it was,
+/// so nothing placed in the same transaction can land on blocks that are
+/// still the committed state. As in `switch_chunk`, the hold is released by
+/// the commit, so it can only be seen when the commit fails.
+#[test]
+fn a_failed_drop_keeps_holding_every_stripe_of_the_chunk() {
+    let (disks, mut fs) = dying_volume(Profile::Raid1, u64::MAX);
+    let vol = fs.vol.clone().unwrap();
+    let (g, want) = {
+        let map = vol.map();
+        let (&g, c) = map
+            .chunks
+            .iter()
+            .find(|(&g, c)| g != 0 && c.stripes.len() > 1)
+            .expect("a chunk of its own with more than one stripe to hold");
+        let len = c.stripe_len();
+        let want: Vec<(u32, u64, u64)> =
+            c.stripes.iter().map(|s| (s.devid, s.phys, len)).collect();
+        (g, want)
+    };
+    // The commit of the drop dies at once, so what it held is still held.
+    for d in &disks {
+        d.arm(1);
+    }
+    assert!(fs.drop_chunk(g).is_err(), "the commit had to fail");
+    let held = vol.held();
+    for r in &want {
+        assert!(
+            held.contains(r),
+            "stripe {:?} of the chunk was not held: {:?}",
+            r,
+            held
+        );
+    }
+    for r in &held {
+        assert!(want.contains(r), "something else was held: {:?}", r);
+    }
+}
