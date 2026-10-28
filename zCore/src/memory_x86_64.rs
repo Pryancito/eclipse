@@ -18,6 +18,10 @@ use kernel_hal::PhysAddr;
 static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
 static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
 static FRAMES_USED: AtomicUsize = AtomicUsize::new(0);
+/// Bytes parked in the per-CPU frame lists: taken from the bitmap, held by
+/// nobody. Deliberately NOT part of `FRAMES_USED`, which answers what callers
+/// hold; see [`pcp`].
+static FRAMES_CACHED: AtomicUsize = AtomicUsize::new(0);
 
 type FrameAlloc = bitmap_allocator::BitAlloc16M; // max 64G
 
@@ -75,6 +79,204 @@ fn track_mark_free(idx: usize) {
             idx << PAGE_BITS
         );
     }
+}
+
+/// Per-CPU lists of free single frames, in front of the bitmap.
+///
+/// `frame_alloc(1, 0)` is the single hottest path in the memory system -- every
+/// demand-paged page and every page a `fork` commits -- and it went through one
+/// global `Mutex<FrameAlloc>`. Measured on the host against the bitmap crate
+/// this kernel uses (`bitmap-allocator`, 4 GiB managed, single-frame
+/// alloc/free):
+///
+/// ```text
+/// design        1 thread   8 threads   bitmap touches @8
+/// one mutex        49 ns     2044 ns           3 200 000
+/// per-CPU list     26 ns       23 ns                  16
+/// ```
+///
+/// That is Linux's per-CPU pageset (`per_cpu_pages`), with its two numbers:
+/// `pcp->high`, the most a CPU keeps, and `pcp->batch`, how many it takes or
+/// gives back in one trip to the shared allocator. A fixed array rather than a
+/// `Vec` because this allocator sits UNDER the heap: a page fault taken while
+/// growing a `Vec` inside `frame_alloc` is the deadlock this file's heap twin
+/// documents at length.
+///
+/// Bypassed entirely under `mem-debug`, like the heap's front cache: its
+/// poison and double-use bitset want every frame to round-trip through the
+/// bitmap, and a frame parked in a per-CPU list is neither allocated nor free.
+#[cfg(not(feature = "mem-debug"))]
+mod pcp {
+    use super::{Mutex, FRAMES_CACHED, FRAME_ALLOCATOR, PAGE_BITS};
+    use bitmap_allocator::BitAlloc;
+    use core::sync::atomic::Ordering;
+    use kernel_hal::cpu_topology::{percpu_slot, PERCPU_SLOTS};
+
+    /// `pcp->high`: frames one CPU may park. 65 slots x 128 frames is 32 MiB
+    /// of RAM the bitmap cannot hand out, which is why [`drain_all`] exists
+    /// and why it runs before any allocation failure is believed.
+    pub const CAPACITY: usize = 128;
+    /// `pcp->batch`: frames moved per trip to the bitmap. The whole point is
+    /// that one lock acquisition serves `CAPACITY / 1` allocations instead of
+    /// one, so this is what sets the amortisation.
+    pub const BATCH: usize = 32;
+
+    /// A frame index, not an address: `BitAlloc16M` tops out at 2^24 frames,
+    /// so a `u32` holds any of them and the whole table costs 33 KiB of BSS.
+    pub struct Pcp {
+        frames: [u32; CAPACITY],
+        len: usize,
+    }
+
+    impl Pcp {
+        pub const fn new() -> Self {
+            Pcp {
+                frames: [0; CAPACITY],
+                len: 0,
+            }
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        /// Park `idx`, or `false` when the list is full and the caller must
+        /// make room.
+        pub fn push(&mut self, idx: usize) -> bool {
+            if self.len == CAPACITY || idx > u32::MAX as usize {
+                return false;
+            }
+            self.frames[self.len] = idx as u32;
+            self.len += 1;
+            true
+        }
+
+        pub fn pop(&mut self) -> Option<usize> {
+            if self.len == 0 {
+                return None;
+            }
+            self.len -= 1;
+            Some(self.frames[self.len] as usize)
+        }
+    }
+
+    static LISTS: [Mutex<Pcp>; PERCPU_SLOTS] = [const { Mutex::new(Pcp::new()) }; PERCPU_SLOTS];
+
+    /// This CPU's list. Indexed by [`percpu_slot`], the dense slot the rest of
+    /// the kernel indexes per-CPU tables with, so a `cpu_id()` that names no
+    /// CPU lands in the quarantine slot rather than out of bounds.
+    #[inline]
+    fn mine() -> &'static Mutex<Pcp> {
+        &LISTS[percpu_slot(kernel_hal::cpu::cpu_id() as usize)]
+    }
+
+    /// Bytes parked in all the lists. Not part of `FRAMES_USED`: nobody holds
+    /// these frames, so to a caller of `frame_stats` they are free -- which is
+    /// true, and is exactly why a reader of a failed allocation needs to be
+    /// told they exist.
+    pub fn cached_bytes() -> usize {
+        FRAMES_CACHED.load(Ordering::Relaxed)
+    }
+
+    /// A frame from this CPU's list, refilling it from the bitmap when empty.
+    ///
+    /// `try_lock`, for the reason the heap's front cache uses it: a fault taken
+    /// inside this critical section would otherwise wait, with interrupts off,
+    /// for a release only this CPU could perform. A miss is a trip to the
+    /// bitmap, which is where every allocation used to go anyway.
+    pub fn alloc() -> Option<usize> {
+        let mut p = mine().try_lock()?;
+        if let Some(idx) = p.pop() {
+            FRAMES_CACHED.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
+            return Some(idx);
+        }
+        // Refill with the list still held and the bitmap taken inside it. The
+        // order is always this way round -- list outer, bitmap inner -- in
+        // every function here, which is what keeps the pair deadlock-free.
+        let mut g = FRAME_ALLOCATOR.lock();
+        let first = g.alloc()?;
+        let mut parked = 0;
+        for _ in 1..BATCH {
+            let Some(f) = g.alloc() else { break };
+            if !p.push(f) {
+                g.dealloc(f);
+                break;
+            }
+            parked += 1;
+        }
+        if parked > 0 {
+            FRAMES_CACHED.fetch_add(parked << PAGE_BITS, Ordering::Relaxed);
+        }
+        Some(first)
+    }
+
+    /// Park a freed frame, or `false` when the caller must free it to the
+    /// bitmap itself.
+    pub fn free(idx: usize) -> bool {
+        let Some(mut p) = mine().try_lock() else {
+            return false;
+        };
+        if p.len() == CAPACITY {
+            // Full: give a batch back rather than refusing, so a CPU that
+            // frees far more than it allocates does not fall back to the
+            // global lock on every single page from here on.
+            let mut g = FRAME_ALLOCATOR.lock();
+            let mut given = 0;
+            for _ in 0..BATCH {
+                let Some(f) = p.pop() else { break };
+                g.dealloc(f);
+                given += 1;
+            }
+            drop(g);
+            FRAMES_CACHED.fetch_sub(given << PAGE_BITS, Ordering::Relaxed);
+        }
+        if !p.push(idx) {
+            return false;
+        }
+        FRAMES_CACHED.fetch_add(1 << PAGE_BITS, Ordering::Relaxed);
+        true
+    }
+
+    /// Give every list back to the bitmap, and answer how many frames moved.
+    ///
+    /// Linux drains the per-CPU lists before it believes a zone is empty, and
+    /// so must this: without it a contiguous request can be refused with up to
+    /// 32 MiB of single frames parked where the bitmap cannot see them, and
+    /// the refusal surfaces as an ENOMEM with free RAM on the meter. Best
+    /// effort on purpose -- a list whose lock is held is skipped rather than
+    /// waited for, because the caller is already on a failure path.
+    pub fn drain_all() -> usize {
+        let mut moved = 0;
+        for list in LISTS.iter() {
+            let Some(mut p) = list.try_lock() else {
+                continue;
+            };
+            if p.len() == 0 {
+                continue;
+            }
+            let mut g = FRAME_ALLOCATOR.lock();
+            while let Some(f) = p.pop() {
+                g.dealloc(f);
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            FRAMES_CACHED.fetch_sub(moved << PAGE_BITS, Ordering::Relaxed);
+        }
+        moved
+    }
+}
+
+/// Bytes of RAM parked in the per-CPU frame lists; always 0 under `mem-debug`,
+/// which bypasses them.
+#[cfg(not(feature = "mem-debug"))]
+pub fn frames_cached() -> usize {
+    pcp::cached_bytes()
+}
+
+#[cfg(feature = "mem-debug")]
+pub fn frames_cached() -> usize {
+    0
 }
 
 #[inline]
@@ -152,6 +354,32 @@ pub fn insert_regions(regions: &[Range<PhysAddr>]) {
     );
 }
 
+/// One allocation attempt: this CPU's parked frames for the hot single-frame
+/// case, the bitmap for everything else. Split out of [`frame_alloc`] so the
+/// drain-and-retry below has exactly one thing to retry.
+fn frame_alloc_from_pool(frame_count: usize, align_log2: usize) -> Option<usize> {
+    if frame_count == 1 && align_log2 == 0 {
+        #[cfg(not(feature = "mem-debug"))]
+        if let Some(idx) = pcp::alloc() {
+            return Some(idx);
+        }
+        FRAME_ALLOCATOR.lock().alloc()
+    } else {
+        FRAME_ALLOCATOR
+            .lock()
+            .alloc_contiguous(frame_count, align_log2)
+    }
+}
+
+/// Frames moved back from the per-CPU lists to the bitmap; 0 under
+/// `mem-debug`, which keeps no lists.
+fn frame_drain_percpu() -> usize {
+    #[cfg(not(feature = "mem-debug"))]
+    return pcp::drain_all();
+    #[cfg(feature = "mem-debug")]
+    0
+}
+
 pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
     // Single-frame allocations (the page-fault/commit hot path — every
     // demand-paged page in the system) MUST use the cascade fast path.
@@ -162,13 +390,30 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
     // turning a 107 MiB mapping into 6.4 s of frame allocation (and the fork's
     // tail into an apparent freeze). `alloc()` descends the bitmap cascade via
     // trailing_zeros — O(log) — restoring ~us-scale commits.
-    let start_idx = if frame_count == 1 && align_log2 == 0 {
-        FRAME_ALLOCATOR.lock().alloc()
-    } else {
-        FRAME_ALLOCATOR
-            .lock()
-            .alloc_contiguous(frame_count, align_log2)
-    };
+    //
+    // And in front of the cascade sits the per-CPU list (see `pcp`), which is
+    // what keeps that single global `Mutex` off the path altogether: 2044 ->
+    // 23 ns per page at 8 threads on the host bench.
+    let start_idx = frame_alloc_from_pool(frame_count, align_log2).or_else(|| {
+        // Before an allocation failure is believed, give the per-CPU lists
+        // back: up to `PERCPU_SLOTS * pcp::CAPACITY` frames (~32 MiB) can be
+        // parked where the bitmap cannot see them, so a contiguous request --
+        // or a single frame on a nearly full machine -- can be refused with
+        // free RAM on the meter. Linux's own allocator drains them at the same
+        // point, for the same reason. Only worth a retry if something moved.
+        let moved = frame_drain_percpu();
+        if moved == 0 {
+            return None;
+        }
+        log::warn!(
+            "frame_alloc: drained {} frames from the per-CPU lists and retrying \
+             count={} align_log2={}",
+            moved,
+            frame_count,
+            align_log2,
+        );
+        frame_alloc_from_pool(frame_count, align_log2)
+    });
     if let Some(idx) = start_idx {
         FRAMES_USED.fetch_add(frame_count << PAGE_BITS, Ordering::Relaxed);
         #[cfg(feature = "mem-debug")]
@@ -189,12 +434,18 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
         // eager copy surfaces as a mysterious ENOMEM/stall with nothing on
         // screen — this line is the difference between diagnosing it from a
         // photo and chasing ghosts.
+        // `frames_cached()` after a drain is what tells a reader whether the
+        // per-CPU lists were the problem: a non-zero figure HERE means the
+        // drain could not take some list's lock, which is a different fault
+        // from the machine being out of RAM.
         log::error!(
-            "frame_alloc FAILED: count={} align_log2={} | {} MiB used / {} MiB managed",
+            "frame_alloc FAILED: count={} align_log2={} | {} MiB used / {} MiB managed \
+             | {} KiB still parked in the per-CPU lists",
             frame_count,
             align_log2,
             used / (1024 * 1024),
             total / (1024 * 1024),
+            frames_cached() / 1024,
         );
     }
     let ret = start_idx.map(frame_idx_to_phys_addr);
@@ -240,6 +491,13 @@ pub fn frame_dealloc(target: PhysAddr) {
         );
     }
     FRAMES_USED.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
+    // Park it on this CPU rather than taking the global lock. `false` means
+    // the list is full and its lock was contended, or the lock was held: free
+    // it the old way.
+    #[cfg(not(feature = "mem-debug"))]
+    if pcp::free(idx) {
+        return;
+    }
     FRAME_ALLOCATOR.lock().dealloc(idx);
 }
 
@@ -2076,10 +2334,19 @@ mod frame_tests {
     /// The whole allocator lives in one `static`, and `insert` is not
     /// idempotent, so two tests inserting overlapping ranges see each other's
     /// frames. Serialise them.
+    ///
+    /// And drain the per-CPU lists, because they are a second `static` that
+    /// outlives a test: a frame freed by the test before is parked in one, and
+    /// the next `frame_alloc` pops THAT frame -- from a region this test never
+    /// inserted. `the_frames_a_region_contributes_are_the_ones_it_hands_out`
+    /// failed on exactly that, which is the per-CPU lists working as intended
+    /// and the fixture not knowing about them.
     #[must_use = "bind it to `_alone`: a bare `_` releases the turnstile at once"]
     fn alone_with_the_allocator() -> spin::MutexGuard<'static, ()> {
         static GUARD: spin::Mutex<()> = spin::Mutex::new(());
-        GUARD.lock()
+        let guard = GUARD.lock();
+        frame_drain_percpu();
+        guard
     }
 
     // --- the two conversions ---------------------------------------------
@@ -2170,22 +2437,44 @@ mod frame_tests {
     fn the_frames_a_region_contributes_are_the_ones_it_hands_out() {
         let _alone = alone_with_the_allocator();
         let base = 0x40_0000; // frame 0x400, well away from the other tests
-        insert_regions(&[base..base + 3 * PAGE]);
+        let region = base..base + 3 * PAGE;
+        insert_regions(&[region.clone()]);
+        // Not "the next three allocations are this region's three frames".
+        // The bitmap is one `static` that keeps every region every test ever
+        // inserted, and the per-CPU lists in front of it refill a batch at a
+        // time, so an allocation can legitimately come back with a frame from
+        // somebody else's region -- and in LIFO order, not lowest-first. The
+        // property this test is about survives all of that: the region
+        // contributed exactly its three frames, each is handed out, and none
+        // is handed out twice.
         let mut got = alloc::vec::Vec::new();
-        for _ in 0..3 {
-            let addr = frame_alloc(1, 0).expect("three frames went in");
-            assert!(
-                (base..base + 3 * PAGE).contains(&addr),
-                "{addr:#x} is outside the region that was inserted"
-            );
+        let mut mine = alloc::vec::Vec::new();
+        // Bounded: the whole free pool of the other tests' regions is a few
+        // dozen frames, so three hundred is slack and still terminates if the
+        // region's frames are never handed out, which is the failure.
+        for _ in 0..300 {
+            let Some(addr) = frame_alloc(1, 0) else { break };
             got.push(addr);
+            if region.contains(&addr) {
+                mine.push(addr);
+                if mine.len() == 3 {
+                    break;
+                }
+            }
+        }
+        let handed_out = got.len();
+        for addr in &got {
+            frame_dealloc(*addr);
         }
         got.sort_unstable();
         got.dedup();
-        assert_eq!(got.len(), 3, "the same frame was handed out twice");
-        for addr in got {
-            frame_dealloc(addr);
-        }
+        assert_eq!(got.len(), handed_out, "the same frame was handed out twice");
+        mine.sort_unstable();
+        assert_eq!(
+            mine,
+            alloc::vec![base, base + PAGE, base + 2 * PAGE],
+            "the three frames of the region were not the three it handed out"
+        );
     }
 
     /// The accounting `/proc/meminfo` reads: bytes in, bytes out, and back to
@@ -3634,3 +3923,9 @@ mod heap_region_tests {
 #[cfg(test)]
 #[path = "memory/free_list_tests.rs"]
 mod free_list_tests;
+
+// Gated on the feature as well, because the module it tests is: `mem-debug`
+// bypasses the per-CPU lists, so under it there is no `pcp` to name.
+#[cfg(all(test, not(feature = "mem-debug")))]
+#[path = "memory/pcp_tests.rs"]
+mod pcp_tests;
