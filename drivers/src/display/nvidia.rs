@@ -1838,7 +1838,7 @@ impl NvidiaGpu {
     /// `bringup_step14` (console GPU): INTx mask, kgspInitRm, narration
     /// capture, per-GPU result cache. `tag` labels the output lines
     /// ("gpustep6"/"gpustep14") so each proc file reads naturally.
-    fn gsp_boot_run(&self, tag: &str, quiet: bool) -> String {
+    fn gsp_boot_run(&self, tag: &str) -> String {
         use core::fmt::Write;
         let device_instance = *self.rm_device_instance.lock();
 
@@ -1917,29 +1917,11 @@ impl NvidiaGpu {
                 // "re-asserts within microseconds"). It is retired for real by
                 // pbus_pri_diagnose_and_clear() below, BEFORE the boot. The
                 // pre-STARTCPU leaf drain stays armed as belt-and-braces (it
-                // correlated with the one lucky pre-fix success), and the real
-                // Linux-faithful fix is the console-quiet window (see `quiet`):
-                // prior-art (nouveau r535 / RM / nova-core) does the STARTCPU
-                // write unconditionally -- what they all ALSO do, and we
-                // didn't, is never touch the console framebuffer (this GPU's
-                // BAR1!) during the boot. The secondary/headless GPU needs
-                // none of this.
+                // correlated with the one lucky pre-fix success). The
+                // secondary/headless GPU needs none of this.
                 let drain_for_console = self.drives_boot_display();
                 if drain_for_console {
-                    if quiet {
-                        // Linux byte-parity: the STARTCPU bracket contributes
-                        // ZERO extra MMIO (no BSI pre-read, no intr snapshot,
-                        // no drain) -- stock kflcnStartCpu is read CPUCTL then
-                        // write CPUCTL_ALIAS with nothing between. The
-                        // console-silent + PBUS-clean run still wedged, and
-                        // the one successful boot ran WITHOUT the display/
-                        // priv-ring probe reads the snapshot later added, so
-                        // our own in-window MMIO is the prime remaining
-                        // suspect. step13 (loud) keeps the drain+diagnostics.
-                        nvidia_rm_sys::os_boundary::linux_parity_arm();
-                    } else {
-                        nvidia_rm_sys::os_boundary::sec2_drain_arm();
-                    }
+                    nvidia_rm_sys::os_boundary::sec2_drain_arm();
                 }
                 // Console GPU: diagnose + retire the latched PBUS PRI error at
                 // the unit BEFORE the boot (fully logged -- no SEC2 window in
@@ -1951,21 +1933,6 @@ impl NvidiaGpu {
                 } else {
                     String::new()
                 };
-                // Console-quiet window (Linux console_lock equivalent) when the
-                // caller asked for it: the console framebuffer lives in THIS
-                // GPU's BAR1, and every prior console-GPU boot interleaved live
-                // seq-trace pixel writes with the sequencer MMIO -- the one
-                // thing Linux explicitly forbids around kgspInitRm
-                // (osinit.c:1841: "to ensure no console writes through BAR1
-                // can interfere"). Everything is still captured and folded
-                // into this /proc read afterwards; only live rendering stops.
-                if quiet && drain_for_console {
-                    log::info!(
-                        "[NVIDIA] {}: entering console-silent GSP boot window (Linux console_lock equivalent) -- next render after kgspInitRm returns",
-                        tag
-                    );
-                    nvidia_rm_sys::os_interface::console_quiet_begin();
-                }
                 // Arm the post-STARTCPU wedge watch (console GPU only): if
                 // the fabric dies, the machine survives with fake-MMIO and
                 // we get to attempt SBR recovery + retry -- converting the
@@ -2081,15 +2048,7 @@ impl NvidiaGpu {
                         }
                     );
                 }
-                if quiet && drain_for_console {
-                    nvidia_rm_sys::os_interface::console_quiet_end();
-                    log::info!(
-                        "[NVIDIA] {}: console-silent window exited (kgspInitRm returned)",
-                        tag
-                    );
-                }
                 if drain_for_console {
-                    nvidia_rm_sys::os_boundary::linux_parity_disarm();
                     nvidia_rm_sys::os_boundary::sec2_drain_disarm();
                 }
                 nvidia_rm_sys::os_boundary::seq_trace_disarm();
@@ -4119,12 +4078,12 @@ impl DrmScheme for NvidiaGpu {
         if self.drives_boot_display() {
             s.push_str(&bringup_all::mark_primary_for_rm(self, "gpustep6"));
             let window = boot_window::BootWindow::enter(self, "gpustep6", &mut s);
-            s.push_str(&self.gsp_boot_run("gpustep6", false));
+            s.push_str(&self.gsp_boot_run("gpustep6"));
             window.leave(&mut s);
             return s;
         }
 
-        s.push_str(&self.gsp_boot_run("gpustep6", false));
+        s.push_str(&self.gsp_boot_run("gpustep6"));
         s
     }
 
@@ -4178,7 +4137,7 @@ impl DrmScheme for NvidiaGpu {
         //    post-boot, if FB carving ever eats the console.
         // 2. GSP-RM boot. gsp_boot_run arms the console SEC2 drain internally
         //    now, so this is the proven path; cached after the first boot.
-        s.push_str("[gpustep14] --- stage 2: GSP-RM boot (kgspInitRm, console-SILENT, Linux-parity STARTCPU, VGA decode off, PBUS pre-clear) ---\n");
+        s.push_str("[gpustep14] --- stage 2: GSP-RM boot (kgspInitRm, VGA decode off, PBUS pre-clear) ---\n");
         // The whole hand-over to the firmware -- display engine off, VGA
         // decode renounced -- lives in `boot_window`, which also says why
         // taking the display away is the piece Linux always had and this
@@ -4190,10 +4149,10 @@ impl DrmScheme for NvidiaGpu {
         // on 0058b6f4) and nothing else ever did. It is 2-for-3 and only
         // partly understood, so it stays until the display hand-over is proven
         // on hardware to make it unnecessary. `gsp_boot_run` arms the drain
-        // for console GPUs when quiet=false.
+        // for console GPUs.
         let window = boot_window::BootWindow::enter(self, "gpustep14", &mut s);
         nvidia_rm_sys::os_interface::live_echo_begin();
-        s.push_str(&self.gsp_boot_run("gpustep14", false));
+        s.push_str(&self.gsp_boot_run("gpustep14"));
         nvidia_rm_sys::os_interface::live_echo_end();
         window.leave(&mut s);
         // 3-5. RM controls, state pre-init/init/load, CE data movement -- reuse

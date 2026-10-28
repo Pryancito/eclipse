@@ -527,20 +527,6 @@ pub fn sec2_drain_disarm() {
     SEC2_DRAIN_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Linux byte-parity mode for the STARTCPU bracket. Stock Linux CORE_RESUME
-/// performs EXACTLY: read SEC2 CPUCTL (0x840100), write CPUCTL_ALIAS
-/// (0x840130) -- with ZERO intervening MMIO (kernel_falcon_tu102.c:231-244).
-/// Eclipse's bracket historically inserted a BSI pre-read, an interrupt-tree
-/// snapshot (including a DISPLAY register read at 0x611C30 and priv-ring
-/// reads at 0x120058), and a W1C drain sweep between those two accesses.
-/// Falsification status of the wedge theories so far: console-silent boot +
-/// pre-boot PBUS clean still wedged, and the single successful boot ran a
-/// build WITHOUT the display/priv-ring probe reads. When armed, the bracket
-/// does NOTHING: no BSI read, no snapshot, no drain -- the store goes through
-/// the generic path exactly like Linux. Armed by gsp_boot_run(quiet=true)
-/// together with the console-silent window; supersedes SEC2_DRAIN_ARMED.
-static LINUX_PARITY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
 /// Wedge containment (the "no more pointless reboots" machinery). The console
 /// GPU's SEC2 CORE_RESUME wedge is a ~25-30% race that no driver-visible knob
 /// controls (falsification ladder: console silence, PBUS clear, VGA decode,
@@ -613,16 +599,6 @@ pub fn wedge_fake_mmio_on() -> bool {
     WEDGE_FAKE_MMIO.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Arm Linux byte-parity mode for the next GSP boot's STARTCPU bracket.
-pub fn linux_parity_arm() {
-    LINUX_PARITY.store(true, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// Disarm Linux byte-parity mode (boot returned).
-pub fn linux_parity_disarm() {
-    LINUX_PARITY.store(false, core::sync::atomic::Ordering::Relaxed);
-}
-
 /// Snapshot + drain the CPU-facing top-level interrupt tree just before the
 /// SEC2 STARTCPU posted write. `base` is this GPU's BAR0 virtual base
 /// (`DEVICE_MAPPING::gpuNvAddr`). Register map (Turing bare-metal, PF: the
@@ -642,9 +618,8 @@ unsafe fn sec2_intr_snapshot_and_drain(base: *mut u8) {
     let wr = |off: usize, v: NvU32| core::ptr::write_volatile(base.add(off) as *mut NvU32, v);
 
     // (1) Snapshot BEFORE draining. probe_line captures ALWAYS (folded into
-    // the /proc read) and renders at ERROR when outside the console-quiet
-    // window (quiet mode deliberately gives up live wedge forensics; step13
-    // stays loud for that).
+    // the /proc read) and renders at INFO when outside the console-quiet
+    // window.
     let top0 = rd(TOP);
     let pmc0 = rd(0x100);
     let pmc1 = rd(0x104);
@@ -1019,12 +994,7 @@ pub extern "C" fn osDevWriteReg032(
     // Set when the STARTCPU store is posted inside the drain path below (tight
     // W1C-then-store), so the generic write at the end is skipped (no double-post).
     let mut startcpu_posted = false;
-    // Linux byte-parity mode: the bracket contributes ZERO extra MMIO and zero
-    // logging -- the store proceeds through the generic write below, exactly
-    // like kflcnStartCpu_TU102 on Linux (read CPUCTL, write CPUCTL_ALIAS,
-    // nothing between). See LINUX_PARITY's doc for the falsification trail.
-    let parity = LINUX_PARITY.load(core::sync::atomic::Ordering::Relaxed);
-    if is_sec2_startcpu && !parity {
+    if is_sec2_startcpu {
         GSP_PROBE_ON.store(true, core::sync::atomic::Ordering::Relaxed);
         // Belt-and-braces trace trigger: normally the trace went live already
         // when the RUN_CPU_SEQUENCER narration line was seen (covering the
@@ -1162,8 +1132,8 @@ pub extern "C" fn osDevWriteReg032(
     if !startcpu_posted {
         if let Some(base) = dev_mapping_base(pMapping) {
             // Breadcrumb only for the STARTCPU store (never per-register — a CMOS
-            // write per MMIO would be ruinous); the non-drain path (Linux-parity
-            // etc.) still hits the same wedge point.
+            // write per MMIO would be ruinous); the non-drain path (the secondary
+            // GPU) still hits the same wedge point.
             if is_sec2_startcpu {
                 crate::survival::checkpoint(crate::survival::milestone::STARTCPU_PRE);
                 let (mv, mc) = crate::survival::msi_status();
@@ -1181,8 +1151,8 @@ pub extern "C" fn osDevWriteReg032(
                 crate::survival::checkpoint(crate::survival::milestone::STARTCPU_POST);
             }
         }
-        // Same 15 ms pause on the non-drain STARTCPU paths (parity mode
-        // etc.), kept for the same reason.
+        // Same 15 ms pause on the non-drain STARTCPU path (the secondary
+        // GPU), kept for the same reason.
         if is_sec2_startcpu {
             crate::hooks::with_hooks((), |h| h.delay_us(15_000));
         }
