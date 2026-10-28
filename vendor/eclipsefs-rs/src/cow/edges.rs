@@ -2025,8 +2025,7 @@ fn a_failed_drop_keeps_holding_every_stripe_of_the_chunk() {
             .find(|(&g, c)| g != 0 && c.stripes.len() > 1)
             .expect("a chunk of its own with more than one stripe to hold");
         let len = c.stripe_len();
-        let want: Vec<(u32, u64, u64)> =
-            c.stripes.iter().map(|s| (s.devid, s.phys, len)).collect();
+        let want: Vec<(u32, u64, u64)> = c.stripes.iter().map(|s| (s.devid, s.phys, len)).collect();
         (g, want)
     };
     // The commit of the drop dies at once, so what it held is still held.
