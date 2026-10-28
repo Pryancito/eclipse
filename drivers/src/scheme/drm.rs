@@ -310,37 +310,6 @@ pub trait DrmScheme: Scheme {
     /// instead of a bare "no firmware". Default: ignore.
     fn set_gsp_firmware_status(&self, _status: alloc::string::String) {}
 
-    /// GPU copy-engine bring-up **Step 2**, surfaced (opt-in) at
-    /// `/proc/gpustep2`: write the channel instance block into sysmem and issue
-    /// the GMMU flush — the first real GPU register writes of the bring-up.
-    /// Default: nothing. The hardware driver targets a specific GPU and
-    /// returns a human-readable report. Unlike `debug_dump` this is NOT
-    /// read-only, hence its own node: `/proc/gpudbg` stays safe to poll.
-    ///
-    /// TEMPORARY (see nvidia.rs `bringup_step2`): currently targets the
-    /// CONSOLE GPU (only one GPU available; the other has unrelated
-    /// problems) instead of the original non-console safety net — a wedge
-    /// here can blank the only display and require a hard reboot.
-    fn bringup_step2(&self) -> alloc::string::String {
-        alloc::string::String::new()
-    }
-
-    /// GPU copy-engine bring-up **Step 3** (`/proc/gpustep3`): enable the
-    /// doorbell, commit the channel runlist, and enable the channel in the
-    /// scheduler — with an empty GPFIFO so nothing actually executes. Same
-    /// targeting as `bringup_step2` (see its TEMPORARY note). Default: nothing.
-    fn bringup_step3(&self) -> alloc::string::String {
-        alloc::string::String::new()
-    }
-
-    /// GPU copy-engine bring-up **Step 4** (`/proc/gpustep4`): ring the doorbell
-    /// with a pushbuffer that binds the copy class (`SET_OBJECT`), exercising the
-    /// full doorbell → PBDMA → GMMU-translated pushbuffer fetch → method-parse
-    /// path. Same targeting as `bringup_step2` (see its TEMPORARY note). Default: nothing.
-    fn bringup_step4(&self) -> alloc::string::String {
-        alloc::string::String::new()
-    }
-
     /// Bring-up **Step 5** (`/proc/gpustep5`): the real vendored RM core's
     /// own attach path (`nvidia_rm_sys::rm_init::attach_gpu`) -- real HAL
     /// bind/attach work, not a safe register read. Originally wired into
@@ -386,32 +355,6 @@ pub trait DrmScheme: Scheme {
     /// buffers, verified by CPU readback through BAR2. Cached per boot.
     /// Default: nothing.
     fn bringup_step10(&self) -> alloc::string::String {
-        alloc::string::String::new()
-    }
-
-    /// Bring-up **Step 11** (`/proc/gpustep11`): GSP-RM boot on the CONSOLE
-    /// GPU with pre-boot register dumps, full-chain VGA-routing disable,
-    /// root-port completion-timeout containment, and post-STARTCPU bus
-    /// autopsy. Cached per boot. Default: nothing.
-    fn bringup_step11(&self) -> alloc::string::String {
-        alloc::string::String::new()
-    }
-
-    /// Bring-up **Step 12** (`/proc/gpustep12`): EXP 1 -- console-GPU GSP
-    /// boot with the display engine held in reset (scanout DMA stopped) to
-    /// test the live-iso-fetch-vs-SEC2 theory. Blanks the screen; run blind
-    /// and capture to a file. Default: nothing.
-    fn bringup_step12(&self) -> alloc::string::String {
-        alloc::string::String::new()
-    }
-
-    /// Bring-up **Step 13** (`/proc/gpustep13`): EXP 2 -- console-GPU GSP boot
-    /// with a pre-STARTCPU interrupt-drain "pseudo-ISR service loop". Snapshots
-    /// + write-1-to-clears the CPU-facing top-level interrupt tree right before
-    /// the SEC2 STARTCPU posted store, testing whether an unserviced
-    /// fabric/display interrupt (Eclipse is 100% polled, no RM ISR) is what
-    /// stalls the write. Does NOT touch PDISP. Cached per boot. Default: nothing.
-    fn bringup_step13(&self) -> alloc::string::String {
         alloc::string::String::new()
     }
 
@@ -1152,18 +1095,12 @@ mod tests {
     fn the_whole_bringup_ladder_is_silent_by_default() {
         let dev = BareDrm::new();
         let steps: Vec<(u32, String)> = vec![
-            (2, dev.bringup_step2()),
-            (3, dev.bringup_step3()),
-            (4, dev.bringup_step4()),
             (5, dev.bringup_step5()),
             (6, dev.bringup_step6()),
             (7, dev.bringup_step7()),
             (8, dev.bringup_step8()),
             (9, dev.bringup_step9()),
             (10, dev.bringup_step10()),
-            (11, dev.bringup_step11()),
-            (12, dev.bringup_step12()),
-            (13, dev.bringup_step13()),
             (14, dev.bringup_step14()),
             (15, dev.bringup_step15()),
             (16, dev.bringup_step16()),
@@ -1175,9 +1112,9 @@ mod tests {
             (22, dev.bringup_step22()),
             (23, dev.bringup_step23()),
         ];
-        // Every rung from 2 to 23 is present and silent. A rung missing from
-        // this list is a rung nobody checked.
-        assert_eq!(steps.len(), 22);
+        // Every rung that still has a node (5 to 10, 14 to 23) is present and
+        // silent. A rung missing from this list is a rung nobody checked.
+        assert_eq!(steps.len(), 16);
         for (n, text) in steps {
             assert!(text.is_empty(), "step{} is not silent: {:?}", n, text);
         }

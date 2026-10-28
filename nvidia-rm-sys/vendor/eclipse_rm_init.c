@@ -7436,7 +7436,7 @@ NV_STATUS eclipse_rm_ce_release_inflight(void)
  * the console GPU wedges during the SEC2 GSP-RM resume even with the graphic
  * console fully frozen (KD_GRAPHICS, zero CPU pixel writes) -- so the
  * remaining delta vs. Linux is exactly this mis-declared identity plus the
- * missing console-region reservation. Called by bringup_step11 (nvidia.rs)
+ * missing console-region reservation. Called by the console GPU's GSP boot (nvidia.rs)
  * before eclipse_rm_init_gsp, i.e. at the same point in the sequence where
  * Linux runs the real thing.
  */

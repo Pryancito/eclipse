@@ -53,7 +53,7 @@ use present::proc_present_content;
 use smoltcp::wire::{IpAddress, IpCidr};
 use status::{proc_pid_status, proc_task_status};
 
-const PROC_ROOT_STATIC: [&str; 59] = [
+const PROC_ROOT_STATIC: [&str; 53] = [
     "net",
     "gpuready",
     "present",
@@ -79,18 +79,12 @@ const PROC_ROOT_STATIC: [&str; 59] = [
     "filesystems",
     "gpudbg",
     "stalls",
-    "gpustep2",
-    "gpustep3",
-    "gpustep4",
     "gpustep5",
     "gpustep6",
     "gpustep7",
     "gpustep8",
     "gpustep9",
     "gpustep10",
-    "gpustep11",
-    "gpustep12",
-    "gpustep13",
     "gpustep14",
     "gpustep15",
     "gpustep16",
@@ -798,18 +792,12 @@ impl INode for ProcRootINode {
             "stalls" => Ok(PROC_STALLS.clone()),
             "present" => Ok(PROC_PRESENT.clone()),
             "oops" => Ok(PROC_OOPS.clone()),
-            "gpustep2" => Ok(PROC_GPUSTEP2.clone()),
-            "gpustep3" => Ok(PROC_GPUSTEP3.clone()),
-            "gpustep4" => Ok(PROC_GPUSTEP4.clone()),
             "gpustep5" => Ok(PROC_GPUSTEP5.clone()),
             "gpustep6" => Ok(PROC_GPUSTEP6.clone()),
             "gpustep7" => Ok(PROC_GPUSTEP7.clone()),
             "gpustep8" => Ok(PROC_GPUSTEP8.clone()),
             "gpustep9" => Ok(PROC_GPUSTEP9.clone()),
             "gpustep10" => Ok(PROC_GPUSTEP10.clone()),
-            "gpustep11" => Ok(PROC_GPUSTEP11.clone()),
-            "gpustep12" => Ok(PROC_GPUSTEP12.clone()),
-            "gpustep13" => Ok(PROC_GPUSTEP13.clone()),
             "gpuready" => Ok(PROC_GPUREADY.clone()),
             "gpustep14" => Ok(PROC_GPUSTEP14.clone()),
             "gpustep15" => Ok(PROC_GPUSTEP15.clone()),
@@ -3310,47 +3298,6 @@ fn proc_gpudbg_content() -> String {
     s
 }
 
-/// `/proc/gpustep2` — opt-in GPU copy-engine bring-up Step 2 (instance block +
-/// GMMU flush). NOT read-only: each `cat` issues the real GPU writes, but only
-/// on the GPU that does not drive the console. Kept separate from `/proc/gpudbg`
-/// so the latter stays safe to poll.
-fn proc_gpustep2_content() -> String {
-    let mut s = String::new();
-    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-        s.push_str(&d.bringup_step2());
-    }
-    if s.is_empty() {
-        s.push_str("[gpustep2] no DRM driver with bring-up support\n");
-    }
-    s
-}
-
-/// `/proc/gpustep3` — opt-in bring-up Step 3 (doorbell + runlist commit) on the
-/// non-console GPU.
-fn proc_gpustep3_content() -> String {
-    let mut s = String::new();
-    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-        s.push_str(&d.bringup_step3());
-    }
-    if s.is_empty() {
-        s.push_str("[gpustep3] no DRM driver with bring-up support\n");
-    }
-    s
-}
-
-/// `/proc/gpustep4` — opt-in bring-up Step 4 (ring doorbell + SET_OBJECT) on the
-/// non-console GPU.
-fn proc_gpustep4_content() -> String {
-    let mut s = String::new();
-    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-        s.push_str(&d.bringup_step4());
-    }
-    if s.is_empty() {
-        s.push_str("[gpustep4] no DRM driver with bring-up support\n");
-    }
-    s
-}
-
 /// `/proc/gpustep5` — opt-in: the real vendored RM core's own attach path
 /// (real HAL bind/attach work). Moved out of `/proc/gpudbg` after it hung
 /// real hardware on a plain `cat` -- deliberately separate so `gpudbg`
@@ -3443,66 +3390,6 @@ fn proc_gpustep10_content() -> String {
     }
     if s.is_empty() {
         s.push_str("[gpustep10] no DRM driver with bring-up support\n");
-    }
-    s
-}
-
-/// `/proc/gpustep11` — GSP-RM boot on the CONSOLE GPU, with the graphic
-/// console frozen around it. The wedge that made step 6 skip this GPU is
-/// (per every experiment so far) CPU pixel writes landing in its BAR1 —
-/// the console framebuffer — during the SEC2 GSP-RM resume window; step 6's
-/// own narration draws dozens of lines right into that window. Freezing =
-/// KD_GRAPHICS on the active VT: pixel presentation stops (this is the
-/// battle-tested Xorg handover path), while the VT shadow buffer keeps
-/// accumulating and serial/dmesg stay live. Returning to KD_TEXT repaints
-/// the whole backlog, so nothing is visually lost — the screen just stands
-/// still for the few seconds the boot takes. NVIDIA's own driver does the
-/// same thing around init via os_disable_console_access() (osinit.c).
-fn proc_gpustep11_content() -> String {
-    // NOTE: an earlier revision froze the graphic console (KD_GRAPHICS)
-    // around this call, mirroring Linux's os_disable_console_access(). The
-    // console GPU wedged identically with zero CPU pixel writes -- so the
-    // console is exonerated and this now runs UNFROZEN, with the driver
-    // narrating every post-STARTCPU register access live (see
-    // bringup_step11): on a wedge, the last line on screen names the exact
-    // register access that never completed.
-    let mut s = String::new();
-    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-        s.push_str(&d.bringup_step11());
-    }
-    if s.is_empty() {
-        s.push_str("[gpustep11] no DRM driver with bring-up support\n");
-    }
-    s
-}
-
-/// `/proc/gpustep12` — EXP 1: console-GPU GSP boot with the display engine
-/// held in reset (scanout stopped). BLANKS THE SCREEN; run blind and capture
-/// to a file (`cat /proc/gpustep12 > /r12.txt; sync`), then hard-reset.
-fn proc_gpustep12_content() -> String {
-    let mut s = String::new();
-    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-        s.push_str(&d.bringup_step12());
-    }
-    if s.is_empty() {
-        s.push_str("[gpustep12] no DRM driver with bring-up support\n");
-    }
-    s
-}
-
-/// `/proc/gpustep13` — EXP 2: console-GPU GSP boot with a pre-STARTCPU
-/// interrupt-drain "pseudo-ISR service loop" (no display touch). Snapshots +
-/// W1C-drains the CPU-facing interrupt tree right before the SEC2 STARTCPU
-/// store. Screen is untouched, but if STARTCPU still wedges the snapshot only
-/// survives on the framebuffer/serial -- capture with
-/// `cat /proc/gpustep13 > /r13.txt; sync`, then read /r13.txt.
-fn proc_gpustep13_content() -> String {
-    let mut s = String::new();
-    for d in kernel_hal::drivers::all_drm().as_vec().iter() {
-        s.push_str(&d.bringup_step13());
-    }
-    if s.is_empty() {
-        s.push_str("[gpustep13] no DRM driver with bring-up support\n");
     }
     s
 }
@@ -4270,24 +4157,6 @@ lazy_static! {
         inode: 131,
         generate: proc_bootprofile_content,
     });
-    /// `/proc/gpustep2` — opt-in: each read performs Step 2 (instance block +
-    /// GMMU flush) on the non-console GPU and reports the result.
-    static ref PROC_GPUSTEP2: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 98,
-        generate: proc_gpustep2_content,
-    });
-    /// `/proc/gpustep3` — opt-in: doorbell-enable + runlist commit on the
-    /// non-console GPU. Inodes 97/98 are deliberately below the `100 + pid`
-    /// per-process inode range to avoid colliding with process directories.
-    static ref PROC_GPUSTEP3: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 97,
-        generate: proc_gpustep3_content,
-    });
-    /// `/proc/gpustep4` — opt-in: ring doorbell + SET_OBJECT on the non-console GPU.
-    static ref PROC_GPUSTEP4: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 96,
-        generate: proc_gpustep4_content,
-    });
     /// `/proc/gpustep5` — opt-in: real vendored RM core attach
     /// (`nvidia_rm_sys::rm_init::attach_gpu`). Moved out of `/proc/gpudbg`
     /// after it hung real hardware on a plain `cat`.
@@ -4320,24 +4189,6 @@ lazy_static! {
     static ref PROC_GPUSTEP10: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 90,
         generate: proc_gpustep10_content,
-    });
-    /// `/proc/gpustep11` -- console-GPU GSP boot, console frozen (see
-    /// proc_gpustep11_content).
-    static ref PROC_GPUSTEP11: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 89,
-        generate: proc_gpustep11_content,
-    });
-    /// `/proc/gpustep12` -- EXP1 console-GPU GSP boot, PDISP held in reset
-    /// (see proc_gpustep12_content).
-    static ref PROC_GPUSTEP12: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 88,
-        generate: proc_gpustep12_content,
-    });
-    /// `/proc/gpustep13` -- EXP2 console-GPU GSP boot, pre-STARTCPU interrupt
-    /// drain (see proc_gpustep13_content).
-    static ref PROC_GPUSTEP13: Arc<dyn INode> = Arc::new(ProcSeqINode {
-        inode: 86,
-        generate: proc_gpustep13_content,
     });
     /// `/proc/gpustep14` -- console GPU full bring-up chain (see
     /// proc_gpustep14_content).

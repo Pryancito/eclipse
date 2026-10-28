@@ -9378,8 +9378,10 @@ mod rm_edges_tests;
 mod rm_failures_tests;
 
 /// The RM bring-up readers (`gpustep5`..`gpustep9`) on the fake RM, and
-/// what `gpustep6` and `gpustep11`..`gpustep14` say before hardware.
+/// what `gpustep6` and `gpustep14` say before hardware.
 mod bringup_steps_tests;
+/// The compute dispatcher (`eclipse-compute`).
+mod compute_launch_tests;
 /// The compute rungs (`gpustep18`..`gpustep23`), `gpubench` and the
 /// copy-engine test (`gpustep10`) on the fake RM, as far as each got.
 mod compute_steps_tests;
@@ -9388,9 +9390,6 @@ mod compute_steps_tests;
 mod display_state_tests;
 /// `/proc/gpudbg` on a BAR0 the test writes, and the two PTOP readers.
 mod gpudbg_tests;
-/// The first three rungs of the copy-engine ladder (`gpustep2/3/4`) and
-/// the compute dispatcher, on a BAR0 the test writes and the spin hook plays.
-mod ladder_mmio_tests;
 /// The `/proc` readers of the bring-up ladder (`gpustep15/16/17`,
 /// `gpuedid`) on the fake RM, and the HDA driver's two questions.
 mod proc_steps_tests;
