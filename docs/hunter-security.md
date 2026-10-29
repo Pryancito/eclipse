@@ -23,6 +23,7 @@ testable on the host.
 | `check_exec_integrity`     | `sys_execve`, interpreters, boot spawn   | exec integrity  |
 | `check_exec_av`            | `sys_execve`, interpreters, boot spawn   | antivirus       |
 | `check_mmap`               | `sys_mmap`                               | W^X memory      |
+| `firewall::check`          | `sys_connect`, `sys_bind`, `sys_sendto`, `sys_sendmsg` | per-application firewall |
 | `check_mprotect`           | `sys_mprotect`                           | W^X memory      |
 | `task_exit`                | `sys_exit_group`                         | state cleanup   |
 | `netmon::on_listen`        | `sys_listen`                             | network monitor |
@@ -46,6 +47,7 @@ There are three independently-tunable enforcement domains, each with its own
 | `anomaly` | Block (vs. only log) detected floods / fork bombs | `Report`  |
 | `integrity` | SHA-256 of the image vs. its pinned digest      | `Report`  |
 | `av`      | Antivirus signatures matched on the image          | `Report`  |
+| `net`     | Which programs may reach the network ([firewall](#per-application-firewall)) | `Report`  |
 
 The defaults are deliberately conservative. The syscall domain is `Enforce`
 because whitelists are opt-in per process (no policy registered ⇒ permissive),
@@ -195,6 +197,9 @@ One directive per line; blank lines and `#` comments are ignored.
 | `media-lock <on\|off>`                 | nothing runs from media until it scans clean (default off) |
 | `media <id> scanning\|failed`          | a scan agent took / gave up on a device             |
 | `media <id> done <files> <infected>`   | a scan agent's verdict on a device                  |
+| `net <allow\|deny> <path> [in\|out]`  | a [firewall](#per-application-firewall) rule; no direction is both |
+| `net forget <path>` / `net dismiss <path>` | drop a program's rules / its open questions     |
+| `net timeout <secs>` / `net mode <mode>` | how long `enforce` waits for an answer (1-300 s); same as `mode net` |
 | `seal`                                 | engage the one-way tighten-only latch               |
 
 **All or nothing.** A script (a whole `policy.conf`, or one `write(2)` to
@@ -319,6 +324,7 @@ the bar as `/bin/lunarhunter`, in the app menu as **Seguridad (hunter)**
 | Programas | the allowlist counts, kernel vs. disk pins, the learned programs, **save learned** (`hunterctl save-learned`) and **verify integrity** (`hunterctl verify`) |
 | Programados | the scheduled scans (see [Antivirus](#antivirus-signatures)): per job off / daily / weekly, the day, the time in 30-minute steps, alert or quarantine, its next run and **run now** (`hunterctl run-scheduled`); then the history, newest first |
 | Red | every TCP/UDP socket with the process holding it (pid, program, local and remote address), unexpected listeners first and in red with an **allow** button (`hunterctl expect-port`, two clicks), the alerts switch, and the expected ports with **remove** (`hunterctl forget-port`); re-read every two seconds while open. See [Network monitor](#network-monitor) |
+| Cortafuegos | the [firewall](#per-application-firewall): each open question ("¿Permitir que wget se conecte a la red?") with **Permitir** / **Bloquear** / **Ignorar**, the rules with **Olvidar**, and the `net` mode; every change is sent to `/proc/hunter` and the live rules are written to `/etc/hunter/firewall` |
 
 Like the bar it holds no policy: settings go through `/proc/hunter`, scans
 through `/proc/hunter_scan` (the same batches of 256 paths `hunterctl scan`
@@ -451,6 +457,73 @@ hunterd do one last pass and exit.
 criticals, `--critical`, `--this-boot`, and a count); it reads only the disk,
 so it works after a reboot and on a kernel without hunter. Tools that want the
 history (reports, scheduled scans) should read `events.log*` directly.
+
+## Per-application firewall
+
+`hunter::firewall` ([`hunter/src/firewall.rs`](../hunter/src/firewall.rs))
+decides which **programs** may reach the network. Every other domain sees a
+dropper calling home and `curl` fetching a page as the same `connect(2)`; this
+one asks which executable is doing it, and keeps the answer as a rule.
+
+**What is checked.** `connect`, and `sendto` / `sendmsg` with a destination
+address, are the outgoing direction (`out`); `bind` to a fixed port is the
+incoming one (`in`, the program wants to be a server). Never asked about:
+loopback either way, the unspecified address as a destination, a bind to port
+0 (a client choosing its source port), and anything that is not IP (unix,
+netlink, packet sockets) — the desktop itself lives on those. The kernel half
+is [`linux-syscall/src/net/hunter_firewall.rs`](../linux-syscall/src/net/hunter_firewall.rs).
+The program is the process's executable as `execve` recorded it (so a script
+is its interpreter).
+
+**Rules and questions.** A rule is `allow` or `deny`, for one program and one
+direction or both. A program with no rule becomes a **question**: it shows up
+in `/proc/hunter_firewall` and in lunarhunter's **Cortafuegos** tab, which
+answers it with `net allow|deny <path> <dir>` on `/proc/hunter`. What happens
+meanwhile depends on the mode:
+
+| Mode | No rule | `deny` rule |
+|---|---|---|
+| `off` | allowed, not asked | allowed |
+| `report` (default) | allowed, and asked | **blocked** (`EACCES`) |
+| `enforce` | the call **waits** for the answer (30 s, `net timeout`), then `EACCES` | **blocked** |
+
+A `deny` blocks under `report` too: `report` is about hunter's own judgement,
+and a rule the person gave is not that. Under `enforce` the waiting call wakes
+on `allow`/`deny` within a quarter of a second, and on a signal with `EINTR`;
+a question that timed out stays open, so the next attempt can still be allowed.
+The question list is capped at 32 (the least recently asked goes first), and
+a program retrying against a `deny` is logged at 1, 2, 4, 8... blocks so it
+cannot flood the ring.
+
+**`/proc/hunter_firewall`** (read-only), one record per line, path last:
+
+```
+mode report
+timeout 30
+now 640
+rule allow both /usr/bin/curl
+rule deny out /usr/bin/nc
+pending out 3 142 610 636 93.184.216.34:443 /usr/bin/wget
+```
+
+`pending <dir> <count> <pid> <first> <last> <peer> <path>`, times in seconds
+since boot.
+
+**`/etc/hunter/firewall`** is loaded at boot (before `policy.conf`, so a
+`seal` there seals the rules), line by line — a bad line loses one rule:
+
+```
+mode enforce
+timeout 30
+allow /usr/bin/curl
+deny /usr/bin/nc out
+```
+
+lunarhunter rewrites it from the live state after every answer.
+
+**The latch.** `net allow` and `net forget` of a program with a `deny` relax
+the policy and are refused once sealed; `net deny` always applies, and
+`net dismiss` changes no rule.
 
 ## Exec integrity (SHA-256)
 
