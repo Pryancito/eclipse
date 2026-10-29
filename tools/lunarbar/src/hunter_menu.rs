@@ -309,6 +309,7 @@ impl State {
     pub(super) fn refresh_hunter(&mut self) {
         self.hunter = hunter::read();
         self.metrics.hunter = self.hunter.as_ref().map(|s| s.shield(self.hunter_seen));
+        self.toast_kernel();
     }
 
     /// Shield click: toggle the menu. Opening it counts as having seen the
