@@ -468,5 +468,7 @@ impl BrcmPcie {
     }
 }
 
+pub mod reset;
+
 #[cfg(test)]
 mod brcmstb_tests;
