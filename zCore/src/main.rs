@@ -1180,6 +1180,17 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     "Eclipse: nvidia.gem_comptags -- VM_BIND honours compressed PTE kinds"
                 );
             }
+            // The AMD 10GbE (`xgbe`) probe runs its bring-up sequence instead
+            // of leaving the device unclaimed. Default off: the whole
+            // sequence is pinned against the `amd-xgbe` source and has never
+            // reached the part, because QEMU does not emulate an XGMAC. With
+            // the hatch shut the device is left exactly as it is without the
+            // driver, so nothing here can regress a machine that is not
+            // asking for it.
+            if kernel_hal::cmdline::flag(&options.cmdline, "xgbe.enable") {
+                kernel_hal::drivers::set_xgbe_enabled(true);
+                klog_info!("Eclipse: xgbe.enable -- the AMD 10GbE bring-up sequence runs");
+            }
             // The classic nvc0 (OpenGL) submission path actually submits,
             // instead of parsing the request and returning EOPNOTSUPP: every
             // listed buffer is mapped into the channel's VAS, the relocs are

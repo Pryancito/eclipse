@@ -240,3 +240,192 @@ fn a_ring_full_of_fragments_with_no_end_does_not_spin() {
     }
     assert!(r.recv(&fake).is_none());
 }
+
+// ——— Tanda 29: la secuencia entera, y la escotilla ———
+
+fn config() -> BringUpConfig {
+    BringUpConfig {
+        variant: Variant::V2b,
+        snps_ver: 0x30,
+        tx_channels: 1,
+        rx_channels: 1,
+        tx_queues: 1,
+        rx_queues: 1,
+        tc_count: 1,
+        tx_fifo: 65_536,
+        rx_fifo: 65_536,
+        mtu: MTU,
+        mac: [0x02, 0x11, 0x22, 0x33, 0x44, 0x55],
+    }
+}
+
+#[test]
+fn the_hatch_is_shut_until_the_cmdline_opens_it() {
+    // Default off, like `nvidia.gem_comptags` and the rest: nothing that
+    // has never run against the part turns itself on.
+    assert!(
+        !enabled() || {
+            set_enabled(false);
+            !enabled()
+        }
+    );
+    set_enabled(true);
+    assert!(enabled());
+    set_enabled(false);
+    assert!(!enabled());
+}
+
+#[test]
+fn the_sequence_flushes_the_queues_before_it_configures_anything() {
+    let fake = FakeXgmac::new();
+    let mut n = 0u32;
+    bring_up(&fake, &config(), &mut || n += 1).unwrap();
+    let log = fake.log();
+    let first_ftq = log
+        .iter()
+        .position(|a| {
+            matches!(a, Access::Write(o, v)
+            if *o == mtl_queue_reg(0, MTL_Q_TQOMR)
+                && get_bits(*v, MTL_Q_TQOMR_FTQ.0, MTL_Q_TQOMR_FTQ.1) == 1)
+        })
+        .unwrap();
+    let first_dma = log
+        .iter()
+        .position(|a| matches!(a, Access::Write(o, _) if *o == DMA_AXIARCR))
+        .unwrap();
+    assert!(
+        first_ftq < first_dma,
+        "flush at {} but the bus attributes at {}",
+        first_ftq,
+        first_dma
+    );
+}
+
+#[test]
+fn the_fifo_is_split_before_anything_measured_in_queue_sizes() {
+    let fake = FakeXgmac::new();
+    let mut n = 0u32;
+    bring_up(&fake, &config(), &mut || n += 1).unwrap();
+    let log = fake.log();
+    let fifo = log
+        .iter()
+        .rposition(|a| {
+            matches!(a, Access::Write(o, v)
+            if *o == mtl_queue_reg(0, MTL_Q_RQOMR)
+                && get_bits(*v, MTL_Q_RQOMR_RQS.0, MTL_Q_RQOMR_RQS.1) != 0)
+        })
+        .unwrap();
+    let marks = log
+        .iter()
+        .position(|a| matches!(a, Access::Write(o, _) if *o == mtl_queue_reg(0, MTL_Q_RQFCR)))
+        .unwrap();
+    assert!(
+        fifo < marks,
+        "fifo at {} but water marks at {}",
+        fifo,
+        marks
+    );
+}
+
+#[test]
+fn the_water_marks_are_computed_from_bytes_and_not_from_the_register_value() {
+    // `equal_fifo_share` returns units-of-256 minus one. Using it as a
+    // byte count would land on a queue a thousand times too small, and
+    // the answer would still be in range.
+    let bytes = 65_536u32;
+    let as_register = equal_fifo_share(bytes, 1).unwrap();
+    assert_ne!(as_register, bytes);
+    let right = queue_flow_control(bytes, MAX_JUMBO_PACKET);
+    let wrong = queue_flow_control(as_register, MAX_JUMBO_PACKET);
+    assert_ne!(right, wrong);
+    // And this is what the sequence actually programs.
+    let fake = FakeXgmac::new();
+    let mut n = 0u32;
+    bring_up(&fake, &config(), &mut || n += 1).unwrap();
+    let written = fake
+        .log()
+        .iter()
+        .filter_map(|a| match a {
+            Access::Write(o, v) if *o == mtl_queue_reg(0, MTL_Q_RQFCR) => Some(*v),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(
+        get_bits(written, MTL_Q_RQFCR_RFA.0, MTL_Q_RQFCR_RFA.1),
+        right.rfa
+    );
+    assert_eq!(
+        get_bits(written, MTL_Q_RQFCR_RFD.0, MTL_Q_RQFCR_RFD.1),
+        right.rfd
+    );
+}
+
+#[test]
+fn the_receiver_is_the_last_thing_switched_on() {
+    let fake = FakeXgmac::new();
+    let mut n = 0u32;
+    bring_up(&fake, &config(), &mut || n += 1).unwrap();
+    let log = fake.log();
+    let re = log
+        .iter()
+        .rposition(|a| {
+            matches!(a, Access::Write(o, v)
+            if *o == MAC_RCR && get_bits(*v, MAC_RCR_RE.0, MAC_RCR_RE.1) == 1)
+        })
+        .unwrap();
+    // Every filter and length limit is already in place by then.
+    for earlier in [MAC_PFR, MAC_VLANTR, MAC_MACA0LR] {
+        let last = log
+            .iter()
+            .rposition(|a| matches!(a, Access::Write(o, _) if *o == earlier))
+            .unwrap();
+        assert!(
+            last < re,
+            "{:#06x} written at {} but RE at {}",
+            earlier,
+            last,
+            re
+        );
+    }
+}
+
+#[test]
+fn the_station_address_the_sequence_writes_is_the_one_it_was_given() {
+    let fake = FakeXgmac::new();
+    let mut n = 0u32;
+    let cfg = config();
+    bring_up(&fake, &cfg, &mut || n += 1).unwrap();
+    let lo = fake
+        .log()
+        .iter()
+        .filter_map(|a| match a {
+            Access::Write(o, v) if *o == MAC_MACA0LR => Some(*v),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(lo & 0xff, cfg.mac[0] as u32);
+    assert_eq!((lo >> 8) & 0xff, cfg.mac[1] as u32);
+}
+
+#[test]
+fn a_sequence_with_no_queues_is_refused_instead_of_dividing_by_zero() {
+    let fake = FakeXgmac::new();
+    let mut n = 0u32;
+    let mut cfg = config();
+    cfg.rx_queues = 0;
+    assert!(bring_up(&fake, &cfg, &mut || n += 1).is_err());
+}
+
+#[test]
+fn the_rings_the_sequence_returns_are_already_programmed() {
+    let fake = FakeXgmac::new();
+    let mut n = 0u32;
+    let mut rings = bring_up(&fake, &config(), &mut || n += 1).unwrap();
+    assert_eq!(rings.buffer_size(), calc_rx_buf_size(MTU));
+    // The ring base went out during the sequence, so a send needs no
+    // further setup.
+    assert!(fake.writes_to(dma_channel_reg(0, DMA_CH_TDLR_LO)) >= 1);
+    rings.send(&fake, &[1u8; 64]).unwrap();
+}

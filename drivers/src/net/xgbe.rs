@@ -1721,14 +1721,75 @@ impl PciDriver for XgbeDriverPci {
             ),
         }
 
-        // And stop here, on purpose. There is no datapath yet, and an
-        // interface registered without one would be handed packets to drop in
-        // silence while `ifconfig` showed a link that does not exist. The
-        // device stays unclaimed, exactly as it is without this driver; what
-        // the lines above print is the geometry the datapath has to be built
-        // against, which is otherwise a guess.
+        // The hatch. Shut unless `xgbe.enable` is on the cmdline, because
+        // not one register write below has ever reached this part: QEMU does
+        // not emulate an XGMAC, so the whole sequence is pinned against the
+        // `amd-xgbe` source and nothing else. With the hatch shut the device
+        // is left exactly as unclaimed as it is without this driver, so there
+        // is no way for any of it to regress a machine that is not asking.
+        if !enabled() {
+            warn!(
+                "[xgbe] identified, but the datapath has never run on hardware: \
+                 leaving the device unclaimed (pass `xgbe.enable` to try it)"
+            );
+            return Err(DeviceError::NotSupported);
+        }
+
+        let Some(mac) = mac_from_prop(lo, hi) else {
+            warn!("[xgbe] xgbe.enable is on but there is no station address to use");
+            return Err(DeviceError::NotSupported);
+        };
+
+        // Safety: `xgmac` is the mapping resolved above, and the length was
+        // checked against `MIN_XGMAC_BAR_LEN` before anything was read.
+        let acc = unsafe { Bar0::new(xgmac) };
+        let cfg = BringUpConfig {
+            variant,
+            snps_ver: version.snps,
+            tx_channels: 1,
+            rx_channels: 1,
+            tx_queues: counts.tx_queues.max(1),
+            rx_queues: counts.rx_queues.max(1),
+            tc_count: feat.tc_count.max(1),
+            tx_fifo,
+            rx_fifo,
+            mtu: STD_PACKET_MTU,
+            mac,
+        };
+
+        warn!("[xgbe] xgbe.enable: running the bring-up sequence for the first time");
+        let mut spins = 0u32;
+        match bring_up(&acc, &cfg, &mut || spins = spins.wrapping_add(1)) {
+            Ok(rings) => {
+                info!(
+                    "[xgbe] bring-up finished: {} B receive buffers, {} tx / {} rx \
+                     descriptors, {} poll iterations",
+                    rings.buffer_size(),
+                    TX_RING_SIZE,
+                    RX_RING_SIZE,
+                    spins
+                );
+                info!(
+                    "[xgbe] MAC_RCR={:#010x} MAC_TCR={:#010x} DMA_CH0_RCR={:#010x} \
+                     DMA_CH0_TCR={:#010x}",
+                    acc.read32(MAC_RCR),
+                    acc.read32(MAC_TCR),
+                    acc.read32(dma_channel_reg(0, DMA_CH_RCR)),
+                    acc.read32(dma_channel_reg(0, DMA_CH_TCR))
+                );
+            }
+            Err(e) => {
+                warn!("[xgbe] bring-up failed at {:?} after {} polls", e, spins);
+                return Err(e);
+            }
+        }
+
+        // And still no interface: the rings exist and the chip is configured,
+        // but nothing is plumbed into the stack yet, so there is nothing to
+        // hand a packet to. What the four lines above print is what a log
+        // from a real card has to show before the next step is worth taking.
         warn!(
-            "[xgbe] identified, but there is no datapath for this controller yet: \
+            "[xgbe] the sequence ran, but there is no interface yet: \
              leaving the device unclaimed"
         );
         Err(DeviceError::NotSupported)
@@ -1740,6 +1801,9 @@ pub use datapath::*;
 
 mod rings;
 pub use rings::*;
+
+mod bringup;
+pub use bringup::*;
 
 #[cfg(test)]
 mod fake;
