@@ -250,6 +250,11 @@ impl MdioBus {
     fn write_reg(&self, off: usize, val: u32) {
         #[cfg(test)]
         let val = mdio_fake::al_escribir(self.base, off, val);
+        // El MDIO escribe en la ventana DEL PUENTE, asi que sus escrituras van
+        // a la misma traza: es la unica forma de comprobar que el PLL se
+        // reprograma con el SerDes ya encendido.
+        #[cfg(test)]
+        super::bridge_fake::apunta(super::bridge_fake::PUENTE, off, val);
         unsafe { write_volatile((self.base + off) as *mut u32, val) }
     }
 }

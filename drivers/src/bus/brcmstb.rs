@@ -63,6 +63,31 @@ const MODULE: &str = "brcm-pcie";
 /// del espacio de configuración del puente.
 pub const CAP_REGS: usize = 0x00ac;
 
+// Los offsets de dentro de la capacidad PCIe, contra
+// `include/uapi/linux/pci_regs.h`. Son relativos a [`CAP_REGS`], no a la
+// ventana, y se acceden **de 16 bits** salvo `LNKCAP`.
+
+/// `PCI_EXP_LNKCAP` (32 bits).
+pub const CAP_LNKCAP: usize = 0x0c;
+/// `PCI_EXP_LNKCAP_SLS`: las velocidades que el puente anuncia soportar.
+pub const LNKCAP_SLS: u32 = 0xf;
+/// `PCI_EXP_LNKSTA` (16 bits).
+pub const CAP_LNKSTA: usize = 0x12;
+/// `PCI_EXP_LNKSTA_CLS`: la velocidad a la que quedo el enlace.
+pub const LNKSTA_CLS: u16 = 0x000f;
+/// `PCI_EXP_LNKSTA_NLW`: y con cuantas lineas.
+pub const LNKSTA_NLW: u16 = 0x03f0;
+/// `PCI_EXP_RTCTL` (16 bits).
+pub const CAP_RTCTL: usize = 0x1c;
+/// `PCI_EXP_RTCTL_CRSSVE`.
+pub const RTCTL_CRSSVE: u16 = 0x0010;
+/// `PCI_EXP_RTCAP` (16 bits).
+pub const CAP_RTCAP: usize = 0x1e;
+/// `PCI_EXP_RTCAP_CRSVIS`.
+pub const RTCAP_CRSVIS: u16 = 0x0001;
+/// `PCI_EXP_LNKCTL2` (16 bits).
+pub const CAP_LNKCTL2: usize = 0x30;
+
 /// `PCIE_RC_CFG_VENDOR_VENDOR_SPECIFIC_REG1`.
 pub const RC_CFG_VENDOR_SPECIFIC_REG1: usize = 0x0188;
 /// `..._ENDIAN_MODE_BAR2_MASK`.
@@ -350,11 +375,36 @@ impl BrcmPcie {
     }
 
     fn read(&self, off: usize) -> u32 {
-        unsafe { read_volatile((self.base + off) as *const u32) }
+        let val = unsafe { read_volatile((self.base + off) as *const u32) };
+        #[cfg(test)]
+        let val = bridge_fake::al_leer(off, val);
+        val
     }
 
     fn write(&self, off: usize, val: u32) {
+        #[cfg(test)]
+        bridge_fake::apunta(bridge_fake::PUENTE, off, val);
         unsafe { write_volatile((self.base + off) as *mut u32, val) }
+    }
+
+    /// Los registros de dentro de la capacidad PCIe son de 16 bits, y la
+    /// anchura es parte del acceso: una escritura de 32 se llevaria por delante
+    /// el registro de al lado, que en este bloque es otro registro de verdad.
+    fn read16(&self, off: usize) -> u16 {
+        unsafe { read_volatile((self.base + off) as *const u16) }
+    }
+
+    fn write16(&self, off: usize, val: u16) {
+        #[cfg(test)]
+        bridge_fake::apunta(bridge_fake::PUENTE, off, u32::from(val));
+        unsafe { write_volatile((self.base + off) as *mut u16, val) }
+    }
+
+    /// Cambia solo los bits de `mask` de un registro de 16.
+    fn modify16(&self, off: usize, mask: u16, val: u16) {
+        let shift = mask.trailing_zeros();
+        let tmp = (self.read16(off) & !mask) | ((val << shift) & mask);
+        self.write16(off, tmp);
     }
 
     /// Cambia sólo los bits de `mask`, dejando el resto como estaban.
@@ -476,8 +526,82 @@ impl BrcmPcie {
     }
 }
 
+pub mod bringup;
 pub mod mdio;
 pub mod reset;
+
+/// El orden en que se tocan los registros, que es la mitad de lo que hay que
+/// comprobar en una secuencia de arranque y lo unico que un banco de registros
+/// no recuerda.
+///
+/// La traza es **una sola para los cuatro bloques** (el puente, el controlador
+/// de resets, el recalibrado y el MDIO del PHY), porque lo que hay que
+/// comprobar es justo el orden ENTRE ellos: que el puente sale de reset antes
+/// de que se toque el SerDes, que el PLL se reprograma con el SerDes ya
+/// encendido.
+#[cfg(test)]
+pub(super) mod bridge_fake {
+    use core::cell::RefCell;
+
+    /// De que bloque es una entrada de la traza.
+    pub const PUENTE: &str = "puente";
+    /// El controlador de resets de estilo SW_INIT.
+    pub const RESET: &str = "reset";
+    /// El recalibrado del PHY.
+    pub const RESCAL: &str = "rescal";
+
+    /// Una entrada: de que bloque, en que offset y con que valor.
+    pub type Entrada = (&'static str, usize, u32);
+
+    std::thread_local! {
+        /// Cada escritura, en orden.
+        pub static TRAZA: RefCell<alloc::vec::Vec<Entrada>> =
+            const { RefCell::new(alloc::vec::Vec::new()) };
+
+        /// Bits del puente que **leen cero** aunque se les escriba un uno, que
+        /// es como se porta un bit reservado en una revision del chip. Sin
+        /// esto no hay forma de recorrer el camino del 2712C1.
+        pub static RESERVADOS: RefCell<alloc::vec::Vec<(usize, u32)>> =
+            const { RefCell::new(alloc::vec::Vec::new()) };
+    }
+
+    pub fn apunta(fuente: &'static str, off: usize, val: u32) {
+        TRAZA.with(|t| t.borrow_mut().push((fuente, off, val)));
+    }
+
+    /// Lo que de verdad se lee del puente, con los bits reservados a cero.
+    pub fn al_leer(off: usize, val: u32) -> u32 {
+        RESERVADOS.with(|r| {
+            let mut out = val;
+            for (o, mask) in r.borrow().iter() {
+                if *o == off {
+                    out &= !*mask;
+                }
+            }
+            out
+        })
+    }
+
+    /// Declara que `mask` del registro `off` es un bit reservado en este chip.
+    pub fn reservar(off: usize, mask: u32) {
+        RESERVADOS.with(|r| r.borrow_mut().push((off, mask)));
+    }
+
+    /// Corre `f` con la traza y la lista de reservados limpias, y devuelve lo
+    /// que se haya apuntado.
+    pub fn trazando<T>(f: impl FnOnce() -> T) -> (T, alloc::vec::Vec<Entrada>) {
+        TRAZA.with(|t| t.borrow_mut().clear());
+        RESERVADOS.with(|r| r.borrow_mut().clear());
+        let r = f();
+        (r, TRAZA.with(|t| core::mem::take(&mut *t.borrow_mut())))
+    }
+
+    /// En que posicion de la traza se escribio por primera vez `off` en
+    /// `fuente`, si se escribio.
+    pub fn primera(traza: &[Entrada], fuente: &str, off: usize) -> Option<usize> {
+        traza.iter().position(|(f, o, _)| *f == fuente && *o == off)
+    }
+}
 
 #[cfg(test)]
 mod brcmstb_tests;

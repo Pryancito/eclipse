@@ -46,20 +46,24 @@ const MODULE: &str = "brcm-reset";
 /// drivers del árbol: un tope de vueltas, para que un reloj que no avanza deje
 /// el arranque con un retardo corto de más en vez de colgar el núcleo.
 pub(super) fn udelay(us: u64) {
+    // En un banco de pruebas la espera se apunta y no se duerme: lo que hay que
+    // comprobar es que esta y cuanto, no gastarla. Con la espera de verdad, los
+    // 200 ms del peor caso del enlace se pagarian en cada test.
     #[cfg(test)]
     reset_fake::ESPERADO.with(|c| c.set(c.get() + us));
-    if us == 0 {
-        return;
-    }
-    const MAX_SPINS: u64 = 1_000_000;
-    let ahora = || unsafe { crate::bus::drivers_timer_now_as_micros() };
-    let t0 = ahora();
-    let mut n = 0u64;
-    while ahora().wrapping_sub(t0) < us {
-        core::hint::spin_loop();
-        n += 1;
-        if n >= MAX_SPINS {
-            break;
+
+    #[cfg(not(test))]
+    if us != 0 {
+        const MAX_SPINS: u64 = 1_000_000;
+        let ahora = || unsafe { crate::bus::drivers_timer_now_as_micros() };
+        let t0 = ahora();
+        let mut n = 0u64;
+        while ahora().wrapping_sub(t0) < us {
+            core::hint::spin_loop();
+            n += 1;
+            if n >= MAX_SPINS {
+                break;
+            }
         }
     }
 }
@@ -180,6 +184,8 @@ impl BrcmstbReset {
     }
 
     fn write(&self, off: usize, val: u32) {
+        #[cfg(test)]
+        super::bridge_fake::apunta(super::bridge_fake::RESET, off, val);
         unsafe { write_volatile((self.base + off) as *mut u32, val) }
     }
 }
@@ -292,6 +298,8 @@ impl PcieRescal {
     fn write(&self, off: usize, val: u32) {
         #[cfg(test)]
         let val = reset_fake::filtra(off, val);
+        #[cfg(test)]
+        super::bridge_fake::apunta(super::bridge_fake::RESCAL, off, val);
         unsafe { write_volatile((self.base + off) as *mut u32, val) }
     }
 }
