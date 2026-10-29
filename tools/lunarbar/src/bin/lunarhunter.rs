@@ -6,10 +6,11 @@
 //! This is the rest of it, as an application the menu opens:
 //!
 //! - **Resumen** — the stance in one sentence, every counter, the newest
-//!   alerts and the quick actions (scan home, update signatures, EICAR test,
-//!   lockdown).
-//! - **Protección** — the six domains with what each one guards, the four
-//!   switches (learning, anomaly-detection, privileged-deny, require-hash),
+//!   alerts, the quick actions (scan home, update signatures, EICAR test,
+//!   lockdown) and the USB sticks and disks mounted now, with their scan.
+//! - **Protección** — the six domains with what each one guards, the six
+//!   switches (learning, anomaly-detection, privileged-deny, require-hash,
+//!   media-scan, media-lock),
 //!   saving the live stance as the boot policy, applying `policy.conf`, and
 //!   the seal.
 //! - **Eventos** — the whole event ring, every field, filtered by severity.
@@ -52,8 +53,9 @@ use std::time::{Duration, Instant};
 
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
-use lunarbar::hunter::{self, Mode, SendError, Shield, DOMAINS};
+use lunarbar::hunter::{self, MediaState, Mode, SendError, Shield, DOMAINS};
 use lunarbar::hunter_export::{self as export, civil_time};
+use lunarbar::hunter_media as media;
 use lunarbar::hunter_report::{
     self as report, Feed, Quarantined, Report, Severity, SigFile, Switch,
 };
@@ -286,6 +288,8 @@ enum Act {
     QuickScan,
     Export,
     Sched(SchedAct),
+    /// Scan removable device `id` again (`hunterctl scan-media`).
+    ScanMedia(u64),
 }
 
 impl Act {
@@ -313,13 +317,14 @@ enum JobKind {
     Restore,
     /// `hunterctl schedule` or `run-scheduled`.
     Schedule,
+    Media,
 }
 
 impl JobKind {
     /// The tab whose console shows this job's output.
     fn home(self) -> Tab {
         match self {
-            JobKind::Scan | JobKind::Quarantine => Tab::Scan,
+            JobKind::Scan | JobKind::Quarantine | JobKind::Media => Tab::Scan,
             JobKind::Eicar | JobKind::Update => Tab::Signatures,
             JobKind::Verify | JobKind::SaveLearned => Tab::Programs,
             JobKind::Restore => Tab::Quarantine,
@@ -829,6 +834,15 @@ impl State {
             self.say(msg, p.failure.is_some() || !p.found.is_empty());
         } else if kind == JobKind::Schedule {
             self.sched_finished(&out);
+        } else if kind == JobKind::Media {
+            // `hunterctl scan-media` ends on its summary, and exits 1 when it
+            // found something: that is a verdict, not a command that failed.
+            let last = out.lines.last().cloned().unwrap_or_default();
+            let last = last
+                .strip_prefix("hunterctl: ")
+                .unwrap_or(&last)
+                .to_string();
+            self.say(last, !out.ok);
         } else if !out.ok {
             let m = self.t(
                 "la orden falló (ver la consola)",
@@ -942,6 +956,14 @@ impl State {
             Act::Verify => self.start(JobKind::Verify, Vec::new(), vec!["verify".into()]),
             Act::Export => self.export(),
             Act::Sched(a) => self.sched_act(a),
+            Act::ScanMedia(id) => {
+                self.tab = Tab::Scan;
+                self.start(
+                    JobKind::Media,
+                    Vec::new(),
+                    vec!["scan-media".into(), id.to_string()],
+                );
+            }
         }
     }
 
@@ -1652,6 +1674,10 @@ fn tab_overview(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
     );
     cy += BTN_H + 24;
 
+    if s.media_known {
+        cy = media_section(g, (x, cy, w), r, &free);
+    }
+
     // The newest alerts.
     g.section(x, cy, w, st.t("Últimas alertas", "Latest alerts"));
     cy += 30;
@@ -1670,6 +1696,79 @@ fn tab_overview(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
         cy += ROW_H;
     }
     (0, 0, 0, 0)
+}
+
+/// The USB sticks and disks mounted now: where, from what, the scan's
+/// verdict, and a button to scan one again. An infected one lists what was
+/// found under it, from `hunterctl scan-media`'s report. Returns where the
+/// next section starts.
+fn media_section(
+    g: &mut Paint,
+    (x, mut cy, w): (i32, i32, i32),
+    r: &Report,
+    free: &dyn Fn(Act) -> Option<Act>,
+) -> i32 {
+    let st = g.st;
+    let p = g.p;
+    g.section(
+        x,
+        cy,
+        w,
+        st.t("Dispositivos extraíbles", "Removable devices"),
+    );
+    cy += 30;
+    let devs = &r.status.media;
+    if devs.is_empty() {
+        let none = if r.status.media_scan {
+            st.t(
+                "ningún dispositivo montado: se escanean al conectarlos",
+                "no device mounted: they are scanned when plugged in",
+            )
+        } else {
+            st.t(
+                "ningún dispositivo montado (escanear USB está apagado)",
+                "no device mounted (scan USB is off)",
+            )
+        };
+        g.text(&fit(none, w), x, cy, p.dim);
+        return cy + ROW_H + 14;
+    }
+    // The newest three: one stick is the usual case, three is already a lot.
+    for d in devs.iter().rev().take(3) {
+        let c = match d.state {
+            MediaState::Infected | MediaState::Failed => CRIT,
+            MediaState::Clean => OK,
+            MediaState::Skipped => p.dim,
+            MediaState::Pending | MediaState::Scanning => p.accent,
+        };
+        let label = st.t("Escanear", "Scan");
+        let bw = Canvas::text_width(label) + 24;
+        let busy = matches!(d.state, MediaState::Pending | MediaState::Scanning);
+        g.button(
+            x + w - bw,
+            cy - 6,
+            bw,
+            label,
+            Style::Normal,
+            if busy {
+                None
+            } else {
+                free(Act::ScanMedia(d.id))
+            },
+        );
+        let left = format!("{}  ({})", d.target, d.source);
+        g.bold(&fit_left(&left, w / 2), x, cy, p.text);
+        let v = media::verdict(st.lang, d);
+        g.text(&fit(&v, w / 2 - bw - 16), x + w / 2, cy, c);
+        cy += ROW_H + 6;
+        if d.state == MediaState::Infected {
+            for f in media::findings(d.id).iter().take(3) {
+                g.text(&fit_left(f, w - 16), x + 16, cy, CRIT);
+                cy += GLYPH_H + 4;
+            }
+        }
+    }
+    cy + 14
 }
 
 /// One event: time, severity, category, text.
@@ -1746,6 +1845,18 @@ fn switch_text(lang: Lang, sw: Switch) -> (&'static str, &'static str) {
             "un programa sin fijar es una violación",
             "an unpinned program is a violation",
         ),
+        Switch::MediaScan => (
+            "escanear USB",
+            "scan USB",
+            "escanear cada pendrive al montarlo",
+            "scan every stick or disk when mounted",
+        ),
+        Switch::MediaLock => (
+            "bloquear USB",
+            "lock USB",
+            "nada se ejecuta del USB sin escanear",
+            "nothing runs from USB until scanned",
+        ),
     };
     (tr(lang, es, en), tr(lang, hes, hen))
 }
@@ -1795,7 +1906,9 @@ fn tab_protection(g: &mut Paint, (x, y, w, _h): Rect, r: &Report) -> Rect {
             |i| st.root && !report::sealed_refuses_switch(r, sw, i == 1),
             |i| Act::Switch(sw, i == 1),
         );
-        cy += ROW_H + 10;
+        // Tighter than the domains: six of them have to leave the buttons
+        // and the seal's note inside a window at its default height.
+        cy += ROW_H + 5;
     }
     cy += 14;
     let ok = |a: Act| st.root.then_some(a);
@@ -2011,10 +2124,10 @@ fn tab_scan(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
 
     // The findings, each with its own quarantine button.
     let console_h = 4 * (GLYPH_H + 3) + 12;
-    let show_console = st
-        .job
-        .as_ref()
-        .is_some_and(|j| j.kind == JobKind::Quarantine || (j.kind == JobKind::Scan && st.auto_q));
+    let show_console = st.job.as_ref().is_some_and(|j| {
+        matches!(j.kind, JobKind::Quarantine | JobKind::Media)
+            || (j.kind == JobKind::Scan && st.auto_q)
+    });
     let lh = y + h - cy - if show_console { console_h + 10 } else { 0 };
     let found = prog.map(|p| p.found).unwrap_or_default();
     let rows = (lh / (ROW_H + 8)).max(1) as usize;
@@ -2722,6 +2835,9 @@ exec allowlist: active (configured=38, learned=3); blacklist=2; learning=on\n\
 heuristics: anomaly-detection=on privileged-deny=off\n\
 integrity: pinned=41 require-hash=off\n\
 av: signatures=5002 (hash=5000 bytes=2) detections=2\n\
+media: auto-scan=on lock=off devices=2\n\
+media-device: id=4 state=clean files=523 infected=0 fstype=vfat source=/dev/sdb1 target=/media/FOTOS\n\
+media-device: id=5 state=scanning files=0 infected=0 fstype=vfat source=/dev/sdc1 target=/media/usb\n\
 learned-programs (3):\n  /usr/bin/firefox\n  /usr/local/bin/eclipse-terminal\n  /bin/busybox\n\
 \n\
 recent events (oldest first):\n\
@@ -3060,6 +3176,16 @@ mod tests {
     }
 
     #[test]
+    fn the_overview_offers_a_rescan_only_for_a_device_not_being_scanned() {
+        let st = sample_state(Tab::Overview);
+        let f = frame(&st);
+        let offered = |id| f.hits.iter().any(|(_, a)| *a == Act::ScanMedia(id));
+        // The sample: #4 scanned clean, #5 being scanned.
+        assert!(offered(4));
+        assert!(!offered(5));
+    }
+
+    #[test]
     fn the_protection_tab_offers_every_mode_but_the_current_one() {
         let st = sample_state(Tab::Protection);
         let f = frame(&st);
@@ -3173,6 +3299,7 @@ mod tests {
             JobKind::SaveLearned,
             JobKind::Quarantine,
             JobKind::Restore,
+            JobKind::Media,
         ] {
             assert_ne!(k.home(), Tab::Overview);
         }
