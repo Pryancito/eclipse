@@ -2963,6 +2963,94 @@ pub fn config_rx_filter(acc: &dyn MmioAccess, filter: &RxFilter) {
     acc.write32(MAC_PFR, pfr);
 }
 
+// ——— Not interrupting on every frame ———
+
+/// `XGBE_V2_DMA_CLOCK_FREQ`: the DMA block's clock on the PCI parts, 500 MHz.
+/// The watchdog below counts THIS clock, not the link's and not a wall
+/// clock.
+pub const DMA_CLOCK_HZ: u32 = 500_000_000;
+/// `XGBE_V2_PTP_CLOCK_FREQ`: 125 MHz. Named only so that nobody reaches for
+/// it here: it times timestamps, not the receive watchdog, and the two are
+/// a factor of four apart.
+pub const PTP_CLOCK_HZ: u32 = 125_000_000;
+
+/// How many clock cycles one unit of the receive watchdog is worth.
+pub const RIWT_CYCLES_PER_UNIT: u32 = 256;
+/// `XGMAC_MAX_DMA_RIWT`: the widest value the eight-bit field holds.
+pub const MAX_DMA_RIWT: u32 = 0xff;
+/// `DMA_CH_RIWT_RWT`, index 0, width 8.
+pub const DMA_CH_RIWT_RWT: (u32, u32) = (0, 8);
+
+/// Microseconds to watchdog units. `xgbe_usec_to_riwt`.
+///
+/// Three things about this arithmetic:
+///
+/// - It counts the DMA clock, so the SAME microsecond figure becomes a
+///   different register value on a part with a different clock. A number
+///   copied out of another driver's defaults means a different delay here.
+/// - Linux divides the rate down to MHz FIRST, so a clock that is not a
+///   whole number of megahertz loses its fraction before anything else
+///   happens. Kept as it is: matching the kernel matters more here than the
+///   last few cycles, and the result is a coalescing delay, not a deadline.
+/// - It is clamped. Linux clamps where the value arrives from ethtool
+///   instead, so the conversion itself can hand back something that does not
+///   fit the eight-bit field; a value that wrapped there would ask for a
+///   *shorter* delay than requested, which is the wrong direction to fail.
+#[inline]
+pub const fn usec_to_riwt(usec: u32, clock_hz: u32) -> u32 {
+    let mhz = clock_hz / 1_000_000;
+    let riwt = usec.saturating_mul(mhz) / RIWT_CYCLES_PER_UNIT;
+    if riwt > MAX_DMA_RIWT {
+        MAX_DMA_RIWT
+    } else {
+        riwt
+    }
+}
+
+/// And back. `xgbe_riwt_to_usec`.
+///
+/// Not the inverse of [`usec_to_riwt`]: both truncate, so a round trip
+/// lands at or below where it started. Anything that compares a configured
+/// delay against a read-back one has to expect that, rather than treating a
+/// difference as the hardware having refused the setting.
+#[inline]
+pub const fn riwt_to_usec(riwt: u32, clock_hz: u32) -> u32 {
+    let mhz = clock_hz / 1_000_000;
+    if mhz == 0 {
+        return 0;
+    }
+    riwt * RIWT_CYCLES_PER_UNIT / mhz
+}
+
+/// Set the receive watchdog on the channels that have a receive ring.
+///
+/// Linux's loop `break`s at the first channel without one rather than
+/// skipping it, which only works because the receive channels come first.
+/// Taking a count instead says that out loud.
+pub fn config_rx_coalesce(acc: &dyn MmioAccess, rx_channels: u32, riwt: u32) {
+    for ch in 0..rx_channels {
+        write_field(
+            acc,
+            dma_channel_reg(ch, DMA_CH_RIWT),
+            DMA_CH_RIWT_RWT.0,
+            DMA_CH_RIWT_RWT.1,
+            riwt.min(MAX_DMA_RIWT),
+        );
+    }
+}
+
+/// The transmit side's coalescing, which is no register at all.
+///
+/// `xgbe_config_tx_coalesce` in Linux is a function that returns success
+/// without writing anything, and the symmetry with the receive side is a
+/// trap: there is no transmit watchdog. What limits transmit interrupts is
+/// the `IC` bit the driver decides to set on a descriptor, back in
+/// [`build_tx_frame`] --- a per-frame choice, not a timer the hardware
+/// keeps. This function exists so the pair reads honestly at the call site
+/// rather than looking like an omission.
+#[inline]
+pub fn config_tx_coalesce(_acc: &dyn MmioAccess) {}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.

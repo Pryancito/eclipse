@@ -3667,3 +3667,124 @@ fn promiscuous_and_all_multicast_are_different_bits() {
     assert_eq!(get_bits(word, MAC_PFR_PR.0, MAC_PFR_PR.1), 0);
     assert_eq!(get_bits(word, MAC_PFR_PM.0, MAC_PFR_PM.1), 1);
 }
+
+// ——— Tanda 20: not interrupting on every frame ———
+
+#[test]
+fn the_watchdog_counts_the_dma_clock_and_not_a_wall_clock() {
+    // 50 us at 500 MHz: 50 * 500 / 256.
+    assert_eq!(usec_to_riwt(50, DMA_CLOCK_HZ), 50 * 500 / 256);
+    // The same request on a part clocked a quarter as fast is a quarter of
+    // the units, which is a quarter of the delay the register will keep.
+    assert_ne!(
+        usec_to_riwt(50, DMA_CLOCK_HZ),
+        usec_to_riwt(50, PTP_CLOCK_HZ)
+    );
+    assert_eq!(usec_to_riwt(50, PTP_CLOCK_HZ), 50 * 125 / 256);
+    // The two clocks are a factor of four apart, which is how far off
+    // reaching for the wrong one puts you.
+    assert_eq!(DMA_CLOCK_HZ / PTP_CLOCK_HZ, 4);
+}
+
+#[test]
+fn the_rate_is_divided_down_to_megahertz_first() {
+    // A clock that is not a whole number of MHz loses its fraction before
+    // anything else happens, exactly as in Linux.
+    assert_eq!(
+        usec_to_riwt(100, 500_999_999),
+        usec_to_riwt(100, 500_000_000)
+    );
+}
+
+#[test]
+fn the_conversion_is_clamped_rather_than_allowed_to_wrap() {
+    // A value that wrapped would ask for a SHORTER delay than requested,
+    // which is the wrong direction to fail.
+    assert_eq!(usec_to_riwt(u32::MAX, DMA_CLOCK_HZ), MAX_DMA_RIWT);
+    assert_eq!(usec_to_riwt(1_000_000, DMA_CLOCK_HZ), MAX_DMA_RIWT);
+    // And it fits the field.
+    assert!(MAX_DMA_RIWT < (1 << DMA_CH_RIWT_RWT.1));
+}
+
+#[test]
+fn the_round_trip_loses_and_never_gains() {
+    // Both directions truncate, so anything comparing a configured delay
+    // against a read-back one has to expect to land at or below where it
+    // started, not treat the difference as a refused setting.
+    for usec in [1u32, 5, 10, 50, 100, 127] {
+        let back = riwt_to_usec(usec_to_riwt(usec, DMA_CLOCK_HZ), DMA_CLOCK_HZ);
+        assert!(back <= usec, "{} us came back as {}", usec, back);
+    }
+    // Small enough requests round all the way down to nothing.
+    assert_eq!(usec_to_riwt(0, DMA_CLOCK_HZ), 0);
+    assert_eq!(riwt_to_usec(0, DMA_CLOCK_HZ), 0);
+}
+
+#[test]
+fn a_clock_below_a_megahertz_does_not_divide_by_zero() {
+    assert_eq!(usec_to_riwt(50, 999_999), 0);
+    assert_eq!(riwt_to_usec(50, 999_999), 0);
+}
+
+#[test]
+fn the_watchdog_goes_to_every_receive_channel() {
+    let fake = FakeXgmac::new();
+    config_rx_coalesce(&fake, 3, 12);
+    for ch in 0..3 {
+        assert_eq!(
+            get_bits(
+                fake.read32(dma_channel_reg(ch, DMA_CH_RIWT)),
+                DMA_CH_RIWT_RWT.0,
+                DMA_CH_RIWT_RWT.1
+            ),
+            12,
+            "channel {}",
+            ch
+        );
+    }
+    // And to no others.
+    assert_eq!(fake.writes_to(dma_channel_reg(3, DMA_CH_RIWT)), 0);
+}
+
+#[test]
+fn a_watchdog_too_big_for_the_field_is_clamped_at_the_register_too() {
+    let fake = FakeXgmac::new();
+    config_rx_coalesce(&fake, 1, 0x1234);
+    assert_eq!(
+        get_bits(
+            fake.read32(dma_channel_reg(0, DMA_CH_RIWT)),
+            DMA_CH_RIWT_RWT.0,
+            DMA_CH_RIWT_RWT.1
+        ),
+        MAX_DMA_RIWT
+    );
+}
+
+#[test]
+fn there_is_no_transmit_watchdog_at_all() {
+    let fake = FakeXgmac::new();
+    config_tx_coalesce(&fake);
+    // Not an omission: Linux's xgbe_config_tx_coalesce writes nothing
+    // either. What limits transmit interrupts is the IC bit on a
+    // descriptor, which is a per-frame choice and not a timer.
+    assert!(fake.log().is_empty());
+    let mut ring = [Desc::default(); 4];
+    let frags = [fragment(0x1000, 60)];
+    let mut frame = one_frame(&frags);
+    frame.wants_interrupt = true;
+    build_tx_frame(&mut ring, 0, &frame).unwrap();
+    assert_ne!(ring[0].desc2 & (1 << TX_DESC2_IC.0), 0);
+}
+
+#[test]
+fn the_two_halves_of_receive_coalescing_are_different_mechanisms() {
+    // The microsecond half is this watchdog, in a register; the frame half
+    // is the INTE bit of batch ten, in a descriptor. Asking for neither
+    // means every descriptor interrupts.
+    assert!(rx_desc_wants_interrupt(0, 0, 0));
+    assert!(rx_desc_wants_interrupt(7, 0, 0));
+    // With only a watchdog, the descriptors stop asking and the timer
+    // carries it.
+    assert!(!rx_desc_wants_interrupt(0, 50, 0));
+    assert!(usec_to_riwt(50, DMA_CLOCK_HZ) > 0);
+}
