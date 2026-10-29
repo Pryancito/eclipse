@@ -321,11 +321,15 @@ standard Courier font, so it needs no library and no embedded font) and
 `/var/lib/hunter/reports/hunter-informe-YYYY-MM-DD.<ext>`, one per day, so a
 weekly run keeps the history.
 
-The event ring lives in kernel memory, so the events section covers the
-period **or since boot, if that is later**, and the report says which; the
+The events come from hunterd's history (`/var/log/hunter/events.log` and its
+rotations, `HUNTERD BOOT` lines left out, `LOST` lines kept) plus whatever the
+ring holds that hunterd has not written yet (by this boot's id and sequence
+number, so nothing counts twice). When the history cannot be read (no hunterd,
+or a reader that is not root: the log is `0640`) the ring is all there is, and
+it starts at boot. Either way the events section covers the period **or from
+where the events start, if that is later**, and the report says which; the
 quarantine and the signatures are on disk and cover the whole period. The
-report also flags when the ring overflowed (`dropped=`). Running it weekly
-from a scheduler, and merging events persisted to disk, plug in here.
+report also flags when the ring overflowed (`dropped=`).
 
 ## Exec integrity (SHA-256)
 

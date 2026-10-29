@@ -53,6 +53,8 @@ fn input(uptime: f64) -> Input {
         now: NOW,
         uptime: Some(uptime),
         days: DEFAULT_DAYS,
+        history: Vec::new(),
+        boot_id: None,
     }
 }
 
@@ -207,4 +209,88 @@ fn pdf_strings_are_escaped() {
     inp.host = "a(b)c\\d".into();
     let p = pdf(&inp, Lang::En);
     assert!(p.windows(10).any(|w| w == b"a\\(b\\)c\\\\d"));
+}
+
+/// hunterd's log for the sample: an older boot with one critical, then this
+/// boot (`bbbbbbbb`, uptime 3600 s, so it began at NOW - 3600) up to seq 3.
+fn history() -> Vec<Logged> {
+    let boot = NOW - 3600;
+    let iso = |t: u64| civil_time(t).replace(' ', "T") + ":00Z";
+    let text = format!(
+        "{a}\taaaaaaaa\t-\t0.000\t0\tNOTICE\tHUNTERD\tBOOT\tboot aaaaaaaa\n\
+         {b}\taaaaaaaa\t7\t50.000\t99\tCRIT\tEXEC\tBLOCKED\tblacklisted program: /tmp/x\n\
+         {c}\tbbbbbbbb\t-\t0.000\t0\tNOTICE\tHUNTERD\tBOOT\tboot bbbbbbbb\n\
+         {d}\tbbbbbbbb\t1\t10.000\t1\tNOTICE\tCONTROL\tCONFIG\tmode av enforce\n\
+         {e}\tbbbbbbbb\t2\t100.000\t733\tWARN\tEXEC\tREPORTED\tuntrusted exec /tmp/a.out\n\
+         {e}\tbbbbbbbb\t3\t101.000\t733\tWARN\tWX\tREPORTED\tW+X mapping in /tmp/a.out\n\
+         not a line\n",
+        a = iso(NOW - 3 * 86_400),
+        b = iso(NOW - 3 * 86_400 + 60),
+        c = iso(boot),
+        d = iso(boot + 60),
+        e = iso(boot + 120),
+    );
+    parse_history(&text)
+}
+
+#[test]
+fn iso_dates_round_trip() {
+    assert_eq!(parse_iso("2026-10-29T12:00:00Z"), Some(NOW));
+    assert_eq!(parse_iso("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(parse_iso("2024-02-29T23:59:59Z"), Some(1_709_251_199));
+    assert_eq!(parse_iso("2026-13-01T00:00:00Z"), None);
+    assert_eq!(parse_iso("2026-10-29 12:00:00"), None);
+}
+
+#[test]
+fn a_history_line_reads_like_a_ring_line() {
+    let h = history();
+    assert_eq!(h.len(), 6, "the bad line is skipped");
+    assert_eq!(h[0].seq, None);
+    assert_eq!(h[1].seq, Some(7));
+    assert_eq!(h[1].ev.sev, Severity::Crit);
+    assert_eq!(h[1].ev.text, "BLOCKED: blacklisted program: /tmp/x");
+    assert_eq!(h[1].time, NOW - 3 * 86_400 + 60);
+}
+
+#[test]
+fn the_history_reaches_past_the_boot_and_the_ring_adds_only_what_is_new() {
+    let mut inp = input(3600.0);
+    inp.history = history();
+    inp.boot_id = Some("bbbbbbbb".into());
+    let s = summarize(&inp, Lang::En);
+    assert!(s.from_disk);
+    // The log starts 3 days ago, inside the week.
+    assert!(s.since_boot);
+    assert_eq!(s.from, NOW - 3 * 86_400);
+    // Disk: the old critical, CONFIG and two warnings (BOOT lines left out);
+    // ring: seq 4 and 5, the two AV criticals not yet written. Ring 1-3 are
+    // already on disk and are not counted twice.
+    assert_eq!(s.events.len(), 6);
+    assert_eq!(s.by_sev, [0, 1, 2, 3]);
+    assert!(coverage(&s, Lang::En).unwrap().contains("hunterd"));
+}
+
+#[test]
+fn without_the_boot_id_the_ring_is_cut_by_date() {
+    let mut inp = input(3600.0);
+    inp.history = history();
+    let s = summarize(&inp, Lang::En);
+    // The last line on disk is at boot + 120 s: ring events at 100 and 101 s
+    // are before it, 200 and 300 s after.
+    assert_eq!(s.by_sev, [0, 1, 2, 3]);
+}
+
+#[test]
+fn a_full_week_on_disk_needs_no_note() {
+    let mut inp = input(3600.0);
+    let mut h = history();
+    h[0].time = NOW - 30 * 86_400;
+    inp.history = h;
+    inp.boot_id = Some("bbbbbbbb".into());
+    let s = summarize(&inp, Lang::Es);
+    assert!(!s.since_boot);
+    assert_eq!(coverage(&s, Lang::Es), None);
+    // The critical of 3 days ago is in, the line of 30 days ago is not.
+    assert_eq!(s.events.len(), 6);
 }

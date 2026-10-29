@@ -10,11 +10,15 @@
 //!
 //! The period is a week by default, but hunter keeps its event ring in kernel
 //! memory: a reboot empties it, and a busy week overflows it (the report's
-//! `dropped=` counter says by how much). So the events section covers "the
-//! period, or since boot if that is later", and says which, instead of
-//! pretending to a week it does not have. The quarantine index and the
-//! signature files are on disk and do cover the whole period. When events are
-//! persisted to disk, this is where they will be merged in.
+//! `dropped=` counter says by how much). `hunterd` copies the ring to
+//! `/var/log/hunter/events.log*` every few seconds, so the events come from
+//! there when it can be read, plus whatever the ring has that the last pass
+//! has not written yet. Without it (no hunterd yet, or a reader that is not
+//! root: the log is `0640`) the ring is all there is. Either way the events
+//! section covers "the period, or from where the history starts if that is
+//! later", and says which, instead of pretending to a week it does not have.
+//! The quarantine index and the signature files are on disk and do cover the
+//! whole period.
 //!
 //! PDF without a PDF library: the text rendering, paginated in Courier (one of
 //! the fourteen fonts every PDF reader carries, so nothing is embedded) with
@@ -49,6 +53,83 @@ pub struct Input {
     /// Seconds since boot, which turns the ring's timestamps into dates.
     pub uptime: Option<f64>,
     pub days: u32,
+    /// hunterd's history, oldest first; empty when there is none to read.
+    pub history: Vec<Logged>,
+    /// The first 8 characters of this boot's `boot_id`, as hunterd names it.
+    pub boot_id: Option<String>,
+}
+
+/// Where hunterd keeps the history, and its rotations (`.4` the oldest).
+pub const HISTORY: &str = "/var/log/hunter/events.log";
+const HISTORY_ROTATIONS: u32 = 4;
+
+/// One line of hunterd's `events.log`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Logged {
+    /// Seconds since the epoch.
+    pub time: u64,
+    pub boot: String,
+    /// `None` on hunterd's own lines (`HUNTERD BOOT`, `HUNTERD LOST`).
+    pub seq: Option<u64>,
+    /// The event as the ring would have shown it (`text` is `action: description`).
+    pub ev: RingEvent,
+}
+
+/// Seconds since the epoch from `YYYY-MM-DDTHH:MM:SSZ`, the inverse of
+/// [`civil_time`] (Hinnant's `days_from_civil`).
+pub fn parse_iso(s: &str) -> Option<u64> {
+    let s = s.strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.splitn(3, '-').map(|x| x.parse::<i64>().ok());
+    let (y, m, d) = (d.next()??, d.next()??, d.next()??);
+    let mut t = time.splitn(3, ':').map(|x| x.parse::<i64>().ok());
+    let (hh, mm, ss) = (t.next()??, t.next()??, t.next()??);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3600 + mm * 60 + ss).ok()
+}
+
+/// One `events.log` line: `time boot seq uptime pid severity category action
+/// description`, tab-separated. The format is hunterd's (see "hunterd: events
+/// and learning on disk" in docs/hunter-security.md).
+pub fn parse_history_line(line: &str) -> Option<Logged> {
+    let f: Vec<&str> = line.splitn(9, '\t').collect();
+    if f.len() < 8 {
+        return None;
+    }
+    let seq = match f[2] {
+        "-" => None,
+        n => Some(n.parse().ok()?),
+    };
+    let desc = f.get(8).copied().unwrap_or("");
+    Some(Logged {
+        time: parse_iso(f[0])?,
+        boot: f[1].to_string(),
+        seq,
+        ev: RingEvent {
+            seq: seq.unwrap_or(0),
+            ts: f[3].to_string(),
+            pid: f[4].parse().ok()?,
+            sev: Severity::parse(f[5])?,
+            category: f[6].to_string(),
+            text: if desc.is_empty() {
+                f[7].to_string()
+            } else {
+                format!("{}: {desc}", f[7])
+            },
+        },
+    })
+}
+
+pub fn parse_history(text: &str) -> Vec<Logged> {
+    text.lines().filter_map(parse_history_line).collect()
 }
 
 /// The three files a report can be.
@@ -127,9 +208,12 @@ pub fn file_name(now: u64, fmt: Format) -> String {
 pub struct Summary {
     /// Seconds since the epoch the events section starts at.
     pub from: u64,
-    /// The ring does not reach back to the start of the period (it starts at
-    /// boot): `from` is the boot, not `now - days`.
+    /// The events do not reach back to the start of the period: `from` is
+    /// the boot (ring only) or the start of hunterd's history, not
+    /// `now - days`.
     pub since_boot: bool,
+    /// The events come from hunterd's history (plus the ring's newest).
+    pub from_disk: bool,
     /// The ring's events in the period, oldest first, each with its date when
     /// the uptime is known.
     pub events: Vec<(Option<u64>, RingEvent)>,
@@ -169,19 +253,50 @@ pub fn summarize(inp: &Input, lang: Lang) -> Summary {
     let r = &inp.report;
     let start = inp.now.saturating_sub(u64::from(inp.days) * 86_400);
     let boot = inp.uptime.map(|u| inp.now.saturating_sub(u as u64));
-    let since_boot = boot.is_none_or(|b| b > start);
-    let from = match boot {
-        Some(b) => b.max(start),
-        None => start,
-    };
     let date_of = |e: &RingEvent| -> Option<u64> {
         let ts: f64 = e.ts.parse().ok()?;
         Some(boot? + ts as u64)
     };
-    let events: Vec<(Option<u64>, RingEvent)> = r
+    let from_disk = !inp.history.is_empty();
+    // Where the events begin: the oldest line on disk, or the boot.
+    let begins = if from_disk {
+        inp.history.first().map(|l| l.time)
+    } else {
+        boot
+    };
+    let since_boot = begins.is_none_or(|b| b > start);
+    let from = begins.map_or(start, |b| b.max(start));
+
+    // The ring's events the history does not have yet: by sequence number
+    // when this boot's id is known (seq restarts every boot), otherwise by
+    // date, after the last line written.
+    let written = |e: &RingEvent, d: Option<u64>| -> bool {
+        if !from_disk {
+            return false;
+        }
+        if let Some(id) = &inp.boot_id {
+            return inp
+                .history
+                .iter()
+                .any(|l| &l.boot == id && l.seq.is_some_and(|q| q >= e.seq));
+        }
+        let last = inp.history.last().map_or(0, |l| l.time);
+        d.is_none_or(|d| d <= last)
+    };
+    let ring = r
         .events
         .iter()
         .map(|e| (date_of(e), e.clone()))
+        .filter(|(d, e)| !written(e, *d));
+    // hunterd's BOOT lines are bookkeeping; its LOST lines are kept, since
+    // events nobody saw are worth a line in a security report.
+    let disk = inp
+        .history
+        .iter()
+        .filter(|l| !(l.ev.category == "HUNTERD" && l.ev.text.starts_with("BOOT")))
+        .map(|l| (Some(l.time), l.ev.clone()));
+    let events: Vec<(Option<u64>, RingEvent)> = disk
+        .chain(ring)
         .filter(|(d, _)| d.is_none_or(|d| d >= start))
         .collect();
 
@@ -216,6 +331,7 @@ pub fn summarize(inp: &Input, lang: Lang) -> Summary {
     let mut s = Summary {
         from,
         since_boot,
+        from_disk,
         events,
         by_sev,
         categories: ranked(cats),
@@ -377,6 +493,42 @@ fn stance(r: &Report, lang: Lang) -> (String, &'static str) {
             ),
             "warn",
         )
+    }
+}
+
+/// Where the events come from and how far back they reach, when it is not
+/// simply "the whole period, from the history on disk".
+fn coverage(s: &Summary, lang: Lang) -> Option<String> {
+    let t = |es, en| tr(lang, es, en);
+    let rest = t(
+        "La cuarentena y las firmas sí cubren el periodo entero.",
+        "The quarantine and the signatures do cover the whole period.",
+    );
+    match (s.from_disk, s.since_boot) {
+        (true, false) => None,
+        (true, true) => Some(format!(
+            "{} {} UTC. {rest}",
+            t(
+                "El historial de hunterd (/var/log/hunter) empieza el",
+                "hunterd's history (/var/log/hunter) starts on"
+            ),
+            civil_time(s.from)
+        )),
+        (false, false) => Some(
+            t(
+                "Eventos tomados del anillo de hunter en memoria (no se pudo leer /var/log/hunter).",
+                "Events taken from hunter's in-memory ring (/var/log/hunter could not be read).",
+            )
+            .into(),
+        ),
+        (false, true) => Some(format!(
+            "{} {} UTC. {rest}",
+            t(
+                "Sin historial en disco, los eventos son los del anillo en memoria: desde el arranque, el",
+                "With no history on disk, the events are the in-memory ring's: since boot, on"
+            ),
+            civil_time(s.from)
+        )),
     }
 }
 
@@ -570,19 +722,8 @@ pub fn html(inp: &Input, lang: Lang) -> String {
         "</div><div class=\"note\">INFO {} · NOTICE {} · WARN {} · CRIT {}</div>\n",
         s.by_sev[0], s.by_sev[1], s.by_sev[2], s.by_sev[3]
     ));
-    if s.since_boot {
-        h.push_str(&format!(
-            "<p class=\"note\">{} {} UTC{}</p>\n",
-            t(
-                "hunter guarda los eventos en memoria: este informe los cubre desde el arranque, el",
-                "hunter keeps its events in memory: this report covers them since boot, on"
-            ),
-            civil_time(s.from),
-            t(
-                ". La cuarentena y las firmas sí cubren el periodo entero.",
-                ". The quarantine and the signatures do cover the whole period."
-            )
-        ));
+    if let Some(note) = coverage(&s, lang) {
+        h.push_str(&format!("<p class=\"note\">{}</p>\n", esc(&note)));
     }
 
     // What to do.
@@ -898,15 +1039,8 @@ pub fn lines(inp: &Input, lang: Lang) -> Vec<Line> {
             st.signatures
         )),
     ];
-    if s.since_boot {
-        o.push(line(format!(
-            "{} {} UTC.",
-            t(
-                "Los eventos se guardan en memoria: cubren desde el arranque,",
-                "Events are kept in memory: they cover since boot,"
-            ),
-            civil_time(s.from)
-        )));
+    if let Some(note) = coverage(&s, lang) {
+        o.push(line(note));
     }
 
     o.push(line(""));
@@ -1208,7 +1342,27 @@ pub fn gather(days: u32) -> Option<Input> {
             .unwrap_or(0),
         uptime: uptime(),
         days,
+        history: read_history(),
+        boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .and_then(|s| s.trim().get(..8).map(str::to_string)),
     })
+}
+
+/// `events.log.4` (the oldest) to `events.log`, whatever of it can be read:
+/// it is `0640`, so a reader that is not root or in its group gets nothing
+/// and the report falls back to the ring.
+fn read_history() -> Vec<Logged> {
+    let mut paths: Vec<String> = (1..=HISTORY_ROTATIONS)
+        .rev()
+        .map(|i| format!("{HISTORY}.{i}"))
+        .collect();
+    paths.push(HISTORY.to_string());
+    paths
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .flat_map(|t| parse_history(&t))
+        .collect()
 }
 
 /// Write `bytes` to `path` through a temporary file and a rename, so a
