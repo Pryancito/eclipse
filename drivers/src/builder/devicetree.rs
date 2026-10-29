@@ -207,10 +207,19 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
 /// llama, pero los tests siguen comprobandola.
 #[cfg(any(not(feature = "loopback"), test))]
 fn is_ethernet(comp: &StringList) -> bool {
-    // El GMAC del Allwinner D1 (riscv64) y el GENET v5 del BCM2711 (la
-    // Raspberry Pi 4). Cada uno tiene su rama en `parse_ethernet`, detras del
-    // `target_arch` que lo compila.
-    comp.contains("allwinner,sunxi-gmac") || comp.contains("brcm,bcm2711-genet-v5")
+    // El GMAC del Allwinner D1 (riscv64), el GENET v5 del BCM2711 (la
+    // Raspberry Pi 4) y el Cadence GEM del RP1 (la Raspberry Pi 5). Cada uno
+    // tiene su rama en `parse_ethernet`, detras del `target_arch` que lo
+    // compila.
+    //
+    // Del GEM se mira el `cdns,macb` y no el `raspberrypi,rp1-gem`, que es el
+    // primero de la lista del nodo: el `rp1-gem` es el nombre de la
+    // integracion y el `cdns,macb` el del silicio, y es el segundo el que dice
+    // que este driver sabe manejarlo. Un GEM del mismo IP en otra placa
+    // declararia el segundo y no el primero.
+    comp.contains("allwinner,sunxi-gmac")
+        || comp.contains("brcm,bcm2711-genet-v5")
+        || comp.contains("cdns,macb")
 }
 
 /// The interrupt number one specifier names, as the controller's own driver
@@ -222,6 +231,16 @@ fn is_ethernet(comp: &StringList) -> bool {
 ///
 /// - **one cell** is the number itself. That is the RISC-V PLIC and the
 ///   `riscv,cpu-intc`, which is all that reached this code until now.
+/// - **two cells** are `<number flags>`, which is the shape a controller that
+///   needs a trigger type but has one interrupt bank uses --- the RP1 of the
+///   Raspberry Pi 5 among them (`#interrupt-cells = <2>`, and its
+///   `interrupts = <RP1_INT_ETH IRQ_TYPE_LEVEL_HIGH>`). The number is the
+///   first cell and needs no offset, because such a controller numbers its own
+///   lines from zero. The **second cell is checked against the `IRQ_TYPE_*`
+///   values** of `dt-bindings/interrupt-controller/irq.h`: those six are all
+///   the legal ones, so a two-cell specifier whose flags cell is something
+///   else is a binding of another shape, and guessing it would wire the device
+///   to the wrong line.
 /// - **three cells** are `<type number flags>`, which is the ARM GIC. The
 ///   first cell is the TYPE, 0 for an SPI and 1 for a PPI, and taking it for
 ///   the number would register every shared interrupt in the tree as IRQ 0.
@@ -234,6 +253,18 @@ fn is_ethernet(comp: &StringList) -> bool {
 fn irq_number(cells: usize, spec: &[u32]) -> Option<u32> {
     match (cells, spec) {
         (1, [number, ..]) => Some(*number),
+        (2, [number, flags, ..]) => {
+            // `IRQ_TYPE_NONE`, `EDGE_RISING`, `EDGE_FALLING`, `EDGE_BOTH`,
+            // `LEVEL_HIGH`, `LEVEL_LOW`.
+            const IRQ_TYPES: [u32; 6] = [0, 1, 2, 3, 4, 8];
+            if !IRQ_TYPES.contains(flags) {
+                warn!(
+                    "{MODULE}: a 2-cell specifier whose second cell is {flags:#x} is not <number flags>"
+                );
+                return None;
+            }
+            Some(*number)
+        }
         (3, [kind, number, _flags, ..]) => match kind {
             // GIC_SPI / GIC_PPI of the binding's own header.
             0 => number.checked_add(32),
@@ -462,6 +493,45 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
                 let base = base_vaddr?;
                 Arc::new(unsafe {
                     genet_from_dt(
+                        alloc::string::String::from("eth0"),
+                        node,
+                        base,
+                        irq_num as usize,
+                    )
+                }?)
+            }
+            // El Cadence GEM del RP1: la Raspberry Pi 5.
+            //
+            // Al contrario que el GENET, **la ventana no tiene que dar para
+            // los descriptores**: los del GEM viven en RAM, no dentro de la
+            // ventana de registros. Los 0x4000 que el nodo declara dan para
+            // todo lo que el driver toca.
+            //
+            // Tres cosas que esta rama no puede arreglar y conviene que esten
+            // dichas donde se sonda:
+            //
+            // 1. **El `reg` del nodo es una direccion de bus del PCIe del
+            //    BCM2712** (`0xc0_40100000`), que hay que traducir por el
+            //    `ranges` del puente raiz. `parse_reg` no traduce `ranges`, y
+            //    Eclipse no tiene driver del controlador PCIe de Broadcom STB:
+            //    en una Pi 5 de verdad nadie llega a esta ventana.
+            // 2. **El RP1 es su propio controlador de interrupciones**
+            //    (`#interrupt-cells = <2>`), y Eclipse no tiene driver suyo,
+            //    asi que `register_interrupts` no encuentra a quien registrar
+            //    la linea.
+            // 3. **El nodo puede no estar en el DTB base**: en el arbol de
+            //    Raspberry Pi el RP1 se descubre por PCIe y su driver aplica un
+            //    overlay en caliente.
+            //
+            // O sea que esta rama es hoy el camino de un arbol que alguien le
+            // pase a mano por la escotilla `dtb=0x…`. Eso no la hace inutil:
+            // es lo que hace que el driver tenga llamante, y lo que habra que
+            // tocar el dia que el PCIe suba.
+            #[cfg(target_arch = "aarch64")]
+            c if c.contains("cdns,macb") => {
+                let base = base_vaddr?;
+                Arc::new(unsafe {
+                    macb_from_dt(
                         alloc::string::String::from("eth0"),
                         node,
                         base,
@@ -1010,6 +1080,28 @@ mod tests {
         // version y detras el generico de la familia.
         let pi = strs(&["brcm,bcm2711-genet-v5", "brcm,genet-v5"]);
         assert!(is_ethernet(&StringList::new(&pi)));
+        // Y el GEM del RP1 de la Pi 5, con la lista entera de su nodo: el
+        // primero es el nombre de la integracion y el segundo el del silicio,
+        // y es el **segundo** el que decide, porque es el que dice que este
+        // driver sabe manejarlo.
+        let rp1 = strs(&["raspberrypi,rp1-gem", "cdns,macb"]);
+        assert!(is_ethernet(&StringList::new(&rp1)));
+        // Un GEM del mismo IP en otra placa declara el `cdns,macb` y no el
+        // `rp1-gem`: tambien tiene que llegar.
+        let gem = strs(&["cdns,macb"]);
+        assert!(is_ethernet(&StringList::new(&gem)));
+    }
+
+    /// Y el nombre de la integracion **a solas** no basta.
+    ///
+    /// Si el predicado mirara el `raspberrypi,rp1-gem`, un nodo que lo
+    /// declarara sin el `cdns,macb` --- otra revision del RP1 con otro MAC
+    /// detras --- llegaria a `parse_ethernet` y se programaria como si fuera
+    /// un Cadence GEM.
+    #[test]
+    fn the_integrations_name_on_its_own_is_not_enough_to_claim_the_node() {
+        let solo = strs(&["raspberrypi,rp1-gem"]);
+        assert!(!is_ethernet(&StringList::new(&solo)));
     }
 
     #[test]
@@ -1017,6 +1109,8 @@ mod tests {
         for comp in [
             "brcm,bcm2835-aux-uart",
             "brcm,genet-mdio-v5",
+            "raspberrypi,rp1-clocks",
+            "raspberrypi,rp1-mbox",
             "snps,dw-apb-uart",
             "virtio,mmio",
         ] {
@@ -1137,6 +1231,27 @@ mod tests {
         assert_eq!(irq_number(3, &[0, 158, 4]), Some(190));
     }
 
+    /// Dos celdas son `<number flags>`, que es la forma del RP1 de la Pi 5.
+    ///
+    /// Un controlador asi numera sus propias lineas desde cero, asi que el
+    /// numero **no lleva desplazamiento**: sumarle los 32 de un SPI del GIC
+    /// registraria el dispositivo en una linea que ese controlador no tiene.
+    #[test]
+    fn two_cells_are_a_number_and_its_trigger_type() {
+        // `interrupts = <RP1_INT_ETH IRQ_TYPE_LEVEL_HIGH>` del nodo
+        // `ethernet@100000` de `rp1.dtsi`. `RP1_INT_ETH` es el 6, de
+        // `dt-bindings/mfd/rp1.h`.
+        assert_eq!(irq_number(2, &[6, 4]), Some(6));
+        // Los seis `IRQ_TYPE_*` de `dt-bindings/interrupt-controller/irq.h`,
+        // que son todos los que hay.
+        for flags in [0, 1, 2, 3, 4, 8] {
+            assert_eq!(irq_number(2, &[29, flags]), Some(29), "flags {flags}");
+        }
+        // Y la linea cero de un controlador asi es una linea: no se puede
+        // tratar como «no hay numero», que es lo que pasaba con el GIC.
+        assert_eq!(irq_number(2, &[0, 4]), Some(0));
+    }
+
     #[test]
     fn a_specifier_shape_nobody_here_has_read_is_refused_not_guessed() {
         // Los bancos extendidos de un GICv3, para los que no hay controlador.
@@ -1144,8 +1259,12 @@ mod tests {
         assert_eq!(irq_number(3, &[3, 0, 4]), None);
         // Un numero de celdas sin forma conocida. Antes se cogia la primera
         // celda igualmente, que es adivinar.
-        assert_eq!(irq_number(2, &[7, 4]), None);
         assert_eq!(irq_number(4, &[0, 0, 7, 4]), None);
+        // Y dos celdas cuya segunda no es ningun `IRQ_TYPE_*`: no es
+        // `<number flags>`, asi que su primera celda no es un numero.
+        assert_eq!(irq_number(2, &[7, 5]), None);
+        assert_eq!(irq_number(2, &[7, 0x1000]), None);
+        assert_eq!(irq_number(2, &[7]), None);
         // Y un especificador mas corto de lo que dice su cuenta de celdas.
         assert_eq!(irq_number(3, &[0, 29]), None);
         assert_eq!(irq_number(1, &[]), None);

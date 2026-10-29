@@ -727,6 +727,13 @@ pub use rings::{MacbRings, RingKind, MAX_TX_FRAME, RX_BUF_LENGTH, RX_RING_SIZE, 
 mod irq;
 pub use irq::*;
 
+/// Lo que el device tree del RP1 dice del GEM, y lo que no.
+mod dt;
+
+/// El `Device` de smoltcp, el manejador de la interrupcion y el `NetScheme`.
+mod glue;
+pub use glue::*;
+
 #[cfg(test)]
 mod macb_fake;
 
