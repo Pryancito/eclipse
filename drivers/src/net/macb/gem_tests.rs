@@ -68,10 +68,10 @@ fn what_the_design_registers_declare_is_read_not_assumed() {
     let hw = Hw::new();
     let mac = hw.mac();
 
-    // `DCFG6` sin el bit: DMA de 32 bits.
-    assert!(!mac.has_64bit_dma());
-    hw.poke(GEM_DCFG6, DCFG6_DAW64);
+    // El falso trae `DCFG6` con el bit puesto: DMA de 64 bits.
     assert!(mac.has_64bit_dma());
+    hw.poke(GEM_DCFG6, 0);
+    assert!(!mac.has_64bit_dma());
 
     // `IRQCOR` a cero (lo que el falso trae) es el `ISR` que se limpia
     // escribiendolo; con el bit puesto, no.
@@ -91,7 +91,7 @@ fn the_reset_stops_the_mac_and_clears_everything_it_can_report() {
     hw.poke(NCR, NCR_RE | NCR_TE | NCR_MPE);
     hw.poke(TSR, 0x1234);
     hw.poke(RSR, 0x5678);
-    hw.poke(IMR, 0xFFFF);
+    hw.poke(IMR, 0);
     hw.raise_irq(0xABC);
     hw.poke(GEM_PBUFRXCUT, 0xDEAD);
 
@@ -100,7 +100,7 @@ fn the_reset_stops_the_mac_and_clears_everything_it_can_report() {
     assert_eq!(hw.peek(NCR) & (NCR_RE | NCR_TE), 0, "sigue encendido");
     assert_eq!(hw.peek(TSR), 0);
     assert_eq!(hw.peek(RSR), 0);
-    assert_eq!(hw.peek(IMR), 0, "quedo alguna interrupcion sin enmascarar");
+    assert_eq!(hw.peek(IMR), !0, "quedo alguna interrupcion sin enmascarar");
     assert_eq!(hw.peek(ISR), 0, "quedo alguna interrupcion pendiente");
     assert_eq!(hw.peek(GEM_PBUFRXCUT), 0);
 }
