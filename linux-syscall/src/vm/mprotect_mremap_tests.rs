@@ -138,10 +138,15 @@ fn an_mremap_past_what_the_kernel_will_map_is_enomem_and_nothing_moves() {
             let at = anon(sys, 1).await.expect("one page");
             let held = mapped(sys.zircon_process());
 
+            // `EINVAL`, from `mremap_args`: a `new_len` that is not anchored
+            // anywhere yet is bounded against the address space as a whole,
+            // and one byte past it is not a length at all. It read `ENOMEM`
+            // while `MAX_MMAP_LEN` was an arbitrary number below the address
+            // space, which gave a second, later refusal to reach.
             assert_eq!(
                 sys.sys_mremap(at, PAGE, MAX_MMAP_LEN + PAGE, MREMAP_MAYMOVE, 0),
-                Err(LxError::ENOMEM),
-                "a new length past the cap"
+                Err(LxError::EINVAL),
+                "a new length past the address space"
             );
             assert_eq!(
                 mapped(sys.zircon_process()),

@@ -45,3 +45,4 @@ tools/ecl-vkcompute/ecl-vkcompute
 tools/gfx-probe/gfx-probe
 tools/nvctl-probe/nvctl-probe
 tools/cuda-probe/cuda-probe
+tools/abiprobe/abiprobe

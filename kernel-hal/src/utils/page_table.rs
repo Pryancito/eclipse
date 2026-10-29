@@ -476,6 +476,58 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
         Ok(ret)
     }
 
+    /// The distance from `vaddr` to the end of the highest-level entry that is
+    /// absent above it (see `GenericPageTable::unmapped_span`): nothing can be
+    /// mapped under a table that was never allocated, so a range walk may jump
+    /// over all of it at once. This is `pgd_none`/`pud_none`/`pmd_none` in
+    /// `mm/memory.c`, and the reason a terabyte of untouched reservation costs
+    /// a few hundred entry reads to tear down instead of 268 million.
+    ///
+    /// A present entry answers one page: the caller is then not in a hole, and
+    /// its own per-page work is what has to happen anyway.
+    fn unmapped_span(&self, vaddr: VirtAddr) -> usize {
+        /// Bytes covered by one entry at each level. Mirrors `p*_index`, which
+        /// shifts by 12 + 27 / 12 + 18 / 12 + 9.
+        const P4_SPAN: usize = 1 << (12 + 27);
+        const P3_SPAN: usize = 1 << (12 + 18);
+        const P2_SPAN: usize = 1 << (12 + 9);
+        // Distance from `vaddr` to the end of the `span`-sized, `span`-aligned
+        // block holding it. Never zero, never past that block.
+        let to_block_end = |span: usize| span - (vaddr & (span - 1));
+
+        let p3 = if L::LEVEL == 4 {
+            let p4 = table_of_mut::<PTE>(self.table_phys());
+            let p4e = &p4[p4_index(vaddr)];
+            if p4e.is_leaf() {
+                return PageSize::Size4K as usize;
+            }
+            match next_table_mut::<PTE>(p4e) {
+                Ok(t) => t,
+                Err(_) => return to_block_end(P4_SPAN),
+            }
+        } else {
+            table_of_mut::<PTE>(self.table_phys())
+        };
+
+        let p3e = &p3[p3_index(vaddr)];
+        if p3e.is_leaf() {
+            return PageSize::Size4K as usize;
+        }
+        let p2 = match next_table_mut::<PTE>(p3e) {
+            Ok(t) => t,
+            Err(_) => return to_block_end(P3_SPAN),
+        };
+
+        let p2e = &p2[p2_index(vaddr)];
+        if p2e.is_leaf() {
+            return PageSize::Size4K as usize;
+        }
+        match next_table_mut::<PTE>(p2e) {
+            Ok(_) => PageSize::Size4K as usize,
+            Err(_) => to_block_end(P2_SPAN),
+        }
+    }
+
     fn unmap_no_shootdown(&mut self, vaddr: VirtAddr) -> PagingResult<(PhysAddr, PageSize)> {
         // Inside a gather window the paired `remote_flush_all` is swallowed, so
         // record here that one is owed. Recorded before the fallible lookup on
@@ -1759,6 +1811,60 @@ mod walker_tests {
                 probe
             );
         }
+    }
+
+    // ── skipping the holes at the level they are missing from ─────────────
+    //
+    // `unmapped_span` is what keeps a range walk over never-touched address
+    // space off the 4 KiB grid. Every answer it gives must be a distance that
+    // lands exactly on the end of the absent entry's coverage: too long steps
+    // over something that IS mapped, too short is only slow.
+
+    /// Nothing mapped at all: the top-level entry is absent, so the span is
+    /// the rest of the 512 GiB block -- and from a block-aligned address, the
+    /// whole of it.
+    #[test]
+    fn an_empty_table_skips_a_whole_top_level_entry() {
+        const P4: usize = 1 << (12 + 27);
+        let pt = a_table::<PageTableLevel4>();
+        assert_eq!(pt.unmapped_span(0), P4);
+        assert_eq!(pt.unmapped_span(3 * P4), P4);
+        // Mid-entry: to the END of that entry, never past it.
+        assert_eq!(pt.unmapped_span(3 * P4 + 4 * G), P4 - 4 * G);
+    }
+
+    /// With one page mapped, the tables above it exist, so a neighbouring
+    /// address is absent at a LOWER level and skips less.
+    #[test]
+    fn a_mapped_page_shortens_the_skip_around_it() {
+        const P3: usize = 1 << (12 + 18);
+        let mut pt = a_table::<PageTableLevel4>();
+        let vaddr = 0x3600_0000_0000;
+        pt.map(Page::new_aligned(vaddr, PageSize::Size4K), 0x1000, rw())
+            .unwrap();
+        // The page's own 2 MiB block has a leaf table: one page at a time.
+        assert_eq!(pt.unmapped_span(vaddr + K), K);
+        // The next 2 MiB block has no leaf table: skip to its end.
+        assert_eq!(pt.unmapped_span(vaddr + M), M);
+        assert_eq!(pt.unmapped_span(vaddr + M + K), M - K);
+        // The next 1 GiB block has no level-2 table: skip to ITS end.
+        assert_eq!(pt.unmapped_span(vaddr + G), G);
+        // A whole different 512 GiB block is still absent at the top.
+        assert_eq!(pt.unmapped_span(vaddr + P3 * 512), 1 << (12 + 27));
+    }
+
+    /// The span is only an optimisation, so the range walk must come out the
+    /// same: a 16 GiB unmap with one page in it removes that page and leaves
+    /// the walk on the grid.
+    #[test]
+    fn unmapping_a_huge_mostly_empty_range_still_removes_what_is_in_it() {
+        let mut pt = a_table::<PageTableLevel4>();
+        let base = 0x3600_0000_0000;
+        let page = base + 9 * G + 7 * M + 3 * K;
+        pt.map(Page::new_aligned(page, PageSize::Size4K), 0x5000, rw())
+            .unwrap();
+        pt.unmap_cont(base, 16 * G).unwrap();
+        assert!(matches!(pt.query(page), Err(PagingError::NotMapped)));
     }
 
     /// `unmap_cont` walks the range in whatever page size it finds, so a hole
