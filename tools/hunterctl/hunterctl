@@ -29,6 +29,9 @@
 #   hunterctl restore <sha256>      put a quarantined file back where it was
 #   hunterctl update-signatures     download the feeds in /etc/hunter/feeds
 #   hunterctl lockdown              enforce exec + integrity + av, learning off, seal
+#   hunterctl report [--pdf|--txt] [--days N] [-o FILE]
+#                                   security report of the last N days (default 7),
+#                                   HTML by default, into /var/lib/hunter/reports/
 #   hunterctl save-learned          append learned programs to the whitelist
 
 PROC=/proc/hunter
@@ -38,6 +41,11 @@ SCAN=/proc/hunter_scan
 QDIR=/var/lib/hunter/quarantine
 FEEDS=/etc/hunter/feeds
 SIGDIR=/etc/hunter/signatures.d
+REPORTS=/var/lib/hunter/reports
+# The report is rendered by lunarhunter (lunarbar's hunter_export), the one
+# place that knows the three formats: two renderings of the same report would
+# drift apart the way two parsers of /proc/hunter would.
+LUNARHUNTER=/bin/lunarhunter
 # Paths per write to /proc/hunter_scan: each batch is scanned before the
 # write returns, and 256 paths stay well under the 1 MiB a write may carry.
 BATCH=256
@@ -264,6 +272,36 @@ update-signatures)
             echo "hunterctl: $name: hunter rejected the feed; not installed" >&2
         fi
     done
+    ;;
+report)
+    fmt=html
+    days=7
+    out=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --html) fmt=html ;;
+        --pdf) fmt=pdf ;;
+        --txt|--text) fmt=txt ;;
+        --days) [ $# -ge 2 ] || usage 1; days=$2; shift ;;
+        -o) [ $# -ge 2 ] || usage 1; out=$2; shift ;;
+        *) usage 1 ;;
+        esac
+        shift
+    done
+    [ -x "$LUNARHUNTER" ] || die "$LUNARHUNTER not found: it renders the report"
+    if [ -z "$out" ]; then
+        # One file per day, named like the window's export button names it,
+        # so a weekly run keeps last week's beside this one.
+        out="$REPORTS/hunter-informe-$(date -u +%Y-%m-%d).$fmt"
+    else
+        # -o names the format by its extension; one without .html/.pdf/.txt
+        # gets the format the flags asked for.
+        case "$out" in
+        *.html|*.htm|*.pdf|*.txt|-) ;;
+        *) out="$out.$fmt" ;;
+        esac
+    fi
+    exec "$LUNARHUNTER" --export "$out" --days "$days"
     ;;
 save-learned)
     [ "$(id -u)" = 0 ] || die "must be root"

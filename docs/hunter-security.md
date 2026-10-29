@@ -214,6 +214,8 @@ hunterctl quarantined           list the quarantine
 hunterctl restore <sha256>      put a quarantined file back
 hunterctl update-signatures     download the feeds in /etc/hunter/feeds
 hunterctl lockdown              exec + integrity + av enforce, learning off, seal
+hunterctl report [--pdf|--txt] [--days N] [-o FILE]
+                                security report (below), into /var/lib/hunter/reports/
 hunterctl save-learned          append learned programs to /etc/hunter/whitelist
 ```
 
@@ -276,7 +278,7 @@ the bar as `/bin/lunarhunter`, in the app menu as **Seguridad (hunter)**
 
 | Tab | What it does |
 |---|---|
-| Resumen | the stance in one line, eight counters, the latest alerts; quick actions: scan home, update signatures, EICAR test, lockdown |
+| Resumen | the stance in one line, eight counters, the latest alerts; quick actions: scan home, update signatures, EICAR test, lockdown, **export report** (the week's report as HTML into `$HOME`) |
 | Protección | the six domains with what each guards, the four switches (`learning`, `anomaly-detection`, `privileged-deny`, `require-hash`); **save as boot policy** writes the live stance to `/etc/hunter/policy.conf` (old file kept as `policy.conf.bak`), **apply policy.conf**, and **seal** |
 | Eventos | the whole event ring with time, pid, severity and category, filtered by all / alerts / critical |
 | Escaneo | presets (home, `/tmp`, programs, `/`, or `--scan PATH...`), a live count with a stop button, per-finding or all-at-once quarantine, or automatic quarantine as it goes |
@@ -294,6 +296,36 @@ the seal, relaxing controls are not offered; without root, nothing that
 changes hunter is. `lunarhunter --tab NAME --dump /path:WxH` renders a tab to
 a raw ARGB8888 file without a compositor (from a built-in sample when there
 is no `/proc/hunter`).
+
+### Security reports
+
+`hunterctl report`, `lunarhunter --export PATH [--days N]` and the **Exportar
+informe** button write the same report
+([`tools/lunarbar/src/hunter_export.rs`](../tools/lunarbar/src/hunter_export.rs)),
+in the desktop's language, for the last 7 days by default:
+
+- the stance and the counters of the period (events by severity, criticals,
+  antivirus detections, files quarantined, signatures, pinned programs);
+- **recommendations**, each naming the `hunterctl` command that acts on it:
+  domains off or only reporting, stale or missing signatures, learning still
+  on, an overflowed event ring, no pins or `require-hash off`, no seal;
+- the six modes and the switches; where the alerts come from (by category
+  and by file/program); every alert with its date, pid and text; the
+  quarantine of the period; the signature files and feeds; the learned
+  programs; and the whole event log, folded.
+
+Three formats, by the file's extension: **HTML** (one self-contained page,
+nothing fetched, prints cleanly), **PDF** (the text version paginated in the
+standard Courier font, so it needs no library and no embedded font) and
+**text**. `-o -` writes to stdout. Without `-o` the file is
+`/var/lib/hunter/reports/hunter-informe-YYYY-MM-DD.<ext>`, one per day, so a
+weekly run keeps the history.
+
+The event ring lives in kernel memory, so the events section covers the
+period **or since boot, if that is later**, and the report says which; the
+quarantine and the signatures are on disk and cover the whole period. The
+report also flags when the ring overflowed (`dropped=`). Running it weekly
+from a scheduler, and merging events persisted to disk, plug in here.
 
 ## Exec integrity (SHA-256)
 

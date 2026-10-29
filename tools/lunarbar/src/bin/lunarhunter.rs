@@ -21,6 +21,10 @@
 //! - **Programas** — the exec allowlist and the integrity pins: the programs
 //!   learning has trusted, saving them to the whitelist, verifying the pins.
 //!
+//! The Resumen tab's "Exportar informe" writes the security report
+//! (`hunter_export`) as HTML into `$HOME`; `--export` writes it from the
+//! command line with no compositor, which is what `hunterctl report` runs.
+//!
 //! It holds no policy of its own, exactly like the bar and `hunterctl`: the
 //! kernel's two doors (`/proc/hunter`, `/proc/hunter_scan`) for everything the
 //! kernel does, and `/sbin/hunterctl` for the file work it already does right
@@ -32,7 +36,8 @@
 //! a desktop nobody can use. It is in the taskbar, moves and resizes; labwc
 //! draws its frame (xdg-decoration, server side).
 //!
-//! `--dump PATH:WxH` renders a tab to a raw ARGB8888 file with no compositor,
+//! `--export PATH [--days N]` writes the report (HTML, PDF or text by the
+//! extension) and exits. `--dump PATH:WxH` renders a tab to a raw ARGB8888 file with no compositor,
 //! from this kernel's hunter or, without one, a sample.
 //!
 //! Env: `ECLIPSE_LOOK=kde|eclipse|win11`, `LANG` (es/en) like the bar.
@@ -45,6 +50,7 @@ use std::time::{Duration, Instant};
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
 use lunarbar::hunter::{self, Mode, SendError, Shield, DOMAINS};
+use lunarbar::hunter_export::{self as export, civil_time};
 use lunarbar::hunter_report::{
     self as report, Feed, Quarantined, Report, Severity, SigFile, Switch,
 };
@@ -264,6 +270,7 @@ enum Act {
     SaveLearned,
     Verify,
     QuickScan,
+    Export,
 }
 
 impl Act {
@@ -910,6 +917,38 @@ impl State {
                 vec!["save-learned".into()],
             ),
             Act::Verify => self.start(JobKind::Verify, Vec::new(), vec!["verify".into()]),
+            Act::Export => self.export(),
+        }
+    }
+
+    /// Write the week's report into `$HOME` (`/tmp` when there is none to
+    /// write to), named by the day so last week's stays. Reading only: it
+    /// needs no root, and it re-reads everything so the file is what the
+    /// kernel says now and not what the window last drew.
+    fn export(&mut self) {
+        let Some(inp) = export::gather(export::DEFAULT_DAYS) else {
+            let m = self.t("no hay hunter que leer", "there is no hunter to read");
+            self.say(m, true);
+            return;
+        };
+        let name = export::file_name(inp.now, export::Format::Html);
+        let bytes = export::render(&inp, self.lang, export::Format::Html);
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let res = export::write(&format!("{home}/{name}"), &bytes)
+            .map(|_| format!("{home}/{name}"))
+            .or_else(|_| {
+                let tmp = format!("/tmp/{name}");
+                export::write(&tmp, &bytes).map(|_| tmp)
+            });
+        match res {
+            Ok(path) => {
+                let m = format!(
+                    "{} {path}",
+                    self.t("informe guardado en", "report saved to")
+                );
+                self.say(m, false);
+            }
+            Err(e) => self.say(format!("{name}: {e}"), true),
         }
     }
 
@@ -1116,27 +1155,6 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// `YYYY-MM-DD HH:MM` (UTC) from seconds since the epoch, with no libc locale
-/// or timezone database: Howard Hinnant's `civil_from_days`.
-fn civil_time(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
-        rem / 3600,
-        rem % 3600 / 60
-    )
 }
 
 /// Cut `s` to what fits in `w` pixels, marking the cut.
@@ -1590,7 +1608,23 @@ fn tab_overview(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
             && s.modes[4] == Mode::Enforce
             && s.modes[5] == Mode::Enforce))
         .then_some(Act::Lockdown);
-    g.button(bx, cy, 0, st.t("Blindar", "Lockdown"), Style::Danger, lock);
+    bx += g.button(bx, cy, 0, st.t("Blindar", "Lockdown"), Style::Danger, lock) + 8;
+    // Reading only, so it needs no root; and not while a job runs, so the
+    // report is not taken halfway through a scan's quarantine. On a row of
+    // its own when the window is too narrow for five buttons.
+    let label = st.t("Exportar informe", "Export report");
+    if bx + Canvas::text_width(label) + 24 > x + w {
+        bx = x;
+        cy += BTN_H + 8;
+    }
+    g.button(
+        bx,
+        cy,
+        0,
+        label,
+        Style::Normal,
+        (!busy).then_some(Act::Export),
+    );
     cy += BTN_H + 24;
 
     // The newest alerts.
@@ -2573,6 +2607,10 @@ struct Cli {
     /// what the bar's "scan" button always did.
     quarantine: bool,
     dump: Option<String>,
+    /// `--export PATH`: write the report there and exit.
+    export: Option<String>,
+    /// `--days N`: the period `--export` covers.
+    days: Option<u32>,
 }
 
 fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Cli, String> {
@@ -2600,6 +2638,14 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             "--update" => cli.update = true,
             "--quarantine" => cli.quarantine = true,
             "--dump" => cli.dump = Some(args.next().ok_or("--dump needs PATH:WxH")?),
+            "--export" => cli.export = Some(args.next().ok_or("--export needs a PATH")?),
+            "--days" => {
+                let n = args.next().ok_or("--days needs a NUMBER")?;
+                match n.parse::<u32>() {
+                    Ok(d) if (1..=3650).contains(&d) => cli.days = Some(d),
+                    _ => return Err(format!("--days takes 1 to 3650 ({n})")),
+                }
+            }
             "-h" | "--help" => return Err("help".into()),
             other => return Err(format!("unknown option {other}")),
         }
@@ -2610,7 +2656,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Cli, String> {
 fn usage() -> ! {
     eprintln!(
         "usage: lunarhunter [--tab NAME] [--quarantine] [--scan PATH...] [--update]\n\
-         \x20                  [--dump PATH:WxH]\n\
+         \x20                  [--dump PATH:WxH] [--export PATH [--days N]]\n\
          \n\
          \x20 --tab NAME     open on a tab: resumen proteccion eventos escaneo\n\
          \x20                cuarentena firmas programas (or 1-7, or English)\n\
@@ -2618,6 +2664,8 @@ fn usage() -> ! {
          \x20 --quarantine   automatic quarantine on (for --scan)\n\
          \x20 --update       update the signatures at once (opens Firmas)\n\
          \x20 --dump P:WxH   render the tab to a raw ARGB8888 file and exit\n\
+         \x20 --export PATH  write the security report (.html, .pdf or .txt) and exit\n\
+         \x20 --days N       the period the report covers (default 7)\n\
          \n\
          keys: 1-7 or Tab switch tabs, arrows/PgUp/PgDn scroll, r re-reads, Esc closes\n\
          env: ECLIPSE_LOOK=kde|eclipse|win11, LANG"
@@ -2670,6 +2718,9 @@ fn main() {
             usage()
         }
     };
+    if let Some(path) = &cli.export {
+        std::process::exit(export_to(path, cli.days.unwrap_or(export::DEFAULT_DAYS)));
+    }
     let tab = cli.tab.unwrap_or(if !cli.scan.is_empty() {
         Tab::Scan
     } else if cli.update {
@@ -2789,6 +2840,38 @@ fn main() {
     }
 }
 
+/// `--export`: the report, from this kernel's hunter, into `path` (`-` is
+/// stdout). The exit status says whether it was written.
+fn export_to(path: &str, days: u32) -> i32 {
+    let Some(inp) = export::gather(days) else {
+        eprintln!(
+            "lunarhunter: {} is not hunter's report; nothing written",
+            hunter::PROC
+        );
+        return 1;
+    };
+    let fmt = export::Format::from_path(path);
+    let bytes = export::render(&inp, Lang::current(), fmt);
+    let res = if path == "-" {
+        use std::io::Write;
+        std::io::stdout().write_all(&bytes)
+    } else {
+        export::write(path, &bytes)
+    };
+    match res {
+        Ok(()) => {
+            if path != "-" {
+                println!("{path}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("lunarhunter: {path}: {e}");
+            1
+        }
+    }
+}
+
 /// Fill a state with the sample, and a finished scan, quarantine and update
 /// output to go with it, for `--dump` with no hunter.
 fn sample(st: &mut State) {
@@ -2878,6 +2961,32 @@ mod tests {
         assert_eq!(cli(&["--tab", "3"]).unwrap().tab, Some(Tab::Events));
         assert!(cli(&["--tab", "nada"]).is_err());
         assert!(cli(&["--tab"]).is_err());
+    }
+
+    #[test]
+    fn export_takes_a_path_and_a_sane_period() {
+        let c = cli(&["--export", "/tmp/i.pdf", "--days", "30"]).unwrap();
+        assert_eq!(c.export.as_deref(), Some("/tmp/i.pdf"));
+        assert_eq!(c.days, Some(30));
+        assert!(cli(&["--export"]).is_err());
+        assert!(cli(&["--days", "0"]).is_err());
+        assert!(cli(&["--days", "semana"]).is_err());
+    }
+
+    #[test]
+    fn export_is_offered_without_root_but_not_during_a_job() {
+        let mut st = sample_state(Tab::Overview);
+        st.root = false;
+        assert!(frame(&st).hits.iter().any(|(_, a)| *a == Act::Export));
+        // Inside the window, at the default size and at the smallest.
+        for (w, h) in [(DEFAULT_W, DEFAULT_H), (MIN_W as u32, MIN_H as u32)] {
+            let mut cv = Canvas::new(w as usize, h as usize);
+            let f = draw(&mut cv, w as i32, h as i32, &st);
+            let (r, _) = f.hits.iter().find(|(_, a)| *a == Act::Export).unwrap();
+            assert!(r.0 + r.2 <= w as i32, "{w}x{h}: {r:?}");
+        }
+        st.job.as_mut().unwrap().out.lock().unwrap().done = false;
+        assert!(!frame(&st).hits.iter().any(|(_, a)| *a == Act::Export));
     }
 
     #[test]
