@@ -10,6 +10,9 @@
 //! * `/etc/hunter/signatures` and `/etc/hunter/signatures.d/*` — the
 //!   antivirus database (`hash:<sha256>:<Name>` / `bytes:<hex>:<Name>`); the
 //!   directory is where `hunterctl update-signatures` puts its feeds.
+//! * `/etc/hunter/firewall` — the per-application firewall's rules
+//!   (`allow /usr/bin/curl out`, `deny /usr/bin/nc`; see `hunter::firewall`),
+//!   which lunarhunter appends to when the person answers a question.
 //! * `/etc/hunter/policy.conf` — a script in hunter's control language
 //!   (`mode exec enforce`, `learning off`, `seal`, ...; see
 //!   `hunter::control`), applied last so it can override the learning
@@ -60,7 +63,35 @@ pub fn load(root: &Arc<dyn INode>) {
     if n_sig > 0 {
         kernel_hal::klog_info!("hunter: loaded {} antivirus signatures", n_sig);
     }
+    let n_net = load_firewall(root, FIREWALL_FILE);
+    if n_net > 0 {
+        kernel_hal::klog_info!("hunter: loaded {} firewall rules", n_net);
+    }
     load_policy(root, POLICY_CONF);
+}
+
+/// The per-application firewall's rules (see `hunter::firewall`).
+const FIREWALL_FILE: &str = "/etc/hunter/firewall";
+
+/// Reads `/etc/hunter/firewall`, line by line like the lists: a bad line loses
+/// one rule, said by number, and the program it was about is asked about
+/// again -- which is what it would be with no file at all. Loaded before
+/// `policy.conf`, so a `seal` there seals these rules too.
+fn load_firewall(root: &Arc<dyn INode>, path: &str) -> usize {
+    let mut count = 0;
+    for_each_line(
+        root,
+        path,
+        |i, line| match hunter::firewall::parse_rules_line(line) {
+            Ok(Some(d)) => {
+                hunter::firewall::apply(&d);
+                count += 1;
+            }
+            Ok(None) => {}
+            Err(e) => kernel_hal::klog_info!("hunter: {}:{}: skipped: {}", path, i, e),
+        },
+    );
+    count
 }
 
 /// The antivirus database (see `hunter::av`).
@@ -502,6 +533,29 @@ mod hunter_config_tests {
         let d = hunter::integrity::parse_hex(abc);
         assert_eq!(hunter::integrity::pinned("/a11/one"), d);
         assert_eq!(hunter::integrity::pinned("/a11/two"), d);
+    }
+
+    #[test]
+    fn firewall_rules_load_line_by_line() {
+        use hunter::firewall::{rule, Action, Direction};
+        use rcore_fs::vfs::FileType;
+        let root = leaked_root();
+        let etc = root.create("etc", FileType::Dir, 0o755).unwrap();
+        let dir = etc.create("hunter", FileType::Dir, 0o755).unwrap();
+        let file = dir.create("firewall", FileType::File, 0o644).unwrap();
+        file.write_at(
+            0,
+            b"# lunarhunter\nallow /a14/curl out\nfrobnicate /a14/x\ndeny /a14/My App\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_firewall(&root, FIREWALL_FILE),
+            2,
+            "the bad line skipped"
+        );
+        assert_eq!(rule("/a14/curl", Direction::Out), Some(Action::Allow));
+        assert_eq!(rule("/a14/curl", Direction::In), None);
+        assert_eq!(rule("/a14/My App", Direction::In), Some(Action::Deny));
     }
 
     #[test]

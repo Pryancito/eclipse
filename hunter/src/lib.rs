@@ -15,6 +15,7 @@
 //! | [`check_mmap`]        | `mmap`                      | W^X memory      |
 //! | [`check_exec_integrity`] | `execve` / loader / interp | exec integrity (SHA-256) |
 //! | [`check_exec_av`]     | `execve` / loader / interp  | antivirus (signatures) |
+//! | [`firewall::check`]   | `connect` / `bind` / `sendto` | per-application firewall |
 //! | [`check_mprotect`]    | `mprotect`                  | W^X memory      |
 //! | [`check_munmap`]      | `munmap`                    | W^X bookkeeping |
 //! | [`task_fork`]         | `fork` / `clone`            | policy lifecycle|
@@ -44,6 +45,7 @@ pub mod av;
 pub mod clock;
 pub mod control;
 pub mod event_log;
+pub mod firewall;
 pub mod heuristics;
 pub mod integrity;
 pub mod policy;

@@ -11,6 +11,11 @@ use linux_object::{
     thread::ThreadExt,
 };
 
+/// hunter's per-application firewall, asked by `connect`, `bind`, `sendto`
+/// and `sendmsg` before they touch the socket.
+mod hunter_firewall;
+use hunter::firewall::Direction as NetDirection;
+
 const MSG_DONTWAIT: usize = 0x40;
 const MSG_PEEK: usize = 0x2;
 const MSG_NOSIGNAL: usize = 0x4000;
@@ -519,6 +524,7 @@ impl Syscall<'_> {
         let endpoint = sockaddr_to_endpoint(read_sockaddr(addr.as_addr(), addrlen)?, addrlen)?;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(sockfd.into())?;
+        self.hunter_net_gate(NetDirection::Out, &endpoint).await?;
 
         if let Endpoint::Unix(path) = &endpoint {
             if let Ok(client) = file_like.clone().downcast_arc::<UnixSocketState>() {
@@ -931,6 +937,7 @@ impl Syscall<'_> {
             let endpoint =
                 sockaddr_to_endpoint(read_sockaddr(dest_addr.as_addr(), addrlen)?, addrlen)?;
             info!("sys_sendto: sockfd:{:?}, endpoint:{:?}", sockfd, endpoint);
+            self.hunter_net_gate(NetDirection::Out, &endpoint).await?;
             Some(endpoint)
         };
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
@@ -1099,6 +1106,7 @@ impl Syscall<'_> {
             let namelen = hdr.msg_namelen as usize;
             let endpoint =
                 sockaddr_to_endpoint(read_sockaddr(hdr.msg_name.as_addr(), namelen)?, namelen)?;
+            self.hunter_net_gate(NetDirection::Out, &endpoint).await?;
             Some(endpoint)
         } else {
             None
@@ -1274,7 +1282,7 @@ impl Syscall<'_> {
     }
 
     /// assigns the address specified by addr to the socket referred to by the file descriptor sockfd
-    pub fn sys_bind(
+    pub async fn sys_bind(
         &mut self,
         sockfd: usize,
         addr: UserInPtr<SockAddr>,
@@ -1286,6 +1294,7 @@ impl Syscall<'_> {
         );
         let endpoint = sockaddr_to_endpoint(read_sockaddr(addr.as_addr(), addrlen)?, addrlen)?;
         debug!("sys_bind: fd:{} bind to {:?}", sockfd, endpoint);
+        self.hunter_net_gate(NetDirection::In, &endpoint).await?;
 
         let proc = self.linux_process();
         if let Endpoint::Unix(path) = &endpoint {

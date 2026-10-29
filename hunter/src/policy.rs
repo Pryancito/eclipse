@@ -143,14 +143,14 @@ pub enum Mode {
 }
 
 impl Mode {
-    const fn to_u8(self) -> u8 {
+    pub(crate) const fn to_u8(self) -> u8 {
         match self {
             Mode::Off => 0,
             Mode::Report => 1,
             Mode::Enforce => 2,
         }
     }
-    fn from_u8(v: u8) -> Self {
+    pub(crate) fn from_u8(v: u8) -> Self {
         match v {
             0 => Mode::Off,
             1 => Mode::Report,
@@ -255,7 +255,7 @@ pub(crate) fn allow_relaxing(what: &str) -> bool {
 
 /// Applies a mode transition for one domain, honouring the tighten-only latch
 /// and recording an audit event. Returns the mode actually in effect after.
-fn apply_mode(slot: &AtomicU8, domain: &'static str, requested: Mode) -> Mode {
+pub(crate) fn apply_mode(slot: &AtomicU8, domain: &'static str, requested: Mode) -> Mode {
     let current = Mode::from_u8(slot.load(Ordering::SeqCst));
     if current == requested {
         return current;

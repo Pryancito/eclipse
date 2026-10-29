@@ -538,7 +538,7 @@ impl Syscall<'_> {
             Sys::SENDMMSG => self.sys_sendmmsg(a0, a1.into(), a2, a3).await,
             Sys::RECVMMSG => self.sys_recvmmsg(a0, a1.into(), a2, a3).await,
             Sys::SHUTDOWN => self.sys_shutdown(a0, a1),
-            Sys::BIND => self.sys_bind(a0, a1.into(), a2),
+            Sys::BIND => self.sys_bind(a0, a1.into(), a2).await,
             Sys::LISTEN => self.sys_listen(a0, a1),
 
             Sys::GETSOCKNAME => self.sys_getsockname(a0, a1.into(), a2.into()),
