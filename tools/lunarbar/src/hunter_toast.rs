@@ -655,6 +655,51 @@ impl State {
         self.spawn(&cmd);
     }
 
+    /// lunarhunter's firewall tab; the event log when it is not installed.
+    fn toast_open_firewall(&self) {
+        if apps::executable_exists(hunter::APP) {
+            self.spawn(&format!("{} --tab cortafuegos", hunter::APP));
+        } else {
+            self.toast_open_log();
+        }
+    }
+
+    /// Answer a firewall question on the spot, and say how it went on a card
+    /// of its own: the click is the only feedback the user has.
+    fn toast_answer_net(&mut self, key: &str, allow: bool) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let when = lunarbar::hunter_export::civil_time(now);
+        let t = notify::text(i18n::Lang::current());
+        let (severity, title) = match notify::answer_net(key, allow, &when) {
+            notify::NetAnswer::Saved if allow => (Severity::Info, t.net_allowed),
+            notify::NetAnswer::Saved => (Severity::Info, t.net_denied),
+            notify::NetAnswer::Unsaved => (Severity::Warn, t.net_unsaved),
+            notify::NetAnswer::Sealed => (Severity::Warn, t.net_sealed),
+            notify::NetAnswer::Failed => (Severity::Warn, t.net_failed),
+        };
+        let body = key
+            .split_once("firewall: ")
+            .and_then(|(_, d)| d.rsplit_once(" wants to "))
+            .map_or("", |(p, _)| p);
+        self.toasts.push(Toast {
+            alert: Alert {
+                severity,
+                title: title.into(),
+                body: body.into(),
+                ..Alert::default()
+            },
+            // Its own key, so it never folds into the question's card.
+            source: Source::Kernel {
+                key: format!("answer {key}"),
+            },
+            count: 1,
+            deadline: None,
+        });
+    }
+
     pub(super) fn toast_click(&mut self, qh: &QueueHandle<State>, x: i32, y: i32) {
         match self.toast_hit(x, y) {
             Some(Hit::Close(i)) => {
@@ -674,6 +719,10 @@ impl State {
                 if let Source::Kernel { key } = t.source {
                     match act.id.as_str() {
                         notify::VIEW => self.toast_open_log(),
+                        notify::NET_VIEW => self.toast_open_firewall(),
+                        id @ (notify::NET_ALLOW | notify::NET_DENY) => {
+                            self.toast_answer_net(&key, id == notify::NET_ALLOW)
+                        }
                         notify::IGNORE if self.toasts.muted.len() < MAX_MUTED => {
                             self.toasts.muted.insert(key);
                         }
