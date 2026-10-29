@@ -458,7 +458,7 @@ fn a_chip_where_the_qos_fix_is_reserved_gets_its_requests_throttled_instead() {
     assert_eq!(
         traza
             .iter()
-            .filter(|(_, o, _)| *o == MISC_AXI_INTF_CTRL)
+            .filter(|(f, o, _)| *f == bridge_fake::PUENTE && *o == MISC_AXI_INTF_CTRL)
             .count(),
         2,
         "el remedio es una segunda escritura, traza {:x?}",
@@ -482,7 +482,7 @@ fn a_chip_that_has_the_qos_fix_is_left_with_its_requests_unthrottled() {
     assert_eq!(
         traza
             .iter()
-            .filter(|(_, o, _)| *o == MISC_AXI_INTF_CTRL)
+            .filter(|(f, o, _)| *f == bridge_fake::PUENTE && *o == MISC_AXI_INTF_CTRL)
             .count(),
         1,
         "se aplicó el remedio sin hacer falta, traza {:x?}",

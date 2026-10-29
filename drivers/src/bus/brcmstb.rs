@@ -527,6 +527,7 @@ impl BrcmPcie {
 }
 
 pub mod bringup;
+pub mod cfg;
 pub mod mdio;
 pub mod reset;
 
@@ -549,6 +550,12 @@ pub(super) mod bridge_fake {
     pub const RESET: &str = "reset";
     /// El recalibrado del PHY.
     pub const RESCAL: &str = "rescal";
+    /// Una **lectura** del puente, no una escritura. Va con fuente propia para
+    /// que las entradas no se cuelen en los tests que miran escrituras, y
+    /// existe porque hay un orden que sólo se ve mirando las dos cosas en la
+    /// misma traza: que el índice del espacio de configuración se escriba
+    /// **antes** de leer por la ventana de datos.
+    pub const LECTURA: &str = "lectura";
 
     /// Una entrada: de que bloque, en que offset y con que valor.
     pub type Entrada = (&'static str, usize, u32);
@@ -571,7 +578,7 @@ pub(super) mod bridge_fake {
 
     /// Lo que de verdad se lee del puente, con los bits reservados a cero.
     pub fn al_leer(off: usize, val: u32) -> u32 {
-        RESERVADOS.with(|r| {
+        let out = RESERVADOS.with(|r| {
             let mut out = val;
             for (o, mask) in r.borrow().iter() {
                 if *o == off {
@@ -579,7 +586,9 @@ pub(super) mod bridge_fake {
                 }
             }
             out
-        })
+        });
+        apunta(LECTURA, off, out);
+        out
     }
 
     /// Declara que `mask` del registro `off` es un bit reservado en este chip.
