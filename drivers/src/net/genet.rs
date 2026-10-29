@@ -131,16 +131,11 @@ const MDIO_TIMEOUT_US: u64 = 20_000;
 // Velocidad y duplex
 // ---------------------------------------------------------------------------
 
-/// La velocidad negociada, tal y como la entiende `UMAC_CMD`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkSpeed {
-    Mbps10,
-    Mbps100,
-    Mbps1000,
-}
-
+/// El valor que va al campo `SPEED` de `UMAC_CMD`.
+///
+/// [`LinkSpeed`] es de [`super::mii`], que es de donde son los registros del
+/// PHY que la deciden; esta traduccion es lo unico del GENET que tiene.
 impl LinkSpeed {
-    /// El valor que va al campo `SPEED` de `UMAC_CMD`.
     pub fn umac_code(self) -> u32 {
         match self {
             LinkSpeed::Mbps10 => UMAC_SPEED_10,
@@ -148,34 +143,6 @@ impl LinkSpeed {
             LinkSpeed::Mbps1000 => UMAC_SPEED_1000,
         }
     }
-
-    /// Megabits por segundo, para los logs y para `ethtool`.
-    pub fn mbps(self) -> u32 {
-        match self {
-            LinkSpeed::Mbps10 => 10,
-            LinkSpeed::Mbps100 => 100,
-            LinkSpeed::Mbps1000 => 1000,
-        }
-    }
-}
-
-/// El estado del enlace leido del PHY.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Link {
-    /// Hay portadora y la autonegociacion termino.
-    pub up: bool,
-    pub speed: LinkSpeed,
-    pub full_duplex: bool,
-}
-
-impl Link {
-    /// El enlace caido. La velocidad no significa nada con `up` a false, pero
-    /// un `Option` aqui obligaria a cada llamante a desenvolverlo para nada.
-    pub const DOWN: Link = Link {
-        up: false,
-        speed: LinkSpeed::Mbps10,
-        full_duplex: false,
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -440,48 +407,13 @@ impl GenetMac {
         )
     }
 
-    /// Lee del PHY el estado del enlace, como `genphy_read_status`.
+    /// Lee del PHY el estado del enlace, por el bus MDIO del UMAC.
     ///
-    /// Sin portadora (`BMSR_LSTATUS`) o sin autonegociacion terminada
-    /// (`BMSR_ANEGCOMPLETE`) el enlace esta caido y la velocidad no se mira:
-    /// lo que diga `STAT1000`/`LPA` mientras negocia es de la vuelta anterior.
-    ///
-    /// `BMSR` latcha `LSTATUS`: una lectura devuelve el estado desde la
-    /// lectura anterior, asi que se lee **dos veces** y vale la segunda. Sin
-    /// eso, un enlace que se cayo y volvio se leeria caido.
+    /// La lectura doble del `BMSR` y la interseccion de lo anunciado son del
+    /// 802.3, no del GENET: estan en [`read_link_with`], que es lo que usa
+    /// tambien el driver del `macb`.
     pub fn read_link(&self, pmd: u8) -> DeviceResult<Link> {
-        let _ = self.mdio_read(pmd, MII_BMSR)?;
-        let bmsr = self.mdio_read(pmd, MII_BMSR)? as u32;
-        if bmsr & BMSR_LSTATUS == 0 || bmsr & BMSR_ANEGCOMPLETE == 0 {
-            return Ok(Link::DOWN);
-        }
-
-        // Lo negociado es la interseccion de lo que anuncia cada lado.
-        let ctrl1000 = self.mdio_read(pmd, MII_CTRL1000)? as u32;
-        let stat1000 = self.mdio_read(pmd, MII_STAT1000)? as u32;
-        let advertise = self.mdio_read(pmd, MII_ADVERTISE)? as u32;
-        let lpa = self.mdio_read(pmd, MII_LPA)? as u32;
-
-        let (speed, full_duplex) =
-            if ctrl1000 & ADVERTISE_1000FULL != 0 && stat1000 & LPA_1000FULL != 0 {
-                (LinkSpeed::Mbps1000, true)
-            } else if ctrl1000 & ADVERTISE_1000HALF != 0 && stat1000 & LPA_1000HALF != 0 {
-                (LinkSpeed::Mbps1000, false)
-            } else if advertise & ADVERTISE_100FULL != 0 && lpa & LPA_100FULL != 0 {
-                (LinkSpeed::Mbps100, true)
-            } else if advertise & ADVERTISE_100HALF != 0 && lpa & LPA_100HALF != 0 {
-                (LinkSpeed::Mbps100, false)
-            } else if advertise & ADVERTISE_10FULL != 0 && lpa & LPA_10FULL != 0 {
-                (LinkSpeed::Mbps10, true)
-            } else {
-                (LinkSpeed::Mbps10, false)
-            };
-
-        Ok(Link {
-            up: true,
-            speed,
-            full_duplex,
-        })
+        read_link_with(|reg| self.mdio_read(pmd, reg))
     }
 
     // -----------------------------------------------------------------------
@@ -542,14 +474,6 @@ impl GenetMac {
             self.modify(UMAC_CMD, CMD_PROMISC, 0);
         }
     }
-}
-
-/// Si un identificador de PHY es de un PHY que esta de verdad.
-///
-/// El bus MDIO sin nadie en esa direccion devuelve todo unos o todo ceros, y
-/// las dos cosas se leen como un identificador.
-pub fn phy_id_is_present(id: u32) -> bool {
-    id != 0 && id != 0xFFFF_FFFF && id != 0x0000_FFFF && id != 0xFFFF_0000
 }
 
 /// El OUI del BCM5421x de Broadcom, que es la familia del BCM54213PE de la
