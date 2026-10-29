@@ -29,6 +29,13 @@
 #   hunterctl restore <sha256>      put a quarantined file back where it was
 #   hunterctl update-signatures     download the feeds in /etc/hunter/feeds
 #   hunterctl lockdown              enforce exec + integrity + av, learning off, seal
+#   hunterctl schedule              the scheduled scans: when, last and next run
+#   hunterctl schedule <job> <daily|mon..sun|off> [HH:MM] [report|quarantine]
+#                                   change when a scheduled scan runs (/etc/hunter/schedule)
+#   hunterctl run-scheduled <job|--due>
+#                                   run a scheduled scan now (--due: every one that is due)
+#   hunterctl history [N]           the last N scheduled scans (default 20)
+#   hunterctl scheduler             the daemon: run-scheduled --due once a minute
 #   hunterctl save-learned          append learned programs to the whitelist
 
 PROC=/proc/hunter
@@ -38,6 +45,12 @@ SCAN=/proc/hunter_scan
 QDIR=/var/lib/hunter/quarantine
 FEEDS=/etc/hunter/feeds
 SIGDIR=/etc/hunter/signatures.d
+SCHEDULE=/etc/hunter/schedule
+# The scheduled scans' state: `<job>.last` (when it last started, seconds
+# since the epoch), `history` (one line per run) and the last LOGS reports.
+SCANS=/var/lib/hunter/scans
+LOGS=30
+HISTORY_MAX=1000
 # Paths per write to /proc/hunter_scan: each batch is scanned before the
 # write returns, and 256 paths stay well under the 1 MiB a write may carry.
 BATCH=256
@@ -68,6 +81,142 @@ send() {
         rm -f "$msg"
         die "hunter rejected the script; nothing was applied (see '$0 events')"
     fi
+}
+
+# ── scheduled scans ─────────────────────────────────────────────────────────
+#
+# /etc/hunter/schedule, one job per line:
+#
+#   <job> <when> <HH:MM> <report|quarantine> <path>...
+#
+# `when` is `daily`, a weekday (`mon` .. `sun`) for once a week, or `off`.
+# The times are the machine's local time. A job is due at the first slot
+# after the one it last started in, so a machine that was off at 12:00 runs
+# the day's scan as soon as it is back (anacron, not cron): a desktop is
+# rarely on at the minute a cron line names.
+
+# The UTC offset in seconds, from `date +%z` (+0000 when it says nothing).
+tz_offset() {
+    z=$(date +%z 2>/dev/null)
+    case "$z" in
+    [+-][0-9][0-9][0-9][0-9]) ;;
+    *) echo 0; return ;;
+    esac
+    h=${z#?}; m=${h#??}; h=${h%??}
+    # Without the leading zero, or ash reads 08 as a bad octal number.
+    h=${h#0}; m=${m#0}
+    o=$((h * 3600 + m * 60))
+    case "$z" in -*) o=$((-o)) ;; esac
+    echo "$o"
+}
+
+# The weekday's number, Monday 1 to Sunday 7 (ISO), or nothing.
+weekday() {
+    case "$1" in
+    mon) echo 1 ;; tue) echo 2 ;; wed) echo 3 ;; thu) echo 4 ;;
+    fri) echo 5 ;; sat) echo 6 ;; sun) echo 7 ;;
+    esac
+}
+
+# Seconds after midnight for HH:MM, or fail.
+time_of_day() {
+    case "$1" in
+    [0-2][0-9]:[0-5][0-9]) ;;
+    *) return 1 ;;
+    esac
+    h=${1%%:*}; m=${1#*:}
+    h=${h#0}; m=${m#0}
+    [ "$h" -lt 24 ] || return 1
+    echo $((h * 3600 + m * 60))
+}
+
+# next_slot <epoch> <when> <HH:MM> [offset]: the first slot strictly after
+# <epoch>, in seconds since the epoch. Days are counted in local time, from
+# 1970-01-01, a Thursday.
+next_slot() {
+    tod=$(time_of_day "$3") || return 1
+    off=${4:-$(tz_offset)}
+    loc=$(($1 + off))
+    day=$((loc / 86400))
+    if [ "$2" = daily ]; then
+        cand=$((day * 86400 + tod))
+        [ "$cand" -gt "$loc" ] || cand=$((cand + 86400))
+    else
+        want=$(weekday "$2")
+        [ -n "$want" ] || return 1
+        dow=$(((day + 3) % 7 + 1))
+        cand=$(((day + (want - dow + 7) % 7) * 86400 + tod))
+        [ "$cand" -gt "$loc" ] || cand=$((cand + 7 * 86400))
+    fi
+    echo $((cand - off))
+}
+
+# `YYYY-MM-DD HH:MM` for an epoch (busybox and GNU date both take `@`).
+when_str() {
+    date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "@$1"
+}
+
+# The jobs, comments and blank lines left out.
+schedule_lines() {
+    [ -r "$SCHEDULE" ] && grep -v '^[[:space:]]*\(#\|$\)' "$SCHEDULE"
+}
+
+# run_job <job> <scheduled|manual>: scan the job's paths, record the run.
+run_job() {
+    line=$(schedule_lines | awk -v j="$1" '$1 == j' | head -n 1)
+    [ -n "$line" ] || die "no job '$1' in $SCHEDULE"
+    trigger=$2
+    set -f
+    # shellcheck disable=SC2086
+    set -- $line
+    set +f
+    job=$1; action=$4
+    shift 4
+    paths=" $*"
+    [ "$paths" != " " ] || die "job '$job' has no paths"
+    mkdir -p "$SCANS" && chmod 700 "$SCANS" || die "cannot create $SCANS"
+    # One scan at a time: two of them would halve each other's speed for no
+    # gain. A pid file and not a directory, so one left by a crash or a
+    # power cut does not block every scan after it.
+    if [ -r "$SCANS/lock" ] && kill -0 "$(cat "$SCANS/lock")" 2>/dev/null; then
+        echo "hunterctl: another scan is running (pid $(cat "$SCANS/lock")); $job not run" >&2
+        return 1
+    fi
+    echo $$ > "$SCANS/lock"
+    start=$(date +%s)
+    # Before the scan, not after: a scan that crashes the machine must not
+    # run again at every boot.
+    echo "$start" > "$SCANS/$job.last"
+    log="$SCANS/$(date -d "@$start" +%Y%m%d-%H%M%S 2>/dev/null || echo "$start")-$job.log"
+    q=""
+    [ "$action" = quarantine ] && q="--quarantine"
+    echo "hunterctl: $job: scanning$paths"
+    set -f
+    # shellcheck disable=SC2086
+    "$0" scan $q $paths > "$log" 2>&1
+    set +f
+    secs=$(($(date +%s) - start))
+    sum=$(sed -n 's/^hunterctl: scanned \([0-9]*\) file(s), \([0-9]*\) infected$/\1 \2/p' "$log" | tail -n 1)
+    if [ -n "$sum" ]; then
+        files=${sum% *}; infected=${sum#* }
+        if [ "$infected" -gt 0 ]; then status=infected; else status=clean; fi
+    else
+        files=0; infected=0; status=failed
+    fi
+    quarantined=$(grep -c '^hunterctl: quarantined ' "$log")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -d "@$start" +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo "$start")" \
+        "$job" "$trigger" "$secs" "$files" "$infected" "$quarantined" "$status" "${log##*/}" >> "$SCANS/history"
+    # Bounded: the newest HISTORY_MAX runs and LOGS reports.
+    if [ "$(wc -l < "$SCANS/history")" -gt "$HISTORY_MAX" ]; then
+        tail -n "$HISTORY_MAX" "$SCANS/history" > "$SCANS/history.new" && mv "$SCANS/history.new" "$SCANS/history"
+    fi
+    ls -1 "$SCANS" | grep '\.log$' | sort -r | sed "1,${LOGS}d" | while IFS= read -r old; do
+        rm -f "$SCANS/$old"
+    done
+    rm -f "$SCANS/lock"
+    grep -v '^hunterctl: scanned ' "$log"
+    echo "hunterctl: $job: $status, $files file(s), $infected infected, $quarantined quarantined, ${secs}s (report: $log)"
+    [ "$status" = clean ]
 }
 
 cmd=${1:-status}
@@ -160,7 +309,12 @@ scan)
     [ -w "$SCAN" ] || die "$SCAN not found: this kernel's hunter has no antivirus"
     list=$(mktemp) && out=$(mktemp) && batch=$(mktemp) || die "mktemp failed"
     trap 'rm -f "$list" "$out" "$batch"' EXIT
-    find "$@" -type f > "$list" 2>/dev/null
+    # Not into the kernel's own trees (a /proc file is endless or a live
+    # process's memory, a /dev node a device) nor into the quarantine, whose
+    # files are known malware already put away. So `scan /` means the disk,
+    # as it does in lunarhunter.
+    find "$@" \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path "$QDIR" \) -prune \
+        -o -type f -print > "$list" 2>/dev/null
     total=$(wc -l < "$list")
     i=1
     while [ "$i" -le "$total" ]; do
@@ -263,6 +417,96 @@ update-signatures)
         else
             echo "hunterctl: $name: hunter rejected the feed; not installed" >&2
         fi
+    done
+    ;;
+schedule)
+    if [ $# -eq 0 ]; then
+        [ -r "$SCHEDULE" ] || die "no $SCHEDULE"
+        now=$(date +%s)
+        schedule_lines | while read -r job when at action paths; do
+            last=$(cat "$SCANS/$job.last" 2>/dev/null)
+            if [ "$when" = off ]; then
+                next=off
+            else
+                n=$(next_slot "${last:-$now}" "$when" "$at") && next=$(when_str "$n") || next="bad schedule"
+            fi
+            [ -n "$last" ] && last=$(when_str "$last") || last=never
+            printf '%s\t%s %s, %s\n\tlast: %s\tnext: %s\n\tpaths: %s\n' \
+                "$job" "$when" "$at" "$action" "$last" "$next" "$paths"
+        done
+        exit 0
+    fi
+    [ $# -ge 2 ] && [ $# -le 4 ] || usage 1
+    [ "$(id -u)" = 0 ] || die "must be root"
+    [ -r "$SCHEDULE" ] || die "no $SCHEDULE"
+    job=$1 when=$2 at="" action=""
+    case "$job" in ''|*[!A-Za-z0-9_-]*) die "bad job name '$job'" ;; esac
+    case "$when" in
+    daily|off) ;;
+    *) [ -n "$(weekday "$when")" ] || die "when: daily, mon..sun or off, not '$when'" ;;
+    esac
+    shift 2
+    for a in "$@"; do
+        case "$a" in
+        report|quarantine) action=$a ;;
+        *) time_of_day "$a" >/dev/null || die "not a time (HH:MM): $a"; at=$a ;;
+        esac
+    done
+    grep -q "^[[:space:]]*$job[[:space:]]" "$SCHEDULE" || die "no job '$job' in $SCHEDULE"
+    # Only the fields asked for change; the rest of the line, and every
+    # other line (comments included), stays as the operator wrote it.
+    tmp=$(mktemp) || die "mktemp failed"
+    awk -v j="$job" -v w="$when" -v t="$at" -v a="$action" '
+        !/^[[:space:]]*#/ && $1 == j {
+            $2 = w
+            if (t != "") $3 = t
+            if (a != "") $4 = a
+        }
+        { print }' "$SCHEDULE" > "$tmp" && cat "$tmp" > "$SCHEDULE"
+    rm -f "$tmp"
+    "$0" schedule
+    ;;
+run-scheduled)
+    [ $# -eq 1 ] || usage 1
+    [ "$(id -u)" = 0 ] || die "must be root"
+    if [ "$1" != --due ]; then
+        run_job "$1" manual
+        exit $?
+    fi
+    now=$(date +%s)
+    rc=0
+    mkdir -p "$SCANS" && chmod 700 "$SCANS" || die "cannot create $SCANS"
+    for job in $(schedule_lines | awk '$2 != "off" { print $1 }'); do
+        set -- $(schedule_lines | awk -v j="$job" '$1 == j { print $2, $3; exit }')
+        last=$(cat "$SCANS/$job.last" 2>/dev/null)
+        # A job seen for the first time starts counting now: its first run
+        # is its next slot, not this minute. And a clock that went back
+        # (an RTC reset, before NTP) must not hold a job off for days.
+        if [ -z "$last" ] || [ "$last" -gt $((now + 86400)) ]; then
+            echo "$now" > "$SCANS/$job.last"
+            continue
+        fi
+        next=$(next_slot "$last" "$1" "$2") || { echo "hunterctl: $job: bad schedule" >&2; continue; }
+        if [ "$now" -ge "$next" ]; then
+            run_job "$job" scheduled || rc=1
+        fi
+    done
+    exit "$rc"
+    ;;
+history)
+    n=${1:-20}
+    case "$n" in ''|*[!0-9]*) usage 1 ;; esac
+    [ -r "$SCANS/history" ] || { echo "hunterctl: no scheduled scan has run yet"; exit 0; }
+    printf 'date\tjob\ttrigger\tseconds\tfiles\tinfected\tquarantined\tstatus\treport\n'
+    tail -n "$n" "$SCANS/history"
+    ;;
+scheduler)
+    [ "$(id -u)" = 0 ] || die "must be root"
+    # In the foreground, for eclipse-init to supervise. A failed scan is
+    # in the history; the loop carries on.
+    while :; do
+        "$0" run-scheduled --due
+        sleep 60
     done
     ;;
 save-learned)

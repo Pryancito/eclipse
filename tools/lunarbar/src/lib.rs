@@ -30,6 +30,7 @@ pub mod files;
 pub mod hunter;
 pub mod hunter_report;
 pub mod hunter_scan;
+pub mod hunter_schedule;
 pub mod fill_guard;
 pub mod i18n;
 pub mod icons;

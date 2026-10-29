@@ -272,7 +272,7 @@ is the rest of hunter as a desktop application: a normal xdg-shell window
 (in the taskbar, movable, resizable, framed by labwc), built and installed with
 the bar as `/bin/lunarhunter`, in the app menu as **Seguridad (hunter)**
 (`/usr/local/bin/eclipse-security`, which falls back to a terminal on
-`hunterctl events`). Seven tabs, keys `1`-`7` or Tab:
+`hunterctl events`). Eight tabs, keys `1`-`8` or Tab:
 
 | Tab | What it does |
 |---|---|
@@ -283,6 +283,7 @@ the bar as `/bin/lunarhunter`, in the app menu as **Seguridad (hunter)**
 | Cuarentena | `/var/lib/hunter/quarantine/index`, each row restorable (two clicks) |
 | Firmas | what the kernel holds (hash / byte patterns / detections), the files under `/etc/hunter/signatures{,.d}`, the feeds, **update now**, and the **EICAR test** (writes the test file, scans it, deletes it, says whether the engine caught it) |
 | Programas | the allowlist counts, kernel vs. disk pins, the learned programs, **save learned** (`hunterctl save-learned`) and **verify integrity** (`hunterctl verify`) |
+| Programados | the scheduled scans (see [Antivirus](#antivirus-signatures)): per job off / daily / weekly, the day, the time in 30-minute steps, alert or quarantine, its next run and **run now** (`hunterctl run-scheduled`); then the history, newest first |
 
 Like the bar it holds no policy: settings go through `/proc/hunter`, scans
 through `/proc/hunter_scan` (the same batches of 256 paths `hunterctl scan`
@@ -396,6 +397,34 @@ MalwareBazaar's list of malware SHA-256s from the last 48 hours. Schedule it
 with crond, e.g. `0 */6 * * * /sbin/hunterctl update-signatures`. Adding a
 signature only ever makes hunter stricter, so the tighten-only latch does not
 block updates.
+
+**Scheduled scans.** `/etc/hunter/schedule` holds the scans that run on
+their own, one per line: `<job> <when> <HH:MM> <report|quarantine>
+<path>...`, where `when` is `daily`, a weekday (`mon` .. `sun`) or `off`, in
+local time. The image ships two: `quick`, daily at 12:00, over the program
+directories, `/tmp`, `/root` and `/home`; and `full`, on Sundays at 13:00,
+over `/` (a scan never enters `/proc`, `/sys`, `/dev`, `/run` or the
+quarantine). Both only report by default; `quarantine` also puts what they
+find away. The `hunter-scheduler` service (`hunterctl scheduler`, supervised
+by eclipse-init) checks once a minute. A job is due at the first slot after
+the one it last started in, like anacron, so a machine that was off at noon
+runs the day's scan when it comes back, once. A job seen for the first time
+starts counting from then.
+
+- `hunterctl schedule` lists the jobs with their last and next run.
+- `hunterctl schedule quick mon 08:30 quarantine` changes the named fields
+  and leaves the rest of the file, comments included, alone.
+- `hunterctl run-scheduled full` runs a job now. It is recorded like a
+  scheduled run, with trigger `manual`.
+- `hunterctl history [N]` prints the last runs from
+  `/var/lib/hunter/scans/history`: date, job, trigger, seconds, files,
+  infected, quarantined, status (`clean`, `infected` or `failed`) and the
+  report file. The newest 30 reports and 1000 runs are kept.
+
+Only one scan runs at a time (a pid file in `/var/lib/hunter/scans/lock`).
+Every finding is an `AV DETECT` event like any other scan's, so it reaches
+lunarbar's shield. lunarhunter's **Programados** tab shows the same jobs and
+history and changes them through these commands.
 
 **Limits.** Hashes cover the whole file. Byte patterns are searched in the
 first 128 MiB of an image, and each pattern is a separate anchored pass, which
