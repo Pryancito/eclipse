@@ -29,6 +29,7 @@ pub mod draw;
 pub mod files;
 pub mod hunter;
 pub mod hunter_export;
+pub mod hunter_notify;
 pub mod hunter_report;
 pub mod hunter_scan;
 pub mod fill_guard;
