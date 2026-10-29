@@ -21,6 +21,8 @@
 //! | [`task_fork`]         | `fork` / `clone`            | policy lifecycle|
 //! | [`task_exec`]         | `execve`                    | policy lifecycle|
 //! | [`task_exit`]         | process teardown            | state cleanup   |
+//! | [`netmon::on_listen`] | `listen`                    | network monitor |
+//! | [`netmon::observe`]   | read of `/proc/hunter_net`  | network monitor |
 //!
 //! Each enforcement domain has an independent [`policy::Mode`] (`Off` /
 //! `Report` / `Enforce`) and the control plane can be sealed tighten-only.
@@ -48,6 +50,7 @@ pub mod event_log;
 pub mod heuristics;
 pub mod integrity;
 pub mod media;
+pub mod netmon;
 pub mod policy;
 pub mod wx;
 
@@ -553,6 +556,16 @@ pub fn render_report() -> String {
         av_hits
     ));
     out.push_str(&media::render());
+    out.push_str(&format!(
+        "netmon: alerts={} rules={} reported={}\n",
+        if netmon::alerts_enabled() {
+            "on"
+        } else {
+            "off"
+        },
+        netmon::rules().len(),
+        netmon::reported(),
+    ));
     // Machine-readable dump of learned programs so a userspace helper can
     // persist them to /etc/hunter/whitelist (kernel never writes the FS).
     let learned = policy::learned_exec_paths();

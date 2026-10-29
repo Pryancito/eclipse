@@ -905,8 +905,9 @@ impl LinuxRootfs {
         fs::create_dir_all(&etc_hunter).unwrap();
         // Each written only when absent, so an operator's edits survive a
         // rebuild: the example policy, the antivirus database (EICAR, so the
-        // scanner can be tested), the signature feeds and the scheduled scans.
-        for name in ["policy.conf", "signatures", "feeds", "schedule"] {
+        // scanner can be tested), the signature feeds, the scheduled scans and
+        // the ports the network monitor expects.
+        for name in ["policy.conf", "signatures", "feeds", "schedule", "ports"] {
             let dst = etc_hunter.join(name);
             if !dst.exists() {
                 fs::copy(PROJECT_DIR.join("tools/hunterctl").join(name), &dst).unwrap();

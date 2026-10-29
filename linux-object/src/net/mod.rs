@@ -330,6 +330,9 @@ pub mod ra;
 pub mod dns;
 
 pub mod wait;
+
+/// Who holds which inet socket, for hunter's network monitor.
+pub mod netmon;
 pub use icmp_rx::*;
 
 // pub mod stack;

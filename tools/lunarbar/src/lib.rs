@@ -31,6 +31,7 @@ pub mod hunter;
 pub mod hunter_export;
 pub mod hunter_notify;
 pub mod hunter_media;
+pub mod hunter_net;
 pub mod hunter_report;
 pub mod hunter_scan;
 pub mod hunter_schedule;
