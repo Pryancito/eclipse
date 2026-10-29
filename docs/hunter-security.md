@@ -503,7 +503,11 @@ starts counting from then.
 
 Only one scan runs at a time (a pid file in `/var/lib/hunter/scans/lock`).
 Every finding is an `AV DETECT` event like any other scan's, so it reaches
-lunarbar's shield. lunarhunter's **Programados** tab shows the same jobs and
+lunarbar's shield. A run the clock started also posts a card on the desktop
+(`hunterctl notify`): a passing note when it is clean, a warning when
+everything it found was quarantined, a critical card with a **quarantine**
+button when something was left in place, and a warning with the report's
+path when the run did not finish. A run started by hand posts nothing. lunarhunter's **Programados** tab shows the same jobs and
 history and changes them through these commands.
 
 **Limits.** Hashes cover the whole file. Byte patterns are searched in the
