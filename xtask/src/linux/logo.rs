@@ -11,6 +11,12 @@
 //!   distribution: readers resolve `distributor-logo-<LOGO>` through the
 //!   installed theme. Shipping `distributor-logo-eclipse.svg` is what makes
 //!   `LOGO=eclipse` true; until this existed the only honest value was `linux`.
+//! - **fastfetch.** It draws an ASCII logo of its own, chosen by `ID` and
+//!   then `ID_LIKE` from `/etc/os-release`. There is no builtin for
+//!   `eclipse` and `ID_LIKE` says `ubuntu debian`, so left alone fastfetch
+//!   puts UBUNTU's circle of friends on an Eclipse box. `/etc/fastfetch/`
+//!   points it at ours instead, as the last candidate in its own search
+//!   order, so a user config still wins.
 //! - **`/etc/profile`.** Nothing prints `/etc/motd` here: `login` would, and
 //!   the serial console has no login (`console.shell=true` drops straight into
 //!   busybox `sh`). So the profile prints it, once.
@@ -174,6 +180,56 @@ const LOGO_PATH: &str = "usr/share/eclipse/logo.txt";
 /// Theme Specification's `distributor-logo-<LOGO>` convention.
 const ICON_STEM: &str = "distributor-logo-eclipse";
 
+/// Where fastfetch looks for a system-wide config.
+///
+/// fastfetch tries `<dir>/fastfetch/config.jsonc` over a list of config
+/// directories that runs `$XDG_CONFIG_HOME`, `~/.config/`, `~/`,
+/// `$XDG_CONFIG_DIRS`, `/etc/xdg/` and then `/etc/`, and it stops at the
+/// FIRST one that parses. So this is the fallback and not a lock: anything
+/// the user puts in `~/.config/fastfetch/config.jsonc` still wins.
+const FASTFETCH_CONFIG: &str = "etc/fastfetch/config.jsonc";
+
+/// The mark again, with fastfetch's colour placeholder on it.
+///
+/// A second file and not the same one because `logo.txt` is the plain asset:
+/// anything that `cat`s it gets the drawing, not a stray `$1`. Both come out
+/// of [`mark`], so they cannot drift.
+const FASTFETCH_LOGO: &str = "usr/share/eclipse/logo.fastfetch.txt";
+
+/// What fastfetch is told `$1` means. The name and not `35`: fastfetch's
+/// colour parser takes names, `@n` for xterm-256 and `#rrggbb`, and a bare
+/// number is not one of them.
+const FASTFETCH_COLOUR: &str = "magenta";
+
+/// The mark with fastfetch's colour placeholder on the front.
+///
+/// One `$1` is enough for the whole drawing: fastfetch carries the colour
+/// from one logo line to the next for every logo type but chafa.
+fn fastfetch_logo() -> String {
+    format!("$1{}", mark())
+}
+
+/// What goes in `/etc/fastfetch/config.jsonc`.
+///
+/// Without this fastfetch draws **Ubuntu's** logo on Eclipse. It picks a
+/// builtin by `ID` from `/etc/os-release`, has no builtin for `eclipse`, and
+/// falls through to `ID_LIKE`, which on x86_64 and aarch64 says `ubuntu
+/// debian` because that is honestly where the userspace comes from. Shipping
+/// our own `LOGO` icon did nothing for it: that field names an ICON for the
+/// icon theme, and fastfetch's ASCII logo is a different thing entirely.
+fn fastfetch_config() -> String {
+    format!(
+        "{{\n\
+         \x20 \"$schema\": \"https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json\",\n\
+         \x20 \"logo\": {{\n\
+         \x20\x20\x20 \"type\": \"file\",\n\
+         \x20\x20\x20 \"source\": \"/{FASTFETCH_LOGO}\",\n\
+         \x20\x20\x20 \"color\": {{ \"1\": \"{FASTFETCH_COLOUR}\" }}\n\
+         \x20 }}\n\
+         }}\n"
+    )
+}
+
 /// The icon: the same formula, read as vectors instead of as characters.
 ///
 /// The ASCII picks a character by how bright the corona is at that cell; here
@@ -326,8 +382,19 @@ pub(super) fn install(rootfs: &Path, arch: &str, variant: Variant) {
         let _ = fs::write(&index, HICOLOR_INDEX);
     }
 
+    // And the one reader that draws an ASCII logo of its own. Left alone it
+    // draws UBUNTU's, which is what `ID_LIKE` honestly says we come from.
+    let ff_logo = rootfs.join(FASTFETCH_LOGO);
+    fs::write(&ff_logo, fastfetch_logo())
+        .unwrap_or_else(|e| panic!("logo: cannot write {}: {e}", ff_logo.display()));
+    let ff_config = rootfs.join(FASTFETCH_CONFIG);
+    fs::create_dir_all(ff_config.parent().unwrap()).unwrap();
+    let _ = fs::remove_file(&ff_config);
+    fs::write(&ff_config, fastfetch_config())
+        .unwrap_or_else(|e| panic!("logo: cannot write {}: {e}", ff_config.display()));
+
     println!(
-        "logo: {} ({MARK_COLUMNS}x{MARK_ROWS}), /etc/motd and {ICON_STEM}.svg",
+        "logo: {} ({MARK_COLUMNS}x{MARK_ROWS}), /etc/motd, {ICON_STEM}.svg and /{FASTFETCH_CONFIG}",
         LOGO_PATH
     );
 }
@@ -568,6 +635,108 @@ mod tests {
                 "the limb is speckled at {out} cells out, on the streamer"
             );
         }
+    }
+
+    /// fastfetch draws an ASCII logo of its OWN, chosen by `ID` and then
+    /// `ID_LIKE` from `/etc/os-release`. There is no builtin for `eclipse`
+    /// and `ID_LIKE` says `ubuntu debian`, so without a config fastfetch
+    /// puts Ubuntu's circle of friends on an Eclipse box. Shipping the
+    /// `LOGO` icon did nothing for this: that field names an icon for the
+    /// icon theme, which is a different reader.
+    #[test]
+    fn fastfetch_is_pointed_at_our_drawing_and_not_ubuntus() {
+        let root = scratch("fastfetch");
+        install(&root, "x86_64", Variant::Minimal);
+
+        let config = root.join(FASTFETCH_CONFIG);
+        let text =
+            fs::read_to_string(&config).unwrap_or_else(|e| panic!("{}: {e}", config.display()));
+        // The path as fastfetch will read it: absolute, and the file the
+        // image actually installs.
+        assert!(
+            text.contains(&format!("\"source\": \"/{FASTFETCH_LOGO}\"")),
+            "the config does not point at the logo we install:\n{text}"
+        );
+        assert!(
+            root.join(FASTFETCH_LOGO).exists(),
+            "the config points at a file the image does not install"
+        );
+        // `file` and not `file-raw`: raw means no placeholder replacement,
+        // and the placeholder is the whole of how it gets its colour.
+        assert!(
+            text.contains("\"type\": \"file\""),
+            "the logo type is not one that replaces the colour placeholder:\n{text}"
+        );
+    }
+
+    /// The config has to PARSE, or fastfetch walks on to the next candidate
+    /// and we are back to Ubuntu's logo with nothing said. Checked
+    /// structurally, since xtask has no JSON parser: balanced braces outside
+    /// strings, no trailing comma before a close, and quotes that close.
+    #[test]
+    fn the_fastfetch_config_is_well_formed() {
+        let text = fastfetch_config();
+        assert!(text.starts_with('{'), "not an object:\n{text}");
+        assert!(text.ends_with("}\n"), "not closed:\n{text}");
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut previous = ' ';
+        for (at, c) in text.char_indices() {
+            match c {
+                '"' if previous != '\\' => in_string = !in_string,
+                '{' if !in_string => depth += 1,
+                '}' if !in_string => {
+                    depth -= 1;
+                    assert!(depth >= 0, "a brace closes what was never opened:\n{text}");
+                }
+                ',' if !in_string => {
+                    // A trailing comma is legal in JSONC and not in JSON, and
+                    // this file is small enough to keep honest either way.
+                    let next = text[at + 1..].trim_start().chars().next();
+                    assert!(
+                        !matches!(next, Some('}') | Some(']') | None),
+                        "a trailing comma at byte {at}:\n{text}"
+                    );
+                }
+                _ => {}
+            }
+            previous = c;
+        }
+        assert_eq!(depth, 0, "unbalanced braces:\n{text}");
+        assert!(!in_string, "an unclosed string:\n{text}");
+    }
+
+    /// The logo fastfetch reads is the SAME drawing, with the placeholder in
+    /// front of it and nothing else. Two files, one source.
+    #[test]
+    fn the_fastfetch_logo_is_the_same_drawing() {
+        let drawn = fastfetch_logo();
+        assert_eq!(
+            drawn.strip_prefix("$1"),
+            Some(mark().as_str()),
+            "fastfetch's copy of the logo is not the logo"
+        );
+        // One placeholder is the point: fastfetch carries the colour from
+        // line to line, so repeating it would be noise in a file people read.
+        assert_eq!(drawn.matches("$1").count(), 1, "{drawn}");
+        assert!(
+            !mark().contains('$'),
+            "the mark has a `$` in it, which fastfetch would eat as a placeholder"
+        );
+    }
+
+    /// The console and fastfetch show the SAME colour. `/etc/profile` prints
+    /// the motd in `os_release::ANSI_COLOR`, and fastfetch is told a name;
+    /// this is what keeps the two from drifting into two different purples.
+    #[test]
+    fn fastfetch_is_given_the_colour_the_console_uses() {
+        // `0;35` is ANSI magenta, and `magenta` is what fastfetch calls it.
+        assert_eq!(os_release::ANSI_COLOR, "0;35");
+        assert_eq!(FASTFETCH_COLOUR, "magenta");
+        assert!(
+            fastfetch_config().contains(&format!("\"1\": \"{FASTFETCH_COLOUR}\"")),
+            "the config does not set the colour of the placeholder"
+        );
     }
 
     /// The same tree has to give the same `/etc/motd`, byte for byte, on every
