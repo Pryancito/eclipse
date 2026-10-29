@@ -185,6 +185,10 @@ pub const NCFGR_RXCOEN: u32 = 1 << 24;
 /// `GEM_SGMIIEN`: SGMII.
 pub const NCFGR_SGMIIEN: u32 = 1 << 27;
 
+/// Trama mas larga que el MAC acepta con `BIG` puesto: los 1518 de una trama
+/// Ethernet con su FCS, redondeados a 1536 como hace el silicio.
+pub const ENET_MAX_FRAME_LEN: u32 = 1536;
+
 /// Los dos bytes de relleno que el MAC mete delante de la trama para que la
 /// cabecera IP caiga alineada a cuatro (el `NET_IP_ALIGN` de Linux).
 pub const RX_IP_ALIGN: u32 = 2;
@@ -707,6 +711,10 @@ impl MacbMac {
 pub fn mac_addr_is_valid(mac: &[u8; 6]) -> bool {
     mac.iter().any(|b| *b != 0) && mac[0] & 1 == 0
 }
+
+/// Los anillos de descriptores y el camino de la trama.
+mod rings;
+pub use rings::{MacbRings, RingKind, MAX_TX_FRAME, RX_BUF_LENGTH, RX_RING_SIZE, TX_RING_SIZE};
 
 #[cfg(test)]
 mod macb_fake;

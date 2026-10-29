@@ -61,6 +61,10 @@ struct State {
     /// Toda escritura del driver, en orden: (offset, valor). Es la unica
     /// forma de comprobar una ordenacion desde el anfitrion.
     writes: Vec<(usize, u32)>,
+    /// Toda escritura de un descriptor, en orden: (anillo, hueco, palabra,
+    /// valor). Un descriptor es memoria y no deja rastro, y de este formato lo
+    /// que importa es el orden.
+    desc_writes: Vec<(RingKind, usize, usize, u32)>,
 }
 
 std::thread_local! {
@@ -96,10 +100,17 @@ impl Hw {
             phy_writes: Vec::new(),
             mdio_starts: 0,
             writes: Vec::new(),
+            desc_writes: Vec::new(),
         };
         st.regs[MID / 4] = GEM_IDNUM << MID_IDNUM_SHIFT | 0x0107;
         // Un bus de 64 bits, que es lo que `DBWDEF` codifica con un 2.
         st.regs[GEM_DCFG1 / 4] = 2 << DCFG1_DBWDEF_SHIFT;
+        // Y un DMA que direcciona a 64 bits, que es lo que declara un GEM
+        // moderno en un SoC de 64 bits --- y lo que el anfitrion obliga: aqui
+        // una region de DMA sale del monton, muy por encima de los 4 GiB, asi
+        // que un GEM de 32 bits no podria alcanzarla (ver
+        // `reachable_by_32bit_dma`).
+        st.regs[GEM_DCFG6 / 4] = DCFG6_DAW64;
         // La logica de gestion del PHY, en reposo desde el principio.
         st.regs[NSR / 4] = NSR_IDLE;
         FAKE.with(|f| *f.borrow_mut() = Some(st));
@@ -223,6 +234,21 @@ impl Hw {
         self.with(|st| st.writes.len())
     }
 
+    /// Toda escritura de descriptor, en orden.
+    pub(super) fn desc_writes(&self) -> Vec<(RingKind, usize, usize, u32)> {
+        self.with(|st| st.desc_writes.clone())
+    }
+
+    /// Cuantas escrituras de descriptor se han visto, para usarlo como marca.
+    pub(super) fn desc_mark(&self) -> usize {
+        self.with(|st| st.desc_writes.len())
+    }
+
+    /// Las escrituras de descriptor desde una marca.
+    pub(super) fn desc_writes_since(&self, marca: usize) -> Vec<(RingKind, usize, usize, u32)> {
+        self.with(|st| st.desc_writes[marca..].to_vec())
+    }
+
     /// Levanta interrupciones como las levantaria el hardware: pone los bits
     /// en el `ISR`, sin tocar la mascara.
     pub(super) fn raise_irq(&self, bits: u32) {
@@ -317,4 +343,17 @@ impl State {
 
         self.regs[NSR / 4] |= NSR_IDLE;
     }
+}
+
+/// El rastro de una escritura de descriptor.
+///
+/// No modela nada: un descriptor es memoria del anfitrion y el driver la
+/// escribe directamente. Lo unico que hace falta del hardware aqui es el
+/// **orden**, que la memoria no guarda.
+pub(super) fn on_desc_write(kind: RingKind, slot: usize, word: usize, val: u32) {
+    FAKE.with(|f| {
+        let mut slot_fake = f.borrow_mut();
+        let Some(st) = slot_fake.as_mut() else { return };
+        st.desc_writes.push((kind, slot, word, val));
+    });
 }

@@ -68,10 +68,10 @@ fn what_the_design_registers_declare_is_read_not_assumed() {
     let hw = Hw::new();
     let mac = hw.mac();
 
-    // `DCFG6` sin el bit: DMA de 32 bits.
-    assert!(!mac.has_64bit_dma());
-    hw.poke(GEM_DCFG6, DCFG6_DAW64);
+    // El falso trae `DCFG6` con el bit puesto: DMA de 64 bits.
     assert!(mac.has_64bit_dma());
+    hw.poke(GEM_DCFG6, 0);
+    assert!(!mac.has_64bit_dma());
 
     // `IRQCOR` a cero (lo que el falso trae) es el `ISR` que se limpia
     // escribiendolo; con el bit puesto, no.
