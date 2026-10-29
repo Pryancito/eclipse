@@ -511,10 +511,12 @@ impl<M: IoMapper> DevicetreeDriverBuilder<M> {
             // dichas donde se sonda:
             //
             // 1. **El `reg` del nodo es una direccion de bus del PCIe del
-            //    BCM2712** (`0xc0_40100000`), que hay que traducir por el
-            //    `ranges` del puente raiz. `parse_reg` no traduce `ranges`, y
-            //    Eclipse no tiene driver del controlador PCIe de Broadcom STB:
-            //    en una Pi 5 de verdad nadie llega a esta ventana.
+            //    BCM2712** (`0xc0_40100000`). `parse_reg` ya la traduce por
+            //    los `ranges` de los dos puentes y da la direccion de CPU
+            //    (`0x1f_00100000`), pero **que la direccion sea correcta no
+            //    levanta el enlace**: Eclipse no tiene driver del controlador
+            //    PCIe de Broadcom STB, asi que en una Pi 5 de verdad esa
+            //    ventana no contesta hasta que alguien lo escriba.
             // 2. **El RP1 es su propio controlador de interrupciones**
             //    (`#interrupt-cells = <2>`), y Eclipse no tiene driver suyo,
             //    asi que `register_interrupts` no encuentra a quien registrar
