@@ -263,6 +263,55 @@ schedule_lines() {
     [ -r "$SCHEDULE" ] && grep -v '^[[:space:]]*\(#\|$\)' "$SCHEDULE"
 }
 
+# The desktop's language, as lunarbar picks it: /etc/eclipse/locale, then
+# LANG, then Spanish.
+desktop_lang() {
+    l=$(grep -v '^[[:space:]]*\(#\|$\)' /etc/eclipse/locale 2>/dev/null |
+        sed -n 's/^lang=//p; /=/!p' | head -n 1)
+    [ -n "$l" ] || l=${LANG:-es}
+    case "$l" in en*|EN*|English*|english*) echo en ;; *) echo es ;; esac
+}
+
+# A card on lunarbar for the run run_job just recorded (its variables). A
+# clean run is a passing info card; a finding nobody put away is critical,
+# stays until answered and offers the quarantine; a failed run points at
+# its report.
+announce_run() {
+    en=0
+    [ "$(desktop_lang)" = en ] && en=1
+    t() { if [ "$en" = 1 ]; then echo "$2"; else echo "$1"; fi; }
+    case "$job" in
+    quick) name=$(t "Rápido" "Quick") ;;
+    full) name=$(t "Completo" "Full") ;;
+    *) name=$job ;;
+    esac
+    title="$(t "Escaneo programado" "Scheduled scan"): $name"
+    set --
+    [ -x /bin/lunarhunter ] && set -- --action "view:$(t ver view):/bin/lunarhunter --tab programados"
+    left=$((infected - quarantined))
+    case "$status" in
+    clean)
+        notify --severity info "$@" "$title" \
+            "$(t "Sin amenazas en $files archivos (${secs}s)." "No threats in $files files (${secs}s).")" ;;
+    infected)
+        if [ "$left" -le 0 ]; then
+            notify --severity warn "$@" "$title" \
+                "$(t "$infected amenaza(s), todas en cuarentena." "$infected threat(s), all quarantined.")"
+        else
+            # Each path in single quotes, for the bar's `sh -c`.
+            paths=$(sed -n 's/: [^ ]* FOUND$//p' "$log" |
+                sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/" | tr '\n' ' ')
+            notify --severity crit "$@" \
+                --action "quarantine:$(t cuarentena quarantine):/sbin/hunterctl quarantine $paths" \
+                "$title" \
+                "$(t "$left amenaza(s) sin aislar en $files archivos." "$left threat(s) not quarantined in $files files.")"
+        fi ;;
+    *)
+        notify --severity warn "$@" "$title" \
+            "$(t "No se completó. Informe: $log" "It did not finish. Report: $log")" ;;
+    esac
+}
+
 # run_job <job> <scheduled|manual>: scan the job's paths, record the run.
 run_job() {
     line=$(schedule_lines | awk -v j="$1" '$1 == j' | head -n 1)
@@ -316,6 +365,9 @@ run_job() {
         rm -f "$SCANS/$old"
     done
     rm -f "$SCANS/lock"
+    # A run the clock started says how it went on the desktop; one started
+    # by hand already has someone reading its output.
+    [ "$trigger" = scheduled ] && ( announce_run ) >/dev/null 2>&1
     grep -v '^hunterctl: scanned ' "$log"
     echo "hunterctl: $job: $status, $files file(s), $infected infected, $quarantined quarantined, ${secs}s (report: $log)"
     [ "$status" = clean ]
