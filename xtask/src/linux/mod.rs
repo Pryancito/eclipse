@@ -922,7 +922,7 @@ impl LinuxRootfs {
         fs::write(
             svc_dir.join("hunter-scheduler.service"),
             b"# hunter's scheduled antivirus scans: /etc/hunter/schedule, history in\n\
-              # /var/lib/hunter/scans. See `hunterctl schedule` and `hunterctl history`.\n\
+              # /var/lib/hunter/scans. See `hunterctl schedule` and `hunterctl scan-history`.\n\
               exec = /sbin/hunterctl scheduler\n\
               type = respawn\n\
               log = /tmp/hunter-scheduler.log\n",

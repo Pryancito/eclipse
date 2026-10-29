@@ -34,7 +34,7 @@
 #                                   change when a scheduled scan runs (/etc/hunter/schedule)
 #   hunterctl run-scheduled <job|--due>
 #                                   run a scheduled scan now (--due: every one that is due)
-#   hunterctl history [N]           the last N scheduled scans (default 20)
+#   hunterctl scan-history [N]      the last N scheduled scans (default 20)
 #   hunterctl scheduler             the daemon: run-scheduled --due once a minute
 #   hunterctl save-learned          append learned programs to the whitelist
 
@@ -493,7 +493,7 @@ run-scheduled)
     done
     exit "$rc"
     ;;
-history)
+scan-history)
     n=${1:-20}
     case "$n" in ''|*[!0-9]*) usage 1 ;; esac
     [ -r "$SCANS/history" ] || { echo "hunterctl: no scheduled scan has run yet"; exit 0; }

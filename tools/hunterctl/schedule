@@ -11,7 +11,7 @@
 #
 # Run by `hunterctl scheduler` (the hunter-scheduler service). Change it with
 # `hunterctl schedule <job> <when> [HH:MM] [report|quarantine]` or from
-# lunarhunter's "Programados" tab; `hunterctl history` lists past runs.
+# lunarhunter's "Programados" tab; `hunterctl scan-history` lists past runs.
 # Paths are separated by spaces, so a path cannot contain one.
 
 # Quick: where programs live and where downloads and temporary files land.

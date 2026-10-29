@@ -416,7 +416,7 @@ starts counting from then.
   and leaves the rest of the file, comments included, alone.
 - `hunterctl run-scheduled full` runs a job now. It is recorded like a
   scheduled run, with trigger `manual`.
-- `hunterctl history [N]` prints the last runs from
+- `hunterctl scan-history [N]` prints the last runs from
   `/var/lib/hunter/scans/history`: date, job, trigger, seconds, files,
   infected, quarantined, status (`clean`, `infected` or `failed`) and the
   report file. The newest 30 reports and 1000 runs are kept.
