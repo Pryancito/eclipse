@@ -17,8 +17,21 @@
 # silencio, y busybox no escribe esa linea. Un patron mas generico (un prompt,
 # un «ok») lo habria dado por bueno.
 #
+# `-d` anade al invitado un SEGUNDO disco con una ESP ajena dentro: un
+# `\EFI\Boot` que solo tiene su `BootX64.efi`, como el de cualquier PC con
+# otro sistema instalado. No es un adorno: rboot abria el PRIMER volumen FAT
+# que le ofrecia el firmware en vez del suyo, y con ese disco delante leia el
+# `\EFI\Boot` del otro sistema y moria con
+#
+#     failed to open \EFI\Boot\rboot.conf: NOT_FOUND;
+#     \EFI\Boot holds: BootX64.efi
+#
+# o sea, la ISO «sin rboot.conf» que se veia en maquinas reales y nunca aqui,
+# porque el invitado de siempre tiene un solo volumen FAT y entonces el primero
+# y el suyo son el mismo. Con un solo disco este fallo NO se reproduce.
+#
 #   scripts/iso-smoke.sh [-a ARCH] [-v VARIANT] [-i ISO] [-t TIMEOUT]
-#                        [-m MEM] [-o OUT] [-p PATRON]
+#                        [-m MEM] [-o OUT] [-p PATRON] [-d]
 #
 #   -a ARCH      arquitectura (por defecto x86_64; es la unica con ISO de UEFI)
 #   -v VARIANT   variante (por defecto minimal)
@@ -27,6 +40,7 @@
 #   -m MEM       RAM del invitado (por defecto 4G; ver abajo)
 #   -o OUT       donde va el log de la consola (por defecto build/iso-smoke.log)
 #   -p PATRON    lo que hay que ver en la consola
+#   -d           anade el disco con la ESP ajena (ver arriba)
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -37,10 +51,11 @@ ISO=""
 TIMEOUT=420
 MEM=4G
 OUT=""
+DECOY=no
 # La primera linea de `tools/eclipse-init/src/main.rs` (`log("starting")`).
 PATRON='[eclipse-init]'
 
-while getopts "a:v:i:t:m:o:p:" opt; do
+while getopts "a:v:i:t:m:o:p:d" opt; do
     case "$opt" in
         a) ARCH=$OPTARG ;;
         v) VARIANT=$OPTARG ;;
@@ -49,7 +64,8 @@ while getopts "a:v:i:t:m:o:p:" opt; do
         m) MEM=$OPTARG ;;
         o) OUT=$OPTARG ;;
         p) PATRON=$OPTARG ;;
-        *) echo "uso: $0 [-a ARCH] [-v VARIANT] [-i ISO] [-t TIMEOUT] [-m MEM] [-o OUT] [-p PATRON]" >&2; exit 2 ;;
+        d) DECOY=yes ;;
+        *) echo "uso: $0 [-a ARCH] [-v VARIANT] [-i ISO] [-t TIMEOUT] [-m MEM] [-o OUT] [-p PATRON] [-d]" >&2; exit 2 ;;
     esac
 done
 
@@ -79,6 +95,32 @@ command -v qemu-system-x86_64 >/dev/null || {
 echo "=== humo de la ISO: $(basename -- "$ISO") ($VARIANT, $ARCH), hasta $TIMEOUT s ==="
 echo "=== esperando en la consola: $PATRON ==="
 
+# El disco de la ESP ajena. Va en virtio y la ISO sigue en el CD-ROM, que es
+# lo que el firmware arranca: el disco esta ahi para que el sistema tenga DOS
+# volumenes FAT, no para arrancar de el.
+DECOY_ARGS=""
+if [ "$DECOY" = yes ]; then
+    for t in mkfs.vfat mmd mcopy; do
+        command -v "$t" >/dev/null || {
+            echo "$0: -d necesita $t (paquetes: dosfstools, mtools)" >&2
+            exit 1
+        }
+    done
+    DECOY_IMG="$(dirname -- "$OUT")/iso-smoke-esp-ajena.img"
+    DECOY_DIR="$(dirname -- "$OUT")/iso-smoke-esp-ajena"
+    rm -rf "$DECOY_DIR" "$DECOY_IMG"
+    mkdir -p "$DECOY_DIR/EFI/Boot"
+    # El contenido da igual mientras se llame como el cargador de reserva: lo
+    # que importa es que ese `\EFI\Boot` exista y NO tenga un rboot.conf.
+    echo "no soy rboot" > "$DECOY_DIR/EFI/Boot/BootX64.efi"
+    dd if=/dev/zero of="$DECOY_IMG" bs=1M count=64 status=none
+    mkfs.vfat -F 32 "$DECOY_IMG" >/dev/null
+    mmd -i "$DECOY_IMG" ::/EFI ::/EFI/Boot
+    mcopy -i "$DECOY_IMG" -s "$DECOY_DIR/EFI/Boot" ::/EFI/
+    DECOY_ARGS="-drive format=raw,file=$DECOY_IMG,if=virtio"
+    echo "=== con una ESP ajena en un segundo disco: $DECOY_IMG ==="
+fi
+
 # Sin `-enable-kvm` a proposito: en un runner de CI no hay /dev/kvm, y con la
 # escotilla puesta QEMU sale con 1 sin explicar casi nada. Arranca igual, mas
 # despacio, y de ahi el timeout generoso.
@@ -94,6 +136,8 @@ qemu-system-x86_64 \
     -serial mon:stdio \
     -drive format=raw,if=pflash,readonly=on,file="$OVMF" \
     -drive file="$ISO",media=cdrom \
+    $DECOY_ARGS \
+    -boot order=d \
     -nic none \
     -display none \
     -no-reboot \
