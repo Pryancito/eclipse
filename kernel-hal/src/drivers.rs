@@ -387,6 +387,14 @@ pub fn set_gem_comptags_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_gem_comptags_enabled(_v: bool) {}
 
+/// Lets the AMD 10GbE (`xgbe`) probe run its bring-up sequence instead of
+/// leaving the device unclaimed (`xgbe.enable`). Default off: not one
+/// register write of that sequence has ever reached the part, because QEMU
+/// does not emulate an XGMAC. See `drivers/src/net/xgbe/bringup.rs`.
+pub fn set_xgbe_enabled(v: bool) {
+    zcore_drivers::net::xgbe::set_enabled(v);
+}
+
 /// Lets `GEM_PUSHBUF` actually submit, instead of parsing the request and
 /// returning EOPNOTSUPP (`nvidia.gem_pushbuf`). Default off: see
 /// `drivers/src/display/nvidia/pushbuf.rs`.
