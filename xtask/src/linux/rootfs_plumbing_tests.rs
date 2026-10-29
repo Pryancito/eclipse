@@ -2275,7 +2275,14 @@ fn both_make_paths_install_the_lunar_clients() {
         .split("\n    }\n")
         .next()
         .unwrap();
-    for b in ["lunarbg", "lunarbar", "lunarrun", "lunarfile", "lunarclip", "lunarhunter"] {
+    for b in [
+        "lunarbg",
+        "lunarbar",
+        "lunarrun",
+        "lunarfile",
+        "lunarclip",
+        "lunarhunter",
+    ] {
         assert!(install.contains(&format!("bin.join(\"{b}\")")), "{b}");
     }
 }
