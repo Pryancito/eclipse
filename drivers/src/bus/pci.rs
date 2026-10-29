@@ -31,6 +31,8 @@ const PCI_COMMAND_INTX_DISABLE: u16 = 0x0400;
 const PCI_CAP_ID_MSI: u8 = 0x05;
 const PCI_MAX_CAP_TRAVERSAL: usize = 64;
 
+pub mod msix;
+
 pub struct PortOpsImpl;
 
 /// Read a BAR's physical base address directly from PCI config space.
