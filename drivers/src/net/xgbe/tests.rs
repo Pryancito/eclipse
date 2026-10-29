@@ -3518,14 +3518,36 @@ fn a_bucket_is_a_word_and_a_bit_within_it() {
 #[test]
 fn adding_an_address_sets_exactly_one_bit() {
     let mut table = [0u32; 8];
-    hash_table_add(&mut table, 0x1234_5678, 256);
+    let addr = [0x01u8, 0x00, 0x5e, 0x00, 0x00, 0x01];
+    hash_table_add(&mut table, &addr, 256);
     assert_eq!(table.iter().map(|w| w.count_ones()).sum::<u32>(), 1);
     // The same address again changes nothing.
-    hash_table_add(&mut table, 0x1234_5678, 256);
+    hash_table_add(&mut table, &addr, 256);
     assert_eq!(table.iter().map(|w| w.count_ones()).sum::<u32>(), 1);
-    // A different one adds a second, unless it collides.
-    hash_table_add(&mut table, 0x8765_4321, 256);
-    assert!(table.iter().map(|w| w.count_ones()).sum::<u32>() >= 1);
+}
+
+#[test]
+fn the_shift_formula_and_the_shared_one_pick_the_same_bucket() {
+    // `26 - (size >> 7)` here and `32 - log2(size)` there are the same
+    // arithmetic written two ways, and the whole hash filter rests on it.
+    use crate::net::ether_hash::{ether_crc32, hash_bucket_of};
+    for addr in [
+        [0x01u8, 0x00, 0x5e, 0x12, 0x34, 0x56],
+        [0x33, 0x33, 0xff, 0x00, 0x00, 0x02],
+    ] {
+        for size in [64u32, 128, 256] {
+            // The crate's value has the complement already applied, so what
+            // goes into the Linux-shaped function is its complement back.
+            let crc_le = !ether_crc32(&addr);
+            assert_eq!(
+                hash_index(crc_le, size),
+                hash_bucket_of(&addr, size),
+                "address {:02x?}, {} buckets",
+                addr,
+                size
+            );
+        }
+    }
 }
 
 #[test]

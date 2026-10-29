@@ -2848,6 +2848,12 @@ pub const fn hash_table_words(hash_table_size: u32) -> u32 {
 /// Skip the reversal and the index is still a number in range, still
 /// deterministic, and still points at the wrong bucket, so the symptom is an
 /// interface that drops exactly the multicast groups it was asked to join.
+///
+/// A CRC-32 crate hands back a value with step 1 ALREADY DONE, so code that
+/// reaches for one and keeps Linux's `~` complements twice and lands
+/// somewhere else entirely. [`crate::net::ether_hash::hash_bucket_of`] takes
+/// an address and does the right thing; this takes Linux's intermediate
+/// value and exists so the two can be checked against each other.
 #[inline]
 pub const fn hash_index(crc_le: u32, hash_table_size: u32) -> u32 {
     (!crc_le).reverse_bits() >> hash_table_shift(hash_table_size)
@@ -2860,12 +2866,15 @@ pub const fn hash_bucket(index: u32) -> (u32, u32) {
 }
 
 /// Set an address's bit in a hash table being built.
+///
+/// The work is [`crate::net::ether_hash`]'s, because the GENET and the macb
+/// compute the same bucket from the same CRC and there is no version of this
+/// that is the XGMAC's own. What stays here is [`hash_index`], which says
+/// the same thing in the terms Linux's `xgbe-dev.c` uses, and a test that
+/// the two agree.
 #[inline]
-pub fn hash_table_add(table: &mut [u32], crc_le: u32, hash_table_size: u32) {
-    let (word, bit) = hash_bucket(hash_index(crc_le, hash_table_size));
-    if let Some(slot) = table.get_mut(word as usize) {
-        *slot |= 1 << bit;
-    }
+pub fn hash_table_add(table: &mut [u32], addr: &[u8], hash_table_size: u32) {
+    crate::net::ether_hash::hash_table_set(table, addr, hash_table_size);
 }
 
 /// Write a built hash table out. `xgbe_set_mac_hash_table`'s last loop.
