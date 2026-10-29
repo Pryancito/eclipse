@@ -513,7 +513,7 @@ impl MacbRings {
     // -----------------------------------------------------------------------
 
     /// Huecos de transmision que el MAC todavia no ha devuelto.
-    fn tx_in_flight(&self) -> usize {
+    pub fn tx_in_flight(&self) -> usize {
         self.tx_head.wrapping_sub(self.tx_tail) & (TX_RING_SIZE - 1)
     }
 
@@ -609,6 +609,9 @@ impl MacbRings {
         n
     }
 }
+
+#[cfg(test)]
+pub(super) mod test_mac;
 
 #[cfg(test)]
 mod rings_tests;
