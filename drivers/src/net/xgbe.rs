@@ -3051,6 +3051,168 @@ pub fn config_rx_coalesce(acc: &dyn MmioAccess, rx_channels: u32, riwt: u32) {
 #[inline]
 pub fn config_tx_coalesce(_acc: &dyn MmioAccess) {}
 
+// ——— How long a frame may be, and how big a buffer it lands in ———
+
+/// `ETH_HLEN`: the Ethernet header Linux counts into a receive buffer.
+pub const ETH_HLEN: u32 = 14;
+/// `ETH_FCS_LEN`: the trailing CRC, which the chip delivers.
+pub const ETH_FCS_LEN: u32 = 4;
+/// `VLAN_HLEN`: room for the one VLAN tag Linux always leaves space for,
+/// whether or not the interface is on a VLAN.
+pub const VLAN_HLEN: u32 = 4;
+/// `ETH_FRAME_LEN`: header plus a standard payload, **without** the FCS.
+pub const ETH_FRAME_LEN: u32 = 1514;
+
+/// `XGBE_RX_MIN_BUF_SIZE`, `xgbe.h`: `ETH_FRAME_LEN + ETH_FCS_LEN + VLAN_HLEN`.
+pub const RX_MIN_BUF_SIZE: u32 = ETH_FRAME_LEN + ETH_FCS_LEN + VLAN_HLEN;
+/// `XGBE_RX_BUF_ALIGN`, `xgbe.h`.
+pub const RX_BUF_ALIGN: u32 = 64;
+/// Linux clamps the receive buffer at `PAGE_SIZE`, because it allocates one
+/// page per buffer. 4 KiB here, which is the page size on every architecture
+/// this kernel builds for.
+///
+/// This clamp is the whole reason a jumbo frame arrives **split**: a 9000-byte
+/// MTU does not get a 9022-byte buffer, it gets 4096, and the frame comes back
+/// over three descriptors with `FD` on the first and `LD` on the last. See
+/// [`read_rx_desc`].
+pub const RX_MAX_BUF_SIZE: u32 = 4096;
+
+/// `XGMAC_STD_PACKET_MTU`.
+pub const STD_PACKET_MTU: u32 = 1500;
+/// `XGMAC_JUMBO_PACKET_MTU`: above this the giant-packet path is used.
+pub const JUMBO_PACKET_MTU: u32 = 9000;
+/// `XGMAC_MAX_JUMBO_PACKET`: 9000 plus header, FCS and a VLAN tag.
+pub const MAX_JUMBO_PACKET: u32 = 9018;
+/// `XGMAC_GIANT_PACKET_MTU`, `xgbe.h` at master: the length the giant path
+/// programs into `GPSL`. Not 16384: `GPSL` is 14 bits, so 16383 is the
+/// ceiling, and Linux stops 15 short of it.
+pub const GIANT_PACKET_MTU: u32 = 16368;
+
+/// `MAC_RCR_GPSLCE`, index 6, width 1: check the received length against
+/// `GPSL` instead of against the fixed 1518/9018 limit.
+pub const MAC_RCR_GPSLCE: (u32, u32) = (6, 1);
+/// `MAC_RCR_WD`, index 7, width 1: **watchdog disable** on receive.
+///
+/// The name reads backwards. The receive watchdog is the timer that cuts a
+/// frame off at about 2 KiB; a 1 here turns that policeman off, which is what
+/// *allows* a giant frame, not what forbids one.
+pub const MAC_RCR_WD: (u32, u32) = (7, 1);
+/// `MAC_RCR_JE`, index 8, width 1: jumbo enable, i.e. raise the fixed length
+/// limit from 1518 to 9018.
+pub const MAC_RCR_JE: (u32, u32) = (8, 1);
+/// `MAC_RCR_GPSL`, index 16, width 14: the giant packet size limit.
+pub const MAC_RCR_GPSL: (u32, u32) = (16, 14);
+/// `MAC_TCR_JD`, index 16, width 1: **jabber disable** on transmit. The
+/// transmit-side twin of [`MAC_RCR_WD`], and it reads backwards for the same
+/// reason.
+pub const MAC_TCR_JD: (u32, u32) = (16, 1);
+
+/// How big a receive buffer an MTU needs. `xgbe_calc_rx_buf_size`.
+///
+/// Three steps, in Linux's order, and each one changes the answer:
+///
+/// 1. the frame is the MTU plus header, FCS and a VLAN tag — 22 bytes, not 18,
+///    because the tag is counted whether or not it is used;
+/// 2. the result is clamped into `[RX_MIN_BUF_SIZE, RX_MAX_BUF_SIZE]`, so a
+///    tiny MTU still gets 1522 and a jumbo MTU is cut to a page;
+/// 3. and only then is it rounded **up** to [`RX_BUF_ALIGN`].
+///
+/// Rounding before clamping would be wrong at the top: 4096 is already
+/// 64-aligned, so in this order the round-up can never push the result back
+/// over the clamp. Doing it the other way round for a hypothetical unaligned
+/// ceiling would.
+#[inline]
+pub const fn calc_rx_buf_size(mtu: u32) -> u32 {
+    let wanted = mtu.saturating_add(ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN);
+    let clamped = if wanted < RX_MIN_BUF_SIZE {
+        RX_MIN_BUF_SIZE
+    } else if wanted > RX_MAX_BUF_SIZE {
+        RX_MAX_BUF_SIZE
+    } else {
+        wanted
+    };
+    (clamped + RX_BUF_ALIGN - 1) & !(RX_BUF_ALIGN - 1)
+}
+
+/// How many descriptors one frame of `mtu` can take up, given the buffer size
+/// [`calc_rx_buf_size`] picked.
+///
+/// Not a Linux function: Linux discovers this by walking `FD`..`LD` as the
+/// frames come back. It is here so the number is written down once, because
+/// it is what decides whether a receive ring of `N` descriptors can hold
+/// anything at all at a jumbo MTU.
+#[inline]
+pub const fn rx_buffers_for_mtu(mtu: u32) -> u32 {
+    let buf = calc_rx_buf_size(mtu);
+    let frame = mtu.saturating_add(ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN);
+    frame.div_ceil(buf)
+}
+
+/// Write the receive buffer size into every receive channel.
+/// `xgbe_config_rx_buffer_size`.
+///
+/// [`program_rx_ring`] already sets `RBSZ` when it hands a ring over, and
+/// Linux does the same thing twice for the same reason: `xgbe_change_mtu`
+/// recomputes the buffer size and restarts the device, and the restart path
+/// goes through this function rather than through ring programming.
+pub fn config_rx_buffer_size(
+    acc: &dyn MmioAccess,
+    rx_channels: u32,
+    buffer_size: u32,
+) -> DeviceResult<()> {
+    if buffer_size == 0 || buffer_size >= (1 << DMA_CH_RCR_RBSZ.1) {
+        return Err(DeviceError::InvalidParam);
+    }
+    for channel in 0..rx_channels {
+        write_field(
+            acc,
+            dma_channel_reg(channel, DMA_CH_RCR),
+            DMA_CH_RCR_RBSZ.0,
+            DMA_CH_RCR_RBSZ.1,
+            buffer_size,
+        );
+    }
+    Ok(())
+}
+
+/// Set the length limits for an MTU. `xgbe_config_jumbo_enable`.
+///
+/// Three regimes, and the middle one is the surprise:
+///
+/// * **MTU above 9000**: the two length policemen are switched off
+///   (`WD` and `JD` to 1), `GPSL` is loaded with [`GIANT_PACKET_MTU`] and
+///   `GPSLCE` turns the comparison against it on. `JE` is **not written at
+///   all** on this path — the fixed 9018 limit is irrelevant once `GPSLCE`
+///   is checking against `GPSL` instead.
+/// * **MTU between 1501 and 9000**: `GPSLCE`, `WD` and `JD` go back to 0 and
+///   `JE` goes to 1, raising the fixed limit to 9018.
+/// * **MTU of 1500 or less**: the same four writes with `JE` at 0 as well.
+///
+/// So the normal path always writes all four fields, and the giant path
+/// writes four different ones. Reading it as "set JE for jumbo" and stopping
+/// there gets frames above 9018 dropped by a watchdog that was never turned
+/// off, with no counter to say so.
+pub fn config_jumbo_enable(acc: &dyn MmioAccess, mtu: u32) {
+    if mtu > JUMBO_PACKET_MTU {
+        write_field(
+            acc,
+            MAC_RCR,
+            MAC_RCR_GPSL.0,
+            MAC_RCR_GPSL.1,
+            GIANT_PACKET_MTU,
+        );
+        write_field(acc, MAC_RCR, MAC_RCR_WD.0, MAC_RCR_WD.1, 1);
+        write_field(acc, MAC_TCR, MAC_TCR_JD.0, MAC_TCR_JD.1, 1);
+        write_field(acc, MAC_RCR, MAC_RCR_GPSLCE.0, MAC_RCR_GPSLCE.1, 1);
+    } else {
+        let jumbo = if mtu > STD_PACKET_MTU { 1 } else { 0 };
+        write_field(acc, MAC_RCR, MAC_RCR_GPSLCE.0, MAC_RCR_GPSLCE.1, 0);
+        write_field(acc, MAC_RCR, MAC_RCR_WD.0, MAC_RCR_WD.1, 0);
+        write_field(acc, MAC_TCR, MAC_TCR_JD.0, MAC_TCR_JD.1, 0);
+        write_field(acc, MAC_RCR, MAC_RCR_JE.0, MAC_RCR_JE.1, jumbo);
+    }
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
@@ -3228,4 +3390,8 @@ impl PciDriver for XgbeDriverPci {
 }
 
 #[cfg(test)]
+mod fake;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_datapath;
