@@ -1738,9 +1738,14 @@ impl PciDriver for XgbeDriverPci {
 mod datapath;
 pub use datapath::*;
 
+mod rings;
+pub use rings::*;
+
 #[cfg(test)]
 mod fake;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_datapath;
+#[cfg(test)]
+mod tests_rings;
