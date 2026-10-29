@@ -2101,3 +2101,146 @@ fn turning_the_checksum_off_leaves_the_receiver_running() {
         ref other => panic!("{:?}", other),
     }
 }
+
+// ——— Tanda 23: decirle al MAC a que velocidad va la linea ———
+
+#[test]
+fn the_speed_field_sits_at_the_very_top_of_the_transmit_control() {
+    assert_eq!(MAC_TCR_SS, (29, 3));
+    // Three bits ending at 31, so nothing can be above it.
+    assert_eq!(MAC_TCR_SS.0 + MAC_TCR_SS.1, 32);
+    // And it does not touch the transmitter enable at the bottom.
+    assert_ne!(MAC_TCR_SS.0, MAC_TCR_TE.0);
+    assert_ne!(MAC_TCR_SS.0, MAC_TCR_JD.0);
+}
+
+#[test]
+fn the_encoding_is_in_no_order_at_all() {
+    // Fastest is 0 and slowest is 7, with the rest shuffled in between.
+    assert_eq!(MAC_SS_10G, 0x00);
+    assert_eq!(MAC_SS_2_5G_GMII, 0x02);
+    assert_eq!(MAC_SS_1G, 0x03);
+    assert_eq!(MAC_SS_2_5G_XGMII, 0x06);
+    assert_eq!(MAC_SS_10M, 0x07);
+    // So comparing two encodings tells you nothing about which is faster.
+    assert!(MAC_SS_10M > MAC_SS_10G);
+    assert!(MAC_SS_1G > MAC_SS_2_5G_GMII);
+}
+
+#[test]
+fn a_zeroed_register_already_claims_ten_gigabits() {
+    // Which is why nothing in the bring-up has to write the speed to get
+    // 10G, and why a missing speed call looks like it worked.
+    assert_eq!(MAC_SS_10G, 0);
+    let fake = FakeXgmac::new();
+    assert!(!set_mac_speed(&fake, LinkSpeed::Speed10G, 0x30));
+    // It read, and then wrote nothing.
+    assert_eq!(fake.reads_of(MAC_TCR), 1);
+    assert_eq!(fake.writes_to(MAC_TCR), 0);
+}
+
+#[test]
+fn one_hundred_megabits_and_two_and_a_half_gigabits_are_the_same_value() {
+    // The field picks an interface mode and a divider, not a speed, so
+    // the collision is real and this register cannot tell them apart.
+    assert_eq!(MAC_SS_100M, MAC_SS_2_5G_GMII);
+    // Linux has no SPEED_100 case, so the value is never written; the
+    // speeds this driver can ask for never produce it by that name.
+    for ver in [0x20u8, 0x21, 0x30, MAC_VER_33] {
+        for speed in [
+            LinkSpeed::Speed10M,
+            LinkSpeed::Speed1G,
+            LinkSpeed::Speed2_5G,
+            LinkSpeed::Speed10G,
+        ] {
+            let ss = speed_select(speed, ver);
+            if ss == MAC_SS_100M {
+                // The only way to land on it is 2.5G on an older core.
+                assert_eq!(speed, LinkSpeed::Speed2_5G);
+                assert_ne!(ver, MAC_VER_33);
+            }
+        }
+    }
+}
+
+#[test]
+fn only_two_and_a_half_gigabits_looks_at_the_core_revision() {
+    for speed in [LinkSpeed::Speed10M, LinkSpeed::Speed1G, LinkSpeed::Speed10G] {
+        assert_eq!(
+            speed_select(speed, 0x30),
+            speed_select(speed, MAC_VER_33),
+            "{:?}",
+            speed
+        );
+    }
+    assert_eq!(
+        speed_select(LinkSpeed::Speed2_5G, MAC_VER_33),
+        MAC_SS_2_5G_XGMII
+    );
+    assert_eq!(speed_select(LinkSpeed::Speed2_5G, 0x30), MAC_SS_2_5G_GMII);
+    // 0x33 exactly, not "0x33 or newer": Linux compares for equality.
+    assert_eq!(speed_select(LinkSpeed::Speed2_5G, 0x34), MAC_SS_2_5G_GMII);
+    assert_eq!(speed_select(LinkSpeed::Speed2_5G, 0x32), MAC_SS_2_5G_GMII);
+    assert_eq!(MAC_VER_33, 0x33);
+}
+
+#[test]
+fn every_encoding_fits_the_three_bit_field() {
+    for ss in [
+        MAC_SS_10G,
+        MAC_SS_2_5G_GMII,
+        MAC_SS_2_5G_XGMII,
+        MAC_SS_1G,
+        MAC_SS_100M,
+        MAC_SS_10M,
+    ] {
+        assert!(ss < (1 << MAC_TCR_SS.1), "{:#x}", ss);
+    }
+}
+
+#[test]
+fn a_speed_that_has_not_changed_is_not_written() {
+    // `MAC_TCR` carries `TE`, so a pointless write would pass through
+    // the transmitter enable of a running device for nothing.
+    let fake = FakeXgmac::new();
+    fake.preload(MAC_TCR, (MAC_SS_1G << MAC_TCR_SS.0) | 1);
+    assert!(!set_mac_speed(&fake, LinkSpeed::Speed1G, 0x30));
+    assert_eq!(fake.writes_to(MAC_TCR), 0);
+    // And a speed that has changed is.
+    assert!(set_mac_speed(&fake, LinkSpeed::Speed10G, 0x30));
+    assert_eq!(fake.writes_to(MAC_TCR), 1);
+}
+
+#[test]
+fn changing_the_speed_leaves_the_transmitter_and_the_jabber_bit_alone() {
+    let fake = FakeXgmac::new();
+    // Bit 0 is left clear on purpose: the fake treats bit 0 as
+    // self-clearing on read, which is what the reset sequences need, so
+    // `TE` cannot be used as the witness here. `JD` does the same job.
+    fake.preload(MAC_TCR, (MAC_SS_1G << MAC_TCR_SS.0) | (1 << MAC_TCR_JD.0));
+    assert!(set_mac_speed(&fake, LinkSpeed::Speed10M, 0x30));
+    let written = fake
+        .log()
+        .iter()
+        .rev()
+        .find_map(|a| match a {
+            Access::Write(o, v) if *o == MAC_TCR => Some(*v),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(get_bits(written, MAC_TCR_SS.0, MAC_TCR_SS.1), MAC_SS_10M);
+    assert_eq!(get_bits(written, MAC_TCR_JD.0, MAC_TCR_JD.1), 1);
+}
+
+#[test]
+fn the_same_core_revision_decides_this_and_the_queue_flush() {
+    // `SNPSVER` is read once and branched on in several places; this is
+    // the fourth. Worth pinning that they are different thresholds, so
+    // nobody folds them into one "is it new enough" predicate.
+    assert_eq!(FLUSH_MIN_SNPSVER, 0x21);
+    assert_ne!(MAC_VER_33, FLUSH_MIN_SNPSVER);
+    // A 0x33 core flushes its queues and drives 2.5G over XGMII; a 0x21
+    // core flushes and drives 2.5G over GMII; a 0x20 core does neither.
+    assert!(MAC_VER_33 >= FLUSH_MIN_SNPSVER);
+    assert_eq!(speed_select(LinkSpeed::Speed2_5G, 0x21), MAC_SS_2_5G_GMII);
+}

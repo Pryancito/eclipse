@@ -3305,6 +3305,95 @@ pub fn config_rx_csum(acc: &dyn MmioAccess, on: bool) {
     );
 }
 
+// ——— Telling the MAC how fast the line is ———
+
+/// `MAC_TCR_SS`, index 29, width 3: the speed selection, at the very top of
+/// the transmit control register.
+pub const MAC_TCR_SS: (u32, u32) = (29, 3);
+
+/// `XGBE_MAC_SS_10G`: 10 Gbps, XGMII mode. **Zero**, so a MAC that has just
+/// come out of reset is already claiming 10G.
+pub const MAC_SS_10G: u32 = 0x00;
+/// `XGBE_MAC_SS_2_5G_GMII`: 2.5 Gbps over GMII, the older platforms.
+pub const MAC_SS_2_5G_GMII: u32 = 0x02;
+/// `XGBE_MAC_SS_2_5G_XGMII`: 2.5 Gbps over XGMII, the P100a.
+pub const MAC_SS_2_5G_XGMII: u32 = 0x06;
+/// `XGBE_MAC_SS_1G`: 1 Gbps.
+pub const MAC_SS_1G: u32 = 0x03;
+/// `XGBE_MAC_SS_100M`: 100 Mbps — **the same encoding as
+/// [`MAC_SS_2_5G_GMII`]**, because the field selects an interface mode and a
+/// divider, not a speed. The two are told apart by which PHY mode the port is
+/// in, which this register does not say.
+///
+/// Linux's `xgbe_set_speed` has no `SPEED_100` case at all, so this value is
+/// defined and never written. It is named here for the same reason: so that
+/// the collision is on the record rather than discovered by someone adding
+/// the missing case.
+pub const MAC_SS_100M: u32 = 0x02;
+/// `XGBE_MAC_SS_10M`: 10 Mbps. 0x07, the largest value, at the bottom of the
+/// speed range — the encoding is in no order at all.
+pub const MAC_SS_10M: u32 = 0x07;
+
+/// `XGBE_MAC_VER_33`: the P100a core revision, the one that drives 2.5 Gbps
+/// over XGMII instead of GMII.
+pub const MAC_VER_33: u8 = 0x33;
+
+/// The link speeds this driver can ask the MAC for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkSpeed {
+    /// 10 Mbps.
+    Speed10M,
+    /// 1 Gbps.
+    Speed1G,
+    /// 2.5 Gbps. Which encoding this becomes depends on the core revision.
+    Speed2_5G,
+    /// 10 Gbps.
+    Speed10G,
+}
+
+/// The `SS` encoding for a speed on a core of revision `snps_ver`.
+/// `xgbe_set_speed`.
+///
+/// The version only matters for 2.5 Gbps, and it matters there because the
+/// two 2.5G encodings are different interface modes rather than different
+/// speeds: `0x06` on a P100a core, `0x02` on everything older. Get it wrong
+/// and the MAC drives the wrong interface at the right nominal rate, which is
+/// not something a link-up check would catch.
+#[inline]
+pub const fn speed_select(speed: LinkSpeed, snps_ver: u8) -> u32 {
+    match speed {
+        LinkSpeed::Speed10M => MAC_SS_10M,
+        LinkSpeed::Speed1G => MAC_SS_1G,
+        LinkSpeed::Speed2_5G => {
+            if snps_ver == MAC_VER_33 {
+                MAC_SS_2_5G_XGMII
+            } else {
+                MAC_SS_2_5G_GMII
+            }
+        }
+        LinkSpeed::Speed10G => MAC_SS_10G,
+    }
+}
+
+/// Set the MAC's speed, writing only if it is not already set.
+/// `xgbe_set_speed`.
+///
+/// The read-before-write is Linux's, and it is not an optimisation: `MAC_TCR`
+/// also holds `TE`, so every write to this register passes through the
+/// transmitter enable. Skipping the write when the value already matches is
+/// how a speed that has not changed costs the running transmitter nothing.
+///
+/// Returns whether it wrote.
+pub fn set_mac_speed(acc: &dyn MmioAccess, speed: LinkSpeed, snps_ver: u8) -> bool {
+    let want = speed_select(speed, snps_ver);
+    let current = get_bits(acc.read32(MAC_TCR), MAC_TCR_SS.0, MAC_TCR_SS.1);
+    if current == want {
+        return false;
+    }
+    write_field(acc, MAC_TCR, MAC_TCR_SS.0, MAC_TCR_SS.1, want);
+    true
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
