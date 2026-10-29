@@ -3609,11 +3609,11 @@ impl PciDriver for HdaDriverPci {
             let am = crate::bus::pci::PCI_ACCESS;
             unsafe {
                 let v = am.read8(ops, dev.loc, 0x4e);
-                am.write8(ops, dev.loc, 0x4e, (v & 0xf0) | 0x0f);
+                crate::bus::pci::cfgwrite::cfg_write8(ops, am, dev.loc, 0x4e, (v & 0xf0) | 0x0f);
                 let v = am.read8(ops, dev.loc, 0x4c);
-                am.write8(ops, dev.loc, 0x4c, v | 0x0f);
+                crate::bus::pci::cfgwrite::cfg_write8(ops, am, dev.loc, 0x4c, v | 0x0f);
                 let v = am.read8(ops, dev.loc, 0x4d);
-                am.write8(ops, dev.loc, 0x4d, v | 0x0f);
+                crate::bus::pci::cfgwrite::cfg_write8(ops, am, dev.loc, 0x4d, v | 0x0f);
             }
         }
 

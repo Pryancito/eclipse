@@ -31,6 +31,7 @@ const PCI_COMMAND_INTX_DISABLE: u16 = 0x0400;
 const PCI_CAP_ID_MSI: u8 = 0x05;
 const PCI_MAX_CAP_TRAVERSAL: usize = 64;
 
+pub mod cfgwrite;
 pub mod msix;
 
 pub struct PortOpsImpl;
@@ -93,7 +94,7 @@ pub(crate) unsafe fn probe_bar_size<T: PortOps>(
 ) -> u64 {
     let orig_cmd = am.read16(ops, loc, PCI_COMMAND);
     // Disable Memory and I/O decoding while probing (PCI spec requirement)
-    am.write16(ops, loc, PCI_COMMAND, orig_cmd & !0x03u16);
+    cfgwrite::cfg_write16(ops, am, loc, PCI_COMMAND, orig_cmd & !0x03u16);
 
     let orig_lo = am.read32(ops, loc, bar_reg);
     am.write32(ops, loc, bar_reg, 0xFFFF_FFFF);
@@ -119,7 +120,7 @@ pub(crate) unsafe fn probe_bar_size<T: PortOps>(
         size_from_mask((mask_lo & !0xFu32) as u64)
     };
 
-    am.write16(ops, loc, PCI_COMMAND, orig_cmd);
+    cfgwrite::cfg_write16(ops, am, loc, PCI_COMMAND, orig_cmd);
     size
 }
 
@@ -270,7 +271,7 @@ pub(crate) unsafe fn enable_with<T: PortOps>(
         let orig = am.read16(ops, loc, PCI_COMMAND);
         // Always enable MEM space + Bus Mastering so DMA devices (e.g. AHCI) work
         // regardless of whether MSI is available.
-        am.write16(ops, loc, PCI_COMMAND, orig | 0x7);
+        cfgwrite::cfg_write16(ops, am, loc, PCI_COMMAND, orig | 0x7);
 
         // find MSI cap
         let mut msi_found = false;

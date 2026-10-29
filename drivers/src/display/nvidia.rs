@@ -1073,8 +1073,9 @@ impl NvidiaGpu {
 
     fn cfg_write16(&self, off: u16, val: u16) {
         unsafe {
-            crate::bus::pci::PCI_ACCESS.write16(
+            crate::bus::pci::cfgwrite::cfg_write16(
                 &crate::bus::pci::PortOpsImpl,
+                crate::bus::pci::PCI_ACCESS,
                 self.cfg_loc(),
                 off,
                 val,
@@ -1487,7 +1488,7 @@ impl NvidiaGpu {
         disable: bool,
         restore: &[(u8, u8, u8, u16)],
     ) -> (String, Vec<(u8, u8, u8, u16)>) {
-        use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+        use crate::bus::pci::{cfgwrite::cfg_write16, PortOpsImpl, PCI_ACCESS};
         use core::fmt::Write;
         use pci::Location;
         let ops = &PortOpsImpl;
@@ -1523,7 +1524,7 @@ impl NvidiaGpu {
                         }
                         let bctl = unsafe { PCI_ACCESS.read16(ops, loc, 0x3E) };
                         if bctl & (1 << 3) != 0 {
-                            unsafe { PCI_ACCESS.write16(ops, loc, 0x3E, bctl & !(1 << 3)) };
+                            unsafe { cfg_write16(ops, PCI_ACCESS, loc, 0x3E, bctl & !(1 << 3)) };
                             changed.push((bus, dev, func, bctl));
                             let _ = writeln!(
                                 s,
@@ -1547,7 +1548,7 @@ impl NvidiaGpu {
                     device: dev,
                     function: func,
                 };
-                unsafe { PCI_ACCESS.write16(ops, loc, 0x3E, old) };
+                unsafe { cfg_write16(ops, PCI_ACCESS, loc, 0x3E, old) };
                 let _ = writeln!(
                     s,
                     "[boot-window] bridge {:02x}:{:02x}.{} VGA routing restored",
@@ -1699,7 +1700,7 @@ impl NvidiaGpu {
     /// root port's (lowering is always protocol-safe); MRRS is left alone
     /// (mismatched MRRS is legal -- completers split completions).
     fn normalize_mps(&self, tag: &str) -> String {
-        use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+        use crate::bus::pci::{cfgwrite::cfg_write16, PortOpsImpl, PCI_ACCESS};
         use pci::Location;
         let ops = &PortOpsImpl;
         let gpu_loc = Location {
@@ -1736,7 +1737,7 @@ impl NvidiaGpu {
             );
         }
         let new_devctl = (gpu_devctl & !(0x7 << 5)) | (rp_mps << 5);
-        unsafe { PCI_ACCESS.write16(ops, gpu_loc, gpu_cap + 0x08, new_devctl) };
+        unsafe { cfg_write16(ops, PCI_ACCESS, gpu_loc, gpu_cap + 0x08, new_devctl) };
         let rb = unsafe { PCI_ACCESS.read16(ops, gpu_loc, gpu_cap + 0x08) };
         let line = alloc::format!(
             "[{}] MPS NORMALIZED (Linux pcie_bus_config equivalent): GPU DevCtl {:#06x} -> {:#06x} (readback {:#06x}); MPS {} -> {} to match root-port {}\n",
@@ -1758,7 +1759,7 @@ impl NvidiaGpu {
     /// until the device answers config again; only then is fake-MMIO cleared
     /// and one BAR0 probe attempted. Returns (recovered, log).
     fn sbr_recover(&self, tag: &str, attempt: u32) -> (bool, String) {
-        use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+        use crate::bus::pci::{cfgwrite::cfg_write16, PortOpsImpl, PCI_ACCESS};
         use core::fmt::Write;
         use pci::Location;
         let mut s = String::new();
@@ -1791,9 +1792,9 @@ impl NvidiaGpu {
         };
         unsafe {
             let bc = PCI_ACCESS.read16(ops, bridge, 0x3E);
-            PCI_ACCESS.write16(ops, bridge, 0x3E, bc | 0x40); // Secondary Bus Reset
+            cfg_write16(ops, PCI_ACCESS, bridge, 0x3E, bc | 0x40); // Secondary Bus Reset
             spin_ms(5);
-            PCI_ACCESS.write16(ops, bridge, 0x3E, bc);
+            cfg_write16(ops, PCI_ACCESS, bridge, 0x3E, bc);
         }
         spin_ms(250); // link retrain + device-ready time
                       // Restore the GPU's config: BARs (address bits; RO flag bits are
@@ -1807,7 +1808,7 @@ impl NvidiaGpu {
             PCI_ACCESS.write32(ops, gpu, 0x18, (self.bar1_phys >> 32) as u32);
             PCI_ACCESS.write32(ops, gpu, 0x1C, self.bar2_phys as u32);
             PCI_ACCESS.write32(ops, gpu, 0x20, (self.bar2_phys >> 32) as u32);
-            PCI_ACCESS.write16(ops, gpu, 0x04, 0x0406);
+            cfg_write16(ops, PCI_ACCESS, gpu, 0x04, 0x0406);
         }
         s.push_str(&self.normalize_mps(tag));
         let id = unsafe { PCI_ACCESS.read32(ops, gpu, 0x00) };
@@ -1876,7 +1877,7 @@ impl NvidiaGpu {
                 // function. MSI/MSI-X were never enabled, so INTx is the only
                 // line it can raise.
                 {
-                    use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+                    use crate::bus::pci::{cfgwrite::cfg_write16, PortOpsImpl, PCI_ACCESS};
                     use pci::Location;
                     let loc = Location {
                         bus: self.pci_bus,
@@ -1885,7 +1886,7 @@ impl NvidiaGpu {
                     };
                     let ops = &PortOpsImpl;
                     let cmd = unsafe { PCI_ACCESS.read16(ops, loc, 0x04) };
-                    unsafe { PCI_ACCESS.write16(ops, loc, 0x04, cmd | (1 << 10)) };
+                    unsafe { cfg_write16(ops, PCI_ACCESS, loc, 0x04, cmd | (1 << 10)) };
                     log::warn!(
                         "[NVIDIA] {}: PCI INTx disabled before GSP boot (COMMAND {:#06x} -> {:#06x})",
                         tag,
