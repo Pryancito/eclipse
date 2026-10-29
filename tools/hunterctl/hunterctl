@@ -24,6 +24,10 @@
 #   hunterctl verify                check the files on disk against /etc/hunter/hashes
 #   hunterctl scan [--quarantine] <path>...
 #                                   antivirus scan of files/trees (exit 1 if infected)
+#   hunterctl scan-media [id|dir]...
+#                                   scan removable media (default: every pending one)
+#   hunterctl media-scan <on|off>   queue new USB sticks / disks for a scan
+#   hunterctl media-lock <on|off>   nothing runs from media until it scans clean
 #   hunterctl quarantine <file>...  move files into the quarantine and deny their paths
 #   hunterctl quarantined           list the quarantine
 #   hunterctl restore <sha256>      put a quarantined file back where it was
@@ -67,6 +71,9 @@ SCHEDULE=/etc/hunter/schedule
 SCANS=/var/lib/hunter/scans
 LOGS=30
 HISTORY_MAX=1000
+# One report per scanned device (`hunterctl scan-media`), named by its id:
+# the FOUND / ERROR lines and a summary. lunarhunter shows them.
+MEDIA_REPORTS=/run/hunter/media
 # Paths per write to /proc/hunter_scan: each batch is scanned before the
 # write returns, and 256 paths stay well under the 1 MiB a write may carry.
 BATCH=256
@@ -342,7 +349,7 @@ mode)
     [ $# -eq 2 ] || usage 1
     send "mode $1 $2"
     ;;
-learning|anomaly-detection|privileged-deny|require-hash|trust|deny|untrusted)
+learning|anomaly-detection|privileged-deny|require-hash|trust|deny|untrusted|media-scan|media-lock)
     [ $# -eq 1 ] || usage 1
     send "$cmd $1"
     ;;
@@ -398,6 +405,7 @@ lockdown)
     send "mode exec enforce
 mode integrity enforce
 mode av enforce
+media-lock on
 learning off
 seal"
     ;;
@@ -435,6 +443,85 @@ scan)
         done
     fi
     [ "$infected" -eq 0 ]
+    ;;
+scan-media)
+    # The kernel notes every filesystem mounted from a device after boot as a
+    # `media-device:` line in /proc/hunter; this walks one and reports the
+    # verdict back with `media <id> ...`. lunarbar runs it on its own for each
+    # new `state=pending` device; by hand it is for a console without the
+    # desktop, or to scan a stick again.
+    [ "$(id -u)" = 0 ] || die "must be root"
+    [ -w "$SCAN" ] || die "$SCAN not found: this kernel's hunter has no antivirus"
+    devs=$(grep '^media-device: ' "$PROC")
+    # `target=` is the last field and may hold spaces: the rest of the line.
+    target_of() {
+        printf '%s\n' "$devs" | awk -v id="$1" '$2 == "id=" id { print substr($0, index($0, " target=") + 8); exit }'
+    }
+    if [ $# -eq 0 ]; then
+        ids=$(printf '%s\n' "$devs" | awk '$3 == "state=pending" { print substr($2, 4) }')
+        [ -n "$ids" ] || { echo "hunterctl: no media waiting for a scan"; exit 0; }
+    else
+        ids=""
+        for a in "$@"; do
+            case "$a" in
+            ''|*[!0-9]*)
+                real=$(readlink -f -- "$a") || die "cannot resolve $a"
+                id=$(printf '%s\n' "$devs" | awk -v t="$real" 'substr($0, index($0, " target=") + 8) == t { print substr($2, 4); exit }')
+                [ -n "$id" ] || die "$a is not a mounted removable device (see '$0 status')"
+                ;;
+            *) id=$a ;;
+            esac
+            ids="$ids $id"
+        done
+    fi
+    mkdir -p "$MEDIA_REPORTS" || die "cannot create $MEDIA_REPORTS"
+    list=$(mktemp) && out=$(mktemp) && batch=$(mktemp) && deny=$(mktemp) || die "mktemp failed"
+    trap 'rm -f "$list" "$out" "$batch" "$deny"' EXIT
+    dirty=0
+    for id in $ids; do
+        target=$(target_of "$id")
+        [ -n "$target" ] || die "no media #$id"
+        send "media $id scanning"
+        : > "$out"
+        # -xdev: a disk mounted inside the stick is its own device, with its
+        # own line and its own scan.
+        find "$target" -xdev -type f > "$list" 2>/dev/null
+        total=$(wc -l < "$list")
+        ok=1
+        i=1
+        while [ "$i" -le "$total" ]; do
+            sed -n "${i},$((i + BATCH - 1))p" "$list" > "$batch"
+            dd if="$batch" of="$SCAN" bs=1048576 count=1 2>/dev/null || { ok=0; break; }
+            cat "$SCAN" >> "$out"
+            i=$((i + BATCH))
+        done
+        if [ "$ok" = 0 ]; then
+            send "media $id failed"
+            echo "hunterctl: media #$id ($target): scan failed" | tee "$MEDIA_REPORTS/$id"
+            dirty=1
+            continue
+        fi
+        infected=$(grep -c ' FOUND$' "$out")
+        { grep -E ' FOUND$|: ERROR ' "$out"
+          echo "hunterctl: media #$id ($target): scanned $total file(s), $infected infected"
+        } | tee "$MEDIA_REPORTS/$id"
+        if [ "$infected" -gt 0 ]; then
+            # Not moved into the quarantine: the files are on somebody's
+            # stick, and pulling it out halfway through would lose them. Denied
+            # instead, so none of them runs (until reboot) even with the
+            # antivirus only reporting; `hunterctl quarantine` is a step away.
+            # One line at a time: a path with a space in it is not a `deny`
+            # hunter takes, and it must not take the rest of them down with it.
+            sed -n 's/: [^ ]* FOUND$//p' "$out" | while IFS= read -r f; do
+                printf 'deny %s\n' "$f" > "$deny"
+                dd if="$deny" of="$PROC" bs=1048576 count=1 2>/dev/null ||
+                    echo "hunterctl: could not deny $f" >&2
+            done
+            dirty=1
+        fi
+        send "media $id done $total $infected"
+    done
+    [ "$dirty" -eq 0 ]
     ;;
 quarantine)
     [ $# -ge 1 ] || usage 1

@@ -8,6 +8,7 @@
 
 use super::*;
 use lunarbar::hunter::{self, Mode, Shield, Status};
+use lunarbar::hunter_media as media;
 
 /// Re-read `/proc/hunter` every this many 1 Hz ticks. The report carries the
 /// whole event ring, which the kernel formats on every read, so not every
@@ -34,6 +35,8 @@ const ROWS: i32 = hunter::DOMAINS.len() as i32 + 1;
 /// Wide enough for the longest mode name ("enforce", "bloqueo": 7 glyphs).
 const SEG_W: i32 = 74;
 const EVENT_H: i32 = 18;
+/// The removable-media line, under the switches.
+const MEDIA_H: i32 = 22;
 const MSG_H: i32 = 20;
 const BTN_H: i32 = 28;
 
@@ -42,7 +45,15 @@ const BTN_H: i32 = 28;
 pub(super) fn size() -> (i32, i32) {
     (
         PW,
-        HEAD_H + COUNT_H + ROWS * ROW_H + 8 + hunter::RECENT as i32 * EVENT_H + MSG_H + BTN_H + PAD,
+        HEAD_H
+            + COUNT_H
+            + ROWS * ROW_H
+            + MEDIA_H
+            + 8
+            + hunter::RECENT as i32 * EVENT_H
+            + MSG_H
+            + BTN_H
+            + PAD,
     )
 }
 
@@ -215,7 +226,22 @@ pub(super) fn draw(
         |i| Action::HunterLearning(i == 1),
         &mut hits,
     );
-    y += ROW_H + 8;
+    y += ROW_H;
+
+    // USB sticks and disks: the one being scanned, an infected one, or the
+    // newest, with the verdict. A kernel without the media table has no line.
+    if st.media_known {
+        let lang = i18n::Lang::current();
+        let col = match media::headline(st) {
+            Some(d) if media::is_bad(d) => pal().warn,
+            Some(d) if d.state == hunter::MediaState::Clean => pal().muted,
+            Some(_) => pal().accent,
+            None => pal().dim,
+        };
+        let line = media::summary(lang, st);
+        cv.text(&fit(&line, pw - 2 * PAD), px + PAD, y + (MEDIA_H - GLYPH_H) / 2, col);
+    }
+    y += MEDIA_H + 8;
 
     // The newest warnings and criticals.
     cv.hline(px + 10, y - 5, pw - 20, pal().rule, 0.5);
@@ -283,6 +309,16 @@ pub(super) fn preview() -> Menu {
         detections: 1,
         pinned: 7,
         learning: false,
+        media_known: true,
+        media_scan: true,
+        media_lock: false,
+        media: vec![hunter::Media {
+            id: 3,
+            state: hunter::MediaState::Scanning,
+            source: "/dev/sdb1".into(),
+            target: "/media/usb".into(),
+            ..Default::default()
+        }],
         recent: vec![
             hunter::Event {
                 seq: 9,
@@ -308,6 +344,7 @@ impl State {
     /// which hides the shield.
     pub(super) fn refresh_hunter(&mut self) {
         self.hunter = hunter::read();
+        self.hunter_media.tick(self.hunter.as_ref());
         self.metrics.hunter = self.hunter.as_ref().map(|s| s.shield(self.hunter_seen));
         self.toast_kernel();
     }

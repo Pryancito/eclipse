@@ -216,7 +216,9 @@ pub fn mount_fs(
     if flags & MS_MOVE != 0 {
         let source = source.ok_or(LxError::EINVAL)?;
         let root = vfs_root().ok_or(LxError::EINVAL)?;
-        return move_from(&root, &MOUNT_TABLE, source, &target_norm);
+        move_from(&root, &MOUNT_TABLE, source, &target_norm)?;
+        hunter::media::note_move(&normalize_target(source), &target_norm);
+        return Ok(());
     }
 
     if flags & MS_BIND != 0 {
@@ -250,6 +252,11 @@ pub fn mount_fs(
     mount_node.mount(fs).map_err(LxError::from)?;
     let opts = build_options_string(flags, data);
     super::register_mount(source, &target_norm, fstype, &opts, Some(state));
+    // A filesystem on a device, mounted after boot: a USB stick, a card, an
+    // external disk, a loop image. hunter queues it for an antivirus scan
+    // (and, under `media-lock on`, keeps its programs from running until the
+    // scan is clean). The boot mounts from fstab do not come through here.
+    hunter::media::note_mount(source, &target_norm, fstype);
     Ok(())
 }
 
@@ -354,7 +361,9 @@ pub fn umount_fs(target: &str, flags: usize) -> LxResult<()> {
     // because the caller believes the mount was detached and it was not.
     mount_state::check_umount_flags(flags)?;
     let root = vfs_root().ok_or(LxError::EINVAL)?;
-    umount_from(&root, &MOUNT_TABLE, target, flags)
+    umount_from(&root, &MOUNT_TABLE, target, flags)?;
+    hunter::media::note_umount(&normalize_target(target));
+    Ok(())
 }
 
 /// `umount2` of `target` with `flags`, on the tree under `root` and the table

@@ -714,6 +714,8 @@ struct State {
     hunter_seen: u64,
     /// hunter's notification cards, above the bar's corner.
     toasts: hunter_toast::Toasts,
+    /// Starts the scan of each USB stick or disk hunter says is pending.
+    hunter_media: lunarbar::hunter_media::Agent,
 }
 
 impl State {
