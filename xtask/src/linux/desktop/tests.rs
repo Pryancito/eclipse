@@ -266,6 +266,28 @@ fn gtk_finds_its_pixbuf_loaders_from_every_launch_path() {
 }
 
 #[test]
+fn hunters_window_has_a_menu_entry_through_its_wrapper() {
+    // Through `eclipse-security`, which falls back to a terminal when the
+    // binary is missing, like every other entry.
+    let dir = std::env::temp_dir().join(format!("eclipse-hunterent-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    write_hunter_desktop_entry(&dir);
+    let e = fs::read_to_string(dir.join("root/.local/share/applications/lunarhunter.desktop"))
+        .unwrap();
+    assert!(e.starts_with("[Desktop Entry]\n"), "{e}");
+    assert!(e.contains("\nType=Application\n") && !e.contains("NoDisplay"), "{e}");
+    assert!(e.contains("\nExec=/usr/local/bin/eclipse-security\n"), "{e}");
+    assert!(e.contains("\nTryExec=/usr/local/bin/eclipse-security\n"), "{e}");
+    let w = fs::read_to_string(dir.join("usr/local/bin/eclipse-security")).unwrap();
+    assert!(w.contains("exec lunarhunter \"$@\""), "{w}");
+    assert!(w.contains("hunterctl events"), "the fallback: {w}");
+    let mod_rs = include_str!("../mod.rs");
+    assert!(mod_rs.contains("bin.join(\"lunarhunter\")"), "installed under /bin");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_file_browser_has_a_menu_entry_that_points_at_the_wrapper() {
     // Through the wrapper, never at `lunarfile` itself: the wrapper is what
     // falls back when the binary is missing, so an entry naming the binary

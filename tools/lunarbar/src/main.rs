@@ -514,6 +514,8 @@ enum Action {
     HunterLog,
     /// Armed by the first click, sent by the second.
     HunterLockdown,
+    /// The menu header's "open": the whole `lunarhunter` window.
+    HunterOpen,
 }
 
 /// A menu: an ARGB xdg_popup parented to the bar's layer surface, holding the
@@ -1779,7 +1781,8 @@ impl State {
             | Action::HunterScan
             | Action::HunterUpdate
             | Action::HunterLog
-            | Action::HunterLockdown)) => self.hunter_click(qh, a),
+            | Action::HunterLockdown
+            | Action::HunterOpen)) => self.hunter_click(qh, a),
             None => {
                 let (px, py, pw, ph) = panel;
                 if !(x >= px && x < px + pw && y >= py && y < py + ph) {

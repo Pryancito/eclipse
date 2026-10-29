@@ -59,6 +59,7 @@ pub fn install(rootfs: &Path) {
     write_freedoom_wrapper(rootfs);
     write_freedoom_desktop_entries(rootfs);
     write_files_desktop_entry(rootfs);
+    write_hunter_desktop_entry(rootfs);
     write_xorg_config(rootfs);
     write_xfce_defaults(rootfs);
     write_fallback_icons(rootfs);
@@ -1068,6 +1069,53 @@ fn write_files_desktop_entry(rootfs: &Path) {
          Icon=system-file-manager\n\
          Categories=System;FileTools;FileManager;\n\
          MimeType=inode/directory;\n\
+         StartupNotify=false\n",
+    )
+    .unwrap();
+}
+
+/// `eclipse-security` and its `.desktop` entry: `lunarhunter`, hunter's
+/// window, in the launcher menu and findable from lunarrun as "Seguridad" /
+/// "hunter", as well as from the shield menu.
+///
+/// Through a wrapper like every other entry, and for the same reason: the
+/// wrapper falls back (a terminal on `hunterctl events`) when the binary is
+/// missing, so the row is never dead. Arguments pass through, so
+/// `eclipse-security --tab firmas` works too.
+fn write_hunter_desktop_entry(rootfs: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let localbin = rootfs.join("usr/local/bin");
+    let _ = fs::create_dir_all(&localbin);
+    let wrapper = localbin.join("eclipse-security");
+    fs::write(
+        &wrapper,
+        b"#!/bin/sh\n\
+          # Eclipse OS: hunter's window (configuration, events, scans,\n\
+          # quarantine, signatures). See tools/lunarbar/src/bin/lunarhunter.rs.\n\
+          if command -v lunarhunter >/dev/null 2>&1; then\n\
+          \x20 exec lunarhunter \"$@\"\n\
+          fi\n\
+          exec /usr/local/bin/eclipse-terminal sh -c \"/sbin/hunterctl events; echo; echo '[enter]'; read _\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let dir = rootfs.join("root/.local/share/applications");
+    let _ = fs::create_dir_all(&dir);
+    fs::write(
+        dir.join("lunarhunter.desktop"),
+        "[Desktop Entry]\n\
+         Version=1.0\n\
+         Type=Application\n\
+         Name=Seguridad (hunter)\n\
+         GenericName=Security Center\n\
+         Comment=Configuración, eventos, escaneo, cuarentena y firmas de hunter\n\
+         Exec=/usr/local/bin/eclipse-security\n\
+         TryExec=/usr/local/bin/eclipse-security\n\
+         Terminal=false\n\
+         Icon=security-high\n\
+         Categories=System;Security;Settings;\n\
+         Keywords=hunter;antivirus;seguridad;security;escaneo;scan;\n\
          StartupNotify=false\n",
     )
     .unwrap();

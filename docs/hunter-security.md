@@ -249,11 +249,14 @@ what "looked at" means). The menu has:
   clickable; should a relaxation still be refused (hunter accepts the write
   and only says so in its ring), the menu re-reads the modes and says so;
 - the newest four warnings and criticals;
-- four buttons: **scan** (`hunterctl scan --quarantine $HOME` in a terminal),
-  **signatures** (`hunterctl update-signatures` in a terminal), **log**
-  (`hunterctl events`), and **lockdown**, which takes a second click to
-  confirm and then sends exactly what `hunterctl lockdown` does (a unit test
-  compares the two).
+- four buttons: **scan**, **signatures**, **log** and **lockdown**. With
+  `lunarhunter` installed (below) the first three open it on the right tab
+  (`lunarhunter --quarantine --scan $HOME`, `--update`, `--tab eventos`);
+  without it they run `hunterctl scan --quarantine $HOME`,
+  `hunterctl update-signatures` and `hunterctl events` in a terminal.
+  **Lockdown** takes a second click to confirm and then sends exactly what
+  `hunterctl lockdown` does (a unit test compares the two);
+- **abrir** / **open** in the header, which opens `lunarhunter`.
 
 The bar holds no policy of its own: it reads the same report and sends the
 same directives as `hunterctl`, through the same root-only `/proc/hunter`
@@ -261,6 +264,36 @@ same directives as `hunterctl`, through the same root-only `/proc/hunter`
 `/proc/hunter`, and then there is no shield. `LUNARBAR_DUMP=/path:WxH
 LUNARBAR_DUMP_HUNTER=1 lunarbar` renders the menu to a file without a
 compositor.
+
+### lunarhunter: hunter's window
+
+`lunarhunter` ([`tools/lunarbar/src/bin/lunarhunter.rs`](../tools/lunarbar/src/bin/lunarhunter.rs))
+is the rest of hunter as a desktop application: a normal xdg-shell window
+(in the taskbar, movable, resizable, framed by labwc), built and installed with
+the bar as `/bin/lunarhunter`, in the app menu as **Seguridad (hunter)**
+(`/usr/local/bin/eclipse-security`, which falls back to a terminal on
+`hunterctl events`). Seven tabs, keys `1`-`7` or Tab:
+
+| Tab | What it does |
+|---|---|
+| Resumen | the stance in one line, eight counters, the latest alerts; quick actions: scan home, update signatures, EICAR test, lockdown |
+| Protección | the six domains with what each guards, the four switches (`learning`, `anomaly-detection`, `privileged-deny`, `require-hash`); **save as boot policy** writes the live stance to `/etc/hunter/policy.conf` (old file kept as `policy.conf.bak`), **apply policy.conf**, and **seal** |
+| Eventos | the whole event ring with time, pid, severity and category, filtered by all / alerts / critical |
+| Escaneo | presets (home, `/tmp`, programs, `/`, or `--scan PATH...`), a live count with a stop button, per-finding or all-at-once quarantine, or automatic quarantine as it goes |
+| Cuarentena | `/var/lib/hunter/quarantine/index`, each row restorable (two clicks) |
+| Firmas | what the kernel holds (hash / byte patterns / detections), the files under `/etc/hunter/signatures{,.d}`, the feeds, **update now**, and the **EICAR test** (writes the test file, scans it, deletes it, says whether the engine caught it) |
+| Programas | the allowlist counts, kernel vs. disk pins, the learned programs, **save learned** (`hunterctl save-learned`) and **verify integrity** (`hunterctl verify`) |
+
+Like the bar it holds no policy: settings go through `/proc/hunter`, scans
+through `/proc/hunter_scan` (the same batches of 256 paths `hunterctl scan`
+writes, from a thread, so the count moves), and the file work (quarantine,
+restore, feed downloads, the whitelist, verify) runs `/sbin/hunterctl` and
+shows its output in the tab. One-way or file-moving actions (lockdown, seal,
+saving the boot policy, quarantine all, restore) take a second click. Under
+the seal, relaxing controls are not offered; without root, nothing that
+changes hunter is. `lunarhunter --tab NAME --dump /path:WxH` renders a tab to
+a raw ARGB8888 file without a compositor (from a built-in sample when there
+is no `/proc/hunter`).
 
 ## Exec integrity (SHA-256)
 

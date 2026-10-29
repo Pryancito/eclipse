@@ -267,6 +267,8 @@ pub struct Text {
     pub update: &'static str,
     pub log: &'static str,
     pub lockdown: &'static str,
+    /// The header button that opens `lunarhunter`.
+    pub open: &'static str,
     pub confirm: &'static str,
     pub no_events: &'static str,
     pub denied: &'static str,
@@ -287,6 +289,7 @@ const ES: Text = Text {
     update: "firmas",
     log: "registro",
     lockdown: "blindar",
+    open: "abrir",
     confirm: "¿seguro?",
     no_events: "sin alertas",
     denied: "hace falta root",
@@ -307,6 +310,7 @@ const EN: Text = Text {
     update: "update",
     log: "log",
     lockdown: "lockdown",
+    open: "open",
     confirm: "sure?",
     no_events: "no alerts",
     denied: "root required",
@@ -351,6 +355,31 @@ pub fn update_command() -> String {
 /// spares depending on a pager.
 pub fn log_command() -> String {
     hold("/sbin/hunterctl events")
+}
+
+/// `lunarhunter`, the window with the rest of hunter (see
+/// `src/bin/lunarhunter.rs`). When it is installed the menu's buttons open it
+/// on the right tab instead of a terminal: a scan with a count that moves and
+/// a stop button, an update whose feeds are listed, the ring with a filter.
+pub const APP: &str = "lunarhunter";
+
+/// The whole window, on its first tab.
+pub fn app_command() -> String {
+    APP.to_string()
+}
+
+/// Scan `home` at once, quarantining as it goes: what `scan_command` does in
+/// a terminal. `--quarantine` before `--scan`, which takes every word after it.
+pub fn app_scan_command(home: &str) -> String {
+    format!("{APP} --quarantine --scan '{}'", home.replace('\'', ""))
+}
+
+pub fn app_update_command() -> String {
+    format!("{APP} --update")
+}
+
+pub fn app_events_command() -> String {
+    format!("{APP} --tab eventos")
 }
 
 fn hold(cmd: &str) -> String {
@@ -496,6 +525,15 @@ recent events (oldest first):\n\
     fn a_quote_in_the_home_path_cannot_break_out_of_the_scan_command() {
         let cmd = scan_command("/root/it's");
         assert!(cmd.starts_with("/sbin/hunterctl scan --quarantine '/root/its';"));
+    }
+
+    #[test]
+    fn the_window_commands_keep_a_quote_in_home_out() {
+        assert_eq!(
+            app_scan_command("/root/it's"),
+            "lunarhunter --quarantine --scan '/root/its'"
+        );
+        assert!(app_events_command().starts_with("lunarhunter "));
     }
 
     #[test]

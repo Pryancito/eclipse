@@ -162,6 +162,11 @@ pub(super) fn draw(
     };
     cv.shield_icon(px + PAD, py + 9, 16, col, shield != Shield::Open);
     cv.text_bold(t.title, px + PAD + 24, py + 10, pal().text);
+    // "open": the rest of hunter, in its own window.
+    let (ox, ow) = (px + PAD + 24 + Canvas::text_width(t.title) + 12, Canvas::text_width(t.open) + 16);
+    cv.round_rect(ox, py + 7, ow, GLYPH_H + 6, 5, pal().pill);
+    cv.text(t.open, ox + 8, py + 10, pal().accent);
+    hits.push((ox, py + 7, ox + ow, py + 7 + GLYPH_H + 6, Action::HunterOpen));
     if st.sealed {
         let w = Canvas::text_width(t.sealed);
         cv.lock_icon(px + pw - PAD - w - 18, py + 10, 14, pal().warn);
@@ -348,13 +353,24 @@ impl State {
                     (None, true)
                 }
             }
-            Action::HunterScan | Action::HunterUpdate | Action::HunterLog => {
-                let cmd = match act {
-                    Action::HunterScan => hunter::scan_command(&home),
-                    Action::HunterUpdate => hunter::update_command(),
-                    _ => hunter::log_command(),
+            Action::HunterScan | Action::HunterUpdate | Action::HunterLog | Action::HunterOpen => {
+                // lunarhunter when it is installed, on the tab the button
+                // names; a terminal running hunterctl when it is not.
+                let cmd = if apps::executable_exists(hunter::APP) {
+                    match act {
+                        Action::HunterScan => hunter::app_scan_command(&home),
+                        Action::HunterUpdate => hunter::app_update_command(),
+                        Action::HunterLog => hunter::app_events_command(),
+                        _ => hunter::app_command(),
+                    }
+                } else {
+                    term(match act {
+                        Action::HunterScan => hunter::scan_command(&home),
+                        Action::HunterUpdate => hunter::update_command(),
+                        // The log, and "open" with no window to open.
+                        _ => hunter::log_command(),
+                    })
                 };
-                let cmd = term(cmd);
                 self.close_popup();
                 self.spawn(&cmd);
                 return;
@@ -532,6 +548,21 @@ mod tests {
                 assert_eq!(fit(b, bw - 6), b, "{l:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_open_button_sits_between_the_title_and_the_seal() {
+        let mut st = status();
+        st.sealed = true;
+        let (hits, (pw, _)) = hits_of(&Menu {
+            st,
+            confirm: false,
+            msg: None,
+        });
+        let open = hits.iter().find(|h| h.4 == Action::HunterOpen).unwrap();
+        assert!(open.3 <= HEAD_H, "inside the header");
+        let sealed_w = Canvas::text_width(hunter::text(i18n::Lang::Es).sealed) + 18;
+        assert!(open.2 + 8 <= pw - PAD - sealed_w, "clear of the seal");
     }
 
     #[test]
