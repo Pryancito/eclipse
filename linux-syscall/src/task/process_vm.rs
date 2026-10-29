@@ -87,6 +87,11 @@ impl Syscall<'_> {
         ) {
             return Err(LxError::EPERM);
         }
+        // hunter: writing into a process that is not the caller's own
+        // descendant is how code is injected (see `hunter::injection`).
+        if to_remote && !hunter::check_process_write(self.zircon_process().id(), target.id()) {
+            return Err(LxError::EPERM);
+        }
         let copied = copy(&target.vmar(), &local, &remote, to_remote);
         if copied == 0 {
             return Err(LxError::EFAULT);

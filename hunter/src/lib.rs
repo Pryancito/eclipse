@@ -17,6 +17,10 @@
 //! | [`check_exec_av`]     | `execve` / loader / interp  | antivirus (signatures) |
 //! | [`check_mprotect`]    | `mprotect`                  | W^X memory      |
 //! | [`check_munmap`]      | `munmap`                    | W^X bookkeeping |
+//! | [`check_file_write`] | `write` family on a file  | behavior (ransomware) |
+//! | [`check_file_rename`] | `rename` family           | behavior (ransomware) |
+//! | [`check_file_unlink`] | `unlink` / `unlinkat`     | behavior (ransomware) |
+//! | [`check_process_write`] | `process_vm_writev`     | behavior (injection) |
 //! | [`task_fork`]         | `fork` / `clone`            | policy lifecycle|
 //! | [`task_exec`]         | `execve`                    | policy lifecycle|
 //! | [`task_exit`]         | process teardown            | state cleanup   |
@@ -41,12 +45,15 @@ extern crate test;
 extern crate log;
 
 pub mod av;
+pub mod behavior;
 pub mod clock;
 pub mod control;
 pub mod event_log;
 pub mod heuristics;
+pub mod injection;
 pub mod integrity;
 pub mod policy;
+pub mod ransomware;
 pub mod wx;
 
 use alloc::format;
@@ -143,6 +150,10 @@ pub fn check_syscall(pid: u64, num: u32, args: &[usize; 6]) -> Result<(), Securi
     }
     // Anomaly detection runs only on permitted calls; it may deny under Enforce.
     if !heuristics::on_syscall(pid, num) {
+        return Err(SecurityViolation::SyscallBlocked);
+    }
+    // `ptrace` aimed at a process that is not the caller's own descendant.
+    if !injection::on_syscall(pid, num, args) {
         return Err(SecurityViolation::SyscallBlocked);
     }
     Ok(())
@@ -451,13 +462,15 @@ fn wx_violation(pid: u64, mode: Mode, op: &str, reason: &str) -> bool {
 pub fn task_fork(parent_pid: u64, child_pid: u64) {
     policy::inherit_policy(parent_pid, child_pid);
     heuristics::on_exec(child_pid);
+    behavior::on_fork(parent_pid, child_pid);
 }
 
 /// Exec hook: re-applies any default whitelist to the new image and resets the
 /// anomaly window so a benign-then-malicious exec cannot launder counters.
-pub fn task_exec(pid: u64, _path: &str) {
+pub fn task_exec(pid: u64, path: &str) {
     policy::apply_default_policy(pid);
     heuristics::on_exec(pid);
+    behavior::on_exec(pid, path);
 }
 
 /// Process-exit hook. Releases all per-process security state so a recycled pid
@@ -466,6 +479,40 @@ pub fn task_exit(pid: u64) {
     policy::remove_policy(pid);
     heuristics::forget(pid);
     wx::forget(pid);
+    behavior::forget(pid);
+}
+
+/// Write hook (`write`, `pwrite`, `writev`, `pwritev`), called per chunk
+/// before the chunk reaches a regular file opened as `path`. `existing_len`
+/// answers the file's current size and is asked at most once per file per
+/// window. Returns `false` when the write must be refused (`EPERM`). The
+/// kernel should ask [`behavior::watching`] first and skip the call (and the
+/// work of finding `path`) when it says no.
+pub fn check_file_write(
+    pid: u64,
+    path: &str,
+    data: &[u8],
+    existing_len: &mut dyn FnMut() -> u64,
+) -> bool {
+    ransomware::on_write(pid, path, data, existing_len)
+}
+
+/// Rename hook, called once the rename has passed its own checks and before
+/// it is made. Both paths absolute. Returns `false` to refuse it (`EPERM`).
+pub fn check_file_rename(pid: u64, old: &str, new: &str) -> bool {
+    ransomware::on_rename(pid, old, new)
+}
+
+/// Unlink hook, the same for `unlink`/`unlinkat` (not `rmdir`).
+pub fn check_file_unlink(pid: u64, path: &str) -> bool {
+    ransomware::on_unlink(pid, path)
+}
+
+/// Cross-process write hook (`process_vm_writev`; a writer of
+/// `/proc/<pid>/mem` would call it too), after the kernel has resolved
+/// `target` to a process. Returns `false` to refuse the write (`EPERM`).
+pub fn check_process_write(pid: u64, target: u64) -> bool {
+    injection::check_process_write(pid, target, "process_vm_writev into")
 }
 
 /// Renders the full `/proc/hunter` report: status header + recent event ring.
@@ -477,13 +524,14 @@ pub fn render_report() -> String {
         env!("CARGO_PKG_VERSION")
     ));
     out.push_str(&format!(
-        "enforcement: syscall={} wx={} exec={} anomaly={} integrity={} av={}{}\n",
+        "enforcement: syscall={} wx={} exec={} anomaly={} integrity={} av={} behavior={}{}\n",
         policy::syscall_mode().as_str(),
         policy::wx_mode().as_str(),
         policy::exec_mode().as_str(),
         policy::anomaly_mode().as_str(),
         policy::integrity_mode().as_str(),
         policy::av_mode().as_str(),
+        behavior::mode().as_str(),
         if policy::is_tighten_only() {
             " [tighten-only]"
         } else {
@@ -544,6 +592,7 @@ pub fn render_report() -> String {
         av_patterns,
         av_hits
     ));
+    out.push_str(&behavior::render_status());
     // Machine-readable dump of learned programs so a userspace helper can
     // persist them to /etc/hunter/whitelist (kernel never writes the FS).
     let learned = policy::learned_exec_paths();

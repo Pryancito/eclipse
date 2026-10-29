@@ -16,7 +16,7 @@
 //!
 //! | Directive                               | Effect                                        |
 //! |-----------------------------------------|-----------------------------------------------|
-//! | `mode <domain> <off\|report\|enforce>`  | domain is `syscall`, `wx`, `exec`, `anomaly`, `integrity`, `av` |
+//! | `mode <domain> <off\|report\|enforce>`  | domain is `syscall`, `wx`, `exec`, `anomaly`, `integrity`, `av`, `behavior` |
 //! | `learning <on\|off>`                    | exec trust-on-first-use                       |
 //! | `anomaly-detection <on\|off>`           | per-process flood / fork-bomb heuristics      |
 //! | `privileged-deny <on\|off>`             | block module/ptrace/bpf/... under `anomaly=enforce` |
@@ -26,6 +26,9 @@
 //! | `hash <sha256> <path>`                  | pin a program's SHA-256 (see [`crate::integrity`]) |
 //! | `require-hash <on\|off>`                | an unpinned program is an integrity violation |
 //! | `signature <hash\|bytes>:<data>:<Name>` | add an antivirus signature (see [`crate::av`]) |
+//! | `canary <path>`                         | a decoy file: touching it is ransomware (see [`crate::ransomware`]) |
+//! | `exempt <path>`                         | a program the behaviour detectors leave alone |
+//! | `release <pid>`                         | lift a process's ransomware containment       |
 //! | `seal`                                  | engage the one-way tighten-only latch         |
 //!
 //! A trailing `/` makes `trust` / `deny` a directory prefix, exactly as in
@@ -56,10 +59,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::av;
+use crate::behavior;
 use crate::event_log::{record, Severity};
 use crate::heuristics;
 use crate::integrity::{self, Digest};
 use crate::policy::{self, Mode};
+use crate::ransomware;
 
 /// An enforcement domain a `mode` directive can name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +75,7 @@ pub enum Domain {
     Anomaly,
     Integrity,
     Av,
+    Behavior,
 }
 
 /// One parsed line of the control language.
@@ -85,6 +91,9 @@ pub enum Directive {
     Hash(Digest, String),
     RequireHash(bool),
     Signature(av::Signature),
+    Canary(String),
+    Exempt(String),
+    Release(u64),
     Seal,
 }
 
@@ -175,6 +184,21 @@ pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
             arity(2)?;
             Directive::RequireHash(parse_switch(words[1])?)
         }
+        "canary" => {
+            arity(2)?;
+            Directive::Canary(parse_path(words[1])?)
+        }
+        "exempt" => {
+            arity(2)?;
+            Directive::Exempt(parse_path(words[1])?)
+        }
+        "release" => {
+            arity(2)?;
+            match words[1].parse::<u64>() {
+                Ok(pid) if pid > 0 => Directive::Release(pid),
+                _ => return Err(format!("'release' takes a pid, got '{}'", words[1])),
+            }
+        }
         "seal" => {
             arity(1)?;
             Directive::Seal
@@ -206,8 +230,9 @@ fn parse_domain(word: &str) -> Result<Domain, String> {
         "anomaly" => Ok(Domain::Anomaly),
         "integrity" => Ok(Domain::Integrity),
         "av" => Ok(Domain::Av),
+        "behavior" => Ok(Domain::Behavior),
         other => Err(format!(
-            "unknown domain '{}' (syscall, wx, exec, anomaly, integrity, av)",
+            "unknown domain '{}' (syscall, wx, exec, anomaly, integrity, av, behavior)",
             other
         )),
     }
@@ -269,6 +294,7 @@ pub fn apply(d: &Directive) {
         Directive::Mode(Domain::Anomaly, m) => policy::set_anomaly_mode(*m),
         Directive::Mode(Domain::Integrity, m) => policy::set_integrity_mode(*m),
         Directive::Mode(Domain::Av, m) => policy::set_av_mode(*m),
+        Directive::Mode(Domain::Behavior, m) => behavior::set_mode(*m),
         Directive::Learning(on) => policy::set_exec_learning(*on),
         Directive::AnomalyDetection(on) => {
             if gate_switch("anomaly-detection", *on) {
@@ -297,6 +323,11 @@ pub fn apply(d: &Directive) {
                     format!("av signature added: {}", sig.name()),
                 );
             }
+        }
+        Directive::Canary(p) => ransomware::add_canary(p.clone()),
+        Directive::Exempt(p) => behavior::add_exempt(p.clone()),
+        Directive::Release(pid) => {
+            behavior::release(*pid);
         }
         Directive::Seal => policy::seal_tighten_only(),
     }
@@ -372,6 +403,7 @@ mod tests {
         policy::reset_for_test();
         heuristics::set_anomaly_detection(false);
         heuristics::set_privileged_deny(false);
+        behavior::reset_for_test();
     }
 
     #[test]
@@ -393,6 +425,10 @@ mod tests {
             mode integrity enforce\n\
             hash ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  /usr/bin/my tool\n\
             require-hash on\n\
+            mode behavior enforce\n\
+            canary /home/u/.~budget.xlsx\n\
+            exempt /usr/bin/gdb\n\
+            release 42\n\
             seal\n";
         assert_eq!(
             parse_script(script).unwrap(),
@@ -417,6 +453,10 @@ mod tests {
                     String::from("/usr/bin/my tool")
                 ),
                 Directive::RequireHash(true),
+                Directive::Mode(Domain::Behavior, Mode::Enforce),
+                Directive::Canary(String::from("/home/u/.~budget.xlsx")),
+                Directive::Exempt(String::from("/usr/bin/gdb")),
+                Directive::Release(42),
                 Directive::Seal,
             ]
         );
@@ -429,7 +469,7 @@ mod tests {
     fn the_shipped_example_is_inert_and_every_line_of_it_parses() {
         let example = include_str!("../../tools/hunterctl/policy.conf");
         assert_eq!(parse_script(example).unwrap(), vec![]);
-        const VERBS: [&str; 11] = [
+        const VERBS: [&str; 14] = [
             "mode",
             "learning",
             "anomaly-detection",
@@ -440,6 +480,9 @@ mod tests {
             "hash",
             "require-hash",
             "signature",
+            "canary",
+            "exempt",
+            "release",
             "seal",
         ];
         // `# mode wx report   # note` -> `mode wx report   # note`, which must
@@ -484,6 +527,10 @@ mod tests {
             "hash deadbeef /bin/x",
             "hash",
             "require-hash",
+            "canary relative",
+            "exempt",
+            "release self",
+            "release 0",
             "frobnicate",
         ] {
             assert!(parse_line(bad).is_err(), "accepted: {}", bad);

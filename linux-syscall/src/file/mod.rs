@@ -8,6 +8,7 @@ use linux_object::fs::*;
 mod dir;
 mod drm_prime;
 mod fd;
+mod hunter_gate;
 /// Shared by `socket`/`socketpair` (and the anonymous-fd constructors in `fd`)
 /// so a stray bit is `EINVAL`, not a silently truncated `OpenFlags`.
 pub(crate) use fd::{anon_fd_flags, open_flags, ANON_CLOEXEC, ANON_NONBLOCK};
