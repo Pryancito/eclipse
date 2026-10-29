@@ -49,11 +49,11 @@ pub(crate) struct LinuxRootfs(Arch, Variant);
 /// beside its `libc.a` and nothing is imported.
 const STATIC_RUSTFLAGS: &str = "-C relocation-model=static -C target-feature=+crt-static";
 
-/// The four binaries `tools/lunarbar` builds, as paths in its target directory.
+/// The five binaries `tools/lunarbar` builds, as paths in its target directory.
 ///
-/// A struct and not a tuple: four paths of the same type in one return value
-/// are four chances to copy the launcher over the file browser, and the day a
-/// fifth binary joins them the struct is the thing that will not compile
+/// A struct and not a tuple: five paths of the same type in one return value
+/// are five chances to copy the launcher over the file browser, and the day
+/// another binary joins them the struct is the thing that will not compile
 /// quietly in the wrong order.
 struct LunarTools {
     /// The panel.
@@ -64,6 +64,8 @@ struct LunarTools {
     file: PathBuf,
     /// The clipboard daemon and its Super+V history picker.
     clip: PathBuf,
+    /// hunter's window, opened from the bar's shield menu.
+    hunter: PathBuf,
 }
 
 impl LinuxRootfs {
@@ -637,6 +639,7 @@ impl LinuxRootfs {
             run: lunarrun,
             file: lunarfile,
             clip: lunarclip,
+            hunter: lunarhunter,
         } = self.lunar_tools();
         if lunarbar.is_file() {
             let _ = dir::rm(bin.join("lunarbar"));
@@ -683,6 +686,17 @@ impl LinuxRootfs {
             fs::copy(&lunarclip, bin.join("lunarclip")).unwrap();
         } else {
             eprintln!("warning: lunarclip not built; there is no clipboard history");
+        }
+
+        // lunarhunter: the window for hunter (configuration, the event ring,
+        // scans with a live count, quarantine, signature updates). The bar's
+        // shield menu opens it, and falls back to a terminal running
+        // hunterctl when it is missing.
+        if lunarhunter.is_file() {
+            let _ = dir::rm(bin.join("lunarhunter"));
+            fs::copy(&lunarhunter, bin.join("lunarhunter")).unwrap();
+        } else {
+            eprintln!("warning: lunarhunter not built; the shield menu opens terminals");
         }
 
         // eclipse-dbusd: Eclipse's own D-Bus session bus (Rust, static musl).
@@ -3257,15 +3271,16 @@ impl LinuxRootfs {
     }
 
     /// Cross-compile the `tools/lunarbar` package (Rust) as static musl
-    /// binaries and return all four: the panel, `lunarrun` (the KRunner-style
+    /// binaries and return all five: the panel, `lunarrun` (the KRunner-style
     /// launcher behind Alt+Space and Super+D), `lunarfile` (the file browser
     /// behind Super+E, and the file chooser `--pick` gives the rest of the
-    /// system) and `lunarclip` (the clipboard manager and its Super+V
-    /// history). One cargo invocation builds them, since they share a library.
+    /// system), `lunarclip` (the clipboard manager and its Super+V history)
+    /// and `lunarhunter` (hunter's window, opened from the shield menu). One
+    /// cargo invocation builds them, since they share a library.
     /// Best-effort: if the build fails the desktop falls back to waybar, the
     /// runner keybinds do nothing (their wrapper says so in
-    /// /tmp/lunarrun.log), `eclipse-files` falls back to a terminal and there
-    /// is no clipboard history.
+    /// /tmp/lunarrun.log), `eclipse-files` falls back to a terminal, there
+    /// is no clipboard history and the shield menu opens terminals.
     fn lunar_tools(&self) -> LunarTools {
         let dir = PROJECT_DIR.join("tools").join("lunarbar");
         let triple = self.musl_rust_triple();
@@ -3274,6 +3289,7 @@ impl LinuxRootfs {
         let runner = out.join("lunarrun");
         let browser = out.join("lunarfile");
         let clipboard = out.join("lunarclip");
+        let hunter = out.join("lunarhunter");
         // Rebuild when any source file is newer than the binaries. The whole
         // `src/` tree is walked rather than listed: the list this replaced
         // missed `hunter.rs` and `hunter_menu.rs` the day they arrived, and a
@@ -3288,11 +3304,11 @@ impl LinuxRootfs {
         .into_iter()
         .flatten()
         .max();
-        // ALL FOUR must exist and be current: a tree built before lunarclip
+        // ALL FIVE must exist and be current: a tree built before lunarclip
         // existed has an up-to-date lunarbar, lunarrun and lunarfile and no
         // clipboard at all, and the stale-binary check would happily ship
         // that. (That is exactly what happened the day lunarfile arrived.)
-        let mtimes: Option<Vec<_>> = [&executable, &runner, &browser, &clipboard]
+        let mtimes: Option<Vec<_>> = [&executable, &runner, &browser, &clipboard, &hunter]
             .iter()
             .map(|p| fs::metadata(p).ok()?.modified().ok())
             .collect();
@@ -3303,6 +3319,7 @@ impl LinuxRootfs {
                     run: runner,
                     file: browser,
                     clip: clipboard,
+                    hunter,
                 };
             }
         }
@@ -3328,7 +3345,7 @@ impl LinuxRootfs {
         let status = cargo.status();
         if !status.success() {
             eprintln!(
-                "warning: lunarbar/lunarrun/lunarfile/lunarclip build failed; waybar fallback remains"
+                "warning: lunarbar/lunarrun/lunarfile/lunarclip/lunarhunter build failed; waybar fallback remains"
             );
         }
         LunarTools {
@@ -3336,6 +3353,7 @@ impl LinuxRootfs {
             run: runner,
             file: browser,
             clip: clipboard,
+            hunter,
         }
     }
 
