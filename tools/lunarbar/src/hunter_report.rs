@@ -279,15 +279,15 @@ pub fn count_signatures(text: &str) -> (usize, usize) {
 }
 
 /// `/etc/hunter/signatures` then every feed in `signatures.d/`, skipping the
-/// dot-files `update-signatures` writes before renaming (the kernel skips
-/// them too).
+/// dot-files `update-signatures` writes before renaming and the `.sig` beside
+/// a signed feed (the kernel skips both too).
 pub fn read_signature_files() -> Vec<SigFile> {
     let mut paths = vec![SIGNATURES.to_string()];
     if let Ok(rd) = std::fs::read_dir(SIGNATURES_D) {
         let mut names: Vec<String> = rd
             .flatten()
             .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| !n.starts_with('.'))
+            .filter(|n| !n.starts_with('.') && !n.ends_with(".sig"))
             .collect();
         names.sort();
         paths.extend(names.into_iter().map(|n| format!("{SIGNATURES_D}/{n}")));

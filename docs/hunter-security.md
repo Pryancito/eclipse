@@ -219,7 +219,11 @@ hunterctl scan [--quarantine] <path>...   antivirus scan (exit 1 if infected)
 hunterctl quarantine <file>...  move into /var/lib/hunter/quarantine, deny the path
 hunterctl quarantined           list the quarantine
 hunterctl restore <sha256>      put a quarantined file back
-hunterctl update-signatures     download the feeds in /etc/hunter/feeds
+hunterctl update-signatures     download the feeds in /etc/hunter/feeds (signed ones verified)
+hunterctl feeds                 installed feeds, trusted keys, saved versions
+hunterctl feed-rollback <feed> [<version>]   back to a saved version, live
+hunterctl trust-key <name> <hex>   trust an Ed25519 feed key (live, and in /etc/hunter/keys)
+hunterctl require-signed-feeds <on|off>
 hunterctl scan-media [id|dir]...  scan removable media (default: every pending one)
 hunterctl media-scan|media-lock <on|off>
 hunterctl lockdown              exec + integrity + av enforce, media-lock on, learning off, seal
@@ -476,17 +480,55 @@ file back with its mode. The path stays denied until reboot, because hunter
 never forgets a deny.
 
 **Database and updates.** `/etc/hunter/signatures` (local; ships with the
-EICAR test signature) and every file in `/etc/hunter/signatures.d/` are
+EICAR test signature) and every feed in `/etc/hunter/signatures.d/` are
 loaded at boot. `hunterctl update-signatures` downloads each feed in
-`/etc/hunter/feeds` (`<format> <name> <url>`; formats `sha256` and `sigs`)
-with curl or wget. It loads the new signatures into the running kernel and,
-only if hunter accepted all of them, installs the feed as
-`signatures.d/<name>` (written to a dot-file, then renamed). An empty or
-failed download keeps the previous feed. The default feed is abuse.ch
-MalwareBazaar's list of malware SHA-256s from the last 48 hours. Schedule it
-with crond, e.g. `0 */6 * * * /sbin/hunterctl update-signatures`. Adding a
-signature only ever makes hunter stricter, so the tighten-only latch does not
-block updates.
+`/etc/hunter/feeds` (`<format> <name> <url> [<key>]`; formats `sha256` and
+`sigs`) with curl or wget into a dot-file in `signatures.d`, and writes
+`install <feed> <file> [<file.sig>]` to `/proc/hunter_feed`. The kernel reads
+the file itself, checks it and loads it whole; only once it said yes is the
+feed renamed into place and a copy saved in `/var/lib/hunter/feeds/<feed>/`
+(the last five versions). An empty, failed or refused download keeps the
+previous feed. The default feed is abuse.ch MalwareBazaar's list of malware
+SHA-256s from the last 48 hours. Schedule it with crond, e.g.
+`0 */6 * * * /sbin/hunterctl update-signatures`.
+
+**Signed feeds.** A signature is not harmless because it can only make
+hunter refuse more: `hash:<sha256 of /bin/sh>` under `mode av enforce` stops
+the system. A feed with a `<key>` in `/etc/hunter/feeds` must come with
+`<url>.sig`, a six-line header signed with Ed25519 (RFC 8032):
+
+```
+hunter-feed-signature 1
+feed <feed>
+serial <version, a number that only grows>
+key <key name>
+sha256 <SHA-256 of the feed file>
+ed25519 <signature over the five lines above>
+```
+
+The kernel (`hunter::feed`) installs it only if the key is trusted, the
+signature verifies, the SHA-256 is the file's, the feed name is the one it is
+installed under, and the serial is not older than the installed one (a
+replayed old feed is refused). A feed installed signed is never replaced by
+an unsigned one, and `require-signed-feeds on` refuses unsigned feeds
+altogether; MalwareBazaar signs nothing, so that is off by default. Keys come
+from `feed-key <name> <hex>` (`/etc/hunter/keys` at boot, read before the
+feeds; `hunterctl trust-key` live). The same checks run at boot on each
+`signatures.d/<feed>` with its `<feed>.sig`. The publisher signs on another
+machine with `tools/hunterctl/hunter-feed-sign` (OpenSSL 3): `keygen` makes a
+key and prints its `feed-key` line, `sign` writes the `.sig`, and
+`from-sha256` turns a MalwareBazaar list into hunter lines, so a signed
+mirror of it is three commands.
+
+**Rollback.** hunter remembers which signatures each feed brought, so a new
+version takes out what the old one had and it does not, unless another feed
+or the local database still holds it. `hunterctl feed-rollback <feed>
+[<version>]` (`hunterctl feeds` lists the saved versions) reinstalls a saved
+version with `rollback`, the only way past the serial check, and its
+signatures are gone live, without a reboot: the cure for a feed whose newest
+version blocks a legitimate program. Once sealed, no signature leaves the
+database: updates and rollbacks still add, and what they would remove stays
+until reboot. The seal also freezes the keys and `require-signed-feeds on`.
 
 **Scheduled scans.** `/etc/hunter/schedule` holds the scans that run on
 their own, one per line: `<job> <when> <HH:MM> <report|quarantine>
