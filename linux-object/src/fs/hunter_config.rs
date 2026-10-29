@@ -10,6 +10,8 @@
 //! * `/etc/hunter/signatures` and `/etc/hunter/signatures.d/*` — the
 //!   antivirus database (`hash:<sha256>:<Name>` / `bytes:<hex>:<Name>`); the
 //!   directory is where `hunterctl update-signatures` puts its feeds.
+//! * `/etc/hunter/ports` — the listening ports the network monitor expects,
+//!   in `hunter::netmon`'s language (`expect tcp 22 /usr/sbin/sshd`).
 //! * `/etc/hunter/policy.conf` — a script in hunter's control language
 //!   (`mode exec enforce`, `learning off`, `seal`, ...; see
 //!   `hunter::control`), applied last so it can override the learning
@@ -60,7 +62,33 @@ pub fn load(root: &Arc<dyn INode>) {
     if n_sig > 0 {
         kernel_hal::klog_info!("hunter: loaded {} antivirus signatures", n_sig);
     }
+    let n_ports = load_ports(root, PORTS_FILE);
+    if n_ports > 0 {
+        kernel_hal::klog_info!("hunter: {} netmon rule(s) from {}", n_ports, PORTS_FILE);
+    }
     load_policy(root, POLICY_CONF);
+}
+
+/// The listeners the network monitor expects (see `hunter::netmon`).
+const PORTS_FILE: &str = "/etc/hunter/ports";
+
+/// Reads `/etc/hunter/ports`, line by line like the signatures: a bad line
+/// loses one rule, said by name, and the listener it meant to allow is
+/// reported -- the same as with no rule at all. Read before `policy.conf`, so
+/// a `seal` there finds the rules in place instead of refusing them.
+fn load_ports(root: &Arc<dyn INode>, path: &str) -> usize {
+    let mut count = 0;
+    for_each_line(root, path, |i, line| {
+        match hunter::netmon::parse_line(line) {
+            Ok(Some(d)) => {
+                hunter::netmon::apply(&d, 0);
+                count += 1;
+            }
+            Ok(None) => {}
+            Err(e) => kernel_hal::klog_info!("hunter: {}:{}: skipped: {}", path, i, e),
+        }
+    });
+    count
 }
 
 /// The antivirus database (see `hunter::av`).

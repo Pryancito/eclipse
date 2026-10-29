@@ -1345,7 +1345,12 @@ impl Syscall<'_> {
         // smoltcp tcp sockets do not support backlog
         // open multiple sockets for each connection
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
-        file_like.clone().as_socket()?.listen()
+        let socket = file_like.as_socket()?;
+        let ret = socket.listen()?;
+        // hunter's network monitor hears of the listener now, not at the next
+        // read of `/proc/hunter_net`. It only watches: the call has succeeded.
+        linux_object::net::netmon::on_listen(self.zircon_process(), socket);
+        Ok(ret)
     }
 
     /// shutdown a socket
