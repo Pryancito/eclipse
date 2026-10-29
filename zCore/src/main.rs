@@ -41,6 +41,8 @@ mod oops;
 #[no_mangle]
 extern "C" fn drivers_net_drain() {}
 
+// hunter's measured boot and the watch on the kernel's own code.
+mod boot_integrity;
 mod fs;
 mod handler;
 mod invariants;
@@ -701,6 +703,11 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         );
     });
     hunter::init();
+    // What rboot measured, and the kernel's own code, before the root
+    // filesystem's /etc/hunter/boot is there to judge them by.
+    boot_integrity::init();
+    #[cfg(feature = "linux")]
+    boot_integrity::start_watch();
     // (The anomaly-rate heuristics now default OFF — see the HUNTERANOMALY=1 /
     // HUNTER_ANOMALY=1 opt-in in the cmdline-switch block above. The old
     // HUNTER_ANOMALY=0 A/B knob became the default state.)

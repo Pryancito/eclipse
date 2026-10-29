@@ -376,6 +376,7 @@ pub(crate) fn reset_for_test() {
     ANOMALY_MODE.store(DEFAULT_ANOMALY_MODE.to_u8(), Ordering::SeqCst);
     INTEGRITY_MODE.store(DEFAULT_INTEGRITY_MODE.to_u8(), Ordering::SeqCst);
     crate::integrity::reset_for_test();
+    crate::boot::reset_for_test();
     AV_MODE.store(DEFAULT_AV_MODE.to_u8(), Ordering::SeqCst);
     EXEC_LEARN.store(DEFAULT_EXEC_LEARN, Ordering::SeqCst);
     TRUSTED_EXEC_PATHS.lock().clear();

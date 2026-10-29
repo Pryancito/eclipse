@@ -41,6 +41,7 @@ extern crate test;
 extern crate log;
 
 pub mod av;
+pub mod boot;
 pub mod clock;
 pub mod control;
 pub mod event_log;
@@ -535,6 +536,11 @@ pub fn render_report() -> String {
         } else {
             "off"
         },
+    ));
+    out.push_str(&format!(
+        "boot: {} pinned={} (see /proc/hunter_boot)\n",
+        boot::verdict().as_str(),
+        boot::pin_count(),
     ));
     let (av_hashes, av_patterns, av_hits) = av::stats();
     out.push_str(&format!(

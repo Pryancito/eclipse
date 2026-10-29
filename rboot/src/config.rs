@@ -7,6 +7,7 @@
 //! outright: an old bootloader binary reading a newer conf's `auto` died with
 //! a `ParseIntError` before drawing anything.)
 
+use crate::measure::MeasureSet;
 use core::str::FromStr;
 use log::warn;
 
@@ -69,6 +70,8 @@ pub struct Config<'a> {
     pub initramfs: Option<&'a str>,
     /// Kernel command line
     pub cmdline: &'a str,
+    /// What rboot measures for hunter's measured boot (see [`crate::measure`]).
+    pub measure: MeasureSet,
 }
 
 pub const PAGE_SIZE: u64 = 0x1000;
@@ -87,6 +90,7 @@ const DEFAULT_CONFIG: Config = Config {
     resolution: Resolution::Keep,
     initramfs: None,
     cmdline: "",
+    measure: MeasureSet::Kernel,
 };
 
 impl<'a> Config<'a> {
@@ -235,6 +239,13 @@ impl<'a> Config<'a> {
             }
             "initramfs" => self.initramfs = Some(value),
             "cmdline" => self.cmdline = value,
+            "measure" => match MeasureSet::parse(value) {
+                Some(m) => self.measure = m,
+                None => warn!(
+                    "invalid measure {:?} (off, kernel, all); keeping {:?}",
+                    value, self.measure
+                ),
+            },
             _ => warn!("undefined config key: {}", key),
         }
     }
@@ -257,6 +268,17 @@ mod tests {
         assert_eq!(c.resolution, Resolution::Auto);
         assert_eq!(c.cmdline, "");
         assert_eq!(c.initramfs, None); // the line is commented out
+        assert_eq!(c.measure, MeasureSet::Kernel);
+    }
+
+    #[test]
+    fn measure_defaults_to_the_cheap_set_and_a_typo_keeps_it() {
+        assert_eq!(Config::parse(b"").measure, MeasureSet::Kernel);
+        assert_eq!(Config::parse(b"measure=all\n").measure, MeasureSet::All);
+        assert_eq!(Config::parse(b"measure=off\n").measure, MeasureSet::Off);
+        // A value nobody should guess the meaning of measures what the
+        // default measures, not nothing.
+        assert_eq!(Config::parse(b"measure=yes\n").measure, MeasureSet::Kernel);
     }
 
     #[test]

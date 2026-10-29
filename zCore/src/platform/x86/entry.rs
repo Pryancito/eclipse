@@ -20,6 +20,9 @@ pub extern "C" fn _start(boot_info: &'static BootInfo) -> ! {
     // it: rboot's own `warn!` goes to the firmware console, which the splash
     // wipes two calls later. See `crate::set_gop_report`.
     crate::set_gop_report(boot_info.gop);
+    // What rboot measured on the way here, for hunter's measured boot: copied
+    // out now for the same reason as the two above. See `crate::boot_integrity`.
+    crate::boot_integrity::set_loader_measurements(boot_info.measurements);
     let info = boot_info.graphic_info;
     // Paint 52% *before* heap / klog / PIT calibration. rboot leaves the bar
     // at 51%; a stall in `memory::init` used to look like a failed jump.
