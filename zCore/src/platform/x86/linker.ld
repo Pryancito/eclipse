@@ -18,9 +18,13 @@ SECTIONS {
 
   .rodata ALIGN(4K):
   {
+    /* srodata..erodata, with stext..etext, is what hunter hashes as the
+       kernel's code (zCore/src/boot_integrity.rs). */
+    srodata = .;
     *(.rodata .rodata.*)
     *(.srodata .srodata.*)
     *(.data.rel.ro .data.rel.ro.*)
+    erodata = .;
   }
 
   .kcounter.desc ALIGN(4K):

@@ -94,3 +94,23 @@ fn the_on_demand_scanner_finds_eicar_in_a_file_and_says_clean_of_the_rest() {
     );
     assert_eq!(node.metadata().unwrap().mode, 0o644);
 }
+
+#[test]
+fn proc_hunter_boot_reports_every_item_and_refuses_a_typo() {
+    let node = ProcHunterBootINode;
+    assert_eq!(node.metadata().unwrap().mode, 0o644);
+    node.resize(0).unwrap();
+    let text = String::from_utf8(node.seq_text().unwrap().unwrap()).unwrap();
+    assert!(text.starts_with("verdict "), "{}", text);
+    for item in hunter::boot::ITEMS {
+        assert!(text.contains(&alloc::format!("item {} ", item)), "{}", text);
+    }
+    // Not an item: the whole write is refused.
+    let bad = alloc::format!("{}  bootloader\n", "ab".repeat(32));
+    assert!(matches!(
+        node.write_at(0, bad.as_bytes()),
+        Err(FsError::InvalidParam)
+    ));
+    // `verify` with nothing registered to measure is a no-op, not an error.
+    assert_eq!(node.write_at(0, b"verify\n").unwrap(), 7);
+}

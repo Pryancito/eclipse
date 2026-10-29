@@ -185,3 +185,68 @@ pub(super) fn scan_inode(path: &str, inode: Option<&dyn INode>) {
         true
     });
 }
+
+/// `/proc/hunter_boot`: hunter's boot integrity (see `hunter::boot`).
+///
+/// Read, the verdict and one line per boot item (measured and pinned
+/// digests). Written by root: `verify` re-hashes the kernel's code now, and
+/// lines of `<sha256>  <item>` pin items, applied all or nothing and then
+/// appraised -- `hunterctl boot pin` writes the running boot's own
+/// measurements here and to `/etc/hunter/boot`.
+///
+/// A read never hashes anything: lunarbar polls hunter's files, and a read
+/// that re-hashed megabytes of kernel each time would be a cost nobody asked
+/// for. The code is re-checked on `verify` and by the kernel's own timer.
+pub(super) struct ProcHunterBootINode;
+
+impl ProcHunterBootINode {
+    const INODE: usize = 157;
+}
+
+fn proc_hunter_boot_content() -> String {
+    hunter::boot::render()
+}
+
+impl INode for ProcHunterBootINode {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        seq_read_at(proc_hunter_boot_content, offset, buf)
+    }
+
+    fn seq_text(&self) -> Option<Result<Vec<u8>>> {
+        Some(Ok(proc_hunter_boot_content().into_bytes()))
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        if !may_control_hunter(crate::process::current_ucred()) {
+            return Err(FsError::NoPermission);
+        }
+        let text = core::str::from_utf8(buf).map_err(|_| FsError::InvalidParam)?;
+        hunter::boot::apply_command(text).map_err(|_| FsError::InvalidParam)?;
+        Ok(buf.len())
+    }
+
+    fn resize(&self, _len: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: true,
+            error: false,
+            hangup: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(file_metadata(Self::INODE, 0o644))
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
+    }
+}

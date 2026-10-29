@@ -20,6 +20,8 @@ pub mod frames;
 #[cfg(any(feature = "boot-ui", test))]
 pub mod logo;
 #[cfg(any(feature = "boot-ui", test))]
+pub mod measure;
+#[cfg(any(feature = "boot-ui", test))]
 pub mod page_table;
 #[cfg(any(feature = "boot-ui", test))]
 pub mod progress;
@@ -77,6 +79,16 @@ pub struct BootInfo {
     /// After `loader_marks`, like everything new here: growing the tail never
     /// shifts an existing field's offset.
     pub gop: GopReport,
+    /// SHA-256 of what rboot loaded and handed over: the kernel ELF, the
+    /// initramfs, `rboot.conf` and the cmdline. The first link of a measured
+    /// boot -- the kernel's `hunter::boot` compares these against the digests
+    /// the operator pinned in `/etc/hunter/boot`. See [`BootMeasurements`].
+    ///
+    /// After `gop`, like everything new here: growing the tail never shifts an
+    /// existing field's offset. A kernel booted by an older rboot reads past
+    /// the end of a shorter struct here, which is why the record opens with a
+    /// magic number instead of trusting whatever bytes follow `gop`.
+    pub measurements: BootMeasurements,
 }
 
 /// One mode the firmware offered, as [`GopReport`] records it.
@@ -246,6 +258,78 @@ impl Default for GopReport {
 /// at 52; the array is sized for the whole of rboot's range plus the handoff
 /// mark, and a percentage outside it is dropped rather than trusted.
 pub const LOADER_MARKS: usize = 52;
+
+/// What [`BootMeasurements::magic`] holds when rboot filled the record in:
+/// `"RBOOTMS1"`, little-endian. Anything else -- an rboot that predates the
+/// field, so the kernel is reading whatever follows a shorter `BootInfo` --
+/// means "this boot was not measured", never "it was measured as zeros".
+pub const MEASURE_MAGIC: u64 = u64::from_le_bytes(*b"RBOOTMS1");
+
+/// One measured input: its SHA-256 and its length in bytes.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct Measurement {
+    /// Whether rboot measured this input at all. `false` for an initramfs the
+    /// config does not name, and for anything `measure=` left out.
+    pub measured: bool,
+    pub size: u64,
+    pub digest: [u8; 32],
+}
+
+impl Measurement {
+    /// The record of an input that was not measured.
+    pub const NONE: Self = Self {
+        measured: false,
+        size: 0,
+        digest: [0; 32],
+    };
+}
+
+/// Everything rboot measured on its way to the kernel. rboot is the start of
+/// the chain: nothing here measures rboot itself, which is UEFI Secure Boot's
+/// job (an rboot an attacker replaced would report whatever digests it
+/// liked). What this catches is the rest of the ESP changing under an rboot
+/// that did not -- a swapped `kernel.elf`, an edited cmdline that turns
+/// hunter off, an initramfs with a different `/sbin/init`.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct BootMeasurements {
+    /// [`MEASURE_MAGIC`] when this record is real.
+    pub magic: u64,
+    /// The kernel ELF file, as read from `kernel_path`.
+    pub kernel: Measurement,
+    /// The initramfs file, when there is one and `measure=all`.
+    pub initramfs: Measurement,
+    /// `rboot.conf` itself: it names every other input, so a changed config
+    /// is a changed boot even when every file it points at is intact.
+    pub config: Measurement,
+    /// The kernel command line, exactly as handed over (no trailing NUL).
+    pub cmdline: Measurement,
+}
+
+impl BootMeasurements {
+    /// The record of a boot nothing measured.
+    pub const fn empty() -> Self {
+        Self {
+            magic: 0,
+            kernel: Measurement::NONE,
+            initramfs: Measurement::NONE,
+            config: Measurement::NONE,
+            cmdline: Measurement::NONE,
+        }
+    }
+
+    /// Whether rboot filled this record in (see [`MEASURE_MAGIC`]).
+    pub fn is_valid(&self) -> bool {
+        self.magic == MEASURE_MAGIC
+    }
+}
+
+impl Default for BootMeasurements {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
 
 /// Graphic output information
 #[derive(Debug, Copy, Clone)]
