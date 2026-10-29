@@ -9,7 +9,7 @@
 #
 #   hunterctl [status]              modes, counters, lists (no event ring)
 #   hunterctl events                the full report, event ring included
-#   hunterctl mode <domain> <mode>  domain: syscall|wx|exec|anomaly|integrity|av
+#   hunterctl mode <domain> <mode>  domain: syscall|wx|exec|anomaly|integrity|av|behavior
 #                                   mode:   off|report|enforce
 #   hunterctl learning <on|off>
 #   hunterctl anomaly-detection <on|off>
@@ -17,6 +17,10 @@
 #   hunterctl trust <path|dir/>     add to the exec allowlist
 #   hunterctl deny <path|dir/>      add to the exec blacklist
 #   hunterctl untrusted <dir/>      add a world-writable location
+#   hunterctl canary <file>...      ransomware tripwire: create decoy files, declare
+#                                   them now and in /etc/hunter/policy.conf
+#   hunterctl exempt <program>      the ransomware/injection detectors leave it alone
+#   hunterctl release <pid>         lift a process's ransomware containment
 #   hunterctl seal                  one-way: from now on, only tighten
 #   hunterctl apply <file>          send a whole policy script (e.g. policy.conf)
 #   hunterctl hash <file>...        pin the SHA-256 of programs (live + /etc/hunter/hashes)
@@ -76,6 +80,7 @@ HASHES=/etc/hunter/hashes
 SCAN=/proc/hunter_scan
 QDIR=/var/lib/hunter/quarantine
 FEEDS=/etc/hunter/feeds
+POLICY=/etc/hunter/policy.conf
 SIGDIR=/etc/hunter/signatures.d
 REPORTS=/var/lib/hunter/reports
 # The report is rendered by lunarhunter (lunarbar's hunter_export), the one
@@ -619,7 +624,7 @@ mode)
     [ $# -eq 2 ] || usage 1
     send "mode $1 $2"
     ;;
-learning|anomaly-detection|privileged-deny|require-hash|require-signed-feeds|trust|deny|untrusted|media-scan|media-lock)
+learning|anomaly-detection|privileged-deny|require-hash|require-signed-feeds|trust|deny|untrusted|media-scan|media-lock|exempt|release)
     [ $# -eq 1 ] || usage 1
     send "$cmd $1"
     ;;
@@ -634,6 +639,37 @@ trust-key)
     touch "$KEYS"
     grep -qx "feed-key $1 $pk" "$KEYS" || printf 'feed-key %s %s\n' "$1" "$pk" >> "$KEYS"
     echo "hunterctl: key $1 trusted (and in $KEYS for the next boot)"
+    ;;
+canary)
+    [ $# -ge 1 ] || usage 1
+    [ "$(id -u)" = 0 ] || die "must be root"
+    # The file is made BEFORE it is declared: once declared, writing it is
+    # exactly what the tripwire is for. Its contents only have to look like
+    # somebody's document; nobody is meant to open it.
+    script=""
+    for f in "$@"; do
+        case "$f" in
+        /*) ;;
+        *) f="$(pwd)/$f" ;;
+        esac
+        if [ ! -e "$f" ]; then
+            mkdir -p "${f%/*}" || die "cannot create ${f%/*}"
+            printf 'Presupuesto 2026 - borrador\nPartida;Importe\nNominas;184500\nAlquiler;36000\n' > "$f" ||
+                die "cannot create $f"
+        fi
+        [ -f "$f" ] || die "not a file: $f"
+        script="${script}canary $f
+"
+    done
+    send "$script"
+    # Declared again at every boot: policy.conf is applied all or nothing, and
+    # a `canary <absolute path>` line is always one that parses.
+    mkdir -p "${POLICY%/*}"
+    touch "$POLICY"
+    printf '%s' "$script" | while IFS= read -r line; do
+        grep -qxF "$line" "$POLICY" || printf '%s\n' "$line" >> "$POLICY"
+    done
+    echo "hunterctl: $# canary file(s) armed"
     ;;
 seal)
     send "seal"

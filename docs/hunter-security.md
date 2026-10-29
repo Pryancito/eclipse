@@ -25,6 +25,11 @@ testable on the host.
 | `check_mmap`               | `sys_mmap`                               | W^X memory      |
 | `firewall::check`          | `sys_connect`, `sys_bind`, `sys_sendto`, `sys_sendmsg` | per-application firewall |
 | `check_mprotect`           | `sys_mprotect`                           | W^X memory      |
+| `check_file_write`         | `write`/`pwrite`/`writev`/`pwritev`, per chunk, regular files | behavior (ransomware) |
+| `check_file_rename`        | `rename`/`renameat`/`renameat2`          | behavior (ransomware) |
+| `check_file_unlink`        | `unlink`/`unlinkat` (not `rmdir`)        | behavior (ransomware) |
+| `check_process_write`      | `process_vm_writev`                      | behavior (injection) |
+| `task_fork` / `task_exec`  | `clone` / `execve`                       | lineage for `behavior` |
 | `task_exit`                | `sys_exit_group`                         | state cleanup   |
 | `netmon::on_listen`        | `sys_listen`                             | network monitor |
 | `netmon::observe`          | each read of `/proc/hunter_net`          | network monitor |
@@ -48,6 +53,7 @@ There are three independently-tunable enforcement domains, each with its own
 | `integrity` | SHA-256 of the image vs. its pinned digest      | `Report`  |
 | `av`      | Antivirus signatures matched on the image          | `Report`  |
 | `net`     | Which programs may reach the network ([firewall](#per-application-firewall)) | `Report`  |
+| `behavior` | Ransomware and process injection, by behaviour    | `Report`  |
 
 The defaults are deliberately conservative. The syscall domain is `Enforce`
 because whitelists are opt-in per process (no policy registered ⇒ permissive),
@@ -183,7 +189,7 @@ One directive per line; blank lines and `#` comments are ignored.
 
 | Directive                              | Effect                                              |
 |----------------------------------------|-----------------------------------------------------|
-| `mode <domain> <off\|report\|enforce>` | `domain` is `syscall`, `wx`, `exec` or `anomaly`    |
+| `mode <domain> <off\|report\|enforce>` | `domain` is `syscall`, `wx`, `exec`, `anomaly`, `integrity`, `av` or `behavior` |
 | `learning <on\|off>`                   | exec trust-on-first-use                             |
 | `anomaly-detection <on\|off>`          | per-process flood / fork-bomb counters              |
 | `privileged-deny <on\|off>`            | block module/ptrace/bpf/kexec under `anomaly=enforce` |
@@ -200,6 +206,9 @@ One directive per line; blank lines and `#` comments are ignored.
 | `net <allow\|deny> <path> [in\|out]`  | a [firewall](#per-application-firewall) rule; no direction is both |
 | `net forget <path>` / `net dismiss <path>` | drop a program's rules / its open questions     |
 | `net timeout <secs>` / `net mode <mode>` | how long `enforce` waits for an answer (1-300 s); same as `mode net` |
+| `canary <path>`                        | a decoy file: touching it is ransomware             |
+| `exempt <path>`                        | a program the `behavior` detectors leave alone      |
+| `release <pid>`                        | lift a process's ransomware containment             |
 | `seal`                                 | engage the one-way tighten-only latch               |
 
 **All or nothing.** A script (a whole `policy.conf`, or one `write(2)` to
@@ -213,8 +222,9 @@ nobody wrote.
 **The latch.** Directives run in order, so `seal` binds the lines after it.
 Once sealed, every relaxing directive is refused and recorded (`mode X` to a
 lower mode, `learning on`, `trust`, `anomaly-detection off`,
-`privileged-deny off`, `media-scan off`, `media-lock off`, a clean verdict
-for a device already found infected); tightening ones still apply. Only a reboot unseals.
+`privileged-deny off`, `media-scan off`, `media-lock off`, `exempt`, `release`, a
+clean verdict for a device already found infected); tightening ones still apply.
+Only a reboot unseals.
 
 **Who may write.** `/proc/hunter` is mode `0644`, and the write handler checks
 the *effective* uid of the writing process, not just the open: a descriptor
@@ -230,6 +240,9 @@ hunterctl mode <domain> <mode>
 hunterctl learning|anomaly-detection|privileged-deny <on|off>
 hunterctl trust|deny <path|dir/>
 hunterctl untrusted <dir/>
+hunterctl canary <file>...      create decoy files, arm them now and at every boot
+hunterctl exempt <program>      the ransomware/injection detectors leave it alone
+hunterctl release <pid>         lift a process's ransomware containment
 hunterctl seal
 hunterctl apply <file>          send a whole script (e.g. a new policy.conf)
 hunterctl hash <file>...        pin SHA-256 digests (live, and in /etc/hunter/hashes)
@@ -829,6 +842,68 @@ they only ever observe calls that were allowed to run:
    most once per window to avoid log storms; under the `anomaly` domain's
    `Enforce` mode the offending syscall is denied. Toggle with
    `heuristics::set_anomaly_detection`.
+
+## Ransomware and process injection (`behavior`)
+
+Signatures catch what somebody has already seen; the `behavior` domain
+catches what an attack has to *do*. Code: `hunter/src/behavior.rs` (domain,
+lineage, containment), `ransomware.rs`, `injection.rs`; the kernel side is
+`linux-syscall/src/file/hunter_gate.rs` and `task/process_vm.rs`.
+
+### Ransomware
+
+The kernel tells hunter about every write, rename and unlink of a regular
+file (pseudo-files under `/proc`, `/sys`, `/dev` and pipes are skipped). Each
+process gets a 10-second window, and an alarm is raised when within it:
+
+| Rule | Fires on |
+|------|----------|
+| encrypt and replace | ≥ 12 files written with random-looking contents **and** ≥ 12 of their originals deleted (`a.docx` gone, `a.docx.locked` or `a.locked` written, in either order) |
+| encrypt in place    | ≥ 12 files that already had contents overwritten with random-looking bytes |
+| mass renaming       | ≥ 12 renames in a row giving files one new extension, appended or replacing the old one (`a.docx` → `a.docx.locked`, `b.pdf` → `b.WNCRY`) |
+| canary              | any write, rename or unlink of a decoy declared with `canary <path>` |
+
+Each rule needs two signals because one is ordinary: unpacking an archive of
+photos writes many random-looking files (compressed data looks random), and
+`rm -rf` deletes thousands, but neither destroys what it read. The names
+matter too: a package manager writes `x.png.dpkg-new`, renames it over `x.png`
+and deletes `x.png.dpkg-tmp`, which links no copy to its original, so an
+upgrade trips nothing. What does look exactly like ransomware is `gzip` over a
+dozen files at once (`a.log` → `a.log.gz`, original deleted): that is the same
+shape, and `exempt /usr/bin/gzip` is the answer if it is routine. Overwriting
+in place is told from an image editor saving over its files by truncation: the
+editor opens with `O_TRUNC`, so the file is already empty when it writes.
+"Random-looking" is the number of distinct byte values in the first 512 bytes
+of a write (≈221 for ciphertext, a few dozen for text, under 200 for machine code);
+writes shorter than that are not judged.
+
+Under `Enforce` the operation that crosses the line is refused with `EPERM`
+and the process is **contained**: every later write, rename or unlink of a
+file by it -- or by children it forks afterwards, or after an `execve` -- is
+refused too, until it exits or `release <pid>`. Pseudo-files stay writable.
+
+Canaries are the strongest signal and cost nothing: `hunterctl canary
+/root/Documents/.~presupuesto.xlsx /home/u/Documentos/.~nominas.ods` creates
+the files, declares them, and appends `canary` lines to
+`/etc/hunter/policy.conf` so they are armed at every boot.
+
+### Process injection
+
+`process_vm_writev`, `ptrace(POKETEXT/POKEDATA/POKEUSER/SETREGS/SETFPREGS/
+SETREGSET)` and `ptrace(ATTACH/SEIZE)` are judged by who the target is. A
+process writing into itself or into one of its descendants is what a debugger
+does (`gdb ./prog`, `strace -f make`) and passes; writing into anything else
+(a sibling, a parent, a stranger) raises an alarm, once per target, and under
+`Enforce` is refused with `EPERM`. hunter knows the lineage from `task_fork`.
+`exempt /usr/bin/gdb` lets `gdb -p <pid>` attach to processes it did not
+start. Eclipse does not implement `ptrace` or `/proc/<pid>/mem` yet: a
+`ptrace` attempt is still judged from its syscall arguments, and
+`hunter::check_process_write` is the hook a `/proc/<pid>/mem` writer would
+call.
+
+`/proc/hunter` shows the mode in the `enforcement:` line (`behavior=`) and a
+`behavior:` line with canaries, exempt programs, contained processes and the
+number of alarms. Events are logged under `RANSOMWARE` and `INJECTION`.
 
 ## `/proc/hunter`
 
