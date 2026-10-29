@@ -25,6 +25,8 @@ testable on the host.
 | `check_mmap`               | `sys_mmap`                               | W^X memory      |
 | `check_mprotect`           | `sys_mprotect`                           | W^X memory      |
 | `task_exit`                | `sys_exit_group`                         | state cleanup   |
+| `netmon::on_listen`        | `sys_listen`                             | network monitor |
+| `netmon::observe`          | each read of `/proc/hunter_net`          | network monitor |
 | `init` / `set_time_source` | `zCore` boot (`primary_main`)            | bring-up        |
 
 ## Enforcement domains and modes
@@ -293,6 +295,7 @@ the bar as `/bin/lunarhunter`, in the app menu as **Seguridad (hunter)**
 | Firmas | what the kernel holds (hash / byte patterns / detections), the files under `/etc/hunter/signatures{,.d}`, the feeds, **update now**, and the **EICAR test** (writes the test file, scans it, deletes it, says whether the engine caught it) |
 | Programas | the allowlist counts, kernel vs. disk pins, the learned programs, **save learned** (`hunterctl save-learned`) and **verify integrity** (`hunterctl verify`) |
 | Programados | the scheduled scans (see [Antivirus](#antivirus-signatures)): per job off / daily / weekly, the day, the time in 30-minute steps, alert or quarantine, its next run and **run now** (`hunterctl run-scheduled`); then the history, newest first |
+| Red | every TCP/UDP socket with the process holding it (pid, program, local and remote address), unexpected listeners first and in red with an **allow** button (`hunterctl expect-port`, two clicks), the alerts switch, and the expected ports with **remove** (`hunterctl forget-port`); re-read every two seconds while open. See [Network monitor](#network-monitor) |
 
 Like the bar it holds no policy: settings go through `/proc/hunter`, scans
 through `/proc/hunter_scan` (the same batches of 256 paths `hunterctl scan`
@@ -571,6 +574,64 @@ batch of results for everybody: a manual `hunterctl scan` while a stick is
 being scanned can mix their results. A file written to the stick after its
 scan is not scanned again until it is run (on-access) or the device is
 scanned again.
+
+## Network monitor
+
+`hunter::netmon` answers the two questions `/proc/net/tcp` cannot: **which
+program holds which socket**, and **did something start listening that
+nobody expected**. A backdoor's first move once it runs is to open a port
+(`nc -l -p 4444 -e /bin/sh`) or call home, and the other domains only watch
+what runs.
+
+The kernel walks every process's descriptor table and hands hunter one entry
+per (process, inet socket), as `netstat -p` pairs them. A **listener** is a TCP
+socket in `LISTEN`, or an unconnected UDP socket on a port below the ephemeral
+range (49152): a client's DNS query is not a service, `bind(0.0.0.0:53)` is. A
+listener no rule expects is a `WARN` event in category `NET` (so the shield in
+lunarbar lights up), once per process and port:
+
+```text
+[  412] +  1203.551s pid=733   WARN   NET       WARNING: unexpected listener: tcp 0.0.0.0:4444 by /tmp/.x/nc
+```
+
+TCP listeners are reported from `sys_listen` the moment they open; UDP ones,
+and anything else, at the next read of the table. Listeners on loopback only
+are exempt by default, since the network cannot reach them. The monitor only
+watches: it never refuses a `bind`, `listen` or `connect` (that is a
+firewall's decision, per program), so it cannot break a service by being
+wrong.
+
+**`/proc/hunter_net`** — read (by anyone, like `/proc/net/tcp`), a fresh
+snapshot:
+
+```text
+hunter netmon
+alerts=on ignore-loopback=on sockets=3 listeners=2 unexpected=1 reported=1
+expect udp 68
+expect udp 546
+expect tcp 22 /usr/sbin/sshd
+sock 412 tcp LISTEN 0.0.0.0:22 - listen /usr/sbin/sshd
+sock 733 tcp LISTEN 0.0.0.0:4444 - ALERT /tmp/.x/nc
+sock 612 tcp ESTAB 10.0.2.15:49822 93.184.216.34:443 ok /usr/bin/firefox
+```
+
+Written by root, a script in netmon's own small language, all or nothing:
+
+| Directive | Effect |
+|---|---|
+| `expect <tcp\|udp\|any> <port\|lo-hi> [<program>]` | that listener is expected; with a program, only for that program |
+| `forget <tcp\|udp\|any> <port\|lo-hi> [<program>]` | drop a rule written the same way |
+| `alerts <on\|off>` | unexpected listeners raise events or not |
+| `ignore-loopback <on\|off>` | loopback-only listeners are exempt or not |
+
+Once sealed, the directives that silence alerts (`expect`, `alerts off`,
+`ignore-loopback on`) are refused and recorded, like every relaxation.
+
+**`/etc/hunter/ports`** holds the same directives, read at boot before
+`policy.conf` (line by line: a bad line loses one rule, named in the log). The
+DHCP clients (`udp 68`, `udp 546`) are expected without a line. `hunterctl net`
+prints the table; `hunterctl expect-port tcp 22 /usr/sbin/sshd` and
+`hunterctl forget-port ...` change the live rules and the file together.
 
 ## Intrusion detection (heuristics)
 

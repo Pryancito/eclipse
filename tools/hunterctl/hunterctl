@@ -43,6 +43,11 @@
 #                                   run a scheduled scan now (--due: every one that is due)
 #   hunterctl scan-history [N]      the last N scheduled scans (default 20)
 #   hunterctl scheduler             the daemon: run-scheduled --due once a minute
+#   hunterctl net                   sockets per process; ALERT = unexpected listener
+#   hunterctl expect-port <tcp|udp|any> <port|lo-hi> [program]
+#                                   that listener is expected (live + /etc/hunter/ports)
+#   hunterctl forget-port <tcp|udp|any> <port|lo-hi> [program]
+#                                   take an expect-port back
 #   hunterctl save-learned          append learned programs to the whitelist
 #   hunterctl notify [--severity info|warn|crit] [--timeout SECS]
 #                    [--action ID:LABEL[:COMMAND]]... [--wait SECS] TITLE [BODY]
@@ -74,6 +79,8 @@ HISTORY_MAX=1000
 # One report per scanned device (`hunterctl scan-media`), named by its id:
 # the FOUND / ERROR lines and a summary. lunarhunter shows them.
 MEDIA_REPORTS=/run/hunter/media
+NET=/proc/hunter_net
+PORTS=/etc/hunter/ports
 # Paths per write to /proc/hunter_scan: each batch is scanned before the
 # write returns, and 256 paths stay well under the 1 MiB a write may carry.
 BATCH=256
@@ -98,7 +105,7 @@ send() {
     [ "$(id -u)" = 0 ] || die "must be root"
     msg=$(mktemp) || die "mktemp failed"
     printf '%s\n' "$1" > "$msg"
-    if dd if="$msg" of="$PROC" bs=1048576 count=1 2>/dev/null; then
+    if dd if="$msg" of="${2:-$PROC}" bs=1048576 count=1 2>/dev/null; then
         rm -f "$msg"
     else
         rm -f "$msg"
@@ -728,6 +735,24 @@ scheduler)
         "$0" run-scheduled --due
         sleep 60
     done
+    ;;
+net)
+    [ -r "$NET" ] || die "$NET not found: this kernel's hunter has no network monitor"
+    cat "$NET"
+    ;;
+expect-port|forget-port)
+    [ $# -ge 2 ] && [ $# -le 3 ] || usage 1
+    rule="$1 $2${3:+ $3}"
+    # Live first: the kernel parses it, so a typo never reaches the file.
+    send "${cmd%-port} $rule" "$NET"
+    mkdir -p "${PORTS%/*}"
+    touch "$PORTS"
+    tmp=$(mktemp) || die "mktemp failed"
+    grep -vxF -- "expect $rule" "$PORTS" > "$tmp"
+    [ "$cmd" = expect-port ] && printf 'expect %s\n' "$rule" >> "$tmp"
+    cat "$tmp" > "$PORTS"
+    rm -f "$tmp"
+    echo "hunterctl: ${cmd%-port} $rule (saved in $PORTS)"
     ;;
 save-learned)
     [ "$(id -u)" = 0 ] || die "must be root"

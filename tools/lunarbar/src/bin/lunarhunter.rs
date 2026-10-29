@@ -24,13 +24,16 @@
 //! - **Programados** — the scheduled scans (a quick one daily, a full one
 //!   weekly), changing them, running one now, and their history
 //!   (`lunarhunter/schedule.rs`).
+//! - **Red** — every network socket with the program that holds it, and the
+//!   ports that started listening without anyone saying they would, each with
+//!   a button that allows it (`net_tab.rs`).
 //!
 //! The Resumen tab's "Exportar informe" writes the security report
 //! (`hunter_export`) as HTML into `$HOME`; `--export` writes it from the
 //! command line with no compositor, which is what `hunterctl report` runs.
 //!
 //! It holds no policy of its own, exactly like the bar and `hunterctl`: the
-//! kernel's two doors (`/proc/hunter`, `/proc/hunter_scan`) for everything the
+//! kernel's doors (`/proc/hunter`, `/proc/hunter_scan`, `/proc/hunter_net`) for everything the
 //! kernel does, and `/sbin/hunterctl` for the file work it already does right
 //! (the quarantine's moves and index, the feed downloads, the whitelist). So a
 //! button here means what the same `hunterctl` command means.
@@ -56,6 +59,7 @@ use lunarbar::fill_guard;
 use lunarbar::hunter::{self, MediaState, Mode, SendError, Shield, DOMAINS};
 use lunarbar::hunter_export::{self as export, civil_time};
 use lunarbar::hunter_media as media;
+use lunarbar::hunter_net::{self as net, NetTable};
 use lunarbar::hunter_report::{
     self as report, Feed, Quarantined, Report, Severity, SigFile, Switch,
 };
@@ -90,6 +94,11 @@ use lunarbar::hunter_schedule as sched;
 use schedule::SchedAct;
 
 const HUNTERCTL: &str = "/sbin/hunterctl";
+
+/// The *Red* tab. A binary's root resolves `mod` beside itself (`src/bin/`),
+/// so the path names the directory of its own.
+#[path = "lunarhunter/net_tab.rs"]
+mod net_tab;
 
 // ── palette ──────────────────────────────────────────────────────────────────
 
@@ -196,10 +205,11 @@ enum Tab {
     Signatures,
     Programs,
     Schedule,
+    Network,
 }
 
 impl Tab {
-    const ALL: [Tab; 8] = [
+    const ALL: [Tab; 9] = [
         Tab::Overview,
         Tab::Protection,
         Tab::Events,
@@ -208,6 +218,7 @@ impl Tab {
         Tab::Signatures,
         Tab::Programs,
         Tab::Schedule,
+        Tab::Network,
     ];
 
     fn label(self, lang: Lang) -> &'static str {
@@ -220,6 +231,7 @@ impl Tab {
             Tab::Signatures => ("Firmas", "Signatures"),
             Tab::Programs => ("Programas", "Programs"),
             Tab::Schedule => ("Programados", "Scheduled"),
+            Tab::Network => ("Red", "Network"),
         };
         tr(lang, es, en)
     }
@@ -236,6 +248,7 @@ impl Tab {
             "firmas" | "signatures" | "6" => Tab::Signatures,
             "programas" | "programs" | "7" => Tab::Programs,
             "programados" | "scheduled" | "schedule" | "8" => Tab::Schedule,
+            "red" | "network" | "net" | "9" => Tab::Network,
             _ => return None,
         })
     }
@@ -290,6 +303,11 @@ enum Act {
     Sched(SchedAct),
     /// Scan removable device `id` again (`hunterctl scan-media`).
     ScanMedia(u64),
+    /// Make the `n`th row of the *Red* list an expected listener.
+    ExpectPort(usize),
+    /// Take back the `n`th expected-port rule.
+    ForgetRule(usize),
+    NetAlerts(bool),
 }
 
 impl Act {
@@ -297,7 +315,13 @@ impl Act {
     fn needs_confirm(self) -> bool {
         matches!(
             self,
-            Act::Lockdown | Act::Seal | Act::SavePolicy | Act::Restore(_) | Act::QuarantineAll
+            Act::Lockdown
+                | Act::Seal
+                | Act::SavePolicy
+                | Act::Restore(_)
+                | Act::QuarantineAll
+                | Act::ExpectPort(_)
+                | Act::NetAlerts(false)
         )
     }
 }
@@ -318,6 +342,8 @@ enum JobKind {
     /// `hunterctl schedule` or `run-scheduled`.
     Schedule,
     Media,
+    /// `hunterctl expect-port` / `forget-port`.
+    Net,
 }
 
 impl JobKind {
@@ -329,6 +355,7 @@ impl JobKind {
             JobKind::Verify | JobKind::SaveLearned => Tab::Programs,
             JobKind::Restore => Tab::Quarantine,
             JobKind::Schedule => Tab::Schedule,
+            JobKind::Net => Tab::Network,
         }
     }
 }
@@ -599,6 +626,8 @@ struct State {
     root: bool,
     tab: Tab,
     report: Option<Report>,
+    /// `/proc/hunter_net`, read while the *Red* tab is open.
+    net: Option<NetTable>,
     quarantine: Vec<Quarantined>,
     sig_files: Vec<SigFile>,
     feeds: Vec<Feed>,
@@ -664,6 +693,7 @@ impl State {
             root: unsafe { libc::geteuid() } == 0,
             tab,
             report: None,
+            net: None,
             quarantine: Vec::new(),
             sig_files: Vec::new(),
             feeds: Vec::new(),
@@ -694,15 +724,25 @@ impl State {
         tr(self.lang, es, en)
     }
 
-    /// Re-read the report. True when it changed.
+    /// Re-read the report, and the network table when its tab is open (a
+    /// read of it is a fresh walk of every process's sockets: not something
+    /// to do every two seconds for a tab nobody is looking at). True when
+    /// either changed.
     fn reload_report(&mut self) -> bool {
         let r = report::read();
+        let mut changed = false;
         if r != self.report {
             self.report = r;
-            true
-        } else {
-            false
+            changed = true;
         }
+        if self.tab == Tab::Network {
+            let n = net::read();
+            if n != self.net {
+                self.net = n;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Re-read the report and the files beside it.
@@ -963,6 +1003,36 @@ impl State {
                     Vec::new(),
                     vec!["scan-media".into(), id.to_string()],
                 );
+            }
+            Act::ExpectPort(i) => {
+                let args = self
+                    .net
+                    .as_ref()
+                    .and_then(|t| net_tab::rows(t).get(i).and_then(|s| s.expect_args()));
+                if let Some(args) = args {
+                    self.start(JobKind::Net, Vec::new(), args);
+                }
+            }
+            Act::ForgetRule(i) => {
+                let args = self
+                    .net
+                    .as_ref()
+                    .and_then(|t| t.rules.get(i))
+                    .and_then(|r| net::forget_args(r));
+                if let Some(args) = args {
+                    self.start(JobKind::Net, Vec::new(), args);
+                }
+            }
+            Act::NetAlerts(on) => {
+                let script = if on { "alerts on\n" } else { "alerts off\n" };
+                match net::send(script) {
+                    Ok(()) => {
+                        self.reload_report();
+                        let m = self.t("aplicado", "applied");
+                        self.say(m, false);
+                    }
+                    Err(e) => self.say(format!("{}: {e}", net::PROC_NET), true),
+                }
             }
         }
     }
@@ -1459,6 +1529,12 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, st: &State) -> Frame {
         }
         let badge = match t {
             Tab::Quarantine if !st.quarantine.is_empty() => Some(st.quarantine.len().to_string()),
+            Tab::Network => st
+                .net
+                .as_ref()
+                .map(NetTable::unexpected)
+                .filter(|&n| n > 0)
+                .map(|n| n.to_string()),
             Tab::Events => st
                 .report
                 .as_ref()
@@ -1537,6 +1613,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, st: &State) -> Frame {
                 Tab::Signatures => (tab_signatures(&mut g, body, r), 0),
                 Tab::Programs => tab_programs(&mut g, body, r),
                 Tab::Schedule => schedule::tab_schedule(&mut g, body),
+                Tab::Network => net_tab::tab_network(&mut g, body, r.status.sealed),
             };
             list = l;
             max_scroll = m;
@@ -2616,7 +2693,7 @@ fn key(st: &mut State, key: u32) {
         KEY_PGUP_WL => st.scroll_by(-page),
         KEY_PGDN_WL => st.scroll_by(page),
         k => match key_char(k) {
-            Some(c @ '1'..='8') => {
+            Some(c @ '1'..='9') => {
                 let t = Tab::ALL[(c as u8 - b'1') as usize];
                 st.act(Act::Tab(t));
             }
@@ -2797,7 +2874,7 @@ fn usage() -> ! {
          \x20                  [--dump PATH:WxH] [--export PATH [--days N]]\n\
          \n\
          \x20 --tab NAME     open on a tab: resumen proteccion eventos escaneo\n\
-         \x20                cuarentena firmas programas programados (or 1-8,\n\
+         \x20                cuarentena firmas programas programados red (or 1-9,\n\
          \x20                or English)\n\
          \x20 --scan PATH..  scan these absolute paths at once (opens Escaneo)\n\
          \x20 --quarantine   automatic quarantine on (for --scan)\n\
@@ -2806,7 +2883,7 @@ fn usage() -> ! {
          \x20 --export PATH  write the security report (.html, .pdf or .txt) and exit\n\
          \x20 --days N       the period the report covers (default 7)\n\
          \n\
-         keys: 1-8 or Tab switch tabs, arrows/PgUp/PgDn scroll, r re-reads, Esc closes\n\
+         keys: 1-9 or Tab switch tabs, arrows/PgUp/PgDn scroll, r re-reads, Esc closes\n\
          env: ECLIPSE_LOOK=kde|eclipse|win11, LANG"
     );
     std::process::exit(2)
@@ -3044,6 +3121,7 @@ fn sample(st: &mut State) {
     ];
     st.feeds = report::parse_feeds(include_str!("../../../hunterctl/feeds"));
     st.pins = 41;
+    st.net = net::parse(net_tab::SAMPLE);
     let found = vec![scan::Finding {
         path: "/root/Descargas/factura.pdf.exe".into(),
         name: "MalwareBazaar.Recent".into(),
@@ -3269,6 +3347,62 @@ mod tests {
     }
 
     #[test]
+    fn an_unexpected_listener_can_be_allowed_and_an_expected_one_cannot() {
+        let st = sample_state(Tab::Network);
+        let f = frame(&st);
+        let rows = net_tab::rows(st.net.as_ref().unwrap());
+        let allowed: Vec<usize> = f
+            .hits
+            .iter()
+            .filter_map(|(_, a)| match a {
+                Act::ExpectPort(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(allowed, [0]);
+        assert_eq!(rows[0].program, "/tmp/.x/nc");
+        assert_eq!(
+            rows[0].expect_args().unwrap(),
+            ["expect-port", "tcp", "4444", "/tmp/.x/nc"]
+        );
+        // Every rule shown has its remove button.
+        for i in 0..3 {
+            assert!(f.hits.iter().any(|(_, a)| *a == Act::ForgetRule(i)));
+        }
+        assert!(f.hits.iter().any(|(_, a)| *a == Act::NetAlerts(false)));
+    }
+
+    #[test]
+    fn sealed_or_not_root_the_network_tab_does_not_relax() {
+        let mut st = sample_state(Tab::Network);
+        st.report.as_mut().unwrap().status.sealed = true;
+        let f = frame(&st);
+        assert!(!f
+            .hits
+            .iter()
+            .any(|(_, a)| matches!(a, Act::ExpectPort(_) | Act::NetAlerts(false))));
+        // Forgetting a rule tightens: still there.
+        assert!(f.hits.iter().any(|(_, a)| *a == Act::ForgetRule(0)));
+        st.root = false;
+        let f = frame(&st);
+        assert!(f.hits.iter().all(|(_, a)| matches!(a, Act::Tab(_))));
+    }
+
+    #[test]
+    fn allowing_a_port_takes_two_clicks() {
+        let mut st = sample_state(Tab::Network);
+        st.act(Act::ExpectPort(0));
+        assert_eq!(st.confirm, Some(Act::ExpectPort(0)));
+        assert!(st.job.as_ref().is_some_and(|j| j.kind == JobKind::Update));
+    }
+
+    #[test]
+    fn the_network_tab_is_reachable_by_name_and_number() {
+        assert_eq!(cli(&["--tab", "red"]).unwrap().tab, Some(Tab::Network));
+        assert_eq!(cli(&["--tab", "9"]).unwrap().tab, Some(Tab::Network));
+    }
+
+    #[test]
     fn the_quote_for_sh_leaves_nothing_to_expand() {
         assert_eq!(sh_quote("/tmp/a b"), "'/tmp/a b'");
         assert_eq!(sh_quote("it's$(x)"), "'it'\\''s$(x)'");
@@ -3300,6 +3434,7 @@ mod tests {
             JobKind::Quarantine,
             JobKind::Restore,
             JobKind::Media,
+            JobKind::Net,
         ] {
             assert_ne!(k.home(), Tab::Overview);
         }

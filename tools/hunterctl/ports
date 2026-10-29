@@ -1,0 +1,19 @@
+# /etc/hunter/ports — the listening ports hunter's network monitor expects.
+#
+# A port that starts listening and is not here is a WARN event in category
+# NET, naming the program (see `hunterctl net`). The monitor only watches: it
+# never blocks a port. One directive per line:
+#
+#   expect <tcp|udp|any> <port|lo-hi> [<program>]
+#
+# Naming the program makes the rule hold only for it: `expect tcp 22
+# /usr/sbin/sshd` does not make port 22 fine for a shell that took it first.
+# Listeners on 127.0.0.1 or ::1 only are exempt (`ignore-loopback on`).
+#
+# `hunterctl expect-port` and lunarhunter's "Permitir" button add lines here;
+# `hunterctl forget-port` and "Quitar" take them out. The DHCP clients (udp 68
+# and 546) are expected without a line.
+#
+# expect tcp 22 /usr/sbin/sshd
+# expect tcp 80 /usr/sbin/nginx
+# expect any 6000-6010
