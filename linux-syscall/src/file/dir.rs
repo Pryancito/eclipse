@@ -338,7 +338,7 @@ impl Syscall<'_> {
         } else {
             last.to_unlink()?
         };
-        let dir_inode = proc.lookup_parent_at(dirfd, dir_path)?;
+        let (dir_inode, dir_walked) = proc.lookup_parent_walked(dirfd, dir_path)?;
         let dir_metadata = dir_inode.metadata()?;
         // The name first, the parent's mode after: `do_unlinkat` resolves it
         // with search permission alone and answers `ENOENT` from the lookup,
@@ -355,6 +355,9 @@ impl Syscall<'_> {
             has_trailing_slash(path),
         )?;
         proc.check_sticky(&dir_metadata, &file_metadata)?;
+        if !remove_dir {
+            self.hunter_allows_unlink(&dir_walked, file_name)?;
+        }
         dir_inode.unlink(file_name)?;
         linux_object::fs::dcache_invalidate();
         Ok(0)
@@ -406,8 +409,8 @@ impl Syscall<'_> {
         let new_file_name = new_last.to_rename()?;
         // The parents are intermediate components: a symlink among them is
         // followed, as everywhere else (`mv x /tmp/link-to-dir/y`).
-        let old_dir_inode = proc.lookup_parent_at(olddirfd, old_dir_path)?;
-        let new_dir_inode = proc.lookup_parent_at(newdirfd, new_dir_path)?;
+        let (old_dir_inode, old_dir_walked) = proc.lookup_parent_walked(olddirfd, old_dir_path)?;
+        let (new_dir_inode, new_dir_walked) = proc.lookup_parent_walked(newdirfd, new_dir_path)?;
         let old_dir_metadata = old_dir_inode.metadata()?;
         let new_dir_metadata = new_dir_inode.metadata()?;
         // The source name first: `do_renameat2` resolves both sides before
@@ -437,6 +440,12 @@ impl Syscall<'_> {
             &old_metadata,
             &new_dir_metadata,
             new_metadata.as_ref(),
+        )?;
+        self.hunter_allows_rename(
+            &old_dir_walked,
+            old_file_name,
+            &new_dir_walked,
+            new_file_name,
         )?;
         old_dir_inode.move_(old_file_name, &new_dir_inode, new_file_name)?;
         linux_object::fs::dcache_invalidate();

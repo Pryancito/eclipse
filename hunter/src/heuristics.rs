@@ -92,7 +92,7 @@ const MAX_TRACKED_PIDS: usize = 4096;
 
 /// Per-architecture syscall numbers. Absent operations use `u32::MAX` as a
 /// sentinel that never matches a real syscall number.
-mod nr {
+pub(crate) mod nr {
     pub const ABSENT: u32 = u32::MAX;
 
     #[cfg(target_arch = "x86_64")]

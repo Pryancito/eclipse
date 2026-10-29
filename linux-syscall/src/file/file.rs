@@ -424,6 +424,14 @@ impl Syscall<'_> {
                 dst.copy_from_slice(base.add(written).as_slice(n)?);
                 dst
             };
+            if !self.hunter_allows_write(&file_like, chunk) {
+                // hunter refused (ransomware, see `hunter_gate`): what was
+                // already written stands, as for any mid-stream failure.
+                if written > 0 {
+                    break;
+                }
+                return Err(LxError::EPERM);
+            }
             let res = file_like.write(chunk).inspect_err(|&e| {
                 if e == LxError::EBADF {
                     let path = file_like
@@ -616,6 +624,14 @@ impl Syscall<'_> {
                 dst.copy_from_slice(base.add(written).as_slice(n)?);
                 dst
             };
+            if !self.hunter_allows_write(&file_like, chunk) {
+                // hunter refused (ransomware, see `hunter_gate`): what was
+                // already written stands, as for any mid-stream failure.
+                if written > 0 {
+                    break;
+                }
+                return Err(LxError::EPERM);
+            }
             match file_like.write_at(offset + written as u64, chunk) {
                 // A write of nothing would spin the loop for ever.
                 Ok(0) => break,
@@ -709,6 +725,14 @@ impl Syscall<'_> {
             if <FileDesc as Into<i32>>::into(fd) <= 2 {
                 tee_x_diag(&buf[..n]);
             }
+            if !self.hunter_allows_write(&file_like, &buf[..n]) {
+                // hunter refused (ransomware, see `hunter_gate`): what was
+                // already written stands, as for any mid-stream failure.
+                if written > 0 {
+                    break;
+                }
+                return Err(LxError::EPERM);
+            }
             match file_like.write(&buf[..n]) {
                 Ok(w) => {
                     written += w;
@@ -797,6 +821,14 @@ impl Syscall<'_> {
             let n = iovs.read_bytes_at(written, &mut buf)?;
             if n == 0 {
                 break;
+            }
+            if !self.hunter_allows_write(&file_like, &buf[..n]) {
+                // hunter refused (ransomware, see `hunter_gate`): what was
+                // already written stands, as for any mid-stream failure.
+                if written > 0 {
+                    break;
+                }
+                return Err(LxError::EPERM);
             }
             match file_like.write_at(offset + written as u64, &buf[..n]) {
                 Ok(w) => {
