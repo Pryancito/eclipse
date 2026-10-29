@@ -5,6 +5,7 @@ mod desktop;
 mod eclipsefs_image;
 mod hunterd;
 mod image;
+mod locales;
 mod logo;
 mod nvctl_probe;
 pub(crate) mod nvidia_firmware;
@@ -257,6 +258,10 @@ impl LinuxRootfs {
             // `LOGO=eclipse`: that field names an icon, and naming one that is
             // not there is what it said before this existed.
             logo::install(&dir, self.0.name(), self.1);
+            // After the package tap too: `/usr/bin/localedef` and the locale
+            // sources only exist once `locales` has been unpacked, and nothing
+            // ran its postinst.
+            locales::install(&dir, self.0.name());
             // LAST, and after the package tap: Ubuntu's `base-files` and
             // Alpine's `alpine-release` both carry an `/etc/os-release`, and
             // the last writer is the one the guest reads.
@@ -793,6 +798,7 @@ impl LinuxRootfs {
         self.install_busybox_init(&dir);
         self.install_eclipse_init(&dir, &musl);
         logo::install(&dir, self.0.name(), self.1);
+        locales::install(&dir, self.0.name());
         // LAST, for the same reason as on the incremental path above.
         os_release::install(&dir, self.0.name(), self.1);
     }
