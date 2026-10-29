@@ -2398,3 +2398,191 @@ pub fn config_vlan_support(
     }
     Ok(())
 }
+
+// ——— The counters, and what reading one costs ———
+
+/// `MMC_CR`: the counter control register.
+pub const MMC_CR: usize = 0x0800;
+/// `MMC_RISR`: which receive counters have raised an interrupt.
+pub const MMC_RISR: usize = 0x0804;
+/// `MMC_TISR`: the same for transmit.
+pub const MMC_TISR: usize = 0x0808;
+/// `MMC_RIER`: which receive counter interrupts are enabled.
+pub const MMC_RIER: usize = 0x080c;
+/// `MMC_TIER`: the same for transmit.
+pub const MMC_TIER: usize = 0x0810;
+
+/// `MMC_CR_CR`, index 0, width 1: reset every counter. Self-clearing.
+pub const MMC_CR_CR: (u32, u32) = (0, 1);
+/// `MMC_CR_CSR`, index 1, width 1: counter stop rollover.
+pub const MMC_CR_CSR: (u32, u32) = (1, 1);
+/// `MMC_CR_ROR`, index 2, width 1: **reset on read**.
+///
+/// With this set, reading a counter zeroes it. So a read is not an
+/// observation, it is a withdrawal: whoever reads owns the delta and nobody
+/// else will ever see it. Linux sets it and accumulates into its own shadow
+/// copy, which is the only way two readers can coexist — there is no second
+/// chance at a value somebody else already took.
+pub const MMC_CR_ROR: (u32, u32) = (2, 1);
+/// `MMC_CR_MCF`, index 3, width 1: freeze the counters.
+pub const MMC_CR_MCF: (u32, u32) = (3, 1);
+/// `MMC_CR_MCT`, index 4, width **2**: the preset/half-full mode.
+pub const MMC_CR_MCT: (u32, u32) = (4, 2);
+
+/// `MMC_RIER_ALL_INTERRUPTS`, index 0, width **23**.
+pub const MMC_RIER_ALL: (u32, u32) = (0, 23);
+/// `MMC_TIER_ALL_INTERRUPTS`, index 0, width **18**. Not the same width as
+/// the receive side: there are fewer transmit counters.
+pub const MMC_TIER_ALL: (u32, u32) = (0, 18);
+
+/// `MAC_ISR`: the MAC interrupt status.
+pub const MAC_ISR: usize = 0x00b0;
+/// `MAC_IER`: the MAC interrupt enable, written **whole**.
+pub const MAC_IER: usize = 0x00b4;
+/// `MAC_MDIOIER`: the MDIO interrupt enable.
+pub const MAC_MDIOIER: usize = 0x0218;
+
+/// `MAC_IER_TSIE`, index 12, width 1: the timestamp interrupt, the only one
+/// Linux enables in this register.
+pub const MAC_IER_TSIE: (u32, u32) = (12, 1);
+/// `MAC_ISR_LSI`, index 0, width 1: a link status *change*.
+pub const MAC_ISR_LSI: (u32, u32) = (0, 1);
+/// `MAC_ISR_SMI`, index 1, width 1.
+pub const MAC_ISR_SMI: (u32, u32) = (1, 1);
+/// `MAC_ISR_PMTIS`, index 4, width 1.
+pub const MAC_ISR_PMTIS: (u32, u32) = (4, 1);
+/// `MAC_ISR_MMCRXIS`, index 9, width 1: a receive counter wants attention.
+pub const MAC_ISR_MMCRXIS: (u32, u32) = (9, 1);
+/// `MAC_ISR_MMCTXIS`, index 10, width 1.
+pub const MAC_ISR_MMCTXIS: (u32, u32) = (10, 1);
+/// `MAC_ISR_TSIS`, index 12, width 1.
+pub const MAC_ISR_TSIS: (u32, u32) = (12, 1);
+/// `MAC_ISR_LS`, index 24, width **2**: the link status itself, which is a
+/// value and not a flag — and a different thing from [`MAC_ISR_LSI`] at the
+/// other end of the same word.
+pub const MAC_ISR_LS: (u32, u32) = (24, 2);
+/// `MAC_MDIOIER_SNGLCOMPIE`, index 12, width 1.
+pub const MAC_MDIOIER_SNGLCOMPIE: (u32, u32) = (12, 1);
+
+/// `MMC_RXRUNTERROR`. One of the six that stay 32 bits wide.
+pub const MMC_RXRUNTERROR: usize = 0x0930;
+/// `MMC_RXJABBERERROR`.
+pub const MMC_RXJABBERERROR: usize = 0x0934;
+/// `MMC_RXUNDERSIZE_G`.
+pub const MMC_RXUNDERSIZE_G: usize = 0x0938;
+/// `MMC_RXOVERSIZE_G`.
+pub const MMC_RXOVERSIZE_G: usize = 0x093c;
+/// `MMC_RXWATCHDOGERROR`.
+pub const MMC_RXWATCHDOGERROR: usize = 0x09a0;
+/// `MMC_RXALIGNMENTERROR`.
+pub const MMC_RXALIGNMENTERROR: usize = 0x09bc;
+
+/// `MMC_TXOCTETCOUNT_GB_LO`. One of the four that are 64 bits even on a
+/// 32-bit MMC.
+pub const MMC_TXOCTETCOUNT_GB_LO: usize = 0x0814;
+/// `MMC_TXOCTETCOUNT_G_LO`.
+pub const MMC_TXOCTETCOUNT_G_LO: usize = 0x0884;
+/// `MMC_RXOCTETCOUNT_GB_LO`.
+pub const MMC_RXOCTETCOUNT_GB_LO: usize = 0x0908;
+/// `MMC_RXOCTETCOUNT_G_LO`.
+pub const MMC_RXOCTETCOUNT_G_LO: usize = 0x0910;
+/// `MMC_TXFRAMECOUNT_GB_LO`, a frame counter: 64 bits on a 64-bit MMC and
+/// 32 on a 32-bit one.
+pub const MMC_TXFRAMECOUNT_GB_LO: usize = 0x081c;
+/// `MMC_RXFRAMECOUNT_GB_LO`.
+pub const MMC_RXFRAMECOUNT_GB_LO: usize = 0x0900;
+
+/// Is the counter at `reg_lo` a 64-bit one? `xgbe_mmc_read`.
+///
+/// The rule **inverts** with the variant, which is the part worth slowing
+/// down for. On a 64-bit MMC everything is 64 bits **except six** named
+/// error counters; on a 32-bit MMC everything is 32 bits **except four**
+/// named octet counters. The two lists do not overlap and neither is a
+/// subset of the other, so "the newer part counts wider" is the wrong
+/// mental model.
+///
+/// Getting it wrong costs more than a width: the high half of a 32-bit
+/// counter is the **low half of the next counter**, four bytes along. Read
+/// it and the answer is a neighbouring statistic shifted up by 32 bits —
+/// a number that is large, plausible and moves.
+#[inline]
+pub const fn mmc_counter_is_64_bit(reg_lo: usize, mmc_64bit: bool) -> bool {
+    if mmc_64bit {
+        !matches!(
+            reg_lo,
+            MMC_RXRUNTERROR
+                | MMC_RXJABBERERROR
+                | MMC_RXUNDERSIZE_G
+                | MMC_RXOVERSIZE_G
+                | MMC_RXWATCHDOGERROR
+                | MMC_RXALIGNMENTERROR
+        )
+    } else {
+        matches!(
+            reg_lo,
+            MMC_TXOCTETCOUNT_GB_LO
+                | MMC_TXOCTETCOUNT_G_LO
+                | MMC_RXOCTETCOUNT_GB_LO
+                | MMC_RXOCTETCOUNT_G_LO
+        )
+    }
+}
+
+/// Read one counter. `xgbe_mmc_read`.
+///
+/// Low half first, then the high half four bytes along if there is one. With
+/// `ROR` set this **consumes** the counter.
+pub fn mmc_read(acc: &dyn MmioAccess, reg_lo: usize, mmc_64bit: bool) -> u64 {
+    let lo = acc.read32(reg_lo) as u64;
+    if mmc_counter_is_64_bit(reg_lo, mmc_64bit) {
+        lo | ((acc.read32(reg_lo + 4) as u64) << 32)
+    } else {
+        lo
+    }
+}
+
+/// Freeze the counters so a sweep of them is consistent.
+/// The `MCF` write at the top of `xgbe_read_mmc_stats`.
+///
+/// Without it a 64-bit counter can be read **torn**: the low half from before
+/// a carry and the high half from after, which makes the value jump backwards
+/// by four billion exactly once in a while.
+pub fn freeze_mmc_counters(acc: &dyn MmioAccess, frozen: bool) {
+    write_field(
+        acc,
+        MMC_CR,
+        MMC_CR_MCF.0,
+        MMC_CR_MCF.1,
+        if frozen { 1 } else { 0 },
+    );
+}
+
+/// Set the counters to reset on read and zero them. `xgbe_config_mmc`.
+pub fn config_mmc(acc: &dyn MmioAccess) {
+    write_field(acc, MMC_CR, MMC_CR_ROR.0, MMC_CR_ROR.1, 1);
+    write_field(acc, MMC_CR, MMC_CR_CR.0, MMC_CR_CR.1, 1);
+}
+
+/// Enable the MAC's own interrupts. `xgbe_enable_mac_interrupts`.
+///
+/// `MAC_IER` is written **whole**, with only the timestamp bit set, so this
+/// also disables everything else that register can raise. That is Linux's
+/// intent and not an oversight: the link, PMT and MMC interrupts are read
+/// from `MAC_ISR` when something else wakes the driver, rather than being
+/// allowed to interrupt on their own.
+///
+/// The two counter-interrupt masks are written as `0xffff_ffff` into fields
+/// of **different widths** — 23 bits for receive and 18 for transmit — so the
+/// same constant means two different masks.
+pub fn enable_mac_interrupts(acc: &dyn MmioAccess) {
+    acc.write32(MAC_IER, 1 << MAC_IER_TSIE.0);
+    write_field(acc, MMC_RIER, MMC_RIER_ALL.0, MMC_RIER_ALL.1, u32::MAX);
+    write_field(acc, MMC_TIER, MMC_TIER_ALL.0, MMC_TIER_ALL.1, u32::MAX);
+    write_field(
+        acc,
+        MAC_MDIOIER,
+        MAC_MDIOIER_SNGLCOMPIE.0,
+        MAC_MDIOIER_SNGLCOMPIE.1,
+        1,
+    );
+}

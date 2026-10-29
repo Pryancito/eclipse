@@ -82,6 +82,18 @@ impl Variant {
     pub const fn pcs_through_smn(self) -> bool {
         matches!(self, Variant::V3)
     }
+
+    /// `mmc_64bit` in the version data. **Every** PCI variant declares it,
+    /// so the 32-bit rule is unreachable on this device; it is carried
+    /// anyway because the two rules are not a superset of each other and a
+    /// future part that clears this would otherwise read the wrong halves
+    /// in silence. See [`mmc_counter_is_64_bit`].
+    #[inline]
+    pub const fn mmc_64bit(self) -> bool {
+        match self {
+            Variant::V2a | Variant::V2b | Variant::V3 => true,
+        }
+    }
 }
 
 /// The controller generation for `device_id`, or `None` if AMD's vendor id is

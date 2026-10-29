@@ -2933,3 +2933,219 @@ fn the_three_vlan_registers_are_where_linux_says() {
     assert_eq!(MAC_VLANHTR - MAC_VLANTR, 8);
     assert_eq!(MAC_VLANIR - MAC_VLANHTR, 8);
 }
+
+// ——— Tanda 27: los contadores ———
+
+#[test]
+fn the_counter_block_is_where_linux_says() {
+    assert_eq!(MMC_CR, 0x0800);
+    assert_eq!(MMC_RISR, 0x0804);
+    assert_eq!(MMC_TISR, 0x0808);
+    assert_eq!(MMC_RIER, 0x080c);
+    assert_eq!(MMC_TIER, 0x0810);
+    // The counters themselves start right after the five control
+    // registers, which is why the first one is at 0x0814.
+    assert_eq!(MMC_TXOCTETCOUNT_GB_LO, MMC_TIER + 4);
+}
+
+#[test]
+fn reading_a_counter_is_a_withdrawal_and_not_an_observation() {
+    assert_eq!(MMC_CR_ROR, (2, 1));
+    let fake = FakeXgmac::new();
+    config_mmc(&fake);
+    let value = fake
+        .log()
+        .iter()
+        .filter_map(|a| match a {
+            Access::Write(o, v) if *o == MMC_CR => Some(*v),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(get_bits(value, MMC_CR_ROR.0, MMC_CR_ROR.1), 1);
+    // And the reset is a separate write after it, so the counters are
+    // zeroed with reset-on-read already in force.
+    assert_eq!(fake.writes_to(MMC_CR), 2);
+    assert_eq!(get_bits(value, MMC_CR_CR.0, MMC_CR_CR.1), 1);
+}
+
+#[test]
+fn the_two_rules_for_counter_width_are_not_a_superset_of_each_other() {
+    // On a 64-bit MMC, all but six. On a 32-bit MMC, only four. The
+    // two lists do not overlap.
+    for reg in [
+        MMC_RXRUNTERROR,
+        MMC_RXJABBERERROR,
+        MMC_RXUNDERSIZE_G,
+        MMC_RXOVERSIZE_G,
+        MMC_RXWATCHDOGERROR,
+        MMC_RXALIGNMENTERROR,
+    ] {
+        assert!(!mmc_counter_is_64_bit(reg, true), "{:#06x}", reg);
+        assert!(!mmc_counter_is_64_bit(reg, false), "{:#06x}", reg);
+    }
+    for reg in [
+        MMC_TXOCTETCOUNT_GB_LO,
+        MMC_TXOCTETCOUNT_G_LO,
+        MMC_RXOCTETCOUNT_GB_LO,
+        MMC_RXOCTETCOUNT_G_LO,
+    ] {
+        assert!(mmc_counter_is_64_bit(reg, true), "{:#06x}", reg);
+        assert!(mmc_counter_is_64_bit(reg, false), "{:#06x}", reg);
+    }
+    // And a frame counter, which is where the two rules disagree.
+    assert!(mmc_counter_is_64_bit(MMC_TXFRAMECOUNT_GB_LO, true));
+    assert!(!mmc_counter_is_64_bit(MMC_TXFRAMECOUNT_GB_LO, false));
+    assert!(mmc_counter_is_64_bit(MMC_RXFRAMECOUNT_GB_LO, true));
+    assert!(!mmc_counter_is_64_bit(MMC_RXFRAMECOUNT_GB_LO, false));
+}
+
+#[test]
+fn the_high_half_of_a_thirty_two_bit_counter_is_the_next_counter() {
+    // Which is why guessing the width wrong gives a number that is
+    // large, plausible and moving rather than an obvious zero.
+    assert_eq!(MMC_RXJABBERERROR, MMC_RXRUNTERROR + 4);
+    assert_eq!(MMC_RXUNDERSIZE_G, MMC_RXJABBERERROR + 4);
+    assert_eq!(MMC_RXOVERSIZE_G, MMC_RXUNDERSIZE_G + 4);
+    // Even values: the fake treats bit 0 as self-clearing on read, so
+    // an odd counter would come back one lower the second time.
+    let fake = FakeXgmac::new();
+    fake.preload(MMC_RXRUNTERROR, 8);
+    fake.preload(MMC_RXJABBERERROR, 10);
+    assert_eq!(mmc_read(&fake, MMC_RXRUNTERROR, true), 8);
+    assert_eq!(mmc_read(&fake, MMC_RXRUNTERROR, false), 8);
+    // Read as 64 bits it would have been the jabber count shifted up.
+    assert_eq!((10u64 << 32) | 8, 0x0000_000a_0000_0008);
+}
+
+#[test]
+fn a_sixty_four_bit_counter_is_read_low_half_first() {
+    let fake = FakeXgmac::new();
+    fake.preload(MMC_TXOCTETCOUNT_GB_LO, 0x1234_5678);
+    fake.preload(MMC_TXOCTETCOUNT_GB_LO + 4, 0x9abc);
+    assert_eq!(
+        mmc_read(&fake, MMC_TXOCTETCOUNT_GB_LO, true),
+        0x0000_9abc_1234_5678
+    );
+    assert_eq!(fake.log()[0], Access::Read(MMC_TXOCTETCOUNT_GB_LO));
+    assert_eq!(fake.log()[1], Access::Read(MMC_TXOCTETCOUNT_GB_LO + 4));
+    assert_eq!(fake.log().len(), 2);
+}
+
+#[test]
+fn the_freeze_is_what_keeps_a_sixty_four_bit_read_from_tearing() {
+    assert_eq!(MMC_CR_MCF, (3, 1));
+    let fake = FakeXgmac::new();
+    freeze_mmc_counters(&fake, true);
+    let frozen = fake
+        .log()
+        .iter()
+        .filter_map(|a| match a {
+            Access::Write(o, v) if *o == MMC_CR => Some(*v),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(get_bits(frozen, MMC_CR_MCF.0, MMC_CR_MCF.1), 1);
+    // It is a field write, so reset-on-read survives the freeze.
+    let fake = FakeXgmac::new();
+    fake.preload(MMC_CR, 1 << MMC_CR_ROR.0);
+    freeze_mmc_counters(&fake, true);
+    let value = fake
+        .log()
+        .iter()
+        .filter_map(|a| match a {
+            Access::Write(o, v) if *o == MMC_CR => Some(*v),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(get_bits(value, MMC_CR_ROR.0, MMC_CR_ROR.1), 1);
+}
+
+#[test]
+fn the_mode_field_is_two_bits_among_the_flags() {
+    assert_eq!(MMC_CR_MCT, (4, 2));
+    // Everything below it is a single bit, so a two-bit field at 4 is
+    // easy to read as a flag at 4 plus a reserved bit at 5.
+    for flag in [MMC_CR_CR, MMC_CR_CSR, MMC_CR_ROR, MMC_CR_MCF] {
+        assert_eq!(flag.1, 1);
+        assert!(flag.0 < MMC_CR_MCT.0);
+    }
+}
+
+#[test]
+fn the_same_constant_means_two_different_masks() {
+    // Linux writes 0xffffffff into both, into fields of different
+    // widths: 23 bits of receive counters and 18 of transmit.
+    assert_eq!(MMC_RIER_ALL, (0, 23));
+    assert_eq!(MMC_TIER_ALL, (0, 18));
+    let fake = FakeXgmac::new();
+    enable_mac_interrupts(&fake);
+    let mask = |off: usize, width: u32| {
+        fake.log()
+            .iter()
+            .filter_map(|a| match a {
+                Access::Write(o, v) if *o == off => Some(get_bits(*v, 0, width)),
+                _ => None,
+            })
+            .next_back()
+            .unwrap()
+    };
+    assert_eq!(mask(MMC_RIER, MMC_RIER_ALL.1), (1 << 23) - 1);
+    assert_eq!(mask(MMC_TIER, MMC_TIER_ALL.1), (1 << 18) - 1);
+    assert_ne!((1u32 << 23) - 1, (1u32 << 18) - 1);
+}
+
+#[test]
+fn the_mac_enable_register_is_written_whole_and_that_disables_the_rest() {
+    let fake = FakeXgmac::new();
+    fake.preload(MAC_IER, 0xffff_fffe);
+    enable_mac_interrupts(&fake);
+    // No read: it is a whole-register store.
+    assert_eq!(fake.reads_of(MAC_IER), 0);
+    assert_eq!(fake.log()[0], Access::Write(MAC_IER, 1 << MAC_IER_TSIE.0));
+    // Only the timestamp bit survives, on purpose: everything else in
+    // this register is read from `MAC_ISR` instead of interrupting.
+    assert_eq!(MAC_IER_TSIE, (12, 1));
+    assert_eq!(MAC_ISR_TSIS.0, MAC_IER_TSIE.0);
+}
+
+#[test]
+fn the_link_status_and_the_link_status_change_are_different_things() {
+    // `LSI` at bit 0 says it changed; `LS` at 24 is a two-bit value
+    // saying what it changed to. Same word, opposite ends.
+    assert_eq!(MAC_ISR_LSI, (0, 1));
+    assert_eq!(MAC_ISR_LS, (24, 2));
+    assert_ne!(MAC_ISR_LS.1, 1);
+    // And none of the status bits collide.
+    let bits = [
+        MAC_ISR_LSI,
+        MAC_ISR_SMI,
+        MAC_ISR_PMTIS,
+        MAC_ISR_MMCRXIS,
+        MAC_ISR_MMCTXIS,
+        MAC_ISR_TSIS,
+        MAC_ISR_LS,
+    ];
+    for (i, a) in bits.iter().enumerate() {
+        for b in &bits[i + 1..] {
+            let mask_a = get_bits(u32::MAX, a.0, a.1) << a.0;
+            let mask_b = get_bits(u32::MAX, b.0, b.1) << b.0;
+            assert_eq!(mask_a & mask_b, 0, "{:?} vs {:?}", a, b);
+        }
+    }
+}
+
+#[test]
+fn every_pci_variant_counts_wide() {
+    // So the 32-bit rule is unreachable on this device. It is carried
+    // because the two rules are not a superset of each other.
+    for variant in [Variant::V2a, Variant::V2b, Variant::V3] {
+        assert!(variant.mmc_64bit(), "{:?}", variant);
+    }
+    assert!(mmc_counter_is_64_bit(
+        MMC_TXFRAMECOUNT_GB_LO,
+        Variant::V2a.mmc_64bit()
+    ));
+}
