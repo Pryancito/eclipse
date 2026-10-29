@@ -3540,6 +3540,197 @@ pub fn config_dma_cache(acc: &dyn MmioAccess, arcr: u32, awcr: u32, awarcr: u32)
     }
 }
 
+// ——— Spreading received frames over the channels ———
+
+/// `MAC_RSSCR`: the RSS control register.
+pub const MAC_RSSCR: usize = 0x0c80;
+/// `MAC_RSSAR`: the address register of the indirect window.
+pub const MAC_RSSAR: usize = 0x0c88;
+/// `MAC_RSSDR`: the data register of the indirect window.
+pub const MAC_RSSDR: usize = 0x0c8c;
+
+/// `MAC_RSSCR_RSSE`, index 0, width 1: RSS enable.
+pub const MAC_RSSCR_RSSE: (u32, u32) = (0, 1);
+/// `MAC_RSSCR_IP2TE`, index 1, width 1: hash over IPv4/IPv6 addresses.
+pub const MAC_RSSCR_IP2TE: (u32, u32) = (1, 1);
+/// `MAC_RSSCR_TCP4TE`, index 2, width 1: hash over the TCP ports too.
+pub const MAC_RSSCR_TCP4TE: (u32, u32) = (2, 1);
+/// `MAC_RSSCR_UDP4TE`, index 3, width 1: hash over the UDP ports too.
+pub const MAC_RSSCR_UDP4TE: (u32, u32) = (3, 1);
+
+/// `MAC_RSSAR_OB`, index 0, width 1: operation busy. Set to start, and the
+/// chip clears it when done.
+pub const MAC_RSSAR_OB: (u32, u32) = (0, 1);
+/// `MAC_RSSAR_CT`, index 1, width 1: 0 writes, 1 reads. Linux writes the 0
+/// explicitly every time rather than relying on what was there.
+pub const MAC_RSSAR_CT: (u32, u32) = (1, 1);
+/// `MAC_RSSAR_ADDRT`, index 2, width 1: which table the index refers to.
+pub const MAC_RSSAR_ADDRT: (u32, u32) = (2, 1);
+/// `MAC_RSSAR_RSSIA`, index 8, width 8: the index within that table.
+pub const MAC_RSSAR_RSSIA: (u32, u32) = (8, 8);
+
+/// `MAC_RSSDR_DMCH`, index 0, width 4: for a lookup-table write, the only
+/// part of the data register that means anything — the DMA channel the
+/// bucket goes to. For a hash-key write the whole 32 bits are data.
+pub const MAC_RSSDR_DMCH: (u32, u32) = (0, 4);
+
+/// `XGBE_RSS_LOOKUP_TABLE_TYPE`.
+pub const RSS_LOOKUP_TABLE_TYPE: u32 = 0;
+/// `XGBE_RSS_HASH_KEY_TYPE`.
+pub const RSS_HASH_KEY_TYPE: u32 = 1;
+/// `XGBE_RSS_HASH_KEY_SIZE`: 40 bytes, so ten 32-bit registers.
+pub const RSS_HASH_KEY_SIZE: usize = 40;
+/// `XGBE_RSS_MAX_TABLE_SIZE`: exactly as many buckets as [`MAC_RSSAR_RSSIA`]
+/// can address.
+pub const RSS_MAX_TABLE_SIZE: usize = 256;
+
+/// One write through the indirect window. `xgbe_write_rss_reg`.
+///
+/// The order matters and is not obvious: the **data** register goes out
+/// first, then the address fields, and `OB` **last** — setting `OB` is what
+/// hands the whole thing to the chip, so anything written after it is a race.
+///
+/// The pre-check is Linux's too: if `OB` is already set the call fails
+/// immediately instead of waiting, because a busy window means someone else
+/// is mid-write and the data register is not ours to touch.
+pub fn write_rss_reg(
+    acc: &dyn MmioAccess,
+    table: u32,
+    index: u32,
+    value: u32,
+    poll: &mut dyn FnMut() -> bool,
+) -> DeviceResult<()> {
+    if index >= (1 << MAC_RSSAR_RSSIA.1) {
+        return Err(DeviceError::InvalidParam);
+    }
+    if get_bits(acc.read32(MAC_RSSAR), MAC_RSSAR_OB.0, MAC_RSSAR_OB.1) != 0 {
+        return Err(DeviceError::NotReady);
+    }
+
+    acc.write32(MAC_RSSDR, value);
+
+    write_field(acc, MAC_RSSAR, MAC_RSSAR_RSSIA.0, MAC_RSSAR_RSSIA.1, index);
+    write_field(acc, MAC_RSSAR, MAC_RSSAR_ADDRT.0, MAC_RSSAR_ADDRT.1, table);
+    write_field(acc, MAC_RSSAR, MAC_RSSAR_CT.0, MAC_RSSAR_CT.1, 0);
+    write_field(acc, MAC_RSSAR, MAC_RSSAR_OB.0, MAC_RSSAR_OB.1, 1);
+
+    while poll() {
+        if get_bits(acc.read32(MAC_RSSAR), MAC_RSSAR_OB.0, MAC_RSSAR_OB.1) == 0 {
+            return Ok(());
+        }
+    }
+    Err(DeviceError::NotReady)
+}
+
+/// Write the hash key. `xgbe_write_rss_hash_key`.
+///
+/// The index counts **down** while the key counts **up**: Linux's loop is
+/// `while (key_regs--)` over `*key++`, so register 9 gets the first word of
+/// the key and register 0 gets the last. Reading it as "write word *i* to
+/// register *i*" gives a key the chip accepts, a hash that is stable, and a
+/// spread that is not the one anybody configured — there is no error for it
+/// anywhere.
+pub fn write_rss_hash_key(
+    acc: &dyn MmioAccess,
+    key: &[u32],
+    poll: &mut dyn FnMut() -> bool,
+) -> DeviceResult<()> {
+    if key.len() * 4 != RSS_HASH_KEY_SIZE {
+        return Err(DeviceError::InvalidParam);
+    }
+    for (word, value) in key.iter().enumerate() {
+        let index = (key.len() - 1 - word) as u32;
+        write_rss_reg(acc, RSS_HASH_KEY_TYPE, index, *value, poll)?;
+    }
+    Ok(())
+}
+
+/// Write the bucket-to-channel table. `xgbe_write_rss_lookup_table`.
+///
+/// Here the index counts up with the data, unlike the key. Only the bottom
+/// four bits of each entry reach the chip ([`MAC_RSSDR_DMCH`]), so a channel
+/// number above 15 would be truncated rather than refused — it is refused
+/// here.
+pub fn write_rss_lookup_table(
+    acc: &dyn MmioAccess,
+    table: &[u32],
+    poll: &mut dyn FnMut() -> bool,
+) -> DeviceResult<()> {
+    if table.is_empty() || table.len() > RSS_MAX_TABLE_SIZE {
+        return Err(DeviceError::InvalidParam);
+    }
+    for (index, channel) in table.iter().enumerate() {
+        if *channel >= (1 << MAC_RSSDR_DMCH.1) {
+            return Err(DeviceError::InvalidParam);
+        }
+        write_rss_reg(acc, RSS_LOOKUP_TABLE_TYPE, index as u32, *channel, poll)?;
+    }
+    Ok(())
+}
+
+/// What the hash covers. `pdata->rss_options`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RssOptions {
+    /// Hash over the IP addresses.
+    pub ip: bool,
+    /// Also hash over the TCP ports.
+    pub tcp4: bool,
+    /// Also hash over the UDP ports.
+    pub udp4: bool,
+}
+
+impl RssOptions {
+    /// The `MAC_RSSCR` value these options make, with `RSSE` still clear.
+    #[inline]
+    pub const fn to_reg(self) -> u32 {
+        let mut value = 0;
+        if self.ip {
+            value |= 1 << MAC_RSSCR_IP2TE.0;
+        }
+        if self.tcp4 {
+            value |= 1 << MAC_RSSCR_TCP4TE.0;
+        }
+        if self.udp4 {
+            value |= 1 << MAC_RSSCR_UDP4TE.0;
+        }
+        value
+    }
+}
+
+/// Turn RSS on: key, table, options, then the enable. `xgbe_enable_rss`.
+///
+/// The options go out as a **whole-register** write, which is also what
+/// clears `RSSE`; the enable is then a separate field write on top. Folding
+/// the two into one store would work, and would lose the moment where the
+/// chip has the new options and is not yet hashing with them.
+pub fn enable_rss(
+    acc: &dyn MmioAccess,
+    has_rss: bool,
+    key: &[u32],
+    table: &[u32],
+    options: RssOptions,
+    poll: &mut dyn FnMut() -> bool,
+) -> DeviceResult<()> {
+    if !has_rss {
+        return Err(DeviceError::NotSupported);
+    }
+    write_rss_hash_key(acc, key, poll)?;
+    write_rss_lookup_table(acc, table, poll)?;
+    acc.write32(MAC_RSSCR, options.to_reg());
+    write_field(acc, MAC_RSSCR, MAC_RSSCR_RSSE.0, MAC_RSSCR_RSSE.1, 1);
+    Ok(())
+}
+
+/// Turn RSS off, leaving the key and the table where they are.
+/// `xgbe_disable_rss`.
+pub fn disable_rss(acc: &dyn MmioAccess, has_rss: bool) -> DeviceResult<()> {
+    if !has_rss {
+        return Err(DeviceError::NotSupported);
+    }
+    write_field(acc, MAC_RSSCR, MAC_RSSCR_RSSE.0, MAC_RSSCR_RSSE.1, 0);
+    Ok(())
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.

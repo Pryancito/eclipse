@@ -2419,3 +2419,259 @@ fn the_three_attribute_sets_are_three_buses_and_not_three_defaults() {
     assert!(DMA_AXIARCR > DMA_SBMR);
     assert!(DMA_AXIAWARCR < DMA_CH_BASE);
 }
+
+// ——— Tanda 25: repartir las tramas entre los canales ———
+
+fn forever(n: &core::cell::Cell<u32>) -> impl FnMut() -> bool + '_ {
+    move || {
+        n.set(n.get() + 1);
+        n.get() < 100
+    }
+}
+
+#[test]
+fn the_indirect_window_is_three_registers_and_the_order_is_load_bearing() {
+    assert_eq!(MAC_RSSCR, 0x0c80);
+    assert_eq!(MAC_RSSAR, 0x0c88);
+    assert_eq!(MAC_RSSDR, 0x0c8c);
+    let fake = FakeXgmac::new();
+    let n = core::cell::Cell::new(0);
+    write_rss_reg(&fake, RSS_HASH_KEY_TYPE, 3, 0xdead_beef, &mut forever(&n)).unwrap();
+    let log = fake.log();
+    // The pre-check read comes first, then the data, and only then the
+    // address fields.
+    assert_eq!(log[0], Access::Read(MAC_RSSAR));
+    assert_eq!(log[1], Access::Write(MAC_RSSDR, 0xdead_beef));
+    // And `OB` is the last thing written: anything after it is a race
+    // with a chip that has already been handed the operation.
+    let last_write = log
+        .iter()
+        .rev()
+        .find_map(|a| match a {
+            Access::Write(o, v) => Some((*o, *v)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(last_write.0, MAC_RSSAR);
+    assert_eq!(get_bits(last_write.1, MAC_RSSAR_OB.0, MAC_RSSAR_OB.1), 1);
+}
+
+#[test]
+fn a_window_that_is_already_busy_is_refused_and_not_waited_on() {
+    // Someone else is mid-write, so the data register is not ours.
+    let fake = FakeXgmac::new();
+    fake.preload(MAC_RSSAR, 1);
+    fake.stick_bit0(MAC_RSSAR);
+    let n = core::cell::Cell::new(0);
+    assert!(write_rss_reg(&fake, RSS_HASH_KEY_TYPE, 0, 1, &mut forever(&n)).is_err());
+    // One read, nothing written, and the poll was never entered.
+    assert_eq!(fake.writes_to(MAC_RSSDR), 0);
+    assert_eq!(n.get(), 0);
+}
+
+#[test]
+fn a_window_that_never_clears_times_out_instead_of_spinning() {
+    let fake = FakeXgmac::new();
+    fake.stick_bit0(MAC_RSSAR);
+    let n = core::cell::Cell::new(0);
+    // Not busy to begin with, so the operation goes out; `OB` then
+    // never clears and the poll runs out instead of spinning forever.
+    assert!(write_rss_reg(&fake, RSS_LOOKUP_TABLE_TYPE, 0, 0, &mut forever(&n)).is_err());
+    assert_eq!(fake.writes_to(MAC_RSSDR), 1);
+    assert_eq!(n.get(), 100);
+}
+
+#[test]
+fn the_index_fills_its_field_exactly_and_nothing_beyond() {
+    // 256 buckets, an eight-bit index: the table is exactly as big as
+    // the field can address, with no room to grow.
+    assert_eq!(MAC_RSSAR_RSSIA, (8, 8));
+    assert_eq!(RSS_MAX_TABLE_SIZE, 1 << MAC_RSSAR_RSSIA.1);
+    let fake = FakeXgmac::new();
+    let n = core::cell::Cell::new(0);
+    assert!(write_rss_reg(&fake, RSS_LOOKUP_TABLE_TYPE, 256, 0, &mut forever(&n)).is_err());
+    assert!(fake.log().is_empty());
+}
+
+#[test]
+fn the_key_index_counts_down_while_the_key_counts_up() {
+    // The trap. Linux's loop is `while (key_regs--)` over `*key++`, so
+    // register 9 gets the first word and register 0 the last.
+    let fake = FakeXgmac::new();
+    let n = core::cell::Cell::new(0);
+    let key: [u32; 10] = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+    write_rss_hash_key(&fake, &key, &mut forever(&n)).unwrap();
+    // Pair each data write with the index written just after it.
+    let log = fake.log();
+    let mut pairs = Vec::new();
+    for (i, access) in log.iter().enumerate() {
+        if let Access::Write(MAC_RSSDR, value) = access {
+            // The next write to MAC_RSSAR carries the index.
+            let index = log[i + 1..]
+                .iter()
+                .find_map(|a| match a {
+                    Access::Write(o, v) if *o == MAC_RSSAR => {
+                        Some(get_bits(*v, MAC_RSSAR_RSSIA.0, MAC_RSSAR_RSSIA.1))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            pairs.push((index, *value));
+        }
+    }
+    assert_eq!(pairs.len(), 10);
+    assert_eq!(pairs[0], (9, 10));
+    assert_eq!(pairs[9], (0, 19));
+    // Written the obvious way round, the chip would take the key, hash
+    // happily, and spread the traffic some other way than configured.
+    for (index, value) in &pairs {
+        assert_ne!((*index, *value), (0, 10));
+    }
+}
+
+#[test]
+fn a_key_of_the_wrong_length_is_refused() {
+    assert_eq!(RSS_HASH_KEY_SIZE, 40);
+    let fake = FakeXgmac::new();
+    let n = core::cell::Cell::new(0);
+    assert!(write_rss_hash_key(&fake, &[0u32; 9], &mut forever(&n)).is_err());
+    assert!(write_rss_hash_key(&fake, &[0u32; 11], &mut forever(&n)).is_err());
+    assert!(fake.log().is_empty());
+}
+
+#[test]
+fn the_lookup_table_index_counts_up_with_its_data() {
+    // Unlike the key: the two loops in Linux really do go opposite ways.
+    let fake = FakeXgmac::new();
+    let n = core::cell::Cell::new(0);
+    write_rss_lookup_table(&fake, &[3, 1, 2], &mut forever(&n)).unwrap();
+    let log = fake.log();
+    let first_data = log
+        .iter()
+        .find_map(|a| match a {
+            Access::Write(MAC_RSSDR, v) => Some(*v),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(first_data, 3);
+    let first_index = log
+        .iter()
+        .find_map(|a| match a {
+            Access::Write(o, v) if *o == MAC_RSSAR => {
+                Some(get_bits(*v, MAC_RSSAR_RSSIA.0, MAC_RSSAR_RSSIA.1))
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(first_index, 0);
+}
+
+#[test]
+fn a_channel_too_big_for_the_data_field_is_refused_not_truncated() {
+    // Only four bits of the data register reach the chip for a lookup
+    // entry, so channel 16 would arrive as channel 0.
+    assert_eq!(MAC_RSSDR_DMCH, (0, 4));
+    assert_eq!(get_bits(16, MAC_RSSDR_DMCH.0, MAC_RSSDR_DMCH.1), 0);
+    let fake = FakeXgmac::new();
+    let n = core::cell::Cell::new(0);
+    assert!(write_rss_lookup_table(&fake, &[16], &mut forever(&n)).is_err());
+    assert!(write_rss_lookup_table(&fake, &[], &mut forever(&n)).is_err());
+    assert!(write_rss_lookup_table(&fake, &[0u32; 257], &mut forever(&n)).is_err());
+}
+
+#[test]
+fn the_two_tables_are_told_apart_by_one_bit_and_share_the_index() {
+    assert_eq!(RSS_LOOKUP_TABLE_TYPE, 0);
+    assert_eq!(RSS_HASH_KEY_TYPE, 1);
+    assert_eq!(MAC_RSSAR_ADDRT, (2, 1));
+    // Index 0 of the key and index 0 of the table are different places,
+    // and nothing but `ADDRT` says which.
+    let fake = FakeXgmac::new();
+    let n = core::cell::Cell::new(0);
+    write_rss_reg(&fake, RSS_HASH_KEY_TYPE, 0, 7, &mut forever(&n)).unwrap();
+    let addrt = fake
+        .log()
+        .iter()
+        .filter_map(|a| match a {
+            Access::Write(o, v) if *o == MAC_RSSAR => {
+                Some(get_bits(*v, MAC_RSSAR_ADDRT.0, MAC_RSSAR_ADDRT.1))
+            }
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(addrt, 1);
+}
+
+#[test]
+fn the_options_and_the_enable_are_two_writes_on_purpose() {
+    let options = RssOptions {
+        ip: true,
+        tcp4: true,
+        udp4: false,
+    };
+    assert_eq!(options.to_reg(), (1 << 1) | (1 << 2));
+    // `RSSE` is not in the options value, so the whole-register write
+    // leaves hashing off, and the field write turns it on afterwards.
+    assert_eq!(
+        get_bits(options.to_reg(), MAC_RSSCR_RSSE.0, MAC_RSSCR_RSSE.1),
+        0
+    );
+    let fake = FakeXgmac::new();
+    let n = core::cell::Cell::new(0);
+    enable_rss(&fake, true, &[0u32; 10], &[0, 1], options, &mut forever(&n)).unwrap();
+    assert_eq!(fake.writes_to(MAC_RSSCR), 2);
+    let last = fake
+        .log()
+        .iter()
+        .filter_map(|a| match a {
+            Access::Write(o, v) if *o == MAC_RSSCR => Some(*v),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(get_bits(last, MAC_RSSCR_RSSE.0, MAC_RSSCR_RSSE.1), 1);
+    assert_eq!(get_bits(last, MAC_RSSCR_IP2TE.0, MAC_RSSCR_IP2TE.1), 1);
+}
+
+#[test]
+fn a_chip_without_rss_is_refused_in_both_directions() {
+    let fake = FakeXgmac::new();
+    let n = core::cell::Cell::new(0);
+    assert!(enable_rss(
+        &fake,
+        false,
+        &[0u32; 10],
+        &[0],
+        RssOptions::default(),
+        &mut forever(&n)
+    )
+    .is_err());
+    assert!(disable_rss(&fake, false).is_err());
+    // And nothing was written on the way to finding out.
+    assert!(fake.log().is_empty());
+}
+
+#[test]
+fn turning_rss_off_leaves_the_key_and_the_table_alone() {
+    let fake = FakeXgmac::new();
+    fake.preload(
+        MAC_RSSCR,
+        (1 << MAC_RSSCR_RSSE.0) | (1 << MAC_RSSCR_IP2TE.0),
+    );
+    disable_rss(&fake, true).unwrap();
+    assert_eq!(fake.writes_to(MAC_RSSDR), 0);
+    assert_eq!(fake.writes_to(MAC_RSSAR), 0);
+    let value = fake
+        .log()
+        .iter()
+        .filter_map(|a| match a {
+            Access::Write(o, v) if *o == MAC_RSSCR => Some(*v),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(get_bits(value, MAC_RSSCR_RSSE.0, MAC_RSSCR_RSSE.1), 0);
+    // The options survive, so turning it back on needs no reprogramming.
+    assert_eq!(get_bits(value, MAC_RSSCR_IP2TE.0, MAC_RSSCR_IP2TE.1), 1);
+}
