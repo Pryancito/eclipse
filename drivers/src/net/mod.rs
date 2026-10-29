@@ -7,6 +7,7 @@ use smoltcp::socket::SocketSet;
 
 pub mod e1000;
 pub mod e1000e;
+pub mod ether_hash;
 pub mod ip_cfg;
 // pub mod ixgbe;
 pub mod loopback;

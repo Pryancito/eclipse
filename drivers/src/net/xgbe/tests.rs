@@ -3447,3 +3447,223 @@ fn a_class_above_the_queue_count_is_refused() {
     assert!(fake.log().is_empty());
     assert!(config_tc_weights(&fake, 4, 4).is_ok());
 }
+
+// ——— Tanda 18: deciding which frames to keep ———
+
+#[test]
+fn the_hash_shift_is_a_log2_in_disguise() {
+    // 26 - (size >> 7). Six index bits for 64 buckets, seven for 128, eight
+    // for 256.
+    assert_eq!(hash_table_shift(64), 26);
+    assert_eq!(hash_table_shift(128), 25);
+    assert_eq!(hash_table_shift(256), 24);
+    for size in [64u32, 128, 256] {
+        let bits = 32 - hash_table_shift(size);
+        assert_eq!(1u32 << bits, size, "{} buckets", size);
+    }
+}
+
+#[test]
+fn hard_coding_the_largest_shift_would_fold_a_small_table() {
+    // The index must stay inside the table it is indexing.
+    for size in [64u32, 128, 256] {
+        for crc in [0u32, 1, 0x1234_5678, 0xffff_ffff, 0xaaaa_aaaa] {
+            let index = hash_index(crc, size);
+            assert!(index < size, "{} buckets, crc {:#x}: {}", size, crc, index);
+        }
+    }
+    // A 24-bit shift on a 64-bucket table gives indices up to 255, three
+    // quarters of which fall off the end.
+    let big = (!0x1234_5678u32).reverse_bits() >> 24;
+    assert!(
+        big >= 64,
+        "this test needs a crc that overflows a small table"
+    );
+}
+
+#[test]
+fn the_three_steps_of_the_index_are_each_load_bearing() {
+    let crc = 0x1234_5678u32;
+    let size = 256;
+    let right = hash_index(crc, size);
+    // Without the complement.
+    let no_complement = crc.reverse_bits() >> hash_table_shift(size);
+    assert_ne!(right, no_complement);
+    // Without the reversal: still a number, still in range, still wrong.
+    let no_reversal = (!crc) >> hash_table_shift(size);
+    assert!(no_reversal < size);
+    assert_ne!(right, no_reversal);
+}
+
+#[test]
+fn the_reversal_keeps_the_bits_that_came_in_at_the_bottom() {
+    // Shifting a reversed word right keeps its top bits, which are the
+    // BOTTOM bits of what came in. A low bit of the CRC therefore moves the
+    // bucket, which is the whole point of a hash.
+    let a = hash_index(0xffff_ff00, 256);
+    let b = hash_index(0xffff_ff01, 256);
+    assert_ne!(a, b, "the lowest crc bit did not reach the index");
+}
+
+#[test]
+fn a_bucket_is_a_word_and_a_bit_within_it() {
+    assert_eq!(hash_bucket(0), (0, 0));
+    assert_eq!(hash_bucket(31), (0, 31));
+    assert_eq!(hash_bucket(32), (1, 0));
+    assert_eq!(hash_bucket(255), (7, 31));
+    assert_eq!(hash_table_words(256), 8);
+    assert_eq!(hash_table_words(64), 2);
+}
+
+#[test]
+fn adding_an_address_sets_exactly_one_bit() {
+    let mut table = [0u32; 8];
+    let addr = [0x01u8, 0x00, 0x5e, 0x00, 0x00, 0x01];
+    hash_table_add(&mut table, &addr, 256);
+    assert_eq!(table.iter().map(|w| w.count_ones()).sum::<u32>(), 1);
+    // The same address again changes nothing.
+    hash_table_add(&mut table, &addr, 256);
+    assert_eq!(table.iter().map(|w| w.count_ones()).sum::<u32>(), 1);
+}
+
+#[test]
+fn the_shift_formula_and_the_shared_one_pick_the_same_bucket() {
+    // `26 - (size >> 7)` here and `32 - log2(size)` there are the same
+    // arithmetic written two ways, and the whole hash filter rests on it.
+    use crate::net::ether_hash::{ether_crc32, hash_bucket_of};
+    for addr in [
+        [0x01u8, 0x00, 0x5e, 0x12, 0x34, 0x56],
+        [0x33, 0x33, 0xff, 0x00, 0x00, 0x02],
+    ] {
+        for size in [64u32, 128, 256] {
+            // The crate's value has the complement already applied, so what
+            // goes into the Linux-shaped function is its complement back.
+            let crc_le = !ether_crc32(&addr);
+            assert_eq!(
+                hash_index(crc_le, size),
+                hash_bucket_of(&addr, size),
+                "address {:02x?}, {} buckets",
+                addr,
+                size
+            );
+        }
+    }
+}
+
+#[test]
+fn only_as_many_words_as_the_table_has_are_written() {
+    let fake = FakeXgmac::new();
+    let table = [0xdead_beefu32; 8];
+    config_hash_table(&fake, &table, 64);
+    let log = fake.log();
+    // A 64-bucket table is two words. Writing eight would scribble on the
+    // registers after it.
+    assert_eq!(log.len(), 2, "{:?}", log);
+    assert_eq!(log[0], Access::Write(MAC_HTR0, 0xdead_beef));
+    assert_eq!(log[1], Access::Write(MAC_HTR0 + MAC_HTR_INC, 0xdead_beef));
+}
+
+#[test]
+fn the_address_slots_are_eight_bytes_apart_and_start_after_the_station() {
+    // Slot zero here is MACA1, not MACA0: the station address of batch seven
+    // is not one of the additional slots.
+    assert_eq!(mac_addr_slot(0), (MAC_MACA1HR, MAC_MACA1HR + 4));
+    assert_eq!(mac_addr_slot(1), (MAC_MACA1HR + 8, MAC_MACA1HR + 12));
+    assert_ne!(mac_addr_slot(0).0, MAC_MACA0HR);
+}
+
+#[test]
+fn a_slot_is_armed_only_once_the_whole_address_is_in_it() {
+    let fake = FakeXgmac::new();
+    config_mac_addr_slot(&fake, 0, Some([1, 2, 3, 4, 5, 6]));
+    let log = fake.log();
+    assert_eq!(log.len(), 2);
+    // Low half first: the enable bit lives in the high half, so writing
+    // that first would arm a slot still holding half of the old address.
+    assert_eq!(log[0], Access::Write(MAC_MACA1HR + 4, 0x0403_0201));
+    match log[1] {
+        Access::Write(reg, value) => {
+            assert_eq!(reg, MAC_MACA1HR);
+            assert_eq!(value & 0xffff, 0x0605);
+            assert_ne!(value & (1 << MAC_MACA1HR_AE.0), 0, "not armed");
+        }
+        ref other => panic!("not a write: {:?}", other),
+    }
+}
+
+#[test]
+fn clearing_a_slot_disarms_it_before_wiping_it() {
+    let fake = FakeXgmac::new();
+    config_mac_addr_slot(&fake, 1, None);
+    let log = fake.log();
+    assert_eq!(log.len(), 2);
+    // High half first this time: the opposite order, for the opposite
+    // reason.
+    assert_eq!(log[0], Access::Write(MAC_MACA1HR + 8, 0));
+    assert_eq!(log[1], Access::Write(MAC_MACA1HR + 12, 0));
+}
+
+#[test]
+fn the_hash_pass_bit_rides_either_hash() {
+    let fake = FakeXgmac::new();
+    for (mc, uc) in [(true, false), (false, true), (true, true)] {
+        let filter = RxFilter {
+            hash_multicast: mc,
+            hash_unicast: uc,
+            ..RxFilter::default()
+        };
+        config_rx_filter(&fake, &filter);
+        let word = fake.read32(MAC_PFR);
+        assert_ne!(
+            get_bits(word, MAC_PFR_HPF.0, MAC_PFR_HPF.1),
+            0,
+            "{} {}",
+            mc,
+            uc
+        );
+    }
+    // Without it, the exact-match slots stop mattering the moment the hash
+    // is on, and the station address would be filtered out by a hash it does
+    // not land in.
+    config_rx_filter(&fake, &RxFilter::default());
+    assert_eq!(
+        get_bits(fake.read32(MAC_PFR), MAC_PFR_HPF.0, MAC_PFR_HPF.1),
+        0
+    );
+}
+
+#[test]
+fn the_filter_register_is_written_whole() {
+    let fake = FakeXgmac::new();
+    fake.preload(MAC_PFR, 0xffff_ffff);
+    config_rx_filter(&fake, &RxFilter::default());
+    // Every bit the driver knows about comes out zero, and so does
+    // everything it does not: this register has no other tenants, and a
+    // merge would keep a filter from the previous configuration.
+    assert_eq!(fake.read32(MAC_PFR), 0);
+}
+
+#[test]
+fn promiscuous_and_all_multicast_are_different_bits() {
+    let fake = FakeXgmac::new();
+    config_rx_filter(
+        &fake,
+        &RxFilter {
+            promiscuous: true,
+            ..RxFilter::default()
+        },
+    );
+    let word = fake.read32(MAC_PFR);
+    assert_eq!(get_bits(word, MAC_PFR_PR.0, MAC_PFR_PR.1), 1);
+    assert_eq!(get_bits(word, MAC_PFR_PM.0, MAC_PFR_PM.1), 0);
+    config_rx_filter(
+        &fake,
+        &RxFilter {
+            all_multicast: true,
+            ..RxFilter::default()
+        },
+    );
+    let word = fake.read32(MAC_PFR);
+    assert_eq!(get_bits(word, MAC_PFR_PR.0, MAC_PFR_PR.1), 0);
+    assert_eq!(get_bits(word, MAC_PFR_PM.0, MAC_PFR_PM.1), 1);
+}
