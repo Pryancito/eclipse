@@ -27,6 +27,10 @@
 //! - **Red** — every network socket with the program that holds it, and the
 //!   ports that started listening without anyone saying they would, each with
 //!   a button that allows it (`net_tab.rs`).
+//! - **Cortafuegos** — the per-application firewall: "¿Permitir que X se
+//!   conecte a la red?" for every program hunter has no rule for, the rules
+//!   already given (and forgetting them), and the firewall's mode. Each answer
+//!   goes to the kernel at once and is saved to `/etc/hunter/firewall`.
 //!
 //! The Resumen tab's "Exportar informe" writes the security report
 //! (`hunter_export`) as HTML into `$HOME`; `--export` writes it from the
@@ -60,6 +64,7 @@ use lunarbar::hunter::{self, MediaState, Mode, SendError, Shield, DOMAINS};
 use lunarbar::hunter_export::{self as export, civil_time};
 use lunarbar::hunter_media as media;
 use lunarbar::hunter_net::{self as net, NetTable};
+use lunarbar::hunter_firewall::{self as fw, Dir, Firewall};
 use lunarbar::hunter_report::{
     self as report, Feed, Quarantined, Report, Severity, SigFile, Switch,
 };
@@ -206,10 +211,11 @@ enum Tab {
     Programs,
     Schedule,
     Network,
+    Firewall,
 }
 
 impl Tab {
-    const ALL: [Tab; 9] = [
+    const ALL: [Tab; 10] = [
         Tab::Overview,
         Tab::Protection,
         Tab::Events,
@@ -219,6 +225,7 @@ impl Tab {
         Tab::Programs,
         Tab::Schedule,
         Tab::Network,
+        Tab::Firewall,
     ];
 
     fn label(self, lang: Lang) -> &'static str {
@@ -232,6 +239,7 @@ impl Tab {
             Tab::Programs => ("Programas", "Programs"),
             Tab::Schedule => ("Programados", "Scheduled"),
             Tab::Network => ("Red", "Network"),
+            Tab::Firewall => ("Cortafuegos", "Firewall"),
         };
         tr(lang, es, en)
     }
@@ -249,6 +257,7 @@ impl Tab {
             "programas" | "programs" | "7" => Tab::Programs,
             "programados" | "scheduled" | "schedule" | "8" => Tab::Schedule,
             "red" | "network" | "net" | "9" => Tab::Network,
+            "cortafuegos" | "firewall" | "10" => Tab::Firewall,
             _ => return None,
         })
     }
@@ -308,6 +317,14 @@ enum Act {
     /// Take back the `n`th expected-port rule.
     ForgetRule(usize),
     NetAlerts(bool),
+    /// The firewall's mode.
+    NetMode(Mode),
+    /// Answer question `i`: allow (true) or deny.
+    NetAnswer(usize, bool),
+    /// Drop question `i` without deciding.
+    NetDismiss(usize),
+    /// Drop rule `i`'s program's rules: it is asked about again.
+    NetForget(usize),
 }
 
 impl Act {
@@ -632,6 +649,8 @@ struct State {
     sig_files: Vec<SigFile>,
     feeds: Vec<Feed>,
     pins: usize,
+    /// `/proc/hunter_firewall`; `None` on a kernel without the firewall.
+    firewall: Option<Firewall>,
     targets: Vec<Target>,
     target: usize,
     auto_q: bool,
@@ -698,6 +717,7 @@ impl State {
             sig_files: Vec::new(),
             feeds: Vec::new(),
             pins: 0,
+            firewall: None,
             targets,
             target,
             auto_q: false,
@@ -724,15 +744,21 @@ impl State {
         tr(self.lang, es, en)
     }
 
-    /// Re-read the report, and the network table when its tab is open (a
-    /// read of it is a fresh walk of every process's sockets: not something
-    /// to do every two seconds for a tab nobody is looking at). True when
-    /// either changed.
+    /// Re-read the report and the firewall (a question has to show up while
+    /// its program is still waiting), and the network table when its tab is
+    /// open (a read of it is a fresh walk of every process's sockets: not
+    /// something to do every two seconds for a tab nobody is looking at).
+    /// True when any of them changed.
     fn reload_report(&mut self) -> bool {
         let r = report::read();
         let mut changed = false;
         if r != self.report {
             self.report = r;
+            changed = true;
+        }
+        let f = fw::read();
+        if f != self.firewall {
+            self.firewall = f;
             changed = true;
         }
         if self.tab == Tab::Network {
@@ -1034,6 +1060,34 @@ impl State {
                     Err(e) => self.say(format!("{}: {e}", net::PROC_NET), true),
                 }
             }
+            Act::NetMode(m) => self.net_send(&fw::mode_script(m)),
+            Act::NetAnswer(i, allow) => {
+                if let Some(q) = self.question(i) {
+                    self.net_send(&fw::answer_script(&q, allow));
+                    // A refused `allow` (sealed) is not an error to the
+                    // kernel, so it is checked here: the question is still
+                    // open.
+                    if allow && self.has_question(&q) {
+                        let m = self.t("sellado: no se puede permitir", "sealed: cannot allow");
+                        self.say(m, true);
+                    }
+                }
+            }
+            Act::NetDismiss(i) => {
+                if let Some(q) = self.question(i) {
+                    self.net_send(&fw::dismiss_script(&q.program));
+                }
+            }
+            Act::NetForget(i) => {
+                let program = self
+                    .firewall
+                    .as_ref()
+                    .and_then(|f| f.rules.get(i))
+                    .map(|r| r.program.clone());
+                if let Some(p) = program {
+                    self.net_send(&fw::forget_script(&p));
+                }
+            }
         }
     }
 
@@ -1065,6 +1119,40 @@ impl State {
                 self.say(m, false);
             }
             Err(e) => self.say(format!("{name}: {e}"), true),
+        }
+    }
+
+    fn question(&self, i: usize) -> Option<fw::Question> {
+        self.firewall.as_ref()?.questions.get(i).cloned()
+    }
+
+    fn has_question(&self, q: &fw::Question) -> bool {
+        self.firewall.as_ref().is_some_and(|f| {
+            f.questions
+                .iter()
+                .any(|o| o.program == q.program && o.dir == q.dir)
+        })
+    }
+
+    /// Send a firewall directive, then write the live rules back to
+    /// `/etc/hunter/firewall`, so the answer outlives the boot.
+    fn net_send(&mut self, script: &str) {
+        if let Err(e) = hunter::send(script) {
+            let m = self.send_error(e);
+            self.say(m, true);
+            return;
+        }
+        self.reload_report();
+        let Some(f) = &self.firewall else { return };
+        match fw::save(f, &civil_time(now_secs()), fw::RULES_FILE) {
+            Ok(()) => {
+                let m = self.t(
+                    "aplicado y guardado en /etc/hunter/firewall",
+                    "applied and saved to /etc/hunter/firewall",
+                );
+                self.say(m, false);
+            }
+            Err(e) => self.say(format!("{}: {e}", fw::RULES_FILE), true),
         }
     }
 
@@ -1535,6 +1623,12 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, st: &State) -> Frame {
                 .map(NetTable::unexpected)
                 .filter(|&n| n > 0)
                 .map(|n| n.to_string()),
+            Tab::Firewall => st
+                .firewall
+                .as_ref()
+                .map(|f| f.questions.len())
+                .filter(|&n| n > 0)
+                .map(|n| n.to_string()),
             Tab::Events => st
                 .report
                 .as_ref()
@@ -1614,6 +1708,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, st: &State) -> Frame {
                 Tab::Programs => tab_programs(&mut g, body, r),
                 Tab::Schedule => schedule::tab_schedule(&mut g, body),
                 Tab::Network => net_tab::tab_network(&mut g, body, r.status.sealed),
+                Tab::Firewall => tab_firewall(&mut g, body),
             };
             list = l;
             max_scroll = m;
@@ -2541,6 +2636,222 @@ fn tab_programs(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> (Rect, usize) 
     ((x, cy, w, lh), max)
 }
 
+/// One line on what the firewall's mode does, for the person choosing it.
+fn net_mode_help(st: &State, f: &Firewall) -> String {
+    match f.mode {
+        Mode::Off => st
+            .t(
+                "Apagado: no se comprueba nada.",
+                "Off: nothing is checked.",
+            )
+            .into(),
+        Mode::Report => st
+            .t(
+                "Aviso: deja pasar y pregunta.",
+                "Report: lets it through and asks.",
+            )
+            .into(),
+        Mode::Enforce => format!(
+            "{} {} s{}",
+            st.t("Bloqueo: espera tu respuesta", "Enforce: waits for you"),
+            f.timeout,
+            st.t(", si no, bloquea.", ", then blocks."),
+        ),
+    }
+}
+
+/// Cortafuegos: the open questions with their answers, the rules, the mode.
+fn tab_firewall(g: &mut Paint, (x, y, w, h): Rect) -> (Rect, usize) {
+    let st = g.st;
+    let p = g.p;
+    let Some(f) = &st.firewall else {
+        g.bold(
+            st.t(
+                "Este núcleo no tiene cortafuegos",
+                "This kernel has no firewall",
+            ),
+            x,
+            y,
+            CRIT,
+        );
+        g.text(
+            st.t(
+                "No hay /proc/hunter_firewall: hace falta un hunter más nuevo.",
+                "No /proc/hunter_firewall: a newer hunter is needed.",
+            ),
+            x,
+            y + 28,
+            p.dim,
+        );
+        return ((0, 0, 0, 0), 0);
+    };
+    let ok = |a: Act| st.root.then_some(a);
+    let modes = hunter::text(st.lang).modes;
+    let seg_x = x + w - 3 * SEG_W;
+    let mut cy = y;
+    g.bold(st.t("Modo", "Mode"), x, cy + 5, p.text);
+    g.text(&fit(&net_mode_help(st, f), seg_x - x - 70), x + 60, cy + 5, p.dim);
+    let on = Mode::ALL.iter().position(|&m| m == f.mode).unwrap_or(0);
+    g.segments(seg_x, cy, &modes, on, |_| st.root, |i| Act::NetMode(Mode::ALL[i]));
+    cy += ROW_H + 20;
+
+    // ── the questions ──
+    let title = format!(
+        "{} ({})",
+        st.t("Preguntas", "Questions"),
+        f.questions.len()
+    );
+    g.section(x, cy, w, &title);
+    cy += 28;
+    // The question across the whole card, the details and the answers under
+    // it: a question cut short is not one anybody can answer.
+    let card_h = ROW_H + BTN_H + 20;
+    // At most half of what is left: the rules below must still show.
+    let room = ((y + h - cy) / 2 / (card_h + 6)).max(1) as usize;
+    if f.questions.is_empty() {
+        g.text(
+            st.t(
+                "Ningún programa espera respuesta.",
+                "No program is waiting for an answer.",
+            ),
+            x,
+            cy,
+            p.dim,
+        );
+        cy += ROW_H + 6;
+    }
+    // Newest first: that is the one someone is waiting on.
+    let newest: Vec<usize> = (0..f.questions.len()).rev().collect();
+    for &i in newest.iter().take(room) {
+        let q = &f.questions[i];
+        g.cv.round_rect(x, cy, w, card_h, 8, p.field);
+        g.cv.round_rect(x, cy + 8, 3, card_h - 16, 1, WARN);
+        let ask = match q.dir {
+            Dir::Out => format!(
+                "{} {} {}",
+                st.t("¿Permitir que", "Allow"),
+                q.name(),
+                st.t("se conecte a la red?", "to connect to the network?")
+            ),
+            Dir::In => format!(
+                "{} {} {} {}?",
+                st.t("¿Permitir que", "Allow"),
+                q.name(),
+                st.t("escuche en el puerto", "to listen on port"),
+                q.port()
+            ),
+        };
+        let mut bx = x + w - 10;
+        let deny_w = Canvas::text_width(st.t("Bloquear", "Block")) + 24;
+        let allow_w = Canvas::text_width(st.t("Permitir", "Allow")) + 24;
+        let skip_w = Canvas::text_width(st.t("Ignorar", "Ignore")) + 24;
+        bx -= skip_w;
+        let by = cy + ROW_H + 10;
+        g.button(
+            bx,
+            by,
+            skip_w,
+            st.t("Ignorar", "Ignore"),
+            Style::Normal,
+            ok(Act::NetDismiss(i)),
+        );
+        bx -= deny_w + 8;
+        g.button(
+            bx,
+            by,
+            deny_w,
+            st.t("Bloquear", "Block"),
+            Style::Danger,
+            ok(Act::NetAnswer(i, false)),
+        );
+        bx -= allow_w + 8;
+        g.button(
+            bx,
+            by,
+            allow_w,
+            st.t("Permitir", "Allow"),
+            Style::Primary,
+            ok(Act::NetAnswer(i, true)),
+        );
+        let tw = bx - x - 24;
+        g.bold(&fit(&ask, w - 24), x + 14, cy + 8, p.text);
+        let ago = f.now.saturating_sub(q.last);
+        // The program's path goes last: the name is already in the question,
+        // so it is the part that can be cut.
+        let detail = format!(
+            "{} · {} {} · pid {} · {} {} s · {}",
+            q.peer,
+            q.count,
+            st.t("intento(s)", "attempt(s)"),
+            q.pid,
+            st.t("hace", "ago"),
+            ago,
+            q.program,
+        );
+        g.text(&fit(&detail, tw), x + 14, by + (BTN_H - GLYPH_H) / 2, p.dim);
+        cy += card_h + 6;
+    }
+    if f.questions.len() > room {
+        let more = format!(
+            "{} {} {}",
+            st.t("y", "and"),
+            f.questions.len() - room,
+            st.t("más", "more")
+        );
+        g.text(&more, x, cy, p.dim);
+        cy += ROW_H;
+    }
+    cy += 10;
+
+    // ── the rules ──
+    let title = format!("{} ({})", st.t("Reglas", "Rules"), f.rules.len());
+    g.section(x, cy, w, &title);
+    cy += 28;
+    let row_h = BTN_H + 6;
+    let lh = y + h - cy;
+    let rows = (lh / row_h).max(1) as usize;
+    let max = f.rules.len().saturating_sub(rows);
+    let top = st.scroll.min(max);
+    if f.rules.is_empty() {
+        g.text(
+            st.t(
+                "Todavía no hay reglas: se crean al responder.",
+                "No rules yet: answering a question makes one.",
+            ),
+            x,
+            cy,
+            p.dim,
+        );
+    }
+    for (k, r) in f.rules.iter().enumerate().skip(top).take(rows) {
+        let ry = cy + (k - top) as i32 * row_h;
+        let ty = ry + (BTN_H - GLYPH_H) / 2;
+        let (word, c) = if r.allow {
+            (st.t("permitido", "allowed"), OK)
+        } else {
+            (st.t("bloqueado", "blocked"), CRIT)
+        };
+        g.bold(word, x, ty, c);
+        let dir = match r.dir {
+            None => st.t("ambas", "both"),
+            Some(Dir::Out) => st.t("salida", "out"),
+            Some(Dir::In) => st.t("entrada", "in"),
+        };
+        g.text(dir, x + 110, ty, p.dim);
+        let fw_w = Canvas::text_width(st.t("Olvidar", "Forget")) + 24;
+        g.text(&fit_left(&r.program, w - 200 - fw_w), x + 190, ty, p.text);
+        g.button(
+            x + w - fw_w,
+            ry,
+            fw_w,
+            st.t("Olvidar", "Forget"),
+            Style::Normal,
+            ok(Act::NetForget(k)),
+        );
+    }
+    ((x, cy, w, lh), max)
+}
+
 // ── wayland plumbing ─────────────────────────────────────────────────────────
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -2693,8 +3004,10 @@ fn key(st: &mut State, key: u32) {
         KEY_PGUP_WL => st.scroll_by(-page),
         KEY_PGDN_WL => st.scroll_by(page),
         k => match key_char(k) {
-            Some(c @ '1'..='9') => {
-                let t = Tab::ALL[(c as u8 - b'1') as usize];
+            Some(c @ '0'..='9') => {
+                // 0 is the tenth tab, as on a keyboard's number row.
+                let i = if c == '0' { 9 } else { (c as u8 - b'1') as usize };
+                let t = Tab::ALL[i];
                 st.act(Act::Tab(t));
             }
             Some('r') => {
@@ -2874,8 +3187,8 @@ fn usage() -> ! {
          \x20                  [--dump PATH:WxH] [--export PATH [--days N]]\n\
          \n\
          \x20 --tab NAME     open on a tab: resumen proteccion eventos escaneo\n\
-         \x20                cuarentena firmas programas programados red (or 1-9,\n\
-         \x20                or English)\n\
+         \x20                cuarentena firmas programas programados red cortafuegos\n\
+         \x20                (or 1-9 and 0, or English)\n\
          \x20 --scan PATH..  scan these absolute paths at once (opens Escaneo)\n\
          \x20 --quarantine   automatic quarantine on (for --scan)\n\
          \x20 --update       update the signatures at once (opens Firmas)\n\
@@ -2883,7 +3196,7 @@ fn usage() -> ! {
          \x20 --export PATH  write the security report (.html, .pdf or .txt) and exit\n\
          \x20 --days N       the period the report covers (default 7)\n\
          \n\
-         keys: 1-9 or Tab switch tabs, arrows/PgUp/PgDn scroll, r re-reads, Esc closes\n\
+         keys: 1-9, 0 or Tab switch tabs, arrows/PgUp/PgDn scroll, r re-reads, Esc closes\n\
          env: ECLIPSE_LOOK=kde|eclipse|win11, LANG"
     );
     std::process::exit(2)
@@ -2904,6 +3217,13 @@ fn parse_dump_spec(spec: &str) -> (String, usize, usize) {
 
 /// A report with a little of everything, for `--dump` on a machine with no
 /// hunter: what the window looks like, in the kernel's own format.
+/// A firewall with a question of each kind and a rule of each, for `--dump`.
+const FW_SAMPLE: &str = "mode report\ntimeout 30\nnow 640\n\
+    rule allow both /usr/bin/curl\n\
+    rule deny out /usr/bin/nc\n\
+    pending in 1 88 600 600 0.0.0.0:8080 /usr/bin/python3\n\
+    pending out 3 142 610 636 93.184.216.34:443 /usr/bin/wget\n";
+
 const SAMPLE: &str = "hunter security subsystem v0.1.0\n\
 enforcement: syscall=enforce wx=report exec=enforce anomaly=report integrity=report av=enforce\n\
 events: total=214 blocked=6 warnings=11 reported=5 critical=2 dropped=0 critical_dropped=0\n\
@@ -3097,6 +3417,7 @@ fn export_to(path: &str, days: u32) -> i32 {
 /// output to go with it, for `--dump` with no hunter.
 fn sample(st: &mut State) {
     st.report = report::parse_report(SAMPLE);
+    st.firewall = fw::parse(FW_SAMPLE);
     st.root = true;
     let sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
     st.quarantine = vec![Quarantined {
@@ -3261,6 +3582,33 @@ mod tests {
         // The sample: #4 scanned clean, #5 being scanned.
         assert!(offered(4));
         assert!(!offered(5));
+    }
+
+    #[test]
+    fn the_firewall_tab_asks_about_every_question_and_can_forget_every_rule() {
+        let st = sample_state(Tab::Firewall);
+        let f = frame(&st);
+        let has = |a: Act| f.hits.iter().any(|(_, h)| *h == a);
+        let n = st.firewall.as_ref().unwrap().questions.len();
+        for i in 0..n {
+            assert!(has(Act::NetAnswer(i, true)), "allow {i}");
+            assert!(has(Act::NetAnswer(i, false)), "deny {i}");
+            assert!(has(Act::NetDismiss(i)), "dismiss {i}");
+        }
+        for k in 0..st.firewall.as_ref().unwrap().rules.len() {
+            assert!(has(Act::NetForget(k)), "forget {k}");
+        }
+        assert!(has(Act::NetMode(Mode::Enforce)));
+        assert!(!has(Act::NetMode(Mode::Report)), "the current mode is lit, not a click");
+        assert_eq!(cli(&["--tab", "cortafuegos"]).unwrap().tab, Some(Tab::Firewall));
+    }
+
+    #[test]
+    fn the_firewall_tab_says_so_on_a_kernel_without_one() {
+        let mut st = sample_state(Tab::Firewall);
+        st.firewall = None;
+        let f = frame(&st);
+        assert!(!f.hits.iter().any(|(_, a)| matches!(a, Act::NetAnswer(..))));
     }
 
     #[test]

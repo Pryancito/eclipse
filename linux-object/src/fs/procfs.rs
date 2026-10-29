@@ -64,7 +64,7 @@ use present::proc_present_content;
 use smoltcp::wire::{IpAddress, IpCidr};
 use status::{proc_pid_status, proc_task_status};
 
-const PROC_ROOT_STATIC: [&str; 56] = [
+const PROC_ROOT_STATIC: [&str; 57] = [
     "net",
     "gpuready",
     "present",
@@ -90,6 +90,7 @@ const PROC_ROOT_STATIC: [&str; 56] = [
     "hunter_scan",
     "hunter_net",
     "hunter_feed",
+    "hunter_firewall",
     "filesystems",
     "gpudbg",
     "stalls",
@@ -789,6 +790,7 @@ impl INode for ProcRootINode {
             "hunter_scan" => Ok(PROC_HUNTER_SCAN.clone()),
             "hunter_net" => Ok(PROC_HUNTER_NET.clone()),
             "hunter_feed" => Ok(PROC_HUNTER_FEED.clone()),
+            "hunter_firewall" => Ok(PROC_HUNTER_FIREWALL.clone()),
             "filesystems" => Ok(PROC_FILESYSTEMS.clone()),
             "gpudbg" => Ok(PROC_GPUDBG.clone()),
             "stalls" => Ok(PROC_STALLS.clone()),
@@ -4338,6 +4340,12 @@ lazy_static! {
     static ref PROC_HUNTER_SCAN: Arc<dyn INode> = Arc::new(ProcHunterScanINode);
     static ref PROC_HUNTER_NET: Arc<dyn INode> = Arc::new(ProcHunterNetINode);
     static ref PROC_HUNTER_FEED: Arc<dyn INode> = Arc::new(ProcHunterFeedINode);
+    /// hunter's firewall: its rules and open questions, read-only. The answers
+    /// go to `/proc/hunter` as `net ...` directives, like every other change.
+    static ref PROC_HUNTER_FIREWALL: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 163,
+        generate: hunter::firewall::render,
+    });
     static ref PROC_NET_DEV: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 30,
         generate: proc_net_dev_content,

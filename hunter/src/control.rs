@@ -16,7 +16,7 @@
 //!
 //! | Directive                               | Effect                                        |
 //! |-----------------------------------------|-----------------------------------------------|
-//! | `mode <domain> <off\|report\|enforce>`  | domain is `syscall`, `wx`, `exec`, `anomaly`, `integrity`, `av` |
+//! | `mode <domain> <off\|report\|enforce>`  | domain is `syscall`, `wx`, `exec`, `anomaly`, `integrity`, `av`, `net` |
 //! | `learning <on\|off>`                    | exec trust-on-first-use                       |
 //! | `anomaly-detection <on\|off>`           | per-process flood / fork-bomb heuristics      |
 //! | `privileged-deny <on\|off>`             | block module/ptrace/bpf/... under `anomaly=enforce` |
@@ -32,6 +32,7 @@
 //! | `media <id> done <files> <infected>`    | a scan agent's verdict on a device            |
 //! | `feed-key <name> <hex>`                 | trust an Ed25519 key for signed feeds (see [`crate::feed`]) |
 //! | `require-signed-feeds <on\|off>`        | refuse signature feeds that are not signed    |
+//! | `net <allow\|deny> <path> [in\|out]`   | a firewall rule (see [`crate::firewall`]); also `net forget\|dismiss <path>`, `net timeout <secs>` |
 //! | `seal`                                  | engage the one-way tighten-only latch         |
 //!
 //! A trailing `/` makes `trust` / `deny` a directory prefix, exactly as in
@@ -64,6 +65,7 @@ use alloc::vec::Vec;
 use crate::av;
 use crate::event_log::{record, Severity};
 use crate::feed;
+use crate::firewall;
 use crate::heuristics;
 use crate::integrity::{self, Digest};
 use crate::media;
@@ -78,6 +80,7 @@ pub enum Domain {
     Anomaly,
     Integrity,
     Av,
+    Net,
 }
 
 /// One parsed line of the control language.
@@ -98,6 +101,7 @@ pub enum Directive {
     Media(u64, media::Report),
     FeedKey(String, feed::PublicKey),
     RequireSignedFeeds(bool),
+    Net(firewall::NetDirective),
     Seal,
 }
 
@@ -184,6 +188,11 @@ pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
                 }
             }
         }
+        "net" => {
+            // The rest of the line, so a rule's path may hold a space, as in
+            // `/etc/hunter/firewall`, whose lines are these without the `net`.
+            Directive::Net(firewall::parse_directive(&line["net".len()..])?)
+        }
         "require-hash" => {
             arity(2)?;
             Directive::RequireHash(parse_switch(words[1])?)
@@ -263,8 +272,9 @@ fn parse_domain(word: &str) -> Result<Domain, String> {
         "anomaly" => Ok(Domain::Anomaly),
         "integrity" => Ok(Domain::Integrity),
         "av" => Ok(Domain::Av),
+        "net" => Ok(Domain::Net),
         other => Err(format!(
-            "unknown domain '{}' (syscall, wx, exec, anomaly, integrity, av)",
+            "unknown domain '{}' (syscall, wx, exec, anomaly, integrity, av, net)",
             other
         )),
     }
@@ -326,6 +336,7 @@ pub fn apply(d: &Directive) {
         Directive::Mode(Domain::Anomaly, m) => policy::set_anomaly_mode(*m),
         Directive::Mode(Domain::Integrity, m) => policy::set_integrity_mode(*m),
         Directive::Mode(Domain::Av, m) => policy::set_av_mode(*m),
+        Directive::Mode(Domain::Net, m) => firewall::set_net_mode(*m),
         Directive::Learning(on) => policy::set_exec_learning(*on),
         Directive::AnomalyDetection(on) => {
             if gate_switch("anomaly-detection", *on) {
@@ -372,6 +383,7 @@ pub fn apply(d: &Directive) {
             feed::add_key(name, *key);
         }
         Directive::RequireSignedFeeds(on) => feed::set_require_signed(*on),
+        Directive::Net(n) => firewall::apply(n),
         Directive::Seal => policy::seal_tighten_only(),
     }
 }

@@ -16,6 +16,7 @@
 //! | [`check_exec_integrity`] | `execve` / loader / interp | exec integrity (SHA-256) |
 //! | [`check_exec_av`]     | `execve` / loader / interp  | antivirus (signatures) |
 //! | [`media::note_mount`] | `mount(2)` / `umount2`      | removable media scan |
+//! | [`firewall::check`]   | `connect` / `bind` / `sendto` | per-application firewall |
 //! | [`check_mprotect`]    | `mprotect`                  | W^X memory      |
 //! | [`check_munmap`]      | `munmap`                    | W^X bookkeeping |
 //! | [`task_fork`]         | `fork` / `clone`            | policy lifecycle|
@@ -48,6 +49,7 @@ pub mod clock;
 pub mod control;
 pub mod event_log;
 pub mod feed;
+pub mod firewall;
 pub mod heuristics;
 pub mod integrity;
 pub mod media;
