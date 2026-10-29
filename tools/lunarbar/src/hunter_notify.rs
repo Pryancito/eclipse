@@ -29,6 +29,7 @@
 //! Anything else is skipped, not deleted — it is not ours to remove.
 
 use crate::hunter::Event;
+use crate::hunter_firewall::{self as fw, Dir};
 use crate::i18n::Lang;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
@@ -341,6 +342,11 @@ pub const VIEW: &str = "view";
 pub const IGNORE: &str = "ignore";
 pub const QUARANTINE: &str = "quarantine";
 pub const ALLOW: &str = "allow";
+/// A firewall question's answers, and its view: the bar sends the rule and
+/// saves the rule file itself ([`answer_net`]), so these carry no command.
+pub const NET_ALLOW: &str = "net-allow";
+pub const NET_DENY: &str = "net-deny";
+pub const NET_VIEW: &str = "net-view";
 
 /// The notification's words.
 pub struct Text {
@@ -362,6 +368,13 @@ pub struct Text {
     pub not_quarantined: &'static str,
     pub allowed: &'static str,
     pub not_allowed: &'static str,
+    pub block: &'static str,
+    pub net_ask: &'static str,
+    pub net_allowed: &'static str,
+    pub net_denied: &'static str,
+    pub net_failed: &'static str,
+    pub net_sealed: &'static str,
+    pub net_unsaved: &'static str,
 }
 
 const ES: Text = Text {
@@ -382,6 +395,13 @@ const ES: Text = Text {
     not_quarantined: "No se pudo poner en cuarentena",
     allowed: "Permitido",
     not_allowed: "hunter no lo permitió",
+    block: "bloquear",
+    net_ask: "¿Permitir acceso a la red?",
+    net_allowed: "Permitido y guardado",
+    net_denied: "Bloqueado y guardado",
+    net_failed: "hunter no aceptó la respuesta",
+    net_sealed: "Sellado: no se puede permitir",
+    net_unsaved: "Aplicado, pero no se guardó en /etc/hunter/firewall",
 };
 
 const EN: Text = Text {
@@ -402,6 +422,13 @@ const EN: Text = Text {
     not_quarantined: "Could not quarantine",
     allowed: "Allowed",
     not_allowed: "hunter did not allow it",
+    block: "block",
+    net_ask: "Allow network access?",
+    net_allowed: "Allowed and saved",
+    net_denied: "Blocked and saved",
+    net_failed: "hunter did not take the answer",
+    net_sealed: "Sealed: cannot allow",
+    net_unsaved: "Applied, but not saved to /etc/hunter/firewall",
 };
 
 pub fn text(lang: Lang) -> &'static Text {
@@ -450,6 +477,74 @@ fn and_report(cmd: &str, ok: &str, failed: &str, what: &str) -> String {
     format!("{cmd} && {} || {}", n("info", ok), n("warn", failed))
 }
 
+/// The program and direction a firewall question is about, out of its ring
+/// text: `firewall: PATH wants to connect to PEER (...)`, or `wants to listen
+/// on`. The path runs up to ` wants to `, so a space in it is kept.
+pub fn net_question(desc: &str) -> Option<(&str, Dir)> {
+    let rest = desc.strip_prefix("firewall: ")?;
+    let (program, what) = rest.rsplit_once(" wants to ")?;
+    let dir = if what.starts_with("connect to ") {
+        Dir::Out
+    } else if what.starts_with("listen on ") {
+        Dir::In
+    } else {
+        return None;
+    };
+    program.starts_with('/').then_some((program, dir))
+}
+
+/// How answering a firewall question went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetAnswer {
+    /// Sent, and `/etc/hunter/firewall` rewritten.
+    Saved,
+    /// Sent, but the rule file could not be written: it holds until reboot.
+    Unsaved,
+    /// hunter took the write and kept the question open: an `allow` under
+    /// the seal, which is a relaxation.
+    Sealed,
+    /// The write failed (not root, no hunter), or the text is no question.
+    Failed,
+}
+
+/// Answer the question a `NET ASK` event (its ring text, `NET ASK: ...`)
+/// asked, the way lunarhunter's firewall tab does: the `net allow|deny`
+/// directive to `/proc/hunter`, then the whole live rule set written back to
+/// `/etc/hunter/firewall` so the answer survives a reboot. `when` dates the
+/// file's header.
+pub fn answer_net(event_text: &str, allow: bool, when: &str) -> NetAnswer {
+    let desc = event_text.split_once(": ").map_or("", |(_, d)| d);
+    let Some((program, dir)) = net_question(desc) else {
+        return NetAnswer::Failed;
+    };
+    let q = fw::Question {
+        dir,
+        count: 0,
+        pid: 0,
+        first: 0,
+        last: 0,
+        peer: String::new(),
+        program: program.to_string(),
+    };
+    if crate::hunter::send(&fw::answer_script(&q, allow)).is_err() {
+        return NetAnswer::Failed;
+    }
+    let Some(f) = fw::read() else {
+        return NetAnswer::Unsaved;
+    };
+    if allow
+        && f.questions
+            .iter()
+            .any(|x| x.program == program && x.dir == dir)
+    {
+        return NetAnswer::Sealed;
+    }
+    match fw::save(&f, when, fw::RULES_FILE) {
+        Ok(()) => NetAnswer::Saved,
+        Err(_) => NetAnswer::Unsaved,
+    }
+}
+
 /// The notification for one ring event, and its actions.
 ///
 /// - Malware (the `AV` domain) with a file to point at: quarantine.
@@ -458,12 +553,34 @@ fn and_report(cmd: &str, ok: &str, failed: &str, what: &str) -> String {
 ///   location (`/tmp`, a world-writable directory): hunter checks those before
 ///   the allowlist, so trusting one would change nothing and the button would
 ///   lie. Not under the seal either: trusting is a relaxation and is refused.
-/// - Everything gets view (the event log) and ignore.
+/// - A firewall question (`NET ASK`): allow and block, which answer it and
+///   save the rule ([`answer_net`]), and view, which opens the firewall tab.
+///   It stays until answered: under `enforce` the program is waiting.
+/// - Everything else gets view (the event log) and ignore.
 pub fn from_event(e: &Event, sealed: bool, lang: Lang) -> Alert {
     let t = text(lang);
     // The ring's text is `CATEGORY ACTION: description`.
     let (cat, rest) = e.text.split_once(' ').unwrap_or((&e.text, ""));
     let (verb, desc) = rest.split_once(": ").unwrap_or(("", rest));
+    if let ("NET", "ASK", Some(_)) = (cat, verb, net_question(desc)) {
+        let act = |id: &str, label: &str| Action {
+            id: id.into(),
+            label: label.into(),
+            run: None,
+        };
+        return Alert {
+            severity: Severity::Warn,
+            title: t.net_ask.into(),
+            body: clean(desc.strip_prefix("firewall: ").unwrap_or(desc)),
+            actions: vec![
+                act(NET_ALLOW, t.allow),
+                act(NET_DENY, t.block),
+                act(NET_VIEW, t.view),
+            ],
+            timeout: Some(0),
+            reply: false,
+        };
+    }
     let blocked = verb.contains("BLOCKED");
     let mut actions = Vec::new();
     let title = match cat {
@@ -705,6 +822,44 @@ mod tests {
             (Severity::Warn, "Programa no confiable")
         );
         assert_eq!(ids(&a), [ALLOW, VIEW, IGNORE]);
+    }
+
+    #[test]
+    fn a_firewall_question_offers_allow_block_and_its_tab() {
+        // As hunter/src/firewall.rs words it.
+        let out = "NET ASK: firewall: /usr/bin/wget wants to connect to 1.2.3.4:443 \
+                   (no rule; waiting for an answer)";
+        let a = from_event(&ev(false, out), false, Lang::Es);
+        assert_eq!(ids(&a), [NET_ALLOW, NET_DENY, NET_VIEW]);
+        assert_eq!(a.title, "¿Permitir acceso a la red?");
+        assert!(a
+            .body
+            .starts_with("/usr/bin/wget wants to connect to 1.2.3.4:443"));
+        // It stays until answered.
+        assert_eq!(a.lifetime(), None);
+        assert!(a.actions.iter().all(|x| x.run.is_none()));
+        assert_eq!(
+            net_question(out.split_once(": ").unwrap().1),
+            Some(("/usr/bin/wget", Dir::Out))
+        );
+        let listen = "firewall: /opt/my app/srv wants to listen on 0.0.0.0:8080 (no rule; allowed in report mode)";
+        assert_eq!(net_question(listen), Some(("/opt/my app/srv", Dir::In)));
+        // A NET event that is not a question is an ordinary alert.
+        let other = from_event(
+            &ev(false, "NET BLOCKED: firewall: /x denied"),
+            false,
+            Lang::En,
+        );
+        assert_eq!(ids(&other), [VIEW, IGNORE]);
+        assert_eq!(
+            net_question("firewall: relative wants to connect to x"),
+            None
+        );
+    }
+
+    #[test]
+    fn answering_something_that_is_not_a_question_sends_nothing() {
+        assert_eq!(answer_net("WX WARNING: x", true, "now"), NetAnswer::Failed);
     }
 
     #[test]

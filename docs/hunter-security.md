@@ -398,6 +398,7 @@ offers in [`hunter_notify.rs`](../tools/lunarbar/src/hunter_notify.rs)):
 |---|---|
 | malware (`AV`) with a file | **cuarentena** (`hunterctl quarantine FILE`), ver, ignorar |
 | a program the allowlist refused (`EXEC`, *not on trusted-program allowlist*), not sealed | **permitir** (`hunterctl trust PATH`), ver, ignorar |
+| a firewall question (`NET ASK`) | **permitir** / **bloquear** (`net allow\|deny PATH out\|in`, then the live rules saved to `/etc/hunter/firewall`), ver (the Cortafuegos tab); stays until answered |
 | anything else | ver, ignorar |
 
 **ver** opens the event log (`lunarhunter --tab eventos`), **ignorar** stops
