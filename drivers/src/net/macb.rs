@@ -185,6 +185,10 @@ pub const NCFGR_RXCOEN: u32 = 1 << 24;
 /// `GEM_SGMIIEN`: SGMII.
 pub const NCFGR_SGMIIEN: u32 = 1 << 27;
 
+/// Trama mas larga que el MAC acepta con `BIG` puesto: los 1518 de una trama
+/// Ethernet con su FCS, redondeados a 1536 como hace el silicio.
+pub const ENET_MAX_FRAME_LEN: u32 = 1536;
+
 /// Los dos bytes de relleno que el MAC mete delante de la trama para que la
 /// cabecera IP caiga alineada a cuatro (el `NET_IP_ALIGN` de Linux).
 pub const RX_IP_ALIGN: u32 = 2;
@@ -364,7 +368,14 @@ impl MacbMac {
 
     #[inline]
     fn read(&self, off: usize) -> u32 {
-        unsafe { read_volatile((self.base + off) as *const u32) }
+        let val = unsafe { read_volatile((self.base + off) as *const u32) };
+        // La otra mitad de la costura del MAC falso: hay un registro que
+        // **se limpia al leerlo** (el `ISR`, con `GEM_IRQCOR` puesto), y un
+        // modelo en memoria que no lo haga deja pasar un driver que lo lee
+        // dos veces --- que en ese silicio pierde causas y en el otro no.
+        #[cfg(test)]
+        let val = macb_fake::on_read(self.base, off, val);
+        val
     }
 
     #[inline]
@@ -707,6 +718,14 @@ impl MacbMac {
 pub fn mac_addr_is_valid(mac: &[u8; 6]) -> bool {
     mac.iter().any(|b| *b != 0) && mac[0] & 1 == 0
 }
+
+/// Los anillos de descriptores y el camino de la trama.
+mod rings;
+pub use rings::{MacbRings, RingKind, MAX_TX_FRAME, RX_BUF_LENGTH, RX_RING_SIZE, TX_RING_SIZE};
+
+/// Las cuatro ventanas de la interrupcion y los grupos de bits.
+mod irq;
+pub use irq::*;
 
 #[cfg(test)]
 mod macb_fake;

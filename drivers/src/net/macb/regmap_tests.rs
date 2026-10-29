@@ -259,3 +259,66 @@ fn the_receive_offset_fits_in_its_field() {
     assert_eq!(RX_IP_ALIGN, 2, "NET_IP_ALIGN");
     const { assert!(RX_IP_ALIGN <= NCFGR_RBOF_MASK) };
 }
+
+/// Los bits del `ISR`/`IER`/`IDR`/`IMR`, uno por uno contra el nombre de la
+/// constante de `macb.h`.
+///
+/// Son cuatro registros con los mismos bits, asi que un bit mal puesto no da
+/// un error: arma otra cosa, y lo que uno queria se queda sin armar. De los
+/// catorce, los dos que de verdad importan son el `RCOMP` y el `TCOMP`, y
+/// estan **pegados a sus parejas de «se leyo un descriptor usado»**
+/// (`RXUBR` en 2, `TXUBR` en 3), que es exactamente donde se confunden.
+#[test]
+fn every_interrupt_bit_is_the_one_linux_names() {
+    for (bit, nombre, offset) in [
+        (ISR_MFD, "MACB_MFD", 0),
+        (ISR_RCOMP, "MACB_RCOMP", 1),
+        (ISR_RXUBR, "MACB_RXUBR", 2),
+        (ISR_TXUBR, "MACB_TXUBR", 3),
+        (ISR_TUND, "MACB_ISR_TUND", 4),
+        (ISR_RLE, "MACB_ISR_RLE", 5),
+        (ISR_TXERR, "MACB_TXERR", 6),
+        (ISR_TCOMP, "MACB_TCOMP", 7),
+        (ISR_LINK, "MACB_ISR_LINK", 9),
+        (ISR_ROVR, "MACB_ISR_ROVR", 10),
+        (ISR_HRESP, "MACB_HRESP", 11),
+        (ISR_PFR, "MACB_PFR", 12),
+        (ISR_PTZ, "MACB_PTZ", 13),
+    ] {
+        assert_eq!(bit, 1 << offset, "{} no es el bit {}", nombre, offset);
+    }
+}
+
+/// Y los cuatro registros de la interrupcion estan donde `macb.h` los pone,
+/// seguidos y sin hueco: `ISR`, `IER`, `IDR`, `IMR`.
+///
+/// El orden importa porque los tres primeros no son intercambiables --`IER` e
+/// `IDR` son ordenes contrarias-- y un offset corrido en cuatro bytes
+/// convierte armar en desarmar sin dar ningun error.
+#[test]
+fn the_four_interrupt_registers_are_where_linux_puts_them() {
+    assert_eq!(ISR, 0x024, "MACB_ISR");
+    assert_eq!(IER, 0x028, "MACB_IER");
+    assert_eq!(IDR, 0x02C, "MACB_IDR");
+    assert_eq!(IMR, 0x030, "MACB_IMR");
+    // Y no pisan el `PHYMNTNC`, que es el siguiente (0x034): una mascara que
+    // cayera ahi arrancaria una transaccion MDIO.
+    const { assert!(IMR + 4 <= MAN, "la mascara se solapa con el MAN") };
+}
+
+/// `GEM_IRQCOR` es el bit 23 de `DCFG1`, y **no** uno de los del ancho de bus.
+///
+/// Si se confundiera con el campo `DBWDEF` (bits 25..27), un GEM de 64 bits
+/// pareceria tener el `ISR` de limpiar-al-leer y el driver dejaria de
+/// reconocer interrupciones: el manejador daria vueltas sobre una causa que
+/// nadie limpia.
+#[test]
+fn the_status_clear_mode_bit_is_not_one_of_the_bus_width_ones() {
+    assert_eq!(DCFG1_IRQCOR, 1 << 23, "GEM_IRQCOR");
+    assert_eq!(DCFG1_DBWDEF_SHIFT, 25, "GEM_DBWDEF_OFFSET");
+    assert_eq!(
+        DCFG1_IRQCOR & (DCFG1_DBWDEF_MASK << DCFG1_DBWDEF_SHIFT),
+        0,
+        "el IRQCOR cae dentro del campo del ancho de bus"
+    );
+}
