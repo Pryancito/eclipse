@@ -1,5 +1,12 @@
 //! External interrupt request and handle.
 
+/// El bloque de configuracion de interrupciones del RP1 de la Raspberry Pi 5.
+///
+/// Sin `cfg` de arquitectura a proposito: no tiene nada de aarch64 -- son
+/// accesos `u32` volatiles a una ventana de PCIe -- asi que un buffer del host
+/// lo contesta igual que la placa, y sus tests corren donde corren los demas.
+pub mod rp1;
+
 cfg_if::cfg_if! {
     if #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))] {
         mod riscv_intc;
