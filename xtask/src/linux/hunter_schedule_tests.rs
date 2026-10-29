@@ -20,7 +20,9 @@ fn the_shipped_schedule_is_well_formed() {
         .collect();
     let names: Vec<&str> = jobs.iter().map(|f| f[0]).collect();
     assert_eq!(names, ["quick", "full"], "{text}");
-    let days = ["daily", "off", "mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    let days = [
+        "daily", "off", "mon", "tue", "wed", "thu", "fri", "sat", "sun",
+    ];
     for f in &jobs {
         assert!(f.len() >= 5, "job without paths: {f:?}");
         assert!(days.contains(&f[1]), "when: {f:?}");
@@ -38,12 +40,17 @@ fn install_hunter_ships_the_schedule_and_its_service() {
     let _ = fs::remove_dir_all(&dir);
     LinuxRootfs::install_hunter(&dir);
     assert!(dir.join("etc/hunter/schedule").is_file());
-    let svc = fs::read_to_string(dir.join("etc/eclipse/services/hunter-scheduler.service")).unwrap();
+    let svc =
+        fs::read_to_string(dir.join("etc/eclipse/services/hunter-scheduler.service")).unwrap();
     let lines: Vec<&str> = svc.lines().filter(|l| !l.starts_with('#')).collect();
     assert!(lines.contains(&"exec = /sbin/hunterctl scheduler"), "{svc}");
     assert!(lines.contains(&"type = respawn"), "{svc}");
     // An operator's schedule survives a rebuild.
-    fs::write(dir.join("etc/hunter/schedule"), "quick off 12:00 report /bin\n").unwrap();
+    fs::write(
+        dir.join("etc/hunter/schedule"),
+        "quick off 12:00 report /bin\n",
+    )
+    .unwrap();
     LinuxRootfs::install_hunter(&dir);
     let kept = fs::read_to_string(dir.join("etc/hunter/schedule")).unwrap();
     assert_eq!(kept, "quick off 12:00 report /bin\n");
@@ -82,7 +89,11 @@ fn next_slot_is_the_first_slot_after_the_last_run() {
         .arg(&sh)
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let got: Vec<u64> = String::from_utf8(out.stdout)
         .unwrap()
         .lines()
