@@ -3,6 +3,7 @@ mod btrfs_image;
 mod cuda_probe;
 mod desktop;
 mod eclipsefs_image;
+mod hunterd;
 mod image;
 mod logo;
 mod nvctl_probe;
@@ -4467,6 +4468,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         )
         .unwrap();
         Self::write_oopslog(localbin, svc_dir);
+        Self::write_hunterd(localbin, svc_dir);
 
         Self::write_dbus_wrapper(localbin);
 
