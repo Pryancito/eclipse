@@ -1,16 +1,28 @@
 # /etc/hunter/feeds — where `hunterctl update-signatures` downloads from.
 #
-#   <format> <name> <url>
+#   <format> <name> <url> [<key>]
 #
 # format `sha256`: one SHA-256 per line (first field; `#` comments), every hash
 #                  becomes `hash:<sha256>:<name>`.
 # format `sigs`:   hunter's own signature lines (see /etc/hunter/signatures).
 #
-# Each feed lands in /etc/hunter/signatures.d/<name>, replacing the previous
-# download only if the new one is non-empty and hunter accepted all of it.
+# With a <key> (a name from /etc/hunter/keys) the feed is signed: hunterctl
+# also downloads <url>.sig, and the kernel installs the feed only if that
+# signature is the key's, covers exactly these bytes, is for this feed name
+# and is not older than the version installed. A signed feed is in `sigs`
+# format. Without a key the feed is unsigned, taken on HTTPS alone, and
+# refused altogether under `require-signed-feeds on`.
+#
+# Each feed lands in /etc/hunter/signatures.d/<name> (and <name>.sig), only
+# if hunter accepted all of it; the last versions are kept in
+# /var/lib/hunter/feeds/<name>/ for `hunterctl feed-rollback <name>`.
 # To update every 6 hours with busybox crond:
 #   0 */6 * * * /sbin/hunterctl update-signatures
 #
 # abuse.ch MalwareBazaar: SHA-256 of malware samples submitted in the last 48
 # hours (free, no key needed for this export).
 sha256 MalwareBazaar.Recent https://bazaar.abuse.ch/export/txt/sha256/recent/
+#
+# A signed feed, e.g. a mirror of the one above that you sign yourself
+# (tools/hunterctl/hunter-feed-sign shows how):
+# sigs MalwareBazaar.Signed https://example.org/hunter/recent mirror

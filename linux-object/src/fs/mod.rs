@@ -16,6 +16,7 @@ mod file;
 mod flagged_fs;
 pub mod flock;
 pub mod hunter_config;
+pub mod hunter_feeds;
 mod inotify;
 pub mod ioctl;
 mod kbd_layout;

@@ -10,4 +10,7 @@ lazy_static = { version = "1.4", features = ["spin_no_std"] }
 # Exec integrity (SHA-256). `force-soft` keeps SHA-NI (SSE registers) out of
 # the kernel, as in eclipsefs.
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+# Signed signature feeds (`feed`): Ed25519 verification only, no_std, no
+# dependencies, no RNG (verifying needs none).
+ed25519-compact = { version = "2.1", default-features = false }
 lock = { git = "https://github.com/DeathWish5/kernel-sync", rev = "8486b8" }

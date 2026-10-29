@@ -197,6 +197,27 @@ pub fn add_signature(sig: Signature) -> bool {
     added
 }
 
+/// Takes a signature out of the database, matched by its data (the name does
+/// not matter). Only [`crate::feed`] calls it, when a feed is replaced or
+/// rolled back and a signature is held by nothing else; the seal never lets it
+/// get this far. Bumps the generation, so a cached detection made by the
+/// signature that is gone is scanned again instead of blocking forever.
+pub fn remove_signature(sig: &Signature) -> bool {
+    let removed = match sig {
+        Signature::Hash(d, _) => HASH_SIGS.lock().remove(d).is_some(),
+        Signature::Bytes(p, _) => {
+            let mut list = BYTE_SIGS.lock();
+            let before = list.len();
+            list.retain(|(q, _)| q != p);
+            list.len() != before
+        }
+    };
+    if removed {
+        GENERATION.fetch_add(1, Ordering::SeqCst);
+    }
+    removed
+}
+
 /// `(hash signatures, byte-pattern signatures, detections since boot)`.
 pub fn stats() -> (usize, usize, u64) {
     (

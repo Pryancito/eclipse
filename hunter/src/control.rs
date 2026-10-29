@@ -30,6 +30,8 @@
 //! | `media-lock <on\|off>`                  | nothing runs from media until it scans clean  |
 //! | `media <id> scanning\|failed`           | a scan agent took / gave up on a device       |
 //! | `media <id> done <files> <infected>`    | a scan agent's verdict on a device            |
+//! | `feed-key <name> <hex>`                 | trust an Ed25519 key for signed feeds (see [`crate::feed`]) |
+//! | `require-signed-feeds <on\|off>`        | refuse signature feeds that are not signed    |
 //! | `seal`                                  | engage the one-way tighten-only latch         |
 //!
 //! A trailing `/` makes `trust` / `deny` a directory prefix, exactly as in
@@ -61,6 +63,7 @@ use alloc::vec::Vec;
 
 use crate::av;
 use crate::event_log::{record, Severity};
+use crate::feed;
 use crate::heuristics;
 use crate::integrity::{self, Digest};
 use crate::media;
@@ -93,6 +96,8 @@ pub enum Directive {
     MediaScan(bool),
     MediaLock(bool),
     Media(u64, media::Report),
+    FeedKey(String, feed::PublicKey),
+    RequireSignedFeeds(bool),
     Seal,
 }
 
@@ -212,6 +217,21 @@ pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
                 }
             }
         }
+        "feed-key" => {
+            arity(3)?;
+            if !feed::valid_name(words[1]) {
+                return Err(format!("bad key name '{}'", words[1]));
+            }
+            // An Ed25519 public key is 32 bytes: 64 hex digits, the same
+            // spelling as a SHA-256.
+            let key = integrity::parse_hex(words[2])
+                .ok_or_else(|| format!("not a 64-hex-digit Ed25519 key: {}", words[2]))?;
+            Directive::FeedKey(String::from(words[1]), key)
+        }
+        "require-signed-feeds" => {
+            arity(2)?;
+            Directive::RequireSignedFeeds(parse_switch(words[1])?)
+        }
         "seal" => {
             arity(1)?;
             Directive::Seal
@@ -325,7 +345,7 @@ pub fn apply(d: &Directive) {
         Directive::Hash(d, p) => integrity::add_exec_hash(p, *d),
         Directive::RequireHash(on) => integrity::set_require_hash(*on),
         Directive::Signature(sig) => {
-            if av::add_signature(sig.clone()) {
+            if feed::add_local(sig.clone()) {
                 record(
                     0,
                     Severity::Notice,
@@ -348,6 +368,10 @@ pub fn apply(d: &Directive) {
                 );
             }
         }
+        Directive::FeedKey(name, key) => {
+            feed::add_key(name, *key);
+        }
+        Directive::RequireSignedFeeds(on) => feed::set_require_signed(*on),
         Directive::Seal => policy::seal_tighten_only(),
     }
 }
@@ -495,7 +519,7 @@ mod tests {
     fn the_shipped_example_is_inert_and_every_line_of_it_parses() {
         let example = include_str!("../../tools/hunterctl/policy.conf");
         assert_eq!(parse_script(example).unwrap(), vec![]);
-        const VERBS: [&str; 13] = [
+        const VERBS: [&str; 14] = [
             "mode",
             "learning",
             "anomaly-detection",
@@ -508,6 +532,7 @@ mod tests {
             "signature",
             "media-scan",
             "media-lock",
+            "require-signed-feeds",
             "seal",
         ];
         // `# mode wx report   # note` -> `mode wx report   # note`, which must
@@ -521,6 +546,47 @@ mod tests {
         let parsed = parse_script(&uncommented).unwrap();
         assert!(parsed.len() >= 10, "{:?}", parsed);
         assert_eq!(parsed.last(), Some(&Directive::Seal));
+    }
+
+    #[test]
+    fn feed_keys_and_the_signed_feeds_switch_parse_and_apply() {
+        let _g = crate::test_globals::lock();
+        reset();
+        feed::reset_for_test();
+        let pk = "e894b9801690dba2c365a9fa5f12e2b3a6fb788668ad34e48eb50265a8d41970";
+        let parsed = parse_script(&format!(
+            "feed-key test-pub {}\nrequire-signed-feeds on\n",
+            pk
+        ))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                Directive::FeedKey(String::from("test-pub"), integrity::parse_hex(pk).unwrap()),
+                Directive::RequireSignedFeeds(true),
+            ]
+        );
+        for d in &parsed {
+            apply(d);
+        }
+        assert!(feed::require_signed());
+        assert!(feed::render().contains(&format!("key test-pub {}", pk)));
+        for bad in [
+            "feed-key test-pub",
+            "feed-key ../x 00",
+            "feed-key k e894b980",
+            "require-signed-feeds maybe",
+        ] {
+            assert!(parse_line(bad).is_err(), "accepted: {}", bad);
+        }
+        feed::reset_for_test();
+    }
+
+    /// `/etc/hunter/keys` as shipped: comments only, so it trusts nobody.
+    #[test]
+    fn the_shipped_keys_file_is_inert() {
+        let keys = include_str!("../../tools/hunterctl/keys");
+        assert_eq!(parse_script(keys).unwrap(), vec![]);
     }
 
     #[test]

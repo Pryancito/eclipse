@@ -1,0 +1,118 @@
+#!/bin/sh
+# hunter-feed-sign -- the publisher's side of hunter's signed signature feeds.
+#
+# Runs on the machine that builds and serves a feed (any Linux or macOS box
+# with OpenSSL 3), NOT on Eclipse OS: the private key must never be on the
+# systems that trust it. Eclipse OS only verifies (in the kernel, see
+# hunter/src/feed.rs); this script only signs.
+#
+#   hunter-feed-sign keygen <key.pem> <keyname>
+#                       new Ed25519 key; prints the line to trust it with
+#   hunter-feed-sign pubkey <key.pem> <keyname>
+#                       print that line again
+#   hunter-feed-sign sign <key.pem> <keyname> <feed> <file> [serial]
+#                       write <file>.sig; serial defaults to the UTC time as
+#                       YYYYMMDDHHMMSS, so every new signing is newer
+#   hunter-feed-sign from-sha256 <feed> < list > file
+#                       turn a list of SHA-256s (abuse.ch MalwareBazaar's
+#                       export) into hunter signature lines
+#
+# A mirror of MalwareBazaar that hunter can verify, every few hours:
+#
+#   curl -fsSL https://bazaar.abuse.ch/export/txt/sha256/recent/ \
+#       | hunter-feed-sign from-sha256 MalwareBazaar.Signed > recent
+#   hunter-feed-sign sign feeds.pem mirror MalwareBazaar.Signed recent
+#   # publish recent and recent.sig side by side, then on Eclipse OS:
+#   #   hunterctl trust-key mirror <hex printed by keygen>
+#   #   echo 'sigs MalwareBazaar.Signed https://example.org/recent mirror' >> /etc/hunter/feeds
+#
+# The signed header (see hunter/src/feed.rs for why each line is there):
+#
+#   hunter-feed-signature 1
+#   feed <feed>
+#   serial <serial>
+#   key <keyname>
+#   sha256 <sha256 of the file>
+#   ed25519 <Ed25519 over the five lines above, newlines included>
+
+set -e
+
+die() {
+    echo "hunter-feed-sign: $*" >&2
+    exit 1
+}
+
+usage() {
+    sed -n '/^#   hunter-feed-sign keygen/,/^#                       export) into/p' "$0" | sed 's/^#//'
+    exit "${1:-0}"
+}
+
+# The same names the kernel takes: a file name in /etc/hunter/signatures.d
+# that is neither hidden nor a .sig.
+check_name() {
+    case "$1" in
+        ''|.*|*.sig|*[!A-Za-z0-9._-]*) die "bad name '$1' (letters, digits, '.', '-', '_')" ;;
+    esac
+    [ "${#1}" -le 64 ] || die "name longer than 64: $1"
+}
+
+hex() {
+    od -An -v -tx1 | tr -d ' \n'
+}
+
+pubkey() {
+    pk=$(openssl pkey -in "$1" -pubout -outform DER | tail -c 32 | hex) || die "cannot read $1"
+    [ "${#pk}" = 64 ] || die "$1 is not an Ed25519 key"
+    echo "feed-key $2 $pk"
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+keygen)
+    [ $# -eq 2 ] || usage 1
+    check_name "$2"
+    [ -e "$1" ] && die "$1 exists; not overwriting a key"
+    (umask 077 && openssl genpkey -algorithm ed25519 -out "$1") || die "openssl genpkey failed (OpenSSL 3 needed)"
+    echo "# On every Eclipse OS that should trust this key (as root):" >&2
+    echo "#   hunterctl trust-key $2 <the hex below>" >&2
+    pubkey "$1" "$2"
+    ;;
+pubkey)
+    [ $# -eq 2 ] || usage 1
+    pubkey "$1" "$2"
+    ;;
+sign)
+    [ $# -eq 4 ] || [ $# -eq 5 ] || usage 1
+    key=$1 keyname=$2 feed=$3 file=$4
+    serial=${5:-$(date -u +%Y%m%d%H%M%S)}
+    check_name "$keyname"
+    check_name "$feed"
+    case "$serial" in ''|*[!0-9]*) die "serial must be a decimal number" ;; esac
+    [ -s "$file" ] || die "no $file (or empty)"
+    # The kernel refuses a feed with a line it cannot parse; better to find
+    # out here than on every machine.
+    bad=$(grep -nvE '^[[:space:]]*(#|$)|^(hash|bytes):[^:]+:.' "$file" | head -n 1) || true
+    [ -z "$bad" ] || die "$file: not a hunter signature line: $bad"
+    sum=$(openssl dgst -sha256 -r "$file" | cut -d' ' -f1)
+    hdr=$(mktemp) && raw=$(mktemp) || die "mktemp failed"
+    trap 'rm -f "$hdr" "$raw"' EXIT
+    printf 'hunter-feed-signature 1\nfeed %s\nserial %s\nkey %s\nsha256 %s\n' \
+        "$feed" "$serial" "$keyname" "$sum" > "$hdr"
+    openssl pkeyutl -sign -inkey "$key" -rawin -in "$hdr" -out "$raw" || die "openssl pkeyutl failed"
+    { cat "$hdr"; printf 'ed25519 %s\n' "$(hex < "$raw")"; } > "$file.sig.new"
+    mv "$file.sig.new" "$file.sig"
+    echo "hunter-feed-sign: $file.sig: feed $feed serial $serial key $keyname"
+    ;;
+from-sha256)
+    [ $# -eq 1 ] || usage 1
+    check_name "$1"
+    awk -v n="$1" '!/^#/ && length($1) == 64 && $1 ~ /^[0-9a-fA-F]+$/ { print "hash:" tolower($1) ":" n }'
+    ;;
+-h|--help|help)
+    usage 0
+    ;;
+*)
+    usage 1
+    ;;
+esac

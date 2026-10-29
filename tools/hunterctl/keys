@@ -1,0 +1,17 @@
+# /etc/hunter/keys — the Ed25519 keys hunter checks signed feeds with.
+#
+# Read by the kernel at boot, before the feeds in /etc/hunter/signatures.d/,
+# as a script in hunter's control language (all or nothing, like
+# policy.conf). One line per publisher:
+#
+#   feed-key <name> <64 hex digits: the Ed25519 public key>
+#
+# `hunterctl trust-key <name> <hex>` adds a key to the running system and
+# here. A feed in /etc/hunter/feeds names the key it must be signed with as a
+# fourth field. The publisher makes the key and signs with it on another
+# machine, with tools/hunterctl/hunter-feed-sign from the Eclipse OS sources:
+#
+#   hunter-feed-sign keygen feeds.pem mirror     # prints the feed-key line
+#
+# Once hunter is sealed no key can be added, and a name never changes its key
+# until reboot.
