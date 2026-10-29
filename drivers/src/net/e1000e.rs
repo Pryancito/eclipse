@@ -2271,7 +2271,13 @@ impl E1000eHw {
         {
             let mut cmd = PCI_ACCESS.read16(&PortOpsImpl, self.pci_loc, 0x04);
             cmd |= 0x0004 | 0x0002; // Bus Master + Memory Space
-            PCI_ACCESS.write16(&PortOpsImpl, self.pci_loc, 0x04, cmd);
+            crate::bus::pci::cfgwrite::cfg_write16(
+                &PortOpsImpl,
+                PCI_ACCESS,
+                self.pci_loc,
+                0x04,
+                cmd,
+            );
         }
 
         // 8. CTRL_EXT: disable PCIe relaxed ordering, signal driver loaded.
@@ -4271,7 +4277,7 @@ impl PciDriver for E1000eDriverPci {
         unsafe {
             let mut cmd = PCI_ACCESS.read16(&PortOpsImpl, dev.loc, 0x04);
             cmd |= 0x0004 | 0x0002;
-            PCI_ACCESS.write16(&PortOpsImpl, dev.loc, 0x04, cmd);
+            crate::bus::pci::cfgwrite::cfg_write16(&PortOpsImpl, PCI_ACCESS, dev.loc, 0x04, cmd);
         }
 
         let vector = irq.map(|idx| idx + 32).unwrap_or(0);

@@ -7,6 +7,14 @@
 /// lo contesta igual que la placa, y sus tests corren donde corren los demas.
 pub mod rp1;
 
+/// El reparto de MSI del puente del BCM2712 de la Raspberry Pi 5: el otro
+/// extremo del cable del que [`rp1`] es el lado del dispositivo.
+///
+/// Sin `cfg` de arquitectura por la misma razon que `rp1`: son accesos `u32`
+/// volatiles a una ventana de registros, que un buffer del host contesta igual
+/// que la placa.
+pub mod bcm2712_mip;
+
 cfg_if::cfg_if! {
     if #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))] {
         mod riscv_intc;

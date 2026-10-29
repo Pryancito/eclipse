@@ -11,6 +11,7 @@
 //! bus=device=function=0 location never collides with 0/null.
 
 use crate::builder::IoMapper;
+use crate::bus::pci::cfgwrite::{cfg_write16, cfg_write8};
 #[cfg(not(test))]
 use crate::bus::pci::PortOpsImpl;
 use crate::bus::pci::PCI_ACCESS;
@@ -133,8 +134,8 @@ impl KernelHooks for EclipseNvrmHooks {
         let ops = port_ops();
         unsafe {
             match len {
-                1 => PCI_ACCESS.write8(ops, loc, offset as u16, value as u8),
-                2 => PCI_ACCESS.write16(ops, loc, offset as u16, value as u16),
+                1 => cfg_write8(ops, PCI_ACCESS, loc, offset as u16, value as u8),
+                2 => cfg_write16(ops, PCI_ACCESS, loc, offset as u16, value as u16),
                 _ => PCI_ACCESS.write32(ops, loc, offset as u16, value),
             }
         }

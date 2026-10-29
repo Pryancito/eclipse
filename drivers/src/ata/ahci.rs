@@ -1802,7 +1802,13 @@ impl PciDriver for AhciDriverPci {
             let ops = &crate::bus::pci::PortOpsImpl;
             let am = crate::bus::pci::PCI_ACCESS;
             let pci_command = am.read16(ops, dev.loc, 0x04);
-            am.write16(ops, dev.loc, 0x04, pci_command | 0x0004 | 0x0002 | 0x0001);
+            crate::bus::pci::cfgwrite::cfg_write16(
+                ops,
+                am,
+                dev.loc,
+                0x04,
+                pci_command | 0x0004 | 0x0002 | 0x0001,
+            );
         }
 
         let vaddr = mapped_vaddr;

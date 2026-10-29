@@ -50,7 +50,7 @@ pub(super) struct BootWindow<'a> {
 impl<'a> BootWindow<'a> {
     /// Prepare `gpu` for its own GSP boot and narrate what was done.
     pub(super) fn enter(gpu: &'a NvidiaGpu, tag: &'static str, log: &mut String) -> Self {
-        use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+        use crate::bus::pci::{cfgwrite::cfg_write16, PortOpsImpl, PCI_ACCESS};
         use pci::Location;
         let loc = Location {
             bus: gpu.pci_bus,
@@ -59,7 +59,7 @@ impl<'a> BootWindow<'a> {
         };
         let ops = &PortOpsImpl;
         let io_cmd_old = unsafe { PCI_ACCESS.read16(ops, loc, 0x04) };
-        unsafe { PCI_ACCESS.write16(ops, loc, 0x04, io_cmd_old & !0x0001) };
+        unsafe { cfg_write16(ops, PCI_ACCESS, loc, 0x04, io_cmd_old & !0x0001) };
         log.push_str(&alloc::format!(
             "[{}] PCI I/O decode disabled for the boot (COMMAND {:#06x} -> {:#06x})\n",
             tag,
@@ -85,7 +85,7 @@ impl<'a> BootWindow<'a> {
     }
 
     fn restore(&mut self) -> String {
-        use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+        use crate::bus::pci::{cfgwrite::cfg_write16, PortOpsImpl, PCI_ACCESS};
         use pci::Location;
         let mut s = String::new();
         let (restore_log, _) = self.gpu.set_path_vga_routing(false, &self.bridges_changed);
@@ -100,7 +100,7 @@ impl<'a> BootWindow<'a> {
             // The original COMMAND, except INTx stays masked: `gsp_boot_run`
             // masked it and Eclipse is fully polled.
             unsafe {
-                PCI_ACCESS.write16(&PortOpsImpl, loc, 0x04, io_cmd_old | (1 << 10));
+                cfg_write16(&PortOpsImpl, PCI_ACCESS, loc, 0x04, io_cmd_old | (1 << 10));
             }
             s.push_str(&alloc::format!(
                 "[{}] PCI I/O decode restored after boot\n",
