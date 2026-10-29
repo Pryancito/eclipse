@@ -2243,3 +2243,46 @@ fn the_key_count_is_the_number_of_public_keys_that_landed() {
         "the keys that were already there stopped being counted"
     );
 }
+
+/// `make image` takes `make`'s incremental branch whenever the rootfs already
+/// exists, which is nearly always. The desktop's own clients were copied only
+/// on the from-scratch branch, so an ordinary rebuild kept the lunarbar the
+/// rootfs was created with and never got lunarhunter at all. Both branches
+/// have to install them.
+#[test]
+fn both_make_paths_install_the_lunar_clients() {
+    let src = include_str!("mod.rs");
+    let make = src
+        .split("    pub fn make(&self, clear: bool) {")
+        .nth(1)
+        .expect("LinuxRootfs::make moved");
+    let (incremental, scratch) = make
+        .split_once("            return;\n        }\n")
+        .expect("the incremental branch no longer ends in `return;`");
+    assert!(
+        incremental.contains("self.install_lunar_tools(&bin);"),
+        "the incremental branch does not install lunarbar/lunarhunter"
+    );
+    let scratch = scratch.split("\n    }\n").next().unwrap();
+    assert!(
+        scratch.contains("self.install_lunar_tools(&bin);"),
+        "the from-scratch branch does not install lunarbar/lunarhunter"
+    );
+    let install = src
+        .split("fn install_lunar_tools(&self, bin: &Path) {")
+        .nth(1)
+        .unwrap()
+        .split("\n    }\n")
+        .next()
+        .unwrap();
+    for b in [
+        "lunarbg",
+        "lunarbar",
+        "lunarrun",
+        "lunarfile",
+        "lunarclip",
+        "lunarhunter",
+    ] {
+        assert!(install.contains(&format!("bin.join(\"{b}\")")), "{b}");
+    }
+}
