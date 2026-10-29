@@ -1585,7 +1585,7 @@ impl PciDriver for XgbeDriverPci {
         &self,
         dev: &PCIDevice,
         mapper: &Option<Arc<dyn IoMapper>>,
-        _irq: Option<usize>,
+        irq: Option<usize>,
     ) -> DeviceResult<Device> {
         let variant = variant_for(dev.id.device_id).ok_or(DeviceError::NotSupported)?;
 
@@ -1759,40 +1759,36 @@ impl PciDriver for XgbeDriverPci {
 
         warn!("[xgbe] xgbe.enable: running the bring-up sequence for the first time");
         let mut spins = 0u32;
-        match bring_up(&acc, &cfg, &mut || spins = spins.wrapping_add(1)) {
-            Ok(rings) => {
-                info!(
-                    "[xgbe] bring-up finished: {} B receive buffers, {} tx / {} rx \
-                     descriptors, {} poll iterations",
-                    rings.buffer_size(),
-                    TX_RING_SIZE,
-                    RX_RING_SIZE,
-                    spins
-                );
-                info!(
-                    "[xgbe] MAC_RCR={:#010x} MAC_TCR={:#010x} DMA_CH0_RCR={:#010x} \
-                     DMA_CH0_TCR={:#010x}",
-                    acc.read32(MAC_RCR),
-                    acc.read32(MAC_TCR),
-                    acc.read32(dma_channel_reg(0, DMA_CH_RCR)),
-                    acc.read32(dma_channel_reg(0, DMA_CH_TCR))
-                );
-            }
+        let rings = match bring_up(&acc, &cfg, &mut || spins = spins.wrapping_add(1)) {
+            Ok(rings) => rings,
             Err(e) => {
                 warn!("[xgbe] bring-up failed at {:?} after {} polls", e, spins);
                 return Err(e);
             }
-        }
-
-        // And still no interface: the rings exist and the chip is configured,
-        // but nothing is plumbed into the stack yet, so there is nothing to
-        // hand a packet to. What the four lines above print is what a log
-        // from a real card has to show before the next step is worth taking.
-        warn!(
-            "[xgbe] the sequence ran, but there is no interface yet: \
-             leaving the device unclaimed"
+        };
+        info!(
+            "[xgbe] bring-up finished: {} B receive buffers, {} tx / {} rx \
+             descriptors, {} poll iterations",
+            rings.buffer_size(),
+            TX_RING_SIZE,
+            RX_RING_SIZE,
+            spins
         );
-        Err(DeviceError::NotSupported)
+        info!(
+            "[xgbe] MAC_RCR={:#010x} MAC_TCR={:#010x} DMA_CH0_RCR={:#010x} \
+             DMA_CH0_TCR={:#010x}",
+            acc.read32(MAC_RCR),
+            acc.read32(MAC_TCR),
+            acc.read32(dma_channel_reg(0, DMA_CH_RCR)),
+            acc.read32(dma_channel_reg(0, DMA_CH_TCR))
+        );
+
+        let name = crate::net::next_eth_ifname();
+        // The same `+ 32` the other PCI NICs apply: the registry hands out a
+        // GSI index and the handler is keyed on the vector.
+        let vector = irq.map(|idx| idx + 32).unwrap_or(0);
+        let iface = new_interface(name, vector, acc, rings, version.snps, mac)?;
+        Ok(as_device(iface))
     }
 }
 
@@ -1804,6 +1800,9 @@ pub use rings::*;
 
 mod bringup;
 pub use bringup::*;
+
+mod iface;
+pub use iface::*;
 
 #[cfg(test)]
 mod fake;
