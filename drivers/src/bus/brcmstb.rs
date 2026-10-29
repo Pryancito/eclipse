@@ -93,6 +93,14 @@ pub const PM_CLK_PERIOD: u32 = 0xff;
 /// redondeado hacia abajo es `0x12`. Es el arreglo de la errata de L1SS.
 pub const PM_CLK_PERIOD_2712: u32 = 0x12;
 
+/// `PCIE_RC_DL_MDIO_ADDR`: el registro de direccion del bus MDIO del PHY del
+/// puente. Ver [`mdio`].
+pub const RC_DL_MDIO_ADDR: usize = 0x1100;
+/// `PCIE_RC_DL_MDIO_WR_DATA`.
+pub const RC_DL_MDIO_WR_DATA: usize = 0x1104;
+/// `PCIE_RC_DL_MDIO_RD_DATA`.
+pub const RC_DL_MDIO_RD_DATA: usize = 0x1108;
+
 /// `PCIE_MISC_MISC_CTRL`.
 pub const MISC_MISC_CTRL: usize = 0x4008;
 /// `..._PCIE_RCB_MPS_MODE_MASK`.
@@ -468,6 +476,7 @@ impl BrcmPcie {
     }
 }
 
+pub mod mdio;
 pub mod reset;
 
 #[cfg(test)]

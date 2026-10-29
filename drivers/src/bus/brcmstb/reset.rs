@@ -45,7 +45,7 @@ const MODULE: &str = "brcm-reset";
 /// Espera activa de `us` microsegundos, con la misma salida que el resto de los
 /// drivers del árbol: un tope de vueltas, para que un reloj que no avanza deje
 /// el arranque con un retardo corto de más en vez de colgar el núcleo.
-fn udelay(us: u64) {
+pub(super) fn udelay(us: u64) {
     #[cfg(test)]
     reset_fake::ESPERADO.with(|c| c.set(c.get() + us));
     if us == 0 {
@@ -299,7 +299,7 @@ impl PcieRescal {
 /// La única parte del silicio que un banco de registros de mentira no puede
 /// imitar: un bit que **no se queda** donde se escribe.
 #[cfg(test)]
-mod reset_fake {
+pub(super) mod reset_fake {
     use core::cell::Cell;
 
     std::thread_local! {
