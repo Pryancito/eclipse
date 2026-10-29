@@ -174,6 +174,10 @@ One directive per line; blank lines and `#` comments are ignored.
 | `hash <sha256> <path>`                 | pin a program's SHA-256 (see below)                 |
 | `require-hash <on\|off>`               | an unpinned program is an integrity violation       |
 | `signature <hash\|bytes>:<data>:<Name>` | add an antivirus signature (never removable)       |
+| `media-scan <on\|off>`                 | queue new removable media for a scan (default on)   |
+| `media-lock <on\|off>`                 | nothing runs from media until it scans clean (default off) |
+| `media <id> scanning\|failed`          | a scan agent took / gave up on a device             |
+| `media <id> done <files> <infected>`   | a scan agent's verdict on a device                  |
 | `seal`                                 | engage the one-way tighten-only latch               |
 
 **All or nothing.** A script (a whole `policy.conf`, or one `write(2)` to
@@ -187,7 +191,8 @@ nobody wrote.
 **The latch.** Directives run in order, so `seal` binds the lines after it.
 Once sealed, every relaxing directive is refused and recorded (`mode X` to a
 lower mode, `learning on`, `trust`, `anomaly-detection off`,
-`privileged-deny off`); tightening ones still apply. Only a reboot unseals.
+`privileged-deny off`, `media-scan off`, `media-lock off`, a clean verdict
+for a device already found infected); tightening ones still apply. Only a reboot unseals.
 
 **Who may write.** `/proc/hunter` is mode `0644`, and the write handler checks
 the *effective* uid of the writing process, not just the open: a descriptor
@@ -213,7 +218,9 @@ hunterctl quarantine <file>...  move into /var/lib/hunter/quarantine, deny the p
 hunterctl quarantined           list the quarantine
 hunterctl restore <sha256>      put a quarantined file back
 hunterctl update-signatures     download the feeds in /etc/hunter/feeds
-hunterctl lockdown              exec + integrity + av enforce, learning off, seal
+hunterctl scan-media [id|dir]...  scan removable media (default: every pending one)
+hunterctl media-scan|media-lock <on|off>
+hunterctl lockdown              exec + integrity + av enforce, media-lock on, learning off, seal
 hunterctl save-learned          append learned programs to /etc/hunter/whitelist
 ```
 
@@ -277,7 +284,7 @@ the bar as `/bin/lunarhunter`, in the app menu as **Seguridad (hunter)**
 | Tab | What it does |
 |---|---|
 | Resumen | the stance in one line, eight counters, the latest alerts; quick actions: scan home, update signatures, EICAR test, lockdown |
-| Protección | the six domains with what each guards, the four switches (`learning`, `anomaly-detection`, `privileged-deny`, `require-hash`); **save as boot policy** writes the live stance to `/etc/hunter/policy.conf` (old file kept as `policy.conf.bak`), **apply policy.conf**, and **seal** |
+| Protección | the six domains with what each guards, the six switches (`learning`, `anomaly-detection`, `privileged-deny`, `require-hash`, `media-scan`, `media-lock`); **save as boot policy** writes the live stance to `/etc/hunter/policy.conf` (old file kept as `policy.conf.bak`), **apply policy.conf**, and **seal** |
 | Eventos | the whole event ring with time, pid, severity and category, filtered by all / alerts / critical |
 | Escaneo | presets (home, `/tmp`, programs, `/`, or `--scan PATH...`), a live count with a stop button, per-finding or all-at-once quarantine, or automatic quarantine as it goes |
 | Cuarentena | `/var/lib/hunter/quarantine/index`, each row restorable (two clicks) |
@@ -402,6 +409,59 @@ first 128 MiB of an image, and each pattern is a separate anchored pass, which
 fits the hundreds of patterns an operator curates rather than a commercial
 database. Shared libraries loaded later with `mmap(PROT_EXEC)` are not scanned
 yet; their bytes are only scanned on demand.
+
+## Removable media (USB sticks, cards, external disks)
+
+[`hunter::media`](../hunter/src/media.rs) scans every filesystem mounted from
+a block device after boot: a USB stick, an SD card, an external disk, a loop
+image. `mount(2)` tells hunter about each one (the boot mounts from
+`/etc/fstab` do not go through it), and `/proc/hunter` lists them:
+
+```
+media: auto-scan=on lock=off devices=1
+media-device: id=3 state=pending files=0 infected=0 fstype=vfat source=/dev/sdb1 target=/media/usb
+```
+
+**Who scans.** The kernel does not walk the new tree itself: `mount(2)` would
+not return until every file on a 64 GB stick had been read. A userland agent
+does, through the same `/proc/hunter_scan` batches as `hunterctl scan`, and
+reports back in the control language (`media <id> scanning`, then
+`media <id> done <files> <infected>` or `media <id> failed`):
+
+* **lunarbar** (as root) sees a `state=pending` device on its next read of
+  `/proc/hunter`, within a few seconds, and runs `hunterctl scan-media <id>`
+  in the background, one device at a time. Its shield menu has a line for the
+  device being scanned (or an infected one, or the newest), and lunarhunter's
+  *Resumen* tab lists every device with its verdict, the findings of an
+  infected one and a button to scan it again.
+* **`hunterctl scan-media`** scans every pending device by hand: on a console
+  without the desktop, or when the bar is not running as root. With an id or
+  a mount point it scans that device again.
+
+`scan-media` walks with `find -xdev` (a disk mounted inside the stick is its
+own device), leaves one report per device in `/run/hunter/media/<id>` (the
+`FOUND` and `ERROR` lines and a summary), and exits 1 if anything was found.
+
+**What a detection does.** An infected device is a `CRIT MEDIA INFECTED`
+event, so the bar's shield turns to alert. Each infected file is `deny`ed
+(the exec blacklist, until reboot), so it does not run even with
+`mode av report`. The files are not moved into the quarantine: they are on
+somebody's stick, and `hunterctl quarantine` is one step away.
+
+**The lock.** `media-lock on` refuses to run anything from a device whose
+scan has not come back clean: pending, being scanned, failed or infected
+(`CRIT MEDIA BLOCKED`). It is asked of the file's real location, like the
+blacklist, so a link elsewhere to a program on the stick is still that
+program. It is off by default, because without an agent a device stays
+pending and its programs would never run; `hunterctl lockdown` turns it on.
+`media-scan off` mounts new devices as `state=skipped`, which the lock lets
+through.
+
+**Limits.** Only one scan runs at a time, and `/proc/hunter_scan` keeps one
+batch of results for everybody: a manual `hunterctl scan` while a stick is
+being scanned can mix their results. A file written to the stick after its
+scan is not scanned again until it is run (on-access) or the device is
+scanned again.
 
 ## Intrusion detection (heuristics)
 

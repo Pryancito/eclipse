@@ -320,7 +320,8 @@ pub fn count_pins(text: &str) -> usize {
 }
 
 /// The script that reproduces the stance the report shows: the six modes,
-/// learning, the two heuristics, require-hash, and the seal when it is on.
+/// learning, the two heuristics, require-hash, the two media switches, and
+/// the seal when it is on.
 ///
 /// This is what "save as the boot policy" writes, so a stance tuned in the
 /// window survives the reboot that would otherwise drop it back to the
@@ -341,6 +342,10 @@ pub fn policy_script(r: &Report) -> String {
     ));
     s.push_str(&format!("privileged-deny {}\n", onoff(r.privileged_deny)));
     s.push_str(&format!("require-hash {}\n", onoff(r.require_hash)));
+    if st.media_known {
+        s.push_str(&format!("media-scan {}\n", onoff(st.media_scan)));
+        s.push_str(&format!("media-lock {}\n", onoff(st.media_lock)));
+    }
     if st.sealed {
         s.push_str("seal\n");
     }
@@ -365,14 +370,18 @@ pub enum Switch {
     AnomalyDetection,
     PrivilegedDeny,
     RequireHash,
+    MediaScan,
+    MediaLock,
 }
 
 impl Switch {
-    pub const ALL: [Switch; 4] = [
+    pub const ALL: [Switch; 6] = [
         Switch::Learning,
         Switch::AnomalyDetection,
         Switch::PrivilegedDeny,
         Switch::RequireHash,
+        Switch::MediaScan,
+        Switch::MediaLock,
     ];
 
     /// The directive, which is also `hunterctl`'s subcommand.
@@ -382,6 +391,8 @@ impl Switch {
             Switch::AnomalyDetection => "anomaly-detection",
             Switch::PrivilegedDeny => "privileged-deny",
             Switch::RequireHash => "require-hash",
+            Switch::MediaScan => "media-scan",
+            Switch::MediaLock => "media-lock",
         }
     }
 
@@ -391,11 +402,13 @@ impl Switch {
             Switch::AnomalyDetection => r.anomaly_detection,
             Switch::PrivilegedDeny => r.privileged_deny,
             Switch::RequireHash => r.require_hash,
+            Switch::MediaScan => r.status.media_scan,
+            Switch::MediaLock => r.status.media_lock,
         }
     }
 
     /// Which way relaxes. Learning ON trusts what runs, so on is the loose
-    /// side; the other three are protections, so off is.
+    /// side; the others are protections, so off is.
     pub fn relaxes(self, to: bool) -> bool {
         match self {
             Switch::Learning => to,
@@ -429,6 +442,7 @@ exec allowlist: active (configured=4, learned=2); blacklist=1; learning=on\n\
 heuristics: anomaly-detection=on privileged-deny=off\n\
 integrity: pinned=7 require-hash=on\n\
 av: signatures=5002 (hash=5000 bytes=2) detections=1\n\
+media: auto-scan=on lock=off devices=0\n\
 learned-programs (2):\n  /bin/ls\n  /bin/sh\n\
 \n\
 recent events (oldest first):\n\
@@ -524,7 +538,11 @@ recent events (oldest first):\n\
         let s = policy_script(&r);
         assert!(s.starts_with("mode syscall enforce\nmode wx report\n"));
         assert!(s.contains("mode av enforce\nlearning on\nanomaly-detection on\n"));
-        assert!(s.contains("privileged-deny off\nrequire-hash on\n"));
+        assert!(s.contains("privileged-deny off\nrequire-hash on\nmedia-scan on\nmedia-lock off\n"));
+        // A kernel without the media table would reject the whole file.
+        let mut old = r.clone();
+        old.status.media_known = false;
+        assert!(!policy_script(&old).contains("media"));
         assert!(!s.contains("seal"));
         r.status.sealed = true;
         assert!(policy_script(&r).ends_with("seal\n"));

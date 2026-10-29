@@ -15,6 +15,7 @@
 //! | [`check_mmap`]        | `mmap`                      | W^X memory      |
 //! | [`check_exec_integrity`] | `execve` / loader / interp | exec integrity (SHA-256) |
 //! | [`check_exec_av`]     | `execve` / loader / interp  | antivirus (signatures) |
+//! | [`media::note_mount`] | `mount(2)` / `umount2`      | removable media scan |
 //! | [`check_mprotect`]    | `mprotect`                  | W^X memory      |
 //! | [`check_munmap`]      | `munmap`                    | W^X bookkeeping |
 //! | [`task_fork`]         | `fork` / `clone`            | policy lifecycle|
@@ -46,6 +47,7 @@ pub mod control;
 pub mod event_log;
 pub mod heuristics;
 pub mod integrity;
+pub mod media;
 pub mod policy;
 pub mod wx;
 
@@ -167,6 +169,12 @@ pub fn check_elf_binary(path: &str, elf_data: &[u8]) -> bool {
 /// violation of the exec mode, whatever the name looked like.
 pub fn check_exec_target(name: &str, resolved: &str, elf_data: &[u8]) -> bool {
     if !check_elf_binary(name, elf_data) {
+        return false;
+    }
+    // Asked of where the file IS, like the blacklist below: a link in /tmp
+    // to a program on an unscanned stick is still that program. Its own
+    // switch, not the exec mode: see `media`.
+    if !media::check_exec(resolved) {
         return false;
     }
     let mode = policy::exec_mode();
@@ -544,6 +552,7 @@ pub fn render_report() -> String {
         av_patterns,
         av_hits
     ));
+    out.push_str(&media::render());
     // Machine-readable dump of learned programs so a userspace helper can
     // persist them to /etc/hunter/whitelist (kernel never writes the FS).
     let learned = policy::learned_exec_paths();

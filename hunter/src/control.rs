@@ -26,6 +26,10 @@
 //! | `hash <sha256> <path>`                  | pin a program's SHA-256 (see [`crate::integrity`]) |
 //! | `require-hash <on\|off>`                | an unpinned program is an integrity violation |
 //! | `signature <hash\|bytes>:<data>:<Name>` | add an antivirus signature (see [`crate::av`]) |
+//! | `media-scan <on\|off>`                  | queue new removable media for a scan (see [`crate::media`]) |
+//! | `media-lock <on\|off>`                  | nothing runs from media until it scans clean  |
+//! | `media <id> scanning\|failed`           | a scan agent took / gave up on a device       |
+//! | `media <id> done <files> <infected>`    | a scan agent's verdict on a device            |
 //! | `seal`                                  | engage the one-way tighten-only latch         |
 //!
 //! A trailing `/` makes `trust` / `deny` a directory prefix, exactly as in
@@ -59,6 +63,7 @@ use crate::av;
 use crate::event_log::{record, Severity};
 use crate::heuristics;
 use crate::integrity::{self, Digest};
+use crate::media;
 use crate::policy::{self, Mode};
 
 /// An enforcement domain a `mode` directive can name.
@@ -85,6 +90,9 @@ pub enum Directive {
     Hash(Digest, String),
     RequireHash(bool),
     Signature(av::Signature),
+    MediaScan(bool),
+    MediaLock(bool),
+    Media(u64, media::Report),
     Seal,
 }
 
@@ -174,6 +182,35 @@ pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
         "require-hash" => {
             arity(2)?;
             Directive::RequireHash(parse_switch(words[1])?)
+        }
+        "media-scan" => {
+            arity(2)?;
+            Directive::MediaScan(parse_switch(words[1])?)
+        }
+        "media-lock" => {
+            arity(2)?;
+            Directive::MediaLock(parse_switch(words[1])?)
+        }
+        "media" => {
+            let id = words.get(1).and_then(|w| w.parse().ok());
+            let count = |i: usize| words.get(i).and_then(|w| w.parse().ok());
+            let report = match words.get(2).copied() {
+                Some("scanning") if words.len() == 3 => Some(media::Report::Scanning),
+                Some("failed") if words.len() == 3 => Some(media::Report::Failed),
+                Some("done") if words.len() == 5 => match (count(3), count(4)) {
+                    (Some(files), Some(infected)) => Some(media::Report::Done { files, infected }),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match (id, report) {
+                (Some(id), Some(r)) => Directive::Media(id, r),
+                _ => {
+                    return Err(String::from(
+                        "'media' takes '<id> scanning', '<id> failed' or '<id> done <files> <infected>'",
+                    ))
+                }
+            }
         }
         "seal" => {
             arity(1)?;
@@ -298,6 +335,19 @@ pub fn apply(d: &Directive) {
                 );
             }
         }
+        Directive::MediaScan(on) => media::set_auto_scan(*on),
+        Directive::MediaLock(on) => media::set_lock(*on),
+        Directive::Media(id, r) => {
+            if !media::report(*id, *r) {
+                record(
+                    0,
+                    Severity::Notice,
+                    "MEDIA",
+                    "STALE",
+                    format!("report for unknown media #{} ignored (unmounted?)", id),
+                );
+            }
+        }
         Directive::Seal => policy::seal_tighten_only(),
     }
 }
@@ -393,6 +443,11 @@ mod tests {
             mode integrity enforce\n\
             hash ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  /usr/bin/my tool\n\
             require-hash on\n\
+            media-scan on\n\
+            media-lock on\n\
+            media 7 scanning\n\
+            media 7 done 120 0\n\
+            media 8 failed\n\
             seal\n";
         assert_eq!(
             parse_script(script).unwrap(),
@@ -417,6 +472,17 @@ mod tests {
                     String::from("/usr/bin/my tool")
                 ),
                 Directive::RequireHash(true),
+                Directive::MediaScan(true),
+                Directive::MediaLock(true),
+                Directive::Media(7, media::Report::Scanning),
+                Directive::Media(
+                    7,
+                    media::Report::Done {
+                        files: 120,
+                        infected: 0
+                    }
+                ),
+                Directive::Media(8, media::Report::Failed),
                 Directive::Seal,
             ]
         );
@@ -429,7 +495,7 @@ mod tests {
     fn the_shipped_example_is_inert_and_every_line_of_it_parses() {
         let example = include_str!("../../tools/hunterctl/policy.conf");
         assert_eq!(parse_script(example).unwrap(), vec![]);
-        const VERBS: [&str; 11] = [
+        const VERBS: [&str; 13] = [
             "mode",
             "learning",
             "anomaly-detection",
@@ -440,6 +506,8 @@ mod tests {
             "hash",
             "require-hash",
             "signature",
+            "media-scan",
+            "media-lock",
             "seal",
         ];
         // `# mode wx report   # note` -> `mode wx report   # note`, which must
@@ -484,6 +552,12 @@ mod tests {
             "hash deadbeef /bin/x",
             "hash",
             "require-hash",
+            "media-lock",
+            "media 3",
+            "media x done 1 0",
+            "media 3 done 1",
+            "media 3 done -1 0",
+            "media 3 scanning now",
             "frobnicate",
         ] {
             assert!(parse_line(bad).is_err(), "accepted: {}", bad);

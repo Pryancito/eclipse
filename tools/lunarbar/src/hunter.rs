@@ -26,11 +26,12 @@ pub const DOMAINS: [&str; 6] = ["syscall", "wx", "exec", "anomaly", "integrity",
 pub const RECENT: usize = 4;
 
 /// What `hunterctl lockdown` sends, word for word: exec, integrity and the
-/// antivirus enforced, learning off, then the seal. W^X and the anomaly
+/// antivirus enforced, nothing run from media that has not scanned clean,
+/// learning off, then the seal. W^X and the anomaly
 /// heuristics stay where they are (enforcing W^X breaks every JIT); see the
 /// comment on `lockdown` in `tools/hunterctl/hunterctl`.
 pub const LOCKDOWN: &str =
-    "mode exec enforce\nmode integrity enforce\nmode av enforce\nlearning off\nseal\n";
+    "mode exec enforce\nmode integrity enforce\nmode av enforce\nmedia-lock on\nlearning off\nseal\n";
 
 /// A domain's enforcement mode, as hunter spells it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,6 +90,66 @@ pub struct Status {
     pub pinned: u64,
     /// The newest [`RECENT`] warnings and criticals, newest first.
     pub recent: Vec<Event>,
+    /// The kernel has the media table at all (prints a `media:` line). One
+    /// from before it would reject a policy that names `media-scan`.
+    pub media_known: bool,
+    /// New USB sticks and disks are queued for a scan (`media-scan`).
+    pub media_scan: bool,
+    /// Nothing runs from media until it scans clean (`media-lock`).
+    pub media_lock: bool,
+    /// The removable devices mounted now, oldest first.
+    pub media: Vec<Media>,
+}
+
+/// Where a removable device's scan stands, as the kernel spells it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MediaState {
+    #[default]
+    Pending,
+    Scanning,
+    Clean,
+    Infected,
+    Failed,
+    Skipped,
+}
+
+impl MediaState {
+    pub fn parse(s: &str) -> Option<MediaState> {
+        Some(match s {
+            "pending" => MediaState::Pending,
+            "scanning" => MediaState::Scanning,
+            "clean" => MediaState::Clean,
+            "infected" => MediaState::Infected,
+            "failed" => MediaState::Failed,
+            "skipped" => MediaState::Skipped,
+            _ => return None,
+        })
+    }
+}
+
+/// One `media-device:` line: a filesystem mounted from a device after boot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Media {
+    pub id: u64,
+    pub state: MediaState,
+    pub files: u64,
+    pub infected: u64,
+    pub source: String,
+    /// The mount point; the rest of the line, so it may hold spaces.
+    pub target: String,
+}
+
+/// A `media-device:` line's fields after the prefix.
+fn parse_media(rest: &str) -> Option<Media> {
+    let (head, target) = rest.split_once(" target=")?;
+    Some(Media {
+        id: field(head, "id")?.parse().ok()?,
+        state: MediaState::parse(field(head, "state")?)?,
+        files: num(head, "files"),
+        infected: num(head, "infected"),
+        source: field(head, "source").unwrap_or("").to_string(),
+        target: target.to_string(),
+    })
 }
 
 /// The bar's shield, one glance's worth of the status.
@@ -168,6 +229,12 @@ pub fn parse(report: &str) -> Option<Status> {
         } else if let Some(rest) = line.strip_prefix("av:") {
             st.signatures = num(rest, "signatures");
             st.detections = num(rest, "detections");
+        } else if let Some(rest) = line.strip_prefix("media-device:") {
+            st.media.extend(parse_media(rest));
+        } else if let Some(rest) = line.strip_prefix("media:") {
+            st.media_known = true;
+            st.media_scan = field(rest, "auto-scan") == Some("on");
+            st.media_lock = field(rest, "lock") == Some("on");
         } else if line.starts_with("recent events") {
             in_events = true;
         }
@@ -399,6 +466,9 @@ exec allowlist: active (configured=4, learned=2); blacklist=1; learning=on\n\
 heuristics: anomaly-detection=on privileged-deny=off\n\
 integrity: pinned=7 require-hash=off\n\
 av: signatures=5002 (hash=5000 bytes=2) detections=1\n\
+media: auto-scan=on lock=off devices=2\n\
+media-device: id=3 state=infected files=40 infected=2 fstype=vfat source=/dev/sdb1 target=/media/My Stick\n\
+media-device: id=4 state=pending files=0 infected=0 fstype=vfat source=/dev/sdc1 target=/mnt\n\
 learned-programs (2):\n  /bin/ls\n  /bin/sh\n\
 \n\
 recent events (oldest first):\n\
@@ -512,6 +582,41 @@ recent events (oldest first):\n\
             .next()
             .unwrap();
         assert_eq!(format!("{sent}\n"), LOCKDOWN);
+    }
+
+    #[test]
+    fn the_media_lines_read_into_devices_with_spaces_in_the_mount_point_kept() {
+        let st = parse(REPORT).unwrap();
+        assert!(st.media_known && st.media_scan);
+        assert!(!st.media_lock);
+        assert_eq!(
+            st.media,
+            vec![
+                Media {
+                    id: 3,
+                    state: MediaState::Infected,
+                    files: 40,
+                    infected: 2,
+                    source: "/dev/sdb1".into(),
+                    target: "/media/My Stick".into(),
+                },
+                Media {
+                    id: 4,
+                    state: MediaState::Pending,
+                    source: "/dev/sdc1".into(),
+                    target: "/mnt".into(),
+                    ..Media::default()
+                },
+            ]
+        );
+        // A kernel from before the media table: none, and scanning reads off.
+        let old: String = REPORT
+            .lines()
+            .filter(|l| !l.starts_with("media"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let st = parse(&old).unwrap();
+        assert!(st.media.is_empty() && !st.media_scan && !st.media_known);
     }
 
     #[test]

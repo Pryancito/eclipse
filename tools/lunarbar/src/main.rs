@@ -710,6 +710,8 @@ struct State {
     /// has seen by opening its menu.
     hunter: Option<hunter::Status>,
     hunter_seen: u64,
+    /// Starts the scan of each USB stick or disk hunter says is pending.
+    hunter_media: lunarbar::hunter_media::Agent,
 }
 
 impl State {
