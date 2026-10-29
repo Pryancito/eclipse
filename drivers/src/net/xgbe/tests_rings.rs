@@ -429,3 +429,51 @@ fn the_rings_the_sequence_returns_are_already_programmed() {
     assert!(fake.writes_to(dma_channel_reg(0, DMA_CH_TDLR_LO)) >= 1);
     rings.send(&fake, &[1u8; 64]).unwrap();
 }
+
+// ——— Tanda 30: la interfaz ———
+
+#[test]
+fn a_frame_too_long_for_the_wire_is_refused_and_not_clipped() {
+    // Refused, because a frame clipped to the buffer goes out corrupt
+    // while the caller is told it all went: the loss only ever shows up
+    // at the far end.
+    assert!(tx_frame_postable(1));
+    assert!(tx_frame_postable(1514));
+    assert!(!tx_frame_postable(1515));
+    assert!(!tx_frame_postable(0));
+}
+
+#[test]
+fn the_hardware_handle_reclaims_before_it_answers_whether_it_can_send() {
+    let fake = FakeXgmac::new();
+    let mut rings = XgbeRings::alloc(0, MTU).unwrap();
+    rings.program(&fake).unwrap();
+    // Fill the ring without ever reclaiming.
+    while rings.can_send() {
+        rings.send(&fake, &[1u8; 60]).unwrap();
+    }
+    assert!(!rings.can_send());
+    // The chip gives one back, and `can_send` has to notice without
+    // anyone calling `reclaim_tx` by hand --- which is the whole reason
+    // `XgbeHw::can_send` takes `&mut self`.
+    rings.tx_give_back(0);
+    assert!(!rings.can_send());
+    assert_eq!(rings.reclaim_tx(), 1);
+    assert!(rings.can_send());
+}
+
+#[test]
+fn a_quiet_status_is_not_claimed_as_ours() {
+    // On a shared INTx line another device's interrupt brings the
+    // handler here too, and claiming a status of zero would swallow it.
+    let quiet = decode_dma_status(0);
+    assert!(dma_status_is_quiet(&quiet));
+    // Anything real is not quiet, including the two that are only ever
+    // reported and not acted on.
+    let mut noisy = quiet;
+    noisy.rx_buffer_unavailable = true;
+    assert!(!dma_status_is_quiet(&noisy));
+    let mut fatal = quiet;
+    fatal.fatal_bus_error = true;
+    assert!(!dma_status_is_quiet(&fatal));
+}
