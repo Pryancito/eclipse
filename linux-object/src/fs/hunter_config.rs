@@ -7,13 +7,19 @@
 //! * `/etc/hunter/blacklist` — denied programs that must never run.
 //! * `/etc/hunter/hashes` — pinned SHA-256 digests, in `sha256sum` format
 //!   (`<sha256>  <path>`), so `sha256sum /bin/* > /etc/hunter/hashes` writes it.
-//! * `/etc/hunter/signatures` and `/etc/hunter/signatures.d/*` — the
-//!   antivirus database (`hash:<sha256>:<Name>` / `bytes:<hex>:<Name>`); the
-//!   directory is where `hunterctl update-signatures` puts its feeds.
+//! * `/etc/hunter/signatures` — the operator's own antivirus signatures
+//!   (`hash:<sha256>:<Name>` / `bytes:<hex>:<Name>`).
+//! * `/etc/hunter/keys` — `feed-key <name> <hex>` lines: the Ed25519 keys
+//!   signed feeds are checked with (see `hunter::feed`).
 //! * `/etc/hunter/policy.conf` — a script in hunter's control language
 //!   (`mode exec enforce`, `learning off`, `seal`, ...; see
-//!   `hunter::control`), applied last so it can override the learning
-//!   default below and seal the result.
+//!   `hunter::control`), applied after the lists so it can override the
+//!   learning default below and seal the result.
+//! * `/etc/hunter/signatures.d/*` — the feeds `hunterctl update-signatures`
+//!   downloads, each verified against its `.sig` when it has one (see
+//!   `hunter_feeds`). Last, after the keys and after policy.conf, which may
+//!   say `require-signed-feeds on`; a feed only ever adds signatures, so the
+//!   seal does not stand in its way.
 //!
 //! Each non-empty, non-`#` line is one entry. A trailing `/` makes it a
 //! directory prefix (everything beneath it); otherwise it is an exact program
@@ -49,24 +55,20 @@ pub fn load(root: &Arc<dyn INode>) {
         kernel_hal::klog_info!("hunter: pinned {} SHA-256 digests", n_hash);
     }
     let mut n_sig = load_signatures(root, SIGNATURES_FILE);
-    // Downloaded feeds (`hunterctl update-signatures`), one file each.
-    if let Ok(dir) = root.lookup(SIGNATURES_DIR) {
-        let mut names = dir.list().unwrap_or_default();
-        names.sort();
-        for name in names.iter().filter(|n| !n.starts_with('.')) {
-            n_sig += load_signatures(root, &alloc::format!("{}/{}", SIGNATURES_DIR, name));
-        }
-    }
+    // The keys before the feeds they verify; policy.conf before them too, for
+    // `require-signed-feeds`.
+    load_policy(root, KEYS_FILE);
+    load_policy(root, POLICY_CONF);
+    n_sig += super::hunter_feeds::load_all(root);
     if n_sig > 0 {
         kernel_hal::klog_info!("hunter: loaded {} antivirus signatures", n_sig);
     }
-    load_policy(root, POLICY_CONF);
 }
 
-/// The antivirus database (see `hunter::av`).
+/// The operator's own antivirus signatures (see `hunter::av`).
 const SIGNATURES_FILE: &str = "/etc/hunter/signatures";
-/// Downloaded signature feeds, one file per feed.
-const SIGNATURES_DIR: &str = "/etc/hunter/signatures.d";
+/// Trusted feed keys, as `feed-key` directives.
+const KEYS_FILE: &str = "/etc/hunter/keys";
 
 /// Reads `/etc/hunter/signatures` into the antivirus database, line by line:
 /// a bad line loses one signature, said by name, not the database.
@@ -75,7 +77,7 @@ fn load_signatures(root: &Arc<dyn INode>, path: &str) -> usize {
     for_each_line(root, path, |i, line| {
         match hunter::av::parse_signature(line) {
             Ok(Some(sig)) => {
-                if hunter::av::add_signature(sig) {
+                if hunter::feed::add_local(sig) {
                     count += 1;
                 }
             }
@@ -520,10 +522,10 @@ mod hunter_config_tests {
         let feed = feeds.create("bazaar", FileType::File, 0o644).unwrap();
         feed.write_at(0, b"bytes:a12a12a12a13:Test.Feed\n").unwrap();
         let before = hunter::av::stats().1;
-        let mut n = load_signatures(&root, SIGNATURES_FILE);
+        let n = load_signatures(&root, SIGNATURES_FILE);
         assert_eq!(n, 1, "the bad line, and only it, skipped");
-        n += load_signatures(&root, "/etc/hunter/signatures.d/bazaar");
-        assert_eq!(n, 2);
+        // A feed is all or nothing, and it is whole.
+        assert_eq!(super::super::hunter_feeds::load_all(&root), 1);
         assert_eq!(hunter::av::stats().1, before + 2);
     }
 

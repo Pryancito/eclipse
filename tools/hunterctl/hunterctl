@@ -27,7 +27,16 @@
 #   hunterctl quarantine <file>...  move files into the quarantine and deny their paths
 #   hunterctl quarantined           list the quarantine
 #   hunterctl restore <sha256>      put a quarantined file back where it was
-#   hunterctl update-signatures     download the feeds in /etc/hunter/feeds
+#   hunterctl update-signatures     download the feeds in /etc/hunter/feeds (signed
+#                                   ones are verified by the kernel before use)
+#   hunterctl feeds                 installed feeds, trusted keys, saved versions
+#   hunterctl feed-rollback <feed> [<version>]
+#                                   go back to a saved version (default: the one
+#                                   before the installed one)
+#   hunterctl trust-key <name> <hex>
+#                                   trust an Ed25519 feed key (live + /etc/hunter/keys)
+#   hunterctl require-signed-feeds <on|off>
+#                                   refuse feeds without a valid signature
 #   hunterctl lockdown              enforce exec + integrity + av, learning off, seal
 #   hunterctl save-learned          append learned programs to the whitelist
 
@@ -38,6 +47,12 @@ SCAN=/proc/hunter_scan
 QDIR=/var/lib/hunter/quarantine
 FEEDS=/etc/hunter/feeds
 SIGDIR=/etc/hunter/signatures.d
+FEEDPROC=/proc/hunter_feed
+KEYS=/etc/hunter/keys
+# Every feed version that was installed, by version (a signed feed's serial,
+# an unsigned one's UTC download time), for feed-rollback.
+HISTORY=/var/lib/hunter/feeds
+KEEP=5
 # Paths per write to /proc/hunter_scan: each batch is scanned before the
 # write returns, and 256 paths stay well under the 1 MiB a write may carry.
 BATCH=256
@@ -70,6 +85,75 @@ send() {
     fi
 }
 
+download() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --max-time 300 -o "$2" "$1"
+    else
+        wget -q -T 300 -O "$2" "$1"
+    fi
+}
+
+# The names the kernel takes for a feed: a plain file name in signatures.d,
+# neither hidden nor a `.sig`.
+valid_feed_name() {
+    case "$1" in
+        ''|.*|*.sig|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 64 ]
+}
+
+# The saved versions of a feed, oldest first.
+versions() {
+    ls "$HISTORY/$1" 2>/dev/null | grep -E '^[0-9]+$' | sort -n
+}
+
+# install_feed <install|rollback> <name> <staged file> [<version>]: asks the kernel to
+# verify the staged feed (and `<staged file>.sig` when there is one) and load
+# it; only once it said yes is the feed moved into signatures.d, where the
+# next boot finds it, and (a new version) saved for feed-rollback.
+install_feed() {
+    how=$1 name=$2 stage=$3
+    if [ -f "$stage.sig" ]; then
+        req="$how $name $stage $stage.sig"
+        ver=$(sed -n 's/^serial //p' "$stage.sig")
+    else
+        req="$how $name $stage"
+        ver=$(date -u +%Y%m%d%H%M%S)
+    fi
+    if ! printf '%s\n' "$req" > "$FEEDPROC" 2>/dev/null; then
+        rm -f "$stage" "$stage.sig"
+        echo "hunterctl: $(sed -n 's/^last: //p' "$FEEDPROC")" >&2
+        return 1
+    fi
+    last=$(sed -n 's/^last: //p' "$FEEDPROC")
+    case "$last" in
+        *unchanged)
+            rm -f "$stage" "$stage.sig"
+            echo "hunterctl: $name: already up to date"
+            return 0 ;;
+    esac
+    if [ "$how" = install ]; then
+        mkdir -p "$HISTORY/$name" || die "cannot create $HISTORY/$name"
+        cp "$stage" "$HISTORY/$name/$ver"
+        if [ -f "$stage.sig" ]; then cp "$stage.sig" "$HISTORY/$name/$ver.sig"; else rm -f "$HISTORY/$name/$ver.sig"; fi
+        versions "$name" | awk -v k="$KEEP" '{ v[NR] = $1 } END { for (i = 1; i <= NR - k; i++) print v[i] }' \
+            | while read -r old; do rm -f "$HISTORY/$name/$old" "$HISTORY/$name/$old.sig"; done
+    else
+        ver=$4
+    fi
+    # Signature first, feed second, each renamed into place: a reboot in
+    # between finds a pair that does not match and refuses that one feed --
+    # loud, and fixed by the next update -- never a feed that was not checked.
+    if [ -f "$stage.sig" ]; then
+        mv "$stage.sig" "$SIGDIR/$name.sig"
+    else
+        rm -f "$SIGDIR/$name.sig"
+    fi
+    mv "$stage" "$SIGDIR/$name"
+    echo "$ver" > "$HISTORY/$name/current"
+    echo "hunterctl: $last"
+}
+
 cmd=${1:-status}
 [ $# -gt 0 ] && shift
 
@@ -90,9 +174,21 @@ mode)
     [ $# -eq 2 ] || usage 1
     send "mode $1 $2"
     ;;
-learning|anomaly-detection|privileged-deny|require-hash|trust|deny|untrusted)
+learning|anomaly-detection|privileged-deny|require-hash|require-signed-feeds|trust|deny|untrusted)
     [ $# -eq 1 ] || usage 1
     send "$cmd $1"
+    ;;
+trust-key)
+    [ $# -eq 2 ] || usage 1
+    send "feed-key $1 $2"
+    # The directive always parses; whether hunter took the key (not sealed,
+    # and the name had no other key) is in its list.
+    pk=$(printf '%s' "$2" | tr 'A-F' 'a-f')
+    grep -qx "key $1 $pk" "$FEEDPROC" \
+        || die "hunter refused key $1 (sealed, or $1 already has another key; see '$0 events')"
+    touch "$KEYS"
+    grep -qx "feed-key $1 $pk" "$KEYS" || printf 'feed-key %s %s\n' "$1" "$pk" >> "$KEYS"
+    echo "hunterctl: key $1 trusted (and in $KEYS for the next boot)"
     ;;
 seal)
     send "seal"
@@ -216,54 +312,87 @@ restore)
 update-signatures)
     [ "$(id -u)" = 0 ] || die "must be root"
     [ -r "$FEEDS" ] || die "no $FEEDS"
+    [ -w "$FEEDPROC" ] || die "$FEEDPROC not found: this kernel cannot verify feeds"
     mkdir -p "$SIGDIR"
-    raw=$(mktemp) && sigs=$(mktemp) && part=$(mktemp) || die "mktemp failed"
-    trap 'rm -f "$raw" "$sigs" "$part"' EXIT
-    # `<format> <name> <url>`: format `sigs` is hunter's own signature lines,
-    # `sha256` a list with one SHA-256 per line (first field), as abuse.ch's
-    # MalwareBazaar exports are.
-    grep -v '^[[:space:]]*\(#\|$\)' "$FEEDS" | while read -r format name url; do
-        case "$name" in
-            ''|*/*|.*) echo "hunterctl: bad feed name '$name'" >&2; continue ;;
-        esac
-        if command -v curl >/dev/null 2>&1; then
-            curl -fsSL --max-time 300 -o "$raw" "$url"
-        else
-            wget -q -T 300 -O "$raw" "$url"
-        fi || { echo "hunterctl: $name: download failed: $url" >&2; continue; }
-        case "$format" in
-            sigs)
-                grep -E '^(hash|bytes):' "$raw" > "$sigs" ;;
-            sha256)
-                awk -v n="$name" '!/^#/ && length($1) == 64 && $1 ~ /^[0-9a-fA-F]+$/ { print "hash:" tolower($1) ":" n }' "$raw" > "$sigs" ;;
-            *)
-                echo "hunterctl: $name: unknown feed format '$format'" >&2; continue ;;
-        esac
-        count=$(wc -l < "$sigs")
-        # An empty or broken download must not replace a feed that worked.
-        if [ "$count" -eq 0 ]; then
-            echo "hunterctl: $name: no signatures in the download; keeping the old feed" >&2
-            continue
+    list=$(mktemp) && raw=$(mktemp) && rawsig=$(mktemp) || die "mktemp failed"
+    trap 'rm -f "$list" "$raw" "$rawsig"' EXIT
+    grep -v '^[[:space:]]*\(#\|$\)' "$FEEDS" > "$list"
+    failed=0
+    # `<format> <name> <url> [<key>]`: format `sigs` is hunter's own signature
+    # lines, `sha256` a list with one SHA-256 per line (first field), as
+    # abuse.ch's MalwareBazaar exports are. With a key, the feed must come with
+    # `<url>.sig` signed by it, and is in `sigs` format: what is signed is
+    # what the kernel loads, byte for byte.
+    while read -r format name url key; do
+        if ! valid_feed_name "$name"; then
+            echo "hunterctl: bad feed name '$name'" >&2; failed=1; continue
         fi
-        # Live, in batches the kernel takes whole: a batch with a line it
-        # cannot parse is refused entirely, and the feed is not installed.
-        ok=1
-        total=$count
-        i=1
-        while [ "$i" -le "$total" ]; do
-            sed -n "${i},$((i + 4999))p" "$sigs" | sed 's/^/signature /' > "$part"
-            dd if="$part" of="$PROC" bs=4194304 count=1 2>/dev/null || { ok=0; break; }
-            i=$((i + 5000))
-        done
-        if [ "$ok" = 1 ]; then
-            # Into a dot-file first (the kernel skips those), then renamed:
-            # a reboot halfway through finds the old feed or the new one.
-            cp "$sigs" "$SIGDIR/.$name.new" && mv "$SIGDIR/.$name.new" "$SIGDIR/$name"
-            echo "hunterctl: $name: $count signature(s)"
+        stage="$SIGDIR/.$name.new"
+        rm -f "$stage" "$stage.sig"
+        download "$url" "$raw" || { echo "hunterctl: $name: download failed: $url" >&2; failed=1; continue; }
+        if [ -n "$key" ]; then
+            if [ "$format" != sigs ]; then
+                echo "hunterctl: $name: a signed feed must be in 'sigs' format" >&2; failed=1; continue
+            fi
+            if ! download "$url.sig" "$rawsig"; then
+                echo "hunterctl: $name: no signature at $url.sig; not installed" >&2; failed=1; continue
+            fi
+            # The kernel checks that a trusted key signed it; that it is the
+            # key the operator chose for THIS feed is checked here.
+            if ! grep -qx "key $key" "$rawsig"; then
+                echo "hunterctl: $name: not signed with key '$key'; not installed" >&2; failed=1; continue
+            fi
+            cp "$raw" "$stage" && cp "$rawsig" "$stage.sig" || die "cannot write $SIGDIR"
         else
-            echo "hunterctl: $name: hunter rejected the feed; not installed" >&2
+            case "$format" in
+                sigs)
+                    grep -E '^(hash|bytes):' "$raw" > "$stage" ;;
+                sha256)
+                    awk -v n="$name" '!/^#/ && length($1) == 64 && $1 ~ /^[0-9a-fA-F]+$/ { print "hash:" tolower($1) ":" n }' "$raw" > "$stage" ;;
+                *)
+                    echo "hunterctl: $name: unknown feed format '$format'" >&2; failed=1; continue ;;
+            esac
+            # An empty or broken download must not replace a feed that worked.
+            if [ ! -s "$stage" ]; then
+                rm -f "$stage"
+                echo "hunterctl: $name: no signatures in the download; keeping the old feed" >&2
+                failed=1; continue
+            fi
         fi
+        install_feed install "$name" "$stage" || failed=1
+    done < "$list"
+    [ "$failed" = 0 ]
+    ;;
+feeds)
+    [ -r "$FEEDPROC" ] || die "$FEEDPROC not found: this kernel cannot verify feeds"
+    cat "$FEEDPROC"
+    for d in "$HISTORY"/*/; do
+        [ -d "$d" ] || continue
+        n=$(basename "$d")
+        echo "saved $n: $(versions "$n" | tr '\n' ' ')(installed: $(cat "$d/current" 2>/dev/null || echo -))"
     done
+    ;;
+feed-rollback)
+    [ $# -eq 1 ] || [ $# -eq 2 ] || usage 1
+    [ "$(id -u)" = 0 ] || die "must be root"
+    [ -w "$FEEDPROC" ] || die "$FEEDPROC not found: this kernel cannot verify feeds"
+    valid_feed_name "$1" || die "bad feed name '$1'"
+    dir="$HISTORY/$1"
+    [ -d "$dir" ] || die "no saved versions of $1"
+    if [ $# -eq 2 ]; then
+        ver=$2
+    else
+        cur=$(cat "$dir/current" 2>/dev/null || echo 0)
+        ver=$(versions "$1" | awk -v c="$cur" '$1 < c { v = $1 } END { print v }')
+        [ -n "$ver" ] || die "no saved version of $1 older than $cur"
+    fi
+    case "$ver" in ''|*[!0-9]*) die "a version is a number, see '$0 feeds'" ;; esac
+    [ -f "$dir/$ver" ] || die "no saved version $ver of $1 (see '$0 feeds')"
+    stage="$SIGDIR/.$1.new"
+    rm -f "$stage" "$stage.sig"
+    cp "$dir/$ver" "$stage" || die "cannot write $SIGDIR"
+    [ -f "$dir/$ver.sig" ] && { cp "$dir/$ver.sig" "$stage.sig" || die "cannot write $SIGDIR"; }
+    install_feed rollback "$1" "$stage" "$ver"
     ;;
 save-learned)
     [ "$(id -u)" = 0 ] || die "must be root"

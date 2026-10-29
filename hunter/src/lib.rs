@@ -44,6 +44,7 @@ pub mod av;
 pub mod clock;
 pub mod control;
 pub mod event_log;
+pub mod feed;
 pub mod heuristics;
 pub mod integrity;
 pub mod policy;

@@ -27,6 +27,8 @@ mod exited_leader_tests;
 mod faults_tests;
 /// `/proc/hunter`, read and written: hunter's report and its control plane.
 mod hunter_proc;
+/// `/proc/hunter_feed`: verified signature feeds.
+mod hunter_feed_proc;
 #[cfg(test)]
 mod hunter_proc_tests;
 /// The addresses of `/proc/<pid>/stat` and the `[heap]` and `[stack]` of
@@ -53,12 +55,13 @@ mod stat_tests;
 mod status;
 #[cfg(test)]
 mod zombie_tests;
+use hunter_feed_proc::ProcHunterFeedINode;
 use hunter_proc::{ProcHunterINode, ProcHunterScanINode};
 use present::proc_present_content;
 use smoltcp::wire::{IpAddress, IpCidr};
 use status::{proc_pid_status, proc_task_status};
 
-const PROC_ROOT_STATIC: [&str; 54] = [
+const PROC_ROOT_STATIC: [&str; 55] = [
     "net",
     "gpuready",
     "present",
@@ -82,6 +85,7 @@ const PROC_ROOT_STATIC: [&str; 54] = [
     "perf",
     "hunter",
     "hunter_scan",
+    "hunter_feed",
     "filesystems",
     "gpudbg",
     "stalls",
@@ -779,6 +783,7 @@ impl INode for ProcRootINode {
             "perf" => Ok(PROC_PERF_DIR.clone()),
             "hunter" => Ok(PROC_HUNTER.clone()),
             "hunter_scan" => Ok(PROC_HUNTER_SCAN.clone()),
+            "hunter_feed" => Ok(PROC_HUNTER_FEED.clone()),
             "filesystems" => Ok(PROC_FILESYSTEMS.clone()),
             "gpudbg" => Ok(PROC_GPUDBG.clone()),
             "stalls" => Ok(PROC_STALLS.clone()),
@@ -4326,6 +4331,7 @@ lazy_static! {
     });
     static ref PROC_HUNTER: Arc<dyn INode> = Arc::new(ProcHunterINode);
     static ref PROC_HUNTER_SCAN: Arc<dyn INode> = Arc::new(ProcHunterScanINode);
+    static ref PROC_HUNTER_FEED: Arc<dyn INode> = Arc::new(ProcHunterFeedINode);
     static ref PROC_NET_DEV: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 30,
         generate: proc_net_dev_content,
