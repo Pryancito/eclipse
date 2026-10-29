@@ -30,6 +30,10 @@
 #   hunterctl update-signatures     download the feeds in /etc/hunter/feeds
 #   hunterctl lockdown              enforce exec + integrity + av, learning off, seal
 #   hunterctl save-learned          append learned programs to the whitelist
+#   hunterctl notify [--severity info|warn|crit] [--timeout SECS]
+#                    [--action ID:LABEL[:COMMAND]]... [--wait SECS] TITLE [BODY]
+#                                   pop up a notification on the desktop (lunarbar);
+#                                   with --wait, print the button pressed
 
 PROC=/proc/hunter
 WHITELIST=/etc/hunter/whitelist
@@ -38,6 +42,10 @@ SCAN=/proc/hunter_scan
 QDIR=/var/lib/hunter/quarantine
 FEEDS=/etc/hunter/feeds
 SIGDIR=/etc/hunter/signatures.d
+# The desktop's notification spool: one file per alert, read by lunarbar (see
+# tools/lunarbar/src/hunter_notify.rs for the format). Under /run, so a reboot
+# forgets what nobody answered.
+NOTIFY=/run/hunter/notify
 # Paths per write to /proc/hunter_scan: each batch is scanned before the
 # write returns, and 256 paths stay well under the 1 MiB a write may carry.
 BATCH=256
@@ -49,7 +57,7 @@ die() {
 }
 
 usage() {
-    sed -n '/^#   hunterctl \[status\]/,/^#   hunterctl save-learned/p' "$0" | sed 's/^#//'
+    sed -n '/^#   hunterctl \[status\]/,/^#                                   with --wait/p' "$0" | sed 's/^#//'
     exit "${1:-0}"
 }
 
@@ -70,11 +78,98 @@ send() {
     fi
 }
 
+# Fields go one per line, so no newline (and no tab, which separates an
+# action's fields) may survive into one.
+oneline() {
+    printf '%s' "$1" | tr '\t\n\r' '   '
+}
+
+# The one door anything on the system uses to tell the user something, or ask:
+# a scheduled scan, the firewall's "may X connect?", a USB stick scanned on
+# mount. lunarbar shows the card, runs the COMMAND of the button pressed, and,
+# with --wait, writes back the ID of that button (or `dismiss` / `timeout`),
+# which this prints. Exit 0 answered, 2 timed out. Without --wait, prints the
+# alert's id. Needs no hunter in the kernel, only root: the bar runs the
+# commands in these files, so it trusts only a root-owned spool.
+notify() {
+    [ "$(id -u)" = 0 ] || die "must be root"
+    sev=info timeout="" wait="" actions=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --severity|--timeout|--action|--wait)
+            [ $# -ge 2 ] || usage 1
+            case "$1" in
+            --severity) sev=$2 ;;
+            --timeout) timeout=$2 ;;
+            --wait) wait=$2 ;;
+            --action)
+                case "$2" in
+                *:?*) ;;
+                *) die "--action wants ID:LABEL[:COMMAND], got '$2'" ;;
+                esac
+                actions="$actions$(oneline "$2")
+" ;;
+            esac
+            shift 2 ;;
+        --) shift; break ;;
+        -*) usage 1 ;;
+        *) break ;;
+        esac
+    done
+    [ $# -ge 1 ] && [ $# -le 2 ] || usage 1
+    case "$sev" in info|warn|crit) ;; *) die "severity is info, warn or crit" ;; esac
+    for n in "$timeout" "$wait"; do
+        case "$n" in ''|*[!0-9]*) [ -z "$n" ] || die "not a number of seconds: $n" ;; esac
+    done
+    mkdir -p "$NOTIFY" && chmod 700 "$NOTIFY" || die "cannot create $NOTIFY"
+    id="$(date +%s)-$$"
+    # Written under a dot-name and renamed: the bar never reads half a file.
+    tmp="$NOTIFY/.$id"
+    {
+        echo "severity=$sev"
+        echo "title=$(oneline "$1")"
+        [ -n "${2:-}" ] && echo "body=$(oneline "$2")"
+        [ -n "$timeout" ] && echo "timeout=$timeout"
+        [ -n "$wait" ] && echo "reply=1"
+        printf '%s' "$actions" | while IFS= read -r a; do
+            aid=${a%%:*}
+            rest=${a#*:}
+            label=${rest%%:*}
+            run=""
+            [ "$label" != "$rest" ] && run=${rest#*:}
+            printf 'action=%s\t%s\t%s\n' "$aid" "$label" "$run"
+        done
+    } > "$tmp" || die "cannot write $tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$NOTIFY/$id.alert" || die "cannot post the alert"
+    if [ -z "$wait" ]; then
+        echo "$id"
+        return 0
+    fi
+    i=0
+    while [ "$i" -lt "$wait" ]; do
+        if [ -f "$NOTIFY/$id.answer" ]; then
+            ans=$(cat "$NOTIFY/$id.answer")
+            rm -f "$NOTIFY/$id.answer"
+            echo "$ans"
+            [ "$ans" = timeout ] && return 2
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    # Taking the file away takes the card down at the bar's next tick.
+    rm -f "$NOTIFY/$id.alert"
+    echo timeout
+    return 2
+}
+
 cmd=${1:-status}
 [ $# -gt 0 ] && shift
 
 case "$cmd" in
 -h|--help|help) usage 0 ;;
+notify) notify "$@"; exit $? ;;
 esac
 
 [ -r "$PROC" ] || die "$PROC not found: is this an Eclipse OS kernel with hunter?"

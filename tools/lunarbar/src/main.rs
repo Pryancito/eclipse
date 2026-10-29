@@ -51,7 +51,8 @@
 //!   between) to a raw XRGB8888 file and exit, for offline verification.
 //!   `LUNARBAR_DUMP_MENU=1` composites the open app menu over the preview;
 //!   `LUNARBAR_DUMP_CAL=1` composites the calendar popup instead, and
-//!   `LUNARBAR_DUMP_HUNTER=1` hunter's menu.
+//!   `LUNARBAR_DUMP_HUNTER=1` hunter's menu, and `LUNARBAR_DUMP_TOAST=1` its
+//!   notifications.
 
 // The drawing stack, /proc readers, .desktop scanner and input tables live in
 // the `lunarbar` library next door, shared with `lunarrun` (see src/lib.rs).
@@ -59,6 +60,7 @@ use lunarbar::look::Look;
 use lunarbar::{apps, draw, fill_guard, hunter, i18n, icons, obmenu, sysinfo};
 
 mod hunter_menu;
+mod hunter_toast;
 use lunarbar::keys::{
     key_char, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ENTER_WL,
     KEY_ESC_WL, KEY_KPENTER_WL, KEY_LEFT_WL, KEY_PGDN_WL, KEY_PGUP_WL, KEY_RIGHT_WL, KEY_TAB_WL,
@@ -710,6 +712,8 @@ struct State {
     /// has seen by opening its menu.
     hunter: Option<hunter::Status>,
     hunter_seen: u64,
+    /// hunter's notification cards, above the bar's corner.
+    toasts: hunter_toast::Toasts,
 }
 
 impl State {
@@ -3511,7 +3515,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     .iter()
                     .find(|b| b.surface.id() == surface.id())
                     .map(|b| b.layer.id().protocol_id());
-                if state.ptr_on_popup {
+                if state.toast_enter(&surface, surface_x, surface_y) {
+                } else if state.ptr_on_popup {
                     state.popup_motion(qh, surface_x as i32, surface_y as i32);
                 } else if let Some(id) = state.ptr_bar {
                     state.bar_motion(id, surface_x as i32);
@@ -3529,6 +3534,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     }
                 }
                 state.ptr_on_popup = false;
+                state.toast_leave();
                 state.scroll_acc = 0.0;
                 state.tip_pending = None;
                 state.tooltip = None;
@@ -3540,7 +3546,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
             } => {
                 state.ptr_x = surface_x;
                 state.ptr_y = surface_y;
-                if state.ptr_on_popup {
+                if state.toasts.pointer_in {
+                    state.toast_motion(surface_x as i32, surface_y as i32);
+                } else if state.ptr_on_popup {
                     state.popup_motion(qh, surface_x as i32, surface_y as i32);
                 } else if let Some(id) = state.ptr_bar {
                     state.bar_motion(id, surface_x as i32);
@@ -3563,6 +3571,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 let (x, y) = (state.ptr_x as i32, state.ptr_y as i32);
                 state.tooltip = None;
                 state.tip_pending = None;
+                if state.toasts.pointer_in {
+                    if button == BTN_LEFT {
+                        state.toast_click(qh, x, y);
+                    }
+                    return;
+                }
                 if state.ptr_on_popup {
                     if button == BTN_LEFT {
                         state.popup_click(qh, x, y);
@@ -4378,7 +4392,8 @@ fn main() {
         let want_cal = std::env::var("LUNARBAR_DUMP_CAL").is_ok();
         let want_power = std::env::var("LUNARBAR_DUMP_POWER").is_ok();
         let want_hunter = std::env::var("LUNARBAR_DUMP_HUNTER").is_ok();
-        if want_menu || want_cal || want_power || want_hunter {
+        let want_toast = std::env::var("LUNARBAR_DUMP_TOAST").is_ok();
+        if want_menu || want_cal || want_power || want_hunter || want_toast {
             let mut cv = Canvas::new(w, full_h);
             // The compositor places the real thing; here the preview has to,
             // so it hangs the panel off the bottom bar the way the positioner
@@ -4397,6 +4412,8 @@ fn main() {
                 let k = PopupKind::PowerMenu;
                 let (px, py, pw, ph) = place(&k, false);
                 draw_power_menu(&mut cv, px, py, pw, ph);
+            } else if want_toast {
+                hunter_toast::draw_preview(&mut cv, w as i32, full_h as i32 - bh as i32);
             } else if want_hunter {
                 let m = hunter_menu::preview();
                 let (px, py, pw, ph) = place(&PopupKind::Hunter(hunter_menu::preview()), false);
@@ -4572,6 +4589,7 @@ fn main() {
         }
         if std::time::Instant::now() >= next_tick {
             state.refresh_metrics();
+            state.toast_tick(&qh);
             state.tick = state.tick.wrapping_add(1);
             state.render_all();
             // Popups are static between interactions and repaint from their

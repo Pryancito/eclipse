@@ -295,6 +295,50 @@ changes hunter is. `lunarhunter --tab NAME --dump /path:WxH` renders a tab to
 a raw ARGB8888 file without a compositor (from a built-in sample when there
 is no `/proc/hunter`).
 
+### Notifications on the desktop
+
+lunarbar pops a card up in the corner above the bar for every new warning or
+critical in hunter's event ring
+([`hunter_toast.rs`](../tools/lunarbar/src/hunter_toast.rs), what each event
+offers in [`hunter_notify.rs`](../tools/lunarbar/src/hunter_notify.rs)):
+
+| Event | Buttons |
+|---|---|
+| malware (`AV`) with a file | **cuarentena** (`hunterctl quarantine FILE`), ver, ignorar |
+| a program the allowlist refused (`EXEC`, *not on trusted-program allowlist*), not sealed | **permitir** (`hunterctl trust PATH`), ver, ignorar |
+| anything else | ver, ignorar |
+
+**ver** opens the event log (`lunarhunter --tab eventos`), **ignorar** stops
+showing that exact event until the bar restarts, and the cross just closes the
+card. Quarantine and allow report back with a second card saying whether it
+worked. Warnings go after 12 s, criticals stay until answered, and no card
+times out while the pointer is on it. At most three are shown; a burst
+beyond that waits behind a **+N más** line, and the same event repeated is
+one card with a count. The backlog the ring holds when the bar starts is not
+shown (the menu and the window are for that). Permitir is not offered for a
+program in an untrusted location such as `/tmp`, because hunter checks those
+before the allowlist and trusting one would change nothing.
+
+**Anything else can raise one too**, which is how the other parts of hunter
+are meant to tell or ask the user something: drop a file in
+`/run/hunter/notify/` (root-owned, mode 700), or from a shell:
+
+```sh
+hunterctl notify --severity info "Escaneo programado" "0 amenazas en /home"
+ans=$(hunterctl notify --severity crit --wait 60 \
+        --action allow:permitir:"hunterctl ..." --action deny:denegar \
+        "Cortafuegos" "¿Permitir que /usr/bin/curl se conecte a la red?")
+# $ans is allow, deny, dismiss or timeout (exit 2)
+```
+
+Each action is `ID:LABEL[:COMMAND]`: the bar runs COMMAND with `/bin/sh -c`
+when the button is pressed, and with `--wait` writes the ID back. From Rust,
+`lunarbar::hunter_notify::{post, take_answer}` do the same. The bar runs those
+commands as root, so it reads only a spool directory and files owned by root
+(or its own user) and writable by nobody else, and skips anything else.
+`LUNARBAR_DUMP=/path:WxH LUNARBAR_DUMP_TOAST=1 lunarbar` renders a sample
+stack without a compositor.
+
 ## Exec integrity (SHA-256)
 
 The `exec` domain decides *where* a program may run from and *which names*
