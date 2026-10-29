@@ -2792,6 +2792,168 @@ pub fn config_tc_weights(acc: &dyn MmioAccess, tc_count: u32, queues: u32) -> De
     Ok(())
 }
 
+// ——— Deciding which frames to keep ———
+
+/// `MAC_PFR`: the packet filter register.
+pub const MAC_PFR: usize = 0x0008;
+/// `MAC_PFR_PR`, index 0: promiscuous --- keep everything.
+pub const MAC_PFR_PR: (u32, u32) = (0, 1);
+/// `MAC_PFR_HUC`, index 1: match unicast addresses through the hash table
+/// rather than only the exact-match slots.
+pub const MAC_PFR_HUC: (u32, u32) = (1, 1);
+/// `MAC_PFR_HMC`, index 2: the same for multicast.
+pub const MAC_PFR_HMC: (u32, u32) = (2, 1);
+/// `MAC_PFR_PM`, index 4: keep every multicast frame.
+pub const MAC_PFR_PM: (u32, u32) = (4, 1);
+/// `MAC_PFR_HPF`, index 10: let a frame in on either the hash OR an
+/// exact-match slot, instead of the hash alone.
+pub const MAC_PFR_HPF: (u32, u32) = (10, 1);
+
+/// `MAC_HTR0`: the first word of the hash filter table.
+pub const MAC_HTR0: usize = 0x0010;
+/// `MAC_HTR_INC`: and the stride between its words.
+pub const MAC_HTR_INC: usize = 4;
+
+/// How far to shift a reversed CRC to get a hash index, for a table of
+/// `hash_table_size` bits.
+///
+/// Linux writes this as `26 - (hash_table_size >> 7)`, which is a log2 in
+/// disguise: 64 bits gives 26 (six index bits), 128 gives 25, 256 gives 24.
+/// Hard-coding the 24 that a 256-bit table wants works perfectly on the chip
+/// it was written against and silently folds three quarters of the table
+/// away on a smaller one.
+#[inline]
+pub const fn hash_table_shift(hash_table_size: u32) -> u32 {
+    26 - (hash_table_size >> 7)
+}
+
+/// How many 32-bit words the table occupies.
+#[inline]
+pub const fn hash_table_words(hash_table_size: u32) -> u32 {
+    hash_table_size / 32
+}
+
+/// The hash index of an address, from the Ethernet CRC of its six bytes.
+///
+/// `crc_le` is `crc32_le(~0, addr, 6)` --- the plain Ethernet CRC, nothing
+/// done to it yet. The three steps here are each the kind that looks
+/// optional and is not:
+///
+/// 1. **Complement it.** `crc32_le` leaves the residue uncomplemented.
+/// 2. **Reverse the bits**, all thirty-two of them. The hardware indexes
+///    from the other end of the word.
+/// 3. **Shift right** by [`hash_table_shift`], keeping the top bits of the
+///    reversed value --- which are the BOTTOM bits of the one that came in.
+///
+/// Skip the reversal and the index is still a number in range, still
+/// deterministic, and still points at the wrong bucket, so the symptom is an
+/// interface that drops exactly the multicast groups it was asked to join.
+#[inline]
+pub const fn hash_index(crc_le: u32, hash_table_size: u32) -> u32 {
+    (!crc_le).reverse_bits() >> hash_table_shift(hash_table_size)
+}
+
+/// Which word of the table an index falls in, and which bit of it.
+#[inline]
+pub const fn hash_bucket(index: u32) -> (u32, u32) {
+    (index >> 5, index & 0x1f)
+}
+
+/// Set an address's bit in a hash table being built.
+#[inline]
+pub fn hash_table_add(table: &mut [u32], crc_le: u32, hash_table_size: u32) {
+    let (word, bit) = hash_bucket(hash_index(crc_le, hash_table_size));
+    if let Some(slot) = table.get_mut(word as usize) {
+        *slot |= 1 << bit;
+    }
+}
+
+/// Write a built hash table out. `xgbe_set_mac_hash_table`'s last loop.
+pub fn config_hash_table(acc: &dyn MmioAccess, table: &[u32], hash_table_size: u32) {
+    let words = hash_table_words(hash_table_size) as usize;
+    for i in 0..words {
+        acc.write32(
+            MAC_HTR0 + i * MAC_HTR_INC,
+            table.get(i).copied().unwrap_or(0),
+        );
+    }
+}
+
+/// An exact-match address slot, one of the `addn_mac` the chip reports.
+/// Slot zero is the station address of batch seven and is not one of these.
+#[inline]
+pub const fn mac_addr_slot(slot: u32) -> (usize, usize) {
+    let base = MAC_MACA1HR + (slot as usize) * 8;
+    (base, base + 4)
+}
+
+/// Put an address in an exact-match slot, or clear the slot with `None`.
+///
+/// The enable bit lives in the HIGH half, so the high half is written LAST:
+/// writing it first arms a slot whose low four bytes are still the previous
+/// address's.
+pub fn config_mac_addr_slot(acc: &dyn MmioAccess, slot: u32, mac: Option<[u8; 6]>) {
+    let (hi_reg, lo_reg) = mac_addr_slot(slot);
+    match mac {
+        Some(mac) => {
+            let (hi, lo) = mac_to_regs(mac);
+            acc.write32(lo_reg, lo);
+            acc.write32(hi_reg, hi | (1 << MAC_MACA1HR_AE.0));
+        }
+        None => {
+            // Clearing is the other way round: disarm first, then wipe.
+            acc.write32(hi_reg, 0);
+            acc.write32(lo_reg, 0);
+        }
+    }
+}
+
+/// What the interface should accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RxFilter {
+    /// Keep every frame, whoever it is for.
+    pub promiscuous: bool,
+    /// Keep every multicast frame.
+    pub all_multicast: bool,
+    /// Consult the hash table for multicast, as well as the exact slots.
+    pub hash_multicast: bool,
+    /// ... and for unicast.
+    pub hash_unicast: bool,
+}
+
+/// Program the filter.
+///
+/// Note what promiscuous does NOT do: the hardware goes on filtering VLANs
+/// in promiscuous mode, so "accept everything" does not accept everything
+/// and Linux turns VLAN filtering off separately. This driver has no VLAN
+/// filtering to turn off yet, which is the only reason that is not a bug
+/// here --- and the reason to write it down before it is.
+///
+/// `HPF` is set whenever a hash is in use, so a frame gets in on the hash OR
+/// an exact slot. Without it the exact slots stop mattering the moment the
+/// hash is on, and the station address itself would be filtered out by a
+/// hash it does not happen to land in.
+pub fn config_rx_filter(acc: &dyn MmioAccess, filter: &RxFilter) {
+    let hash = filter.hash_multicast || filter.hash_unicast;
+    let mut pfr = 0u32;
+    pfr = set_bits(pfr, MAC_PFR_PR.0, MAC_PFR_PR.1, filter.promiscuous as u32);
+    pfr = set_bits(pfr, MAC_PFR_PM.0, MAC_PFR_PM.1, filter.all_multicast as u32);
+    pfr = set_bits(
+        pfr,
+        MAC_PFR_HMC.0,
+        MAC_PFR_HMC.1,
+        filter.hash_multicast as u32,
+    );
+    pfr = set_bits(
+        pfr,
+        MAC_PFR_HUC.0,
+        MAC_PFR_HUC.1,
+        filter.hash_unicast as u32,
+    );
+    pfr = set_bits(pfr, MAC_PFR_HPF.0, MAC_PFR_HPF.1, hash as u32);
+    acc.write32(MAC_PFR, pfr);
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
