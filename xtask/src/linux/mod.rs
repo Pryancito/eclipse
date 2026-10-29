@@ -200,6 +200,11 @@ impl LinuxRootfs {
                 let _ = fs::copy(&portald, bin.join("eclipse-portald"));
             }
             self.install_thread_tests(&dir);
+            // The desktop's own clients. They were copied only on a
+            // from-scratch build, so an ordinary `make image` kept whatever
+            // lunarbar the rootfs was created with and never got the
+            // binaries added after it -- lunarhunter, the day it arrived.
+            self.install_lunar_tools(&bin);
             // INIT (PID 1): the Eclipse-native Rust init by default, with busybox
             // init as a resilient fallback. `install_busybox_init` runs first so
             // `/sbin/init` always resolves to *some* PID 1; `install_eclipse_init`
@@ -621,84 +626,7 @@ impl LinuxRootfs {
             fs::copy(&libeclipse_spawnfix, lib.join("libeclipse_spawnfix.so")).unwrap();
         }
 
-        // lunarbg: the native wallpaper client (Rust, static musl). Renders
-        // the Eclipse night scene procedurally over wlr-layer-shell, replacing
-        // swaybg and its gdk-pixbuf image-decoding dependency entirely.
-        let lunarbg = self.lunarbg();
-        if lunarbg.is_file() {
-            let _ = dir::rm(bin.join("lunarbg"));
-            fs::copy(&lunarbg, bin.join("lunarbg")).unwrap();
-        } else {
-            eprintln!("warning: lunarbg not built; autostart will fall back to swaybg");
-        }
-
-        // lunarbar: the native status/task bar (Rust, static musl). A two-bar
-        // panel over wlr-layer-shell + wlr-foreign-toplevel-management, replacing
-        // waybar and its GTK/D-Bus/gdk-pixbuf/fontconfig dependency chain.
-        let LunarTools {
-            bar: lunarbar,
-            run: lunarrun,
-            file: lunarfile,
-            clip: lunarclip,
-            hunter: lunarhunter,
-        } = self.lunar_tools();
-        if lunarbar.is_file() {
-            let _ = dir::rm(bin.join("lunarbar"));
-            fs::copy(&lunarbar, bin.join("lunarbar")).unwrap();
-        } else {
-            eprintln!("warning: lunarbar not built; autostart will fall back to waybar");
-        }
-
-        // lunarrun: the KRunner stand-in (Alt+Space / Alt+F2) and KDE's
-        // Super+D, from the same package. There IS a session bus now
-        // (`dbus.service`), but krunner still needs Qt, KF6 and the rest of
-        // Plasma; this speaks wlr-layer-shell and
-        // wlr-foreign-toplevel-management instead.
-        if lunarrun.is_file() {
-            let _ = dir::rm(bin.join("lunarrun"));
-            fs::copy(&lunarrun, bin.join("lunarrun")).unwrap();
-        } else {
-            eprintln!("warning: lunarrun not built; Alt+Space will do nothing");
-        }
-
-        // lunarfile: the file browser behind Super+E, and -- through
-        // `--pick` -- the file chooser the rest of the system has never had.
-        // Dolphin, Nautilus and Thunar are all GTK/Qt applications with a
-        // gdk-pixbuf, fontconfig and theme-engine chain behind them; this is
-        // wlr-layer-shell and wl_shm, like its two siblings. Without it
-        // `eclipse-files` falls back to a shell in $HOME, which is what
-        // Super+E did before it existed.
-        if lunarfile.is_file() {
-            let _ = dir::rm(bin.join("lunarfile"));
-            fs::copy(&lunarfile, bin.join("lunarfile")).unwrap();
-        } else {
-            eprintln!("warning: lunarfile not built; Super+E falls back to a terminal");
-        }
-
-        // lunarclip: the clipboard manager (the daemon behind
-        // `lunarclip.service`) and the Super+V history picker. On Wayland the
-        // selection belongs to the client that copied, so closing the window
-        // you copied from empties the clipboard; a manager over
-        // wlr-data-control is the only thing that fixes that, and Alpine's
-        // answer (wl-clipboard + clipman + wofi) is a Go program plus a GTK
-        // launcher that wants the session bus.
-        if lunarclip.is_file() {
-            let _ = dir::rm(bin.join("lunarclip"));
-            fs::copy(&lunarclip, bin.join("lunarclip")).unwrap();
-        } else {
-            eprintln!("warning: lunarclip not built; there is no clipboard history");
-        }
-
-        // lunarhunter: the window for hunter (configuration, the event ring,
-        // scans with a live count, quarantine, signature updates). The bar's
-        // shield menu opens it, and falls back to a terminal running
-        // hunterctl when it is missing.
-        if lunarhunter.is_file() {
-            let _ = dir::rm(bin.join("lunarhunter"));
-            fs::copy(&lunarhunter, bin.join("lunarhunter")).unwrap();
-        } else {
-            eprintln!("warning: lunarhunter not built; the shield menu opens terminals");
-        }
+        self.install_lunar_tools(&bin);
 
         // eclipse-dbusd: Eclipse's own D-Bus session bus (Rust, static musl).
         // The `eclipse-dbus` wrapper prefers Alpine's dbus-daemon when the
@@ -3293,6 +3221,90 @@ impl LinuxRootfs {
               exit 127\n",
         )
         .unwrap();
+    }
+
+    /// Copy `lunarbg` and the five `tools/lunarbar` binaries into `bin`,
+    /// building them first when their sources are newer. Called from both
+    /// `make` paths, from-scratch and incremental.
+    fn install_lunar_tools(&self, bin: &Path) {
+        // lunarbg: the native wallpaper client (Rust, static musl). Renders
+        // the Eclipse night scene procedurally over wlr-layer-shell, replacing
+        // swaybg and its gdk-pixbuf image-decoding dependency entirely.
+        let lunarbg = self.lunarbg();
+        if lunarbg.is_file() {
+            let _ = dir::rm(bin.join("lunarbg"));
+            fs::copy(&lunarbg, bin.join("lunarbg")).unwrap();
+        } else {
+            eprintln!("warning: lunarbg not built; autostart will fall back to swaybg");
+        }
+
+        // lunarbar: the native status/task bar (Rust, static musl). A two-bar
+        // panel over wlr-layer-shell + wlr-foreign-toplevel-management, replacing
+        // waybar and its GTK/D-Bus/gdk-pixbuf/fontconfig dependency chain.
+        let LunarTools {
+            bar: lunarbar,
+            run: lunarrun,
+            file: lunarfile,
+            clip: lunarclip,
+            hunter: lunarhunter,
+        } = self.lunar_tools();
+        if lunarbar.is_file() {
+            let _ = dir::rm(bin.join("lunarbar"));
+            fs::copy(&lunarbar, bin.join("lunarbar")).unwrap();
+        } else {
+            eprintln!("warning: lunarbar not built; autostart will fall back to waybar");
+        }
+
+        // lunarrun: the KRunner stand-in (Alt+Space / Alt+F2) and KDE's
+        // Super+D, from the same package. There IS a session bus now
+        // (`dbus.service`), but krunner still needs Qt, KF6 and the rest of
+        // Plasma; this speaks wlr-layer-shell and
+        // wlr-foreign-toplevel-management instead.
+        if lunarrun.is_file() {
+            let _ = dir::rm(bin.join("lunarrun"));
+            fs::copy(&lunarrun, bin.join("lunarrun")).unwrap();
+        } else {
+            eprintln!("warning: lunarrun not built; Alt+Space will do nothing");
+        }
+
+        // lunarfile: the file browser behind Super+E, and -- through
+        // `--pick` -- the file chooser the rest of the system has never had.
+        // Dolphin, Nautilus and Thunar are all GTK/Qt applications with a
+        // gdk-pixbuf, fontconfig and theme-engine chain behind them; this is
+        // wlr-layer-shell and wl_shm, like its two siblings. Without it
+        // `eclipse-files` falls back to a shell in $HOME, which is what
+        // Super+E did before it existed.
+        if lunarfile.is_file() {
+            let _ = dir::rm(bin.join("lunarfile"));
+            fs::copy(&lunarfile, bin.join("lunarfile")).unwrap();
+        } else {
+            eprintln!("warning: lunarfile not built; Super+E falls back to a terminal");
+        }
+
+        // lunarclip: the clipboard manager (the daemon behind
+        // `lunarclip.service`) and the Super+V history picker. On Wayland the
+        // selection belongs to the client that copied, so closing the window
+        // you copied from empties the clipboard; a manager over
+        // wlr-data-control is the only thing that fixes that, and Alpine's
+        // answer (wl-clipboard + clipman + wofi) is a Go program plus a GTK
+        // launcher that wants the session bus.
+        if lunarclip.is_file() {
+            let _ = dir::rm(bin.join("lunarclip"));
+            fs::copy(&lunarclip, bin.join("lunarclip")).unwrap();
+        } else {
+            eprintln!("warning: lunarclip not built; there is no clipboard history");
+        }
+
+        // lunarhunter: the window for hunter (configuration, the event ring,
+        // scans with a live count, quarantine, signature updates). The bar's
+        // shield menu opens it, and falls back to a terminal running
+        // hunterctl when it is missing.
+        if lunarhunter.is_file() {
+            let _ = dir::rm(bin.join("lunarhunter"));
+            fs::copy(&lunarhunter, bin.join("lunarhunter")).unwrap();
+        } else {
+            eprintln!("warning: lunarhunter not built; the shield menu opens terminals");
+        }
     }
 
     /// Cross-compile the `tools/lunarbar` package (Rust) as static musl
