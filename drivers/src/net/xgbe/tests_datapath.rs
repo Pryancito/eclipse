@@ -2675,3 +2675,261 @@ fn turning_rss_off_leaves_the_key_and_the_table_alone() {
     // The options survive, so turning it back on needs no reprogramming.
     assert_eq!(get_bits(value, MAC_RSSCR_IP2TE.0, MAC_RSSCR_IP2TE.1), 1);
 }
+
+// ——— Tanda 26: VLANs ———
+
+/// The same CRC written the other way round: take bit `i` of the id
+/// directly instead of shifting a byte and reloading it halfway.
+fn vid_crc32_reference(vid: u16) -> u32 {
+    let mut crc: u32 = !0;
+    for i in 0..12 {
+        let bit = ((vid >> i) & 1) as u32;
+        let temp = (crc & 1) ^ bit;
+        crc >>= 1;
+        if temp != 0 {
+            crc ^= CRC32_POLY_LE;
+        }
+    }
+    crc
+}
+
+#[test]
+fn the_vlan_crc_runs_over_twelve_bits_and_not_two_bytes() {
+    // The byte reload halfway through is equivalent to walking the bits
+    // of the id, which is what makes "twelve iterations" the real rule.
+    for vid in [0u16, 1, 2, 7, 100, 1234, 2048, 4095] {
+        assert_eq!(vid_crc32_le(vid), vid_crc32_reference(vid), "vid {}", vid);
+    }
+    // And the bits above the twelfth never reach the CRC, so they
+    // cannot change the bucket.
+    for vid in [1u16, 100, 4095] {
+        assert_eq!(vid_crc32_le(vid), vid_crc32_le(vid | 0xf000));
+    }
+}
+
+#[test]
+fn a_byte_oriented_crc_cannot_produce_this_value() {
+    // Sixteen bits of the same id give a different answer, so the
+    // multicast filter's crate-backed helper is not reusable here: it
+    // has no way to stop in the middle of the second byte.
+    let full_sixteen = |vid: u16| {
+        let mut crc: u32 = !0;
+        for i in 0..16 {
+            let bit = ((vid >> i) & 1) as u32;
+            let temp = (crc & 1) ^ bit;
+            crc >>= 1;
+            if temp != 0 {
+                crc ^= CRC32_POLY_LE;
+            }
+        }
+        crc
+    };
+    assert_ne!(vid_crc32_le(100), full_sixteen(100));
+    assert_ne!(vid_crc32_le(1), full_sixteen(1));
+}
+
+#[test]
+fn the_table_is_sixteen_buckets_for_four_thousand_ids() {
+    assert_eq!(VLAN_N_VID, 4096);
+    assert_eq!(MAC_VLANHTR_VLHT, (0, 16));
+    for vid in [0u16, 1, 42, 999, 4095] {
+        assert!(vlan_hash_bucket(vid) < 16, "vid {}", vid);
+    }
+    // Collisions are not an edge case at that ratio: with a handful of
+    // ids two of them already share a bucket somewhere in the range.
+    let mut seen = [0u32; 16];
+    for vid in 0..256u16 {
+        seen[vlan_hash_bucket(vid) as usize] += 1;
+    }
+    assert!(seen.iter().all(|n| *n > 1));
+}
+
+#[test]
+fn the_filter_passes_more_than_it_was_asked_for() {
+    // Two ids in the same bucket: joining one lets the other through,
+    // so "it arrived" never means "we joined that VLAN".
+    let mut partner = None;
+    for vid in 1..4096u16 {
+        if vlan_hash_bucket(vid) == vlan_hash_bucket(7) && vid != 7 {
+            partner = Some(vid);
+            break;
+        }
+    }
+    let partner = partner.unwrap();
+    let joined = vlan_hash_table(&[7]).unwrap();
+    let other = vlan_hash_table(&[partner]).unwrap();
+    assert_eq!(joined, other);
+    // The only honest check is the tag the descriptor carries.
+    assert_ne!(7, partner);
+}
+
+#[test]
+fn a_vlan_id_outside_twelve_bits_is_refused() {
+    assert_eq!(VLAN_VID_MASK, 0x0fff);
+    assert!(vlan_hash_table(&[4096]).is_err());
+    assert!(vlan_hash_table(&[0xffff]).is_err());
+    assert!(vlan_hash_table(&[4095]).is_ok());
+    // An empty set is a real case: it means "no VLANs joined", and the
+    // register is written with zero rather than left alone.
+    assert_eq!(vlan_hash_table(&[]).unwrap(), 0);
+    let fake = FakeXgmac::new();
+    update_vlan_hash_table(&fake, &[]).unwrap();
+    assert_eq!(fake.writes_to(MAC_VLANHTR), 1);
+}
+
+#[test]
+fn the_strip_setting_is_two_bits_and_not_a_flag() {
+    assert_eq!(MAC_VLANTR_EVLS, (21, 2));
+    assert_eq!(VLAN_STRIP_ALWAYS, 0x3);
+    let fake = FakeXgmac::new();
+    enable_rx_vlan_stripping(&fake);
+    let value = fake
+        .log()
+        .iter()
+        .filter_map(|a| match a {
+            Access::Write(o, v) if *o == MAC_VLANTR => Some(*v),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(get_bits(value, MAC_VLANTR_EVLS.0, MAC_VLANTR_EVLS.1), 3);
+    // A 1 would be a different mode, not "on".
+    assert_ne!(get_bits(value, MAC_VLANTR_EVLS.0, MAC_VLANTR_EVLS.1), 1);
+}
+
+#[test]
+fn stripping_puts_the_tag_in_the_descriptor_and_only_for_c_tags() {
+    let fake = FakeXgmac::new();
+    enable_rx_vlan_stripping(&fake);
+    let value = fake
+        .log()
+        .iter()
+        .filter_map(|a| match a {
+            Access::Write(o, v) if *o == MAC_VLANTR => Some(*v),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(get_bits(value, MAC_VLANTR_EVLRXS.0, MAC_VLANTR_EVLRXS.1), 1);
+    assert_eq!(get_bits(value, MAC_VLANTR_DOVLTC.0, MAC_VLANTR_DOVLTC.1), 1);
+    // S-TAGs are neither stripped nor counted as VLAN frames.
+    assert_eq!(get_bits(value, MAC_VLANTR_ERSVLM.0, MAC_VLANTR_ERSVLM.1), 0);
+    assert_eq!(get_bits(value, MAC_VLANTR_ESVL.0, MAC_VLANTR_ESVL.1), 0);
+    // And the tag would otherwise be dropped on the floor: without
+    // `EVLRXS` the frame comes up stripped and unlabelled.
+    assert_eq!(RX_DESC0_OVT, (0, 16));
+}
+
+#[test]
+fn disabling_the_stripping_writes_one_field_where_enabling_wrote_five() {
+    let on = FakeXgmac::new();
+    enable_rx_vlan_stripping(&on);
+    assert_eq!(on.writes_to(MAC_VLANTR), 5);
+    let off = FakeXgmac::new();
+    disable_rx_vlan_stripping(&off);
+    assert_eq!(off.writes_to(MAC_VLANTR), 1);
+    // The four left alone say what a tag *is*, not what to do with it,
+    // so they survive on purpose.
+}
+
+#[test]
+fn vlan_one_always_passes_the_filter() {
+    // Linux's own comment: the hash table filter does nothing while
+    // `VL` is zero, so it is set to 1, and VLAN 1 is let through
+    // whether or not anyone joined it.
+    let fake = FakeXgmac::new();
+    enable_rx_vlan_filtering(&fake);
+    let vlantr = fake
+        .log()
+        .iter()
+        .filter_map(|a| match a {
+            Access::Write(o, v) if *o == MAC_VLANTR => Some(*v),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(get_bits(vlantr, MAC_VLANTR_VL.0, MAC_VLANTR_VL.1), 1);
+    assert_ne!(get_bits(vlantr, MAC_VLANTR_VL.0, MAC_VLANTR_VL.1), 0);
+    // And it is a 16-bit field, so this is a tag, not a flag.
+    assert_eq!(MAC_VLANTR_VL, (0, 16));
+}
+
+#[test]
+fn inverse_matching_is_cleared_because_a_stray_one_inverts_the_filter() {
+    let fake = FakeXgmac::new();
+    enable_rx_vlan_filtering(&fake);
+    let vlantr = fake
+        .log()
+        .iter()
+        .filter_map(|a| match a {
+            Access::Write(o, v) if *o == MAC_VLANTR => Some(*v),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(get_bits(vlantr, MAC_VLANTR_VTIM.0, MAC_VLANTR_VTIM.1), 0);
+    assert_eq!(get_bits(vlantr, MAC_VLANTR_VTHM.0, MAC_VLANTR_VTHM.1), 1);
+    // Only the low twelve bits are compared, so priority and CFI in a
+    // tag cannot make a joined VLAN miss.
+    assert_eq!(get_bits(vlantr, MAC_VLANTR_ETV.0, MAC_VLANTR_ETV.1), 1);
+}
+
+#[test]
+fn the_master_switch_is_in_a_different_register_from_the_rest() {
+    // Enabling touches two registers; disabling touches only the one
+    // that is not with the others.
+    assert_eq!(MAC_PFR_VTFE, (16, 1));
+    let on = FakeXgmac::new();
+    enable_rx_vlan_filtering(&on);
+    assert_eq!(on.writes_to(MAC_PFR), 1);
+    assert_eq!(on.writes_to(MAC_VLANTR), 4);
+    let off = FakeXgmac::new();
+    disable_rx_vlan_filtering(&off);
+    assert_eq!(off.writes_to(MAC_PFR), 1);
+    assert_eq!(off.writes_to(MAC_VLANTR), 0);
+    // And it does not collide with the hash-filter bits of the same
+    // register from tanda 18.
+    let vtfe = get_bits(u32::MAX, MAC_PFR_VTFE.0, MAC_PFR_VTFE.1) << MAC_PFR_VTFE.0;
+    for other in [
+        MAC_PFR_PR,
+        MAC_PFR_HUC,
+        MAC_PFR_HMC,
+        MAC_PFR_PM,
+        MAC_PFR_HPF,
+    ] {
+        let mask = get_bits(u32::MAX, other.0, other.1) << other.0;
+        assert_eq!(vtfe & mask, 0, "{:?}", other);
+    }
+}
+
+#[test]
+fn the_transmit_tag_comes_from_the_context_descriptor() {
+    let fake = FakeXgmac::new();
+    config_vlan_support(&fake, &[7, 100], true, true).unwrap();
+    let vlanir = fake
+        .log()
+        .iter()
+        .filter_map(|a| match a {
+            Access::Write(o, v) if *o == MAC_VLANIR => Some(*v),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(get_bits(vlanir, MAC_VLANIR_VLTI.0, MAC_VLANIR_VLTI.1), 1);
+    // A C-TAG, not an S-TAG.
+    assert_eq!(get_bits(vlanir, MAC_VLANIR_CSVL.0, MAC_VLANIR_CSVL.1), 0);
+    // And the context descriptor is the one the receive side already
+    // knows how to recognise.
+    assert_eq!(DESC3_CTXT, 1 << 30);
+}
+
+#[test]
+fn the_three_vlan_registers_are_where_linux_says() {
+    assert_eq!(MAC_VLANTR, 0x0050);
+    assert_eq!(MAC_VLANHTR, 0x0058);
+    assert_eq!(MAC_VLANIR, 0x0060);
+    // Eight apart, not four: there is a register between each pair that
+    // this driver does not touch.
+    assert_eq!(MAC_VLANHTR - MAC_VLANTR, 8);
+    assert_eq!(MAC_VLANIR - MAC_VLANHTR, 8);
+}
