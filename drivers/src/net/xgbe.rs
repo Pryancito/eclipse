@@ -3213,6 +3213,98 @@ pub fn config_jumbo_enable(acc: &dyn MmioAccess, mtu: u32) {
     }
 }
 
+// ——— The offloads, and the bit each one actually hangs on ———
+
+/// `DMA_CH_TCR_TSE`, index 12, width 1: TCP segmentation offload, per
+/// transmit channel.
+///
+/// This is only half the switch. The other half is `TSE` in a descriptor's
+/// `desc3` (bit 18, see [`TX_DESC3_TSE`]), which is what says *this frame* is
+/// a segmentation request. Linux turns the channel bit on for every transmit
+/// channel unconditionally and then never sets the descriptor bit unless the
+/// stack handed it a TSO skb.
+///
+/// So the channel bit on its own changes nothing, which is why it is safe to
+/// set it before there is any TSO path: a frame built by [`build_tx_frame`]
+/// leaves `desc3` bit 18 at zero, and [`tx_desc3_frame_len`] cannot reach it.
+pub const DMA_CH_TCR_TSE: (u32, u32) = (12, 1);
+
+/// `DMA_CH_CR_SPH`, index 24, width 1: split the header of a received frame
+/// into its own buffer, per receive channel.
+pub const DMA_CH_CR_SPH: (u32, u32) = (24, 1);
+
+/// `MAC_RCR_HDSMS`, index 12, width 3: how big that header buffer is.
+///
+/// An **index**, not a byte count. Linux writes `XGBE_SPH_HDSMS_SIZE`, which
+/// is 2, and the comment next to it says "keep in sync with SKB_ALLOC_SIZE" —
+/// i.e. the number is tied to how Linux allocates its own buffers, not to
+/// anything the chip requires. Whoever gives this driver a receive path has
+/// to pick it against *our* buffer, and copying the 2 across because Linux
+/// has a 2 is exactly the mistake the comment is warning about.
+pub const MAC_RCR_HDSMS: (u32, u32) = (12, 3);
+
+/// `XGBE_SPH_HDSMS_SIZE`: the value Linux writes. Named so the number has a
+/// provenance, not so it gets reused.
+pub const SPH_HDSMS_SIZE: u32 = 2;
+
+/// `MAC_RCR_IPC`, index 9, width 1: check the checksums of received frames.
+///
+/// The gate in front of everything [`rx_frame_verdict`] decides. With `IPC`
+/// at 0 the chip never reports a checksum error, so every frame comes back
+/// `Clean` — not "checksum not checked", **clean**. A receiver that trusts
+/// the verdict without having set this bit is passing unverified checksums
+/// up as verified ones, and nothing in the descriptor says so.
+pub const MAC_RCR_IPC: (u32, u32) = (9, 1);
+
+/// Turn the transmit channel's TSO switch on. `xgbe_config_tso_mode`.
+pub fn config_tso_mode(acc: &dyn MmioAccess, tx_channels: u32) {
+    for channel in 0..tx_channels {
+        write_field(
+            acc,
+            dma_channel_reg(channel, DMA_CH_TCR),
+            DMA_CH_TCR_TSE.0,
+            DMA_CH_TCR_TSE.1,
+            1,
+        );
+    }
+}
+
+/// Turn header splitting on for every receive channel, and set the header
+/// size once in the MAC. `xgbe_config_sph_mode`.
+///
+/// Note the shape: the per-channel bit goes out `rx_channels` times and the
+/// size goes out **once**, because it lives in the MAC and not in the
+/// channel. One size for every channel, whatever their buffers look like.
+pub fn config_sph_mode(acc: &dyn MmioAccess, rx_channels: u32, hdsms: u32) -> DeviceResult<()> {
+    if hdsms >= (1 << MAC_RCR_HDSMS.1) {
+        return Err(DeviceError::InvalidParam);
+    }
+    for channel in 0..rx_channels {
+        write_field(
+            acc,
+            dma_channel_reg(channel, DMA_CH_CR),
+            DMA_CH_CR_SPH.0,
+            DMA_CH_CR_SPH.1,
+            1,
+        );
+    }
+    write_field(acc, MAC_RCR, MAC_RCR_HDSMS.0, MAC_RCR_HDSMS.1, hdsms);
+    Ok(())
+}
+
+/// Switch receive checksum checking on or off. `xgbe_enable_rx_csum` and
+/// `xgbe_disable_rx_csum`, which are one field write each and differ only in
+/// the value.
+pub fn config_rx_csum(acc: &dyn MmioAccess, on: bool) {
+    write_field(
+        acc,
+        MAC_RCR,
+        MAC_RCR_IPC.0,
+        MAC_RCR_IPC.1,
+        if on { 1 } else { 0 },
+    );
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.

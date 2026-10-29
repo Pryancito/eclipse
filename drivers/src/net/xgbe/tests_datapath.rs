@@ -1928,3 +1928,176 @@ fn the_length_bits_do_not_collide_with_the_enables_below_them() {
     }
     assert_ne!(MAC_TCR_JD.0, MAC_TCR_TE.0);
 }
+
+// ——— Tanda 22: los descargos ———
+
+#[test]
+fn the_two_tso_switches_are_in_different_places() {
+    // One per channel in the DMA, one per frame in the descriptor.
+    assert_eq!(DMA_CH_TCR_TSE, (12, 1));
+    assert_eq!(TX_DESC3_TSE, 1 << 18);
+    // They are not the same bit, and turning the channel one on cannot
+    // turn the descriptor one on by accident.
+    assert_ne!(DMA_CH_TCR_TSE.0, 18);
+}
+
+#[test]
+fn enabling_tso_on_the_channel_does_not_make_any_frame_a_tso_frame() {
+    // This is why it is safe to set the channel bit with no TSO path:
+    // every descriptor this driver builds leaves bit 18 clear.
+    let fake = FakeXgmac::new();
+    config_tso_mode(&fake, 2);
+    let mut ring = [Desc::default(); 4];
+    let frags = [fragment(0x1000, 100)];
+    build_tx_frame(&mut ring, 0, &one_frame(&frags)).unwrap();
+    assert_eq!(ring[0].desc3 & TX_DESC3_TSE, 0);
+    // And the frame length, which shares the word, cannot reach it.
+    assert_eq!(tx_desc3_frame_len(u32::MAX) & TX_DESC3_TSE, 0);
+}
+
+#[test]
+fn tso_goes_to_every_transmit_channel_and_nowhere_else() {
+    let fake = FakeXgmac::new();
+    config_tso_mode(&fake, 3);
+    for channel in 0..3 {
+        let off = dma_channel_reg(channel, DMA_CH_TCR);
+        assert_eq!(fake.writes_to(off), 1);
+    }
+    assert_eq!(fake.writes_to(dma_channel_reg(3, DMA_CH_TCR)), 0);
+    // And it is a field write, so the enable bit beside it survives.
+    let fake = FakeXgmac::new();
+    fake.preload(dma_channel_reg(0, DMA_CH_TCR), 1);
+    config_tso_mode(&fake, 1);
+    match fake.log()[1] {
+        Access::Write(_, v) => {
+            assert_eq!(v & 1, 1);
+            assert_eq!(get_bits(v, DMA_CH_TCR_TSE.0, DMA_CH_TCR_TSE.1), 1);
+        }
+        ref other => panic!("{:?}", other),
+    }
+}
+
+#[test]
+fn the_header_split_bit_is_per_channel_and_its_size_is_not() {
+    let fake = FakeXgmac::new();
+    config_sph_mode(&fake, 4, SPH_HDSMS_SIZE).unwrap();
+    for channel in 0..4 {
+        assert_eq!(fake.writes_to(dma_channel_reg(channel, DMA_CH_CR)), 1);
+    }
+    // The size goes out once, in the MAC, for all four channels at once.
+    assert_eq!(fake.writes_to(MAC_RCR), 1);
+}
+
+#[test]
+fn the_header_size_is_an_index_and_not_a_byte_count() {
+    // Three bits, so eight possible values. 2 is what Linux writes, and
+    // its own comment ties that to SKB_ALLOC_SIZE rather than to the
+    // chip: the number travels with the buffer, not with the register.
+    assert_eq!(MAC_RCR_HDSMS, (12, 3));
+    assert_eq!(SPH_HDSMS_SIZE, 2);
+    assert!(SPH_HDSMS_SIZE < (1 << MAC_RCR_HDSMS.1));
+    // A byte count would not fit at all: the field tops out at 7.
+    assert_eq!((1u32 << MAC_RCR_HDSMS.1) - 1, 7);
+    let fake = FakeXgmac::new();
+    assert!(config_sph_mode(&fake, 1, 1 << MAC_RCR_HDSMS.1).is_err());
+    assert!(fake.log().is_empty());
+}
+
+#[test]
+fn the_header_size_does_not_disturb_the_length_limits_in_the_same_register() {
+    // `MAC_RCR` already carries `IPC`, `JE`, `WD`, `GPSLCE` and `GPSL`.
+    let fake = FakeXgmac::new();
+    config_jumbo_enable(&fake, 9000);
+    let after = fake
+        .log()
+        .iter()
+        .rev()
+        .find_map(|a| match a {
+            Access::Write(o, v) if *o == MAC_RCR => Some(*v),
+            _ => None,
+        })
+        .unwrap();
+    let fake = FakeXgmac::new();
+    fake.preload(MAC_RCR, after);
+    config_sph_mode(&fake, 1, SPH_HDSMS_SIZE).unwrap();
+    let rcr = fake
+        .log()
+        .iter()
+        .rev()
+        .find_map(|a| match a {
+            Access::Write(o, v) if *o == MAC_RCR => Some(*v),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(get_bits(rcr, MAC_RCR_JE.0, MAC_RCR_JE.1), 1);
+    assert_eq!(
+        get_bits(rcr, MAC_RCR_HDSMS.0, MAC_RCR_HDSMS.1),
+        SPH_HDSMS_SIZE
+    );
+}
+
+#[test]
+fn the_checksum_bits_of_this_register_do_not_overlap_each_other() {
+    for (a, b) in [
+        (MAC_RCR_IPC, MAC_RCR_HDSMS),
+        (MAC_RCR_IPC, MAC_RCR_JE),
+        (MAC_RCR_HDSMS, MAC_RCR_GPSL),
+        (MAC_RCR_IPC, MAC_RCR_WD),
+    ] {
+        let mask_a = get_bits(u32::MAX, a.0, a.1) << a.0;
+        let mask_b = get_bits(u32::MAX, b.0, b.1) << b.0;
+        assert_eq!(mask_a & mask_b, 0, "{:?} vs {:?}", a, b);
+    }
+    // `IPC` is below `LM` and above `JE`, which is the order that makes
+    // the three of them one contiguous run.
+    assert_eq!(MAC_RCR_IPC, (9, 1));
+    assert_eq!(MAC_RCR_JE.0 + 1, MAC_RCR_IPC.0);
+}
+
+#[test]
+fn without_the_checksum_bit_every_frame_comes_back_clean() {
+    // The trap. `rx_frame_verdict` reads error codes the chip only ever
+    // produces with `IPC` on, so with it off the verdict is not "not
+    // checked", it is `Clean`.
+    assert_eq!(rx_frame_verdict(0), RxVerdict::Clean);
+    // Which is the same answer a genuinely good frame gives.
+    let good = whole_frame(0);
+    assert_eq!(rx_frame_verdict(good.desc3), RxVerdict::Clean);
+    // And a bad checksum is only distinguishable because the chip set
+    // both the error summary and the type.
+    let bad = written_back((1 << RX_DESC3_ES.0) | (ETLT_PAYLOAD_CSUM << RX_DESC3_ETLT.0));
+    assert_eq!(rx_frame_verdict(bad.desc3), RxVerdict::ChecksumBad);
+}
+
+#[test]
+fn the_two_checksum_calls_differ_only_in_the_value() {
+    let on = FakeXgmac::new();
+    config_rx_csum(&on, true);
+    let off = FakeXgmac::new();
+    config_rx_csum(&off, false);
+    assert_eq!(on.log().len(), 2);
+    assert_eq!(on.log().len(), off.log().len());
+    let value = |f: &FakeXgmac| match f.log()[1] {
+        Access::Write(_, v) => v,
+        ref other => panic!("{:?}", other),
+    };
+    assert_eq!(get_bits(value(&on), MAC_RCR_IPC.0, MAC_RCR_IPC.1), 1);
+    assert_eq!(get_bits(value(&off), MAC_RCR_IPC.0, MAC_RCR_IPC.1), 0);
+}
+
+#[test]
+fn turning_the_checksum_off_leaves_the_receiver_running() {
+    // It is a field write, not a register write: a device already up
+    // keeps `RE` and its length limits while the offload is toggled.
+    let fake = FakeXgmac::new();
+    fake.preload(MAC_RCR, (1 << MAC_RCR_RE.0) | (1 << MAC_RCR_JE.0));
+    config_rx_csum(&fake, false);
+    match fake.log()[1] {
+        Access::Write(_, v) => {
+            assert_eq!(get_bits(v, MAC_RCR_RE.0, MAC_RCR_RE.1), 1);
+            assert_eq!(get_bits(v, MAC_RCR_JE.0, MAC_RCR_JE.1), 1);
+            assert_eq!(get_bits(v, MAC_RCR_IPC.0, MAC_RCR_IPC.1), 0);
+        }
+        ref other => panic!("{:?}", other),
+    }
+}
