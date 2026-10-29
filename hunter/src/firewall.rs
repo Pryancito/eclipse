@@ -266,10 +266,14 @@ pub fn check(pid: u64, program: &str, dir: Direction, peer: &str, local_only: bo
             }
         }
     }
+    // A new question is a `Warning`: it is something the person has to
+    // answer, and the desktop shows warnings (lunarbar's alerts, the
+    // notifications). It is raised once per program and direction, so it
+    // cannot flood them.
     if ask(pid, &canon, dir, peer) {
         record(
             pid,
-            Severity::Notice,
+            Severity::Warning,
             "NET",
             "ASK",
             format!(
