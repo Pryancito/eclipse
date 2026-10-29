@@ -1,3 +1,4 @@
+pub mod brcmstb;
 pub mod klog;
 #[cfg(any(
     target_arch = "x86_64",
