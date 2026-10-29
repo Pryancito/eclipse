@@ -25,6 +25,7 @@ use rboot::{
     cmdline, esp, fb, frames, logo, page_table, progress, video, BootInfo, GopReport, GraphicInfo,
 };
 use uefi::proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat};
+use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::file::*;
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::proto::unsafe_protocol;
@@ -387,14 +388,55 @@ fn open_file(bs: &BootServices, path: &str) -> RegularFile {
     }
 }
 
+/// The volume rboot was loaded from, which is the one its three files live on.
+///
+/// `get_handle_for_protocol` returns the FIRST handle in the system that
+/// speaks `SimpleFileSystem`, and that is a different volume as soon as the
+/// machine has more than one. A PC that boots the ISO almost always does: the
+/// internal disk's ESP is there too, and so is the ISO's own appended ESP
+/// partition when the image was written to a USB stick. When the firmware
+/// enumerated one of those first, rboot read ITS `\EFI\Boot` and died with
+///
+///     failed to open \EFI\Boot\rboot.conf: NOT_FOUND;
+///     \EFI\Boot holds: BootX64.efi (897536 B)
+///
+/// -- the other system's fallback loader, on a volume rboot never booted
+/// from. It never showed in QEMU because the usual run has exactly one FAT
+/// volume in the machine, so first and own were the same handle.
+///
+/// `LoadedImage::device()` is the handle the firmware loaded `BootX64.efi`
+/// off, so asking it is the whole fix. It is an `Option` in the protocol, and
+/// the fallback is the old behaviour: on a machine with one volume it is the
+/// right answer anyway, and on a machine with several there is nothing better
+/// to guess.
+fn boot_volume_handle(bs: &BootServices) -> Handle {
+    let image = bs.image_handle();
+    let loaded = unsafe {
+        bs.open_protocol::<LoadedImage>(
+            OpenProtocolParams {
+                handle: image,
+                agent: image,
+                controller: None,
+            },
+            // GET_PROTOCOL and not exclusive: the firmware itself holds this
+            // protocol open on the image handle, and taking it away from the
+            // loader that is still running us is not worth a config file.
+            OpenProtocolAttributes::GetProtocol,
+        )
+    };
+    if let Some(device) = loaded.ok().and_then(|li| li.device()) {
+        return device;
+    }
+    bs.get_handle_for_protocol::<SimpleFileSystem>()
+        .expect("failed to get FileSystem handle")
+}
+
 /// Open the root of the boot volume.
 ///
 /// The filesystem `ScopedProtocol` is dropped on return, exactly as
 /// `open_file` has always done: the handle it opened stays valid.
 fn open_volume(bs: &BootServices) -> Directory {
-    let fs_handle = bs
-        .get_handle_for_protocol::<SimpleFileSystem>()
-        .expect("failed to get FileSystem handle");
+    let fs_handle = boot_volume_handle(bs);
     let mut fs = bs
         .open_protocol_exclusive::<SimpleFileSystem>(fs_handle)
         .expect("failed to open FileSystem protocol");
