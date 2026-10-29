@@ -130,8 +130,23 @@ lists stay empty). Example `/etc/hunter/whitelist`:
 
 Learned entries live in kernel memory and are surfaced at `/proc/hunter` under
 a `learned-programs (N):` block. The kernel deliberately does **not** write the
-filesystem; `hunterctl save-learned` reads that block and appends new
-programs to `/etc/hunter/whitelist`, so the learned set survives a reboot.
+filesystem. [`hunterd`](#hunterd-events-and-learning-on-disk) copies that block
+to `/var/lib/hunter/learned` every few seconds, and at the next boot the kernel
+reads the file back (after the white/blacklists, before `policy.conf`) into
+the **learned** set, so learning picks up where it stopped and `/proc/hunter`
+still tells learned programs from configured ones.
+
+Each restored line passes the same test a program passes to be learned: an
+exact absolute path (a directory prefix is skipped), not blacklisted, not in a
+world-writable location, not a `/proc/*/fd/*` link, and no control characters.
+That last rule also applies to learning itself now: a program whose name holds
+a newline still runs, but is not learned, because `/proc/hunter` would list it
+as two lines and the second would come back from disk as a program that never
+ran. The file only grows; to stop trusting a learned program, `hunterctl deny`
+it (a denied program is not restored).
+
+`hunterctl save-learned` is still there to promote the learned set into
+`/etc/hunter/whitelist`, where an operator can review and edit it.
 
 ### Programmatic control
 
@@ -215,6 +230,10 @@ hunterctl restore <sha256>      put a quarantined file back
 hunterctl update-signatures     download the feeds in /etc/hunter/feeds
 hunterctl lockdown              exec + integrity + av enforce, learning off, seal
 hunterctl save-learned          append learned programs to /etc/hunter/whitelist
+hunterctl daemon [seconds]      hunterd (see below); eclipse-init runs it
+hunterctl persist               one pass of hunterd, now
+hunterctl history [--alerts|--critical] [--this-boot] [N]
+                                the last N events on disk (default 50, 0 = all)
 ```
 
 A typical hardening pass on a running system: let it run with learning on
@@ -294,6 +313,49 @@ the seal, relaxing controls are not offered; without root, nothing that
 changes hunter is. `lunarhunter --tab NAME --dump /path:WxH` renders a tab to
 a raw ARGB8888 file without a compositor (from a built-in sample when there
 is no `/proc/hunter`).
+
+### hunterd: events and learning on disk
+
+`/proc/hunter`'s event ring holds the last few hundred events of the current
+boot, and the learned set lives in kernel memory: a reboot used to lose both.
+`hunterd` is `hunterctl daemon`, started by eclipse-init
+(`/etc/eclipse/services/hunterd.service` → `/usr/local/bin/eclipse-hunterd`)
+and restarted if it dies. Every 5 seconds it reads `/proc/hunter` and:
+
+- appends every event it has not written yet to `/var/log/hunter/events.log`;
+- merges the learned programs into `/var/lib/hunter/learned` (see above).
+
+| File | Mode | What |
+|---|---|---|
+| `/var/log/hunter/events.log` (+ `.1` … `.4`) | `0640` | the history, rotated past 1 MiB, so at most 5 MiB |
+| `/var/lib/hunter/learned` | `0600` | the learned set the kernel restores at boot |
+| `/var/lib/hunter/events.cursor` | `0640` | `<boot_id> <next seq>`: where the next pass starts |
+
+`events.log` is tab-separated, one event per line, oldest first:
+
+```
+time                  boot      seq  uptime   pid  severity category action  description
+2026-10-29T18:46:00Z  aaaaaaaa  17   4.500    142  CRIT     EXEC     BLOCKED blacklisted program: /tmp/x
+```
+
+`time` is UTC, worked out from the uptime (so it is only as right as the
+clock was), `boot` is the first 8 characters of
+`/proc/sys/kernel/random/boot_id`, and `seq` is hunter's own sequence number,
+which starts again at 0 each boot. hunterd adds two kinds of lines of its
+own, all with category `HUNTERD` and seq `-`: `BOOT` opens each boot,
+and `LOST` names the sequence numbers that left the ring before a pass could
+read them (a flood between two passes), so a gap is never silent.
+
+A restarted hunterd carries on from the cursor, so nothing is written twice.
+eclipse-init does not signal its services before `reboot(2)`, so at most the
+last 5 seconds of events before a reboot do not reach the disk (the durable
+sink still sends every `Warning`+ event to the kernel log). A `TERM` makes
+hunterd do one last pass and exit.
+
+`hunterctl history` prints the file for people (`--alerts` for warnings and
+criticals, `--critical`, `--this-boot`, and a count); it reads only the disk,
+so it works after a reboot and on a kernel without hunter. Tools that want the
+history (reports, scheduled scans) should read `events.log*` directly.
 
 ## Exec integrity (SHA-256)
 
