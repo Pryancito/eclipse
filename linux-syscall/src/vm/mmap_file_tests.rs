@@ -56,10 +56,15 @@ const FIXED_ANON_PRIVATE: usize = 0x32;
 const NOREPLACE_ANON_PRIVATE: usize = 0x10_0022;
 const FIXED_FILE_PRIVATE: usize = 0x12;
 
-/// `MAX_MMAP_LEN` plus one byte: the length the kernel refuses to place.
-/// Written out rather than read from the constant, which is what the refusal
-/// is made of.
-const PAST_WHAT_IS_PLACED: usize = 64 * 1024 * 1024 * 1024 + 1;
+/// One byte more than the whole user address space: the length the kernel
+/// refuses to place, and `arch_get_unmapped_area`'s only length check
+/// (`if (len > TASK_SIZE) return -ENOMEM;`).
+///
+/// Read from the address space rather than from `MAX_MMAP_LEN`, which is what
+/// the refusal is made of. It used to be 64 GiB + 1, back when the cap was an
+/// arbitrary 64 GiB -- a length the address space holds perfectly well, so
+/// what the test pinned was the arbitrary number and not the rule.
+const PAST_WHAT_IS_PLACED: usize = zircon_object::vm::USER_ASPACE_SIZE as usize + 1;
 
 /// What the file holds. Its size only has to be non-zero for the mapping to
 /// have something to be backed by.

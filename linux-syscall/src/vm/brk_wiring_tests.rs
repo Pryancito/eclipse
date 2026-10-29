@@ -262,23 +262,24 @@ fn a_break_on_the_same_page_is_bookkeeping_and_the_number_asked_for_is_kept() {
 fn a_grow_whose_reservation_would_be_absurd_hands_back_the_old_break() {
     // The reservation ahead is rounded up to `BRK_CHUNK`, so a break far
     // enough away makes it bigger than any mapping this kernel will make:
-    // `MAX_MMAP_LEN` is the same cap `mmap` refuses with, and over it `brk`
-    // keeps the break it has rather than attempting the map. The address is
-    // inside the address space -- that is what makes this a different
-    // refusal from the one above.
+    // `MAX_MMAP_LEN` is the same ceiling `mmap` refuses with, and over it
+    // `brk` keeps the break it has rather than attempting the map. What is
+    // pinned here is that answer -- the old break, handed back, with nothing
+    // mapped -- and not which check produced it.
     //
-    // The distance is measured from where the first grow left the
-    // reservation, and it has to pass the cap rather than reach it: a break
-    // exactly at it is a 64 GiB mapping this kernel does attempt, which
-    // means sixteen million page frames and sixteen seconds of them before
-    // the answer comes back the same way for a different reason.
+    // It USED to be pinned as a refusal for SIZE at an address that was still
+    // inside the address space, which `MAX_MMAP_LEN` being an arbitrary 64 GiB
+    // made possible. It is the address space now, so no address is both
+    // reachable and over it, and the assertion below says the opposite of what
+    // it used to: a reservation this kernel will not make is one that does not
+    // fit, full stop.
     let proc = a_process(48_704);
     let base = a_heap(&proc);
     let far = base + BRK_CHUNK + MAX_MMAP_LEN + PAGE;
     assert!(
-        far <= USER_ASPACE_END,
-        "this test needs a reachable address to be refused for its SIZE and \
-         not for being outside the address space"
+        far > USER_ASPACE_END,
+        "a reservation past the ceiling has to be past the address space too, \
+         or the ceiling is not the address space"
     );
     let (grown, far_away, stored) = on_a_thread(&proc, move |sys| {
         Box::pin(async move {

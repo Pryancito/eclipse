@@ -10,33 +10,33 @@ use zircon_object::vm::{
     USER_ASPACE_BASE, USER_ASPACE_SIZE,
 };
 
-/// Per-call cap for a single `mmap` / `brk` growth. It bounds how much a single
-/// syscall can commit at once (physical frames + per-page VMO metadata).
+/// The largest length a single `mmap` / `brk` growth may ask for: what Linux
+/// refuses, and nothing more.
 ///
-/// This must be larger than the biggest single-call reservation we expect from
-/// userspace. Two very different consumers push this up:
-///   * the dynamic linker maps a library's whole LOAD span in one call, and
-///     `libLLVM.so` (pulled in by `perf`) is ~150 MiB — the original 128 MiB cap
-///     rejected it outright with ENOMEM (surfaced by musl as "Out of memory")
-///     despite gigabytes being free;
-///   * SpiderMonkey (Firefox's JS engine) reserves its whole JIT executable
-///     region up front as a single `PROT_NONE` anonymous `mmap`. On x86-64 that
-///     reservation is ~1.1 GiB (`MaxCodeBytesPerProcess`), so a 1 GiB cap
-///     bounced it — and, crucially, the early-return did so *silently*, which is
-///     why `js::jit::InitProcessExecutableMemory() failed` fired with no mmap
-///     error in the log.
+/// `arch_get_unmapped_area()` makes exactly one length check —
+/// `if (len > TASK_SIZE) return -ENOMEM;` — and `TASK_SIZE` on x86-64 is
+/// `(1 << 47) - PAGE_SIZE`, which is [`USER_ASPACE_SIZE`]. A length that fits
+/// in the address space is then accepted or refused by placement and by
+/// `RLIMIT_AS` (`may_expand_vm()`), both of which this file already does:
+/// `as_rlimit_allows` for the limit, `map_ext_min` for the hole.
 ///
-///     2 GiB was not enough either: Firefox 136's SpiderMonkey asks for a
-///     single 16 GiB `PROT_NONE` reservation (its WASM huge-memory region) and
-///     had it bounced. The user address space is `1 << 47`, so 16 GiB is a
-///     rounding error in it; 64 GiB clears that request with room and still
-///     bounds a runaway caller to a small fraction of the space per call.
+/// This was an arbitrary number instead, and it was raised three times, each
+/// time by whichever program had just been bounced: 128 MiB bounced `ld.so`
+/// mapping the ~150 MiB LOAD span of `libLLVM.so`; 1 GiB bounced SpiderMonkey's
+/// ~1.1 GiB JIT reservation (`js::jit::InitProcessExecutableMemory() failed`);
+/// 2 GiB bounced Firefox 136's 16 GiB WASM huge-memory region; and 64 GiB
+/// bounces V8, which opens by reserving **1 TiB** of `PROT_NONE` address space
+/// for its sandbox and halves that until something is granted. Every raise
+/// was a guess at the next program's appetite, and the next program was always
+/// bigger. The address space is the only ceiling that is not a guess.
 ///
-/// Because anonymous mappings are now demand-paged (see `sys_mmap`), a large
-/// reservation costs only address space plus a sparse per-touched-page frame
-/// entry, not committed RAM — so the cap bounds address-space requests, not
-/// physical footprint.
-const MAX_MMAP_LEN: usize = 64 * 1024 * 1024 * 1024;
+/// Nothing is committed by a large reservation: anonymous mappings are
+/// demand-paged (see `sys_mmap`), the per-page protection of a mapping is
+/// run-length encoded (`zircon_object::vm::page_flags`), and a VMO's frames
+/// live in a `BTreeMap` keyed by the pages that were actually touched. A
+/// terabyte of `PROT_NONE` therefore costs one VMAR entry and one VMO, the
+/// same as a page of it.
+const MAX_MMAP_LEN: usize = USER_ASPACE_SIZE as usize;
 
 /// How much heap `brk` reserves at a time, instead of one VMO per call.
 ///
@@ -945,10 +945,13 @@ impl Syscall<'_> {
         let (may_move, at_new_addr) = mremap_flags(flags)?;
         // Linux: old_addr must be page-aligned; lengths round up to pages. A
         // zero old_len (the MAP_SHARED duplication trick) is not supported.
+        // `mremap_args` has already bounded `new_len` against the whole address
+        // space (it is not anchored anywhere yet, so that is the only bound
+        // there is). A `new_len > MAX_MMAP_LEN` test stood here as well, and it
+        // meant something only while `MAX_MMAP_LEN` was an arbitrary number
+        // BELOW the address space; now that it is the address space, the two
+        // refuse exactly the same lengths and the second one can never fire.
         let (old_len, new_len) = mremap_args(old_addr, old_len, new_len)?;
-        if new_len > MAX_MMAP_LEN {
-            return Err(LxError::ENOMEM);
-        }
 
         let proc = self.zircon_process();
         let pid = proc.id();
