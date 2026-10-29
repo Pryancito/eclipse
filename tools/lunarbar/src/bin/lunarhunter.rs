@@ -20,6 +20,9 @@
 //!   the feeds, updating them, and the EICAR test that proves the engine works.
 //! - **Programas** — the exec allowlist and the integrity pins: the programs
 //!   learning has trusted, saving them to the whitelist, verifying the pins.
+//! - **Programados** — the scheduled scans (a quick one daily, a full one
+//!   weekly), changing them, running one now, and their history
+//!   (`lunarhunter/schedule.rs`).
 //!
 //! The Resumen tab's "Exportar informe" writes the security report
 //! (`hunter_export`) as HTML into `$HOME`; `--export` writes it from the
@@ -77,6 +80,13 @@ use wayland_protocols::xdg::decoration::zv1::client::{
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 /// Where `install_hunter` (xtask) puts the operator's front end.
+// A crate root's modules sit beside it, so the path is spelled out.
+#[path = "lunarhunter/schedule.rs"]
+mod schedule;
+
+use lunarbar::hunter_schedule as sched;
+use schedule::SchedAct;
+
 const HUNTERCTL: &str = "/sbin/hunterctl";
 
 // ── palette ──────────────────────────────────────────────────────────────────
@@ -183,10 +193,11 @@ enum Tab {
     Quarantine,
     Signatures,
     Programs,
+    Schedule,
 }
 
 impl Tab {
-    const ALL: [Tab; 7] = [
+    const ALL: [Tab; 8] = [
         Tab::Overview,
         Tab::Protection,
         Tab::Events,
@@ -194,6 +205,7 @@ impl Tab {
         Tab::Quarantine,
         Tab::Signatures,
         Tab::Programs,
+        Tab::Schedule,
     ];
 
     fn label(self, lang: Lang) -> &'static str {
@@ -205,6 +217,7 @@ impl Tab {
             Tab::Quarantine => ("Cuarentena", "Quarantine"),
             Tab::Signatures => ("Firmas", "Signatures"),
             Tab::Programs => ("Programas", "Programs"),
+            Tab::Schedule => ("Programados", "Scheduled"),
         };
         tr(lang, es, en)
     }
@@ -220,6 +233,7 @@ impl Tab {
             "cuarentena" | "quarantine" | "5" => Tab::Quarantine,
             "firmas" | "signatures" | "6" => Tab::Signatures,
             "programas" | "programs" | "7" => Tab::Programs,
+            "programados" | "scheduled" | "schedule" | "8" => Tab::Schedule,
             _ => return None,
         })
     }
@@ -271,6 +285,7 @@ enum Act {
     Verify,
     QuickScan,
     Export,
+    Sched(SchedAct),
 }
 
 impl Act {
@@ -296,6 +311,8 @@ enum JobKind {
     SaveLearned,
     Quarantine,
     Restore,
+    /// `hunterctl schedule` or `run-scheduled`.
+    Schedule,
 }
 
 impl JobKind {
@@ -306,6 +323,7 @@ impl JobKind {
             JobKind::Eicar | JobKind::Update => Tab::Signatures,
             JobKind::Verify | JobKind::SaveLearned => Tab::Programs,
             JobKind::Restore => Tab::Quarantine,
+            JobKind::Schedule => Tab::Schedule,
         }
     }
 }
@@ -596,6 +614,7 @@ struct State {
     last_scan: Option<Progress>,
     /// Findings already put away, so their buttons go.
     quarantined: Vec<String>,
+    sched: sched::Schedule,
 
     frame: Frame,
     ptr: (f64, f64),
@@ -656,6 +675,7 @@ impl State {
             job: None,
             last_scan: None,
             quarantined: Vec::new(),
+            sched: sched::Schedule::default(),
             frame: Frame::default(),
             ptr: (-1.0, -1.0),
             hover: None,
@@ -691,6 +711,7 @@ impl State {
         self.pins = std::fs::read_to_string(report::HASHES)
             .map(|t| report::count_pins(&t))
             .unwrap_or(0);
+        self.reload_schedule();
     }
 
     fn busy(&self) -> bool {
@@ -806,6 +827,8 @@ impl State {
                 )
             };
             self.say(msg, p.failure.is_some() || !p.found.is_empty());
+        } else if kind == JobKind::Schedule {
+            self.sched_finished(&out);
         } else if !out.ok {
             let m = self.t(
                 "la orden falló (ver la consola)",
@@ -918,6 +941,7 @@ impl State {
             ),
             Act::Verify => self.start(JobKind::Verify, Vec::new(), vec!["verify".into()]),
             Act::Export => self.export(),
+            Act::Sched(a) => self.sched_act(a),
         }
     }
 
@@ -1490,6 +1514,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, st: &State) -> Frame {
                 Tab::Quarantine => tab_quarantine(&mut g, body),
                 Tab::Signatures => (tab_signatures(&mut g, body, r), 0),
                 Tab::Programs => tab_programs(&mut g, body, r),
+                Tab::Schedule => schedule::tab_schedule(&mut g, body),
             };
             list = l;
             max_scroll = m;
@@ -2478,7 +2503,7 @@ fn key(st: &mut State, key: u32) {
         KEY_PGUP_WL => st.scroll_by(-page),
         KEY_PGDN_WL => st.scroll_by(page),
         k => match key_char(k) {
-            Some(c @ '1'..='7') => {
+            Some(c @ '1'..='8') => {
                 let t = Tab::ALL[(c as u8 - b'1') as usize];
                 st.act(Act::Tab(t));
             }
@@ -2659,7 +2684,8 @@ fn usage() -> ! {
          \x20                  [--dump PATH:WxH] [--export PATH [--days N]]\n\
          \n\
          \x20 --tab NAME     open on a tab: resumen proteccion eventos escaneo\n\
-         \x20                cuarentena firmas programas (or 1-7, or English)\n\
+         \x20                cuarentena firmas programas programados (or 1-8,\n\
+         \x20                or English)\n\
          \x20 --scan PATH..  scan these absolute paths at once (opens Escaneo)\n\
          \x20 --quarantine   automatic quarantine on (for --scan)\n\
          \x20 --update       update the signatures at once (opens Firmas)\n\
@@ -2667,7 +2693,7 @@ fn usage() -> ! {
          \x20 --export PATH  write the security report (.html, .pdf or .txt) and exit\n\
          \x20 --days N       the period the report covers (default 7)\n\
          \n\
-         keys: 1-7 or Tab switch tabs, arrows/PgUp/PgDn scroll, r re-reads, Esc closes\n\
+         keys: 1-8 or Tab switch tabs, arrows/PgUp/PgDn scroll, r re-reads, Esc closes\n\
          env: ECLIPSE_LOOK=kde|eclipse|win11, LANG"
     );
     std::process::exit(2)
@@ -2827,7 +2853,9 @@ fn main() {
             st.render();
         }
         if Instant::now() >= next_refresh {
-            if st.reload_report() {
+            // The scheduler runs scans whether this window is open or not.
+            let sched = st.tab == Tab::Schedule && st.reload_schedule();
+            if st.reload_report() | sched {
                 st.render();
             }
             next_refresh = Instant::now() + refresh;
@@ -2927,6 +2955,7 @@ fn sample(st: &mut State) {
         cancel: Arc::new(AtomicBool::new(false)),
         handled: true,
     });
+    schedule::sample(st);
 }
 
 #[cfg(test)]

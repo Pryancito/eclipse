@@ -888,8 +888,8 @@ impl LinuxRootfs {
     /// hunter's operator side: `/sbin/hunterctl` (refreshed on every build, so
     /// it never lags the kernel's control language), an example
     /// `/etc/hunter/policy.conf` (every line commented out: an image that boots
-    /// with it behaves exactly as one without it), the antivirus database and
-    /// its feeds.
+    /// with it behaves exactly as one without it), the antivirus database, its
+    /// feeds, the scheduled scans and the service that runs them.
     fn install_hunter(rootfs: &Path) {
         let sbin = rootfs.join("sbin");
         fs::create_dir_all(&sbin).unwrap();
@@ -905,14 +905,29 @@ impl LinuxRootfs {
         fs::create_dir_all(&etc_hunter).unwrap();
         // Each written only when absent, so an operator's edits survive a
         // rebuild: the example policy, the antivirus database (EICAR, so the
-        // scanner can be tested) and the signature feeds.
-        for name in ["policy.conf", "signatures", "feeds"] {
+        // scanner can be tested), the signature feeds and the scheduled scans.
+        for name in ["policy.conf", "signatures", "feeds", "schedule"] {
             let dst = etc_hunter.join(name);
             if !dst.exists() {
                 fs::copy(PROJECT_DIR.join("tools/hunterctl").join(name), &dst).unwrap();
             }
         }
         fs::create_dir_all(etc_hunter.join("signatures.d")).unwrap();
+        // The scheduled scans' daemon, for eclipse-init to supervise (busybox
+        // init does not read this directory, so there it is inert). Rewritten
+        // on every build like hunterctl: what it runs is decided by
+        // /etc/hunter/schedule, which is the operator's.
+        let svc_dir = rootfs.join("etc/eclipse/services");
+        fs::create_dir_all(&svc_dir).unwrap();
+        fs::write(
+            svc_dir.join("hunter-scheduler.service"),
+            b"# hunter's scheduled antivirus scans: /etc/hunter/schedule, history in\n\
+              # /var/lib/hunter/scans. See `hunterctl schedule` and `hunterctl scan-history`.\n\
+              exec = /sbin/hunterctl scheduler\n\
+              type = respawn\n\
+              log = /tmp/hunter-scheduler.log\n",
+        )
+        .unwrap();
     }
 
     /// Lay down the base `/etc/passwd` and `/etc/group` so name lookups resolve.
@@ -5810,6 +5825,9 @@ mod cross_linker_tests {
 
 #[cfg(test)]
 mod rootfs_plumbing_tests;
+
+#[cfg(test)]
+mod hunter_schedule_tests;
 
 #[cfg(test)]
 mod apk_closure_tests {

@@ -1,0 +1,20 @@
+# /etc/hunter/schedule -- hunter's scheduled antivirus scans.
+#
+#   <job> <when> <HH:MM> <report|quarantine> <path>...
+#
+# when:   daily, a weekday (mon tue wed thu fri sat sun) for once a week,
+#         or off.
+# HH:MM:  local time. A machine that was off then runs the scan as soon as
+#         it is back on, once (like anacron).
+# action: report only records what is found (and hunter raises an alert for
+#         each finding); quarantine also moves it to the quarantine.
+#
+# Run by `hunterctl scheduler` (the hunter-scheduler service). Change it with
+# `hunterctl schedule <job> <when> [HH:MM] [report|quarantine]` or from
+# lunarhunter's "Programados" tab; `hunterctl scan-history` lists past runs.
+# Paths are separated by spaces, so a path cannot contain one.
+
+# Quick: where programs live and where downloads and temporary files land.
+quick daily 12:00 report /bin /sbin /usr/bin /usr/sbin /usr/local/bin /tmp /root /home
+# Full: the whole disk (not /proc, /sys, /dev, /run or the quarantine).
+full sun 13:00 report /
