@@ -773,6 +773,15 @@ pub fn learn_exec_path(path: &str) -> bool {
         return false;
     }
     let canon = canonicalize(path);
+    // `/proc/hunter` lists the learned set one path per line, and that list is
+    // what `hunterd` writes to disk and the kernel trusts again at the next
+    // boot. A name with a newline in it would come back as two entries, and
+    // the second is whatever the program's author put after the newline: a
+    // trust for a path that never ran. Such a program still runs; it is just
+    // not learned.
+    if canon.chars().any(char::is_control) {
+        return false;
+    }
     let mut learned = LEARNED_EXEC_PATHS.lock();
     // The duplicate test looks redundant after `is_exec_listed` above, and is
     // not: that check released the list lock before this one took it, so two
@@ -783,6 +792,23 @@ pub fn learn_exec_path(path: &str) -> bool {
     }
     learned.push(canon);
     true
+}
+
+/// Puts a program learned on an earlier boot back into the learned set.
+///
+/// `hunterd` keeps the learned set in `/var/lib/hunter/learned`, and the kernel
+/// reads that file at boot, before `policy.conf`. What comes back is held to
+/// the same test a program passes to be learned in the first place, because the
+/// file is only as trustworthy as the disk it sits on: nothing blacklisted,
+/// nothing in a world-writable location, no `/proc/*/fd/*` magic link, and no
+/// name with a control character. It goes back into the *learned* set rather
+/// than the configured allowlist so that `/proc/hunter` still tells the two
+/// apart, and so that it keeps being saved. Returns `true` if it was restored.
+pub fn restore_learned_exec_path(path: &str) -> bool {
+    if !path.starts_with('/') || is_exec_blacklisted(path) || is_world_writable_exec_path(path) {
+        return false;
+    }
+    learn_exec_path(path)
 }
 
 // ---- Exec blacklist (operator-curated hard deny) --------------------------
@@ -1740,6 +1766,53 @@ mod exec_learning_tests {
             1,
             "turning it off does not re-announce turning it on"
         );
+    }
+
+    #[test]
+    fn a_program_learned_on_an_earlier_boot_comes_back_as_learned() {
+        let _g = start();
+        assert!(restore_learned_exec_path("/usr/lib/../bin/vim"));
+        assert_eq!(learned_exec_paths(), [String::from("/usr/bin/vim")]);
+        assert_eq!(trusted_exec_count(), 0, "learned, not configured");
+        assert!(
+            !restore_learned_exec_path("/usr/bin/vim"),
+            "a second copy of the same line is not a second entry"
+        );
+    }
+
+    #[test]
+    fn the_learned_file_cannot_trust_what_learning_would_have_refused() {
+        let _g = start();
+        add_blacklisted_exec_prefix(String::from("/opt/bad/"));
+        for path in [
+            "/tmp/dropper",
+            "/dev/shm/x",
+            "/proc/self/fd/3",
+            "/opt/bad/tool",
+            "relative/prog",
+            "",
+        ] {
+            assert!(!restore_learned_exec_path(path), "{path:?} was restored");
+        }
+        assert_eq!(learned_exec_count(), 0);
+    }
+
+    #[test]
+    fn a_name_with_a_newline_is_never_learned() {
+        let _g = start();
+        // In `/proc/hunter` this is two lines, and the second one would be
+        // read back from disk as a program of its own.
+        assert!(!learn_exec_path("/home/u/a\n  /home/u/planted"));
+        assert!(!restore_learned_exec_path("/home/u/tab\there"));
+        assert_eq!(learned_exec_count(), 0);
+    }
+
+    #[test]
+    fn nothing_is_restored_once_sealed() {
+        let _g = start();
+        seal_tighten_only();
+        assert!(!restore_learned_exec_path("/bin/late"));
+        assert_eq!(learned_exec_count(), 0);
     }
 
     #[test]

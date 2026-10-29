@@ -27,9 +27,13 @@
 //! directory prefix (everything beneath it); otherwise it is an exact program
 //! path. Missing files are fine — the lists simply stay empty.
 //!
+//! * `/var/lib/hunter/learned` — the programs learned on earlier boots, one
+//!   exact path per line, read after the two lists and before `policy.conf`.
+//!
 //! Learned programs (trust-on-first-use) live in kernel memory and are surfaced
-//! at `/proc/hunter`; a userspace helper is expected to append them back to
-//! `/etc/hunter/whitelist`. The kernel deliberately does not write the FS.
+//! at `/proc/hunter`. The kernel deliberately does not write the FS: `hunterd`
+//! (`hunterctl daemon`) copies them to `/var/lib/hunter/learned`, and this
+//! module hands them back to `hunter::policy` as learned at the next boot.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -45,13 +49,30 @@ pub fn load(root: &Arc<dyn INode>) {
     // Learning on by default: a "whitelist that never denies" which builds
     // itself from observed-safe execs. The blacklist remains the only deny.
     hunter::policy::set_exec_learning(true);
-    let n_white = load_list(root, "/etc/hunter/whitelist", false);
-    let n_black = load_list(root, "/etc/hunter/blacklist", true);
+    let n_white = load_list(root, "/etc/hunter/whitelist", List::Whitelist);
+    let n_black = load_list(root, "/etc/hunter/blacklist", List::Blacklist);
+    // After the blacklist, so a program denied since it was learned stays
+    // denied; before policy.conf, whose `seal` would refuse every one of them.
+    let n_learned = load_list(root, LEARNED_FILE, List::Learned);
     kernel_hal::klog_info!(
-        "hunter: loaded /etc/hunter (whitelist={}, blacklist={}, learning=on)",
+        "hunter: loaded /etc/hunter (whitelist={}, blacklist={}, learned={}, learning=on)",
         n_white,
-        n_black
+        n_black,
+        n_learned
     );
+    if n_learned > 0 {
+        hunter::event_log::record(
+            0,
+            hunter::Severity::Notice,
+            "CONTROL",
+            "CONFIG",
+            alloc::format!(
+                "restored {} learned programs from {}",
+                n_learned,
+                LEARNED_FILE
+            ),
+        );
+    }
     let n_hash = load_hashes(root, HASHES_FILE);
     if n_hash > 0 {
         kernel_hal::klog_info!("hunter: pinned {} SHA-256 digests", n_hash);
@@ -92,6 +113,20 @@ fn load_ports(root: &Arc<dyn INode>, path: &str) -> usize {
         }
     });
     count
+}
+
+/// Where `hunterd` keeps the learned set between boots.
+const LEARNED_FILE: &str = "/var/lib/hunter/learned";
+
+/// Which of hunter's lists a file feeds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum List {
+    Whitelist,
+    Blacklist,
+    /// Programs learned on an earlier boot: exact paths only, each one held
+    /// to the test it passed to be learned (see
+    /// `hunter::policy::restore_learned_exec_path`).
+    Learned,
 }
 
 /// The operator's own antivirus signatures (see `hunter::av`).
@@ -278,7 +313,7 @@ fn reject_policy(path: &str, why: &str) {
 ///   unlisted, and a cut that lands just after a `/` turns the entry into a
 ///   directory prefix — `/usr/bin/foo` cut to `/usr/` in the whitelist trusts
 ///   the whole tree. A truncated file drops its last, incomplete line.
-fn load_list(root: &Arc<dyn INode>, path: &str, blacklist: bool) -> usize {
+fn load_list(root: &Arc<dyn INode>, path: &str, list: List) -> usize {
     let inode = match root.lookup(path) {
         Ok(i) => i,
         Err(_) => return 0,
@@ -297,7 +332,7 @@ fn load_list(root: &Arc<dyn INode>, path: &str, blacklist: bool) -> usize {
         &buf[..n],
         full_size > MAX_CONFIG_BYTES || n < full_size,
         path,
-        blacklist,
+        list,
     )
 }
 
@@ -323,7 +358,7 @@ fn read_all(inode: &dyn INode, buf: &mut [u8]) -> usize {
 /// `cut` says the bytes are not all of it (the file was longer than
 /// [`MAX_CONFIG_BYTES`], or the read stopped short), in which case the last line
 /// has no terminator of its own and is not known to be whole.
-fn register_entries(bytes: &[u8], cut: bool, path: &str, blacklist: bool) -> usize {
+fn register_entries(bytes: &[u8], cut: bool, path: &str, list: List) -> usize {
     let mut lines: alloc::vec::Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
     // `split` always yields a last element; when the bytes end in a newline it
     // is empty, and then nothing was cut in half whatever `cut` says.
@@ -350,11 +385,22 @@ fn register_entries(bytes: &[u8], cut: bool, path: &str, blacklist: bool) -> usi
         }
         let is_prefix = line.ends_with('/');
         let entry = String::from(line);
-        match (blacklist, is_prefix) {
-            (false, false) => hunter::policy::add_trusted_exec_path(entry),
-            (false, true) => hunter::policy::add_trusted_exec_prefix(entry),
-            (true, false) => hunter::policy::add_blacklisted_exec_path(entry),
-            (true, true) => hunter::policy::add_blacklisted_exec_prefix(entry),
+        match (list, is_prefix) {
+            (List::Whitelist, false) => hunter::policy::add_trusted_exec_path(entry),
+            (List::Whitelist, true) => hunter::policy::add_trusted_exec_prefix(entry),
+            (List::Blacklist, false) => hunter::policy::add_blacklisted_exec_path(entry),
+            (List::Blacklist, true) => hunter::policy::add_blacklisted_exec_prefix(entry),
+            // Learning never learns a directory, so a prefix in this file was
+            // written by someone other than hunterd and is not taken.
+            (List::Learned, true) => {
+                kernel_hal::klog_info!("hunter: {}: skipped directory {}", path, line);
+                continue;
+            }
+            (List::Learned, false) => {
+                if !hunter::policy::restore_learned_exec_path(line) {
+                    continue;
+                }
+            }
         }
         count += 1;
     }
@@ -394,7 +440,7 @@ mod hunter_config_tests {
         // the deny list came out EMPTY, and the boot log said `blacklist=0`,
         // which reads as "none configured".
         let file = bytes(&[b"/a1/denied-one", BAD, b"/a1/denied-two"]);
-        let added = register_entries(&file, false, "/etc/hunter/blacklist", true);
+        let added = register_entries(&file, false, "/etc/hunter/blacklist", List::Blacklist);
         assert_eq!(added, 2, "the two good lines, and only the bad one dropped");
         assert!(hunter::policy::is_exec_blacklisted("/a1/denied-one"));
         assert!(
@@ -410,7 +456,7 @@ mod hunter_config_tests {
         // does not exist gets denied instead.
         let mut file = bytes(&[b"/a2/whole"]);
         file.extend_from_slice(b"/a2/evil");
-        let added = register_entries(&file, true, "/etc/hunter/blacklist", true);
+        let added = register_entries(&file, true, "/etc/hunter/blacklist", List::Blacklist);
         assert_eq!(added, 1);
         assert!(hunter::policy::is_exec_blacklisted("/a2/whole"));
         assert!(
@@ -427,7 +473,7 @@ mod hunter_config_tests {
         let mut file = bytes(&[b"/a3/kept"]);
         file.extend_from_slice(b"/a3/");
         assert_eq!(
-            register_entries(&file, true, "/etc/hunter/whitelist", false),
+            register_entries(&file, true, "/etc/hunter/whitelist", List::Whitelist),
             1
         );
         assert!(hunter::policy::is_exec_listed("/a3/kept"));
@@ -444,7 +490,12 @@ mod hunter_config_tests {
         // not cut keeps its last line even without a terminator.
         let ending_in_newline = bytes(&[b"/a4/first", b"/a4/last"]);
         assert_eq!(
-            register_entries(&ending_in_newline, true, "/etc/hunter/blacklist", true),
+            register_entries(
+                &ending_in_newline,
+                true,
+                "/etc/hunter/blacklist",
+                List::Blacklist
+            ),
             2,
             "a trailing newline means nothing was cut in half"
         );
@@ -452,7 +503,12 @@ mod hunter_config_tests {
 
         let no_terminator = alloc::vec::Vec::from(&b"/a5/only"[..]);
         assert_eq!(
-            register_entries(&no_terminator, false, "/etc/hunter/blacklist", true),
+            register_entries(
+                &no_terminator,
+                false,
+                "/etc/hunter/blacklist",
+                List::Blacklist
+            ),
             1
         );
         assert!(hunter::policy::is_exec_blacklisted("/a5/only"));
@@ -469,12 +525,36 @@ mod hunter_config_tests {
             b"\t# indented comment",
         ]);
         assert_eq!(
-            register_entries(&file, false, "/etc/hunter/whitelist", false),
+            register_entries(&file, false, "/etc/hunter/whitelist", List::Whitelist),
             2
         );
         assert!(hunter::policy::is_exec_listed("/a6/spaced"));
         assert!(hunter::policy::is_exec_listed("/a6/tree/anything"));
         assert!(!hunter::policy::is_exec_listed("/a6/a-comment"));
+    }
+
+    #[test]
+    fn the_learned_file_restores_programs_as_learned_and_nothing_more() {
+        hunter::policy::add_blacklisted_exec_path(String::from("/a7/denied-since"));
+        let file = bytes(&[
+            b"# written by hunterd",
+            b"/a7/editor",
+            b"/a7/whole-tree/",
+            b"/a7/denied-since",
+            b"/tmp/a7-dropper",
+        ]);
+        assert_eq!(
+            register_entries(&file, false, LEARNED_FILE, List::Learned),
+            1,
+            "only the plain program comes back"
+        );
+        assert!(hunter::policy::learned_exec_paths().contains(&String::from("/a7/editor")));
+        assert!(
+            !hunter::policy::is_exec_listed("/a7/whole-tree/anything"),
+            "learning never learns a directory, so the file cannot trust one"
+        );
+        assert!(!hunter::policy::is_exec_listed("/a7/denied-since"));
+        assert!(!hunter::policy::is_exec_listed("/tmp/a7-dropper"));
     }
 
     /// A root with `/etc/hunter/policy.conf` holding `text`. The filesystem
@@ -608,7 +688,7 @@ mod hunter_config_tests {
         assert_eq!(buf, content);
 
         assert_eq!(
-            register_entries(&buf, false, "/etc/hunter/blacklist", true),
+            register_entries(&buf, false, "/etc/hunter/blacklist", List::Blacklist),
             3
         );
         assert!(hunter::policy::is_exec_blacklisted("/a7/three"));
@@ -628,7 +708,7 @@ mod hunter_config_tests {
         assert_eq!(n, 17, "the file is shorter than the buffer");
         assert!(n < buf.len(), "which is how the caller learns it is cut");
         assert_eq!(
-            register_entries(&buf[..n], true, "/etc/hunter/blacklist", true),
+            register_entries(&buf[..n], true, "/etc/hunter/blacklist", List::Blacklist),
             1
         );
         assert!(!hunter::policy::is_exec_blacklisted("/a8/half"));

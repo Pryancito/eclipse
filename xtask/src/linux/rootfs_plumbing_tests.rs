@@ -626,6 +626,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "/usr/local/bin/eclipse-gtk-caches",
             "",
         ),
+        ("hunterd", "respawn", "/usr/local/bin/eclipse-hunterd", ""),
         (
             "labwc",
             "respawn",
@@ -996,6 +997,8 @@ fn the_two_sessions_never_start_each_others_clients() {
         "dbus",
         "dbus-selftest",
         "dbus-system",
+        // Keeps hunter's events and learned programs; no session needed.
+        "hunterd",
         "ntpd",
         "oopslog",
         // A bus service, not a session one: Xorg has GTK apps too.
