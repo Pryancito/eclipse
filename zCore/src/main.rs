@@ -658,6 +658,23 @@ fn primary_main(config: kernel_hal::KernelConfig) {
     if !linux_object::fs::register_shrinkers() {
         log::error!("shrinker registry is full: the ELF image cache will not be reclaimed");
     }
+    // MSI-X instead of the MSI every PCI device gets today. This has to be set
+    // HERE, before `primary_init`, and not with the switches further down:
+    // `primary_init` is what enumerates and claims PCI devices, so a hatch
+    // opened after it returns is read by nobody. (Measured: with the flag
+    // parsed later, `pci.msix` on the cmdline changed nothing at all and the
+    // bus came up with plain MSI, exactly as with the hatch shut.)
+    //
+    // The layer behind it is pinned against the PCI 3.0 capability and tested
+    // against a table in host memory, but no vector of it had been armed on a
+    // machine, and a device that is armed and does not deliver looks exactly
+    // like a device that works until something waits for an interrupt. With
+    // the hatch shut not even the capability is read.
+    #[cfg(not(feature = "libos"))]
+    if kernel_hal::cmdline::flag(&options.cmdline, "pci.msix") {
+        kernel_hal::drivers::set_pci_msix_enabled(true);
+        klog_info!("Eclipse: pci.msix -- PCI devices are armed with MSI-X");
+    }
     kernel_hal::console::early_progress_bar(80);
     kernel_hal::primary_init();
     // ... and start the worker that walks the caches direct reclaim may not:

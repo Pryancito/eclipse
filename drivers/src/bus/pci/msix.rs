@@ -58,6 +58,8 @@
 //! 16`) y para uno de `0x60` sale mal (`0x62 & 0x10 == 0`): la mitad alta se
 //! escribe en la baja, y lo que se pisa son el id de la capacidad y el
 //! puntero al siguiente. `write8` tiene el mismo paréntesis que falta.
+//! (Los caminos propios que escribían menos de una palabra ya no pasan por
+//! ahí: ver [`super::cfgwrite`].)
 //!
 //! Así que aquí no se usa ninguno de los dos. El puntero de una capacidad
 //! está alineado a palabra por especificación, de modo que el control es
@@ -65,13 +67,19 @@
 //! `read32`/`write32` — que es, además, lo que ya hace el camino de MSI de
 //! [`super::enable_with`]. Ver [`flags_de_palabra`].
 //!
-//! # Lo que esta tanda no hace
+//! # Quién usa esto
 //!
-//! No conecta nada: no toca [`super::enable`] ni [`super::init_driver`], que
-//! son el camino que de verdad arranca en x86_64. Esto es la capa, y lo que
-//! haga uso de ella va aparte, detrás de una escotilla.
+//! Esta capa son los registros y el orden. Lo que hace falta para llegar a un
+//! dispositivo de verdad -- encontrar la capacidad, encontrar la BAR donde
+//! vive la tabla y armar el primer vector -- está en [`bringup`], detrás de
+//! la escotilla `pci.msix`.
 
 use pci::{CSpaceAccessMethod, Location, PortOps};
+
+/// Lo que hace falta para llegar a un dispositivo de verdad: encontrar la
+/// capacidad, encontrar la BAR de la tabla y armar el primer vector, detrás de
+/// la escotilla `pci.msix`.
+pub mod bringup;
 
 /// `PCI_CAP_ID_MSIX`.
 pub const CAP_ID_MSIX: u8 = 0x11;
@@ -286,6 +294,23 @@ impl MsixTable {
             None => false,
             Some(ctrl) => self.escribe(vector, ENTRY_VECTOR_CTRL, ctrl & !ENTRY_CTRL_MASKBIT),
         }
+    }
+
+    /// Las cuatro palabras de una entrada, tal como el dispositivo las
+    /// devuelve.
+    ///
+    /// Existe para poder **releer lo que se acaba de escribir**: es la única
+    /// comprobación, sin esperar una interrupción, de que la tabla estaba
+    /// donde la capacidad decía. Con el `BIR` mal leído o el offset sin
+    /// enmascarar, lo escrito cae en otro sitio de la BAR y lo que vuelve de
+    /// aquí no es lo que se puso.
+    pub fn read_back(&self, vector: usize) -> Option<[u32; 4]> {
+        Some([
+            self.lee(vector, ENTRY_LOWER_ADDR)?,
+            self.lee(vector, ENTRY_UPPER_ADDR)?,
+            self.lee(vector, ENTRY_DATA)?,
+            self.lee(vector, ENTRY_VECTOR_CTRL)?,
+        ])
     }
 
     /// Si está tapada. `None` si ese vector no existe.

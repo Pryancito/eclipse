@@ -387,6 +387,16 @@ pub fn set_gem_comptags_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_gem_comptags_enabled(_v: bool) {}
 
+/// Lets a PCI device be armed with MSI-X instead of the MSI it gets today
+/// (`pci.msix`). Default off: the layer under it is pinned against the spec
+/// and tested against a table in host memory and a fake config space, but no
+/// vector of it has ever been armed on a machine, and whether a real device
+/// then delivers the message is the part a buffer cannot answer. See
+/// `drivers/src/bus/pci/msix/bringup.rs`.
+pub fn set_pci_msix_enabled(v: bool) {
+    zcore_drivers::bus::pci::msix::bringup::set_enabled(v);
+}
+
 /// Lets the AMD 10GbE (`xgbe`) probe run its bring-up sequence instead of
 /// leaving the device unclaimed (`xgbe.enable`). Default off: not one
 /// register write of that sequence has ever reached the part, because QEMU

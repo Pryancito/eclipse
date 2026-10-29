@@ -213,25 +213,45 @@ impl PortOps for PortOpsImpl {
 /// Enable the pci device and its interrupt
 /// Return assigned MSI interrupt number when applicable
 #[allow(dead_code)]
-unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
-    // 23 and lower are used. Atomic, not `static mut`: device probe can run
-    // concurrently, and a plain `+=` on a `static mut` is a data race (UB).
-    static MSI_IRQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(23);
-    // SDM Vol. 3 §10.11 Message Signalled Interrupts: address bits 19:12
-    // carry the destination APIC id (physical mode). This used to be hardcoded
-    // to 0 with "0 is (usually) the apic id of the bsp" -- on firmware that
-    // gives the BSP any other id, every MSI (xHCI keyboard/mouse, e1000e RX)
-    // went to a CPU that may never come up and was silently lost. Route MSIs
-    // to the CPU that actually runs the interrupt handlers.
+// 23 and lower are used. Atomic, not `static mut`: device probe can run
+// concurrently, and a plain `+=` on a `static mut` is a data race (UB).
+//
+// Module scope, not inside `enable`, because the MSI-X path hands out numbers
+// from the same pool: a device that declares MSI-X and no MSI gets no number
+// out of `enable` and still needs one.
+static MSI_IRQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(23);
+
+/// The next interrupt number for a message-signalled interrupt, MSI or MSI-X.
+fn next_msi_irq() -> u32 {
+    MSI_IRQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// Which APIC the messages must be addressed to.
+///
+/// SDM Vol. 3 §10.11 Message Signalled Interrupts: address bits 19:12 carry
+/// the destination APIC id (physical mode). This used to be hardcoded to 0
+/// with "0 is (usually) the apic id of the bsp" -- on firmware that gives the
+/// BSP any other id, every MSI (xHCI keyboard/mouse, e1000e RX) went to a CPU
+/// that may never come up and was silently lost. Route them to the CPU that
+/// actually runs the interrupt handlers.
+fn msi_dest() -> u32 {
     #[cfg(target_arch = "x86_64")]
-    let dest = crate::irq::x86::Apic::bsp_apic_id() as u32;
+    return crate::irq::x86::Apic::bsp_apic_id() as u32;
     #[cfg(not(target_arch = "x86_64"))]
-    let dest = 0u32;
+    0u32
+}
+
+unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
     // SAFETY: same call as the body below, against the real config ports.
     unsafe {
-        enable_with(&PortOpsImpl, PCI_ACCESS, loc, paddr, dest, || {
-            MSI_IRQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
-        })
+        enable_with(
+            &PortOpsImpl,
+            PCI_ACCESS,
+            loc,
+            paddr,
+            msi_dest(),
+            next_msi_irq,
+        )
     }
 }
 
@@ -346,9 +366,103 @@ pub(crate) unsafe fn enable_with<T: PortOps>(
     }
 }
 
+/// What [`msix::bringup::arm_first_vector`] needs and only the machine can
+/// answer: where a BAR is, how big it is, and a mapping of it.
+///
+/// x86_64 only, and not by accident: the message address this arms is the
+/// LAPIC window (`0xfee0_0000` plus the destination apic id), which is an x86
+/// address. On riscv64 the message goes to an IMSIC or an APLIC window and on
+/// aarch64 to the GIC's ITS, so arming a vector there with this address would
+/// write a plausible-looking message that lands nowhere. The two BAR helpers
+/// below are x86_64-only for their own reasons, which is what makes this a
+/// compile error rather than a quiet wrong address.
+#[cfg(target_arch = "x86_64")]
+struct MachineBar<'a> {
+    loc: Location,
+    mapper: &'a Option<Arc<dyn IoMapper>>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl msix::bringup::BarInfo for MachineBar<'_> {
+    fn addr(&mut self, bar_reg: u16) -> u64 {
+        unsafe { read_bar_addr(&PortOpsImpl, PCI_ACCESS, self.loc, bar_reg) }
+    }
+    fn len(&mut self, bar_reg: u16) -> u64 {
+        unsafe { probe_bar_size(&PortOpsImpl, PCI_ACCESS, self.loc, bar_reg) }
+    }
+    fn map(&mut self, pa: u64, len: usize) -> usize {
+        super::resolve_window(self.mapper, pa as usize, len, 0)
+    }
+}
+
+/// Arms MSI-X on `loc`, behind the `pci.msix` hatch, and returns the irq to
+/// use if it worked.
+///
+/// x86_64 only: see [`MachineBar`]. Elsewhere this is the stub below and the
+/// device keeps the MSI it already had.
+///
+/// `irq` is what [`enable`] already assigned to MSI, if any: the same number
+/// is reused so whatever handler the driver registers is the one the device
+/// now raises. A device that declares MSI-X and no MSI gets a fresh number.
+///
+/// Every refusal is a "this device, not now", never a failure: the function
+/// keeps the MSI (or the INTx line) it already had, which is exactly what it
+/// has today with the hatch shut.
+#[cfg(target_arch = "x86_64")]
+fn arm_msix(
+    loc: Location,
+    mapper: &Option<Arc<dyn IoMapper>>,
+    irq: Option<usize>,
+) -> Option<usize> {
+    if !msix::bringup::enabled() {
+        return None;
+    }
+    let irq = irq.map(|i| i as u32).unwrap_or_else(next_msi_irq);
+    let mut bar = MachineBar { loc, mapper };
+    match unsafe {
+        msix::bringup::arm_first_vector(&PortOpsImpl, PCI_ACCESS, loc, msi_dest(), irq, &mut bar)
+    } {
+        Ok(armado) => {
+            // El releído de la entrada va en el log a propósito: es lo único
+            // que dice, sin esperar una interrupción, que la tabla estaba
+            // donde la capacidad decía.
+            info!(
+                "MSI-X armed on {:?}: {} vector(s), table in BAR {} at {:#x}, vector 0 -> irq {}; entry 0 reads back addr={:#x}:{:#x} data={:#x} ctrl={:#x}",
+                loc,
+                armado.cap.table_size,
+                armado.cap.table_bir,
+                armado.cap.table_offset,
+                irq + 32,
+                armado.entrada[1],
+                armado.entrada[0],
+                armado.entrada[2],
+                armado.entrada[3],
+            );
+            Some(irq as usize)
+        }
+        Err(why) => {
+            debug!("MSI-X not armed on {:?}: {:?}", loc, why);
+            None
+        }
+    }
+}
+
+/// The non-x86_64 stub: no message address this code knows how to build, so
+/// nothing is armed and nothing is logged.
+#[cfg(not(target_arch = "x86_64"))]
+fn arm_msix(
+    _loc: Location,
+    _mapper: &Option<Arc<dyn IoMapper>>,
+    _irq: Option<usize>,
+) -> Option<usize> {
+    None
+}
+
 pub fn init_driver(dev: &PCIDevice, mapper: &Option<Arc<dyn IoMapper>>) -> DeviceResult<Device> {
     // Enable Memory Space and Bus Mastering
     let irq = unsafe { enable(dev.loc, 0) };
+    // And, if the hatch is open, MSI-X instead of the MSI that just got armed.
+    let irq = arm_msix(dev.loc, mapper, irq).or(irq);
 
     // Try modular PCI drivers (ArceOS style)
     if let Ok(device) = super::pci_drivers::probe_pci_device(dev, mapper, irq) {
