@@ -31,6 +31,10 @@ use crate::net::mii::*;
 /// del nodo del RP1, donde cabe todo lo que el driver toca.
 const WINDOW_BYTES: usize = MACB_WINDOW_BYTES;
 
+/// Los tres registros que **se limpian escribiendo unos** y no guardan lo
+/// escrito. Su valor de verdad vive en `State::w1c`.
+const WRITE_ONE_TO_CLEAR: [usize; 3] = [TSR, RSR, ISR];
+
 /// El `IDNUM` que el GEM del RP1 declara. Linux solo exige que sea 2 o mas.
 pub(super) const GEM_IDNUM: u32 = 2;
 
@@ -54,6 +58,17 @@ struct State {
     faults: Faults,
     /// Los registros del PHY, por (direccion MDIO, registro).
     phy: BTreeMap<(u8, u32), u16>,
+    /// El valor de verdad de los tres registros que se limpian escribiendo
+    /// unos (`TSR`, `RSR`, `ISR`).
+    ///
+    /// Hace falta una copia porque `MacbMac::write` **ya ha guardado** el
+    /// valor escrito en la ventana cuando `on_write` corre: el valor anterior,
+    /// que es el que hay que limpiar, ya no esta. Sin esto, reconocer un bit
+    /// limpiaba el registro entero y nadie se daba cuenta, porque un test que
+    /// reconoce TODO lo pendiente da el mismo resultado de las dos formas.
+    w1c: BTreeMap<usize, u32>,
+    /// Los offsets que el driver ha leido, en orden.
+    reads: Vec<usize>,
     /// Lo que el driver ha escrito en el PHY, en orden.
     phy_writes: Vec<(u8, u32, u16)>,
     /// Cuantas transacciones MDIO se han arrancado.
@@ -96,6 +111,8 @@ impl Hw {
             regs,
             base,
             faults: Faults::default(),
+            w1c: BTreeMap::new(),
+            reads: Vec::new(),
             phy: BTreeMap::new(),
             phy_writes: Vec::new(),
             mdio_starts: 0,
@@ -103,6 +120,8 @@ impl Hw {
             desc_writes: Vec::new(),
         };
         st.regs[MID / 4] = GEM_IDNUM << MID_IDNUM_SHIFT | 0x0107;
+        // El reset deja la tarjeta callada, que en el `IMR` es todo a unos.
+        st.regs[IMR / 4] = !0;
         // Un bus de 64 bits, que es lo que `DBWDEF` codifica con un 2.
         st.regs[GEM_DCFG1 / 4] = 2 << DCFG1_DBWDEF_SHIFT;
         // Y un DMA que direcciona a 64 bits, que es lo que declara un GEM
@@ -140,7 +159,12 @@ impl Hw {
     }
 
     pub(super) fn poke(&self, off: usize, val: u32) {
-        self.with(|st| st.regs[off / 4] = val);
+        self.with(|st| {
+            st.regs[off / 4] = val;
+            if WRITE_ONE_TO_CLEAR.contains(&off) {
+                st.w1c.insert(off, val);
+            }
+        });
     }
 
     pub(super) fn peek(&self, off: usize) -> u32 {
@@ -230,6 +254,15 @@ impl Hw {
     }
 
     /// Cuantas escrituras se han visto, para usarlo como marca.
+    /// Cuantas veces ha leido el driver el registro `off` desde `marca`.
+    pub(super) fn reads_since(&self, marca: usize, off: usize) -> usize {
+        self.with(|st| st.reads[marca..].iter().filter(|o| **o == off).count())
+    }
+
+    pub(super) fn read_mark(&self) -> usize {
+        self.with(|st| st.reads.len())
+    }
+
     pub(super) fn write_mark(&self) -> usize {
         self.with(|st| st.writes.len())
     }
@@ -263,6 +296,28 @@ impl Drop for Hw {
     }
 }
 
+/// La reaccion del MAC falso a una **lectura** del driver.
+///
+/// Dos cosas: cuenta la lectura, para que un test pueda fijar que un registro
+/// se lee **una sola vez**, y modela el `ISR` que se limpia al leerlo cuando
+/// `GEM_IRQCOR` esta puesto, que es la mitad del silicio donde leerlo dos
+/// veces pierde causas.
+pub(super) fn on_read(base: usize, off: usize, val: u32) -> u32 {
+    FAKE.with(|f| {
+        let mut slot = f.borrow_mut();
+        let Some(st) = slot.as_mut() else { return val };
+        if st.base != base {
+            return val;
+        }
+        st.reads.push(off);
+        if off == ISR && st.regs[GEM_DCFG1 / 4] & DCFG1_IRQCOR != 0 {
+            st.w1c.insert(ISR, 0);
+            st.regs[ISR / 4] = 0;
+        }
+        val
+    })
+}
+
 /// La reaccion del MAC falso a una escritura del driver.
 ///
 /// Se llama desde `MacbMac::write` y solo bajo `cfg(test)`. Una escritura en
@@ -279,17 +334,30 @@ pub(super) fn on_write(base: usize, off: usize, val: u32) {
         match off {
             NCR => st.ncr_cmd(val),
             MAN => st.man_cmd(val),
+            // `IMR` se llama *mask* y **uno es enmascarado**: armar algo le
+            // QUITA el bit, desarmarlo se lo pone, y el reset lo deja a unos
+            // porque la tarjeta arranca callada. Eso no sale de ninguna
+            // fuente que se haya podido leer --ningun driver publicado lee el
+            // `IMR` para decidir nada-- sino del nombre del registro, asi que
+            // el driver no depende de ello: filtra el `ISR` contra la
+            // constante que armo. Aqui se modela para que un test pueda
+            // comprobar QUE bits se armaron, que es lo que importa.
             IER => {
-                st.regs[IMR / 4] |= val;
+                st.regs[IMR / 4] &= !val;
                 st.regs[IER / 4] = 0;
             }
             IDR => {
-                st.regs[IMR / 4] &= !val;
+                st.regs[IMR / 4] |= val;
                 st.regs[IDR / 4] = 0;
             }
             TSR | RSR | ISR => {
-                // Se limpia lo que se escribe, no se guarda lo escrito.
-                st.regs[off / 4] &= !val;
+                // Se limpia lo que se escribe, no se guarda lo escrito. Y el
+                // valor del que se limpia es el de `w1c`, no el de la
+                // ventana: ahi ya esta `val`.
+                let antes = st.w1c.get(&off).copied().unwrap_or(0);
+                let despues = antes & !val;
+                st.w1c.insert(off, despues);
+                st.regs[off / 4] = despues;
             }
             _ => {}
         }

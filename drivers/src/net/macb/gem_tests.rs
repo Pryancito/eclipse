@@ -91,7 +91,7 @@ fn the_reset_stops_the_mac_and_clears_everything_it_can_report() {
     hw.poke(NCR, NCR_RE | NCR_TE | NCR_MPE);
     hw.poke(TSR, 0x1234);
     hw.poke(RSR, 0x5678);
-    hw.poke(IMR, 0xFFFF);
+    hw.poke(IMR, 0);
     hw.raise_irq(0xABC);
     hw.poke(GEM_PBUFRXCUT, 0xDEAD);
 
@@ -100,7 +100,7 @@ fn the_reset_stops_the_mac_and_clears_everything_it_can_report() {
     assert_eq!(hw.peek(NCR) & (NCR_RE | NCR_TE), 0, "sigue encendido");
     assert_eq!(hw.peek(TSR), 0);
     assert_eq!(hw.peek(RSR), 0);
-    assert_eq!(hw.peek(IMR), 0, "quedo alguna interrupcion sin enmascarar");
+    assert_eq!(hw.peek(IMR), !0, "quedo alguna interrupcion sin enmascarar");
     assert_eq!(hw.peek(ISR), 0, "quedo alguna interrupcion pendiente");
     assert_eq!(hw.peek(GEM_PBUFRXCUT), 0);
 }
