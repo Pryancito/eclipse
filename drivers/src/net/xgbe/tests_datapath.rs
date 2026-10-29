@@ -2244,3 +2244,178 @@ fn the_same_core_revision_decides_this_and_the_queue_flush() {
     assert!(MAC_VER_33 >= FLUSH_MIN_SNPSVER);
     assert_eq!(speed_select(LinkSpeed::Speed2_5G, 0x21), MAC_SS_2_5G_GMII);
 }
+
+// ——— Tanda 24: cuanto trae el DMA de una vez ———
+
+#[test]
+fn the_burst_length_field_is_six_bits_and_the_legal_values_are_not() {
+    assert_eq!(DMA_CH_TCR_PBL, (16, 6));
+    assert_eq!(DMA_CH_RCR_PBL, (16, 6));
+    // Six bits tops out at 63, and three of the eight legal burst
+    // lengths are above that.
+    assert_eq!((1u32 << DMA_CH_TCR_PBL.1) - 1, 63);
+    for pbl in [64u32, 128, 256] {
+        assert!(pbl > 63);
+        // Written straight into the field, 64 would come out as 0: a
+        // burst length of nothing, with no complaint from anywhere.
+        assert_eq!(
+            get_bits(64 << DMA_CH_TCR_PBL.0, DMA_CH_TCR_PBL.0, DMA_CH_TCR_PBL.1),
+            0
+        );
+    }
+}
+
+#[test]
+fn a_burst_above_thirty_two_is_a_multiplier_and_not_a_bigger_number() {
+    assert_eq!(pbl_encoding(32), Some((32, 0)));
+    assert_eq!(pbl_encoding(64), Some((8, 1)));
+    assert_eq!(pbl_encoding(128), Some((16, 1)));
+    assert_eq!(pbl_encoding(256), Some((32, 1)));
+    // And the encoded value always fits, which is the point of the
+    // multiplier.
+    for pbl in DMA_PBL_VALUES {
+        let (value, _) = pbl_encoding(pbl).unwrap();
+        assert!(value < (1 << DMA_CH_TCR_PBL.1), "pbl {}", pbl);
+    }
+}
+
+#[test]
+fn the_boundary_is_above_thirty_two_and_not_at_it() {
+    assert_eq!(pbl_encoding(32).unwrap().1, 0);
+    assert_eq!(pbl_encoding(64).unwrap().1, 1);
+    // 32 with the multiplier would be 256, so the two encodings of the
+    // same field value mean different things.
+    assert_eq!(pbl_encoding(32).unwrap().0, pbl_encoding(256).unwrap().0);
+    assert_ne!(pbl_encoding(32).unwrap().1, pbl_encoding(256).unwrap().1);
+}
+
+#[test]
+fn a_burst_that_is_not_one_of_the_eight_is_refused() {
+    // Linux shifts whatever it is given; here anything that is not a
+    // named `DMA_PBL_*` is a bug, because the shift silently rounds.
+    for pbl in [0u32, 3, 33, 40, 48, 100, 255, 512] {
+        assert!(pbl_encoding(pbl).is_none(), "pbl {}", pbl);
+    }
+    // 33 would have become 4 under a bare shift: an eightfold mistake.
+    assert_eq!(33u32 >> 3, 4);
+    let fake = FakeXgmac::new();
+    assert!(config_pbl_val(&fake, 2, 2, 33).is_err());
+    assert!(fake.log().is_empty());
+}
+
+#[test]
+fn one_setting_goes_to_three_different_registers() {
+    let fake = FakeXgmac::new();
+    config_pbl_val(&fake, 2, 2, 256).unwrap();
+    for channel in 0..2 {
+        assert_eq!(fake.writes_to(dma_channel_reg(channel, DMA_CH_CR)), 1);
+        assert_eq!(fake.writes_to(dma_channel_reg(channel, DMA_CH_TCR)), 1);
+        assert_eq!(fake.writes_to(dma_channel_reg(channel, DMA_CH_RCR)), 1);
+    }
+    assert_eq!(fake.writes_to(dma_channel_reg(2, DMA_CH_CR)), 0);
+}
+
+#[test]
+fn the_multiplier_reaches_channels_that_the_lengths_do_not() {
+    // Four channels, but only two transmit rings and three receive
+    // ones. The `PBLX8` bit still goes to all four.
+    let fake = FakeXgmac::new();
+    config_pbl_val(&fake, 2, 3, 64).unwrap();
+    for channel in 0..3 {
+        assert_eq!(
+            fake.writes_to(dma_channel_reg(channel, DMA_CH_CR)),
+            1,
+            "channel {}",
+            channel
+        );
+    }
+    assert_eq!(fake.writes_to(dma_channel_reg(2, DMA_CH_TCR)), 0);
+    assert_eq!(fake.writes_to(dma_channel_reg(2, DMA_CH_RCR)), 1);
+}
+
+#[test]
+fn the_burst_does_not_disturb_the_start_bits_it_shares_a_word_with() {
+    // `DMA_CH_RCR` bit 0 is `SR` and carries `RBSZ` at bit 1; `PBL` is
+    // at 16 and must leave both alone.
+    let fake = FakeXgmac::new();
+    fake.preload(dma_channel_reg(0, DMA_CH_RCR), 1536 << DMA_CH_RCR_RBSZ.0);
+    config_pbl_val(&fake, 0, 1, 16).unwrap();
+    let rcr = fake
+        .log()
+        .iter()
+        .rev()
+        .find_map(|a| match a {
+            Access::Write(o, v) if *o == dma_channel_reg(0, DMA_CH_RCR) => Some(*v),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(get_bits(rcr, DMA_CH_RCR_RBSZ.0, DMA_CH_RCR_RBSZ.1), 1536);
+    assert_eq!(get_bits(rcr, DMA_CH_RCR_PBL.0, DMA_CH_RCR_PBL.1), 16);
+}
+
+#[test]
+fn operate_on_second_packet_is_transmit_only_and_switchable() {
+    assert_eq!(DMA_CH_TCR_OSP, (4, 1));
+    let on = FakeXgmac::new();
+    config_osp_mode(&on, 2, true);
+    assert_eq!(on.writes_to(dma_channel_reg(0, DMA_CH_TCR)), 1);
+    assert_eq!(on.writes_to(dma_channel_reg(0, DMA_CH_RCR)), 0);
+    let off = FakeXgmac::new();
+    config_osp_mode(&off, 2, false);
+    let value = |f: &FakeXgmac| {
+        f.log()
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Access::Write(o, v) if *o == dma_channel_reg(1, DMA_CH_TCR) => Some(*v),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(get_bits(value(&on), DMA_CH_TCR_OSP.0, DMA_CH_TCR_OSP.1), 1);
+    assert_eq!(get_bits(value(&off), DMA_CH_TCR_OSP.0, DMA_CH_TCR_OSP.1), 0);
+    // It is below the TSO bit and above nothing this driver writes.
+    assert!(DMA_CH_TCR_OSP.0 < DMA_CH_TCR_TSE.0);
+}
+
+#[test]
+fn the_cache_attributes_are_written_whole_and_not_merged() {
+    // `XGMAC_IOWRITE`, not `XGMAC_IOWRITE_BITS`: no read first.
+    let fake = FakeXgmac::new();
+    fake.preload(DMA_AXIARCR, 0xdead_beef);
+    config_dma_cache(&fake, DMA_PCI_ARCR, DMA_PCI_AWCR, DMA_PCI_AWARCR);
+    assert_eq!(fake.reads_of(DMA_AXIARCR), 0);
+    assert_eq!(fake.log()[0], Access::Write(DMA_AXIARCR, DMA_PCI_ARCR));
+    assert_eq!(fake.log()[1], Access::Write(DMA_AXIAWCR, DMA_PCI_AWCR));
+    assert_eq!(fake.log()[2], Access::Write(DMA_AXIAWARCR, DMA_PCI_AWARCR));
+    assert_eq!(fake.log().len(), 3);
+}
+
+#[test]
+fn a_zero_in_the_third_register_means_leave_it_alone() {
+    // Linux's own guard. A platform without an `awarcr` keeps whatever
+    // reset left, so zero is "do not touch", not "clear".
+    let fake = FakeXgmac::new();
+    config_dma_cache(&fake, DMA_PCI_ARCR, DMA_PCI_AWCR, 0);
+    assert_eq!(fake.log().len(), 2);
+    assert_eq!(fake.writes_to(DMA_AXIAWARCR), 0);
+}
+
+#[test]
+fn the_three_attribute_sets_are_three_buses_and_not_three_defaults() {
+    // `XGBE_DMA_SYS_ARCR` is 0x00303030 and `XGBE_DMA_OS_ARCR` is
+    // 0x002b2b2b; this is the PCI one, which is what this driver's
+    // device is behind. Nothing in the chip would object to the wrong
+    // one, so the number is pinned here rather than chosen at the call.
+    assert_eq!(DMA_PCI_ARCR, 0x000f_0f0f);
+    assert_eq!(DMA_PCI_AWCR, 0x0f0f_0f0f);
+    assert_eq!(DMA_PCI_AWARCR, 0x0000_0f0f);
+    assert_ne!(DMA_PCI_ARCR, 0x0030_3030);
+    // And the three registers are four bytes apart but not contiguous:
+    // 0x3010, 0x3018, 0x301c.
+    assert_eq!(DMA_AXIAWCR - DMA_AXIARCR, 8);
+    assert_eq!(DMA_AXIAWARCR - DMA_AXIAWCR, 4);
+    // All three sit above the bus mode register and below the channels.
+    assert!(DMA_AXIARCR > DMA_SBMR);
+    assert!(DMA_AXIAWARCR < DMA_CH_BASE);
+}

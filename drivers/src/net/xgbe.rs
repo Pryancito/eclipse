@@ -3394,6 +3394,152 @@ pub fn set_mac_speed(acc: &dyn MmioAccess, speed: LinkSpeed, snps_ver: u8) -> bo
     true
 }
 
+// ——— How much the DMA fetches at a time, and what it tells the bus ———
+
+/// `DMA_AXIARCR`: the AXI read cache attributes. Written **whole**, not as
+/// fields: Linux uses `XGMAC_IOWRITE`, not `XGMAC_IOWRITE_BITS`.
+pub const DMA_AXIARCR: usize = 0x3010;
+/// `DMA_AXIAWCR`: the AXI write cache attributes. Written whole.
+pub const DMA_AXIAWCR: usize = 0x3018;
+/// `DMA_AXIAWARCR`: the attributes for writes that follow a read.
+pub const DMA_AXIAWARCR: usize = 0x301c;
+
+/// `XGBE_DMA_PCI_ARCR`: the read attributes for a PCI port — this device.
+///
+/// Three different sets exist in `xgbe.h` (`PCI`, `SYS` and `OS`) and they do
+/// not resemble each other: the system one is `0x00303030` against this
+/// `0x000f0f0f`. They are not interchangeable defaults, they are three
+/// different buses, and there is nothing in the chip that would complain
+/// about the wrong one.
+pub const DMA_PCI_ARCR: u32 = 0x000f_0f0f;
+/// `XGBE_DMA_PCI_AWCR`.
+pub const DMA_PCI_AWCR: u32 = 0x0f0f_0f0f;
+/// `XGBE_DMA_PCI_AWARCR`.
+pub const DMA_PCI_AWARCR: u32 = 0x0000_0f0f;
+
+/// `DMA_CH_CR_PBLX8`, index 16, width 1: multiply the programmed burst length
+/// by eight.
+pub const DMA_CH_CR_PBLX8: (u32, u32) = (16, 1);
+/// `DMA_CH_TCR_PBL`, index 16, width **6**: the transmit burst length.
+pub const DMA_CH_TCR_PBL: (u32, u32) = (16, 6);
+/// `DMA_CH_RCR_PBL`, index 16, width 6: the receive burst length.
+pub const DMA_CH_RCR_PBL: (u32, u32) = (16, 6);
+/// `DMA_CH_TCR_OSP`, index 4, width 1: operate on the second packet — let the
+/// engine start fetching the next frame before the current one is done.
+pub const DMA_CH_TCR_OSP: (u32, u32) = (4, 1);
+
+/// The burst lengths `DMA_PBL_*` names. Only these eight are legal.
+pub const DMA_PBL_VALUES: [u32; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+
+/// How a burst length is encoded: the value that goes in the 6-bit `PBL`
+/// field, and whether the `PBLX8` multiplier is on. `xgbe_config_pbl_val`.
+///
+/// Above 32 the burst is **not** written as a bigger number — it cannot be.
+/// The field is six bits, so 63 is the ceiling, and `DMA_PBL_64`,
+/// `DMA_PBL_128` and `DMA_PBL_256` would all be truncated: 64 becomes 0, a
+/// burst length of nothing. Linux turns `PBLX8` on and shifts the value right
+/// by three instead, so 256 goes out as 32 with the multiplier set.
+///
+/// Returns `None` for a burst that is not one of [`DMA_PBL_VALUES`], rather
+/// than shifting an arbitrary number down and writing whatever falls out.
+#[inline]
+pub fn pbl_encoding(pbl: u32) -> Option<(u32, u32)> {
+    let mut legal = false;
+    let mut i = 0;
+    while i < DMA_PBL_VALUES.len() {
+        if DMA_PBL_VALUES[i] == pbl {
+            legal = true;
+        }
+        i += 1;
+    }
+    if !legal {
+        return None;
+    }
+    if pbl > 32 {
+        Some((pbl >> 3, 1))
+    } else {
+        Some((pbl, 0))
+    }
+}
+
+/// Write the burst length into every channel. `xgbe_config_pbl_val`.
+///
+/// One setting, three registers: the multiplier lives in the channel's
+/// control register and the length itself in the transmit and receive control
+/// registers. And the shapes differ — the multiplier goes to **every**
+/// channel, while each length goes only to the channels that have that
+/// direction's ring.
+pub fn config_pbl_val(
+    acc: &dyn MmioAccess,
+    tx_channels: u32,
+    rx_channels: u32,
+    pbl: u32,
+) -> DeviceResult<()> {
+    let (value, x8) = pbl_encoding(pbl).ok_or(DeviceError::InvalidParam)?;
+    let channels = if tx_channels > rx_channels {
+        tx_channels
+    } else {
+        rx_channels
+    };
+    for channel in 0..channels {
+        write_field(
+            acc,
+            dma_channel_reg(channel, DMA_CH_CR),
+            DMA_CH_CR_PBLX8.0,
+            DMA_CH_CR_PBLX8.1,
+            x8,
+        );
+        if channel < tx_channels {
+            write_field(
+                acc,
+                dma_channel_reg(channel, DMA_CH_TCR),
+                DMA_CH_TCR_PBL.0,
+                DMA_CH_TCR_PBL.1,
+                value,
+            );
+        }
+        if channel < rx_channels {
+            write_field(
+                acc,
+                dma_channel_reg(channel, DMA_CH_RCR),
+                DMA_CH_RCR_PBL.0,
+                DMA_CH_RCR_PBL.1,
+                value,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Set "operate on second packet" on every transmit channel.
+/// `xgbe_config_osp_mode`.
+pub fn config_osp_mode(acc: &dyn MmioAccess, tx_channels: u32, on: bool) {
+    for channel in 0..tx_channels {
+        write_field(
+            acc,
+            dma_channel_reg(channel, DMA_CH_TCR),
+            DMA_CH_TCR_OSP.0,
+            DMA_CH_TCR_OSP.1,
+            if on { 1 } else { 0 },
+        );
+    }
+}
+
+/// Write the AXI cache attributes. `xgbe_config_dma_cache`.
+///
+/// Three whole-register writes, and the third is **conditional on the value
+/// being non-zero**. That is Linux's own guard and not a tidy-up: a platform
+/// that has no `awarcr` leaves the register at whatever reset put there
+/// rather than clearing it, so a zero here means "do not touch", not "set to
+/// zero". Passing 0 and expecting the register cleared is the mistake.
+pub fn config_dma_cache(acc: &dyn MmioAccess, arcr: u32, awcr: u32, awarcr: u32) {
+    acc.write32(DMA_AXIARCR, arcr);
+    acc.write32(DMA_AXIAWCR, awcr);
+    if awarcr != 0 {
+        acc.write32(DMA_AXIAWARCR, awarcr);
+    }
+}
+
 // ——— The probe ———
 
 /// Read a 32-bit register. `base` is a mapped virtual address.
