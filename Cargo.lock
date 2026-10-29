@@ -1936,6 +1936,7 @@ name = "rboot"
 version = "0.1.6"
 dependencies = [
  "log",
+ "sha2",
  "uefi",
  "uefi-raw",
  "x86_64",

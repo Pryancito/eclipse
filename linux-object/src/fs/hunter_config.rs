@@ -16,6 +16,9 @@
 //! * `/etc/hunter/firewall` — the per-application firewall's rules
 //!   (`allow /usr/bin/curl out`, `deny /usr/bin/nc`; see `hunter::firewall`),
 //!   which lunarhunter appends to when the person answers a question.
+//! * `/etc/hunter/boot` — golden digests of the boot itself (`<sha256>  kernel`,
+//!   `cmdline`, ...; see `hunter::boot`), compared against what the loader
+//!   measured once `policy.conf` has set the mode.
 //! * `/etc/hunter/policy.conf` — a script in hunter's control language
 //!   (`mode exec enforce`, `learning off`, `seal`, ...; see
 //!   `hunter::control`), applied after the lists so it can override the
@@ -99,6 +102,36 @@ pub fn load(root: &Arc<dyn INode>) {
     if n_sig > 0 {
         kernel_hal::klog_info!("hunter: loaded {} antivirus signatures", n_sig);
     }
+    // Last: the appraisal runs under the operator's integrity mode, which is
+    // `policy.conf`'s to set, and under `enforce` a tampered boot seals
+    // hunter -- after which nothing above could have been loaded.
+    let n_boot = load_boot_pins(root, BOOT_FILE);
+    let verdict = hunter::boot::appraise();
+    kernel_hal::klog_info!(
+        "hunter: boot integrity {} ({} item(s) pinned)",
+        verdict.as_str(),
+        n_boot
+    );
+}
+
+/// The golden digests of the boot (see `hunter::boot`).
+const BOOT_FILE: &str = "/etc/hunter/boot";
+
+/// Reads `/etc/hunter/boot` and pins every item in it. Line by line, like
+/// `hashes`: a line that does not parse leaves one item unpinned and says so.
+fn load_boot_pins(root: &Arc<dyn INode>, path: &str) -> usize {
+    let mut count = 0;
+    for_each_line(root, path, |i, line| {
+        match hunter::boot::parse_pin_line(line) {
+            Ok(Some((item, digest))) => match hunter::boot::pin(item, digest) {
+                Ok(()) => count += 1,
+                Err(e) => kernel_hal::klog_info!("hunter: {}:{}: skipped: {}", path, i, e),
+            },
+            Ok(None) => {}
+            Err(e) => kernel_hal::klog_info!("hunter: {}:{}: skipped: {}", path, i, e),
+        }
+    });
+    count
 }
 
 /// The listeners the network monitor expects (see `hunter::netmon`).
@@ -668,6 +701,27 @@ mod hunter_config_tests {
         assert_eq!(rule("/a14/curl", Direction::Out), Some(Action::Allow));
         assert_eq!(rule("/a14/curl", Direction::In), None);
         assert_eq!(rule("/a14/My App", Direction::In), Some(Action::Deny));
+    }
+
+    #[test]
+    fn boot_pins_load_line_by_line_and_skip_unknown_items() {
+        use rcore_fs::vfs::FileType;
+        let root = leaked_root();
+        let etc = root.create("etc", FileType::Dir, 0o755).unwrap();
+        let dir = etc.create("hunter", FileType::Dir, 0o755).unwrap();
+        let file = dir.create("boot", FileType::File, 0o644).unwrap();
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let text = alloc::format!("# golden\n{abc}  rboot.conf\n{abc}  bootloader\n");
+        file.write_at(0, text.as_bytes()).unwrap();
+        assert_eq!(
+            load_boot_pins(&root, BOOT_FILE),
+            1,
+            "an item hunter does not know is a typo, not a pin"
+        );
+        assert_eq!(
+            hunter::boot::pinned("rboot.conf"),
+            hunter::integrity::parse_hex(abc)
+        );
     }
 
     #[test]

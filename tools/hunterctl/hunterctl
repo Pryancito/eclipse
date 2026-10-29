@@ -26,6 +26,9 @@
 #   hunterctl hash <file>...        pin the SHA-256 of programs (live + /etc/hunter/hashes)
 #   hunterctl require-hash <on|off> unpinned programs are integrity violations
 #   hunterctl verify                check the files on disk against /etc/hunter/hashes
+#   hunterctl boot                  boot integrity: verdict, measured and pinned digests
+#   hunterctl boot pin [item...]    pin this boot's measurements (live + /etc/hunter/boot)
+#   hunterctl boot verify           re-hash the kernel's code now (exit 1 if tampered)
 #   hunterctl scan [--quarantine] <path>...
 #                                   antivirus scan of files/trees (exit 1 if infected)
 #   hunterctl scan-media [id|dir]...
@@ -78,6 +81,8 @@ PROC=$R/proc/hunter
 WHITELIST=/etc/hunter/whitelist
 HASHES=/etc/hunter/hashes
 SCAN=/proc/hunter_scan
+BOOTPROC=/proc/hunter_boot
+BOOTPINS=/etc/hunter/boot
 QDIR=/var/lib/hunter/quarantine
 FEEDS=/etc/hunter/feeds
 POLICY=/etc/hunter/policy.conf
@@ -711,6 +716,56 @@ hash)
 verify)
     [ -r "$HASHES" ] || die "no $HASHES"
     sha256sum -c "$HASHES"
+    ;;
+boot)
+    [ -r "$BOOTPROC" ] || die "$BOOTPROC not found: this kernel's hunter has no boot integrity"
+    sub=${1:-status}
+    [ $# -gt 0 ] && shift
+    case "$sub" in
+    status)
+        cat "$BOOTPROC"
+        ;;
+    pin)
+        [ "$(id -u)" = 0 ] || die "must be root"
+        # Trust on first use, like `hash`: what this boot measured becomes
+        # what every later boot must match. Run it on a boot you trust --
+        # right after installing or updating the kernel, not after a
+        # warning. `item <name> <status> size=.. measured=<hex|-> pinned=..`
+        tmp=$(mktemp) && pins=$(mktemp) || die "mktemp failed"
+        trap 'rm -f "$tmp" "$pins" "$tmp.new"' EXIT
+        mkdir -p "${BOOTPINS%/*}"
+        touch "$BOOTPINS"
+        cp "$BOOTPINS" "$tmp"
+        n=0
+        for item in $(sed -n 's/^item \([^ ]*\) .* measured=\([0-9a-f]\{64\}\) .*/\1/p' "$BOOTPROC"); do
+            if [ $# -gt 0 ]; then
+                case " $* " in *" $item "*) ;; *) continue ;; esac
+            fi
+            sum=$(sed -n "s/^item $item .* measured=\([0-9a-f]\{64\}\) .*/\1/p" "$BOOTPROC")
+            awk -v i="$item" 'substr($0, 67) != i' "$tmp" > "$tmp.new"
+            printf '%s  %s\n' "$sum" "$item" >> "$tmp.new"
+            mv "$tmp.new" "$tmp"
+            printf '%s  %s\n' "$sum" "$item" >> "$pins"
+            n=$((n + 1))
+        done
+        [ "$n" -gt 0 ] || die "nothing measured to pin (see '$0 boot')"
+        # Live first, all or nothing: a sealed hunter refuses a changed pin,
+        # and then the file must not say otherwise either.
+        dd if="$pins" of="$BOOTPROC" bs=1048576 count=1 2>/dev/null \
+            || die "hunter refused the pins (sealed, and one of them changed?); nothing written"
+        mv "$tmp" "$BOOTPINS"
+        echo "hunterctl: pinned $n boot item(s) in $BOOTPINS"
+        ;;
+    verify)
+        [ "$(id -u)" = 0 ] || die "must be root"
+        echo verify | dd of="$BOOTPROC" 2>/dev/null || die "verify failed"
+        sed -n '1p;/^kernel-code /p' "$BOOTPROC"
+        ! grep -q '^verdict TAMPERED' "$BOOTPROC"
+        ;;
+    *)
+        usage 1
+        ;;
+    esac
     ;;
 lockdown)
     # Exec and integrity. W^X stays where it is because enforcing it breaks

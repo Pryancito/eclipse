@@ -11,6 +11,9 @@ uefi-services = { version = "0.23", optional = true }
 uefi-raw = "0.5.2"
 log = "=0.4.20"
 xmas-elf = "0.8"
+# SHA-256 of what the loader hands the kernel (see `measure`). Pure software:
+# the firmware's FPU/SIMD state is not ours to assume.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 x86_64 = { git = "https://github.com/rust-osdev/x86_64", tag = "v0.15.5" }
 
 [features]

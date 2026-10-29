@@ -50,7 +50,7 @@ There are three independently-tunable enforcement domains, each with its own
 | `wx`      | Write-xor-execute memory (`mmap` / `mprotect`)    | `Report`  |
 | `exec`    | Executable path policy (untrusted/world-writable) | `Report`  |
 | `anomaly` | Block (vs. only log) detected floods / fork bombs | `Report`  |
-| `integrity` | SHA-256 of the image vs. its pinned digest      | `Report`  |
+| `integrity` | SHA-256 of the image vs. its pinned digest; also the [boot](#boot-integrity-measured-boot) | `Report`  |
 | `av`      | Antivirus signatures matched on the image          | `Report`  |
 | `net`     | Which programs may reach the network ([firewall](#per-application-firewall)) | `Report`  |
 | `behavior` | Ransomware and process injection, by behaviour    | `Report`  |
@@ -248,6 +248,9 @@ hunterctl apply <file>          send a whole script (e.g. a new policy.conf)
 hunterctl hash <file>...        pin SHA-256 digests (live, and in /etc/hunter/hashes)
 hunterctl require-hash <on|off>
 hunterctl verify                sha256sum -c /etc/hunter/hashes
+hunterctl boot                  boot integrity: verdict, measured and pinned digests
+hunterctl boot pin [item...]    pin this boot's measurements (live + /etc/hunter/boot)
+hunterctl boot verify           re-hash the kernel's code now (exit 1 if tampered)
 hunterctl scan [--quarantine] <path>...   antivirus scan (exit 1 if infected)
 hunterctl quarantine <file>...  move into /var/lib/hunter/quarantine, deny the path
 hunterctl quarantined           list the quarantine
@@ -595,6 +598,66 @@ the old image is torn down (so a refusal is an ordinary `EACCES`). Lists are
 asked of the name, and the resolved path is also checked against the
 blacklist and the untrusted locations. That means a symlink from a
 trusted-looking name to `/tmp/evil` no longer hides where the file is.
+
+## Boot integrity (measured boot)
+
+Exec integrity starts at the first `execve`. Everything before it -- the
+kernel, its command line, the initramfs holding `/sbin/init` and
+`/etc/hunter/policy.conf` -- decides whether any later check means anything:
+a cmdline without hunter's switches, a `kernel.elf` with the exec gate patched
+out, or an initramfs whose `policy.conf` says `mode exec off` all boot a
+system on which hunter reports green. [`hunter::boot`](../hunter/src/boot.rs)
+covers that stretch, in two halves.
+
+**Measured boot.** rboot hashes (SHA-256) each input it hands the kernel and
+passes the digests in `BootInfo` ([`rboot::measure`](../rboot/src/measure.rs)).
+`measure=` in `rboot.conf` chooses what:
+
+| `measure=` | Measured | Cost |
+|------------|----------|------|
+| `kernel` (default) | the kernel ELF, `rboot.conf`, the cmdline | lost in the time the firmware takes to read them |
+| `all` | those and the initramfs, hashed while it is read | seconds: the initramfs is the whole live root |
+| `off` | nothing | -- |
+
+rboot never refuses to boot over a digest: it does not know what they should
+be, and a loader that stopped on a mismatch would turn a kernel update nobody
+re-pinned into a machine that shows a splash and stops. The kernel compares.
+
+**Kernel code.** Right after hunter comes up the kernel hashes its own
+`.text` and `.rodata` as mapped (the `kernel-code` item), and re-hashes them
+every ten minutes and on `hunterctl boot verify`. Nothing in this kernel
+writes either range after boot, so a digest that changes is code patched in
+memory -- which is how a kernel rootkit hooks a function. A change is sticky:
+code patched and patched back is still a compromised boot.
+
+**Pins** live in `/etc/hunter/boot`, `sha256sum`-shaped with an item where the
+path would be (`<sha256>  kernel`). Items: `kernel`, `initramfs`, `rboot.conf`,
+`cmdline`, `kernel-code`; anything else is refused as a typo. `hunterctl boot
+pin` writes the running boot's own measurements there and pins them live --
+trust on first use, so run it on a boot you trust: right after installing or
+updating the kernel. Only pinned items are judged:
+
+- measured and equal: `ok`;
+- measured and different: `MISMATCH`;
+- pinned and **not measured**: `UNMEASURED`, a violation too -- `measure=off`
+  or an older rboot that never measured must not be the way around a pin.
+
+The verdict is in `/proc/hunter_boot` (and as `boot:` in `/proc/hunter`).
+The domain shares `mode integrity`: `report` records each violation as a
+`CRIT` `BOOT` event; `enforce` records it and **locks hunter down** -- exec,
+integrity and av to `enforce`, learning off, the latch sealed -- because a
+boot cannot be un-booted, and a system that started from inputs nobody pinned
+should keep every guard up and not be talked out of them (not even by the
+`policy.conf` a tampered initramfs ships) until a clean reboot. The appraisal
+runs after `policy.conf` is applied, so the mode is the operator's.
+
+**Limits.** The chain starts at rboot, and nothing measures rboot: a replaced
+rboot reports whatever digests it likes. That link is UEFI Secure Boot's.
+The pins live on the root filesystem, which in a live boot *is* the
+initramfs, so there pin from a trusted copy rather than from the running
+system; on an installed system the root is its own partition. The installer
+rewrites the cmdline (`ROOT=`), so pin after installing, not from the live
+medium.
 
 ## Antivirus (signatures)
 

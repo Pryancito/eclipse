@@ -22,7 +22,8 @@ use core::arch::asm;
 use log::warn;
 use rboot::config::{self, Resolution};
 use rboot::{
-    cmdline, esp, fb, frames, logo, page_table, progress, video, BootInfo, GopReport, GraphicInfo,
+    cmdline, esp, fb, frames, logo, measure, page_table, progress, video, BootInfo,
+    BootMeasurements, GopReport, GraphicInfo,
 };
 use uefi::proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat};
 use uefi::proto::loaded_image::LoadedImage;
@@ -64,11 +65,20 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
 
     //info!("bootloader is running");
     let bs = st.boot_services();
-    let config = {
+    let (config, config_bytes) = {
         let mut file = open_file(bs, CONFIG_PATH);
-        let buf = load_file(bs, &mut file);
-        config::Config::parse(buf)
+        let buf: &'static [u8] = load_file(bs, &mut file);
+        (config::Config::parse(buf), buf)
     };
+    // What this boot measured, for hunter's measured boot (see
+    // `rboot::measure`). The config first: it is what decides everything
+    // else, `measure=` included.
+    let mut measurements = BootMeasurements::empty();
+    if config.measure.kernel() {
+        measurements.magic = rboot::MEASURE_MAGIC;
+        measurements.config = measure::of(config_bytes);
+        measurements.cmdline = measure::of(config.cmdline.as_bytes());
+    }
 
     if let Some(level) = cmdline::parse_log_level(config.cmdline) {
         log::set_max_level(level);
@@ -114,7 +124,13 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
             bs,
             &mut file,
             Some((graphic_info.mode, graphic_info.fb_addr, 5, 15)),
+            None,
         );
+        // The file as read, before anything is mapped out of it: the same
+        // bytes `sha256sum` gives for `kernel_path` on the ESP.
+        if config.measure.kernel() {
+            measurements.kernel = measure::of(buf);
+        }
         ElfFile::new(buf).expect("failed to parse ELF")
     };
     step(&graphic_info, 15);
@@ -132,11 +148,18 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     // steady movement instead of sitting "frozen at 15%" for minutes.
     let (initramfs_addr, initramfs_size) = if let Some(path) = config.initramfs {
         let mut file = open_file(bs, path);
+        // Hashed as it is read, chunk by chunk, so `measure=all` spends its
+        // seconds under a moving bar instead of after it.
+        let mut hasher = config.measure.initramfs().then(measure::start);
         let buf = load_file_progress(
             bs,
             &mut file,
             Some((graphic_info.mode, graphic_info.fb_addr, 15, 44)),
+            hasher.as_mut(),
         );
+        if let Some(h) = hasher {
+            measurements.initramfs = measure::finish(h, buf.len());
+        }
         debug!(
             "initramfs loaded: addr={:#x} size={:#x}",
             buf.as_ptr() as u64,
@@ -269,6 +292,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         // Filled in below, once the marks around `ExitBootServices` are in.
         loader_marks: [0; rboot::LOADER_MARKS],
         gop: gop_report,
+        measurements,
     });
 
     // On some real machines, ExitBootServices can be the point where things go wrong.
@@ -530,7 +554,7 @@ fn list_dir(bs: &BootServices, dir: &str) -> alloc::string::String {
 }
 
 fn load_file(bs: &BootServices, file: &mut RegularFile) -> &'static mut [u8] {
-    load_file_progress(bs, file, None)
+    load_file_progress(bs, file, None, None)
 }
 
 /// Load a file in bounded chunks, optionally advancing the boot progress bar
@@ -544,10 +568,13 @@ fn load_file(bs: &BootServices, file: &mut RegularFile) -> &'static mut [u8] {
 /// Chunking keeps every firmware inside its comfort zone and lets the bar
 /// move, so a slow medium looks slow instead of hung, and a genuine failure
 /// panics with the failing offset instead of silently wedging.
+///
+/// `hasher`, when given, is fed every chunk as it lands (see `rboot::measure`).
 fn load_file_progress(
     bs: &BootServices,
     file: &mut RegularFile,
     progress: Option<(ModeInfo, u64, u32, u32)>,
+    mut hasher: Option<&mut sha2::Sha256>,
 ) -> &'static mut [u8] {
     /// 8 MiB: large enough to stream at full speed on real firmware, small
     /// enough that even VirtualBox's EFI returns each call promptly.
@@ -573,6 +600,9 @@ fn load_file_progress(
             // Firmware reported EOF earlier than FileInfo promised: keep what
             // we got rather than spinning forever on zero-byte reads.
             break;
+        }
+        if let Some(h) = hasher.as_deref_mut() {
+            sha2::Digest::update(h, &buf[done..done + n]);
         }
         done += n;
         if let Some((mode, fb_addr, from, to)) = progress {
