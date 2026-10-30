@@ -137,21 +137,21 @@ const DRAIN_WAIT_MIN: core::time::Duration = core::time::Duration::from_millis(1
 const DRAIN_WAIT_MAX: core::time::Duration = core::time::Duration::from_millis(20);
 
 /// How long `frames` take to play at `rate` Hz.
-fn play_time(frames: u64, rate: u64) -> Duration {
+pub(super) fn play_time(frames: u64, rate: u64) -> Duration {
     Duration::from_nanos(frames.saturating_mul(1_000_000_000) / rate.max(1))
 }
 
 /// A blocked writer's sleep before it offers the ring PCM again: the time
 /// the device takes to free `frames`, within [`REFILL_WAIT_MIN`,
 /// `REFILL_WAIT_MAX`].
-fn refill_wait_for(frames: u64, rate: u32) -> Duration {
+pub(super) fn refill_wait_for(frames: u64, rate: u32) -> Duration {
     play_time(frames, rate as u64).clamp(REFILL_WAIT_MIN, REFILL_WAIT_MAX)
 }
 
 /// One slice of a sleeping `DRAIN` with `queued` frames still to play: their
 /// play time, within [`DRAIN_WAIT_MIN`, `DRAIN_WAIT_MAX`]. The ceiling is
 /// what notices a stream that stopped or was reset under the drain.
-fn drain_wait_for(queued: u64, rate: u64) -> Duration {
+pub(super) fn drain_wait_for(queued: u64, rate: u64) -> Duration {
     play_time(queued, rate).clamp(DRAIN_WAIT_MIN, DRAIN_WAIT_MAX)
 }
 
@@ -2926,7 +2926,7 @@ mod hw_params_tests;
 mod ctl_tests;
 
 #[cfg(test)]
-mod sleeping_tests;
+pub(super) mod sleeping_tests;
 
 // ── Control device node ─────────────────────────────────────────────────────
 

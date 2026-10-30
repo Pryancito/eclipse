@@ -15,17 +15,17 @@ use zcore_drivers::DeviceResult;
 const BYTES_PER_MS: u64 = 48 * BYTES_PER_FRAME;
 
 /// Un anillo que suena de verdad: lo encolado baja con el reloj, a 48 kHz.
-struct PlayingRing {
+pub(crate) struct PlayingRing {
     cap: usize,
     /// Encolado en el instante `.1`.
     queued: Mutex<(usize, Duration)>,
     /// Cuántas veces se ha mirado cuánto queda: lo que una espera que gira
     /// dispara y una que duerme no.
-    looks: AtomicUsize,
+    pub(crate) looks: AtomicUsize,
 }
 
 impl PlayingRing {
-    fn new(frames: usize) -> Self {
+    pub(crate) fn new(frames: usize) -> Self {
         Self {
             cap: frames * BYTES_PER_FRAME as usize,
             queued: Mutex::new((0, kernel_hal::timer::timer_now())),
@@ -33,7 +33,7 @@ impl PlayingRing {
         }
     }
 
-    fn queued_now(&self) -> usize {
+    pub(crate) fn queued_now(&self) -> usize {
         let mut q = self.queued.lock();
         let now = kernel_hal::timer::timer_now();
         let ms = now.saturating_sub(q.1).as_millis() as u64;
