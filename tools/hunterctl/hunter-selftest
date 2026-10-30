@@ -1,0 +1,692 @@
+#!/bin/sh
+# hunter-selftest -- end-to-end checks of hunter on the running system.
+#
+#   hunter-selftest [--seal] [--keep] [section...]
+#
+# Drives every part of hunter the way an operator or an attacker would: the
+# control plane, the exec gate, integrity pins, the antivirus (on demand, on
+# access, quarantine, feeds), boot integrity, the firewall, the network
+# monitor, ransomware and injection detection, the anomaly heuristics,
+# scheduled scans, notifications, hunterd and the reports. Each check prints
+# PASS, FAIL (with what it saw) or SKIP (what this system lacks), and the
+# exit status is the number of failures (capped at 125).
+#
+# It is meant to be run as root on a test machine or VM, but it cleans up
+# after itself: modes are put back, the samples, rules, schedule jobs, feeds,
+# ports and canaries it added are taken out of /etc/hunter, and its files are
+# deleted. What it cannot take back is what hunter itself never forgets until
+# reboot: the test signatures (random samples nobody else has), the denied
+# test paths under its own work directory, and its live pins.
+#
+# --seal  also check the one-way latch (`hunterctl seal`). The latch stays
+#         engaged until reboot, so this runs last and only when asked.
+# --keep  leave the work directory (for a look at the samples and logs).
+# section names: control exec integrity av fullscan feeds boot firewall netmon
+#         behavior anomaly schedule notify hunterd report media seal
+#         (default: all but seal)
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin:$PATH
+HUNTERCTL=${HUNTERCTL:-/sbin/hunterctl}
+PROC=/proc/hunter
+W=/tmp/hunter-selftest.$$
+PASS=0 FAIL=0 SKIP=0
+SEAL=0 KEEP=0
+SECTIONS=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --seal) SEAL=1 ;;
+    --keep) KEEP=1 ;;
+    -h|--help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    -*) echo "hunter-selftest: unknown option $1" >&2; exit 125 ;;
+    *) SECTIONS="$SECTIONS $1" ;;
+    esac
+    shift
+done
+
+pass() { PASS=$((PASS + 1)); echo "PASS $SECTION: $1"; }
+fail() { FAIL=$((FAIL + 1)); echo "FAIL $SECTION: $1"; [ -n "${2:-}" ] && printf '%s\n' "$2" | sed 's/^/     | /'; return 0; }
+skip() { SKIP=$((SKIP + 1)); echo "SKIP $SECTION: $1"; }
+
+# check <description> <command...>: PASS if the command exits 0.
+check() {
+    d=$1; shift
+    if out=$("$@" 2>&1); then pass "$d"; else fail "$d" "$out"; fi
+}
+# refuse <description> <command...>: PASS if the command fails.
+refuse() {
+    d=$1; shift
+    if out=$("$@" 2>&1); then fail "$d (it succeeded)" "$out"; else pass "$d"; fi
+}
+
+want() {
+    [ -z "$SECTIONS" ] && [ "$1" != seal ] && return 0
+    case " $SECTIONS " in *" $1 "*) return 0 ;; esac
+    [ "$1" = seal ] && [ "$SEAL" = 1 ]
+}
+
+# A directive straight to the kernel, one write.
+ctl() { printf '%s\n' "$1" > "$PROC"; }
+hc() { "$HUNTERCTL" "$@"; }
+
+# The event ring: `mark` remembers the newest sequence number, `since` prints
+# the events logged after it.
+lastseq() {
+    sed -n 's/^\[ *\([0-9]*\)\] +.*/\1/p' "$PROC" | tail -n 1
+}
+mark() { MARK=$(lastseq); MARK=${MARK:--1}; }
+since() {
+    awk -v m="$MARK" '/^\[ *[0-9]+\] \+/ { s = $0; sub(/^\[ */, "", s); sub(/\].*/, "", s); if (s + 0 > m + 0) print }' "$PROC"
+}
+# saw <description> <regex>: an event matching regex was logged since `mark`.
+saw() {
+    if since | grep -Eq "$2"; then pass "$1"; else fail "$1" "$(since | tail -n 8)"; fi
+}
+nosaw() {
+    if since | grep -Eq "$2"; then fail "$1" "$(since | grep -E "$2" | tail -n 4)"; else pass "$1"; fi
+}
+
+modes() { sed -n 's/^enforcement: //p' "$PROC"; }
+mode_of() { modes | tr ' ' '\n' | sed -n "s/^$1=//p"; }
+sealed() { modes | grep -q 'tighten-only'; }
+
+# Random hex, from the kernel's generator.
+rnd() { od -An -N"${1:-8}" -tx1 /dev/urandom | tr -d ' \n'; }
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+
+# A program of our own, so a rule or a pin for it touches nothing else:
+# a copy of busybox (a static binary that runs from anywhere), with a few
+# random bytes after it so its hash is new to hunter.
+mkprog() {
+    cp "$(readlink -f /bin/busybox)" "$1" && rnd 16 >> "$1" && chmod 755 "$1"
+}
+
+# File backups, restored by cleanup().
+BACKUPS=""
+backup() {
+    for f in "$@"; do
+        if [ -e "$f" ]; then cp -p "$f" "$W/backup.$(echo "$f" | tr / _)"; fi
+        BACKUPS="$BACKUPS $f"
+    done
+}
+
+SAVED_MODES=""
+cleanup() {
+    trap - EXIT INT TERM
+    if ! sealed; then
+        for m in $SAVED_MODES; do ctl "mode ${m%%=*} ${m#*=}" 2>/dev/null; done
+        [ -n "$SAVED_NET" ] && ctl "net mode $SAVED_NET" 2>/dev/null
+        [ -n "$SAVED_LEARN" ] && ctl "learning $SAVED_LEARN" 2>/dev/null
+    fi
+    for p in $FW_PROGS; do ctl "net forget $p" 2>/dev/null; ctl "net dismiss $p" 2>/dev/null; done
+    for f in $BACKUPS; do
+        b="$W/backup.$(echo "$f" | tr / _)"
+        if [ -e "$b" ]; then cp -p "$b" "$f"; else rm -f "$f"; fi
+    done
+    [ -n "$FEED" ] && rm -rf "/etc/hunter/signatures.d/$FEED" "/etc/hunter/signatures.d/$FEED.sig" "/var/lib/hunter/feeds/$FEED"
+    [ -n "$JOB" ] && rm -f "/var/lib/hunter/scans/$JOB.last"
+    for p in $BGPIDS; do kill "$p" 2>/dev/null; done
+    [ "$KEEP" = 1 ] || rm -rf "$W"
+}
+
+[ "$(id -u)" = 0 ] || { echo "hunter-selftest: must be root" >&2; exit 125; }
+[ -r "$PROC" ] || { echo "hunter-selftest: no $PROC: is this an Eclipse OS kernel with hunter?" >&2; exit 125; }
+mkdir -p "$W" || exit 125
+SAVED_MODES=$(modes | sed 's/ \[tighten-only\]//')
+SAVED_NET=$(sed -n 's/^mode //p' /proc/hunter_firewall 2>/dev/null)
+SAVED_LEARN=$(sed -n 's/.*learning=\([a-z]*\).*/\1/p' "$PROC")
+FW_PROGS="" BGPIDS="" FEED="" JOB=""
+trap cleanup EXIT
+trap 'exit 125' INT TERM
+
+if sealed; then
+    echo "hunter-selftest: hunter is sealed (tighten-only); most checks need to change modes. Reboot first." >&2
+    exit 125
+fi
+
+echo "hunter-selftest: $(head -n 1 "$PROC")"
+echo "hunter-selftest: $SAVED_MODES"
+
+# ── control plane ──────────────────────────────────────────────────────────
+SECTION=control
+if want control; then
+    check "hunterctl status prints the header" sh -c "'$HUNTERCTL' status | grep -q '^hunter security subsystem v'"
+    check "hunterctl status leaves the event ring out" sh -c "! '$HUNTERCTL' status | grep -q '^recent events'"
+    check "hunterctl events includes the ring" sh -c "'$HUNTERCTL' events | grep -q '^recent events'"
+    for d in syscall wx exec anomaly integrity av behavior; do
+        old=$(mode_of $d)
+        hc mode $d report >/dev/null 2>&1
+        if [ "$(mode_of $d)" = report ]; then pass "mode $d report applies"; else fail "mode $d report applies" "$(modes)"; fi
+        ctl "mode $d $old"
+    done
+    refuse "a bad mode is refused" hc mode exec bogus
+    refuse "a bad domain is refused" hc mode nosuchdomain report
+    # All or nothing: a script with one bad line applies none of it.
+    old=$(mode_of wx)
+    new=enforce; [ "$old" = enforce ] && new=report
+    printf 'mode wx %s\nthis is not a directive\n' "$new" > "$W/bad.conf"
+    refuse "apply of a script with a bad line fails" hc apply "$W/bad.conf"
+    if [ "$(mode_of wx)" = "$old" ]; then pass "...and applies none of it"; else fail "...and applies none of it" "$(modes)"; ctl "mode wx $old"; fi
+    printf '# a comment\n\nmode wx %s\n' "$new" > "$W/good.conf"
+    check "apply of a good script" hc apply "$W/good.conf"
+    if [ "$(mode_of wx)" = "$new" ]; then pass "...takes effect"; else fail "...takes effect" "$(modes)"; fi
+    ctl "mode wx $old"
+    if command -v su >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
+        refuse "a non-root writer is refused" su -s /bin/sh nobody -c "printf 'mode exec off\n' > $PROC"
+    else
+        skip "non-root write (no su or no 'nobody' user)"
+    fi
+    refuse "an unknown hunterctl command is an error" hc no-such-command
+fi
+
+# ── exec gate ──────────────────────────────────────────────────────────────
+SECTION=exec
+if want exec; then
+    mkprog "$W/denied"
+    mkprog "$W/allowed"
+    check "a fresh program runs under the default policy" "$W/allowed" true
+    check "hunterctl deny" hc deny "$W/denied"
+    old=$(mode_of exec)
+    ctl "mode exec report"
+    mark
+    check "a denied program still runs under report" "$W/denied" true
+    saw "...and is reported" "EXEC.*$W/denied"
+    ctl "mode exec enforce"
+    mark
+    refuse "a denied program does not run under enforce" "$W/denied" true
+    saw "...and is logged as blocked" "EXEC.*$W/denied"
+    check "an allowed program still runs under enforce" "$W/allowed" true
+    # A copy of a denied program under another name is another path; a
+    # symlink to it is the same file.
+    ln -s "$W/denied" "$W/denied-link"
+    refuse "a symlink to a denied program does not run under enforce" "$W/denied-link" true
+    ctl "mode exec $old"
+fi
+
+# ── integrity ──────────────────────────────────────────────────────────────
+SECTION=integrity
+if want integrity; then
+    backup /etc/hunter/hashes
+    mkprog "$W/pinned"
+    check "hunterctl hash" hc hash "$W/pinned"
+    check "...writes /etc/hunter/hashes" grep -q "  $W/pinned\$" /etc/hunter/hashes
+    check "...pins it live" sh -c "'$HUNTERCTL' status | grep -q 'integrity: pinned=[1-9]'"
+    old=$(mode_of integrity)
+    ctl "mode integrity enforce"
+    check "the pinned program runs" "$W/pinned" true
+    printf 'x' >> "$W/pinned"
+    mark
+    refuse "the modified program does not run under enforce" "$W/pinned" true
+    saw "...and is logged" "INTEGRITY.*$W/pinned|$W/pinned.*(hash|integrity)"
+    refuse "hunterctl verify notices the change" hc verify
+    ctl "mode integrity report"
+    mark
+    check "under report it runs" "$W/pinned" true
+    saw "...and is reported" "$W/pinned"
+    # Pinning again (not sealed) accepts the new contents.
+    check "re-pinning the new contents" hc hash "$W/pinned"
+    if [ "$(grep -c "  $W/pinned\$" /etc/hunter/hashes)" = 1 ]; then pass "...replaces the old line"; else fail "...replaces the old line" "$(grep "$W/pinned" /etc/hunter/hashes)"; fi
+    ctl "mode integrity enforce"
+    check "...and it runs again under enforce" "$W/pinned" true
+    ctl "mode integrity $old"
+    refuse "hash of a missing file is an error" hc hash "$W/no-such-file"
+fi
+
+# ── antivirus ──────────────────────────────────────────────────────────────
+SECTION=av
+if want av; then
+    backup /var/lib/hunter/quarantine/index
+    mkdir -p "$W/av/sub" "$W/av/space dir"
+    printf 'hunter selftest sample %s\n' "$(rnd 16)" > "$W/av/sample-hash"
+    H=$(sha "$W/av/sample-hash")
+    P=$(rnd 8)
+    printf 'leading text %s trailing\n' "$P" > "$W/av/sub/sample-bytes"
+    # The pattern is written as text, so it is matched as the hex of those
+    # ASCII characters.
+    PH=$(printf '%s' "$P" | od -An -tx1 | tr -d ' \n')
+    echo "just a clean file" > "$W/av/clean"
+    cp "$W/av/sample-hash" "$W/av/space dir/copy of sample"
+    mark
+    check "a hash signature is accepted" ctl "signature hash:$H:Hunter.SelfTest.Hash"
+    check "a bytes signature is accepted" ctl "signature bytes:$PH:Hunter.SelfTest.Bytes"
+    refuse "a malformed signature is refused" ctl "signature bytes:zz:Bad"
+    refuse "a pattern with fewer than 4 fixed bytes is refused" ctl "signature bytes:41??:Short"
+    out=$(hc scan "$W/av" 2>&1); rc=$?
+    [ "$rc" = 1 ] && pass "scan of an infected tree exits 1" || fail "scan of an infected tree exits 1 (got $rc)" "$out"
+    for f in "$W/av/sample-hash:Hunter.SelfTest.Hash" "$W/av/sub/sample-bytes:Hunter.SelfTest.Bytes" "$W/av/space dir/copy of sample:Hunter.SelfTest.Hash"; do
+        p=${f%:*} n=${f##*:}
+        if printf '%s\n' "$out" | grep -qxF "$p: $n FOUND"; then pass "finds ${p#$W/}"; else fail "finds ${p#$W/}" "$out"; fi
+    done
+    if printf '%s\n' "$out" | grep -q "clean.*FOUND"; then fail "no false positive on a clean file" "$out"; else pass "no false positive on a clean file"; fi
+    printf '%s\n' "$out" | grep -q 'scanned 4 file(s), 3 infected' && pass "the summary counts 4 files, 3 infected" || fail "the summary counts 4 files, 3 infected" "$out"
+    saw "a detection is an AV event" "AV.*Hunter.SelfTest"
+    check "scan of a clean file exits 0" hc scan "$W/av/clean"
+    refuse "scan of a missing path is an error, not a clean result" hc scan "$W/av/no-such-file"
+    (cd "$W/av" && "$HUNTERCTL" scan sample-hash) > "$W/rel.out" 2>&1
+    if grep -q 'Hunter.SelfTest.Hash FOUND' "$W/rel.out"; then pass "scan of a relative path"; else fail "scan of a relative path" "$(cat "$W/rel.out")"; fi
+    # scan / must not walk into /proc (endless) and must finish.
+    # Quarantine.
+    out=$(hc scan --quarantine "$W/av" 2>&1)
+    if [ ! -e "$W/av/sample-hash" ] && [ ! -e "$W/av/sub/sample-bytes" ] && [ ! -e "$W/av/space dir/copy of sample" ]; then
+        pass "scan --quarantine moves every detection away"
+    else
+        fail "scan --quarantine moves every detection away" "$out$(ls -R "$W/av")"
+    fi
+    [ -e "$W/av/clean" ] && pass "...and leaves the clean file" || fail "...and leaves the clean file"
+    check "the quarantined file is mode 000" sh -c "[ \"\$(stat -c %a /var/lib/hunter/quarantine/$H)\" = 0 ]"
+    check "hunterctl quarantined lists it" sh -c "'$HUNTERCTL' quarantined | grep -q '$W/av/sample-hash'"
+    check "hunterctl restore puts it back" hc restore "$H"
+    check "...at its path" test -f "$W/av/sample-hash"
+    refuse "restore of an empty id is refused" hc restore ""
+    check "the quarantine directory is still there" test -d /var/lib/hunter/quarantine
+    refuse "restore of an unknown id is refused" hc restore 0000000000000000000000000000000000000000000000000000000000000000
+    # On access: a program carrying the pattern.
+    mkprog "$W/av/infected-prog"
+    printf '%s' "$P" >> "$W/av/infected-prog"
+    old=$(mode_of av)
+    ctl "mode av report"
+    mark
+    check "an infected program runs under av report" "$W/av/infected-prog" true
+    saw "...and is detected on access" "AV.*infected-prog"
+    ctl "mode av enforce"
+    mark
+    refuse "an infected program does not run under av enforce" "$W/av/infected-prog" true
+    saw "...and is logged as blocked" "AV.*infected-prog"
+    mkprog "$W/av/clean-prog"
+    check "a clean program runs under av enforce" "$W/av/clean-prog" true
+    ctl "mode av $old"
+fi
+
+# ── full scan of / ─────────────────────────────────────────────────────────
+# What a person runs first, and on real hardware (several CPUs) the kernel
+# once panicked during it. Twice at once, as the desktop's scan and a
+# scheduled one can overlap.
+SECTION=fullscan
+if want fullscan; then
+    mkdir -p "$W/fs1" "$W/fs2"
+    printf 'full scan sample one %s\n' "$(rnd 16)" > "$W/fs1/one"
+    printf 'full scan sample two %s\n' "$(rnd 16)" > "$W/fs2/two"
+    ctl "signature hash:$(sha "$W/fs1/one"):Hunter.SelfTest.Full1"
+    ctl "signature hash:$(sha "$W/fs2/two"):Hunter.SelfTest.Full2"
+    t0=$(date +%s)
+    hc scan / > "$W/full1.out" 2>&1 &
+    p1=$!
+    hc scan /usr /etc "$W/fs2" > "$W/full2.out" 2>&1 &
+    p2=$!
+    wait $p1; rc1=$?
+    wait $p2; rc2=$?
+    t1=$(date +%s)
+    s1=$(grep '^hunterctl: scanned ' "$W/full1.out")
+    if [ -n "$s1" ] && [ "$rc1" -le 1 ]; then pass "scan / finishes: ${s1#hunterctl: } in $((t1 - t0))s"; else fail "scan / finishes (rc $rc1)" "$(tail -n 5 "$W/full1.out")"; fi
+    n=$(echo "$s1" | sed -n 's/.*scanned \([0-9]*\) file.*/\1/p')
+    [ "${n:-0}" -gt 1000 ] && pass "...and covers the disk ($n files)" || fail "...and covers the disk" "$s1"
+    grep -q '^hunterctl: scanned ' "$W/full2.out" && [ "$rc2" -le 1 ] && pass "a second scan at the same time finishes" || fail "a second scan at the same time finishes (rc $rc2)" "$(tail -n 5 "$W/full2.out")"
+    grep -qxF "$W/fs1/one: Hunter.SelfTest.Full1 FOUND" "$W/full1.out" && pass "scan / finds its sample while another scan runs" || fail "scan / finds its sample while another scan runs" "$(grep FOUND "$W/full1.out" | head -n 5)"
+    grep -qxF "$W/fs2/two: Hunter.SelfTest.Full2 FOUND" "$W/full2.out" && pass "...and so does the other scan" || fail "...and so does the other scan" "$(grep FOUND "$W/full2.out" | head -n 5)"
+    if grep -q "fs2/two.*FOUND" "$W/full2.out" && [ "$(grep -c FOUND "$W/full2.out")" != 1 ]; then fail "...without the other's results mixed in" "$(grep FOUND "$W/full2.out")"; else pass "...without the other's results mixed in"; fi
+    if grep -q '^/proc/\|^/sys/\|^/dev/' "$W/full1.out"; then fail "scan / stays out of /proc, /sys and /dev" "$(grep '^/proc/\|^/sys/\|^/dev/' "$W/full1.out" | head -n 3)"; else pass "scan / stays out of /proc, /sys and /dev"; fi
+    check "the kernel still answers afterwards" grep -q '^hunter security subsystem' "$PROC"
+fi
+
+# ── signature feeds ────────────────────────────────────────────────────────
+SECTION=feeds
+if want feeds; then
+    if [ ! -w /proc/hunter_feed ]; then
+        skip "no /proc/hunter_feed"
+    elif ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        skip "neither curl nor wget"
+    else
+        backup /etc/hunter/feeds
+        FEED=selftest-$(rnd 4)
+        mkdir -p "$W/feed"
+        printf 'feed one %s\n' "$(rnd 16)" > "$W/feed/s1"
+        printf 'feed two %s\n' "$(rnd 16)" > "$W/feed/s2"
+        printf 'hash:%s:Hunter.SelfTest.Feed1\n' "$(sha "$W/feed/s1")" > "$W/feed/v1"
+        printf 'sigs %s file://%s/feed/v1\n' "$FEED" "$W" > /etc/hunter/feeds
+        check "update-signatures installs an unsigned feed" hc update-signatures
+        check "...into signatures.d" test -s "/etc/hunter/signatures.d/$FEED"
+        check "...and the kernel uses it" sh -c "'$HUNTERCTL' scan '$W/feed/s1' | grep -q 'Feed1 FOUND'"
+        check "hunterctl feeds lists it" sh -c "'$HUNTERCTL' feeds | grep -q '$FEED'"
+        out=$(hc update-signatures 2>&1)
+        printf '%s\n' "$out" | grep -q 'already up to date' && pass "an unchanged feed is not installed twice" || fail "an unchanged feed is not installed twice" "$out"
+        sleep 1
+        { cat "$W/feed/v1"; printf 'hash:%s:Hunter.SelfTest.Feed2\n' "$(sha "$W/feed/s2")"; } > "$W/feed/v2"
+        cp "$W/feed/v2" "$W/feed/v1"
+        check "a new version of the feed installs" hc update-signatures
+        check "...and its new signature works" sh -c "'$HUNTERCTL' scan '$W/feed/s2' | grep -q 'Feed2 FOUND'"
+        n=$(ls "/var/lib/hunter/feeds/$FEED" | grep -c '^[0-9]*$')
+        [ "$n" = 2 ] && pass "both versions are saved" || fail "both versions are saved ($n)" "$(ls -l "/var/lib/hunter/feeds/$FEED")"
+        check "feed-rollback goes back to the previous version" hc feed-rollback "$FEED"
+        check "...whose file is in signatures.d" sh -c "! grep -q Feed2 '/etc/hunter/signatures.d/$FEED'"
+        refuse "feed-rollback of an unknown feed fails" hc feed-rollback "nosuchfeed-$(rnd 4)"
+        refuse "feed-rollback with a bad name fails" hc feed-rollback "../etc"
+        # An empty download must not replace a working feed.
+        : > "$W/feed/v1"
+        refuse "an empty download is an error" hc update-signatures
+        check "...and keeps the installed feed" test -s "/etc/hunter/signatures.d/$FEED"
+        # A feed that must be signed but is not.
+        printf 'sigs %s file://%s/feed/v2 selftestkey\n' "$FEED" "$W" > /etc/hunter/feeds
+        refuse "a keyed feed without a .sig is refused" hc update-signatures
+        printf 'sigs %s file://%s/feed/nonexistent\n' "$FEED" "$W" > /etc/hunter/feeds
+        refuse "a failed download is an error" hc update-signatures
+        printf 'sigs ../evil file://%s/feed/v2\n' "$W" > /etc/hunter/feeds
+        refuse "a feed name with a path in it is refused" hc update-signatures
+        check "...and nothing is written outside signatures.d" test ! -e /etc/hunter/evil
+        # Straight at the kernel: a file outside signatures.d's staging.
+        refuse "the kernel refuses to install a feed with a bad name" sh -c "printf 'install ../x %s\n' '$W/feed/v2' > /proc/hunter_feed"
+    fi
+fi
+
+# ── boot integrity ─────────────────────────────────────────────────────────
+SECTION=boot
+if want boot; then
+    if [ ! -r /proc/hunter_boot ]; then
+        skip "no /proc/hunter_boot"
+    else
+        check "hunterctl boot shows a verdict" sh -c "'$HUNTERCTL' boot | grep -q '^verdict '"
+        check "hunterctl boot verify passes on an untouched kernel" hc boot verify
+        if grep -q '^verdict TAMPERED' /proc/hunter_boot; then fail "the boot is not TAMPERED" "$(cat /proc/hunter_boot)"; else pass "the boot is not TAMPERED"; fi
+        check "the kernel code is measured" grep -q '^kernel-code ' /proc/hunter_boot
+    fi
+fi
+
+# A TCP connect to a non-loopback address, by a given program (a busybox
+# copy): prints `ok`, `denied` (EACCES) or `other: <error>`.
+fw_try() {
+    out=$("$1" nc -w 2 "${2:-10.0.2.2}" "${3:-9}" < /dev/null 2>&1); rc=$?
+    case "$out" in
+    *"ermission denied"*) echo denied ;;
+    *) if [ "$rc" = 0 ]; then echo ok; else echo "other: $out"; fi ;;
+    esac
+}
+
+# ── firewall ───────────────────────────────────────────────────────────────
+SECTION=firewall
+if want firewall; then
+    if [ ! -r /proc/hunter_firewall ]; then
+        skip "no /proc/hunter_firewall"
+    else
+        mkprog "$W/fw-deny"; mkprog "$W/fw-ask"; mkprog "$W/fw-allow"
+        FW_PROGS="$W/fw-deny $W/fw-ask $W/fw-allow"
+        check "/proc/hunter_firewall shows the mode" grep -q '^mode ' /proc/hunter_firewall
+        ctl "net mode report"
+        check "net deny <prog> out" ctl "net deny $W/fw-deny out"
+        check "...is listed as a rule" grep -qx "rule deny out $W/fw-deny" /proc/hunter_firewall
+        r=$(fw_try "$W/fw-deny")
+        [ "$r" = denied ] && pass "a denied program cannot connect (EACCES)" || fail "a denied program cannot connect (EACCES)" "$r"
+        r=$(fw_try "$W/fw-deny" 127.0.0.1 9)
+        [ "$r" != denied ] && pass "loopback is never blocked" || fail "loopback is never blocked" "$r"
+        r=$(fw_try "$W/fw-ask")
+        [ "$r" != denied ] && pass "a program with no rule connects under report" || fail "a program with no rule connects under report" "$r"
+        check "...and becomes a question" grep -q "^pending out .* $W/fw-ask\$" /proc/hunter_firewall
+        check "net allow answers it" ctl "net allow $W/fw-ask out"
+        check "...and the question is gone" sh -c "! grep -q '^pending .* $W/fw-ask\$' /proc/hunter_firewall"
+        ctl "net allow $W/fw-allow"
+        ctl "net mode enforce"
+        ctl "net timeout 2"
+        r=$(fw_try "$W/fw-allow")
+        [ "$r" != denied ] && pass "an allowed program connects under enforce" || fail "an allowed program connects under enforce" "$r"
+        r=$(fw_try "$W/fw-deny")
+        [ "$r" = denied ] && pass "a denied program is blocked under enforce" || fail "a denied program is blocked under enforce" "$r"
+        mkprog "$W/fw-new"; FW_PROGS="$FW_PROGS $W/fw-new"
+        t0=$(date +%s)
+        r=$(fw_try "$W/fw-new")
+        t1=$(date +%s)
+        [ "$r" = denied ] && pass "an unanswered question is refused under enforce" || fail "an unanswered question is refused under enforce" "$r"
+        [ $((t1 - t0)) -ge 1 ] && [ $((t1 - t0)) -le 10 ] && pass "...after the timeout ($((t1 - t0))s)" || fail "...after the timeout" "took $((t1 - t0))s"
+        # Answered while it waits: the call goes through.
+        ctl "net timeout 20"
+        ( sleep 2; printf 'net allow %s out\n' "$W/fw-new" > "$PROC" ) &
+        t0=$(date +%s)
+        r=$(fw_try "$W/fw-new")
+        t1=$(date +%s)
+        [ "$r" != denied ] && pass "a question answered while the call waits lets it through" || fail "a question answered while the call waits lets it through" "$r"
+        [ $((t1 - t0)) -lt 10 ] && pass "...without waiting out the timeout" || fail "...without waiting out the timeout" "took $((t1 - t0))s"
+        wait
+        ctl "net timeout 30"
+        check "net forget drops the rules" ctl "net forget $W/fw-deny"
+        check "...from the list" sh -c "! grep -q ' $W/fw-deny\$' /proc/hunter_firewall"
+        refuse "a bad net directive is refused" ctl "net perhaps $W/fw-deny"
+        refuse "net timeout out of range is refused" ctl "net timeout 0"
+        ctl "net mode ${SAVED_NET:-report}"
+    fi
+fi
+
+# ── network monitor ────────────────────────────────────────────────────────
+SECTION=netmon
+if want netmon; then
+    if [ ! -r /proc/hunter_net ]; then
+        skip "no /proc/hunter_net"
+    else
+        backup /etc/hunter/ports
+        mkprog "$W/listener"
+        port=$((40000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 20000))
+        # Not loopback-only: bound to every address.
+        "$W/listener" nc -l -p "$port" > /dev/null 2>&1 &
+        BGPIDS="$BGPIDS $!"
+        sleep 1
+        mark
+        out=$(hc net)
+        if printf '%s\n' "$out" | grep -q ":$port\b.*ALERT\|ALERT.*:$port\b"; then pass "an unexpected listener is an ALERT"; else fail "an unexpected listener is an ALERT" "$out"; fi
+        saw "...and an event" "$port"
+        check "expect-port tcp $port" hc expect-port tcp "$port"
+        check "...is saved in /etc/hunter/ports" grep -qx "expect tcp $port" /etc/hunter/ports
+        out=$(hc net)
+        if printf '%s\n' "$out" | grep "$port" | grep -q ALERT; then fail "an expected listener is no ALERT" "$out"; else pass "an expected listener is no ALERT"; fi
+        check "forget-port tcp $port" hc forget-port tcp "$port"
+        check "...is taken out of /etc/hunter/ports" sh -c "! grep -q 'expect tcp $port' /etc/hunter/ports"
+        refuse "expect-port with a bad protocol is refused" hc expect-port sctp 80
+        refuse "expect-port with a bad port is refused" hc expect-port tcp 99999
+        check "a bad expect-port is not saved" sh -c "! grep -q 99999 /etc/hunter/ports"
+        kill $BGPIDS 2>/dev/null; BGPIDS=""
+    fi
+fi
+
+# ── behaviour: ransomware and injection ────────────────────────────────────
+SECTION=behavior
+if want behavior; then
+    backup /etc/hunter/policy.conf
+    old=$(mode_of behavior)
+    ctl "mode behavior report"
+    mkdir -p "$W/docs"
+    check "hunterctl canary creates and arms a decoy" hc canary "$W/docs/.~presupuesto.xlsx"
+    check "...in policy.conf for the next boot" grep -qx "canary $W/docs/.~presupuesto.xlsx" /etc/hunter/policy.conf
+    mark
+    echo "touch" >> "$W/docs/.~presupuesto.xlsx"
+    saw "writing a canary raises an alarm" "RANSOMWARE.*presupuesto"
+    # Mass renaming: 12+ files given one new extension within 10 s.
+    mkdir -p "$W/ren"
+    i=0; while [ $i -lt 14 ]; do echo "doc $i" > "$W/ren/f$i.docx"; i=$((i + 1)); done
+    mark
+    sh -c "i=0; while [ \$i -lt 14 ]; do mv '$W/ren/f'\$i'.docx' '$W/ren/f'\$i'.docx.locked'; i=\$((i + 1)); done"
+    saw "mass renaming to one extension raises an alarm" "RANSOMWARE"
+    # Encrypt and replace: random-looking copies written, originals deleted.
+    mkdir -p "$W/enc"
+    i=0; while [ $i -lt 14 ]; do echo "report $i" > "$W/enc/r$i.txt"; i=$((i + 1)); done
+    mark
+    sh -c "i=0; while [ \$i -lt 14 ]; do head -c 4096 /dev/urandom > '$W/enc/r'\$i'.txt.crypt'; rm '$W/enc/r'\$i'.txt'; i=\$((i + 1)); done"
+    saw "encrypt-and-replace raises an alarm" "RANSOMWARE"
+    # Ordinary work raises nothing: a dozen text files written and removed.
+    mkdir -p "$W/plain"
+    mark
+    sh -c "i=0; while [ \$i -lt 20 ]; do echo 'line' > '$W/plain/n'\$i'.txt'; rm '$W/plain/n'\$i'.txt'; i=\$((i + 1)); done"
+    nosaw "writing and deleting text files is not ransomware" "RANSOMWARE"
+    # Enforce: the process that trips it is stopped and contained.
+    ctl "mode behavior enforce"
+    mark
+    refuse "under enforce, writing a canary is refused" sh -c "echo x >> '$W/docs/.~presupuesto.xlsx'"
+    saw "...and logged" "RANSOMWARE"
+    out=$(sh -c "echo x >> '$W/docs/.~presupuesto.xlsx' 2>/dev/null; echo y > '$W/docs/after' && echo wrote" 2>&1)
+    [ "$out" != wrote ] && pass "...and the process is contained (its next write fails)" || fail "...and the process is contained (its next write fails)" "$out"
+    check "an innocent process still writes" sh -c "echo y > '$W/docs/innocent'"
+    ctl "mode behavior report"
+    # Injection: ptrace(ATTACH) into a process that is not a descendant.
+    if command -v perl >/dev/null 2>&1; then
+        sleep 30 & victim=$!
+        BGPIDS="$BGPIDS $victim"
+        mark
+        perl -e 'syscall(101, 16, $ARGV[0], 0, 0)' "$victim" 2>/dev/null
+        saw "ptrace(ATTACH) into a stranger is an injection alarm" "INJECTION"
+        ctl "mode behavior enforce"
+        r=$(perl -e '$r = syscall(101, 16, $ARGV[0], 0, 0); print $r < 0 ? "$!" : "ok"' "$victim" 2>&1)
+        case "$r" in *"not permitted"*) pass "...refused with EPERM under enforce" ;; *) fail "...refused with EPERM under enforce" "$r" ;; esac
+        ctl "mode behavior report"
+        kill "$victim" 2>/dev/null
+    else
+        skip "injection (no perl to call ptrace)"
+    fi
+    refuse "release of a bad pid is refused" ctl "release notapid"
+    ctl "mode behavior $old"
+fi
+
+# ── anomaly heuristics ─────────────────────────────────────────────────────
+SECTION=anomaly
+if want anomaly; then
+    oldad=$(sed -n 's/.*anomaly-detection=\([a-z]*\).*/\1/p' "$PROC")
+    check "anomaly-detection on" hc anomaly-detection on
+    mark
+    sh -c 'i=0; while [ $i -lt 300 ]; do /bin/true & i=$((i + 1)); done; wait'
+    saw "a burst of 300 forks is flagged" "ANOMALY|fork"
+    hc anomaly-detection "${oldad:-off}" >/dev/null 2>&1
+fi
+
+# ── scheduled scans ────────────────────────────────────────────────────────
+SECTION=schedule
+if want schedule; then
+    backup /etc/hunter/schedule
+    JOB=selftest$(rnd 2)
+    mkdir -p "$W/sched"
+    echo clean > "$W/sched/clean"
+    touch /etc/hunter/schedule
+    printf '%s off 03:00 report %s/sched\n' "$JOB" "$W" >> /etc/hunter/schedule
+    check "hunterctl schedule lists the job" sh -c "'$HUNTERCTL' schedule | grep -q '^$JOB'"
+    check "run-scheduled of a clean job exits 0" hc run-scheduled "$JOB"
+    check "...and is in the history as clean" sh -c "tail -n 1 /var/lib/hunter/scans/history | grep -q '$JOB.*clean'"
+    check "scan-history shows it" sh -c "'$HUNTERCTL' scan-history 5 | grep -q '$JOB'"
+    printf 'scheduled sample %s\n' "$(rnd 16)" > "$W/sched/bad"
+    ctl "signature hash:$(sha "$W/sched/bad"):Hunter.SelfTest.Sched"
+    refuse "run-scheduled of an infected job exits 1" hc run-scheduled "$JOB"
+    check "...and is in the history as infected" sh -c "tail -n 1 /var/lib/hunter/scans/history | grep -q '$JOB.*infected'"
+    check "schedule <job> daily 04:30 quarantine" hc schedule "$JOB" daily 04:30 quarantine
+    check "...rewrites the line" grep -q "^$JOB daily 04:30 quarantine $W/sched" /etc/hunter/schedule
+    run=$(hc run-scheduled "$JOB" 2>&1)
+    [ ! -e "$W/sched/bad" ] && pass "a quarantine job quarantines" || fail "a quarantine job quarantines" "$run"
+    check "...and records it" sh -c "tail -n 1 /var/lib/hunter/scans/history | awk -F '\t' '{ exit !(\$7 == 1) }'"
+    refuse "schedule with a bad time is refused" hc schedule "$JOB" daily 25:00
+    refuse "schedule with a bad day is refused" hc schedule "$JOB" someday
+    refuse "schedule of an unknown job is refused" hc schedule "nojob$(rnd 2)" daily
+    refuse "run-scheduled of an unknown job is refused" hc run-scheduled "nojob$(rnd 2)"
+    # --due: a job seen for the first time only starts counting.
+    rm -f "/var/lib/hunter/scans/$JOB.last"
+    n0=$(wc -l < /var/lib/hunter/scans/history)
+    hc run-scheduled --due >/dev/null 2>&1
+    n1=$(wc -l < /var/lib/hunter/scans/history)
+    [ "$n0" = "$n1" ] && pass "--due does not run a job it has never seen" || fail "--due does not run a job it has never seen" "$(tail -n 2 /var/lib/hunter/scans/history)"
+    # Last run two days ago: due now.
+    echo $(( $(date +%s) - 2 * 86400 )) > "/var/lib/hunter/scans/$JOB.last"
+    hc run-scheduled --due >/dev/null 2>&1
+    if tail -n 1 /var/lib/hunter/scans/history | grep -q "$JOB.scheduled"; then pass "--due runs a job whose slot has passed"; else fail "--due runs a job whose slot has passed" "$(tail -n 2 /var/lib/hunter/scans/history)"; fi
+fi
+
+# ── notifications ──────────────────────────────────────────────────────────
+SECTION=notify
+if want notify; then
+    id=$(hc notify --severity warn --action ok:Vale "hunter-selftest" "una prueba")
+    check "notify posts an alert file" test -f "/run/hunter/notify/$id.alert"
+    check "...with the title" grep -qx "title=hunter-selftest" "/run/hunter/notify/$id.alert"
+    check "...and the action" grep -q "^action=ok	Vale	" "/run/hunter/notify/$id.alert"
+    check "the spool is root-only" sh -c "[ \"\$(stat -c %a /run/hunter/notify)\" = 700 ]"
+    rm -f "/run/hunter/notify/$id.alert"
+    out=$(hc notify --wait 2 "hunter-selftest" "nadie contesta"); rc=$?
+    [ "$out" = timeout ] && [ "$rc" = 2 ] && pass "an unanswered --wait times out with exit 2" || fail "an unanswered --wait times out with exit 2" "$out rc=$rc"
+    # An answer: what the bar writes when a button is pressed.
+    ( sleep 1; f=$(ls /run/hunter/notify/*.alert 2>/dev/null | head -n 1); [ -n "$f" ] && echo yes > "${f%.alert}.answer" ) &
+    out=$(hc notify --wait 10 --action yes:Si "hunter-selftest" "contesta"); rc=$?
+    wait
+    [ "$out" = yes ] && [ "$rc" = 0 ] && pass "an answer is printed with exit 0" || fail "an answer is printed with exit 0" "$out rc=$rc"
+    refuse "a bad severity is refused" hc notify --severity loud "x"
+    refuse "a bad --action is refused" hc notify --action nolabel "x"
+    out=$(hc notify "tab	and" "line
+break")
+    if grep -c '' "/run/hunter/notify/$out.alert" | grep -qx 2; then pass "tabs and newlines cannot inject fields"; else fail "tabs and newlines cannot inject fields" "$(cat "/run/hunter/notify/$out.alert")"; fi
+    rm -f "/run/hunter/notify/$out.alert"
+fi
+
+# ── hunterd ────────────────────────────────────────────────────────────────
+SECTION=hunterd
+if want hunterd; then
+    check "hunterctl persist" hc persist
+    check "events.log exists" test -s /var/log/hunter/events.log
+    ctl "mode wx $(mode_of wx)"
+    mark
+    tok=$(rnd 6)
+    mkprog "$W/hd-$tok"
+    hc deny "$W/hd-$tok" >/dev/null
+    ctl "mode exec report"
+    "$W/hd-$tok" true
+    ctl "mode exec $(echo "$SAVED_MODES" | tr ' ' '\n' | sed -n 's/^exec=//p')"
+    hc persist
+    check "a new event reaches events.log" grep -q "hd-$tok" /var/log/hunter/events.log
+    check "hunterctl history shows it" sh -c "'$HUNTERCTL' history 0 | grep -q 'hd-$tok'"
+    n=$(grep -c "hd-$tok" /var/log/hunter/events.log)
+    hc persist
+    [ "$(grep -c "hd-$tok" /var/log/hunter/events.log)" = "$n" ] && pass "a second pass does not duplicate events" || fail "a second pass does not duplicate events"
+    check "the log is not world-readable" sh -c "[ \"\$(stat -c %a /var/log/hunter/events.log | cut -c3)\" = 0 ]"
+    check "history --alerts only has WARN/CRIT" sh -c "'$HUNTERCTL' history --alerts 0 | awk '{ print \$3 }' | grep -vqE '^(WARN|CRIT)\$' && exit 1 || exit 0"
+    refuse "history with a bad argument is refused" hc history --bogus
+fi
+
+# ── reports ────────────────────────────────────────────────────────────────
+SECTION=report
+if want report; then
+    if [ ! -x /bin/lunarhunter ]; then
+        skip "no /bin/lunarhunter"
+    else
+        check "report --txt" hc report --txt -o "$W/r.txt"
+        check "...is not empty" test -s "$W/r.txt"
+        check "report --pdf" hc report --pdf -o "$W/r.pdf"
+        check "...is a PDF" sh -c "head -c 5 '$W/r.pdf' | grep -q '%PDF-'"
+        check "...that ends with %%EOF" sh -c "tail -c 32 '$W/r.pdf' | grep -q '%%EOF'"
+        check "report (html)" hc report -o "$W/r"
+        check "...adds the extension" sh -c "grep -qi '<html' '$W/r.html'"
+        check "report --days 1" hc report --txt --days 1 -o "$W/r1.txt"
+        refuse "report --days with no number is refused" hc report --days
+    fi
+fi
+
+# ── removable media ────────────────────────────────────────────────────────
+SECTION=media
+if want media; then
+    if grep -q '^media-device: ' "$PROC"; then
+        out=$(hc scan-media 2>&1); rc=$?
+        printf '%s\n' "$out" | grep -q 'scanned\|no media waiting' && pass "scan-media runs ($rc)" || fail "scan-media runs" "$out"
+    else
+        skip "no removable media attached"
+    fi
+    check "media-lock on/off" sh -c "'$HUNTERCTL' media-lock on && '$HUNTERCTL' media-lock off"
+fi
+
+# ── the seal (one way, until reboot) ───────────────────────────────────────
+SECTION=seal
+if want seal; then
+    mkprog "$W/seal-denied"
+    ctl "net deny $W/seal-denied out"
+    ctl "mode exec report"
+    check "hunterctl seal" hc seal
+    check "the header says tighten-only" sealed
+    refuse "sealed: hunterctl mode exec off says it was refused" hc mode exec off
+    [ "$(mode_of exec)" = report ] && pass "...and exec stays at report" || fail "...and exec stays at report" "$(modes)"
+    check "sealed: tightening a mode still works" hc mode exec enforce
+    [ "$(mode_of exec)" = enforce ] && pass "...and takes effect" || fail "...and takes effect" "$(modes)"
+    ctl "net allow $W/seal-denied out"
+    check "sealed: net allow of a denied program changes nothing" grep -qx "rule deny out $W/seal-denied" /proc/hunter_firewall
+    check "sealed: net deny still works" ctl "net deny $W/seal-denied in"
+    refuse "sealed: hunterctl learning on says it was refused" hc learning on
+    refuse "sealed: hunterctl trust / says it was refused" hc trust /
+    # Leave the system usable for whoever reads this: exec enforce with an
+    # inactive allowlist only blocks the blacklist.
+fi
+
+echo "hunter-selftest: $PASS passed, $FAIL failed, $SKIP skipped"
+[ "$FAIL" -lt 125 ] || FAIL=125
+exit "$FAIL"
