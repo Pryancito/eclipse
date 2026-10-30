@@ -209,6 +209,24 @@ pub(super) struct DiskState {
     pub cdbs: Vec<Vec<u8>>,
     /// Una fase de datos OUT a medias: `(lba, bytes que faltan, tag, pedidos)`.
     pending_write: Option<(u64, usize, u32, u32)>,
+    /// Las ordenes que quedan por rechazar con CSW status 1 y sentido de
+    /// UNIT ATTENTION. `REQUEST SENSE` no gasta ninguna: es precisamente la
+    /// orden que limpia la condicion.
+    unit_attention: u32,
+    /// Cuantos STALL van DELANTE del CSW de cada orden mientras queden ordenes
+    /// en `csw_stall_commands`. Es lo que hace una unidad que para su endpoint
+    /// IN: el que reintenta encuentra la respuesta esperandole detras.
+    ///
+    /// Dos numeros y no uno porque las dos cosas que hay que poder distinguir
+    /// son «un tropiezo del que se sale reintentando» (un STALL) y «un CSW que
+    /// no llega en ningun intento» (tantos como intentos haga el driver), y con
+    /// un solo contador la segunda se reparte entre ordenes y ninguna llega a
+    /// quedarse sin CSW.
+    csw_stalls: u32,
+    /// Ordenes que quedan por contestar asi.
+    csw_stall_commands: u32,
+    /// Lo que contesta `REQUEST SENSE`.
+    sense: Vec<u8>,
 }
 
 impl DiskState {
@@ -230,6 +248,11 @@ impl DiskState {
             short_by: 0,
             cdbs: Vec::new(),
             pending_write: None,
+            unit_attention: 0,
+            csw_stalls: 0,
+            csw_stall_commands: 0,
+            // Por defecto, el de una unidad sin medio dentro.
+            sense: fixed_sense(0x02, 0x3a, 0x00),
         }
     }
 
@@ -292,13 +315,19 @@ impl DiskState {
 
     /// Los 18 de `REQUEST SENSE`, con la condición que explica un «no lista».
     fn sense(&self) -> Vec<u8> {
-        let mut d = alloc::vec![0u8; 18];
-        d[0] = 0x70; // Current error, fixed format.
-        d[2] = 0x02; // NOT READY.
-        d[7] = 10; // Additional length.
-        d[12] = 0x3a; // MEDIUM NOT PRESENT.
-        d
+        self.sense.clone()
     }
+}
+
+/// Los 18 bytes de unos datos de sentido de formato fijo (SPC-4 §4.5.3).
+fn fixed_sense(key: u8, asc: u8, ascq: u8) -> Vec<u8> {
+    let mut d = alloc::vec![0u8; 18];
+    d[0] = 0x70; // Current error, formato fijo.
+    d[2] = key & 0x0f;
+    d[7] = 10; // Additional length.
+    d[12] = asc;
+    d[13] = ascq;
+    d
 }
 
 /// `(lba, bloques)` de un READ(10) o WRITE(10).
@@ -711,7 +740,7 @@ impl FakeDev {
             disk.put_block(lba, &bytes[..n]);
             let status = u8::from(n < want);
             let csw = bot_csw(tag, asked.saturating_sub(n as u32), status, disk.wrong_tag);
-            self.queued.push((DCI_BULK_IN, csw, TRB_CC_SUCCESS));
+            self.push_csw(csw);
             return true;
         }
         if bytes.len() < 31
@@ -725,9 +754,19 @@ impl FakeDev {
         let cdb = bytes[15..(15 + cb_len).min(bytes.len())].to_vec();
         disk.cdbs.push(cdb.clone());
         let op = cdb.first().copied().unwrap_or(0xff);
+        // La condicion de atencion se come la orden ENTERA: ni fase de datos
+        // ni medio tocado, solo el CSW que dice que fallo. Es lo que contesta
+        // un pendrive a lo primero que se le pregunta tras un enchufe o un
+        // reset del transporte.
+        if disk.unit_attention > 0 && op != SCSI_REQUEST_SENSE {
+            disk.unit_attention -= 1;
+            let csw = bot_csw(tag, asked, 1, disk.wrong_tag);
+            self.push_rejection(csw, asked);
+            return true;
+        }
         if disk.fail_op == Some(op) {
             let csw = bot_csw(tag, asked, 1, disk.wrong_tag);
-            self.queued.push((DCI_BULK_IN, csw, TRB_CC_SUCCESS));
+            self.push_rejection(csw, asked);
             return true;
         }
         let (data, status) = match op {
@@ -770,8 +809,43 @@ impl FakeDev {
                 .push((DCI_BULK_IN, data[..moved as usize].to_vec(), TRB_CC_SUCCESS));
         }
         let csw = bot_csw(tag, asked - moved, status, wrong_tag);
-        self.queued.push((DCI_BULK_IN, csw, TRB_CC_SUCCESS));
+        self.push_csw(csw);
         true
+    }
+
+    /// Encola un CSW, con el STALL de delante si el molde lo pidio.
+    ///
+    /// Un endpoint parado entrega CERO bytes y el codigo del STALL, y el CSW
+    /// de verdad se queda detras en la cola: eso es exactamente lo que ve un
+    /// driver que le quita el halt y vuelve a preguntar, y lo que no ve uno
+    /// que da la orden por perdida al primer intento.
+    fn push_csw(&mut self, csw: Vec<u8>) {
+        let stalls = match self.disk.as_mut() {
+            Some(d) if d.csw_stall_commands > 0 => {
+                d.csw_stall_commands -= 1;
+                d.csw_stalls
+            }
+            _ => 0,
+        };
+        for _ in 0..stalls {
+            self.queued.push((DCI_BULK_IN, Vec::new(), TRB_CC_STALL));
+        }
+        self.queued.push((DCI_BULK_IN, csw, TRB_CC_SUCCESS));
+    }
+
+    /// Encola el rechazo de una orden: la fase de datos que el host espera y
+    /// que no va a llegar, y detras el CSW que dice que fallo.
+    ///
+    /// La fase de datos hace falta. Una unidad que rechaza una orden PARA su
+    /// endpoint de datos (BOT §6.7.2), y el host tiene un TRB armado para
+    /// ella: sin nada que entregarle, el CSW de detras se le entrega a ESE
+    /// TRB --el fake no distingue fases, cualquier endpoint IN es el suyo-- y
+    /// el driver se queda esperando un CSW que ya se gasto como datos.
+    fn push_rejection(&mut self, csw: Vec<u8>, asked: u32) {
+        if asked > 0 {
+            self.queued.push((DCI_BULK_IN, Vec::new(), TRB_CC_STALL));
+        }
+        self.push_csw(csw);
     }
 
     /// Un hub de `ports` puertos: clase 9 en el dispositivo y en su única
@@ -899,6 +973,19 @@ impl FakeDev {
             // SET_CONFIGURATION, SET_INTERFACE y las dos opcionales de HID
             // (SET_IDLE, SET_PROTOCOL) no llevan datos.
             (0x00, 0x09, _) | (0x01, 0x0b, _) | (0x21, 0x0a, _) | (0x21, 0x0b, _) => Vec::new(),
+            // CLEAR_FEATURE(ENDPOINT_HALT) al endpoint, que la contesta
+            // cualquier aparato. Hasta que esto estuvo aqui el fake la paraba,
+            // y un STALL en ella hace que `wait_ep0_status_any` la vuelva a
+            // intentar sobre EP0, que el fake paraba tambien: una recursion
+            // que no se parece a nada que haga un dispositivo de verdad.
+            (0x02, 0x01, _) => Vec::new(),
+            // `Bulk-Only Mass Storage Reset` (BOT §3.1): sin unidad detras es
+            // un STALL, que es lo que contesta un aparato al que esa peticion
+            // no le va dirigida.
+            (0x21, 0xff, _) => match self.disk.as_ref() {
+                Some(_) => Vec::new(),
+                None => return Some((Vec::new(), TRB_CC_STALL)),
+            },
             // Lo de clase, que sólo un hub contesta.
             // GET_MAX_LUN (MSC BOT §3.2): sin unidad es un STALL, que es
             // justo lo que el driver tiene que leer como «una sola unidad».
@@ -2162,6 +2249,59 @@ impl Hw {
                 .map(|d| d.cdbs.clone())
                 .unwrap_or_default()
         })
+    }
+
+    /// Arma una condicion de atencion en la unidad del puerto `port`: las `n`
+    /// ordenes siguientes se rechazan y `REQUEST SENSE` contesta
+    /// UNIT ATTENTION / 0x28 (MEDIUM MAY HAVE CHANGED).
+    ///
+    /// Se arma DESPUES de la enumeracion a proposito: lo que hay que probar es
+    /// la condicion que se encuentra una lectura normal, no la que ve
+    /// `msc_identify`, que ya pedia el sentido en su bucle de «no lista».
+    pub(super) fn arm_unit_attention(&self, port: u8, n: u32) {
+        self.with(|st| {
+            if let Some(d) = st
+                .devs
+                .iter_mut()
+                .find(|n| n.port == port && n.route == 0)
+                .and_then(|n| n.dev.disk.as_mut())
+            {
+                d.unit_attention = n;
+                d.sense = fixed_sense(0x06, 0x28, 0x00);
+            }
+        });
+    }
+
+    /// Lo mismo con un sentido que NO se reintenta: error de medio sin
+    /// recuperacion posible (clave 3, ASC 0x11).
+    pub(super) fn arm_medium_error(&self, port: u8, n: u32) {
+        self.with(|st| {
+            if let Some(d) = st
+                .devs
+                .iter_mut()
+                .find(|n| n.port == port && n.route == 0)
+                .and_then(|n| n.dev.disk.as_mut())
+            {
+                d.unit_attention = n;
+                d.sense = fixed_sense(0x03, 0x11, 0x00);
+            }
+        });
+    }
+
+    /// Las `commands` ordenes siguientes de la unidad del puerto `port` salen
+    /// con `stalls` STALL delante de su CSW.
+    pub(super) fn arm_csw_stall(&self, port: u8, stalls: u32, commands: u32) {
+        self.with(|st| {
+            if let Some(d) = st
+                .devs
+                .iter_mut()
+                .find(|n| n.port == port && n.route == 0)
+                .and_then(|n| n.dev.disk.as_mut())
+            {
+                d.csw_stalls = stalls;
+                d.csw_stall_commands = commands;
+            }
+        });
     }
 
     /// Lo que un dispositivo no ha podido entregar todavía porque su endpoint
