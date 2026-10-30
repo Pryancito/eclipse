@@ -69,6 +69,89 @@ fn wrote(done: usize, asked: usize) -> rcore_fs::vfs::Result<usize> {
 const ZERO_CHUNK: usize = 4096;
 
 // ---------------------------------------------------------------------------
+// Lo que contesta un montaje que no sale
+// ---------------------------------------------------------------------------
+
+/// Qué error es «esto no es un volumen FAT» y cuál es «el disco no contestó».
+///
+/// `FileSystem::new` falla por dos motivos que no se parecen en nada: el
+/// sector de arranque no describe un volumen FAT (`CorruptedFileSystem`, y los
+/// `InvalidInput` de los parámetros que salen de él) o la lectura no llegó
+/// (`Io`). Los dos salían como `DeviceError`, o sea **EIO**, y de ahí nacía el
+/// «I/O error» de montar un pendrive perfectamente sano cuyo sistema de
+/// archivos este kernel no tiene.
+///
+/// Linux contesta **EINVAL** a un superbloque que no es el suyo --el
+/// «wrong fs type, bad option, bad superblock» de toda la vida--, y eso no es
+/// cosmético: `mount` sin `-t` prueba uno por uno los tipos de
+/// `/proc/filesystems` y el errno que el usuario ve es el del último intento.
+/// Con vfat contestando EIO, **cualquier** unidad que no sea FAT acababa en
+/// «I/O error», que señala al disco y al driver USB en vez de al formato.
+/// btrfs y EclipseFS ya lo hacían bien (`FsError::WrongFs`); vfat era el que
+/// quedaba.
+fn fat_open_error(e: fatfs::Error<()>) -> FsError {
+    match e {
+        fatfs::Error::Io(()) => FsError::DeviceError,
+        _ => FsError::WrongFs,
+    }
+}
+
+/// Qué dice el superbloque que hay, cuando no es FAT. Sólo para la línea del
+/// registro, y sólo con los formatos que se reconocen por una firma fija.
+///
+/// Hace falta porque el caso normal es un pendrive **recién comprado**: las
+/// unidades de más de 32 GiB vienen de fábrica en exFAT, que este kernel no
+/// monta, y lo único que se veía era un EIO que no dice ni el formato ni que
+/// el disco esté sano.
+fn probe_foreign_fs(dev: &Arc<dyn Device>) -> Option<&'static str> {
+    // Hasta el superbloque de ext, que vive en el byte 1024 y lleva su firma
+    // en el 1080.
+    let mut sb = alloc::vec![0u8; 2048];
+    if dev.read_at(0, &mut sb).ok()? < sb.len() {
+        return None;
+    }
+    // exFAT y NTFS ponen su nombre donde FAT pone el del formateador.
+    match &sb[3..11] {
+        b"EXFAT   " => return Some("exFAT"),
+        b"NTFS    " => return Some("NTFS"),
+        _ => {}
+    }
+    // ext2/3/4: `s_magic` = 0xEF53, en el byte 1080 (1024 + 56), little endian.
+    if sb[1080..1082] == [0x53, 0xef] {
+        return Some("ext2/3/4");
+    }
+    // XFS y btrfs, para que la línea no mienta llamándolos desconocidos.
+    if &sb[0..4] == b"XFSB" {
+        return Some("XFS");
+    }
+    if &sb[1024..1030] == b"ReIsEr" {
+        return Some("ReiserFS");
+    }
+    None
+}
+
+/// El error del montaje y, de paso, la única línea que explica por qué.
+///
+/// Sin ella el usuario sólo tiene el errno que `mount` imprime, y `mount` sin
+/// `-t` ni siquiera dice qué tipo fue el que falló.
+fn fat_open_failed(dev: &Arc<dyn Device>, e: fatfs::Error<()>) -> FsError {
+    let err = fat_open_error(e);
+    if err == FsError::DeviceError {
+        zcore_drivers::klog_warn!("[vfat] el disco no contesto al leer el sector de arranque");
+    } else if let Some(name) = probe_foreign_fs(dev) {
+        zcore_drivers::klog_warn!(
+            "[vfat] el volumen no es FAT: parece {}, que este kernel no monta",
+            name
+        );
+    } else {
+        zcore_drivers::klog_warn!(
+            "[vfat] el volumen no es FAT: el sector de arranque no describe uno"
+        );
+    }
+    err
+}
+
+// ---------------------------------------------------------------------------
 // Reloj
 // ---------------------------------------------------------------------------
 
@@ -323,7 +406,7 @@ impl FatMountFs {
             pos: 0,
         };
         let fs = FileSystem::new(disk, FsOptions::new().time_provider(KernelTimeProvider))
-            .map_err(|_| FsError::DeviceError)?;
+            .map_err(|e| fat_open_failed(&dev, e))?;
         let cluster_size = fs.cluster_size();
         let arc = Arc::new(Self {
             inner: Mutex::new(Some(fs)),

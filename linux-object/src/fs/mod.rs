@@ -12,6 +12,10 @@ mod epoll;
 pub use epoll::stats as epoll_stats;
 mod eventfd;
 mod fat_mount;
+/// Qué errno nace de montar vfat sobre un volumen que no es FAT: la segunda
+/// mitad del «I/O error» de los pendrives, sin bus USB de por medio.
+#[cfg(test)]
+mod fat_wrong_fs_tests;
 mod file;
 mod flagged_fs;
 pub mod flock;

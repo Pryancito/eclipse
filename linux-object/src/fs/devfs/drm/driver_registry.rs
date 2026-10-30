@@ -11,9 +11,36 @@
 
 use super::*;
 
-/// Register a new DRM driver
+/// Register a new DRM driver. Registering one that is already in the list
+/// does nothing, matched by identity (`Arc::ptr_eq`) the way
+/// [`unregister_driver`] matches.
+///
+/// The guard is not defensive. `create_root_fs` walks `drivers::all_drm()` and
+/// registers every card it finds, and `LinuxProcess::new` calls
+/// `create_root_fs` -- that is what `with_root` exists to avoid "re-scanning
+/// disks / re-mounting" for. So every call of it put a SECOND entry in this
+/// list for each card already there, and nothing ever took one out: the list
+/// is append-only on purpose, because no GPU gets unplugged.
+///
+/// What that costs: [`super::build_gpu_nodes`] builds one node per entry, so a
+/// duplicated card gets a duplicated `/dev/dri/cardN`, with the minors of
+/// every card after it pushed along; `software_kms_active()` asks every entry
+/// the same question twice; and each duplicate holds an `Arc` clone of the
+/// driver for the rest of the boot.
+///
+/// In the unit-test binary it also made the DRM tests unreliable, which is how
+/// it was found: every test that creates a Linux process runs
+/// `create_root_fs`, and it did so WITHOUT `test_globals::lock()`, so it
+/// re-registered the emulated cards of whichever DRM test was running beside
+/// it and moved the card indices under its feet. The suite failed about one
+/// run in ten, with the victim changing -- the two-card node test, the exit
+/// reclaim tests, `/dev/shm` -- which reads as a real regression and is not
+/// one.
 pub fn register_driver(driver: Arc<dyn DrmScheme>) {
     let mut state = DRM_STATE.lock();
+    if state.drivers.iter().any(|d| Arc::ptr_eq(d, &driver)) {
+        return;
+    }
     if driver.name() == "simplefb" {
         state.drivers.push(driver);
     } else {
@@ -189,6 +216,10 @@ type PciBdf = (u32, u8, u8, u8);
 
 #[cfg(test)]
 mod compute_bdf_tests;
+/// Que registrar la misma tarjeta dos veces no la ponga dos veces, que es lo
+/// que hacía cada `LinuxProcess::new` a través de `create_root_fs`.
+#[cfg(test)]
+mod dedupe_tests;
 #[cfg(test)]
 mod monitor_pin_tests;
 

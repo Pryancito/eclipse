@@ -3993,6 +3993,19 @@ fn proc_mounts_content() -> String {
 /// and the type name. Userland (`mount`, `grep`, init scripts) probes this
 /// before mounting; a missing file makes tools log
 /// `grep: /proc/filesystems: No such file or directory`.
+///
+/// Every type `parse_fstype` accepts has to be here, because this list is what
+/// `mount` with no `-t` tries: a type the kernel mounts but does not declare is
+/// a type autodetection can never find. `eclipsefs` -- the kernel's OWN
+/// filesystem, and the one an installed disk carries -- was missing, so
+/// `mount /dev/sdb1 /mnt` could only ever try btrfs and vfat on it.
+/// El texto de `/proc/filesystems`, para que un test pueda comprobar que
+/// declara todo lo que `parse_fstype` sabe montar.
+#[cfg(test)]
+pub(super) fn proc_filesystems_for_test() -> String {
+    proc_filesystems_content()
+}
+
 fn proc_filesystems_content() -> String {
     "nodev\tsysfs\n\
      nodev\tproc\n\
@@ -4000,6 +4013,7 @@ fn proc_filesystems_content() -> String {
      nodev\tdevtmpfs\n\
      nodev\tramfs\n\
      nodev\tdevpts\n\
+     \teclipsefs\n\
      \tbtrfs\n\
      \tvfat\n"
         .into()
