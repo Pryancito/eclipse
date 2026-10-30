@@ -4,7 +4,7 @@ use x2apic::lapic::{
 };
 
 use super::{consts, Phys2VirtFn};
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 // APIC MMIO addresses are CPU-local, but the driver's mutable configuration
 // must also be private to each CPU.
@@ -21,6 +21,48 @@ static mut LOCAL_APICS: [Option<LocalApic>; lock::MAX_CORE_NUM] =
     [const { None }; lock::MAX_CORE_NUM];
 static APIC_BASE: AtomicUsize = AtomicUsize::new(0);
 static BSP_ID: AtomicU8 = AtomicU8::new(0);
+
+/// The mode every Local APIC ends up in once its slot exists, published by the
+/// BSP. `LocalApicBuilder::build` picks it from CPUID, which is the same on
+/// every core, so an AP that has been through `init_ap` agrees with it.
+static X2APIC_MODE: AtomicBool = AtomicBool::new(false);
+
+/// (x2APIC MSR, xAPIC MMIO offset) of the two registers written on every
+/// interrupt. Same values as the private constants in `x2apic::lapic`.
+const REG_EOI: (u32, u32) = (0x80B, 0x0B0);
+const REG_TICR: (u32, u32) = (0x838, 0x380);
+
+// A copy of each slot as it was last left by this driver, and a count of the
+// times a slot was found to differ from it.
+//
+// A real machine died with `#GP` on the `wrmsr` of `set_timer_initial` on
+// CPU6, 375 s after boot, with `ecx = 0xffffff00`: the TICR register in that
+// CPU's slot no longer said MSR 0x838. Nothing in this driver writes a
+// register descriptor after `init_*`, so something else wrote over this
+// static. The two registers written on every interrupt (EOI and the timer
+// count) no longer go through the slot at all, see `write_reg`. The copy is
+// for the rest of it and for finding the writer: the tick compares the slot
+// against it, logs what changed and where, and puts it back.
+const SLOT_WORDS: usize = core::mem::size_of::<LocalApic>() / 8;
+static mut SLOT_SHADOWS: [[u64; SLOT_WORDS]; lock::MAX_CORE_NUM] =
+    [[0; SLOT_WORDS]; lock::MAX_CORE_NUM];
+static SLOT_CORRUPTIONS: AtomicUsize = AtomicUsize::new(0);
+/// Lines `check_slot` may log in all; the counter keeps counting past it.
+const SLOT_CORRUPTION_LOG_BUDGET: usize = 8;
+
+/// Write one Local APIC register of the calling CPU without reading anything
+/// from its slot. Only after this CPU's `init_*` (the callers reach it through
+/// `get()`, which refuses an empty slot), so the mode is the published one.
+unsafe fn write_reg(reg: (u32, u32), value: u32) {
+    unsafe {
+        if X2APIC_MODE.load(Ordering::Relaxed) {
+            x86_64::registers::model_specific::Msr::new(reg.0).write(value as u64);
+        } else {
+            let base = APIC_BASE.load(Ordering::Relaxed);
+            core::ptr::write_volatile((base + reg.1 as usize) as *mut u32, value);
+        }
+    }
+}
 
 /// Index of this CPU's slot in [`LOCAL_APICS`].
 fn slot_index() -> usize {
@@ -114,7 +156,9 @@ impl LocalApic {
                 .cast::<Option<LocalApic>>()
                 .add(slot_index());
             slot.write(Some(LocalApic { inner }));
+            X2APIC_MODE.store(x2apic_active(), Ordering::Release);
             APIC_BASE.store(base_vaddr, Ordering::Release);
+            Self::get().snapshot();
         }
     }
 
@@ -142,6 +186,65 @@ impl LocalApic {
                 .cast::<Option<LocalApic>>()
                 .add(slot_index());
             slot.write(Some(LocalApic { inner }));
+            Self::get().snapshot();
+        }
+    }
+
+    fn words(&self) -> *const u64 {
+        (self as *const Self).cast()
+    }
+
+    /// Record this slot as the driver left it. After `init_*` and after every
+    /// setter that changes a field of the inner object.
+    fn snapshot(&mut self) {
+        let idx = slot_index();
+        unsafe {
+            let shadow = &mut *(&raw mut SLOT_SHADOWS).cast::<[u64; SLOT_WORDS]>().add(idx);
+            for (i, w) in shadow.iter_mut().enumerate() {
+                *w = core::ptr::read_volatile(self.words().add(i));
+            }
+        }
+    }
+
+    /// Compare this slot with its copy; on a difference, log it and restore
+    /// the copy. Runs from the tick, which is interrupt context or under an
+    /// IRQ-disabling lock (see kernel-hal `arm_deadline`), so nothing on this
+    /// CPU is half way through a setter.
+    fn check_slot(&mut self) {
+        let idx = slot_index();
+        let words = (self as *mut Self).cast::<u64>();
+        unsafe {
+            let shadow = &*(&raw const SLOT_SHADOWS)
+                .cast::<[u64; SLOT_WORDS]>()
+                .add(idx);
+            let mut first = None;
+            let mut last = 0;
+            for (i, &want) in shadow.iter().enumerate() {
+                if core::ptr::read_volatile(words.add(i)) != want {
+                    first.get_or_insert(i);
+                    last = i;
+                }
+            }
+            let Some(first) = first else {
+                return;
+            };
+            let found = core::ptr::read_volatile(words.add(first));
+            let n = SLOT_CORRUPTIONS.fetch_add(1, Ordering::Relaxed);
+            for (i, &want) in shadow.iter().enumerate() {
+                core::ptr::write_volatile(words.add(i), want);
+            }
+            if n < SLOT_CORRUPTION_LOG_BUDGET {
+                crate::klog_err!(
+                    "[lapic] cpu{} slot overwritten at {:p} +{:#x}..+{:#x}: \
+                     {:#018x} where {:#018x} was; restored",
+                    idx,
+                    words,
+                    first * 8,
+                    last * 8 + 8,
+                    found,
+                    shadow[first],
+                );
+            }
         }
     }
 
@@ -186,7 +289,7 @@ impl LocalApic {
     }
 
     pub fn eoi(&mut self) {
-        unsafe { self.inner.end_of_interrupt() }
+        unsafe { write_reg(REG_EOI, 0) }
     }
 
     pub fn disable_timer(&mut self) {
@@ -199,14 +302,21 @@ impl LocalApic {
 
     pub fn set_timer_mode(&mut self, mode: TimerMode) {
         unsafe { self.inner.set_timer_mode(mode) }
+        self.snapshot();
     }
 
     pub fn set_timer_divide(&mut self, divide: TimerDivide) {
         unsafe { self.inner.set_timer_divide(divide) }
+        self.snapshot();
     }
 
+    /// The timer's initial count. Written straight to the register: the
+    /// inner object keeps its own copy only for `enable()`, which has run by
+    /// now. Every tick comes through here, so it is also where the slot is
+    /// checked.
     pub fn set_timer_initial(&mut self, initial: u32) {
-        unsafe { self.inner.set_timer_initial(initial) }
+        self.check_slot();
+        unsafe { write_reg(REG_TICR, initial) }
     }
 
     /// The timer's current count (TMCCT): how far the countdown loaded by
