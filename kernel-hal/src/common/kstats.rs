@@ -637,10 +637,35 @@ pub fn note_timer_rearm() {
 // between configurations matters here, and converting would need the very clock
 // this avoids.
 static HEAP_PROF: AtomicBool = AtomicBool::new(false);
-static HEAP_ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
-static HEAP_ALLOC_CYCLES: AtomicU64 = AtomicU64::new(0);
-static HEAP_DEALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
-static HEAP_DEALLOC_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+/// One CPU's heap counters: allocs, alloc cycles, frees, free cycles.
+///
+/// Per CPU, one cache line each. These are bumped on every heap `alloc` and
+/// `dealloc` on every CPU, and as four shared statics they sat on one line that
+/// every allocating CPU had to pull from the last one -- a contended RMW on the
+/// path the per-CPU front cache exists to keep local. Readers sum the rows; the
+/// totals are exact.
+#[repr(align(64))]
+struct HeapRow([AtomicU64; 4]);
+
+const ALLOCS: usize = 0;
+const ALLOC_CYCLES: usize = 1;
+const FREES: usize = 2;
+const FREE_CYCLES: usize = 3;
+
+static HEAP_ROWS: [HeapRow; crate::cpu_topology::PERCPU_SLOTS] =
+    [const { HeapRow([const { AtomicU64::new(0) }; 4]) }; crate::cpu_topology::PERCPU_SLOTS];
+
+#[inline(always)]
+fn heap_row() -> &'static HeapRow {
+    &HEAP_ROWS[crate::cpu_topology::percpu_slot(crate::cpu::cpu_id() as usize)]
+}
+
+fn heap_sum(i: usize) -> u64 {
+    HEAP_ROWS
+        .iter()
+        .fold(0u64, |acc, r| acc.wrapping_add(r.0[i].load(Relaxed)))
+}
 
 /// Enable heap profiling (`HEAPPROF=1` on the kernel command line).
 pub fn set_heap_prof(on: bool) {
@@ -656,31 +681,31 @@ pub fn heap_prof_enabled() -> bool {
 
 /// Account one allocation taking `cycles` (0 when profiling is off).
 ///
-/// The *count* is kept unconditionally — one relaxed add, alongside the two the
-/// allocator already does — because it is what attributes allocations to a
-/// caller: sampling it around a region of code gives that region's allocation
-/// count without any per-caller plumbing. The cycle total is only meaningful
-/// with `HEAPPROF=1`.
+/// The *count* is kept unconditionally — one relaxed add on this CPU's own
+/// line — because it is what attributes allocations to a caller: sampling it
+/// around a region of code gives that region's allocation count without any
+/// per-caller plumbing. The cycle total is only meaningful with `HEAPPROF=1`.
 #[inline(always)]
 pub fn note_heap_alloc(cycles: u64) {
-    HEAP_ALLOC_CALLS.fetch_add(1, Relaxed);
+    let row = heap_row();
+    row.0[ALLOCS].fetch_add(1, Relaxed);
     if cycles != 0 {
-        HEAP_ALLOC_CYCLES.fetch_add(cycles, Relaxed);
+        row.0[ALLOC_CYCLES].fetch_add(cycles, Relaxed);
     }
 }
 
 /// Allocations performed since boot. Sample around a region to count its own.
-#[inline(always)]
 pub fn heap_alloc_calls() -> u64 {
-    HEAP_ALLOC_CALLS.load(Relaxed)
+    heap_sum(ALLOCS)
 }
 
 /// Account one deallocation taking `cycles`.
 #[inline(always)]
 pub fn note_heap_dealloc(cycles: u64) {
-    HEAP_DEALLOC_CALLS.fetch_add(1, Relaxed);
+    let row = heap_row();
+    row.0[FREES].fetch_add(1, Relaxed);
     if cycles != 0 {
-        HEAP_DEALLOC_CYCLES.fetch_add(cycles, Relaxed);
+        row.0[FREE_CYCLES].fetch_add(cycles, Relaxed);
     }
 }
 
@@ -690,10 +715,10 @@ pub fn note_heap_dealloc(cycles: u64) {
 /// while `alloc` stays flat, is the free-list scan.
 pub fn heap_prof_stats() -> (u64, u64, u64, u64) {
     (
-        HEAP_ALLOC_CALLS.load(Relaxed),
-        HEAP_ALLOC_CYCLES.load(Relaxed),
-        HEAP_DEALLOC_CALLS.load(Relaxed),
-        HEAP_DEALLOC_CYCLES.load(Relaxed),
+        heap_sum(ALLOCS),
+        heap_sum(ALLOC_CYCLES),
+        heap_sum(FREES),
+        heap_sum(FREE_CYCLES),
     )
 }
 
