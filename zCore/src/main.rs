@@ -1694,27 +1694,6 @@ fn log_scanout_liveness(phase: &str) {
     }
 }
 
-#[cfg(feature = "linux")]
-fn console_notice(msg: &str) {
-    use kernel_hal::console::{active_vt, serial_vt, vt_console_write_str};
-    klog_info!("{}", msg);
-    // Both the VT on the monitor and the serial-bound one: with a compositor
-    // holding the graphics VT those are different terminals, and the notice
-    // has to reach whichever one the operator is actually looking at.
-    let active = active_vt();
-    let serial = serial_vt();
-    let both = [active, serial];
-    let vts = if active == serial {
-        &both[..1]
-    } else {
-        &both[..]
-    };
-    for vt in vts {
-        vt_console_write_str(*vt, msg);
-        vt_console_write_str(*vt, "\r\n");
-    }
-}
-
 /// After the progress bar hits 100% and labwc can start: wait for KD_GRAPHICS,
 /// pause scanout (so BAR1 is quiet), run console-GPU gpustep14 once, then
 /// resume. Never blocks boot, and never runs on the boot progress path — a
@@ -1873,34 +1852,11 @@ fn schedule_deferred_console_bringup(
             );
         }
 
-        // Say it on the screen, before the screen stops moving. The pause
-        // below freezes scanout for as long as a cold GSP boot plus a
-        // state-load takes -- tens of seconds -- and the last thing the
-        // console shows while it runs is the RM's own narration stopping at
-        // `STARTCPU: ... about to post store`. On a real dual-2060 box that
-        // read, correctly, as a dead machine: a still screen and a log that
-        // ends mid-sequence is exactly what a wedge looks like. It was a
-        // 46-second wait that finished with both cards up. This notice and
-        // the one after the pause are what tell those two apart, so they go
-        // straight to the VT and to dmesg instead of through `log::`, which
-        // `LOG=error` -- the level every image boots at -- would swallow.
-        //
-        // And paint the kernel console over the compositor's VT while this
-        // runs.
-        // Without that a desktop box shows the notices to nobody: KD_GRAPHICS
-        // suppresses presentation, which is right while labwc is drawing and
-        // wrong for the one stretch where labwc is deliberately NOT drawing.
-        // Restored to whatever `console.overgraphics` left it at.
+        // Paint the kernel console over the compositor's VT while scanout is
+        // paused (KD_GRAPHICS would otherwise suppress presentation). Restored
+        // to whatever `console.overgraphics` left it at when the window closes.
         let over_graphics_was = kernel_hal::console::diag_present_over_graphics();
         kernel_hal::console::set_diag_present_over_graphics(true);
-        console_notice(&alloc::format!(
-            "[gpu-consola] subiendo la GPU de consola ({}): el GSP arranca en frio y \
-             la pantalla se queda QUIETA hasta {} s. No es un cuelgue. \
-             Para no hacerlo: nvidia.noconsole_gpu en la cmdline.",
-            reason,
-            linux_object::fs::devfs::drm::SCANOUT_PAUSE_MAX.as_secs(),
-        ));
-        let paused_at = timer_now();
 
         // Watchdogged: `bringup_step14` drives the SEC2 STARTCPU path, which is
         // the one known way this hardware wedges, and a latched pause freezes
@@ -1909,14 +1865,10 @@ fn schedule_deferred_console_bringup(
         linux_object::fs::devfs::drm::set_scanout_paused_for(
             linux_object::fs::devfs::drm::SCANOUT_PAUSE_MAX,
         );
-        // And the kernel console with it: the notice above is the last thing
-        // drawn until the window closes. The state load inside rebinds the
-        // console card's BAR1, which is its framebuffer, and a console present
-        // landing in the bind left BAR1 faulted for the rest of the boot (every
-        // channel on that card dead, nvkms's LUT unreadable). The RM's
-        // narration still goes to dmesg; the screen was going to stand still
-        // anyway. Pushed out first: a notice that fell inside the console's
-        // present throttle is still pending, and a hold drops pending presents.
+        // Hold console presents across the window: the state load rebinds the
+        // console card's BAR1 (its framebuffer), and a present landing in that
+        // bind left BAR1 faulted for the rest of the boot. Flush pending work
+        // first; a hold drops presents still in the throttle.
         kernel_hal::console::redraw_active_console();
         kernel_hal::console::hold_presents_for(linux_object::fs::devfs::drm::SCANOUT_PAUSE_MAX);
         // Brief settle so in-flight blits/CE finish before SEC2.
@@ -1955,14 +1907,6 @@ fn schedule_deferred_console_bringup(
         kernel_hal::console::release_presents();
         linux_object::fs::devfs::drm::set_scanout_paused(false);
 
-        // The other half of the pair above: the screen moves again, and this
-        // says how long it did not.
-        let held = timer_now().saturating_sub(paused_at);
-        console_notice(&alloc::format!(
-            "[gpu-consola] bring-up terminado en {}.{:03} s; el scanout vuelve",
-            held.as_secs(),
-            held.subsec_millis(),
-        ));
         kernel_hal::console::set_diag_present_over_graphics(over_graphics_was);
         // No-op on a VT a compositor owns: the panel already got its frame
         // back inside `set_scanout_paused(false)`, and painting the text
