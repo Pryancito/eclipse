@@ -2386,6 +2386,26 @@ const MSC_PROTO_BULK_ONLY: u8 = 0x50;
 const MSC_SUBCLASS_SCSI: u8 = 0x06;
 /// `GET_MAX_LUN`, peticion de clase a la interfaz (USB MSC BOT §3.2).
 const MSC_REQ_GET_MAX_LUN: u8 = 0xfe;
+/// `Bulk-Only Mass Storage Reset`, peticion de clase a la interfaz (BOT §3.1).
+///
+/// Es la primera mitad de la recuperacion del transporte; la otra son los dos
+/// `CLEAR_FEATURE(ENDPOINT_HALT)`. Ver [`XhciInner::msc_reset_recovery`].
+const MSC_REQ_RESET: u8 = 0xff;
+/// Veces que se pide el CSW antes de dar la orden por perdida.
+///
+/// Dos, que es lo que hace Linux en `usb_stor_Bulk_transport`: hay unidades
+/// que paran el endpoint o entregan un CSW de longitud cero y contestan bien
+/// al segundo intento.
+const MSC_CSW_ATTEMPTS: u8 = 2;
+/// `bCSWStatus` = 2: error de fase. No es «la orden fallo», es «el transporte
+/// se ha ido de sincronia y hay que resetearlo» (BOT §6.7.3).
+const BOT_CSW_PHASE_ERROR: u8 = 2;
+/// Veces que se repite una orden de lectura o escritura que la unidad rechazo
+/// con un sentido de los que significan «vuelve a preguntar».
+///
+/// Una basta: la condicion que los produce (UNIT ATTENTION, «arrancando») la
+/// limpia el propio REQUEST SENSE de la vuelta anterior.
+const MSC_RW_SENSE_RETRIES: u8 = 1;
 
 const BOT_CBW_LEN: usize = 31;
 const BOT_CSW_LEN: usize = 13;
@@ -2530,6 +2550,50 @@ fn bot_parse_csw(raw: &[u8], want_tag: u32) -> Option<BotCsw> {
         residue: u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
         status,
     })
+}
+
+/// `(clave de sentido, ASC, ASCQ)` de unos datos de sentido de formato fijo
+/// (SPC-4 §4.5.3).
+///
+/// `None` cuando no son de formato fijo: el formato descriptor (codigos de
+/// respuesta 0x72 y 0x73) pone la clave y el ASC en otro sitio, y leerlos ahi
+/// como si fueran fijos da una clave inventada. Mejor no opinar que opinar
+/// mal: quien llama trata el `None` como «no se sabe».
+fn scsi_fixed_sense(raw: &[u8]) -> Option<(u8, u8, u8)> {
+    // El ASC y el ASCQ viven en los bytes 12 y 13, asi que menos de catorce
+    // bytes no llevan lo que hace falta aunque la cabecera sea valida.
+    if raw.len() < 14 {
+        return None;
+    }
+    // Bit 7 es `VALID` y no forma parte del codigo de respuesta.
+    if !matches!(raw[0] & 0x7f, 0x70 | 0x71) {
+        return None;
+    }
+    Some((raw[2] & 0x0f, raw[12], raw[13]))
+}
+
+/// Si una orden rechazada merece repetirse, por lo que dice su sentido.
+///
+/// Las dos primeras son el caso NORMAL de un pendrive recien enchufado, no un
+/// disco roto:
+///
+/// - `UNIT ATTENTION` (clave 6) es lo que contesta a la primera orden tras un
+///   enchufe o un reset del transporte: la condicion se declara una vez, la
+///   orden que se la encuentra se descarta y la siguiente ya va. Linux la
+///   reintenta en la capa SCSI (`scsi_check_sense` devuelve `NEEDS_RETRY`);
+///   aqui no hay capa SCSI, asi que se reintenta en el driver.
+/// - `NOT READY` con ASC 04/01 es literalmente «estoy arrancando, pregunta
+///   otra vez».
+/// - Clave 0 (`NO SENSE`) con un CSW que dijo que la orden fallo es una unidad
+///   que no cuenta por que; una vuelta mas es mas barata que un EIO.
+///
+/// Todo lo demas --medio ausente, error de medio, orden ilegal, proteccion de
+/// escritura-- es un fallo de verdad y repetirlo solo retrasa el error.
+fn msc_sense_is_retryable(raw: &[u8]) -> bool {
+    matches!(
+        scsi_fixed_sense(raw),
+        Some((6, _, _)) | Some((2, 0x04, 0x01)) | Some((0, _, _))
+    )
 }
 
 /// Lo que un INQUIRY cuenta del dispositivo.
@@ -4583,25 +4647,120 @@ impl XhciInner {
             }
         }
 
-        wrap.flush(0, 64);
-        if self
-            .bulk_transfer(slot, dci_in, wrap.sub_phys(0), BOT_CSW_LEN as u32)
-            .is_err()
-        {
+        // El CSW, y hasta [`MSC_CSW_ATTEMPTS`] intentos de leerlo, que es lo
+        // que hace Linux. `bulk_transfer` ya le quito el halt al endpoint si
+        // el fallo fue un STALL, que es justo lo que hace falta para poder
+        // volver a preguntar; un CSW de longitud cero tambien se repite,
+        // porque los bytes que quedan en el bufer son los del CBW.
+        let mut csw_ok = false;
+        for _ in 0..MSC_CSW_ATTEMPTS {
+            wrap.flush(0, 64);
+            if let Ok(n) = self.bulk_transfer(slot, dci_in, wrap.sub_phys(0), BOT_CSW_LEN as u32) {
+                if n as usize == BOT_CSW_LEN {
+                    csw_ok = true;
+                    break;
+                }
+            }
+        }
+        if !csw_ok {
+            // El bufer no vuelve al asignador: el controlador puede seguir
+            // escribiendo en el. Y la unidad se queda a media orden, asi que
+            // sin resetear el transporte la orden siguiente leeria ESTE CSW,
+            // no casaria el tag, y el fallo seria ya permanente.
             wrap.leak();
+            crate::klog_warn!("[xhci] msc slot={}: CSW no llego (tag {})", slot, tag);
+            self.msc_reset_recovery(idx);
             return Err(DeviceError::IoError);
         }
         wrap.flush(0, 64);
         let mut raw = [0u8; BOT_CSW_LEN];
         wrap.read_into(0, &mut raw);
         let Some(csw) = bot_parse_csw(&raw, tag) else {
-            warn!(
+            crate::klog_warn!(
                 "[xhci] msc slot={} CSW invalido o de otra orden (tag esperado {}): {:?}",
-                slot, tag, raw
+                slot,
+                tag,
+                raw
             );
+            self.msc_reset_recovery(idx);
             return Err(DeviceError::IoError);
         };
+        if csw.status == BOT_CSW_PHASE_ERROR {
+            // Un error de fase NO es «la orden fallo»: es la unidad pidiendo
+            // un reset del transporte. Devolverlo como fallo de la orden
+            // dejaba la unidad desincronizada y toda orden posterior en error.
+            crate::klog_warn!(
+                "[xhci] msc slot={}: error de fase en el CSW; se resetea el transporte",
+                slot
+            );
+            self.msc_reset_recovery(idx);
+            return Err(DeviceError::IoError);
+        }
         Ok((moved, csw.status))
+    }
+
+    /// Recuperacion del transporte, igual que `usb_stor_Bulk_reset` de Linux.
+    ///
+    /// Tres pasos y en este orden (BOT §5.3.4): la peticion de clase 0xFF a la
+    /// interfaz, y despues `CLEAR_FEATURE(ENDPOINT_HALT)` en el endpoint IN y
+    /// en el OUT. Lo que arregla no es un endpoint parado, que ya se desatasca
+    /// solo: es la SINCRONIA. Una orden que se queda sin su CSW deja a la
+    /// unidad con una respuesta pendiente, y la orden siguiente se la encuentra
+    /// --tag que no casa-- y falla, y la de despues igual. Sin esto, el primer
+    /// tropiezo de un pendrive es un «I/O error» que no se va hasta
+    /// desenchufarlo, que es exactamente el sintoma.
+    ///
+    /// No devuelve nada a proposito: lo que haga falta se intenta entero, y un
+    /// paso que falla no es razon para saltarse los de despues. La unidad que
+    /// no contesta la peticion de clase puede tener de todas formas un endpoint
+    /// parado, y dejarlo asi es el mismo cuelgue que no haber hecho nada.
+    fn msc_reset_recovery(&mut self, idx: usize) {
+        let Some((slot, iface, dci_in, dci_out)) = self
+            .mscs
+            .get(idx)
+            .map(|m| (m.slot, m.iface, m.dci_in, m.dci_out))
+        else {
+            return;
+        };
+        // 0x21: del host al dispositivo, de clase, dirigida a la interfaz. Sin
+        // fase de datos, y el estado llega por IN.
+        let _ = self.ep0_control_out0(
+            slot,
+            trb_setup(0x21, MSC_REQ_RESET, 0, iface as u16, 0, 0),
+            true,
+        );
+        for dci in [dci_in, dci_out] {
+            let _ = self.clear_endpoint_halt(slot, dci);
+            let _ = self.reset_endpoint_and_dequeue(slot, dci);
+        }
+    }
+
+    /// `REQUEST SENSE`: por que fallo la orden anterior.
+    ///
+    /// `None` cuando ni eso se pudo preguntar. Pedirlo no es solo diagnostico:
+    /// es lo que LIMPIA la condicion de atencion de la unidad, y sin eso hay
+    /// unidades que repiten el mismo fallo para siempre.
+    fn msc_request_sense(&mut self, idx: usize) -> Option<[u8; 18]> {
+        let buf = DmaBuf::new(64, 64).ok()?;
+        buf.flush(0, 64);
+        match self.msc_command(
+            idx,
+            &[SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0],
+            Some((&buf, 18, true)),
+        ) {
+            Ok((_, 0)) => {
+                buf.flush(0, 64);
+                let mut raw = [0u8; 18];
+                buf.read_into(0, &mut raw);
+                Some(raw)
+            }
+            Ok(_) => None,
+            Err(_) => {
+                // Mismo criterio que el resto de la DMA de este driver.
+                buf.leak();
+                None
+            }
+        }
     }
 
     /// Una tanda de READ(10) o WRITE(10) sobre la unidad `disk_id`, partida en
@@ -4630,6 +4789,18 @@ impl XhciInner {
         }
         let len = data.len();
         if len == 0 || !len.is_multiple_of(bs) {
+            // Una peticion que no cae en bloques enteros no se puede mandar, y
+            // el EINVAL que sale de aqui llega al usuario como «I/O error» en
+            // cuanto pasa por un sistema de archivos montado (el `Device` de
+            // `rcore-fs` solo tiene un error). Sin esta linea el rechazo es
+            // invisible y no hay forma de distinguirlo de un fallo del
+            // transporte, que es el otro camino al mismo mensaje.
+            crate::klog_warn!(
+                "[xhci] disco slot={}: peticion de {} B no cabe en bloques de {}",
+                slot,
+                len,
+                bs
+            );
             return Err(DeviceError::InvalidParam);
         }
         let total = len / bs;
@@ -4641,6 +4812,15 @@ impl XhciInner {
             .checked_add(total as u64)
             .is_none_or(|end| end > dev_blocks)
         {
+            // Mismo motivo que arriba: se ve como un error de E/S y hay que
+            // poder leer en el log que lo que paso fue pedir fuera del disco.
+            crate::klog_warn!(
+                "[xhci] disco slot={}: se piden {} bloques desde {} y la unidad tiene {}",
+                slot,
+                total,
+                first_block,
+                dev_blocks
+            );
             return Err(DeviceError::InvalidParam);
         }
 
@@ -4671,32 +4851,68 @@ impl XhciInner {
                 self.return_bounce(idx, bounce);
                 return Err(DeviceError::InvalidParam);
             };
-            match self.msc_command(idx, &cdb, Some((&bounce, bytes as u32, !write))) {
-                Ok((moved, 0)) if moved as usize == bytes => {}
-                Ok((moved, status)) => {
-                    // La orden llego y la unidad no la hizo, o la hizo a
-                    // medias. Un `Ok` aqui dejaria datos sin escribir, o un
-                    // bufer medio lleno de ceros creyendose un sector leido.
-                    warn!(
-                        "[xhci] disco slot={} {} lba={} bloques={}: CSW status={} movidos={}/{}",
-                        slot,
-                        if write { "WRITE" } else { "READ" },
-                        first_block + done as u64,
-                        turn,
-                        status,
-                        moved,
-                        bytes
-                    );
-                    self.return_bounce(idx, bounce);
-                    return Err(DeviceError::IoError);
-                }
-                Err(e) => {
-                    // El transporte fallo: el controlador puede seguir
-                    // escribiendo en el bufer de rebote, asi que ese bufer no
-                    // vuelve ni a la unidad ni al asignador. Mismo criterio que
-                    // el resto de la DMA de este driver.
-                    bounce.leak();
-                    return Err(e);
+            // La vuelta, con los reintentos que admite el sentido. Un pendrive
+            // recien enchufado rechaza su primera orden con UNIT ATTENTION
+            // --condicion que se declara una vez y se limpia al preguntarla--
+            // y eso llegaba al sistema de archivos como un error de E/S: el
+            // «I/O error» al montar nacia aqui, con la unidad perfectamente
+            // sana.
+            let mut sense_retries = 0u8;
+            loop {
+                match self.msc_command(idx, &cdb, Some((&bounce, bytes as u32, !write))) {
+                    Ok((moved, 0)) if moved as usize == bytes => break,
+                    Ok((moved, status)) => {
+                        // La orden llego y la unidad no la hizo, o la hizo a
+                        // medias. Un `Ok` aqui dejaria datos sin escribir, o un
+                        // bufer medio lleno de ceros creyendose un sector leido.
+                        let sense = if status == 0 {
+                            // Movio menos de lo pedido diciendo que todo fue
+                            // bien: eso no lo explica ningun sentido.
+                            None
+                        } else {
+                            self.msc_request_sense(idx)
+                        };
+                        if sense.as_ref().is_some_and(|s| msc_sense_is_retryable(s))
+                            && sense_retries < MSC_RW_SENSE_RETRIES
+                        {
+                            sense_retries += 1;
+                            continue;
+                        }
+                        let (key, asc, ascq) = sense
+                            .as_ref()
+                            .and_then(|s| scsi_fixed_sense(s))
+                            .unwrap_or((0xff, 0xff, 0xff));
+                        // Por `klog_*` y no por `log::`: este es el diagnostico
+                        // que explica un EIO que el usuario ya esta viendo, y
+                        // tiene que llegar a la consola pase lo que pase con el
+                        // nivel de log.
+                        crate::klog_warn!(
+                            "[xhci] disco slot={} {} lba={} bloques={}: CSW status={} \
+                             movidos={}/{} sentido={:#04x}/{:#04x}/{:#04x}",
+                            slot,
+                            if write { "WRITE" } else { "READ" },
+                            first_block + done as u64,
+                            turn,
+                            status,
+                            moved,
+                            bytes,
+                            key,
+                            asc,
+                            ascq
+                        );
+                        self.return_bounce(idx, bounce);
+                        return Err(DeviceError::IoError);
+                    }
+                    Err(e) => {
+                        // El transporte fallo: el controlador puede seguir
+                        // escribiendo en el bufer de rebote, asi que ese bufer no
+                        // vuelve ni a la unidad ni al asignador. Mismo criterio que
+                        // el resto de la DMA de este driver. `msc_command` ya ha
+                        // reseteado el transporte, asi que la unidad queda usable
+                        // para la peticion siguiente.
+                        bounce.leak();
+                        return Err(e);
+                    }
                 }
             }
             if let MscData::Read(dst) = &mut data {
@@ -4854,14 +5070,7 @@ impl XhciInner {
                     // La unidad contesta «no lista» mientras arranca. Pedirle
                     // el sentido es lo que limpia su condicion de atencion; sin
                     // eso, algunas repiten el mismo fallo para siempre.
-                    let sense = DmaBuf::new(64, 64).ok();
-                    if let Some(sb) = sense {
-                        let _ = self.msc_command(
-                            idx,
-                            &[SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0],
-                            Some((&sb, 18, true)),
-                        );
-                    }
+                    let _ = self.msc_request_sense(idx);
                     if attempt + 1 == MSC_READY_ATTEMPTS {
                         warn!(
                             "[xhci] msc slot={}: no lista tras {} intentos (CSW status {})",
@@ -7521,6 +7730,11 @@ mod hub_tree_tests;
 /// medio de verdad detrás para que una lectura y una escritura se noten.
 #[cfg(test)]
 mod msc_tests;
+
+/// Lo que pasa cuando una orden SCSI NO sale bien: la condición de atención de
+/// un pendrive recién enchufado, el CSW que se para y el reset del transporte.
+#[cfg(test)]
+mod msc_recovery_tests;
 
 /// El enganche con el bus: de un dispositivo PCI al controlador en marcha.
 #[cfg(test)]
