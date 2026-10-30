@@ -8,7 +8,7 @@ use crate::hunter_report::parse_report;
 const NOW: u64 = 1_793_275_200;
 
 const REPORT: &str = "hunter security subsystem v0.1.0\n\
-enforcement: syscall=enforce wx=report exec=enforce anomaly=off integrity=report av=enforce\n\
+enforcement: syscall=enforce wx=report exec=enforce anomaly=off integrity=report av=enforce behavior=report\n\
 events: total=9 blocked=2 warnings=3 reported=2 critical=2 dropped=4 critical_dropped=0\n\
 active syscall policies: 0\n\
 exec allowlist: active (configured=38, learned=1); blacklist=0; learning=on\n\

@@ -332,7 +332,7 @@ the bar as `/bin/lunarhunter`, in the app menu as **Seguridad (hunter)**
 | Tab | What it does |
 |---|---|
 | Resumen | the stance in one line, eight counters, the latest alerts; quick actions: scan home, update signatures, lockdown, **export report** (the week's report as HTML into `$HOME`) |
-| Protección | the six domains with what each guards, the six switches (`learning`, `anomaly-detection`, `privileged-deny`, `require-hash`, `media-scan`, `media-lock`); **save as boot policy** writes the live stance to `/etc/hunter/policy.conf` (old file kept as `policy.conf.bak`), **apply policy.conf**, and **seal** |
+| Protección | the seven domains (`behavior` included) with what each guards, the six switches (`learning`, `anomaly-detection`, `privileged-deny`, `require-hash`, `media-scan`, `media-lock`); **save as boot policy** writes the live stance to `/etc/hunter/policy.conf` (old file kept as `policy.conf.bak`), **apply policy.conf**, and **seal** |
 | Eventos | the whole event ring with time, pid, severity and category, filtered by all / alerts / critical |
 | Escaneo | presets (home, `/tmp`, programs, `/`, or `--scan PATH...`), a live count with a stop button, per-finding or all-at-once quarantine, or automatic quarantine as it goes |
 | Cuarentena | `/var/lib/hunter/quarantine/index`, each row restorable (two clicks) |
@@ -365,7 +365,7 @@ in the desktop's language, for the last 7 days by default:
 - **recommendations**, each naming the `hunterctl` command that acts on it:
   domains off or only reporting, stale or missing signatures, learning still
   on, an overflowed event ring, no pins or `require-hash off`, no seal;
-- the six modes and the switches; where the alerts come from (by category
+- the seven modes and the switches; where the alerts come from (by category
   and by file/program); every alert with its date, pid and text; the
   quarantine of the period; the signature files and feeds; the learned
   programs; and the whole event log, folded.

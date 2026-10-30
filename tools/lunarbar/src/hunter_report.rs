@@ -2,7 +2,7 @@
 //! quarantine index, the signature feeds and the signature files on disk.
 //!
 //! `lunarbar::hunter` reads the report down to what fits in the bar's menu
-//! (six modes, three counters, the four newest alerts). The full window needs
+//! (seven modes, three counters, the four newest alerts). The full window needs
 //! the rest of it — every counter, the heuristics switches, the learned
 //! programs, every event in the ring with its time and pid — and the files
 //! `hunterctl` keeps beside the kernel. This is that half, still pure (text
@@ -319,7 +319,7 @@ pub fn count_pins(text: &str) -> usize {
         .count()
 }
 
-/// The script that reproduces the stance the report shows: the six modes,
+/// The script that reproduces the stance the report shows: the seven modes,
 /// learning, the two heuristics, require-hash, the two media switches, and
 /// the seal when it is on.
 ///
@@ -435,7 +435,7 @@ mod tests {
     use super::*;
 
     const REPORT: &str = "hunter security subsystem v0.1.0\n\
-enforcement: syscall=enforce wx=report exec=report anomaly=off integrity=report av=enforce\n\
+enforcement: syscall=enforce wx=report exec=report anomaly=off integrity=report av=enforce behavior=enforce\n\
 events: total=12 blocked=3 warnings=5 reported=4 critical=2 dropped=1 critical_dropped=0\n\
 active syscall policies: 2\n\
 exec allowlist: active (configured=4, learned=2); blacklist=1; learning=on\n\
@@ -539,7 +539,9 @@ recent events (oldest first):\n\
         let mut r = parse_report(REPORT).unwrap();
         let s = policy_script(&r);
         assert!(s.starts_with("mode syscall enforce\nmode wx report\n"));
-        assert!(s.contains("mode av enforce\nlearning on\nanomaly-detection on\n"));
+        // The behavior domain too: without its line, a saved policy reset
+        // ransomware/injection protection to the default at the next boot.
+        assert!(s.contains("mode av enforce\nmode behavior enforce\nlearning on\nanomaly-detection on\n"));
         assert!(s.contains("privileged-deny off\nrequire-hash on\nmedia-scan on\nmedia-lock off\n"));
         // A kernel without the media table would reject the whole file.
         let mut old = r.clone();

@@ -1,13 +1,13 @@
 //! lunarhunter — the window for hunter, Eclipse OS's in-kernel security
 //! subsystem.
 //!
-//! The bar's shield menu (`hunter_menu.rs`) is a glance: six modes, three
+//! The bar's shield menu (`hunter_menu.rs`) is a glance: seven modes, three
 //! counters, four alerts and four buttons, three of which open a terminal.
 //! This is the rest of it, as an application the menu opens:
 //!
 //! - **Resumen** — the stance in one sentence, every counter, the newest
 //!   alerts, the quick actions (scan home, update signatures, lockdown) and the USB sticks and disks mounted now, with their scan.
-//! - **Protección** — the six domains with what each one guards, the six
+//! - **Protección** — the seven domains with what each one guards, the six
 //!   switches (learning, anomaly-detection, privileged-deny, require-hash,
 //!   media-scan, media-lock),
 //!   saving the live stance as the boot policy, applying `policy.conf`, and
@@ -1911,9 +1911,13 @@ fn domain_help(lang: Lang, d: usize) -> &'static str {
             "SHA-256 de los programas fijados",
             "SHA-256 of pinned programs",
         ),
-        _ => (
+        5 => (
             "antivirus por firmas al ejecutar",
             "signature antivirus at exec",
+        ),
+        _ => (
+            "ransomware e inyección en procesos",
+            "ransomware and process injection",
         ),
     };
     tr(lang, es, en)
@@ -3144,7 +3148,7 @@ const FW_SAMPLE: &str = "mode report\ntimeout 30\nnow 640\n\
     pending out 3 142 610 636 93.184.216.34:443 /usr/bin/wget\n";
 
 const SAMPLE: &str = "hunter security subsystem v0.1.0\n\
-enforcement: syscall=enforce wx=report exec=enforce anomaly=report integrity=report av=enforce\n\
+enforcement: syscall=enforce wx=report exec=enforce anomaly=report integrity=report av=enforce behavior=report\n\
 events: total=214 blocked=6 warnings=11 reported=5 critical=2 dropped=0 critical_dropped=0\n\
 active syscall policies: 0\n\
 exec allowlist: active (configured=38, learned=3); blacklist=2; learning=on\n\
