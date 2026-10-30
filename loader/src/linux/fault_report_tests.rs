@@ -530,3 +530,49 @@ fn a_stack_pointer_nobody_mapped_yields_no_trace() {
         "nor from a null one"
     );
 }
+
+// ---- and what the report calls the si_code ------------------------------
+
+/// `si_code` is scoped to its signal: the value 1 is four different causes
+/// depending on which signal carries it. A report that prints the number
+/// names none of them, and the two SIGSEGV causes are two different bugs —
+/// "nothing is mapped there" against "something is, but not for this
+/// access".
+#[test]
+fn a_fault_code_is_named_by_the_signal_that_carries_it() {
+    use linux_object::signal::{Signal, SignalCode};
+
+    assert_eq!(
+        super::fault_code_name(Signal::SIGSEGV, SignalCode::SEGV_MAPERR),
+        "SEGV_MAPERR"
+    );
+    assert_eq!(
+        super::fault_code_name(Signal::SIGSEGV, SignalCode::SEGV_ACCERR),
+        "SEGV_ACCERR"
+    );
+    // The same NUMBER under another signal is another cause entirely.
+    assert_eq!(SignalCode::SEGV_MAPERR, SignalCode::BUS_ADRALN);
+    assert_eq!(
+        super::fault_code_name(Signal::SIGBUS, SignalCode::BUS_ADRALN),
+        "BUS_ADRALN"
+    );
+    assert_eq!(
+        super::fault_code_name(Signal::SIGILL, SignalCode::ILL_ILLOPC),
+        "ILL_ILLOPC"
+    );
+    assert_eq!(
+        super::fault_code_name(Signal::SIGFPE, SignalCode::FPE_INTDIV),
+        "FPE_INTDIV"
+    );
+    // `SI_KERNEL` is not scoped to a signal: a #GP and the rest arrive with
+    // it whatever signal they become.
+    assert_eq!(
+        super::fault_code_name(Signal::SIGSEGV, SignalCode::KERNEL),
+        "SI_KERNEL"
+    );
+    // And a code this kernel does not send is still printed, not guessed at.
+    assert_eq!(
+        super::fault_code_name(Signal::SIGSEGV, SignalCode(9)),
+        "si_code"
+    );
+}

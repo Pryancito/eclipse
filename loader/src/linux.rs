@@ -1245,6 +1245,27 @@ fn fault_kills(thread: &CurrentThread, signal: Signal) -> bool {
     fault_signal_kills(&thread.inner().lock_linux(), signal, action.handler)
 }
 
+/// The `si_code` of a fault signal, by name.
+///
+/// The number alone says nothing: `si_code` is scoped to its signal, and the
+/// value 1 is `SEGV_MAPERR`, `BUS_ADRALN`, `ILL_ILLOPC` and `FPE_INTDIV` at
+/// once. In a death report, "nothing was mapped there" and "something was,
+/// but not for this access" are two different bugs, and `SignalCode(1)` is
+/// neither of them.
+fn fault_code_name(signal: Signal, code: SignalCode) -> &'static str {
+    if code == SignalCode::KERNEL {
+        return "SI_KERNEL";
+    }
+    match (signal, code) {
+        (Signal::SIGSEGV, SignalCode::SEGV_MAPERR) => "SEGV_MAPERR",
+        (Signal::SIGSEGV, SignalCode::SEGV_ACCERR) => "SEGV_ACCERR",
+        (Signal::SIGBUS, SignalCode::BUS_ADRALN) => "BUS_ADRALN",
+        (Signal::SIGILL, SignalCode::ILL_ILLOPC) => "ILL_ILLOPC",
+        (Signal::SIGFPE, SignalCode::FPE_INTDIV) => "FPE_INTDIV",
+        _ => "si_code",
+    }
+}
+
 fn force_fault_signal(thread: &CurrentThread, signal: Signal, info: SigInfo) {
     let action = thread.proc().linux().signal_action(signal);
     let inner = thread.inner();
@@ -1262,12 +1283,35 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal, info: SigInfo) {
         //
         // The process name goes in too, as it does above: a bare pid says
         // nothing when the question is *which* program just died.
+        // ... and it says WHERE. This line used to carry only the signal,
+        // on the understanding that its caller had already printed the fault
+        // report with the address, the pc and the code bytes. That holds for
+        // the two callers that can get here -- the page fault and the CPU
+        // exception -- but not for the person reading the log: a `dmesg |
+        // tail` wide enough to catch this line need not be wide enough to
+        // catch the report, and then the only evidence of a death is a line
+        // that names a signal and nothing else. That is how a round of
+        // chasing `claude-desktop`'s segfault came back with "killed by
+        // SIGSEGV" and no address. The pc, the faulting address and the
+        // `si_code` are all in hand right here; a report that needs a second
+        // line to be worth anything is a report that will be read without it.
+        let pc = thread
+            .with_context(|ctx| ctx.get_field(UserContextField::InstrPointer))
+            .unwrap_or(0);
+        let vmar = thread.proc().vmar();
+        let addr = info.fault_addr();
         error!(
-            "[exit] pid={} ({}) killed by fault signal {:?} ({}) — undeliverable, terminating",
+            "[exit] pid={} ({}) killed by fault signal {:?} ({}) at pc={:#x} [{}], \
+             addr={:#x} [{}], {} — undeliverable, terminating",
             thread.proc().id(),
             thread.proc().name(),
             signal,
             signal as i32,
+            pc,
+            describe_addr(&vmar, pc),
+            addr,
+            describe_addr(&vmar, addr),
+            fault_code_name(signal, info.code),
         );
         let exit_code = undeliverable_fault_exit_code(signal);
         thread.proc().exit(exit_code);
