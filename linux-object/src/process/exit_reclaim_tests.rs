@@ -59,10 +59,7 @@ fn an_exited_process_lets_go_of_every_page_it_wrote() {
     let process = Arc::downgrade(&proc);
     proc.exit(0);
     drop(proc);
-    assert!(
-        gone(&process),
-        "the process itself outlived its exit"
-    );
+    assert!(gone(&process), "the process itself outlived its exit");
     assert!(
         gone(&vmo),
         "its memory outlived it: the frames behind {} written pages were never freed",
@@ -89,8 +86,5 @@ fn a_forked_child_and_its_parent_both_let_go_when_they_exit() {
     drop(parent);
     assert!(gone(&p), "the parent outlived its exit");
     assert!(gone(&c), "the child outlived its exit");
-    assert!(
-        gone(&vmo),
-        "the pages the two of them wrote outlived both"
-    );
+    assert!(gone(&vmo), "the pages the two of them wrote outlived both");
 }
