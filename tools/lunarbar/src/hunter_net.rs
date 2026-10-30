@@ -124,9 +124,18 @@ impl NetTable {
 /// The `hunterctl forget-port` arguments for a rule line.
 pub fn forget_args(rule: &str) -> Option<Vec<String>> {
     let rest = rule.strip_prefix("expect ")?;
-    let mut args = vec!["forget-port".to_string()];
-    args.extend(rest.split_whitespace().map(str::to_string));
-    (3..=4).contains(&args.len()).then_some(args)
+    // Protocol, port, and the program as one argument whatever spaces it
+    // has: the kernel reads the rest of the line as the program too.
+    let mut w = rest.splitn(3, ' ').filter(|s| !s.is_empty());
+    let mut args = vec![
+        "forget-port".to_string(),
+        w.next()?.to_string(),
+        w.next()?.to_string(),
+    ];
+    if let Some(p) = w.next() {
+        args.push(p.trim().to_string());
+    }
+    Some(args)
 }
 
 /// Parse the kernel's table. `None` when it is not one (no such file, or a
@@ -244,6 +253,11 @@ sock 3 udp UNCONN 0.0.0.0:68 - listen /sbin/edhcpc\n";
             ["forget-port", "tcp", "22", "/usr/sbin/sshd"]
         );
         assert_eq!(forget_args("expect any 6000-6010").unwrap().len(), 3);
+        assert_eq!(
+            forget_args("expect tcp 443 /opt/My App/bin/app").unwrap(),
+            ["forget-port", "tcp", "443", "/opt/My App/bin/app"]
+        );
+        assert_eq!(forget_args("expect tcp"), None);
         assert_eq!(forget_args("alerts on"), None);
     }
 
