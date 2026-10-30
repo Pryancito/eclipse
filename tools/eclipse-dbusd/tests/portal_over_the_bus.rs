@@ -62,6 +62,13 @@ fn until<F: FnMut() -> bool>(que: &str, mut cond: F) {
 /// Start a bus and a portal whose chooser is `guion` (shell, with `$OUT` as the
 /// answer file it was told to write and `$@` its arguments).
 fn start(guion: &str) -> World {
+    start_with_env(guion, &[])
+}
+
+/// The same, with `env` added to the portal's own environment. The chooser
+/// writes its environment to `$dir/env` either way, which is how a test sees
+/// what the dialog was actually started with.
+fn start_with_env(guion: &str, env: &[(String, String)]) -> World {
     let dir = format!("/tmp/{}", unique("eclipse-portal-e2e"));
     std::fs::create_dir_all(&dir).expect("mkdir");
     let sock = format!("{dir}/bus");
@@ -75,14 +82,15 @@ fn start(guion: &str) -> World {
         std::os::unix::net::UnixStream::connect(&sock).is_ok()
     });
 
-    // The stand-in chooser. It records its own argv and then does whatever the
-    // test asked, so one script covers both halves: what the portal passed in,
-    // and what comes back out.
+    // The stand-in chooser. It records its own argv and its environment, and
+    // then does whatever the test asked, so one script covers every half: what
+    // the portal passed in, what session it was started in, and what comes
+    // back out.
     let picker = format!("{dir}/chooser");
     let mut f = std::fs::File::create(&picker).expect("crear el guion");
     writeln!(
         f,
-        "#!/bin/sh\nOUT=\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = --out ]; then OUT=$a; fi\n  prev=$a\ndone\nprintf '%s\\n' \"$@\" > {dir}/argv\n{guion}"
+        "#!/bin/sh\nOUT=\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = --out ]; then OUT=$a; fi\n  prev=$a\ndone\nprintf '%s\\n' \"$@\" > {dir}/argv\nenv > {dir}/env\n{guion}"
     )
     .expect("escribir el guion");
     drop(f);
@@ -93,7 +101,11 @@ fn start(guion: &str) -> World {
         .expect("chmod");
 
     let ready = format!("{dir}/listo");
-    let portald = Command::new(env!("CARGO_BIN_EXE_eclipse-portald"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_eclipse-portald"));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let portald = cmd
         .arg(format!("--address=unix:path={sock}"))
         .arg(format!("--picker={picker}"))
         .arg(format!("--answers={dir}/answers"))
@@ -526,4 +538,53 @@ fn the_portal_leaves_when_the_bus_leaves() {
         matches!(portald.try_wait(), Ok(Some(_)))
     });
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The dialog has to be started IN THE SESSION, and the portal is the one
+/// process that cannot take that for granted.
+///
+/// `eclipse-init` gives every service `XDG_RUNTIME_DIR` and deliberately no
+/// `WAYLAND_DISPLAY` (the compositor is what creates the socket, and it may
+/// not have started yet). A chooser launched with that environment is a
+/// Wayland client with no display: `lunarfile` prints one line, exits, writes
+/// no answer -- and an answer with no paths in it is a CANCELLATION, so the
+/// browser's "add files" does nothing at all and says nothing either. That was
+/// the bug. The portal now resolves the socket when the dialog is asked for.
+#[test]
+fn the_chooser_is_started_in_the_session_even_with_none_in_the_environment() {
+    let runtime = format!("/tmp/{}", unique("eclipse-portal-rt"));
+    std::fs::create_dir_all(&runtime).expect("mkdir");
+    // What a running labwc leaves there: the socket and its lock file.
+    std::fs::write(format!("{runtime}/wayland-1"), "").expect("socket");
+    std::fs::write(format!("{runtime}/wayland-1.lock"), "").expect("lock");
+    // The portal starts with NO WAYLAND_DISPLAY, exactly as init starts it.
+    let w = start_with_env(
+        "printf '/tmp/x\\n' > \"$OUT\"",
+        &[
+            ("XDG_RUNTIME_DIR".to_string(), runtime.clone()),
+            ("WAYLAND_DISPLAY".to_string(), String::new()),
+        ],
+    );
+    let mut c = Client::connect(&w.sock).expect("connect");
+    let handle = ask(&mut c, "OpenFile", vec![]);
+    assert_eq!(response(&mut c, &handle).0, RESPONSE_OK);
+    let env = std::fs::read_to_string(format!("{}/env", w.dir)).expect("el entorno del dialogo");
+    let var = |k: &str| -> Option<String> {
+        env.lines()
+            .filter_map(|l| l.split_once('='))
+            .find(|(n, _)| *n == k)
+            .map(|(_, v)| v.to_string())
+    };
+    // The socket that is REALLY there, not the `wayland-0` a client guesses.
+    assert_eq!(
+        var("WAYLAND_DISPLAY").as_deref(),
+        Some("wayland-1"),
+        "{env}"
+    );
+    assert_eq!(
+        var("XDG_RUNTIME_DIR").as_deref(),
+        Some(runtime.as_str()),
+        "{env}"
+    );
+    let _ = std::fs::remove_dir_all(&runtime);
 }
