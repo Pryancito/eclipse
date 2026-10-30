@@ -142,12 +142,79 @@ pub fn walk(
     true
 }
 
+/// The scanners' lock: `/proc/hunter_scan` keeps ONE batch of results, the
+/// last write's, so a scan from this window and a scheduled `hunterctl scan`
+/// at the same time would read each other's verdicts -- a FOUND counted
+/// against the wrong file, or lost. Whoever writes to it holds this
+/// directory meanwhile (`mkdir` is atomic), with its pid inside so one left by
+/// a crash is taken over once that pid is gone. The same protocol as
+/// `hunterctl`'s `scan_lock`, which is the point.
+pub const LOCK: &str = "/run/hunter/scan.lock";
+
+/// How long to wait for the lock: a scan of the whole disk.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The lock, held until dropped.
+pub struct ScanLock(std::path::PathBuf);
+
+impl ScanLock {
+    pub fn take(dir: &std::path::Path) -> std::io::Result<ScanLock> {
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let start = std::time::Instant::now();
+        loop {
+            match std::fs::create_dir(dir) {
+                Ok(()) => {
+                    let _ = std::fs::write(dir.join("pid"), format!("{}\n", std::process::id()));
+                    return Ok(ScanLock(dir.to_path_buf()));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let owner: Option<u32> = std::fs::read_to_string(dir.join("pid"))
+                        .ok()
+                        .and_then(|s| s.trim().parse().ok());
+                    // `kill -0`: is the owner still there?
+                    let alive = match owner {
+                        Some(pid) => {
+                            let r = unsafe { libc::kill(pid as i32, 0) };
+                            r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+                        }
+                        None => true,
+                    };
+                    if !alive {
+                        let _ = std::fs::remove_dir_all(dir);
+                        continue;
+                    }
+                    if start.elapsed() > LOCK_WAIT {
+                        return Err(std::io::Error::other(format!(
+                            "another scan has held {} for 10 minutes (pid {})",
+                            dir.display(),
+                            owner.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl Drop for ScanLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Send one batch to the kernel's scanner and read its verdicts back. ONE
-/// write: the kernel takes each write as one batch.
+/// write: the kernel takes each write as one batch. The lock is held per
+/// batch, so two scanners take turns instead of one waiting for the whole of
+/// the other.
 pub fn kernel_batch(paths: &[String]) -> std::io::Result<String> {
     use std::io::{Read, Write};
     let mut text = paths.join("\n");
     text.push('\n');
+    let _lock = ScanLock::take(std::path::Path::new(LOCK))?;
     {
         let mut f = std::fs::OpenOptions::new().write(true).open(PROC)?;
         let n = f.write(text.as_bytes())?;
@@ -241,6 +308,35 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scan_lock_is_exclusive_and_a_dead_owners_lock_is_taken_over() {
+        let dir = std::env::temp_dir().join(format!("lunarhunter-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("scan.lock");
+        // Left by a process that is gone (no pid is ever that large).
+        std::fs::create_dir(&lock).unwrap();
+        std::fs::write(lock.join("pid"), "4194304\n").unwrap();
+        let held = ScanLock::take(&lock).expect("a dead owner's lock is taken over");
+        assert_eq!(
+            std::fs::read_to_string(lock.join("pid")).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        // Held by us (alive): a second taker waits until we drop it.
+        let l2 = lock.clone();
+        let t = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let _l = ScanLock::take(&l2).unwrap();
+            started.elapsed()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        drop(held);
+        let waited = t.join().unwrap();
+        assert!(waited >= std::time::Duration::from_millis(400), "{waited:?}");
+        assert!(!lock.exists(), "released when dropped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn result_lines_parse_in_all_three_shapes() {

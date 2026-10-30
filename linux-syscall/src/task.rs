@@ -1633,6 +1633,10 @@ impl Syscall<'_> {
             {
                 return Err(LxError::EACCES);
             }
+            // Only now, with every gate's yes in hand, is the program learned
+            // as trusted. Learning used to be a side effect of the first gate,
+            // so a program the appraisal then refused was already trusted.
+            hunter::learn_exec(&target.name);
         }
 
         // POSIX/Linux: execve in a multithreaded process kills every other

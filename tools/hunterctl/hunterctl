@@ -30,7 +30,8 @@
 #   hunterctl boot pin [item...]    pin this boot's measurements (live + /etc/hunter/boot)
 #   hunterctl boot verify           re-hash the kernel's code now (exit 1 if tampered)
 #   hunterctl scan [--quarantine] <path>...
-#                                   antivirus scan of files/trees (exit 1 if infected)
+#                                   antivirus scan of files/trees (exit 1 if infected,
+#                                   2 if a path is not there)
 #   hunterctl scan-media [id|dir]...
 #                                   scan removable media (default: every pending one)
 #   hunterctl media-scan <on|off>   queue new USB sticks / disks for a scan
@@ -116,6 +117,11 @@ KEEP=5
 # Paths per write to /proc/hunter_scan: each batch is scanned before the
 # write returns, and 256 paths stay well under the 1 MiB a write may carry.
 BATCH=256
+# /proc/hunter_scan keeps ONE batch of results, the last write's, so two
+# scanners at once (the desktop's and a scheduled one, say) would read each
+# other's verdicts. Whoever writes to it holds this lock meanwhile; lunarhunter
+# takes the same one (tools/lunarbar/src/hunter_scan.rs).
+SCANLOCK=/run/hunter/scan.lock
 TAB=$(printf '\t')
 # hunterd's files. The event history is a log (and readable by the adm
 # group, like the rest of /var/log); the learned set and the cursor are
@@ -150,12 +156,31 @@ send() {
     [ "$(id -u)" = 0 ] || die "must be root"
     msg=$(mktemp) || die "mktemp failed"
     printf '%s\n' "$1" > "$msg"
+    from=$(last_seq)
     if dd if="$msg" of="${2:-$PROC}" bs=1048576 count=1 2>/dev/null; then
         rm -f "$msg"
     else
         rm -f "$msg"
         die "hunter rejected the script; nothing was applied (see '$0 events')"
     fi
+    # Sealed, a relaxing directive parses and is then not applied: the write
+    # succeeds and hunter only says so in its ring. Saying nothing here made
+    # `hunterctl mode exec off` on a sealed system look like it had worked.
+    refused=$(events_after "$from" | sed -n 's/.*WARNING: \(refused relaxing .*\)/\1/p')
+    if [ -n "$refused" ]; then
+        printf '%s\n' "$refused" | sed 's/^/hunterctl: /' >&2
+        die "hunter is sealed: the change above was not applied (the rest was)"
+    fi
+}
+
+# The newest sequence number in hunter's event ring (-1 when it is empty),
+# and the ring's lines after a given one.
+last_seq() {
+    n=$(sed -n 's/^\[ *\([0-9]*\)\] +.*/\1/p' "$PROC" 2>/dev/null | tail -n 1)
+    echo "${n:--1}"
+}
+events_after() {
+    awk -v m="$1" '/^\[ *[0-9]+\] \+/ { s = $0; sub(/^\[ */, "", s); sub(/\].*/, "", s); if (s + 0 > m + 0) print }' "$PROC" 2>/dev/null
 }
 
 # Fields go one per line, so no newline (and no tab, which separates an
@@ -404,6 +429,7 @@ run_job() {
     set -f
     # shellcheck disable=SC2086
     "$0" scan $q $paths > "$log" 2>&1
+    rc=$?
     set +f
     secs=$(($(date +%s) - start))
     sum=$(sed -n 's/^hunterctl: scanned \([0-9]*\) file(s), \([0-9]*\) infected$/\1 \2/p' "$log" | tail -n 1)
@@ -413,6 +439,9 @@ run_job() {
     else
         files=0; infected=0; status=failed
     fi
+    # Exit 2: a path of the job is not there. Nothing found in what is left
+    # is no reason to call the run clean.
+    [ "$rc" -ge 2 ] && [ "$status" = clean ] && status=failed
     quarantined=$(grep -c '^hunterctl: quarantined ' "$log")
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -d "@$start" +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo "$start")" \
         "$job" "$trigger" "$secs" "$files" "$infected" "$quarantined" "$status" "${log##*/}" >> "$SCANS/history"
@@ -430,6 +459,28 @@ run_job() {
     grep -v '^hunterctl: scanned ' "$log"
     echo "hunterctl: $job: $status, $files file(s), $infected infected, $quarantined quarantined, ${secs}s (report: $log)"
     [ "$status" = clean ]
+}
+
+# scan_lock / scan_unlock: the scanner lock, a directory holding the owner's
+# pid (mkdir is atomic; a directory left by a crash is taken over once its
+# pid is gone). Waits up to 10 minutes: a scan of the disk takes that long.
+scan_lock() {
+    mkdir -p "${SCANLOCK%/*}"
+    i=0
+    while ! mkdir "$SCANLOCK" 2>/dev/null; do
+        owner=$(cat "$SCANLOCK/pid" 2>/dev/null)
+        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -rf "$SCANLOCK"
+            continue
+        fi
+        [ "$i" -lt 600 ] || die "another scan has held $SCANLOCK for 10 minutes (pid ${owner:-?})"
+        sleep 1
+        i=$((i + 1))
+    done
+    echo $$ > "$SCANLOCK/pid"
+}
+scan_unlock() {
+    [ "$(cat "$SCANLOCK/pid" 2>/dev/null)" = $$ ] && rm -rf "$SCANLOCK"
 }
 
 download() {
@@ -844,7 +895,17 @@ scan)
     [ $# -ge 1 ] || usage 1
     [ -w "$SCAN" ] || die "$SCAN not found: this kernel's hunter has no antivirus"
     list=$(mktemp) && out=$(mktemp) && batch=$(mktemp) || die "mktemp failed"
-    trap 'rm -f "$list" "$out" "$batch"' EXIT
+    trap 'rm -f "$list" "$out" "$batch"; scan_unlock' EXIT
+    # A path that is not there is an error, not a clean result: `find`
+    # would list nothing for it, and a typo in a scheduled job's path would
+    # read "0 infected" every night.
+    missing=0
+    for a in "$@"; do
+        if [ ! -e "$a" ] && [ ! -L "$a" ]; then
+            echo "$a: ERROR not found" >> "$out"
+            missing=$((missing + 1))
+        fi
+    done
     # Not into the kernel's own trees (a /proc file is endless or a live
     # process's memory, a /dev node a device) nor into the quarantine, whose
     # files are known malware already put away. So `scan /` means the disk,
@@ -852,6 +913,7 @@ scan)
     find "$@" \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path "$QDIR" \) -prune \
         -o -type f -print > "$list" 2>/dev/null
     total=$(wc -l < "$list")
+    scan_lock
     i=1
     while [ "$i" -le "$total" ]; do
         sed -n "${i},$((i + BATCH - 1))p" "$list" > "$batch"
@@ -859,6 +921,7 @@ scan)
         cat "$SCAN" >> "$out"
         i=$((i + BATCH))
     done
+    scan_unlock
     grep -E ' FOUND$|: ERROR ' "$out"
     infected=$(grep -c ' FOUND$' "$out")
     echo "hunterctl: scanned $total file(s), $infected infected"
@@ -867,7 +930,8 @@ scan)
             "$0" quarantine "$f"
         done
     fi
-    [ "$infected" -eq 0 ]
+    [ "$infected" -eq 0 ] || exit 1
+    [ "$missing" -eq 0 ] || exit 2
     ;;
 scan-media)
     # The kernel notes every filesystem mounted from a device after boot as a
@@ -901,7 +965,7 @@ scan-media)
     fi
     mkdir -p "$MEDIA_REPORTS" || die "cannot create $MEDIA_REPORTS"
     list=$(mktemp) && out=$(mktemp) && batch=$(mktemp) && deny=$(mktemp) || die "mktemp failed"
-    trap 'rm -f "$list" "$out" "$batch" "$deny"' EXIT
+    trap 'rm -f "$list" "$out" "$batch" "$deny"; scan_unlock' EXIT
     dirty=0
     for id in $ids; do
         target=$(target_of "$id")
@@ -914,12 +978,14 @@ scan-media)
         total=$(wc -l < "$list")
         ok=1
         i=1
+        scan_lock
         while [ "$i" -le "$total" ]; do
             sed -n "${i},$((i + BATCH - 1))p" "$list" > "$batch"
             dd if="$batch" of="$SCAN" bs=1048576 count=1 2>/dev/null || { ok=0; break; }
             cat "$SCAN" >> "$out"
             i=$((i + BATCH))
         done
+        scan_unlock
         if [ "$ok" = 0 ]; then
             send "media $id failed"
             echo "hunterctl: media #$id ($target): scan failed" | tee "$MEDIA_REPORTS/$id"
@@ -935,8 +1001,9 @@ scan-media)
             # stick, and pulling it out halfway through would lose them. Denied
             # instead, so none of them runs (until reboot) even with the
             # antivirus only reporting; `hunterctl quarantine` is a step away.
-            # One line at a time: a path with a space in it is not a `deny`
-            # hunter takes, and it must not take the rest of them down with it.
+            # One line at a time: a path hunter will not take (a relative
+            # one, from a stick mounted oddly) must not take the rest of them
+            # down with it.
             sed -n 's/: [^ ]* FOUND$//p' "$out" | while IFS= read -r f; do
                 printf 'deny %s\n' "$f" > "$deny"
                 dd if="$deny" of="$PROC" bs=1048576 count=1 2>/dev/null ||
@@ -973,13 +1040,27 @@ quarantined)
 restore)
     [ $# -eq 1 ] || usage 1
     [ "$(id -u)" = 0 ] || die "must be root"
+    # Only a SHA-256: an empty one matched every line of the index, and
+    # `$QDIR/` is the quarantine itself, which mv then carried off whole.
+    case "$1" in
+    *[!0-9a-f]*) die "no quarantined file $1 (a SHA-256, see '$0 quarantined')" ;;
+    esac
+    [ "${#1}" -eq 64 ] || die "no quarantined file $1 (a SHA-256, see '$0 quarantined')"
     line=$(grep -F "$TAB$1$TAB" "$QDIR/index" 2>/dev/null | tail -n 1)
     [ -n "$line" ] && [ -e "$QDIR/$1" ] || die "no quarantined file $1"
     mode=$(printf '%s\n' "$line" | cut -f3)
     dest=$(printf '%s\n' "$line" | cut -f4-)
     [ -e "$dest" ] && die "$dest exists; not overwriting it"
-    mv -- "$QDIR/$1" "$dest" && chmod "$mode" "$dest" || die "cannot restore to $dest"
-    grep -vF "$TAB$1$TAB" "$QDIR/index" > "$QDIR/index.new"; mv "$QDIR/index.new" "$QDIR/index"
+    # The same contents quarantined from two paths are one file here and two
+    # lines in the index: restoring one copies it out and keeps the other.
+    if [ "$(grep -cF "$TAB$1$TAB" "$QDIR/index")" -gt 1 ]; then
+        cp -- "$QDIR/$1" "$dest" && chmod "$mode" "$dest" || die "cannot restore to $dest"
+    else
+        mv -- "$QDIR/$1" "$dest" && chmod "$mode" "$dest" || die "cannot restore to $dest"
+    fi
+    # Only the line restored: the last one for this file.
+    n=$(grep -nF "$TAB$1$TAB" "$QDIR/index" | tail -n 1 | cut -d: -f1)
+    sed "${n}d" "$QDIR/index" > "$QDIR/index.new" && mv "$QDIR/index.new" "$QDIR/index"
     echo "hunterctl: restored $dest (its path stays denied until reboot)"
     ;;
 update-signatures)

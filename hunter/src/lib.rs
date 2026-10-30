@@ -298,7 +298,9 @@ fn valid_image(path: &str, elf_data: &[u8]) -> bool {
 /// Executable-path policy check only (no ELF integrity). Used for dynamic-linker
 /// and shebang interpreters, where the target may legitimately be a script and
 /// magic validation would be inappropriate (P7). Returns `true` if execution
-/// from `path` may proceed under the current [`policy::exec_mode`].
+/// from `path` may proceed under the current [`policy::exec_mode`]. A verdict
+/// and nothing else: the trust-on-first-use learning is [`learn_exec`], for
+/// the caller to do once the other gates have agreed.
 pub fn check_exec_path(path: &str) -> bool {
     let exec_mode = policy::exec_mode();
     if exec_mode == Mode::Off {
@@ -320,26 +322,21 @@ pub fn check_exec_path(path: &str) -> bool {
         return false;
     }
 
-    // 2. Learning (trust-on-first-use) — never denies. A safe program (already
-    //    proven a valid ELF/script by the caller, not blacklisted, not from a
-    //    world-writable location) is auto-added to the allowlist and allowed.
-    if policy::exec_learning_enabled() {
-        if policy::is_exec_listed(path) {
-            return true;
-        }
-        if !policy::is_world_writable_exec_path(path) {
-            if policy::learn_exec_path(path) {
-                event_log::record(
-                    0,
-                    Severity::Notice,
-                    "EXEC",
-                    "LEARN",
-                    format!("learned trusted program: {}", policy::canonicalize(path)),
-                );
-            }
-            return true;
-        }
-        // World-writable and not yet trusted: fall through to the mode policy.
+    // 2. Learning (trust-on-first-use) — never denies. A program that is not
+    //    blacklisted and not from a world-writable location is allowed here,
+    //    and is added to the allowlist by [`learn_exec`] once every other gate
+    //    has let it through: the listing is the only decision made here.
+    //
+    //    Learning used to happen right here, which was before the gates that
+    //    run after this one -- the media lock, the blacklist of the resolved
+    //    path, the integrity appraisal and the antivirus. A piece of malware
+    //    the AV then refused had already been written onto the trusted list,
+    //    and hunterd had persisted it to /etc/hunter: a permanent trust for a
+    //    program hunter itself would not run.
+    if policy::exec_learning_enabled()
+        && (policy::is_exec_listed(path) || !policy::is_world_writable_exec_path(path))
+    {
+        return true;
     }
 
     // 3. Denylist of untrusted locations + optional deny-by-default allowlist.
@@ -373,6 +370,34 @@ pub fn check_exec_path(path: &str) -> bool {
         reason, path
     );
     true
+}
+
+/// The learning half of trust-on-first-use: puts `path` on the trusted
+/// allowlist, under the same terms [`check_exec_path`] allows it on. The
+/// kernel calls it once a program has passed *every* exec gate -- the path
+/// policy, the media lock, the integrity appraisal, the antivirus -- and never
+/// before, so a program that any of them refused is never trusted. Does
+/// nothing when the exec domain is off or learning is, or for a program that
+/// is already listed, blacklisted, or in a world-writable place.
+pub fn learn_exec(path: &str) {
+    if policy::exec_mode() == Mode::Off || !policy::exec_learning_enabled() {
+        return;
+    }
+    if policy::is_exec_blacklisted(path)
+        || policy::is_exec_listed(path)
+        || policy::is_world_writable_exec_path(path)
+    {
+        return;
+    }
+    if policy::learn_exec_path(path) {
+        event_log::record(
+            0,
+            Severity::Notice,
+            "EXEC",
+            "LEARN",
+            format!("learned trusted program: {}", policy::canonicalize(path)),
+        );
+    }
 }
 
 fn reject_exec(path: &str, why: &str) {
@@ -800,11 +825,13 @@ mod tests {
         // --- learning: never denies, auto-adds safe programs ---
         policy::set_exec_learning(true);
         assert_eq!(policy::learned_exec_count(), 0);
-        // A relative apk-style path is safe (not world-writable) -> learned.
+        // A relative apk-style path is safe (not world-writable) -> allowed,
+        // and learned once the kernel says every gate agreed.
         assert!(check_elf_binary(
             "lib/apk/exec/busybox-1.37.0-r",
             b"\x7fELF"
         ));
+        learn_exec("lib/apk/exec/busybox-1.37.0-r");
         assert!(policy::is_exec_listed("/lib/apk/exec/busybox-1.37.0-r"));
         assert_eq!(policy::learned_exec_count(), 1);
         // Re-exec does not double-learn.
@@ -812,6 +839,7 @@ mod tests {
             "/lib/apk/exec/busybox-1.37.0-r",
             b"\x7fELF"
         ));
+        learn_exec("/lib/apk/exec/busybox-1.37.0-r");
         assert_eq!(policy::learned_exec_count(), 1);
         // World-writable programs are not auto-learned.
         assert!(!policy::is_world_writable_exec_path(
@@ -862,7 +890,11 @@ mod tests {
         }
         // A real program on the same boot still learns and still runs.
         assert!(check_exec_path("/usr/bin/apt-get"));
+        learn_exec("/usr/bin/apt-get");
         assert!(policy::is_exec_listed("/usr/bin/apt-get"));
+        // The magic links are not learned even when asked to be.
+        learn_exec("/bin/../proc/self/fd/3");
+        assert_eq!(policy::learned_exec_count(), 1);
         policy::reset_for_test();
     }
 
@@ -1056,8 +1088,49 @@ mod exec_learning_tests {
         policy::set_exec_mode(Mode::Enforce);
         policy::set_exec_learning(true);
         assert!(check_exec_path("/usr/bin/new-thing"));
+        learn_exec("/usr/bin/new-thing");
         assert!(event_log::render().contains("learned trusted program"));
         assert_eq!(policy::learned_exec_count(), 1);
+    }
+
+    #[test]
+    fn the_verdict_alone_learns_nothing() {
+        // The gates run in a row (path policy, media lock, integrity, AV), and
+        // learning used to be a side effect of the first. A program the last
+        // gate refused was on the trusted list by then, and hunterd wrote it
+        // to /etc/hunter/trusted -- permanent trust for refused malware. The
+        // verdict and the learning are two calls now; the kernel makes the
+        // second only after every gate said yes.
+        let _g = start();
+        policy::set_exec_mode(Mode::Enforce);
+        policy::set_exec_learning(true);
+        assert!(check_exec_path("/usr/bin/suspect"));
+        assert!(check_elf_binary("/usr/bin/suspect", b"\x7fELF"));
+        assert!(
+            !policy::is_exec_listed("/usr/bin/suspect"),
+            "allowed through the path policy, but not yet trusted"
+        );
+        assert_eq!(policy::learned_exec_count(), 0);
+        assert!(!event_log::render().contains("learned trusted program"));
+        // The gates that follow the path policy could still say no, so the
+        // learning is not theirs to skip: a blacklisted or world-writable
+        // program is refused the trust even when asked for it directly.
+        policy::add_blacklisted_exec_path(String::from("/usr/bin/nc"));
+        learn_exec("/usr/bin/nc");
+        learn_exec("/tmp/dropper");
+        assert_eq!(policy::learned_exec_count(), 0);
+        learn_exec("/usr/bin/suspect");
+        assert!(policy::is_exec_listed("/usr/bin/suspect"));
+        assert_eq!(policy::learned_exec_count(), 1);
+    }
+
+    #[test]
+    fn nothing_is_learned_with_the_exec_domain_off() {
+        let _g = start();
+        policy::set_exec_mode(Mode::Off);
+        policy::set_exec_learning(true);
+        learn_exec("/usr/bin/thing");
+        assert_eq!(policy::learned_exec_count(), 0);
     }
 
     #[test]
@@ -1420,6 +1493,41 @@ mod exec_target_tests {
         policy::add_blacklisted_exec_path(alloc::string::String::from("/bin/nc.real"));
         assert!(!check_exec_target("/usr/bin/nc", "/bin/nc.real", &elf()));
         assert!(check_exec_target("/usr/bin/cat", "/bin/cat.real", &elf()));
+        policy::reset_for_test();
+    }
+
+    #[test]
+    fn a_program_the_gate_refuses_is_not_learned_as_trusted() {
+        let _g = crate::test_globals::lock();
+        policy::reset_for_test();
+        media::reset_for_test();
+        policy::set_exec_mode(Mode::Enforce);
+        policy::set_exec_learning(true);
+        // Refused for where the file is (a blacklisted file behind a link).
+        policy::add_blacklisted_exec_path(alloc::string::String::from("/bin/nc.real"));
+        assert!(!check_exec_target("/usr/bin/nc", "/bin/nc.real", &elf()));
+        assert!(
+            !policy::is_exec_listed("/usr/bin/nc"),
+            "a name whose file is blacklisted was learned as trusted"
+        );
+        // Refused for being on a stick that has not been scanned.
+        media::set_lock(true);
+        media::note_mount("/dev/sdb1", "/media/usb", "vfat");
+        assert!(!check_exec_target(
+            "/home/u/setup",
+            "/media/usb/setup.elf",
+            &elf()
+        ));
+        assert!(
+            !policy::is_exec_listed("/home/u/setup"),
+            "a name whose file is on a locked stick was learned as trusted"
+        );
+        assert_eq!(policy::learned_exec_count(), 0);
+        // One that every gate lets through is learned on request.
+        assert!(check_exec_target("/usr/bin/tool", "/usr/bin/tool", &elf()));
+        learn_exec("/usr/bin/tool");
+        assert!(policy::is_exec_listed("/usr/bin/tool"));
+        media::reset_for_test();
         policy::reset_for_test();
     }
 }

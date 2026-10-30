@@ -257,6 +257,52 @@ fn the_rules_block_round_trips_through_the_language() {
 }
 
 #[test]
+fn a_hash_in_a_program_path_is_not_a_comment() {
+    let _g = reset();
+    let d = parse_line("expect tcp 80 /opt/app#2/httpd  # the second one").unwrap();
+    assert_eq!(
+        d,
+        Some(Directive::Expect(Rule {
+            proto: RuleProto::Tcp,
+            lo: 80,
+            hi: 80,
+            program: Some(alloc::string::String::from("/opt/app#2/httpd")),
+        }))
+    );
+    assert_eq!(parse_line("  # only a comment").unwrap(), None);
+}
+
+#[test]
+fn a_program_with_a_space_in_its_path_is_one_program() {
+    let _g = reset();
+    let rule = |line: &str| match parse_line(line).unwrap().unwrap() {
+        Directive::Expect(r) | Directive::Forget(r) => r,
+        _ => unreachable!(),
+    };
+    let r = rule("expect tcp 8080 /opt/My App/bin/app");
+    assert_eq!(r.program.as_deref(), Some("/opt/My App/bin/app"));
+    assert_eq!(
+        rule(&r.to_line()),
+        r,
+        "the table's line parses back to the rule"
+    );
+    assert_eq!(rule("forget udp 68").program, None);
+    assert_eq!(rule("expect any 6000-6010 *").program, None);
+    assert!(parse_line("expect tcp").is_err());
+    assert!(parse_line("expect tcp 80 relative/x").is_err());
+    assert!(
+        parse_line("expect tcp 80 /a /b").is_ok(),
+        "spaces are the program's"
+    );
+    assert_eq!(
+        rule("  expect   tcp  22   /usr/sbin/sshd  ")
+            .program
+            .as_deref(),
+        Some("/usr/sbin/sshd")
+    );
+}
+
+#[test]
 fn v6_addresses_keep_their_port_apart() {
     assert_eq!(join_addr("::", 22), "[::]:22");
     assert_eq!(join_addr("10.0.2.15", 22), "10.0.2.15:22");

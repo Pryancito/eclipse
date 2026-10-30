@@ -828,13 +828,18 @@ impl LinuxRootfs {
     fn install_hunter(rootfs: &Path) {
         let sbin = rootfs.join("sbin");
         fs::create_dir_all(&sbin).unwrap();
-        let dst = sbin.join("hunterctl");
-        let _ = dir::rm(&dst);
-        fs::copy(PROJECT_DIR.join("tools/hunterctl/hunterctl"), &dst).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
+        // hunter-selftest beside it: the end-to-end checks of every part of
+        // hunter, run on the system itself (scripts/qemu-hunter-selftest.sh
+        // runs it in QEMU).
+        for name in ["hunterctl", "hunter-selftest"] {
+            let dst = sbin.join(name);
+            let _ = dir::rm(&dst);
+            fs::copy(PROJECT_DIR.join("tools/hunterctl").join(name), &dst).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
+            }
         }
         let etc_hunter = rootfs.join("etc/hunter");
         fs::create_dir_all(&etc_hunter).unwrap();

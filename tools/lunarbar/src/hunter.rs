@@ -20,7 +20,23 @@ pub const PROC: &str = "/proc/hunter";
 
 /// The domains `mode <domain> <mode>` takes, in the order the report prints
 /// them (and the menu shows them).
-pub const DOMAINS: [&str; 6] = ["syscall", "wx", "exec", "anomaly", "integrity", "av"];
+/// The domains, as the kernel's `enforcement:` line names them. `net`, the
+/// firewall, has its mode in `/proc/hunter_firewall` and is kept in
+/// `/etc/hunter/firewall` (see `hunter_firewall`), so it is not here.
+///
+/// `behavior` (ransomware, process injection) was missing from this list, so
+/// the window never showed its mode and, worse, "save as boot policy" wrote a
+/// `policy.conf` without a `mode behavior` line: whatever the operator had
+/// set it to went back to the default at the next boot.
+pub const DOMAINS: [&str; 7] = [
+    "syscall",
+    "wx",
+    "exec",
+    "anomaly",
+    "integrity",
+    "av",
+    "behavior",
+];
 
 /// How many of the newest warnings/criticals the menu lists.
 pub const RECENT: usize = 4;
@@ -78,7 +94,7 @@ pub struct Event {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Status {
     /// Indexed like [`DOMAINS`].
-    pub modes: [Mode; 6],
+    pub modes: [Mode; 7],
     /// The tighten-only latch is engaged: relaxations are refused until reboot.
     pub sealed: bool,
     pub learning: bool,
@@ -459,7 +475,7 @@ mod tests {
 
     /// A report as the kernel renders it (`render_report` in hunter/src/lib.rs).
     const REPORT: &str = "hunter security subsystem v0.1.0\n\
-enforcement: syscall=enforce wx=report exec=report anomaly=off integrity=report av=enforce\n\
+enforcement: syscall=enforce wx=report exec=report anomaly=off integrity=report av=enforce behavior=report\n\
 events: total=12 blocked=3 warnings=5 reported=4 critical=2 dropped=0 critical_dropped=0\n\
 active syscall policies: 0\n\
 exec allowlist: active (configured=4, learned=2); blacklist=1; learning=on\n\
@@ -491,7 +507,8 @@ recent events (oldest first):\n\
                 Mode::Report,
                 Mode::Off,
                 Mode::Report,
-                Mode::Enforce
+                Mode::Enforce,
+                Mode::Report
             ]
         );
         assert!(!st.sealed);
@@ -502,7 +519,7 @@ recent events (oldest first):\n\
 
     #[test]
     fn the_seal_is_read_off_the_enforcement_line() {
-        let sealed = REPORT.replace("av=enforce\n", "av=enforce [tighten-only]\n");
+        let sealed = REPORT.replace("behavior=report\n", "behavior=report [tighten-only]\n");
         assert!(parse(&sealed).unwrap().sealed);
     }
 
@@ -535,7 +552,7 @@ recent events (oldest first):\n\
         assert_eq!(parse("cpu  1 2 3 4\n"), None);
         // A mode hunter does not have is not silently read as off.
         assert_eq!(
-            parse("enforcement: syscall=maybe wx=off exec=off anomaly=off integrity=off av=off\n"),
+            parse("enforcement: syscall=maybe wx=off exec=off anomaly=off integrity=off av=off behavior=off\n"),
             None
         );
     }
@@ -570,7 +587,11 @@ recent events (oldest first):\n\
             mode_script(5, Mode::Enforce).as_deref(),
             Some("mode av enforce\n")
         );
-        assert_eq!(mode_script(6, Mode::Off), None);
+        assert_eq!(
+            mode_script(6, Mode::Off).as_deref(),
+            Some("mode behavior off\n")
+        );
+        assert_eq!(mode_script(7, Mode::Off), None);
         // Same directives as `hunterctl lockdown`, same order, seal last.
         let ctl = include_str!("../../hunterctl/hunterctl");
         let block = ctl.split("lockdown)").nth(1).unwrap();

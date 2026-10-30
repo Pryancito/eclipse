@@ -228,11 +228,11 @@ pub enum Directive {
 
 /// Parses one line. `Ok(None)` for a blank line or a comment.
 pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
-    let line = match line.find('#') {
-        Some(i) => &line[..i],
-        None => line,
-    }
-    .trim();
+    // The same comment rule as the control language: a `#` inside a word
+    // (a program path) is part of the word, not the start of a comment.
+    // Cutting at any `#` made `expect tcp 80 /opt/app#2/httpd` lose its
+    // program, and the rule the table renders no longer re-parsed to itself.
+    let line = crate::control::strip_comment(line).trim();
     if line.is_empty() {
         return Ok(None);
     }
@@ -245,21 +245,32 @@ pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
         }
     };
     Ok(Some(match words[0] {
-        "expect" => Directive::Expect(parse_rule(&words)?),
-        "forget" => Directive::Forget(parse_rule(&words)?),
+        "expect" => Directive::Expect(parse_rule(line)?),
+        "forget" => Directive::Forget(parse_rule(line)?),
         "alerts" => Directive::Alerts(switch(&words)?),
         "ignore-loopback" => Directive::IgnoreLoopback(switch(&words)?),
         other => return Err(format!("unknown directive '{}'", other)),
     }))
 }
 
-fn parse_rule(words: &[&str]) -> Result<Rule, String> {
-    if !(3..=4).contains(&words.len()) {
+/// `<expect|forget> <tcp|udp|any> <port|lo-hi> [<program>]`, from the
+/// trimmed line. The program is everything after the port, so a path with a
+/// space in it (`/opt/My App/bin/app`, which the table shows as one field
+/// too) is one program: split into words it was "too many arguments", and
+/// the listener of such a program could not be expected at all.
+fn parse_rule(line: &str) -> Result<Rule, String> {
+    let mut it = line.split_whitespace();
+    let word = it.next().unwrap_or("");
+    let (Some(proto), Some(port)) = (it.next(), it.next()) else {
         return Err(format!(
             "'{}' takes '<tcp|udp|any> <port|lo-hi> [<program>]'",
-            words[0]
+            word
         ));
-    }
+    };
+    // The program is what follows the port, however many spaces are in it.
+    let after_port = port.as_ptr() as usize - line.as_ptr() as usize + port.len();
+    let program = line[after_port..].trim();
+    let words = [word, proto, port, program];
     let proto = match words[1] {
         "tcp" => RuleProto::Tcp,
         "udp" => RuleProto::Udp,
@@ -282,10 +293,10 @@ fn parse_rule(words: &[&str]) -> Result<Rule, String> {
     if lo > hi {
         return Err(format!("empty port range '{}'", words[2]));
     }
-    let program = match words.get(3) {
-        None | Some(&"*") => None,
-        Some(p) if p.starts_with('/') => Some(String::from(*p)),
-        Some(p) => return Err(format!("program must be an absolute path: {}", p)),
+    let program = match words[3] {
+        "*" | "" => None,
+        p if p.starts_with('/') => Some(String::from(p)),
+        p => return Err(format!("program must be an absolute path: {}", p)),
     };
     Ok(Rule {
         proto,

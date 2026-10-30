@@ -157,17 +157,10 @@ pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
             arity(2)?;
             Directive::PrivilegedDeny(parse_switch(words[1])?)
         }
-        "trust" => {
-            arity(2)?;
-            Directive::Trust(parse_path(words[1])?)
-        }
-        "deny" => {
-            arity(2)?;
-            Directive::Deny(parse_path(words[1])?)
-        }
+        "trust" => Directive::Trust(rest_path(line, "trust")?),
+        "deny" => Directive::Deny(rest_path(line, "deny")?),
         "untrusted" => {
-            arity(2)?;
-            let p = parse_path(words[1])?;
+            let p = rest_path(line, "untrusted")?;
             if !p.ends_with('/') {
                 return Err(format!(
                     "'untrusted' takes a directory ending in '/': {}",
@@ -250,14 +243,8 @@ pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
             arity(2)?;
             Directive::RequireSignedFeeds(parse_switch(words[1])?)
         }
-        "canary" => {
-            arity(2)?;
-            Directive::Canary(parse_path(words[1])?)
-        }
-        "exempt" => {
-            arity(2)?;
-            Directive::Exempt(parse_path(words[1])?)
-        }
+        "canary" => Directive::Canary(rest_path(line, "canary")?),
+        "exempt" => Directive::Exempt(rest_path(line, "exempt")?),
         "release" => {
             arity(2)?;
             match words[1].parse::<u64>() {
@@ -278,7 +265,7 @@ pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
 /// whitespace, so `mode wx report  # JITs` is `mode wx report` while a `#`
 /// inside a word (a path) is kept. The shipped example annotates its lines
 /// this way, and uncommenting one of them must give a line that parses.
-fn strip_comment(line: &str) -> &str {
+pub(crate) fn strip_comment(line: &str) -> &str {
     let b = line.as_bytes();
     for i in 0..b.len() {
         if b[i] == b'#' && (i == 0 || b[i - 1].is_ascii_whitespace()) {
@@ -330,6 +317,20 @@ fn parse_path(word: &str) -> Result<String, String> {
     } else {
         Err(format!("path must be absolute: {}", word))
     }
+}
+
+/// The rest of the line after the directive's word, as one absolute path.
+/// The rest and not the next word, so a path with a space in it can be
+/// trusted, denied or armed: `hunterctl quarantine` denies whatever path the
+/// malware had, and a word-sized `deny` refused `/home/u/Mis documentos/x`
+/// -- after the file was already moved away, leaving a fresh copy dropped
+/// there free to run. Like `hash`, whose path is also the rest of the line.
+fn rest_path(line: &str, word: &str) -> Result<String, String> {
+    let rest = line[word.len()..].trim();
+    if rest.is_empty() {
+        return Err(format!("'{}' takes a path", word));
+    }
+    parse_path(rest)
 }
 
 /// Parses a whole script, or answers the first line that does not parse.
@@ -655,6 +656,47 @@ mod tests {
             Some(Directive::Deny(String::from("/opt/c#/tool")))
         );
         assert!(parse_line("mode wx report extra # comment").is_err());
+    }
+
+    #[test]
+    fn a_path_with_spaces_is_one_path() {
+        // What `hunterctl quarantine` sends for malware that was in a
+        // folder with a space in its name: the deny must take, or a fresh
+        // copy dropped at the same path runs.
+        assert_eq!(
+            parse_line("deny /home/u/Mis documentos/factura.pdf.exe").unwrap(),
+            Some(Directive::Deny(String::from(
+                "/home/u/Mis documentos/factura.pdf.exe"
+            )))
+        );
+        assert_eq!(
+            parse_line("trust  /opt/My App/bin/app  # vendor").unwrap(),
+            Some(Directive::Trust(String::from("/opt/My App/bin/app")))
+        );
+        assert_eq!(
+            parse_line("canary /home/u/Mis documentos/.~nominas.ods").unwrap(),
+            Some(Directive::Canary(String::from(
+                "/home/u/Mis documentos/.~nominas.ods"
+            )))
+        );
+        assert_eq!(
+            parse_line("exempt /opt/Backup Tool/bin/backup").unwrap(),
+            Some(Directive::Exempt(String::from(
+                "/opt/Backup Tool/bin/backup"
+            )))
+        );
+        assert_eq!(
+            parse_line("untrusted /media/USB DISK/").unwrap(),
+            Some(Directive::Untrusted(String::from("/media/USB DISK/")))
+        );
+        for bad in [
+            "deny",
+            "deny   ",
+            "trust  # nothing",
+            "deny relative/with space",
+        ] {
+            assert!(parse_line(bad).is_err(), "accepted: {}", bad);
+        }
     }
 
     #[test]

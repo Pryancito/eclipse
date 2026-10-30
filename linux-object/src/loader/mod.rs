@@ -469,6 +469,8 @@ impl LinuxElfLoader {
             if !crate::fs::hunter_config::appraise(&[interp], &interp_vmo) {
                 return Err(ZxError::ACCESS_DENIED.into());
             }
+            // Trusted only once both gates agreed, never before.
+            hunter::learn_exec(interp);
             let interp_size = zircon_object::vm::roundup_pages(interp_vmo.len());
             let interp_virt = zircon_object::vm::KERNEL_ASPACE.map(
                 None,
@@ -576,6 +578,8 @@ impl LinuxElfLoader {
             if !crate::fs::hunter_config::appraise(&[interp], &interp_vmo) {
                 return Err(ZxError::ACCESS_DENIED.into());
             }
+            // Trusted only once both gates agreed, never before.
+            hunter::learn_exec(interp);
             let interp_size_aligned = zircon_object::vm::roundup_pages(interp_vmo.len());
             let interp_virt = zircon_object::vm::KERNEL_ASPACE.map(
                 None,
