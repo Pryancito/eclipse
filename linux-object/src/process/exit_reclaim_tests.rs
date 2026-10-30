@@ -15,6 +15,26 @@ use zircon_object::vm::{VmObject, PAGE_SIZE};
 
 const PAGES: usize = 16;
 
+/// Floor for the kernel-chosen placement below, the same 64 KiB
+/// `vm.mmap_min_addr` default that the Linux `mmap` path passes as
+/// `linux_syscall::MMAP_MIN_ADDR`.
+///
+/// Without it the mapping lands at address **0**: a Linux process's root
+/// VMAR starts at `USER_ASPACE_BASE`, which is zero so a non-PIE image can
+/// be mapped at the absolute vaddrs baked into its code, and `Vmar::map`
+/// searches from offset 0 up. On bare metal that is merely the null page
+/// being mappable; under libos a guest address IS a host address, so
+/// writing the first page asks the host for `mmap(0, MAP_FIXED)` -- which
+/// `vm.mmap_min_addr` refuses to anyone without `CAP_SYS_RAWIO`.
+///
+/// So these two tests passed for whoever ran them as root and failed, both
+/// of them, every single run, on an ordinary CI runner --
+/// `failed to mmap: ... vaddr=0x0 ...: EPERM`, from `mock_mem`, with the
+/// panic a page-table write away from anything this file is about. Reading
+/// as a flake is what cost the time: the placement is 0 on every run, the
+/// privilege is what differs.
+const MAP_FLOOR: usize = 0x1_0000;
+
 /// Whether `weak` is gone, allowing for a test running beside this one that
 /// is holding a strong handle for a moment: anything that walks the job tree
 /// (`all_live_processes`, a group signal) clones every process it passes, so a
@@ -37,14 +57,26 @@ fn a_process_holding_memory(pid: KoID) -> (Arc<Process>, Weak<VmObject>, usize) 
     let weak = Arc::downgrade(&vmo);
     let addr = proc
         .vmar()
-        .map(
+        .map_ext_min(
             None,
             vmo,
             0,
             PAGES * PAGE_SIZE,
+            MMUFlags::RXW,
             MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
+            false,
+            true,
+            false,
+            MAP_FLOOR,
         )
         .unwrap();
+    assert!(
+        addr >= MAP_FLOOR,
+        "the mapping was placed at {:#x}, below the {:#x} floor: writing it would ask the host \
+         to mmap the null page",
+        addr,
+        MAP_FLOOR
+    );
     for i in 0..PAGES {
         proc.vmar()
             .write_memory(addr + i * PAGE_SIZE, &[0xa5; 8])
