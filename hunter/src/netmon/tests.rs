@@ -281,14 +281,23 @@ fn a_program_with_a_space_in_its_path_is_one_program() {
     };
     let r = rule("expect tcp 8080 /opt/My App/bin/app");
     assert_eq!(r.program.as_deref(), Some("/opt/My App/bin/app"));
-    assert_eq!(rule(&r.to_line()), r, "the table's line parses back to the rule");
+    assert_eq!(
+        rule(&r.to_line()),
+        r,
+        "the table's line parses back to the rule"
+    );
     assert_eq!(rule("forget udp 68").program, None);
     assert_eq!(rule("expect any 6000-6010 *").program, None);
     assert!(parse_line("expect tcp").is_err());
     assert!(parse_line("expect tcp 80 relative/x").is_err());
-    assert!(parse_line("expect tcp 80 /a /b").is_ok(), "spaces are the program's");
+    assert!(
+        parse_line("expect tcp 80 /a /b").is_ok(),
+        "spaces are the program's"
+    );
     assert_eq!(
-        rule("  expect   tcp  22   /usr/sbin/sshd  ").program.as_deref(),
+        rule("  expect   tcp  22   /usr/sbin/sshd  ")
+            .program
+            .as_deref(),
         Some("/usr/sbin/sshd")
     );
 }

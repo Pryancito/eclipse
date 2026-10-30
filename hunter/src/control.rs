@@ -665,7 +665,9 @@ mod tests {
         // copy dropped at the same path runs.
         assert_eq!(
             parse_line("deny /home/u/Mis documentos/factura.pdf.exe").unwrap(),
-            Some(Directive::Deny(String::from("/home/u/Mis documentos/factura.pdf.exe")))
+            Some(Directive::Deny(String::from(
+                "/home/u/Mis documentos/factura.pdf.exe"
+            )))
         );
         assert_eq!(
             parse_line("trust  /opt/My App/bin/app  # vendor").unwrap(),
@@ -673,17 +675,26 @@ mod tests {
         );
         assert_eq!(
             parse_line("canary /home/u/Mis documentos/.~nominas.ods").unwrap(),
-            Some(Directive::Canary(String::from("/home/u/Mis documentos/.~nominas.ods")))
+            Some(Directive::Canary(String::from(
+                "/home/u/Mis documentos/.~nominas.ods"
+            )))
         );
         assert_eq!(
             parse_line("exempt /opt/Backup Tool/bin/backup").unwrap(),
-            Some(Directive::Exempt(String::from("/opt/Backup Tool/bin/backup")))
+            Some(Directive::Exempt(String::from(
+                "/opt/Backup Tool/bin/backup"
+            )))
         );
         assert_eq!(
             parse_line("untrusted /media/USB DISK/").unwrap(),
             Some(Directive::Untrusted(String::from("/media/USB DISK/")))
         );
-        for bad in ["deny", "deny   ", "trust  # nothing", "deny relative/with space"] {
+        for bad in [
+            "deny",
+            "deny   ",
+            "trust  # nothing",
+            "deny relative/with space",
+        ] {
             assert!(parse_line(bad).is_err(), "accepted: {}", bad);
         }
     }
