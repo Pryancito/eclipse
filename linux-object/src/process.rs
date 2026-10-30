@@ -616,7 +616,12 @@ impl NewChild for Process {
         // address space that never existed (the Xwayland fork-child dying in
         // its first mallocs). Taken BEFORE `inner` — that is the global order
         // (see the `aspace_lock` field doc).
-        let _aspace = linux_parent.aspace_lock().lock();
+        //
+        // Held in an `Option` so the copy arm below can put it down early when
+        // there is provably nobody to race (see there): this is an IRQ-off
+        // spinlock, and holding it across the copy costs the forking CPU every
+        // interrupt for as long as the copy runs.
+        let mut aspace = Some(linux_parent.aspace_lock().lock());
         let linux_parent_inner = linux_parent.inner.lock();
         // Child joins the parent's process group: copy the parent's *effective*
         // pgid so the inherited value is concrete even if the parent never
@@ -687,7 +692,24 @@ impl NewChild for Process {
         let new_proc = match memory {
             ChildMemory::Copy => {
                 let new_proc = Process::create_with_ext(&parent.job(), "", new_linux_proc)?;
+                // Read UNDER `aspace`, which is what makes the answer keep
+                // being true for the copy below rather than being a sample.
                 let alone = alone_in_its_address_space(parent);
+                // `aspace` is here to stop ANOTHER THREAD of this parent
+                // reshaping the layout while `fork_from` walks its snapshot,
+                // and a parent alone in its address space has none: creating
+                // a thread, and sharing this address space with another
+                // process, are both things only a thread of this process can
+                // ask for, and that thread is the one running this fork. So
+                // across the copy the lock guards nothing — while its cost is
+                // real, because it is an IRQ-off spinlock (`kernel-sync`
+                // `Mutex::lock` → `push_off`) and `fork_from` calls its own
+                // copy "tens of ms". A multithreaded parent still needs it
+                // and still pays; that case wants a lock that SLEEPS, as
+                // Linux's `mmap_lock` does, and is not this commit.
+                if alone {
+                    drop(aspace.take());
+                }
                 new_proc.vmar().fork_from(&parent.vmar(), alone)?;
                 new_proc
             }
@@ -6332,6 +6354,9 @@ mod exit_path_benches;
 
 #[cfg(test)]
 mod exit_path_summary_tests;
+
+#[cfg(test)]
+mod fork_aspace_lock_tests;
 
 #[cfg(test)]
 mod fork_inheritance_tests;
