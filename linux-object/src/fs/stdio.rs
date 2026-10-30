@@ -162,6 +162,45 @@ fn tty_flow_stopped(vt: usize) -> bool {
         .load(Ordering::Relaxed)
 }
 
+/// Whether a write to `inode` would wait on a console paused by software
+/// flow control (Ctrl-S), for the async syscall dispatcher to wait it out
+/// asleep: see [`wait_while_output_stopped`]. `false` for every inode that
+/// is not a VT terminal.
+pub fn console_output_stopped(inode: &dyn INode) -> bool {
+    let any = inode.as_any_ref();
+    // `CurrentVtTty` hands out its inner `Stdin` here, so this covers it.
+    let vt = if let Some(stdin) = any.downcast_ref::<Stdin>() {
+        stdin.vt
+    } else if let Some(stdout) = any.downcast_ref::<Stdout>() {
+        stdout.vt
+    } else {
+        return false;
+    };
+    tty_flow_stopped(vt)
+}
+
+/// How often a writer parked behind Ctrl-S looks again. Ctrl-Q is a person
+/// pressing a key, so a hundredth of a second is not a delay anyone sees.
+pub const STOPPED_OUTPUT_RECHECK: core::time::Duration = core::time::Duration::from_millis(10);
+
+/// Wait asleep while output to `inode` is paused by Ctrl-S.
+///
+/// `tty_write_out` waits for VSTART by spinning, inside a synchronous
+/// `write_at`: a program printing to a frozen console held a whole CPU at
+/// 100% for as long as the user left it frozen -- and, being one poll, kept
+/// every other task queued on that CPU behind it until the timer preempted
+/// it. The syscall dispatcher calls this first, so by the time the write
+/// reaches `tty_write_out` the flag is down and the spin finds nothing to
+/// wait for. A signal ends the wait (the job-control keys also lift the
+/// freeze, see the line discipline).
+pub async fn wait_while_output_stopped(inode: &dyn INode) -> crate::error::LxResult<()> {
+    while console_output_stopped(inode) {
+        let wake = kernel_hal::timer::timer_now() + STOPPED_OUTPUT_RECHECK;
+        crate::process::interruptible(kernel_hal::thread::sleep_until(wake)).await?;
+    }
+    Ok(())
+}
+
 /// Whether VT `vt` is translating key presses into TTY characters. False while
 /// an X server holds the keyboard in `K_RAW`/`K_OFF`/`K_MEDIUMRAW`.
 fn tty_kbd_cooked(vt: usize) -> bool {
@@ -3200,6 +3239,45 @@ mod line_discipline_tests {
         s.push('\n');
         // Neither Ctrl-S nor Ctrl-Q may reach the reader.
         assert_eq!(drain(&s), "a\n");
+    }
+
+    /// A writer behind Ctrl-S waits asleep and goes on once Ctrl-Q lands,
+    /// looking at the flag a hundred times a second rather than spinning on
+    /// it (see `wait_while_output_stopped`).
+    #[test]
+    fn a_writer_behind_ctrl_s_sleeps_until_ctrl_q() {
+        extern crate std;
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        let s = Arc::new(tty(d.c_lflag, IXON | I_ICRNL));
+        let inode: Arc<dyn INode> = s.clone();
+        assert!(!console_output_stopped(inode.as_ref()));
+        s.push(CTRL_S);
+        assert!(console_output_stopped(inode.as_ref()));
+        let typist = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                s.push(CTRL_Q);
+            })
+        };
+        let start = kernel_hal::timer::timer_now();
+        async_std::task::block_on(wait_while_output_stopped(inode.as_ref())).unwrap();
+        typist.join().unwrap();
+        assert!(!console_output_stopped(inode.as_ref()));
+        assert!(kernel_hal::timer::timer_now() - start >= core::time::Duration::from_millis(20));
+    }
+
+    /// Only a VT terminal can be frozen: any other inode never waits.
+    #[test]
+    fn only_a_vt_terminal_waits_on_ctrl_s() {
+        let _g = SERIAL.lock();
+        let d = Termios::default_tty();
+        let s = tty(d.c_lflag, IXON | I_ICRNL);
+        s.push(CTRL_S);
+        let other: Arc<dyn INode> = Arc::new(crate::fs::devfs::RandomINode::new(false));
+        assert!(!console_output_stopped(other.as_ref()));
+        s.push(CTRL_Q);
     }
 
     #[test]
