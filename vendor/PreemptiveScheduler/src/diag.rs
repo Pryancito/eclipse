@@ -15,7 +15,21 @@ const DEADLOCK_SPINS: u64 = 1_000_000_000;
 
 #[track_caller]
 pub(crate) fn diag_lock<'a, T>(m: &'a Mutex<T>) -> MutexGuard<'a, T> {
-    let caller = core::panic::Location::caller();
+    diag_lock_reporting_after(m, DEADLOCK_SPINS, core::panic::Location::caller())
+}
+
+/// The body of [`diag_lock`], with the report threshold and the call site
+/// handed in rather than taken from the constant and from `#[track_caller]`.
+///
+/// The threshold is ~8s of PAUSE iterations, which is the point: no test can
+/// wait for it, so without this seam the one line that matters here -- the
+/// report itself -- is the one line nothing ever runs, and the arguments it
+/// passes could be wrong for as long as the file exists.
+fn diag_lock_reporting_after<'a, T>(
+    m: &'a Mutex<T>,
+    report_after: u64,
+    caller: &'static core::panic::Location<'static>,
+) -> MutexGuard<'a, T> {
     let mut spins: u64 = 0;
     loop {
         if let Some(g) = m.try_lock() {
@@ -32,7 +46,7 @@ pub(crate) fn diag_lock<'a, T>(m: &'a Mutex<T>) -> MutexGuard<'a, T> {
         if spins & 511 == 0 {
             lock::pump();
         }
-        if spins == DEADLOCK_SPINS {
+        if spins == report_after {
             lock::report_stuck(caller.file(), caller.line());
         }
     }
@@ -40,7 +54,7 @@ pub(crate) fn diag_lock<'a, T>(m: &'a Mutex<T>) -> MutexGuard<'a, T> {
 
 #[cfg(test)]
 mod diag_lock_tests {
-    use super::diag_lock;
+    use super::{diag_lock, diag_lock_reporting_after, DEADLOCK_SPINS};
     use spin::Mutex;
 
     /// Sin disputa es un `try_lock` y se va: es el caso de siempre, y el que
@@ -78,5 +92,35 @@ mod diag_lock_tests {
         // entonces ve su escritura.
         assert_eq!(*diag_lock(&m), 1);
         peer.join().unwrap();
+    }
+
+    /// Y pasado el umbral informa del sitio que lo pidio, **y sigue girando**:
+    /// esto no es un `panic!` ni un `return` con las manos vacias, solo un
+    /// aviso para que el cuelgue tenga nombre en la consola. El umbral de
+    /// verdad son ~8 s de PAUSE, asi que el test entra por la costura y pone
+    /// uno de dos giros; en el arbol hospedado `lock::report_stuck` es un
+    /// no-op, de modo que lo que se comprueba es que la llamada ocurre, con
+    /// el sitio del llamante y no el de `diag_lock`, y que el cerrojo se
+    /// acaba tomando igual.
+    #[test]
+    fn pasado_el_umbral_informa_del_sitio_y_no_deja_de_girar() {
+        use alloc::sync::Arc;
+        let m = Arc::new(Mutex::new(0u32));
+        let held = Arc::new(std::sync::Barrier::new(2));
+        let peer_m = m.clone();
+        let peer_held = held.clone();
+        let peer = std::thread::spawn(move || {
+            let mut g = peer_m.lock();
+            peer_held.wait();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            *g = 1;
+        });
+        held.wait();
+        let here = core::panic::Location::caller();
+        assert_eq!(*diag_lock_reporting_after(&m, 2, here), 1);
+        peer.join().unwrap();
+        // El umbral de produccion sigue siendo el de produccion: si alguien
+        // lo baja, este test no lo tapa.
+        assert_eq!(DEADLOCK_SPINS, 1_000_000_000);
     }
 }
