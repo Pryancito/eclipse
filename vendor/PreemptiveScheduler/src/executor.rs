@@ -158,6 +158,25 @@ impl StubExecutor {
 
 /// Lo que los observadores y las trabas de contencion contestan sin pila
 /// detras; ver las notas del modulo.
+/// One lock for every test that touches this module's globals.
+///
+/// The stack pool, the two live-stack registries, the retired-stack table and
+/// the spine are module statics, and each test module that empties one of them
+/// used to have a `LOCK` of its own -- which serialises that module against
+/// itself and against nothing else. `Executor::new` touches all of them in a
+/// single call, so a test that calls it would have raced all four. One lock
+/// for the lot, and the four modules take this one.
+#[cfg(test)]
+pub(crate) fn executor_globals_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What `Executor::new` builds, and what its stack looks like when it is
+/// built, reused and retired; see the module docs.
+#[cfg(test)]
+mod birth_tests;
+
 #[cfg(test)]
 mod metadata_tests;
 
@@ -2779,8 +2798,7 @@ mod grace_period_tests {
     use core::sync::atomic::Ordering;
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        super::executor_globals_lock()
     }
 
     /// Empty every global these tests read, and hand back the ready mask that
@@ -3428,8 +3446,7 @@ mod stack_registry_tests {
 
     /// Both registries are module globals; every test here empties them.
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        super::executor_globals_lock()
     }
 
     struct Clean(std::sync::MutexGuard<'static, ()>);
@@ -4218,8 +4235,7 @@ mod spine_tests {
 
     /// The table is a module global, so the tests take turns.
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        super::executor_globals_lock()
     }
 
     fn wipe() {

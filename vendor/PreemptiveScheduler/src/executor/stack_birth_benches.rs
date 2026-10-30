@@ -164,14 +164,16 @@
 //!
 //! ## Por que no hay una fila que mida `Executor::new` entero
 //!
-//! No es pureza, es que no se puede: `init_stack_and_context` llama a
-//! `crate::arch::pg_base_register()`, que en x86_64 es `mov reg, cr3`. Una
-//! instruccion privilegiada en un test del anfitrion es un #GP, o sea
-//! SIGSEGV, antes de que la fila mida nada. (Probado, 11-oct.) Por eso el
-//! denominador se arma sumando filas y no cronometrando la funcion. Y por eso
-//! la reserva del monton en un fallo de fondo tampoco tiene fila: ahi `Global`
-//! es el `malloc` del anfitrion, no el asignador de camaradas del nucleo, y la
-//! cifra no se trasladaria.
+//! La razon original era que no se podia llamar: `init_stack_and_context`
+//! llama a `crate::arch::pg_base_register()`, que en x86_64 es `mov reg, cr3`,
+//! una instruccion privilegiada que en un test del anfitrion es un #GP, o sea
+//! SIGSEGV, antes de que la fila midiera nada (probado el 11-oct-2026). Esa
+//! lectura **ya tiene un sustituto de anfitrion** y la funcion se llama en
+//! `executor::birth_tests`, asi que lo que queda es la otra mitad: la reserva
+//! del monton en un fallo de fondo no se puede cronometrar aqui porque
+//! `Global` es el `malloc` del anfitrion y no el asignador de camaradas del
+//! nucleo, y la cifra no se trasladaria. Por eso el denominador se sigue
+//! armando sumando filas y no cronometrando la funcion.
 //!
 //! Correr:
 //!

@@ -3208,6 +3208,11 @@ pub(crate) fn get_current_runtime() -> MutexGuard<'static, ExecutorRuntime> {
 
 /// Lo que contestan las sondas en una CPU sin runtime; ver las notas del
 /// modulo.
+/// What an `ExecutorRuntime` is when it is built, and what a mid-poll
+/// preemption does to it; see the module docs.
+#[cfg(test)]
+mod runtime_birth_tests;
+
 #[cfg(test)]
 mod probe_tests;
 
