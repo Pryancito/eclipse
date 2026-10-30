@@ -270,6 +270,8 @@ fn spawn(
         warn!("spawn: binary {:?} blocked by hunter security policy", path);
         return None;
     }
+    // Trusted only once both gates agreed, never before.
+    hunter::learn_exec(&path);
 
     // Boot UX: clear to black right before the first graphic-console output
     // (prompt). No-op when graphic mode is disabled. Only when this process

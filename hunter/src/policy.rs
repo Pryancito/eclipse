@@ -999,7 +999,7 @@ mod tests {
         // which any process could execute whatever inode it had open there.
         set_exec_learning(true);
         assert!(learn_exec_path("/bin/sh"), "a real program is learnable");
-        // The learning gate in `check_exec_path` is this predicate, so it is
+        // The learning gate in `learn_exec` is this predicate, so it is
         // the one that has to see through the spelling.
         for p in [
             "/proc/self/fd/3",

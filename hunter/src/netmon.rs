@@ -228,11 +228,11 @@ pub enum Directive {
 
 /// Parses one line. `Ok(None)` for a blank line or a comment.
 pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
-    let line = match line.find('#') {
-        Some(i) => &line[..i],
-        None => line,
-    }
-    .trim();
+    // The same comment rule as the control language: a `#` inside a word
+    // (a program path) is part of the word, not the start of a comment.
+    // Cutting at any `#` made `expect tcp 80 /opt/app#2/httpd` lose its
+    // program, and the rule the table renders no longer re-parsed to itself.
+    let line = crate::control::strip_comment(line).trim();
     if line.is_empty() {
         return Ok(None);
     }

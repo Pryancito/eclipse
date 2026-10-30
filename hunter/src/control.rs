@@ -265,7 +265,7 @@ pub fn parse_line(line: &str) -> Result<Option<Directive>, String> {
 /// whitespace, so `mode wx report  # JITs` is `mode wx report` while a `#`
 /// inside a word (a path) is kept. The shipped example annotates its lines
 /// this way, and uncommenting one of them must give a line that parses.
-fn strip_comment(line: &str) -> &str {
+pub(crate) fn strip_comment(line: &str) -> &str {
     let b = line.as_bytes();
     for i in 0..b.len() {
         if b[i] == b'#' && (i == 0 || b[i - 1].is_ascii_whitespace()) {

@@ -257,6 +257,22 @@ fn the_rules_block_round_trips_through_the_language() {
 }
 
 #[test]
+fn a_hash_in_a_program_path_is_not_a_comment() {
+    let _g = reset();
+    let d = parse_line("expect tcp 80 /opt/app#2/httpd  # the second one").unwrap();
+    assert_eq!(
+        d,
+        Some(Directive::Expect(Rule {
+            proto: RuleProto::Tcp,
+            lo: 80,
+            hi: 80,
+            program: Some(alloc::string::String::from("/opt/app#2/httpd")),
+        }))
+    );
+    assert_eq!(parse_line("  # only a comment").unwrap(), None);
+}
+
+#[test]
 fn v6_addresses_keep_their_port_apart() {
     assert_eq!(join_addr("::", 22), "[::]:22");
     assert_eq!(join_addr("10.0.2.15", 22), "10.0.2.15:22");
