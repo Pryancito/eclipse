@@ -169,6 +169,72 @@ fn gtk_caches_and_firefox_wrappers_parse_and_cover_both_caches() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Choosing software WebRender must also DROP the session's GPU pins.
+///
+/// On a GPU session `/etc/profile` and labwc's environment export
+/// `GALLIUM_DRIVER=zink`, `MESA_LOADER_DRIVER_OVERRIDE=zink` and
+/// `VK_DRIVER_FILES` pinned to NVK's ICD alone, and the wrapper inherits
+/// them. It used to add `LIBGL_ALWAYS_SOFTWARE=1` on top and leave them,
+/// which is a contradiction Mesa refuses — Moebius' `~/.eclipse-firefox.log`
+/// on his two 2060 Supers, with the wrapper having correctly picked software
+/// (`ACCEL=0`) and the launch line still saying `GL=zink`:
+///
+/// ```text
+/// MESA-EGL: warning: Not allowed to force software rendering when API
+///                    explicitly selects a hardware device.
+/// MESA: error: ZINK: CPU device requested but none found!
+/// MESA: error: ZINK: failed to choose pdev
+/// MESA-EGL: warning: egl: failed to create dri2 screen
+/// ```
+///
+/// repeated without end: zink asks the loader for a CPU device, and the
+/// NVK-only ICD list cannot have one.
+#[test]
+fn the_software_path_drops_the_sessions_zink_and_nvk_pins() {
+    let dir = std::env::temp_dir().join(format!("eclipse-ff-sw-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    write_firefox_wrapper(&dir);
+    let w = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
+
+    let sw = w
+        .split_once("# Software rendering.")
+        .expect("the software branch must still be there")
+        .1
+        .split_once("\nfi\n")
+        .expect("the renderer if/else must close")
+        .0;
+    for var in [
+        "GALLIUM_DRIVER",
+        "MESA_LOADER_DRIVER_OVERRIDE",
+        "VK_DRIVER_FILES",
+        "VK_ICD_FILENAMES",
+    ] {
+        assert!(
+            sw.contains(&format!("unset {var} ")) || sw.contains(&format!(" {var} ")),
+            "the software branch must unset the inherited {var}:\n{sw}"
+        );
+    }
+    assert!(
+        sw.contains("unset GALLIUM_DRIVER MESA_LOADER_DRIVER_OVERRIDE"),
+        "both Mesa pins go together"
+    );
+    assert!(
+        sw.contains("unset VK_DRIVER_FILES VK_ICD_FILENAMES MESA_VK_DEVICE_SELECT"),
+        "the Vulkan loader pin goes too: zink's CPU device cannot be in an \
+         ICD list holding only NVK"
+    );
+    // ...and the unsets must come BEFORE the software driver is named, or
+    // the `unset` would throw the replacement away again.
+    let unset = sw.find("unset GALLIUM_DRIVER").unwrap();
+    let set = sw.find("export GALLIUM_DRIVER=llvmpipe").expect(
+        "name the software driver outright: LIBGL_ALWAYS_SOFTWARE alone is \
+         what Mesa calls forcing software against an explicit hardware device",
+    );
+    assert!(unset < set, "unset must come before the llvmpipe pin");
+    assert!(sw.contains("export LIBGL_ALWAYS_SOFTWARE=1"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A `firefox` typed into a terminal must BE the wrapper.
 ///
 /// It was not: the wrapper was reachable only through a `.desktop` file, so
