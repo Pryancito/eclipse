@@ -153,7 +153,7 @@ fn gtk_caches_and_firefox_wrappers_parse_and_cover_both_caches() {
     assert!(ff.contains("export NO_AT_BRIDGE=1\n"));
     // Rapid-release is the shipped package; ESR stays as the fallback.
     assert!(
-        ff.contains("for c in firefox firefox-esr; do\n"),
+        ff.contains("for c in /usr/lib/firefox/firefox /usr/lib/firefox-esr/firefox-esr \\\n"),
         "the wrapper must try firefox before firefox-esr"
     );
     assert!(ff.contains("(apt-get install firefox)"));
@@ -165,6 +165,70 @@ fn gtk_caches_and_firefox_wrappers_parse_and_cover_both_caches() {
     assert!(
         ff.contains("nvidia.wlr_pixman"),
         "software kill-switch must be mentioned"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A `firefox` typed into a terminal must BE the wrapper.
+///
+/// It was not: the wrapper was reachable only through a `.desktop` file, so
+/// the one launch path a user takes while debugging got none of its
+/// environment — no `MOZ_CRASHREPORTER_DISABLE=1` (a fault became a `.dmp`
+/// instead of a kernel `[exit] ... at pc=`), no `MOZ_DISABLE_RDD_SANDBOX`
+/// and friends, no zink+NVK-versus-software decision, no launch line in
+/// `~/.eclipse-firefox.log`.
+///
+/// The loop this invites is the point of the second half: `/usr/local/bin`
+/// comes first on `PATH`, so the wrapper must NOT look its binary up by
+/// name or it re-enters the shim forever.
+#[test]
+fn the_browsers_own_name_on_path_is_the_wrapper_and_cannot_loop() {
+    let dir = std::env::temp_dir().join(format!("eclipse-ff-shim-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    write_firefox_wrapper(&dir);
+
+    for name in ["firefox", "firefox-esr"] {
+        let path = dir.join("usr/local/bin").join(name);
+        let shim = fs::read_to_string(&path).unwrap();
+        assert!(shim.starts_with("#!/bin/sh\n"), "{name}: shebang");
+        assert!(
+            shim.contains("exec /usr/local/bin/eclipse-firefox \"$@\"\n"),
+            "{name} must exec the wrapper, got:\n{shim}"
+        );
+        let st = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success(), "{name}: sh -n rejected the shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "{name} must be executable");
+        }
+    }
+
+    let wrapper = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
+    assert!(
+        !wrapper.contains("command -v \"$c\""),
+        "the wrapper must not resolve the browser by name: /usr/local/bin is \
+         first on PATH, so `command -v firefox` finds the shim and loops"
+    );
+    for abs in [
+        "/usr/lib/firefox/firefox",
+        "/usr/lib/firefox-esr/firefox-esr",
+        "/usr/bin/firefox",
+    ] {
+        assert!(
+            wrapper.contains(abs),
+            "the wrapper must look for {abs} by absolute path"
+        );
+    }
+    assert!(
+        wrapper.contains("if [ -t 2 ]; then\n"),
+        "launched from a terminal the wrapper must leave stderr on the \
+         terminal instead of swallowing it into the log"
     );
     let _ = fs::remove_dir_all(&dir);
 }

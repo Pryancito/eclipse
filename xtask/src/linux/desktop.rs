@@ -1563,9 +1563,16 @@ fn write_firefox_wrapper(rootfs: &Path) {
           export XDG_CACHE_HOME=\"${XDG_CACHE_HOME:-/tmp/xdg-cache}\"\n\
           mkdir -p \"$XDG_CACHE_HOME\"\n\
           FLOG=\"${HOME:-/root}/.eclipse-firefox.log\"\n\
+          # ABSOLUTE paths, never `command -v firefox`: /usr/local/bin/firefox\n\
+          # is the shim that got us here and comes FIRST on PATH, so a name\n\
+          # lookup would re-enter this script forever. firefox before\n\
+          # firefox-esr, install dir before /usr/bin (which on a Debian rootfs\n\
+          # is a symlink into the install dir anyway).\n\
           FFBIN=\n\
-          for c in firefox firefox-esr; do\n\
-          \x20 if command -v \"$c\" >/dev/null 2>&1; then FFBIN=$c; break; fi\n\
+          for c in /usr/lib/firefox/firefox /usr/lib/firefox-esr/firefox-esr \\\n\
+          \x20\x20\x20\x20\x20\x20\x20\x20 /usr/bin/firefox /usr/bin/firefox-esr \\\n\
+          \x20\x20\x20\x20\x20\x20\x20\x20 /bin/firefox /bin/firefox-esr; do\n\
+          \x20 if [ -x \"$c\" ]; then FFBIN=$c; break; fi\n\
           done\n\
           if [ -z \"$FFBIN\" ]; then\n\
           \x20 echo 'eclipse-firefox: firefox not found (apt-get install firefox)' >&2\n\
@@ -1574,12 +1581,64 @@ fn write_firefox_wrapper(rootfs: &Path) {
           fi\n\
           echo \"[$(date '+%H:%M:%S')] $FFBIN $* (WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-UNSET} GL=${GALLIUM_DRIVER:-sw} ACCEL=${MOZ_ACCELERATED:-?})\" >>\"$FLOG\"\n\
           [ -n \"${NVK_SW_REASON:-}\" ] && echo \"eclipse-firefox: $NVK_SW_REASON\" >>\"$FLOG\"\n\
+          # Launched from a terminal, stderr belongs to the terminal: swallowing\n\
+          # it into the log is how `firefox` typed into foot would print nothing\n\
+          # at all. Off a tty (.desktop, menu, autostart) the log is the only\n\
+          # place it could go, so keep the redirect there.\n\
+          if [ -t 2 ]; then\n\
+          \x20 exec \"$FFBIN\" \"$@\"\n\
+          fi\n\
           exec \"$FFBIN\" \"$@\" 2>>\"$FLOG\"\n",
     )
     .unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    write_firefox_name_shims(&localbin);
+}
+
+/// `/usr/local/bin/firefox` and `/usr/local/bin/firefox-esr`: the browser's
+/// OWN names, pointing at [`write_firefox_wrapper`]'s script.
+///
+/// Until these existed the wrapper was reachable only through a `.desktop`
+/// file — the panel launcher, the labwc menu, `eclipse-view`. A `firefox`
+/// typed into a terminal ran the packaged binary directly and got NONE of
+/// the wrapper's environment, which is not a cosmetic difference:
+///
+/// * `MOZ_CRASHREPORTER_DISABLE=1` is unset, so a fault is swallowed by
+///   Breakpad into a `.dmp` nobody can read here instead of reaching the
+///   kernel, where `[exit] ... at pc=` names the library and offset. That is
+///   what `ExceptionHandler::GenerateDump attempting to generate:` followed
+///   by a row of `Exiting due to channel error.` is: the parent faulted,
+///   Breakpad ate the signal, the children only saw the channel close.
+/// * `MOZ_DISABLE_RDD_SANDBOX` and its four siblings are unset, so the media
+///   decoder and the socket process start sandboxed.
+/// * The zink+NVK / software-WebRender decision never runs, so a session
+///   where NVK enumerates no device falls into GL on lavapipe.
+/// * `$HOME/.eclipse-firefox.log` gets no line.
+///
+/// `/usr/local/bin` is first on `PATH` (`/etc/profile`, eclipse-init's
+/// `CHILD_ENV`, the labwc environment), so these shadow `/usr/bin/firefox`
+/// the way `/usr/local/bin/labwc` already shadows the packaged compositor.
+/// The wrapper resolves the real binary by absolute path for this reason: a
+/// `command -v firefox` would now find the shim and loop.
+fn write_firefox_name_shims(localbin: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    for name in ["firefox", "firefox-esr"] {
+        let shim = localbin.join(name);
+        fs::write(
+            &shim,
+            b"#!/bin/sh\n\
+              # Eclipse OS: the browser's own name on PATH, so a `firefox`\n\
+              # typed into a terminal starts the same way the menu does.\n\
+              # See write_firefox_name_shims in xtask/src/linux/desktop.rs.\n\
+              exec /usr/local/bin/eclipse-firefox \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
 
