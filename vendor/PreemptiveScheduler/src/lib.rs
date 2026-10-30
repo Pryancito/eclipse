@@ -43,6 +43,12 @@ extern crate log;
 #[cfg(test)]
 extern crate std;
 
+#[cfg(test)]
+pub(crate) fn evaluate_log_arguments_in_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| log::set_max_level(log::LevelFilter::Trace));
+}
+
 // The bench harness. `extern crate test` is what makes `test::Bencher` and
 // `test::black_box` nameable from the `mod benches` blocks; the rows live
 // inline next to the mechanisms they time (and usually *inside* the existing

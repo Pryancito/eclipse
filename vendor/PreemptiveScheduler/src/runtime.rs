@@ -51,6 +51,7 @@ pub(crate) fn executor_ready_mask() -> u64 {
 /// `cargo test` locally would, intermittently.
 #[cfg(test)]
 pub(crate) fn resched_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::evaluate_log_arguments_in_tests();
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }

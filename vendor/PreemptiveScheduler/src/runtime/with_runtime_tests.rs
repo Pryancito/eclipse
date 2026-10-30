@@ -316,15 +316,23 @@ fn a_fault_is_attributed_to_the_stack_its_pointers_land_on() {
 ///
 /// The walk is `try_lock` only because it runs from the panic path, where
 /// waiting for a lock turns a diagnosable fault into a freeze with nothing on
-/// screen. The count is how a reader of the report knows the answer is partial.
+/// screen. The count is how a reader of the report knows the answer is partial:
+/// every online CPU has to land in one bucket or the other, or the report says
+/// "no esta en ninguna pila" while having quietly looked at fewer stacks than
+/// the machine has.
 #[test]
 fn the_cpus_the_walk_could_not_look_at_are_counted() {
-    // Four CPUs "online", one of which has a runtime.
+    // Four CPUs "online". How many of them have a runtime is NOT fixed: the
+    // slots are `Once`, and a ranking test in `placement_tests` legitimately
+    // builds a victim's. The property is the accounting, so it is read from
+    // whichever slots exist.
     let _rt = with_runtime(0b1111);
+    let built = (0..4).filter(|&c| GLOBAL_RUNTIME.get(c).is_some()).count();
     let attr = attribute_fault_stack_ptrs(0x1000, 0x2000);
-    assert_eq!(attr.cpus_walked, 1);
+    assert_eq!(attr.cpus_walked, built);
     assert_eq!(
-        attr.cpus_skipped, 3,
+        attr.cpus_skipped,
+        4 - built,
         "no se contaron los huecos sin construir"
     );
 }

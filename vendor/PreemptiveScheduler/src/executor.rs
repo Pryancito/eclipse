@@ -168,6 +168,7 @@ impl StubExecutor {
 /// for the lot, and the four modules take this one.
 #[cfg(test)]
 pub(crate) fn executor_globals_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::evaluate_log_arguments_in_tests();
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }

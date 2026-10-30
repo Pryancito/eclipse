@@ -36,14 +36,31 @@ struct Placed {
     saved_stranded: u64,
 }
 
-/// Give CPU 0 a brand-new collection and a strong executor built from it.
-fn reset_cpu0() {
-    let mut rt = GLOBAL_RUNTIME.force(0).lock();
+/// Give `cpu`'s runtime a brand-new collection and a strong executor built
+/// from it, building the slot if it does not exist yet.
+fn reset_cpu(cpu: usize) {
+    let mut rt = GLOBAL_RUNTIME.force(cpu).lock();
     rt.current_executor = None;
     rt.weak_executors.clear();
-    rt.task_collection = TaskCollection::new(0);
+    rt.task_collection = TaskCollection::new(cpu as u8);
     let fresh = Arc::new(Executor::new(rt.task_collection.clone()));
     rt.strong_executor = fresh;
+}
+
+/// Empty every slot that exists, which is CPU 0 plus whichever victims a
+/// ranking test asked for.
+///
+/// The slots are `Once`: a victim one test built is there for the rest of the
+/// process, and a task left in its queue would be in the next test's count --
+/// including the counts of `probe_tests`, which takes the same lock and whose
+/// premise is that the peers hold nothing.
+fn reset_built_slots() {
+    reset_cpu(0);
+    for cpu in 1..MAX_CORE_NUM {
+        if GLOBAL_RUNTIME.get(cpu).is_some() {
+            reset_cpu(cpu);
+        }
+    }
 }
 
 impl Drop for Placed {
@@ -53,7 +70,7 @@ impl Drop for Placed {
         // built reclaim their blocks at `Drop` instead of being parked in the
         // retired-stack table waiting for CPUs this host does not have.
         set_executor_ready_mask_for_test(0);
-        reset_cpu0();
+        reset_built_slots();
         publish_weak_waiting(0);
         STEALABLE.store(self.saved_stealable, O::SeqCst);
         STRANDED.store(self.saved_stranded, O::SeqCst);
@@ -83,7 +100,7 @@ fn placed(ready: u64, cpu: u8) -> Placed {
     // retired-stack table waiting for CPUs this host does not have. The mask
     // the suite found is the one captured for the way out.
     let saved_ready = set_executor_ready_mask_for_test(0);
-    reset_cpu0();
+    reset_built_slots();
     publish_weak_waiting(0);
     set_executor_ready_mask_for_test(ready);
     let saved_cpu = crate::arch::set_cpu_id_for_test(cpu);
@@ -655,4 +672,116 @@ fn tirar_un_runtime_es_un_error_que_se_anuncia() {
     let runtime = ExecutorRuntime::new(0);
     set_executor_ready_mask_for_test(saved);
     drop(runtime);
+}
+
+/// **A CPU with no logical id steals nothing, and does not index the scratch
+/// array it has no slot in.**
+///
+/// `STEAL_CANDIDATES` is one element per CPU and the victim list lives in this
+/// CPU's own, deliberately OFF this stack frame: it used to be a 1 KiB array
+/// on the scan's frame whose zero-init blanked a return address a parked
+/// executor's saved frame shared with it, which is every captured
+/// `[null-exec]`. `cpu_id()` under `MAX_CORE_NUM` is a scheduler invariant, so
+/// this never fires in practice; bailing to "no steal this pass" is what it
+/// does if it ever did.
+#[test]
+fn una_cpu_sin_id_logico_no_roba_y_no_indexa_el_bloc_que_no_tiene() {
+    let _p = placed(0b11, u8::MAX);
+    note_stealable(0);
+    assert!(
+        steal_task_from_other_cpu().is_none(),
+        "sin ranura propia en el bloc del barrido no hay barrido"
+    );
+}
+
+/// **A peer with work, but less than the bar the caller set, is not a
+/// candidate.**
+///
+/// The rebalance pull asks for `1 + REBALANCE_MARGIN`: its caller already has
+/// exactly one runnable task of its own, so pulling off a peer that holds one
+/// too would just hand the queue back and forth on every rebalance tick.
+#[test]
+fn un_igual_con_menos_trabajo_del_que_se_pide_no_es_candidato() {
+    let _p = placed(0b11, 1);
+    note_stealable(0);
+    {
+        let rt = GLOBAL_RUNTIME.force(0).lock();
+        rt.add_task(DEFAULT_PRIORITY, parked(), None);
+    }
+    let (_, probed_before, _, _, _, _, _) = sched_steal_stats();
+    assert!(
+        steal_for_balance().is_none(),
+        "una tarea no es «claramente mas rico» que ninguna"
+    );
+    assert_eq!(
+        sched_steal_stats().1,
+        probed_before,
+        "y al no ser candidato no se le sonda la cola: el reparto no toca su \
+         cerrojo de coleccion"
+    );
+}
+
+/// **With two victims the thief goes to the richer one first.**
+///
+/// Ranking is on *runnable tasks we may poll*, descending. A plain ascending
+/// sweep by cpu id sent every idle core at the same lowest-id victim first,
+/// and all but one of them lost the `try_lock` and walked away empty; and
+/// ranking by total tasks put a CPU full of blocked daemons ahead of the
+/// genuinely backlogged one.
+#[test]
+fn con_dos_victimas_el_ladron_va_primero_a_la_mas_rica() {
+    let _p = placed(0b111, 2);
+    reset_cpu(1);
+    {
+        let poor = GLOBAL_RUNTIME.force(0).lock();
+        poor.add_task(DEFAULT_PRIORITY, parked(), None);
+        let rich = GLOBAL_RUNTIME.force(1).lock();
+        for _ in 0..4 {
+            rich.add_task(DEFAULT_PRIORITY, parked(), None);
+        }
+    }
+    note_stealable(0);
+    note_stealable(1);
+
+    assert!(steal_task_from_other_cpu().is_some());
+
+    assert_eq!(
+        GLOBAL_RUNTIME.force(0).lock().ready_num(),
+        Some(1),
+        "la victima pobre sigue con la suya: no se la toco"
+    );
+    assert_eq!(
+        GLOBAL_RUNTIME.force(1).lock().ready_num(),
+        Some(3),
+        "la tarea salio de la rica, que es a la que se fue primero"
+    );
+}
+
+/// **With no CPU named and two CPUs ready, the task goes to the emptier
+/// one.**
+///
+/// The scan keeps the best seen so far, so a later candidate that is not
+/// better has to leave it alone -- the half of the comparison a single-CPU
+/// machine can never exercise.
+#[test]
+fn con_dos_cpus_listas_la_tarea_nace_en_la_menos_cargada() {
+    let _p = placed(0b11, 0);
+    reset_cpu(1);
+    {
+        let busy = GLOBAL_RUNTIME.force(0).lock();
+        for _ in 0..3 {
+            busy.add_task(DEFAULT_PRIORITY, parked(), None);
+        }
+    }
+    spawn_task(parked(), None, None, None);
+    assert_eq!(
+        GLOBAL_RUNTIME.force(1).lock().task_num(),
+        1,
+        "la CPU 1 estaba vacia y es donde tenia que caer"
+    );
+    assert_eq!(
+        GLOBAL_RUNTIME.force(0).lock().task_num(),
+        3,
+        "la 0 no crecio"
+    );
 }
