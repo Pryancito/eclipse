@@ -2262,8 +2262,13 @@ impl Syscall<'_> {
                 }
             }
         }
+        // A PCM write or drain that blocks waits asleep here rather than
+        // spinning inside the synchronous `io_control`: see
+        // `PcmDev::writei_sleeping`. Its answer goes through the same
+        // errno normalisation and logging as every other ioctl below.
+        let pcm_wait = pcm_sleeping_ioctl(&file_like, request, arg1).await;
         // `TIOCGWINSZ` (get terminal window size).
-        let ret = match file_like.ioctl(request, arg1, arg2, arg3) {
+        let ret = match pcm_wait.unwrap_or_else(|| file_like.ioctl(request, arg1, arg2, arg3)) {
             // Some programs insist on a valid window size and keep retrying
             // `TIOCGWINSZ` when it fails on a char device that is not a full
             // tty backend (e.g. DRM/fb). Only synthesize a size for char
@@ -2811,6 +2816,27 @@ impl Syscall<'_> {
         buf.write(statfs)?;
         Ok(0)
     }
+}
+
+/// The PCM ioctls that block -- a `WRITEI_FRAMES` on a blocking descriptor,
+/// and `DRAIN` -- served by `PcmDev`'s sleeping waits. `None` for every other
+/// request and every other file, which go to the synchronous `ioctl`.
+async fn pcm_sleeping_ioctl(
+    file_like: &Arc<dyn FileLike>,
+    request: usize,
+    arg1: usize,
+) -> Option<SysResult> {
+    use linux_object::fs::devfs::{PcmBlockingIoctl, PcmDev};
+    let kind = PcmBlockingIoctl::of(request as u32)?;
+    let file = file_like.downcast_ref::<File>()?;
+    let inode = file.inode();
+    let pcm = inode.as_any_ref().downcast_ref::<PcmDev>()?;
+    let res = match kind {
+        PcmBlockingIoctl::WriteiFrames if file_like.flags().non_block() => return None,
+        PcmBlockingIoctl::WriteiFrames => pcm.writei_sleeping(arg1).await,
+        PcmBlockingIoctl::Drain => pcm.drain_sleeping().await,
+    };
+    Some(res.map(|()| 0))
 }
 
 /// `include/uapi/linux/magic.h`: the pseudo filesystems a descriptor with no

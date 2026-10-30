@@ -52,6 +52,7 @@ use lock::Mutex;
 use rcore_fs::vfs::*;
 use rcore_fs_devfs::DevFS;
 
+use crate::error::LxResult;
 use crate::fs::OpenFlags;
 
 fn ucheck<T>(addr: usize) -> Result<()> {
@@ -123,6 +124,62 @@ const BUFFER_STALL_FLOOR: core::time::Duration = core::time::Duration::from_mill
 /// How long a blocking `writei` waits before re-offering PCM to a full ring.
 /// The same backoff `/dev/dsp` uses; see the loop in [`PcmDev::writei`].
 const WRITE_RETRY_BACKOFF: core::time::Duration = core::time::Duration::from_micros(250);
+/// How long a blocking `writei` goes without the ring taking a byte before it
+/// gives up and returns what it wrote.
+const WRITE_STALL_LIMIT: core::time::Duration = core::time::Duration::from_secs(4);
+/// Bounds of a sleeping writer's wait for room (see [`refill_wait_for`]).
+/// The floor is the spinning path's backoff; the ceiling keeps the refill
+/// well inside even a small buffer, so sleeping never turns into an underrun.
+const REFILL_WAIT_MIN: core::time::Duration = core::time::Duration::from_micros(250);
+const REFILL_WAIT_MAX: core::time::Duration = core::time::Duration::from_millis(10);
+/// Bounds of one slice of a sleeping `DRAIN` (see [`drain_wait_for`]).
+const DRAIN_WAIT_MIN: core::time::Duration = core::time::Duration::from_millis(1);
+const DRAIN_WAIT_MAX: core::time::Duration = core::time::Duration::from_millis(20);
+
+/// How long `frames` take to play at `rate` Hz.
+fn play_time(frames: u64, rate: u64) -> Duration {
+    Duration::from_nanos(frames.saturating_mul(1_000_000_000) / rate.max(1))
+}
+
+/// A blocked writer's sleep before it offers the ring PCM again: the time
+/// the device takes to free `frames`, within [`REFILL_WAIT_MIN`,
+/// `REFILL_WAIT_MAX`].
+fn refill_wait_for(frames: u64, rate: u32) -> Duration {
+    play_time(frames, rate as u64).clamp(REFILL_WAIT_MIN, REFILL_WAIT_MAX)
+}
+
+/// One slice of a sleeping `DRAIN` with `queued` frames still to play: their
+/// play time, within [`DRAIN_WAIT_MIN`, `DRAIN_WAIT_MAX`]. The ceiling is
+/// what notices a stream that stopped or was reset under the drain.
+fn drain_wait_for(queued: u64, rate: u64) -> Duration {
+    play_time(queued, rate).clamp(DRAIN_WAIT_MIN, DRAIN_WAIT_MAX)
+}
+
+/// The two PCM ioctls a process may block in, and which the syscall
+/// dispatcher therefore routes to the sleeping waits instead of the
+/// synchronous `io_control` (see [`PcmDev::writei_sleeping`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcmBlockingIoctl {
+    /// `SNDRV_PCM_IOCTL_WRITEI_FRAMES`, on a blocking descriptor.
+    WriteiFrames,
+    /// `SNDRV_PCM_IOCTL_DRAIN`.
+    Drain,
+}
+
+impl PcmBlockingIoctl {
+    /// Which of the two `cmd` is, decoded the way [`PcmDev`]'s `io_control`
+    /// decodes it (type `'A'` and the number; direction and size ignored).
+    pub fn of(cmd: u32) -> Option<Self> {
+        if (cmd >> 8) & 0xff != b'A' as u32 {
+            return None;
+        }
+        match cmd & 0xff {
+            0x50 => Some(Self::WriteiFrames),
+            0x44 => Some(Self::Drain),
+            _ => None,
+        }
+    }
+}
 const STATE_DRAINING: i32 = 5;
 const STATE_PAUSED: i32 = 6;
 const TSTAMP_MODE_LAST: i32 = 1;
@@ -1384,44 +1441,86 @@ impl PcmDev {
         Err(FsError::Broken)
     }
 
-    /// Interleaved write. Blocking callers keep the old spin-retry behaviour;
-    /// nonblocking callers get Linux-style "write what fits right now, else
-    /// EAGAIN" semantics so alsa-lib/PulseAudio can return to poll().
-    fn writei(&self, xfer: &mut SndXferI, flags: OpenFlags) -> Result<()> {
-        {
-            let mut st = self.st.lock();
-            self.note_underrun(&mut st);
-            // Linux (`__snd_pcm_lib_xfer`) accepts PREPARED, RUNNING *and*
-            // PAUSED, and answers every other state with EBADFD -- never
-            // EINVAL. Both halves of that matter to a client:
-            //
-            //  * PAUSED was rejected here, so a client that pauses and keeps
-            //    filling the buffer (what PulseAudio's ALSA sink does while a
-            //    stream is corked) got an error where Linux takes the data.
-            //  * EINVAL means "bad arguments" and alsa-lib treats it as a
-            //    caller bug rather than a stream-state problem, which is how a
-            //    plain state mismatch reached PulseAudio as a fatal error:
-            //      [einval-hunt] pid=1028 syscall=16 (IOCTL) a1=0x40184150 -> EINVAL
-            //    (0x40184150 = _IOW('A', 0x50, 24) = WRITEI_FRAMES), and then
-            //    an abort inside libasound.
-            // An underrun is not "this fd is unusable": Linux answers EPIPE and
-            // every client recovers with `snd_pcm_prepare()`. Reporting EBADFD
-            // here would tell PulseAudio the stream is dead when it is merely
-            // stalled.
-            if st.state == STATE_XRUN {
-                return Err(FsError::Broken);
-            }
-            if st.state != STATE_PREPARED && st.state != STATE_RUNNING && st.state != STATE_PAUSED {
-                // Name the state: the errno alone cannot say whether the
-                // stream was never prepared (SETUP), already torn down (OPEN)
-                // or something else.
-                warn!(
-                    "[snd] pcmC{}D0p: writei in state {} (need prepared/running/paused) -> EBADFD",
-                    self.card, st.state
-                );
-                return Err(FsError::BadState);
-            }
+    /// The state check every `WRITEI_FRAMES` makes before it moves a frame.
+    fn writei_admit(&self) -> Result<()> {
+        let mut st = self.st.lock();
+        self.note_underrun(&mut st);
+        // Linux (`__snd_pcm_lib_xfer`) accepts PREPARED, RUNNING *and*
+        // PAUSED, and answers every other state with EBADFD -- never
+        // EINVAL. Both halves of that matter to a client:
+        //
+        //  * PAUSED was rejected here, so a client that pauses and keeps
+        //    filling the buffer (what PulseAudio's ALSA sink does while a
+        //    stream is corked) got an error where Linux takes the data.
+        //  * EINVAL means "bad arguments" and alsa-lib treats it as a
+        //    caller bug rather than a stream-state problem, which is how a
+        //    plain state mismatch reached PulseAudio as a fatal error:
+        //      [einval-hunt] pid=1028 syscall=16 (IOCTL) a1=0x40184150 -> EINVAL
+        //    (0x40184150 = _IOW('A', 0x50, 24) = WRITEI_FRAMES), and then
+        //    an abort inside libasound.
+        // An underrun is not "this fd is unusable": Linux answers EPIPE and
+        // every client recovers with `snd_pcm_prepare()`. Reporting EBADFD
+        // here would tell PulseAudio the stream is dead when it is merely
+        // stalled.
+        if st.state == STATE_XRUN {
+            return Err(FsError::Broken);
         }
+        if st.state != STATE_PREPARED && st.state != STATE_RUNNING && st.state != STATE_PAUSED {
+            // Name the state: the errno alone cannot say whether the
+            // stream was never prepared (SETUP), already torn down (OPEN)
+            // or something else.
+            warn!(
+                "[snd] pcmC{}D0p: writei in state {} (need prepared/running/paused) -> EBADFD",
+                self.card, st.state
+            );
+            return Err(FsError::BadState);
+        }
+        Ok(())
+    }
+
+    /// One offer of a blocking write to the ring: queue as much of
+    /// `src[done..total_bytes]` as the negotiated buffer has room for, and
+    /// count it. Returns the bytes taken, 0 when the buffer is full.
+    fn writei_offer(&self, src: *const u8, done: usize, total_bytes: usize) -> Result<usize> {
+        // Respect the negotiated buffer size: never queue past it.
+        let st_buffer = self.st.lock().buffer_size;
+        let queued = self.queued_frames();
+        let room_frames = st_buffer.saturating_sub(queued);
+        let room = (room_frames * BYTES_PER_FRAME) as usize;
+        let chunk = room.min(total_bytes - done);
+        if chunk < BYTES_PER_FRAME as usize {
+            return Ok(0);
+        }
+        let buf = unsafe { core::slice::from_raw_parts(src.add(done), chunk) };
+        let n = self.audio.write(buf).map_err(|_| FsError::DeviceError)?;
+        if n > 0 {
+            self.commit_write_progress(n);
+        }
+        Ok(n)
+    }
+
+    /// How long a blocked writer sleeps before offering the ring PCM again.
+    ///
+    /// Long enough for the device to play out what the writer is waiting for
+    /// room for: the rest of its write, or `avail_min` frames if that is less
+    /// -- the point at which Linux wakes a writer blocked in
+    /// `snd_pcm_lib_write`. See [`refill_wait_for`] for the bounds.
+    fn refill_wait(&self, remaining_bytes: usize) -> Duration {
+        let st = self.st.lock();
+        let frames = (remaining_bytes as u64 / BYTES_PER_FRAME).min(st.avail_min.max(1));
+        refill_wait_for(frames, st.rate)
+    }
+
+    /// Interleaved write. Nonblocking callers get Linux-style "write what
+    /// fits right now, else EAGAIN" semantics so alsa-lib/PulseAudio can
+    /// return to poll().
+    ///
+    /// A blocking `ioctl(2)` from a process does not wait here: the syscall
+    /// dispatcher hands it to [`Self::writei_sleeping`], which waits for room
+    /// asleep. What is left on this synchronous path is a caller with no
+    /// executor to give the CPU back to, and it keeps the spin-retry.
+    fn writei(&self, xfer: &mut SndXferI, flags: OpenFlags) -> Result<()> {
+        self.writei_admit()?;
         let total_bytes = (xfer.frames * BYTES_PER_FRAME) as usize;
         let src = xfer.buf as *const u8;
         if flags.non_block() {
@@ -1452,25 +1551,12 @@ impl PcmDev {
             return Ok(());
         }
         let mut done = 0usize;
-        let deadline_step = core::time::Duration::from_secs(4);
-        let mut deadline = kernel_hal::timer::timer_now() + deadline_step;
+        let mut deadline = kernel_hal::timer::timer_now() + WRITE_STALL_LIMIT;
         while done < total_bytes {
-            // Respect the negotiated buffer size: never queue past it.
-            let st_buffer = self.st.lock().buffer_size;
-            let queued = self.queued_frames();
-            let room_frames = st_buffer.saturating_sub(queued);
-            let room = (room_frames * BYTES_PER_FRAME) as usize;
-            let chunk = room.min(total_bytes - done);
-            let n = if chunk >= BYTES_PER_FRAME as usize {
-                let buf = unsafe { core::slice::from_raw_parts(src.add(done), chunk) };
-                self.audio.write(buf).map_err(|_| FsError::DeviceError)?
-            } else {
-                0
-            };
+            let n = self.writei_offer(src, done, total_bytes)?;
             if n > 0 {
                 done += n;
-                self.commit_write_progress(n);
-                deadline = kernel_hal::timer::timer_now() + deadline_step;
+                deadline = kernel_hal::timer::timer_now() + WRITE_STALL_LIMIT;
                 continue;
             }
             if kernel_hal::timer::timer_now() >= deadline {
@@ -1495,7 +1581,65 @@ impl PcmDev {
         Ok(())
     }
 
-    fn drain(&self) -> Result<()> {
+    /// A blocking `WRITEI_FRAMES` from the async syscall dispatcher: the
+    /// same write as [`Self::writei`], with the wait for room spent asleep.
+    ///
+    /// The synchronous loop waits by spinning, and a blocking writer is
+    /// waiting nearly all the time: the ring takes PCM at its playback rate
+    /// (192 KB/s at 48 kHz) and the writer is ahead of it by a whole buffer.
+    /// So `aplay`, `mpg123 -o alsa`, SDL and every other client that leaves
+    /// its PCM blocking held one CPU at 100% for as long as it played --
+    /// not running anything, just re-reading the DMA position -- and, being
+    /// a synchronous loop inside one poll, kept every other task queued on
+    /// that CPU waiting for the timer to preempt it. Here the CPU goes back
+    /// to the scheduler (or to `hlt`) between offers, and the writer is
+    /// woken when the device has played what it is waiting for room for.
+    ///
+    /// A signal ends the wait as it ends Linux's: the frames already queued
+    /// are the result, and with none queued the call fails with `EINTR`.
+    pub async fn writei_sleeping(&self, data: usize) -> LxResult<()> {
+        ucheck::<SndXferI>(data)?;
+        self.writei_admit()?;
+        let (total_bytes, src) = {
+            let xfer = unsafe { &*(data as *const SndXferI) };
+            ((xfer.frames * BYTES_PER_FRAME) as usize, xfer.buf as usize)
+        };
+        let mut done = 0usize;
+        let mut deadline = kernel_hal::timer::timer_now() + WRITE_STALL_LIMIT;
+        while done < total_bytes {
+            let n = self.writei_offer(src as *const u8, done, total_bytes)?;
+            if n > 0 {
+                done += n;
+                deadline = kernel_hal::timer::timer_now() + WRITE_STALL_LIMIT;
+                continue;
+            }
+            let now = kernel_hal::timer::timer_now();
+            if now >= deadline {
+                warn!("[snd] pcmC{}D0p: writei stalled", self.card);
+                break;
+            }
+            kernel_hal::deferred_job::drain_deferred_jobs();
+            let wake = (now + self.refill_wait(total_bytes - done)).min(deadline);
+            if let Err(e) =
+                crate::process::interruptible(kernel_hal::thread::sleep_until(wake)).await
+            {
+                if done == 0 {
+                    return Err(e);
+                }
+                break;
+            }
+        }
+        // Re-checked: the process may have unmapped the struct while asleep.
+        ucheck::<SndXferI>(data)?;
+        unsafe { (*(data as *mut SndXferI)).result = (done as u64 / BYTES_PER_FRAME) as i64 };
+        Ok(())
+    }
+
+    /// The first half of `DRAIN`: start a primed stream, or finish at once.
+    ///
+    /// `None` when there is nothing to wait for; otherwise the deadline the
+    /// wait is bounded by and the stream's rate.
+    fn drain_begin(&self) -> Option<(Duration, u64)> {
         let rate = {
             let mut st = self.st.lock();
             // Linux starts a PREPARED stream that holds data before draining
@@ -1514,7 +1658,7 @@ impl PcmDev {
                 st.appl_ptr = 0;
                 st.stalled_since = None;
                 self.clear_timer_focus();
-                return Ok(());
+                return None;
             }
             st.state = STATE_DRAINING;
             st.rate.max(1) as u64
@@ -1526,33 +1670,71 @@ impl PcmDev {
                     .saturating_add(2)
                     .min(10),
             );
-        while self.audio.queued_bytes() > 0 {
-            {
-                let st = self.st.lock();
-                if st.state != STATE_DRAINING {
-                    break;
-                }
-            }
-            if kernel_hal::timer::timer_now() >= deadline {
-                break;
-            }
-            // The engine stopping mid-drain (the ring ran dry, or it was
-            // reset under us) means the rest is never going to play out.
-            if !self.audio.is_playing() {
-                break;
-            }
-            kernel_hal::deferred_job::drain_deferred_jobs();
-            core::hint::spin_loop();
+        Some((deadline, rate))
+    }
+
+    /// Whether a `DRAIN` still has something to wait for.
+    fn drain_pending(&self, deadline: Duration) -> bool {
+        if self.audio.queued_bytes() == 0 {
+            return false;
         }
-        // Drain done (or timed out): wipe the ring so leftover PCM cannot
-        // loop. PREPARE/DROP also reset; this covers PulseAudio's end-of-stream
-        // path that only DRAIN'd.
+        if self.st.lock().state != STATE_DRAINING {
+            return false;
+        }
+        if kernel_hal::timer::timer_now() >= deadline {
+            return false;
+        }
+        // The engine stopping mid-drain (the ring ran dry, or it was
+        // reset under us) means the rest is never going to play out.
+        self.audio.is_playing()
+    }
+
+    /// The last half of `DRAIN`, done (or timed out).
+    fn drain_finish(&self) {
+        // Wipe the ring so leftover PCM cannot loop. PREPARE/DROP also
+        // reset; this covers PulseAudio's end-of-stream path that only
+        // DRAIN'd.
         let _ = self.audio.reset();
         let mut st = self.st.lock();
         st.state = STATE_SETUP;
         st.appl_ptr = 0;
         st.stalled_since = None;
         self.clear_timer_focus();
+    }
+
+    /// `DRAIN` for a caller with no executor to give the CPU back to; a
+    /// process's ioctl goes through [`Self::drain_sleeping`] instead.
+    fn drain(&self) -> Result<()> {
+        if let Some((deadline, _)) = self.drain_begin() {
+            while self.drain_pending(deadline) {
+                kernel_hal::deferred_job::drain_deferred_jobs();
+                core::hint::spin_loop();
+            }
+            self.drain_finish();
+        }
+        Ok(())
+    }
+
+    /// A process's `DRAIN`: [`Self::drain`] with the wait spent asleep.
+    ///
+    /// Every client that ends a stream cleanly drains it, and the queue it
+    /// waits out is up to a whole buffer -- a third of a second by default,
+    /// and the bound is ten seconds. The synchronous version spent all of
+    /// it spinning on one CPU. This one sleeps until the device should have
+    /// played what is queued, a slice at a time (see [`drain_wait_for`]).
+    ///
+    /// Not interruptible, like the synchronous one it replaces: an abandoned
+    /// drain would leave the stream DRAINING with no one to move it on.
+    pub async fn drain_sleeping(&self) -> LxResult<()> {
+        if let Some((deadline, rate)) = self.drain_begin() {
+            while self.drain_pending(deadline) {
+                kernel_hal::deferred_job::drain_deferred_jobs();
+                let now = kernel_hal::timer::timer_now();
+                let wake = (now + drain_wait_for(self.queued_frames(), rate)).min(deadline);
+                kernel_hal::thread::sleep_until(wake).await;
+            }
+            self.drain_finish();
+        }
         Ok(())
     }
 
@@ -2742,6 +2924,9 @@ mod hw_params_tests;
 
 #[cfg(test)]
 mod ctl_tests;
+
+#[cfg(test)]
+mod sleeping_tests;
 
 // ── Control device node ─────────────────────────────────────────────────────
 
