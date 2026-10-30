@@ -501,6 +501,103 @@ impl DspDev {
         (hw_bytes as u64).div_ceil(bps.max(1)) + 1
     }
 
+    /// The ring's playback rate, in hardware frames a second.
+    fn hw_rate(&self) -> u32 {
+        self.audio.params().0
+    }
+
+    /// A sleeping writer's wait for room: the time the device takes to play
+    /// one fragment, within the bounds of [`super::snd::refill_wait_for`].
+    /// Linux's OSS emulation wakes a blocked writer a period at a time too.
+    fn refill_wait(&self) -> core::time::Duration {
+        let period = {
+            let rt = self.rt.lock();
+            rt.hw_bytes(rt.period_bytes.max(rt.client_frame()))
+        };
+        super::snd::refill_wait_for((period / HW_FRAME) as u64, self.hw_rate())
+    }
+
+    /// Whether room for a write that found none is coming: the ring drains
+    /// only while the stream is triggered. A held stream (`SETTRIGGER` off)
+    /// answers `EAGAIN` to a blocking writer as before, never sleeps.
+    fn room_is_coming(&self) -> bool {
+        self.rt.lock().trigger
+    }
+
+    /// `write(2)` on a blocking descriptor, from the async syscall
+    /// dispatcher: [`Self::write_pcm`] with the wait for room spent asleep.
+    ///
+    /// The blocking `write_pcm` waits by spinning on a 250 us backoff, and a
+    /// blocking OSS writer (`cat music.raw > /dev/dsp`, `aplay -D oss`, any
+    /// old game) is a buffer ahead of the device and so waiting nearly all
+    /// the time: one CPU at 100% for as long as it played. Here each offer
+    /// is a nonblocking one -- it takes whatever fits, partial frames
+    /// stitched as usual -- and between offers the writer sleeps a fragment.
+    /// A short count goes back to the caller's loop, which offers the rest;
+    /// that loop is what makes the write as a whole block until all of it is
+    /// in, the way `write_pcm`'s own loop did.
+    ///
+    /// The bounds are `write_pcm`'s: a stream that takes nothing for the
+    /// device's whole buffer time is `EIO`, and a signal ends the wait (the
+    /// caller turns that into a short count when it already wrote some).
+    pub async fn write_pcm_sleeping(&self, buf: &[u8]) -> crate::error::LxResult<usize> {
+        let mut deadline = None;
+        loop {
+            match self.write_pcm(buf, true) {
+                Err(FsError::Again) if self.room_is_coming() => {}
+                res => return res.map_err(Into::into),
+            }
+            let now = kernel_hal::timer::timer_now();
+            let limit = *deadline.get_or_insert_with(|| {
+                let rt = self.rt.lock();
+                now + core::time::Duration::from_secs(
+                    self.drain_secs(rt.hw_bytes(rt.buffer_bytes()).max(HW_FRAME)),
+                )
+            });
+            if now >= limit {
+                kernel_hal::klog_warn!(
+                    "[dsp{}] playback ring made no progress; giving up a sleeping write -> EIO",
+                    self.index
+                );
+                return Err(FsError::DeviceError.into());
+            }
+            kernel_hal::deferred_job::drain_deferred_jobs();
+            let wake = (now + self.refill_wait()).min(limit);
+            crate::process::interruptible(kernel_hal::thread::sleep_until(wake)).await?;
+        }
+    }
+
+    /// `SNDCTL_DSP_SYNC` from the async syscall dispatcher: flush, play out
+    /// the queue asleep, leave the stream prepared. The synchronous one in
+    /// `io_control` spun through the whole queue -- up to the device's whole
+    /// buffer -- on every SYNC.
+    pub async fn sync_sleeping(&self) -> crate::error::LxResult<()> {
+        let queued = {
+            let mut rt = self.rt.lock();
+            self.sync_begin(&mut rt)?
+        };
+        let deadline = kernel_hal::timer::timer_now()
+            + core::time::Duration::from_secs(self.drain_secs(queued));
+        loop {
+            let left = self.audio.queued_bytes();
+            let now = kernel_hal::timer::timer_now();
+            if left == 0 || now >= deadline {
+                break;
+            }
+            kernel_hal::deferred_job::drain_deferred_jobs();
+            let slice = super::snd::drain_wait_for((left / HW_FRAME) as u64, self.hw_rate() as u64);
+            kernel_hal::thread::sleep_until((now + slice).min(deadline)).await;
+        }
+        let mut rt = self.rt.lock();
+        self.sync_finish(&mut rt);
+        Ok(())
+    }
+
+    /// Whether `cmd` is `SNDCTL_DSP_SYNC`, the one OSS ioctl that blocks.
+    pub fn is_sync_ioctl(cmd: u32) -> bool {
+        cmd == SNDCTL_DSP_SYNC
+    }
+
     fn backoff() {
         kernel_hal::deferred_job::drain_deferred_jobs();
         let resume = kernel_hal::timer::timer_now() + RETRY_BACKOFF;
@@ -1217,6 +1314,9 @@ mod conversion_tests;
 
 #[cfg(test)]
 mod geometry_tests;
+
+#[cfg(test)]
+mod sleeping_tests;
 
 #[cfg(test)]
 mod tests {

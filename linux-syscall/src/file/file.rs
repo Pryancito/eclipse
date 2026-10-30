@@ -11,6 +11,7 @@
 
 use super::*;
 use linux_object::error::LxResult;
+use linux_object::fs::devfs::DspDev;
 use linux_object::fs::ioctl::{
     FIOASYNC, FIOCLEX, FIONBIO, FIONCLEX, FIONREAD, FIOQSIZE, TCGETS2, TCSETS2, TCSETSF2, TCSETSW2,
     TIOCGPTPEER, TIOCGWINSZ, TIOCSCTTY,
@@ -413,6 +414,7 @@ impl Syscall<'_> {
         })?;
         let chunk_size = len.min(super::SYSCALL_IO_MAX);
         let waits = self.waits_for_room(&file_like);
+        let dsp = blocking_dsp(&file_like);
         // The bytes are copied into kernel memory before the file sees them;
         // see `Staging` for the deadlock that a raw user slice caused here.
         let mut staging = Staging::new(chunk_size)?;
@@ -432,7 +434,16 @@ impl Syscall<'_> {
                 }
                 return Err(LxError::EPERM);
             }
-            let res = file_like.write(chunk).inspect_err(|&e| {
+            // A blocking `/dev/dsp` waits for room asleep, not spinning
+            // inside the synchronous write; see `DspDev::write_pcm_sleeping`.
+            let res = match dsp
+                .as_ref()
+                .and_then(|i| i.as_any_ref().downcast_ref::<DspDev>())
+            {
+                Some(dsp) => dsp.write_pcm_sleeping(chunk).await,
+                None => file_like.write(chunk),
+            };
+            let res = res.inspect_err(|&e| {
                 if e == LxError::EBADF {
                     let path = file_like
                         .downcast_ref::<linux_object::fs::File>()
@@ -2818,18 +2829,41 @@ impl Syscall<'_> {
     }
 }
 
-/// The PCM ioctls that block -- a `WRITEI_FRAMES` on a blocking descriptor,
-/// and `DRAIN` -- served by `PcmDev`'s sleeping waits. `None` for every other
+/// The sound ioctls that block -- a PCM `WRITEI_FRAMES` on a blocking
+/// descriptor, the PCM's `DRAIN` and the OSS `SNDCTL_DSP_SYNC` -- served by
+/// the devices' sleeping waits. `None` for every other
 /// request and every other file, which go to the synchronous `ioctl`.
+/// `/dev/dsp` opened without `O_NONBLOCK`: the inode, for `sys_write` to
+/// hand its writes to `DspDev::write_pcm_sleeping`.
+fn blocking_dsp(file_like: &Arc<dyn FileLike>) -> Option<Arc<dyn INode>> {
+    let flags = file_like.flags();
+    // Not for a descriptor the write would refuse (`O_PATH`, read-only):
+    // `File::write` answers those, with its `EBADF`.
+    if flags.non_block() || !flags.writable() || flags.is_path() {
+        return None;
+    }
+    let inode = file_like.downcast_ref::<File>()?.inode();
+    inode.as_any_ref().downcast_ref::<DspDev>()?;
+    Some(inode)
+}
+
 async fn pcm_sleeping_ioctl(
     file_like: &Arc<dyn FileLike>,
     request: usize,
     arg1: usize,
 ) -> Option<SysResult> {
     use linux_object::fs::devfs::{PcmBlockingIoctl, PcmDev};
-    let kind = PcmBlockingIoctl::of(request as u32)?;
+    if file_like.flags().is_path() {
+        return None;
+    }
     let file = file_like.downcast_ref::<File>()?;
     let inode = file.inode();
+    // And `SNDCTL_DSP_SYNC` on `/dev/dsp`, which waits out the queue.
+    if DspDev::is_sync_ioctl(request as u32) {
+        let dsp = inode.as_any_ref().downcast_ref::<DspDev>()?;
+        return Some(dsp.sync_sleeping().await.map(|()| 0));
+    }
+    let kind = PcmBlockingIoctl::of(request as u32)?;
     let pcm = inode.as_any_ref().downcast_ref::<PcmDev>()?;
     let res = match kind {
         PcmBlockingIoctl::WriteiFrames if file_like.flags().non_block() => return None,
