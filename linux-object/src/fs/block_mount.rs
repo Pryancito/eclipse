@@ -228,16 +228,28 @@ impl Device for FileByteDevice {
 ///
 /// The figure above is what this cap was written for; the constant said 64 MiB
 /// from the day it was born, and nothing ever measured that. It is a cap on
-/// allocation *count* as much as on bytes, because every resident sector is its
-/// own heap block: a `Box<[u8; 512]>`, plus its entry in `lines` (~24 B) and in
-/// `lru` (~16 B), both of which land in `BTreeMap` nodes of their own. At
-/// 64 MiB that is 131072 separate 512-byte blocks plus some 24000 map nodes,
-/// and it showed: on a machine with the heap over half full, those 512-byte
-/// blocks were the single largest size class in the kernel's heap-pressure
-/// report, one `BlockCache::insert` under btrfs's `read_logical` at a time.
-/// The cache was behaving exactly as designed -- it has a bound and it evicts;
-/// the bound was simply eight times what its own paragraph claims.
+/// allocation *count* as much as on bytes: at 64 MiB of 512-byte lines that was
+/// 131072 separate heap blocks plus some 24000 map nodes, and on a machine with
+/// the heap over half full those blocks were the single largest size class in
+/// the kernel's heap-pressure report. Lines are whole pages now (see
+/// [`PAGE_SECTORS`]), so the same 8 MiB is 2048 blocks rather than 16384.
 const CACHE_CAPACITY_SECTORS: usize = 8 * 1024 * 1024 / SECTOR;
+
+/// Sectors per cache line: one 4 KiB page.
+///
+/// The cache used to keep one line per 512-byte sector, and its bookkeeping —
+/// not the disk — became the ceiling. Every resident sector cost a `BTreeMap`
+/// lookup to prove it was there, another to copy it out and two more to move
+/// it in the LRU index, so a 4 KiB hit was 32 tree operations and a 1 MiB
+/// read-ahead window was over 12000 of them, every one under the cache lock.
+/// Measured on the host against an in-memory disk, that capped the layer at
+/// about 690 MB/s cold and 1.7 GB/s warm — below what an NVMe drive delivers
+/// on its own. Filesystems ask in 4 KiB pages (ext2/FAT clusters, btrfs nodes,
+/// demand paging) and read-ahead brings whole pages in, so grouping eight
+/// sectors under one line divides all of that by eight while a per-sector
+/// valid mask keeps the sector-exact coherence rules below unchanged.
+const PAGE_SECTORS: usize = 8;
+const PAGE_BYTES: usize = PAGE_SECTORS * SECTOR;
 
 /// Forward read-ahead window. On a cache miss for a request smaller than this,
 /// the backing device is read this far past the request in one command and the
@@ -248,29 +260,59 @@ const CACHE_CAPACITY_SECTORS: usize = 8 * 1024 * 1024 / SECTOR;
 /// AHCI). Sized to roughly one AHCI command so the prefetch is ~free latency-wise.
 const READAHEAD_BYTES: usize = 1024 * 1024;
 
-/// One cached 512-byte sector plus its LRU timestamp.
+/// One cached page plus its LRU timestamp.
 struct CacheLine {
-    data: Box<[u8; SECTOR]>,
+    data: Box<[u8; PAGE_BYTES]>,
+    /// Bit `i` set: sector `i` of this page is resident and matches the disk.
+    /// The bytes of a sector whose bit is clear are meaningless (left over
+    /// from a recycled line) and are never read.
+    valid: u8,
     /// Monotonic tick of the last access; the smallest tick is the LRU victim.
     tick: u64,
 }
 
-/// Fallible `Box::new([0u8; SECTOR])`. The first fill of a cold cache (and
+/// Fallible `Box::new([0u8; PAGE_BYTES])`. The first fill of a cold cache (and
 /// every fill when the recycle path has nothing to reuse) used to panic the
 /// kernel under heap pressure mid multi-GB write.
-fn try_sector_box() -> Option<Box<[u8; SECTOR]>> {
+fn try_page_box() -> Option<Box<[u8; PAGE_BYTES]>> {
     use core::alloc::Layout;
-    let layout = Layout::new::<[u8; SECTOR]>();
-    // SAFETY: layout is for one sector; null means OOM.
+    let layout = Layout::new::<[u8; PAGE_BYTES]>();
+    // SAFETY: layout is for one page; null means OOM.
     let raw = unsafe { alloc::alloc::alloc_zeroed(layout) };
     if raw.is_null() {
         return None;
     }
-    // SAFETY: raw is a zeroed allocation of exactly `[u8; SECTOR]`.
-    Some(unsafe { Box::from_raw(raw as *mut [u8; SECTOR]) })
+    // SAFETY: raw is a zeroed allocation of exactly `[u8; PAGE_BYTES]`.
+    Some(unsafe { Box::from_raw(raw as *mut [u8; PAGE_BYTES]) })
 }
 
-/// A write-through, sector-granular LRU buffer cache.
+/// Page holding `sector`, and the sector's bit within that page's mask.
+#[inline]
+fn page_of(sector: u64) -> (u64, u8) {
+    (
+        sector / PAGE_SECTORS as u64,
+        1u8 << (sector % PAGE_SECTORS as u64),
+    )
+}
+
+/// Mask of the sectors of `page` that the byte span `[start, end)` touches.
+/// The span must overlap the page.
+#[inline]
+fn span_mask(page: u64, start: usize, end: usize) -> u8 {
+    let base = page as usize * PAGE_BYTES;
+    let lo = (max(start, base) - base) / SECTOR;
+    let hi = (min(end, base + PAGE_BYTES) - 1 - base) / SECTOR;
+    run_mask(lo, hi - lo + 1)
+}
+
+/// Mask of `n` consecutive sectors starting at sector `first` of a page.
+#[inline]
+fn run_mask(first: usize, n: usize) -> u8 {
+    debug_assert!(n >= 1 && first + n <= PAGE_SECTORS);
+    ((((1u16 << n) - 1) << first) & 0xFF) as u8
+}
+
+/// A write-through, page-granular LRU buffer cache with sector-exact validity.
 ///
 /// Every on-disk filesystem in the kernel (ext2 via `Synced`/editor, btrfs via
 /// the device adapter) funnels *all* of its reads and writes through a single
@@ -287,34 +329,48 @@ fn try_sector_box() -> Option<Box<[u8; SECTOR]>> {
 ///   never lose acknowledged data) and then update the cache so a subsequent
 ///   read never observes a stale sector.
 ///
-/// Correctness rests on one invariant: a sector present in the cache always
+/// Correctness rests on one invariant: a sector whose valid bit is set always
 /// holds exactly what is on disk. Write-through plus the post-write update below
 /// maintains it. This assumes the wrapped device is reached *only* through this
 /// cache (the normal one-`CachedDevice`-per-mount case); it is not a coherent
 /// cache across two independent handles to the same disk.
+///
+/// Lines, eviction and LRU order are per page; residency is per sector. A page
+/// leaves the cache when it is the LRU victim or when its last valid sector is
+/// invalidated.
 struct BlockCache {
-    /// Resident sectors keyed by sector id.
+    /// Resident pages keyed by page index (`sector / PAGE_SECTORS`).
     lines: BTreeMap<u64, CacheLine>,
-    /// LRU index: tick -> sector id. The first entry is the eviction victim.
+    /// LRU index: tick -> page index. The first entry is the eviction victim.
     lru: BTreeMap<u64, u64>,
     /// Monotonic access counter feeding `CacheLine::tick`.
     clock: u64,
-    /// Maximum number of resident sectors.
+    /// Budget in sectors, as configured. Only `max_pages` governs eviction;
+    /// this is kept so tests can ask what budget a mount was given.
+    #[cfg(test)]
     capacity: usize,
+    /// Maximum number of resident pages: the sector budget rounded up to whole
+    /// pages, and never zero.
+    max_pages: usize,
 }
 
 impl BlockCache {
     fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             lines: BTreeMap::new(),
             lru: BTreeMap::new(),
             clock: 1,
-            capacity: capacity.max(1),
+            #[cfg(test)]
+            capacity,
+            max_pages: capacity.div_ceil(PAGE_SECTORS),
         }
     }
 
+    #[cfg(test)]
     fn contains(&self, sector: u64) -> bool {
-        self.lines.contains_key(&sector)
+        let (page, bit) = page_of(sector);
+        self.lines.get(&page).is_some_and(|l| l.valid & bit != 0)
     }
 
     /// Hand out the next monotonic access tick. Kept tiny and borrow-free so
@@ -327,64 +383,118 @@ impl BlockCache {
     }
 
     /// Copy `dst.len()` bytes starting at `off` within `sector` out of the
-    /// cache, marking the sector most-recently-used. Returns `false` on a miss.
+    /// cache, marking its page most-recently-used. Returns `false` on a miss.
+    #[cfg(test)]
     fn read_into(&mut self, sector: u64, off: usize, dst: &mut [u8]) -> bool {
-        let new_tick = self.next_tick();
-        let old = match self.lines.get_mut(&sector) {
-            Some(line) => {
-                dst.copy_from_slice(&line.data[off..off + dst.len()]);
-                let old = line.tick;
-                line.tick = new_tick;
-                old
+        debug_assert!(off + dst.len() <= SECTOR);
+        let start = sector as usize * SECTOR + off;
+        self.read_span(start, dst)
+    }
+
+    /// Copy the byte span `[start, start + dst.len())` out of the cache if
+    /// every sector it touches is resident, marking each page it touches
+    /// most-recently-used once. Returns `false`, having copied nothing that
+    /// matters and left the LRU order alone, on a miss.
+    fn read_span(&mut self, start: usize, dst: &mut [u8]) -> bool {
+        if dst.is_empty() {
+            return true;
+        }
+        let end = start + dst.len();
+        let first = (start / PAGE_BYTES) as u64;
+        let last = ((end - 1) / PAGE_BYTES) as u64;
+
+        // Residency first, in one walk over the range rather than a lookup
+        // per page, so a miss leaves the LRU order exactly as it was.
+        let mut expect = first;
+        for (&page, line) in self.lines.range(first..=last) {
+            let need = span_mask(page, start, end);
+            if page != expect || line.valid & need != need {
+                return false;
             }
-            None => return false,
-        };
-        // `lines` borrow released; update the LRU index.
-        self.lru.remove(&old);
-        self.lru.insert(new_tick, sector);
+            expect += 1;
+        }
+        if expect != last + 1 {
+            return false;
+        }
+
+        let mut tick = self.clock;
+        let lru = &mut self.lru;
+        for (&page, line) in self.lines.range_mut(first..=last) {
+            let base = page as usize * PAGE_BYTES;
+            let lo = max(start, base);
+            let hi = min(end, base + PAGE_BYTES);
+            dst[lo - start..hi - start].copy_from_slice(&line.data[lo - base..hi - base]);
+            let old = core::mem::replace(&mut line.tick, tick);
+            lru.remove(&old);
+            lru.insert(tick, page);
+            tick = tick.wrapping_add(1);
+        }
+        self.clock = tick;
         true
     }
 
-    /// Insert or replace a full sector, evicting the LRU victim(s) if at
-    /// capacity. `data` must be exactly one sector.
+    /// Insert or replace a full sector. `data` must be exactly one sector.
+    fn insert(&mut self, sector: u64, data: &[u8]) {
+        debug_assert_eq!(data.len(), SECTOR);
+        self.insert_run(sector, data);
+    }
+
+    /// Insert or replace `data.len() / SECTOR` consecutive whole sectors
+    /// starting at `sector`, one page at a time.
+    fn insert_run(&mut self, sector: u64, data: &[u8]) {
+        debug_assert!(data.len().is_multiple_of(SECTOR));
+        let mut sector = sector;
+        let mut off = 0;
+        while off < data.len() {
+            let in_page = (sector % PAGE_SECTORS as u64) as usize;
+            let n = min(PAGE_SECTORS - in_page, (data.len() - off) / SECTOR);
+            let bytes = n * SECTOR;
+            self.fill_page(
+                sector / PAGE_SECTORS as u64,
+                in_page,
+                &data[off..off + bytes],
+            );
+            off += bytes;
+            sector += n as u64;
+        }
+    }
+
+    /// Store `src` (whole sectors) at sector `first` of `page`, creating the
+    /// page — and evicting the LRU victim if at capacity — when it is not
+    /// resident.
     ///
     /// When at capacity the victim's `Box` is reused for the newcomer: a
     /// streaming multi-GB write (Ollama model download, `apk` extracting
-    /// libLLVM) otherwise does `drop`+`Box::new([0u8; 512])` once per sector
-    /// — millions of heap churn events that left the buddy freelist unable to
-    /// satisfy even a 16-byte `epoll` subscription and panicking the kernel.
-    fn insert(&mut self, sector: u64, data: &[u8]) {
-        debug_assert_eq!(data.len(), SECTOR);
+    /// libLLVM) otherwise does `drop`+`Box::new` once per line — millions of
+    /// heap churn events that left the buddy freelist unable to satisfy even a
+    /// 16-byte `epoll` subscription and panicking the kernel.
+    fn fill_page(&mut self, page: u64, first: usize, src: &[u8]) {
+        let bits = run_mask(first, src.len() / SECTOR);
+        let at = first * SECTOR;
         let new_tick = self.next_tick();
-        // Update in place if the sector is already resident.
-        let mut old_tick: Option<u64> = None;
-        if let Some(line) = self.lines.get_mut(&sector) {
-            old_tick = Some(line.tick);
-            line.data.copy_from_slice(data);
-            line.tick = new_tick;
-        }
-        if let Some(old) = old_tick {
+        // Update in place if the page is already resident.
+        if let Some(line) = self.lines.get_mut(&page) {
+            line.data[at..at + src.len()].copy_from_slice(src);
+            line.valid |= bits;
+            let old = core::mem::replace(&mut line.tick, new_tick);
             self.lru.remove(&old);
-            self.lru.insert(new_tick, sector);
+            self.lru.insert(new_tick, page);
             return;
         }
-        // Fresh sector: evict the least-recently-used until under capacity,
+        // Fresh page: evict the least-recently-used until under capacity,
         // keeping one victim buffer to refill instead of allocating again.
-        let mut recycled: Option<Box<[u8; SECTOR]>> = None;
-        while self.lines.len() >= self.capacity {
-            let victim_tick = match self.lru.keys().next().copied() {
-                Some(t) => t,
-                None => break,
+        let mut recycled: Option<Box<[u8; PAGE_BYTES]>> = None;
+        while self.lines.len() >= self.max_pages {
+            let Some((_, victim)) = self.lru.pop_first() else {
+                break;
             };
-            if let Some(victim_sector) = self.lru.remove(&victim_tick) {
-                if let Some(line) = self.lines.remove(&victim_sector) {
-                    recycled = Some(line.data);
-                }
+            if let Some(line) = self.lines.remove(&victim) {
+                recycled = Some(line.data);
             }
         }
-        let mut boxed = match recycled {
+        let mut data = match recycled {
             Some(b) => b,
-            None => match try_sector_box() {
+            None => match try_page_box() {
                 Some(b) => b,
                 // Heap full: skip the cache line. Write-through already put
                 // the bytes on disk; the next read fetches them. Better than
@@ -392,26 +502,46 @@ impl BlockCache {
                 None => return,
             },
         };
-        boxed.copy_from_slice(data);
+        data[at..at + src.len()].copy_from_slice(src);
         self.lines.insert(
-            sector,
+            page,
             CacheLine {
-                data: boxed,
+                data,
+                valid: bits,
                 tick: new_tick,
             },
         );
-        self.lru.insert(new_tick, sector);
+        self.lru.insert(new_tick, page);
     }
 
     /// Forget a sector whose on-disk contents are no longer known, so the next
     /// read fetches it from the device instead of trusting a copy that may not
-    /// match the disk. Both indexes are cleared together: an `lru` key left
-    /// behind names a sector that is no longer resident, so it costs the
-    /// eviction loop a wasted round for as long as it sits there, and the two
-    /// maps stop agreeing on how much is cached.
+    /// match the disk.
+    #[cfg(test)]
     fn invalidate(&mut self, sector: u64) {
-        if let Some(line) = self.lines.remove(&sector) {
-            self.lru.remove(&line.tick);
+        self.invalidate_span(sector, sector);
+    }
+
+    /// Forget sectors `first..=last`. A page left with no valid sector is
+    /// dropped from both indexes together: an `lru` key left behind names a
+    /// page that is no longer resident, so it costs the eviction loop a wasted
+    /// round for as long as it sits there, and the two maps stop agreeing on
+    /// how much is cached.
+    fn invalidate_span(&mut self, first: u64, last: u64) {
+        let p_first = first / PAGE_SECTORS as u64;
+        let p_last = last / PAGE_SECTORS as u64;
+        let start = first as usize * SECTOR;
+        let end = (last as usize + 1) * SECTOR;
+        let mut emptied: Option<alloc::vec::Vec<u64>> = None;
+        for (&page, line) in self.lines.range_mut(p_first..=p_last) {
+            line.valid &= !span_mask(page, start, end);
+            if line.valid == 0 {
+                self.lru.remove(&line.tick);
+                emptied.get_or_insert_with(alloc::vec::Vec::new).push(page);
+            }
+        }
+        for page in emptied.into_iter().flatten() {
+            self.lines.remove(&page);
         }
     }
 
@@ -419,8 +549,12 @@ impl BlockCache {
     /// sector is not cached: write-through already put the bytes on disk, so the
     /// next read will fetch them fresh.
     fn patch(&mut self, sector: u64, off: usize, src: &[u8]) {
-        if let Some(line) = self.lines.get_mut(&sector) {
-            line.data[off..off + src.len()].copy_from_slice(src);
+        let (page, bit) = page_of(sector);
+        if let Some(line) = self.lines.get_mut(&page) {
+            if line.valid & bit != 0 {
+                let at = (sector % PAGE_SECTORS as u64) as usize * SECTOR + off;
+                line.data[at..at + src.len()].copy_from_slice(src);
+            }
         }
     }
 }
@@ -619,13 +753,9 @@ impl CachedDevice {
     /// backing device. Only fully-read sectors (`valid_len` may be short at
     /// end-of-device) are inserted.
     fn populate(&self, first_sector: u64, data: &[u8], valid_len: usize) {
-        let mut cache = self.cache.lock();
-        let mut off = 0;
-        let mut sector = first_sector;
-        while off + SECTOR <= valid_len {
-            cache.insert(sector, &data[off..off + SECTOR]);
-            off += SECTOR;
-            sector += 1;
+        let whole = min(valid_len, data.len()) / SECTOR * SECTOR;
+        if whole > 0 {
+            self.cache.lock().insert_run(first_sector, &data[..whole]);
         }
     }
 }
@@ -642,22 +772,8 @@ impl Device for CachedDevice {
         // Fast path: every sector is resident -> serve entirely from RAM with no
         // device I/O. This is what turns repeated stat/lookup/re-read traffic
         // into pure memory copies.
-        {
-            let mut cache = self.cache.lock();
-            if (first..=last).all(|s| cache.contains(s)) {
-                let mut pos = offset;
-                let mut done = 0;
-                while pos < end {
-                    let sector = (pos / SECTOR) as u64;
-                    let soff = pos % SECTOR;
-                    let take = min(SECTOR - soff, end - pos);
-                    let hit = cache.read_into(sector, soff, &mut buf[done..done + take]);
-                    debug_assert!(hit);
-                    done += take;
-                    pos += take;
-                }
-                return Ok(done);
-            }
+        if self.cache.lock().read_span(offset, buf) {
+            return Ok(buf.len());
         }
         // Lock released before touching the (slow) backing device.
 
@@ -739,10 +855,7 @@ impl Device for CachedDevice {
                 // the filesystem above having already been told the write
                 // failed. Forget the whole span instead: the next read pays one
                 // device command and sees the truth.
-                let mut cache = self.cache.lock();
-                for sector in req_first..=req_last {
-                    cache.invalidate(sector);
-                }
+                self.cache.lock().invalidate_span(req_first, req_last);
                 return Err(e);
             }
         };
@@ -761,9 +874,7 @@ impl Device for CachedDevice {
         // still update in place below.
         const STREAMING_WRITE: usize = 64 * 1024;
         if n >= STREAMING_WRITE {
-            for sector in first as u64..=last as u64 {
-                cache.invalidate(sector);
-            }
+            cache.invalidate_span(first as u64, last as u64);
         } else {
             for sector in first..=last {
                 let s_start = sector * SECTOR;
@@ -790,9 +901,7 @@ impl Device for CachedDevice {
         // surfaces). Anything the reconciliation above did not account for is
         // therefore of unknown content and must not stay cached.
         if n < buf.len() {
-            for sector in (end / SECTOR) as u64..=req_last {
-                cache.invalidate(sector);
-            }
+            cache.invalidate_span((end / SECTOR) as u64, req_last);
         }
         Ok(n)
     }
@@ -1291,20 +1400,95 @@ mod block_byte_tests {
     // the eviction policy and the read/patch/insert bookkeeping that the
     // higher-level coherence tests above rely on.
 
+    /// First sector of page `p`, so unit tests can name distinct lines.
+    fn pg(p: u64) -> u64 {
+        p * PAGE_SECTORS as u64
+    }
+
     #[test]
     fn cache_lru_evicts_least_recently_used() {
-        let mut c = BlockCache::new(2);
-        c.insert(0, &[0xAA; SECTOR]);
-        c.insert(1, &[0xBB; SECTOR]);
-        assert!(c.contains(0) && c.contains(1));
-        // Touch sector 0 -> sector 1 becomes the least-recently-used victim.
+        let mut c = BlockCache::new(2 * PAGE_SECTORS);
+        c.insert(pg(0), &[0xAA; SECTOR]);
+        c.insert(pg(1), &[0xBB; SECTOR]);
+        assert!(c.contains(pg(0)) && c.contains(pg(1)));
+        // Touch page 0 -> page 1 becomes the least-recently-used victim.
         let mut buf = [0u8; SECTOR];
-        assert!(c.read_into(0, 0, &mut buf));
+        assert!(c.read_into(pg(0), 0, &mut buf));
         assert_eq!(buf[0], 0xAA);
-        c.insert(2, &[0xCC; SECTOR]);
-        assert!(c.contains(0), "recently-read sector 0 stays resident");
-        assert!(c.contains(2), "freshly inserted sector 2 present");
-        assert!(!c.contains(1), "LRU sector 1 evicted");
+        c.insert(pg(2), &[0xCC; SECTOR]);
+        assert!(c.contains(pg(0)), "recently-read page 0 stays resident");
+        assert!(c.contains(pg(2)), "freshly inserted page 2 present");
+        assert!(!c.contains(pg(1)), "LRU page 1 evicted");
+    }
+
+    #[test]
+    fn sectors_of_one_page_share_a_line_but_not_their_validity() {
+        let mut c = BlockCache::new(PAGE_SECTORS);
+        c.insert(3, &[0x33; SECTOR]);
+        assert!(c.contains(3));
+        // Same line, but nothing has vouched for its neighbours: a hit on
+        // them would hand out whatever a recycled buffer held.
+        assert!(!c.contains(2) && !c.contains(4));
+        let mut buf = [0u8; SECTOR];
+        assert!(!c.read_into(2, 0, &mut buf));
+        c.insert(4, &[0x44; SECTOR]);
+        assert_eq!(c.lines.len(), 1, "two sectors of one page are one line");
+        let mut two = [0u8; 2 * SECTOR];
+        assert!(c.read_span(3 * SECTOR, &mut two));
+        assert!(two[..SECTOR].iter().all(|&b| b == 0x33));
+        assert!(two[SECTOR..].iter().all(|&b| b == 0x44));
+        // A span that reaches one sector further is a miss as a whole.
+        let mut three = [0u8; 3 * SECTOR];
+        assert!(!c.read_span(3 * SECTOR, &mut three));
+    }
+
+    #[test]
+    fn a_span_with_a_missing_page_in_the_middle_is_a_miss() {
+        let mut c = BlockCache::new(4 * PAGE_SECTORS);
+        c.insert_run(pg(0), &[1u8; PAGE_BYTES]);
+        c.insert_run(pg(2), &[3u8; PAGE_BYTES]);
+        let mut buf = vec![0u8; 3 * PAGE_BYTES];
+        assert!(!c.read_span(0, &mut buf));
+        c.insert_run(pg(1), &[2u8; PAGE_BYTES]);
+        assert!(c.read_span(0, &mut buf));
+        assert_eq!(buf[PAGE_BYTES], 2);
+        assert_eq!(buf[3 * PAGE_BYTES - 1], 3);
+    }
+
+    #[test]
+    fn a_run_that_straddles_pages_lands_in_both() {
+        let mut c = BlockCache::new(4 * PAGE_SECTORS);
+        // Sectors 6..11: the last two of page 0 and the first four of page 1.
+        let data: Vec<u8> = (0..6 * SECTOR).map(pat).collect();
+        c.insert_run(6, &data);
+        for s in 6..12 {
+            assert!(c.contains(s), "sector {} missing", s);
+        }
+        assert!(!c.contains(5) && !c.contains(12));
+        let mut got = vec![0u8; 6 * SECTOR];
+        assert!(c.read_span(6 * SECTOR, &mut got));
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn invalidating_the_last_valid_sector_drops_the_line() {
+        let mut c = BlockCache::new(4 * PAGE_SECTORS);
+        c.insert_run(0, &[7u8; 2 * PAGE_BYTES]);
+        c.invalidate_span(3, 9);
+        assert!(c.contains(2) && !c.contains(3) && !c.contains(9) && c.contains(10));
+        assert_eq!(c.lines.len(), 2);
+        c.invalidate_span(0, 15);
+        assert_eq!(c.lines.len(), 0);
+        assert_eq!(c.lru.len(), 0);
+    }
+
+    #[test]
+    fn patch_never_revives_a_sector_that_is_not_valid() {
+        let mut c = BlockCache::new(PAGE_SECTORS);
+        c.insert(0, &[0u8; SECTOR]);
+        // Sector 1 shares the line but is not resident.
+        c.patch(1, 0, &[9, 9]);
+        assert!(!c.contains(1));
     }
 
     #[test]
@@ -1347,9 +1531,9 @@ mod block_byte_tests {
 
     #[test]
     fn cache_insert_at_capacity_never_grows_past_the_ceiling() {
-        let mut c = BlockCache::new(4);
+        let mut c = BlockCache::new(4 * PAGE_SECTORS);
         for i in 0..200u64 {
-            c.insert(i, &[(i as u8).wrapping_mul(3); SECTOR]);
+            c.insert(i * 3, &[(i as u8).wrapping_mul(3); SECTOR]);
             assert!(
                 c.lines.len() <= 4 && c.lru.len() == c.lines.len(),
                 "insert #{i} left lines={} lru={}",
@@ -1842,11 +2026,8 @@ mod block_byte_tests {
         let mut c = BlockCache::new(0);
         c.insert(0, &[1; SECTOR]);
         assert!(c.contains(0));
-        c.insert(1, &[2; SECTOR]);
-        assert!(c.contains(1));
-        assert!(
-            !c.contains(0),
-            "capacity floored at 1 -> one resident sector"
-        );
+        c.insert(pg(1), &[2; SECTOR]);
+        assert!(c.contains(pg(1)));
+        assert!(!c.contains(0), "capacity floored at 1 -> one resident page");
     }
 }
