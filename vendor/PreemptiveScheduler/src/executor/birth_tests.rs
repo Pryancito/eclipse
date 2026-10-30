@@ -473,3 +473,101 @@ fn the_quarantine_protects_a_retired_block_and_unprotects_it_before_reuse() {
     );
     assert_eq!(stack_pool_stats(), (1, 0));
 }
+
+// ── the two switches the boot path throws, and the resume latch ────────────
+
+/// **The public setter installs the dirty-depth hook the poison bound reads.**
+///
+/// It is `unsafe` for a reason the signature cannot say: the hook runs inside
+/// `Executor::new`, with interrupts off, so it may take no lock the scheduler
+/// might be holding and may not shoot down the TLB. A hook that cannot promise
+/// that answers `None` and the whole 2 MiB gets poisoned instead.
+#[test]
+fn el_gancho_de_profundidad_se_instala_por_la_puerta_publica() {
+    fn clean_block(_base: usize, _size: usize) -> Option<usize> {
+        Some(0)
+    }
+    // The lock this returns is the one every test that touches the hook takes;
+    // it also parks the hook, which the setter below then replaces.
+    let _lock = with_dirty_depth_hook(None);
+    // SAFETY: the hook below takes no lock and touches no page tables.
+    unsafe { set_stack_dirty_depth_hook(clean_block) };
+    assert!(
+        STACK_DIRTY_DEPTH.lock().is_some(),
+        "el gancho tiene que quedar puesto: sin el, cada executor envenena \
+         los 2 MiB enteros"
+    );
+    *STACK_DIRTY_DEPTH.lock() = None;
+}
+
+/// **The quarantine switch is a plain boot flag (`STACKQUARANTINE=1`).**
+///
+/// Armed, a retired block is write-protected until it is handed out again, so
+/// a use-after-free on a discarded coroutine stack faults at the write instead
+/// of corrupting whoever got the block next.
+#[test]
+fn la_cuarentena_se_arma_y_se_desarma_con_una_bandera() {
+    let _f = fresh(0);
+    let saved = QUARANTINE_ENABLED.load(Ordering::SeqCst);
+    set_stack_quarantine_enabled(true);
+    assert!(QUARANTINE_ENABLED.load(Ordering::SeqCst));
+    set_stack_quarantine_enabled(false);
+    assert!(!QUARANTINE_ENABLED.load(Ordering::SeqCst));
+    QUARANTINE_ENABLED.store(saved, Ordering::SeqCst);
+}
+
+/// **A resume claim released by its holder is released quietly.**
+///
+/// The claim is what closes the double-resume window: two CPUs that both
+/// decide to resume the same parked stack would run one saved frame twice.
+/// Releasing is only legal once control is back OFF the stack -- its frame
+/// saved and parked -- because releasing while still standing on it re-opens
+/// exactly that window.
+#[test]
+fn una_reclamacion_devuelta_por_su_dueno_no_dice_nada() {
+    let _f = fresh(0);
+    let executor = Executor::new(collection());
+    assert_eq!(executor.try_claim_resume(2), Ok(()));
+    executor.release_resume(2);
+    assert_eq!(
+        executor.resume_claim.holder(),
+        None,
+        "la pila queda parada y libre para el siguiente que la reanude"
+    );
+}
+
+/// **A release by anyone but the holder is reported, and still clears.**
+///
+/// It used to take no CPU at all and clear unconditionally, which made the
+/// latch a guard anybody could switch off: a caller releasing a claim it never
+/// made left the stack open to a second resumer with nothing said. The clear
+/// still happens -- refusing to clear would strand the stack forever -- but
+/// now the slip is *seen*.
+#[test]
+fn una_reclamacion_devuelta_por_otro_se_delata_y_se_suelta_igual() {
+    let _f = fresh(0);
+    let executor = Executor::new(collection());
+    assert_eq!(executor.try_claim_resume(1), Ok(()));
+    executor.release_resume(5);
+    assert_eq!(
+        executor.resume_claim.holder(),
+        None,
+        "el pestillo se suelta de todas formas: dejarlo echado dejaria la \
+         pila sin poder reanudarse nunca"
+    );
+}
+
+/// **A release of a claim nobody made is reported too.**
+///
+/// Different report from the one above on purpose: "released by CPU5 but
+/// claimed by CPU1" is a bug in who owns the stack, and "released by CPU5 but
+/// nobody claimed it" is a bug in the claim/release pairing. The two have
+/// different fixes.
+#[test]
+fn soltar_una_reclamacion_que_nadie_pidio_tambien_se_delata() {
+    let _f = fresh(0);
+    let executor = Executor::new(collection());
+    assert_eq!(executor.resume_claim.holder(), None);
+    executor.release_resume(0);
+    assert_eq!(executor.resume_claim.holder(), None);
+}

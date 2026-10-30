@@ -3220,6 +3220,10 @@ mod probe_tests;
 #[cfg(test)]
 mod with_runtime_tests;
 
+/// Donde nace una tarea y quien va a por ella; ver las notas del modulo.
+#[cfg(test)]
+mod placement_tests;
+
 #[cfg(test)]
 mod containment_tests {
     use super::*;
@@ -4817,6 +4821,12 @@ mod resched_tests {
 
     #[test]
     fn the_boot_cpu_counts_as_ready_before_anyone_marks_it() {
+        // The lock, although this only reads: every other test that writes the
+        // mask takes it, and the mask is a module global. Without it this
+        // reads whatever a concurrent `placement_tests` or `with_runtime_tests`
+        // had installed at that instant -- both of them legitimately set a
+        // mask with CPU 0 out of it.
+        let _g = test_lock();
         // Tasks are spawned before any CPU reaches `run_until_idle`, and they
         // have to land somewhere that will actually poll them.
         assert!(is_executor_ready(0));
