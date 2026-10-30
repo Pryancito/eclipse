@@ -68,19 +68,43 @@ pub(crate) fn write_firefox_wrapper(rootfs: &Path) {
           # sanitize GL_RENDERER' for every window. So pin the Vulkan loader to\n\
           # NVK's manifest alone, and ask vulkaninfo (vulkan-tools) whether NVK\n\
           # enumerates a device before taking the GPU path at all.\n\
+          #\n\
+          # One step at a time, RECORDING which one said no. As one chained\n\
+          # condition it printed 'NVK exposes no GPU (vulkaninfo)' whatever had\n\
+          # failed -- including a glob that matched no ICD, which is not the\n\
+          # same diagnosis at all. On a machine where nvidia-smi shows labwc\n\
+          # holding 63 MiB on card0, that message sends the reader after NVK\n\
+          # for a fault that may be three lines above it.\n\
+          NVK_WHY=\n\
           NVK_ICD=\n\
-          for f in /usr/share/vulkan/icd.d/nouveau_icd.*.json; do\n\
+          for f in /usr/share/vulkan/icd.d/nouveau_icd*.json; do\n\
           \x20 [ -r \"$f\" ] && { NVK_ICD=$f; break; }\n\
           done\n\
-          if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
-          \x20\x20 [ \"$(tr -d '[:space:]' < /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ] && \\\n\
-          \x20\x20 ! grep -q 'nvidia\\.wlr_pixman' /proc/cmdline 2>/dev/null && \\\n\
-          \x20\x20 [ ! -e /run/labwc-renderer-fallback ] && [ -n \"$NVK_ICD\" ] && \\\n\
-          \x20\x20 { ! command -v vulkaninfo >/dev/null 2>&1 || \\\n\
-          \x20\x20\x20 { VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\" \\\n\
-          \x20\x20\x20\x20 vulkaninfo --summary >/tmp/vulkaninfo.summary 2>/dev/null; \\\n\
-          \x20\x20\x20\x20 grep -q 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\\|PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU' \\\n\
-          \x20\x20\x20\x20\x20 /tmp/vulkaninfo.summary; }; }; then\n\
+          # `cat ... 2>/dev/null | tr`, not `tr < ...`: with no card0 the\n\
+          # redirection fails in the SHELL, whose message 2>/dev/null on tr\n\
+          # never covered -- one 'cannot open /sys/class/drm/card0/device/\n\
+          # vendor' on the terminal of every launch in a session without one.\n\
+          CARD0_VENDOR=$(cat /sys/class/drm/card0/device/vendor 2>/dev/null | tr -d '[:space:]')\n\
+          if ! grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null; then\n\
+          \x20 NVK_WHY='no nvidia.nouveau_uapi in /proc/cmdline'\n\
+          elif [ \"$CARD0_VENDOR\" != \"0x10de\" ]; then\n\
+          \x20 NVK_WHY=\"card0 is not NVIDIA (vendor ${CARD0_VENDOR:-unreadable})\"\n\
+          elif grep -q 'nvidia\\.wlr_pixman' /proc/cmdline 2>/dev/null; then\n\
+          \x20 NVK_WHY='nvidia.wlr_pixman asked for the pixman session'\n\
+          elif [ -e /run/labwc-renderer-fallback ]; then\n\
+          \x20 NVK_WHY='labwc fell back to pixman (/run/labwc-renderer-fallback)'\n\
+          elif [ -z \"$NVK_ICD\" ]; then\n\
+          \x20 NVK_WHY='no NVK ICD under /usr/share/vulkan/icd.d (nouveau_icd*.json)'\n\
+          elif command -v vulkaninfo >/dev/null 2>&1; then\n\
+          \x20 # 2>&1, not 2>/dev/null: when vulkaninfo is the step that says no,\n\
+          \x20 # its own error IS the diagnosis, and it was being thrown away.\n\
+          \x20 VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\" \\\n\
+          \x20\x20 vulkaninfo --summary >/tmp/vulkaninfo.summary 2>&1\n\
+          \x20 grep -q 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\\|PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU' \\\n\
+          \x20\x20 /tmp/vulkaninfo.summary || \\\n\
+          \x20\x20 NVK_WHY=\"vulkaninfo on $NVK_ICD lists no GPU (/tmp/vulkaninfo.summary)\"\n\
+          fi\n\
+          if [ -z \"$NVK_WHY\" ]; then\n\
           \x20 export VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\"\n\
           \x20 export GALLIUM_DRIVER=\"${GALLIUM_DRIVER:-zink}\"\n\
           \x20 export MESA_LOADER_DRIVER_OVERRIDE=\"${MESA_LOADER_DRIVER_OVERRIDE:-zink}\"\n\
@@ -110,11 +134,8 @@ pub(crate) fn write_firefox_wrapper(rootfs: &Path) {
           \x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
           \x20 export MOZ_WEBRENDER_SOFTWARE=1\n\
           \x20 export MOZ_ACCELERATED=0\n\
-          \x20 # An NVK-less GPU session lands here too; log why, once per launch.\n\
-          \x20 if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
-          \x20\x20\x20 [ ! -e /run/labwc-renderer-fallback ]; then\n\
-          \x20\x20 NVK_SW_REASON='NVK exposes no GPU (vulkaninfo); software WebRender instead of zink on lavapipe'\n\
-          \x20 fi\n\
+          \x20 # The step that said no, verbatim, once per launch.\n\
+          \x20 NVK_SW_REASON=\"software WebRender instead of zink+NVK: $NVK_WHY\"\n\
           fi\n\
           export MOZ_CRASHREPORTER_DISABLE=1\n\
           export NO_AT_BRIDGE=1\n\

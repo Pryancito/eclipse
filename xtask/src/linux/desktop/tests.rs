@@ -1336,9 +1336,34 @@ fn firefox_gpu_path_never_lands_zink_on_lavapipe() {
     let ff = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
     let gpu = ff.find("export GALLIUM_DRIVER=").unwrap();
     let gate = &ff[..gpu];
-    assert!(gate.contains("/usr/share/vulkan/icd.d/nouveau_icd.*.json"));
+    assert!(gate.contains("/usr/share/vulkan/icd.d/nouveau_icd*.json"));
     assert!(gate.contains("vulkaninfo --summary"));
-    assert!(gate.contains("[ -n \"$NVK_ICD\" ]"));
+    assert!(gate.contains("[ -z \"$NVK_ICD\" ]"));
+    // Each step that can decline the GPU path must leave its own reason:
+    // one shared message blamed vulkaninfo even when the ICD glob was what
+    // matched nothing, which is a different fault in a different package.
+    for why in [
+        "no nvidia.nouveau_uapi in /proc/cmdline",
+        "card0 is not NVIDIA",
+        "nvidia.wlr_pixman asked for",
+        "labwc fell back to pixman",
+        "no NVK ICD under /usr/share/vulkan/icd.d",
+        "vulkaninfo on $NVK_ICD lists no GPU",
+    ] {
+        assert!(
+            gate.contains(why),
+            "the GPU gate must record `{why}` as its own reason"
+        );
+    }
+    assert!(
+        gate.contains("vulkaninfo --summary >/tmp/vulkaninfo.summary 2>&1"),
+        "vulkaninfo's own error is the diagnosis when it is the step that \
+         says no; it must not go to /dev/null"
+    );
+    assert!(
+        ff.contains("NVK_SW_REASON=\"software WebRender instead of zink+NVK: $NVK_WHY\""),
+        "the log line must carry the step that said no, verbatim"
+    );
     assert!(gate.contains("export VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\""));
     assert!(!ff.contains("lvp_icd"));
     if let Ok(st) = std::process::Command::new("sh")

@@ -111,6 +111,13 @@ pub struct BatchedCounter<const BATCH: isize> {
     local: PerCpuCounters<1>,
 }
 
+// Every writer of this counter lives in the heap allocator, which is
+// `cfg(not(feature = "libos"))`; a libos build keeps only the readers
+// (`HEAP_USED.get()`), so `add`, `sub`, `add_on` and `approx` are the quiet
+// dead code `#![deny(warnings)]` turns into a build error. Same `cfg_attr`
+// the allocator's own helpers in `memory_x86_64.rs` already carry, for the
+// same reason -- `new` and `get` stay live, so nothing here is blanket-allowed.
+#[cfg_attr(feature = "libos", allow(dead_code))]
 impl<const BATCH: isize> BatchedCounter<BATCH> {
     pub const fn new() -> Self {
         BatchedCounter {
