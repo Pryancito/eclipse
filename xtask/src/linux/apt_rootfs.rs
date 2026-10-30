@@ -642,7 +642,7 @@ fn fix_common_alternatives(root: &Path) {
     }
 }
 
-fn gnu_tuple(deb: &str) -> &'static str {
+pub(super) fn gnu_tuple(deb: &str) -> &'static str {
     match deb {
         "amd64" => "x86_64-linux-gnu",
         "arm64" => "aarch64-linux-gnu",
