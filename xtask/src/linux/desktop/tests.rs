@@ -153,7 +153,7 @@ fn gtk_caches_and_firefox_wrappers_parse_and_cover_both_caches() {
     assert!(ff.contains("export NO_AT_BRIDGE=1\n"));
     // Rapid-release is the shipped package; ESR stays as the fallback.
     assert!(
-        ff.contains("for c in firefox firefox-esr; do\n"),
+        ff.contains("for c in /usr/lib/firefox/firefox /usr/lib/firefox-esr/firefox-esr \\\n"),
         "the wrapper must try firefox before firefox-esr"
     );
     assert!(ff.contains("(apt-get install firefox)"));
@@ -165,6 +165,136 @@ fn gtk_caches_and_firefox_wrappers_parse_and_cover_both_caches() {
     assert!(
         ff.contains("nvidia.wlr_pixman"),
         "software kill-switch must be mentioned"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Choosing software WebRender must also DROP the session's GPU pins.
+///
+/// On a GPU session `/etc/profile` and labwc's environment export
+/// `GALLIUM_DRIVER=zink`, `MESA_LOADER_DRIVER_OVERRIDE=zink` and
+/// `VK_DRIVER_FILES` pinned to NVK's ICD alone, and the wrapper inherits
+/// them. It used to add `LIBGL_ALWAYS_SOFTWARE=1` on top and leave them,
+/// which is a contradiction Mesa refuses — Moebius' `~/.eclipse-firefox.log`
+/// on his two 2060 Supers, with the wrapper having correctly picked software
+/// (`ACCEL=0`) and the launch line still saying `GL=zink`:
+///
+/// ```text
+/// MESA-EGL: warning: Not allowed to force software rendering when API
+///                    explicitly selects a hardware device.
+/// MESA: error: ZINK: CPU device requested but none found!
+/// MESA: error: ZINK: failed to choose pdev
+/// MESA-EGL: warning: egl: failed to create dri2 screen
+/// ```
+///
+/// repeated without end: zink asks the loader for a CPU device, and the
+/// NVK-only ICD list cannot have one.
+#[test]
+fn the_software_path_drops_the_sessions_zink_and_nvk_pins() {
+    let dir = std::env::temp_dir().join(format!("eclipse-ff-sw-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    write_firefox_wrapper(&dir);
+    let w = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
+
+    let sw = w
+        .split_once("# Software rendering.")
+        .expect("the software branch must still be there")
+        .1
+        .split_once("\nfi\n")
+        .expect("the renderer if/else must close")
+        .0;
+    for var in [
+        "GALLIUM_DRIVER",
+        "MESA_LOADER_DRIVER_OVERRIDE",
+        "VK_DRIVER_FILES",
+        "VK_ICD_FILENAMES",
+    ] {
+        assert!(
+            sw.contains(&format!("unset {var} ")) || sw.contains(&format!(" {var} ")),
+            "the software branch must unset the inherited {var}:\n{sw}"
+        );
+    }
+    assert!(
+        sw.contains("unset GALLIUM_DRIVER MESA_LOADER_DRIVER_OVERRIDE"),
+        "both Mesa pins go together"
+    );
+    assert!(
+        sw.contains("unset VK_DRIVER_FILES VK_ICD_FILENAMES MESA_VK_DEVICE_SELECT"),
+        "the Vulkan loader pin goes too: zink's CPU device cannot be in an \
+         ICD list holding only NVK"
+    );
+    // ...and the unsets must come BEFORE the software driver is named, or
+    // the `unset` would throw the replacement away again.
+    let unset = sw.find("unset GALLIUM_DRIVER").unwrap();
+    let set = sw.find("export GALLIUM_DRIVER=llvmpipe").expect(
+        "name the software driver outright: LIBGL_ALWAYS_SOFTWARE alone is \
+         what Mesa calls forcing software against an explicit hardware device",
+    );
+    assert!(unset < set, "unset must come before the llvmpipe pin");
+    assert!(sw.contains("export LIBGL_ALWAYS_SOFTWARE=1"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A `firefox` typed into a terminal must BE the wrapper.
+///
+/// It was not: the wrapper was reachable only through a `.desktop` file, so
+/// the one launch path a user takes while debugging got none of its
+/// environment — no `MOZ_CRASHREPORTER_DISABLE=1` (a fault became a `.dmp`
+/// instead of a kernel `[exit] ... at pc=`), no `MOZ_DISABLE_RDD_SANDBOX`
+/// and friends, no zink+NVK-versus-software decision, no launch line in
+/// `~/.eclipse-firefox.log`.
+///
+/// The loop this invites is the point of the second half: `/usr/local/bin`
+/// comes first on `PATH`, so the wrapper must NOT look its binary up by
+/// name or it re-enters the shim forever.
+#[test]
+fn the_browsers_own_name_on_path_is_the_wrapper_and_cannot_loop() {
+    let dir = std::env::temp_dir().join(format!("eclipse-ff-shim-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    write_firefox_wrapper(&dir);
+
+    for name in ["firefox", "firefox-esr"] {
+        let path = dir.join("usr/local/bin").join(name);
+        let shim = fs::read_to_string(&path).unwrap();
+        assert!(shim.starts_with("#!/bin/sh\n"), "{name}: shebang");
+        assert!(
+            shim.contains("exec /usr/local/bin/eclipse-firefox \"$@\"\n"),
+            "{name} must exec the wrapper, got:\n{shim}"
+        );
+        let st = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success(), "{name}: sh -n rejected the shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "{name} must be executable");
+        }
+    }
+
+    let wrapper = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
+    assert!(
+        !wrapper.contains("command -v \"$c\""),
+        "the wrapper must not resolve the browser by name: /usr/local/bin is \
+         first on PATH, so `command -v firefox` finds the shim and loops"
+    );
+    for abs in [
+        "/usr/lib/firefox/firefox",
+        "/usr/lib/firefox-esr/firefox-esr",
+        "/usr/bin/firefox",
+    ] {
+        assert!(
+            wrapper.contains(abs),
+            "the wrapper must look for {abs} by absolute path"
+        );
+    }
+    assert!(
+        wrapper.contains("if [ -t 2 ]; then\n"),
+        "launched from a terminal the wrapper must leave stderr on the \
+         terminal instead of swallowing it into the log"
     );
     let _ = fs::remove_dir_all(&dir);
 }
