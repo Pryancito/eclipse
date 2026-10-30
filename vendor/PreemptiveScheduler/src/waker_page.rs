@@ -179,15 +179,16 @@ std::thread_local! {
     static STEAL_NEXT_RECLAIM: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
-#[inline]
-fn reclaim_stolen() -> bool {
-    STEAL_NEXT_RECLAIM.with(|f| f.replace(false))
-}
-
-#[cfg(not(test))]
+// Una sola funcion con el cuerpo bajo `cfg` y no dos funciones: dos cuerpos
+// `#[cfg]` son dos juegos de lineas de los que la cobertura solo puede
+// ejecutar uno, y el del build que no es de test no lo alcanza nada publico
+// (`mod waker_page` es privado). Asi la unica linea que no se puede cubrir es
+// el `false`. En ese build sigue doblandose la rama entera.
 #[inline(always)]
 fn reclaim_stolen() -> bool {
+    #[cfg(test)]
+    return STEAL_NEXT_RECLAIM.with(|f| f.replace(false));
+    #[cfg(not(test))]
     false
 }
 
