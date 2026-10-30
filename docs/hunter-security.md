@@ -107,6 +107,10 @@ linker and `#!` interpreters, which pass through the same gate:
    automatically added to the allowlist and **allowed without denial**. Merely
    relative paths (e.g. a package manager exec'ing `lib/apk/.../busybox`) are
    *not* treated as unsafe, so they are learned rather than warned about.
+   The program is **allowed** here, but only **learned** once every other
+   gate has passed too -- the resolved-path blacklist, the media lock, the
+   integrity appraisal and the antivirus -- so a program one of them refuses
+   never lands on the trusted list (and in `/var/lib/hunter/learned`).
 3. **Denylist + allowlist** — anything left is checked against the untrusted
    locations and, if the allowlist is active, the trusted set. Under `Report`
    this only logs; under `Enforce` a non-trusted program is blocked.
