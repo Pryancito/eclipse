@@ -331,12 +331,12 @@ the bar as `/bin/lunarhunter`, in the app menu as **Seguridad (hunter)**
 
 | Tab | What it does |
 |---|---|
-| Resumen | the stance in one line, eight counters, the latest alerts; quick actions: scan home, update signatures, EICAR test, lockdown, **export report** (the week's report as HTML into `$HOME`) |
+| Resumen | the stance in one line, eight counters, the latest alerts; quick actions: scan home, update signatures, lockdown, **export report** (the week's report as HTML into `$HOME`) |
 | Protección | the six domains with what each guards, the six switches (`learning`, `anomaly-detection`, `privileged-deny`, `require-hash`, `media-scan`, `media-lock`); **save as boot policy** writes the live stance to `/etc/hunter/policy.conf` (old file kept as `policy.conf.bak`), **apply policy.conf**, and **seal** |
 | Eventos | the whole event ring with time, pid, severity and category, filtered by all / alerts / critical |
 | Escaneo | presets (home, `/tmp`, programs, `/`, or `--scan PATH...`), a live count with a stop button, per-finding or all-at-once quarantine, or automatic quarantine as it goes |
 | Cuarentena | `/var/lib/hunter/quarantine/index`, each row restorable (two clicks) |
-| Firmas | what the kernel holds (hash / byte patterns / detections), the files under `/etc/hunter/signatures{,.d}`, the feeds, **update now**, and the **EICAR test** (writes the test file, scans it, deletes it, says whether the engine caught it) |
+| Firmas | what the kernel holds (hash / byte patterns / detections), the files under `/etc/hunter/signatures{,.d}`, the feeds, and **update now** |
 | Programas | the allowlist counts, kernel vs. disk pins, the learned programs, **save learned** (`hunterctl save-learned`) and **verify integrity** (`hunterctl verify`) |
 | Programados | the scheduled scans (see [Antivirus](#antivirus-signatures)): per job off / daily / weekly, the day, the time in 30-minute steps, alert or quarantine, its next run and **run now** (`hunterctl run-scheduled`); then the history, newest first |
 | Red | every TCP/UDP socket with the process holding it (pid, program, local and remote address), unexpected listeners first and in red with an **allow** button (`hunterctl expect-port`, two clicks), the alerts switch, and the expected ports with **remove** (`hunterctl forget-port`); re-read every two seconds while open. See [Network monitor](#network-monitor) |
@@ -691,8 +691,9 @@ a fresh copy dropped there will not run. `hunterctl restore <sha256>` puts the
 file back with its mode. The path stays denied until reboot, because hunter
 never forgets a deny.
 
-**Database and updates.** `/etc/hunter/signatures` (local; ships with the
-EICAR test signature) and every feed in `/etc/hunter/signatures.d/` are
+**Database and updates.** `/etc/hunter/signatures` (local; ships
+empty, since a sample signature such as EICAR's text pattern matched every
+file that quoted it, the shipped programs and documentation included) and every feed in `/etc/hunter/signatures.d/` are
 loaded at boot. `hunterctl update-signatures` downloads each feed in
 `/etc/hunter/feeds` (`<format> <name> <url> [<key>]`; formats `sha256` and
 `sigs`) with curl or wget into a dot-file in `signatures.d`, and writes

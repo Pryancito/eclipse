@@ -6,8 +6,7 @@
 //! This is the rest of it, as an application the menu opens:
 //!
 //! - **Resumen** — the stance in one sentence, every counter, the newest
-//!   alerts, the quick actions (scan home, update signatures, EICAR test,
-//!   lockdown) and the USB sticks and disks mounted now, with their scan.
+//!   alerts, the quick actions (scan home, update signatures, lockdown) and the USB sticks and disks mounted now, with their scan.
 //! - **Protección** — the six domains with what each one guards, the six
 //!   switches (learning, anomaly-detection, privileged-deny, require-hash,
 //!   media-scan, media-lock),
@@ -18,7 +17,7 @@
 //!   and quarantines what it finds (each finding, all of them, or as it goes).
 //! - **Cuarentena** — what `hunterctl quarantine` put away, and restoring it.
 //! - **Firmas** — the signatures the kernel holds, the files they come from,
-//!   the feeds, updating them, and the EICAR test that proves the engine works.
+//!   the feeds, and updating them.
 //! - **Programas** — the exec allowlist and the integrity pins: the programs
 //!   learning has trusted, saving them to the whitelist, verifying the pins.
 //! - **Programados** — the scheduled scans (a quick one daily, a full one
@@ -304,7 +303,6 @@ enum Act {
     QuarantineAll,
     Restore(usize),
     Update,
-    Eicar,
     SaveLearned,
     Verify,
     QuickScan,
@@ -350,7 +348,6 @@ impl Act {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JobKind {
     Scan,
-    Eicar,
     Update,
     Verify,
     SaveLearned,
@@ -368,7 +365,7 @@ impl JobKind {
     fn home(self) -> Tab {
         match self {
             JobKind::Scan | JobKind::Quarantine | JobKind::Media => Tab::Scan,
-            JobKind::Eicar | JobKind::Update => Tab::Signatures,
+            JobKind::Update => Tab::Signatures,
             JobKind::Verify | JobKind::SaveLearned => Tab::Programs,
             JobKind::Restore => Tab::Quarantine,
             JobKind::Schedule => Tab::Schedule,
@@ -457,13 +454,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Start `kind` in a thread. `roots` is what a scan walks; `args` what a
 /// `hunterctl` job runs.
-fn start_job(
-    kind: JobKind,
-    roots: Vec<String>,
-    args: Vec<String>,
-    auto_q: bool,
-    lang: Lang,
-) -> Job {
+fn start_job(kind: JobKind, roots: Vec<String>, args: Vec<String>, auto_q: bool) -> Job {
     let job = Job {
         kind,
         out: Arc::new(Mutex::new(JobOut::default())),
@@ -485,7 +476,6 @@ fn start_job(
                 }
                 ok
             }
-            JobKind::Eicar => eicar_test(&prog, &out, lang),
             _ => run_ctl(&args, &out),
         };
         let mut o = lock(&out);
@@ -493,56 +483,6 @@ fn start_job(
         o.done = true;
     });
     job
-}
-
-/// Write the EICAR test file, scan it, delete it, and say whether the engine
-/// caught it. The proof that the antivirus works end to end, which a count of
-/// signatures is not.
-fn eicar_test(prog: &Mutex<Progress>, out: &Mutex<JobOut>, lang: Lang) -> bool {
-    let path = std::env::temp_dir().join("lunarhunter-eicar.com");
-    let path = path.to_string_lossy().to_string();
-    if let Err(e) = std::fs::write(&path, scan::EICAR) {
-        lock(out).push(format!("{path}: {e}"));
-        return false;
-    }
-    scan::run(
-        std::slice::from_ref(&path),
-        prog,
-        &AtomicBool::new(false),
-        scan::kernel_batch,
-    );
-    let _ = std::fs::remove_file(&path);
-    let p = lock(prog).clone();
-    let mut o = lock(out);
-    if let Some(why) = p.failure {
-        o.push(format!("EICAR: {why}"));
-        return false;
-    }
-    match p.found.first() {
-        Some(f) => {
-            o.push(format!(
-                "{} ({})",
-                tr(
-                    lang,
-                    "EICAR detectado: el antivirus funciona",
-                    "EICAR detected: the antivirus works"
-                ),
-                f.name
-            ));
-            true
-        }
-        None => {
-            o.push(
-                tr(
-                    lang,
-                    "EICAR NO detectado: ¿faltan las firmas de /etc/hunter/signatures?",
-                    "EICAR NOT detected: are /etc/hunter/signatures missing?",
-                )
-                .into(),
-            );
-            false
-        }
-    }
 }
 
 // ── scan targets ─────────────────────────────────────────────────────────────
@@ -848,7 +788,7 @@ impl State {
             self.last_scan = None;
             self.quarantined.clear();
         }
-        self.job = Some(start_job(kind, roots, args, self.auto_q, self.lang));
+        self.job = Some(start_job(kind, roots, args, self.auto_q));
         self.note.clear();
     }
 
@@ -1009,10 +949,6 @@ impl State {
                     Vec::new(),
                     vec!["update-signatures".into()],
                 );
-            }
-            Act::Eicar => {
-                self.tab = Tab::Signatures;
-                self.start(JobKind::Eicar, Vec::new(), Vec::new());
             }
             Act::SaveLearned => self.start(
                 JobKind::SaveLearned,
@@ -1813,14 +1749,6 @@ fn tab_overview(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
         Style::Normal,
         free(Act::Update),
     ) + 8;
-    bx += g.button(
-        bx,
-        cy,
-        0,
-        st.t("Probar con EICAR", "EICAR test"),
-        Style::Normal,
-        free(Act::Eicar),
-    ) + 8;
     let lock = (st.root
         && !(s.sealed
             && s.modes[2] == Mode::Enforce
@@ -1830,7 +1758,7 @@ fn tab_overview(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
     bx += g.button(bx, cy, 0, st.t("Blindar", "Lockdown"), Style::Danger, lock) + 8;
     // Reading only, so it needs no root; and not while a job runs, so the
     // report is not taken halfway through a scan's quarantine. On a row of
-    // its own when the window is too narrow for five buttons.
+    // its own when the window is too narrow for four buttons.
     let label = st.t("Exportar informe", "Export report");
     if bx + Canvas::text_width(label) + 24 > x + w {
         bx = x;
@@ -2463,22 +2391,13 @@ fn tab_signatures(g: &mut Paint, (x, y, w, h): Rect, r: &Report) -> Rect {
 
     let busy = st.busy();
     let free = |a: Act| (!busy && st.root).then_some(a);
-    let mut bx = x;
-    bx += g.button(
-        bx,
+    g.button(
+        x,
         cy,
         0,
         st.t("Actualizar ahora", "Update now"),
         Style::Primary,
         free(Act::Update),
-    ) + 8;
-    g.button(
-        bx,
-        cy,
-        0,
-        st.t("Probar con EICAR", "EICAR test"),
-        Style::Normal,
-        free(Act::Eicar),
     );
     cy += BTN_H + 20;
 
@@ -3456,10 +3375,7 @@ fn sample(st: &mut State) {
         ..Progress::default()
     });
     let out = JobOut {
-        lines: vec![
-            "hunterctl: MalwareBazaar.Recent: 4999 signature(s)".into(),
-            "EICAR detectado: el antivirus funciona (EICAR-Test-File)".into(),
-        ],
+        lines: vec!["hunterctl: MalwareBazaar.Recent: 4999 signature(s)".into()],
         done: true,
         ok: true,
     };
@@ -3775,7 +3691,6 @@ mod tests {
     fn every_job_has_a_home_tab_with_a_console() {
         for k in [
             JobKind::Scan,
-            JobKind::Eicar,
             JobKind::Update,
             JobKind::Verify,
             JobKind::SaveLearned,

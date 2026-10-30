@@ -517,9 +517,11 @@ recent events (oldest first):\n\
         assert_eq!(feeds.len(), 1);
         assert_eq!(feeds[0].format, "sha256");
         assert!(feeds[0].url.starts_with("https://"));
+        // No sample signature ships: EICAR's pattern flagged every file that
+        // quoted it.
         assert_eq!(
             count_signatures(include_str!("../../hunterctl/signatures")),
-            (1, 1)
+            (0, 0)
         );
     }
 

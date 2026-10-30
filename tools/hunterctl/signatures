@@ -11,8 +11,9 @@
 # Signatures can also be added to a running system, never removed:
 #   echo 'signature bytes:deadbeef:Example' > /proc/hunter
 #
-# The EICAR test file: harmless, and what every antivirus is tested with.
-# `printf '%s' 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > /tmp/eicar.com`
-# then `hunterctl scan /tmp` should report it.
-hash:275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f:EICAR-Test-File
-bytes:45494341522d5354414e444152442d414e544956495255532d544553542d46494c45:EICAR-Test-File
+#
+# No signature ships here: the database comes from the feeds above. Sample
+# strings (the EICAR test file and the like) are not shipped either, because
+# a byte pattern matches every file that merely contains its text -- this
+# file, the documentation, the programs that print it -- and turns them all
+# into false positives.

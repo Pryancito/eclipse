@@ -440,9 +440,16 @@ pub(crate) fn reset_for_test() {
 mod tests {
     use super::*;
 
-    /// The EICAR anti-virus test file: harmless, and every engine detects it.
-    const EICAR: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
-    const EICAR_SHA256: &str = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
+    /// A made-up "malware" sample. Not a real test string such as SAMPLE: no
+    /// signature anywhere matches it, so it cannot become a false positive in
+    /// the binaries that carry it.
+    const SAMPLE: &[u8] = b"hunter-av unit test sample: harmless bytes";
+    /// `SAMPLE`'s pattern signature: its middle, `test sample`.
+    const SAMPLE_PATTERN: &str = "746573742073616d706c65";
+
+    fn sample_sha256() -> String {
+        integrity::to_hex(&Sha256::digest(SAMPLE).into())
+    }
 
     fn reader(bytes: &[u8]) -> impl FnMut(usize, &mut [u8]) -> bool + '_ {
         move |off, buf| {
@@ -458,10 +465,10 @@ mod tests {
     #[test]
     fn signatures_parse() {
         assert_eq!(
-            sig(&format!("hash:{}:EICAR-Test-File", EICAR_SHA256)),
+            sig(&format!("hash:{}:Sample-File", sample_sha256())),
             Signature::Hash(
-                integrity::parse_hex(EICAR_SHA256).unwrap(),
-                String::from("EICAR-Test-File")
+                integrity::parse_hex(&sample_sha256()).unwrap(),
+                String::from("Sample-File")
             )
         );
         assert_eq!(
@@ -486,38 +493,27 @@ mod tests {
         }
     }
 
-    /// The database the image ships: every line parses, and it finds EICAR
-    /// both ways -- which is what `hunterctl scan` is first tried with.
+    /// The database the image ships: every line parses, and none is a
+    /// signature -- a sample one (SAMPLE's text) matched every file that
+    /// merely quoted it, the shipped programs and documentation included.
     #[test]
-    fn the_shipped_database_parses_and_finds_eicar() {
-        let _g = crate::test_globals::lock();
-        reset_for_test();
+    fn the_shipped_database_parses_and_holds_no_sample_signature() {
         let shipped = include_str!("../../tools/hunterctl/signatures");
-        let mut n = 0;
         for line in shipped.lines() {
-            if let Some(s) = parse_signature(line).unwrap() {
-                assert!(add_signature(s));
-                n += 1;
-            }
+            assert_eq!(parse_signature(line).unwrap(), None, "{}", line);
         }
-        assert_eq!(n, 2);
-        assert_eq!(
-            scan(EICAR.len(), &mut reader(EICAR)),
-            Ok(Some(String::from("EICAR-Test-File")))
-        );
-        reset_for_test();
     }
 
     #[test]
-    fn eicar_is_found_by_hash_and_by_pattern() {
+    fn a_sample_is_found_by_hash_and_by_pattern() {
         let _g = crate::test_globals::lock();
         reset_for_test();
-        add_signature(sig(&format!("hash:{}:EICAR-Hash", EICAR_SHA256)));
+        add_signature(sig(&format!("hash:{}:Sample-Hash", sample_sha256())));
         assert_eq!(
-            scan(EICAR.len(), &mut reader(EICAR)),
-            Ok(Some(String::from("EICAR-Hash")))
+            scan(SAMPLE.len(), &mut reader(SAMPLE)),
+            Ok(Some(String::from("Sample-Hash")))
         );
-        let mut longer = Vec::from(EICAR);
+        let mut longer = Vec::from(SAMPLE);
         longer.push(b'\n');
         assert_eq!(
             scan(longer.len(), &mut reader(&longer)),
@@ -525,13 +521,10 @@ mod tests {
             "a hash is the whole file"
         );
 
-        add_signature(sig(&format!(
-            "bytes:{}:EICAR-Pattern",
-            "45494341522d5354414e444152442d414e544956495255532d544553542d46494c45"
-        )));
+        add_signature(sig(&format!("bytes:{}:Sample-Pattern", SAMPLE_PATTERN)));
         assert_eq!(
             scan(longer.len(), &mut reader(&longer)),
-            Ok(Some(String::from("EICAR-Pattern")))
+            Ok(Some(String::from("Sample-Pattern")))
         );
         reset_for_test();
     }
@@ -562,20 +555,20 @@ mod tests {
         // Empty database: the reader is never asked for a byte.
         assert!(check_exec_av(&["/bin/x"], 7, 10, &mut |_, _| panic!()));
 
-        add_signature(sig(&format!("hash:{}:EICAR-Hash", EICAR_SHA256)));
+        add_signature(sig(&format!("hash:{}:Sample-Hash", sample_sha256())));
         assert!(
-            check_exec_av(&["/tmp/e"], 0, EICAR.len(), &mut reader(EICAR)),
+            check_exec_av(&["/tmp/e"], 0, SAMPLE.len(), &mut reader(SAMPLE)),
             "report"
         );
         policy::set_av_mode(Mode::Enforce);
         let mut reads = 0;
         let mut counting = |off: usize, buf: &mut [u8]| {
             reads += 1;
-            buf.copy_from_slice(&EICAR[off..off + buf.len()]);
+            buf.copy_from_slice(&SAMPLE[off..off + buf.len()]);
             true
         };
-        assert!(!check_exec_av(&["/tmp/e"], 9, EICAR.len(), &mut counting));
-        assert!(!check_exec_av(&["/tmp/e"], 9, EICAR.len(), &mut counting));
+        assert!(!check_exec_av(&["/tmp/e"], 9, SAMPLE.len(), &mut counting));
+        assert!(!check_exec_av(&["/tmp/e"], 9, SAMPLE.len(), &mut counting));
         assert_eq!(reads, 1, "the same image was scanned twice");
         assert_eq!(stats().2, 3);
         policy::reset_for_test();
@@ -592,12 +585,12 @@ mod tests {
         assert!(check_exec_av(
             &["/tmp/e"],
             11,
-            EICAR.len(),
-            &mut reader(EICAR)
+            SAMPLE.len(),
+            &mut reader(SAMPLE)
         ));
-        add_signature(sig(&format!("hash:{}:EICAR-Hash", EICAR_SHA256)));
+        add_signature(sig(&format!("hash:{}:Sample-Hash", sample_sha256())));
         assert!(
-            !check_exec_av(&["/tmp/e"], 11, EICAR.len(), &mut reader(EICAR)),
+            !check_exec_av(&["/tmp/e"], 11, SAMPLE.len(), &mut reader(SAMPLE)),
             "the clean verdict from the smaller database was reused"
         );
         policy::reset_for_test();
@@ -608,15 +601,15 @@ mod tests {
     fn on_demand_results_read_like_clamscan() {
         let _g = crate::test_globals::lock();
         reset_for_test();
-        add_signature(sig(&format!("hash:{}:EICAR-Hash", EICAR_SHA256)));
+        add_signature(sig(&format!("hash:{}:Sample-Hash", sample_sha256())));
         begin_scan_batch();
-        scan_file("/tmp/eicar.com", Some(EICAR.len()), &mut reader(EICAR));
+        scan_file("/tmp/sample", Some(SAMPLE.len()), &mut reader(SAMPLE));
         scan_file("/bin/clean", Some(3), &mut reader(b"abc"));
         scan_file("/nope", None, &mut |_, _| false);
         scan_file("/bad", Some(3), &mut |_, _| false);
         assert_eq!(
             render_scan_results(),
-            "/tmp/eicar.com: EICAR-Hash FOUND\n/bin/clean: OK\n/nope: ERROR cannot open\n/bad: ERROR read failed\n"
+            "/tmp/sample: Sample-Hash FOUND\n/bin/clean: OK\n/nope: ERROR cannot open\n/bad: ERROR read failed\n"
         );
         begin_scan_batch();
         assert_eq!(render_scan_results(), "");
