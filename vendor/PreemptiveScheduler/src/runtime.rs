@@ -3206,15 +3206,19 @@ pub(crate) fn get_current_runtime() -> MutexGuard<'static, ExecutorRuntime> {
     crate::diag::diag_lock(GLOBAL_RUNTIME.force(id))
 }
 
-/// Lo que contestan las sondas en una CPU sin runtime; ver las notas del
-/// modulo.
 /// What an `ExecutorRuntime` is when it is built, and what a mid-poll
 /// preemption does to it; see the module docs.
 #[cfg(test)]
 mod runtime_birth_tests;
 
+/// Lo que contestan las sondas en una CPU sin runtime; ver las notas del
+/// modulo.
 #[cfg(test)]
 mod probe_tests;
+
+/// Las mismas sondas con un runtime detras; ver las notas del modulo.
+#[cfg(test)]
+mod with_runtime_tests;
 
 #[cfg(test)]
 mod containment_tests {

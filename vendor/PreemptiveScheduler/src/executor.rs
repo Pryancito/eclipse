@@ -172,6 +172,25 @@ pub(crate) fn executor_globals_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Empty the stack pool, the overflow retention list and the retired-stack
+/// table.
+///
+/// For a test that built an `Executor` and let it go: the block is retained in
+/// coroutine-stack land on purpose (it must never go back to the shared
+/// arena), so without this every test that creates one leaves a block behind
+/// for the next to pick up, and a test about a FRESH block would get a pooled
+/// one. The caller must hold [`executor_globals_lock`].
+#[cfg(test)]
+pub(crate) fn wipe_stack_pool_for_test() {
+    use core::sync::atomic::Ordering;
+    *RETIRED_STACKS.lock() = [RetiredStack::EMPTY; RETIRED_STACKS_CAP];
+    RETIRED_OCCUPIED.store(0, Ordering::SeqCst);
+    for slot in STACK_POOL.iter() {
+        slot.store(0, Ordering::SeqCst);
+    }
+    STACK_OVERFLOW.lock().clear();
+}
+
 /// What `Executor::new` builds, and what its stack looks like when it is
 /// built, reused and retired; see the module docs.
 #[cfg(test)]
