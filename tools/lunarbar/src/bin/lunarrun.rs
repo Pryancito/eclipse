@@ -1429,8 +1429,10 @@ fn main() {
         return;
     }
 
-    let Ok(conn) = Connection::connect_to_env() else {
-        eprintln!("lunarrun: no WAYLAND_DISPLAY (is the session up?)");
+    // Not `connect_to_env`: the portal and labwc's autostart start us
+    // with no WAYLAND_DISPLAY. See `lunarbar::wl`.
+    let Ok(conn) = lunarbar::wl::connect() else {
+        eprintln!("lunarrun: no Wayland compositor found (is the session up?)");
         std::process::exit(1);
     };
     let mut queue = conn.new_event_queue();
@@ -2046,9 +2048,7 @@ mod tests {
         let dump = body
             .find("if let Some(spec) = dump")
             .expect("the dump block");
-        let connect = body
-            .find("Connection::connect_to_env")
-            .expect("the connect");
+        let connect = body.find("wl::connect()").expect("the connect");
         assert!(
             dump < connect,
             "the --dump block must come before the compositor connect"

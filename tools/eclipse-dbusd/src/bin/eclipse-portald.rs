@@ -64,6 +64,11 @@ const DEFAULT_ANSWER_DIR: &str = "/run/user/0/eclipse-portal";
 /// when a developer puts it earlier in `PATH`.
 const DEFAULT_PICKER: &str = "lunarfile";
 
+/// The session's runtime directory when `XDG_RUNTIME_DIR` is unset, which is
+/// where the compositor's socket is looked for. It is the one `eclipse-init`
+/// gives every service, and the one the service files wait on.
+const DEFAULT_RUNTIME_DIR: &str = "/run/user/0";
+
 /// How long a dialog may stay up before the portal stops waiting for it.
 ///
 /// Without a bound a client that is never answered is a `Response` that never
@@ -383,9 +388,41 @@ fn respond(bus: &mut Client, handle: &str, sender: &str, code: u32, uris: &[Stri
 /// Start the chooser, detached from the terminal but NOT from this process: the
 /// portal needs to know when it exits, which is the whole signal that the user
 /// has answered.
+///
+/// The child is given the SESSION, which this daemon does not have: a service
+/// started by `eclipse-init` gets `XDG_RUNTIME_DIR` and deliberately no
+/// `WAYLAND_DISPLAY`, since the compositor is what creates the socket and may
+/// not have started yet. A chooser launched with that environment is a Wayland
+/// client with no display: it exits before it maps, writes no answer, and the
+/// empty answer reaches the application as a cancellation -- an "Open file"
+/// that does nothing at all. So the socket is resolved HERE, at the moment the
+/// dialog is asked for, and exported for the child.
 fn launch(picker: &str, ask: &Ask, answer: &str) -> std::io::Result<Child> {
     let cmd = portal::picker_command(picker, ask, answer);
-    Command::new("/bin/sh").arg("-c").arg(&cmd).spawn()
+    let mut c = Command::new("/bin/sh");
+    c.arg("-c").arg(&cmd);
+    let runtime =
+        std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| DEFAULT_RUNTIME_DIR.to_string());
+    let entries: Vec<String> = std::fs::read_dir(&runtime)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    match portal::wayland_socket(&entries, std::env::var("WAYLAND_DISPLAY").ok().as_deref()) {
+        Some(display) => {
+            c.env("XDG_RUNTIME_DIR", &runtime);
+            c.env("WAYLAND_DISPLAY", &display);
+        }
+        // Not a refusal: a chooser that finds the compositor by itself still
+        // works (`lunarbar::wl`). But it is the first thing to look at when a
+        // dialog never appears, so it is said out loud.
+        None => log(&format!(
+            "sin socket de Wayland en {runtime}; el dialogo tendra que buscarlo solo"
+        )),
+    }
+    c.spawn()
 }
 
 /// Look at every dialog in flight and answer the ones that have finished.

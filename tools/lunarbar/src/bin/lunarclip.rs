@@ -647,7 +647,7 @@ fn connect(
     path: PathBuf,
     persist: bool,
 ) -> Option<(Connection, wayland_client::EventQueue<Clip>, Clip)> {
-    let conn = Connection::connect_to_env().ok()?;
+    let conn = lunarbar::wl::connect().ok()?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
@@ -752,7 +752,7 @@ fn watch(cli: &Cli) -> ! {
         std::env::var("HOME").ok().as_deref(),
     );
     let Some((conn, mut queue, mut st)) = connect(hist_path.clone(), !cli.no_persist) else {
-        eprintln!("lunarclip: no hay WAYLAND_DISPLAY (¿esta la sesion arriba?)");
+        eprintln!("lunarclip: no encuentro el compositor (¿esta la sesion arriba?)");
         std::process::exit(1);
     };
     if st.device.is_none() {
@@ -1108,7 +1108,7 @@ fn copy(cli: &Cli) -> ! {
          \x20          (Ctrl-C la suelta; con el demonio esto vuelve al momento)"
     );
     let Some((conn, mut queue, mut st)) = connect(PathBuf::new(), false) else {
-        eprintln!("lunarclip: no hay WAYLAND_DISPLAY");
+        eprintln!("lunarclip: no encuentro el compositor");
         std::process::exit(1);
     };
     if st.device.is_none() {
@@ -1128,7 +1128,7 @@ fn copy(cli: &Cli) -> ! {
 /// `--paste`: the selection on stdout, with no trailing newline added.
 fn paste() -> ! {
     let Some((conn, mut queue, mut st)) = connect(PathBuf::new(), false) else {
-        eprintln!("lunarclip: no hay WAYLAND_DISPLAY");
+        eprintln!("lunarclip: no encuentro el compositor");
         std::process::exit(1);
     };
     if st.device.is_none() {
@@ -1168,7 +1168,7 @@ fn paste() -> ! {
 /// protocol is missing.
 fn check() -> ! {
     let Some((_conn, _queue, st)) = connect(PathBuf::new(), false) else {
-        println!("lunarclip: no hay WAYLAND_DISPLAY (¿esta la sesion arriba?)");
+        println!("lunarclip: no encuentro el compositor (¿esta la sesion arriba?)");
         std::process::exit(1);
     };
     let sock = clip::socket_path(std::env::var("XDG_RUNTIME_DIR").ok().as_deref());
@@ -2104,8 +2104,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Picker {
 /// `--pick`: the overlay, and the `SET` of whatever was chosen.
 fn pick() -> ! {
     let (items, live) = history_for_picker();
-    let Ok(conn) = Connection::connect_to_env() else {
-        eprintln!("lunarclip: no hay WAYLAND_DISPLAY (¿esta la sesion arriba?)");
+    let Ok(conn) = lunarbar::wl::connect() else {
+        eprintln!("lunarclip: no encuentro el compositor (¿esta la sesion arriba?)");
         std::process::exit(1);
     };
     let mut queue = conn.new_event_queue();

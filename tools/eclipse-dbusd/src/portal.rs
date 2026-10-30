@@ -462,6 +462,44 @@ pub fn answer_file(dir: &str, pid: u32, nanos: u128, seq: u64) -> String {
     format!("{dir}/pick-{pid}-{nanos:x}-{seq}")
 }
 
+/// The compositor socket the chooser has to be pointed at, out of a listing of
+/// the runtime directory.
+///
+/// A portal is a SERVICE: `eclipse-init` starts it with
+/// `XDG_RUNTIME_DIR=/run/user/0` and deliberately no `WAYLAND_DISPLAY`,
+/// because the compositor is what creates the socket and it may not exist yet
+/// when the portal starts. The chooser inherits that environment, so a dialog
+/// asked for by a browser was started with no session in it: `lunarfile`
+/// exited before it mapped, wrote nothing, and the empty answer reached the
+/// browser as a cancellation -- "the file dialog does not open".
+///
+/// So the socket is resolved at the moment the dialog is asked for, not when
+/// the daemon started. What this does is the choice itself: the daemon's own
+/// `WAYLAND_DISPLAY` when it has one (a portal started by hand from a session
+/// terminal), otherwise the lowest-numbered `wayland-N` the directory holds.
+/// The `.lock` file libwayland keeps beside each socket is not a socket.
+/// `None` means there is no session to point at, which is worth a log line and
+/// not a reason to refuse: a chooser that finds the compositor by itself still
+/// works.
+pub fn wayland_socket(entries: &[String], current: Option<&str>) -> Option<String> {
+    if let Some(d) = current.filter(|d| !d.is_empty() && !d.contains('/')) {
+        return Some(d.to_string());
+    }
+    let mut socks: Vec<&String> = entries
+        .iter()
+        .filter(|n| n.starts_with("wayland-") && !n.ends_with(".lock"))
+        .collect();
+    // Lowest first, and by NUMBER: `wayland-10` sorts before `wayland-2` as
+    // text, and the first session on a seat is always `wayland-0`.
+    socks.sort_by_key(|n| {
+        (
+            n["wayland-".len()..].parse::<u64>().unwrap_or(u64::MAX),
+            (*n).clone(),
+        )
+    });
+    socks.first().map(|n| (*n).clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1323,5 +1361,41 @@ mod tests {
             (RESPONSE_OK, RESPONSE_CANCELLED, RESPONSE_OTHER),
             (0u32, 1u32, 2u32)
         );
+    }
+
+    /// The daemon's own `WAYLAND_DISPLAY` wins: a portal started by hand from
+    /// a session terminal is already in the session that asked.
+    #[test]
+    fn the_env_wins_over_the_listing() {
+        let entries = vec!["wayland-0".to_string()];
+        assert_eq!(
+            wayland_socket(&entries, Some("wayland-7")).as_deref(),
+            Some("wayland-7")
+        );
+        // An exported-but-empty variable is not an answer, and a path is
+        // `connect_to_env`'s business, not a name to join onto a directory.
+        assert_eq!(
+            wayland_socket(&entries, Some("")).as_deref(),
+            Some("wayland-0")
+        );
+        assert_eq!(
+            wayland_socket(&entries, Some("/run/user/0/wayland-0")).as_deref(),
+            Some("wayland-0")
+        );
+    }
+
+    /// Lowest by NUMBER, and never the lock file: `wayland-10` sorts before
+    /// `wayland-2` as text, and connecting to `wayland-0.lock` is a connect
+    /// that can only fail.
+    #[test]
+    fn the_lowest_socket_is_chosen_and_the_lock_is_not_a_socket() {
+        let entries: Vec<String> = ["wayland-10", "wayland-2", "bus", "wayland-2.lock"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(wayland_socket(&entries, None).as_deref(), Some("wayland-2"));
+        let only_lock = vec!["wayland-0.lock".to_string(), "bus".to_string()];
+        assert_eq!(wayland_socket(&only_lock, None), None);
+        assert_eq!(wayland_socket(&[], None), None);
     }
 }

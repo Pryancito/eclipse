@@ -35,8 +35,10 @@
 //! `--pick` is the seam the XDG desktop portal's `FileChooser` backend needs:
 //! `org.freedesktop.portal.FileChooser.OpenFile` is how GTK and Firefox ask for
 //! a file, and a backend for it is one process that spawns this and reads the
-//! `--out` file back. That portal does not exist in this tree yet; this is the
-//! half of it that has to exist first.
+//! `--out` file back. That backend is `eclipse-portald`
+//! (`tools/eclipse-dbusd`), and it is a SERVICE: `eclipse-init` starts it with
+//! no `WAYLAND_DISPLAY`, so the chooser cannot assume one -- see
+//! `lunarbar::wl`.
 //!
 //! Env: `ECLIPSE_LOOK=kde|eclipse|win11` to override `/etc/eclipse/look`.
 
@@ -1920,8 +1922,10 @@ fn main() {
         return;
     }
 
-    let Ok(conn) = Connection::connect_to_env() else {
-        eprintln!("lunarfile: no WAYLAND_DISPLAY (is the session up?)");
+    // Not `connect_to_env`: the portal and labwc's autostart start us
+    // with no WAYLAND_DISPLAY. See `lunarbar::wl`.
+    let Ok(conn) = lunarbar::wl::connect() else {
+        eprintln!("lunarfile: no Wayland compositor found (is the session up?)");
         std::process::exit(1);
     };
     let mut queue = conn.new_event_queue();

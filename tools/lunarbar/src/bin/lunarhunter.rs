@@ -3217,8 +3217,10 @@ fn main() {
         return;
     }
 
-    let Ok(conn) = Connection::connect_to_env() else {
-        eprintln!("lunarhunter: no WAYLAND_DISPLAY (is the session up?)");
+    // Not `connect_to_env`: the portal and labwc's autostart start us
+    // with no WAYLAND_DISPLAY. See `lunarbar::wl`.
+    let Ok(conn) = lunarbar::wl::connect() else {
+        eprintln!("lunarhunter: no Wayland compositor found (is the session up?)");
         std::process::exit(1);
     };
     let mut queue = conn.new_event_queue();
