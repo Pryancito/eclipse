@@ -114,7 +114,13 @@ fn a_cpu_with_no_dense_id_is_always_on_the_idle_path() {
 /// contestan `false`: «no se sabe, no fuerces el salto».
 #[test]
 fn an_unreadable_runtime_is_not_reported_as_idle() {
-    let _cpu = AsCpu::new(0);
+    // `NO_SLOT`, not 0, for the reason its own comment gives: the CPU 0 slot
+    // is BUILT by `with_runtime_tests`, `placement_tests` and
+    // `runtime_birth_tests`, through a `Once` that never undoes itself. Once
+    // any of those has run first, CPU 0's runtime IS readable and IS idle, so
+    // this assertion became a question about test order -- it failed on CI and
+    // reproduces here five times out of five with `--test-threads=2`.
+    let _cpu = AsCpu::new(NO_SLOT);
     assert!(!irq_on_idle_executor());
 }
 
