@@ -112,10 +112,43 @@ fn a_cpu_with_no_dense_id_is_always_on_the_idle_path() {
 
 /// Un hueco sin construir no es lo mismo que uno tomado, y aqui los dos
 /// contestan `false`: «no se sabe, no fuerces el salto».
+///
+/// Las dos mitades piden una CPU distinta, y por una razon que este fichero ya
+/// cuenta en su cabecera: miraba la **CPU 0**, cuyo hueco construyen
+/// `with_runtime_tests`, `placement_tests` y `runtime_birth_tests`, y un `Once`
+/// no se deshace. Construido el hueco y suelto su cerrojo, `irq_on_idle_executor`
+/// contesta `true` --que es la verdad: ese runtime no tiene ejecutor-- y la
+/// afirmacion se caia. **No era un test inestable, era dependiente del orden**:
+/// en cuanto uno de esos modulos llegaba antes, fallaba siempre, y con mas
+/// nucleos eso pasa mas. La mitad «sin construir» va ahora a [`NO_SLOT`], que
+/// es el hueco que nadie construye.
 #[test]
 fn an_unreadable_runtime_is_not_reported_as_idle() {
+    let _cpu = AsCpu::new(NO_SLOT);
+    assert!(
+        !irq_on_idle_executor(),
+        "un hueco sin construir no se puede leer, asi que no se puede decir que este ocioso"
+    );
+}
+
+/// Y la otra mitad: un hueco que existe pero cuyo cerrojo tiene otro. La
+/// sonda se llama desde contexto de IRQ dura, asi que esperar el cerrojo
+/// convierte un fallo diagnosticable en una congelacion sin una linea; y
+/// creerse «ocioso» sin haber podido mirar manda a apagar el despacho del
+/// temporizador en una CPU que si tiene trabajo.
+#[test]
+fn a_runtime_whose_lock_is_taken_is_not_reported_as_idle_either() {
+    // La CPU 0 vale aqui justamente porque su hueco lo construye medio
+    // fichero de tests: forzarlo no anade nada que no estuviese ya.
+    let slot = GLOBAL_RUNTIME
+        .try_force(0)
+        .expect("la CPU 0 tiene id logico denso");
+    let _held = slot.lock();
     let _cpu = AsCpu::new(0);
-    assert!(!irq_on_idle_executor());
+    assert!(
+        !irq_on_idle_executor(),
+        "con el cerrojo tomado no se ha mirado nada: no se puede contestar «ocioso»"
+    );
 }
 
 /// La heuristica del tope de pila esta retirada y contesta `false` siempre.
