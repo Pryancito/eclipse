@@ -14,10 +14,19 @@ use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_hal::sync::Mutex;
 use kernel_hal::PhysAddr;
+use percpu_counter::{BatchedCounter, PerCpuCounter};
+
+#[path = "memory/percpu_counter.rs"]
+mod percpu_counter;
 
 static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
-static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
-static FRAMES_USED: AtomicUsize = AtomicUsize::new(0);
+/// Bytes the heap's callers hold. Written on every `alloc` and `dealloc` and
+/// read on every `alloc` (the growth watermark), so it is per CPU with a
+/// batched shared figure; see [`percpu_counter`]. 64 KiB per CPU slot of
+/// staleness in the watermark is 4 MiB at most against a 512 MiB heap.
+static HEAP_USED: BatchedCounter<{ 64 * 1024 }> = BatchedCounter::new();
+/// Bytes of frames callers hold. Per CPU: it moves on every page fault.
+static FRAMES_USED: PerCpuCounter = PerCpuCounter::new();
 /// Bytes parked in the per-CPU frame lists: taken from the bitmap, held by
 /// nobody. Deliberately NOT part of `FRAMES_USED`, which answers what callers
 /// hold; see [`pcp`].
@@ -28,7 +37,7 @@ static FRAMES_USED: AtomicUsize = AtomicUsize::new(0);
 /// error under the crate's `deny(warnings)`, which is what the `mem-debug` CI
 /// job exists to catch.
 #[cfg(not(feature = "mem-debug"))]
-static FRAMES_CACHED: AtomicUsize = AtomicUsize::new(0);
+static FRAMES_CACHED: PerCpuCounter = PerCpuCounter::new();
 
 type FrameAlloc = bitmap_allocator::BitAlloc16M; // max 64G
 
@@ -116,7 +125,6 @@ fn track_mark_free(idx: usize) {
 mod pcp {
     use super::{Mutex, FRAMES_CACHED, FRAME_ALLOCATOR, PAGE_BITS};
     use bitmap_allocator::BitAlloc;
-    use core::sync::atomic::Ordering;
     use kernel_hal::cpu_topology::{percpu_slot, PERCPU_SLOTS};
 
     /// `pcp->high`: frames one CPU may park. 65 slots x 128 frames is 32 MiB
@@ -182,7 +190,7 @@ mod pcp {
     /// true, and is exactly why a reader of a failed allocation needs to be
     /// told they exist.
     pub fn cached_bytes() -> usize {
-        FRAMES_CACHED.load(Ordering::Relaxed)
+        FRAMES_CACHED.get()
     }
 
     /// A frame from this CPU's list, refilling it from the bitmap when empty.
@@ -194,7 +202,7 @@ mod pcp {
     pub fn alloc() -> Option<usize> {
         let mut p = mine().try_lock()?;
         if let Some(idx) = p.pop() {
-            FRAMES_CACHED.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
+            FRAMES_CACHED.sub(1 << PAGE_BITS);
             return Some(idx);
         }
         // Refill with the list still held and the bitmap taken inside it. The
@@ -212,7 +220,7 @@ mod pcp {
             parked += 1;
         }
         if parked > 0 {
-            FRAMES_CACHED.fetch_add(parked << PAGE_BITS, Ordering::Relaxed);
+            FRAMES_CACHED.add(parked << PAGE_BITS);
         }
         Some(first)
     }
@@ -235,12 +243,12 @@ mod pcp {
                 given += 1;
             }
             drop(g);
-            FRAMES_CACHED.fetch_sub(given << PAGE_BITS, Ordering::Relaxed);
+            FRAMES_CACHED.sub(given << PAGE_BITS);
         }
         if !p.push(idx) {
             return false;
         }
-        FRAMES_CACHED.fetch_add(1 << PAGE_BITS, Ordering::Relaxed);
+        FRAMES_CACHED.add(1 << PAGE_BITS);
         true
     }
 
@@ -268,7 +276,7 @@ mod pcp {
             }
         }
         if moved > 0 {
-            FRAMES_CACHED.fetch_sub(moved << PAGE_BITS, Ordering::Relaxed);
+            FRAMES_CACHED.sub(moved << PAGE_BITS);
         }
         moved
     }
@@ -431,7 +439,7 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
         frame_alloc_from_pool(frame_count, align_log2)
     });
     if let Some(idx) = start_idx {
-        FRAMES_USED.fetch_add(frame_count << PAGE_BITS, Ordering::Relaxed);
+        FRAMES_USED.add(frame_count << PAGE_BITS);
         #[cfg(feature = "mem-debug")]
         for i in 0..frame_count {
             track_mark_alloc(idx + i);
@@ -444,7 +452,7 @@ pub fn frame_alloc(frame_count: usize, align_log2: usize) -> Option<PhysAddr> {
         // exhausted; for a multi-frame request it may instead be fragmentation
         // (no contiguous run). Printed unconditionally so we can tell a real
         // shortage apart from a code path bug when something reports ENOMEM.
-        let used = FRAMES_USED.load(Ordering::Relaxed);
+        let used = FRAMES_USED.get();
         let total = TOTAL_MEMORY.load(Ordering::Relaxed);
         // error! (console), not klog: physical-RAM exhaustion during a fork's
         // eager copy surfaces as a mysterious ENOMEM/stall with nothing on
@@ -506,7 +514,7 @@ pub fn frame_dealloc(target: PhysAddr) {
             1 << PAGE_BITS,
         );
     }
-    FRAMES_USED.fetch_sub(1 << PAGE_BITS, Ordering::Relaxed);
+    FRAMES_USED.sub(1 << PAGE_BITS);
     // Park it on this CPU rather than taking the global lock. `false` means
     // the list is full and its lock was contended, or the lock was held: free
     // it the old way.
@@ -518,10 +526,7 @@ pub fn frame_dealloc(target: PhysAddr) {
 }
 
 pub fn frame_stats() -> (usize, usize) {
-    (
-        FRAMES_USED.load(Ordering::Relaxed),
-        TOTAL_MEMORY.load(Ordering::Relaxed),
-    )
+    (FRAMES_USED.get(), TOTAL_MEMORY.load(Ordering::Relaxed))
 }
 
 /// The next table down from page-table entry `e` at `level`, or `None` when
@@ -620,8 +625,8 @@ pub fn reserve_active_page_table_frames() {
 
 /// Combined usage for `/proc/meminfo` and diagnostics.
 pub fn stats() -> (usize, usize) {
-    let heap_used = HEAP_USED.load(Ordering::Relaxed);
-    let frames_used = FRAMES_USED.load(Ordering::Relaxed);
+    let heap_used = HEAP_USED.get();
+    let frames_used = FRAMES_USED.get();
     (
         heap_used + frames_used,
         heap_total() + TOTAL_MEMORY.load(Ordering::Relaxed),
@@ -631,7 +636,7 @@ pub fn stats() -> (usize, usize) {
 /// Kernel heap bytes currently allocated (diagnostics / OOM handler).
 #[allow(dead_code)]
 pub fn heap_used() -> usize {
-    HEAP_USED.load(Ordering::Relaxed)
+    HEAP_USED.get()
 }
 
 cfg_if! {
@@ -1091,11 +1096,16 @@ cfg_if! {
         /// The last free of `block` the ring still holds.
         #[cfg(not(feature = "mem-debug"))]
         fn report_freer(block: usize) {
-            match slab::FREES.find(block) {
-                Some((rets, age)) => {
+            // The block was freed on some CPU, and only that CPU's ring has it.
+            let found = slab::FREES
+                .iter()
+                .enumerate()
+                .find_map(|(cpu, ring)| ring.find(block).map(|(rets, age)| (cpu, rets, age)));
+            match found {
+                Some((cpu, rets, age)) => {
                     emit(format_args!(
-                        "[heap-uaf] {:#x} was freed {} cached free(s) ago, by:\n",
-                        block, age,
+                        "[heap-uaf] {:#x} was freed on cpu {}, {} cached free(s) ago there, by:\n",
+                        block, cpu, age,
                     ));
                     for ret in rets.iter().take_while(|r| **r != 0) {
                         emit(format_args!(
@@ -1105,9 +1115,9 @@ cfg_if! {
                     }
                 }
                 None => emit(format_args!(
-                    "[heap-uaf] {:#x}: its free is no longer in the ring of the last {} frees\n",
+                    "[heap-uaf] {:#x}: its free is no longer in any CPU's ring of its last {} frees\n",
                     block,
-                    slab::FREES.len(),
+                    slab::FREES_PER_CPU,
                 )),
             }
         }
@@ -1462,8 +1472,7 @@ cfg_if! {
             // a sequence anyone reads in order.
             let mut rows = [(0usize, 0usize); HEAP_BUCKETS];
             let mut counted = 0usize;
-            for (i, count) in HEAP_LIVE.iter().enumerate() {
-                let live = count.load(Ordering::Relaxed);
+            for (i, live) in heap_live_histogram().into_iter().enumerate() {
                 let size = 1usize << i;
                 rows[i] = (live.saturating_mul(size), live);
                 counted = counted.saturating_add(rows[i].0);
@@ -1599,7 +1608,7 @@ cfg_if! {
         #[inline(never)]
         fn grow_heap_on_failure() -> bool {
             let total = HEAP_TOTAL.load(Ordering::Relaxed);
-            let used = HEAP_USED.load(Ordering::Relaxed);
+            let used = HEAP_USED.get();
             grow_heap_guarded(used, total)
         }
 
@@ -1627,7 +1636,7 @@ cfg_if! {
             }
             // Leave the machine room to commit user pages.
             let ram = TOTAL_MEMORY.load(Ordering::Relaxed);
-            let ram_used = FRAMES_USED.load(Ordering::Relaxed);
+            let ram_used = FRAMES_USED.get();
             let reserve = ram / 100 * HEAP_LEAVE_FREE_PCT;
             if ram == 0 || ram_used + HEAP_GROW_CHUNKS[HEAP_GROW_CHUNKS.len() - 1] + reserve > ram
             {
@@ -1766,10 +1775,13 @@ cfg_if! {
         // Histograma de asignaciones VIVAS por clase de tamaño (log2). El OOM
         // del escritorio (499/512 MiB usados) necesita atribución: qué clase
         // de tamaño retiene el heap. Coste: un fetch_add relajado por
-        // alloc/dealloc. `heap_live_histogram` lo vuelca el alloc_error
-        // handler sin asignar memoria.
+        // alloc/dealloc, en la fila de ESTA CPU (ver `percpu_counter`): una
+        // fila global compartida rebotaba entre CPUs en cada asignación.
+        // `heap_live_histogram` lo vuelca el alloc_error handler sin asignar
+        // memoria.
         const HEAP_BUCKETS: usize = 32;
-        static HEAP_LIVE: [AtomicUsize; HEAP_BUCKETS] = [const { AtomicUsize::new(0) }; HEAP_BUCKETS];
+        static HEAP_LIVE: percpu_counter::PerCpuCounters<HEAP_BUCKETS> =
+            percpu_counter::PerCpuCounters::new();
 
         #[inline]
         fn bucket_of(size: usize) -> usize {
@@ -1780,8 +1792,8 @@ cfg_if! {
         /// report. Index i counts allocations with size in (2^(i-1), 2^i].
         pub fn heap_live_histogram() -> [usize; HEAP_BUCKETS] {
             let mut out = [0usize; HEAP_BUCKETS];
-            for (i, slot) in HEAP_LIVE.iter().enumerate() {
-                out[i] = slot.load(Ordering::Relaxed);
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = HEAP_LIVE.sum(i);
             }
             out
         }
@@ -1790,10 +1802,55 @@ cfg_if! {
         // distinct allocation sizes across the heap, first-come-first-served.
         const HOT_SLOTS: usize = 32;
         static HOT_SIZE: [AtomicUsize; HOT_SLOTS] = [const { AtomicUsize::new(0) }; HOT_SLOTS];
-        static HOT_LIVE: [AtomicUsize; HOT_SLOTS] = [const { AtomicUsize::new(0) }; HOT_SLOTS];
+        /// Per CPU, like `HEAP_LIVE`: this runs on every alloc and every free.
+        static HOT_LIVE: percpu_counter::PerCpuCounters<HOT_SLOTS> =
+            percpu_counter::PerCpuCounters::new();
+        /// Per slot, the next of its size's leak-hunt thresholds to fire.
+        static HOT_HUNT_NEXT: [AtomicUsize; HOT_SLOTS] = [const { AtomicUsize::new(0) }; HOT_SLOTS];
+        /// Slots a size probes, from the one its hash names. A size whose run
+        /// is full goes untracked, which only a table already holding many
+        /// more distinct sizes than the OOM report prints can cause. Bounded
+        /// so that a size that is NOT tracked -- most of them, once the table
+        /// fills up in the first seconds of boot -- costs this many loads on
+        /// every alloc and free instead of all 32.
+        const HOT_PROBES: usize = 8;
+
+        #[inline]
+        fn hot_home(size: usize) -> usize {
+            // Fibonacci hashing: sizes are mostly multiples of 8 and 16, and
+            // `size % 32` would pile them onto a handful of slots.
+            (size.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (usize::BITS - 5)) % HOT_SLOTS
+        }
+
+        /// Leak hunt: the desktop OOMs (512 MiB heap) with ~2M live 8 B and
+        /// 96 B blocks -- a per-event allocation that is never freed. Dump the
+        /// allocating call chain a few times as each suspect class climbs, so
+        /// the leaking site can be symbolized from the printed return
+        /// addresses. Fires once per threshold.
+        ///
+        /// 512 B joined them from an OOM report taken on hardware: `512B x
+        /// 131156 (~64 MiB)`, the largest exact class on the screen, against a
+        /// heap that then could not find 4 MiB. No call site in the tree
+        /// allocates exactly 512 bytes often enough to explain 131k live
+        /// blocks, and nothing bounded holds that many (the console's
+        /// scrollback caps at 1000 lines per VT, and there are 7 VTs), so it
+        /// is either a leak or a cache with no ceiling -- and either way the
+        /// only way to name it is to catch it allocating. Thresholds are set
+        /// below what the report showed so the dump lands before the heap is
+        /// gone.
+        fn hunt_thresholds(size: usize) -> &'static [usize] {
+            match size {
+                8 | 96 => &[100_000, 400_000, 800_000],
+                512 => &[20_000, 60_000, 120_000],
+                4096 => &[50_000, 90_000],
+                _ => &[],
+            }
+        }
 
         fn hot_track(size: usize, delta: isize) {
-            for i in 0..HOT_SLOTS {
+            let home = hot_home(size);
+            for probe in 0..HOT_PROBES {
+                let i = (home + probe) % HOT_SLOTS;
                 let cur = HOT_SIZE[i].load(Ordering::Relaxed);
                 let claimed = cur == size
                     || (cur == 0
@@ -1801,39 +1858,24 @@ cfg_if! {
                             .compare_exchange(0, size, Ordering::Relaxed, Ordering::Relaxed)
                             .map_or_else(|racer| racer == size, |_| true));
                 if claimed {
-                    if delta > 0 {
-                        let live = HOT_LIVE[i].fetch_add(1, Ordering::Relaxed) + 1;
-                        // Leak hunt: the desktop OOMs (512 MiB heap) with ~2M live
-                        // 8 B and 96 B blocks -- a per-event allocation that is never
-                        // freed. Dump the allocating call chain a few times as each
-                        // suspect class climbs, so the leaking site can be symbolized
-                        // from the printed return addresses. Fires at most 3x/class.
-                        //
-                        // 512 B joined them from an OOM report taken on hardware:
-                        // `512B x 131156 (~64 MiB)`, the largest exact class on the
-                        // screen, against a heap that then could not find 4 MiB. No
-                        // call site in the tree allocates exactly 512 bytes often
-                        // enough to explain 131k live blocks, and nothing bounded
-                        // holds that many (the console's scrollback caps at 1000
-                        // lines per VT, and there are 7 VTs), so it is either a leak
-                        // or a cache with no ceiling -- and either way the only way
-                        // to name it is to catch it allocating. Thresholds are set
-                        // below what the report showed so the dump lands before the
-                        // heap is gone.
-                        let hunt = match size {
-                            8 | 96 => matches!(live, 100_000 | 400_000 | 800_000),
-                            512 => matches!(live, 20_000 | 60_000 | 120_000),
-                            _ => false,
-                        };
-                        if (size == 4096 && (live == 50_000 || live == 90_000)) || hunt {
+                    let row = HOT_LIVE.add(i, delta);
+                    // The live count is a sum over every CPU, so it is only
+                    // added up every 64 moves of this CPU's row, and only for
+                    // the sizes being hunted. A threshold fires when the sum
+                    // has crossed it rather than when it equals it -- the
+                    // count is no longer seen one step at a time.
+                    let thresholds = hunt_thresholds(size);
+                    if delta > 0 && !thresholds.is_empty() && row & 63 == 0 {
+                        let live = HOT_LIVE.sum(i);
+                        let next = HOT_HUNT_NEXT[i].load(Ordering::Relaxed);
+                        if next < thresholds.len()
+                            && live >= thresholds[next]
+                            && HOT_HUNT_NEXT[i]
+                                .compare_exchange(next, next + 1, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                        {
                             leak_trace_dump(size, live);
                         }
-                    } else {
-                        HOT_LIVE[i].try_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |v| Some(v.saturating_sub(1)),
-                        ).ok();
                     }
                     return;
                 }
@@ -1893,7 +1935,7 @@ cfg_if! {
             for i in 0..HOT_SLOTS {
                 out[i] = (
                     HOT_SIZE[i].load(Ordering::Relaxed),
-                    HOT_LIVE[i].load(Ordering::Relaxed),
+                    HOT_LIVE.sum(i),
                 );
             }
             out
@@ -2017,8 +2059,21 @@ cfg_if! {
                 &SLAB[percpu_slot(kernel_hal::cpu::cpu_id() as usize)]
             }
 
-            /// Who freed each cached block, newest last. See [`free_ring`].
-            pub static FREES: free_ring::FreeRing<4096> = free_ring::FreeRing::new();
+            /// Who freed each cached block, newest last, one ring per CPU. See
+            /// [`free_ring`].
+            ///
+            /// Per CPU for the same reason as the cache: one machine-wide ring
+            /// put a `fetch_add` on its shared cursor, and seven stores into a
+            /// slot another CPU had just written, on every cached free. A ring
+            /// per CPU is also the one that holds the answer: a block is
+            /// cached, and so popped and checked, on the CPU that freed it.
+            pub static FREES: [free_ring::FreeRing<FREES_PER_CPU>; PERCPU_SLOTS] =
+                [const { free_ring::FreeRing::new() }; PERCPU_SLOTS];
+
+            /// Frees each CPU's ring remembers. The old shared ring held 4096,
+            /// about 512 per CPU on an eight-core machine; 256 keeps the 65
+            /// rings under 1 MiB of BSS (56 bytes a slot).
+            pub const FREES_PER_CPU: usize = 256;
 
             /// Whether a link may be followed: a block of `size` bytes, aligned
             /// to it, inside the heap. Before `init`, or once the registry has
@@ -2080,14 +2135,15 @@ cfg_if! {
                 let Some(i) = free_lists::cache_slot(layout) else {
                     return Freed::ToBuddy;
                 };
-                let Some(mut c) = mine().try_lock() else {
+                let slot = percpu_slot(kernel_hal::cpu::cpu_id() as usize);
+                let Some(mut c) = SLAB[slot].try_lock() else {
                     return Freed::ToBuddy;
                 };
                 match unsafe { c.push(i, ptr as usize) } {
                     Ok(true) => {
                         // Under the lock: nothing can pop the block, write into
                         // it and be caught before its freer is on record.
-                        FREES.note(ptr as usize, rets);
+                        FREES[slot].note(ptr as usize, rets);
                         Freed::Cached
                     }
                     Ok(false) => Freed::ToBuddy,
@@ -2233,8 +2289,9 @@ cfg_if! {
                     {
                         report_stack_double_alloc(p as usize, sz, base);
                     }
-                    let used = HEAP_USED.fetch_add(sz, Ordering::Relaxed) + sz;
-                    HEAP_LIVE[bucket_of(sz)].fetch_add(1, Ordering::Relaxed);
+                    HEAP_USED.add(sz);
+                    let used = HEAP_USED.approx();
+                    HEAP_LIVE.add(bucket_of(sz), 1);
                     hot_track(sz, 1);
                     try_grow_heap(used);
                     note_heap_pressure(used, p as usize, sz);
@@ -2320,8 +2377,8 @@ cfg_if! {
                     // stale reader sees 0xa5a5... instead of plausible data.
                     core::ptr::write_bytes(ptr, POISON, sz);
                 }
-                HEAP_USED.fetch_sub(sz, Ordering::Relaxed);
-                HEAP_LIVE[bucket_of(sz)].fetch_sub(1, Ordering::Relaxed);
+                HEAP_USED.sub(sz);
+                HEAP_LIVE.add(bucket_of(sz), -1);
                 if sz >= BIG_ALLOC_MIN {
                     untrack_big_alloc(ptr as usize);
                 }
@@ -3659,7 +3716,9 @@ pub mod free_ring {
             }
         }
 
-        /// Frees the ring remembers.
+        /// Frees the ring remembers. The kernel reads the per-CPU depth from
+        /// `FREES_PER_CPU`; only the tests ask a ring.
+        #[cfg(test)]
         pub const fn len(&self) -> usize {
             N
         }
