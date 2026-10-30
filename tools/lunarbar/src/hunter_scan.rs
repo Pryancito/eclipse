@@ -238,10 +238,6 @@ pub fn run(
     });
 }
 
-/// The EICAR test file: harmless, and what every antivirus is tested with
-/// (`tools/hunterctl/signatures` ships both of its signatures).
-pub const EICAR: &str = r"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,14 +270,17 @@ mod tests {
         assert!(skipped("/var/lib/hunter/quarantine/x", &SKIP));
     }
 
-    /// A small tree with one EICAR in it, its own per test (they run in
+    /// A made-up "malware" sample for the fake kernel below to find.
+    const SAMPLE: &str = "lunarhunter test sample: harmless bytes";
+
+    /// A small tree with one sample in it, its own per test (they run in
     /// threads).
     fn tree(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("lunarhunter-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("sub/deeper")).unwrap();
         std::fs::write(d.join("a"), "clean").unwrap();
-        std::fs::write(d.join("sub/eicar.com"), EICAR).unwrap();
+        std::fs::write(d.join("sub/sample"), SAMPLE).unwrap();
         std::fs::write(d.join("sub/deeper/z"), "clean").unwrap();
         // A link loop: never followed.
         let _ = std::os::unix::fs::symlink(&d, d.join("sub/loop"));
@@ -301,7 +300,7 @@ mod tests {
             &mut out
         ));
         let rel: Vec<_> = out.iter().map(|p| p[root.len()..].to_string()).collect();
-        assert_eq!(rel, ["/a", "/sub/deeper/z", "/sub/eicar.com"]);
+        assert_eq!(rel, ["/a", "/sub/deeper/z", "/sub/sample"]);
         // Cut at the cap, and says so.
         let mut few = Vec::new();
         assert!(!walk(&[root], &[], 2, &AtomicBool::new(false), &mut few));
@@ -314,14 +313,14 @@ mod tests {
         let d = tree("scan");
         let root = d.to_string_lossy().to_string();
         let prog = Mutex::new(Progress::default());
-        // The fake kernel: EICAR is found, `z` cannot be read.
+        // The fake kernel: the sample is found, `z` cannot be read.
         run(&[root], &prog, &AtomicBool::new(false), |paths| {
             Ok(paths
                 .iter()
                 .map(|p| {
                     let body = std::fs::read_to_string(p).unwrap_or_default();
-                    if body == EICAR {
-                        format!("{p}: EICAR-Test-File FOUND\n")
+                    if body == SAMPLE {
+                        format!("{p}: Sample FOUND\n")
                     } else if p.ends_with("/z") {
                         format!("{p}: ERROR read failed\n")
                     } else {
@@ -334,7 +333,7 @@ mod tests {
         assert!(p.finished && !p.cancelled && p.failure.is_none());
         assert_eq!((p.total, p.done, p.errors), (3, 3, 1));
         assert_eq!(p.found.len(), 1);
-        assert!(p.found[0].path.ends_with("/sub/eicar.com"));
+        assert!(p.found[0].path.ends_with("/sub/sample"));
         let _ = std::fs::remove_dir_all(&d);
     }
 

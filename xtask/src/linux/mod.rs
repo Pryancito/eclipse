@@ -839,10 +839,10 @@ impl LinuxRootfs {
         let etc_hunter = rootfs.join("etc/hunter");
         fs::create_dir_all(&etc_hunter).unwrap();
         // Each written only when absent, so an operator's edits survive a
-        // rebuild: the example policy, the antivirus database (EICAR, so the
-        // scanner can be tested), the signature feeds, the (commented out) keys
-        // their signatures are checked with, the scheduled scans and the ports
-        // the network monitor expects.
+        // rebuild: the example policy, the (empty) antivirus database, the
+        // signature feeds, the (commented out) keys their signatures are
+        // checked with, the scheduled scans and the ports the network monitor
+        // expects.
         for name in [
             "policy.conf",
             "signatures",
@@ -854,6 +854,20 @@ impl LinuxRootfs {
             let dst = etc_hunter.join(name);
             if !dst.exists() {
                 fs::copy(PROJECT_DIR.join("tools/hunterctl").join(name), &dst).unwrap();
+            }
+        }
+        // Images built before the database shipped empty carry the EICAR
+        // sample signatures, whose byte pattern flags every file that quotes
+        // the test string: drop those two lines, keep the operator's.
+        let sigs = etc_hunter.join("signatures");
+        if let Ok(old) = fs::read_to_string(&sigs) {
+            if old.lines().any(|l| l.ends_with(":EICAR-Test-File")) {
+                let kept: String = old
+                    .lines()
+                    .filter(|l| !l.ends_with(":EICAR-Test-File"))
+                    .map(|l| format!("{l}\n"))
+                    .collect();
+                fs::write(&sigs, kept).unwrap();
             }
         }
         fs::create_dir_all(etc_hunter.join("signatures.d")).unwrap();

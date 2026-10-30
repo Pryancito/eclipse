@@ -58,30 +58,29 @@ fn a_valid_script_is_taken_whole() {
     assert!(hunter::policy::is_exec_blacklisted("/hunter-tests/denied"));
 }
 
-/// The EICAR test file: harmless, and what every antivirus is tested with.
-const EICAR: &[u8] = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+/// A made-up "malware" sample: not a real test string such as EICAR, so no
+/// signature anywhere matches the binaries that carry it.
+const SAMPLE: &[u8] = b"hunter procfs test sample: harmless bytes";
 
 #[test]
-fn the_on_demand_scanner_finds_eicar_in_a_file_and_says_clean_of_the_rest() {
+fn the_on_demand_scanner_finds_a_sample_in_a_file_and_says_clean_of_the_rest() {
     use rcore_fs::vfs::FileType;
     // A byte signature of its own, so it cannot collide with another test's.
     hunter::av::add_signature(
-        hunter::av::parse_signature(
-            "bytes:45494341522d5354414e444152442d414e544956495255532d544553542d46494c45:Test.EICAR.procfs",
-        )
-        .unwrap()
-        .unwrap(),
+        hunter::av::parse_signature("bytes:70726f636673207465737420:Test.Sample.procfs")
+            .unwrap()
+            .unwrap(),
     );
     let fs = rcore_fs_ramfs::RamFS::new();
     let root = rcore_fs::vfs::FileSystem::root_inode(&*fs);
-    let bad = root.create("eicar.com", FileType::File, 0o644).unwrap();
-    bad.write_at(0, EICAR).unwrap();
+    let bad = root.create("sample", FileType::File, 0o644).unwrap();
+    bad.write_at(0, SAMPLE).unwrap();
     let good = root.create("clean", FileType::File, 0o644).unwrap();
     good.write_at(0, b"nothing to see").unwrap();
     let dir = root.create("dir", FileType::Dir, 0o755).unwrap();
 
     hunter::av::begin_scan_batch();
-    scan_inode("/eicar.com", Some(&*bad));
+    scan_inode("/sample", Some(&*bad));
     scan_inode("/clean", Some(&*good));
     scan_inode("/dir", Some(&*dir));
     scan_inode("/missing", None);
@@ -90,7 +89,7 @@ fn the_on_demand_scanner_finds_eicar_in_a_file_and_says_clean_of_the_rest() {
     let n = node.read_at(0, &mut buf).unwrap();
     assert_eq!(
         core::str::from_utf8(&buf[..n]).unwrap(),
-        "/eicar.com: Test.EICAR.procfs FOUND\n/clean: OK\n/dir: ERROR cannot open\n/missing: ERROR cannot open\n"
+        "/sample: Test.Sample.procfs FOUND\n/clean: OK\n/dir: ERROR cannot open\n/missing: ERROR cannot open\n"
     );
     assert_eq!(node.metadata().unwrap().mode, 0o644);
 }
