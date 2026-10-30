@@ -201,6 +201,50 @@ const FASTFETCH_LOGO: &str = "usr/share/eclipse/logo.fastfetch.txt";
 /// number is not one of them.
 const FASTFETCH_COLOUR: &str = "magenta";
 
+/// Every module fastfetch would print on its own.
+///
+/// This list is not a choice of ours: it is fastfetch's own default
+/// structure (`DEFAULT_STRUCTURE` in its `CMakeLists.txt`), written out
+/// because **a config file silently replaces it**. `printJsonConfig` reads
+/// the `modules` key of the config it settled on and returns straight away
+/// when there is none -- no default, no warning, not even an error line. A
+/// config that says only which logo to draw therefore prints the logo and
+/// nothing else, which is exactly what #2285 shipped.
+///
+/// Lower case because that is how fastfetch writes its own generated
+/// config; it matches the type case-insensitively either way.
+const FASTFETCH_MODULES: &[&str] = &[
+    "title",
+    "separator",
+    "os",
+    "host",
+    "kernel",
+    "uptime",
+    "packages",
+    "shell",
+    "display",
+    "de",
+    "wm",
+    "wmtheme",
+    "theme",
+    "icons",
+    "font",
+    "cursor",
+    "terminal",
+    "terminalfont",
+    "cpu",
+    "gpu",
+    "memory",
+    "swap",
+    "disk",
+    "localip",
+    "battery",
+    "poweradapter",
+    "locale",
+    "break",
+    "colors",
+];
+
 /// The mark with fastfetch's colour placeholder on the front.
 ///
 /// One `$1` is enough for the whole drawing: fastfetch carries the colour
@@ -217,7 +261,20 @@ fn fastfetch_logo() -> String {
 /// debian` because that is honestly where the userspace comes from. Shipping
 /// our own `LOGO` icon did nothing for it: that field names an ICON for the
 /// icon theme, and fastfetch's ASCII logo is a different thing entirely.
+///
+/// It also has to spell out [`FASTFETCH_MODULES`]: a config file without a
+/// `modules` key makes fastfetch print the logo and stop, so the file that
+/// fixed the logo took every line of output with it.
 fn fastfetch_config() -> String {
+    let mut modules = String::new();
+    for (at, module) in FASTFETCH_MODULES.iter().enumerate() {
+        let comma = if at + 1 == FASTFETCH_MODULES.len() {
+            ""
+        } else {
+            ","
+        };
+        modules.push_str(&format!("    \"{module}\"{comma}\n"));
+    }
     format!(
         "{{\n\
          \x20 \"$schema\": \"https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json\",\n\
@@ -225,7 +282,9 @@ fn fastfetch_config() -> String {
          \x20\x20\x20 \"type\": \"file\",\n\
          \x20\x20\x20 \"source\": \"/{FASTFETCH_LOGO}\",\n\
          \x20\x20\x20 \"color\": {{ \"1\": \"{FASTFETCH_COLOUR}\" }}\n\
-         \x20 }}\n\
+         \x20 }},\n\
+         \x20 \"modules\": [\n\
+         {modules}\x20 ]\n\
          }}\n"
     )
 }
@@ -704,6 +763,46 @@ mod tests {
         }
         assert_eq!(depth, 0, "unbalanced braces:\n{text}");
         assert!(!in_string, "an unclosed string:\n{text}");
+    }
+
+    /// A config file REPLACES fastfetch's default module list instead of
+    /// adding to it: `printJsonConfig` returns the moment the config has no
+    /// `modules` key, so the config that fixed the logo in #2285 printed the
+    /// logo and not one line beside it. Every module of fastfetch's own
+    /// default structure has to be in the file, in order.
+    #[test]
+    fn the_fastfetch_config_lists_the_modules_itself() {
+        let text = fastfetch_config();
+        assert!(
+            text.contains("\"modules\": ["),
+            "the config declares no modules, so fastfetch prints the logo alone:\n{text}"
+        );
+        let listed: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('"') && !line.contains(':'))
+            .map(|line| line.trim_end_matches(',').trim_matches('"'))
+            .collect();
+        assert_eq!(
+            listed, FASTFETCH_MODULES,
+            "the file does not list what the constant says"
+        );
+        // The ones a desktop is actually read for. Named one by one so that
+        // dropping any of them is a failure and not a shorter list.
+        for wanted in ["title", "os", "kernel", "uptime", "cpu", "gpu", "memory"] {
+            assert!(
+                FASTFETCH_MODULES.contains(&wanted),
+                "`{wanted}` is not among the modules"
+            );
+        }
+        // fastfetch matches the type case-insensitively, but its own
+        // generated config is lower case and a reader compares the two.
+        for module in FASTFETCH_MODULES {
+            assert!(
+                !module.is_empty() && module.chars().all(|c| c.is_ascii_lowercase()),
+                "`{module}` is not a lower-case module name"
+            );
+        }
     }
 
     /// The logo fastfetch reads is the SAME drawing, with the placeholder in
