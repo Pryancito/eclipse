@@ -196,6 +196,15 @@ impl SiginfoFields {
         self.pad[..core::mem::size_of::<usize>()].copy_from_slice(&addr.to_ne_bytes());
     }
 
+    /// `si_addr` back out again. Only meaningful on fields [`write_fault`]
+    /// wrote; on anything else these are the bytes of another member of the
+    /// union, which is why the only caller is [`SigInfo::fault_addr`].
+    fn read_fault(&self) -> usize {
+        let mut bytes = [0u8; core::mem::size_of::<usize>()];
+        bytes.copy_from_slice(&self.pad[..core::mem::size_of::<usize>()]);
+        usize::from_ne_bytes(bytes)
+    }
+
     /// `_sigchld`: `si_pid`, `si_uid` (the child's REAL uid, `task_uid`),
     /// `si_status`.
     fn write_sigchld(&mut self, pid: i32, uid: u32, status: i32) {
@@ -368,6 +377,18 @@ impl SigInfo {
         };
         info.field.write_fault(addr);
         info
+    }
+
+    /// The address a fault signal carries (`si_addr`), for the kernel's own
+    /// report of a process it is about to kill.
+    ///
+    /// It is the one thing that says WHERE, and the signal that reaches
+    /// userspace is no use when there is no userspace left to read it: a
+    /// process with no handler is terminated by the kernel and the `siginfo`
+    /// is never written anywhere. Only call it on a `SigInfo` built by
+    /// [`SigInfo::fault`] -- the fields are a union.
+    pub fn fault_addr(&self) -> usize {
+        self.field.read_fault()
     }
 
     /// What a signal sent with no information carries: its number, and
@@ -1073,6 +1094,32 @@ mod fault_info_tests {
         assert_eq!(addr, 0xdead_beef_0000);
         assert_eq!(info.code, SignalCode::SEGV_MAPERR);
         assert_eq!(info.signo, Signal::SIGSEGV as i32);
+    }
+
+    /// The kernel's own report of a fault it is killing a process for reads
+    /// the address back out of the same `SigInfo` it would have delivered,
+    /// so the number it prints has to be the one it wrote.
+    ///
+    /// A process with no handler never sees its `siginfo`: it is terminated
+    /// and the struct goes nowhere. `fault_addr` is how the address survives
+    /// that, into the log line that is the only evidence left.
+    #[test]
+    fn the_address_a_fault_carries_reads_back_out_for_the_kernels_own_report() {
+        for addr in [0usize, 0x1000, 0xdead_beef_0000, usize::MAX] {
+            let info = SigInfo::fault(Signal::SIGSEGV, SignalCode::SEGV_MAPERR, addr);
+            assert_eq!(
+                info.fault_addr(),
+                addr,
+                "si_addr did not read back as it was written"
+            );
+            // And it is the SAME bytes userspace would have been handed.
+            let b = info.as_bytes();
+            assert_eq!(
+                info.fault_addr(),
+                usize::from_ne_bytes(b[16..24].try_into().unwrap()),
+                "the kernel's reader and si_addr disagree"
+            );
+        }
     }
 
     #[test]

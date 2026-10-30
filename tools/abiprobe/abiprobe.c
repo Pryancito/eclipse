@@ -68,7 +68,23 @@ static void probe_v8_cage(size_t size) {
 
 static void *thread_body(void *arg) { (void)arg; sched_yield(); return NULL; }
 
-int main(void) {
+/* `abiprobe --segv [addr]`: fault on purpose, with no handler installed, so
+   the kernel prints its own report of a process it is about to kill. This is
+   how that report is checked -- it is the only evidence left of a death the
+   process cannot report itself. */
+static int deliberate_fault(const char *where) {
+    unsigned long addr = where ? strtoul(where, NULL, 0) : 0;
+    printf("# faulting on purpose at %#lx, no handler installed\n", addr);
+    fflush(stdout);
+    *(volatile char *)addr = 1;
+    printf("# the write went through: nothing faulted\n");
+    return 1;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--segv") == 0)
+        return deliberate_fault(argc > 2 ? argv[2] : NULL);
+
     struct utsname u;
     if (uname(&u) == 0) printf("# %s %s %s\n", u.sysname, u.release, u.machine);
     printf("# pid=%d uid=%d\n\n", getpid(), getuid());
