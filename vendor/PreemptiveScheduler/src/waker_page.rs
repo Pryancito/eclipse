@@ -165,16 +165,24 @@ pub struct WakerPage {
 /// `false` and the branch folds away.
 #[cfg(test)]
 pub(crate) fn steal_next_reclaim() {
-    STEAL_NEXT_RECLAIM.store(true, Ordering::SeqCst);
+    STEAL_NEXT_RECLAIM.with(|f| f.set(true));
 }
 
+// Por HILO, y no un `static` del proceso: `cargo test` corre las suites en
+// paralelo, y esta bandera la arma un test y la consume la primera llamada a
+// `reclaim_*` que pase por aqui, sea del test que la armo o no. Como `static`
+// compartido el que la armaba podia verla consumida por otra suite -- y la
+// otra suite veia un reclamo robado que nadie le habia pedido. Los dos usos
+// del arbol arman y consumen en el mismo hilo.
 #[cfg(test)]
-static STEAL_NEXT_RECLAIM: AtomicBool = AtomicBool::new(false);
+std::thread_local! {
+    static STEAL_NEXT_RECLAIM: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
 
 #[cfg(test)]
 #[inline]
 fn reclaim_stolen() -> bool {
-    STEAL_NEXT_RECLAIM.swap(false, Ordering::SeqCst)
+    STEAL_NEXT_RECLAIM.with(|f| f.replace(false))
 }
 
 #[cfg(not(test))]
@@ -783,6 +791,25 @@ mod waker_page_tests {
     }
 
     #[test]
+    fn el_carril_tambien_suma_resta_y_se_deja_ver_por_puntero() {
+        // `fetch_add`, `fetch_sub` y `as_mut_ptr` son los tres accesos de
+        // `AtomicU64SC` que ninguna linea de produccion usa hoy: estan para
+        // que un carril pueda ser un contador y no solo un mapa de bits, y
+        // para que una lectura sin atomico pueda alcanzarlo. Sin test, un
+        // `as_ptr` que devolviera otra celda -- la firma cambio de nombre una
+        // vez ya -- mentiria en silencio hasta el dia que alguien los use.
+        let mut lane = AtomicU64SC::new(7);
+        assert_eq!(lane.fetch_add(3), 7, "devuelve el valor de antes");
+        assert_eq!(lane.load(), 10);
+        assert_eq!(lane.fetch_sub(4), 10);
+        assert_eq!(lane.load(), 6);
+        let ptr = lane.as_mut_ptr();
+        assert_eq!(unsafe { *ptr }, 6, "el puntero no apunta a la celda");
+        unsafe { *ptr = 0b1010 };
+        assert_eq!(lane.load(), 0b1010, "y la escritura por el no se ve");
+    }
+
+    #[test]
     fn taking_bits_out_of_a_lane_reports_which_were_there() {
         let lane = AtomicU64SC::new(0b1010);
         assert_eq!(lane.fetch_and_prev(!0b0010), 0b1010);
@@ -1306,6 +1333,25 @@ mod waker_page_tests {
         assert_eq!(p.peek().0, 1 << 40, "the deferred wake was thrown away");
     }
 
+    /// El gemelo de `a_slot_whose_bit_a_peer_took_first_is_not_handed_out`
+    /// (en `task_collection`) para el carril de cesion voluntaria: `schedule`
+    /// elige un hueco sin el cerrojo de la pagina, asi que entre elegirlo y
+    /// reclamar su bit el bit puede haber volado. Reportar 0 es la unica
+    /// respuesta segura, y el bit se consume: dejarlo publicado lo repartiria
+    /// otra vez a una tarea que el par ya esta sondeando.
+    #[test]
+    fn a_yield_whose_bit_a_peer_took_first_is_reported_as_nothing() {
+        let p = page();
+        p.park_yielded(1 << 11);
+        steal_next_reclaim();
+        assert_eq!(p.reclaim_yielded(1 << 11), 0);
+        assert_eq!(p.peek().1, 0, "el bit se quedo publicado");
+        // Y la inyeccion es de un solo uso, que es lo que la hace util: el
+        // reclamo siguiente es el normal y devuelve el bit.
+        p.park_yielded(1 << 11);
+        assert_eq!(p.reclaim_yielded(1 << 11), 1 << 11);
+    }
+
     #[test]
     fn parking_nothing_is_not_a_wake() {
         let p = page();
@@ -1348,6 +1394,39 @@ mod waker_page_tests {
 
     fn kicked() -> u64 {
         KICKED.load(Ordering::SeqCst)
+    }
+
+    /// El `Woke` es por donde pasan TODOS los despertares de verdad: el
+    /// ejecutor no llama a `WakerRef::wake_by_ref`, construye un
+    /// `core::task::Waker` con `woke::waker_ref` y se lo da al futuro. Si ese
+    /// puente no acabara en el mismo sitio que la llamada directa, todo lo que
+    /// miden los tests de esta pagina seria un camino que nadie recorre.
+    #[test]
+    fn the_woke_bridge_lands_on_the_same_wake_as_the_direct_call() {
+        let _g = wake_lock();
+        let p = page();
+        let w = waker_for(&p, 5);
+        p.take_notified();
+        let waker = woke::waker_ref(&w);
+        waker.wake_by_ref();
+        assert_eq!(p.peek().0, 1 << 5, "el puente no publico el despertar");
+        assert_eq!(p.take_notified(), 1 << 5);
+    }
+
+    /// El registro de patadas de estos tests es un `u64`, y `1u64 << 64` es un
+    /// panico en debug: una CPU fuera de su alcance se descarta, de modo que
+    /// un `owner_cpu` alto (el campo es un `u8`) no tumba el test en vez de
+    /// fallarlo.
+    #[test]
+    fn a_kick_for_a_cpu_outside_the_record_is_dropped_and_not_shifted() {
+        let _g = wake_lock();
+        KICKED.store(0, Ordering::SeqCst);
+        record_kick(64);
+        record_kick(255);
+        assert_eq!(kicked(), 0);
+        record_kick(63);
+        assert_eq!(kicked(), 1 << 63);
+        KICKED.store(0, Ordering::SeqCst);
     }
 
     #[test]
