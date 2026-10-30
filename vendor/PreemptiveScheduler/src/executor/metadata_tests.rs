@@ -1,15 +1,19 @@
 //! Lo que un `Executor` contesta y lo que sus trabas dejan dicho, sin pila
 //! detras.
 //!
-//! `Executor::new` no se puede llamar aqui: reserva 2,6 MiB de pila y
-//! `init_stack_and_context` lee `cr3`, una instruccion privilegiada que en un
-//! proceso de usuario es un SIGSEGV antes de que el test compruebe nada (ver
-//! las notas de `stack_birth_benches`). Asi que todo lo de este fichero sale
-//! del literal [`super::metadata_only_executor`], que es la unica costura por
-//! la que se pueden leer los observadores (`is_polling`, `stack_contains`,
-//! `canary_intact`) y accionar las trabas de contencion
-//! (`abandon_idle_executor`, `force_replace_executor`,
-//! `abandon_current_task`).
+//! Todo lo de este fichero sale del literal
+//! [`super::metadata_only_executor`], que es la costura por la que se leen los
+//! observadores (`is_polling`, `stack_contains`, `canary_intact`) y se
+//! accionan las trabas de contencion (`abandon_idle_executor`,
+//! `force_replace_executor`, `abandon_current_task`) **sin reservar 2,6 MiB de
+//! pila por test**.
+//!
+//! `Executor::new` si se puede llamar ahora -- `arch::pg_base_register` tiene
+//! un sustituto de anfitrion desde que esa lectura de `cr3`, privilegiada y
+//! por tanto un SIGSEGV en un proceso de usuario, dejo de ser el techo de este
+//! modulo -- y lo que hace de verdad el constructor esta en
+//! [`super::birth_tests`]. Aqui sigue el literal porque lo que se mide son las
+//! respuestas, no el nacimiento.
 //!
 //! Son justo los que el camino del panico consulta para decidir si descarta
 //! una tarea, un ejecutor entero, o nada: cada uno de ellos contestando de mas

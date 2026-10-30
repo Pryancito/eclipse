@@ -10,9 +10,12 @@
 //! queda esperando el cerrojo convierte un fallo diagnosticable en una
 //! congelacion sin una linea en pantalla.
 //!
-//! En el anfitrion NINGUNA CPU tiene runtime, y no se puede construir uno:
-//! `ExecutorRuntime::new` llama a `Executor::new`, que lee `cr3`. Asi que esta
-//! es la unica mitad que se puede probar aqui, y es la que importa.
+//! Aqui el hueco que no existe es el de [`NO_SLOT`], no el de la CPU 0: desde
+//! que `arch::pg_base_register` tiene un sustituto de anfitrion, los modulos
+//! que prueban un runtime de verdad construyen el de la CPU 0, y los huecos de
+//! `GLOBAL_RUNTIME` son `Once` -- una vez construido existe para el resto del
+//! proceso y no hay forma de quitarlo. Ninguna otra CPU construye el suyo,
+//! asi que la mitad sin hueco sigue siendo probable; solo cambia en cual.
 //!
 //! Lo que queda deliberadamente fuera, por lo mismo: `get_current_runtime`
 //! (fuerza la construccion del hueco), `get_current_executor_id`,
@@ -45,11 +48,17 @@ impl Drop for AsCpu {
 /// tomar un cerrojo del nucleo y no debe correr codigo del nucleo.
 const NO_DENSE_ID: u8 = MAX_CORE_NUM as u8;
 
+/// Una CPU con id logico denso y valido cuyo hueco **nadie construye nunca**.
+///
+/// La CPU 0 ya no sirve para esto: `with_runtime_tests`, `placement_tests` y
+/// `runtime_birth_tests` construyen su hueco, y un `Once` no se deshace.
+const NO_SLOT: u8 = MAX_CORE_NUM as u8 - 1;
+
 #[test]
 fn an_unbuilt_slot_is_skipped_rather_than_built_or_waited_on() {
     assert!(
-        GLOBAL_RUNTIME.try_lock_cpu(0).is_none(),
-        "en el anfitrion no hay runtime construido en ninguna CPU"
+        GLOBAL_RUNTIME.try_lock_cpu(NO_SLOT as usize).is_none(),
+        "un hueco que nadie ha construido se salta, no se construye"
     );
     assert!(GLOBAL_RUNTIME.try_lock_cpu(MAX_CORE_NUM).is_none());
     assert!(GLOBAL_RUNTIME.try_lock_cpu(usize::MAX).is_none());
@@ -165,7 +174,14 @@ fn a_suspected_smash_stops_all_dyn_dispatch_not_only_the_idle_tick() {
 
 #[test]
 fn the_fault_walk_reports_what_it_could_not_look_at() {
+    let _globals = crate::executor::executor_globals_lock();
     let _cpu = AsCpu::new(0);
+    // El recorrido va de `0` a `num_online_cpus()`, asi que la CPU 0 entra
+    // siempre y su hueco ya esta construido. Lo que este test dice es lo que
+    // pasa cuando el hueco no se puede LEER, y la unica forma de montar eso a
+    // mano es tenerlo tomado: es tambien el caso real, el del camino del
+    // panico que llega mientras el planificador tiene su propio cerrojo.
+    let _held = GLOBAL_RUNTIME.force(0).lock();
     let attr = attribute_fault_stack_ptrs(current_sp(), 0);
     assert!(
         attr.rsp.is_none(),
@@ -175,7 +191,7 @@ fn the_fault_walk_reports_what_it_could_not_look_at() {
     assert_eq!(attr.executors_seen, 0);
     assert_eq!(
         attr.cpus_walked, 0,
-        "una CPU sin runtime no se cuenta como recorrida"
+        "una CPU cuyo runtime no se pudo leer no se cuenta como recorrida"
     );
     assert!(
         attr.cpus_skipped > 0,

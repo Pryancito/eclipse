@@ -65,6 +65,39 @@ fn alloc_id() -> usize {
     TASK_ID.fetch_add(1, Ordering::SeqCst)
 }
 
+/// Make the next [`Task::abandon`] lose the race for the future lock.
+///
+/// Between the `force_unlock` and the `try_lock` of that function there is a
+/// window in which another CPU can take the lock, and the whole point of its
+/// `false` return is that window. No test can hit it from outside: forcing it
+/// with a real peer thread would put two writers inside the same critical
+/// section, which is the very thing the lock is there to stop, so the race is
+/// injected here instead -- the same way `waker_page::steal_next_reclaim`
+/// injects the lost bit claim. One-shot, per thread, and in a build that is
+/// not the test build `abandon_lock_stolen` is `false` and the branch folds
+/// away.
+#[cfg(test)]
+pub(crate) fn steal_next_abandon_lock() {
+    ABANDON_LOCK_STOLEN.with(|f| f.set(true));
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static ABANDON_LOCK_STOLEN: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+// Una sola funcion con el cuerpo bajo `cfg` y no dos funciones: dos cuerpos
+// `#[cfg]` son dos juegos de lineas de los que la medida de cobertura solo
+// puede ejecutar uno, y el del build que no es de test no lo alcanza nada
+// publico. Asi la unica linea que no se puede cubrir es el `false`.
+#[inline(always)]
+fn abandon_lock_stolen() -> bool {
+    #[cfg(not(test))]
+    return false;
+    #[cfg(test)]
+    ABANDON_LOCK_STOLEN.with(|f| f.replace(false))
+}
+
 impl Task {
     pub fn new(
         future: impl Future<Output = ()> + Send + 'static,
@@ -166,7 +199,12 @@ impl Task {
     pub unsafe fn abandon(&self) -> bool {
         // The panicking poll holds `future`'s lock and will never release it.
         self.future.force_unlock();
-        let Some(mut slot) = self.future.try_lock() else {
+        let reclaimed = if abandon_lock_stolen() {
+            None
+        } else {
+            self.future.try_lock()
+        };
+        let Some(mut slot) = reclaimed else {
             // Someone else took it between the unlock and here — do not touch
             // a future another CPU may be polling.
             return false;
@@ -803,9 +841,18 @@ impl TaskCollection {
                         continue;
                     }
                     let bit = 1u64 << subpage_idx;
+                    // `bit` esta en `runnable`, que es `(notified | voluntary)`
+                    // menos lo muerto y lo prestado: o esta en un carril o
+                    // esta en el otro, y no hay tercer caso. Escrito como un
+                    // `else if` quedaba una rama que ninguna entrada podia
+                    // tomar; el invariante se dice y se comprueba.
                     if notified & bit != 0 {
                         Self::consider_slot(&mut urgent, slot, cursor.urgent_next);
-                    } else if voluntary & bit != 0 {
+                    } else {
+                        debug_assert!(
+                            voluntary & bit != 0,
+                            "un hueco listo que no esta en ningun carril"
+                        );
                         Self::consider_slot(&mut yielded, slot, cursor.yielded_next);
                     }
                 }
@@ -1241,6 +1288,102 @@ mod collection_tests {
             "«en ninguna parte» no es lo mismo que «donde sea»"
         );
         assert!(!nowhere.allowed_on(0));
+    }
+
+    /// **Una tarea cuyo futuro ya acabo no se vuelve a sondear.**
+    ///
+    /// `finish` lo pone `drop_by_ref` en el instante en que un sondeo devuelve
+    /// `Ready`, ANTES de que el cursor quite el hueco del slab y libere el
+    /// `Box` del futuro. Un waker rancio -- un temporizador de red o de
+    /// `IoMultiplexWait` que aun tiene un clon -- que notifique en esa ventana
+    /// conseguiria que el hueco se repartiera y el futuro acabado se sondeara
+    /// otra vez, sobre un monton ya liberado y envenenado: era el `#GP`
+    /// intermitente de `sys_epoll_pwait` con `0xa5..` en el registro.
+    ///
+    /// El futuro de este test entra en panico si alguien lo sondea, asi que lo
+    /// que se comprueba no es solo el `Ready` que sale, es que el futuro no se
+    /// toco.
+    #[test]
+    fn a_task_whose_future_already_finished_is_not_polled_again() {
+        struct Exploding;
+        impl Future for Exploding {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context) -> Poll<()> {
+                panic!("se sondeo el futuro de una tarea acabada");
+            }
+        }
+        let task = Task::new(Exploding, 0, None);
+        let mut cx = Context::from_waker(core::task::Waker::noop());
+        task.finish.store(true, Ordering::Relaxed);
+        assert!(matches!(task.poll(&mut cx), Poll::Ready(())));
+        // Y sin la marca el sondeo si llega al futuro, que es lo que dice que
+        // el `Ready` de arriba sale de la marca y no de otra cosa.
+        task.finish.store(false, Ordering::Relaxed);
+        let entered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cx = Context::from_waker(core::task::Waker::noop());
+            task.poll(&mut cx)
+        }));
+        assert!(entered.is_err(), "la marca es lo unico que tapa el sondeo");
+    }
+
+    /// **El `false` de `abandon`: el cerrojo del futuro no se recupero.**
+    ///
+    /// `abandon` fuerza la apertura del cerrojo que el sondeo en panico se
+    /// llevo y lo vuelve a tomar; entre esas dos cosas otra CPU puede tomarlo,
+    /// y entonces lo unico seguro es no tocar nada y decirlo, porque el
+    /// `mem::replace` de abajo escribiria un futuro que otro esta sondeando.
+    /// La carrera se inyecta con `steal_next_abandon_lock` (ver su doc).
+    ///
+    /// El cerrojo se toma y se olvida antes de llamar, que es la precondicion
+    /// de la funcion y no un detalle del test: `spin::Mutex` es aqui un
+    /// TicketMutex (`kernel-sync` enciende `spin/use_ticket_mutex` para todo
+    /// el arbol), y en un ticket un `force_unlock` sin dueño adelanta el turno
+    /// servido y deja el cerrojo imposible de tomar para siempre.
+    ///
+    /// Lo que se comprueba es la mitad que importa: que la tarea se queda
+    /// EXACTAMENTE como estaba, es decir que el futuro original sigue ahi y no
+    /// lo ha sustituido el `Pending` inerte.
+    #[test]
+    fn abandoning_a_task_whose_lock_a_peer_took_changes_nothing() {
+        static POLLED: AtomicBool = AtomicBool::new(false);
+        struct Marking;
+        impl Future for Marking {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context) -> Poll<()> {
+                POLLED.store(true, Ordering::SeqCst);
+                Poll::Pending
+            }
+        }
+        fn poll_once(task: &Task) -> Poll<()> {
+            let mut cx = Context::from_waker(core::task::Waker::noop());
+            task.poll(&mut cx)
+        }
+        let task = Task::new(Marking, 0, None);
+
+        // El sondeo que entro en panico: tiene el cerrojo y no lo suelta.
+        core::mem::forget(task.future.lock());
+        POLLED.store(false, Ordering::SeqCst);
+        steal_next_abandon_lock();
+        assert!(
+            !unsafe { task.abandon() },
+            "se dio por bueno un cerrojo ajeno"
+        );
+        assert_eq!(poll_once(&task), Poll::Pending);
+        assert!(
+            POLLED.load(Ordering::SeqCst),
+            "el futuro original se perdio"
+        );
+
+        // Y sin la carrera si lo cambia por el `Pending` inerte, que es el
+        // otro lado del contrato.
+        core::mem::forget(task.future.lock());
+        POLLED.store(false, Ordering::SeqCst);
+        assert!(unsafe { task.abandon() });
+        assert_eq!(poll_once(&task), Poll::Pending);
+        assert!(
+            !POLLED.load(Ordering::SeqCst),
+            "el futuro abandonado se volvio a entrar"
+        );
     }
 
     /// El `Debug` de `Task` toma el cerrojo interno con `diag_lock`, que es lo
@@ -1716,6 +1859,51 @@ mod collection_tests {
         assert_eq!(tc.debug_pending(), (0, 0, 0, 0));
     }
 
+    /// **Una marca de muerte sobre un hueco que nadie ocupa no descuenta.**
+    ///
+    /// El drenaje de muertes de `schedule` descuenta `task_num` por cada bit
+    /// que la pagina le da, y `FutureCollection::remove` es lo unico que sabe
+    /// si detras de ese bit habia de verdad una tarea. Si no se le preguntara,
+    /// un bit rancio -- el que deja un `WakerRef` viejo de un hueco ya
+    /// reutilizado y retirado -- bajaria la cuenta de tareas vivas por una que
+    /// no existe, y con eso el contador se va por debajo de la realidad y
+    /// `has_ready` empieza a mentir.
+    #[test]
+    fn a_death_mark_on_a_slot_nobody_occupies_does_not_lower_the_count() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        let key = tc.add_task(pending(), None);
+        tc.get_mut_inner(DEFAULT_PRIORITY).pages[0].mark_dropped(7);
+        assert_eq!(tc.task_num(), 1);
+        // El reparto drena las muertes antes de elegir: la del hueco 7 no
+        // tiene a quien quitar, la tarea de verdad sigue repartiendose.
+        assert_eq!(tc.take_task().map(|(k, _, _)| k), Some(key));
+        assert_eq!(tc.task_num(), 1, "se descontó una tarea que no existía");
+    }
+
+    /// **Un bit listo y fijado de un hueco vacio se limpia, no se reparte.**
+    ///
+    /// La rama de afinidad de `schedule` recorre bit a bit los huecos fijados
+    /// y busca cada uno en el slab para leer su mascara. Un bit que sobrevive
+    /// a su ocupante no tiene mascara que leer, y dejarlo publicado haria que
+    /// cada pasada lo mirara otra vez para nada; se limpia ahi mismo.
+    #[test]
+    fn a_pinned_ready_bit_for_an_empty_slot_is_cleared_and_not_handed_out() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        // Una tarea fijada AQUI: hace `inner.affine != 0`, que es lo que saca
+        // a `schedule` del camino de mapas de bits, y se puede repartir.
+        let key = tc.add_task(pending(), Some(Arc::new(AtomicU64::new(1))));
+        {
+            let inner = tc.get_mut_inner(DEFAULT_PRIORITY);
+            inner.pages[0].initialize(9);
+            inner.pages[0].mark_affine(9);
+        }
+        assert_eq!(tc.take_task().map(|(k, _, _)| k), Some(key));
+        let (notified, _, _, _) = tc.get_mut_inner(DEFAULT_PRIORITY).pages[0].peek_lanes();
+        assert_eq!(notified & (1 << 9), 0, "el bit rancio se quedo publicado");
+    }
+
     #[test]
     fn old_checkout_handles_cannot_release_or_retire_a_reused_slot() {
         let _g = crate::runtime::resched_test_lock();
@@ -1763,6 +1951,12 @@ mod collection_tests {
             crate::runtime::stranded_mask_for_test() & LONE_BIT,
             LONE_BIT
         );
+        assert!(PUBLISHED_BEFORE_KICK.load(Ordering::SeqCst));
+        // Y el grabador solo contesta por la CPU 2: una patada a cualquier
+        // otra no puede pisar lo que acaba de leer, que es lo que hace que la
+        // lectura de arriba sea sobre el destino y no sobre la ultima patada
+        // que haya pasado por aqui.
+        record(3);
         assert!(PUBLISHED_BEFORE_KICK.load(Ordering::SeqCst));
         waker.mark_borrowed(false);
         crate::runtime::clear_need_resched(2);
@@ -1841,10 +2035,13 @@ mod collection_tests {
         while let Some((key, _task, waker)) = tc.take_task() {
             keys.push(key);
             waker.mark_borrowed(false);
+            // Sin el numero de reparto en el mensaje a proposito: se
+            // comprueba en cada vuelta, asi que al fallar vale siempre
+            // `DRAIN_CAP + 1` y un argumento calculado en un `assert!` es
+            // codigo que solo se ejecuta el dia que el test falla.
             assert!(
                 keys.len() <= DRAIN_CAP,
-                "the queue never empties: take_task kept handing work out ({} hand-outs)",
-                keys.len()
+                "the queue never empties: take_task kept handing work out"
             );
         }
         keys
@@ -1880,6 +2077,45 @@ mod collection_tests {
         waker.mark_borrowed(false);
     }
 
+    /// Hand out up to `vueltas` tasks, calling `cada` for each one with the
+    /// turn number, and **stop the moment the queue has nothing left**.
+    ///
+    /// The five fairness tests below each asked for a fixed number of turns
+    /// out of a queue that re-publishes its tasks, so each one carried its own
+    /// copy of this loop -- and its own "the queue ran dry" exit that nothing
+    /// ever took, because none of those queues can run dry. One copy, taken
+    /// by the test right below it, says what that exit does: an empty queue is
+    /// the end of the round and not a failure.
+    fn vueltas(
+        tc: &Arc<TaskCollection>,
+        vueltas: usize,
+        mut cada: impl FnMut(usize, Key, Arc<WakerRef>),
+    ) {
+        for vuelta in 0..vueltas {
+            let Some((key, _t, waker)) = tc.take_task() else {
+                return;
+            };
+            cada(vuelta, key, waker);
+        }
+    }
+
+    #[test]
+    fn una_ronda_sobre_una_cola_vacia_termina_en_la_primera_vuelta() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        let mut repartidas = 0;
+        vueltas(&tc, 10, |_, _, _| repartidas += 1);
+        assert_eq!(repartidas, 0, "una cola vacia no reparte nada");
+        // Y con una tarea reparte exactamente las vueltas que se piden, que
+        // es el otro lado: la salida de arriba no es «no repartir nunca».
+        tc.add_task(pending(), None);
+        vueltas(&tc, 3, |_, _, waker| {
+            repartidas += 1;
+            cede(&waker);
+        });
+        assert_eq!(repartidas, 3);
+    }
+
     /// **La rama de afinidad reparte en el MISMO orden que la rapida.**
     ///
     /// Es la propiedad que se podia romper al dejar de recorrer bit a bit: el
@@ -1898,16 +2134,13 @@ mod collection_tests {
     fn la_rama_de_afinidad_reparte_en_el_mismo_orden_que_la_rapida() {
         let _g = crate::runtime::resched_test_lock();
 
-        fn secuencia(tc: &Arc<TaskCollection>, vueltas: usize) -> Vec<usize> {
+        fn secuencia(tc: &Arc<TaskCollection>, n: usize) -> Vec<usize> {
             let mut salida = Vec::new();
-            for _ in 0..vueltas {
-                let Some((key, _t, waker)) = tc.take_task() else {
-                    break;
-                };
+            vueltas(tc, n, |_, key, waker| {
                 let (_, page_idx, subpage_idx) = unpack_key(key);
                 salida.push(page_idx * WAKER_PAGE_SIZE + subpage_idx);
                 cede(&waker);
-            }
+            });
             salida
         }
 
@@ -1988,17 +2221,18 @@ mod collection_tests {
         let tc = TaskCollection::new(0);
         let (a, b) = (tc.add_task(pending(), None), tc.add_task(pending(), None));
         let (mut n_a, mut n_b) = (0, 0);
-        for _ in 0..40 {
-            let Some((key, _t, waker)) = tc.take_task() else {
-                break;
-            };
+        vueltas(&tc, 40, |_, key, waker| {
+            // `else` y no `else if key == b`: solo hay dos tareas, asi que una
+            // tercera rama no la puede tomar nada y la igualdad es mas
+            // estricta escrita como aserto.
             if key == a {
                 n_a += 1;
-            } else if key == b {
+            } else {
+                assert_eq!(key, b);
                 n_b += 1;
             }
             cede(&waker);
-        }
+        });
         assert_eq!((n_a, n_b), (20, 20), "el carril de cesion no rota");
     }
 
@@ -2024,10 +2258,7 @@ mod collection_tests {
         let (a, _b) = (tc.add_task(pending(), None), tc.add_task(pending(), None));
         let mut stuck = None;
         let (mut n_a, mut n_b) = (0, 0);
-        for round in 0..40 {
-            let Some((key, _t, waker)) = tc.take_task() else {
-                break;
-            };
+        vueltas(&tc, 40, |round, key, waker| {
             if key == a {
                 n_a += 1;
             } else {
@@ -2040,10 +2271,10 @@ mod collection_tests {
                 waker.wake_by_ref();
                 crate::runtime::end_voluntary_yield();
                 stuck = Some(waker);
-                continue;
+                return;
             }
             cede(&waker);
-        }
+        });
         assert_eq!(
             (n_a, n_b),
             (1, 39),
@@ -2055,15 +2286,12 @@ mod collection_tests {
         let waker = stuck.expect("la tarea atascada");
         waker.mark_borrowed(false);
         let mut back = 0;
-        for _ in 0..10 {
-            let Some((key, _t, waker)) = tc.take_task() else {
-                break;
-            };
+        vueltas(&tc, 10, |_, key, waker| {
             if key == a {
                 back += 1;
             }
             cede(&waker);
-        }
+        });
         assert_eq!(back, 5, "soltar el prestamo la devuelve a la rotacion");
     }
 
@@ -2086,25 +2314,29 @@ mod collection_tests {
         assert_ne!(y1, y2);
 
         let mut handed = Vec::new();
+        let mut sleeping = None;
         // The sleeper is awake for one hand-out, then asleep: it publishes no
         // wake until the next 200 us tick. Everything else on the CPU is a
         // yielder re-ceding immediately.
-        for round in 0..30 {
-            let Some((key, _t, waker)) = tc.take_task() else {
-                break;
-            };
+        vueltas(&tc, 30, |round, key, waker| {
             handed.push(key);
             if key == sleeper {
-                // Asleep now; nothing re-publishes it until its timer. Model
-                // the tick landing every tenth round.
+                // Asleep now; nothing re-publishes it until its timer.
                 waker.mark_borrowed(false);
-                if round % 10 == 9 {
-                    notified_back(&waker);
-                }
+                sleeping = Some(waker);
             } else {
                 cede(&waker);
             }
-        }
+            // The tick lands every tenth round whoever happens to be running,
+            // which is what a timer does. Hanging it off the round the sleeper
+            // was handed out instead meant it never landed at all -- the
+            // sleeper is served on round 2 and never again, so `round % 10 ==
+            // 9` was never true while holding it, and the "wakes every 200 us"
+            // half of this test was not being exercised.
+            if round % 10 == 9 {
+                notified_back(sleeping.as_ref().expect("el durmiente ya se repartio"));
+            }
+        });
 
         let yields = handed.iter().filter(|k| **k == y1 || **k == y2).count();
         assert!(
@@ -2518,11 +2750,12 @@ mod collection_tests {
         let (req1, _, _) = crate::runtime::wakeup_preempt_stats();
         crate::runtime::clear_need_resched(1);
         crate::runtime::set_executor_ready_mask_for_test(saved);
+        // `assert_eq!` ya imprime los dos lados, asi que el numero en el
+        // mensaje era un argumento calculado que solo se evalua al fallar.
         assert_eq!(
             req1 - req0,
             1,
-            "eight pinned tasks raised {} kicks",
-            req1 - req0
+            "eight pinned tasks raised the wrong number of kicks"
         );
         // All eight are still there for CPU 1.
         assert_eq!(tc.ready_num_for(1), Some(8));

@@ -1,4 +1,8 @@
-use core::arch::{asm, global_asm};
+use core::arch::global_asm;
+// Solo lo usa la lectura de `cr3`, que en una compilacion de test la
+// sustituye el valor de anfitrion de mas abajo.
+#[cfg(not(test))]
+use core::arch::asm;
 
 mod context;
 
@@ -81,6 +85,7 @@ pub(crate) fn cpu_id() -> u8 {
 //         .as_u64() as _
 // }
 
+#[cfg(not(test))]
 pub(crate) fn pg_base_register() -> usize {
     let mut cr3;
     unsafe {
@@ -88,6 +93,30 @@ pub(crate) fn pg_base_register() -> usize {
     }
     cr3
 }
+
+/// Host stand-in for the read above.
+///
+/// Same reason as `hal_cpu_idle_host_shim` and the `cli`/`sti` pair further
+/// down: reading CR3 is privileged, so in a user-mode test process it is a
+/// #GP -- SIGSEGV before the test reports anything (diagnosed 11-oct-2026,
+/// see the note in `executor/stack_birth_benches.rs`). It is the one
+/// instruction that kept `Executor::new` out of reach of `cargo test`, and
+/// with it `ExecutorRuntime::new`, the stack registry, the saved-frame
+/// validation and every caller of the three.
+///
+/// A fixed, page-aligned, non-zero value is the honest stand-in. Every reader
+/// of this number either stores it in a `ContextData` for `switch.S` to load
+/// -- and nothing on the host ever switches -- or compares it against zero to
+/// spot a frame that was written over, and that reader wants "some address
+/// space" and not "none".
+#[cfg(test)]
+pub(crate) fn pg_base_register() -> usize {
+    HOST_PG_BASE
+}
+
+/// What [`pg_base_register`] reports in a test build.
+#[cfg(test)]
+pub(crate) const HOST_PG_BASE: usize = 0x1000;
 
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;

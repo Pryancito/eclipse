@@ -158,6 +158,45 @@ impl StubExecutor {
 
 /// Lo que los observadores y las trabas de contencion contestan sin pila
 /// detras; ver las notas del modulo.
+/// One lock for every test that touches this module's globals.
+///
+/// The stack pool, the two live-stack registries, the retired-stack table and
+/// the spine are module statics, and each test module that empties one of them
+/// used to have a `LOCK` of its own -- which serialises that module against
+/// itself and against nothing else. `Executor::new` touches all of them in a
+/// single call, so a test that calls it would have raced all four. One lock
+/// for the lot, and the four modules take this one.
+#[cfg(test)]
+pub(crate) fn executor_globals_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::evaluate_log_arguments_in_tests();
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Empty the stack pool, the overflow retention list and the retired-stack
+/// table.
+///
+/// For a test that built an `Executor` and let it go: the block is retained in
+/// coroutine-stack land on purpose (it must never go back to the shared
+/// arena), so without this every test that creates one leaves a block behind
+/// for the next to pick up, and a test about a FRESH block would get a pooled
+/// one. The caller must hold [`executor_globals_lock`].
+#[cfg(test)]
+pub(crate) fn wipe_stack_pool_for_test() {
+    use core::sync::atomic::Ordering;
+    *RETIRED_STACKS.lock() = [RetiredStack::EMPTY; RETIRED_STACKS_CAP];
+    RETIRED_OCCUPIED.store(0, Ordering::SeqCst);
+    for slot in STACK_POOL.iter() {
+        slot.store(0, Ordering::SeqCst);
+    }
+    STACK_OVERFLOW.lock().clear();
+}
+
+/// What `Executor::new` builds, and what its stack looks like when it is
+/// built, reused and retired; see the module docs.
+#[cfg(test)]
+mod birth_tests;
+
 #[cfg(test)]
 mod metadata_tests;
 
@@ -2779,8 +2818,7 @@ mod grace_period_tests {
     use core::sync::atomic::Ordering;
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        super::executor_globals_lock()
     }
 
     /// Empty every global these tests read, and hand back the ready mask that
@@ -3428,8 +3466,7 @@ mod stack_registry_tests {
 
     /// Both registries are module globals; every test here empties them.
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        super::executor_globals_lock()
     }
 
     struct Clean(std::sync::MutexGuard<'static, ()>);
@@ -4218,8 +4255,7 @@ mod spine_tests {
 
     /// The table is a module global, so the tests take turns.
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        super::executor_globals_lock()
     }
 
     fn wipe() {
@@ -4875,5 +4911,74 @@ mod spine_tests {
         assert_eq!(spine_snapshot(&mut roomy), 3);
         assert_eq!(roomy[3], 0, "the tail must be cleared, not left stale");
         assert_eq!(roomy[4], 0);
+    }
+
+    /// **A sample copies the registered word while retirement and reuse are
+    /// excluded, and names its owner.**
+    ///
+    /// The `#DB` handler asks for this with the faulting address in hand: the
+    /// registry guard is what keeps the stack behind that address alive until
+    /// the read lands, which is the whole reason the copy happens here and not
+    /// in the handler.
+    #[test]
+    fn a_sample_copies_the_registered_word_and_names_its_owner() {
+        let _c = clean();
+        let mut fake = Fake::new(16, 0, UNTOUCHED);
+        let slot = fake.at(4 * 8);
+        fake.set(slot, RETURN_INTO_RUN_EXECUTOR);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 42, fake.base());
+        assert_eq!(
+            spine_sample(slot),
+            Some((42, RETURN_INTO_RUN_EXECUTOR)),
+            "the sample is the live word, not the value registration recorded"
+        );
+        fake.set(slot, 0);
+        assert_eq!(
+            spine_sample(slot),
+            Some((42, 0)),
+            "and it is re-read on every ask: a snapshot taken at registration \
+             would hide the very smash this exists to catch"
+        );
+    }
+
+    /// **An address nobody registered is sampled as nothing.**
+    ///
+    /// The two values the table uses for itself -- `0` for an empty entry and
+    /// `usize::MAX` for one being reserved -- can never be a slot address, and
+    /// matching on either would hand back whatever executor id the entry held
+    /// last for an address nobody is watching.
+    #[test]
+    fn an_unregistered_address_is_sampled_as_nothing() {
+        let _c = clean();
+        let fake = Fake::new(16, 0, UNTOUCHED);
+        let slot = fake.at(4 * 8);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 7, fake.base());
+        assert_eq!(spine_sample(slot + 8), None, "a neighbour is not the slot");
+        assert_eq!(spine_sample(0), None);
+        assert_eq!(spine_sample(usize::MAX), None);
+    }
+
+    /// **A busy registry is skipped, not waited on.**
+    ///
+    /// This is called from the `#DB` handler and the timer tick. Waiting on
+    /// `SPINE_ACCESS` there means spinning in an interrupt handler on a lock
+    /// whose holder is `Executor::new` with interrupts off -- the holder can
+    /// never finish, because finishing needs the CPU the handler is standing
+    /// on.
+    #[test]
+    fn a_busy_registry_is_skipped_rather_than_waited_on() {
+        let _c = clean();
+        let mut fake = Fake::new(16, 0, UNTOUCHED);
+        let slot = fake.at(4 * 8);
+        fake.set(slot, RETURN_INTO_RUN_EXECUTOR);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 3, fake.base());
+        let held = SPINE_ACCESS.lock();
+        assert_eq!(
+            spine_sample(slot),
+            None,
+            "con el registro tomado la respuesta es \"no se\", nunca una espera"
+        );
+        drop(held);
+        assert_eq!(spine_sample(slot), Some((3, RETURN_INTO_RUN_EXECUTOR)));
     }
 }

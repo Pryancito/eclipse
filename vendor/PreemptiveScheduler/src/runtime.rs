@@ -51,6 +51,7 @@ pub(crate) fn executor_ready_mask() -> u64 {
 /// `cargo test` locally would, intermittently.
 #[cfg(test)]
 pub(crate) fn resched_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::evaluate_log_arguments_in_tests();
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -3206,10 +3207,23 @@ pub(crate) fn get_current_runtime() -> MutexGuard<'static, ExecutorRuntime> {
     crate::diag::diag_lock(GLOBAL_RUNTIME.force(id))
 }
 
+/// What an `ExecutorRuntime` is when it is built, and what a mid-poll
+/// preemption does to it; see the module docs.
+#[cfg(test)]
+mod runtime_birth_tests;
+
 /// Lo que contestan las sondas en una CPU sin runtime; ver las notas del
 /// modulo.
 #[cfg(test)]
 mod probe_tests;
+
+/// Las mismas sondas con un runtime detras; ver las notas del modulo.
+#[cfg(test)]
+mod with_runtime_tests;
+
+/// Donde nace una tarea y quien va a por ella; ver las notas del modulo.
+#[cfg(test)]
+mod placement_tests;
 
 #[cfg(test)]
 mod containment_tests {
@@ -4808,6 +4822,12 @@ mod resched_tests {
 
     #[test]
     fn the_boot_cpu_counts_as_ready_before_anyone_marks_it() {
+        // The lock, although this only reads: every other test that writes the
+        // mask takes it, and the mask is a module global. Without it this
+        // reads whatever a concurrent `placement_tests` or `with_runtime_tests`
+        // had installed at that instant -- both of them legitimately set a
+        // mask with CPU 0 out of it.
+        let _g = test_lock();
         // Tasks are spawned before any CPU reaches `run_until_idle`, and they
         // have to land somewhere that will actually poll them.
         assert!(is_executor_ready(0));
