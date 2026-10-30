@@ -6470,6 +6470,9 @@ mod session_and_group_tests;
 mod dying_process_tests;
 
 #[cfg(test)]
+mod exit_reclaim_tests;
+
+#[cfg(test)]
 mod census_tests;
 
 #[cfg(test)]

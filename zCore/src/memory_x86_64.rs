@@ -624,12 +624,38 @@ pub fn reserve_active_page_table_frames() {
 }
 
 /// Combined usage for `/proc/meminfo` and diagnostics.
+///
+/// The chunks the elastic heap took from RAM are counted ONCE, as heap. They
+/// are frames too -- `frame_alloc` charged them to `FRAMES_USED` and they are
+/// inside `TOTAL_MEMORY` -- and adding the two figures as they stand counted
+/// every grown MiB as used RAM *plus* as heap: the part of a chunk nobody was
+/// using any more still read as used. So after a big program exited, the heap
+/// it had made grow kept `used` up for the rest of the boot, and to `free` that
+/// is memory a closed program never gave back. Taken out of the frame side
+/// here, a chunk is what the static arena already is: its live bytes are used,
+/// the rest is free.
 pub fn stats() -> (usize, usize) {
-    let heap_used = HEAP_USED.get();
-    let frames_used = FRAMES_USED.get();
+    combined_stats(
+        HEAP_USED.get(),
+        heap_total(),
+        heap_grown(),
+        FRAMES_USED.get(),
+        TOTAL_MEMORY.load(Ordering::Relaxed),
+    )
+}
+
+/// [`stats`] for given counters, so the arithmetic can be tested on the host,
+/// where the heap is the host's and every counter reads zero.
+fn combined_stats(
+    heap_used: usize,
+    heap_total: usize,
+    heap_grown: usize,
+    frames_used: usize,
+    ram: usize,
+) -> (usize, usize) {
     (
-        heap_used + frames_used,
-        heap_total() + TOTAL_MEMORY.load(Ordering::Relaxed),
+        heap_used + frames_used.saturating_sub(heap_grown),
+        heap_total + ram.saturating_sub(heap_grown),
     )
 }
 
@@ -1523,6 +1549,12 @@ cfg_if! {
             HEAP_TOTAL.load(Ordering::Relaxed)
         }
 
+        /// Bytes the heap has taken from the frame allocator past its static
+        /// arena: frames that are heap now, and counted as heap by [`stats`].
+        pub fn heap_grown() -> usize {
+            heap_total().saturating_sub(KERNEL_HEAP_SIZE)
+        }
+
         // ── Elastic heap ────────────────────────────────────────────────────
         //
         // The arena is a fixed `static mut HEAP: [usize; _]` in .bss, and
@@ -2409,6 +2441,10 @@ cfg_if! {
             0
         }
 
+        pub fn heap_grown() -> usize {
+            0
+        }
+
         /// No kernel heap of our own under `libos`: the host allocator is not
         /// a lock this kernel can be inside. Unused there -- the fault paths
         /// that ask are bare-metal only -- and kept so the two arms of the
@@ -2641,6 +2677,24 @@ mod frame_tests {
         for i in 0..4 {
             frame_dealloc(addr + i * PAGE);
         }
+    }
+
+    /// A heap chunk taken from RAM is heap: counted once, and its unused part
+    /// free. Counted as frames AND as heap, a 64 MiB chunk that is empty again
+    /// read as 64 MiB used after the program that grew it had exited.
+    #[test]
+    fn a_grown_heap_chunk_is_counted_once_and_its_free_part_reads_free() {
+        const MIB: usize = 1 << 20;
+        // 512 MiB arena + one 64 MiB chunk, 10 MiB of heap in use; 4 GiB of
+        // RAM of which 100 MiB are frames, the chunk among them.
+        let (used, total) = combined_stats(10 * MIB, 576 * MIB, 64 * MIB, 100 * MIB, 4096 * MIB);
+        assert_eq!(used, 10 * MIB + 36 * MIB, "the chunk was counted twice");
+        assert_eq!(total, 576 * MIB + 4032 * MIB, "and so was the total");
+        // Without growth it is the plain sum it always was.
+        assert_eq!(
+            combined_stats(10 * MIB, 512 * MIB, 0, 100 * MIB, 4096 * MIB),
+            (110 * MIB, 4608 * MIB)
+        );
     }
 
     /// The managed total is the bytes that went INTO the allocator, not the

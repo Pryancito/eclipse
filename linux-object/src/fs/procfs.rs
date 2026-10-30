@@ -3073,7 +3073,14 @@ fn loadavg_text(load: [f64; 3], running: usize, total: usize, last_pid: u64) -> 
 fn proc_meminfo_content() -> String {
     let (used, total) = kernel_hal::mem::memory_usage();
     let (kheap_used, kheap_total) = kernel_hal::mem::kernel_heap_usage();
-    meminfo_text(used, total, kheap_used, kheap_total)
+    // What the caches would give back if asked: unmapped page-cache files and
+    // ELF images nobody runs any more. The frames behind them are inside
+    // `used`, and they stay there after the program that read them exits --
+    // which is the point of a cache, and which `free` showed as memory the
+    // program never returned.
+    let cached = kernel_hal::shrinker::reclaimable()
+        .saturating_add(kernel_hal::shrinker::deferred_reclaimable());
+    meminfo_text(used, total, kheap_used, kheap_total, cached)
 }
 
 /// The text of `/proc/meminfo` for a given set of counters.
@@ -3085,14 +3092,30 @@ fn proc_meminfo_content() -> String {
 /// `used - total`. This is the file `free(1)`, every task manager and every
 /// runtime that sizes a cache read, and bytes printed where kilobytes are
 /// expected are a machine that claims a thousand times the memory it has.
-fn meminfo_text(used: usize, total: usize, kheap_used: usize, kheap_total: usize) -> String {
+///
+/// `cached` is what the reclaimable caches hold. It is part of `used` -- those
+/// are allocated frames -- and is reported the way Linux does: as `Cached:`,
+/// and inside `MemAvailable:`, since a cache gives it back under pressure.
+/// `free(1)` and `htop` subtract `Cached:` from used memory; with it at zero,
+/// every file a closed program had read stayed on the "used" bar.
+fn meminfo_text(
+    used: usize,
+    total: usize,
+    kheap_used: usize,
+    kheap_total: usize,
+    cached: usize,
+) -> String {
     let free = total.saturating_sub(used);
+    // Never more than is used: two caches can hold the same frames (an ELF
+    // image borrowing the page cache), and a cache cannot free what is free.
+    let cached = cached.min(used);
+    let available = free.saturating_add(cached).min(total);
     let mut s = String::with_capacity(128);
     let _ = writeln!(s, "MemTotal:     {:>10} kB", total / 1024);
     let _ = writeln!(s, "MemFree:      {:>10} kB", free / 1024);
-    let _ = writeln!(s, "MemAvailable: {:>10} kB", free / 1024);
+    let _ = writeln!(s, "MemAvailable: {:>10} kB", available / 1024);
     let _ = writeln!(s, "Buffers:               0 kB");
-    let _ = writeln!(s, "Cached:                0 kB");
+    let _ = writeln!(s, "Cached:       {:>10} kB", cached / 1024);
     // The kernel heap is a FIXED arena, separate from the frames above, and
     // running it out kills the machine (`alloc_error` -> panic). It appeared
     // in no /proc file, so its growth could only be seen as the crash. Not a
@@ -5644,7 +5667,7 @@ mod proc_numbers_tests {
 
     #[test]
     fn meminfo_counts_in_kilobytes_and_says_so_on_every_line() {
-        let text = meminfo_text(4 * 1024 * 1024, 16 * 1024 * 1024, 0, 0);
+        let text = meminfo_text(4 * 1024 * 1024, 16 * 1024 * 1024, 0, 0, 0);
         assert_eq!(mem_kb(&text, "MemTotal:"), 16 * 1024);
         assert_eq!(mem_kb(&text, "MemFree:"), 12 * 1024);
         assert_eq!(mem_kb(&text, "MemAvailable:"), 12 * 1024);
@@ -5657,26 +5680,41 @@ mod proc_numbers_tests {
 
     #[test]
     fn free_memory_is_what_is_left_of_the_total_not_the_other_way_round() {
-        let text = meminfo_text(1024 * 1024, 4 * 1024 * 1024, 0, 0);
+        let text = meminfo_text(1024 * 1024, 4 * 1024 * 1024, 0, 0, 0);
         assert_eq!(mem_kb(&text, "MemFree:"), 3 * 1024);
     }
 
     #[test]
     fn more_used_than_there_is_means_nothing_free_and_not_a_wrap() {
-        let text = meminfo_text(8 * 1024 * 1024, 1024 * 1024, 0, 0);
+        let text = meminfo_text(8 * 1024 * 1024, 1024 * 1024, 0, 0, 0);
         assert_eq!(mem_kb(&text, "MemFree:"), 0);
         assert_eq!(mem_kb(&text, "MemAvailable:"), 0);
+    }
+
+    /// Cache a closed program left behind is used memory that is available:
+    /// `Cached:` says how much, and `MemAvailable:` counts it, as on Linux.
+    #[test]
+    fn a_cache_is_used_but_available() {
+        const MIB: usize = 1024 * 1024;
+        let text = meminfo_text(6 * MIB, 16 * MIB, 0, 0, 4 * MIB);
+        assert_eq!(mem_kb(&text, "MemFree:"), 10 * 1024);
+        assert_eq!(mem_kb(&text, "Cached:"), 4 * 1024);
+        assert_eq!(mem_kb(&text, "MemAvailable:"), 14 * 1024);
+        // A cache that claims more than is in use is clamped to what is used.
+        let over = meminfo_text(2 * MIB, 16 * MIB, 0, 0, 9 * MIB);
+        assert_eq!(mem_kb(&over, "Cached:"), 2 * 1024);
+        assert_eq!(mem_kb(&over, "MemAvailable:"), 16 * 1024);
     }
 
     /// The kernel heap is a separate arena and its lines only make sense when
     /// there is one, so the test is `> 0`: a heap of any size at all is a heap.
     #[test]
     fn the_kernel_heap_lines_are_there_when_there_is_a_heap_and_not_when_there_is_none() {
-        let none = meminfo_text(0, 1024 * 1024, 0, 0);
+        let none = meminfo_text(0, 1024 * 1024, 0, 0, 0);
         assert!(!none.contains("KernelHeap"), "{}", none);
-        assert!(meminfo_text(0, 0, 0, 1).contains("KernelHeapTotal:"));
+        assert!(meminfo_text(0, 0, 0, 1, 0).contains("KernelHeapTotal:"));
 
-        let some = meminfo_text(0, 1024 * 1024, 3 * 1024 * 1024, 8 * 1024 * 1024);
+        let some = meminfo_text(0, 1024 * 1024, 3 * 1024 * 1024, 8 * 1024 * 1024, 0);
         assert_eq!(mem_kb(&some, "KernelHeapTotal:"), 8 * 1024);
         assert_eq!(mem_kb(&some, "KernelHeapUsed:"), 3 * 1024);
         assert_eq!(mem_kb(&some, "KernelHeapFree:"), 5 * 1024);
