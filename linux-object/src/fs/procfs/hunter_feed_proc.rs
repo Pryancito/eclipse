@@ -58,9 +58,9 @@ pub(super) fn parse_command(text: &str) -> Option<FeedCommand<'_>> {
         return None;
     }
     let words: Vec<&str> = line.split_whitespace().collect();
-    let how = match words.first()? {
-        &"install" => Install::Update,
-        &"rollback" => Install::Rollback,
+    let how = match *words.first()? {
+        "install" => Install::Update,
+        "rollback" => Install::Rollback,
         _ => return None,
     };
     match words.len() {
