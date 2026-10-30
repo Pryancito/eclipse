@@ -415,6 +415,7 @@ impl Syscall<'_> {
         let chunk_size = len.min(super::SYSCALL_IO_MAX);
         let waits = self.waits_for_room(&file_like);
         let dsp = blocking_dsp(&file_like);
+        let tty = console_tty(&file_like);
         // The bytes are copied into kernel memory before the file sees them;
         // see `Staging` for the deadlock that a raw user slice caused here.
         let mut staging = Staging::new(chunk_size)?;
@@ -433,6 +434,19 @@ impl Syscall<'_> {
                     break;
                 }
                 return Err(LxError::EPERM);
+            }
+            // A console frozen by Ctrl-S: wait asleep here rather than in
+            // the spin inside its synchronous write.
+            if let Some(tty) = &tty {
+                if let Err(e) =
+                    linux_object::fs::stdio::wait_while_output_stopped(tty.as_ref()).await
+                {
+                    // A signal mid-write: what is already out stands.
+                    if written > 0 {
+                        break;
+                    }
+                    return Err(e);
+                }
             }
             // A blocking `/dev/dsp` waits for room asleep, not spinning
             // inside the synchronous write; see `DspDev::write_pcm_sleeping`.
@@ -2833,6 +2847,19 @@ impl Syscall<'_> {
 /// descriptor, the PCM's `DRAIN` and the OSS `SNDCTL_DSP_SYNC` -- served by
 /// the devices' sleeping waits. `None` for every other
 /// request and every other file, which go to the synchronous `ioctl`.
+/// A VT terminal, whose writes can be frozen by Ctrl-S: the inode, for
+/// `sys_write` to wait out the freeze asleep
+/// (`linux_object::fs::stdio::wait_while_output_stopped`).
+fn console_tty(file_like: &Arc<dyn FileLike>) -> Option<Arc<dyn INode>> {
+    use linux_object::fs::stdio::{Stdin, Stdout};
+    let inode = file_like.downcast_ref::<File>()?.inode();
+    let any = inode.as_any_ref();
+    if any.downcast_ref::<Stdin>().is_none() && any.downcast_ref::<Stdout>().is_none() {
+        return None;
+    }
+    Some(inode)
+}
+
 /// `/dev/dsp` opened without `O_NONBLOCK`: the inode, for `sys_write` to
 /// hand its writes to `DspDev::write_pcm_sleeping`.
 fn blocking_dsp(file_like: &Arc<dyn FileLike>) -> Option<Arc<dyn INode>> {
