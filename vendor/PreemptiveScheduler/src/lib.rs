@@ -170,15 +170,22 @@ mod interrupt_macro_tests {
 
     #[test]
     fn question_mark_restores_disabled_interrupts() {
-        fn fail() -> Result<(), ()> {
+        fn leave(by_question_mark: bool) -> Result<(), ()> {
             crate::run_with_intr_saved_on! {
                 assert!(crate::arch::intr_get());
-                Err(())?;
+                if by_question_mark {
+                    Err(())?;
+                }
             }
             Ok(())
         }
         let _original = crate::InterruptGuard::new(false);
-        assert_eq!(fail(), Err(()));
+        assert_eq!(leave(true), Err(()));
+        assert!(!crate::arch::intr_get());
+        // And the same scope left by falling off its end, which is what says
+        // the restore belongs to the guard's `Drop` and not to the `?`: the
+        // caller's disabled state has to come back either way.
+        assert_eq!(leave(false), Ok(()));
         assert!(!crate::arch::intr_get());
     }
 }

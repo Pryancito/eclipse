@@ -103,11 +103,122 @@ fn instructions(source: &str) -> alloc::string::String {
 mod tests {
     use super::*;
     use alloc::format;
+    use alloc::string::String;
     use alloc::vec::Vec;
 
     /// How many slots the save side pushes onto the frame.
     fn n_pushes(lines: &[&str]) -> usize {
         lines.iter().filter(|s| s.starts_with("push ")).count()
+    }
+
+    /// Does the x86_64 save side leave `cr3` in the slot `pgbr_offset` names?
+    ///
+    /// `cr3` is read into `r15` and pushed *last*, which is what puts it at
+    /// offset 0; the last-instant dead-frame check is the one place that names
+    /// that slot by `rsp`. Spelled as a predicate rather than inline so the
+    /// "this file never reads `cr3` at all" answer is one a test can ask for.
+    fn x86_64_names_pgbr_slot(lines: &[&str], code: &str, pgbr_offset: usize) -> bool {
+        let pushes: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.starts_with("push "))
+            .map(|(i, _)| i)
+            .collect();
+        match lines.iter().position(|s| *s == "mov r15, cr3") {
+            Some(c) => {
+                pgbr_offset == 0 && code.contains("[rsp], 0") && pushes.last() == Some(&(c + 1))
+            }
+            None => false,
+        }
+    }
+
+    /// The riscv64 twin. The satp slot is named once beside each `satp`
+    /// access, and a bare `contains` would match any of the fourteen other
+    /// slots that file names, so this pins it to those two lines. Assembly
+    /// missing either `csr` access cannot be naming the slot beside it.
+    fn riscv64_names_pgbr_slot(lines: &[&str], pgbr_offset: usize) -> bool {
+        let save = format!("sd s11, {}(a0)", pgbr_offset);
+        let load = format!("ld s11, {}(a1)", pgbr_offset);
+        let i = lines.iter().position(|s| *s == "csrr s11, satp");
+        let j = lines.iter().position(|s| s.starts_with("csrw satp"));
+        match (i, j) {
+            (Some(i), Some(j)) => lines[i + 1] == save && lines[j - 1] == load,
+            _ => false,
+        }
+    }
+
+    /// Why a `.S` file's frame depth disagrees with its `ContextData`, or
+    /// `None` when the two agree.
+    ///
+    /// The complaints are the text a future reader gets the day a field is
+    /// added to `ContextData`, so they are built here and not in an `assert!`
+    /// message, where nothing but a real failure would ever evaluate them.
+    fn frame_depth_complaint(arch: &str, code: &str, size: usize) -> Option<String> {
+        let lines: Vec<&str> = code.lines().map(|s| s.trim()).collect();
+        match arch {
+            "x86_64" => {
+                let slots = n_pushes(&lines) + 1;
+                if slots * 8 != size {
+                    return Some(format!("x86_64 pushes {} slots", slots));
+                }
+                // ...and the caller's `rip` is the top one, which is the
+                // other half of the dead-frame check.
+                if !code.contains(&format!("[rsp + {:#x}], 0", size - 8)) {
+                    return Some(format!(
+                        "x86_64 does not check the return slot at {}",
+                        size - 8
+                    ));
+                }
+                None
+            }
+            "riscv64" => {
+                let top = lines
+                    .iter()
+                    .filter_map(|s| s.strip_prefix("sd "))
+                    .filter_map(|s| s.split(", ").nth(1))
+                    .filter_map(|s| s.split('(').next())
+                    .filter_map(|s| s.parse::<usize>().ok())
+                    .max();
+                if top != Some(size - 8) {
+                    return Some(format!("riscv64 saves past its struct: {:?}", top));
+                }
+                None
+            }
+            // The two `.S` files in the tree do not agree on the column
+            // alignment of this `add`, and `instructions` keeps whatever the
+            // file wrote, so both spellings have to be read.
+            _ => {
+                if code.contains(&format!("add     x0, x0, #{}", size))
+                    || code.contains(&format!("add x0, x0, #{}", size))
+                {
+                    None
+                } else {
+                    Some(format!(
+                        "aarch64 does not start its save at offset {}",
+                        size
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Does the aarch64 entry load its argument, drop the startup slot and
+    /// branch, in that order? `false` if the order is wrong or any of the
+    /// three instructions is missing -- either way `run_executor` would be
+    /// entered on an `sp` that is not what the ABI promised it.
+    fn aarch64_entry_consumes_its_slot(code: &str) -> bool {
+        let lines: Vec<&str> = code
+            .lines()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let load = lines.iter().position(|s| *s == "ldr x0, [sp]");
+        let adjust = lines.iter().position(|s| *s == "add sp, sp, #16");
+        let branch = lines.iter().position(|s| *s == "b run_executor");
+        match (load, adjust, branch) {
+            (Some(load), Some(adjust), Some(branch)) => load < adjust && adjust < branch,
+            _ => false,
+        }
     }
 
     #[test]
@@ -178,38 +289,8 @@ mod tests {
                 // Pushed and popped, never indexed: `cr3` is the *last* push,
                 // so it sits at offset 0, and the last-instant dead-frame
                 // check is the one place that names it by `rsp`.
-                "x86_64" => {
-                    // `cr3` is read into `r15` and pushed *last*, which is
-                    // what puts it at offset 0; the last-instant dead-frame
-                    // check is the one place that names that slot by `rsp`.
-                    let pushes: Vec<usize> = lines
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, s)| s.starts_with("push "))
-                        .map(|(i, _)| i)
-                        .collect();
-                    match lines.iter().position(|s| *s == "mov r15, cr3") {
-                        Some(c) => {
-                            l.pgbr_offset == 0
-                                && code.contains("[rsp], 0")
-                                && pushes.last() == Some(&(c + 1))
-                        }
-                        None => false,
-                    }
-                }
-                // The satp slot is named once beside each `satp` access, and
-                // a bare `contains` would match any of the fourteen other
-                // slots this file names, so pin it to those two lines.
-                "riscv64" => {
-                    let save = format!("sd s11, {}(a0)", l.pgbr_offset);
-                    let load = format!("ld s11, {}(a1)", l.pgbr_offset);
-                    let i = lines.iter().position(|s| *s == "csrr s11, satp");
-                    let j = lines.iter().position(|s| s.starts_with("csrw satp"));
-                    match (i, j) {
-                        (Some(i), Some(j)) => lines[i + 1] == save && lines[j - 1] == load,
-                        _ => false,
-                    }
-                }
+                "x86_64" => x86_64_names_pgbr_slot(&lines, &code, l.pgbr_offset),
+                "riscv64" => riscv64_names_pgbr_slot(&lines, l.pgbr_offset),
                 _ => code.contains(&format!("#{}]", l.pgbr_offset)),
             };
             assert!(
@@ -221,6 +302,39 @@ mod tests {
     }
 
     #[test]
+    fn a_switch_that_never_reads_the_page_base_register_names_no_slot() {
+        // The predicate's job is to say *which slot* `cr3` lands in, and a
+        // file that never reads `cr3` has no such slot -- not a slot at
+        // offset 0, which is what a plain "is the push last?" check would
+        // conclude from an empty answer.
+        let code = instructions("        push rbx\n        cmpq [rsp], 0\n");
+        let lines: Vec<&str> = code.lines().map(|s| s.trim()).collect();
+        assert!(!x86_64_names_pgbr_slot(&lines, &code, 0));
+        // And with the read in place the same assembly answers yes, so the
+        // `false` above is the missing `mov` and not the shape of the input.
+        let code = instructions("        mov r15, cr3\n        push r15\n        cmpq [rsp], 0\n");
+        let lines: Vec<&str> = code.lines().map(|s| s.trim()).collect();
+        assert!(x86_64_names_pgbr_slot(&lines, &code, 0));
+    }
+
+    #[test]
+    fn the_riscv64_satp_slot_is_not_named_by_assembly_that_never_touches_satp() {
+        // Neither `csrr` nor `csrw`: there is no line to be beside, and the
+        // `sd s11, 104(a0)` in the file is some other register's slot.
+        let code = instructions("        sd s11, 104(a0)\n        ld s11, 104(a1)\n");
+        let lines: Vec<&str> = code.lines().map(|s| s.trim()).collect();
+        assert!(!riscv64_names_pgbr_slot(&lines, 104));
+        // With both `csr` accesses around them the very same two lines do
+        // name it, which is what makes the answer above about `satp` and not
+        // about the offset.
+        let code = instructions(
+            "        csrr s11, satp\n        sd s11, 104(a0)\n                     ld s11, 104(a1)\n        csrw satp, s11\n",
+        );
+        let lines: Vec<&str> = code.lines().map(|s| s.trim()).collect();
+        assert!(riscv64_names_pgbr_slot(&lines, 104));
+    }
+
+    #[test]
     fn each_switch_agrees_with_its_struct_on_how_deep_the_frame_is() {
         // aarch64 walks backwards with `stp ..., [x0, #-16]!`, so its very
         // first instruction adds `size_of::<ContextData>()` to the pointer;
@@ -229,38 +343,65 @@ mod tests {
         // slot, so its last one is `size - 8`. Get the number wrong and every
         // register is saved one slot out.
         for l in LAYOUTS.iter() {
-            let code = instructions(l.source);
-            let lines: Vec<&str> = code.lines().map(|s| s.trim()).collect();
-            match l.arch {
-                "x86_64" => {
-                    let slots = n_pushes(&lines) + 1;
-                    assert_eq!(slots * 8, l.size, "x86_64 pushes {} slots", slots);
-                    // ...and the caller's `rip` is the top one, which is the
-                    // other half of the dead-frame check.
-                    assert!(
-                        code.contains(&format!("[rsp + {:#x}], 0", l.size - 8)),
-                        "x86_64 does not check the return slot at {}",
-                        l.size - 8
-                    );
-                }
-                "riscv64" => {
-                    let top = lines
-                        .iter()
-                        .filter_map(|s| s.strip_prefix("sd "))
-                        .filter_map(|s| s.split(", ").nth(1))
-                        .filter_map(|s| s.split('(').next())
-                        .filter_map(|s| s.parse::<usize>().ok())
-                        .max();
-                    assert_eq!(top, Some(l.size - 8), "riscv64 saves past its struct");
-                }
-                _ => assert!(
-                    code.contains(&format!("add     x0, x0, #{}", l.size))
-                        || code.contains(&format!("add x0, x0, #{}", l.size)),
-                    "aarch64 does not start its save at offset {}",
-                    l.size
-                ),
-            }
+            assert_eq!(
+                frame_depth_complaint(l.arch, &instructions(l.source), l.size),
+                None
+            );
         }
+    }
+
+    #[test]
+    fn a_frame_that_pushes_the_wrong_number_of_slots_is_named_by_its_count() {
+        // Two pushes plus the caller's `rip` is a 24-byte frame, and the
+        // struct says 64: the complaint has to name what the file does, which
+        // is the number the reader has to go and compare against the fields.
+        let short = instructions("        push r15\n        push r14\n");
+        assert_eq!(
+            frame_depth_complaint("x86_64", &short, 64),
+            Some("x86_64 pushes 3 slots".into())
+        );
+    }
+
+    #[test]
+    fn an_x86_64_frame_without_its_dead_frame_check_names_the_slot_it_skipped() {
+        // Seven pushes plus `rip` is exactly 64 bytes, so the depth agrees
+        // and the only thing missing is the check on the return slot.
+        let mut asm = String::new();
+        for _ in 0..7 {
+            asm.push_str("        push rbx\n");
+        }
+        assert_eq!(
+            frame_depth_complaint("x86_64", &instructions(&asm), 64),
+            Some("x86_64 does not check the return slot at 56".into())
+        );
+    }
+
+    #[test]
+    fn a_riscv64_frame_that_stops_short_of_its_struct_reports_its_top_slot() {
+        // `sd` offsets up to 8 against a 128-byte struct: fifteen slots are
+        // never written, and the frame the switch pops is mostly garbage.
+        let asm = instructions("        sd ra, 0(a0)\n        sd sp, 8(a0)\n");
+        assert_eq!(
+            frame_depth_complaint("riscv64", &asm, 128),
+            Some("riscv64 saves past its struct: Some(8)".into())
+        );
+    }
+
+    #[test]
+    fn the_aarch64_frame_depth_is_read_in_either_spelling_of_its_add() {
+        for spelling in [
+            "        add     x0, x0, #112\n",
+            "        add x0, x0, #112\n",
+        ] {
+            assert_eq!(
+                frame_depth_complaint("aarch64", &instructions(spelling), 112),
+                None
+            );
+        }
+        assert_eq!(
+            frame_depth_complaint("aarch64", &instructions("        add x0, x0, #96\n"), 112),
+            Some("aarch64 does not start its save at offset 112".into())
+        );
     }
 
     #[test]
@@ -287,23 +428,21 @@ mod tests {
     #[test]
     fn aarch64_executor_entry_consumes_the_aligned_startup_slot() {
         let code = instructions(include_str!("arch/aarch64/executor_entry.S"));
-        let lines: Vec<&str> = code
-            .lines()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let load = lines.iter().position(|s| *s == "ldr x0, [sp]");
-        let adjust = lines.iter().position(|s| *s == "add sp, sp, #16");
-        let branch = lines.iter().position(|s| *s == "b run_executor");
-        match (load, adjust, branch) {
-            (Some(load), Some(adjust), Some(branch)) => {
-                assert!(load < adjust && adjust < branch);
-            }
-            _ => panic!(
-                "aarch64 executor_entry does not consume its slot: {:?}",
-                lines
-            ),
-        }
+        assert!(aarch64_entry_consumes_its_slot(&code));
+    }
+
+    #[test]
+    fn an_aarch64_entry_that_leaves_its_startup_slot_behind_is_caught() {
+        // Branching without the `add`: the slot stays on the stack and
+        // `run_executor` runs 16 bytes below where its caller thinks it is.
+        assert!(!aarch64_entry_consumes_its_slot(&instructions(
+            "        ldr     x0, [sp]\n        b       run_executor\n"
+        )));
+        // And dropping the slot before reading it loses the argument, so the
+        // order is as much of the contract as the presence of all three.
+        assert!(!aarch64_entry_consumes_its_slot(&instructions(
+            "        add     sp, sp, #16\n        ldr     x0, [sp]\n        b       run_executor\n"
+        )));
     }
 
     #[test]
@@ -416,5 +555,17 @@ mod tests {
         }
         let context = aarch64_context::ContextData::new(1, 2, 3);
         assert_eq!(context.d, [0; 8]);
+    }
+
+    #[test]
+    fn the_riscv64_frame_constructor_keeps_the_three_fields_it_is_handed() {
+        // `ContextData::new` names `ra`, `sp` and `satp` and takes the twelve
+        // `s` slots from `Default`. Written the other way round -- the
+        // `..Default::default()` first -- it would compile and zero the three
+        // that decide where the restored context resumes and on which page
+        // table, which is the whole of the frame that is not callee-saved.
+        let context = riscv64_context::ContextData::new(1, 2, 3);
+        assert_eq!((context.ra, context.sp, context.satp), (1, 2, 3));
+        assert_eq!(context.s, [0; 12]);
     }
 }

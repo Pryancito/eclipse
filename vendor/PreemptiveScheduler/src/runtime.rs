@@ -4347,6 +4347,56 @@ mod wake_latency_tests {
         NOW_NS_HOOK.store(saved, Ordering::SeqCst);
     }
 
+    /// The sampler is read from `WakerRef::wake_by_ref`, and that call is the
+    /// only place the stamp is ever written: `sample_wake_stamp` returning
+    /// `Some` and the slot carrying a stamp afterwards are two different
+    /// claims, and until now only the first one had a test. A publish path
+    /// that sampled and then dropped the stamp would leave every latency
+    /// figure reading zero with the probe apparently on.
+    #[test]
+    fn a_sampled_wake_leaves_its_stamp_on_the_slot_it_published() {
+        let _g = super::resched_test_lock();
+        fn clock() -> u64 {
+            6_000
+        }
+        let saved = NOW_NS_HOOK.swap(clock as usize, Ordering::SeqCst);
+        let was = wake_latency_enabled();
+        set_wake_latency(true);
+
+        let page = crate::waker_page::WakerPage::new(crate::arch::cpu_id());
+        let dropped = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let waker = alloc::sync::Arc::new(page.make_waker(0, &dropped));
+        page.initialize(0);
+        page.take_notified();
+
+        // One period's worth of wakes, and exactly one of them is sampled --
+        // "at least one of a period" because the counter is global and
+        // another test may have advanced it. The slot is drained each round,
+        // so the one stamp cannot hide behind a leftover.
+        let mut stamped = 0;
+        for _ in 0..WAKE_SAMPLE_PERIOD {
+            waker.wake_by_ref();
+            page.take_notified();
+            let stamp = page.take_wake_stamp(0);
+            if stamp != 0 {
+                stamped += 1;
+                assert_eq!(
+                    unpack_wake_stamp(stamp),
+                    (crate::arch::cpu_id(), 6_000),
+                    "the stamp does not carry this CPU and this clock reading"
+                );
+            }
+        }
+        assert_eq!(
+            stamped, 1,
+            "exactly one wake in a period of {} must leave a stamp",
+            WAKE_SAMPLE_PERIOD
+        );
+
+        set_wake_latency(was);
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
     /// The switch is the first thing the publish path reads, so a build with
     /// the probe off stamps nothing however the sampler and the clock stand.
     #[test]
