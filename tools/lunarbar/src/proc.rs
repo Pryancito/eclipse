@@ -108,41 +108,137 @@ pub fn map_shm_pool(total: usize, who: &str) -> Option<(*mut u8, OwnedFd)> {
     Some((map as *mut u8, fd))
 }
 
-/// Run `cmd` through `/bin/sh -c`, detached via double-fork: the intermediate
-/// child `setsid()`s and exits at once, so the grandchild is reparented to
-/// init and the caller never accumulates zombies (the parent reaps the
-/// intermediate with a waitpid that returns immediately).
+/// `cmd` wrapped so that the shell running it backgrounds the whole thing and
+/// exits at once.
+///
+/// The braces are separated by NEWLINES, not `;`. `{ cmd ;}` is a syntax error
+/// the moment `cmd` itself ends in `&` or `;` — `{ foo & ;}` — and a launcher
+/// must not care how the line it was handed happens to end. A newline
+/// terminates a list in every POSIX shell and leaves `}` the separate token it
+/// has to be, so any `cmd` that `sh -c` accepts today survives the wrap.
+///
+/// Backgrounding inside the shell is what keeps the launcher childless: the
+/// shell forks for the `&` and exits, so the program is reparented to init and
+/// the only child the launcher ever has is a shell that is already gone. The
+/// fork for the `&` copies the SHELL's address space, which is a rounding
+/// error next to the panel's.
+fn backgrounded(cmd: &str) -> String {
+    // A blank line needs the no-op colon: braces take a non-empty list, so
+    // `{\n\n} &` is a syntax error where plain `sh -c ""` was a silent no-op.
+    // A launcher handed nothing must still do nothing, not fail to parse.
+    if cmd.trim().is_empty() {
+        return String::from("{\n:\n} &\n");
+    }
+    format!("{{\n{cmd}\n}} &\n")
+}
+
+/// Run `cmd` through `/bin/sh -c`, detached, without copying this process's
+/// address space.
+///
+/// This used to be a double `fork()`: the intermediate `setsid()`ed, forked the
+/// real child and exited, so the grandchild was reparented to init and the
+/// launcher accumulated no zombies. Correct, and on Eclipse ruinously
+/// expensive — **two** of them. Eclipse runs with `cow-fork=OFF` (Zircon's
+/// hidden-node snapshot tree can resurrect a page, so `fork` takes the eager
+/// path and copies every committed page: `fork eager` in `/proc/perf/kernel`
+/// measured 167 us per mapping), so each `fork` copied the whole panel —
+/// GTK, Mesa, every icon surface — to throw it away microseconds later at
+/// `exec`. And the parent blocked in `waitpid` while both copies ran, so the
+/// panel froze for the length of its own launch.
+///
+/// `posix_spawn` is the same thing for free: both glibc and musl implement it
+/// with `clone(CLONE_VM | CLONE_VFORK)`, which Eclipse routes through
+/// `vfork_from` → `ChildMemory::Parents` — the child runs in the parent's
+/// address space and nothing is copied. `POSIX_SPAWN_SETSID` gives the new
+/// session that the intermediate fork existed only to provide, so the
+/// intermediate goes away with it.
+///
+/// It also retires a latent deadlock. Between `fork()` and `exec()` a child
+/// may call only async-signal-safe functions, so the old code had to build its
+/// `CString` before forking; that was safe only because no other thread of the
+/// panel is alive at this point, an invariant nothing enforced (add one
+/// background icon loader and a fork landing while it held the allocator lock
+/// leaves the child deadlocked on a lock whose owner does not exist in it — a
+/// launch that silently never happens). `posix_spawn` never runs user code
+/// between the clone and the exec, so there is no such window to protect.
 pub fn spawn_detached(cmd: &str) {
-    // Build the argv string BEFORE forking. Between fork() and exec() a child
-    // may call only async-signal-safe functions, and CString::new allocates.
-    // Today that is latent rather than live — par_rows joins its workers
-    // before returning, so no thread is alive when the event loop calls this —
-    // but the safety rests on an invariant nothing enforces: add any
-    // background thread (an async icon loader, say) and a fork landing while
-    // it held the allocator lock would leave the child deadlocked forever on a
-    // lock whose owner does not exist in it, as a launch that silently never
-    // happens. Cheap to make structural.
-    let Ok(c) = std::ffi::CString::new(cmd) else {
+    let Ok(c) = std::ffi::CString::new(backgrounded(cmd)) else {
         return; // an interior NUL cannot be passed to exec at all
     };
+    let sh = c"/bin/sh";
+    let dashc = c"-c";
+    let argv = [
+        sh.as_ptr(),
+        dashc.as_ptr(),
+        c.as_ptr(),
+        std::ptr::null::<libc::c_char>(),
+    ];
+    let mut pid: libc::pid_t = 0;
+    let mut attr: libc::posix_spawnattr_t = unsafe { core::mem::zeroed() };
+    // SAFETY: `attr` is owned here and destroyed on every path out; the argv
+    // array is NULL-terminated and outlives the call, which copies what it
+    // needs before returning.
+    let rc = unsafe {
+        if libc::posix_spawnattr_init(&mut attr) != 0 {
+            return fork_detached(&c);
+        }
+        let flags = libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_SETSID as _);
+        let rc = if flags == 0 {
+            libc::posix_spawn(
+                &mut pid,
+                sh.as_ptr(),
+                std::ptr::null(),
+                &attr,
+                argv.as_ptr() as *const *mut libc::c_char,
+                // The environment the panel itself was given: WAYLAND_DISPLAY
+                // and XDG_RUNTIME_DIR are how anything launched finds the
+                // compositor, and `fork` passed them down by inheriting them.
+                environ(),
+            )
+        } else {
+            flags
+        };
+        libc::posix_spawnattr_destroy(&mut attr);
+        rc
+    };
+    if rc != 0 {
+        // A kernel without the `CLONE_VM|CLONE_VFORK` path, or an attr this
+        // libc will not set: a slow launch beats no launch.
+        return fork_detached(&c);
+    }
+    // The shell backgrounded the program and is already exiting; this returns
+    // at once and is what keeps the launcher childless.
+    let mut st = 0;
+    unsafe { libc::waitpid(pid, &mut st, 0) };
+}
+
+/// This process's environment block, for `posix_spawn` to hand to the child.
+fn environ() -> *const *mut libc::c_char {
+    extern "C" {
+        static environ: *const *mut libc::c_char;
+    }
+    // SAFETY: `environ` is libc's own global; read, never written.
+    unsafe { environ }
+}
+
+/// The double-`fork()` launch, kept as the fallback for a `posix_spawn` that
+/// will not run. `c` is already the backgrounded line, so the shell still
+/// exits at once and the no-zombie property is the same.
+fn fork_detached(c: &std::ffi::CStr) {
     unsafe {
         let pid = libc::fork();
         if pid == 0 {
-            // Intermediate child: new session, fork the real child, exit.
             libc::setsid();
-            if libc::fork() == 0 {
-                let sh = b"/bin/sh\0";
-                let dashc = b"-c\0";
-                let argv = [
-                    sh.as_ptr() as *const libc::c_char,
-                    dashc.as_ptr() as *const libc::c_char,
-                    c.as_ptr(),
-                    std::ptr::null(),
-                ];
-                libc::execv(sh.as_ptr() as *const libc::c_char, argv.as_ptr());
-                libc::_exit(127);
-            }
-            libc::_exit(0);
+            let sh = b"/bin/sh\0";
+            let dashc = b"-c\0";
+            let argv = [
+                sh.as_ptr() as *const libc::c_char,
+                dashc.as_ptr() as *const libc::c_char,
+                c.as_ptr(),
+                std::ptr::null(),
+            ];
+            libc::execv(sh.as_ptr() as *const libc::c_char, argv.as_ptr());
+            libc::_exit(127);
         }
         if pid > 0 {
             let mut st = 0;
@@ -329,11 +425,14 @@ mod tests {
             (r, std::io::Error::last_os_error().raw_os_error())
         };
         assert_eq!(unreaped(), (-1, Some(libc::ECHILD)), "started with a child");
-        // The double fork exists so the launcher never accumulates children: it
-        // waits for the intermediate, which exits at once, and the grandchild is
-        // reparented to init. Without the wait, every launch would leave a zombie
-        // for as long as the session lives -- and a session launches something
-        // every time someone presses Alt+Space.
+        // The launcher never accumulates children: the only child it has is the
+        // shell, which backgrounds the program and exits at once, so the wait
+        // returns immediately and the program is reparented to init. Without
+        // that, every launch would leave a zombie for as long as the session
+        // lives -- and a session launches something every time someone presses
+        // Alt+Space. This is the property that survived the move from the
+        // double fork to `posix_spawn`, and the reason the `&` is in
+        // `backgrounded` rather than being a second clone here.
         spawn_detached("true");
         assert_eq!(unreaped(), (-1, Some(libc::ECHILD)), "a child was left");
         spawn_detached("exit 7");
@@ -356,10 +455,10 @@ mod tests {
             "eight launches left one"
         );
 
-        // And DETACHED means the call returns while the program runs on. Drop the
-        // inner fork and the intermediate execs the program itself, so the
-        // `waitpid` above waits for the PROGRAM: the overlay would sit frozen on
-        // screen for as long as whatever was launched takes to exit.
+        // And DETACHED means the call returns while the program runs on. Drop
+        // the `&` from `backgrounded` and the shell execs the program itself,
+        // so the `waitpid` above waits for the PROGRAM: the overlay would sit
+        // frozen on screen for as long as whatever was launched takes to exit.
         let t = std::time::Instant::now();
         spawn_detached("sleep 3");
         let waited = t.elapsed();
@@ -368,5 +467,64 @@ mod tests {
             "the launch blocked for {waited:?} on a program that runs for 3s"
         );
         assert_eq!(unreaped(), (-1, Some(libc::ECHILD)), "sleep left a child");
+
+        // The wrap has to be a line a shell will actually parse, for every
+        // ending in `AWKWARD_ENDINGS`. `sh -n` parses without running, and it
+        // forks -- which is why it lives in this test and not beside the
+        // string assertions.
+        for cmd in AWKWARD_ENDINGS {
+            let line = backgrounded(cmd);
+            let st = std::process::Command::new("/bin/sh")
+                .args(["-n", "-c"])
+                .arg(&line)
+                .status()
+                .expect("a shell to parse with");
+            assert!(st.success(), "sh cannot parse {line:?} (from {cmd:?})");
+        }
+        // And the command still reaches the shell intact.
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(backgrounded("printf hola"))
+            .output()
+            .expect("a shell to run with");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hola");
+        assert_eq!(unreaped(), (-1, Some(libc::ECHILD)), "a probe left a child");
+    }
+
+    /// Command lines whose ending is what breaks a wrap. `{ cmd ;}` is a
+    /// syntax error the moment `cmd` ends in `&` or `;`, and the empty line
+    /// needs the no-op colon because braces take a non-empty list. A launch
+    /// that dies of this says nothing at all: the shell exits 2 and nobody is
+    /// waiting for its status.
+    const AWKWARD_ENDINGS: [&str; 7] = [
+        "firefox",
+        "foo; bar",
+        "foo &",
+        "foo;",
+        "foo &&bar",
+        "x=1 foo",
+        "",
+    ];
+
+    /// The shape of the wrap, without forking: newline-separated braces, the
+    /// background `&` last, and the command carried through unmangled (a wrap
+    /// that mangled it would launch the wrong thing, which is worse than
+    /// launching nothing).
+    ///
+    /// Whether a shell *accepts* these lines is checked in the one forking
+    /// test below, not here -- see its note on `waitpid(-1)`.
+    #[test]
+    fn the_wrap_is_newline_separated_and_backgrounded() {
+        for cmd in AWKWARD_ENDINGS {
+            let line = backgrounded(cmd);
+            assert!(line.starts_with("{\n"), "{cmd:?} -> {line:?}");
+            assert!(line.ends_with("\n} &\n"), "{cmd:?} -> {line:?}");
+            let body = line
+                .strip_prefix("{\n")
+                .and_then(|l| l.strip_suffix("\n} &\n"))
+                .expect("the shape just asserted");
+            // The blank line is the colon; everything else is carried verbatim.
+            assert_eq!(body, if cmd.trim().is_empty() { ":" } else { cmd });
+        }
     }
 }
