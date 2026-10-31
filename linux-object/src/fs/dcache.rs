@@ -157,11 +157,16 @@ pub fn is_absent(root: &Arc<dyn INode>, path: &str) -> bool {
 
 /// Keeps what `path` leads to from `root`, and `walked`, where the walk to
 /// it ended, unless it is another file to each process.
+///
+/// Publishes into whatever epoch is current. Lookups call [`remember`], which
+/// publishes only into the epoch the walk started in; a test calls this.
+#[cfg(test)]
 pub fn put(root: &Arc<dyn INode>, path: &str, inode: &Arc<dyn INode>, walked: &Walked) {
     store_found(None, root, path, inode, walked);
 }
 
-/// [`put`], but only if `seen` is still the epoch.
+/// Keeps what `path` leads to from `root`, and `walked`, where the walk to
+/// it ended, but only if `seen` is still the epoch.
 ///
 /// `seen` is the epoch from before the walk. A name created or removed while
 /// the walk ran has bumped it, and publishing the walk's answer would record
