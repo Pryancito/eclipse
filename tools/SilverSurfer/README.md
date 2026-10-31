@@ -17,6 +17,10 @@ dibujada con tiny-skia, y sigue `/etc/eclipse/look`.
 Servo arranca con el feature `multiprocess`. Cada proceso de contenido abre
 su propio fichero DRM; el kernel le da un contexto de GPU distinto.
 
+Parches locales sobre crates.io (hasta que Servo los absorba):
+`vendor/servo-net` (cabeceras HTTP/2 de YouTube) y `vendor/servo-script`
+(finalize WebGLBuffer/VAO al cerrar sin `assert is_deleted`).
+
 ## Construir
 
 En la máquina que compila hacen falta las cabeceras de desarrollo, no solo

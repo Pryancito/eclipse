@@ -11,12 +11,14 @@ license = "MPL-2.0"
 [workspace]
 exclude = ["vendor"]
 
-# servo-net 0.7.0 from crates.io with one change in `connector.rs`: the hyper
-# client accepts HTTP/2 response header lists up to 256 KiB instead of hyper's
-# 16 KiB default, which made YouTube fail with "client error (SendRequest)".
-# Drop this when Servo raises the limit upstream. Tests are not vendored.
+# Patches over crates.io Servo 0.7 pieces. Drop each when fixed upstream.
+# - servo-net: hyper HTTP/2 response header list up to 256 KiB (YouTube).
+# - servo-script: WebGLBuffer/VAO finalize must not assert during ScriptThread
+#   teardown (window close after WebGL pages).
+# Tests are not vendored.
 [patch.crates-io]
 servo-net = { path = "vendor/servo-net" }
+servo-script = { path = "vendor/servo-script" }
 
 [features]
 default = ["engine", "media-gstreamer"]
