@@ -834,7 +834,15 @@ impl App {
             }
             return true;
         }
-        if self.ctrl && evdev == 38 {
+        // Ctrl+Shift+L — guardar usuario/contraseña del formulario visible.
+        if self.ctrl && self.shift && evdev == 38 {
+            self.leave_location();
+            if let Some(session) = &self.session {
+                session.shell.save_login_from_page();
+            }
+            return true;
+        }
+        if self.ctrl && !self.shift && evdev == 38 {
             self.loc_focused = true;
             if let Some(session) = &self.session {
                 session.shell.set_page_focused(false);

@@ -16,12 +16,13 @@ use servo::{
     DevicePoint, EmbedderControl, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
     LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent,
     MouseLeftViewportEvent, MouseMoveEvent, Opts, Preferences, Servo, ServoBuilder, Theme,
-    UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
-    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    JSValue, UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView,
+    WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use crate::about;
 use crate::files::{self, PickRequest};
 use crate::filter;
+use crate::passwords;
 use crate::privacy;
 use crate::session::{SavedTab, Snapshot};
 
@@ -116,6 +117,8 @@ pub struct Delegate {
     scale: Cell<f32>,
     user_content: Rc<UserContentManager>,
     blocked: Cell<usize>,
+    /// Ventana `--private`: no lee ni escribe el almacén de contraseñas.
+    private: bool,
 }
 
 pub struct Session {
@@ -263,8 +266,60 @@ impl Delegate {
                 privacy::cookies_page_url(&sites)
             }
             "filters" | "adblock" => filter::status_page_url(self.blocked.get()),
+            "passwords" | "logins" => passwords::page_url(),
             _ => about::expand(url),
         }
+    }
+
+    /// Extrae usuario/contraseña del formulario visible y los guarda (no-op en privado).
+    pub fn save_login_from_page(&self) {
+        if self.private {
+            eprintln!("silversurfer: contraseñas desactivadas en ventana privada");
+            return;
+        }
+        let Some(view) = self.active_view() else {
+            return;
+        };
+        let url = self.location_text();
+        let Some(origin) = passwords::origin_of(&url) else {
+            eprintln!("silversurfer: origen no válido para guardar login");
+            return;
+        };
+        view.evaluate_javascript(passwords::extract_script(), move |result| {
+            let text = match result {
+                Ok(JSValue::String(s)) => s,
+                _ => String::new(),
+            };
+            if text.is_empty() {
+                eprintln!("silversurfer: no hay campos de login rellenos");
+                return;
+            }
+            let mut parts = text.splitn(2, '\n');
+            let user = parts.next().unwrap_or("").to_string();
+            let secret = parts.next().unwrap_or("").to_string();
+            if secret.is_empty() {
+                eprintln!("silversurfer: falta la contraseña en el formulario");
+                return;
+            }
+            let mut store = passwords::load();
+            store.upsert(&origin, &user, &secret);
+            match passwords::save(&store) {
+                Ok(()) => eprintln!("silversurfer: guardada contraseña para {origin}"),
+                Err(err) => eprintln!("silversurfer: {err}"),
+            }
+        });
+    }
+
+    fn try_autofill(&self, view: &WebView, url: &str) {
+        if self.private {
+            return;
+        }
+        let store = passwords::load();
+        let Some(entry) = store.find_for_url(url) else {
+            return;
+        };
+        let script = passwords::fill_script(&entry.username, &entry.secret);
+        view.evaluate_javascript(script, |_| {});
     }
 
     /// Borra cookies, session/local storage y caché HTTP de esta instancia.
@@ -623,10 +678,17 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
-        if let Some(mut tab) = self.tab_mut_by_id(&webview) {
+        let url = if let Some(mut tab) = self.tab_mut_by_id(&webview) {
             tab.loading = status != LoadStatus::Complete;
-        }
+            tab.url.clone()
+        } else {
+            self.flags.chrome.store(true, Ordering::Relaxed);
+            return;
+        };
         self.flags.chrome.store(true, Ordering::Relaxed);
+        if status == LoadStatus::Complete {
+            self.try_autofill(&webview, &url);
+        }
     }
 
     fn request_create_new(
@@ -722,6 +784,7 @@ pub fn start(
         scale: Cell::new(scale.max(1.0)),
         user_content: user_content.clone(),
         blocked: Cell::new(0),
+        private,
     });
 
     let servo = ServoBuilder::default()
