@@ -98,6 +98,8 @@ vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.
 El distintivo `GL` / `SW` indica si la página va por EGL o por blit
 software; en ventana privada aparece además `P`.
 `about:privacy`, `about:cookies` y `about:clear` cubren la UI de datos.
+El bloqueo de anuncios lite (hosts/paths + CSS hide) está activo por
+defecto; `SILVERSURFER_ADBLOCK=0` lo apaga. Ver `about:filters`.
 La home es un lienzo en blanco con el logo de Eclipse OS
 (paleta de `/etc/eclipse/look`). Los smokes de canvas / WebGL / WebGPU /
 WebAudio / MP4 / HLS viven en `smoke.html` (`smoke_url()`).
