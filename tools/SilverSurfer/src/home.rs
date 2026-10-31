@@ -78,6 +78,8 @@ mod tests {
         assert!(SMOKE_HTML.contains(".m3u8"));
         assert!(SMOKE_HTML.contains("webgl"));
         assert!(SMOKE_HTML.contains("gpu"));
+        assert!(SMOKE_HTML.contains("React / SPA APIs"));
+        assert!(SMOKE_HTML.contains("AbortController"));
         assert!(SMOKE_HTML.contains("AudioContext") || SMOKE_HTML.contains("webkitAudioContext"));
         assert!(SMOKE_HTML.contains("Smokes locales"));
         // HLS is opt-in so opening smoke.html does not spam GstHLSDemux2 errors.

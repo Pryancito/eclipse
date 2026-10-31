@@ -45,6 +45,9 @@ servo = { version = "0.7", optional = true, default-features = false, features =
     "multiprocess",
     "webgl",
     "webgpu",
+    # SubtleCrypto + CompressionStream help modern SPA bundles (React/Next).
+    "webcrypto",
+    "brotli-compression-stream",
 ] }
 euclid = { version = "0.22", optional = true }
 dpi = { version = "0.1", optional = true }
