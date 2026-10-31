@@ -706,6 +706,12 @@ impl Syscall<'_> {
             // name_to_handle_at on hotplug/device paths and handle ENOSYS
             // fine; the loud per-call ERROR line was pure log noise.
             Sys::NAME_TO_HANDLE_AT => Err(LxError::ENOSYS),
+            // Disk quotas are not compiled in. udisks, PAM and util-linux
+            // probe `quotactl` once per mount and read ENOSYS as "this kernel
+            // has no quotas" — the answer Linux gives with `CONFIG_QUOTA`
+            // off. The unknown-syscall path logged that probe at error level
+            // through a desktop start.
+            Sys::QUOTACTL => Err(LxError::ENOSYS),
             // No namespaces in this kernel, and `sys_unshare` answers ENOSYS
             // to every call that asks for one. That ENOSYS is LOAD-BEARING, not
             // a placeholder: bubblewrap turns it into

@@ -2286,3 +2286,48 @@ fn both_make_paths_install_the_lunar_clients() {
         assert!(install.contains(&format!("bin.join(\"{b}\")")), "{b}");
     }
 }
+
+/// SilverSurfer is hundreds of MiB. `/bin` is copied into the RAM-resident
+/// root with a 16 MiB cap, so a binary installed there never reaches the
+/// image QEMU boots. Both `make` paths have to put it in `usr/bin`, which
+/// `copy_into_live` copies uncapped with the rest of the desktop, and take
+/// away a copy left in `/bin` by an older build.
+#[test]
+fn both_make_paths_install_silversurfer_with_the_desktop_binaries() {
+    let src = include_str!("mod.rs");
+    let make = src
+        .split("    pub fn make(&self, clear: bool) {")
+        .nth(1)
+        .expect("LinuxRootfs::make moved");
+    let (incremental, scratch) = make
+        .split_once("            return;\n        }\n")
+        .expect("the incremental branch no longer ends in `return;`");
+    assert!(
+        incremental.contains("self.install_silversurfer(&dir);"),
+        "the incremental branch does not install silversurfer into the rootfs"
+    );
+    let scratch = scratch.split("\n    }\n").next().unwrap();
+    assert!(
+        scratch.contains("self.install_silversurfer(&dir);"),
+        "the from-scratch branch does not install silversurfer into the rootfs"
+    );
+    let install = src
+        .split("fn install_silversurfer(&self, rootfs: &Path) {")
+        .nth(1)
+        .expect("install_silversurfer moved")
+        .split("\n    fn lunar_tools(")
+        .next()
+        .unwrap();
+    assert!(
+        install.contains("rootfs.join(\"usr/bin\").join(\"silversurfer\")"),
+        "silversurfer has to land in usr/bin, which the live root keeps"
+    );
+    assert!(
+        install.contains("rootfs.join(\"bin\").join(\"silversurfer\")"),
+        "a copy left in /bin has to be removed"
+    );
+    assert!(
+        !install.contains("fs::copy(&executable, bin.join(\"silversurfer\"))"),
+        "installing into /bin is what the 16 MiB cap drops"
+    );
+}

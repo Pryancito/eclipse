@@ -48,11 +48,15 @@ cargo build --release --manifest-path tools/SilverSurfer/Cargo.toml \
 
 `cargo xtask` (al armar el rootfs) compila SilverSurfer en el host: si
 `pkg-config --exists gstreamer-1.0` tiene éxito usa medios; si no, avisa y
-compila solo con `--features engine`. Copia el binario a `/bin/silversurfer`
-cuando el build sale bien. El escritorio instala `eclipse-browser` (prefer
-SilverSurfer, si no Firefox), `silversurfer.desktop` y el handler
-`http`/`https` por defecto. La imagen lleva los plugins de ejecución
-(`gstreamer1.0-plugins-*` / `gst-plugins-*`).
+compila solo con `--features engine`. Copia el binario a
+`/usr/bin/silversurfer` cuando el build sale bien. No va a `/bin`: ese
+directorio entra en la imagen de arranque con un tope de 16 MiB y este
+binario lo supera, así que la copia se descartaba y el sistema arrancado no
+tenía navegador. `/usr/bin` se copia entero con el resto del escritorio.
+El escritorio instala `eclipse-browser` (prefer SilverSurfer, si no
+Firefox), `silversurfer.desktop` y el handler `http`/`https` por defecto.
+La imagen lleva los plugins de ejecución (`gstreamer1.0-plugins-*` /
+`gst-plugins-*`).
 
 Las pruebas de unidad y los benchmarks no arrancan Servo. Miden el cromo, la
 barra de direcciones, el diálogo de lunarfile y la copia de un fotograma a

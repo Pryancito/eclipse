@@ -1,7 +1,9 @@
 //! Calls libc makes by number that the table did not have, made the way
 //! libc makes them: `epoll_pwait2` on every architecture, and on x86_64
 //! `creat` (glibc's `creat`) and `lchown` (both libcs' `lchown`). Each
-//! answered `ENOSYS`.
+//! answered `ENOSYS`. `quotactl` is in the table and still answers `ENOSYS`:
+//! this kernel has no disk quotas, and saying so has to be the handler, not
+//! the unknown-syscall log line.
 
 use super::*;
 use crate::on_a_thread::on_a_thread;
@@ -207,6 +209,30 @@ fn epoll_pwait2_waits_under_the_mask_it_is_given() {
         })
     });
     assert_eq!(got, (true, core::task::Poll::Ready(EINTR)));
+}
+
+/// `quotactl` is in the table on every architecture. A desktop start probes
+/// it once per mount (udisks, PAM, util-linux). Leaving the call to
+/// `unknown_syscall` logged an error each time and still answered `ENOSYS`,
+/// which is the answer Linux gives when quotas are not compiled in. The
+/// answer stays that; the log line does not.
+#[test]
+fn quotactl_answers_that_this_kernel_has_no_quotas() {
+    let proc = a_process(46_517, "tq");
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            // `Q_GETFMT` for user quota: the probe those callers actually make.
+            let q_getfmt: usize = 0x800004;
+            by_number(sys, Sys::QUOTACTL as u32, [q_getfmt, 0, 0, 0, 0, 0]).await
+        })
+    });
+    assert_eq!(got, -(LxError::ENOSYS as isize));
+    // `unknown_syscall` answers the same errno, so the call above cannot see
+    // a fall-through. The fall-through is the error line on the console.
+    assert!(
+        include_str!("lib.rs").contains("Sys::QUOTACTL => Err(LxError::ENOSYS)"),
+        "quotactl fell through to unknown_syscall again"
+    );
 }
 
 #[cfg(target_arch = "x86_64")]

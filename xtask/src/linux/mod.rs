@@ -206,7 +206,9 @@ impl LinuxRootfs {
             // lunarbar the rootfs was created with and never got the
             // binaries added after it -- lunarhunter, the day it arrived.
             self.install_lunar_tools(&bin);
-            self.install_silversurfer(&bin);
+            // Not into `bin`: that tree is copied into the live root with a
+            // 16 MiB cap, and this binary is far past it.
+            self.install_silversurfer(&dir);
             // INIT (PID 1): the Eclipse-native Rust init by default, with busybox
             // init as a resilient fallback. `install_busybox_init` runs first so
             // `/sbin/init` always resolves to *some* PID 1; `install_eclipse_init`
@@ -633,7 +635,8 @@ impl LinuxRootfs {
         }
 
         self.install_lunar_tools(&bin);
-        self.install_silversurfer(&bin);
+        // Same as the incremental path: `usr/bin`, not the capped `bin`.
+        self.install_silversurfer(&dir);
 
         // eclipse-dbusd: Eclipse's own D-Bus session bus (Rust, static musl).
         // The `eclipse-dbus` wrapper prefers Alpine's dbus-daemon when the
@@ -3334,13 +3337,21 @@ impl LinuxRootfs {
         }
     }
 
-    /// Best-effort host build of SilverSurfer into `bin/silversurfer`.
+    /// Best-effort host build of SilverSurfer into `usr/bin/silversurfer`.
     ///
     /// Unlike lunarbar this is **dynamically** linked (Servo needs Mesa;
     /// media needs GStreamer). If `pkg-config --exists gstreamer-1.0` fails,
     /// the build drops `media-gstreamer` and keeps the engine. A missing
     /// binary is fine: `eclipse-browser` falls back to Firefox.
-    fn install_silversurfer(&self, bin: &Path) {
+    ///
+    /// It does not go in `/bin`. That directory is one of `LIVE_KEEP`, copied
+    /// into the RAM-resident root with a 16 MiB cap, and this binary is
+    /// hundreds of MiB — the copy was skipped and the image QEMU boots had
+    /// no `silversurfer`. `usr/bin` is copied later, uncapped, with the rest
+    /// of the desktop (`copy_into_live`), which is the path Firefox takes.
+    /// The lean installer snapshots are taken before that copy, so the
+    /// browser stays out of the EFI initramfs.
+    fn install_silversurfer(&self, rootfs: &Path) {
         let dir = PROJECT_DIR.join("tools").join("SilverSurfer");
         let executable = dir.join("target").join("release").join("silversurfer");
         let newest_src = [
@@ -3392,10 +3403,30 @@ impl LinuxRootfs {
                 );
             }
         }
+        // A rootfs built before this landed still has the binary in `/bin`.
+        // Leaving it there puts 800 MiB into `rootfs.btrfs` twice and the
+        // live-root copy still skips the `/bin` one. Drop that copy only
+        // after `usr/bin` actually has the binary.
+        let stale = rootfs.join("bin").join("silversurfer");
+        let dest = rootfs.join("usr/bin").join("silversurfer");
+        if let Some(parent) = dest.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         if executable.is_file() {
-            let _ = dir::rm(bin.join("silversurfer"));
-            if let Err(err) = fs::copy(&executable, bin.join("silversurfer")) {
+            let _ = fs::remove_file(&dest);
+            if let Err(err) = fs::copy(&executable, &dest) {
                 eprintln!("warning: could not install silversurfer: {err}");
+            } else {
+                let _ = fs::remove_file(&stale);
+                let mib = fs::metadata(&dest).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+                println!("silversurfer: /usr/bin/silversurfer ({mib} MiB)");
+            }
+        } else if stale.is_file() {
+            let _ = fs::remove_file(&dest);
+            if let Err(err) = fs::rename(&stale, &dest) {
+                eprintln!("warning: could not move silversurfer out of /bin: {err}");
+            } else {
+                println!("silversurfer: moved /bin/silversurfer to /usr/bin/silversurfer");
             }
         } else {
             eprintln!(

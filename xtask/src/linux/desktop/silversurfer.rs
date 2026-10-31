@@ -17,8 +17,8 @@ pub(crate) fn write_silversurfer_wrapper(rootfs: &Path) {
         b"#!/bin/sh\n\
           # Eclipse OS: native browser when present, Firefox otherwise.\n\
           export HOME=\"${HOME:-/root}\"\n\
-          if command -v silversurfer >/dev/null 2>&1; then\n\
-          \x20 exec silversurfer \"$@\"\n\
+          if [ -x /usr/bin/silversurfer ]; then\n\
+          \x20 exec /usr/bin/silversurfer \"$@\"\n\
           fi\n\
           exec /usr/local/bin/eclipse-firefox \"$@\"\n",
     )
@@ -94,7 +94,7 @@ mod tests {
         let desk = root.join("root/.local/share/applications/silversurfer.desktop");
         let mime = root.join("root/.config/mimeapps.list");
         let w = fs::read_to_string(&wrapper).unwrap();
-        assert!(w.contains("silversurfer"));
+        assert!(w.contains("/usr/bin/silversurfer"));
         assert!(w.contains("eclipse-firefox"));
         let d = fs::read_to_string(&desk).unwrap();
         assert!(d.contains("x-scheme-handler/https"));
