@@ -9,6 +9,14 @@ license = "MPL-2.0"
 # Built by xtask the same way as lunarbar, but dynamically linked: Servo needs
 # Mesa, and the media feature needs GStreamer.
 [workspace]
+exclude = ["vendor"]
+
+# servo-net 0.7.0 from crates.io with one change in `connector.rs`: the hyper
+# client accepts HTTP/2 response header lists up to 256 KiB instead of hyper's
+# 16 KiB default, which made YouTube fail with "client error (SendRequest)".
+# Drop this when Servo raises the limit upstream. Tests are not vendored.
+[patch.crates-io]
+servo-net = { path = "vendor/servo-net" }
 
 [features]
 default = ["engine", "media-gstreamer"]
