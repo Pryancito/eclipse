@@ -309,6 +309,10 @@ impl App {
         let (context, gpu) = self.make_context(pw, ph)?;
         let waker = Waker::new()?;
         let session = engine::start(waker.clone(), context, gpu, url, self.scale as f32)?;
+        eprintln!(
+            "silversurfer: paint={}",
+            if gpu { "EGL" } else { "software→wl_shm" }
+        );
         let extra = std::mem::take(&mut self.pending_tabs);
         let active = self.pending_active;
         if !extra.is_empty() || active > 0 {
@@ -496,6 +500,7 @@ impl App {
         if let Some(top) = &self.toplevel {
             top.set_title(window_title);
         }
+        let gpu = self.session.as_ref().is_some_and(|s| s.gpu);
         let pixels = chrome::render(&View {
             width: self.logical_w,
             look: self.look,
@@ -506,6 +511,7 @@ impl App {
             location_focused: self.loc_focused,
             location_cursor: self.loc_cursor,
             scheme,
+            gpu,
             can_back,
             can_forward,
             scale: self.scale,

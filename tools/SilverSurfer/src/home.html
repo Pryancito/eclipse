@@ -13,6 +13,8 @@
     --dim: #8ea0c8;
     --accent: #6ea8ff;
     --line: #275a9e;
+    --ok: #6ecf8e;
+    --bad: #e07a7a;
   }
   * { box-sizing: border-box; }
   body {
@@ -50,15 +52,25 @@
     padding: 8px 14px;
     font: inherit;
     font-weight: 600;
+    margin-right: 8px;
+    margin-top: 8px;
   }
   code { color: var(--accent); }
-  #gl, #gpu, #clock { color: var(--dim); min-height: 1.2em; }
+  #gl, #gpu, #clock, #wa, #summary { color: var(--dim); min-height: 1.2em; }
+  #summary li.ok { color: var(--ok); }
+  #summary li.bad { color: var(--bad); }
+  #summary ul { margin: 8px 0 0; padding-left: 1.2em; }
 </style>
 </head>
 <body>
 <main>
   <h1>Silver<span>Surfer</span></h1>
-  <p class="lead">Navegador de Eclipse OS. HTML, CSS y JavaScript los pinta Servo. El audio, el vídeo y el streaming HLS pasan por GStreamer.</p>
+  <p class="lead">Navegador de Eclipse OS. HTML, CSS y JavaScript los pinta Servo. El audio, el vídeo y el streaming HLS pasan por GStreamer. El distintivo <code>GL</code>/<code>SW</code> del cromo indica si la página usa EGL o blit software.</p>
+
+  <section>
+    <h2>Smokes locales (sin red)</h2>
+    <div id="summary">Comprobando…</div>
+  </section>
 
   <section>
     <h2>JavaScript</h2>
@@ -74,29 +86,47 @@
   </section>
 
   <section>
-    <h2>Vídeo</h2>
-    <p>Un MP4 progresivo. Hace falta red y el plugin correspondiente.</p>
-    <video controls src="https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4"></video>
+    <h2>WebAudio (local)</h2>
+    <p id="wa">Listo para un beep corto sin fichero remoto.</p>
+    <button id="beep" type="button">Beep</button>
   </section>
 
   <section>
-    <h2>Audio</h2>
-    <audio controls src="https://interactive-examples.mdn.mozilla.net/media/cc0-audio/t-rex-roar.mp3"></audio>
+    <h2>Vídeo (red)</h2>
+    <p>MP4 progresivo remoto. Si falla, la fila de smokes lo marca.</p>
+    <video id="vid" controls src="https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4"></video>
   </section>
 
   <section>
-    <h2>Streaming HLS</h2>
+    <h2>Audio (red)</h2>
+    <audio id="aud" controls src="https://interactive-examples.mdn.mozilla.net/media/cc0-audio/t-rex-roar.mp3"></audio>
+  </section>
+
+  <section>
+    <h2>Streaming HLS (red)</h2>
     <p>Lista <code>m3u8</code>. Servo la anuncia si GStreamer tiene el demuxer <code>application/x-hls</code>.</p>
-    <video controls src="https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"></video>
+    <video id="hls" controls src="https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"></video>
   </section>
 </main>
 <script>
+  const results = {};
+  function mark(key, ok, detail) {
+    results[key] = { ok, detail };
+    const box = document.getElementById("summary");
+    const items = Object.keys(results).map((k) => {
+      const r = results[k];
+      return "<li class=\"" + (r.ok ? "ok" : "bad") + "\">" + k + ": " + r.detail + "</li>";
+    }).join("");
+    box.innerHTML = "<ul>" + items + "</ul>";
+  }
+
   const clock = document.getElementById("clock");
   function tick() {
     clock.textContent = new Date().toLocaleString("es");
   }
   tick();
   setInterval(tick, 1000);
+  mark("javascript", true, "reloj y rAF activos");
 
   const canvas = document.getElementById("wave");
   const ctx = canvas.getContext("2d");
@@ -117,16 +147,22 @@
     requestAnimationFrame(wave);
   }
   wave();
+  mark("canvas2d", !!ctx, ctx ? "contexto 2d listo" : "sin 2d");
 
   function probeGl() {
     const c = document.createElement("canvas");
     const gl = c.getContext("webgl2") || c.getContext("webgl");
     const out = document.getElementById("gl");
-    if (!gl) { out.textContent = "WebGL no está disponible."; return; }
+    if (!gl) {
+      out.textContent = "WebGL no está disponible.";
+      mark("webgl", false, "no disponible");
+      return;
+    }
     gl.clearColor(0.07, 0.16, 0.32, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
     const r = gl.getParameter(gl.RENDERER) || "WebGL";
     out.textContent = "WebGL: " + r;
+    mark("webgl", true, r);
   }
   probeGl();
   document.getElementById("paint").addEventListener("click", probeGl);
@@ -134,11 +170,48 @@
   const gpu = document.getElementById("gpu");
   if (!navigator.gpu) {
     gpu.textContent = "WebGPU no está en esta construcción.";
+    mark("webgpu", false, "API ausente");
   } else {
     navigator.gpu.requestAdapter().then((a) => {
-      gpu.textContent = a ? "WebGPU: adaptador listo." : "WebGPU: sin adaptador.";
-    }).catch((e) => { gpu.textContent = "WebGPU: " + e; });
+      const ok = !!a;
+      gpu.textContent = ok ? "WebGPU: adaptador listo." : "WebGPU: sin adaptador.";
+      mark("webgpu", ok, ok ? "adaptador listo" : "sin adaptador");
+    }).catch((e) => {
+      gpu.textContent = "WebGPU: " + e;
+      mark("webgpu", false, String(e));
+    });
   }
+
+  document.getElementById("beep").addEventListener("click", () => {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) {
+        mark("webaudio", false, "sin AudioContext");
+        return;
+      }
+      const ac = new AC();
+      const o = ac.createOscillator();
+      const g = ac.createGain();
+      o.connect(g);
+      g.connect(ac.destination);
+      g.gain.value = 0.08;
+      o.frequency.value = 660;
+      o.start();
+      o.stop(ac.currentTime + 0.15);
+      document.getElementById("wa").textContent = "Beep disparado.";
+      mark("webaudio", true, "oscilador local OK");
+    } catch (e) {
+      mark("webaudio", false, String(e));
+    }
+  });
+
+  function watchMedia(el, key) {
+    el.addEventListener("loadeddata", () => mark(key, true, "loadeddata"));
+    el.addEventListener("error", () => mark(key, false, "error de carga (¿red/plugin?)"));
+  }
+  watchMedia(document.getElementById("vid"), "video-mp4");
+  watchMedia(document.getElementById("aud"), "audio-mp3");
+  watchMedia(document.getElementById("hls"), "video-hls");
 </script>
 </body>
 </html>

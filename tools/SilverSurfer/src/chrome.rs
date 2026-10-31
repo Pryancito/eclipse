@@ -20,6 +20,7 @@ const PAD: i32 = 8;
 const BTN: i32 = 24;
 const GAP: i32 = 4;
 const SCHEME_W: i32 = 16;
+const GPU_W: i32 = 28;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RectI {
@@ -56,6 +57,7 @@ pub struct Layout {
     pub reload: RectI,
     pub scheme: RectI,
     pub location: RectI,
+    pub gpu: RectI,
 }
 
 pub fn layout(width: i32, tabs: usize) -> Layout {
@@ -129,6 +131,13 @@ pub fn layout(width: i32, tabs: usize) -> Layout {
         h: BTN,
     };
     let loc_x = scheme.x + scheme.w + GAP;
+    let gpu = RectI {
+        x: (width - PAD - GPU_W).max(loc_x),
+        y: y_tool,
+        w: GPU_W,
+        h: BTN,
+    };
+    let loc_w = (gpu.x - GAP - loc_x).max(1);
     Layout {
         tabs: tab_rects,
         closes,
@@ -140,9 +149,10 @@ pub fn layout(width: i32, tabs: usize) -> Layout {
         location: RectI {
             x: loc_x,
             y: y_tool,
-            w: (width - PAD - loc_x).max(1),
+            w: loc_w,
             h: BTN,
         },
+        gpu,
     }
 }
 
@@ -191,6 +201,8 @@ pub struct View<'a> {
     /// Caret, in characters, used only while the bar is focused.
     pub location_cursor: usize,
     pub scheme: SchemeHint,
+    /// `true` = página por EGL; `false` = blit software → wl_shm.
+    pub gpu: bool,
     pub can_back: bool,
     pub can_forward: bool,
     /// Output scale. The buffer is `width * scale` by `HEIGHT * scale`.
@@ -245,8 +257,21 @@ pub fn render(view: &View<'_>) -> Pixels {
     fill(&mut pixmap, s(lay.reload), pal.field);
     fill(&mut pixmap, s(lay.scheme), pal.field);
     fill(&mut pixmap, s(lay.location), pal.field);
+    fill(&mut pixmap, s(lay.gpu), pal.field);
     if view.location_focused {
         stroke_scaled(&mut pixmap, lay.location, pal.accent, scale);
+    }
+    if view.gpu {
+        fill(
+            &mut pixmap,
+            s(RectI {
+                x: lay.gpu.x,
+                y: lay.gpu.y + lay.gpu.h - 2,
+                w: lay.gpu.w,
+                h: 2,
+            }),
+            pal.accent,
+        );
     }
     if view.scheme == SchemeHint::Https {
         fill(
@@ -307,6 +332,16 @@ pub fn render(view: &View<'_>) -> Pixels {
         lay.scheme.y + 16,
         view.scheme.badge(),
         scheme_color,
+        scale,
+    );
+    let gpu_label = if view.gpu { "GL" } else { "SW" };
+    let gpu_color = if view.gpu { pal.accent } else { dim };
+    label_scaled(
+        &mut target,
+        lay.gpu.x + 6,
+        lay.gpu.y + 16,
+        gpu_label,
+        gpu_color,
         scale,
     );
     let loc = if view.location.is_empty() {
@@ -716,6 +751,7 @@ mod tests {
             location_focused: true,
             location_cursor: 0,
             scheme: SchemeHint::Https,
+            gpu: true,
             can_back: false,
             can_forward: true,
             scale: 2,
@@ -808,6 +844,7 @@ mod tests {
                 location_focused: false,
                 location_cursor: 0,
                 scheme: SchemeHint::Other,
+                gpu: false,
                 can_back: true,
                 can_forward: false,
                 scale: 1,
@@ -824,5 +861,7 @@ mod tests {
         assert!(lay.scheme.x < lay.location.x);
         assert!(lay.scheme.x > lay.reload.x);
         assert_eq!(lay.scheme.w, SCHEME_W);
+        assert!(lay.location.x + lay.location.w < lay.gpu.x);
+        assert_eq!(lay.gpu.w, GPU_W);
     }
 }

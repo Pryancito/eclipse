@@ -22,11 +22,15 @@ mod tests {
         assert!(HTML.contains(".m3u8"));
         assert!(HTML.contains("webgl"));
         assert!(HTML.contains("gpu"));
+        assert!(HTML.contains("AudioContext") || HTML.contains("webkitAudioContext"));
+        assert!(HTML.contains("Smokes locales"));
+        assert!(HTML.contains("GL"));
         let url = home_url();
         assert_eq!(url.scheme(), "file");
         assert!(url.path().ends_with("silversurfer-home.html"));
         let body = std::fs::read_to_string(url.to_file_path().unwrap()).unwrap();
         assert!(body.contains("<video"));
         assert!(body.contains(".m3u8"));
+        assert!(body.contains("webaudio") || body.contains("AudioContext"));
     }
 }
