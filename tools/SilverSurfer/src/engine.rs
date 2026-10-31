@@ -20,8 +20,8 @@ use servo::{
     WheelDelta, WheelEvent, WheelMode,
 };
 use crate::files::{self, PickRequest};
-use crate::github_compat::{self, GITHUB_REVEAL_USERSCRIPT};
 use crate::session::{SavedTab, Snapshot};
+use crate::spa_compat::{self, GITHUB_REVEAL_USERSCRIPT};
 
 /// Default HTTP / `navigator.userAgent` string.
 ///
@@ -45,12 +45,24 @@ fn install_compat_preferences(preferences: &mut Preferences) {
     preferences.dom_webgpu_enabled = true;
     preferences.dom_webgl2_enabled = true;
     preferences.dom_webrtc_enabled = true;
-    // GitHub (and other SPAs) touch these behind Servo experimental flags.
-    // Enabling them is cheap; incomplete implementations still fail soft.
+
+    // React / SPA surfaces (GitHub marketing, dashboards, etc.) probe these.
+    // Defaults in Servo 0.7 are off; incomplete impls still fail softer than
+    // a hard ReferenceError. Service Workers stay off — half-broken SW
+    // registration breaks sites worse than missing SW.
     preferences.dom_intersection_observer_enabled = true;
     preferences.dom_web_animations_enabled = true;
     preferences.dom_fontface_enabled = true;
     preferences.dom_adoptedstylesheet_enabled = true;
+    preferences.dom_indexeddb_enabled = true;
+    preferences.dom_async_clipboard_enabled = true;
+    preferences.dom_visual_viewport_enabled = true;
+    preferences.dom_entries_api_enabled = true;
+    preferences.dom_offscreen_canvas_enabled = true;
+    preferences.dom_storage_manager_api_enabled = true;
+    preferences.layout_css_container_queries_enabled = true;
+    preferences.layout_css_backdrop_filter_enabled = true;
+
     // Eclipse's panel is dark. A white flash on the first frame reads as a
     // broken window more than as an unloaded page.
     preferences.shell_background_color_rgba = [0.043, 0.071, 0.125, 1.0];
@@ -58,7 +70,9 @@ fn install_compat_preferences(preferences: &mut Preferences) {
 
 fn build_user_content(servo: &Servo) -> Rc<UserContentManager> {
     let manager = Rc::new(UserContentManager::new(servo));
-    manager.add_script(Rc::new(UserScript::from(GITHUB_REVEAL_USERSCRIPT)));
+    for script in spa_compat::userscripts() {
+        manager.add_script(Rc::new(UserScript::from(script)));
+    }
     manager
 }
 
@@ -69,7 +83,7 @@ fn reveal_github_if_needed(webview: &WebView) {
     let Some(host) = url.host_str() else {
         return;
     };
-    if !github_compat::is_github_host(host) {
+    if !spa_compat::is_github_host(host) {
         return;
     }
     webview.evaluate_javascript(GITHUB_REVEAL_USERSCRIPT, |_| {});
@@ -147,7 +161,7 @@ pub struct Delegate {
     context: Rc<dyn servo::RenderingContext>,
     flags: Rc<Flags>,
     scale: Cell<f32>,
-    /// Shared userscripts/styles (GitHub opacity reveal, etc.).
+    /// Shared userscripts (SPA polyfills + GitHub opacity reveal).
     user_content: RefCell<Option<Rc<UserContentManager>>>,
 }
 

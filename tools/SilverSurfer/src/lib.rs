@@ -6,11 +6,11 @@
 
 pub mod chrome;
 pub mod files;
-pub mod github_compat;
 pub mod home;
 pub mod look;
 pub mod location;
 pub mod session;
+pub mod spa_compat;
 pub mod wl;
 
 #[cfg(feature = "engine")]
