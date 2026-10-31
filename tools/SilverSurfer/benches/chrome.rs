@@ -207,3 +207,73 @@ fn lunarfile_argv(b: &mut Bencher) {
         test::black_box(args.len())
     });
 }
+
+#[bench]
+fn history_autocomplete(b: &mut Bencher) {
+    use silversurfer::history::History;
+    let mut h = History::default();
+    for i in 0..80 {
+        h.record(&format!("https://example{i}.test/path/page"), &format!("T{i}"));
+    }
+    b.iter(|| {
+        let hit = h.autocomplete(test::black_box("https://example4"));
+        test::black_box(hit.map(|v| v.url.len()).unwrap_or(0))
+    });
+}
+
+#[bench]
+fn context_menu_overlay(b: &mut Bencher) {
+    use silversurfer::menu::{self, Item, Popup};
+    let titles = titles(4);
+    let loading = vec![false; 4];
+    let popup = Popup {
+        x: 40,
+        y: 80,
+        items: vec![
+            Item {
+                label: "Atrás".into(),
+                enabled: true,
+                separator: false,
+            },
+            Item {
+                label: "".into(),
+                enabled: false,
+                separator: true,
+            },
+            Item {
+                label: "Recargar".into(),
+                enabled: true,
+                separator: false,
+            },
+            Item {
+                label: "Abrir enlace en ventana nueva".into(),
+                enabled: true,
+                separator: false,
+            },
+        ],
+    };
+    b.iter(|| {
+        let pixels = menu::render(
+            &View {
+                width: test::black_box(1280),
+                look: Look::Eclipse,
+                titles: test::black_box(&titles),
+                loading: test::black_box(&loading),
+                active: 0,
+                location: "https://example.com",
+                location_focused: false,
+                location_cursor: 0,
+                location_suggest: "",
+                find_mode: false,
+                scheme: SchemeHint::Https,
+                gpu: true,
+                can_back: true,
+                can_forward: false,
+                scale: test::black_box(1),
+            },
+            800,
+            Some(test::black_box(&popup)),
+        );
+        test::black_box(pixels.argb.len())
+    });
+}

@@ -179,6 +179,10 @@ pub struct App {
     page_drove_fs: bool,
     /// Arrastre de pestaña en curso (índice origen).
     drag_tab: Option<usize>,
+    /// Huella del último cromo subido; evita commit Wayland si no cambió.
+    chrome_fp: u64,
+    /// Reloj de arranque para métricas percibidas.
+    started_at: Instant,
 }
 
 impl App {
@@ -250,6 +254,8 @@ impl App {
             fullscreen: false,
             page_drove_fs: false,
             drag_tab: None,
+            chrome_fp: 0,
+            started_at: Instant::now(),
         }
     }
 
@@ -287,6 +293,7 @@ impl App {
         if let Some(session) = &self.session {
             session.shell.resize(pw, ph, self.scale as f32);
         }
+        self.chrome_fp = 0;
         self.need_paint = true;
     }
 
@@ -319,6 +326,7 @@ impl App {
         let next = Look::current();
         if next != self.look {
             self.look = next;
+            self.chrome_fp = 0;
             self.need_paint = true;
         }
     }
@@ -376,10 +384,12 @@ impl App {
         let (pw, ph) = chrome::content_px(self.logical_w, self.logical_h, self.scale);
         let (context, gpu) = self.make_context(pw, ph)?;
         let waker = Waker::new()?;
+        let t0 = self.started_at;
         let session = engine::start(waker.clone(), context, gpu, url, self.scale as f32)?;
         eprintln!(
-            "silversurfer: paint={}",
-            if gpu { "EGL" } else { "software→wl_shm" }
+            "silversurfer: paint={} session_ms={}",
+            if gpu { "EGL" } else { "software→wl_shm" },
+            t0.elapsed().as_millis()
         );
         let extra = std::mem::take(&mut self.pending_tabs);
         let active = self.pending_active;
@@ -412,6 +422,13 @@ impl App {
     ) -> Result<(Rc<dyn RenderingContext>, bool), String> {
         if let Some(context) = self.try_gpu(width, height) {
             return Ok((context, true));
+        }
+        let require_egl = std::env::var_os("SILVERSURFER_REQUIRE_EGL").is_some();
+        if require_egl {
+            return Err(
+                "SILVERSURFER_REQUIRE_EGL: no hay contexto EGL y el software está prohibido"
+                    .into(),
+            );
         }
         eprintln!("silversurfer: sin contexto EGL, la página se pinta en software");
         Ok((engine::software_context(width, height)?, false))
@@ -614,8 +631,29 @@ impl App {
             can_forward,
             scale: self.scale,
         };
+        let fp = chrome_fingerprint(
+            &titles,
+            &loading,
+            active,
+            &location,
+            self.loc_focused,
+            self.loc_cursor,
+            self.find_mode,
+            scheme,
+            gpu,
+            can_back,
+            can_forward,
+            self.scale,
+            self.logical_w,
+            popup.as_ref(),
+        );
+        if fp == self.chrome_fp && popup.is_none() {
+            // Contenido idéntico: no reconstruir ni recommitear el wl_shm del cromo.
+            return Ok(());
+        }
         let pixels = menu::render(&view, self.logical_h, popup.as_ref());
         self.upload_chrome(&pixels.argb, pixels.width, pixels.height)?;
+        self.chrome_fp = fp;
         self.ensure_parent_buffer()?;
         if let Some(page) = &self.page {
             page.set_buffer_scale(self.scale);
@@ -1346,12 +1384,66 @@ impl App {
                 session.shell.resize(pw, ph, self.scale as f32);
             }
         }
+        self.chrome_fp = 0;
         self.need_paint = true;
     }
 }
 
 fn is_modifier(evdev: u32) -> bool {
     matches!(evdev, 29 | 97 | 56 | 100 | 42 | 54)
+}
+
+fn chrome_fingerprint(
+    titles: &[String],
+    loading: &[bool],
+    active: usize,
+    location: &str,
+    loc_focused: bool,
+    loc_cursor: usize,
+    find_mode: bool,
+    scheme: SchemeHint,
+    gpu: bool,
+    can_back: bool,
+    can_forward: bool,
+    scale: i32,
+    width: i32,
+    popup: Option<&menu::Popup>,
+) -> u64 {
+    // FNV-1a 64: suficiente para saltar commits idénticos del cromo.
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    mix(&(width as u32).to_le_bytes());
+    mix(&(scale as u32).to_le_bytes());
+    mix(&(active as u32).to_le_bytes());
+    mix(&[u8::from(loc_focused), u8::from(find_mode), u8::from(gpu)]);
+    mix(&[u8::from(can_back), u8::from(can_forward)]);
+    mix(&(loc_cursor as u32).to_le_bytes());
+    mix(&[match scheme {
+        SchemeHint::Https => 1,
+        SchemeHint::Http => 2,
+        SchemeHint::File => 3,
+        SchemeHint::Other => 0,
+    }]);
+    mix(location.as_bytes());
+    for (t, l) in titles.iter().zip(loading.iter().chain(std::iter::repeat(&false))) {
+        mix(t.as_bytes());
+        mix(&[u8::from(*l)]);
+        mix(&[0xff]);
+    }
+    if let Some(p) = popup {
+        mix(&(p.x as u32).to_le_bytes());
+        mix(&(p.y as u32).to_le_bytes());
+        for item in &p.items {
+            mix(item.label.as_bytes());
+            mix(&[u8::from(item.enabled), u8::from(item.separator)]);
+        }
+    }
+    h
 }
 
 fn insert_chars(text: &mut String, cursor: &mut usize, extra: &str) {
