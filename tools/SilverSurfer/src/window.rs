@@ -518,7 +518,7 @@ impl App {
             window_title
         };
         if let Some(top) = &self.toplevel {
-            top.set_title(&window_title);
+            top.set_title(window_title);
         }
         let pixels = chrome::render(&View {
             width: self.logical_w,

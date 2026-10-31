@@ -62,8 +62,8 @@ fn install_compat_preferences(preferences: &mut Preferences) {
     preferences.dom_entries_api_enabled = true;
     preferences.dom_offscreen_canvas_enabled = true;
     preferences.dom_storage_manager_api_enabled = true;
-    preferences.layout_css_container_queries_enabled = true;
-    preferences.layout_css_backdrop_filter_enabled = true;
+    // layout_css_container_queries_enabled / layout_css_backdrop_filter_enabled
+    // are not on Servo 0.7 Preferences; omit until the crate exposes them.
 
     // Eclipse's panel is dark. A white flash on the first frame reads as a
     // broken window more than as an unloaded page.
