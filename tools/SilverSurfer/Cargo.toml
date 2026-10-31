@@ -1,0 +1,70 @@
+[package]
+name = "silversurfer"
+version = "0.1.0"
+edition = "2021"
+description = "Eclipse OS web browser (Wayland, Servo, GStreamer)"
+license = "MPL-2.0"
+
+# Standalone tool: NOT a workspace member. Userspace, not the kernel target.
+# Built by xtask the same way as lunarbar, but dynamically linked: Servo needs
+# Mesa, and the media feature needs GStreamer.
+[workspace]
+
+[features]
+default = ["engine", "media-gstreamer"]
+# The Servo engine. Without it the crate still builds its chrome, URL and
+# file-dialog logic, which is what the unit tests exercise.
+engine = [
+    "dep:dpi",
+    "dep:euclid",
+    "dep:raw-window-handle",
+    "dep:rustls",
+    "dep:servo",
+    "dep:webrender_api",
+]
+# `<audio>`, `<video>`, WebAudio and HLS, via servo-media-gstreamer.
+# Needs the host package `libgstreamer1.0-dev` (pkg-config name gstreamer-1.0)
+# at build time, and the GStreamer plugins in the image at run time.
+media-gstreamer = ["engine", "servo/media-gstreamer"]
+
+[dependencies]
+libc = "0.2"
+url = "2"
+tiny-skia = { version = "0.11", default-features = false, features = ["std"] }
+embedded-graphics = "0.8"
+# `system` is the libwayland backend: Mesa needs the real `wl_display` and
+# `wl_surface` pointers, which the pure-Rust backend does not expose.
+# `dlopen` loads that library at run time instead of linking it.
+wayland-client = { version = "0.31", features = ["dlopen", "system"] }
+wayland-protocols = { version = "0.32", features = ["client"] }
+xkbcommon = "0.7"
+
+servo = { version = "0.7", optional = true, default-features = false, features = [
+    "bundled",
+    "js_jit",
+    "multiprocess",
+    "webgl",
+    "webgpu",
+] }
+euclid = { version = "0.22", optional = true }
+dpi = { version = "0.1", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+webrender_api = { version = "0.70", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "std"] }
+
+[profile.release]
+opt-level = 3
+# Servo is enormous. Thin LTO here turns the link into an overnight job and
+# buys nothing the compositor can see.
+lto = false
+codegen-units = 16
+debug = 1
+strip = false
+
+# Host-side rows for the chrome and the software blit. They do not need Servo:
+#
+#   cargo bench --manifest-path tools/SilverSurfer/Cargo.toml \
+#       --no-default-features --bench chrome
+[[bench]]
+name = "chrome"
+harness = true
