@@ -131,7 +131,11 @@ Superficie **completa del embutidor** (prefs + polyfills + reveal):
 - Prefs DOM experimentales (IO, Web Animations, FontFace, adoptedStyleSheets,
   IndexedDB, clipboard, viewport, Entries, OffscreenCanvas, CookieStore,
   Credentials, Permissions, module preload, …). Service Workers **off**.
-- Features del crate: `webcrypto`, `brotli-compression-stream`.
+- Features del crate: `brotli-compression-stream`. **Sin `webcrypto`**: en
+  servo-script 0.7 arrastra `aes-gcm ^0.11` (solo RCs en índices anteriores a
+  2026-06, así que la resolución falla) y prereleases fijadas (`rsa`, `x448`,
+  `ed448-goldilocks`). Sin ella no existe el global `crypto` (ni
+  `getRandomValues` ni `subtle`); el polyfill de `randomUUID` se omite.
 - Userscripts: `AbortController`/`AbortSignal` (+ `abort`/`timeout`/`any`),
   idle/microtask/scheduler, `structuredClone`, `randomUUID`, `Object.hasOwn`,
   `replaceAll`/`replaceChildren`, View Transitions no-op, stubs de
