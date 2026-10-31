@@ -36,13 +36,15 @@ SilverSurfer — navegador de Eclipse OS
 
 Uso: silversurfer [URL]
 
-Sin URL abre la página de inicio. Una dirección sin esquema lleva https://.
+Sin URL abre la página de inicio. Una dirección o host navega;
+una búsqueda (palabras) usa DuckDuckGo (SILVERSURFER_SEARCH).
 Ctrl+L barra, Ctrl+T pestaña, Ctrl+W cerrar, Ctrl+O lunarfile,
 Alt+Izquierda / Alt+Derecha historial, F5 recargar."
             );
             return Ok(());
         }
-        let url = location::parse_location(&arg).map_err(|_| format!("dirección no válida: {arg}"))?;
+        let url = location::resolve_omnibox(&arg, &location::search_template())
+            .map_err(|_| format!("dirección no válida: {arg}"))?;
         window::run(url)
     } else {
         window::run(home::home_url())

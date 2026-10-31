@@ -14,9 +14,9 @@ use dpi::PhysicalSize;
 use euclid::Scale;
 use servo::{
     DevicePoint, EmbedderControl, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
-    Location, Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
-    MouseMoveEvent, Opts, Preferences, Servo, ServoBuilder, Theme, WebView, WebViewBuilder,
-    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent,
+    MouseLeftViewportEvent, MouseMoveEvent, Opts, Preferences, Servo, ServoBuilder, Theme,
+    WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use crate::files::{self, PickRequest};
 
@@ -76,6 +76,7 @@ pub struct Tab {
     pub view: WebView,
     pub title: String,
     pub url: String,
+    pub loading: bool,
     pub animating: bool,
 }
 
@@ -131,6 +132,15 @@ impl Delegate {
             .collect()
     }
 
+    pub fn tab_loading(&self) -> Vec<bool> {
+        self.model
+            .borrow()
+            .tabs
+            .iter()
+            .map(|tab| tab.loading)
+            .collect()
+    }
+
     pub fn active_index(&self) -> usize {
         self.model.borrow().active
     }
@@ -142,6 +152,23 @@ impl Delegate {
             .get(model.active)
             .map(|tab| tab.url.clone())
             .unwrap_or_default()
+    }
+
+    /// Título de la ventana xdg: pestaña activa, o marca de carga.
+    pub fn window_title(&self) -> String {
+        let model = self.model.borrow();
+        let Some(tab) = model.tabs.get(model.active) else {
+            return "SilverSurfer".into();
+        };
+        if tab.loading && !tab.title.is_empty() {
+            format!("…{} — SilverSurfer", tab.title)
+        } else if tab.loading {
+            "Cargando — SilverSurfer".into()
+        } else if tab.title.is_empty() {
+            "SilverSurfer".into()
+        } else {
+            format!("{} — SilverSurfer", tab.title)
+        }
     }
 
     pub fn can_go_back(&self) -> bool {
@@ -161,26 +188,38 @@ impl Delegate {
         view.load(url);
         if let Some(tab) = self.model.borrow_mut().tabs.get_mut(index) {
             tab.url = text;
+            tab.loading = true;
         }
         self.flags.chrome.store(true, Ordering::Relaxed);
     }
 
     pub fn go_back(&self) {
         if let Some(view) = self.active_view() {
+            self.mark_active_loading();
             view.go_back(1);
         }
     }
 
     pub fn go_forward(&self) {
         if let Some(view) = self.active_view() {
+            self.mark_active_loading();
             view.go_forward(1);
         }
     }
 
     pub fn reload(&self) {
         if let Some(view) = self.active_view() {
+            self.mark_active_loading();
             view.reload();
         }
+    }
+
+    fn mark_active_loading(&self) {
+        let active = self.active_index();
+        if let Some(tab) = self.model.borrow_mut().tabs.get_mut(active) {
+            tab.loading = true;
+        }
+        self.flags.chrome.store(true, Ordering::Relaxed);
     }
 
     pub fn new_tab(&self, url: url::Url) {
@@ -365,6 +404,7 @@ impl Delegate {
             view,
             title: "Nueva pestaña".into(),
             url,
+            loading: true,
             animating: false,
         });
         model.active = model.tabs.len() - 1;
@@ -409,6 +449,13 @@ impl WebViewDelegate for Delegate {
     fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
         if let Some(mut tab) = self.tab_mut_by_id(&webview) {
             tab.title = title.unwrap_or_else(|| "SilverSurfer".into());
+        }
+        self.flags.chrome.store(true, Ordering::Relaxed);
+    }
+
+    fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
+        if let Some(mut tab) = self.tab_mut_by_id(&webview) {
+            tab.loading = status != LoadStatus::Complete;
         }
         self.flags.chrome.store(true, Ordering::Relaxed);
     }
@@ -513,6 +560,7 @@ pub fn start(
         view,
         title: "Nueva pestaña".into(),
         url: url.to_string(),
+        loading: true,
         animating: false,
     });
     shell.flags.chrome.store(true, Ordering::Relaxed);

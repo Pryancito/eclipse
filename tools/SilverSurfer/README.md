@@ -70,8 +70,13 @@ silversurfer /ruta/pagina.html
 |---|---|
 | Alt+Izquierda / Alt+Derecha | Atrás / adelante |
 | F5 o Ctrl+R | Recargar |
-| Ctrl+L | Barra de dirección |
+| Ctrl+L | Barra de dirección (omnibox: URL o búsqueda) |
 | Ctrl+T / Ctrl+W | Pestaña nueva / cerrar |
 | Ctrl+O | `lunarfile --pick` y abre el fichero |
+
+La barra busca con DuckDuckGo si el texto no parece una dirección
+(`SILVERSURFER_SEARCH` cambia la plantilla; usa `{query}` o `{}`).
+El título de la ventana sigue la pestaña activa; mientras carga, el tab
+muestra `…` y la barra un distintivo de esquema (`s` https, `!` http, `/` file).
 
 `<input type=file>` también abre `lunarfile`. Escape en el selector cancela.

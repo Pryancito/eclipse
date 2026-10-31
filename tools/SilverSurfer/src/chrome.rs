@@ -9,6 +9,7 @@ use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::Text;
 use tiny_skia::{Color, Paint, Pixmap, Rect, Transform};
 
+use crate::location::SchemeHint;
 use crate::look::{Look, Rgb};
 
 pub const TAB_H: i32 = 28;
@@ -18,6 +19,7 @@ pub const HEIGHT: i32 = TAB_H + TOOL_H;
 const PAD: i32 = 8;
 const BTN: i32 = 24;
 const GAP: i32 = 4;
+const SCHEME_W: i32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RectI {
@@ -52,6 +54,7 @@ pub struct Layout {
     pub back: RectI,
     pub forward: RectI,
     pub reload: RectI,
+    pub scheme: RectI,
     pub location: RectI,
 }
 
@@ -118,7 +121,14 @@ pub fn layout(width: i32, tabs: usize) -> Layout {
         w: BTN,
         h: BTN,
     };
-    let loc_x = reload.x + BTN + GAP * 2;
+    let scheme_x = reload.x + BTN + GAP * 2;
+    let scheme = RectI {
+        x: scheme_x,
+        y: y_tool,
+        w: SCHEME_W,
+        h: BTN,
+    };
+    let loc_x = scheme.x + scheme.w + GAP;
     Layout {
         tabs: tab_rects,
         closes,
@@ -126,6 +136,7 @@ pub fn layout(width: i32, tabs: usize) -> Layout {
         back,
         forward,
         reload,
+        scheme,
         location: RectI {
             x: loc_x,
             y: y_tool,
@@ -162,7 +173,7 @@ pub fn hit(width: i32, tabs: usize, x: i32, y: i32) -> Option<Hit> {
     if lay.reload.contains(x, y) {
         return Some(Hit::Reload);
     }
-    if lay.location.contains(x, y) {
+    if lay.scheme.contains(x, y) || lay.location.contains(x, y) {
         return Some(Hit::Location);
     }
     None
@@ -172,11 +183,14 @@ pub struct View<'a> {
     pub width: i32,
     pub look: Look,
     pub titles: &'a [String],
+    /// Parallel to `titles`: the tab is mid-load.
+    pub loading: &'a [bool],
     pub active: usize,
     pub location: &'a str,
     pub location_focused: bool,
     /// Caret, in characters, used only while the bar is focused.
     pub location_cursor: usize,
+    pub scheme: SchemeHint,
     pub can_back: bool,
     pub can_forward: bool,
     /// Output scale. The buffer is `width * scale` by `HEIGHT * scale`.
@@ -241,9 +255,22 @@ fn render_logical(view: &View<'_>) -> Vec<u8> {
     fill(&mut pixmap, lay.back, pal.field);
     fill(&mut pixmap, lay.forward, pal.field);
     fill(&mut pixmap, lay.reload, pal.field);
+    fill(&mut pixmap, lay.scheme, pal.field);
     fill(&mut pixmap, lay.location, pal.field);
     if view.location_focused {
         stroke(&mut pixmap, lay.location, pal.accent);
+    }
+    if view.scheme == SchemeHint::Https {
+        fill(
+            &mut pixmap,
+            RectI {
+                x: lay.scheme.x,
+                y: lay.scheme.y + lay.scheme.h - 2,
+                w: lay.scheme.w,
+                h: 2,
+            },
+            pal.accent,
+        );
     }
 
     let mut argb = Vec::with_capacity(pixmap.data().len());
@@ -257,9 +284,15 @@ fn render_logical(view: &View<'_>) -> Vec<u8> {
     let text = pal.text;
     let dim = pal.dim;
     for (i, rect) in lay.tabs.iter().enumerate() {
-        let title = titles.get(i).map(String::as_str).unwrap_or("Nueva pestaña");
+        let raw = titles.get(i).map(String::as_str).unwrap_or("Nueva pestaña");
+        let loading = view.loading.get(i).copied().unwrap_or(false);
+        let title = if loading {
+            format!("…{raw}")
+        } else {
+            raw.to_string()
+        };
         let room = ((rect.w - 20) / 6).max(1) as usize;
-        label(&mut target, rect.x + 6, rect.y + 14, &clip(title, room), text);
+        label(&mut target, rect.x + 6, rect.y + 14, &clip(&title, room), text);
         if rect.w >= 20 {
             label(&mut target, rect.x + rect.w - 12, rect.y + 14, "x", dim);
         }
@@ -280,6 +313,18 @@ fn render_logical(view: &View<'_>) -> Vec<u8> {
         if view.can_forward { text } else { dim },
     );
     label(&mut target, lay.reload.x + 8, lay.reload.y + 16, "R", text);
+    let scheme_color = if view.scheme == SchemeHint::Https {
+        pal.accent
+    } else {
+        dim
+    };
+    label(
+        &mut target,
+        lay.scheme.x + 5,
+        lay.scheme.y + 16,
+        view.scheme.badge(),
+        scheme_color,
+    );
     let loc = if view.location.is_empty() {
         "Buscar o escribir una dirección"
     } else {
@@ -536,14 +581,17 @@ mod tests {
     #[test]
     fn a_frame_is_opaque_and_scaled() {
         let title = "Servo".to_string();
+        let loading = [true];
         let pixels = render(&View {
             width: 640,
             look: Look::Eclipse,
             titles: std::slice::from_ref(&title),
+            loading: &loading,
             active: 0,
             location: "https://example.com",
             location_focused: true,
             location_cursor: 0,
+            scheme: SchemeHint::Https,
             can_back: false,
             can_forward: true,
             scale: 2,
@@ -625,14 +673,17 @@ mod tests {
     fn every_look_paints_an_opaque_strip() {
         for look in [Look::Eclipse, Look::Kde, Look::Win11] {
             let title = "pestaña".to_string();
+            let loading = [false];
             let pixels = render(&View {
                 width: 320,
                 look,
                 titles: std::slice::from_ref(&title),
+                loading: &loading,
                 active: 0,
                 location: "",
                 location_focused: false,
                 location_cursor: 0,
+                scheme: SchemeHint::Other,
                 can_back: true,
                 can_forward: false,
                 scale: 1,
@@ -641,5 +692,13 @@ mod tests {
             assert_eq!(pixels.height, HEIGHT);
             assert!(pixels.argb.chunks_exact(4).all(|px| px[3] == 255));
         }
+    }
+
+    #[test]
+    fn the_scheme_badge_sits_before_the_location_field() {
+        let lay = layout(800, 1);
+        assert!(lay.scheme.x < lay.location.x);
+        assert!(lay.scheme.x > lay.reload.x);
+        assert_eq!(lay.scheme.w, SCHEME_W);
     }
 }

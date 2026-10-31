@@ -26,7 +26,7 @@ extern crate test;
 
 use silversurfer::chrome::{self, Hit, View};
 use silversurfer::files::{arguments, PickRequest};
-use silversurfer::location::parse_location;
+use silversurfer::location::{parse_location, resolve_omnibox, SchemeHint, DEFAULT_SEARCH_TEMPLATE};
 use silversurfer::look::Look;
 use std::path::Path;
 use test::Bencher;
@@ -36,14 +36,17 @@ fn titles(n: usize) -> Vec<String> {
 }
 
 fn paint(width: i32, scale: i32, titles: &[String]) -> chrome::Pixels {
+    let loading = vec![false; titles.len().max(1)];
     chrome::render(&View {
         width,
         look: Look::Eclipse,
         titles,
+        loading: &loading,
         active: 0,
         location: "https://example.com/documentacion",
         location_focused: false,
         location_cursor: 0,
+        scheme: SchemeHint::Https,
         can_back: true,
         can_forward: false,
         scale,
@@ -153,6 +156,28 @@ fn parse_typed_locations(b: &mut Bencher) {
         let mut n = 0;
         for sample in samples {
             n += parse_location(test::black_box(sample)).unwrap().as_str().len();
+        }
+        test::black_box(n)
+    });
+}
+
+#[bench]
+fn resolve_omnibox_mix(b: &mut Bencher) {
+    let samples = [
+        "servo.org",
+        "hola mundo",
+        "firefox",
+        "https://example.com",
+        "/tmp/x.html",
+    ];
+    let tpl = DEFAULT_SEARCH_TEMPLATE;
+    b.iter(|| {
+        let mut n = 0;
+        for sample in samples {
+            n += resolve_omnibox(test::black_box(sample), test::black_box(tpl))
+                .unwrap()
+                .as_str()
+                .len();
         }
         test::black_box(n)
     });
