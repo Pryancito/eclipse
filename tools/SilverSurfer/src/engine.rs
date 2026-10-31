@@ -18,7 +18,9 @@ use servo::{
     MouseLeftViewportEvent, MouseMoveEvent, Opts, Preferences, Servo, ServoBuilder, Theme,
     WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
+use crate::about;
 use crate::files::{self, PickRequest};
+use crate::history;
 use crate::session::{SavedTab, Snapshot};
 
 const USER_AGENT: &str = "SilverSurfer/0.1 (Eclipse OS; Wayland) Servo/0.7";
@@ -185,6 +187,7 @@ impl Delegate {
         let Some(view) = self.active_view() else {
             return;
         };
+        let url = about::expand(url);
         let text = url.to_string();
         view.load(url);
         if let Some(tab) = self.model.borrow_mut().tabs.get_mut(index) {
@@ -192,6 +195,45 @@ impl Delegate {
             tab.loading = true;
         }
         self.flags.chrome.store(true, Ordering::Relaxed);
+    }
+
+    pub fn page_zoom(&self) -> f32 {
+        self.active_view()
+            .map(|view| view.page_zoom())
+            .unwrap_or(1.0)
+    }
+
+    pub fn set_page_zoom(&self, zoom: f32) {
+        if let Some(view) = self.active_view() {
+            view.set_page_zoom(zoom.clamp(0.25, 5.0));
+            self.flags.frame.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn zoom_by(&self, factor: f32) {
+        let next = (self.page_zoom() * factor).clamp(0.25, 5.0);
+        self.set_page_zoom(next);
+    }
+
+    pub fn zoom_reset(&self) {
+        self.set_page_zoom(1.0);
+    }
+
+    /// Busca en la página vía `window.find` (mejor esfuerzo; Servo 0.7
+    /// no expone Find-in-Page en el embedder).
+    pub fn find_in_page(&self, query: &str) {
+        let Some(view) = self.active_view() else {
+            return;
+        };
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r");
+        let script = format!(
+            "(function(){{try{{return window.find('{escaped}',false,false,true,false,false,false);}}catch(e){{return false;}}}})()"
+        );
+        view.evaluate_javascript(script, |_| {});
     }
 
     pub fn go_back(&self) {
@@ -224,9 +266,19 @@ impl Delegate {
     }
 
     pub fn new_tab(&self, url: url::Url) {
+        let url = about::expand(url);
         let text = url.to_string();
         let view = self.make_view(Some(url));
         self.add_tab(view, text);
+    }
+
+    pub fn active_title(&self) -> String {
+        let model = self.model.borrow();
+        model
+            .tabs
+            .get(model.active)
+            .map(|tab| tab.title.clone())
+            .unwrap_or_default()
     }
 
     /// Close `index`. `false` means it was the last tab and the window should
@@ -432,6 +484,7 @@ impl Delegate {
     }
 
     fn make_view(&self, url: Option<url::Url>) -> WebView {
+        let url = url.map(about::expand);
         let mut builder = WebViewBuilder::new(&self.servo_handle(), self.context.clone())
             .delegate(self.this())
             .hidpi_scale_factor(Scale::new(self.scale.get()));
@@ -511,8 +564,23 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
-        if let Some(mut tab) = self.tab_mut_by_id(&webview) {
+        let visit = {
+            let mut tab = match self.tab_mut_by_id(&webview) {
+                Some(tab) => tab,
+                None => {
+                    self.flags.chrome.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
             tab.loading = status != LoadStatus::Complete;
+            if status == LoadStatus::Complete {
+                Some((tab.url.clone(), tab.title.clone()))
+            } else {
+                None
+            }
+        };
+        if let Some((url, title)) = visit {
+            history::record(&url, &title);
         }
         self.flags.chrome.store(true, Ordering::Relaxed);
     }
@@ -605,6 +673,7 @@ pub fn start(
 
     // The first tab is built with the handle we still hold. Later tabs clone
     // the copy stored on the delegate.
+    let url = about::expand(url);
     let view = WebViewBuilder::new(&servo, context.clone())
         .delegate(shell.clone())
         .url(url.clone())

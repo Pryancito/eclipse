@@ -105,7 +105,7 @@ pub fn save(snap: &Snapshot) -> Result<(), String> {
     save_to(&session_path(), snap)
 }
 
-fn json_string(s: &str) -> String {
+pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::from('"');
     for ch in s.chars() {
         match ch {
@@ -133,7 +133,7 @@ fn find_number(text: &str, key: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
-fn find_string(text: &str, key: &str) -> Option<String> {
+pub(crate) fn find_string(text: &str, key: &str) -> Option<String> {
     let i = text.find(key)?;
     let after = text[i + key.len()..].trim_start();
     let after = after.strip_prefix(':')?.trim_start();

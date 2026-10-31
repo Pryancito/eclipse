@@ -4,8 +4,11 @@
 //! engine and the Wayland window are behind the `engine` feature, so the unit
 //! tests and the benchmarks run without compiling the engine.
 
+pub mod about;
+pub mod bookmarks;
 pub mod chrome;
 pub mod files;
+pub mod history;
 pub mod home;
 pub mod look;
 pub mod location;
@@ -43,7 +46,9 @@ Sin URL restaura la sesión anterior (o la página de inicio).
 --fresh ignora la sesión y abre una pestaña nueva.
 Una dirección o host navega; palabras buscan (SILVERSURFER_SEARCH).
 Ctrl+L barra, Ctrl+T/W pestaña, Ctrl+Tab cambiar, Ctrl+O lunarfile,
-Alt+Izquierda / Alt+Derecha historial, F5 recargar."
+Ctrl+/-/0 zoom, Ctrl+D marcador, Ctrl+F buscar en página,
+Alt+Izquierda / Alt+Derecha historial, F5 recargar.
+about:history y about:bookmarks abren listas locales."
             );
             return Ok(());
         }

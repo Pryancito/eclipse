@@ -82,13 +82,21 @@ Sin URL restaura las pestañas de
 | Ctrl+Tab / Ctrl+Shift+Tab | Pestaña siguiente / anterior |
 | Ctrl+1 … Ctrl+8 | Ir a la pestaña N |
 | Ctrl+O | `lunarfile --pick` y abre el fichero |
+| Ctrl++ / Ctrl+- / Ctrl+0 | Zoom página / restablecer |
+| Ctrl+F | Buscar en la página (`window.find`) |
+| Ctrl+D | Añadir o quitar marcador |
+| Ctrl+H / Ctrl+B | Historial / marcadores |
+| Tab (en la barra) | Aceptar sugerencia del historial |
 
 La barra busca con DuckDuckGo si el texto no parece una dirección
 (`SILVERSURFER_SEARCH` cambia la plantilla; usa `{query}` o `{}`).
-El título de la ventana sigue la pestaña activa; mientras carga, el tab
-muestra `…` y la barra un distintivo de esquema (`s` https, `!` http, `/` file).
-El cromo se pinta a la escala del output (HiDPI nativo), con iconos
-vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.
+Las visitas se guardan en
+`$XDG_DATA_HOME/silversurfer/history.json` y los marcadores en
+`bookmarks.json`. `about:history` y `about:bookmarks` abren listas
+locales. El título de la ventana sigue la pestaña activa; mientras carga,
+el tab muestra `…` y la barra un distintivo de esquema (`s` https, `!`
+http, `/` file). El cromo se pinta a la escala del output (HiDPI nativo),
+con iconos vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.
 El distintivo `GL` / `SW` indica si la página va por EGL o por blit
 software; la home lista smokes locales (canvas, WebGL, WebGPU, WebAudio)
 y remotas (MP4/HLS).
