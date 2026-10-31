@@ -94,4 +94,16 @@ software. La home es un lienzo en blanco con el logo de Eclipse OS
 (paleta de `/etc/eclipse/look`). Los smokes de canvas / WebGL / WebGPU /
 WebAudio / MP4 / HLS viven en `smoke.html` (`smoke_url()`).
 
+## Medios y límites
+
+Con `media-gstreamer`, `<audio>` / `<video>` y listas HLS simples (`*.m3u8`
+con segmentos MPEG-TS) las reproduce GStreamer (`GstHLSDemux2`). El smoke HLS
+usa una lista media de Apple (bipbop) y solo la carga al pulsar «Probar HLS»,
+para no disparar `Player error` / `Invalid playlist` al abrir la página.
+
+No esperes YouTube ni DASH/MSE adaptativo por este camino: el reproductor de
+YouTube no alimenta un `<video src="…m3u8">` a GStreamer. Si una página pide
+HLS nativo con un master raro o cifrado, el demuxer puede fallar; el smoke lo
+marca en rojo en lugar de reintentar en bucle.
+
 `<input type=file>` también abre `lunarfile`. Escape en el selector cancela.

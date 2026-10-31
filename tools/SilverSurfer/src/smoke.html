@@ -104,11 +104,23 @@
 
   <section>
     <h2>Streaming HLS (red)</h2>
-    <p>Lista <code>m3u8</code>. Servo la anuncia si GStreamer tiene el demuxer <code>application/x-hls</code>.</p>
-    <video id="hls" controls src="https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"></video>
+    <p>
+      Lista media <code>m3u8</code> (Apple bipbop, un bitrate). GStreamer
+      (<code>GstHLSDemux2</code>) la reproduce si el plugin HLS está en la imagen.
+      No se carga sola: así un fallo de red o de demux no llena el log de ERROR al abrir la página.
+      YouTube y el streaming adaptativo con MSE/DASH no pasan por este demuxer.
+    </p>
+    <p id="hls-status">Pulsa «Probar HLS» para cargar la lista.</p>
+    <button id="hls-load" type="button">Probar HLS</button>
+    <video id="hls" controls preload="none"></video>
   </section>
 </main>
 <script>
+  // Media playlist (single bitrate TS), not a multi-variant master. Masters
+  // often trip GstHLSDemux2 with "Invalid playlist" even when ffmpeg likes them.
+  const HLS_MEDIA =
+    "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_4x3/gear1/prog_index.m3u8";
+
   const results = {};
   function mark(key, ok, detail) {
     results[key] = { ok, detail };
@@ -211,7 +223,35 @@
   }
   watchMedia(document.getElementById("vid"), "video-mp4");
   watchMedia(document.getElementById("aud"), "audio-mp3");
-  watchMedia(document.getElementById("hls"), "video-hls");
+
+  const hls = document.getElementById("hls");
+  const hlsStatus = document.getElementById("hls-status");
+  mark("video-hls", true, "sin cargar (espera «Probar HLS»)");
+  hls.addEventListener("loadeddata", () => {
+    hlsStatus.textContent = "HLS: segmentos listos.";
+    mark("video-hls", true, "loadeddata");
+  });
+  hls.addEventListener("error", () => {
+    const code = hls.error && hls.error.code;
+    hlsStatus.textContent =
+      "HLS no reproducible aquí (¿red, plugin HLS o lista incompatible con GstHLSDemux2?). Código media: " +
+      (code != null ? code : "?");
+    mark("video-hls", false, "error de carga / demux");
+    // Avoid leaving a broken src that GStreamer keeps retrying.
+    try { hls.removeAttribute("src"); hls.load(); } catch (_) {}
+  });
+  document.getElementById("hls-load").addEventListener("click", () => {
+    hlsStatus.textContent = "Cargando " + HLS_MEDIA + " …";
+    mark("video-hls", true, "cargando…");
+    hls.src = HLS_MEDIA;
+    hls.load();
+    const play = hls.play();
+    if (play && typeof play.catch === "function") {
+      play.catch(() => {
+        /* autoplay may be blocked; loadeddata/error still update the smoke row */
+      });
+    }
+  });
 </script>
 </body>
 </html>

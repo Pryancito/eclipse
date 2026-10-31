@@ -80,6 +80,11 @@ mod tests {
         assert!(SMOKE_HTML.contains("gpu"));
         assert!(SMOKE_HTML.contains("AudioContext") || SMOKE_HTML.contains("webkitAudioContext"));
         assert!(SMOKE_HTML.contains("Smokes locales"));
+        // HLS is opt-in so opening smoke.html does not spam GstHLSDemux2 errors.
+        assert!(SMOKE_HTML.contains("preload=\"none\""));
+        assert!(SMOKE_HTML.contains("Probar HLS"));
+        assert!(SMOKE_HTML.contains("bipbop_4x3/gear1/prog_index.m3u8"));
+        assert!(!SMOKE_HTML.contains("test-streams.mux.dev"));
         let url = smoke_url();
         assert_eq!(url.scheme(), "file");
         assert!(url.path().ends_with("silversurfer-smoke.html"));
@@ -87,5 +92,6 @@ mod tests {
         assert!(body.contains("<video"));
         assert!(body.contains(".m3u8"));
         assert!(body.contains("webaudio") || body.contains("AudioContext"));
+        assert!(body.contains("Probar HLS"));
     }
 }
