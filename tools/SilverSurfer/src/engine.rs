@@ -16,9 +16,11 @@ use servo::{
     DevicePoint, EmbedderControl, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
     LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent,
     MouseLeftViewportEvent, MouseMoveEvent, Opts, Preferences, Servo, ServoBuilder, Theme,
-    WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    UserContentManager, UserScript, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
+    WheelDelta, WheelEvent, WheelMode,
 };
 use crate::files::{self, PickRequest};
+use crate::github_compat::{self, GITHUB_REVEAL_USERSCRIPT};
 use crate::session::{SavedTab, Snapshot};
 
 /// Default HTTP / `navigator.userAgent` string.
@@ -36,6 +38,41 @@ fn user_agent() -> String {
                 .into()
         }
     }
+}
+
+fn install_compat_preferences(preferences: &mut Preferences) {
+    preferences.user_agent = user_agent();
+    preferences.dom_webgpu_enabled = true;
+    preferences.dom_webgl2_enabled = true;
+    preferences.dom_webrtc_enabled = true;
+    // GitHub (and other SPAs) touch these behind Servo experimental flags.
+    // Enabling them is cheap; incomplete implementations still fail soft.
+    preferences.dom_intersection_observer_enabled = true;
+    preferences.dom_web_animations_enabled = true;
+    preferences.dom_fontface_enabled = true;
+    preferences.dom_adoptedstylesheet_enabled = true;
+    // Eclipse's panel is dark. A white flash on the first frame reads as a
+    // broken window more than as an unloaded page.
+    preferences.shell_background_color_rgba = [0.043, 0.071, 0.125, 1.0];
+}
+
+fn build_user_content(servo: &Servo) -> Rc<UserContentManager> {
+    let manager = Rc::new(UserContentManager::new(servo));
+    manager.add_script(Rc::new(UserScript::from(GITHUB_REVEAL_USERSCRIPT)));
+    manager
+}
+
+fn reveal_github_if_needed(webview: &WebView) {
+    let Some(url) = webview.url() else {
+        return;
+    };
+    let Some(host) = url.host_str() else {
+        return;
+    };
+    if !github_compat::is_github_host(host) {
+        return;
+    }
+    webview.evaluate_javascript(GITHUB_REVEAL_USERSCRIPT, |_| {});
 }
 
 #[derive(Clone)]
@@ -110,6 +147,8 @@ pub struct Delegate {
     context: Rc<dyn servo::RenderingContext>,
     flags: Rc<Flags>,
     scale: Cell<f32>,
+    /// Shared userscripts/styles (GitHub opacity reveal, etc.).
+    user_content: RefCell<Option<Rc<UserContentManager>>>,
 }
 
 pub struct Session {
@@ -474,6 +513,9 @@ impl Delegate {
         let mut builder = WebViewBuilder::new(&self.servo_handle(), self.context.clone())
             .delegate(self.this())
             .hidpi_scale_factor(Scale::new(self.scale.get()));
+        if let Some(manager) = self.user_content.borrow().clone() {
+            builder = builder.user_content_manager(manager);
+        }
         if let Some(url) = url {
             builder = builder.url(url);
         }
@@ -553,6 +595,12 @@ impl WebViewDelegate for Delegate {
         if let Some(mut tab) = self.tab_mut_by_id(&webview) {
             tab.loading = status != LoadStatus::Complete;
         }
+        if status == LoadStatus::Complete {
+            // Belt-and-suspenders: userscripts run at document start, but if
+            // React re-hydrates the hero back to opacity:0 after a failed GSAP
+            // path, re-run the reveal once the load settles.
+            reveal_github_if_needed(&webview);
+        }
         self.flags.chrome.store(true, Ordering::Relaxed);
     }
 
@@ -561,11 +609,14 @@ impl WebViewDelegate for Delegate {
         _parent: WebView,
         request: servo::CreateNewWebViewRequest,
     ) {
-        let view = request
+        let mut builder = request
             .builder(self.context.clone())
             .delegate(self.this())
-            .hidpi_scale_factor(Scale::new(self.scale.get()))
-            .build();
+            .hidpi_scale_factor(Scale::new(self.scale.get()));
+        if let Some(manager) = self.user_content.borrow().clone() {
+            builder = builder.user_content_manager(manager);
+        }
+        let view = builder.build();
         view.notify_theme_change(Theme::Dark);
         self.add_tab(view, "about:blank".into());
     }
@@ -612,13 +663,7 @@ pub fn start(
     let mut opts = Opts::default();
     opts.multiprocess = true;
     let mut preferences = Preferences::default();
-    preferences.user_agent = user_agent();
-    preferences.dom_webgpu_enabled = true;
-    preferences.dom_webgl2_enabled = true;
-    preferences.dom_webrtc_enabled = true;
-    // Eclipse's panel is dark. A white flash on the first frame reads as a
-    // broken window more than as an unloaded page.
-    preferences.shell_background_color_rgba = [0.043, 0.071, 0.125, 1.0];
+    install_compat_preferences(&mut preferences);
 
     let flags = Rc::new(Flags::default());
     let context_for_shell = context.clone();
@@ -632,6 +677,7 @@ pub fn start(
         context: context_for_shell,
         flags: flags.clone(),
         scale: Cell::new(scale.max(1.0)),
+        user_content: RefCell::new(None),
     });
 
     let servo = ServoBuilder::default()
@@ -641,11 +687,14 @@ pub fn start(
         .build();
     servo.setup_logging();
     *shell.servo.borrow_mut() = Some(servo.clone());
+    let user_content = build_user_content(&servo);
+    *shell.user_content.borrow_mut() = Some(user_content.clone());
 
     // The first tab is built with the handle we still hold. Later tabs clone
     // the copy stored on the delegate.
     let view = WebViewBuilder::new(&servo, context.clone())
         .delegate(shell.clone())
+        .user_content_manager(user_content)
         .url(url.clone())
         .hidpi_scale_factor(Scale::new(scale.max(1.0)))
         .build();

@@ -6,6 +6,7 @@
 
 pub mod chrome;
 pub mod files;
+pub mod github_compat;
 pub mod home;
 pub mod look;
 pub mod location;
