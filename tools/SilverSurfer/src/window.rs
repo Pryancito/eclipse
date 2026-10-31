@@ -38,9 +38,11 @@ use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use xkbcommon::xkb::{self, Keymap, State as XkbState};
 
+use crate::bookmarks;
 use crate::chrome::{self, Hit, View};
 use crate::engine::{self, Session, Waker};
 use crate::files::{self, PickRequest};
+use crate::history;
 use crate::home;
 use crate::location::{resolve_omnibox, search_template, SchemeHint};
 use crate::look::Look;
@@ -144,6 +146,8 @@ pub struct App {
     loc_focused: bool,
     loc_text: String,
     loc_cursor: usize,
+    /// Ctrl+F: la barra busca en la página en vez de navegar.
+    find_mode: bool,
     /// Linux button code held over the page. Release sends button-up, so a
     /// drag can select text instead of clicking on the press.
     page_button: Option<u32>,
@@ -214,6 +218,7 @@ impl App {
             loc_focused: false,
             loc_text: String::new(),
             loc_cursor: 0,
+            find_mode: false,
             page_button: None,
             on_page: false,
             swallowed: None,
@@ -501,6 +506,14 @@ impl App {
             top.set_title(window_title);
         }
         let gpu = self.session.as_ref().is_some_and(|s| s.gpu);
+        let suggest = if self.loc_focused && !self.find_mode {
+            history::load()
+                .autocomplete(&location)
+                .map(|v| v.url.chars().skip(location.chars().count()).collect())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let pixels = chrome::render(&View {
             width: self.logical_w,
             look: self.look,
@@ -510,6 +523,8 @@ impl App {
             location: &location,
             location_focused: self.loc_focused,
             location_cursor: self.loc_cursor,
+            location_suggest: &suggest,
+            find_mode: self.find_mode,
             scheme,
             gpu,
             can_back,
@@ -815,6 +830,7 @@ impl App {
             return true;
         }
         if self.ctrl && evdev == 38 {
+            self.find_mode = false;
             self.loc_focused = true;
             if let Some(session) = &self.session {
                 session.shell.set_page_focused(false);
@@ -876,14 +892,82 @@ impl App {
             }
             return true;
         }
+        // Ctrl++ / Ctrl+= / KP+ — zoom in.
+        if self.ctrl && (evdev == 13 || evdev == 78) {
+            if let Some(session) = &self.session {
+                session.shell.zoom_by(1.1);
+            }
+            return true;
+        }
+        // Ctrl+- / KP- — zoom out.
+        if self.ctrl && (evdev == 12 || evdev == 74) {
+            if let Some(session) = &self.session {
+                session.shell.zoom_by(1.0 / 1.1);
+            }
+            return true;
+        }
+        // Ctrl+0 — zoom reset.
+        if self.ctrl && evdev == 11 {
+            if let Some(session) = &self.session {
+                session.shell.zoom_reset();
+            }
+            return true;
+        }
+        // Ctrl+D — toggle bookmark for the active tab.
+        if self.ctrl && evdev == 32 {
+            if let Some(session) = &self.session {
+                let url = session.shell.location_text();
+                let title = session.shell.active_title();
+                let marked = bookmarks::toggle(&url, &title);
+                eprintln!(
+                    "silversurfer: marcador {} — {}",
+                    if marked { "añadido" } else { "quitado" },
+                    url
+                );
+            }
+            return true;
+        }
+        // Ctrl+F — find in page (barra como campo de búsqueda).
+        if self.ctrl && evdev == 33 {
+            self.find_mode = true;
+            self.loc_focused = true;
+            self.loc_text.clear();
+            self.loc_cursor = 0;
+            if let Some(session) = &self.session {
+                session.shell.set_page_focused(false);
+            }
+            self.need_paint = true;
+            return true;
+        }
+        // Ctrl+H — about:history.
+        if self.ctrl && evdev == 35 {
+            self.leave_location();
+            if let Some(session) = &self.session {
+                if let Ok(url) = url::Url::parse("about:history") {
+                    session.shell.load(url);
+                }
+            }
+            return true;
+        }
+        // Ctrl+B — about:bookmarks.
+        if self.ctrl && evdev == 48 {
+            self.leave_location();
+            if let Some(session) = &self.session {
+                if let Ok(url) = url::Url::parse("about:bookmarks") {
+                    session.shell.load(url);
+                }
+            }
+            return true;
+        }
         false
     }
 
     fn leave_location(&mut self) {
-        if !self.loc_focused {
+        if !self.loc_focused && !self.find_mode {
             return;
         }
         self.loc_focused = false;
+        self.find_mode = false;
         if let Some(session) = &self.session {
             session.shell.set_page_focused(true);
         }
@@ -912,20 +996,27 @@ impl App {
     fn edit_location(&mut self, evdev: u32) {
         match evdev {
             1 => {
-                self.loc_focused = false;
-                if let Some(session) = &self.session {
-                    session.shell.set_page_focused(true);
+                self.leave_location();
+            }
+            15 if !self.find_mode => {
+                // Tab — aceptar autocompletado del historial.
+                if let Some(visit) = history::load().autocomplete(&self.loc_text) {
+                    self.loc_text = visit.url.clone();
+                    self.loc_cursor = self.loc_text.chars().count();
                 }
             }
             28 | 96 => {
-                if let Ok(url) = resolve_omnibox(&self.loc_text, &search_template()) {
+                if self.find_mode {
+                    if let Some(session) = &self.session {
+                        session.shell.find_in_page(&self.loc_text);
+                    }
+                } else if let Ok(url) = resolve_omnibox(&self.loc_text, &search_template()) {
                     if let Some(session) = &self.session {
                         session.shell.load(url);
                     }
-                }
-                self.loc_focused = false;
-                if let Some(session) = &self.session {
-                    session.shell.set_page_focused(true);
+                    self.leave_location();
+                } else {
+                    self.leave_location();
                 }
             }
             14 => {

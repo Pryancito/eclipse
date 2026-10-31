@@ -1,0 +1,47 @@
+//! Expande `about:*` a ficheros locales que Servo sí puede cargar.
+
+use url::Url;
+
+use crate::{bookmarks, history, home};
+
+/// Resuelve páginas internas. Lo demás se deja igual.
+pub fn expand(url: Url) -> Url {
+    if url.scheme() != "about" {
+        return url;
+    }
+    match url.path().to_ascii_lowercase().as_str() {
+        "blank" => url,
+        "" | "home" | "newtab" | "start" => home::home_url(),
+        "history" => history::page_url(),
+        "bookmarks" | "favorites" => bookmarks::page_url(),
+        _ => url,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_stays_about() {
+        let url = expand(Url::parse("about:blank").unwrap());
+        assert_eq!(url.as_str(), "about:blank");
+    }
+
+    #[test]
+    fn history_and_bookmarks_become_files() {
+        let h = expand(Url::parse("about:history").unwrap());
+        assert_eq!(h.scheme(), "file");
+        assert!(h.path().ends_with("silversurfer-history.html"));
+        let b = expand(Url::parse("about:bookmarks").unwrap());
+        assert_eq!(b.scheme(), "file");
+        assert!(b.path().ends_with("silversurfer-bookmarks.html"));
+    }
+
+    #[test]
+    fn home_aliases() {
+        let url = expand(Url::parse("about:home").unwrap());
+        assert_eq!(url.scheme(), "file");
+        assert!(url.path().ends_with("silversurfer-home.html"));
+    }
+}
