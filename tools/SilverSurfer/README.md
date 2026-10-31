@@ -102,6 +102,22 @@ La home es un lienzo en blanco con el logo de Eclipse OS
 (paleta de `/etc/eclipse/look`). Los smokes de canvas / WebGL / WebGPU /
 WebAudio / MP4 / HLS viven en `smoke.html` (`smoke_url()`).
 
+## React / SPAs (Servo 0.7)
+
+El embutidor activa prefs experimentales que los bundles React tocan
+(`IntersectionObserver`, Web Animations, `FontFace`, `adoptedStyleSheets`,
+IndexedDB, visual viewport, container queries, …) e inyecta userscripts
+mínimos: polyfill de `AbortController` / `requestIdleCallback` /
+`queueMicrotask` si faltan, y un reveal de `opacity:1` gated a
+`github.com` (el landing SSR deja el hero en `opacity:0` hasta GSAP).
+
+Esto acerca sitios como la homepage de GitHub a “usable a primera vista”.
+**No** iguala Firefox: Custom Elements / Shadow DOM robustos, Service
+Workers, streams modernos y la hidratación React completa siguen siendo
+techo del motor. Service Workers se dejan apagados a propósito (un SW
+a medias rompe más que su ausencia). Crate `servo` 0.7 es lo último en
+crates.io; un bump no está disponible aún.
+
 ## Medios y límites
 
 Con `media-gstreamer`, `<audio>` / `<video>` y listas HLS simples (`*.m3u8`

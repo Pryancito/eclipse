@@ -12,6 +12,7 @@ pub mod look;
 pub mod location;
 pub mod privacy;
 pub mod session;
+pub mod spa_compat;
 pub mod spawn;
 pub mod wl;
 
