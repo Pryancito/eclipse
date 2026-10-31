@@ -1446,6 +1446,16 @@ const DESKTOP_UBUNTU: &[&str] = &[
     "pulseaudio-utils",
     "libpulse0",
     "gstreamer1.0-pulseaudio",
+    // SilverSurfer's media feature is linked against these SONAMEs. On
+    // GStreamer 1.28 (stonking) they are not in plugins-base/good, which is
+    // what the image already had: `libgstplay-1.0.so.0` lives in the extra
+    // library, `libgstwebrtc-1.0.so.0` in bad, `libgstgl-1.0.so.0` in gl.
+    // A missing one is `error while loading shared libraries` before the
+    // window exists. Named here, not left to a transitive Depends, because
+    // the binary loads them itself.
+    "libgstreamer-plugins-extra1.0-0",
+    "libgstreamer-plugins-bad1.0-0",
+    "libgstreamer-gl1.0-0",
     "mpg123",
     "freedoom",
     "chocolate-doom",
@@ -1548,6 +1558,18 @@ mod tests {
         assert!(!DESKTOP_UBUNTU.contains(&"garcon"));
         assert!(DESKTOP_UBUNTU.contains(&"libsdl3-0"));
         assert!(DESKTOP_UBUNTU.contains(&"libicu78"));
+        // The three SONAMEs `silversurfer` DT_NEEDs that plugins-base does
+        // not ship. On 1.28, play is in extra, not in bad.
+        for pkg in [
+            "libgstreamer-plugins-extra1.0-0",
+            "libgstreamer-plugins-bad1.0-0",
+            "libgstreamer-gl1.0-0",
+        ] {
+            assert!(
+                DESKTOP_UBUNTU.contains(&pkg),
+                "{pkg} must be top-level or silversurfer cannot load"
+            );
+        }
     }
 
     /// Input/audio packages the Ubuntu desktop set must keep naming explicitly:
