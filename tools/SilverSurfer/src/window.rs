@@ -13,6 +13,7 @@ use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
 use raw_window_handle::{
@@ -132,6 +133,17 @@ pub struct App {
     loc_focused: bool,
     loc_text: String,
     loc_cursor: usize,
+    /// Linux button code held over the page. Release sends button-up, so a
+    /// drag can select text instead of clicking on the press.
+    page_button: Option<u32>,
+    on_page: bool,
+    /// Shortcut that consumed the key-down. Its key-up must not reach the page.
+    swallowed: Option<u32>,
+    repeat_rate: i32,
+    repeat_delay_ms: i32,
+    held: Option<u32>,
+    held_at: Option<Instant>,
+    repeated_at: Option<Instant>,
     look: Look,
     waker: Option<Waker>,
     session: Option<Session>,
@@ -176,6 +188,14 @@ impl App {
             loc_focused: false,
             loc_text: String::new(),
             loc_cursor: 0,
+            page_button: None,
+            on_page: false,
+            swallowed: None,
+            repeat_rate: 0,
+            repeat_delay_ms: 0,
+            held: None,
+            held_at: None,
+            repeated_at: None,
             look: Look::current(),
             waker: None,
             session: None,
@@ -282,6 +302,9 @@ impl App {
             .as_ref()
             .is_some_and(|s| s.shell.flags().animating.load(std::sync::atomic::Ordering::Relaxed));
         if let Some(session) = self.session.as_mut() {
+            if session.shell.flags().close_window.load(std::sync::atomic::Ordering::Relaxed) {
+                self.exit = true;
+            }
             session.servo.spin_event_loop();
         }
         let frame = self.session.as_ref().is_some_and(|s| {
@@ -314,9 +337,12 @@ impl App {
         let _ = session.context.make_current();
         session.shell.paint();
         if session.gpu {
+            let scale = self.scale;
+            if let Some(page) = &self.page {
+                page.set_buffer_scale(scale);
+            }
             session.context.present();
             if let Some(page) = &self.page {
-                page.set_buffer_scale(self.scale);
                 page.commit();
             }
             return Ok(());
@@ -331,23 +357,33 @@ impl App {
         };
         let raw = image.into_raw();
         let width = image_width(&raw, pw);
-        self.blit_page(&raw, width, ph);
+        if !self.blit_page(&raw, width, ph) {
+            if let Some(session) = &self.session {
+                session
+                    .shell
+                    .flags()
+                    .frame
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Ok(());
+        }
         self.commit_parent()?;
         Ok(())
     }
 
-    fn blit_page(&mut self, raw: &[u8], src_w: u32, src_h: u32) {
+    fn blit_page(&mut self, raw: &[u8], src_w: u32, src_h: u32) -> bool {
         let Some(buf) = self.parent_buf.as_mut() else {
-            return;
+            return false;
         };
         if buf.busy {
-            return;
+            return false;
         }
         let dst_y = (chrome::HEIGHT * self.scale).max(0) as u32;
         let stride = (buf.width as usize) * 4;
         let len = buf.mem.len;
         let dst = unsafe { std::slice::from_raw_parts_mut(buf.mem.ptr, len) };
         chrome::blit_rgba(raw, src_w, src_h, dst, buf.width as u32, stride, dst_y);
+        true
     }
 
     fn paint_chrome(&mut self) -> Result<(), String> {
@@ -411,11 +447,13 @@ impl App {
     fn ensure_parent_buffer(&mut self) -> Result<(), String> {
         let width = self.logical_w * self.scale;
         let height = self.logical_h * self.scale;
-        let fresh = self
+        // A busy buffer still holds the page that was just blitted. Replacing
+        // it here would commit a panel-coloured frame over that page.
+        if self
             .parent_buf
             .as_ref()
-            .is_none_or(|buf| buf.width != width || buf.height != height || buf.busy);
-        if !fresh {
+            .is_some_and(|buf| buf.width == width && buf.height == height)
+        {
             return Ok(());
         }
         let scale = self.scale;
@@ -485,6 +523,12 @@ impl App {
 
     fn on_pointer_button(&mut self, button: u32, down: bool) {
         if !down {
+            if self.page_button == Some(button) {
+                self.page_button = None;
+                if let Some((px, py)) = self.page_px() {
+                    self.send_button(button, px, py, false);
+                }
+            }
             return;
         }
         let x = self.px.round() as i32;
@@ -496,23 +540,36 @@ impl App {
         let Some((px, py)) = self.page_px() else {
             return;
         };
-        let mouse = match button {
-            0x110 => MouseButton::Primary,
-            0x111 => MouseButton::Secondary,
-            0x112 => MouseButton::Auxiliary,
-            0x113 => MouseButton::Back,
-            0x114 => MouseButton::Forward,
-            other => MouseButton::Other(other as u16),
-        };
-        if mouse == MouseButton::Back {
+        if button == 0x113 {
             if let Some(session) = &self.session {
                 session.shell.go_back();
             }
             return;
         }
+        if button == 0x114 {
+            if let Some(session) = &self.session {
+                session.shell.go_forward();
+            }
+            return;
+        }
+        self.loc_focused = false;
         if let Some(session) = &self.session {
-            session.shell.pointer(px, py, Some((mouse, true)));
-            session.shell.pointer(px, py, Some((mouse, false)));
+            session.shell.set_page_focused(true);
+        }
+        self.page_button = Some(button);
+        self.send_button(button, px, py, true);
+        self.need_paint = true;
+    }
+
+    fn send_button(&self, button: u32, px: f32, py: f32, down: bool) {
+        let mouse = match button {
+            0x110 => MouseButton::Primary,
+            0x111 => MouseButton::Secondary,
+            0x112 => MouseButton::Auxiliary,
+            other => MouseButton::Other(other as u16),
+        };
+        if let Some(session) = &self.session {
+            session.shell.pointer(px, py, Some((mouse, down)));
         }
     }
 
@@ -527,6 +584,9 @@ impl App {
             return;
         };
         self.loc_focused = matches!(hit, Hit::Location);
+        if let Some(session) = &self.session {
+            session.shell.set_page_focused(!self.loc_focused);
+        }
         match hit {
             Hit::Location => {
                 if let Some(session) = &self.session {
@@ -580,12 +640,22 @@ impl App {
             _ => {}
         }
         if !down {
-            if !self.loc_focused {
+            if self.held == Some(evdev) {
+                self.held = None;
+                self.held_at = None;
+                self.repeated_at = None;
+            }
+            if self.swallowed == Some(evdev) {
+                self.swallowed = None;
+                return;
+            }
+            if !self.loc_focused && !is_modifier(evdev) {
                 self.send_key(evdev, false, false);
             }
             return;
         }
         if self.handle_shortcut(evdev) {
+            self.swallowed = Some(evdev);
             return;
         }
         if self.loc_focused {
@@ -593,7 +663,34 @@ impl App {
             self.need_paint = true;
             return;
         }
-        self.send_key(evdev, true, false);
+        if !is_modifier(evdev) {
+            self.held = Some(evdev);
+            self.held_at = Some(Instant::now());
+            self.repeated_at = None;
+            self.send_key(evdev, true, false);
+        }
+    }
+
+    fn pump_key_repeat(&mut self) {
+        let Some(evdev) = self.held else {
+            return;
+        };
+        if self.loc_focused || self.repeat_rate <= 0 {
+            return;
+        }
+        let Some(start) = self.held_at else {
+            return;
+        };
+        let now = Instant::now();
+        if now.duration_since(start) < Duration::from_millis(self.repeat_delay_ms.max(0) as u64) {
+            return;
+        }
+        let interval = Duration::from_secs_f64(1.0 / f64::from(self.repeat_rate));
+        if self.repeated_at.is_some_and(|prev| now.duration_since(prev) < interval) {
+            return;
+        }
+        self.repeated_at = Some(now);
+        self.send_key(evdev, true, true);
     }
 
     fn handle_shortcut(&mut self, evdev: u32) -> bool {
@@ -611,6 +708,9 @@ impl App {
         }
         if self.ctrl && evdev == 38 {
             self.loc_focused = true;
+            if let Some(session) = &self.session {
+                session.shell.set_page_focused(false);
+            }
             if let Some(session) = &self.session {
                 self.loc_text = session.shell.location_text();
                 self.loc_cursor = self.loc_text.chars().count();
@@ -671,6 +771,9 @@ impl App {
         match evdev {
             1 => {
                 self.loc_focused = false;
+                if let Some(session) = &self.session {
+                    session.shell.set_page_focused(true);
+                }
             }
             28 => {
                 if let Ok(url) = parse_location(&self.loc_text) {
@@ -679,6 +782,9 @@ impl App {
                     }
                 }
                 self.loc_focused = false;
+                if let Some(session) = &self.session {
+                    session.shell.set_page_focused(true);
+                }
             }
             14 => {
                 if self.loc_cursor > 0 {
@@ -769,8 +875,15 @@ impl App {
     }
 
     fn note_motion(&mut self, x: f64, y: f64) {
+        let was = self.on_page;
         self.px = x;
         self.py = y;
+        self.on_page = self.py >= chrome::HEIGHT as f64;
+        if was && !self.on_page {
+            if let Some(session) = &self.session {
+                session.shell.pointer_left();
+            }
+        }
         if let Some((px, py)) = self.page_px() {
             if let Some(session) = &self.session {
                 session.shell.pointer(px, py, None);
@@ -793,6 +906,10 @@ impl App {
         }
         self.need_paint = true;
     }
+}
+
+fn is_modifier(evdev: u32) -> bool {
+    matches!(evdev, 29 | 97 | 56 | 100 | 42 | 54)
 }
 
 fn insert_chars(text: &mut String, cursor: &mut usize, extra: &str) {
@@ -1260,6 +1377,10 @@ impl Dispatch<WlKeyboard, ()> for App {
                     state.xkb = keymap_from_fd(File::from(fd), size);
                 }
             }
+            wl_keyboard::Event::RepeatInfo { rate, delay } => {
+                state.repeat_rate = rate;
+                state.repeat_delay_ms = delay;
+            }
             wl_keyboard::Event::Key { key, state: key_state, .. } => {
                 let down = matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed));
                 if let Some(xkb) = &mut state.xkb {
@@ -1298,6 +1419,11 @@ impl Dispatch<WlPointer, ()> for App {
         _: &QueueHandle<Self>,
     ) {
         match event {
+            wl_pointer::Event::Enter {
+                surface_x,
+                surface_y,
+                ..
+            } => state.note_motion(surface_x, surface_y),
             wl_pointer::Event::Motion {
                 surface_x,
                 surface_y,
@@ -1311,18 +1437,22 @@ impl Dispatch<WlPointer, ()> for App {
                 let Some((px, py)) = state.page_px() else {
                     return;
                 };
+                let scale = state.scale as f64;
                 let (dx, dy) = if matches!(axis, WEnum::Value(wl_pointer::Axis::VerticalScroll)) {
-                    (0.0, -value)
+                    (0.0, -value * scale)
                 } else {
-                    (-value, 0.0)
+                    (-value * scale, 0.0)
                 };
                 if let Some(session) = &state.session {
                     session.shell.wheel(px, py, dx, dy);
                 }
             }
             wl_pointer::Event::Leave { .. } => {
-                if let Some(session) = &state.session {
-                    session.shell.pointer_left();
+                if state.on_page {
+                    state.on_page = false;
+                    if let Some(session) = &state.session {
+                        session.shell.pointer_left();
+                    }
                 }
             }
             _ => {}
@@ -1375,6 +1505,7 @@ pub fn run(url: url::Url) -> Result<(), String> {
             .dispatch_pending(&mut app)
             .map_err(|err| format!("wayland: {err}"))?;
         app.after_dispatch()?;
+        app.pump_key_repeat();
         if app.exit {
             break;
         }
@@ -1402,7 +1533,8 @@ pub fn run(url: url::Url) -> Result<(), String> {
                 revents: 0,
             },
         ];
-        let timeout = if animating { 16 } else { -1 };
+        let repeating = app.held.is_some() && app.repeat_rate > 0 && !app.loc_focused;
+        let timeout = if animating || repeating { 16 } else { -1 };
         unsafe {
             libc::poll(fds.as_mut_ptr(), 2, timeout);
         }
@@ -1418,11 +1550,6 @@ pub fn run(url: url::Url) -> Result<(), String> {
         } else {
             // Dropping the guard is the cancel: nothing was read from the socket.
             drop(guard);
-        }
-        if animating {
-            if let Some(session) = app.session.as_mut() {
-                session.servo.spin_event_loop();
-            }
         }
     }
     Ok(())

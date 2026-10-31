@@ -68,12 +68,15 @@ pub struct Flags {
     pub frame: AtomicBool,
     pub chrome: AtomicBool,
     pub animating: AtomicBool,
+    /// The script closed the last tab. The window loop exits.
+    pub close_window: AtomicBool,
 }
 
 pub struct Tab {
     pub view: WebView,
     pub title: String,
     pub url: String,
+    pub animating: bool,
 }
 
 pub struct Model {
@@ -209,6 +212,7 @@ impl Delegate {
             next.show();
             next.set_focused(true);
         }
+        self.sync_animating();
         self.flags.chrome.store(true, Ordering::Relaxed);
         self.flags.frame.store(true, Ordering::Relaxed);
         true
@@ -225,11 +229,30 @@ impl Delegate {
             let next = model.tabs[index].view.clone();
             (prev, next)
         };
+        prev.set_focused(false);
         prev.hide();
         next.show();
         next.set_focused(true);
+        self.sync_animating();
         self.flags.chrome.store(true, Ordering::Relaxed);
         self.flags.frame.store(true, Ordering::Relaxed);
+    }
+
+    pub fn set_page_focused(&self, focused: bool) {
+        if let Some(view) = self.active_view() {
+            view.set_focused(focused);
+        }
+    }
+
+    fn sync_animating(&self) {
+        let animating = {
+            let model = self.model.borrow();
+            model
+                .tabs
+                .get(model.active)
+                .is_some_and(|tab| tab.animating)
+        };
+        self.flags.animating.store(animating, Ordering::Relaxed);
     }
 
     pub fn resize(&self, width: u32, height: u32, scale: f32) {
@@ -341,6 +364,7 @@ impl Delegate {
             view,
             title: "Nueva pestaña".into(),
             url,
+            animating: false,
         });
         model.active = model.tabs.len() - 1;
         self.flags.chrome.store(true, Ordering::Relaxed);
@@ -360,8 +384,18 @@ impl WebViewDelegate for Delegate {
         self.flags.frame.store(true, Ordering::Relaxed);
     }
 
-    fn notify_animating_changed(&self, _webview: WebView, animating: bool) {
-        self.flags.animating.store(animating, Ordering::Relaxed);
+    fn notify_animating_changed(&self, webview: WebView, animating: bool) {
+        let active = {
+            let mut model = self.model.borrow_mut();
+            let Some(tab) = model.tabs.iter_mut().find(|tab| tab.view.id() == webview.id()) else {
+                return;
+            };
+            tab.animating = animating;
+            model.tabs.get(model.active).map(|tab| tab.view.id())
+        };
+        if active == Some(webview.id()) {
+            self.flags.animating.store(animating, Ordering::Relaxed);
+        }
     }
 
     fn notify_url_changed(&self, webview: WebView, url: url::Url) {
@@ -390,6 +424,19 @@ impl WebViewDelegate for Delegate {
             .build();
         view.notify_theme_change(Theme::Dark);
         self.add_tab(view, "about:blank".into());
+    }
+
+    fn notify_closed(&self, webview: WebView) {
+        let index = {
+            let model = self.model.borrow();
+            model.tabs.iter().position(|tab| tab.view.id() == webview.id())
+        };
+        let Some(index) = index else {
+            return;
+        };
+        if !self.close_tab(index) {
+            self.flags.close_window.store(true, Ordering::Relaxed);
+        }
     }
 
     fn show_embedder_control(&self, _webview: WebView, control: EmbedderControl) {
@@ -465,6 +512,7 @@ pub fn start(
         view,
         title: "Nueva pestaña".into(),
         url: url.to_string(),
+        animating: false,
     });
     shell.flags.chrome.store(true, Ordering::Relaxed);
 

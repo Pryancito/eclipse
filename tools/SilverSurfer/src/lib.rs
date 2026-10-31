@@ -21,6 +21,14 @@ pub mod window;
 pub fn launch() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     if let Some(arg) = args.next() {
+        // Servo relaunches this binary as `--content-process <token>`. That
+        // process must enter the engine and stop. Treating the flag as a URL
+        // opens another window, which spawns more content processes.
+        if arg == "--content-process" {
+            let token = args.next().unwrap_or_default();
+            servo::run_content_process(token);
+            return Ok(());
+        }
         if arg == "--help" || arg == "-h" {
             println!(
                 "\
