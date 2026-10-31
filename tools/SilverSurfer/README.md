@@ -71,7 +71,8 @@ silversurfer /ruta/pagina.html
 
 Sin URL restaura las pestañas de
 `$XDG_DATA_HOME/silversurfer/session.json` (o `~/.local/share/…`).
-`--fresh` ignora esa sesión.
+`--fresh` ignora esa sesión. `--private` abre una ventana privada (sin
+sesión; al cerrar borra cookies/almacenamiento/caché de esa instancia).
 
 | Tecla | Acción |
 |---|---|
@@ -82,6 +83,8 @@ Sin URL restaura las pestañas de
 | Ctrl+Tab / Ctrl+Shift+Tab | Pestaña siguiente / anterior |
 | Ctrl+1 … Ctrl+8 | Ir a la pestaña N |
 | Ctrl+O | `lunarfile --pick` y abre el fichero |
+| Ctrl+Shift+P | Ventana privada (otro proceso) |
+| Ctrl+Shift+Delete | Borrar cookies y datos de sitio |
 
 La barra busca con DuckDuckGo si el texto no parece una dirección
 (`SILVERSURFER_SEARCH` cambia la plantilla; usa `{query}` o `{}`).
@@ -93,7 +96,9 @@ muestra `…` y la barra un distintivo de esquema (`s` https, `!` http, `/` file
 El cromo se pinta a la escala del output (HiDPI nativo), con iconos
 vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.
 El distintivo `GL` / `SW` indica si la página va por EGL o por blit
-software. La home es un lienzo en blanco con el logo de Eclipse OS
+software; en ventana privada aparece además `P`.
+`about:privacy`, `about:cookies` y `about:clear` cubren la UI de datos.
+La home es un lienzo en blanco con el logo de Eclipse OS
 (paleta de `/etc/eclipse/look`). Los smokes de canvas / WebGL / WebGPU /
 WebAudio / MP4 / HLS viven en `smoke.html` (`smoke_url()`).
 

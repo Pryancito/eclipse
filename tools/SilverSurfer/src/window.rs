@@ -45,6 +45,7 @@ use crate::home;
 use crate::location::{resolve_omnibox, search_template, SchemeHint};
 use crate::look::Look;
 use crate::session::{self, Snapshot};
+use crate::spawn;
 use crate::wl;
 
 /// How the window chooses its first tab set.
@@ -55,6 +56,8 @@ pub enum Start {
     Fresh,
     /// Restore `session.json` or fall back to home.
     Restore,
+    /// Ventana privada: sin persistencia; limpia site data al salir.
+    Private(url::Url),
 }
 
 const DEFAULT_W: i32 = 1100;
@@ -173,6 +176,7 @@ impl App {
         let (initial_url, pending_tabs, pending_active, persist) = match start {
             Start::Url(url) => (url, Vec::new(), 0, true),
             Start::Fresh => (home::home_url(), Vec::new(), 0, true),
+            Start::Private(url) => (url, Vec::new(), 0, false),
             Start::Restore => match session::load() {
                 Some(snap) => snapshot_to_start(snap),
                 None => (home::home_url(), Vec::new(), 0, true),
@@ -308,10 +312,19 @@ impl App {
         let (pw, ph) = chrome::content_px(self.logical_w, self.logical_h, self.scale);
         let (context, gpu) = self.make_context(pw, ph)?;
         let waker = Waker::new()?;
-        let session = engine::start(waker.clone(), context, gpu, url, self.scale as f32)?;
+        let private = !self.persist;
+        let session = engine::start(
+            waker.clone(),
+            context,
+            gpu,
+            url,
+            self.scale as f32,
+            private,
+        )?;
         eprintln!(
-            "silversurfer: paint={}",
-            if gpu { "EGL" } else { "software→wl_shm" }
+            "silversurfer: paint={}{}",
+            if gpu { "EGL" } else { "software→wl_shm" },
+            if private { " private" } else { "" }
         );
         let extra = std::mem::take(&mut self.pending_tabs);
         let active = self.pending_active;
@@ -497,10 +510,16 @@ impl App {
             scheme = SchemeHint::Other;
             window_title = "SilverSurfer".into();
         }
-        if let Some(top) = &self.toplevel {
-            top.set_title(window_title);
-        }
         let gpu = self.session.as_ref().is_some_and(|s| s.gpu);
+        let private = self.session.as_ref().is_some_and(|s| s.private);
+        let window_title = if private && !window_title.contains("Privado") {
+            format!("Privado — {window_title}")
+        } else {
+            window_title
+        };
+        if let Some(top) = &self.toplevel {
+            top.set_title(&window_title);
+        }
         let pixels = chrome::render(&View {
             width: self.logical_w,
             look: self.look,
@@ -512,6 +531,7 @@ impl App {
             location_cursor: self.loc_cursor,
             scheme,
             gpu,
+            private,
             can_back,
             can_forward,
             scale: self.scale,
@@ -873,6 +893,22 @@ impl App {
         if evdev == 63 || (self.ctrl && evdev == 19) {
             if let Some(session) = &self.session {
                 session.shell.reload();
+            }
+            return true;
+        }
+        // Ctrl+Shift+P — ventana privada (proceso nuevo).
+        if self.ctrl && self.shift && evdev == 25 {
+            if let Err(err) = spawn::private_window(None) {
+                eprintln!("silversurfer: {err}");
+            }
+            return true;
+        }
+        // Ctrl+Shift+Delete — borrar cookies y datos de sitio.
+        if self.ctrl && self.shift && evdev == 111 {
+            self.leave_location();
+            if let Some(session) = &self.session {
+                let summary = session.shell.clear_browsing_data();
+                session.shell.load(crate::privacy::cleared_page_url(&summary));
             }
             return true;
         }
@@ -1749,6 +1785,13 @@ pub fn run(start: Start) -> Result<(), String> {
         }
     }
     app.persist_session();
+    // Ventana privada: purgar cookies/storage/caché de esta instancia Servo
+    // antes de tumbar el proceso.
+    if let Some(session) = app.session.as_ref() {
+        if session.private {
+            let _ = session.shell.clear_browsing_data();
+        }
+    }
     // Tear Servo down while the Wayland connection is still alive so
     // `Session::drop` can spin the constellation / content-process exit
     // instead of racing a hard process teardown (BHM control disconnect).

@@ -18,7 +18,9 @@ use servo::{
     MouseLeftViewportEvent, MouseMoveEvent, Opts, Preferences, Servo, ServoBuilder, Theme,
     WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
+use crate::about;
 use crate::files::{self, PickRequest};
+use crate::privacy;
 use crate::session::{SavedTab, Snapshot};
 
 /// Default HTTP / `navigator.userAgent` string.
@@ -117,6 +119,8 @@ pub struct Session {
     pub shell: Rc<Delegate>,
     pub context: Rc<dyn servo::RenderingContext>,
     pub gpu: bool,
+    /// Ventana `--private`: no persiste sesión; al salir limpia site data.
+    pub private: bool,
 }
 
 /// Tear down tabs before `Servo` so content processes get `CloseWebView` and
@@ -224,6 +228,7 @@ impl Delegate {
         let Some(view) = self.active_view() else {
             return;
         };
+        let url = self.expand_url(url);
         let text = url.to_string();
         view.load(url);
         if let Some(tab) = self.model.borrow_mut().tabs.get_mut(index) {
@@ -231,6 +236,74 @@ impl Delegate {
             tab.loading = true;
         }
         self.flags.chrome.store(true, Ordering::Relaxed);
+    }
+
+    pub fn new_tab(&self, url: url::Url) {
+        let url = self.expand_url(url);
+        let text = url.to_string();
+        let view = self.make_view(Some(url));
+        self.add_tab(view, text);
+    }
+
+    fn expand_url(&self, url: url::Url) -> url::Url {
+        if url.scheme() != "about" {
+            return about::expand(url);
+        }
+        match url.path().to_ascii_lowercase().as_str() {
+            "clear" => {
+                let summary = self.clear_browsing_data();
+                privacy::cleared_page_url(&summary)
+            }
+            "cookies" | "site-data" => {
+                let sites = self.list_site_data();
+                privacy::cookies_page_url(&sites)
+            }
+            _ => about::expand(url),
+        }
+    }
+
+    /// Borra cookies, session/local storage y caché HTTP de esta instancia.
+    pub fn clear_browsing_data(&self) -> String {
+        let Some(servo) = self.servo.borrow().clone() else {
+            return "Servo no está listo".into();
+        };
+        let sdm = servo.site_data_manager();
+        let sites = sdm.site_data(servo::StorageType::all());
+        let n = sites.len();
+        let names: Vec<String> = sites.iter().map(|s| s.name()).collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        if !refs.is_empty() {
+            sdm.clear_site_data(&refs, servo::StorageType::all());
+        }
+        sdm.clear_cookies(None);
+        sdm.clear_session_cookies(None);
+        servo.network_manager().clear_cache();
+        eprintln!("silversurfer: borrados datos de {n} sitios + cookies + caché");
+        format!("Borrados datos de {n} sitios, cookies y caché HTTP.")
+    }
+
+    pub fn list_site_data(&self) -> Vec<(String, String)> {
+        let Some(servo) = self.servo.borrow().clone() else {
+            return Vec::new();
+        };
+        let sdm = servo.site_data_manager();
+        sdm.site_data(servo::StorageType::all())
+            .into_iter()
+            .map(|site| {
+                let mut kinds = Vec::new();
+                let t = site.storage_types();
+                if t.contains(servo::StorageType::Cookies) {
+                    kinds.push("cookies");
+                }
+                if t.contains(servo::StorageType::Local) {
+                    kinds.push("local");
+                }
+                if t.contains(servo::StorageType::Session) {
+                    kinds.push("session");
+                }
+                (site.name(), kinds.join("+"))
+            })
+            .collect()
     }
 
     pub fn go_back(&self) {
@@ -260,12 +333,6 @@ impl Delegate {
             tab.loading = true;
         }
         self.flags.chrome.store(true, Ordering::Relaxed);
-    }
-
-    pub fn new_tab(&self, url: url::Url) {
-        let text = url.to_string();
-        let view = self.make_view(Some(url));
-        self.add_tab(view, text);
     }
 
     /// Close `index`. `false` means it was the last tab and the window should
@@ -475,7 +542,7 @@ impl Delegate {
             .delegate(self.this())
             .hidpi_scale_factor(Scale::new(self.scale.get()));
         if let Some(url) = url {
-            builder = builder.url(url);
+            builder = builder.url(self.expand_url(url));
         }
         let view = builder.build();
         view.notify_theme_change(Theme::Dark);
@@ -607,6 +674,7 @@ pub fn start(
     gpu: bool,
     url: url::Url,
     scale: f32,
+    private: bool,
 ) -> Result<Session, String> {
     install_crypto();
     let mut opts = Opts::default();
@@ -644,6 +712,7 @@ pub fn start(
 
     // The first tab is built with the handle we still hold. Later tabs clone
     // the copy stored on the delegate.
+    let url = shell.expand_url(url);
     let view = WebViewBuilder::new(&servo, context.clone())
         .delegate(shell.clone())
         .url(url.clone())
@@ -654,7 +723,11 @@ pub fn start(
     view.set_focused(true);
     shell.model.borrow_mut().tabs.push(Tab {
         view,
-        title: "Nueva pestaña".into(),
+        title: if private {
+            "Privado".into()
+        } else {
+            "Nueva pestaña".into()
+        },
         url: url.to_string(),
         loading: true,
         animating: false,
@@ -666,6 +739,7 @@ pub fn start(
         shell,
         context,
         gpu,
+        private,
     })
 }
 
