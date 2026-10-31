@@ -4,13 +4,16 @@
 //! engine and the Wayland window are behind the `engine` feature, so the unit
 //! tests and the benchmarks run without compiling the engine.
 
+pub mod about;
 pub mod chrome;
 pub mod files;
 pub mod home;
 pub mod look;
 pub mod location;
+pub mod privacy;
 pub mod session;
 pub mod spa_compat;
+pub mod spawn;
 pub mod wl;
 
 #[cfg(feature = "engine")]
@@ -22,6 +25,7 @@ pub mod window;
 #[cfg(feature = "engine")]
 pub fn launch() -> Result<(), String> {
     let mut fresh = false;
+    let mut private = false;
     let mut url_arg: Option<String> = None;
     for arg in std::env::args().skip(1) {
         if arg == "--content-process" {
@@ -38,18 +42,25 @@ pub fn launch() -> Result<(), String> {
                 "\
 SilverSurfer — navegador de Eclipse OS
 
-Uso: silversurfer [--fresh] [URL]
+Uso: silversurfer [--fresh|--private] [URL]
 
 Sin URL restaura la sesión anterior (o la página de inicio).
 --fresh ignora la sesión y abre una pestaña nueva.
+--private ventana privada (sin sesión; limpia datos al cerrar).
 Una dirección o host navega; palabras buscan (SILVERSURFER_SEARCH).
 Ctrl+L barra, Ctrl+T/W pestaña, Ctrl+Tab cambiar, Ctrl+O lunarfile,
-Alt+Izquierda / Alt+Derecha historial, F5 recargar."
+Ctrl+Shift+P ventana privada, Ctrl+Shift+Delete borrar datos,
+Alt+Izquierda / Alt+Derecha historial, F5 recargar.
+about:privacy · about:cookies · about:clear"
             );
             return Ok(());
         }
         if arg == "--fresh" {
             fresh = true;
+            continue;
+        }
+        if arg == "--private" {
+            private = true;
             continue;
         }
         if arg.starts_with('-') {
@@ -58,7 +69,14 @@ Alt+Izquierda / Alt+Derecha historial, F5 recargar."
         url_arg = Some(arg);
     }
 
-    if let Some(arg) = url_arg {
+    if private {
+        let url = match url_arg {
+            Some(arg) => location::resolve_omnibox(&arg, &location::search_template())
+                .map_err(|_| format!("dirección no válida: {arg}"))?,
+            None => home::home_url(),
+        };
+        window::run(window::Start::Private(url))
+    } else if let Some(arg) = url_arg {
         let url = location::resolve_omnibox(&arg, &location::search_template())
             .map_err(|_| format!("dirección no válida: {arg}"))?;
         window::run(window::Start::Url(url))

@@ -48,6 +48,7 @@ fn paint(width: i32, scale: i32, titles: &[String]) -> chrome::Pixels {
         location_cursor: 0,
         scheme: SchemeHint::Https,
         gpu: true,
+        private: false,
         can_back: true,
         can_forward: false,
         scale,
