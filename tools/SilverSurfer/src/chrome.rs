@@ -31,7 +31,7 @@ pub struct RectI {
 }
 
 impl RectI {
-    fn contains(self, x: i32, y: i32) -> bool {
+    pub fn contains(self, x: i32, y: i32) -> bool {
         x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
     }
 }
