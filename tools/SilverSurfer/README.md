@@ -86,14 +86,19 @@ Sin URL restaura las pestañas de
 | Ctrl+F | Buscar en la página (`window.find`) |
 | Ctrl+D | Añadir o quitar marcador |
 | Ctrl+H / Ctrl+B | Historial / marcadores |
+| Ctrl+S | Descargar URL actual (`lunarfile --save` + curl) |
+| Ctrl+J | Lista de descargas |
+| F11 / Escape | Pantalla completa / salir |
 | Tab (en la barra) | Aceptar sugerencia del historial |
 
 La barra busca con DuckDuckGo si el texto no parece una dirección
 (`SILVERSURFER_SEARCH` cambia la plantilla; usa `{query}` o `{}`).
 Las visitas se guardan en
-`$XDG_DATA_HOME/silversurfer/history.json` y los marcadores en
-`bookmarks.json`. `about:history` y `about:bookmarks` abren listas
-locales. El título de la ventana sigue la pestaña activa; mientras carga,
+`$XDG_DATA_HOME/silversurfer/history.json`, los marcadores en
+`bookmarks.json` y el registro de descargas en `downloads.json`.
+`about:history`, `about:bookmarks` y `about:downloads` abren listas
+locales. Navegar a PDF/ZIP/… intercepta la carga y pide destino con
+lunarfile (Servo 0.7 no expone un hook de descarga nativo). El título de la ventana sigue la pestaña activa; mientras carga,
 el tab muestra `…` y la barra un distintivo de esquema (`s` https, `!`
 http, `/` file). El cromo se pinta a la escala del output (HiDPI nativo),
 con iconos vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.

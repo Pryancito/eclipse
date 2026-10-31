@@ -2,7 +2,7 @@
 
 use url::Url;
 
-use crate::{bookmarks, history, home};
+use crate::{bookmarks, downloads, history, home};
 
 /// Resuelve páginas internas. Lo demás se deja igual.
 pub fn expand(url: Url) -> Url {
@@ -14,6 +14,7 @@ pub fn expand(url: Url) -> Url {
         "" | "home" | "newtab" | "start" => home::home_url(),
         "history" => history::page_url(),
         "bookmarks" | "favorites" => bookmarks::page_url(),
+        "downloads" => downloads::page_url(),
         _ => url,
     }
 }
@@ -43,5 +44,12 @@ mod tests {
         let url = expand(Url::parse("about:home").unwrap());
         assert_eq!(url.scheme(), "file");
         assert!(url.path().ends_with("silversurfer-home.html"));
+    }
+
+    #[test]
+    fn downloads_becomes_file() {
+        let url = expand(Url::parse("about:downloads").unwrap());
+        assert_eq!(url.scheme(), "file");
+        assert!(url.path().ends_with("silversurfer-downloads.html"));
     }
 }

@@ -40,6 +40,7 @@ use xkbcommon::xkb::{self, Keymap, State as XkbState};
 
 use crate::bookmarks;
 use crate::chrome::{self, Hit, View};
+use crate::downloads;
 use crate::engine::{self, Session, Waker};
 use crate::files::{self, PickRequest};
 use crate::history;
@@ -170,6 +171,10 @@ pub struct App {
     pending_tabs: Vec<(url::Url, String)>,
     pending_active: usize,
     persist: bool,
+    /// F11 / Fullscreen API: cromo oculto y página a pantalla completa.
+    fullscreen: bool,
+    /// La Fullscreen API de la página empujó el estado (para no pelear con F11).
+    page_drove_fs: bool,
 }
 
 impl App {
@@ -238,7 +243,60 @@ impl App {
             pending_tabs,
             pending_active,
             persist,
+            fullscreen: false,
+            page_drove_fs: false,
         }
+    }
+
+    fn chrome_h(&self) -> i32 {
+        if self.fullscreen {
+            0
+        } else {
+            chrome::HEIGHT
+        }
+    }
+
+    fn apply_fullscreen_layout(&mut self) {
+        let chrome_h = self.chrome_h();
+        if let Some(page_sub) = &self.page_sub {
+            page_sub.set_position(0, chrome_h);
+        }
+        if let Some(top) = &self.toplevel {
+            if self.fullscreen {
+                top.set_fullscreen(None);
+            } else {
+                top.unset_fullscreen();
+            }
+        }
+        let (pw, ph) = chrome::content_px(self.logical_w, self.logical_h.max(chrome_h + 1), self.scale);
+        // content_px resta HEIGHT fijo; en fullscreen usamos el alto completo.
+        let (pw, ph) = if self.fullscreen {
+            let scale = self.scale.max(1) as u32;
+            (
+                (self.logical_w.max(1) as u32) * scale,
+                (self.logical_h.max(1) as u32) * scale,
+            )
+        } else {
+            (pw, ph)
+        };
+        if let Some(session) = &self.session {
+            session.shell.resize(pw, ph, self.scale as f32);
+        }
+        self.need_paint = true;
+    }
+
+    fn set_fullscreen(&mut self, on: bool) {
+        if self.fullscreen == on {
+            return;
+        }
+        self.fullscreen = on;
+        if !on {
+            self.page_drove_fs = false;
+            if let Some(session) = &self.session {
+                session.shell.exit_fullscreen();
+            }
+        }
+        self.apply_fullscreen_layout();
     }
 
     fn refresh_look(&mut self) {
@@ -387,6 +445,19 @@ impl App {
             }
             session.servo.spin_event_loop();
         }
+        let page_fs = self.session.as_ref().is_some_and(|s| {
+            s.shell
+                .flags()
+                .page_fullscreen
+                .load(std::sync::atomic::Ordering::Relaxed)
+        });
+        if page_fs && !self.fullscreen {
+            self.page_drove_fs = true;
+            self.set_fullscreen(true);
+        } else if !page_fs && self.page_drove_fs {
+            self.page_drove_fs = false;
+            self.set_fullscreen(false);
+        }
         let frame = self.session.as_ref().is_some_and(|s| {
             s.shell
                 .flags()
@@ -402,8 +473,10 @@ impl App {
         if frame {
             self.paint_page()?;
         }
-        if chrome || self.need_paint {
+        if (chrome || self.need_paint) && !self.fullscreen {
             self.paint_chrome()?;
+            self.need_paint = false;
+        } else if self.need_paint {
             self.need_paint = false;
         }
         let _ = animating;
@@ -458,7 +531,7 @@ impl App {
         if buf.busy {
             return false;
         }
-        let dst_y = (chrome::HEIGHT * self.scale).max(0) as u32;
+        let dst_y = (self.chrome_h() * self.scale).max(0) as u32;
         let stride = (buf.width as usize) * 4;
         let len = buf.mem.len;
         let dst = unsafe { std::slice::from_raw_parts_mut(buf.mem.ptr, len) };
@@ -644,7 +717,7 @@ impl App {
         }
         let x = self.px.round() as i32;
         let y = self.py.round() as i32;
-        if y < chrome::HEIGHT {
+        if y < self.chrome_h() {
             self.on_chrome_click(x, y);
             return;
         }
@@ -959,6 +1032,37 @@ impl App {
             }
             return true;
         }
+        // Ctrl+J — about:downloads.
+        if self.ctrl && evdev == 36 {
+            self.leave_location();
+            if let Some(session) = &self.session {
+                if let Ok(url) = url::Url::parse("about:downloads") {
+                    session.shell.load(url);
+                }
+            }
+            return true;
+        }
+        // Ctrl+S — guardar / descargar la URL actual.
+        if self.ctrl && evdev == 31 {
+            self.leave_location();
+            if let Some(session) = &self.session {
+                if let Ok(url) = url::Url::parse(&session.shell.location_text()) {
+                    if let Err(err) = downloads::save_url(&url) {
+                        eprintln!("silversurfer: descarga: {err}");
+                    }
+                }
+            }
+            return true;
+        }
+        // F11 — pantalla completa (también Escape para salir).
+        if evdev == 87 {
+            self.set_fullscreen(!self.fullscreen);
+            return true;
+        }
+        if evdev == 1 && self.fullscreen && !self.loc_focused {
+            self.set_fullscreen(false);
+            return true;
+        }
         false
     }
 
@@ -1112,13 +1216,14 @@ impl App {
     }
 
     fn page_px(&self) -> Option<(f32, f32)> {
-        if self.py < chrome::HEIGHT as f64 {
+        let chrome_h = self.chrome_h() as f64;
+        if self.py < chrome_h {
             return None;
         }
         let scale = self.scale as f64;
         Some((
             (self.px * scale) as f32,
-            ((self.py - chrome::HEIGHT as f64) * scale) as f32,
+            ((self.py - chrome_h) * scale) as f32,
         ))
     }
 
@@ -1126,7 +1231,7 @@ impl App {
         let was = self.on_page;
         self.px = x;
         self.py = y;
-        self.on_page = self.py >= chrome::HEIGHT as f64;
+        self.on_page = self.py >= self.chrome_h() as f64;
         if was && !self.on_page {
             if let Some(session) = &self.session {
                 session.shell.pointer_left();
@@ -1146,11 +1251,18 @@ impl App {
         if height > 0 {
             self.logical_h = height.max(chrome::HEIGHT + 64);
         }
-        let (pw, ph) = chrome::content_px(self.logical_w, self.logical_h, self.scale);
-        if let Some(session) = &self.session {
-            session
-                .shell
-                .resize(pw, ph, self.scale as f32);
+        if self.fullscreen {
+            let scale = self.scale.max(1) as u32;
+            let pw = (self.logical_w.max(1) as u32) * scale;
+            let ph = (self.logical_h.max(1) as u32) * scale;
+            if let Some(session) = &self.session {
+                session.shell.resize(pw, ph, self.scale as f32);
+            }
+        } else {
+            let (pw, ph) = chrome::content_px(self.logical_w, self.logical_h, self.scale);
+            if let Some(session) = &self.session {
+                session.shell.resize(pw, ph, self.scale as f32);
+            }
         }
         self.need_paint = true;
     }
