@@ -89,5 +89,8 @@ El título de la ventana sigue la pestaña activa; mientras carga, el tab
 muestra `…` y la barra un distintivo de esquema (`s` https, `!` http, `/` file).
 El cromo se pinta a la escala del output (HiDPI nativo), con iconos
 vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.
+El distintivo `GL` / `SW` indica si la página va por EGL o por blit
+software; la home lista smokes locales (canvas, WebGL, WebGPU, WebAudio)
+y remotas (MP4/HLS).
 
 `<input type=file>` también abre `lunarfile`. Escape en el selector cancela.
