@@ -62,9 +62,14 @@ cargo bench --manifest-path tools/SilverSurfer/Cargo.toml \
 
 ```sh
 silversurfer
+silversurfer --fresh
 silversurfer https://example.com
 silversurfer /ruta/pagina.html
 ```
+
+Sin URL restaura las pestañas de
+`$XDG_DATA_HOME/silversurfer/session.json` (o `~/.local/share/…`).
+`--fresh` ignora esa sesión.
 
 | Tecla | Acción |
 |---|---|
@@ -72,6 +77,8 @@ silversurfer /ruta/pagina.html
 | F5 o Ctrl+R | Recargar |
 | Ctrl+L | Barra de dirección (omnibox: URL o búsqueda) |
 | Ctrl+T / Ctrl+W | Pestaña nueva / cerrar |
+| Ctrl+Tab / Ctrl+Shift+Tab | Pestaña siguiente / anterior |
+| Ctrl+1 … Ctrl+8 | Ir a la pestaña N |
 | Ctrl+O | `lunarfile --pick` y abre el fichero |
 
 La barra busca con DuckDuckGo si el texto no parece una dirección
