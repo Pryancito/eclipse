@@ -21,6 +21,7 @@ const BTN: i32 = 24;
 const GAP: i32 = 4;
 const SCHEME_W: i32 = 16;
 const GPU_W: i32 = 28;
+const PRIV_W: i32 = 18;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RectI {
@@ -58,9 +59,14 @@ pub struct Layout {
     pub scheme: RectI,
     pub location: RectI,
     pub gpu: RectI,
+    pub private: RectI,
 }
 
 pub fn layout(width: i32, tabs: usize) -> Layout {
+    layout_ex(width, tabs, false)
+}
+
+pub fn layout_ex(width: i32, tabs: usize, private: bool) -> Layout {
     let width = width.max(1);
     let tabs = tabs.max(1);
     let y_tab = 4;
@@ -137,7 +143,23 @@ pub fn layout(width: i32, tabs: usize) -> Layout {
         w: GPU_W,
         h: BTN,
     };
-    let loc_w = (gpu.x - GAP - loc_x).max(1);
+    let private = if private {
+        RectI {
+            x: (gpu.x - GAP - PRIV_W).max(loc_x),
+            y: y_tool,
+            w: PRIV_W,
+            h: BTN,
+        }
+    } else {
+        RectI {
+            x: gpu.x,
+            y: y_tool,
+            w: 0,
+            h: BTN,
+        }
+    };
+    let loc_right = if private.w > 0 { private.x } else { gpu.x };
+    let loc_w = (loc_right - GAP - loc_x).max(1);
     Layout {
         tabs: tab_rects,
         closes,
@@ -153,6 +175,7 @@ pub fn layout(width: i32, tabs: usize) -> Layout {
             h: BTN,
         },
         gpu,
+        private,
     }
 }
 
@@ -203,6 +226,8 @@ pub struct View<'a> {
     pub scheme: SchemeHint,
     /// `true` = página por EGL; `false` = blit software → wl_shm.
     pub gpu: bool,
+    /// Ventana `--private`.
+    pub private: bool,
     pub can_back: bool,
     pub can_forward: bool,
     /// Output scale. The buffer is `width * scale` by `HEIGHT * scale`.
@@ -223,7 +248,11 @@ pub fn render(view: &View<'_>) -> Pixels {
     let mut pixmap = Pixmap::new(width, height).expect("chrome pixmap");
     let pal = view.look.palette();
     pixmap.fill(color(pal.panel));
-    let lay = layout(view.width.max(1), view.titles.len().max(1));
+    let lay = layout_ex(
+        view.width.max(1),
+        view.titles.len().max(1),
+        view.private,
+    );
     let titles: &[String] = if view.titles.is_empty() {
         &[]
     } else {
@@ -258,8 +287,23 @@ pub fn render(view: &View<'_>) -> Pixels {
     fill(&mut pixmap, s(lay.scheme), pal.field);
     fill(&mut pixmap, s(lay.location), pal.field);
     fill(&mut pixmap, s(lay.gpu), pal.field);
+    if view.private {
+        fill(&mut pixmap, s(lay.private), pal.field);
+    }
     if view.location_focused {
         stroke_scaled(&mut pixmap, lay.location, pal.accent, scale);
+    }
+    if view.private {
+        fill(
+            &mut pixmap,
+            s(RectI {
+                x: lay.private.x,
+                y: lay.private.y + lay.private.h - 2,
+                w: lay.private.w,
+                h: 2,
+            }),
+            pal.accent,
+        );
     }
     if view.gpu {
         fill(
@@ -344,6 +388,16 @@ pub fn render(view: &View<'_>) -> Pixels {
         gpu_color,
         scale,
     );
+    if view.private {
+        label_scaled(
+            &mut target,
+            lay.private.x + 5,
+            lay.private.y + 16,
+            "P",
+            pal.accent,
+            scale,
+        );
+    }
     let loc = if view.location.is_empty() {
         "Buscar o escribir una dirección"
     } else {
@@ -752,6 +806,7 @@ mod tests {
             location_cursor: 0,
             scheme: SchemeHint::Https,
             gpu: true,
+            private: false,
             can_back: false,
             can_forward: true,
             scale: 2,
@@ -845,6 +900,7 @@ mod tests {
                 location_cursor: 0,
                 scheme: SchemeHint::Other,
                 gpu: false,
+                private: true,
                 can_back: true,
                 can_forward: false,
                 scale: 1,
