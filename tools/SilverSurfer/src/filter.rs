@@ -8,23 +8,20 @@
 
 use url::Url;
 
-/// Fragmentos de host o path que se bloquean (minúsculas).
-const BLOCK_NEEDLES: &[&str] = &[
+/// Dominios bloqueados, con sus subdominios.
+const BLOCK_DOMAINS: &[&str] = &[
     "doubleclick.net",
     "googlesyndication.com",
     "googleadservices.com",
     "googletagservices.com",
     "googletagmanager.com",
     "google-analytics.com",
-    "adservice.google.",
-    "pagead2.googlesyndication",
     "adsystem.com",
     "amazon-adsystem.com",
     "adsrvr.org",
     "adnxs.com",
     "ads-twitter.com",
     "ads.linkedin.com",
-    "facebook.net/tr",
     "connect.facebook.net",
     "scorecardresearch.com",
     "quantserve.com",
@@ -40,17 +37,16 @@ const BLOCK_NEEDLES: &[&str] = &[
     "advertising.com",
     "adform.net",
     "adsafeprotected.com",
-    "/ads?",
-    "/ads/",
-    "/ad/",
-    "/ad-",
-    "ads.js",
-    "ads.min.js",
-    "advertisement",
-    "pagead/js",
-    "gtag/js",
-    "analytics.js",
 ];
+
+/// Nombres de fichero exactos (último segmento del path).
+const BLOCK_FILES: &[&str] = &["ads.js", "ads.min.js", "analytics.js"];
+
+/// Directorios exactos (un segmento que no es el último).
+const BLOCK_DIRS: &[&str] = &["ad", "ads"];
+
+/// Prefijos de path.
+const BLOCK_PATH_PREFIXES: &[&str] = &["/pagead/", "/gtag/js"];
 
 /// CSS inyectado para ocultar contenedores típicos de anuncios.
 pub const HIDE_ADS_CSS: &str = "\
@@ -79,14 +75,37 @@ pub fn should_block(url: &Url) -> bool {
     }
     let host = url.host_str().unwrap_or("").to_ascii_lowercase();
     let path = url.path().to_ascii_lowercase();
-    let full = format!("{host}{path}");
-    let query = url.query().unwrap_or("").to_ascii_lowercase();
-    let hay = if query.is_empty() {
-        full
-    } else {
-        format!("{full}?{query}")
+    if BLOCK_DOMAINS.iter().any(|d| domain_matches(&host, d)) {
+        return true;
+    }
+    if host.starts_with("adservice.google.") {
+        return true;
+    }
+    if domain_matches(&host, "facebook.net") && (path == "/tr" || path.starts_with("/tr/")) {
+        return true;
+    }
+    if BLOCK_PATH_PREFIXES.iter().any(|p| path.starts_with(p)) {
+        return true;
+    }
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some((last, dirs)) = segments.split_last() else {
+        return false;
     };
-    BLOCK_NEEDLES.iter().any(|n| hay.contains(n))
+    if BLOCK_FILES.contains(last) || last.starts_with("advertisement") {
+        return true;
+    }
+    if *last == "ads" && url.query().is_some() {
+        return true;
+    }
+    dirs.iter()
+        .any(|d| BLOCK_DIRS.contains(d) || d.starts_with("advertisement"))
+}
+
+fn domain_matches(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|rest| rest.ends_with('.'))
 }
 
 /// Script que inserta [`HIDE_ADS_CSS`] una sola vez.
@@ -126,7 +145,7 @@ code{{background:#222;padding:.1rem .35rem}}h1{{font-size:1.35rem}}</style>\
 Cancelaciones de red en esta sesión (aprox.): {blocked}.</p>\
 <p>No es uBlock: solo hosts/paths frecuentes + CSS hide. Sin WebExtensions.</p>",
         on = on,
-        n = BLOCK_NEEDLES.len(),
+        n = BLOCK_DOMAINS.len() + BLOCK_FILES.len() + BLOCK_DIRS.len() + BLOCK_PATH_PREFIXES.len(),
         blocked = blocked_hint
     );
     let path = std::env::temp_dir().join("silversurfer-filters.html");
@@ -146,6 +165,32 @@ mod tests {
         assert!(!should_block(&ok));
         let tracker = Url::parse("https://www.google-analytics.com/analytics.js").unwrap();
         assert!(should_block(&tracker));
+    }
+
+    #[test]
+    fn ordinary_names_that_contain_ad_words_load() {
+        for ok in [
+            "https://example.com/static/uploads.js",
+            "https://example.com/js/threads.js",
+            "https://example.com/js/downloads.js",
+            "https://example.com/blog/ad-hoc-networks/",
+            "https://example.com/road/map.png",
+            "https://notdoubleclick.net/app.js",
+            "https://example.com/ads",
+        ] {
+            assert!(!should_block(&Url::parse(ok).unwrap()), "{ok}");
+        }
+        for blocked in [
+            "https://stats.g.doubleclick.net/collect",
+            "https://example.com/ads/banner.png",
+            "https://example.com/ads?slot=1",
+            "https://example.com/js/ads.js",
+            "https://www.googletagmanager.com/gtag/js?id=G-1",
+            "https://connect.facebook.net/en_US/fbevents.js",
+            "https://adservice.google.es/ddm/fls",
+        ] {
+            assert!(should_block(&Url::parse(blocked).unwrap()), "{blocked}");
+        }
     }
 
     #[test]

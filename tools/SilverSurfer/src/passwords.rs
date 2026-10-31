@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::session::{data_dir, find_string, json_string};
+use crate::session::{data_dir, find_string, json_string, leaf_objects};
 
 const XOR_KEY: &[u8] = b"EclipseOS-SilverSurfer-passwords-v1";
 
@@ -45,13 +45,7 @@ impl Store {
 
     pub fn decode(text: &str) -> Self {
         let mut entries = Vec::new();
-        let mut rest = text;
-        while let Some(start) = rest.find('{') {
-            let chunk = &rest[start..];
-            let Some(end) = chunk.find('}') else {
-                break;
-            };
-            let obj = &chunk[..=end];
+        for obj in leaf_objects(text) {
             if obj.contains("\"origin\"") && obj.contains("\"secret\"") {
                 if let (Some(origin), Some(username), Some(secret)) = (
                     find_string(obj, "\"origin\""),
@@ -67,7 +61,6 @@ impl Store {
                     }
                 }
             }
-            rest = &chunk[end + 1..];
         }
         Self { entries }
     }
@@ -139,8 +132,8 @@ pub fn origin_of(url: &str) -> Option<String> {
     if url.scheme() != "http" && url.scheme() != "https" {
         return None;
     }
-    let host = url.host_str()?;
-    Some(format!("{}://{}", url.scheme(), host))
+    url.host_str()?;
+    Some(url.origin().ascii_serialization())
 }
 
 pub fn page_url() -> url::Url {
@@ -346,6 +339,18 @@ mod tests {
         let e = store.find_for_url("https://example.com/login").unwrap();
         assert_eq!(e.username, "ada");
         assert_eq!(e.secret, "lovelace");
+    }
+
+    #[test]
+    fn another_port_is_another_origin() {
+        let mut store = Store::default();
+        store.upsert("http://example.com", "ada", "lovelace");
+        assert!(store.find_for_url("http://example.com:80/login").is_some());
+        assert!(store.find_for_url("http://example.com:8080/login").is_none());
+        assert_eq!(
+            origin_of("https://example.com:8443/a").as_deref(),
+            Some("https://example.com:8443")
+        );
     }
 
     #[test]

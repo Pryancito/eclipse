@@ -282,22 +282,31 @@ impl App {
                 top.unset_fullscreen();
             }
         }
-        let (pw, ph) = chrome::content_px(self.logical_w, self.logical_h.max(chrome_h + 1), self.scale);
-        // content_px resta HEIGHT fijo; en fullscreen usamos el alto completo.
-        let (pw, ph) = if self.fullscreen {
+        if self.fullscreen {
+            if let Some(chrome) = &self.chrome_surface {
+                chrome.attach(None, 0, 0);
+                chrome.commit();
+            }
+        }
+        let (pw, ph) = self.content_size();
+        if let Some(session) = &self.session {
+            session.shell.resize(pw, ph, self.scale as f32);
+        }
+        self.chrome_fp = 0;
+        self.need_paint = true;
+    }
+
+    /// Page size in pixels: below the chrome, or the whole window in F11.
+    fn content_size(&self) -> (u32, u32) {
+        if self.fullscreen {
             let scale = self.scale.max(1) as u32;
             (
                 (self.logical_w.max(1) as u32) * scale,
                 (self.logical_h.max(1) as u32) * scale,
             )
         } else {
-            (pw, ph)
-        };
-        if let Some(session) = &self.session {
-            session.shell.resize(pw, ph, self.scale as f32);
+            chrome::content_px(self.logical_w, self.logical_h, self.scale)
         }
-        self.chrome_fp = 0;
-        self.need_paint = true;
     }
 
     fn set_fullscreen(&mut self, on: bool) {
@@ -512,6 +521,7 @@ impl App {
             self.need_paint = false;
         } else if self.need_paint {
             self.need_paint = false;
+            self.ensure_parent_buffer()?;
         }
         let _ = animating;
         Ok(())
@@ -534,7 +544,7 @@ impl App {
             }
             return Ok(());
         }
-        let (pw, ph) = chrome::content_px(self.logical_w, self.logical_h, self.scale);
+        let (pw, ph) = self.content_size();
         let rect = webrender_api::units::DeviceIntRect::from_size(euclid::size2(
             pw as i32,
             ph as i32,
@@ -909,6 +919,20 @@ impl App {
         self.need_paint = true;
     }
 
+    /// Keyboard focus moved. Key-ups for keys pressed elsewhere (lunarfile,
+    /// a new window) never reach us, so modifiers and repeat start over from
+    /// what the compositor says is held now.
+    fn reset_keys(&mut self, pressed: &[u32]) {
+        let held = |codes: &[u32]| pressed.iter().any(|k| codes.contains(k));
+        self.ctrl = held(&[29, 97]);
+        self.alt = held(&[56, 100]);
+        self.shift = held(&[42, 54]);
+        self.held = None;
+        self.held_at = None;
+        self.repeated_at = None;
+        self.swallowed = None;
+    }
+
     fn on_key(&mut self, evdev: u32, down: bool) {
         match evdev {
             29 | 97 => self.ctrl = down,
@@ -1155,7 +1179,7 @@ impl App {
             self.leave_location();
             if let Some(session) = &self.session {
                 if let Ok(url) = url::Url::parse(&session.shell.location_text()) {
-                    if let Err(err) = downloads::save_url(&url) {
+                    if let Err(err) = downloads::save_url(&url, !self.persist) {
                         eprintln!("silversurfer: descarga: {err}");
                     }
                 }
@@ -1414,18 +1438,9 @@ impl App {
         if height > 0 {
             self.logical_h = height.max(chrome::HEIGHT + 64);
         }
-        if self.fullscreen {
-            let scale = self.scale.max(1) as u32;
-            let pw = (self.logical_w.max(1) as u32) * scale;
-            let ph = (self.logical_h.max(1) as u32) * scale;
-            if let Some(session) = &self.session {
-                session.shell.resize(pw, ph, self.scale as f32);
-            }
-        } else {
-            let (pw, ph) = chrome::content_px(self.logical_w, self.logical_h, self.scale);
-            if let Some(session) = &self.session {
-                session.shell.resize(pw, ph, self.scale as f32);
-            }
+        let (pw, ph) = self.content_size();
+        if let Some(session) = &self.session {
+            session.shell.resize(pw, ph, self.scale as f32);
         }
         self.chrome_fp = 0;
         self.need_paint = true;
@@ -2001,6 +2016,14 @@ impl Dispatch<WlKeyboard, ()> for App {
                     xkb.state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
                 }
             }
+            wl_keyboard::Event::Enter { keys, .. } => {
+                let pressed: Vec<u32> = keys
+                    .chunks_exact(4)
+                    .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                state.reset_keys(&pressed);
+            }
+            wl_keyboard::Event::Leave { .. } => state.reset_keys(&[]),
             _ => {}
         }
     }

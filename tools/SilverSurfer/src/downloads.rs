@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::files::{self, PickRequest};
-use crate::session::{data_dir, find_string, json_string};
+use crate::session::{data_dir, find_string, json_string, leaf_objects};
 
 const MAX_ENTRIES: usize = 100;
 
@@ -54,13 +54,7 @@ impl Log {
 
     pub fn decode(text: &str) -> Self {
         let mut entries = Vec::new();
-        let mut rest = text;
-        while let Some(start) = rest.find('{') {
-            let chunk = &rest[start..];
-            let Some(end) = chunk.find('}') else {
-                break;
-            };
-            let obj = &chunk[..=end];
+        for obj in leaf_objects(text) {
             if obj.contains("\"url\"") && obj.contains("\"path\"") {
                 if let (Some(url), Some(path)) =
                     (find_string(obj, "\"url\""), find_string(obj, "\"path\""))
@@ -69,7 +63,6 @@ impl Log {
                     entries.push(Entry { url, path, ok });
                 }
             }
-            rest = &chunk[end + 1..];
         }
         Self { entries }
     }
@@ -135,10 +128,11 @@ pub fn looks_like_download(url: &url::Url) -> bool {
     DOWNLOAD_EXTS.iter().any(|e| *e == ext)
 }
 
-/// Abre lunarfile en modo guardar y descarga con `curl -L`.
+/// Abre lunarfile en modo guardar y descarga con `curl -L` en otro hilo.
 ///
-/// Devuelve `Ok(path)` si se guardó, `Ok(None)` si el usuario canceló.
-pub fn save_url(url: &url::Url) -> Result<Option<PathBuf>, String> {
+/// Devuelve `Ok(Some(path))` si la descarga arrancó, `Ok(None)` si el
+/// usuario canceló. `private` no deja rastro en `downloads.json`.
+pub fn save_url(url: &url::Url, private: bool) -> Result<Option<PathBuf>, String> {
     let name = suggested_name(url);
     let paths = files::pick(&PickRequest {
         multiple: false,
@@ -150,27 +144,55 @@ pub fn save_url(url: &url::Url) -> Result<Option<PathBuf>, String> {
     if let Some(parent) = dest.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let status = Command::new("curl")
-        .args(["-fsSL", "--output"])
-        .arg(&dest)
-        .arg(url.as_str())
+    let url = url.clone();
+    let target = dest.clone();
+    std::thread::Builder::new()
+        .name("silversurfer-download".into())
+        .spawn(move || fetch(&url, &target, private))
+        .map_err(|e| format!("descarga: {e}"))?;
+    Ok(Some(dest))
+}
+
+fn fetch(url: &url::Url, dest: &Path, private: bool) {
+    let ok = match Command::new("curl")
+        .args(curl_args(url, dest))
         .status()
-        .map_err(|e| format!("curl: {e}"))?;
-    let ok = status.success();
-    let mut log = load();
-    log.push(Entry {
-        url: url.to_string(),
-        path: dest.display().to_string(),
-        ok,
-    });
-    let _ = save(&log);
+    {
+        Ok(status) => status.success(),
+        Err(err) => {
+            eprintln!("silversurfer: curl: {err}");
+            false
+        }
+    };
+    if !private {
+        let mut log = load();
+        log.push(Entry {
+            url: url.to_string(),
+            path: dest.display().to_string(),
+            ok,
+        });
+        let _ = save(&log);
+    }
     if ok {
         eprintln!("silversurfer: descargado → {}", dest.display());
-        Ok(Some(dest))
     } else {
-        let _ = std::fs::remove_file(&dest);
-        Err(format!("curl falló al descargar {}", url))
+        let _ = std::fs::remove_file(dest);
+        eprintln!("silversurfer: curl falló al descargar {url}");
     }
+}
+
+fn curl_args(url: &url::Url, dest: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "-fsSL".into(),
+        "--proto".into(),
+        "=http,https,ftp".into(),
+        "--proto-redir".into(),
+        "=http,https".into(),
+        "--output".into(),
+        dest.as_os_str().to_owned(),
+        "--".into(),
+        url.as_str().into(),
+    ]
 }
 
 pub fn page_url() -> url::Url {
@@ -233,6 +255,16 @@ mod tests {
         assert!(!looks_like_download(&html));
         let page = url::Url::parse("https://example.com/ruta/").unwrap();
         assert!(!looks_like_download(&page));
+    }
+
+    #[test]
+    fn curl_gets_the_url_after_the_option_terminator() {
+        let url = url::Url::parse("https://example.com/a.zip").unwrap();
+        let args = curl_args(&url, Path::new("/home/u/a.zip"));
+        let n = args.len();
+        assert_eq!(args[n - 2], "--");
+        assert_eq!(args[n - 1], "https://example.com/a.zip");
+        assert!(args.iter().any(|a| a == "=http,https,ftp"));
     }
 
     #[test]

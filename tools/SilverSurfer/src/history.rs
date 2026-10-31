@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::session::{data_dir, json_string, find_string};
+use crate::session::{data_dir, find_string, json_string, leaf_objects};
 
 const MAX_VISITS: usize = 200;
 
@@ -39,13 +39,7 @@ impl History {
 
     pub fn decode(text: &str) -> Self {
         let mut visits = Vec::new();
-        let mut rest = text;
-        while let Some(start) = rest.find('{') {
-            let chunk = &rest[start..];
-            let Some(end) = chunk.find('}') else {
-                break;
-            };
-            let obj = &chunk[..=end];
+        for obj in leaf_objects(text) {
             if obj.contains("\"url\"") {
                 if let Some(url) = find_string(obj, "\"url\"") {
                     if !url.is_empty() && !url.starts_with("about:") {
@@ -54,7 +48,6 @@ impl History {
                     }
                 }
             }
-            rest = &chunk[end + 1..];
         }
         Self { visits }
     }

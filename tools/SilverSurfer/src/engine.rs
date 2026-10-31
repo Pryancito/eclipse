@@ -1025,7 +1025,7 @@ impl WebViewDelegate for Delegate {
         if downloads::looks_like_download(&request.url) {
             let url = request.url.clone();
             request.deny();
-            if let Err(err) = downloads::save_url(&url) {
+            if let Err(err) = downloads::save_url(&url, self.private) {
                 eprintln!("silversurfer: descarga: {err}");
             }
             return;

@@ -40,20 +40,14 @@ impl Snapshot {
     pub fn decode(text: &str) -> Option<Self> {
         let active = find_number(text, "\"active\"")?;
         let mut tabs = Vec::new();
-        let mut rest = text;
-        while let Some(start) = rest.find('{') {
-            // Skip the root object: only objects that contain "url".
-            let chunk = &rest[start..];
-            let end = chunk.find('}')?;
-            let obj = &chunk[..=end];
-            if obj.contains("\"url\"") {
-                let url = find_string(obj, "\"url\"")?;
-                let title = find_string(obj, "\"title\"").unwrap_or_default();
-                if !url.is_empty() {
-                    tabs.push(SavedTab { url, title });
-                }
+        for obj in leaf_objects(text) {
+            let Some(url) = find_string(obj, "\"url\"") else {
+                continue;
+            };
+            let title = find_string(obj, "\"title\"").unwrap_or_default();
+            if !url.is_empty() {
+                tabs.push(SavedTab { url, title });
             }
-            rest = &chunk[end + 1..];
         }
         if tabs.is_empty() {
             return None;
@@ -122,6 +116,38 @@ pub(crate) fn json_string(s: &str) -> String {
         }
     }
     out.push('"');
+    out
+}
+
+/// Innermost `{…}` objects of `text`. Braces inside JSON strings (a URL
+/// with `?q={x}`, a title with `}`) do not open or close an object.
+pub(crate) fn leaf_objects(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = None;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, b) in text.bytes().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => start = Some(i),
+            b'}' => {
+                if let Some(s) = start.take() {
+                    out.push(&text[s..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
     out
 }
 
@@ -213,6 +239,24 @@ mod tests {
         let back = load_from(&path).unwrap();
         assert_eq!(back, snap);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn braces_inside_strings_do_not_lose_the_session() {
+        let snap = Snapshot {
+            active: 1,
+            tabs: vec![
+                SavedTab {
+                    url: "https://example.com/?q={x}".into(),
+                    title: "a } b { c".into(),
+                },
+                SavedTab {
+                    url: "https://servo.org/".into(),
+                    title: "Servo".into(),
+                },
+            ],
+        };
+        assert_eq!(Snapshot::decode(&snap.encode()), Some(snap));
     }
 
     #[test]
