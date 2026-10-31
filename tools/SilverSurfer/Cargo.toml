@@ -46,8 +46,12 @@ servo = { version = "0.7", optional = true, default-features = false, features =
     "multiprocess",
     "webgl",
     "webgpu",
-    # SubtleCrypto + CompressionStream help modern SPA bundles (React/Next).
-    "webcrypto",
+    # CompressionStream helps modern SPA bundles (React/Next).
+    # No `webcrypto`: in servo-script 0.7 it pulls `aes-gcm = "^0.11"` (stable
+    # only since 2026-06; a stale index entry has just RCs, so resolution
+    # fails) and exact prerelease pins (`rsa =0.10.0-rc.18`, `x448`,
+    # `ed448-goldilocks`). Without it Servo exposes no `crypto` global at all,
+    # not even `getRandomValues`. The `pkcs1` pin below is for when it is back.
     "brotli-compression-stream",
 ] }
 euclid = { version = "0.22", optional = true }
