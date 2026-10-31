@@ -310,12 +310,13 @@ impl App {
         }
         let url = self.initial_url.take().unwrap_or_else(home::home_url);
         let (pw, ph) = chrome::content_px(self.logical_w, self.logical_h, self.scale);
-        let (context, gpu) = self.make_context(pw, ph)?;
+        let (context, window_context, gpu) = self.make_context(pw, ph)?;
         let waker = Waker::new()?;
         let private = !self.persist;
         let session = engine::start(
             waker.clone(),
             context,
+            window_context,
             gpu,
             url,
             self.scale as f32,
@@ -354,15 +355,23 @@ impl App {
         &self,
         width: u32,
         height: u32,
-    ) -> Result<(Rc<dyn RenderingContext>, bool), String> {
+    ) -> Result<
+        (
+            Rc<dyn RenderingContext>,
+            Option<Rc<WindowRenderingContext>>,
+            bool,
+        ),
+        String,
+    > {
         if let Some(context) = self.try_gpu(width, height) {
-            return Ok((context, true));
+            let dyn_context: Rc<dyn RenderingContext> = context.clone();
+            return Ok((dyn_context, Some(context), true));
         }
         eprintln!("silversurfer: sin contexto EGL, la página se pinta en software");
-        Ok((engine::software_context(width, height)?, false))
+        Ok((engine::software_context(width, height)?, None, false))
     }
 
-    fn try_gpu(&self, width: u32, height: u32) -> Option<Rc<dyn RenderingContext>> {
+    fn try_gpu(&self, width: u32, height: u32) -> Option<Rc<WindowRenderingContext>> {
         let page = self.page.as_ref()?;
         let surface = NonNull::new(proxy_ptr(page))?;
         let display = NonNull::new(self.conn.backend().display_ptr().cast())?;
@@ -393,7 +402,7 @@ impl App {
             if session.shell.flags().close_window.load(std::sync::atomic::Ordering::Relaxed) {
                 self.exit = true;
             }
-            session.servo.spin_event_loop();
+            session.spin_event_loop();
         }
         let frame = self.session.as_ref().is_some_and(|s| {
             s.shell
@@ -1792,9 +1801,9 @@ pub fn run(start: Start) -> Result<(), String> {
             let _ = session.shell.clear_browsing_data();
         }
     }
-    // Tear Servo down while the Wayland connection is still alive so
-    // `Session::drop` can spin the constellation / content-process exit
-    // instead of racing a hard process teardown (BHM control disconnect).
+    // Tear Servo / WebGL / EGL down while Wayland is still alive: Session::drop
+    // drains CloseWebView, runs Servo Exit (joins WebGL destroy_context), then
+    // take_window so FBO renderbuffers are not left for surfman Drop panics.
     drop(app.session.take());
     Ok(())
 }
