@@ -85,6 +85,9 @@ Sin URL restaura las pestañas de
 
 La barra busca con DuckDuckGo si el texto no parece una dirección
 (`SILVERSURFER_SEARCH` cambia la plantilla; usa `{query}` o `{}`).
+El User-Agent por defecto imita Firefox de escritorio (con `Gecko/` y
+`Firefox/`, más `Servo/0.7`) para que sitios como Google no sirvan la
+cáscara degradada; `SILVERSURFER_UA` lo sustituye entero.
 El título de la ventana sigue la pestaña activa; mientras carga, el tab
 muestra `…` y la barra un distintivo de esquema (`s` https, `!` http, `/` file).
 El cromo se pinta a la escala del output (HiDPI nativo), con iconos

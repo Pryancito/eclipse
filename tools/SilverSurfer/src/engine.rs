@@ -21,7 +21,22 @@ use servo::{
 use crate::files::{self, PickRequest};
 use crate::session::{SavedTab, Snapshot};
 
-const USER_AGENT: &str = "SilverSurfer/0.1 (Eclipse OS; Wayland) Servo/0.7";
+/// Default HTTP / `navigator.userAgent` string.
+///
+/// A custom `SilverSurfer/… Servo/…` UA without `Firefox`/`Gecko` tokens makes
+/// several major sites (notably Google) serve a degraded shell. Servo itself
+/// defaults to a Firefox-shaped UA; we keep that shape and add the `Gecko/`
+/// token some CDNs require when they see `Firefox` (see servo/servo#36951).
+/// Override with `SILVERSURFER_UA` for debugging.
+fn user_agent() -> String {
+    match std::env::var("SILVERSURFER_UA") {
+        Ok(ua) if !ua.is_empty() => ua,
+        _ => {
+            "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0 Servo/0.7"
+                .into()
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Waker {
@@ -597,7 +612,7 @@ pub fn start(
     let mut opts = Opts::default();
     opts.multiprocess = true;
     let mut preferences = Preferences::default();
-    preferences.user_agent = USER_AGENT.into();
+    preferences.user_agent = user_agent();
     preferences.dom_webgpu_enabled = true;
     preferences.dom_webgl2_enabled = true;
     preferences.dom_webrtc_enabled = true;
