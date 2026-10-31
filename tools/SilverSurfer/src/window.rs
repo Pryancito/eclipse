@@ -38,12 +38,16 @@ use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use xkbcommon::xkb::{self, Keymap, State as XkbState};
 
+use crate::bookmarks;
 use crate::chrome::{self, Hit, View};
+use crate::downloads;
 use crate::engine::{self, Session, Waker};
 use crate::files::{self, PickRequest};
+use crate::history;
 use crate::home;
 use crate::location::{resolve_omnibox, search_template, SchemeHint};
 use crate::look::Look;
+use crate::menu;
 use crate::session::{self, Snapshot};
 use crate::spawn;
 use crate::wl;
@@ -147,6 +151,8 @@ pub struct App {
     loc_focused: bool,
     loc_text: String,
     loc_cursor: usize,
+    /// Ctrl+F: la barra busca en la página en vez de navegar.
+    find_mode: bool,
     /// Linux button code held over the page. Release sends button-up, so a
     /// drag can select text instead of clicking on the press.
     page_button: Option<u32>,
@@ -169,6 +175,16 @@ pub struct App {
     pending_tabs: Vec<(url::Url, String)>,
     pending_active: usize,
     persist: bool,
+    /// F11 / Fullscreen API: cromo oculto y página a pantalla completa.
+    fullscreen: bool,
+    /// La Fullscreen API de la página empujó el estado (para no pelear con F11).
+    page_drove_fs: bool,
+    /// Arrastre de pestaña en curso (índice origen).
+    drag_tab: Option<usize>,
+    /// Huella del último cromo subido; evita commit Wayland si no cambió.
+    chrome_fp: u64,
+    /// Reloj de arranque para métricas percibidas.
+    started_at: Instant,
 }
 
 impl App {
@@ -218,6 +234,7 @@ impl App {
             loc_focused: false,
             loc_text: String::new(),
             loc_cursor: 0,
+            find_mode: false,
             page_button: None,
             on_page: false,
             swallowed: None,
@@ -237,7 +254,64 @@ impl App {
             pending_tabs,
             pending_active,
             persist,
+            fullscreen: false,
+            page_drove_fs: false,
+            drag_tab: None,
+            chrome_fp: 0,
+            started_at: Instant::now(),
         }
+    }
+
+    fn chrome_h(&self) -> i32 {
+        if self.fullscreen {
+            0
+        } else {
+            chrome::HEIGHT
+        }
+    }
+
+    fn apply_fullscreen_layout(&mut self) {
+        let chrome_h = self.chrome_h();
+        if let Some(page_sub) = &self.page_sub {
+            page_sub.set_position(0, chrome_h);
+        }
+        if let Some(top) = &self.toplevel {
+            if self.fullscreen {
+                top.set_fullscreen(None);
+            } else {
+                top.unset_fullscreen();
+            }
+        }
+        let (pw, ph) = chrome::content_px(self.logical_w, self.logical_h.max(chrome_h + 1), self.scale);
+        // content_px resta HEIGHT fijo; en fullscreen usamos el alto completo.
+        let (pw, ph) = if self.fullscreen {
+            let scale = self.scale.max(1) as u32;
+            (
+                (self.logical_w.max(1) as u32) * scale,
+                (self.logical_h.max(1) as u32) * scale,
+            )
+        } else {
+            (pw, ph)
+        };
+        if let Some(session) = &self.session {
+            session.shell.resize(pw, ph, self.scale as f32);
+        }
+        self.chrome_fp = 0;
+        self.need_paint = true;
+    }
+
+    fn set_fullscreen(&mut self, on: bool) {
+        if self.fullscreen == on {
+            return;
+        }
+        self.fullscreen = on;
+        if !on {
+            self.page_drove_fs = false;
+            if let Some(session) = &self.session {
+                session.shell.exit_fullscreen();
+            }
+        }
+        self.apply_fullscreen_layout();
     }
 
     fn refresh_look(&mut self) {
@@ -255,6 +329,7 @@ impl App {
         let next = Look::current();
         if next != self.look {
             self.look = next;
+            self.chrome_fp = 0;
             self.need_paint = true;
         }
     }
@@ -312,6 +387,7 @@ impl App {
         let (pw, ph) = chrome::content_px(self.logical_w, self.logical_h, self.scale);
         let (context, gpu) = self.make_context(pw, ph)?;
         let waker = Waker::new()?;
+        let t0 = self.started_at;
         let private = !self.persist;
         let session = engine::start(
             waker.clone(),
@@ -322,9 +398,10 @@ impl App {
             private,
         )?;
         eprintln!(
-            "silversurfer: paint={}{}",
+            "silversurfer: paint={}{} session_ms={}",
             if gpu { "EGL" } else { "software→wl_shm" },
-            if private { " private" } else { "" }
+            if private { " private" } else { "" },
+            t0.elapsed().as_millis()
         );
         let extra = std::mem::take(&mut self.pending_tabs);
         let active = self.pending_active;
@@ -357,6 +434,13 @@ impl App {
     ) -> Result<(Rc<dyn RenderingContext>, bool), String> {
         if let Some(context) = self.try_gpu(width, height) {
             return Ok((context, true));
+        }
+        let require_egl = std::env::var_os("SILVERSURFER_REQUIRE_EGL").is_some();
+        if require_egl {
+            return Err(
+                "SILVERSURFER_REQUIRE_EGL: no hay contexto EGL y el software está prohibido"
+                    .into(),
+            );
         }
         eprintln!("silversurfer: sin contexto EGL, la página se pinta en software");
         Ok((engine::software_context(width, height)?, false))
@@ -395,6 +479,19 @@ impl App {
             }
             session.servo.spin_event_loop();
         }
+        let page_fs = self.session.as_ref().is_some_and(|s| {
+            s.shell
+                .flags()
+                .page_fullscreen
+                .load(std::sync::atomic::Ordering::Relaxed)
+        });
+        if page_fs && !self.fullscreen {
+            self.page_drove_fs = true;
+            self.set_fullscreen(true);
+        } else if !page_fs && self.page_drove_fs {
+            self.page_drove_fs = false;
+            self.set_fullscreen(false);
+        }
         let frame = self.session.as_ref().is_some_and(|s| {
             s.shell
                 .flags()
@@ -410,8 +507,10 @@ impl App {
         if frame {
             self.paint_page()?;
         }
-        if chrome || self.need_paint {
+        if (chrome || self.need_paint) && !self.fullscreen {
             self.paint_chrome()?;
+            self.need_paint = false;
+        } else if self.need_paint {
             self.need_paint = false;
         }
         let _ = animating;
@@ -466,7 +565,7 @@ impl App {
         if buf.busy {
             return false;
         }
-        let dst_y = (chrome::HEIGHT * self.scale).max(0) as u32;
+        let dst_y = (self.chrome_h() * self.scale).max(0) as u32;
         let stride = (buf.width as usize) * 4;
         let len = buf.mem.len;
         let dst = unsafe { std::slice::from_raw_parts_mut(buf.mem.ptr, len) };
@@ -520,7 +619,20 @@ impl App {
         if let Some(top) = &self.toplevel {
             top.set_title(window_title);
         }
-        let pixels = chrome::render(&View {
+        let suggest = if self.loc_focused && !self.find_mode {
+            history::load()
+                .autocomplete(&location)
+                .map(|v| v.url.chars().skip(location.chars().count()).collect())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let popup = self
+            .session
+            .as_ref()
+            .and_then(|s| s.shell.context_popup())
+            .map(|p| p.clamp_to(self.logical_w, self.logical_h));
+        let view = View {
             width: self.logical_w,
             look: self.look,
             titles: &titles,
@@ -529,14 +641,38 @@ impl App {
             location: &location,
             location_focused: self.loc_focused,
             location_cursor: self.loc_cursor,
+            location_suggest: &suggest,
+            find_mode: self.find_mode,
             scheme,
             gpu,
             private,
             can_back,
             can_forward,
             scale: self.scale,
-        });
+        };
+        let fp = chrome_fingerprint(
+            &titles,
+            &loading,
+            active,
+            &location,
+            self.loc_focused,
+            self.loc_cursor,
+            self.find_mode,
+            scheme,
+            gpu,
+            can_back,
+            can_forward,
+            self.scale,
+            self.logical_w,
+            popup.as_ref(),
+        );
+        if fp == self.chrome_fp && popup.is_none() {
+            // Contenido idéntico: no reconstruir ni recommitear el wl_shm del cromo.
+            return Ok(());
+        }
+        let pixels = menu::render(&view, self.logical_h, popup.as_ref());
         self.upload_chrome(&pixels.argb, pixels.width, pixels.height)?;
+        self.chrome_fp = fp;
         self.ensure_parent_buffer()?;
         if let Some(page) = &self.page {
             page.set_buffer_scale(self.scale);
@@ -639,6 +775,11 @@ impl App {
 
     fn on_pointer_button(&mut self, button: u32, down: bool) {
         if !down {
+            if let Some(from) = self.drag_tab.take() {
+                let x = self.px.round() as i32;
+                let y = self.py.round() as i32;
+                self.finish_tab_drag(from, x, y);
+            }
             if self.page_button == Some(button) {
                 self.page_button = None;
                 if let Some((px, py)) = self.page_px() {
@@ -649,7 +790,25 @@ impl App {
         }
         let x = self.px.round() as i32;
         let y = self.py.round() as i32;
-        if y < chrome::HEIGHT {
+        // Clic en menú contextual (overlay del cromo a pantalla completa).
+        if let Some(popup) = self.session.as_ref().and_then(|s| s.shell.context_popup()) {
+            if let Some(index) = popup.hit(x, y) {
+                if let Some(session) = &self.session {
+                    session.shell.activate_context_menu(index);
+                }
+                self.need_paint = true;
+                return;
+            }
+            if let Some(session) = &self.session {
+                session.shell.dismiss_context_menu();
+            }
+            self.need_paint = true;
+            if y >= self.chrome_h() {
+                // El clic fuera cierra el menú; no reenvía al page en este down.
+                return;
+            }
+        }
+        if y < self.chrome_h() {
             self.on_chrome_click(x, y);
             return;
         }
@@ -734,6 +893,8 @@ impl App {
                 if let Some(session) = &self.session {
                     session.shell.select_tab(index);
                 }
+                // Inicio de arrastre para reordenar al soltar.
+                self.drag_tab = Some(index);
             }
             Hit::Close(index) => {
                 let keep = self
@@ -835,6 +996,7 @@ impl App {
             return true;
         }
         if self.ctrl && evdev == 38 {
+            self.find_mode = false;
             self.loc_focused = true;
             if let Some(session) = &self.session {
                 session.shell.set_page_focused(false);
@@ -903,6 +1065,102 @@ impl App {
             }
             return true;
         }
+        // Ctrl++ / Ctrl+= / KP+ — zoom in.
+        if self.ctrl && (evdev == 13 || evdev == 78) {
+            if let Some(session) = &self.session {
+                session.shell.zoom_by(1.1);
+            }
+            return true;
+        }
+        // Ctrl+- / KP- — zoom out.
+        if self.ctrl && (evdev == 12 || evdev == 74) {
+            if let Some(session) = &self.session {
+                session.shell.zoom_by(1.0 / 1.1);
+            }
+            return true;
+        }
+        // Ctrl+0 — zoom reset.
+        if self.ctrl && evdev == 11 {
+            if let Some(session) = &self.session {
+                session.shell.zoom_reset();
+            }
+            return true;
+        }
+        // Ctrl+D — toggle bookmark for the active tab.
+        if self.ctrl && evdev == 32 {
+            if let Some(session) = &self.session {
+                let url = session.shell.location_text();
+                let title = session.shell.active_title();
+                let marked = bookmarks::toggle(&url, &title);
+                eprintln!(
+                    "silversurfer: marcador {} — {}",
+                    if marked { "añadido" } else { "quitado" },
+                    url
+                );
+            }
+            return true;
+        }
+        // Ctrl+F — find in page (barra como campo de búsqueda).
+        if self.ctrl && evdev == 33 {
+            self.find_mode = true;
+            self.loc_focused = true;
+            self.loc_text.clear();
+            self.loc_cursor = 0;
+            if let Some(session) = &self.session {
+                session.shell.set_page_focused(false);
+            }
+            self.need_paint = true;
+            return true;
+        }
+        // Ctrl+H — about:history.
+        if self.ctrl && evdev == 35 {
+            self.leave_location();
+            if let Some(session) = &self.session {
+                if let Ok(url) = url::Url::parse("about:history") {
+                    session.shell.load(url);
+                }
+            }
+            return true;
+        }
+        // Ctrl+B — about:bookmarks.
+        if self.ctrl && evdev == 48 {
+            self.leave_location();
+            if let Some(session) = &self.session {
+                if let Ok(url) = url::Url::parse("about:bookmarks") {
+                    session.shell.load(url);
+                }
+            }
+            return true;
+        }
+        // Ctrl+J — about:downloads.
+        if self.ctrl && evdev == 36 {
+            self.leave_location();
+            if let Some(session) = &self.session {
+                if let Ok(url) = url::Url::parse("about:downloads") {
+                    session.shell.load(url);
+                }
+            }
+            return true;
+        }
+        // Ctrl+S — guardar / descargar la URL actual.
+        if self.ctrl && evdev == 31 {
+            self.leave_location();
+            if let Some(session) = &self.session {
+                if let Ok(url) = url::Url::parse(&session.shell.location_text()) {
+                    if let Err(err) = downloads::save_url(&url) {
+                        eprintln!("silversurfer: descarga: {err}");
+                    }
+                }
+            }
+            return true;
+        }
+        // Ctrl+N — ventana nueva (proceso).
+        if self.ctrl && evdev == 49 {
+            if let Err(err) = spawn::new_window(None) {
+                eprintln!("silversurfer: {err}");
+            }
+            return true;
+        }
         // Ctrl+Shift+Delete — borrar cookies y datos de sitio.
         if self.ctrl && self.shift && evdev == 111 {
             self.leave_location();
@@ -912,14 +1170,63 @@ impl App {
             }
             return true;
         }
+        // F11 — pantalla completa (también Escape para salir).
+        if evdev == 87 {
+            self.set_fullscreen(!self.fullscreen);
+            return true;
+        }
+        if evdev == 1 && !self.loc_focused {
+            if self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.shell.context_popup().is_some())
+            {
+                if let Some(session) = &self.session {
+                    session.shell.dismiss_context_menu();
+                }
+                self.need_paint = true;
+                return true;
+            }
+            if self.fullscreen {
+                self.set_fullscreen(false);
+                return true;
+            }
+        }
         false
     }
 
+    fn finish_tab_drag(&mut self, from: usize, x: i32, y: i32) {
+        if y < 0 || y >= chrome::HEIGHT {
+            return;
+        }
+        let tabs = self
+            .session
+            .as_ref()
+            .map(|s| s.shell.tab_titles().len())
+            .unwrap_or(1)
+            .max(1);
+        let Some(hit) = chrome::hit(self.logical_w, tabs, x, y) else {
+            return;
+        };
+        let to = match hit {
+            Hit::Tab(i) | Hit::Close(i) => i,
+            _ => return,
+        };
+        if to == from {
+            return;
+        }
+        if let Some(session) = &self.session {
+            session.shell.move_tab(from, to);
+        }
+        self.need_paint = true;
+    }
+
     fn leave_location(&mut self) {
-        if !self.loc_focused {
+        if !self.loc_focused && !self.find_mode {
             return;
         }
         self.loc_focused = false;
+        self.find_mode = false;
         if let Some(session) = &self.session {
             session.shell.set_page_focused(true);
         }
@@ -948,20 +1255,27 @@ impl App {
     fn edit_location(&mut self, evdev: u32) {
         match evdev {
             1 => {
-                self.loc_focused = false;
-                if let Some(session) = &self.session {
-                    session.shell.set_page_focused(true);
+                self.leave_location();
+            }
+            15 if !self.find_mode => {
+                // Tab — aceptar autocompletado del historial.
+                if let Some(visit) = history::load().autocomplete(&self.loc_text) {
+                    self.loc_text = visit.url.clone();
+                    self.loc_cursor = self.loc_text.chars().count();
                 }
             }
             28 | 96 => {
-                if let Ok(url) = resolve_omnibox(&self.loc_text, &search_template()) {
+                if self.find_mode {
+                    if let Some(session) = &self.session {
+                        session.shell.find_in_page(&self.loc_text);
+                    }
+                } else if let Ok(url) = resolve_omnibox(&self.loc_text, &search_template()) {
                     if let Some(session) = &self.session {
                         session.shell.load(url);
                     }
-                }
-                self.loc_focused = false;
-                if let Some(session) = &self.session {
-                    session.shell.set_page_focused(true);
+                    self.leave_location();
+                } else {
+                    self.leave_location();
                 }
             }
             14 => {
@@ -1057,13 +1371,14 @@ impl App {
     }
 
     fn page_px(&self) -> Option<(f32, f32)> {
-        if self.py < chrome::HEIGHT as f64 {
+        let chrome_h = self.chrome_h() as f64;
+        if self.py < chrome_h {
             return None;
         }
         let scale = self.scale as f64;
         Some((
             (self.px * scale) as f32,
-            ((self.py - chrome::HEIGHT as f64) * scale) as f32,
+            ((self.py - chrome_h) * scale) as f32,
         ))
     }
 
@@ -1071,7 +1386,7 @@ impl App {
         let was = self.on_page;
         self.px = x;
         self.py = y;
-        self.on_page = self.py >= chrome::HEIGHT as f64;
+        self.on_page = self.py >= self.chrome_h() as f64;
         if was && !self.on_page {
             if let Some(session) = &self.session {
                 session.shell.pointer_left();
@@ -1091,18 +1406,79 @@ impl App {
         if height > 0 {
             self.logical_h = height.max(chrome::HEIGHT + 64);
         }
-        let (pw, ph) = chrome::content_px(self.logical_w, self.logical_h, self.scale);
-        if let Some(session) = &self.session {
-            session
-                .shell
-                .resize(pw, ph, self.scale as f32);
+        if self.fullscreen {
+            let scale = self.scale.max(1) as u32;
+            let pw = (self.logical_w.max(1) as u32) * scale;
+            let ph = (self.logical_h.max(1) as u32) * scale;
+            if let Some(session) = &self.session {
+                session.shell.resize(pw, ph, self.scale as f32);
+            }
+        } else {
+            let (pw, ph) = chrome::content_px(self.logical_w, self.logical_h, self.scale);
+            if let Some(session) = &self.session {
+                session.shell.resize(pw, ph, self.scale as f32);
+            }
         }
+        self.chrome_fp = 0;
         self.need_paint = true;
     }
 }
 
 fn is_modifier(evdev: u32) -> bool {
     matches!(evdev, 29 | 97 | 56 | 100 | 42 | 54)
+}
+
+fn chrome_fingerprint(
+    titles: &[String],
+    loading: &[bool],
+    active: usize,
+    location: &str,
+    loc_focused: bool,
+    loc_cursor: usize,
+    find_mode: bool,
+    scheme: SchemeHint,
+    gpu: bool,
+    can_back: bool,
+    can_forward: bool,
+    scale: i32,
+    width: i32,
+    popup: Option<&menu::Popup>,
+) -> u64 {
+    // FNV-1a 64: suficiente para saltar commits idénticos del cromo.
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    mix(&(width as u32).to_le_bytes());
+    mix(&(scale as u32).to_le_bytes());
+    mix(&(active as u32).to_le_bytes());
+    mix(&[u8::from(loc_focused), u8::from(find_mode), u8::from(gpu)]);
+    mix(&[u8::from(can_back), u8::from(can_forward)]);
+    mix(&(loc_cursor as u32).to_le_bytes());
+    mix(&[match scheme {
+        SchemeHint::Https => 1,
+        SchemeHint::Http => 2,
+        SchemeHint::File => 3,
+        SchemeHint::Other => 0,
+    }]);
+    mix(location.as_bytes());
+    for (t, l) in titles.iter().zip(loading.iter().chain(std::iter::repeat(&false))) {
+        mix(t.as_bytes());
+        mix(&[u8::from(*l)]);
+        mix(&[0xff]);
+    }
+    if let Some(p) = popup {
+        mix(&(p.x as u32).to_le_bytes());
+        mix(&(p.y as u32).to_le_bytes());
+        for item in &p.items {
+            mix(item.label.as_bytes());
+            mix(&[u8::from(item.enabled), u8::from(item.separator)]);
+        }
+    }
+    h
 }
 
 fn insert_chars(text: &mut String, cursor: &mut usize, extra: &str) {

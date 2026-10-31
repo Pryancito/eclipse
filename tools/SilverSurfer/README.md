@@ -85,9 +85,26 @@ sesión; al cerrar borra cookies/almacenamiento/caché de esa instancia).
 | Ctrl+O | `lunarfile --pick` y abre el fichero |
 | Ctrl+Shift+P | Ventana privada (otro proceso) |
 | Ctrl+Shift+Delete | Borrar cookies y datos de sitio |
+| Ctrl++ / Ctrl+- / Ctrl+0 | Zoom página / restablecer |
+| Ctrl+F | Buscar en la página (`window.find`) |
+| Ctrl+D | Añadir o quitar marcador |
+| Ctrl+H / Ctrl+B | Historial / marcadores |
+| Ctrl+S | Descargar URL actual (`lunarfile --save` + curl) |
+| Ctrl+J | Lista de descargas |
+| F11 / Escape | Pantalla completa / salir |
+| Ctrl+N | Ventana nueva (otro proceso) |
+| Arrastrar pestaña | Reordenar |
+| Clic derecho (página) | Menú contextual |
+| Tab (en la barra) | Aceptar sugerencia del historial |
 
 La barra busca con DuckDuckGo si el texto no parece una dirección
 (`SILVERSURFER_SEARCH` cambia la plantilla; usa `{query}` o `{}`).
+Las visitas se guardan en
+`$XDG_DATA_HOME/silversurfer/history.json`, los marcadores en
+`bookmarks.json` y el registro de descargas en `downloads.json`.
+`about:history`, `about:bookmarks` y `about:downloads` abren listas
+locales. Navegar a PDF/ZIP/… intercepta la carga y pide destino con
+lunarfile (Servo 0.7 no expone un hook de descarga nativo).
 El User-Agent por defecto imita Firefox de escritorio (con `Gecko/` y
 `Firefox/`, más `Servo/0.7`) para que sitios como Google no sirvan la
 cáscara degradada; `SILVERSURFER_UA` lo sustituye entero.
@@ -134,3 +151,8 @@ HLS nativo con un master raro o cifrado, el demuxer puede fallar; el smoke lo
 marca en rojo en lugar de reintentar en bucle.
 
 `<input type=file>` también abre `lunarfile`. Escape en el selector cancela.
+
+Arranque: el log incluye `session_ms` hasta tener Servo listo. Con
+`SILVERSURFER_REQUIRE_EGL=1` falla si no hay EGL (sin fallback software).
+El cromo omite el commit Wayland si el contenido no cambió; solo la
+pestaña activa dispara el present de frames.

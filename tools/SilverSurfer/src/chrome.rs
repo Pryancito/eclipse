@@ -32,7 +32,7 @@ pub struct RectI {
 }
 
 impl RectI {
-    fn contains(self, x: i32, y: i32) -> bool {
+    pub fn contains(self, x: i32, y: i32) -> bool {
         x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
     }
 }
@@ -223,6 +223,10 @@ pub struct View<'a> {
     pub location_focused: bool,
     /// Caret, in characters, used only while the bar is focused.
     pub location_cursor: usize,
+    /// Sufijo de autocompletado del historial (solo barra enfocada).
+    pub location_suggest: &'a str,
+    /// La barra actúa como buscar-en-página (Ctrl+F).
+    pub find_mode: bool,
     pub scheme: SchemeHint,
     /// `true` = página por EGL; `false` = blit software → wl_shm.
     pub gpu: bool,
@@ -398,8 +402,13 @@ pub fn render(view: &View<'_>) -> Pixels {
             scale,
         );
     }
-    let loc = if view.location.is_empty() {
+    let placeholder = if view.find_mode {
+        "Buscar en la página"
+    } else {
         "Buscar o escribir una dirección"
+    };
+    let loc = if view.location.is_empty() {
+        placeholder
     } else {
         view.location
     };
@@ -422,6 +431,25 @@ pub fn render(view: &View<'_>) -> Pixels {
         loc_color,
         scale,
     );
+    // Ghost del historial: mono FONT_6X10 → 6 CSS px por carácter.
+    if view.location_focused
+        && !view.find_mode
+        && !view.location_suggest.is_empty()
+        && view.location_cursor == view.location.chars().count()
+    {
+        let typed_chars = view.location.chars().count().min(room.saturating_sub(1));
+        let ghost = clip(view.location_suggest, room.saturating_sub(typed_chars + 1));
+        if !ghost.is_empty() {
+            label_scaled(
+                &mut target,
+                lay.location.x + 8 + (typed_chars as i32 + 1) * 6,
+                lay.location.y + 16,
+                &ghost,
+                dim,
+                scale,
+            );
+        }
+    }
     Pixels {
         argb,
         width: width as i32,
@@ -804,6 +832,8 @@ mod tests {
             location: "https://example.com",
             location_focused: true,
             location_cursor: 0,
+            location_suggest: "",
+            find_mode: false,
             scheme: SchemeHint::Https,
             gpu: true,
             private: false,
@@ -898,6 +928,8 @@ mod tests {
                 location: "",
                 location_focused: false,
                 location_cursor: 0,
+                location_suggest: "",
+                find_mode: false,
                 scheme: SchemeHint::Other,
                 gpu: false,
                 private: true,

@@ -13,17 +13,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use dpi::PhysicalSize;
 use euclid::Scale;
 use servo::{
-    DevicePoint, EmbedderControl, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
-    LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent,
-    MouseLeftViewportEvent, MouseMoveEvent, Opts, Preferences, Servo, ServoBuilder, Theme,
-    UserContentManager, UserScript, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
-    WheelDelta, WheelEvent, WheelMode,
+    ContextMenu, ContextMenuAction, ContextMenuItem, DevicePoint, EmbedderControl, EventLoopWaker,
+    InputEvent, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
+    MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent, MouseMoveEvent, NavigationRequest,
+    Opts, Preferences, Servo, ServoBuilder, Theme, UserContentManager, UserScript, WebView,
+    WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use crate::about;
+use crate::downloads;
 use crate::files::{self, PickRequest};
+use crate::history;
+use crate::menu::{self, Popup};
 use crate::privacy;
 use crate::session::{SavedTab, Snapshot};
 use crate::spa_compat::{self, GITHUB_REVEAL_USERSCRIPT};
+use crate::spawn;
 
 /// Default HTTP / `navigator.userAgent` string.
 ///
@@ -148,6 +152,10 @@ pub struct Flags {
     pub animating: AtomicBool,
     /// The script closed the last tab. The window loop exits.
     pub close_window: AtomicBool,
+    /// La página pidió Fullscreen API; la ventana debe seguirla.
+    pub page_fullscreen: AtomicBool,
+    /// Hay un menú contextual pendiente de pintar / resolver.
+    pub context_menu: AtomicBool,
 }
 
 pub struct Tab {
@@ -174,6 +182,8 @@ pub struct Delegate {
     scale: Cell<f32>,
     /// Shared userscripts (SPA polyfills + GitHub opacity reveal).
     user_content: RefCell<Option<Rc<UserContentManager>>>,
+    /// Menú contextual vivo hasta que la ventana elige o cancela.
+    pending_menu: RefCell<Option<(ContextMenu, Popup)>>,
 }
 
 pub struct Session {
@@ -368,6 +378,136 @@ impl Delegate {
             .collect()
     }
 
+    pub fn page_zoom(&self) -> f32 {
+        self.active_view()
+            .map(|view| view.page_zoom())
+            .unwrap_or(1.0)
+    }
+
+    pub fn set_page_zoom(&self, zoom: f32) {
+        if let Some(view) = self.active_view() {
+            view.set_page_zoom(zoom.clamp(0.25, 5.0));
+            self.flags.frame.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn zoom_by(&self, factor: f32) {
+        let next = (self.page_zoom() * factor).clamp(0.25, 5.0);
+        self.set_page_zoom(next);
+    }
+
+    pub fn zoom_reset(&self) {
+        self.set_page_zoom(1.0);
+    }
+
+    pub fn exit_fullscreen(&self) {
+        if let Some(view) = self.active_view() {
+            view.exit_fullscreen();
+        }
+        self.flags.page_fullscreen.store(false, Ordering::Relaxed);
+    }
+
+    pub fn context_popup(&self) -> Option<Popup> {
+        self.pending_menu
+            .borrow()
+            .as_ref()
+            .map(|(_, popup)| popup.clone())
+    }
+
+    pub fn dismiss_context_menu(&self) {
+        if let Some((menu, _)) = self.pending_menu.borrow_mut().take() {
+            menu.dismiss();
+        }
+        self.flags.context_menu.store(false, Ordering::Relaxed);
+        self.flags.chrome.store(true, Ordering::Relaxed);
+    }
+
+    pub fn activate_context_menu(&self, index: usize) {
+        let Some((menu, popup)) = self.pending_menu.borrow_mut().take() else {
+            return;
+        };
+        self.flags.context_menu.store(false, Ordering::Relaxed);
+        self.flags.chrome.store(true, Ordering::Relaxed);
+        let Some(item) = popup.items.get(index) else {
+            menu.dismiss();
+            return;
+        };
+        if item.separator || !item.enabled {
+            menu.dismiss();
+            return;
+        }
+        let action = match menu.items().get(index) {
+            Some(ContextMenuItem::Item { action, .. }) => *action,
+            _ => {
+                menu.dismiss();
+                return;
+            }
+        };
+        // Abrir enlace/imagen en ventana nueva (proceso), no solo pestaña.
+        match action {
+            ContextMenuAction::OpenLinkInNewWebView => {
+                if let Some(url) = menu.element_info().link_url.clone() {
+                    menu.dismiss();
+                    if let Err(err) = spawn::new_window(Some(url.as_str())) {
+                        eprintln!("silversurfer: {err}");
+                    }
+                    return;
+                }
+            }
+            ContextMenuAction::OpenImageInNewView => {
+                if let Some(url) = menu.element_info().image_url.clone() {
+                    menu.dismiss();
+                    if let Err(err) = spawn::new_window(Some(url.as_str())) {
+                        eprintln!("silversurfer: {err}");
+                    }
+                    return;
+                }
+            }
+            _ => {}
+        }
+        menu.select(action);
+    }
+
+    /// Reordena pestañas. Tras el movimiento la pestaña queda en el índice `to`.
+    pub fn move_tab(&self, from: usize, to: usize) {
+        let mut model = self.model.borrow_mut();
+        let n = model.tabs.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        let tab = model.tabs.remove(from);
+        // Tras quitar `from`, insertar de forma que el índice final sea `to`.
+        let insert_at = if from < to { to } else { to };
+        let insert_at = insert_at.min(model.tabs.len());
+        model.tabs.insert(insert_at, tab);
+        if model.active == from {
+            model.active = insert_at;
+        } else if from < model.active && insert_at >= model.active {
+            model.active -= 1;
+        } else if from > model.active && insert_at <= model.active {
+            model.active += 1;
+        }
+        self.flags.chrome.store(true, Ordering::Relaxed);
+        self.flags.frame.store(true, Ordering::Relaxed);
+    }
+
+    /// Busca en la página vía `window.find` (mejor esfuerzo; Servo 0.7
+    /// no expone Find-in-Page en el embedder).
+    pub fn find_in_page(&self, query: &str) {
+        let Some(view) = self.active_view() else {
+            return;
+        };
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r");
+        let script = format!(
+            "(function(){{try{{return window.find('{escaped}',false,false,true,false,false,false);}}catch(e){{return false;}}}})()"
+        );
+        view.evaluate_javascript(script, |_| {});
+    }
+
     pub fn go_back(&self) {
         if let Some(view) = self.active_view() {
             self.mark_active_loading();
@@ -395,6 +535,15 @@ impl Delegate {
             tab.loading = true;
         }
         self.flags.chrome.store(true, Ordering::Relaxed);
+    }
+
+    pub fn active_title(&self) -> String {
+        let model = self.model.borrow();
+        model
+            .tabs
+            .get(model.active)
+            .map(|tab| tab.title.clone())
+            .unwrap_or_default()
     }
 
     /// Close `index`. `false` means it was the last tab and the window should
@@ -649,8 +798,14 @@ impl Delegate {
 }
 
 impl WebViewDelegate for Delegate {
-    fn notify_new_frame_ready(&self, _webview: WebView) {
-        self.flags.frame.store(true, Ordering::Relaxed);
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        // Solo la pestaña visible empuja el present; las demás siguen
+        // compositando en Servo sin forzar blit/EGL en el toplevel.
+        let model = self.model.borrow();
+        let active = model.tabs.get(model.active).map(|tab| tab.view.id());
+        if active == Some(webview.id()) {
+            self.flags.frame.store(true, Ordering::Relaxed);
+        }
     }
 
     fn notify_animating_changed(&self, webview: WebView, animating: bool) {
@@ -668,22 +823,43 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_url_changed(&self, webview: WebView, url: url::Url) {
-        if let Some(mut tab) = self.tab_mut_by_id(&webview) {
-            tab.url = url.to_string();
+        let is_active = {
+            let id = webview.id();
+            let mut model = self.model.borrow_mut();
+            let Some(index) = model.tabs.iter().position(|tab| tab.view.id() == id) else {
+                return;
+            };
+            model.tabs[index].url = url.to_string();
+            index == model.active
+        };
+        if is_active {
+            self.flags.chrome.store(true, Ordering::Relaxed);
         }
-        self.flags.chrome.store(true, Ordering::Relaxed);
     }
 
     fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
         if let Some(mut tab) = self.tab_mut_by_id(&webview) {
             tab.title = title.unwrap_or_else(|| "SilverSurfer".into());
         }
+        // El strip muestra todos los títulos.
         self.flags.chrome.store(true, Ordering::Relaxed);
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
-        if let Some(mut tab) = self.tab_mut_by_id(&webview) {
+        let visit = {
+            let mut tab = match self.tab_mut_by_id(&webview) {
+                Some(tab) => tab,
+                None => return,
+            };
             tab.loading = status != LoadStatus::Complete;
+            if status == LoadStatus::Complete {
+                Some((tab.url.clone(), tab.title.clone()))
+            } else {
+                None
+            }
+        };
+        if let Some((url, title)) = visit {
+            history::record(&url, &title);
         }
         if status == LoadStatus::Complete {
             // Belt-and-suspenders: userscripts run at document start, but if
@@ -725,20 +901,78 @@ impl WebViewDelegate for Delegate {
     }
 
     fn show_embedder_control(&self, _webview: WebView, control: EmbedderControl) {
-        let EmbedderControl::FilePicker(mut picker) = control else {
-            return;
-        };
-        let request = PickRequest {
-            multiple: picker.allow_select_multiple(),
-            save_name: None,
-        };
-        match files::pick(&request) {
-            Ok(paths) if !paths.is_empty() => {
-                picker.select(&paths);
-                picker.submit();
+        match control {
+            EmbedderControl::FilePicker(mut picker) => {
+                let request = PickRequest {
+                    multiple: picker.allow_select_multiple(),
+                    save_name: None,
+                };
+                match files::pick(&request) {
+                    Ok(paths) if !paths.is_empty() => {
+                        picker.select(&paths);
+                        picker.submit();
+                    }
+                    _ => picker.dismiss(),
+                }
             }
-            _ => picker.dismiss(),
+            EmbedderControl::ContextMenu(menu) => {
+                if let Some((old, _)) = self.pending_menu.borrow_mut().take() {
+                    old.dismiss();
+                }
+                let pos = menu.position();
+                let scale = self.scale.get().max(1.0);
+                let items: Vec<menu::Item> = menu
+                    .items()
+                    .iter()
+                    .map(|item| match item {
+                        ContextMenuItem::Separator => menu::Item {
+                            label: String::new(),
+                            enabled: false,
+                            separator: true,
+                        },
+                        ContextMenuItem::Item {
+                            label,
+                            enabled,
+                            ..
+                        } => menu::Item {
+                            label: label.clone(),
+                            enabled: *enabled,
+                            separator: false,
+                        },
+                    })
+                    .collect();
+                // `position` es en device px de la página; la ventana suma el cromo.
+                let popup = Popup {
+                    x: (pos.min.x as f32 / scale).round() as i32,
+                    y: crate::chrome::HEIGHT + (pos.min.y as f32 / scale).round() as i32,
+                    items,
+                };
+                *self.pending_menu.borrow_mut() = Some((menu, popup));
+                self.flags.context_menu.store(true, Ordering::Relaxed);
+                self.flags.chrome.store(true, Ordering::Relaxed);
+            }
+            _ => {}
         }
+    }
+
+    fn request_navigation(&self, _webview: WebView, request: NavigationRequest) {
+        if downloads::looks_like_download(&request.url) {
+            let url = request.url.clone();
+            request.deny();
+            if let Err(err) = downloads::save_url(&url) {
+                eprintln!("silversurfer: descarga: {err}");
+            }
+            return;
+        }
+        request.allow();
+    }
+
+    fn notify_fullscreen_state_changed(&self, _webview: WebView, is_fullscreen: bool) {
+        self.flags
+            .page_fullscreen
+            .store(is_fullscreen, Ordering::Relaxed);
+        self.flags.chrome.store(true, Ordering::Relaxed);
+        self.flags.frame.store(true, Ordering::Relaxed);
     }
 }
 
@@ -769,6 +1003,7 @@ pub fn start(
         flags: flags.clone(),
         scale: Cell::new(scale.max(1.0)),
         user_content: RefCell::new(None),
+        pending_menu: RefCell::new(None),
     });
 
     let servo = ServoBuilder::default()

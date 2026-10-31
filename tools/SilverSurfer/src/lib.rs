@@ -5,11 +5,15 @@
 //! tests and the benchmarks run without compiling the engine.
 
 pub mod about;
+pub mod bookmarks;
 pub mod chrome;
+pub mod downloads;
 pub mod files;
+pub mod history;
 pub mod home;
 pub mod look;
 pub mod location;
+pub mod menu;
 pub mod privacy;
 pub mod session;
 pub mod spa_compat;
@@ -49,9 +53,13 @@ Sin URL restaura la sesión anterior (o la página de inicio).
 --private ventana privada (sin sesión; limpia datos al cerrar).
 Una dirección o host navega; palabras buscan (SILVERSURFER_SEARCH).
 Ctrl+L barra, Ctrl+T/W pestaña, Ctrl+Tab cambiar, Ctrl+O lunarfile,
-Ctrl+Shift+P ventana privada, Ctrl+Shift+Delete borrar datos,
+Ctrl+/-/0 zoom, Ctrl+D marcador, Ctrl+F buscar en página,
+Ctrl+S descargar URL, Ctrl+J descargas, F11 pantalla completa,
+Ctrl+N ventana nueva, Ctrl+Shift+P ventana privada,
+Ctrl+Shift+Delete borrar datos, arrastrar pestañas para reordenar,
 Alt+Izquierda / Alt+Derecha historial, F5 recargar.
-about:privacy · about:cookies · about:clear"
+about:history · about:bookmarks · about:downloads · about:privacy ·
+about:cookies · about:clear. Clic derecho en la página abre el menú contextual."
             );
             return Ok(());
         }
