@@ -9,6 +9,7 @@ pub mod files;
 pub mod home;
 pub mod look;
 pub mod location;
+pub mod session;
 pub mod wl;
 
 #[cfg(feature = "engine")]
@@ -19,13 +20,15 @@ pub mod window;
 /// Parse argv and open the window. `--help` prints usage and returns.
 #[cfg(feature = "engine")]
 pub fn launch() -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
-    if let Some(arg) = args.next() {
-        // Servo relaunches this binary as `--content-process <token>`. That
-        // process must enter the engine and stop. Treating the flag as a URL
-        // opens another window, which spawns more content processes.
+    let mut fresh = false;
+    let mut url_arg: Option<String> = None;
+    for arg in std::env::args().skip(1) {
         if arg == "--content-process" {
-            let token = args.next().unwrap_or_default();
+            // Servo relaunches this binary as `--content-process <token>`.
+            let token = std::env::args()
+                .skip_while(|a| a != "--content-process")
+                .nth(1)
+                .unwrap_or_default();
             servo::run_content_process(token);
             return Ok(());
         }
@@ -34,19 +37,33 @@ pub fn launch() -> Result<(), String> {
                 "\
 SilverSurfer — navegador de Eclipse OS
 
-Uso: silversurfer [URL]
+Uso: silversurfer [--fresh] [URL]
 
-Sin URL abre la página de inicio. Una dirección o host navega;
-una búsqueda (palabras) usa DuckDuckGo (SILVERSURFER_SEARCH).
-Ctrl+L barra, Ctrl+T pestaña, Ctrl+W cerrar, Ctrl+O lunarfile,
+Sin URL restaura la sesión anterior (o la página de inicio).
+--fresh ignora la sesión y abre una pestaña nueva.
+Una dirección o host navega; palabras buscan (SILVERSURFER_SEARCH).
+Ctrl+L barra, Ctrl+T/W pestaña, Ctrl+Tab cambiar, Ctrl+O lunarfile,
 Alt+Izquierda / Alt+Derecha historial, F5 recargar."
             );
             return Ok(());
         }
+        if arg == "--fresh" {
+            fresh = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            return Err(format!("opción desconocida: {arg}"));
+        }
+        url_arg = Some(arg);
+    }
+
+    if let Some(arg) = url_arg {
         let url = location::resolve_omnibox(&arg, &location::search_template())
             .map_err(|_| format!("dirección no válida: {arg}"))?;
-        window::run(url)
+        window::run(window::Start::Url(url))
+    } else if fresh {
+        window::run(window::Start::Fresh)
     } else {
-        window::run(home::home_url())
+        window::run(window::Start::Restore)
     }
 }

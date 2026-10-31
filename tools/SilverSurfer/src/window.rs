@@ -13,7 +13,7 @@ use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use dpi::PhysicalSize;
 use raw_window_handle::{
@@ -44,7 +44,18 @@ use crate::files::{self, PickRequest};
 use crate::home;
 use crate::location::{resolve_omnibox, search_template, SchemeHint};
 use crate::look::Look;
+use crate::session::{self, Snapshot};
 use crate::wl;
+
+/// How the window chooses its first tab set.
+pub enum Start {
+    /// One URL from the CLI (no session restore).
+    Url(url::Url),
+    /// Ignore saved session; open the home page.
+    Fresh,
+    /// Restore `session.json` or fall back to home.
+    Restore,
+}
 
 const DEFAULT_W: i32 = 1100;
 const DEFAULT_H: i32 = 720;
@@ -145,13 +156,28 @@ pub struct App {
     held_at: Option<Instant>,
     repeated_at: Option<Instant>,
     look: Look,
+    look_mtime: Option<SystemTime>,
+    look_checked: Instant,
     waker: Option<Waker>,
     session: Option<Session>,
+    /// First URL passed to `engine::start`.
     initial_url: Option<url::Url>,
+    /// Extra tabs to open after start (restore).
+    pending_tabs: Vec<(url::Url, String)>,
+    pending_active: usize,
+    persist: bool,
 }
 
 impl App {
-    fn new(conn: Connection, qh: QueueHandle<App>, url: url::Url) -> Self {
+    fn new(conn: Connection, qh: QueueHandle<App>, start: Start) -> Self {
+        let (initial_url, pending_tabs, pending_active, persist) = match start {
+            Start::Url(url) => (url, Vec::new(), 0, true),
+            Start::Fresh => (home::home_url(), Vec::new(), 0, true),
+            Start::Restore => match session::load() {
+                Some(snap) => snapshot_to_start(snap),
+                None => (home::home_url(), Vec::new(), 0, true),
+            },
+        };
         Self {
             conn,
             qh,
@@ -197,9 +223,35 @@ impl App {
             held_at: None,
             repeated_at: None,
             look: Look::current(),
+            look_mtime: std::fs::metadata("/etc/eclipse/look")
+                .and_then(|m| m.modified())
+                .ok(),
+            look_checked: Instant::now(),
             waker: None,
             session: None,
-            initial_url: Some(url),
+            initial_url: Some(initial_url),
+            pending_tabs,
+            pending_active,
+            persist,
+        }
+    }
+
+    fn refresh_look(&mut self) {
+        if self.look_checked.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.look_checked = Instant::now();
+        let mtime = std::fs::metadata("/etc/eclipse/look")
+            .and_then(|m| m.modified())
+            .ok();
+        if mtime == self.look_mtime {
+            return;
+        }
+        self.look_mtime = mtime;
+        let next = Look::current();
+        if next != self.look {
+            self.look = next;
+            self.need_paint = true;
         }
     }
 
@@ -257,10 +309,28 @@ impl App {
         let (context, gpu) = self.make_context(pw, ph)?;
         let waker = Waker::new()?;
         let session = engine::start(waker.clone(), context, gpu, url, self.scale as f32)?;
+        let extra = std::mem::take(&mut self.pending_tabs);
+        let active = self.pending_active;
+        if !extra.is_empty() || active > 0 {
+            session.shell.restore_tabs(&extra, active);
+        }
         self.waker = Some(waker);
         self.session = Some(session);
         self.need_paint = true;
         Ok(())
+    }
+
+    fn persist_session(&self) {
+        if !self.persist {
+            return;
+        }
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let snap = session.shell.snapshot();
+        if let Err(err) = session::save(&snap) {
+            eprintln!("silversurfer: no se pudo guardar la sesión: {err}");
+        }
     }
 
     fn make_context(
@@ -291,6 +361,7 @@ impl App {
     }
 
     fn after_dispatch(&mut self) -> Result<(), String> {
+        self.refresh_look();
         if self.compositor.is_some() && self.parent.is_none() {
             self.create_window()?;
         }
@@ -764,6 +835,27 @@ impl App {
                 .is_none_or(|session| session.shell.close_tab(session.shell.active_index()));
             if !keep {
                 self.exit = true;
+            }
+            self.need_paint = true;
+            return true;
+        }
+        // Ctrl+Tab / Ctrl+Shift+Tab — next / previous tab.
+        if self.ctrl && evdev == 15 {
+            if let Some(session) = &self.session {
+                if self.shift {
+                    session.shell.prev_tab();
+                } else {
+                    session.shell.next_tab();
+                }
+            }
+            self.need_paint = true;
+            return true;
+        }
+        // Ctrl+1..8 — jump to tab (1-based).
+        if self.ctrl && (2..=9).contains(&evdev) {
+            let index = (evdev - 2) as usize;
+            if let Some(session) = &self.session {
+                session.shell.select_tab(index);
             }
             self.need_paint = true;
             return true;
@@ -1558,11 +1650,30 @@ impl Dispatch<WlOutput, ()> for App {
     }
 }
 
-pub fn run(url: url::Url) -> Result<(), String> {
+fn snapshot_to_start(snap: Snapshot) -> (url::Url, Vec<(url::Url, String)>, usize, bool) {
+    let mut urls = Vec::new();
+    for tab in &snap.tabs {
+        if let Ok(url) = url::Url::parse(&tab.url) {
+            urls.push((url, tab.title.clone()));
+        }
+    }
+    if urls.is_empty() {
+        return (home::home_url(), Vec::new(), 0, true);
+    }
+    let active = snap.active.min(urls.len() - 1);
+    let (first, title) = urls.remove(0);
+    // restore_tabs opens *extra* tabs after the first; active index is global.
+    // If active was 0, pending_active stays 0. If active > 0, first tab is
+    // still index 0 and extras follow — select_tab(active) after restore.
+    let _ = title;
+    (first, urls, active, true)
+}
+
+pub fn run(start: Start) -> Result<(), String> {
     let conn = wl::connect()?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
-    let mut app = App::new(conn.clone(), qh.clone(), url);
+    let mut app = App::new(conn.clone(), qh.clone(), start);
     let _registry = conn.display().get_registry(&qh, ());
     queue
         .roundtrip(&mut app)
@@ -1631,5 +1742,6 @@ pub fn run(url: url::Url) -> Result<(), String> {
             drop(guard);
         }
     }
+    app.persist_session();
     Ok(())
 }

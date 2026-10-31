@@ -206,6 +206,7 @@ impl LinuxRootfs {
             // lunarbar the rootfs was created with and never got the
             // binaries added after it -- lunarhunter, the day it arrived.
             self.install_lunar_tools(&bin);
+            self.install_silversurfer(&bin);
             // INIT (PID 1): the Eclipse-native Rust init by default, with busybox
             // init as a resilient fallback. `install_busybox_init` runs first so
             // `/sbin/init` always resolves to *some* PID 1; `install_eclipse_init`
@@ -632,6 +633,7 @@ impl LinuxRootfs {
         }
 
         self.install_lunar_tools(&bin);
+        self.install_silversurfer(&bin);
 
         // eclipse-dbusd: Eclipse's own D-Bus session bus (Rust, static musl).
         // The `eclipse-dbus` wrapper prefers Alpine's dbus-daemon when the
@@ -3329,6 +3331,76 @@ impl LinuxRootfs {
             fs::copy(&lunarhunter, bin.join("lunarhunter")).unwrap();
         } else {
             eprintln!("warning: lunarhunter not built; the shield menu opens terminals");
+        }
+    }
+
+    /// Best-effort host build of SilverSurfer into `bin/silversurfer`.
+    ///
+    /// Unlike lunarbar this is **dynamically** linked (Servo needs Mesa;
+    /// media needs GStreamer). If `pkg-config --exists gstreamer-1.0` fails,
+    /// the build drops `media-gstreamer` and keeps the engine. A missing
+    /// binary is fine: `eclipse-browser` falls back to Firefox.
+    fn install_silversurfer(&self, bin: &Path) {
+        let dir = PROJECT_DIR.join("tools").join("SilverSurfer");
+        let executable = dir.join("target").join("release").join("silversurfer");
+        let newest_src = [
+            newest_mtime_under(&dir.join("src")),
+            fs::metadata(dir.join("Cargo.toml"))
+                .ok()
+                .and_then(|m| m.modified().ok()),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        let bin_mtime = fs::metadata(&executable)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let needs_build = match (newest_src, bin_mtime) {
+            (Some(src), Some(bin_m)) => src > bin_m,
+            _ => true,
+        };
+        if needs_build {
+            let media = Ext::new("pkg-config")
+                .arg("--exists")
+                .arg("gstreamer-1.0")
+                .status()
+                .success();
+            if media {
+                println!("Compiling silversurfer (host, media-gstreamer)...");
+            } else {
+                println!(
+                    "Compiling silversurfer (host, engine only; install libgstreamer1.0-dev for media)..."
+                );
+            }
+            let mut cargo = Ext::new("cargo");
+            cargo
+                .current_dir(&dir)
+                .arg("build")
+                .arg("--release")
+                .arg("--manifest-path")
+                .arg(dir.join("Cargo.toml"));
+            if !media {
+                cargo
+                    .arg("--no-default-features")
+                    .arg("--features")
+                    .arg("engine");
+            }
+            let status = cargo.status();
+            if !status.success() {
+                eprintln!(
+                    "warning: silversurfer build failed; eclipse-browser falls back to Firefox"
+                );
+            }
+        }
+        if executable.is_file() {
+            let _ = dir::rm(bin.join("silversurfer"));
+            if let Err(err) = fs::copy(&executable, bin.join("silversurfer")) {
+                eprintln!("warning: could not install silversurfer: {err}");
+            }
+        } else {
+            eprintln!(
+                "warning: silversurfer not built; menu uses eclipse-browser → Firefox fallback"
+            );
         }
     }
 

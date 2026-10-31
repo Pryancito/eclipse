@@ -42,11 +42,13 @@ cargo build --release --manifest-path tools/SilverSurfer/Cargo.toml \
   --no-default-features --features engine
 ```
 
-`cargo xtask` elige solo: si `pkg-config --exists gstreamer-1.0` tiene éxito
-compila con medios; si no, avisa y compila sin ellos. La imagen, en cambio,
-sí lleva los plugins de ejecución (`gstreamer1.0-plugins-*` y
-`gstreamer1.0-libav` en el rootfs de Ubuntu, `gst-plugins-*` y `gst-libav`
-en el de Alpine).
+`cargo xtask` (al armar el rootfs) compila SilverSurfer en el host: si
+`pkg-config --exists gstreamer-1.0` tiene éxito usa medios; si no, avisa y
+compila solo con `--features engine`. Copia el binario a `/bin/silversurfer`
+cuando el build sale bien. El escritorio instala `eclipse-browser` (prefer
+SilverSurfer, si no Firefox), `silversurfer.desktop` y el handler
+`http`/`https` por defecto. La imagen lleva los plugins de ejecución
+(`gstreamer1.0-plugins-*` / `gst-plugins-*`).
 
 Las pruebas de unidad y los benchmarks no arrancan Servo. Miden el cromo, la
 barra de direcciones, el diálogo de lunarfile y la copia de un fotograma a
@@ -62,9 +64,14 @@ cargo bench --manifest-path tools/SilverSurfer/Cargo.toml \
 
 ```sh
 silversurfer
+silversurfer --fresh
 silversurfer https://example.com
 silversurfer /ruta/pagina.html
 ```
+
+Sin URL restaura las pestañas de
+`$XDG_DATA_HOME/silversurfer/session.json` (o `~/.local/share/…`).
+`--fresh` ignora esa sesión.
 
 | Tecla | Acción |
 |---|---|
@@ -72,11 +79,15 @@ silversurfer /ruta/pagina.html
 | F5 o Ctrl+R | Recargar |
 | Ctrl+L | Barra de dirección (omnibox: URL o búsqueda) |
 | Ctrl+T / Ctrl+W | Pestaña nueva / cerrar |
+| Ctrl+Tab / Ctrl+Shift+Tab | Pestaña siguiente / anterior |
+| Ctrl+1 … Ctrl+8 | Ir a la pestaña N |
 | Ctrl+O | `lunarfile --pick` y abre el fichero |
 
 La barra busca con DuckDuckGo si el texto no parece una dirección
 (`SILVERSURFER_SEARCH` cambia la plantilla; usa `{query}` o `{}`).
 El título de la ventana sigue la pestaña activa; mientras carga, el tab
 muestra `…` y la barra un distintivo de esquema (`s` https, `!` http, `/` file).
+El cromo se pinta a la escala del output (HiDPI nativo), con iconos
+vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.
 
 `<input type=file>` también abre `lunarfile`. Escape en el selector cancela.
