@@ -85,5 +85,7 @@ La barra busca con DuckDuckGo si el texto no parece una dirección
 (`SILVERSURFER_SEARCH` cambia la plantilla; usa `{query}` o `{}`).
 El título de la ventana sigue la pestaña activa; mientras carga, el tab
 muestra `…` y la barra un distintivo de esquema (`s` https, `!` http, `/` file).
+El cromo se pinta a la escala del output (HiDPI nativo), con iconos
+vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.
 
 `<input type=file>` también abre `lunarfile`. Escape en el selector cancela.

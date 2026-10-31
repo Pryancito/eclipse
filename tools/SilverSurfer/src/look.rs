@@ -52,6 +52,9 @@ impl Look {
         Self::resolve(env.as_deref(), file.as_deref())
     }
 
+    /// Path `eclipse-look` writes; used to detect mid-session changes.
+    pub const FILE: &'static str = "/etc/eclipse/look";
+
     pub fn palette(self) -> Palette {
         match self {
             Look::Kde => Palette {
