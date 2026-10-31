@@ -15,12 +15,12 @@ use std::time::{Duration, Instant};
 use dpi::PhysicalSize;
 use euclid::Scale;
 use servo::{
-    ContextMenu, ContextMenuAction, ContextMenuItem, DevicePoint, EmbedderControl, EventLoopWaker,
-    InputEvent, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers,
-    MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent, MouseMoveEvent,
-    NavigationRequest, Opts, Preferences, Servo, ServoBuilder, Theme, UserContentManager,
-    UserScript, WebResourceLoad, WebResourceResponse, WebView,
-    WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    ConsoleLogLevel, ContextMenu, ContextMenuAction, ContextMenuItem, DevicePoint,
+    EmbedderControl, EventLoopWaker, InputEvent, JSValue, Key, KeyState, KeyboardEvent,
+    LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent,
+    MouseLeftViewportEvent, MouseMoveEvent, NavigationRequest, Opts, Preferences, Servo,
+    ServoBuilder, Theme, UserContentManager, UserScript, WebResourceLoad, WebResourceResponse,
+    WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
     WindowRenderingContext,
 };
 use crate::about;
@@ -111,6 +111,66 @@ fn reveal_github_if_needed(webview: &WebView) {
         return;
     }
     webview.evaluate_javascript(GITHUB_REVEAL_USERSCRIPT, |_| {});
+}
+
+/// Page console verbosity. Errors and warnings by default;
+/// `SILVERSURFER_CONSOLE=log` (or `off`) to change it.
+/// Rank: higher = more severe. `None` means console is off.
+fn console_min_rank() -> Option<u8> {
+    static LEVEL: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        match std::env::var("SILVERSURFER_CONSOLE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "off" | "none" | "0" => None,
+            "error" => Some(5),
+            "log" | "info" | "all" | "debug" | "trace" => Some(2),
+            _ => Some(4), // warn
+        }
+    })
+}
+
+fn console_rank(level: &ConsoleLogLevel) -> u8 {
+    match level {
+        ConsoleLogLevel::Error => 5,
+        ConsoleLogLevel::Warn => 4,
+        ConsoleLogLevel::Info => 3,
+        ConsoleLogLevel::Log | ConsoleLogLevel::Dir => 2,
+        ConsoleLogLevel::Debug => 1,
+        ConsoleLogLevel::Trace => 0,
+    }
+}
+
+fn console_label(level: &ConsoleLogLevel) -> &'static str {
+    match level {
+        ConsoleLogLevel::Error => "error",
+        ConsoleLogLevel::Warn => "warn",
+        ConsoleLogLevel::Info => "info",
+        ConsoleLogLevel::Log => "log",
+        ConsoleLogLevel::Debug => "debug",
+        ConsoleLogLevel::Trace => "trace",
+        ConsoleLogLevel::Dir => "dir",
+    }
+}
+
+/// `SILVERSURFER_PROBE=/path/script.js` evaluates that script once the page
+/// finishes loading and prints the result. Debugging aid when a site paints wrong.
+fn run_probe(webview: &WebView) {
+    let Ok(path) = std::env::var("SILVERSURFER_PROBE") else {
+        return;
+    };
+    let script = match std::fs::read_to_string(&path) {
+        Ok(script) => script,
+        Err(err) => {
+            eprintln!("silversurfer: sonda {path}: {err}");
+            return;
+        }
+    };
+    webview.evaluate_javascript(script, |result| {
+        eprintln!("silversurfer: sonda => {result:?}");
+    });
 }
 
 #[derive(Clone)]
@@ -994,11 +1054,28 @@ impl WebViewDelegate for Delegate {
             // React re-hydrates the hero back to opacity:0 after a failed GSAP
             // path, re-run the reveal once the load settles.
             reveal_github_if_needed(&webview);
+            run_probe(&webview);
         }
         self.flags.chrome.store(true, Ordering::Relaxed);
         if status == LoadStatus::Complete {
             self.try_autofill(&webview, &url);
         }
+    }
+
+    // Servo 0.7 delivers uncaught page exceptions only through this hook, so
+    // without it a site that dies at boot logs nothing at all.
+    fn show_console_message(&self, webview: WebView, level: ConsoleLogLevel, message: String) {
+        let Some(min) = console_min_rank() else {
+            return;
+        };
+        if console_rank(&level) < min {
+            return;
+        }
+        let url = webview.url().map(|url| url.to_string()).unwrap_or_default();
+        eprintln!(
+            "silversurfer: consola [{}] {url}: {message}",
+            console_label(&level)
+        );
     }
 
     fn request_create_new(
