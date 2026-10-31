@@ -110,3 +110,8 @@ software; la home lista smokes locales (canvas, WebGL, WebGPU, WebAudio)
 y remotas (MP4/HLS).
 
 `<input type=file>` también abre `lunarfile`. Escape en el selector cancela.
+
+Arranque: el log incluye `session_ms` hasta tener Servo listo. Con
+`SILVERSURFER_REQUIRE_EGL=1` falla si no hay EGL (sin fallback software).
+El cromo omite el commit Wayland si el contenido no cambió; solo la
+pestaña activa dispara el present de frames.

@@ -632,8 +632,14 @@ impl Delegate {
 }
 
 impl WebViewDelegate for Delegate {
-    fn notify_new_frame_ready(&self, _webview: WebView) {
-        self.flags.frame.store(true, Ordering::Relaxed);
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        // Solo la pestaña visible empuja el present; las demás siguen
+        // compositando en Servo sin forzar blit/EGL en el toplevel.
+        let model = self.model.borrow();
+        let active = model.tabs.get(model.active).map(|tab| tab.view.id());
+        if active == Some(webview.id()) {
+            self.flags.frame.store(true, Ordering::Relaxed);
+        }
     }
 
     fn notify_animating_changed(&self, webview: WebView, animating: bool) {
@@ -651,16 +657,25 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_url_changed(&self, webview: WebView, url: url::Url) {
-        if let Some(mut tab) = self.tab_mut_by_id(&webview) {
-            tab.url = url.to_string();
+        let is_active = {
+            let id = webview.id();
+            let mut model = self.model.borrow_mut();
+            let Some(index) = model.tabs.iter().position(|tab| tab.view.id() == id) else {
+                return;
+            };
+            model.tabs[index].url = url.to_string();
+            index == model.active
+        };
+        if is_active {
+            self.flags.chrome.store(true, Ordering::Relaxed);
         }
-        self.flags.chrome.store(true, Ordering::Relaxed);
     }
 
     fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
         if let Some(mut tab) = self.tab_mut_by_id(&webview) {
             tab.title = title.unwrap_or_else(|| "SilverSurfer".into());
         }
+        // El strip muestra todos los títulos.
         self.flags.chrome.store(true, Ordering::Relaxed);
     }
 
@@ -668,10 +683,7 @@ impl WebViewDelegate for Delegate {
         let visit = {
             let mut tab = match self.tab_mut_by_id(&webview) {
                 Some(tab) => tab,
-                None => {
-                    self.flags.chrome.store(true, Ordering::Relaxed);
-                    return;
-                }
+                None => return,
             };
             tab.loading = status != LoadStatus::Complete;
             if status == LoadStatus::Complete {
@@ -683,6 +695,7 @@ impl WebViewDelegate for Delegate {
         if let Some((url, title)) = visit {
             history::record(&url, &title);
         }
+        // El indicador `…` vive en cada tab del cromo.
         self.flags.chrome.store(true, Ordering::Relaxed);
     }
 
