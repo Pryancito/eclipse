@@ -96,6 +96,7 @@ sesión; al cerrar borra cookies/almacenamiento/caché de esa instancia).
 | Arrastrar pestaña | Reordenar |
 | Clic derecho (página) | Menú contextual |
 | Tab (en la barra) | Aceptar sugerencia del historial |
+| Ctrl+Shift+L | Guardar login del formulario visible |
 
 La barra busca con DuckDuckGo si el texto no parece una dirección
 (`SILVERSURFER_SEARCH` cambia la plantilla; usa `{query}` o `{}`).
@@ -115,6 +116,10 @@ vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.
 El distintivo `GL` / `SW` indica si la página va por EGL o por blit
 software; en ventana privada aparece además `P`.
 `about:privacy`, `about:cookies` y `about:clear` cubren la UI de datos.
+El bloqueo de anuncios lite (hosts/paths + CSS hide) está activo por
+defecto; `SILVERSURFER_ADBLOCK=0` lo apaga. Ver `about:filters`.
+Contraseñas: almacén local ofuscado (`passwords.json`); autocompletado al
+cargar el origen; `about:passwords` lista entradas. Desactivado en `--private`.
 La home es un lienzo en blanco con el logo de Eclipse OS
 (paleta de `/etc/eclipse/look`). Los smokes de canvas / WebGL / WebGPU /
 WebAudio / MP4 / HLS viven en `smoke.html` (`smoke_url()`).

@@ -9,11 +9,13 @@ pub mod bookmarks;
 pub mod chrome;
 pub mod downloads;
 pub mod files;
+pub mod filter;
 pub mod history;
 pub mod home;
 pub mod look;
 pub mod location;
 pub mod menu;
+pub mod passwords;
 pub mod privacy;
 pub mod session;
 pub mod spa_compat;
@@ -56,10 +58,13 @@ Ctrl+L barra, Ctrl+T/W pestaña, Ctrl+Tab cambiar, Ctrl+O lunarfile,
 Ctrl+/-/0 zoom, Ctrl+D marcador, Ctrl+F buscar en página,
 Ctrl+S descargar URL, Ctrl+J descargas, F11 pantalla completa,
 Ctrl+N ventana nueva, Ctrl+Shift+P ventana privada,
-Ctrl+Shift+Delete borrar datos, arrastrar pestañas para reordenar,
+Ctrl+Shift+Delete borrar datos, Ctrl+Shift+L guardar login,
+arrastrar pestañas para reordenar,
 Alt+Izquierda / Alt+Derecha historial, F5 recargar.
 about:history · about:bookmarks · about:downloads · about:privacy ·
-about:cookies · about:clear. Clic derecho en la página abre el menú contextual."
+about:cookies · about:clear · about:filters · about:passwords.
+Clic derecho en la página abre el menú contextual.
+SILVERSURFER_ADBLOCK=0 desactiva el bloqueo lite."
             );
             return Ok(());
         }

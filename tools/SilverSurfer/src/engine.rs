@@ -14,16 +14,19 @@ use dpi::PhysicalSize;
 use euclid::Scale;
 use servo::{
     ContextMenu, ContextMenuAction, ContextMenuItem, DevicePoint, EmbedderControl, EventLoopWaker,
-    InputEvent, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent, MouseMoveEvent, NavigationRequest,
-    Opts, Preferences, Servo, ServoBuilder, Theme, UserContentManager, UserScript, WebView,
+    InputEvent, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers,
+    MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent, MouseMoveEvent,
+    NavigationRequest, Opts, Preferences, Servo, ServoBuilder, Theme, UserContentManager,
+    UserScript, WebResourceLoad, WebResourceResponse, WebView,
     WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use crate::about;
 use crate::downloads;
 use crate::files::{self, PickRequest};
+use crate::filter;
 use crate::history;
 use crate::menu::{self, Popup};
+use crate::passwords;
 use crate::privacy;
 use crate::session::{SavedTab, Snapshot};
 use crate::spa_compat::{self, GITHUB_REVEAL_USERSCRIPT};
@@ -87,6 +90,9 @@ fn build_user_content(servo: &Servo) -> Rc<UserContentManager> {
     let manager = Rc::new(UserContentManager::new(servo));
     for script in spa_compat::userscripts() {
         manager.add_script(Rc::new(UserScript::from(script)));
+    }
+    if filter::enabled() {
+        manager.add_script(Rc::new(UserScript::from(filter::hide_ads_userscript())));
     }
     manager
 }
@@ -184,6 +190,9 @@ pub struct Delegate {
     user_content: RefCell<Option<Rc<UserContentManager>>>,
     /// Menú contextual vivo hasta que la ventana elige o cancela.
     pending_menu: RefCell<Option<(ContextMenu, Popup)>>,
+    blocked: Cell<usize>,
+    /// Ventana `--private`: no lee ni escribe historial ni contraseñas.
+    private: bool,
 }
 
 pub struct Session {
@@ -330,8 +339,61 @@ impl Delegate {
                 let sites = self.list_site_data();
                 privacy::cookies_page_url(&sites)
             }
+            "filters" | "adblock" => filter::status_page_url(self.blocked.get()),
+            "passwords" | "logins" => passwords::page_url(),
             _ => about::expand(url),
         }
+    }
+
+    /// Extrae usuario/contraseña del formulario visible y los guarda (no-op en privado).
+    pub fn save_login_from_page(&self) {
+        if self.private {
+            eprintln!("silversurfer: contraseñas desactivadas en ventana privada");
+            return;
+        }
+        let Some(view) = self.active_view() else {
+            return;
+        };
+        let url = self.location_text();
+        let Some(origin) = passwords::origin_of(&url) else {
+            eprintln!("silversurfer: origen no válido para guardar login");
+            return;
+        };
+        view.evaluate_javascript(passwords::extract_script(), move |result| {
+            let text = match result {
+                Ok(JSValue::String(s)) => s,
+                _ => String::new(),
+            };
+            if text.is_empty() {
+                eprintln!("silversurfer: no hay campos de login rellenos");
+                return;
+            }
+            let mut parts = text.splitn(2, '\n');
+            let user = parts.next().unwrap_or("").to_string();
+            let secret = parts.next().unwrap_or("").to_string();
+            if secret.is_empty() {
+                eprintln!("silversurfer: falta la contraseña en el formulario");
+                return;
+            }
+            let mut store = passwords::load();
+            store.upsert(&origin, &user, &secret);
+            match passwords::save(&store) {
+                Ok(()) => eprintln!("silversurfer: guardada contraseña para {origin}"),
+                Err(err) => eprintln!("silversurfer: {err}"),
+            }
+        });
+    }
+
+    fn try_autofill(&self, view: &WebView, url: &str) {
+        if self.private {
+            return;
+        }
+        let store = passwords::load();
+        let Some(entry) = store.find_for_url(url) else {
+            return;
+        };
+        let script = passwords::fill_script(&entry.username, &entry.secret);
+        view.evaluate_javascript(script, |_| {});
     }
 
     /// Borra cookies, session/local storage y caché HTTP de esta instancia.
@@ -846,19 +908,20 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
-        let visit = {
+        let (url, visit) = {
             let mut tab = match self.tab_mut_by_id(&webview) {
                 Some(tab) => tab,
-                None => return,
+                None => {
+                    self.flags.chrome.store(true, Ordering::Relaxed);
+                    return;
+                }
             };
             tab.loading = status != LoadStatus::Complete;
-            if status == LoadStatus::Complete {
-                Some((tab.url.clone(), tab.title.clone()))
-            } else {
-                None
-            }
+            let visit = (status == LoadStatus::Complete && !self.private)
+                .then(|| tab.title.clone());
+            (tab.url.clone(), visit)
         };
-        if let Some((url, title)) = visit {
+        if let Some(title) = visit {
             history::record(&url, &title);
         }
         if status == LoadStatus::Complete {
@@ -868,6 +931,9 @@ impl WebViewDelegate for Delegate {
             reveal_github_if_needed(&webview);
         }
         self.flags.chrome.store(true, Ordering::Relaxed);
+        if status == LoadStatus::Complete {
+            self.try_autofill(&webview, &url);
+        }
     }
 
     fn request_create_new(
@@ -974,6 +1040,15 @@ impl WebViewDelegate for Delegate {
         self.flags.chrome.store(true, Ordering::Relaxed);
         self.flags.frame.store(true, Ordering::Relaxed);
     }
+
+    fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
+        let url = load.request().url.clone();
+        if filter::should_block(&url) {
+            self.blocked.set(self.blocked.get().saturating_add(1));
+            let response = WebResourceResponse::new(url);
+            load.intercept(response).cancel();
+        }
+    }
 }
 
 pub fn start(
@@ -1004,6 +1079,8 @@ pub fn start(
         scale: Cell::new(scale.max(1.0)),
         user_content: RefCell::new(None),
         pending_menu: RefCell::new(None),
+        blocked: Cell::new(0),
+        private,
     });
 
     let servo = ServoBuilder::default()
