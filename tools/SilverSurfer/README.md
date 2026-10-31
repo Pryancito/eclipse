@@ -134,18 +134,22 @@ Superficie **completa del embutidor** (prefs + polyfills + reveal):
 - Features del crate: `brotli-compression-stream`. **Sin `webcrypto`**: en
   servo-script 0.7 arrastra `aes-gcm ^0.11` (solo RCs en índices anteriores a
   2026-06, así que la resolución falla) y prereleases fijadas (`rsa`, `x448`,
-  `ed448-goldilocks`). Sin ella no existe el global `crypto` (ni
-  `getRandomValues` ni `subtle`); el polyfill de `randomUUID` se omite.
+  `ed448-goldilocks`). Sin ella el motor no expone `crypto`; el userscript
+  crea un stub con `getRandomValues` / `randomUUID` (sin `subtle`).
 - Userscripts: `AbortController`/`AbortSignal` (+ `abort`/`timeout`/`any`),
-  idle/microtask/scheduler, `structuredClone`, `randomUUID`, `Object.hasOwn`,
+  idle/microtask/scheduler, `structuredClone`, `crypto` stub, `Object.hasOwn`,
   `replaceAll`/`replaceChildren`, View Transitions no-op, stubs de
   Intersection/ResizeObserver y CE **solo si faltan**, reveal GitHub
-  (`opacity`/`visibility`/`inert`).
+  (hoja CSS one-shot + `matchMedia(prefers-reduced-motion)` forzado, sin
+  pelear a GSAP con `setInterval`).
+- Consola de página → stderr vía `show_console_message`
+  (`SILVERSURFER_CONSOLE=warn|error|log|off`). Sonda opcional al load
+  (`SILVERSURFER_PROBE=/ruta/script.js`).
 - Smoke `React / SPA APIs` en `smoke.html`.
 
 **Techo Servo (no 100 % Firefox):** Custom Elements / Shadow DOM reales,
-Service Workers, streams/fetch moderno, apps GitHub logueadas. Crate
-`servo` 0.7 es lo último en crates.io.
+Service Workers, streams/fetch moderno, apps GitHub logueadas / vídeo hero.
+Crate `servo` 0.7 es lo último en crates.io.
 
 ## Medios y límites
 

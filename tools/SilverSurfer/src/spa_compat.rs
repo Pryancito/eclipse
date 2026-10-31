@@ -160,23 +160,35 @@ pub const SPA_POLYFILL_USERSCRIPT: &str = r#"(function () {
       };
     }
 
-    if (typeof crypto !== "undefined" && typeof crypto.randomUUID !== "function") {
-      crypto.randomUUID = function () {
-        var bytes = new Uint8Array(16);
-        if (crypto.getRandomValues) crypto.getRandomValues(bytes);
-        else for (var i = 0; i < 16; i++) bytes[i] = (Math.random() * 256) | 0;
-        bytes[6] = (bytes[6] & 0x0f) | 0x40;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        var hex = [];
-        for (var j = 0; j < 16; j++) hex.push((bytes[j] + 256).toString(16).slice(1));
-        return (
-          hex.slice(0, 4).join("") + "-" +
-          hex.slice(4, 6).join("") + "-" +
-          hex.slice(6, 8).join("") + "-" +
-          hex.slice(8, 10).join("") + "-" +
-          hex.slice(10, 16).join("")
-        );
-      };
+    // Servo 0.7 without the `webcrypto` feature exposes no `crypto` global at
+    // all. GitHub's marketing bundles call `crypto.randomUUID` at boot.
+    if (typeof crypto === "undefined") {
+      try { window.crypto = {}; } catch (e) {}
+    }
+    if (typeof crypto !== "undefined") {
+      if (typeof crypto.getRandomValues !== "function") {
+        crypto.getRandomValues = function (arr) {
+          for (var i = 0; i < arr.length; i++) arr[i] = (Math.random() * 256) | 0;
+          return arr;
+        };
+      }
+      if (typeof crypto.randomUUID !== "function") {
+        crypto.randomUUID = function () {
+          var bytes = new Uint8Array(16);
+          crypto.getRandomValues(bytes);
+          bytes[6] = (bytes[6] & 0x0f) | 0x40;
+          bytes[8] = (bytes[8] & 0x3f) | 0x80;
+          var hex = [];
+          for (var j = 0; j < 16; j++) hex.push((bytes[j] + 256).toString(16).slice(1));
+          return (
+            hex.slice(0, 4).join("") + "-" +
+            hex.slice(4, 6).join("") + "-" +
+            hex.slice(6, 8).join("") + "-" +
+            hex.slice(8, 10).join("") + "-" +
+            hex.slice(10, 16).join("")
+          );
+        };
+      }
     }
 
     if (typeof Object.hasOwn !== "function") {
@@ -292,37 +304,94 @@ pub const SPA_POLYFILL_USERSCRIPT: &str = r#"(function () {
 })();"#;
 
 /// Reveal GitHub SSR hero / marketing blocks stuck at opacity:0 / visibility:hidden.
+///
+/// Prefer a one-shot stylesheet over polling `style.opacity`. The old interval
+/// fought GSAP's `fromTo` / `clearProps` and made hero text flicker
+/// (appear → disappear → appear). Servo 0.7 also rejects
+/// `(prefers-reduced-motion: reduce)` CSS media rules, so we force the JS
+/// `matchMedia` path GSAP uses to skip straight to the end state.
 pub const GITHUB_REVEAL_USERSCRIPT: &str = r#"(function () {
   try {
     var host = location.hostname;
     if (host !== "github.com" && host.slice(-11) !== ".github.com") return;
-    function reveal() {
+    if (window.__ssGithubReveal) return;
+    window.__ssGithubReveal = true;
+
+    // Force reduced-motion for GSAP only on github.com (Servo MQ parse fails).
+    try {
+      var nativeMM = window.matchMedia && window.matchMedia.bind(window);
+      window.matchMedia = function (query) {
+        var q = String(query);
+        if (/prefers-reduced-motion/i.test(q)) {
+          return {
+            matches: true,
+            media: q,
+            onchange: null,
+            addListener: function () {},
+            removeListener: function () {},
+            addEventListener: function () {},
+            removeEventListener: function () {},
+            dispatchEvent: function () { return false; }
+          };
+        }
+        return nativeMM
+          ? nativeMM(query)
+          : {
+              matches: false,
+              media: q,
+              onchange: null,
+              addListener: function () {},
+              removeListener: function () {},
+              addEventListener: function () {},
+              removeEventListener: function () {},
+              dispatchEvent: function () { return false; }
+            };
+      };
+    } catch (e) {}
+
+    function injectSheet() {
+      if (document.getElementById("ss-github-reveal")) return;
+      var style = document.createElement("style");
+      style.id = "ss-github-reveal";
+      style.textContent = [
+        ".Intro__content, .Intro__mona, [data-hpc],",
+        "react-app .PrimerBrand__Hero-module__HeroContent,",
+        "react-app [class*='Intro__'] {",
+        "  opacity: 1 !important;",
+        "  visibility: visible !important;",
+        "}"
+      ].join("\n");
+      (document.head || document.documentElement).appendChild(style);
+    }
+
+    function clearInlineHide() {
       var nodes = document.querySelectorAll(
-        "[style*='opacity'], [style*='visibility'], .Intro__content, .Intro__mona, react-app, [data-hpc]"
+        ".Intro__content, .Intro__mona, [data-hpc], react-app [style*='opacity'], react-app [style*='visibility']"
       );
       for (var i = 0; i < nodes.length; i++) {
         var el = nodes[i];
         if (!el || !el.style) continue;
-        if (el.style.opacity === "0") el.style.setProperty("opacity", "1", "important");
-        if (el.style.visibility === "hidden") {
-          el.style.setProperty("visibility", "visible", "important");
-        }
-        if (el.getAttribute && el.getAttribute("inert") !== null) {
-          try { el.removeAttribute("inert"); } catch (e) {}
-        }
+        // Drop inline opacity/visibility so the stylesheet wins without
+        // repeatedly writing !important over GSAP's timeline.
+        if (el.style.opacity === "0") el.style.removeProperty("opacity");
+        if (el.style.visibility === "hidden") el.style.removeProperty("visibility");
       }
     }
+
+    function reveal() {
+      injectSheet();
+      clearInlineHide();
+    }
+
     reveal();
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", reveal);
     }
     window.addEventListener("load", function () {
       reveal();
-      var n = 0;
-      var id = setInterval(function () {
-        reveal();
-        if (++n >= 20) clearInterval(id);
-      }, 400);
+      // One delayed pass after hydration — not a multi-second polling fight.
+      setTimeout(reveal, 250);
+      setTimeout(reveal, 1000);
     });
   } catch (e) {}
 })();"#;
@@ -383,7 +452,17 @@ mod tests {
         assert!(GITHUB_REVEAL_USERSCRIPT.contains("opacity"));
         assert!(GITHUB_REVEAL_USERSCRIPT.contains("visibility"));
         assert!(GITHUB_REVEAL_USERSCRIPT.contains("Intro__content"));
-        assert!(GITHUB_REVEAL_USERSCRIPT.contains("setProperty"));
+        assert!(GITHUB_REVEAL_USERSCRIPT.contains("ss-github-reveal"));
+        assert!(GITHUB_REVEAL_USERSCRIPT.contains("prefers-reduced-motion"));
+        assert!(GITHUB_REVEAL_USERSCRIPT.contains("__ssGithubReveal"));
+        assert!(!GITHUB_REVEAL_USERSCRIPT.contains("setInterval"));
+    }
+
+    #[test]
+    fn spa_polyfill_covers_missing_crypto_global() {
+        assert!(SPA_POLYFILL_USERSCRIPT.contains("typeof crypto === \"undefined\""));
+        assert!(SPA_POLYFILL_USERSCRIPT.contains("getRandomValues"));
+        assert!(SPA_POLYFILL_USERSCRIPT.contains("randomUUID"));
     }
 
     #[test]
