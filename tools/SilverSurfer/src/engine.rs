@@ -7,8 +7,10 @@
 //! is the GPU context Eclipse already hands out per process.
 
 use std::cell::{Cell, RefCell};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
 use euclid::Scale;
@@ -19,6 +21,7 @@ use servo::{
     NavigationRequest, Opts, Preferences, Servo, ServoBuilder, Theme, UserContentManager,
     UserScript, WebResourceLoad, WebResourceResponse, WebView,
     WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    WindowRenderingContext,
 };
 use crate::about;
 use crate::downloads;
@@ -196,35 +199,80 @@ pub struct Delegate {
 }
 
 pub struct Session {
-    pub servo: Servo,
+    /// `Option` so [`Drop`] can run `ServoInner::Exit` (and join WebGL) before
+    /// unbinding the EGL widget / dropping the rendering context.
+    pub servo: Option<Servo>,
     pub shell: Rc<Delegate>,
     pub context: Rc<dyn servo::RenderingContext>,
+    /// Concrete GPU context for [`WindowRenderingContext::take_window`]. `None`
+    /// on the software path.
+    window_context: Option<Rc<WindowRenderingContext>>,
     pub gpu: bool,
     /// Ventana `--private`: no persiste sesión; al salir limpia site data.
     pub private: bool,
 }
 
-/// Tear down tabs before `Servo` so content processes get `CloseWebView` and
-/// then a clean `Exit`. Without this, the `Delegate` ↔ `WebView` cycle keeps
-/// the constellation alive until the process dies, and Servo's BHM logs
-/// `BHM control disconnected before shutting down!`.
+impl Session {
+    pub fn spin_event_loop(&self) {
+        if let Some(servo) = self.servo.as_ref() {
+            servo.spin_event_loop();
+        }
+    }
+}
+
+/// Ordered teardown:
+/// 1. Close every `WebView` (`CloseWebView` + painter/webrender unlock).
+/// 2. Drain the embedder loop so content-process `RemoveContext` reaches the
+///    WebGL thread *before* constellation `Exit` drops ScriptThreads.
+/// 3. Drop `Servo` (sends `Exit`, waits `ShutdownComplete`, joins WebGL so
+///    surfman `destroy_context` runs on that thread).
+/// 4. `take_window` so the Wayland widget surface / FBO renderbuffers are
+///    destroyed before `Rc` drop (surfman panics otherwise).
+///
+/// Without (2)/(3) before script GC, `WebGLProgram` finalize hits Broken pipe;
+/// without (4), main panics on undestroyed FBO renderbuffers.
 impl Drop for Session {
     fn drop(&mut self) {
+        self.shell.flags.animating.store(false, Ordering::Relaxed);
+        self.shell.flags.frame.store(false, Ordering::Relaxed);
+
         let tabs = {
             let mut model = self.shell.model.borrow_mut();
             std::mem::take(&mut model.tabs)
         };
+        // Stop compositing before drop so WebRender releases WebGL swap-chain
+        // locks (busy_count) and Exit can call destroy_context.
+        for tab in &tabs {
+            tab.view.hide();
+        }
         // Dropping each WebView sends CloseWebView and releases its Servo +
         // Delegate refs, breaking the cycle that would otherwise leak the
-        // session past the window loop.
+        // session past the window loop. Last WebView also drops its Painter.
         drop(tabs);
-        for _ in 0..32 {
-            self.servo.spin_event_loop();
+
+        if let Some(servo) = self.servo.as_ref() {
+            let deadline = Instant::now() + Duration::from_millis(750);
+            while Instant::now() < deadline {
+                servo.spin_event_loop();
+                std::thread::sleep(Duration::from_millis(2));
+            }
         }
+
         *self.shell.servo.borrow_mut() = None;
-        // Field drop order then drops `servo` (ServoInner::Exit + spin) while
-        // `shell` is still alive to receive constellation callbacks, then the
-        // shell itself.
+        *self.shell.user_content.borrow_mut() = None;
+
+        // Exit + WebGL join while the rendering context is still alive for
+        // make_current during painter/WebGL cleanup.
+        let servo = self.servo.take();
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(servo)));
+
+        if let Some(window) = self.window_context.take() {
+            if let Err(err) = window.take_window() {
+                eprintln!("silversurfer: take_window al salir: {err:?}");
+            }
+            drop(window);
+        }
+        // Field drop: shell (extra context Rc), then context → destroy_context.
     }
 }
 
@@ -1054,6 +1102,7 @@ impl WebViewDelegate for Delegate {
 pub fn start(
     waker: Waker,
     context: Rc<dyn servo::RenderingContext>,
+    window_context: Option<Rc<WindowRenderingContext>>,
     gpu: bool,
     url: url::Url,
     scale: f32,
@@ -1119,9 +1168,10 @@ pub fn start(
     shell.flags.chrome.store(true, Ordering::Relaxed);
 
     Ok(Session {
-        servo,
+        servo: Some(servo),
         shell,
         context,
+        window_context,
         gpu,
         private,
     })
