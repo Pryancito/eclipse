@@ -13,7 +13,9 @@ pub mod history;
 pub mod home;
 pub mod look;
 pub mod location;
+pub mod menu;
 pub mod session;
+pub mod spawn;
 pub mod wl;
 
 #[cfg(feature = "engine")]
@@ -49,8 +51,10 @@ Una dirección o host navega; palabras buscan (SILVERSURFER_SEARCH).
 Ctrl+L barra, Ctrl+T/W pestaña, Ctrl+Tab cambiar, Ctrl+O lunarfile,
 Ctrl+/-/0 zoom, Ctrl+D marcador, Ctrl+F buscar en página,
 Ctrl+S descargar URL, Ctrl+J descargas, F11 pantalla completa,
+Ctrl+N ventana nueva, arrastrar pestañas para reordenar,
 Alt+Izquierda / Alt+Derecha historial, F5 recargar.
-about:history, about:bookmarks y about:downloads abren listas locales."
+about:history, about:bookmarks y about:downloads abren listas locales.
+Clic derecho en la página abre el menú contextual."
             );
             return Ok(());
         }

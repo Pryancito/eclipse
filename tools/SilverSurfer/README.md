@@ -89,6 +89,9 @@ Sin URL restaura las pestañas de
 | Ctrl+S | Descargar URL actual (`lunarfile --save` + curl) |
 | Ctrl+J | Lista de descargas |
 | F11 / Escape | Pantalla completa / salir |
+| Ctrl+N | Ventana nueva (otro proceso) |
+| Arrastrar pestaña | Reordenar |
+| Clic derecho (página) | Menú contextual |
 | Tab (en la barra) | Aceptar sugerencia del historial |
 
 La barra busca con DuckDuckGo si el texto no parece una dirección

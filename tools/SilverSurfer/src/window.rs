@@ -47,7 +47,9 @@ use crate::history;
 use crate::home;
 use crate::location::{resolve_omnibox, search_template, SchemeHint};
 use crate::look::Look;
+use crate::menu;
 use crate::session::{self, Snapshot};
+use crate::spawn;
 use crate::wl;
 
 /// How the window chooses its first tab set.
@@ -175,6 +177,8 @@ pub struct App {
     fullscreen: bool,
     /// La Fullscreen API de la página empujó el estado (para no pelear con F11).
     page_drove_fs: bool,
+    /// Arrastre de pestaña en curso (índice origen).
+    drag_tab: Option<usize>,
 }
 
 impl App {
@@ -245,6 +249,7 @@ impl App {
             persist,
             fullscreen: false,
             page_drove_fs: false,
+            drag_tab: None,
         }
     }
 
@@ -587,7 +592,12 @@ impl App {
         } else {
             String::new()
         };
-        let pixels = chrome::render(&View {
+        let popup = self
+            .session
+            .as_ref()
+            .and_then(|s| s.shell.context_popup())
+            .map(|p| p.clamp_to(self.logical_w, self.logical_h));
+        let view = View {
             width: self.logical_w,
             look: self.look,
             titles: &titles,
@@ -603,7 +613,8 @@ impl App {
             can_back,
             can_forward,
             scale: self.scale,
-        });
+        };
+        let pixels = menu::render(&view, self.logical_h, popup.as_ref());
         self.upload_chrome(&pixels.argb, pixels.width, pixels.height)?;
         self.ensure_parent_buffer()?;
         if let Some(page) = &self.page {
@@ -707,6 +718,11 @@ impl App {
 
     fn on_pointer_button(&mut self, button: u32, down: bool) {
         if !down {
+            if let Some(from) = self.drag_tab.take() {
+                let x = self.px.round() as i32;
+                let y = self.py.round() as i32;
+                self.finish_tab_drag(from, x, y);
+            }
             if self.page_button == Some(button) {
                 self.page_button = None;
                 if let Some((px, py)) = self.page_px() {
@@ -717,6 +733,24 @@ impl App {
         }
         let x = self.px.round() as i32;
         let y = self.py.round() as i32;
+        // Clic en menú contextual (overlay del cromo a pantalla completa).
+        if let Some(popup) = self.session.as_ref().and_then(|s| s.shell.context_popup()) {
+            if let Some(index) = popup.hit(x, y) {
+                if let Some(session) = &self.session {
+                    session.shell.activate_context_menu(index);
+                }
+                self.need_paint = true;
+                return;
+            }
+            if let Some(session) = &self.session {
+                session.shell.dismiss_context_menu();
+            }
+            self.need_paint = true;
+            if y >= self.chrome_h() {
+                // El clic fuera cierra el menú; no reenvía al page en este down.
+                return;
+            }
+        }
         if y < self.chrome_h() {
             self.on_chrome_click(x, y);
             return;
@@ -802,6 +836,8 @@ impl App {
                 if let Some(session) = &self.session {
                     session.shell.select_tab(index);
                 }
+                // Inicio de arrastre para reordenar al soltar.
+                self.drag_tab = Some(index);
             }
             Hit::Close(index) => {
                 let keep = self
@@ -1054,16 +1090,62 @@ impl App {
             }
             return true;
         }
+        // Ctrl+N — ventana nueva (proceso).
+        if self.ctrl && evdev == 49 {
+            if let Err(err) = spawn::new_window(None) {
+                eprintln!("silversurfer: {err}");
+            }
+            return true;
+        }
         // F11 — pantalla completa (también Escape para salir).
         if evdev == 87 {
             self.set_fullscreen(!self.fullscreen);
             return true;
         }
-        if evdev == 1 && self.fullscreen && !self.loc_focused {
-            self.set_fullscreen(false);
-            return true;
+        if evdev == 1 && !self.loc_focused {
+            if self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.shell.context_popup().is_some())
+            {
+                if let Some(session) = &self.session {
+                    session.shell.dismiss_context_menu();
+                }
+                self.need_paint = true;
+                return true;
+            }
+            if self.fullscreen {
+                self.set_fullscreen(false);
+                return true;
+            }
         }
         false
+    }
+
+    fn finish_tab_drag(&mut self, from: usize, x: i32, y: i32) {
+        if y < 0 || y >= chrome::HEIGHT {
+            return;
+        }
+        let tabs = self
+            .session
+            .as_ref()
+            .map(|s| s.shell.tab_titles().len())
+            .unwrap_or(1)
+            .max(1);
+        let Some(hit) = chrome::hit(self.logical_w, tabs, x, y) else {
+            return;
+        };
+        let to = match hit {
+            Hit::Tab(i) | Hit::Close(i) => i,
+            _ => return,
+        };
+        if to == from {
+            return;
+        }
+        if let Some(session) = &self.session {
+            session.shell.move_tab(from, to);
+        }
+        self.need_paint = true;
     }
 
     fn leave_location(&mut self) {
