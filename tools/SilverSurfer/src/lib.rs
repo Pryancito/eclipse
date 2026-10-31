@@ -11,6 +11,7 @@ pub mod filter;
 pub mod home;
 pub mod look;
 pub mod location;
+pub mod passwords;
 pub mod privacy;
 pub mod session;
 pub mod spawn;
@@ -50,8 +51,8 @@ Sin URL restaura la sesión anterior (o la página de inicio).
 Una dirección o host navega; palabras buscan (SILVERSURFER_SEARCH).
 Ctrl+L barra, Ctrl+T/W pestaña, Ctrl+Tab cambiar, Ctrl+O lunarfile,
 Ctrl+Shift+P ventana privada, Ctrl+Shift+Delete borrar datos,
-Alt+Izquierda / Alt+Derecha historial, F5 recargar.
-about:privacy · about:cookies · about:clear · about:filters
+Ctrl+Shift+L guardar login, Alt+Izquierda / Alt+Derecha historial, F5 recargar.
+about:privacy · about:cookies · about:clear · about:filters · about:passwords
 SILVERSURFER_ADBLOCK=0 desactiva el bloqueo lite."
             );
             return Ok(());

@@ -22,6 +22,7 @@ code{background:#222;padding:.1rem .35rem}a{color:#7ec8ff}h1{font-size:1.35rem}<
 <li><code>Ctrl+Shift+Delete</code> — borrar cookies y datos de sitio ahora</li>\
 <li><a href=\"about:clear\">about:clear</a> — misma acción vía página</li>\
 <li><a href=\"about:cookies\">about:cookies</a> — lista de sitios con datos</li>\
+<li><a href=\"about:passwords\">about:passwords</a> — logins guardados (no en privado)</li>\
 </ul>";
     write_temp("silversurfer-privacy.html", body)
 }

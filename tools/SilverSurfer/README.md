@@ -85,6 +85,7 @@ sesión; al cerrar borra cookies/almacenamiento/caché de esa instancia).
 | Ctrl+O | `lunarfile --pick` y abre el fichero |
 | Ctrl+Shift+P | Ventana privada (otro proceso) |
 | Ctrl+Shift+Delete | Borrar cookies y datos de sitio |
+| Ctrl+Shift+L | Guardar login del formulario visible |
 
 La barra busca con DuckDuckGo si el texto no parece una dirección
 (`SILVERSURFER_SEARCH` cambia la plantilla; usa `{query}` o `{}`).
@@ -100,6 +101,8 @@ software; en ventana privada aparece además `P`.
 `about:privacy`, `about:cookies` y `about:clear` cubren la UI de datos.
 El bloqueo de anuncios lite (hosts/paths + CSS hide) está activo por
 defecto; `SILVERSURFER_ADBLOCK=0` lo apaga. Ver `about:filters`.
+Contraseñas: almacén local ofuscado (`passwords.json`); autocompletado al
+cargar el origen; `about:passwords` lista entradas. Desactivado en `--private`.
 La home es un lienzo en blanco con el logo de Eclipse OS
 (paleta de `/etc/eclipse/look`). Los smokes de canvas / WebGL / WebGPU /
 WebAudio / MP4 / HLS viven en `smoke.html` (`smoke_url()`).
