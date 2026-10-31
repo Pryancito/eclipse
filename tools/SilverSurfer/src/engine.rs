@@ -16,10 +16,12 @@ use servo::{
     DevicePoint, EmbedderControl, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
     LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent,
     MouseLeftViewportEvent, MouseMoveEvent, Opts, Preferences, Servo, ServoBuilder, Theme,
-    WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
+    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use crate::about;
 use crate::files::{self, PickRequest};
+use crate::filter;
 use crate::privacy;
 use crate::session::{SavedTab, Snapshot};
 
@@ -112,6 +114,8 @@ pub struct Delegate {
     context: Rc<dyn servo::RenderingContext>,
     flags: Rc<Flags>,
     scale: Cell<f32>,
+    user_content: Rc<UserContentManager>,
+    blocked: Cell<usize>,
 }
 
 pub struct Session {
@@ -258,6 +262,7 @@ impl Delegate {
                 let sites = self.list_site_data();
                 privacy::cookies_page_url(&sites)
             }
+            "filters" | "adblock" => filter::status_page_url(self.blocked.get()),
             _ => about::expand(url),
         }
     }
@@ -540,6 +545,7 @@ impl Delegate {
     fn make_view(&self, url: Option<url::Url>) -> WebView {
         let mut builder = WebViewBuilder::new(&self.servo_handle(), self.context.clone())
             .delegate(self.this())
+            .user_content_manager(self.user_content.clone())
             .hidpi_scale_factor(Scale::new(self.scale.get()));
         if let Some(url) = url {
             builder = builder.url(self.expand_url(url));
@@ -631,6 +637,7 @@ impl WebViewDelegate for Delegate {
         let view = request
             .builder(self.context.clone())
             .delegate(self.this())
+            .user_content_manager(self.user_content.clone())
             .hidpi_scale_factor(Scale::new(self.scale.get()))
             .build();
         view.notify_theme_change(Theme::Dark);
@@ -666,6 +673,15 @@ impl WebViewDelegate for Delegate {
             _ => picker.dismiss(),
         }
     }
+
+    fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
+        let url = load.request().url.clone();
+        if filter::should_block(&url) {
+            self.blocked.set(self.blocked.get().saturating_add(1));
+            let response = WebResourceResponse::new(url);
+            load.intercept(response).cancel();
+        }
+    }
 }
 
 pub fn start(
@@ -689,6 +705,10 @@ pub fn start(
     preferences.shell_background_color_rgba = [0.043, 0.071, 0.125, 1.0];
 
     let flags = Rc::new(Flags::default());
+    let user_content = Rc::new(UserContentManager::new());
+    if filter::enabled() {
+        user_content.add_script(Rc::new(UserScript::from(filter::hide_ads_userscript())));
+    }
     let context_for_shell = context.clone();
     let shell = Rc::new_cyclic(|weak| Delegate {
         this: weak.clone(),
@@ -700,6 +720,8 @@ pub fn start(
         context: context_for_shell,
         flags: flags.clone(),
         scale: Cell::new(scale.max(1.0)),
+        user_content: user_content.clone(),
+        blocked: Cell::new(0),
     });
 
     let servo = ServoBuilder::default()
@@ -716,6 +738,7 @@ pub fn start(
     let view = WebViewBuilder::new(&servo, context.clone())
         .delegate(shell.clone())
         .url(url.clone())
+        .user_content_manager(user_content.clone())
         .hidpi_scale_factor(Scale::new(scale.max(1.0)))
         .build();
     view.notify_theme_change(Theme::Dark);

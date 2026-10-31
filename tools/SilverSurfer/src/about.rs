@@ -2,7 +2,7 @@
 
 use url::Url;
 
-use crate::{home, privacy};
+use crate::{filter, home, privacy};
 
 pub fn expand(url: Url) -> Url {
     if url.scheme() != "about" {
@@ -12,6 +12,7 @@ pub fn expand(url: Url) -> Url {
         "blank" => url,
         "" | "home" | "newtab" | "start" => home::home_url(),
         "privacy" | "private" => privacy::privacy_page_url(),
+        "filters" | "adblock" => filter::status_page_url(0),
         // clear / cookies se resuelven en el motor (necesitan SiteDataManager).
         _ => url,
     }
