@@ -104,6 +104,30 @@ pub struct Session {
     pub gpu: bool,
 }
 
+/// Tear down tabs before `Servo` so content processes get `CloseWebView` and
+/// then a clean `Exit`. Without this, the `Delegate` ↔ `WebView` cycle keeps
+/// the constellation alive until the process dies, and Servo's BHM logs
+/// `BHM control disconnected before shutting down!`.
+impl Drop for Session {
+    fn drop(&mut self) {
+        let tabs = {
+            let mut model = self.shell.model.borrow_mut();
+            std::mem::take(&mut model.tabs)
+        };
+        // Dropping each WebView sends CloseWebView and releases its Servo +
+        // Delegate refs, breaking the cycle that would otherwise leak the
+        // session past the window loop.
+        drop(tabs);
+        for _ in 0..32 {
+            self.servo.spin_event_loop();
+        }
+        *self.shell.servo.borrow_mut() = None;
+        // Field drop order then drops `servo` (ServoInner::Exit + spin) while
+        // `shell` is still alive to receive constellation callbacks, then the
+        // shell itself.
+    }
+}
+
 impl Delegate {
     pub fn flags(&self) -> &Flags {
         &self.flags

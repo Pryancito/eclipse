@@ -1749,5 +1749,9 @@ pub fn run(start: Start) -> Result<(), String> {
         }
     }
     app.persist_session();
+    // Tear Servo down while the Wayland connection is still alive so
+    // `Session::drop` can spin the constellation / content-process exit
+    // instead of racing a hard process teardown (BHM control disconnect).
+    drop(app.session.take());
     Ok(())
 }
