@@ -104,19 +104,22 @@ WebAudio / MP4 / HLS viven en `smoke.html` (`smoke_url()`).
 
 ## React / SPAs (Servo 0.7)
 
-El embutidor activa prefs experimentales que los bundles React tocan
-(`IntersectionObserver`, Web Animations, `FontFace`, `adoptedStyleSheets`,
-IndexedDB, visual viewport, container queries, …) e inyecta userscripts
-mínimos: polyfill de `AbortController` / `requestIdleCallback` /
-`queueMicrotask` si faltan, y un reveal de `opacity:1` gated a
-`github.com` (el landing SSR deja el hero en `opacity:0` hasta GSAP).
+Superficie **completa del embutidor** (prefs + polyfills + reveal):
 
-Esto acerca sitios como la homepage de GitHub a “usable a primera vista”.
-**No** iguala Firefox: Custom Elements / Shadow DOM robustos, Service
-Workers, streams modernos y la hidratación React completa siguen siendo
-techo del motor. Service Workers se dejan apagados a propósito (un SW
-a medias rompe más que su ausencia). Crate `servo` 0.7 es lo último en
-crates.io; un bump no está disponible aún.
+- Prefs DOM experimentales (IO, Web Animations, FontFace, adoptedStyleSheets,
+  IndexedDB, clipboard, viewport, Entries, OffscreenCanvas, CookieStore,
+  Credentials, Permissions, module preload, …). Service Workers **off**.
+- Features del crate: `webcrypto`, `brotli-compression-stream`.
+- Userscripts: `AbortController`/`AbortSignal` (+ `abort`/`timeout`/`any`),
+  idle/microtask/scheduler, `structuredClone`, `randomUUID`, `Object.hasOwn`,
+  `replaceAll`/`replaceChildren`, View Transitions no-op, stubs de
+  Intersection/ResizeObserver y CE **solo si faltan**, reveal GitHub
+  (`opacity`/`visibility`/`inert`).
+- Smoke `React / SPA APIs` en `smoke.html`.
+
+**Techo Servo (no 100 % Firefox):** Custom Elements / Shadow DOM reales,
+Service Workers, streams/fetch moderno, apps GitHub logueadas. Crate
+`servo` 0.7 es lo último en crates.io.
 
 ## Medios y límites
 

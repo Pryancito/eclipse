@@ -79,6 +79,15 @@
   </section>
 
   <section>
+    <h2>React / SPA APIs</h2>
+    <p class="lead" style="margin:0 0 8px;font-size:14px">
+      Globals que los bundles React 18+ suelen asumir. Los userscripts de
+      SilverSurfer rellenan huecos; Custom Elements nativos siguen siendo techo Servo.
+    </p>
+    <div id="react-apis">Comprobando…</div>
+  </section>
+
+  <section>
     <h2>WebGL y WebGPU</h2>
     <p id="gl">Comprobando WebGL…</p>
     <p id="gpu">Comprobando WebGPU…</p>
@@ -139,6 +148,42 @@
   tick();
   setInterval(tick, 1000);
   mark("javascript", true, "reloj y rAF activos");
+
+  (function probeReactApis() {
+    const checks = [
+      ["AbortController", typeof AbortController === "function"],
+      ["AbortSignal.abort", !!(AbortSignal && typeof AbortSignal.abort === "function")],
+      ["AbortSignal.timeout", !!(AbortSignal && typeof AbortSignal.timeout === "function")],
+      ["queueMicrotask", typeof queueMicrotask === "function"],
+      ["requestIdleCallback", typeof requestIdleCallback === "function"],
+      ["structuredClone", typeof structuredClone === "function"],
+      ["crypto.randomUUID", !!(crypto && typeof crypto.randomUUID === "function")],
+      ["customElements", typeof customElements !== "undefined"],
+      ["IntersectionObserver", typeof IntersectionObserver === "function"],
+      ["ResizeObserver", typeof ResizeObserver === "function"],
+      ["Object.hasOwn", typeof Object.hasOwn === "function"],
+      ["startViewTransition", !!(document.startViewTransition)],
+    ];
+    const box = document.getElementById("react-apis");
+    const ok = checks.filter((c) => c[1]).length;
+    box.innerHTML =
+      "<ul>" +
+      checks
+        .map(function (c) {
+          return (
+            '<li class="' +
+            (c[1] ? "ok" : "bad") +
+            '">' +
+            c[0] +
+            ": " +
+            (c[1] ? "OK" : "ausente") +
+            "</li>"
+          );
+        })
+        .join("") +
+      "</ul>";
+    mark("react-apis", ok === checks.length, ok + "/" + checks.length + " presentes");
+  })();
 
   const canvas = document.getElementById("wave");
   const ctx = canvas.getContext("2d");

@@ -48,10 +48,10 @@ fn install_compat_preferences(preferences: &mut Preferences) {
     preferences.dom_webgl2_enabled = true;
     preferences.dom_webrtc_enabled = true;
 
-    // React / SPA surfaces (GitHub marketing, dashboards, etc.) probe these.
-    // Defaults in Servo 0.7 are off; incomplete impls still fail softer than
-    // a hard ReferenceError. Service Workers stay off — half-broken SW
-    // registration breaks sites worse than missing SW.
+    // Full embedder React/SPA pref surface for Servo 0.7. Incomplete engine
+    // impls still fail softer than a hard ReferenceError. Service Workers
+    // stay off — half-broken SW registration breaks sites worse than missing SW.
+    // layout_css_* container/backdrop prefs are not on Preferences 0.7.
     preferences.dom_intersection_observer_enabled = true;
     preferences.dom_web_animations_enabled = true;
     preferences.dom_fontface_enabled = true;
@@ -62,8 +62,17 @@ fn install_compat_preferences(preferences: &mut Preferences) {
     preferences.dom_entries_api_enabled = true;
     preferences.dom_offscreen_canvas_enabled = true;
     preferences.dom_storage_manager_api_enabled = true;
-    // layout_css_container_queries_enabled / layout_css_backdrop_filter_enabled
-    // are not on Servo 0.7 Preferences; omit until the crate exposes them.
+    preferences.dom_composition_event_enabled = true;
+    preferences.dom_cookiestore_enabled = true;
+    preferences.dom_credential_management_enabled = true;
+    preferences.dom_exec_command_enabled = true;
+    preferences.dom_geolocation_enabled = true;
+    preferences.dom_notification_enabled = true;
+    preferences.dom_permissions_enabled = true;
+    preferences.dom_allow_preloading_module_descendants = true;
+    preferences.dom_canvas_capture_enabled = true;
+    preferences.dom_wakelock_enabled = true;
+    preferences.dom_webrtc_transceiver_enabled = true;
 
     // Eclipse's panel is dark. A white flash on the first frame reads as a
     // broken window more than as an unloaded page.
