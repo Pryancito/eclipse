@@ -15,10 +15,12 @@ use euclid::Scale;
 use servo::{
     DevicePoint, EmbedderControl, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
     LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent,
-    MouseLeftViewportEvent, MouseMoveEvent, Opts, Preferences, Servo, ServoBuilder, Theme,
-    WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    MouseLeftViewportEvent, MouseMoveEvent, NavigationRequest, Opts, Preferences, Servo,
+    ServoBuilder, Theme, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
+    WheelEvent, WheelMode,
 };
 use crate::about;
+use crate::downloads;
 use crate::files::{self, PickRequest};
 use crate::history;
 use crate::session::{SavedTab, Snapshot};
@@ -73,6 +75,8 @@ pub struct Flags {
     pub animating: AtomicBool,
     /// The script closed the last tab. The window loop exits.
     pub close_window: AtomicBool,
+    /// La página pidió Fullscreen API; la ventana debe seguirla.
+    pub page_fullscreen: AtomicBool,
 }
 
 pub struct Tab {
@@ -217,6 +221,13 @@ impl Delegate {
 
     pub fn zoom_reset(&self) {
         self.set_page_zoom(1.0);
+    }
+
+    pub fn exit_fullscreen(&self) {
+        if let Some(view) = self.active_view() {
+            view.exit_fullscreen();
+        }
+        self.flags.page_fullscreen.store(false, Ordering::Relaxed);
     }
 
     /// Busca en la página vía `window.find` (mejor esfuerzo; Servo 0.7
@@ -627,6 +638,26 @@ impl WebViewDelegate for Delegate {
             }
             _ => picker.dismiss(),
         }
+    }
+
+    fn request_navigation(&self, _webview: WebView, request: NavigationRequest) {
+        if downloads::looks_like_download(&request.url) {
+            let url = request.url.clone();
+            request.deny();
+            if let Err(err) = downloads::save_url(&url) {
+                eprintln!("silversurfer: descarga: {err}");
+            }
+            return;
+        }
+        request.allow();
+    }
+
+    fn notify_fullscreen_state_changed(&self, _webview: WebView, is_fullscreen: bool) {
+        self.flags
+            .page_fullscreen
+            .store(is_fullscreen, Ordering::Relaxed);
+        self.flags.chrome.store(true, Ordering::Relaxed);
+        self.flags.frame.store(true, Ordering::Relaxed);
     }
 }
 

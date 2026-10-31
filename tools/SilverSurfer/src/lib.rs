@@ -7,6 +7,7 @@
 pub mod about;
 pub mod bookmarks;
 pub mod chrome;
+pub mod downloads;
 pub mod files;
 pub mod history;
 pub mod home;
@@ -47,8 +48,9 @@ Sin URL restaura la sesión anterior (o la página de inicio).
 Una dirección o host navega; palabras buscan (SILVERSURFER_SEARCH).
 Ctrl+L barra, Ctrl+T/W pestaña, Ctrl+Tab cambiar, Ctrl+O lunarfile,
 Ctrl+/-/0 zoom, Ctrl+D marcador, Ctrl+F buscar en página,
+Ctrl+S descargar URL, Ctrl+J descargas, F11 pantalla completa,
 Alt+Izquierda / Alt+Derecha historial, F5 recargar.
-about:history y about:bookmarks abren listas locales."
+about:history, about:bookmarks y about:downloads abren listas locales."
             );
             return Ok(());
         }
