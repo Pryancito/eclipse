@@ -221,16 +221,17 @@ impl Session {
 }
 
 /// Ordered teardown:
-/// 1. Close every `WebView` (`CloseWebView` + painter/webrender unlock).
-/// 2. Drain the embedder loop so content-process `RemoveContext` reaches the
-///    WebGL thread *before* constellation `Exit` drops ScriptThreads.
-/// 3. Drop `Servo` (sends `Exit`, waits `ShutdownComplete`, joins WebGL so
+/// 1. Load `about:blank` and drain so page WebGL/canvas tear down before close.
+/// 2. Close every `WebView` (`CloseWebView` + painter/webrender unlock).
+/// 3. Drain so content-process `RemoveContext` reaches the WebGL thread
+///    *before* constellation `Exit` drops ScriptThreads.
+/// 4. Drop `Servo` (sends `Exit`, waits `ShutdownComplete`, joins WebGL so
 ///    surfman `destroy_context` runs on that thread).
-/// 4. `take_window` so the Wayland widget surface / FBO renderbuffers are
+/// 5. `take_window` so the Wayland widget surface / FBO renderbuffers are
 ///    destroyed before `Rc` drop (surfman panics otherwise).
 ///
-/// Without (2)/(3) before script GC, `WebGLProgram` finalize hits Broken pipe;
-/// without (4), main panics on undestroyed FBO renderbuffers.
+/// Script-side WebGLBuffer/VAO finalize races are also softened in the
+/// vendored `servo-script` patch (see `vendor/servo-script/README.eclipse.md`).
 impl Drop for Session {
     fn drop(&mut self) {
         self.shell.flags.animating.store(false, Ordering::Relaxed);
@@ -240,6 +241,22 @@ impl Drop for Session {
             let mut model = self.shell.model.borrow_mut();
             std::mem::take(&mut model.tabs)
         };
+
+        // Navigate away first so documents release canvas/WebGL through the
+        // normal pipeline *before* CloseWebView / ScriptThread DestroyContext
+        // finalizes leftover WebGLBuffer/VAO (upstream assert is_deleted).
+        let blank = url::Url::parse("about:blank").expect("about:blank");
+        for tab in &tabs {
+            tab.view.load(blank.clone());
+        }
+        if let Some(servo) = self.servo.as_ref() {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                servo.spin_event_loop();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
         // Stop compositing before drop so WebRender releases WebGL swap-chain
         // locks (busy_count) and Exit can call destroy_context.
         for tab in &tabs {
