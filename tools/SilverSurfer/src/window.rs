@@ -42,7 +42,7 @@ use crate::chrome::{self, Hit, View};
 use crate::engine::{self, Session, Waker};
 use crate::files::{self, PickRequest};
 use crate::home;
-use crate::location::parse_location;
+use crate::location::{resolve_omnibox, search_template, SchemeHint};
 use crate::look::Look;
 use crate::wl;
 
@@ -388,35 +388,53 @@ impl App {
 
     fn paint_chrome(&mut self) -> Result<(), String> {
         let titles;
+        let loading;
         let active;
         let location;
+        let scheme;
+        let window_title;
         let can_back;
         let can_forward;
         if let Some(session) = self.session.as_ref() {
             titles = session.shell.tab_titles();
+            loading = session.shell.tab_loading();
             active = session.shell.active_index();
             can_back = session.shell.can_go_back();
             can_forward = session.shell.can_go_forward();
+            window_title = session.shell.window_title();
             location = if self.loc_focused {
                 self.loc_text.clone()
             } else {
                 session.shell.location_text()
             };
+            scheme = if self.loc_focused {
+                SchemeHint::Other
+            } else {
+                SchemeHint::from_url_str(&location)
+            };
         } else {
             titles = vec!["SilverSurfer".into()];
+            loading = vec![false];
             active = 0;
             can_back = false;
             can_forward = false;
             location = String::new();
+            scheme = SchemeHint::Other;
+            window_title = "SilverSurfer".into();
+        }
+        if let Some(top) = &self.toplevel {
+            top.set_title(window_title);
         }
         let pixels = chrome::render(&View {
             width: self.logical_w,
             look: self.look,
             titles: &titles,
+            loading: &loading,
             active,
             location: &location,
             location_focused: self.loc_focused,
             location_cursor: self.loc_cursor,
+            scheme,
             can_back,
             can_forward,
             scale: self.scale,
@@ -802,7 +820,7 @@ impl App {
                 }
             }
             28 | 96 => {
-                if let Ok(url) = parse_location(&self.loc_text) {
+                if let Ok(url) = resolve_omnibox(&self.loc_text, &search_template()) {
                     if let Some(session) = &self.session {
                         session.shell.load(url);
                     }

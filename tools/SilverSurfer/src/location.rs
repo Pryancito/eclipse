@@ -1,8 +1,12 @@
-//! What the address bar turns into a URL.
+//! What the address bar turns into a URL — and when it becomes a search.
 
 use url::Url;
 
-/// Parse what the user typed.
+/// Default DuckDuckGo HTML search. `{query}` is replaced with a percent-encoded
+/// query. Override with `$SILVERSURFER_SEARCH`.
+pub const DEFAULT_SEARCH_TEMPLATE: &str = "https://duckduckgo.com/?q={query}";
+
+/// Parse what the user typed as a location only (no search fallback).
 ///
 /// A path that starts with `/` is a local file. Anything that already has a
 /// scheme (`https://`, `file:`, `about:`, `data:`) is used as written. A bare
@@ -34,6 +38,108 @@ pub fn parse_location(input: &str) -> Result<Url, ()> {
         }
     }
     Url::parse(&format!("https://{text}")).map_err(|_| ())
+}
+
+/// Plantilla de búsqueda: `$SILVERSURFER_SEARCH` o [`DEFAULT_SEARCH_TEMPLATE`].
+pub fn search_template() -> String {
+    std::env::var("SILVERSURFER_SEARCH").unwrap_or_else(|_| DEFAULT_SEARCH_TEMPLATE.to_string())
+}
+
+/// Decide si el texto se navega o se busca (comportamiento tipo omnibox).
+///
+/// - Esquema, `about:`, `data:`, ruta absoluta o `//host` → ubicación.
+/// - Espacios → búsqueda.
+/// - Una sola etiqueta sin `.` ni `:` (p. ej. `hola`) → búsqueda.
+/// - Host con punto, puerto o `localhost` → `https://…`.
+pub fn resolve_omnibox(input: &str, search_template: &str) -> Result<Url, ()> {
+    let text = input.trim();
+    if text.is_empty() {
+        return Err(());
+    }
+    if looks_like_location(text) {
+        parse_location(text)
+    } else {
+        build_search(text, search_template)
+    }
+}
+
+fn looks_like_location(text: &str) -> bool {
+    if text.starts_with('/') || text.starts_with("//") {
+        return true;
+    }
+    if text.contains("://") || text.starts_with("about:") || text.starts_with("data:") {
+        return true;
+    }
+    if text.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower.starts_with("localhost:")
+        || lower.starts_with("localhost/")
+    {
+        return true;
+    }
+    text.contains('.') || text.contains(':')
+}
+
+fn build_search(query: &str, template: &str) -> Result<Url, ()> {
+    let encoded = percent_encode_query(query);
+    let url = if template.contains("{query}") {
+        template.replace("{query}", &encoded)
+    } else if template.contains("{}") {
+        template.replace("{}", &encoded)
+    } else {
+        format!("{template}{encoded}")
+    };
+    Url::parse(&url).map_err(|_| ())
+}
+
+fn percent_encode_query(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 3);
+    for &b in text.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push_str("%20"),
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// Esquema que muestra el cromo junto a la barra.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemeHint {
+    Https,
+    Http,
+    File,
+    Other,
+}
+
+impl SchemeHint {
+    pub fn from_url_str(url: &str) -> Self {
+        match Url::parse(url).ok().as_ref().map(Url::scheme) {
+            Some("https") => Self::Https,
+            Some("http") => Self::Http,
+            Some("file") => Self::File,
+            _ => Self::Other,
+        }
+    }
+
+    /// Etiqueta ASCII corta para FONT_6X10.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Https => "s",
+            Self::Http => "!",
+            Self::File => "/",
+            Self::Other => "·",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -109,5 +215,59 @@ mod tests {
         let url = parse_location("localhost:8080").unwrap();
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.port(), Some(8080));
+    }
+
+    #[test]
+    fn omnibox_searches_words_and_navigates_hosts() {
+        let tpl = DEFAULT_SEARCH_TEMPLATE;
+        let search = resolve_omnibox("hola mundo", tpl).unwrap();
+        assert_eq!(search.scheme(), "https");
+        assert!(search.as_str().contains("duckduckgo.com"));
+        assert!(search.as_str().contains("hola%20mundo"));
+
+        let single = resolve_omnibox("firefox", tpl).unwrap();
+        assert!(single.as_str().contains("duckduckgo.com"));
+        assert!(single.as_str().contains("firefox"));
+
+        let host = resolve_omnibox("servo.org/demo", tpl).unwrap();
+        assert_eq!(host.as_str(), "https://servo.org/demo");
+
+        let https = resolve_omnibox("https://example.com", tpl).unwrap();
+        assert_eq!(https.as_str(), "https://example.com/");
+
+        let path = resolve_omnibox("/tmp/x.html", tpl).unwrap();
+        assert_eq!(path.scheme(), "file");
+
+        let local = resolve_omnibox("localhost:8080", tpl).unwrap();
+        assert_eq!(local.as_str(), "https://localhost:8080/");
+    }
+
+    #[test]
+    fn omnibox_honours_custom_template_placeholder() {
+        let url = resolve_omnibox("a b", "https://example.test/search?q={query}").unwrap();
+        assert_eq!(url.as_str(), "https://example.test/search?q=a%20b");
+        let url = resolve_omnibox("x", "https://example.test/?q={}").unwrap();
+        assert_eq!(url.as_str(), "https://example.test/?q=x");
+    }
+
+    #[test]
+    fn scheme_hint_reads_the_url() {
+        assert_eq!(
+            SchemeHint::from_url_str("https://a"),
+            SchemeHint::Https
+        );
+        assert_eq!(SchemeHint::from_url_str("http://a"), SchemeHint::Http);
+        assert_eq!(
+            SchemeHint::from_url_str("file:///tmp/a"),
+            SchemeHint::File
+        );
+        assert_eq!(SchemeHint::from_url_str("about:blank"), SchemeHint::Other);
+        assert_eq!(SchemeHint::Https.badge(), "s");
+        assert_eq!(SchemeHint::Http.badge(), "!");
+    }
+
+    #[test]
+    fn empty_omnibox_is_rejected() {
+        assert!(resolve_omnibox("  ", DEFAULT_SEARCH_TEMPLATE).is_err());
     }
 }
