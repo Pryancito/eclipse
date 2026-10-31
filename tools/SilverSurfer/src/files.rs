@@ -36,9 +36,8 @@ fn path_arg(path: &Path) -> String {
 /// An empty `Ok` is a cancellation (Escape, or a non-zero exit). `Err` means
 /// the dialog could not be started.
 pub fn pick(request: &PickRequest) -> Result<Vec<PathBuf>, String> {
-    let program = find_lunarfile().ok_or_else(|| {
-        "lunarfile no está en PATH ni en /usr/local/bin".to_string()
-    })?;
+    let program = find_lunarfile()
+        .ok_or_else(|| "lunarfile no está en PATH ni en /usr/local/bin".to_string())?;
     let out = std::env::temp_dir().join(format!("silversurfer-pick-{}", std::process::id()));
     let _ = std::fs::remove_file(&out);
     let status = Command::new(&program)
@@ -104,7 +103,14 @@ mod tests {
         );
         assert_eq!(
             args,
-            vec!["--pick", "--out", "/tmp/out", "--multiple", "--save", "notas.txt"]
+            vec![
+                "--pick",
+                "--out",
+                "/tmp/out",
+                "--multiple",
+                "--save",
+                "notas.txt"
+            ]
         );
     }
 

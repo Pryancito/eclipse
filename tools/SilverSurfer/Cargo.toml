@@ -11,14 +11,19 @@ license = "MPL-2.0"
 [workspace]
 exclude = ["vendor"]
 
-# Patches over crates.io Servo 0.7 pieces. Drop each when fixed upstream.
+# Patches over crates.io. Drop each when fixed upstream.
 # - servo-net: hyper HTTP/2 response header list up to 256 KiB (YouTube).
 # - servo-script: WebGLBuffer/VAO finalize must not assert during ScriptThread
 #   teardown (window close after WebGL pages).
+# - surfman: `eglInitialize` returning EGL_FALSE must be an error. In QEMU the
+#   Wayland socket is up but virtio-gpu is 2D-only, so the call returns 0.
+#   Asserting there aborts before the unix backend falls through to
+#   surfaceless llvmpipe, which is how the page is painted into wl_shm.
 # Tests are not vendored.
 [patch.crates-io]
 servo-net = { path = "vendor/servo-net" }
 servo-script = { path = "vendor/servo-script" }
+surfman = { path = "vendor/surfman" }
 
 [features]
 default = ["engine", "media-gstreamer"]

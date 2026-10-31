@@ -12,8 +12,8 @@ pub mod files;
 pub mod filter;
 pub mod history;
 pub mod home;
-pub mod look;
 pub mod location;
+pub mod look;
 pub mod menu;
 pub mod passwords;
 pub mod privacy;
@@ -97,5 +97,30 @@ SILVERSURFER_ADBLOCK=0 desactiva el bloqueo lite."
         window::run(window::Start::Fresh)
     } else {
         window::run(window::Start::Restore)
+    }
+}
+
+#[cfg(test)]
+mod surfman_fallback {
+    #[test]
+    fn egl_init_failure_is_an_error_not_an_abort() {
+        let aborts = |src: &str| {
+            src.lines()
+                .any(|line| line.trim_start().starts_with("assert_ne!(ok, egl::FALSE)"))
+        };
+        let wayland = include_str!("../vendor/surfman/src/wayland/connection.rs");
+        let x11 = include_str!("../vendor/surfman/src/x11/connection.rs");
+        assert!(!aborts(wayland), "wayland eglInitialize still aborts");
+        assert!(
+            wayland.contains("ok == egl::FALSE"),
+            "wayland eglInitialize failure must return an error"
+        );
+        assert!(!aborts(x11), "x11 eglInitialize still aborts");
+        assert!(
+            x11.contains(
+                "fn create_egl_display(display: *mut Display) -> Result<EGLDisplay, Error>"
+            ),
+            "x11 eglInitialize failure must return an error"
+        );
     }
 }

@@ -14,9 +14,9 @@ const MAX_ENTRIES: usize = 100;
 
 /// Extensiones que se tratan como descarga en vez de navegación.
 const DOWNLOAD_EXTS: &[&str] = &[
-    "7z", "apk", "bz2", "csv", "deb", "dmg", "doc", "docx", "epub", "exe",
-    "gz", "iso", "jar", "odt", "ods", "odp", "pdf", "ppt", "pptx", "rar",
-    "rpm", "rtf", "tar", "tgz", "torrent", "xz", "zip", "zst",
+    "7z", "apk", "bz2", "csv", "deb", "dmg", "doc", "docx", "epub", "exe", "gz", "iso", "jar",
+    "odt", "ods", "odp", "pdf", "ppt", "pptx", "rar", "rpm", "rtf", "tar", "tgz", "torrent", "xz",
+    "zip", "zst",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,10 +154,7 @@ pub fn save_url(url: &url::Url, private: bool) -> Result<Option<PathBuf>, String
 }
 
 fn fetch(url: &url::Url, dest: &Path, private: bool) {
-    let ok = match Command::new("curl")
-        .args(curl_args(url, dest))
-        .status()
-    {
+    let ok = match Command::new("curl").args(curl_args(url, dest)).status() {
         Ok(status) => status.success(),
         Err(err) => {
             eprintln!("silversurfer: curl: {err}");

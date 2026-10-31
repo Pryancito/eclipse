@@ -12,17 +12,6 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use dpi::PhysicalSize;
-use euclid::Scale;
-use servo::{
-    ConsoleLogLevel, ContextMenu, ContextMenuAction, ContextMenuItem, DevicePoint,
-    EmbedderControl, EventLoopWaker, InputEvent, JSValue, Key, KeyState, KeyboardEvent,
-    LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent,
-    MouseLeftViewportEvent, MouseMoveEvent, NavigationRequest, Opts, Preferences, Servo,
-    ServoBuilder, Theme, UserContentManager, UserScript, WebResourceLoad, WebResourceResponse,
-    WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
-    WindowRenderingContext,
-};
 use crate::about;
 use crate::downloads;
 use crate::files::{self, PickRequest};
@@ -34,6 +23,16 @@ use crate::privacy;
 use crate::session::{SavedTab, Snapshot};
 use crate::spa_compat::{self, GITHUB_REVEAL_USERSCRIPT};
 use crate::spawn;
+use dpi::PhysicalSize;
+use euclid::Scale;
+use servo::{
+    ConsoleLogLevel, ContextMenu, ContextMenuAction, ContextMenuItem, DevicePoint, EmbedderControl,
+    EventLoopWaker, InputEvent, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, Location,
+    Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
+    MouseMoveEvent, NavigationRequest, Opts, Preferences, Servo, ServoBuilder, Theme,
+    UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
+    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
+};
 
 /// Default HTTP / `navigator.userAgent` string.
 ///
@@ -45,10 +44,8 @@ use crate::spawn;
 fn user_agent() -> String {
     match std::env::var("SILVERSURFER_UA") {
         Ok(ua) if !ua.is_empty() => ua,
-        _ => {
-            "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0 Servo/0.7"
-                .into()
-        }
+        _ => "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0 Servo/0.7"
+            .into(),
     }
 }
 
@@ -207,7 +204,11 @@ impl EventLoopWaker for Waker {
     fn wake(&self) {
         let one: u64 = 1;
         unsafe {
-            libc::write(self.fd, (&one as *const u64).cast(), std::mem::size_of::<u64>());
+            libc::write(
+                self.fd,
+                (&one as *const u64).cast(),
+                std::mem::size_of::<u64>(),
+            );
         }
     }
 }
@@ -900,7 +901,9 @@ impl Delegate {
 
     pub fn pointer_left(&self) {
         if let Some(view) = self.active_view() {
-            view.notify_input_event(InputEvent::MouseLeftViewport(MouseLeftViewportEvent::default()));
+            view.notify_input_event(InputEvent::MouseLeftViewport(
+                MouseLeftViewportEvent::default(),
+            ));
         }
     }
 
@@ -980,7 +983,9 @@ impl Delegate {
         let id = view.id();
         let model = self.model.borrow_mut();
         let index = model.tabs.iter().position(|tab| tab.view.id() == id)?;
-        Some(std::cell::RefMut::map(model, |model| &mut model.tabs[index]))
+        Some(std::cell::RefMut::map(model, |model| {
+            &mut model.tabs[index]
+        }))
     }
 }
 
@@ -998,7 +1003,11 @@ impl WebViewDelegate for Delegate {
     fn notify_animating_changed(&self, webview: WebView, animating: bool) {
         let active = {
             let mut model = self.model.borrow_mut();
-            let Some(tab) = model.tabs.iter_mut().find(|tab| tab.view.id() == webview.id()) else {
+            let Some(tab) = model
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.view.id() == webview.id())
+            else {
                 return;
             };
             tab.animating = animating;
@@ -1042,8 +1051,8 @@ impl WebViewDelegate for Delegate {
                 }
             };
             tab.loading = status != LoadStatus::Complete;
-            let visit = (status == LoadStatus::Complete && !self.private)
-                .then(|| tab.title.clone());
+            let visit =
+                (status == LoadStatus::Complete && !self.private).then(|| tab.title.clone());
             (tab.url.clone(), visit)
         };
         if let Some(title) = visit {
@@ -1078,11 +1087,7 @@ impl WebViewDelegate for Delegate {
         );
     }
 
-    fn request_create_new(
-        &self,
-        _parent: WebView,
-        request: servo::CreateNewWebViewRequest,
-    ) {
+    fn request_create_new(&self, _parent: WebView, request: servo::CreateNewWebViewRequest) {
         let mut builder = request
             .builder(self.context.clone())
             .delegate(self.this())
@@ -1098,7 +1103,10 @@ impl WebViewDelegate for Delegate {
     fn notify_closed(&self, webview: WebView) {
         let index = {
             let model = self.model.borrow();
-            model.tabs.iter().position(|tab| tab.view.id() == webview.id())
+            model
+                .tabs
+                .iter()
+                .position(|tab| tab.view.id() == webview.id())
         };
         let Some(index) = index else {
             return;
@@ -1138,11 +1146,7 @@ impl WebViewDelegate for Delegate {
                             enabled: false,
                             separator: true,
                         },
-                        ContextMenuItem::Item {
-                            label,
-                            enabled,
-                            ..
-                        } => menu::Item {
+                        ContextMenuItem::Item { label, enabled, .. } => menu::Item {
                             label: label.clone(),
                             enabled: *enabled,
                             separator: false,
@@ -1279,8 +1283,13 @@ pub fn software_context(
     width: u32,
     height: u32,
 ) -> Result<Rc<dyn servo::RenderingContext>, String> {
-    let context = servo::SoftwareRenderingContext::new(PhysicalSize::new(width.max(1), height.max(1)))
-        .map_err(|err| format!("contexto de software: {err:?}"))?;
+    // Mesa probes the DRM node inside `eglInitialize`, before surfman picks a
+    // software adapter. QEMU's virtio-gpu is 2D-only, so that probe fails the
+    // Wayland platform. Forcing llvmpipe first lets the surfaceless fallback
+    // open. The window path never reaches here when EGL already works.
+    std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+    let context =
+        servo::SoftwareRenderingContext::new(PhysicalSize::new(width.max(1), height.max(1)))
+            .map_err(|err| format!("contexto de software: {err:?}"))?;
     Ok(Rc::new(context))
 }
-

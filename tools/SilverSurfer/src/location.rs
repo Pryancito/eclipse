@@ -30,7 +30,10 @@ pub fn parse_location(input: &str) -> Result<Url, ()> {
     }
     if let Some((scheme, rest)) = text.split_once(':') {
         let scheme_ok = !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphabetic());
-        let known = matches!(scheme.to_ascii_lowercase().as_str(), "about" | "data" | "mailto");
+        let known = matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "about" | "data" | "mailto"
+        );
         // `file:/tmp/a`, `http:/host` and `About:blank`. `localhost:8080` is
         // not a scheme: the part after the colon does not start a path.
         if scheme_ok && (known || rest.starts_with('/') || rest.starts_with("//")) {
@@ -81,10 +84,7 @@ fn looks_like_location(text: &str) -> bool {
         }
     }
     let lower = text.to_ascii_lowercase();
-    if lower == "localhost"
-        || lower.starts_with("localhost:")
-        || lower.starts_with("localhost/")
-    {
+    if lower == "localhost" || lower.starts_with("localhost:") || lower.starts_with("localhost/") {
         return true;
     }
     text.contains('.') || text.contains(':')
@@ -181,7 +181,10 @@ mod tests {
 
     #[test]
     fn about_and_data_are_kept() {
-        assert_eq!(parse_location("about:blank").unwrap().as_str(), "about:blank");
+        assert_eq!(
+            parse_location("about:blank").unwrap().as_str(),
+            "about:blank"
+        );
         let data = parse_location("data:text/plain,hola").unwrap();
         assert_eq!(data.scheme(), "data");
     }
@@ -207,7 +210,10 @@ mod tests {
         let http = parse_location("http:/ejemplo.com").unwrap();
         assert_eq!(http.scheme(), "http");
         assert_eq!(http.host_str(), Some("ejemplo.com"));
-        assert_eq!(parse_location("About:blank").unwrap().as_str(), "about:blank");
+        assert_eq!(
+            parse_location("About:blank").unwrap().as_str(),
+            "about:blank"
+        );
     }
 
     #[test]
@@ -259,15 +265,9 @@ mod tests {
 
     #[test]
     fn scheme_hint_reads_the_url() {
-        assert_eq!(
-            SchemeHint::from_url_str("https://a"),
-            SchemeHint::Https
-        );
+        assert_eq!(SchemeHint::from_url_str("https://a"), SchemeHint::Https);
         assert_eq!(SchemeHint::from_url_str("http://a"), SchemeHint::Http);
-        assert_eq!(
-            SchemeHint::from_url_str("file:///tmp/a"),
-            SchemeHint::File
-        );
+        assert_eq!(SchemeHint::from_url_str("file:///tmp/a"), SchemeHint::File);
         assert_eq!(SchemeHint::from_url_str("about:blank"), SchemeHint::Other);
         assert_eq!(SchemeHint::Https.badge(), "s");
         assert_eq!(SchemeHint::Http.badge(), "!");

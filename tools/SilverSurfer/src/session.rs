@@ -21,7 +21,10 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn encode(&self) -> String {
         let mut out = String::from("{\n");
-        out.push_str(&format!("  \"active\": {},\n", self.active.min(self.tabs.len().saturating_sub(1))));
+        out.push_str(&format!(
+            "  \"active\": {},\n",
+            self.active.min(self.tabs.len().saturating_sub(1))
+        ));
         out.push_str("  \"tabs\": [\n");
         for (i, tab) in self.tabs.iter().enumerate() {
             out.push_str("    {\n");

@@ -41,9 +41,7 @@ impl Look {
         if let Some(look) = env.and_then(Self::from_name) {
             return look;
         }
-        file_text
-            .and_then(look_from_text)
-            .unwrap_or(Look::Eclipse)
+        file_text.and_then(look_from_text).unwrap_or(Look::Eclipse)
     }
 
     pub fn current() -> Self {

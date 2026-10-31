@@ -71,10 +71,7 @@ a{color:#7ec8ff}h1{font-size:1.35rem}</style>\
 }
 
 pub fn cookies_page_url(sites: &[(String, String)]) -> Url {
-    write_temp(
-        "silversurfer-cookies.html",
-        &cookies_page_html(sites),
-    )
+    write_temp("silversurfer-cookies.html", &cookies_page_html(sites))
 }
 
 fn write_temp(name: &str, body: &str) -> Url {

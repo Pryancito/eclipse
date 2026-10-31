@@ -135,7 +135,11 @@ fn js_string_literal(s: &str) -> String {
 }
 
 pub fn status_page_url(blocked_hint: usize) -> Url {
-    let on = if enabled() { "activo" } else { "desactivado (SILVERSURFER_ADBLOCK=0)" };
+    let on = if enabled() {
+        "activo"
+    } else {
+        "desactivado (SILVERSURFER_ADBLOCK=0)"
+    };
     let body = format!(
         "<!doctype html><meta charset=utf-8><title>Filtro — SilverSurfer</title>\
 <style>body{{font:14px/1.5 system-ui,sans-serif;margin:2rem;background:#111;color:#eee;max-width:40rem}}\
@@ -159,7 +163,8 @@ mod tests {
 
     #[test]
     fn blocks_known_ad_hosts() {
-        let u = Url::parse("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js").unwrap();
+        let u =
+            Url::parse("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js").unwrap();
         assert!(should_block(&u));
         let ok = Url::parse("https://example.com/docs/index.html").unwrap();
         assert!(!should_block(&ok));

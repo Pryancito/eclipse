@@ -252,11 +252,7 @@ pub fn render(view: &View<'_>) -> Pixels {
     let mut pixmap = Pixmap::new(width, height).expect("chrome pixmap");
     let pal = view.look.palette();
     pixmap.fill(color(pal.panel));
-    let lay = layout_ex(
-        view.width.max(1),
-        view.titles.len().max(1),
-        view.private,
-    );
+    let lay = layout_ex(view.width.max(1), view.titles.len().max(1), view.private);
     let titles: &[String] = if view.titles.is_empty() {
         &[]
     } else {
@@ -801,10 +797,7 @@ mod tests {
         assert!(lay.tabs[0].y < HEIGHT);
         assert!(lay.location.y >= TAB_H);
         let close = lay.closes[0];
-        assert_eq!(
-            hit(800, 2, close.x + 1, close.y + 1),
-            Some(Hit::Close(0))
-        );
+        assert_eq!(hit(800, 2, close.x + 1, close.y + 1), Some(Hit::Close(0)));
         assert_eq!(
             hit(800, 2, lay.location.x + 4, lay.location.y + 4),
             Some(Hit::Location)

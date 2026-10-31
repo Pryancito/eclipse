@@ -47,7 +47,10 @@ mod tests {
         assert!(!html.contains("{{BG}}"));
         assert!(!html.contains("{{LOGO}}"));
         assert!(html.contains("#0b1220"), "eclipse panel colour: {html}");
-        assert!(html.contains("aria-label=\"Eclipse OS\"") || html.contains("<title>Eclipse OS</title>"));
+        assert!(
+            html.contains("aria-label=\"Eclipse OS\"")
+                || html.contains("<title>Eclipse OS</title>")
+        );
         assert!(html.contains("viewBox=\"0 0 48 48\""));
         assert!(html.contains("<circle"));
         assert!(html.contains("#aa00aa"));

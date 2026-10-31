@@ -20,7 +20,9 @@ use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
     RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle, WindowHandle,
 };
-use servo::{Code, Key, Modifiers, MouseButton, NamedKey, RenderingContext, WindowRenderingContext};
+use servo::{
+    Code, Key, Modifiers, MouseButton, NamedKey, RenderingContext, WindowRenderingContext,
+};
 use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
@@ -456,8 +458,7 @@ impl App {
         let require_egl = std::env::var_os("SILVERSURFER_REQUIRE_EGL").is_some();
         if require_egl {
             return Err(
-                "SILVERSURFER_REQUIRE_EGL: no hay contexto EGL y el software está prohibido"
-                    .into(),
+                "SILVERSURFER_REQUIRE_EGL: no hay contexto EGL y el software está prohibido".into(),
             );
         }
         eprintln!("silversurfer: sin contexto EGL, la página se pinta en software");
@@ -487,12 +488,19 @@ impl App {
         if self.parent.is_some() && (self.configured || self.session.is_none()) {
             self.ensure_session()?;
         }
-        let animating = self
-            .session
-            .as_ref()
-            .is_some_and(|s| s.shell.flags().animating.load(std::sync::atomic::Ordering::Relaxed));
+        let animating = self.session.as_ref().is_some_and(|s| {
+            s.shell
+                .flags()
+                .animating
+                .load(std::sync::atomic::Ordering::Relaxed)
+        });
         if let Some(session) = self.session.as_mut() {
-            if session.shell.flags().close_window.load(std::sync::atomic::Ordering::Relaxed) {
+            if session
+                .shell
+                .flags()
+                .close_window
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 self.exit = true;
             }
             session.spin_event_loop();
@@ -554,10 +562,8 @@ impl App {
             return Ok(());
         }
         let (pw, ph) = self.content_size();
-        let rect = webrender_api::units::DeviceIntRect::from_size(euclid::size2(
-            pw as i32,
-            ph as i32,
-        ));
+        let rect =
+            webrender_api::units::DeviceIntRect::from_size(euclid::size2(pw as i32, ph as i32));
         let Some(image) = session.context.read_to_image(rect) else {
             return Ok(());
         };
@@ -1001,7 +1007,10 @@ impl App {
             return;
         }
         let interval = Duration::from_secs_f64(1.0 / f64::from(self.repeat_rate));
-        if self.repeated_at.is_some_and(|prev| now.duration_since(prev) < interval) {
+        if self
+            .repeated_at
+            .is_some_and(|prev| now.duration_since(prev) < interval)
+        {
             return;
         }
         self.repeated_at = Some(now);
@@ -1207,7 +1216,9 @@ impl App {
             self.leave_location();
             if let Some(session) = &self.session {
                 let summary = session.shell.clear_browsing_data();
-                session.shell.load(crate::privacy::cleared_page_url(&summary));
+                session
+                    .shell
+                    .load(crate::privacy::cleared_page_url(&summary));
             }
             return true;
         }
@@ -1365,9 +1376,7 @@ impl App {
             return;
         };
         let (key, code) = self.key_and_code(evdev);
-        session
-            .shell
-            .key(down, key, code, self.modifiers(), repeat);
+        session.shell.key(down, key, code, self.modifiers(), repeat);
     }
 
     fn modifiers(&self) -> Modifiers {
@@ -1497,7 +1506,10 @@ fn chrome_fingerprint(
         SchemeHint::Other => 0,
     }]);
     mix(location.as_bytes());
-    for (t, l) in titles.iter().zip(loading.iter().chain(std::iter::repeat(&false))) {
+    for (t, l) in titles
+        .iter()
+        .zip(loading.iter().chain(std::iter::repeat(&false)))
+    {
         mix(t.as_bytes());
         mix(&[u8::from(*l)]);
         mix(&[0xff]);
@@ -1594,15 +1606,7 @@ fn alloc_buffer(
     }
     let file = unsafe { File::from_raw_fd(fd) };
     let pool = shm.create_pool(file.as_fd(), len as i32, qh, ());
-    let buffer = pool.create_buffer(
-        0,
-        width,
-        height,
-        stride,
-        wl_shm::Format::Argb8888,
-        qh,
-        id,
-    );
+    let buffer = pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, qh, id);
     drop(file);
     Ok(LiveBuf {
         buffer,
@@ -2002,7 +2006,11 @@ impl Dispatch<WlKeyboard, ()> for App {
                 state.repeat_rate = rate;
                 state.repeat_delay_ms = delay;
             }
-            wl_keyboard::Event::Key { key, state: key_state, .. } => {
+            wl_keyboard::Event::Key {
+                key,
+                state: key_state,
+                ..
+            } => {
                 let down = matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed));
                 if let Some(xkb) = &mut state.xkb {
                     let dir = if down {
@@ -2022,7 +2030,8 @@ impl Dispatch<WlKeyboard, ()> for App {
                 ..
             } => {
                 if let Some(xkb) = &mut state.xkb {
-                    xkb.state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                    xkb.state
+                        .update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
                 }
             }
             wl_keyboard::Event::Enter { keys, .. } => {
@@ -2058,7 +2067,9 @@ impl Dispatch<WlPointer, ()> for App {
                 surface_y,
                 ..
             } => state.note_motion(surface_x, surface_y),
-            wl_pointer::Event::Button { button, state: st, .. } => {
+            wl_pointer::Event::Button {
+                button, state: st, ..
+            } => {
                 let down = matches!(st, WEnum::Value(wl_pointer::ButtonState::Pressed));
                 state.on_pointer_button(button, down);
             }

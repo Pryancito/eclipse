@@ -28,7 +28,10 @@ impl Store {
         for (i, e) in self.entries.iter().enumerate() {
             out.push_str("    {\n");
             out.push_str(&format!("      \"origin\": {},\n", json_string(&e.origin)));
-            out.push_str(&format!("      \"username\": {},\n", json_string(&e.username)));
+            out.push_str(&format!(
+                "      \"username\": {},\n",
+                json_string(&e.username)
+            ));
             out.push_str(&format!(
                 "      \"secret\": {}\n",
                 json_string(&obfuscate(&e.secret))
@@ -272,16 +275,8 @@ fn base64_decode(text: &str) -> Result<Vec<u8>, ()> {
     for chunk in bytes.chunks(4) {
         let a = val(chunk[0])?;
         let b = val(chunk[1])?;
-        let c = if chunk[2] == b'=' {
-            0
-        } else {
-            val(chunk[2])?
-        };
-        let d = if chunk[3] == b'=' {
-            0
-        } else {
-            val(chunk[3])?
-        };
+        let c = if chunk[2] == b'=' { 0 } else { val(chunk[2])? };
+        let d = if chunk[3] == b'=' { 0 } else { val(chunk[3])? };
         let n = (a << 18) | (b << 12) | (c << 6) | d;
         out.push(((n >> 16) & 255) as u8);
         if chunk[2] != b'=' {
@@ -346,7 +341,9 @@ mod tests {
         let mut store = Store::default();
         store.upsert("http://example.com", "ada", "lovelace");
         assert!(store.find_for_url("http://example.com:80/login").is_some());
-        assert!(store.find_for_url("http://example.com:8080/login").is_none());
+        assert!(store
+            .find_for_url("http://example.com:8080/login")
+            .is_none());
         assert_eq!(
             origin_of("https://example.com:8443/a").as_deref(),
             Some("https://example.com:8443")
