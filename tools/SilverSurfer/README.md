@@ -90,7 +90,8 @@ muestra `…` y la barra un distintivo de esquema (`s` https, `!` http, `/` file
 El cromo se pinta a la escala del output (HiDPI nativo), con iconos
 vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.
 El distintivo `GL` / `SW` indica si la página va por EGL o por blit
-software; la home lista smokes locales (canvas, WebGL, WebGPU, WebAudio)
-y remotas (MP4/HLS).
+software. La home es un lienzo en blanco con el logo de Eclipse OS
+(paleta de `/etc/eclipse/look`). Los smokes de canvas / WebGL / WebGPU /
+WebAudio / MP4 / HLS viven en `smoke.html` (`smoke_url()`).
 
 `<input type=file>` también abre `lunarfile`. Escape en el selector cancela.

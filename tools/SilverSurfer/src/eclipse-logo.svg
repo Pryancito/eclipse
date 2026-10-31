@@ -1,0 +1,43 @@
+<!-- Eclipse OS distributor logo (same formula as xtask/src/linux/logo.rs). -->
+<svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-label="Eclipse OS">
+  <title>Eclipse OS</title>
+  <g fill="none" stroke="#aa00aa" stroke-linecap="round">
+    <circle cx="24" cy="24" r="13" stroke-width="1.5" opacity="0.45"/>
+  <path stroke-width="2" d="M37.00 24.00L41.62 24.00"/>
+  <path stroke-width="2" d="M36.80 26.26L42.16 27.20"/>
+  <path stroke-width="2" d="M36.22 28.45L42.00 30.55"/>
+  <path stroke-width="2" d="M35.26 30.50L41.04 33.84"/>
+  <path stroke-width="2" d="M33.96 32.36L39.29 36.83"/>
+  <path stroke-width="2" d="M32.36 33.96L36.83 39.29"/>
+  <path stroke-width="2" d="M30.50 35.26L33.84 41.04"/>
+  <path stroke-width="2" d="M28.45 36.22L30.55 42.00"/>
+  <path stroke-width="2" d="M26.26 36.80L27.20 42.16"/>
+  <path stroke-width="2" d="M24.00 37.00L24.00 41.62"/>
+  <path stroke-width="2" d="M21.74 36.80L21.08 40.56"/>
+  <path stroke-width="2" d="M19.55 36.22L18.49 39.13"/>
+  <path stroke-width="2" d="M17.50 35.26L16.22 37.48"/>
+  <path stroke-width="2" d="M15.64 33.96L14.17 35.71"/>
+  <path stroke-width="2" d="M14.04 32.36L12.29 33.83"/>
+  <path stroke-width="2" d="M12.74 30.50L10.52 31.78"/>
+  <path stroke-width="2" d="M11.78 28.45L8.87 29.51"/>
+  <path stroke-width="2" d="M11.20 26.26L7.44 26.92"/>
+  <path stroke-width="2" d="M11.00 24.00L6.38 24.00"/>
+  <path stroke-width="2" d="M11.20 21.74L5.84 20.80"/>
+  <path stroke-width="2" d="M11.78 19.55L6.00 17.45"/>
+  <path stroke-width="2" d="M12.74 17.50L6.96 14.16"/>
+  <path stroke-width="2" d="M14.04 15.64L8.71 11.17"/>
+  <path stroke-width="2" d="M15.64 14.04L11.17 8.71"/>
+  <path stroke-width="2" d="M17.50 12.74L14.16 6.96"/>
+  <path stroke-width="2" d="M19.55 11.78L17.45 6.00"/>
+  <path stroke-width="2" d="M21.74 11.20L20.80 5.84"/>
+  <path stroke-width="2" d="M24.00 11.00L24.00 6.38"/>
+  <path stroke-width="2" d="M26.26 11.20L26.92 7.44"/>
+  <path stroke-width="2" d="M28.45 11.78L29.51 8.87"/>
+  <path stroke-width="2" d="M30.50 12.74L31.78 10.52"/>
+  <path stroke-width="2" d="M32.36 14.04L33.83 12.29"/>
+  <path stroke-width="2" d="M33.96 15.64L35.71 14.17"/>
+  <path stroke-width="2" d="M35.26 17.50L37.48 16.22"/>
+  <path stroke-width="2" d="M36.22 19.55L39.13 18.49"/>
+  <path stroke-width="2" d="M36.80 21.74L40.56 21.08"/>
+  </g>
+</svg>
