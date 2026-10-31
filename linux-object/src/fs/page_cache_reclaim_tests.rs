@@ -53,6 +53,29 @@ type ProbeFile = (
     Arc<AtomicUsize>,
 );
 
+/// Drop idle caches left by earlier tests.
+///
+/// A private file cache now survives the process that filled it, which is
+/// the point of the cache, and these tests share one registry. A pass that
+/// measures "the one entry I just made" has to start from a registry those
+/// leftovers are not still sitting in.
+fn drain_idle() {
+    let evicted = {
+        let mut registry = SHARED_FILE_VMOS.lock();
+        let keys: Vec<_> = registry
+            .iter()
+            .filter(|(_, (vmo, inode_weak, _))| {
+                Arc::strong_count(vmo) <= 1 && inode_weak.strong_count() <= 1
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| registry.remove(&key))
+            .collect()
+    };
+    finish_eviction(evicted);
+}
+
 /// A fresh ramfs holding one file of `content`.
 fn probe_file(content: &[u8]) -> ProbeFile {
     let fs = RamFS::new();
@@ -112,6 +135,7 @@ fn settle_registry() -> (Arc<dyn INode>, Arc<VmObject>) {
 #[test]
 fn an_unmapped_entry_is_counted_by_its_resident_pages() {
     let _g = REGISTRY_TEST_LOCK.lock();
+    drain_idle();
     let _settled = settle_registry();
     let before = count();
     // Four pages long, one page resident.
@@ -130,6 +154,7 @@ fn an_unmapped_entry_is_counted_by_its_resident_pages() {
 #[test]
 fn an_entry_that_is_still_mapped_is_left_alone() {
     let _g = REGISTRY_TEST_LOCK.lock();
+    drain_idle();
     let _settled = settle_registry();
     let before = count();
     let (_root, _node, wrapper, _) = probe_file(&[1u8; PAGE_SIZE]);
@@ -141,7 +166,10 @@ fn an_entry_that_is_still_mapped_is_left_alone() {
     mapped.read(0, &mut buf).unwrap();
 
     assert_eq!(count(), before, "a mapped entry was counted as reclaimable");
-    assert_eq!(scan(8 * PAGE_SIZE), 0, "a mapped entry was evicted");
+    // `scan` may free other idle private caches — those are the page cache,
+    // and they are supposed to be reclaimable. What this entry must not do
+    // is be among them: something still maps it.
+    let _ = scan(8 * PAGE_SIZE);
     assert!(
         crate::fs::file::cache_vmo_of(&wrapper).is_some(),
         "the mapped entry was taken out of the registry"
@@ -156,6 +184,7 @@ fn an_entry_that_is_still_mapped_is_left_alone() {
 #[test]
 fn a_shared_entry_with_no_file_behind_it_is_never_evicted() {
     let _g = REGISTRY_TEST_LOCK.lock();
+    drain_idle();
     let _settled = settle_registry();
     let before = count();
     let (root, _node, wrapper, _) = probe_file(&[3u8; PAGE_SIZE]);
@@ -172,11 +201,9 @@ fn a_shared_entry_with_no_file_behind_it_is_never_evicted() {
         before,
         "an unlinked shared entry was counted as reclaimable"
     );
-    assert_eq!(
-        scan(8 * PAGE_SIZE),
-        0,
-        "an unlinked shared entry was evicted"
-    );
+    // Other idle private caches may be freed by this pass. This entry must
+    // not be: its VMO is the only copy of an unlinked file.
+    let _ = scan(8 * PAGE_SIZE);
     assert!(
         crate::fs::file::cache_vmo_of(&wrapper).is_some(),
         "the shared pages of an unlinked file were thrown away"
@@ -188,6 +215,7 @@ fn a_shared_entry_with_no_file_behind_it_is_never_evicted() {
 #[test]
 fn an_unmapped_entry_of_a_live_file_is_evicted_and_its_bytes_reported() {
     let _g = REGISTRY_TEST_LOCK.lock();
+    drain_idle();
     let (_root, _node, wrapper, _) = probe_file(&[9u8; 2 * PAGE_SIZE]);
     cache_one_page(&wrapper, false, None);
     assert!(
@@ -213,6 +241,7 @@ fn an_unmapped_entry_of_a_live_file_is_evicted_and_its_bytes_reported() {
 #[test]
 fn a_dirty_entry_is_written_back_before_its_frames_go() {
     let _g = REGISTRY_TEST_LOCK.lock();
+    drain_idle();
     let (_root, node, wrapper, writes) = probe_file(b"old content, to be overwritten..");
     cache_one_page(&wrapper, true, Some(b"NEW"));
 
@@ -231,6 +260,7 @@ fn a_dirty_entry_is_written_back_before_its_frames_go() {
 #[test]
 fn the_pass_stops_once_the_target_is_met() {
     let _g = REGISTRY_TEST_LOCK.lock();
+    drain_idle();
     let files: Vec<_> = (0..3).map(|_| probe_file(&[5u8; PAGE_SIZE])).collect();
     for (_, _, wrapper, _) in files.iter() {
         cache_one_page(wrapper, false, None);

@@ -196,3 +196,68 @@ fn a_walk_through_proc_or_a_magic_link_is_not_kept() {
     }
     assert!(rounds > 0, "not one round of 64 cached anything");
 }
+
+/// ld.so asks for `/lib/libfoo.so` on every process, and the answer is
+/// ENOENT. The second ask has to be the cache, not another filesystem walk,
+/// until a name is created or removed.
+#[test]
+fn a_path_that_names_nothing_is_remembered_until_a_name_changes() {
+    let root = an_inode();
+    let other = an_inode();
+    let path = "/dcache-test/absent/libfoo.so";
+    let mut rounds = 0;
+    for _ in 0..64 {
+        let seen = epoch();
+        note_absent(seen, &root, path, &Walked::default());
+        if !is_absent(&root, path) {
+            continue;
+        }
+        assert!(
+            !is_absent(&other, path),
+            "a miss under one root was a miss under another"
+        );
+        assert!(
+            get(&root, path, &mut Walked::default()).is_none(),
+            "a miss was handed back as an inode"
+        );
+        invalidate();
+        // A test alongside may record the same path again after this
+        // invalidation; that round says nothing, the next one does.
+        if is_absent(&root, path) {
+            continue;
+        }
+        rounds += 1;
+    }
+    assert!(rounds > 0, "not one round of 64 remembered a miss");
+}
+
+/// The walk and the publish are not one step. A file created in between has
+/// bumped the epoch, and the miss the walk already decided must not be stored.
+#[test]
+fn a_miss_from_before_a_namespace_change_is_not_stored() {
+    let root = an_inode();
+    let path = "/dcache-test/absent/created-while-we-walked";
+    let mut rounds = 0;
+    for _ in 0..64 {
+        let seen = epoch();
+        invalidate();
+        note_absent(seen, &root, path, &Walked::default());
+        if is_absent(&root, path) {
+            continue;
+        }
+        rounds += 1;
+    }
+    assert!(rounds > 0, "a stale miss was stored");
+}
+
+/// A magic link's answer is a different file for each process. A miss through
+/// one is too: it is not the filesystem's answer.
+#[test]
+fn a_miss_through_a_magic_link_is_not_kept() {
+    let root = an_inode();
+    let path = "/dcache-test/absent/through-proc-self-fd";
+    let mut through = Walked::default();
+    through.jumped = true;
+    note_absent(epoch(), &root, path, &through);
+    assert!(!is_absent(&root, path), "a magic-link miss was cached");
+}

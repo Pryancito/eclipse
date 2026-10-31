@@ -387,8 +387,12 @@ lazy_static::lazy_static! {
     /// COW off this VMO) would see zeros and foot would SIGSEGV on the empty
     /// keymap. There is no MAP_SHARED->inode writeback path (msync is a no-op),
     /// so the shared VMO *is* the file's storage for as long as an fd keeps the
-    /// inode alive. Dead-inode entries are pruned on every access, freeing the
-    /// VMO (and its frames) once the last fd closes.
+    /// inode alive. An idle `MAP_SHARED` entry whose last fd has closed is
+    /// pruned on the next access. A private file cache — a library, an
+    /// executable — is not: the next process that maps the same file reuses
+    /// the pages already read, and the reclaim worker drops them only when
+    /// memory is short. Dropping them here made every program start re-read
+    /// every shared object from disk.
     ///
     /// LOCKING RULE: this is a ticket spinlock, held with interrupts off and
     /// not re-entrant. Under it, do refcount reads, pointer compares and map
@@ -819,12 +823,25 @@ pub fn cache_truncate(inode: &Arc<dyn INode>, new_len: usize) {
 /// registry lock must never cover.
 type EvictedVmos = alloc::vec::Vec<(Arc<VmObject>, alloc::sync::Weak<dyn INode>, bool)>;
 
-/// Take every entry whose backing inode has been freed (all fds closed) OUT of
-/// the registry, without touching it further.
+/// Take unreachable `MAP_SHARED` entries OUT of the registry, without
+/// touching them further.
 ///
-/// Called under the registry lock, which is a ticket spinlock held with
-/// interrupts off. That is why this does nothing but compare refcounts and
-/// move entries out: the version that pruned in place called
+/// A private file cache that nothing maps any more stays. It is the page
+/// cache: the next `exec` of a program that uses the same libraries faults
+/// those pages out of RAM instead of reading them off the disk again. The
+/// reclaim worker ([`page_cache_reclaim`]) is what gives the frames back,
+/// and only when memory is short. Pruning them on this path — which runs on
+/// every `mmap` — is what made opening a program take seconds.
+///
+/// An idle `MAP_SHARED` entry is different. Once nothing maps it and no fd
+/// remains, a memfd or an unlinked shm pool can never be opened again, and a
+/// still-linked one has to be written back before its frames go. Both are
+/// this function's. `ever_shared` is the distinction, and it is a flag in
+/// the entry, so the decision stays a refcount compare: this lock is a
+/// ticket spinlock held with interrupts off.
+///
+/// Called under the registry lock. That is why this does nothing but compare
+/// refcounts and move entries out: the version that pruned in place called
 /// `writeback_shared_vmo` -- `inode.write_at`, a whole filesystem write, plus
 /// the page faults `vmo.read` triggers back into `inode.read_at` -- from
 /// inside the critical section, and dropped the evicted VMOs (and all their
@@ -839,11 +856,12 @@ type EvictedVmos = alloc::vec::Vec<(Arc<VmObject>, alloc::sync::Weak<dyn INode>,
 fn take_prunable(registry: &mut SharedVmoMap) -> EvictedVmos {
     let dead: alloc::vec::Vec<(usize, usize)> = registry
         .iter()
-        .filter(|(_, (vmo, inode_weak, _))| {
+        .filter(|(_, (vmo, inode_weak, ever_shared))| {
             // The cycle contributes exactly ONE strong reference to each, so
             // an entry is live while something still maps the VMO or some fd
             // is still open. Both halves matter -- see `inode_cache_vmo`.
-            Arc::strong_count(vmo) <= 1 && inode_weak.strong_count() <= 1
+            // Private caches fail the `ever_shared` test and stay.
+            *ever_shared && Arc::strong_count(vmo) <= 1 && inode_weak.strong_count() <= 1
         })
         .map(|(key, _)| *key)
         .collect();
@@ -3332,6 +3350,39 @@ mod shared_vmo_registry_tests {
             "a mapped cache was pruned out from under its mapper"
         );
         drop(live_vmo);
+    }
+
+    /// A library mapped `MAP_PRIVATE`, then unmapped when the process exits,
+    /// has to still be here for the next process. `take_prunable` runs on the
+    /// next `mmap`; dropping the cache there is a full re-read of every
+    /// shared object on every program start.
+    #[test]
+    fn an_idle_private_file_cache_is_kept() {
+        let _g = REGISTRY_TEST_LOCK.lock();
+        let (_node, wrapper, _) = probe_file(b"library bytes");
+        let size = wrapper.metadata().unwrap().size;
+        let key = cache_key(&wrapper);
+        let vmo = inode_cache_vmo(&wrapper, "libc.so", size, 0, PAGE_SIZE, false)
+            .expect("the cache vmo should have been created");
+        // Nothing maps it, and no fd holds the inode: the state a process
+        // leaves its libraries in when it exits.
+        drop(vmo);
+        drop(wrapper);
+
+        let evicted = {
+            let mut registry = SHARED_FILE_VMOS.lock();
+            let evicted = take_prunable(&mut registry);
+            assert!(
+                registry.contains_key(&key),
+                "an idle private file cache was dropped; the next exec re-reads it from disk"
+            );
+            evicted
+        };
+        finish_eviction(evicted);
+        assert!(
+            SHARED_FILE_VMOS.lock().contains_key(&key),
+            "dropping the shared entries that WERE pruned took the library cache with them"
+        );
     }
 }
 

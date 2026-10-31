@@ -416,6 +416,7 @@ impl App {
             active,
             location: &location,
             location_focused: self.loc_focused,
+            location_cursor: self.loc_cursor,
             can_back,
             can_forward,
             scale: self.scale,
@@ -659,6 +660,11 @@ impl App {
             return;
         }
         if self.loc_focused {
+            if !is_modifier(evdev) {
+                self.held = Some(evdev);
+                self.held_at = Some(Instant::now());
+                self.repeated_at = None;
+            }
             self.edit_location(evdev);
             self.need_paint = true;
             return;
@@ -675,7 +681,7 @@ impl App {
         let Some(evdev) = self.held else {
             return;
         };
-        if self.loc_focused || self.repeat_rate <= 0 {
+        if self.repeat_rate <= 0 {
             return;
         }
         let Some(start) = self.held_at else {
@@ -690,17 +696,24 @@ impl App {
             return;
         }
         self.repeated_at = Some(now);
-        self.send_key(evdev, true, true);
+        if self.loc_focused {
+            self.edit_location(evdev);
+            self.need_paint = true;
+        } else {
+            self.send_key(evdev, true, true);
+        }
     }
 
     fn handle_shortcut(&mut self, evdev: u32) -> bool {
         if self.alt && evdev == 105 {
+            self.leave_location();
             if let Some(session) = &self.session {
                 session.shell.go_back();
             }
             return true;
         }
         if self.alt && evdev == 106 {
+            self.leave_location();
             if let Some(session) = &self.session {
                 session.shell.go_forward();
             }
@@ -719,12 +732,14 @@ impl App {
             return true;
         }
         if self.ctrl && evdev == 20 {
+            self.leave_location();
             if let Some(session) = &self.session {
                 session.shell.new_tab(home::home_url());
             }
             return true;
         }
         if self.ctrl && evdev == 17 {
+            self.leave_location();
             let keep = self
                 .session
                 .as_ref()
@@ -746,6 +761,17 @@ impl App {
             return true;
         }
         false
+    }
+
+    fn leave_location(&mut self) {
+        if !self.loc_focused {
+            return;
+        }
+        self.loc_focused = false;
+        if let Some(session) = &self.session {
+            session.shell.set_page_focused(true);
+        }
+        self.need_paint = true;
     }
 
     fn open_file(&mut self) {
@@ -775,7 +801,7 @@ impl App {
                     session.shell.set_page_focused(true);
                 }
             }
-            28 => {
+            28 | 96 => {
                 if let Ok(url) = parse_location(&self.loc_text) {
                     if let Some(session) = &self.session {
                         session.shell.load(url);
@@ -797,6 +823,17 @@ impl App {
                         .map(|(_, ch)| *ch)
                         .collect();
                     self.loc_cursor = at;
+                }
+            }
+            111 => {
+                let chars: Vec<char> = self.loc_text.chars().collect();
+                if self.loc_cursor < chars.len() {
+                    self.loc_text = chars
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != self.loc_cursor)
+                        .map(|(_, ch)| *ch)
+                        .collect();
                 }
             }
             105 => self.loc_cursor = self.loc_cursor.saturating_sub(1),
@@ -847,6 +884,10 @@ impl App {
             if !text.is_empty() && !text.chars().all(char::is_control) {
                 return Some(text);
             }
+            return None;
+        }
+        if self.ctrl || self.alt {
+            return None;
         }
         qwerty(evdev, self.shift)
     }
@@ -1057,13 +1098,29 @@ fn evdev_code(evdev: u32) -> Code {
         1 => Code::Escape,
         14 => Code::Backspace,
         15 => Code::Tab,
-        28 => Code::Enter,
+        28 | 96 => Code::Enter,
         57 => Code::Space,
+        102 => Code::Home,
+        104 => Code::PageUp,
+        107 => Code::End,
+        109 => Code::PageDown,
+        111 => Code::Delete,
         103 => Code::ArrowUp,
         105 => Code::ArrowLeft,
         106 => Code::ArrowRight,
         108 => Code::ArrowDown,
+        59 => Code::F1,
+        60 => Code::F2,
+        61 => Code::F3,
+        62 => Code::F4,
         63 => Code::F5,
+        64 => Code::F6,
+        65 => Code::F7,
+        66 => Code::F8,
+        67 => Code::F9,
+        68 => Code::F10,
+        87 => Code::F11,
+        88 => Code::F12,
         16 => Code::KeyQ,
         17 => Code::KeyW,
         18 => Code::KeyE,
@@ -1138,6 +1195,10 @@ fn keymap_from_fd(fd: File, size: u32) -> Option<Xkb> {
     let mut file = fd;
     let mut buf = vec![0u8; size as usize];
     file.read_exact(&mut buf).ok()?;
+    // wlroots includes the terminating NUL in `size`. CString rejects it.
+    if buf.last() == Some(&0) {
+        buf.pop();
+    }
     let text = String::from_utf8(buf).ok()?;
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
     let keymap = Keymap::new_from_string(
@@ -1533,7 +1594,7 @@ pub fn run(url: url::Url) -> Result<(), String> {
                 revents: 0,
             },
         ];
-        let repeating = app.held.is_some() && app.repeat_rate > 0 && !app.loc_focused;
+        let repeating = app.held.is_some() && app.repeat_rate > 0;
         let timeout = if animating || repeating { 16 } else { -1 };
         unsafe {
             libc::poll(fds.as_mut_ptr(), 2, timeout);

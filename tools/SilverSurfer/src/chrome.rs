@@ -87,7 +87,9 @@ pub fn layout(width: i32, tabs: usize) -> Layout {
             w: each,
             h: tab_h,
         };
-        let close_w = 16.min(rect.w);
+        // Narrower than the tab, or a click would close it instead of
+        // selecting it. Below 20px there is no room for a separate box.
+        let close_w = if rect.w >= 20 { 12 } else { 0 };
         closes.push(RectI {
             x: rect.x + rect.w - close_w,
             y: rect.y,
@@ -173,6 +175,8 @@ pub struct View<'a> {
     pub active: usize,
     pub location: &'a str,
     pub location_focused: bool,
+    /// Caret, in characters, used only while the bar is focused.
+    pub location_cursor: usize,
     pub can_back: bool,
     pub can_forward: bool,
     /// Output scale. The buffer is `width * scale` by `HEIGHT * scale`.
@@ -256,7 +260,9 @@ fn render_logical(view: &View<'_>) -> Vec<u8> {
         let title = titles.get(i).map(String::as_str).unwrap_or("Nueva pestaña");
         let room = ((rect.w - 20) / 6).max(1) as usize;
         label(&mut target, rect.x + 6, rect.y + 14, &clip(title, room), text);
-        label(&mut target, rect.x + rect.w - 12, rect.y + 14, "x", dim);
+        if rect.w >= 20 {
+            label(&mut target, rect.x + rect.w - 12, rect.y + 14, "x", dim);
+        }
     }
     label(&mut target, lay.new_tab.x + 8, lay.new_tab.y + 14, "+", text);
     label(
@@ -285,14 +291,36 @@ fn render_logical(view: &View<'_>) -> Vec<u8> {
         text
     };
     let room = (lay.location.w / 6).max(1) as usize;
+    let shown = if view.location_focused {
+        location_line(loc, room, view.location_cursor)
+    } else {
+        clip(loc, room)
+    };
     label(
         &mut target,
         lay.location.x + 8,
         lay.location.y + 16,
-        &clip(loc, room),
+        &shown,
         loc_color,
     );
     argb
+}
+
+/// The slice of the bar that ends at the caret, plus a `|`.
+fn location_line(text: &str, room: usize, cursor: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let room = room.max(1);
+    if room == 1 {
+        return "|".into();
+    }
+    let body = room - 1;
+    let start = cursor.saturating_sub(body);
+    let end = (start + body).min(chars.len());
+    let mut out: String = chars[start..cursor].iter().collect();
+    out.push('|');
+    out.extend(chars[cursor..end].iter().copied());
+    out
 }
 
 fn clip(text: &str, chars: usize) -> String {
@@ -515,6 +543,7 @@ mod tests {
             active: 0,
             location: "https://example.com",
             location_focused: true,
+            location_cursor: 0,
             can_back: false,
             can_forward: true,
             scale: 2,
@@ -603,6 +632,7 @@ mod tests {
                 active: 0,
                 location: "",
                 location_focused: false,
+                location_cursor: 0,
                 can_back: true,
                 can_forward: false,
                 scale: 1,

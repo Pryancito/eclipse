@@ -2878,15 +2878,31 @@ impl LinuxProcess {
             // do hundreds of absolute open/stat calls over the same library
             // and data paths per process start; each was a full per-component
             // VFS walk (two String allocations + a directory scan per
-            // component on SFS) before this.
+            // component on SFS) before this. A miss is cached too: ld.so
+            // probes `/lib/<soname>` (ENOENT) before `/usr/lib/<soname>` for
+            // every library of every process, and that probe was a disk walk
+            // each time.
             if follow {
                 if let Some(inode) = dcache::get(&root, path, walked) {
                     return Ok(inode);
                 }
+                if dcache::is_absent(&root, path) {
+                    return Err(LxError::ENOENT);
+                }
             }
-            let inode = root.lookup_walked(path, follow_max_depth, Some(walked))?;
+            // The epoch from before the walk. A name created or removed
+            // while it ran must not be published as the answer.
+            let seen = dcache::epoch();
+            let inode = match root.lookup_walked(path, follow_max_depth, Some(walked)) {
+                Ok(inode) => inode,
+                Err(rcore_fs::vfs::FsError::EntryNotFound) if follow => {
+                    dcache::note_absent(seen, &root, path, walked);
+                    return Err(LxError::ENOENT);
+                }
+                Err(e) => return Err(e.into()),
+            };
             if follow {
-                dcache::put(&root, path, &inode, walked);
+                dcache::remember(seen, &root, path, &inode, walked);
             }
             return Ok(inode);
         }

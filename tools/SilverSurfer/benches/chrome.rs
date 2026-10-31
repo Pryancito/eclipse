@@ -43,6 +43,7 @@ fn paint(width: i32, scale: i32, titles: &[String]) -> chrome::Pixels {
         active: 0,
         location: "https://example.com/documentacion",
         location_focused: false,
+        location_cursor: 0,
         can_back: true,
         can_forward: false,
         scale,

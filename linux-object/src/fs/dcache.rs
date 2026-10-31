@@ -1,5 +1,12 @@
 //! Maps a fully-resolved absolute path (symlinks followed) to its final inode
-//! and what that inode is named.
+//! and what that inode is named — or to the fact that the path names nothing.
+//!
+//! The dynamic linker probes `/lib/<soname>` before `/usr/lib/<soname>` for
+//! every library of every process. The first probe is `ENOENT`, and without
+//! a negative entry it walked the filesystem again on the next program.
+//! Measured on hardware, that probe was a large part of a multi-second
+//! start. A create, unlink or rename bumps the epoch, so a name that appears
+//! afterwards is not stuck as missing.
 //!
 //! Only paths that reach the real-FS branch of `lookup_inode_at_walk` are
 //! ever cached — `/proc`, `/sys` and `/dev` are intercepted earlier by
@@ -54,10 +61,19 @@ struct Entry {
     gates: Vec<Arc<dyn INode>>,
 }
 
+/// A path that was walked, and what the walk found.
+enum Slot {
+    /// The inode the path leads to.
+    Found(Entry),
+    /// The path names nothing. Same root rule as [`Entry`]: a miss under one
+    /// root is not a miss under another.
+    Absent { root: Arc<dyn INode> },
+}
+
 struct Inner {
     /// Epoch the map contents belong to; a mismatch clears the map.
     epoch: u64,
-    map: HashMap<String, Entry>,
+    map: HashMap<String, Slot>,
 }
 
 lazy_static::lazy_static! {
@@ -96,7 +112,10 @@ pub fn get(root: &Arc<dyn INode>, path: &str, walked: &mut Walked) -> Option<Arc
         c.epoch = now;
         return None;
     }
-    let entry = c.map.get(path)?;
+    let Slot::Found(entry) = c.map.get(path)? else {
+        // A remembered miss is not an inode. `is_absent` is what answers it.
+        return None;
+    };
     // Another root's answer to the same path is not this root's.
     if !Arc::ptr_eq(&entry.root, root) {
         return None;
@@ -117,33 +136,106 @@ pub fn get(root: &Arc<dyn INode>, path: &str, walked: &mut Walked) -> Option<Arc
     Some(inode)
 }
 
+/// Whether `path` from `root` is a remembered miss.
+///
+/// A miss recorded for another root is not this root's, and a namespace
+/// change since the entry was stored is not a miss either: the map is
+/// dropped and the caller walks.
+pub fn is_absent(root: &Arc<dyn INode>, path: &str) -> bool {
+    let mut c = CACHE.lock();
+    let now = EPOCH.load(Ordering::Acquire);
+    if c.epoch != now {
+        c.map.clear();
+        c.epoch = now;
+        return false;
+    }
+    match c.map.get(path) {
+        Some(Slot::Absent { root: cached }) => Arc::ptr_eq(cached, root),
+        _ => false,
+    }
+}
+
 /// Keeps what `path` leads to from `root`, and `walked`, where the walk to
 /// it ended, unless it is another file to each process.
 pub fn put(root: &Arc<dyn INode>, path: &str, inode: &Arc<dyn INode>, walked: &Walked) {
-    if walked.jumped || walked.names.first().is_some_and(|top| top == "proc") {
+    store_found(None, root, path, inode, walked);
+}
+
+/// [`put`], but only if `seen` is still the epoch.
+///
+/// `seen` is the epoch from before the walk. A name created or removed while
+/// the walk ran has bumped it, and publishing the walk's answer would record
+/// a file that is no longer there — or, for a miss, a file that now is.
+pub fn remember(
+    seen: u64,
+    root: &Arc<dyn INode>,
+    path: &str,
+    inode: &Arc<dyn INode>,
+    walked: &Walked,
+) {
+    store_found(Some(seen), root, path, inode, walked);
+}
+
+/// Remember that `path` from `root` names nothing, on the same terms as
+/// [`remember`]: not across a namespace change, and not for a walk whose
+/// answer belongs to one process.
+pub fn note_absent(seen: u64, root: &Arc<dyn INode>, path: &str, walked: &Walked) {
+    if path.is_empty() || walked.jumped || walked.names.first().is_some_and(|top| top == "proc") {
         return;
     }
+    let Some(mut c) = admit(Some(seen)) else {
+        return;
+    };
+    c.map
+        .insert(String::from(path), Slot::Absent { root: root.clone() });
+}
+
+/// The lock, ready for an insert, or nothing when `seen` is already stale.
+///
+/// `None` for `seen` is the test `put`: it publishes into whatever epoch is
+/// current. `Some` publishes only into that epoch, so a mutation during the
+/// walk is not recorded as the truth after it.
+fn admit(seen: Option<u64>) -> Option<lock::MutexGuard<'static, Inner>> {
     let mut c = CACHE.lock();
     let now = EPOCH.load(Ordering::Acquire);
     if c.epoch != now {
         c.map.clear();
         c.epoch = now;
     }
+    if seen.is_some_and(|seen| seen != now) {
+        return None;
+    }
     if c.map.len() >= MAX_ENTRIES {
         // Full: drop everything rather than tracking recency — refill is
         // one miss per path and the storm patterns are bursty anyway.
         c.map.clear();
     }
+    Some(c)
+}
+
+fn store_found(
+    seen: Option<u64>,
+    root: &Arc<dyn INode>,
+    path: &str,
+    inode: &Arc<dyn INode>,
+    walked: &Walked,
+) {
+    if walked.jumped || walked.names.first().is_some_and(|top| top == "proc") {
+        return;
+    }
+    let Some(mut c) = admit(seen) else {
+        return;
+    };
     let name = walked.path();
     let name = (name != path).then_some(name);
     c.map.insert(
         String::from(path),
-        Entry {
+        Slot::Found(Entry {
             inode: inode.clone(),
             root: root.clone(),
             name,
             gates: walked.gates.clone(),
-        },
+        }),
     );
 }
 

@@ -153,12 +153,13 @@ impl Delegate {
     }
 
     pub fn load(&self, url: url::Url) {
+        let index = self.active_index();
         let Some(view) = self.active_view() else {
             return;
         };
         let text = url.to_string();
         view.load(url);
-        if let Some(tab) = self.model.borrow_mut().tabs.get_mut(self.active_index()) {
+        if let Some(tab) = self.model.borrow_mut().tabs.get_mut(index) {
             tab.url = text;
         }
         self.flags.chrome.store(true, Ordering::Relaxed);
