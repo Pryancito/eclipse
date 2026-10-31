@@ -7,7 +7,7 @@ use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::Text;
-use tiny_skia::{Color, Paint, Pixmap, Rect, Transform};
+use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
 use crate::location::SchemeHint;
 use crate::look::{Look, Rgb};
@@ -206,22 +206,8 @@ pub struct Pixels {
 
 pub fn render(view: &View<'_>) -> Pixels {
     let scale = view.scale.max(1);
-    let logical = render_logical(view);
-    let argb = if scale == 1 {
-        logical
-    } else {
-        nearest(&logical, view.width.max(1), HEIGHT, scale)
-    };
-    Pixels {
-        argb,
-        width: view.width.max(1) * scale,
-        height: HEIGHT * scale,
-    }
-}
-
-fn render_logical(view: &View<'_>) -> Vec<u8> {
-    let width = view.width.max(1) as u32;
-    let height = HEIGHT as u32;
+    let width = (view.width.max(1) * scale) as u32;
+    let height = (HEIGHT * scale) as u32;
     let mut pixmap = Pixmap::new(width, height).expect("chrome pixmap");
     let pal = view.look.palette();
     pixmap.fill(color(pal.panel));
@@ -231,47 +217,56 @@ fn render_logical(view: &View<'_>) -> Vec<u8> {
     } else {
         view.titles
     };
+    let s = |r: RectI| scale_rect(r, scale);
     for (i, rect) in lay.tabs.iter().enumerate() {
         let on = i == view.active;
         fill(
             &mut pixmap,
-            *rect,
+            s(*rect),
             if on { pal.field } else { pal.panel },
         );
         if on {
             fill(
                 &mut pixmap,
-                RectI {
+                s(RectI {
                     x: rect.x,
                     y: rect.y + rect.h - 2,
                     w: rect.w,
                     h: 2,
-                },
+                }),
                 pal.accent,
             );
         }
+        icon_close(&mut pixmap, *rect, scale, pal.dim);
     }
-    fill(&mut pixmap, lay.new_tab, pal.field);
-    fill(&mut pixmap, lay.back, pal.field);
-    fill(&mut pixmap, lay.forward, pal.field);
-    fill(&mut pixmap, lay.reload, pal.field);
-    fill(&mut pixmap, lay.scheme, pal.field);
-    fill(&mut pixmap, lay.location, pal.field);
+    fill(&mut pixmap, s(lay.new_tab), pal.field);
+    fill(&mut pixmap, s(lay.back), pal.field);
+    fill(&mut pixmap, s(lay.forward), pal.field);
+    fill(&mut pixmap, s(lay.reload), pal.field);
+    fill(&mut pixmap, s(lay.scheme), pal.field);
+    fill(&mut pixmap, s(lay.location), pal.field);
     if view.location_focused {
-        stroke(&mut pixmap, lay.location, pal.accent);
+        stroke_scaled(&mut pixmap, lay.location, pal.accent, scale);
     }
     if view.scheme == SchemeHint::Https {
         fill(
             &mut pixmap,
-            RectI {
+            s(RectI {
                 x: lay.scheme.x,
                 y: lay.scheme.y + lay.scheme.h - 2,
                 w: lay.scheme.w,
                 h: 2,
-            },
+            }),
             pal.accent,
         );
     }
+
+    let back_color = if view.can_back { pal.text } else { pal.dim };
+    let forward_color = if view.can_forward { pal.text } else { pal.dim };
+    icon_chevron(&mut pixmap, lay.back, scale, back_color, true);
+    icon_chevron(&mut pixmap, lay.forward, scale, forward_color, false);
+    icon_reload(&mut pixmap, lay.reload, scale, pal.text);
+    icon_plus(&mut pixmap, lay.new_tab, scale, pal.text);
 
     let mut argb = Vec::with_capacity(pixmap.data().len());
     rgba_premul_to_argb(pixmap.data(), &mut argb);
@@ -292,38 +287,27 @@ fn render_logical(view: &View<'_>) -> Vec<u8> {
             raw.to_string()
         };
         let room = ((rect.w - 20) / 6).max(1) as usize;
-        label(&mut target, rect.x + 6, rect.y + 14, &clip(&title, room), text);
-        if rect.w >= 20 {
-            label(&mut target, rect.x + rect.w - 12, rect.y + 14, "x", dim);
-        }
+        label_scaled(
+            &mut target,
+            rect.x + 6,
+            rect.y + 14,
+            &clip(&title, room),
+            text,
+            scale,
+        );
     }
-    label(&mut target, lay.new_tab.x + 8, lay.new_tab.y + 14, "+", text);
-    label(
-        &mut target,
-        lay.back.x + 8,
-        lay.back.y + 16,
-        "<",
-        if view.can_back { text } else { dim },
-    );
-    label(
-        &mut target,
-        lay.forward.x + 8,
-        lay.forward.y + 16,
-        ">",
-        if view.can_forward { text } else { dim },
-    );
-    label(&mut target, lay.reload.x + 8, lay.reload.y + 16, "R", text);
     let scheme_color = if view.scheme == SchemeHint::Https {
         pal.accent
     } else {
         dim
     };
-    label(
+    label_scaled(
         &mut target,
         lay.scheme.x + 5,
         lay.scheme.y + 16,
         view.scheme.badge(),
         scheme_color,
+        scale,
     );
     let loc = if view.location.is_empty() {
         "Buscar o escribir una dirección"
@@ -341,14 +325,19 @@ fn render_logical(view: &View<'_>) -> Vec<u8> {
     } else {
         clip(loc, room)
     };
-    label(
+    label_scaled(
         &mut target,
         lay.location.x + 8,
         lay.location.y + 16,
         &shown,
         loc_color,
+        scale,
     );
-    argb
+    Pixels {
+        argb,
+        width: width as i32,
+        height: height as i32,
+    }
 }
 
 /// The slice of the bar that ends at the caret, plus a `|`.
@@ -384,6 +373,15 @@ fn color(c: Rgb) -> Color {
     Color::from_rgba8(c.r, c.g, c.b, 255)
 }
 
+fn scale_rect(rect: RectI, scale: i32) -> RectI {
+    RectI {
+        x: rect.x * scale,
+        y: rect.y * scale,
+        w: rect.w * scale,
+        h: rect.h * scale,
+    }
+}
+
 fn fill(pixmap: &mut Pixmap, rect: RectI, rgb: Rgb) {
     let Some(r) = Rect::from_xywh(rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32)
     else {
@@ -394,52 +392,195 @@ fn fill(pixmap: &mut Pixmap, rect: RectI, rgb: Rgb) {
     pixmap.fill_rect(r, &paint, Transform::identity(), None);
 }
 
-fn stroke(pixmap: &mut Pixmap, rect: RectI, rgb: Rgb) {
+fn stroke_scaled(pixmap: &mut Pixmap, rect: RectI, rgb: Rgb, scale: i32) {
+    let t = scale.max(1);
+    let r = scale_rect(rect, t);
     fill(
         pixmap,
         RectI {
-            x: rect.x,
-            y: rect.y,
-            w: rect.w,
-            h: 1,
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: t,
         },
         rgb,
     );
     fill(
         pixmap,
         RectI {
-            x: rect.x,
-            y: rect.y + rect.h - 1,
-            w: rect.w,
-            h: 1,
+            x: r.x,
+            y: r.y + r.h - t,
+            w: r.w,
+            h: t,
         },
         rgb,
     );
     fill(
         pixmap,
         RectI {
-            x: rect.x,
-            y: rect.y,
-            w: 1,
-            h: rect.h,
+            x: r.x,
+            y: r.y,
+            w: t,
+            h: r.h,
         },
         rgb,
     );
     fill(
         pixmap,
         RectI {
-            x: rect.x + rect.w - 1,
-            y: rect.y,
-            w: 1,
-            h: rect.h,
+            x: r.x + r.w - t,
+            y: r.y,
+            w: t,
+            h: r.h,
         },
         rgb,
     );
 }
 
-fn label(target: &mut ArgbTarget<'_>, x: i32, y: i32, text: &str, rgb: Rgb) {
+fn stroke_path(pixmap: &mut Pixmap, path: tiny_skia::Path, rgb: Rgb, width: f32) {
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(rgb.r, rgb.g, rgb.b, 255);
+    paint.anti_alias = true;
+    let stroke = Stroke {
+        width,
+        ..Stroke::default()
+    };
+    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+}
+
+fn icon_chevron(pixmap: &mut Pixmap, btn: RectI, scale: i32, rgb: Rgb, left: bool) {
+    let s = scale.max(1) as f32;
+    let cx = (btn.x + btn.w / 2) as f32 * s;
+    let cy = (btn.y + btn.h / 2) as f32 * s;
+    let dx = 4.0 * s * if left { -1.0 } else { 1.0 };
+    let dy = 5.0 * s;
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx - dx, cy - dy);
+    pb.line_to(cx + dx, cy);
+    pb.line_to(cx - dx, cy + dy);
+    if let Some(path) = pb.finish() {
+        stroke_path(pixmap, path, rgb, 1.6 * s);
+    }
+}
+
+fn icon_reload(pixmap: &mut Pixmap, btn: RectI, scale: i32, rgb: Rgb) {
+    let s = scale.max(1) as f32;
+    let cx = (btn.x + btn.w / 2) as f32 * s;
+    let cy = (btn.y + btn.h / 2) as f32 * s;
+    let r = 6.0 * s;
+    let mut pb = PathBuilder::new();
+    // Open arc: from ~40° to ~320°.
+    let steps = 18;
+    for i in 0..=steps {
+        let t = 0.35 + (std::f32::consts::TAU - 0.9) * (i as f32 / steps as f32);
+        let x = cx + r * t.cos();
+        let y = cy + r * t.sin();
+        if i == 0 {
+            pb.move_to(x, y);
+        } else {
+            pb.line_to(x, y);
+        }
+    }
+    if let Some(path) = pb.finish() {
+        stroke_path(pixmap, path, rgb, 1.5 * s);
+    }
+    let mut arrow = PathBuilder::new();
+    let tip_x = cx + r * 0.35f32.cos();
+    let tip_y = cy + r * 0.35f32.sin();
+    arrow.move_to(tip_x - 3.0 * s, tip_y - 1.0 * s);
+    arrow.line_to(tip_x, tip_y);
+    arrow.line_to(tip_x - 1.0 * s, tip_y + 3.5 * s);
+    if let Some(path) = arrow.finish() {
+        stroke_path(pixmap, path, rgb, 1.4 * s);
+    }
+}
+
+fn icon_plus(pixmap: &mut Pixmap, btn: RectI, scale: i32, rgb: Rgb) {
+    let s = scale.max(1);
+    let cx = btn.x + btn.w / 2;
+    let cy = btn.y + btn.h / 2;
+    let arm = 5;
+    fill(
+        pixmap,
+        scale_rect(
+            RectI {
+                x: cx - arm,
+                y: cy - 1,
+                w: arm * 2,
+                h: 2,
+            },
+            s,
+        ),
+        rgb,
+    );
+    fill(
+        pixmap,
+        scale_rect(
+            RectI {
+                x: cx - 1,
+                y: cy - arm,
+                w: 2,
+                h: arm * 2,
+            },
+            s,
+        ),
+        rgb,
+    );
+}
+
+fn icon_close(pixmap: &mut Pixmap, tab: RectI, scale: i32, rgb: Rgb) {
+    let s = scale.max(1) as f32;
+    let cx = (tab.x + tab.w - 8) as f32 * s;
+    let cy = (tab.y + tab.h / 2) as f32 * s;
+    let d = 3.5 * s;
+    let mut a = PathBuilder::new();
+    a.move_to(cx - d, cy - d);
+    a.line_to(cx + d, cy + d);
+    let mut b = PathBuilder::new();
+    b.move_to(cx + d, cy - d);
+    b.line_to(cx - d, cy + d);
+    if let Some(path) = a.finish() {
+        stroke_path(pixmap, path, rgb, 1.3 * s);
+    }
+    if let Some(path) = b.finish() {
+        stroke_path(pixmap, path, rgb, 1.3 * s);
+    }
+}
+
+fn label_scaled(target: &mut ArgbTarget<'_>, x: i32, y: i32, text: &str, rgb: Rgb, scale: i32) {
+    let scale = scale.max(1);
+    // Draw into a 1× logical buffer then stamp scale×scale blocks so glyphs
+    // stay sharp on HiDPI instead of nearest-neighbour upscaling the strip.
     let style = MonoTextStyle::new(&FONT_6X10, Rgb888::new(rgb.r, rgb.g, rgb.b));
-    let _ = Text::new(text, Point::new(x, y), style).draw(target);
+    let w = (text.chars().count() as i32 * 6 + 2).max(1) as u32;
+    let h = 12u32;
+    let mut tiny = vec![0u8; (w * h * 4) as usize];
+    {
+        let mut scratch = ArgbTarget {
+            data: &mut tiny,
+            width: w,
+            height: h,
+        };
+        let _ = Text::new(text, Point::new(0, 10), style).draw(&mut scratch);
+    }
+    for py in 0..h as i32 {
+        for px in 0..w as i32 {
+            let i = ((py as u32 * w + px as u32) * 4) as usize;
+            if tiny[i + 3] == 0 {
+                continue;
+            }
+            let color = Rgb888::new(tiny[i + 2], tiny[i + 1], tiny[i]);
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    let _ = Pixel(
+                        Point::new((x + px) * scale + dx, (y - 10 + py) * scale + dy),
+                        color,
+                    )
+                    .draw(target);
+                }
+            }
+        }
+    }
 }
 
 /// Content rectangle in device pixels. At least one pixel on each side: Servo
@@ -489,23 +630,6 @@ pub fn rgba_premul_to_argb(src: &[u8], dst: &mut Vec<u8>) {
     for px in src.chunks_exact(4) {
         dst.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
     }
-}
-
-fn nearest(src: &[u8], width: i32, height: i32, scale: i32) -> Vec<u8> {
-    let scale = scale.max(1);
-    let dw = width * scale;
-    let dh = height * scale;
-    let mut out = vec![0u8; (dw * dh * 4) as usize];
-    for y in 0..dh {
-        for x in 0..dw {
-            let sx = x / scale;
-            let sy = y / scale;
-            let si = ((sy * width + sx) * 4) as usize;
-            let di = ((y * dw + x) * 4) as usize;
-            out[di..di + 4].copy_from_slice(&src[si..si + 4]);
-        }
-    }
-    out
 }
 
 struct ArgbTarget<'a> {

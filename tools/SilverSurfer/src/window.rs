@@ -13,7 +13,7 @@ use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use dpi::PhysicalSize;
 use raw_window_handle::{
@@ -156,6 +156,8 @@ pub struct App {
     held_at: Option<Instant>,
     repeated_at: Option<Instant>,
     look: Look,
+    look_mtime: Option<SystemTime>,
+    look_checked: Instant,
     waker: Option<Waker>,
     session: Option<Session>,
     /// First URL passed to `engine::start`.
@@ -221,12 +223,35 @@ impl App {
             held_at: None,
             repeated_at: None,
             look: Look::current(),
+            look_mtime: std::fs::metadata("/etc/eclipse/look")
+                .and_then(|m| m.modified())
+                .ok(),
+            look_checked: Instant::now(),
             waker: None,
             session: None,
             initial_url: Some(initial_url),
             pending_tabs,
             pending_active,
             persist,
+        }
+    }
+
+    fn refresh_look(&mut self) {
+        if self.look_checked.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.look_checked = Instant::now();
+        let mtime = std::fs::metadata("/etc/eclipse/look")
+            .and_then(|m| m.modified())
+            .ok();
+        if mtime == self.look_mtime {
+            return;
+        }
+        self.look_mtime = mtime;
+        let next = Look::current();
+        if next != self.look {
+            self.look = next;
+            self.need_paint = true;
         }
     }
 
@@ -336,6 +361,7 @@ impl App {
     }
 
     fn after_dispatch(&mut self) -> Result<(), String> {
+        self.refresh_look();
         if self.compositor.is_some() && self.parent.is_none() {
             self.create_window()?;
         }

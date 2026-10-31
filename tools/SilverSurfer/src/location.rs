@@ -67,11 +67,18 @@ fn looks_like_location(text: &str) -> bool {
     if text.starts_with('/') || text.starts_with("//") {
         return true;
     }
-    if text.contains("://") || text.starts_with("about:") || text.starts_with("data:") {
-        return true;
-    }
     if text.chars().any(char::is_whitespace) {
         return false;
+    }
+    if let Some((scheme, rest)) = text.split_once(':') {
+        let scheme_ok = !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphabetic());
+        let known = matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "about" | "data" | "mailto"
+        );
+        if scheme_ok && (known || rest.starts_with('/') || rest.starts_with("//")) {
+            return true;
+        }
     }
     let lower = text.to_ascii_lowercase();
     if lower == "localhost"
