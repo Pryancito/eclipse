@@ -569,13 +569,13 @@ impl App {
     }
 
     fn blit_page(&mut self, raw: &[u8], src_w: u32, src_h: u32) -> bool {
+        let dst_y = (self.chrome_h() * self.scale).max(0) as u32;
         let Some(buf) = self.parent_buf.as_mut() else {
             return false;
         };
         if buf.busy {
             return false;
         }
-        let dst_y = (self.chrome_h() * self.scale).max(0) as u32;
         let stride = (buf.width as usize) * 4;
         let len = buf.mem.len;
         let dst = unsafe { std::slice::from_raw_parts_mut(buf.mem.ptr, len) };

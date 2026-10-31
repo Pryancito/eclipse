@@ -18,6 +18,7 @@ engine = [
     "dep:dpi",
     "dep:euclid",
     "dep:raw-window-handle",
+    "dep:pkcs1",
     "dep:rustls",
     "dep:servo",
     "dep:webrender_api",
@@ -53,6 +54,9 @@ euclid = { version = "0.22", optional = true }
 dpi = { version = "0.1", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 webrender_api = { version = "0.70", optional = true }
+# Cargo.lock is not committed. Servo 0.7's rsa 0.10.0-rc.18 does not build
+# against pkcs1 0.8.0-rc.5, which a fresh resolve picks; servo's own lock uses rc.4.
+pkcs1 = { version = "=0.8.0-rc.4", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs", "std"] }
 
 [profile.release]
