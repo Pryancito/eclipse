@@ -19,6 +19,7 @@ use servo::{
     WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use crate::files::{self, PickRequest};
+use crate::session::{SavedTab, Snapshot};
 
 const USER_AGENT: &str = "SilverSurfer/0.1 (Eclipse OS; Wayland) Servo/0.7";
 
@@ -276,6 +277,62 @@ impl Delegate {
         self.sync_animating();
         self.flags.chrome.store(true, Ordering::Relaxed);
         self.flags.frame.store(true, Ordering::Relaxed);
+    }
+
+    pub fn next_tab(&self) {
+        let n = self.model.borrow().tabs.len();
+        if n == 0 {
+            return;
+        }
+        let next = (self.active_index() + 1) % n;
+        self.select_tab(next);
+    }
+
+    pub fn prev_tab(&self) {
+        let n = self.model.borrow().tabs.len();
+        if n == 0 {
+            return;
+        }
+        let active = self.active_index();
+        let prev = if active == 0 { n - 1 } else { active - 1 };
+        self.select_tab(prev);
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.model.borrow().tabs.len()
+    }
+
+    /// Snapshot for session.json (URLs + titles + active index).
+    pub fn snapshot(&self) -> Snapshot {
+        let model = self.model.borrow();
+        Snapshot {
+            active: model.active,
+            tabs: model
+                .tabs
+                .iter()
+                .map(|tab| SavedTab {
+                    url: tab.url.clone(),
+                    title: tab.title.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Open extra tabs after `start` and select `active`.
+    pub fn restore_tabs(&self, tabs: &[(url::Url, String)], active: usize) {
+        for (url, title) in tabs {
+            let text = url.to_string();
+            let view = self.make_view(Some(url.clone()));
+            self.add_tab(view, text);
+            if let Some(tab) = self.model.borrow_mut().tabs.last_mut() {
+                if !title.is_empty() {
+                    tab.title = title.clone();
+                }
+            }
+        }
+        if active > 0 {
+            self.select_tab(active.min(self.tab_count().saturating_sub(1)));
+        }
     }
 
     pub fn set_page_focused(&self, focused: bool) {
