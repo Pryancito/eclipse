@@ -530,6 +530,14 @@ impl KernelHandler for ZcoreKernelHandler {
             used / 1024,
             total / 1024
         );
+        // What the heap grew into and then gave back once it no longer used
+        // it. A heap that grows and never shows this is one whose growth is
+        // still held, or held in pieces too small to give back.
+        let _ = writeln!(
+            s,
+            "KernelHeapGivenBack: {:>6} kB",
+            memory::heap_released_total() / 1024
+        );
         let refused = memory::heap_reentrancy_events();
         if refused > 0 {
             let _ = writeln!(s, "ReentrancyRefusals: {}", refused);

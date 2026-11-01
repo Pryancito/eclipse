@@ -370,6 +370,12 @@ pub fn heap_held_by_current_cpu() -> bool {
     HEAP.0.held_by_current_cpu_via_apic()
 }
 
+/// The x86_64 heap grows out of physical RAM and gives that growth back
+/// here; this one is a fixed pool with nothing grown to return.
+pub fn release_idle_heap(_want: usize) -> usize {
+    0
+}
+
 /// Total bytes managed by the heap (mirrors `memory_x86_64::heap_total`).
 #[allow(dead_code)]
 pub fn heap_total() -> usize {
