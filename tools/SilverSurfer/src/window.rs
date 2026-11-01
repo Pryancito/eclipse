@@ -597,7 +597,9 @@ impl App {
 
     fn blit_page(&mut self, raw: &[u8], src_w: u32, src_h: u32) -> bool {
         let dst_y = (self.chrome_h() * self.scale).max(0) as u32;
-        if !self.free_parent_buffer() {
+        // A resize in the same dispatch would otherwise blit into the
+        // old-sized buffer, which paint_chrome then replaces with a bare panel.
+        if self.ensure_parent_buffer().is_err() || !self.free_parent_buffer() {
             return false;
         }
         let Some(buf) = self.parent_buf.as_mut() else {
