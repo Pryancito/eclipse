@@ -543,6 +543,8 @@ fn register_waiter(
             signaled,
             eventbus,
         });
+        #[cfg(test)]
+        super::syncobj_eventfd::hardware_fence_tests::assert_held("syncobj_file::WAITERS");
         WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
     }
     // Same poller the SYNCOBJ_EVENTFD path uses: without it, a GPU fence that
@@ -587,6 +589,8 @@ pub(crate) mod tests_support {
             signaled: Arc::new(AtomicBool::new(false)),
             eventbus: EventBus::new(),
         });
+        #[cfg(test)]
+        super::syncobj_eventfd::hardware_fence_tests::assert_held("syncobj_file::WAITERS");
         WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
     }
 
@@ -594,6 +598,8 @@ pub(crate) mod tests_support {
     pub(crate) fn pop_waiters_for_test() {
         let mut waiters = WAITERS.lock();
         waiters.retain(|w| (w.handle, w.point) != SENTINEL);
+        #[cfg(test)]
+        super::syncobj_eventfd::hardware_fence_tests::assert_held("syncobj_file::WAITERS");
         WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
     }
 }
@@ -656,6 +662,8 @@ pub(super) fn wake_ready_waiters() {
                 None => i += 1,
             }
         }
+        #[cfg(test)]
+        super::syncobj_eventfd::hardware_fence_tests::assert_held("syncobj_file::WAITERS");
         WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
     }
     for (signaled, bus) in fire {
@@ -677,6 +685,8 @@ impl Drop for SyncobjHandle {
                         && w.handle == self.handle
                         && w.point == point)
                 });
+                #[cfg(test)]
+                super::syncobj_eventfd::hardware_fence_tests::assert_held("syncobj_file::WAITERS");
                 WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
             }
         }
@@ -877,6 +887,10 @@ mod sync_file_poll_tests {
     /// `anon_inode_getfile` was told to.
     #[test]
     fn a_syncobj_fd_and_a_sync_file_are_named_as_linux_names_them() {
+        // Signalling a syncobj runs the process-wide point-advance hook, and
+        // that walk prunes the `sync_file` waiter registry on THIS thread --
+        // which is the contract the serial's own comment states. See it.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         let handle = zcore_drivers::scheme::syncobj::create(false);
         assert!(zcore_drivers::scheme::syncobj::timeline_signal(handle, 1));
         assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
@@ -893,6 +907,10 @@ mod sync_file_poll_tests {
     /// DRI3 fence handshake look failed and Zink killed the GLX swapchain.
     #[test]
     fn a_sync_file_exported_after_signal_is_immediately_pollable() {
+        // Signalling a syncobj runs the process-wide point-advance hook, and
+        // that walk prunes the `sync_file` waiter registry on THIS thread --
+        // which is the contract the serial's own comment states. See it.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         let handle = zcore_drivers::scheme::syncobj::create(false);
         assert!(zcore_drivers::scheme::syncobj::timeline_signal(handle, 3));
         let fd = SyncobjHandle::new_sync_file(handle, 3);
@@ -911,6 +929,10 @@ mod sync_file_poll_tests {
     /// Linux sync_file.
     #[test]
     fn a_sync_file_for_a_future_point_is_not_ready_yet() {
+        // The `sync_file` waiter registry this test puts an entry in is
+        // process-wide, and the test that asks whether anybody is waiting
+        // runs on another thread. See the serial's own comment.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         let handle = zcore_drivers::scheme::syncobj::create(false);
         assert!(zcore_drivers::scheme::syncobj::timeline_signal(handle, 1));
         assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
@@ -931,6 +953,10 @@ mod sync_file_poll_tests {
     /// its own schedule. The client must still own its object afterwards.
     #[test]
     fn an_importer_freeing_its_handle_does_not_take_the_creators_syncobj() {
+        // Signalling a syncobj runs the process-wide point-advance hook, and
+        // that walk prunes the `sync_file` waiter registry on THIS thread --
+        // which is the contract the serial's own comment states. See it.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         let handle = zcore_drivers::scheme::syncobj::create(false);
         // HANDLE_TO_FD: the fd takes its own reference.
         assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
@@ -975,6 +1001,10 @@ mod sync_file_poll_tests {
     /// would alias the two, so `import_opaque` refuses and takes no reference.
     #[test]
     fn a_sync_file_fd_is_not_importable_as_a_syncobj() {
+        // The `sync_file` waiter registry this test puts an entry in is
+        // process-wide, and the test that asks whether anybody is waiting
+        // runs on another thread. See the serial's own comment.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         let handle = zcore_drivers::scheme::syncobj::create(false);
         assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
         let fd = SyncobjHandle::new_sync_file(handle, 1);
@@ -987,6 +1017,10 @@ mod sync_file_poll_tests {
     /// `SYNC_IOC_MERGE`: ready only once both fences are.
     #[test]
     fn a_merged_sync_file_is_ready_only_when_both_fences_are() {
+        // The `sync_file` waiter registry this test puts an entry in is
+        // process-wide, and the test that asks whether anybody is waiting
+        // runs on another thread. See the serial's own comment.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         let a = zcore_drivers::scheme::syncobj::create(false);
         let b = zcore_drivers::scheme::syncobj::create(false);
         assert!(zcore_drivers::scheme::syncobj::add_ref(a));
@@ -1019,6 +1053,10 @@ mod sync_file_poll_tests {
     /// must keep waiting for both fences.
     #[test]
     fn closing_the_merged_fd_after_import_keeps_the_dependency() {
+        // The `sync_file` waiter registry this test puts an entry in is
+        // process-wide, and the test that asks whether anybody is waiting
+        // runs on another thread. See the serial's own comment.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         use zcore_drivers::scheme::syncobj as so;
         let a = so::create(false);
         let b = so::create(false);
@@ -1048,6 +1086,10 @@ mod sync_file_poll_tests {
     /// sync_file's is `POLLIN` when signaled and never `POLLOUT`.
     #[test]
     fn an_opaque_syncobj_fd_is_always_ready_and_has_no_ioctl() {
+        // The `sync_file` waiter registry this test puts an entry in is
+        // process-wide, and the test that asks whether anybody is waiting
+        // runs on another thread. See the serial's own comment.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         let a = zcore_drivers::scheme::syncobj::create(false);
         assert!(zcore_drivers::scheme::syncobj::add_ref(a));
         assert!(zcore_drivers::scheme::syncobj::add_ref(a));
@@ -1100,6 +1142,10 @@ mod sync_file_poll_tests {
     /// `lseek` ESPIPE. They answered ENOSYS and claimed `O_RDWR`.
     #[test]
     fn the_fds_are_read_only_anon_files_with_no_read_or_write() {
+        // Signalling a syncobj runs the process-wide point-advance hook, and
+        // that walk prunes the `sync_file` waiter registry on THIS thread --
+        // which is the contract the serial's own comment states. See it.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         use async_std::task::block_on;
         let a = zcore_drivers::scheme::syncobj::create(true);
         assert!(zcore_drivers::scheme::syncobj::add_ref(a));
@@ -1128,6 +1174,10 @@ mod sync_file_poll_tests {
     /// `sync_file_ioctl_fence_info`.
     #[test]
     fn file_info_reports_the_one_fence_its_status_and_its_name() {
+        // The `sync_file` waiter registry this test puts an entry in is
+        // process-wide, and the test that asks whether anybody is waiting
+        // runs on another thread. See the serial's own comment.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         let a = zcore_drivers::scheme::syncobj::create(false);
         assert!(zcore_drivers::scheme::syncobj::add_ref(a));
         let fence = SyncobjHandle::new_sync_file(a, 1);
@@ -1226,6 +1276,10 @@ mod sync_file_poll_tests {
     /// `SET_DEADLINE` takes its struct and refuses a pad.
     #[test]
     fn a_merge_carries_its_name_and_set_deadline_takes_only_the_struct() {
+        // Signalling a syncobj runs the process-wide point-advance hook, and
+        // that walk prunes the `sync_file` waiter registry on THIS thread --
+        // which is the contract the serial's own comment states. See it.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         let a = zcore_drivers::scheme::syncobj::create(true);
         let b = zcore_drivers::scheme::syncobj::create(true);
         assert!(zcore_drivers::scheme::syncobj::add_ref(a));
@@ -1283,6 +1337,10 @@ mod sync_file_poll_tests {
     /// and the summary is 1 only once every one is.
     #[test]
     fn file_info_of_a_merge_lists_the_fences_that_were_pending_when_it_was_made() {
+        // The `sync_file` waiter registry this test puts an entry in is
+        // process-wide, and the test that asks whether anybody is waiting
+        // runs on another thread. See the serial's own comment.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         use zcore_drivers::scheme::syncobj as so;
         fn info_of(
             f: &SyncobjHandle,
@@ -1422,6 +1480,10 @@ mod sync_file_poll_tests {
 
     #[test]
     fn subscribe_readiness_is_offered_for_sync_files() {
+        // The `sync_file` waiter registry this test puts an entry in is
+        // process-wide, and the test that asks whether anybody is waiting
+        // runs on another thread. See the serial's own comment.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         let handle = zcore_drivers::scheme::syncobj::create(false);
         assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
         let fd = SyncobjHandle::new_sync_file(handle, 1);

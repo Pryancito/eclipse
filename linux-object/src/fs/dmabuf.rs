@@ -753,6 +753,10 @@ mod sync_file_tests {
     /// fence; and a buffer nobody fenced exports one that is ready at once.
     #[test]
     fn an_export_waits_for_what_was_imported_by_usage() {
+        // The `sync_file` waiter registry this test puts an entry in is
+        // process-wide, and the test that asks whether anybody is waiting
+        // runs on another thread. See the serial's own comment.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         let phys = 0x8_0000_0000;
         let d = dmabuf_at(phys);
         let idle = d.export_sync_file(false);
@@ -799,6 +803,10 @@ mod sync_file_tests {
     /// gone. Buffers do not see each other's fences.
     #[test]
     fn only_a_sync_file_can_be_imported_and_buffers_are_apart() {
+        // The `sync_file` waiter registry this test puts an entry in is
+        // process-wide, and the test that asks whether anybody is waiting
+        // runs on another thread. See the serial's own comment.
+        let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
         let (a, b) = (0x8_1000_0000, 0x8_2000_0000);
         let da = dmabuf_at(a);
         let db = dmabuf_at(b);
