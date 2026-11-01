@@ -34,7 +34,14 @@ use std::process::Command;
 const TECHO: usize = 4000;
 
 /// Lo que no es nuestro: dependencias con su propio estilo y su propio dueño.
-const AJENOS: &[&str] = &["vendor/", "smoltcp/", "nvidia-rm-sys/vendor/"];
+///
+/// Se comprueba como PREFIJO, y por eso hace falta la regla de `/vendor/` de
+/// [`ficheros_rs`]: un vendor no vive siempre en la raíz. El de Servo que
+/// entró el 1-nov-2026 con SilverSurfer está en
+/// `tools/SilverSurfer/vendor/servo-script/`, nueve de sus ficheros pasan del
+/// techo general, y este test enrojeció en todos los PRs del árbol por código
+/// que no escribimos nosotros.
+const AJENOS: &[&str] = &["vendor/", "smoltcp/"];
 
 /// Los que ya pasaban el techo el 9-oct-2026, con el techo propio de cada uno
 /// (su tamaño de ese día redondeado al siguiente múltiplo de 250).
@@ -112,50 +119,6 @@ const PASADOS: &[(&str, usize)] = &[
     // quién arranca cada wrapper, y lo que lo satisfacía era el texto de los
     // tests que ahora están fuera.
     ("xtask/src/linux/mod.rs", 6000),
-    // VENDOR, no es codigo nuestro: `tools/SilverSurfer/vendor/servo-script`
-    // es el arbol de Servo que entro el 1-nov-2026 con SilverSurfer. Nueve de
-    // sus ficheros pasan del techo general y enrojecian este test en TODOS los
-    // PRs. Partirlos no es una opcion: son upstream, y cada division cuesta un
-    // conflicto en la siguiente actualizacion del vendor. Van apuntados al
-    // siguiente multiplo de 250 por encima de su tamano de hoy, que es lo que
-    // impide que crezcan sin que se vea. **La regla de partir sigue valiendo
-    // para todo lo que escribimos nosotros.**
-    (
-        "tools/SilverSurfer/vendor/servo-script/dom/document/document.rs",
-        7500,
-    ),
-    (
-        "tools/SilverSurfer/vendor/servo-script/dom/element/element.rs",
-        5750,
-    ),
-    (
-        "tools/SilverSurfer/vendor/servo-script/dom/html/embedded_content/htmlmediaelement.rs",
-        4750,
-    ),
-    (
-        "tools/SilverSurfer/vendor/servo-script/dom/node/node.rs",
-        4750,
-    ),
-    (
-        "tools/SilverSurfer/vendor/servo-script/dom/webcrypto/subtlecrypto.rs",
-        7000,
-    ),
-    (
-        "tools/SilverSurfer/vendor/servo-script/dom/webgl/webgl2renderingcontext.rs",
-        5250,
-    ),
-    (
-        "tools/SilverSurfer/vendor/servo-script/dom/webgl/webglrenderingcontext.rs",
-        5500,
-    ),
-    (
-        "tools/SilverSurfer/vendor/servo-script/dom/window/window.rs",
-        4500,
-    ),
-    (
-        "tools/SilverSurfer/vendor/servo-script/event_loop/script_thread.rs",
-        5000,
-    ),
     // 7000: master llego a 6753 con el techo en 6750, asi que el trinquete
     // estaba rojo antes de esta tanda y no por ella. 7250: la busqueda por
     // tarjeta del nodo (multi-GPU) lo dejo en 7025; mismo caso que drm.rs.
@@ -195,7 +158,12 @@ fn ficheros_rs() -> Vec<(String, usize)> {
     let lista = String::from_utf8(salida.stdout).expect("git ls-files no es utf-8");
     let mut out = Vec::new();
     for rel in lista.lines() {
-        if rel.is_empty() || AJENOS.iter().any(|a| rel.starts_with(a)) {
+        // `/vendor/` como SEGMENTO, no como prefijo: cualquier árbol vendorizado
+        // queda fuera viva donde viva. Apuntar sus ficheros en `PASADOS` no
+        // valdría, porque esa lista lleva un techo fijo por fichero y la
+        // siguiente subida de versión del vendor lo volvería a pasar.
+        let ajeno = AJENOS.iter().any(|a| rel.starts_with(a)) || rel.contains("/vendor/");
+        if rel.is_empty() || ajeno {
             continue;
         }
         let ruta = PROJECT_DIR.join(rel);
