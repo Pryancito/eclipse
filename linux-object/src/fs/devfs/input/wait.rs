@@ -110,6 +110,26 @@ pub fn clear_input_waker(waker: &core::task::Waker) {
     INPUT_WAKERS.lock().retain(|w| !w.will_wake(waker));
 }
 
+/// A readiness subscription on the input waker list, for
+/// [`crate::fs::FileLike::subscribe_readiness`] of an evdev node or of
+/// `/dev/input/mice`.
+///
+/// Without one those fds answered `None`, which keeps the whole wait set of a
+/// `poll`/`epoll_wait` on the short re-scan tick even though the next frame
+/// already wakes it through this list. A compositor parked on its event loop
+/// (libinput's epoll is in it) then woke 250 times a second with nothing to
+/// do. The scan/register race is covered the same way the `watch_hid`
+/// registration covers it: the wait reads [`input_seq`] before its scan.
+pub fn subscribe_input(waker: &core::task::Waker) -> Option<crate::sync::ReadinessSub> {
+    register_input_waker(waker.clone());
+    let parked = waker.clone();
+    let sub = crate::sync::ReadinessSub::try_new(move || clear_input_waker(&parked));
+    if sub.is_none() {
+        clear_input_waker(waker);
+    }
+    sub
+}
+
 #[cfg(test)]
 mod tests {
     //! The list is the whole of the mechanism: a frame fires it, a wait
@@ -150,6 +170,27 @@ mod tests {
         let g = TEST_LOCK.lock();
         INPUT_WAKERS.lock().clear();
         g
+    }
+
+    /// An evdev fd answers `subscribe_readiness` with this, so it no longer
+    /// keeps its whole wait set on the short re-scan tick: the frame wakes
+    /// the subscription, and dropping it leaves nothing behind.
+    #[test]
+    fn an_input_subscription_is_woken_by_a_frame_and_dropped_cleanly() {
+        let _serial = drained();
+        let (c, w) = counting();
+        let sub = subscribe_input(&w).expect("the heap holds a closure");
+        wake_input_waiters();
+        assert_eq!(c.0.load(Ordering::SeqCst), 1);
+        drop(sub);
+        let (c, w) = counting();
+        drop(subscribe_input(&w));
+        assert!(
+            INPUT_WAKERS.lock().is_empty(),
+            "a dropped subscription stays parked"
+        );
+        wake_input_waiters();
+        assert_eq!(c.0.load(Ordering::SeqCst), 0);
     }
 
     #[test]

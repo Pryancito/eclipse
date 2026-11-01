@@ -1690,6 +1690,13 @@ impl FileLike for File {
         if let Some(stdin) = inode.downcast_ref::<super::stdio::Stdin>() {
             return Some(stdin.subscribe_readiness(events, waker));
         }
+        // A keyboard, mouse or touchpad: the frame interrupt fires the input
+        // waker list, so a wait parked here is told the moment a reader has
+        // something to take.
+        use super::devfs::{EventDev, MiceDev};
+        if inode.downcast_ref::<EventDev>().is_some() || inode.downcast_ref::<MiceDev>().is_some() {
+            return super::devfs::input::wait::subscribe_input(waker);
+        }
         // Regular files / directories are always ready (poll never parks on
         // them), and everything else — device nodes without an event bus,
         // FIFOs resolved through the fs — keeps the caller's short re-poll

@@ -662,6 +662,65 @@ impl FileLike for Epoll {
         Err(LxError::EINVAL)
     }
 
+    /// A nested epoll parks the waker on everything it watches, so the
+    /// outer wait can stretch its backstop like it does for any other
+    /// covered fd.
+    ///
+    /// It used to answer `None`, and a single nested epoll in a set kept the
+    /// whole set on the 4 ms re-scan tick. That is the shape of every
+    /// Wayland compositor's main loop (`libinput_get_fd` is an epoll fd), so
+    /// an idle desktop woke its compositor 250 times a second to find
+    /// nothing.
+    ///
+    /// Answers `None`, and leaves the caller on the short tick, whenever one
+    /// entry anywhere below cannot be covered: the child cannot subscribe,
+    /// the entry is edge-triggered (a level subscription would fire at once
+    /// on a level the child is suppressing, and spin), or the nesting goes
+    /// past [`EPOLL_MAX_NEST_DEPTH`]. An entry with an empty mask (a used-up
+    /// `EPOLLONESHOT`) can never become ready and needs nothing.
+    ///
+    /// Taken only after the caller's scan found the epoll not ready, so no
+    /// level entry below is up: a level subscription parks instead of firing.
+    /// Walked iteratively, like [`Self::any_ready`].
+    fn subscribe_readiness(
+        &self,
+        _events: PollEvents,
+        waker: &core::task::Waker,
+    ) -> Option<crate::sync::ReadinessSub> {
+        let mut stack: Vec<(EpollEvent, Arc<dyn FileLike>, usize)> = Vec::new();
+        {
+            let inner = self.inner.lock();
+            stack.try_reserve_exact(inner.interest_list.len()).ok()?;
+            for (event, file) in inner.interest_list.values() {
+                stack.push((*event, file.clone(), 0));
+            }
+        }
+        let mut subs: Vec<crate::sync::ReadinessSub> = Vec::new();
+        while let Some((event, file, depth)) = stack.pop() {
+            if event.events & EPOLLET != 0 {
+                return None;
+            }
+            let interest = PollEvents::from_bits_truncate(event.events as u16);
+            if interest.is_empty() {
+                continue;
+            }
+            if let Ok(child) = file.clone().downcast_arc::<Epoll>() {
+                if depth >= EPOLL_MAX_NEST_DEPTH {
+                    return None;
+                }
+                let inner = child.inner.lock();
+                stack.try_reserve(inner.interest_list.len()).ok()?;
+                for (event, file) in inner.interest_list.values() {
+                    stack.push((*event, file.clone(), depth + 1));
+                }
+                continue;
+            }
+            subs.try_reserve(1).ok()?;
+            subs.push(file.subscribe_readiness(interest, waker)?);
+        }
+        crate::sync::ReadinessSub::try_new(move || drop(subs))
+    }
+
     /// An epoll fd counts as an input device when anything it watches is one.
     ///
     /// `libinput_get_fd` returns libinput's own epoll fd, and that is what a
@@ -2856,5 +2915,192 @@ mod edge_bookkeeping_tests {
             Some(state()),
             "the entry that stayed must keep what its own scan computed"
         );
+    }
+}
+
+#[cfg(test)]
+mod nested_cover_tests {
+    //! A nested epoll answers `subscribe_readiness` for the whole subtree it
+    //! watches, so the outer wait can take the long backstop. Until it did, a
+    //! compositor's main loop (libinput's epoll sits in it) re-scanned every
+    //! 4 ms on an idle desktop.
+
+    use super::*;
+    use crate::fs::eventfd::EventFd;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::future::Future;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Waker};
+
+    const ADD: i32 = 1;
+    const IN: u32 = PollEvents::IN.bits() as u32;
+
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn counting_waker() -> (Arc<Count>, Waker) {
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        (count.clone(), Waker::from(count))
+    }
+
+    fn ev(events: u32) -> EpollEvent {
+        EpollEvent { events, data: 0 }
+    }
+
+    fn add(ep: &Epoll, fd: usize, events: u32, file: Arc<dyn FileLike>) {
+        ep.ctl(ADD, FileDesc::from(fd), ev(events), Some(file))
+            .unwrap();
+    }
+
+    /// `outer -> inner -> eventfd`, all level-triggered.
+    fn nested() -> (Arc<EventFd>, Arc<Epoll>) {
+        let efd = EventFd::new(0, OpenFlags::empty());
+        let inner = Epoll::new(OpenFlags::empty());
+        add(&inner, 5, IN, efd.clone());
+        let outer = Epoll::new(OpenFlags::empty());
+        add(&outer, 6, IN, inner);
+        (efd, outer)
+    }
+
+    #[test]
+    fn a_nested_epoll_of_subscribable_files_is_covered() {
+        let (efd, outer) = nested();
+        let (count, waker) = counting_waker();
+        let sub = outer.subscribe_readiness(PollEvents::IN, &waker);
+        assert!(sub.is_some(), "a nested eventfd can carry the waker");
+        efd.write(&1u64.to_ne_bytes()).unwrap();
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+        drop(sub);
+    }
+
+    #[test]
+    fn dropping_the_subscription_unparks_every_child() {
+        let (efd, outer) = nested();
+        let (count, waker) = counting_waker();
+        drop(outer.subscribe_readiness(PollEvents::IN, &waker));
+        efd.write(&1u64.to_ne_bytes()).unwrap();
+        assert_eq!(count.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_blocking_wait_on_a_nested_epoll_is_woken_by_the_inner_write() {
+        let (efd, outer) = nested();
+        let (count, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = alloc::boxed::Box::pin(outer.wait(16, -1));
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        efd.write(&1u64.to_ne_bytes()).unwrap();
+        assert!(
+            count.0.load(Ordering::SeqCst) >= 1,
+            "the write waits for the re-scan tick instead of waking the wait"
+        );
+    }
+
+    #[test]
+    fn an_edge_triggered_entry_below_keeps_the_short_tick() {
+        let efd = EventFd::new(0, OpenFlags::empty());
+        let inner = Epoll::new(OpenFlags::empty());
+        add(&inner, 5, IN | EPOLLET, efd);
+        let (_, waker) = counting_waker();
+        assert!(inner.subscribe_readiness(PollEvents::IN, &waker).is_none());
+    }
+
+    #[test]
+    fn an_unsubscribable_entry_below_keeps_the_short_tick() {
+        // The default `subscribe_readiness` answers `None`.
+        struct Plain {
+            base: KObjectBase,
+        }
+        impl_kobject!(Plain);
+        #[async_trait]
+        impl FileLike for Plain {
+            fn flags(&self) -> OpenFlags {
+                OpenFlags::empty()
+            }
+            fn set_flags(&self, _f: OpenFlags) -> LxResult {
+                Ok(())
+            }
+            async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
+                Ok(0)
+            }
+            fn write(&self, _buf: &[u8]) -> LxResult<usize> {
+                Ok(0)
+            }
+            async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+                Ok(0)
+            }
+            fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
+                Ok(PollStatus {
+                    read: false,
+                    write: false,
+                    error: false,
+                    hangup: false,
+                })
+            }
+            async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+                self.poll(events)
+            }
+        }
+        let efd = EventFd::new(0, OpenFlags::empty());
+        let inner = Epoll::new(OpenFlags::empty());
+        add(&inner, 5, IN, efd.clone());
+        add(
+            &inner,
+            7,
+            IN,
+            Arc::new(Plain {
+                base: KObjectBase::new(),
+            }),
+        );
+        let (count, waker) = counting_waker();
+        assert!(inner.subscribe_readiness(PollEvents::IN, &waker).is_none());
+        // What was parked before the refusal is unparked with it.
+        efd.write(&1u64.to_ne_bytes()).unwrap();
+        assert_eq!(count.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_used_up_oneshot_entry_needs_no_subscription() {
+        let efd = EventFd::new(0, OpenFlags::empty());
+        let inner = Epoll::new(OpenFlags::empty());
+        // What a delivered `EPOLLONESHOT` entry is left with.
+        add(&inner, 5, EPOLLONESHOT, efd);
+        inner
+            .inner
+            .lock()
+            .interest_list
+            .get_mut(&FileDesc::from(5))
+            .unwrap()
+            .0
+            .events = EPOLLONESHOT;
+        let (_, waker) = counting_waker();
+        assert!(inner.subscribe_readiness(PollEvents::IN, &waker).is_some());
+    }
+
+    #[test]
+    fn nesting_past_the_limit_is_not_covered() {
+        let efd = EventFd::new(0, OpenFlags::empty());
+        let mut top = Epoll::new(OpenFlags::empty());
+        add(&top, 5, IN, efd);
+        for i in 0..=EPOLL_MAX_NEST_DEPTH {
+            let up = Epoll::new(OpenFlags::empty());
+            // Built bottom-up, so `ctl`'s own depth check never sees the
+            // whole chain; insert directly.
+            up.inner.lock().interest_list.insert(
+                FileDesc::from(10 + i),
+                (ev(IN), top.clone() as Arc<dyn FileLike>),
+            );
+            top = up;
+        }
+        let (_, waker) = counting_waker();
+        assert!(top.subscribe_readiness(PollEvents::IN, &waker).is_none());
     }
 }
