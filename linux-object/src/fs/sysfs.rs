@@ -3366,21 +3366,7 @@ mod tree_tests {
     /// Every node reachable from `/sys`, without following a symlink --
     /// following them would make the walk infinite, and they get a test of
     /// their own.
-    ///
-    /// Takes the DRM test lock for the whole walk. A good part of this tree is
-    /// read straight out of the process-wide `/dev/dri` node table --
-    /// `/sys/class/drm`, the `drm/` directory of each PCI device
-    /// ([`drm_nodes_for_pci_index`]), the compute alias, and
-    /// [`drm_card0_pci_index`] through `all_drm()` -- and a DRM test in another
-    /// thread rebuilds that table under `drm::test_globals::lock()`. Without
-    /// the lock the walk read it mid-rebuild: `listing()` named a
-    /// `/dev/char/226:128` that the `find()` one line later could no longer
-    /// resolve, and the panic was `... listed but EntryNotFound` in a test
-    /// about the shape of `/sys` that had done nothing wrong. The lock is the
-    /// same one every test that touches those globals takes; reading them is
-    /// no different from writing them.
     fn whole_tree() -> Vec<Node> {
-        let _serialised = crate::fs::devfs::drm::test_globals::lock();
         let mut out: Vec<Node> = vec![];
         let root = SYS_ROOT.clone();
         let root_ino = root.metadata().unwrap().inode;
