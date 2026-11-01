@@ -65,7 +65,13 @@ impl DnsFamily {
 }
 
 /// Resolve `hostname` using `/etc/hosts`, then nameservers from `/etc/resolv.conf`.
-pub fn resolve(
+///
+/// Async because the wait for a nameserver's answer sleeps: it used to spin
+/// 50 ms at a time, so every lookup that went to the network cost at least
+/// 50 ms of one CPU per query (an `AF_UNSPEC` lookup asks twice), and one
+/// with no answer coming -- no network, a dead resolver -- held a CPU at
+/// 100% for 1.6 s per query and server.
+pub async fn resolve(
     root: &Arc<dyn INode>,
     hostname: &str,
     family: DnsFamily,
@@ -90,12 +96,12 @@ pub fn resolve(
 
     for server in servers {
         if want_v4 {
-            if let Ok(addrs) = query_at(server, hostname, QTYPE_A) {
+            if let Ok(addrs) = query_at(server, hostname, QTYPE_A).await {
                 out.extend(addrs);
             }
         }
         if want_v6 {
-            if let Ok(addrs) = query_at(server, hostname, QTYPE_AAAA) {
+            if let Ok(addrs) = query_at(server, hostname, QTYPE_AAAA).await {
                 out.extend(addrs);
             }
         }
@@ -301,7 +307,7 @@ fn parse_ipv6(s: &str) -> Option<Ipv6Address> {
     Some(Ipv6Address::from_bytes(&bytes))
 }
 
-fn query_at(server: IpAddress, name: &str, qtype: u16) -> LxResult<Vec<IpAddress>> {
+async fn query_at(server: IpAddress, name: &str, qtype: u16) -> LxResult<Vec<IpAddress>> {
     let id = (super::rand() & 0xffff) as u16;
     let query = build_query(name, id, qtype)?;
     let (local, remote) = match server {
@@ -315,7 +321,7 @@ fn query_at(server: IpAddress, name: &str, qtype: u16) -> LxResult<Vec<IpAddress
         ),
         IpAddress::Unspecified | _ => return Err(LxError::EINVAL),
     };
-    let reply = udp_exchange(local, remote, &query, id)?;
+    let reply = udp_exchange(local, remote, &query, id).await?;
     parse_addresses(&reply, qtype)
 }
 
@@ -360,14 +366,35 @@ fn encode_qname(name: &str, out: &mut Vec<u8>) -> LxResult {
     Ok(())
 }
 
-fn spin_ms(ms: u64) {
-    let deadline = kernel_hal::timer::timer_now() + Duration::from_millis(ms);
-    while kernel_hal::timer::timer_now() < deadline {
-        core::hint::spin_loop();
+/// How long one query waits for its answer: what the 32 rounds of 50 ms
+/// it waited in before added up to.
+const REPLY_TIMEOUT: Duration = Duration::from_millis(32 * 50);
+/// The first sleep while waiting for an answer. A resolver on the LAN (or
+/// QEMU's) answers in a millisecond or two, and the old 50 ms step added
+/// that much latency to every lookup.
+const REPLY_WAIT_MIN: Duration = Duration::from_millis(2);
+/// The longest sleep: the step doubles up to here, so an answer that is slow
+/// in coming costs a wake every 50 ms, as the spinning wait looked.
+const REPLY_WAIT_MAX: Duration = Duration::from_millis(50);
+
+/// The sleep after `step` (the one before it), doubling within the bounds.
+fn next_reply_wait(step: Duration) -> Duration {
+    (step * 2).clamp(REPLY_WAIT_MIN, REPLY_WAIT_MAX)
+}
+
+/// Removes the query's socket from the set however the exchange ends --
+/// answer, timeout, error, or the future dropped because the caller was
+/// killed while it slept. A stranded socket keeps its buffers for the rest
+/// of the uptime, and enough of them fill the set (see below).
+struct QuerySocket(smoltcp::socket::SocketHandle);
+
+impl Drop for QuerySocket {
+    fn drop(&mut self) {
+        get_sockets().lock().remove(self.0);
     }
 }
 
-fn udp_exchange(
+async fn udp_exchange(
     local: IpEndpoint,
     remote: IpEndpoint,
     query: &[u8],
@@ -389,6 +416,7 @@ fn udp_exchange(
     }
     let handle = set.add(socket);
     drop(set);
+    let _socket = QuerySocket(handle);
     // The socket is already IN the set, so an early return here does not drop
     // it -- it strands it, with its two 512-byte buffers and its metadata
     // vectors, for the rest of the uptime. Both of these fail for ordinary
@@ -404,41 +432,38 @@ fn udp_exchange(
             .bind(local)
             .map_err(|_| LxError::EINVAL)
             .and_then(|_| sock.send_slice(query, remote).map_err(|_| LxError::EIO));
-        if let Err(e) = started {
-            drop(sock);
-            drop(set);
-            sockets.lock().remove(handle);
-            return Err(e);
-        }
+        started?;
     }
 
     let mut buf = [0u8; 512];
-    for round in 0..32 {
+    let deadline = kernel_hal::timer::timer_now() + REPLY_TIMEOUT;
+    let mut step = Duration::ZERO;
+    let mut first = true;
+    loop {
         drain_net_poll(8);
-        if round == 0 {
+        if first {
             kernel_hal::deferred_job::drain_deferred_jobs();
+            first = false;
         }
-        let mut set = sockets.lock();
-        let mut sock = set.get::<UdpSocket>(handle);
-        if sock.can_recv() {
-            if let Ok((n, _)) = sock.recv_slice(&mut buf) {
-                if n >= 2 {
-                    let id = u16::from_be_bytes([buf[0], buf[1]]);
-                    if id == expect_id {
-                        drop(sock);
-                        drop(set);
-                        sockets.lock().remove(handle);
+        {
+            let mut set = sockets.lock();
+            let mut sock = set.get::<UdpSocket>(handle);
+            if sock.can_recv() {
+                if let Ok((n, _)) = sock.recv_slice(&mut buf) {
+                    if n >= 2 && u16::from_be_bytes([buf[0], buf[1]]) == expect_id {
                         return Ok(buf[..n].to_vec());
                     }
                 }
             }
         }
-        drop(sock);
-        drop(set);
-        spin_ms(50);
+        let now = kernel_hal::timer::timer_now();
+        if now >= deadline {
+            return Err(LxError::ETIMEDOUT);
+        }
+        step = next_reply_wait(step);
+        crate::process::interruptible(kernel_hal::thread::sleep_until((now + step).min(deadline)))
+            .await?;
     }
-    sockets.lock().remove(handle);
-    Err(LxError::ETIMEDOUT)
 }
 
 fn skip_name(data: &[u8], mut off: usize) -> Option<usize> {
@@ -932,5 +957,50 @@ mod dns_tests {
             parse_addresses(&pkt, QTYPE_A),
             Err(LxError::EINVAL)
         ));
+    }
+
+    // ── the wait for a nameserver's answer ──────────────────────────────────
+
+    #[test]
+    fn the_wait_for_an_answer_starts_short_and_doubles_to_the_old_step() {
+        let mut step = Duration::ZERO;
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            step = next_reply_wait(step);
+            seen.push(step.as_millis() as u64);
+        }
+        assert_eq!(seen, alloc::vec![2, 4, 8, 16, 32, 50, 50]);
+    }
+
+    #[test]
+    fn a_query_nobody_answers_wakes_about_as_often_as_the_spinning_one_looked() {
+        // The spinning wait looked 32 times in its 1.6 s and burned the CPU
+        // in between; the sleeping one may look a few more times early on,
+        // and sleeps through all of it.
+        let mut step = Duration::ZERO;
+        let mut waited = Duration::ZERO;
+        let mut wakes = 0;
+        while waited < REPLY_TIMEOUT {
+            step = next_reply_wait(step);
+            waited += step;
+            wakes += 1;
+        }
+        assert!(wakes <= 37, "{} wakes", wakes);
+        assert_eq!(REPLY_TIMEOUT, Duration::from_millis(1600));
+    }
+
+    #[test]
+    fn a_name_in_etc_hosts_resolves_without_waiting_on_the_network() {
+        use rcore_fs::vfs::{FileSystem, FileType};
+        let fs = rcore_fs_ramfs::RamFS::new();
+        let root = fs.root_inode();
+        let etc = root.create("etc", FileType::Dir, 0o755).unwrap();
+        let hosts = etc.create("hosts", FileType::File, 0o644).unwrap();
+        hosts.write_at(0, b"10.0.0.7 nas.local\n").unwrap();
+        let got = async_std::task::block_on(resolve(&root, "nas.local", DnsFamily::V4)).unwrap();
+        assert_eq!(
+            got,
+            alloc::vec![IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 7))]
+        );
     }
 }

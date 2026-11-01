@@ -838,7 +838,10 @@ impl Syscall<'_> {
             Sys::BLOCK_IN_KERNEL => self.sys_block_in_kernel(),
             // Custom `eclipse_dns_query` is only in the x86_64 syscall table.
             #[cfg(target_arch = "x86_64")]
-            Sys::ECLIPSE_DNS_QUERY => self.sys_eclipse_dns_query(a0.into(), a1, a2, a3.into(), a4),
+            Sys::ECLIPSE_DNS_QUERY => {
+                self.sys_eclipse_dns_query(a0.into(), a1, a2, a3.into(), a4)
+                    .await
+            }
             Sys::PERF_EVENT_OPEN => {
                 self.sys_perf_event_open(a0, a1 as i32, a2 as i32, a3 as i32, a4)
             }
