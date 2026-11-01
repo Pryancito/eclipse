@@ -184,6 +184,24 @@ pub trait GenericPageTable: Sync + Send {
         0
     }
 
+    /// Unlink every table below the root that this address space allocated for
+    /// its lower (user) half, and hand the frames back to the caller.
+    ///
+    /// For the last teardown of an address space, once every mapping in it is
+    /// gone. The tables are otherwise freed only with the whole page table,
+    /// which an exited process keeps until it is reaped: a zombie its parent
+    /// has not waited for yet held every table its mappings ever needed.
+    ///
+    /// The frames are RETURNED, not freed, on purpose: another CPU may still
+    /// have the unlinked entries in its paging-structure caches, so the caller
+    /// must complete a TLB shootdown of this address space before it drops
+    /// them -- Linux's `tlb_remove_table` ordering. Tables the root shares with
+    /// the kernel (anything this address space did not allocate) are left as
+    /// they are. 0 frames where the tables are not this crate's.
+    fn take_user_tables(&mut self) -> alloc::vec::Vec<crate::mem::PhysFrame> {
+        alloc::vec::Vec::new()
+    }
+
     fn map_cont(
         &mut self,
         start_vaddr: VirtAddr,

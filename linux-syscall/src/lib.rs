@@ -335,7 +335,10 @@ impl Syscall<'_> {
             Sys::READ => self.sys_read(a0.into(), a1.into(), a2).await,
             Sys::WRITE => self.sys_write(a0.into(), a1.into(), a2).await,
             Sys::OPENAT => self.sys_openat_waiting(a0.into(), a1.into(), a2, a3).await,
-            Sys::CLOSE => self.sys_close(a0.into()),
+            Sys::CLOSE => {
+                self.sync_dsp_before_close(a0.into()).await;
+                self.sys_close(a0.into())
+            }
             Sys::FSTAT => self.sys_fstat(a0.into(), a1.into()),
             Sys::NEWFSTATAT => self.sys_fstatat(a0.into(), a1.into(), a2.into(), a3),
             Sys::LSEEK => self.sys_lseek(a0.into(), a1 as i64, a2),
@@ -835,7 +838,10 @@ impl Syscall<'_> {
             Sys::BLOCK_IN_KERNEL => self.sys_block_in_kernel(),
             // Custom `eclipse_dns_query` is only in the x86_64 syscall table.
             #[cfg(target_arch = "x86_64")]
-            Sys::ECLIPSE_DNS_QUERY => self.sys_eclipse_dns_query(a0.into(), a1, a2, a3.into(), a4),
+            Sys::ECLIPSE_DNS_QUERY => {
+                self.sys_eclipse_dns_query(a0.into(), a1, a2, a3.into(), a4)
+                    .await
+            }
             Sys::PERF_EVENT_OPEN => {
                 self.sys_perf_event_open(a0, a1 as i32, a2 as i32, a3 as i32, a4)
             }

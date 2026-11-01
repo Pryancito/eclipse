@@ -2862,6 +2862,51 @@ fn console_tty(file_like: &Arc<dyn FileLike>) -> Option<Arc<dyn INode>> {
 
 /// `/dev/dsp` opened without `O_NONBLOCK`: the inode, for `sys_write` to
 /// hand its writes to `DspDev::write_pcm_sleeping`.
+/// The `/dev/dsp` client `close(fd)` is about to release, when this fd is
+/// the last reference to its open file: the fd table's and the caller's
+/// handle, and nobody else's (a `dup`, a `fork`, an epoll interest list or a
+/// wait in flight all hold one more).
+fn dsp_released_by_close(file_like: &Arc<dyn FileLike>) -> Option<Arc<dyn INode>> {
+    if Arc::strong_count(file_like) != 2 {
+        return None;
+    }
+    let inode = file_like.downcast_ref::<File>()?.inode();
+    if !inode
+        .as_any_ref()
+        .downcast_ref::<DspDev>()?
+        .syncs_on_close()
+    {
+        return None;
+    }
+    Some(inode)
+}
+
+impl Syscall<'_> {
+    /// Play out a `/dev/dsp` client's queue asleep before `close(2)` drops
+    /// it. Linux `snd_pcm_oss_release` syncs on the last close, and so does
+    /// `DspDev`'s `Drop` -- but `Drop` cannot sleep, and it spun one CPU for
+    /// the whole tail of the stream (up to the device's buffer) every time an
+    /// OSS player closed its fd: `cat musica.raw > /dev/dsp` ends that way.
+    ///
+    /// Only the last close waits, as in Linux. Anything that keeps the file
+    /// alive past this close (a `dup`, a `fork`) skips it, and the drop of
+    /// the last reference syncs as it always has.
+    pub async fn sync_dsp_before_close(&self, fd: FileDesc) {
+        let Ok(file_like) = self.linux_process().get_file_like(fd) else {
+            return;
+        };
+        let Some(inode) = dsp_released_by_close(&file_like) else {
+            return;
+        };
+        drop(file_like);
+        if let Some(dsp) = inode.as_any_ref().downcast_ref::<DspDev>() {
+            // An unconfigured stream has nothing to play: `Drop` takes the
+            // same error and carries on.
+            let _ = dsp.sync_sleeping().await;
+        }
+    }
+}
+
 fn blocking_dsp(file_like: &Arc<dyn FileLike>) -> Option<Arc<dyn INode>> {
     let flags = file_like.flags();
     // Not for a descriptor the write would refuse (`O_PATH`, read-only):
@@ -3958,3 +4003,6 @@ mod pipe_write_wiring_tests;
 /// given, which nothing already in this tree does.
 #[cfg(test)]
 mod short_write_tests;
+
+#[cfg(test)]
+mod dsp_close_tests;

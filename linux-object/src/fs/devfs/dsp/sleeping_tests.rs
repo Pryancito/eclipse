@@ -87,3 +87,28 @@ fn only_sync_is_the_blocking_oss_ioctl() {
     assert!(!DspDev::is_sync_ioctl(SNDCTL_DSP_RESET));
     assert!(!DspDev::is_sync_ioctl(SNDCTL_DSP_POST));
 }
+
+#[test]
+fn a_client_synced_asleep_before_close_drops_without_spinning() {
+    // What `close(2)` now does: `sync_sleeping`, then the drop. The drop's
+    // own sync finds the queue empty and does not wait.
+    let ring = Arc::new(PlayingRing::new(960));
+    let mut dsp = DspDev::new(ring.clone(), 0);
+    dsp.client = true;
+    assert!(dsp.syncs_on_close());
+    let pcm = alloc::vec![0u8; 20 * BYTES_PER_MS];
+    write_all(&dsp, &pcm);
+    async_std::task::block_on(dsp.sync_sleeping()).unwrap();
+    let before = ring.looks.load(Ordering::Relaxed);
+    let start = kernel_hal::timer::timer_now();
+    drop(dsp);
+    assert!(kernel_hal::timer::timer_now() - start < core::time::Duration::from_millis(5));
+    let looks = ring.looks.load(Ordering::Relaxed) - before;
+    assert!(looks < 5, "the drop looked at the ring {} times", looks);
+}
+
+#[test]
+fn only_a_client_syncs_on_close() {
+    let ring = Arc::new(PlayingRing::new(480));
+    assert!(!DspDev::new(ring, 0).syncs_on_close());
+}

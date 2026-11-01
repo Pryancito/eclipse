@@ -1875,6 +1875,7 @@ impl INode for ProcSysVmDirINode {
             ".." => Ok(PROC_SYS_DIR.clone()),
             "overcommit_memory" => Ok(PROC_SYS_OVERCOMMIT.clone()),
             "max_map_count" => Ok(PROC_SYS_MAX_MAP_COUNT.clone()),
+            "drop_caches" => Ok(PROC_SYS_DROP_CACHES.clone()),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -1884,6 +1885,7 @@ impl INode for ProcSysVmDirINode {
             1 => Ok("..".into()),
             2 => Ok("overcommit_memory".into()),
             3 => Ok("max_map_count".into()),
+            4 => Ok("drop_caches".into()),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -2345,6 +2347,52 @@ fn proc_sysvipc_shm_content() -> String {
 /// wasm engines) read it to size their reservation strategy.
 fn proc_sys_max_map_count_content() -> String {
     String::from("65530\n")
+}
+
+/// `/proc/sys/vm/drop_caches` reads back 0, as on Linux: it is a trigger,
+/// not a setting.
+fn proc_sys_drop_caches_content() -> String {
+    String::from("0\n")
+}
+
+/// What `drop_caches` asks for: 1 the file caches (page cache and the ELF
+/// images built from it), 2 the kernel's other caches (every direct-reclaim
+/// shrinker), 3 both. Anything else is `EINVAL`, as on Linux.
+fn drop_caches_scope(value: &str) -> Result<(bool, bool)> {
+    match value.trim() {
+        "1" => Ok((true, false)),
+        "2" => Ok((false, true)),
+        "3" => Ok((true, true)),
+        _ => Err(FsError::InvalidParam),
+    }
+}
+
+/// `echo 3 > /proc/sys/vm/drop_caches`: give back now what the caches keep.
+///
+/// A program that exits returns every frame it owned, but the files it read
+/// stay cached -- reported as `Cached:` and counted in `MemAvailable:`, and
+/// freed on their own once memory runs short. This is the way to free them
+/// before that, for a measurement that wants the machine back where it booted.
+///
+/// Like Linux it only drops what can be dropped: pages still mapped, or
+/// shared pages whose file is gone, stay. The page cache is normally asked
+/// only from the reclaim worker because its eviction may write dirty pages
+/// back; a `write(2)` is a thread that may wait for that, and holds no lock
+/// here.
+fn store_drop_caches(value: &str) -> Result<()> {
+    let (files, others) = drop_caches_scope(value)?;
+    let mut freed = 0usize;
+    if files {
+        freed = freed.saturating_add((super::file::page_cache_reclaim::RECLAIMER.scan)(
+            usize::MAX,
+        ));
+        freed = freed.saturating_add((super::elf_vmo_shrinker::SHRINKER.scan)(usize::MAX));
+    }
+    if others {
+        freed = freed.saturating_add(kernel_hal::shrinker::shrink(usize::MAX));
+    }
+    log::info!("drop_caches={}: freed {} KiB", value.trim(), freed / 1024);
+    Ok(())
 }
 
 fn proc_sys_file_max_content() -> String {
@@ -4493,6 +4541,11 @@ lazy_static! {
         inode: 64,
         generate: proc_sys_max_map_count_content,
     }));
+    static ref PROC_SYS_DROP_CACHES: Arc<dyn INode> = Arc::new(ProcSysWritableINode {
+        inode: 74,
+        generate: proc_sys_drop_caches_content,
+        store: store_drop_caches,
+    });
     static ref PROC_SYS_FS_DIR: Arc<dyn INode> = Arc::new(ProcSysFsDirINode);
     static ref PROC_SYS_FILE_MAX: Arc<dyn INode> = Arc::new(ProcSysValueINode(ProcSeqINode {
         inode: 66,
@@ -5052,6 +5105,32 @@ mod dir_shape_tests {
 #[cfg(test)]
 mod sysctl_tests {
     use super::*;
+
+    #[test]
+    fn drop_caches_takes_1_2_or_3_and_nothing_else() {
+        assert_eq!(drop_caches_scope("1"), Ok((true, false)));
+        assert_eq!(drop_caches_scope("2"), Ok((false, true)));
+        assert_eq!(drop_caches_scope("3"), Ok((true, true)));
+        assert_eq!(drop_caches_scope(" 3 "), Ok((true, true)));
+        for bad in ["0", "4", "", "drop", "13"] {
+            assert_eq!(
+                drop_caches_scope(bad),
+                Err(FsError::InvalidParam),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// `echo 3 > /proc/sys/vm/drop_caches`: found, written, and read back as 0.
+    #[test]
+    fn drop_caches_is_listed_writable_and_reads_zero() {
+        let file = PROC_SYS_VM_DIR.find("drop_caches").unwrap();
+        assert_eq!(file.write_at(0, b"3\n").unwrap(), 2);
+        let mut buf = [0u8; 8];
+        let n = file.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"0\n");
+        assert!(file.write_at(0, b"7\n").is_err());
+    }
 
     #[test]
     fn writable_hostname_trims_newline_and_roundtrips() {

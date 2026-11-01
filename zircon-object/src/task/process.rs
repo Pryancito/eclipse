@@ -156,6 +156,9 @@ struct AddressSpace(Arc<VmAddressRegion>);
 impl Drop for AddressSpace {
     fn drop(&mut self) {
         let _ = self.0.clear();
+        // Nobody runs in it any more, so its page tables go now too, rather
+        // than when the process object is reaped.
+        self.0.release_page_tables();
     }
 }
 
