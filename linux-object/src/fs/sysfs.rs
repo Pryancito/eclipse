@@ -3432,6 +3432,14 @@ mod tree_tests {
 
     #[test]
     fn every_directory_lists_itself_and_its_parent_first() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         // `getdents` goes straight through `get_entry` and synthesises
         // nothing, so a directory numbering from its first real name is one
         // `readdir` never reports `.` or `..` for -- which every other
@@ -3464,6 +3472,14 @@ mod tree_tests {
 
     #[test]
     fn an_empty_directory_still_has_the_two() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         let _bus = test_bus::with(vec![]);
         let empty = SYS_ROOT.lookup_follow("class/power_supply", 4).unwrap();
         assert_eq!(listing(&empty), vec![String::from("."), String::from("..")]);
@@ -3471,6 +3487,14 @@ mod tree_tests {
 
     #[test]
     fn dot_is_the_directory_and_dotdot_is_the_one_above_it() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         let _bus = test_bus::with(test_bus::a_real_machine());
         for node in whole_tree() {
             if node.type_ != FileType::Dir {
@@ -3490,6 +3514,14 @@ mod tree_tests {
 
     #[test]
     fn walking_up_from_a_power_supply_reaches_the_class_directory() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         // Its `..` used to be itself, so anything walking up from a battery
         // -- which is how a power daemon finds the device one belongs to --
         // stayed in `/sys/class/power_supply` for ever.
@@ -3511,6 +3543,14 @@ mod tree_tests {
 
     #[test]
     fn every_name_a_directory_lists_can_be_opened() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         // The walk panics on a name `find` refuses, so reaching the end is
         // the assertion; the count keeps it from passing on an empty tree.
         let _bus = test_bus::with(test_bus::a_real_machine());
@@ -3519,6 +3559,14 @@ mod tree_tests {
 
     #[test]
     fn a_listing_ends_instead_of_repeating_itself_or_panicking() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         let _bus = test_bus::with(test_bus::a_real_machine());
         for node in whole_tree() {
             if node.type_ != FileType::Dir {
@@ -3542,6 +3590,14 @@ mod tree_tests {
 
     #[test]
     fn no_two_directories_of_the_tree_claim_the_same_inode() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         // They were literals spaced ten apart with the per-device ones
         // written `40 + index` and `100 + index`, so the eleventh PCI
         // function was `/sys/devices/system` over again and the first disk
@@ -3562,6 +3618,14 @@ mod tree_tests {
 
     #[test]
     fn a_bus_wider_than_the_old_numbering_allowed_still_numbers_apart() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         // Twenty functions, which an ordinary desktop passes once the
         // chipset's own are counted.
         let devs: Vec<PciDevInfo> = (0..20)
@@ -3581,6 +3645,14 @@ mod tree_tests {
 
     #[test]
     fn every_symlink_resolves_to_something_in_the_tree() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         // Four of these are what libdrm walks to decide which device a card
         // belongs to, and the only thing that can be wrong with one is the
         // number of `..` in it, which reads as correct however long you look.
@@ -3620,6 +3692,14 @@ mod tree_tests {
 
     #[test]
     fn a_file_read_from_the_middle_gives_the_rest_of_it() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         // `cat` reads whatever its buffer holds and asks again from where it
         // stopped. A file answering from the beginning every time never ends.
         let _bus = test_bus::with(test_bus::a_real_machine());
@@ -3645,6 +3725,14 @@ mod tree_tests {
 
     #[test]
     fn the_bus_the_tree_shows_is_the_bus_it_was_given() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         let _bus = test_bus::with(test_bus::a_real_machine());
         let devices = SYS_ROOT.lookup_follow("bus/pci/devices", 4).unwrap();
         let names = listing(&devices);
@@ -3695,6 +3783,14 @@ mod tree_tests {
 
     #[test]
     fn a_class_with_a_hex_letter_in_it_keeps_its_case() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         // An xHCI controller is class 0x0c0330, and the `0c` is the only
         // reason to look: every other number on a desk is digits. The old
         // modalias took the three bytes as text straight out of the string
@@ -3718,6 +3814,14 @@ mod tree_tests {
 
     #[test]
     fn a_device_with_nothing_readable_in_it_still_answers() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         // `scan_pci_devices` writes these strings and they are always
         // well-formed, but the synthetic compute alias builds one by hand
         // with `0x0000`, and a parse that gave up used to leave three
@@ -3740,6 +3844,14 @@ mod tree_tests {
 
     #[test]
     fn a_disk_is_the_same_disk_from_both_places_that_show_it() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         let _bus = test_bus::with(test_bus::a_real_machine());
         // Moebius's NVMe, plus the SATA disk he has said he does not have
         // here but the installer still has to name.
@@ -3776,6 +3888,14 @@ mod tree_tests {
 
     #[test]
     fn walking_up_from_a_disk_goes_back_the_way_it_came() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         let _bus = test_bus::with(vec![]);
         let _disks = test_bus::disks(&_bus, &["nvme0"], 512);
 
@@ -3823,6 +3943,14 @@ mod tree_tests {
 
     #[test]
     fn a_twenty_seventh_disk_does_not_take_the_first_one_s_name() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         // `sda` through `sdz`, and then what? The naming wrapped with
         // `% 26` and started over, so two disks answered to `sda` and
         // `block_index_by_name` handed out the first of them for both --
@@ -3858,6 +3986,14 @@ mod tree_tests {
 
     #[test]
     fn el_arranque_por_uefi_se_anuncia_en_sys_firmware_efi() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         // Lo que mira todo instalador para decidir la tabla de particiones.
         // Los dos cargadores del arbol son aplicaciones UEFI -- rboot en
         // x86_64 y rayboot en aarch64 -- asi que en las dos esto tiene que
@@ -3886,6 +4022,14 @@ mod tree_tests {
 
     #[test]
     fn a_machine_with_no_bus_at_all_still_has_a_tree() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         // Not hypothetical: it is what every non-PCI machine looks like, and
         // the walk has to end rather than fault or run on.
         let _bus = test_bus::with(vec![]);
@@ -3899,6 +4043,14 @@ mod tree_tests {
 
     #[test]
     fn sysfs_device_id_is_distinct_from_root_fs() {
+        // DRM first, then the bus: `whole_tree()` walks `/sys` and a good
+        // part of that tree comes out of the DRM node table, which another
+        // thread rebuilds. Taking it here and not inside `whole_tree()` is
+        // what keeps the order the same as everywhere else -- see
+        // `sysfs::card0_identity_tests`, which already does DRM then bus.
+        // The reverse order deadlocks: both are plain non-reentrant
+        // `std::sync::Mutex`, and the DRM side of sysfs reads the bus table.
+        let _drm_table = crate::fs::devfs::drm::test_globals::lock();
         let _bus = test_bus::with(test_bus::a_real_machine());
         let root_md = SYS_ROOT.metadata().unwrap();
         assert_eq!(root_md.dev, SYSFS_DEV);

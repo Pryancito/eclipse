@@ -8317,6 +8317,55 @@ fn with_core_scanout_state(card: u32, mut plane: DrmPlane) -> DrmPlane {
 /// cursor, or a blanked CRTC, behind, and the next test then fails for a reason
 /// that is not its own -- exactly the noise [`test_globals`] exists to remove.
 /// Call it with no display registered, so unblanking cannot clear one.
+/// What [`reset_output_state_for_test`] puts back, read back: the flags a test
+/// must hand over at their boot values when it releases the DRM test lock.
+///
+/// The lock stops two tests from interleaving, but it does not stop one from
+/// leaving a flag flipped for the NEXT holder, which is the same defect with
+/// a different clock: the victim is whoever takes the lock next, and the
+/// suite reports the victim. `test_globals::Held` checks this on release so
+/// the panic names the test that left it.
+///
+/// Only the flags, not the counters below them: a stale counter is a
+/// diagnostic, and the tests that read one reset it themselves.
+#[cfg(test)]
+pub(crate) fn output_state_left_dirty() -> Option<alloc::string::String> {
+    use alloc::format;
+    let mut out = alloc::vec::Vec::new();
+    for (name, is, should) in [
+        ("crtc_blanked", crtc_blanked(), false),
+        ("crtc_enabled", crtc_enabled(), true),
+        ("scanout_paused", scanout_paused(), false),
+        ("atomic_enabled", atomic_enabled(), false),
+        ("present_probe_enabled", present_probe_enabled(), false),
+        ("cursor_from_client", cursor_from_client(), false),
+        ("present_repair_enabled", present_repair_enabled(), true),
+        ("present_skip_enabled", present_skip_enabled(), false),
+    ] {
+        if is != should {
+            out.push(format!("{name}={is} (should be {should})"));
+        }
+    }
+    // And the machine itself. In a test build the boot-time bring-up is a
+    // no-op (see `fs::drm_bring_up`), so a card or a `/dev/dri` node still
+    // there on release is one this test registered and did not take down --
+    // which is how `software_kms_active()` comes out false under the NEXT
+    // test and its synthetic CRTC starts answering `EntryNotFound`.
+    let cards = DRM_STATE.lock().drivers.len();
+    if cards != 0 {
+        out.push(format!("{cards} DRM driver(s) still registered"));
+    }
+    let nodes = gpu_nodes().len();
+    if nodes != 0 {
+        out.push(format!("{nodes} /dev/dri node(s) still in the table"));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join(", "))
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn reset_output_state_for_test() {
     set_crtc_blanked(false);
@@ -8385,7 +8434,7 @@ pub(crate) fn reset_output_state_for_test() {
 }
 
 #[cfg(test)]
-pub(super) mod test_globals;
+pub(crate) mod test_globals;
 
 #[cfg(test)]
 mod release_tests;
