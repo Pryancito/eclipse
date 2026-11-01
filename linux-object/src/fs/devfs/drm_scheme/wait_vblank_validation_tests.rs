@@ -269,6 +269,10 @@ impl CrtcOff {
     /// parked in the sleep by then sees the pipe go off under it.
     fn after(delay: Duration) -> (Self, std::thread::JoinHandle<()>) {
         let off = std::thread::spawn(move || {
+            // The CRTC goes off under a wait the caller is parked in, so
+            // this runs inside the caller's critical section and cannot
+            // take the lock itself.
+            let _inside = drm::test_globals::join_as_helper();
             std::thread::sleep(delay);
             drm::set_crtc_blanked(true);
         });

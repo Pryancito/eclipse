@@ -6,7 +6,7 @@ use core::time::Duration;
 /// Put the process-global latches back however the body leaves -- or panics
 /// out of -- them, and serialise against every other test that presents.
 struct Restored {
-    _serialised: self::std::sync::MutexGuard<'static, ()>,
+    _serialised: super::test_globals::Held,
 }
 
 impl Drop for Restored {

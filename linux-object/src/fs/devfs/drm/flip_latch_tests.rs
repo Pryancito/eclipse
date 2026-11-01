@@ -251,6 +251,11 @@ fn race_against_delivery<R: Send + 'static>(
         let file = file.clone();
         let entered = entered.clone();
         std::thread::spawn(move || {
+            // This thread runs production code -- a flip, a commit -- while
+            // the test that spawned it is parked in `finish_delivery`. It is
+            // inside that test's critical section and cannot take the lock
+            // itself, so it says so.
+            let _inside = super::test_globals::join_as_helper();
             entered.store(true, Ordering::Release);
             let answer = f(&file);
             (answer, file.has_events())

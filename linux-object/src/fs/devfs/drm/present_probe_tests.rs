@@ -10,7 +10,7 @@ use super::present_counters::bump_bands;
 /// Put the process-global latches back however the body leaves them, and
 /// serialise against every other test that touches them.
 struct Restored {
-    _serialised: self::std::sync::MutexGuard<'static, ()>,
+    _serialised: super::test_globals::Held,
 }
 
 impl Drop for Restored {

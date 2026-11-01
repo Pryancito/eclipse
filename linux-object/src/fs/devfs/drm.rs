@@ -320,6 +320,8 @@ fn deadline_kept_by_plain_pause(deadline_ns: u64, now_ns: u64) -> u64 {
 /// off -- wlroots, Xorg's DPMS -- stops presenting when it does, so the blank
 /// holds exactly as long as it should.
 pub fn set_crtc_blanked(on: bool) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::CRTC_BLANKED");
     if CRTC_BLANKED.swap(on, Ordering::SeqCst) == on {
         return;
     }
@@ -390,6 +392,8 @@ fn wake_crtc_off_queue() {
 /// on along with the un-blank, for the same reason: the frame is on the
 /// panel, so the pipe is what shows it.
 pub fn set_crtc_enabled(on: bool) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::CRTC_ENABLED");
     CRTC_ENABLED.store(on, Ordering::SeqCst);
 }
 
@@ -405,6 +409,8 @@ pub fn crtc_enabled() -> bool {
 /// cmdline flags, and again after a deferred console-GPU bring-up, which can
 /// make a GPU able to present that was not able to when boot decided.
 pub fn set_ce_present_enabled(on: bool) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::CE_PRESENT_ENABLED");
     CE_PRESENT_ENABLED.store(on, Ordering::Relaxed);
 }
 
@@ -441,6 +447,8 @@ static GPU_READY_WAS_READ: AtomicBool = AtomicBool::new(false);
 /// card finished coming up. The order is not visible from either side alone,
 /// which is why it is checked here rather than left to a comment.
 pub fn set_console_bringup_expected(on: bool) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::CONSOLE_BRINGUP_EXPECTED");
     if bringup_declared_too_late(on, gpu_ready_was_read()) {
         kernel_hal::klog_warn!(
             "[drm] /proc/gpuready was read BEFORE the console-GPU bring-up was declared: \
@@ -554,6 +562,8 @@ pub(crate) fn bringup_still_coming(expected: bool, done: bool) -> bool {
 /// present taken during the pause was acknowledged and dropped: see
 /// [`SCANOUT_STALE`].
 pub fn set_scanout_paused(on: bool) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::SCANOUT_PAUSED");
     if !on {
         SCANOUT_PAUSED.store(false, Ordering::SeqCst);
         SCANOUT_PAUSE_DEADLINE_NS.store(0, Ordering::SeqCst);
@@ -644,6 +654,8 @@ pub fn scanout_paused() -> bool {
 /// test at all.
 #[cfg(test)]
 pub(crate) fn set_graphics_vt_for_test(vt: Option<usize>) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::GRAPHICS_VT");
     DRM_STATE.lock().graphics_vt = vt;
 }
 
@@ -691,6 +703,8 @@ static ATOMIC_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 
 /// Enable the atomic uAPI (set once at boot from the `drm.atomic` flag).
 pub fn set_atomic_enabled(on: bool) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::ATOMIC_ENABLED");
     ATOMIC_ENABLED.store(on, Ordering::Relaxed);
 }
 
@@ -715,6 +729,8 @@ static FLIP_FENCE_ENABLED: core::sync::atomic::AtomicBool =
 
 /// Turn the pre-present fence wait off (or back on) for this boot.
 pub fn set_flip_fence_enabled(on: bool) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::FLIP_FENCE_ENABLED");
     FLIP_FENCE_ENABLED.store(on, Ordering::Relaxed);
 }
 
@@ -766,6 +782,8 @@ static CURSOR_FROM_CLIENT: core::sync::atomic::AtomicBool =
 /// Make the software pointer read the client's framebuffer again, black
 /// rectangles and all. See [`CURSOR_FROM_CLIENT`].
 pub fn set_cursor_from_client(on: bool) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::CURSOR_FROM_CLIENT");
     CURSOR_FROM_CLIENT.store(on, Ordering::Relaxed);
 }
 
@@ -776,6 +794,8 @@ pub fn cursor_from_client() -> bool {
 
 /// Turn the present probe on (or back off) for this boot.
 pub fn set_present_probe_enabled(on: bool) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::PRESENT_PROBE_ENABLED");
     PRESENT_PROBE.store(on, Ordering::Relaxed);
 }
 
@@ -837,6 +857,8 @@ static SCANOUT_MODIFIERS: core::sync::atomic::AtomicBool =
 
 /// Turn modifier advertising on (or back off) for this boot.
 pub fn set_scanout_modifiers_enabled(on: bool) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::SCANOUT_MODIFIERS_ENABLED");
     SCANOUT_MODIFIERS.store(on, Ordering::Relaxed);
 }
 
@@ -900,6 +922,8 @@ pub fn block_linear_size(
 
 /// Turn the present repair pass on (or back off) for this boot.
 pub fn set_present_repair_enabled(on: bool) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::PRESENT_REPAIR_ENABLED");
     PRESENT_REPAIR.store(on, Ordering::Relaxed);
 }
 
@@ -939,6 +963,8 @@ static PRESENT_SKIP: AtomicBool = AtomicBool::new(false);
 
 /// Turn the unchanged-band skip on (or back off) for this boot.
 pub fn set_present_skip_enabled(on: bool) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::PRESENT_SKIP_ENABLED");
     PRESENT_SKIP.store(on, Ordering::Relaxed);
     // The state describes what the panel holds, and nothing was tracking it
     // while the switch was off, so an arming boot starts from "nothing known".
@@ -1690,6 +1716,8 @@ pub fn drop_master(minor: u32, file: usize) -> bool {
 /// the master its bus id (`drm_pci_set_busid`), which [`busid_set`] then
 /// reports to `GET_UNIQUE`.
 pub fn set_busid(minor: u32) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::BUSID");
     let mut state = DRM_STATE.lock();
     if !state.busid.contains(&minor) {
         state.busid.push(minor);
@@ -2450,6 +2478,8 @@ static GPU_NODES: Mutex<Vec<GpuNode>> = Mutex::new(Vec::new());
 /// Only the first [`MAX_GPU_NODES`] GPUs get nodes: past that, `card{n}` would
 /// collide with the render range and two GPUs would answer to one minor.
 pub fn build_gpu_nodes() {
+    #[cfg(test)]
+    test_globals::assert_held("drm::GPU_NODES");
     // `card0` is the card the display goes through, not whichever card happens
     // to be first in the registry. [`get_display_driver`] carries the why --
     // in short, there is no udevd here, so `card0` is a name the session is
@@ -2569,6 +2599,8 @@ pub(crate) fn table_sizes_for_test() -> (usize, usize) {
 /// than from drivers this test has already dropped.
 #[cfg(test)]
 pub(crate) fn clear_gpu_nodes_for_test() {
+    #[cfg(test)]
+    test_globals::assert_held("drm::GPU_NODES");
     *GPU_NODES.lock() = Vec::new();
 }
 
@@ -3580,6 +3612,8 @@ pub fn display_mode() -> Option<(u32, u32, u32)> {
 
 /// Bind a framebuffer to the panel's CRTC (the value reported back by GETCRTC).
 pub fn set_crtc_fb(_crtc_id: u32, fb_id: u32) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::CRTC_FB");
     set_crtc_fb_on(PANEL_CARD, fb_id);
 }
 
@@ -3590,6 +3624,8 @@ pub fn crtc_fb() -> u32 {
 
 /// [`set_crtc_fb`] on `card`'s CRTC.
 pub fn set_crtc_fb_on(card: u32, fb_id: u32) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::CRTC_FB");
     DRM_STATE.lock().crtc_fb.set(card, fb_id);
 }
 
@@ -5041,6 +5077,8 @@ static HW_CURSOR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::n
 /// the flag on -- and that path decides whether the pointer is drawn by the CPU
 /// or by the display engine, so "the pointer vanished" had no test either way.
 pub fn set_hw_cursor_enabled(v: bool) {
+    #[cfg(test)]
+    test_globals::assert_held("drm::HW_CURSOR");
     HW_CURSOR.store(if v { 1 } else { 2 }, Ordering::Relaxed);
 }
 
@@ -6517,6 +6555,8 @@ pub fn represent_if_owner_active() -> bool {
 /// Forget the compositor's VT ownership (on DROP_MASTER / compositor exit) so a
 /// subsequent text-only session is never gated off the display or input.
 pub fn clear_graphics_owner() {
+    #[cfg(test)]
+    test_globals::assert_held("drm::GRAPHICS_OWNER");
     DRM_STATE.lock().graphics_vt = None;
 }
 

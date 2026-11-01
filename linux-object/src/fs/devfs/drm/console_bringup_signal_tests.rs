@@ -8,6 +8,15 @@
 //! could move, so both ran out their timeouts -- 25 s of black screen, then
 //! pixman anyway -- and on a box booted with `nvidia.noconsole_gpu` the file
 //! said `waiting` forever about a bring-up nobody had scheduled.
+//!
+//! They take the DRM test lock because the three signals are process-wide,
+//! and two of them are one-way latches. Writing one without the lock lands
+//! the write in whichever test is running in another thread, and the suite
+//! then reports THAT test. The first of these flipped
+//! `CONSOLE_BRINGUP_EXPECTED` to `true` and back with no lock at all, which
+//! is the shape the `lockdep_assert_held` in `drm::test_globals` was added to
+//! catch -- and it caught this one in a SERIAL run, because the assertion
+//! does not need the race to happen.
 
 use super::*;
 
@@ -15,6 +24,7 @@ use super::*;
 /// `/proc/gpuready` saying `waiting` is a promise that it will.
 #[test]
 fn nothing_is_expected_until_a_bring_up_is_scheduled() {
+    let _serialised = super::test_globals::lock();
     set_console_bringup_expected(false);
     assert!(
         !console_bringup_expected(),
@@ -34,6 +44,7 @@ fn nothing_is_expected_until_a_bring_up_is_scheduled() {
 /// A flag that cleared itself would be missed and both ends would wait again.
 #[test]
 fn asking_once_is_remembered() {
+    let _serialised = super::test_globals::lock();
     note_gpu_ready_read();
     assert!(
         gpu_ready_was_read(),
@@ -54,6 +65,7 @@ fn asking_once_is_remembered() {
 /// with the courtesy sleep.
 #[test]
 fn a_parked_client_is_remembered() {
+    let _serialised = super::test_globals::lock();
     note_cold_client_waiting();
     assert!(
         cold_client_waiting(),

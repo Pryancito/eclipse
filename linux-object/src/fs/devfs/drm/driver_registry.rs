@@ -37,6 +37,8 @@ use super::*;
 /// reclaim tests, `/dev/shm` -- which reads as a real regression and is not
 /// one.
 pub fn register_driver(driver: Arc<dyn DrmScheme>) {
+    #[cfg(test)]
+    super::test_globals::assert_held("drm::DRM_STATE.drivers");
     let mut state = DRM_STATE.lock();
     if state.drivers.iter().any(|d| Arc::ptr_eq(d, &driver)) {
         return;
@@ -60,6 +62,8 @@ pub fn register_driver(driver: Arc<dyn DrmScheme>) {
 /// would put every later test on the hardware path.
 #[cfg(test)]
 pub(crate) fn unregister_driver(driver: &Arc<dyn DrmScheme>) -> bool {
+    #[cfg(test)]
+    super::test_globals::assert_held("drm::DRM_STATE.drivers");
     let mut state = DRM_STATE.lock();
     match state.drivers.iter().position(|d| Arc::ptr_eq(d, driver)) {
         Some(pos) => {
