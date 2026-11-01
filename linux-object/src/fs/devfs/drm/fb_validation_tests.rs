@@ -61,6 +61,10 @@ fn addfb_rejects_a_pitch_that_is_not_whole_pixels() {
 /// exist. There was nowhere to import such a fence before.
 #[test]
 fn a_scanout_waits_for_the_writes_imported_onto_its_buffer() {
+    // Signalling a syncobj runs the process-wide point-advance hook, and
+    // that walk prunes the `sync_file` waiter registry on THIS thread --
+    // which is the contract the serial's own comment states. See it.
+    let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
     use zcore_drivers::scheme::{resv, syncobj};
     let _serialised = super::test_globals::lock();
     let phys = 0x9_0000_0000u64;

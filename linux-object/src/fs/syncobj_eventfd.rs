@@ -462,24 +462,89 @@ pub(crate) mod hardware_fence_tests {
         }
     }
 
-    lazy_static::lazy_static! {
-        /// Both tests below drive the same process-wide waiter table, and cargo
-        /// runs them on two threads at once. Without this, one test's `reset()`
-        /// lands between the other's `register` and the signal it is about to
-        /// check for, wiping the waiter: the eventfd is never delivered and the
-        /// assertion reads `0` where it wanted `1`. It failed 9 runs in 60 that
-        /// way, and never once under `--test-threads=1`.
-        ///
-        /// Held for the whole body, not just around `reset`, because every step
-        /// in between touches the same globals.
-        ///
-        /// `pub(crate)`: a test elsewhere in the crate that signals syncobjs
-        /// fires `on_syncobj_signaled` too, once a test here has installed it
-        /// (the hook is process-wide and never uninstalled), and that walk
-        /// delivers a waiter of these tests outside the `WAITERS` lock -- so
-        /// the assertion here could run between the other thread's
-        /// `swap_remove` and its `deliver`. Such a test takes this lock.
-        pub(crate) static ref TEST_SERIAL: Mutex<()> = Mutex::new(());
+    /// The serial itself, with its holder recorded: Linux's
+    /// `lockdep_assert_held`, for the same reason the DRM test lock has one
+    /// (`devfs::drm::test_globals`). The lock only works if EVERY toucher of
+    /// the waiter registry takes it, and a test that registers a waiter
+    /// without it fails a DIFFERENT, innocent test in another thread --
+    /// `standing_down_with_nobody_waiting_leaves_the_poller_idle`, which asks
+    /// `should_tick()` and gets `true` because somebody else's `sync_file`
+    /// waiter is in the process-wide count. The defect is invisible where it
+    /// is and loud where it is not.
+    ///
+    /// [`assert_held`] turns that into a panic on the offender's own thread,
+    /// which libtest names after the offending test -- and a pass EN SERIE
+    /// finds every one of them without needing the race to happen.
+    pub(crate) struct TestSerial;
+
+    /// Both tests below drive the same process-wide waiter table, and cargo
+    /// runs them on two threads at once. Without this, one test's `reset()`
+    /// lands between the other's `register` and the signal it is about to
+    /// check for, wiping the waiter: the eventfd is never delivered and the
+    /// assertion reads `0` where it wanted `1`. It failed 9 runs in 60 that
+    /// way, and never once under `--test-threads=1`.
+    ///
+    /// Held for the whole body, not just around `reset`, because every step
+    /// in between touches the same globals.
+    ///
+    /// `pub(crate)`: a test elsewhere in the crate that signals syncobjs
+    /// fires `on_syncobj_signaled` too, once a test here has installed it
+    /// (the hook is process-wide and never uninstalled), and that walk
+    /// delivers a waiter of these tests outside the `WAITERS` lock -- so
+    /// the assertion here could run between the other thread's
+    /// `swap_remove` and its `deliver`. Such a test takes this lock.
+    pub(crate) static TEST_SERIAL: TestSerial = TestSerial;
+
+    extern crate std;
+
+    static SERIAL: self::std::sync::Mutex<()> = self::std::sync::Mutex::new(());
+
+    /// The thread inside the critical section, if any.
+    static SERIAL_OWNER: self::std::sync::Mutex<Option<self::std::thread::ThreadId>> =
+        self::std::sync::Mutex::new(None);
+
+    fn owner_slot() -> self::std::sync::MutexGuard<'static, Option<self::std::thread::ThreadId>> {
+        // Poison is stepped over on purpose: a test that panics while holding
+        // the serial has already reported its own failure, and turning every
+        // later test of the crate into a poison panic would bury it.
+        SERIAL_OWNER.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What [`TestSerial::lock`] hands back. Releasing it clears the owner.
+    pub(crate) struct Held(#[allow(dead_code)] self::std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            *owner_slot() = None;
+        }
+    }
+
+    impl TestSerial {
+        pub(crate) fn lock(&self) -> Held {
+            let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            *owner_slot() = Some(self::std::thread::current().id());
+            Held(g)
+        }
+    }
+
+    /// Whether this thread is the one inside the critical section.
+    pub(crate) fn held_by_me() -> bool {
+        *owner_slot() == Some(self::std::thread::current().id())
+    }
+
+    /// `lockdep_assert_held`: every write to the process-wide waiter registry
+    /// says its caller took the serial.
+    #[track_caller]
+    pub(crate) fn assert_held(what: &str) {
+        assert!(
+            held_by_me(),
+            "`{what}` was written without \
+             `syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock()`. It is \
+             process-wide, so this breaks whichever test of this crate happens \
+             to be asking about it on another thread -- and the suite reports \
+             that test, not this one. Take the serial for the whole body.",
+            what = what
+        );
     }
 
     fn reset() {

@@ -276,6 +276,10 @@ fn the_fence_scan_and_the_staging_pick_the_same_in_fence() {
 /// table to look in.
 #[test]
 fn an_in_fence_is_a_sync_file_and_nothing_else() {
+    // The `sync_file` waiter registry this test puts an entry in is
+    // process-wide, and the test that asks whether anybody is waiting
+    // runs on another thread. See the serial's own comment.
+    let _serial = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
     use crate::fs::{FileLike, SyncobjHandle};
     let a = zcore_drivers::scheme::syncobj::create(false);
     assert!(zcore_drivers::scheme::syncobj::add_ref(a));
