@@ -8355,6 +8355,24 @@ pub(crate) fn output_state_left_dirty() -> Option<alloc::string::String> {
             out.push(format!("{name}={is} (should be {should})"));
         }
     }
+    // The framebuffer the CRTC has bound, which is the one global
+    // `atomic_commit` INHERITS: `new_fb = upd.plane_fb_id.unwrap_or(crtc_fb())`,
+    // so a request that names no `FB_ID` scans out whatever the last test left
+    // bound. Left naming a framebuffer that is not in the table any more -- or
+    // never was -- the next atomic commit on the panel answers `NotFound` and
+    // the test that gets it did nothing wrong. Which is exactly how
+    // `out_fence_tests` fell 7 runs in 8 at 16 threads while passing alone.
+    let cur = crtc_fb();
+    if cur != 0 {
+        out.push(format!(
+            "crtc_fb={cur:#x} (should be 0{})",
+            if get_fb(cur).is_some() {
+                ""
+            } else {
+                ", and that framebuffer does not even exist"
+            }
+        ));
+    }
     // The watchdog deadline goes with it: armed with the latch already clear,
     // it expires nothing and nobody reads it, but the next
     // `set_scanout_paused_for` of the next test compare-exchanges against a
@@ -8398,6 +8416,9 @@ pub(crate) fn reset_output_state_for_test() {
     SCANOUT_PAUSED.store(false, Ordering::SeqCst);
     SCANOUT_PAUSE_DEADLINE_NS.store(0, Ordering::SeqCst);
     SCANOUT_STALE.store(false, Ordering::SeqCst);
+    // Nothing bound to any CRTC, which is what a fresh boot looks like and
+    // what the next test's atomic commit inherits when it names no `FB_ID`.
+    DRM_STATE.lock().crtc_fb = CardFbs::new();
     // Back to "nobody has said", which is what a fresh process looks like.
     HW_CURSOR.store(0, Ordering::Relaxed);
     // And back to the default boot, where the atomic uAPI is off.
