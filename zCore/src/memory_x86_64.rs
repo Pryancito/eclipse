@@ -1815,6 +1815,94 @@ cfg_if! {
         }
 
 
+        /// The most often [`release_idle_heap`] drains the front caches.
+        const FRONT_CACHE_DRAIN_EVERY_MS: u64 = 10_000;
+        static FRONT_CACHE_DRAINED_AT_MS: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+
+        /// Whether the last drain was long enough ago, claiming this one if
+        /// so: two callers at once get one drain between them.
+        fn front_cache_drain_due() -> bool {
+            let now = kernel_hal::timer::timer_now().as_millis() as u64;
+            let last = FRONT_CACHE_DRAINED_AT_MS.load(Ordering::Relaxed);
+            now.saturating_sub(last) >= FRONT_CACHE_DRAIN_EVERY_MS
+                && FRONT_CACHE_DRAINED_AT_MS
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+        }
+
+        /// Every block the per-CPU front caches hold, back to the buddy.
+        #[cfg(not(feature = "mem-debug"))]
+        fn drain_front_caches() {
+            // `give` takes the heap lock, and the ticket lock is not
+            // reentrant.
+            if HEAP_ALLOCATOR.0.held_by_current_cpu() {
+                return;
+            }
+            slab::drain(|block, size| {
+                // SAFETY: a cached block is one the buddy handed out, of
+                // exactly this class; `size` is its power-of-two size and its
+                // alignment, which is how the buddy rounded it.
+                unsafe {
+                    HEAP_ALLOCATOR.0.lock().dealloc(
+                        NonNull::new_unchecked(block as *mut u8),
+                        Layout::from_size_align_unchecked(size, size),
+                    );
+                }
+            });
+        }
+
+        /// `mem-debug` has no front cache.
+        #[cfg(feature = "mem-debug")]
+        fn drain_front_caches() {}
+
+        /// Take free blocks out of grown regions and give their frames back,
+        /// up to `want` bytes. Answers the bytes given and whether it stopped
+        /// with room left to give but no block that would do.
+        fn release_free_blocks(want: usize) -> (usize, bool) {
+            let arena = HEAP_ARENA_START.load(Ordering::Relaxed);
+            let in_arena = |a: usize| a >= arena && a < arena + KERNEL_HEAP_SIZE;
+            let mut freed = 0;
+            let mut starved = false;
+            while freed < want && heap_grown() > 0 {
+                // An interrupt that lands while this CPU holds the heap lock
+                // and ends up here would wait on itself.
+                if HEAP_ALLOCATOR.0.held_by_current_cpu() {
+                    break;
+                }
+                if HEAP_GROWING.swap(true, Ordering::AcqRel) {
+                    break;
+                }
+                let taken = {
+                    let mut h = HEAP_ALLOCATOR.0.lock();
+                    let room = heap_release_room(h.stats_total_bytes(), h.stats_alloc_actual());
+                    if room < HEAP_RELEASE_MIN {
+                        None
+                    } else {
+                        let t = h.take_free_block(HEAP_RELEASE_MIN, |a, size| {
+                            size <= room && !in_arena(a)
+                        });
+                        starved = t.is_none();
+                        t
+                    }
+                };
+                if let Some((va, size)) = taken {
+                    HEAP_TOTAL.fetch_sub(size, Ordering::Relaxed);
+                    heap_regions::note_released(va, va + size);
+                }
+                HEAP_GROWING.store(false, Ordering::Release);
+                let Some((va, size)) = taken else {
+                    break;
+                };
+                let pa = kernel_hal::mem::virt_to_phys(va);
+                for i in 0..size >> PAGE_BITS {
+                    frame_dealloc(pa + (i << PAGE_BITS));
+                }
+                freed += size;
+            }
+            (freed, starved)
+        }
+
         /// Give free memory in grown regions back to the frame allocator, at
         /// least `want` bytes if there is that much to give, and answer how
         /// much went.
@@ -1831,42 +1919,17 @@ cfg_if! {
         /// `frame_dealloc` takes the frame allocator's lock, and nothing should
         /// wait on the heap behind it.
         pub fn release_idle_heap(want: usize) -> usize {
-            let arena = HEAP_ARENA_START.load(Ordering::Relaxed);
-            let in_arena = |a: usize| a >= arena && a < arena + KERNEL_HEAP_SIZE;
-            let mut freed = 0;
-            while freed < want && heap_grown() > 0 {
-                // An interrupt that lands while this CPU holds the heap lock
-                // and ends up here would wait on itself.
-                if HEAP_ALLOCATOR.0.held_by_current_cpu() {
-                    break;
-                }
-                if HEAP_GROWING.swap(true, Ordering::AcqRel) {
-                    break;
-                }
-                let taken = {
-                    let mut h = HEAP_ALLOCATOR.0.lock();
-                    let room = heap_release_room(h.stats_total_bytes(), h.stats_alloc_actual());
-                    if room < HEAP_RELEASE_MIN {
-                        None
-                    } else {
-                        h.take_free_block(HEAP_RELEASE_MIN, |a, size| {
-                            size <= room && !in_arena(a)
-                        })
-                    }
-                };
-                if let Some((va, size)) = taken {
-                    HEAP_TOTAL.fetch_sub(size, Ordering::Relaxed);
-                    heap_regions::note_released(va, va + size);
-                }
-                HEAP_GROWING.store(false, Ordering::Release);
-                let Some((va, size)) = taken else {
-                    break;
-                };
-                let pa = kernel_hal::mem::virt_to_phys(va);
-                for i in 0..size >> PAGE_BITS {
-                    frame_dealloc(pa + (i << PAGE_BITS));
-                }
-                freed += size;
+            let (mut freed, starved) = release_free_blocks(want);
+            // Room to give back and no block big enough to give: the free
+            // space is in pieces. Part of the reason can be the front caches,
+            // which hold up to ~500 KiB of small blocks per CPU that the buddy
+            // counts as in use and so cannot merge with their free buddies.
+            // Hand them back and look once more. Rate-limited, because the
+            // other part of the reason is usually live objects, which no
+            // drain moves, and a drain costs every CPU its warm cache.
+            if starved && freed < want && front_cache_drain_due() {
+                drain_front_caches();
+                freed += release_free_blocks(want - freed).0;
             }
             if freed > 0 {
                 HEAP_RELEASED_TOTAL.fetch_add(freed, Ordering::Relaxed);
@@ -2308,6 +2371,39 @@ cfg_if! {
             /// Uses `try_lock` instead of `lock` for the same re-entrancy safety
             /// reason as `try_alloc`.
             #[inline]
+            /// Empty every CPU's cache, handing each block to `give` with its
+            /// class size. A cache whose lock is held right now (its CPU is in
+            /// the middle of an alloc or a free) is skipped rather than waited
+            /// on; the next drain gets it.
+            ///
+            /// `give` runs under that cache's lock. Taking the buddy's lock
+            /// there is safe: nothing holds the buddy's lock and then asks for
+            /// a cache's, since both paths use the cache with `try_lock` and
+            /// let go of it before they touch the buddy.
+            pub fn drain(mut give: impl FnMut(usize, usize)) {
+                for cache in SLAB.iter() {
+                    let mut broken = None;
+                    if let Some(mut c) = cache.try_lock() {
+                        'classes: for i in 0..free_lists::NUM_CLASSES {
+                            loop {
+                                match unsafe { c.pop(i, owns) } {
+                                    Ok(Some(block)) => give(block, free_lists::class_size(i)),
+                                    Ok(None) => break,
+                                    Err(b) => {
+                                        broken = Some((b, free_lists::class_size(i)));
+                                        break 'classes;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Off the lock, as in `try_alloc`: the report formats.
+                    if let Some((b, size)) = broken {
+                        super::report_broken_free_block(b, size);
+                    }
+                }
+            }
+
             pub fn try_free(ptr: *mut u8, layout: Layout, rets: [usize; free_ring::DEPTH]) -> Freed {
                 let Some(i) = free_lists::cache_slot(layout) else {
                     return Freed::ToBuddy;
