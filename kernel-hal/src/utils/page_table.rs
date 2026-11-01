@@ -628,6 +628,55 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
         self.intrm_tables.len() * crate::PAGE_SIZE
     }
 
+    fn take_user_tables(&mut self) -> Vec<PhysFrame> {
+        use alloc::collections::BTreeSet;
+        if self.intrm_tables.is_empty() {
+            return Vec::new();
+        }
+        let owned: BTreeSet<PhysAddr> = self.intrm_tables.iter().map(|f| f.paddr()).collect();
+        let mut unlinked = BTreeSet::new();
+        // Tables reachable from `entry` that are ours, the table itself first.
+        // `level` is the entry's own: a level-3 (P1) table holds only leaves.
+        fn collect<PTE: GenericPTE>(
+            entry: &PTE,
+            level: usize,
+            owned: &BTreeSet<PhysAddr>,
+            out: &mut BTreeSet<PhysAddr>,
+        ) -> bool {
+            if level >= 3 || entry.is_leaf() || !entry.is_present() {
+                return false;
+            }
+            let table = entry.addr();
+            if !owned.contains(&table) {
+                return false;
+            }
+            out.insert(table);
+            for e in table_of::<PTE>(table) {
+                collect(e, level + 1, owned, out);
+            }
+            true
+        }
+        let root_level = Self::root_walk_level();
+        let root = table_of_mut::<PTE>(self.table_phys());
+        // The lower half is the user half on every architecture this crate
+        // pages for (x86_64's 0..0x8000_0000_0000, Sv39's lower 256 GiB);
+        // `pt_clone_kernel_space` shares the upper one with the kernel.
+        for entry in root[..ENTRY_COUNT / 2].iter_mut() {
+            if collect(entry, root_level, &owned, &mut unlinked) {
+                entry.clear();
+            }
+        }
+        if unlinked.is_empty() {
+            return Vec::new();
+        }
+        let (taken, kept): (Vec<PhysFrame>, Vec<PhysFrame>) =
+            core::mem::take(&mut self.intrm_tables)
+                .into_iter()
+                .partition(|f| unlinked.contains(&f.paddr()));
+        self.intrm_tables = kept;
+        taken
+    }
+
     fn set_gather(&mut self, on: bool) -> bool {
         if on {
             self.gather += 1;
@@ -969,6 +1018,67 @@ mod walker_tests {
             assert!(test_frames::live_frames() > before);
         }
         assert_eq!(test_frames::live_frames(), before);
+    }
+
+    /// An exited process's tables go back at its teardown, not when it is
+    /// reaped -- and only once the caller lets go of them, after its
+    /// shootdown, so no CPU can still be walking into a recycled frame.
+    #[test]
+    fn the_user_tables_are_handed_back_and_freed_only_when_dropped() {
+        test_frames::install();
+        let before = test_frames::live_frames();
+        let mut pt = Pt4::new();
+        let with_root = test_frames::live_frames();
+        for i in 0..4 {
+            let va = 0x2200_0000_0000 + i * G;
+            pt.map(
+                Page::new_aligned(va, PageSize::Size4K),
+                0x1000 * (i + 1),
+                rw(),
+            )
+            .unwrap();
+            pt.unmap_no_shootdown(va).unwrap();
+        }
+        let tables = pt.table_bytes() / PAGE_SIZE;
+        assert!(tables > 0, "the mappings built no tables");
+        assert_eq!(test_frames::live_frames(), with_root + tables);
+
+        let taken = pt.take_user_tables();
+        assert_eq!(taken.len(), tables, "every table of the user half");
+        assert_eq!(
+            pt.table_bytes(),
+            0,
+            "and the page table no longer counts them"
+        );
+        assert_eq!(
+            test_frames::live_frames(),
+            with_root + tables,
+            "freed before the caller's shootdown"
+        );
+        drop(taken);
+        assert_eq!(test_frames::live_frames(), with_root);
+        assert!(pt.query(0x2200_0000_0000).is_err());
+        // Usable again: a later mapping builds fresh tables.
+        pt.map(Page::new_aligned(0x1000, PageSize::Size4K), 0x5000, rw())
+            .unwrap();
+        assert_eq!(pt.query(0x1000).unwrap().0, 0x5000);
+        drop(pt);
+        assert_eq!(test_frames::live_frames(), before);
+    }
+
+    /// The upper half belongs to the kernel, and a table the root merely points
+    /// at (one this address space did not allocate) is not this one's to free.
+    #[test]
+    fn the_kernel_half_and_tables_it_does_not_own_are_left_alone() {
+        test_frames::install();
+        let mut pt = Pt4::new();
+        let kernel_va = 0xffff_9000_0000_0000;
+        pt.map(Page::new_aligned(kernel_va, PageSize::Size4K), 0x7000, rw())
+            .unwrap();
+        let kernel_tables = pt.table_bytes();
+        assert!(pt.take_user_tables().is_empty());
+        assert_eq!(pt.table_bytes(), kernel_tables);
+        assert_eq!(pt.query(kernel_va).unwrap().0, 0x7000);
     }
 
     #[test]

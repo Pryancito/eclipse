@@ -1334,6 +1334,29 @@ impl VmAddressRegion {
         drop(mappings);
     }
 
+    /// Give back the page-table pages of this address space's user half.
+    ///
+    /// For the final teardown only, after [`clear`](Self::clear) has unmapped
+    /// everything: the tables would otherwise stay until the page table itself
+    /// is dropped, which is when the process is reaped -- so a zombie kept them
+    /// for as long as its parent did not wait. The frames are dropped only
+    /// after the shootdown, so no CPU can still walk into a table that has
+    /// been handed to someone else. A later mapping (nothing makes one in a
+    /// dead address space, but nothing forbids it) builds fresh tables.
+    pub fn release_page_tables(&self) {
+        let (tables, root) = {
+            let mut pt = self.page_table.lock();
+            (pt.take_user_tables(), pt.table_phys())
+        };
+        if tables.is_empty() {
+            return;
+        }
+        // Not under the page-table lock, for the reason `unmap_taken_mappings`
+        // gives: the ack-wait must not run with an IRQ-off lock held.
+        kernel_hal::remote_flush_tlb_aspace(None, Some(root));
+        drop(tables);
+    }
+
     /// Get physical address of the underlying page table.
     pub fn table_phys(&self) -> PhysAddr {
         self.page_table.lock().table_phys()
