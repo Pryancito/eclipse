@@ -29,6 +29,18 @@ use rcore_fs_ramfs::RamFS;
 /// A hold that is somebody else's walk goes away; a hold that is the
 /// parent's own `children` entry never does, which is what this has to
 /// fail on. The bound is what tells them apart.
+///
+/// **Every "the pid went back" assertion in this file goes through here.**
+/// Three of them used to ask `upgrade().is_none()` outright, and that is the
+/// same claim about the whole crate that this function exists to avoid
+/// making: `a_zombie_keeps_its_pid_until_it_is_waited_for` was the one that
+/// failed, at FOUR threads and about one run in three, saying "a reaped child
+/// is never let go" about a reap that had happened microseconds earlier and
+/// whose `Arc` a neighbour's census of `ROOT_JOB` was still holding.
+///
+/// The `is_some()` assertions are left asking outright on purpose: a stray
+/// `Arc` from somebody else's walk can only make `upgrade` succeed, which is
+/// what they want to see, so they cannot be fooled by one.
 fn let_go(weak: &Weak<Process>) -> bool {
     for round in 0..600 {
         if weak.upgrade().is_none() {
@@ -71,7 +83,7 @@ fn a_zombie_keeps_its_pid_until_it_is_waited_for() {
         block_on(wait_child(&parent, pid, true, true)).map(|(status, _)| status),
         Ok(wait_status_exited(0))
     );
-    assert!(child.upgrade().is_none(), "a reaped child is never let go");
+    assert!(let_go(&child), "a reaped child is never let go");
 }
 
 #[test]
@@ -83,7 +95,7 @@ fn so_does_one_a_wait_for_any_child_reaps() {
         block_on(wait_child_any(&parent, true, true)).map(|(id, status, _)| (id, status)),
         Ok((pid, wait_status_exited(0)))
     );
-    assert!(child.upgrade().is_none(), "a reaped child is never let go");
+    assert!(let_go(&child), "a reaped child is never let go");
 }
 
 /// `waitid(WNOWAIT)` looks without reaping: the pid stays worn.
@@ -115,7 +127,10 @@ fn an_adopted_zombie_still_wears_it() {
         block_on(wait_child(&reaper, pid, true, true)).map(|(status, _)| status),
         Ok(wait_status_exited(0))
     );
-    assert!(weak.upgrade().is_none());
+    assert!(
+        let_go(&weak),
+        "the adopted zombie kept its pid after the reap"
+    );
 }
 
 /// And a child nobody will wait for is no zombie at all: with SIGCHLD
