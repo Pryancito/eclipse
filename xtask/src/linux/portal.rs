@@ -14,7 +14,7 @@
 //! What the portal itself does is in `tools/eclipse-dbusd/src/portal.rs`.
 
 use super::LinuxRootfs;
-use crate::PROJECT_DIR;
+use crate::{commands::optional_status, PROJECT_DIR};
 use os_xtask_utils::CommandExt;
 use os_xtask_utils::Ext;
 use std::fs;
@@ -63,11 +63,10 @@ impl LinuxRootfs {
         }
 
         println!("Compiling eclipse-dbusd (Rust, {triple})...");
-        let _ = Ext::new("rustup")
-            .arg("target")
-            .arg("add")
-            .arg(triple)
-            .status();
+        let _ = optional_status(
+            Ext::new("rustup").arg("target").arg("add").arg(triple),
+            "install rustup so the musl target can be added",
+        );
         let mut cargo = Ext::new("cargo");
         cargo
             .current_dir(&dir)

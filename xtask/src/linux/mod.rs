@@ -21,7 +21,11 @@ mod usb_probe;
 mod verify;
 mod xorg;
 
-use crate::{commands::fetch_online, variant::Variant, Arch, PROJECT_DIR, REPOS, TARGET};
+use crate::{
+    commands::{fetch_online, optional_status},
+    variant::Variant,
+    Arch, PROJECT_DIR, REPOS, TARGET,
+};
 use os_xtask_utils::{dir, CommandExt, Ext, Git, Make};
 use std::{
     env,
@@ -1030,20 +1034,22 @@ impl LinuxRootfs {
 
         println!("Compiling thr3 (sysbench barrier regression test)...");
         fs::create_dir_all(&dir).unwrap();
-        let status = Ext::new("gcc")
-            .current_dir(&dir)
-            .arg("-static")
-            .arg("-no-pie")
-            .arg("-nostdlib")
-            .arg("-fno-stack-protector")
-            .arg("-fno-builtin")
-            .arg("-O1")
-            .arg("-DQUICK_TEST")
-            .arg("-o")
-            .arg(&executable)
-            .arg(&source)
-            .status();
-        if !status.success() {
+        let ok = optional_status(
+            Ext::new("gcc")
+                .current_dir(&dir)
+                .arg("-static")
+                .arg("-no-pie")
+                .arg("-nostdlib")
+                .arg("-fno-stack-protector")
+                .arg("-fno-builtin")
+                .arg("-O1")
+                .arg("-DQUICK_TEST")
+                .arg("-o")
+                .arg(&executable)
+                .arg(&source),
+            "install gcc to build the freestanding thread tests",
+        );
+        if !ok {
             eprintln!("warning: failed to compile thr3");
         }
         executable
@@ -2015,16 +2021,18 @@ impl LinuxRootfs {
         println!("Checking apk ({arch}) against Chimera Linux repo...");
         // -N / --timestamping: sólo descarga si el servidor tiene versión más nueva.
         // -q: silencioso excepto errores.  -P: directorio destino.
-        let status = Ext::new("wget")
-            .arg("-N")
-            .arg("-q")
-            .arg("--show-progress")
-            .arg("-P")
-            .arg(&apk_src_dir)
-            .arg(&url)
-            .status();
+        let ok = optional_status(
+            Ext::new("wget")
+                .arg("-N")
+                .arg("-q")
+                .arg("--show-progress")
+                .arg("-P")
+                .arg(&apk_src_dir)
+                .arg(&url),
+            "install wget to refresh the apk static binary",
+        );
 
-        if status.success() {
+        if ok {
             if stored.is_file() {
                 // Asegurarse de que tiene permisos de ejecución.
                 #[cfg(unix)]
@@ -2754,7 +2762,8 @@ impl LinuxRootfs {
                 _ => false,
             };
             if regen {
-                let _ = Ext::new("python3").arg(&gen).current_dir(&dir).status();
+                let gen_hint = "install python3 to regenerate the shader header";
+                let _ = optional_status(Ext::new("python3").arg(&gen).current_dir(&dir), gen_hint);
             }
         }
 
@@ -2930,11 +2939,10 @@ impl LinuxRootfs {
 
         println!("Compiling eclipse-init (Rust, {triple})...");
         // Make sure the userspace musl target is available (best-effort).
-        let _ = Ext::new("rustup")
-            .arg("target")
-            .arg("add")
-            .arg(triple)
-            .status();
+        let _ = optional_status(
+            Ext::new("rustup").arg("target").arg("add").arg(triple),
+            "install rustup so the musl target can be added",
+        );
 
         let mut cargo = Ext::new("cargo");
         cargo
@@ -2980,11 +2988,10 @@ impl LinuxRootfs {
         }
 
         println!("Compiling lunarbg (Rust, {triple})...");
-        let _ = Ext::new("rustup")
-            .arg("target")
-            .arg("add")
-            .arg(triple)
-            .status();
+        let _ = optional_status(
+            Ext::new("rustup").arg("target").arg("add").arg(triple),
+            "install rustup so the musl target can be added",
+        );
         let mut cargo = Ext::new("cargo");
         cargo
             .current_dir(&dir)
@@ -3371,11 +3378,11 @@ impl LinuxRootfs {
             _ => true,
         };
         if needs_build {
-            let media = Ext::new("pkg-config")
-                .arg("--exists")
-                .arg("gstreamer-1.0")
-                .status()
-                .success();
+            // Best-effort: a host with no `pkg-config` falls back to engine-only.
+            let media = optional_status(
+                Ext::new("pkg-config").arg("--exists").arg("gstreamer-1.0"),
+                "install pkg-config and libgstreamer1.0-dev for media support",
+            );
             if media {
                 println!("Compiling silversurfer (host, media-gstreamer)...");
             } else {
@@ -3418,7 +3425,9 @@ impl LinuxRootfs {
                 eprintln!("warning: could not install silversurfer: {err}");
             } else {
                 let _ = fs::remove_file(&stale);
-                let mib = fs::metadata(&dest).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+                let mib = fs::metadata(&dest)
+                    .map(|m| m.len() / (1024 * 1024))
+                    .unwrap_or(0);
                 println!("silversurfer: /usr/bin/silversurfer ({mib} MiB)");
             }
         } else if stale.is_file() {
@@ -3490,11 +3499,10 @@ impl LinuxRootfs {
         }
 
         println!("Compiling lunarbar (Rust, {triple})...");
-        let _ = Ext::new("rustup")
-            .arg("target")
-            .arg("add")
-            .arg(triple)
-            .status();
+        let _ = optional_status(
+            Ext::new("rustup").arg("target").arg("add").arg(triple),
+            "install rustup so the musl target can be added",
+        );
         let mut cargo = Ext::new("cargo");
         cargo
             .current_dir(&dir)
@@ -3986,11 +3994,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         }
 
         println!("Compiling wavplay (Rust, {triple})...");
-        let _ = Ext::new("rustup")
-            .arg("target")
-            .arg("add")
-            .arg(triple)
-            .status();
+        let _ = optional_status(
+            Ext::new("rustup").arg("target").arg("add").arg(triple),
+            "install rustup so the musl target can be added",
+        );
         let mut cargo = Ext::new("cargo");
         cargo
             .current_dir(&dir)
@@ -5833,146 +5840,7 @@ mod apk_arch_tests {
 /// eclipse-init, eclipse-dbusd, wavplay and lunarbar/lunarbg/lunarrun and
 /// said so only in warnings. See `LinuxRootfs::cross_build_env`.
 #[cfg(test)]
-mod cross_linker_tests {
-    use super::*;
-
-    /// The host-native build must keep the exact command line it has always
-    /// used. x86_64-on-x86_64 has been working for the whole life of the tree;
-    /// pointing it at a downloaded cross gcc to fix arm64 would be trading one
-    /// broken arch for another.
-    #[test]
-    fn el_host_nativo_no_toca_el_enlazador() {
-        // A host Eclipse does not target at all (an ARMv7 builder, say) has no
-        // native case to check; it must not fail the suite either.
-        let Ok(host) = std::env::consts::ARCH.parse::<Arch>() else {
-            return;
-        };
-        let rootfs = LinuxRootfs::new(host);
-        assert!(
-            !rootfs.needs_cross_linker(),
-            "{} es el arch del host y no debería necesitar cross",
-            host.name()
-        );
-        let env = rootfs.cross_build_env();
-        assert_eq!(
-            env,
-            vec![("RUSTFLAGS".to_string(), STATIC_RUSTFLAGS.to_string())],
-            "el caso nativo ha dejado de ser el de siempre"
-        );
-    }
-
-    /// And every OTHER arch does need one, which is the actual bug: on this
-    /// x86_64 host `aarch64-unknown-linux-musl` was linked by `/usr/bin/ld`,
-    /// which rejects rustc's `--fix-cortex-a53-843419` outright.
-    #[test]
-    fn los_demas_arcos_si_necesitan_cross() {
-        let host = std::env::consts::ARCH;
-        for arch in [Arch::X86_64, Arch::Aarch64, Arch::Riscv64] {
-            assert_eq!(
-                LinuxRootfs::new(arch).needs_cross_linker(),
-                arch.name() != host,
-                "{} contra un host {host}",
-                arch.name()
-            );
-        }
-    }
-
-    /// The cross case has to ADD the linker, not replace the flags: a tool
-    /// linked PIE would not be the static non-PIE ET_EXEC the Eclipse loader
-    /// and the busybox/apk base expect.
-    #[test]
-    fn el_enlazador_cruzado_no_pisa_el_relocation_model() {
-        let rootfs = LinuxRootfs::new(Arch::Aarch64);
-        let env = rootfs.cross_build_env_with(Some("/toolchain/bin/aarch64-linux-musl-gcc"));
-        let rustflags = env
-            .iter()
-            .find(|(k, _)| k == "RUSTFLAGS")
-            .map(|(_, v)| v.as_str())
-            .expect("RUSTFLAGS");
-        assert!(
-            rustflags.contains("-C relocation-model=static"),
-            "{rustflags:?} ha perdido el relocation-model"
-        );
-        assert!(
-            rustflags.contains("-C linker=/toolchain/bin/aarch64-linux-musl-gcc"),
-            "{rustflags:?} no lleva el enlazador cruzado"
-        );
-    }
-
-    /// cc-rs reads `CC_<triple>` with the dashes turned into UNDERSCORES. With
-    /// the dashes left in, the variable is never read at all and a dependency
-    /// with a C build script goes back to the host compiler -- silently, which
-    /// is exactly the failure mode this batch is about.
-    #[test]
-    fn la_variable_de_cc_va_con_guiones_bajos() {
-        let env = LinuxRootfs::new(Arch::Aarch64).cross_build_env_with(Some("/cc"));
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "CC_aarch64_unknown_linux_musl" && v == "/cc"),
-            "no está CC_aarch64_unknown_linux_musl: {env:?}"
-        );
-        assert!(
-            !env.iter().any(|(k, _)| k.contains('-')),
-            "una variable de entorno con guiones no la lee nadie: {env:?}"
-        );
-    }
-
-    /// No `CC_…` at all in the native case: it would point host build scripts
-    /// at a compiler they must not use.
-    #[test]
-    fn sin_cross_no_se_fija_ningun_compilador() {
-        let env = LinuxRootfs::new(Arch::X86_64).cross_build_env_with(None);
-        assert!(
-            !env.iter().any(|(k, _)| k.starts_with("CC")),
-            "{env:?} fija un compilador sin hacer falta"
-        );
-    }
-
-    /// Every arch, cross or native, links static. riscv64 is the one that
-    /// needs saying: its musl target spec has no `crt-static-default`, so
-    /// before this flag its `/sbin/init` was a dynamic binary that asked the
-    /// rootfs for `_Unwind_*` out of a `libgcc_s.so` nobody ships, exited 127
-    /// and left the arch unbootable.
-    #[test]
-    fn todos_los_arcos_enlazan_estatico() {
-        for arch in [Arch::X86_64, Arch::Aarch64, Arch::Riscv64] {
-            for cc in [None, Some("/toolchain/bin/cross-gcc")] {
-                let env = LinuxRootfs::new(arch).cross_build_env_with(cc);
-                let rustflags = env
-                    .iter()
-                    .find(|(k, _)| k == "RUSTFLAGS")
-                    .map(|(_, v)| v.as_str())
-                    .expect("RUSTFLAGS");
-                assert!(
-                    rustflags.contains("-C target-feature=+crt-static"),
-                    "{} se enlazaria dinamico: {rustflags:?}",
-                    arch.name()
-                );
-            }
-        }
-    }
-
-    /// The recurrence, not the instance. The same `RUSTFLAGS` line was copied
-    /// into five build functions, so the sixth tool would have copied it again
-    /// and arrived with the same broken linker. Nothing may hand `RUSTFLAGS`
-    /// to a command directly any more: the value comes from
-    /// `cross_build_env`, which is the only thing that knows whether a cross
-    /// linker is needed.
-    #[test]
-    fn ninguna_herramienta_arma_su_propio_rustflags() {
-        let src = include_str!("mod.rs");
-        let culprits: Vec<&str> = src
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.contains("env(\"RUSTFLAGS\""))
-            .collect();
-        assert!(
-            culprits.is_empty(),
-            "estas líneas le pasan RUSTFLAGS a un comando a mano en vez de \
-             usar cross_build_env: {culprits:?}"
-        );
-    }
-}
+mod cross_linker_tests;
 
 #[cfg(test)]
 mod rootfs_plumbing_tests;
@@ -5981,48 +5849,7 @@ mod rootfs_plumbing_tests;
 mod hunter_schedule_tests;
 
 #[cfg(test)]
-mod apk_closure_tests {
-    use super::apk_closure_fits_image;
-
-    /// El arco que rompio: su imagen va de `-initrd` en un invitado de 1 GiB.
-    #[test]
-    fn riscv64_no_carga_el_cierre_de_apk() {
-        assert!(
-            !apk_closure_fits_image("riscv64"),
-            "la imagen de riscv64 la carga QEMU en la RAM del invitado (-initrd, -m 1G); \
-             con el cierre del escritorio dentro sale de 1,3 GiB y no arranca"
-        );
-    }
-
-    /// Y el que NO hay que volver a dejar sin paquetes: el #1758 existe por eso.
-    #[test]
-    fn aarch64_si_lo_carga() {
-        assert!(
-            apk_closure_fits_image("aarch64"),
-            "aarch64 monta su imagen por virtio-blk, fuera de la RAM, y su ISO de \
-             escritorio necesita el cierre: dejarla sin el es el bug que arreglo el #1758"
-        );
-    }
-
-    #[test]
-    fn x86_64_si_lo_carga() {
-        assert!(apk_closure_fits_image("x86_64"));
-    }
-
-    /// El techo es de UN arco, no «todo lo que no sea x86_64».
-    #[test]
-    fn no_es_un_corte_por_todo_lo_que_no_sea_x86() {
-        let fuera: Vec<&str> = ["x86_64", "aarch64", "riscv64"]
-            .into_iter()
-            .filter(|a| !apk_closure_fits_image(a))
-            .collect();
-        assert_eq!(
-            fuera,
-            vec!["riscv64"],
-            "solo riscv64 tiene techo de RAM; si aparece otro, que sea con su motivo escrito"
-        );
-    }
-}
+mod apk_closure_tests;
 
 /// The newest modification time of any file under `dir`, recursively.
 fn newest_mtime_under(dir: &Path) -> Option<std::time::SystemTime> {
@@ -6041,38 +5868,4 @@ fn newest_mtime_under(dir: &Path) -> Option<std::time::SystemTime> {
 }
 
 #[cfg(test)]
-mod newest_mtime_tests {
-    use super::newest_mtime_under;
-    use std::fs;
-    use std::time::{Duration, SystemTime};
-
-    /// A file in a subdirectory counts: `main_tests/` and any future
-    /// submodule directory must trigger a rebuild like `src/` itself.
-    #[test]
-    fn a_nested_file_is_found_and_the_newest_wins() {
-        let root = std::env::temp_dir().join(format!("newest-mtime-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("a/b")).unwrap();
-        let old = root.join("top.rs");
-        let new = root.join("a/b/deep.rs");
-        fs::write(&old, "").unwrap();
-        fs::write(&new, "").unwrap();
-        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let t1 = t0 + Duration::from_secs(60);
-        fs::File::options()
-            .write(true)
-            .open(&old)
-            .unwrap()
-            .set_modified(t0)
-            .unwrap();
-        fs::File::options()
-            .write(true)
-            .open(&new)
-            .unwrap()
-            .set_modified(t1)
-            .unwrap();
-        assert_eq!(newest_mtime_under(&root), Some(t1));
-        assert_eq!(newest_mtime_under(&root.join("missing")), None);
-        fs::remove_dir_all(&root).unwrap();
-    }
-}
+mod newest_mtime_tests;

@@ -1,5 +1,14 @@
 # Makefile for top level of zCore
 
+# Los directorios `sbin` NO estan en el PATH de un usuario normal en Debian, y
+# `mkfs.vfat` (dosfstools) vive en `/usr/sbin`. Sin esto, un host con el
+# paquete instalado fallaba igual: `command -v mkfs.vfat` no lo veia y el
+# `make image` moria con "missing `mkfs.vfat` (package: dosfstools)" justo
+# despues de verificar la rootfs. Se anade al final para no tapar nada de lo
+# que el usuario ya tenga delante. Exportado, asi que lo heredan tambien
+# xtask y todo lo que lancen las recetas.
+export PATH := $(PATH):/usr/local/sbin:/usr/sbin:/sbin
+
 HOST_ARCH := $(shell uname -m)
 ifeq ($(HOST_ARCH),arm64)
   HOST_ARCH := aarch64
