@@ -182,7 +182,7 @@ fn run_mid_blit_hook() {
 /// that asserts there is no KMS card must not observe this one. Dropping it
 /// unregisters the display again, including while a panic unwinds.
 pub(crate) struct Screen {
-    _serialised: std::sync::MutexGuard<'static, ()>,
+    _serialised: super::drm::test_globals::Held,
     /// `None` for a [`headless`] guard, which takes the lock without attaching
     /// an output at all.
     dev: Option<Device>,

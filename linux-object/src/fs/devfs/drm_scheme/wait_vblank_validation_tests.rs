@@ -268,7 +268,15 @@ impl CrtcOff {
     /// The CRTC goes off from another thread `after` this call: a wait
     /// parked in the sleep by then sees the pipe go off under it.
     fn after(delay: Duration) -> (Self, std::thread::JoinHandle<()>) {
+        // Read while the caller is the holder: the token proves the helper
+        // belongs to this acquisition and not to whoever holds the lock by
+        // the time the sleep is over.
+        let token = drm::test_globals::acquisition();
         let off = std::thread::spawn(move || {
+            // The CRTC goes off under a wait the caller is parked in, so
+            // this runs inside the caller's critical section and cannot
+            // take the lock itself.
+            let _inside = drm::test_globals::join_as_helper(token);
             std::thread::sleep(delay);
             drm::set_crtc_blanked(true);
         });
