@@ -391,7 +391,14 @@ fn on_syncobj_signaled(_handle: u32, _point: u64) {
 }
 
 /// Wire [`on_syncobj_signaled`] into the syncobj layer's point-advance upcall.
-/// Called once at boot.
+///
+/// The kernel calls this once, through [`init_at_boot`]. A **test** that wants
+/// the real hook calls it directly, and then has to hold
+/// [`hardware_fence_tests::TEST_SERIAL`] for the whole body: the hook is one
+/// word for the whole process, so installing it is writing a global, and
+/// [`set_signal_hook_checked`] says so with an assertion rather than letting
+/// the next test pay for it. Every test in the tree that calls this already
+/// takes the serial on its first line.
 pub fn init() {
     set_signal_hook_checked(on_syncobj_signaled);
 }
