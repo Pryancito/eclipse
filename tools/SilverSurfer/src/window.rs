@@ -135,6 +135,11 @@ pub struct App {
     keyboard: Option<WlKeyboard>,
     pointer: Option<WlPointer>,
     parent_buf: Option<LiveBuf>,
+    /// Second toplevel buffer for the software page. wlroots' pixman
+    /// renderer (Eclipse OS without a GPU) keeps a wl_shm buffer until the
+    /// surface gets another one, so a single buffer is never released and the
+    /// page could not be blitted again after the first commit.
+    parent_back: Option<LiveBuf>,
     chrome_buf: Option<LiveBuf>,
     retired: Vec<LiveBuf>,
     next_buf: u64,
@@ -218,6 +223,7 @@ impl App {
             keyboard: None,
             pointer: None,
             parent_buf: None,
+            parent_back: None,
             chrome_buf: None,
             retired: Vec::new(),
             next_buf: 1,
@@ -451,7 +457,13 @@ impl App {
         ),
         String,
     > {
-        if let Some(context) = self.try_gpu(width, height) {
+        // SILVERSURFER_SOFTWARE=1 skips EGL, so the wl_shm path Eclipse OS
+        // takes under pixman can be reproduced on a Linux desktop with a GPU.
+        let force_software = std::env::var_os("SILVERSURFER_SOFTWARE").is_some();
+        if let Some(context) = (!force_software)
+            .then(|| self.try_gpu(width, height))
+            .flatten()
+        {
             let dyn_context: Rc<dyn RenderingContext> = context.clone();
             return Ok((dyn_context, Some(context), true));
         }
@@ -585,12 +597,14 @@ impl App {
 
     fn blit_page(&mut self, raw: &[u8], src_w: u32, src_h: u32) -> bool {
         let dst_y = (self.chrome_h() * self.scale).max(0) as u32;
+        // A resize in the same dispatch would otherwise blit into the
+        // old-sized buffer, which paint_chrome then replaces with a bare panel.
+        if self.ensure_parent_buffer().is_err() || !self.free_parent_buffer() {
+            return false;
+        }
         let Some(buf) = self.parent_buf.as_mut() else {
             return false;
         };
-        if buf.busy {
-            return false;
-        }
         let stride = (buf.width as usize) * 4;
         let len = buf.mem.len;
         let dst = unsafe { std::slice::from_raw_parts_mut(buf.mem.ptr, len) };
@@ -746,6 +760,51 @@ impl App {
         Ok(())
     }
 
+    /// Leaves a released buffer of the toplevel's size in `parent_buf`,
+    /// swapping in (or allocating) the back buffer when the front one is
+    /// still held by the compositor. `false` when both are held: the page is
+    /// retried once a `wl_buffer.release` arrives.
+    fn free_parent_buffer(&mut self) -> bool {
+        let Some(front) = self.parent_buf.as_ref() else {
+            return false;
+        };
+        if !front.busy {
+            return true;
+        }
+        let (width, height) = (front.width, front.height);
+        let back_fits = self
+            .parent_back
+            .as_ref()
+            .is_some_and(|buf| buf.width == width && buf.height == height);
+        if !back_fits {
+            if let Some(old) = self.parent_back.take() {
+                if old.busy {
+                    self.retired.push(old);
+                }
+            }
+            let Some(shm) = self.shm.clone() else {
+                return false;
+            };
+            let id = self.next_buf;
+            self.next_buf += 1;
+            match alloc_buffer(&shm, &self.qh, width, height, id) {
+                Ok(mut buf) => {
+                    fill_panel(&mut buf, self.look);
+                    self.parent_back = Some(buf);
+                }
+                Err(err) => {
+                    eprintln!("silversurfer: búfer trasero de la página: {err}");
+                    return false;
+                }
+            }
+        }
+        if self.parent_back.as_ref().is_some_and(|buf| buf.busy) {
+            return false;
+        }
+        std::mem::swap(&mut self.parent_buf, &mut self.parent_back);
+        true
+    }
+
     fn commit_parent(&mut self) -> Result<(), String> {
         let Some(surface) = self.parent.clone() else {
             return Ok(());
@@ -773,6 +832,19 @@ impl App {
         let reuse = slot
             .as_ref()
             .is_some_and(|buf| buf.width == width && buf.height == height && !buf.busy);
+        if !reuse && !chrome {
+            // A resize also invalidates the software page's back buffer.
+            if let Some(old) = self.parent_back.take() {
+                if old.busy {
+                    self.retired.push(old);
+                }
+            }
+        }
+        let slot = if chrome {
+            &mut self.chrome_buf
+        } else {
+            &mut self.parent_buf
+        };
         if !reuse {
             if let Some(old) = slot.take() {
                 if old.busy {
@@ -788,7 +860,11 @@ impl App {
     }
 
     fn release_buffer(&mut self, id: u64) {
-        for buf in [&mut self.parent_buf, &mut self.chrome_buf] {
+        for buf in [
+            &mut self.parent_buf,
+            &mut self.parent_back,
+            &mut self.chrome_buf,
+        ] {
             if let Some(live) = buf.as_mut() {
                 if live.id == id {
                     live.busy = false;

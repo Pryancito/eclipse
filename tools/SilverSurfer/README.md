@@ -175,5 +175,9 @@ marca en rojo en lugar de reintentar en bucle.
 
 Arranque: el log incluye `session_ms` hasta tener Servo listo. Con
 `SILVERSURFER_REQUIRE_EGL=1` falla si no hay EGL (sin fallback software).
+`SILVERSURFER_SOFTWARE=1` hace lo contrario: salta EGL y pinta la página en
+software→wl_shm, el camino que toma Eclipse OS con labwc en pixman. Ahí el
+toplevel usa dos búferes: pixman no suelta un `wl_shm` hasta recibir otro, y
+con uno solo la página no se volvía a copiar tras el primer commit.
 El cromo omite el commit Wayland si el contenido no cambió; solo la
 pestaña activa dispara el present de frames.
