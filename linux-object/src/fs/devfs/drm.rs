@@ -8335,7 +8335,16 @@ pub(crate) fn output_state_left_dirty() -> Option<alloc::string::String> {
     for (name, is, should) in [
         ("crtc_blanked", crtc_blanked(), false),
         ("crtc_enabled", crtc_enabled(), true),
-        ("scanout_paused", scanout_paused(), false),
+        // The latch itself, NOT `scanout_paused()`: that reader expires a
+        // watchdogged pause whose deadline has passed, so it would repair the
+        // very state it is asked to diagnose -- and a test that leaves the
+        // pause set would be reported dirty or clean depending on how long the
+        // audit took to run. An audit must not have a clock in it.
+        (
+            "scanout_paused",
+            SCANOUT_PAUSED.load(Ordering::SeqCst),
+            false,
+        ),
         ("atomic_enabled", atomic_enabled(), false),
         ("present_probe_enabled", present_probe_enabled(), false),
         ("cursor_from_client", cursor_from_client(), false),
@@ -8345,6 +8354,16 @@ pub(crate) fn output_state_left_dirty() -> Option<alloc::string::String> {
         if is != should {
             out.push(format!("{name}={is} (should be {should})"));
         }
+    }
+    // The watchdog deadline goes with it: armed with the latch already clear,
+    // it expires nothing and nobody reads it, but the next
+    // `set_scanout_paused_for` of the next test compare-exchanges against a
+    // deadline it did not write.
+    let deadline = SCANOUT_PAUSE_DEADLINE_NS.load(Ordering::SeqCst);
+    if deadline != 0 {
+        out.push(format!(
+            "scanout pause deadline still armed at {deadline} ns"
+        ));
     }
     // And the machine itself. In a test build the boot-time bring-up is a
     // no-op (see `fs::drm_bring_up`), so a card or a `/dev/dri` node still
