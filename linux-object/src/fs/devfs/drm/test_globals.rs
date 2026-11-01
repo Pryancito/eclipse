@@ -56,7 +56,29 @@ pub(crate) struct Held(#[allow(dead_code)] MutexGuard<'static, ()>);
 
 impl Drop for Held {
     fn drop(&mut self) {
+        // The handover. The lock stops two tests from interleaving, but it
+        // does not stop one from leaving a flag flipped for the next holder:
+        // same defect, later clock, and the victim is again whoever runs
+        // next. Checked here so the panic names the test that left it.
+        //
+        // Not while already unwinding: a panic in a drop during a panic
+        // aborts the process and takes the real failure's report with it.
+        // A test that has already failed has been reported.
+        let dirty = super::output_state_left_dirty();
         owners().clear();
+        if let Some(dirty) = dirty {
+            if !self::std::thread::panicking() {
+                panic!(
+                    "the DRM test lock was released with the output state \
+                     left dirty: {dirty}. It is process-wide, so the next \
+                     test to take the lock inherits it and THAT test is the \
+                     one the suite reports. Put it back before releasing -- \
+                     `drm::reset_output_state_for_test()` does the whole lot \
+                     -- or keep the lock until you do.",
+                    dirty = dirty
+                );
+            }
+        }
     }
 }
 
