@@ -30,6 +30,7 @@ default = ["engine", "media-gstreamer"]
 # The Servo engine. Without it the crate still builds its chrome, URL and
 # file-dialog logic, which is what the unit tests exercise.
 engine = [
+    "dep:arboard",
     "dep:dpi",
     "dep:euclid",
     "dep:raw-window-handle",
@@ -52,7 +53,7 @@ embedded-graphics = "0.8"
 # `wl_surface` pointers, which the pure-Rust backend does not expose.
 # `dlopen` loads that library at run time instead of linking it.
 wayland-client = { version = "0.31", features = ["dlopen", "system"] }
-wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 xkbcommon = "0.7"
 
 servo = { version = "0.7", optional = true, default-features = false, features = [
@@ -70,6 +71,10 @@ servo = { version = "0.7", optional = true, default-features = false, features =
     "brotli-compression-stream",
 ] }
 euclid = { version = "0.22", optional = true }
+# System clipboard for pages and the location bar. On Wayland it talks
+# wlr/ext data-control (labwc has both), so it works without keyboard focus
+# serials; without data-control it falls back to X11 and then to memory.
+arboard = { version = "3", optional = true, default-features = false, features = ["wayland-data-control"] }
 dpi = { version = "0.1", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 webrender_api = { version = "0.70", optional = true }

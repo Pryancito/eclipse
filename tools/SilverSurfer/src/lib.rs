@@ -23,6 +23,8 @@ pub mod spawn;
 pub mod wl;
 
 #[cfg(feature = "engine")]
+pub mod clipboard;
+#[cfg(feature = "engine")]
 pub mod engine;
 #[cfg(feature = "engine")]
 pub mod window;

@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::about;
+use crate::clipboard;
 use crate::downloads;
 use crate::files::{self, PickRequest};
 use crate::filter;
@@ -26,12 +27,13 @@ use crate::spawn;
 use dpi::PhysicalSize;
 use euclid::Scale;
 use servo::{
-    ConsoleLogLevel, ContextMenu, ContextMenuAction, ContextMenuItem, DevicePoint, EmbedderControl,
-    EventLoopWaker, InputEvent, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, Location,
-    Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
-    MouseMoveEvent, NavigationRequest, Opts, Preferences, Servo, ServoBuilder, Theme,
-    UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
-    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
+    ClipboardAction, ConsoleLogLevel, ContextMenu, ContextMenuAction, ContextMenuItem, Cursor,
+    DevicePoint, EmbedderControl, EventLoopWaker, InputEvent, JSValue, Key, KeyState,
+    KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton, MouseButtonAction,
+    MouseButtonEvent, MouseLeftViewportEvent, MouseMoveEvent, NavigationRequest, Opts, Preferences,
+    Servo, ServoBuilder, Theme, UserContentManager, UserScript, WebResourceLoad,
+    WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
+    WheelEvent, WheelMode, WindowRenderingContext,
 };
 
 /// Default HTTP / `navigator.userAgent` string.
@@ -255,6 +257,8 @@ pub struct Delegate {
     /// Menú contextual vivo hasta que la ventana elige o cancela.
     pending_menu: RefCell<Option<(ContextMenu, Popup)>>,
     blocked: Cell<usize>,
+    /// Cursor que pidió la pestaña activa (mano en enlaces, I en texto…).
+    cursor: Cell<Cursor>,
     /// Ventana `--private`: no lee ni escribe historial ni contraseñas.
     private: bool,
 }
@@ -357,6 +361,11 @@ impl Drop for Session {
 impl Delegate {
     pub fn flags(&self) -> &Flags {
         &self.flags
+    }
+
+    /// Cursor que la página activa quiere bajo el puntero.
+    pub fn page_cursor(&self) -> Cursor {
+        self.cursor.get()
     }
 
     pub fn set_scale(&self, scale: f32) {
@@ -922,6 +931,14 @@ impl Delegate {
         )));
     }
 
+    /// Copiar / cortar / pegar en la página. Servo 0.7 no lo deduce de la
+    /// tecla: el embutidor manda la acción (como servoshell con Ctrl+C/X/V).
+    pub fn clipboard_action(&self, action: ClipboardAction) {
+        if let Some(view) = self.active_view() {
+            view.notify_input_event(InputEvent::EditingAction(action));
+        }
+    }
+
     pub fn key(&self, down: bool, key: Key, code: servo::Code, mods: Modifiers, repeat: bool) {
         let Some(view) = self.active_view() else {
             return;
@@ -941,6 +958,7 @@ impl Delegate {
     fn make_view(&self, url: Option<url::Url>) -> WebView {
         let mut builder = WebViewBuilder::new(&self.servo_handle(), self.context.clone())
             .delegate(self.this())
+            .clipboard_delegate(Rc::new(clipboard::Delegate))
             .hidpi_scale_factor(Scale::new(self.scale.get()));
         if let Some(manager) = self.user_content.borrow().clone() {
             builder = builder.user_content_manager(manager);
@@ -1179,6 +1197,15 @@ impl WebViewDelegate for Delegate {
         request.allow();
     }
 
+    fn notify_cursor_changed(&self, webview: WebView, cursor: Cursor) {
+        let active = self
+            .active_view()
+            .is_some_and(|view| view.id() == webview.id());
+        if active {
+            self.cursor.set(cursor);
+        }
+    }
+
     fn notify_fullscreen_state_changed(&self, _webview: WebView, is_fullscreen: bool) {
         self.flags
             .page_fullscreen
@@ -1227,6 +1254,7 @@ pub fn start(
         user_content: RefCell::new(None),
         pending_menu: RefCell::new(None),
         blocked: Cell::new(0),
+        cursor: Cell::new(Cursor::Default),
         private,
     });
 
@@ -1245,6 +1273,7 @@ pub fn start(
     let url = shell.expand_url(url);
     let view = WebViewBuilder::new(&servo, context.clone())
         .delegate(shell.clone())
+        .clipboard_delegate(Rc::new(clipboard::Delegate))
         .user_content_manager(user_content)
         .url(url.clone())
         .hidpi_scale_factor(Scale::new(scale.max(1.0)))

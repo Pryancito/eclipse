@@ -149,6 +149,15 @@ impl SchemeHint {
     }
 }
 
+/// Texto pegado en la barra: una sola línea, sin espacios en los extremos.
+/// Copiar una URL de un terminal suele traer `\n` o tabuladores.
+pub fn paste_line(text: &str) -> String {
+    text.trim()
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +285,11 @@ mod tests {
     #[test]
     fn empty_omnibox_is_rejected() {
         assert!(resolve_omnibox("  ", DEFAULT_SEARCH_TEMPLATE).is_err());
+    }
+
+    #[test]
+    fn paste_line_flattens_newlines_and_trims() {
+        assert_eq!(paste_line("  https://a.example/\n"), "https://a.example/");
+        assert_eq!(paste_line("dos\nlíneas\tjuntas"), "dos líneas juntas");
     }
 }
