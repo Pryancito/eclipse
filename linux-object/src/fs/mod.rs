@@ -1653,7 +1653,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // signaled when the syncobj advances (from an ioctl or a driver EXEC
         // completion). Unconditional: the syncobj table exists even on the
         // software-KMS path, and the hook is a no-op until an eventfd registers.
-        syncobj_eventfd::init();
+        syncobj_eventfd::init_at_boot();
 
         // Register DRM drivers from kernel-hal, then decide which GPU owns
         // which `/dev/dri` node. Both are process-wide, so they live in one
