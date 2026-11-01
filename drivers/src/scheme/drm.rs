@@ -266,6 +266,28 @@ pub trait DrmScheme: Scheme {
         Vec::new()
     }
 
+    /// The waits of a nouveau `EXEC` at `arg` that its arm would do on the
+    /// CPU, as `(handles, points)`, so the async syscall path can sleep
+    /// through them before the synchronous arm runs.
+    ///
+    /// The arm cannot sleep (`INode::io_control` is synchronous), so a wait
+    /// it cannot hand the GPU as an ACQUIRE -- another process's fence, which
+    /// on a desktop is the compositor releasing the client's buffer, every
+    /// frame -- spins a core until it lands. Answering here lets the caller
+    /// wait asleep; the arm then finds those syncobjs signaled.
+    ///
+    /// Must be the set the arm itself would CPU-wait, no more: a wait the GPU
+    /// would take as an ACQUIRE has to stay off the CPU, or the submission is
+    /// held back for nothing. `None` (the default) when the request is not
+    /// one the arm would wait on at all -- it refuses it first, or there is
+    /// nothing to wait for -- and the ioctl then behaves exactly as before.
+    ///
+    /// The caller has checked that the request and its wait array are
+    /// readable.
+    fn exec_cpu_waits(&self, _arg: usize, _owner_pid: u64) -> Option<(Vec<u32>, Vec<u64>)> {
+        None
+    }
+
     /// The GPU work that may still be reading or writing `gem_handle`, as
     /// hardware fences a `sync_file` can carry: what
     /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` hands a client that is about to use

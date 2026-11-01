@@ -6141,6 +6141,94 @@ impl DrmScheme for NvidiaGpu {
             .collect()
     }
 
+    fn exec_cpu_waits(&self, arg: usize, owner_pid: u64) -> Option<(Vec<u32>, Vec<u64>)> {
+        use super::nouveau_uapi as nv;
+        // SAFETY: the caller checked `EXEC_REQUEST_BYTES` readable.
+        let req = unsafe { &*(arg as *const nv::DrmNouveauExec) };
+        // The refusals the arm makes before it waits, in its order, made
+        // quietly: the arm says why when it refuses, and this must not wait
+        // for a request it is about to refuse.
+        if req.wait_count == 0
+            || req.wait_ptr == 0
+            || req.wait_count > nv::EXEC_MAX_WAITS
+            || req.sig_count > nv::EXEC_MAX_WAITS
+            || req.push_count > 64
+        {
+            return None;
+        }
+        if !self.nouveau_has_uvmm(owner_pid)
+            || self.exec_channel_check(req.channel, owner_pid).is_err()
+        {
+            return None;
+        }
+        if !user_slice_ok::<nv::DrmNouveauSync>(req.wait_ptr, req.wait_count) {
+            return None;
+        }
+        // SAFETY: the caller checked the array readable, and its length is
+        // in range.
+        let waits = unsafe {
+            core::slice::from_raw_parts(
+                req.wait_ptr as *const nv::DrmNouveauSync,
+                req.wait_count as usize,
+            )
+        };
+        if waits.iter().any(|s| {
+            let t = s.flags & nv::SYNC_TYPE_MASK;
+            t != nv::SYNC_SYNCOBJ && t != nv::SYNC_TIMELINE_SYNCOBJ
+        }) {
+            return None;
+        }
+        let handles: Vec<u32> = waits.iter().map(|s| s.handle).collect();
+        let points: Vec<u64> = waits
+            .iter()
+            .map(|s| {
+                if s.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ {
+                    s.timeline_value
+                } else {
+                    1
+                }
+            })
+            .collect();
+        // `nouveau_syncs_ok`'s two lookups: another process's handle is
+        // ENOENT, and a point nobody submitted EINVAL, both before any wait.
+        if crate::scheme::syncobj::first_unusable_by(
+            file_ctx::pid_of(owner_pid),
+            handles.iter().copied(),
+        )
+        .is_some()
+            || crate::scheme::syncobj::without_fence(&handles, Some(&points)).is_some()
+        {
+            return None;
+        }
+        let device_instance = *self.rm_device_instance.lock();
+        if req.push_count > 0 && device_instance.is_none() {
+            // A real submission with no RM yet: ENODEV, no wait.
+            return None;
+        }
+        let ctx = self.ctx_idx_for_pid(owner_pid);
+        if req.push_count == 0 && ctx >= 1 && nv::ctx_is_wedged(ctx) {
+            // The health probe on a killed channel: ENODEV, no wait.
+            return None;
+        }
+        // The arm's split, on the same inputs: what the GPU can ACQUIRE
+        // stays with the GPU only when the direct-submit path will run (and,
+        // for an empty EXEC, when it has a fence to attach); otherwise every
+        // wait is a CPU wait.
+        let (grouped, cpu_h, cpu_p) = self.partition_exec_waits(&handles, &points, ctx);
+        let with_fence = req.sig_count > 0 && req.sig_ptr != 0;
+        let gpu_takes_some = !grouped.is_empty()
+            && (req.push_count > 0 || with_fence)
+            && device_instance
+                .map(|d| self.fast_ctx_ready(d, ctx))
+                .unwrap_or(false);
+        let (h, p) = if gpu_takes_some {
+            (cpu_h, cpu_p)
+        } else {
+            (handles, points)
+        };
+        (!h.is_empty()).then_some((h, p))
+    }
+
     fn queued_fences(&self, gem_handle: u32) -> Vec<crate::scheme::syncobj::HwFence> {
         // Only a buffer this driver knows: another GPU's handle, or a dumb
         // buffer, has no ring here. The owner is the pid that allocated it,

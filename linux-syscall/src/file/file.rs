@@ -2004,6 +2004,21 @@ impl Syscall<'_> {
                 }
             }
         }
+        // And the waits of a nouveau `EXEC` that the GPU cannot take as an
+        // ACQUIRE -- another process's fence, the compositor releasing the
+        // client's buffer -- which the sync arm otherwise spins on, once a
+        // frame. Same split as the four above.
+        if linux_object::fs::devfs::drm_scheme::is_exec_ioctl(request as u32) {
+            if let Some(file) = file_like.downcast_ref::<File>() {
+                if let Some(dev) = file
+                    .inode()
+                    .as_any_ref()
+                    .downcast_ref::<linux_object::fs::devfs::DrmDev>()
+                {
+                    dev.exec_wait_sleep(request as u32, arg1).await?;
+                }
+            }
+        }
         // And the one wait that is not about the GPU finishing something, but
         // about it having STARTED: `GEM_NEW`/`VM_BIND`/`EXEC` on the card that
         // scans out the console, while the deferred bring-up that attaches its

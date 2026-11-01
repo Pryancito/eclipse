@@ -3889,6 +3889,8 @@ mod pre_wait_account;
 use pre_wait_account::PreWaitAccount;
 /// The wait that keeps the console GPU's bring-up from costing the session.
 mod console_bringup_wait;
+/// The sleep ahead of an `EXEC`'s CPU waits; own file for the size ceiling.
+mod exec_wait_sleep;
 /// The sleep behind a blocking `WAIT_VBLANK`; own file for the size ceiling.
 mod wait_vblank_sleep;
 use legacy_disable_trace::{
@@ -4020,6 +4022,13 @@ pub fn is_syncobj_wait_ioctl(cmd: u32) -> bool {
 /// `linux-syscall` does not link `zcore-drivers`.
 pub fn is_cpu_prep_ioctl(cmd: u32) -> bool {
     zcore_drivers::display::is_cpu_prep_ioctl(cmd)
+}
+
+/// True for nouveau's `EXEC`. Used by `sys_ioctl` to run
+/// [`DrmDev::exec_wait_sleep`] before `io_control`; the recogniser is the
+/// driver's, for the reason given at [`is_cpu_prep_ioctl`].
+pub fn is_exec_ioctl(cmd: u32) -> bool {
+    zcore_drivers::display::is_exec_ioctl(cmd)
 }
 
 /// ioctl NUMBERs of the two syncobj waits. Both structs grew a trailing

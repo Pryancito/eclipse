@@ -9345,6 +9345,10 @@ mod vm_bind_tests;
 /// same reason.
 mod exec_tests;
 
+/// What the async pre-wait sleeps through ahead of an EXEC: same harness,
+/// own file, same reason.
+mod exec_cpu_waits_tests;
+
 /// The buffer's reservation (imported fences, ring probes): same harness,
 /// own file, same reason.
 mod resv_tests;
