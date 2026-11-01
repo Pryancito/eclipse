@@ -31,6 +31,11 @@ use kernel_hal::timer::timer_now;
 /// 100 ms watchdog; this is the watchdog without the waitqueue.
 const PERIOD_MS: u64 = 200;
 
+/// The most spare kernel heap one pass gives back. Each page is one
+/// `frame_dealloc`, so this bounds the pass at 16 384 of them; at one pass
+/// every [`PERIOD_MS`] that is still 320 MiB a second.
+const HEAP_RELEASE_PER_PASS: usize = 64 * 1024 * 1024;
+
 /// Free memory under this share of the total is what the worker reclaims ahead
 /// of a failure, in percent. Linux's `min_free_kbytes` works out to about 1 %
 /// of RAM for a small machine and less for a large one; 5 % here because a
@@ -113,6 +118,20 @@ pub fn start() {
         }
         loop {
             kernel_hal::thread::sleep_until(timer_now() + Duration::from_millis(PERIOD_MS)).await;
+            // Before the figures are read, so a pass that gave memory back
+            // sees it as free. Not tied to the watermark: memory the heap
+            // grew into and no longer uses goes back to the frame allocator
+            // as soon as it is spare, which is what lets a program that
+            // exits give back all it took. One relaxed load when the heap
+            // never grew. Bounded per pass, so a gigabyte to give back is
+            // spread over a few seconds rather than held in one tick.
+            let released = crate::memory::release_idle_heap(HEAP_RELEASE_PER_PASS);
+            if released > 0 {
+                log::info!(
+                    "reclaimd: gave {} KiB of spare kernel heap back to the frame allocator",
+                    released / 1024
+                );
+            }
             let (used, total) = crate::memory::stats();
             let freed = pass(used, total);
             if out_of_memory(used, total, freed) {

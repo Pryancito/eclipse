@@ -659,6 +659,21 @@ fn combined_stats(
     )
 }
 
+/// What the kernel heap keeps after it gives growth back: the buddy's bytes
+/// in use stay at or below this share of its total. Growth starts at 70 %
+/// (`HEAP_GROW_AT_PCT`), so a heap released down to here has 20 points of
+/// headroom before it grows again, and a load that sits near the line does
+/// not take and give back the same chunk on every pass.
+const HEAP_RELEASE_KEEP_PCT: usize = 50;
+
+/// How much of a heap of `total` bytes can go while keeping `in_use` at or
+/// below [`HEAP_RELEASE_KEEP_PCT`] of what is left. Out here rather than next
+/// to the release so that the host tests can reach it.
+#[cfg_attr(feature = "libos", allow(dead_code))]
+fn heap_release_room(total: usize, in_use: usize) -> usize {
+    total.saturating_sub(in_use.saturating_mul(100) / HEAP_RELEASE_KEEP_PCT)
+}
+
 /// Kernel heap bytes currently allocated (diagnostics / OOM handler).
 #[allow(dead_code)]
 pub fn heap_used() -> usize {
@@ -1751,11 +1766,138 @@ cfg_if! {
             true
         }
 
+        // ── Giving the growth back ──────────────────────────────────────────
+        //
+        // Growth used to be one way. A desktop client that put 600 MiB of
+        // memfd and tmpfs content into the heap made it take that much RAM
+        // from the frame allocator, and when the client exited the bytes were
+        // free *in the heap* and nowhere else: no user page could be committed
+        // from them, and `/proc/meminfo` counted them as free memory the
+        // machine could not actually hand out. Closing the program did not
+        // give its memory back.
+        //
+        // So once the heap has room to spare, free blocks that lie in a grown
+        // region leave the buddy and their frames go back to the frame
+        // allocator. Linux's slab gives an empty slab page back the same way;
+        // the unit here is a buddy block of at least [`HEAP_RELEASE_MIN`],
+        // since every block the buddy holds is aligned to its size and so a
+        // block that size is whole pages.
+
+        /// The smallest block worth giving back. Smaller ones would chop the
+        /// grown regions into holes the buddy can no longer merge across, for
+        /// a few pages each.
+        const HEAP_RELEASE_MIN: usize = 256 * 1024;
+        const _: () = assert!(HEAP_RELEASE_MIN >= 1 << PAGE_BITS);
+
+        const _: () = assert!(HEAP_RELEASE_KEEP_PCT < HEAP_GROW_AT_PCT);
+
+        /// Where the static arena starts, which is never given back: it is
+        /// `.bss`, not frames the frame allocator owns.
+        static HEAP_ARENA_START: AtomicUsize = AtomicUsize::new(0);
+        /// Bytes given back since boot, for `/proc/kheap` readers.
+        static HEAP_RELEASED_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+        pub fn heap_released_total() -> usize {
+            HEAP_RELEASED_TOTAL.load(Ordering::Relaxed)
+        }
+
+        /// Bytes a release could give back if the free blocks sat just right:
+        /// the room above [`HEAP_RELEASE_KEEP_PCT`], capped by what was grown.
+        pub fn heap_releasable() -> usize {
+            let grown = heap_grown();
+            if grown == 0 {
+                return 0;
+            }
+            let Some(h) = HEAP_ALLOCATOR.0.try_lock() else {
+                return 0;
+            };
+            heap_release_room(h.stats_total_bytes(), h.stats_alloc_actual()).min(grown)
+        }
+
+
+        /// Give free memory in grown regions back to the frame allocator, at
+        /// least `want` bytes if there is that much to give, and answer how
+        /// much went.
+        ///
+        /// Each block is taken under `HEAP_GROWING`, so a release never races
+        /// a growth: both write the region registry and `HEAP_TOTAL`. A growth
+        /// already running means the heap is short, which is no time to give
+        /// memory away, so that ends the release instead of waiting. The flag
+        /// is dropped again before the block's frames are freed, which is the
+        /// slow part: a heap allocation that fails meanwhile on another CPU
+        /// must be able to grow, or it ends the machine.
+        ///
+        /// The heap lock, likewise, is held only while the block is picked:
+        /// `frame_dealloc` takes the frame allocator's lock, and nothing should
+        /// wait on the heap behind it.
+        pub fn release_idle_heap(want: usize) -> usize {
+            let arena = HEAP_ARENA_START.load(Ordering::Relaxed);
+            let in_arena = |a: usize| a >= arena && a < arena + KERNEL_HEAP_SIZE;
+            let mut freed = 0;
+            while freed < want && heap_grown() > 0 {
+                // An interrupt that lands while this CPU holds the heap lock
+                // and ends up here would wait on itself.
+                if HEAP_ALLOCATOR.0.held_by_current_cpu() {
+                    break;
+                }
+                if HEAP_GROWING.swap(true, Ordering::AcqRel) {
+                    break;
+                }
+                let taken = {
+                    let mut h = HEAP_ALLOCATOR.0.lock();
+                    let room = heap_release_room(h.stats_total_bytes(), h.stats_alloc_actual());
+                    if room < HEAP_RELEASE_MIN {
+                        None
+                    } else {
+                        h.take_free_block(HEAP_RELEASE_MIN, |a, size| {
+                            size <= room && !in_arena(a)
+                        })
+                    }
+                };
+                if let Some((va, size)) = taken {
+                    HEAP_TOTAL.fetch_sub(size, Ordering::Relaxed);
+                    heap_regions::note_released(va, va + size);
+                }
+                HEAP_GROWING.store(false, Ordering::Release);
+                let Some((va, size)) = taken else {
+                    break;
+                };
+                let pa = kernel_hal::mem::virt_to_phys(va);
+                for i in 0..size >> PAGE_BITS {
+                    frame_dealloc(pa + (i << PAGE_BITS));
+                }
+                freed += size;
+            }
+            if freed > 0 {
+                HEAP_RELEASED_TOTAL.fetch_add(freed, Ordering::Relaxed);
+                if HEAP_GROW_LOG {
+                    emit(format_args!(
+                        "\n[heap-grow] -{} KiB back to physical RAM (heap now {} MiB)\n",
+                        freed >> 10,
+                        heap_total() >> 20,
+                    ));
+                }
+            }
+            freed
+        }
+
+        /// The release as a cache the reclaim paths can ask: a frame
+        /// allocation that fails, and `drop_caches`, then get the heap's spare
+        /// growth back as well. It never answers for the heap's own failures:
+        /// a heap that is short has no room above its keep line, so `count`
+        /// and `scan` both come back 0 there.
+        static HEAP_SHRINKER: kernel_hal::shrinker::Shrinker = kernel_hal::shrinker::Shrinker {
+            name: "kernel heap growth",
+            count: heap_releasable,
+            scan: release_idle_heap,
+        };
+
         pub fn init() {
             const MACHINE_ALIGN: usize = core::mem::size_of::<usize>();
             const HEAP_BLOCK: usize = KERNEL_HEAP_SIZE / MACHINE_ALIGN;
             static mut HEAP: [usize; HEAP_BLOCK] = [0; HEAP_BLOCK];
             let heap_start = (&raw const HEAP).cast::<u8>() as usize;
+            HEAP_ARENA_START.store(heap_start, Ordering::Relaxed);
             // Tell the allocator which addresses are actually its own, so a
             // free of anything else is refused instead of corrupting the free
             // lists. Before `init`, for the same reason as in
@@ -1772,6 +1914,9 @@ cfg_if! {
             // and must be leaked, not dispatched. See
             // `zcore_drivers::utils::fat_ptr`.
             kernel_hal::drivers::utils::set_vtable_max(heap_start);
+            if !kernel_hal::shrinker::register(&HEAP_SHRINKER) {
+                crate::klog_info!("memory: shrinker registry full, heap growth is given back only by reclaimd");
+            }
             crate::klog_info!(
                 "memory: kernel heap ready ({} KiB @ {:#x}), vtable ceiling registered",
                 KERNEL_HEAP_SIZE / 1024,
@@ -2445,6 +2590,21 @@ cfg_if! {
             0
         }
 
+        #[allow(dead_code)]
+        pub fn heap_released_total() -> usize {
+            0
+        }
+
+        #[allow(dead_code)]
+        pub fn heap_releasable() -> usize {
+            0
+        }
+
+        /// No heap of our own under `libos`, so nothing grown to give back.
+        pub fn release_idle_heap(_want: usize) -> usize {
+            0
+        }
+
         /// No kernel heap of our own under `libos`: the host allocator is not
         /// a lock this kernel can be inside. Unused there -- the fault paths
         /// that ask are bare-metal only -- and kept so the two arms of the
@@ -2858,8 +3018,8 @@ pub mod heap_regions {
     /// short of memory. A `const` assertion next to the growth policy ties
     /// this number to those chunk sizes, so it cannot silently fall behind.
     ///
-    /// At two words a region this is 16 KiB of `.bss`, which is the cheapest
-    /// part of the bargain.
+    /// At three words a region this is 24 KiB of `.bss`, which is the
+    /// cheapest part of the bargain.
     pub const MAX_REGIONS: usize = 1024;
 
     static STARTS: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
@@ -2870,6 +3030,9 @@ pub mod heap_regions {
     /// Slots that are fully written. Readers never look past this.
     static COUNT: AtomicUsize = AtomicUsize::new(0);
     static UNREGISTERED: AtomicUsize = AtomicUsize::new(0);
+    /// Bytes of each region the heap has given back to the frame allocator.
+    /// See [`note_released`].
+    static RELEASED: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
     /// The region that answered last. Every free runs through [`contains`], so
     /// the common case -- block after block out of the same region -- is two
     /// comparisons instead of a walk over every region the heap has grown.
@@ -2905,9 +3068,27 @@ pub mod heap_regions {
     /// Called from `init` for the static arena and from the elastic growth
     /// right where it hands the frames to the buddy. A region that does not
     /// fit is counted, not dropped: see [`check`].
+    ///
+    /// A slot that [`note_released`] emptied is used again before a new one
+    /// is taken: the heap can grow, give the growth back and grow again for
+    /// as long as the machine runs, and taking a fresh slot each time would
+    /// fill the registry and turn the guard off. Callers are serialised (the
+    /// heap's growth and its release both run under `HEAP_GROWING`, and
+    /// `init` runs before either), so two of them never pick the same empty
+    /// slot.
     pub fn register(start: usize, end: usize) {
         if end <= start {
             return;
+        }
+        for i in 0..registered() {
+            if STARTS[i].load(Ordering::SeqCst) == 0 {
+                RELEASED[i].store(0, Ordering::SeqCst);
+                // End first, as below: the slot reads as empty until the
+                // start lands, and then as the complete new pair.
+                ENDS[i].store(end, Ordering::SeqCst);
+                STARTS[i].store(start, Ordering::SeqCst);
+                return;
+            }
         }
         let slot = RESERVED.fetch_add(1, Ordering::SeqCst);
         if slot >= MAX_REGIONS {
@@ -2929,6 +3110,41 @@ pub mod heap_regions {
         {
             core::hint::spin_loop();
         }
+    }
+
+    /// Record that `[start, end)` went back to the frame allocator, and
+    /// forget every region that has now been given back whole. Answers how
+    /// many regions were forgotten.
+    ///
+    /// A region given back only in part stays on record, holes and all: the
+    /// registry has one range per region, and splitting it would take slots
+    /// a growth may need. The cost is that a wild free into a hole is not
+    /// called wild, which is the same blind spot the guard has for a free
+    /// into a part of the heap that is merely unused.
+    ///
+    /// The range may cover more than one region: two growths can be
+    /// physically adjacent, and the buddy then merges blocks across them.
+    /// Serialised with [`register`], for the same reason.
+    pub fn note_released(start: usize, end: usize) -> usize {
+        let mut forgotten = 0;
+        for i in 0..registered() {
+            let s = STARTS[i].load(Ordering::SeqCst);
+            if s == 0 {
+                continue;
+            }
+            let e = ENDS[i].load(Ordering::SeqCst);
+            let (lo, hi) = (start.max(s), end.min(e));
+            if lo >= hi {
+                continue;
+            }
+            let gone = RELEASED[i].fetch_add(hi - lo, Ordering::SeqCst) + (hi - lo);
+            if gone >= e - s {
+                STARTS[i].store(0, Ordering::SeqCst);
+                RELEASED[i].store(0, Ordering::SeqCst);
+                forgotten += 1;
+            }
+        }
+        forgotten
     }
 
     /// Whether `[addr, addr + size)` lies inside one region.
@@ -3072,13 +3288,14 @@ pub mod heap_regions {
     /// chunks prints the first of them and says how many it did not.
     pub const SNAPSHOT: usize = 64;
 
-    /// Forget every region. Tests only — the heap's regions are never given
-    /// back while the kernel runs.
+    /// Forget every region. Tests only: while the kernel runs, a region is
+    /// forgotten only once [`note_released`] has seen all of it given back.
     #[cfg(test)]
     pub(super) fn reset() {
         for i in 0..MAX_REGIONS {
             STARTS[i].store(0, Ordering::SeqCst);
             ENDS[i].store(0, Ordering::SeqCst);
+            RELEASED[i].store(0, Ordering::SeqCst);
         }
         COUNT.store(0, Ordering::SeqCst);
         RESERVED.store(0, Ordering::SeqCst);

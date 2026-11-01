@@ -51,6 +51,9 @@ members = [
     # EclipseFS: the on-disk filesystem ported from eclipse-old's
     # `eclipsefs-lib`, with the same interface as `vendor/btrfs-rs`.
     "vendor/eclipsefs-rs",
+    # The kernel heap's buddy allocator: crates.io 0.8.0 plus
+    # `Heap::take_free_block`, so the heap can give grown memory back.
+    "vendor/buddy_system_allocator",
     "hunter",
     # Host-testable cmdline parsers extracted from zCore (binary stays test=false).
     "zcore-boot-opts",
@@ -100,6 +103,10 @@ time-core = { git = "https://github.com/time-rs/time", tag = "v0.3.36" }
 # región apuntada por GSBASE (estilo ProcessorControlRegion de Redox), para
 # acceder al PercpuBlock por registro en lugar de indexar arrays por CPU id.
 trapframe = { path = "vendor/trapframe" }
+# buddy_system_allocator 0.8.0 plus `Heap::take_free_block`: the kernel heap
+# grows by taking chunks of RAM, and without a way to take a free block back
+# out of the buddy that memory never went back to the frame allocator.
+buddy_system_allocator = { path = "vendor/buddy_system_allocator" }
 
 [patch."https://github.com/smoltcp-rs/smoltcp"]
 smoltcp = { path = "./smoltcp" }

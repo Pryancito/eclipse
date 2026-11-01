@@ -284,3 +284,97 @@ fn an_empty_region_is_not_recorded() {
     heap_regions::register(0x2000, 0x1000);
     assert_eq!(heap_regions::registered(), 0);
 }
+
+const GROWTH: usize = 0xffff_8002_0000_0000;
+const CHUNK: usize = 32 * 1024 * 1024;
+
+/// A growth given back in part stays on record: a block still in use in the
+/// rest of it must keep passing.
+#[test]
+fn a_region_given_back_in_part_is_still_the_heaps() {
+    let _alone = alone();
+    with_arena();
+    heap_regions::register(GROWTH, GROWTH + CHUNK);
+    assert_eq!(heap_regions::note_released(GROWTH, GROWTH + CHUNK / 2), 0);
+    assert_eq!(heap_regions::check(GROWTH + CHUNK - 64, 64, 8), None);
+    assert_eq!(heap_regions::registered(), 2);
+}
+
+/// Given back whole, piece by piece, it is forgotten: a free into it now is
+/// a free into memory the frame allocator owns, and must be called wild.
+#[test]
+fn a_region_given_back_whole_is_forgotten() {
+    let _alone = alone();
+    with_arena();
+    heap_regions::register(GROWTH, GROWTH + CHUNK);
+    let quarter = CHUNK / 4;
+    for i in 0..3 {
+        let at = GROWTH + i * quarter;
+        assert_eq!(heap_regions::note_released(at, at + quarter), 0);
+    }
+    let last = GROWTH + 3 * quarter;
+    assert_eq!(heap_regions::note_released(last, last + quarter), 1);
+    assert_eq!(
+        heap_regions::check(GROWTH + 64, 64, 8),
+        Some(BlockFault::Outside)
+    );
+    assert_eq!(
+        heap_regions::check(ARENA + 64, 64, 8),
+        None,
+        "the arena stays"
+    );
+}
+
+/// The slot a forgotten region leaves is the next growth's, so a heap that
+/// grows and gives back for as long as the machine runs never fills the
+/// registry and never turns the guard off.
+#[test]
+fn growing_and_giving_back_forever_does_not_fill_the_registry() {
+    let _alone = alone();
+    with_arena();
+    for round in 0..(heap_regions::MAX_REGIONS * 3) {
+        let base = GROWTH + (round % 7) * CHUNK;
+        heap_regions::register(base, base + CHUNK);
+        assert_eq!(heap_regions::check(base + 64, 64, 8), None);
+        assert_eq!(heap_regions::note_released(base, base + CHUNK), 1);
+    }
+    assert_eq!(heap_regions::registered(), 2);
+    assert_eq!(heap_regions::unregistered(), 0);
+}
+
+/// Two growths that are neighbours in physical memory: the buddy merges free
+/// blocks across them, so one block given back covers part of each.
+#[test]
+fn a_block_across_two_adjacent_growths_counts_for_both() {
+    let _alone = alone();
+    with_arena();
+    heap_regions::register(GROWTH, GROWTH + CHUNK);
+    heap_regions::register(GROWTH + CHUNK, GROWTH + 2 * CHUNK);
+    assert_eq!(
+        heap_regions::note_released(GROWTH + CHUNK / 2, GROWTH + CHUNK + CHUNK / 2),
+        0
+    );
+    assert_eq!(heap_regions::note_released(GROWTH, GROWTH + CHUNK / 2), 1);
+    assert_eq!(
+        heap_regions::check(GROWTH + 64, 64, 8),
+        Some(BlockFault::Outside)
+    );
+    assert_eq!(
+        heap_regions::check(GROWTH + 2 * CHUNK - 64, 64, 8),
+        None,
+        "the second growth is only half given back"
+    );
+}
+
+#[test]
+fn the_heap_keeps_half_of_itself_free_after_a_release() {
+    use super::heap_release_room as room;
+    const MIB: usize = 1024 * 1024;
+    // 600 MiB of a 1 GiB heap in use: nothing to give.
+    assert_eq!(room(1024 * MIB, 600 * MIB), 0);
+    // A client exited and 100 MiB is in use: down to 200 MiB, no lower.
+    assert_eq!(room(1024 * MIB, 100 * MIB), 824 * MIB);
+    // Right at the line, and an empty heap.
+    assert_eq!(room(512 * MIB, 256 * MIB), 0);
+    assert_eq!(room(0, 0), 0);
+}
