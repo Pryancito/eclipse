@@ -112,6 +112,50 @@ const PASADOS: &[(&str, usize)] = &[
     // quién arranca cada wrapper, y lo que lo satisfacía era el texto de los
     // tests que ahora están fuera.
     ("xtask/src/linux/mod.rs", 6000),
+    // VENDOR, no es codigo nuestro: `tools/SilverSurfer/vendor/servo-script`
+    // es el arbol de Servo que entro el 1-nov-2026 con SilverSurfer. Nueve de
+    // sus ficheros pasan del techo general y enrojecian este test en TODOS los
+    // PRs. Partirlos no es una opcion: son upstream, y cada division cuesta un
+    // conflicto en la siguiente actualizacion del vendor. Van apuntados al
+    // siguiente multiplo de 250 por encima de su tamano de hoy, que es lo que
+    // impide que crezcan sin que se vea. **La regla de partir sigue valiendo
+    // para todo lo que escribimos nosotros.**
+    (
+        "tools/SilverSurfer/vendor/servo-script/dom/document/document.rs",
+        7500,
+    ),
+    (
+        "tools/SilverSurfer/vendor/servo-script/dom/element/element.rs",
+        5750,
+    ),
+    (
+        "tools/SilverSurfer/vendor/servo-script/dom/html/embedded_content/htmlmediaelement.rs",
+        4750,
+    ),
+    (
+        "tools/SilverSurfer/vendor/servo-script/dom/node/node.rs",
+        4750,
+    ),
+    (
+        "tools/SilverSurfer/vendor/servo-script/dom/webcrypto/subtlecrypto.rs",
+        7000,
+    ),
+    (
+        "tools/SilverSurfer/vendor/servo-script/dom/webgl/webgl2renderingcontext.rs",
+        5250,
+    ),
+    (
+        "tools/SilverSurfer/vendor/servo-script/dom/webgl/webglrenderingcontext.rs",
+        5500,
+    ),
+    (
+        "tools/SilverSurfer/vendor/servo-script/dom/window/window.rs",
+        4500,
+    ),
+    (
+        "tools/SilverSurfer/vendor/servo-script/event_loop/script_thread.rs",
+        5000,
+    ),
     // 7000: master llego a 6753 con el techo en 6750, asi que el trinquete
     // estaba rojo antes de esta tanda y no por ella. 7250: la busqueda por
     // tarjeta del nodo (multi-GPU) lo dejo en 7025; mismo caso que drm.rs.
