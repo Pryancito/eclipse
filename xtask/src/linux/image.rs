@@ -458,16 +458,12 @@ impl super::LinuxRootfs {
             // checks, and the same advice, as the `iso` target in the root
             // Makefile. Only this arch builds an EFI image, which is why
             // aarch64 and riscv64 never needed them.
-            for (tool, package) in [
+            let [mkfs_vfat, mmd, mcopy] = [
                 ("mkfs.vfat", "dosfstools"),
                 ("mmd", "mtools"),
                 ("mcopy", "mtools"),
-            ] {
-                let found = std::env::var_os("PATH").is_some_and(|paths| {
-                    std::env::split_paths(&paths).any(|dir| dir.join(tool).is_file())
-                });
-                assert!(found, "missing `{tool}` (package: {package})");
-            }
+            ]
+            .map(|(tool, package)| find_host_tool(tool, package));
 
             let rootfs_path = self.path();
             let boot_dir = rootfs_path.join("boot");
@@ -621,7 +617,7 @@ impl super::LinuxRootfs {
             file.set_len(efi_fat_bytes as u64).unwrap();
             drop(file);
 
-            let status = std::process::Command::new("mkfs.vfat")
+            let status = std::process::Command::new(&mkfs_vfat)
                 .arg("-F")
                 .arg("32")
                 .arg(&efi_img)
@@ -629,7 +625,7 @@ impl super::LinuxRootfs {
                 .unwrap();
             assert!(status.success(), "Failed to format efi.img");
 
-            let status = std::process::Command::new("mmd")
+            let status = std::process::Command::new(&mmd)
                 .arg("-i")
                 .arg(&efi_img)
                 .arg("::/EFI")
@@ -639,7 +635,7 @@ impl super::LinuxRootfs {
                 .unwrap();
             assert!(status.success(), "Failed to create EFI directories");
 
-            let status = std::process::Command::new("mcopy")
+            let status = std::process::Command::new(&mcopy)
                 .arg("-i")
                 .arg(&efi_img)
                 .arg(&rboot_efi)
@@ -648,7 +644,7 @@ impl super::LinuxRootfs {
                 .unwrap();
             assert!(status.success(), "Failed to copy BootX64.efi");
 
-            let status = std::process::Command::new("mcopy")
+            let status = std::process::Command::new(&mcopy)
                 .arg("-i")
                 .arg(&efi_img)
                 .arg(&rboot_conf)
@@ -657,7 +653,7 @@ impl super::LinuxRootfs {
                 .unwrap();
             assert!(status.success(), "Failed to copy rboot.conf");
 
-            let status = std::process::Command::new("mcopy")
+            let status = std::process::Command::new(&mcopy)
                 .arg("-i")
                 .arg(&efi_img)
                 .arg(&zcore_elf)
@@ -666,7 +662,7 @@ impl super::LinuxRootfs {
                 .unwrap();
             assert!(status.success(), "Failed to copy zcore.elf");
 
-            let status = std::process::Command::new("mcopy")
+            let status = std::process::Command::new(&mcopy)
                 .arg("-i")
                 .arg(&efi_img)
                 .arg(&initramfs_img)
@@ -1578,5 +1574,51 @@ mod ram_resident_tests {
     #[test]
     fn aarch64_no_avisa_por_grande_que_sea() {
         assert!(ram_resident_warning("aarch64", 4096 * MIB).is_none());
+    }
+}
+
+/// Finds a host tool for the EFI image, looking **beyond `PATH`**.
+///
+/// The `sbin` directories are not in a normal user's `PATH` on Debian, and
+/// `mkfs.vfat` (dosfstools) lives in `/usr/sbin`. Checking only `PATH` told a
+/// host that HAD the package installed that it was missing: observed
+/// 2026-11-01, `make image` dying with ``missing `mkfs.vfat` (package:
+/// dosfstools)`` right after it verified the rootfs, on a Debian where
+/// `apt install dosfstools` answered "ya esta en su version mas reciente".
+///
+/// The tool is then invoked by the absolute path found here, so the lookup and
+/// the call can never disagree. The root `Makefile` appends the same
+/// directories to `PATH` for its own recipes.
+fn find_host_tool(tool: &str, package: &str) -> std::path::PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .chain(["/usr/local/sbin", "/usr/sbin", "/sbin"].map(std::path::PathBuf::from))
+        .map(|dir| dir.join(tool))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "missing `{tool}` (package: {package}); not in PATH nor in \
+                 /usr/local/sbin, /usr/sbin or /sbin"
+            )
+        })
+}
+
+#[cfg(test)]
+mod host_tool_tests {
+    use super::find_host_tool;
+
+    #[test]
+    fn devuelve_la_ruta_absoluta_de_algo_que_si_esta() {
+        let sh = find_host_tool("sh", "dash");
+        assert!(sh.is_absolute(), "{sh:?} no es absoluta");
+        assert!(sh.is_file(), "{sh:?} no existe");
+    }
+
+    /// El fallo que arregla: el mensaje tiene que nombrar el binario Y el
+    /// paquete, y decir que tambien se han mirado los `sbin`.
+    #[test]
+    #[should_panic(expected = "missing `eclipse-no-such-tool` (package: ninguno)")]
+    fn lo_que_no_esta_en_ningun_sitio_lo_dice_con_su_paquete() {
+        find_host_tool("eclipse-no-such-tool", "ninguno");
     }
 }
