@@ -706,6 +706,57 @@ pub fn content_px(logical_w: i32, logical_h: i32, scale: i32) -> (u32, u32) {
     (width as u32, height as u32)
 }
 
+/// Copia una lectura GL en BGRA (filas de abajo arriba) a un wl_shm
+/// ARGB8888 little-endian (mismos bytes, filas de arriba abajo), empezando en
+/// la fila `dst_y`. Solo copia las filas `rows` (de arriba abajo, inclusivo).
+/// Es un `memcpy` por fila: sin reordenar canales.
+#[allow(clippy::too_many_arguments)]
+pub fn blit_bgra_flipped(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_stride: usize,
+    dst_y: u32,
+    rows: (u32, u32),
+) {
+    let src_stride = (src_w as usize) * 4;
+    let row_bytes = (src_w.min(dst_w) as usize) * 4;
+    let last = rows.1.min(src_h.saturating_sub(1));
+    for row in rows.0 as usize..=last as usize {
+        if src_h == 0 {
+            break;
+        }
+        let src_off = (src_h as usize - 1 - row) * src_stride;
+        let dst_off = (dst_y as usize + row) * dst_stride;
+        if src_off + row_bytes > src.len() || dst_off + row_bytes > dst.len() {
+            break;
+        }
+        dst[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
+    }
+}
+
+/// Filas que cambian entre dos lecturas GL del mismo tamaño (de abajo
+/// arriba), devueltas de arriba abajo como rango inclusivo. `None` si son
+/// idénticas: no hay nada que copiar ni que mandar al compositor.
+pub fn changed_rows_flipped(
+    cur: &[u8],
+    prev: &[u8],
+    width: u32,
+    height: u32,
+) -> Option<(u32, u32)> {
+    let stride = (width as usize) * 4;
+    let rows = height as usize;
+    if stride == 0 || cur.len() < stride * rows || prev.len() != cur.len() {
+        return (rows > 0).then(|| (0, height.saturating_sub(1)));
+    }
+    let same = |r: usize| cur[r * stride..(r + 1) * stride] == prev[r * stride..(r + 1) * stride];
+    let first = (0..rows).find(|&r| !same(r))?;
+    let last = (first..rows).rev().find(|&r| !same(r)).unwrap_or(first);
+    Some(((rows - 1 - last) as u32, (rows - 1 - first) as u32))
+}
+
 /// Little-endian ARGB from an RGBA8888 image, row by row. `dst_stride` is the
 /// destination row in bytes. Rows that do not fit are dropped.
 pub fn blit_rgba(
@@ -944,5 +995,29 @@ mod tests {
         assert_eq!(lay.scheme.w, SCHEME_W);
         assert!(lay.location.x + lay.location.w < lay.gpu.x);
         assert_eq!(lay.gpu.w, GPU_W);
+    }
+
+    #[test]
+    fn bgra_flip_copies_rows_upside_down() {
+        // 1x2 GL frame: bottom row first.
+        let src = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut dst = [0u8; 12];
+        blit_bgra_flipped(&src, 1, 2, &mut dst, 1, 4, 1, (0, 1));
+        assert_eq!(dst, [0, 0, 0, 0, 5, 6, 7, 8, 1, 2, 3, 4]);
+        let mut dst = [0u8; 12];
+        blit_bgra_flipped(&src, 1, 2, &mut dst, 1, 4, 1, (1, 1));
+        assert_eq!(dst, [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn changed_rows_are_reported_top_down() {
+        let prev = vec![0u8; 4 * 4];
+        assert_eq!(changed_rows_flipped(&prev, &prev, 1, 4), None);
+        let mut cur = prev.clone();
+        cur[4] = 9; // GL row 1 = second from the bottom = top-down row 2
+        assert_eq!(changed_rows_flipped(&cur, &prev, 1, 4), Some((2, 2)));
+        cur[12] = 9; // GL row 3 = top row
+        assert_eq!(changed_rows_flipped(&cur, &prev, 1, 4), Some((0, 2)));
+        assert_eq!(changed_rows_flipped(&cur, &[], 1, 4), Some((0, 3)));
     }
 }

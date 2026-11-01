@@ -33,6 +33,7 @@ engine = [
     "dep:arboard",
     "dep:dpi",
     "dep:euclid",
+    "dep:gleam",
     "dep:raw-window-handle",
     "dep:pkcs1",
     "dep:rustls",
@@ -71,6 +72,9 @@ servo = { version = "0.7", optional = true, default-features = false, features =
     "brotli-compression-stream",
 ] }
 euclid = { version = "0.22", optional = true }
+# Same gleam as servo-paint-api: read the software framebuffer as BGRA straight
+# into a reused buffer instead of `read_to_image` (clone + flip + RGBA swizzle).
+gleam = { version = "0.15", optional = true }
 # System clipboard for pages and the location bar. On Wayland it talks
 # wlr/ext data-control (labwc has both), so it works without keyboard focus
 # serials; without data-control it falls back to X11 and then to memory.

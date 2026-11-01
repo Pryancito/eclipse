@@ -117,6 +117,38 @@ fn hit_close_box(b: &mut Bencher) {
 }
 
 #[bench]
+fn blit_bgra_flipped_1080p(b: &mut Bencher) {
+    let w = 1920u32;
+    let h = 1080u32;
+    let src = vec![0x11u8; (w * h * 4) as usize];
+    let mut dst = vec![0u8; (w * (h + chrome::HEIGHT as u32) * 4) as usize];
+    let stride = (w as usize) * 4;
+    b.iter(|| {
+        chrome::blit_bgra_flipped(
+            test::black_box(&src),
+            w,
+            h,
+            test::black_box(&mut dst),
+            w,
+            stride,
+            chrome::HEIGHT as u32,
+            (0, h - 1),
+        );
+        test::black_box(dst[stride * 80])
+    });
+}
+
+#[bench]
+fn changed_rows_1080p_one_row(b: &mut Bencher) {
+    let w = 1920u32;
+    let h = 1080u32;
+    let prev = vec![0x11u8; (w * h * 4) as usize];
+    let mut cur = prev.clone();
+    cur[(w * 4 * 540) as usize] = 0;
+    b.iter(|| chrome::changed_rows_flipped(test::black_box(&cur), &prev, w, h));
+}
+
+#[bench]
 fn blit_1080p(b: &mut Bencher) {
     let w = 1920u32;
     let h = 1080u32;
@@ -268,6 +300,7 @@ fn context_menu_overlay(b: &mut Bencher) {
                 find_mode: false,
                 scheme: SchemeHint::Https,
                 gpu: true,
+                private: false,
                 can_back: true,
                 can_forward: false,
                 scale: test::black_box(1),
