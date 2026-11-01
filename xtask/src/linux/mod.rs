@@ -21,7 +21,11 @@ mod usb_probe;
 mod verify;
 mod xorg;
 
-use crate::{commands::fetch_online, variant::Variant, Arch, PROJECT_DIR, REPOS, TARGET};
+use crate::{
+    commands::{fetch_online, optional_status},
+    variant::Variant,
+    Arch, PROJECT_DIR, REPOS, TARGET,
+};
 use os_xtask_utils::{dir, CommandExt, Ext, Git, Make};
 use std::{
     env,
@@ -1030,20 +1034,22 @@ impl LinuxRootfs {
 
         println!("Compiling thr3 (sysbench barrier regression test)...");
         fs::create_dir_all(&dir).unwrap();
-        let status = Ext::new("gcc")
-            .current_dir(&dir)
-            .arg("-static")
-            .arg("-no-pie")
-            .arg("-nostdlib")
-            .arg("-fno-stack-protector")
-            .arg("-fno-builtin")
-            .arg("-O1")
-            .arg("-DQUICK_TEST")
-            .arg("-o")
-            .arg(&executable)
-            .arg(&source)
-            .status();
-        if !status.success() {
+        let ok = optional_status(
+            Ext::new("gcc")
+                .current_dir(&dir)
+                .arg("-static")
+                .arg("-no-pie")
+                .arg("-nostdlib")
+                .arg("-fno-stack-protector")
+                .arg("-fno-builtin")
+                .arg("-O1")
+                .arg("-DQUICK_TEST")
+                .arg("-o")
+                .arg(&executable)
+                .arg(&source),
+            "install gcc to build the freestanding thread tests",
+        );
+        if !ok {
             eprintln!("warning: failed to compile thr3");
         }
         executable
@@ -2015,16 +2021,18 @@ impl LinuxRootfs {
         println!("Checking apk ({arch}) against Chimera Linux repo...");
         // -N / --timestamping: sólo descarga si el servidor tiene versión más nueva.
         // -q: silencioso excepto errores.  -P: directorio destino.
-        let status = Ext::new("wget")
-            .arg("-N")
-            .arg("-q")
-            .arg("--show-progress")
-            .arg("-P")
-            .arg(&apk_src_dir)
-            .arg(&url)
-            .status();
+        let ok = optional_status(
+            Ext::new("wget")
+                .arg("-N")
+                .arg("-q")
+                .arg("--show-progress")
+                .arg("-P")
+                .arg(&apk_src_dir)
+                .arg(&url),
+            "install wget to refresh the apk static binary",
+        );
 
-        if status.success() {
+        if ok {
             if stored.is_file() {
                 // Asegurarse de que tiene permisos de ejecución.
                 #[cfg(unix)]
@@ -2754,7 +2762,8 @@ impl LinuxRootfs {
                 _ => false,
             };
             if regen {
-                let _ = Ext::new("python3").arg(&gen).current_dir(&dir).status();
+                let gen_hint = "install python3 to regenerate the shader header";
+                let _ = optional_status(Ext::new("python3").arg(&gen).current_dir(&dir), gen_hint);
             }
         }
 
@@ -2930,11 +2939,10 @@ impl LinuxRootfs {
 
         println!("Compiling eclipse-init (Rust, {triple})...");
         // Make sure the userspace musl target is available (best-effort).
-        let _ = Ext::new("rustup")
-            .arg("target")
-            .arg("add")
-            .arg(triple)
-            .status();
+        let _ = optional_status(
+            Ext::new("rustup").arg("target").arg("add").arg(triple),
+            "install rustup so the musl target can be added",
+        );
 
         let mut cargo = Ext::new("cargo");
         cargo
@@ -2980,11 +2988,10 @@ impl LinuxRootfs {
         }
 
         println!("Compiling lunarbg (Rust, {triple})...");
-        let _ = Ext::new("rustup")
-            .arg("target")
-            .arg("add")
-            .arg(triple)
-            .status();
+        let _ = optional_status(
+            Ext::new("rustup").arg("target").arg("add").arg(triple),
+            "install rustup so the musl target can be added",
+        );
         let mut cargo = Ext::new("cargo");
         cargo
             .current_dir(&dir)
@@ -3371,11 +3378,11 @@ impl LinuxRootfs {
             _ => true,
         };
         if needs_build {
-            let media = Ext::new("pkg-config")
-                .arg("--exists")
-                .arg("gstreamer-1.0")
-                .status()
-                .success();
+            // Best-effort: a host with no `pkg-config` falls back to engine-only.
+            let media = optional_status(
+                Ext::new("pkg-config").arg("--exists").arg("gstreamer-1.0"),
+                "install pkg-config and libgstreamer1.0-dev for media support",
+            );
             if media {
                 println!("Compiling silversurfer (host, media-gstreamer)...");
             } else {
@@ -3418,7 +3425,9 @@ impl LinuxRootfs {
                 eprintln!("warning: could not install silversurfer: {err}");
             } else {
                 let _ = fs::remove_file(&stale);
-                let mib = fs::metadata(&dest).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+                let mib = fs::metadata(&dest)
+                    .map(|m| m.len() / (1024 * 1024))
+                    .unwrap_or(0);
                 println!("silversurfer: /usr/bin/silversurfer ({mib} MiB)");
             }
         } else if stale.is_file() {
@@ -3490,11 +3499,10 @@ impl LinuxRootfs {
         }
 
         println!("Compiling lunarbar (Rust, {triple})...");
-        let _ = Ext::new("rustup")
-            .arg("target")
-            .arg("add")
-            .arg(triple)
-            .status();
+        let _ = optional_status(
+            Ext::new("rustup").arg("target").arg("add").arg(triple),
+            "install rustup so the musl target can be added",
+        );
         let mut cargo = Ext::new("cargo");
         cargo
             .current_dir(&dir)
@@ -3986,11 +3994,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         }
 
         println!("Compiling wavplay (Rust, {triple})...");
-        let _ = Ext::new("rustup")
-            .arg("target")
-            .arg("add")
-            .arg(triple)
-            .status();
+        let _ = optional_status(
+            Ext::new("rustup").arg("target").arg("add").arg(triple),
+            "install rustup so the musl target can be added",
+        );
         let mut cargo = Ext::new("cargo");
         cargo
             .current_dir(&dir)
