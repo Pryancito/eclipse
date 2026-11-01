@@ -3418,7 +3418,9 @@ impl LinuxRootfs {
                 eprintln!("warning: could not install silversurfer: {err}");
             } else {
                 let _ = fs::remove_file(&stale);
-                let mib = fs::metadata(&dest).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+                let mib = fs::metadata(&dest)
+                    .map(|m| m.len() / (1024 * 1024))
+                    .unwrap_or(0);
                 println!("silversurfer: /usr/bin/silversurfer ({mib} MiB)");
             }
         } else if stale.is_file() {
