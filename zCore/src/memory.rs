@@ -371,7 +371,9 @@ pub fn heap_held_by_current_cpu() -> bool {
 }
 
 /// The x86_64 heap grows out of physical RAM and gives that growth back
-/// here; this one is a fixed pool with nothing grown to return.
+/// here; this one is a fixed pool with nothing grown to return. Only
+/// `reclaimd` calls it, and a zircon-only kernel has no `reclaimd`.
+#[allow(dead_code)]
 pub fn release_idle_heap(_want: usize) -> usize {
     0
 }
