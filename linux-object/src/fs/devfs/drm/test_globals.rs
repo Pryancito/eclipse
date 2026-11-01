@@ -1,5 +1,6 @@
 extern crate std;
 
+use self::std::sync::atomic::{AtomicU64, Ordering};
 use self::std::sync::{Mutex, MutexGuard};
 use self::std::thread::ThreadId;
 use alloc::vec::Vec;
@@ -27,6 +28,19 @@ static LOCK: Mutex<()> = Mutex::new(());
 /// offender's own thread, which libtest names after the offending test.
 static OWNERS: Mutex<Vec<ThreadId>> = Mutex::new(Vec::new());
 
+/// Which acquisition of [`LOCK`] is the current one. It only ever goes up,
+/// so a token taken before a helper was spawned proves not just that the
+/// lock is held but that it is held by the SAME acquisition -- the one the
+/// helper belongs to.
+///
+/// Without it a helper could be waved through by a stranger: if the test
+/// that spawned it unwinds before the helper registers, `OWNERS` is empty
+/// for a moment, another test takes the lock, and the late helper then sees
+/// a non-empty `OWNERS` and writes into THAT test's globals with the
+/// assertions none the wiser. Which is this whole file's defect, one level
+/// up.
+static ACQUISITION: AtomicU64 = AtomicU64::new(0);
+
 fn owners() -> MutexGuard<'static, Vec<ThreadId>> {
     OWNERS.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -51,11 +65,22 @@ pub(crate) fn lock() -> Held {
     // a failure for the tests that follow, so step over it -- the panicking
     // test has already been reported.
     let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ACQUISITION.fetch_add(1, Ordering::SeqCst);
     let mut o = owners();
     o.clear();
     o.push(me());
     drop(o);
     Held(g)
+}
+
+/// The token for the acquisition in force, to hand to a helper before
+/// spawning it. Taking one asserts that the caller is inside the section,
+/// because a token from outside it names an acquisition that has nothing to
+/// do with the caller.
+#[track_caller]
+pub(crate) fn acquisition() -> u64 {
+    assert_held("drm::test_globals::ACQUISITION");
+    ACQUISITION.load(Ordering::SeqCst)
 }
 
 /// Says that this thread is a helper working inside the critical section of
@@ -68,27 +93,42 @@ pub(crate) fn lock() -> Held {
 /// it must not: the point of the helper is to run WHILE the holder waits.
 /// So it registers instead, and [`assert_held`] accepts it.
 ///
-/// It asserts that somebody holds the lock, because a helper whose parent
-/// has already left is not inside anything and its writes land wherever the
-/// next test is.
+/// It takes the `token` its parent read with [`acquisition`] and checks it
+/// against the acquisition in force, which catches both ways a helper can be
+/// outside the section it thinks it is in: nobody holds the lock at all, or
+/// somebody else has taken it since -- a parent that unwound early, and a
+/// stranger waved the late helper through.
 pub(crate) struct Helper;
 
 impl Drop for Helper {
     fn drop(&mut self) {
+        // Its OWN registration, not every entry this thread has. They are
+        // not the same when the holder is also the helper, which is what
+        // `a_helper_of_the_acquisition_in_force_is_accepted` does: a
+        // `retain` there took the holder out of its own section.
         let mine = me();
-        owners().retain(|t| *t != mine);
+        let mut o = owners();
+        if let Some(i) = o.iter().rposition(|t| *t == mine) {
+            o.remove(i);
+        }
     }
 }
 
 #[track_caller]
-pub(crate) fn join_as_helper() -> Helper {
+pub(crate) fn join_as_helper(token: u64) -> Helper {
     let mut o = owners();
+    let now = ACQUISITION.load(Ordering::SeqCst);
     assert!(
-        !o.is_empty(),
-        "a helper thread joined the DRM critical section while nobody held \
-         it: whatever it writes lands in whichever test runs next. Keep the \
-         `Held` guard alive in the thread that spawned this one, for as long \
-         as this helper runs."
+        !o.is_empty() && now == token,
+        "a helper thread joined the DRM critical section it is not in: it \
+         carries acquisition {token} and the one in force is {now}, held by \
+         {held} thread(s). Its parent left the section before this helper \
+         registered, so whatever it writes lands in whichever test holds the \
+         lock now. Keep the `Held` guard alive in the thread that spawned \
+         this one, for as long as this helper runs.",
+        token = token,
+        now = now,
+        held = o.len()
     );
     o.push(me());
     Helper
@@ -115,4 +155,45 @@ pub(crate) fn assert_held(global: &str) {
          thread the holder spawned, call `join_as_helper` first.",
         global = global
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The handoff this file's own assertion used to let through: a helper
+    /// whose parent left the section before it registered, with another test
+    /// holding the lock by then. A non-empty `OWNERS` says only that SOMEBODY
+    /// holds it, so the late helper was waved through by a stranger and wrote
+    /// into that stranger's globals -- the very defect the assertions exist to
+    /// catch, one level up.
+    ///
+    /// The two acquisitions here stand for the parent's and the stranger's;
+    /// what matters is that the token names the first and the second is in
+    /// force.
+    #[test]
+    #[should_panic(expected = "joined the DRM critical section it is not in")]
+    fn a_helper_that_registers_after_its_parent_left_is_refused() {
+        let token = {
+            let _parent = lock();
+            acquisition()
+        };
+        let _stranger = lock();
+        let _late = join_as_helper(token);
+    }
+
+    /// And the token of the acquisition in force is accepted, so the refusal
+    /// above is about the handoff and not about tokens in general.
+    #[test]
+    fn a_helper_of_the_acquisition_in_force_is_accepted() {
+        let _holder = lock();
+        let token = acquisition();
+        let late = join_as_helper(token);
+        assert!(held_by_me());
+        drop(late);
+        assert!(
+            held_by_me(),
+            "dropping the helper took the holder out of its own section"
+        );
+    }
 }

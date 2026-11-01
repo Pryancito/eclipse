@@ -247,6 +247,10 @@ fn race_against_delivery<R: Send + 'static>(
     f: impl FnOnce(&Arc<DrmFileState>) -> R + Send + 'static,
 ) -> (R, bool) {
     let entered = Arc::new(AtomicBool::new(false));
+    // Read while we are the holder, so the helper can prove it belongs to
+    // THIS acquisition and not to whoever holds the lock by the time it
+    // gets going.
+    let token = super::test_globals::acquisition();
     let racer = {
         let file = file.clone();
         let entered = entered.clone();
@@ -255,7 +259,7 @@ fn race_against_delivery<R: Send + 'static>(
             // the test that spawned it is parked in `finish_delivery`. It is
             // inside that test's critical section and cannot take the lock
             // itself, so it says so.
-            let _inside = super::test_globals::join_as_helper();
+            let _inside = super::test_globals::join_as_helper(token);
             entered.store(true, Ordering::Release);
             let answer = f(&file);
             (answer, file.has_events())
