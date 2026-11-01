@@ -984,6 +984,35 @@ pub fn needs_rm_attached(request: u32) -> bool {
     (request >> 8) & 0xff == 0x64 && matches!(nr, NR_GEM_NEW | NR_VM_BIND | NR_EXEC)
 }
 
+/// Whether `request` is the nouveau `EXEC`, carrying a whole request.
+///
+/// By NR with a size floor, like [`is_cpu_prep_ioctl`]. Exists for the async
+/// pre-wait in `linux-object`: an `EXEC` whose waits cannot go to the GPU
+/// waits for them on the CPU, and the synchronous arm can only spin.
+pub fn is_exec_ioctl(request: u32) -> bool {
+    let (_dir, nr, size) = decode_ioc(request);
+    (request >> 8) & 0xff == 0x64 && nr == NR_EXEC && size as usize >= EXEC_REQUEST_BYTES
+}
+
+/// Bytes of an `EXEC` request, so the pre-wait can check them readable
+/// without naming the struct.
+pub const EXEC_REQUEST_BYTES: usize = core::mem::size_of::<DrmNouveauExec>();
+
+/// Bytes of one entry of an `EXEC`'s wait array.
+pub const EXEC_SYNC_BYTES: usize = core::mem::size_of::<DrmNouveauSync>();
+
+/// The most waits an `EXEC` may carry (the arm's own cap, NVK's batch).
+pub const EXEC_MAX_WAITS: u32 = 256;
+
+/// An `EXEC`'s wait array, as `(user pointer, count)`.
+///
+/// # Safety
+/// `arg` must point at [`EXEC_REQUEST_BYTES`] readable bytes.
+pub unsafe fn exec_wait_list(arg: usize) -> (usize, u32) {
+    let req = &*(arg as *const DrmNouveauExec);
+    (req.wait_ptr as usize, req.wait_count)
+}
+
 /// How many bytes of a `GEM_CPU_PREP` request the pre-wait reads, so its
 /// caller can check that many are readable without naming the struct.
 pub const CPU_PREP_REQUEST_BYTES: usize = core::mem::size_of::<DrmNouveauGemCpuPrep>();

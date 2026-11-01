@@ -1,8 +1,9 @@
 //! How long a DRM ioctl was parked BEFORE the driver ever saw it.
 //!
-//! Five DRM ioctls block by contract -- `WAIT_VBLANK`, `SYNCOBJ_WAIT` and its
-//! timeline form, a `MODE_ATOMIC` carrying `IN_FENCE_FD`, `GEM_CPU_PREP`, and
-//! a legacy present with a render fence still in flight. `INode::io_control`
+//! Six DRM ioctls block by contract -- `WAIT_VBLANK`, `SYNCOBJ_WAIT` and its
+//! timeline form, a `MODE_ATOMIC` carrying `IN_FENCE_FD`, `GEM_CPU_PREP`, a
+//! legacy present with a render fence still in flight, and a nouveau `EXEC`
+//! whose waits go to the CPU. `INode::io_control`
 //! is synchronous, so each of them is split: an `async fn` in `sys_ioctl`
 //! parks the thread until the condition is met, and only then does the
 //! synchronous arm run and answer. Without that split the sync arm spin-polls
@@ -44,16 +45,19 @@ pub enum Kind {
     CpuPrep = 3,
     /// `SETCRTC` or `PAGE_FLIP` waiting for the fb's render fence.
     PresentFence = 4,
+    /// A nouveau `EXEC` whose waits the GPU cannot take go to the CPU.
+    ExecWait = 5,
 }
 
 impl Kind {
     /// Every kind, in the order they are printed.
-    pub const ALL: [Kind; 5] = [
+    pub const ALL: [Kind; 6] = [
         Kind::WaitVblank,
         Kind::SyncobjWait,
         Kind::AtomicInFence,
         Kind::CpuPrep,
         Kind::PresentFence,
+        Kind::ExecWait,
     ];
 
     /// The name this kind is printed under.
@@ -64,6 +68,7 @@ impl Kind {
             Kind::AtomicInFence => "ATOMIC_IN_FENCE",
             Kind::CpuPrep => "GEM_CPU_PREP",
             Kind::PresentFence => "PRESENT_FENCE",
+            Kind::ExecWait => "EXEC_WAIT",
         }
     }
 }
@@ -272,7 +277,7 @@ mod tests {
     #[test]
     fn every_kind_is_listed_and_named_once() {
         let _g = test_lock();
-        assert_eq!(Kind::ALL.len(), 5);
+        assert_eq!(Kind::ALL.len(), 6);
         for (i, &k) in Kind::ALL.iter().enumerate() {
             assert_eq!(k as usize, i, "{:?} is not at its own index", k);
             // A distinct probe count per kind, so a line reading another

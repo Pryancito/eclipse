@@ -38,6 +38,12 @@ pub use nouveau_uapi::{
 };
 #[cfg(target_arch = "x86_64")]
 pub use nouveau_uapi::{enabled as nouveau_uapi_enabled, set_enabled as set_nouveau_uapi_enabled};
+/// `EXEC`'s recogniser and wait-list reader, for the same kind of pre-wait:
+/// the waits the GPU cannot take as an ACQUIRE are waited for on the CPU.
+#[cfg(target_arch = "x86_64")]
+pub use nouveau_uapi::{
+    exec_wait_list, is_exec_ioctl, EXEC_MAX_WAITS, EXEC_REQUEST_BYTES, EXEC_SYNC_BYTES,
+};
 /// Honouring a compressed PTE kind at `VM_BIND` (`nvidia.gem_comptags`),
 /// reached from `zCore`'s cmdline parsing by way of `kernel_hal::drivers`.
 #[cfg(target_arch = "x86_64")]
@@ -157,6 +163,33 @@ pub unsafe fn cpu_prep_request(_arg: usize) -> (u32, u32) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn cpu_prep_is_nowait(_flags: u32) -> bool {
     true
+}
+
+/// No nouveau uAPI off x86_64, so no `EXEC` to wait ahead of.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn is_exec_ioctl(_request: u32) -> bool {
+    false
+}
+
+/// Unreachable off x86_64 ([`is_exec_ioctl`] is false there).
+#[cfg(not(target_arch = "x86_64"))]
+pub const EXEC_REQUEST_BYTES: usize = 40;
+
+/// Unreachable off x86_64 ([`is_exec_ioctl`] is false there).
+#[cfg(not(target_arch = "x86_64"))]
+pub const EXEC_SYNC_BYTES: usize = 16;
+
+/// Unreachable off x86_64 ([`is_exec_ioctl`] is false there).
+#[cfg(not(target_arch = "x86_64"))]
+pub const EXEC_MAX_WAITS: u32 = 256;
+
+/// Unreachable off x86_64 ([`is_exec_ioctl`] is false there).
+///
+/// # Safety
+/// Never called: there is no request to read.
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn exec_wait_list(_arg: usize) -> (usize, u32) {
+    (0, 0)
 }
 
 /// The CE page-flip (`nvidia.hwflip`) and NVC57E surface-flip

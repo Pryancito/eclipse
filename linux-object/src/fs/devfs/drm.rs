@@ -1556,6 +1556,17 @@ pub fn cpu_prep_fences(gem_handle: u32, owner_pid: u64) -> Vec<(usize, u32)> {
         .collect()
 }
 
+/// The waits of the nouveau `EXEC` at `arg` that its arm would do on the CPU
+/// (`DrmScheme::exec_cpu_waits`), from the first driver that answers: the
+/// `EXEC` goes to one card. `None` when no driver would wait.
+pub fn exec_cpu_waits(arg: usize, owner_pid: u64) -> Option<(Vec<u32>, Vec<u64>)> {
+    // The guard is dropped before any driver call, as for `cpu_prep_fences`.
+    let drivers = DRM_STATE.lock().drivers.clone();
+    drivers
+        .iter()
+        .find_map(|d| d.exec_cpu_waits(arg, owner_pid))
+}
+
 /// The GPU work still queued on `gem_handle`, from every registered driver
 /// (`DrmScheme::queued_fences`, the same fan-out as
 /// [`scanout_render_fence`] and for the same two-GPU reason): what

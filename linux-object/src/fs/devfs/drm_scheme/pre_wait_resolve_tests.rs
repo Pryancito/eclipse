@@ -8,7 +8,8 @@
 fn sources() -> &'static str {
     concat!(
         include_str!("../drm_scheme.rs"),
-        include_str!("wait_vblank_sleep.rs")
+        include_str!("wait_vblank_sleep.rs"),
+        include_str!("exec_wait_sleep.rs")
     )
 }
 
@@ -27,6 +28,7 @@ fn a_pre_wait_does_not_resolve_the_table_twice_per_look() {
     for name in [
         "pub async fn syncobj_wait_sleep(",
         "pub async fn atomic_in_fence_sleep(",
+        "pub async fn exec_wait_sleep(",
     ] {
         let body = body(src, name);
         assert!(
@@ -218,6 +220,7 @@ fn every_pre_wait_accounts_its_parking() {
         ("pub async fn atomic_in_fence_sleep(", "Kind::AtomicInFence"),
         ("pub async fn cpu_prep_sleep(", "Kind::CpuPrep"),
         ("pub async fn present_fence_sleep(", "Kind::PresentFence"),
+        ("pub async fn exec_wait_sleep(", "Kind::ExecWait"),
     ] {
         let body = body(src, name);
         assert!(
@@ -243,6 +246,7 @@ fn every_pre_wait_accounts_its_parking() {
         "Kind::AtomicInFence",
         "Kind::CpuPrep",
         "Kind::PresentFence",
+        "Kind::ExecWait",
     ] {
         assert_eq!(
             src.matches(&alloc::format!(
