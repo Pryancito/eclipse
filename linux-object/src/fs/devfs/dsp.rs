@@ -593,6 +593,14 @@ impl DspDev {
         Ok(())
     }
 
+    /// Whether dropping this handle plays out its queue first (a per-open
+    /// client, as [`Drop`] does it). `close(2)` uses this to do that wait
+    /// asleep with [`Self::sync_sleeping`] before the handle goes, so the
+    /// synchronous one in `Drop` finds nothing left to spin on.
+    pub fn syncs_on_close(&self) -> bool {
+        self.client
+    }
+
     /// Whether `cmd` is `SNDCTL_DSP_SYNC`, the one OSS ioctl that blocks.
     pub fn is_sync_ioctl(cmd: u32) -> bool {
         cmd == SNDCTL_DSP_SYNC
