@@ -1682,7 +1682,7 @@ mod reentrancy_tests {
         // runs of the suite, green in 5 of 5 with `--test-threads=1`.
         UPCALLS.store(0, Ordering::SeqCst);
         ALWAYS_FREE.store(true, Ordering::SeqCst);
-        syncobj::set_signal_hook(probe_hook);
+        super::super::syncobj_eventfd::set_signal_hook_checked(probe_hook);
 
         let handle = syncobj::create(false);
         assert!(syncobj::add_ref(handle), "keep a ref for the test itself");

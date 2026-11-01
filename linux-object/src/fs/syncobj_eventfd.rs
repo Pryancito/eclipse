@@ -393,8 +393,54 @@ fn on_syncobj_signaled(_handle: u32, _point: u64) {
 /// Wire [`on_syncobj_signaled`] into the syncobj layer's point-advance upcall.
 /// Called once at boot.
 pub fn init() {
-    zcore_drivers::scheme::syncobj::set_signal_hook(on_syncobj_signaled);
+    set_signal_hook_checked(on_syncobj_signaled);
 }
+
+/// `syncobj::set_signal_hook` with the lockdep on it.
+///
+/// The hook is ONE word for the whole process, and a test that installs its own
+/// (`syncobj_file::reentrancy_tests::probe_hook`) loses it the moment anybody
+/// else stores here -- then fails saying its upcall never ran, which is true
+/// and is not its fault. So in a test build every write says its caller took
+/// the serial, and a single pass IN SERIE names whoever does not, with no race
+/// needed. Same idiom as `drm::test_globals`' own `assert_held` (#2355) and as
+/// Linux's `lockdep_assert_held`.
+pub(crate) fn set_signal_hook_checked(f: fn(u32, u64)) {
+    #[cfg(test)]
+    hardware_fence_tests::assert_held("syncobj::SIGNAL_HOOK");
+    zcore_drivers::scheme::syncobj::set_signal_hook(f);
+}
+
+/// [`init`] as the boot path calls it, from [`crate::fs::create_root_fs`].
+///
+/// A no-op in a test build, for the reason
+/// [`crate::fs::drm_bring_up::bring_up_drm_globals`] gives about its own half
+/// of the same bring-up: the kernel runs `create_root_fs` **once**, for init's
+/// root, but 236 call sites of the test binary make a process with
+/// `LinuxProcess::new`, which does call it, and the harness runs them in
+/// parallel with the syncobj tests. So this line re-registered the kernel's
+/// hook over the one a running test had just installed, from another thread,
+/// hundreds of times a run.
+///
+/// That is the whole of what made
+/// `syncobj_file::reentrancy_tests::the_point_advance_upcall_never_runs_with_the_waiter_registry_held`
+/// fail with `UPCALLS == 0`: its probe hook had been replaced by
+/// [`on_syncobj_signaled`] between the `set_signal_hook` and the
+/// `wake_ready_waiters`, so the upcall it was asserting about did run -- just
+/// not into it. Victim and culprit in different modules, as every time.
+///
+/// Nothing is lost by skipping it: the hook only ever delivers a registered
+/// `SYNCOBJ_EVENTFD`, the tests that want the real one call [`init`]
+/// themselves (under the serial), and what it does at boot is what
+/// [`hardware_fence_tests`] walks.
+#[cfg(not(test))]
+pub fn init_at_boot() {
+    init();
+}
+
+/// See [`init_at_boot`].
+#[cfg(test)]
+pub fn init_at_boot() {}
 
 /// The half of explicit sync that only real hardware walks.
 ///
@@ -564,7 +610,7 @@ pub(crate) mod hardware_fence_tests {
     fn an_explicit_signal_delivers_the_eventfd() {
         let _serial = TEST_SERIAL.lock();
         reset();
-        syncobj::set_signal_hook(on_syncobj_signaled);
+        super::set_signal_hook_checked(on_syncobj_signaled);
         let handle = syncobj::create(false);
         let ev = CountingEventfd::new();
 
@@ -591,7 +637,7 @@ pub(crate) mod hardware_fence_tests {
     fn a_fence_submitted_after_the_waiter_still_gets_polled() {
         let _serial = TEST_SERIAL.lock();
         reset();
-        syncobj::set_signal_hook(on_syncobj_signaled);
+        super::set_signal_hook_checked(on_syncobj_signaled);
         let handle = syncobj::create(false);
         let ev = CountingEventfd::new();
 
@@ -639,7 +685,7 @@ pub(crate) mod hardware_fence_tests {
     fn wait_available_eventfd_does_not_fire_on_submit_alone() {
         let _serial = TEST_SERIAL.lock();
         reset();
-        syncobj::set_signal_hook(on_syncobj_signaled);
+        super::set_signal_hook_checked(on_syncobj_signaled);
         let handle = syncobj::create(false);
         let ev = CountingEventfd::new();
 
