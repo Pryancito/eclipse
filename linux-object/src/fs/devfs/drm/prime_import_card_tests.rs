@@ -37,13 +37,27 @@ impl Drop for NodeTable {
 /// with it: a `Gpu` left behind stays in `DRM_STATE.drivers` for the rest of
 /// the binary (see `unregister_driver`), which would put every later test of
 /// the crate on the hardware-KMS path.
+///
+/// **The `Screen` is declared LAST on purpose**, because it holds
+/// `drm::test_globals::lock()` and must be the last thing released. A struct
+/// drops its fields in DECLARATION order, which is the opposite of the `let`
+/// bindings this helper was lifted from -- `node_tests` says "declare it
+/// after the `Screen`, so it drops before it" and that is true of locals and
+/// false here. With the `Screen` first, the lock was gone before
+/// `clear_gpu_nodes_for_test` and the two `unregister_driver` calls ran, so
+/// this test's teardown touched the process-wide DRM state while the NEXT
+/// test already held the lock and was building its own: two hardware-KMS
+/// cards still registered under a test that asked for software KMS is
+/// `out_fence_tests` getting `EntryNotFound` from the synthetic CRTC, and a
+/// node table wiped mid-test is `fs::sysfs::tree_tests` listing a
+/// `/dev/char/226:128` it cannot then look up.
 struct TwoCards {
-    _screen: kms_emu::Screen,
     _table: NodeTable,
     _console: kms_emu::Gpu,
     _compute: kms_emu::Gpu,
     card0: u32,
     card1: u32,
+    _screen: kms_emu::Screen,
 }
 
 fn two_cards() -> TwoCards {
@@ -72,12 +86,12 @@ fn two_cards() -> TwoCards {
     gem_mmap::register(ON_CARD0, PHYS_ON_CARD0, PAGE_SIZE as u64, 0);
     gem_mmap::register(ON_CARD1, PHYS_ON_CARD1, PAGE_SIZE as u64, 0);
     TwoCards {
-        _screen: screen,
         _table: table,
         _console: console,
         _compute: compute,
         card0,
         card1,
+        _screen: screen,
     }
 }
 

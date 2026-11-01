@@ -10,6 +10,7 @@ mod eclipsefs_mount;
 mod epoll;
 /// System-wide `epoll_wait(2)` usage counters, for `/proc/perf/kernel`.
 pub use epoll::stats as epoll_stats;
+mod drm_bring_up;
 mod eventfd;
 mod fat_mount;
 /// Qué errno nace de montar vfat sobre un volumen que no es FAT: la segunda
@@ -1654,10 +1655,10 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // software-KMS path, and the hook is a no-op until an eventfd registers.
         syncobj_eventfd::init();
 
-        // Register DRM drivers from kernel-hal
-        for drm in drivers::all_drm().as_vec().iter() {
-            devfs::drm::register_driver(drm.clone());
-        }
+        // Register DRM drivers from kernel-hal, then decide which GPU owns
+        // which `/dev/dri` node. Both are process-wide, so they live in one
+        // place; see [`bring_up_drm_globals`].
+        drm_bring_up::bring_up_drm_globals();
 
         // Expose /dev/dri/card0 when there is a real DRM/GPU driver OR just a
         // framebuffer display. In the latter case the DRM scheme provides a
@@ -1682,11 +1683,10 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // session (which genuinely drives KMS) does not set desktop=xorg and
         // keeps card0.
         //
-        // Decide which GPU owns which node before creating any of them: the
-        // devfs nodes below and the `/sys/class/drm` identities read the same
-        // table, so they cannot drift apart. Unconditional, so sysfs is never
-        // consulted against an empty table.
-        devfs::drm::build_gpu_nodes();
+        // Which GPU owns which node was decided above, in
+        // [`bring_up_drm_globals`], before any of them is created: the devfs
+        // nodes below and the `/sys/class/drm` identities read the same table,
+        // so they cannot drift apart.
         // `/dev/nvidiactl` and `/dev/nvidia<N>`, for NVIDIA's own user-mode
         // driver (`nvidia.nvidiactl`, default off).
         #[cfg(target_arch = "x86_64")]

@@ -8345,7 +8345,7 @@ pub(crate) fn reset_output_state_for_test() {
 }
 
 #[cfg(test)]
-pub(super) mod test_globals;
+pub(crate) mod test_globals;
 
 #[cfg(test)]
 mod release_tests;
