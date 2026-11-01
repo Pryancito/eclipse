@@ -131,8 +131,30 @@ fn map_memory(paddr: PhysAddr, len: usize) -> Option<VirtAddr> {
 /// tree to read, `init_early` registered them, and a second driver for either
 /// would be a second driver for the same silicon. The controller the tree
 /// names is handed to the walk instead, which is what `adopt_intc` is for.
+///
+/// The command line comes from [`super::cmdline`], the owned copy
+/// `primary_init_early` took, and NOT from `KCONFIG.cmdline`. That field is a
+/// `&'static str` whose bytes live in rayboot's own allocation, low in RAM
+/// (`0x785x_xxxx` on the QEMU `virt` machine), reachable only through
+/// TTBR0_EL1 --- and `vm::init` sets TTBR0_EL1 to 0 the moment it activates
+/// the kernel table, which `boot::primary_init` does BEFORE it calls
+/// `arch::primary_init` and therefore before this runs. Reading that slice
+/// here was a kernel page fault on the first byte of the command line, on
+/// every case of `Linux Other Test Baremetal (aarch64)`:
+///
+/// ```text
+/// ########## jump to kernel ##########
+/// [ipi-watch] armed: ...
+/// [KERNEL PAGE FAULT] vaddr=0x78525ba7 is a user-half address in a kernel
+///                     code slot ... flags=READ rip=0x0
+/// ```
+///
+/// The fault came before the `dtb=` test could fail, so it did not need the
+/// hatch to be open: every aarch64 boot died here. See
+/// `cmdline::aarch64_boot_cmdline_tests` for the regression guard.
 fn probe_devicetree() {
-    let Some(paddr) = crate::cmdline::dtb_paddr(KCONFIG.cmdline) else {
+    let cmdline = super::cmdline();
+    let Some(paddr) = crate::cmdline::dtb_paddr(&cmdline) else {
         return;
     };
     info!("dtb: the command line puts a device tree blob at {paddr:#x}");

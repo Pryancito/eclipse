@@ -906,3 +906,70 @@ mod tests {
         );
     }
 }
+
+/// The aarch64 boot cannot read the command line off the bootloader's own
+/// allocation after it has dropped the mapping that reaches it.
+///
+/// `zCore::platform::aarch64::rust_main` fills `KernelConfig.cmdline` with
+/// `rayboot`'s `&'static str`: its bytes sit low in RAM (`0x785x_xxxx` under
+/// the QEMU `virt` machine), in the half of the address space TTBR0_EL1
+/// translates. `bare::arch::aarch64::vm::init` writes 0 into TTBR0_EL1 when it
+/// activates the kernel page table, and `bare::boot::primary_init` calls that
+/// (`activate_kernel_page_table`) BEFORE `arch::primary_init`. So from
+/// `arch::primary_init` on, `KCONFIG.cmdline` is a dangling slice and touching
+/// one byte of it is a kernel page fault with no thread to blame and no `rip`:
+///
+/// ```text
+/// [KERNEL PAGE FAULT] vaddr=0x78525ba7 is a user-half address in a kernel
+///                     code slot ... flags=READ rip=0x0
+/// [KERNEL PAGE FAULT] re-entrant fault while diagnosing — halting
+/// ```
+///
+/// `primary_init_early` copies the line into the owned `CMDLINE` precisely so
+/// that everything after activation has something to read, and this is a
+/// source check rather than a runtime one because the code that must not do it
+/// is `target_arch = "aarch64"` only: no host test can execute it, and the one
+/// machine that would catch it is CI's emulator, where the symptom is a 60 s
+/// timeout per case with the kernel dead before its first log line.
+#[cfg(test)]
+mod aarch64_boot_cmdline_tests {
+    /// Everything `arch::primary_init` reaches on aarch64 lives in these two
+    /// files; a third would have to be added here with it.
+    const AFTER_ACTIVATION: [&str; 2] = [
+        include_str!("../bare/arch/aarch64/drivers.rs"),
+        include_str!("../bare/arch/aarch64/smp.rs"),
+    ];
+
+    #[test]
+    fn nothing_the_aarch64_primary_init_reaches_reads_kconfig_cmdline() {
+        for src in AFTER_ACTIVATION {
+            for (n, line) in src.lines().enumerate() {
+                // Prose about the field is fine; a use of it is not.
+                let code = line.split("//").next().unwrap_or("");
+                assert!(
+                    !code.contains("KCONFIG.cmdline"),
+                    "line {} reads KCONFIG.cmdline after TTBR0_EL1 has been \
+                     cleared, which faults on its first byte: {}. Use \
+                     `super::cmdline()`, the owned copy.",
+                    n + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
+
+    /// And the copy is still what `probe_devicetree` asks for. The assertion
+    /// above only says what it must not read.
+    #[test]
+    fn probe_devicetree_reads_the_owned_copy() {
+        let src = include_str!("../bare/arch/aarch64/drivers.rs");
+        let body = src
+            .split("fn probe_devicetree() {")
+            .nth(1)
+            .expect("probe_devicetree moved");
+        assert!(
+            body.contains("super::cmdline()"),
+            "probe_devicetree no longer takes the command line from the owned copy"
+        );
+    }
+}
