@@ -266,9 +266,17 @@ impl INode for MiceDev {
         // client with no answer, so it concludes there is nothing but a plain
         // three-byte mouse here and settles for one. That conclusion was
         // right, and it is what kept the wheel off this node entirely.
-        let mut inner = self.inner.lock();
-        for &c in buf {
-            inner.write_byte(c);
+        let readable = {
+            let mut inner = self.inner.lock();
+            for &c in buf {
+                inner.write_byte(c);
+            }
+            inner.stage_pos < inner.stage_len || !inner.buf.is_empty()
+        };
+        // A command reply is something to read, the same as a packet: a
+        // reader parked on this node is told now, not on the re-scan tick.
+        if readable {
+            super::wait::wake_input_waiters();
         }
         Ok(buf.len())
     }
@@ -802,6 +810,17 @@ mod mice_poll_tests {
             node.poll().unwrap().write,
             "a client that waits for writability before talking waits for ever"
         );
+    }
+
+    /// A command reply is a reader's to take, so it fires the input list
+    /// like a packet does: a `poll` parked on the node on the long backstop
+    /// would otherwise sleep through it.
+    #[test]
+    fn a_reply_to_a_command_wakes_the_input_waiters() {
+        let node = a_node();
+        let before = super::super::wait::input_seq();
+        node.write_at(0, &[0xf2]).unwrap();
+        assert!(super::super::wait::input_seq() > before);
     }
 
     #[test]
