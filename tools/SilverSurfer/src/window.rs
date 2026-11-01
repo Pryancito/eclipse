@@ -21,7 +21,8 @@ use raw_window_handle::{
     RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle, WindowHandle,
 };
 use servo::{
-    Code, Key, Modifiers, MouseButton, NamedKey, RenderingContext, WindowRenderingContext,
+    ClipboardAction, Code, Cursor, Key, Modifiers, MouseButton, NamedKey, RenderingContext,
+    WindowRenderingContext,
 };
 use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_compositor::WlCompositor;
@@ -37,17 +38,22 @@ use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_client::protocol::wl_subsurface::WlSubsurface;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum};
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1::{self, Shape, WpCursorShapeDeviceV1},
+    wp_cursor_shape_manager_v1::{self, WpCursorShapeManagerV1},
+};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use xkbcommon::xkb::{self, Keymap, State as XkbState};
 
 use crate::bookmarks;
 use crate::chrome::{self, Hit, View};
+use crate::clipboard;
 use crate::downloads;
 use crate::engine::{self, Session, Waker};
 use crate::files::{self, PickRequest};
 use crate::history;
 use crate::home;
-use crate::location::{resolve_omnibox, search_template, SchemeHint};
+use crate::location::{paste_line, resolve_omnibox, search_template, SchemeHint};
 use crate::look::Look;
 use crate::menu;
 use crate::session::{self, Snapshot};
@@ -134,6 +140,14 @@ pub struct App {
     chrome_sub: Option<WlSubsurface>,
     keyboard: Option<WlKeyboard>,
     pointer: Option<WlPointer>,
+    /// `wp_cursor_shape_v1` (labwc ≥ 0.7). Sin él el cursor queda como lo
+    /// dejó el compositor.
+    cursor_mgr: Option<WpCursorShapeManagerV1>,
+    cursor_dev: Option<WpCursorShapeDeviceV1>,
+    /// Serial del último `wl_pointer.enter`; `None` con el puntero fuera.
+    pointer_serial: Option<u32>,
+    /// Último cursor enviado al compositor (evita repetir `set_shape`).
+    cursor_applied: Option<Cursor>,
     parent_buf: Option<LiveBuf>,
     /// Second toplevel buffer for the software page. wlroots' pixman
     /// renderer (Eclipse OS without a GPU) keeps a wl_shm buffer until the
@@ -222,6 +236,10 @@ impl App {
             chrome_sub: None,
             keyboard: None,
             pointer: None,
+            cursor_mgr: None,
+            cursor_dev: None,
+            pointer_serial: None,
+            cursor_applied: None,
             parent_buf: None,
             parent_back: None,
             chrome_buf: None,
@@ -517,6 +535,7 @@ impl App {
             }
             session.spin_event_loop();
         }
+        self.update_cursor();
         let page_fs = self.session.as_ref().is_some_and(|s| {
             s.shell
                 .flags()
@@ -1050,6 +1069,21 @@ impl App {
             self.swallowed = Some(evdev);
             return;
         }
+        if !self.loc_focused && self.ctrl && !self.alt {
+            let action = match evdev {
+                46 => Some(ClipboardAction::Copy),
+                45 => Some(ClipboardAction::Cut),
+                47 => Some(ClipboardAction::Paste),
+                _ => None,
+            };
+            if let Some(action) = action {
+                if let Some(session) = &self.session {
+                    session.shell.clipboard_action(action);
+                }
+                self.swallowed = Some(evdev);
+                return;
+            }
+        }
         if self.loc_focused {
             if !is_modifier(evdev) {
                 self.held = Some(evdev);
@@ -1439,6 +1473,18 @@ impl App {
             }
             102 => self.loc_cursor = 0,
             107 => self.loc_cursor = self.loc_text.chars().count(),
+            // Ctrl+C / Ctrl+X: la barra no tiene selección, copia el texto entero.
+            46 | 45 if self.ctrl => {
+                clipboard::set_text(&self.loc_text);
+                if evdev == 45 {
+                    self.loc_text.clear();
+                    self.loc_cursor = 0;
+                }
+            }
+            47 if self.ctrl => {
+                let text = paste_line(&clipboard::get_text());
+                insert_chars(&mut self.loc_text, &mut self.loc_cursor, &text);
+            }
             _ => {
                 if let Some(text) = self.key_text(evdev) {
                     insert_chars(&mut self.loc_text, &mut self.loc_cursor, &text);
@@ -1490,10 +1536,32 @@ impl App {
         if let Some(named) = named {
             return (Key::Named(named), code);
         }
-        if let Some(text) = self.key_text(evdev) {
+        let text = if self.ctrl || self.alt {
+            self.shortcut_char(evdev)
+        } else {
+            self.key_text(evdev)
+        };
+        if let Some(text) = text {
             return (Key::Character(text.into()), code);
         }
         (Key::Named(NamedKey::Unidentified), code)
+    }
+
+    /// Carácter de la tecla con Ctrl/Alt pulsado. xkb aplica la transformación
+    /// de control (Ctrl+V → U+0016), y Servo espera `Key::Character("v")` con
+    /// `Modifiers::CONTROL` para copiar, pegar, cortar, deshacer y seleccionar
+    /// todo en los campos de la página. El keysym no lleva esa transformación.
+    fn shortcut_char(&self, evdev: u32) -> Option<String> {
+        if let Some(xkb) = &self.xkb {
+            let sym = xkb.state.key_get_one_sym(xkb::Keycode::new(evdev + 8));
+            let text = xkb::keysym_to_utf8(sym);
+            let text = text.trim_end_matches('\0');
+            if text.is_empty() || text.chars().any(char::is_control) {
+                return None;
+            }
+            return Some(text.to_owned());
+        }
+        qwerty(evdev, self.shift)
     }
 
     fn page_px(&self) -> Option<(f32, f32)> {
@@ -1523,6 +1591,58 @@ impl App {
                 session.shell.pointer(px, py, None);
             }
         }
+        self.update_cursor();
+    }
+
+    /// Cursor que toca bajo el puntero: el que pidió la página, o el del cromo
+    /// (mano sobre botones y pestañas, I sobre la barra).
+    fn wanted_cursor(&self) -> Cursor {
+        if self.on_page {
+            return self
+                .session
+                .as_ref()
+                .map_or(Cursor::Default, |s| s.shell.page_cursor());
+        }
+        if self.drag_tab.is_some() {
+            return Cursor::Grabbing;
+        }
+        let tabs = self
+            .session
+            .as_ref()
+            .map(|s| s.shell.tab_titles().len())
+            .unwrap_or(1)
+            .max(1);
+        chrome_cursor(chrome::hit(
+            self.logical_w,
+            tabs,
+            self.px as i32,
+            self.py as i32,
+        ))
+    }
+
+    fn update_cursor(&mut self) {
+        let Some(serial) = self.pointer_serial else {
+            return;
+        };
+        let wanted = self.wanted_cursor();
+        if self.cursor_applied == Some(wanted) {
+            return;
+        }
+        if self.cursor_dev.is_none() {
+            if let (Some(mgr), Some(pointer)) = (&self.cursor_mgr, &self.pointer) {
+                self.cursor_dev = Some(mgr.get_pointer(pointer, &self.qh, ()));
+            }
+        }
+        if wanted == Cursor::None {
+            if let Some(pointer) = &self.pointer {
+                pointer.set_cursor(serial, None, 0, 0);
+            }
+        } else if let Some(dev) = &self.cursor_dev {
+            dev.set_shape(serial, cursor_shape(wanted));
+        } else {
+            return;
+        }
+        self.cursor_applied = Some(wanted);
     }
 
     fn apply_size(&mut self, width: i32, height: i32) {
@@ -1538,6 +1658,55 @@ impl App {
         }
         self.chrome_fp = 0;
         self.need_paint = true;
+    }
+}
+
+/// Cursor del cromo según lo que hay bajo el puntero.
+fn chrome_cursor(hit: Option<Hit>) -> Cursor {
+    match hit {
+        Some(Hit::Location) => Cursor::Text,
+        Some(_) => Cursor::Pointer,
+        None => Cursor::Default,
+    }
+}
+
+/// `servo::Cursor` → forma de `wp_cursor_shape_v1` (mismos nombres CSS).
+fn cursor_shape(cursor: Cursor) -> Shape {
+    match cursor {
+        Cursor::None | Cursor::Default => Shape::Default,
+        Cursor::Pointer => Shape::Pointer,
+        Cursor::ContextMenu => Shape::ContextMenu,
+        Cursor::Help => Shape::Help,
+        Cursor::Progress => Shape::Progress,
+        Cursor::Wait => Shape::Wait,
+        Cursor::Cell => Shape::Cell,
+        Cursor::Crosshair => Shape::Crosshair,
+        Cursor::Text => Shape::Text,
+        Cursor::VerticalText => Shape::VerticalText,
+        Cursor::Alias => Shape::Alias,
+        Cursor::Copy => Shape::Copy,
+        Cursor::Move => Shape::Move,
+        Cursor::NoDrop => Shape::NoDrop,
+        Cursor::NotAllowed => Shape::NotAllowed,
+        Cursor::Grab => Shape::Grab,
+        Cursor::Grabbing => Shape::Grabbing,
+        Cursor::EResize => Shape::EResize,
+        Cursor::NResize => Shape::NResize,
+        Cursor::NeResize => Shape::NeResize,
+        Cursor::NwResize => Shape::NwResize,
+        Cursor::SResize => Shape::SResize,
+        Cursor::SeResize => Shape::SeResize,
+        Cursor::SwResize => Shape::SwResize,
+        Cursor::WResize => Shape::WResize,
+        Cursor::EwResize => Shape::EwResize,
+        Cursor::NsResize => Shape::NsResize,
+        Cursor::NeswResize => Shape::NeswResize,
+        Cursor::NwseResize => Shape::NwseResize,
+        Cursor::ColResize => Shape::ColResize,
+        Cursor::RowResize => Shape::RowResize,
+        Cursor::AllScroll => Shape::AllScroll,
+        Cursor::ZoomIn => Shape::ZoomIn,
+        Cursor::ZoomOut => Shape::ZoomOut,
     }
 }
 
@@ -1881,6 +2050,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
             }
             "xdg_wm_base" => state.wm = Some(registry.bind(name, version.min(4), qh, ())),
             "wl_seat" => state.seat = Some(registry.bind(name, version.min(5), qh, ())),
+            "wp_cursor_shape_manager_v1" => {
+                state.cursor_mgr = Some(registry.bind(name, 1, qh, ()));
+            }
             "wl_output" => {
                 let _: WlOutput = registry.bind(name, version.min(2), qh, ());
             }
@@ -2134,10 +2306,15 @@ impl Dispatch<WlPointer, ()> for App {
     ) {
         match event {
             wl_pointer::Event::Enter {
+                serial,
                 surface_x,
                 surface_y,
                 ..
-            } => state.note_motion(surface_x, surface_y),
+            } => {
+                state.pointer_serial = Some(serial);
+                state.cursor_applied = None;
+                state.note_motion(surface_x, surface_y);
+            }
             wl_pointer::Event::Motion {
                 surface_x,
                 surface_y,
@@ -2164,6 +2341,8 @@ impl Dispatch<WlPointer, ()> for App {
                 }
             }
             wl_pointer::Event::Leave { .. } => {
+                state.pointer_serial = None;
+                state.cursor_applied = None;
                 if state.on_page {
                     state.on_page = false;
                     if let Some(session) = &state.session {
@@ -2173,6 +2352,30 @@ impl Dispatch<WlPointer, ()> for App {
             }
             _ => {}
         }
+    }
+}
+
+impl Dispatch<WpCursorShapeManagerV1, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &WpCursorShapeManagerV1,
+        _: wp_cursor_shape_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpCursorShapeDeviceV1, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &WpCursorShapeDeviceV1,
+        _: wp_cursor_shape_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
     }
 }
 

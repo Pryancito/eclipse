@@ -104,6 +104,7 @@ sesión; al cerrar borra cookies/almacenamiento/caché de esa instancia).
 | Arrastrar pestaña | Reordenar |
 | Clic derecho (página) | Menú contextual |
 | Tab (en la barra) | Aceptar sugerencia del historial |
+| Ctrl+C / Ctrl+X / Ctrl+V (en la barra) | Copiar / cortar la dirección, pegar |
 | Ctrl+Shift+L | Guardar login del formulario visible |
 
 La barra busca con DuckDuckGo si el texto no parece una dirección
@@ -121,6 +122,12 @@ El título de la ventana sigue la pestaña activa; mientras carga, el tab
 muestra `…` y la barra un distintivo de esquema (`s` https, `!` http, `/` file).
 El cromo se pinta a la escala del output (HiDPI nativo), con iconos
 vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.
+El cursor sigue a la página (mano en enlaces, I en texto, redimensionar…) y
+al cromo (mano en botones y pestañas, I en la barra) vía `wp_cursor_shape_v1`;
+sin ese protocolo queda el del compositor.
+El portapapeles es el del sistema: `arboard` sobre wlr/ext data-control
+(labwc), con X11 y un texto en memoria como respaldo. Lo usan los campos de
+la página, `navigator.clipboard` y la barra.
 El distintivo `GL` / `SW` indica si la página va por EGL o por blit
 software; en ventana privada aparece además `P`.
 `about:privacy`, `about:cookies` y `about:clear` cubren la UI de datos.
