@@ -186,5 +186,13 @@ Arranque: el log incluye `session_ms` hasta tener Servo listo. Con
 software→wl_shm, el camino que toma Eclipse OS con labwc en pixman. Ahí el
 toplevel usa dos búferes: pixman no suelta un `wl_shm` hasta recibir otro, y
 con uno solo la página no se volvía a copiar tras el primer commit.
+En ese camino la página se lee con `glReadPixels(GL_BGRA)` directamente a un
+búfer reutilizado (los mismos bytes que `wl_shm` ARGB8888, sin reordenar
+canales), se compara con el fotograma anterior y solo se copian y marcan como
+daño las filas que cambiaron; si no cambió nada no hay commit. Cada commit
+pide un `wl_surface.frame` y el siguiente fotograma espera a ese callback, así
+que la página no se pinta más rápido que el monitor ni mientras la ventana no
+se ve. `SILVERSURFER_FRAME_STATS=1` imprime fps, ms de lectura y copia y el %
+de filas dañadas cada 120 fotogramas.
 El cromo omite el commit Wayland si el contenido no cambió; solo la
 pestaña activa dispara el present de frames.

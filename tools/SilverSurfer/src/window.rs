@@ -25,6 +25,7 @@ use servo::{
     WindowRenderingContext,
 };
 use wayland_client::protocol::wl_buffer::WlBuffer;
+use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
 use wayland_client::protocol::wl_output::{self, WlOutput};
@@ -116,6 +117,9 @@ struct LiveBuf {
     busy: bool,
     width: i32,
     height: i32,
+    /// Lleva un fotograma de página completo (de uno o dos commits atrás):
+    /// basta con copiar las filas que cambiaron desde entonces.
+    page: bool,
 }
 
 struct Xkb {
@@ -206,6 +210,23 @@ pub struct App {
     chrome_fp: u64,
     /// Reloj de arranque para métricas percibidas.
     started_at: Instant,
+    /// `SILVERSURFER_FRAME_STATS=1`: tiempos del camino software en stderr.
+    stats: Option<FrameStats>,
+    /// Lectura GL del fotograma actual y del último enviado (BGRA, de abajo
+    /// arriba). Compararlas da las filas que cambiaron: solo esas se marcan
+    /// como daño y, si no cambió nada, no hay commit.
+    readback: Vec<u8>,
+    shown: Vec<u8>,
+    /// `glReadPixels(GL_BGRA)` funcionó; si el driver lo rechaza se vuelve a
+    /// `read_to_image` (RGBA, daño completo).
+    bgra_read: bool,
+    /// Hay un `wl_surface.frame` del toplevel sin responder: el compositor aún
+    /// no mostró el fotograma anterior, así que el siguiente espera. Limita el
+    /// camino software a la frecuencia del monitor (y a cero si no se ve).
+    frame_wait: Option<Instant>,
+    /// Filas dañadas en el commit anterior de la página. El búfer trasero va
+    /// un fotograma por detrás, así que también hay que copiarlas.
+    last_rows: Option<(u32, u32)>,
 }
 
 impl App {
@@ -285,6 +306,12 @@ impl App {
             drag_tab: None,
             chrome_fp: 0,
             started_at: Instant::now(),
+            stats: FrameStats::from_env(),
+            readback: Vec::new(),
+            shown: Vec::new(),
+            bgra_read: true,
+            frame_wait: None,
+            last_rows: None,
         }
     }
 
@@ -562,7 +589,13 @@ impl App {
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
         });
         if frame {
-            self.paint_page()?;
+            let software = self.session.as_ref().is_some_and(|s| !s.gpu);
+            if software && self.waiting_for_frame() {
+                // Se pinta cuando llegue el `frame` del compositor.
+                self.retry_frame();
+            } else {
+                self.paint_page()?;
+            }
         }
         if (chrome || self.need_paint) && !self.fullscreen {
             self.paint_chrome()?;
@@ -593,29 +626,128 @@ impl App {
             return Ok(());
         }
         let (pw, ph) = self.content_size();
+        if !self.bgra_read {
+            return self.paint_page_rgba(pw, ph);
+        }
+        let t0 = Instant::now();
+        let gl = session.context.gleam_gl_api();
+        session.context.prepare_for_rendering();
+        gl.bind_vertex_array(0);
+        let len = (pw as usize) * (ph as usize) * 4;
+        let mut cur = std::mem::take(&mut self.readback);
+        cur.resize(len, 0);
+        gl.read_pixels_into_buffer(
+            0,
+            0,
+            pw as i32,
+            ph as i32,
+            gleam::gl::BGRA,
+            gleam::gl::UNSIGNED_BYTE,
+            &mut cur,
+        );
+        if gl.get_error() != gleam::gl::NO_ERROR {
+            eprintln!("silversurfer: glReadPixels(BGRA) no disponible; lectura RGBA");
+            self.bgra_read = false;
+            self.readback = cur;
+            return self.paint_page_rgba(pw, ph);
+        }
+        let t1 = Instant::now();
+        // Un búfer nuevo (resize, primer fotograma) se pinta entero.
+        let fresh = self.shown.len() != len;
+        let rows = if fresh {
+            Some((0, ph.saturating_sub(1)))
+        } else {
+            chrome::changed_rows_flipped(&cur, &self.shown, pw, ph)
+        };
+        let Some((top, bottom)) = rows else {
+            // Idéntico a lo que ya se ve: ni copia ni commit.
+            self.readback = cur;
+            if let Some(stats) = self.stats.as_mut() {
+                stats.add(t1 - t0, Duration::ZERO, 0, ph);
+            }
+            return Ok(());
+        };
+        let dst_y = (self.chrome_h() * self.scale).max(0) as u32;
+        let full = (0, ph.saturating_sub(1));
+        let since_back = match self.last_rows {
+            Some(last) if !fresh => (top.min(last.0), bottom.max(last.1)),
+            _ => full,
+        };
+        let copied = self.with_free_parent(|dst, dst_w, stride, has_page| {
+            let copy = if has_page { since_back } else { full };
+            chrome::blit_bgra_flipped(&cur, pw, ph, dst, dst_w, stride, dst_y, copy);
+        });
+        let t2 = Instant::now();
+        if !copied {
+            // Los dos búferes siguen en el compositor: reintentar tras el release.
+            self.readback = cur;
+            self.retry_frame();
+            return Ok(());
+        }
+        self.commit_parent_rows(dst_y + top, bottom - top + 1)?;
+        if let Some(stats) = self.stats.as_mut() {
+            stats.add(t1 - t0, t2 - t1, bottom - top + 1, ph);
+        }
+        self.readback = std::mem::replace(&mut self.shown, cur);
+        self.last_rows = Some((top, bottom));
+        Ok(())
+    }
+
+    /// Camino antiguo: `read_to_image` (RGBA ya volteado) y daño completo.
+    fn paint_page_rgba(&mut self, pw: u32, ph: u32) -> Result<(), String> {
+        let Some(session) = self.session.as_ref() else {
+            return Ok(());
+        };
         let rect =
             webrender_api::units::DeviceIntRect::from_size(euclid::size2(pw as i32, ph as i32));
+        let t0 = Instant::now();
         let Some(image) = session.context.read_to_image(rect) else {
             return Ok(());
         };
         let raw = image.into_raw();
         let width = image_width(&raw, pw);
-        if !self.blit_page(&raw, width, ph) {
-            if let Some(session) = &self.session {
-                session
-                    .shell
-                    .flags()
-                    .frame
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+        let t1 = Instant::now();
+        let dst_y = (self.chrome_h() * self.scale).max(0) as u32;
+        // Este camino no lleva `shown`: el próximo BGRA copia entero.
+        self.shown.clear();
+        self.last_rows = None;
+        let ok = self.with_free_parent(|dst, dst_w, stride, _| {
+            chrome::blit_rgba(&raw, width, ph, dst, dst_w, stride, dst_y);
+        });
+        let t2 = Instant::now();
+        if !ok {
+            self.retry_frame();
             return Ok(());
         }
-        self.commit_parent()?;
-        Ok(())
+        if let Some(stats) = self.stats.as_mut() {
+            stats.add(t1 - t0, t2 - t1, ph, ph);
+        }
+        let height = self.parent_buf.as_ref().map_or(0, |b| b.height as u32);
+        self.commit_parent_rows(0, height)
     }
 
-    fn blit_page(&mut self, raw: &[u8], src_w: u32, src_h: u32) -> bool {
-        let dst_y = (self.chrome_h() * self.scale).max(0) as u32;
+    /// Vuelve a marcar el fotograma como pendiente para pintarlo más tarde.
+    fn retry_frame(&self) {
+        if let Some(session) = &self.session {
+            session
+                .shell
+                .flags()
+                .frame
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// El compositor aún no mostró el último fotograma de la página. Un
+    /// callback perdido no puede congelar la página: pasado un segundo se
+    /// pinta igual.
+    fn waiting_for_frame(&self) -> bool {
+        self.frame_wait
+            .is_some_and(|since| since.elapsed() < Duration::from_secs(1))
+    }
+
+    /// Deja en `parent_buf` un búfer libre del tamaño del toplevel y le pasa
+    /// su memoria a `fill`. `false` si no hay ninguno libre todavía.
+    fn with_free_parent(&mut self, fill: impl FnOnce(&mut [u8], u32, usize, bool)) -> bool {
         // A resize in the same dispatch would otherwise blit into the
         // old-sized buffer, which paint_chrome then replaces with a bare panel.
         if self.ensure_parent_buffer().is_err() || !self.free_parent_buffer() {
@@ -627,7 +759,8 @@ impl App {
         let stride = (buf.width as usize) * 4;
         let len = buf.mem.len;
         let dst = unsafe { std::slice::from_raw_parts_mut(buf.mem.ptr, len) };
-        chrome::blit_rgba(raw, src_w, src_h, dst, buf.width as u32, stride, dst_y);
+        fill(dst, buf.width as u32, stride, buf.page);
+        buf.page = true;
         true
     }
 
@@ -776,6 +909,9 @@ impl App {
         surface.damage_buffer(0, 0, width, height);
         surface.commit();
         buf.busy = true;
+        // Lo que se ve ahora es el panel: el próximo fotograma va entero.
+        self.shown.clear();
+        self.last_rows = None;
         Ok(())
     }
 
@@ -824,19 +960,23 @@ impl App {
         true
     }
 
-    fn commit_parent(&mut self) -> Result<(), String> {
+    /// Adjunta `parent_buf` marcando como dañadas solo `rows` filas desde
+    /// `y` (píxeles de búfer), y pide un `frame` para no adelantarse al
+    /// compositor.
+    fn commit_parent_rows(&mut self, y: u32, rows: u32) -> Result<(), String> {
         let Some(surface) = self.parent.clone() else {
             return Ok(());
         };
+        let qh = self.qh.clone();
         let Some(buf) = self.parent_buf.as_mut() else {
             return Ok(());
         };
-        let width = buf.width;
-        let height = buf.height;
         surface.attach(Some(&buf.buffer), 0, 0);
-        surface.damage_buffer(0, 0, width, height);
+        surface.damage_buffer(0, y as i32, buf.width, rows as i32);
+        surface.frame(&qh, ());
         surface.commit();
         buf.busy = true;
+        self.frame_wait = Some(Instant::now());
         Ok(())
     }
 
@@ -1710,6 +1850,59 @@ fn cursor_shape(cursor: Cursor) -> Shape {
     }
 }
 
+/// Medias del camino software (lectura GL, copia a wl_shm, filas dañadas),
+/// impresas cada 120 fotogramas.
+struct FrameStats {
+    frames: u32,
+    read: Duration,
+    copy: Duration,
+    damaged_rows: u64,
+    total_rows: u64,
+    since: Instant,
+}
+
+impl FrameStats {
+    fn from_env() -> Option<Self> {
+        std::env::var_os("SILVERSURFER_FRAME_STATS")
+            .filter(|v| v != "0")
+            .map(|_| Self {
+                frames: 0,
+                read: Duration::ZERO,
+                copy: Duration::ZERO,
+                damaged_rows: 0,
+                total_rows: 0,
+                since: Instant::now(),
+            })
+    }
+
+    fn add(&mut self, read: Duration, copy: Duration, damaged: u32, rows: u32) {
+        self.frames += 1;
+        self.read += read;
+        self.copy += copy;
+        self.damaged_rows += u64::from(damaged);
+        self.total_rows += u64::from(rows);
+        if self.frames < 120 {
+            return;
+        }
+        let n = f64::from(self.frames);
+        let secs = self.since.elapsed().as_secs_f64().max(1e-3);
+        eprintln!(
+            "silversurfer: frames={} fps={:.1} lectura_ms={:.2} copia_ms={:.2} daño={:.0}%",
+            self.frames,
+            n / secs,
+            self.read.as_secs_f64() * 1e3 / n,
+            self.copy.as_secs_f64() * 1e3 / n,
+            100.0 * self.damaged_rows as f64 / self.total_rows.max(1) as f64,
+        );
+        self.frames = 0;
+        self.read = Duration::ZERO;
+        self.copy = Duration::ZERO;
+        self.damaged_rows = 0;
+        self.total_rows = 0;
+        self.since = Instant::now();
+    }
+}
+
 fn is_modifier(evdev: u32) -> bool {
     matches!(evdev, 29 | 97 | 56 | 100 | 42 | 54)
 }
@@ -1797,6 +1990,7 @@ fn fill_panel(buf: &mut LiveBuf, look: Look) {
     for chunk in dst.chunks_exact_mut(4) {
         chunk.copy_from_slice(&px);
     }
+    buf.page = false;
 }
 
 fn image_width(raw: &[u8], fallback: u32) -> u32 {
@@ -1864,6 +2058,7 @@ fn alloc_buffer(
         busy: false,
         width,
         height,
+        page: false,
     })
 }
 
@@ -2355,6 +2550,21 @@ impl Dispatch<WlPointer, ()> for App {
     }
 }
 
+impl Dispatch<WlCallback, ()> for App {
+    fn event(
+        state: &mut Self,
+        _: &WlCallback,
+        event: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.frame_wait = None;
+        }
+    }
+}
+
 impl Dispatch<WpCursorShapeManagerV1, ()> for App {
     fn event(
         _: &mut Self,
@@ -2472,7 +2682,20 @@ pub fn run(start: Start) -> Result<(), String> {
             },
         ];
         let repeating = app.held.is_some() && app.repeat_rate > 0;
-        let timeout = if animating || repeating { 16 } else { -1 };
+        // Un fotograma retenido por `frame_wait` necesita volver a mirar aunque
+        // no llegue el callback (ver `waiting_for_frame`).
+        let held_frame = app.frame_wait.is_some()
+            && app.session.as_ref().is_some_and(|s| {
+                s.shell
+                    .flags()
+                    .frame
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            });
+        let timeout = if animating || repeating || held_frame {
+            16
+        } else {
+            -1
+        };
         unsafe {
             libc::poll(fds.as_mut_ptr(), 2, timeout);
         }
