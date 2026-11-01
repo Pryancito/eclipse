@@ -1629,7 +1629,7 @@ impl Syscall<'_> {
     }
 
     /// Eclipse-specific DNS/hosts lookup for userland shims (`libeclipse_dns.so`).
-    pub fn sys_eclipse_dns_query(
+    pub async fn sys_eclipse_dns_query(
         &self,
         name: UserInPtr<u8>,
         name_len: usize,
@@ -1648,7 +1648,7 @@ impl Syscall<'_> {
         }
         let hostname = name.as_str(name_len).map_err(|_| LxError::EINVAL)?;
         let root_inode = dns_vfs_root().ok_or(LxError::ENOENT)?;
-        let addrs = dns::resolve(&root_inode, hostname, DnsFamily::from_usize(family))?;
+        let addrs = dns::resolve(&root_inode, hostname, DnsFamily::from_usize(family)).await?;
         let n = addrs.len().min(out_max);
         for (i, ip) in addrs.iter().take(n).enumerate() {
             out.add(i)
