@@ -38,6 +38,14 @@
  *   24  open(argv[0]) failed
  *   25  _llseek did not seek to where it was asked
  *   26  pread64 did not read the bytes at that offset
+ *   27  fstat64 failed
+ *   28  st_mode does not say this is a regular file
+ *   29  st_size does not agree with the size _llseek reports
+ *   30  the inode is missing from one of the two places it is kept
+ *   31  fcntl64 with a scalar command failed
+ *   32  fcntl64(F_SETLK64) failed
+ *   33  fcntl64(F_GETLK64) did not write the answer back
+ *   34  fcntl(55) did not answer a wide command the way fcntl64 does
  *
  * The last six are the segment registers, which is the second half of what
  * compatibility mode needs and the half `iretq` does not do: it reloads `CS`
@@ -251,6 +259,164 @@ _start:
 	cmpl	$0x464c45, %eax
 	jne	bad_pread
 
+	/* fstat64(fd, statbuf): i386 197, and the first call in this program
+	 * whose answer is a STRUCTURE rather than a number. Its ninety-six
+	 * bytes are what makes it a conversion: the real st_ino is the LAST
+	 * field and not the second, and every 64-bit field sits at 4-byte
+	 * alignment, so st_size begins at offset 44 and not 48.
+	 *
+	 * Checking it against this container's own Linux is the point. An
+	 * offset table transcribed wrongly passes every unit test written
+	 * from the same wrong table; it cannot pass here. */
+	movl	$197, %eax
+	movl	fd, %ebx
+	movl	$statbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_fstat64
+
+	/* st_mode at offset 16: this is a regular file, so the type bits are
+	 * S_IFREG. Reading the field at the wrong offset finds st_nlink or
+	 * __st_ino there, neither of which has 0x8000 in its type bits. */
+	movl	statbuf + 16, %eax
+	andl	$0xf000, %eax
+	cmpl	$0x8000, %eax
+	jne	bad_fstat64_mode
+
+	/* st_size at offset 44, against the size _llseek reports for the same
+	 * descriptor. The two have to agree, and offset 44 is the one that
+	 * 8-byte alignment would have moved to 48 -- so a structure that was
+	 * padded like a native one fails here and nowhere else. */
+	movl	$140, %eax
+	movl	fd, %ebx
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	movl	page, %esi
+	movl	$2, %edi		/* SEEK_END */
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_fstat64_size
+	movl	page, %eax
+	movl	(%eax), %ecx		/* the size, low half */
+	movl	4(%eax), %edx		/* and high */
+	cmpl	statbuf + 44, %ecx
+	jne	bad_fstat64_size
+	cmpl	statbuf + 48, %edx
+	jne	bad_fstat64_size
+	/* And it is not zero, so the comparison above is not two empty
+	 * fields agreeing with each other. */
+	testl	%ecx, %ecx
+	jz	bad_fstat64_size
+
+	/* The inode is in the structure TWICE: whole at offset 88, and
+	 * truncated to 32 bits at offset 12, where `struct stat` used to keep
+	 * it. Both have to be filled, and the low half of the one has to be
+	 * the other. */
+	movl	statbuf + 88, %eax
+	testl	%eax, %eax
+	jz	bad_fstat64_ino
+	cmpl	statbuf + 12, %eax
+	jne	bad_fstat64_ino
+	/* st_blksize at offset 52, which no filesystem reports as zero. */
+	movl	statbuf + 52, %eax
+	testl	%eax, %eax
+	jz	bad_fstat64_ino
+
+	/* fcntl64(fd, F_GETFL, 0): i386 221 with a command whose argument is
+	 * a scalar, so it goes straight through to the native handler. It is
+	 * here to separate the two halves of fcntl64: if this fails, nothing
+	 * about `struct flock` is to blame. */
+	movl	$221, %eax
+	movl	fd, %ebx
+	movl	$3, %ecx		/* F_GETFL */
+	xorl	%edx, %edx
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_fcntl64
+
+	/* fcntl64(fd, F_SETLK64, &lock64): the other half. F_SETLK64 is a
+	 * command that exists only in a 32-bit ABI, and its argument is the
+	 * 24-byte `struct flock64` -- l_start at offset 4, l_len at 12,
+	 * l_pid at 20. A read lock, because this descriptor is open for
+	 * reading only. */
+	movl	$221, %eax
+	movl	fd, %ebx
+	movl	$13, %ecx		/* F_SETLK64 */
+	movl	$lock64, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_setlk64
+
+	/* F_GETLK64 over the same range. This process holds the lock, and a
+	 * lock never conflicts with its own owner, so the answer has to be
+	 * l_type = F_UNLCK (2) written back into the structure -- which is
+	 * the write-back path, the one that has to lay the 24 bytes out again
+	 * rather than merely read them. */
+	movl	$0, lock64		/* clear l_type and l_whence */
+	movl	$221, %eax
+	movl	fd, %ebx
+	movl	$12, %ecx		/* F_GETLK64 */
+	movl	$lock64, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_getlk64
+	movzwl	lock64, %eax
+	cmpl	$2, %eax		/* F_UNLCK */
+	jne	bad_getlk64
+
+	/* And release it, so the program leaves nothing behind. */
+	movw	$2, lock64		/* F_UNLCK */
+	movl	$221, %eax
+	movl	fd, %ebx
+	movl	$13, %ecx		/* F_SETLK64 */
+	movl	$lock64, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_setlk64
+
+	/* fcntl(fd, F_SETLK64, &lock64): i386 55, the OLD number with a
+	 * command that exists only in a 32-bit ABI.
+	 *
+	 * This step was written expecting EINVAL, on the belief that
+	 * `compat_sys_fcntl` refuses the wide commands and leaves them to
+	 * `fcntl64`. Running it here said otherwise: 55 takes the lock and
+	 * returns 0, and F_GETLK64 on 55 writes the 24 bytes back. So the two
+	 * numbers are the same call, the width comes from the command alone,
+	 * and this step asserts what Linux actually does rather than what the
+	 * first draft assumed. */
+	movw	$0, lock64		/* F_RDLCK */
+	movl	$55, %eax
+	movl	fd, %ebx
+	movl	$13, %ecx		/* F_SETLK64 */
+	movl	$lock64, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_fcntl_wide
+
+	/* F_GETLK64 on the old number too, which has to write the answer back
+	 * into the same 24 bytes. */
+	movl	$0, lock64
+	movl	$55, %eax
+	movl	fd, %ebx
+	movl	$12, %ecx		/* F_GETLK64 */
+	movl	$lock64, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_fcntl_wide
+	movzwl	lock64, %eax
+	cmpl	$2, %eax		/* F_UNLCK */
+	jne	bad_fcntl_wide
+
+	/* And release, through the old number as well. */
+	movw	$2, lock64		/* F_UNLCK */
+	movl	$55, %eax
+	movl	fd, %ebx
+	movl	$13, %ecx		/* F_SETLK64 */
+	movl	$lock64, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_fcntl_wide
+
 	/* get_thread_area(&tls_desc): i386 244, the other half, and the one a
 	 * debugger uses. It has to hand back the base this program asked for,
 	 * which means the descriptor really does hold it rather than
@@ -314,6 +480,30 @@ bad_llseek:
 	jmp	die
 bad_pread:
 	movl	$26, %ebx
+	jmp	die
+bad_fstat64:
+	movl	$27, %ebx
+	jmp	die
+bad_fstat64_mode:
+	movl	$28, %ebx
+	jmp	die
+bad_fstat64_size:
+	movl	$29, %ebx
+	jmp	die
+bad_fstat64_ino:
+	movl	$30, %ebx
+	jmp	die
+bad_fcntl64:
+	movl	$31, %ebx
+	jmp	die
+bad_setlk64:
+	movl	$32, %ebx
+	jmp	die
+bad_getlk64:
+	movl	$33, %ebx
+	jmp	die
+bad_fcntl_wide:
+	movl	$34, %ebx
 
 	/* exit_group(status): i386 252. `exit` (1) would do for a single
 	 * thread, but exit_group is what a C library calls and it is in the
@@ -361,3 +551,17 @@ page:
 	.long	0
 fd:
 	.long	0
+	/* The ninety-six bytes of a `struct stat64`, and the twenty-four of a
+	 * `struct flock64`. The lock asks for the whole file from byte 0:
+	 * l_type (F_RDLCK, 0), l_whence (SEEK_SET, 0), l_start (0), l_len
+	 * (0, which means "to the end and beyond") and l_pid, which only
+	 * F_GETLK fills in. */
+	.align 4
+statbuf:
+	.space	96
+lock64:
+	.word	0			/* l_type: F_RDLCK */
+	.word	0			/* l_whence: SEEK_SET */
+	.long	0, 0			/* l_start, 64 bits at offset 4 */
+	.long	0, 0			/* l_len, 64 bits at offset 12 */
+	.long	0			/* l_pid at offset 20 */

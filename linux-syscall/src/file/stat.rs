@@ -46,11 +46,31 @@ impl Syscall<'_> {
         mut stat_ptr: UserOutPtr<Stat>,
         flags: usize,
     ) -> SysResult {
+        let stat = self.stat_metadata(dirfd, path, flags)?;
+        stat_ptr.write(stat.into())?;
+        Ok(0)
+    }
+
+    /// The lookup half of the whole `stat` family: everything up to the point
+    /// where the answer has to be laid out for one particular ABI.
+    ///
+    /// This is Linux's `vfs_fstatat`, split off for the reason Linux splits
+    /// it: the 32-bit `stat64` family asks exactly this question and then
+    /// writes a different structure (`cp_new_stat` against `cp_new_stat64`).
+    /// Sharing the lookup is not tidiness. The `AT_EMPTY_PATH` arm below is a
+    /// correctness fix that took a Firefox bug to find, and a second copy of
+    /// this function would be a second place for it to be missing.
+    pub(crate) fn stat_metadata(
+        &self,
+        dirfd: FileDesc,
+        path: UserInPtr<u8>,
+        flags: usize,
+    ) -> Result<Metadata, LxError> {
         let flags = at_flags(flags, FSTATAT_FLAGS)?;
         let path = path.as_c_str()?;
         info!(
-            "fstatat: dirfd={:?}, path={:?}, stat_ptr={:?}, flags={:?}",
-            dirfd, path, stat_ptr, flags
+            "fstatat: dirfd={:?}, path={:?}, flags={:?}",
+            dirfd, path, flags
         );
 
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
@@ -60,17 +80,15 @@ impl Syscall<'_> {
         // without it `fstat` fails on every descriptor that is not a regular
         // file — sockets included, which is what Firefox stats on the handles
         // it receives over its IPC channels.
-        let stat = if flags.contains(AtFlags::EMPTY_PATH) && path.is_empty() {
+        if flags.contains(AtFlags::EMPTY_PATH) && path.is_empty() {
             if dirfd == FileDesc::CWD {
-                proc.working_directory()?.0.metadata()?
+                Ok(proc.working_directory()?.0.metadata()?)
             } else {
-                proc.get_file_like(dirfd)?.metadata()?
+                proc.get_file_like(dirfd)?.metadata()
             }
         } else {
-            proc.lookup_inode_at(dirfd, path, follow)?.metadata()?
-        };
-        stat_ptr.write(stat.into())?;
-        Ok(0)
+            Ok(proc.lookup_inode_at(dirfd, path, follow)?.metadata()?)
+        }
     }
 
     /// Returns information about a file in a structure named stat.
@@ -386,7 +404,7 @@ impl StatMode {
     /// several store `st_mode` whole -- would otherwise have them read as a
     /// **type** and ORed into the answer, so one inode could come back as two
     /// kinds of file at once.
-    fn from_type_mode(type_: FileType, mode: u16) -> Self {
+    pub(crate) fn from_type_mode(type_: FileType, mode: u16) -> Self {
         let type_ = match type_ {
             FileType::File => StatMode::FILE,
             FileType::Dir => StatMode::DIR,
