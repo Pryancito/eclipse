@@ -649,6 +649,22 @@ impl<P: Policy> UserInPtr<IoVec<P>> {
     /// unsigned, and a 32-bit address is an address in the low 4 GiB, never a
     /// negative offset from the top of the address space. This is Linux's
     /// `compat_import_iovec` / `compat_ptr`.
+    ///
+    /// A length above `i32::MAX` is `EINVAL`, even though the wire field is
+    /// unsigned. Linux's `copy_compat_iovec_from_user` reads each one into a
+    /// *signed* `compat_ssize_t` and refuses it if it came out negative, so
+    /// the field's range and the ABI's range are not the same thing.
+    /// **Measured** on this container's Linux with an i386 `writev`:
+    ///
+    /// | `iov_len` | i386 `writev(2)` says |
+    /// |---|---|
+    /// | `0x7fffffff` | accepted (a short write of what was mapped) |
+    /// | `0x80000000` | **`EINVAL`**, nothing transferred |
+    /// | `0xffffffff` | **`EINVAL`**, nothing transferred |
+    ///
+    /// Widening it as a plain number instead lets the request through, and
+    /// then the transfer happens: a program that passes `(size_t)-1` by
+    /// mistake gets bytes moved where Linux would have told it no.
     pub fn read_iovecs32(&self, count: usize) -> Result<IoVecs<P>> {
         if self.0.is_null() {
             return Err(Error::InvalidPointer);
@@ -664,6 +680,10 @@ impl<P: Policy> UserInPtr<IoVec<P>> {
         for entry in entries {
             let base = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
             let len = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+            // `compat_ssize_t`, not `size_t`: see the table above.
+            if len > i32::MAX as u32 {
+                return Err(Error::InvalidLength);
+            }
             vec.push(IoVec {
                 ptr: UserPtr::from(base as usize),
                 len: len as usize,
@@ -1171,7 +1191,13 @@ mod tests {
         init_handler();
         // Every half here has all four of its bytes non-zero and distinct,
         // so a decoder that drops or misplaces one cannot pass.
-        let bytes = iovec32_bytes(&[(0x0804_8000, 64), (0xbfff_f000, 0xfedc_ba98), (1, 0)]);
+        // The long length is `0x7edc_ba98` and not `0xfedc_ba98`: the top
+        // bit of a length is what `compat_ssize_t` refuses (see
+        // `read_iovecs32_refuses_a_length_that_does_not_fit_a_signed_word`),
+        // so a length with it set cannot double as a decoding fixture. The
+        // four bytes are still non-zero and distinct, which is what this test
+        // needs.
+        let bytes = iovec32_bytes(&[(0x0804_8000, 64), (0xbfff_f000, 0x7edc_ba98), (1, 0)]);
         let p = UserInPtr::<IoVecIn>::from(bytes.as_ptr() as usize);
         let vecs = p.read_iovecs32(3).unwrap();
         assert_eq!(vecs.len(), 3);
@@ -1181,10 +1207,10 @@ mod tests {
         // third gigabyte, not a negative offset from the top of the address
         // space: the halves are zero-extended, as `compat_ptr` does.
         assert_eq!(vecs[1].addr(), 0xbfff_f000);
-        assert_eq!(vecs[1].len(), 0xfedc_ba98);
+        assert_eq!(vecs[1].len(), 0x7edc_ba98);
         // A zero-length entry is legal and contributes nothing (POSIX).
         assert_eq!(vecs[2].len(), 0);
-        assert_eq!(vecs.total_len(), 64 + 0xfedc_ba98);
+        assert_eq!(vecs.total_len(), 64 + 0x7edc_ba98);
     }
 
     /// And the reason this function exists: reading the same bytes at the
@@ -1242,16 +1268,43 @@ mod tests {
             Some(Error::InvalidPointer)
         );
         // The overflow check cannot be reached through four-byte lengths ---
-        // 1024 entries of at most 0xffff_ffff sum to about 4 TiB, which fits
-        // a `usize` --- so what this half asserts is that a huge but legal
+        // 1024 entries of at most `i32::MAX` sum to about 2 TiB, which fits a
+        // `usize` --- so what this half asserts is that a huge but legal
         // total is accepted here and left for the caller to bound, exactly as
         // the native width leaves it.
-        let many = iovec32_bytes(&vec![(0x1000, 0xffff_ffff); 1024]);
+        let biggest = i32::MAX as usize;
+        let many = iovec32_bytes(&vec![(0x1000, biggest); 1024]);
         let p = UserInPtr::<IoVecIn>::from(many.as_ptr() as usize);
-        assert_eq!(
-            p.read_iovecs32(1024).unwrap().total_len(),
-            1024 * 0xffff_ffff
-        );
+        assert_eq!(p.read_iovecs32(1024).unwrap().total_len(), 1024 * biggest);
+    }
+
+    /// A length the unsigned wire field holds but the ABI does not: Linux
+    /// reads each one into a signed `compat_ssize_t` and answers `EINVAL` for
+    /// a negative, which is `0x80000000` and up. **Measured** against this
+    /// container's Linux with an i386 `writev`; the table is in
+    /// `read_iovecs32`'s documentation.
+    ///
+    /// The boundary is asserted from both sides, because the interesting part
+    /// is that it is `i32::MAX` and not a round number: `0x7fffffff` is a
+    /// legal length and `0x80000000` is not.
+    #[test]
+    fn read_iovecs32_refuses_a_length_that_does_not_fit_a_signed_word() {
+        init_handler();
+        for (len, expected) in [
+            (0x7fff_ffffusize, None),
+            (0x8000_0000, Some(Error::InvalidLength)),
+            (0xffff_ffff, Some(Error::InvalidLength)),
+        ] {
+            let bytes = iovec32_bytes(&[(0x1000, len)]);
+            let p = UserInPtr::<IoVecIn>::from(bytes.as_ptr() as usize);
+            assert_eq!(p.read_iovecs32(1).err(), expected, "iov_len {:#x}", len);
+        }
+        // And it is the entry's OWN length that is refused, not the total: a
+        // legal entry beside an illegal one still fails, so a list cannot
+        // smuggle one through by being mostly fine.
+        let bytes = iovec32_bytes(&[(0x1000, 16), (0x2000, 0x8000_0000)]);
+        let p = UserInPtr::<IoVecIn>::from(bytes.as_ptr() as usize);
+        assert_eq!(p.read_iovecs32(2).err(), Some(Error::InvalidLength));
     }
 
     #[test]

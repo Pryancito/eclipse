@@ -176,3 +176,59 @@ fn a_32_bit_prlimit64_writes_a_four_aligned_buffer_that_the_native_one_refuses()
 
     assert_eq!(size_of::<RLimit>(), 16, "the same sixteen bytes in both");
 }
+
+/// `ppoll`'s signal mask, the fourth of this shape --- and the one that was
+/// already reachable before the two above were fixed, because `ppoll` went
+/// into `i386_abi_narrow.in` in the fifth batch for its `timespec`.
+///
+/// `Sigset` is a `u64`, so the typed read wants 8. An i386 `sigset_t` is
+/// `unsigned long sig[2]`, which aligns to **4**. Measured on this
+/// container's Linux: an i386 `ppoll(NULL, 0, {0,0}, mask, 8)` with its mask
+/// at `0x0804a02c` --- 4 mod 8 --- answers 0.
+///
+/// This is a read and not a write, so the mutation it guards against is the
+/// opposite one: the mask would be refused with `EFAULT` and `ppoll` would
+/// fail for a program whose mask Linux accepts.
+#[test]
+fn a_32_bit_ppoll_reads_a_four_aligned_sigmask_that_the_native_one_refuses() {
+    let answer = |pid: KoID, top: &'static str, abi: Abi| {
+        let proc = a_process(pid, top, abi);
+        on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let mut room = [0u32; 8];
+                let at = four_mod_eight(&mut room);
+                // A mask that blocks nothing, so what is being asked is only
+                // whether the eight bytes could be read at all.
+                let mut mask: kernel_hal::user::UserOutPtr<u8> = at.into();
+                mask.write_array(&[0u8; 8]).unwrap();
+                // The timeout is `{0, 0}` and goes in a buffer of its own,
+                // 8-aligned: a `timespec` is sixteen bytes here and eight for
+                // a 32-bit caller, and all of them are zero either way, so
+                // the same bytes serve both widths. Keeping it off the
+                // 4-mod-8 address matters --- otherwise the native half would
+                // fail on the TIMEOUT's alignment and the test would pass
+                // without ever reaching the mask.
+                let mut when = [0u64; 2];
+                let ts_at = when.as_mut_ptr() as usize;
+                assert_eq!(ts_at % 8, 0);
+                let mut own = Syscall {
+                    thread: sys.thread,
+                    thread_fn: sys.thread_fn,
+                    syscall_entry: sys.syscall_entry,
+                };
+                own.sys_ppoll(0.into(), 0, ts_at.into(), at.into(), 8).await
+            })
+        })
+    };
+
+    assert_eq!(
+        answer(47_305, "unal_p", Abi::Linux32),
+        Ok(0),
+        "a 32-bit ppoll was refused a mask Linux accepts"
+    );
+    assert_eq!(
+        answer(47_306, "unal_p", Abi::Linux),
+        Err(LxError::EFAULT),
+        "the native alignment check is gone, which is not the fix"
+    );
+}

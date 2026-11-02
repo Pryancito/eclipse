@@ -64,6 +64,8 @@
  *   50  the narrow infinity did not widen to the wide one
  *   51  the two getrlimits did not clamp where they each clamp
  *   52  statx did not fill 256 bytes at a 4-aligned destination
+ *   53  ppoll refused a signal mask aligned to 4 and not to 8
+ *   54  writev accepted an iov_len that does not fit a signed word
  *
  * The last six are the segment registers, which is the second half of what
  * compatibility mode needs and the half `iretq` does not do: it reloads `CS`
@@ -543,14 +545,27 @@ _start:
 	jne	bad_preadv
 
 	/* pwritev(fd2, iov, 2, 0, 0): i386 334. It needs a writable
-	 * descriptor, so this one opens a file of its own under /tmp
-	 * --- O_RDWR | O_CREAT | O_TRUNC, mode 0600 --- gathers six bytes
-	 * into it from two places, and reads them back with pread64 to check
-	 * that the two entries arrived in order and nothing from between them
-	 * came along. */
+	 * descriptor, so this one opens a file of its own under /tmp and
+	 * gathers six bytes into it from two places, then reads them back
+	 * with pread64 to check that the two entries arrived in order and
+	 * nothing from between them came along.
+	 *
+	 * The name is a fixed one in a directory anybody can write, so the
+	 * file is created EXCLUSIVELY -- O_RDWR|O_CREAT|O_EXCL, mode 0600 --
+	 * and the name is unlinked first. Without O_EXCL an existing path is
+	 * opened and its first six bytes overwritten, and a SYMLINK at that
+	 * path sends the write somewhere else entirely and the cleanup
+	 * unlinks the name; this probe is documented as something to run on a
+	 * Linux host, so that would be damage to a real machine's files.
+	 * `unlink` removes the link and not what it points at, so the pair is
+	 * safe: if anybody recreates the path in between, O_EXCL makes the
+	 * step FAIL rather than write through it. */
+	movl	$10, %eax		/* unlink, ENOENT is fine */
+	movl	$tmppath, %ebx
+	int	$0x80
 	movl	$5, %eax		/* open */
 	movl	$tmppath, %ebx
-	movl	$0102, %ecx		/* O_RDWR|O_CREAT|O_TRUNC = 2|64|512 */
+	movl	$0302, %ecx		/* O_RDWR|O_CREAT|O_EXCL = 2|64|128 */
 	movl	$0600, %edx
 	int	$0x80
 	testl	%eax, %eax
@@ -994,6 +1009,76 @@ statx_poison:
 	cmpl	$0, statxbuf + 44	/* the top half of a size under 4 GiB */
 	jne	bad_statx
 
+	/* ppoll(NULL, 0, {0,0}, mask, 8): i386 309, and the same trap in the
+	 * READING direction. A kernel `sigset_t` is one 64-bit word, so a
+	 * typed load wants 8; an i386 `sigset_t` is `unsigned long sig[2]`,
+	 * which aligns to 4, so this mask -- deliberately 4 mod 8, like
+	 * `statxbuf` -- is one Linux reads and a typed load refuses.
+	 *
+	 * Measured on a Linux host before it was written: the same call with
+	 * its mask at an address 4 mod 8 answers 0.
+	 *
+	 * No descriptors and a zero timeout, so it returns at once and what
+	 * the status reports is only whether the arguments were accepted. The
+	 * timeout goes in `zerots`, which is 8-aligned on purpose: at a
+	 * 4-mod-8 address the TIMEOUT would be the thing refused and the step
+	 * would be testing the wrong argument. */
+	movl	$sigmask4, %eax
+	testl	$4, %eax
+	jz	bad_ppoll_mask
+	movl	$0, sigmask4 + 0
+	movl	$0, sigmask4 + 4
+	movl	$0, zerots + 0
+	movl	$0, zerots + 4
+	movl	$0, zerots + 8
+	movl	$0, zerots + 12
+	movl	$309, %eax
+	xorl	%ebx, %ebx		/* no fds */
+	xorl	%ecx, %ecx		/* nfds = 0 */
+	movl	$zerots, %edx
+	movl	$sigmask4, %esi
+	movl	$8, %edi		/* sigsetsize */
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ppoll_mask
+
+	/* writev(1, iov, 1) with iov_len = 0x80000000: i386 146, and the one
+	 * step here that asks for a REFUSAL. The wire field is unsigned, but
+	 * Linux reads each length into a signed `compat_ssize_t` and answers
+	 * EINVAL for a negative one, so the field's range and the ABI's are
+	 * not the same.
+	 *
+	 * Measured on a Linux host: 0x7fffffff is accepted (a short write of
+	 * whatever was mapped) and both 0x80000000 and 0xffffffff are EINVAL
+	 * with nothing transferred. Only the refusal is asserted here,
+	 * because the accepted case writes to the probe's own stdout and its
+	 * byte count depends on how much of the page is mapped.
+	 *
+	 * -EINVAL is -22, and it has to be exactly that: a kernel that
+	 * widened the length as a plain number would move bytes and report a
+	 * count, which is a positive answer and not merely a different
+	 * errno. */
+	movl	page, %eax
+	movl	%eax, iov + 0
+	movl	$0x80000000, iov + 4
+	movl	$146, %eax
+	movl	$1, %ebx
+	movl	$iov, %ecx
+	movl	$1, %edx
+	int	$0x80
+	cmpl	$-22, %eax
+	jne	bad_iov_len
+	/* And 0xffffffff, which is the `(size_t)-1` a program reaches by
+	 * mistake rather than on purpose. */
+	movl	$0xffffffff, iov + 4
+	movl	$146, %eax
+	movl	$1, %ebx
+	movl	$iov, %ecx
+	movl	$1, %edx
+	int	$0x80
+	cmpl	$-22, %eax
+	jne	bad_iov_len
+
 	/* get_thread_area(&tls_desc): i386 244, the other half, and the one a
 	 * debugger uses. It has to hand back the base this program asked for,
 	 * which means the descriptor really does hold it rather than
@@ -1135,6 +1220,12 @@ bad_rlimit_clamp:
 	jmp	die
 bad_statx:
 	movl	$52, %ebx
+	jmp	die
+bad_ppoll_mask:
+	movl	$53, %ebx
+	jmp	die
+bad_iov_len:
+	movl	$54, %ebx
 	jmp	die
 
 	/* Fill the scratch buffer with 0xaa, so that every structure written
@@ -1278,6 +1369,20 @@ statx_pad:
 	.long	0
 statxbuf:
 	.space	320
+
+	/* A `timespec` of zeros, 8-aligned, so that in step 53 the only
+	 * argument at a 4-mod-8 address is the signal mask. All zeros is the
+	 * same bytes at either width, so one buffer serves both. */
+	.align 8
+zerots:
+	.space	16
+
+	/* And the mask, placed 4 mod 8 on purpose: `zerots` is 16 bytes from
+	 * an 8-aligned start, so a single pad word puts this one 4 past a
+	 * boundary. The step checks the address rather than trusting this. */
+	.long	0
+sigmask4:
+	.space	8
 	.align 4
 statbuf:
 	.space	96
