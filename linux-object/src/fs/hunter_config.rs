@@ -739,12 +739,29 @@ mod hunter_config_tests {
         let feeds = dir.create("signatures.d", FileType::Dir, 0o755).unwrap();
         let feed = feeds.create("bazaar", FileType::File, 0o644).unwrap();
         feed.write_at(0, b"bytes:a12a12a12a13:Test.Feed\n").unwrap();
-        let before = hunter::av::stats().1;
         let n = load_signatures(&root, SIGNATURES_FILE);
         assert_eq!(n, 1, "the bad line, and only it, skipped");
         // A feed is all or nothing, and it is whole.
         assert_eq!(super::super::hunter_feeds::load_all(&root), 1);
-        assert_eq!(hunter::av::stats().1, before + 2);
+        // Ask after its own two signatures, by their patterns, and not after a
+        // delta on `stats()`: the signature database belongs to the process and
+        // other tests add to it from other threads, so that delta counts
+        // everybody's. `remove_signature` matches a pattern and says whether it
+        // was there, which is the only question this test has, and it leaves
+        // the database as it found it.
+        for line in [
+            "bytes:a12a12a12a12:Test.Local",
+            "bytes:a12a12a12a13:Test.Feed",
+        ] {
+            let sig = hunter::av::parse_signature(line)
+                .expect("the test's own line parses")
+                .expect("and it is a signature, not a comment");
+            assert!(
+                hunter::av::remove_signature(&sig),
+                "loading did not put `{}` in the database",
+                line
+            );
+        }
     }
 
     #[test]
