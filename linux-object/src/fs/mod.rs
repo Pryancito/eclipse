@@ -1446,6 +1446,19 @@ fn devfs_root_once() -> (Arc<DevFS>, Arc<DevINode>) {
 /// the `/dev` the first one built ([`devfs_root_once`]), so it finds each node
 /// made. In the kernel it runs once and this never fires; anything else is
 /// still fatal, as it was.
+///
+/// In the kernel it keeps the old behaviour exactly: a node that is already
+/// there means `create_root_fs` ran twice, which it must not, so it still
+/// panics. Only the test build tolerates it, and only because there the
+/// second run is the point.
+#[cfg(not(test))]
+fn devfs_mknod(root: &DevINode, name: &str, dev: Arc<dyn INode>) {
+    root.add(name, dev)
+        .unwrap_or_else(|e| panic!("failed to mknod /dev/{}: {:?}", name, e));
+}
+
+/// See [`devfs_mknod`].
+#[cfg(test)]
 fn devfs_mknod(root: &DevINode, name: &str, dev: Arc<dyn INode>) {
     match root.add(name, dev) {
         Ok(()) | Err(rcore_fs::vfs::FsError::EntryExist) => {}
@@ -3002,6 +3015,9 @@ pub fn split_path(path: &str) -> (&str, &str) {
         None => (".", path),
     }
 }
+
+#[cfg(test)]
+mod devfs_once_tests;
 
 #[cfg(test)]
 mod mount_lookup_tests;
