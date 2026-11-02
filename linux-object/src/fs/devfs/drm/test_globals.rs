@@ -95,6 +95,14 @@ pub(crate) fn lock() -> Held {
     Held(g)
 }
 
+/// The acquisition in force, asserting nothing. For code that runs on a
+/// thread no test owns and has to tell whether it still belongs to the test
+/// that set it going -- a HAL timer callback, which fires on an async-std
+/// pool thread some milliseconds after whoever armed it has finished.
+pub(crate) fn acquisition_now() -> u64 {
+    ACQUISITION.load(Ordering::SeqCst)
+}
+
 /// The token for the acquisition in force, to hand to a helper before
 /// spawning it. Taking one asserts that the caller is inside the section,
 /// because a token from outside it names an acquisition that has nothing to
