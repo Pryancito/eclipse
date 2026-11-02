@@ -14,6 +14,14 @@
 //! concurrent namespace mutation could also have caused is asserted
 //! directly, and anything that has to be PRESENT is asked for in a loop
 //! that keeps the first round another test did not clear.
+//!
+//! That loop was not enough, because the tests that interrupt each other
+//! most are the ones in THIS file: every one of them invalidates the cache
+//! or asserts what it holds, so at sixteen threads all 64 rounds of a loop
+//! could be cleared and the test had nothing left to assert. So each test
+//! takes [`super::test_globals::lock`] for its whole body, and the loop is
+//! left for the invalidations that come from elsewhere in the suite --
+//! thirty-odd callers of `dcache_invalidate`, in tests and in syscalls.
 
 use super::*;
 use alloc::format;
@@ -26,6 +34,7 @@ fn an_inode() -> Arc<dyn INode> {
 
 #[test]
 fn a_hit_gives_back_the_inode_under_the_name_the_walk_ended_at() {
+    let _serial = test_globals::lock();
     let inode = an_inode();
     let root = an_inode();
     // A path that is its own name, and one that went through a link, which
@@ -66,6 +75,7 @@ fn a_hit_gives_back_the_inode_under_the_name_the_walk_ended_at() {
 
 #[test]
 fn an_invalidation_is_not_undone_by_the_lookup_that_notices_it() {
+    let _serial = test_globals::lock();
     let inode = an_inode();
     let root = an_inode();
     let path = "/dcache-test/unlinked-right-after";
@@ -91,6 +101,7 @@ fn an_invalidation_is_not_undone_by_the_lookup_that_notices_it() {
 
 #[test]
 fn a_session_start_fits_and_a_full_cache_goes_whole() {
+    let _serial = test_globals::lock();
     let inode = an_inode();
     let root = an_inode();
     let first = "/dcache-test/cap/the-first-one";
@@ -138,6 +149,7 @@ fn a_session_start_fits_and_a_full_cache_goes_whole() {
 /// another test's filesystem and its own next open of it was `ENOENT`.
 #[test]
 fn a_path_put_in_from_one_root_is_not_an_answer_for_another() {
+    let _serial = test_globals::lock();
     let root = an_inode();
     let other_root = an_inode();
     let inode = an_inode();
@@ -164,6 +176,7 @@ fn a_path_put_in_from_one_root_is_not_an_answer_for_another() {
 
 #[test]
 fn a_walk_through_proc_or_a_magic_link_is_not_kept() {
+    let _serial = test_globals::lock();
     let inode = an_inode();
     let root = an_inode();
     let plain = "/dcache-test/kept-beside-them";
@@ -202,6 +215,7 @@ fn a_walk_through_proc_or_a_magic_link_is_not_kept() {
 /// until a name is created or removed.
 #[test]
 fn a_path_that_names_nothing_is_remembered_until_a_name_changes() {
+    let _serial = test_globals::lock();
     let root = an_inode();
     let other = an_inode();
     let path = "/dcache-test/absent/libfoo.so";
@@ -235,6 +249,7 @@ fn a_path_that_names_nothing_is_remembered_until_a_name_changes() {
 /// bumped the epoch, and the miss the walk already decided must not be stored.
 #[test]
 fn a_miss_from_before_a_namespace_change_is_not_stored() {
+    let _serial = test_globals::lock();
     let root = an_inode();
     let path = "/dcache-test/absent/created-while-we-walked";
     let mut rounds = 0;
@@ -254,6 +269,7 @@ fn a_miss_from_before_a_namespace_change_is_not_stored() {
 /// one is too: it is not the filesystem's answer.
 #[test]
 fn a_miss_through_a_magic_link_is_not_kept() {
+    let _serial = test_globals::lock();
     let root = an_inode();
     let path = "/dcache-test/absent/through-proc-self-fd";
     let mut through = Walked::default();

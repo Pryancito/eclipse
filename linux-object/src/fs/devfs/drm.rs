@@ -6082,8 +6082,40 @@ fn deliver_pending_drm_timer() {
     // Everything scheduled for this vblank boundary completes together — the
     // queue holds at most one Flip (flush_pending_flip_completions drains any
     // outstanding one before accepting a new flip) plus any vblank waits.
-    let jobs: Vec<PendingDrmTimer> = PENDING_DRM_TIMERS.lock().drain(..).collect();
-    let now_seq = vblank_seq_now();
+    //
+    // Only the jobs whose vblank has come leave the queue; the rest stay in
+    // it, in order and keeping it, under one acquisition of its lock -- the
+    // shape `send_pending_vblank_events_on_off` already uses. This used to
+    // `drain(..)` the whole queue into a local and push the not-due ones back
+    // after, and in that window the queue said it held no waits at all: a
+    // reader on another thread sees a job it is still owed simply gone, with
+    // nothing to tell it from the truth. In the suite that reader is whichever
+    // test asserts about its own job while a timer armed by an earlier test
+    // fires on an async-std pool thread, so the test that failed was never
+    // the one at fault.
+    // One sample for the whole delivery: counter and time together.
+    let (now_seq, now_time_ns) = vblank_seq_and_time_now();
+    let jobs: Vec<PendingDrmTimer> = {
+        let mut queue = PENDING_DRM_TIMERS.lock();
+        // Its vblank has come, wrap-safe; a flip's always has.
+        let due_now = |job: &PendingDrmTimer| match job {
+            PendingDrmTimer::Flip { .. } => true,
+            PendingDrmTimer::Vblank { due_seq, .. } | PendingDrmTimer::Sequence { due_seq, .. } => {
+                (due_seq.wrapping_sub(now_seq) as i32) <= 0
+            }
+        };
+        let mut due = Vec::new();
+        let mut waiting = VecDeque::with_capacity(queue.len());
+        while let Some(job) = queue.pop_front() {
+            if due_now(&job) {
+                due.push(job);
+            } else {
+                waiting.push_back(job);
+            }
+        }
+        *queue = waiting;
+        due
+    };
     for job in jobs {
         match job {
             PendingDrmTimer::Flip {
@@ -6093,40 +6125,16 @@ fn deliver_pending_drm_timer() {
                 event,
                 out_fence,
             } => complete_flip(crtc_id, user_data, file, event, out_fence),
-            PendingDrmTimer::Vblank {
-                signal,
-                due_seq,
-                file,
-            } => {
-                // Not due yet (wrap-safe compare): keep it for a later vblank.
-                if (due_seq.wrapping_sub(now_seq) as i32) > 0 {
-                    PENDING_DRM_TIMERS
-                        .lock()
-                        .push_back(PendingDrmTimer::Vblank {
-                            signal,
-                            due_seq,
-                            file,
-                        });
-                } else if let Some(file) = file.upgrade() {
+            PendingDrmTimer::Vblank { signal, file, .. } => {
+                if let Some(file) = file.upgrade() {
                     queue_vblank_event(&file, now_seq, signal);
                 }
             }
             PendingDrmTimer::Sequence {
-                user_data,
-                due_seq,
-                file,
+                user_data, file, ..
             } => {
-                // Paced like a vblank wait: not due yet, back in the queue.
-                if (due_seq.wrapping_sub(now_seq) as i32) > 0 {
-                    PENDING_DRM_TIMERS
-                        .lock()
-                        .push_back(PendingDrmTimer::Sequence {
-                            user_data,
-                            due_seq,
-                            file,
-                        });
-                } else if let Some(file) = file.upgrade() {
-                    queue_crtc_sequence_event(&file, now_seq, user_data);
+                if let Some(file) = file.upgrade() {
+                    queue_crtc_sequence_event(&file, now_seq, now_time_ns, user_data);
                 }
             }
         }
@@ -6152,7 +6160,39 @@ fn arm_coalesced_drm_timer_locked() {
         deliver_pending_drm_timer();
         return;
     }
-    kernel_hal::timer::timer_set(deadline, Box::new(move |_| deliver_pending_drm_timer()));
+    // The acquisition of the test lock this arming belongs to, read before the
+    // timer is set so the callback can tell whether it still does. In a release
+    // build there is no test lock and no guard: this is `#[cfg(test)]` only.
+    #[cfg(test)]
+    let armed_in = test_globals::acquisition_now();
+    kernel_hal::timer::timer_set(
+        deadline,
+        Box::new(move |_| {
+            // A timer armed by a test that has since finished still fires, on
+            // an async-std pool thread holding no test lock, up to a vblank
+            // period later -- by which time another test is running with jobs
+            // of its own. The callback then delivered THAT test's flip, and
+            // the test that failed was the one that queued it, not the one
+            // that left the timer behind. A callback whose acquisition is no
+            // longer the one in force has nothing left to deliver for anybody,
+            // so it returns. `DRM_TIMER_ARMED` cannot stand in: one bit, it
+            // says only that SOME arming is outstanding, and the tests clear
+            // it themselves. This is what `join_as_helper` asks of a helper
+            // thread, same counter, same reason: the work has to belong to
+            // the section it lands in.
+            #[cfg(test)]
+            if test_globals::acquisition_now() != armed_in {
+                // Still release the armed bit, which is what the delivery
+                // below would have done. Left set it would latch:
+                // `arm_coalesced_drm_timer_locked` returns early on it, so
+                // every later arming in the process would be a no-op and the
+                // next test would wait for a timer nobody set.
+                DRM_TIMER_ARMED.store(false, Ordering::Release);
+                return;
+            }
+            deliver_pending_drm_timer()
+        }),
+    );
 }
 
 fn arm_coalesced_drm_timer(pending: PendingDrmTimer) {
@@ -6413,7 +6453,7 @@ fn send_pending_vblank_events_on_off() {
     if taken.is_empty() {
         return;
     }
-    let now_seq = vblank_seq_now();
+    let (now_seq, now_time_ns) = vblank_seq_and_time_now();
     for job in taken {
         match job {
             PendingDrmTimer::Vblank { signal, file, .. } => {
@@ -6425,7 +6465,7 @@ fn send_pending_vblank_events_on_off() {
                 user_data, file, ..
             } => {
                 if let Some(file) = file.upgrade() {
-                    queue_crtc_sequence_event(&file, now_seq, user_data);
+                    queue_crtc_sequence_event(&file, now_seq, now_time_ns, user_data);
                 }
             }
             // Kept in the queue above.
@@ -6871,9 +6911,16 @@ pub fn queue_vblank_event(file: &DrmFileState, seq: u32, user_data: u64) {
 /// u64 sequence }`, 32 bytes like the vblank event but stamped in
 /// nanoseconds with the time of the vblank it names (`send_vblank_event`
 /// fills `e->event.seq` from `drm_vblank_count_and_time`).
-fn queue_crtc_sequence_event(file: &DrmFileState, seq: u32, user_data: u64) {
+///
+/// `seq` and `time_ns` are the ONE pair [`vblank_seq_and_time_now`] returns,
+/// sampled once by the caller for every event it sends. This used to take only
+/// `seq` and sample the clock again here, throwing that sample's own sequence
+/// away -- so when a vblank boundary fell between the two readings, the event
+/// named one vblank and carried the timestamp of the next, exactly one period
+/// out. That is the pair `drm_vblank_count_and_time` keeps together, and a
+/// compositor deriving its next deadline from `time_ns` lands a frame off.
+fn queue_crtc_sequence_event(file: &DrmFileState, seq: u32, time_ns: u64, user_data: u64) {
     const DRM_EVENT_CRTC_SEQUENCE: u32 = 3;
-    let (_, time_ns) = vblank_seq_and_time_now();
     let mut buf = [0u8; 32];
     buf[0..4].copy_from_slice(&DRM_EVENT_CRTC_SEQUENCE.to_ne_bytes());
     buf[4..8].copy_from_slice(&32u32.to_ne_bytes());

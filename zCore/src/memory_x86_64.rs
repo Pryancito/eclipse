@@ -2697,6 +2697,15 @@ cfg_if! {
         }
 
         /// No heap of our own under `libos`, so nothing grown to give back.
+        ///
+        /// `#[allow(dead_code)]` like the two above it: the only caller is
+        /// `reclaimd`, which hangs off `primary_main`, and whether that counts
+        /// as a use under `libos` is not the same on the CI runner as it is
+        /// here -- it is this that made `test-libos` red while the same
+        /// command, toolchain and a clean target directory built green. The
+        /// function is kept so both arms of the `cfg_if` expose the same
+        /// surface, which is exactly what this attribute is for here.
+        #[allow(dead_code)]
         pub fn release_idle_heap(_want: usize) -> usize {
             0
         }

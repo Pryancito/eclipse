@@ -36,13 +36,46 @@ fn a_signal_an_unknown_bit_or_a_missing_pipe_is_refused_before_the_wait() {
     // The shapes libdrm sends on a one-head card all go through: a
     // relative query, the same with the high-CRTC field naming pipe 0,
     // NEXTONMISS, and the event form.
+    //
+    // The counter runs on the clock, so the pipe-0 reply is bracketed between
+    // two readings instead of pinned to the one before it, the way
+    // `the_event_form_replies_with_the_vblank_it_queued` below brackets its
+    // own. Pinning it asserted that no vblank boundary fell between two
+    // ioctls, which at sixteen threads is not something this test can ask for:
+    // a 60 Hz boundary every 16.7 ms and a scheduler that can take the thread
+    // away in between. What it means to assert is that the high-CRTC field
+    // naming pipe 0 IS pipe 0 -- this arm answered every pipe with pipe 0's
+    // counter -- and a bracket says that and nothing about the clock.
+    let before = wait(&c, RELATIVE, 0).expect("a relative query");
+    let pipe0 = wait(&c, RELATIVE | high_crtc(0), 0).expect("high-CRTC pipe 0");
     let now = wait(&c, RELATIVE, 0).expect("a relative query");
-    assert_eq!(wait(&c, RELATIVE | high_crtc(0), 0), Ok(now));
+    assert!(
+        (pipe0.wrapping_sub(before) as i32) >= 0 && (now.wrapping_sub(pipe0) as i32) >= 0,
+        "high-CRTC pipe 0 answered {}, outside {}..{}",
+        pipe0,
+        before,
+        now
+    );
     assert_eq!(
         wait(&c, RELATIVE | _DRM_VBLANK_NEXTONMISS_FLAG, 0).map(|s| s >= now),
         Ok(true)
     );
     assert_eq!(wait(&c, RELATIVE | _DRM_VBLANK_EVENT, 1).is_ok(), true);
+
+    // The refusals go through an fd of their own, and the read at the end is
+    // of that one.
+    //
+    // The accepted event form above is owed an event at the next vblank, and
+    // a real timer delivers it: `arm_coalesced_drm_timer` sets one on the HAL,
+    // which under libos is an async-std task that sleeps about 16.7 ms and
+    // then posts the event to the fd that asked. So "the fd carries nothing"
+    // held only while the rest of this test body ran inside one vblank
+    // period, and at sixteen threads it does not: the event lands, the read
+    // returns `Ok(32)` instead of `Again`, and the test reads as a regression
+    // in the refusals it was never about. This fd was owed nothing by
+    // anybody, so the read below says what the test means it to say.
+    drop(c);
+    let c = Client::open(0);
 
     // Signals: EINVAL, whatever else is set.
     for typ in [
@@ -71,9 +104,8 @@ fn a_signal_an_unknown_bit_or_a_missing_pipe_is_refused_before_the_wait() {
     ] {
         assert_eq!(wait(&c, typ, 0), Err(FsError::InvalidParam), "{typ:#x}");
     }
-    // Refused before anything is scheduled: the fd carries nothing (the
-    // one accepted event above is owed at the next vblank, which no
-    // timer delivers here).
+    // Refused before anything is scheduled: nothing was queued on this fd,
+    // so it carries nothing.
     let mut buf = [0u8; 128];
     assert_eq!(c.read_events(&mut buf), Err(FsError::Again));
 }
