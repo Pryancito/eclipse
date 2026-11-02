@@ -114,6 +114,7 @@ use linux_object::error::LxError;
 mod fcntl;
 mod iovec;
 mod rlimit;
+mod socketcall;
 mod stat;
 mod tls;
 mod wide;
@@ -153,6 +154,10 @@ const I386_FSTATAT64: u32 = 300;
 const I386_SETRLIMIT: u32 = 75;
 const I386_OLD_GETRLIMIT: u32 = 76;
 const I386_UGETRLIMIT: u32 = 191;
+
+/// `socketcall`, the one number behind which i386 keeps all twenty socket
+/// calls. See [`socketcall`].
+const I386_SOCKETCALL: u32 = 102;
 
 /// And the scatter/gather calls whose offset arrives split across two
 /// registers. `readv` (145) and `writev` (146) are not here: their only
@@ -233,6 +238,10 @@ impl Syscall<'_> {
             // `readv` (145) and `writev` (146) are not here: see
             // `i386_abi_narrow.in`. These two are, because the offset
             // arrives in two registers. See [`iovec`].
+            // `socketcall` multiplexes twenty calls through one number,
+            // with the real arguments in a block of memory. See
+            // [`socketcall`].
+            I386_SOCKETCALL => return syscall_ret(self.sys_socketcall(a0, a1).await),
             I386_PREADV => return syscall_ret(self.sys_preadv32(a0, a1, a2, a3, a4).await),
             I386_PWRITEV => return syscall_ret(self.sys_pwritev32(a0, a1, a2, a3, a4)),
             _ => {}
@@ -262,3 +271,6 @@ impl Syscall<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod unaligned_tests;

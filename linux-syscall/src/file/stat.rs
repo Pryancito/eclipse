@@ -139,7 +139,12 @@ impl Syscall<'_> {
         {
             x.set_atomic_write_unit(unit);
         }
-        statxbuf.write(x)?;
+        // `struct statx` is the same 256 bytes in both ABIs --- it was
+        // designed that way --- but on i386 a `long long` is aligned to 4,
+        // so a 32-bit program's `struct statx *` is 4-aligned and the typed
+        // write would answer EFAULT for a pointer Linux accepts. See
+        // [`crate::narrow`].
+        crate::narrow::wide_put_unaligned(self.narrow_abi(), &mut statxbuf, x)?;
         Ok(0)
     }
 }

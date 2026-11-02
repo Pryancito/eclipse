@@ -283,14 +283,40 @@ impl<T, P: Policy> UserPtr<T, P> {
         Ok(())
     }
 
+    /// [`check_len_for`](Self::check_len_for) without the alignment
+    /// requirement: for a copy that goes through bytes and so has none.
+    fn check_len_for_unaligned(&self, count: usize, access: MMUFlags) -> Result<()> {
+        let bytes = self.user_bytes_with(count, 1)?;
+        if !crate::KHANDLER.check_user_access(self.0 as usize, bytes, access) {
+            return Err(Error::InvalidPointer);
+        }
+        if !crate::KHANDLER.check_user_range(self.0 as usize, bytes) {
+            return Err(Error::InvalidPointer);
+        }
+        Ok(())
+    }
+
     /// The bytes `count` elements from here take, when the pointer is
     /// neither null nor unaligned and they all lie in the user half.
     fn user_bytes(&self, count: usize) -> Result<usize> {
+        self.user_bytes_with(count, core::mem::align_of::<T>())
+    }
+
+    /// [`user_bytes`](Self::user_bytes) with the alignment named, so that a
+    /// copy that goes through bytes can ask for 1 --- which is what
+    /// `copy_to_user` requires, and all it requires.
+    ///
+    /// The alignment this type needs is not the alignment the CALLER's ABI
+    /// gives it: on i386 a `long long` is aligned to 4, so a 32-bit
+    /// program's `struct rlimit64 *` or `struct statx *` is 4-aligned where
+    /// the same structure here is 8-aligned. Insisting would answer `EFAULT`
+    /// to a pointer Linux accepts. See `linux_syscall::narrow`.
+    fn user_bytes_with(&self, count: usize, align: usize) -> Result<usize> {
         let bytes = count
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(Error::InvalidLength)?;
         if !self.0.is_null()
-            && (self.0 as usize).is_multiple_of(core::mem::align_of::<T>())
+            && (self.0 as usize).is_multiple_of(align)
             && in_user_half(self.0 as usize, bytes)
         {
             Ok(bytes)
@@ -322,6 +348,18 @@ impl<T, P: Read> UserPtr<T, P> {
     pub fn read(&self) -> Result<T> {
         self.check_len_for(1, MMUFlags::READ)?;
         Ok(unsafe { self.0.read() })
+    }
+
+    /// [`read`](Self::read) with **no** alignment requirement, which is
+    /// what `copy_from_user` has.
+    ///
+    /// For a structure a 32-bit process passes: the same layout, aligned to
+    /// 4 rather than to 8, because on i386 a `long long` aligns to 4. The
+    /// aligned `read` answers `EFAULT` for such a pointer, which Linux
+    /// accepts. See `linux_syscall::narrow`.
+    pub fn read_unaligned(&self) -> Result<T> {
+        self.check_len_for_unaligned(1, MMUFlags::READ)?;
+        Ok(unsafe { self.0.read_unaligned() })
     }
 
     // 和读取一样，
@@ -464,6 +502,26 @@ impl<T, P: Write> UserPtr<T, P> {
         Ok(())
     }
 
+    /// [`write`](Self::write) with **no** alignment requirement, which is
+    /// what `copy_to_user` has. The counterpart of
+    /// [`read_unaligned`](UserPtr::read_unaligned); see it for why.
+    pub fn write_unaligned(&mut self, value: T) -> Result<()> {
+        self.check_len_for_unaligned(1, MMUFlags::WRITE)?;
+        #[cfg(all(not(feature = "libos"), feature = "uleak-scan"))]
+        dbg_scan_physmap_leak(
+            unsafe {
+                core::slice::from_raw_parts(
+                    &value as *const T as *const u8,
+                    core::mem::size_of::<T>(),
+                )
+            },
+            self.0 as usize,
+            "write_unaligned",
+        );
+        unsafe { self.0.write_unaligned(value) };
+        Ok(())
+    }
+
     /// The checks [`write`](Self::write) makes before its store, without the
     /// store: whether one value could be written here now.
     ///
@@ -591,6 +649,22 @@ impl<P: Policy> UserInPtr<IoVec<P>> {
     /// unsigned, and a 32-bit address is an address in the low 4 GiB, never a
     /// negative offset from the top of the address space. This is Linux's
     /// `compat_import_iovec` / `compat_ptr`.
+    ///
+    /// A length above `i32::MAX` is `EINVAL`, even though the wire field is
+    /// unsigned. Linux's `copy_compat_iovec_from_user` reads each one into a
+    /// *signed* `compat_ssize_t` and refuses it if it came out negative, so
+    /// the field's range and the ABI's range are not the same thing.
+    /// **Measured** on this container's Linux with an i386 `writev`:
+    ///
+    /// | `iov_len` | i386 `writev(2)` says |
+    /// |---|---|
+    /// | `0x7fffffff` | accepted (a short write of what was mapped) |
+    /// | `0x80000000` | **`EINVAL`**, nothing transferred |
+    /// | `0xffffffff` | **`EINVAL`**, nothing transferred |
+    ///
+    /// Widening it as a plain number instead lets the request through, and
+    /// then the transfer happens: a program that passes `(size_t)-1` by
+    /// mistake gets bytes moved where Linux would have told it no.
     pub fn read_iovecs32(&self, count: usize) -> Result<IoVecs<P>> {
         if self.0.is_null() {
             return Err(Error::InvalidPointer);
@@ -606,6 +680,10 @@ impl<P: Policy> UserInPtr<IoVec<P>> {
         for entry in entries {
             let base = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
             let len = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+            // `compat_ssize_t`, not `size_t`: see the table above.
+            if len > i32::MAX as u32 {
+                return Err(Error::InvalidLength);
+            }
             vec.push(IoVec {
                 ptr: UserPtr::from(base as usize),
                 len: len as usize,
@@ -901,6 +979,134 @@ mod tests {
         );
     }
 
+    // ---- the unaligned pair ---------------------------------------------
+
+    /// A structure whose alignment the caller's ABI does not give it. On
+    /// i386 a `long long` aligns to 4, so a 32-bit program's
+    /// `struct rlimit64 *` or `struct statx *` is 4-aligned where the same
+    /// structure is 8-aligned here, and `copy_to_user` accepts it.
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    #[repr(C)]
+    struct TwoWords {
+        first: u64,
+        second: u64,
+    }
+
+    /// An address inside `room` that is a multiple of 4 and not of 8 ---
+    /// which is exactly the pointer a 32-bit program hands over.
+    fn four_aligned(room: &mut [u32]) -> usize {
+        let base = room.as_mut_ptr() as usize;
+        let at = if base.is_multiple_of(8) {
+            base + 4
+        } else {
+            base
+        };
+        assert!(at.is_multiple_of(4) && !at.is_multiple_of(8));
+        at
+    }
+
+    #[test]
+    fn the_unaligned_pair_writes_and_reads_where_the_typed_one_refuses() {
+        init_handler();
+        let mut room = [0u32; 8];
+        let at = four_aligned(&mut room);
+        let value = TwoWords {
+            first: 1234,
+            second: u64::MAX,
+        };
+
+        let mut typed = UserInOutPtr::<TwoWords>::from(at);
+        assert_eq!(
+            typed.write(value),
+            Err(Error::InvalidPointer),
+            "the typed store has to insist on align_of::<T>()"
+        );
+        assert_eq!(typed.read(), Err(Error::InvalidPointer), "and so does it");
+
+        typed
+            .write_unaligned(value)
+            .expect("copy_to_user requires no alignment");
+        assert_eq!(
+            typed.read_unaligned(),
+            Ok(value),
+            "and the value comes back whole"
+        );
+
+        // The native layout, not a repacked one: sixteen bytes with the
+        // second word eight along.
+        let bytes = UserInPtr::<u8>::from(at).read_array(16).unwrap();
+        assert_eq!(&bytes[0..8], &1234u64.to_ne_bytes());
+        assert_eq!(&bytes[8..16], &u64::MAX.to_ne_bytes());
+    }
+
+    /// The alignment is the only check it drops: a null pointer and one
+    /// outside the user half are refused exactly as before.
+    ///
+    /// The second half needs the strict switch turned on, because this suite
+    /// runs under `libos`, where the user-half bound is lifted by default so
+    /// the host's own buffers can be addressed. Without it the kernel
+    /// pointer would pass for a reason that has nothing to do with these two
+    /// methods, and the test would be claiming a check it never made.
+    ///
+    /// The check it pins is the `in_user_half` inside
+    /// [`user_bytes_with`](Self::user_bytes_with) --- checked by mutation:
+    /// dropping that one makes this test fail, while dropping either
+    /// `KHANDLER` call in `check_len_for_unaligned` does not, because those
+    /// two ask the handler about access flags and its own ranges and answer
+    /// yes for both of these addresses under `libos`. So this is the shared
+    /// bound, which is what makes it worth pinning from the unaligned side:
+    /// the split into `user_bytes_with` is where it could have been lost.
+    ///
+    /// The
+    /// switch is per-thread (see
+    /// `the_strict_switch_applies_the_user_half_bound_on_this_thread_only`)
+    /// and is put back before anything is asserted, so a failing assertion
+    /// cannot leave it on for whatever this thread runs next.
+    #[test]
+    fn the_unaligned_pair_still_refuses_a_null_and_a_kernel_pointer() {
+        init_handler();
+        let zero = TwoWords {
+            first: 0,
+            second: 0,
+        };
+        let mut null = UserOutPtr::<TwoWords>::from(0);
+        assert_eq!(null.write_unaligned(zero), Err(Error::InvalidPointer));
+        assert_eq!(
+            UserInPtr::<TwoWords>::from(0).read_unaligned(),
+            Err(Error::InvalidPointer)
+        );
+
+        // A kernel-half address, and one whose START is in the user half but
+        // whose sixteen bytes run past the end: the check is over the whole
+        // range and not over the first byte.
+        #[cfg(feature = "libos")]
+        {
+            const KERNEL_PTR: usize = 0xffff_8000_0000_0000;
+            let crossing = USER_MAX - 8;
+            set_strict_user_half(true);
+            let answers = [
+                UserOutPtr::<TwoWords>::from(KERNEL_PTR).write_unaligned(zero),
+                UserOutPtr::<TwoWords>::from(crossing).write_unaligned(zero),
+            ];
+            let reads = [
+                UserInPtr::<TwoWords>::from(KERNEL_PTR).read_unaligned(),
+                UserInPtr::<TwoWords>::from(crossing).read_unaligned(),
+            ];
+            set_strict_user_half(false);
+            for (at, got) in [KERNEL_PTR, crossing].iter().zip(answers.iter()) {
+                assert_eq!(*got, Err(Error::InvalidPointer), "write at {:#x}", at);
+            }
+            for (at, got) in [KERNEL_PTR, crossing].iter().zip(reads.iter()) {
+                assert_eq!(
+                    got.as_ref().err(),
+                    Some(&Error::InvalidPointer),
+                    "read at {:#x}",
+                    at
+                );
+            }
+        }
+    }
+
     // ---- copies ---------------------------------------------------------
 
     #[test]
@@ -1034,7 +1240,13 @@ mod tests {
         init_handler();
         // Every half here has all four of its bytes non-zero and distinct,
         // so a decoder that drops or misplaces one cannot pass.
-        let bytes = iovec32_bytes(&[(0x0804_8000, 64), (0xbfff_f000, 0xfedc_ba98), (1, 0)]);
+        // The long length is `0x7edc_ba98` and not `0xfedc_ba98`: the top
+        // bit of a length is what `compat_ssize_t` refuses (see
+        // `read_iovecs32_refuses_a_length_that_does_not_fit_a_signed_word`),
+        // so a length with it set cannot double as a decoding fixture. The
+        // four bytes are still non-zero and distinct, which is what this test
+        // needs.
+        let bytes = iovec32_bytes(&[(0x0804_8000, 64), (0xbfff_f000, 0x7edc_ba98), (1, 0)]);
         let p = UserInPtr::<IoVecIn>::from(bytes.as_ptr() as usize);
         let vecs = p.read_iovecs32(3).unwrap();
         assert_eq!(vecs.len(), 3);
@@ -1044,10 +1256,10 @@ mod tests {
         // third gigabyte, not a negative offset from the top of the address
         // space: the halves are zero-extended, as `compat_ptr` does.
         assert_eq!(vecs[1].addr(), 0xbfff_f000);
-        assert_eq!(vecs[1].len(), 0xfedc_ba98);
+        assert_eq!(vecs[1].len(), 0x7edc_ba98);
         // A zero-length entry is legal and contributes nothing (POSIX).
         assert_eq!(vecs[2].len(), 0);
-        assert_eq!(vecs.total_len(), 64 + 0xfedc_ba98);
+        assert_eq!(vecs.total_len(), 64 + 0x7edc_ba98);
     }
 
     /// And the reason this function exists: reading the same bytes at the
@@ -1105,16 +1317,43 @@ mod tests {
             Some(Error::InvalidPointer)
         );
         // The overflow check cannot be reached through four-byte lengths ---
-        // 1024 entries of at most 0xffff_ffff sum to about 4 TiB, which fits
-        // a `usize` --- so what this half asserts is that a huge but legal
+        // 1024 entries of at most `i32::MAX` sum to about 2 TiB, which fits a
+        // `usize` --- so what this half asserts is that a huge but legal
         // total is accepted here and left for the caller to bound, exactly as
         // the native width leaves it.
-        let many = iovec32_bytes(&vec![(0x1000, 0xffff_ffff); 1024]);
+        let biggest = i32::MAX as usize;
+        let many = iovec32_bytes(&vec![(0x1000, biggest); 1024]);
         let p = UserInPtr::<IoVecIn>::from(many.as_ptr() as usize);
-        assert_eq!(
-            p.read_iovecs32(1024).unwrap().total_len(),
-            1024 * 0xffff_ffff
-        );
+        assert_eq!(p.read_iovecs32(1024).unwrap().total_len(), 1024 * biggest);
+    }
+
+    /// A length the unsigned wire field holds but the ABI does not: Linux
+    /// reads each one into a signed `compat_ssize_t` and answers `EINVAL` for
+    /// a negative, which is `0x80000000` and up. **Measured** against this
+    /// container's Linux with an i386 `writev`; the table is in
+    /// `read_iovecs32`'s documentation.
+    ///
+    /// The boundary is asserted from both sides, because the interesting part
+    /// is that it is `i32::MAX` and not a round number: `0x7fffffff` is a
+    /// legal length and `0x80000000` is not.
+    #[test]
+    fn read_iovecs32_refuses_a_length_that_does_not_fit_a_signed_word() {
+        init_handler();
+        for (len, expected) in [
+            (0x7fff_ffffusize, None),
+            (0x8000_0000, Some(Error::InvalidLength)),
+            (0xffff_ffff, Some(Error::InvalidLength)),
+        ] {
+            let bytes = iovec32_bytes(&[(0x1000, len)]);
+            let p = UserInPtr::<IoVecIn>::from(bytes.as_ptr() as usize);
+            assert_eq!(p.read_iovecs32(1).err(), expected, "iov_len {:#x}", len);
+        }
+        // And it is the entry's OWN length that is refused, not the total: a
+        // legal entry beside an illegal one still fails, so a list cannot
+        // smuggle one through by being mostly fine.
+        let bytes = iovec32_bytes(&[(0x1000, 16), (0x2000, 0x8000_0000)]);
+        let p = UserInPtr::<IoVecIn>::from(bytes.as_ptr() as usize);
+        assert_eq!(p.read_iovecs32(2).err(), Some(Error::InvalidLength));
     }
 
     #[test]

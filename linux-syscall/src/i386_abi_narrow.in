@@ -79,6 +79,12 @@ writev
 // `u32` futex word or a scalar.
 futex
 
+// struct statx: the SAME 256 bytes in both ABIs -- it was designed that way
+// -- and still a conversion for the same reason as `prlimit64` below: on
+// i386 a `long long` aligns to 4, so a 32-bit program's `struct statx *` is
+// 4-aligned and the typed write would insist on 8.
+statx
+
 // struct rlimit64: the SAME sixteen bytes in both ABIs, and still a
 // conversion, because on i386 a `long long` is aligned to 4 and `UserPtr`
 // insists on 8. The handler writes the native layout as bytes

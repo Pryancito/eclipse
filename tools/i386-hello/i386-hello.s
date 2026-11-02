@@ -63,6 +63,11 @@
  *   49  ugetrlimit wrote the wrong shape of rlimit
  *   50  the narrow infinity did not widen to the wide one
  *   51  the two getrlimits did not clamp where they each clamp
+ *   52  statx did not fill 256 bytes at a 4-aligned destination
+ *   53  ppoll refused a signal mask aligned to 4 and not to 8
+ *   54  writev accepted an iov_len that does not fit a signed word
+ *   55  socketcall did not carry a socketpair through its argument block
+ *   56  socketcall read past the end of a block that ends at a page
  *
  * The last six are the segment registers, which is the second half of what
  * compatibility mode needs and the half `iretq` does not do: it reloads `CS`
@@ -542,14 +547,27 @@ _start:
 	jne	bad_preadv
 
 	/* pwritev(fd2, iov, 2, 0, 0): i386 334. It needs a writable
-	 * descriptor, so this one opens a file of its own under /tmp
-	 * --- O_RDWR | O_CREAT | O_TRUNC, mode 0600 --- gathers six bytes
-	 * into it from two places, and reads them back with pread64 to check
-	 * that the two entries arrived in order and nothing from between them
-	 * came along. */
+	 * descriptor, so this one opens a file of its own under /tmp and
+	 * gathers six bytes into it from two places, then reads them back
+	 * with pread64 to check that the two entries arrived in order and
+	 * nothing from between them came along.
+	 *
+	 * The name is a fixed one in a directory anybody can write, so the
+	 * file is created EXCLUSIVELY -- O_RDWR|O_CREAT|O_EXCL, mode 0600 --
+	 * and the name is unlinked first. Without O_EXCL an existing path is
+	 * opened and its first six bytes overwritten, and a SYMLINK at that
+	 * path sends the write somewhere else entirely and the cleanup
+	 * unlinks the name; this probe is documented as something to run on a
+	 * Linux host, so that would be damage to a real machine's files.
+	 * `unlink` removes the link and not what it points at, so the pair is
+	 * safe: if anybody recreates the path in between, O_EXCL makes the
+	 * step FAIL rather than write through it. */
+	movl	$10, %eax		/* unlink, ENOENT is fine */
+	movl	$tmppath, %ebx
+	int	$0x80
 	movl	$5, %eax		/* open */
 	movl	$tmppath, %ebx
-	movl	$0102, %ecx		/* O_RDWR|O_CREAT|O_TRUNC = 2|64|512 */
+	movl	$0302, %ecx		/* O_RDWR|O_CREAT|O_EXCL = 2|64|128 */
 	movl	$0600, %edx
 	int	$0x80
 	testl	%eax, %eax
@@ -943,6 +961,253 @@ _start:
 	cmpl	$0xaaaaaaaa, tbuf + 8
 	jne	bad_rlimit_clamp
 
+	/* statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, buf): i386 383, and
+	 * the third shape of the same trouble. `struct statx` is the SAME 256
+	 * bytes in both ABIs -- it was designed that way -- so nothing about
+	 * its layout needs converting. What differs is that on i386 a
+	 * `long long` aligns to 4, so this buffer, at an address that is a
+	 * multiple of 4 and not of 8, is a perfectly good `struct statx *`
+	 * here and one a typed store in the kernel would refuse.
+	 *
+	 * Which makes the FIRST check the address itself: if the linker ever
+	 * puts `tbuf` on an eight-byte boundary this step stops testing what
+	 * it is for, and saying so is better than passing for the wrong
+	 * reason. */
+	movl	$statxbuf, %eax
+	testl	$4, %eax
+	jz	bad_statx
+	movl	$statxbuf, %edi
+	movl	$320, %ecx
+	movl	$0xaaaaaaaa, %eax
+statx_poison:
+	movl	%eax, (%edi)
+	addl	$4, %edi
+	subl	$4, %ecx
+	jnz	statx_poison
+	movl	$383, %eax
+	movl	fd, %ebx
+	movl	$emptystr, %ecx
+	movl	$0x1000, %edx		/* AT_EMPTY_PATH */
+	movl	$0x7ff, %esi		/* STATX_BASIC_STATS */
+	movl	$statxbuf, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_statx
+	/* 256 bytes, so the word at 256 is still the poison. */
+	cmpl	$0xaaaaaaaa, statxbuf + 256
+	jne	bad_statx
+	/* stx_mask at 0 carries at least the basic bits it was asked for. */
+	movl	statxbuf + 0, %eax
+	andl	$0x7ff, %eax
+	cmpl	$0x7ff, %eax
+	jne	bad_statx
+	/* stx_mode at 28 says regular file, and stx_size at 40 is not zero. */
+	movzwl	statxbuf + 28, %eax
+	andl	$0xf000, %eax
+	cmpl	$0x8000, %eax		/* S_IFREG */
+	jne	bad_statx
+	cmpl	$0, statxbuf + 40
+	je	bad_statx
+	cmpl	$0, statxbuf + 44	/* the top half of a size under 4 GiB */
+	jne	bad_statx
+
+	/* socketcall(call, args): i386 102, and the only call here whose
+	 * arguments are not in registers at all --- they are in a block of
+	 * `unsigned long` in the caller's memory, four bytes each where this
+	 * kernel's registers are eight.
+	 *
+	 * A whole connected pair, through socketcall and nothing else:
+	 * socketpair(8), send(9), recv(10), getsockname(6), shutdown(13). An
+	 * AF_UNIX pair needs no network, so this works the same on a Linux
+	 * host and in Eclipse. */
+	movl	$1, sargs + 0		/* AF_UNIX */
+	movl	$1, sargs + 4		/* SOCK_STREAM */
+	movl	$0, sargs + 8
+	movl	$sv, sargs + 12
+	movl	$102, %eax
+	movl	$8, %ebx		/* SYS_SOCKETPAIR */
+	movl	$sargs, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_socketcall
+
+	/* send(sv[0], "ABC", 3, 0) */
+	movl	$0x434241, sbuf
+	movl	sv + 0, %eax
+	movl	%eax, sargs + 0
+	movl	$sbuf, sargs + 4
+	movl	$3, sargs + 8
+	movl	$0, sargs + 12
+	movl	$102, %eax
+	movl	$9, %ebx		/* SYS_SEND */
+	movl	$sargs, %ecx
+	int	$0x80
+	cmpl	$3, %eax
+	jne	bad_socketcall
+
+	/* recv(sv[1], sbuf2, 3, 0), and the bytes have to be the ones sent:
+	 * a block read at the wrong width would hand the descriptor and the
+	 * length to each other's slots and this would not be "ABC". */
+	movl	$0, sbuf2
+	movl	sv + 4, %eax
+	movl	%eax, sargs + 0
+	movl	$sbuf2, sargs + 4
+	movl	$3, sargs + 8
+	movl	$0, sargs + 12
+	movl	$102, %eax
+	movl	$10, %ebx		/* SYS_RECV */
+	movl	$sargs, %ecx
+	int	$0x80
+	cmpl	$3, %eax
+	jne	bad_socketcall
+	movl	sbuf2, %ecx
+	andl	$0xffffff, %ecx
+	cmpl	$0x434241, %ecx
+	jne	bad_socketcall
+
+	/* getsockname(sv[0], sa, &salen): three words, the last two pointers.
+	 * The length comes back no bigger than it went in. */
+	movl	$128, salen
+	movl	sv + 0, %eax
+	movl	%eax, sargs + 0
+	movl	$sa, sargs + 4
+	movl	$salen, sargs + 8
+	movl	$102, %eax
+	movl	$6, %ebx		/* SYS_GETSOCKNAME */
+	movl	$sargs, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_socketcall
+	cmpl	$128, salen
+	ja	bad_socketcall
+
+	/* shutdown(sv[0], SHUT_RDWR): two words, which is the SHORTEST block
+	 * any call has. A kernel that read a fixed six would reach four words
+	 * past it. */
+	movl	sv + 0, %eax
+	movl	%eax, sargs + 0
+	movl	$2, sargs + 4
+	movl	$102, %eax
+	movl	$13, %ebx		/* SYS_SHUTDOWN */
+	movl	$sargs, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_socketcall
+
+	/* And the step that says the word count is not a guess: put a
+	 * two-word block for `shutdown` at the very END of a mapped page
+	 * whose next page is NOT mapped, so that reading a third word is
+	 * EFAULT. Linux reads exactly two and answers 0; a kernel that read
+	 * more would answer EFAULT for a block a program is entitled to put
+	 * there.
+	 *
+	 * mmap2 two pages, drop the second. The address must be checked
+	 * UNSIGNED: a valid high address like 0xf7xxxxxx is negative as a
+	 * signed int, which cost me a run. */
+	movl	$192, %eax
+	xorl	%ebx, %ebx
+	movl	$8192, %ecx
+	movl	$3, %edx		/* PROT_READ|PROT_WRITE */
+	movl	$0x22, %esi		/* MAP_PRIVATE|MAP_ANONYMOUS */
+	movl	$-1, %edi
+	xorl	%ebp, %ebp
+	int	$0x80
+	cmpl	$-4096, %eax
+	jae	bad_sargs_edge
+	movl	%eax, twopages
+	movl	$91, %eax		/* munmap the second page: the guard */
+	movl	twopages, %ebx
+	addl	$4096, %ebx
+	movl	$4096, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_sargs_edge
+
+	/* The block goes at page_end - 8, so words 0 and 1 are readable and
+	 * word 2 is not. */
+	movl	twopages, %edi
+	addl	$4096, %edi
+	subl	$8, %edi
+	movl	sv + 4, %eax		/* the other end, still open */
+	movl	%eax, (%edi)
+	movl	$2, 4(%edi)		/* SHUT_RDWR */
+	movl	$102, %eax
+	movl	$13, %ebx
+	movl	%edi, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_sargs_edge
+
+	/* ppoll(NULL, 0, {0,0}, mask, 8): i386 309, and the same trap in the
+	 * READING direction. A kernel `sigset_t` is one 64-bit word, so a
+	 * typed load wants 8; an i386 `sigset_t` is `unsigned long sig[2]`,
+	 * which aligns to 4, so this mask -- deliberately 4 mod 8, like
+	 * `statxbuf` -- is one Linux reads and a typed load refuses.
+	 *
+	 * Measured on a Linux host before it was written: the same call with
+	 * its mask at an address 4 mod 8 answers 0.
+	 *
+	 * No descriptors and a zero timeout, so it returns at once and what
+	 * the status reports is only whether the arguments were accepted. The
+	 * timeout goes in `zerots`, which is 8-aligned on purpose: at a
+	 * 4-mod-8 address the TIMEOUT would be the thing refused and the step
+	 * would be testing the wrong argument. */
+	movl	$sigmask4, %eax
+	testl	$4, %eax
+	jz	bad_ppoll_mask
+	movl	$0, sigmask4 + 0
+	movl	$0, sigmask4 + 4
+	movl	$0, zerots + 0
+	movl	$0, zerots + 4
+	movl	$0, zerots + 8
+	movl	$0, zerots + 12
+	movl	$309, %eax
+	xorl	%ebx, %ebx		/* no fds */
+	xorl	%ecx, %ecx		/* nfds = 0 */
+	movl	$zerots, %edx
+	movl	$sigmask4, %esi
+	movl	$8, %edi		/* sigsetsize */
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ppoll_mask
+
+	/* writev(1, iov, 1) with iov_len = 0x80000000: i386 146, and the one
+	 * step here that asks for a REFUSAL. The wire field is unsigned, but
+	 * Linux reads each length into a signed `compat_ssize_t` and answers
+	 * EINVAL for a negative one, so the field's range and the ABI's are
+	 * not the same.
+	 *
+	 * Measured on a Linux host: 0x7fffffff is accepted (a short write of
+	 * whatever was mapped) and both 0x80000000 and 0xffffffff are EINVAL
+	 * with nothing transferred. Only the refusal is asserted here,
+	 * because the accepted case writes to the probe's own stdout and its
+	 * byte count depends on how much of the page is mapped.
+	 *
+	 * -EINVAL is -22, and it has to be exactly that: a kernel that
+	 * widened the length as a plain number would move bytes and report a
+	 * count, which is a positive answer and not merely a different
+	 * errno. */
+	movl	page, %eax
+	movl	%eax, iov + 0
+	movl	$0x80000000, iov + 4
+	movl	$146, %eax
+	movl	$1, %ebx
+	movl	$iov, %ecx
+	movl	$1, %edx
+	int	$0x80
+	cmpl	$-22, %eax
+	jne	bad_iov_len
+	/* And 0xffffffff, which is the `(size_t)-1` a program reaches by
+	 * mistake rather than on purpose. */
+	movl	$0xffffffff, iov + 4
+	movl	$146, %eax
+	movl	$1, %ebx
+	movl	$iov, %ecx
+	movl	$1, %edx
+	int	$0x80
+	cmpl	$-22, %eax
+	jne	bad_iov_len
+
 	/* get_thread_area(&tls_desc): i386 244, the other half, and the one a
 	 * debugger uses. It has to hand back the base this program asked for,
 	 * which means the descriptor really does hold it rather than
@@ -1081,6 +1346,22 @@ bad_setrlimit32:
 	jmp	die
 bad_rlimit_clamp:
 	movl	$51, %ebx
+	jmp	die
+bad_statx:
+	movl	$52, %ebx
+	jmp	die
+bad_ppoll_mask:
+	movl	$53, %ebx
+	jmp	die
+bad_iov_len:
+	movl	$54, %ebx
+	jmp	die
+bad_socketcall:
+	movl	$55, %ebx
+	jmp	die
+bad_sargs_edge:
+	movl	$56, %ebx
+	jmp	die
 
 	/* Fill the scratch buffer with 0xaa, so that every structure written
 	 * into it afterwards says by itself how many bytes it is: the first
@@ -1122,6 +1403,9 @@ msg2b:
 	.set	msg2blen, . - msg2b
 tmppath:
 	.asciz	"/tmp/i386-hello-pwritev"
+	/* The empty path of AT_EMPTY_PATH, which names the descriptor itself. */
+emptystr:
+	.asciz	""
 
 	.section .data
 	.align 4
@@ -1208,6 +1492,48 @@ futex_to:
 	.space	16
 rl32:
 	.space	16
+	/* And the buffer `statx` writes: 256 bytes plus the poison behind it,
+	 * placed DELIBERATELY at a multiple of 4 that is not a multiple of 8
+	 * --- `.align 8` and then four bytes --- because that is the alignment
+	 * a 32-bit program's `struct statx *` has and the whole point of the
+	 * step that uses it. Its own symbol rather than a corner of `tbuf`, so
+	 * that the placement is the assembler's promise and not the linker's
+	 * accident. */
+	.align 8
+statx_pad:
+	.long	0
+statxbuf:
+	.space	320
+
+	/* A `timespec` of zeros, 8-aligned, so that in step 53 the only
+	 * argument at a 4-mod-8 address is the signal mask. All zeros is the
+	 * same bytes at either width, so one buffer serves both. */
+	.align 8
+zerots:
+	.space	16
+
+	/* And the mask, placed 4 mod 8 on purpose: `zerots` is 16 bytes from
+	 * an 8-aligned start, so a single pad word puts this one 4 past a
+	 * boundary. The step checks the address rather than trusting this. */
+	.long	0
+sigmask4:
+	.space	8
+
+	/* The socketcall argument block, and what its calls point at. */
+sargs:
+	.space	24
+sv:
+	.space	8
+sbuf:
+	.space	8
+sbuf2:
+	.space	8
+sa:
+	.space	128
+salen:
+	.long	0
+twopages:
+	.long	0
 	.align 4
 statbuf:
 	.space	96

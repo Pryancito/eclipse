@@ -1084,7 +1084,15 @@ impl Syscall<'_> {
             return Ok(None);
         }
         check_sigsetsize(sigsetsize)?;
-        let newmask = sigmask.read()?;
+        // `Sigset` is a `u64`, so the typed read requires an 8-aligned
+        // destination. An i386 `sigset_t` is `unsigned long sig[2]`, which
+        // aligns to **4**, so a 32-bit program's mask can legitimately sit at
+        // an address congruent to 4 modulo 8 and Linux reads it. Measured on
+        // this container's Linux: an i386 `ppoll` with its mask at
+        // `0x0804a02c` answers 0. See [`crate::narrow`] for the three forms
+        // of this trap; this is the third one, where only the alignment
+        // differs.
+        let newmask = crate::narrow::wide_get_unaligned(self.narrow_abi(), &sigmask)?;
         let thread = alloc::sync::Arc::clone(self.thread);
         let old = {
             let mut lt = thread.lock_linux();
