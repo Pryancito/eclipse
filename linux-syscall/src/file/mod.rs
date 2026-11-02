@@ -36,6 +36,12 @@ mod stat;
 /// into a `struct stat64` of its own. One table of `S_IF*` bits, not two.
 #[cfg(target_arch = "x86_64")]
 pub(crate) use self::stat::StatMode;
+/// Shared with the i386 compat layer's alignment tests, which ask `statx`
+/// for a field at a destination this kernel would otherwise refuse and need
+/// the offset of that field. Test-only: production has no reason to name the
+/// type outside the module that fills it.
+#[cfg(test)]
+pub(crate) use self::stat::Statx;
 mod xattr;
 pub(crate) use xattr::{XattrOp, XattrTarget};
 

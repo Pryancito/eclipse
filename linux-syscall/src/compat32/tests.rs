@@ -369,28 +369,26 @@ fn pselect6_stays_unmapped_for_its_sigset_argument_and_not_its_timeout() {
     assert_eq!(native_number(308), None);
 }
 
-/// `statx` was in `i386_abi_same.in` and is not any more, and the reason is
-/// worth a test of its own because it is not the one anybody looks for:
-/// `struct statx` IS the same 256 bytes in both ABIs. What differs is the
-/// alignment --- on i386 a `long long` aligns to 4, so a 32-bit program's
-/// `struct statx *` is 4-aligned, and `UserPtr::write` insists on 8 because
-/// it stores through a `*Statx`.
+/// `statx` and `prlimit64` are mapped for a reason that is not the one
+/// anybody looks for: both structures ARE the same bytes in both ABIs ---
+/// `struct statx` was designed that way, `struct rlimit64` is two `__u64`.
+/// What differs is the **alignment**: on i386 a `long long` aligns to 4, so
+/// a 32-bit program's pointer to either is 4-aligned, and a typed write
+/// insists on 8 because it stores through a `*T`.
 ///
-/// `EFAULT` for a pointer Linux accepts is worse than `ENOSYS`: musl falls
-/// back to `fstatat` on `ENOSYS` and has nowhere to go on `EFAULT`. It comes
-/// back once it writes its bytes the way `stat64` does.
+/// They are mapped because their handlers write unaligned, which is what
+/// `copy_to_user` does. Pinned together because they are the same problem,
+/// and because `prlimit64` is the one the i386 probe caught answering
+/// `EFAULT` in QEMU for a pointer the container's Linux accepted.
 #[test]
-fn statx_stays_unmapped_until_it_writes_its_bytes() {
-    assert_eq!(name(383), Some("statx"));
-    assert_eq!(native_number(383), None);
-}
-
-/// And `prlimit64`, which has the same trouble, is mapped --- because its
-/// handler now writes its sixteen bytes rather than storing through a
-/// `*RLimit`. The two are the same problem with and without its fix, so
-/// they are pinned together.
-#[test]
-fn prlimit64_is_mapped_because_its_handler_writes_bytes() {
-    assert_eq!(name(340), Some("prlimit64"));
-    assert!(native_number(340).is_some());
+fn the_calls_whose_only_difference_is_the_alignment_are_mapped() {
+    for (num, called) in [(340, "prlimit64"), (383, "statx")] {
+        assert_eq!(name(num), Some(called), "i386 {}", num);
+        assert!(
+            native_number(num).is_some(),
+            "i386 {} ({}) is the same bytes in both ABIs, 4-aligned there",
+            num,
+            called
+        );
+    }
 }

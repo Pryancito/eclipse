@@ -213,13 +213,3 @@ timerfd_create
 timer_getoverrun
 timer_delete
 
-// NOT here, and it was until the i386 probe said otherwise:
-//
-//   statx
-//
-// `struct statx` is the same 256 bytes in both ABIs -- it was designed that
-// way -- but on i386 a `long long` is aligned to 4, so a 32-bit program's
-// `struct statx *` is 4-aligned and `UserPtr::write` insists on 8. It answers
-// EFAULT for a pointer Linux accepts, which is worse than ENOSYS: musl falls
-// back to `fstatat` on ENOSYS and has nowhere to go on EFAULT. It comes back
-// once it writes its bytes the way `stat64` does.

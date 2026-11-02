@@ -283,14 +283,40 @@ impl<T, P: Policy> UserPtr<T, P> {
         Ok(())
     }
 
+    /// [`check_len_for`](Self::check_len_for) without the alignment
+    /// requirement: for a copy that goes through bytes and so has none.
+    fn check_len_for_unaligned(&self, count: usize, access: MMUFlags) -> Result<()> {
+        let bytes = self.user_bytes_with(count, 1)?;
+        if !crate::KHANDLER.check_user_access(self.0 as usize, bytes, access) {
+            return Err(Error::InvalidPointer);
+        }
+        if !crate::KHANDLER.check_user_range(self.0 as usize, bytes) {
+            return Err(Error::InvalidPointer);
+        }
+        Ok(())
+    }
+
     /// The bytes `count` elements from here take, when the pointer is
     /// neither null nor unaligned and they all lie in the user half.
     fn user_bytes(&self, count: usize) -> Result<usize> {
+        self.user_bytes_with(count, core::mem::align_of::<T>())
+    }
+
+    /// [`user_bytes`](Self::user_bytes) with the alignment named, so that a
+    /// copy that goes through bytes can ask for 1 --- which is what
+    /// `copy_to_user` requires, and all it requires.
+    ///
+    /// The alignment this type needs is not the alignment the CALLER's ABI
+    /// gives it: on i386 a `long long` is aligned to 4, so a 32-bit
+    /// program's `struct rlimit64 *` or `struct statx *` is 4-aligned where
+    /// the same structure here is 8-aligned. Insisting would answer `EFAULT`
+    /// to a pointer Linux accepts. See `linux_syscall::narrow`.
+    fn user_bytes_with(&self, count: usize, align: usize) -> Result<usize> {
         let bytes = count
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(Error::InvalidLength)?;
         if !self.0.is_null()
-            && (self.0 as usize).is_multiple_of(core::mem::align_of::<T>())
+            && (self.0 as usize).is_multiple_of(align)
             && in_user_half(self.0 as usize, bytes)
         {
             Ok(bytes)
@@ -322,6 +348,18 @@ impl<T, P: Read> UserPtr<T, P> {
     pub fn read(&self) -> Result<T> {
         self.check_len_for(1, MMUFlags::READ)?;
         Ok(unsafe { self.0.read() })
+    }
+
+    /// [`read`](Self::read) with **no** alignment requirement, which is
+    /// what `copy_from_user` has.
+    ///
+    /// For a structure a 32-bit process passes: the same layout, aligned to
+    /// 4 rather than to 8, because on i386 a `long long` aligns to 4. The
+    /// aligned `read` answers `EFAULT` for such a pointer, which Linux
+    /// accepts. See `linux_syscall::narrow`.
+    pub fn read_unaligned(&self) -> Result<T> {
+        self.check_len_for_unaligned(1, MMUFlags::READ)?;
+        Ok(unsafe { self.0.read_unaligned() })
     }
 
     // 和读取一样，
@@ -461,6 +499,26 @@ impl<T, P: Write> UserPtr<T, P> {
             "write",
         );
         unsafe { self.0.write(value) };
+        Ok(())
+    }
+
+    /// [`write`](Self::write) with **no** alignment requirement, which is
+    /// what `copy_to_user` has. The counterpart of
+    /// [`read_unaligned`](UserPtr::read_unaligned); see it for why.
+    pub fn write_unaligned(&mut self, value: T) -> Result<()> {
+        self.check_len_for_unaligned(1, MMUFlags::WRITE)?;
+        #[cfg(all(not(feature = "libos"), feature = "uleak-scan"))]
+        dbg_scan_physmap_leak(
+            unsafe {
+                core::slice::from_raw_parts(
+                    &value as *const T as *const u8,
+                    core::mem::size_of::<T>(),
+                )
+            },
+            self.0 as usize,
+            "write_unaligned",
+        );
+        unsafe { self.0.write_unaligned(value) };
         Ok(())
     }
 
@@ -898,6 +956,85 @@ mod tests {
         assert_eq!(
             UserInPtr::<u64>::from_addr_size(0x1000, 7).err(),
             Some(Error::BufferTooSmall)
+        );
+    }
+
+    // ---- the unaligned pair ---------------------------------------------
+
+    /// A structure whose alignment the caller's ABI does not give it. On
+    /// i386 a `long long` aligns to 4, so a 32-bit program's
+    /// `struct rlimit64 *` or `struct statx *` is 4-aligned where the same
+    /// structure is 8-aligned here, and `copy_to_user` accepts it.
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    #[repr(C)]
+    struct TwoWords {
+        first: u64,
+        second: u64,
+    }
+
+    /// An address inside `room` that is a multiple of 4 and not of 8 ---
+    /// which is exactly the pointer a 32-bit program hands over.
+    fn four_aligned(room: &mut [u32]) -> usize {
+        let base = room.as_mut_ptr() as usize;
+        let at = if base.is_multiple_of(8) {
+            base + 4
+        } else {
+            base
+        };
+        assert!(at.is_multiple_of(4) && !at.is_multiple_of(8));
+        at
+    }
+
+    #[test]
+    fn the_unaligned_pair_writes_and_reads_where_the_typed_one_refuses() {
+        init_handler();
+        let mut room = [0u32; 8];
+        let at = four_aligned(&mut room);
+        let value = TwoWords {
+            first: 1234,
+            second: u64::MAX,
+        };
+
+        let mut typed = UserInOutPtr::<TwoWords>::from(at);
+        assert_eq!(
+            typed.write(value),
+            Err(Error::InvalidPointer),
+            "the typed store has to insist on align_of::<T>()"
+        );
+        assert_eq!(typed.read(), Err(Error::InvalidPointer), "and so does it");
+
+        typed
+            .write_unaligned(value)
+            .expect("copy_to_user requires no alignment");
+        assert_eq!(
+            typed.read_unaligned(),
+            Ok(value),
+            "and the value comes back whole"
+        );
+
+        // The native layout, not a repacked one: sixteen bytes with the
+        // second word eight along.
+        let bytes = UserInPtr::<u8>::from(at).read_array(16).unwrap();
+        assert_eq!(&bytes[0..8], &1234u64.to_ne_bytes());
+        assert_eq!(&bytes[8..16], &u64::MAX.to_ne_bytes());
+    }
+
+    /// The alignment is the only check it drops: a null pointer and one
+    /// outside the user half are refused exactly as before.
+    #[test]
+    fn the_unaligned_pair_still_refuses_a_null_and_a_kernel_pointer() {
+        init_handler();
+        let mut null = UserOutPtr::<TwoWords>::from(0);
+        assert_eq!(
+            null.write_unaligned(TwoWords {
+                first: 0,
+                second: 0
+            }),
+            Err(Error::InvalidPointer)
+        );
+        assert_eq!(
+            UserInPtr::<TwoWords>::from(0).read_unaligned(),
+            Err(Error::InvalidPointer)
         );
     }
 

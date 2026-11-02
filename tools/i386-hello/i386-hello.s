@@ -63,6 +63,7 @@
  *   49  ugetrlimit wrote the wrong shape of rlimit
  *   50  the narrow infinity did not widen to the wide one
  *   51  the two getrlimits did not clamp where they each clamp
+ *   52  statx did not fill 256 bytes at a 4-aligned destination
  *
  * The last six are the segment registers, which is the second half of what
  * compatibility mode needs and the half `iretq` does not do: it reloads `CS`
@@ -943,6 +944,56 @@ _start:
 	cmpl	$0xaaaaaaaa, tbuf + 8
 	jne	bad_rlimit_clamp
 
+	/* statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, buf): i386 383, and
+	 * the third shape of the same trouble. `struct statx` is the SAME 256
+	 * bytes in both ABIs -- it was designed that way -- so nothing about
+	 * its layout needs converting. What differs is that on i386 a
+	 * `long long` aligns to 4, so this buffer, at an address that is a
+	 * multiple of 4 and not of 8, is a perfectly good `struct statx *`
+	 * here and one a typed store in the kernel would refuse.
+	 *
+	 * Which makes the FIRST check the address itself: if the linker ever
+	 * puts `tbuf` on an eight-byte boundary this step stops testing what
+	 * it is for, and saying so is better than passing for the wrong
+	 * reason. */
+	movl	$statxbuf, %eax
+	testl	$4, %eax
+	jz	bad_statx
+	movl	$statxbuf, %edi
+	movl	$320, %ecx
+	movl	$0xaaaaaaaa, %eax
+statx_poison:
+	movl	%eax, (%edi)
+	addl	$4, %edi
+	subl	$4, %ecx
+	jnz	statx_poison
+	movl	$383, %eax
+	movl	fd, %ebx
+	movl	$emptystr, %ecx
+	movl	$0x1000, %edx		/* AT_EMPTY_PATH */
+	movl	$0x7ff, %esi		/* STATX_BASIC_STATS */
+	movl	$statxbuf, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_statx
+	/* 256 bytes, so the word at 256 is still the poison. */
+	cmpl	$0xaaaaaaaa, statxbuf + 256
+	jne	bad_statx
+	/* stx_mask at 0 carries at least the basic bits it was asked for. */
+	movl	statxbuf + 0, %eax
+	andl	$0x7ff, %eax
+	cmpl	$0x7ff, %eax
+	jne	bad_statx
+	/* stx_mode at 28 says regular file, and stx_size at 40 is not zero. */
+	movzwl	statxbuf + 28, %eax
+	andl	$0xf000, %eax
+	cmpl	$0x8000, %eax		/* S_IFREG */
+	jne	bad_statx
+	cmpl	$0, statxbuf + 40
+	je	bad_statx
+	cmpl	$0, statxbuf + 44	/* the top half of a size under 4 GiB */
+	jne	bad_statx
+
 	/* get_thread_area(&tls_desc): i386 244, the other half, and the one a
 	 * debugger uses. It has to hand back the base this program asked for,
 	 * which means the descriptor really does hold it rather than
@@ -1081,6 +1132,10 @@ bad_setrlimit32:
 	jmp	die
 bad_rlimit_clamp:
 	movl	$51, %ebx
+	jmp	die
+bad_statx:
+	movl	$52, %ebx
+	jmp	die
 
 	/* Fill the scratch buffer with 0xaa, so that every structure written
 	 * into it afterwards says by itself how many bytes it is: the first
@@ -1122,6 +1177,9 @@ msg2b:
 	.set	msg2blen, . - msg2b
 tmppath:
 	.asciz	"/tmp/i386-hello-pwritev"
+	/* The empty path of AT_EMPTY_PATH, which names the descriptor itself. */
+emptystr:
+	.asciz	""
 
 	.section .data
 	.align 4
@@ -1208,6 +1266,18 @@ futex_to:
 	.space	16
 rl32:
 	.space	16
+	/* And the buffer `statx` writes: 256 bytes plus the poison behind it,
+	 * placed DELIBERATELY at a multiple of 4 that is not a multiple of 8
+	 * --- `.align 8` and then four bytes --- because that is the alignment
+	 * a 32-bit program's `struct statx *` has and the whole point of the
+	 * step that uses it. Its own symbol rather than a corner of `tbuf`, so
+	 * that the placement is the assembler's promise and not the linker's
+	 * accident. */
+	.align 8
+statx_pad:
+	.long	0
+statxbuf:
+	.space	320
 	.align 4
 statbuf:
 	.space	96
