@@ -181,6 +181,232 @@ impl fmt::Display for X86TrapErrorCode {
     }
 }
 
+/// How many 32-bit TLS slots a thread has. Linux has the same three.
+///
+/// Stated here as well as in `trapframe` because a hosted (libos) build has
+/// no GDT module at all, and the system-call layer and its tests are built
+/// there. The two are tied together below on the builds that have both.
+#[cfg(target_arch = "x86_64")]
+pub const COMPAT_TLS_ENTRIES: usize = 3;
+
+#[cfg(all(target_arch = "x86_64", any(target_os = "none", target_os = "uefi")))]
+const _: () = assert!(COMPAT_TLS_ENTRIES == trapframe::COMPAT_TLS_ENTRIES);
+
+/// The GDT index of this thread's TLS slot number `slot`, which is the
+/// `entry_number` of `set_thread_area(2)`.
+///
+/// It is the real index and not a number of our own choosing, because ring 3
+/// builds the selector itself: musl does `(entry_number << 3) | 3`. Linux can
+/// state its as a constant (`GDT_ENTRY_TLS_MIN`, 12) because Linux builds its
+/// whole GDT; this one starts as the firmware's table, so the index depends on
+/// how many descriptors were already in it.
+///
+/// On a hosted (libos) build there is no GDT, no thread that could load a
+/// selector, and nothing that reads this but the tests. The stand-in keeps the
+/// shape -- consecutive indices, away from zero -- so the system-call layer
+/// runs there; no test should assert the number itself.
+#[cfg(target_arch = "x86_64")]
+pub fn compat_tls_entry_number(slot: usize) -> u32 {
+    #[cfg(any(target_os = "none", target_os = "uefi"))]
+    {
+        (trapframe::compat_tls_index() + slot) as u32
+    }
+    #[cfg(not(any(target_os = "none", target_os = "uefi")))]
+    {
+        /// Linux's `GDT_ENTRY_TLS_MIN`, used only as the hosted stand-in: it
+        /// is a plausible index, which makes a test that prints one readable.
+        const HOSTED_TLS_INDEX: usize = 12;
+        (HOSTED_TLS_INDEX + slot) as u32
+    }
+}
+
+/// The slot `entry_number` names, or `None` when it names no slot of this
+/// thread's.
+#[cfg(target_arch = "x86_64")]
+pub fn compat_tls_slot_of(entry_number: u32) -> Option<usize> {
+    let base = compat_tls_entry_number(0);
+    let slot = entry_number.checked_sub(base)? as usize;
+    (slot < COMPAT_TLS_ENTRIES).then_some(slot)
+}
+
+/// The selector ring 3 loads into `%gs` to reach TLS slot `slot`: its
+/// `entry_number` with RPL 3, which is the arithmetic ring 3 does itself.
+#[cfg(target_arch = "x86_64")]
+fn compat_tls_selector(slot: usize) -> u16 {
+    ((compat_tls_entry_number(slot) as u16) << 3) | 3
+}
+
+/// Linux's `struct user_desc`, the sixteen bytes `set_thread_area(2)` takes.
+///
+/// It is a 32-bit ABI structure and it is read from a 32-bit caller, so every
+/// field is four bytes and the last four are a bitfield. Kept as the bytes
+/// rather than as a Rust struct with the same name: a `#[repr(C)]` with six
+/// one-bit fields is not a thing Rust writes, and the bit numbering is the
+/// part worth stating explicitly.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CompatUserDesc {
+    /// Which of the thread's slots, or `-1` for "pick one and tell me".
+    pub entry_number: u32,
+    /// The segment base, which for TLS is the thread pointer.
+    pub base_addr: u32,
+    /// The segment limit, in bytes or in pages (see `limit_in_pages`).
+    pub limit: u32,
+    /// `D/B`: a 32-bit segment rather than a 16-bit one.
+    pub seg_32bit: bool,
+    /// 0 data, 1 data expand-down, 2 code non-conforming, 3 code conforming.
+    pub contents: u8,
+    /// A code segment that cannot be written, or a data one that cannot.
+    pub read_exec_only: bool,
+    /// `G`: the limit counts 4 KiB pages.
+    pub limit_in_pages: bool,
+    /// The descriptor is NOT present, i.e. loading its selector faults.
+    pub seg_not_present: bool,
+    /// `AVL`, which the CPU does not look at. Linux keeps it for the "is this
+    /// an empty descriptor" test and so does this.
+    pub useable: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl CompatUserDesc {
+    /// The sixteen bytes as the 32-bit caller laid them out.
+    pub fn from_bytes(b: &[u8; 16]) -> Self {
+        let word = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        let flags = word(12);
+        Self {
+            entry_number: word(0),
+            base_addr: word(4),
+            limit: word(8),
+            seg_32bit: flags & (1 << 0) != 0,
+            contents: ((flags >> 1) & 0b11) as u8,
+            read_exec_only: flags & (1 << 3) != 0,
+            limit_in_pages: flags & (1 << 4) != 0,
+            seg_not_present: flags & (1 << 5) != 0,
+            useable: flags & (1 << 6) != 0,
+        }
+    }
+
+    /// Whether this is the "forget the slot" request rather than a
+    /// descriptor: all zeroes but for the two negative flags.
+    ///
+    /// Linux's `LDT_empty`, and it has to be a special case rather than just
+    /// a not-present descriptor, because glibc clears a slot this way and the
+    /// kernel is expected to zero the entry rather than store something that
+    /// looks like a descriptor and is not.
+    pub fn is_empty(&self) -> bool {
+        self.base_addr == 0
+            && self.limit == 0
+            && self.contents == 0
+            && self.read_exec_only
+            && self.seg_not_present
+            && !self.seg_32bit
+            && !self.limit_in_pages
+            && !self.useable
+    }
+
+    /// The eight bytes of the GDT descriptor these fields describe, or 0 for
+    /// an empty one.
+    ///
+    /// The field-by-field translation of Linux's `fill_ldt`, including the two
+    /// parts that are not in the caller's structure at all:
+    ///
+    /// - **`DPL` is 3, always.** The caller does not get to say; a descriptor
+    ///   a 32-bit thread loads into `%gs` is a ring-3 descriptor or it is a
+    ///   way to run with the kernel's privileges.
+    /// - **`L` is 0, always.** A 64-bit code segment is not something a
+    ///   thread area can be, and the bit is `AVL`-adjacent in the same byte.
+    /// - **The accessed bit is set**, as Linux sets it: the CPU would set it
+    ///   on the first load anyway, and that would be a write to the GDT from
+    ///   ring 3's point of view.
+    pub fn to_descriptor(&self) -> u64 {
+        if self.is_empty() {
+            return 0;
+        }
+        let base = self.base_addr as u64;
+        let limit = self.limit as u64;
+        // The access byte: type in 0..4 (with the accessed bit at the bottom),
+        // then S (a code/data segment, not a system one), DPL and P.
+        let kind = u64::from(u8::from(!self.read_exec_only) << 1 | self.contents << 2 | 1);
+        let access = kind | (1 << 4) | (3 << 5) | (u64::from(!self.seg_not_present) << 7);
+        (limit & 0xffff)
+            | ((base & 0xffff) << 16)
+            | (((base >> 16) & 0xff) << 32)
+            | (access << 40)
+            | (((limit >> 16) & 0xf) << 48)
+            // AVL 0, L 0 -- see above.
+            | (u64::from(self.seg_32bit) << 54)
+            | (u64::from(self.limit_in_pages) << 55)
+            | (((base >> 24) & 0xff) << 56)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl CompatUserDesc {
+    /// The fields a GDT descriptor describes: the inverse of
+    /// [`Self::to_descriptor`], for `get_thread_area(2)`.
+    ///
+    /// Not a perfect inverse, in two ways, both of them Linux's.
+    ///
+    /// `DPL`, `S`, `L` and the accessed bit are not fields of a `user_desc` at
+    /// all, so a descriptor that had other values in them comes back as one
+    /// that does not. Nothing in this kernel writes such a descriptor ---
+    /// [`Self::to_descriptor`] is the only thing that fills these slots.
+    ///
+    /// And `useable` does not survive at all: `to_descriptor` writes `AVL = 0`
+    /// whatever the caller asked, exactly as Linux's `fill_ldt` does, so this
+    /// always reads it back as false. The hardware never looks at the bit.
+    pub fn from_descriptor(entry_number: u32, desc: u64) -> Self {
+        let bits = |at: u32, width: u32| ((desc >> at) & ((1 << width) - 1)) as u32;
+        let base_addr = bits(16, 16) | (bits(32, 8) << 16) | (bits(56, 8) << 24);
+        let limit = bits(0, 16) | (bits(48, 4) << 16);
+        let kind = bits(40, 4);
+        Self {
+            entry_number,
+            base_addr,
+            limit,
+            seg_32bit: desc & (1 << 54) != 0,
+            contents: ((kind >> 2) & 0b11) as u8,
+            read_exec_only: kind & 0b10 == 0,
+            limit_in_pages: desc & (1 << 55) != 0,
+            seg_not_present: desc & (1 << 47) == 0,
+            useable: desc & (1 << 52) != 0,
+        }
+    }
+
+    /// The sixteen bytes a 32-bit caller reads back, little endian.
+    pub fn to_bytes(self) -> [u8; 16] {
+        let flags = u32::from(self.seg_32bit)
+            | (u32::from(self.contents) << 1)
+            | (u32::from(self.read_exec_only) << 3)
+            | (u32::from(self.limit_in_pages) << 4)
+            | (u32::from(self.seg_not_present) << 5)
+            | (u32::from(self.useable) << 6);
+        let mut out = [0u8; 16];
+        let words = [self.entry_number, self.base_addr, self.limit, flags];
+        for (at, word) in words.iter().enumerate() {
+            out[at * 4..at * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+
+    /// The descriptor an empty slot reads back as: not present, and nothing
+    /// else set. Linux answers `get_thread_area` for a slot nobody claimed
+    /// with exactly this, rather than with an error.
+    pub fn empty(entry_number: u32) -> Self {
+        Self {
+            entry_number,
+            base_addr: 0,
+            limit: 0,
+            seg_32bit: false,
+            contents: 0,
+            read_exec_only: true,
+            limit_in_pages: false,
+            seg_not_present: true,
+            useable: false,
+        }
+    }
+}
+
 /// Is `a` a canonical 64-bit virtual address on x86-64 (48-bit, sign-extended)?
 ///
 /// A load or store through a register that is not canonical raises `#GP(0)`,
@@ -786,6 +1012,64 @@ impl UserContext {
         self.0.compat32 != 0
     }
 
+    /// Install a 32-bit TLS descriptor in one of this thread's three slots,
+    /// and hand back the selector ring 3 loads into `%gs` to reach it.
+    ///
+    /// This is the kernel half of `set_thread_area(2)`. The descriptor is
+    /// already assembled -- see [`CompatUserDesc`] -- because the shape of
+    /// the `struct user_desc` it came from is the system-call layer's
+    /// business, and the shape of a GDT descriptor is this one's.
+    ///
+    /// The descriptors stay with the thread. They reach a CPU's GDT on the
+    /// way to user mode, in [`UserContext::enter_uspace`], because the slots
+    /// are per-CPU scratch and the thread does not always wake up where it
+    /// stopped.
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_compat_tls(&mut self, entry: usize, desc: u64) -> Option<u16> {
+        if entry >= self.0.compat_tls.len() {
+            return None;
+        }
+        self.0.compat_tls[entry] = desc;
+        Some(compat_tls_selector(entry))
+    }
+
+    /// The descriptor in one of this thread's three 32-bit TLS slots, or
+    /// `None` for a slot it never claimed. The kernel half of
+    /// `get_thread_area(2)`.
+    #[cfg(target_arch = "x86_64")]
+    pub fn compat_tls(&self, entry: usize) -> Option<u64> {
+        match self.0.compat_tls.get(entry) {
+            Some(&0) | None => None,
+            Some(&desc) => Some(desc),
+        }
+    }
+
+    /// How many 32-bit TLS slots a thread has, which is the range
+    /// `set_thread_area` accepts as an `entry_number`.
+    #[cfg(target_arch = "x86_64")]
+    pub fn compat_tls_slots() -> usize {
+        COMPAT_TLS_ENTRIES
+    }
+
+    /// Remember the selector ring 3 put in `%gs`, so the return path can put
+    /// it back: `iretq` reloads `CS` and `SS` and nothing else.
+    ///
+    /// Called with what `set_thread_area` just handed out, which is what musl
+    /// loads immediately afterwards. A thread that loads some other selector
+    /// itself is not followed -- the kernel would have to trap every `mov`
+    /// into a segment register to know -- and that is the same bargain Linux
+    /// makes.
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_compat_gs(&mut self, selector: u16) {
+        self.0.compat_gs = selector as usize;
+    }
+
+    /// The selector this thread has in `%gs`, or 0 if it never set one.
+    #[cfg(target_arch = "x86_64")]
+    pub fn compat_gs(&self) -> u16 {
+        self.0.compat_gs as u16
+    }
+
     /// Setup return addr
     pub fn set_ra(&mut self, _ra: usize) {
         cfg_if! {
@@ -834,6 +1118,21 @@ impl UserContext {
                     return;
                 }
                 self.dbg_validate_user_ctx("before enter_uspace");
+                // Linux's `load_TLS`, in the place Linux calls it from: the
+                // three descriptors are the thread's, the GDT slots are the
+                // running CPU's, and a thread does not always wake up on the
+                // CPU it stopped on. Loading them here, on every trip out,
+                // is what makes the selector in `%gs` mean the same thing
+                // wherever the thread is scheduled.
+                //
+                // Only for a compat thread, and only when it has claimed a
+                // slot: a 64-bit thread has no 32-bit thread area, and
+                // writing the slots for one would cost a CPU's GDT write per
+                // return for nothing.
+                #[cfg(target_arch = "x86_64")]
+                if self.0.compat32 != 0 && self.0.compat_tls.iter().any(|&d| d != 0) {
+                    trapframe::load_compat_tls(&self.0.compat_tls);
+                }
                 // There used to be a `[rbpfix]` here that rewrote a user `rbp`
                 // found inside the kernel physmap window (0xffff_8000_...) on
                 // the theory that "ring 3 can never legitimately hold it". It
@@ -1195,6 +1494,170 @@ cfg_if! {
 /// host. The AArch64 and RISC-V halves are the point: the CI runs neither,
 /// so every divergence below was one only a real board would ever have
 /// reported, by failing.
+/// The translation between Linux's `struct user_desc` and a GDT descriptor,
+/// which is the whole of what `set_thread_area` has to get right.
+///
+/// It is worth testing bit by bit because nothing else will catch it. A
+/// descriptor with the base in the wrong three places does not fail: it hands
+/// the thread a thread pointer that is almost its own, and the first TLS read
+/// returns somebody else's memory.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod compat_tls_tests {
+    use super::*;
+
+    /// A thread pointer as musl asks for one: a flat, 4 GiB, 32-bit, writable
+    /// data segment whose base IS the thread pointer.
+    fn musl_tls(base: u32) -> CompatUserDesc {
+        CompatUserDesc {
+            entry_number: u32::MAX,
+            base_addr: base,
+            limit: 0xfffff,
+            seg_32bit: true,
+            contents: 0,
+            read_exec_only: false,
+            limit_in_pages: true,
+            seg_not_present: false,
+            useable: true,
+        }
+    }
+
+    /// The base is split across THREE fields of a descriptor, 16 bits then 8
+    /// then 8, and the limit across two. A base that comes back whole is the
+    /// one thing this translation exists to do.
+    #[test]
+    fn the_base_and_the_limit_survive_being_taken_apart() {
+        let desc = musl_tls(0xdead_beef).to_descriptor();
+        assert_eq!((desc >> 16) & 0xffff, 0xbeef, "base0 {:#x}", desc);
+        assert_eq!((desc >> 32) & 0xff, 0xad, "base1 {:#x}", desc);
+        assert_eq!((desc >> 56) & 0xff, 0xde, "base2 {:#x}", desc);
+        let back = CompatUserDesc::from_descriptor(0, desc);
+        assert_eq!(back.base_addr, 0xdead_beef);
+        assert_eq!(back.limit, 0xfffff);
+    }
+
+    /// And the whole structure survives the round trip, for every field that
+    /// reaches the descriptor at all (`useable` does not -- see below).
+    #[test]
+    fn a_descriptor_round_trips_through_both_directions() {
+        for base in [0, 1, 0xffff, 0x1_0000, 0xffff_ffff, 0xdead_beef] {
+            for limit in [0, 1, 0xffff, 0xf_ffff] {
+                for (bits, pages) in [(false, false), (true, false), (true, true)] {
+                    let mut info = musl_tls(base);
+                    info.limit = limit;
+                    info.seg_32bit = bits;
+                    info.limit_in_pages = pages;
+                    info.entry_number = 2;
+                    info.useable = false;
+                    let back = CompatUserDesc::from_descriptor(2, info.to_descriptor());
+                    assert_eq!(back, info, "base {:#x} limit {:#x}", base, limit);
+                }
+            }
+        }
+    }
+
+    /// `useable` is the one field a caller sets that does not come back, and
+    /// that is Linux's behaviour rather than an oversight: `fill_ldt` writes
+    /// `AVL = 0` whatever the caller asked for, and `AVL` is the only place a
+    /// descriptor could have kept it. The hardware never reads the bit, so
+    /// the thread loses nothing it can observe --- but a test asserting a
+    /// perfect round trip would be asserting something neither kernel does,
+    /// so the loss is stated here instead.
+    #[test]
+    fn the_useable_bit_is_dropped_exactly_as_linux_drops_it() {
+        let mut info = musl_tls(0x1000);
+        info.useable = true;
+        let desc = info.to_descriptor();
+        assert_eq!((desc >> 52) & 1, 0, "AVL is set: {:#x}", desc);
+        assert!(!CompatUserDesc::from_descriptor(0, desc).useable);
+    }
+
+    /// The two bits the caller does not get to choose. `DPL` is 3 because a
+    /// descriptor ring 3 loads is a ring-3 descriptor or it is a hole in the
+    /// kernel; `L` is 0 because a thread area is not a 64-bit code segment.
+    /// Neither is a field of `user_desc`, so neither can be asserted through
+    /// the round trip -- only here, on the bits themselves.
+    #[test]
+    fn the_privilege_level_is_three_and_the_long_bit_is_clear() {
+        let desc = musl_tls(0x1000).to_descriptor();
+        assert_eq!((desc >> 45) & 0b11, 3, "DPL is not 3: {:#x}", desc);
+        assert_eq!((desc >> 53) & 1, 0, "L is set: {:#x}", desc);
+        assert_eq!((desc >> 44) & 1, 1, "S is clear: {:#x}", desc);
+        assert_eq!((desc >> 47) & 1, 1, "P is clear: {:#x}", desc);
+        // The accessed bit, set here rather than left for the CPU to set on
+        // the first load -- which would be a write to the GDT.
+        assert_eq!(desc & (1 << 40), 1 << 40, "A is clear: {:#x}", desc);
+    }
+
+    /// A data segment has to come out writable, and `read_exec_only` has to
+    /// turn that off: the bit is inverted between the two representations, so
+    /// a straight copy would hand out a read-only thread area that musl
+    /// cannot write its own TLS through.
+    #[test]
+    fn the_writable_bit_is_inverted_not_copied() {
+        let mut info = musl_tls(0x1000);
+        assert_eq!(info.to_descriptor() >> 41 & 1, 1, "not writable");
+        info.read_exec_only = true;
+        assert_eq!(info.to_descriptor() >> 41 & 1, 0, "still writable");
+        assert!(CompatUserDesc::from_descriptor(0, info.to_descriptor()).read_exec_only);
+    }
+
+    /// `LDT_empty`: all zeroes but for the two negative flags is a thread
+    /// giving a slot back, and it has to zero the entry rather than store a
+    /// descriptor that merely says "not present".
+    #[test]
+    fn clearing_a_slot_is_a_zero_descriptor_and_not_a_present_one() {
+        let empty = CompatUserDesc::empty(1);
+        assert!(empty.is_empty());
+        assert_eq!(empty.to_descriptor(), 0);
+        // And it is not mistaken for an ordinary not-present descriptor,
+        // which keeps its base and limit.
+        let mut not_present = musl_tls(0x1000);
+        not_present.seg_not_present = true;
+        assert!(!not_present.is_empty());
+        assert_ne!(not_present.to_descriptor(), 0);
+    }
+
+    /// The sixteen bytes, as the 32-bit caller laid them out: four little
+    /// endian words and then a bitfield whose bit numbering is the part that
+    /// has no way of announcing a mistake.
+    #[test]
+    fn the_sixteen_bytes_are_read_the_way_a_32_bit_caller_wrote_them() {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // entry -1
+        bytes[4..8].copy_from_slice(&0x1234_5678u32.to_le_bytes()); // base
+        bytes[8..12].copy_from_slice(&0x000f_ffffu32.to_le_bytes()); // limit
+        bytes[12] = 0b0101_0001; // seg_32bit, limit_in_pages, useable
+        let info = CompatUserDesc::from_bytes(&bytes);
+        assert_eq!(info.entry_number, u32::MAX);
+        assert_eq!(info.base_addr, 0x1234_5678);
+        assert_eq!(info.limit, 0xf_ffff);
+        assert!(info.seg_32bit);
+        assert!(info.limit_in_pages);
+        assert!(info.useable);
+        assert_eq!(info.contents, 0);
+        assert!(!info.read_exec_only);
+        assert!(!info.seg_not_present);
+        // And back out again byte for byte.
+        assert_eq!(info.to_bytes(), bytes);
+    }
+
+    /// Every slot gets a selector of its own, with RPL 3, and they are in
+    /// order. The numbers themselves are not asserted: the GDT index depends
+    /// on how many descriptors the firmware left in the table, so it is not
+    /// knowable in a hosted test -- see [`compat_tls_selector`].
+    #[test]
+    fn each_slot_has_its_own_ring_three_selector() {
+        let selectors: Vec<u16> = (0..COMPAT_TLS_ENTRIES).map(compat_tls_selector).collect();
+        for (at, &selector) in selectors.iter().enumerate() {
+            assert_eq!(selector & 0b11, 3, "slot {} is not RPL 3", at);
+            assert_eq!(selector & 0b100, 0, "slot {} names the LDT", at);
+        }
+        for pair in selectors.windows(2) {
+            assert_eq!(pair[1] - pair[0], 8, "slots are not consecutive");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

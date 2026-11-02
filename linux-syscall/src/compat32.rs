@@ -32,17 +32,11 @@
 //! What is left out falls into two groups. The first is the calls i386 has to
 //! itself, which have no native twin to match:
 //!
-//! - `mmap2` (192) takes its offset in pages, not bytes;
 //! - `socketcall` (102) and `ipc` (117) multiplex a whole family through one
 //!   number, with the real arguments in a block of memory;
 //! - `fstat64`/`stat64`/`lstat64`/`fstatat64` pass a `struct stat64` whose
 //!   layout is not `struct stat`'s;
-//! - `_llseek`, `pread64`, `truncate64` and friends split a 64-bit offset
-//!   across two registers;
-//! - `fcntl64`, and the `*32` credential calls (`getuid32`, `setresuid32`,
-//!   ...), which exist because the originals were 16-bit;
-//! - `set_thread_area` (243), which installs a `%gs` *selector* for TLS where
-//!   x86_64 writes an `FSBASE` MSR;
+//! - `fcntl64`, whose `F_SETLK` passes a `struct flock` of `off_t`;
 //! - `sigreturn` (119) and `rt_sigreturn` (173), whose signal frames are
 //!   32-bit structures;
 //! - the `*_time64` calls (403 and up), the 32-bit world's answer to 2038.
@@ -53,7 +47,35 @@
 //! zero-extended; `clone`, whose last two arguments are swapped on i386; and
 //! `execve`, whose `argv` and `envp` are arrays of 4-byte pointers.
 //!
-//! Every one of them answers `ENOSYS` **with its own name** in the log, which
+//! ## And the ones with no native twin at all
+//!
+//! A number can be missing from the allowlist for a second reason: not that
+//! its ABI differs from a native call's, but that there is no native call. For
+//! those the kernel does the work itself, and the dispatch below answers them
+//! before it asks the table --- which would say `ENOSYS` for a call that is
+//! right here.
+//!
+//! `set_thread_area` (243) and `get_thread_area` (244) are the first:
+//! x86_64 keeps a thread pointer in an MSR and i386 keeps it in a segment
+//! descriptor, so the two kernels genuinely do different work. See
+//! [`tls`](tls).
+//!
+//! The rest so far are the ones whose native twin exists but reads the
+//! arguments differently: a 64-bit offset arrives in two registers
+//! (`_llseek`, `pread64`, `pwrite64`, `truncate64`, `ftruncate64`) or in 4 KiB
+//! units (`mmap2`). Each is two halves put back together, and each is in a
+//! different order. See [`wide`](wide).
+//!
+//! ## The renames
+//!
+//! A third group needs neither: the call is the same call under another name.
+//! i386 grew up with 16-bit uids, so each credential call has a `*32` number
+//! for the real thing, and x86_64 --- which never had a 16-bit anything ---
+//! has only the plain name. Those are in the allowlist as
+//! `getuid32 = getuid`, and the names they replaced must stay out of it: the
+//! ABI of the pair is identical, the ABI of the ancestor is not.
+//!
+//! Every remaining one answers `ENOSYS` **with its own name** in the log, which
 //! is a far better report than a number:
 //! `sys_compat32: i386 syscall 192 (mmap2) is not implemented` says exactly
 //! what to write next. [`I386_NAMES`] carries all 451 numbers for that, mapped
@@ -61,6 +83,29 @@
 
 use super::*;
 use linux_object::error::LxError;
+
+mod tls;
+mod wide;
+
+/// The i386 numbers this kernel answers **itself**, because there is no native
+/// call to translate them into.
+///
+/// A number here is deliberately absent from `i386_abi_same.in`: it is not
+/// that its ABI differs from a native twin's, it is that it has no twin at
+/// all. `set_thread_area` is the first: x86_64 keeps a thread pointer in an
+/// MSR and i386 keeps it in a segment descriptor, so the two kernels do
+/// genuinely different work. See [`tls`].
+const I386_SET_THREAD_AREA: u32 = 243;
+const I386_GET_THREAD_AREA: u32 = 244;
+
+/// And the ones whose native twin exists but takes its 64-bit offset in one
+/// register where i386 passes it in two. See [`wide`].
+const I386_LLSEEK: u32 = 140;
+const I386_PREAD64: u32 = 180;
+const I386_PWRITE64: u32 = 181;
+const I386_MMAP2: u32 = 192;
+const I386_TRUNCATE64: u32 = 193;
+const I386_FTRUNCATE64: u32 = 194;
 
 mod table {
     include!(concat!(env!("OUT_DIR"), "/compat32.rs"));
@@ -104,6 +149,23 @@ impl Syscall<'_> {
     /// frame. See the [module documentation](self) for why the list is an
     /// allowlist.
     pub async fn compat32_syscall(&mut self, num: u32, args: [usize; 6]) -> isize {
+        // The i386-only calls this kernel implements come first: they are not
+        // in the translation table on purpose, so asking it would answer
+        // `ENOSYS` for a call that is right here.
+        let [a0, a1, a2, a3, a4, a5] = args;
+        match num {
+            I386_SET_THREAD_AREA => return syscall_ret(self.sys_set_thread_area(a0)),
+            I386_GET_THREAD_AREA => return syscall_ret(self.sys_get_thread_area(a0)),
+            I386_LLSEEK => return syscall_ret(self.sys_llseek(a0, a1, a2, a3, a4)),
+            I386_PREAD64 => return syscall_ret(self.sys_pread64(a0, a1, a2, a3, a4).await),
+            I386_PWRITE64 => return syscall_ret(self.sys_pwrite64(a0, a1, a2, a3, a4)),
+            I386_MMAP2 => {
+                return syscall_ret(self.sys_mmap2(a0, a1, a2, a3, a4, a5).await);
+            }
+            I386_TRUNCATE64 => return syscall_ret(self.sys_truncate64(a0, a1, a2)),
+            I386_FTRUNCATE64 => return syscall_ret(self.sys_ftruncate64(a0, a1, a2)),
+            _ => {}
+        }
         match native_number(num) {
             Some(native) => {
                 trace!(

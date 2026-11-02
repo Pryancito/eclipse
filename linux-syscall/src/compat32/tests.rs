@@ -121,7 +121,6 @@ fn the_numbers_cross_over() {
 #[test]
 fn the_i386_only_calls_are_left_unmapped() {
     for (num, called) in [
-        (192, "mmap2"),
         (102, "socketcall"),
         (117, "ipc"),
         (195, "stat64"),
@@ -129,12 +128,8 @@ fn the_i386_only_calls_are_left_unmapped() {
         (197, "fstat64"),
         (300, "fstatat64"),
         (221, "fcntl64"),
-        (140, "_llseek"),
         (119, "sigreturn"),
         (173, "rt_sigreturn"),
-        (243, "set_thread_area"),
-        (199, "getuid32"),
-        (213, "setuid32"),
         (403, "clock_gettime64"),
         (422, "futex_time64"),
     ] {
@@ -143,6 +138,91 @@ fn the_i386_only_calls_are_left_unmapped() {
             native_number(num),
             None,
             "i386 {} ({}) must not be mapped by name: its ABI differs",
+            num,
+            called
+        );
+    }
+}
+
+/// The credential calls i386 renamed. `getuid32` is mapped -- to native
+/// `getuid`, which is a different name and the same ABI -- and `getuid`, the
+/// i386 number that predates it, must NOT be, because that one returns an
+/// `old_uid_t` of sixteen bits. The pair is the clearest case of why the
+/// allowlist had to grow an `i386 = native` form rather than only matching
+/// names: matching names would have mapped exactly the wrong one of the two.
+#[test]
+fn the_renamed_credential_calls_are_mapped_and_their_16_bit_ancestors_are_not() {
+    for (num32, called, native) in [
+        (199, "getuid32", Sys::GETUID),
+        (200, "getgid32", Sys::GETGID),
+        (201, "geteuid32", Sys::GETEUID),
+        (202, "getegid32", Sys::GETEGID),
+        (213, "setuid32", Sys::SETUID),
+        (214, "setgid32", Sys::SETGID),
+        (205, "getgroups32", Sys::GETGROUPS),
+        (206, "setgroups32", Sys::SETGROUPS),
+        (212, "chown32", Sys::CHOWN),
+    ] {
+        assert_eq!(name(num32), Some(called), "i386 {}", num32);
+        assert_eq!(
+            native_number(num32),
+            Some(native as u32),
+            "i386 {} ({}) does not reach its native twin",
+            num32,
+            called
+        );
+    }
+    // And the sixteen-bit ancestors, each of which has its own i386 number
+    // and must stay unmapped however much its name matches.
+    for (num, called) in [
+        (24, "getuid"),
+        (47, "getgid"),
+        (49, "geteuid"),
+        (50, "getegid"),
+        (23, "setuid"),
+        (46, "setgid"),
+        (80, "getgroups"),
+        (81, "setgroups"),
+        (182, "chown"),
+    ] {
+        assert_eq!(name(num), Some(called), "i386 {}", num);
+        assert_eq!(
+            native_number(num),
+            None,
+            "i386 {} ({}) is the 16-bit one: mapping it hands back the overflow uid",
+            num,
+            called
+        );
+    }
+}
+
+/// The calls the kernel answers ITSELF are absent from the translation table
+/// on purpose, and that absence is load-bearing: the dispatch checks them
+/// first, so a row here would be dead and a row that pointed at a native
+/// number would be wrong. They are not `ENOSYS` either, which is what every
+/// other unmapped number is -- the difference is the dispatch, and this is the
+/// half of it that can be asserted here.
+#[test]
+fn the_calls_this_kernel_answers_itself_are_not_in_the_table() {
+    for (num, called) in [
+        (243, "set_thread_area"),
+        (244, "get_thread_area"),
+        // And the ones whose native twin exists but reads its arguments
+        // differently: a 64-bit offset in two registers, or in 4 KiB units.
+        // Mapping any of these by number would hand the native handler one
+        // half of an offset as the whole of it.
+        (140, "_llseek"),
+        (180, "pread64"),
+        (181, "pwrite64"),
+        (192, "mmap2"),
+        (193, "truncate64"),
+        (194, "ftruncate64"),
+    ] {
+        assert_eq!(name(num), Some(called), "i386 {}", num);
+        assert_eq!(
+            native_number(num),
+            None,
+            "i386 {} ({}) has no native twin: it must not be mapped",
             num,
             called
         );
