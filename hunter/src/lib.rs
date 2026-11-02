@@ -238,6 +238,35 @@ pub fn check_exec_target(name: &str, resolved: &str, elf_data: &[u8]) -> bool {
     true
 }
 
+/// `EM_386`: the 32-bit image an x86_64 kernel also runs, in the CPU's
+/// compatibility mode.
+#[cfg(target_arch = "x86_64")]
+const COMPAT32_MACHINE: u16 = 3;
+
+/// Whether `(EI_CLASS, e_machine)` name an image this kernel will execute.
+///
+/// The pair, not either half. The class and the machine used to be checked
+/// independently -- any class the parser knows, then `e_machine` against
+/// [`EXPECTED_MACHINE`] -- and that is both too loose and too tight. Too
+/// loose, because an `ELFCLASS32` file claiming `EM_X86_64` passed. And too
+/// tight, because an `ELFCLASS32` / `EM_386` image is one this kernel does
+/// run, in compatibility mode, and hunter rejected it before the loader was
+/// ever asked: `hunter: rejected binary (foreign ELF machine)`, which the
+/// shell reports as `Permission denied`.
+///
+/// This has to agree with `linux_object::loader`'s own `runnable_here`. Two
+/// gates that disagree about what runs are one gate that lies: whichever is
+/// stricter decides, and it decides with the other one's error message.
+fn runnable_machine(class: u8, machine: u16) -> bool {
+    const ELFCLASS32: u8 = 1;
+    const ELFCLASS64: u8 = 2;
+    #[cfg(target_arch = "x86_64")]
+    if class == ELFCLASS32 && machine == COMPAT32_MACHINE {
+        return true;
+    }
+    class == ELFCLASS64 && EXPECTED_MACHINE == Some(machine)
+}
+
 /// The format half of [`check_elf_binary`]: an ELF image for this machine or
 /// a `#!` script.
 fn valid_image(path: &str, elf_data: &[u8]) -> bool {
@@ -283,9 +312,9 @@ fn valid_image(path: &str, elf_data: &[u8]) -> bool {
             reject_exec(path, "unexpected ELF type");
             return false;
         }
-        if let Some(expected) = EXPECTED_MACHINE {
+        if EXPECTED_MACHINE.is_some() {
             let e_machine = rd16(18);
-            if e_machine != expected {
+            if !runnable_machine(class, e_machine) {
                 reject_exec(path, "foreign ELF machine");
                 return false;
             }
@@ -766,6 +795,38 @@ mod tests {
         let mut badt = h;
         badt[16] = 9;
         assert!(!check_elf_binary("/bin/badtype", &badt));
+
+        // An i386 image (ELFCLASS32 + EM_386) is one an x86_64 kernel runs,
+        // in the CPU's compatibility mode, so hunter must not be the gate
+        // that stops it: it used to reject `/bin/i386-hello` as a "foreign
+        // ELF machine" before the loader was ever asked, and the shell
+        // reported that as `Permission denied`.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut i386 = h;
+            i386[4] = 1; // ELFCLASS32
+            i386[18] = 3; // EM_386
+            assert!(check_elf_binary("/bin/i386", &i386));
+
+            // The class and the machine are judged TOGETHER. Each of these
+            // passed when they were checked independently, and neither names
+            // an image that exists: a 32-bit header with 64-bit fields, and
+            // the other way round.
+            let mut mixed = h;
+            mixed[4] = 1; // ELFCLASS32 ...
+            mixed[18] = 62; // ... claiming EM_X86_64
+            assert!(!check_elf_binary("/bin/mixed", &mixed));
+            let mut mixed2 = h;
+            mixed2[18] = 3; // ELFCLASS64 claiming EM_386
+            assert!(!check_elf_binary("/bin/mixed2", &mixed2));
+
+            // And a 32-bit image for another machine is still foreign: ARM
+            // (EM_ARM = 40) is not what compatibility mode runs.
+            let mut arm32 = h;
+            arm32[4] = 1;
+            arm32[18] = 40;
+            assert!(!check_elf_binary("/bin/arm32", &arm32));
+        }
     }
 
     fn wx_section() {

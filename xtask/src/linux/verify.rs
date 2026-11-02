@@ -39,6 +39,12 @@ const EM_X86_64: u16 = 62;
 const EM_AARCH64: u16 = 183;
 const EM_RISCV: u16 = 243;
 
+/// i386, que no es la maquina de ninguna rootfs nuestra: es la del unico
+/// artefacto que se construye a proposito para el modo compatibilidad del CPU,
+/// `tools/i386-hello`. Vive aqui para que la cache de ese artefacto pueda
+/// pedir su puerta del arco como todas las demas.
+pub(super) const EM_386: u16 = 3;
+
 /// Lo que se devuelve cuando el fichero SI es un ELF pero no uno de los
 /// nuestros: clase distinta de ELF64 o big endian. No es `None` --- «no es un
 /// ELF» se salta en silencio, y esto no se salta: ninguna maquina esperada
@@ -65,7 +71,7 @@ fn machine_name(machine: u16) -> &'static str {
         EM_X86_64 => "x86_64",
         EM_AARCH64 => "aarch64",
         EM_RISCV => "riscv",
-        3 => "i386",
+        EM_386 => "i386",
         40 => "arm",
         MACHINE_RARA => "una clase o endianness que no construimos",
         _ => "desconocida",
@@ -95,6 +101,34 @@ pub(super) fn elf_machine(path: &Path) -> Option<u16> {
         return Some(MACHINE_RARA);
     }
     Some(u16::from_le_bytes([header[18], header[19]]))
+}
+
+/// La puerta del arco de la UNICA cache cuyo artefacto no declara la maquina
+/// del build: `tools/i386-hello`, que es un ELF32 / `EM_386` a proposito,
+/// porque existe justo para que el kernel demuestre que ejecuta un binario de
+/// 32 bits. Lo seguira siendo construyendo para cualquier arco.
+///
+/// [`elf_machine`] no sirve aqui: contesta [`MACHINE_RARA`] a cualquier ELF32,
+/// que es lo correcto para un binario de la rootfs y lo contrario de lo que
+/// hace falta para este. Pero la pregunta sigue siendo la misma que la de
+/// `cached_for_target` --- «este fichero que ya estaba sigue siendo lo que esta
+/// cache construye» --- y se contesta mirando el PAR: clase 32 **y** maquina
+/// i386. Un ELF64 que declare `EM_386` no lo construyo esto, igual que no lo
+/// construyo un ELF32 de otra maquina.
+///
+/// Un fichero que no es un ELF se deja pasar, como en [`elf_machine`]: no es
+/// esta funcion la que decide si el fichero sirve, solo si hay que
+/// reconstruirlo por venir de otro arco.
+pub(super) fn cached_for_i386(path: &Path) -> bool {
+    let mut header = [0u8; 20];
+    let Ok(mut file) = fs::File::open(path) else {
+        return true;
+    };
+    if file.read_exact(&mut header).is_err() || &header[..4] != b"\x7fELF" {
+        return true;
+    }
+    // EI_CLASS 1 = ELF32, EI_DATA 1 = little endian.
+    header[4] == 1 && header[5] == 1 && u16::from_le_bytes([header[18], header[19]]) == EM_386
 }
 
 /// Los `.pub` que hay en un directorio, por nombre.
@@ -672,6 +706,42 @@ mod tests {
         assert!(!LinuxRootfs::new(Arch::Riscv64).cached_for_target(&p));
     }
 
+    /// La puerta de `i386-hello`, que es la unica cache que NO construye un
+    /// binario del arco del build. Lo que tiene que juzgar es el PAR: una
+    /// clase sin su maquina, o una maquina sin su clase, no es lo que esa
+    /// cache construyo, y reconstruirlo cuesta un `as` y un `ld`.
+    #[test]
+    fn la_puerta_de_i386_juzga_la_clase_y_la_maquina() {
+        // El bueno: ELF32 / EM_386.
+        let mut i386 = elf64(EM_386);
+        i386[4] = 1;
+        assert!(cached_for_i386(&scratch("i386.elf", &i386)));
+
+        // La maquina sola no vale: un ELF64 que declare EM_386 no lo
+        // construyo `as --32`.
+        assert!(!cached_for_i386(&scratch("i386_en_64.elf", &elf64(EM_386))));
+
+        // Ni la clase sola: un ELF32 de otra maquina es lo que quedaria de
+        // construir esto en un arbol ajeno.
+        let mut arm32 = elf64(40);
+        arm32[4] = 1;
+        assert!(!cached_for_i386(&scratch("arm32.elf", &arm32)));
+
+        // Y un ELF64 del arco del build tampoco, que es el caso que de verdad
+        // pasa: `cached_for_target` lo habria dejado pasar.
+        assert!(!cached_for_i386(&scratch("host.elf", &elf64(EM_X86_64))));
+    }
+
+    /// Lo que la puerta NO juzga: un fichero que no es un ELF se deja pasar,
+    /// porque no es ella la que decide si el fichero sirve. Y uno que no se
+    /// puede leer tampoco se reconstruye por eso: lo dira quien lo use.
+    #[test]
+    fn la_puerta_de_i386_deja_pasar_lo_que_no_es_un_elf() {
+        assert!(cached_for_i386(&scratch("script", b"#!/bin/sh\necho\n")));
+        assert!(cached_for_i386(&scratch("corto", b"\x7fELF")));
+        assert!(cached_for_i386(Path::new("/no/existe/i386-hello")));
+    }
+
     /// Solo la cabecera: con 20 bytes exactos ya se lee la maquina, asi que el
     /// barrido no carga en memoria el firmware ni los assets de la rootfs.
     #[test]
@@ -890,15 +960,29 @@ mod cableado_tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Las que comparan contra un `source` suelto.
+        // Las que comparan contra un `source` suelto. La condicion se junta
+        // en una linea antes de mirarla: una puerta que no cabe en 100
+        // columnas la reparte `rustfmt` en varias, y leer linea a linea la
+        // daba por inexistente --- que es peor que no comprobarla, porque
+        // tambien deja de verse la que falta de verdad.
         let mut sin_puerta = Vec::new();
+        let mut condicion: Option<(usize, String)> = None;
         for (n, l) in src.lines().enumerate() {
             let t = l.trim();
-            let es_puerta = t.starts_with("if ")
-                && t.contains(".is_file() && source.is_file()")
-                && t.ends_with('{');
-            if es_puerta && !t.contains("cached_for_target") {
-                sin_puerta.push(n + 1);
+            let (inicio, texto) = match condicion.take() {
+                Some((inicio, texto)) => (inicio, texto + " " + t),
+                None if t.starts_with("if ") => (n + 1, t.to_string()),
+                None => continue,
+            };
+            if !texto.ends_with('{') {
+                condicion = Some((inicio, texto));
+                continue;
+            }
+            if texto.contains(".is_file()")
+                && texto.contains("source.is_file()")
+                && !texto.contains("cached_for_")
+            {
+                sin_puerta.push(inicio);
             }
         }
         assert!(
@@ -915,6 +999,16 @@ mod cableado_tests {
             puertas, 22,
             "las puertas del arco eran 22 y ahora son {puertas}: si has añadido \
              una cache con la suya, sube el numero; si has quitado una puerta, no"
+        );
+
+        // Y la variante para un artefacto cuya maquina no es la del build.
+        // Si aparece una segunda, es que alguien ha eximido otra cache de la
+        // puerta normal, y eso se mira a mano antes de subir el numero.
+        let ajenas = src.matches("verify::cached_for_i386(").count();
+        assert_eq!(
+            ajenas, 1,
+            "las puertas de maquina ajena eran 1 y ahora son {ajenas}: solo \
+             `i386-hello` tiene motivo para una, porque es un ELF32 a proposito"
         );
     }
 
