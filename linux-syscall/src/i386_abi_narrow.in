@@ -12,6 +12,11 @@
 // site, so one handler serves both ABIs and there is no `compat_sys_*`
 // wrapper to keep in step with it.
 //
+// "Width" covers alignment too, and one entry here is only about that:
+// `prlimit64` passes the same sixteen bytes in both ABIs, 4-aligned on i386
+// and 8-aligned here, which `UserPtr::write` refuses. See the bottom of this
+// file.
+//
 // So a name belongs here once EVERY structure it passes is converted. A name
 // stays out while even one is not, and answers `ENOSYS` until then --
 // `pselect6` is the example worth keeping in mind: its timeout is a
@@ -67,3 +72,17 @@ wait4
 // difference and so a job for `compat32::wide`, not for this list.
 readv
 writev
+
+// struct timespec, again: `futex`'s fourth argument is a timeout for the
+// commands that wait and a plain count for the ones that requeue, and the
+// timeout is the only thing it points at. Everything else it touches is a
+// `u32` futex word or a scalar.
+futex
+
+// struct rlimit64: the SAME sixteen bytes in both ABIs, and still a
+// conversion, because on i386 a `long long` is aligned to 4 and `UserPtr`
+// insists on 8. The handler writes the native layout as bytes
+// (`wide_put_unaligned`). The three narrow rlimit calls -- `setrlimit` (75),
+// `getrlimit` (76) and `ugetrlimit` (191) -- are NOT here: theirs is a clamp
+// and not a halving, so they have their own handlers in `compat32::rlimit`.
+prlimit64

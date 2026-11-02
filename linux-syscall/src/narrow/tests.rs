@@ -157,3 +157,86 @@ fn narrowing_and_widening_round_trips_everything_that_fits() {
     assert_eq!(back.minflt, 123);
     assert_eq!(back.nvcsw, 456);
 }
+
+/// The native layout written to a destination that is **4**-aligned and not
+/// 8, which is what a 32-bit program's `struct rlimit64 *` is: on i386 a
+/// `long long` aligns to 4.
+///
+/// The i386 probe found this one. `prlimit64` failed on a buffer at
+/// `0x0804b09c` --- a perfectly good pointer to a 32-bit program, and one
+/// `UserPtr::write` refuses because it stores through a `*RLimit` and so has
+/// to insist on `align_of::<RLimit>()`. Linux's `copy_to_user` insists on
+/// nothing, so the call worked there and answered `EFAULT` here.
+#[test]
+fn the_native_layout_goes_to_a_four_aligned_destination_that_the_typed_write_refuses() {
+    use kernel_hal::user::UserInOutPtr;
+    use linux_object::process::RLimit;
+
+    // Room for the structure plus the four bytes of slack that let a
+    // 4-aligned address inside it be chosen.
+    let mut room = [0u32; 6];
+    let base = room.as_mut_ptr() as usize;
+    let at = if base.is_multiple_of(8) {
+        base + 4
+    } else {
+        base
+    };
+    assert!(
+        !at.is_multiple_of(8) && at.is_multiple_of(4),
+        "the address under test has to be the awkward one: {:#x}",
+        at
+    );
+
+    let limit = RLimit {
+        cur: 1234,
+        max: u64::MAX,
+    };
+    let mut ptr: UserInOutPtr<RLimit> = at.into();
+
+    // What the typed write does there, which is the reason this pair exists.
+    assert!(
+        ptr.write(limit).is_err(),
+        "a 4-aligned destination is exactly what UserPtr::write refuses"
+    );
+
+    // And what this does there.
+    wide_put_unaligned(true, &mut ptr, limit).expect("bytes have no alignment to respect");
+    let back = wide_get_unaligned::<RLimit, _>(true, &ptr).expect("and are read back the same way");
+    assert_eq!(back.cur, 1234);
+    assert_eq!(back.max, u64::MAX);
+
+    // Sixteen bytes, the native layout: the first word at the start and the
+    // second eight bytes along, not four. Read back through the same user
+    // pointer, as a byte array, so the test needs no `unsafe` of its own ---
+    // which this crate denies.
+    let image: kernel_hal::user::UserInPtr<u8> = at.into();
+    let bytes = image.read_array(16).expect("the image this just wrote");
+    let word = |off: usize| {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[off..off + 8]);
+        u64::from_ne_bytes(buf)
+    };
+    assert_eq!(word(0), 1234, "rlim_cur at 0");
+    assert_eq!(word(8), u64::MAX, "rlim_max at 8, not at 4");
+}
+
+/// For a 64-bit caller nothing changes: the typed write is used, so a
+/// misaligned pointer is still refused as it was before.
+#[test]
+fn a_64_bit_caller_still_goes_through_the_typed_write() {
+    use kernel_hal::user::UserOutPtr;
+    use linux_object::process::RLimit;
+
+    let mut room = [0u32; 6];
+    let base = room.as_mut_ptr() as usize;
+    let at = if base.is_multiple_of(8) {
+        base + 4
+    } else {
+        base
+    };
+    let mut ptr: UserOutPtr<RLimit> = at.into();
+    assert!(
+        wide_put_unaligned(false, &mut ptr, RLimit { cur: 1, max: 2 }).is_err(),
+        "the native path is unchanged"
+    );
+}

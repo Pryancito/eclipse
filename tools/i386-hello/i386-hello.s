@@ -59,6 +59,10 @@
  *   45  setitimer/getitimer wrote the wrong shape of itimerval
  *   46  _newselect did not read and write back a 32-bit timeval
  *   47  the timerfd itimerspec did not survive the round trip
+ *   48  futex did not answer EAGAIN/ETIMEDOUT with a 32-bit timeout
+ *   49  ugetrlimit wrote the wrong shape of rlimit
+ *   50  the narrow infinity did not widen to the wide one
+ *   51  the two getrlimits did not clamp where they each clamp
  *
  * The last six are the segment registers, which is the second half of what
  * compatibility mode needs and the half `iretq` does not do: it reloads `CS`
@@ -819,6 +823,126 @@ _start:
 	movl	fd3, %ebx
 	int	$0x80
 
+	/* futex(FUTEX_WAIT_PRIVATE): i386 240. Two calls, and neither of them
+	 * waits for anything real. The first passes a `val` that does NOT
+	 * match the word, which `futex(2)` answers with EAGAIN before it looks
+	 * at the timeout: that is the entry path and the futex word. The
+	 * second passes the matching value and a one-millisecond timeout, so
+	 * it comes back ETIMEDOUT -- and THAT is the narrow `timespec`, because
+	 * read at the native width those eight bytes are one field and the
+	 * timeout would be 1000000 << 32 nanoseconds, which is either a
+	 * refusal or a wait of 140 million years. */
+	movl	$0, futex_word
+	movl	$240, %eax
+	movl	$futex_word, %ebx
+	movl	$128, %ecx		/* FUTEX_WAIT | FUTEX_PRIVATE_FLAG */
+	movl	$1, %edx		/* a value the word does not hold */
+	xorl	%esi, %esi
+	int	$0x80
+	cmpl	$-11, %eax		/* -EAGAIN */
+	jne	bad_futex
+	movl	$0, futex_to + 0
+	movl	$1000000, futex_to + 4
+	movl	$240, %eax
+	movl	$futex_word, %ebx
+	movl	$128, %ecx
+	xorl	%edx, %edx		/* the value the word does hold */
+	movl	$futex_to, %esi
+	int	$0x80
+	cmpl	$-110, %eax		/* -ETIMEDOUT */
+	jne	bad_futex
+
+	/* futex(FUTEX_WAKE_PRIVATE, 1): nobody is waiting, so the answer is
+	 * the count woken, zero. The fourth argument is a COUNT here and not a
+	 * timeout, which is the half of this call that has no structure in it
+	 * at all. */
+	movl	$240, %eax
+	movl	$futex_word, %ebx
+	movl	$129, %ecx		/* FUTEX_WAKE | FUTEX_PRIVATE_FLAG */
+	movl	$1, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_futex
+
+	/* ugetrlimit(RLIMIT_CORE, buf): i386 191, eight bytes and not sixteen.
+	 * i386 calls it `ugetrlimit` because 76 was already taken by the one
+	 * that clamps to a signed long instead. */
+	call	poison_tbuf
+	movl	$191, %eax
+	movl	$4, %ebx		/* RLIMIT_CORE */
+	movl	$tbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ugetrlimit
+	cmpl	$0xaaaaaaaa, tbuf + 8
+	jne	bad_ugetrlimit
+	cmpl	$0xaaaaaaaa, tbuf + 12
+	jne	bad_ugetrlimit
+
+	/* setrlimit(RLIMIT_CORE, { 1234, 0xffffffff }): i386 75. The hard
+	 * limit is written as the narrow infinity, and read back through
+	 * `prlimit64` it has to be the WIDE infinity -- not the number
+	 * 4294967295, which is what widening it as a plain number would give
+	 * and which would quietly cap at four gigabytes a process that asked
+	 * for no cap at all. */
+	movl	$1234, rl32 + 0
+	movl	$0xffffffff, rl32 + 4
+	movl	$75, %eax
+	movl	$4, %ebx
+	movl	$rl32, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_setrlimit32
+	call	poison_tbuf
+	movl	$340, %eax		/* prlimit64, sixteen bytes in both ABIs */
+	xorl	%ebx, %ebx
+	movl	$4, %ecx
+	xorl	%edx, %edx
+	movl	$tbuf, %esi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_setrlimit32
+	cmpl	$1234, tbuf + 0
+	jne	bad_setrlimit32
+	cmpl	$0, tbuf + 4
+	jne	bad_setrlimit32
+	cmpl	$0xffffffff, tbuf + 8
+	jne	bad_setrlimit32
+	cmpl	$0xffffffff, tbuf + 12
+	jne	bad_setrlimit32
+	cmpl	$0xaaaaaaaa, tbuf + 16
+	jne	bad_setrlimit32
+
+	/* And the two getters on that same limit, which is now infinite: 191
+	 * clamps to 0xffffffff and 76 clamps to 0x7fffffff. Clamped, not
+	 * truncated -- truncating an infinite limit gives 0xffffffff by
+	 * accident, but truncating one of eight gigabytes gives zero, which
+	 * says "forbidden" for a limit that forbids nothing. */
+	call	poison_tbuf
+	movl	$191, %eax
+	movl	$4, %ebx
+	movl	$tbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_rlimit_clamp
+	cmpl	$1234, tbuf + 0
+	jne	bad_rlimit_clamp
+	cmpl	$0xffffffff, tbuf + 4
+	jne	bad_rlimit_clamp
+	call	poison_tbuf
+	movl	$76, %eax		/* the older getrlimit */
+	movl	$4, %ebx
+	movl	$tbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_rlimit_clamp
+	cmpl	$1234, tbuf + 0
+	jne	bad_rlimit_clamp
+	cmpl	$0x7fffffff, tbuf + 4
+	jne	bad_rlimit_clamp
+	cmpl	$0xaaaaaaaa, tbuf + 8
+	jne	bad_rlimit_clamp
+
 	/* get_thread_area(&tls_desc): i386 244, the other half, and the one a
 	 * debugger uses. It has to hand back the base this program asked for,
 	 * which means the descriptor really does hold it rather than
@@ -945,6 +1069,18 @@ bad_select:
 	jmp	die
 bad_timerfd:
 	movl	$47, %ebx
+	jmp	die
+bad_futex:
+	movl	$48, %ebx
+	jmp	die
+bad_ugetrlimit:
+	movl	$49, %ebx
+	jmp	die
+bad_setrlimit32:
+	movl	$50, %ebx
+	jmp	die
+bad_rlimit_clamp:
+	movl	$51, %ebx
 
 	/* Fill the scratch buffer with 0xaa, so that every structure written
 	 * into it afterwards says by itself how many bytes it is: the first
@@ -1061,6 +1197,17 @@ seltv:
 	.space	16
 fd3:
 	.long	0
+	/* The futex word, which is a `u32` in both ABIs, its timeout, and the
+	 * eight bytes of a narrow `struct rlimit`. Each is given the room a
+	 * native one would need, so that a kernel reading or writing the wide
+	 * layout touches this program's own memory. */
+	.align 4
+futex_word:
+	.long	0
+futex_to:
+	.space	16
+rl32:
+	.space	16
 	.align 4
 statbuf:
 	.space	96

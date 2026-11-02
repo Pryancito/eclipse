@@ -368,3 +368,29 @@ fn pselect6_stays_unmapped_for_its_sigset_argument_and_not_its_timeout() {
     assert_eq!(name(308), Some("pselect6"));
     assert_eq!(native_number(308), None);
 }
+
+/// `statx` was in `i386_abi_same.in` and is not any more, and the reason is
+/// worth a test of its own because it is not the one anybody looks for:
+/// `struct statx` IS the same 256 bytes in both ABIs. What differs is the
+/// alignment --- on i386 a `long long` aligns to 4, so a 32-bit program's
+/// `struct statx *` is 4-aligned, and `UserPtr::write` insists on 8 because
+/// it stores through a `*Statx`.
+///
+/// `EFAULT` for a pointer Linux accepts is worse than `ENOSYS`: musl falls
+/// back to `fstatat` on `ENOSYS` and has nowhere to go on `EFAULT`. It comes
+/// back once it writes its bytes the way `stat64` does.
+#[test]
+fn statx_stays_unmapped_until_it_writes_its_bytes() {
+    assert_eq!(name(383), Some("statx"));
+    assert_eq!(native_number(383), None);
+}
+
+/// And `prlimit64`, which has the same trouble, is mapped --- because its
+/// handler now writes its sixteen bytes rather than storing through a
+/// `*RLimit`. The two are the same problem with and without its fix, so
+/// they are pinned together.
+#[test]
+fn prlimit64_is_mapped_because_its_handler_writes_bytes() {
+    assert_eq!(name(340), Some("prlimit64"));
+    assert!(native_number(340).is_some());
+}

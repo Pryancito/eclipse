@@ -214,6 +214,22 @@ impl Narrow for RUsage {
     }
 }
 
+impl Narrow for linux_object::process::RLimit {
+    const WORDS: usize = 2;
+
+    fn to_words(self, out: &mut [u64]) {
+        out[0] = self.cur;
+        out[1] = self.max;
+    }
+
+    fn from_words(words: &[u64]) -> Self {
+        Self {
+            cur: words[0],
+            max: words[1],
+        }
+    }
+}
+
 /// The narrow image of `value`: `WORDS` little-endian `u32`s.
 fn to_narrow_bytes<T: Narrow>(value: T) -> ([u8; MAX_WORDS * 4], usize) {
     let mut words = [0u64; MAX_WORDS];
@@ -305,6 +321,100 @@ pub(crate) fn narrow_get_if_not_null<T: Narrow, P: Policy + Read>(
     narrow_get(abi32, ptr).map(Some)
 }
 
+/// The structure's **native** image, as bytes: the same layout, with no
+/// alignment requirement.
+fn to_wide_bytes<T: Narrow>(value: T) -> ([u8; MAX_WORDS * 8], usize) {
+    let mut words = [0u64; MAX_WORDS];
+    value.to_words(&mut words[..T::WORDS]);
+    let mut bytes = [0u8; MAX_WORDS * 8];
+    let (slots, _) = bytes.as_chunks_mut::<8>();
+    for (slot, word) in slots.iter_mut().zip(words[..T::WORDS].iter()) {
+        *slot = word.to_ne_bytes();
+    }
+    (bytes, T::WORDS * 8)
+}
+
+/// `value` back out of its native image.
+fn from_wide_bytes<T: Narrow>(bytes: &[u8]) -> T {
+    let mut words = [0u64; MAX_WORDS];
+    let (slots, _) = bytes.as_chunks::<8>();
+    for (word, slot) in words[..T::WORDS].iter_mut().zip(slots.iter()) {
+        *word = u64::from_ne_bytes(*slot);
+    }
+    T::from_words(&words[..T::WORDS])
+}
+
+/// Write `value` in the **native** layout, but without requiring the
+/// destination be aligned to it.
+///
+/// Not every structure a 32-bit process passes is halved. `struct rlimit64`
+/// and `struct statx` were designed to be the same bytes in both ABIs --- and
+/// they are, except for one thing: on i386 a `long long` is aligned to 4, so
+/// such a structure is **4-aligned** in a 32-bit program and 8-aligned here.
+/// `UserPtr::write` reads and writes through a `*T`, so it has to insist on
+/// `align_of::<T>()`; `copy_to_user` insists on nothing, and a 32-bit caller
+/// that passes its own correctly-aligned buffer would be answered `EFAULT`
+/// for a pointer Linux accepts.
+///
+/// Found by the i386 probe: `prlimit64` failed on a buffer at `...9c`, which
+/// is a perfectly good `struct rlimit64 *` to a 32-bit program.
+pub(crate) fn wide_put_unaligned<T: Narrow, P: Policy + Write>(
+    abi32: bool,
+    ptr: &mut UserPtr<T, P>,
+    value: T,
+) -> LxResult<()> {
+    if !abi32 {
+        ptr.write(value)?;
+        return Ok(());
+    }
+    if ptr.is_null() {
+        return Err(LxError::EFAULT);
+    }
+    let (bytes, len) = to_wide_bytes(value);
+    let mut out: UserOutPtr<u8> = ptr.as_addr().into();
+    out.write_array(&bytes[..len])?;
+    Ok(())
+}
+
+/// [`wide_put_unaligned`], but a null pointer is "not asked for".
+pub(crate) fn wide_put_unaligned_if_not_null<T: Narrow, P: Policy + Write>(
+    abi32: bool,
+    ptr: &mut UserPtr<T, P>,
+    value: T,
+) -> LxResult<()> {
+    if ptr.is_null() {
+        return Ok(());
+    }
+    wide_put_unaligned(abi32, ptr, value)
+}
+
+/// [`wide_put_unaligned`] the other way round.
+pub(crate) fn wide_get_unaligned<T: Narrow, P: Policy + Read>(
+    abi32: bool,
+    ptr: &UserPtr<T, P>,
+) -> LxResult<T> {
+    if !abi32 {
+        return Ok(ptr.read()?);
+    }
+    if ptr.is_null() {
+        return Err(LxError::EFAULT);
+    }
+    let raw: UserPtr<u8, P> = ptr.as_addr().into();
+    let bytes = raw.read_array(T::WORDS * 8)?;
+    Ok(from_wide_bytes(&bytes))
+}
+
+/// [`wide_get_unaligned`], but a null pointer is `None`.
+pub(crate) fn wide_get_unaligned_if_not_null<T: Narrow, P: Policy + Read>(
+    abi32: bool,
+    ptr: &UserPtr<T, P>,
+) -> LxResult<Option<T>> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    wide_get_unaligned(abi32, ptr).map(Some)
+}
+
 impl Syscall<'_> {
     /// Whether the calling process reads and writes these structures at half
     /// the native width: Linux's `in_compat_syscall()`.
@@ -335,6 +445,23 @@ impl Syscall<'_> {
         ptr: &UserPtr<T, P>,
     ) -> LxResult<Option<T>> {
         narrow_get_if_not_null(self.narrow_abi(), ptr)
+    }
+
+    /// [`wide_put_unaligned_if_not_null`] for the calling process.
+    pub(crate) fn put_wide_if_not_null<T: Narrow, P: Policy + Write>(
+        &self,
+        ptr: &mut UserPtr<T, P>,
+        value: T,
+    ) -> LxResult<()> {
+        wide_put_unaligned_if_not_null(self.narrow_abi(), ptr, value)
+    }
+
+    /// [`wide_get_unaligned_if_not_null`] for the calling process.
+    pub(crate) fn get_wide_if_not_null<T: Narrow, P: Policy + Read>(
+        &self,
+        ptr: &UserPtr<T, P>,
+    ) -> LxResult<Option<T>> {
+        wide_get_unaligned_if_not_null(self.narrow_abi(), ptr)
     }
 }
 

@@ -87,7 +87,11 @@
 //! 64-bit field at 4-byte alignment (see [`stat`](stat)); and `fcntl64` (221)
 //! with `fcntl` (55), six of whose commands point at one of i386's two
 //! `struct flock` --- which one being decided by the command number (see
-//! [`fcntl`](fcntl)).
+//! [`fcntl`](fcntl)); and `setrlimit` (75), `getrlimit` (76) and
+//! `ugetrlimit` (191), whose two words are **clamped** rather than
+//! truncated, at a different number for each of the two getters, and whose
+//! `0xffffffff` means "no limit" rather than the number it spells (see
+//! [`rlimit`](rlimit)).
 //!
 //! ## The renames
 //!
@@ -109,6 +113,7 @@ use linux_object::error::LxError;
 
 mod fcntl;
 mod iovec;
+mod rlimit;
 mod stat;
 mod tls;
 mod wide;
@@ -141,6 +146,13 @@ const I386_LSTAT64: u32 = 196;
 const I386_FSTAT64: u32 = 197;
 const I386_FCNTL64: u32 = 221;
 const I386_FSTATAT64: u32 = 300;
+
+/// And the `struct rlimit` calls, whose narrow form is not a truncation but
+/// a clamp --- and whose two getters clamp at different numbers. See
+/// [`rlimit`].
+const I386_SETRLIMIT: u32 = 75;
+const I386_OLD_GETRLIMIT: u32 = 76;
+const I386_UGETRLIMIT: u32 = 191;
 
 /// And the scatter/gather calls whose offset arrives split across two
 /// registers. `readv` (145) and `writev` (146) are not here: their only
@@ -215,6 +227,9 @@ impl Syscall<'_> {
             // The same handler for both numbers, because measuring Linux
             // says they are the same call: see [`fcntl`].
             I386_FCNTL64 | I386_FCNTL => return syscall_ret(self.sys_fcntl64(a0, a1, a2).await),
+            I386_SETRLIMIT => return syscall_ret(self.sys_setrlimit32(a0, a1)),
+            I386_OLD_GETRLIMIT => return syscall_ret(self.sys_old_getrlimit32(a0, a1)),
+            I386_UGETRLIMIT => return syscall_ret(self.sys_ugetrlimit(a0, a1)),
             // `readv` (145) and `writev` (146) are not here: see
             // `i386_abi_narrow.in`. These two are, because the offset
             // arrives in two registers. See [`iovec`].
