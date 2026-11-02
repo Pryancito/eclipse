@@ -2603,11 +2603,11 @@ impl LinuxRootfs {
         let dir = PROJECT_DIR.join("tools").join("i386-hello");
         let executable = dir.join("i386-hello");
         let source = dir.join("i386-hello.s");
-        // NOT `cached_for_target`: that gate asks whether a cached artifact is
-        // an ELF for the architecture being built, and this one is an i386 ELF
-        // on purpose. Its machine never changes, so the mtime alone is the
-        // whole question.
-        if executable.is_file() && source.is_file() {
+        // `verify::cached_for_i386`, not `self.cached_for_target`: the gate
+        // asks whether a cached artifact is still what this cache builds, and
+        // what this one builds is an ELF32 / `EM_386`, whatever architecture
+        // the image is for. `cached_for_target` would reject it outright.
+        if executable.is_file() && source.is_file() && verify::cached_for_i386(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
