@@ -86,20 +86,30 @@ fn compat32(native: &[(String, u32)]) {
         if line.is_empty() || line.starts_with("//") {
             continue;
         }
-        let Some(&id32) = i386_by_name.get(line) else {
+        // A bare name means the two tables call the call the same thing.
+        // `i386_name = native_name` is for the ones i386 renamed, which are
+        // all the same story: the original was 16-bit, so i386 grew a `*32`
+        // number for the real thing, while x86_64 -- which never had a
+        // 16-bit anything -- just calls it by its name. The ABI of the pair
+        // is still identical, which is the only question this file answers.
+        let (name32, name64) = match line.split_once('=') {
+            Some((left, right)) => (left.trim(), right.trim()),
+            None => (line, line),
+        };
+        let Some(&id32) = i386_by_name.get(name32) else {
             panic!(
                 "{}: {:?} is not a system call in {}",
-                SAME_IN, line, I386_IN
+                SAME_IN, name32, I386_IN
             );
         };
-        let Some(&id64) = by_name.get(line) else {
+        let Some(&id64) = by_name.get(name64) else {
             panic!(
                 "{}: {:?} is not a system call this kernel implements",
-                SAME_IN, line
+                SAME_IN, name64
             );
         };
-        if abi_same.insert(line, (id32, id64)).is_some() {
-            panic!("{}: {:?} is listed twice", SAME_IN, line);
+        if abi_same.insert(name32, (id32, id64)).is_some() {
+            panic!("{}: {:?} is listed twice", SAME_IN, name32);
         }
     }
 

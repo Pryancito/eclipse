@@ -29,6 +29,10 @@
 //   - an argument block in memory rather than in registers (`old_mmap`,
 //     `old_select`, `socketcall`, `ipc`).
 //
+// A line is a bare name when the two tables call the call the same thing, or
+// `i386_name = native_name` for the ones i386 renamed. See the credential
+// block at the bottom: those are renamed, not reshaped.
+//
 // Verified against `include/linux/syscalls.h` and `asm/unistd_32.h`. Each
 // addition is one line, and the test in `compat32/tests.rs` checks that every
 // name here exists in both tables.
@@ -163,3 +167,40 @@ accept4
 getsockname
 getpeername
 shutdown
+
+// --- credentials, the 32-bit ones
+//
+// Every one of these is a RENAME and not a reshape, which is why they are
+// here and the names they replaced are not. i386 grew up with 16-bit uids:
+// `getuid`(24) returns an `old_uid_t`, and a uid that does not fit in 16 bits
+// comes back as the overflow uid, 65534. So Linux added a second number for
+// each of them, `*32`, returning the real 32-bit value -- and x86_64, which
+// never had a 16-bit anything, has only the plain name.
+//
+// `uid_t` and `gid_t` are `unsigned int` in both ABIs, so every argument and
+// every return value of the pair is four bytes wide on both sides, and the
+// pointer arguments (`getresuid`, `getgroups`) point at arrays of them. That
+// is the whole of what makes these safe, and it is also why the names they
+// replaced must never appear here: those pass a different width.
+//
+// Measured, not guessed: all nineteen are in the i386 `busybox-static` of
+// Ubuntu noble, which is the first real corpus this compat has had.
+getuid32 = getuid
+geteuid32 = geteuid
+getgid32 = getgid
+getegid32 = getegid
+setuid32 = setuid
+setgid32 = setgid
+setreuid32 = setreuid
+setregid32 = setregid
+setresuid32 = setresuid
+setresgid32 = setresgid
+getresuid32 = getresuid
+getresgid32 = getresgid
+setfsuid32 = setfsuid
+setfsgid32 = setfsgid
+getgroups32 = getgroups
+setgroups32 = setgroups
+chown32 = chown
+fchown32 = fchown
+lchown32 = lchown
