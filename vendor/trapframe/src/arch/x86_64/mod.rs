@@ -16,8 +16,9 @@ mod trap;
 pub use fncall::syscall_fn_entry;
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 pub use gdt::{
-    enable_user_fsgsbase, logical_cpu_id_valid, read_cpu_local, read_logical_cpu_id,
-    user_fsgsbase_enabled, write_cpu_local, write_logical_cpu_id,
+    compat_tls_index, compat_tls_selector, enable_user_fsgsbase, load_compat_tls,
+    logical_cpu_id_valid, read_cpu_local, read_logical_cpu_id, user_fsgsbase_enabled,
+    write_cpu_local, write_logical_cpu_id, COMPAT_TLS_ENTRIES,
 };
 #[cfg(any(target_os = "none", target_os = "uefi"))]
 pub use syscall::dbg_save_addr;
@@ -239,6 +240,36 @@ pub struct UserContext {
     /// have been popped, which is this field's offset in the frame; the
     /// `OFFSET` assertion below is what keeps the two in step.
     pub compat32: usize,
+    /// The selector a 32-bit thread has in `%gs`, which is where i386 keeps
+    /// its thread pointer.
+    ///
+    /// It has to be restored on the way out, and the hardware will not do it:
+    /// `iretq` reloads `CS` and `SS` and leaves `DS`, `ES`, `FS` and `GS`
+    /// alone. In 64-bit mode nothing notices, because the segment a data
+    /// access uses is ignored; a thread running in compatibility mode notices
+    /// immediately, because `mov %gs:0x0, %eax` is how it reads its own TLS
+    /// and the kernel's `%gs` is not its.
+    ///
+    /// Zero means "no thread area yet", and then the data selector is used:
+    /// that is the state a thread starts in, before `set_thread_area`, and a
+    /// `%gs` of zero in compatibility mode faults on the first TLS access
+    /// rather than reading somebody else's.
+    ///
+    /// Read by `syscall.S` at `[rsp + 7*8]` from the slot of `rip`, the slot
+    /// after [`compat32`](Self::compat32).
+    pub compat_gs: usize,
+    /// This thread's three 32-bit TLS descriptors, as `set_thread_area` built
+    /// them, to be written into the running CPU's GDT on the way to user mode
+    /// (`gdt::load_compat_tls`, Linux's `load_TLS`).
+    ///
+    /// They live with the thread and not with the CPU: the GDT slots are
+    /// scratch space for whoever is running now, and a thread can be resumed
+    /// on a CPU that last held another thread's. A descriptor of zero is a
+    /// slot its owner never claimed.
+    ///
+    /// Not read by the assembly --- the kernel loads them before entering ---
+    /// so this one carries no offset assertion.
+    pub compat_tls: [u64; 3],
     /// FXSAVE area holding this thread's x87/SSE (FPU/MMX/XMM) state. The kernel
     /// is compiled with SSE2 (`+sse2`) and freely uses XMM (memcpy, etc.), so the
     /// per-thread user FPU state MUST be saved on every kernel entry and restored
@@ -324,6 +355,7 @@ const _: () = {
     assert!(core::mem::offset_of!(UserContext, trap_num) == 20 * 8);
     assert!(core::mem::offset_of!(UserContext, error_code) == 21 * 8);
     assert!(core::mem::offset_of!(UserContext, compat32) == 22 * 8);
+    assert!(core::mem::offset_of!(UserContext, compat_gs) == 23 * 8);
 };
 
 impl UserContext {
@@ -455,6 +487,17 @@ mod layout_tests {
             offset_of!(UserContext, error_code) + 8,
             22 * 8,
             "el `add rsp, 22*8` de syscall.S y trap.S ya no salta el marco entero"
+        );
+        // Y lo que hay DESPUES del marco: los dos campos del compat de 32
+        // bits, en las ranuras que `syscall.S` lee con un desplazamiento
+        // escrito a mano. Las entradas no los pisan --- ponen `rsp` en la
+        // ranura 22 y empujan hacia ABAJO --- asi que sobreviven al viaje, y
+        // es justo eso lo que les permite llevar estado del hilo.
+        assert_eq!(offset_of!(UserContext, compat32), 22 * 8);
+        assert_eq!(
+            offset_of!(UserContext, compat_gs),
+            23 * 8,
+            "el `[rsp + 7*8]` del camino del iret ya no lee compat_gs"
         );
     }
 

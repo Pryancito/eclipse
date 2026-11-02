@@ -19,6 +19,24 @@ use x86_64::{PrivilegeLevel, VirtAddr};
 static BSP_GDT_BASE: AtomicU64 = AtomicU64::new(0);
 static BSP_GDT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Index of the first of this GDT's three 32-bit TLS descriptors, and of
+/// `KCODE64`, as [`init`] laid them out. Both are the same on every CPU: an AP
+/// copies the BSP's whole table and appends only its own TSS, so everything the
+/// BSP placed keeps its index. That is the whole reason the TLS slots are the
+/// BSP's and not each CPU's own appendix --- a selector is a number ring 3
+/// holds on to, and it has to name the same descriptor on whichever CPU the
+/// thread wakes up on.
+static BSP_TLS_INDEX: AtomicUsize = AtomicUsize::new(0);
+static BSP_KCODE64_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+/// How many TLS descriptors a 32-bit thread gets, and the first `entry_number`
+/// `set_thread_area(2)` hands out. Linux's are `GDT_ENTRY_TLS_MIN..=MAX`,
+/// three of them, and its `entry_number` is the GDT index itself; here the
+/// index depends on how many descriptors the firmware left in the table, so
+/// the numbers ring 3 sees are 0, 1 and 2 and [`compat_tls_selector`] turns
+/// one into a selector.
+pub const COMPAT_TLS_ENTRIES: usize = 3;
+
 /// The `STAR` MSR value written by the BSP.  `STAR` is a per-CPU MSR, so each
 /// AP must write it independently with the same value.
 /// Packed as `(u_cs_raw << 16) | k_cs_raw` into a single AtomicU32.
@@ -322,13 +340,21 @@ pub fn init() {
         let entry_count = (gdtp.limit + 1) as usize / size_of::<u64>();
         let old_gdt = core::slice::from_raw_parts(gdtp.base.as_ptr::<u64>(), entry_count);
 
-        // allocate new GDT with 7 more entries
+        // allocate new GDT with 7 more entries, and the three TLS slots after
+        // them
         //
         // NOTICE: for fast syscall:
         //   STAR[47:32] = K_CS   = K_SS - 8
         //   STAR[63:48] = U_CS32 = U_SS32 - 8 = U_CS - 16
+        //
+        // The TLS descriptors start out empty (a not-present descriptor, which
+        // is what index 0 of any GDT is too): a thread that has not called
+        // `set_thread_area` has no thread area, and loading its selector has
+        // to fault rather than reach whatever the last thread put there.
         let mut gdt = Vec::from(old_gdt);
         gdt.extend([tss0, tss1, KCODE64, KDATA64, UCODE32, UDATA32, UCODE64].iter());
+        let tls_index = gdt.len();
+        gdt.extend([0u64; COMPAT_TLS_ENTRIES].iter());
         let gdt = Vec::leak(gdt);
 
         // load new GDT and TSS
@@ -378,6 +404,14 @@ pub fn init() {
         // lacks KCODE64/UCODE64/UDATA32 etc.  They must extend THIS GDT.
         BSP_GDT_BASE.store(gdt.as_ptr() as u64, Ordering::Release);
         BSP_GDT_COUNT.store(gdt.len(), Ordering::Release);
+        // Published before `BSP_GDT_BASE`'s release store is read by any AP,
+        // and read by `init_ap` and `load_compat_tls` instead of being
+        // recomputed: the one arithmetic copy of this layout that existed
+        // ("KCODE64 index = entry_count - 5") went stale the moment the table
+        // grew, and an index into a descriptor table that is quietly off by
+        // three is a #GP on a far return with no clue in it.
+        BSP_TLS_INDEX.store(tls_index, Ordering::Release);
+        BSP_KCODE64_INDEX.store(entry_count + 2, Ordering::Release);
         // Pack STAR fields so APs can replicate the write.
         BSP_STAR.store(
             ((star_u_cs as u32) << 16) | star_k_cs as u32,
@@ -464,11 +498,15 @@ pub fn init_ap() {
         // the new GDT and faults with #GP error_code=0x8.  Fix: far-return to
         // immediately reload CS with KCODE64.
         //
-        // BSP's init() appended [tss0, tss1, KCODE64, KDATA64, UCODE32, UDATA32,
-        // UCODE64], so KCODE64 is at GDT index (original_count + 2).
-        // entry_count = BSP_GDT_COUNT = original_count + 7, so
-        // KCODE64 index = entry_count - 5.
-        let kcode64_idx = entry_count as u16 - 5;
+        // `init` published the index rather than leaving it to be derived
+        // from `entry_count`: it appends a variable number of descriptors
+        // (seven, plus the TLS slots), and the arithmetic that used to live
+        // here was wrong by exactly as many as the table had grown.
+        let kcode64_idx = BSP_KCODE64_INDEX.load(Ordering::Acquire) as u16;
+        assert!(
+            kcode64_idx != 0,
+            "BSP GDT layout not published before init_ap"
+        );
         let kcode64_sel = SegmentSelector::new(kcode64_idx, PrivilegeLevel::Ring0).0 as u64;
         asm!(
             // Push new CS, then the return address, then 64-bit far return.
@@ -505,6 +543,67 @@ pub fn init_ap() {
     }
 
     GDT_EXTEND_LOCK.store(false, Ordering::Release);
+}
+
+/// The selector ring 3 loads into `%gs` (or `%fs`) to reach TLS entry
+/// `entry`, with RPL 3.
+///
+/// `entry` is 0, 1 or 2; anything else is a caller that did not range-check
+/// what came from ring 3, and would hand out a selector naming some other
+/// descriptor entirely.
+pub fn compat_tls_selector(entry: usize) -> u16 {
+    assert!(entry < COMPAT_TLS_ENTRIES, "TLS entry out of range");
+    let index = BSP_TLS_INDEX.load(Ordering::Acquire);
+    assert!(index != 0, "GDT not initialized");
+    SegmentSelector::new((index + entry) as u16, PrivilegeLevel::Ring3).0
+}
+
+/// The GDT index of the first TLS descriptor, which is the `entry_number`
+/// `set_thread_area(2)` speaks in.
+///
+/// Linux's is the constant `GDT_ENTRY_TLS_MIN`, 12, because Linux lays out its
+/// own GDT from the first entry. This one cannot be a constant: the table
+/// starts as the firmware's and this kernel appends to it, so where the TLS
+/// slots land depends on how many descriptors were already there. The number
+/// has to be the real index all the same, and not a slot number of our own
+/// choosing, because ring 3 builds the selector itself --- musl does
+/// `(entry_number << 3) | 3` --- and a number that is not the index names some
+/// other descriptor.
+pub fn compat_tls_index() -> usize {
+    let index = BSP_TLS_INDEX.load(Ordering::Acquire);
+    assert!(index != 0, "GDT not initialized");
+    index
+}
+
+/// Write a thread's three 32-bit TLS descriptors into THIS CPU's GDT.
+///
+/// The counterpart of Linux's `load_TLS`, and called in the same place: on the
+/// way to user mode, every time, because the thread can wake up on a CPU that
+/// last held somebody else's descriptors. The descriptors live with the thread
+/// and the GDT slots are scratch space for whoever is running now.
+///
+/// Writing a descriptor table that is currently loaded is allowed: the CPU
+/// reads a descriptor when a selector is loaded, not before, so ring 3's next
+/// `mov %gs, sel` is what picks this up. The window between this call and the
+/// return to user is not a hole either --- a preemption in it ends in another
+/// trip through the same path, which loads the right thread's descriptors
+/// again.
+///
+/// Takes `&self`-free module state only: there is no lock, because the slots
+/// it writes belong to the CPU it runs on, and the caller is that CPU.
+pub fn load_compat_tls(desc: &[u64; COMPAT_TLS_ENTRIES]) {
+    let index = BSP_TLS_INDEX.load(Ordering::Acquire);
+    assert!(index != 0, "GDT not initialized");
+    unsafe {
+        let gdtp = sgdt();
+        let count = (gdtp.limit as usize + 1) / size_of::<u64>();
+        assert!(
+            index + COMPAT_TLS_ENTRIES <= count,
+            "this CPU's GDT has no TLS slots"
+        );
+        let slots = gdtp.base.as_mut_ptr::<u64>().add(index);
+        core::ptr::copy_nonoverlapping(desc.as_ptr(), slots, COMPAT_TLS_ENTRIES);
+    }
 }
 
 /// Get current GDT register

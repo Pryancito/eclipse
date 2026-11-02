@@ -132,7 +132,6 @@ fn the_i386_only_calls_are_left_unmapped() {
         (140, "_llseek"),
         (119, "sigreturn"),
         (173, "rt_sigreturn"),
-        (243, "set_thread_area"),
         (199, "getuid32"),
         (213, "setuid32"),
         (403, "clock_gettime64"),
@@ -143,6 +142,26 @@ fn the_i386_only_calls_are_left_unmapped() {
             native_number(num),
             None,
             "i386 {} ({}) must not be mapped by name: its ABI differs",
+            num,
+            called
+        );
+    }
+}
+
+/// The i386-only calls the kernel answers ITSELF are absent from the
+/// translation table on purpose, and that absence is load-bearing: the
+/// dispatch checks them first, so a row here would be dead and a row that
+/// pointed at a native number would be wrong. They are not `ENOSYS` either,
+/// which is what every other unmapped number is -- the difference is the
+/// dispatch, and this is the half of it that can be asserted here.
+#[test]
+fn the_calls_this_kernel_answers_itself_are_not_in_the_table() {
+    for (num, called) in [(243, "set_thread_area"), (244, "get_thread_area")] {
+        assert_eq!(name(num), Some(called), "i386 {}", num);
+        assert_eq!(
+            native_number(num),
+            None,
+            "i386 {} ({}) has no native twin: it must not be mapped",
             num,
             called
         );

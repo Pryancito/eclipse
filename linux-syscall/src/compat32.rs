@@ -41,8 +41,6 @@
 //!   across two registers;
 //! - `fcntl64`, and the `*32` credential calls (`getuid32`, `setresuid32`,
 //!   ...), which exist because the originals were 16-bit;
-//! - `set_thread_area` (243), which installs a `%gs` *selector* for TLS where
-//!   x86_64 writes an `FSBASE` MSR;
 //! - `sigreturn` (119) and `rt_sigreturn` (173), whose signal frames are
 //!   32-bit structures;
 //! - the `*_time64` calls (403 and up), the 32-bit world's answer to 2038.
@@ -53,7 +51,20 @@
 //! zero-extended; `clone`, whose last two arguments are swapped on i386; and
 //! `execve`, whose `argv` and `envp` are arrays of 4-byte pointers.
 //!
-//! Every one of them answers `ENOSYS` **with its own name** in the log, which
+//! ## And the ones with no native twin at all
+//!
+//! A number can be missing from the allowlist for a second reason: not that
+//! its ABI differs from a native call's, but that there is no native call. For
+//! those the kernel does the work itself, and the dispatch below answers them
+//! before it asks the table --- which would say `ENOSYS` for a call that is
+//! right here.
+//!
+//! `set_thread_area` (243) and `get_thread_area` (244) are the first:
+//! x86_64 keeps a thread pointer in an MSR and i386 keeps it in a segment
+//! descriptor, so the two kernels genuinely do different work. See
+//! [`tls`](tls).
+//!
+//! Every remaining one answers `ENOSYS` **with its own name** in the log, which
 //! is a far better report than a number:
 //! `sys_compat32: i386 syscall 192 (mmap2) is not implemented` says exactly
 //! what to write next. [`I386_NAMES`] carries all 451 numbers for that, mapped
@@ -61,6 +72,19 @@
 
 use super::*;
 use linux_object::error::LxError;
+
+mod tls;
+
+/// The i386 numbers this kernel answers **itself**, because there is no native
+/// call to translate them into.
+///
+/// A number here is deliberately absent from `i386_abi_same.in`: it is not
+/// that its ABI differs from a native twin's, it is that it has no twin at
+/// all. `set_thread_area` is the first: x86_64 keeps a thread pointer in an
+/// MSR and i386 keeps it in a segment descriptor, so the two kernels do
+/// genuinely different work. See [`tls`].
+const I386_SET_THREAD_AREA: u32 = 243;
+const I386_GET_THREAD_AREA: u32 = 244;
 
 mod table {
     include!(concat!(env!("OUT_DIR"), "/compat32.rs"));
@@ -104,6 +128,14 @@ impl Syscall<'_> {
     /// frame. See the [module documentation](self) for why the list is an
     /// allowlist.
     pub async fn compat32_syscall(&mut self, num: u32, args: [usize; 6]) -> isize {
+        // The i386-only calls this kernel implements come first: they are not
+        // in the translation table on purpose, so asking it would answer
+        // `ENOSYS` for a call that is right here.
+        match num {
+            I386_SET_THREAD_AREA => return syscall_ret(self.sys_set_thread_area(args[0])),
+            I386_GET_THREAD_AREA => return syscall_ret(self.sys_get_thread_area(args[0])),
+            _ => {}
+        }
         match native_number(num) {
             Some(native) => {
                 trace!(

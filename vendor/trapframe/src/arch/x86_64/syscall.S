@@ -121,7 +121,40 @@ iret:
     cmp qword ptr [rsp + 6*8], 0      # compat32?
     jne 3f                  # yes: keep dx = user_cs32
     add dx, 16              # no: dx = user_cs64
+    jmp 4f
 3:
+    # Compatibility mode, and now the segment registers `iretq` will NOT
+    # reload: it does `CS` and `SS` and leaves `DS`, `ES`, `FS` and `GS` as
+    # the kernel left them. A 64-bit thread does not care, because a data
+    # access in 64-bit mode ignores the segment; a 32-bit one is addressing
+    # through `DS` on every ordinary load, and through `GS` for its TLS.
+    #
+    # `ax` is the user data selector, which is what `DS`, `ES` and `FS` want:
+    # `UDATA32`, flat and 4 GiB. `GS` is the thread's own, out of the frame,
+    # because that is where i386 keeps its thread pointer and each thread has
+    # a different one. Loading a selector in long mode also sets that
+    # segment's base from its descriptor, which is exactly how a 32-bit thread
+    # expects `%gs:0x0` to resolve.
+    #
+    # `rcx` is scratch here: the iret path recovers it from the frame further
+    # down, after the pushes. Nothing between here and `iretq` reads `gs:` --
+    # the `swapgs` above already took this CPU off its per-CPU region -- and
+    # every memory operand left is `rsp`-based, i.e. through `SS`, which this
+    # does not touch.
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov rcx, [rsp + 7*8]    # compat_gs
+    test rcx, rcx
+    jnz 5f
+    # No thread area claimed yet. Use the data selector rather than leaving
+    # the kernel's `GS`: a thread that has not called `set_thread_area` has no
+    # TLS to reach, and this way its first `%gs:` access reads its own flat
+    # segment instead of whatever the kernel had loaded.
+    mov rcx, rax
+5:
+    mov gs, cx
+4:
 
     # construct trap frame
     push rax                # push ss

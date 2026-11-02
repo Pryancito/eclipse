@@ -328,8 +328,11 @@ dump_registers:
             trap_num: 0,
             error_code: 0,
             // `fncall` is the libos path, where the "user" code is a function
-            // in this very process: it is 64-bit, so never a compat thread.
+            // in this very process: it is 64-bit, so never a compat thread,
+            // and it has no 32-bit thread area either.
             compat32: 0,
+            compat_gs: 0,
+            compat_tls: [0; 3],
             fpstate: Default::default(),
         };
         cx.run_fncall();
