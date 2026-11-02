@@ -747,8 +747,13 @@ mod hunter_config_tests {
         // delta on `stats()`: the signature database belongs to the process and
         // other tests add to it from other threads, so that delta counts
         // everybody's. `remove_signature` matches a pattern and says whether it
-        // was there, which is the only question this test has, and it leaves
-        // the database as it found it.
+        // was there, which is the only question this test has.
+        //
+        // Taking them out again leaves the database as it was only because
+        // these two patterns are THIS test's: nothing else in the tree writes
+        // `a12a12a12a12` or `a12a12a12a13`. A test that reused one would both
+        // satisfy this assertion without this test having loaded anything and
+        // lose its own signature here, so they are reserved -- pick another.
         for line in [
             "bytes:a12a12a12a12:Test.Local",
             "bytes:a12a12a12a13:Test.Feed",
