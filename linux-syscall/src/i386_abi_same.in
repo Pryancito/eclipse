@@ -204,3 +204,12 @@ setgroups32 = setgroups
 chown32 = chown
 fchown32 = fchown
 lchown32 = lchown
+
+// Scalars and arrays of structures that are the same bytes in both ABIs, and
+// which the timer and poll families above need in order to be usable at all:
+// `struct pollfd` is `{ int; short; short }` -- 8 bytes in either ABI -- and
+// a `timerfd` is created with three scalars.
+poll
+timerfd_create
+timer_getoverrun
+timer_delete

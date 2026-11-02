@@ -69,19 +69,40 @@ fn main() {
 /// A name in the allowlist that is in neither table is a mistake worth
 /// stopping the build for: it is a line that looks like it does something and
 /// does nothing.
+///
+/// There are **two** allowlist files, read as one. `i386_abi_same.in` is the
+/// calls that need no conversion at all. `i386_abi_narrow.in` is the calls
+/// whose registers are already native but whose *structures* the handler
+/// converts, because it asks the calling process how wide a word is
+/// (`linux_syscall::narrow`, Linux's `in_compat_syscall()`): once that is
+/// true of every structure a call passes, translating the number is again all
+/// there is to do. Two files rather than one because the claim they make is
+/// different, and a reader has to be able to tell which one is being made.
 fn compat32(native: &[(String, u32)]) {
     const I386_IN: &str = "src/i386_syscall.h.in";
     const SAME_IN: &str = "src/i386_abi_same.in";
+    const NARROW_IN: &str = "src/i386_abi_narrow.in";
     println!("cargo:rerun-if-changed={}", I386_IN);
     println!("cargo:rerun-if-changed={}", SAME_IN);
+    println!("cargo:rerun-if-changed={}", NARROW_IN);
 
     let by_name: BTreeMap<&str, u32> = native.iter().map(|(n, id)| (n.as_str(), *id)).collect();
     let i386 = read_table(I386_IN);
     let i386_by_name: BTreeMap<&str, u32> = i386.iter().map(|(n, id)| (n.as_str(), *id)).collect();
 
-    let same = std::fs::read_to_string(SAME_IN).unwrap();
+    // Two files, read as one list and checked against each other for
+    // duplicates. Each line is carried with the file it came from, so that a
+    // name that is in neither table is reported against the file somebody has
+    // to go and edit.
+    let lists = [
+        (SAME_IN, std::fs::read_to_string(SAME_IN).unwrap()),
+        (NARROW_IN, std::fs::read_to_string(NARROW_IN).unwrap()),
+    ];
     let mut abi_same = BTreeMap::new();
-    for line in same.lines() {
+    for (from, line) in lists
+        .iter()
+        .flat_map(|(from, text)| text.lines().map(move |line| (*from, line)))
+    {
         let line = line.trim();
         if line.is_empty() || line.starts_with("//") {
             continue;
@@ -91,25 +112,22 @@ fn compat32(native: &[(String, u32)]) {
         // all the same story: the original was 16-bit, so i386 grew a `*32`
         // number for the real thing, while x86_64 -- which never had a
         // 16-bit anything -- just calls it by its name. The ABI of the pair
-        // is still identical, which is the only question this file answers.
+        // is still identical, which is the only question those files answer.
         let (name32, name64) = match line.split_once('=') {
             Some((left, right)) => (left.trim(), right.trim()),
             None => (line, line),
         };
         let Some(&id32) = i386_by_name.get(name32) else {
-            panic!(
-                "{}: {:?} is not a system call in {}",
-                SAME_IN, name32, I386_IN
-            );
+            panic!("{}: {:?} is not a system call in {}", from, name32, I386_IN);
         };
         let Some(&id64) = by_name.get(name64) else {
             panic!(
                 "{}: {:?} is not a system call this kernel implements",
-                SAME_IN, name64
+                from, name64
             );
         };
-        if abi_same.insert(name32, (id32, id64)).is_some() {
-            panic!("{}: {:?} is listed twice", SAME_IN, name32);
+        if abi_same.insert(name32.to_string(), (id32, id64)).is_some() {
+            panic!("{} / {}: {:?} is listed twice", SAME_IN, NARROW_IN, name32);
         }
     }
 
@@ -142,7 +160,8 @@ fn compat32(native: &[(String, u32)]) {
     writeln!(
         out,
         "/// i386 number -> native number, for the calls `i386_abi_same.in`\n\
-         /// says need no conversion, sorted by the i386 number. See\n\
+         /// says need no conversion and the ones `i386_abi_narrow.in` says\n\
+         /// the handler converts itself, sorted by the i386 number. See\n\
          /// `build.rs::compat32`.\n\
          pub const I386_TO_NATIVE: &[(u32, u32)] = &["
     )

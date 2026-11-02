@@ -1,0 +1,69 @@
+// The i386 calls whose registers are already the native ones but whose
+// STRUCTURES the handler converts itself.
+//
+// The other allowlist, `i386_abi_same.in`, is for the calls that need no
+// conversion at all: scalars, paths, byte buffers. This one makes a weaker
+// claim, and a different one. These calls pass a structure whose i386 image
+// is the native one with every word halved -- `struct timespec`,
+// `timeval`, `itimerval`, `itimerspec`, `tms`, `rusage` -- and the handler
+// writes and reads it at the width the CALLING PROCESS speaks, because it
+// goes through `linux_syscall::narrow`. That is Linux's
+// `in_compat_syscall()`: the width is asked of the process, not of the call
+// site, so one handler serves both ABIs and there is no `compat_sys_*`
+// wrapper to keep in step with it.
+//
+// So a name belongs here once EVERY structure it passes is converted. A name
+// stays out while even one is not, and answers `ENOSYS` until then --
+// `pselect6` is the example worth keeping in mind: its timeout is a
+// `timespec`, which is converted, but its sixth argument points at a
+// `{ const sigset_t *ss; size_t ss_len; }` of two words, 8 bytes to a 32-bit
+// caller against 16 natively, and nothing converts that yet.
+//
+// Not here, each for its own reason:
+//
+//   - `utime` (30), `utimes` (271), `futimesat` (299) and `utimensat` (320)
+//     pass an ARRAY of two of these structures, which needs a conversion of
+//     its own rather than the one-structure helper;
+//   - `waitid` (284) passes a `siginfo_t`, which is 128 bytes in both ABIs
+//     but not the same 128 bytes;
+//   - `timer_create` (259) passes a `struct sigevent`, whose union holds a
+//     pointer;
+//   - `select` (82) is i386's OLD select, which passes its arguments in a
+//     block of memory rather than in registers; `_newselect` (142) is the
+//     one that takes them the native way, and is the one listed here.
+//   - the `*_time64` calls (403 and up) are a separate job: their structures
+//     are NOT halved -- that is their whole point -- so they need the native
+//     layout with a 32-bit caller, which is a third shape.
+
+// struct timespec, struct timeval
+clock_gettime
+clock_settime
+clock_getres
+clock_nanosleep
+nanosleep
+gettimeofday
+settimeofday
+sched_rr_get_interval
+ppoll
+// i386's `_newselect` is x86_64's `select`: the old `select` (82) is the one
+// that takes a block of memory, and is deliberately not here.
+_newselect = select
+
+// struct itimerval, struct itimerspec
+setitimer
+getitimer
+timer_settime
+timer_gettime
+timerfd_settime
+timerfd_gettime
+
+// struct tms, struct rusage
+times
+getrusage
+wait4
+
+// struct iovec. `preadv` (333) and `pwritev` (334) are NOT here: their
+// offset arrives split across two registers, which is a register-level
+// difference and so a job for `compat32::wide`, not for this list.
+readv
+writev

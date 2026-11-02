@@ -1,30 +1,37 @@
-//! That these four numbers are answered here and not through the table.
+//! That these two numbers are answered here and the other two are not.
 //!
 //! The arithmetic of the split offset is tested where it lives
-//! ([`super::super::wide`]); what is left to pin is the routing, and it is
-//! worth pinning because `readv` and `writev` look exactly like calls that
-//! belong in the allowlist. They have the same name and the same three
-//! arguments on both sides. What differs is the shape of the memory the
-//! second argument points at, which no table can see.
+//! ([`super::super::wide`]); what is left to pin is the routing, and the
+//! routing is the part that is easy to get wrong, because `readv` and
+//! `writev` are **not** here. Their only difference from the native calls is
+//! the width of a `struct iovec` entry, and
+//! [`Syscall::read_iovecs`](crate::Syscall::read_iovecs) asks the calling
+//! process about that, so the number is all there is to translate and they go
+//! through the table like any other converted call (`i386_abi_narrow.in`).
+//! `preadv` and `pwritev` cannot: their offset arrives split across two
+//! registers, which is a difference the handler cannot see.
 
 use super::super::{name, native_number};
 
-/// None of the four is mapped by name, and each is named in the log.
+/// The division of labour: 145 and 146 through the table, 333 and 334 here.
 #[test]
 fn the_scatter_gather_calls_are_answered_here_and_not_by_the_table() {
-    for (num, called) in [
-        // The two whose arguments are identical and whose memory is not.
-        (145, "readv"),
-        (146, "writev"),
-        // And the two that also split their offset across two registers.
-        (333, "preadv"),
-        (334, "pwritev"),
-    ] {
+    for (num, called, native) in [(145, "readv", 19), (146, "writev", 20)] {
+        assert_eq!(name(num), Some(called), "i386 {}", num);
+        assert_eq!(
+            native_number(num),
+            Some(native),
+            "i386 {} ({}) is converted by the handler, so the table maps it",
+            num,
+            called
+        );
+    }
+    for (num, called) in [(333, "preadv"), (334, "pwritev")] {
         assert_eq!(name(num), Some(called), "i386 {}", num);
         assert_eq!(
             native_number(num),
             None,
-            "i386 {} ({}) must not be mapped: its iovec is half the width",
+            "i386 {} ({}) must not be mapped: its offset is in two registers",
             num,
             called
         );

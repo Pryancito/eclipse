@@ -201,15 +201,20 @@ pub(crate) async fn sleep_or_eintr(
     thread: &Arc<Thread>,
     deadline: core::time::Duration,
     mut rem: UserOutPtr<TimeSpec>,
+    abi32: bool,
 ) -> LxResult<()> {
     match linux_object::process::interruptible_sleep_until(thread, deadline).await {
         Ok(()) => Ok(()),
         Err(e) => {
             if e == LxError::EINTR {
-                rem.write_if_not_null(nanosleep_remaining(
-                    deadline,
-                    kernel_hal::timer::timer_now(),
-                ))?;
+                // `abi32`, and not a `Syscall` to ask, because this is a free
+                // helper: the remainder is a `struct timespec` and so half as
+                // wide to a 32-bit caller. See [`crate::narrow`].
+                crate::narrow::narrow_put_if_not_null(
+                    abi32,
+                    &mut rem,
+                    nanosleep_remaining(deadline, kernel_hal::timer::timer_now()),
+                )?;
             }
             Err(e)
         }
@@ -316,12 +321,15 @@ pub(crate) fn wait4_finish(
     mut wstatus: UserOutPtr<i32>,
     mut rusage: UserOutPtr<RUsage>,
     found: Option<(KoID, i32, linux_object::process::ChildCpu)>,
+    abi32: bool,
 ) -> SysResult {
     let Some((pid, code, cpu)) = found else {
         return Ok(0);
     };
     wstatus.write_if_not_null(code)?;
-    rusage.write_if_not_null(child_rusage(cpu))?;
+    // The status is an `int` in both ABIs; the usage is not -- 72 bytes to a
+    // 32-bit caller against 144. See [`crate::narrow`].
+    crate::narrow::narrow_put_if_not_null(abi32, &mut rusage, child_rusage(cpu))?;
     Ok(pid as usize)
 }
 
@@ -1344,7 +1352,7 @@ impl Syscall<'_> {
             Err(LxError::EAGAIN) if nohang => None,
             Err(e) => return Err(e),
         };
-        wait4_finish(wstatus, rusage, found)
+        wait4_finish(wstatus, rusage, found, self.narrow_abi())
     }
 
     /// Wait for a child state change (`waitid(2)`). Supports `P_PID`, `P_PIDFD`, and `P_ALL`.
@@ -1934,7 +1942,7 @@ impl Syscall<'_> {
         // A `timespec` out of range is EINVAL, not a sleep of some other
         // length: `tv_nsec` has to be a fraction of a second and `tv_sec`
         // must not be negative.
-        let duration = req.read()?.try_into_duration()?;
+        let duration = self.get_narrow(&req)?.try_into_duration()?;
         let deadline = kernel_hal::timer::deadline_after(duration);
         // One timer for the whole sleep, and the thread's signal-wake bit
         // beside it: no per-tick rescheduling, and a signal that arrives
@@ -1944,7 +1952,7 @@ impl Syscall<'_> {
         // daemon in `sleep(60)` saw its SIGTERM a minute late, and a
         // `nanosleep` loop that restarts on EINTR with `rem` restarted from
         // whatever was in the buffer.
-        sleep_or_eintr(self.thread, deadline, rem).await?;
+        sleep_or_eintr(self.thread, deadline, rem, self.narrow_abi()).await?;
         Ok(0)
     }
 
@@ -2284,7 +2292,7 @@ impl Syscall<'_> {
         } else {
             TimeSpec { sec: 0, nsec: 0 }
         };
-        interval.write(ts)?;
+        self.put_narrow(&mut interval, ts)?;
         Ok(0)
     }
 
@@ -3401,12 +3409,12 @@ mod wait4_finish_tests {
         rusage.utime.sec = 9;
         let ws = UserOutPtr::from(&mut status as *mut i32 as usize);
         let ru = UserOutPtr::from(&mut rusage as *mut RUsage as usize);
-        assert_eq!(wait4_finish(ws, ru, None), Ok(0));
+        assert_eq!(wait4_finish(ws, ru, None, false), Ok(0));
         assert_eq!(status, 0x1234, "the status the caller kept");
         assert_eq!(rusage.utime.sec, 9);
         // Null pointers are fine either way.
         assert_eq!(
-            wait4_finish(UserOutPtr::from(0), UserOutPtr::from(0), None),
+            wait4_finish(UserOutPtr::from(0), UserOutPtr::from(0), None, false),
             Ok(0)
         );
     }
@@ -3423,7 +3431,10 @@ mod wait4_finish_tests {
             stime_ns: 250_000,
             ..Default::default()
         };
-        assert_eq!(wait4_finish(ws, ru, Some((4242, 7 << 8, cpu))), Ok(4242));
+        assert_eq!(
+            wait4_finish(ws, ru, Some((4242, 7 << 8, cpu)), false),
+            Ok(4242)
+        );
         assert_eq!(status, 7 << 8);
         assert_eq!((rusage.utime.sec, rusage.utime.usec), (1, 500_000));
         assert_eq!((rusage.stime.sec, rusage.stime.usec), (0, 250));
@@ -3434,7 +3445,12 @@ mod wait4_finish_tests {
             ..Default::default()
         };
         assert_eq!(
-            wait4_finish(UserOutPtr::from(0), UserOutPtr::from(0), Some((5, 0, cpu))),
+            wait4_finish(
+                UserOutPtr::from(0),
+                UserOutPtr::from(0),
+                Some((5, 0, cpu)),
+                false
+            ),
             Ok(5)
         );
     }
@@ -3727,79 +3743,7 @@ mod failed_exec_exit_tests {
 }
 
 #[cfg(test)]
-mod nanosleep_rem_tests {
-    //! `nanosleep(2)` took no `rem` at all, and its sleep could not be cut
-    //! short by a signal: a signal that arrived in the middle was seen at
-    //! the deadline, and a loop that restarts on `EINTR` with `rem`
-    //! restarted from whatever was in the buffer.
-    extern crate std;
-
-    use super::*;
-    use core::time::Duration;
-    use linux_object::process::send_signal_to_process;
-    use linux_object::signal::{Signal as LinuxSignal, SignalAction, SignalActionFlags, Sigset};
-    use rcore_fs_ramfs::RamFS;
-    use zircon_object::task::ROOT_JOB;
-
-    // `libos` addresses are ordinary host addresses, so a local is the
-    // caller's buffer.
-    fn user_out<T>(slot: &mut T) -> UserOutPtr<T> {
-        UserOutPtr::from(slot as *mut T as usize)
-    }
-
-    #[test]
-    fn what_is_left_is_the_deadline_minus_now_and_never_negative() {
-        let rem = nanosleep_remaining(Duration::from_millis(2_750), Duration::from_millis(1_000));
-        assert_eq!((rem.sec, rem.nsec), (1, 750_000_000));
-        let rem = nanosleep_remaining(Duration::from_secs(1), Duration::from_secs(5));
-        assert_eq!((rem.sec, rem.nsec), (0, 0));
-    }
-
-    #[test]
-    fn a_signal_ends_the_sleep_and_leaves_the_rest_in_rem() {
-        let proc = Process::create_with_fixed_id_ext(
-            &ROOT_JOB,
-            43_501,
-            "sleeper",
-            LinuxProcess::new(RamFS::new(), 0),
-        )
-        .unwrap();
-        let thread = Thread::create_linux(&proc).unwrap();
-        proc.linux().set_signal_action(
-            LinuxSignal::SIGUSR1,
-            SignalAction {
-                handler: 0x1000,
-                flags: SignalActionFlags::empty(),
-                restorer: 0,
-                mask: Sigset::default(),
-            },
-        );
-        let pid = proc.id() as usize;
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            let _ = send_signal_to_process(pid, LinuxSignal::SIGUSR1);
-        });
-        let mut slot = TimeSpec { sec: 99, nsec: 99 };
-        let deadline = kernel_hal::timer::timer_now() + Duration::from_secs(3);
-        let start = std::time::Instant::now();
-        let r = async_std::task::block_on(sleep_or_eintr(&thread, deadline, user_out(&mut slot)));
-        assert_eq!(r, Err(LxError::EINTR));
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "slept past the signal"
-        );
-        assert_eq!(
-            slot.sec, 2,
-            "rem {:?} is not what was left of the 3 s",
-            slot
-        );
-        assert!(
-            slot.nsec > 500_000_000 && slot.nsec < 1_000_000_000,
-            "rem {:?}",
-            slot
-        );
-    }
-}
+mod nanosleep_rem_tests;
 
 #[cfg(test)]
 mod setaffinity_migration_tests {

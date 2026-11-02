@@ -18,10 +18,22 @@
 //! ## What is mapped, and why so little
 //!
 //! [`I386_TO_NATIVE`] is **default-deny**: `build.rs` emits a row only for a
-//! name listed in [`i386_abi_same.in`](../i386_abi_same.in), the calls whose
-//! ABI is byte-for-byte the native one. This is the allowlist half of Linux's
-//! `ia32_sys_call_table`, where each entry is either the plain `sys_*` -- these
-//! -- or a `compat_sys_*` wrapper that converts something.
+//! name listed in one of two allowlists. This is Linux's
+//! `ia32_sys_call_table`, where each entry is either the plain `sys_*` or a
+//! `compat_sys_*` wrapper that converts something -- except that here the
+//! conversion lives in the handler rather than in a wrapper, so the two
+//! cases are two files rather than two kinds of entry:
+//!
+//! - [`i386_abi_same.in`](../i386_abi_same.in): the calls whose ABI is
+//!   byte-for-byte the native one. Scalars, paths, byte buffers.
+//! - [`i386_abi_narrow.in`](../i386_abi_narrow.in): the calls whose
+//!   registers are already native but whose **structures** the handler
+//!   converts, because it asks the calling process how wide a word is
+//!   ([`crate::narrow`], Linux's `in_compat_syscall()`). `struct timespec`,
+//!   `timeval`, `itimerval`, `itimerspec`, `tms`, `rusage` and the entries
+//!   of a `struct iovec` are all the native layout with every word halved,
+//!   and once a call passes nothing else, translating the number is again
+//!   all there is to do.
 //!
 //! Matching the two tables by name alone would be unsound, and quietly so.
 //! `gettimeofday` has that name in both and passes a `struct timeval` of two
@@ -38,11 +50,15 @@
 //!   32-bit structures;
 //! - the `*_time64` calls (403 and up), the 32-bit world's answer to 2038.
 //!
-//! The second is the calls that share a name but not a shape: anything passing
-//! a `stat`, `timespec`, `timeval`, `rusage`, `iovec`, `msghdr`, `rlimit` or
-//! `sigaction`; `lseek`, whose offset is signed where these registers are read
-//! zero-extended; `clone`, whose last two arguments are swapped on i386; and
-//! `execve`, whose `argv` and `envp` are arrays of 4-byte pointers.
+//! The second is the calls that share a name but not a shape and whose shape
+//! nothing converts yet: anything passing a `msghdr`, an `rlimit`, a
+//! `sigaction`, a `siginfo_t`, a `sigevent`, or an **array** of the
+//! structures [`crate::narrow`] converts one at a time (`utimensat`,
+//! `utimes`); `pselect6`, whose timeout is converted but whose sixth
+//! argument points at two words; `lseek`, whose offset is signed where these
+//! registers are read zero-extended; `clone`, whose last two arguments are
+//! swapped on i386; and `execve`, whose `argv` and `envp` are arrays of
+//! 4-byte pointers.
 //!
 //! ## And the ones with no native twin at all
 //!
@@ -64,7 +80,9 @@
 //! different order. See [`wide`](wide).
 //!
 //! And then the ones whose answer is a **structure** of a shape this ABI does
-//! not share: `stat64` (195), `lstat64` (196), `fstat64` (197) and
+//! not share, and which is not simply the native one halved --- so
+//! [`crate::narrow`] does not reach them: `stat64` (195), `lstat64` (196),
+//! `fstat64` (197) and
 //! `fstatat64` (300), whose 96 bytes keep the real inode last and every
 //! 64-bit field at 4-byte alignment (see [`stat`](stat)); and `fcntl64` (221)
 //! with `fcntl` (55), six of whose commands point at one of i386's two
@@ -124,10 +142,12 @@ const I386_FSTAT64: u32 = 197;
 const I386_FCNTL64: u32 = 221;
 const I386_FSTATAT64: u32 = 300;
 
-/// And the scatter/gather calls, whose list is a `struct iovec` of half the
-/// width. See [`iovec`].
-const I386_READV: u32 = 145;
-const I386_WRITEV: u32 = 146;
+/// And the scatter/gather calls whose offset arrives split across two
+/// registers. `readv` (145) and `writev` (146) are not here: their only
+/// difference is the width of a `struct iovec` entry, which
+/// [`Syscall::read_iovecs`](crate::Syscall::read_iovecs) asks the process
+/// about, so they are in `i386_abi_narrow.in` with the rest of the calls the
+/// handler converts itself. See [`iovec`].
 const I386_PREADV: u32 = 333;
 const I386_PWRITEV: u32 = 334;
 
@@ -195,18 +215,9 @@ impl Syscall<'_> {
             // The same handler for both numbers, because measuring Linux
             // says they are the same call: see [`fcntl`].
             I386_FCNTL64 | I386_FCNTL => return syscall_ret(self.sys_fcntl64(a0, a1, a2).await),
-            // The native handlers, unchanged: the list they read is already
-            // the 32-bit one, because `Syscall::read_iovecs` asks the
-            // process's ABI how wide an entry is. They are dispatched here
-            // rather than mapped in the allowlist because their ABI is NOT
-            // byte-for-byte the native one --- it is the handler that adapts,
-            // and the allowlist says nothing about handlers. See [`iovec`].
-            I386_READV => {
-                return syscall_ret(self.sys_readv((a0 as i32).into(), a1.into(), a2).await)
-            }
-            I386_WRITEV => {
-                return syscall_ret(self.sys_writev((a0 as i32).into(), a1.into(), a2).await)
-            }
+            // `readv` (145) and `writev` (146) are not here: see
+            // `i386_abi_narrow.in`. These two are, because the offset
+            // arrives in two registers. See [`iovec`].
             I386_PREADV => return syscall_ret(self.sys_preadv32(a0, a1, a2, a3, a4).await),
             I386_PWRITEV => return syscall_ret(self.sys_pwritev32(a0, a1, a2, a3, a4)),
             _ => {}

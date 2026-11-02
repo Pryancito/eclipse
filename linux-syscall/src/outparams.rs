@@ -26,9 +26,24 @@ pub(crate) fn commit_and_report_old<T>(
     out: &mut UserOutPtr<T>,
     change: impl FnOnce() -> Result<(), LxError>,
 ) -> Result<(), LxError> {
+    commit_and_report_old_with(old, |old| Ok(out.write_if_not_null(old)?), change)
+}
+
+/// [`commit_and_report_old`] where the caller says how the old value is
+/// written.
+///
+/// The rule is the order, not the write: the change first, the copy out
+/// last. A structure whose width depends on the calling process's ABI
+/// (`struct itimerval`, `struct itimerspec`: see [`crate::narrow`]) cannot go
+/// out through `UserOutPtr::write_if_not_null`, so it passes the write in
+/// instead of reimplementing the order.
+pub(crate) fn commit_and_report_old_with<T>(
+    old: T,
+    write_old: impl FnOnce(T) -> Result<(), LxError>,
+    change: impl FnOnce() -> Result<(), LxError>,
+) -> Result<(), LxError> {
     change()?;
-    out.write_if_not_null(old)?;
-    Ok(())
+    write_old(old)
 }
 
 /// Hand a pair of freshly installed descriptors to the caller, taking them

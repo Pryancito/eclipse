@@ -1047,7 +1047,7 @@ impl Syscall<'_> {
         let deadline = if timeout.is_null() {
             None
         } else {
-            let dur = timeout.read()?.try_into_duration()?;
+            let dur = self.get_narrow(&timeout)?.try_into_duration()?;
             // Saturating: adding a `Duration` panics on overflow, and this
             // one comes from userspace.
             Some(kernel_hal::timer::timer_now().saturating_add(dur))

@@ -545,8 +545,8 @@ impl Syscall<'_> {
                 } else {
                     let timeout_addr: UserInPtr<TimeSpec> = val2.into();
                     // Validated: a `timespec` out of range is EINVAL.
-                    let timeout = timeout_addr
-                        .read_if_not_null()?
+                    let timeout = self
+                        .get_narrow_if_not_null(&timeout_addr)?
                         .map(|timeout| timeout.try_into_duration())
                         .transpose()?;
                     let now = if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
@@ -658,8 +658,8 @@ impl Syscall<'_> {
                 let timeout_addr: UserInPtr<TimeSpec> = val2.into();
                 // Validated: a `timespec` out of range is EINVAL, and it is
                 // rejected whether or not we end up waiting.
-                let timeout = timeout_addr
-                    .read_if_not_null()?
+                let timeout = self
+                    .get_narrow_if_not_null(&timeout_addr)?
                     .map(|timeout| timeout.try_into_duration())
                     .transpose()?;
                 // FUTEX_WAIT takes a RELATIVE timeout; FUTEX_WAIT_BITSET takes

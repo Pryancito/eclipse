@@ -50,6 +50,15 @@
  *   36  readv did not scatter into both destinations
  *   37  preadv read the wrong bytes, or moved the file position
  *   38  pwritev did not gather the two entries in order
+ *   39  clock_gettime wrote the wrong shape of timespec
+ *   40  gettimeofday wrote the wrong shape of timeval
+ *   41  clock_getres wrote the wrong shape of timespec
+ *   42  nanosleep did not read the request four bytes at a time
+ *   43  times wrote the wrong shape of tms
+ *   44  getrusage wrote the wrong shape of rusage
+ *   45  setitimer/getitimer wrote the wrong shape of itimerval
+ *   46  _newselect did not read and write back a 32-bit timeval
+ *   47  the timerfd itimerspec did not survive the round trip
  *
  * The last six are the segment registers, which is the second half of what
  * compatibility mode needs and the half `iretq` does not do: it reloads `CS`
@@ -592,6 +601,224 @@ _start:
 	movl	$tmppath, %ebx
 	int	$0x80
 
+	/* The structures of time, and the one rule they all follow: a field
+	 * that is eight bytes natively is four bytes here, in the same order,
+	 * with no padding. Each step poisons the buffer with 0xaa first and
+	 * then checks TWO things: that the right values arrived, and that the
+	 * word just past the structure is still the poison. The second check
+	 * is the one that matters, because a kernel that wrote the native
+	 * layout would pass the first: `clock_gettime` would put its seconds
+	 * at offset 0 all the same, and write eight bytes of somebody else's
+	 * memory after it.
+	 *
+	 * clock_gettime(CLOCK_REALTIME, ts): i386 265. */
+	call	poison_tbuf
+	movl	$265, %eax
+	xorl	%ebx, %ebx
+	movl	$tbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_clock_gettime
+	cmpl	$0xaaaaaaaa, tbuf + 8
+	jne	bad_clock_gettime
+	cmpl	$0xaaaaaaaa, tbuf + 12
+	jne	bad_clock_gettime
+	/* A wall clock later than 2001, and a nanosecond field that is a
+	 * fraction of a second rather than the top half of a seconds count. */
+	cmpl	$1000000000, tbuf + 0
+	jbe	bad_clock_gettime
+	cmpl	$1000000000, tbuf + 4
+	jae	bad_clock_gettime
+
+	/* gettimeofday(tv, NULL): i386 78, the call the module documentation
+	 * uses as its example of why matching the two tables by name is
+	 * unsound. Microseconds, so the second field is below a million. */
+	call	poison_tbuf
+	movl	$78, %eax
+	movl	$tbuf, %ebx
+	xorl	%ecx, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_gettimeofday
+	cmpl	$0xaaaaaaaa, tbuf + 8
+	jne	bad_gettimeofday
+	cmpl	$1000000000, tbuf + 0
+	jbe	bad_gettimeofday
+	cmpl	$1000000, tbuf + 4
+	jae	bad_gettimeofday
+
+	/* clock_getres(CLOCK_MONOTONIC, res): i386 266. A resolution of whole
+	 * seconds would be absurd, so the seconds are 0 and the nanoseconds
+	 * are a real fraction -- which also means the two fields cannot be
+	 * confused for one another. */
+	call	poison_tbuf
+	movl	$266, %eax
+	movl	$1, %ebx
+	movl	$tbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_clock_getres
+	cmpl	$0xaaaaaaaa, tbuf + 8
+	jne	bad_clock_getres
+	cmpl	$0, tbuf + 0
+	jne	bad_clock_getres
+	cmpl	$0, tbuf + 4
+	je	bad_clock_getres
+	cmpl	$1000000000, tbuf + 4
+	ja	bad_clock_getres
+
+	/* nanosleep(req, NULL): i386 162, and the first of these that is read
+	 * rather than written. One millisecond. Read at the native width the
+	 * eight bytes at `nsreq` are ONE field, so the seconds would come out
+	 * as 1000000 << 32 -- a sleep of 140 million years, which
+	 * `timespec64_valid` refuses with EINVAL. A zero return is the proof
+	 * that the request was read four bytes at a time. */
+	movl	$0, nsreq + 0
+	movl	$1000000, nsreq + 4
+	movl	$162, %eax
+	movl	$nsreq, %ebx
+	xorl	%ecx, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_nanosleep
+
+	/* times(buf): i386 43. Sixteen bytes, four clock_t. All four may
+	 * legitimately be zero in a program this short, so the only thing
+	 * worth asserting is the size -- which is the thing that would be
+	 * wrong. */
+	call	poison_tbuf
+	movl	$43, %eax
+	movl	$tbuf, %ebx
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_times
+	cmpl	$0xaaaaaaaa, tbuf + 16
+	jne	bad_times
+	cmpl	$0xaaaaaaaa, tbuf + 20
+	jne	bad_times
+
+	/* getrusage(RUSAGE_SELF, buf): i386 77, and the big one -- 72 bytes
+	 * against 144. The two `timeval`s are 8 bytes each, so `ru_minflt`
+	 * lands at 32 and `ru_nvcsw` at 64 where a doubled layout would put
+	 * them at 64 and 128. Both are checked as "written", not as a value:
+	 * a count of zero is a legitimate answer and is still not 0xaa. */
+	call	poison_tbuf
+	movl	$77, %eax
+	xorl	%ebx, %ebx
+	movl	$tbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_getrusage
+	cmpl	$0xaaaaaaaa, tbuf + 72
+	jne	bad_getrusage
+	cmpl	$0xaaaaaaaa, tbuf + 32
+	je	bad_getrusage
+	cmpl	$0xaaaaaaaa, tbuf + 64
+	je	bad_getrusage
+
+	/* setitimer(ITIMER_REAL, new, NULL) then getitimer: i386 104 and 105.
+	 * Sixteen bytes, and the pair is in ABI order -- the interval first,
+	 * the value second -- which is what makes a 100 second value readable
+	 * as a countdown rather than as an interval. */
+	movl	$0, itv + 0
+	movl	$0, itv + 4
+	movl	$100, itv + 8
+	movl	$0, itv + 12
+	movl	$104, %eax
+	xorl	%ebx, %ebx
+	movl	$itv, %ecx
+	xorl	%edx, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_itimer
+	call	poison_tbuf
+	movl	$105, %eax
+	xorl	%ebx, %ebx
+	movl	$tbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_itimer
+	cmpl	$0xaaaaaaaa, tbuf + 16
+	jne	bad_itimer
+	cmpl	$0, tbuf + 8
+	je	bad_itimer
+	cmpl	$100, tbuf + 8
+	ja	bad_itimer
+	/* Disarmed again, so that no SIGALRM arrives while the rest runs. */
+	movl	$0, itv + 8
+	movl	$104, %eax
+	xorl	%ebx, %ebx
+	movl	$itv, %ecx
+	xorl	%edx, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_itimer
+
+	/* _newselect(0, NULL, NULL, NULL, tv): i386 142, which is x86_64's
+	 * `select`. i386's own `select` is 82 and passes its arguments in a
+	 * block of memory, so getting the two confused would hand the native
+	 * handler a pointer where it expects `nfds`. The timeout is a
+	 * `timeval` read AND written back, which is the round trip. */
+	movl	$0, seltv + 0
+	movl	$1000, seltv + 4
+	movl	$142, %eax
+	xorl	%ebx, %ebx
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	xorl	%esi, %esi
+	movl	$seltv, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_select
+	/* What is left of a one-millisecond timeout, which cannot be more
+	 * than what was asked for and cannot have grown a seconds field. */
+	cmpl	$0, seltv + 0
+	jne	bad_select
+	cmpl	$1000, seltv + 4
+	ja	bad_select
+
+	/* timerfd_create / timerfd_settime / timerfd_gettime: i386 322, 325
+	 * and 326, the `itimerspec` pair both ways. The interval comes back
+	 * exactly as it went in, which no misread of the layout survives, and
+	 * the value is counting down from three seconds. */
+	movl	$322, %eax
+	movl	$1, %ebx		/* CLOCK_MONOTONIC */
+	xorl	%ecx, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_timerfd
+	movl	%eax, fd3
+	movl	$7, its + 0
+	movl	$0, its + 4
+	movl	$3, its + 8
+	movl	$0, its + 12
+	movl	$325, %eax
+	movl	fd3, %ebx
+	xorl	%ecx, %ecx
+	movl	$its, %edx
+	xorl	%esi, %esi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_timerfd
+	call	poison_tbuf
+	movl	$326, %eax
+	movl	fd3, %ebx
+	movl	$tbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_timerfd
+	cmpl	$0xaaaaaaaa, tbuf + 16
+	jne	bad_timerfd
+	cmpl	$7, tbuf + 0
+	jne	bad_timerfd
+	cmpl	$0, tbuf + 8
+	je	bad_timerfd
+	cmpl	$3, tbuf + 8
+	ja	bad_timerfd
+	movl	$6, %eax
+	movl	fd3, %ebx
+	int	$0x80
+
 	/* get_thread_area(&tls_desc): i386 244, the other half, and the one a
 	 * debugger uses. It has to hand back the base this program asked for,
 	 * which means the descriptor really does hold it rather than
@@ -691,6 +918,49 @@ bad_preadv:
 	jmp	die
 bad_pwritev:
 	movl	$38, %ebx
+	jmp	die
+bad_clock_gettime:
+	movl	$39, %ebx
+	jmp	die
+bad_gettimeofday:
+	movl	$40, %ebx
+	jmp	die
+bad_clock_getres:
+	movl	$41, %ebx
+	jmp	die
+bad_nanosleep:
+	movl	$42, %ebx
+	jmp	die
+bad_times:
+	movl	$43, %ebx
+	jmp	die
+bad_getrusage:
+	movl	$44, %ebx
+	jmp	die
+bad_itimer:
+	movl	$45, %ebx
+	jmp	die
+bad_select:
+	movl	$46, %ebx
+	jmp	die
+bad_timerfd:
+	movl	$47, %ebx
+
+	/* Fill the scratch buffer with 0xaa, so that every structure written
+	 * into it afterwards says by itself how many bytes it is: the first
+	 * word past the end is still the poison, or the kernel wrote the
+	 * native layout. Clobbers %eax, %ecx and %edi, so it is called before
+	 * the arguments of the call it is poisoning for. */
+poison_tbuf:
+	movl	$tbuf, %edi
+	movl	$160, %ecx
+	movl	$0xaaaaaaaa, %eax
+poison_word:
+	movl	%eax, (%edi)
+	addl	$4, %edi
+	subl	$4, %ecx
+	jnz	poison_word
+	ret
 
 	/* exit_group(status): i386 252. `exit` (1) would do for a single
 	 * thread, but exit_group is what a C library calls and it is in the
@@ -763,6 +1033,34 @@ iov:
 	 * l_type (F_RDLCK, 0), l_whence (SEEK_SET, 0), l_start (0), l_len
 	 * (0, which means "to the end and beyond") and l_pid, which only
 	 * F_GETLK fills in. */
+	/* The scratch buffer every structure of time is written into, with
+	 * room to spare past the biggest of them (`struct rusage`, 72 bytes)
+	 * so that the poison past the end has somewhere to live. And the
+	 * structures those calls READ, which have to be built by hand: the
+	 * point of each is that it is half the native size.
+	 *
+	 *   nsreq  `struct timespec`,   8 bytes
+	 *   itv    `struct itimerval`, 16 bytes
+	 *   its    `struct itimerspec`,16 bytes
+	 *   seltv  `struct timeval`,    8 bytes, read AND written back
+	 *
+	 * Each is declared with the room a native one would need, so that a
+	 * kernel that read or wrote the wide layout touches this program's
+	 * own memory and not the next variable along: the test is the value
+	 * that comes back, not a fault. */
+	.align 4
+tbuf:
+	.space	160
+nsreq:
+	.space	16
+itv:
+	.space	32
+its:
+	.space	32
+seltv:
+	.space	16
+fd3:
+	.long	0
 	.align 4
 statbuf:
 	.space	96

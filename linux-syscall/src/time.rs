@@ -1,7 +1,7 @@
 //! Syscalls for time
 //! - clock_gettime
 //!
-use crate::outparams::commit_and_report_old;
+use crate::outparams::commit_and_report_old_with;
 use crate::Syscall;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -484,7 +484,7 @@ impl Syscall<'_> {
                 TimeSpec::from_duration(Duration::from_nanos(self.cpu_clock_ns(cpu)?))
             }
         };
-        buf.write(ts)?;
+        self.put_narrow(&mut buf, ts)?;
 
         trace!("clock_gettime: {:?}", ts);
 
@@ -510,7 +510,7 @@ impl Syscall<'_> {
         // We service these clocks from a nanosecond-granularity timer
         // source, and the CPU clocks are `posix_cpu_clock_getres`'s 1 ns.
         let res = TimeSpec { sec: 0, nsec: 1 };
-        buf.write(res)?;
+        self.put_narrow(&mut buf, res)?;
         Ok(0)
     }
 
@@ -554,7 +554,7 @@ impl Syscall<'_> {
         info!(
             "clock_settime: id={:?} timespec={:?}",
             clock,
-            timespec.read_if_not_null()?
+            self.get_narrow_if_not_null(&timespec)?
         );
         if clock != 0 {
             return Err(LxError::EINVAL);
@@ -562,7 +562,7 @@ impl Syscall<'_> {
         // `posix_clock_realtime_set` is `do_sys_settimeofday64(tp, NULL)`:
         // the time is read and judged (`timespec64_valid_settod`, EINVAL)
         // before anybody asks who is calling.
-        let ts = timespec.read()?;
+        let ts = self.get_narrow(&timespec)?;
         let target = settod_time(ts.sec, ts.nsec)?;
         // Linux routes both clock setters through `security_settime64`, whose
         // default (`security/commoncap.c`) is the whole rule:
@@ -599,8 +599,8 @@ impl Syscall<'_> {
         info!("settimeofday: tv={:?}, tz={:?}", tv, tz);
         // `do_sys_settimeofday64`: the time is judged first (EINVAL), then
         // the caller (EPERM), then the timezone (EINVAL), then both apply.
-        let tv = tv
-            .read_if_not_null()?
+        let tv = self
+            .get_narrow_if_not_null(&tv)?
             .map(|tv| settod_timeval(tv.sec, tv.usec))
             .transpose()?;
         let tz = tz.read_if_not_null()?;
@@ -661,7 +661,7 @@ impl Syscall<'_> {
         if !tv.is_null() {
             let timeval = TimeVal::now();
             trace!("gettimeofday: {:?}", timeval);
-            tv.write(timeval)?;
+            self.put_narrow(&mut tv, timeval)?;
         }
         if !tz.is_null() {
             let sys_tz = *SYS_TZ.lock();
@@ -731,7 +731,7 @@ impl Syscall<'_> {
             // wait4/waitid time exactly like Linux does.
             RusageWho::Children => RUsage::from(self.linux_process().children_usage()),
         };
-        rusage.write(usage)?;
+        self.put_narrow(&mut rusage, usage)?;
         Ok(0)
     }
 
@@ -765,7 +765,7 @@ impl Syscall<'_> {
                 tms_cutime: cutime_ns / NSEC_PER_TICK,
                 tms_cstime: cstime_ns / NSEC_PER_TICK,
             };
-            buf.write(new_buf)?;
+            self.put_narrow(&mut buf, new_buf)?;
         } else {
             warn!("sys_times: Invalid buf {:x?}", buf);
         }
@@ -789,7 +789,8 @@ impl Syscall<'_> {
         use kernel_hal::timer;
         // Same rule as `nanosleep`: reject an out-of-range `timespec`
         // instead of sleeping for whatever it happens to convert to.
-        let request: Duration = req.read()?.try_into_duration()?;
+        let request: Duration = self.get_narrow(&req)?.try_into_duration()?;
+        let abi32 = self.narrow_abi();
         // Every decision this call makes, taken before anything sleeps. The
         // clock id and the flag word both used to go through an infallible
         // `From<usize>` ending in `unreachable!()`, so an id or a flag this
@@ -812,7 +813,7 @@ impl Syscall<'_> {
             rem
         };
         if let SleepPlan::Until(deadline) = plan {
-            crate::task::sleep_or_eintr(self.thread, deadline, rem).await?;
+            crate::task::sleep_or_eintr(self.thread, deadline, rem, abi32).await?;
         }
         Ok(0)
     }
@@ -837,7 +838,7 @@ impl Syscall<'_> {
         new_value: UserInPtr<ITimerVal>,
         mut old_value: UserOutPtr<ITimerVal>,
     ) -> SysResult {
-        let val = itimer_request(new_value.read_if_not_null()?)?;
+        let val = itimer_request(self.get_narrow_if_not_null(&new_value)?)?;
         info!(
             "setitimer: which={}, new_value={:?}, old_value={:?}",
             which, val, old_value
@@ -854,12 +855,17 @@ impl Syscall<'_> {
         // abort the call on a faulting pointer with the slot ALREADY changed
         // and `arm_itimer` never reached: the process was left with a timer
         // that `getitimer` counts down and that never fires.
-        commit_and_report_old(old, &mut old_value, || {
-            if let Some((deadline, generation)) = arm {
-                arm_itimer(owner, which, deadline, generation);
-            }
-            Ok(())
-        })?;
+        let abi32 = self.narrow_abi();
+        commit_and_report_old_with(
+            old,
+            |old| crate::narrow::narrow_put_if_not_null(abi32, &mut old_value, old),
+            || {
+                if let Some((deadline, generation)) = arm {
+                    arm_itimer(owner, which, deadline, generation);
+                }
+                Ok(())
+            },
+        )?;
         Ok(0)
     }
 
@@ -878,7 +884,7 @@ impl Syscall<'_> {
             let slots = self.linux_process().itimers().lock();
             itimerval_from_slot(&slots[which], now)
         };
-        curr_value.write(val)?;
+        self.put_narrow(&mut curr_value, val)?;
         Ok(0)
     }
 
@@ -967,7 +973,7 @@ impl Syscall<'_> {
         mut old_value: UserOutPtr<ITimerSpec>,
     ) -> SysResult {
         let owner = self.zircon_process().id();
-        let spec = new_value.read()?;
+        let spec = self.get_narrow(&new_value)?;
         // Linux validates both timespecs of the itimerspec before arming.
         if !spec.interval.valid() || !spec.value.valid() {
             return Err(LxError::EINVAL);
@@ -992,12 +998,17 @@ impl Syscall<'_> {
         stale::drop_signal_from_before(id, owner);
         // Same as `setitimer`: armed first, reported after. A faulting
         // `old_value` used to leave the timer recorded as due and never armed.
-        commit_and_report_old(old, &mut old_value, || {
-            if let Some((deadline, gen)) = arm {
-                arm_posix_timer(id, deadline, gen);
-            }
-            Ok(())
-        })?;
+        let abi32 = self.narrow_abi();
+        commit_and_report_old_with(
+            old,
+            |old| crate::narrow::narrow_put_if_not_null(abi32, &mut old_value, old),
+            || {
+                if let Some((deadline, gen)) = arm {
+                    arm_posix_timer(id, deadline, gen);
+                }
+                Ok(())
+            },
+        )?;
         Ok(0)
     }
 
@@ -1018,7 +1029,7 @@ impl Syscall<'_> {
                 None => ITimerSpec::default(),
             };
             let mut p: UserOutPtr<ITimerSpec> = curr_value.into();
-            p.write(out)?;
+            self.put_narrow(&mut p, out)?;
             return Ok(0);
         }
         let now = kernel_hal::timer::timer_now();
@@ -1039,7 +1050,7 @@ impl Syscall<'_> {
             }
         };
         let mut p: UserOutPtr<ITimerSpec> = curr_value.into();
-        p.write(out)?;
+        self.put_narrow(&mut p, out)?;
         Ok(0)
     }
 
@@ -1096,7 +1107,12 @@ impl Syscall<'_> {
         let (target, now) = cpu_timer_target(self.zircon_process(), cpu).ok_or(LxError::ESRCH)?;
         let old = set_cpu_timer(id, owner, &target, now, abs, init, interval)?;
         stale::drop_signal_from_before(id, owner);
-        commit_and_report_old(old, old_value, || Ok(()))?;
+        let abi32 = self.narrow_abi();
+        commit_and_report_old_with(
+            old,
+            |old| crate::narrow::narrow_put_if_not_null(abi32, old_value, old),
+            || Ok(()),
+        )?;
         run_cpu_timers(self.thread);
         Ok(0)
     }

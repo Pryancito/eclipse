@@ -274,18 +274,11 @@ fn the_calls_that_share_a_name_but_not_a_shape() {
             "i386 swaps the last two arguments (tls, ctid)",
         ),
         (11, "execve", "argv and envp are arrays of 4-byte pointers"),
-        (78, "gettimeofday", "struct timeval is two longs"),
-        (162, "nanosleep", "struct timespec is two longs"),
-        (145, "readv", "struct iovec is a pointer and a size_t"),
-        (146, "writev", "struct iovec is a pointer and a size_t"),
-        (114, "wait4", "struct rusage is sixteen longs"),
         (
             174,
             "rt_sigaction",
             "struct sigaction holds a handler pointer",
         ),
-        (77, "getrusage", "struct rusage is sixteen longs"),
-        (43, "times", "struct tms is four clock_t"),
         (
             54,
             "ioctl",
@@ -302,4 +295,76 @@ fn the_calls_that_share_a_name_but_not_a_shape() {
             why
         );
     }
+}
+
+/// The calls whose registers are already the native ones but whose
+/// **structures** the handler converts, because it asks the calling process
+/// how wide a word is: `i386_abi_narrow.in`, Linux's `in_compat_syscall()`.
+///
+/// They are mapped, and they have to be: the number is all there is left to
+/// translate once the conversion lives in the handler. Each one passed one of
+/// the six structures whose i386 image is the native one halved --- and each
+/// one answered `ENOSYS` until the conversion existed, which is the honest
+/// half of this file's history.
+#[test]
+fn the_calls_whose_structures_the_handler_narrows_are_mapped() {
+    for (num, called, what) in [
+        (43, "times", "struct tms"),
+        (77, "getrusage", "struct rusage"),
+        (78, "gettimeofday", "struct timeval"),
+        (79, "settimeofday", "struct timeval"),
+        (104, "setitimer", "struct itimerval"),
+        (105, "getitimer", "struct itimerval"),
+        (114, "wait4", "struct rusage"),
+        (142, "_newselect", "struct timeval"),
+        (145, "readv", "struct iovec"),
+        (146, "writev", "struct iovec"),
+        (161, "sched_rr_get_interval", "struct timespec"),
+        (162, "nanosleep", "struct timespec"),
+        (260, "timer_settime", "struct itimerspec"),
+        (261, "timer_gettime", "struct itimerspec"),
+        (264, "clock_settime", "struct timespec"),
+        (265, "clock_gettime", "struct timespec"),
+        (266, "clock_getres", "struct timespec"),
+        (267, "clock_nanosleep", "struct timespec"),
+        (309, "ppoll", "struct timespec"),
+        (325, "timerfd_settime", "struct itimerspec"),
+        (326, "timerfd_gettime", "struct itimerspec"),
+    ] {
+        assert_eq!(name(num), Some(called), "i386 {}", num);
+        assert!(
+            native_number(num).is_some(),
+            "i386 {} ({}) passes a {} and must be mapped",
+            num,
+            called,
+            what
+        );
+    }
+}
+
+/// i386's `_newselect` (142) is x86_64's `select` (23), and i386's own
+/// `select` (82) is the ancestor that takes its arguments in a block of
+/// memory. Mapping the wrong one of the two would hand the native handler a
+/// pointer where it expects `nfds`.
+#[test]
+fn the_select_that_is_mapped_is_the_one_that_uses_registers() {
+    assert_eq!(name(142), Some("_newselect"));
+    assert_eq!(name(82), Some("select"));
+    assert_eq!(
+        native_number(142),
+        Some(23),
+        "_newselect is the native select"
+    );
+    assert_eq!(native_number(82), None, "old_select takes a memory block");
+}
+
+/// `pselect6` is the one to keep out, and the reason is not its timeout ---
+/// that is a `timespec`, which is converted. It is the sixth argument, a
+/// pointer to `{ const sigset_t *ss; size_t ss_len; }`: two words, so 8
+/// bytes to a 32-bit caller against 16 natively. Reading it at the native
+/// width would take the length out of the next structure along.
+#[test]
+fn pselect6_stays_unmapped_for_its_sigset_argument_and_not_its_timeout() {
+    assert_eq!(name(308), Some("pselect6"));
+    assert_eq!(native_number(308), None);
 }

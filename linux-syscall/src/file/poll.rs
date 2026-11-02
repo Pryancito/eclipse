@@ -750,7 +750,7 @@ impl Syscall<'_> {
         let timeout_msecs = if timeout.is_null() {
             -1
         } else {
-            let timeout = timeout.read()?;
+            let timeout = self.get_narrow(&timeout)?;
             info!("sys_ppoll: timeout: {:?}", timeout);
             // Validated, not cast: a `timespec` out of range is EINVAL, and
             // a huge one must stay finite rather than turn into the
@@ -786,7 +786,7 @@ impl Syscall<'_> {
         let (timeout_msecs, timeout_left) = if timeout.is_null() {
             (-1, None)
         } else {
-            let ts = timeout.read()?;
+            let ts = self.get_narrow(&timeout)?;
             (ts.try_into_poll_msecs()?, Some(ts.try_into_duration()?))
         };
         let sticky = self.linux_process().personality() & STICKY_TIMEOUTS != 0;
@@ -812,7 +812,7 @@ impl Syscall<'_> {
             // A `timespec` in read-only memory must not turn a completed
             // select into EFAULT (`fs/select.c`, "sticky"): the write's
             // failure is ignored.
-            let _ = timeout.write(TimeSpec::from_duration(left));
+            let _ = self.put_narrow(&mut timeout, TimeSpec::from_duration(left));
         }
         result
     }
@@ -838,7 +838,7 @@ impl Syscall<'_> {
             return Ok(0);
         } */
         let (timeout_msecs, timeout_left) = if !timeout.is_null() {
-            let tv = timeout.read()?;
+            let tv = self.get_narrow(&timeout)?;
             (tv.try_into_poll_msecs()?, Some(tv.try_into_duration()?))
         } else {
             // infinity
@@ -852,7 +852,7 @@ impl Syscall<'_> {
         if let Some(left) = select_time_left(timeout_left, mono_now().saturating_sub(begin), sticky)
         {
             // See `sys_pselect6`: a failed write-back is ignored.
-            let _ = timeout.write(TimeVal::from(left));
+            let _ = self.put_narrow(&mut timeout, TimeVal::from(left));
         }
         result
     }
@@ -1301,7 +1301,7 @@ impl Syscall<'_> {
         let timeout = if timeout.is_null() {
             -1
         } else {
-            timeout.read()?.try_into_poll_msecs()?
+            self.get_narrow(&timeout)?.try_into_poll_msecs()?
         };
         self.sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
             .await
