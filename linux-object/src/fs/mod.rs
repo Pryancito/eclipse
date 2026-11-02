@@ -81,6 +81,13 @@ use rcore_fs_ramfs::RamFS;
 lazy_static! {
     pub(crate) static ref DEVFS_ROOT: Mutex<Option<Arc<DevINode>>> = Mutex::new(None);
 }
+
+#[cfg(test)]
+lazy_static! {
+    /// The one `/dev` of the whole test binary, kept alive. See
+    /// [`devfs_root_once`] for why there is only one.
+    static ref TEST_DEVFS: Mutex<Option<(Arc<DevFS>, Arc<DevINode>)>> = Mutex::new(None);
+}
 use zircon_object::{object::KernelObject, vm::VmObject};
 
 use crate::error::{LxError, LxResult};
@@ -1389,6 +1396,76 @@ fn tmpfs_mount_opts() -> String {
 }
 
 /// create root filesystem, mount DevFS and RamFS
+/// The `/dev` of this process, and the `DevFS` that has to stay alive for it.
+///
+/// `DEVFS_ROOT` is process-wide and it is what every `/dev` lookup resolves
+/// against ([`lookup_virtual_fs`] goes straight to it, because `/dev` is not in
+/// the mount tree at all). The kernel builds it once, from
+/// [`create_root_fs`], for init's root.
+///
+/// The test binary is the other story, and it is the same one the DRM
+/// bring-up had ([`drm_bring_up::bring_up_drm_globals`]) and the syncobj hook
+/// had ([`syncobj_eventfd::init_at_boot`]): 428 call sites make a process with
+/// `LinuxProcess::new`, which does call `create_root_fs`, and the harness runs
+/// them in parallel. Each one used to build a BRAND NEW `DevFS` and store it
+/// here, so a test standing in `/dev` had the whole filesystem swapped under
+/// it by another thread: its working directory was still a real directory, but
+/// no longer the one `/dev` named, and `/dev` is a virtual top you cannot
+/// climb out of -- which is `cwd::tests::a_working_directory_in_dev_or_proc...`
+/// reading `None` where it had just put `Some("/dev")`.
+///
+/// So under `cfg(test)` there is ONE `/dev` for the whole binary, and every
+/// call after the first gets it back. The `Arc<DevFS>` goes with it because
+/// `DevINode` holds its filesystem by `Weak`.
+#[cfg(not(test))]
+fn devfs_root_once() -> (Arc<DevFS>, Arc<DevINode>) {
+    let devfs = DevFS::new();
+    let root = devfs.root();
+    *DEVFS_ROOT.lock() = Some(root.clone());
+    (devfs, root)
+}
+
+/// See [`devfs_root_once`].
+#[cfg(test)]
+fn devfs_root_once() -> (Arc<DevFS>, Arc<DevINode>) {
+    // The check and the store under ONE lock, or two threads both build.
+    let mut kept = TEST_DEVFS.lock();
+    if let Some((fs, root)) = kept.as_ref() {
+        return (fs.clone(), root.clone());
+    }
+    let devfs = DevFS::new();
+    let root = devfs.root();
+    *DEVFS_ROOT.lock() = Some(root.clone());
+    *kept = Some((devfs.clone(), root.clone()));
+    (devfs, root)
+}
+
+/// `mknod` into `/dev`, where a node that is already there is not an error.
+///
+/// In a test build every `create_root_fs` after the first walks this list over
+/// the `/dev` the first one built ([`devfs_root_once`]), so it finds each node
+/// made. In the kernel it runs once and this never fires; anything else is
+/// still fatal, as it was.
+///
+/// In the kernel it keeps the old behaviour exactly: a node that is already
+/// there means `create_root_fs` ran twice, which it must not, so it still
+/// panics. Only the test build tolerates it, and only because there the
+/// second run is the point.
+#[cfg(not(test))]
+fn devfs_mknod(root: &DevINode, name: &str, dev: Arc<dyn INode>) {
+    root.add(name, dev)
+        .unwrap_or_else(|e| panic!("failed to mknod /dev/{}: {:?}", name, e));
+}
+
+/// See [`devfs_mknod`].
+#[cfg(test)]
+fn devfs_mknod(root: &DevINode, name: &str, dev: Arc<dyn INode>) {
+    match root.add(name, dev) {
+        Ok(()) | Err(rcore_fs::vfs::FsError::EntryExist) => {}
+        Err(e) => panic!("failed to mknod /dev/{}: {:?}", name, e),
+    }
+}
+
 pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     warn!("[boot] create_root_fs: begin");
     // Pages for /tmp, /run, /dev/shm come from the frame allocator (not the
@@ -1405,21 +1482,11 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     let mut block_candidates: Vec<(String, Arc<dyn INode>)> = Vec::new();
 
     // create DevFS
-    let devfs = DevFS::new();
-    let devfs_root = devfs.root();
-    *DEVFS_ROOT.lock() = Some(devfs_root.clone());
-    devfs_root
-        .add("null", Arc::new(NullINode::new()))
-        .expect("failed to mknod /dev/null");
-    devfs_root
-        .add("zero", Arc::new(ZeroINode::new()))
-        .expect("failed to mknod /dev/zero");
-    devfs_root
-        .add("random", Arc::new(RandomINode::new(false)))
-        .expect("failed to mknod /dev/random");
-    devfs_root
-        .add("urandom", Arc::new(RandomINode::new(true)))
-        .expect("failed to mknod /dev/urandom");
+    let (devfs, devfs_root) = devfs_root_once();
+    devfs_mknod(&devfs_root, "null", Arc::new(NullINode::new()));
+    devfs_mknod(&devfs_root, "zero", Arc::new(ZeroINode::new()));
+    devfs_mknod(&devfs_root, "random", Arc::new(RandomINode::new(false)));
+    devfs_mknod(&devfs_root, "urandom", Arc::new(RandomINode::new(true)));
     // `/dev/shm` is a POSIX shared-memory tmpfs *directory*, not a device node:
     // `shm_open(name, O_CREAT, ...)` (used by wlroots to allocate the keyboard
     // keymap fd, and by any program using POSIX shm) creates files under
@@ -1452,9 +1519,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             warn!("failed to link /dev/{}: {:?}", name, e);
         }
     }
-    devfs_root
-        .add("tty", stdio::STDIN.clone())
-        .expect("failed to mknod /dev/tty");
+    devfs_mknod(&devfs_root, "tty", stdio::STDIN.clone());
     // `/dev/tty0` (current VT) and `/dev/console`: an X server / seatd opens
     // `/dev/tty0` to query/allocate a VT (VT_OPENQRY) and to drive the whole
     // VT-switch handshake (VT_SETMODE(VT_PROCESS), KDSETMODE, VT_RELDISP).
@@ -2952,301 +3017,10 @@ pub fn split_path(path: &str) -> (&str, &str) {
 }
 
 #[cfg(test)]
-mod mount_lookup_tests {
-    //! Which mount a path is on. It decides whether a set-user-ID bit on that
-    //! path is honoured, so getting it wrong in one direction hands privilege
-    //! away on a `nosuid` mount and in the other takes it from a mount that
-    //! never asked for the option.
-    //!
-    //! All of it is checked through [`mount_flag_from`], over mount points the
-    //! test supplies, so nothing here touches the one live mount table -- a
-    //! test that mounted something would leave it mounted for every test
-    //! after it, and `--test-threads=1` is exactly the setting under which
-    //! that goes unnoticed.
+mod devfs_once_tests;
 
-    use super::*;
-
-    /// A plausible boot: the root plus the pseudo-filesystems the kernel
-    /// mounts itself, with the `nosuid` each of them is registered with.
-    const A_BOOT: &[(&str, bool)] = &[
-        ("/", false),
-        ("/dev", true),
-        ("/dev/shm", true),
-        ("/tmp", true),
-        ("/run", true),
-        ("/proc", true),
-        ("/sys", true),
-    ];
-
-    fn nosuid(path: &str) -> bool {
-        mount_flag_from(path, A_BOOT.iter().copied())
-    }
-
-    #[test]
-    fn a_mount_with_no_state_of_its_own_gets_one_from_the_line_it_records() {
-        // The pseudo-filesystems the kernel mounts itself have no wrapped
-        // filesystem to carry a state, and they are exactly the ones
-        // registered `nosuid`. Their state used to be built from nothing.
-        let entry = new_mount_entry("proc", "/proc", "proc", "rw,nosuid,nodev,noexec", None);
-        assert!(entry.state.is_nosuid());
-        assert!(!entry.state.is_read_only());
-        let plain = new_mount_entry("/dev/sda2", "/", "btrfs", "rw", None);
-        assert!(!plain.state.is_nosuid());
-    }
-
-    #[test]
-    fn a_mount_that_brought_its_own_state_keeps_it() {
-        // A real mount hands over the very state its filesystem wrapper is
-        // already enforcing; rebuilding it here would give the table a second
-        // copy that a remount could move without the wrapper noticing.
-        let state = alloc::sync::Arc::new(mount_state::MountState::from_options(0, "rw"));
-        let entry = new_mount_entry(
-            "/dev/sdb1",
-            "/mnt",
-            "vfat",
-            "rw,nosuid",
-            Some(state.clone()),
-        );
-        assert!(
-            !entry.state.is_nosuid(),
-            "the line did not win over the state"
-        );
-        state.set_nosuid(true);
-        assert!(entry.state.is_nosuid(), "the table holds the SAME state");
-    }
-
-    #[test]
-    fn a_remount_moves_the_state_the_filesystem_is_enforcing() {
-        // Not a copy of it: the entry and the mounted filesystem share one
-        // `MountState`, which is how a `mount -o remount,ro` reaches the
-        // write path at all.
-        let state = alloc::sync::Arc::new(mount_state::MountState::from_options(0, "rw,nosuid"));
-        let mut table = alloc::vec![new_mount_entry(
-            "tmpfs",
-            "/tmp",
-            "tmpfs",
-            "rw,nosuid",
-            Some(state.clone())
-        )];
-        remount_entry(&mut table, "/tmp", 0, "ro").unwrap();
-        assert!(state.is_read_only(), "the filesystem still thinks it is rw");
-        assert!(
-            !state.is_nosuid(),
-            "nosuid outlived a remount that dropped it"
-        );
-        assert_eq!(table[0].options, "ro");
-    }
-
-    #[test]
-    fn a_remount_where_two_are_stacked_moves_the_top_one() {
-        // Linux 6.18, `mount -t tmpfs t1 c; mount -t tmpfs t2 c; mount -o
-        // remount,ro c`: `t2` read `ro`, `t1` stayed `rw`. Here init's own
-        // `mount -t tmpfs tmpfs /tmp` stacks one over the kernel's, and the
-        // flags are read off the top one.
-        let mut table = alloc::vec![
-            new_mount_entry("t1", "/tmp", "tmpfs", "rw", None),
-            new_mount_entry("t2", "/tmp", "tmpfs", "rw", None),
-        ];
-        remount_entry(&mut table, "/tmp", 0, "ro,noexec").unwrap();
-        assert_eq!(
-            (table[0].options.as_str(), table[1].options.as_str()),
-            ("rw", "ro,noexec")
-        );
-        assert!(table[1].state.is_noexec() && !table[0].state.is_noexec());
-        let flagged = table
-            .iter()
-            .map(|m| (m.target.as_str(), m.state.is_noexec()));
-        assert!(
-            mount_flag_from("/tmp/x", flagged),
-            "the remount did nothing"
-        );
-
-        // A move takes the top one too, as the path leads to it.
-        move_entry(&mut table, "/tmp", "/mnt").unwrap();
-        assert_eq!(
-            (table[0].target.as_str(), table[1].target.as_str()),
-            ("/tmp", "/mnt")
-        );
-    }
-
-    #[test]
-    fn a_remount_of_something_that_is_not_mounted_is_einval() {
-        let mut table = alloc::vec![new_mount_entry("tmpfs", "/tmp", "tmpfs", "rw", None)];
-        assert!(remount_entry(&mut table, "/nowhere", 0, "ro").is_err());
-        // And a trailing slash names the same mount, because `/proc/mounts`
-        // never carries one and the caller typed whatever they typed.
-        assert!(remount_entry(&mut table, "/tmp/", 0, "ro").is_ok());
-    }
-
-    #[test]
-    fn a_program_on_the_root_filesystem_may_be_set_user_id() {
-        // The case every program on this machine is in. Answering the other
-        // way would turn off set-user-ID for the whole system.
-        assert!(!nosuid("/bin/busybox"));
-        assert!(!nosuid("/usr/bin/passwd"));
-        assert!(!nosuid("/"));
-    }
-
-    #[test]
-    fn a_program_dropped_in_tmp_may_not() {
-        // Which is the entire reason `/tmp` is mounted `nosuid`: it is the one
-        // directory anybody can write to.
-        assert!(nosuid("/tmp/x"));
-        assert!(nosuid("/tmp/deep/er/still"));
-        assert!(nosuid("/dev/shm/x"));
-    }
-
-    #[test]
-    fn the_mount_point_itself_is_on_its_own_mount() {
-        assert!(nosuid("/tmp"));
-        assert!(nosuid("/tmp/"));
-    }
-
-    #[test]
-    fn a_mount_point_is_not_a_prefix_of_a_name_that_merely_starts_with_it() {
-        // `/tmpfiles` is a directory on the root filesystem, not something
-        // inside the mount at `/tmp`. A plain `starts_with` puts it there and
-        // silently disarms every set-user-ID program under it.
-        assert!(!nosuid("/tmpfiles/x"));
-        assert!(!nosuid("/tmpfoo"));
-        assert!(!nosuid("/proc-backup/x"));
-    }
-
-    /// The pseudo-filesystems as `create_root_fs` actually registers them,
-    /// option strings and all, so the table these tests reason over is the one
-    /// the kernel builds rather than a guess at it.
-    const AS_REGISTERED: &[(&str, &str)] = &[
-        ("/", "rw"),
-        ("/dev", "rw,nosuid"),
-        ("/dev/shm", "rw,nosuid,nodev"),
-        ("/tmp", "rw,nosuid,nodev"),
-        ("/run", "rw,nosuid,nodev"),
-        ("/proc", "rw,nosuid,nodev,noexec,relatime"),
-        ("/sys", "rw,nosuid,nodev,noexec,relatime"),
-    ];
-
-    fn asked(path: &str, flag: fn(&mount_state::MountState) -> bool) -> bool {
-        let states: Vec<(&str, bool)> = AS_REGISTERED
-            .iter()
-            .map(|(target, opts)| {
-                (
-                    *target,
-                    flag(&mount_state::MountState::from_options(0, opts)),
-                )
-            })
-            .collect();
-        mount_flag_from(path, states.iter().copied())
-    }
-
-    #[test]
-    /// What the boot table means once the two options reach something. Both
-    /// directions matter equally: refusing where nothing asked for a refusal
-    /// breaks the desktop, and allowing where the line promised otherwise is
-    /// the bug.
-    fn the_boot_table_refuses_exactly_where_it_says_it_does() {
-        let noexec = |p: &str| asked(p, |s| s.is_noexec());
-        let nodev = |p: &str| asked(p, |s| s.is_nodev());
-
-        // `noexec`: the two pseudo-filesystems that say so, and nowhere else.
-        assert!(noexec("/proc/1/mem"));
-        assert!(noexec("/sys/kernel/whatever"));
-        assert!(!noexec("/bin/sh"), "the root filesystem is not noexec");
-        // The pair that makes busybox work. `/proc/self/exe` is under a
-        // `noexec` mount and would be refused if `execve` asked about the name
-        // the caller wrote -- which is why it canonicalises the magic link to
-        // the real binary FIRST, and the real binary is on the root.
-        assert!(
-            noexec("/proc/self/exe"),
-            "the name itself is on a noexec mount"
-        );
-        assert!(
-            !noexec("/bin/busybox"),
-            "the path the magic link canonicalises to must stay executable"
-        );
-        assert!(!noexec("/tmp/script.sh"), "/tmp is not registered noexec");
-        assert!(!noexec("/usr/lib/libc.so"));
-
-        // `nodev`: the three tmpfs mounts, and NOT `/dev`.
-        assert!(nodev("/tmp/fakedisk"));
-        assert!(nodev("/run/x"));
-        assert!(nodev("/dev/shm/x"));
-        assert!(!nodev("/dev/null"), "/dev is where the nodes live");
-        assert!(!nodev("/dev/sda"));
-        // `/dev/pts` is a plain directory, not a mount, so a pty slave answers
-        // to `/dev`. If this ever came back `true`, every terminal on the
-        // machine would stop opening -- which is the whole reason it is pinned
-        // here rather than left to be noticed on hardware.
-        assert!(!nodev("/dev/pts/0"), "pty slaves must still open");
-        assert!(!nodev("/dev/ptmx"));
-    }
-
-    #[test]
-    /// `/dev/shm` is inside `/dev`, and the two disagree about `nodev`. That is
-    /// the longest-match rule doing the only job it has, on the one pair of
-    /// real mounts where getting it wrong is the difference between a working
-    /// `/dev` and none.
-    fn dev_shm_is_nodev_without_making_dev_nodev() {
-        let nodev = |p: &str| asked(p, |s| s.is_nodev());
-        assert!(nodev("/dev/shm/sem.foo"));
-        assert!(!nodev("/dev/tty0"));
-        // And the boundary: a name that merely starts with `/dev/shm`.
-        assert!(!nodev("/dev/shmfoo"), "a prefix is not a mount point");
-    }
-
-    #[test]
-    fn the_longest_mount_point_wins() {
-        // Both directions, because a rule that took the first match would be
-        // right about half of these by luck.
-        let mounts = &[("/", false), ("/mnt", true), ("/mnt/usb", false)];
-        assert!(mount_flag_from("/mnt/x", mounts.iter().copied()));
-        assert!(
-            !mount_flag_from("/mnt/usb/x", mounts.iter().copied()),
-            "a mount inside a nosuid mount answers for itself"
-        );
-        let inverted = &[("/", false), ("/mnt", false), ("/mnt/usb", true)];
-        assert!(!mount_flag_from("/mnt/x", inverted.iter().copied()));
-        assert!(mount_flag_from("/mnt/usb/x", inverted.iter().copied()));
-    }
-
-    #[test]
-    fn the_last_mount_on_a_point_is_the_one_that_answers() {
-        // Mounting over an existing mount point pushes a second entry with
-        // the same target; a lookup reaches the newer filesystem, so the
-        // newer entry is the one whose options apply.
-        let stacked = &[("/", false), ("/mnt", false), ("/mnt", true)];
-        assert!(mount_flag_from("/mnt/x", stacked.iter().copied()));
-        let unstacked = &[("/", false), ("/mnt", true), ("/mnt", false)];
-        assert!(!mount_flag_from("/mnt/x", unstacked.iter().copied()));
-    }
-
-    #[test]
-    fn a_path_on_no_mount_at_all_grants_nothing_extra() {
-        // With no root entry there is nothing to be under. Fail open, which
-        // is what the tree did before any of this existed -- the option is a
-        // restriction, and inventing one nobody asked for is its own bug.
-        assert!(!mount_flag_from("/bin/sh", core::iter::empty()));
-        assert!(!mount_flag_from("relative/path", A_BOOT.iter().copied()));
-    }
-
-    #[test]
-    fn the_root_mount_covers_a_path_that_matches_nothing_else() {
-        let ro_root = &[("/", true), ("/tmp", false)];
-        assert!(mount_flag_from("/bin/sh", ro_root.iter().copied()));
-        assert!(!mount_flag_from("/tmp/x", ro_root.iter().copied()));
-    }
-
-    #[test]
-    fn the_boundary_rule_on_its_own() {
-        // `path_is_under` is what the rule above is built from, so it gets its
-        // own test: the failures of the composite are hard to read.
-        assert!(path_is_under("/anything", "/"));
-        assert!(path_is_under("/tmp", "/tmp"));
-        assert!(path_is_under("/tmp/x", "/tmp"));
-        assert!(!path_is_under("/tmpx", "/tmp"));
-        assert!(!path_is_under("/tm", "/tmp"));
-        assert!(!path_is_under("/var/tmp/x", "/tmp"));
-    }
-}
+#[cfg(test)]
+mod mount_lookup_tests;
 
 #[cfg(test)]
 mod tests {
