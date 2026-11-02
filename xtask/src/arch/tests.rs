@@ -346,3 +346,69 @@ fn the_one_line_form_distinguishes_broken_from_unrunnable() {
     assert!(unrunnable.contains("i386"), "{unrunnable}");
     assert!(unrunnable.contains("will not run"), "{unrunnable}");
 }
+
+// ---------------------------------------------------------------------------
+// A musl toolchain already on this host.
+// ---------------------------------------------------------------------------
+
+/// `-dumpmachine` is the only thing worth trusting about a compiler, because
+/// the name lies: the published `x86_64-linux-musl-gcc` is a 32-bit i386
+/// binary. These are the answers the three compilers that matter give.
+#[test]
+fn only_a_musl_triple_for_the_right_arch_counts_as_a_match() {
+    let matches = |triple: &str, arch: &str| {
+        triple.starts_with(&format!("{arch}-")) && triple.ends_with("-musl")
+    };
+
+    // Alpine's native compiler, which is what Eclipse's own rootfs can install
+    // with `apk add build-base`.
+    assert!(matches("x86_64-alpine-linux-musl", "x86_64"));
+    // A cross toolchain built by musl-cross-make.
+    assert!(matches("x86_64-linux-musl", "x86_64"));
+    assert!(matches("aarch64-linux-musl", "aarch64"));
+
+    // A glibc host is not a match, which is why the CI runners keep
+    // downloading exactly as they did.
+    assert!(!matches("x86_64-pc-linux-gnu", "x86_64"));
+    assert!(!matches("x86_64-linux-gnu", "x86_64"));
+    // Nor is the right libc on the wrong arch.
+    assert!(!matches("aarch64-linux-musl", "x86_64"));
+    assert!(!matches("i686-linux-musl", "x86_64"));
+}
+
+/// The real `targets_musl` agrees with that, run against a compiler that is
+/// not there (nothing to run means no match) and against one that answers
+/// something else entirely.
+#[test]
+fn a_compiler_that_cannot_be_asked_is_not_a_match() {
+    assert!(!targets_musl(
+        &PathBuf::from("/nonexistent-4c2a/x86_64-linux-musl-gcc"),
+        "x86_64"
+    ));
+    // `true` exists and exits 0, but prints no triple.
+    if let Some(yes) = which("true") {
+        assert!(!targets_musl(&yes, "x86_64"));
+    }
+}
+
+/// `which` finds what is on `PATH` and nothing else.
+#[test]
+fn which_finds_a_program_on_the_path() {
+    let sh = which("sh").expect("every host has sh");
+    assert!(sh.is_file(), "{}", sh.display());
+    assert!(sh.ends_with("sh"), "{}", sh.display());
+    assert!(which("eclipse-no-such-program-xtask-test").is_none());
+}
+
+/// The linked names are the ones `CROSS_COMPILE=<prefix>` makes a makefile
+/// reach for. `gcc` is the one every caller in this tree uses by hand, and
+/// `strip` is used by `LinuxRootfs` directly, so losing either would break the
+/// build in a way no test here would see.
+#[test]
+fn the_linked_tools_cover_what_the_build_actually_asks_for() {
+    for needed in ["gcc", "g++", "strip", "ld", "ar", "ranlib"] {
+        assert!(TOOLS.contains(&needed), "{needed} is not linked");
+    }
+    let unique: std::collections::HashSet<_> = TOOLS.iter().collect();
+    assert_eq!(unique.len(), TOOLS.len(), "a tool is listed twice");
+}

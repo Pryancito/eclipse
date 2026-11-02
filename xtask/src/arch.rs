@@ -87,6 +87,15 @@ impl Arch {
             return dir;
         }
 
+        // A compiler already on this host that targets the same musl triple
+        // beats anything downloaded: it is native, so it runs by definition.
+        // This is what makes building from inside Eclipse work -- its rootfs
+        // ships `apk` pointed at Alpine, and Alpine's `gcc` *is* an
+        // `x86_64-...-musl` compiler.
+        if let Some(native) = self.native_musl(&target) {
+            return native;
+        }
+
         let mut refused = Vec::new();
         for source in Source::ALL {
             let tgz = origin.join(source.tarball(&name));
@@ -134,6 +143,70 @@ impl Arch {
     fn musl_gcc(&self, dir: &Path) -> PathBuf {
         dir.join("bin")
             .join(format!("{}-linux-musl-gcc", self.name()))
+    }
+
+    /// A toolchain already installed on this host that targets the same musl
+    /// triple, presented in the layout every caller expects: a directory whose
+    /// `bin/` holds `<arch>-linux-musl-<tool>`.
+    ///
+    /// Two shapes count. One is a cross toolchain installed under its own
+    /// name, `<arch>-linux-musl-gcc` on `PATH`; its whole `bin/` is already
+    /// spelled the way the build wants, so its prefix directory is handed back
+    /// as it is. The other is a **native** musl compiler -- plain `gcc` whose
+    /// `-dumpmachine` is something like `x86_64-alpine-linux-musl` -- and for
+    /// that a directory of links named with the prefix is built under
+    /// `target/<arch>/`, because `CROSS_COMPILE` is a prefix and nothing in
+    /// the build asks for a tool by its bare name.
+    ///
+    /// A glibc host is not a match: its `gcc` reports `-gnu` and the download
+    /// happens exactly as before. That is why the CI runners are unaffected.
+    fn native_musl(&self, target: &Path) -> Option<PathBuf> {
+        let prefix = format!("{}-linux-musl-", self.name());
+        let prefixed = format!("{prefix}gcc");
+
+        for candidate in [prefixed.as_str(), "gcc", "cc"] {
+            let Some(path) = which(candidate) else {
+                continue;
+            };
+            if !targets_musl(&path, self.name()) {
+                continue;
+            }
+            let bin = path.parent()?;
+            // Already named with the prefix: its directory is the toolchain.
+            if candidate == prefixed {
+                println!(
+                    "using the {prefix}toolchain already on PATH: {}",
+                    path.display()
+                );
+                return bin.parent().map(Path::to_path_buf);
+            }
+            // Native: build the prefixed names next to the build's own files.
+            let home = target.join("native-musl");
+            let link_dir = home.join("bin");
+            dir::clear(&link_dir).ok()?;
+            let mut linked = 0;
+            for tool in TOOLS {
+                let from = bin.join(tool);
+                if !from.exists() {
+                    continue;
+                }
+                if std::os::unix::fs::symlink(&from, link_dir.join(format!("{prefix}{tool}")))
+                    .is_ok()
+                {
+                    linked += 1;
+                }
+            }
+            if linked == 0 {
+                continue;
+            }
+            println!(
+                "using this host's native musl toolchain ({}): {linked} tools linked into {}",
+                path.display(),
+                link_dir.display()
+            );
+            return Some(home);
+        }
+        None
     }
 }
 
@@ -300,6 +373,43 @@ impl Compiler {
             ),
         }
     }
+}
+
+/// The tools `CROSS_COMPILE=<prefix>` makes a makefile reach for. Whichever of
+/// them the host has get a prefixed name; the rest are simply not there, which
+/// is what a cross toolchain missing one would look like anyway.
+const TOOLS: [&str; 14] = [
+    "gcc", "g++", "c++", "cpp", "ld", "as", "ar", "ranlib", "nm", "strip", "objcopy", "objdump",
+    "readelf", "size",
+];
+
+/// Where `name` resolves on `PATH`, or `None` if it is not there. There is no
+/// `which` in the standard library and no crate for it in this build, and
+/// `PATH` lookup is three lines.
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Whether the compiler at `cc` builds for musl on `arch`.
+///
+/// `-dumpmachine` is the compiler's own answer and the only one worth trusting:
+/// a name says nothing (the published `x86_64-linux-musl-gcc` is a 32-bit i386
+/// binary) and neither does the host distribution. Alpine's native compiler
+/// answers `x86_64-alpine-linux-musl`, a cross one `x86_64-linux-musl`, and a
+/// glibc one `x86_64-pc-linux-gnu`, which is not a match.
+fn targets_musl(cc: &Path, arch: &str) -> bool {
+    let Ok(out) = std::process::Command::new(cc).arg("-dumpmachine").output() else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let triple = String::from_utf8_lossy(&out.stdout);
+    let triple = triple.trim();
+    triple.starts_with(&format!("{arch}-")) && triple.ends_with("-musl")
 }
 
 /// Decides what the file at `gcc` is: missing, half-written, unrunnable here,
