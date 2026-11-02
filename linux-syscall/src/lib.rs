@@ -209,6 +209,11 @@ mod file;
 mod intarg;
 mod ipc;
 mod misc;
+/// Structures whose 32-bit image is the native one with every word
+/// halved: Linux's `put_timespec64`/`get_timespec64` and the `compat_*`
+/// conversions next to them. Every call site goes through them, and the
+/// width is asked of the process, not of the call site.
+mod narrow;
 mod net;
 #[cfg(test)]
 mod on_a_thread;

@@ -684,7 +684,7 @@ impl Syscall<'_> {
         iov_count: usize,
     ) -> SysResult {
         info!("readv: fd={:?}, iov={:?}, count={}", fd, iov_ptr, iov_count);
-        let mut iovs = iov_ptr.read_iovecs(iov_count)?;
+        let mut iovs = self.read_iovecs(iov_ptr, iov_count)?;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
         let total_len = iovs.total_len().min(super::SYSCALL_IO_MAX);
@@ -734,7 +734,7 @@ impl Syscall<'_> {
             "writev: fd={:?}, iov={:?}, count={}",
             fd, iov_ptr, iov_count
         );
-        let iovs = iov_ptr.read_iovecs(iov_count)?;
+        let iovs = self.read_iovecs(iov_ptr, iov_count)?;
         let total = iovs.total_len();
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
@@ -806,7 +806,7 @@ impl Syscall<'_> {
             fd, iov_ptr, iov_count, offset
         );
         let offset = linux_object::fs::user_offset(offset)?;
-        let mut iovs = iov_ptr.read_iovecs(iov_count)?;
+        let mut iovs = self.read_iovecs(iov_ptr, iov_count)?;
         let proc = self.linux_process();
         let file_like = proc.get_file_like(fd)?;
         let total_len = iovs.total_len().min(super::SYSCALL_IO_MAX);
@@ -833,7 +833,7 @@ impl Syscall<'_> {
             fd, iov_ptr, iov_count, offset
         );
         let offset = linux_object::fs::user_offset(offset)?;
-        let iovs = iov_ptr.read_iovecs(iov_count)?;
+        let iovs = self.read_iovecs(iov_ptr, iov_count)?;
         // Same chunked gather as sys_writev — no artificial total cap, short
         // write on a mid-stream failure — with the position carried in the
         // explicit offset instead of the file cursor.
@@ -946,7 +946,7 @@ impl Syscall<'_> {
         if iov_count != 1 {
             return Err(LxError::EINVAL);
         }
-        let iovs = iov_ptr.read_iovecs(iov_count)?;
+        let iovs = self.read_iovecs(iov_ptr, iov_count)?;
         let len = iovs.total_len();
         let pos = if offset == -1 {
             file.seek(SeekFrom::Current(0))?

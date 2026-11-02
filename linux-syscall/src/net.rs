@@ -1045,7 +1045,7 @@ impl Syscall<'_> {
     async fn sendmsg_hdr(&mut self, sockfd: usize, hdr: &MsgHdr, flags: usize) -> SysResult {
         let iov_ptr: UserInPtr<IoVecIn> = hdr.msg_iov.as_addr().into();
         let iovlen = hdr.msg_iovlen;
-        let iovs = iov_ptr.read_iovecs(iovlen)?;
+        let iovs = self.read_iovecs(iov_ptr, iovlen)?;
         let total = iovs.total_len();
 
         // Resolve the fd before gathering, so the socket's type can decide what
@@ -1162,7 +1162,7 @@ impl Syscall<'_> {
 
         let iov_ptr = hdr.msg_iov;
         let iovlen = hdr.msg_iovlen;
-        let mut iovs = iov_ptr.read_iovecs(iovlen)?;
+        let mut iovs = self.read_iovecs(iov_ptr, iovlen)?;
         let total_len = iovs.total_len().min(super::SYSCALL_IO_MAX);
         let mut data = crate::try_zeroed_buf(total_len)?;
 

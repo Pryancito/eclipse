@@ -104,30 +104,93 @@ fn what_goes_in_comes_back_out_in_the_same_shape() {
     }
 }
 
-/// An `F_GETLK` answer that does not fit in the narrow structure is
-/// `EOVERFLOW`, not a truncated offset.
+/// An `F_GETLK` answer that does not fit in the narrow structure: the start
+/// is refused, the length is clamped, and the two are not interchangeable.
 ///
-/// `F_GETLK` reports somebody else's lock, so the offset is not one this
-/// program chose and can be anywhere in the file. Truncating it would answer
-/// "the conflict is at byte 0" for a conflict two gigabytes in, and the
-/// program would retry forever against a range that is free. Linux answers
-/// `EOVERFLOW` here for the same reason.
+/// Both numbers come from measuring the Linux of the build container (a
+/// 64-bit process holding the lock, a 32-bit one asking through the narrow
+/// structure); the table is in [`super::flock_to_bytes`]'s documentation.
+///
+/// The asymmetry is the point. A clamped *start* would report a conflict at
+/// the wrong place and the caller could not tell; a refused *length* would
+/// hide a conflict that is really there. So each half gets the treatment that
+/// loses the least.
 #[test]
-fn an_answer_too_big_for_the_narrow_struct_is_eoverflow() {
-    let fl = Flock {
+fn a_narrow_getlk_answer_refuses_an_oversized_start_and_clamps_an_oversized_length() {
+    let mut raw = [0u8; FLOCK64_SIZE];
+
+    // A start past `i32::MAX`: refused.
+    let far = Flock {
         l_type: 1,
         l_whence: 0,
-        l_start: 1 << 40,
+        l_start: 1 << 31,
         l_len: 1,
         l_pid: 9,
     };
-    let mut raw = [0u8; FLOCK64_SIZE];
     assert_eq!(
-        flock_to_bytes(&fl, FLOCK32_SIZE, &mut raw).unwrap_err(),
+        flock_to_bytes(&far, FLOCK32_SIZE, &mut raw).unwrap_err(),
         LxError::EOVERFLOW
     );
-    // The same answer fits the wide one.
-    assert!(flock_to_bytes(&fl, FLOCK64_SIZE, &mut raw).is_ok());
+    // The same answer fits the wide structure.
+    assert!(flock_to_bytes(&far, FLOCK64_SIZE, &mut raw).is_ok());
+
+    // A length past `i32::MAX`: clamped, and the call succeeds.
+    let long = Flock {
+        l_type: 1,
+        l_whence: 0,
+        l_start: 0,
+        l_len: 5 * 1024 * 1024 * 1024,
+        l_pid: 9,
+    };
+    flock_to_bytes(&long, FLOCK32_SIZE, &mut raw).unwrap();
+    let back = flock_from_bytes(&raw[..16], FLOCK32_SIZE).unwrap();
+    assert_eq!(back.l_start, 0);
+    assert_eq!(
+        back.l_len,
+        i64::from(i32::MAX),
+        "2147483647, as Linux reports"
+    );
+
+    // A start of exactly `i32::MAX` with a length that ends past it is
+    // reported exactly: the check is on the start alone.
+    let edge = Flock {
+        l_type: 1,
+        l_whence: 0,
+        l_start: i64::from(i32::MAX),
+        l_len: 10,
+        l_pid: 9,
+    };
+    flock_to_bytes(&edge, FLOCK32_SIZE, &mut raw).unwrap();
+    let back = flock_from_bytes(&raw[..16], FLOCK32_SIZE).unwrap();
+    assert_eq!(back.l_start, i64::from(i32::MAX));
+    assert_eq!(back.l_len, 10);
+
+    // A lock to end-of-file is `l_len = 0` and stays 0, not clamped to
+    // `i32::MAX`: zero already means "and everything after".
+    let to_eof = Flock {
+        l_type: 1,
+        l_whence: 0,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 9,
+    };
+    flock_to_bytes(&to_eof, FLOCK32_SIZE, &mut raw).unwrap();
+    assert_eq!(flock_from_bytes(&raw[..16], FLOCK32_SIZE).unwrap().l_len, 0);
+
+    // And a negative length saturates downwards rather than becoming two
+    // gigabytes, which an `unwrap_or(i32::MAX)` would have made it.
+    let backwards = Flock {
+        l_type: 1,
+        l_whence: 0,
+        l_start: 0,
+        l_len: -(5 * 1024 * 1024 * 1024),
+        l_pid: 9,
+    };
+    flock_to_bytes(&backwards, FLOCK32_SIZE, &mut raw).unwrap();
+    assert_eq!(
+        flock_from_bytes(&raw[..16], FLOCK32_SIZE).unwrap().l_len,
+        i64::from(i32::MIN)
+    );
 }
 
 /// Each command picks its structure, and the ones that are not lock commands

@@ -11,21 +11,34 @@ use super::*;
 use core::convert::TryInto;
 use linux_object::fs::vfs::{FileType, Timespec};
 
-/// The byte image of a `Stat64`, written through the same copy-to-userspace
-/// path the system call uses --- not a `transmute`, which would be this file's
-/// opinion of the layout rather than the compiler's.
-///
-/// The buffer is `u32`s because `Stat64` is 4-byte aligned and a `[u8; 96]`
-/// need not be.
+/// The byte image of a `Stat64`: the production path, the one the system call
+/// copies to userspace.
 fn bytes(s: &Stat64) -> [u8; STAT64_SIZE] {
+    s.to_bytes()
+}
+
+/// The bridge between the two: the hand-assembled image is byte-for-byte what
+/// a struct copy of the same value would have written.
+///
+/// Without this, the offsets below would only say that `to_bytes` and the
+/// tests agree with each other. With it, they say that the compiler's own
+/// `repr(C)` layout puts each field where Linux's header does --- and the
+/// `const` assertions in the module then stand on something the running code
+/// also obeys.
+///
+/// The destination here is a `[u32; 24]` because a struct copy DOES need the
+/// alignment, which is the whole reason the production path does not use one.
+#[test]
+fn the_hand_assembled_image_is_what_a_struct_copy_would_have_written() {
+    let s = Stat64::from(distinctive());
     let mut words = [0u32; STAT64_SIZE / 4];
     let mut out: UserOutPtr<Stat64> = (words.as_mut_ptr() as usize).into();
-    out.write(*s).unwrap();
-    let mut b = [0u8; STAT64_SIZE];
+    out.write(s).unwrap();
+    let mut copied = [0u8; STAT64_SIZE];
     for (i, word) in words.iter().enumerate() {
-        b[i * 4..i * 4 + 4].copy_from_slice(&word.to_ne_bytes());
+        copied[i * 4..i * 4 + 4].copy_from_slice(&word.to_ne_bytes());
     }
-    b
+    assert_eq!(s.to_bytes(), copied);
 }
 
 /// Read a 32-bit value at a byte offset, the way a 32-bit program's compiler
@@ -214,6 +227,54 @@ fn the_seconds_are_32_bits_with_both_of_the_limits_that_implies() {
     let s = Stat64::from(meta);
     assert_eq!(u64::from(s.st_mtime), 1_762_000_000u64);
     assert_eq!(s.st_mtime_nsec, 123_456_789);
+}
+
+/// An unaligned destination is written, not refused.
+///
+/// This is the bug the byte-pointer copy exists for. `UserPtr::user_bytes`
+/// requires the destination to be a multiple of `align_of::<T>()`, so a
+/// `UserOutPtr<Stat64>` refuses any address that is not a multiple of four
+/// --- and Linux's `copy_to_user` requires nothing of the sort, so a program
+/// whose 96-byte buffer happens to sit at an odd address got `EFAULT` from a
+/// perfectly good `fstat64`. The second half of this test is what the first
+/// half replaced, kept so that the distinction cannot quietly go away.
+#[test]
+fn an_unaligned_destination_is_written_and_not_refused() {
+    let mut buf = [0u8; STAT64_SIZE + 4];
+    let base = buf.as_mut_ptr() as usize;
+    // An address that is 1 modulo 4, whatever the array happened to land on,
+    // and at least one byte into the buffer so the 96 bytes still fit.
+    let skip = (1 + 4 - base % 4) % 4;
+    let at = base + if skip == 0 { 4 } else { skip };
+    assert_eq!(
+        at % 4,
+        1,
+        "the test needs a destination that is not aligned"
+    );
+
+    let s = Stat64::from(distinctive());
+    let mut out: UserOutPtr<u8> = at.into();
+    out.write_array(&s.to_bytes()).unwrap();
+
+    // And the bytes landed there, read back at the same offsets as above.
+    let written = &buf[at - base..at - base + STAT64_SIZE];
+    assert_eq!(
+        u32::from_ne_bytes(written[16..20].try_into().unwrap()),
+        0o100_644,
+        "st_mode"
+    );
+    assert_eq!(
+        u64::from_ne_bytes(written[44..52].try_into().unwrap()),
+        0x0000_0002_dead_beef,
+        "st_size"
+    );
+
+    // The typed pointer this replaced refuses the same address.
+    let mut typed: UserOutPtr<Stat64> = at.into();
+    assert!(
+        typed.write(s).is_err(),
+        "a typed write still requires the alignment, which is why it is not used"
+    );
 }
 
 /// The padding is zero, not left over.

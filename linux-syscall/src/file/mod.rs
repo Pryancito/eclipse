@@ -39,6 +39,43 @@ pub(crate) use self::stat::StatMode;
 mod xattr;
 pub(crate) use xattr::{XattrOp, XattrTarget};
 
+impl Syscall<'_> {
+    /// Read a `readv`-shaped scatter/gather list, in whichever width the
+    /// calling process's ABI uses.
+    ///
+    /// A native `struct iovec` is two 8-byte words; a 32-bit process's is two
+    /// 4-byte ones. Reading the narrow list as the wide one does not fail ---
+    /// that is what makes it dangerous --- it pairs the halves wrongly, so
+    /// the first buffer's address comes out as entry 0's base with entry 0's
+    /// *length* in its high half, and its length as the whole of entry 1.
+    /// `writev` then gathers from an address nothing named, for hundreds of
+    /// gigabytes, and reports a count.
+    ///
+    /// The width is asked of the process and not of the call site, which is
+    /// `in_compat_syscall()` in Linux and is the only arrangement that stays
+    /// right: `readv`, `preadv`, `sendmsg` and every later caller get it
+    /// without each one remembering to.
+    ///
+    /// This covers the list and not what surrounds it. `sendmsg` reads its
+    /// `msg_iov` out of a `struct msghdr`, which is a 32-bit structure of its
+    /// own and still needs its own conversion; a 32-bit process cannot reach
+    /// that call yet (`socketcall` answers `ENOSYS`), so routing the list
+    /// through here makes it one less thing wrong rather than one thing
+    /// right.
+    pub(crate) fn read_iovecs<P: 'static + kernel_hal::user::Policy>(
+        &self,
+        iov_ptr: UserInPtr<kernel_hal::user::IoVec<P>>,
+        iov_count: usize,
+    ) -> LxResult<kernel_hal::user::IoVecs<P>> {
+        if self.linux_process().abi().is_32bit() {
+            iov_ptr.read_iovecs32(iov_count)
+        } else {
+            iov_ptr.read_iovecs(iov_count)
+        }
+        .map_err(Into::into)
+    }
+}
+
 // Shared with the FreeBSD personality's `getdirentries`, which only exists on
 // x86_64; elsewhere the re-export would be an unused import under
 // `deny(warnings)`.

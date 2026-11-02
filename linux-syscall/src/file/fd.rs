@@ -6,7 +6,7 @@
 //! - pipe
 
 use super::*;
-use crate::outparams::{commit_and_report_old, hand_out_pair};
+use crate::outparams::{commit_and_report_old_with, hand_out_pair};
 use alloc::string::String;
 use alloc::sync::Arc;
 use linux_object::error::LxResult;
@@ -20,6 +20,25 @@ use rcore_fs::vfs::INode;
 pub struct ITimerSpec {
     it_interval: TimeSpec,
     it_value: TimeSpec,
+}
+
+/// The `timerfd` pair is two `timespec`s, so its 32-bit image is the same
+/// halving as every other one: see [`crate::narrow`]. The fields are private
+/// here, which is why the implementation lives next to them.
+impl crate::narrow::Narrow for ITimerSpec {
+    const WORDS: usize = 4;
+
+    fn to_words(self, out: &mut [u64]) {
+        crate::narrow::Narrow::to_words(self.it_interval, &mut out[0..2]);
+        crate::narrow::Narrow::to_words(self.it_value, &mut out[2..4]);
+    }
+
+    fn from_words(words: &[u64]) -> Self {
+        Self {
+            it_interval: crate::narrow::Narrow::from_words(&words[0..2]),
+            it_value: crate::narrow::Narrow::from_words(&words[2..4]),
+        }
+    }
 }
 
 impl ITimerSpec {
@@ -338,26 +357,31 @@ impl Syscall<'_> {
         // timerfd_settime(2) does: reading `new_value` can fault and an
         // out-of-range timespec is EINVAL, and neither of those may have
         // already written the caller's `old_value`.
-        commit_and_report_old(old, &mut old_value, || {
-            let v = new_value.read()?;
-            // Same rule as `timer_settime`: an out-of-range `timespec` is EINVAL.
-            if !v.it_interval.valid() || !v.it_value.valid() {
-                return Err(LxError::EINVAL);
-            }
-            info!(
-                "timerfd_settime: fd={:?}, flags={:#x}, value_ns={}, interval_ns={}",
-                fd,
-                flags,
-                v.value_ns(),
-                v.interval_ns()
-            );
-            tfd.set_time(
-                v.value_ns(),
-                v.interval_ns(),
-                flags & TFD_TIMER_ABSTIME != 0,
-            );
-            Ok(())
-        })?;
+        let abi32 = self.narrow_abi();
+        commit_and_report_old_with(
+            old,
+            |old| crate::narrow::narrow_put_if_not_null(abi32, &mut old_value, old),
+            || {
+                let v = self.get_narrow(&new_value)?;
+                // Same rule as `timer_settime`: an out-of-range `timespec` is EINVAL.
+                if !v.it_interval.valid() || !v.it_value.valid() {
+                    return Err(LxError::EINVAL);
+                }
+                info!(
+                    "timerfd_settime: fd={:?}, flags={:#x}, value_ns={}, interval_ns={}",
+                    fd,
+                    flags,
+                    v.value_ns(),
+                    v.interval_ns()
+                );
+                tfd.set_time(
+                    v.value_ns(),
+                    v.interval_ns(),
+                    flags & TFD_TIMER_ABSTIME != 0,
+                );
+                Ok(())
+            },
+        )?;
         Ok(0)
     }
 
@@ -370,7 +394,7 @@ impl Syscall<'_> {
         let file_like = self.linux_process().get_file_like(fd)?;
         let tfd = file_like.downcast_ref::<TimerFd>().ok_or(LxError::EINVAL)?;
         let (iv, rem) = tfd.get_time();
-        curr_value.write(ITimerSpec::from_ns(iv, rem))?;
+        self.put_narrow(&mut curr_value, ITimerSpec::from_ns(iv, rem))?;
         Ok(0)
     }
 

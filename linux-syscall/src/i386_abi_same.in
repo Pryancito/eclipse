@@ -121,7 +121,6 @@ vfork
 // ABIs by design: `linux_dirent64` spells its `d_ino`/`d_off` `__u64`, and
 // `struct statx` was defined with explicit widths for exactly this reason.
 getdents64
-statx
 setxattr
 lsetxattr
 fsetxattr
@@ -204,3 +203,23 @@ setgroups32 = setgroups
 chown32 = chown
 fchown32 = fchown
 lchown32 = lchown
+
+// Scalars and arrays of structures that are the same bytes in both ABIs, and
+// which the timer and poll families above need in order to be usable at all:
+// `struct pollfd` is `{ int; short; short }` -- 8 bytes in either ABI -- and
+// a `timerfd` is created with three scalars.
+poll
+timerfd_create
+timer_getoverrun
+timer_delete
+
+// NOT here, and it was until the i386 probe said otherwise:
+//
+//   statx
+//
+// `struct statx` is the same 256 bytes in both ABIs -- it was designed that
+// way -- but on i386 a `long long` is aligned to 4, so a 32-bit program's
+// `struct statx *` is 4-aligned and `UserPtr::write` insists on 8. It answers
+// EFAULT for a pointer Linux accepts, which is worse than ENOSYS: musl falls
+// back to `fstatat` on ENOSYS and has nowhere to go on EFAULT. It comes back
+// once it writes its bytes the way `stat64` does.

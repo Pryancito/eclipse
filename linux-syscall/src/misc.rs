@@ -545,8 +545,8 @@ impl Syscall<'_> {
                 } else {
                     let timeout_addr: UserInPtr<TimeSpec> = val2.into();
                     // Validated: a `timespec` out of range is EINVAL.
-                    let timeout = timeout_addr
-                        .read_if_not_null()?
+                    let timeout = self
+                        .get_narrow_if_not_null(&timeout_addr)?
                         .map(|timeout| timeout.try_into_duration())
                         .transpose()?;
                     let now = if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
@@ -658,8 +658,8 @@ impl Syscall<'_> {
                 let timeout_addr: UserInPtr<TimeSpec> = val2.into();
                 // Validated: a `timespec` out of range is EINVAL, and it is
                 // rejected whether or not we end up waiting.
-                let timeout = timeout_addr
-                    .read_if_not_null()?
+                let timeout = self
+                    .get_narrow_if_not_null(&timeout_addr)?
                     .map(|timeout| timeout.try_into_duration())
                     .transpose()?;
                 // FUTEX_WAIT takes a RELATIVE timeout; FUTEX_WAIT_BITSET takes
@@ -833,7 +833,29 @@ impl Syscall<'_> {
             "prlimit64: pid: {}, resource: {}, new_limit: {:x?}, old_limit: {:x?}",
             pid, resource, new_limit, old_limit
         );
-        let new_limit = new_limit.read_if_not_null()?;
+        // `struct rlimit64` is the same sixteen bytes in both ABIs, but on
+        // i386 it is aligned to 4 and not to 8, so neither of these can go
+        // through `UserPtr::read`/`write`. See [`crate::narrow`].
+        let new_limit = self.get_wide_if_not_null(&new_limit)?;
+        let old = self.do_prlimit(pid, resource, new_limit)?;
+        self.put_wide_if_not_null(&mut old_limit, old)?;
+        Ok(0)
+    }
+
+    /// `do_prlimit`: the whole of `prlimit64(2)` except the copying to and
+    /// from user memory.
+    ///
+    /// Split off for the reason Linux splits it: the i386 calls ask exactly
+    /// this question and then read and write a DIFFERENT structure --- a
+    /// `struct rlimit` of two 32-bit words, where "infinity" is `0xffffffff`
+    /// and anything bigger is clamped, not truncated. See
+    /// [`crate::compat32::rlimit`].
+    pub(crate) fn do_prlimit(
+        &self,
+        pid: usize,
+        resource: usize,
+        new_limit: Option<RLimit>,
+    ) -> linux_object::error::LxResult<RLimit> {
         // `capable(CAP_SYS_RESOURCE)` is asked of whoever is CALLING, both
         // here and inside `prlimit_target`; the target's own privileges never
         // enter into it.
@@ -849,8 +871,7 @@ impl Syscall<'_> {
         {
             linux.itimers().watch_cpu_limit();
         }
-        old_limit.write_if_not_null(old)?;
-        Ok(0)
+        Ok(old)
     }
 
     /// The process `prlimit64(pid, ...)` is about: the caller for `pid == 0`
