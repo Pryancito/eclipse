@@ -254,3 +254,95 @@ fn the_checked_compiler_is_the_one_the_callers_run() {
         dir.join("bin/riscv64-linux-musl-gcc")
     );
 }
+
+// ---------------------------------------------------------------------------
+// The order the toolchain is looked for in.
+// ---------------------------------------------------------------------------
+
+/// The 64-bit-hosted source is tried **first**. That ordering is the whole
+/// point: the mirror that comes second works everywhere a host runs 32-bit x86
+/// binaries, so a build that asked it first would never notice the 64-bit one
+/// had appeared, and the host that needs it is exactly the one that cannot say
+/// so -- it fails inside busybox's makefile, not here.
+#[test]
+fn the_64_bit_source_is_tried_before_the_32_bit_mirror() {
+    assert_eq!(Source::ALL, [Source::Eclipse64, Source::ZcoreMusl]);
+}
+
+/// Each source fetches a tarball named for the toolchain, from its own
+/// release.
+#[test]
+fn each_source_names_the_toolchain_it_fetches() {
+    let name = "x86_64-linux-musl-cross";
+    let eclipse = Source::Eclipse64.url(name);
+    assert!(eclipse.contains("Pryancito/eclipse"), "{eclipse}");
+    assert!(eclipse.contains("musl-cross-64"), "{eclipse}");
+    assert!(
+        eclipse.ends_with("/x86_64-linux-musl-cross.tgz"),
+        "{eclipse}"
+    );
+
+    let zcore = Source::ZcoreMusl.url(name);
+    assert!(zcore.contains("YdrMaster/zCore"), "{zcore}");
+    assert!(zcore.contains("musl-cache"), "{zcore}");
+    assert!(zcore.ends_with("/x86_64-linux-musl-cross.tgz"), "{zcore}");
+}
+
+/// And every arch gets its own tarball from every source, so nothing collides
+/// across arches either.
+#[test]
+fn every_arch_has_its_own_tarball_from_every_source() {
+    let mut seen = std::collections::HashSet::new();
+    for arch in [Arch::Riscv64, Arch::X86_64, Arch::Aarch64] {
+        let name = format!("{}-linux-musl-cross", arch.name());
+        for source in Source::ALL {
+            assert!(
+                seen.insert(source.tarball(&name)),
+                "two tarballs share a name: {} for {}",
+                source.tarball(&name),
+                arch.name()
+            );
+            assert!(source.tarball(&name).contains(arch.name()));
+        }
+    }
+}
+
+/// The two sources must not share a cached file name. `wget` returns early when
+/// the destination already exists, so if both wrote `<name>.tgz`, a failed
+/// first download that left a file behind -- or, worse, a *successful* one
+/// holding the wrong toolchain -- would be handed straight to the second
+/// source and unpacked as if it were its own.
+#[test]
+fn the_two_sources_cache_their_downloads_under_different_names() {
+    let name = "x86_64-linux-musl-cross";
+    assert_ne!(
+        Source::Eclipse64.tarball(name),
+        Source::ZcoreMusl.tarball(name)
+    );
+    // The historical one keeps its historical name, so an existing checkout's
+    // cache is still used rather than downloaded again.
+    assert_eq!(
+        Source::ZcoreMusl.tarball(name),
+        "x86_64-linux-musl-cross.tgz"
+    );
+}
+
+/// The one-line form is what the "tried, in order" list is built from, so it
+/// has to say which of the two failures it was without repeating the URL that
+/// already precedes it.
+#[test]
+fn the_one_line_form_distinguishes_broken_from_unrunnable() {
+    let gcc = PathBuf::from("bin/x86_64-linux-musl-gcc");
+
+    let broken = Compiler::Broken("not there".into()).one_line(&gcc);
+    assert!(broken.contains("not there"), "{broken}");
+
+    let unrunnable = Compiler::Unrunnable {
+        elf: ElfId::parse(&MUSL_GCC_HEAD).unwrap(),
+        why: "Exec format error".into(),
+    }
+    .one_line(&gcc);
+    assert!(unrunnable.contains("32-bit"), "{unrunnable}");
+    assert!(unrunnable.contains("i386"), "{unrunnable}");
+    assert!(unrunnable.contains("will not run"), "{unrunnable}");
+}

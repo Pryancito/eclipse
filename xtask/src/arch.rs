@@ -1,7 +1,11 @@
 //! 支持架构的定义。
 
-use crate::{commands::wget, variant::Variant, LinuxRootfs, XError, ARCHS, TARGET};
-use os_xtask_utils::{dir, CommandExt, Tar};
+use crate::{
+    commands::{optional_status, wget_optional},
+    variant::Variant,
+    LinuxRootfs, XError, ARCHS, TARGET,
+};
+use os_xtask_utils::{dir, CommandExt, Ext};
 use std::{
     io::Read,
     path::{Path, PathBuf},
@@ -63,13 +67,12 @@ impl Arch {
 
         let origin = self.origin();
         let target = self.target();
-
-        let tgz = origin.join(format!("{name}.tgz"));
         let dir = target.join(&name);
+        let gcc = self.musl_gcc(&dir);
 
-        // An explicit toolchain wins over the downloaded one, and goes through
-        // exactly the same check. It is the only way out for a host that
-        // cannot run the prebuilt compiler at all.
+        // An explicit toolchain wins over every download, and goes through
+        // exactly the same check. It is the way out for a host none of the
+        // published toolchains run on.
         if let Some(home) = std::env::var_os(MUSL_CROSS_HOME) {
             let home = PathBuf::from(home);
             match check_compiler(&self.musl_gcc(&home)) {
@@ -79,42 +82,51 @@ impl Arch {
         }
 
         dir::create_parent(&dir).unwrap();
-        let gcc = self.musl_gcc(&dir);
-        match check_compiler(&gcc) {
-            // Already there and it runs: nothing to do.
-            Compiler::Usable => return dir,
-            // It runs, but it is not a compiler we can use, or it cannot run
-            // on this host at all. Downloading the same tarball again would
-            // produce the same file, so say why and stop.
-            bad @ Compiler::Unrunnable { .. } => {
-                panic!("{}", bad.explain(&gcc, MUSL_CROSS_HOME))
+        // Whatever was left from a previous build, if it still runs.
+        if let Compiler::Usable = check_compiler(&gcc) {
+            return dir;
+        }
+
+        let mut refused = Vec::new();
+        for source in Source::ALL {
+            let tgz = origin.join(source.tarball(&name));
+            // Nothing cached here is trusted: the directory holds a compiler
+            // that already failed the check above, and a tarball `wget` would
+            // skip re-downloading may be the one that produced it.
+            let _ = dir::rm(&dir);
+            if !wget_optional(source.url(&name), &tgz) {
+                refused.push(format!("{}: could not be downloaded", source.url(&name)));
+                let _ = dir::rm(&tgz);
+                continue;
             }
-            // Missing, truncated, or not an ELF at all: whatever is cached is
-            // not the toolchain. Throw away *both* the directory and the
-            // tarball -- `wget` skips the download when the tarball is still
-            // there, so leaving it behind would re-extract the same rubbish --
-            // and fetch it again.
-            Compiler::Broken(why) => {
-                if dir.exists() {
-                    println!("{}: {why}. Re-downloading.", gcc.display());
+            if !optional_status(
+                Ext::new("tar").arg("xf").arg(&tgz).arg("-C").arg(&target),
+                "needed to unpack the musl toolchain",
+            ) {
+                refused.push(format!("{}: could not be unpacked", tgz.display()));
+                let _ = dir::rm(&tgz);
+                continue;
+            }
+            match check_compiler(&gcc) {
+                Compiler::Usable => return dir,
+                // Not this host's toolchain, or it arrived broken. Either way
+                // the next source gets its turn, and this tarball goes, so a
+                // later run does not re-extract it from the cache.
+                bad => {
+                    refused.push(format!("{}: {}", source.url(&name), bad.one_line(&gcc)));
+                    let _ = dir::rm(&tgz);
                 }
-                dir::rm(&dir).unwrap();
-                dir::rm(&tgz).unwrap();
             }
         }
 
-        wget(
-            format!("https://github.com/YdrMaster/zCore/releases/download/musl-cache/{name}.tgz"),
-            &tgz,
+        let _ = dir::rm(&dir);
+        panic!(
+            "No usable {name} toolchain. Tried, in order:\n  {}\n\n\
+             Point {MUSL_CROSS_HOME} at a directory holding \
+             bin/{}-linux-musl-gcc that this host can run.",
+            refused.join("\n  "),
+            self.name(),
         );
-        Tar::xf(&tgz, Some(target)).invoke();
-
-        // And check the fresh one too: an extraction that ran out of disk, or
-        // died with the build, leaves the same half-written compiler behind.
-        match check_compiler(&gcc) {
-            Compiler::Usable => dir,
-            bad => panic!("{}", bad.explain(&gcc, MUSL_CROSS_HOME)),
-        }
     }
 
     /// The one file out of the whole toolchain that every caller runs.
@@ -128,6 +140,53 @@ impl Arch {
 /// Points at a directory holding `bin/<arch>-linux-musl-gcc`, used instead of
 /// the downloaded toolchain.
 const MUSL_CROSS_HOME: &str = "MUSL_CROSS_HOME";
+
+/// Where a prebuilt musl cross toolchain can be fetched from.
+///
+/// There is more than one because the original mirror's toolchains are
+/// **32-bit i386** binaries -- `x86_64-linux-musl-gcc-11.2.1` is
+/// `ELF 32-bit LSB executable, Intel 80386`, despite the `x86_64-` naming,
+/// which is the target triple and says nothing about the host. That is fine on
+/// a host with 32-bit x86 support, which every CI runner has, and impossible on
+/// one without: Eclipse's own ELF loader takes 64-bit images only, so building
+/// the image *from inside Eclipse* got as far as busybox and then handed
+/// `/bin/sh` a compiler it could not `execve`.
+///
+/// So the sources are tried in order and the first one that yields a compiler
+/// this host actually runs wins. Each keeps its own tarball under `archs/`, so
+/// a cached download for one is never mistaken for the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// A 64-bit-hosted build published on this project's own releases.
+    Eclipse64,
+    /// The historical mirror: 32-bit i386 hosted.
+    ZcoreMusl,
+}
+
+impl Source {
+    pub const ALL: [Self; 2] = [Self::Eclipse64, Self::ZcoreMusl];
+
+    /// The tarball to fetch, for the toolchain named `name`.
+    pub fn url(&self, name: &str) -> String {
+        match self {
+            Self::Eclipse64 => format!(
+                "https://github.com/Pryancito/eclipse/releases/download/musl-cross-64/{name}.tgz"
+            ),
+            Self::ZcoreMusl => format!(
+                "https://github.com/YdrMaster/zCore/releases/download/musl-cache/{name}.tgz"
+            ),
+        }
+    }
+
+    /// Its file name under `archs/<arch>/`. The two must differ, or the second
+    /// source would find the first one's failed download already cached.
+    pub fn tarball(&self, name: &str) -> String {
+        match self {
+            Self::Eclipse64 => format!("{name}-64.tgz"),
+            Self::ZcoreMusl => format!("{name}.tgz"),
+        }
+    }
+}
 
 /// What the cross compiler at a given path turned out to be.
 #[derive(Debug, PartialEq, Eq)]
@@ -200,6 +259,19 @@ impl ElfId {
 }
 
 impl Compiler {
+    /// The same thing in one line, for a list of sources that were tried.
+    pub fn one_line(&self, gcc: &Path) -> String {
+        match self {
+            Self::Usable => "usable".into(),
+            Self::Broken(why) => format!("{} is {why}", gcc.display()),
+            Self::Unrunnable { elf, why } => format!(
+                "holds a {} {} compiler this host will not run ({why})",
+                elf.width(),
+                elf.machine_name(),
+            ),
+        }
+    }
+
     /// The whole message the user gets. It has to name the file, say what is
     /// wrong with it in one line, and say what to do about it -- because the
     /// alternative, historically, was busybox's make quoting an ELF header.
