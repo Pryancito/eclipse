@@ -1041,21 +1041,70 @@ mod tests {
 
     /// The alignment is the only check it drops: a null pointer and one
     /// outside the user half are refused exactly as before.
+    ///
+    /// The second half needs the strict switch turned on, because this suite
+    /// runs under `libos`, where the user-half bound is lifted by default so
+    /// the host's own buffers can be addressed. Without it the kernel
+    /// pointer would pass for a reason that has nothing to do with these two
+    /// methods, and the test would be claiming a check it never made.
+    ///
+    /// The check it pins is the `in_user_half` inside
+    /// [`user_bytes_with`](Self::user_bytes_with) --- checked by mutation:
+    /// dropping that one makes this test fail, while dropping either
+    /// `KHANDLER` call in `check_len_for_unaligned` does not, because those
+    /// two ask the handler about access flags and its own ranges and answer
+    /// yes for both of these addresses under `libos`. So this is the shared
+    /// bound, which is what makes it worth pinning from the unaligned side:
+    /// the split into `user_bytes_with` is where it could have been lost.
+    ///
+    /// The
+    /// switch is per-thread (see
+    /// `the_strict_switch_applies_the_user_half_bound_on_this_thread_only`)
+    /// and is put back before anything is asserted, so a failing assertion
+    /// cannot leave it on for whatever this thread runs next.
     #[test]
     fn the_unaligned_pair_still_refuses_a_null_and_a_kernel_pointer() {
         init_handler();
+        let zero = TwoWords {
+            first: 0,
+            second: 0,
+        };
         let mut null = UserOutPtr::<TwoWords>::from(0);
-        assert_eq!(
-            null.write_unaligned(TwoWords {
-                first: 0,
-                second: 0
-            }),
-            Err(Error::InvalidPointer)
-        );
+        assert_eq!(null.write_unaligned(zero), Err(Error::InvalidPointer));
         assert_eq!(
             UserInPtr::<TwoWords>::from(0).read_unaligned(),
             Err(Error::InvalidPointer)
         );
+
+        // A kernel-half address, and one whose START is in the user half but
+        // whose sixteen bytes run past the end: the check is over the whole
+        // range and not over the first byte.
+        #[cfg(feature = "libos")]
+        {
+            const KERNEL_PTR: usize = 0xffff_8000_0000_0000;
+            let crossing = USER_MAX - 8;
+            set_strict_user_half(true);
+            let answers = [
+                UserOutPtr::<TwoWords>::from(KERNEL_PTR).write_unaligned(zero),
+                UserOutPtr::<TwoWords>::from(crossing).write_unaligned(zero),
+            ];
+            let reads = [
+                UserInPtr::<TwoWords>::from(KERNEL_PTR).read_unaligned(),
+                UserInPtr::<TwoWords>::from(crossing).read_unaligned(),
+            ];
+            set_strict_user_half(false);
+            for (at, got) in [KERNEL_PTR, crossing].iter().zip(answers.iter()) {
+                assert_eq!(*got, Err(Error::InvalidPointer), "write at {:#x}", at);
+            }
+            for (at, got) in [KERNEL_PTR, crossing].iter().zip(reads.iter()) {
+                assert_eq!(
+                    got.as_ref().err(),
+                    Some(&Error::InvalidPointer),
+                    "read at {:#x}",
+                    at
+                );
+            }
+        }
     }
 
     // ---- copies ---------------------------------------------------------

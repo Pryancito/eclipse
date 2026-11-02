@@ -40,7 +40,15 @@ pub(crate) use self::stat::StatMode;
 /// for a field at a destination this kernel would otherwise refuse and need
 /// the offset of that field. Test-only: production has no reason to name the
 /// type outside the module that fills it.
-#[cfg(test)]
+///
+/// Gated on the architecture as well as on `test`, like `StatMode` above and
+/// for the same reason: `compat32` is x86_64 only, so without the second
+/// gate this is an unused import in an aarch64 or riscv64 test build, which
+/// `deny(warnings)` makes a compile error. `make clippy` does not catch it
+/// --- it builds the kernel target, where `cfg(test)` code does not exist
+/// --- so the first thing to say so is the `Zircon Core Test Libos`
+/// job.
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) use self::stat::Statx;
 mod xattr;
 pub(crate) use xattr::{XattrOp, XattrTarget};

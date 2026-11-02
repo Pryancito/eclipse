@@ -23,7 +23,10 @@
 //! alignment", which would drop a check Linux does make --- `futex` wants
 //! its word 4-aligned and says `EINVAL` otherwise.
 //!
-//! Fixed pids live in 47_3xx.
+//! Fixed pids live in 47_45x. 47_3xx was taken: `ipc/semctl_wiring_tests`
+//! already holds 47_300 to 47_307, and two processes created with the same
+//! fixed id both leave the shared `ROOT_JOB` when either one exits, so a
+//! collision unregisters a process that is still running.
 
 extern crate std;
 
@@ -60,7 +63,7 @@ fn a_process(pid: KoID, top: &str, abi: Abi) -> Arc<Process> {
 /// address would pass for the wrong reason --- which is exactly how the
 /// probe nearly missed this, when its buffer grew and moved onto a boundary.
 fn four_mod_eight(buf: &mut [u32]) -> usize {
-    let at = buf.as_ptr() as usize;
+    let at = buf.as_mut_ptr() as usize;
     let addr = if at % 8 == 4 { at } else { at + 4 };
     assert_eq!(addr % 8, 4, "no 4-mod-8 address in this buffer");
     assert_eq!(align_of::<Statx>(), 8, "the refusal is about this number");
@@ -110,7 +113,7 @@ fn a_32_bit_statx_writes_a_four_aligned_buffer_that_the_native_one_refuses() {
     // `/unal_x/f` has to exist for the 32-bit half to be able to answer
     // anything, and the path is the same for both so the only difference
     // between the two calls is the ABI.
-    let (ok32, ino32) = answer(47_301, "unal_x", Abi::Linux32, at);
+    let (ok32, ino32) = answer(47_450, "unal_x", Abi::Linux32, at);
     assert_eq!(ok32, Ok(()), "a 32-bit statx was refused its own buffer");
     assert!(
         ino32.map(|i| i != 0).unwrap_or(false),
@@ -118,7 +121,7 @@ fn a_32_bit_statx_writes_a_four_aligned_buffer_that_the_native_one_refuses() {
         ino32
     );
 
-    let (ok64, _) = answer(47_302, "unal_x", Abi::Linux, at);
+    let (ok64, _) = answer(47_451, "unal_x", Abi::Linux, at);
     assert_eq!(
         ok64,
         Err(LxError::EFAULT),
@@ -155,7 +158,7 @@ fn a_32_bit_prlimit64_writes_a_four_aligned_buffer_that_the_native_one_refuses()
         })
     };
 
-    let (ok32, cur32) = answer(47_303, "unal_r", Abi::Linux32);
+    let (ok32, cur32) = answer(47_452, "unal_r", Abi::Linux32);
     assert_eq!(
         ok32,
         Ok(()),
@@ -167,7 +170,7 @@ fn a_32_bit_prlimit64_writes_a_four_aligned_buffer_that_the_native_one_refuses()
         cur32
     );
 
-    let (ok64, _) = answer(47_304, "unal_r", Abi::Linux);
+    let (ok64, _) = answer(47_453, "unal_r", Abi::Linux);
     assert_eq!(
         ok64,
         Err(LxError::EFAULT),
@@ -222,12 +225,12 @@ fn a_32_bit_ppoll_reads_a_four_aligned_sigmask_that_the_native_one_refuses() {
     };
 
     assert_eq!(
-        answer(47_305, "unal_p", Abi::Linux32),
+        answer(47_454, "unal_p", Abi::Linux32),
         Ok(0),
         "a 32-bit ppoll was refused a mask Linux accepts"
     );
     assert_eq!(
-        answer(47_306, "unal_p", Abi::Linux),
+        answer(47_455, "unal_p", Abi::Linux),
         Err(LxError::EFAULT),
         "the native alignment check is gone, which is not the fix"
     );
