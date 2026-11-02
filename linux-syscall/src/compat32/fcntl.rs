@@ -132,10 +132,33 @@ fn flock_from_bytes(bytes: &[u8], width: usize) -> Result<Flock, LxError> {
 /// Lay a native `Flock` back out in whichever of the two shapes the caller
 /// passed, for `F_GETLK`.
 ///
-/// The narrow form can fail here, and that is not pedantry: `F_GETLK` reports
-/// a *conflicting* lock, which some other process set and which may well sit
-/// past two gigabytes. Linux answers `EOVERFLOW` for exactly this, and a
-/// truncated offset would instead report a conflict at the wrong place.
+/// The narrow form cannot always hold the answer, and the two halves of it
+/// are handled **differently**. `F_GETLK` reports a *conflicting* lock, which
+/// some other process set and which may well sit past two gigabytes, so this
+/// is not a corner case.
+///
+/// Measured against the Linux of the build container, with a 64-bit process
+/// holding the lock and a 32-bit one asking about it through the narrow
+/// structure:
+///
+/// | conflicting lock | narrow `F_GETLK` answers |
+/// |---|---|
+/// | `[0, 4096)` | `l_start = 0`, `l_len = 4096` |
+/// | `[0, 5 GiB)` | `l_start = 0`, **`l_len = 2147483647`** |
+/// | `[0, 1 TiB)` | `l_start = 0`, `l_len = 2147483647` |
+/// | `[0, EOF)` | `l_start = 0`, `l_len = 0` |
+/// | `[2 GiB, +10)` | **`EOVERFLOW`** |
+/// | `[2147483647, +10)` | `l_start = 2147483647`, `l_len = 10` |
+///
+/// So the **length is clamped** and the **start is refused**, and the two
+/// cannot be swapped. A clamped start would report a conflict at the wrong
+/// place, which the caller cannot detect; a refused length would hide a
+/// conflict that is really there, at a place the caller could have used. The
+/// last row is the one that shows the check is on the start alone: the lock
+/// ends past `i32::MAX` and the answer is still exact.
+///
+/// This function was written refusing both. Copilot said so on #2380 and the
+/// measurement above agreed with it.
 fn flock_to_bytes(fl: &Flock, width: usize, out: &mut [u8]) -> Result<(), LxError> {
     out[..2].copy_from_slice(&fl.l_type.to_le_bytes());
     out[2..4].copy_from_slice(&fl.l_whence.to_le_bytes());
@@ -145,7 +168,11 @@ fn flock_to_bytes(fl: &Flock, width: usize, out: &mut [u8]) -> Result<(), LxErro
         out[20..24].copy_from_slice(&fl.l_pid.to_le_bytes());
     } else {
         let start = i32::try_from(fl.l_start).map_err(|_| LxError::EOVERFLOW)?;
-        let len = i32::try_from(fl.l_len).map_err(|_| LxError::EOVERFLOW)?;
+        // Clamped, not refused: see the table above. `clamp` rather than
+        // `unwrap_or(i32::MAX)` so that a negative length --- which
+        // `fcntl(2)` gives a meaning --- saturates downwards instead of
+        // coming back as two gigabytes.
+        let len = fl.l_len.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
         out[4..8].copy_from_slice(&start.to_le_bytes());
         out[8..12].copy_from_slice(&len.to_le_bytes());
         out[12..16].copy_from_slice(&fl.l_pid.to_le_bytes());

@@ -136,6 +136,57 @@ fn split(value: u64) -> (u32, u32) {
 }
 
 impl Stat64 {
+    /// The ninety-six bytes a 32-bit program reads, laid out by the
+    /// compiler's own offsets.
+    ///
+    /// Not `UserOutPtr<Stat64>::write`, which was the first version:
+    /// `UserPtr::user_bytes` requires the destination to be aligned to
+    /// `align_of::<T>()`, and **Linux's `copy_to_user` requires nothing of
+    /// the sort**. A perfectly writable 96-byte buffer at an address that is
+    /// not a multiple of four would have answered `EFAULT` through every
+    /// entry point below. Copilot said so on #2380.
+    ///
+    /// `offset_of!` is what places each field, so this is the compiler's
+    /// layout and not a second opinion about it; the `const` assertions above
+    /// are what tie that layout to Linux's header, and a test asserts that
+    /// this image is byte-for-byte what a struct copy would have written.
+    fn to_bytes(self) -> [u8; STAT64_SIZE] {
+        let mut out = [0u8; STAT64_SIZE];
+        macro_rules! put {
+            ($($field:ident),* $(,)?) => {$({
+                let at = core::mem::offset_of!(Stat64, $field);
+                out[at..at + 4].copy_from_slice(&self.$field.to_ne_bytes());
+            })*};
+        }
+        put!(
+            st_dev_lo,
+            st_dev_hi,
+            _pad0,
+            __st_ino,
+            st_mode,
+            st_nlink,
+            st_uid,
+            st_gid,
+            st_rdev_lo,
+            st_rdev_hi,
+            _pad3,
+            st_size_lo,
+            st_size_hi,
+            st_blksize,
+            st_blocks_lo,
+            st_blocks_hi,
+            st_atime,
+            st_atime_nsec,
+            st_mtime,
+            st_mtime_nsec,
+            st_ctime,
+            st_ctime_nsec,
+            st_ino_lo,
+            st_ino_hi,
+        );
+        out
+    }
+
     /// Read `st_size` back, for the tests: the halves joined again.
     #[cfg(test)]
     fn size(&self) -> u64 {
@@ -246,12 +297,16 @@ impl Syscall<'_> {
     }
 
     /// Lay the answer out and copy it to the 96 bytes the program provided.
+    ///
+    /// Through a **byte** pointer, so that the buffer's address carries no
+    /// alignment requirement: see [`Stat64::to_bytes`].
     fn write_stat64(&self, stat_ptr: usize, meta: Metadata) -> SysResult {
         if stat_ptr == 0 {
             return Err(LxError::EFAULT);
         }
-        let mut out: UserOutPtr<Stat64> = stat_ptr.into();
-        out.write(meta.into())?;
+        let stat = Stat64::from(meta);
+        let mut out: UserOutPtr<u8> = stat_ptr.into();
+        out.write_array(&stat.to_bytes())?;
         Ok(0)
     }
 }
