@@ -34,9 +34,6 @@
 //!
 //! - `socketcall` (102) and `ipc` (117) multiplex a whole family through one
 //!   number, with the real arguments in a block of memory;
-//! - `fstat64`/`stat64`/`lstat64`/`fstatat64` pass a `struct stat64` whose
-//!   layout is not `struct stat`'s;
-//! - `fcntl64`, whose `F_SETLK` passes a `struct flock` of `off_t`;
 //! - `sigreturn` (119) and `rt_sigreturn` (173), whose signal frames are
 //!   32-bit structures;
 //! - the `*_time64` calls (403 and up), the 32-bit world's answer to 2038.
@@ -60,11 +57,19 @@
 //! descriptor, so the two kernels genuinely do different work. See
 //! [`tls`](tls).
 //!
-//! The rest so far are the ones whose native twin exists but reads the
-//! arguments differently: a 64-bit offset arrives in two registers
-//! (`_llseek`, `pread64`, `pwrite64`, `truncate64`, `ftruncate64`) or in 4 KiB
-//! units (`mmap2`). Each is two halves put back together, and each is in a
+//! The next are the ones whose native twin exists but reads the arguments
+//! differently: a 64-bit offset arrives in two registers (`_llseek`,
+//! `pread64`, `pwrite64`, `truncate64`, `ftruncate64`) or in 4 KiB units
+//! (`mmap2`). Each is two halves put back together, and each is in a
 //! different order. See [`wide`](wide).
+//!
+//! And then the ones whose answer is a **structure** of a shape this ABI does
+//! not share: `stat64` (195), `lstat64` (196), `fstat64` (197) and
+//! `fstatat64` (300), whose 96 bytes keep the real inode last and every
+//! 64-bit field at 4-byte alignment (see [`stat`](stat)); and `fcntl64` (221)
+//! with `fcntl` (55), six of whose commands point at one of i386's two
+//! `struct flock` --- which one being decided by the command number (see
+//! [`fcntl`](fcntl)).
 //!
 //! ## The renames
 //!
@@ -84,6 +89,8 @@
 use super::*;
 use linux_object::error::LxError;
 
+mod fcntl;
+mod stat;
 mod tls;
 mod wide;
 
@@ -106,6 +113,15 @@ const I386_PWRITE64: u32 = 181;
 const I386_MMAP2: u32 = 192;
 const I386_TRUNCATE64: u32 = 193;
 const I386_FTRUNCATE64: u32 = 194;
+
+/// And the ones whose answer is a structure this ABI lays out differently.
+/// See [`stat`] and [`fcntl`].
+const I386_FCNTL: u32 = 55;
+const I386_STAT64: u32 = 195;
+const I386_LSTAT64: u32 = 196;
+const I386_FSTAT64: u32 = 197;
+const I386_FCNTL64: u32 = 221;
+const I386_FSTATAT64: u32 = 300;
 
 mod table {
     include!(concat!(env!("OUT_DIR"), "/compat32.rs"));
@@ -164,6 +180,13 @@ impl Syscall<'_> {
             }
             I386_TRUNCATE64 => return syscall_ret(self.sys_truncate64(a0, a1, a2)),
             I386_FTRUNCATE64 => return syscall_ret(self.sys_ftruncate64(a0, a1, a2)),
+            I386_STAT64 => return syscall_ret(self.sys_stat64(a0, a1)),
+            I386_LSTAT64 => return syscall_ret(self.sys_lstat64(a0, a1)),
+            I386_FSTAT64 => return syscall_ret(self.sys_fstat64(a0, a1)),
+            I386_FSTATAT64 => return syscall_ret(self.sys_fstatat64(a0, a1, a2, a3)),
+            // The same handler for both numbers, because measuring Linux
+            // says they are the same call: see [`fcntl`].
+            I386_FCNTL64 | I386_FCNTL => return syscall_ret(self.sys_fcntl64(a0, a1, a2).await),
             _ => {}
         }
         match native_number(num) {

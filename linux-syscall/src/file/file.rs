@@ -2504,11 +2504,34 @@ impl Syscall<'_> {
         wait: bool,
         arg: usize,
     ) -> SysResult {
+        let mut ptr: UserInOutPtr<Flock> = arg.into();
+        let fl = ptr.read()?;
+        let (ret, back) = self.do_lock_file_wait(file_like, get, wait, fl).await?;
+        if let Some(fl) = back {
+            ptr.write(fl)?;
+        }
+        Ok(ret)
+    }
+
+    /// The same thing with the copy to and from userspace taken out: a
+    /// `struct flock` in, a return value and, for `F_GETLK`, the structure to
+    /// write back.
+    ///
+    /// Split off because a 32-bit caller does not pass this structure. i386
+    /// has two of its own --- a 16-byte `struct flock` whose offsets are
+    /// `long`, and a 24-byte `struct flock64` --- so the compat layer converts
+    /// and then asks for the same work. This is Linux's split too:
+    /// `get_compat_flock` / `do_lock_file_wait` / `put_compat_flock`.
+    pub(crate) async fn do_lock_file_wait(
+        &self,
+        file_like: &Arc<dyn FileLike>,
+        get: bool,
+        wait: bool,
+        mut fl: Flock,
+    ) -> Result<(usize, Option<Flock>), LxError> {
         use core::time::Duration;
         use linux_object::fs::record_lock::{self, LockRequest, F_RDLCK, F_UNLCK, F_WRLCK};
 
-        let mut ptr: UserInOutPtr<Flock> = arg.into();
-        let mut fl = ptr.read()?;
         // Record locks apply to files; pipes/sockets answer EBADF like Linux.
         let file = file_like.downcast_ref::<File>().ok_or(LxError::EBADF)?;
         let meta = file.metadata()?;
@@ -2533,7 +2556,7 @@ impl Syscall<'_> {
                     owner,
                 };
                 record_lock::setlk(key, &req, true);
-                Ok(0)
+                Ok((0, None))
             }
             F_RDLCK | F_WRLCK => {
                 let req = LockRequest {
@@ -2553,15 +2576,14 @@ impl Syscall<'_> {
                             fl.l_pid = c.pid as i32;
                         }
                     }
-                    ptr.write(fl)?;
-                    Ok(0)
+                    Ok((0, Some(fl)))
                 } else if wait {
                     // Contended F_SETLKW: retry on a short timer. Lock churn is
                     // rare (package-manager style whole-file locks), so a poll
                     // loop beats wiring a waiter queue through the table.
                     loop {
                         if record_lock::setlk(key, &req, false) {
-                            return Ok(0);
+                            return Ok((0, None));
                         }
                         // An interruptible wait in Linux: a kill did not end
                         // it, so a process killed in it was reaped and stayed
@@ -2573,7 +2595,7 @@ impl Syscall<'_> {
                         .await;
                     }
                 } else if record_lock::setlk(key, &req, false) {
-                    Ok(0)
+                    Ok((0, None))
                 } else {
                     Err(LxError::EAGAIN)
                 }

@@ -118,16 +118,16 @@ fn the_numbers_cross_over() {
 /// whose 32-bit layout differs, so sending it to the native handler would
 /// quietly read the wrong bytes out of the process. They answer `ENOSYS` --
 /// with a name -- until each one has its conversion written.
+///
+/// The ones that now have theirs have moved to
+/// [`the_calls_this_kernel_answers_itself_are_not_in_the_table`], which makes
+/// the same claim about the table and a stronger one about the dispatch. This
+/// list is what is left to write.
 #[test]
 fn the_i386_only_calls_are_left_unmapped() {
     for (num, called) in [
         (102, "socketcall"),
         (117, "ipc"),
-        (195, "stat64"),
-        (196, "lstat64"),
-        (197, "fstat64"),
-        (300, "fstatat64"),
-        (221, "fcntl64"),
         (119, "sigreturn"),
         (173, "rt_sigreturn"),
         (403, "clock_gettime64"),
@@ -217,6 +217,17 @@ fn the_calls_this_kernel_answers_itself_are_not_in_the_table() {
         (192, "mmap2"),
         (193, "truncate64"),
         (194, "ftruncate64"),
+        // And the ones whose answer is a structure of a shape this ABI does
+        // not share. `fcntl` is the one that would look safest to map by
+        // name: the number exists on both sides and most of its commands
+        // take a scalar --- but six of them point at a `struct flock` that
+        // is 16 or 24 bytes here and 32 there.
+        (195, "stat64"),
+        (196, "lstat64"),
+        (197, "fstat64"),
+        (300, "fstatat64"),
+        (221, "fcntl64"),
+        (55, "fcntl"),
     ] {
         assert_eq!(name(num), Some(called), "i386 {}", num);
         assert_eq!(
@@ -280,7 +291,6 @@ fn the_calls_that_share_a_name_but_not_a_shape() {
             "ioctl",
             "the third argument is whatever the request says",
         ),
-        (55, "fcntl", "F_SETLK passes a struct flock of off_t"),
     ] {
         assert_eq!(name(num), Some(called), "i386 {}", num);
         assert_eq!(

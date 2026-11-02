@@ -15,6 +15,13 @@ pub(crate) use fd::{anon_fd_flags, open_flags, ANON_CLOEXEC, ANON_NONBLOCK};
 #[allow(clippy::module_inception)]
 mod file;
 pub(crate) use file::{after_write_error, sigpipe_due, writes_a_file, AfterWriteError};
+/// The other four lock commands and the structure they all point at, shared
+/// with the i386 compat layer, which answers the six from a `struct flock` of
+/// its own shape (see `compat32::fcntl`). x86_64-only because that layer is:
+/// elsewhere these would be imports nobody uses, and `deny(warnings)` turns an
+/// unused import into an error.
+#[cfg(target_arch = "x86_64")]
+pub(crate) use file::{Flock, F_GETLK, F_OFD_GETLK, F_OFD_SETLK, F_SETLK};
 /// Shared with `restart`, which reports on the two lock commands that wait:
 /// `sys_fcntl` is what decides it, so the numbers live there and not twice.
 pub(crate) use file::{F_OFD_SETLKW, F_SETLKW};
@@ -25,6 +32,10 @@ mod pidfd;
 mod poll;
 mod splice;
 mod stat;
+/// Shared with the i386 compat layer, which lays the same type-and-mode word
+/// into a `struct stat64` of its own. One table of `S_IF*` bits, not two.
+#[cfg(target_arch = "x86_64")]
+pub(crate) use self::stat::StatMode;
 mod xattr;
 pub(crate) use xattr::{XattrOp, XattrTarget};
 
