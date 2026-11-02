@@ -1169,19 +1169,9 @@ fn claim_exited_child(proc: &Arc<Process>, pid: KoID, cpu: ChildCpu) -> bool {
     true
 }
 
-/// System-call personality of a process: which operating system's ABI its
-/// binary speaks. Detected from the ELF header at load time (see
-/// `crate::loader`) and consulted by the trap handler to route each syscall to
-/// the right translation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Abi {
-    /// Native Linux ABI (the default for every binary this kernel runs).
-    #[default]
-    Linux,
-    /// FreeBSD/amd64 ABI (`ELFOSABI_FREEBSD` or a FreeBSD ABI note). Only
-    /// meaningful on x86_64; other architectures always run as [`Abi::Linux`].
-    Freebsd,
-}
+mod abi;
+
+pub use abi::Abi;
 
 /// The `FD_CLOEXEC` a descriptor starts with when it is created by OPENING
 /// something: whatever `O_CLOEXEC` the caller asked for.

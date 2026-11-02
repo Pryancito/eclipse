@@ -167,6 +167,12 @@ impl LinuxRootfs {
             if clock_probe.is_file() {
                 let _ = fs::copy(&clock_probe, bin.join("clock-probe"));
             }
+            if matches!(self.0, Arch::X86_64) {
+                let i386_hello = self.i386_hello();
+                if i386_hello.is_file() {
+                    let _ = fs::copy(&i386_hello, bin.join("i386-hello"));
+                }
+            }
             self.install_signal_probe(&musl, &bin);
             self.install_usb_probe(&musl, &bin);
             let firefox_probe = self.firefox_probe(&musl);
@@ -720,6 +726,19 @@ impl LinuxRootfs {
             let dst = bin.join("clock-probe");
             let _ = dir::rm(&dst);
             fs::copy(&clock_probe, &dst).unwrap();
+        }
+
+        // i386-hello: whether this kernel runs a 32-bit binary at all. The one
+        // ELF in the rootfs that is deliberately not for the architecture the
+        // rootfs is built for, which is why `verify::check_elf_machines`
+        // knows its name. See tools/i386-hello.
+        if matches!(self.0, Arch::X86_64) {
+            let i386_hello = self.i386_hello();
+            if i386_hello.is_file() {
+                let dst = bin.join("i386-hello");
+                let _ = dir::rm(&dst);
+                fs::copy(&i386_hello, &dst).unwrap();
+            }
         }
 
         // signal-probe: whether a signal puts the program back as it found it.
@@ -2560,6 +2579,71 @@ impl LinuxRootfs {
         }
 
         Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
+    }
+
+    /// Assemble `i386-hello` (tools/i386-hello): the one program that proves
+    /// this kernel runs a 32-bit binary.
+    ///
+    /// x86_64 only, and freestanding: it is an `ELFCLASS32` / `EM_386` static
+    /// executable with no libc, so it exercises the kernel's compatibility
+    /// path -- the ELF32 loader, the `iretq` into compatibility mode, the
+    /// `int $0x80` gate, the i386 syscall numbering, the 4-byte initial stack
+    /// -- and nothing else. See the comment at the top of `i386-hello.s` for
+    /// what each exit status means.
+    ///
+    /// Built with the HOST's binutils (`as --32`, `ld -m elf_i386`) rather
+    /// than the musl cross compiler, for two reasons: a program with no libc
+    /// needs no toolchain beyond an assembler and a linker, and the musl cross
+    /// toolchain this tree downloads cannot target i386 at all.
+    ///
+    /// Best-effort, like every other probe here: a binutils without 32-bit
+    /// support skips the tool instead of failing the image.
+    fn i386_hello(&self) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("i386-hello");
+        let executable = dir.join("i386-hello");
+        let source = dir.join("i386-hello.s");
+        // NOT `cached_for_target`: that gate asks whether a cached artifact is
+        // an ELF for the architecture being built, and this one is an i386 ELF
+        // on purpose. Its machine never changes, so the mtime alone is the
+        // whole question.
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Assembling i386-hello...");
+        let object = dir.join("i386-hello.o");
+        let assembled = Ext::new("as")
+            .current_dir(&dir)
+            .arg("--32")
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .status();
+        if !assembled.success() {
+            println!("Failed to assemble i386-hello (does `as` support --32?)");
+            return executable;
+        }
+        let linked = Ext::new("ld")
+            .current_dir(&dir)
+            .arg("-m")
+            .arg("elf_i386")
+            .arg("-static")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&object)
+            .status();
+        let _ = fs::remove_file(&object);
+        if !linked.success() {
+            println!("Failed to link i386-hello (does `ld` support -m elf_i386?)");
+        }
         executable
     }
 

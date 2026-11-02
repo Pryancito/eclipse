@@ -225,6 +225,20 @@ pub struct UserContext {
     pub general: GeneralRegs,
     pub trap_num: usize,
     pub error_code: usize,
+    /// Non-zero when this context belongs to a 32-bit (i386) thread, which
+    /// `syscall_return` has to send back to **compatibility mode** instead of
+    /// 64-bit mode: `iretq` to a code selector whose descriptor has `L=0` and
+    /// `D/B=1`, which is what `UCODE32` (see `gdt.rs`) is.
+    ///
+    /// It is the saved `CS` of Linux's `struct pt_regs`, reduced to the one bit
+    /// this frame actually needs. `iretq` is the only way back for such a
+    /// thread -- `sysretq` always returns to 64-bit mode -- so this flag also
+    /// takes the `sysret` fast path out of play, whatever `trap_num` says.
+    ///
+    /// Read by `syscall.S` at `[rsp + 6*8]` once the sixteen general registers
+    /// have been popped, which is this field's offset in the frame; the
+    /// `OFFSET` assertion below is what keeps the two in step.
+    pub compat32: usize,
     /// FXSAVE area holding this thread's x87/SSE (FPU/MMX/XMM) state. The kernel
     /// is compiled with SSE2 (`+sse2`) and freely uses XMM (memcpy, etc.), so the
     /// per-thread user FPU state MUST be saved on every kernel entry and restored
@@ -299,6 +313,18 @@ pub struct GeneralRegs {
     pub fsbase: usize,
     pub gsbase: usize,
 }
+
+/// `syscall.S` and `trap.S` address this frame by hand: `add rsp, 22*8` is
+/// "one past `error_code`", the pushes below it land on `trap_num` and
+/// `error_code`, and the `iret` path reads [`UserContext::compat32`] at
+/// `[rsp + 6*8]` from the slot of `rip`. All three are the same three numbers,
+/// and nothing in the build would notice a field falling in between them.
+const _: () = {
+    assert!(core::mem::size_of::<GeneralRegs>() == 20 * 8);
+    assert!(core::mem::offset_of!(UserContext, trap_num) == 20 * 8);
+    assert!(core::mem::offset_of!(UserContext, error_code) == 21 * 8);
+    assert!(core::mem::offset_of!(UserContext, compat32) == 22 * 8);
+};
 
 impl UserContext {
     /// Get number of syscall

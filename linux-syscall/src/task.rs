@@ -1814,7 +1814,14 @@ impl Syscall<'_> {
         if self.thread.id() != self.zircon_process().id() {
             match self.thread.successor_as_leader() {
                 Ok(leader) => {
-                    match leader.start_with_entry(entry, start_sp, arg0, 0, self.thread_fn) {
+                    match leader.start_with(
+                        |ctx| {
+                            ctx.setup_uspace(entry, start_sp, &[arg0, 0, 0]);
+                            #[cfg(target_arch = "x86_64")]
+                            ctx.set_compat32(abi.is_32bit());
+                        },
+                        self.thread_fn,
+                    ) {
                         Ok(()) => {
                             self.thread.exit();
                             return Ok(0);
@@ -1833,8 +1840,13 @@ impl Syscall<'_> {
             }
         }
         self.thread.with_context(|ctx| {
+            // A fresh context, so a 32-bit image `execve`d over a 64-bit one
+            // -- and the other way round -- starts from the right mode rather
+            // than inheriting the last one.
             *ctx = UserContext::new();
             ctx.setup_uspace(entry, start_sp, &[arg0, 0, 0]);
+            #[cfg(target_arch = "x86_64")]
+            ctx.set_compat32(abi.is_32bit());
         })?;
         Ok(0)
     }

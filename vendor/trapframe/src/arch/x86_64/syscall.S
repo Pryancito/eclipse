@@ -93,6 +93,18 @@ syscall_return:
     # error_code
 
     # determain sysret or iret
+    #
+    # `rsp` is now the slot of `rip`, so the frame reads from here as
+    # [+0]=rip [+1]=rflags [+2]=fsbase [+3]=gsbase [+4]=trap_num
+    # [+5]=error_code [+6]=compat32 (see the offset assertions in mod.rs).
+    #
+    # A 32-bit thread always goes back through `iretq`, whatever brought it
+    # here: `sysretq` returns to 64-bit mode by definition, so taking that path
+    # would drop a compat thread into long mode on its own 32-bit instruction
+    # stream. Asked before the `trap_num` test rather than inside it, so no
+    # trap number can route around it.
+    cmp qword ptr [rsp + 6*8], 0      # compat32?
+    jne iret
     cmp dword ptr [rsp + 4*8], 0x100  # syscall?
     je sysret
 iret:
@@ -101,7 +113,15 @@ iret:
     rdmsr                   # msr[ecx] => edx:eax
     shr edx, 16             # dx = user_cs32
     lea ax, [edx + 8]       # ax = user_ss
-    add dx, 16              # dx = user_cs64
+    # STAR[63:48] is UCODE32 with RPL=3 and the GDT holds
+    # [UCODE32, UDATA32, UCODE64], so +16 is the 64-bit code selector and
+    # UCODE32 itself -- `L=0`, `D/B=1` -- is compatibility mode. The data
+    # selector is the same one either way: 64-bit mode barely looks at it, and
+    # a 32-bit thread needs exactly UDATA32.
+    cmp qword ptr [rsp + 6*8], 0      # compat32?
+    jne 3f                  # yes: keep dx = user_cs32
+    add dx, 16              # no: dx = user_cs64
+3:
 
     # construct trap frame
     push rax                # push ss

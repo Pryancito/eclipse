@@ -52,13 +52,36 @@ const EM_HOST: u16 = 183; // EM_AARCH64
 #[cfg(target_arch = "riscv64")]
 const EM_HOST: u16 = 243; // EM_RISCV
 
+/// `EM_386`: the 32-bit image an x86_64 kernel also runs, in the CPU's
+/// compatibility mode. Linux's `compat_elf_check_arch`.
+#[cfg(target_arch = "x86_64")]
+const EM_I386: u16 = 3;
+
+/// Whether `(class, machine)` name an image this kernel will start.
+///
+/// Two answers on x86_64, one everywhere else: `elf_check_arch` for the
+/// native class, and `compat_elf_check_arch` for the 32-bit one. The pair has
+/// to be judged together -- an `ELFCLASS32` file claiming `EM_X86_64`, or an
+/// `ELFCLASS64` one claiming `EM_386`, is neither, and each would send the
+/// loader to read a header of the wrong shape.
+fn runnable_here(class: u8, machine: u16) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if class == ELFCLASS32 && machine == EM_I386 {
+        return true;
+    }
+    class == ELFCLASS64 && machine == EM_HOST
+}
+
 /// `e_type` of an image `execve` will start: a fixed-address executable or a
 /// position-independent one.
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const PT_INTERP: u32 = 3;
-/// `EI_CLASS` = 64-bit and `EI_DATA` = little-endian, the only kind of image
-/// this loader reads (see [`check_elf_bounds`]).
+/// Where `EI_CLASS` sits in the identification bytes, and the two values this
+/// loader reads, with the `EI_DATA` that goes with both: little-endian (see
+/// [`check_elf_bounds`]).
+const EI_CLASS: usize = 4;
+const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 
@@ -66,6 +89,11 @@ const ELFDATA2LSB: u8 = 1;
 const EHDR_SIZE: usize = 64;
 const PHDR_SIZE: usize = 56;
 const SHDR_SIZE: u64 = 64;
+
+/// The same three for an ELF32 image.
+const EHDR_SIZE_32: usize = 52;
+const PHDR_SIZE_32: usize = 32;
+const SHDR_SIZE_32: u64 = 40;
 
 /// The largest program header table `load_elf_phdrs` reads, in bytes:
 /// `ELF_MIN_ALIGN`, one page. Seventy-three entries.
@@ -75,9 +103,15 @@ const MAX_PHDR_TABLE: usize = 4096;
 /// `PATH_MAX`.
 const MAX_INTERP_PATH: u64 = 4096;
 
-/// The fields of an ELF64 header the preflight reads.
+/// The fields of an ELF header the preflight reads, whatever its class.
+///
+/// `class` is kept because every later read -- the size of one program
+/// header, where `p_offset` and `p_filesz` sit inside one -- depends on it,
+/// and because it is half of what says whether this kernel runs the image at
+/// all (see [`runnable_here`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Header {
+    class: u8,
     kind: u16,
     machine: u16,
     ph_offset: u64,
@@ -86,6 +120,42 @@ struct Header {
     ph_count: u16,
     sh_entry_size: u16,
     sh_count: u16,
+}
+
+impl Header {
+    /// Size of one program header of this image's class.
+    fn phdr_size(&self) -> usize {
+        if self.class == ELFCLASS32 {
+            PHDR_SIZE_32
+        } else {
+            PHDR_SIZE
+        }
+    }
+
+    /// Smallest `e_shentsize` this image's class can have.
+    fn shdr_size(&self) -> u64 {
+        if self.class == ELFCLASS32 {
+            SHDR_SIZE_32
+        } else {
+            SHDR_SIZE
+        }
+    }
+
+    /// `p_offset` and `p_filesz` of the program header `ph`, whose length is
+    /// this image's [`Self::phdr_size`].
+    ///
+    /// The two classes agree on `p_type` at offset 0 and on nothing else: an
+    /// ELF32 header puts `p_offset` at 4 and `p_filesz` at 16, both four bytes
+    /// wide, where an ELF64 one puts them at 8 and 32, eight bytes wide.
+    /// Reading an ELF32 table with the 64-bit offsets is how a well-formed
+    /// i386 binary looks like a corrupt one.
+    fn segment_extent(&self, ph: &[u8]) -> (u64, u64) {
+        if self.class == ELFCLASS32 {
+            (u64::from(u32_at(ph, 4)), u64::from(u32_at(ph, 16)))
+        } else {
+            (u64_at(ph, 8), u64_at(ph, 32))
+        }
+    }
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> u16 {
@@ -105,23 +175,47 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
 }
 
 /// The header at the start of `head`, if `head` starts with one this loader
-/// can read at all: the magic, a whole header, 64-bit, little-endian.
+/// can read at all: the magic, a class it knows, little-endian, and a whole
+/// header of that class.
+///
+/// The two classes share their first eighteen bytes -- magic, `EI_CLASS`,
+/// `EI_DATA`, `e_type`, `e_machine` -- and then part company: every offset
+/// after that is four bytes earlier in an ELF32 header, and the offset fields
+/// are four bytes wide instead of eight. Nothing here judges *which* class the
+/// kernel runs; that is [`runnable_here`], asked together with `e_machine`.
 fn elf_header(head: &[u8]) -> Option<Header> {
-    if head.len() < EHDR_SIZE || head[..4] != *b"\x7fELF" {
+    if head.len() < 6 || head[..4] != *b"\x7fELF" {
         return None;
     }
-    if head[4] != ELFCLASS64 || head[5] != ELFDATA2LSB {
+    if head[5] != ELFDATA2LSB {
         return None;
     }
+    let class = head[EI_CLASS];
+    let (header_size, ph_offset_at, ph_entry_size_at, offset_width) = match class {
+        ELFCLASS32 => (EHDR_SIZE_32, 28, 42, 4),
+        ELFCLASS64 => (EHDR_SIZE, 32, 54, 8),
+        _ => return None,
+    };
+    if head.len() < header_size {
+        return None;
+    }
+    let offset_at = |at: usize| -> u64 {
+        if offset_width == 4 {
+            u64::from(u32_at(head, at))
+        } else {
+            u64_at(head, at)
+        }
+    };
     Some(Header {
+        class,
         kind: u16_at(head, 16),
         machine: u16_at(head, 18),
-        ph_offset: u64_at(head, 32),
-        sh_offset: u64_at(head, 40),
-        ph_entry_size: u16_at(head, 54),
-        ph_count: u16_at(head, 56),
-        sh_entry_size: u16_at(head, 58),
-        sh_count: u16_at(head, 60),
+        ph_offset: offset_at(ph_offset_at),
+        sh_offset: offset_at(ph_offset_at + offset_width),
+        ph_entry_size: u16_at(head, ph_entry_size_at),
+        ph_count: u16_at(head, ph_entry_size_at + 2),
+        sh_entry_size: u16_at(head, ph_entry_size_at + 4),
+        sh_count: u16_at(head, ph_entry_size_at + 6),
     })
 }
 
@@ -171,14 +265,15 @@ fn opened_for_exec(file: &Arc<dyn INode>, creds: &Credentials) -> LxResult<()> {
 ///
 /// `bad` is the errno for every way it is not one: `ENOEXEC` for the image,
 /// `ELIBBAD` for its interpreter -- the split `load_elf_binary` makes.
-fn image_phdrs(file: &Arc<dyn INode>, head: &[u8], bad: LxError) -> LxResult<Vec<u8>> {
+fn image_phdrs(file: &Arc<dyn INode>, head: &[u8], bad: LxError) -> LxResult<(Header, Vec<u8>)> {
     let header = elf_header(head).ok_or(bad)?;
-    if !matches!(header.kind, ET_EXEC | ET_DYN) || header.machine != EM_HOST {
+    if !matches!(header.kind, ET_EXEC | ET_DYN) || !runnable_here(header.class, header.machine) {
         return Err(bad);
     }
     // `load_elf_phdrs`.
-    let table = usize::from(header.ph_count) * PHDR_SIZE;
-    if usize::from(header.ph_entry_size) != PHDR_SIZE || table == 0 || table > MAX_PHDR_TABLE {
+    let phdr_size = header.phdr_size();
+    let table = usize::from(header.ph_count) * phdr_size;
+    if usize::from(header.ph_entry_size) != phdr_size || table == 0 || table > MAX_PHDR_TABLE {
         return Err(bad);
     }
     // Measured before it is read: an offset the file chose is not an offset
@@ -189,7 +284,7 @@ fn image_phdrs(file: &Arc<dyn INode>, head: &[u8], bad: LxError) -> LxResult<Vec
     }
     // What `check_elf_bounds` will refuse on the other side of the line.
     if header.sh_count != 0
-        && (u64::from(header.sh_entry_size) < SHDR_SIZE
+        && (u64::from(header.sh_entry_size) < header.shdr_size()
             || !fits(
                 header.sh_offset,
                 u64::from(header.sh_count) * u64::from(header.sh_entry_size),
@@ -202,12 +297,13 @@ fn image_phdrs(file: &Arc<dyn INode>, head: &[u8], bad: LxError) -> LxResult<Vec
     if read_full(file, header.ph_offset as usize, &mut phdrs)? != table {
         return Err(bad);
     }
-    for ph in phdrs.as_chunks::<PHDR_SIZE>().0 {
-        if !fits(u64_at(ph, 8), u64_at(ph, 32), size) {
+    for ph in phdrs.chunks_exact(phdr_size) {
+        let (offset, filesz) = header.segment_extent(ph);
+        if !fits(offset, filesz, size) {
             return Err(bad);
         }
     }
-    Ok(phdrs)
+    Ok((header, phdrs))
 }
 
 impl LinuxElfLoader {
@@ -234,8 +330,8 @@ impl LinuxElfLoader {
             let n = read_full(&file, 0, &mut buf)?;
             let head = &buf[..n];
             if !head.starts_with(b"#!") {
-                let phdrs = image_phdrs(&file, head, LxError::ENOEXEC)?;
-                return self.preflight_pt_interp(&file, &phdrs, creds);
+                let (header, phdrs) = image_phdrs(&file, head, LxError::ENOEXEC)?;
+                return self.preflight_pt_interp(&file, &header, &phdrs, creds);
             }
             // `load_script`: "No interpreter name found".
             let interp = shebang_interp(head).ok_or(LxError::ENOEXEC)?;
@@ -254,20 +350,21 @@ impl LinuxElfLoader {
     fn preflight_pt_interp(
         &self,
         image: &Arc<dyn INode>,
+        header: &Header,
         phdrs: &[u8],
         creds: &Credentials,
     ) -> LxResult<()> {
-        // The first `PT_INTERP`, as `get_interpreter` finds it.
+        // The first `PT_INTERP`, as `get_interpreter` finds it. `p_type` is at
+        // offset 0 in both classes; the extent is not, which is what `header`
+        // is for.
         let ph = match phdrs
-            .as_chunks::<PHDR_SIZE>()
-            .0
-            .iter()
-            .find(|ph| u32_at(&ph[..], 0) == PT_INTERP)
+            .chunks_exact(header.phdr_size())
+            .find(|ph| u32_at(ph, 0) == PT_INTERP)
         {
             Some(ph) => ph,
             None => return Ok(()),
         };
-        let (offset, len) = (u64_at(ph, 8), u64_at(ph, 32));
+        let (offset, len) = header.segment_extent(ph);
         if !(2..=MAX_INTERP_PATH).contains(&len) {
             return Err(LxError::ENOEXEC);
         }
@@ -291,10 +388,20 @@ impl LinuxElfLoader {
         })?;
         opened_for_exec(&file, creds)?;
         let mut head = [0u8; EHDR_SIZE];
-        if read_full(&file, 0, &mut head)? != EHDR_SIZE {
+        let read = read_full(&file, 0, &mut head)?;
+        // `elf_read`: a short read is `EIO`. How much is short depends on the
+        // class the file claims -- 52 bytes of header for an ELF32 image, 64
+        // for an ELF64 one -- and a file too small to say which is short
+        // either way.
+        let want = if read > EI_CLASS && head[EI_CLASS] == ELFCLASS32 {
+            EHDR_SIZE_32
+        } else {
+            EHDR_SIZE
+        };
+        if read < want {
             return Err(LxError::EIO);
         }
-        image_phdrs(&file, &head, LxError::ELIBBAD)?;
+        image_phdrs(&file, &head[..read], LxError::ELIBBAD)?;
         Ok(())
     }
 }
