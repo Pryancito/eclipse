@@ -19,6 +19,30 @@ pub struct ProcInitInfo {
 impl ProcInitInfo {
     /// push process init information into stack
     pub fn push_at(&self, stack_top: usize) -> Stack {
+        self.push_at_width(stack_top, 8)
+    }
+
+    /// The same initial stack for a 32-bit (i386) process: every word of
+    /// `argc`, `argv`, `envp` and the auxiliary vector is **four** bytes
+    /// wide, not eight.
+    ///
+    /// Nothing else about the layout changes. Linux builds a compat process's
+    /// stack with the same `create_elf_tables`, and the only thing
+    /// `CONFIG_COMPAT` does to it is make `elf_addr_t` a `u32`: the strings,
+    /// the `AT_RANDOM` canary, the order of the lists and the 16-byte
+    /// alignment of the final stack pointer are all the same.
+    ///
+    /// Every address this writes has already been placed below 4 GiB by the
+    /// loader, so the truncation to `u32` is a narrowing of the word and not
+    /// of the value. The debug assertion in [`Stack::push_u32_slice`] is
+    /// there to say so out loud if that ever stops being true.
+    pub fn push_at_32(&self, stack_top: usize) -> Stack {
+        self.push_at_width(stack_top, 4)
+    }
+
+    /// [`Self::push_at`] and [`Self::push_at_32`]: `word` is the width of one
+    /// word of the pointer table, in bytes.
+    fn push_at_width(&self, stack_top: usize, word: usize) -> Stack {
         // We will build the stack from top to bottom.
         // The strings and random bytes go first (highest addresses).
         //
@@ -138,16 +162,24 @@ impl ProcInitInfo {
         // final_sp = sp - table.len() * 8.
         // We want final_sp % 16 == 0.
         let mut sp = writer.sp;
-        sp &= !0x7; // Ensure 8-byte alignment first
-        let table_size = table.len() * 8;
-        if !(sp - table_size).is_multiple_of(16) {
-            sp -= 8; // Add 8 bytes of padding
+        sp &= !(word - 1); // Ensure word alignment first
+        let table_size = table.len() * word;
+        // Pad up to the 16-byte alignment the psABI promises at `_start`,
+        // which takes up to three words of padding once a word is four bytes
+        // wide rather than eight.
+        while !(sp - table_size).is_multiple_of(16) {
+            sp -= word;
         }
         writer.sp = sp;
 
-        // Push the table. Since push_usize_slice decrements sp first and then
-        // copies the slice, table[0] (argc) will end up at the lowest address (the new sp).
-        writer.push_usize_slice(&table);
+        // Push the table. Since the push decrements sp first and then copies
+        // the slice, table[0] (argc) will end up at the lowest address (the
+        // new sp).
+        if word == 4 {
+            writer.push_u32_slice(&table);
+        } else {
+            writer.push_usize_slice(&table);
+        }
         writer.auxv = table.split_off(auxv_at);
 
         writer
@@ -259,6 +291,24 @@ impl Stack {
 
     fn push_usize_slice(&mut self, vs: &[usize]) {
         self.push_slice_aligned(vs, align_of::<usize>());
+    }
+
+    /// The same table as [`Self::push_usize_slice`], as the 4-byte words a
+    /// 32-bit process reads: see [`ProcInitInfo::push_at_32`].
+    fn push_u32_slice(&mut self, vs: &[usize]) {
+        let words: Vec<u32> = vs
+            .iter()
+            .map(|&v| {
+                debug_assert!(
+                    v <= u32::MAX as usize,
+                    "a 32-bit process's initial stack cannot carry {:#x}: \
+                     the loader must place every address below 4 GiB",
+                    v
+                );
+                v as u32
+            })
+            .collect();
+        self.push_slice_aligned(&words, align_of::<u32>());
     }
 
     /// push str into stack

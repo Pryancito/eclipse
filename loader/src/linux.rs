@@ -335,8 +335,21 @@ fn spawn(
         let _ = abi;
         (sp, 0)
     };
+    // `start_with` rather than `start_with_entry`, so an `ELFCLASS32` image's
+    // first thread is marked for compatibility mode in the same breath as its
+    // entry point. A thread cloned or forked from it inherits the flag with
+    // the rest of its context; an `execve` sets it again from the new image.
+    #[cfg(target_arch = "x86_64")]
+    let compat32 = abi.is_32bit();
     thread
-        .start_with_entry(entry, start_sp, arg1, 0, thread_fn)
+        .start_with(
+            |ctx| {
+                ctx.setup_uspace(entry, start_sp, &[arg1, 0, 0]);
+                #[cfg(target_arch = "x86_64")]
+                ctx.set_compat32(compat32);
+            },
+            thread_fn,
+        )
         .expect("failed to start main thread");
 
     // Mount the non-root /etc/fstab entries (/boot/efi vfat, /home, …) as a
@@ -1403,6 +1416,19 @@ async fn handle_user_trap(
             })?;
             return Ok(None);
         }
+        // A 32-bit process speaks the i386 numbering, which is a different
+        // table and not an offset: its `write` is 4, and 4 natively is `stat`.
+        #[cfg(target_arch = "x86_64")]
+        if thread.proc().linux().abi().is_32bit() {
+            let ret = run_with_irq_enable! {
+                syscall.compat32_syscall(num as u32, args).await as usize
+            };
+            thread.with_context(|ctx| ctx.set_field(UserContextField::ReturnValue, ret))?;
+            // No restart bookkeeping yet: a 32-bit process has no signal
+            // frames to be interrupted into (see `linux_syscall::compat32`),
+            // so there is nothing a restart could restart from.
+            return Ok(None);
+        }
         trace!("Syscall: {} {:x?}", num as u32, args);
         let ret = run_with_irq_enable! {
             syscall.syscall(num as u32, args).await as usize
@@ -1685,6 +1711,12 @@ fn syscall_num(ctx: &UserContext) -> usize {
     let regs = ctx.general();
     cfg_if! {
         if #[cfg(target_arch = "x86_64")] {
+            // A 32-bit thread put its number in `eax`, not `rax`: the upper
+            // half of the register is whatever the kernel last left there, and
+            // `int $0x80` does not clear it.
+            if ctx.is_compat32() {
+                return regs.rax & 0xffff_ffff;
+            }
             regs.rax
         } else if #[cfg(target_arch = "aarch64")] {
             regs.x8
@@ -1826,6 +1858,25 @@ fn syscall_args(ctx: &UserContext) -> [usize; 6] {
     let regs = ctx.general();
     cfg_if! {
         if #[cfg(target_arch = "x86_64")] {
+            // i386 passes its six arguments in `ebx ecx edx esi edi ebp`,
+            // where x86_64 uses `rdi rsi rdx r10 r8 r9`: different registers
+            // AND a different order, so neither half of the question can be
+            // skipped. Each is taken as the 32 bits the program wrote, zero
+            // extended -- every address it can name is below 4 GiB, and a
+            // signed argument is the business of the one call that has one
+            // (`lseek`, which is why that call is not mapped at all; see
+            // `linux_syscall::compat32`).
+            if ctx.is_compat32() {
+                const LOW32: usize = 0xffff_ffff;
+                return [
+                    regs.rbx & LOW32,
+                    regs.rcx & LOW32,
+                    regs.rdx & LOW32,
+                    regs.rsi & LOW32,
+                    regs.rdi & LOW32,
+                    regs.rbp & LOW32,
+                ];
+            }
             [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9]
         } else if #[cfg(target_arch = "aarch64")] {
             [regs.x0, regs.x1, regs.x2, regs.x3, regs.x4, regs.x5]

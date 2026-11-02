@@ -378,6 +378,12 @@ pub fn mem_routine_operands(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The IDT vector a 32-bit program calls the kernel through:
+/// `IA32_SYSCALL_VECTOR`. Reachable from ring 3 because `idt::init` gives this
+/// one entry DPL 3, as Linux's `SYSG(IA32_SYSCALL_VECTOR, ..)` does.
+#[cfg(target_arch = "x86_64")]
+pub const X86_INT80_VECTOR: usize = 0x80;
+
 impl TrapReason {
     /// Decode an x86 trap from the vector and error code the trap frame
     /// carries.
@@ -754,6 +760,32 @@ impl UserContext {
         }
     }
 
+    /// Send this thread back to user mode in **32-bit compatibility mode**
+    /// (i386) rather than 64-bit mode, or stop doing so.
+    ///
+    /// This is Linux's `CONFIG_COMPAT`: the thread keeps running on the same
+    /// 64-bit kernel, under the same page tables, but ring 3 executes with a
+    /// code segment whose descriptor has `L=0`, so the CPU decodes 32-bit
+    /// instructions, truncates addresses to 32 bits and reaches the kernel
+    /// through `int $0x80` instead of `syscall`.
+    ///
+    /// Set once, by the loader, for a thread whose image is an ELF32. There is
+    /// no half-way state: everything that reads a register out of this context
+    /// -- the syscall number and its arguments, a signal frame, `ptrace` --
+    /// has to ask [`Self::is_compat32`] first, because the width of what the
+    /// thread wrote there is not visible in the register itself.
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_compat32(&mut self, compat: bool) {
+        self.0.compat32 = usize::from(compat);
+    }
+
+    /// Whether this thread runs in 32-bit compatibility mode: see
+    /// [`Self::set_compat32`].
+    #[cfg(target_arch = "x86_64")]
+    pub fn is_compat32(&self) -> bool {
+        self.0.compat32 != 0
+    }
+
     /// Setup return addr
     pub fn set_ra(&mut self, _ra: usize) {
         cfg_if! {
@@ -977,6 +1009,15 @@ impl UserContext {
     pub fn trap_reason(&self) -> TrapReason {
         cfg_if! {
             if #[cfg(target_arch = "x86_64")] {
+                // A 32-bit thread reaches the kernel through the `int $0x80`
+                // gate, so for it vector 0x80 is a system call and not the
+                // software interrupt it would be for anyone else. Decided here
+                // rather than in [`TrapReason::from_x86`], which is handed two
+                // numbers out of a frame and has no thread to ask -- and it is
+                // the thread's mode, not the vector, that settles it.
+                if self.0.compat32 != 0 && self.0.trap_num == X86_INT80_VECTOR {
+                    return TrapReason::Syscall;
+                }
                 TrapReason::from(self.0.trap_num, self.0.error_code)
             } else if #[cfg(target_arch = "aarch64")] {
                 TrapReason::from(self.0.trap_num)

@@ -301,6 +301,7 @@ impl LinuxRootfs {
     /// no las construimos nosotros.
     fn check_elf_machines(&self, root: &Path) -> Vec<Problem> {
         let want = expected_machine(self.0);
+        let deliberadamente_de_32 = root.join("bin").join("i386-hello");
         let mut out = Vec::new();
         let mut checked = 0usize;
         let mut stack = vec![root.to_path_buf()];
@@ -338,6 +339,16 @@ impl LinuxRootfs {
                 match entry.file_type() {
                     Ok(t) if t.is_dir() => stack.push(path),
                     Ok(t) if t.is_file() => {
+                        // `bin/i386-hello` es un ELF de i386 A PROPOSITO: es la
+                        // unica prueba de que el nucleo ejecuta un binario de 32
+                        // bits, y no puede estar construida para la maquina del
+                        // anfitrion sin dejar de probar nada. Se exime POR RUTA
+                        // y no por maquina: eximir «todo lo que sea i386» dejaria
+                        // pasar el fallo que esta comprobacion existe para cazar,
+                        // un binario enlazado con el toolchain equivocado.
+                        if path == deliberadamente_de_32 {
+                            continue;
+                        }
                         if let Some(machine) = elf_machine(&path) {
                             checked += 1;
                             if machine != want {

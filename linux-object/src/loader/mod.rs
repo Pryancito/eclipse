@@ -40,6 +40,35 @@ fn header_osabi_is_freebsd(data: &[u8]) -> bool {
     data.get(EI_OSABI) == Some(&ELFOSABI_FREEBSD)
 }
 
+/// `e_ident[EI_CLASS]`, and the value that means a 32-bit image.
+const EI_CLASS: usize = 4;
+const ELFCLASS32: u8 = 1;
+
+/// `e_machine`, a `u16` at a fixed offset in every class of ELF header, and
+/// the value i386 stamps there (`EM_386`).
+#[cfg(target_arch = "x86_64")]
+const E_MACHINE: usize = 18;
+#[cfg(target_arch = "x86_64")]
+const EM_386: u16 = 3;
+
+/// Whether the identification bytes say i386: a 32-bit image for this
+/// machine's own 32-bit mode, which runs in compatibility mode as
+/// [`Abi::Linux32`].
+///
+/// Read straight out of the file rather than through the parser because these
+/// two fields are at the same offsets in both classes of header, while every
+/// accessor that would reach them is class-dependent. `data` is whatever file
+/// `execve` was handed and can be shorter than the header, so each field is
+/// `get`-ed: indexing it would panic the kernel from an unprivileged process.
+#[cfg(target_arch = "x86_64")]
+fn header_is_i386(data: &[u8]) -> bool {
+    let machine = match data.get(E_MACHINE..E_MACHINE + 2) {
+        Some(bytes) => u16::from_le_bytes([bytes[0], bytes[1]]),
+        None => return false,
+    };
+    data.get(EI_CLASS) == Some(&ELFCLASS32) && machine == EM_386
+}
+
 /// Whether one `PT_NOTE` segment's bytes carry the FreeBSD vendor name.
 #[cfg(target_arch = "x86_64")]
 fn segment_names_freebsd(seg: &[u8]) -> bool {
@@ -99,6 +128,15 @@ fn allocate_image_vmar(
 fn detect_abi(data: &[u8], _elf: &ElfFile) -> Abi {
     #[cfg(target_arch = "x86_64")]
     {
+        // An `ELFCLASS32` / `EM_386` image is a 32-bit program, and that
+        // outranks every other signal: it decides how the CPU decodes its
+        // instructions, not merely which system calls it expects.
+        // `parse_checked_elf` has already established that the header is whole
+        // and of a class this parser knows, so `EI_CLASS` and `e_machine` are
+        // both there to read.
+        if header_is_i386(data) {
+            return Abi::Linux32;
+        }
         if header_osabi_is_freebsd(data) {
             return Abi::Freebsd;
         }
@@ -160,12 +198,12 @@ fn shebang_interp(data: &[u8]) -> Option<&str> {
 /// round to a small address, and the process was started on whatever happened
 /// to be mapped there instead of being rejected. Linux rejects the same
 /// binaries, `BAD_ADDR(elf_entry)` in `load_elf_binary`.
-fn entry_address(base: usize, entry_point: u64) -> LxResult<usize> {
+fn entry_address(base: usize, entry_point: u64, abi: Abi) -> LxResult<usize> {
     let entry = usize::try_from(entry_point)
         .ok()
         .and_then(|entry| base.checked_add(entry))
         .ok_or(ZxError::INVALID_ARGS)?;
-    if entry >= STACK_TOP {
+    if entry >= task_top_for(abi) {
         warn!(
             "elf: entry point {:#x} is outside the user address space",
             entry
@@ -179,6 +217,32 @@ fn entry_address(base: usize, entry_point: u64) -> LxResult<usize> {
 /// that the heap (at `initial_brk` just after the loaded image) never collides
 /// with the stack.  Linux uses a similar high-address default for the stack.
 const STACK_TOP: usize = USER_ASPACE_BASE as usize + USER_ASPACE_SIZE as usize;
+
+/// `TASK_SIZE` of a 32-bit process: the highest address an i386 program can
+/// name at all.
+///
+/// Linux's compat `TASK_SIZE` is `IA32_PAGE_OFFSET - PAGE_SIZE`
+/// (`arch/x86/include/asm/page_32_types.h` through `TASK_SIZE_MAX`), which is
+/// 4 GiB less one page. The last page is left out so that a mapping running
+/// to the very top of the space cannot be addressed by a pointer that wraps:
+/// `addr + len` stays a 32-bit number the program can compute.
+///
+/// Everything the loader places for such a process -- the image, its stack,
+/// the break -- goes below this, and the pointer table on its initial stack is
+/// four bytes per word, so an address above it could not be written down.
+#[cfg(target_arch = "x86_64")]
+pub const TASK_SIZE_32: usize = 0xffff_e000;
+
+/// The top of the address space a process of `abi` may use: [`STACK_TOP`] for
+/// a 64-bit one, [`TASK_SIZE_32`] for a 32-bit one.
+pub fn task_top_for(abi: Abi) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if abi.is_32bit() {
+        return TASK_SIZE_32;
+    }
+    let _ = abi;
+    STACK_TOP
+}
 
 /// `RLIMIT_STACK` has to report the size the loader actually maps.
 ///
@@ -201,8 +265,8 @@ const _: () = assert!(
 /// aspace-separate/libos builds -- so the heap, which grows up from
 /// `initial_brk`, never collides with it. `pages` is [`USER_STACK_PAGES`] for
 /// every caller in this tree.
-fn stack_placement(vmar_end: usize, pages: usize) -> (usize, usize) {
-    let top = vmar_end.min(STACK_TOP);
+fn stack_placement(vmar_end: usize, pages: usize, abi: Abi) -> (usize, usize) {
+    let top = vmar_end.min(task_top_for(abi));
     (top - pages * PAGE_SIZE, top)
 }
 
@@ -240,7 +304,19 @@ fn stack_placement(vmar_end: usize, pages: usize) -> (usize, usize) {
 /// program still gets its memory, but the line is an `ERROR` and the harness
 /// fails any case whose log contains one.
 pub fn heap_base(vmar: &VmAddressRegion) -> usize {
-    let len = vmar.end_addr() - vmar.addr();
+    heap_base_for(vmar, Abi::Linux)
+}
+
+/// [`heap_base`] for a process of `abi`.
+///
+/// A 32-bit process's whole address space is [`TASK_SIZE_32`], so a quarter of
+/// the way up is 1 GiB rather than 32 TiB -- which is both the same rule and
+/// the only answer that is an address at all for such a process. Its `brk`
+/// return value is four bytes wide, so a heap above 4 GiB would come back
+/// truncated and malloc would hand out pointers into the middle of the image.
+pub fn heap_base_for(vmar: &VmAddressRegion, abi: Abi) -> usize {
+    let top = vmar.end_addr().min(task_top_for(abi));
+    let len = top - vmar.addr();
     vmar.addr() + len.next_power_of_two() / 4
 }
 
@@ -427,7 +503,18 @@ impl LinuxElfLoader {
         // Limit scan to the first 512 bytes to match typical OS shebang length restrictions.
         if data.starts_with(b"\x7fELF") {
             debug!("elf: detected ELF for {:?}", path);
-            if data.len() < 64 {
+            // An ELF header is 64 bytes for a 64-bit image and 52 for a
+            // 32-bit one, and `EI_CLASS` -- the fifth byte -- says which.
+            // Demanding 64 of both refused every i386 image small enough to
+            // have nothing after its header. `parse_checked_elf` checks the
+            // same thing properly, per class, a few lines down; this is the
+            // early, cheap half of it and must not be stricter.
+            let header_size = if data.get(EI_CLASS) == Some(&ELFCLASS32) {
+                52
+            } else {
+                64
+            };
+            if data.len() < header_size {
                 error!("elf: truncated header for {:?}", path);
                 return Err(ZxError::INVALID_ARGS.into());
             }
@@ -535,7 +622,7 @@ impl LinuxElfLoader {
                 error!("elf: load app from elf failed: {:?}", e);
             })?;
             layout::name_segments(vmar, &elf, app_base, &path);
-            let app_entry = entry_address(app_base, elf.header.pt2.entry_point())?;
+            let app_entry = entry_address(app_base, elf.header.pt2.entry_point(), abi)?;
 
             // Patch any in-binary syscall-entry trampoline present in the main program.
             // Write through the VMAR (which resolves the per-segment VMO): the symbol
@@ -610,7 +697,8 @@ impl LinuxElfLoader {
                     error!("elf: load interp {:?} from elf failed: {:?}", interp, e);
                 })?;
             layout::name_segments(vmar, &interp_elf, interp_base, interp);
-            let interp_entry = entry_address(interp_base, interp_elf.header.pt2.entry_point())?;
+            let interp_entry =
+                entry_address(interp_base, interp_elf.header.pt2.entry_point(), abi)?;
 
             match interp_elf.relocate(interp_vmar.clone(), vmar) {
                 Ok(()) => info!("interp relocate passed!"),
@@ -654,7 +742,7 @@ impl LinuxElfLoader {
 
             let stack_vmo = VmObject::new_paged(self.stack_pages);
             let stack_flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
-            let (stack_bottom, stack_top) = stack_placement(vmar.end_addr(), self.stack_pages);
+            let (stack_bottom, stack_top) = stack_placement(vmar.end_addr(), self.stack_pages, abi);
             // map_range=false: don't commit the stack eagerly on every exec —
             // the argv/env/auxv tail is committed by the `stack_vmo.write`
             // below and the rest demand-zeroes on first touch like any anon
@@ -740,7 +828,11 @@ impl LinuxElfLoader {
                     map
                 },
             };
-            let init_stack = info.push_at(sp);
+            let init_stack = if abi.is_32bit() {
+                info.push_at_32(sp)
+            } else {
+                info.push_at(sp)
+            };
             stack_vmo.write(self.stack_pages * PAGE_SIZE - init_stack.len(), &init_stack)?;
             sp -= init_stack.len();
 
@@ -752,7 +844,7 @@ impl LinuxElfLoader {
             // the FreeBSD dynamic linker (`/libexec/ld-elf.so.1`), which this
             // tree does not ship — so in practice only *static* FreeBSD binaries
             // (handled in the no-interpreter path below) get a FreeBSD stack.
-            let initial_brk = heap_base(vmar);
+            let initial_brk = heap_base_for(vmar, abi);
             let layout = ImageLayout::of_elf(&elf, app_base, initial_brk, sp);
             return Ok((
                 interp_entry,
@@ -780,7 +872,7 @@ impl LinuxElfLoader {
             error!("elf: load_from_elf failed: {:?}", e);
         })?;
         layout::name_segments(vmar, &elf, base, &path);
-        let entry = entry_address(base, elf.header.pt2.entry_point())?;
+        let entry = entry_address(base, elf.header.pt2.entry_point(), abi)?;
 
         debug!(
             "load: vmar.addr & size: {:#x?}, base: {:#x?}, entry: {:#x?}",
@@ -814,7 +906,7 @@ impl LinuxElfLoader {
 
         let stack_vmo = VmObject::new_paged(self.stack_pages);
         let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
-        let (stack_bottom, stack_top) = stack_placement(vmar.end_addr(), self.stack_pages);
+        let (stack_bottom, stack_top) = stack_placement(vmar.end_addr(), self.stack_pages, abi);
         // map_range=false: lazy stack, same rationale as the interpreter path
         // above — the init_stack tail is committed by `stack_vmo.write` below,
         // everything else demand-zeroes on first touch.
@@ -908,6 +1000,8 @@ impl LinuxElfLoader {
                 };
                 info.push_at_freebsd(sp, &fbsd)
             }
+            // A 32-bit program reads the same table in 4-byte words.
+            _ if abi.is_32bit() => info.push_at_32(sp),
             _ => info.push_at(sp),
         };
         stack_vmo.write(self.stack_pages * PAGE_SIZE - init_stack.len(), &init_stack)?;
@@ -921,7 +1015,7 @@ impl LinuxElfLoader {
         // Initial brk: the same dedicated heap base as the dynamic case. A
         // static binary has no interpreter mapping its own libraries, but it
         // still mmaps, and the collision is the same one.
-        let initial_brk = heap_base(vmar);
+        let initial_brk = heap_base_for(vmar, abi);
         let layout = ImageLayout::of_elf(&elf, base, initial_brk, sp);
         Ok((
             entry,
@@ -1798,14 +1892,17 @@ mod elf_bounds_tests {
     /// whatever happened to be mapped there.
     #[test]
     fn an_entry_point_that_does_not_fit_is_rejected() {
-        assert_eq!(entry_address(0x40_0000, 0x1000), Ok(0x40_1000));
-        assert_eq!(entry_address(0, 0), Ok(0));
+        assert_eq!(entry_address(0x40_0000, 0x1000, Abi::Linux), Ok(0x40_1000));
+        assert_eq!(entry_address(0, 0, Abi::Linux), Ok(0));
 
-        assert!(entry_address(0x40_0000, u64::MAX).is_err());
-        assert!(entry_address(usize::MAX, 1).is_err());
+        assert!(entry_address(0x40_0000, u64::MAX, Abi::Linux).is_err());
+        assert!(entry_address(usize::MAX, 1, Abi::Linux).is_err());
         // In range as a number, outside the user address space.
-        assert!(entry_address(0, STACK_TOP as u64).is_err());
-        assert_eq!(entry_address(0, STACK_TOP as u64 - 1), Ok(STACK_TOP - 1));
+        assert!(entry_address(0, STACK_TOP as u64, Abi::Linux).is_err());
+        assert_eq!(
+            entry_address(0, STACK_TOP as u64 - 1, Abi::Linux),
+            Ok(STACK_TOP - 1)
+        );
     }
 
     /// `sh_type` values this tree's loader meets.
@@ -2602,7 +2699,7 @@ mod stack_tests {
     /// same fact as a test so a reader of the loader meets it here too.
     #[test]
     fn the_stack_is_as_big_as_rlimit_stack_promises() {
-        let (bottom, top) = stack_placement(STACK_TOP, USER_STACK_PAGES);
+        let (bottom, top) = stack_placement(STACK_TOP, USER_STACK_PAGES, Abi::Linux);
         assert_eq!(top, STACK_TOP);
         assert_eq!(top - bottom, USER_STACK_SIZE as usize);
     }
@@ -2615,7 +2712,7 @@ mod stack_tests {
     fn halloys_vulkan_frame_fits_in_the_stack() {
         let deepest = STACK_TOP - HALLOY_LIVE - HALLOY_FRAME;
 
-        let (bottom, top) = stack_placement(STACK_TOP, USER_STACK_PAGES);
+        let (bottom, top) = stack_placement(STACK_TOP, USER_STACK_PAGES, Abi::Linux);
         assert!(
             (bottom..top).contains(&deepest),
             "the frame reaches {:#x}, below a stack that starts at {:#x}",
@@ -2624,7 +2721,7 @@ mod stack_tests {
         );
 
         // And the regression it is: 544 KiB of stack over a 512 KiB mapping.
-        let (old_bottom, _) = stack_placement(STACK_TOP, 128);
+        let (old_bottom, _) = stack_placement(STACK_TOP, 128, Abi::Linux);
         assert!(
             deepest < old_bottom,
             "this is the crash being reproduced: it must not fit in 128 pages"
@@ -2645,7 +2742,7 @@ mod stack_tests {
     #[test]
     fn a_smaller_window_puts_the_stack_at_its_own_top() {
         let window_end = STACK_TOP - 0x1_0000_0000;
-        let (bottom, top) = stack_placement(window_end, USER_STACK_PAGES);
+        let (bottom, top) = stack_placement(window_end, USER_STACK_PAGES, Abi::Linux);
         assert_eq!(top, window_end);
         assert_eq!(top - bottom, USER_STACK_SIZE as usize);
     }

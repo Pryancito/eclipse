@@ -1,0 +1,165 @@
+// The i386 system calls whose ABI is byte-for-byte the native one, so the
+// native handler is the right handler with nothing but the number translated.
+//
+// This is the allowlist half of Linux's `ia32_sys_call_table`: there, each
+// entry is either the plain `sys_*` -- these -- or a `compat_sys_*` wrapper
+// that converts something. The list is the allowlist and not a list of
+// exceptions **on purpose**. Matching the two tables by name alone over-maps
+// badly: `gettimeofday` is called `gettimeofday` in both and passes a `struct
+// timeval` that is 8 bytes on i386 and 16 natively, and reading 16 bytes of a
+// 32-bit program's 8-byte struct is not an error anything reports. Default-deny
+// means an unconverted call answers `ENOSYS` with its name instead.
+//
+// A name belongs here only when every argument is one of:
+//   - a scalar that fits in 32 bits and is never negative (a file descriptor,
+//     a flag word, a length, a mode, a signal number, a pid);
+//   - a pointer, which the loader has placed below 4 GiB;
+//   - a `char *` path, or a byte buffer with a separate length;
+//   - a pointer to `int`s only, which are four bytes wide in both ABIs.
+//
+// A name does NOT belong here when any argument is:
+//   - a pointer to a struct holding a `long`, a pointer, a `time_t` or an
+//     `off_t` (`stat`, `timespec`, `timeval`, `rusage`, `iovec`, `msghdr`,
+//     `rlimit`, `tms`, `statfs`, `sigaction`, `siginfo`, `ucontext`);
+//   - a 64-bit value split across two registers (`_llseek`, `pread64`);
+//   - a signed scalar (`lseek`'s offset: the registers are read zero-extended,
+//     so a backward seek would become a huge forward one);
+//   - the 16-bit credential type the original i386 calls used (`getuid` is
+//     `old_uid_t`; `getuid32` is the one that returns a real uid);
+//   - an argument block in memory rather than in registers (`old_mmap`,
+//     `old_select`, `socketcall`, `ipc`).
+//
+// Verified against `include/linux/syscalls.h` and `asm/unistd_32.h`. Each
+// addition is one line, and the test in `compat32/tests.rs` checks that every
+// name here exists in both tables.
+
+// --- descriptors and plain I/O
+read
+write
+close
+dup
+dup2
+dup3
+pipe
+pipe2
+eventfd
+eventfd2
+memfd_create
+epoll_create
+epoll_create1
+inotify_init1
+fsync
+fdatasync
+sync
+syncfs
+ftruncate
+truncate
+flock
+fchmod
+fchdir
+
+// --- the namespace: paths in, nothing structured out
+open
+openat
+creat
+access
+faccessat
+faccessat2
+chmod
+fchmodat
+chdir
+chroot
+mkdir
+mkdirat
+rmdir
+unlink
+unlinkat
+rename
+renameat
+renameat2
+link
+linkat
+symlink
+symlinkat
+readlink
+readlinkat
+getcwd
+mknod
+mknodat
+pivot_root
+
+// --- memory: addresses and lengths
+brk
+munmap
+mprotect
+madvise
+mlock
+mlock2
+munlock
+mlockall
+munlockall
+msync
+mincore
+mremap
+
+// --- leaving, and making, a process
+//
+// `clone` is NOT here: i386 is `clone(flags, stack, ptid, tls, ctid)` and
+// x86_64 is `clone(flags, stack, ptid, ctid, tls)` -- the last two arguments
+// are swapped, which no name match can see. Nor is `execve`, whose `argv` and
+// `envp` are arrays of 4-byte pointers.
+exit
+exit_group
+fork
+vfork
+
+// --- directory and attribute calls whose structures are fixed-width in both
+// ABIs by design: `linux_dirent64` spells its `d_ino`/`d_off` `__u64`, and
+// `struct statx` was defined with explicit widths for exactly this reason.
+getdents64
+statx
+setxattr
+lsetxattr
+fsetxattr
+getxattr
+lgetxattr
+fgetxattr
+listxattr
+llistxattr
+flistxattr
+removexattr
+lremovexattr
+fremovexattr
+
+// --- identity and process scalars
+getpid
+getppid
+gettid
+getpgrp
+getpgid
+setpgid
+getsid
+setsid
+umask
+personality
+set_tid_address
+sched_yield
+sched_get_priority_max
+sched_get_priority_min
+sched_getscheduler
+kill
+tkill
+tgkill
+getrandom
+
+// --- sockets, which i386 can also call directly (359 and up). Only the ones
+// whose arguments are descriptors, flag words, byte blobs and `int *`.
+socket
+socketpair
+bind
+connect
+listen
+accept4
+getsockname
+getpeername
+shutdown

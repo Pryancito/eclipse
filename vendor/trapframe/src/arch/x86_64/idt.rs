@@ -21,8 +21,16 @@ pub fn init() {
     for i in 0..256 {
         let handler: HandlerFunc = unsafe { core::mem::transmute(VECTORS[i]) };
         let opt = entries[i].set_handler_fn(handler);
-        // Enable user space `int3` and `into`
-        if i == 3 || i == 4 {
+        // Enable user space `int3`, `into` and `int $0x80`.
+        //
+        // Every one of the 256 entries gets a stub, but an entry whose DPL is
+        // 0 cannot be reached by an `int n` from ring 3 at all: the CPU raises
+        // #GP(n*8+2) instead of delivering the vector. Vector 0x80 is the
+        // 32-bit Linux system-call gate (`SYSG(IA32_SYSCALL_VECTOR, ...)` in
+        // `arch/x86/kernel/idt.c`, where `SYSG` is exactly "same stub, DPL 3"),
+        // so without this line an `int 0x80` from an i386 program is a general
+        // protection fault and never a syscall.
+        if i == 3 || i == 4 || i == 0x80 {
             opt.set_privilege_level(PrivilegeLevel::Ring3);
         }
         // Double fault (#DF, vector 8) runs on its own known-good IST stack

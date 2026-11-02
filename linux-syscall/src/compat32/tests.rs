@@ -1,0 +1,215 @@
+//! The i386 numbering, and the mapping onto this kernel's own.
+//!
+//! The mapping is generated, so what is worth checking is not each row but the
+//! properties the generator is supposed to guarantee -- and the handful of
+//! numbers that are load-bearing ABI, which a program would notice instantly
+//! if they moved. Every number asserted here was read out of Linux's own
+//! `asm/unistd_32.h`, the same file `i386_syscall.h.in` was transcribed from.
+
+use super::*;
+use crate::Sys;
+use core::convert::TryFrom;
+
+/// The table is sorted and has no repeated number: both are what
+/// [`native_number`] and [`name`] rely on to use a binary search at all.
+#[test]
+fn the_tables_are_sorted_and_unique() {
+    for pair in I386_TO_NATIVE.windows(2) {
+        assert!(
+            pair[0].0 < pair[1].0,
+            "I386_TO_NATIVE is not sorted: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+    for pair in I386_NAMES.windows(2) {
+        assert!(
+            pair[0].0 < pair[1].0,
+            "I386_NAMES is not sorted: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+/// `syscall_32.tbl` has 451 entries in the kernel this table was taken from,
+/// and its numbers run from 0 to 461 with gaps (the numbers withdrawn over the
+/// years: 222, 223, 251, 285, and the `*_time64` hole at 415).
+#[test]
+fn the_i386_table_is_the_whole_table() {
+    assert_eq!(I386_NAMES.len(), 451);
+    assert_eq!(I386_NAMES.first().map(|r| r.0), Some(0));
+    assert_eq!(I386_NAMES.last().map(|r| r.0), Some(461));
+    for gap in [222, 223, 251, 285, 387, 415] {
+        assert_eq!(name(gap), None, "{} should not be in syscall_32.tbl", gap);
+    }
+}
+
+/// Every number the mapping points at is a number this kernel's own table
+/// knows, and every number it maps FROM is a real i386 call. Both hold by
+/// construction -- `build.rs` refuses to emit a row it cannot find in both
+/// tables -- which is exactly why they are cheap to assert and worth
+/// asserting: a generator that started matching some other way would be caught
+/// here and not by a program crashing.
+#[test]
+fn every_mapped_number_is_a_syscall_on_both_sides() {
+    for &(i386, native) in I386_TO_NATIVE {
+        assert!(
+            name(i386).is_some(),
+            "i386 {} is mapped but is not in syscall_32.tbl",
+            i386
+        );
+        assert!(
+            Sys::try_from(native).is_ok(),
+            "i386 {} ({}) maps to {}, which is not in this kernel's table",
+            i386,
+            name(i386).unwrap_or("?"),
+            native
+        );
+    }
+}
+
+/// The mapping is an allowlist, so it is a small fraction of the table. If it
+/// ever covered everything, the allowlist would have stopped being one --
+/// which is the failure this guards against, not the count itself.
+#[test]
+fn the_mapping_is_a_small_allowlist() {
+    assert!(
+        I386_TO_NATIVE.len() < I386_NAMES.len() / 2,
+        "{} of {} numbers are mapped: that is no longer an allowlist",
+        I386_TO_NATIVE.len(),
+        I386_NAMES.len()
+    );
+    assert!(!I386_TO_NATIVE.is_empty());
+}
+
+/// The numbers a static i386 program uses before it has done anything, and
+/// where each one has to land. `write` is the whole point of the first
+/// milestone: i386 4 is `write`, where native 4 is `stat`, so a mapping that
+/// did nothing would have the first `write` of the first program stat-ing its
+/// own buffer.
+#[test]
+fn the_numbers_a_first_program_uses() {
+    assert_eq!(name(4), Some("write"));
+    assert_eq!(native_number(4), Some(Sys::WRITE as u32));
+    assert_eq!(name(3), Some("read"));
+    assert_eq!(native_number(3), Some(Sys::READ as u32));
+    assert_eq!(name(1), Some("exit"));
+    assert_eq!(native_number(1), Some(Sys::EXIT as u32));
+    assert_eq!(name(252), Some("exit_group"));
+    assert_eq!(native_number(252), Some(Sys::EXIT_GROUP as u32));
+    assert_eq!(name(45), Some("brk"));
+    assert_eq!(native_number(45), Some(Sys::BRK as u32));
+    assert_eq!(name(20), Some("getpid"));
+    assert_eq!(native_number(20), Some(Sys::GETPID as u32));
+}
+
+/// `write` is 4 on i386 and 1 natively; `stat` is 106 on i386 and 4 natively.
+/// The pair is the clearest statement of why the translation exists, and it
+/// also says the translation is not symmetric nonsense: the numbers really do
+/// cross over.
+#[test]
+fn the_numbers_cross_over() {
+    assert_eq!(native_number(4), Some(1));
+    assert_eq!(Sys::try_from(4u32), Ok(Sys::STAT));
+}
+
+/// The calls i386 has to itself must NOT be mapped: each passes something
+/// whose 32-bit layout differs, so sending it to the native handler would
+/// quietly read the wrong bytes out of the process. They answer `ENOSYS` --
+/// with a name -- until each one has its conversion written.
+#[test]
+fn the_i386_only_calls_are_left_unmapped() {
+    for (num, called) in [
+        (192, "mmap2"),
+        (102, "socketcall"),
+        (117, "ipc"),
+        (195, "stat64"),
+        (196, "lstat64"),
+        (197, "fstat64"),
+        (300, "fstatat64"),
+        (221, "fcntl64"),
+        (140, "_llseek"),
+        (119, "sigreturn"),
+        (173, "rt_sigreturn"),
+        (243, "set_thread_area"),
+        (199, "getuid32"),
+        (213, "setuid32"),
+        (403, "clock_gettime64"),
+        (422, "futex_time64"),
+    ] {
+        assert_eq!(name(num), Some(called), "i386 {}", num);
+        assert_eq!(
+            native_number(num),
+            None,
+            "i386 {} ({}) must not be mapped by name: its ABI differs",
+            num,
+            called
+        );
+    }
+}
+
+/// A number in no table at all is `None` from both, not a panic and not a
+/// neighbour's answer.
+#[test]
+fn a_number_in_no_table_maps_to_nothing() {
+    for num in [462, 1000, u32::MAX] {
+        assert_eq!(name(num), None, "{}", num);
+        assert_eq!(native_number(num), None, "{}", num);
+    }
+}
+
+/// The calls that share a NAME with a native one but not a shape. A mapping
+/// built by matching names would have let every one of these through, and each
+/// would have misread the caller's memory rather than failed.
+///
+/// `mmap` is the sharpest: i386 90 is `old_mmap`, which takes its six
+/// arguments in a **block of memory** rather than in registers, so the native
+/// handler would have read a pointer as a length. `clone` is the quietest:
+/// same name, same arity, same types -- and the last two arguments swapped.
+#[test]
+fn the_calls_that_share_a_name_but_not_a_shape() {
+    for (num, called, why) in [
+        (90, "mmap", "old_mmap passes its arguments in memory"),
+        (82, "select", "old_select passes its arguments in memory"),
+        (
+            19,
+            "lseek",
+            "a signed offset, and these registers read zero-extended",
+        ),
+        (
+            120,
+            "clone",
+            "i386 swaps the last two arguments (tls, ctid)",
+        ),
+        (11, "execve", "argv and envp are arrays of 4-byte pointers"),
+        (78, "gettimeofday", "struct timeval is two longs"),
+        (162, "nanosleep", "struct timespec is two longs"),
+        (145, "readv", "struct iovec is a pointer and a size_t"),
+        (146, "writev", "struct iovec is a pointer and a size_t"),
+        (114, "wait4", "struct rusage is sixteen longs"),
+        (
+            174,
+            "rt_sigaction",
+            "struct sigaction holds a handler pointer",
+        ),
+        (77, "getrusage", "struct rusage is sixteen longs"),
+        (43, "times", "struct tms is four clock_t"),
+        (
+            54,
+            "ioctl",
+            "the third argument is whatever the request says",
+        ),
+        (55, "fcntl", "F_SETLK passes a struct flock of off_t"),
+    ] {
+        assert_eq!(name(num), Some(called), "i386 {}", num);
+        assert_eq!(
+            native_number(num),
+            None,
+            "i386 {} ({}) must not be mapped: {}",
+            num,
+            called,
+            why
+        );
+    }
+}

@@ -190,6 +190,13 @@ mod abi;
 /// return). amd64-only: the ABI it implements is FreeBSD/amd64.
 #[cfg(target_arch = "x86_64")]
 pub mod bsd;
+/// The 32-bit (i386) system-call personality: `CONFIG_COMPAT`.
+///
+/// Translates an i386 system-call number onto this crate's own numbering so an
+/// `ELFCLASS32` program running in compatibility mode reaches the same
+/// handlers. x86_64-only: compatibility mode is an x86 thing.
+#[cfg(target_arch = "x86_64")]
+pub mod compat32;
 #[cfg(target_arch = "x86_64")]
 mod cuda_failures;
 /// What each arm of the table hands over, and in what order: the six words
