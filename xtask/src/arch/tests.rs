@@ -106,3 +106,151 @@ fn an_empty_architecture_is_refused_too() {
     };
     assert_eq!(e.to_string(), "Parse Arch from  failed.");
 }
+
+// ---------------------------------------------------------------------------
+// The cross compiler check.
+//
+// Until 2026-11-02 `linux_musl_cross` asked one question about the toolchain:
+// does the directory exist. Whatever was inside went to busybox's makefile as
+// `CROSS_COMPILE`, and when it was not a compiler this host could execute,
+// `/bin/sh` failed to `execve` it, read it as a shell script instead and
+// reported the ELF header as a syntax error at `applets/usage.c`. None of
+// these tests can download anything, so they test the two halves that decide
+// the message: reading the ELF identification, and the wording that comes out.
+// ---------------------------------------------------------------------------
+
+/// The first bytes of the `x86_64-linux-musl-gcc` that this build downloads,
+/// as published at `YdrMaster/zCore` `musl-cache` (sha256
+/// `c5d410d9…`, read 2026-11-02): `EI_CLASS` 1 and `e_machine` 3, i.e. a
+/// **32-bit i386** binary, despite the `x86_64-` in its name. That is not a
+/// corruption, it is what the tarball has always held -- so a host that
+/// cannot run 32-bit x86 binaries cannot use this toolchain, and no amount of
+/// re-downloading will help it.
+const MUSL_GCC_HEAD: [u8; 20] = [
+    0x7f, b'E', b'L', b'F', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 3, 0,
+];
+
+#[test]
+fn the_published_cross_compiler_is_read_as_a_32_bit_i386_binary() {
+    let elf = ElfId::parse(&MUSL_GCC_HEAD).unwrap();
+    assert_eq!(elf.class, 1);
+    assert_eq!(elf.machine, 3);
+    assert_eq!(elf.width(), "32-bit");
+    assert_eq!(elf.machine_name(), "i386");
+}
+
+/// A 64-bit x86 compiler reads as one, so the check does not call every
+/// toolchain 32-bit.
+#[test]
+fn a_64_bit_x86_compiler_reads_as_one() {
+    let mut head = MUSL_GCC_HEAD;
+    head[4] = 2; // ELFCLASS64
+    head[18] = 0x3e; // EM_X86_64
+    let elf = ElfId::parse(&head).unwrap();
+    assert_eq!(elf.width(), "64-bit");
+    assert_eq!(elf.machine_name(), "x86-64");
+}
+
+/// An extraction that died part way through leaves a file too short to say
+/// anything about. That is the case worth re-downloading, and the one the old
+/// code passed straight to `make`.
+#[test]
+fn a_file_too_short_to_hold_a_header_is_not_identified() {
+    for len in 0..20 {
+        let e = ElfId::parse(&MUSL_GCC_HEAD[..len]).unwrap_err();
+        assert!(e.contains(&len.to_string()), "{len}: {e}");
+        assert!(e.contains("ELF header"), "{len}: {e}");
+    }
+    // Twenty bytes is enough: `e_machine` ends at offset 20 in both widths.
+    assert!(ElfId::parse(&MUSL_GCC_HEAD[..20]).is_ok());
+}
+
+/// And a file that is not an ELF at all -- an HTML error page saved under the
+/// compiler's name, say -- is refused by the magic rather than read as a
+/// header full of rubbish.
+#[test]
+fn something_that_is_not_an_elf_file_is_refused_by_the_magic() {
+    let html = b"<!DOCTYPE html><html><head><title>404";
+    let e = ElfId::parse(html).unwrap_err();
+    assert!(e.contains("ELF magic"), "{e}");
+    // A near miss is still a miss.
+    let mut almost = MUSL_GCC_HEAD;
+    almost[3] = b'G';
+    assert!(ElfId::parse(&almost).unwrap_err().contains("ELF magic"));
+}
+
+/// The message for a half-written toolchain names the file and says to delete
+/// it, because that is the one the user can act on.
+#[test]
+fn the_message_for_a_broken_toolchain_names_the_file_and_the_way_out() {
+    let gcc = PathBuf::from("/root/eclipse/ignored/target/x86_64")
+        .join("x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc");
+    let shown = Compiler::Broken("not there".into()).explain(&gcc, "MUSL_CROSS_HOME");
+    assert!(shown.contains("x86_64-linux-musl-gcc"), "{shown}");
+    assert!(shown.contains("not there"), "{shown}");
+    assert!(shown.contains("Delete"), "{shown}");
+}
+
+/// The message for a compiler this host cannot execute says so in those words,
+/// names the width and the machine it is actually for, and does **not** tell
+/// anybody to download it again -- which was the first thing anybody tried.
+#[test]
+fn the_message_for_an_unrunnable_toolchain_says_downloading_it_again_will_not_help() {
+    let gcc = PathBuf::from("bin/x86_64-linux-musl-gcc");
+    let shown = Compiler::Unrunnable {
+        elf: ElfId::parse(&MUSL_GCC_HEAD).unwrap(),
+        why: "Exec format error (os error 8)".into(),
+    }
+    .explain(&gcc, "MUSL_CROSS_HOME");
+    assert!(shown.contains("32-bit"), "{shown}");
+    assert!(shown.contains("i386"), "{shown}");
+    assert!(shown.contains("Exec format error"), "{shown}");
+    assert!(shown.contains("will not change that"), "{shown}");
+    assert!(shown.contains("MUSL_CROSS_HOME"), "{shown}");
+}
+
+/// `check_compiler` answers for a path that is not there without touching the
+/// network or the filesystem it is not allowed to touch, and the answer is the
+/// one that triggers a re-download rather than the one that stops the build.
+#[test]
+fn a_compiler_that_is_not_there_is_broken_rather_than_unrunnable() {
+    let missing = PathBuf::from("/nonexistent-8b1f/bin/x86_64-linux-musl-gcc");
+    match check_compiler(&missing) {
+        Compiler::Broken(why) => assert!(why.contains("not there"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A file that exists but holds rubbish is `Broken` too: the check never gets
+/// as far as running it, so no test here ever executes a downloaded binary.
+#[test]
+fn a_file_of_rubbish_is_broken_without_being_run() {
+    let path = std::env::temp_dir().join(format!("xtask-arch-test-{}", std::process::id()));
+    std::fs::write(&path, b"#!/bin/sh\necho not a compiler\n").unwrap();
+    let verdict = check_compiler(&path);
+    std::fs::remove_file(&path).unwrap();
+    match verdict {
+        Compiler::Broken(why) => assert!(why.contains("ELF magic"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The compiler the callers run is the one the check looks at: `bin/` under
+/// the toolchain directory, named after the arch. If those two ever drift the
+/// check would be passing a file nobody uses.
+#[test]
+fn the_checked_compiler_is_the_one_the_callers_run() {
+    let dir = PathBuf::from("/tmp/x86_64-linux-musl-cross");
+    assert_eq!(
+        Arch::X86_64.musl_gcc(&dir),
+        dir.join("bin/x86_64-linux-musl-gcc")
+    );
+    assert_eq!(
+        Arch::Aarch64.musl_gcc(&dir),
+        dir.join("bin/aarch64-linux-musl-gcc")
+    );
+    assert_eq!(
+        Arch::Riscv64.musl_gcc(&dir),
+        dir.join("bin/riscv64-linux-musl-gcc")
+    );
+}
