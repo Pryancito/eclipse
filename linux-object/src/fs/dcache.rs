@@ -244,5 +244,24 @@ fn store_found(
     );
 }
 
+/// Serialises the tests that assert about the process-wide cache.
+#[cfg(test)]
+pub(crate) mod test_globals {
+    extern crate std;
+
+    /// `EPOCH` and `CACHE` belong to the process, and every test of this
+    /// module either invalidates them or asserts what they hold. Two of them
+    /// at once see each other: a round another test invalidated proves
+    /// nothing, and when every round is interrupted the test has nothing
+    /// left to assert and says so by failing.
+    static LOCK: self::std::sync::Mutex<()> = self::std::sync::Mutex::new(());
+
+    /// Take it. A test that panics while holding it poisons the lock; that is
+    /// not a failure for the tests that follow, so step over the poison.
+    pub(crate) fn lock() -> self::std::sync::MutexGuard<'static, ()> {
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod epoch_tests;
