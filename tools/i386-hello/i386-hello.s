@@ -46,6 +46,10 @@
  *   32  fcntl64(F_SETLK64) failed
  *   33  fcntl64(F_GETLK64) did not write the answer back
  *   34  fcntl(55) did not answer a wide command the way fcntl64 does
+ *   35  writev did not write both entries of the gather list
+ *   36  readv did not scatter into both destinations
+ *   37  preadv read the wrong bytes, or moved the file position
+ *   38  pwritev did not gather the two entries in order
  *
  * The last six are the segment registers, which is the second half of what
  * compatibility mode needs and the half `iretq` does not do: it reloads `CS`
@@ -417,6 +421,177 @@ _start:
 	testl	%eax, %eax
 	jnz	bad_fcntl_wide
 
+	/* writev(1, iov, 2): i386 146, and the first call whose argument is a
+	 * LIST of structures. A 32-bit `struct iovec` is eight bytes, a
+	 * 4-byte base and a 4-byte length, where the native one is sixteen.
+	 *
+	 * Two entries, because one entry cannot tell the two widths apart: a
+	 * list of one read at the wrong stride still finds the right base and
+	 * the right length in the first eight bytes. With two, a kernel
+	 * reading sixteen-byte entries takes the SECOND entry's base as the
+	 * FIRST entry's length. */
+	movl	$msg2a, iov + 0
+	movl	$msg2alen, iov + 4
+	movl	$msg2b, iov + 8
+	movl	$msg2blen, iov + 12
+	movl	$146, %eax
+	movl	$1, %ebx		/* stdout */
+	movl	$iov, %ecx
+	movl	$2, %edx
+	int	$0x80
+	cmpl	$msg2alen + msg2blen, %eax
+	jne	bad_writev
+
+	/* readv(fd, iov, 2): i386 145, scattering four bytes of this file
+	 * into two places that are not next to each other. Seek to 1 first,
+	 * so the first three bytes have to be "ELF" --- and the fourth is
+	 * EI_CLASS at file offset 4, which for this program is 1
+	 * (ELFCLASS32), a value nothing else in the header happens to be.
+	 *
+	 * The gap between the two destinations is what makes this a scatter
+	 * and not a read: a kernel that ignored the second entry would leave
+	 * the byte at page+16 as the 0xee this program puts there. */
+	movl	$140, %eax		/* _llseek to offset 1 */
+	movl	fd, %ebx
+	xorl	%ecx, %ecx
+	movl	$1, %edx
+	movl	page, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_readv
+
+	movl	page, %eax
+	movl	$0, (%eax)
+	movb	$0xee, 16(%eax)
+	movl	%eax, iov + 0
+	movl	$3, iov + 4
+	addl	$16, %eax
+	movl	%eax, iov + 8
+	movl	$1, iov + 12
+	movl	$145, %eax
+	movl	fd, %ebx
+	movl	$iov, %ecx
+	movl	$2, %edx
+	int	$0x80
+	cmpl	$4, %eax
+	jne	bad_readv
+	movl	page, %eax
+	movl	(%eax), %ecx
+	andl	$0xffffff, %ecx
+	cmpl	$0x464c45, %ecx		/* "ELF", little endian */
+	jne	bad_readv
+	movzbl	16(%eax), %ecx
+	cmpl	$1, %ecx		/* EI_CLASS = ELFCLASS32 */
+	jne	bad_readv
+
+	/* preadv(fd, iov, 2, 1, 0): i386 333, the same scatter at an explicit
+	 * offset that arrives in two registers, LOW FIRST --- `pread64`'s
+	 * order and not `_llseek`'s. It must not move the file position, so
+	 * the plain read that follows has to pick up where readv left it,
+	 * which is file offset 5. */
+	movl	page, %eax
+	movl	$0, (%eax)
+	movb	$0xee, 16(%eax)
+	movl	$333, %eax
+	movl	fd, %ebx
+	movl	$iov, %ecx
+	movl	$2, %edx
+	movl	$1, %esi		/* offset low */
+	xorl	%edi, %edi		/* offset high */
+	int	$0x80
+	cmpl	$4, %eax
+	jne	bad_preadv
+	movl	page, %eax
+	movl	(%eax), %ecx
+	andl	$0xffffff, %ecx
+	cmpl	$0x464c45, %ecx
+	jne	bad_preadv
+	movzbl	16(%eax), %ecx
+	cmpl	$1, %ecx
+	jne	bad_preadv
+
+	/* And the position: _llseek(fd, 0, SEEK_CUR) has to say 5, which is
+	 * where readv stopped. If preadv had moved it, it would say 9. */
+	movl	$140, %eax
+	movl	fd, %ebx
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	movl	page, %esi
+	movl	$1, %edi		/* SEEK_CUR */
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_preadv
+	movl	page, %eax
+	cmpl	$5, (%eax)
+	jne	bad_preadv
+	cmpl	$0, 4(%eax)
+	jne	bad_preadv
+
+	/* pwritev(fd2, iov, 2, 0, 0): i386 334. It needs a writable
+	 * descriptor, so this one opens a file of its own under /tmp
+	 * --- O_RDWR | O_CREAT | O_TRUNC, mode 0600 --- gathers six bytes
+	 * into it from two places, and reads them back with pread64 to check
+	 * that the two entries arrived in order and nothing from between them
+	 * came along. */
+	movl	$5, %eax		/* open */
+	movl	$tmppath, %ebx
+	movl	$0102, %ecx		/* O_RDWR|O_CREAT|O_TRUNC = 2|64|512 */
+	movl	$0600, %edx
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_pwritev
+	movl	%eax, fd2
+
+	movl	page, %eax
+	movl	$0x434241, (%eax)	/* "ABC" */
+	movl	%eax, iov + 0
+	movl	$3, iov + 4
+	addl	$16, %eax
+	movl	$0x465445, (%eax)	/* "ETF" -- distinct from "ABC" */
+	movl	%eax, iov + 8
+	movl	$3, iov + 12
+	movl	$334, %eax
+	movl	fd2, %ebx
+	movl	$iov, %ecx
+	movl	$2, %edx
+	xorl	%esi, %esi		/* offset low */
+	xorl	%edi, %edi		/* offset high */
+	int	$0x80
+	cmpl	$6, %eax
+	jne	bad_pwritev
+
+	movl	page, %eax
+	movl	$0, 32(%eax)
+	movl	$0, 36(%eax)
+	movl	$180, %eax		/* pread64 */
+	movl	fd2, %ebx
+	movl	page, %ecx
+	addl	$32, %ecx
+	movl	$6, %edx
+	xorl	%esi, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	cmpl	$6, %eax
+	jne	bad_pwritev
+	movl	page, %eax
+	movl	32(%eax), %ecx
+	andl	$0xffffff, %ecx
+	cmpl	$0x434241, %ecx		/* "ABC" first */
+	jne	bad_pwritev
+	movl	35(%eax), %ecx
+	andl	$0xffffff, %ecx
+	cmpl	$0x465445, %ecx		/* "ETF" right after it */
+	jne	bad_pwritev
+
+	/* And leave nothing behind. */
+	movl	$6, %eax		/* close */
+	movl	fd2, %ebx
+	int	$0x80
+	movl	$10, %eax		/* unlink */
+	movl	$tmppath, %ebx
+	int	$0x80
+
 	/* get_thread_area(&tls_desc): i386 244, the other half, and the one a
 	 * debugger uses. It has to hand back the base this program asked for,
 	 * which means the descriptor really does hold it rather than
@@ -504,6 +679,18 @@ bad_getlk64:
 	jmp	die
 bad_fcntl_wide:
 	movl	$34, %ebx
+	jmp	die
+bad_writev:
+	movl	$35, %ebx
+	jmp	die
+bad_readv:
+	movl	$36, %ebx
+	jmp	die
+bad_preadv:
+	movl	$37, %ebx
+	jmp	die
+bad_pwritev:
+	movl	$38, %ebx
 
 	/* exit_group(status): i386 252. `exit` (1) would do for a single
 	 * thread, but exit_group is what a C library calls and it is in the
@@ -519,6 +706,16 @@ die:
 msg:
 	.ascii	"i386-hello: compatibility mode works\n"
 	.set	msglen, . - msg
+	/* Two pieces of one line, so that `writev` has something to gather
+	 * whose halves can be told apart. */
+msg2a:
+	.ascii	"i386-hello: writev gathers "
+	.set	msg2alen, . - msg2a
+msg2b:
+	.ascii	"two entries\n"
+	.set	msg2blen, . - msg2b
+tmppath:
+	.asciz	"/tmp/i386-hello-pwritev"
 
 	.section .data
 	.align 4
@@ -551,6 +748,16 @@ page:
 	.long	0
 fd:
 	.long	0
+fd2:
+	.long	0
+	/* Two entries of a 32-bit `struct iovec`: a 4-byte base and a 4-byte
+	 * length each, sixteen bytes in all where two native entries would be
+	 * thirty-two. Filled in at run time, because the buffers it points at
+	 * come from mmap2. */
+	.align 4
+iov:
+	.long	0, 0
+	.long	0, 0
 	/* The ninety-six bytes of a `struct stat64`, and the twenty-four of a
 	 * `struct flock64`. The lock asks for the whole file from byte 0:
 	 * l_type (F_RDLCK, 0), l_whence (SEEK_SET, 0), l_start (0), l_len

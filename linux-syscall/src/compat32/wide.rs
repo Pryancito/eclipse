@@ -36,11 +36,15 @@ use linux_object::error::LxError;
 
 /// The two halves of a 64-bit value, low first.
 ///
+/// Shared with [`super::iovec`], whose `preadv`/`pwritev` split their offset
+/// the same way `pread64` does. One function, so the order can be argued
+/// about in one place.
+///
 /// Four bytes wide each, because that is what a 32-bit register holds, and
 /// the mask says so rather than trusting that the dispatch already did it:
 /// this is the one function that would turn a stray upper half into an offset
 /// of several terabytes.
-fn join(low: usize, high: usize) -> u64 {
+pub(super) fn join(low: usize, high: usize) -> u64 {
     ((high as u64 & 0xffff_ffff) << 32) | (low as u64 & 0xffff_ffff)
 }
 

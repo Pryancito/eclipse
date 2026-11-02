@@ -90,6 +90,7 @@ use super::*;
 use linux_object::error::LxError;
 
 mod fcntl;
+mod iovec;
 mod stat;
 mod tls;
 mod wide;
@@ -122,6 +123,13 @@ const I386_LSTAT64: u32 = 196;
 const I386_FSTAT64: u32 = 197;
 const I386_FCNTL64: u32 = 221;
 const I386_FSTATAT64: u32 = 300;
+
+/// And the scatter/gather calls, whose list is a `struct iovec` of half the
+/// width. See [`iovec`].
+const I386_READV: u32 = 145;
+const I386_WRITEV: u32 = 146;
+const I386_PREADV: u32 = 333;
+const I386_PWRITEV: u32 = 334;
 
 mod table {
     include!(concat!(env!("OUT_DIR"), "/compat32.rs"));
@@ -187,6 +195,20 @@ impl Syscall<'_> {
             // The same handler for both numbers, because measuring Linux
             // says they are the same call: see [`fcntl`].
             I386_FCNTL64 | I386_FCNTL => return syscall_ret(self.sys_fcntl64(a0, a1, a2).await),
+            // The native handlers, unchanged: the list they read is already
+            // the 32-bit one, because `Syscall::read_iovecs` asks the
+            // process's ABI how wide an entry is. They are dispatched here
+            // rather than mapped in the allowlist because their ABI is NOT
+            // byte-for-byte the native one --- it is the handler that adapts,
+            // and the allowlist says nothing about handlers. See [`iovec`].
+            I386_READV => {
+                return syscall_ret(self.sys_readv((a0 as i32).into(), a1.into(), a2).await)
+            }
+            I386_WRITEV => {
+                return syscall_ret(self.sys_writev((a0 as i32).into(), a1.into(), a2).await)
+            }
+            I386_PREADV => return syscall_ret(self.sys_preadv32(a0, a1, a2, a3, a4).await),
+            I386_PWRITEV => return syscall_ret(self.sys_pwritev32(a0, a1, a2, a3, a4)),
             _ => {}
         }
         match native_number(num) {

@@ -563,18 +563,69 @@ impl<P: Policy> Debug for IoVecs<P> {
 // never fired. It is removed rather than fixed: `read_iovecs` is the same call
 // with the error kept, and an infallible-looking constructor over fallible
 // user input is a trap for whoever reaches for it next.
+/// `sizeof(struct iovec)` for a 32-bit process: a 4-byte pointer and a 4-byte
+/// `size_t`, where the native one is two 8-byte words.
+pub const IOVEC32_SIZE: usize = 8;
+
 impl<P: Policy> UserInPtr<IoVec<P>> {
     pub fn read_iovecs(&self, count: usize) -> Result<IoVecs<P>> {
         if self.0.is_null() {
             return Err(Error::InvalidPointer);
         }
-        // Linux caps the number of iovecs at `IOV_MAX` (1024); reject anything
-        // larger so a huge `count` cannot trigger an unbounded allocation.
+        let vec = Self::checked_count(count).and_then(|()| self.read_array(count))?;
+        Self::validate(vec)
+    }
+
+    /// The same list as a 32-bit process passes it: `struct iovec` entries of
+    /// **eight** bytes, a 4-byte `iov_base` and a 4-byte `iov_len`, widened
+    /// here.
+    ///
+    /// Reading them as native sixteen-byte entries does not fail, which is
+    /// the danger: it pairs the halves wrongly. The first buffer's address
+    /// comes out as entry 0's base with entry 0's **length** in its high
+    /// half, and its length as entry 1's base with entry 1's length in its
+    /// high half --- an address nothing in the list named, and a length of
+    /// hundreds of gigabytes.
+    ///
+    /// Each half is zero-extended rather than sign-extended: a length is
+    /// unsigned, and a 32-bit address is an address in the low 4 GiB, never a
+    /// negative offset from the top of the address space. This is Linux's
+    /// `compat_import_iovec` / `compat_ptr`.
+    pub fn read_iovecs32(&self, count: usize) -> Result<IoVecs<P>> {
+        if self.0.is_null() {
+            return Err(Error::InvalidPointer);
+        }
+        Self::checked_count(count)?;
+        let raw: UserInPtr<u8> = UserInPtr::from(self.0 as usize);
+        let bytes = raw.read_array(count * IOVEC32_SIZE)?;
+        let mut vec = Vec::with_capacity(count);
+        // `as_chunks`, not `chunks_exact`: the length is `count *
+        // IOVEC32_SIZE` exactly, so there is no remainder, and clippy asks
+        // for the form that says the chunk size is a constant.
+        let (entries, _) = bytes.as_chunks::<IOVEC32_SIZE>();
+        for entry in entries {
+            let base = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            let len = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+            vec.push(IoVec {
+                ptr: UserPtr::from(base as usize),
+                len: len as usize,
+            });
+        }
+        Self::validate(vec)
+    }
+
+    /// Linux caps the number of iovecs at `IOV_MAX` (1024); reject anything
+    /// larger so a huge `count` cannot trigger an unbounded allocation.
+    fn checked_count(count: usize) -> Result<()> {
         if count > 1024 {
             return Err(Error::InvalidLength);
         }
-        let vec = self.read_array(count)?;
-        // The sum of length should not overflow.
+        Ok(())
+    }
+
+    /// The sum of the lengths must not overflow. Shared by both widths, so
+    /// the 32-bit path cannot be the one that forgets.
+    fn validate(vec: Vec<IoVec<P>>) -> Result<IoVecs<P>> {
         let mut total_count = 0usize;
         for io_vec in vec.iter() {
             let (result, overflow) = total_count.overflowing_add(io_vec.len());
@@ -959,6 +1010,110 @@ mod tests {
                 .read_iovecs(2)
                 .err(),
             Some(Error::InvalidLength)
+        );
+    }
+
+    /// A 32-bit `struct iovec` array, eight bytes an entry.
+    fn iovec32_bytes(entries: &[(usize, usize)]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(entries.len() * IOVEC32_SIZE);
+        for &(base, len) in entries {
+            out.extend_from_slice(&(base as u32).to_le_bytes());
+            out.extend_from_slice(&(len as u32).to_le_bytes());
+        }
+        out
+    }
+
+    /// The narrow list read at the narrow width: each entry widened.
+    ///
+    /// The host's own addresses do not fit in 32 bits, so the bases here are
+    /// small constants rather than real buffers --- what is under test is the
+    /// decoding of the eight bytes, and `read_iovecs32` does not dereference
+    /// them.
+    #[test]
+    fn read_iovecs32_widens_each_four_byte_half() {
+        init_handler();
+        // Every half here has all four of its bytes non-zero and distinct,
+        // so a decoder that drops or misplaces one cannot pass.
+        let bytes = iovec32_bytes(&[(0x0804_8000, 64), (0xbfff_f000, 0xfedc_ba98), (1, 0)]);
+        let p = UserInPtr::<IoVecIn>::from(bytes.as_ptr() as usize);
+        let vecs = p.read_iovecs32(3).unwrap();
+        assert_eq!(vecs.len(), 3);
+        assert_eq!(vecs[0].addr(), 0x0804_8000);
+        assert_eq!(vecs[0].len(), 64);
+        // A base with the top bit of the 32-bit word set is an address in the
+        // third gigabyte, not a negative offset from the top of the address
+        // space: the halves are zero-extended, as `compat_ptr` does.
+        assert_eq!(vecs[1].addr(), 0xbfff_f000);
+        assert_eq!(vecs[1].len(), 0xfedc_ba98);
+        // A zero-length entry is legal and contributes nothing (POSIX).
+        assert_eq!(vecs[2].len(), 0);
+        assert_eq!(vecs.total_len(), 64 + 0xfedc_ba98);
+    }
+
+    /// And the reason this function exists: reading the same bytes at the
+    /// NATIVE width does not fail. It answers, and it answers nonsense.
+    ///
+    /// Four entries of eight bytes read as two of sixteen pair up the halves
+    /// wrongly: the first buffer's *address* becomes entry 0's base with
+    /// entry 0's **length** in its high half, and its *length* becomes entry
+    /// 1's base with entry 1's length in its high half. So the address is one
+    /// nothing in the list named and the length is hundreds of gigabytes.
+    ///
+    /// There is no error to propagate and no assertion inside the kernel that
+    /// would catch it, which is why the width is decided from the process's
+    /// ABI rather than guessed.
+    #[test]
+    fn the_same_bytes_at_the_native_width_answer_nonsense_rather_than_failing() {
+        init_handler();
+        let bytes = iovec32_bytes(&[
+            (0x0804_8000, 64),
+            (0xbfff_f000, 64),
+            (0x0804_9000, 64),
+            (0xbfff_e000, 64),
+        ]);
+        let p = UserInPtr::<IoVecIn>::from(bytes.as_ptr() as usize);
+
+        let narrow = p.read_iovecs32(4).unwrap();
+        assert_eq!(narrow.len(), 4);
+        assert_eq!(narrow.total_len(), 4 * 64);
+
+        // The same memory, two native entries. It succeeds.
+        let wide = p.read_iovecs(2).unwrap();
+        assert_eq!(wide.len(), 2);
+        // base 0 with length 0 (64) sitting in its high half.
+        assert_eq!(wide[0].addr(), 0x0000_0040_0804_8000);
+        // base 1 with length 1 in its high half, as a LENGTH: 277 GiB.
+        assert_eq!(wide[0].len(), 0x0000_0040_bfff_f000);
+        // Neither is anything the program named.
+        for &(base, len) in &[(0x0804_8000usize, 64usize), (0xbfff_f000, 64)] {
+            assert_ne!(wide[0].addr(), base);
+            assert_ne!(wide[0].len(), len);
+        }
+        assert_ne!(wide.total_len(), narrow.total_len());
+    }
+
+    /// The caps are the same for both widths, which is the point of their
+    /// living in one place: `IOV_MAX` and a total that does not overflow.
+    #[test]
+    fn read_iovecs32_enforces_the_same_caps_as_the_native_width() {
+        init_handler();
+        let bytes = iovec32_bytes(&[(0x1000, 1)]);
+        let p = UserInPtr::<IoVecIn>::from(bytes.as_ptr() as usize);
+        assert_eq!(p.read_iovecs32(1025).err(), Some(Error::InvalidLength));
+        assert_eq!(
+            UserInPtr::<IoVecIn>::from(0).read_iovecs32(0).err(),
+            Some(Error::InvalidPointer)
+        );
+        // The overflow check cannot be reached through four-byte lengths ---
+        // 1024 entries of at most 0xffff_ffff sum to about 4 TiB, which fits
+        // a `usize` --- so what this half asserts is that a huge but legal
+        // total is accepted here and left for the caller to bound, exactly as
+        // the native width leaves it.
+        let many = iovec32_bytes(&vec![(0x1000, 0xffff_ffff); 1024]);
+        let p = UserInPtr::<IoVecIn>::from(many.as_ptr() as usize);
+        assert_eq!(
+            p.read_iovecs32(1024).unwrap().total_len(),
+            1024 * 0xffff_ffff
         );
     }
 
