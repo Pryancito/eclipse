@@ -346,3 +346,125 @@ fn the_one_line_form_distinguishes_broken_from_unrunnable() {
     assert!(unrunnable.contains("i386"), "{unrunnable}");
     assert!(unrunnable.contains("will not run"), "{unrunnable}");
 }
+
+// ---------------------------------------------------------------------------
+// A musl toolchain already on this host.
+// ---------------------------------------------------------------------------
+
+/// `-dumpmachine` is the only thing worth trusting about a compiler, because
+/// the name lies: the published `x86_64-linux-musl-gcc` is a 32-bit i386
+/// binary. These are the answers the three compilers that matter give.
+#[test]
+fn only_a_musl_triple_for_the_right_arch_counts_as_a_match() {
+    let matches = |triple: &str, arch: &str| {
+        triple.starts_with(&format!("{arch}-")) && triple.ends_with("-musl")
+    };
+
+    // Alpine's native compiler, which is what Eclipse's own rootfs can install
+    // with `apk add build-base`.
+    assert!(matches("x86_64-alpine-linux-musl", "x86_64"));
+    // A cross toolchain built by musl-cross-make.
+    assert!(matches("x86_64-linux-musl", "x86_64"));
+    assert!(matches("aarch64-linux-musl", "aarch64"));
+
+    // A glibc host is not a match, which is why the CI runners keep
+    // downloading exactly as they did.
+    assert!(!matches("x86_64-pc-linux-gnu", "x86_64"));
+    assert!(!matches("x86_64-linux-gnu", "x86_64"));
+    // Nor is the right libc on the wrong arch.
+    assert!(!matches("aarch64-linux-musl", "x86_64"));
+    assert!(!matches("i686-linux-musl", "x86_64"));
+}
+
+/// The real `targets_musl` agrees with that, run against a compiler that is
+/// not there (nothing to run means no match) and against one that answers
+/// something else entirely.
+#[test]
+fn a_compiler_that_cannot_be_asked_is_not_a_match() {
+    assert!(!targets_musl(
+        &PathBuf::from("/nonexistent-4c2a/x86_64-linux-musl-gcc"),
+        "x86_64"
+    ));
+    // `true` exists and exits 0, but prints no triple.
+    if let Some(yes) = which("true") {
+        assert!(!targets_musl(&yes, "x86_64"));
+    }
+}
+
+/// `which` finds what is on `PATH` and nothing else.
+#[test]
+fn which_finds_a_program_on_the_path() {
+    let sh = which("sh").expect("every host has sh");
+    assert!(sh.is_file(), "{}", sh.display());
+    assert!(sh.ends_with("sh"), "{}", sh.display());
+    assert!(which("eclipse-no-such-program-xtask-test").is_none());
+}
+
+/// The linked names are the ones `CROSS_COMPILE=<prefix>` makes a makefile
+/// reach for. `gcc` is the one every caller in this tree uses by hand, and
+/// `strip` is used by `LinuxRootfs` directly, so losing either would break the
+/// build in a way no test here would see.
+#[test]
+fn the_linked_tools_cover_what_the_build_actually_asks_for() {
+    for needed in ["gcc", "strip", "ld", "ar", "ranlib"] {
+        assert!(TOOLS.contains(&needed), "{needed} is not linked");
+    }
+    let mut all: Vec<&str> = TOOLS.iter().chain(CXX_TOOLS).copied().collect();
+    let before = all.len();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), before, "a tool is listed twice");
+}
+
+/// C++ is kept out of the always-linked set on purpose. `musl-tools` ships
+/// `musl-gcc` and nothing else: the `g++` sitting next to it builds against
+/// glibc, so linking it under a musl name would hand a C++ caller a compiler
+/// that silently produces the wrong binaries. The C tools have no such
+/// problem -- `ld`, `ar` and the rest are binutils and do not care which libc
+/// the objects were compiled for.
+#[test]
+fn the_cxx_tools_are_separate_from_the_c_ones() {
+    for cxx in CXX_TOOLS {
+        assert!(
+            !TOOLS.contains(cxx),
+            "{cxx} is linked even for a wrapper that has no C++"
+        );
+    }
+    assert!(CXX_TOOLS.contains(&"g++"));
+}
+
+/// `cc` and `gcc` are both in the set, because the link farm points both of
+/// them at the compiler it found rather than at the file of that name beside
+/// it -- for the `musl-gcc` wrapper those are different programs, and the one
+/// beside it is the glibc one.
+#[test]
+fn both_spellings_of_the_compiler_are_linked() {
+    assert!(TOOLS.contains(&"gcc"));
+    assert!(TOOLS.contains(&"cc"));
+}
+
+/// The weaker question, the one asked of the `musl-gcc` wrapper: it cannot say
+/// `musl` because `-dumpmachine` answers for the gcc underneath it, so all
+/// that is checked is that it builds for the right architecture. An x86_64
+/// wrapper must never be picked up for an aarch64 build.
+#[test]
+fn the_wrapper_is_still_held_to_the_right_architecture() {
+    let for_arch = |triple: &str, arch: &str| triple.starts_with(&format!("{arch}-"));
+
+    // What `musl-gcc` on Ubuntu actually answers.
+    assert!(for_arch("x86_64-linux-gnu", "x86_64"));
+    assert!(!for_arch("x86_64-linux-gnu", "aarch64"));
+    assert!(!for_arch("x86_64-linux-gnu", "riscv64"));
+    // And a near miss on the arch name is still a miss.
+    assert!(!for_arch("i686-linux-gnu", "x86_64"));
+}
+
+/// `builds_for` and `targets_musl` agree about a compiler that is not there,
+/// and the stricter one is strictly stricter.
+#[test]
+fn asking_a_compiler_that_is_not_there_answers_no_either_way() {
+    let missing = PathBuf::from("/nonexistent-4c2a/gcc");
+    assert!(!builds_for(&missing, "x86_64"));
+    assert!(!targets_musl(&missing, "x86_64"));
+    assert!(dumpmachine(&missing).is_none());
+}

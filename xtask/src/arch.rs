@@ -87,6 +87,15 @@ impl Arch {
             return dir;
         }
 
+        // A compiler already on this host that targets the same musl triple
+        // beats anything downloaded: it is native, so it runs by definition.
+        // This is what makes building from inside Eclipse work -- its rootfs
+        // ships `apk` pointed at Alpine, and Alpine's `gcc` *is* an
+        // `x86_64-...-musl` compiler.
+        if let Some(native) = self.native_musl(&target) {
+            return native;
+        }
+
         let mut refused = Vec::new();
         for source in Source::ALL {
             let tgz = origin.join(source.tarball(&name));
@@ -134,6 +143,109 @@ impl Arch {
     fn musl_gcc(&self, dir: &Path) -> PathBuf {
         dir.join("bin")
             .join(format!("{}-linux-musl-gcc", self.name()))
+    }
+
+    /// A toolchain already installed on this host that can build musl
+    /// binaries, presented in the layout every caller expects: a directory
+    /// whose `bin/` holds `<arch>-linux-musl-<tool>`.
+    ///
+    /// Three shapes count, in this order:
+    ///
+    /// 1. A cross toolchain installed under its own name, `<arch>-linux-musl-gcc`
+    ///    on `PATH`. Its whole `bin/` is already spelled the way the build
+    ///    wants, so its prefix directory is handed back as it is.
+    /// 2. A **native** musl compiler -- plain `gcc` whose `-dumpmachine` is
+    ///    something like `x86_64-alpine-linux-musl`.
+    /// 3. `musl-gcc`, the wrapper `musl-tools` installs on Debian and Ubuntu.
+    ///    This is the one that matters inside Eclipse, whose x86_64 and aarch64
+    ///    rootfs is Ubuntu with glibc (`apt_rootfs::use_apt`) while busybox is
+    ///    still built `-static` against musl on purpose.
+    ///
+    /// For 2 and 3 a directory of links named with the prefix is built under
+    /// `target/<arch>/`, because `CROSS_COMPILE` is a prefix and nothing in the
+    /// build asks for a tool by its bare name.
+    ///
+    /// A glibc host with no musl anything is not a match, and the download
+    /// happens exactly as before. That is why the CI runners are unaffected.
+    fn native_musl(&self, target: &Path) -> Option<PathBuf> {
+        let prefix = format!("{}-linux-musl-", self.name());
+        let prefixed = format!("{prefix}gcc");
+
+        // 1. A whole cross toolchain, already named the way the build wants.
+        if let Some(path) = which(&prefixed) {
+            if targets_musl(&path, self.name()) {
+                println!(
+                    "using the {prefix}toolchain already on PATH: {}",
+                    path.display()
+                );
+                return path.parent().and_then(Path::parent).map(Path::to_path_buf);
+            }
+        }
+
+        // 2. A native musl compiler, or 3. the `musl-tools` wrapper.
+        //
+        // The wrapper is `exec gcc "$@" -specs .../musl-gcc.specs`, so
+        // `-dumpmachine` answers for the gcc underneath and says `-gnu`. Its
+        // name is what identifies it, and unlike `x86_64-linux-musl-gcc` --
+        // which names a 32-bit i386 binary -- that name is a package's, not a
+        // mirror's guess. It is still asked for its arch, so an x86_64 wrapper
+        // is never used to build for aarch64.
+        for (candidate, cxx) in [("gcc", true), ("cc", true), ("musl-gcc", false)] {
+            let Some(cc) = which(candidate) else { continue };
+            let native_musl = targets_musl(&cc, self.name());
+            if !native_musl && !(candidate == "musl-gcc" && builds_for(&cc, self.name())) {
+                continue;
+            }
+            // A `musl-tools` wrapper has no `musl-g++`: linking the system
+            // `g++` under a musl name would hand a C++ caller a glibc compiler
+            // that silently builds the wrong thing. C only, then.
+            let with_cxx = cxx && native_musl;
+            if let Some(home) = self.link_farm(target, &prefix, &cc, with_cxx) {
+                println!(
+                    "using this host's musl compiler: {} (C++ {})",
+                    cc.display(),
+                    if with_cxx {
+                        "included"
+                    } else {
+                        "not available"
+                    }
+                );
+                return Some(home);
+            }
+        }
+        None
+    }
+
+    /// Builds `target/<arch>/native-musl/bin/<prefix><tool>` for every tool
+    /// this host has, with `gcc` and `cc` pointing at `cc` itself rather than
+    /// at whatever shares its directory -- for the `musl-gcc` wrapper those are
+    /// not the same program, and the one beside it is the glibc one.
+    fn link_farm(&self, target: &Path, prefix: &str, cc: &Path, with_cxx: bool) -> Option<PathBuf> {
+        let bin = cc.parent()?;
+        let home = target.join("native-musl");
+        let link_dir = home.join("bin");
+        dir::clear(&link_dir).ok()?;
+
+        let mut linked = 0;
+        for tool in TOOLS.iter().chain(if with_cxx { CXX_TOOLS } else { &[] }) {
+            let from = match *tool {
+                "gcc" | "cc" => cc.to_path_buf(),
+                other => bin.join(other),
+            };
+            if !from.exists() {
+                continue;
+            }
+            if std::os::unix::fs::symlink(&from, link_dir.join(format!("{prefix}{tool}"))).is_ok() {
+                linked += 1;
+            }
+        }
+        // The compiler itself has to be there, or this is not a toolchain.
+        link_dir
+            .join(format!("{prefix}gcc"))
+            .exists()
+            .then_some(())?;
+        println!("{linked} tools linked into {}", link_dir.display());
+        Some(home)
     }
 }
 
@@ -300,6 +412,61 @@ impl Compiler {
             ),
         }
     }
+}
+
+/// The tools `CROSS_COMPILE=<prefix>` makes a makefile reach for. Whichever of
+/// them the host has get a prefixed name; the rest are simply not there, which
+/// is what a cross toolchain missing one would look like anyway.
+const TOOLS: [&str; 12] = [
+    "gcc", "cc", "ld", "as", "ar", "ranlib", "nm", "strip", "objcopy", "objdump", "readelf", "size",
+];
+
+/// The C++ half, linked only when the compiler found is a real musl-targeting
+/// toolchain. The `musl-tools` wrapper has no C++ counterpart, and the `g++`
+/// beside it builds against glibc.
+const CXX_TOOLS: &[&str] = &["g++", "c++", "cpp"];
+
+/// Where `name` resolves on `PATH`, or `None` if it is not there. There is no
+/// `which` in the standard library and no crate for it in this build, and
+/// `PATH` lookup is three lines.
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Whether the compiler at `cc` builds for musl on `arch`.
+///
+/// `-dumpmachine` is the compiler's own answer and the only one worth trusting:
+/// a name says nothing (the published `x86_64-linux-musl-gcc` is a 32-bit i386
+/// binary) and neither does the host distribution. Alpine's native compiler
+/// answers `x86_64-alpine-linux-musl`, a cross one `x86_64-linux-musl`, and a
+/// glibc one `x86_64-pc-linux-gnu`, which is not a match.
+fn targets_musl(cc: &Path, arch: &str) -> bool {
+    dumpmachine(cc).is_some_and(|t| t.starts_with(&format!("{arch}-")) && t.ends_with("-musl"))
+}
+
+/// The compiler's own answer about what it builds, or `None` if it cannot be
+/// asked. `-dumpmachine` is the only answer worth trusting about a toolchain:
+/// a name says nothing (the published `x86_64-linux-musl-gcc` is a 32-bit i386
+/// binary) and neither does the host distribution.
+fn dumpmachine(cc: &Path) -> Option<String> {
+    let out = std::process::Command::new(cc)
+        .arg("-dumpmachine")
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// Whether the compiler at `cc` builds for `arch` at all, whatever its libc.
+///
+/// This is the weaker question, asked only of `musl-gcc`, whose libc cannot be
+/// read off `-dumpmachine` because the wrapper reports the gcc underneath it.
+fn builds_for(cc: &Path, arch: &str) -> bool {
+    dumpmachine(cc).is_some_and(|t| t.starts_with(&format!("{arch}-")))
 }
 
 /// Decides what the file at `gcc` is: missing, half-written, unrunnable here,
