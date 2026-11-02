@@ -406,9 +406,65 @@ fn which_finds_a_program_on_the_path() {
 /// build in a way no test here would see.
 #[test]
 fn the_linked_tools_cover_what_the_build_actually_asks_for() {
-    for needed in ["gcc", "g++", "strip", "ld", "ar", "ranlib"] {
+    for needed in ["gcc", "strip", "ld", "ar", "ranlib"] {
         assert!(TOOLS.contains(&needed), "{needed} is not linked");
     }
-    let unique: std::collections::HashSet<_> = TOOLS.iter().collect();
-    assert_eq!(unique.len(), TOOLS.len(), "a tool is listed twice");
+    let mut all: Vec<&str> = TOOLS.iter().chain(CXX_TOOLS).copied().collect();
+    let before = all.len();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), before, "a tool is listed twice");
+}
+
+/// C++ is kept out of the always-linked set on purpose. `musl-tools` ships
+/// `musl-gcc` and nothing else: the `g++` sitting next to it builds against
+/// glibc, so linking it under a musl name would hand a C++ caller a compiler
+/// that silently produces the wrong binaries. The C tools have no such
+/// problem -- `ld`, `ar` and the rest are binutils and do not care which libc
+/// the objects were compiled for.
+#[test]
+fn the_cxx_tools_are_separate_from_the_c_ones() {
+    for cxx in CXX_TOOLS {
+        assert!(
+            !TOOLS.contains(cxx),
+            "{cxx} is linked even for a wrapper that has no C++"
+        );
+    }
+    assert!(CXX_TOOLS.contains(&"g++"));
+}
+
+/// `cc` and `gcc` are both in the set, because the link farm points both of
+/// them at the compiler it found rather than at the file of that name beside
+/// it -- for the `musl-gcc` wrapper those are different programs, and the one
+/// beside it is the glibc one.
+#[test]
+fn both_spellings_of_the_compiler_are_linked() {
+    assert!(TOOLS.contains(&"gcc"));
+    assert!(TOOLS.contains(&"cc"));
+}
+
+/// The weaker question, the one asked of the `musl-gcc` wrapper: it cannot say
+/// `musl` because `-dumpmachine` answers for the gcc underneath it, so all
+/// that is checked is that it builds for the right architecture. An x86_64
+/// wrapper must never be picked up for an aarch64 build.
+#[test]
+fn the_wrapper_is_still_held_to_the_right_architecture() {
+    let for_arch = |triple: &str, arch: &str| triple.starts_with(&format!("{arch}-"));
+
+    // What `musl-gcc` on Ubuntu actually answers.
+    assert!(for_arch("x86_64-linux-gnu", "x86_64"));
+    assert!(!for_arch("x86_64-linux-gnu", "aarch64"));
+    assert!(!for_arch("x86_64-linux-gnu", "riscv64"));
+    // And a near miss on the arch name is still a miss.
+    assert!(!for_arch("i686-linux-gnu", "x86_64"));
+}
+
+/// `builds_for` and `targets_musl` agree about a compiler that is not there,
+/// and the stricter one is strictly stricter.
+#[test]
+fn asking_a_compiler_that_is_not_there_answers_no_either_way() {
+    let missing = PathBuf::from("/nonexistent-4c2a/gcc");
+    assert!(!builds_for(&missing, "x86_64"));
+    assert!(!targets_musl(&missing, "x86_64"));
+    assert!(dumpmachine(&missing).is_none());
 }
