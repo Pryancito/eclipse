@@ -66,6 +66,8 @@
  *   52  statx did not fill 256 bytes at a 4-aligned destination
  *   53  ppoll refused a signal mask aligned to 4 and not to 8
  *   54  writev accepted an iov_len that does not fit a signed word
+ *   55  socketcall did not carry a socketpair through its argument block
+ *   56  socketcall read past the end of a block that ends at a page
  *
  * The last six are the segment registers, which is the second half of what
  * compatibility mode needs and the half `iretq` does not do: it reloads `CS`
@@ -1009,6 +1011,133 @@ statx_poison:
 	cmpl	$0, statxbuf + 44	/* the top half of a size under 4 GiB */
 	jne	bad_statx
 
+	/* socketcall(call, args): i386 102, and the only call here whose
+	 * arguments are not in registers at all --- they are in a block of
+	 * `unsigned long` in the caller's memory, four bytes each where this
+	 * kernel's registers are eight.
+	 *
+	 * A whole connected pair, through socketcall and nothing else:
+	 * socketpair(8), send(9), recv(10), getsockname(6), shutdown(13). An
+	 * AF_UNIX pair needs no network, so this works the same on a Linux
+	 * host and in Eclipse. */
+	movl	$1, sargs + 0		/* AF_UNIX */
+	movl	$1, sargs + 4		/* SOCK_STREAM */
+	movl	$0, sargs + 8
+	movl	$sv, sargs + 12
+	movl	$102, %eax
+	movl	$8, %ebx		/* SYS_SOCKETPAIR */
+	movl	$sargs, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_socketcall
+
+	/* send(sv[0], "ABC", 3, 0) */
+	movl	$0x434241, sbuf
+	movl	sv + 0, %eax
+	movl	%eax, sargs + 0
+	movl	$sbuf, sargs + 4
+	movl	$3, sargs + 8
+	movl	$0, sargs + 12
+	movl	$102, %eax
+	movl	$9, %ebx		/* SYS_SEND */
+	movl	$sargs, %ecx
+	int	$0x80
+	cmpl	$3, %eax
+	jne	bad_socketcall
+
+	/* recv(sv[1], sbuf2, 3, 0), and the bytes have to be the ones sent:
+	 * a block read at the wrong width would hand the descriptor and the
+	 * length to each other's slots and this would not be "ABC". */
+	movl	$0, sbuf2
+	movl	sv + 4, %eax
+	movl	%eax, sargs + 0
+	movl	$sbuf2, sargs + 4
+	movl	$3, sargs + 8
+	movl	$0, sargs + 12
+	movl	$102, %eax
+	movl	$10, %ebx		/* SYS_RECV */
+	movl	$sargs, %ecx
+	int	$0x80
+	cmpl	$3, %eax
+	jne	bad_socketcall
+	movl	sbuf2, %ecx
+	andl	$0xffffff, %ecx
+	cmpl	$0x434241, %ecx
+	jne	bad_socketcall
+
+	/* getsockname(sv[0], sa, &salen): three words, the last two pointers.
+	 * The length comes back no bigger than it went in. */
+	movl	$128, salen
+	movl	sv + 0, %eax
+	movl	%eax, sargs + 0
+	movl	$sa, sargs + 4
+	movl	$salen, sargs + 8
+	movl	$102, %eax
+	movl	$6, %ebx		/* SYS_GETSOCKNAME */
+	movl	$sargs, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_socketcall
+	cmpl	$128, salen
+	ja	bad_socketcall
+
+	/* shutdown(sv[0], SHUT_RDWR): two words, which is the SHORTEST block
+	 * any call has. A kernel that read a fixed six would reach four words
+	 * past it. */
+	movl	sv + 0, %eax
+	movl	%eax, sargs + 0
+	movl	$2, sargs + 4
+	movl	$102, %eax
+	movl	$13, %ebx		/* SYS_SHUTDOWN */
+	movl	$sargs, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_socketcall
+
+	/* And the step that says the word count is not a guess: put a
+	 * two-word block for `shutdown` at the very END of a mapped page
+	 * whose next page is NOT mapped, so that reading a third word is
+	 * EFAULT. Linux reads exactly two and answers 0; a kernel that read
+	 * more would answer EFAULT for a block a program is entitled to put
+	 * there.
+	 *
+	 * mmap2 two pages, drop the second. The address must be checked
+	 * UNSIGNED: a valid high address like 0xf7xxxxxx is negative as a
+	 * signed int, which cost me a run. */
+	movl	$192, %eax
+	xorl	%ebx, %ebx
+	movl	$8192, %ecx
+	movl	$3, %edx		/* PROT_READ|PROT_WRITE */
+	movl	$0x22, %esi		/* MAP_PRIVATE|MAP_ANONYMOUS */
+	movl	$-1, %edi
+	xorl	%ebp, %ebp
+	int	$0x80
+	cmpl	$-4096, %eax
+	jae	bad_sargs_edge
+	movl	%eax, twopages
+	movl	$91, %eax		/* munmap the second page: the guard */
+	movl	twopages, %ebx
+	addl	$4096, %ebx
+	movl	$4096, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_sargs_edge
+
+	/* The block goes at page_end - 8, so words 0 and 1 are readable and
+	 * word 2 is not. */
+	movl	twopages, %edi
+	addl	$4096, %edi
+	subl	$8, %edi
+	movl	sv + 4, %eax		/* the other end, still open */
+	movl	%eax, (%edi)
+	movl	$2, 4(%edi)		/* SHUT_RDWR */
+	movl	$102, %eax
+	movl	$13, %ebx
+	movl	%edi, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_sargs_edge
+
 	/* ppoll(NULL, 0, {0,0}, mask, 8): i386 309, and the same trap in the
 	 * READING direction. A kernel `sigset_t` is one 64-bit word, so a
 	 * typed load wants 8; an i386 `sigset_t` is `unsigned long sig[2]`,
@@ -1227,6 +1356,12 @@ bad_ppoll_mask:
 bad_iov_len:
 	movl	$54, %ebx
 	jmp	die
+bad_socketcall:
+	movl	$55, %ebx
+	jmp	die
+bad_sargs_edge:
+	movl	$56, %ebx
+	jmp	die
 
 	/* Fill the scratch buffer with 0xaa, so that every structure written
 	 * into it afterwards says by itself how many bytes it is: the first
@@ -1383,6 +1518,22 @@ zerots:
 	.long	0
 sigmask4:
 	.space	8
+
+	/* The socketcall argument block, and what its calls point at. */
+sargs:
+	.space	24
+sv:
+	.space	8
+sbuf:
+	.space	8
+sbuf2:
+	.space	8
+sa:
+	.space	128
+salen:
+	.long	0
+twopages:
+	.long	0
 	.align 4
 statbuf:
 	.space	96
