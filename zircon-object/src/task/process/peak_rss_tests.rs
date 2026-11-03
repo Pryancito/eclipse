@@ -46,7 +46,8 @@ fn a_process_s_peak_is_its_address_space_s_and_outlasts_the_unmap() {
 }
 
 /// `exec_mmap()`: the old image's peak stays the process's, and the new
-/// image's own starts from nothing, which is what `VmHWM:` shows.
+/// image's own starts from nothing, which is what `VmHWM:` shows. A smaller
+/// new image leaves it where it was, through its own exit too.
 #[test]
 fn an_execve_keeps_the_old_image_s_peak_for_the_process() {
     let proc = Process::create(&Job::root(), "peak").unwrap();
@@ -57,8 +58,24 @@ fn an_execve_keeps_the_old_image_s_peak_for_the_process() {
     assert_eq!(proc.peak_resident_bytes(), 4 * K);
     touch(&own, 1, 1);
     assert_eq!(proc.peak_resident_bytes(), 4 * K, "under the old peak");
-    touch(&own, 2, 6);
-    assert_eq!(proc.peak_resident_bytes(), 7 * K, "over it");
+    proc.exit(0);
+    assert_eq!(
+        proc.peak_resident_bytes(),
+        4 * K,
+        "the smaller exit kept it"
+    );
+}
+
+/// A new image that grows past the old peak is the new peak.
+#[test]
+fn a_new_image_bigger_than_the_old_one_is_the_new_peak() {
+    let proc = Process::create(&Job::root(), "peak").unwrap();
+    touch(&proc.vmar(), 6, 4);
+    let own = proc.own_address_space();
+    own.clear().unwrap();
+    touch(&own, 6, 1);
+    touch(&own, 7, 6);
+    assert_eq!(proc.peak_resident_bytes(), 7 * K);
 }
 
 /// `do_exit()`: emptying the address space starts its peak over, and the
