@@ -265,6 +265,19 @@ async fn set_timeout(sys: &Syscall<'_>, fd: usize, value: &[u8]) -> isize {
         .await
 }
 
+/// The same, with `optlen` put in the register by hand rather than taken from
+/// the value's length: the only way to reach a register whose top half is not
+/// the argument.
+async fn set_timeout_with_raw_len(sys: &Syscall<'_>, fd: usize, value: &[u8], raw: usize) -> isize {
+    put(VAL_AT, value);
+    own(sys)
+        .syscall(
+            crate::Sys::SETSOCKOPT as u32,
+            [fd, SOL_SOCKET, RCVTIMEO, VAL_AT, raw, 0],
+        )
+        .await
+}
+
 /// `getsockopt` of the same option into a buffer of `room` bytes, poisoned
 /// first so that a write past the caller's length is visible.
 async fn get_timeout(sys: &Syscall<'_>, fd: usize, room: u32) -> (isize, Vec<u8>) {
@@ -504,5 +517,46 @@ fn the_largest_optlen_an_int_can_hold_is_not_refused() {
         got, 0,
         "i32::MAX is a positive length, and the eight bytes it covers are there"
     );
+    proc.exit(0);
+}
+
+#[test]
+fn a_native_optlen_with_rubbish_in_its_top_half_is_still_a_length() {
+    // Copilot's second round, and it is right: `optlen` is an `int`, so the
+    // top half of the register is NOT the argument, and nothing in the ABI
+    // requires a caller to clear it --- a varargs `int` is not widened. A
+    // bound on the whole register answered `EINVAL` to a perfectly ordinary
+    // native `SO_RCVTIMEO` of sixteen bytes whose register happened to carry
+    // `0x1_0000_0010`. Truncating to an `int` first is what makes one rule
+    // serve both ABIs.
+    let proc = a_process(48_438, Abi::Linux);
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let fd = a_socket(sys, AF_INET, A_DGRAM).await;
+            set_timeout_with_raw_len(sys, fd, &native_tv(5, 500_000), 0x1_0000_0010).await
+        })
+    });
+    assert_eq!(
+        got, 0,
+        "sixteen with rubbish above it is sixteen: the high half of the \
+         register is not the argument"
+    );
+    proc.exit(0);
+}
+
+#[test]
+fn a_native_optlen_that_is_negative_in_its_low_half_is_refused() {
+    // The other spelling of the same argument, and the other half of the
+    // pair: `0xffff_ffff_ffff_fff0` is -16 to Linux, which refuses it. Read
+    // as a whole `usize` it is a colossal length and the native path answered
+    // `EFAULT` from the buffer instead of `EINVAL` from the length.
+    let proc = a_process(48_439, Abi::Linux);
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let fd = a_socket(sys, AF_INET, A_DGRAM).await;
+            set_timeout_with_raw_len(sys, fd, &native_tv(5, 500_000), usize::MAX - 15).await
+        })
+    });
+    assert_eq!(got, EINVAL);
     proc.exit(0);
 }
