@@ -198,6 +198,18 @@ fn a_32_bit_brk_above_the_top_hands_back_the_old_break() {
         Ok(TASK_SIZE_32),
         "a break at the top of the space was refused"
     );
+    // And the RESERVATION the grow made is under the top as well. `brk`
+    // rounds a growth up to `BRK_CHUNK` so a burst of small grows costs one
+    // `map_at`, and that megabyte runs ahead of the break: for a break near
+    // the top it is memory above 4 GiB, mapped, with the call reporting a
+    // break that is perfectly legal. The break's own bound cannot see it.
+    assert!(
+        proc.linux().mapped_brk() <= TASK_SIZE_32,
+        "the break ends at {:#x} but its reservation reaches {:#x}, which is \
+         past the top of the address space",
+        proc.linux().brk(),
+        proc.linux().mapped_brk()
+    );
 }
 
 #[test]
@@ -256,5 +268,26 @@ fn a_32_bit_shmat_is_refused_above_the_top() {
         answers(&native, A_KEY + 1),
         Err(LxError::ENOMEM),
         "the 32-bit ceiling reached shmat of a native process"
+    );
+}
+
+#[test]
+fn a_hint_above_the_top_is_dropped_and_not_refused() {
+    // A hint is a suggestion. Linux's `get_unmapped_area` answers one it
+    // cannot honour by choosing an address itself, and a 32-bit program's
+    // bookkeeping can easily suggest an address near the top of its space,
+    // so refusing it would be an `ENOMEM` with room to spare below.
+    //
+    // `MAP_FIXED` is not a suggestion and keeps the ceiling's error, which
+    // the test above asks for at the same address.
+    let proc = a_process(47_481, Abi::Linux32);
+    let hinted = on_a_thread(&proc, |sys| {
+        Box::pin(async move { mmap_at(sys, TASK_SIZE_32, 1, ANON_PRIVATE).await })
+    });
+    let at = hinted.expect("a hint that cannot be honoured is not a failure");
+    assert!(
+        at + PAGE <= TASK_SIZE_32,
+        "the hint above the top was honoured anyway: {:#x}",
+        at
     );
 }

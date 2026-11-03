@@ -351,7 +351,7 @@ impl Syscall<'_> {
         //
         // A hint is read under `aspace_lock` too, so the range it found free
         // is still free when the mapping goes in.
-        let vmar_offset = mmap_offset(placement, addr, len, &vmar);
+        let vmar_offset = mmap_offset(placement, addr, len, &vmar, task_max);
         // What a `MAP_FIXED` replaces is not new to the address space, so
         // `RLIMIT_AS` counts only the rest (`count_vma_pages_range()`).
         let replaced = (placement == Placement::Fixed).then_some((addr, addr.saturating_add(len)));
@@ -856,6 +856,24 @@ impl Syscall<'_> {
         // problem; this keeps the batching and its failure mode both.
         let mut last_err = None;
         for size in [size, roundup_pages(want)] {
+            // The reservation runs AHEAD of the break, so it is one more
+            // place a 32-bit process's address space can be left behind: the
+            // break itself is bounded above, but rounding the growth up to
+            // `BRK_CHUNK` maps a megabyte past it, which for a break near the
+            // top is memory above 4 GiB. Skipping the chunk leaves the exact
+            // growth below to be tried, which is the same fallback a chunk
+            // that runs into a neighbour already takes.
+            match mapped_brk.checked_add(size) {
+                Some(end) if end <= task_max => {}
+                _ => {
+                    info!(
+                        "brk: reserving {:#x} from {:#x} would pass the top of \
+                         the address space ({:#x})",
+                        size, mapped_brk, task_max
+                    );
+                    continue;
+                }
+            }
             // `RLIMIT_AS` (`may_expand_vm()` in `do_brk_flags()`): a chunk
             // the limit has no room for falls back to the exact amount, and
             // that one failing keeps the old break.
@@ -1688,14 +1706,27 @@ fn mmap_placement(flags: MmapFlags) -> Placement {
 /// when it checks where its mapping landed. libcuda lays its unified address
 /// space out at addresses it asks for, and that is the suspect behind
 /// `cuInit` failing on real hardware with CUDA_ERROR_OUT_OF_MEMORY.
+///
+/// `max` is the top of the address space the calling process may use (see
+/// [`Syscall::task_max`]), and a hint above it is **dropped** rather than
+/// refused: a hint is a suggestion, and Linux's `get_unmapped_area` answers
+/// one it cannot honour by choosing an address itself. Refusing it instead
+/// would turn a 32-bit program's harmless hint --- any address its own
+/// bookkeeping suggests, which for a program that has been running a while
+/// is easily near the top of its space --- into an `ENOMEM` with room to
+/// spare below. A FIXED placement is not a suggestion and keeps the ceiling's
+/// error.
 fn mmap_offset(
     placement: Placement,
     addr: usize,
     len: usize,
     vmar: &VmAddressRegion,
+    max: usize,
 ) -> Option<usize> {
     let at = match placement {
-        Placement::Hint => mmap_hint(addr).filter(|&hint| vmar.range_is_free(hint, len))?,
+        Placement::Hint => mmap_hint(addr)
+            .filter(|&hint| hint.checked_add(len).is_some_and(|end| end <= max))
+            .filter(|&hint| vmar.range_is_free(hint, len))?,
         Placement::Fixed | Placement::FixedNoReplace => addr,
     };
     Some(at - vmar.addr())
@@ -3430,10 +3461,16 @@ mod mmap_hint_tests {
     fn a_free_hint_is_where_the_mapping_goes() {
         let (vmar, addr) = mapped(0x2000_0000, 1);
         let hint = addr + 4 * PAGE_SIZE;
-        let at = mmap_offset(Placement::Hint, hint, 2 * PAGE_SIZE, &vmar);
+        let at = mmap_offset(Placement::Hint, hint, 2 * PAGE_SIZE, &vmar, usize::MAX);
         assert_eq!(at, Some(hint - vmar.addr()));
         assert_eq!(
-            mmap_offset(Placement::Hint, hint + 0x123, 2 * PAGE_SIZE, &vmar),
+            mmap_offset(
+                Placement::Hint,
+                hint + 0x123,
+                2 * PAGE_SIZE,
+                &vmar,
+                usize::MAX
+            ),
             at,
             "an unaligned hint names the page it falls in"
         );
@@ -3448,15 +3485,16 @@ mod mmap_hint_tests {
         let (vmar, addr) = mapped(0x2100_0000, 1);
         let hint = addr + 0x10_0000;
         assert_ne!(map(&vmar, None, 1), hint);
-        let at = mmap_offset(Placement::Hint, hint, PAGE_SIZE, &vmar);
+        let at = mmap_offset(Placement::Hint, hint, PAGE_SIZE, &vmar, usize::MAX);
         assert_eq!(map(&vmar, at, 1), hint);
     }
 
     #[test]
     fn a_taken_hint_leaves_the_choice_to_the_vmar() {
         let (vmar, addr) = mapped(0x2200_0000, 4);
-        let hint =
-            |at: usize, pages: usize| mmap_offset(Placement::Hint, at, pages * PAGE_SIZE, &vmar);
+        let hint = |at: usize, pages: usize| {
+            mmap_offset(Placement::Hint, at, pages * PAGE_SIZE, &vmar, usize::MAX)
+        };
         assert_eq!(hint(addr, 1), None, "on the mapping");
         assert_eq!(hint(addr + 3 * PAGE_SIZE, 2), None, "running off its end");
         assert_eq!(hint(addr - PAGE_SIZE, 2), None, "running into its start");
@@ -3472,20 +3510,74 @@ mod mmap_hint_tests {
         );
     }
 
+    /// A hint the caller's own address space cannot hold is dropped, exactly
+    /// like one that is outside the VMAR or already taken: the VMAR chooses.
+    /// The ceiling is what a 32-bit process gets (`Syscall::task_max`), and
+    /// the point of the test is that it drops the hint rather than refusing
+    /// the call -- a hint is a suggestion, and the free-range test below it
+    /// would have said yes.
+    #[test]
+    fn a_hint_above_the_callers_own_ceiling_is_dropped_too() {
+        let (vmar, _) = mapped(0x2300_0000, 1);
+        let ceiling = 0x4000_0000;
+        assert_eq!(
+            mmap_offset(Placement::Hint, ceiling, PAGE_SIZE, &vmar, ceiling),
+            None,
+            "a hint at the ceiling was taken"
+        );
+        assert_eq!(
+            mmap_offset(
+                Placement::Hint,
+                ceiling - PAGE_SIZE,
+                2 * PAGE_SIZE,
+                &vmar,
+                ceiling
+            ),
+            None,
+            "a hint straddling the ceiling was taken"
+        );
+        assert_eq!(
+            mmap_offset(
+                Placement::Hint,
+                ceiling - PAGE_SIZE,
+                PAGE_SIZE,
+                &vmar,
+                ceiling
+            ),
+            Some(ceiling - PAGE_SIZE - vmar.addr()),
+            "the hint ending exactly at the ceiling was dropped"
+        );
+        // And a FIXED placement is not a suggestion: it keeps its address,
+        // and `map_ext_within` is what refuses it with ENOMEM.
+        assert_eq!(
+            mmap_offset(Placement::Fixed, ceiling, PAGE_SIZE, &vmar, ceiling),
+            Some(ceiling - vmar.addr())
+        );
+    }
+
     /// libcuda probes for a 57-bit address space with a hint at 2^48, and on a
     /// 4-level machine takes whatever it is given instead.
     #[test]
     fn a_hint_outside_the_address_space_leaves_the_choice_to_the_vmar() {
         let (vmar, _) = mapped(0x2300_0000, 1);
         let end = vmar.end_addr();
-        assert_eq!(mmap_offset(Placement::Hint, end, PAGE_SIZE, &vmar), None);
         assert_eq!(
-            mmap_offset(Placement::Hint, end - PAGE_SIZE, 2 * PAGE_SIZE, &vmar),
+            mmap_offset(Placement::Hint, end, PAGE_SIZE, &vmar, usize::MAX),
+            None
+        );
+        assert_eq!(
+            mmap_offset(
+                Placement::Hint,
+                end - PAGE_SIZE,
+                2 * PAGE_SIZE,
+                &vmar,
+                usize::MAX
+            ),
             None,
             "a range that starts inside and ends past the end"
         );
         assert_eq!(
-            mmap_offset(Placement::Hint, 1 << 48, PAGE_SIZE, &vmar),
+            mmap_offset(Placement::Hint, 1 << 48, PAGE_SIZE, &vmar, usize::MAX),
             None
         );
     }
@@ -3498,10 +3590,13 @@ mod mmap_hint_tests {
         let vmar = VmAddressRegion::new_root_zircon();
         assert_ne!(vmar.addr(), 0);
         let hint = vmar.addr() + 0x2500_0000;
-        let at = mmap_offset(Placement::Hint, hint, PAGE_SIZE, &vmar);
+        let at = mmap_offset(Placement::Hint, hint, PAGE_SIZE, &vmar, usize::MAX);
         assert_eq!(at, Some(0x2500_0000));
         assert_eq!(map(&vmar, at, 1), hint);
-        assert_eq!(mmap_offset(Placement::Fixed, hint, PAGE_SIZE, &vmar), at);
+        assert_eq!(
+            mmap_offset(Placement::Fixed, hint, PAGE_SIZE, &vmar, usize::MAX),
+            at
+        );
     }
 
     /// `MAP_FIXED` replaces what is there, and `MAP_FIXED_NOREPLACE` has
@@ -3512,7 +3607,7 @@ mod mmap_hint_tests {
         let (vmar, addr) = mapped(0x2400_0000, 2);
         for placement in [Placement::Fixed, Placement::FixedNoReplace] {
             assert_eq!(
-                mmap_offset(placement, addr, PAGE_SIZE, &vmar),
+                mmap_offset(placement, addr, PAGE_SIZE, &vmar, usize::MAX),
                 Some(addr - vmar.addr()),
                 "{placement:?}"
             );
@@ -3792,5 +3887,8 @@ mod mprotect_mremap_tests;
 #[cfg(test)]
 mod mmap_file_tests;
 
-#[cfg(test)]
+/// The 32-bit address-space ceiling, which only x86_64 has: `TASK_SIZE_32`
+/// is defined for that target alone, because it is the only one this kernel
+/// runs a 32-bit personality on.
+#[cfg(all(test, target_arch = "x86_64"))]
 mod task_size_tests;
