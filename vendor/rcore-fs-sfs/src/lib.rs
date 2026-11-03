@@ -72,6 +72,14 @@ pub struct INodeImpl {
     /// Char/block device id (major, minor)
     /// e.g. crw-rw-rw- 1 root wheel 3, 2 May 13 16:40 /dev/null
     device_inode_id: usize,
+    /// Serializes every change of `blocks`/`size`. `_resize` takes and drops
+    /// the `disk_inode` lock several times while it allocates or frees, so two
+    /// resizes of the same inode used to interleave: a writer that read
+    /// `size` before another writer grew the file then "grew" it to a SMALLER
+    /// length, which `_resize` treats as a truncate. That cut off the other
+    /// writer's data, and two such truncates racing freed the same blocks
+    /// twice (`assertion failed: !free_map[block_id]`).
+    resize_lock: Mutex<()>,
 }
 
 impl Debug for INodeImpl {
@@ -228,6 +236,21 @@ impl INodeImpl {
     }
     /// Resize content size, no matter what type it is.
     fn _resize(&self, len: usize) -> vfs::Result<()> {
+        let _guard = self.resize_lock.lock();
+        self._resize_locked(len)
+    }
+    /// Grow the content to at least `len` bytes; never shrinks. The size is
+    /// checked under `resize_lock`, so a concurrent writer that already made
+    /// the file longer is not truncated back to this caller's end offset.
+    fn _grow_to(&self, len: usize) -> vfs::Result<()> {
+        let _guard = self.resize_lock.lock();
+        if (self.disk_inode.read().size as usize) < len {
+            self._resize_locked(len)?;
+        }
+        Ok(())
+    }
+    /// `_resize` body. Caller holds `resize_lock`.
+    fn _resize_locked(&self, len: usize) -> vfs::Result<()> {
         if len > MAX_FILE_SIZE {
             return Err(FsError::InvalidParam);
         }
@@ -328,12 +351,14 @@ impl INodeImpl {
                     disk_inode.blocks = old_blocks;
                     return Err(e);
                 }
-                // clean up
-                let mut disk_inode = self.disk_inode.write();
-                let old_size = disk_inode.size as usize;
-                disk_inode.size = len as u32;
-                drop(disk_inode);
-                self._clean_at(old_size, len)?;
+                // Zero the new tail BEFORE publishing the new size. Once
+                // `size` says `len`, a concurrent writer whose end offset is
+                // below `len` skips `_grow_to` and writes straight into
+                // [old_size, len); zeroing after that wiped its data.
+                let old_size = self.disk_inode.read().size as usize;
+                let cleaned = self._clean_at(old_size, len);
+                self.disk_inode.write().size = len as u32;
+                cleaned?;
             }
             Ordering::Less => {
                 // free extra blocks
@@ -421,11 +446,25 @@ impl INodeImpl {
         })
     }
     /// Clean content, no matter what type it is
+    /// Unlike the other `_*_at`, NOT clamped to `size`: `_resize` zeroes the
+    /// grown tail before it publishes the new size. Bounded by `blocks`
+    /// instead (`get_disk_block_id` refuses a slot past it).
     fn _clean_at(&self, begin: usize, end: usize) -> vfs::Result<usize> {
         static ZEROS: [u8; BLKSIZE] = [0; BLKSIZE];
-        self._io_at(begin, end, |device, range, _| {
-            device.write_block(range.block, range.begin, &ZEROS[..range.len()])
-        })
+        let iter = BlockIter {
+            begin,
+            end: end.max(begin),
+            block_size_log2: BLKSIZE_LOG2,
+        };
+        let mut cleaned = 0usize;
+        for mut range in iter {
+            range.block = self.get_disk_block_id(range.block)?;
+            self.fs
+                .device
+                .write_block(range.block, range.begin, &ZEROS[..range.len()])?;
+            cleaned += range.len();
+        }
+        Ok(cleaned)
     }
     fn nlinks_inc(&self) {
         self.disk_inode.write().nlinks += 1;
@@ -460,8 +499,7 @@ impl INodeImpl {
             id: child.id as u32,
             name: Str256::from(name),
         };
-        let disk_inode = self.disk_inode.write();
-        let old_size = disk_inode.size as usize;
+        let old_size = self.disk_inode.read().size as usize;
         self._resize(old_size + BLKSIZE)?;
         self._write_at(old_size, entry.as_buf()).unwrap();
         child.nlinks_inc();
@@ -491,7 +529,7 @@ impl vfs::INode for INodeImpl {
             FileType::File | FileType::SymLink => {
                 let end_offset = offset + buf.len();
                 if (size as usize) < end_offset {
-                    self._resize(end_offset)?;
+                    self._grow_to(end_offset)?;
                 }
                 self._write_at(offset, buf)
             }
@@ -1101,6 +1139,7 @@ impl SimpleFileSystem {
             disk_inode: RwLock::new(disk_inode),
             fs: self.self_ptr.upgrade().unwrap(),
             device_inode_id,
+            resize_lock: Mutex::new(()),
         });
         self.inodes.write().insert(id, Arc::downgrade(&inode));
         inode
@@ -1117,9 +1156,26 @@ impl SimpleFileSystem {
                 return inode;
             }
         }
-        // Load if not in set, or is weak ref.
+        // Load if not in set, or is weak ref. Re-check under the write lock:
+        // two threads that both missed above used to each load their own
+        // INodeImpl for the same id, with separate in-memory `disk_inode`
+        // copies. Growing one and syncing the other then pointed the on-disk
+        // inode at blocks the free map no longer agreed with.
+        let mut inodes = self.inodes.write();
+        if let Some(inode) = inodes.get(&id).and_then(|w| w.upgrade()) {
+            return inode;
+        }
         let disk_inode = Dirty::new(self.device.load_struct::<DiskINode>(id).unwrap());
-        self._new_inode(id, disk_inode)
+        let device_inode_id = disk_inode.device_inode_id;
+        let inode = Arc::new(INodeImpl {
+            id,
+            disk_inode: RwLock::new(disk_inode),
+            fs: self.self_ptr.upgrade().unwrap(),
+            device_inode_id,
+            resize_lock: Mutex::new(()),
+        });
+        inodes.insert(id, Arc::downgrade(&inode));
+        inode
     }
     /// Create a new INode file
     fn new_inode_file(&self) -> vfs::Result<Arc<INodeImpl>> {

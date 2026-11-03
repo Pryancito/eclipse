@@ -994,3 +994,47 @@ fn two_renames_onto_one_name_at_once_replace_it_once_each() -> Result<()> {
     }
     Ok(())
 }
+
+/// Several threads writing interleaved chunks of ONE file. Each write past
+/// EOF grows the file; a writer that read the size before another writer
+/// grew it must not "grow" the file back down to its own end offset. That
+/// used to truncate the other writers' blocks and, with two such truncates
+/// racing, free the same block twice (`!free_map[block_id]` panic).
+#[test]
+fn concurrent_writers_never_shrink_the_file() -> Result<()> {
+    const THREADS: usize = 4;
+    const CHUNKS: usize = 64;
+    // Block-aligned on purpose: two writers sharing one device block race in
+    // the device's read-modify-write, which is a different bug.
+    const CHUNK: usize = 3 * BLKSIZE;
+    for _round in 0..8 {
+        let sfs = _create_new_sfs();
+        let root = sfs.root_inode();
+        let file = root.create("shared", FileType::File, 0o777)?;
+        let handles: std::vec::Vec<_> = (0..THREADS)
+            .map(|t| {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    let buf = [t as u8 + 1; CHUNK];
+                    for k in 0..CHUNKS {
+                        let off = (k * THREADS + t) * CHUNK;
+                        assert_eq!(file.write_at(off, &buf).unwrap(), CHUNK);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("writer thread panicked");
+        }
+        let total = THREADS * CHUNKS * CHUNK;
+        assert_eq!(file.metadata()?.size, total, "a writer shrank the file");
+        let mut back = std::vec![0u8; total];
+        assert_eq!(file.read_at(0, &mut back)?, total);
+        for (i, c) in back.chunks(CHUNK).enumerate() {
+            let want = (i % THREADS) as u8 + 1;
+            assert!(c.iter().all(|&b| b == want), "chunk {} lost its data: first={} want={} bad={}", i, c[0], want, c.iter().filter(|&&b| b != want).count());
+        }
+        sfs.sync()?;
+    }
+    Ok(())
+}
