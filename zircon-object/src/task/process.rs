@@ -1349,11 +1349,23 @@ impl Process {
     /// used before it `execve`d stays the process's, the way `time(1)` over
     /// a shell that execs its command counts it.
     ///
-    /// The address space is asked first. The exit keeps that peak before it
-    /// empties the space, which starts the space's own peak over, so a read
-    /// that races the exit finds the peak in one place or the other.
+    /// The address space counts only while this process holds it, and it is
+    /// read under the lock the exit lets go of it under. The exit keeps the
+    /// space's peak before it lets go, so a read finds the peak in the space
+    /// or in what was kept, never in neither. And once this process has
+    /// exited, a space that another process still runs in cannot raise its
+    /// peak: a `vfork` child that exits without an `execve` leaves its
+    /// parent's space behind, and the parent goes on growing it before it
+    /// reaps the child. Linux reads only a zombie's `signal->maxrss`, since
+    /// the zombie has no `mm` any more.
     pub fn peak_resident_bytes(&self) -> usize {
-        let now = self.vmar().resident_peak_bytes();
+        let now = {
+            let space = self.space.lock();
+            match space.hold {
+                Some(_) => space.vmar.resident_peak_bytes(),
+                None => 0,
+            }
+        };
         now.max(self.left_spaces_peak.load(Ordering::Acquire))
     }
 

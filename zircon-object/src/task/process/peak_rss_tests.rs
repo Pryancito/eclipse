@@ -110,3 +110,24 @@ fn a_vfork_child_s_execve_keeps_the_peak_of_the_space_it_borrowed() {
     assert_eq!(child.peak_resident_bytes(), 6 * K);
     assert_eq!(parent.peak_resident_bytes(), 6 * K);
 }
+
+/// A `vfork` child that exits without an `execve` leaves its parent's space
+/// behind, still running. Its peak is the one it had at its exit, as Linux's
+/// zombie has only `signal->maxrss`: the parent growing the space before it
+/// reaps the child must not make the child's peak grow too.
+#[test]
+fn an_exited_vfork_child_s_peak_stays_where_its_exit_left_it() {
+    let parent = Process::create(&Job::root(), "parent").unwrap();
+    touch(&parent.vmar(), 8, 6);
+    let child = Process::create_sharing_address_space(&Job::root(), "child", &parent, ()).unwrap();
+    child.exit(0);
+    assert_eq!(
+        child.peak_resident_bytes(),
+        6 * K,
+        "the space's, at the exit"
+    );
+
+    touch(&parent.vmar(), 9, 4);
+    assert_eq!(parent.peak_resident_bytes(), 10 * K);
+    assert_eq!(child.peak_resident_bytes(), 6 * K, "not the parent's since");
+}
