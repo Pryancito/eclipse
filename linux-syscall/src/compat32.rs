@@ -46,13 +46,14 @@
 //!
 //! - `socketcall` (102) and `ipc` (117) multiplex a whole family through one
 //!   number, with the real arguments in a block of memory;
-//! - `sigreturn` (119) and `rt_sigreturn` (173), whose signal frames are
-//!   32-bit structures;
+//! - `sigreturn` (119), whose signal frame is a 32-bit structure --- and
+//!   `rt_sigreturn` (173), whose frame is too, and which is wired: see
+//!   [`signal`];
 //! - the `*_time64` calls (403 and up), the 32-bit world's answer to 2038.
 //!
 //! The second is the calls that share a name but not a shape and whose shape
-//! nothing converts yet: anything passing a `msghdr`, an `rlimit`, a
-//! `sigaction`, a `siginfo_t`, a `sigevent`, or an **array** of the
+//! nothing converts yet: anything passing an `rlimit`, a
+//! `siginfo_t`, a `sigevent`, or an **array** of the
 //! structures [`crate::narrow`] converts one at a time (`utimensat`,
 //! `utimes`); `pselect6`, whose timeout is converted but whose sixth
 //! argument points at two words; `lseek`, whose offset is signed where these
@@ -91,7 +92,10 @@
 //! `ugetrlimit` (191), whose two words are **clamped** rather than
 //! truncated, at a different number for each of the two getters, and whose
 //! `0xffffffff` means "no limit" rather than the number it spells (see
-//! [`rlimit`](rlimit)).
+//! [`rlimit`](rlimit)); and `rt_sigaction` (174) and `sigaltstack` (186),
+//! whose structures lose a pointer's width in some members and not in
+//! others, next to the `rt_sigreturn` (173) that reads the frame they set up
+//! (see [`signal`](signal)).
 //!
 //! ## The renames
 //!
@@ -115,6 +119,7 @@ mod fcntl;
 mod ioctl;
 mod iovec;
 mod rlimit;
+mod signal;
 mod socketcall;
 mod stat;
 mod tls;
@@ -159,6 +164,12 @@ const I386_UGETRLIMIT: u32 = 191;
 /// `socketcall`, the one number behind which i386 keeps all twenty socket
 /// calls. See [`socketcall`].
 const I386_SOCKETCALL: u32 = 102;
+
+/// And the signal calls whose structures are not the native ones halved:
+/// a `struct sigaction`'s `sa_mask` does not change width while its other
+/// three members do, a `struct sigaltstack` loses padding rather than bytes,
+/// and `rt_sigreturn` reads a 32-bit frame. See [`signal`].
+use signal::{I386_RT_SIGACTION, I386_RT_SIGRETURN, I386_SIGALTSTACK};
 
 /// And `ioctl`, which is in neither allowlist because the thing to vouch for
 /// is not the call but the **request**. See [`ioctl`].
@@ -252,6 +263,16 @@ impl Syscall<'_> {
             I386_IOCTL => {
                 return syscall_ret(self.sys_ioctl32(a0, a1 as u32, a2, a3, a4).await);
             }
+            // The signal calls. `rt_sigreturn` asks the process how wide its
+            // frame is rather than being a second handler: see
+            // `Syscall::sys_rt_sigreturn`.
+            I386_RT_SIGACTION => {
+                return syscall_ret(self.sys_rt_sigaction32(a0, a1.into(), a2.into(), a3));
+            }
+            I386_SIGALTSTACK => {
+                return syscall_ret(self.sys_sigaltstack32(a0.into(), a1.into()));
+            }
+            I386_RT_SIGRETURN => return syscall_ret(self.sys_rt_sigreturn()),
             I386_PREADV => return syscall_ret(self.sys_preadv32(a0, a1, a2, a3, a4).await),
             I386_PWRITEV => return syscall_ret(self.sys_pwritev32(a0, a1, a2, a3, a4)),
             _ => {}

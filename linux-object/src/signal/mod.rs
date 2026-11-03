@@ -4,9 +4,11 @@ use bitflags::*;
 use numeric_enum_macro::numeric_enum;
 
 mod action;
+pub mod siginfo32;
 pub mod ucontext;
 
 pub use action::*;
+pub use siginfo32::{siginfo_layout, SiginfoLayout, SIGINFO_LEN};
 pub use ucontext::*;
 
 #[repr(C)]

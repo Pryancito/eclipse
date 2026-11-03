@@ -9,7 +9,7 @@
 //! - sigaltstack
 
 use super::*;
-use crate::outparams::commit_and_report_old;
+use crate::outparams::{commit_and_report_old, commit_and_report_old_with};
 use linux_object::error::LxResult;
 use linux_object::process::{Credentials, LinuxProcess};
 use linux_object::signal::{
@@ -439,25 +439,55 @@ impl Syscall<'_> {
         mut oldact: UserOutPtr<SignalAction>,
         sigsetsize: usize,
     ) -> SysResult {
-        // sigaction(2) has no use for the probe: `do_sigaction()` rejects
-        // signal 0 (`sig < 1`) alongside everything out of range.
-        let signal = Signal::from_syscall_arg(signum)?.ok_or(LxError::EINVAL)?;
         info!(
-            "rt_sigaction: signal={:?}, act={:?}, oldact={:?}, sigsetsize={}, thread={}",
-            signal,
+            "rt_sigaction: signum={}, act={:?}, oldact={:?}, sigsetsize={}, thread={}",
+            signum,
             act,
             oldact,
             sigsetsize,
             self.thread.id()
         );
+        self.sigaction_with(
+            signum,
+            act.is_null(),
+            sigsetsize,
+            || Ok(act.read()?),
+            |old| Ok(oldact.write_if_not_null(old)?),
+        )
+    }
+
+    /// `do_sigaction()`, with the reading of the new action and the writing of
+    /// the old one left to the caller.
+    ///
+    /// A `struct sigaction` is twenty bytes to a 32-bit process and
+    /// thirty-two here, so the compat entry cannot pass a
+    /// `UserInPtr<SignalAction>` --- but everything the call DOES is the
+    /// same, down to the order in which it does it. Splitting at the
+    /// structures rather than writing the call twice is what keeps the two
+    /// from drifting: the signal check, the `sigsetsize` check, the refusal
+    /// of a disposition for `SIGKILL`/`SIGSTOP`, the `sa_mask` filtering and
+    /// the "change first, report the old value last" order are all here, and
+    /// there is no second copy of any of them to forget.
+    pub(crate) fn sigaction_with(
+        &self,
+        signum: usize,
+        act_is_null: bool,
+        sigsetsize: usize,
+        read_act: impl FnOnce() -> LxResult<SignalAction>,
+        write_old: impl FnOnce(SignalAction) -> Result<(), LxError>,
+    ) -> SysResult {
+        // sigaction(2) has no use for the probe: `do_sigaction()` rejects
+        // signal 0 (`sig < 1`) alongside everything out of range.
+        let signal = Signal::from_syscall_arg(signum)?.ok_or(LxError::EINVAL)?;
         check_sigsetsize(sigsetsize)?;
-        if sigaction_refused(signal, act.is_null()) {
+        if sigaction_refused(signal, act_is_null) {
             return Err(LxError::EINVAL);
         }
         let proc = self.linux_process();
         let old = proc.signal_action(signal);
-        commit_and_report_old(old, &mut oldact, || {
-            if let Some(act) = act.read_if_not_null()? {
+        commit_and_report_old_with(old, write_old, || {
+            if !act_is_null {
+                let act = read_act()?;
                 info!("new action: {:?} -> {:x?}", signal, act);
                 // `SignalAction::stored` is the fifth door into "which signals
                 // may be blocked", and the only one that was not shut: a
@@ -541,6 +571,23 @@ impl Syscall<'_> {
         mut old_ss: UserOutPtr<SignalStack>,
     ) -> SysResult {
         info!("sigaltstack: ss={:?}, old_ss={:?}", ss, old_ss);
+        self.sigaltstack_with(
+            ss.is_null(),
+            || Ok(ss.read()?),
+            |old| Ok(old_ss.write_if_not_null(old)?),
+        )
+    }
+
+    /// `do_sigaltstack()`, with the structures left to the caller: a
+    /// `struct sigaltstack` is twelve bytes to a 32-bit process and
+    /// twenty-four here, and everything else is the same call. See
+    /// [`Syscall::sigaction_with`] for why the split is at the structures.
+    pub(crate) fn sigaltstack_with(
+        &self,
+        ss_is_null: bool,
+        read_ss: impl FnOnce() -> LxResult<SignalStack>,
+        write_old: impl FnOnce(SignalStack) -> Result<(), LxError>,
+    ) -> SysResult {
         // `SS_ONSTACK` and `SS_DISABLE` come from the stack pointer the caller
         // is using right now, not from anything stored -- see
         // `SignalStack::as_reported_from`. Without this the flag was never set
@@ -555,11 +602,11 @@ impl Syscall<'_> {
             .lock_linux()
             .signal_alternate_stack
             .as_reported_from(sp);
-        commit_and_report_old(old, &mut old_ss, || {
-            if ss.is_null() {
+        commit_and_report_old_with(old, write_old, || {
+            if ss_is_null {
                 return Ok(());
             }
-            let ss = ss.read()?;
+            let ss = read_ss()?;
             check_sigaltstack(ss, old.flags.contains(SignalStackFlags::ONSTACK))?;
             // `SS_DISABLE` forgets the stack, it does not merely park it:
             // Linux zeroes `ss_sp`/`ss_size` here, so the next
@@ -851,13 +898,20 @@ impl Syscall<'_> {
             Some(v) => v,
             None => return Err(LxError::EINVAL),
         };
+        // Which frame is at those two addresses is a property of the
+        // PROCESS, not of the call: a 32-bit program reaches this through
+        // i386 number 173 and a native one through 15, and both arrive here.
+        // Reading the native `ucontext` out of a 116-byte one would restore
+        // the interrupted registers from 820 bytes past the end of the frame.
+        let narrow = self.narrow_abi();
         self.thread
             .with_context(|ctx| {
-                self.thread.lock_linux().restore_after_handle_signal(
+                self.thread.lock_linux().restore_after_a_handler(
                     ctx,
                     &old_ctx,
                     siginfo_ptr,
                     uctx_ptr,
+                    narrow,
                 )
             })
             .map_err(|_| LxError::EINVAL)?;
