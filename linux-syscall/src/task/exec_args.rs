@@ -30,16 +30,17 @@ const ARG_CEILING: usize = 6 << 20;
 
 /// `argv` as the new program gets it: what the caller passed, or one empty
 /// string when that is no argument at all.
-pub(super) fn read_argv(argv: UserInPtr<UserInPtr<u8>>) -> LxResult<Vec<String>> {
-    let mut args = if argv.is_null() {
-        Vec::new()
-    } else {
-        argv.read_cstring_array()?
-    };
+///
+/// The array itself is read by the caller, through
+/// [`Syscall::read_cstring_array`](crate::Syscall::read_cstring_array),
+/// which asks the process how wide one of its pointers is. This is only the
+/// rule about an empty `argv`, which is Linux's: a program always gets an
+/// `argv[0]`, even when it was given none.
+pub(super) fn argv_or_empty(mut args: Vec<String>) -> Vec<String> {
     if args.is_empty() {
         args.push(String::new());
     }
-    Ok(args)
+    args
 }
 
 /// How many bytes of strings and pointers an exec may hand the new program
@@ -63,12 +64,13 @@ pub(super) fn check_arg_sizes(
     args: &[String],
     envs: &[String],
     limit: usize,
+    pointer_size: usize,
 ) -> LxResult<()> {
     let strings = || core::iter::once(filename).chain(args.iter().chain(envs).map(String::as_str));
     if strings().any(|s| s.len() + 1 > MAX_ARG_STRLEN) {
         return Err(LxError::E2BIG);
     }
-    let pointers = (args.len() + envs.len()) * size_of::<usize>();
+    let pointers = (args.len() + envs.len()) * pointer_size;
     let bytes: usize = strings().map(|s| s.len() + 1).sum::<usize>() + pointers;
     if bytes > limit {
         return Err(LxError::E2BIG);
@@ -84,7 +86,28 @@ pub(super) fn check_exec_args(
     envs: &[String],
 ) -> LxResult<()> {
     let stack = proc.rlimit(RLIMIT_STACK, None, false)?.cur;
-    check_arg_sizes(filename, args, envs, arg_limit(stack))
+    check_arg_sizes(
+        filename,
+        args,
+        envs,
+        arg_limit(stack),
+        pointer_size(proc.abi()),
+    )
+}
+
+/// What one pointer of the initial stack costs the limit: four bytes for a
+/// 32-bit process and eight for a native one.
+///
+/// Linux counts `sizeof(void *)` of the **new** program here
+/// (`bprm_stack_limits` through `bprm->p`), and the number is the one the
+/// loader will really write: counting eight for a 32-bit image refuses an
+/// argument list that fits, by twice the size of its pointer table.
+pub(super) fn pointer_size(abi: linux_object::process::Abi) -> usize {
+    if abi.is_32bit() {
+        4
+    } else {
+        size_of::<usize>()
+    }
 }
 
 #[cfg(test)]

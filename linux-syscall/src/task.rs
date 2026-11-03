@@ -1507,13 +1507,21 @@ impl Syscall<'_> {
         // Normal program launch — keep at debug so shells / fork+exec loops
         // don't pay a synchronous serial write per exec at the default LOG=warn.
         debug!("EXECVE: path={:?}", path_str);
-        let args = exec_args::read_argv(argv).inspect_err(|&e| {
-            error!("execve: argv.read_cstring_array() failed: {:?}", e);
-        })?;
+        // Both arrays are read at the CALLING process's pointer width: a
+        // 32-bit program's `argv` is four bytes an entry, and reading it at
+        // eight does not fail, it invents the arguments. See
+        // `Syscall::read_cstring_array`.
+        let args = exec_args::argv_or_empty(if argv.is_null() {
+            Vec::new()
+        } else {
+            self.read_cstring_array(argv).inspect_err(|&e| {
+                error!("execve: reading argv failed: {:?}", e);
+            })?
+        });
         let mut envs: Vec<String> = Vec::new();
         if !envp.is_null() {
-            envs = envp.read_cstring_array().inspect_err(|&e| {
-                error!("execve: envp.read_cstring_array() failed: {:?}", e);
+            envs = self.read_cstring_array(envp).inspect_err(|&e| {
+                error!("execve: reading envp failed: {:?}", e);
             })?;
         }
         // Bound argv+envp so a huge argument list -- a glob like `rm dir/*`
@@ -3920,6 +3928,9 @@ mod wait_family_wiring_tests;
 
 #[cfg(test)]
 mod execve_refusal_wiring_tests;
+
+#[cfg(test)]
+mod exec_argv32_wiring_tests;
 
 #[cfg(test)]
 mod vfork_wiring_tests;

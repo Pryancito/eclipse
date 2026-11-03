@@ -478,6 +478,45 @@ impl<P: 'static + Read> UserPtr<UserPtr<u8, P>, P> {
         }
         Err(Error::InvalidLength)
     }
+
+    /// [`read_cstring_array`](Self::read_cstring_array) for a 32-bit
+    /// process, whose `argv` and `envp` are arrays of **4-byte** pointers.
+    ///
+    /// Reading one of those at the native width does not fail --- the same
+    /// thing that makes the narrow `iovec` dangerous (see
+    /// [`read_iovecs32`](UserPtr::read_iovecs32)) --- it pairs the halves
+    /// wrongly: entry 0 comes out as `argv[0]` with `argv[1]` in its high
+    /// half, which is an address nothing in the array named, and the `NULL`
+    /// that ends a two-entry array is read as part of entry 1 rather than as
+    /// the terminator. What `execve` then builds for the new program is
+    /// whatever `as_c_str` finds at an address the caller never wrote.
+    ///
+    /// Each pointer is zero-extended, like `compat_ptr`: a 32-bit address is
+    /// an address in the low 4 GiB and never a negative offset from the top
+    /// of the address space.
+    ///
+    /// The array is walked one entry at a time rather than read whole,
+    /// because its length is the position of the `NULL` and the walk must
+    /// not read past it: an `argv` with no terminator before the end of its
+    /// mapping is `EFAULT`, not a walk into whatever comes next. That is
+    /// what the per-page check does, exactly as in the native version.
+    pub fn read_cstring_array32(&self) -> Result<Vec<String>> {
+        let mut result = Vec::new();
+        let base: UserPtr<u32, P> = UserPtr::from(self.0 as usize);
+        for i in 0..MAX_C_STR_ARRAY_LEN {
+            let at = base.add(i);
+            if at.starts_a_page(i) {
+                at.check_len_for(1, MMUFlags::READ)?;
+            }
+            let sptr = unsafe { at.0.read() };
+            if sptr == 0 {
+                return Ok(result);
+            }
+            let string: UserPtr<u8, P> = UserPtr::from(sptr as usize);
+            result.push(string.as_c_str()?.into());
+        }
+        Err(Error::InvalidLength)
+    }
 }
 
 impl<T, P: Write> UserPtr<T, P> {

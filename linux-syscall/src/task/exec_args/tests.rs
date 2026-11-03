@@ -15,13 +15,25 @@ fn argv_at(pointers: &[usize]) -> UserInPtr<UserInPtr<u8>> {
 
 #[test]
 fn a_null_or_an_empty_argv_is_one_empty_argument() {
-    assert_eq!(read_argv(UserInPtr::from(0)).unwrap(), strings(&[""]));
-    assert_eq!(read_argv(argv_at(&[0])).unwrap(), strings(&[""]));
-    let (a, b) = (b"uno\0", b"dos\0");
+    // Linux's rule, and the whole of what this helper decides now that the
+    // array itself is read by the caller at the calling process's pointer
+    // width (`Syscall::read_cstring_array`): a program always gets an
+    // `argv[0]`, even when it was given none.
+    assert_eq!(argv_or_empty(Vec::new()), strings(&[""]));
     assert_eq!(
-        read_argv(argv_at(&[a.as_ptr() as usize, b.as_ptr() as usize, 0])).unwrap(),
+        argv_or_empty(strings(&["uno", "dos"])),
         strings(&["uno", "dos"]),
         "an argv with arguments is what it says"
+    );
+    // And the reading itself, at the native width, through the pointer type
+    // the caller passes.
+    assert_eq!(argv_at(&[0]).read_cstring_array().unwrap(), strings(&[]));
+    let (a, b) = (b"uno\0", b"dos\0");
+    assert_eq!(
+        argv_at(&[a.as_ptr() as usize, b.as_ptr() as usize, 0])
+            .read_cstring_array()
+            .unwrap(),
+        strings(&["uno", "dos"])
     );
 }
 
@@ -30,30 +42,33 @@ fn one_string_may_take_32_pages_with_its_nul() {
     let most = "a".repeat(MAX_ARG_STRLEN - 1);
     let over = "a".repeat(MAX_ARG_STRLEN);
     let limit = usize::MAX;
-    assert!(check_arg_sizes("f", &[most.clone()], &[], limit).is_ok());
+    assert!(check_arg_sizes("f", &[most.clone()], &[], limit, 8).is_ok());
     assert_eq!(
-        check_arg_sizes("f", &[String::new(), over.clone()], &[], limit),
+        check_arg_sizes("f", &[String::new(), over.clone()], &[], limit, 8),
         Err(LxError::E2BIG)
     );
     assert_eq!(
-        check_arg_sizes("f", &[], &[over.clone()], limit),
+        check_arg_sizes("f", &[], &[over.clone()], limit, 8),
         Err(LxError::E2BIG),
         "an environment string"
     );
     assert_eq!(
-        check_arg_sizes(&over, &[], &[], limit),
+        check_arg_sizes(&over, &[], &[], limit, 8),
         Err(LxError::E2BIG),
         "the file name"
     );
-    assert!(check_arg_sizes(&most.clone(), &[most.clone()], &[most], limit).is_ok());
+    assert!(check_arg_sizes(&most.clone(), &[most.clone()], &[most], limit, 8).is_ok());
 }
 
 #[test]
 fn the_total_is_the_strings_with_their_nuls_and_a_pointer_for_each() {
     let (args, envs) = (strings(&["ab"]), strings(&["c"]));
     // "f\0", "ab\0" and "c\0" are 7 bytes; two pointers 16.
-    assert!(check_arg_sizes("f", &args, &envs, 23).is_ok());
-    assert_eq!(check_arg_sizes("f", &args, &envs, 22), Err(LxError::E2BIG));
+    assert!(check_arg_sizes("f", &args, &envs, 23, 8).is_ok());
+    assert_eq!(
+        check_arg_sizes("f", &args, &envs, 22, 8),
+        Err(LxError::E2BIG)
+    );
 }
 
 #[test]

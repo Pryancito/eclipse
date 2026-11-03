@@ -110,8 +110,9 @@ mremap
 //
 // `clone` is NOT here: i386 is `clone(flags, stack, ptid, tls, ctid)` and
 // x86_64 is `clone(flags, stack, ptid, ctid, tls)` -- the last two arguments
-// are swapped, which no name match can see. Nor is `execve`, whose `argv` and
-// `envp` are arrays of 4-byte pointers.
+// are swapped, which no name match can see. Nor is `execve`: its `argv` and
+// `envp` are arrays of 4-byte pointers, so it is in the OTHER allowlist,
+// with the calls whose structures the handler converts itself.
 exit
 exit_group
 fork

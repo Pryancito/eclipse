@@ -76,6 +76,28 @@ impl Syscall<'_> {
     /// that call yet (`socketcall` answers `ENOSYS`), so routing the list
     /// through here makes it one less thing wrong rather than one thing
     /// right.
+    /// `argv` and `envp` as the calling process writes them: an array of
+    /// pointers ended by a `NULL`, four bytes each for a 32-bit process and
+    /// eight for a native one.
+    ///
+    /// The same rule as [`read_iovecs`](Self::read_iovecs), and for the same
+    /// reason: the width is the process's, not the call site's, so `execve`
+    /// and `execveat` both get it without either one remembering. Without
+    /// this an `execve` from a 32-bit program read its `argv` at the native
+    /// width, which does not fail --- it builds the new program's arguments
+    /// out of addresses the caller never wrote.
+    pub(crate) fn read_cstring_array(
+        &self,
+        array: UserInPtr<UserInPtr<u8>>,
+    ) -> LxResult<alloc::vec::Vec<alloc::string::String>> {
+        if self.linux_process().abi().is_32bit() {
+            array.read_cstring_array32()
+        } else {
+            array.read_cstring_array()
+        }
+        .map_err(Into::into)
+    }
+
     pub(crate) fn read_iovecs<P: 'static + kernel_hal::user::Policy>(
         &self,
         iov_ptr: UserInPtr<kernel_hal::user::IoVec<P>>,

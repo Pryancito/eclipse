@@ -273,7 +273,6 @@ fn the_calls_that_share_a_name_but_not_a_shape() {
             "clone",
             "i386 swaps the last two arguments (tls, ctid)",
         ),
-        (11, "execve", "argv and envp are arrays of 4-byte pointers"),
         (
             174,
             "rt_sigaction",
@@ -356,6 +355,33 @@ fn the_select_that_is_mapped_is_the_one_that_uses_registers() {
         "_newselect is the native select"
     );
     assert_eq!(native_number(82), None, "old_select takes a memory block");
+}
+
+/// `execve` and `execveat` are mapped, and for a third reason again: what
+/// differs is neither a halved structure nor an alignment but an **array of
+/// pointers**. A 32-bit program's `argv` and `envp` are four-byte entries
+/// ended by a four-byte NULL, and reading them at the native width does not
+/// fail --- it pairs the halves of two entries into one pointer and hands the
+/// new program arguments nobody passed.
+///
+/// They sat in the list above, unmapped with that very reason written next to
+/// them, until the handler learned to ask the calling process how wide a
+/// pointer is (`Syscall::read_cstring_array`). This test is the other side of
+/// that move: keeping them out would mean a 32-bit program could not start
+/// any program at all --- no shell, no `xargs`, no second half of a pipeline
+/// --- which is a worse answer than the one the conversion gives.
+#[test]
+fn execve_is_mapped_because_the_handler_reads_argv_at_the_callers_width() {
+    assert_eq!(name(11), Some("execve"));
+    assert_eq!(name(358), Some("execveat"));
+    assert!(
+        native_number(11).is_some(),
+        "execve must be mapped: its argv is read four bytes at a time"
+    );
+    assert!(
+        native_number(358).is_some(),
+        "execveat must be mapped: same arrays, same conversion"
+    );
 }
 
 /// `pselect6` is the one to keep out, and the reason is not its timeout ---
