@@ -165,7 +165,7 @@ impl GenericPageTable for PageTable {
             // A host mmap replaces whatever was there, where a real table
             // answers `AlreadyMapped`: count the page it replaced out first.
             let old = MAPPED_PAGES.lock().insert(page.vaddr, (paddr, flags));
-            if old.map_or(false, |(_, f)| !f.contains(MMUFlags::SPECIAL)) {
+            if old.is_some_and(|(_, f)| !f.contains(MMUFlags::SPECIAL)) {
                 self.resident.sub(PAGE_SIZE);
             }
             if !flags.contains(MMUFlags::SPECIAL) {
