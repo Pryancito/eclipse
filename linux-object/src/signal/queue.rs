@@ -143,8 +143,7 @@ impl SigQueue {
             let charge = match to {
                 None => None,
                 Some(to) => {
-                    let override_limit =
-                        signal.is_standard() && info.map_or(true, |i| i.code.0 >= 0);
+                    let override_limit = signal.is_standard() && info.is_none_or(|i| i.code.0 >= 0);
                     match Charge::take(to, override_limit) {
                         Some(charge) => Some(charge),
                         None if !signal.is_standard()
