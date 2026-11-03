@@ -77,6 +77,19 @@
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
+ *   192+e  execve of this program itself answered errno e (step 61)
+ *
+ * Step 61 is the one step whose result this program cannot read: a
+ * successful `execve` replaces it. So it execs ITSELF with one argument
+ * added and lets the new image report. A run started with no arguments does
+ * all 60 steps, execs, and the second image does all 60 again and exits 0
+ * because `argc >= 2`; a run started WITH an argument does the 60 and stops
+ * there, which is the same program with the step switched off. The status
+ * that reaches the shell is therefore the second image's, so an `argv` that
+ * arrived miscounted comes back as 13 or 14 --- which is what a kernel
+ * reading a 32-bit `argv` eight bytes at a time produces, since pairing the
+ * halves of two entries into one pointer neither faults nor is noticed by
+ * anything else.
  *
  * The last six are the segment registers, which is the second half of what
  * compatibility mode needs and the half `iretq` does not do: it reloads `CS`
@@ -119,6 +132,20 @@ _start:
 	movl	4(%esp), %eax
 	testl	%eax, %eax
 	jz	bad_argv
+
+	/* Keep what step 61 needs, because this is the only place it is
+	 * reachable: `%esp` is this program's to move, and nothing below
+	 * promises to leave the initial frame where it is. `argc` decides
+	 * whether this run is the first or the one the first one exec'd,
+	 * `argv[0]` is the name to exec, and the environment begins one NULL
+	 * past the end of the argv array --- 4 bytes of `argc`, 4 per argv
+	 * entry, 4 for its terminator. */
+	movl	4(%esp), %eax
+	movl	%eax, saved_argv0
+	movl	(%esp), %eax
+	movl	%eax, saved_argc
+	leal	8(%esp,%eax,4), %eax
+	movl	%eax, saved_envp
 
 	/* write(1, msg, msglen): i386 4, where 4 is `stat` in the native
 	 * numbering. Nothing else in this program would notice an untranslated
@@ -1325,6 +1352,48 @@ statx_poison:
 	cmpl	$tls_area, %eax
 	jne	bad_get_tls
 
+	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
+	 * program needs to start any program at all --- a shell, `xargs`, the
+	 * second half of a pipeline. Its `argv` and `envp` are arrays of
+	 * FOUR-byte pointers ended by a four-byte NULL, and a kernel that
+	 * reads them eight bytes at a time does not fault: it pairs the halves
+	 * of two entries into one pointer and hands the new program arguments
+	 * nobody passed. So the shape of the step is not "did the call
+	 * return" --- a successful `execve` never returns --- but "does the
+	 * program that comes out of it agree with the one that went in".
+	 *
+	 * This run execs ITSELF with one argument added, so the new image runs
+	 * the whole probe again and, finding `argc >= 2`, exits 0 without
+	 * exec'ing a third time. The status this program finally reports is
+	 * therefore the SECOND image's: if the arguments arrived wrong the
+	 * exec'd image fails `bad_argc` or `bad_argv` and says so with its own
+	 * number, and if the exec is refused outright this one reports
+	 * 192 plus the errno --- `ENOENT` is 2 and `EFAULT` is 14, so 194 and
+	 * 206 are the two to expect, and no errno reaches the 128 and 160
+	 * bands above. */
+	cmpl	$2, saved_argc
+	jge	all_steps_passed
+
+	/* { argv[0], "x", NULL }, written as four-byte entries: this is the
+	 * array a 32-bit program builds, not one this program could borrow
+	 * from its own stack. */
+	movl	saved_argv0, %eax
+	movl	%eax, xargv + 0
+	movl	$xarg1, %eax
+	movl	%eax, xargv + 4
+	movl	$0, xargv + 8
+
+	movl	$11, %eax		/* execve */
+	movl	saved_argv0, %ebx
+	movl	$xargv, %ecx
+	movl	saved_envp, %edx
+	int	$0x80
+	negl	%eax
+	addl	$192, %eax
+	movl	%eax, %ebx
+	jmp	die
+
+all_steps_passed:
 	xorl	%ebx, %ebx
 	jmp	die
 
@@ -1560,6 +1629,10 @@ ptmxpath:
 	/* The empty path of AT_EMPTY_PATH, which names the descriptor itself. */
 emptystr:
 	.asciz	""
+	/* The one argument step 61 adds, which is only there to be counted:
+	 * the exec'd image reads `argc`, not what the argument says. */
+xarg1:
+	.asciz	"x"
 
 	.section .data
 	.align 4
@@ -1699,6 +1772,20 @@ twopages:
 	.align 4
 statbuf:
 	.space	96
+	/* What step 61 keeps from the initial stack, and the array it builds.
+	 * `xargv` is given the room a NATIVE read of three entries would
+	 * need, so that a kernel reading it eight bytes at a time walks this
+	 * program's own memory rather than off the end of the section: the
+	 * test is the arguments the new image sees, not a fault. */
+	.align 4
+saved_argc:
+	.long	0
+saved_argv0:
+	.long	0
+saved_envp:
+	.long	0
+xargv:
+	.space	48
 lock64:
 	.word	0			/* l_type: F_RDLCK */
 	.word	0			/* l_whence: SEEK_SET */

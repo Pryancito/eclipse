@@ -92,3 +92,19 @@ statx
 // `getrlimit` (76) and `ugetrlimit` (191) -- are NOT here: theirs is a clamp
 // and not a halving, so they have their own handlers in `compat32::rlimit`.
 prlimit64
+
+// argv and envp: arrays of POINTERS, four bytes each for a 32-bit caller
+// against eight natively, read at the calling process's width by
+// `Syscall::read_cstring_array`. Not a halved structure like the rest of
+// this file, but the same rule and the same reason: reading the narrow array
+// at the native width does not fail, it pairs the halves wrongly and the new
+// program's arguments come out of addresses the caller never wrote. The
+// pointer table's cost against `RLIMIT_STACK` is counted at the same width
+// (`exec_args::pointer_size`), because Linux counts the NEW program's
+// pointer there.
+//
+// Everything else these two pass is a path or a scalar, and the image they
+// load brings its own ABI: `exec_at` adopts whatever the loader detected, so
+// a 32-bit program may exec a 64-bit one and stop being a 32-bit process.
+execve
+execveat
