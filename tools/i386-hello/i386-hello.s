@@ -2022,6 +2022,353 @@ statx_poison:
 	cmpl	$-22, %eax
 	jne	bad_nanosleep64
 
+	/* Step 76: the rest of the `*_time64` family this kernel answers ---
+	 * `timerfd_gettime64` (410), `timerfd_settime64` (411) and
+	 * `futex_time64` (422).
+	 *
+	 * These three are what a threaded 32-bit program actually waits on.
+	 * 422 is the number behind every `pthread_cond_timedwait`, every
+	 * `sem_timedwait` and every `pthread_mutex_timedlock` of a modern
+	 * i386 musl, and the two `timerfd` numbers are behind every timer it
+	 * arms. A `struct itimerspec` is TWO `timespec`s, so sixteen bytes at
+	 * this program's own width and thirty-two at the `_time64` one: a
+	 * kernel that got the width from the process rather than from the
+	 * number would hand back the interval where the value belongs.
+	 *
+	 * As in step 75, each pair is made from this one program so that
+	 * neither half can pass on its own. */
+	movl	$322, %eax		/* timerfd_create */
+	movl	$1, %ebx		/* CLOCK_MONOTONIC */
+	xorl	%ecx, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_timerfd_create
+	movl	%eax, tfd
+
+	/* Armed through the NARROW number, so what follows is not one width
+	 * all the way through: sixteen bytes in, and sixteen or thirty-two
+	 * out. { it_interval = {0, 0}, it_value = {100, 0} }. */
+	movl	$0, its + 0
+	movl	$0, its + 4
+	movl	$100, its + 8
+	movl	$0, its + 12
+	movl	$325, %eax		/* timerfd_settime */
+	movl	tfd, %ebx
+	xorl	%ecx, %ecx		/* relative */
+	movl	$its, %edx
+	xorl	%esi, %esi		/* no old value */
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_timerfd_arm
+
+	/* 326: sixteen bytes, interval zero, value a hair under a hundred
+	 * seconds, and the poison untouched after them. */
+	call	poison_tbuf
+	movl	$326, %eax		/* timerfd_gettime */
+	movl	tfd, %ebx
+	movl	$tbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_timerfd_narrow
+	cmpl	$0, tbuf + 0
+	jne	bad_timerfd_narrow
+	cmpl	$0, tbuf + 4
+	jne	bad_timerfd_narrow
+	cmpl	$100, tbuf + 8		/* it_value.tv_sec, narrow offset */
+	ja	bad_timerfd_narrow
+	cmpl	$90, tbuf + 8
+	jb	bad_timerfd_narrow
+	cmpl	$0xaaaaaaaa, tbuf + 16
+	jne	bad_timerfd_narrow
+	cmpl	$0xaaaaaaaa, tbuf + 20
+	jne	bad_timerfd_narrow
+
+	/* 410: the same timer, thirty-two bytes. `it_value.tv_sec` is now at
+	 * byte 16 and its high half at byte 20 --- which is where the narrow
+	 * layout keeps nothing at all, so a kernel that wrote sixteen bytes
+	 * leaves the poison there and this fails. */
+	call	poison_tbuf
+	movl	$410, %eax		/* timerfd_gettime64 */
+	movl	tfd, %ebx
+	movl	$tbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_timerfd64
+	cmpl	$0, tbuf + 0		/* it_interval, both words of both */
+	jne	bad_timerfd64
+	cmpl	$0, tbuf + 4
+	jne	bad_timerfd64
+	cmpl	$0, tbuf + 8
+	jne	bad_timerfd64
+	cmpl	$0, tbuf + 12
+	jne	bad_timerfd64
+	cmpl	$100, tbuf + 16		/* it_value.tv_sec, wide offset */
+	ja	bad_timerfd64
+	cmpl	$90, tbuf + 16
+	jb	bad_timerfd64
+	cmpl	$0, tbuf + 20		/* its high half */
+	jne	bad_timerfd64
+	cmpl	$0xaaaaaaaa, tbuf + 32	/* and nothing past the structure */
+	jne	bad_timerfd64
+
+	/* 411 the other way: thirty-two bytes whose WIDE reading has an
+	 * `it_value.tv_nsec` of two thousand million --- over a billion, so
+	 * EINVAL --- while the same bytes read sixteen at a time are four
+	 * zero words, a perfectly good disarm that returns 0. EINVAL is 22. */
+	movl	$0, its + 0
+	movl	$0, its + 4
+	movl	$0, its + 8
+	movl	$0, its + 12
+	movl	$0, its + 16
+	movl	$0, its + 20
+	movl	$2000000000, its + 24
+	movl	$0, its + 28
+	movl	$411, %eax		/* timerfd_settime64 */
+	movl	tfd, %ebx
+	xorl	%ecx, %ecx
+	movl	$its, %edx
+	xorl	%esi, %esi
+	int	$0x80
+	cmpl	$-22, %eax
+	jne	bad_timerfd_settime64
+
+	movl	$6, %eax		/* close the timerfd */
+	movl	tfd, %ebx
+	int	$0x80
+
+	/* 422: the futex timeout. The same discriminating bytes --- a 64-bit
+	 * `tv_sec` of zero and a 64-bit `tv_nsec` of two thousand million ---
+	 * which are EINVAL read as sixteen and `{0, 0}` read as eight. So
+	 * 422 must answer -22, and i386's own 240, which DOES read eight,
+	 * must park for nothing and come back ETIMEDOUT (110). Two different
+	 * errors, so neither can be reached by accident. */
+	movl	$0, tbuf + 0
+	movl	$0, tbuf + 4
+	movl	$2000000000, tbuf + 8
+	movl	$0, tbuf + 12
+	movl	$0, fword
+	movl	$422, %eax		/* futex_time64 */
+	movl	$fword, %ebx
+	movl	$128, %ecx		/* FUTEX_WAIT | FUTEX_PRIVATE_FLAG */
+	xorl	%edx, %edx		/* the value we expect: 0 */
+	movl	$tbuf, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	cmpl	$-22, %eax
+	jne	bad_futex_time64
+
+	movl	$240, %eax		/* futex */
+	movl	$fword, %ebx
+	movl	$128, %ecx
+	xorl	%edx, %edx
+	movl	$tbuf, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	cmpl	$-110, %eax
+	jne	bad_futex_narrow
+
+	/* Step 77: `ipc` (117), the eleven System V calls behind one number.
+	 *
+	 * i386 never got the separate `semget`/`msgsnd`/`shmat` syscalls, so
+	 * every System V program on this ABI goes through here. What makes
+	 * the step worth having is that the MULTIPLEXER itself reads and
+	 * writes this program's memory in three places --- places that are
+	 * in no handler at all --- and that `struct msgbuf` keeps its type
+	 * in a `long`, which is four bytes here and eight to the kernel.
+	 *
+	 * Sub-calls: SEMOP 1, SEMGET 2, SEMCTL 3, MSGSND 11, MSGRCV 12,
+	 * MSGGET 13, MSGCTL 14, SHMAT 21, SHMDT 22, SHMGET 23, SHMCTL 24.
+	 * The version is `call >> 16`.
+	 *
+	 * `0x100` is `__IPC_64`, which an i386 glibc ORs into the command of
+	 * EVERY `*ctl`. Sent that way here on purpose: a kernel that does not
+	 * take the bit off again answers EINVAL to all of them, `IPC_RMID`
+	 * included. */
+
+	/* shmget(IPC_PRIVATE, 4096, IPC_CREAT|0600) */
+	movl	$117, %eax
+	movl	$23, %ebx
+	xorl	%ecx, %ecx		/* IPC_PRIVATE */
+	movl	$4096, %edx
+	movl	$0x600, %esi
+	orl	$0x200, %esi		/* IPC_CREAT */
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_shmget
+	movl	%eax, shmid
+
+	/* shmat: the address comes back in `third`, in FOUR bytes, and the
+	 * call answers 0. Eight would drop a zero high half into the word
+	 * after it, which is why `ipcout + 4` is checked. */
+	movl	$0xaaaaaaaa, ipcout + 0
+	movl	$0xaaaaaaaa, ipcout + 4
+	movl	$117, %eax
+	movl	$21, %ebx
+	movl	shmid, %ecx
+	xorl	%edx, %edx		/* no flags */
+	movl	$ipcout, %esi		/* third: where the address goes */
+	xorl	%edi, %edi		/* ptr: any address */
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_shmat		/* it answers 0, NOT the address */
+	cmpl	$0xaaaaaaaa, ipcout + 0
+	je	bad_shmat		/* nothing was stored */
+	cmpl	$0, ipcout + 0
+	je	bad_shmat		/* a null pointer was stored */
+	cmpl	$0xaaaaaaaa, ipcout + 4
+	jne	bad_shmat		/* EIGHT bytes were stored */
+	movl	ipcout + 0, %eax
+	movl	%eax, shmaddr
+
+	/* And the segment is really there: write a word and read it back. */
+	movl	shmaddr, %edi
+	movl	$0x5a5a5a5a, (%edi)
+	cmpl	$0x5a5a5a5a, (%edi)
+	jne	bad_shmat
+
+	/* shmdt takes its address in `ptr`, not in `first`. */
+	movl	$117, %eax
+	movl	$22, %ebx
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	xorl	%esi, %esi
+	movl	shmaddr, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_shmdt
+
+	/* shmctl(id, IPC_RMID|__IPC_64, 0) */
+	movl	$117, %eax
+	movl	$24, %ebx
+	movl	shmid, %ecx
+	movl	$0x100, %edx		/* IPC_RMID | __IPC_64 */
+	xorl	%esi, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ipc_rmid
+
+	/* msgget, then a message whose type is 1 and whose payload is the
+	 * four bytes "ABCD". At this program's width those are bytes 0..4
+	 * and 4..8 of the `struct msgbuf`. Read eight bytes as one `long`,
+	 * the type becomes 0x44434241_00000001 --- a large POSITIVE number,
+	 * so not an error: the message would be queued under a type nobody
+	 * asks for, with its payload taken from four bytes further on. */
+	movl	$117, %eax
+	movl	$13, %ebx
+	xorl	%ecx, %ecx
+	movl	$0x600, %edx
+	orl	$0x200, %edx		/* IPC_CREAT */
+	xorl	%esi, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_msg
+	movl	%eax, msqid
+
+	movl	$1, msgbuf + 0		/* mtype */
+	movl	$0x44434241, msgbuf + 4	/* "ABCD", little-endian */
+	movl	$117, %eax
+	movl	$11, %ebx		/* MSGSND */
+	movl	msqid, %ecx
+	movl	$4, %edx		/* msgsz: the payload only */
+	xorl	%esi, %esi		/* msgflg */
+	movl	$msgbuf, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_msg			/* msgsnd(2) answers 0 */
+
+	/* MSGRCV version 0, which is the form glibc's i386 `msgrcv` has
+	 * always used: `ptr` points at a `struct ipc_kludge { void *msgp;
+	 * long msgtyp; }` and NOT at the buffer. A kernel that ignores the
+	 * version takes the address of the kludge as the buffer.
+	 *
+	 * The type asked for is -5, which is `msgrcv`'s "the lowest type not
+	 * above five" mode, so the sign matters: read unsigned it is four
+	 * thousand million and nothing ever matches. IPC_NOWAIT (0o4000) so
+	 * that a wrong type is ENOMSG and not a wait for ever. */
+	movl	$msgout, kludge + 0
+	movl	$-5, kludge + 4
+	movl	$0xaaaaaaaa, msgout + 0
+	movl	$0xaaaaaaaa, msgout + 4
+	movl	$0xaaaaaaaa, msgout + 8
+	movl	$117, %eax
+	movl	$12, %ebx		/* MSGRCV, version 0 */
+	movl	msqid, %ecx
+	movl	$4, %edx
+	movl	$04000, %esi		/* IPC_NOWAIT */
+	movl	$kludge, %edi
+	int	$0x80
+	cmpl	$4, %eax
+	jne	bad_msg
+	cmpl	$1, msgout + 0
+	jne	bad_msg			/* the type, in its four bytes */
+	cmpl	$0x44434241, msgout + 4
+	jne	bad_msg			/* the payload, at msgp + 4 */
+	cmpl	$0xaaaaaaaa, msgout + 8
+	jne	bad_msg			/* and nothing after it */
+
+	movl	$117, %eax
+	movl	$14, %ebx		/* MSGCTL */
+	movl	msqid, %ecx
+	movl	$0x100, %edx		/* IPC_RMID | __IPC_64 */
+	xorl	%esi, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ipc_rmid
+
+	/* semget, then SETVAL through SEMCTL --- the one sub-call where `ptr`
+	 * does NOT point at the structure: it points at a word HOLDING the
+	 * `union semun`, and that word is four bytes. GETVAL afterwards is
+	 * what says the value arrived, with no structure anywhere for it to
+	 * have come from by accident. */
+	movl	$117, %eax
+	movl	$2, %ebx		/* SEMGET */
+	xorl	%ecx, %ecx
+	movl	$1, %edx		/* one semaphore */
+	movl	$0x600, %esi
+	orl	$0x200, %esi		/* IPC_CREAT */
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_sem
+	movl	%eax, semid
+
+	movl	$7, semarg
+	movl	$117, %eax
+	movl	$3, %ebx		/* SEMCTL */
+	movl	semid, %ecx
+	xorl	%edx, %edx		/* semnum */
+	movl	$16, %esi		/* SETVAL */
+	orl	$0x100, %esi		/* | __IPC_64 */
+	movl	$semarg, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_sem
+
+	movl	$117, %eax
+	movl	$3, %ebx
+	movl	semid, %ecx
+	xorl	%edx, %edx
+	movl	$12, %esi		/* GETVAL */
+	orl	$0x100, %esi
+	movl	$semarg, %edi
+	int	$0x80
+	cmpl	$7, %eax
+	jne	bad_sem
+
+	movl	$117, %eax
+	movl	$3, %ebx
+	movl	semid, %ecx
+	xorl	%edx, %edx
+	movl	$0x100, %esi		/* IPC_RMID | __IPC_64 */
+	movl	$semarg, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ipc_rmid
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -2306,6 +2653,45 @@ bad_getres64:
 bad_nanosleep64:
 	movl	$85, %ebx
 	jmp	die
+bad_timerfd_create:
+	movl	$86, %ebx
+	jmp	die
+bad_timerfd_narrow:
+	movl	$87, %ebx
+	jmp	die
+bad_timerfd64:
+	movl	$88, %ebx
+	jmp	die
+bad_timerfd_settime64:
+	movl	$89, %ebx
+	jmp	die
+bad_futex_time64:
+	movl	$90, %ebx
+	jmp	die
+bad_futex_narrow:
+	movl	$91, %ebx
+	jmp	die
+bad_timerfd_arm:
+	movl	$92, %ebx
+	jmp	die
+bad_shmget:
+	movl	$93, %ebx
+	jmp	die
+bad_shmat:
+	movl	$94, %ebx
+	jmp	die
+bad_shmdt:
+	movl	$95, %ebx
+	jmp	die
+bad_msg:
+	movl	$96, %ebx
+	jmp	die
+bad_sem:
+	movl	$97, %ebx
+	jmp	die
+bad_ipc_rmid:
+	movl	$98, %ebx
+	jmp	die
 
 	/* 0xaa over the two entries of the batch array, so that each transfer
 	 * count the kernel writes is a byte the program did not put there and
@@ -2535,6 +2921,34 @@ iov:
 	.align 4
 tbuf:
 	.space	160
+	/* The `timerfd` of step 76, and the futex word its `futex_time64`
+	 * waits on: an `int` at both widths, so the only thing that changes
+	 * about the call is its timeout. */
+tfd:
+	.long	0
+fword:
+	.long	0
+	/* Step 77's own data: the ids, the address `shmat` stores through
+	 * `third`, the `struct ipc_kludge` of the old `msgrcv`, and the word
+	 * `SEMCTL` reads the `union semun` out of. */
+shmid:
+	.long	0
+msqid:
+	.long	0
+semid:
+	.long	0
+shmaddr:
+	.long	0
+semarg:
+	.long	0
+ipcout:
+	.space	16
+kludge:
+	.space	8
+msgbuf:
+	.space	32
+msgout:
+	.space	32
 nsreq:
 	.space	16
 itv:

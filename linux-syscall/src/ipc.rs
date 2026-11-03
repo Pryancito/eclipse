@@ -511,19 +511,40 @@ impl Syscall<'_> {
         msgsz: usize,
         msgflg: usize,
     ) -> SysResult {
+        self.msgsnd_at(id, msgp, msgsz, msgflg, self.narrow_abi())
+            .await
+    }
+
+    /// `msgsnd`, with the width of the `struct msgbuf` header given rather
+    /// than asked of the process.
+    ///
+    /// `struct msgbuf` is `{ long mtype; char mtext[]; }`, so on i386 the
+    /// type is FOUR bytes and the payload starts at `msgp + 4`. Read eight,
+    /// and `mtype` is the real type with the first four payload bytes above
+    /// it --- which for any ordinary small type is a huge positive number
+    /// rather than an error --- and every byte of the message is then taken
+    /// from four bytes too far along. See [`crate::compat32::ipc`].
+    pub(crate) async fn msgsnd_at(
+        &self,
+        id: usize,
+        msgp: usize,
+        msgsz: usize,
+        msgflg: usize,
+        abi32: bool,
+    ) -> SysResult {
         info!(
-            "msgsnd: id={}, msgp={:#x}, msgsz={}, flags={:#x}",
-            id, msgp, msgsz, msgflg
+            "msgsnd: id={}, msgp={:#x}, msgsz={}, flags={:#x}, abi32={}",
+            id, msgp, msgsz, msgflg, abi32
         );
         if msgsz > MSGMAX {
             return Err(LxError::EINVAL);
         }
-        let mtype: isize = UserInPtr::<isize>::from(msgp).read()?;
+        let mtype = read_mtype(msgp, abi32)?;
         // msgsnd(2): the type must be strictly positive.
         if mtype < 1 {
             return Err(LxError::EINVAL);
         }
-        let data = UserInPtr::<u8>::from(msgp + core::mem::size_of::<isize>()).read_array(msgsz)?;
+        let data = UserInPtr::<u8>::from(msgp + mtype_len(abi32)).read_array(msgsz)?;
         let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
         let proc = self.linux_process();
         if !queue.may_access(proc.euid(), proc.egid(), &proc.groups(), IPC_W) {
@@ -557,6 +578,7 @@ impl Syscall<'_> {
     /// `MSG_EXCEPT`; <0 = lowest type ≤ |msgtyp|); `MSG_NOERROR` truncates an
     /// oversized message instead of failing with `E2BIG`. Returns the number
     /// of payload bytes copied.
+    #[allow(clippy::too_many_arguments)]
     pub async fn sys_msgrcv(
         &self,
         id: usize,
@@ -565,9 +587,27 @@ impl Syscall<'_> {
         msgtyp: isize,
         msgflg: usize,
     ) -> SysResult {
+        self.msgrcv_at(id, msgp, msgsz, msgtyp, msgflg, self.narrow_abi())
+            .await
+    }
+
+    /// `msgrcv`, with the width of the `struct msgbuf` header given rather
+    /// than asked of the process: the same split as [`Self::msgsnd_at`], and
+    /// here it is a WRITE, so the wrong width puts four bytes of zero where
+    /// the caller's first payload bytes belong.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn msgrcv_at(
+        &self,
+        id: usize,
+        msgp: usize,
+        msgsz: usize,
+        msgtyp: isize,
+        msgflg: usize,
+        abi32: bool,
+    ) -> SysResult {
         info!(
-            "msgrcv: id={}, msgp={:#x}, msgsz={}, msgtyp={}, flags={:#x}",
-            id, msgp, msgsz, msgtyp, msgflg
+            "msgrcv: id={}, msgp={:#x}, msgsz={}, msgtyp={}, flags={:#x}, abi32={}",
+            id, msgp, msgsz, msgtyp, msgflg, abi32
         );
         let msgsz = msgrcv_bufsz(msgsz)?;
         let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
@@ -584,9 +624,8 @@ impl Syscall<'_> {
             // until a message lands, instead of a 5 ms sleep-and-look-again.
             let since = match queue.try_recv(msgtyp, msgsz, noerror, except, receiver) {
                 Ok((mtype, data)) => {
-                    UserOutPtr::<isize>::from(msgp).write(mtype)?;
-                    UserOutPtr::<u8>::from(msgp + core::mem::size_of::<isize>())
-                        .write_array(&data)?;
+                    write_mtype(msgp, mtype, abi32)?;
+                    UserOutPtr::<u8>::from(msgp + mtype_len(abi32)).write_array(&data)?;
                     return Ok(data.len());
                 }
                 Err(MsgRecvError::Removed) => return Err(LxError::EIDRM),
@@ -2783,3 +2822,39 @@ mod msg_wiring_tests;
 /// leaves behind.
 #[cfg(test)]
 mod shm_wiring_tests;
+
+/// How many bytes the `mtype` of a `struct msgbuf` takes, and so where the
+/// payload starts: `sizeof(long)` in the CALLER's ABI.
+///
+/// This is the whole of the `msgbuf` conversion. There is nothing else in the
+/// structure: `mtext` is a run of bytes, and `msgsz` counts only those.
+pub(crate) fn mtype_len(abi32: bool) -> usize {
+    if abi32 {
+        core::mem::size_of::<i32>()
+    } else {
+        core::mem::size_of::<isize>()
+    }
+}
+
+/// Read a `struct msgbuf`'s `mtype` at the caller's width, sign-extending
+/// the narrow one: on i386 it is a `long`, which is signed, and `msgsnd`
+/// refuses anything below 1. A type of -1 read as unsigned would be
+/// `4294967295` and pass the check.
+fn read_mtype(msgp: usize, abi32: bool) -> LxResult<isize> {
+    if !abi32 {
+        return Ok(UserInPtr::<isize>::from(msgp).read()?);
+    }
+    Ok(UserInPtr::<i32>::from(msgp).read()? as isize)
+}
+
+/// [`read_mtype`] the other way. The value is truncated rather than refused,
+/// as a `long` store on i386 is: the queue itself keeps whatever `msgsnd`
+/// put in, and a 32-bit process can only ever have put a 32-bit value there.
+fn write_mtype(msgp: usize, mtype: isize, abi32: bool) -> LxResult<()> {
+    if !abi32 {
+        UserOutPtr::<isize>::from(msgp).write(mtype)?;
+        return Ok(());
+    }
+    UserOutPtr::<i32>::from(msgp).write(mtype as i32)?;
+    Ok(())
+}
