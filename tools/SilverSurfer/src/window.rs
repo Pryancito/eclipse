@@ -1521,7 +1521,8 @@ impl App {
             self.leave_location();
             if let Some(session) = &self.session {
                 if let Ok(url) = url::Url::parse(&session.shell.location_text()) {
-                    if let Err(err) = downloads::save_url(&url, !self.persist) {
+                    let request = session.shell.download_request(&url, None);
+                    if let Err(err) = downloads::save_url(&url, !self.persist, request) {
                         eprintln!("silversurfer: descarga: {err}");
                     }
                 }

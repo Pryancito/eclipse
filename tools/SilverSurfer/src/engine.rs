@@ -543,6 +543,50 @@ impl Delegate {
         view.evaluate_javascript(script, |_| {});
     }
 
+    /// Cookies, User-Agent y Referer para descargar `url` con curl como si
+    /// lo pidiera la página: así funcionan las descargas que piden sesión.
+    pub fn download_request(
+        &self,
+        url: &url::Url,
+        referer: Option<url::Url>,
+    ) -> downloads::Request {
+        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        let cookies = self
+            .servo
+            .borrow()
+            .as_ref()
+            .map(|servo| {
+                servo
+                    .site_data_manager()
+                    .cookies_for_url(url.clone(), servo::CookieSource::HTTP)
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| {
+                let domain = c
+                    .domain()
+                    .unwrap_or(&host)
+                    .trim_start_matches('.')
+                    .to_ascii_lowercase();
+                downloads::JarCookie {
+                    // Una cookie de un dominio padre solo pudo llegar aquí con
+                    // `Domain=`; la del propio host se trata como host-only.
+                    subdomains: domain != host,
+                    domain,
+                    path: c.path().unwrap_or("/").to_owned(),
+                    secure: c.secure().unwrap_or(false),
+                    name: c.name().to_owned(),
+                    value: c.value().to_owned(),
+                }
+            })
+            .collect();
+        downloads::Request {
+            cookies,
+            user_agent: Some(user_agent()),
+            referer,
+        }
+    }
+
     /// Borra cookies, session/local storage y caché HTTP de esta instancia.
     pub fn clear_browsing_data(&self) -> String {
         let Some(servo) = self.servo.borrow().clone() else {
@@ -1234,11 +1278,13 @@ impl WebViewDelegate for Delegate {
         }
     }
 
-    fn request_navigation(&self, _webview: WebView, request: NavigationRequest) {
+    fn request_navigation(&self, webview: WebView, request: NavigationRequest) {
         if downloads::looks_like_download(&request.url) {
             let url = request.url.clone();
             request.deny();
-            if let Err(err) = downloads::save_url(&url, self.private) {
+            let referer = webview.url();
+            let dl = self.download_request(&url, referer);
+            if let Err(err) = downloads::save_url(&url, self.private, dl) {
                 eprintln!("silversurfer: descarga: {err}");
             }
             return;

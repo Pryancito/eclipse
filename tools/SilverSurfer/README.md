@@ -118,6 +118,10 @@ Las visitas se guardan en
 `about:history`, `about:bookmarks` y `about:downloads` abren listas
 locales. Navegar a PDF/ZIP/… intercepta la carga y pide destino con
 lunarfile (Servo 0.7 no expone un hook de descarga nativo).
+La descarga la hace curl con las cookies que Servo tiene para esa URL
+(pasadas por la entrada estándar, nunca en la línea de órdenes), el mismo
+User-Agent y como Referer solo el origen de la página, así que también
+funcionan los enlaces que piden sesión iniciada.
 El User-Agent por defecto imita Firefox de escritorio (con `Gecko/` y
 `Firefox/`, más `Servo/0.7`) para que sitios como Google no sirvan la
 cáscara degradada; `SILVERSURFER_UA` lo sustituye entero.
