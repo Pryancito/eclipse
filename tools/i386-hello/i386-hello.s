@@ -67,7 +67,16 @@
  *   53  ppoll refused a signal mask aligned to 4 and not to 8
  *   54  writev accepted an iov_len that does not fit a signed word
  *   55  socketcall did not carry a socketpair through its argument block
- *   56  socketcall read past the end of a block that ends at a page
+ *   56  the guard page for the next check could not be set up (unused:
+ *       the two halves report their own errno, see below)
+ *   57  socketcall read past the end of a block that ends at a page
+ *   58  ioctl(FIOCLEX)/ioctl(FIONCLEX) did not move the close-on-exec bit
+ *   59  ioctl(TCGETS) did not write 36 bytes of termios, or refused a
+ *       destination aligned to 4 and not to 8
+ *   60  ioctl(TIOCGPTN) did not write exactly one 4-byte pty number
+ *
+ *   128+e  mmap2 of the two pages of the guard answered errno e
+ *   160+e  munmap of just the second page answered errno e
  *
  * The last six are the segment registers, which is the second half of what
  * compatibility mode needs and the half `iretq` does not do: it reloads `CS`
@@ -1113,7 +1122,7 @@ statx_poison:
 	xorl	%ebp, %ebp
 	int	$0x80
 	cmpl	$-4096, %eax
-	jae	bad_sargs_edge
+	jae	bad_mmap2_pair
 	movl	%eax, twopages
 	movl	$91, %eax		/* munmap the second page: the guard */
 	movl	twopages, %ebx
@@ -1121,7 +1130,7 @@ statx_poison:
 	movl	$4096, %ecx
 	int	$0x80
 	testl	%eax, %eax
-	jnz	bad_sargs_edge
+	jnz	bad_munmap_guard
 
 	/* The block goes at page_end - 8, so words 0 and 1 are readable and
 	 * word 2 is not. */
@@ -1136,7 +1145,7 @@ statx_poison:
 	movl	%edi, %ecx
 	int	$0x80
 	testl	%eax, %eax
-	jnz	bad_sargs_edge
+	jnz	bad_sargs_read
 
 	/* ppoll(NULL, 0, {0,0}, mask, 8): i386 309, and the same trap in the
 	 * READING direction. A kernel `sigset_t` is one 64-bit word, so a
@@ -1207,6 +1216,101 @@ statx_poison:
 	int	$0x80
 	cmpl	$-22, %eax
 	jne	bad_iov_len
+
+	/* ioctl(FIOCLEX) and ioctl(FIONCLEX): i386 54, and the first request
+	 * this kernel answers for a 32-bit process. These two take NO
+	 * argument at all, so nothing is read or written through a pointer
+	 * and what the step proves is only that the call arrives and acts ---
+	 * which is why it comes first, before any request with a structure.
+	 *
+	 * The proof is the close-on-exec bit itself, read back with
+	 * `fcntl64(F_GETFD)`: a kernel that answered 0 and did nothing would
+	 * pass a step that only checked the return value. */
+	movl	$54, %eax
+	movl	fd, %ebx
+	movl	$0x5451, %ecx		/* FIOCLEX */
+	xorl	%edx, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_fioclex
+	movl	$221, %eax
+	movl	fd, %ebx
+	movl	$1, %ecx		/* F_GETFD */
+	xorl	%edx, %edx
+	int	$0x80
+	testl	$1, %eax		/* FD_CLOEXEC */
+	jz	bad_fioclex
+	movl	$54, %eax
+	movl	fd, %ebx
+	movl	$0x5450, %ecx		/* FIONCLEX */
+	xorl	%edx, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_fioclex
+	movl	$221, %eax
+	movl	fd, %ebx
+	movl	$1, %ecx
+	xorl	%edx, %edx
+	int	$0x80
+	testl	$1, %eax
+	jnz	bad_fioclex
+
+	/* ioctl(TCGETS) on a pty master, into a destination 4 mod 8.
+	 *
+	 * Two things in one step, and both are measurements rather than
+	 * beliefs. The kernel ABI `struct termios` is 36 bytes --- four
+	 * `tcflag_t`, `c_line`, `c_cc[19]` --- and NOT the 60-byte structure
+	 * libc carries, so the word at offset 36 has to still be the poison.
+	 * And the destination is deliberately 4 mod 8: termios is made of
+	 * u32, u16 and bytes, so it has none of the alignment trouble the
+	 * 64-bit structures have, and this is the step that says so rather
+	 * than a comment saying so.
+	 *
+	 * Measured on a Linux host: `TCGETS` on `/dev/ptmx` with its
+	 * destination at an address 4 mod 8 answers 0. */
+	movl	$5, %eax
+	movl	$ptmxpath, %ebx
+	movl	$2, %ecx		/* O_RDWR */
+	xorl	%edx, %edx
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_tcgets
+	movl	%eax, ptmxfd
+	movl	$iobuf4, %eax
+	testl	$4, %eax
+	jz	bad_tcgets
+	call	poison_iobuf4
+	movl	$54, %eax
+	movl	ptmxfd, %ebx
+	movl	$0x5401, %ecx		/* TCGETS */
+	movl	$iobuf4, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_tcgets
+	/* c_iflag was written over the poison... */
+	cmpl	$0xaaaaaaaa, iobuf4 + 0
+	je	bad_tcgets
+	/* ...and the word at 36 was not: 36 bytes, not 60. */
+	cmpl	$0xaaaaaaaa, iobuf4 + 36
+	jne	bad_tcgets
+
+	/* ioctl(TIOCGPTN): the pty number, one `unsigned int`. Its request
+	 * number has bit 31 set (0x80045430), so this is also the step that
+	 * says a request arriving zero-extended out of the 32-bit trap frame
+	 * reaches a handler that compares the low 32 bits --- a native caller
+	 * sends the same request sign-extended. */
+	call	poison_iobuf4
+	movl	$54, %eax
+	movl	ptmxfd, %ebx
+	movl	$0x80045430, %ecx	/* TIOCGPTN */
+	movl	$iobuf4, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_tiocgptn
+	cmpl	$0xaaaaaaaa, iobuf4 + 0
+	je	bad_tiocgptn
+	cmpl	$0xaaaaaaaa, iobuf4 + 4
+	jne	bad_tiocgptn
 
 	/* get_thread_area(&tls_desc): i386 244, the other half, and the one a
 	 * debugger uses. It has to hand back the base this program asked for,
@@ -1359,8 +1463,37 @@ bad_iov_len:
 bad_socketcall:
 	movl	$55, %ebx
 	jmp	die
+	/* The two halves of the guard-page setup, each reporting its own
+	 * errno rather than one opaque number: the status is 128 plus the
+	 * errno for the `mmap2` and 160 plus it for the `munmap`, so a run
+	 * that cannot build the guard says WHY. `ENOMEM` is 12 and `EINVAL`
+	 * is 22, so 140 and 150 are the two to expect from the first and
+	 * 172 and 182 from the second; no errno is big enough for the two
+	 * ranges to meet. Clobbers %eax, which neither path needs again. */
+bad_mmap2_pair:
+	negl	%eax
+	addl	$128, %eax
+	movl	%eax, %ebx
+	jmp	die
+bad_munmap_guard:
+	negl	%eax
+	addl	$160, %eax
+	movl	%eax, %ebx
+	jmp	die
 bad_sargs_edge:
 	movl	$56, %ebx
+	jmp	die
+bad_sargs_read:
+	movl	$57, %ebx
+	jmp	die
+bad_fioclex:
+	movl	$58, %ebx
+	jmp	die
+bad_tcgets:
+	movl	$59, %ebx
+	jmp	die
+bad_tiocgptn:
+	movl	$60, %ebx
 	jmp	die
 
 	/* Fill the scratch buffer with 0xaa, so that every structure written
@@ -1377,6 +1510,21 @@ poison_word:
 	addl	$4, %edi
 	subl	$4, %ecx
 	jnz	poison_word
+	ret
+
+	/* The same poison for `iobuf4`, which is its own buffer and not a
+	 * corner of `tbuf`: it has to sit at an address 4 mod 8 and `tbuf`
+	 * cannot promise that. Forty-eight bytes, which is past the end of
+	 * every structure the ioctl steps write. */
+poison_iobuf4:
+	movl	$iobuf4, %edi
+	movl	$48, %ecx
+	movl	$0xaaaaaaaa, %eax
+poison_iobuf4_word:
+	movl	%eax, (%edi)
+	addl	$4, %edi
+	subl	$4, %ecx
+	jnz	poison_iobuf4_word
 	ret
 
 	/* exit_group(status): i386 252. `exit` (1) would do for a single
@@ -1403,6 +1551,12 @@ msg2b:
 	.set	msg2blen, . - msg2b
 tmppath:
 	.asciz	"/tmp/i386-hello-pwritev"
+	/* A pty master, for the terminal ioctls. Both this container's Linux
+	 * and Eclipse have it, which is why the ioctl steps use it instead of
+	 * descriptor 0: this program's stdin is a pipe as often as a tty, and
+	 * `TCGETS` on a pipe is ENOTTY on both. */
+ptmxpath:
+	.asciz	"/dev/ptmx"
 	/* The empty path of AT_EMPTY_PATH, which names the descriptor itself. */
 emptystr:
 	.asciz	""
@@ -1438,6 +1592,14 @@ page:
 	.long	0
 fd:
 	.long	0
+ptmxfd:
+	.long	0
+	/* 4 mod 8 on purpose, and the steps that use it say so out loud with
+	 * a `testl $4` rather than trusting this. */
+	.align	8
+	.space	4
+iobuf4:
+	.space	48
 fd2:
 	.long	0
 	/* Two entries of a 32-bit `struct iovec`: a 4-byte base and a 4-byte

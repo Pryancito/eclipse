@@ -112,6 +112,7 @@ use super::*;
 use linux_object::error::LxError;
 
 mod fcntl;
+mod ioctl;
 mod iovec;
 mod rlimit;
 mod socketcall;
@@ -158,6 +159,10 @@ const I386_UGETRLIMIT: u32 = 191;
 /// `socketcall`, the one number behind which i386 keeps all twenty socket
 /// calls. See [`socketcall`].
 const I386_SOCKETCALL: u32 = 102;
+
+/// And `ioctl`, which is in neither allowlist because the thing to vouch for
+/// is not the call but the **request**. See [`ioctl`].
+const I386_IOCTL: u32 = 54;
 
 /// And the scatter/gather calls whose offset arrives split across two
 /// registers. `readv` (145) and `writev` (146) are not here: their only
@@ -242,6 +247,11 @@ impl Syscall<'_> {
             // with the real arguments in a block of memory. See
             // [`socketcall`].
             I386_SOCKETCALL => return syscall_ret(self.sys_socketcall(a0, a1).await),
+            // One number, a thousand requests: vouched one request at a
+            // time. See [`ioctl`].
+            I386_IOCTL => {
+                return syscall_ret(self.sys_ioctl32(a0, a1 as u32, a2, a3, a4).await);
+            }
             I386_PREADV => return syscall_ret(self.sys_preadv32(a0, a1, a2, a3, a4).await),
             I386_PWRITEV => return syscall_ret(self.sys_pwritev32(a0, a1, a2, a3, a4)),
             _ => {}
