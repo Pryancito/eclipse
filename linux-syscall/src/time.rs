@@ -472,8 +472,36 @@ impl Syscall<'_> {
     /// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` and returned -1 to every
     /// program, and so did what `clock_getcpuclockid(3)` and
     /// `pthread_getcpuclockid(3)` hand back. See [`clock_gettime_source`].
-    pub fn sys_clock_gettime(&self, clock: usize, mut buf: UserOutPtr<TimeSpec>) -> SysResult {
-        trace!("clock_gettime: id={:?} buf={:?}", clock, buf);
+    pub fn sys_clock_gettime(&self, clock: usize, buf: UserOutPtr<TimeSpec>) -> SysResult {
+        self.clock_gettime_at(clock, buf, self.narrow_abi())
+    }
+
+    /// `clock_gettime`, with the width of the `timespec` it writes given
+    /// rather than asked of the process.
+    ///
+    /// Everywhere else in this kernel the width is a property of the PROCESS
+    /// and never of the call --- that is the whole shape of
+    /// [`crate::narrow`], and Linux's `in_compat_syscall()`. The `*_time64`
+    /// calls are the one family where it is a property of the call: a 32-bit
+    /// program that calls `clock_gettime64` (i386 403) is asking for a
+    /// `struct __kernel_timespec`, two SIXTY-FOUR-bit words, from the same
+    /// process that gets eight bytes from `clock_gettime` (265). That is why
+    /// Linux has two entry points and not one with a test in it, and why
+    /// this takes the width as an argument: the alternative is a call site
+    /// asking `narrow_abi()` and then overriding the answer, which is the
+    /// same mistake in a worse place.
+    pub(crate) fn clock_gettime_at(
+        &self,
+        clock: usize,
+        mut buf: UserOutPtr<TimeSpec>,
+        abi32: bool,
+    ) -> SysResult {
+        trace!(
+            "clock_gettime: id={:?} buf={:?} abi32={}",
+            clock,
+            buf,
+            abi32
+        );
         // The clock first (EINVAL), then the read, then `put_timespec64`,
         // which is where a NULL buffer fails: EFAULT. A NULL was EINVAL
         // here, the answer for a clock that does not exist.
@@ -485,7 +513,7 @@ impl Syscall<'_> {
                 TimeSpec::from_duration(Duration::from_nanos(self.cpu_clock_ns(cpu)?))
             }
         };
-        self.put_narrow(&mut buf, ts)?;
+        crate::narrow::narrow_put(abi32, &mut buf, ts)?;
 
         trace!("clock_gettime: {:?}", ts);
 
@@ -496,8 +524,19 @@ impl Syscall<'_> {
     /// buffer is non-NULL, stores it in the struct timespec pointed to by it.
     /// glibc/musl and some applications (e.g. Firefox) treat a garbage or
     /// unwritten resolution as a fatal condition, so always fill the struct.
-    pub fn sys_clock_getres(&self, clock: usize, mut buf: UserOutPtr<TimeSpec>) -> SysResult {
-        trace!("clock_getres: id={:?} buf={:?}", clock, buf);
+    pub fn sys_clock_getres(&self, clock: usize, buf: UserOutPtr<TimeSpec>) -> SysResult {
+        self.clock_getres_at(clock, buf, self.narrow_abi())
+    }
+
+    /// `clock_getres`, at the width the caller asked for. See
+    /// [`Syscall::clock_gettime_at`].
+    pub(crate) fn clock_getres_at(
+        &self,
+        clock: usize,
+        mut buf: UserOutPtr<TimeSpec>,
+        abi32: bool,
+    ) -> SysResult {
+        trace!("clock_getres: id={:?} buf={:?} abi32={}", clock, buf, abi32);
         // Exactly the clocks `clock_gettime` reads, and for a CPU clock the
         // same look-up of whose (`posix_cpu_clock_getres` validates the
         // task first): a resolution for a clock that cannot be read was
@@ -511,7 +550,7 @@ impl Syscall<'_> {
         // We service these clocks from a nanosecond-granularity timer
         // source, and the CPU clocks are `posix_cpu_clock_getres`'s 1 ns.
         let res = TimeSpec { sec: 0, nsec: 1 };
-        self.put_narrow(&mut buf, res)?;
+        crate::narrow::narrow_put(abi32, &mut buf, res)?;
         Ok(0)
     }
 
@@ -552,10 +591,22 @@ impl Syscall<'_> {
 
     /// set the time of the clock with id clockid
     pub fn sys_clock_settime(&self, clock: usize, timespec: UserInPtr<TimeSpec>) -> SysResult {
+        self.clock_settime_at(clock, timespec, self.narrow_abi())
+    }
+
+    /// `clock_settime`, at the width the caller asked for. See
+    /// [`Syscall::clock_gettime_at`].
+    pub(crate) fn clock_settime_at(
+        &self,
+        clock: usize,
+        timespec: UserInPtr<TimeSpec>,
+        abi32: bool,
+    ) -> SysResult {
         info!(
-            "clock_settime: id={:?} timespec={:?}",
+            "clock_settime: id={:?} timespec={:?} abi32={}",
             clock,
-            self.get_narrow_if_not_null(&timespec)?
+            crate::narrow::narrow_get_if_not_null(abi32, &timespec)?,
+            abi32
         );
         if clock != 0 {
             return Err(LxError::EINVAL);
@@ -563,7 +614,7 @@ impl Syscall<'_> {
         // `posix_clock_realtime_set` is `do_sys_settimeofday64(tp, NULL)`:
         // the time is read and judged (`timespec64_valid_settod`, EINVAL)
         // before anybody asks who is calling.
-        let ts = self.get_narrow(&timespec)?;
+        let ts = crate::narrow::narrow_get(abi32, &timespec)?;
         let target = settod_time(ts.sec, ts.nsec)?;
         // Linux routes both clock setters through `security_settime64`, whose
         // default (`security/commoncap.c`) is the whole rule:
@@ -789,15 +840,30 @@ impl Syscall<'_> {
         req: UserInPtr<TimeSpec>,
         rem: UserOutPtr<TimeSpec>,
     ) -> SysResult {
+        let abi32 = self.narrow_abi();
+        self.clock_nanosleep_at(clockid, flags, req, rem, abi32)
+            .await
+    }
+
+    /// `clock_nanosleep`, at the width the caller asked for --- in BOTH
+    /// directions: the request is read at it and the remainder a signal
+    /// leaves is written at it. See [`Syscall::clock_gettime_at`].
+    pub(crate) async fn clock_nanosleep_at(
+        &mut self,
+        clockid: usize,
+        flags: usize,
+        req: UserInPtr<TimeSpec>,
+        rem: UserOutPtr<TimeSpec>,
+        abi32: bool,
+    ) -> SysResult {
         info!(
-            "clock_nanosleep: clockid={}, flags={:#x}, req={:?}, rem={:?}",
-            clockid, flags, req, rem
+            "clock_nanosleep: clockid={}, flags={:#x}, req={:?}, rem={:?}, abi32={}",
+            clockid, flags, req, rem, abi32
         );
         use kernel_hal::timer;
         // Same rule as `nanosleep`: reject an out-of-range `timespec`
         // instead of sleeping for whatever it happens to convert to.
-        let request: Duration = self.get_narrow(&req)?.try_into_duration()?;
-        let abi32 = self.narrow_abi();
+        let request: Duration = crate::narrow::narrow_get(abi32, &req)?.try_into_duration()?;
         // Every decision this call makes, taken before anything sleeps. The
         // clock id and the flag word both used to go through an infallible
         // `From<usize>` ending in `unreachable!()`, so an id or a flag this

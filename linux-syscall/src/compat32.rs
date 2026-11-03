@@ -49,7 +49,10 @@
 //! - `sigreturn` (119), whose signal frame is a 32-bit structure --- and
 //!   `rt_sigreturn` (173), whose frame is too, and which is wired: see
 //!   [`signal`];
-//! - the `*_time64` calls (403 and up), the 32-bit world's answer to 2038.
+//! - the `*_time64` calls (403 and up), the 32-bit world's answer to 2038,
+//!   whose structures are the NATIVE ones even from a 32-bit process ---
+//!   the one family where the width is a property of the call. Four of them
+//!   are wired: see [`time64`].
 //!
 //! The second is the calls that share a name but not a shape and whose shape
 //! nothing converts yet: anything passing an `rlimit`, a
@@ -122,6 +125,7 @@ mod rlimit;
 mod signal;
 mod socketcall;
 mod stat;
+mod time64;
 mod tls;
 mod wide;
 
@@ -170,6 +174,13 @@ const I386_SOCKETCALL: u32 = 102;
 /// three members do, a `struct sigaltstack` loses padding rather than bytes,
 /// and `rt_sigreturn` reads a 32-bit frame. See [`signal`].
 use signal::{I386_RT_SIGACTION, I386_RT_SIGRETURN, I386_SIGALTSTACK};
+
+/// And the `*_time64` calls, the one family where the width of a structure is
+/// a property of the CALL and not of the process. See [`time64`].
+use time64::{
+    I386_CLOCK_GETRES_TIME64, I386_CLOCK_GETTIME64, I386_CLOCK_NANOSLEEP_TIME64,
+    I386_CLOCK_SETTIME64,
+};
 
 /// And `ioctl`, which is in neither allowlist because the thing to vouch for
 /// is not the call but the **request**. See [`ioctl`].
@@ -273,6 +284,19 @@ impl Syscall<'_> {
                 return syscall_ret(self.sys_sigaltstack32(a0.into(), a1.into()));
             }
             I386_RT_SIGRETURN => return syscall_ret(self.sys_rt_sigreturn()),
+            // The `*_time64` calls, whose structures are the NATIVE ones
+            // even though the caller is a 32-bit process. See [`time64`].
+            I386_CLOCK_GETTIME64 => return syscall_ret(self.sys_clock_gettime64(a0, a1.into())),
+            I386_CLOCK_SETTIME64 => return syscall_ret(self.sys_clock_settime64(a0, a1.into())),
+            I386_CLOCK_GETRES_TIME64 => {
+                return syscall_ret(self.sys_clock_getres_time64(a0, a1.into()));
+            }
+            I386_CLOCK_NANOSLEEP_TIME64 => {
+                return syscall_ret(
+                    self.sys_clock_nanosleep_time64(a0, a1, a2.into(), a3.into())
+                        .await,
+                );
+            }
             I386_PREADV => return syscall_ret(self.sys_preadv32(a0, a1, a2, a3, a4).await),
             I386_PWRITEV => return syscall_ret(self.sys_pwritev32(a0, a1, a2, a3, a4)),
             _ => {}
