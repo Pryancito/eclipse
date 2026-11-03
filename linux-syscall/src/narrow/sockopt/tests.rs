@@ -265,6 +265,19 @@ async fn set_timeout(sys: &Syscall<'_>, fd: usize, value: &[u8]) -> isize {
         .await
 }
 
+/// The same, with `optlen` put in the register by hand rather than taken from
+/// the value's length: the only way to reach a register whose top half is not
+/// the argument.
+async fn set_timeout_with_raw_len(sys: &Syscall<'_>, fd: usize, value: &[u8], raw: usize) -> isize {
+    put(VAL_AT, value);
+    own(sys)
+        .syscall(
+            crate::Sys::SETSOCKOPT as u32,
+            [fd, SOL_SOCKET, RCVTIMEO, VAL_AT, raw, 0],
+        )
+        .await
+}
+
 /// `getsockopt` of the same option into a buffer of `room` bytes, poisoned
 /// first so that a write past the caller's length is visible.
 async fn get_timeout(sys: &Syscall<'_>, fd: usize, room: u32) -> (isize, Vec<u8>) {
@@ -435,5 +448,115 @@ fn a_32_bit_program_reaches_both_through_socketcall() {
     assert_eq!(get_ret, 0, "i386 socketcall 15 did not reach `getsockopt`");
     assert_eq!(len, 8);
     assert_eq!(&buf[..], &narrow_tv(5, 500_000));
+    proc.exit(0);
+}
+
+#[test]
+fn a_negative_optlen_through_socketcall_is_refused() {
+    // Copilot's finding on this batch, and it is right. `optlen` is an
+    // `int`, and a 32-bit caller's `socketcall` block carries it as a word:
+    // `0xffffffff` is -1 to the program and arrives here zero-extended as
+    // four billion. Four billion is more than eight, so the widening's lower
+    // bound was satisfied, it read the eight bytes it needed, ignored the
+    // rest of `optlen` and the call SUCCEEDED --- changing a timeout on a
+    // length `__sys_setsockopt` refuses outright.
+    //
+    // Through `socketcall`, because that is the only door that can carry the
+    // value: a native caller passes `optlen` in a register, where -1 is
+    // `usize::MAX` and not `0xffffffff`.
+    let proc = a_process(48_436, Abi::Linux32);
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let fd = a_socket(sys, AF_INET, A_DGRAM).await;
+            put(VAL_AT, &narrow_tv(5, 500_000));
+            put_sargs(&[
+                fd as u32,
+                SOL_SOCKET as u32,
+                RCVTIMEO as u32,
+                VAL_AT as u32,
+                0xffff_ffff,
+            ]);
+            own(sys)
+                .compat32_syscall(I386_SOCKETCALL, [CALL_SETSOCKOPT, SARGS_AT, 0, 0, 0, 0])
+                .await
+        })
+    });
+    assert_eq!(
+        got, EINVAL,
+        "a negative optlen set a timeout: the length the caller passed was \
+         never looked at past the eight bytes the conversion needed"
+    );
+    proc.exit(0);
+}
+
+#[test]
+fn the_largest_optlen_an_int_can_hold_is_not_refused() {
+    // The other side of the bound, so that the check is a check on the sign
+    // and not a ceiling pulled out of the air: `i32::MAX` is a positive
+    // length, and `__sys_setsockopt` takes it. It fails further in, on the
+    // buffer, which is the native path's business and not this one's --- what
+    // matters here is that it is not EINVAL from the length.
+    let proc = a_process(48_437, Abi::Linux32);
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let fd = a_socket(sys, AF_INET, A_DGRAM).await;
+            put(VAL_AT, &narrow_tv(5, 500_000));
+            put_sargs(&[
+                fd as u32,
+                SOL_SOCKET as u32,
+                RCVTIMEO as u32,
+                VAL_AT as u32,
+                i32::MAX as u32,
+            ]);
+            own(sys)
+                .compat32_syscall(I386_SOCKETCALL, [CALL_SETSOCKOPT, SARGS_AT, 0, 0, 0, 0])
+                .await
+        })
+    });
+    assert_eq!(
+        got, 0,
+        "i32::MAX is a positive length, and the eight bytes it covers are there"
+    );
+    proc.exit(0);
+}
+
+#[test]
+fn a_native_optlen_with_rubbish_in_its_top_half_is_still_a_length() {
+    // Copilot's second round, and it is right: `optlen` is an `int`, so the
+    // top half of the register is NOT the argument, and nothing in the ABI
+    // requires a caller to clear it --- a varargs `int` is not widened. A
+    // bound on the whole register answered `EINVAL` to a perfectly ordinary
+    // native `SO_RCVTIMEO` of sixteen bytes whose register happened to carry
+    // `0x1_0000_0010`. Truncating to an `int` first is what makes one rule
+    // serve both ABIs.
+    let proc = a_process(48_438, Abi::Linux);
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let fd = a_socket(sys, AF_INET, A_DGRAM).await;
+            set_timeout_with_raw_len(sys, fd, &native_tv(5, 500_000), 0x1_0000_0010).await
+        })
+    });
+    assert_eq!(
+        got, 0,
+        "sixteen with rubbish above it is sixteen: the high half of the \
+         register is not the argument"
+    );
+    proc.exit(0);
+}
+
+#[test]
+fn a_native_optlen_that_is_negative_in_its_low_half_is_refused() {
+    // The other spelling of the same argument, and the other half of the
+    // pair: `0xffff_ffff_ffff_fff0` is -16 to Linux, which refuses it. Read
+    // as a whole `usize` it is a colossal length and the native path answered
+    // `EFAULT` from the buffer instead of `EINVAL` from the length.
+    let proc = a_process(48_439, Abi::Linux);
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let fd = a_socket(sys, AF_INET, A_DGRAM).await;
+            set_timeout_with_raw_len(sys, fd, &native_tv(5, 500_000), usize::MAX - 15).await
+        })
+    });
+    assert_eq!(got, EINVAL);
     proc.exit(0);
 }

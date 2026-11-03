@@ -557,6 +557,15 @@ impl Syscall<'_> {
             "sys_setsockopt: sockfd:{}, level:{}, optname:{}, optval:{:?} , optlen:{}",
             sockfd, level, optname, optval, optlen
         );
+        // `optlen` is an `int` in the prototype, and `__sys_setsockopt`
+        // refuses a negative one before it looks at anything else:
+        //     if (optlen < 0) return -EINVAL;
+        // Truncated to an `int` FIRST, which is what makes one rule serve
+        // both ABIs: see `intarg::sockopt_len`. The check belongs here, at
+        // the entry, and not inside the conversion below: it is a property
+        // of the call's prototype, so every option gets it and no option can
+        // be added without it.
+        let optlen = crate::intarg::sockopt_len(optlen)?;
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let socket = file_like.as_socket()?;
         // At the caller's width, not at this kernel's: `SO_RCVTIMEO`'s

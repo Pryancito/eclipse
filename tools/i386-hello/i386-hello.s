@@ -91,6 +91,9 @@
  *   72  the timeout that came back is not the one that went in, or it was
  *       reported at the native width (the microseconds are the field a clamp
  *       loses and a conversion keeps)
+ *   73  socketcall(setsockopt) accepted a negative optlen, which is a word of
+ *       0xffffffff in the block and four billion to a kernel that
+ *       zero-extends it
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -1735,6 +1738,26 @@ statx_poison:
 	cmpl	$0xaaaaaaaa, tvout + 12
 	jne	bad_timeo_value
 
+	/* And the length itself, which is an `int`: `-1` is a word of
+	 * 0xffffffff in the block, and a kernel that zero-extends it sees four
+	 * billion --- more than the eight bytes the conversion needs, so the
+	 * conversion reads its eight, never looks at the rest and the call
+	 * SUCCEEDS on a length `__sys_setsockopt` refuses outright
+	 * (`if (optlen < 0) return -EINVAL`). Copilot found that on this
+	 * batch. EINVAL is 22. */
+	movl	optfd, %eax
+	movl	%eax, sargs + 0
+	movl	$1, sargs + 4
+	movl	$20, sargs + 8
+	movl	$tvin, sargs + 12
+	movl	$-1, sargs + 16
+	movl	$102, %eax
+	movl	$14, %ebx		/* SYS_SETSOCKOPT */
+	movl	$sargs, %ecx
+	int	$0x80
+	cmpl	$-22, %eax
+	jne	bad_optlen_sign
+
 	movl	$6, %eax		/* close */
 	movl	optfd, %ebx
 	int	$0x80
@@ -1983,6 +2006,9 @@ bad_getsockopt32:
 	jmp	die
 bad_timeo_value:
 	movl	$72, %ebx
+	jmp	die
+bad_optlen_sign:
+	movl	$73, %ebx
 	jmp	die
 
 	/* 0xaa over the two entries of the batch array, so that each transfer
