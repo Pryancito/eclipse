@@ -179,7 +179,7 @@ use signal::{I386_RT_SIGACTION, I386_RT_SIGRETURN, I386_SIGALTSTACK};
 /// a property of the CALL and not of the process. See [`time64`].
 use time64::{
     I386_CLOCK_GETRES_TIME64, I386_CLOCK_GETTIME64, I386_CLOCK_NANOSLEEP_TIME64,
-    I386_CLOCK_SETTIME64,
+    I386_CLOCK_SETTIME64, I386_FUTEX_TIME64, I386_TIMERFD_GETTIME64, I386_TIMERFD_SETTIME64,
 };
 
 /// And `ioctl`, which is in neither allowlist because the thing to vouch for
@@ -294,6 +294,23 @@ impl Syscall<'_> {
             I386_CLOCK_NANOSLEEP_TIME64 => {
                 return syscall_ret(
                     self.sys_clock_nanosleep_time64(a0, a1, a2.into(), a3.into())
+                        .await,
+                );
+            }
+            I386_TIMERFD_GETTIME64 => {
+                return syscall_ret(self.sys_timerfd_gettime64(a0.into(), a1.into()));
+            }
+            I386_TIMERFD_SETTIME64 => {
+                return syscall_ret(self.sys_timerfd_settime64(
+                    a0.into(),
+                    a1,
+                    a2.into(),
+                    a3.into(),
+                ));
+            }
+            I386_FUTEX_TIME64 => {
+                return syscall_ret(
+                    self.sys_futex_time64(a0, a1 as _, a2 as _, a3, a4, a5 as _)
                         .await,
                 );
             }

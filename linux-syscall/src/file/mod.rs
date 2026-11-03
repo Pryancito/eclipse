@@ -9,6 +9,13 @@ mod dir;
 mod drm_prime;
 mod fd;
 mod hunter_gate;
+/// The `struct itimerspec` of the `timerfd` calls, shared with the i386
+/// compat layer: `timerfd_gettime64`/`timerfd_settime64` pass the SAME
+/// structure at the native width from a 32-bit process, so they reach the
+/// handlers here rather than carrying a shape of their own (see
+/// `compat32::time64`). x86_64-only because that layer is.
+#[cfg(target_arch = "x86_64")]
+pub(crate) use fd::ITimerSpec;
 /// Shared by `socket`/`socketpair` (and the anonymous-fd constructors in `fd`)
 /// so a stray bit is `EINVAL`, not a silently truncated `OpenFlags`.
 pub(crate) use fd::{anon_fd_flags, open_flags, ANON_CLOEXEC, ANON_NONBLOCK};

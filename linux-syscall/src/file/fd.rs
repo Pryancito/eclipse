@@ -344,7 +344,22 @@ impl Syscall<'_> {
         fd: FileDesc,
         flags: usize,
         new_value: UserInPtr<ITimerSpec>,
+        old_value: UserOutPtr<ITimerSpec>,
+    ) -> SysResult {
+        self.timerfd_settime_at(fd, flags, new_value, old_value, self.narrow_abi())
+    }
+
+    /// `timerfd_settime`, with the width of the two `struct timespec`s given
+    /// rather than asked of the process, so that i386's `timerfd_settime64`
+    /// (411) is this call with `abi32 = false`. See
+    /// [`crate::compat32::time64`].
+    pub(crate) fn timerfd_settime_at(
+        &self,
+        fd: FileDesc,
+        flags: usize,
+        new_value: UserInPtr<ITimerSpec>,
         mut old_value: UserOutPtr<ITimerSpec>,
+        abi32: bool,
     ) -> SysResult {
         if !timerfd_settime_flags_ok(flags) {
             return Err(LxError::EINVAL);
@@ -357,12 +372,11 @@ impl Syscall<'_> {
         // timerfd_settime(2) does: reading `new_value` can fault and an
         // out-of-range timespec is EINVAL, and neither of those may have
         // already written the caller's `old_value`.
-        let abi32 = self.narrow_abi();
         commit_and_report_old_with(
             old,
             |old| crate::narrow::narrow_put_if_not_null(abi32, &mut old_value, old),
             || {
-                let v = self.get_narrow(&new_value)?;
+                let v = crate::narrow::narrow_get(abi32, &new_value)?;
                 // Same rule as `timer_settime`: an out-of-range `timespec` is EINVAL.
                 if !v.it_interval.valid() || !v.it_value.valid() {
                     return Err(LxError::EINVAL);
@@ -389,12 +403,24 @@ impl Syscall<'_> {
     pub fn sys_timerfd_gettime(
         &self,
         fd: FileDesc,
+        curr_value: UserOutPtr<ITimerSpec>,
+    ) -> SysResult {
+        self.timerfd_gettime_at(fd, curr_value, self.narrow_abi())
+    }
+
+    /// `timerfd_gettime`, with the width given rather than asked of the
+    /// process: i386's `timerfd_gettime64` (410) is this call with
+    /// `abi32 = false`. See [`crate::compat32::time64`].
+    pub(crate) fn timerfd_gettime_at(
+        &self,
+        fd: FileDesc,
         mut curr_value: UserOutPtr<ITimerSpec>,
+        abi32: bool,
     ) -> SysResult {
         let file_like = self.linux_process().get_file_like(fd)?;
         let tfd = file_like.downcast_ref::<TimerFd>().ok_or(LxError::EINVAL)?;
         let (iv, rem) = tfd.get_time();
-        self.put_narrow(&mut curr_value, ITimerSpec::from_ns(iv, rem))?;
+        crate::narrow::narrow_put(abi32, &mut curr_value, ITimerSpec::from_ns(iv, rem))?;
         Ok(0)
     }
 

@@ -454,6 +454,29 @@ impl Syscall<'_> {
         uaddr2: usize,
         val3: u32,
     ) -> SysResult {
+        self.futex_at(uaddr, op, val, val2, uaddr2, val3, self.narrow_abi())
+            .await
+    }
+
+    /// `futex`, with the width of the `struct timespec` at `val2` given
+    /// rather than asked of the process.
+    ///
+    /// Every check, every clock and the whole operation table are here, so
+    /// that i386's `futex_time64` (422) --- which passes a
+    /// `struct __kernel_timespec`, 16 bytes, from a 32-bit process --- is the
+    /// same call with `abi32 = false` and not a second implementation. See
+    /// [`crate::compat32::time64`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn futex_at(
+        &self,
+        uaddr: usize,
+        op: u32,
+        val: u32,
+        val2: usize,
+        uaddr2: usize,
+        val3: u32,
+        abi32: bool,
+    ) -> SysResult {
         debug!(
             "Futex uaddr: {:#x}, op: {:x}, val: {}, val2(timeout_addr): {:x}",
             uaddr, op, val, val2,
@@ -545,8 +568,7 @@ impl Syscall<'_> {
                 } else {
                     let timeout_addr: UserInPtr<TimeSpec> = val2.into();
                     // Validated: a `timespec` out of range is EINVAL.
-                    let timeout = self
-                        .get_narrow_if_not_null(&timeout_addr)?
+                    let timeout = crate::narrow::narrow_get_if_not_null(abi32, &timeout_addr)?
                         .map(|timeout| timeout.try_into_duration())
                         .transpose()?;
                     let now = if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
@@ -658,8 +680,7 @@ impl Syscall<'_> {
                 let timeout_addr: UserInPtr<TimeSpec> = val2.into();
                 // Validated: a `timespec` out of range is EINVAL, and it is
                 // rejected whether or not we end up waiting.
-                let timeout = self
-                    .get_narrow_if_not_null(&timeout_addr)?
+                let timeout = crate::narrow::narrow_get_if_not_null(abi32, &timeout_addr)?
                     .map(|timeout| timeout.try_into_duration())
                     .transpose()?;
                 // FUTEX_WAIT takes a RELATIVE timeout; FUTEX_WAIT_BITSET takes
