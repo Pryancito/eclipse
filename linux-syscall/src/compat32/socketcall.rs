@@ -65,14 +65,13 @@
 //! Left out, each for a reason that is about a structure and not about this
 //! file:
 //!
-//! - **`sendmsg`(16), `recvmsg`(17), `sendmmsg`(20), `recvmmsg`(19)**: a
-//!   `struct msghdr` is a 32-bit structure of its own --- `msg_name`,
-//!   `msg_iov` and `msg_control` are pointers and `msg_iovlen` and
-//!   `msg_controllen` are `size_t`, so the whole thing is 28 bytes for a
-//!   32-bit caller against 56 native. Reading it at the native width does
-//!   not fail; it pairs the halves wrongly, the way the `iovec` did. The
-//!   `iovec` list inside it is already handled ([`crate::file`] asks the
-//!   process its width), so what is missing is the envelope.
+//! - **`sendmmsg`(20) and `recvmmsg`(19)**: the envelope is converted now
+//!   (see below), but a `struct mmsghdr` is an envelope *plus* a count, and
+//!   the distance between two of them in the caller's array is 32 bytes for
+//!   a 32-bit caller against 64 native. The walk steps by that distance and
+//!   writes each count inside it, so the stride and the count's offset are
+//!   their own piece of work ([`crate::narrow::msghdr`] has the layout; the walk in
+//!   [`crate::net`] does not ask it yet).
 //! - **`setsockopt`(14) and `getsockopt`(15)**: their `optval` is a byte
 //!   buffer for most options and a **structure** for some, and which one it
 //!   is depends on `optname`. `SO_RCVTIMEO` and `SO_SNDTIMEO` take a
@@ -80,6 +79,14 @@
 //!   so wiring these two would quietly read sixteen bytes of a caller's
 //!   eight-byte timeout. They need a per-option table, which is its own
 //!   piece of work.
+//!
+//! And **`sendmsg`(16) and `recvmsg`(17)** are wired, as of the twelfth
+//! batch, for the same reason `readv` and `writev` are: the conversion lives
+//! in the handler, which asks the process how wide a word is, so the number
+//! is all there is left to translate. The envelope is 28 bytes against 56 and
+//! the `struct cmsghdr` inside it is 12 aligned to 4 against 16 aligned to 8;
+//! [`crate::narrow::msghdr`] has both layouts and why neither can be read at the
+//! wrong width without inventing a pointer.
 //!
 //! An unwired call answers `ENOSYS`, like every other name this layer has
 //! not vouched for, rather than being passed through on the guess that its
@@ -240,6 +247,11 @@ impl Syscall<'_> {
                     .await
             }
             13 => self.sys_shutdown(a[0], a[1]),
+            // The envelope and the control messages inside it are converted
+            // by asking the process its width ([`crate::narrow::msghdr`]), so these
+            // two are the native handlers unchanged, like `readv`/`writev`.
+            16 => self.sys_sendmsg(a[0], a[1].into(), a[2]).await,
+            17 => self.sys_recvmsg(a[0], a[1].into(), a[2]).await,
             18 => self.sys_accept4(a[0], a[1].into(), a[2].into(), a[3]).await,
             _ => {
                 warn!(

@@ -439,5 +439,10 @@ impl Syscall<'_> {
     }
 }
 
+/// The envelope of `sendmsg`/`recvmsg`, which belongs to this family and
+/// breaks its one rule: the native `struct msghdr` has padding, so it takes a
+/// table of offsets rather than a count of words.
+pub(crate) mod msghdr;
+
 #[cfg(test)]
 mod tests;

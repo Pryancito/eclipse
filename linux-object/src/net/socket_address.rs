@@ -3,7 +3,7 @@
 use core::{cmp::min, mem::size_of};
 
 // crate
-use crate::error::LxError;
+use crate::error::{LxError, LxResult};
 // use crate::net::Endpoint;
 
 // smoltcp
@@ -442,6 +442,34 @@ impl SockAddr {
         }
         addr_len.write(full_len as u32)?;
         Ok(0)
+    }
+
+    /// Write the address into a `recvmsg` caller's `msg_name` buffer, and
+    /// hand back the length the kernel has to report --- which is the
+    /// address's FULL length even when the buffer was shorter, because that
+    /// is how a caller learns it was truncated.
+    ///
+    /// The reporting is the caller's to do, at the offset ITS ABI puts
+    /// `msg_namelen` at. What this used to do instead was read the whole
+    /// `struct msghdr` back out of user memory, change that one field and
+    /// write all 56 bytes back ([`Self::write_to_msg`], still here for the
+    /// native callers that have no ABI to ask): over a 32-bit caller's
+    /// 28-byte structure that is twenty-eight bytes of whatever the caller
+    /// keeps next to it, and even natively it is a read-modify-write of
+    /// fields nobody touched.
+    pub fn write_name_to(&self, name: UserInOutPtr<SockAddr>, max_len: usize) -> LxResult<u32> {
+        let full_len = self.output_len()?;
+        let written_len = min(max_len, full_len);
+        if written_len > 0 && !name.is_null() {
+            #[allow(unsafe_code)]
+            unsafe {
+                let source =
+                    core::slice::from_raw_parts(self as *const SockAddr as *const u8, written_len);
+                let mut addr_ptr: UserOutPtr<u8> = core::mem::transmute_copy(&name);
+                addr_ptr.write_array(source)?;
+            }
+        }
+        Ok(full_len as u32)
     }
 
     pub fn write_to_msg(&self, mut msg: UserInOutPtr<MsgHdr>) -> SysResult {
