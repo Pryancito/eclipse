@@ -243,6 +243,44 @@ fn to_narrow_bytes<T: Narrow>(value: T) -> ([u8; MAX_WORDS * 4], usize) {
     (bytes, T::WORDS * 4)
 }
 
+/// The same structure's **native** image, as bytes.
+///
+/// The pair above converts between a structure and its 32-bit image; this
+/// pair does the other width. Both are needed where the value is already
+/// bytes on both sides and never a user pointer of its own: an option value
+/// of `setsockopt`, whose `optval` is a byte buffer whose meaning --- and so
+/// whose width --- depends on `optname`. See [`sockopt`].
+///
+/// A word is `size_of::<usize>()` bytes and not a literal eight, so this
+/// holds on a host of either width rather than only on the one the kernel
+/// happens to be built for.
+fn to_native_bytes<T: Narrow>(value: T) -> ([u8; MAX_WORDS * 8], usize) {
+    let w = size_of::<usize>();
+    let mut words = [0u64; MAX_WORDS];
+    value.to_words(&mut words[..T::WORDS]);
+    let mut bytes = [0u8; MAX_WORDS * 8];
+    for (i, word) in words[..T::WORDS].iter().enumerate() {
+        bytes[i * w..(i + 1) * w].copy_from_slice(&(*word as usize).to_ne_bytes());
+    }
+    (bytes, T::WORDS * w)
+}
+
+/// `value` back out of its native image.
+///
+/// No sign extension to do: a native word is already as wide as the word
+/// these structures carry, which is what makes this the dull half of the
+/// pair and [`from_narrow_bytes`] the one with a rule.
+fn from_native_bytes<T: Narrow>(bytes: &[u8]) -> T {
+    let w = size_of::<usize>();
+    let mut words = [0u64; MAX_WORDS];
+    for (i, word) in words[..T::WORDS].iter_mut().enumerate() {
+        let mut slot = [0u8; 8];
+        slot[..w].copy_from_slice(&bytes[i * w..(i + 1) * w]);
+        *word = u64::from_ne_bytes(slot);
+    }
+    T::from_words(&words[..T::WORDS])
+}
+
 /// `value` back out of its narrow image, each word **sign**-extended.
 fn from_narrow_bytes<T: Narrow>(bytes: &[u8]) -> T {
     let mut words = [0u64; MAX_WORDS];
@@ -438,6 +476,10 @@ impl Syscall<'_> {
         wide_get_unaligned_if_not_null(self.narrow_abi(), ptr)
     }
 }
+
+/// The option value of `setsockopt`/`getsockopt`, whose width depends not on
+/// the structure but on **which option** it is.
+pub(crate) mod sockopt;
 
 /// The envelope of `sendmsg`/`recvmsg`, which belongs to this family and
 /// breaks its one rule: the native `struct msghdr` has padding, so it takes a
