@@ -2947,9 +2947,17 @@ statx_poison:
 	 * Their `struct __kernel_itimerspec` is four 64-bit words --- thirty-two
 	 * bytes, where the narrow 260 and 261 pass sixteen. The timer itself is
 	 * made with 259, whose `struct sigevent` holds a pointer in a union and
-	 * so is NOT in the translation table: this step passes a null `sevp`,
-	 * which is `SIGALRM` to the process and the only form that needs no
-	 * conversion.
+	 * so is NOT in the translation table. Passing a null `sevp` --- `SIGALRM`
+	 * to the process, the only form that needs no conversion --- does NOT
+	 * get round that: the table is consulted by NUMBER, so 259 answers
+	 * `ENOSYS` whatever its arguments say. **So on Eclipse this step skips
+	 * itself**, and what it measures it measures on a kernel that HAS 259:
+	 * the Linux of this container, where breaking an expectation here still
+	 * gives 106. Skipping and not failing, because a timer that cannot be
+	 * created is a missing 259 and not a wrong width --- and failing here
+	 * would stop the probe before step 61's `execve`.
+	 *
+	 * Lo vio Copilot en el #2411.
 	 *
 	 * `tsp` is 4 mod 8, which is the alignment a 32-bit program gives a
 	 * structure of `__s64`s. */
@@ -2958,6 +2966,10 @@ statx_poison:
 	xorl	%ecx, %ecx		/* sevp = NULL: SIGALRM to the process */
 	movl	$timerid, %edx
 	int	$0x80
+	/* `-ENOSYS`: this kernel has no 259 for a 32-bit process, so there is
+	 * no timer to ask about. Skip the step rather than fail it. */
+	cmpl	$-38, %eax
+	je	timer64_skipped
 	testl	%eax, %eax
 	jnz	bad_timer64
 
@@ -3058,6 +3070,7 @@ statx_poison:
 	testl	%eax, %eax
 	jnz	bad_timer64
 
+timer64_skipped:
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of

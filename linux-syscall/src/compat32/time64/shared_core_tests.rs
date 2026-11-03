@@ -454,3 +454,61 @@ fn the_old_value_of_a_cpu_clock_arming_is_written_at_the_width_of_the_number() {
     );
     proc.exit(0);
 }
+
+/// And the CPU-clock GETTER, which writes through a `narrow_put` of its own.
+///
+/// `timer_gettime_at` has two conversion sites, not one: a CPU clock returns
+/// early through the write at `time.rs`'s CPU branch, and every other clock
+/// falls through to the one at the end. The test above makes a
+/// `CLOCK_MONOTONIC` timer, so it measures only the second: putting
+/// `self.narrow_abi()` back inside the CPU branch left it green while 408
+/// still wrote sixteen bytes for a CPU timer.
+///
+/// Pointed out by Copilot on the #2411, which had exactly this gap.
+#[test]
+fn the_cpu_clock_getter_writes_at_the_width_of_the_number_too() {
+    let proc = a_process(48_497, Abi::Linux32);
+    let (narrow, wide) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut sys = as_mut(sys);
+            let id = a_timer(&sys, CLOCK_THREAD_CPUTIME_ID);
+            put(BUF_AT, &[0xAAu8; 48]);
+            let n = sys
+                .compat32_syscall(I386_TIMER_GETTIME, [id, BUF_AT, 0, 0, 0, 0])
+                .await;
+            let narrow = (n, get(BUF_AT, 48));
+            put(BUF_AT, &[0xAAu8; 48]);
+            let w = sys
+                .compat32_syscall(I386_TIMER_GETTIME64, [id, BUF_AT, 0, 0, 0, 0])
+                .await;
+            (narrow, (w, get(BUF_AT, 48)))
+        })
+    });
+    assert_eq!(narrow.0, 0, "timer_gettime (261) on a CPU clock");
+    assert_eq!(wide.0, 0, "timer_gettime64 (408) on a CPU clock");
+    assert_eq!(
+        word(&narrow.1, 12),
+        0,
+        "261's four narrow words: {:x?}",
+        &narrow.1[..24]
+    );
+    assert_eq!(
+        word(&narrow.1, 16),
+        0xaaaa_aaaa,
+        "and nothing past sixteen bytes: {:x?}",
+        &narrow.1[..24]
+    );
+    assert_eq!(
+        word(&wide.1, 28),
+        0,
+        "408's eight wide halves: {:x?}",
+        &wide.1[..40]
+    );
+    assert_eq!(
+        word(&wide.1, 32),
+        0xaaaa_aaaa,
+        "and nothing past thirty-two: {:x?}",
+        &wide.1[..40]
+    );
+    proc.exit(0);
+}
