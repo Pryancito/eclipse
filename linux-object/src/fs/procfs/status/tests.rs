@@ -639,13 +639,19 @@ fn vmhwm_is_never_below_vmrss() {
     };
     let vmo = VmObject::new_paged(PAGES);
     vmo.write(0, &alloc::vec![7u8; PAGES * 4096]).unwrap();
+    // Mapped the way `mmap` maps (`map_range` false): nothing is faulted in,
+    // so the page table holds none of the pages the walk finds.
     proc.vmar()
-        .map(
+        .map_ext(
             Some(0x3_7800_0000),
             vmo,
             0,
             PAGES * 4096,
+            MMUFlags::RXW | MMUFlags::USER,
             MMUFlags::READ | MMUFlags::USER,
+            false,
+            false,
+            false,
         )
         .unwrap();
     let status = proc_pid_status(&proc);

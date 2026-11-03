@@ -342,33 +342,36 @@ mod tests {
         let mut pt = PageTable::new();
         let page = |i: usize| Page::new_aligned(VBASE_RESIDENT + i * PAGE_SIZE, BASE_PAGE_SIZE);
         let rw = MMUFlags::READ | MMUFlags::WRITE;
-        for i in 0..3 {
+        for i in [0, 1, 2, 4] {
             pt.map(page(i), (i + 1) * PAGE_SIZE, rw).unwrap();
         }
         pt.map(page(3), 8 * PAGE_SIZE, rw | MMUFlags::SPECIAL)
             .unwrap();
         assert_eq!(
             pt.resident_bytes(),
-            3 * PAGE_SIZE,
+            4 * PAGE_SIZE,
             "the special page is out"
         );
 
         // A host mmap over a mapped page replaces it: one page, not two.
         pt.map(page(0), 5 * PAGE_SIZE, rw).unwrap();
-        assert_eq!(pt.resident_bytes(), 3 * PAGE_SIZE);
+        assert_eq!(pt.resident_bytes(), 4 * PAGE_SIZE);
         // An mprotect leaves a page the kind it was, and `query` answers
         // what a real entry would, without the mark.
         pt.update(page(3).vaddr, None, Some(MMUFlags::READ))
             .unwrap();
         assert_eq!(pt.query(page(3).vaddr).unwrap().1, MMUFlags::READ);
 
+        // Page 4 stays: a special page counted out by mistake would take it.
         pt.unmap_cont(VBASE_RESIDENT, 4 * PAGE_SIZE).unwrap();
         assert_eq!(
             pt.resident_bytes(),
-            0,
+            PAGE_SIZE,
             "the special page counted nothing out"
         );
-        assert_eq!(pt.resident_peak_bytes(), 3 * PAGE_SIZE);
+        pt.unmap(page(4).vaddr).unwrap();
+        assert_eq!(pt.resident_bytes(), 0);
+        assert_eq!(pt.resident_peak_bytes(), 4 * PAGE_SIZE);
         pt.restart_resident_peak();
         assert_eq!(pt.resident_peak_bytes(), 0);
     }
