@@ -1076,3 +1076,88 @@ fn concurrent_lookup_and_unlink_do_not_double_free() -> Result<()> {
     }
     Ok(())
 }
+
+/// Offline consistency check of an SFS image: every block referenced once and
+/// marked used. `SFS_FSCK=img cargo test -p rcore-fs-sfs --features std
+/// fsck_image -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn fsck_image() {
+    let path = match std::env::var("SFS_FSCK") {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .write(false)
+        .open(&path)
+        .unwrap();
+    let sfs = SimpleFileSystem::open(Arc::new(Mutex::new(file))).expect("open");
+    let mut owner: std::collections::BTreeMap<usize, (usize, &'static str)> = Default::default();
+    let mut dup = 0usize;
+    let mut freeref = 0usize;
+    let mut stack = std::vec![BLKN_ROOT];
+    let mut seen = std::collections::BTreeSet::new();
+    let fm: BitVec<Lsb0, u8> = (**sfs.free_map.read()).clone();
+    let mut claim =
+        |b: usize, ino: usize, what: &'static str, dup: &mut usize, freeref: &mut usize| {
+            if fm[b] {
+                *freeref += 1;
+                if *freeref < 10 {
+                    std::println!("ino {} {} block {} marked FREE", ino, what, b);
+                }
+            }
+            if let Some(o) = owner.insert(b, (ino, what)) {
+                *dup += 1;
+                if *dup < 10 {
+                    std::println!(
+                        "block {} shared: ino {} {} and ino {} {}",
+                        b,
+                        o.0,
+                        o.1,
+                        ino,
+                        what
+                    );
+                }
+            }
+        };
+    while let Some(ino) = stack.pop() {
+        if !seen.insert(ino) {
+            continue;
+        }
+        let inode = sfs.get_inode(ino);
+        claim(ino, ino, "inode", &mut dup, &mut freeref);
+        let (dblocks, dind, ddb, dtype, dsize) = {
+            let d = inode.disk_inode.read();
+            (d.blocks, d.indirect, d.db_indirect, d.type_, d.size)
+        };
+        let blocks = dblocks as usize;
+        if blocks > NDIRECT {
+            claim(dind as usize, ino, "indirect", &mut dup, &mut freeref);
+        }
+        if blocks > MAX_NBLOCK_INDIRECT {
+            claim(ddb as usize, ino, "dbind", &mut dup, &mut freeref);
+        }
+        for i in 0..blocks {
+            let b = inode.get_disk_block_id(i).unwrap();
+            claim(b, ino, "data", &mut dup, &mut freeref);
+        }
+        if dtype == crate::structs::FileType::Dir {
+            for e in 0..(dsize as usize / DIRENT_SIZE) {
+                let ent = inode.read_direntry(e).unwrap();
+                let n: &str = ent.name.as_ref();
+                if n != "." && n != ".." {
+                    stack.push(ent.id as usize);
+                }
+            }
+        }
+    }
+    std::println!(
+        "inodes {} blocks used {} shared {} referenced-but-free {}",
+        seen.len(),
+        owner.len(),
+        dup,
+        freeref
+    );
+    std::mem::forget(sfs);
+}
