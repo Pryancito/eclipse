@@ -621,6 +621,42 @@ fn vmhwm_holds_the_resident_peak_after_the_memory_is_gone() {
     assert_eq!(kb(&after, "VmHWM"), 256, "the peak stays: {:?}", after);
 }
 
+/// `VmRSS:` is a walk of the committed pages and `VmHWM:` the page table's
+/// count, and the walk can read more: pages already in an object -- a file's
+/// cache, here a written VMO -- count there before this process has touched
+/// them. Linux writes `max(hiwater_rss, rss)`, so `VmHWM:` is never below
+/// `VmRSS:`; nor is it here.
+#[test]
+fn vmhwm_is_never_below_vmrss() {
+    use zircon_object::vm::{MMUFlags, VmObject};
+    const PAGES: usize = 16;
+    let (_job, proc, _thread) = a_process(45_388);
+    let kb = |status: &str, key: &str| -> u64 {
+        line(status, key)
+            .and_then(|v| v.trim().strip_suffix("kB"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap()
+    };
+    let vmo = VmObject::new_paged(PAGES);
+    vmo.write(0, &alloc::vec![7u8; PAGES * 4096]).unwrap();
+    proc.vmar()
+        .map(
+            Some(0x3_7800_0000),
+            vmo,
+            0,
+            PAGES * 4096,
+            MMUFlags::READ | MMUFlags::USER,
+        )
+        .unwrap();
+    let status = proc_pid_status(&proc);
+    assert_eq!(kb(&status, "VmRSS"), 64, "{:?}", status);
+    assert!(
+        kb(&status, "VmHWM") >= kb(&status, "VmRSS"),
+        "VmHWM below VmRSS: {:?}",
+        status
+    );
+}
+
 /// Each `Cap*:` line is its own set: capset, a bounding-set drop and an
 /// inheritable bit, all different, each read back on its line.
 #[test]
