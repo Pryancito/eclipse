@@ -201,6 +201,12 @@ marca en rojo en lugar de reintentar en bucle.
 
 Arranque: el log incluye `session_ms` hasta tener Servo listo. Con
 `SILVERSURFER_REQUIRE_EGL=1` falla si no hay EGL (sin fallback software).
+Con zink (`GALLIUM_DRIVER` o `MESA_LOADER_DRIVER_OVERRIDE` = `zink`, las
+sesiones GPU de Eclipse OS sobre NVK) el contexto EGL se crea y Servo pinta en
+la GPU, pero lo que se presenta no llega a verse: la página quedaba vacía bajo
+el indicador `GL`. Ahí la página se renderiza en el FBO fuera de pantalla de
+Servo y se lee al `wl_shm` del toplevel, como en software (`paint=EGL→wl_shm`
+en el log). `SILVERSURFER_PRESENT=egl` o `=shm` fuerza un camino u otro.
 `SILVERSURFER_SOFTWARE=1` hace lo contrario: salta EGL y pinta la página en
 software→wl_shm, el camino que toma Eclipse OS con labwc en pixman. Ahí el
 toplevel usa dos búferes: pixman no suelta un `wl_shm` hasta recibir otro, y
