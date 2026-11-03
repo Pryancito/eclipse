@@ -9,7 +9,7 @@ impl App {
         };
         let _ = session.context.make_current();
         session.shell.paint();
-        if session.gpu {
+        if !self.shm_present {
             let scale = self.scale;
             if let Some(page) = &self.page {
                 page.set_buffer_scale(scale);

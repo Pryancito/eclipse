@@ -243,6 +243,10 @@ pub struct App {
     /// `glReadPixels(GL_BGRA)` funcionó; si el driver lo rechaza se vuelve a
     /// `read_to_image` (RGBA, daño completo).
     bgra_read: bool,
+    /// The page is read back into the toplevel's wl_shm buffer instead of
+    /// being presented on its own EGL subsurface. Always true in software;
+    /// with EGL, see [`egl_via_shm`].
+    shm_present: bool,
     /// Hay un `wl_surface.frame` del toplevel sin responder: el compositor aún
     /// no mostró el fotograma anterior, así que el siguiente espera. Limita el
     /// camino software a la frecuencia del monitor (y a cero si no se ve).
@@ -334,6 +338,7 @@ impl App {
             readback: Vec::new(),
             shown: Vec::new(),
             bgra_read: true,
+            shm_present: false,
             frame_wait: None,
             last_rows: None,
         }
@@ -484,9 +489,14 @@ impl App {
             self.scale as f32,
             private,
         )?;
+        self.shm_present = !gpu || egl_via_shm();
         eprintln!(
             "silversurfer: paint={}{} session_ms={}",
-            if gpu { "EGL" } else { "software→wl_shm" },
+            match (gpu, self.shm_present) {
+                (true, false) => "EGL",
+                (true, true) => "EGL→wl_shm",
+                (false, _) => "software→wl_shm",
+            },
             if private { " private" } else { "" },
             t0.elapsed().as_millis()
         );
@@ -533,7 +543,15 @@ impl App {
             .then(|| self.try_gpu(width, height))
             .flatten()
         {
-            let dyn_context: Rc<dyn RenderingContext> = context.clone();
+            // Read back into wl_shm: render into Servo's offscreen FBO, whose
+            // size follows resizes at once. The EGL window's own back buffer
+            // only resizes on eglSwapBuffers, which this path never calls, so
+            // reading it after a configure gave a shifted, stale page.
+            let dyn_context: Rc<dyn RenderingContext> = if egl_via_shm() {
+                Rc::new(context.offscreen_context(PhysicalSize::new(width.max(1), height.max(1))))
+            } else {
+                context.clone()
+            };
             return Ok((dyn_context, Some(context), true));
         }
         let require_egl = std::env::var_os("SILVERSURFER_REQUIRE_EGL").is_some();
@@ -613,8 +631,7 @@ impl App {
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
         });
         if frame {
-            let software = self.session.as_ref().is_some_and(|s| !s.gpu);
-            if software && self.waiting_for_frame() {
+            if self.shm_present && self.waiting_for_frame() {
                 // Se pinta cuando llegue el `frame` del compositor.
                 self.retry_frame();
             } else {
@@ -646,6 +663,25 @@ impl App {
         self.chrome_fp = 0;
         self.need_paint = true;
     }
+}
+
+/// Whether a GPU page is read back into wl_shm instead of presented.
+///
+/// On Eclipse OS the GPU sessions run Mesa's GL on zink+NVK. The context
+/// builds and Servo renders on the GPU, but the buffers that kopper hands the
+/// compositor never show: the page stays empty under a `GL` toolbar. Reading
+/// the frame back keeps the GPU rendering (WebGL, WebGPU, layout) and shows it
+/// through the same wl_shm path as software. `SILVERSURFER_PRESENT=egl|shm`
+/// overrides the guess.
+fn egl_via_shm() -> bool {
+    match std::env::var("SILVERSURFER_PRESENT").as_deref() {
+        Ok("egl") => return false,
+        Ok("shm") => return true,
+        _ => {}
+    }
+    ["GALLIUM_DRIVER", "MESA_LOADER_DRIVER_OVERRIDE"]
+        .iter()
+        .any(|var| std::env::var(var).is_ok_and(|v| v.eq_ignore_ascii_case("zink")))
 }
 
 fn proxy_ptr<P: Proxy>(proxy: &P) -> *mut libc::c_void {
