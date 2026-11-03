@@ -1045,3 +1045,34 @@ fn concurrent_writers_never_shrink_the_file() -> Result<()> {
     }
     Ok(())
 }
+
+/// Threads creating, writing, looking up and unlinking files in one
+/// directory. A lookup racing an inode's `Drop` used to load a second copy of
+/// it from disk, and dropping that copy freed its blocks again.
+#[test]
+fn concurrent_lookup_and_unlink_do_not_double_free() -> Result<()> {
+    for _round in 0..4 {
+        let sfs = _create_new_sfs();
+        let root = sfs.root_inode();
+        let hs: std::vec::Vec<_> = (0..4)
+            .map(|t| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    for i in 0..300 {
+                        let name = std::format!("f{}_{}", t, i);
+                        let f = root.create(&name, FileType::File, 0o644).unwrap();
+                        f.write_at(0, &[1u8; 5000]).unwrap();
+                        drop(f);
+                        let _ = root.find(&std::format!("f{}_{}", (t + 1) % 4, i));
+                        root.unlink(&name).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().expect("thread panicked");
+        }
+        sfs.sync()?;
+    }
+    Ok(())
+}
