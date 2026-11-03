@@ -2369,6 +2369,286 @@ statx_poison:
 	testl	%eax, %eax
 	jnz	bad_ipc_rmid
 
+	/* Step 78: the three `*id64_ds` of System V, which are the structures
+	 * `IPC_STAT` and `IPC_SET` carry and the last shapes of the family
+	 * that the kernel had to refuse.
+	 *
+	 * None of them is the native structure with its words made smaller.
+	 * Each begins with a `struct ipc64_perm`, 36 bytes here against 48
+	 * there, and on a 32-bit architecture Linux splits every `time_t`
+	 * member into a `_low`/`_high` PAIR of `unsigned long` --- so what is
+	 * reserved padding in the native layout is live data here, and the
+	 * whole tail of each structure sits somewhere else.
+	 *
+	 * `dsbuf` is deliberately 4 mod 8, because that is what these
+	 * structures are: nothing in any of them is wider than an
+	 * `unsigned long` at this width, so i386 aligns all three to 4. A
+	 * kernel that reads or writes them through a native pointer insists
+	 * on 8 and answers EFAULT to a buffer every i386 program may pass. */
+
+	/* shmget(IPC_PRIVATE, 4096, IPC_CREAT|0600) */
+	movl	$117, %eax
+	movl	$23, %ebx
+	xorl	%ecx, %ecx
+	movl	$4096, %edx
+	movl	$0600, %esi
+	orl	$01000, %esi		/* IPC_CREAT; OCTAL, so these are
+					 * real permission bits */
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_ds_shm
+	movl	%eax, shmid
+
+	call	poison_dsbuf
+	/* shmctl(id, IPC_STAT|__IPC_64, dsbuf) */
+	movl	$117, %eax
+	movl	$24, %ebx
+	movl	shmid, %ecx
+	movl	$2, %edx
+	orl	$0x100, %edx
+	xorl	%esi, %esi
+	movl	$dsbuf, %edi		/* `ptr`, not `third`: that is where
+					 * the multiplexer takes the buffer of
+					 * `msgctl` and `shmctl` from */
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ds_shm
+	/* `shm_segsz` at 36: this is the one of the three whose size comes
+	 * BEFORE the times, so a table copied from `semid64_ds` would report
+	 * the segment size as a timestamp. */
+	cmpl	$4096, dsbuf + 36
+	jne	bad_ds_shm
+	/* `mode` at 20, inside the 36-byte perm. */
+	movl	dsbuf + 20, %eax
+	andl	$0777, %eax
+	cmpl	$0600, %eax
+	jne	bad_ds_shm
+	/* And nothing at all past byte 84. The native structure is 112 and
+	 * would have written `shm_nattch` at 88. */
+	cmpl	$0xaaaaaaaa, dsbuf + 84
+	jne	bad_ds_shm
+	cmpl	$0xaaaaaaaa, dsbuf + 108
+	jne	bad_ds_shm
+
+	movl	$117, %eax
+	movl	$24, %ebx
+	movl	shmid, %ecx
+	movl	$0x100, %edx
+	xorl	%esi, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ds_rmid
+
+	/* semget with THREE semaphores, so `sem_nsems` is a number this
+	 * program chose and not a 1 that could come from anywhere. */
+	movl	$117, %eax
+	movl	$2, %ebx
+	xorl	%ecx, %ecx
+	movl	$3, %edx
+	movl	$0600, %esi
+	orl	$01000, %esi		/* IPC_CREAT; OCTAL, so these are
+					 * real permission bits */
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_ds_sem
+	movl	%eax, semid
+
+	call	poison_dsbuf
+	/* `semctl`'s `ptr` does not point at the structure: it points at a
+	 * word HOLDING the pointer, because the argument is a `union semun`.
+	 * That is the multiplexer's own read, and it is in no handler. */
+	movl	$dsbuf, %eax
+	movl	%eax, semarg
+	movl	$117, %eax
+	movl	$3, %ebx
+	movl	semid, %ecx
+	xorl	%edx, %edx
+	movl	$2, %esi
+	orl	$0x100, %esi
+	movl	$semarg, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ds_sem
+	/* `sem_nsems` at 52. Halving the native words would put it at 40,
+	 * which is where `sem_otime_high` lives. */
+	cmpl	$3, dsbuf + 52
+	jne	bad_ds_sem
+	/* Nothing past 64: the native structure is 104 and puts `sem_nsems`
+	 * at 80. */
+	cmpl	$0xaaaaaaaa, dsbuf + 64
+	jne	bad_ds_sem
+	cmpl	$0xaaaaaaaa, dsbuf + 100
+	jne	bad_ds_sem
+
+	movl	$117, %eax
+	movl	$3, %ebx
+	movl	semid, %ecx
+	xorl	%edx, %edx
+	movl	$0x100, %esi
+	movl	$semarg, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ds_rmid
+
+	/* msgget, then the only field of these three structures that
+	 * `IPC_SET` reads back IN: `msg_qbytes`, at offset 68 here and 88
+	 * there --- and 88 is the whole LENGTH of this structure, so a
+	 * native read looks for the capacity past the end of what this
+	 * program passed. */
+	movl	$117, %eax
+	movl	$13, %ebx
+	xorl	%ecx, %ecx
+	movl	$0600, %edx
+	orl	$01000, %edx
+	xorl	%esi, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_ds_msg
+	movl	%eax, msqid
+
+	call	poison_dsbuf
+	/* A `msqid64_ds` of this program's shape: zero, except `mode` at 20
+	 * and `qbytes` at 68. */
+	movl	$dsbuf, %edi
+	movl	$88, %ecx
+	xorl	%eax, %eax
+	rep	stosb
+	movl	$0600, dsbuf + 20
+	movl	$2048, dsbuf + 68
+	movl	$117, %eax
+	movl	$14, %ebx
+	movl	msqid, %ecx
+	movl	$1, %edx
+	orl	$0x100, %edx
+	xorl	%esi, %esi
+	movl	$dsbuf, %edi		/* `ptr`, not `third`: that is where
+					 * the multiplexer takes the buffer of
+					 * `msgctl` and `shmctl` from */
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ds_msg
+
+	call	poison_dsbuf
+	movl	$117, %eax
+	movl	$14, %ebx
+	movl	msqid, %ecx
+	movl	$2, %edx
+	orl	$0x100, %edx
+	xorl	%esi, %esi
+	movl	$dsbuf, %edi		/* `ptr`, not `third`: that is where
+					 * the multiplexer takes the buffer of
+					 * `msgctl` and `shmctl` from */
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ds_msg
+	cmpl	$2048, dsbuf + 68
+	jne	bad_ds_msg
+	/* Nothing past 88, where the native 120 bytes would reach. */
+	cmpl	$0xaaaaaaaa, dsbuf + 88
+	jne	bad_ds_msg
+	cmpl	$0xaaaaaaaa, dsbuf + 116
+	jne	bad_ds_msg
+
+	movl	$117, %eax
+	movl	$14, %ebx
+	movl	msqid, %ecx
+	movl	$0x100, %edx
+	xorl	%esi, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ds_rmid
+
+	/* Step 79: the two TABLE commands of shared memory, which are the
+	 * last two shapes of `ipc(117)`.
+	 *
+	 * `IPC_INFO` carries a `struct shminfo64`, which is nine
+	 * `__kernel_ulong_t` and nothing else: 36 bytes here against 72.
+	 * `SHM_INFO` carries a `struct shm_info`, which is NOT a pure run ---
+	 * it leads with an `int used_ids`, and the native layout pads after
+	 * it to 8-align the counts, so `shm_tot` is at 4 here and at 8
+	 * there. 24 bytes against 48.
+	 *
+	 * Neither takes an id: that is what a table command is. */
+
+	movl	$117, %eax
+	movl	$23, %ebx
+	xorl	%ecx, %ecx
+	movl	$4096, %edx
+	movl	$0600, %esi
+	orl	$01000, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_shm_table
+	movl	%eax, shmid
+
+	call	poison_dsbuf
+	/* shmctl(0, IPC_INFO|__IPC_64, dsbuf) --- the id is ignored. */
+	movl	$117, %eax
+	movl	$24, %ebx
+	xorl	%ecx, %ecx
+	movl	$3, %edx
+	orl	$0x100, %edx
+	xorl	%esi, %esi
+	movl	$dsbuf, %edi
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_shm_table
+	/* `shmmin` is the SECOND word, so at 4 here and at 8 there, and it is
+	 * 1 in the header rather than a sysctl, so it is a number this step
+	 * can name. */
+	cmpl	$1, dsbuf + 4
+	jne	bad_shm_table
+	/* `shmmax` is not zero, so the structure is really filled. */
+	cmpl	$0, dsbuf + 0
+	je	bad_shm_table
+	/* And nothing past 36, where the native 72 would reach. */
+	cmpl	$0xaaaaaaaa, dsbuf + 36
+	jne	bad_shm_table
+	cmpl	$0xaaaaaaaa, dsbuf + 68
+	jne	bad_shm_table
+
+	call	poison_dsbuf
+	/* shmctl(0, SHM_INFO|__IPC_64, dsbuf) */
+	movl	$117, %eax
+	movl	$24, %ebx
+	xorl	%ecx, %ecx
+	movl	$14, %edx
+	orl	$0x100, %edx
+	xorl	%esi, %esi
+	movl	$dsbuf, %edi
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_shm_table
+	/* `used_ids` at 0: there is at least the segment above. */
+	cmpl	$0, dsbuf + 0
+	jle	bad_shm_table
+	/* `shm_tot` at 4. Natively that offset is the PADDING after the
+	 * `int`, so a native write leaves it zero and this is the check that
+	 * says which layout was used. */
+	cmpl	$0, dsbuf + 4
+	je	bad_shm_table
+	/* Nothing past 24, where the native 48 would reach. */
+	cmpl	$0xaaaaaaaa, dsbuf + 24
+	jne	bad_shm_table
+	cmpl	$0xaaaaaaaa, dsbuf + 44
+	jne	bad_shm_table
+
+	movl	$117, %eax
+	movl	$24, %ebx
+	movl	shmid, %ecx
+	movl	$0x100, %edx
+	xorl	%esi, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ds_rmid
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -2692,6 +2972,31 @@ bad_sem:
 bad_ipc_rmid:
 	movl	$98, %ebx
 	jmp	die
+bad_ds_shm:
+	movl	$99, %ebx
+	jmp	die
+bad_ds_sem:
+	movl	$100, %ebx
+	jmp	die
+bad_ds_msg:
+	movl	$101, %ebx
+	jmp	die
+bad_ds_rmid:
+	movl	$102, %ebx
+	jmp	die
+bad_shm_table:
+	movl	$103, %ebx
+	jmp	die
+
+	/* 0xaa over the 128 bytes of `dsbuf`, so that every byte the kernel
+	 * writes is one this program did not put there and every byte it
+	 * does NOT write stays visible. Clobbers %eax, %ecx and %edi. */
+poison_dsbuf:
+	movl	$dsbuf, %edi
+	movl	$32, %ecx
+	movl	$0xaaaaaaaa, %eax
+	rep	stosl
+	ret
 
 	/* 0xaa over the two entries of the batch array, so that each transfer
 	 * count the kernel writes is a byte the program did not put there and
@@ -2961,6 +3266,14 @@ itv:
 	 * instead of `EINVAL` the first time a new step's data moved this
 	 * buffer by four bytes, so the alignment is pinned here rather
 	 * than left to whatever the labels above happen to add up to. */
+	/* Step 78's `*id64_ds` buffer, 128 bytes so the native width has
+	 * room to overrun into something this program can see. Deliberately
+	 * 4 mod 8, which is the alignment i386 gives all three structures:
+	 * none of them has a member wider than an `unsigned long` here. */
+	.balign	8
+	.long	0
+dsbuf:
+	.space	128
 	.balign	8
 	.long	0
 its:

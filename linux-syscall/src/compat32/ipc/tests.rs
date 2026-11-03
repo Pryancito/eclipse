@@ -342,12 +342,14 @@ fn semctl_takes_its_argument_from_the_word_the_pointer_holds() {
 }
 
 #[test]
-fn the_shapes_that_are_not_written_yet_say_so_rather_than_guessing() {
-    // Three refusals, each for its own reason, pinned so that "not
-    // implemented" stays visible instead of becoming a silent wrong layout
-    // or a wrong wait.
+fn what_is_still_refused_says_so_by_name_rather_than_guessing() {
+    // The refusals that are left, and NONE of them is a layout any more:
+    // every structure of `ipc(117)` is converted. What is left is a call
+    // this kernel does not have at either width, an interface that never
+    // shipped, and a sub-call number that does not exist --- each said by
+    // name rather than silently becoming something else.
     let proc = a_process(48_465, Abi::Linux32);
-    let (stat, set, rmid, timedop, shmat_v1, nonsense) = on_a_thread(&proc, |sys| {
+    let (rmid, timedop, shmat_v1, nonsense) = on_a_thread(&proc, |sys| {
         Box::pin(async move {
             let mut sys = as_mut(sys);
             let id = sys
@@ -355,21 +357,10 @@ fn the_shapes_that_are_not_written_yet_say_so_rather_than_guessing() {
                 .await;
             assert!(id >= 0);
             let id = id as usize;
-            // IPC_STAT and IPC_SET carry a `semid64_ds`, which is 64 bytes
-            // to this caller and 104 here. Writing the native one would
-            // overwrite forty bytes of the caller's memory, so: ENOSYS.
-            // `| IPC_64` is what an i386 glibc actually sends, on EVERY
-            // command, which is the whole reason `ctl_cmd` has to take it
-            // off again.
-            let stat = sys
-                .compat32_syscall(IPC, [3, id, 0, 2 | 0x100, BUF, 0])
-                .await;
-            let set = sys
-                .compat32_syscall(IPC, [3, id, 0, 1 | 0x100, BUF, 0])
-                .await;
             // IPC_RMID carries nothing, so it goes through -- and it is the
             // only command in the family with no other reason to fail, which
-            // is how the `IPC_64` bit left on showed up at all.
+            // is how the `IPC_64` bit left on showed up at all. `| IPC_64`
+            // is what an i386 glibc actually sends, on EVERY command.
             let rmid = sys.compat32_syscall(IPC, [3, id, 0, 0x100, BUF, 0]).await;
             // No `semtimedop` at either width yet. Said by name rather than
             // silently becoming an untimed `semop`, which would park for
@@ -380,11 +371,9 @@ fn the_shapes_that_are_not_written_yet_say_so_rather_than_guessing() {
                 .compat32_syscall(IPC, [21 | (1 << 16), 1, 0, OUT, 0, 0])
                 .await;
             let nonsense = sys.compat32_syscall(IPC, [99, 0, 0, 0, 0, 0]).await;
-            (stat, set, rmid, timedop, shmat_v1, nonsense)
+            (rmid, timedop, shmat_v1, nonsense)
         })
     });
-    assert_eq!(stat, ENOSYS, "IPC_STAT must not write the native layout");
-    assert_eq!(set, ENOSYS, "IPC_SET must not read the native layout");
     assert_eq!(rmid, 0, "IPC_RMID carries no structure and must go through");
     assert_eq!(timedop, ENOSYS, "semtimedop");
     assert_eq!(shmat_v1, EINVAL, "shmat version 1");
@@ -398,4 +387,315 @@ fn the_number_is_not_in_the_translation_table() {
     // whatever number 117 happens to be here.
     assert_eq!(crate::compat32::native_number(IPC), None);
     assert_eq!(crate::compat32::name(IPC), Some("ipc"));
+}
+
+/// What `IPC_STAT` writes, and above all what it does **not** write: the
+/// `semid64_ds` of a 32-bit caller is 64 bytes, and the native one is 104.
+///
+/// Before the conversion the multiplexer refused this command outright, and
+/// the alternative it was refusing was writing forty bytes into whatever the
+/// caller keeps after its structure. The poison past byte 64 is the whole
+/// test: a native write passes every assertion about the fields it manages
+/// to land and fails this one.
+#[test]
+fn the_semid_ds_comes_back_at_sixty_four_bytes_through_the_multiplexer() {
+    let proc = a_process(48_466, Abi::Linux32);
+    let (rc, bytes) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut sys = as_mut(sys);
+            let id = sys
+                .compat32_syscall(IPC, [2, 0x4846_6001, 3, IPC_CREAT | OWNER_RW, 0, 0])
+                .await;
+            assert!(id >= 0, "semget through 117: {}", id);
+            put(BUF, &[0xAAu8; 128]);
+            // `semctl` is the sub-call whose `ptr` does not point at the
+            // structure: it points at a word HOLDING the pointer, because
+            // the argument is a `union semun`. So the buffer address goes
+            // into a word of its own.
+            put(OUT, &(BUF as u32).to_ne_bytes());
+            let rc = sys
+                .compat32_syscall(IPC, [3, id as usize, 0, 2 | 0x100, OUT, 0])
+                .await;
+            (rc, get(BUF, 128))
+        })
+    });
+    assert_eq!(rc, 0, "semctl IPC_STAT through 117");
+    // `sem_nsems` at 52, which is where the narrow layout puts it.
+    assert_eq!(
+        word(&bytes, 52),
+        3,
+        "nsems is not at offset 52: {:x?}",
+        &bytes[36..64]
+    );
+    // `mode` at 20, inside the 36-byte `ipc64_perm`.
+    assert_eq!(word(&bytes, 20) & 0o777, 0o600, "mode is not at offset 20");
+    // And nothing at all past 64. The native structure would have written
+    // `nsems` at 80 and run to 104.
+    assert!(
+        bytes[64..].iter().all(|&b| b == 0xAA),
+        "IPC_STAT wrote past the end of a 64-byte structure: {:x?}",
+        &bytes[64..104]
+    );
+    proc.exit(0);
+}
+
+/// `msg_qbytes` is the one field of the three structures that `IPC_SET`
+/// reads, so it is the one whose offset decides whether a 32-bit
+/// `msgctl(IPC_SET)` sets the queue's capacity or something else.
+///
+/// It is at 68 in the narrow layout and 88 in the native one --- and 88 is
+/// the narrow structure's whole length, so a native read runs off the end of
+/// the caller's buffer before it even gets there.
+#[test]
+fn msgctl_ipc_set_takes_qbytes_from_offset_sixty_eight() {
+    const CAP: u32 = 8192;
+    let proc = a_process(48_467, Abi::Linux32);
+    let (set, stat, bytes) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut sys = as_mut(sys);
+            let id = sys
+                .compat32_syscall(IPC, [13, 0x4846_7001, IPC_CREAT | OWNER_RW, 0, 0, 0])
+                .await;
+            assert!(id >= 0, "msgget through 117: {}", id);
+            // A `msqid64_ds` as this caller lays it out: 88 bytes, zero
+            // everywhere except `mode` at 20 and `qbytes` at 68.
+            let mut image = [0u8; 88];
+            image[20..24].copy_from_slice(&0o600u32.to_ne_bytes());
+            image[68..72].copy_from_slice(&CAP.to_ne_bytes());
+            put(BUF, &image);
+            let set = sys
+                .compat32_syscall(IPC, [14, id as usize, 1 | 0x100, 0, BUF, 0])
+                .await;
+            put(BUF, &[0xAAu8; 128]);
+            let stat = sys
+                .compat32_syscall(IPC, [14, id as usize, 2 | 0x100, 0, BUF, 0])
+                .await;
+            (set, stat, get(BUF, 128))
+        })
+    });
+    assert_eq!(set, 0, "msgctl IPC_SET through 117");
+    assert_eq!(stat, 0, "msgctl IPC_STAT through 117");
+    assert_eq!(
+        word(&bytes, 68),
+        CAP,
+        "the capacity did not survive the round trip: IPC_SET read qbytes \
+         from somewhere else, or IPC_STAT wrote it somewhere else. {:x?}",
+        &bytes[56..88]
+    );
+    assert!(
+        bytes[88..].iter().all(|&b| b == 0xAA),
+        "IPC_STAT wrote past the end of an 88-byte structure: {:x?}",
+        &bytes[88..120]
+    );
+    proc.exit(0);
+}
+
+/// `shmid64_ds` is the odd one: `shm_segsz` comes before the times, so its
+/// first time pair starts at 40 and not 36. A table copied from
+/// `semid64_ds` would report the segment size as a timestamp.
+#[test]
+fn the_shmid_ds_reports_its_size_at_offset_thirty_six() {
+    let proc = a_process(48_468, Abi::Linux32);
+    let (rc, bytes) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut sys = as_mut(sys);
+            let id = sys
+                .compat32_syscall(
+                    IPC,
+                    [23, 0x4846_8001, PAGE_SIZE, IPC_CREAT | OWNER_RW, 0, 0],
+                )
+                .await;
+            assert!(id >= 0, "shmget through 117: {}", id);
+            put(BUF, &[0xAAu8; 128]);
+            let rc = sys
+                .compat32_syscall(IPC, [24, id as usize, 2 | 0x100, 0, BUF, 0])
+                .await;
+            (rc, get(BUF, 128))
+        })
+    });
+    assert_eq!(rc, 0, "shmctl IPC_STAT through 117");
+    assert_eq!(
+        word(&bytes, 36),
+        PAGE_SIZE as u32,
+        "segsz is not at offset 36: {:x?}",
+        &bytes[32..48]
+    );
+    assert_eq!(word(&bytes, 20) & 0o777, 0o600, "mode is not at offset 20");
+    assert!(
+        bytes[84..].iter().all(|&b| b == 0xAA),
+        "IPC_STAT wrote past the end of an 84-byte structure: {:x?}",
+        &bytes[84..112]
+    );
+    proc.exit(0);
+}
+
+/// Every one of the six copies takes a **4-aligned** buffer, which is what
+/// an i386 program actually passes.
+///
+/// None of these three structures has a member wider than an `unsigned long`
+/// at 32 bits, so i386 aligns all three to **4**, and a real
+/// `struct semid64_ds *` is 4 mod 8 half the time. The native structures
+/// align to 8, and `UserPtr::read`/`write` store through a `*T`, so wiring
+/// any of these six copies to the native width answers `EFAULT` for a
+/// pointer Linux accepts --- the same trap as the `*_time64` family
+/// ([`crate::narrow::narrow_put`]), and the only thing that distinguishes
+/// the width of the two `IPC_SET`s that read nothing but `uid`, `gid` and
+/// `mode`: those three are at offsets 4, 8 and 20 in both layouts, so
+/// nothing else about them differs.
+///
+/// Both directions of all three families, in one place and at one address,
+/// because the address is the whole question.
+#[test]
+fn every_one_of_the_six_copies_takes_a_four_aligned_buffer() {
+    /// 4 mod 8, inside the mapping, clear of `BUF` and `OUT`.
+    const AT_ODD: usize = USER_AT + 0x404;
+    let proc = a_process(48_469, Abi::Linux32);
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut sys = as_mut(sys);
+            let sem = sys
+                .compat32_syscall(IPC, [2, 0x4846_9001, 1, IPC_CREAT | OWNER_RW, 0, 0])
+                .await;
+            let msg = sys
+                .compat32_syscall(IPC, [13, 0x4846_9002, IPC_CREAT | OWNER_RW, 0, 0, 0])
+                .await;
+            let shm = sys
+                .compat32_syscall(
+                    IPC,
+                    [23, 0x4846_9003, PAGE_SIZE, IPC_CREAT | OWNER_RW, 0, 0],
+                )
+                .await;
+            assert!(sem >= 0 && msg >= 0 && shm >= 0, "the three gets");
+            // One image serves all three `IPC_SET`s: `uid`, `gid` and
+            // `mode` are at 4, 8 and 20 in every one of them, and the
+            // longest of the three is 88 bytes.
+            let mut image = [0u8; 88];
+            image[20..24].copy_from_slice(&0o640u32.to_ne_bytes());
+            // `msg_qbytes`, which only `msgctl` reads.
+            image[68..72].copy_from_slice(&8192u32.to_ne_bytes());
+            put(AT_ODD, &image);
+            // `semctl`'s `ptr` is a word holding the pointer, not the
+            // pointer.
+            put(BUF, &(AT_ODD as u32).to_ne_bytes());
+            let sem_set = sys
+                .compat32_syscall(IPC, [3, sem as usize, 0, 1 | 0x100, BUF, 0])
+                .await;
+            let sem_stat = sys
+                .compat32_syscall(IPC, [3, sem as usize, 0, 2 | 0x100, BUF, 0])
+                .await;
+            let msg_set = sys
+                .compat32_syscall(IPC, [14, msg as usize, 1 | 0x100, 0, AT_ODD, 0])
+                .await;
+            let msg_stat = sys
+                .compat32_syscall(IPC, [14, msg as usize, 2 | 0x100, 0, AT_ODD, 0])
+                .await;
+            let shm_set = sys
+                .compat32_syscall(IPC, [24, shm as usize, 1 | 0x100, 0, AT_ODD, 0])
+                .await;
+            let shm_stat = sys
+                .compat32_syscall(IPC, [24, shm as usize, 2 | 0x100, 0, AT_ODD, 0])
+                .await;
+            (
+                [sem_set, sem_stat, msg_set, msg_stat, shm_set, shm_stat],
+                word(&get(AT_ODD, 88), 20) & 0o777,
+            )
+        })
+    });
+    assert_eq!(AT_ODD % 8, 4, "this test is about a 4-aligned address");
+    let names = [
+        "semctl IPC_SET",
+        "semctl IPC_STAT",
+        "msgctl IPC_SET",
+        "msgctl IPC_STAT",
+        "shmctl IPC_SET",
+        "shmctl IPC_STAT",
+    ];
+    for (rc, what) in got.0.iter().zip(names) {
+        assert_eq!(
+            *rc, 0,
+            "{} refused a 4-aligned buffer, which is what an i386 program \
+             passes: it was wired to the native width",
+            what
+        );
+    }
+    assert_eq!(
+        got.1, 0o640,
+        "the last IPC_STAT did not report the mode set"
+    );
+    proc.exit(0);
+}
+
+/// The two table commands of shared memory, which were the last two shapes
+/// of `ipc(117)` left: `IPC_INFO` carries a `struct shminfo64`, 36 bytes
+/// here against 72, and `SHM_INFO` a `struct shm_info`, 24 against 48.
+///
+/// Both at a 4-aligned address, which is what these two are: neither has a
+/// member wider than an `unsigned long` at this width.
+#[test]
+fn the_two_table_commands_of_shared_memory_come_back_narrow() {
+    /// 4 mod 8, clear of `BUF`.
+    const AT_ODD: usize = USER_AT + 0x404;
+    let proc = a_process(48_470, Abi::Linux32);
+    let (info_rc, stat_rc, info, stat) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut sys = as_mut(sys);
+            // One segment of this process's own, so `used_ids` is not zero
+            // and the counts are a number and not an absence.
+            let shm = sys
+                .compat32_syscall(
+                    IPC,
+                    [23, 0x4847_0001, PAGE_SIZE, IPC_CREAT | OWNER_RW, 0, 0],
+                )
+                .await;
+            assert!(shm >= 0, "shmget through 117: {}", shm);
+            put(AT_ODD, &[0xAAu8; 96]);
+            // `IPC_INFO` is 3, and the first argument is ignored: that is
+            // the point of a TABLE command, and looking an id up first made
+            // `ipcs -m` say the kernel had no shared memory at all.
+            let info_rc = sys
+                .compat32_syscall(IPC, [24, 0, 3 | 0x100, 0, AT_ODD, 0])
+                .await;
+            let info = get(AT_ODD, 96);
+            put(AT_ODD, &[0xAAu8; 96]);
+            let stat_rc = sys
+                .compat32_syscall(IPC, [24, 0, 14 | 0x100, 0, AT_ODD, 0])
+                .await;
+            (info_rc, stat_rc, info, get(AT_ODD, 96))
+        })
+    });
+    assert_eq!(AT_ODD % 8, 4, "this test is about a 4-aligned address");
+    assert!(info_rc >= 0, "shmctl IPC_INFO through 117: {}", info_rc);
+    // `shmmni` is the third word, so at 8 here and at 16 natively.
+    assert_eq!(
+        word(&info, 8),
+        4096,
+        "shmmni is not the third FOUR-byte word: {:x?}",
+        &info[..36]
+    );
+    assert!(
+        info[36..].iter().all(|&b| b == 0xAA),
+        "IPC_INFO wrote past the end of a 36-byte shminfo64: {:x?}",
+        &info[36..72]
+    );
+    assert!(stat_rc >= 0, "shmctl SHM_INFO through 117: {}", stat_rc);
+    // `used_ids` is an `int` at 0 in both layouts; `shm_tot` is the one
+    // that moves, from 8 natively to 4 here, because of the padding the
+    // native layout puts after that `int`.
+    // The table is system-wide and the tests beside this one make segments
+    // of their own, so the counts are "at least ours" and not an exact
+    // number.
+    assert!(word(&stat, 0) >= 1, "used_ids: {:x?}", &stat[..24]);
+    assert_ne!(
+        word(&stat, 4),
+        0,
+        "shm_tot is not at offset 4: the native padding after `used_ids` \
+         was kept, so offset 4 is the padding. {:x?}",
+        &stat[..24]
+    );
+    assert!(
+        stat[24..].iter().all(|&b| b == 0xAA),
+        "SHM_INFO wrote past the end of a 24-byte shm_info: {:x?}",
+        &stat[24..48]
+    );
+    proc.exit(0);
 }
