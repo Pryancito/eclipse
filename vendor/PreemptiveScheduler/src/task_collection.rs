@@ -310,7 +310,10 @@ impl FutureCollection {
         // mutable `slab` access below.)
         let page = page.clone();
         let task = self.slab.get(key).unwrap();
-        let waker = Arc::new(page.make_waker(subpage_idx, &task.finish));
+        let waker = Arc::new(
+            page.make_waker(subpage_idx, &task.finish)
+                .with_affinity(task.affinity.clone()),
+        );
         task.waker.call_once(|| waker);
         // self.vec.push_back(key);
         key
