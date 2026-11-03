@@ -107,6 +107,11 @@
  *   80  the siginfo's union does not start at byte twelve
  *   81  the ucontext's sigcontext_32 is not where a 32-bit handler reads it,
  *       or reports a 64-bit code selector
+ *   82  clock_gettime (265) stopped writing a 32-bit timespec
+ *   83  clock_gettime64 (403) did not write a 64-bit one: the same process
+ *       got the same width from both numbers
+ *   84  clock_getres_time64 put its one nanosecond in the wrong word
+ *   85  clock_nanosleep_time64 read its request eight bytes at a time
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -1925,6 +1930,98 @@ statx_poison:
 	xorl	%ecx, %ecx
 	int	$0x80
 
+	/* Step 75: the `*_time64` calls, which are the one family where the
+	 * width of a structure is a property of the CALL and not of this
+	 * process. The same program gets eight bytes from `clock_gettime`
+	 * (265) and SIXTEEN from `clock_gettime64` (403), because
+	 * `struct __kernel_timespec` is two 64-bit words at every width ---
+	 * that is what the `64` in the name means.
+	 *
+	 * It matters because a musl built for i386 in the last few years
+	 * calls only the 64-bit form: with 403 answering `ENOSYS` a 32-bit
+	 * program has no clock at all, not a wrong time.
+	 *
+	 * The step makes both calls into the same poisoned buffer and
+	 * requires the two answers to be DIFFERENT widths. Either one alone
+	 * would pass on a kernel that got everything the same way round. */
+	call	poison_tbuf
+	movl	$265, %eax		/* clock_gettime */
+	movl	$1, %ebx		/* CLOCK_MONOTONIC */
+	movl	$tbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_gettime_narrow
+	/* Eight bytes, and the poison still there after them. */
+	cmpl	$0xaaaaaaaa, tbuf + 8
+	jne	bad_gettime_narrow
+	cmpl	$0xaaaaaaaa, tbuf + 12
+	jne	bad_gettime_narrow
+
+	call	poison_tbuf
+	movl	$403, %eax		/* clock_gettime64 */
+	movl	$1, %ebx		/* CLOCK_MONOTONIC */
+	movl	$tbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_gettime64
+	/* Sixteen bytes. The seconds of a monotonic clock are a small number
+	 * and its nanoseconds are anything, so no single word is reliably
+	 * not the poison --- but the HIGH half of each 64-bit field is a
+	 * zero, and a zero is not 0xaaaaaaaa. So the discriminating check is
+	 * that bytes 8..12 (the low half of a 64-bit `tv_nsec`) are no longer
+	 * the poison, which only a sixteen-byte write can do. */
+	cmpl	$0xaaaaaaaa, tbuf + 8
+	je	bad_gettime64
+	cmpl	$0, tbuf + 4		/* tv_sec's high half */
+	jne	bad_gettime64
+	cmpl	$0, tbuf + 12		/* tv_nsec's high half */
+	jne	bad_gettime64
+	/* And nothing past the structure. */
+	cmpl	$0xaaaaaaaa, tbuf + 16
+	jne	bad_gettime64
+	cmpl	$0xaaaaaaaa, tbuf + 20
+	jne	bad_gettime64
+
+	/* `clock_getres_time64` (406), whose answer is `{0, 1}`: the one call
+	 * here whose VALUES say which layout was written, so a kernel that
+	 * wrote the right number of bytes in the wrong places is caught too. */
+	call	poison_tbuf
+	movl	$406, %eax
+	movl	$1, %ebx
+	movl	$tbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_getres64
+	cmpl	$0, tbuf + 0		/* tv_sec, low half */
+	jne	bad_getres64
+	cmpl	$0, tbuf + 4		/* tv_sec, high half */
+	jne	bad_getres64
+	cmpl	$1, tbuf + 8		/* tv_nsec, low half: 1 ns */
+	jne	bad_getres64
+	cmpl	$0, tbuf + 12
+	jne	bad_getres64
+	cmpl	$0xaaaaaaaa, tbuf + 16
+	jne	bad_getres64
+
+	/* `clock_nanosleep_time64` (407). A request of zero sleeps for
+	 * nothing at either width, so the discriminating bytes are a 64-bit
+	 * `tv_sec` of zero and a 64-bit `tv_nsec` of two thousand million:
+	 * over a billion, so `EINVAL` when read as sixteen bytes --- while
+	 * the SAME bytes read eight at a time are `{0, 0}`, a valid request
+	 * that returns 0. EINVAL is 22. */
+	movl	$0, tbuf + 0
+	movl	$0, tbuf + 4
+	movl	$2000000000, tbuf + 8
+	movl	$0, tbuf + 12
+	movl	$407, %eax
+	movl	$1, %ebx		/* CLOCK_MONOTONIC */
+	xorl	%ecx, %ecx		/* flags: relative */
+	movl	$tbuf, %edx
+	xorl	%esi, %esi		/* no remainder */
+	int	$0x80
+	cmpl	$-22, %eax
+	jne	bad_nanosleep64
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -2196,6 +2293,18 @@ bad_siginfo32:
 	jmp	die
 bad_ucontext32:
 	movl	$81, %ebx
+	jmp	die
+bad_gettime_narrow:
+	movl	$82, %ebx
+	jmp	die
+bad_gettime64:
+	movl	$83, %ebx
+	jmp	die
+bad_getres64:
+	movl	$84, %ebx
+	jmp	die
+bad_nanosleep64:
+	movl	$85, %ebx
 	jmp	die
 
 	/* 0xaa over the two entries of the batch array, so that each transfer
