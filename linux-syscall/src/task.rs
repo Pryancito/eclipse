@@ -2289,7 +2289,20 @@ impl Syscall<'_> {
     pub fn sys_sched_rr_get_interval(
         &self,
         pid: usize,
+        interval: UserOutPtr<TimeSpec>,
+    ) -> SysResult {
+        self.sched_rr_get_interval_at(pid, interval, self.narrow_abi())
+    }
+
+    /// The core both `sched_rr_get_interval` and
+    /// `sched_rr_get_interval_time64` (i386's 423) reach, with the width of
+    /// the `timespec` handed in rather than asked of the process. See
+    /// [`crate::compat32::time64`].
+    pub(crate) fn sched_rr_get_interval_at(
+        &self,
+        pid: usize,
         mut interval: UserOutPtr<TimeSpec>,
+        abi32: bool,
     ) -> SysResult {
         let thread = self.sched_target(crate::intarg::sched_pid(pid)?)?;
         let ts = if thread.sched_policy() == SCHED_RR {
@@ -2300,7 +2313,7 @@ impl Syscall<'_> {
         } else {
             TimeSpec { sec: 0, nsec: 0 }
         };
-        self.put_narrow(&mut interval, ts)?;
+        crate::narrow::narrow_put(abi32, &mut interval, ts)?;
         Ok(0)
     }
 

@@ -2745,11 +2745,11 @@ impl Syscall<'_> {
         // A null `times` means "now", exactly as in utimensat; a pair of
         // timevals is a pair of explicit times, microseconds and all
         // (`do_utimes` -> `utimes_common` with `ATTR_ATIME_SET`).
-        let times = if times.is_null() {
-            None
-        } else {
-            Some(times.read()?)
-        };
+        // `narrow_get_array_if_not_null` and not `times.read()`: a pair of
+        // `struct timeval` is 32 bytes here and 16 to a 32-bit caller, and
+        // the width is the calling process's to answer
+        // (`compat_sys_utimes` -> `get_old_timeval32` twice).
+        let times = crate::narrow::narrow_get_array_if_not_null(self.narrow_abi(), &times)?;
         let request = utimes_times(times, TimeSpec::now())?;
         self.apply_utimes(&inode, request)
     }
@@ -2762,16 +2762,36 @@ impl Syscall<'_> {
         times: UserInOutPtr<[TimeSpec; 2]>,
         flags: usize,
     ) -> SysResult {
+        // See `sys_utimes`: the pair is 32 bytes here and 16 to a 32-bit
+        // caller (`compat_sys_utimensat` -> `get_old_timespec32` twice), and
+        // the width is the calling process's to answer.
+        self.utimensat_at(dirfd, pathname, times, flags, self.narrow_abi())
+    }
+
+    /// The core both `utimensat` (280 / i386's 320) and `utimensat_time64`
+    /// (i386's 412) reach, with the width of the pair handed in rather than
+    /// asked of the process.
+    ///
+    /// 412 is the one a modern i386 musl actually calls, and its pair is a
+    /// `struct __kernel_timespec[2]` --- 32 bytes from a 32-bit program, like
+    /// the rest of the `*_time64` family, because that is what the `64` in
+    /// the name means. So this is the one call in the family that is in BOTH
+    /// of this layer's rules at once: by 320 the width is the process's, by
+    /// 412 it is the call's. See [`crate::compat32::time64`].
+    pub(crate) fn utimensat_at(
+        &mut self,
+        dirfd: FileDesc,
+        pathname: UserInPtr<u8>,
+        times: UserInOutPtr<[TimeSpec; 2]>,
+        flags: usize,
+        abi32: bool,
+    ) -> SysResult {
         info!(
             "utimensat(raw): dirfd: {:?}, pathname: {:?}, times: {:?}, flags: {:#x}",
             dirfd, pathname, times, flags
         );
+        let times = crate::narrow::narrow_get_array_if_not_null(abi32, &times)?;
         let proc = self.linux_process();
-        let times = if times.is_null() {
-            None
-        } else {
-            Some(times.read()?)
-        };
         let request = utimensat_times(times, TimeSpec::now())?;
         let inode = if pathname.is_null() {
             // `futimens(3)`, which glibc spells `utimensat(fd, NULL, times, 0)`;

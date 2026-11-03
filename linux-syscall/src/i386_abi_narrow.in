@@ -26,9 +26,10 @@
 //
 // Not here, each for its own reason:
 //
-//   - `utime` (30), `utimes` (271), `futimesat` (299) and `utimensat` (320)
-//     pass an ARRAY of two of these structures, which needs a conversion of
-//     its own rather than the one-structure helper;
+//   - `utime` (30) passes a `struct utimbuf`, which is a pair of words and
+//     not an array of these structures -- and whose native number (132) has
+//     no handler in this kernel at all, so there is nothing for the table to
+//     point it at. The same goes for `futimesat` (299) and its native 261;
 //   - `waitid` (284) passes a `siginfo_t`, which is 128 bytes in both ABIs
 //     but not the same 128 bytes;
 //   - `timer_create` (259) passes a `struct sigevent`, whose union holds a
@@ -72,6 +73,16 @@ wait4
 // difference and so a job for `compat32::wide`, not for this list.
 readv
 writev
+
+// An ARRAY of two `struct timespec` / `struct timeval`: 32 bytes here and
+// **16** to a 32-bit caller, read at the calling process's width by
+// `narrow::narrow_get_array`. The stride is the thing that differs, which is
+// why this is a helper and not a loop at the call site: reading the native
+// array first and halving each entry afterwards reads sixteen bytes past the
+// end of the caller's buffer before it converts anything. A null pointer is
+// "now" in both, which is `narrow_get_array_if_not_null`.
+utimes
+utimensat
 
 // struct timespec, again: `futex`'s fourth argument is a timeout for the
 // commands that wait and a plain count for the ones that requeue, and the

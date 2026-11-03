@@ -31,7 +31,10 @@
 //!   converts, because it asks the calling process how wide a word is
 //!   ([`crate::narrow`], Linux's `in_compat_syscall()`). `struct timespec`,
 //!   `timeval`, `itimerval`, `itimerspec`, `tms`, `rusage` and the entries
-//!   of a `struct iovec` are all the native layout with every word halved,
+//!   of a `struct iovec` are all the native layout with every word halved ---
+//!   as is an ARRAY of them, which is what the `times` of `utimensat` and
+//!   `utimes` is, and which [`crate::narrow::narrow_get_array`] reads at the
+//!   caller's stride ---
 //!   and once a call passes nothing else, translating the number is again
 //!   all there is to do.
 //!
@@ -56,9 +59,7 @@
 //!
 //! The second is the calls that share a name but not a shape and whose shape
 //! nothing converts yet: anything passing an `rlimit`, a
-//! `siginfo_t`, a `sigevent`, or an **array** of the
-//! structures [`crate::narrow`] converts one at a time (`utimensat`,
-//! `utimes`); `pselect6`, whose timeout is converted but whose sixth
+//! `siginfo_t` or a `sigevent`; `pselect6`, whose timeout is converted but whose sixth
 //! argument points at two words; `lseek`, whose offset is signed where these
 //! registers are read zero-extended; `clone`, whose last two arguments are
 //! swapped on i386; and `execve`, whose `argv` and `envp` are arrays of
@@ -180,7 +181,8 @@ use signal::{I386_RT_SIGACTION, I386_RT_SIGRETURN, I386_SIGALTSTACK};
 /// a property of the CALL and not of the process. See [`time64`].
 use time64::{
     I386_CLOCK_GETRES_TIME64, I386_CLOCK_GETTIME64, I386_CLOCK_NANOSLEEP_TIME64,
-    I386_CLOCK_SETTIME64, I386_FUTEX_TIME64, I386_TIMERFD_GETTIME64, I386_TIMERFD_SETTIME64,
+    I386_CLOCK_SETTIME64, I386_FUTEX_TIME64, I386_PPOLL_TIME64, I386_SCHED_RR_GET_INTERVAL_TIME64,
+    I386_TIMERFD_GETTIME64, I386_TIMERFD_SETTIME64, I386_UTIMENSAT_TIME64,
 };
 
 /// And `ipc`, the eleven System V calls behind one number --- where the
@@ -320,6 +322,18 @@ impl Syscall<'_> {
                         .await,
                 );
             }
+            I386_UTIMENSAT_TIME64 => {
+                return syscall_ret(self.sys_utimensat_time64(a0.into(), a1.into(), a2.into(), a3));
+            }
+            I386_PPOLL_TIME64 => {
+                return syscall_ret(
+                    self.sys_ppoll_time64(a0.into(), a1, a2.into(), a3.into(), a4)
+                        .await,
+                );
+            }
+            I386_SCHED_RR_GET_INTERVAL_TIME64 => {
+                return syscall_ret(self.sys_sched_rr_get_interval_time64(a0, a1.into()));
+            }
             I386_IPC => {
                 return syscall_ret(self.sys_ipc32(a0 as u32, a1, a2, a3, a4, a5).await);
             }
@@ -355,3 +369,8 @@ mod tests;
 
 #[cfg(test)]
 mod unaligned_tests;
+
+/// The `times` of `utimensat` and `utimes`, whose subject is the STRIDE of an
+/// array rather than the width of one structure.
+#[cfg(test)]
+mod utimes_tests;

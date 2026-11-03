@@ -747,10 +747,28 @@ impl Syscall<'_> {
         sigmask: UserInPtr<Sigset>,
         sigsetsize: usize,
     ) -> SysResult {
+        let abi32 = self.narrow_abi();
+        self.ppoll_at(ufds, nfds, timeout, sigmask, sigsetsize, abi32)
+            .await
+    }
+
+    /// The core both `ppoll` and `ppoll_time64` (i386's 414) reach, with the
+    /// width of the timeout handed in rather than asked of the process: by
+    /// 414 a 32-bit caller's `struct __kernel_timespec` is sixteen bytes.
+    /// See [`crate::compat32::time64`].
+    pub(crate) async fn ppoll_at(
+        &mut self,
+        ufds: UserInOutPtr<PollFd>,
+        nfds: usize,
+        timeout: UserInPtr<TimeSpec>,
+        sigmask: UserInPtr<Sigset>,
+        sigsetsize: usize,
+        abi32: bool,
+    ) -> SysResult {
         let timeout_msecs = if timeout.is_null() {
             -1
         } else {
-            let timeout = self.get_narrow(&timeout)?;
+            let timeout = crate::narrow::narrow_get(abi32, &timeout)?;
             info!("sys_ppoll: timeout: {:?}", timeout);
             // Validated, not cast: a `timespec` out of range is EINVAL, and
             // a huge one must stay finite rather than turn into the

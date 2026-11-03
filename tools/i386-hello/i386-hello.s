@@ -112,6 +112,15 @@
  *       got the same width from both numbers
  *   84  clock_getres_time64 put its one nanosecond in the wrong word
  *   85  clock_nanosleep_time64 read its request eight bytes at a time
+ *   86..103  the `timerfd`/`futex` pair and the whole of `ipc(117)`, each
+ *       named by its own `bad_*` label at the bottom of this file
+ *   104 the `times` of utimensat (320) or utimes (271) was read at the
+ *       NATIVE stride: the pair is sixteen bytes to a 32-bit caller, so the
+ *       modification time came out of the poison behind it
+ *   105 one of utimensat_time64 (412), ppoll_time64 (414) or
+ *       sched_rr_get_interval_time64 (423) read or wrote its structure at
+ *       the NARROW width: in this family the width is the CALL's, so a
+ *       32-bit caller's timespec is sixteen bytes
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -2649,6 +2658,286 @@ statx_poison:
 	testl	%eax, %eax
 	jnz	bad_ds_rmid
 
+	/* Step 80: the `times` of `utimensat(2)` and of `utimes(2)`, which is
+	 * an ARRAY of two of these structures and so the one shape where the
+	 * thing that differs between the ABIs is the STRIDE.
+	 *
+	 * A pair of `struct timespec` is 16 bytes here and 32 natively, so a
+	 * kernel that read the native array would take the MODIFICATION time
+	 * out of the sixteen bytes after this pair --- which this step
+	 * poisons with 0xaa. That does not fault and does not return an
+	 * error: it sets the file to a time nobody asked for, so the shape of
+	 * the step is "ask the filesystem what the file ended up with", which
+	 * is `fstat64`.
+	 *
+	 * The buffer is 4 mod 8 on purpose (see `tsp`): on i386 every field
+	 * of these structures is a `long`, so that is the alignment a real
+	 * program's `struct timespec *` has.
+	 *
+	 * The file is its own, created EXCLUSIVELY and unlinked first, for
+	 * the reason step 12's comment gives: this probe is documented as
+	 * something to run on a Linux host too, and a symlink at a fixed path
+	 * under /tmp would otherwise send the step at a real machine's
+	 * file. */
+	movl	$10, %eax		/* unlink, ENOENT is fine */
+	movl	$utpath, %ebx
+	int	$0x80
+	movl	$5, %eax		/* open */
+	movl	$utpath, %ebx
+	movl	$0302, %ecx		/* O_RDWR|O_CREAT|O_EXCL */
+	movl	$0600, %edx
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_utimes
+	movl	%eax, fd4
+
+	call	poison_tsp
+	/* The two `struct timespec` a 32-bit caller owns: sixteen bytes, and
+	 * nanosecond fields that are neither UTIME_NOW ((1<<30)-1) nor
+	 * UTIME_OMIT ((1<<30)-2), so both halves are times the kernel has to
+	 * take from this buffer. */
+	movl	$1000000, tsp + 0
+	movl	$123456789, tsp + 4
+	movl	$2000000, tsp + 8
+	movl	$987654321, tsp + 12
+
+	/* utimensat(fd, NULL, tsp, 0): the `futimens(3)` form, which needs no
+	 * pathname and no permission beyond owning the descriptor. */
+	movl	$320, %eax
+	movl	fd4, %ebx
+	xorl	%ecx, %ecx
+	movl	$tsp, %edx
+	xorl	%esi, %esi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_utimes
+
+	movl	$197, %eax		/* fstat64 */
+	movl	fd4, %ebx
+	movl	$statbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_utimes
+	/* st_atime at 64 and st_atime_nsec at 68; st_mtime at 72 and its
+	 * nanoseconds at 76. The modification time is the one that says which
+	 * stride was used: at the native stride it would have come from
+	 * offset 16 of the pair, which is 0xaaaaaaaa --- a nanosecond field
+	 * out of range, so the call would have answered EINVAL rather than
+	 * setting this. */
+	cmpl	$1000000, statbuf + 64
+	jne	bad_utimes
+	cmpl	$123456789, statbuf + 68
+	jne	bad_utimes
+	cmpl	$2000000, statbuf + 72
+	jne	bad_utimes
+	cmpl	$987654321, statbuf + 76
+	jne	bad_utimes
+
+	/* And `utimes(2)`, whose pair is `struct timeval`: the same stride,
+	 * and a sub-second field in MICROseconds, which the kernel multiplies
+	 * by a thousand on the way to the inode. 999999 is the largest it
+	 * accepts. */
+	call	poison_tsp
+	movl	$3000000, tsp + 0
+	movl	$999999, tsp + 4
+	movl	$4000000, tsp + 8
+	movl	$1, tsp + 12
+
+	movl	$271, %eax		/* utimes */
+	movl	$utpath, %ebx
+	movl	$tsp, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_utimes
+
+	movl	$197, %eax		/* fstat64 */
+	movl	fd4, %ebx
+	movl	$statbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_utimes
+	cmpl	$3000000, statbuf + 64
+	jne	bad_utimes
+	cmpl	$999999000, statbuf + 68
+	jne	bad_utimes
+	cmpl	$4000000, statbuf + 72
+	jne	bad_utimes
+	cmpl	$1000, statbuf + 76
+	jne	bad_utimes
+
+	/* A null `times` is "now" in both, and the file stops being where the
+	 * two calls above put it. Anything after 1970 will do: the seconds
+	 * this step set are all under five million. */
+	movl	$320, %eax
+	movl	fd4, %ebx
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	xorl	%esi, %esi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_utimes
+	movl	$197, %eax
+	movl	fd4, %ebx
+	movl	$statbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_utimes
+	cmpl	$5000000, statbuf + 64
+	jbe	bad_utimes
+	cmpl	$5000000, statbuf + 72
+	jbe	bad_utimes
+
+	movl	$6, %eax		/* close */
+	movl	fd4, %ebx
+	int	$0x80
+	movl	$10, %eax		/* unlink */
+	movl	$utpath, %ebx
+	int	$0x80
+
+	/* Step 81: the three `*_time64` numbers whose core already existed and
+	 * only needed the width handed in --- `utimensat_time64` (412),
+	 * `ppoll_time64` (414) and `sched_rr_get_interval_time64` (423).
+	 *
+	 * These are the family where the width is a property of the CALL: a
+	 * 32-bit program's `struct __kernel_timespec` is SIXTEEN bytes, so the
+	 * pair of 412 is thirty-two where the pair of 320 (step 80) is
+	 * sixteen. 412 is the number a modern i386 musl actually sends for
+	 * `utimensat(2)` and `futimens(3)`.
+	 *
+	 * And it is the case that proves the alignment: `tsp` is 4 mod 8 and
+	 * an `__s64` aligns to 4 on i386, so this is a wide structure at a
+	 * 4-aligned address --- which `copy_from_user` accepts and a typed
+	 * store would not. */
+	movl	$10, %eax		/* unlink, ENOENT is fine */
+	movl	$utpath, %ebx
+	int	$0x80
+	movl	$5, %eax		/* open */
+	movl	$utpath, %ebx
+	movl	$0302, %ecx		/* O_RDWR|O_CREAT|O_EXCL */
+	movl	$0600, %edx
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_time64_rest
+	movl	%eax, fd4
+
+	call	poison_tsp
+	/* Two `struct __kernel_timespec`: sixteen bytes each, little-endian,
+	 * so the high half of every field is the zero after it. The sixteen
+	 * bytes behind the pair stay 0xaa, which is where a kernel reading
+	 * the NARROW stride would have taken nothing from --- the failure
+	 * this way round is the opposite one, a modification time read from
+	 * offset 8, which is the high half of the access seconds and so
+	 * zero. */
+	movl	$1000000, tsp + 0	/* atime.tv_sec  low */
+	movl	$0, tsp + 4		/*               high */
+	movl	$123456789, tsp + 8	/* atime.tv_nsec low */
+	movl	$0, tsp + 12		/*               high */
+	movl	$2000000, tsp + 16	/* mtime.tv_sec  low */
+	movl	$0, tsp + 20		/*               high */
+	movl	$987654321, tsp + 24	/* mtime.tv_nsec low */
+	movl	$0, tsp + 28		/*               high */
+
+	/* utimensat_time64(fd, NULL, tsp, 0) */
+	movl	$412, %eax
+	movl	fd4, %ebx
+	xorl	%ecx, %ecx
+	movl	$tsp, %edx
+	xorl	%esi, %esi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_time64_rest
+
+	movl	$197, %eax		/* fstat64 */
+	movl	fd4, %ebx
+	movl	$statbuf, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_time64_rest
+	/* The modification time is the one that says which stride was used: at
+	 * the narrow stride it would have come from offset 8, which here is
+	 * `atime.tv_nsec`, 123456789 --- a nanosecond count and not a second,
+	 * so it would have been set as the seconds. */
+	cmpl	$1000000, statbuf + 64
+	jne	bad_time64_rest
+	cmpl	$123456789, statbuf + 68
+	jne	bad_time64_rest
+	cmpl	$2000000, statbuf + 72
+	jne	bad_time64_rest
+	cmpl	$987654321, statbuf + 76
+	jne	bad_time64_rest
+
+	movl	$6, %eax		/* close */
+	movl	fd4, %ebx
+	int	$0x80
+	movl	$10, %eax		/* unlink */
+	movl	$utpath, %ebx
+	int	$0x80
+
+	/* ppoll_time64(NULL, 0, timeout, NULL, 0): no descriptors, so the
+	 * call is its timeout and nothing else. A tv_nsec of two thousand
+	 * million is not a nanosecond count, so a kernel that reads the
+	 * SIXTEEN bytes answers EINVAL; one that reads eight finds tv_sec 0
+	 * and a tv_nsec that is the high half of the seconds, which is a
+	 * valid timeout of zero and returns 0. So the expected answer here is
+	 * the ERROR. */
+	call	poison_tsp
+	movl	$0, tsp + 0		/* tv_sec  low */
+	movl	$0, tsp + 4		/*         high */
+	movl	$2000000000, tsp + 8	/* tv_nsec low: out of range */
+	movl	$0, tsp + 12		/*         high */
+	movl	$414, %eax
+	xorl	%ebx, %ebx		/* ufds = NULL */
+	xorl	%ecx, %ecx		/* nfds = 0 */
+	movl	$tsp, %edx
+	xorl	%esi, %esi		/* sigmask = NULL */
+	xorl	%edi, %edi		/* sigsetsize = 0 */
+	int	$0x80
+	cmpl	$-22, %eax		/* -EINVAL */
+	jne	bad_time64_rest
+
+	/* And a timeout that IS a nanosecond count, so the same number
+	 * returns 0: without this the check above would pass on a kernel that
+	 * refused every `ppoll_time64`. */
+	call	poison_tsp
+	movl	$0, tsp + 0
+	movl	$0, tsp + 4
+	movl	$1000000, tsp + 8	/* one millisecond */
+	movl	$0, tsp + 12
+	movl	$414, %eax
+	xorl	%ebx, %ebx
+	xorl	%ecx, %ecx
+	movl	$tsp, %edx
+	xorl	%esi, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_time64_rest
+
+	/* sched_rr_get_interval_time64(0, tsp): sixteen bytes OUT, where 161
+	 * writes eight. This thread is not SCHED_RR, so the interval is all
+	 * zeros and the readable thing is WHERE the poison stops. */
+	call	poison_tsp
+	movl	$423, %eax
+	xorl	%ebx, %ebx		/* pid 0: this thread */
+	movl	$tsp, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_time64_rest
+	cmpl	$0, tsp + 0
+	jne	bad_time64_rest
+	cmpl	$0, tsp + 4
+	jne	bad_time64_rest
+	cmpl	$0, tsp + 8
+	jne	bad_time64_rest
+	/* Byte 12 is the high half of tv_nsec, which the narrow number never
+	 * touches: if this is still the poison, only eight bytes were
+	 * written. */
+	cmpl	$0, tsp + 12
+	jne	bad_time64_rest
+	/* And nothing past sixteen. */
+	cmpl	$0xaaaaaaaa, tsp + 16
+	jne	bad_time64_rest
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -2987,6 +3276,12 @@ bad_ds_rmid:
 bad_shm_table:
 	movl	$103, %ebx
 	jmp	die
+bad_utimes:
+	movl	$104, %ebx
+	jmp	die
+bad_time64_rest:
+	movl	$105, %ebx
+	jmp	die
 
 	/* 0xaa over the 128 bytes of `dsbuf`, so that every byte the kernel
 	 * writes is one this program did not put there and every byte it
@@ -2994,6 +3289,16 @@ bad_shm_table:
 poison_dsbuf:
 	movl	$dsbuf, %edi
 	movl	$32, %ecx
+	movl	$0xaaaaaaaa, %eax
+	rep	stosl
+	ret
+
+	/* 0xaa over the forty-eight bytes of `tsp`, so that the sixteen a
+	 * native stride would reach into are a value no clock produces and no
+	 * nanosecond field may hold. Clobbers %eax, %ecx and %edi. */
+poison_tsp:
+	movl	$tsp, %edi
+	movl	$12, %ecx
 	movl	$0xaaaaaaaa, %eax
 	rep	stosl
 	ret
@@ -3140,6 +3445,9 @@ msg2b:
 	.set	msg2blen, . - msg2b
 tmppath:
 	.asciz	"/tmp/i386-hello-pwritev"
+	/* Step 80's own name, for the same reason step 12's has one. */
+utpath:
+	.asciz	"/tmp/i386-hello-utimes"
 	/* A pty master, for the terminal ioctls. Both this container's Linux
 	 * and Eclipse have it, which is why the ioctl steps use it instead of
 	 * descriptor 0: this program's stdin is a pipe as often as a tty, and
@@ -3274,6 +3582,17 @@ itv:
 	.long	0
 dsbuf:
 	.space	128
+	/* Step 80's pair of `struct timespec` / `struct timeval`, with room
+	 * for the native pair plus the sixteen bytes a native stride would
+	 * take the second entry from. Deliberately 4 mod 8, which is the
+	 * alignment i386 gives these structures, every field of them being a
+	 * `long` here. */
+	.balign	8
+	.long	0
+tsp:
+	.space	48
+fd4:
+	.long	0
 	.balign	8
 	.long	0
 its:
