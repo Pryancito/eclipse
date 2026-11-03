@@ -1049,10 +1049,24 @@ impl Syscall<'_> {
         id: usize,
         flags: usize,
         new_value: UserInPtr<ITimerSpec>,
+        old_value: UserOutPtr<ITimerSpec>,
+    ) -> SysResult {
+        self.timer_settime_at(id, flags, new_value, old_value, self.narrow_abi())
+    }
+
+    /// The core both `timer_settime` and `timer_settime64` (i386's 409)
+    /// reach, with the width of the `struct itimerspec` handed in rather
+    /// than asked of the process. See [`crate::compat32::time64`].
+    pub(crate) fn timer_settime_at(
+        &self,
+        id: usize,
+        flags: usize,
+        new_value: UserInPtr<ITimerSpec>,
         mut old_value: UserOutPtr<ITimerSpec>,
+        abi32: bool,
     ) -> SysResult {
         let owner = self.zircon_process().id();
-        let spec = self.get_narrow(&new_value)?;
+        let spec = crate::narrow::narrow_get(abi32, &new_value)?;
         // Linux validates both timespecs of the itimerspec before arming.
         if !spec.interval.valid() || !spec.value.valid() {
             return Err(LxError::EINVAL);
@@ -1066,7 +1080,17 @@ impl Syscall<'_> {
         let base = match posix_timer_clock_of(id, owner)? {
             PosixTimerClock::Base(base) => base,
             PosixTimerClock::Cpu(cpu) => {
-                return self.cpu_timer_settime(id, cpu, abs, init, interval, &mut old_value)
+                return self.cpu_timer_settime(
+                    id,
+                    cpu,
+                    Arming {
+                        abs,
+                        init,
+                        interval,
+                    },
+                    &mut old_value,
+                    abi32,
+                )
             }
         };
         // Both clocks read before the lock, so the deadline arithmetic
@@ -1077,7 +1101,6 @@ impl Syscall<'_> {
         stale::drop_signal_from_before(id, owner);
         // Same as `setitimer`: armed first, reported after. A faulting
         // `old_value` used to leave the timer recorded as due and never armed.
-        let abi32 = self.narrow_abi();
         commit_and_report_old_with(
             old,
             |old| crate::narrow::narrow_put_if_not_null(abi32, &mut old_value, old),
@@ -1093,6 +1116,13 @@ impl Syscall<'_> {
 
     /// `timer_gettime`: report the time until next expiration and the interval.
     pub fn sys_timer_gettime(&self, id: usize, curr_value: usize) -> SysResult {
+        self.timer_gettime_at(id, curr_value, self.narrow_abi())
+    }
+
+    /// The core both `timer_gettime` and `timer_gettime64` (i386's 408)
+    /// reach, with the width of the `struct itimerspec` handed in rather
+    /// than asked of the process. See [`crate::compat32::time64`].
+    pub(crate) fn timer_gettime_at(&self, id: usize, curr_value: usize, abi32: bool) -> SysResult {
         let owner = self.zircon_process().id();
         if let PosixTimerClock::Cpu(cpu) = posix_timer_clock_of(id, owner)? {
             // `posix_cpu_timer_get`: all zeros once the task is gone.
@@ -1108,7 +1138,7 @@ impl Syscall<'_> {
                 None => ITimerSpec::default(),
             };
             let mut p: UserOutPtr<ITimerSpec> = curr_value.into();
-            self.put_narrow(&mut p, out)?;
+            crate::narrow::narrow_put(abi32, &mut p, out)?;
             return Ok(0);
         }
         let now = kernel_hal::timer::timer_now();
@@ -1129,7 +1159,7 @@ impl Syscall<'_> {
             }
         };
         let mut p: UserOutPtr<ITimerSpec> = curr_value.into();
-        self.put_narrow(&mut p, out)?;
+        crate::narrow::narrow_put(abi32, &mut p, out)?;
         Ok(0)
     }
 
@@ -1177,16 +1207,19 @@ impl Syscall<'_> {
         &self,
         id: usize,
         cpu: CpuClock,
-        abs: bool,
-        init: Duration,
-        interval: Duration,
+        arming: Arming,
         old_value: &mut UserOutPtr<ITimerSpec>,
+        abi32: bool,
     ) -> SysResult {
+        let Arming {
+            abs,
+            init,
+            interval,
+        } = arming;
         let owner = self.zircon_process().id();
         let (target, now) = cpu_timer_target(self.zircon_process(), cpu).ok_or(LxError::ESRCH)?;
         let old = set_cpu_timer(id, owner, &target, now, abs, init, interval)?;
         stale::drop_signal_from_before(id, owner);
-        let abi32 = self.narrow_abi();
         commit_and_report_old_with(
             old,
             |old| crate::narrow::narrow_put_if_not_null(abi32, old_value, old),
@@ -1195,6 +1228,23 @@ impl Syscall<'_> {
         run_cpu_timers(self.thread);
         Ok(0)
     }
+}
+
+/// What a `timer_settime` asks of a timer, as one value: Linux's
+/// `it_value` and `it_interval` plus the one flag that can come with them.
+///
+/// Three arguments rather than a structure is what `cpu_timer_settime` had,
+/// and with the width of the caller's `itimerspec` added it crossed clippy's
+/// argument ceiling. Grouping them is the honest fix: they travel together
+/// everywhere and they are exactly the contents of one `struct itimerspec`
+/// once it has been decoded.
+struct Arming {
+    /// `TIMER_ABSTIME`: `init` is a time on the clock and not a length.
+    abs: bool,
+    /// `it_value`, the first expiry. Zero disarms.
+    init: Duration,
+    /// `it_interval`, every expiry after the first. Zero is one-shot.
+    interval: Duration,
 }
 
 /// Point timer `id` of `owner`, on `base`'s clock, at `init` -- a length,

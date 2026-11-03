@@ -56,9 +56,7 @@ const ETIMEDOUT: isize = -(LxError::ETIMEDOUT as isize);
 /// Every `*_time64` number this kernel does NOT answer yet, with the name it
 /// reports. The whole remaining set, so that wiring one and forgetting to
 /// take it out of here fails rather than leaving a stale list.
-const STILL_MISSING: [(u32, &str); 5] = [
-    (408, "timer_gettime64"),
-    (409, "timer_settime64"),
+const STILL_MISSING: [(u32, &str); 3] = [
     (413, "pselect6_time64"),
     (417, "recvmmsg_time64"),
     (421, "rt_sigtimedwait_time64"),
