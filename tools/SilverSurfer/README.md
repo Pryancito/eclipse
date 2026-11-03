@@ -121,7 +121,8 @@ lunarfile (Servo 0.7 no expone un hook de descarga nativo).
 El User-Agent por defecto imita Firefox de escritorio (con `Gecko/` y
 `Firefox/`, más `Servo/0.7`) para que sitios como Google no sirvan la
 cáscara degradada; `SILVERSURFER_UA` lo sustituye entero.
-El título de la ventana sigue la pestaña activa; mientras carga, el tab
+Cada pestaña muestra el favicon de la página (reducido a 16×16 y escalado
+con la salida). El título de la ventana sigue la pestaña activa; mientras carga, el tab
 muestra `…` y la barra un distintivo de esquema (`s` https, `!` http, `/` file).
 El cromo se pinta a la escala del output (HiDPI nativo), con iconos
 vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.

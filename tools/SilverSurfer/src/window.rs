@@ -776,6 +776,7 @@ impl App {
     fn paint_chrome(&mut self) -> Result<(), String> {
         let titles;
         let loading;
+        let icons;
         let active;
         let location;
         let scheme;
@@ -785,6 +786,7 @@ impl App {
         if let Some(session) = self.session.as_ref() {
             titles = session.shell.tab_titles();
             loading = session.shell.tab_loading();
+            icons = session.shell.tab_icons();
             active = session.shell.active_index();
             can_back = session.shell.can_go_back();
             can_forward = session.shell.can_go_forward();
@@ -802,6 +804,7 @@ impl App {
         } else {
             titles = vec!["SilverSurfer".into()];
             loading = vec![false];
+            icons = Vec::new();
             active = 0;
             can_back = false;
             can_forward = false;
@@ -837,6 +840,7 @@ impl App {
             look: self.look,
             titles: &titles,
             loading: &loading,
+            icons: &icons,
             active,
             location: &location,
             location_focused: self.loc_focused,
@@ -854,6 +858,7 @@ impl App {
         let fp = chrome_fingerprint(
             &titles,
             &loading,
+            &icons,
             active,
             &location,
             self.loc_focused,
@@ -1992,6 +1997,7 @@ fn is_modifier(evdev: u32) -> bool {
 fn chrome_fingerprint(
     titles: &[String],
     loading: &[bool],
+    icons: &[Option<Rc<chrome::Favicon>>],
     active: usize,
     location: &str,
     loc_focused: bool,
@@ -2031,6 +2037,11 @@ fn chrome_fingerprint(
         SchemeHint::Other => 0,
     }]);
     mix(location.as_bytes());
+    for icon in icons {
+        // La dirección del Rc cambia con cada favicon nuevo.
+        let id = icon.as_ref().map_or(0, |i| Rc::as_ptr(i) as usize as u64);
+        mix(&id.to_le_bytes());
+    }
     for (t, l) in titles
         .iter()
         .zip(loading.iter().chain(std::iter::repeat(&false)))

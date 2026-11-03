@@ -7,7 +7,11 @@ use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::Text;
-use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use std::rc::Rc;
+
+use tiny_skia::{
+    Color, FilterQuality, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke, Transform,
+};
 
 use crate::location::SchemeHint;
 use crate::look::{Look, Rgb};
@@ -212,12 +216,69 @@ pub fn hit(width: i32, tabs: usize, x: i32, y: i32) -> Option<Hit> {
     None
 }
 
+/// Lado del favicon en px CSS dentro de la pestaña.
+pub const FAVICON: u32 = 16;
+
+/// Favicon reducido a `FAVICON`×`FAVICON` px, RGBA premultiplicado (el
+/// formato de tiny-skia), listo para pintarlo en cualquier escala.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Favicon {
+    pub rgba: Vec<u8>,
+}
+
+impl Favicon {
+    /// Reduce una imagen RGBA (sin premultiplicar) de cualquier tamaño a
+    /// 16×16 promediando cajas. `None` si la imagen está vacía o no cuadra.
+    pub fn from_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<Self> {
+        let (w, h) = (width as usize, height as usize);
+        if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+            return None;
+        }
+        let side = FAVICON as usize;
+        let mut out = vec![0u8; side * side * 4];
+        for oy in 0..side {
+            let (y0, y1) = (oy * h / side, ((oy + 1) * h / side).max(oy * h / side + 1));
+            for ox in 0..side {
+                let (x0, x1) = (ox * w / side, ((ox + 1) * w / side).max(ox * w / side + 1));
+                // Media ponderada por alfa (premultiplicada), para que el
+                // fondo transparente no oscurezca los bordes.
+                let mut acc = [0u64; 4];
+                let mut n = 0u64;
+                for y in y0..y1.min(h) {
+                    for x in x0..x1.min(w) {
+                        let i = (y * w + x) * 4;
+                        let a = u64::from(rgba[i + 3]);
+                        acc[0] += u64::from(rgba[i]) * a / 255;
+                        acc[1] += u64::from(rgba[i + 1]) * a / 255;
+                        acc[2] += u64::from(rgba[i + 2]) * a / 255;
+                        acc[3] += a;
+                        n += 1;
+                    }
+                }
+                let o = (oy * side + ox) * 4;
+                for c in 0..4 {
+                    out[o + c] = (acc[c] / n.max(1)) as u8;
+                }
+            }
+        }
+        Some(Self { rgba: out })
+    }
+
+    fn pixmap(&self) -> Option<Pixmap> {
+        let mut pm = Pixmap::new(FAVICON, FAVICON)?;
+        pm.data_mut().copy_from_slice(&self.rgba);
+        Some(pm)
+    }
+}
+
 pub struct View<'a> {
     pub width: i32,
     pub look: Look,
     pub titles: &'a [String],
     /// Parallel to `titles`: the tab is mid-load.
     pub loading: &'a [bool],
+    /// Parallel to `titles`: el favicon de la pestaña, si la página tiene.
+    pub icons: &'a [Option<Rc<Favicon>>],
     pub active: usize,
     pub location: &'a str,
     pub location_focused: bool,
@@ -281,6 +342,26 @@ pub fn render(view: &View<'_>) -> Pixels {
             );
         }
         icon_close(&mut pixmap, *rect, scale, pal.dim);
+        if let Some(icon) = view.icons.get(i).and_then(Option::as_ref) {
+            if rect.w >= 40 {
+                if let Some(pm) = icon.pixmap() {
+                    let x = (rect.x + 4) * scale;
+                    let y = (rect.y + (rect.h - FAVICON as i32) / 2) * scale;
+                    pixmap.draw_pixmap(
+                        0,
+                        0,
+                        pm.as_ref(),
+                        &PixmapPaint {
+                            quality: FilterQuality::Bilinear,
+                            ..PixmapPaint::default()
+                        },
+                        Transform::from_scale(scale as f32, scale as f32)
+                            .post_translate(x as f32, y as f32),
+                        None,
+                    );
+                }
+            }
+        }
     }
     fill(&mut pixmap, s(lay.new_tab), pal.field);
     fill(&mut pixmap, s(lay.back), pal.field);
@@ -371,10 +452,12 @@ pub fn render(view: &View<'_>) -> Pixels {
         } else {
             raw.to_string()
         };
-        let room = ((rect.w - 20) / 6).max(1) as usize;
+        let has_icon = rect.w >= 40 && view.icons.get(i).is_some_and(Option::is_some);
+        let shift = if has_icon { FAVICON as i32 + 4 } else { 0 };
+        let room = ((rect.w - 20 - shift) / 6).max(1) as usize;
         label_scaled(
             &mut target,
-            rect.x + 6,
+            rect.x + 6 + shift,
             rect.y + 14,
             &clip(&title, room),
             text,
@@ -911,6 +994,7 @@ mod tests {
             look: Look::Eclipse,
             titles: std::slice::from_ref(&title),
             loading: &loading,
+            icons: &[],
             active: 0,
             location: "https://example.com",
             location_focused: true,
@@ -1008,6 +1092,7 @@ mod tests {
                 look,
                 titles: std::slice::from_ref(&title),
                 loading: &loading,
+                icons: &[],
                 active: 0,
                 location: "",
                 location_focused: false,
@@ -1069,5 +1154,55 @@ mod tests {
         // Caret at the left end: "abcd|[ef]"
         assert_eq!(selection_span("abcdef", 40, 4, (4, 6)), Some((30, 12)));
         assert_eq!(selection_span("abcdef", 40, 6, (6, 6)), None);
+    }
+
+    #[test]
+    fn favicon_is_box_filtered_to_16px() {
+        // 32x32 opaque red → 16x16 opaque red.
+        let src: Vec<u8> = (0..32 * 32).flat_map(|_| [255, 0, 0, 255]).collect();
+        let icon = Favicon::from_rgba(32, 32, &src).expect("icono");
+        assert_eq!(icon.rgba.len(), 16 * 16 * 4);
+        assert_eq!(&icon.rgba[..4], &[255, 0, 0, 255]);
+        // Transparent stays transparent (premultiplied zero).
+        let clear = vec![0u8; 8 * 8 * 4];
+        assert_eq!(
+            &Favicon::from_rgba(8, 8, &clear).unwrap().rgba[..4],
+            &[0, 0, 0, 0]
+        );
+        assert!(Favicon::from_rgba(0, 4, &[]).is_none());
+    }
+
+    #[test]
+    fn favicon_shifts_the_tab_title() {
+        let titles = vec!["Ejemplo".to_string()];
+        let icon = Some(Rc::new(
+            Favicon::from_rgba(1, 1, &[0, 255, 0, 255]).unwrap(),
+        ));
+        let icons = [icon];
+        let loading = [false];
+        let mut view = View {
+            width: 640,
+            look: Look::Eclipse,
+            titles: &titles,
+            loading: &loading,
+            icons: &[],
+            active: 0,
+            location: "",
+            location_focused: false,
+            location_cursor: 0,
+            location_selection: None,
+            location_suggest: "",
+            find_mode: false,
+            scheme: SchemeHint::Https,
+            gpu: true,
+            private: false,
+            can_back: false,
+            can_forward: false,
+            scale: 1,
+        };
+        let plain = render(&view);
+        view.icons = &icons;
+        let with_icon = render(&view);
+        assert_ne!(plain.argb, with_icon.argb);
     }
 }
