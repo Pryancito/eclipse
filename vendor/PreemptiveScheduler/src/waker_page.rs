@@ -514,6 +514,7 @@ impl WakerPage {
             idx,
             dropped: dropped.clone(),
             lifecycle: Arc::new(spin::Mutex::new(())),
+            affinity: None,
         }
     }
 }
@@ -525,9 +526,40 @@ pub struct WakerRef {
     idx: usize,
     dropped: Arc<AtomicBool>,
     lifecycle: Arc<spin::Mutex<()>>,
+    /// The task's affinity mask, shared with the task (so a later
+    /// `sched_setaffinity` is seen here too). `None`: runs anywhere.
+    affinity: Option<Arc<core::sync::atomic::AtomicU64>>,
 }
 
 impl WakerRef {
+    /// The same waker, knowing the task's affinity mask.
+    pub(crate) fn with_affinity(
+        mut self,
+        affinity: Option<Arc<core::sync::atomic::AtomicU64>>,
+    ) -> Self {
+        self.affinity = affinity;
+        self
+    }
+
+    /// The task's mask when it forbids the CPU that owns this page.
+    ///
+    /// A task never leaves the page it was inserted on, so a thread born on
+    /// one CPU and pinned to another is woken on a CPU that must refuse it,
+    /// every time: the owner had to make a pass, refuse it, and only then
+    /// forward it with `kick_for_affinity` -- a pass that a halted owner or
+    /// one running a userspace spinner makes at its next tick. That hop is
+    /// the ~20 ms `pipe RT pinned cross-CPU` row (0.9 ms same-CPU).
+    #[inline]
+    fn forbidding_owner(&self) -> Option<u64> {
+        let mask = self.affinity.as_ref()?.load(Ordering::Relaxed);
+        let owner = self.page.owner_cpu as usize;
+        if owner < 64 && mask != 0 && (mask >> owner) & 1 == 0 {
+            Some(mask)
+        } else {
+            None
+        }
+    }
+
     // pub fn mark_complete(&self) {
     //     self.page.mark_completed(self.idx);
     // }
@@ -617,6 +649,14 @@ impl WakerRef {
             }
             if in_flight {
                 crate::runtime::maybe_send_resched_ipi(self.page.owner_cpu);
+            } else if let Some(mask) = self.forbidding_owner() {
+                // Skip the owner's refuse-and-forward pass: mark it as
+                // holding a stranded task and kick an allowed CPU now, the
+                // two things that pass would have done. Its rescue scan takes
+                // the notified slot straight off the owner's page.
+                let owner = self.page.owner_cpu as usize;
+                crate::runtime::note_stranded(owner);
+                crate::runtime::kick_for_affinity(mask, owner);
             } else {
                 crate::runtime::request_resched(self.page.owner_cpu);
             }
@@ -652,6 +692,7 @@ impl Clone for WakerRef {
             idx: self.idx,
             dropped: self.dropped.clone(),
             lifecycle: self.lifecycle.clone(),
+            affinity: self.affinity.clone(),
         }
     }
 }
@@ -1428,6 +1469,45 @@ mod waker_page_tests {
         record_kick(63);
         assert_eq!(kicked(), 1 << 63);
         KICKED.store(0, Ordering::SeqCst);
+    }
+
+    /// A thread born on CPU 3 and pinned to CPU 5: its wake goes straight to
+    /// CPU 5 (and marks CPU 3 as holding a stranded task for 5's rescue
+    /// scan) instead of waking CPU 3 only for it to refuse and forward.
+    #[test]
+    fn a_wake_the_owner_must_refuse_goes_straight_to_an_allowed_cpu() {
+        let _g = owner_asleep(3, true);
+        crate::runtime::set_cpu_sleeping(5, true);
+        let ready = crate::runtime::set_executor_ready_mask_for_test(0xff);
+        crate::runtime::clear_stranded_for_test();
+        let p = WakerPage::new(3);
+        let mask = Arc::new(core::sync::atomic::AtomicU64::new(1 << 5));
+        let w = Arc::new(
+            waker_for(&p, 7)
+                .as_ref()
+                .clone()
+                .with_affinity(Some(mask.clone())),
+        );
+        p.take_notified();
+        w.wake_by_ref();
+        assert_eq!(p.peek().0, 1 << 7, "the wake was not published on the page");
+        assert_eq!(
+            kicked(),
+            1 << 5,
+            "the allowed CPU was not kicked, or the owner was"
+        );
+        assert_eq!(crate::runtime::stranded_mask_for_test() & (1 << 3), 1 << 3);
+
+        // Widen the mask to include the owner: back to the ordinary wake.
+        mask.store((1 << 3) | (1 << 5), Ordering::SeqCst);
+        KICKED.store(0, Ordering::SeqCst);
+        p.take_notified();
+        w.wake_by_ref();
+        assert_eq!(kicked(), 1 << 3, "an owner the mask allows was not woken");
+
+        crate::runtime::set_cpu_sleeping(5, false);
+        crate::runtime::clear_stranded_for_test();
+        crate::runtime::set_executor_ready_mask_for_test(ready);
     }
 
     #[test]
