@@ -84,6 +84,13 @@
  *   67  socketcall(recvmmsg) did not take the batch back
  *   68  a per-message transfer count was not written at offset 28 of its
  *       own entry
+ *   69  socket(AF_INET, SOCK_DGRAM) through socketcall failed
+ *   70  socketcall(setsockopt) refused an eight-byte SO_RCVTIMEO, which is
+ *       the width a 32-bit struct timeval is
+ *   71  socketcall(getsockopt) did not answer
+ *   72  the timeout that came back is not the one that went in, or it was
+ *       reported at the native width (the microseconds are the field a clamp
+ *       loses and a conversion keeps)
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -1641,6 +1648,97 @@ statx_poison:
 	cmpl	$0x41, bbuf2
 	jne	bad_mmsg_count
 
+	/* Step 64: `setsockopt`/`getsockopt` of `SO_RCVTIMEO`, the last two of
+	 * the twenty `socketcall` numbers, and the only two whose conversion
+	 * depends not on the call but on WHICH OPTION it is. `optval` is a
+	 * byte buffer: for `SO_REUSEADDR` it is an `int` and the same in both
+	 * ABIs, for `SO_RCVTIMEO` it is a `struct timeval`, which is eight
+	 * bytes here and sixteen to the kernel.
+	 *
+	 * The two halves fail differently, and the second is why this step
+	 * exists. Going in, the eight bytes this program owns are half a
+	 * native `timeval` and the call is refused outright: EINVAL, so a
+	 * program that sets a socket timeout before using the socket never
+	 * gets to the read. Coming back, a sixteen-byte answer clamped to this
+	 * buffer's eight is the native `tv_sec` alone --- little-endian, so
+	 * the SECONDS come back right and `tv_usec` comes out of the seconds'
+	 * high half, which is zero. So a whole-second timeout round-trips
+	 * correctly with no conversion at all.
+	 *
+	 * Which is why the timeout here has microseconds in it: 500 000 is the
+	 * field that a clamp loses and a conversion keeps. */
+	movl	$5, tvin + 0
+	movl	$500000, tvin + 4
+
+	movl	$2, sargs + 0		/* AF_INET */
+	movl	$2, sargs + 4		/* SOCK_DGRAM */
+	movl	$0, sargs + 8
+	movl	$102, %eax
+	movl	$1, %ebx		/* SYS_SOCKET */
+	movl	$sargs, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_optsock
+	movl	%eax, optfd
+
+	movl	optfd, %eax
+	movl	%eax, sargs + 0
+	movl	$1, sargs + 4		/* SOL_SOCKET */
+	movl	$20, sargs + 8		/* SO_RCVTIMEO */
+	movl	$tvin, sargs + 12
+	movl	$8, sargs + 16		/* the width THIS program's timeval is */
+	movl	$102, %eax
+	movl	$14, %ebx		/* SYS_SETSOCKOPT */
+	movl	$sargs, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jne	bad_setsockopt32
+
+	/* 0xaa over the whole output buffer, so that a sixteen-byte write into
+	 * a buffer that asked for eight is visible as poison gone rather than
+	 * as a fault: the buffer is given 32 bytes of this program's own. */
+	movl	$0xaaaaaaaa, tvout + 0
+	movl	$0xaaaaaaaa, tvout + 4
+	movl	$0xaaaaaaaa, tvout + 8
+	movl	$0xaaaaaaaa, tvout + 12
+	movl	$0xaaaaaaaa, tvout + 16
+	movl	$0xaaaaaaaa, tvout + 20
+	movl	$0xaaaaaaaa, tvout + 24
+	movl	$0xaaaaaaaa, tvout + 28
+	movl	$8, optlenw
+
+	movl	optfd, %eax
+	movl	%eax, sargs + 0
+	movl	$1, sargs + 4
+	movl	$20, sargs + 8
+	movl	$tvout, sargs + 12
+	movl	$optlenw, sargs + 16
+	movl	$102, %eax
+	movl	$15, %ebx		/* SYS_GETSOCKOPT */
+	movl	$sargs, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jne	bad_getsockopt32
+
+	/* Eight bytes reported, not sixteen: a caller told sixteen goes on to
+	 * read eight bytes the kernel never wrote. */
+	cmpl	$8, optlenw
+	jne	bad_timeo_value
+	cmpl	$5, tvout + 0
+	jne	bad_timeo_value
+	/* The microseconds, which is the whole step. */
+	cmpl	$500000, tvout + 4
+	jne	bad_timeo_value
+	/* And nothing past the eight bytes this buffer asked for. */
+	cmpl	$0xaaaaaaaa, tvout + 8
+	jne	bad_timeo_value
+	cmpl	$0xaaaaaaaa, tvout + 12
+	jne	bad_timeo_value
+
+	movl	$6, %eax		/* close */
+	movl	optfd, %ebx
+	int	$0x80
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -1873,6 +1971,18 @@ bad_recvmmsg32:
 	jmp	die
 bad_mmsg_count:
 	movl	$68, %ebx
+	jmp	die
+bad_optsock:
+	movl	$69, %ebx
+	jmp	die
+bad_setsockopt32:
+	movl	$70, %ebx
+	jmp	die
+bad_getsockopt32:
+	movl	$71, %ebx
+	jmp	die
+bad_timeo_value:
+	movl	$72, %ebx
 	jmp	die
 
 	/* 0xaa over the two entries of the batch array, so that each transfer
@@ -2170,6 +2280,20 @@ mhdr2:
 	.space	56
 rctrl:
 	.space	96
+
+	/* What step 64 sets and reads its timeout through. `tvout` is given 32
+	 * bytes, four times the eight it asks for, so that a kernel writing a
+	 * NATIVE sixteen-byte timeval lands in this program's own memory and
+	 * is caught by the poison rather than by a fault. */
+	.align 4
+optfd:
+	.long	0
+optlenw:
+	.long	0
+tvin:
+	.space	8
+tvout:
+	.space	32
 
 	/* What step 61 keeps from the initial stack, and the array it builds.
 	 * `xargv` is given the room a NATIVE read of three entries would
