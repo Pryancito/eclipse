@@ -74,10 +74,26 @@
  *   59  ioctl(TCGETS) did not write 36 bytes of termios, or refused a
  *       destination aligned to 4 and not to 8
  *   60  ioctl(TIOCGPTN) did not write exactly one 4-byte pty number
+ *   62  socketcall(sendmsg) did not carry a 28-byte envelope with two
+ *       SCM_RIGHTS messages in it
+ *   63  socketcall(recvmsg) did not take the message back
+ *   64  recvmsg reported msg_controllen or msg_flags in the wrong place, or
+ *       the control header that came back is not 12 bytes wide
+ *   65  a descriptor arrived but is not a descriptor
+ *   66  socketcall(sendmmsg) did not walk two entries of a 32-byte stride
+ *   67  socketcall(recvmmsg) did not take the batch back
+ *   68  a per-message transfer count was not written at offset 28 of its
+ *       own entry
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
  *   192+e  execve of this program itself answered errno e (step 61)
+ *
+ * There is no 61: step 61 IS the `execve`, and it is reported by the image it
+ * exec'd rather than by a number of its own (see below). It is also the last
+ * step, because it replaces the program, so step 62 runs BEFORE it --- the
+ * numbers are the order they were written in, not the order they run in, and
+ * this is the one place the two differ.
  *
  * Step 61 is the one step whose result this program cannot read: a
  * successful `execve` replaces it. So it execs ITSELF with one argument
@@ -1352,6 +1368,279 @@ statx_poison:
 	cmpl	$tls_area, %eax
 	jne	bad_get_tls
 
+	/* Step 62: a real descriptor through a real `SCM_RIGHTS`, at the
+	 * 32-bit layout of BOTH structures it needs --- the envelope and the
+	 * control header inside it.
+	 *
+	 * ```text
+	 * struct msghdr, i386: 28 bytes       struct cmsghdr, i386: 12 bytes
+	 *   msg_name        0, 4               cmsg_len     0, 4
+	 *   msg_namelen     4, 4               cmsg_level   4, 4
+	 *   msg_iov         8, 4               cmsg_type    8, 4
+	 *   msg_iovlen     12, 4             CMSG_ALIGN is sizeof(long) = 4
+	 *   msg_control    16, 4
+	 *   msg_controllen 20, 4             native: 16 bytes, aligned to 8
+	 *   msg_flags      24, 4
+	 * ```
+	 *
+	 * Natively the envelope is 56 bytes and the header 16 aligned to 8,
+	 * and the two sides of this step catch the two ways that matters:
+	 *
+	 *   - **TWO control messages**, the first carrying two descriptors.
+	 *     Twenty bytes, which is a multiple of 4 and not of 8, so a walk
+	 *     that kept the native `CMSG_ALIGN` steps 24 from the first and
+	 *     lands four bytes inside the second --- and the second's
+	 *     descriptor never arrives. One message of one descriptor is 16
+	 *     bytes either way, which is why that is the round trip this does
+	 *     NOT do.
+	 *   - **Poison past the end of the receiving envelope**, as far as 56
+	 *     bytes. `recvmsg` reports `msg_controllen` and `msg_flags`
+	 *     through the caller's own structure, and at the native offsets
+	 *     those land 12 and 20 bytes past the end of this one, over
+	 *     whatever the program keeps next to it. The poison at 28 and at
+	 *     48 has to survive, and the one at 24 has to be gone.
+	 *
+	 * A fresh pair: step 55 shut its own down. */
+	movl	$1, sargs + 0		/* AF_UNIX */
+	movl	$1, sargs + 4		/* SOCK_STREAM */
+	movl	$0, sargs + 8
+	movl	$msv, sargs + 12
+	movl	$102, %eax
+	movl	$8, %ebx		/* SYS_SOCKETPAIR */
+	movl	$sargs, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_sendmsg32
+
+	/* The control buffer: { len 20, SOL_SOCKET, SCM_RIGHTS, fd, fd } and
+	 * then { len 16, SOL_SOCKET, SCM_RIGHTS, fd }. The descriptors passed
+	 * are the pair's own ends, which are the two this program is sure to
+	 * have. */
+	movl	$20, mctrl + 0
+	movl	$1, mctrl + 4		/* SOL_SOCKET */
+	movl	$1, mctrl + 8		/* SCM_RIGHTS */
+	movl	msv + 0, %eax
+	movl	%eax, mctrl + 12
+	movl	msv + 4, %eax
+	movl	%eax, mctrl + 16
+	movl	$16, mctrl + 20
+	movl	$1, mctrl + 24
+	movl	$1, mctrl + 28
+	movl	msv + 0, %eax
+	movl	%eax, mctrl + 32
+
+	/* One byte of data, because ancillary data rides a message and a
+	 * message of no bytes is not delivered. */
+	movl	$0x5a, mbuf
+	movl	$mbuf, miov + 0
+	movl	$1, miov + 4
+
+	movl	$0, mhdr + 0		/* msg_name */
+	movl	$0, mhdr + 4		/* msg_namelen */
+	movl	$miov, mhdr + 8		/* msg_iov */
+	movl	$1, mhdr + 12		/* msg_iovlen */
+	movl	$mctrl, mhdr + 16	/* msg_control */
+	movl	$36, mhdr + 20		/* msg_controllen: both messages */
+	movl	$0, mhdr + 24		/* msg_flags */
+
+	movl	msv + 0, %eax
+	movl	%eax, sargs + 0
+	movl	$mhdr, sargs + 4
+	movl	$0, sargs + 8
+	movl	$102, %eax
+	movl	$16, %ebx		/* SYS_SENDMSG */
+	movl	$sargs, %ecx
+	int	$0x80
+	cmpl	$1, %eax
+	jne	bad_sendmsg32
+
+	/* And back. Both the control buffer and the whole 56 bytes from the
+	 * envelope's start are poisoned first, so every field this step reads
+	 * afterwards says by itself whether the kernel wrote it. */
+	call	poison_recv_msg
+	movl	$0, mbuf2
+	movl	$mbuf2, miov2 + 0
+	movl	$1, miov2 + 4
+	movl	$0, mhdr2 + 0
+	movl	$0, mhdr2 + 4
+	movl	$miov2, mhdr2 + 8
+	movl	$1, mhdr2 + 12
+	movl	$rctrl, mhdr2 + 16
+	movl	$64, mhdr2 + 20
+	/* msg_flags stays poisoned: the kernel always reports it. */
+
+	movl	msv + 4, %eax
+	movl	%eax, sargs + 0
+	movl	$mhdr2, sargs + 4
+	movl	$0, sargs + 8
+	movl	$102, %eax
+	movl	$17, %ebx		/* SYS_RECVMSG */
+	movl	$sargs, %ecx
+	int	$0x80
+	cmpl	$1, %eax
+	jne	bad_recvmsg32
+
+	/* msg_controllen at 20: a 12-byte header and the THREE descriptors. */
+	cmpl	$24, mhdr2 + 20
+	jne	bad_cmsg32
+	/* msg_flags at 24 was written... */
+	cmpl	$0xaaaaaaaa, mhdr2 + 24
+	je	bad_cmsg32
+	/* ...and nothing past the end of the envelope was: 28 is where a
+	 * native `msg_controllen` would reach from 40, and 48 is the native
+	 * `msg_flags` exactly. */
+	cmpl	$0xaaaaaaaa, mhdr2 + 28
+	jne	bad_cmsg32
+	cmpl	$0xaaaaaaaa, mhdr2 + 40
+	jne	bad_cmsg32
+	cmpl	$0xaaaaaaaa, mhdr2 + 48
+	jne	bad_cmsg32
+
+	/* The header that came back, at the narrow width. */
+	cmpl	$24, rctrl + 0
+	jne	bad_cmsg32
+	cmpl	$1, rctrl + 4
+	jne	bad_cmsg32
+	cmpl	$1, rctrl + 8
+	jne	bad_cmsg32
+	/* And nothing past the 24 bytes it reported. */
+	cmpl	$0xaaaaaaaa, rctrl + 24
+	jne	bad_cmsg32
+
+	/* The three descriptors are descriptors: `fcntl(F_GETFD)` on each,
+	 * which is the cheapest question a live fd answers and a stale number
+	 * does not. */
+	movl	rctrl + 12, %ebx
+	call	check_passed_fd
+	movl	rctrl + 16, %ebx
+	call	check_passed_fd
+	movl	rctrl + 20, %ebx
+	call	check_passed_fd
+
+	/* Step 63: a batch of two messages, by `sendmmsg` and `recvmmsg`
+	 * through `socketcall`, which is the only door a 32-bit program has
+	 * to either.
+	 *
+	 * ```text
+	 * struct mmsghdr, i386: 32 bytes      native: 64 bytes
+	 *   msg_hdr       0, 28                 msg_hdr       0, 56
+	 *   msg_len      28, 4                  msg_len      56, 4
+	 *                                       4 bytes of padding
+	 * ```
+	 *
+	 * TWO entries, because the first one sits at offset 0 whatever the
+	 * stride is: a batch of one says nothing about it. With the native
+	 * stride the second entry is looked for at 64, which in a 32-bit
+	 * array is where entry THREE would start --- so the second message's
+	 * envelope comes out of whatever follows the array, and its transfer
+	 * count is written there too.
+	 *
+	 * The counts are the sharper half of the check: they are 1 and 2
+	 * bytes, so they differ from each other and from any length the
+	 * kernel could have written by accident. They are poisoned first. */
+	call	poison_mmsg
+	movl	$1, sargs + 0		/* AF_UNIX */
+	movl	$1, sargs + 4		/* SOCK_STREAM */
+	movl	$0, sargs + 8
+	movl	$bsv, sargs + 12
+	movl	$102, %eax
+	movl	$8, %ebx		/* SYS_SOCKETPAIR */
+	movl	$sargs, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_sendmmsg32
+
+	/* One byte in the first message, two in the second. */
+	movl	$0x41, bbuf + 0
+	movl	$0x4342, bbuf + 4
+	movl	$bbuf, biov + 0
+	movl	$1, biov + 4
+	movl	$bbuf + 4, biov + 8
+	movl	$2, biov + 12
+
+	/* Entry 0 at bmsg + 0 and entry 1 at bmsg + 32: the envelope's seven
+	 * words and then the count, which the kernel writes. */
+	movl	$0, bmsg + 0
+	movl	$0, bmsg + 4
+	movl	$biov, bmsg + 8
+	movl	$1, bmsg + 12
+	movl	$0, bmsg + 16
+	movl	$0, bmsg + 20
+	movl	$0, bmsg + 24
+	movl	$0, bmsg + 32
+	movl	$0, bmsg + 36
+	movl	$biov + 8, bmsg + 40
+	movl	$1, bmsg + 44
+	movl	$0, bmsg + 48
+	movl	$0, bmsg + 52
+	movl	$0, bmsg + 56
+
+	movl	bsv + 0, %eax
+	movl	%eax, sargs + 0
+	movl	$bmsg, sargs + 4
+	movl	$2, sargs + 8		/* vlen */
+	movl	$0, sargs + 12
+	movl	$102, %eax
+	movl	$20, %ebx		/* SYS_SENDMMSG */
+	movl	$sargs, %ecx
+	int	$0x80
+	cmpl	$2, %eax
+	jne	bad_sendmmsg32
+
+	/* The two counts, at 28 of each 32-byte entry. One and two, which no
+	 * other write in this call could have produced. */
+	cmpl	$1, bmsg + 28
+	jne	bad_mmsg_count
+	cmpl	$2, bmsg + 60
+	jne	bad_mmsg_count
+	/* And the word a native `msg_len` would have gone to --- 56 of entry
+	 * 0, which is 24 into entry 1 --- is still this program's own zero,
+	 * because that is where the envelope of entry 1 put its msg_flags. */
+
+	/* And back. Two destinations, two entries, the counts poisoned again.
+	 * A stream socket coalesces, so what the receive has to show is that
+	 * it walked two entries at all. */
+	call	poison_mmsg
+	movl	$0, bbuf2 + 0
+	movl	$0, bbuf2 + 4
+	movl	$bbuf2, biov2 + 0
+	movl	$1, biov2 + 4
+	movl	$bbuf2 + 4, biov2 + 8
+	movl	$2, biov2 + 12
+	movl	$0, bmsg + 0
+	movl	$0, bmsg + 4
+	movl	$biov2, bmsg + 8
+	movl	$1, bmsg + 12
+	movl	$0, bmsg + 16
+	movl	$0, bmsg + 20
+	movl	$0, bmsg + 24
+	movl	$0, bmsg + 32
+	movl	$0, bmsg + 36
+	movl	$biov2 + 8, bmsg + 40
+	movl	$1, bmsg + 44
+	movl	$0, bmsg + 48
+	movl	$0, bmsg + 52
+	movl	$0, bmsg + 56
+
+	movl	bsv + 4, %eax
+	movl	%eax, sargs + 0
+	movl	$bmsg, sargs + 4
+	movl	$2, sargs + 8
+	movl	$0, sargs + 12
+	movl	$0, sargs + 16		/* timeout: none */
+	movl	$102, %eax
+	movl	$19, %ebx		/* SYS_RECVMMSG */
+	movl	$sargs, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jle	bad_recvmmsg32
+	/* The first entry's count was written where a 32-bit entry keeps it,
+	 * and it is the one byte the first destination asked for. */
+	cmpl	$1, bmsg + 28
+	jne	bad_mmsg_count
+	cmpl	$0x41, bbuf2
+	jne	bad_mmsg_count
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -1564,6 +1853,71 @@ bad_tcgets:
 bad_tiocgptn:
 	movl	$60, %ebx
 	jmp	die
+bad_sendmsg32:
+	movl	$62, %ebx
+	jmp	die
+bad_recvmsg32:
+	movl	$63, %ebx
+	jmp	die
+bad_cmsg32:
+	movl	$64, %ebx
+	jmp	die
+bad_passed_fd:
+	movl	$65, %ebx
+	jmp	die
+bad_sendmmsg32:
+	movl	$66, %ebx
+	jmp	die
+bad_recvmmsg32:
+	movl	$67, %ebx
+	jmp	die
+bad_mmsg_count:
+	movl	$68, %ebx
+	jmp	die
+
+	/* 0xaa over the two entries of the batch array, so that each transfer
+	 * count the kernel writes is a byte the program did not put there and
+	 * each one it does NOT write stays visible. Clobbers %eax, %ecx and
+	 * %edi. */
+poison_mmsg:
+	movl	$bmsg, %edi
+	movl	$64, %ecx
+	movl	$0xaaaaaaaa, %eax
+poison_mmsg_word:
+	movl	%eax, (%edi)
+	addl	$4, %edi
+	subl	$4, %ecx
+	jnz	poison_mmsg_word
+	ret
+
+	/* `fcntl(%ebx, F_GETFD)`, which answers 0 or 1 for a live descriptor
+	 * and `EBADF` for a number that is not one. Jumps to the failure
+	 * rather than returning a verdict, because there is nothing else to
+	 * do with the answer. Clobbers %eax, %ecx and %edx. */
+check_passed_fd:
+	movl	$55, %eax		/* fcntl */
+	movl	$1, %ecx		/* F_GETFD */
+	xorl	%edx, %edx
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_passed_fd
+	ret
+
+	/* 0xaa over the receiving envelope's fifty-six bytes and the control
+	 * buffer's ninety-six, so that every field step 62 reads afterwards
+	 * says by itself whether the kernel wrote it --- and so that the
+	 * bytes past the end of a 28-byte envelope can be required to still
+	 * be there. Clobbers %eax, %ecx and %edi. */
+poison_recv_msg:
+	movl	$mhdr2, %edi
+	movl	$152, %ecx		/* 56 of envelope + 96 of control */
+	movl	$0xaaaaaaaa, %eax
+poison_recv_word:
+	movl	%eax, (%edi)
+	addl	$4, %edi
+	subl	$4, %ecx
+	jnz	poison_recv_word
+	ret
 
 	/* Fill the scratch buffer with 0xaa, so that every structure written
 	 * into it afterwards says by itself how many bytes it is: the first
@@ -1772,6 +2126,51 @@ twopages:
 	.align 4
 statbuf:
 	.space	96
+	/* What step 63 sends its batch of two through. `bmsg` is two 32-byte
+	 * entries, which is what a 32-bit `struct mmsghdr` array is; it is
+	 * given 96 bytes, half an entry more than it needs, so that a kernel
+	 * walking with the NATIVE stride of 64 lands in this program's own
+	 * memory and is caught by the poison rather than by a fault. */
+	.align 4
+bsv:
+	.space	8
+bbuf:
+	.space	16
+bbuf2:
+	.space	16
+biov:
+	.space	16
+biov2:
+	.space	16
+bmsg:
+	.space	96
+
+	/* What step 62 sends a descriptor through. `mhdr2` and `rctrl` are
+	 * ADJACENT and in that order on purpose: `poison_recv_msg` fills the
+	 * two in one pass, and the envelope is given the room a NATIVE one
+	 * would need (56, not 28) so that a kernel writing at the native
+	 * offsets lands in this program's own memory and is caught by the
+	 * poison rather than by a fault. */
+	.align 4
+msv:
+	.space	8
+mbuf:
+	.long	0
+mbuf2:
+	.long	0
+miov:
+	.space	8
+miov2:
+	.space	8
+mctrl:
+	.space	64
+mhdr:
+	.space	32
+mhdr2:
+	.space	56
+rctrl:
+	.space	96
+
 	/* What step 61 keeps from the initial stack, and the array it builds.
 	 * `xargv` is given the room a NATIVE read of three entries would
 	 * need, so that a kernel reading it eight bytes at a time walks this

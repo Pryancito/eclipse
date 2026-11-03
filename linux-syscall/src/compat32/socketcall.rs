@@ -65,14 +65,6 @@
 //! Left out, each for a reason that is about a structure and not about this
 //! file:
 //!
-//! - **`sendmsg`(16), `recvmsg`(17), `sendmmsg`(20), `recvmmsg`(19)**: a
-//!   `struct msghdr` is a 32-bit structure of its own --- `msg_name`,
-//!   `msg_iov` and `msg_control` are pointers and `msg_iovlen` and
-//!   `msg_controllen` are `size_t`, so the whole thing is 28 bytes for a
-//!   32-bit caller against 56 native. Reading it at the native width does
-//!   not fail; it pairs the halves wrongly, the way the `iovec` did. The
-//!   `iovec` list inside it is already handled ([`crate::file`] asks the
-//!   process its width), so what is missing is the envelope.
 //! - **`setsockopt`(14) and `getsockopt`(15)**: their `optval` is a byte
 //!   buffer for most options and a **structure** for some, and which one it
 //!   is depends on `optname`. `SO_RCVTIMEO` and `SO_SNDTIMEO` take a
@@ -80,6 +72,25 @@
 //!   so wiring these two would quietly read sixteen bytes of a caller's
 //!   eight-byte timeout. They need a per-option table, which is its own
 //!   piece of work.
+//!
+//! And **`sendmsg`(16), `recvmsg`(17), `recvmmsg`(19) and `sendmmsg`(20)** are
+//! wired, for the same reason `readv` and `writev` are: the conversion lives
+//! in the handler, which asks the process how wide a word is, so the number
+//! is all there is left to translate. The envelope is 28 bytes against 56,
+//! the `struct cmsghdr` inside it is 12 aligned to 4 against 16 aligned to 8,
+//! and an `mmsghdr` array has a stride of 32 with its count at 28 against 64
+//! with its count at 56. [`crate::narrow::msghdr`] has all three layouts and
+//! why none of them can be read at the wrong width without inventing a
+//! pointer.
+//!
+//! One gap, and it is not an ABI one: `recvmmsg`'s fifth word is a
+//! `struct timespec *` timeout, and [`Syscall::sys_recvmmsg`] does not honour
+//! a timeout in **either** ABI --- it forces every receive after the first
+//! non-blocking and returns when the queue drains. So the narrow caller is
+//! no worse off than the native one, and the five words are still read (the
+//! measured `nargs`), which is what keeps a block that ends at a page from
+//! answering `EFAULT`. Wiring the timeout is one piece of work for both
+//! ABIs, with the conversion already written ([`crate::narrow`]).
 //!
 //! An unwired call answers `ENOSYS`, like every other name this layer has
 //! not vouched for, rather than being passed through on the guess that its
@@ -240,6 +251,20 @@ impl Syscall<'_> {
                     .await
             }
             13 => self.sys_shutdown(a[0], a[1]),
+            // The envelope and the control messages inside it are converted
+            // by asking the process its width ([`crate::narrow::msghdr`]), so these
+            // two are the native handlers unchanged, like `readv`/`writev`.
+            16 => self.sys_sendmsg(a[0], a[1].into(), a[2]).await,
+            17 => self.sys_recvmsg(a[0], a[1].into(), a[2]).await,
+            // The batch pair, whose array has a stride of its own: 32 bytes
+            // for a 32-bit caller against 64, with the count at 28 and not
+            // at 56. Asked of the process, like the envelope.
+            // Word 5 of `recvmmsg` is a `timespec *` timeout, which
+            // `sys_recvmmsg` does not honour in either ABI; see the module
+            // documentation. It is still read, so a block that ends at a
+            // page does not answer EFAULT.
+            19 => self.sys_recvmmsg(a[0], a[1].into(), a[2], a[3]).await,
+            20 => self.sys_sendmmsg(a[0], a[1].into(), a[2], a[3]).await,
             18 => self.sys_accept4(a[0], a[1].into(), a[2].into(), a[3]).await,
             _ => {
                 warn!(

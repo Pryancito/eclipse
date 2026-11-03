@@ -660,6 +660,39 @@ impl MsgHdr {
     pub fn set_msg_name_len(&mut self, len: u32) {
         self.msg_namelen = len;
     }
+
+    /// Build one out of the seven fields a caller supplied, whatever width
+    /// the caller wrote them at.
+    ///
+    /// A 32-bit caller's `struct msghdr` is 28 bytes against this one's 56 ---
+    /// every pointer and every `size_t` is half as wide --- so its fields are
+    /// read one at a time and widened, and this is where they land. The
+    /// padding is the compiler's, and that is exactly why this constructor
+    /// exists rather than a literal at the call site: `_pad1` and `_pad2` are
+    /// private, and a widening conversion that had to name them would be
+    /// asserting a layout instead of using one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        msg_name: usize,
+        msg_namelen: u32,
+        msg_iov: usize,
+        msg_iovlen: usize,
+        msg_control: usize,
+        msg_controllen: usize,
+        msg_flags: i32,
+    ) -> Self {
+        Self {
+            msg_name: msg_name.into(),
+            msg_namelen,
+            _pad1: 0,
+            msg_iov: msg_iov.into(),
+            msg_iovlen,
+            msg_control: msg_control.into(),
+            msg_controllen,
+            msg_flags,
+            _pad2: 0,
+        }
+    }
 }
 
 numeric_enum! {

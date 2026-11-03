@@ -1,5 +1,6 @@
 use super::*;
 use crate::file::{anon_fd_flags, ANON_CLOEXEC, ANON_NONBLOCK};
+use crate::narrow::msghdr::CmsgLayout;
 use crate::outparams::hand_out_pair;
 use alloc::vec::Vec;
 use core::convert::TryInto;
@@ -57,30 +58,6 @@ fn send_mode(flags: usize, fd_non_block: bool, bounded_queue: bool) -> SendMode 
         sigpipe: flags & MSG_NOSIGNAL == 0,
     }
 }
-
-/// `struct mmsghdr` from `<sys/socket.h>`: one batch entry for
-/// `sendmmsg`/`recvmmsg` — a plain `msghdr` plus the per-message transfer
-/// count the kernel writes back. Only its layout is used (stride and the
-/// `msg_len` offset); the per-entry `msg_hdr` is re-read by the wrapped
-/// single-message syscalls straight from user memory.
-///
-/// Both batch calls walk the user's array by [`MMSGHDR_STRIDE`] and write the
-/// count at [`MMSGHDR_LEN_OFFSET`], which is why those two come from this
-/// declaration and not from arithmetic: a `msghdr` that grows a field would
-/// otherwise leave the walk one stride short of the real `mmsghdr` and put
-/// each count inside the NEXT entry, over its `msg_name` pointer.
-#[repr(C)]
-struct MMsgHdr {
-    msg_hdr: MsgHdr,
-    msg_len: u32,
-    _pad: u32,
-}
-
-/// The distance between two `struct mmsghdr` in the user's array.
-const MMSGHDR_STRIDE: usize = size_of::<MMsgHdr>();
-
-/// Where the per-message transfer count sits inside one of them.
-const MMSGHDR_LEN_OFFSET: usize = core::mem::offset_of!(MMsgHdr, msg_len);
 
 /// Read a `sockaddr` from user space, honoring the user-supplied `addrlen`.
 ///
@@ -191,7 +168,12 @@ fn sockopt_out_len(requested: usize, actual: usize) -> usize {
 /// `struct cmsghdr` is `{ size_t cmsg_len; int cmsg_level; int cmsg_type; }`:
 /// 16 bytes on a 64-bit target, followed by the payload, with each message
 /// `CMSG_ALIGN`ed to 8.
-const CMSG_HDR_LEN: usize = 16;
+///
+/// A 32-bit caller's is 12 bytes aligned to 4, and **both numbers move at
+/// once**, so the walk and the builders below take a [`CmsgLayout`]: the
+/// number itself lives there, in one place, as `NATIVE_CMSG.hdr_len`.
+#[cfg(test)]
+const CMSG_HDR_LEN: usize = crate::narrow::msghdr::NATIVE_CMSG.hdr_len;
 /// The largest `msg_controllen` this kernel will read.
 ///
 /// `msg_controllen` is entirely the caller's, and it sizes a `read_array`, so
@@ -226,8 +208,8 @@ fn mmsg_batch(vlen: usize) -> usize {
 /// carries no message, so it is ignored rather than refused: that is what
 /// Linux does, and a caller that zeroes a `struct msghdr` and sets only
 /// `msg_control` depends on it.
-fn scm_control_action(is_null: bool, controllen: usize) -> LxResult<bool> {
-    if is_null || controllen < CMSG_HDR_LEN {
+fn scm_control_action(cmsg: CmsgLayout, is_null: bool, controllen: usize) -> LxResult<bool> {
+    if is_null || controllen < cmsg.hdr_len {
         return Ok(false);
     }
     if controllen > CONTROL_MAX {
@@ -301,21 +283,25 @@ const SCM_MAX_FD: usize = 253;
 /// A malformed *tail* is simply where the walk ends, which is what
 /// `__cmsg_nxthdr()` does; only the fd count is an error, because Linux makes
 /// it one.
-fn parse_scm_rights_fds(ctrl: &[u8]) -> Result<Vec<i32>, LxError> {
+fn parse_scm_rights_fds(cmsg: CmsgLayout, ctrl: &[u8]) -> Result<Vec<i32>, LxError> {
     let mut fds: Vec<i32> = Vec::new();
     let mut off = 0usize;
-    while off + CMSG_HDR_LEN <= ctrl.len() {
-        let cmsg_len = u64::from_ne_bytes(ctrl[off..off + 8].try_into().unwrap()) as usize;
-        let level = i32::from_ne_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
-        let typ = i32::from_ne_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
+    while off + cmsg.hdr_len <= ctrl.len() {
+        let cmsg_len = match cmsg.read_len(&ctrl[off..]) {
+            Some(len) => len,
+            None => break,
+        };
+        let ints = off + cmsg.len_width;
+        let level = i32::from_ne_bytes(ctrl[ints..ints + 4].try_into().unwrap());
+        let typ = i32::from_ne_bytes(ctrl[ints + 4..ints + 8].try_into().unwrap());
         let cmsg_end = match off.checked_add(cmsg_len) {
-            Some(end) if cmsg_len >= CMSG_HDR_LEN && end <= ctrl.len() => end,
+            Some(end) if cmsg_len >= cmsg.hdr_len && end <= ctrl.len() => end,
             _ => break,
         };
         if level == SOL_SOCKET_LEVEL && typ == SCM_RIGHTS {
             // A trailing partial fd is not one: `as_chunks` drops it, as the
             // kernel's `(cmsg_len - sizeof(cmsghdr)) / sizeof(int)` does.
-            for chunk in ctrl[off + CMSG_HDR_LEN..cmsg_end].as_chunks::<4>().0 {
+            for chunk in ctrl[off + cmsg.hdr_len..cmsg_end].as_chunks::<4>().0 {
                 if fds.len() == SCM_MAX_FD {
                     return Err(LxError::EINVAL);
                 }
@@ -324,7 +310,7 @@ fn parse_scm_rights_fds(ctrl: &[u8]) -> Result<Vec<i32>, LxError> {
         }
         // CMSG_ALIGN(cmsg_len); checked, and required to move forward so a
         // wrapped or zero step cannot spin forever.
-        let step = match cmsg_len.checked_add(7).map(|v| v & !7) {
+        let step = match cmsg.align_up_checked(cmsg_len) {
             Some(s) if s > 0 => s,
             _ => break,
         };
@@ -342,8 +328,9 @@ fn parse_scm_rights_fds(ctrl: &[u8]) -> Result<Vec<i32>, LxError> {
 /// The two are the same 16-byte header written twice, once in each direction,
 /// which is why the tests below round-trip them against each other rather than
 /// each against a hand-written blob.
-fn build_scm_rights_cmsg(fds: &[i32]) -> Vec<u8> {
+fn build_scm_rights_cmsg(cmsg: CmsgLayout, fds: &[i32]) -> Vec<u8> {
     build_cmsg(
+        cmsg,
         SCM_RIGHTS,
         &fds.iter()
             .flat_map(|f| f.to_ne_bytes())
@@ -358,19 +345,14 @@ fn build_scm_rights_cmsg(fds: &[i32]) -> Vec<u8> {
 /// over to reach the next message. Writing the padded length into the header
 /// instead would make a lone message look longer than it is and a reader
 /// walking two of them land past the second.
-fn build_cmsg(typ: i32, payload: &[u8]) -> Vec<u8> {
-    let cmsg_len = CMSG_HDR_LEN + payload.len();
-    let mut buf = Vec::with_capacity(cmsg_align(cmsg_len));
-    buf.extend_from_slice(&(cmsg_len as u64).to_ne_bytes());
+fn build_cmsg(cmsg: CmsgLayout, typ: i32, payload: &[u8]) -> Vec<u8> {
+    let cmsg_len = cmsg.hdr_len + payload.len();
+    let mut buf = Vec::with_capacity(cmsg.align_up(cmsg_len));
+    cmsg.push_len(&mut buf, cmsg_len);
     buf.extend_from_slice(&SOL_SOCKET_LEVEL.to_ne_bytes());
     buf.extend_from_slice(&typ.to_ne_bytes());
     buf.extend_from_slice(payload);
     buf
-}
-
-/// `CMSG_ALIGN`: control messages sit on 8-byte boundaries.
-fn cmsg_align(len: usize) -> usize {
-    (len + 7) & !7
 }
 
 /// The control buffer `recvmsg` hands back: the descriptors the peer attached,
@@ -380,16 +362,16 @@ fn cmsg_align(len: usize) -> usize {
 /// 20 bytes is followed by 4 bytes of padding before the next header, and a
 /// reader that walked without it would read the credentials out of the middle
 /// of the descriptors.
-fn build_recv_cmsgs(fds: &[i32], creds: Option<&[u8; 12]>) -> Vec<u8> {
+fn build_recv_cmsgs(cmsg: CmsgLayout, fds: &[i32], creds: Option<&[u8; 12]>) -> Vec<u8> {
     let mut buf = Vec::new();
     if !fds.is_empty() {
-        buf.extend(build_scm_rights_cmsg(fds));
+        buf.extend(build_scm_rights_cmsg(cmsg, fds));
     }
     if let Some(creds) = creds {
         if !buf.is_empty() {
-            buf.resize(cmsg_align(buf.len()), 0);
+            buf.resize(cmsg.align_up(buf.len()), 0);
         }
-        buf.extend(build_cmsg(SCM_CREDENTIALS, creds));
+        buf.extend(build_cmsg(cmsg, SCM_CREDENTIALS, creds));
     }
     buf
 }
@@ -1013,7 +995,7 @@ impl Syscall<'_> {
     /// the Nth request — every one of them: DRI3, `wl_shm`, `wl_buffer` —
     /// silently pairs each fd with somebody else's request from there on.
     fn collect_scm_rights_fds(&self, ctrl: &[u8]) -> Result<Vec<Arc<dyn FileLike>>, LxError> {
-        let raw_fds = parse_scm_rights_fds(ctrl)?;
+        let raw_fds = parse_scm_rights_fds(self.cmsg_layout(), ctrl)?;
         let proc = self.linux_process();
         let mut fds = Vec::with_capacity(raw_fds.len());
         for raw in raw_fds {
@@ -1037,7 +1019,10 @@ impl Syscall<'_> {
             "sys_sendmsg: sockfd:{:?}, msg:{:?}, flags:{}",
             sockfd, msg, flags
         );
-        let hdr = msg.read()?;
+        // At the CALLER's width: a 32-bit caller's envelope is 28 bytes, not
+        // 56, and reading it natively does not fail --- it pairs the halves
+        // of two fields into one. See [`crate::narrow::msghdr`].
+        let hdr = self.read_msghdr(msg.as_addr())?;
         self.sendmsg_hdr(sockfd, &hdr, flags).await
     }
 
@@ -1095,7 +1080,11 @@ impl Syscall<'_> {
         };
 
         // SCM_RIGHTS: resolve any attached fds before queueing the bytes.
-        let passed_fds = if scm_control_action(hdr.msg_control.is_null(), hdr.msg_controllen)? {
+        let passed_fds = if scm_control_action(
+            self.cmsg_layout(),
+            hdr.msg_control.is_null(),
+            hdr.msg_controllen,
+        )? {
             let ctrl = hdr.msg_control.read_array(hdr.msg_controllen)?;
             self.collect_scm_rights_fds(&ctrl)?
         } else {
@@ -1156,9 +1145,10 @@ impl Syscall<'_> {
             "sys_recvmsg: sockfd:{}, msg:{:?}, flags:{}",
             sockfd, msg, flags
         );
-        let mut hdr = msg.read()?;
-        // Capture the user address before `msg` may be moved by `write_to_msg`.
         let msg_addr = msg.as_addr();
+        // At the CALLER's width, as `sendmsg` does.
+        let mut hdr = self.read_msghdr(msg_addr)?;
+        let cmsg = self.cmsg_layout();
 
         let iov_ptr = hdr.msg_iov;
         let iovlen = hdr.msg_iovlen;
@@ -1188,13 +1178,18 @@ impl Syscall<'_> {
             iovs.write_from_buf(&data[..len])?;
             if !addr.is_null() {
                 let sockaddr_in = SockAddr::from(endpoint);
-                sockaddr_in.write_to_msg(msg)?;
+                // The address bytes, and then the length at the offset the
+                // CALLER's ABI puts `msg_namelen` at --- which for a 32-bit
+                // caller is 4 and not 8, and which the old whole-structure
+                // write-back could not have got right.
+                let full = sockaddr_in.write_name_to(addr, hdr.msg_namelen as usize)?;
+                self.write_msg_namelen(msg_addr, full)?;
             }
             // SCM_RIGHTS: install any fds the peer attached, and SCM_CREDENTIALS
             // when this end asked for credentials, and emit the cmsgs.
             let mut ctrl_written = 0usize;
             let mut ctrunc = false;
-            if !hdr.msg_control.is_null() && hdr.msg_controllen >= CMSG_HDR_LEN {
+            if !hdr.msg_control.is_null() && hdr.msg_controllen >= cmsg.hdr_len {
                 // Credentials, when wanted, are reserved out of the control
                 // buffer BEFORE the descriptors are counted: they are the
                 // kernel's own word about who sent this, so dropping them to
@@ -1216,9 +1211,9 @@ impl Syscall<'_> {
                 } else {
                     None
                 };
-                let creds_room = creds.map_or(0, |_| cmsg_align(CMSG_HDR_LEN + 12));
+                let creds_room = creds.map_or(0, |_| cmsg.align_up(cmsg.hdr_len + 12));
                 let fd_room = hdr.msg_controllen.saturating_sub(creds_room);
-                let max_fds = fd_room.saturating_sub(CMSG_HDR_LEN) / 4;
+                let max_fds = fd_room.saturating_sub(cmsg.hdr_len) / 4;
                 let fds = socket.recv_fds(max_fds);
                 let mut installed: Vec<i32> = Vec::with_capacity(fds.len());
                 if !fds.is_empty() {
@@ -1232,7 +1227,7 @@ impl Syscall<'_> {
                         installed.push(proc.add_file_cloexec(fl, cloexec)?.into());
                     }
                 }
-                let cbuf = build_recv_cmsgs(&installed, creds.as_ref());
+                let cbuf = build_recv_cmsgs(cmsg, &installed, creds.as_ref());
                 if cbuf.len() <= hdr.msg_controllen {
                     ctrl_written = cbuf.len();
                     if ctrl_written > 0 {
@@ -1248,7 +1243,7 @@ impl Syscall<'_> {
                     // credentials whole and say so with `MSG_CTRUNC`, as
                     // Linux does.
                     ctrunc = true;
-                    let fitting = build_recv_cmsgs(&installed, None);
+                    let fitting = build_recv_cmsgs(cmsg, &installed, None);
                     ctrl_written = fitting.len();
                     if ctrl_written > 0 {
                         hdr.msg_control.write_array(&fitting[..ctrl_written])?;
@@ -1264,18 +1259,19 @@ impl Syscall<'_> {
             // "range start index 18446744069414584321 out of range for slice
             // of length 136" — 136 being exactly the untouched capacity.
             // libwayland's C macros merely skidded over the same garbage.
+            //
+            // At the caller's offset AND width: `msg_controllen` is a
+            // `size_t`, so for a 32-bit caller it is four bytes at offset 20,
+            // and writing eight there carried half the answer into
+            // `msg_flags`.
             if !hdr.msg_control.is_null() {
-                let controllen_addr = msg_addr + core::mem::offset_of!(MsgHdr, msg_controllen);
-                let mut p = UserOutPtr::<usize>::from(controllen_addr);
-                p.write(ctrl_written)?;
+                self.write_msg_controllen(msg_addr, ctrl_written)?;
             }
-            // Report truncation (and any other recv flags) via msg_flags.
+            // Report truncation (and any other recv flags) via msg_flags ---
+            // at offset 24 for a 32-bit caller, where the native 48 is twenty
+            // bytes past the end of its structure.
             let msg_flags = socket.take_msg_flags() | if ctrunc { MSG_CTRUNC } else { 0 };
-            {
-                let flags_addr = msg_addr + core::mem::offset_of!(MsgHdr, msg_flags);
-                let mut p = UserOutPtr::<i32>::from(flags_addr);
-                p.write(msg_flags)?;
-            }
+            self.write_msg_flags(msg_addr, msg_flags)?;
         }
 
         result
@@ -1565,15 +1561,18 @@ impl Syscall<'_> {
             sockfd, msgvec, vlen
         );
         let base = msgvec.as_addr();
-        let stride = MMSGHDR_STRIDE;
+        // The stride and the count's offset as the CALLER writes them: 32 and
+        // 28 for a 32-bit caller against 64 and 56. See
+        // [`crate::narrow::msghdr`] --- the strides are in a ratio of two and
+        // the offsets are not, so neither can be derived from the other.
+        let l = self.mmsghdr_layout();
+        let stride = l.stride;
         let mut sent = 0usize;
         for i in 0..mmsg_batch(vlen) {
-            let hdr_ptr: UserInPtr<MsgHdr> = (base + i * stride).into();
-            let hdr = hdr_ptr.read()?;
+            let hdr = self.read_msghdr(base + i * stride)?;
             match self.sendmsg_hdr(sockfd, &hdr, flags).await {
                 Ok(n) => {
-                    let mut len_ptr: UserOutPtr<u32> =
-                        (base + i * stride + MMSGHDR_LEN_OFFSET).into();
+                    let mut len_ptr: UserOutPtr<u32> = (base + i * stride + l.len).into();
                     len_ptr.write(n as u32)?;
                     sent += 1;
                 }
@@ -1604,15 +1603,15 @@ impl Syscall<'_> {
             sockfd, msgvec, vlen
         );
         let base = msgvec.as_addr();
-        let stride = MMSGHDR_STRIDE;
+        let l = self.mmsghdr_layout();
+        let stride = l.stride;
         let mut received = 0usize;
         for i in 0..mmsg_batch(vlen) {
             let hdr_ptr: UserInOutPtr<MsgHdr> = (base + i * stride).into();
             let per_flags = if i == 0 { flags } else { flags | MSG_DONTWAIT };
             match self.sys_recvmsg(sockfd, hdr_ptr, per_flags).await {
                 Ok(n) => {
-                    let mut len_ptr: UserOutPtr<u32> =
-                        (base + i * stride + MMSGHDR_LEN_OFFSET).into();
+                    let mut len_ptr: UserOutPtr<u32> = (base + i * stride + l.len).into();
                     len_ptr.write(n as u32)?;
                     received += 1;
                 }
@@ -1712,6 +1711,10 @@ fn peer_endpoint(ep: Option<Endpoint>) -> Result<Endpoint, LxError> {
 #[cfg(test)]
 mod scm_rights_tests {
     use super::*;
+    /// The native row of [`CmsgLayout`], which is the ABI these tests are
+    /// about: a 16-byte header aligned to 8. The narrow row has its own
+    /// tests, in `crate::narrow::msghdr`.
+    const NATIVE: CmsgLayout = crate::narrow::msghdr::NATIVE_CMSG;
 
     /// A control buffer holding one cmsg with `level`, `typ` and `payload`,
     /// padded to `CMSG_ALIGN` so another can follow.
@@ -1746,7 +1749,7 @@ mod scm_rights_tests {
     #[test]
     fn one_message_yields_the_descriptors_it_carries() {
         let ctrl = cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[7, 9, 11]));
-        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![7, 9, 11]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Ok(vec![7, 9, 11]));
     }
 
     /// `MSG_CMSG_CLOEXEC` is the only bit that decides FD_CLOEXEC on the
@@ -1766,9 +1769,9 @@ mod scm_rights_tests {
         // data; reading it as descriptor numbers would install whatever the
         // numbers happened to be.
         let creds = cmsg(SOL_SOCKET_LEVEL, 2, &fd_bytes(&[3, 4, 5]));
-        assert_eq!(parse_scm_rights_fds(&creds), Ok(vec![]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &creds), Ok(vec![]));
         let ip = cmsg(0, SCM_RIGHTS, &fd_bytes(&[3, 4, 5]));
-        assert_eq!(parse_scm_rights_fds(&ip), Ok(vec![]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &ip), Ok(vec![]));
     }
 
     #[test]
@@ -1780,7 +1783,7 @@ mod scm_rights_tests {
         assert_eq!(ctrl.len(), 24);
         ctrl.extend(cmsg(SOL_SOCKET_LEVEL, 2, &fd_bytes(&[99])));
         ctrl.extend(cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[5, 6])));
-        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![3, 5, 6]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Ok(vec![3, 5, 6]));
     }
 
     /// `SO_PASSCRED` is why chromium's zygote works at all: the browser hands
@@ -1793,7 +1796,7 @@ mod scm_rights_tests {
     #[test]
     fn the_credentials_message_is_the_one_scm_rights_is_not() {
         let creds = ucred_of(1282);
-        let buf = build_recv_cmsgs(&[], Some(&creds));
+        let buf = build_recv_cmsgs(NATIVE, &[], Some(&creds));
         assert_eq!(buf.len(), CMSG_HDR_LEN + 12);
         assert_eq!(
             i32::from_ne_bytes(buf[12..16].try_into().unwrap()),
@@ -1808,10 +1811,10 @@ mod scm_rights_tests {
         // It is NOT a descriptor message, so the fd walk must not take it for
         // one -- a `ucred` read as fd numbers would install whatever pid, uid
         // and gid happened to be.
-        assert_eq!(parse_scm_rights_fds(&buf), Ok(vec![]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &buf), Ok(vec![]));
         // And with the option off there is no message at all, rather than an
         // empty one: Linux reports `msg_controllen` 0 there.
-        assert!(build_recv_cmsgs(&[], None).is_empty());
+        assert!(build_recv_cmsgs(NATIVE, &[], None).is_empty());
     }
 
     /// Both messages in one buffer. The descriptor message is 20 bytes for one
@@ -1821,10 +1824,10 @@ mod scm_rights_tests {
     #[test]
     fn descriptors_and_credentials_sit_on_the_alignment_a_reader_steps_by() {
         let creds = ucred_of(7);
-        let buf = build_recv_cmsgs(&[9], Some(&creds));
+        let buf = build_recv_cmsgs(NATIVE, &[9], Some(&creds));
         assert_eq!(buf.len(), 24 + CMSG_HDR_LEN + 12);
         // The fd walk finds the descriptor and stops there.
-        assert_eq!(parse_scm_rights_fds(&buf), Ok(vec![9]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &buf), Ok(vec![9]));
         // The second header begins at the aligned offset.
         assert_eq!(
             i32::from_ne_bytes(buf[24 + 12..24 + 16].try_into().unwrap()),
@@ -1846,13 +1849,13 @@ mod scm_rights_tests {
             SCM_RIGHTS,
             &[1, 0, 0, 0, 2, 0],
         );
-        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![1]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Ok(vec![1]));
     }
 
     #[test]
     fn a_length_past_the_end_of_the_buffer_stops_the_walk() {
         let ctrl = cmsg_raw(4096, SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, 4]));
-        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Ok(vec![]));
     }
 
     #[test]
@@ -1861,7 +1864,12 @@ mod scm_rights_tests {
         // then slice with start > end, which is a kernel panic.
         for len in [u64::MAX, u64::MAX - 7, (usize::MAX as u64) - 16] {
             let ctrl = cmsg_raw(len, SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, 4]));
-            assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![]), "cmsg_len {}", len);
+            assert_eq!(
+                parse_scm_rights_fds(NATIVE, &ctrl),
+                Ok(vec![]),
+                "cmsg_len {}",
+                len
+            );
         }
     }
 
@@ -1878,14 +1886,19 @@ mod scm_rights_tests {
         assert_eq!(ctrl.len(), 24);
         ctrl.extend(cmsg_raw(u64::MAX - 20, SOL_SOCKET_LEVEL, SCM_RIGHTS, &[]));
         assert_eq!(ctrl.len(), 40);
-        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![3]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Ok(vec![3]));
     }
 
     #[test]
     fn a_length_shorter_than_its_own_header_stops_the_walk() {
         for len in [0u64, 1, 8, 15] {
             let ctrl = cmsg_raw(len, SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, 4]));
-            assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![]), "cmsg_len {}", len);
+            assert_eq!(
+                parse_scm_rights_fds(NATIVE, &ctrl),
+                Ok(vec![]),
+                "cmsg_len {}",
+                len
+            );
         }
     }
 
@@ -1901,14 +1914,19 @@ mod scm_rights_tests {
         // than a wrong answer, and no test can tell the two locks apart.
         let mut ctrl = cmsg_raw(16, SOL_SOCKET_LEVEL, SCM_RIGHTS, &[]);
         ctrl.extend(cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[8])));
-        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![8]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Ok(vec![8]));
     }
 
     #[test]
     fn a_buffer_too_short_for_a_header_carries_nothing() {
         for n in 0..CMSG_HDR_LEN {
             let ctrl = vec![0xffu8; n];
-            assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![]), "{} bytes", n);
+            assert_eq!(
+                parse_scm_rights_fds(NATIVE, &ctrl),
+                Ok(vec![]),
+                "{} bytes",
+                n
+            );
         }
     }
 
@@ -1929,14 +1947,20 @@ mod scm_rights_tests {
             SCM_RIGHTS,
             &fd_bytes(&(0..SCM_MAX_FD as i32).collect::<Vec<_>>()),
         );
-        assert_eq!(parse_scm_rights_fds(&ok).map(|v| v.len()), Ok(SCM_MAX_FD));
+        assert_eq!(
+            parse_scm_rights_fds(NATIVE, &ok).map(|v| v.len()),
+            Ok(SCM_MAX_FD)
+        );
 
         let too_many = cmsg(
             SOL_SOCKET_LEVEL,
             SCM_RIGHTS,
             &fd_bytes(&(0..SCM_MAX_FD as i32 + 1).collect::<Vec<_>>()),
         );
-        assert_eq!(parse_scm_rights_fds(&too_many), Err(LxError::EINVAL));
+        assert_eq!(
+            parse_scm_rights_fds(NATIVE, &too_many),
+            Err(LxError::EINVAL)
+        );
     }
 
     #[test]
@@ -1946,7 +1970,7 @@ mod scm_rights_tests {
         let half = || fd_bytes(&(0..200i32).collect::<Vec<_>>());
         let mut ctrl = cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &half());
         ctrl.extend(cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &half()));
-        assert_eq!(parse_scm_rights_fds(&ctrl), Err(LxError::EINVAL));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Err(LxError::EINVAL));
     }
 
     #[test]
@@ -1954,7 +1978,7 @@ mod scm_rights_tests {
         // The walk reports what is on the wire; `collect_scm_rights_fds` is
         // the half that turns a number into a file and answers EBADF.
         let ctrl = cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[3, -1, 4]));
-        assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![3, -1, 4]));
+        assert_eq!(parse_scm_rights_fds(NATIVE, &ctrl), Ok(vec![3, -1, 4]));
     }
 
     #[test]
@@ -1966,8 +1990,13 @@ mod scm_rights_tests {
             vec![3, 4, 5],
             vec![i32::MAX, 1, 2, 3, 4, 5, 6, 7],
         ] {
-            let built = build_scm_rights_cmsg(&fds);
-            assert_eq!(parse_scm_rights_fds(&built), Ok(fds.clone()), "{:?}", fds);
+            let built = build_scm_rights_cmsg(NATIVE, &fds);
+            assert_eq!(
+                parse_scm_rights_fds(NATIVE, &built),
+                Ok(fds.clone()),
+                "{:?}",
+                fds
+            );
         }
     }
 
@@ -1975,7 +2004,7 @@ mod scm_rights_tests {
     fn the_built_message_is_the_length_it_declares() {
         // A caller walks the buffer with `cmsg_len`, so a header that lies
         // about its own size sends it into the next message or off the end.
-        let built = build_scm_rights_cmsg(&[3, 4, 5]);
+        let built = build_scm_rights_cmsg(NATIVE, &[3, 4, 5]);
         let declared = u64::from_ne_bytes(built[..8].try_into().unwrap()) as usize;
         assert_eq!(declared, built.len());
         assert_eq!(built.len(), CMSG_HDR_LEN + 3 * 4);
@@ -2405,42 +2434,9 @@ mod socket_type_flag_tests {
 #[cfg(test)]
 mod wire_numbers_tests {
     use super::*;
-    use core::mem::{align_of, offset_of, size_of};
-
-    #[test]
-    fn the_batch_entry_is_the_mmsghdr_of_the_uapi() {
-        // `struct mmsghdr { struct msghdr msg_hdr; unsigned int msg_len; }`,
-        // which the compiler pads to 8 because `msghdr` holds pointers. Both
-        // batch calls walk the user's array by this size and write the count
-        // at this offset, so these two numbers ARE where `sendmmsg(2)` and
-        // `recvmmsg(2)` reach into user memory.
-        assert_eq!(size_of::<MMsgHdr>(), 64);
-        assert_eq!(align_of::<MMsgHdr>(), 8);
-        assert_eq!(offset_of!(MMsgHdr, msg_hdr), 0);
-        assert_eq!(offset_of!(MMsgHdr, msg_len), 56);
-        assert_eq!(offset_of!(MMsgHdr, _pad), 60);
-        // And the one `msghdr` inside it, whose size is what the entry is
-        // built around: a field added to it moves `msg_len`, and the two
-        // constants below are the only reason the walk follows.
-        assert_eq!(size_of::<MsgHdr>(), 56);
-        assert_eq!(MMSGHDR_STRIDE, 64);
-        assert_eq!(MMSGHDR_LEN_OFFSET, 56);
-    }
-
-    #[test]
-    fn the_stride_is_the_whole_entry_and_not_the_header_plus_a_guess() {
-        // What this replaces, written out: `size_of::<MsgHdr>() + 8` for the
-        // stride and `size_of::<MsgHdr>()` for the offset. The two agree with
-        // the entry today, which is why nothing caught the arithmetic -- and
-        // the day a `msghdr` field is added they stop agreeing, the walk
-        // falls one stride short per entry, and each transfer count lands
-        // inside the next entry, on top of its `msg_name` pointer.
-        assert_eq!(MMSGHDR_STRIDE, size_of::<MsgHdr>() + 8);
-        assert_eq!(MMSGHDR_LEN_OFFSET, size_of::<MsgHdr>());
-        // The count has to fit inside the entry it belongs to, which is the
-        // property the arithmetic never stated.
-        assert!(MMSGHDR_LEN_OFFSET + size_of::<u32>() <= MMSGHDR_STRIDE);
-    }
+    // The struct-layout tests of `mmsghdr` moved next to its declaration, in
+    // `crate::narrow::msghdr`: the stride and the count's offset belong to the
+    // ABI table now, and there are two rows of them.
 
     #[test]
     fn the_control_message_numbers_are_the_ones_the_headers_give() {
@@ -2448,7 +2444,10 @@ mod wire_numbers_tests {
         // whose level or type does not match what the peer's libc wrote is
         // simply not seen: `recvmsg` hands back a buffer the caller walks and
         // finds nothing in, with no error anywhere.
-        assert_eq!(CMSG_HDR_LEN, 16, "sizeof(struct cmsghdr) on a 64-bit ABI");
+        //
+        // The header's size is the layout's business and is pinned there, in
+        // two rows; what this one is about is the numbers inside it.
+        assert_eq!(CMSG_HDR_LEN, size_of::<usize>() + 4 + 4);
         assert_eq!(SOL_SOCKET, 1);
         assert_eq!(SOL_SOCKET_LEVEL, 1, "SOL_SOCKET as cmsg_level");
         assert_eq!(
@@ -2562,20 +2561,24 @@ mod benches {
     //! branch, with a constant input it is a call that was folded away.
 
     use super::*;
+    /// The native row of [`CmsgLayout`], which is the ABI these tests are
+    /// about: a 16-byte header aligned to 8. The narrow row has its own
+    /// tests, in `crate::narrow::msghdr`.
+    const NATIVE: CmsgLayout = crate::narrow::msghdr::NATIVE_CMSG;
     use test::{black_box, Bencher};
 
     /// A control buffer carrying one `SCM_RIGHTS` message with `n`
     /// descriptors, in the layout a peer's `sendmsg` produces.
     fn rights_buffer(n: usize) -> Vec<u8> {
         let fds: Vec<i32> = (0..n as i32).map(|i| i + 3).collect();
-        build_scm_rights_cmsg(&fds)
+        build_scm_rights_cmsg(NATIVE, &fds)
     }
 
     /// One descriptor passed over a Unix socket: the per-message cost.
     #[bench]
     fn parse_scm_rights_of_1_fd(b: &mut Bencher) {
         let ctrl = rights_buffer(1);
-        b.iter(|| black_box(parse_scm_rights_fds(black_box(&ctrl))));
+        b.iter(|| black_box(parse_scm_rights_fds(NATIVE, black_box(&ctrl))));
     }
 
     /// Sixteen, which is what a compositor or a sandbox launcher hands over
@@ -2583,7 +2586,7 @@ mod benches {
     #[bench]
     fn parse_scm_rights_of_16_fds(b: &mut Bencher) {
         let ctrl = rights_buffer(16);
-        b.iter(|| black_box(parse_scm_rights_fds(black_box(&ctrl))));
+        b.iter(|| black_box(parse_scm_rights_fds(NATIVE, black_box(&ctrl))));
     }
 
     /// `SCM_MAX_FD`, the most one `sendmsg` may carry. The cap is the reason
@@ -2592,7 +2595,7 @@ mod benches {
     #[bench]
     fn parse_scm_rights_of_253_fds(b: &mut Bencher) {
         let ctrl = rights_buffer(253);
-        b.iter(|| black_box(parse_scm_rights_fds(black_box(&ctrl))));
+        b.iter(|| black_box(parse_scm_rights_fds(NATIVE, black_box(&ctrl))));
     }
 
     /// A control buffer one descriptor over the cap: `EINVAL`, and the walk
@@ -2600,7 +2603,7 @@ mod benches {
     #[bench]
     fn parse_scm_rights_over_the_cap(b: &mut Bencher) {
         let ctrl = rights_buffer(254);
-        b.iter(|| black_box(parse_scm_rights_fds(black_box(&ctrl))));
+        b.iter(|| black_box(parse_scm_rights_fds(NATIVE, black_box(&ctrl))));
     }
 
     /// A buffer whose `cmsg_len` is malformed: the walk stops, which is what
@@ -2609,7 +2612,7 @@ mod benches {
     fn parse_scm_rights_of_a_malformed_buffer(b: &mut Bencher) {
         let mut ctrl = rights_buffer(4);
         ctrl[..8].copy_from_slice(&u64::MAX.to_ne_bytes());
-        b.iter(|| black_box(parse_scm_rights_fds(black_box(&ctrl))));
+        b.iter(|| black_box(parse_scm_rights_fds(NATIVE, black_box(&ctrl))));
     }
 
     /// The other direction: the control buffer `recvmsg` hands back with
@@ -2619,7 +2622,13 @@ mod benches {
     fn build_recv_cmsgs_of_16_fds_and_creds(b: &mut Bencher) {
         let fds: Vec<i32> = (3..19).collect();
         let creds = ucred_of(4242);
-        b.iter(|| black_box(build_recv_cmsgs(black_box(&fds), black_box(Some(&creds)))));
+        b.iter(|| {
+            black_box(build_recv_cmsgs(
+                NATIVE,
+                black_box(&fds),
+                black_box(Some(&creds)),
+            ))
+        });
     }
 
     /// Credentials alone, which is what `SO_PASSCRED` costs per message
@@ -2627,7 +2636,13 @@ mod benches {
     #[bench]
     fn build_recv_cmsgs_of_creds_only(b: &mut Bencher) {
         let creds = ucred_of(4242);
-        b.iter(|| black_box(build_recv_cmsgs(black_box(&[]), black_box(Some(&creds)))))
+        b.iter(|| {
+            black_box(build_recv_cmsgs(
+                NATIVE,
+                black_box(&[]),
+                black_box(Some(&creds)),
+            ))
+        })
     }
 
     /// `struct ucred` for `SO_PEERCRED`, which looks the process up.
@@ -2639,7 +2654,7 @@ mod benches {
     /// `CMSG_ALIGN`, which every step of both walks goes through.
     #[bench]
     fn cmsg_alignment(b: &mut Bencher) {
-        b.iter(|| black_box(cmsg_align(black_box(20))));
+        b.iter(|| black_box(NATIVE.align_up(black_box(20))));
     }
 
     /// `getsockopt`'s value-result `optlen`, which is what stopped a 12-byte
@@ -2679,6 +2694,10 @@ mod benches {
 #[cfg(test)]
 mod control_and_batch_bounds_tests {
     use super::*;
+    /// The native row of [`CmsgLayout`], which is the ABI these tests are
+    /// about: a 16-byte header aligned to 8. The narrow row has its own
+    /// tests, in `crate::narrow::msghdr`.
+    const NATIVE: CmsgLayout = crate::narrow::msghdr::NATIVE_CMSG;
 
     /// A control buffer too short to hold one header carries no message, and
     /// is ignored rather than refused.
@@ -2691,15 +2710,21 @@ mod control_and_batch_bounds_tests {
     #[test]
     fn a_control_buffer_shorter_than_one_header_is_ignored_and_not_refused() {
         // A null pointer, whatever the length claims.
-        assert_eq!(scm_control_action(true, 0), Ok(false));
-        assert_eq!(scm_control_action(true, 4096), Ok(false));
+        assert_eq!(scm_control_action(NATIVE, true, 0), Ok(false));
+        assert_eq!(scm_control_action(NATIVE, true, 4096), Ok(false));
         // A buffer too short to hold `struct cmsghdr`.
-        assert_eq!(scm_control_action(false, 0), Ok(false));
-        assert_eq!(scm_control_action(false, 8), Ok(false));
-        assert_eq!(scm_control_action(false, CMSG_HDR_LEN - 1), Ok(false));
+        assert_eq!(scm_control_action(NATIVE, false, 0), Ok(false));
+        assert_eq!(scm_control_action(NATIVE, false, 8), Ok(false));
+        assert_eq!(
+            scm_control_action(NATIVE, false, CMSG_HDR_LEN - 1),
+            Ok(false)
+        );
         // Exactly one header is a message, payload or no payload.
-        assert_eq!(scm_control_action(false, CMSG_HDR_LEN), Ok(true));
-        assert_eq!(scm_control_action(false, CMSG_HDR_LEN + 1), Ok(true));
+        assert_eq!(scm_control_action(NATIVE, false, CMSG_HDR_LEN), Ok(true));
+        assert_eq!(
+            scm_control_action(NATIVE, false, CMSG_HDR_LEN + 1),
+            Ok(true)
+        );
     }
 
     /// The floor is the header length and not a number that happens to match
@@ -2710,9 +2735,21 @@ mod control_and_batch_bounds_tests {
     /// the two moves.
     #[test]
     fn the_floor_is_the_header_length_itself() {
+        // The relation, which holds on any target: the native header is a
+        // `size_t` and two `int`. The 16 below is that relation's value where
+        // this kernel is built for a 64-bit target, and nowhere else --- on a
+        // 32-bit target the NATIVE header IS 12, which is the whole reason
+        // this layout has two rows. Pinning the 16 unconditionally used to be
+        // right when `CMSG_HDR_LEN` was a literal; now that it is derived it
+        // would be a claim about the host, which Copilot caught.
+        assert_eq!(CMSG_HDR_LEN, size_of::<usize>() + 4 + 4);
+        #[cfg(target_pointer_width = "64")]
         assert_eq!(CMSG_HDR_LEN, 16, "sizeof(struct cmsghdr) on a 64-bit ABI");
-        assert_eq!(scm_control_action(false, CMSG_HDR_LEN), Ok(true));
-        assert_eq!(scm_control_action(false, CMSG_HDR_LEN - 1), Ok(false));
+        assert_eq!(scm_control_action(NATIVE, false, CMSG_HDR_LEN), Ok(true));
+        assert_eq!(
+            scm_control_action(NATIVE, false, CMSG_HDR_LEN - 1),
+            Ok(false)
+        );
     }
 
     /// The largest control buffer this kernel will read is 64 KiB.
@@ -2724,12 +2761,15 @@ mod control_and_batch_bounds_tests {
     #[test]
     fn the_biggest_control_buffer_the_kernel_will_read_is_sixty_four_kib() {
         assert_eq!(CONTROL_MAX, 64 * 1024, "the optmem_max default");
-        assert_eq!(scm_control_action(false, 64 * 1024), Ok(true));
+        assert_eq!(scm_control_action(NATIVE, false, 64 * 1024), Ok(true));
         assert_eq!(
-            scm_control_action(false, 64 * 1024 + 1),
+            scm_control_action(NATIVE, false, 64 * 1024 + 1),
             Err(LxError::EINVAL)
         );
-        assert_eq!(scm_control_action(false, usize::MAX), Err(LxError::EINVAL));
+        assert_eq!(
+            scm_control_action(NATIVE, false, usize::MAX),
+            Err(LxError::EINVAL)
+        );
         // The ceiling has to clear the floor, or no control message could ever
         // pass at all.
         assert!(CONTROL_MAX > CMSG_HDR_LEN);
@@ -2742,8 +2782,8 @@ mod control_and_batch_bounds_tests {
     /// as whatever was on the stack must get an ordinary send, not `EINVAL`.
     #[test]
     fn a_null_pointer_is_answered_before_the_ceiling() {
-        assert_eq!(scm_control_action(true, usize::MAX), Ok(false));
-        assert_eq!(scm_control_action(true, CONTROL_MAX + 1), Ok(false));
+        assert_eq!(scm_control_action(NATIVE, true, usize::MAX), Ok(false));
+        assert_eq!(scm_control_action(NATIVE, true, CONTROL_MAX + 1), Ok(false));
     }
 
     /// One batch call walks at most 64 entries, whatever `vlen` says.
@@ -2770,11 +2810,13 @@ mod control_and_batch_bounds_tests {
 
     /// The walk the clamp allows stays inside an address.
     ///
-    /// Both batch calls index with `base + i * MMSGHDR_STRIDE`, so the clamp
-    /// and the stride together are what keeps that arithmetic from wrapping.
+    /// Both batch calls index with `base + i * stride`, so the clamp and the
+    /// stride together are what keeps that arithmetic from wrapping. The
+    /// native stride is the larger of the two, so it is the one to check.
     #[test]
     fn the_whole_batch_fits_in_an_address() {
-        assert!(MMSG_MAX.checked_mul(MMSGHDR_STRIDE).is_some());
-        assert_eq!(MMSG_MAX * MMSGHDR_STRIDE, 4096, "one page of entries");
+        let stride = crate::narrow::msghdr::NATIVE_MMSG.stride;
+        assert!(MMSG_MAX.checked_mul(stride).is_some());
+        assert_eq!(MMSG_MAX * stride, 4096, "one page of entries");
     }
 }

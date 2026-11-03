@@ -3,7 +3,7 @@
 use core::{cmp::min, mem::size_of};
 
 // crate
-use crate::error::LxError;
+use crate::error::{LxError, LxResult};
 // use crate::net::Endpoint;
 
 // smoltcp
@@ -442,6 +442,43 @@ impl SockAddr {
         }
         addr_len.write(full_len as u32)?;
         Ok(0)
+    }
+
+    /// Write the address into a `recvmsg` caller's `msg_name` buffer, and
+    /// hand back the length the kernel has to report --- which is the
+    /// address's FULL length even when the buffer was shorter, because that
+    /// is how a caller learns it was truncated.
+    ///
+    /// The reporting is the caller's to do, at the offset ITS ABI puts
+    /// `msg_namelen` at. What this used to do instead was read the whole
+    /// `struct msghdr` back out of user memory, change that one field and
+    /// write all 56 bytes back ([`Self::write_to_msg`], still here for the
+    /// native callers that have no ABI to ask): over a 32-bit caller's
+    /// 28-byte structure that is twenty-eight bytes of whatever the caller
+    /// keeps next to it, and even natively it is a read-modify-write of
+    /// fields nobody touched.
+    pub fn write_name_to(&self, name: UserInOutPtr<SockAddr>, max_len: usize) -> LxResult<u32> {
+        let full_len = self.output_len()?;
+        let written_len = min(max_len, full_len);
+        if written_len > 0 && !name.is_null() {
+            // `as_addr()` and `into()`, not `transmute_copy`: the pointer
+            // wrapper already hands out its address, and going through it
+            // asserts nothing about the wrapper's layout. The `unsafe` that
+            // is left is the byte view of the address, and `written_len` is
+            // `output_len()`, which never exceeds the union variant that
+            // `From<Endpoint>` initialised whole --- so every byte read here
+            // is an initialised one. None of the five variants has internal
+            // padding (16, 28, 20, 12 bytes, and `sun_family` + `sun_path`),
+            // which is what makes that true and is worth saying out loud,
+            // because a variant that grew some would leak it.
+            let mut addr_ptr: UserOutPtr<u8> = name.as_addr().into();
+            #[allow(unsafe_code)]
+            let source = unsafe {
+                core::slice::from_raw_parts(self as *const SockAddr as *const u8, written_len)
+            };
+            addr_ptr.write_array(source)?;
+        }
+        Ok(full_len as u32)
     }
 
     pub fn write_to_msg(&self, mut msg: UserInOutPtr<MsgHdr>) -> SysResult {
