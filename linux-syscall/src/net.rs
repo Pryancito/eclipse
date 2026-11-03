@@ -59,30 +59,6 @@ fn send_mode(flags: usize, fd_non_block: bool, bounded_queue: bool) -> SendMode 
     }
 }
 
-/// `struct mmsghdr` from `<sys/socket.h>`: one batch entry for
-/// `sendmmsg`/`recvmmsg` — a plain `msghdr` plus the per-message transfer
-/// count the kernel writes back. Only its layout is used (stride and the
-/// `msg_len` offset); the per-entry `msg_hdr` is re-read by the wrapped
-/// single-message syscalls straight from user memory.
-///
-/// Both batch calls walk the user's array by [`MMSGHDR_STRIDE`] and write the
-/// count at [`MMSGHDR_LEN_OFFSET`], which is why those two come from this
-/// declaration and not from arithmetic: a `msghdr` that grows a field would
-/// otherwise leave the walk one stride short of the real `mmsghdr` and put
-/// each count inside the NEXT entry, over its `msg_name` pointer.
-#[repr(C)]
-struct MMsgHdr {
-    msg_hdr: MsgHdr,
-    msg_len: u32,
-    _pad: u32,
-}
-
-/// The distance between two `struct mmsghdr` in the user's array.
-const MMSGHDR_STRIDE: usize = size_of::<MMsgHdr>();
-
-/// Where the per-message transfer count sits inside one of them.
-const MMSGHDR_LEN_OFFSET: usize = core::mem::offset_of!(MMsgHdr, msg_len);
-
 /// Read a `sockaddr` from user space, honoring the user-supplied `addrlen`.
 ///
 /// `SockAddr` is a union whose alignment (4, coming from the `u32` fields of
@@ -1588,15 +1564,18 @@ impl Syscall<'_> {
             sockfd, msgvec, vlen
         );
         let base = msgvec.as_addr();
-        let stride = MMSGHDR_STRIDE;
+        // The stride and the count's offset as the CALLER writes them: 32 and
+        // 28 for a 32-bit caller against 64 and 56. See
+        // [`crate::narrow::msghdr`] --- the strides are in a ratio of two and
+        // the offsets are not, so neither can be derived from the other.
+        let l = self.mmsghdr_layout();
+        let stride = l.stride;
         let mut sent = 0usize;
         for i in 0..mmsg_batch(vlen) {
-            let hdr_ptr: UserInPtr<MsgHdr> = (base + i * stride).into();
-            let hdr = hdr_ptr.read()?;
+            let hdr = self.read_msghdr(base + i * stride)?;
             match self.sendmsg_hdr(sockfd, &hdr, flags).await {
                 Ok(n) => {
-                    let mut len_ptr: UserOutPtr<u32> =
-                        (base + i * stride + MMSGHDR_LEN_OFFSET).into();
+                    let mut len_ptr: UserOutPtr<u32> = (base + i * stride + l.len).into();
                     len_ptr.write(n as u32)?;
                     sent += 1;
                 }
@@ -1627,15 +1606,15 @@ impl Syscall<'_> {
             sockfd, msgvec, vlen
         );
         let base = msgvec.as_addr();
-        let stride = MMSGHDR_STRIDE;
+        let l = self.mmsghdr_layout();
+        let stride = l.stride;
         let mut received = 0usize;
         for i in 0..mmsg_batch(vlen) {
             let hdr_ptr: UserInOutPtr<MsgHdr> = (base + i * stride).into();
             let per_flags = if i == 0 { flags } else { flags | MSG_DONTWAIT };
             match self.sys_recvmsg(sockfd, hdr_ptr, per_flags).await {
                 Ok(n) => {
-                    let mut len_ptr: UserOutPtr<u32> =
-                        (base + i * stride + MMSGHDR_LEN_OFFSET).into();
+                    let mut len_ptr: UserOutPtr<u32> = (base + i * stride + l.len).into();
                     len_ptr.write(n as u32)?;
                     received += 1;
                 }
@@ -2458,42 +2437,9 @@ mod socket_type_flag_tests {
 #[cfg(test)]
 mod wire_numbers_tests {
     use super::*;
-    use core::mem::{align_of, offset_of, size_of};
-
-    #[test]
-    fn the_batch_entry_is_the_mmsghdr_of_the_uapi() {
-        // `struct mmsghdr { struct msghdr msg_hdr; unsigned int msg_len; }`,
-        // which the compiler pads to 8 because `msghdr` holds pointers. Both
-        // batch calls walk the user's array by this size and write the count
-        // at this offset, so these two numbers ARE where `sendmmsg(2)` and
-        // `recvmmsg(2)` reach into user memory.
-        assert_eq!(size_of::<MMsgHdr>(), 64);
-        assert_eq!(align_of::<MMsgHdr>(), 8);
-        assert_eq!(offset_of!(MMsgHdr, msg_hdr), 0);
-        assert_eq!(offset_of!(MMsgHdr, msg_len), 56);
-        assert_eq!(offset_of!(MMsgHdr, _pad), 60);
-        // And the one `msghdr` inside it, whose size is what the entry is
-        // built around: a field added to it moves `msg_len`, and the two
-        // constants below are the only reason the walk follows.
-        assert_eq!(size_of::<MsgHdr>(), 56);
-        assert_eq!(MMSGHDR_STRIDE, 64);
-        assert_eq!(MMSGHDR_LEN_OFFSET, 56);
-    }
-
-    #[test]
-    fn the_stride_is_the_whole_entry_and_not_the_header_plus_a_guess() {
-        // What this replaces, written out: `size_of::<MsgHdr>() + 8` for the
-        // stride and `size_of::<MsgHdr>()` for the offset. The two agree with
-        // the entry today, which is why nothing caught the arithmetic -- and
-        // the day a `msghdr` field is added they stop agreeing, the walk
-        // falls one stride short per entry, and each transfer count lands
-        // inside the next entry, on top of its `msg_name` pointer.
-        assert_eq!(MMSGHDR_STRIDE, size_of::<MsgHdr>() + 8);
-        assert_eq!(MMSGHDR_LEN_OFFSET, size_of::<MsgHdr>());
-        // The count has to fit inside the entry it belongs to, which is the
-        // property the arithmetic never stated.
-        assert!(MMSGHDR_LEN_OFFSET + size_of::<u32>() <= MMSGHDR_STRIDE);
-    }
+    // The struct-layout tests of `mmsghdr` moved next to its declaration, in
+    // `crate::narrow::msghdr`: the stride and the count's offset belong to the
+    // ABI table now, and there are two rows of them.
 
     #[test]
     fn the_control_message_numbers_are_the_ones_the_headers_give() {
@@ -2855,11 +2801,13 @@ mod control_and_batch_bounds_tests {
 
     /// The walk the clamp allows stays inside an address.
     ///
-    /// Both batch calls index with `base + i * MMSGHDR_STRIDE`, so the clamp
-    /// and the stride together are what keeps that arithmetic from wrapping.
+    /// Both batch calls index with `base + i * stride`, so the clamp and the
+    /// stride together are what keeps that arithmetic from wrapping. The
+    /// native stride is the larger of the two, so it is the one to check.
     #[test]
     fn the_whole_batch_fits_in_an_address() {
-        assert!(MMSG_MAX.checked_mul(MMSGHDR_STRIDE).is_some());
-        assert_eq!(MMSG_MAX * MMSGHDR_STRIDE, 4096, "one page of entries");
+        let stride = crate::narrow::msghdr::NATIVE_MMSG.stride;
+        assert!(MMSG_MAX.checked_mul(stride).is_some());
+        assert_eq!(MMSG_MAX * stride, 4096, "one page of entries");
     }
 }

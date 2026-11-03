@@ -282,5 +282,73 @@ impl Syscall<'_> {
     }
 }
 
+/// `struct mmsghdr` from `<sys/socket.h>`: one batch entry for
+/// `sendmmsg`/`recvmmsg` --- a plain `msghdr` plus the per-message transfer
+/// count the kernel writes back.
+///
+/// Only its layout is used (the stride and the `msg_len` offset); the
+/// per-entry `msg_hdr` is re-read by the wrapped single-message syscalls
+/// straight from user memory. Both batch calls walk the caller's array by
+/// that stride and write the count at that offset, which is why the two come
+/// from this declaration and not from arithmetic: a `msghdr` that grows a
+/// field would otherwise leave the walk one stride short of the real
+/// `mmsghdr` and put each count inside the NEXT entry, over its `msg_name`
+/// pointer.
+#[repr(C)]
+struct MMsgHdr {
+    msg_hdr: MsgHdr,
+    msg_len: u32,
+    _pad: u32,
+}
+
+/// The stride of a `struct mmsghdr` array and where the count sits in one
+/// entry, for one ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MMsgHdrLayout {
+    /// The distance between two entries.
+    pub stride: usize,
+    /// Where `msg_len` sits inside one. It is an `unsigned int` in both
+    /// ABIs, so only the offset moves and never the width.
+    pub len: usize,
+}
+
+/// A 32-bit `struct mmsghdr`: the 28-byte envelope and then the count.
+///
+/// **Not twice the narrow envelope, and not half the native entry.** The
+/// native one is 56 + 4 rounded up to the structure's own 8-byte alignment,
+/// which is 64; the narrow one is 28 + 4, which is 32 and needs no rounding
+/// because an i386 `msghdr` aligns to 4. So the two strides happen to be 32
+/// and 64 --- a factor of two, like the envelope --- while the count's
+/// offsets are 28 and 56, which are not in that ratio at all. A walk that
+/// halved the native numbers wholesale would put the count four bytes past
+/// the end of each entry, inside the next one's `msg_name`.
+const NARROW_MMSG: MMsgHdrLayout = MMsgHdrLayout {
+    stride: 32,
+    len: 28,
+};
+
+/// The native entry, straight out of the declaration above.
+pub(crate) const NATIVE_MMSG: MMsgHdrLayout = MMsgHdrLayout {
+    stride: size_of::<MMsgHdr>(),
+    len: core::mem::offset_of!(MMsgHdr, msg_len),
+};
+
+/// How `abi` lays out an array of them.
+pub(crate) fn mmsghdr_layout(abi: Abi) -> MMsgHdrLayout {
+    if abi.is_32bit() {
+        NARROW_MMSG
+    } else {
+        NATIVE_MMSG
+    }
+}
+
+impl Syscall<'_> {
+    /// The layout of a `struct mmsghdr` array as the calling process writes
+    /// one.
+    pub(crate) fn mmsghdr_layout(&self) -> MMsgHdrLayout {
+        mmsghdr_layout(self.linux_process().abi())
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -664,3 +664,200 @@ fn a_32_bit_program_reaches_sendmsg_and_recvmsg_through_socketcall() {
     assert_eq!(&got, MSG, "the bytes did not arrive at the other end");
     proc.exit(0);
 }
+
+// ---------------------------------------------------------------------------
+// The batch array's stride
+// ---------------------------------------------------------------------------
+
+/// The stride and the count's offset, and the trap that they are **not** in
+/// the same ratio.
+///
+/// A `struct mmsghdr` is an envelope plus an `unsigned int`. Natively that is
+/// 56 + 4 rounded up to the structure's own 8-byte alignment, which is 64;
+/// narrow it is 28 + 4, which is 32 and needs no rounding at all because an
+/// i386 `msghdr` aligns to 4. So the strides happen to be in a ratio of two,
+/// like the envelope --- and the offsets, 56 and 28, are too.
+///
+/// What is **not** derivable is the stride from the envelope: 2 * 28 is 56,
+/// which is the narrow *offset*, not the narrow stride. A walk that reached
+/// for the obvious arithmetic would step 56 through an array of 32-byte
+/// entries and read every other entry's second half as an envelope.
+#[test]
+fn a_batch_entry_is_an_envelope_and_a_count_and_not_twice_an_envelope() {
+    let n = mmsghdr_layout(Abi::Linux);
+    assert_eq!(n.stride, 64);
+    assert_eq!(n.len, 56, "the count sits right after the envelope");
+    assert_eq!(n.len, msghdr_layout(Abi::Linux).size);
+
+    let w = mmsghdr_layout(Abi::Linux32);
+    assert_eq!(w.stride, 32);
+    assert_eq!(w.len, 28);
+    assert_eq!(w.len, msghdr_layout(Abi::Linux32).size);
+
+    // The count is four bytes in both, so it fits inside the entry in both:
+    // `len + 4 <= stride`. Natively there are four bytes of padding after
+    // it; narrow there are none, and that is the whole difference.
+    assert_eq!(n.len + 4 + 4, n.stride, "padding after the native count");
+    assert_eq!(w.len + 4, w.stride, "no padding after the narrow one");
+
+    // And the trap, written out: the narrow stride is NOT twice the narrow
+    // envelope, which is the number an arithmetic shortcut would reach for.
+    assert_ne!(w.stride, 2 * msghdr_layout(Abi::Linux32).size);
+}
+
+/// Where the second entry of a narrow array starts, and what the native
+/// stride would read instead.
+#[test]
+fn the_native_stride_walks_past_the_second_narrow_entry() {
+    let w = mmsghdr_layout(Abi::Linux32);
+    let n = mmsghdr_layout(Abi::Linux);
+    // Entry 1 of a narrow array starts at 32. With the native stride the
+    // walk looks for it at 64, which is where entry **2** starts --- so a
+    // batch of three has its middle message skipped and its count written
+    // into the array's own tail.
+    assert_eq!(w.stride, 32);
+    assert_eq!(n.stride, 2 * w.stride);
+    assert_eq!(2 * w.stride, n.stride, "entry 2, not entry 1");
+}
+
+/// The i386 numbers of the two batch calls, inside `socketcall`.
+const SYS_SENDMMSG: usize = 20;
+const SYS_RECVMMSG: usize = 19;
+
+/// Where a two-entry narrow `mmsghdr` array goes.
+const MMSG_AT: usize = USER_AT + 0x600;
+/// And the two `iovec`, and the two buffers they name.
+const MIOV_AT: usize = USER_AT + 0x700;
+const MBUF_AT: usize = USER_AT + 0x800;
+
+/// Two bytes to send, one per message, so the two counts written back differ
+/// from each other and from the message length.
+const TWO: [&[u8]; 2] = [b"a", b"bb"];
+
+#[test]
+fn a_32_bit_program_sends_and_receives_a_batch_through_socketcall() {
+    // Two messages in one call, which is the smallest batch that uses the
+    // stride at all: the first entry is at offset 0 whatever the stride is,
+    // so a one-entry batch says nothing.
+    //
+    // With the native stride the second entry is looked for at 64, which in
+    // a 32-bit array is past the end of the two entries written there --- so
+    // the second message's envelope is read out of whatever follows and the
+    // call either answers 1 instead of 2 or faults.
+    let proc = a_process(48_426, Abi::Linux32);
+    let (sent, recvd, counts, got) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut own = Syscall {
+                thread: sys.thread,
+                thread_fn: sys.thread_fn,
+                syscall_entry: sys.syscall_entry,
+            };
+            let (a, b) = a_pair(sys).await;
+
+            // Two entries of 32 bytes: a 28-byte envelope and a four-byte
+            // count, with the count poisoned so that a kernel writing it
+            // anywhere else is caught by what is left behind.
+            let mut vec = [0xaau8; 64];
+            for i in 0..2 {
+                put(MBUF_AT + i * 0x40, TWO[i]);
+                put(
+                    MIOV_AT + i * 8,
+                    &a_narrow_iovec(MBUF_AT + i * 0x40, TWO[i].len()),
+                );
+                let hdr = a_narrow_msghdr(MIOV_AT + i * 8, 1, 0, 0);
+                vec[i * 32..i * 32 + 28].copy_from_slice(&hdr);
+            }
+            put(MMSG_AT, &vec);
+
+            let mut block = [0u8; 16];
+            block[..4].copy_from_slice(&(a as u32).to_ne_bytes());
+            block[4..8].copy_from_slice(&(MMSG_AT as u32).to_ne_bytes());
+            block[8..12].copy_from_slice(&2u32.to_ne_bytes());
+            put(SARGS_AT, &block);
+            let sent = own
+                .compat32_syscall(I386_SOCKETCALL, [SYS_SENDMMSG, SARGS_AT, 0, 0, 0, 0])
+                .await;
+            // The two counts the kernel wrote, at offsets 28 and 60.
+            let counts = [
+                u32::from_ne_bytes(get(MMSG_AT + 28, 4).try_into().unwrap()),
+                u32::from_ne_bytes(get(MMSG_AT + 32 + 28, 4).try_into().unwrap()),
+            ];
+
+            // And back, into two destinations of their own.
+            let mut vec = [0xaau8; 64];
+            for i in 0..2 {
+                put(MBUF_AT + 0x100 + i * 0x40, &[0u8; 8]);
+                put(
+                    MIOV_AT + 0x40 + i * 8,
+                    &a_narrow_iovec(MBUF_AT + 0x100 + i * 0x40, 8),
+                );
+                let hdr = a_narrow_msghdr(MIOV_AT + 0x40 + i * 8, 1, 0, 0);
+                vec[i * 32..i * 32 + 28].copy_from_slice(&hdr);
+            }
+            put(MMSG_AT, &vec);
+            block[..4].copy_from_slice(&(b as u32).to_ne_bytes());
+            put(SARGS_AT, &block);
+            let recvd = own
+                .compat32_syscall(I386_SOCKETCALL, [SYS_RECVMMSG, SARGS_AT, 0, 0, 0, 0])
+                .await;
+            let got = [get(MBUF_AT + 0x100, 1), get(MBUF_AT + 0x100 + 0x40, 2)];
+            (sent, recvd, counts, got)
+        })
+    });
+
+    assert_eq!(
+        sent, 2,
+        "socketcall(20) did not walk two entries of a 32-byte stride"
+    );
+    assert_eq!(
+        counts,
+        [1, 2],
+        "the per-message counts were not written at offset 28 of each entry"
+    );
+    // A stream socket coalesces, so the two messages arrive as one run of
+    // bytes; what the batch receive has to show is that it walked two
+    // entries and wrote two counts, which `recvd` says.
+    assert!(
+        recvd >= 1,
+        "socketcall(19) did not receive the batch: {}",
+        recvd
+    );
+    assert_eq!(&got[0], b"a", "the first message's byte did not arrive");
+    proc.exit(0);
+}
+
+use core::mem::{align_of, offset_of};
+#[test]
+fn the_batch_entry_is_the_mmsghdr_of_the_uapi() {
+    // `struct mmsghdr { struct msghdr msg_hdr; unsigned int msg_len; }`,
+    // which the compiler pads to 8 because `msghdr` holds pointers. Both
+    // batch calls walk the user's array by this size and write the count
+    // at this offset, so these two numbers ARE where `sendmmsg(2)` and
+    // `recvmmsg(2)` reach into user memory.
+    assert_eq!(size_of::<MMsgHdr>(), 64);
+    assert_eq!(align_of::<MMsgHdr>(), 8);
+    assert_eq!(offset_of!(MMsgHdr, msg_hdr), 0);
+    assert_eq!(offset_of!(MMsgHdr, msg_len), 56);
+    assert_eq!(offset_of!(MMsgHdr, _pad), 60);
+    // And the one `msghdr` inside it, whose size is what the entry is
+    // built around: a field added to it moves `msg_len`, and the two
+    // constants below are the only reason the walk follows.
+    assert_eq!(size_of::<MsgHdr>(), 56);
+    assert_eq!(NATIVE_MMSG.stride, 64);
+    assert_eq!(NATIVE_MMSG.len, 56);
+}
+
+#[test]
+fn the_stride_is_the_whole_entry_and_not_the_header_plus_a_guess() {
+    // What this replaces, written out: `size_of::<MsgHdr>() + 8` for the
+    // stride and `size_of::<MsgHdr>()` for the offset. The two agree with
+    // the entry today, which is why nothing caught the arithmetic -- and
+    // the day a `msghdr` field is added they stop agreeing, the walk
+    // falls one stride short per entry, and each transfer count lands
+    // inside the next entry, on top of its `msg_name` pointer.
+    assert_eq!(NATIVE_MMSG.stride, size_of::<MsgHdr>() + 8);
+    assert_eq!(NATIVE_MMSG.len, size_of::<MsgHdr>());
+    // The count has to fit inside the entry it belongs to, which is the
+    // property the arithmetic never stated.
+    assert!(NATIVE_MMSG.len + size_of::<u32>() <= NATIVE_MMSG.stride);
+}
