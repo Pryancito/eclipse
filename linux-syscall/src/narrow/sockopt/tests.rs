@@ -437,3 +437,72 @@ fn a_32_bit_program_reaches_both_through_socketcall() {
     assert_eq!(&buf[..], &narrow_tv(5, 500_000));
     proc.exit(0);
 }
+
+#[test]
+fn a_negative_optlen_through_socketcall_is_refused() {
+    // Copilot's finding on this batch, and it is right. `optlen` is an
+    // `int`, and a 32-bit caller's `socketcall` block carries it as a word:
+    // `0xffffffff` is -1 to the program and arrives here zero-extended as
+    // four billion. Four billion is more than eight, so the widening's lower
+    // bound was satisfied, it read the eight bytes it needed, ignored the
+    // rest of `optlen` and the call SUCCEEDED --- changing a timeout on a
+    // length `__sys_setsockopt` refuses outright.
+    //
+    // Through `socketcall`, because that is the only door that can carry the
+    // value: a native caller passes `optlen` in a register, where -1 is
+    // `usize::MAX` and not `0xffffffff`.
+    let proc = a_process(48_436, Abi::Linux32);
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let fd = a_socket(sys, AF_INET, A_DGRAM).await;
+            put(VAL_AT, &narrow_tv(5, 500_000));
+            put_sargs(&[
+                fd as u32,
+                SOL_SOCKET as u32,
+                RCVTIMEO as u32,
+                VAL_AT as u32,
+                0xffff_ffff,
+            ]);
+            own(sys)
+                .compat32_syscall(I386_SOCKETCALL, [CALL_SETSOCKOPT, SARGS_AT, 0, 0, 0, 0])
+                .await
+        })
+    });
+    assert_eq!(
+        got, EINVAL,
+        "a negative optlen set a timeout: the length the caller passed was \
+         never looked at past the eight bytes the conversion needed"
+    );
+    proc.exit(0);
+}
+
+#[test]
+fn the_largest_optlen_an_int_can_hold_is_not_refused() {
+    // The other side of the bound, so that the check is a check on the sign
+    // and not a ceiling pulled out of the air: `i32::MAX` is a positive
+    // length, and `__sys_setsockopt` takes it. It fails further in, on the
+    // buffer, which is the native path's business and not this one's --- what
+    // matters here is that it is not EINVAL from the length.
+    let proc = a_process(48_437, Abi::Linux32);
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let fd = a_socket(sys, AF_INET, A_DGRAM).await;
+            put(VAL_AT, &narrow_tv(5, 500_000));
+            put_sargs(&[
+                fd as u32,
+                SOL_SOCKET as u32,
+                RCVTIMEO as u32,
+                VAL_AT as u32,
+                i32::MAX as u32,
+            ]);
+            own(sys)
+                .compat32_syscall(I386_SOCKETCALL, [CALL_SETSOCKOPT, SARGS_AT, 0, 0, 0, 0])
+                .await
+        })
+    });
+    assert_eq!(
+        got, 0,
+        "i32::MAX is a positive length, and the eight bytes it covers are there"
+    );
+    proc.exit(0);
+}
