@@ -1,7 +1,7 @@
 //! The toolbar drawn into a wl_shm buffer. The page never paints this strip:
 //! it is a subsurface of its own, so Servo's GL window starts below it.
 
-use embedded_graphics::mono_font::ascii::FONT_6X10;
+use embedded_graphics::mono_font::iso_8859_1::FONT_6X10;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::*;

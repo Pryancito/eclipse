@@ -125,6 +125,11 @@ vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.
 El cursor sigue a la página (mano en enlaces, I en texto, redimensionar…) y
 al cromo (mano en botones y pestañas, I en la barra) vía `wp_cursor_shape_v1`;
 sin ese protocolo queda el del compositor.
+Las teclas muertas (´ + a → á, ¨ + u → ü, ~ + n → ñ…) pasan por xkb compose
+con la tabla de la locale (`LC_ALL`/`LC_CTYPE`/`LANG`); si la imagen no trae
+`/usr/share/X11/locale`, hay una tabla mínima integrada para los acentos
+latinos. El cromo dibuja Latin-1 (ISO 8859-1), así que «Nueva pestaña» y las
+URL con tildes se ven bien.
 El portapapeles es el del sistema: `arboard` sobre wlr/ext data-control
 (labwc), con X11 y un texto en memoria como respaldo. Lo usan los campos de
 la página, `navigator.clipboard` y la barra.

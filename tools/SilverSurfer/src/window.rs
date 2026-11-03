@@ -49,6 +49,7 @@ use xkbcommon::xkb::{self, Keymap, State as XkbState};
 use crate::bookmarks;
 use crate::chrome::{self, Hit, View};
 use crate::clipboard;
+use crate::compose::{Composer, Outcome};
 use crate::downloads;
 use crate::engine::{self, Session, Waker};
 use crate::files::{self, PickRequest};
@@ -125,6 +126,8 @@ struct LiveBuf {
 struct Xkb {
     _keymap: Keymap,
     state: XkbState,
+    /// Teclas muertas (´ + a → á). `None` si no hay tabla de composición.
+    composer: Option<Composer>,
 }
 
 pub struct App {
@@ -1181,6 +1184,9 @@ impl App {
         self.held_at = None;
         self.repeated_at = None;
         self.swallowed = None;
+        if let Some(composer) = self.xkb.as_mut().and_then(|x| x.composer.as_mut()) {
+            composer.reset();
+        }
     }
 
     fn on_key(&mut self, evdev: u32, down: bool) {
@@ -1208,6 +1214,20 @@ impl App {
         if self.handle_shortcut(evdev) {
             self.swallowed = Some(evdev);
             return;
+        }
+        if !is_modifier(evdev) && !self.ctrl {
+            match self.compose_key(evdev) {
+                Outcome::Pass => {}
+                Outcome::Swallow => {
+                    self.swallowed = Some(evdev);
+                    return;
+                }
+                Outcome::Text(text) => {
+                    self.swallowed = Some(evdev);
+                    self.type_text(evdev, text);
+                    return;
+                }
+            }
         }
         if !self.loc_focused && self.ctrl && !self.alt {
             let action = match evdev {
@@ -1631,6 +1651,39 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Pasa la tecla por la tabla de composición (teclas muertas).
+    fn compose_key(&mut self, evdev: u32) -> Outcome {
+        let Some(xkb) = self.xkb.as_mut() else {
+            return Outcome::Pass;
+        };
+        let sym = xkb.state.key_get_one_sym(xkb::Keycode::new(evdev + 8));
+        match xkb.composer.as_mut() {
+            Some(composer) => composer.feed(sym),
+            None => Outcome::Pass,
+        }
+    }
+
+    /// Escribe el resultado de una secuencia compuesta en la barra o en la
+    /// página (como pulsar y soltar una tecla que diera ese texto).
+    fn type_text(&mut self, evdev: u32, text: String) {
+        if self.loc_focused {
+            insert_chars(&mut self.loc_text, &mut self.loc_cursor, &text);
+            self.need_paint = true;
+            return;
+        }
+        let Some(session) = &self.session else {
+            return;
+        };
+        let code = evdev_code(evdev);
+        let mods = self.modifiers();
+        session
+            .shell
+            .key(true, Key::Character(text.clone().into()), code, mods, false);
+        session
+            .shell
+            .key(false, Key::Character(text.into()), code, mods, false);
     }
 
     fn send_key(&self, evdev: u32, down: bool, repeat: bool) {
@@ -2215,6 +2268,7 @@ fn keymap_from_fd(fd: File, size: u32) -> Option<Xkb> {
     Some(Xkb {
         _keymap: keymap,
         state,
+        composer: Composer::new(),
     })
 }
 

@@ -7,6 +7,7 @@
 pub mod about;
 pub mod bookmarks;
 pub mod chrome;
+pub mod compose;
 pub mod downloads;
 pub mod files;
 pub mod filter;
