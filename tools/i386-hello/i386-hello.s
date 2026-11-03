@@ -2563,6 +2563,92 @@ statx_poison:
 	testl	%eax, %eax
 	jnz	bad_ds_rmid
 
+	/* Step 79: the two TABLE commands of shared memory, which are the
+	 * last two shapes of `ipc(117)`.
+	 *
+	 * `IPC_INFO` carries a `struct shminfo64`, which is nine
+	 * `__kernel_ulong_t` and nothing else: 36 bytes here against 72.
+	 * `SHM_INFO` carries a `struct shm_info`, which is NOT a pure run ---
+	 * it leads with an `int used_ids`, and the native layout pads after
+	 * it to 8-align the counts, so `shm_tot` is at 4 here and at 8
+	 * there. 24 bytes against 48.
+	 *
+	 * Neither takes an id: that is what a table command is. */
+
+	movl	$117, %eax
+	movl	$23, %ebx
+	xorl	%ecx, %ecx
+	movl	$4096, %edx
+	movl	$0600, %esi
+	orl	$01000, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_shm_table
+	movl	%eax, shmid
+
+	call	poison_dsbuf
+	/* shmctl(0, IPC_INFO|__IPC_64, dsbuf) --- the id is ignored. */
+	movl	$117, %eax
+	movl	$24, %ebx
+	xorl	%ecx, %ecx
+	movl	$3, %edx
+	orl	$0x100, %edx
+	xorl	%esi, %esi
+	movl	$dsbuf, %edi
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_shm_table
+	/* `shmmin` is the SECOND word, so at 4 here and at 8 there, and it is
+	 * 1 in the header rather than a sysctl, so it is a number this step
+	 * can name. */
+	cmpl	$1, dsbuf + 4
+	jne	bad_shm_table
+	/* `shmmax` is not zero, so the structure is really filled. */
+	cmpl	$0, dsbuf + 0
+	je	bad_shm_table
+	/* And nothing past 36, where the native 72 would reach. */
+	cmpl	$0xaaaaaaaa, dsbuf + 36
+	jne	bad_shm_table
+	cmpl	$0xaaaaaaaa, dsbuf + 68
+	jne	bad_shm_table
+
+	call	poison_dsbuf
+	/* shmctl(0, SHM_INFO|__IPC_64, dsbuf) */
+	movl	$117, %eax
+	movl	$24, %ebx
+	xorl	%ecx, %ecx
+	movl	$14, %edx
+	orl	$0x100, %edx
+	xorl	%esi, %esi
+	movl	$dsbuf, %edi
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_shm_table
+	/* `used_ids` at 0: there is at least the segment above. */
+	cmpl	$0, dsbuf + 0
+	jle	bad_shm_table
+	/* `shm_tot` at 4. Natively that offset is the PADDING after the
+	 * `int`, so a native write leaves it zero and this is the check that
+	 * says which layout was used. */
+	cmpl	$0, dsbuf + 4
+	je	bad_shm_table
+	/* Nothing past 24, where the native 48 would reach. */
+	cmpl	$0xaaaaaaaa, dsbuf + 24
+	jne	bad_shm_table
+	cmpl	$0xaaaaaaaa, dsbuf + 44
+	jne	bad_shm_table
+
+	movl	$117, %eax
+	movl	$24, %ebx
+	movl	shmid, %ecx
+	movl	$0x100, %edx
+	xorl	%esi, %esi
+	xorl	%edi, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_ds_rmid
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -2897,6 +2983,9 @@ bad_ds_msg:
 	jmp	die
 bad_ds_rmid:
 	movl	$102, %ebx
+	jmp	die
+bad_shm_table:
+	movl	$103, %ebx
 	jmp	die
 
 	/* 0xaa over the 128 bytes of `dsbuf`, so that every byte the kernel

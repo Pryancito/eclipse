@@ -123,6 +123,11 @@ fn the_shmid_ds_puts_segsz_before_the_times() {
 
 /// A time whose seconds do not fit in 32 bits survives the pair, in both
 /// directions. This is the whole reason the pair exists.
+///
+/// Only on a 64-bit host, and said so rather than worked around: the
+/// constant below does not fit in a 32-bit `usize`, and neither does the
+/// `otime` of the native structure, so there would be nothing to measure.
+#[cfg(target_pointer_width = "64")]
 #[test]
 fn a_time_past_2106_survives_the_low_high_pair() {
     // 2106-02-07 is where an unsigned 32-bit count of seconds ends. One
@@ -201,4 +206,73 @@ fn the_reserved_words_go_out_as_zeroes() {
     assert_eq!(narrow.perm.__unused1, 0);
     assert_eq!(narrow.perm.__unused2, 0);
     assert_eq!(narrow.segsz, 4096);
+}
+
+/// `struct shminfo64` under `__i386__`: nine `__kernel_ulong_t` and nothing
+/// else, which is why it needs no layout of its own. 36 bytes against 72.
+#[test]
+fn the_shminfo_is_nine_words_and_so_needs_no_layout() {
+    use super::super::Narrow;
+    assert_eq!(<ShmInfo64 as Narrow>::WORDS, 9);
+    assert_eq!(size_of::<ShmInfo64>(), 9 * 8);
+    // The claim the trait makes, stated as a number: nine words of eight
+    // bytes IS the native structure, with no padding anywhere in it.
+    assert_eq!(size_of::<ShmInfo64>(), <ShmInfo64 as Narrow>::WORDS * 8);
+
+    // And the round trip through the words keeps every field, including the
+    // four reserved ones.
+    let mut info = ShmInfo64::linux_defaults();
+    info.unused = [1, 2, 3, 4];
+    let mut words = [0u64; 18];
+    info.to_words(&mut words[..9]);
+    assert_eq!(words[0], info.shmmax as u64);
+    assert_eq!(words[4], info.shmall as u64);
+    assert_eq!(&words[5..9], &[1, 2, 3, 4]);
+    let back = <ShmInfo64 as Narrow>::from_words(&words[..9]);
+    assert_eq!(back.shmmax, info.shmmax);
+    assert_eq!(back.shmmni, info.shmmni);
+    assert_eq!(back.unused, [1, 2, 3, 4]);
+}
+
+/// `struct shm_info` under `__i386__`: 24 bytes against 48, and the reason
+/// it is not nine words is the **padding** the native layout puts after its
+/// leading `int`.
+#[test]
+fn the_shm_info_is_not_a_pure_run_because_of_the_int() {
+    assert_eq!(size_of::<ShmInfo32>(), 24);
+    assert_eq!(align_of::<ShmInfo32>(), 4);
+    assert_eq!(size_of::<ShmInfo>(), 48);
+
+    assert_eq!(offset_of!(ShmInfo32, used_ids), 0);
+    assert_eq!(offset_of!(ShmInfo32, shm_tot), 4);
+    assert_eq!(offset_of!(ShmInfo32, shm_rss), 8);
+    assert_eq!(offset_of!(ShmInfo32, shm_swp), 12);
+    assert_eq!(offset_of!(ShmInfo32, swap_attempts), 16);
+    assert_eq!(offset_of!(ShmInfo32, swap_successes), 20);
+
+    // The padding, which is the whole reason this one is not six words: the
+    // `int` is at 0 in both, and natively `shm_tot` is at 8 and not 4.
+    assert_eq!(offset_of!(ShmInfo, used_ids), 0);
+    assert_eq!(offset_of!(ShmInfo, shm_tot), 8);
+    // Six words of eight bytes would be 48, which this structure is --- so
+    // the size alone does NOT catch the padding. The offset does.
+    assert_eq!(6 * 8, size_of::<ShmInfo>());
+}
+
+/// What the conversion keeps: the counts, and the `int` as an `int`.
+#[test]
+fn the_shm_info_conversion_keeps_the_counts() {
+    let info = ShmInfo {
+        used_ids: 3,
+        shm_tot: 17,
+        shm_rss: 17,
+        shm_swp: 0,
+        swap_attempts: 0,
+        swap_successes: 0,
+    };
+    let narrow: ShmInfo32 = info.into();
+    assert_eq!(narrow.used_ids, 3);
+    assert_eq!(narrow.shm_tot, 17);
+    assert_eq!(narrow.shm_rss, 17);
+    assert_eq!(narrow.swap_successes, 0);
 }

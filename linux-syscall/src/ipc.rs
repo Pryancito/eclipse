@@ -653,7 +653,10 @@ impl Syscall<'_> {
             IPC_SET => {
                 let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
                 // `msg_qbytes` is the one field read back in, and it is at
-                // offset 68 to a 32-bit caller against 96 here.
+                // offset 68 to a 32-bit caller against 88 here --- which is
+                // also the whole LENGTH of the narrow structure, so reading
+                // at the native offset reads past the end of the caller's
+                // buffer.
                 let ds = ipcbuf::get_msqid_ds(self.narrow_abi(), buf)?;
                 queue.set(&ds, self.linux_process().euid())?;
                 Ok(0)
@@ -891,18 +894,28 @@ impl Syscall<'_> {
                 let max_index = linux_object::ipc::shm_max_index();
                 match cmd {
                     ShmctlCmds::IPC_INFO => {
+                        // `shminfo64` is a pure run of nine words, so the
+                        // word-halving of [`crate::narrow`] serves it as it
+                        // stands. `shm_info` next door is not, and does not.
                         let mut buffer: UserOutPtr<ShmInfo64> = buffer.into();
-                        buffer.write(ShmInfo64::linux_defaults())?;
+                        crate::narrow::narrow_put(
+                            self.narrow_abi(),
+                            &mut buffer,
+                            ShmInfo64::linux_defaults(),
+                        )?;
                     }
                     _ => {
                         let (used_ids, shm_tot, shm_rss) = linux_object::ipc::shm_totals();
-                        let mut buffer: UserOutPtr<ShmInfo> = buffer.into();
-                        buffer.write(ShmInfo {
-                            used_ids: used_ids as i32,
-                            shm_tot,
-                            shm_rss,
-                            ..ShmInfo::default()
-                        })?;
+                        ipcbuf::put_shm_info(
+                            self.narrow_abi(),
+                            buffer,
+                            ShmInfo {
+                                used_ids: used_ids as i32,
+                                shm_tot,
+                                shm_rss,
+                                ..ShmInfo::default()
+                            },
+                        )?;
                     }
                 }
                 return Ok(ipc_info_result(max_index));
@@ -1448,46 +1461,46 @@ pub fn plan_semop(values: &[isize], ops: &[SemBuf]) -> Result<SemopPlan, LxError
 /// `struct shm_info` for `shmctl(SHM_INFO)`: 48 bytes on 64-bit. It used to
 /// stop at `shm_swp`, 40, so the last two fields were never written.
 #[repr(C)]
-#[derive(Default)]
-struct ShmInfo {
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ShmInfo {
     /// currently existing segments
-    used_ids: i32,
+    pub(crate) used_ids: i32,
     /// Total number of shared memory pages
-    shm_tot: usize,
+    pub(crate) shm_tot: usize,
     /// of resident shared memory pages
-    shm_rss: usize,
+    pub(crate) shm_rss: usize,
     /// of swapped shared memory pages
-    shm_swp: usize,
+    pub(crate) shm_swp: usize,
     /// Unused since Linux 2.4; written as zero.
-    swap_attempts: usize,
+    pub(crate) swap_attempts: usize,
     /// Unused since Linux 2.4; written as zero.
-    swap_successes: usize,
+    pub(crate) swap_successes: usize,
 }
 
 static_assertions::const_assert_eq!(48, core::mem::size_of::<ShmInfo>());
 
 /// `struct shminfo64` for `shmctl(IPC_INFO)`: the system's limits.
 #[repr(C)]
-#[derive(Default)]
-struct ShmInfo64 {
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ShmInfo64 {
     /// Maximum segment size (`SHMMAX`).
-    shmmax: usize,
+    pub(crate) shmmax: usize,
     /// Minimum segment size (`SHMMIN`).
-    shmmin: usize,
+    pub(crate) shmmin: usize,
     /// Maximum number of segments (`SHMMNI`).
-    shmmni: usize,
+    pub(crate) shmmni: usize,
     /// Maximum segments per process (`SHMSEG`).
-    shmseg: usize,
+    pub(crate) shmseg: usize,
     /// Maximum pages of shared memory system-wide (`SHMALL`).
-    shmall: usize,
+    pub(crate) shmall: usize,
     /// Padding, zero.
-    unused: [usize; 4],
+    pub(crate) unused: [usize; 4],
 }
 
 impl ShmInfo64 {
     /// `include/uapi/linux/shm.h` defaults: `SHMMAX` and `SHMALL` are
     /// `ULONG_MAX - (1UL << 24)`, `SHMMIN` 1, `SHMMNI` and `SHMSEG` 4096.
-    fn linux_defaults() -> Self {
+    pub(crate) fn linux_defaults() -> Self {
         ShmInfo64 {
             shmmax: linux_object::ipc::SHMMAX,
             shmmin: linux_object::ipc::SHMMIN,

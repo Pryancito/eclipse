@@ -40,6 +40,18 @@
 //! module replaces, and the per-family refusal lists in
 //! [`crate::compat32::ipc`] shrink to what is still missing.
 //!
+//! ## What `abi32` means here
+//!
+//! The switch below is the `abi32` of the rest of [`crate::narrow`], which
+//! is `Abi::is_32bit()` of the calling process, while everything in this
+//! module is specifically **i386**: little-endian, and the `_high` half
+//! after its low half. Those agree because `Abi` has exactly one 32-bit
+//! variant and [`crate::compat32`] is x86_64-only --- compatibility mode is
+//! an x86 thing. A second 32-bit personality with another layout would need
+//! the choice made on the ABI and not on its width, and the place for that
+//! is `Abi` itself, not here: the whole `narrow` family halves
+//! little-endian words and would need the same.
+//!
 //! ## How the layout is checked
 //!
 //! The sizes and the offset of every field are asserted against Linux's own
@@ -48,6 +60,7 @@
 //! it.
 
 use super::{wide_get_unaligned, wide_put_unaligned};
+use crate::ipc::{ShmInfo, ShmInfo64};
 use kernel_hal::user::{UserInPtr, UserOutPtr};
 use linux_object::error::LxResult;
 use linux_object::ipc::{IpcPerm, MsqidDs, SemidDs, ShmidDs};
@@ -117,13 +130,21 @@ impl From<IpcPerm32> for IpcPerm {
 
 /// A time as the 32-bit layouts carry it: the low half, then the `_high`
 /// half. Little-endian, so the pair is the 64-bit value.
+///
+/// The arithmetic is in `u64` and not in `usize` deliberately: a `>> 32` of
+/// a `usize` is undefined on a 32-bit target, and while nothing builds this
+/// crate for one today (the three architectures are all 64-bit), the shift
+/// is the kind of thing that is wrong long before anyone finds out. Pointed
+/// out by Copilot on the #2409.
 fn split(t: usize) -> (u32, u32) {
+    let t = t as u64;
     (t as u32, (t >> 32) as u32)
 }
 
-/// [`split`] the other way.
+/// [`split`] the other way. On a 32-bit host the join would truncate, which
+/// is the honest answer there: the native structures carry a `usize`.
 fn join(lo: u32, hi: u32) -> usize {
-    lo as usize | ((hi as usize) << 32)
+    (lo as u64 | ((hi as u64) << 32)) as usize
 }
 
 /// `struct semid64_ds` as i386 lays it out: 64 bytes, against 104 here.
@@ -359,6 +380,98 @@ macro_rules! ds_pair {
             wide_get_unaligned(false, &ptr)
         }
     };
+}
+
+/// `struct shminfo64`, which IS a pure run of words and so needs no layout
+/// of its own: nine `__kernel_ulong_t` and nothing else, four bytes each
+/// there and eight here. 36 bytes against 72.
+///
+/// This is the one structure of the family that the word-halving of
+/// [`super::Narrow`] serves as it stands, and saying so is the point: the
+/// trait's contract is that the structure has no padding and no field that
+/// is not a word in EITHER ABI, and `shminfo64` is the only one here that
+/// can make that claim.
+impl super::Narrow for ShmInfo64 {
+    const WORDS: usize = 9;
+
+    fn to_words(self, out: &mut [u64]) {
+        for (slot, field) in out[0..9].iter_mut().zip([
+            self.shmmax,
+            self.shmmin,
+            self.shmmni,
+            self.shmseg,
+            self.shmall,
+            self.unused[0],
+            self.unused[1],
+            self.unused[2],
+            self.unused[3],
+        ]) {
+            *slot = field as u64;
+        }
+    }
+
+    fn from_words(words: &[u64]) -> Self {
+        let at = |i: usize| words[i] as usize;
+        Self {
+            shmmax: at(0),
+            shmmin: at(1),
+            shmmni: at(2),
+            shmseg: at(3),
+            shmall: at(4),
+            unused: [at(5), at(6), at(7), at(8)],
+        }
+    }
+}
+
+/// `struct shm_info` as i386 lays it out: 24 bytes against 48, and **not** a
+/// pure run of words.
+///
+/// It leads with an `int used_ids` and then five `__kernel_ulong_t`. At this
+/// width the `int` and a word are both four bytes, so the whole thing is six
+/// four-byte fields; natively the `int` is followed by **four bytes of
+/// padding** to 8-align `shm_tot`. So the native image is not nine words and
+/// [`super::Narrow`] cannot honestly be claimed for it --- the contract is
+/// about both ABIs --- which is why this one gets a layout and `shminfo64`
+/// above does not.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ShmInfo32 {
+    /// `used_ids` (offset 0): an `int` at both widths.
+    used_ids: i32,
+    /// `shm_tot` (offset 4). Natively at 8, because of the padding.
+    shm_tot: u32,
+    /// `shm_rss` (offset 8).
+    shm_rss: u32,
+    /// `shm_swp` (offset 12).
+    shm_swp: u32,
+    /// `swap_attempts` (offset 16): unused since Linux 2.4.
+    swap_attempts: u32,
+    /// `swap_successes` (offset 20).
+    swap_successes: u32,
+}
+
+impl From<ShmInfo> for ShmInfo32 {
+    fn from(i: ShmInfo) -> Self {
+        Self {
+            used_ids: i.used_ids,
+            shm_tot: i.shm_tot as u32,
+            shm_rss: i.shm_rss as u32,
+            shm_swp: i.shm_swp as u32,
+            swap_attempts: i.swap_attempts as u32,
+            swap_successes: i.swap_successes as u32,
+        }
+    }
+}
+
+/// Write a `struct shm_info` at the caller's width. Out only: nothing reads
+/// one in.
+pub(crate) fn put_shm_info(abi32: bool, addr: usize, info: ShmInfo) -> LxResult<()> {
+    if abi32 {
+        let mut ptr: UserOutPtr<ShmInfo32> = addr.into();
+        return wide_put_unaligned(true, &mut ptr, info.into());
+    }
+    let mut ptr: UserOutPtr<ShmInfo> = addr.into();
+    wide_put_unaligned(false, &mut ptr, info)
 }
 
 ds_pair!(put_semid_ds, get_semid_ds, SemidDs, SemidDs32, "semid64_ds");

@@ -342,14 +342,14 @@ fn semctl_takes_its_argument_from_the_word_the_pointer_holds() {
 }
 
 #[test]
-fn the_shapes_that_are_not_written_yet_say_so_rather_than_guessing() {
-    // The refusals that are left, each for its own reason, pinned so that
-    // "not implemented" stays visible instead of becoming a silent wrong
-    // layout or a wrong wait. The `*id64_ds` ones are gone from here
-    // because they are converted now; see
-    // `the_semid_ds_comes_back_at_sixty_four_bytes_through_the_multiplexer`.
+fn what_is_still_refused_says_so_by_name_rather_than_guessing() {
+    // The refusals that are left, and NONE of them is a layout any more:
+    // every structure of `ipc(117)` is converted. What is left is a call
+    // this kernel does not have at either width, an interface that never
+    // shipped, and a sub-call number that does not exist --- each said by
+    // name rather than silently becoming something else.
     let proc = a_process(48_465, Abi::Linux32);
-    let (shminfo, shm_info, rmid, timedop, shmat_v1, nonsense) = on_a_thread(&proc, |sys| {
+    let (rmid, timedop, shmat_v1, nonsense) = on_a_thread(&proc, |sys| {
         Box::pin(async move {
             let mut sys = as_mut(sys);
             let id = sys
@@ -357,25 +357,10 @@ fn the_shapes_that_are_not_written_yet_say_so_rather_than_guessing() {
                 .await;
             assert!(id >= 0);
             let id = id as usize;
-            // The two left: shared memory's `IPC_INFO` carries a
-            // `struct shminfo64` and its `SHM_INFO` a `struct shm_info`,
-            // both runs of `__kernel_ulong_t`, neither converted yet.
-            // Writing the native one would overwrite the tail of the
-            // caller's buffer, so: ENOSYS.
-            //
-            // `| IPC_64` is what an i386 glibc actually sends, on EVERY
-            // command, which is the whole reason `ctl_cmd` has to take it
-            // off again, and these two carry it here so the refusal is shown
-            // to survive it.
-            let shminfo = sys
-                .compat32_syscall(IPC, [24, 0, 3 | 0x100, 0, BUF, 0])
-                .await;
-            let shm_info = sys
-                .compat32_syscall(IPC, [24, 0, 14 | 0x100, 0, BUF, 0])
-                .await;
             // IPC_RMID carries nothing, so it goes through -- and it is the
             // only command in the family with no other reason to fail, which
-            // is how the `IPC_64` bit left on showed up at all.
+            // is how the `IPC_64` bit left on showed up at all. `| IPC_64`
+            // is what an i386 glibc actually sends, on EVERY command.
             let rmid = sys.compat32_syscall(IPC, [3, id, 0, 0x100, BUF, 0]).await;
             // No `semtimedop` at either width yet. Said by name rather than
             // silently becoming an untimed `semop`, which would park for
@@ -386,17 +371,9 @@ fn the_shapes_that_are_not_written_yet_say_so_rather_than_guessing() {
                 .compat32_syscall(IPC, [21 | (1 << 16), 1, 0, OUT, 0, 0])
                 .await;
             let nonsense = sys.compat32_syscall(IPC, [99, 0, 0, 0, 0, 0]).await;
-            (shminfo, shm_info, rmid, timedop, shmat_v1, nonsense)
+            (rmid, timedop, shmat_v1, nonsense)
         })
     });
-    assert_eq!(
-        shminfo, ENOSYS,
-        "shmctl IPC_INFO must not write the native shminfo64"
-    );
-    assert_eq!(
-        shm_info, ENOSYS,
-        "shmctl SHM_INFO must not write the native shm_info"
-    );
     assert_eq!(rmid, 0, "IPC_RMID carries no structure and must go through");
     assert_eq!(timedop, ENOSYS, "semtimedop");
     assert_eq!(shmat_v1, EINVAL, "shmat version 1");
@@ -644,6 +621,81 @@ fn every_one_of_the_six_copies_takes_a_four_aligned_buffer() {
     assert_eq!(
         got.1, 0o640,
         "the last IPC_STAT did not report the mode set"
+    );
+    proc.exit(0);
+}
+
+/// The two table commands of shared memory, which were the last two shapes
+/// of `ipc(117)` left: `IPC_INFO` carries a `struct shminfo64`, 36 bytes
+/// here against 72, and `SHM_INFO` a `struct shm_info`, 24 against 48.
+///
+/// Both at a 4-aligned address, which is what these two are: neither has a
+/// member wider than an `unsigned long` at this width.
+#[test]
+fn the_two_table_commands_of_shared_memory_come_back_narrow() {
+    /// 4 mod 8, clear of `BUF`.
+    const AT_ODD: usize = USER_AT + 0x404;
+    let proc = a_process(48_470, Abi::Linux32);
+    let (info_rc, stat_rc, info, stat) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut sys = as_mut(sys);
+            // One segment of this process's own, so `used_ids` is not zero
+            // and the counts are a number and not an absence.
+            let shm = sys
+                .compat32_syscall(
+                    IPC,
+                    [23, 0x4847_0001, PAGE_SIZE, IPC_CREAT | OWNER_RW, 0, 0],
+                )
+                .await;
+            assert!(shm >= 0, "shmget through 117: {}", shm);
+            put(AT_ODD, &[0xAAu8; 96]);
+            // `IPC_INFO` is 3, and the first argument is ignored: that is
+            // the point of a TABLE command, and looking an id up first made
+            // `ipcs -m` say the kernel had no shared memory at all.
+            let info_rc = sys
+                .compat32_syscall(IPC, [24, 0, 3 | 0x100, 0, AT_ODD, 0])
+                .await;
+            let info = get(AT_ODD, 96);
+            put(AT_ODD, &[0xAAu8; 96]);
+            let stat_rc = sys
+                .compat32_syscall(IPC, [24, 0, 14 | 0x100, 0, AT_ODD, 0])
+                .await;
+            (info_rc, stat_rc, info, get(AT_ODD, 96))
+        })
+    });
+    assert_eq!(AT_ODD % 8, 4, "this test is about a 4-aligned address");
+    assert!(info_rc >= 0, "shmctl IPC_INFO through 117: {}", info_rc);
+    // `shmmni` is the third word, so at 8 here and at 16 natively.
+    assert_eq!(
+        word(&info, 8),
+        4096,
+        "shmmni is not the third FOUR-byte word: {:x?}",
+        &info[..36]
+    );
+    assert!(
+        info[36..].iter().all(|&b| b == 0xAA),
+        "IPC_INFO wrote past the end of a 36-byte shminfo64: {:x?}",
+        &info[36..72]
+    );
+    assert!(stat_rc >= 0, "shmctl SHM_INFO through 117: {}", stat_rc);
+    // `used_ids` is an `int` at 0 in both layouts; `shm_tot` is the one
+    // that moves, from 8 natively to 4 here, because of the padding the
+    // native layout puts after that `int`.
+    // The table is system-wide and the tests beside this one make segments
+    // of their own, so the counts are "at least ours" and not an exact
+    // number.
+    assert!(word(&stat, 0) >= 1, "used_ids: {:x?}", &stat[..24]);
+    assert_ne!(
+        word(&stat, 4),
+        0,
+        "shm_tot is not at offset 4: the native padding after `used_ids` \
+         was kept, so offset 4 is the padding. {:x?}",
+        &stat[..24]
+    );
+    assert!(
+        stat[24..].iter().all(|&b| b == 0xAA),
+        "SHM_INFO wrote past the end of a 24-byte shm_info: {:x?}",
+        &stat[24..48]
     );
     proc.exit(0);
 }

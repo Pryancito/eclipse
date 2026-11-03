@@ -112,11 +112,13 @@ const IPC_64: usize = 0x100;
 /// - The `seminfo` and `msginfo` of `IPC_INFO`/`SEM_INFO`/`MSG_INFO` are runs
 ///   of `int` (and one `unsigned short`), the same at both widths, so those
 ///   are **not** held back.
-/// - Shared memory's are the exception, and the only thing left: `struct
-///   shminfo64` (`IPC_INFO`) and `struct shm_info` (`SHM_INFO`) are runs of
-///   `__kernel_ulong_t`, so both of those differ and both are still held
-///   back. `shm_info` leads with an `int used_ids`, so it is not a pure run
-///   and the word-halving of [`crate::narrow`] does not serve it either.
+/// - `struct shminfo64` (`IPC_INFO`) and `struct shm_info` (`SHM_INFO`) are
+///   runs of `__kernel_ulong_t`, so both differ --- and both are converted
+///   now too. `shminfo64` is a run of nine words and nothing else, so the
+///   word-halving of [`crate::narrow`] serves it as it stands; `shm_info`
+///   leads with an `int used_ids`, which the native layout then pads, so it
+///   is not a pure run and gets a layout of its own in
+///   [`crate::narrow::ipcbuf`].
 /// - `GETALL`/`SETALL` carry `unsigned short[]`, and `GETVAL`/`SETVAL` and
 ///   friends are scalars: nothing to convert.
 ///
@@ -126,9 +128,9 @@ const IPC_64: usize = 0x100;
 const SEM_NEEDS_LAYOUT: &[usize] = &[];
 /// See [`SEM_NEEDS_LAYOUT`]: nothing left in this family either.
 const MSG_NEEDS_LAYOUT: &[usize] = &[];
-/// See [`SEM_NEEDS_LAYOUT`]: `IPC_INFO` (`shminfo64`) and `SHM_INFO`
-/// (`shm_info`), the two that are still not converted.
-const SHM_NEEDS_LAYOUT: &[usize] = &[3, 14];
+/// See [`SEM_NEEDS_LAYOUT`]: nothing left in this family either, which is
+/// the whole of `ipc(117)`.
+const SHM_NEEDS_LAYOUT: &[usize] = &[];
 
 /// `struct ipc_kludge`, the old `msgrcv` argument block: a pointer and a
 /// `long`, both four bytes to a 32-bit program.
