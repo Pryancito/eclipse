@@ -1532,3 +1532,239 @@ pub(crate) mod hazmat {
         inv_bitslice_block(block, &state);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hex_literal::hex;
+
+    /// FIPS-197 Appendix C: one plaintext, the three key sizes, and the three
+    /// ciphertexts any conforming AES has to produce for them.
+    const PLAINTEXT: [u8; 16] = hex!("00112233445566778899aabbccddeeff");
+    const KEY128: [u8; 16] = hex!("000102030405060708090a0b0c0d0e0f");
+    const KEY192: [u8; 24] = hex!("000102030405060708090a0b0c0d0e0f1011121314151617");
+    const KEY256: [u8; 32] =
+        hex!("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    const CIPHER128: [u8; 16] = hex!("69c4e0d86a7b0430d8cdb78070b4c55a");
+    const CIPHER192: [u8; 16] = hex!("dda97ca4864cdfe06eaf70a0ec0d7191");
+    const CIPHER256: [u8; 16] = hex!("8ea2b7ca516745bfeafc49904b496089");
+
+    /// A batch whose four blocks all hold the same bytes.
+    fn four_of(bytes: &[u8; 16]) -> BatchBlocks {
+        let block = *Block::from_slice(bytes);
+        BatchBlocks::from([block, block, block, block])
+    }
+
+    /// A batch of four different blocks, in the order given.
+    fn batch_of(blocks: &[[u8; 16]; 4]) -> BatchBlocks {
+        BatchBlocks::from([
+            *Block::from_slice(&blocks[0]),
+            *Block::from_slice(&blocks[1]),
+            *Block::from_slice(&blocks[2]),
+            *Block::from_slice(&blocks[3]),
+        ])
+    }
+
+    /// Eight words that are all different and all have bits in every nibble,
+    /// so a swap of rows, of columns or of words cannot go unnoticed.
+    fn a_state() -> State {
+        [
+            0x0123456789abcdef,
+            0xfedcba9876543210,
+            0x1111222233334444,
+            0x5555666677778888,
+            0x99aabbccddeeff00,
+            0x0f1e2d3c4b5a6978,
+            0xa5a5a5a5a5a5a5a5,
+            0x3c3c3c3c3c3c3c3c,
+        ]
+    }
+
+    /// The whole of AES, end to end, for every key size this file implements.
+    /// A single wrong constant anywhere in the S-box, the MixColumns matrix,
+    /// the round constants or the key schedule moves these 16 bytes.
+    #[test]
+    fn the_three_key_sizes_match_the_published_vectors() {
+        let out = aes128_encrypt(&aes128_key_schedule(&KEY128), &four_of(&PLAINTEXT));
+        for block in out.iter() {
+            assert_eq!(
+                block.as_slice(),
+                &CIPHER128,
+                "AES-128 of the FIPS-197 vector"
+            );
+        }
+
+        let out = aes192_encrypt(&aes192_key_schedule(&KEY192), &four_of(&PLAINTEXT));
+        for block in out.iter() {
+            assert_eq!(
+                block.as_slice(),
+                &CIPHER192,
+                "AES-192 of the FIPS-197 vector"
+            );
+        }
+
+        let out = aes256_encrypt(&aes256_key_schedule(&KEY256), &four_of(&PLAINTEXT));
+        for block in out.iter() {
+            assert_eq!(
+                block.as_slice(),
+                &CIPHER256,
+                "AES-256 of the FIPS-197 vector"
+            );
+        }
+    }
+
+    /// Decryption is the other direction of the same vectors, not merely the
+    /// inverse of whatever encryption happens to do: a pair of matching errors
+    /// would round-trip and still be wrong.
+    #[test]
+    fn decryption_takes_the_published_ciphertexts_back() {
+        let out = aes128_decrypt(&aes128_key_schedule(&KEY128), &four_of(&CIPHER128));
+        for block in out.iter() {
+            assert_eq!(block.as_slice(), &PLAINTEXT, "AES-128 back from its vector");
+        }
+
+        let out = aes192_decrypt(&aes192_key_schedule(&KEY192), &four_of(&CIPHER192));
+        for block in out.iter() {
+            assert_eq!(block.as_slice(), &PLAINTEXT, "AES-192 back from its vector");
+        }
+
+        let out = aes256_decrypt(&aes256_key_schedule(&KEY256), &four_of(&CIPHER256));
+        for block in out.iter() {
+            assert_eq!(block.as_slice(), &PLAINTEXT, "AES-256 back from its vector");
+        }
+    }
+
+    /// The four blocks of a batch are four separate blocks: lane n of the
+    /// answer is what that block encrypts to on its own, and nothing of its
+    /// neighbours leaks into it. This is what `bitslice` and `inv_bitslice`
+    /// owe each other, and the vectors above cannot see it, since they put the
+    /// same block in all four lanes.
+    #[test]
+    fn the_four_blocks_of_a_batch_do_not_mix() {
+        let blocks = [
+            PLAINTEXT,
+            hex!("00000000000000000000000000000000"),
+            hex!("ffffffffffffffffffffffffffffffff"),
+            hex!("0f0e0d0c0b0a09080706050403020100"),
+        ];
+        let rkeys = aes128_key_schedule(&KEY128);
+
+        let together = aes128_encrypt(&rkeys, &batch_of(&blocks));
+        for (lane, block) in blocks.iter().enumerate() {
+            let alone = aes128_encrypt(&rkeys, &four_of(block));
+            assert_eq!(
+                together[lane].as_slice(),
+                alone[0].as_slice(),
+                "lane {lane} of a mixed batch is not that block on its own"
+            );
+        }
+
+        // And the same on the way back, so neither direction crosses lanes.
+        let back = aes128_decrypt(&rkeys, &together);
+        for (lane, block) in blocks.iter().enumerate() {
+            assert_eq!(
+                back[lane].as_slice(),
+                block,
+                "lane {lane} does not decrypt back to the block it started as"
+            );
+        }
+    }
+
+    /// A state word holds four rows of four columns of four bits, so ShiftRows
+    /// is a four-cycle: three more applications undo one, two of them are their
+    /// own inverse, and the file's own `inv_` names have to agree with that.
+    /// Every one of the three is a pair of delta swaps over hand-written masks,
+    /// and a wrong mask bit breaks the cycle without breaking any single call.
+    #[cfg(not(aes_compact))]
+    #[test]
+    fn shifting_the_rows_four_times_puts_them_back() {
+        let original = a_state();
+
+        let mut state = original;
+        for round in 1..=4 {
+            shift_rows_1(&mut state);
+            if round < 4 {
+                assert_ne!(state, original, "shifting {round} time(s) changed nothing");
+            }
+        }
+        assert_eq!(state, original, "four shifts are not the identity");
+
+        let mut state = original;
+        shift_rows_1(&mut state);
+        inv_shift_rows_1(&mut state);
+        assert_eq!(
+            state, original,
+            "inv_shift_rows_1 does not undo shift_rows_1"
+        );
+
+        let mut state = original;
+        shift_rows_2(&mut state);
+        assert_ne!(state, original, "two shifts changed nothing");
+        inv_shift_rows_2(&mut state);
+        assert_eq!(
+            state, original,
+            "inv_shift_rows_2 does not undo shift_rows_2"
+        );
+
+        let mut state = original;
+        shift_rows_3(&mut state);
+        inv_shift_rows_3(&mut state);
+        assert_eq!(
+            state, original,
+            "inv_shift_rows_3 does not undo shift_rows_3"
+        );
+
+        // Shifting once twice is shifting twice, and once more is three times.
+        let mut twice = original;
+        shift_rows_1(&mut twice);
+        shift_rows_1(&mut twice);
+        let mut expected = original;
+        shift_rows_2(&mut expected);
+        assert_eq!(
+            twice, expected,
+            "two single shifts are not the double shift"
+        );
+
+        shift_rows_1(&mut twice);
+        let mut expected = original;
+        shift_rows_3(&mut expected);
+        assert_eq!(
+            twice, expected,
+            "three single shifts are not the triple shift"
+        );
+    }
+
+    /// The distances every rotation in this file is built out of: a row is
+    /// sixteen bits of a word and a column is four. The rotations themselves
+    /// have to compose the way that arithmetic says they do.
+    #[test]
+    fn a_row_is_sixteen_bits_and_a_column_is_four() {
+        assert_eq!(ror_distance(1, 0), 16, "a row is sixteen bits");
+        assert_eq!(ror_distance(0, 1), 4, "a column is four bits");
+        assert_eq!(ror_distance(1, 1), 20);
+        assert_eq!(ror_distance(1, 3), 28);
+        assert_eq!(ror_distance(2, 2), 40);
+        assert_eq!(
+            ror_distance(3, 3),
+            60,
+            "the far corner still fits in a word"
+        );
+
+        let x = 0x0123456789abcdef_u64;
+        assert_eq!(
+            rotate_rows_1(rotate_rows_1(x)),
+            rotate_rows_2(x),
+            "rotating one row twice is not rotating two rows"
+        );
+        let mut four = x;
+        for _ in 0..4 {
+            four = rotate_rows_1(four);
+        }
+        assert_eq!(four, x, "four row rotations are not the identity");
+        assert_eq!(
+            rotate_rows_2(rotate_rows_2(x)),
+            x,
+            "two double rotations are not the identity"
+        );
+    }
+}

@@ -78,6 +78,20 @@ jobs:
           # nothing. Only `fncall.rs` and the structs compile for a host
           # target; pinning that layout is what `layout_tests` does.
           cargo test --manifest-path vendor/trapframe/Cargo.toml
+          # `vendor/aes` is the AES that EclipseFS encrypts with, and it is in
+          # the workspace `exclude` too, so the bare `cargo test` above does
+          # not reach it either; `cargo test -p aes` cannot reach it at all,
+          # since cargo refuses to test a non-member that has
+          # dev-dependencies. Nothing here had ever named it, and the test
+          # target did not even compile: vendoring dropped upstream's
+          # `hex-literal` dev-dependency, so `src/ni/test_expand.rs` failed to
+          # build before a single test ran. Behind that error sat upstream's
+          # three AES-NI key-expansion tests, which do run on this runner, and
+          # `src/soft/fixslice64.rs` -- the bitsliced software implementation,
+          # 1534 lines of hand-written masks and rotations, the one every
+          # soft-float kernel target uses because AES-NI needs the SSE
+          # registers -- with no tests of any kind.
+          cargo test --manifest-path vendor/aes/Cargo.toml
           # The same `default-members = ["xtask"]` hole as the block below,
           # and these two fell straight through it with their tests already
           # written: `z-config` holds the machine table that decides what an

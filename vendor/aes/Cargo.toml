@@ -30,6 +30,12 @@ zeroize = { version = "1.6.0", optional = true, default_features = false }
 [target.'cfg(all(aes_armv8, target_arch = "aarch64"))'.dependencies]
 zeroize = { version = "1.5.6", optional = true, default_features = false, features = ["aarch64"] }
 
+[dev-dependencies]
+# Upstream's own dev-dependency, dropped when this crate was vendored: without
+# it `src/ni/test_expand.rs` does not compile, so `cargo test -p aes` failed
+# before a single test ran.
+hex-literal = "0.4"
+
 [features]
 hazmat = [] # Expose cryptographically hazardous APIs
 
