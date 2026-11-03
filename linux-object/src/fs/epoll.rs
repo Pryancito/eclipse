@@ -347,11 +347,13 @@ struct EpollInner {
     /// compares the file first and the number second. The entries that watch
     /// one description sit together, so [`Epoll::forget_closed`] finds them
     /// without walking the rest. Linux finds them through `file->f_ep`, and
-    /// either way a close costs the same however many other files the epoll
-    /// watches. It was a `retain` over the whole interest list: 23 us for
-    /// each close in an event loop holding eight thousand connections, and
-    /// `n` squared to close all `n` (`close_watched_and_rewatch_of_*` in
-    /// `benches/process.rs`).
+    /// either way a close costs about the same however many other files the
+    /// epoll watches: 0.68 us with 256, 0.78 us with eight thousand. It was a
+    /// `retain` over the whole interest list: 23 us for each close in an
+    /// event loop holding eight thousand connections, and `n` squared to
+    /// close all `n` (`close_watched_and_rewatch_of_*` in
+    /// `benches/process.rs`). The second tree has a price: with only the one
+    /// file watched, a close and re-add costs 0.49 us where it cost 0.44.
     ///
     /// The description is its address as a number, as the process's
     /// `holders` keeps it, and for the same reason it is a safe key: the
