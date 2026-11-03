@@ -49,13 +49,25 @@
 //! `pthread_mutex_timedlock` of a modern i386 musl, and the two `timerfd`
 //! numbers are behind every timer it arms.
 //!
+//! And `utimensat_time64` (412), `ppoll_time64` (414) and
+//! `sched_rr_get_interval_time64` (423). 412 is the number a modern i386
+//! musl's `utimensat` and `futimens` actually send, and 414 the one behind
+//! its `poll` with a deadline.
+//!
+//! 412 is worth singling out: its `times` is an ARRAY of two
+//! `struct __kernel_timespec`, so it is the one call that is in BOTH of this
+//! layer's rules at once --- by i386's 320 the width of the pair is the
+//! PROCESS's and the pair is sixteen bytes, by 412 it is the CALL's and the
+//! pair is thirty-two. One core, `Syscall::utimensat_at`, reached from both
+//! with the answer handed in.
+//!
 //! ## What is still missing
 //!
-//! The rest of the family, each of which needs the same treatment of a
-//! structure this kernel already converts: `timer_gettime64` (408),
-//! `timer_settime64` (409), `utimensat_time64` (412),
-//! `pselect6_time64` (413), `ppoll_time64` (414), `recvmmsg_time64` (417),
-//! `rt_sigtimedwait_time64` (421) and `sched_rr_get_interval_time64` (423).
+//! `timer_gettime64` (408) and `timer_settime64` (409), whose
+//! `struct itimerspec` this kernel converts in several places including the
+//! CPU-timer path; `pselect6_time64` (413), whose sixth argument points at
+//! two words that nothing converts yet; `recvmmsg_time64` (417); and
+//! `rt_sigtimedwait_time64` (421), which passes a `siginfo_t` outwards.
 
 use super::*;
 use crate::file::ITimerSpec;
@@ -76,6 +88,12 @@ pub(super) const I386_TIMERFD_GETTIME64: u32 = 410;
 pub(super) const I386_TIMERFD_SETTIME64: u32 = 411;
 /// i386's number for `futex_time64`.
 pub(super) const I386_FUTEX_TIME64: u32 = 422;
+/// i386's number for `utimensat_time64`.
+pub(super) const I386_UTIMENSAT_TIME64: u32 = 412;
+/// i386's number for `ppoll_time64`.
+pub(super) const I386_PPOLL_TIME64: u32 = 414;
+/// i386's number for `sched_rr_get_interval_time64`.
+pub(super) const I386_SCHED_RR_GET_INTERVAL_TIME64: u32 = 423;
 
 impl Syscall<'_> {
     /// `clock_gettime64` (403): the native call, writing a
@@ -151,7 +169,54 @@ impl Syscall<'_> {
         self.futex_at(uaddr, op, val, val2, uaddr2, val3, false)
             .await
     }
+
+    /// `utimensat_time64` (412), whose `times` is an array of two
+    /// `struct __kernel_timespec`: **thirty-two** bytes from a 32-bit
+    /// program, where i386's 320 passes sixteen.
+    ///
+    /// This is the number a modern i386 musl sends for `utimensat(2)`,
+    /// `futimens(3)` and `utimes(3)` alike, so with it answering `ENOSYS` a
+    /// 32-bit program cannot set a file's times at all --- which is every
+    /// archive extractor, every `install`, every `cp -p`.
+    pub fn sys_utimensat_time64(
+        &mut self,
+        dirfd: FileDesc,
+        pathname: UserInPtr<u8>,
+        times: kernel_hal::user::UserInOutPtr<[TimeSpec; 2]>,
+        flags: usize,
+    ) -> SysResult {
+        self.utimensat_at(dirfd, pathname, times, flags, false)
+    }
+
+    /// `ppoll_time64` (414): the timeout is a `struct __kernel_timespec`.
+    /// Everything else `ppoll` passes is a `struct pollfd` of three fields
+    /// that are the same width in both ABIs, or a `sigset_t`.
+    pub async fn sys_ppoll_time64(
+        &mut self,
+        ufds: kernel_hal::user::UserInOutPtr<crate::file::PollFd>,
+        nfds: usize,
+        timeout: UserInPtr<TimeSpec>,
+        sigmask: UserInPtr<linux_object::signal::Sigset>,
+        sigsetsize: usize,
+    ) -> SysResult {
+        self.ppoll_at(ufds, nfds, timeout, sigmask, sigsetsize, false)
+            .await
+    }
+
+    /// `sched_rr_get_interval_time64` (423).
+    pub fn sys_sched_rr_get_interval_time64(
+        &self,
+        pid: usize,
+        interval: UserOutPtr<TimeSpec>,
+    ) -> SysResult {
+        self.sched_rr_get_interval_at(pid, interval, false)
+    }
 }
 
 #[cfg(test)]
 mod tests;
+
+/// The three numbers whose core already existed and only needed the width
+/// handed in: own file so the two subjects do not share a ceiling.
+#[cfg(test)]
+mod shared_core_tests;

@@ -37,6 +37,10 @@ mod mount;
 mod nvidia;
 mod pidfd;
 mod poll;
+/// Shared with the i386 compat layer: `ppoll_time64` (414) passes the same
+/// `struct pollfd`, whose three fields are the same width in both ABIs.
+#[cfg(target_arch = "x86_64")]
+pub(crate) use self::poll::PollFd;
 mod splice;
 mod stat;
 /// Shared with the i386 compat layer, which lays the same type-and-mode word

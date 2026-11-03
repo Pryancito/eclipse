@@ -56,15 +56,12 @@ const ETIMEDOUT: isize = -(LxError::ETIMEDOUT as isize);
 /// Every `*_time64` number this kernel does NOT answer yet, with the name it
 /// reports. The whole remaining set, so that wiring one and forgetting to
 /// take it out of here fails rather than leaving a stale list.
-const STILL_MISSING: [(u32, &str); 8] = [
+const STILL_MISSING: [(u32, &str); 5] = [
     (408, "timer_gettime64"),
     (409, "timer_settime64"),
-    (412, "utimensat_time64"),
     (413, "pselect6_time64"),
-    (414, "ppoll_time64"),
     (417, "recvmmsg_time64"),
     (421, "rt_sigtimedwait_time64"),
-    (423, "sched_rr_get_interval_time64"),
 ];
 
 const USER_AT: usize = 0x2200_0000;
@@ -89,22 +86,22 @@ fn a_process(pid: KoID, abi: Abi) -> alloc::sync::Arc<Process> {
     proc
 }
 
-fn put(at: usize, bytes: &[u8]) {
+pub(super) fn put(at: usize, bytes: &[u8]) {
     let mut p: kernel_hal::user::UserOutPtr<u8> = at.into();
     p.write_array(bytes).expect("mapped above");
 }
 
-fn get(at: usize, len: usize) -> Vec<u8> {
+pub(super) fn get(at: usize, len: usize) -> Vec<u8> {
     let p: kernel_hal::user::UserInPtr<u8> = at.into();
     p.read_array(len).expect("mapped above")
 }
 
-fn word(bytes: &[u8], at: usize) -> u32 {
+pub(super) fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_ne_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
 /// A `Syscall` as a `&mut` one, since `compat32_syscall` takes `&mut self`.
-fn as_mut<'a>(sys: &Syscall<'a>) -> Syscall<'a> {
+pub(super) fn as_mut<'a>(sys: &Syscall<'a>) -> Syscall<'a> {
     Syscall {
         thread: sys.thread,
         thread_fn: sys.thread_fn,

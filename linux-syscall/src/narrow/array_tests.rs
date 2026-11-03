@@ -124,6 +124,38 @@ fn the_second_entry_of_a_native_pair_comes_from_offset_sixteen() {
     assert_eq!(word(16), 9, "mtime.sec at 16, not at 8");
 }
 
+/// The native branch reads **unaligned** too, and this is the test that
+/// measures it: a `[TimeSpec; 2]` at a 4-aligned address, read with
+/// `abi32 == false`.
+///
+/// It is not a theoretical case. `utimensat_time64` (i386's 412) is a 32-bit
+/// process passing this pair at the NATIVE width --- thirty-two bytes, at a
+/// 4-aligned address, because on i386 an `__s64` aligns to 4. That is the
+/// fifth form of the trap: `abi32 == false` is a statement about the
+/// structure and not about the process. Without this test, replacing the
+/// native branch's `read_unaligned()` with `read()` leaves every other test
+/// in this file green and answers `EFAULT` for a pointer Linux accepts.
+///
+/// Pointed out by Copilot on the #2410, which had exactly this gap.
+#[test]
+fn a_four_aligned_native_pair_is_read_rather_than_refused() {
+    let mut room = Room::new();
+    let at = room.four_aligned();
+    // Written as WORDS and not with the typed `write`, which is the whole
+    // point: at this address the typed write refuses too.
+    put_words(at, &[21, 0, 0, 0, 22, 0, 0, 0]);
+
+    let ptr: UserInOutPtr<[TimeSpec; 2]> = at.into();
+    assert!(
+        ptr.read().is_err(),
+        "a 4-aligned native pair is exactly what the typed read refuses"
+    );
+
+    let [a, m] = narrow_get_array(false, &ptr).expect("bytes have no alignment to respect");
+    assert_eq!((a.sec, a.nsec), (21, 0), "atime.sec at 0, nsec at 8");
+    assert_eq!((m.sec, m.nsec), (22, 0), "mtime.sec at 16, nsec at 24");
+}
+
 /// A 32-bit caller's pair is 4-aligned, because on i386 every field of these
 /// structures is a `long`. The typed read of a `[TimeSpec; 2]` refuses such
 /// an address --- it stores through a `*[TimeSpec; 2]`, so it has to insist
