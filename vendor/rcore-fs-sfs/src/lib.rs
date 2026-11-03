@@ -999,6 +999,12 @@ impl Drop for INodeImpl {
             self._resize(0).unwrap();
             self.disk_inode.write().sync();
             self.fs.free_block(self.id);
+        } else if let Some(index) = self.dir_index.write().take() {
+            let mut parked = self.fs.parked_dir_indexes.lock();
+            if parked.len() >= MAX_PARKED_DIR_INDEXES {
+                parked.pop_first();
+            }
+            parked.insert(self.id, index);
         }
         // Only now is the inode on disk final, so only now may `get_inode`
         // load it again: until this entry goes away it waits (see there).
@@ -1017,6 +1023,11 @@ impl Drop for INodeImpl {
 /// 为了方便协调外部及INode对SFS的访问，并为日后并行化做准备，
 /// 将SFS设置为内部可变，即对外接口全部是&self，struct的全部field用RwLock包起来
 /// 这样其内部各field均可独立访问
+/// Directory indexes kept for dropped `INodeImpl`s; the oldest inode id goes
+/// first past this. A few hundred directories is every directory a typical
+/// root has, at a few tens of bytes per name.
+const MAX_PARKED_DIR_INDEXES: usize = 256;
+
 pub struct SimpleFileSystem {
     /// on-disk superblock
     super_block: RwLock<Dirty<SuperBlock>>,
@@ -1024,6 +1035,14 @@ pub struct SimpleFileSystem {
     free_map: RwLock<Dirty<BitVec<Lsb0, u8>>>,
     /// inode list
     inodes: RwLock<BTreeMap<INodeId, Weak<INodeImpl>>>,
+    /// Name indexes of directories whose `INodeImpl` was dropped, by inode.
+    /// Nothing keeps a directory's `INodeImpl` alive between two path walks
+    /// once the path cache is invalidated, so an index that lived only in
+    /// the `INodeImpl` was rebuilt -- the whole directory read and parsed --
+    /// on nearly every cold lookup, which cost more than the scan it
+    /// replaced. `Drop` parks it here and the next load takes it back; the
+    /// two cannot overlap, since `get_inode` waits for a `Drop` in progress.
+    parked_dir_indexes: Mutex<BTreeMap<INodeId, BTreeMap<String, usize>>>,
     /// device
     device: Arc<dyn Device>,
     /// What every inode of it reports as `st_dev`: [`vfs::anon_dev`], since
@@ -1082,6 +1101,7 @@ impl SimpleFileSystem {
             super_block: RwLock::new(Dirty::new(super_block)),
             free_map: RwLock::new(Dirty::new(BitVec::from_vec(freemap_disk))),
             inodes: RwLock::new(BTreeMap::new()),
+            parked_dir_indexes: Mutex::new(BTreeMap::new()),
             device,
             dev: vfs::anon_dev(),
             self_ptr: Weak::default(),
@@ -1116,6 +1136,7 @@ impl SimpleFileSystem {
             super_block: RwLock::new(Dirty::new_dirty(super_block)),
             free_map: RwLock::new(Dirty::new_dirty(free_map)),
             inodes: RwLock::new(BTreeMap::new()),
+            parked_dir_indexes: Mutex::new(BTreeMap::new()),
             device,
             dev: vfs::anon_dev(),
             self_ptr: Weak::default(),
@@ -1244,6 +1265,7 @@ impl SimpleFileSystem {
     /// Create a new INode struct, then insert it to self.inodes
     /// Private used for load or create INode
     fn _new_inode(&self, id: INodeId, disk_inode: Dirty<DiskINode>) -> Arc<INodeImpl> {
+        self.parked_dir_indexes.lock().remove(&id);
         let device_inode_id = disk_inode.device_inode_id;
         let inode = Arc::new(INodeImpl {
             id,
@@ -1304,13 +1326,14 @@ impl SimpleFileSystem {
         }
         let disk_inode = Dirty::new(self.device.load_struct::<DiskINode>(id).unwrap());
         let device_inode_id = disk_inode.device_inode_id;
+        let dir_index = self.parked_dir_indexes.lock().remove(&id);
         let inode = Arc::new(INodeImpl {
             id,
             disk_inode: RwLock::new(disk_inode),
             fs: self.self_ptr.upgrade().unwrap(),
             device_inode_id,
             resize_lock: Mutex::new(()),
-            dir_index: RwLock::new(None),
+            dir_index: RwLock::new(dir_index),
         });
         inodes.insert(id, Arc::downgrade(&inode));
         inode

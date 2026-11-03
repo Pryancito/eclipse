@@ -1168,9 +1168,8 @@ fn fsck_image() {
 fn dir_index_agrees_with_a_scan() -> Result<()> {
     let sfs = _create_new_sfs();
     let root = sfs.root_inode();
-    let a = root.create("a", FileType::Dir, 0o755)?;
-    let b = root.create("b", FileType::Dir, 0o755)?;
-    let dirs = [a.clone(), b.clone()];
+    root.create("a", FileType::Dir, 0o755)?;
+    root.create("b", FileType::Dir, 0o755)?;
     let mut seed: u64 = 0x9e3779b97f4a7c15;
     let mut rnd = |n: u64| {
         seed ^= seed << 13;
@@ -1179,6 +1178,9 @@ fn dir_index_agrees_with_a_scan() -> Result<()> {
         seed % n
     };
     for _ in 0..3000 {
+        // Fresh handles each round: the directories' INodeImpls are dropped
+        // and reloaded, so the index also has to survive being parked.
+        let dirs = [root.find("a")?, root.find("b")?];
         let d = &dirs[rnd(2) as usize];
         let name = std::format!("f{}", rnd(60));
         match rnd(4) {
