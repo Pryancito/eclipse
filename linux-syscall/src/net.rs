@@ -557,6 +557,21 @@ impl Syscall<'_> {
             "sys_setsockopt: sockfd:{}, level:{}, optname:{}, optval:{:?} , optlen:{}",
             sockfd, level, optname, optval, optlen
         );
+        // `optlen` is an `int` in the prototype, and `__sys_setsockopt`
+        // refuses a negative one before it looks at anything else:
+        //     if (optlen < 0) return -EINVAL;
+        // A 32-bit caller's `socketcall` block carries it as a word, so
+        // `0xffffffff` arrives here zero-extended as four billion and
+        // satisfies any lower bound a conversion might check. Without this
+        // the two timeout options would SUCCEED on a length Linux refuses,
+        // because the widening below reads the eight bytes it needs and
+        // never looks at the rest of `optlen`. The check belongs here, at
+        // the entry, and not inside the conversion: it is a property of the
+        // call's prototype, so every option gets it and no option can be
+        // added without it.
+        if optlen > i32::MAX as usize {
+            return Err(LxError::EINVAL);
+        }
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let socket = file_like.as_socket()?;
         // At the caller's width, not at this kernel's: `SO_RCVTIMEO`'s
