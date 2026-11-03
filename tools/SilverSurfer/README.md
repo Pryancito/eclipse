@@ -104,7 +104,10 @@ sesión; al cerrar borra cookies/almacenamiento/caché de esa instancia).
 | Arrastrar pestaña | Reordenar |
 | Clic derecho (página) | Menú contextual |
 | Tab (en la barra) | Aceptar sugerencia del historial |
-| Ctrl+C / Ctrl+X / Ctrl+V (en la barra) | Copiar / cortar la dirección, pegar |
+| Ctrl+C / Ctrl+X / Ctrl+V (en la barra) | Copiar / cortar la selección (o la dirección entera), pegar |
+| Ctrl+A, Shift+flechas, Shift+Inicio/Fin (en la barra) | Seleccionar |
+| Ctrl+← / Ctrl+→, Ctrl+Retroceso / Ctrl+Supr (en la barra) | Saltar / borrar por trozos de la URL |
+| Clic / doble clic / arrastrar (en la barra) | El primer clic selecciona la dirección; luego cursor, palabra o selección |
 | Ctrl+Shift+L | Guardar login del formulario visible |
 
 La barra busca con DuckDuckGo si el texto no parece una dirección

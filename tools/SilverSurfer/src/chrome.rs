@@ -223,6 +223,8 @@ pub struct View<'a> {
     pub location_focused: bool,
     /// Caret, in characters, used only while the bar is focused.
     pub location_cursor: usize,
+    /// Selección de la barra enfocada, `[inicio, fin)` en caracteres.
+    pub location_selection: Option<(usize, usize)>,
     /// Sufijo de autocompletado del historial (solo barra enfocada).
     pub location_suggest: &'a str,
     /// La barra actúa como buscar-en-página (Ctrl+F).
@@ -286,6 +288,20 @@ pub fn render(view: &View<'_>) -> Pixels {
     fill(&mut pixmap, s(lay.reload), pal.field);
     fill(&mut pixmap, s(lay.scheme), pal.field);
     fill(&mut pixmap, s(lay.location), pal.field);
+    if view.location_focused {
+        if let Some(sel) = view.location_selection {
+            let room = (lay.location.w / 6).max(1) as usize;
+            if let Some((x, w)) = selection_span(view.location, room, view.location_cursor, sel) {
+                let rect = RectI {
+                    x: lay.location.x + 8 + x,
+                    y: lay.location.y + 6,
+                    w,
+                    h: 13,
+                };
+                fill(&mut pixmap, s(rect), pal.accent);
+            }
+        }
+    }
     fill(&mut pixmap, s(lay.gpu), pal.field);
     if view.private {
         fill(&mut pixmap, s(lay.private), pal.field);
@@ -453,6 +469,29 @@ pub fn render(view: &View<'_>) -> Pixels {
     }
 }
 
+/// Desplazamiento y ancho (px CSS, desde el inicio del texto) del fondo de
+/// la selección en la línea que dibuja [`location_line`].
+fn selection_span(
+    text: &str,
+    room: usize,
+    cursor: usize,
+    sel: (usize, usize),
+) -> Option<(i32, i32)> {
+    let len = text.chars().count();
+    let cursor = cursor.min(len);
+    let start = crate::lineedit::visible_start(len, room, cursor);
+    let end = (start + room.max(2) - 1).min(len);
+    let a = sel.0.max(start);
+    let b = sel.1.min(end);
+    if a >= b {
+        return None;
+    }
+    // El cursor siempre está en un extremo de la selección: si está a la
+    // izquierda, el `|` va antes y empuja la selección una columna.
+    let col = (a - start) as i32 + i32::from(cursor <= a);
+    Some((col * 6, (b - a) as i32 * 6))
+}
+
 /// The slice of the bar that ends at the caret, plus a `|`.
 fn location_line(text: &str, room: usize, cursor: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
@@ -462,7 +501,7 @@ fn location_line(text: &str, room: usize, cursor: usize) -> String {
         return "|".into();
     }
     let body = room - 1;
-    let start = cursor.saturating_sub(body);
+    let start = crate::lineedit::visible_start(chars.len(), room, cursor);
     let end = (start + body).min(chars.len());
     let mut out: String = chars[start..cursor].iter().collect();
     out.push('|');
@@ -876,6 +915,7 @@ mod tests {
             location: "https://example.com",
             location_focused: true,
             location_cursor: 0,
+            location_selection: None,
             location_suggest: "",
             find_mode: false,
             scheme: SchemeHint::Https,
@@ -972,6 +1012,7 @@ mod tests {
                 location: "",
                 location_focused: false,
                 location_cursor: 0,
+                location_selection: None,
                 location_suggest: "",
                 find_mode: false,
                 scheme: SchemeHint::Other,
@@ -1019,5 +1060,14 @@ mod tests {
         cur[12] = 9; // GL row 3 = top row
         assert_eq!(changed_rows_flipped(&cur, &prev, 1, 4), Some((0, 2)));
         assert_eq!(changed_rows_flipped(&cur, &[], 1, 4), Some((0, 3)));
+    }
+
+    #[test]
+    fn selection_span_skips_the_caret_column() {
+        // "abcdef", caret at 6 after Shift+← ×2 → "abcd[ef]|"
+        assert_eq!(selection_span("abcdef", 40, 6, (4, 6)), Some((24, 12)));
+        // Caret at the left end: "abcd|[ef]"
+        assert_eq!(selection_span("abcdef", 40, 4, (4, 6)), Some((30, 12)));
+        assert_eq!(selection_span("abcdef", 40, 6, (6, 6)), None);
     }
 }

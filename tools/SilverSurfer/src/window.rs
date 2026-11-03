@@ -55,6 +55,7 @@ use crate::engine::{self, Session, Waker};
 use crate::files::{self, PickRequest};
 use crate::history;
 use crate::home;
+use crate::lineedit::{self, LineEdit};
 use crate::location::{paste_line, resolve_omnibox, search_template, SchemeHint};
 use crate::look::Look;
 use crate::menu;
@@ -177,8 +178,12 @@ pub struct App {
     px: f64,
     py: f64,
     loc_focused: bool,
-    loc_text: String,
-    loc_cursor: usize,
+    /// Texto, cursor y selección de la barra.
+    loc: LineEdit,
+    /// Arrastre del ratón seleccionando en la barra.
+    loc_drag: bool,
+    /// Último clic en la barra (doble clic = palabra).
+    loc_clicked: Option<(Instant, i32)>,
     /// Ctrl+F: la barra busca en la página en vez de navegar.
     find_mode: bool,
     /// Linux button code held over the page. Release sends button-up, so a
@@ -282,8 +287,9 @@ impl App {
             px: 0.0,
             py: 0.0,
             loc_focused: false,
-            loc_text: String::new(),
-            loc_cursor: 0,
+            loc: LineEdit::default(),
+            loc_drag: false,
+            loc_clicked: None,
             find_mode: false,
             page_button: None,
             on_page: false,
@@ -784,7 +790,7 @@ impl App {
             can_forward = session.shell.can_go_forward();
             window_title = session.shell.window_title();
             location = if self.loc_focused {
-                self.loc_text.clone()
+                self.loc.text().to_owned()
             } else {
                 session.shell.location_text()
             };
@@ -834,7 +840,8 @@ impl App {
             active,
             location: &location,
             location_focused: self.loc_focused,
-            location_cursor: self.loc_cursor,
+            location_cursor: self.loc.cursor(),
+            location_selection: self.loc.selection(),
             location_suggest: &suggest,
             find_mode: self.find_mode,
             scheme,
@@ -850,7 +857,8 @@ impl App {
             active,
             &location,
             self.loc_focused,
-            self.loc_cursor,
+            self.loc.cursor(),
+            self.loc.selection(),
             self.find_mode,
             scheme,
             gpu,
@@ -1038,6 +1046,7 @@ impl App {
 
     fn on_pointer_button(&mut self, button: u32, down: bool) {
         if !down {
+            self.loc_drag = false;
             if let Some(from) = self.drag_tab.take() {
                 let x = self.px.round() as i32;
                 let y = self.py.round() as i32;
@@ -1121,15 +1130,34 @@ impl App {
         let Some(hit) = chrome::hit(self.logical_w, tabs, x, y) else {
             return;
         };
+        let was_focused = self.loc_focused;
         self.loc_focused = matches!(hit, Hit::Location);
         if let Some(session) = &self.session {
             session.shell.set_page_focused(!self.loc_focused);
         }
         match hit {
             Hit::Location => {
-                if let Some(session) = &self.session {
-                    self.loc_text = session.shell.location_text();
-                    self.loc_cursor = self.loc_text.chars().count();
+                if !was_focused {
+                    // Primer clic: toda la dirección seleccionada, como en
+                    // Firefox, lista para escribir otra encima.
+                    if let Some(session) = &self.session {
+                        self.loc.set(session.shell.location_text());
+                    }
+                    self.loc.select_all();
+                    self.loc_clicked = None;
+                } else {
+                    let index = self.location_index_at(x);
+                    let double = self.loc_clicked.is_some_and(|(at, cx)| {
+                        at.elapsed() < Duration::from_millis(400) && (cx - x).abs() < 4
+                    });
+                    if double {
+                        self.loc.select_word_at(index);
+                        self.loc_clicked = None;
+                    } else {
+                        self.loc.move_to(index, self.shift);
+                        self.loc_drag = true;
+                        self.loc_clicked = Some((Instant::now(), x));
+                    }
                 }
             }
             Hit::Back => {
@@ -1322,9 +1350,10 @@ impl App {
                 session.shell.set_page_focused(false);
             }
             if let Some(session) = &self.session {
-                self.loc_text = session.shell.location_text();
-                self.loc_cursor = self.loc_text.chars().count();
+                self.loc.set(session.shell.location_text());
             }
+            // Como en Firefox: Ctrl+L deja la dirección seleccionada.
+            self.loc.select_all();
             self.need_paint = true;
             return true;
         }
@@ -1424,8 +1453,7 @@ impl App {
         if self.ctrl && evdev == 33 {
             self.find_mode = true;
             self.loc_focused = true;
-            self.loc_text.clear();
-            self.loc_cursor = 0;
+            self.loc.clear();
             if let Some(session) = &self.session {
                 session.shell.set_page_focused(false);
             }
@@ -1575,23 +1603,24 @@ impl App {
     }
 
     fn edit_location(&mut self, evdev: u32) {
+        let (shift, word) = (self.shift, self.ctrl);
         match evdev {
             1 => {
                 self.leave_location();
             }
             15 if !self.find_mode => {
                 // Tab — aceptar autocompletado del historial.
-                if let Some(visit) = history::load().autocomplete(&self.loc_text) {
-                    self.loc_text = visit.url.clone();
-                    self.loc_cursor = self.loc_text.chars().count();
+                if let Some(visit) = history::load().autocomplete(self.loc.text()) {
+                    self.loc.set(visit.url.clone());
                 }
             }
             28 | 96 => {
+                let text = self.loc.text().to_owned();
                 if self.find_mode {
                     if let Some(session) = &self.session {
-                        session.shell.find_in_page(&self.loc_text);
+                        session.shell.find_in_page(&text);
                     }
-                } else if let Ok(url) = resolve_omnibox(&self.loc_text, &search_template()) {
+                } else if let Ok(url) = resolve_omnibox(&text, &search_template()) {
                     if let Some(session) = &self.session {
                         session.shell.load(url);
                     }
@@ -1600,57 +1629,52 @@ impl App {
                     self.leave_location();
                 }
             }
-            14 => {
-                if self.loc_cursor > 0 {
-                    let chars: Vec<char> = self.loc_text.chars().collect();
-                    let at = self.loc_cursor - 1;
-                    self.loc_text = chars
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| *i != at)
-                        .map(|(_, ch)| *ch)
-                        .collect();
-                    self.loc_cursor = at;
-                }
-            }
-            111 => {
-                let chars: Vec<char> = self.loc_text.chars().collect();
-                if self.loc_cursor < chars.len() {
-                    self.loc_text = chars
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| *i != self.loc_cursor)
-                        .map(|(_, ch)| *ch)
-                        .collect();
-                }
-            }
-            105 => self.loc_cursor = self.loc_cursor.saturating_sub(1),
-            106 => {
-                let n = self.loc_text.chars().count();
-                if self.loc_cursor < n {
-                    self.loc_cursor += 1;
-                }
-            }
-            102 => self.loc_cursor = 0,
-            107 => self.loc_cursor = self.loc_text.chars().count(),
-            // Ctrl+C / Ctrl+X: la barra no tiene selección, copia el texto entero.
+            14 => self.loc.backspace(word),
+            111 => self.loc.delete(word),
+            105 => self.loc.left(shift, word),
+            106 => self.loc.right(shift, word),
+            102 => self.loc.home(shift),
+            107 => self.loc.end(shift),
+            // Ctrl+A: seleccionar todo.
+            30 if self.ctrl => self.loc.select_all(),
+            // Ctrl+C / Ctrl+X: la selección, o la dirección entera si no hay.
             46 | 45 if self.ctrl => {
-                clipboard::set_text(&self.loc_text);
+                if self.loc.selection().is_none() {
+                    self.loc.select_all();
+                }
+                if let Some(text) = self.loc.selected_text() {
+                    clipboard::set_text(&text);
+                }
                 if evdev == 45 {
-                    self.loc_text.clear();
-                    self.loc_cursor = 0;
+                    self.loc.delete_selection();
                 }
             }
             47 if self.ctrl => {
                 let text = paste_line(&clipboard::get_text());
-                insert_chars(&mut self.loc_text, &mut self.loc_cursor, &text);
+                self.loc.insert(&text);
             }
             _ => {
                 if let Some(text) = self.key_text(evdev) {
-                    insert_chars(&mut self.loc_text, &mut self.loc_cursor, &text);
+                    self.loc.insert(&text);
                 }
             }
         }
+    }
+
+    /// Índice de carácter bajo la x (px CSS de la ventana) en la barra.
+    fn location_index_at(&self, x: i32) -> usize {
+        let tabs = self
+            .session
+            .as_ref()
+            .map(|s| s.shell.tab_titles().len())
+            .unwrap_or(1)
+            .max(1);
+        let private = self.session.as_ref().is_some_and(|s| s.private);
+        let lay = chrome::layout_ex(self.logical_w, tabs, private);
+        let room = (lay.location.w / 6).max(1) as usize;
+        let column = ((x - lay.location.x - 8).max(0) + 3) / 6;
+        let len = self.loc.text().chars().count();
+        lineedit::column_to_index(len, room, self.loc.cursor(), column as usize)
     }
 
     /// Pasa la tecla por la tabla de composición (teclas muertas).
@@ -1669,7 +1693,7 @@ impl App {
     /// página (como pulsar y soltar una tecla que diera ese texto).
     fn type_text(&mut self, evdev: u32, text: String) {
         if self.loc_focused {
-            insert_chars(&mut self.loc_text, &mut self.loc_cursor, &text);
+            self.loc.insert(&text);
             self.need_paint = true;
             return;
         }
@@ -1774,6 +1798,11 @@ impl App {
         self.px = x;
         self.py = y;
         self.on_page = self.py >= self.chrome_h() as f64;
+        if self.loc_drag && self.loc_focused {
+            let index = self.location_index_at(x.round() as i32);
+            self.loc.move_to(index, true);
+            self.need_paint = true;
+        }
         if was && !self.on_page {
             if let Some(session) = &self.session {
                 session.shell.pointer_left();
@@ -1967,6 +1996,7 @@ fn chrome_fingerprint(
     location: &str,
     loc_focused: bool,
     loc_cursor: usize,
+    loc_selection: Option<(usize, usize)>,
     find_mode: bool,
     scheme: SchemeHint,
     gpu: bool,
@@ -1990,6 +2020,10 @@ fn chrome_fingerprint(
     mix(&[u8::from(loc_focused), u8::from(find_mode), u8::from(gpu)]);
     mix(&[u8::from(can_back), u8::from(can_forward)]);
     mix(&(loc_cursor as u32).to_le_bytes());
+    if let Some((a, b)) = loc_selection {
+        mix(&(a as u32).to_le_bytes());
+        mix(&(b as u32).to_le_bytes());
+    }
     mix(&[match scheme {
         SchemeHint::Https => 1,
         SchemeHint::Http => 2,
@@ -2014,18 +2048,6 @@ fn chrome_fingerprint(
         }
     }
     h
-}
-
-fn insert_chars(text: &mut String, cursor: &mut usize, extra: &str) {
-    let mut byte = 0;
-    for (i, ch) in text.chars().enumerate() {
-        if i == *cursor {
-            break;
-        }
-        byte += ch.len_utf8();
-    }
-    text.insert_str(byte, extra);
-    *cursor += extra.chars().count();
 }
 
 fn copy_into(buf: &mut LiveBuf, src: &[u8]) {
@@ -2475,10 +2497,34 @@ impl Dispatch<WlSeat, ()> for App {
         let WEnum::Value(caps) = capabilities else {
             return;
         };
-        if caps.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
+        // Cuando el asiento pierde una capacidad (ratón o teclado
+        // desconectado, un dispositivo virtual que entra o sale) el objeto
+        // viejo queda inerte: hay que soltarlo y pedir otro cuando vuelva, o
+        // la ventana deja de recibir clics o teclas.
+        let has_keyboard = caps.contains(wl_seat::Capability::Keyboard);
+        if !has_keyboard {
+            if let Some(keyboard) = state.keyboard.take() {
+                if keyboard.version() >= 3 {
+                    keyboard.release();
+                }
+                state.reset_keys(&[]);
+            }
+        } else if state.keyboard.is_none() {
             state.keyboard = Some(seat.get_keyboard(qh, ()));
         }
-        if caps.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
+        let has_pointer = caps.contains(wl_seat::Capability::Pointer);
+        if !has_pointer {
+            if let Some(dev) = state.cursor_dev.take() {
+                dev.destroy();
+            }
+            if let Some(pointer) = state.pointer.take() {
+                if pointer.version() >= 3 {
+                    pointer.release();
+                }
+            }
+            state.pointer_serial = None;
+            state.cursor_applied = None;
+        } else if state.pointer.is_none() {
             state.pointer = Some(seat.get_pointer(qh, ()));
         }
     }
