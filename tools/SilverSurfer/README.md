@@ -150,7 +150,9 @@ software; en ventana privada aparece además `P`.
 `about:privacy`, `about:cookies` y `about:clear` cubren la UI de datos.
 El bloqueo de anuncios lite (hosts/paths + CSS hide) está activo por
 defecto; `SILVERSURFER_ADBLOCK=0` lo apaga. Ver `about:filters`.
-Contraseñas: almacén local ofuscado (`passwords.json`); autocompletado al
+Contraseñas: almacén local cifrado con ChaCha20-Poly1305 (`passwords.json`,
+clave aleatoria aparte en `passwords.key`, ambos 0600; los almacenes
+ofuscados antiguos se migran solos al abrirlos); autocompletado al
 cargar el origen; `about:passwords` lista entradas. Desactivado en `--private`.
 La home es un lienzo en blanco con el logo de Eclipse OS
 (paleta de `/etc/eclipse/look`). Los smokes de canvas / WebGL / WebGPU /

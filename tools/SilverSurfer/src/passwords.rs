@@ -1,14 +1,84 @@
 //! Almacén local de credenciales (F3-lite).
 //!
-//! Fichero XDG `passwords.json`. El secreto se guarda ofuscado (XOR + base64),
-//! no es cifrado fuerte: protege solo frente a lectura casual del disco.
-//! En ventana `--private` no se lee ni escribe.
+//! Fichero XDG `passwords.json`. Cada secreto va cifrado con
+//! ChaCha20-Poly1305 (`"v2:" + base64(nonce ‖ cifrado)`), con el origen y el
+//! usuario como datos asociados para que no se puedan intercambiar entradas.
+//! La clave son 32 bytes aleatorios en `passwords.key` (0600), aparte del
+//! almacén: copiar o sincronizar `passwords.json` solo no revela nada. Quien
+//! pueda leer los dos ficheros del usuario puede descifrarlos, como en
+//! Firefox sin contraseña maestra.
+//!
+//! Los almacenes antiguos (XOR + base64, sin prefijo) se leen y se reescriben
+//! cifrados al cargarlos. En ventana `--private` no se lee ni escribe.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
 use crate::session::{data_dir, find_string, json_string, leaf_objects};
 
-const XOR_KEY: &[u8] = b"EclipseOS-SilverSurfer-passwords-v1";
+/// Clave del formato antiguo; solo para leer almacenes sin migrar.
+const LEGACY_XOR_KEY: &[u8] = b"EclipseOS-SilverSurfer-passwords-v1";
+const V2: &str = "v2:";
+const NONCE_LEN: usize = 12;
+
+/// Clave del almacén.
+#[derive(Clone)]
+pub struct Cipher(ChaCha20Poly1305);
+
+impl Cipher {
+    pub fn from_key(key: &[u8; 32]) -> Self {
+        Self(ChaCha20Poly1305::new(Key::from_slice(key)))
+    }
+
+    fn seal(&self, entry: &Entry) -> Result<String, String> {
+        let mut nonce = [0u8; NONCE_LEN];
+        random_bytes(&mut nonce)?;
+        let aad = associated_data(&entry.origin, &entry.username);
+        let sealed = self
+            .0
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: entry.secret.as_bytes(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| "contraseñas: no se pudo cifrar".to_string())?;
+        let mut blob = nonce.to_vec();
+        blob.extend_from_slice(&sealed);
+        Ok(format!("{V2}{}", base64_encode(&blob)))
+    }
+
+    fn open(&self, origin: &str, username: &str, stored: &str) -> Option<String> {
+        let blob = base64_decode(stored.strip_prefix(V2)?).ok()?;
+        if blob.len() < NONCE_LEN {
+            return None;
+        }
+        let (nonce, sealed) = blob.split_at(NONCE_LEN);
+        let aad = associated_data(origin, username);
+        let plain = self
+            .0
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: sealed,
+                    aad: &aad,
+                },
+            )
+            .ok()?;
+        String::from_utf8(plain).ok()
+    }
+}
+
+fn associated_data(origin: &str, username: &str) -> Vec<u8> {
+    let mut aad = origin.as_bytes().to_vec();
+    aad.push(0);
+    aad.extend_from_slice(username.as_bytes());
+    aad
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -20,10 +90,12 @@ pub struct Entry {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Store {
     pub entries: Vec<Entry>,
+    /// Alguna entrada venía en el formato antiguo y hay que reescribirla.
+    pub legacy: bool,
 }
 
 impl Store {
-    pub fn encode(&self) -> String {
+    pub fn encode(&self, cipher: &Cipher) -> Result<String, String> {
         let mut out = String::from("{\n  \"passwords\": [\n");
         for (i, e) in self.entries.iter().enumerate() {
             out.push_str("    {\n");
@@ -34,7 +106,7 @@ impl Store {
             ));
             out.push_str(&format!(
                 "      \"secret\": {}\n",
-                json_string(&obfuscate(&e.secret))
+                json_string(&cipher.seal(e)?)
             ));
             out.push_str("    }");
             if i + 1 < self.entries.len() {
@@ -43,11 +115,12 @@ impl Store {
             out.push('\n');
         }
         out.push_str("  ]\n}\n");
-        out
+        Ok(out)
     }
 
-    pub fn decode(text: &str) -> Self {
+    pub fn decode(text: &str, cipher: &Cipher) -> Self {
         let mut entries = Vec::new();
+        let mut legacy = false;
         for obj in leaf_objects(text) {
             if obj.contains("\"origin\"") && obj.contains("\"secret\"") {
                 if let (Some(origin), Some(username), Some(secret)) = (
@@ -55,17 +128,35 @@ impl Store {
                     find_string(obj, "\"username\""),
                     find_string(obj, "\"secret\""),
                 ) {
-                    if !origin.is_empty() {
-                        entries.push(Entry {
-                            origin,
-                            username,
-                            secret: deobfuscate(&secret),
-                        });
+                    if origin.is_empty() {
+                        continue;
                     }
+                    let secret = if secret.starts_with(V2) {
+                        match cipher.open(&origin, &username, &secret) {
+                            Some(plain) => plain,
+                            None => {
+                                // Otra clave o fichero alterado: se descarta
+                                // en vez de rellenar formularios con basura.
+                                eprintln!(
+                                    "silversurfer: contraseña de {origin} ilegible \
+(¿falta passwords.key?)"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        legacy = true;
+                        deobfuscate(&secret)
+                    };
+                    entries.push(Entry {
+                        origin,
+                        username,
+                        secret,
+                    });
                 }
             }
         }
-        Self { entries }
+        Self { entries, legacy }
     }
 
     pub fn find_for_url(&self, url: &str) -> Option<&Entry> {
@@ -101,33 +192,135 @@ pub fn passwords_path() -> PathBuf {
     data_dir().join("passwords.json")
 }
 
-pub fn load_from(path: &Path) -> Store {
+pub fn key_path() -> PathBuf {
+    data_dir().join("passwords.key")
+}
+
+/// Lee la clave de `path`; si no existe, la crea (0600, sin pisar otra).
+pub fn load_or_create_key(path: &Path) -> Result<Cipher, String> {
+    let mut key = [0u8; 32];
+    match std::fs::File::open(path) {
+        Ok(mut file) => {
+            file.read_exact(&mut key)
+                .map_err(|e| format!("passwords.key: {e}"))?;
+            return Ok(Cipher::from_key(&key));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("passwords.key: {e}")),
+    }
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent)?;
+    }
+    random_bytes(&mut key)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(&key)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| format!("passwords.key: {e}"))?;
+            Ok(Cipher::from_key(&key))
+        }
+        // Otra ventana la creó a la vez: vale la suya.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => load_or_create_key(path),
+        Err(e) => Err(format!("passwords.key: {e}")),
+    }
+}
+
+fn create_private_dir(dir: &Path) -> Result<(), String> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir).map_err(|e| format!("passwords: {e}"))
+}
+
+/// Carga el almacén. Si venía en el formato antiguo, lo reescribe cifrado.
+pub fn load_from(path: &Path, key: &Path) -> Store {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Store::default();
     };
-    Store::decode(&text)
+    let cipher = match load_or_create_key(key) {
+        Ok(cipher) => cipher,
+        Err(err) => {
+            eprintln!("silversurfer: {err}");
+            return Store::default();
+        }
+    };
+    let mut store = Store::decode(&text, &cipher);
+    if store.legacy {
+        match write_store(path, &store, &cipher) {
+            Ok(()) => store.legacy = false,
+            Err(err) => eprintln!("silversurfer: {err}"),
+        }
+    }
+    store
 }
 
 pub fn load() -> Store {
-    load_from(&passwords_path())
+    load_from(&passwords_path(), &key_path())
 }
 
-pub fn save_to(path: &Path, store: &Store) -> Result<(), String> {
+pub fn save_to(path: &Path, key: &Path, store: &Store) -> Result<(), String> {
+    let cipher = load_or_create_key(key)?;
+    write_store(path, store, &cipher)
+}
+
+fn write_store(path: &Path, store: &Store, cipher: &Cipher) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("passwords: {e}"))?;
+        create_private_dir(parent)?;
     }
+    let text = store.encode(cipher)?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, store.encode()).map_err(|e| format!("passwords: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options.open(&tmp).map_err(|e| format!("passwords: {e}"))?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("passwords: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("passwords: {e}"))
 }
 
 pub fn save(store: &Store) -> Result<(), String> {
-    save_to(&passwords_path(), store)
+    save_to(&passwords_path(), &key_path(), store)
+}
+
+/// Bytes del generador del núcleo (getrandom(2), o `/dev/urandom`).
+fn random_bytes(buf: &mut [u8]) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut filled = 0;
+        while filled < buf.len() {
+            let rest = &mut buf[filled..];
+            // SAFETY: `rest` es un búfer válido de `rest.len()` bytes.
+            let n = unsafe { libc::getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) };
+            if n > 0 {
+                filled += n as usize;
+            } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        if filled == buf.len() {
+            return Ok(());
+        }
+    }
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(buf))
+        .map_err(|e| format!("aleatoriedad: {e}"))
 }
 
 pub fn origin_of(url: &str) -> Option<String> {
@@ -148,7 +341,8 @@ pub fn page_url() -> url::Url {
 code{background:#222;padding:.1rem .3rem}</style>\
 <h1>Contraseñas guardadas</h1>\
 <p>Ctrl+Shift+L guarda el login visible. Autocompletado al cargar el origen.\
- Almacén ofuscado en <code>passwords.json</code> (no es cifrado fuerte).</p>",
+ Cifrado con ChaCha20-Poly1305 en <code>passwords.json</code>; la clave está\
+ en <code>passwords.key</code>.</p>",
     );
     if store.entries.is_empty() {
         body.push_str("<p>Vacío.</p>");
@@ -210,16 +404,6 @@ return user+'\\n'+pass;\
 }catch(e){return '';}})()"
 }
 
-fn obfuscate(plain: &str) -> String {
-    let xored: Vec<u8> = plain
-        .as_bytes()
-        .iter()
-        .enumerate()
-        .map(|(i, b)| b ^ XOR_KEY[i % XOR_KEY.len()])
-        .collect();
-    base64_encode(&xored)
-}
-
 fn deobfuscate(encoded: &str) -> String {
     let Ok(bytes) = base64_decode(encoded) else {
         return String::new();
@@ -227,7 +411,7 @@ fn deobfuscate(encoded: &str) -> String {
     let plain: Vec<u8> = bytes
         .iter()
         .enumerate()
-        .map(|(i, b)| b ^ XOR_KEY[i % XOR_KEY.len()])
+        .map(|(i, b)| b ^ LEGACY_XOR_KEY[i % LEGACY_XOR_KEY.len()])
         .collect();
     String::from_utf8_lossy(&plain).into_owned()
 }
@@ -325,10 +509,67 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ss-pass-{tag}-{nanos}"))
+    }
+
+    fn cipher() -> Cipher {
+        Cipher::from_key(&[7u8; 32])
+    }
+
     #[test]
-    fn obfuscate_round_trip() {
-        let s = "páss word! 🔐";
-        assert_eq!(deobfuscate(&obfuscate(s)), s);
+    fn encrypted_round_trip_hides_the_secret() {
+        let mut store = Store::default();
+        store.upsert("https://a.test", "ada", "páss word! 🔐");
+        let text = store.encode(&cipher()).unwrap();
+        assert!(!text.contains("páss"));
+        assert!(text.contains("\"v2:"));
+        let back = Store::decode(&text, &cipher());
+        assert_eq!(back.entries, store.entries);
+        assert!(!back.legacy);
+        // Nonce nuevo en cada guardado.
+        assert_ne!(text, store.encode(&cipher()).unwrap());
+    }
+
+    #[test]
+    fn wrong_key_or_swapped_entry_does_not_decrypt() {
+        let mut store = Store::default();
+        store.upsert("https://a.test", "ada", "s3cret");
+        let text = store.encode(&cipher()).unwrap();
+        let other = Cipher::from_key(&[8u8; 32]);
+        assert!(Store::decode(&text, &other).entries.is_empty());
+        // El mismo secreto pegado en otro origen no se abre.
+        let moved = text.replace("https://a.test", "https://evil.test");
+        assert!(Store::decode(&moved, &cipher()).entries.is_empty());
+    }
+
+    #[test]
+    fn legacy_store_is_read_and_migrated() {
+        let dir = temp_dir("legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("passwords.json");
+        let key = dir.join("passwords.key");
+        let xored: Vec<u8> = "viejo"
+            .bytes()
+            .enumerate()
+            .map(|(i, b)| b ^ LEGACY_XOR_KEY[i % LEGACY_XOR_KEY.len()])
+            .collect();
+        let legacy = format!(
+            "{{\"passwords\": [{{\"origin\": \"https://a.test\", \"username\": \"u\", \
+\"secret\": \"{}\"}}]}}",
+            base64_encode(&xored)
+        );
+        std::fs::write(&path, legacy).unwrap();
+        let store = load_from(&path, &key);
+        assert_eq!(store.entries[0].secret, "viejo");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("\"v2:"));
+        assert_eq!(load_from(&path, &key).entries[0].secret, "viejo");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -356,18 +597,23 @@ mod tests {
 
     #[test]
     fn file_round_trip() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("ss-pass-{nanos}"));
+        let dir = temp_dir("file");
         let path = dir.join("passwords.json");
+        let key = dir.join("passwords.key");
         let mut store = Store::default();
         store.upsert("https://a.test", "u", "s3cret");
-        save_to(&path, &store).unwrap();
-        let back = load_from(&path);
+        save_to(&path, &key, &store).unwrap();
+        let back = load_from(&path, &key);
         assert_eq!(back.entries.len(), 1);
         assert_eq!(back.entries[0].secret, "s3cret");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(&key), 0o600);
+            assert_eq!(std::fs::metadata(&key).unwrap().len(), 32);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
