@@ -124,6 +124,24 @@ impl SignalFd {
         outcome
     }
 
+    /// `signalfd_read()` once the first record of `buf` is in, `done` bytes
+    /// of it: every further whole record the buffer holds takes another
+    /// pending signal, without waiting, and the read returns what it got.
+    ///
+    /// It returned one record whatever the buffer, so the three entries a
+    /// real-time signal queued took three reads where Linux hands them out in
+    /// one.
+    fn read_more(&self, buf: &mut [u8], mut done: usize) -> usize {
+        while buf.len() - done >= SIGINFO_SIZE {
+            let Some(info) = self.consume_one() else {
+                break;
+            };
+            buf[done..done + SIGINFO_SIZE].copy_from_slice(&signalfd_record(&info));
+            done += SIGINFO_SIZE;
+        }
+        done
+    }
+
     /// Consume and return the lowest-numbered accepted pending signal, removing
     /// it from the calling thread's pending set, with the `siginfo_t` that
     /// came with it.
@@ -282,19 +300,20 @@ impl FileLike for SignalFd {
         if buf.len() < SIGINFO_SIZE {
             return Err(LxError::EINVAL);
         }
-        if let Some(info) = self.consume_one() {
+        let first = if let Some(info) = self.consume_one() {
             buf[..SIGINFO_SIZE].copy_from_slice(&signalfd_record(&info));
-            return Ok(SIGINFO_SIZE);
-        }
-        if self.flags().non_block() {
+            SIGINFO_SIZE
+        } else if self.flags().non_block() {
             return Err(LxError::EAGAIN);
-        }
-        match Self::current_thread() {
-            Some(thread) => self.wait_for_one(buf, &thread).await,
-            // No Linux thread behind the call: nothing can ever be queued
-            // to it, so there is nothing to wait for.
-            None => Err(LxError::EAGAIN),
-        }
+        } else {
+            match Self::current_thread() {
+                Some(thread) => self.wait_for_one(buf, &thread).await?,
+                // No Linux thread behind the call: nothing can ever be
+                // queued to it, so there is nothing to wait for.
+                None => return Err(LxError::EAGAIN),
+            }
+        };
+        Ok(self.read_more(buf, first))
     }
 
     fn write(&self, _buf: &[u8]) -> LxResult<usize> {
@@ -624,6 +643,8 @@ mod blocking_read_tests {
     use crate::process::ProcessExt;
     use crate::process::{send_signal_to_process, LinuxProcess};
     use crate::signal::{SignalAction, SignalActionFlags};
+    use alloc::vec::Vec;
+    use core::convert::TryInto;
     use core::time::Duration;
     use rcore_fs_ramfs::RamFS;
     use std::sync::mpsc;
@@ -698,6 +719,54 @@ mod blocking_read_tests {
             0,
             "the wait set must be cleared once the read returns"
         );
+    }
+
+    /// `read` of a `records`-record buffer as `thread`, which has its
+    /// signals pending already: what came back, and the `ssi_int` of each
+    /// record.
+    fn read_records(
+        fd: &SignalFd,
+        thread: Arc<Thread>,
+        records: usize,
+    ) -> (LxResult<usize>, Vec<i32>) {
+        let mut buf = alloc::vec![0u8; records * SIGINFO_SIZE];
+        let r = async_std::task::block_on(async {
+            kernel_hal::thread::set_current_thread(Some(thread));
+            fd.read(&mut buf).await
+        });
+        let got = *r.as_ref().unwrap_or(&0) / SIGINFO_SIZE;
+        let ints = (0..got)
+            .map(|i| i32::from_ne_bytes(buf[i * SIGINFO_SIZE + 44..][..4].try_into().unwrap()))
+            .collect();
+        (r, ints)
+    }
+
+    /// `signalfd_read()` fills the buffer: every whole record of it takes
+    /// one more pending entry, without waiting for more. A read returned one
+    /// record whatever the buffer, so three `sigqueue`s of one signal took
+    /// three reads.
+    #[test]
+    fn one_read_takes_as_many_entries_as_the_buffer_holds() {
+        let (_proc, _main, reader) = program(51_121);
+        let rt = LinuxSignal::SIGRT34;
+        reader.lock_linux().set_signal_mask(Sigset::new(bit(rt)));
+        let queue = |v: usize| {
+            let info = SigInfo::queued(rt, 1, 0, v);
+            reader.lock_linux().queue_signal(rt, Some(info));
+        };
+        (1..=3).for_each(queue);
+        let fd = SignalFd::new(bit(rt), OpenFlags::NON_BLOCK);
+        let (r, ints) = read_records(&fd, reader.clone(), 4);
+        assert_eq!(r, Ok(3 * SIGINFO_SIZE));
+        assert_eq!(ints, [1, 2, 3]);
+        assert_eq!(read_records(&fd, reader.clone(), 4).0, Err(LxError::EAGAIN));
+        // A buffer of exactly two takes two.
+        (5..=6).for_each(queue);
+        assert_eq!(read_records(&fd, reader.clone(), 2).1, [5, 6]);
+        // A buffer of one record takes the first, and leaves the second.
+        (8..=9).for_each(queue);
+        assert_eq!(read_records(&fd, reader.clone(), 1).1, [8]);
+        assert_eq!(read_records(&fd, reader, 1).1, [9]);
     }
 
     #[test]

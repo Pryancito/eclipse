@@ -260,7 +260,12 @@ fn deliver_direct_sigkill(
 /// `send_signal_to_process` carries the comment "that drop is why lunarbar's
 /// `kill 1` did nothing". Contention is likeliest exactly when the target is
 /// busy, which is when a signal matters.
-fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal, info: SigInfo) {
+///
+/// Counted against the target's real user, as every send is: `EAGAIN` for a
+/// real-time signal past its `RLIMIT_SIGPENDING` (a `tkill` too, whose
+/// `SI_TKILL` is not `kill(2)`'s `SI_USER`), with nothing made pending and
+/// nobody woken.
+fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal, info: SigInfo) -> LxResult<()> {
     // The same three steps `do_send_specific` takes, and only the middle one
     // used to be here. `prepare_signal` and the job-control half of
     // `complete_signal` are process-wide even for a signal aimed at one
@@ -272,23 +277,15 @@ fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal, info: SigInfo) {
     // stop and a continue at once.
     let process = thread.proc();
     linux_object::process::prepare_signal(process, signal);
-    thread.lock_linux().queue_signal(signal, Some(info));
+    let to = process.try_linux().map(|lp| lp.signal_receiver());
+    (thread.lock_linux())
+        .send_signal(signal, Some(info), to)
+        .map_err(|_| LxError::EAGAIN)?;
     linux_object::process::wake_signal_sleeper(thread);
     linux_object::process::complete_signal_for_job_control(process, signal);
+    Ok(())
 }
 
-/// The `siginfo_t` a process queues with `rt_sigqueueinfo(2)`,
-/// `rt_tgsigqueueinfo(2)` or `pidfd_send_signal(2)`: the caller's own,
-/// verbatim, with `si_signo` forced to the signal the call named
-/// (`do_rt_sigqueueinfo`: `info->si_signo = sig`). Nothing else is
-/// rewritten, since `may_queue_siginfo` has already refused the codes that
-/// would forge a kernel or a `tkill`: `si_pid` and `si_uid` are what the
-/// sender wrote (glibc's `sigqueue(3)` fills them in itself) and `si_value`
-/// is the whole point of the call.
-///
-/// The syscalls used to read only the 12-byte head, decide the permission on
-/// it and then deliver the `siginfo_t` of a plain `kill(2)`: `SI_USER` and a
-/// zero `si_value`, whatever `sigqueue(pid, sig, value)` had sent.
 /// The wait of `rt_sigtimedwait(2)`: park `thread` until one of `waitset`
 /// is pending on it, dequeue that signal and return it with its `siginfo`.
 /// `EINTR` if an unblocked signal outside the set interrupts the wait,
@@ -348,6 +345,18 @@ pub(crate) async fn sigtimedwait_on(
     outcome
 }
 
+/// The `siginfo_t` a process queues with `rt_sigqueueinfo(2)`,
+/// `rt_tgsigqueueinfo(2)` or `pidfd_send_signal(2)`: the caller's own,
+/// verbatim, with `si_signo` forced to the signal the call named
+/// (`do_rt_sigqueueinfo`: `info->si_signo = sig`). Nothing else is
+/// rewritten, since `may_queue_siginfo` has already refused the codes that
+/// would forge a kernel or a `tkill`: `si_pid` and `si_uid` are what the
+/// sender wrote (glibc's `sigqueue(3)` fills them in itself) and `si_value`
+/// is the whole point of the call.
+///
+/// The syscalls used to read only the 12-byte head, decide the permission on
+/// it and then deliver the `siginfo_t` of a plain `kill(2)`: `SI_USER` and a
+/// zero `si_value`, whatever `sigqueue(pid, sig, value)` had sent.
 pub(crate) fn queued_from_user(signal: Signal, mut user: SigInfo) -> SigInfo {
     user.signo = signal as i32;
     user
@@ -669,7 +678,7 @@ impl Syscall<'_> {
         };
         if let Some(thread) = thread.cloned().or_else(leader) {
             let info = info.unwrap_or_else(|| self.sent_by_me(signal, SignalCode::TKILL));
-            queue_signal_to_thread(&thread, signal, info);
+            queue_signal_to_thread(&thread, signal, info)?;
         }
         Ok(())
     }
@@ -803,7 +812,7 @@ impl Syscall<'_> {
         self.may_signal_process(&self.kill_context(signal), &process)?;
         // tkill(tid, 0) probes the thread and delivers nothing.
         if let Some(signal) = signal {
-            queue_signal_to_thread(&thread, signal, self.sent_by_me(signal, SignalCode::TKILL));
+            queue_signal_to_thread(&thread, signal, self.sent_by_me(signal, SignalCode::TKILL))?;
         }
         Ok(0)
     }
@@ -829,7 +838,7 @@ impl Syscall<'_> {
         self.may_signal_process(&self.kill_context(signal), &process)?;
         // tgkill(tgid, tid, 0) probes the thread and delivers nothing.
         if let (Some(signal), Some(thread)) = (signal, thread) {
-            queue_signal_to_thread(&thread, signal, self.sent_by_me(signal, SignalCode::TKILL));
+            queue_signal_to_thread(&thread, signal, self.sent_by_me(signal, SignalCode::TKILL))?;
         }
         Ok(0)
     }
@@ -1013,7 +1022,7 @@ impl Syscall<'_> {
         // it is refused just the same, so it cannot report the existence of a
         // thread you may not signal.
         if let (Some(signal), Some(thread)) = (signal, thread) {
-            queue_signal_to_thread(&thread, signal, queued_from_user(signal, user));
+            queue_signal_to_thread(&thread, signal, queued_from_user(signal, user))?;
         }
         Ok(0)
     }
@@ -1156,6 +1165,9 @@ mod zombie_tests;
 
 #[cfg(test)]
 mod exited_leader_tests;
+
+#[cfg(test)]
+mod queue_tests;
 
 #[cfg(test)]
 mod sigaction_query_tests {
@@ -1560,7 +1572,8 @@ mod queued_siginfo_tests {
             &thread,
             Signal::SIGUSR1,
             SigInfo::from_user(Signal::SIGUSR1, 31, 1000, SignalCode::TKILL),
-        );
+        )
+        .unwrap();
         let info = thread.lock_linux().take_siginfo(Signal::SIGUSR1);
         let b = info.as_bytes();
         let word = |at: usize| i32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);

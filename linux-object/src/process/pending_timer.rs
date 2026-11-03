@@ -48,7 +48,9 @@ pub fn drop_pending_timer_signal(
 }
 
 /// Hand `act` timer `timerid`'s waiting signal, and throw it away when
-/// `act` says so.
+/// `act` says so. Only the timer's own entry is looked at
+/// ([`SigQueue::at_timer`]): a signal of the same number from anybody else,
+/// queued before or after it, stays where it is.
 fn at_pending_timer_signal(
     pid: usize,
     tid: Option<usize>,
@@ -56,30 +58,10 @@ fn at_pending_timer_signal(
     timerid: i32,
     mut act: impl FnMut(&mut SigInfo) -> bool,
 ) -> bool {
-    use crate::thread::{LinuxThread, ThreadExt};
+    use crate::thread::ThreadExt;
     let Some(process) = ROOT_JOB.find_process(pid as KoID) else {
         return false;
     };
-    // Whether the timer's signal was there, and whether to throw it away.
-    let mut ours = |info: Option<&mut SigInfo>| match info {
-        Some(info) if info.timer_id() == Some(timerid) => Some(act(info)),
-        _ => None,
-    };
-    fn on_thread(
-        lt: &mut LinuxThread,
-        signal: LinuxSignal,
-        ours: &mut impl FnMut(Option<&mut SigInfo>) -> Option<bool>,
-    ) -> bool {
-        match ours(lt.pending_siginfo_mut(signal)) {
-            Some(drop) => {
-                if drop {
-                    lt.discard_signal(signal);
-                }
-                true
-            }
-            None => false,
-        }
-    }
     if let Some(tid) = tid {
         let Some(thread) = process
             .get_child(tid as KoID)
@@ -88,26 +70,23 @@ fn at_pending_timer_signal(
         else {
             return false;
         };
-        let mut lt = thread.lock_linux();
-        return on_thread(&mut lt, signal, &mut ours);
+        let found = thread
+            .lock_linux()
+            .at_pending_timer(signal, timerid, &mut act);
+        return found;
     }
     if let Some(lp) = process.try_linux() {
-        let mut inner = lp.inner.lock();
-        if inner.shared_pending.contains(signal) {
-            if let Some(drop) = ours(inner.shared_pending_info.get_mut(&(signal as u8))) {
-                if drop {
-                    inner.shared_pending.remove(signal);
-                    inner.shared_pending_info.remove(&(signal as u8));
-                    lp.refresh_exit_path(&inner);
-                }
-                return true;
-            }
+        let mut guard = lp.inner.lock();
+        let inner = &mut *guard;
+        if (inner.shared_queue).at_timer(&mut inner.shared_pending, signal, timerid, &mut act) {
+            lp.refresh_exit_path(&guard);
+            return true;
         }
     }
     process.threads().iter().any(|thread| {
         thread
             .try_lock_linux()
-            .is_some_and(|mut lt| on_thread(&mut lt, signal, &mut ours))
+            .is_some_and(|mut lt| lt.at_pending_timer(signal, timerid, &mut act))
     })
 }
 

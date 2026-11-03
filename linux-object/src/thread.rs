@@ -2,9 +2,9 @@
 
 use crate::error::SysResult;
 use crate::process::ProcessExt;
+use crate::signal::queue::{QueueFull, Receiver, SigQueue};
 use crate::signal::{SigInfo, Signal, SignalStack, SignalUserContext, Sigset};
 use crate::sync::shared_futex;
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -829,12 +829,10 @@ pub struct LinuxThread {
     /// `get_task_ioprio` does. Recorded and read back: there is no I/O
     /// scheduler here to act on it, but `ionice` must see what it set.
     pub ioprio: u16,
-    /// The `siginfo_t` that goes with each pending signal in `signals`, when
-    /// the sender left one: who sent a `kill`, which child a `SIGCHLD` is
-    /// about and how it ended. `signals` is a bitmap, so a signal is pending
-    /// once and, as for Linux's non-realtime signals, the FIRST sender's
-    /// information is the one kept. Read and cleared by [`Self::take_siginfo`].
-    pending_info: BTreeMap<u8, SigInfo>,
+    /// The entries of the pending signals in `signals`: who sent a `kill`,
+    /// which child a `SIGCHLD` is about, each `sigqueue` value of a real-time
+    /// signal sent more than once. Read by [`Self::take_siginfo`].
+    queue: SigQueue,
     /// The `siginfo_t` handed to the handler now running, so `sigreturn` can
     /// tell what the handler changed from what the kernel wrote.
     handling_info: SigInfo,
@@ -985,7 +983,7 @@ impl LinuxThread {
             comm: String::new(),
             timerslack_ns: 0,
             ioprio: 0,
-            pending_info: BTreeMap::new(),
+            queue: SigQueue::default(),
             handling_info: SigInfo::default(),
         }
     }
@@ -1085,7 +1083,7 @@ impl LinuxThread {
             saved_sigmask: None,
             sigwait: Sigset::default(),
             // Pending signals are fresh (above), and so is what went with them.
-            pending_info: BTreeMap::new(),
+            queue: SigQueue::default(),
             handling_info: SigInfo::default(),
         }
     }
@@ -1120,7 +1118,7 @@ impl LinuxThread {
             // an `ioprio_set` followed by an `execve`, and it must stick.
             ioprio: _,
             // Pending signals survive `execve`, and what went with them too.
-            pending_info: _,
+            queue: _,
             handling_info: _,
         } = self;
 
@@ -1164,38 +1162,75 @@ impl LinuxThread {
         //   never touches it.
     }
 
-    /// Handle signal
-    /// Make `signal` pending, with what the sender knows about it.
+    /// Make `signal` pending, with what the sender knows about it, counted
+    /// against nobody: a fault the CPU raised, and the tests. Everything a
+    /// process sends goes through [`Self::send_signal`].
     ///
-    /// A signal already pending keeps the information it came with, as Linux
-    /// does for the non-realtime signals: the second `kill` is not queued and
-    /// the handler learns about the first.
+    /// A standard signal already pending keeps the information it came
+    /// with, as Linux keeps it: the second `kill` is not queued and the
+    /// handler learns about the first. A real-time one is queued again.
     pub fn queue_signal(&mut self, signal: Signal, info: Option<SigInfo>) {
-        self.signals.insert(signal);
-        if let Some(info) = info {
-            self.pending_info.entry(signal as u8).or_insert(info);
-        }
+        let _ = self.queue.send(&mut self.signals, signal, info, None);
     }
 
-    /// Take `signal` out of the pending set together with its `siginfo_t`,
-    /// which is [`SigInfo::bare`] when the sender left none. What is
-    /// returned is also what `sigreturn` will compare the handler's frame
-    /// against.
+    /// [`Self::queue_signal`], counted against the receiving user `to`:
+    /// [`QueueFull`] (`EAGAIN`) for a real-time signal past its
+    /// `RLIMIT_SIGPENDING` that `kill(2)` did not send. See
+    /// [`SigQueue::send`].
+    pub fn send_signal(
+        &mut self,
+        signal: Signal,
+        info: Option<SigInfo>,
+        to: Option<Receiver>,
+    ) -> Result<(), QueueFull> {
+        self.queue.send(&mut self.signals, signal, info, to)
+    }
+
+    /// The expiry of a POSIX timer aimed at this thread, in the timer's own
+    /// entry ([`SigQueue::send_timer`]).
+    pub fn send_timer_signal(&mut self, signal: Signal, info: SigInfo) {
+        self.queue.send_timer(&mut self.signals, signal, info);
+    }
+
+    /// Take `signal`'s first entry out of the pending set: its `siginfo_t`,
+    /// which is [`SigInfo::bare`] when the sender left none. The signal stays
+    /// pending while it has another. What is returned is also what
+    /// `sigreturn` will compare the handler's frame against.
     pub fn take_siginfo(&mut self, signal: Signal) -> SigInfo {
-        self.signals.remove(signal);
-        let info = self
-            .pending_info
-            .remove(&(signal as u8))
-            .unwrap_or_else(|| SigInfo::bare(signal));
+        let info = self.queue.take(&mut self.signals, signal);
         self.handling_info = info;
         info
     }
 
-    /// Throw `signal` away with its `siginfo_t`, without taking it: nothing
-    /// is handled, so what `sigreturn` compares against stays as it is.
+    /// Throw `signal` away with every entry it has, without taking it:
+    /// nothing is handled, so what `sigreturn` compares against stays as it
+    /// is.
     pub fn discard_signal(&mut self, signal: Signal) {
-        self.signals.remove(signal);
-        self.pending_info.remove(&(signal as u8));
+        self.queue.discard(&mut self.signals, signal);
+    }
+
+    /// How many entries `signal` has queued on this thread.
+    pub fn queued_entries_of(&self, signal: Signal) -> usize {
+        self.queue.entries_of(signal)
+    }
+
+    /// The thread is gone: every signal it had pending goes, and its
+    /// entries are given back to their users (`flush_sigqueue(&tsk->pending)`
+    /// in `__exit_signal`).
+    pub fn flush_pending(&mut self) {
+        self.signals = Sigset::empty();
+        self.queue.clear();
+    }
+
+    /// The thread end of a process-directed signal moving onto it: see
+    /// [`SigQueue::move_into`].
+    pub(crate) fn absorb_signal(
+        &mut self,
+        from: &mut SigQueue,
+        from_pending: &mut Sigset,
+        signal: Signal,
+    ) {
+        from.move_into(from_pending, signal, &mut self.queue, &mut self.signals);
     }
 
     /// [`Self::discard_signal`] for each of `set` that is pending: what a
@@ -1217,13 +1252,15 @@ impl LinuxThread {
         self.handling_info = info;
     }
 
-    /// The `siginfo_t` `signal` is pending with, to change in place: `None`
-    /// when it is not pending, or came without one.
-    pub fn pending_siginfo_mut(&mut self, signal: Signal) -> Option<&mut SigInfo> {
-        if !self.signals.contains(signal) {
-            return None;
-        }
-        self.pending_info.get_mut(&(signal as u8))
+    /// POSIX timer `timerid`'s entry for `signal` on this thread, handed to
+    /// `act`, and taken out when `act` says so: see [`SigQueue::at_timer`].
+    pub fn at_pending_timer(
+        &mut self,
+        signal: Signal,
+        timerid: i32,
+        act: impl FnOnce(&mut SigInfo) -> bool,
+    ) -> bool {
+        self.queue.at_timer(&mut self.signals, signal, timerid, act)
     }
 
     /// The signals this thread would take **right now**: pending and not
@@ -1258,11 +1295,7 @@ impl LinuxThread {
             .mask_with(&self.signal_mask)
             .find_first_signal()?;
         self.handling_signal = Some(signal as u32);
-        self.signals.remove(signal);
-        let info = self
-            .pending_info
-            .remove(&(signal as u8))
-            .unwrap_or_else(|| SigInfo::bare(signal));
+        let info = self.queue.take(&mut self.signals, signal);
         // If a `rt_sigsuspend` (or similar) saved a mask to restore once
         // the handler returns, hand that mask to the signal frame so it
         // is reinstated on `sigreturn`. Otherwise keep the current mask --
@@ -1331,7 +1364,7 @@ mod signal_delivery_tests {
             comm: String::new(),
             timerslack_ns: 0,
             ioprio: IDLE_IOPRIO,
-            pending_info: BTreeMap::new(),
+            queue: SigQueue::default(),
             handling_info: SigInfo::default(),
         }
     }
@@ -1355,7 +1388,11 @@ mod signal_delivery_tests {
         t.queue_signal(Signal::SIGALRM, Some(alarm));
         t.discard_signal(Signal::SIGALRM);
         assert!(!t.signals.contains(Signal::SIGALRM), "still pending");
-        assert!(t.pending_info.is_empty(), "its siginfo_t is still there");
+        assert_eq!(
+            t.queued_entries_of(Signal::SIGALRM),
+            0,
+            "its siginfo_t is still there"
+        );
         assert!(t.handling_info == usr1, "it was taken, not thrown away");
     }
 
@@ -2268,7 +2305,7 @@ mod exec_reset_tests {
             sigwait: Sigset::default(),
             timerslack_ns: 1_234_567,
             ioprio: IDLE_IOPRIO,
-            pending_info: BTreeMap::new(),
+            queue: SigQueue::default(),
             handling_info: SigInfo::default(),
         }
     }
@@ -2445,7 +2482,7 @@ mod clone_inheritance_tests {
             sigwait: Sigset::default(),
             timerslack_ns: 1_234_567,
             ioprio: IDLE_IOPRIO,
-            pending_info: BTreeMap::new(),
+            queue: SigQueue::default(),
             handling_info: SigInfo::default(),
         }
     }
@@ -2704,6 +2741,42 @@ mod siginfo_tests {
         assert_eq!(info.signo, Signal::SIGHUP as i32);
         assert_eq!(word(&info, 16), 0, "si_pid of nobody");
         assert_eq!(info.code, SignalCode::USER);
+    }
+
+    /// The `si_value` of a `sigqueue`d info.
+    fn value(info: &SigInfo) -> i32 {
+        word(info, 24)
+    }
+
+    /// A handler runs once per entry of a real-time signal, each with its
+    /// own value, in the order they were sent, and the lower number goes
+    /// first: what `rtq` measures on Linux, a delivery at a time.
+    #[test]
+    fn each_entry_of_a_real_time_signal_is_its_own_delivery() {
+        let mut t = LinuxThread::initial();
+        let (rt, rt1) = (Signal::SIGRT34, Signal::SIGRT35);
+        for (signal, v) in [(rt1, 10), (rt, 20), (rt1, 11), (rt, 21)] {
+            t.queue_signal(signal, Some(SigInfo::queued(signal, 1, 0, v)));
+        }
+        let mut got = Vec::new();
+        while let Some((signal, _, info)) = t.handle_signal() {
+            got.push((signal, value(&info)));
+        }
+        assert_eq!(got, [(rt, 20), (rt, 21), (rt1, 10), (rt1, 11)]);
+    }
+
+    /// `execve` keeps what is queued, entries and all.
+    #[test]
+    fn exec_keeps_every_entry() {
+        let mut t = LinuxThread::initial();
+        let rt = Signal::SIGRT34;
+        for v in [41, 42] {
+            t.queue_signal(rt, Some(SigInfo::queued(rt, 1, 0, v)));
+        }
+        t.reset_for_exec();
+        assert_eq!(value(&t.take_siginfo(rt)), 41);
+        assert_eq!(value(&t.take_siginfo(rt)), 42);
+        assert!(!t.signals.contains(rt));
     }
 
     #[test]

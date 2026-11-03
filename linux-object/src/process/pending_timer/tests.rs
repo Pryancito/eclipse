@@ -17,7 +17,7 @@ fn a_process(pid: KoID) -> (Arc<Process>, Arc<Thread>) {
 /// Timer 7's `SIGALRM`, with `overrun` expiries in it, sent to `proc`.
 fn timer_7_fires(proc: &Process, overrun: i32) {
     let info = SigInfo::timer(LinuxSignal::SIGALRM, 7, overrun, 0);
-    send_signal_to_process_with_info(proc.id() as usize, LinuxSignal::SIGALRM, Some(info)).unwrap();
+    send_timer_signal_to_process(proc.id() as usize, LinuxSignal::SIGALRM, info).unwrap();
 }
 
 /// Look for timer `timerid`'s `SIGALRM` on `proc`, and make its overrun 5.
@@ -106,7 +106,7 @@ fn a_thread_directed_one_is_looked_for_on_its_thread_only() {
     let info = SigInfo::timer(LinuxSignal::SIGALRM, 7, 0, 0);
     second
         .lock_linux()
-        .queue_signal(LinuxSignal::SIGALRM, Some(info));
+        .send_timer_signal(LinuxSignal::SIGALRM, info);
     assert!(
         !restamp(&proc, Some(&first), 7),
         "found on the wrong thread"
@@ -153,9 +153,7 @@ fn dropped_from_the_process_while_every_thread_blocks_it() {
     assert!(drop_it(&proc, None, 7), "not found on the process");
     let inner = proc.linux().inner.lock();
     assert!(!inner.shared_pending.contains(LinuxSignal::SIGALRM));
-    assert!(!inner
-        .shared_pending_info
-        .contains_key(&(LinuxSignal::SIGALRM as u8)));
+    assert_eq!(inner.shared_queue.entries_of(LinuxSignal::SIGALRM), 0);
     let bits = proc
         .linux()
         .exit_path
@@ -195,10 +193,10 @@ fn a_thread_directed_one_is_dropped_from_its_thread_only() {
     let info = SigInfo::timer(LinuxSignal::SIGALRM, 7, 0, 0);
     first
         .lock_linux()
-        .queue_signal(LinuxSignal::SIGALRM, Some(info));
+        .send_timer_signal(LinuxSignal::SIGALRM, info);
     second
         .lock_linux()
-        .queue_signal(LinuxSignal::SIGALRM, Some(info));
+        .send_timer_signal(LinuxSignal::SIGALRM, info);
     assert!(drop_it(&proc, Some(&second), 7));
     assert!(!second.lock_linux().signals.contains(LinuxSignal::SIGALRM));
     assert!(

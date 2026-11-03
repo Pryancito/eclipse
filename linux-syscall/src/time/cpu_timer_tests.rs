@@ -218,6 +218,7 @@ fn a_cpu_timer(owner: KoID, clock: CpuClock, notify: TimerNotify) -> usize {
     POSIX_TIMERS.lock().insert(
         id,
         PosixTimer {
+            _sigq: None,
             owner,
             notify,
             clock: PosixTimerClock::Cpu(clock),
