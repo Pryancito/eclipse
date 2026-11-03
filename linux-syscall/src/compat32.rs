@@ -121,6 +121,7 @@ use linux_object::error::LxError;
 mod fcntl;
 mod ioctl;
 mod iovec;
+mod ipc;
 mod rlimit;
 mod signal;
 mod socketcall;
@@ -181,6 +182,11 @@ use time64::{
     I386_CLOCK_GETRES_TIME64, I386_CLOCK_GETTIME64, I386_CLOCK_NANOSLEEP_TIME64,
     I386_CLOCK_SETTIME64, I386_FUTEX_TIME64, I386_TIMERFD_GETTIME64, I386_TIMERFD_SETTIME64,
 };
+
+/// And `ipc`, the eleven System V calls behind one number --- where the
+/// MULTIPLEXER itself reads and writes the caller's memory in three places.
+/// See [`ipc`].
+use ipc::I386_IPC;
 
 /// And `ioctl`, which is in neither allowlist because the thing to vouch for
 /// is not the call but the **request**. See [`ioctl`].
@@ -313,6 +319,9 @@ impl Syscall<'_> {
                     self.sys_futex_time64(a0, a1 as _, a2 as _, a3, a4, a5 as _)
                         .await,
                 );
+            }
+            I386_IPC => {
+                return syscall_ret(self.sys_ipc32(a0 as u32, a1, a2, a3, a4, a5).await);
             }
             I386_PREADV => return syscall_ret(self.sys_preadv32(a0, a1, a2, a3, a4).await),
             I386_PWRITEV => return syscall_ret(self.sys_pwritev32(a0, a1, a2, a3, a4)),
