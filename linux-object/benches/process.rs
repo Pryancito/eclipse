@@ -43,7 +43,7 @@
 
 extern crate test;
 
-use linux_object::fs::{File, FileDesc, OpenFlags};
+use linux_object::fs::{EpollEvent, File, FileDesc, OpenFlags};
 use linux_object::process::{LinuxProcess, RLimit, RLIMIT_NOFILE};
 use rcore_fs::vfs::{FileType, INode};
 use rcore_fs_ramfs::RamFS;
@@ -339,4 +339,78 @@ fn close_and_reopen_of_256(b: &mut Bencher) {
 #[bench]
 fn close_and_reopen_of_8192(b: &mut Bencher) {
     bench_close_and_reopen(b, 8192);
+}
+
+/// `EPOLL_CTL_ADD`, as `<sys/epoll.h>` numbers it.
+const EPOLL_CTL_ADD: i32 = 1;
+
+/// A process whose epoll, at descriptor 0, watches each of its `n` other
+/// descriptors: an event loop holding `n` connections, which is what a server
+/// looks like. Eventfds stand in for the sockets, since a regular file cannot
+/// be watched.
+fn with_watched_files(n: usize) -> (LinuxProcess, Arc<linux_object::fs::Epoll>) {
+    let proc = with_open_files(0);
+    let ep = linux_object::fs::Epoll::new(OpenFlags::empty());
+    proc.add_file(ep.clone()).expect("an empty table has room");
+    for _ in 0..n {
+        let file: Arc<dyn linux_object::fs::FileLike> =
+            linux_object::fs::EventFd::new(0, OpenFlags::empty());
+        let fd = proc
+            .add_file(file.clone())
+            .expect("the limit was raised above n");
+        ep.ctl(
+            EPOLL_CTL_ADD,
+            fd,
+            EpollEvent { events: 1, data: 0 },
+            Some(file),
+        )
+        .expect("an eventfd can be watched");
+    }
+    (proc, ep)
+}
+
+/// One `close(2)` of a watched descriptor, and the `accept` and
+/// `EPOLL_CTL_ADD` that put a new connection under the same number: the
+/// cycle an event loop runs once per connection. The close is the one that
+/// has to take the entry out of the epoll, as Linux's `__fput` does with
+/// `eventpoll_release`. Linux finds a file's entries through `file->f_ep`,
+/// so its cost does not depend on how many other files the epoll watches.
+/// A family that grows with `n` here pays for every connection still open
+/// each time one closes, and closing all `n` costs `n` squared.
+fn bench_close_watched_and_rewatch(b: &mut Bencher, n: usize) {
+    let (proc, ep) = with_watched_files(n);
+    let last = FileDesc::from(n);
+    b.iter(|| {
+        proc.close_file(test::black_box(last)).expect("it is open");
+        let file: Arc<dyn linux_object::fs::FileLike> =
+            linux_object::fs::EventFd::new(0, OpenFlags::empty());
+        let fd = proc
+            .add_file(file.clone())
+            .expect("the number just came free");
+        test::black_box(
+            ep.ctl(
+                EPOLL_CTL_ADD,
+                fd,
+                EpollEvent { events: 1, data: 0 },
+                Some(file),
+            )
+            .expect("the closed entry is gone, so this is no EEXIST"),
+        )
+    });
+}
+
+/// The control row: the epoll watches the one descriptor that is cycled.
+#[bench]
+fn close_watched_and_rewatch_of_1(b: &mut Bencher) {
+    bench_close_watched_and_rewatch(b, 1);
+}
+
+#[bench]
+fn close_watched_and_rewatch_of_256(b: &mut Bencher) {
+    bench_close_watched_and_rewatch(b, 256);
+}
+
+#[bench]
+fn close_watched_and_rewatch_of_8192(b: &mut Bencher) {
+    bench_close_watched_and_rewatch(b, 8192);
 }

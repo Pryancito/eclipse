@@ -1,5 +1,5 @@
 use super::*;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use lock::Mutex;
 use zircon_object::object::*;
@@ -342,6 +342,72 @@ struct EpollInner {
     /// `EPOLL_CTL_*` on the fd starts it over, as `ep_modify` re-reports a
     /// level that is already up.
     edge: BTreeMap<FileDesc, EdgeState>,
+    /// Every entry of `interest_list` again, as (description, number): the
+    /// order Linux keeps its own interest tree in, since `ep_cmp_ffd`
+    /// compares the file first and the number second. The entries that watch
+    /// one description sit together, so [`Epoll::forget_closed`] finds them
+    /// without walking the rest. Linux finds them through `file->f_ep`, and
+    /// either way a close costs about the same however many other files the
+    /// epoll watches: 0.68 us with 256, 0.78 us with eight thousand. It was a
+    /// `retain` over the whole interest list: 23 us for each close in an
+    /// event loop holding eight thousand connections, and `n` squared to
+    /// close all `n` (`close_watched_and_rewatch_of_*` in
+    /// `benches/process.rs`). The second tree has a price: with only the one
+    /// file watched, a close and re-add costs 0.49 us where it cost 0.44.
+    ///
+    /// The description is its address as a number, as the process's
+    /// `holders` keeps it, and for the same reason it is a safe key: the
+    /// interest list holds a strong reference to every description named
+    /// here, so no address is reused while it is in the set. The invariant is
+    /// exact: these are exactly the pairs of `interest_list`. Only
+    /// [`EpollInner::watch`], [`EpollInner::unwatch`] and
+    /// [`EpollInner::forget_one`] add or remove an entry of either.
+    by_file: BTreeSet<(usize, FileDesc)>,
+}
+
+impl EpollInner {
+    /// The address of an open file description, as the process's own
+    /// `description_key` takes it: the thin half of the `dyn` pointer.
+    fn description_key(file: &Arc<dyn FileLike>) -> usize {
+        Arc::as_ptr(file) as *const () as usize
+    }
+
+    /// Watch `file` under `fd` with `event`, in place of whatever `fd`
+    /// watched before.
+    fn watch(&mut self, fd: FileDesc, event: EpollEvent, file: Arc<dyn FileLike>) {
+        let key = Self::description_key(&file);
+        if let Some((_, old)) = self.interest_list.insert(fd, (event, file)) {
+            // Out before the new pair goes in: an `EPOLL_CTL_MOD` of the same
+            // file has the same pair, and taking it out afterwards would
+            // leave that entry with none.
+            self.by_file.remove(&(Self::description_key(&old), fd));
+        }
+        self.by_file.insert((key, fd));
+    }
+
+    /// Stop watching `fd`, and hand back what it watched.
+    fn unwatch(&mut self, fd: FileDesc) -> Option<(EpollEvent, Arc<dyn FileLike>)> {
+        let entry = self.interest_list.remove(&fd)?;
+        self.by_file.remove(&(Self::description_key(&entry.1), fd));
+        Some(entry)
+    }
+
+    /// Drop one entry that watches the description at `key`, and say
+    /// whether there was one. The pair leaves the index first, so a loop on
+    /// this ends even if the two had come apart.
+    fn forget_one(&mut self, key: usize) -> bool {
+        let Some(&(_, fd)) = self
+            .by_file
+            .range((key, FileDesc(i32::MIN))..=(key, FileDesc(i32::MAX)))
+            .next()
+        else {
+            return false;
+        };
+        self.by_file.remove(&(key, fd));
+        self.interest_list.remove(&fd);
+        self.edge.remove(&fd);
+        true
+    }
 }
 
 /// epoll event
@@ -365,6 +431,7 @@ impl Epoll {
             inner: Mutex::new(EpollInner {
                 interest_list: BTreeMap::new(),
                 edge: BTreeMap::new(),
+                by_file: BTreeSet::new(),
             }),
             flags: Mutex::new(flags),
             changes: crate::sync::EventBus::new(),
@@ -431,7 +498,7 @@ impl Epoll {
                     if Arc::ptr_eq(watched, &file) {
                         return Err(LxError::EEXIST);
                     }
-                    inner.interest_list.remove(&fd);
+                    inner.unwatch(fd);
                 }
                 // If the target is itself an epoll, reject a self-add or any
                 // nesting that would create a cycle or exceed
@@ -461,15 +528,17 @@ impl Epoll {
                         }
                     }
                 }
-                inner.interest_list.insert(fd, (event, file));
+                inner.watch(fd, event, file);
             }
             EPOLL_CTL_DEL => {
-                inner.interest_list.remove(&fd).ok_or(LxError::ENOENT)?;
+                inner.unwatch(fd).ok_or(LxError::ENOENT)?;
             }
             EPOLL_CTL_MOD => {
                 let file = file.ok_or(LxError::EBADF)?;
-                let e = inner.interest_list.get_mut(&fd).ok_or(LxError::ENOENT)?;
-                *e = (event, file);
+                if !inner.interest_list.contains_key(&fd) {
+                    return Err(LxError::ENOENT);
+                }
+                inner.watch(fd, event, file);
             }
             _ => return Err(LxError::EINVAL),
         }
@@ -525,18 +594,17 @@ impl Epoll {
     /// description may be a `dup` under another one. Compared by pointer, as
     /// `disarm_oneshot` does, because a number that was closed and reopened
     /// may already watch its new description. Returns how many entries went.
+    ///
+    /// The entries are found through [`EpollInner::by_file`], as Linux finds
+    /// them through `file->f_ep`, not by walking the interest list.
     pub fn forget_closed(&self, file: &Arc<dyn FileLike>) -> usize {
+        let key = EpollInner::description_key(file);
         let mut inner = self.inner.lock();
-        let before = inner.interest_list.len();
-        inner
-            .interest_list
-            .retain(|_, (_, watched)| !Arc::ptr_eq(watched, file));
-        let EpollInner {
-            interest_list,
-            edge,
-        } = &mut *inner;
-        edge.retain(|fd, _| interest_list.contains_key(fd));
-        before - inner.interest_list.len()
+        let mut gone = 0;
+        while inner.forget_one(key) {
+            gone += 1;
+        }
+        gone
     }
 
     /// The file watched under `fd`, as `kcmp(KCMP_EPOLL_TFD)` asks for it:
@@ -1915,6 +1983,9 @@ mod flag_tests {
     }
 }
 
+#[cfg(test)]
+mod by_file_tests;
+
 /// Closing a watched descriptor is what removes it from the interest list,
 /// as epoll(7) promises; nothing here did it.
 #[cfg(test)]
@@ -3186,9 +3257,10 @@ mod nested_cover_tests {
             let up = Epoll::new(OpenFlags::empty());
             // Built bottom-up, so `ctl`'s own depth check never sees the
             // whole chain; insert directly.
-            up.inner.lock().interest_list.insert(
+            up.inner.lock().watch(
                 FileDesc::from(10 + i),
-                (ev(IN), top.clone() as Arc<dyn FileLike>),
+                ev(IN),
+                top.clone() as Arc<dyn FileLike>,
             );
             top = up;
         }
