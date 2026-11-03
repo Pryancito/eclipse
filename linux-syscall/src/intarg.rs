@@ -82,6 +82,29 @@ pub fn readlink_bufsiz(raw: usize) -> LxResult<usize> {
     Ok(bufsiz as usize)
 }
 
+/// The `int optlen` of `setsockopt(2)`: `__sys_setsockopt` opens with
+/// `if (optlen < 0) return -EINVAL;`, before the descriptor is even looked
+/// up. Zero is a length Linux takes, so this is the sign and not
+/// [`readlink_bufsiz`]'s `<= 0`.
+///
+/// Read as a whole `usize` it is wrong at both ends. A 32-bit caller's
+/// `socketcall` block carries it as a word, so `0xffffffff` --- which is
+/// `-1` to the program --- arrives zero-extended as four billion, which
+/// passes any lower bound and let a `SO_RCVTIMEO` of eight bytes change a
+/// timeout Linux refuses outright. And a native caller's register need not
+/// have its top half clear --- a varargs `int` is not widened, and nothing
+/// in the ABI requires it --- so `0x1_0000_0010` is a length of **sixteen**
+/// to Linux, and a bound on the whole register answers `EINVAL` to a
+/// perfectly ordinary call. Truncating first is what makes one rule serve
+/// both, and it is the same `(int)` as every other helper here.
+pub fn sockopt_len(raw: usize) -> LxResult<usize> {
+    let optlen = int_arg(raw);
+    if optlen < 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(optlen as usize)
+}
+
 /// A `pid_t` that names a task with no rule of its own for negatives:
 /// `sched_setaffinity`, `sched_getaffinity` and `prlimit64` hand it to
 /// `find_task_by_vpid`, which finds nothing, so a negative one is `ESRCH`.
@@ -301,6 +324,26 @@ mod tests {
     /// A 32-bit `-1` zero-extended, and sign-extended: the same argument.
     const MINUS_ONE_ZX: usize = 0xffff_ffff;
     const MINUS_ONE_SX: usize = usize::MAX;
+
+    #[test]
+    fn a_sockopt_len_is_its_low_32_bits_and_zero_is_a_length() {
+        assert_eq!(sockopt_len(0), Ok(0), "zero is a length Linux takes");
+        assert_eq!(sockopt_len(16), Ok(16));
+        assert_eq!(sockopt_len(i32::MAX as usize), Ok(i32::MAX as usize));
+        // Both spellings of a negative one, which is what a 32-bit caller's
+        // `socketcall` word and a native caller's register each produce.
+        assert_eq!(sockopt_len(MINUS_ONE_ZX), Err(LxError::EINVAL));
+        assert_eq!(sockopt_len(MINUS_ONE_SX), Err(LxError::EINVAL));
+        assert_eq!(sockopt_len(0x8000_0000), Err(LxError::EINVAL));
+        // And the half of the register that is NOT the argument: sixteen
+        // with rubbish above it is sixteen, which a bound on the whole
+        // register would have refused.
+        assert_eq!(
+            sockopt_len(0x1_0000_0010),
+            Ok(16),
+            "the high half is not the argument"
+        );
+    }
 
     #[test]
     fn a_register_is_read_as_its_low_32_bits_with_sign() {
