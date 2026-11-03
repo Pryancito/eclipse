@@ -222,10 +222,18 @@ const STACK_TOP: usize = USER_ASPACE_BASE as usize + USER_ASPACE_SIZE as usize;
 /// name at all.
 ///
 /// Linux's compat `TASK_SIZE` is `IA32_PAGE_OFFSET - PAGE_SIZE`
-/// (`arch/x86/include/asm/page_32_types.h` through `TASK_SIZE_MAX`), which is
-/// 4 GiB less one page. The last page is left out so that a mapping running
-/// to the very top of the space cannot be addressed by a pointer that wraps:
-/// `addr + len` stays a 32-bit number the program can compute.
+/// (`arch/x86/include/asm/page_32_types.h` through `TASK_SIZE_MAX`). That
+/// leaves the top **two** pages out, not one, and the number is measured
+/// rather than remembered: an i386 program on a real Linux gets
+/// `mmap2(MAP_FIXED)` accepted at `0xffffc000` and `0xffffd000` and `ENOMEM`
+/// at `0xffffe000` and `0xfffff000`, so the last page it may hold runs
+/// `0xffffd000..0xffffe000`.
+///
+/// Two pages rather than one is what keeps a valid address out of the errno
+/// band for good: every libc reads a return in `[-4096, -1]` ---
+/// `[0xfffff000, 0xffffffff]` --- as a failure, so a page handed out there
+/// would be a success the ABI cannot express, and `addr + len` stays a
+/// 32-bit number the program can compute.
 ///
 /// Everything the loader places for such a process -- the image, its stack,
 /// the break -- goes below this, and the pointer table on its initial stack is

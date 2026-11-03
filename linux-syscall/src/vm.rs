@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 use linux_object::error::LxResult;
-use linux_object::loader::heap_base;
+use linux_object::loader::heap_base_for;
 use linux_object::process::{RLIMIT_AS, RLIMIT_DATA, RLIM_INFINITY};
 use zircon_object::vm::{
     pages, round_down_pages, roundup_pages, MMUFlags, VmAddressRegion, VmObject, PAGE_SIZE,
@@ -59,6 +59,49 @@ const BRK_CHUNK: usize = 1 << 20;
 /// there). Also restores NULL-dereference protection for user processes.
 /// MAP_FIXED requests are exempt, matching Linux for privileged tooling.
 pub(crate) const MMAP_MIN_ADDR: usize = 0x1_0000;
+
+/// Where a 32-bit process's address space ENDS: the mirror of
+/// [`MMAP_MIN_ADDR`], and the reason an i386 program's `mmap` cannot be left
+/// to the native placement.
+///
+/// The number itself is `linux_object::loader`'s, re-exported here rather
+/// than spelled again: the loader already places a 32-bit image, its stack
+/// and its break under this same top (`task_top_for`), and an ABI number
+/// that exists twice is one that can drift. What is here is the measurement
+/// behind it.
+///
+/// `mmap2` returns its address in a 32-bit register, so a mapping placed
+/// above 4 GiB is one the process cannot name --- the register holds the low
+/// half and the pointer is somebody else's memory. And the top of the range
+/// is the **errno band**: every libc reads a return in `[-4096, -1]`, which
+/// is `[0xfffff000, 0xffffffff]`, as a failure, so a mapping placed there is
+/// a success the ABI cannot express. Eclipse did exactly that --- an i386
+/// program asking for two pages was handed `0xfffff000`, a mapping that both
+/// crosses the 4 GiB line and looks like `ENOMEM` --- and step 56 of
+/// `tools/i386-hello` is the probe that caught it.
+///
+/// The number is measured, not remembered. With an i386 program on this
+/// container's Linux, `mmap2(MAP_FIXED)` answers:
+///
+/// | address | answer |
+/// |---|---|
+/// | `0xffffc000` | accepted |
+/// | `0xffffd000` | accepted |
+/// | `0xffffe000` | `ENOMEM` |
+/// | `0xfffff000` | `ENOMEM` |
+///
+/// So the last page a 32-bit task may hold runs `0xffffd000..0xffffe000`, and
+/// its address space ends at `0xffffe000` --- Linux's `IA32_PAGE_OFFSET`. The
+/// two pages above that are reserved, which is what keeps a valid address out
+/// of the errno band for good rather than by luck.
+///
+/// Measured for the record, on the same program: when nobody asks for an
+/// address Linux places the mapping **top-down** from just under the stack
+/// (`0xf7f95000`, then `0xf7f93000`). This kernel searches bottom-up, which
+/// is a policy and not a bug, and is left alone here: what it may not do is
+/// leave the space the process can address.
+#[cfg(target_arch = "x86_64")]
+pub(crate) use linux_object::loader::TASK_SIZE_32;
 
 /// Syscalls for virtual memory.
 ///
@@ -256,6 +299,9 @@ impl Syscall<'_> {
         let proc = self.zircon_process();
         let pid = proc.id();
         let vmar = proc.vmar();
+        // The ceiling this process may be placed under, asked of the process
+        // and not of the call site. See `Syscall::task_max`.
+        let task_max = self.task_max();
         let want_write = prot.contains(MmapProt::WRITE);
 
         // mmap_lock (see `LinuxProcess::aspace_lock`): every layout mutation
@@ -333,7 +379,7 @@ impl Syscall<'_> {
             // syscall (e.g. `read`) still faults in correctly on the kernel
             // store.
             let addr = vmar
-                .map_ext_min(
+                .map_ext_within(
                     vmar_offset,
                     vmo.clone(),
                     0,
@@ -344,6 +390,7 @@ impl Syscall<'_> {
                     false,
                     false,
                     MMAP_MIN_ADDR,
+                    task_max,
                 )
                 .inspect_err(|e| {
                     error!(
@@ -466,7 +513,7 @@ impl Syscall<'_> {
                 // demand-zero exactly like Linux.
                 let anon = VmObject::new_paged(pages(len));
                 let base = vmar
-                    .map_ext_min(
+                    .map_ext_within(
                         vmar_offset,
                         anon,
                         0,
@@ -477,6 +524,7 @@ impl Syscall<'_> {
                         false,
                         false,
                         MMAP_MIN_ADDR,
+                        task_max,
                     )
                     .inspect_err(|e| {
                         error!(
@@ -484,7 +532,7 @@ impl Syscall<'_> {
                             e, len, map_len
                         );
                     })?;
-                vmar.map_ext_min(
+                vmar.map_ext_within(
                     Some(base - vmar.addr()),
                     vmo.clone(),
                     vmo_offset,
@@ -495,6 +543,7 @@ impl Syscall<'_> {
                     false,
                     false,
                     MMAP_MIN_ADDR,
+                    task_max,
                 )
                 .inspect_err(|e| {
                     error!(
@@ -507,7 +556,7 @@ impl Syscall<'_> {
                 })?;
                 base
             } else {
-                vmar.map_ext_min(
+                vmar.map_ext_within(
                     vmar_offset,
                     vmo.clone(),
                     vmo_offset,
@@ -518,6 +567,7 @@ impl Syscall<'_> {
                     false,
                     false,
                     MMAP_MIN_ADDR,
+                    task_max,
                 )
                 .inspect_err(|e| {
                     error!(
@@ -530,6 +580,33 @@ impl Syscall<'_> {
             verify_installed(&vmar, addr, len, "file");
             Ok(addr)
         }
+    }
+
+    /// The highest address this process may hold, as an offset into its
+    /// VMAR: Linux's `TASK_SIZE`.
+    ///
+    /// Asked of the **process** and not of the call site, like every other
+    /// width in this kernel (`in_compat_syscall()`): `mmap`, `mremap`, `brk`
+    /// and `shmat` all place memory, and each of them gets the right ceiling
+    /// without having to remember that a second ABI exists.
+    ///
+    /// `usize::MAX` for a native process is not a limit at all --- the VMAR
+    /// clamps it to its own size --- which is deliberate: the native path's
+    /// behaviour must not change, and the ceiling exists for the one ABI that
+    /// cannot name an address above it. See `TASK_SIZE_32` above (spelled
+    /// without a link because the constant is x86_64's).
+    ///
+    /// The VMAR takes its bounds as **offsets** into the region, and this is
+    /// an absolute address. The two are the same number for a Linux process,
+    /// whose VMAR starts at `USER_ASPACE_BASE == 0` --- which
+    /// `linux_object::loader` asserts rather than assumes --- and that is
+    /// already what [`MMAP_MIN_ADDR`] relies on.
+    pub(crate) fn task_max(&self) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        if self.linux_process().abi().is_32bit() {
+            return TASK_SIZE_32;
+        }
+        usize::MAX
     }
 
     /// `may_expand_vm()` for `RLIMIT_AS`: whether this address space can take
@@ -637,14 +714,40 @@ impl Syscall<'_> {
             .rlimit(RLIMIT_DATA, None, false)
             .map(|l| l.cur)
             .unwrap_or(RLIM_INFINITY);
-        if !brk_within_data_rlimit(new_brk, heap_base(&vmar), data_rlimit) {
+        // The heap base is the process's own, not a 64-bit one: a 32-bit
+        // process's heap starts a quarter of the way up ITS address space (1
+        // GiB), and asking for the 64-bit answer here put it at 32 TiB. Every
+        // break an i386 program can even name is below that, so `brk_target`
+        // read each one as "below where the heap starts" and `brk` handed back
+        // the old break for ever: a malloc that grows the heap through `brk`
+        // never grew it once. Same `in_compat_syscall()` rule as the ceiling
+        // below --- ask the process.
+        let heap = heap_base_for(&vmar, proc.abi());
+        if !brk_within_data_rlimit(new_brk, heap, data_rlimit) {
             info!(
                 "brk: {:#x} would take the data segment past RLIMIT_DATA ({}), keeping {:#x}",
                 new_brk, data_rlimit, current_brk
             );
             return Ok(current_brk);
         }
-        let Some(plan) = brk_plan(new_brk, current_brk, heap_base(&vmar)) else {
+        // And past the end of the address space this process can name. The
+        // heap is the third place a 32-bit program can be handed memory it
+        // cannot reach (`mmap` and `mremap` are the other two); here the
+        // break would simply walk off the top. Keeping the old break rather
+        // than answering an errno is what Linux does for a `brk` it will not
+        // grant, and what the two refusals around this one already do.
+        let task_max = self.task_max();
+        if new_brk > task_max {
+            info!(
+                "brk: {:#x} is past the top of a {}-bit address space ({:#x}), keeping {:#x}",
+                new_brk,
+                if task_max == usize::MAX { 64 } else { 32 },
+                task_max,
+                current_brk
+            );
+            return Ok(current_brk);
+        }
+        let Some(plan) = brk_plan(new_brk, current_brk, heap) else {
             info!(
                 "brk: {:#x} is not a break this address space can take, keeping {:#x}",
                 new_brk, current_brk
@@ -979,7 +1082,7 @@ impl Syscall<'_> {
             return Err(LxError::ENOMEM);
         }
         let ret = vmar
-            .remap(old_addr, old_len, new_len, may_move, fixed)
+            .remap_within(old_addr, old_len, new_len, may_move, fixed, self.task_max())
             .map_err(|e| match e {
                 zircon_object::ZxError::NOT_FOUND => LxError::EFAULT,
                 zircon_object::ZxError::INVALID_ARGS => LxError::EINVAL,
@@ -3637,256 +3740,7 @@ mod mprotect_prot_tests {
 }
 
 #[cfg(test)]
-mod benches {
-    //! The memory syscalls: `mmap`, `munmap`, `mprotect`, `madvise`,
-    //! `msync`, `mincore`, `mlockall` and `brk`.
-    //!
-    //! Two kinds of row. The `_args` and flag rows are the work every one of
-    //! these calls does before it touches a mapping -- rounding a length,
-    //! bounding a range, narrowing a flag word -- and they are the reason
-    //! those helpers exist, since each one was a wrong answer once. The
-    //! `mincore_` and `msync_` rows walk a real VMAR a page at a time, which
-    //! is work proportional to the range, and they come in families so the
-    //! slope can be read.
-    //!
-    //! Every row black-boxes its inputs. Two cycles (~0.6 ns) is `b.iter`'s
-    //! own loop; a row there with an opaque input is a real compare and
-    //! branch, a row there with a constant input is a call that was folded
-    //! away and never ran.
-
-    use super::*;
-    use test::{black_box, Bencher};
-
-    fn user_rw() -> MMUFlags {
-        MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER
-    }
-
-    /// A root VMAR with one mapping of `pages` pages at `base`, plus the
-    /// address it landed at. One mapping rather than many: `mincore` walks
-    /// pages, not mappings, and this is the shape its loop meets in a heap.
-    ///
-    /// `base` is a parameter, and every row below passes a different one, for
-    /// the same two reasons the test helper of the same name spells out:
-    /// under `libos` these mappings are backed by the *host* process's
-    /// address space, so two rows sharing a base fight over one host mapping;
-    /// and a low base runs into `vm.mmap_min_addr`, which on a CI runner is
-    /// 65536 and here is 4096 -- mapping at 0, as an earlier version of this
-    /// helper did, is an `EPERM` from the host `mmap` that only CI sees.
-    /// Bases start past the test helper's range so the two never collide.
-    fn mapped(base: usize, pages: usize) -> (Arc<VmAddressRegion>, usize) {
-        assert!(base >= 0x1000_0000 && base.is_multiple_of(PAGE_SIZE));
-        let vmar = VmAddressRegion::new_root();
-        let vmo = VmObject::new_paged(pages);
-        let addr = vmar
-            .map_at(base, vmo, 0, pages * PAGE_SIZE, user_rw())
-            .expect("a fresh root VMAR has room for this");
-        (vmar, addr)
-    }
-
-    /// `mincore` over one page: the per-call cost, since the loop runs once.
-    #[bench]
-    fn mincore_residency_of_1_page(b: &mut Bencher) {
-        let (vmar, addr) = mapped(0x1000_0000, 1);
-        b.iter(|| {
-            black_box(mincore_residency(
-                black_box(&vmar),
-                black_box(addr),
-                black_box(1),
-            ))
-        });
-    }
-
-    /// 64 pages, a quarter of a megabyte.
-    #[bench]
-    fn mincore_residency_of_64_pages(b: &mut Bencher) {
-        let (vmar, addr) = mapped(0x1100_0000, 64);
-        b.iter(|| {
-            black_box(mincore_residency(
-                black_box(&vmar),
-                black_box(addr),
-                black_box(64),
-            ))
-        });
-    }
-
-    /// 512 pages, which is the chunk `sys_mincore` hands over at a time, so
-    /// this row is one full chunk of a `mincore` over a large heap: the
-    /// figure an allocator probing address-space layout pays per call.
-    #[bench]
-    fn mincore_residency_of_512_pages(b: &mut Bencher) {
-        let (vmar, addr) = mapped(0x1200_0000, 512);
-        b.iter(|| {
-            black_box(mincore_residency(
-                black_box(&vmar),
-                black_box(addr),
-                black_box(512),
-            ))
-        });
-    }
-
-    /// The distinct objects under a range, which `msync(MS_SYNC)` needs
-    /// before it can write any of them back. It looks a mapping up per page
-    /// and keeps a set, so its slope is the question: a `msync` of a mapped
-    /// file is one object however large the range.
-    ///
-    /// `distinct_vmos` takes an absolute `end`, not a length. A row that
-    /// passed the length read 11 ns flat at both 64 and 512 pages, because
-    /// `end` was below `start` and the loop never ran once -- the same
-    /// signature as a folded call, and the reason a flat family is worth
-    /// doubting before it is believed.
-    #[bench]
-    fn msync_distinct_vmos_over_64_pages(b: &mut Bencher) {
-        let (vmar, addr) = mapped(0x1300_0000, 64);
-        b.iter(|| {
-            black_box(distinct_vmos(
-                black_box(&vmar),
-                black_box(addr),
-                black_box(addr + 64 * PAGE_SIZE),
-            ))
-        });
-    }
-
-    /// The same over 512 pages of the same single object.
-    #[bench]
-    fn msync_distinct_vmos_over_512_pages(b: &mut Bencher) {
-        let (vmar, addr) = mapped(0x1400_0000, 512);
-        b.iter(|| {
-            black_box(distinct_vmos(
-                black_box(&vmar),
-                black_box(addr),
-                black_box(addr + 512 * PAGE_SIZE),
-            ))
-        });
-    }
-
-    /// The `(addr, len)` of every memory syscall, resolved into the range it
-    /// names. This is the rounding whose wrap made a call naming most of the
-    /// address space look like one naming nothing.
-    #[bench]
-    fn user_range_resolve(b: &mut Bencher) {
-        b.iter(|| black_box(user_range(black_box(0x1000_0000), black_box(1 << 20))));
-    }
-
-    /// The same for the length that wraps, which is the arm that was missing.
-    #[bench]
-    fn user_range_resolve_wrapping_len(b: &mut Bencher) {
-        b.iter(|| black_box(user_range(black_box(0x1000_0000), black_box(usize::MAX))));
-    }
-
-    /// `munmap`'s arguments: alignment, then the range.
-    #[bench]
-    fn munmap_arg_check(b: &mut Bencher) {
-        b.iter(|| black_box(munmap_args(black_box(0x1000_0000), black_box(1 << 20))));
-    }
-
-    /// `mprotect`'s, which differ from `munmap`'s on both bad answers.
-    #[bench]
-    fn mprotect_arg_check(b: &mut Bencher) {
-        b.iter(|| black_box(mprotect_args(black_box(0x1000_0000), black_box(1 << 20))));
-    }
-
-    /// `mprotect`'s `prot`, which unlike `mmap`'s is validated: an unknown
-    /// bit is `EINVAL`, and the two growth directions together are too.
-    #[bench]
-    fn mprotect_prot_word(b: &mut Bencher) {
-        b.iter(|| black_box(mprotect_prot(black_box(0x1 | 0x2))));
-    }
-
-    /// And the answer for a `prot` with a bit this kernel does not name.
-    #[bench]
-    fn mprotect_prot_unknown_bit(b: &mut Bencher) {
-        b.iter(|| black_box(mprotect_prot(black_box(0x1 | 0x40))));
-    }
-
-    /// `mmap`'s length, bounded before anything is reserved.
-    #[bench]
-    fn mmap_len_arg_check(b: &mut Bencher) {
-        b.iter(|| black_box(mmap_len_check(black_box(1 << 20))));
-    }
-
-    /// `mmap`'s sixth argument, whose sum with the length must fit.
-    #[bench]
-    fn mmap_offset_validation(b: &mut Bencher) {
-        b.iter(|| {
-            black_box(validate_mmap_offset(
-                black_box(1 << 20),
-                black_box(4096),
-                black_box(false),
-            ))
-        });
-    }
-
-    /// `MAP_SHARED` vs `MAP_PRIVATE`, which are not a bitmask but exactly
-    /// one of three values in the low four bits.
-    #[bench]
-    fn mmap_shared_flag(b: &mut Bencher) {
-        b.iter(|| black_box(mmap_shared(black_box(MAP_PRIVATE), black_box(true))));
-    }
-
-    /// Where `mmap` may put the mapping: a hint, fixed, or fixed and
-    /// refusing to replace.
-    #[bench]
-    fn mmap_placement_decision(b: &mut Bencher) {
-        b.iter(|| black_box(mmap_placement(black_box(MmapFlags::empty()))));
-    }
-
-    /// `MAP_HUGETLB`, which this kernel refuses rather than silently
-    /// ignoring.
-    #[bench]
-    fn mmap_hugetlb_check(b: &mut Bencher) {
-        b.iter(|| black_box(mmap_no_hugetlb(black_box(MAP_PRIVATE))));
-    }
-
-    /// How much of a file a mapping covers, given the object's length and
-    /// the offset into it.
-    #[bench]
-    fn mmap_file_map_len(b: &mut Bencher) {
-        b.iter(|| {
-            black_box(file_map_len(
-                black_box(1 << 20),
-                black_box(1 << 22),
-                black_box(4096),
-            ))
-        });
-    }
-
-    /// `madvise`'s `advice`: a known one, one this kernel accepts and does
-    /// not act on, and one it refuses.
-    #[bench]
-    fn madvise_advice_lookup(b: &mut Bencher) {
-        b.iter(|| {
-            black_box((
-                madvise_advice_known(black_box(4)),
-                madvise_advice_known(black_box(9)),
-                madvise_advice_known(black_box(77)),
-            ))
-        });
-    }
-
-    /// `msync`'s arguments, which carry a flag word the other calls do not.
-    #[bench]
-    fn msync_arg_check(b: &mut Bencher) {
-        b.iter(|| {
-            black_box(msync_args(
-                black_box(0x1000_0000),
-                black_box(1 << 20),
-                black_box(4),
-            ))
-        });
-    }
-
-    /// `mincore`'s, which bound the per-call chunk.
-    #[bench]
-    fn mincore_arg_check(b: &mut Bencher) {
-        b.iter(|| black_box(mincore_args(black_box(0x1000_0000), black_box(1 << 20))));
-    }
-
-    /// `mlockall`'s flags.
-    #[bench]
-    fn mlockall_flag_check(b: &mut Bencher) {
-        b.iter(|| black_box(check_mlockall_flags(black_box(1))));
-    }
-}
+mod benches;
 
 #[cfg(test)]
 mod brk_chunk_tests {
@@ -3937,3 +3791,6 @@ mod mprotect_mremap_tests;
 /// -- and the three refusals of `sys_mmap` that had never been asked for.
 #[cfg(test)]
 mod mmap_file_tests;
+
+#[cfg(test)]
+mod task_size_tests;

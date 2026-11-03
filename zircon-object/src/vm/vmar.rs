@@ -553,7 +553,7 @@ impl VmAddressRegion {
         let inner = guard.as_mut().ok_or(ZxError::BAD_STATE)?;
         // No floor: the ELF loader's app sub-VMAR must land at offset 0 for
         // non-PIE binaries (see determine_offset).
-        let offset = self.determine_offset(inner, offset, len, align, 0)?;
+        let offset = self.determine_offset(inner, offset, len, align, 0, self.size)?;
         // Share the parent's meter so this child's mappings count toward the one
         // `VmSize`/`VmPeak:` of the whole tree (the loader maps the vDSO here).
         let child_inner = VmarInner {
@@ -660,6 +660,54 @@ impl VmAddressRegion {
         allow_faults: bool,
         min_offset: usize,
     ) -> ZxResult<VirtAddr> {
+        self.map_ext_within(
+            vmar_offset,
+            vmo,
+            vmo_offset,
+            len,
+            permissions,
+            flags,
+            overwrite,
+            map_range,
+            allow_faults,
+            min_offset,
+            self.size,
+        )
+    }
+
+    /// [`map_ext_min`](Self::map_ext_min) with a **ceiling** as well as a
+    /// floor: the mapping has to end at or below `max_offset`, whether the
+    /// caller chose the address or the kernel did.
+    ///
+    /// This is what a 32-bit process needs. Its `mmap` returns an address in
+    /// a 32-bit register, so a mapping placed above 4 GiB is one the process
+    /// cannot name: the register holds the low half and the pointer is
+    /// somebody else's memory. Worse, the top of that range is the errno
+    /// band --- every libc reads a return in `[-4096, -1]`, which is
+    /// `[0xfffff000, 0xffffffff]`, as a failure --- so a mapping placed there
+    /// is a success the ABI cannot express. Measured on this container's
+    /// Linux from a 32-bit task: `MAP_FIXED` at `0xffffd000` is accepted and
+    /// at `0xffffe000` and `0xfffff000` answers `ENOMEM`, so a compat task's
+    /// address space ends at `0xffffe000` (Linux's `IA32_PAGE_OFFSET`).
+    ///
+    /// `max_offset` is an offset into this region, like `min_offset`, and is
+    /// clamped to the region's own size, so passing `self.size` means "no
+    /// ceiling" and is exactly what [`map_ext_min`](Self::map_ext_min) does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_ext_within(
+        &self,
+        vmar_offset: Option<usize>,
+        vmo: Arc<VmObject>,
+        vmo_offset: usize,
+        len: usize,
+        permissions: MMUFlags,
+        flags: MMUFlags,
+        overwrite: bool,
+        map_range: bool,
+        allow_faults: bool,
+        min_offset: usize,
+        max_offset: usize,
+    ) -> ZxResult<VirtAddr> {
         // `len == 0` must be rejected, not just for Linux/Zircon semantics: the
         // mappings tree is keyed by start address, and inserting a zero-length
         // mapping at an explicit offset equal to an existing mapping's start
@@ -698,15 +746,26 @@ impl VmAddressRegion {
         // before the replacement is inserted.
         let offset = match vmar_offset {
             Some(offset) if overwrite => {
-                if !check_aligned(offset, PAGE_SIZE)
-                    || !check_aligned(len, PAGE_SIZE)
-                    || offset.checked_add(len).is_none_or(|end| end > self.size)
-                {
+                // The ceiling applies to an explicit placement as well, and
+                // with `ENOMEM`: that is the errno Linux answers a 32-bit
+                // `MAP_FIXED` above its address space, measured at
+                // `0xffffe000` (see this function's documentation). The
+                // alignment and in-region failures stay `INVALID_ARGS`,
+                // because those are `EINVAL` in Linux and a caller probing
+                // for a usable address has to be able to tell the two apart.
+                if !check_aligned(offset, PAGE_SIZE) || !check_aligned(len, PAGE_SIZE) {
                     return Err(ZxError::INVALID_ARGS);
+                }
+                match offset.checked_add(len) {
+                    Some(end) if end <= max_offset.min(self.size) => {}
+                    Some(end) if end <= self.size => return Err(ZxError::NO_MEMORY),
+                    _ => return Err(ZxError::INVALID_ARGS),
                 }
                 offset
             }
-            _ => self.determine_offset(inner, vmar_offset, len, PAGE_SIZE, min_offset)?,
+            _ => {
+                self.determine_offset(inner, vmar_offset, len, PAGE_SIZE, min_offset, max_offset)?
+            }
         };
         let addr = self.addr + offset;
         let mut flags = flags;
@@ -1001,6 +1060,23 @@ impl VmAddressRegion {
         may_move: bool,
         fixed: Option<VirtAddr>,
     ) -> ZxResult<VirtAddr> {
+        self.remap_within(old_addr, old_len, new_len, may_move, fixed, self.size)
+    }
+
+    /// [`remap`](Self::remap) with the same ceiling
+    /// [`map_ext_within`](Self::map_ext_within) takes, for the same reason: a
+    /// `mremap` that MAY MOVE picks a new address exactly the way `mmap`
+    /// does, so without the ceiling it is the second way a 32-bit process
+    /// ends up holding an address it cannot name.
+    pub fn remap_within(
+        &self,
+        old_addr: VirtAddr,
+        old_len: usize,
+        new_len: usize,
+        may_move: bool,
+        fixed: Option<VirtAddr>,
+        max_offset: usize,
+    ) -> ZxResult<VirtAddr> {
         if !page_aligned(old_addr)
             || !page_aligned(old_len)
             || !page_aligned(new_len)
@@ -1016,6 +1092,13 @@ impl VmAddressRegion {
             let new_end = new_addr.checked_add(new_len).ok_or(ZxError::INVALID_ARGS)?;
             if !page_aligned(new_addr) || new_addr < self.addr || new_end > self.end_addr() {
                 return Err(ZxError::INVALID_ARGS);
+            }
+            // And under the caller's ceiling, with `ENOMEM` rather than
+            // `EINVAL`: see [`map_ext_within`](Self::map_ext_within). The
+            // in-region test above has already passed, so this is the case of
+            // a target that exists but is out of the caller's reach.
+            if new_end > self.addr + max_offset.min(self.size) {
+                return Err(ZxError::NO_MEMORY);
             }
             if new_addr < old_end && old_addr < new_end {
                 return Err(ZxError::INVALID_ARGS);
@@ -1066,8 +1149,14 @@ impl VmAddressRegion {
             // Grow in place when the old range is the tail of its mapping and
             // the address space right after it is free.
             let delta = new_len - old_len;
+            // The ceiling bounds the growth as well. Growing in place is the
+            // third way a mapping ends up above what the caller can address:
+            // a mapping that ends just under the ceiling would otherwise be
+            // stretched straight through it without any address being chosen.
+            // Linux bounds this the same way, in `vma_to_resize`.
             let in_place_ok = old_end == map_addr + map_size
                 && old_end + delta <= self.end_addr()
+                && old_end + delta <= self.addr + max_offset.min(self.size)
                 && self.test_map(inner, old_end - self.addr, delta, PAGE_SIZE);
             if in_place_ok {
                 if vmo_window >= new_len {
@@ -1115,7 +1204,7 @@ impl VmAddressRegion {
                 offset
             }
             None => self
-                .find_free_area(inner, 0, new_len, PAGE_SIZE)
+                .find_free_area(inner, 0, new_len, PAGE_SIZE, max_offset)
                 .ok_or(ZxError::NO_MEMORY)?,
         };
         let new_addr = self.addr + target_offset;
@@ -1614,6 +1703,7 @@ impl VmAddressRegion {
         len: usize,
         align: usize,
         min_offset: usize,
+        max_offset: usize,
     ) -> ZxResult<VirtAddr> {
         // The alignment is the BASE's, not the length's: `zx_vmar_allocate`
         // with `ZX_VM_ALIGN_1MB` asks for a region that starts on a megabyte,
@@ -1625,6 +1715,17 @@ impl VmAddressRegion {
         if !page_aligned(len) {
             Err(ZxError::INVALID_ARGS)
         } else if let Some(offset) = offset {
+            // The ceiling first, and with its own errno: a placement that is
+            // aligned and free but ABOVE what the caller may address is
+            // `ENOMEM` in Linux, not `EINVAL`. See
+            // [`map_ext_within`](Self::map_ext_within).
+            if offset
+                .checked_add(len)
+                .is_none_or(|end| end > max_offset.min(self.size))
+                && offset.checked_add(len).is_some_and(|end| end <= self.size)
+            {
+                return Err(ZxError::NO_MEMORY);
+            }
             if check_aligned(offset, align) && self.test_map(inner, offset, len, align) {
                 Ok(offset)
             } else {
@@ -1642,7 +1743,7 @@ impl VmAddressRegion {
             // SIGSEGVs every process (observed when the floor was mistakenly
             // applied here globally).
             let floor = min_offset.next_multiple_of(align.max(1));
-            self.find_free_area(inner, floor, len, align)
+            self.find_free_area(inner, floor, len, align, max_offset)
                 .ok_or(ZxError::NO_MEMORY)
         }
     }
@@ -1724,12 +1825,18 @@ impl VmAddressRegion {
         min_offset: usize,
         len: usize,
         align: usize,
+        max_offset: usize,
     ) -> Option<usize> {
         // TODO: randomize
         debug_assert!(check_aligned(min_offset, align));
         debug_assert!(page_aligned(len));
         let base = self.addr;
-        let limit = base + self.size;
+        // `max_offset` is the mirror of `min_offset`: a CEILING the whole
+        // range has to fit under, which the Linux mmap path uses to keep a
+        // 32-bit process's mappings inside the address space it can
+        // address. Clamped to this region, so a caller that does not care
+        // passes `self.size` (or anything larger) and nothing changes.
+        let limit = base + max_offset.min(self.size);
         let floor = base + min_offset;
 
         // Fast path: just above the highest mapping (or the floor, if higher).
@@ -5020,6 +5127,9 @@ mod released_frames_tests;
 
 #[cfg(test)]
 mod range_is_free_tests;
+
+#[cfg(test)]
+mod ceiling_tests;
 
 #[cfg(test)]
 mod mapping_count_tests;

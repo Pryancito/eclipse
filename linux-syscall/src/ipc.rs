@@ -742,7 +742,11 @@ impl Syscall<'_> {
         // what the floor was added to `mmap` for: userspace holds 0 as a valid
         // pointer, every syscall null-check answers EFAULT, and the null page
         // is mapped for the life of the process.
-        let addr = vmar.map_ext_min(
+        // The ceiling, like `mmap`'s: `shmat` is the fourth place a process is
+        // handed an address, and a 32-bit one cannot name a segment attached
+        // above its address space any more than it can name a mapping there.
+        // See `Syscall::task_max`.
+        let addr = vmar.map_ext_within(
             vmar_offset,
             vmo.clone(),
             0,
@@ -753,6 +757,7 @@ impl Syscall<'_> {
             true,
             false,
             crate::vm::MMAP_MIN_ADDR,
+            self.task_max(),
         )?;
         // Account on the segment, then record where in the process -- one
         // record per attachment, so a segment attached twice can be
