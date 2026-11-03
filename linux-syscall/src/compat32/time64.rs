@@ -38,6 +38,17 @@
 //! wrong time, no time --- and every `gettimeofday`, every `time()`, every
 //! timestamp in a log and every timeout computed from one fails.
 //!
+//! ## What is here
+//!
+//! `clock_gettime64` (403), `clock_settime64` (404),
+//! `clock_getres_time64` (406), `clock_nanosleep_time64` (407),
+//! `timerfd_gettime64` (410), `timerfd_settime64` (411) and `futex_time64`
+//! (422), each an entry point that calls the native handler's own core with
+//! `abi32 = false`. The three last are the ones a THREADED 32-bit program
+//! reaches: 422 is every `pthread_cond_timedwait`, `sem_timedwait` and
+//! `pthread_mutex_timedlock` of a modern i386 musl, and the two `timerfd`
+//! numbers are behind every timer it arms.
+//!
 //! ## What is still missing
 //!
 //! The rest of the family, each of which needs the same treatment of a

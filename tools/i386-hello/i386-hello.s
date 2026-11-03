@@ -2059,7 +2059,7 @@ statx_poison:
 	xorl	%esi, %esi		/* no old value */
 	int	$0x80
 	testl	%eax, %eax
-	jnz	bad_timerfd_create
+	jnz	bad_timerfd_arm
 
 	/* 326: sixteen bytes, interval zero, value a hair under a hundred
 	 * seconds, and the poison untouched after them. */
@@ -2468,6 +2468,9 @@ bad_futex_time64:
 	jmp	die
 bad_futex_narrow:
 	movl	$91, %ebx
+	jmp	die
+bad_timerfd_arm:
+	movl	$92, %ebx
 	jmp	die
 
 	/* 0xaa over the two entries of the batch array, so that each transfer

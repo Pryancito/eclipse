@@ -53,6 +53,20 @@ const EINVAL: isize = -(LxError::EINVAL as isize);
 const ENOSYS: isize = -(LxError::ENOSYS as isize);
 const ETIMEDOUT: isize = -(LxError::ETIMEDOUT as isize);
 
+/// Every `*_time64` number this kernel does NOT answer yet, with the name it
+/// reports. The whole remaining set, so that wiring one and forgetting to
+/// take it out of here fails rather than leaving a stale list.
+const STILL_MISSING: [(u32, &str); 8] = [
+    (408, "timer_gettime64"),
+    (409, "timer_settime64"),
+    (412, "utimensat_time64"),
+    (413, "pselect6_time64"),
+    (414, "ppoll_time64"),
+    (417, "recvmmsg_time64"),
+    (421, "rt_sigtimedwait_time64"),
+    (423, "sched_rr_get_interval_time64"),
+];
+
 const USER_AT: usize = 0x2200_0000;
 const USER_PAGES: usize = 2;
 const PAGE_SIZE: usize = 0x1000;
@@ -341,14 +355,23 @@ fn the_rest_of_the_family_still_says_so_by_name() {
         Box::pin(async move {
             let mut sys = as_mut(sys);
             let mut out = Vec::new();
-            for n in [408u32, 409, 412, 414, 421, 423] {
+            for (n, _) in STILL_MISSING {
                 out.push(sys.compat32_syscall(n, [0, 0, 0, 0, 0, 0]).await);
             }
             out
         })
     });
     assert!(got.iter().all(|&r| r == ENOSYS), "{:?}", got);
-    assert_eq!(crate::compat32::name(412), Some("utimensat_time64"));
+    // And by NAME, which is the half that says the report is readable: a
+    // number alone in a log does not tell anyone what to write next.
+    for (n, name) in STILL_MISSING {
+        assert_eq!(
+            crate::compat32::name(n),
+            Some(name),
+            "i386 {} must still say what it is",
+            n
+        );
+    }
     proc.exit(0);
 }
 
@@ -450,32 +473,44 @@ fn timerfd_settime64_reads_thirty_two_bytes_and_shares_every_check() {
                 .await;
             assert!(fd >= 0, "timerfd_create (322): {}", fd);
             let fd = fd as usize;
-            // Thirty-two bytes whose WIDE reading is
+            // The flags check lives in the shared core, before the structure
+            // is read at all. Two things have to be right for the assertion
+            // to mean anything.
+            //
+            // The BIT has to be outside the mask: 1 is `TFD_TIMER_ABSTIME`
+            // and 2 is `TFD_TIMER_CANCEL_ON_SET`, and
+            // `timerfd_settime_flags_ok` accepts both. 4 is in neither.
+            //
+            // And the STRUCTURE has to be valid, or the `EINVAL` is the one
+            // an out-of-range `timespec` earns and the flag is never the
+            // reason. That is the version of this test that survived deleting
+            // the flags check from the core: it passed, because the bytes it
+            // sent were refused for the other reason.
+            let mut arm = Vec::new();
+            arm.extend_from_slice(&0u64.to_ne_bytes()); // it_interval.tv_sec
+            arm.extend_from_slice(&0u64.to_ne_bytes()); // it_interval.tv_nsec
+            arm.extend_from_slice(&100u64.to_ne_bytes()); // it_value.tv_sec
+            arm.extend_from_slice(&0u64.to_ne_bytes()); // it_value.tv_nsec
+            put(TS_AT, &arm);
+            let bad_flag = sys
+                .compat32_syscall(TIMERFD_SETTIME64, [fd, 4, TS_AT, 0, 0, 0])
+                .await;
+            // Now the width. Thirty-two bytes whose WIDE reading is
             // `{ {0, 0}, {0, 2_000_000_000} }` --- an `it_value.tv_nsec` over
             // a billion, which `ITimerSpec::valid` refuses --- and whose
             // NARROW reading is four zero words, a perfectly good disarm. So
             // `EINVAL` says the thirty-two bytes were read as thirty-two.
             let mut ts = Vec::new();
-            ts.extend_from_slice(&0u64.to_ne_bytes()); // it_interval.tv_sec
-            ts.extend_from_slice(&0u64.to_ne_bytes()); // it_interval.tv_nsec
-            ts.extend_from_slice(&0u64.to_ne_bytes()); // it_value.tv_sec
-            ts.extend_from_slice(&2_000_000_000u64.to_ne_bytes()); // it_value.tv_nsec
+            ts.extend_from_slice(&0u64.to_ne_bytes());
+            ts.extend_from_slice(&0u64.to_ne_bytes());
+            ts.extend_from_slice(&0u64.to_ne_bytes());
+            ts.extend_from_slice(&2_000_000_000u64.to_ne_bytes());
             put(TS_AT, &ts);
-            // The flags check lives in the shared core, before the structure
-            // is read at all: bit 1 is not a `timerfd_settime` flag.
-            let bad_flag = sys
-                .compat32_syscall(TIMERFD_SETTIME64, [fd, 2, TS_AT, 0, 0, 0])
-                .await;
             let narrow_reading = sys
                 .compat32_syscall(TIMERFD_SETTIME64, [fd, 0, TS_AT, 0, 0, 0])
                 .await;
             // And the way OUT: arm it with a valid wide value, asking for the
             // old one into a poisoned buffer above the request.
-            let mut arm = Vec::new();
-            arm.extend_from_slice(&0u64.to_ne_bytes());
-            arm.extend_from_slice(&0u64.to_ne_bytes());
-            arm.extend_from_slice(&100u64.to_ne_bytes());
-            arm.extend_from_slice(&0u64.to_ne_bytes());
             put(TS_AT, &arm);
             let old_at = TS_AT + 64;
             put(old_at, &[0xAAu8; 64]);
@@ -486,7 +521,11 @@ fn timerfd_settime64_reads_thirty_two_bytes_and_shares_every_check() {
             (bad_flag, narrow_reading, get(old_at, 64))
         })
     });
-    assert_eq!(bad_flag, EINVAL, "the flags check is not shared");
+    assert_eq!(
+        bad_flag, EINVAL,
+        "the flags check is not shared: a bit outside the mask was accepted \
+         on an otherwise perfectly good itimerspec"
+    );
     assert_eq!(
         narrow_reading, EINVAL,
         "timerfd_settime64 read sixteen bytes: the tv_nsec of over a billion \
