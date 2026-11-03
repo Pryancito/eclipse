@@ -994,3 +994,170 @@ fn two_renames_onto_one_name_at_once_replace_it_once_each() -> Result<()> {
     }
     Ok(())
 }
+
+/// Several threads writing interleaved chunks of ONE file. Each write past
+/// EOF grows the file; a writer that read the size before another writer
+/// grew it must not "grow" the file back down to its own end offset. That
+/// used to truncate the other writers' blocks and, with two such truncates
+/// racing, free the same block twice (`!free_map[block_id]` panic).
+#[test]
+fn concurrent_writers_never_shrink_the_file() -> Result<()> {
+    const THREADS: usize = 4;
+    const CHUNKS: usize = 64;
+    // Block-aligned on purpose: two writers sharing one device block race in
+    // the device's read-modify-write, which is a different bug.
+    const CHUNK: usize = 3 * BLKSIZE;
+    for _round in 0..8 {
+        let sfs = _create_new_sfs();
+        let root = sfs.root_inode();
+        let file = root.create("shared", FileType::File, 0o777)?;
+        let handles: std::vec::Vec<_> = (0..THREADS)
+            .map(|t| {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    let buf = [t as u8 + 1; CHUNK];
+                    for k in 0..CHUNKS {
+                        let off = (k * THREADS + t) * CHUNK;
+                        assert_eq!(file.write_at(off, &buf).unwrap(), CHUNK);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("writer thread panicked");
+        }
+        let total = THREADS * CHUNKS * CHUNK;
+        assert_eq!(file.metadata()?.size, total, "a writer shrank the file");
+        let mut back = std::vec![0u8; total];
+        assert_eq!(file.read_at(0, &mut back)?, total);
+        for (i, c) in back.chunks(CHUNK).enumerate() {
+            let want = (i % THREADS) as u8 + 1;
+            assert!(
+                c.iter().all(|&b| b == want),
+                "chunk {} lost its data: first={} want={} bad={}",
+                i,
+                c[0],
+                want,
+                c.iter().filter(|&&b| b != want).count()
+            );
+        }
+        sfs.sync()?;
+    }
+    Ok(())
+}
+
+/// Threads creating, writing, looking up and unlinking files in one
+/// directory. A lookup racing an inode's `Drop` used to load a second copy of
+/// it from disk, and dropping that copy freed its blocks again.
+#[test]
+fn concurrent_lookup_and_unlink_do_not_double_free() -> Result<()> {
+    for _round in 0..4 {
+        let sfs = _create_new_sfs();
+        let root = sfs.root_inode();
+        let hs: std::vec::Vec<_> = (0..4)
+            .map(|t| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    for i in 0..300 {
+                        let name = std::format!("f{}_{}", t, i);
+                        let f = root.create(&name, FileType::File, 0o644).unwrap();
+                        f.write_at(0, &[1u8; 5000]).unwrap();
+                        drop(f);
+                        let _ = root.find(&std::format!("f{}_{}", (t + 1) % 4, i));
+                        root.unlink(&name).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().expect("thread panicked");
+        }
+        sfs.sync()?;
+    }
+    Ok(())
+}
+
+/// Offline consistency check of an SFS image: every block referenced once and
+/// marked used. `SFS_FSCK=img cargo test -p rcore-fs-sfs --features std
+/// fsck_image -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn fsck_image() {
+    let path = match std::env::var("SFS_FSCK") {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .write(false)
+        .open(&path)
+        .unwrap();
+    let sfs = SimpleFileSystem::open(Arc::new(Mutex::new(file))).expect("open");
+    let mut owner: std::collections::BTreeMap<usize, (usize, &'static str)> = Default::default();
+    let mut dup = 0usize;
+    let mut freeref = 0usize;
+    let mut stack = std::vec![BLKN_ROOT];
+    let mut seen = std::collections::BTreeSet::new();
+    let fm: BitVec<Lsb0, u8> = (**sfs.free_map.read()).clone();
+    let mut claim =
+        |b: usize, ino: usize, what: &'static str, dup: &mut usize, freeref: &mut usize| {
+            if fm[b] {
+                *freeref += 1;
+                if *freeref < 10 {
+                    std::println!("ino {} {} block {} marked FREE", ino, what, b);
+                }
+            }
+            if let Some(o) = owner.insert(b, (ino, what)) {
+                *dup += 1;
+                if *dup < 10 {
+                    std::println!(
+                        "block {} shared: ino {} {} and ino {} {}",
+                        b,
+                        o.0,
+                        o.1,
+                        ino,
+                        what
+                    );
+                }
+            }
+        };
+    while let Some(ino) = stack.pop() {
+        if !seen.insert(ino) {
+            continue;
+        }
+        let inode = sfs.get_inode(ino);
+        claim(ino, ino, "inode", &mut dup, &mut freeref);
+        let (dblocks, dind, ddb, dtype, dsize) = {
+            let d = inode.disk_inode.read();
+            (d.blocks, d.indirect, d.db_indirect, d.type_, d.size)
+        };
+        let blocks = dblocks as usize;
+        if blocks > NDIRECT {
+            claim(dind as usize, ino, "indirect", &mut dup, &mut freeref);
+        }
+        if blocks > MAX_NBLOCK_INDIRECT {
+            claim(ddb as usize, ino, "dbind", &mut dup, &mut freeref);
+        }
+        for i in 0..blocks {
+            let b = inode.get_disk_block_id(i).unwrap();
+            claim(b, ino, "data", &mut dup, &mut freeref);
+        }
+        if dtype == crate::structs::FileType::Dir {
+            for e in 0..(dsize as usize / DIRENT_SIZE) {
+                let ent = inode.read_direntry(e).unwrap();
+                let n: &str = ent.name.as_ref();
+                if n != "." && n != ".." {
+                    stack.push(ent.id as usize);
+                }
+            }
+        }
+    }
+    std::println!(
+        "inodes {} blocks used {} shared {} referenced-but-free {}",
+        seen.len(),
+        owner.len(),
+        dup,
+        freeref
+    );
+    std::mem::forget(sfs);
+}

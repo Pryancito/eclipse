@@ -72,6 +72,14 @@ pub struct INodeImpl {
     /// Char/block device id (major, minor)
     /// e.g. crw-rw-rw- 1 root wheel 3, 2 May 13 16:40 /dev/null
     device_inode_id: usize,
+    /// Serializes every change of `blocks`/`size`. `_resize` takes and drops
+    /// the `disk_inode` lock several times while it allocates or frees, so two
+    /// resizes of the same inode used to interleave: a writer that read
+    /// `size` before another writer grew the file then "grew" it to a SMALLER
+    /// length, which `_resize` treats as a truncate. That cut off the other
+    /// writer's data, and two such truncates racing freed the same blocks
+    /// twice (`assertion failed: !free_map[block_id]`).
+    resize_lock: Mutex<()>,
 }
 
 impl Debug for INodeImpl {
@@ -228,6 +236,21 @@ impl INodeImpl {
     }
     /// Resize content size, no matter what type it is.
     fn _resize(&self, len: usize) -> vfs::Result<()> {
+        let _guard = self.resize_lock.lock();
+        self._resize_locked(len)
+    }
+    /// Grow the content to at least `len` bytes; never shrinks. The size is
+    /// checked under `resize_lock`, so a concurrent writer that already made
+    /// the file longer is not truncated back to this caller's end offset.
+    fn _grow_to(&self, len: usize) -> vfs::Result<()> {
+        let _guard = self.resize_lock.lock();
+        if (self.disk_inode.read().size as usize) < len {
+            self._resize_locked(len)?;
+        }
+        Ok(())
+    }
+    /// `_resize` body. Caller holds `resize_lock`.
+    fn _resize_locked(&self, len: usize) -> vfs::Result<()> {
         if len > MAX_FILE_SIZE {
             return Err(FsError::InvalidParam);
         }
@@ -328,12 +351,14 @@ impl INodeImpl {
                     disk_inode.blocks = old_blocks;
                     return Err(e);
                 }
-                // clean up
-                let mut disk_inode = self.disk_inode.write();
-                let old_size = disk_inode.size as usize;
-                disk_inode.size = len as u32;
-                drop(disk_inode);
-                self._clean_at(old_size, len)?;
+                // Zero the new tail BEFORE publishing the new size. Once
+                // `size` says `len`, a concurrent writer whose end offset is
+                // below `len` skips `_grow_to` and writes straight into
+                // [old_size, len); zeroing after that wiped its data.
+                let old_size = self.disk_inode.read().size as usize;
+                let cleaned = self._clean_at(old_size, len);
+                self.disk_inode.write().size = len as u32;
+                cleaned?;
             }
             Ordering::Less => {
                 // free extra blocks
@@ -421,11 +446,25 @@ impl INodeImpl {
         })
     }
     /// Clean content, no matter what type it is
+    /// Unlike the other `_*_at`, NOT clamped to `size`: `_resize` zeroes the
+    /// grown tail before it publishes the new size. Bounded by `blocks`
+    /// instead (`get_disk_block_id` refuses a slot past it).
     fn _clean_at(&self, begin: usize, end: usize) -> vfs::Result<usize> {
         static ZEROS: [u8; BLKSIZE] = [0; BLKSIZE];
-        self._io_at(begin, end, |device, range, _| {
-            device.write_block(range.block, range.begin, &ZEROS[..range.len()])
-        })
+        let iter = BlockIter {
+            begin,
+            end: end.max(begin),
+            block_size_log2: BLKSIZE_LOG2,
+        };
+        let mut cleaned = 0usize;
+        for mut range in iter {
+            range.block = self.get_disk_block_id(range.block)?;
+            self.fs
+                .device
+                .write_block(range.block, range.begin, &ZEROS[..range.len()])?;
+            cleaned += range.len();
+        }
+        Ok(cleaned)
     }
     fn nlinks_inc(&self) {
         self.disk_inode.write().nlinks += 1;
@@ -437,7 +476,7 @@ impl INodeImpl {
     }
 
     pub fn link_inodeimpl(&self, name: &str, other: &Arc<INodeImpl>) -> vfs::Result<()> {
-        let _namespace = self.fs.namespace.lock();
+        let _namespace = self.fs.namespace.write();
         check_entry_name(name)?;
         let info = self.metadata()?;
         if info.type_ != vfs::FileType::Dir {
@@ -460,8 +499,7 @@ impl INodeImpl {
             id: child.id as u32,
             name: Str256::from(name),
         };
-        let disk_inode = self.disk_inode.write();
-        let old_size = disk_inode.size as usize;
+        let old_size = self.disk_inode.read().size as usize;
         self._resize(old_size + BLKSIZE)?;
         self._write_at(old_size, entry.as_buf()).unwrap();
         child.nlinks_inc();
@@ -491,7 +529,7 @@ impl vfs::INode for INodeImpl {
             FileType::File | FileType::SymLink => {
                 let end_offset = offset + buf.len();
                 if (size as usize) < end_offset {
-                    self._resize(end_offset)?;
+                    self._grow_to(end_offset)?;
                 }
                 self._write_at(offset, buf)
             }
@@ -575,7 +613,7 @@ impl vfs::INode for INodeImpl {
         _mode: u32,
         data: usize,
     ) -> vfs::Result<Arc<dyn vfs::INode>> {
-        let _namespace = self.fs.namespace.lock();
+        let _namespace = self.fs.namespace.write();
         check_entry_name(name)?;
         let info = self.metadata()?;
         if info.type_ != vfs::FileType::Dir {
@@ -614,7 +652,7 @@ impl vfs::INode for INodeImpl {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn INode>) -> vfs::Result<()> {
-        let _namespace = self.fs.namespace.lock();
+        let _namespace = self.fs.namespace.write();
         check_entry_name(name)?;
         let info = self.metadata()?;
         if info.type_ != vfs::FileType::Dir {
@@ -643,7 +681,7 @@ impl vfs::INode for INodeImpl {
         Ok(())
     }
     fn unlink(&self, name: &str) -> vfs::Result<()> {
-        let _namespace = self.fs.namespace.lock();
+        let _namespace = self.fs.namespace.write();
         let info = self.metadata()?;
         if info.type_ != vfs::FileType::Dir {
             return Err(FsError::NotDir);
@@ -680,7 +718,7 @@ impl vfs::INode for INodeImpl {
         Ok(())
     }
     fn move_(&self, old_name: &str, target: &Arc<dyn INode>, new_name: &str) -> vfs::Result<()> {
-        let _namespace = self.fs.namespace.lock();
+        let _namespace = self.fs.namespace.write();
         check_entry_name(new_name)?;
         if new_name == "." || new_name == ".." {
             return Err(FsError::InvalidParam);
@@ -805,6 +843,7 @@ impl vfs::INode for INodeImpl {
         if info.type_ != vfs::FileType::Dir {
             return Err(FsError::NotDir);
         }
+        let _namespace = self.fs.namespace.read();
         let inode_id = self.get_file_inode_id(name).ok_or(FsError::EntryNotFound)?;
         Ok(self.fs.get_inode(inode_id))
     }
@@ -823,6 +862,7 @@ impl vfs::INode for INodeImpl {
         if self.disk_inode.read().type_ != FileType::Dir {
             return Err(FsError::NotDir);
         }
+        let _namespace = self.fs.namespace.read();
         if id >= self.disk_inode.read().size as usize / DIRENT_SIZE {
             return Err(FsError::EntryNotFound);
         };
@@ -868,6 +908,14 @@ impl Drop for INodeImpl {
             self.disk_inode.write().sync();
             self.fs.free_block(self.id);
         }
+        // Only now is the inode on disk final, so only now may `get_inode`
+        // load it again: until this entry goes away it waits (see there).
+        let mut inodes = self.fs.inodes.write();
+        if let Some(w) = inodes.get(&self.id) {
+            if core::ptr::eq(w.as_ptr(), self) {
+                inodes.remove(&self.id);
+            }
+        }
     }
 }
 
@@ -909,8 +957,17 @@ pub struct SimpleFileSystem {
     ///
     /// One lock for the whole filesystem rather than one per directory: a
     /// `move_` changes two directories, and a filesystem-wide lock needs no
-    /// order to take them in. Lookups do not take it.
-    namespace: Mutex<()>,
+    /// order to take them in.
+    ///
+    /// Lookups take it for reading. They used to take nothing, and a lookup
+    /// that read a directory entry just before `unlink` removed it then
+    /// called `get_inode` on an inode whose last `Arc` was already being
+    /// dropped: the `Weak` no longer upgraded, so the inode was loaded again
+    /// from disk, and when that second copy dropped it freed the inode's
+    /// blocks a second time (`!free_map[block_id]` from `Drop`). A reader
+    /// could also see `remove_direntry` half way through moving the last
+    /// entry into the hole.
+    namespace: RwLock<()>,
 }
 
 impl SimpleFileSystem {
@@ -937,7 +994,7 @@ impl SimpleFileSystem {
             dev: vfs::anon_dev(),
             self_ptr: Weak::default(),
             device_inodes: RwLock::new(BTreeMap::new()),
-            namespace: Mutex::new(()),
+            namespace: RwLock::new(()),
         }
         .wrap())
     }
@@ -971,7 +1028,7 @@ impl SimpleFileSystem {
             dev: vfs::anon_dev(),
             self_ptr: Weak::default(),
             device_inodes: RwLock::new(BTreeMap::new()),
-            namespace: Mutex::new(()),
+            namespace: RwLock::new(()),
         }
         .wrap();
 
@@ -1101,6 +1158,7 @@ impl SimpleFileSystem {
             disk_inode: RwLock::new(disk_inode),
             fs: self.self_ptr.upgrade().unwrap(),
             device_inode_id,
+            resize_lock: Mutex::new(()),
         });
         self.inodes.write().insert(id, Arc::downgrade(&inode));
         inode
@@ -1117,9 +1175,51 @@ impl SimpleFileSystem {
                 return inode;
             }
         }
-        // Load if not in set, or is weak ref.
+        // An entry that no longer upgrades is an INodeImpl whose `Drop` is
+        // still running: it has not yet written its final `disk_inode` (and,
+        // if unlinked, not yet freed its blocks). Loading the id from disk in
+        // that window gave a second copy with stale metadata -- for a fresh
+        // file, an inode block never written at all -- and dropping that copy
+        // freed blocks twice. `Drop` removes its own entry when it is done.
+        loop {
+            {
+                let inodes = self.inodes.read();
+                match inodes.get(&id) {
+                    None => break,
+                    Some(w) => {
+                        if let Some(inode) = w.upgrade() {
+                            return inode;
+                        }
+                    }
+                }
+            }
+            core::hint::spin_loop();
+        }
+        // Load if not in set, or is weak ref. Re-check under the write lock:
+        // two threads that both missed above used to each load their own
+        // INodeImpl for the same id, with separate in-memory `disk_inode`
+        // copies. Growing one and syncing the other then pointed the on-disk
+        // inode at blocks the free map no longer agreed with.
+        let mut inodes = self.inodes.write();
+        if let Some(w) = inodes.get(&id) {
+            if let Some(inode) = w.upgrade() {
+                return inode;
+            }
+            // Started dying since the wait above: wait again.
+            drop(inodes);
+            return self.get_inode(id);
+        }
         let disk_inode = Dirty::new(self.device.load_struct::<DiskINode>(id).unwrap());
-        self._new_inode(id, disk_inode)
+        let device_inode_id = disk_inode.device_inode_id;
+        let inode = Arc::new(INodeImpl {
+            id,
+            disk_inode: RwLock::new(disk_inode),
+            fs: self.self_ptr.upgrade().unwrap(),
+            device_inode_id,
+            resize_lock: Mutex::new(()),
+        });
+        inodes.insert(id, Arc::downgrade(&inode));
+        inode
     }
     /// Create a new INode file
     fn new_inode_file(&self) -> vfs::Result<Arc<INodeImpl>> {
@@ -1154,17 +1254,6 @@ impl SimpleFileSystem {
         new_inode.sync_all()?;
         Ok(new_inode)
     }
-    fn flush_weak_inodes(&self) {
-        let mut inodes = self.inodes.write();
-        let remove_ids: Vec<_> = inodes
-            .iter()
-            .filter(|(_, inode)| inode.upgrade().is_none())
-            .map(|(&id, _)| id)
-            .collect();
-        for id in remove_ids.iter() {
-            inodes.remove(id);
-        }
-    }
 }
 
 impl vfs::FileSystem for SimpleFileSystem {
@@ -1188,12 +1277,24 @@ impl vfs::FileSystem for SimpleFileSystem {
             }
             free_map.sync();
         }
-        self.flush_weak_inodes();
-        for inode in self.inodes.read().values() {
-            if let Some(inode) = inode.upgrade() {
-                inode.sync_all()?;
-            }
+        // Released before the inodes: dropping the last `Arc` of one of
+        // them below runs its `Drop`, which frees blocks (`free_map`) and
+        // removes its own `inodes` entry -- both would spin forever on a
+        // lock this function still held. (Dead entries are no longer swept
+        // here: each `Drop` removes its own, and one still listed is a
+        // `Drop` in progress that `get_inode` must see.)
+        drop(super_block);
+        drop(free_map);
+        let live: Vec<Arc<INodeImpl>> = self
+            .inodes
+            .read()
+            .values()
+            .filter_map(|w| w.upgrade())
+            .collect();
+        for inode in live.iter() {
+            inode.sync_all()?;
         }
+        drop(live);
         self.device.sync()?;
         Ok(())
     }
