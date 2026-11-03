@@ -130,3 +130,67 @@ fn each_who_reports_its_own_tasks_minor_faults() {
         "no fault here reads a disk"
     );
 }
+
+/// Map `pages` fresh pages in `proc`'s address space and write each one, in
+/// window `window` of 16 MiB windows from an address nothing else in this
+/// binary maps: libos keeps every process's pages in one host address space.
+fn touch(proc: &Arc<Process>, window: usize, pages: usize) -> usize {
+    use zircon_object::vm::{MMUFlags, VmObject};
+    let vmar = proc.vmar();
+    let rw = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+    let addr = vmar
+        .map_at(
+            0x3_a000_0000 + window * 0x100_0000,
+            VmObject::new_paged(pages),
+            0,
+            pages * 4096,
+            rw,
+        )
+        .unwrap();
+    for i in 0..pages {
+        vmar.handle_page_fault(addr + i * 4096, MMUFlags::WRITE | MMUFlags::USER)
+            .unwrap();
+    }
+    addr
+}
+
+/// `ru_maxrss` is the most memory the tasks have had resident, in kB: for
+/// `RUSAGE_SELF` still there after a `munmap`, for `RUSAGE_THREAD` the same,
+/// since the memory is the process's and not one thread's, and for
+/// `RUSAGE_CHILDREN` the largest reaped child's, not the sum. All three were
+/// 0, which `time -v` printed as "Maximum resident set size (kbytes): 0".
+#[test]
+fn each_who_reports_its_tasks_peak_resident_size() {
+    let proc = Process::create_with_fixed_id_ext(
+        &ROOT_JOB,
+        47_112,
+        "rusage",
+        LinuxProcess::new(RamFS::new(), 0),
+    )
+    .unwrap();
+    let at = touch(&proc, 0, 24);
+    proc.vmar().unmap(at, 24 * 4096).unwrap();
+    for (window, pages) in [(1, 40), (2, 4)] {
+        let child = Process::fork_from(&proc).unwrap();
+        touch(&child, window, pages);
+        child.exit(0);
+        block_on(wait_child(&proc, child.id(), true, true)).unwrap();
+    }
+
+    let (thread, process, children) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            (
+                usage(sys, RUSAGE_THREAD),
+                usage(sys, RUSAGE_SELF),
+                usage(sys, RUSAGE_CHILDREN),
+            )
+        })
+    });
+    assert_eq!(process.maxrss, 24 * 4, "RUSAGE_SELF, after the munmap");
+    assert_eq!(thread.maxrss, 24 * 4, "RUSAGE_THREAD is the process's");
+    assert_eq!(
+        children.maxrss,
+        40 * 4,
+        "RUSAGE_CHILDREN, the largest child"
+    );
+}

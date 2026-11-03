@@ -60,6 +60,7 @@ fn a_configured_parent() -> LinuxProcessInner {
             voluntary_switches: 333,
             involuntary_switches: 444,
             minor_faults: 555,
+            max_rss_bytes: 666,
         },
         pdeathsig: 15,
         child_subreaper: true,

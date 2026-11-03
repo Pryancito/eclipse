@@ -6,6 +6,10 @@
 //! tgutime + sig->cutime`, and `getrusage(p, RUSAGE_BOTH)` for the rusage),
 //! so `time sh -c make` here showed the shell's few milliseconds and none of
 //! the compilers; and the context switches were not counted at all.
+//!
+//! The peak resident size is the one thing in it that is not added up: it is
+//! a peak, and the reaper keeps the largest (`wait_task_zombie`: `psig->cmaxrss
+//! = max(psig->cmaxrss, max(sig->maxrss, sig->cmaxrss))`).
 
 use super::*;
 
@@ -25,6 +29,9 @@ pub struct ChildCpu {
     pub involuntary_switches: u64,
     /// Faults on its memory resolved without a disk (`ru_minflt`).
     pub minor_faults: u64,
+    /// The most it had resident, in bytes, or any child it reaped had
+    /// (`ru_maxrss`).
+    pub max_rss_bytes: u64,
 }
 
 impl ChildCpu {
@@ -35,14 +42,15 @@ impl ChildCpu {
         self.voluntary_switches += other.voluntary_switches;
         self.involuntary_switches += other.involuntary_switches;
         self.minor_faults += other.minor_faults;
+        self.max_rss_bytes = self.max_rss_bytes.max(other.max_rss_bytes);
     }
 }
 
 /// Read an exited child's final usage off its still-live object: its
 /// threads' measured time, live ones included, since an `exit_group` makes
 /// the child waitable before they are gone (it was the exited threads' user
-/// time alone, which was nothing for a child that called `exit`), and what
-/// the children it reaped itself had used.
+/// time alone, which was nothing for a child that called `exit`), its peak
+/// resident size, and what the children it reaped itself had used.
 pub(super) fn child_cpu(child: &Arc<Process>) -> ChildCpu {
     let (utime_ns, stime_ns) = child.cpu_time_ns();
     let (voluntary_switches, involuntary_switches) = child.context_switches();
@@ -52,6 +60,7 @@ pub(super) fn child_cpu(child: &Arc<Process>) -> ChildCpu {
         voluntary_switches,
         involuntary_switches,
         minor_faults: child.minor_faults(),
+        max_rss_bytes: child.peak_resident_bytes() as u64,
     };
     if let Some(lp) = child.try_linux() {
         cpu.add(lp.children_usage());

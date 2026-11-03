@@ -123,7 +123,13 @@ pub(crate) mod flush_probe {
 ///
 /// The pages live in the one host address space and in [`MAPPED_PAGES`],
 /// which every table shares; what is this table's own is the count of what it
-/// mapped. The mark [`MMUFlags::SPECIAL`] rides in the flags kept there, and is
+/// mapped. That count is best-effort when two tables map the same address: the
+/// host keeps one page there, the one mapped second replaces the other's, and
+/// the replaced page is counted out of the table that mapped second, which is
+/// the only one that knows. A real table refuses that `map` instead. The tests
+/// that read the count each use an address of their own.
+///
+/// The mark [`MMUFlags::SPECIAL`] rides in the flags kept there, and is
 /// taken back out of what [`GenericPageTable::query`] answers, as a real
 /// entry's `flags()` never reports it.
 pub struct PageTable {
@@ -163,7 +169,8 @@ impl GenericPageTable for PageTable {
         if paddr < PMEM_SIZE {
             MOCK_PHYS_MEM.mmap(page.vaddr, PAGE_SIZE, paddr, flags);
             // A host mmap replaces whatever was there, where a real table
-            // answers `AlreadyMapped`: count the page it replaced out first.
+            // answers `AlreadyMapped`: count the page it replaced out first,
+            // of this table, whichever table mapped it (see the struct's doc).
             let old = MAPPED_PAGES.lock().insert(page.vaddr, (paddr, flags));
             if old.is_some_and(|(_, f)| !f.contains(MMUFlags::SPECIAL)) {
                 self.resident.sub(PAGE_SIZE);

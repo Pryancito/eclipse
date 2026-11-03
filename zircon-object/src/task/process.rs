@@ -118,6 +118,12 @@ pub struct Process {
     dead_threads_switches: super::thread::ContextSwitches,
     /// The minor page faults of threads that have already exited.
     dead_threads_faults: super::thread::MinorFaults,
+    /// The peak resident size, in bytes, of the address spaces this process
+    /// has left: the one an `execve` emptied or gave back, and the one it ran
+    /// in when it exited. Linux's `signal->maxrss`, which `exec_mmap()` and
+    /// `do_exit()` fold the old `mm`'s `hiwater_rss` into. See
+    /// [`Process::peak_resident_bytes`].
+    left_spaces_peak: AtomicUsize,
     /// What the leader had for the scheduler when it left the thread list.
     /// See [`Process::leader_sched`].
     leader_sched: Mutex<Option<SchedSnapshot>>,
@@ -538,6 +544,7 @@ impl Process {
             dead_threads_sys_time: AtomicU64::new(0),
             dead_threads_switches: Default::default(),
             dead_threads_faults: Default::default(),
+            left_spaces_peak: AtomicUsize::new(0),
             leader_sched: Mutex::new(None),
             exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
@@ -574,6 +581,7 @@ impl Process {
             dead_threads_sys_time: AtomicU64::new(0),
             dead_threads_switches: Default::default(),
             dead_threads_faults: Default::default(),
+            left_spaces_peak: AtomicUsize::new(0),
             leader_sched: Mutex::new(None),
             exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
@@ -637,6 +645,7 @@ impl Process {
             dead_threads_sys_time: AtomicU64::new(0),
             dead_threads_switches: Default::default(),
             dead_threads_faults: Default::default(),
+            left_spaces_peak: AtomicUsize::new(0),
             leader_sched: Mutex::new(None),
             exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
@@ -839,6 +848,11 @@ impl Process {
         // runs here when this was the last process in the address space, and
         // waits for the last one when a `vfork` child or its parent is still
         // running in it.
+        //
+        // Its peak first, which the clear starts over: `do_exit()`'s
+        // `setmax_mm_hiwater_rss(&tsk->signal->maxrss, mm)`, so the reaper's
+        // rusage still has it.
+        self.keep_resident_peak(&self.vmar());
         let hold = self.space.lock().hold.take();
         drop(hold);
 
@@ -1004,11 +1018,19 @@ impl Process {
     /// parent's while that child has not exec'd -- is left to the other and
     /// swapped for a new, empty one, which is what Linux's `exec_mmap()`
     /// does with a shared `mm`. Clearing a shared one instead would unmap
-    /// the parent's program from under it.
+    /// the parent's program from under it. Either way the old image's peak
+    /// resident size stays the process's ([`peak_resident_bytes`]).
+    ///
+    /// [`peak_resident_bytes`]: Self::peak_resident_bytes
     ///
     /// Called by a thread of this process, which goes back to user mode in
     /// the new one: this CPU is switched to it here.
     pub fn own_address_space(&self) -> Arc<VmAddressRegion> {
+        // The image being replaced leaves its peak with the process, as
+        // `exec_mmap()` folds the old `mm`'s into `signal->maxrss`: the
+        // caller empties this space next, or it goes back to the process
+        // that lent it, and either way it is not this process's any more.
+        self.keep_resident_peak(&self.vmar());
         if !self.space.lock().is_shared() {
             return self.vmar();
         }
@@ -1317,6 +1339,40 @@ impl Process {
         let inner = self.inner.lock();
         let gone = self.dead_threads_faults.get();
         gone + inner.threads.iter().map(|t| t.minor_faults()).sum::<u64>()
+    }
+
+    /// The most memory this process has had resident, in bytes: what
+    /// `getrusage(2)` reports as `ru_maxrss` for the process and for each of
+    /// its threads, and its reaper's rusage once it has exited. Linux's
+    /// `max(signal->maxrss, mm->hiwater_rss)`: the peak of the address space
+    /// it runs in now and of the ones it has left, so the memory a program
+    /// used before it `execve`d stays the process's, the way `time(1)` over
+    /// a shell that execs its command counts it.
+    ///
+    /// The address space counts only while this process holds it, and it is
+    /// read under the lock the exit lets go of it under. The exit keeps the
+    /// space's peak before it lets go, so a read finds the peak in the space
+    /// or in what was kept, never in neither. And once this process has
+    /// exited, a space that another process still runs in cannot raise its
+    /// peak: a `vfork` child that exits without an `execve` leaves its
+    /// parent's space behind, and the parent goes on growing it before it
+    /// reaps the child. Linux reads only a zombie's `signal->maxrss`, since
+    /// the zombie has no `mm` any more.
+    pub fn peak_resident_bytes(&self) -> usize {
+        let now = {
+            let space = self.space.lock();
+            match space.hold {
+                Some(_) => space.vmar.resident_peak_bytes(),
+                None => 0,
+            }
+        };
+        now.max(self.left_spaces_peak.load(Ordering::Acquire))
+    }
+
+    /// Keep the peak of `vmar`, the address space this process is leaving.
+    fn keep_resident_peak(&self, vmar: &VmAddressRegion) {
+        self.left_spaces_peak
+            .fetch_max(vmar.resident_peak_bytes(), Ordering::Release);
     }
 
     pub(super) fn remove_thread(&self, tid: KoID) {
@@ -1666,6 +1722,9 @@ pub use self::leader_sched::SchedSnapshot;
 
 #[cfg(test)]
 mod shared_space_tests;
+
+#[cfg(test)]
+mod peak_rss_tests;
 
 #[cfg(test)]
 mod tests {
