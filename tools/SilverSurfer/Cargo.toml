@@ -56,6 +56,9 @@ embedded-graphics = "0.8"
 wayland-client = { version = "0.31", features = ["dlopen", "system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 xkbcommon = "0.7"
+# Saved passwords: ChaCha20-Poly1305 with a per-user key in `passwords.key`.
+# Pure Rust, no default features: the nonce comes from getrandom(2).
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 
 servo = { version = "0.7", optional = true, default-features = false, features = [
     "bundled",

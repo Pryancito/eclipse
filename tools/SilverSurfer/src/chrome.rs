@@ -1,13 +1,17 @@
 //! The toolbar drawn into a wl_shm buffer. The page never paints this strip:
 //! it is a subsurface of its own, so Servo's GL window starts below it.
 
-use embedded_graphics::mono_font::ascii::FONT_6X10;
+use embedded_graphics::mono_font::iso_8859_1::FONT_6X10;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::Text;
-use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use std::rc::Rc;
+
+use tiny_skia::{
+    Color, FilterQuality, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke, Transform,
+};
 
 use crate::location::SchemeHint;
 use crate::look::{Look, Rgb};
@@ -212,17 +216,76 @@ pub fn hit(width: i32, tabs: usize, x: i32, y: i32) -> Option<Hit> {
     None
 }
 
+/// Lado del favicon en px CSS dentro de la pestaña.
+pub const FAVICON: u32 = 16;
+
+/// Favicon reducido a `FAVICON`×`FAVICON` px, RGBA premultiplicado (el
+/// formato de tiny-skia), listo para pintarlo en cualquier escala.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Favicon {
+    pub rgba: Vec<u8>,
+}
+
+impl Favicon {
+    /// Reduce una imagen RGBA (sin premultiplicar) de cualquier tamaño a
+    /// 16×16 promediando cajas. `None` si la imagen está vacía o no cuadra.
+    pub fn from_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<Self> {
+        let (w, h) = (width as usize, height as usize);
+        if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+            return None;
+        }
+        let side = FAVICON as usize;
+        let mut out = vec![0u8; side * side * 4];
+        for oy in 0..side {
+            let (y0, y1) = (oy * h / side, ((oy + 1) * h / side).max(oy * h / side + 1));
+            for ox in 0..side {
+                let (x0, x1) = (ox * w / side, ((ox + 1) * w / side).max(ox * w / side + 1));
+                // Media ponderada por alfa (premultiplicada), para que el
+                // fondo transparente no oscurezca los bordes.
+                let mut acc = [0u64; 4];
+                let mut n = 0u64;
+                for y in y0..y1.min(h) {
+                    for x in x0..x1.min(w) {
+                        let i = (y * w + x) * 4;
+                        let a = u64::from(rgba[i + 3]);
+                        acc[0] += u64::from(rgba[i]) * a / 255;
+                        acc[1] += u64::from(rgba[i + 1]) * a / 255;
+                        acc[2] += u64::from(rgba[i + 2]) * a / 255;
+                        acc[3] += a;
+                        n += 1;
+                    }
+                }
+                let o = (oy * side + ox) * 4;
+                for c in 0..4 {
+                    out[o + c] = (acc[c] / n.max(1)) as u8;
+                }
+            }
+        }
+        Some(Self { rgba: out })
+    }
+
+    fn pixmap(&self) -> Option<Pixmap> {
+        let mut pm = Pixmap::new(FAVICON, FAVICON)?;
+        pm.data_mut().copy_from_slice(&self.rgba);
+        Some(pm)
+    }
+}
+
 pub struct View<'a> {
     pub width: i32,
     pub look: Look,
     pub titles: &'a [String],
     /// Parallel to `titles`: the tab is mid-load.
     pub loading: &'a [bool],
+    /// Parallel to `titles`: el favicon de la pestaña, si la página tiene.
+    pub icons: &'a [Option<Rc<Favicon>>],
     pub active: usize,
     pub location: &'a str,
     pub location_focused: bool,
     /// Caret, in characters, used only while the bar is focused.
     pub location_cursor: usize,
+    /// Selección de la barra enfocada, `[inicio, fin)` en caracteres.
+    pub location_selection: Option<(usize, usize)>,
     /// Sufijo de autocompletado del historial (solo barra enfocada).
     pub location_suggest: &'a str,
     /// La barra actúa como buscar-en-página (Ctrl+F).
@@ -279,6 +342,26 @@ pub fn render(view: &View<'_>) -> Pixels {
             );
         }
         icon_close(&mut pixmap, *rect, scale, pal.dim);
+        if let Some(icon) = view.icons.get(i).and_then(Option::as_ref) {
+            if rect.w >= 40 {
+                if let Some(pm) = icon.pixmap() {
+                    let x = (rect.x + 4) * scale;
+                    let y = (rect.y + (rect.h - FAVICON as i32) / 2) * scale;
+                    pixmap.draw_pixmap(
+                        0,
+                        0,
+                        pm.as_ref(),
+                        &PixmapPaint {
+                            quality: FilterQuality::Bilinear,
+                            ..PixmapPaint::default()
+                        },
+                        Transform::from_scale(scale as f32, scale as f32)
+                            .post_translate(x as f32, y as f32),
+                        None,
+                    );
+                }
+            }
+        }
     }
     fill(&mut pixmap, s(lay.new_tab), pal.field);
     fill(&mut pixmap, s(lay.back), pal.field);
@@ -286,6 +369,20 @@ pub fn render(view: &View<'_>) -> Pixels {
     fill(&mut pixmap, s(lay.reload), pal.field);
     fill(&mut pixmap, s(lay.scheme), pal.field);
     fill(&mut pixmap, s(lay.location), pal.field);
+    if view.location_focused {
+        if let Some(sel) = view.location_selection {
+            let room = (lay.location.w / 6).max(1) as usize;
+            if let Some((x, w)) = selection_span(view.location, room, view.location_cursor, sel) {
+                let rect = RectI {
+                    x: lay.location.x + 8 + x,
+                    y: lay.location.y + 6,
+                    w,
+                    h: 13,
+                };
+                fill(&mut pixmap, s(rect), pal.accent);
+            }
+        }
+    }
     fill(&mut pixmap, s(lay.gpu), pal.field);
     if view.private {
         fill(&mut pixmap, s(lay.private), pal.field);
@@ -355,10 +452,12 @@ pub fn render(view: &View<'_>) -> Pixels {
         } else {
             raw.to_string()
         };
-        let room = ((rect.w - 20) / 6).max(1) as usize;
+        let has_icon = rect.w >= 40 && view.icons.get(i).is_some_and(Option::is_some);
+        let shift = if has_icon { FAVICON as i32 + 4 } else { 0 };
+        let room = ((rect.w - 20 - shift) / 6).max(1) as usize;
         label_scaled(
             &mut target,
-            rect.x + 6,
+            rect.x + 6 + shift,
             rect.y + 14,
             &clip(&title, room),
             text,
@@ -453,6 +552,29 @@ pub fn render(view: &View<'_>) -> Pixels {
     }
 }
 
+/// Desplazamiento y ancho (px CSS, desde el inicio del texto) del fondo de
+/// la selección en la línea que dibuja [`location_line`].
+fn selection_span(
+    text: &str,
+    room: usize,
+    cursor: usize,
+    sel: (usize, usize),
+) -> Option<(i32, i32)> {
+    let len = text.chars().count();
+    let cursor = cursor.min(len);
+    let start = crate::lineedit::visible_start(len, room, cursor);
+    let end = (start + room.max(2) - 1).min(len);
+    let a = sel.0.max(start);
+    let b = sel.1.min(end);
+    if a >= b {
+        return None;
+    }
+    // El cursor siempre está en un extremo de la selección: si está a la
+    // izquierda, el `|` va antes y empuja la selección una columna.
+    let col = (a - start) as i32 + i32::from(cursor <= a);
+    Some((col * 6, (b - a) as i32 * 6))
+}
+
 /// The slice of the bar that ends at the caret, plus a `|`.
 fn location_line(text: &str, room: usize, cursor: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
@@ -462,7 +584,7 @@ fn location_line(text: &str, room: usize, cursor: usize) -> String {
         return "|".into();
     }
     let body = room - 1;
-    let start = cursor.saturating_sub(body);
+    let start = crate::lineedit::visible_start(chars.len(), room, cursor);
     let end = (start + body).min(chars.len());
     let mut out: String = chars[start..cursor].iter().collect();
     out.push('|');
@@ -872,10 +994,12 @@ mod tests {
             look: Look::Eclipse,
             titles: std::slice::from_ref(&title),
             loading: &loading,
+            icons: &[],
             active: 0,
             location: "https://example.com",
             location_focused: true,
             location_cursor: 0,
+            location_selection: None,
             location_suggest: "",
             find_mode: false,
             scheme: SchemeHint::Https,
@@ -968,10 +1092,12 @@ mod tests {
                 look,
                 titles: std::slice::from_ref(&title),
                 loading: &loading,
+                icons: &[],
                 active: 0,
                 location: "",
                 location_focused: false,
                 location_cursor: 0,
+                location_selection: None,
                 location_suggest: "",
                 find_mode: false,
                 scheme: SchemeHint::Other,
@@ -1019,5 +1145,64 @@ mod tests {
         cur[12] = 9; // GL row 3 = top row
         assert_eq!(changed_rows_flipped(&cur, &prev, 1, 4), Some((0, 2)));
         assert_eq!(changed_rows_flipped(&cur, &[], 1, 4), Some((0, 3)));
+    }
+
+    #[test]
+    fn selection_span_skips_the_caret_column() {
+        // "abcdef", caret at 6 after Shift+← ×2 → "abcd[ef]|"
+        assert_eq!(selection_span("abcdef", 40, 6, (4, 6)), Some((24, 12)));
+        // Caret at the left end: "abcd|[ef]"
+        assert_eq!(selection_span("abcdef", 40, 4, (4, 6)), Some((30, 12)));
+        assert_eq!(selection_span("abcdef", 40, 6, (6, 6)), None);
+    }
+
+    #[test]
+    fn favicon_is_box_filtered_to_16px() {
+        // 32x32 opaque red → 16x16 opaque red.
+        let src: Vec<u8> = (0..32 * 32).flat_map(|_| [255, 0, 0, 255]).collect();
+        let icon = Favicon::from_rgba(32, 32, &src).expect("icono");
+        assert_eq!(icon.rgba.len(), 16 * 16 * 4);
+        assert_eq!(&icon.rgba[..4], &[255, 0, 0, 255]);
+        // Transparent stays transparent (premultiplied zero).
+        let clear = vec![0u8; 8 * 8 * 4];
+        assert_eq!(
+            &Favicon::from_rgba(8, 8, &clear).unwrap().rgba[..4],
+            &[0, 0, 0, 0]
+        );
+        assert!(Favicon::from_rgba(0, 4, &[]).is_none());
+    }
+
+    #[test]
+    fn favicon_shifts_the_tab_title() {
+        let titles = vec!["Ejemplo".to_string()];
+        let icon = Some(Rc::new(
+            Favicon::from_rgba(1, 1, &[0, 255, 0, 255]).unwrap(),
+        ));
+        let icons = [icon];
+        let loading = [false];
+        let mut view = View {
+            width: 640,
+            look: Look::Eclipse,
+            titles: &titles,
+            loading: &loading,
+            icons: &[],
+            active: 0,
+            location: "",
+            location_focused: false,
+            location_cursor: 0,
+            location_selection: None,
+            location_suggest: "",
+            find_mode: false,
+            scheme: SchemeHint::Https,
+            gpu: true,
+            private: false,
+            can_back: false,
+            can_forward: false,
+            scale: 1,
+        };
+        let plain = render(&view);
+        view.icons = &icons;
+        let with_icon = render(&view);
+        assert_ne!(plain.argb, with_icon.argb);
     }
 }

@@ -4,8 +4,9 @@
 //! navegaciones a extensiones típicas de fichero y Ctrl+S sobre la URL
 //! actual.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::files::{self, PickRequest};
 use crate::session::{data_dir, find_string, json_string, leaf_objects};
@@ -128,11 +129,71 @@ pub fn looks_like_download(url: &url::Url) -> bool {
     DOWNLOAD_EXTS.iter().any(|e| *e == ext)
 }
 
+/// Una cookie del navegador para el tarro de curl.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JarCookie {
+    /// Dominio sin punto inicial.
+    pub domain: String,
+    /// `Domain=` explícito: vale también para subdominios. Si no, solo el host.
+    pub subdomains: bool,
+    pub path: String,
+    pub secure: bool,
+    pub name: String,
+    pub value: String,
+}
+
+/// Lo que el navegador sabe de una descarga además de la URL: sus cookies,
+/// el User-Agent y el origen de la página desde la que se pidió.
+#[derive(Clone, Debug, Default)]
+pub struct Request {
+    pub cookies: Vec<JarCookie>,
+    pub user_agent: Option<String>,
+    pub referer: Option<url::Url>,
+}
+
+/// Tarro de cookies en formato Netscape (el que lee `curl --cookie`). Las
+/// cookies van como de sesión (expiración 0): solo sirven a esta descarga.
+pub fn netscape_jar(cookies: &[JarCookie]) -> String {
+    let mut out = String::from("# Netscape HTTP Cookie File\n");
+    for c in cookies {
+        let clean = |s: &str| s.replace(['\t', '\n', '\r'], "");
+        let domain = clean(c.domain.trim_start_matches('.'));
+        if domain.is_empty() || c.name.is_empty() {
+            continue;
+        }
+        let domain = if c.subdomains {
+            format!(".{domain}")
+        } else {
+            domain
+        };
+        let flag = if c.subdomains { "TRUE" } else { "FALSE" };
+        let secure = if c.secure { "TRUE" } else { "FALSE" };
+        let path = if c.path.is_empty() {
+            "/".into()
+        } else {
+            clean(&c.path)
+        };
+        out.push_str(&format!(
+            "{domain}\t{flag}\t{path}\t{secure}\t0\t{}\t{}\n",
+            clean(&c.name),
+            clean(&c.value)
+        ));
+    }
+    out
+}
+
 /// Abre lunarfile en modo guardar y descarga con `curl -L` en otro hilo.
 ///
 /// Devuelve `Ok(Some(path))` si la descarga arrancó, `Ok(None)` si el
-/// usuario canceló. `private` no deja rastro en `downloads.json`.
-pub fn save_url(url: &url::Url, private: bool) -> Result<Option<PathBuf>, String> {
+/// usuario canceló. `private` no deja rastro en `downloads.json`. Las
+/// cookies de `request` llegan a curl por su entrada estándar, nunca en la
+/// línea de órdenes, y curl solo las manda a los dominios que les tocan,
+/// también tras redirecciones.
+pub fn save_url(
+    url: &url::Url,
+    private: bool,
+    request: Request,
+) -> Result<Option<PathBuf>, String> {
     let name = suggested_name(url);
     let paths = files::pick(&PickRequest {
         multiple: false,
@@ -148,19 +209,16 @@ pub fn save_url(url: &url::Url, private: bool) -> Result<Option<PathBuf>, String
     let target = dest.clone();
     std::thread::Builder::new()
         .name("silversurfer-download".into())
-        .spawn(move || fetch(&url, &target, private))
+        .spawn(move || fetch(&url, &target, private, &request))
         .map_err(|e| format!("descarga: {e}"))?;
     Ok(Some(dest))
 }
 
-fn fetch(url: &url::Url, dest: &Path, private: bool) {
-    let ok = match Command::new("curl").args(curl_args(url, dest)).status() {
-        Ok(status) => status.success(),
-        Err(err) => {
-            eprintln!("silversurfer: curl: {err}");
-            false
-        }
-    };
+fn fetch(url: &url::Url, dest: &Path, private: bool, request: &Request) {
+    let ok = run_curl(url, dest, request).unwrap_or_else(|err| {
+        eprintln!("silversurfer: curl: {err}");
+        false
+    });
     if !private {
         let mut log = load();
         log.push(Entry {
@@ -178,8 +236,35 @@ fn fetch(url: &url::Url, dest: &Path, private: bool) {
     }
 }
 
-fn curl_args(url: &url::Url, dest: &Path) -> Vec<std::ffi::OsString> {
-    vec![
+fn run_curl(url: &url::Url, dest: &Path, request: &Request) -> std::io::Result<bool> {
+    let mut child = Command::new("curl")
+        .args(curl_args(url, dest, request))
+        .stdin(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // `--cookie -` lee el tarro de aquí; vacío si no hay cookies.
+        let _ = stdin.write_all(netscape_jar(&request.cookies).as_bytes());
+    }
+    Ok(child.wait()?.success())
+}
+
+fn curl_args(url: &url::Url, dest: &Path, request: &Request) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if !request.cookies.is_empty() {
+        args.extend(["--cookie".into(), "-".into()]);
+    }
+    if let Some(ua) = &request.user_agent {
+        args.extend(["--user-agent".into(), ua.into()]);
+    }
+    if let Some(referer) = &request.referer {
+        // Solo el origen, como `strict-origin-when-cross-origin`: la ruta de
+        // la página puede llevar datos privados y queda visible en `ps`.
+        let origin = referer.origin().ascii_serialization();
+        if origin != "null" {
+            args.extend(["--referer".into(), format!("{origin}/").into()]);
+        }
+    }
+    args.extend([
         "-fsSL".into(),
         "--proto".into(),
         "=http,https,ftp".into(),
@@ -189,7 +274,8 @@ fn curl_args(url: &url::Url, dest: &Path) -> Vec<std::ffi::OsString> {
         dest.as_os_str().to_owned(),
         "--".into(),
         url.as_str().into(),
-    ]
+    ]);
+    args
 }
 
 pub fn page_url() -> url::Url {
@@ -257,11 +343,60 @@ mod tests {
     #[test]
     fn curl_gets_the_url_after_the_option_terminator() {
         let url = url::Url::parse("https://example.com/a.zip").unwrap();
-        let args = curl_args(&url, Path::new("/home/u/a.zip"));
+        let args = curl_args(&url, Path::new("/home/u/a.zip"), &Request::default());
         let n = args.len();
         assert_eq!(args[n - 2], "--");
         assert_eq!(args[n - 1], "https://example.com/a.zip");
         assert!(args.iter().any(|a| a == "=http,https,ftp"));
+    }
+
+    #[test]
+    fn cookies_go_through_stdin_and_referer_is_only_the_origin() {
+        let url = url::Url::parse("https://cdn.example.com/a.zip").unwrap();
+        let request = Request {
+            cookies: vec![JarCookie {
+                domain: "example.com".into(),
+                subdomains: true,
+                path: "/".into(),
+                secure: true,
+                name: "sid".into(),
+                value: "s3cr3t".into(),
+            }],
+            user_agent: Some("UA/1".into()),
+            referer: Some(url::Url::parse("https://example.com/cuenta?token=x").unwrap()),
+        };
+        let args = curl_args(&url, Path::new("/tmp/a.zip"), &request);
+        assert!(args.windows(2).any(|w| w[0] == "--cookie" && w[1] == "-"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--referer" && w[1] == "https://example.com/"));
+        assert!(!args.iter().any(|a| a.to_string_lossy().contains("s3cr3t")));
+        assert!(!args.iter().any(|a| a.to_string_lossy().contains("token")));
+    }
+
+    #[test]
+    fn netscape_jar_lines() {
+        let jar = netscape_jar(&[
+            JarCookie {
+                domain: ".example.com".into(),
+                subdomains: true,
+                path: "".into(),
+                secure: true,
+                name: "a".into(),
+                value: "1".into(),
+            },
+            JarCookie {
+                domain: "host.example.org".into(),
+                subdomains: false,
+                path: "/x".into(),
+                secure: false,
+                name: "b".into(),
+                value: "2\tmal".into(),
+            },
+        ]);
+        let lines: Vec<&str> = jar.lines().collect();
+        assert_eq!(lines[1], ".example.com\tTRUE\t/\tTRUE\t0\ta\t1");
+        assert_eq!(lines[2], "host.example.org\tFALSE\t/x\tFALSE\t0\tb\t2mal");
     }
 
     #[test]

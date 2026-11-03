@@ -104,7 +104,10 @@ sesión; al cerrar borra cookies/almacenamiento/caché de esa instancia).
 | Arrastrar pestaña | Reordenar |
 | Clic derecho (página) | Menú contextual |
 | Tab (en la barra) | Aceptar sugerencia del historial |
-| Ctrl+C / Ctrl+X / Ctrl+V (en la barra) | Copiar / cortar la dirección, pegar |
+| Ctrl+C / Ctrl+X / Ctrl+V (en la barra) | Copiar / cortar la selección (o la dirección entera), pegar |
+| Ctrl+A, Shift+flechas, Shift+Inicio/Fin (en la barra) | Seleccionar |
+| Ctrl+← / Ctrl+→, Ctrl+Retroceso / Ctrl+Supr (en la barra) | Saltar / borrar por trozos de la URL |
+| Clic / doble clic / arrastrar (en la barra) | El primer clic selecciona la dirección; luego cursor, palabra o selección |
 | Ctrl+Shift+L | Guardar login del formulario visible |
 
 La barra busca con DuckDuckGo si el texto no parece una dirección
@@ -115,25 +118,41 @@ Las visitas se guardan en
 `about:history`, `about:bookmarks` y `about:downloads` abren listas
 locales. Navegar a PDF/ZIP/… intercepta la carga y pide destino con
 lunarfile (Servo 0.7 no expone un hook de descarga nativo).
+La descarga la hace curl con las cookies que Servo tiene para esa URL
+(pasadas por la entrada estándar, nunca en la línea de órdenes), el mismo
+User-Agent y como Referer solo el origen de la página, así que también
+funcionan los enlaces que piden sesión iniciada.
 El User-Agent por defecto imita Firefox de escritorio (con `Gecko/` y
 `Firefox/`, más `Servo/0.7`) para que sitios como Google no sirvan la
 cáscara degradada; `SILVERSURFER_UA` lo sustituye entero.
-El título de la ventana sigue la pestaña activa; mientras carga, el tab
+Cada pestaña muestra el favicon de la página (reducido a 16×16 y escalado
+con la salida). El título de la ventana sigue la pestaña activa; mientras carga, el tab
 muestra `…` y la barra un distintivo de esquema (`s` https, `!` http, `/` file).
 El cromo se pinta a la escala del output (HiDPI nativo), con iconos
 vectoriales, y recarga la paleta si cambia `/etc/eclipse/look`.
 El cursor sigue a la página (mano en enlaces, I en texto, redimensionar…) y
 al cromo (mano en botones y pestañas, I en la barra) vía `wp_cursor_shape_v1`;
 sin ese protocolo queda el del compositor.
+Las teclas muertas (´ + a → á, ¨ + u → ü, ~ + n → ñ…) pasan por xkb compose
+con la tabla de la locale (`LC_ALL`/`LC_CTYPE`/`LANG`); si la imagen no trae
+`/usr/share/X11/locale`, hay una tabla mínima integrada para los acentos
+latinos. El cromo dibuja Latin-1 (ISO 8859-1), así que «Nueva pestaña» y las
+URL con tildes se ven bien.
 El portapapeles es el del sistema: `arboard` sobre wlr/ext data-control
 (labwc), con X11 y un texto en memoria como respaldo. Lo usan los campos de
 la página, `navigator.clipboard` y la barra.
+También hay selección primaria: lo que se selecciona en la barra o en la
+página (al soltar el ratón; nunca un campo de contraseña) se puede pegar con
+el botón central en otra app, y el botón central sobre la barra o sobre un
+campo de texto de la página pega la selección primaria del sistema.
 El distintivo `GL` / `SW` indica si la página va por EGL o por blit
 software; en ventana privada aparece además `P`.
 `about:privacy`, `about:cookies` y `about:clear` cubren la UI de datos.
 El bloqueo de anuncios lite (hosts/paths + CSS hide) está activo por
 defecto; `SILVERSURFER_ADBLOCK=0` lo apaga. Ver `about:filters`.
-Contraseñas: almacén local ofuscado (`passwords.json`); autocompletado al
+Contraseñas: almacén local cifrado con ChaCha20-Poly1305 (`passwords.json`,
+clave aleatoria aparte en `passwords.key`, ambos 0600; los almacenes
+ofuscados antiguos se migran solos al abrirlos); autocompletado al
 cargar el origen; `about:passwords` lista entradas. Desactivado en `--private`.
 La home es un lienzo en blanco con el logo de Eclipse OS
 (paleta de `/etc/eclipse/look`). Los smokes de canvas / WebGL / WebGPU /

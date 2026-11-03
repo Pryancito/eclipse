@@ -7,11 +7,13 @@
 pub mod about;
 pub mod bookmarks;
 pub mod chrome;
+pub mod compose;
 pub mod downloads;
 pub mod files;
 pub mod filter;
 pub mod history;
 pub mod home;
+pub mod lineedit;
 pub mod location;
 pub mod look;
 pub mod menu;

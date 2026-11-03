@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::about;
+use crate::chrome;
 use crate::clipboard;
 use crate::downloads;
 use crate::files::{self, PickRequest};
@@ -236,6 +237,8 @@ pub struct Tab {
     pub url: String,
     pub loading: bool,
     pub animating: bool,
+    /// Favicon de la página, ya reducido a 16×16.
+    pub icon: Option<Rc<chrome::Favicon>>,
 }
 
 pub struct Model {
@@ -392,6 +395,15 @@ impl Delegate {
             .collect()
     }
 
+    pub fn tab_icons(&self) -> Vec<Option<Rc<chrome::Favicon>>> {
+        self.model
+            .borrow()
+            .tabs
+            .iter()
+            .map(|tab| tab.icon.clone())
+            .collect()
+    }
+
     pub fn tab_loading(&self) -> Vec<bool> {
         self.model
             .borrow()
@@ -531,6 +543,50 @@ impl Delegate {
         view.evaluate_javascript(script, |_| {});
     }
 
+    /// Cookies, User-Agent y Referer para descargar `url` con curl como si
+    /// lo pidiera la página: así funcionan las descargas que piden sesión.
+    pub fn download_request(
+        &self,
+        url: &url::Url,
+        referer: Option<url::Url>,
+    ) -> downloads::Request {
+        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        let cookies = self
+            .servo
+            .borrow()
+            .as_ref()
+            .map(|servo| {
+                servo
+                    .site_data_manager()
+                    .cookies_for_url(url.clone(), servo::CookieSource::HTTP)
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| {
+                let domain = c
+                    .domain()
+                    .unwrap_or(&host)
+                    .trim_start_matches('.')
+                    .to_ascii_lowercase();
+                downloads::JarCookie {
+                    // Una cookie de un dominio padre solo pudo llegar aquí con
+                    // `Domain=`; la del propio host se trata como host-only.
+                    subdomains: domain != host,
+                    domain,
+                    path: c.path().unwrap_or("/").to_owned(),
+                    secure: c.secure().unwrap_or(false),
+                    name: c.name().to_owned(),
+                    value: c.value().to_owned(),
+                }
+            })
+            .collect();
+        downloads::Request {
+            cookies,
+            user_agent: Some(user_agent()),
+            referer,
+        }
+    }
+
     /// Borra cookies, session/local storage y caché HTTP de esta instancia.
     pub fn clear_browsing_data(&self) -> String {
         let Some(servo) = self.servo.borrow().clone() else {
@@ -573,6 +629,38 @@ impl Delegate {
                 (site.name(), kinds.join("+"))
             })
             .collect()
+    }
+
+    /// Lo seleccionado en la página (texto o campo enfocado) pasa a la
+    /// selección primaria. Los campos de contraseña no se copian.
+    pub fn page_selection_to_primary(&self) {
+        let Some(view) = self.active_view() else {
+            return;
+        };
+        view.evaluate_javascript(PAGE_SELECTION_JS, |result| {
+            if let Ok(JSValue::String(text)) = result {
+                if !text.is_empty() {
+                    clipboard::set_primary(&text);
+                }
+            }
+        });
+    }
+
+    /// Botón central sobre un campo editable: pega la selección primaria en
+    /// el punto (px de dispositivo de la página).
+    pub fn paste_primary_at(&self, x: f32, y: f32, text: &str) {
+        let Some(view) = self.active_view() else {
+            return;
+        };
+        let css = (self.scale.get() * view.page_zoom()).max(0.01);
+        let script = format!(
+            "{}({},{},{})",
+            PASTE_AT_JS,
+            x / css,
+            y / css,
+            passwords::js_str(text)
+        );
+        view.evaluate_javascript(&script, |_| {});
     }
 
     pub fn page_zoom(&self) -> f32 {
@@ -991,6 +1079,7 @@ impl Delegate {
             url,
             loading: true,
             animating: false,
+            icon: None,
         });
         model.active = model.tabs.len() - 1;
         self.flags.chrome.store(true, Ordering::Relaxed);
@@ -1069,6 +1158,10 @@ impl WebViewDelegate for Delegate {
                 }
             };
             tab.loading = status != LoadStatus::Complete;
+            if status == LoadStatus::Started {
+                // Página nueva: el favicon de la anterior ya no vale.
+                tab.icon = None;
+            }
             let visit =
                 (status == LoadStatus::Complete && !self.private).then(|| tab.title.clone());
             (tab.url.clone(), visit)
@@ -1185,16 +1278,29 @@ impl WebViewDelegate for Delegate {
         }
     }
 
-    fn request_navigation(&self, _webview: WebView, request: NavigationRequest) {
+    fn request_navigation(&self, webview: WebView, request: NavigationRequest) {
         if downloads::looks_like_download(&request.url) {
             let url = request.url.clone();
             request.deny();
-            if let Err(err) = downloads::save_url(&url, self.private) {
+            let referer = webview.url();
+            let dl = self.download_request(&url, referer);
+            if let Err(err) = downloads::save_url(&url, self.private, dl) {
                 eprintln!("silversurfer: descarga: {err}");
             }
             return;
         }
         request.allow();
+    }
+
+    fn notify_favicon_changed(&self, webview: WebView) {
+        let icon = webview.favicon().and_then(|image| {
+            let rgba = favicon_rgba(&image)?;
+            chrome::Favicon::from_rgba(image.width, image.height, &rgba)
+        });
+        if let Some(mut tab) = self.tab_mut_by_id(&webview) {
+            tab.icon = icon.map(Rc::new);
+        }
+        self.flags.chrome.store(true, Ordering::Relaxed);
     }
 
     fn notify_cursor_changed(&self, webview: WebView, cursor: Cursor) {
@@ -1291,6 +1397,7 @@ pub fn start(
         url: url.to_string(),
         loading: true,
         animating: false,
+        icon: None,
     });
     shell.flags.chrome.store(true, Ordering::Relaxed);
 
@@ -1306,6 +1413,66 @@ pub fn start(
 
 fn install_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+/// Texto seleccionado: en un `<input>`/`<textarea>` enfocado, su rango;
+/// si no, `getSelection()`. Vacío para contraseñas.
+const PAGE_SELECTION_JS: &str = r#"(function () {
+  var e = document.activeElement;
+  if (e && (e.tagName === "INPUT" || e.tagName === "TEXTAREA")) {
+    if (e.type === "password") return "";
+    if (typeof e.selectionStart === "number" && e.selectionEnd > e.selectionStart)
+      return e.value.substring(e.selectionStart, e.selectionEnd);
+  }
+  var s = window.getSelection && window.getSelection();
+  return s ? String(s) : "";
+})()"#;
+
+/// `(x, y, texto)`: si bajo el punto hay un campo de texto, lo enfoca y
+/// escribe el texto donde está su cursor, como el botón central en Linux.
+const PASTE_AT_JS: &str = r#"(function (x, y, text) {
+  var e = document.elementFromPoint(x, y);
+  while (e && !(e.tagName === "INPUT" || e.tagName === "TEXTAREA" || e.isContentEditable))
+    e = e.parentElement;
+  if (!e || e.disabled || e.readOnly) return false;
+  e.focus();
+  if (typeof e.setRangeText === "function" && typeof e.selectionStart === "number") {
+    e.setRangeText(text, e.selectionStart, e.selectionEnd, "end");
+  } else if (document.execCommand) {
+    document.execCommand("insertText", false, text);
+  }
+  e.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertFromPaste" }));
+  return true;
+})"#;
+
+/// Primer fotograma de un favicon de Servo como RGBA sin premultiplicar.
+fn favicon_rgba(image: &servo::Image) -> Option<Vec<u8>> {
+    let data = image.data();
+    let px = (image.width as usize) * (image.height as usize);
+    let rgba = match image.format {
+        servo::PixelFormat::RGBA8 => data.get(..px * 4)?.to_vec(),
+        servo::PixelFormat::BGRA8 => data
+            .get(..px * 4)?
+            .chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0], p[3]])
+            .collect(),
+        servo::PixelFormat::RGB8 => data
+            .get(..px * 3)?
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        servo::PixelFormat::K8 => data
+            .get(..px)?
+            .iter()
+            .flat_map(|&k| [k, k, k, 255])
+            .collect(),
+        servo::PixelFormat::KA8 => data
+            .get(..px * 2)?
+            .chunks_exact(2)
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect(),
+    };
+    Some(rgba)
 }
 
 pub fn software_context(
