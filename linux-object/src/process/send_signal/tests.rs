@@ -184,3 +184,19 @@ fn a_dying_process_gives_back_what_waited_on_it() {
     assert!(!thread.lock_linux().signals.contains(RT));
     assert_eq!(queued_for_user(51_107), 0);
 }
+
+#[test]
+fn a_dying_forked_child_gives_back_what_waited_on_it() {
+    // A forked child dies by `new_child`'s callback, not `create_linux`'s.
+    let parent = Process::create_linux(&ROOT_JOB, RamFS::new(), 0, None, 51_108).unwrap();
+    let child = Process::fork_from(&parent).unwrap();
+    child.linux().set_resuid(51_108, 51_108, 51_108).unwrap();
+    let thread = Thread::create_linux(&child).unwrap();
+    let mut rt = Sigset::empty();
+    rt.insert(RT);
+    thread.lock_linux().block_signals(&rt);
+    sigqueue(&child, RT, 1).unwrap();
+    assert_eq!(queued_for_user(51_108), 1);
+    child.exit(0);
+    assert_eq!(queued_for_user(51_108), 0);
+}
