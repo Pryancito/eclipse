@@ -150,8 +150,24 @@ impl CmsgLayout {
     /// The mask is derived from `align`, which is a power of two by
     /// construction (`sizeof(long)`), so this is the same arithmetic the
     /// macro does and not a second rule.
+    ///
+    /// For a length that came from the caller, use [`Self::align_up_checked`]
+    /// instead: this one wraps, and a length that wraps here becomes a step
+    /// of zero, which is a walk that never ends.
     pub fn align_up(&self, len: usize) -> usize {
         (len + self.align - 1) & !(self.align - 1)
+    }
+
+    /// `CMSG_ALIGN(len)` for a length the **caller** supplied, which is every
+    /// `cmsg_len` the walk reads: `None` when the rounding would wrap.
+    ///
+    /// The checked one and the infallible one are the same rule, which is why
+    /// this exists rather than the arithmetic being written out a second time
+    /// at the one call site that needs the check. Copilot caught that second
+    /// copy fifteen lines from the first.
+    pub fn align_up_checked(&self, len: usize) -> Option<usize> {
+        len.checked_add(self.align - 1)
+            .map(|v| v & !(self.align - 1))
     }
 
     /// `cmsg_len`, read out of the front of a message.

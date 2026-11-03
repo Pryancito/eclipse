@@ -159,6 +159,33 @@ fn a_narrow_control_length_read_natively_is_four_gigabytes() {
     );
 }
 
+/// A `cmsg_len` big enough to wrap the rounding, which is the case the
+/// checked rounding exists for.
+///
+/// `cmsg_len` is entirely the caller's, so the walk reads whatever is in the
+/// buffer. Rounded up unchecked, a length within `align - 1` of `usize::MAX`
+/// wraps to a small number or to zero --- and a **step of zero** is a walk
+/// that reads the same header for ever. The walk's own `> 0` catches the zero;
+/// this is the half that catches the wrap before it becomes a plausible small
+/// step.
+#[test]
+fn a_control_length_that_wraps_the_rounding_has_no_step() {
+    for abi in [Abi::Linux, Abi::Linux32] {
+        let l = cmsg_layout(abi);
+        // The largest length that still rounds, and the smallest that does
+        // not: the boundary, not a round number near it.
+        let last = usize::MAX - (l.align - 1);
+        assert_eq!(l.align_up_checked(last), Some(last), "{:?}", abi);
+        assert_eq!(l.align_up_checked(last + 1), None, "{:?}", abi);
+        assert_eq!(l.align_up_checked(usize::MAX), None, "{:?}", abi);
+        // And the ordinary case is the same answer as the infallible one, so
+        // the two are one rule and not two.
+        for len in [0, 1, l.hdr_len, l.hdr_len + 4, l.hdr_len + 8, 1024] {
+            assert_eq!(l.align_up_checked(len), Some(l.align_up(len)));
+        }
+    }
+}
+
 /// `cmsg_len` written and read back at each width, which is the pair that
 /// says `push_len` and `read_len` agree about more than one number.
 #[test]

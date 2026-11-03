@@ -461,13 +461,22 @@ impl SockAddr {
         let full_len = self.output_len()?;
         let written_len = min(max_len, full_len);
         if written_len > 0 && !name.is_null() {
+            // `as_addr()` and `into()`, not `transmute_copy`: the pointer
+            // wrapper already hands out its address, and going through it
+            // asserts nothing about the wrapper's layout. The `unsafe` that
+            // is left is the byte view of the address, and `written_len` is
+            // `output_len()`, which never exceeds the union variant that
+            // `From<Endpoint>` initialised whole --- so every byte read here
+            // is an initialised one. None of the five variants has internal
+            // padding (16, 28, 20, 12 bytes, and `sun_family` + `sun_path`),
+            // which is what makes that true and is worth saying out loud,
+            // because a variant that grew some would leak it.
+            let mut addr_ptr: UserOutPtr<u8> = name.as_addr().into();
             #[allow(unsafe_code)]
-            unsafe {
-                let source =
-                    core::slice::from_raw_parts(self as *const SockAddr as *const u8, written_len);
-                let mut addr_ptr: UserOutPtr<u8> = core::mem::transmute_copy(&name);
-                addr_ptr.write_array(source)?;
-            }
+            let source = unsafe {
+                core::slice::from_raw_parts(self as *const SockAddr as *const u8, written_len)
+            };
+            addr_ptr.write_array(source)?;
         }
         Ok(full_len as u32)
     }

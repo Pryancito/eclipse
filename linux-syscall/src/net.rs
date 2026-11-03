@@ -310,10 +310,7 @@ fn parse_scm_rights_fds(cmsg: CmsgLayout, ctrl: &[u8]) -> Result<Vec<i32>, LxErr
         }
         // CMSG_ALIGN(cmsg_len); checked, and required to move forward so a
         // wrapped or zero step cannot spin forever.
-        let step = match cmsg_len
-            .checked_add(cmsg.align - 1)
-            .map(|v| v & !(cmsg.align - 1))
-        {
+        let step = match cmsg.align_up_checked(cmsg_len) {
             Some(s) if s > 0 => s,
             _ => break,
         };
@@ -2447,7 +2444,10 @@ mod wire_numbers_tests {
         // whose level or type does not match what the peer's libc wrote is
         // simply not seen: `recvmsg` hands back a buffer the caller walks and
         // finds nothing in, with no error anywhere.
-        assert_eq!(CMSG_HDR_LEN, 16, "sizeof(struct cmsghdr) on a 64-bit ABI");
+        //
+        // The header's size is the layout's business and is pinned there, in
+        // two rows; what this one is about is the numbers inside it.
+        assert_eq!(CMSG_HDR_LEN, size_of::<usize>() + 4 + 4);
         assert_eq!(SOL_SOCKET, 1);
         assert_eq!(SOL_SOCKET_LEVEL, 1, "SOL_SOCKET as cmsg_level");
         assert_eq!(
@@ -2735,6 +2735,15 @@ mod control_and_batch_bounds_tests {
     /// the two moves.
     #[test]
     fn the_floor_is_the_header_length_itself() {
+        // The relation, which holds on any target: the native header is a
+        // `size_t` and two `int`. The 16 below is that relation's value where
+        // this kernel is built for a 64-bit target, and nowhere else --- on a
+        // 32-bit target the NATIVE header IS 12, which is the whole reason
+        // this layout has two rows. Pinning the 16 unconditionally used to be
+        // right when `CMSG_HDR_LEN` was a literal; now that it is derived it
+        // would be a claim about the host, which Copilot caught.
+        assert_eq!(CMSG_HDR_LEN, size_of::<usize>() + 4 + 4);
+        #[cfg(target_pointer_width = "64")]
         assert_eq!(CMSG_HDR_LEN, 16, "sizeof(struct cmsghdr) on a 64-bit ABI");
         assert_eq!(scm_control_action(NATIVE, false, CMSG_HDR_LEN), Ok(true));
         assert_eq!(
