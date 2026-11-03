@@ -598,3 +598,82 @@ fn the_futex_timeout_is_sixteen_bytes_for_number_422() {
     );
     proc.exit(0);
 }
+
+/// A 4-aligned buffer, which is what a 32-bit program's
+/// `struct __kernel_timespec` actually is.
+///
+/// `TS_AT` is the start of a mapping and so 8-aligned. That is NOT what an
+/// i386 program hands over: there an `__s64` aligns to **4**, so the
+/// structure sits wherever the linker put it, and half the time that is
+/// 4 mod 8.
+const TS_AT_ODD: usize = USER_AT + 0x404;
+
+#[test]
+fn the_wide_width_is_not_an_alignment_promise() {
+    // The bug this test exists for, and the one the whole `*_time64` family
+    // had for two batches: `abi32 == false` says the STRUCTURE is native. It
+    // does not say the CALLER is.
+    //
+    // `UserPtr::read`/`write` store through a `*T` and so insist on
+    // `align_of::<T>()`, which is 8 for a `TimeSpec`. Linux accepts a
+    // 4-aligned pointer here --- `get_timespec64` and `put_timespec64` go
+    // through `copy_from_user`/`copy_to_user`, which require no alignment at
+    // any width --- so a kernel that insists answers `EFAULT` for a buffer
+    // every i386 program is entitled to pass.
+    //
+    // It passed in QEMU for two batches by luck: the probe's buffer happened
+    // to land 8-aligned, and the next batch's data moved it by four bytes.
+    let proc = a_process(48_459, Abi::Linux32);
+    let (wide_out, wide_in, narrow_out) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            let mut sys = as_mut(sys);
+            // Out: `clock_gettime64` writing sixteen bytes to a 4-aligned
+            // address.
+            put(TS_AT_ODD, &[0xAAu8; 32]);
+            let wide_out = sys
+                .compat32_syscall(CLOCK_GETTIME64, [CLOCK_MONOTONIC, TS_AT_ODD, 0, 0, 0, 0])
+                .await;
+            let got = get(TS_AT_ODD, 32);
+            // In: `clock_nanosleep_time64` reading sixteen from one. The
+            // bytes are a valid zero request, so a non-zero answer here is
+            // the alignment and nothing else.
+            put(TS_AT_ODD, &[0u8; 16]);
+            let wide_in = sys
+                .compat32_syscall(
+                    CLOCK_NANOSLEEP_TIME64,
+                    [CLOCK_MONOTONIC, 0, TS_AT_ODD, 0, 0, 0],
+                )
+                .await;
+            // And the narrow path at the same address, which never had the
+            // problem: it goes through a byte array by construction.
+            put(TS_AT_ODD, &[0xAAu8; 32]);
+            let narrow_out = sys
+                .compat32_syscall(CLOCK_GETTIME, [CLOCK_MONOTONIC, TS_AT_ODD, 0, 0, 0, 0])
+                .await;
+            ((wide_out, got), wide_in, (narrow_out, get(TS_AT_ODD, 32)))
+        })
+    });
+    assert_eq!(
+        TS_AT_ODD % 8,
+        4,
+        "this test is about a 4-aligned address and this one is not"
+    );
+    assert_eq!(
+        wide_out.0, 0,
+        "clock_gettime64 refused a 4-aligned buffer, which is what every \
+         i386 program passes: the wide branch used the ALIGNED accessor"
+    );
+    assert!(
+        !poison_left_from(&wide_out.1, 2),
+        "and it wrote only eight bytes: {:x?}",
+        &wide_out.1[..16]
+    );
+    assert!(poison_left_from(&wide_out.1, 4), "nor past sixteen");
+    assert_eq!(
+        wide_in, 0,
+        "clock_nanosleep_time64 refused a 4-aligned request"
+    );
+    assert_eq!(narrow_out.0, 0, "and the narrow path still works there");
+    assert!(poison_left_from(&narrow_out.1, 2));
+    proc.exit(0);
+}

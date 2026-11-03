@@ -139,6 +139,31 @@ fn addr_of(word: &AtomicI32) -> usize {
     word as *const AtomicI32 as usize
 }
 
+/// An address in the **kernel half**, which `access_ok()` refuses: the first
+/// one past `kernel_hal::user::USER_MAX`. Readable by nothing, at any
+/// alignment, so a handler that dereferences it answers `EFAULT` for that
+/// reason and no other.
+const UNREADABLE: usize = 0x0000_8000_0000_0000;
+
+/// The user-half bound of `access_ok()`, applied on this thread for as long
+/// as the guard lives. `libos` exempts host addresses from it by default,
+/// because the host's own heap and stack are not user-half addresses; a test
+/// that wants to watch a kernel pointer be refused has to ask for the bound.
+struct StrictUserHalf;
+
+impl StrictUserHalf {
+    fn on() -> Self {
+        kernel_hal::user::set_strict_user_half(true);
+        Self
+    }
+}
+
+impl Drop for StrictUserHalf {
+    fn drop(&mut self) {
+        kernel_hal::user::set_strict_user_half(false);
+    }
+}
+
 /// The `Syscall` the harness lends, as a `&mut` one, for the calls that want
 /// one. Every field is `Copy`.
 fn as_mut<'a>(sys: &Syscall<'a>) -> Syscall<'a> {
@@ -376,6 +401,16 @@ fn a_futex_word_that_is_null_or_unaligned_is_refused_whatever_the_operation_aske
 /// allocated and nothing parked. The order is visible because a `timespec`
 /// the kernel cannot read would be `EFAULT` if it were read first -- which
 /// is also how this test knows the pointer really is unreadable.
+///
+/// The unreadable pointer is one in the **kernel half**, with the user-half
+/// bound of `access_ok()` turned on for this thread. It used to be a
+/// misaligned one, which was a cheaper way of saying the same thing until it
+/// stopped being true: the timeout now goes through
+/// [`crate::narrow::narrow_get`], whose wide branch no longer demands
+/// `align_of::<TimeSpec>()`, because a 32-bit process passing a
+/// `struct __kernel_timespec` is entitled to a 4-aligned one. A misaligned
+/// timeout is read fine and is then merely `EINVAL`, which measures the
+/// order of nothing.
 #[test]
 fn a_wait_on_a_word_that_has_already_changed_never_reads_the_timeout() {
     let proc = a_process(47_262, "futex-eagain");
@@ -385,8 +420,10 @@ fn a_wait_on_a_word_that_has_already_changed_never_reads_the_timeout() {
     let unchanged = addr_of(still);
     on_a_thread(&proc, move |sys| {
         Box::pin(async move {
-            let good = TimeSpec::from_duration(A_TIMEOUT);
-            let at = &good as *const TimeSpec as usize;
+            // Per thread, so this changes nothing for the tests beside it,
+            // and the futex words themselves are host-heap addresses, which
+            // are in the user half.
+            let _strict = StrictUserHalf::on();
             // The value is what it is judged on, and nothing else is read.
             assert_eq!(
                 futex(
@@ -394,7 +431,7 @@ fn a_wait_on_a_word_that_has_already_changed_never_reads_the_timeout() {
                     changed,
                     FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
                     0,
-                    at + 1,
+                    UNREADABLE,
                     0,
                     0
                 )
@@ -410,7 +447,7 @@ fn a_wait_on_a_word_that_has_already_changed_never_reads_the_timeout() {
                     unchanged,
                     FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
                     0,
-                    at + 1,
+                    UNREADABLE,
                     0,
                     0
                 )
@@ -427,7 +464,7 @@ fn a_wait_on_a_word_that_has_already_changed_never_reads_the_timeout() {
                     changed,
                     FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
                     7,
-                    at + 1,
+                    UNREADABLE,
                     0,
                     0
                 )

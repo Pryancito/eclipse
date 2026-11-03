@@ -298,13 +298,38 @@ fn from_narrow_bytes<T: Narrow>(bytes: &[u8]) -> T {
 /// call sites are free helpers of their own (`sleep_or_eintr` and the
 /// `commit_and_report_old` of [`crate::outparams`]) and the alternative was
 /// for each of them to grow its own copy of the conversion.
+/// ## The wide branch is not an alignment promise
+///
+/// `abi32 == false` means "the structure has its native layout". It does
+/// **not** mean the caller is a native process, and that distinction cost a
+/// green probe run: the `*_time64` family ([`crate::compat32::time64`]) is
+/// exactly the case where a 32-bit process passes a structure at the native
+/// width, because `struct __kernel_timespec` is two 64-bit words at every
+/// width.
+///
+/// On i386 an `__s64` aligns to **4**, so such a structure in a 32-bit
+/// program sits at a 4-aligned address --- and `UserPtr::read`/`write` store
+/// through a `*T` and so insist on `align_of::<T>()`, which is 8. Linux
+/// accepts the pointer: `get_timespec64` and `put_timespec64` go through
+/// `copy_from_user`/`copy_to_user`, which require no alignment at any width.
+///
+/// So the wide branch uses the unaligned accessors. Found in QEMU, not in a
+/// review, and only by accident: `timerfd_settime64` passed for two batches
+/// because the probe's buffer happened to land 8-aligned, and answered
+/// `EFAULT` the moment a later step's data moved it by four bytes.
 pub(crate) fn narrow_put<T: Narrow, P: Policy + Write>(
     abi32: bool,
     ptr: &mut UserPtr<T, P>,
     value: T,
 ) -> LxResult<()> {
     if !abi32 {
-        ptr.write(value)?;
+        // `write_unaligned` and not `write`: see the section above, and
+        // `the_wide_width_is_not_an_alignment_promise` in
+        // `compat32/time64/tests.rs`. `copy_to_user` requires no alignment
+        // at any width, and the one caller of this branch that is a 32-bit
+        // process --- the `*_time64` family --- hands over a buffer that is
+        // only 4-aligned.
+        ptr.write_unaligned(value)?;
         return Ok(());
     }
     if ptr.is_null() {
@@ -337,7 +362,9 @@ pub(crate) fn narrow_get<T: Narrow, P: Policy + Read>(
     ptr: &UserPtr<T, P>,
 ) -> LxResult<T> {
     if !abi32 {
-        return Ok(ptr.read()?);
+        // `read_unaligned` and not `read`: see [`narrow_put`]'s
+        // documentation.
+        return Ok(ptr.read_unaligned()?);
     }
     if ptr.is_null() {
         return Err(LxError::EFAULT);

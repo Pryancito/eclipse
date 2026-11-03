@@ -2953,6 +2953,16 @@ nsreq:
 	.space	16
 itv:
 	.space	32
+	/* `its` is deliberately 4-aligned and NOT 8-aligned, because that
+	 * is the harder case and the one a real i386 program hits: on i386
+	 * an `__s64` aligns to 4, so a `struct __kernel_itimerspec` of a
+	 * 32-bit program is only 4-aligned, and the kernel has to accept
+	 * it the way `copy_from_user` does. Step 76 answered `EFAULT`
+	 * instead of `EINVAL` the first time a new step's data moved this
+	 * buffer by four bytes, so the alignment is pinned here rather
+	 * than left to whatever the labels above happen to add up to. */
+	.balign	8
+	.long	0
 its:
 	.space	32
 seltv:
