@@ -408,9 +408,12 @@ fn blocks_under_a_rule_are_logged_at_one_two_four_and_eight() {
     }
     let log = crate::event_log::render();
     // A program retrying in a loop must not fill the ring: an event at 1, 2,
-    // 4 and 8 blocks and at nothing in between. Without the brake, the 512
-    // entries of the general log are gone in half a second and every other
-    // domain's events go with them.
+    // 4 and 8 blocks and at nothing in between. `BLOCKED` is a verdict
+    // `event_log::verdict` calls evidence, so these land in the 256-entry
+    // RESERVE ring and not in the 512-entry evictable one -- which makes an
+    // unthrottled loop worse, not milder: what it evicts is the other
+    // domains' blocked and reported evidence, out of a ring half the size,
+    // and that ring exists precisely so routine noise cannot reach it.
     assert_eq!(
         log.matches("firewall rule: /bin/b out").count(),
         4,
