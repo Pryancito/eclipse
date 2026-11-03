@@ -1062,7 +1062,15 @@ impl App {
                 if let Some((px, py)) = self.page_px() {
                     self.send_button(button, px, py, false);
                 }
+                if button == 0x110 {
+                    // Fin de un clic o arrastre: lo seleccionado va a la
+                    // selección primaria.
+                    if let Some(session) = &self.session {
+                        session.shell.page_selection_to_primary();
+                    }
+                }
             }
+            self.sync_primary();
             return;
         }
         let x = self.px.round() as i32;
@@ -1086,6 +1094,10 @@ impl App {
             }
         }
         if y < self.chrome_h() {
+            if button == 0x112 {
+                self.paste_primary_in_location(x, y);
+                return;
+            }
             self.on_chrome_click(x, y);
             return;
         }
@@ -1110,6 +1122,14 @@ impl App {
         }
         self.page_button = Some(button);
         self.send_button(button, px, py, true);
+        if button == 0x112 {
+            let text = clipboard::get_primary();
+            if !text.is_empty() {
+                if let Some(session) = &self.session {
+                    session.shell.paste_primary_at(px, py, &text);
+                }
+            }
+        }
         self.need_paint = true;
     }
 
@@ -1284,6 +1304,7 @@ impl App {
                 self.repeated_at = None;
             }
             self.edit_location(evdev);
+            self.sync_primary();
             self.need_paint = true;
             return;
         }
@@ -1664,6 +1685,43 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Lo seleccionado en la barra pasa a la selección primaria.
+    fn sync_primary(&mut self) {
+        if !self.loc_focused || self.find_mode {
+            return;
+        }
+        if let Some(text) = self.loc.selected_text() {
+            clipboard::set_primary(&text);
+        }
+    }
+
+    /// Botón central en la barra: enfoca (sin seleccionar) y pega la
+    /// selección primaria donde cae el clic.
+    fn paste_primary_in_location(&mut self, x: i32, y: i32) {
+        let tabs = self
+            .session
+            .as_ref()
+            .map(|s| s.shell.tab_titles().len())
+            .unwrap_or(1)
+            .max(1);
+        if chrome::hit(self.logical_w, tabs, x, y) != Some(Hit::Location) {
+            return;
+        }
+        let text = paste_line(&clipboard::get_primary());
+        if !self.loc_focused {
+            self.loc_focused = true;
+            self.find_mode = false;
+            if let Some(session) = &self.session {
+                session.shell.set_page_focused(false);
+                self.loc.set(session.shell.location_text());
+            }
+        }
+        let index = self.location_index_at(x);
+        self.loc.move_to(index, false);
+        self.loc.insert(&text);
+        self.need_paint = true;
     }
 
     /// Índice de carácter bajo la x (px CSS de la ventana) en la barra.

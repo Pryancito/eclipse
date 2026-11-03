@@ -11,6 +11,7 @@ use servo::{ClipboardDelegate, StringRequest, WebView};
 
 static SYSTEM: OnceLock<Option<Mutex<arboard::Clipboard>>> = OnceLock::new();
 static LOCAL: Mutex<String> = Mutex::new(String::new());
+static LOCAL_PRIMARY: Mutex<String> = Mutex::new(String::new());
 
 fn with_system<T>(
     f: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
@@ -40,6 +41,27 @@ pub fn set_text(text: &str) {
         local.push_str(text);
     }
     with_system(|cb| cb.set_text(text));
+}
+
+/// Selección primaria (seleccionar y pegar con el botón central).
+pub fn get_primary() -> String {
+    use arboard::{GetExtLinux, LinuxClipboardKind};
+    if let Some(text) = with_system(|cb| cb.get().clipboard(LinuxClipboardKind::Primary).text()) {
+        return text;
+    }
+    LOCAL_PRIMARY.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+pub fn set_primary(text: &str) {
+    use arboard::{LinuxClipboardKind, SetExtLinux};
+    if let Ok(mut local) = LOCAL_PRIMARY.lock() {
+        if *local == text {
+            return;
+        }
+        local.clear();
+        local.push_str(text);
+    }
+    with_system(|cb| cb.set().clipboard(LinuxClipboardKind::Primary).text(text));
 }
 
 pub fn clear() {

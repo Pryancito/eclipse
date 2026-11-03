@@ -289,7 +289,8 @@ fn base64_decode(text: &str) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
-fn js_str(s: &str) -> String {
+/// Literal de cadena JavaScript (entre comillas dobles) para `s`.
+pub fn js_str(s: &str) -> String {
     let mut out = String::from('"');
     for ch in s.chars() {
         match ch {
@@ -297,6 +298,9 @@ fn js_str(s: &str) -> String {
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
     }

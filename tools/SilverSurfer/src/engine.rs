@@ -587,6 +587,38 @@ impl Delegate {
             .collect()
     }
 
+    /// Lo seleccionado en la página (texto o campo enfocado) pasa a la
+    /// selección primaria. Los campos de contraseña no se copian.
+    pub fn page_selection_to_primary(&self) {
+        let Some(view) = self.active_view() else {
+            return;
+        };
+        view.evaluate_javascript(PAGE_SELECTION_JS, |result| {
+            if let Ok(JSValue::String(text)) = result {
+                if !text.is_empty() {
+                    clipboard::set_primary(&text);
+                }
+            }
+        });
+    }
+
+    /// Botón central sobre un campo editable: pega la selección primaria en
+    /// el punto (px de dispositivo de la página).
+    pub fn paste_primary_at(&self, x: f32, y: f32, text: &str) {
+        let Some(view) = self.active_view() else {
+            return;
+        };
+        let css = (self.scale.get() * view.page_zoom()).max(0.01);
+        let script = format!(
+            "{}({},{},{})",
+            PASTE_AT_JS,
+            x / css,
+            y / css,
+            passwords::js_str(text)
+        );
+        view.evaluate_javascript(&script, |_| {});
+    }
+
     pub fn page_zoom(&self) -> f32 {
         self.active_view()
             .map(|view| view.page_zoom())
@@ -1336,6 +1368,36 @@ pub fn start(
 fn install_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
+
+/// Texto seleccionado: en un `<input>`/`<textarea>` enfocado, su rango;
+/// si no, `getSelection()`. Vacío para contraseñas.
+const PAGE_SELECTION_JS: &str = r#"(function () {
+  var e = document.activeElement;
+  if (e && (e.tagName === "INPUT" || e.tagName === "TEXTAREA")) {
+    if (e.type === "password") return "";
+    if (typeof e.selectionStart === "number" && e.selectionEnd > e.selectionStart)
+      return e.value.substring(e.selectionStart, e.selectionEnd);
+  }
+  var s = window.getSelection && window.getSelection();
+  return s ? String(s) : "";
+})()"#;
+
+/// `(x, y, texto)`: si bajo el punto hay un campo de texto, lo enfoca y
+/// escribe el texto donde está su cursor, como el botón central en Linux.
+const PASTE_AT_JS: &str = r#"(function (x, y, text) {
+  var e = document.elementFromPoint(x, y);
+  while (e && !(e.tagName === "INPUT" || e.tagName === "TEXTAREA" || e.isContentEditable))
+    e = e.parentElement;
+  if (!e || e.disabled || e.readOnly) return false;
+  e.focus();
+  if (typeof e.setRangeText === "function" && typeof e.selectionStart === "number") {
+    e.setRangeText(text, e.selectionStart, e.selectionEnd, "end");
+  } else if (document.execCommand) {
+    document.execCommand("insertText", false, text);
+  }
+  e.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertFromPaste" }));
+  return true;
+})"#;
 
 /// Primer fotograma de un favicon de Servo como RGBA sin premultiplicar.
 fn favicon_rgba(image: &servo::Image) -> Option<Vec<u8>> {

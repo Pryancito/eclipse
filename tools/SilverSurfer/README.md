@@ -137,6 +137,10 @@ URL con tildes se ven bien.
 El portapapeles es el del sistema: `arboard` sobre wlr/ext data-control
 (labwc), con X11 y un texto en memoria como respaldo. Lo usan los campos de
 la página, `navigator.clipboard` y la barra.
+También hay selección primaria: lo que se selecciona en la barra o en la
+página (al soltar el ratón; nunca un campo de contraseña) se puede pegar con
+el botón central en otra app, y el botón central sobre la barra o sobre un
+campo de texto de la página pega la selección primaria del sistema.
 El distintivo `GL` / `SW` indica si la página va por EGL o por blit
 software; en ventana privada aparece además `P`.
 `about:privacy`, `about:cookies` y `about:clear` cubren la UI de datos.
