@@ -172,6 +172,11 @@ impl From<PTF> for MMUFlags {
     }
 }
 
+/// [`MMUFlags::SPECIAL`] in the descriptor: bit 55, the first of the four
+/// (55..58) the ARM ARM reserves for software use in a stage 1 block or page
+/// descriptor. Kept by `set_flags` and `set_addr`, never seen by the walker.
+const SPECIAL: u64 = 1 << 55;
+
 /// Page table entry.
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -220,7 +225,17 @@ impl GenericPTE for AARCH64PTE {
         if !is_huge {
             flags |= PTF::NON_BLOCK
         }
-        self.0 = (self.0 & PHYS_ADDR_MASK as u64) | flags.bits() as u64;
+        self.0 = (self.0 & (PHYS_ADDR_MASK as u64 | SPECIAL)) | flags.bits() as u64;
+    }
+    fn is_special(&self) -> bool {
+        self.0 & SPECIAL != 0
+    }
+    fn set_special(&mut self, special: bool) {
+        if special {
+            self.0 |= SPECIAL;
+        } else {
+            self.0 &= !SPECIAL;
+        }
     }
     fn set_table(&mut self, paddr: PhysAddr) {
         self.0 = ((paddr & PHYS_ADDR_MASK) | PTF::VALID.bits() | PTF::NON_BLOCK.bits()) as u64;

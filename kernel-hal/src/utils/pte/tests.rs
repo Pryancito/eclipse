@@ -992,3 +992,125 @@ fn the_other_two_formats_refuse_to_answer() {
     assert_eq!(a64.raw(), before);
     assert_eq!(a64.dirty(), None);
 }
+
+// ── the special mark ───────────────────────────────────────────────────────
+
+/// `MMUFlags::SPECIAL` for one format: what the resident count in
+/// `page_table.rs` asks of an entry. The page is counted in when the entry
+/// is made and out when it is cleared, and both times the entry is asked, so
+/// the mark has to come through every rewrite in between unchanged.
+fn the_special_mark<P: GenericPTE>(zeroed: fn() -> P, arch: &str) {
+    // Put on the way `PageTableImpl::map` puts it: first, on the empty entry.
+    let mut e = zeroed();
+    e.set_special(true);
+    e.set_addr(FRAME);
+    e.set_flags(rw(), false);
+    assert!(
+        e.is_special(),
+        "{}: making the entry dropped the mark",
+        arch
+    );
+    let plain = a_leaf(zeroed(), FRAME, rw(), false);
+    assert!(!plain.is_special(), "{}: an unmarked leaf is marked", arch);
+    assert_eq!(
+        (e.addr(), e.flags(), e.is_present(), e.is_leaf()),
+        (
+            plain.addr(),
+            plain.flags(),
+            plain.is_present(),
+            plain.is_leaf()
+        ),
+        "{}: the mark shows through the entry",
+        arch
+    );
+
+    // An `mprotect`, all the way down to no access and back: none of them
+    // says SPECIAL, and none of them may take it away.
+    for flags in [MMUFlags::READ, MMUFlags::empty(), rw() | MMUFlags::USER] {
+        e.set_flags(flags, false);
+        assert!(
+            e.is_special(),
+            "{}: set_flags({:?}) dropped the mark",
+            arch,
+            flags
+        );
+    }
+    e.set_addr(OTHER_FRAME);
+    assert!(e.is_special(), "{}: set_addr dropped the mark", arch);
+    assert_eq!(e.addr(), OTHER_FRAME, "{}: the mark moved the frame", arch);
+
+    // Taken off by hand, and gone with the entry.
+    e.set_special(false);
+    assert!(
+        !e.is_special(),
+        "{}: set_special(false) kept the mark",
+        arch
+    );
+    assert_eq!(e.addr(), OTHER_FRAME, "{}: unmarking moved the frame", arch);
+    e.set_special(true);
+    e.clear();
+    assert!(e.is_unused(), "{}: a cleared marked entry is in use", arch);
+    assert!(!e.is_special(), "{}: clear kept the mark", arch);
+
+    // A huge leaf is marked the same way.
+    let mut h = zeroed();
+    h.set_special(true);
+    h.set_addr(0x4000_0000);
+    h.set_flags(rw(), true);
+    assert!(
+        h.is_special() && h.is_leaf(),
+        "{}: a marked huge leaf",
+        arch
+    );
+    h.set_flags(MMUFlags::READ, true);
+    assert!(
+        h.is_special(),
+        "{}: a huge leaf's rewrite dropped the mark",
+        arch
+    );
+}
+
+#[test]
+fn every_format_keeps_the_special_mark_until_the_entry_goes() {
+    the_special_mark(X86PTE::zeroed, "x86_64");
+    the_special_mark(AARCH64PTE::zeroed, "aarch64");
+    the_special_mark(Rv64PTE::zeroed, "riscv64");
+}
+
+/// The mark has to live in a bit each manual leaves to software: anywhere
+/// else it is an attribute the walker reads, and a device page would come out
+/// with some permission or memory type nobody asked for.
+#[test]
+fn the_special_mark_sits_in_a_bit_the_hardware_ignores() {
+    fn marked<P: GenericPTE>(zeroed: fn() -> P) -> P {
+        let mut e = zeroed();
+        e.set_special(true);
+        e.set_addr(FRAME);
+        e.set_flags(rw(), false);
+        e
+    }
+    // Intel SDM vol. 3, 4.5: bits 9..11 of a PTE are ignored.
+    let x86 = a_leaf(X86PTE::zeroed(), FRAME, rw(), false).raw();
+    assert_eq!(marked(X86PTE::zeroed).raw() ^ x86, 1 << 9);
+    // ARM ARM D8.3: bits 55..58 of a page descriptor are for software use.
+    let a64 = a_leaf(AARCH64PTE::zeroed(), FRAME, rw(), false).raw();
+    assert_eq!(marked(AARCH64PTE::zeroed).raw() ^ a64, 1 << 55);
+    // RISC-V privileged spec, 12.4: the RSW field, bits 8..9.
+    let rv = a_leaf(Rv64PTE::zeroed(), FRAME, rw(), false).raw();
+    assert_eq!(marked(Rv64PTE::zeroed).raw() ^ rv, 1 << 8);
+}
+
+/// `MMUFlags::SPECIAL` handed to `set_flags` is not the mark: only
+/// `set_special` puts it on. Otherwise an `mprotect` that happened to carry
+/// it, or one that did not, would decide what kind of memory a page is.
+#[test]
+fn the_special_flag_alone_does_not_mark_an_entry() {
+    let with = rw() | MMUFlags::SPECIAL;
+    assert!(!a_leaf(X86PTE::zeroed(), FRAME, with, false).is_special());
+    assert!(!a_leaf(AARCH64PTE::zeroed(), FRAME, with, false).is_special());
+    assert!(!a_leaf(Rv64PTE::zeroed(), FRAME, with, false).is_special());
+    assert_eq!(
+        a_leaf(X86PTE::zeroed(), FRAME, with, false).raw(),
+        a_leaf(X86PTE::zeroed(), FRAME, rw(), false).raw()
+    );
+}

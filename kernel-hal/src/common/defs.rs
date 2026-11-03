@@ -21,6 +21,12 @@ bitflags! {
         const USER      = 1 << 5;
         const HUGE_PAGE = 1 << 6;
         const DEVICE    = 1 << 7;
+        /// Not an ordinary page of memory: a window onto a device (a physical
+        /// VMO) or the shared zero frame. Linux's `pte_special`, the mark
+        /// `vm_normal_page` reads to leave such a page out of the resident
+        /// count (`GenericPageTable::resident_bytes`). The page table keeps it
+        /// in a software bit of the entry; no hardware ever sees it.
+        const SPECIAL   = 1 << 8;
         const RXW = Self::READ.bits | Self::WRITE.bits | Self::EXECUTE.bits;
     }
 }
@@ -466,12 +472,12 @@ mod generic_flag_tests {
     use super::*;
     use core::convert::TryFrom;
 
-    /// The eight generic flags are this crate's own vocabulary, so their
+    /// The nine generic flags are this crate's own vocabulary, so their
     /// numbers look free to choose. They are not: two pieces of the page-table
     /// glue read them as a number rather than by name, and neither would fail
     /// loudly if a bit moved.
     #[test]
-    fn the_eight_generic_flags_are_eight_different_bits() {
+    fn the_nine_generic_flags_are_nine_different_bits() {
         let all = [
             ("CACHE_1", MMUFlags::CACHE_1),
             ("CACHE_2", MMUFlags::CACHE_2),
@@ -481,6 +487,7 @@ mod generic_flag_tests {
             ("USER", MMUFlags::USER),
             ("HUGE_PAGE", MMUFlags::HUGE_PAGE),
             ("DEVICE", MMUFlags::DEVICE),
+            ("SPECIAL", MMUFlags::SPECIAL),
         ];
         let mut seen = 0usize;
         for (name, f) in all {
@@ -488,7 +495,7 @@ mod generic_flag_tests {
             assert_eq!(seen & f.bits(), 0, "{} reuses a bit already taken", name);
             seen |= f.bits();
         }
-        assert_eq!(seen.count_ones(), 8);
+        assert_eq!(seen.count_ones(), 9);
     }
 
     /// `From<MMUFlags> for PTF` (every architecture's, in `utils/pte/`) reads
@@ -557,6 +564,7 @@ mod generic_flag_tests {
             MMUFlags::USER,
             MMUFlags::HUGE_PAGE,
             MMUFlags::DEVICE,
+            MMUFlags::SPECIAL,
             MMUFlags::CACHE_1,
             MMUFlags::CACHE_2,
         ] {

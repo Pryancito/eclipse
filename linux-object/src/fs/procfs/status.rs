@@ -8,9 +8,10 @@
 //! traced (`grep TracerPid`) found nothing to read, `ps s` had no masks to
 //! show, and a check of `CapEff:` before trying something privileged read an
 //! empty string. Of the memory lines Linux writes after `NSsid:`, `VmPeak:`
-//! (the `VmSize` high-water) is now kept incrementally by the VMAR; `VmHWM:`
-//! (the resident peak), the locked and pinned sizes and the split of the
-//! resident size still need numbers this kernel does not keep yet.
+//! (the `VmSize` high-water) is kept incrementally by the VMAR and `VmHWM:`
+//! (the resident high-water) by the page table; the locked and pinned sizes
+//! and the split of the resident size still need numbers this kernel does
+//! not keep yet.
 
 use super::*;
 use crate::fs::FileDesc;
@@ -113,14 +114,24 @@ pub(super) fn proc_task_status(proc: &Process, thread: Option<&Arc<Thread>>) -> 
         // peak ever reading below the live size (it never should): VmPeak is
         // never less than VmSize in Linux.
         let vm_peak_kb = vmar.peak_mapped_bytes().max(stats.mapped_bytes()) / 1024;
-        let vm_rss_kb = (stats.private_bytes() + stats.shared_bytes()) / 1024;
+        let vm_rss = stats.private_bytes() + stats.shared_bytes();
+        let vm_rss_kb = vm_rss / 1024;
+        // VmHWM = hiwater of the resident size, which the page table counts
+        // page by page as entries come and go (Linux's `hiwater_rss`). VmRSS
+        // is a walk of the committed pages instead, and that can read higher:
+        // a file's pages already in the cache count there before this process
+        // touches them. Linux writes `max(hiwater_rss, rss)` for the same
+        // reason the max is here: VmHWM is never below VmRSS.
+        let vm_hwm_kb = (vmar.resident_peak_bytes() as u64).max(vm_rss) / 1024;
         let sizes = layout::Sizes::of(&vmar.mappings_dump(), layout::Mm::of(proc).as_ref());
         let _ = write!(
             out,
-            "VmPeak:\t{:8} kB\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nVmData:\t{:8} kB\nVmStk:\t{:8} kB\n\
-             VmExe:\t{:8} kB\nVmLib:\t{:8} kB\nVmPTE:\t{:8} kB\nVmSwap:\t{:8} kB\n",
+            "VmPeak:\t{:8} kB\nVmSize:\t{:8} kB\nVmHWM:\t{:8} kB\nVmRSS:\t{:8} kB\n\
+             VmData:\t{:8} kB\nVmStk:\t{:8} kB\nVmExe:\t{:8} kB\nVmLib:\t{:8} kB\n\
+             VmPTE:\t{:8} kB\nVmSwap:\t{:8} kB\n",
             vm_peak_kb,
             vm_size_kb,
+            vm_hwm_kb,
             vm_rss_kb,
             sizes.data / 1024,
             sizes.stack / 1024,

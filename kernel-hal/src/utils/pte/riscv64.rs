@@ -86,6 +86,10 @@ impl From<PTF> for MMUFlags {
 
 const PHYS_ADDR_MASK: u64 = 0x003f_ffff_ffff_fc00; // 10..54
 
+/// [`MMUFlags::SPECIAL`] in the entry: bit 8, the first of the two RSW bits
+/// the privileged spec reserves for supervisor software.
+const SPECIAL: u64 = PTF::RESERVED1.bits() as u64;
+
 /// Sv39 and Sv48 page table entry.
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -134,7 +138,17 @@ impl GenericPTE for Rv64PTE {
         // for a 4 KiB page; see `a_no_access_mapping_is_claimed_but_absent`
         // for what it is not.
         let flags = PTF::from(flags) | PTF::ACCESSED | PTF::DIRTY;
-        self.0 = (self.0 & PHYS_ADDR_MASK) | flags.bits() as u64;
+        self.0 = (self.0 & (PHYS_ADDR_MASK | SPECIAL)) | flags.bits() as u64;
+    }
+    fn is_special(&self) -> bool {
+        self.0 & SPECIAL != 0
+    }
+    fn set_special(&mut self, special: bool) {
+        if special {
+            self.0 |= SPECIAL;
+        } else {
+            self.0 &= !SPECIAL;
+        }
     }
     fn set_table(&mut self, paddr: PhysAddr) {
         self.0 = ((paddr as u64 >> 2) & PHYS_ADDR_MASK) | PTF::VALID.bits() as u64;

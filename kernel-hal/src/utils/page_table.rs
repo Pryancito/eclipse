@@ -1,3 +1,4 @@
+use super::resident::Resident;
 use crate::sync::Mutex;
 use crate::{common::vm::*, mem::PhysFrame, MMUFlags, PhysAddr, VirtAddr};
 use alloc::vec::Vec;
@@ -57,6 +58,23 @@ pub trait GenericPTE: Debug + Clone + Copy + Sync + Send {
     /// [`GenericPTE::dirty`] is `None` is never believed in the first place.
     fn set_dirty(&mut self) {}
 
+    /// Whether this leaf carries [`MMUFlags::SPECIAL`]: Linux's `pte_special`.
+    ///
+    /// `false` by default, which is sound because the page table asks the
+    /// entry itself both when it counts a page in and when it counts it out: a
+    /// format that cannot keep the mark counts every page, a device's included,
+    /// and never drifts.
+    fn is_special(&self) -> bool {
+        false
+    }
+
+    /// Put the mark on or take it off. [`GenericPTE::set_flags`] and
+    /// [`GenericPTE::set_addr`] must both keep it, the way `set_flags` keeps
+    /// the hardware's accessed and dirty bits: an `mprotect` of a device page
+    /// rewrites its flags without saying it is one, and a mark lost there
+    /// counts out a page that was never counted in.
+    fn set_special(&mut self, _special: bool) {}
+
     /// Set flags for all types of entries.
     fn set_flags(&mut self, flags: MMUFlags, is_huge: bool);
     /// Set physical address for terminal entries.
@@ -78,6 +96,8 @@ pub struct PageTableImpl<L: PageTableLevel, PTE: GenericPTE> {
     /// window another level still needs. See `GenericPageTable::set_gather`.
     gather: usize,
     gather_pending: bool,
+    /// Bytes of ordinary memory mapped, and the most there has been.
+    resident: Resident,
     /// Phantom data.
     _phantom: PhantomData<(L, PTE)>,
 }
@@ -90,6 +110,7 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
             intrm_tables: Vec::new(),
             gather: 0,
             gather_pending: false,
+            resident: Resident::default(),
             _phantom: PhantomData,
         }
     }
@@ -192,6 +213,10 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
             }
             let base = entry.addr();
             let flags = entry.flags();
+            // The children are the same memory, so they are the same kind of
+            // memory: a device window split stays uncounted, and the bytes
+            // resident do not change.
+            let special = entry.is_special();
             // Allocated before the parent is touched: running out of frames
             // must leave the mapping exactly as it was.
             let table_paddr = alloc().ok_or(PagingError::NoMemory)?;
@@ -202,6 +227,7 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
                 // bit, and the PAT bit that moves with it), so only
                 // `set_flags` knows how to spell "same flags, one level down".
                 e.clear();
+                e.set_special(special);
                 e.set_addr(base + i * child as usize);
                 e.set_flags(flags, child != PageSize::Size4K);
                 // Every child is born dirty, whatever the parent said.
@@ -348,6 +374,7 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
             intrm_tables: Vec::new(),
             gather: 0,
             gather_pending: false,
+            resident: Resident::default(),
             _phantom: PhantomData,
         }
     }
@@ -451,8 +478,17 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
         if !entry.is_unused() {
             return Err(PagingError::AlreadyMapped);
         }
+        // The mark goes on first, while the entry is still empty and no walker
+        // can be reading it; `set_addr` and `set_flags` keep it from there.
+        entry.set_special(flags.contains(MMUFlags::SPECIAL));
         entry.set_addr(page.size.align_down(paddr));
         entry.set_flags(flags, page.size.is_huge());
+        // Asked of the entry, not of `flags`: the count out in
+        // `unmap_no_shootdown` can only ask the entry, and the two answers
+        // have to be the same one.
+        if !entry.is_special() {
+            self.resident.add(page.size as usize);
+        }
         crate::vm::flush_tlb(Some(page.vaddr));
         trace!(
             "PageTable map: {:x?} -> {:x?}, flags={:?} in {:#x?}",
@@ -539,7 +575,11 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
             return Err(PagingError::NotMapped);
         }
         let paddr = entry.addr();
+        let counted = !entry.is_special();
         entry.clear();
+        if counted {
+            self.resident.sub(size as usize);
+        }
         // Gathered range ops pay one local flush when the window closes
         // (`remote_flush_tlb_aspace`); per-page INVLPG here is O(pages).
         if self.gather == 0 {
@@ -587,11 +627,24 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
         if entry.is_unused() {
             return Err(PagingError::NotMapped);
         }
+        let counted_before = !entry.is_special();
         if let Some(paddr) = paddr {
             entry.set_addr(paddr);
         }
         if let Some(flags) = flags {
             entry.set_flags(flags, size.is_huge());
+            // A new frame AND new flags is a new page in an old slot -- the
+            // write fault that replaces the zero frame with the private copy
+            // (`wp_page_copy`) -- so the mark is the new page's. New flags
+            // alone are an `mprotect`, and the page is what it was.
+            if paddr.is_some() {
+                entry.set_special(flags.contains(MMUFlags::SPECIAL));
+            }
+        }
+        match (counted_before, !entry.is_special()) {
+            (true, false) => self.resident.sub(size as usize),
+            (false, true) => self.resident.add(size as usize),
+            _ => {}
         }
         if self.gather == 0 {
             crate::vm::flush_tlb(Some(vaddr));
@@ -626,6 +679,18 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
     /// the tables that held it, where Linux frees them (`free_pgtables`).
     fn table_bytes(&self) -> usize {
         self.intrm_tables.len() * crate::PAGE_SIZE
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.resident.now()
+    }
+
+    fn resident_peak_bytes(&self) -> usize {
+        self.resident.peak()
+    }
+
+    fn restart_resident_peak(&mut self) {
+        self.resident.restart_peak();
     }
 
     fn take_user_tables(&mut self) -> Vec<PhysFrame> {
@@ -805,6 +870,9 @@ mod walker_tests {
     /// difference between "poison everything" and "poison nothing".
     const MUTE: u64 = 1 << 5;
     const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+    /// [`MMUFlags::SPECIAL`], in a bit of its own: the flags parked above the
+    /// address are cut to eight bits and would drop it.
+    const SPECIAL: u64 = 1 << 9;
     /// The `MMUFlags` the caller asked for, parked above the address so they
     /// survive a round trip. A real entry re-derives them from the hardware
     /// bits; that translation is the architecture's business, not the
@@ -841,13 +909,23 @@ mod walker_tests {
         fn set_dirty(&mut self) {
             self.0 |= D;
         }
+        fn is_special(&self) -> bool {
+            self.0 & SPECIAL != 0
+        }
+        fn set_special(&mut self, special: bool) {
+            if special {
+                self.0 |= SPECIAL;
+            } else {
+                self.0 &= !SPECIAL;
+            }
+        }
         fn set_addr(&mut self, paddr: PhysAddr) {
             self.0 = (self.0 & !ADDR_MASK) | (paddr as u64 & ADDR_MASK);
         }
         fn set_flags(&mut self, flags: MMUFlags, is_huge: bool) {
             // Like x86: a mapping with no access at all (PROT_NONE) keeps its
             // address and its page-size bit but is not present.
-            let mut bits = self.0 & ADDR_MASK;
+            let mut bits = self.0 & (ADDR_MASK | SPECIAL);
             if flags.intersects(MMUFlags::READ | MMUFlags::WRITE | MMUFlags::EXECUTE) {
                 bits |= PRESENT;
             }
@@ -2208,5 +2286,217 @@ mod walker_tests {
         assert_eq!(pt.dirty_depth_from_top(base, 8 * K), Some(0));
         set_bits(&pt, base + 3 * K, D);
         assert_eq!(pt.dirty_depth_from_top(base, 8 * K), Some(5 * K));
+    }
+
+    // ── the resident count ─────────────────────────────────────────────────
+
+    /// A frame the tests below call the zero frame or a device's: the table
+    /// never reads what is behind a leaf, so any page-aligned number will do.
+    const ELSEWHERE: usize = 0x7700_0000;
+
+    fn special(flags: MMUFlags) -> MMUFlags {
+        flags | MMUFlags::SPECIAL
+    }
+
+    fn counts<L: PageTableLevel>(pt: &PageTableImpl<L, TestPTE>) -> (usize, usize) {
+        (pt.resident_bytes(), pt.resident_peak_bytes())
+    }
+
+    /// `VmRSS`'s count and `VmHWM`'s mark move with every page that appears
+    /// and goes away, by the page's own size, on both shapes of tree.
+    fn a_page_counts_in_by_its_size_and_out_again<L: PageTableLevel>(base: usize) {
+        let mut pt = a_table::<L>();
+        assert_eq!(counts(&pt), (0, 0));
+        for i in 0..3 {
+            pt.map(
+                Page::new_aligned(base + i * K, PageSize::Size4K),
+                0x10_0000 + i * K,
+                rw(),
+            )
+            .unwrap();
+        }
+        let huge = base + 2 * M;
+        pt.map(Page::new_aligned(huge, PageSize::Size2M), 4 * M, rw())
+            .unwrap();
+        assert_eq!(counts(&pt), (3 * K + M, 3 * K + M));
+
+        pt.unmap(base + K).unwrap();
+        assert_eq!(counts(&pt), (2 * K + M, 3 * K + M), "the mark stays");
+        pt.unmap(huge).unwrap();
+        assert_eq!(counts(&pt), (2 * K, 3 * K + M));
+        pt.map(Page::new_aligned(base + K, PageSize::Size4K), 0x9000, rw())
+            .unwrap();
+        assert_eq!(counts(&pt), (3 * K, 3 * K + M), "under the mark again");
+    }
+
+    #[test]
+    fn a_page_counts_in_by_its_size_and_out_again_on_four_levels() {
+        a_page_counts_in_by_its_size_and_out_again::<PageTableLevel4>(0x2e00_0000_0000);
+    }
+
+    #[test]
+    fn a_page_counts_in_by_its_size_and_out_again_on_three_levels() {
+        a_page_counts_in_by_its_size_and_out_again::<PageTableLevel3>(0x2e_0000_0000);
+    }
+
+    /// What the table refuses changes nothing: a second map of the same page
+    /// is `AlreadyMapped`, a second unmap is `NotMapped`, and neither may count
+    /// the page twice.
+    #[test]
+    fn a_refused_map_or_unmap_counts_nothing() {
+        let mut pt = a_table::<PageTableLevel4>();
+        let page = Page::new_aligned(0x2e10_0000_0000, PageSize::Size4K);
+        pt.map(page, 0x5000, rw()).unwrap();
+        assert!(matches!(
+            pt.map(page, 0x6000, rw()),
+            Err(PagingError::AlreadyMapped)
+        ));
+        assert_eq!(counts(&pt), (K, K));
+        pt.unmap(page.vaddr).unwrap();
+        assert!(pt.unmap(page.vaddr).is_err());
+        assert!(pt.unmap_no_shootdown(page.vaddr).is_err());
+        assert_eq!(counts(&pt), (0, K));
+    }
+
+    /// A device window or the zero frame is mapped SPECIAL and never counted,
+    /// in or out -- and taking one away must not take away a page beside it
+    /// that was counted.
+    #[test]
+    fn a_special_page_is_never_counted_in_or_out() {
+        let mut pt = a_table::<PageTableLevel4>();
+        let base = 0x2e20_0000_0000;
+        pt.map(Page::new_aligned(base, PageSize::Size4K), 0x5000, rw())
+            .unwrap();
+        pt.map(
+            Page::new_aligned(base + K, PageSize::Size4K),
+            ELSEWHERE,
+            special(rw()),
+        )
+        .unwrap();
+        pt.map(
+            Page::new_aligned(base + 2 * M, PageSize::Size2M),
+            8 * M,
+            special(rw()),
+        )
+        .unwrap();
+        assert_eq!(counts(&pt), (K, K));
+        pt.unmap(base + K).unwrap();
+        pt.unmap(base + 2 * M).unwrap();
+        assert_eq!(counts(&pt), (K, K), "the counted page is still there");
+        pt.unmap(base).unwrap();
+        assert_eq!(counts(&pt), (0, K));
+    }
+
+    /// An `mprotect` of a device page names its new permissions and nothing
+    /// else -- `VmMapping::protect` happens to carry SPECIAL along, but the
+    /// count must not depend on it. The page stays what it was, so taking it
+    /// away later still counts nothing out.
+    #[test]
+    fn a_change_of_permissions_keeps_a_page_what_it_was() {
+        let mut pt = a_table::<PageTableLevel4>();
+        let base = 0x2e30_0000_0000;
+        pt.map(Page::new_aligned(base, PageSize::Size4K), 0x5000, rw())
+            .unwrap();
+        pt.map(
+            Page::new_aligned(base + K, PageSize::Size4K),
+            ELSEWHERE,
+            special(rw()),
+        )
+        .unwrap();
+        for flags in [MMUFlags::READ, MMUFlags::empty(), rw()] {
+            pt.update(base + K, None, Some(flags)).unwrap();
+            pt.update(base, None, Some(special(flags))).unwrap();
+            assert_eq!(counts(&pt), (K, K), "after {:?}", flags);
+        }
+        // A repoint without flags (the walker's own) keeps it too.
+        pt.update(base + K, Some(ELSEWHERE + K), None).unwrap();
+        assert_eq!(counts(&pt), (K, K));
+        pt.unmap(base + K).unwrap();
+        assert_eq!(counts(&pt), (K, K));
+        pt.unmap(base).unwrap();
+        assert_eq!(counts(&pt), (0, K));
+    }
+
+    /// A new frame with new flags is a new page in the old slot: the write
+    /// fault that puts a private copy where the zero frame was
+    /// (`handle_page_fault`'s `AlreadyMapped` path) makes the page count, and
+    /// the way back makes it stop.
+    #[test]
+    fn a_new_frame_with_new_flags_counts_as_the_new_page() {
+        let mut pt = a_table::<PageTableLevel4>();
+        let vaddr = 0x2e40_0000_0000;
+        pt.map(
+            Page::new_aligned(vaddr, PageSize::Size4K),
+            ELSEWHERE,
+            special(MMUFlags::READ),
+        )
+        .unwrap();
+        assert_eq!(counts(&pt), (0, 0));
+        pt.update(vaddr, Some(0x5000), Some(rw())).unwrap();
+        assert_eq!(counts(&pt), (K, K));
+        pt.update(vaddr, Some(0x6000), Some(rw())).unwrap();
+        assert_eq!(counts(&pt), (K, K), "an ordinary page for another");
+        pt.update(vaddr, Some(ELSEWHERE), Some(special(MMUFlags::READ)))
+            .unwrap();
+        assert_eq!(counts(&pt), (0, K));
+        pt.unmap(vaddr).unwrap();
+        assert_eq!(counts(&pt), (0, K));
+    }
+
+    /// `execve` keeps the table and empties it; the mark then starts over
+    /// from what is still there, and climbs with the new image.
+    #[test]
+    fn a_restart_starts_the_mark_over_from_what_is_mapped_now() {
+        let mut pt = a_table::<PageTableLevel4>();
+        let base = 0x2e50_0000_0000;
+        for i in 0..4 {
+            pt.map(
+                Page::new_aligned(base + i * K, PageSize::Size4K),
+                0x5000,
+                rw(),
+            )
+            .unwrap();
+        }
+        pt.unmap_cont(base + K, 3 * K).unwrap();
+        assert_eq!(counts(&pt), (K, 4 * K));
+        pt.restart_resident_peak();
+        assert_eq!(counts(&pt), (K, K));
+        pt.map(Page::new_aligned(base + K, PageSize::Size4K), 0x5000, rw())
+            .unwrap();
+        assert_eq!(counts(&pt), (2 * K, 2 * K));
+    }
+
+    /// A split describes the same memory, so it leaves the count where it was
+    /// and hands the parent's kind down: the 512 children of a counted page
+    /// count out one by one, and those of a device page count out nothing.
+    #[test]
+    fn a_split_keeps_the_bytes_and_the_kind_of_memory() {
+        for (flags, each) in [(rw(), K), (special(rw()), 0)] {
+            let mut pt = a_table::<PageTableLevel4>();
+            let vaddr = 0x2e60_0000_0000;
+            pt.map(Page::new_aligned(vaddr - K, PageSize::Size4K), 0x5000, rw())
+                .unwrap();
+            pt.map(Page::new_aligned(vaddr, PageSize::Size2M), 16 * M, flags)
+                .unwrap();
+            let before = counts(&pt);
+            let mut frames = vec![];
+            pt.split_huge_page(vaddr, || {
+                let f = PhysFrame::new_zero()?;
+                let paddr = f.paddr();
+                frames.push(f);
+                Some(paddr)
+            })
+            .unwrap();
+            assert_eq!(counts(&pt), before, "{:?}: the split", flags);
+            pt.unmap(vaddr + 5 * K).unwrap();
+            assert_eq!(
+                pt.resident_bytes(),
+                before.0 - each,
+                "{:?}: one child",
+                flags
+            );
+            pt.unmap_cont(vaddr, M).unwrap();
+            assert_eq!(pt.resident_bytes(), K, "{:?}: the neighbour is left", flags);
+        }
     }
 }

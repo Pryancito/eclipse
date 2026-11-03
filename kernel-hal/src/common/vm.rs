@@ -184,6 +184,26 @@ pub trait GenericPageTable: Sync + Send {
         0
     }
 
+    /// Bytes of ordinary memory this address space maps: Linux's RSS
+    /// (`get_mm_rss`), counted entry by entry as the table gains and loses
+    /// them. An entry mapped [`MMUFlags::SPECIAL`] -- device memory, the zero
+    /// frame -- is not counted. 0 where the table is not this crate's to count.
+    fn resident_bytes(&self) -> usize {
+        0
+    }
+
+    /// The most [`Self::resident_bytes`] has been since the table was made or
+    /// since [`Self::restart_resident_peak`]: Linux's `hiwater_rss`, the
+    /// `VmHWM:` of `/proc/<pid>/status`.
+    fn resident_peak_bytes(&self) -> usize {
+        0
+    }
+
+    /// Start the high-water mark over from what is resident now. An `execve`
+    /// gets a new `mm` in Linux, and its mark starts from what the new image
+    /// maps; here the address space is emptied and kept, so it is told.
+    fn restart_resident_peak(&mut self) {}
+
     /// Unlink every table below the root that this address space allocated for
     /// its lower (user) half, and hand the frames back to the caller.
     ///
