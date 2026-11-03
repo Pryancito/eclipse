@@ -2745,11 +2745,11 @@ impl Syscall<'_> {
         // A null `times` means "now", exactly as in utimensat; a pair of
         // timevals is a pair of explicit times, microseconds and all
         // (`do_utimes` -> `utimes_common` with `ATTR_ATIME_SET`).
-        let times = if times.is_null() {
-            None
-        } else {
-            Some(times.read()?)
-        };
+        // `narrow_get_array_if_not_null` and not `times.read()`: a pair of
+        // `struct timeval` is 32 bytes here and 16 to a 32-bit caller, and
+        // the width is the calling process's to answer
+        // (`compat_sys_utimes` -> `get_old_timeval32` twice).
+        let times = crate::narrow::narrow_get_array_if_not_null(self.narrow_abi(), &times)?;
         let request = utimes_times(times, TimeSpec::now())?;
         self.apply_utimes(&inode, request)
     }
@@ -2766,12 +2766,10 @@ impl Syscall<'_> {
             "utimensat(raw): dirfd: {:?}, pathname: {:?}, times: {:?}, flags: {:#x}",
             dirfd, pathname, times, flags
         );
+        // See `sys_utimes`: the pair is 32 bytes here and 16 to a 32-bit
+        // caller (`compat_sys_utimensat` -> `get_old_timespec32` twice).
+        let times = crate::narrow::narrow_get_array_if_not_null(self.narrow_abi(), &times)?;
         let proc = self.linux_process();
-        let times = if times.is_null() {
-            None
-        } else {
-            Some(times.read()?)
-        };
         let request = utimensat_times(times, TimeSpec::now())?;
         let inode = if pathname.is_null() {
             // `futimens(3)`, which glibc spells `utimensat(fd, NULL, times, 0)`;

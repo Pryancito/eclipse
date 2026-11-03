@@ -31,7 +31,10 @@
 //!   converts, because it asks the calling process how wide a word is
 //!   ([`crate::narrow`], Linux's `in_compat_syscall()`). `struct timespec`,
 //!   `timeval`, `itimerval`, `itimerspec`, `tms`, `rusage` and the entries
-//!   of a `struct iovec` are all the native layout with every word halved,
+//!   of a `struct iovec` are all the native layout with every word halved ---
+//!   as is an ARRAY of them, which is what the `times` of `utimensat` and
+//!   `utimes` is, and which [`crate::narrow::narrow_get_array`] reads at the
+//!   caller's stride ---
 //!   and once a call passes nothing else, translating the number is again
 //!   all there is to do.
 //!
@@ -56,9 +59,7 @@
 //!
 //! The second is the calls that share a name but not a shape and whose shape
 //! nothing converts yet: anything passing an `rlimit`, a
-//! `siginfo_t`, a `sigevent`, or an **array** of the
-//! structures [`crate::narrow`] converts one at a time (`utimensat`,
-//! `utimes`); `pselect6`, whose timeout is converted but whose sixth
+//! `siginfo_t` or a `sigevent`; `pselect6`, whose timeout is converted but whose sixth
 //! argument points at two words; `lseek`, whose offset is signed where these
 //! registers are read zero-extended; `clone`, whose last two arguments are
 //! swapped on i386; and `execve`, whose `argv` and `envp` are arrays of
@@ -355,3 +356,8 @@ mod tests;
 
 #[cfg(test)]
 mod unaligned_tests;
+
+/// The `times` of `utimensat` and `utimes`, whose subject is the STRIDE of an
+/// array rather than the width of one structure.
+#[cfg(test)]
+mod utimes_tests;

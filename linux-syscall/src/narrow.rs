@@ -386,6 +386,60 @@ pub(crate) fn narrow_get_if_not_null<T: Narrow, P: Policy + Read>(
     narrow_get(abi32, ptr).map(Some)
 }
 
+/// Read an **array** of `N` of these structures at the width the calling
+/// process speaks: Linux's `get_timespec64` run twice over, which is what
+/// `do_utimes` and `compat_sys_utimensat` do.
+///
+/// A separate helper and not a loop at the call site, because the stride is
+/// the thing that changes and the call site is exactly where it would be got
+/// wrong: two `struct timespec` are 32 bytes here and **16** to a 32-bit
+/// process, so a handler that read the native array and then halved each
+/// entry would have read sixteen bytes past the end of the caller's buffer
+/// before it converted anything.
+///
+/// There is no padding between the entries to worry about at either width:
+/// every one of these structures is a run of machine words
+/// ([`Narrow`]), so an array of them is a run of machine words too, and
+/// `the_entries_of_an_array_sit_back_to_back` pins that.
+///
+/// The native branch reads the `[T; N]` whole rather than entry by entry,
+/// which needs no claim about `T`'s layout at all --- and reads it
+/// **unaligned**, for the reason [`narrow_put`] gives: `abi32 == false` is a
+/// statement about the structure, not about the process.
+pub(crate) fn narrow_get_array<T: Narrow, P: Policy + Read, const N: usize>(
+    abi32: bool,
+    ptr: &UserPtr<[T; N], P>,
+) -> LxResult<[T; N]> {
+    if !abi32 {
+        return Ok(ptr.read_unaligned()?);
+    }
+    if ptr.is_null() {
+        return Err(LxError::EFAULT);
+    }
+    let stride = T::WORDS * 4;
+    // One read of the whole array and not `N` of them: `copy_from_user` is
+    // all-or-nothing, so a short second entry must not leave the first one
+    // already converted.
+    let raw: UserPtr<u8, P> = ptr.as_addr().into();
+    let bytes = raw.read_array(stride * N)?;
+    Ok(core::array::from_fn(|i| {
+        from_narrow_bytes(&bytes[i * stride..(i + 1) * stride])
+    }))
+}
+
+/// [`narrow_get_array`], but a null pointer is `None` rather than `EFAULT`:
+/// the `times` of `utimensat(2)` and of `utimes(2)`, where a null pointer
+/// means "now".
+pub(crate) fn narrow_get_array_if_not_null<T: Narrow, P: Policy + Read, const N: usize>(
+    abi32: bool,
+    ptr: &UserPtr<[T; N], P>,
+) -> LxResult<Option<[T; N]>> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    narrow_get_array(abi32, ptr).map(Some)
+}
+
 /// Write `value` in its **native** layout, but without requiring the
 /// destination be aligned to it.
 ///
@@ -520,3 +574,8 @@ pub(crate) mod ipcbuf;
 
 #[cfg(test)]
 mod tests;
+
+/// The array conversion of [`narrow_get_array`], whose whole subject is the
+/// STRIDE: own file so the two subjects do not share a ceiling.
+#[cfg(test)]
+mod array_tests;
