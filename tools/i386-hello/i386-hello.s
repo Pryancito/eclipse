@@ -94,6 +94,19 @@
  *   73  socketcall(setsockopt) accepted a negative optlen, which is a word of
  *       0xffffffff in the block and four billion to a kernel that
  *       zero-extends it
+ *   74  sigaltstack did not round-trip twelve bytes, or answered with the
+ *       native twenty-four
+ *   75  rt_sigaction refused a twenty-byte struct sigaction
+ *   76  kill() to this process failed
+ *   77  the handler never ran: the frame was not built, or the restorer
+ *       never reached rt_sigreturn
+ *   78  the handler's arguments were not on its stack, where i386 passes
+ *       them (they were in registers, as x86_64 passes them)
+ *   79  the frame is not a struct rt_sigframe_ia32: the siginfo is not
+ *       sixteen bytes above %esp, or the ucontext is not 128 bytes above it
+ *   80  the siginfo's union does not start at byte twelve
+ *   81  the ucontext's sigcontext_32 is not where a 32-bit handler reads it,
+ *       or reports a 64-bit code selector
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -1762,6 +1775,156 @@ statx_poison:
 	movl	optfd, %ebx
 	int	$0x80
 
+	/* Step 74: a signal handler, which is the first thing in this probe
+	 * that the KERNEL has to build a structure for rather than read one.
+	 * Everything before it converts something a program wrote; this is
+	 * the other direction, and it has four parts that can each be wrong
+	 * on their own:
+	 *
+	 *   - `rt_sigaction` (174) takes a TWENTY-byte struct: three of its
+	 *     four members halve and `sa_mask` does not, because `_NSIG` is
+	 *     64 in both ABIs;
+	 *   - the frame is `struct rt_sigframe_ia32`, whose first four words
+	 *     ARE the handler's arguments, because i386 passes arguments on
+	 *     the stack and not in registers;
+	 *   - the `siginfo` in it is 128 bytes whose union starts at byte 12
+	 *     and not at byte 16;
+	 *   - and the handler's `ret` goes to `sa_restorer`, which makes the
+	 *     `rt_sigreturn` (173) that reads the frame back.
+	 *
+	 * The handler records what it was given and returns; everything is
+	 * checked here, afterwards, so that a handler that never ran and a
+	 * handler that ran with rubbish are different failures. */
+
+	/* First the alternate stack, which is twelve bytes to this program
+	 * and twenty-four natively: the size is at byte 8 here and at byte 16
+	 * there. */
+	movl	$altstk, ssin + 0
+	movl	$0, ssin + 4			/* ss_flags */
+	movl	$8192, ssin + 8			/* ss_size */
+	call	poison_ssout
+	movl	$186, %eax			/* sigaltstack */
+	movl	$ssin, %ebx
+	movl	$ssout, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_sigaltstack32
+	/* Read it back, into the poisoned buffer, and require twelve bytes:
+	 * the stack, zero flags, the size --- and the poison still there at
+	 * byte 12, where a native twenty-four-byte answer would have put the
+	 * low half of `ss_size`. */
+	call	poison_ssout
+	movl	$186, %eax
+	xorl	%ebx, %ebx
+	movl	$ssout, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_sigaltstack32
+	cmpl	$altstk, ssout + 0
+	jne	bad_sigaltstack32
+	cmpl	$0, ssout + 4
+	jne	bad_sigaltstack32
+	cmpl	$8192, ssout + 8
+	jne	bad_sigaltstack32
+	cmpl	$0xaaaaaaaa, ssout + 12
+	jne	bad_sigaltstack32
+
+	/* Now the handler. `SA_SIGINFO | SA_RESTORER` is what musl's
+	 * `__libc_sigaction` sets, and `SA_RESTORER` is not optional on
+	 * i386: there is no other way back into the kernel from a handler. */
+	movl	$sighandler, sigact + 0
+	movl	$0x04000004, sigact + 4		/* SA_SIGINFO | SA_RESTORER */
+	movl	$sigrestore, sigact + 8
+	movl	$0, sigact + 12			/* sa_mask, low word */
+	movl	$0, sigact + 16			/* and high word */
+	movl	$174, %eax			/* rt_sigaction */
+	movl	$10, %ebx			/* SIGUSR1 */
+	movl	$sigact, %ecx
+	xorl	%edx, %edx			/* no oldact */
+	movl	$8, %esi			/* sigsetsize */
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_sigaction32
+
+	/* And send it to ourselves, which is also what makes `si_pid`
+	 * checkable: it is this process. */
+	movl	$20, %eax			/* getpid */
+	int	$0x80
+	movl	%eax, mypid
+	movl	%eax, %ebx
+	movl	$37, %eax			/* kill */
+	movl	$10, %ecx			/* SIGUSR1 */
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_raise32
+
+	/* The handler runs on the way back out of that `kill`, so by here it
+	 * has run and returned through `rt_sigreturn`. If it had not, this is
+	 * where it shows. */
+	cmpl	$1, ranflag
+	jne	bad_handler_ran
+
+	/* Its three arguments, which it read off its own stack. A kernel
+	 * that passed them the x86_64 way --- in %edi, %esi, %edx --- leaves
+	 * whatever the interrupted code had at 4(%esp), and the handler reads
+	 * that instead. */
+	cmpl	$10, gotsig
+	jne	bad_handler_args
+
+	/* And where they point, which is the layout of the frame itself:
+	 * `esp` at the four-word header, then the 128-byte `siginfo`, then
+	 * the `ucontext`. This is the one check that measures the FRAME and
+	 * not a field in it. */
+	movl	gotsp, %eax
+	addl	$16, %eax
+	cmpl	%eax, gotinfo
+	jne	bad_frame32
+	movl	gotinfo, %eax
+	addl	$128, %eax
+	cmpl	%eax, gotuc
+	jne	bad_frame32
+
+	/* The `siginfo`: `si_signo`, `si_errno`, `si_code` --- and then the
+	 * union at byte TWELVE, where `si_pid` is. Natively it starts at
+	 * byte 16, so a kernel that copied its own struct across hands this
+	 * program four bytes of padding as the sender's pid. */
+	movl	gotinfo, %eax
+	cmpl	$10, 0(%eax)			/* si_signo */
+	jne	bad_siginfo32
+	cmpl	$0, 4(%eax)			/* si_errno */
+	jne	bad_siginfo32
+	cmpl	$0, 8(%eax)			/* si_code: SI_USER */
+	jne	bad_siginfo32
+	movl	12(%eax), %edx			/* si_pid */
+	cmpl	mypid, %edx
+	jne	bad_siginfo32
+
+	/* And the `ucontext`: `uc_flags`, `uc_link`, a twelve-byte
+	 * `uc_stack`, then the 88-byte `sigcontext_32`. Its `ip` is at byte
+	 * 56 of that and its `cs` at byte 60, and `cs` is the field that says
+	 * whose frame this is: 0x23 is a 32-bit user code selector and 0x33
+	 * is a 64-bit one. */
+	movl	gotuc, %eax
+	movl	20 + 56(%eax), %edx		/* uc_mcontext.ip */
+	testl	%edx, %edx
+	jz	bad_ucontext32
+	movzwl	20 + 60(%eax), %edx		/* uc_mcontext.cs */
+	cmpl	$0x23, %edx
+	jne	bad_ucontext32
+	movl	20 + 28(%eax), %edx		/* uc_mcontext.sp */
+	testl	%edx, %edx
+	jz	bad_ucontext32
+
+	/* Put the alternate stack back the way it was, so nothing after this
+	 * step inherits it. `SS_DISABLE` is 2. */
+	movl	$0, ssin + 0
+	movl	$2, ssin + 4
+	movl	$0, ssin + 8
+	movl	$186, %eax
+	movl	$ssin, %ebx
+	xorl	%ecx, %ecx
+	int	$0x80
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -2010,6 +2173,30 @@ bad_timeo_value:
 bad_optlen_sign:
 	movl	$73, %ebx
 	jmp	die
+bad_sigaltstack32:
+	movl	$74, %ebx
+	jmp	die
+bad_sigaction32:
+	movl	$75, %ebx
+	jmp	die
+bad_raise32:
+	movl	$76, %ebx
+	jmp	die
+bad_handler_ran:
+	movl	$77, %ebx
+	jmp	die
+bad_handler_args:
+	movl	$78, %ebx
+	jmp	die
+bad_frame32:
+	movl	$79, %ebx
+	jmp	die
+bad_siginfo32:
+	movl	$80, %ebx
+	jmp	die
+bad_ucontext32:
+	movl	$81, %ebx
+	jmp	die
 
 	/* 0xaa over the two entries of the batch array, so that each transfer
 	 * count the kernel writes is a byte the program did not put there and
@@ -2084,6 +2271,49 @@ poison_iobuf4_word:
 	addl	$4, %edi
 	subl	$4, %ecx
 	jnz	poison_iobuf4_word
+	ret
+
+	/* The handler itself, in the i386 calling convention: its arguments
+	 * are on its own stack, at 4(%esp), 8(%esp) and 12(%esp), and
+	 * 0(%esp) is the return address the kernel put there --- which is
+	 * `sa_restorer` and nothing else, because a signal handler has no
+	 * caller to return to. Everything is recorded and checked by the
+	 * step, so that "the handler did not run" and "the handler ran with
+	 * the wrong arguments" are two different failures. */
+sighandler:
+	movl	%esp, gotsp
+	movl	4(%esp), %eax
+	movl	%eax, gotsig
+	movl	8(%esp), %eax
+	movl	%eax, gotinfo
+	movl	12(%esp), %eax
+	movl	%eax, gotuc
+	movl	$1, ranflag
+	ret
+
+	/* `sa_restorer`: the trampoline libc passes, and the only way out of
+	 * a handler on i386. musl's is these two instructions. It pops
+	 * nothing --- that is `sigreturn`'s trampoline, not `rt_sigreturn`'s
+	 * --- so the kernel finds the frame four bytes below %esp. */
+sigrestore:
+	movl	$173, %eax		/* rt_sigreturn */
+	int	$0x80
+	/* It does not return. If it ever did, fault here rather than run on
+	 * with a stack nobody can account for. */
+	hlt
+
+	/* 0xaa over the thirty-two bytes the alternate stack is read back
+	 * into, so that a native twenty-four-byte answer is visible as bytes
+	 * the program did not write. Clobbers %eax, %ecx and %edi. */
+poison_ssout:
+	movl	$ssout, %edi
+	movl	$32, %ecx
+	movl	$0xaaaaaaaa, %eax
+poison_ssout_word:
+	movl	%eax, (%edi)
+	addl	$4, %edi
+	subl	$4, %ecx
+	jnz	poison_ssout_word
 	ret
 
 	/* exit_group(status): i386 252. `exit` (1) would do for a single
@@ -2320,6 +2550,35 @@ tvin:
 	.space	8
 tvout:
 	.space	32
+
+	/* What step 74 uses. `ssout` is given thirty-two bytes, more than
+	 * twice the twelve a `compat_stack_t` is, so that a native
+	 * twenty-four-byte answer lands in this program's own memory and is
+	 * caught by the poison rather than by a fault. `altstk` is a real
+	 * region because `sigaltstack` checks the size against
+	 * `MINSIGSTKSZ`; nothing ever runs on it. */
+	.align 4
+sigact:
+	.space	20
+ssin:
+	.space	12
+ssout:
+	.space	32
+ranflag:
+	.long	0
+gotsig:
+	.long	0
+gotinfo:
+	.long	0
+gotuc:
+	.long	0
+gotsp:
+	.long	0
+mypid:
+	.long	0
+	.align 16
+altstk:
+	.space	8192
 
 	/* What step 61 keeps from the initial stack, and the array it builds.
 	 * `xargv` is given the room a NATIVE read of three entries would

@@ -786,6 +786,36 @@ fn taken_without_handler(
     Interrupted::no_handler_ran(interrupted);
 }
 
+/// How much stack one signal frame takes, which is what the writable-memory
+/// check has to ask about.
+///
+/// A 32-bit process gets Linux's `rt_sigframe_ia32`, which is not the native
+/// frame with its words halved but a structure of its own --- and a much
+/// smaller one, so asking about the native size would refuse a stack that has
+/// room for the frame it is actually about to get.
+#[cfg(target_arch = "x86_64")]
+fn sigframe_size(thread: &CurrentThread) -> usize {
+    if thread.proc().linux().abi().is_32bit() {
+        sigframe32::FRAME32_SIZE
+    } else {
+        native_sigframe_size()
+    }
+}
+
+/// The same, where there is no 32-bit personality to ask about:
+/// `Abi::Linux32` is only ever set on x86_64.
+#[cfg(not(target_arch = "x86_64"))]
+fn sigframe_size(_thread: &CurrentThread) -> usize {
+    native_sigframe_size()
+}
+
+/// The `siginfo`, the `ucontext` and the restorer's address.
+fn native_sigframe_size() -> usize {
+    core::mem::size_of::<SigInfo>()
+        + core::mem::size_of::<SignalUserContext>()
+        + core::mem::size_of::<usize>()
+}
+
 fn handle_signal(
     thread: &CurrentThread,
     mut ctx: Box<UserContext>,
@@ -1046,10 +1076,7 @@ fn handle_signal(
     // same range with `access_ok()` and answers a bad one with a forced
     // SIGSEGV, which is what a process gets for handing the kernel a stack
     // pointer it cannot use.
-    let frame_size = RED_ZONE_MAX_SIZE
-        + core::mem::size_of::<SigInfo>()
-        + core::mem::size_of::<SignalUserContext>()
-        + core::mem::size_of::<usize>();
+    let frame_size = RED_ZONE_MAX_SIZE + sigframe_size(thread);
     let usable = frame_top.filter(|top| {
         let ranges: Vec<(usize, usize, bool)> = thread
             .proc()
@@ -1083,6 +1110,19 @@ fn handle_signal(
             return ctx;
         }
     };
+    #[cfg(target_arch = "x86_64")]
+    if thread.proc().linux().abi().is_32bit() {
+        return setup_i386_frame(
+            thread,
+            ctx,
+            sp,
+            signal,
+            &action,
+            signal_info,
+            uc_stack,
+            sigmask,
+        );
+    }
     // Always use the 3-argument SA_SIGINFO calling convention; extra args are harmless
     // for 1-argument handlers on SysV ABIs, and avoids crashing when flags are unset.
     sp = push_stack(sp & !0xF, signal_info); // & !0xF for 16 bytes aligned
@@ -1107,6 +1147,85 @@ fn handle_signal(
         sp,
         &[signal as usize, siginfo_ptr, uctx_ptr],
     );
+    ctx
+}
+
+/// Enter a 32-bit process's handler, with the frame i386 wants.
+///
+/// The native path is three pushes and three registers; this is one structure
+/// and three stack words. Both halves of that matter:
+///
+/// - the frame is `struct rt_sigframe_ia32`, whose header **is** the
+///   handler's arguments, because i386 passes arguments on the stack;
+/// - the `siginfo` and the `ucontext` in it are the 32-bit layouts, not the
+///   native ones ([`linux_object::signal::ucontext::i386`]).
+///
+/// `ax`, `dx` and `cx` are set as well, which is not redundant: Linux's
+/// `ia32_setup_rt_frame` leaves them holding the same three values, and a
+/// handler written in assembly is entitled to read them there.
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "x86_64")]
+fn setup_i386_frame(
+    thread: &CurrentThread,
+    mut ctx: Box<UserContext>,
+    frame_top: usize,
+    signal: Signal,
+    action: &SignalAction,
+    signal_info: SigInfo,
+    uc_stack: SignalStack,
+    sigmask: Sigset,
+) -> Box<UserContext> {
+    use linux_object::signal::ucontext::i386::{SigContext32, SignalStack32, SignalUserContext32};
+    let frame = match sigframe32::Frame32::at(frame_top) {
+        Some(frame) => frame,
+        None => {
+            // The same answer the native path gives a stack pointer it
+            // cannot use, and for the same reason: the alternative is the
+            // kernel writing a frame wherever the arithmetic wrapped to.
+            error!(
+                "[exit] pid={} nowhere to put the 32-bit {:?} frame: top={:#x} (forcing SIGSEGV)",
+                thread.proc().id(),
+                signal,
+                frame_top,
+            );
+            thread
+                .proc()
+                .exit(linux_object::process::exit_code_killed_by(
+                    Signal::SIGSEGV as u8,
+                ));
+            return ctx;
+        }
+    };
+    let mut uc = SignalUserContext32 {
+        stack: SignalStack32::from_native(&uc_stack),
+        context: SigContext32::from_context(&mut ctx),
+        ..Default::default()
+    };
+    uc.set_mask(sigmask);
+    // SAFETY: the user page table is live and the caller has checked that
+    // `frame_size` bytes below `frame_top` lie in one writable user mapping,
+    // with `frame_size` the 32-bit frame's own size.
+    #[allow(unsafe_code)]
+    unsafe {
+        sigframe32::write_frame(frame, action.restorer, signal as u32, &signal_info, &uc);
+    }
+    thread.backup_context(
+        *ctx,
+        frame.siginfo_ptr,
+        frame.uctx_ptr,
+        frame.sigreturn_sp(),
+    );
+    ctx.setup_uspace(
+        action.handler,
+        frame.sp,
+        &[signal as usize, frame.siginfo_ptr, frame.uctx_ptr],
+    );
+    {
+        let g = ctx.general_mut();
+        g.rax = signal as usize;
+        g.rdx = frame.siginfo_ptr;
+        g.rcx = frame.uctx_ptr;
+    }
     ctx
 }
 
@@ -1887,6 +2006,14 @@ fn syscall_args(ctx: &UserContext) -> [usize; 6] {
         }
     }
 }
+
+// `Abi::Linux32` is only ever set on x86_64 (see its own documentation), and
+// the frame this builds is made of that architecture's registers, so there is
+// nothing for it to do on the others and nothing it could compile into. The
+// LAYOUTS it uses stay compiled everywhere, in
+// `linux_object::signal::ucontext`, so their tests still run on any host.
+#[cfg(target_arch = "x86_64")]
+mod sigframe32;
 
 #[cfg(test)]
 mod user_trap_tests;

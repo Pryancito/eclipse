@@ -2,6 +2,8 @@
 
 use crate::error::SysResult;
 use crate::process::ProcessExt;
+#[cfg(target_arch = "x86_64")]
+use crate::signal::ucontext::i386::SignalUserContext32;
 use crate::signal::{SigInfo, Signal, SignalStack, SignalUserContext, Sigset};
 use crate::sync::shared_futex;
 use alloc::collections::BTreeMap;
@@ -915,6 +917,70 @@ impl LinuxThread {
         self.handling_signal = None;
     }
 
+    /// The same, for a 32-bit process, whose frame is Linux's
+    /// `rt_sigframe_ia32` and not the native one.
+    ///
+    /// A separate entry point rather than a flag threaded into the one above,
+    /// because the two read **different structures** out of the same two
+    /// addresses: a `ucontext_ia32` is 116 bytes where the native frame is
+    /// 936, and reading the native layout out of a 32-bit frame reads 820
+    /// bytes past the end of it and then restores registers out of whatever
+    /// that was. Everything after the read is the same, and is shared.
+    #[cfg(target_arch = "x86_64")]
+    pub fn restore_after_handle_signal32(
+        &mut self,
+        ctx: &mut UserContext,
+        old_ctx: &UserContext,
+        siginfo_ptr: usize,
+        uctx_ptr: usize,
+    ) {
+        let info_bytes = unsafe { &*(siginfo_ptr as *const [u8; crate::signal::SIGINFO_LEN]) };
+        let user_ctx = unsafe { &*(uctx_ptr as *const SignalUserContext32) };
+        // The `siginfo` a 32-bit handler was given is the narrowed one, so
+        // the comparison is against that and not against the native struct:
+        // the handler cannot have left the native bytes there, and comparing
+        // them would log "unsupported signal fields" on every single
+        // `sigreturn` a 32-bit program makes.
+        let mut check = (*info_bytes != self.handling_info.to_i386_bytes()) as usize;
+        check |= ((user_ctx.flags != 0) as usize) << 1;
+        check |= ((user_ctx.link != 0) as usize) << 2;
+        if check != 0 {
+            error!("unsupported signal fields : {:b}", check);
+            trace!("uctx32 = {:x?}", *user_ctx);
+        }
+        let handler_sp = ctx.get_field(UserContextField::StackPointer);
+        self.signal_alternate_stack
+            .restore_from_frame(user_ctx.stack.to_native(), handler_sp);
+        *ctx = *old_ctx;
+        user_ctx.context.restore_into(ctx);
+        self.set_signal_mask(user_ctx.mask());
+        self.handling_signal = None;
+    }
+
+    /// The `sigreturn` of a thread whose process has the given width, which
+    /// is the one door `linux-syscall` goes through.
+    ///
+    /// The branch lives here rather than at the call site because
+    /// [`Self::restore_after_handle_signal32`] only exists on x86_64 ---
+    /// `Abi::Linux32` is only ever set there, and the frame it reads is made
+    /// of that architecture's registers.
+    pub fn restore_after_a_handler(
+        &mut self,
+        ctx: &mut UserContext,
+        old_ctx: &UserContext,
+        siginfo_ptr: usize,
+        uctx_ptr: usize,
+        narrow: bool,
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        if narrow {
+            return self.restore_after_handle_signal32(ctx, old_ctx, siginfo_ptr, uctx_ptr);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = narrow;
+        self.restore_after_handle_signal(ctx, old_ctx, siginfo_ptr, uctx_ptr)
+    }
+
     /// The signals this thread currently has blocked.
     pub fn signal_mask(&self) -> Sigset {
         self.signal_mask
@@ -1777,6 +1843,134 @@ mod signal_delivery_tests {
             ctx.general().r14,
             0xaaaa,
             "a register the handler left alone must come back as it was"
+        );
+    }
+
+    /// The 32-bit frame on the way back, which is the other half of
+    /// `loader::linux::sigframe32`.
+    ///
+    /// These matter more than their native twins, because the native path
+    /// cannot be wrong by accident here and this one can: the two frames are
+    /// at the same two addresses, and reading a `ucontext_ia32` as the native
+    /// `SignalUserContext` reads 820 bytes past the end of a 116-byte object
+    /// and then restores the process's registers out of whatever that was.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sigreturn32_resumes_where_the_32_bit_frame_says() {
+        use crate::signal::ucontext::i386::{SigContext32, SignalUserContext32};
+        let mut t = thread();
+        t.handling_signal = Some(Signal::SIGUSR1 as u32);
+
+        let mut old_ctx = UserContext::default();
+        old_ctx.general_mut().rsp = 0xffff_d000;
+        old_ctx.general_mut().r14 = 0xaaaa;
+
+        let info = SigInfo::default().to_i386_bytes();
+        let mut uctx = SignalUserContext32 {
+            context: SigContext32::from_context(&mut old_ctx.clone()),
+            ..Default::default()
+        };
+        // What a handler does when it steps past a faulting instruction, or
+        // when a JIT patches the resume point.
+        uctx.context.sp = 0xffff_cff8;
+        uctx.context.ip = 0x0804_9100;
+
+        let mut ctx = UserContext::default();
+        t.restore_after_handle_signal32(
+            &mut ctx,
+            &old_ctx,
+            info.as_ptr() as usize,
+            &uctx as *const SignalUserContext32 as usize,
+        );
+
+        assert_eq!(ctx.general().rsp, 0xffff_cff8);
+        assert_eq!(ctx.general().rip, 0x0804_9100);
+        assert_eq!(
+            ctx.general().r14,
+            0xaaaa,
+            "a register a 32-bit frame does not carry must come back as it was"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sigreturn32_reads_both_words_of_the_mask_and_filters_it() {
+        use crate::signal::ucontext::i386::SignalUserContext32;
+        // `uc_sigmask` is two `u32`, and the realtime signals are all in the
+        // SECOND one: a restore that read only the first would silently
+        // unblock every one of them on the way out of a handler. And the
+        // mask is userspace's to rewrite before it returns, so it gets the
+        // same filter `sigprocmask` gets.
+        let mut t = thread();
+        t.handling_signal = Some(Signal::SIGUSR1 as u32);
+
+        let info = SigInfo::default().to_i386_bytes();
+        let mut uctx = SignalUserContext32::default();
+        let mut doctored = Sigset::empty();
+        doctored.insert(Signal::SIGKILL);
+        doctored.insert(Signal::SIGUSR2);
+        // Bit 36: a realtime signal, which lives in `sig_mask[1]`.
+        let with_rt = Sigset::new(doctored.val() | (1u64 << 36));
+        uctx.set_mask(with_rt);
+
+        let old_ctx = UserContext::default();
+        let mut ctx = UserContext::default();
+        t.restore_after_handle_signal32(
+            &mut ctx,
+            &old_ctx,
+            info.as_ptr() as usize,
+            &uctx as *const SignalUserContext32 as usize,
+        );
+
+        assert!(
+            !t.signal_mask().contains(Signal::SIGKILL),
+            "a 32-bit sigreturn let a handler block SIGKILL"
+        );
+        assert!(t.signal_mask().contains(Signal::SIGUSR2));
+        assert_eq!(
+            t.signal_mask().val() & (1u64 << 36),
+            1u64 << 36,
+            "the high word of the mask was dropped"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sigreturn32_reinstalls_the_alternate_stack_the_frame_carries() {
+        use crate::signal::ucontext::i386::{SignalStack32, SignalUserContext32};
+        use crate::signal::{SignalStack, SignalStackFlags};
+        // The same contract as the native twin, through twelve bytes instead
+        // of twenty-four: an `SS_AUTODISARM` stack comes back only from the
+        // frame.
+        let alt = SignalStack {
+            sp: 0xffff_0000,
+            flags: SignalStackFlags::AUTODISARM,
+            size: 0x4000,
+        };
+        let mut t = thread();
+        t.handling_signal = Some(Signal::SIGUSR1 as u32);
+        t.signal_alternate_stack = alt;
+        let uc_stack = t.signal_alternate_stack.take_for_frame();
+        assert!(!t.signal_alternate_stack.usable_from(0xffff_f000));
+
+        let info = SigInfo::default().to_i386_bytes();
+        let uctx = SignalUserContext32 {
+            stack: SignalStack32::from_native(&uc_stack),
+            ..Default::default()
+        };
+        let old_ctx = UserContext::default();
+        let mut ctx = UserContext::default();
+        // The handler returns from the alternate stack.
+        ctx.set_field(UserContextField::StackPointer, alt.sp + alt.size / 2);
+        t.restore_after_handle_signal32(
+            &mut ctx,
+            &old_ctx,
+            info.as_ptr() as usize,
+            &uctx as *const SignalUserContext32 as usize,
+        );
+        assert_eq!(
+            t.signal_alternate_stack, alt,
+            "a 32-bit sigreturn did not put the auto-disarmed stack back"
         );
     }
 
