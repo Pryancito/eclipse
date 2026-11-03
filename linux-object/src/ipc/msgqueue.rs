@@ -40,7 +40,7 @@ const MSG_INTERRUPT_CHECK_TICK_MS: u64 = 100;
 
 /// `struct msqid_ds` as 64-bit userland (musl/glibc `msqid64_ds`) lays it out.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct MsqidDs {
     /// Ownership and permissions
     pub perm: IpcPerm,

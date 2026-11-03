@@ -513,5 +513,10 @@ pub(crate) mod sockopt;
 /// table of offsets rather than a count of words.
 pub(crate) mod msghdr;
 
+/// The three `*id64_ds` of System V, which break the rule the other way: a
+/// 32-bit layout of them is not the native one with its words halved,
+/// because Linux splits each of their times into a `_low`/`_high` pair.
+pub(crate) mod ipcbuf;
+
 #[cfg(test)]
 mod tests;

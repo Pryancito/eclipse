@@ -1,4 +1,5 @@
 use super::*;
+use crate::narrow::ipcbuf;
 use alloc::vec::Vec;
 use bitflags::*;
 use numeric_enum_macro::numeric_enum;
@@ -402,18 +403,20 @@ impl Syscall<'_> {
                 Ok(0)
             }
             SemctlCmds::IPC_SET => {
-                // arg is struct semid_ds
-                let ptr = UserInPtr::from(arg);
-                let ds: SemidDs = ptr.read()?;
+                // arg is struct semid_ds, at the WIDTH OF THE CALLER: 64
+                // bytes to a 32-bit process and 104 here, and not the same
+                // fields in smaller words either. See
+                // [`crate::narrow::ipcbuf`].
+                let ds = ipcbuf::get_semid_ds(self.narrow_abi(), arg)?;
                 // update IpcPerm
                 sem_array.set(&ds, self.linux_process().euid())?;
                 sem_array.ctime();
                 Ok(0)
             }
             SemctlCmds::IPC_STAT | SemctlCmds::SEM_STAT | SemctlCmds::SEM_STAT_ANY => {
-                // arg is struct semid_ds
-                let mut ptr = UserOutPtr::from(arg);
-                ptr.write(*sem_array.semid_ds.lock())?;
+                // arg is struct semid_ds, at the caller's width.
+                let ds = *sem_array.semid_ds.lock();
+                ipcbuf::put_semid_ds(self.narrow_abi(), arg, ds)?;
                 Ok(ipc_stat_result(cmd != SemctlCmds::IPC_STAT, id))
             }
             // The two whole-set commands: `arg.array` is `unsigned short[nsems]`.
@@ -649,7 +652,9 @@ impl Syscall<'_> {
             IPC_RMID => msg_remove(id, self.linux_process().euid()).map(|_| 0),
             IPC_SET => {
                 let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
-                let ds: MsqidDs = UserInPtr::from(buf).read()?;
+                // `msg_qbytes` is the one field read back in, and it is at
+                // offset 68 to a 32-bit caller against 96 here.
+                let ds = ipcbuf::get_msqid_ds(self.narrow_abi(), buf)?;
                 queue.set(&ds, self.linux_process().euid())?;
                 Ok(0)
             }
@@ -669,7 +674,7 @@ impl Syscall<'_> {
                 {
                     return Err(LxError::EACCES);
                 }
-                UserOutPtr::from(buf).write(queue.stat())?;
+                ipcbuf::put_msqid_ds(self.narrow_abi(), buf, queue.stat())?;
                 Ok(ipc_stat_result(cmd != IPC_STAT, id))
             }
             IPC_INFO | MSG_INFO => {
@@ -942,9 +947,9 @@ impl Syscall<'_> {
                 Ok(0)
             }
             ShmctlCmds::IPC_SET => {
-                let buffer: UserInPtr<ShmidDs> = buffer.into();
-                // Read userspace BEFORE locking the segment.
-                let set_ds = buffer.read()?;
+                // Read userspace BEFORE locking the segment, and at the
+                // caller's width: 84 bytes to a 32-bit process, 112 here.
+                let set_ds = ipcbuf::get_shmid_ds(self.narrow_abi(), buffer)?;
                 let shm_guard = guard.lock();
                 shm_guard.set(&set_ds, self.linux_process().euid())?;
                 shm_guard.ctime();
@@ -964,8 +969,7 @@ impl Syscall<'_> {
                     let ds = *shm_guard.shmid_ds.lock();
                     ds
                 };
-                let mut buffer: UserOutPtr<ShmidDs> = buffer.into();
-                buffer.write(shmid_ds)?;
+                ipcbuf::put_shmid_ds(self.narrow_abi(), buffer, shmid_ds)?;
                 // The `SHM_STAT`s answer the segment's id: it is how the
                 // caller learns it from the index it walked to.
                 Ok(ipc_stat_result(cmd != ShmctlCmds::IPC_STAT, id))

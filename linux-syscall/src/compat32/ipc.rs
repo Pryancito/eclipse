@@ -93,9 +93,10 @@ const SHMCTL: u32 = 24;
 /// the modern structure. Kept out of the command before it is judged.
 const IPC_64: usize = 0x100;
 
-/// The `*ctl` commands whose structure is not the same at both widths, per
-/// family. Everything else goes through, because its structure is the same
-/// bytes either way or there is no structure at all.
+/// The `*ctl` commands whose structure is not the same at both widths **and
+/// is not converted yet**, per family. Everything else goes through, because
+/// its structure is the same bytes either way, because there is no structure
+/// at all, or because [`crate::narrow::ipcbuf`] converts it.
 ///
 /// Worked out from the structures, not guessed at a family level:
 ///
@@ -103,22 +104,31 @@ const IPC_64: usize = 0x100;
 ///   `struct ipc64_perm` --- 36 bytes to a 32-bit caller, 48 here --- and
 ///   whose `time_t` members Linux splits into a `_low`/`_high` PAIR of
 ///   `unsigned long` on a 32-bit architecture. So do the per-family
-///   `*_STAT`s, which are the same structure reached by index.
+///   `*_STAT`s, which are the same structure reached by index. **These are
+///   converted now**, which is why two of the three lists below are empty:
+///   the conversion is in the handlers, not here, because `semctl`, `msgctl`
+///   and `shmctl` have no separate i386 number and are reached directly as
+///   well as through this multiplexer.
 /// - The `seminfo` and `msginfo` of `IPC_INFO`/`SEM_INFO`/`MSG_INFO` are runs
 ///   of `int` (and one `unsigned short`), the same at both widths, so those
 ///   are **not** held back.
-/// - Shared memory's are the exception: `struct shminfo64` (`IPC_INFO`) and
-///   `struct shm_info` (`SHM_INFO`) are runs of `__kernel_ulong_t`, so both
-///   of those differ and both are held back.
+/// - Shared memory's are the exception, and the only thing left: `struct
+///   shminfo64` (`IPC_INFO`) and `struct shm_info` (`SHM_INFO`) are runs of
+///   `__kernel_ulong_t`, so both of those differ and both are still held
+///   back. `shm_info` leads with an `int used_ids`, so it is not a pure run
+///   and the word-halving of [`crate::narrow`] does not serve it either.
 /// - `GETALL`/`SETALL` carry `unsigned short[]`, and `GETVAL`/`SETVAL` and
 ///   friends are scalars: nothing to convert.
-const SEM_NEEDS_LAYOUT: &[usize] = &[1, 2, 18, 20];
-/// See [`SEM_NEEDS_LAYOUT`]: `IPC_SET`, `IPC_STAT`, `MSG_STAT`,
-/// `MSG_STAT_ANY`.
-const MSG_NEEDS_LAYOUT: &[usize] = &[1, 2, 11, 13];
-/// See [`SEM_NEEDS_LAYOUT`]: `IPC_SET`, `IPC_STAT`, `IPC_INFO`, `SHM_STAT`,
-/// `SHM_INFO`, `SHM_STAT_ANY`.
-const SHM_NEEDS_LAYOUT: &[usize] = &[1, 2, 3, 13, 14, 15];
+///
+/// A list stays here, empty, rather than being deleted with its call site:
+/// the next structure of its family that turns out to differ is a number in
+/// it, and the check is one `contains` either way.
+const SEM_NEEDS_LAYOUT: &[usize] = &[];
+/// See [`SEM_NEEDS_LAYOUT`]: nothing left in this family either.
+const MSG_NEEDS_LAYOUT: &[usize] = &[];
+/// See [`SEM_NEEDS_LAYOUT`]: `IPC_INFO` (`shminfo64`) and `SHM_INFO`
+/// (`shm_info`), the two that are still not converted.
+const SHM_NEEDS_LAYOUT: &[usize] = &[3, 14];
 
 /// `struct ipc_kludge`, the old `msgrcv` argument block: a pointer and a
 /// `long`, both four bytes to a 32-bit program.

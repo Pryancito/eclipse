@@ -11,7 +11,7 @@ use lazy_static::*;
 ///
 /// struct semid_ds
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct SemidDs {
     /// Ownership and permissions
     pub perm: IpcPerm,
