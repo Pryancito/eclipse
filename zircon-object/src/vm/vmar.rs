@@ -773,6 +773,13 @@ impl VmAddressRegion {
         {
             flags |= MMUFlags::from_bits_truncate(vmo.cache_policy() as usize);
         }
+        // A physical VMO is a window onto a device, not memory the process
+        // holds: Linux's `remap_pfn_range` maps it `pte_special`, and RSS
+        // leaves it out. The walk behind `VmRSS:` already does (it commits
+        // nothing), and the page table's count has to agree.
+        if vmo.is_physical() {
+            flags |= MMUFlags::SPECIAL;
+        }
         // align = 1K? 2K? 4K? 8K? ...
         if !self.test_map(inner, offset, len, PAGE_SIZE) {
             if overwrite {
@@ -1367,10 +1374,11 @@ impl VmAddressRegion {
             (children, mappings)
         };
         self.destroy_taken_subtree(children, mappings);
-        // Tree emptied; reset the peak to the live total for the next image.
+        // Tree emptied; reset the peaks to the live totals for the next image.
         if let Some(inner) = self.inner.lock().as_ref() {
             inner.vm_size.reset_peak_to_live();
         }
+        self.page_table.lock().restart_resident_peak();
         Ok(())
     }
 
@@ -2314,6 +2322,20 @@ impl VmAddressRegion {
         self.page_table.lock().table_bytes()
     }
 
+    /// Bytes of ordinary memory the address space maps, counted by its page
+    /// table as entries come and go: Linux's RSS. Device windows and the zero
+    /// frame are left out. One table serves the whole VMAR tree, so any
+    /// region of it answers for all of it.
+    pub fn resident_bytes(&self) -> usize {
+        self.page_table.lock().resident_bytes()
+    }
+
+    /// The most [`Self::resident_bytes`] has been: Linux's `hiwater_rss`,
+    /// the `VmHWM:` of `/proc/<pid>/status`. Started over by [`Self::clear`].
+    pub fn resident_peak_bytes(&self) -> usize {
+        self.page_table.lock().resident_peak_bytes()
+    }
+
     /// Returns statistics about memory used by a task.
     pub fn get_task_stats(&self) -> TaskStatsInfo {
         let mut task_stats = TaskStatsInfo::default();
@@ -2606,6 +2628,19 @@ fn fault_grants(flags: MMUFlags) -> MMUFlags {
     }
 }
 
+/// The flags a leaf for `paddr` is mapped with: the shared zero frame a read
+/// of untouched memory maps is SPECIAL, as Linux's zero page is
+/// (`do_anonymous_page` maps it `pte_mkspecial`), so reading a heap does not
+/// make it resident. The walk behind `VmRSS:` does not count it either: no
+/// page is committed there.
+fn leaf_flags(paddr: PhysAddr, flags: MMUFlags) -> MMUFlags {
+    if paddr == kernel_hal::mem::ZERO_FRAME.paddr() {
+        flags | MMUFlags::SPECIAL
+    } else {
+        flags
+    }
+}
+
 /// Pages a fault makes resident and maps, including the faulting one: the
 /// window `VmMapping::handle_page_fault` prefills with one source read and
 /// `fault_around` then maps read-only (Linux's default `fault_around_bytes`
@@ -2750,7 +2785,7 @@ impl VmMapping {
                     .map(
                         Page::new_aligned(inner.addr + i * PAGE_SIZE, BASE_PAGE_SIZE),
                         paddr,
-                        inner.flags[i],
+                        leaf_flags(paddr, inner.flags[i]),
                     )
                     .expect("failed to map");
             }
@@ -3058,7 +3093,7 @@ impl VmMapping {
                     .map(
                         Page::new_aligned(inner.addr + i * PAGE_SIZE, BASE_PAGE_SIZE),
                         paddr,
-                        inner.flags[i],
+                        leaf_flags(paddr, inner.flags[i]),
                     )
                     .expect("failed to map");
             }
@@ -3336,6 +3371,7 @@ impl VmMapping {
             self.vmo.prefill(vmo_offset / PAGE_SIZE, FAULT_AROUND_PAGES);
         }
         let paddr = self.vmo.commit_page(vmo_offset / PAGE_SIZE, access_flags)?;
+        let flags = leaf_flags(paddr, flags);
         // error!("paddr = {:x}", paddr);
         fault_publish_hook(vaddr);
         {
@@ -3455,7 +3491,7 @@ impl VmMapping {
         for &(va, vmo_page, flags) in &targets[..n] {
             match self.vmo.commit_page(vmo_page, MMUFlags::READ) {
                 Ok(paddr) => {
-                    committed[m] = (va, paddr, flags);
+                    committed[m] = (va, paddr, leaf_flags(paddr, flags));
                     m += 1;
                 }
                 Err(_) => break,
@@ -5136,6 +5172,9 @@ mod mapping_count_tests;
 
 #[cfg(test)]
 mod mapped_bytes_tests;
+
+#[cfg(test)]
+mod resident_tests;
 
 #[cfg(test)]
 mod fork_name_tests;

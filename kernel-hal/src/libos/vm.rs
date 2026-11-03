@@ -4,6 +4,7 @@ use alloc::collections::BTreeMap;
 
 use super::mem::{MOCK_PHYS_MEM, PMEM_MAP_VADDR, PMEM_SIZE};
 use crate::sync::Mutex;
+use crate::utils::resident::Resident;
 use crate::{addr::is_aligned, MMUFlags, PhysAddr, VirtAddr, PAGE_SIZE};
 
 lazy_static! {
@@ -119,15 +120,25 @@ pub(crate) mod flush_probe {
 }
 
 /// Dummy page table implemented by `mmap`, `munmap`, and `mprotect`.
-pub struct PageTable;
+///
+/// The pages live in the one host address space and in [`MAPPED_PAGES`],
+/// which every table shares; what is this table's own is the count of what it
+/// mapped. The mark [`MMUFlags::SPECIAL`] rides in the flags kept there, and is
+/// taken back out of what [`GenericPageTable::query`] answers, as a real
+/// entry's `flags()` never reports it.
+pub struct PageTable {
+    resident: Resident,
+}
 
 impl PageTable {
     pub fn new() -> Self {
-        Self
+        Self {
+            resident: Resident::default(),
+        }
     }
 
     pub fn from_current() -> Self {
-        Self
+        Self::new()
     }
 
     pub fn clone_kernel(&self) -> Self {
@@ -151,7 +162,15 @@ impl GenericPageTable for PageTable {
         debug_assert!(is_aligned(paddr));
         if paddr < PMEM_SIZE {
             MOCK_PHYS_MEM.mmap(page.vaddr, PAGE_SIZE, paddr, flags);
-            MAPPED_PAGES.lock().insert(page.vaddr, (paddr, flags));
+            // A host mmap replaces whatever was there, where a real table
+            // answers `AlreadyMapped`: count the page it replaced out first.
+            let old = MAPPED_PAGES.lock().insert(page.vaddr, (paddr, flags));
+            if old.map_or(false, |(_, f)| !f.contains(MMUFlags::SPECIAL)) {
+                self.resident.sub(PAGE_SIZE);
+            }
+            if !flags.contains(MMUFlags::SPECIAL) {
+                self.resident.add(PAGE_SIZE);
+            }
             Ok(())
         } else {
             Err(PagingError::NoMemory)
@@ -178,8 +197,10 @@ impl GenericPageTable for PageTable {
             if !MOCK_PHYS_MEM.mprotect(vaddr as _, PAGE_SIZE, flags) {
                 return Err(PagingError::NotMapped);
             }
+            // The frame stays the same (`_paddr` is not honoured), so the
+            // page stays the kind of memory it was.
             if let Some(entry) = MAPPED_PAGES.lock().get_mut(&vaddr) {
-                entry.1 = flags;
+                entry.1 = (flags - MMUFlags::SPECIAL) | (entry.1 & MMUFlags::SPECIAL);
             }
         }
         Ok(crate::vm::BASE_PAGE_SIZE)
@@ -197,7 +218,7 @@ impl GenericPageTable for PageTable {
         MAPPED_PAGES
             .lock()
             .get(&vaddr)
-            .map(|&(paddr, flags)| (paddr, flags, crate::vm::BASE_PAGE_SIZE))
+            .map(|&(paddr, flags)| (paddr, flags - MMUFlags::SPECIAL, crate::vm::BASE_PAGE_SIZE))
             .ok_or(PagingError::NotMapped)
     }
 
@@ -209,9 +230,25 @@ impl GenericPageTable for PageTable {
         MOCK_PHYS_MEM.munmap(vaddr as _, size);
         let mut mapped = MAPPED_PAGES.lock();
         for page in (vaddr..vaddr + size).step_by(PAGE_SIZE) {
-            mapped.remove(&page);
+            if let Some((_, f)) = mapped.remove(&page) {
+                if !f.contains(MMUFlags::SPECIAL) {
+                    self.resident.sub(PAGE_SIZE);
+                }
+            }
         }
         Ok(())
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.resident.now()
+    }
+
+    fn resident_peak_bytes(&self) -> usize {
+        self.resident.peak()
+    }
+
+    fn restart_resident_peak(&mut self) {
+        self.resident.restart_peak();
     }
 }
 
@@ -293,5 +330,46 @@ mod tests {
         ));
         pt.unmap(VBASE_QUERY).unwrap();
         assert!(matches!(pt.query(VBASE_QUERY), Err(PagingError::NotMapped)));
+    }
+
+    /// Distinct again, for the same reason.
+    const VBASE_RESIDENT: VirtAddr = 0x0002_0200_0000;
+
+    /// The count libos keeps is the one a real table keeps: each page the
+    /// table maps, unless it is SPECIAL, and the most there has been.
+    #[test]
+    fn the_resident_count_follows_what_this_table_mapped() {
+        let mut pt = PageTable::new();
+        let page = |i: usize| Page::new_aligned(VBASE_RESIDENT + i * PAGE_SIZE, BASE_PAGE_SIZE);
+        let rw = MMUFlags::READ | MMUFlags::WRITE;
+        for i in 0..3 {
+            pt.map(page(i), (i + 1) * PAGE_SIZE, rw).unwrap();
+        }
+        pt.map(page(3), 8 * PAGE_SIZE, rw | MMUFlags::SPECIAL)
+            .unwrap();
+        assert_eq!(
+            pt.resident_bytes(),
+            3 * PAGE_SIZE,
+            "the special page is out"
+        );
+
+        // A host mmap over a mapped page replaces it: one page, not two.
+        pt.map(page(0), 5 * PAGE_SIZE, rw).unwrap();
+        assert_eq!(pt.resident_bytes(), 3 * PAGE_SIZE);
+        // An mprotect leaves a page the kind it was, and `query` answers
+        // what a real entry would, without the mark.
+        pt.update(page(3).vaddr, None, Some(MMUFlags::READ))
+            .unwrap();
+        assert_eq!(pt.query(page(3).vaddr).unwrap().1, MMUFlags::READ);
+
+        pt.unmap_cont(VBASE_RESIDENT, 4 * PAGE_SIZE).unwrap();
+        assert_eq!(
+            pt.resident_bytes(),
+            0,
+            "the special page counted nothing out"
+        );
+        assert_eq!(pt.resident_peak_bytes(), 3 * PAGE_SIZE);
+        pt.restart_resident_peak();
+        assert_eq!(pt.resident_peak_bytes(), 0);
     }
 }

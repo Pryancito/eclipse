@@ -146,6 +146,7 @@ fn the_file_has_linux_s_lines_in_linux_s_order() {
             "Kthread",
             "VmPeak",
             "VmSize",
+            "VmHWM",
             "VmRSS",
             "VmData",
             "VmStk",
@@ -574,6 +575,50 @@ fn vmsize_is_in_kilobytes_of_1024() {
         .unwrap();
 
     assert_eq!(kb(&proc_pid_status(&proc)) - before, 1024);
+}
+
+/// `VmHWM:` is the most that has been resident, Linux's `hiwater_rss`: it
+/// climbs with every page the process touches and is still there after the
+/// memory is given back, where `VmRSS:` falls. It was not written at all, so
+/// `grep VmHWM` -- how a test harness or a build tool reads a process's peak
+/// memory -- found nothing.
+#[test]
+fn vmhwm_holds_the_resident_peak_after_the_memory_is_gone() {
+    use zircon_object::vm::{MMUFlags, VmObject};
+    const PAGES: usize = 64;
+    let (_job, proc, _thread) = a_process(45_387);
+    let kb = |status: &str, key: &str| -> u64 {
+        line(status, key)
+            .and_then(|v| v.trim().strip_suffix("kB"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap()
+    };
+    let vmar = proc.vmar();
+    // Touched by hand, so the pages are resident whether or not the build
+    // maps eagerly; at an address no other test in the binary uses, because
+    // libos keeps every test's pages in the one host address space.
+    let rw = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+    let addr = vmar
+        .map(
+            Some(0x3_7000_0000),
+            VmObject::new_paged(PAGES),
+            0,
+            PAGES * 4096,
+            rw,
+        )
+        .unwrap();
+    for i in 0..PAGES {
+        vmar.handle_page_fault(addr + i * 4096, MMUFlags::WRITE | MMUFlags::USER)
+            .unwrap();
+    }
+    let touched = proc_pid_status(&proc);
+    assert_eq!(kb(&touched, "VmRSS"), 256, "{:?}", touched);
+    assert_eq!(kb(&touched, "VmHWM"), 256, "{:?}", touched);
+
+    vmar.unmap(addr, PAGES * 4096).unwrap();
+    let after = proc_pid_status(&proc);
+    assert_eq!(kb(&after, "VmRSS"), 0, "{:?}", after);
+    assert_eq!(kb(&after, "VmHWM"), 256, "the peak stays: {:?}", after);
 }
 
 /// Each `Cap*:` line is its own set: capset, a bounding-set drop and an

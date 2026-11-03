@@ -120,6 +120,10 @@ impl From<PTF> for MMUFlags {
 
 const PHYS_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000; // 12..52
 
+/// [`MMUFlags::SPECIAL`] in the entry: bit 9, one of the three (9..11) the
+/// SDM leaves to software in every paging-structure entry.
+const SPECIAL: u64 = PTF::BIT_9.bits();
+
 /// Page table entry on x86.
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -156,6 +160,23 @@ impl GenericPTE for X86PTE {
 
     fn set_dirty(&mut self) {
         self.0 |= PTF::DIRTY.bits();
+    }
+
+    fn is_special(&self) -> bool {
+        self.0 & SPECIAL != 0
+    }
+
+    /// Atomic for the same reason [`Self::set_flags`] is: the entry may be
+    /// live, and a plain read-modify-write would lose a dirty bit the CPU
+    /// set in between.
+    fn set_special(&mut self, special: bool) {
+        // SAFETY: as in `set_flags`.
+        let cell = unsafe { &*(self as *mut Self as *const AtomicU64) };
+        if special {
+            cell.fetch_or(SPECIAL, Ordering::AcqRel);
+        } else {
+            cell.fetch_and(!SPECIAL, Ordering::AcqRel);
+        }
     }
 
     fn set_addr(&mut self, paddr: PhysAddr) {
@@ -199,7 +220,11 @@ impl GenericPTE for X86PTE {
         // Carrying a stale D onto an entry that was just repointed can only
         // over-report, which costs stores, and nothing else in the kernel
         // reads either bit.
-        const HW: u64 = PTF::ACCESSED.bits() | PTF::DIRTY.bits();
+        //
+        // The SPECIAL mark is carried the same way, though no hardware writes
+        // it: it says what kind of memory the entry maps, which a change of
+        // permissions does not change.
+        const HW: u64 = PTF::ACCESSED.bits() | PTF::DIRTY.bits() | SPECIAL;
         // SAFETY: `X86PTE` is a `repr(transparent)` `u64`, so an `AtomicU64`
         // describes the same object with the same layout; `&mut self` is
         // exclusive as far as Rust is concerned, and the CPU -- which is the

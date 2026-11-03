@@ -3,6 +3,7 @@ use core::cell::UnsafeCell;
 
 pub(crate) mod page_table;
 pub(crate) mod pte;
+pub(crate) mod resident;
 
 #[cfg(test)]
 pub(crate) mod test_frames;
