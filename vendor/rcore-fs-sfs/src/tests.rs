@@ -1161,3 +1161,122 @@ fn fsck_image() {
     );
     std::mem::forget(sfs);
 }
+
+/// The name index must answer exactly what a scan of the entries answers,
+/// through creates, unlinks, renames, moves and replacing renames.
+#[test]
+fn dir_index_agrees_with_a_scan() -> Result<()> {
+    let sfs = _create_new_sfs();
+    let root = sfs.root_inode();
+    root.create("a", FileType::Dir, 0o755)?;
+    root.create("b", FileType::Dir, 0o755)?;
+    let mut seed: u64 = 0x9e3779b97f4a7c15;
+    let mut rnd = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    for _ in 0..3000 {
+        // Fresh handles each round: the directories' INodeImpls are dropped
+        // and reloaded, so the index also has to survive being parked.
+        let dirs = [root.find("a")?, root.find("b")?];
+        let d = &dirs[rnd(2) as usize];
+        let name = std::format!("f{}", rnd(60));
+        match rnd(4) {
+            0 => {
+                let _ = d.create(&name, FileType::File, 0o644);
+            }
+            1 => {
+                let _ = d.unlink(&name);
+            }
+            2 => {
+                let to = &dirs[rnd(2) as usize];
+                let _ = d.move_(&name, to, &std::format!("f{}", rnd(60)));
+            }
+            _ => {
+                let _ = d.find(&name);
+            }
+        }
+        for dir in dirs.iter() {
+            let imp = dir.downcast_ref::<INodeImpl>().unwrap();
+            for i in 0..60 {
+                let n = std::format!("f{}", i);
+                assert_eq!(
+                    imp.get_file_inode_and_entry_id(&n),
+                    imp.scan_for_entry(&n),
+                    "{}",
+                    n
+                );
+            }
+            for n in [".", ".."] {
+                assert_eq!(imp.get_file_inode_and_entry_id(n), imp.scan_for_entry(n));
+            }
+        }
+    }
+    sfs.sync()?;
+    Ok(())
+}
+
+struct RamDev(spin::RwLock<std::vec::Vec<u8>>);
+impl rcore_fs::dev::Device for RamDev {
+    fn read_at(&self, off: usize, buf: &mut [u8]) -> rcore_fs::dev::Result<usize> {
+        let v = self.0.read();
+        let n = buf.len().min(v.len().saturating_sub(off));
+        buf[..n].copy_from_slice(&v[off..off + n]);
+        Ok(n)
+    }
+    fn write_at(&self, off: usize, buf: &[u8]) -> rcore_fs::dev::Result<usize> {
+        let mut v = self.0.write();
+        let n = buf.len().min(v.len().saturating_sub(off));
+        v[off..off + n].copy_from_slice(&buf[..n]);
+        Ok(n)
+    }
+    fn sync(&self) -> rcore_fs::dev::Result<()> {
+        Ok(())
+    }
+}
+
+/// `find` timing on a real image held in RAM: `SFS_IMG=img cargo test --release
+/// -p rcore-fs-sfs --features std find_cost_on_image -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn find_cost_on_image() {
+    let img = std::fs::read(std::env::var("SFS_IMG").unwrap()).unwrap();
+    let sfs = SimpleFileSystem::open(Arc::new(RamDev(spin::RwLock::new(img)))).unwrap();
+    let root = sfs.root_inode();
+    for dir in ["", "bin", "etc", "lib", "usr", "sbin"] {
+        let d = if dir.is_empty() {
+            root.clone()
+        } else {
+            match root.lookup(dir) {
+                Ok(d) => d,
+                Err(_) => continue,
+            }
+        };
+        let n = d.metadata().unwrap().size;
+        let names: std::vec::Vec<_> = (0..).map_while(|i| d.get_entry(i).ok()).collect();
+        let n = names.len();
+        let _ = n;
+        let last = names.last().unwrap().clone();
+        let first = names[2].clone();
+        let iters = 2000;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = d.find(&last).unwrap();
+        }
+        let tl = t.elapsed().as_nanos() as f64 / iters as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = d.find(&first).unwrap();
+        }
+        let tf = t.elapsed().as_nanos() as f64 / iters as f64;
+        std::println!(
+            "/{:<10} {:5} entries  find(first) {:8.0} ns  find(last) {:8.0} ns",
+            dir,
+            n,
+            tf,
+            tl
+        );
+    }
+}

@@ -80,6 +80,14 @@ pub struct INodeImpl {
     /// writer's data, and two such truncates racing freed the same blocks
     /// twice (`assertion failed: !free_map[block_id]`).
     resize_lock: Mutex<()>,
+    /// Directories only: name -> entry slot, built on the first lookup and
+    /// kept up to date by `write_direntry`/`remove_direntry`. A lookup used
+    /// to read and compare every entry in turn -- 446 of them for `/bin`,
+    /// on every `exec` that searches `PATH`. A hit is checked against the
+    /// slot it names, so a stale index costs a rebuild, never a wrong
+    /// answer; a miss is trusted, so every write of a slot goes through
+    /// here (or drops the index, as `link_inodeimpl` does).
+    dir_index: RwLock<Option<BTreeMap<String, usize>>>,
 }
 
 impl Debug for INodeImpl {
@@ -177,10 +185,58 @@ impl INodeImpl {
     }
     /// Only for Dir
     fn get_file_inode_and_entry_id(&self, name: &str) -> Option<(INodeId, usize)> {
+        for _ in 0..2 {
+            let slot = {
+                let index = self.dir_index.read();
+                match index.as_ref() {
+                    Some(map) => map.get(name).copied(),
+                    None => {
+                        drop(index);
+                        self.build_dir_index();
+                        continue;
+                    }
+                }
+            };
+            let slot = slot?;
+            if let Ok(entry) = self.read_direntry(slot) {
+                if slot < self.disk_inode.read().size as usize / DIRENT_SIZE
+                    && entry.name.as_ref() == name
+                {
+                    return Some((entry.id as INodeId, slot));
+                }
+            }
+            // The index named a slot that holds something else: rebuild.
+            *self.dir_index.write() = None;
+        }
+        self.scan_for_entry(name)
+    }
+    /// The lookup without the index: every entry, in order.
+    fn scan_for_entry(&self, name: &str) -> Option<(INodeId, usize)> {
         (0..self.disk_inode.read().size as usize / DIRENT_SIZE)
             .map(|i| (self.read_direntry(i as usize).unwrap(), i))
             .find(|(entry, _)| entry.name.as_ref() == name)
             .map(|(entry, id)| (entry.id as INodeId, id as usize))
+    }
+    /// Read the whole directory once and index it. The first slot holding a
+    /// name wins, as it does for `scan_for_entry`.
+    fn build_dir_index(&self) {
+        let mut index = self.dir_index.write();
+        if index.is_some() {
+            return;
+        }
+        let size = self.disk_inode.read().size as usize;
+        let count = size / DIRENT_SIZE;
+        let mut raw = vec![0u8; count * DIRENT_SIZE];
+        if self._read_at(0, &mut raw) != Ok(raw.len()) {
+            return;
+        }
+        let mut map = BTreeMap::new();
+        for (slot, chunk) in raw.chunks_exact(DIRENT_SIZE).enumerate() {
+            let mut entry: DiskEntry = unsafe { uninit_memory() };
+            entry.as_buf_mut().copy_from_slice(chunk);
+            map.entry(String::from(entry.name.as_ref())).or_insert(slot);
+        }
+        *index = Some(map);
     }
     fn get_file_inode_id(&self, name: &str) -> Option<INodeId> {
         self.get_file_inode_and_entry_id(name)
@@ -213,14 +269,39 @@ impl INodeImpl {
         Ok(direntry)
     }
     fn write_direntry(&self, id: usize, direntry: &DiskEntry) -> vfs::Result<()> {
-        self._write_at(DIRENT_SIZE * id, direntry.as_buf())?;
+        self.write_direntry_slot(id, direntry, false)
+    }
+    /// `fresh`: the slot was just added by a resize and holds no name yet
+    /// (its bytes may not even be on the device), so there is nothing to
+    /// unindex.
+    fn write_direntry_slot(&self, id: usize, direntry: &DiskEntry, fresh: bool) -> vfs::Result<()> {
+        let mut index = self.dir_index.write();
+        if !fresh && index.is_some() && id < self.disk_inode.read().size as usize / DIRENT_SIZE {
+            let old = self.read_direntry(id)?;
+            let map = index.as_mut().unwrap();
+            if map.get(old.name.as_ref()) == Some(&id) {
+                map.remove(old.name.as_ref());
+            }
+        }
+        if let Err(e) = self._write_at(DIRENT_SIZE * id, direntry.as_buf()) {
+            *index = None;
+            return Err(e);
+        }
+        if let Some(map) = index.as_mut() {
+            let slot = map
+                .entry(String::from(direntry.name.as_ref()))
+                .or_insert(id);
+            if *slot > id {
+                *slot = id;
+            }
+        }
         Ok(())
     }
     fn append_direntry(&self, direntry: &DiskEntry) -> vfs::Result<()> {
         let size = self.disk_inode.read().size as usize;
         let dirent_count = size / DIRENT_SIZE;
         self._resize(size + DIRENT_SIZE)?;
-        self.write_direntry(dirent_count, direntry)?;
+        self.write_direntry_slot(dirent_count, direntry, true)?;
         Ok(())
     }
     /// remove a direntry in middle of file and insert the last one here, useful for direntry remove
@@ -231,8 +312,18 @@ impl INodeImpl {
         debug_assert!(id < dirent_count);
         let last_dirent = self.read_direntry(dirent_count - 1)?;
         self.write_direntry(id, &last_dirent)?;
-        self._resize(size - DIRENT_SIZE)?;
-        Ok(())
+        let resized = self._resize(size - DIRENT_SIZE);
+        // The last slot is gone; whatever name the index still points there
+        // (only when `id` WAS the last slot) goes with it.
+        let mut index = self.dir_index.write();
+        if resized.is_err() {
+            *index = None;
+        } else if let Some(map) = index.as_mut() {
+            if map.get(last_dirent.name.as_ref()) == Some(&(dirent_count - 1)) {
+                map.remove(last_dirent.name.as_ref());
+            }
+        }
+        resized
     }
     /// Resize content size, no matter what type it is.
     fn _resize(&self, len: usize) -> vfs::Result<()> {
@@ -500,6 +591,7 @@ impl INodeImpl {
             name: Str256::from(name),
         };
         let old_size = self.disk_inode.read().size as usize;
+        *self.dir_index.write() = None;
         self._resize(old_size + BLKSIZE)?;
         self._write_at(old_size, entry.as_buf()).unwrap();
         child.nlinks_inc();
@@ -907,6 +999,12 @@ impl Drop for INodeImpl {
             self._resize(0).unwrap();
             self.disk_inode.write().sync();
             self.fs.free_block(self.id);
+        } else if let Some(index) = self.dir_index.write().take() {
+            let mut parked = self.fs.parked_dir_indexes.lock();
+            if parked.len() >= MAX_PARKED_DIR_INDEXES {
+                parked.pop_first();
+            }
+            parked.insert(self.id, index);
         }
         // Only now is the inode on disk final, so only now may `get_inode`
         // load it again: until this entry goes away it waits (see there).
@@ -925,6 +1023,11 @@ impl Drop for INodeImpl {
 /// 为了方便协调外部及INode对SFS的访问，并为日后并行化做准备，
 /// 将SFS设置为内部可变，即对外接口全部是&self，struct的全部field用RwLock包起来
 /// 这样其内部各field均可独立访问
+/// Directory indexes kept for dropped `INodeImpl`s; the oldest inode id goes
+/// first past this. A few hundred directories is every directory a typical
+/// root has, at a few tens of bytes per name.
+const MAX_PARKED_DIR_INDEXES: usize = 256;
+
 pub struct SimpleFileSystem {
     /// on-disk superblock
     super_block: RwLock<Dirty<SuperBlock>>,
@@ -932,6 +1035,14 @@ pub struct SimpleFileSystem {
     free_map: RwLock<Dirty<BitVec<Lsb0, u8>>>,
     /// inode list
     inodes: RwLock<BTreeMap<INodeId, Weak<INodeImpl>>>,
+    /// Name indexes of directories whose `INodeImpl` was dropped, by inode.
+    /// Nothing keeps a directory's `INodeImpl` alive between two path walks
+    /// once the path cache is invalidated, so an index that lived only in
+    /// the `INodeImpl` was rebuilt -- the whole directory read and parsed --
+    /// on nearly every cold lookup, which cost more than the scan it
+    /// replaced. `Drop` parks it here and the next load takes it back; the
+    /// two cannot overlap, since `get_inode` waits for a `Drop` in progress.
+    parked_dir_indexes: Mutex<BTreeMap<INodeId, BTreeMap<String, usize>>>,
     /// device
     device: Arc<dyn Device>,
     /// What every inode of it reports as `st_dev`: [`vfs::anon_dev`], since
@@ -990,6 +1101,7 @@ impl SimpleFileSystem {
             super_block: RwLock::new(Dirty::new(super_block)),
             free_map: RwLock::new(Dirty::new(BitVec::from_vec(freemap_disk))),
             inodes: RwLock::new(BTreeMap::new()),
+            parked_dir_indexes: Mutex::new(BTreeMap::new()),
             device,
             dev: vfs::anon_dev(),
             self_ptr: Weak::default(),
@@ -1024,6 +1136,7 @@ impl SimpleFileSystem {
             super_block: RwLock::new(Dirty::new_dirty(super_block)),
             free_map: RwLock::new(Dirty::new_dirty(free_map)),
             inodes: RwLock::new(BTreeMap::new()),
+            parked_dir_indexes: Mutex::new(BTreeMap::new()),
             device,
             dev: vfs::anon_dev(),
             self_ptr: Weak::default(),
@@ -1152,6 +1265,7 @@ impl SimpleFileSystem {
     /// Create a new INode struct, then insert it to self.inodes
     /// Private used for load or create INode
     fn _new_inode(&self, id: INodeId, disk_inode: Dirty<DiskINode>) -> Arc<INodeImpl> {
+        self.parked_dir_indexes.lock().remove(&id);
         let device_inode_id = disk_inode.device_inode_id;
         let inode = Arc::new(INodeImpl {
             id,
@@ -1159,6 +1273,7 @@ impl SimpleFileSystem {
             fs: self.self_ptr.upgrade().unwrap(),
             device_inode_id,
             resize_lock: Mutex::new(()),
+            dir_index: RwLock::new(None),
         });
         self.inodes.write().insert(id, Arc::downgrade(&inode));
         inode
@@ -1211,12 +1326,14 @@ impl SimpleFileSystem {
         }
         let disk_inode = Dirty::new(self.device.load_struct::<DiskINode>(id).unwrap());
         let device_inode_id = disk_inode.device_inode_id;
+        let dir_index = self.parked_dir_indexes.lock().remove(&id);
         let inode = Arc::new(INodeImpl {
             id,
             disk_inode: RwLock::new(disk_inode),
             fs: self.self_ptr.upgrade().unwrap(),
             device_inode_id,
             resize_lock: Mutex::new(()),
+            dir_index: RwLock::new(dir_index),
         });
         inodes.insert(id, Arc::downgrade(&inode));
         inode
