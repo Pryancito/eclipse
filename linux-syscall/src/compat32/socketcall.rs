@@ -50,9 +50,9 @@
 //! pointer in the block, not from the block --- and `recv` on a descriptor
 //! that was not a socket blocked for ever.
 //!
-//! ## Which twelve are wired, and why the other eight are not
+//! ## All twenty, and what each one's conversion rests on
 //!
-//! Wired, because every argument is a scalar, a byte buffer, a `socklen_t`
+//! Twelve need none, because every argument is a scalar, a byte buffer, a `socklen_t`
 //! (a `u32` in both ABIs) or a `struct sockaddr` (a `u16` family and bytes,
 //! with no pointer and no `long` in it, so the same in both):
 //!
@@ -62,16 +62,17 @@
 //! those two syscalls --- so they go to `sendto` and `recvfrom` with a null
 //! address, which is what Linux's `__sys_sendto` does with them too.)
 //!
-//! Left out, each for a reason that is about a structure and not about this
-//! file:
+//! **`setsockopt`(14) and `getsockopt`(15)** are wired too, and they are the
+//! only two whose conversion is not a property of the call at all: `optval`
+//! is a byte buffer for most options and a **structure** for some, and which
+//! one it is depends on `optname`. `SO_RCVTIMEO` and `SO_SNDTIMEO` take a
+//! `struct timeval`, eight bytes to a 32-bit caller against sixteen here, so
+//! they take a per-option table --- [`crate::narrow::sockopt`], asked by both
+//! directions --- rather than a conversion the call can carry.
 //!
-//! - **`setsockopt`(14) and `getsockopt`(15)**: their `optval` is a byte
-//!   buffer for most options and a **structure** for some, and which one it
-//!   is depends on `optname`. `SO_RCVTIMEO` and `SO_SNDTIMEO` take a
-//!   `struct timeval`, which is half the width here (see [`crate::narrow`]),
-//!   so wiring these two would quietly read sixteen bytes of a caller's
-//!   eight-byte timeout. They need a per-option table, which is its own
-//!   piece of work.
+//! **With those two, all twenty are wired.** The remaining gaps are inside
+//! handlers and are not ABI ones; the `recvmmsg` timeout below is the one
+//! worth naming.
 //!
 //! And **`sendmsg`(16), `recvmsg`(17), `recvmmsg`(19) and `sendmmsg`(20)** are
 //! wired, for the same reason `readv` and `writev` are: the conversion lives
@@ -251,6 +252,14 @@ impl Syscall<'_> {
                     .await
             }
             13 => self.sys_shutdown(a[0], a[1]),
+            // The option value is converted by asking the process its width
+            // AND the option its shape, because `optval` is a byte buffer
+            // whose meaning depends on `optname`: `SO_RCVTIMEO` is a
+            // `struct timeval`, eight bytes to this caller and sixteen here,
+            // and almost everything else is an `int` and the same in both.
+            // One table, both directions: [`crate::narrow::sockopt`].
+            14 => self.sys_setsockopt(a[0], a[1], a[2], a[3].into(), a[4]),
+            15 => self.sys_getsockopt(a[0], a[1], a[2], a[3].into(), a[4].into()),
             // The envelope and the control messages inside it are converted
             // by asking the process its width ([`crate::narrow::msghdr`]), so these
             // two are the native handlers unchanged, like `readv`/`writev`.
