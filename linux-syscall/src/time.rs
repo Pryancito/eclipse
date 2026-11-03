@@ -700,6 +700,10 @@ impl Syscall<'_> {
     /// (`Process::cpu_time_ns`) or of its thread ([`thread_cpu_ns`]), and
     /// `RUSAGE_CHILDREN` the reaped children's totals; `ru_nvcsw` and
     /// `ru_nivcsw` the context switches of the same tasks, which were 0.
+    /// `ru_maxrss` is the process's peak resident size for `RUSAGE_SELF` and
+    /// for `RUSAGE_THREAD` alike, as Linux's is, since the memory is the
+    /// process's; for `RUSAGE_CHILDREN`, the largest of the reaped children's.
+    /// It was 0.
     /// The previous implementation wrote the wall-clock time-since-boot into
     /// both fields, which made any "CPU used" computation (`time(1)`, build
     /// systems' self-profiling) nonsense.
@@ -717,6 +721,7 @@ impl Syscall<'_> {
                     proc.cpu_time_ns(),
                     proc.context_switches(),
                     proc.minor_faults(),
+                    proc.peak_resident_bytes() as u64,
                 )
             }
             RusageWho::Thread => {
@@ -725,6 +730,7 @@ impl Syscall<'_> {
                     thread_cpu_ns(thread),
                     thread.context_switches(),
                     thread.minor_faults(),
+                    self.zircon_process().peak_resident_bytes() as u64,
                 )
             }
             // Totals of children this process has reaped, accumulated at
