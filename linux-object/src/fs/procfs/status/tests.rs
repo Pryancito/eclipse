@@ -262,7 +262,7 @@ fn the_signal_masks_are_the_process_s_and_the_task_s() {
     let lp = proc.linux();
     lp.set_signal_action(Signal::SIGINT, handler(SIG_IGN));
     lp.set_signal_action(Signal::SIGTERM, handler(0x1234));
-    lp.queue_shared_signal(Signal::SIGUSR2, None);
+    lp.queue_shared_signal(Signal::SIGUSR2, None).unwrap();
     {
         let mut lt = thread.lock_linux();
         let mut mask = Sigset::default();
@@ -283,10 +283,12 @@ fn the_signal_masks_are_the_process_s_and_the_task_s() {
     assert_eq!(line(&status, "SigCgt"), Some("0000000000004000"));
 }
 
-/// `SigQ:` counts what is pending for every task of the real user, and the
-/// limit is that user's `RLIMIT_SIGPENDING`, unlimited until somebody sets it.
+/// `SigQ:` counts the entries queued for every task of the real user, as
+/// Linux counts them while it queues: a standard signal sent twice is one, a
+/// real-time one sent twice is two. The limit is the process's
+/// `RLIMIT_SIGPENDING`, which starts at half of `max_threads`.
 #[test]
-fn the_signal_queue_is_the_user_s() {
+fn the_signal_queue_is_the_user_s_entries() {
     let uid = 45_375;
     let (job, proc, thread) = a_process(45_375);
     let (_other_job, other, _) = a_process(45_376);
@@ -301,18 +303,31 @@ fn the_signal_queue_is_the_user_s() {
         .linux()
         .set_resuid(uid + 1, uid + 1, uid + 1)
         .unwrap();
-    stranger.linux().queue_shared_signal(Signal::SIGUSR1, None);
+    stranger
+        .linux()
+        .queue_shared_signal(Signal::SIGUSR1, None)
+        .unwrap();
+    let to = proc.linux().signal_receiver();
     {
         let mut lt = thread.lock_linux();
-        lt.signals.insert(Signal::SIGUSR1);
-        lt.signals.insert(Signal::SIGUSR2);
+        for signal in [
+            Signal::SIGUSR1,
+            Signal::SIGUSR1,
+            Signal::SIGRT40,
+            Signal::SIGRT40,
+        ] {
+            lt.send_signal(signal, None, Some(to)).unwrap();
+        }
     }
-    other.linux().queue_shared_signal(Signal::SIGUSR2, None);
-    assert_eq!(signals_pending_for_user_in(&job, uid), 2, "one job's");
+    other
+        .linux()
+        .queue_shared_signal(Signal::SIGUSR2, None)
+        .unwrap();
+    let limit = crate::process::default_sigpending_limit(kernel_hal::mem::memory_usage().1);
     let status = proc_pid_status(&proc);
     assert_eq!(
         line(&status, "SigQ"),
-        Some("3/18446744073709551615"),
+        Some(alloc::format!("4/{}", limit).as_str()),
         "{:?}",
         status
     );
@@ -320,6 +335,10 @@ fn the_signal_queue_is_the_user_s() {
     proc.linux()
         .rlimit(crate::process::RLIMIT_SIGPENDING, Some(limit), false)
         .unwrap();
+    let status = proc_pid_status(&proc);
+    assert_eq!(line(&status, "SigQ"), Some("4/100"), "{:?}", status);
+    // Taken, and given back.
+    thread.lock_linux().take_siginfo(Signal::SIGRT40);
     let status = proc_pid_status(&proc);
     assert_eq!(line(&status, "SigQ"), Some("3/100"), "{:?}", status);
 }

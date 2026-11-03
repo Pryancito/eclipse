@@ -6,11 +6,10 @@ use crate::{
     ipc::*,
     loader::AuxIdentity,
     net::SOCKET_FD,
-    signal::{SigInfo, Signal as LinuxSignal, SignalAction, Sigset},
+    signal::{queue::SigQueue, SigInfo, Signal as LinuxSignal, SignalAction, Sigset},
 };
 use alloc::{
     boxed::Box,
-    collections::BTreeMap,
     string::String,
     sync::{Arc, Weak},
     vec,
@@ -400,7 +399,10 @@ impl ProcessExt for Process {
                             inner.cloexec_fds.clear();
                             inner.semaphores = Default::default();
                             let shm = core::mem::take(&mut inner.shm_identifiers);
-                            (files, shm, futexes, leader)
+                            // And what waited on it, given back to its users.
+                            inner.shared_pending = Sigset::empty();
+                            let sigq = core::mem::take(&mut inner.shared_queue);
+                            (files, shm, futexes, leader, sigq)
                         };
                         drop(dropped);
                     }
@@ -804,7 +806,10 @@ impl NewChild for Process {
                             inner.cloexec_fds.clear();
                             inner.semaphores = Default::default();
                             let shm = core::mem::take(&mut inner.shm_identifiers);
-                            (files, shm, futexes, leader)
+                            // And what waited on it, given back to its users.
+                            inner.shared_pending = Sigset::empty();
+                            let sigq = core::mem::take(&mut inner.shared_queue);
+                            (files, shm, futexes, leader, sigq)
                         };
                         drop(dropped);
                         // Only now may a `wait*` take it (`exit_handover`).
@@ -1448,8 +1453,8 @@ struct LinuxProcessInner {
     /// first tid left the signal stuck there forever when that thread kept
     /// it masked and another later unmasked it.
     shared_pending: Sigset,
-    /// `siginfo_t` for bits in [`Self::shared_pending`].
-    shared_pending_info: BTreeMap<u8, SigInfo>,
+    /// The entries of [`Self::shared_pending`]: see `SigQueue`.
+    shared_queue: SigQueue,
     /// Exit signal delivered to the parent when this process dies
     /// (`clone`'s CSIGNAL / `clone3.exit_signal`). Default `SIGCHLD`.
     exit_signal: u8,
@@ -1662,7 +1667,13 @@ pub struct RLimits([RLimit; RLIM_NLIMITS]);
 
 impl Default for RLimits {
     fn default() -> Self {
-        RLimits(INIT_RLIMITS)
+        let mut table = INIT_RLIMITS;
+        let sigpending = default_sigpending_limit(kernel_hal::mem::memory_usage().1);
+        table[RLIMIT_SIGPENDING] = RLimit {
+            cur: sigpending,
+            max: sigpending,
+        };
+        RLimits(table)
     }
 }
 
@@ -1683,10 +1694,11 @@ impl RLimits {
 /// `INIT_RLIMITS` (`include/asm-generic/resource.h`), one row per resource in
 /// the order above.
 ///
-/// One deliberate departure: `RLIMIT_NPROC` and `RLIMIT_SIGPENDING` are
-/// `{0, 0}` in Linux because `init` overwrites them from `max_threads` before
-/// any userspace runs. This kernel has no `max_threads` to take them from, so
-/// they start unlimited (`RLIMIT_NPROC` is held once somebody sets it).
+/// `RLIMIT_NPROC` and `RLIMIT_SIGPENDING` are `{0, 0}` in Linux because
+/// `init` overwrites them from `max_threads` before any userspace runs.
+/// `RLIMIT_SIGPENDING` is taken from memory the same way (see
+/// [`default_sigpending_limit`]); `RLIMIT_NPROC` starts unlimited, a
+/// departure (it is held once somebody sets it).
 ///
 /// What a process used to get was [`RLimit::default`] -- 1024/1024 -- for the
 /// one limit that existed. The soft limit is unchanged; the hard one becomes
@@ -3963,32 +3975,19 @@ impl LinuxProcess {
         self.inner.lock().exit_signal = sig;
     }
 
-    /// Queue a process-directed signal that every thread currently has blocked.
-    pub fn queue_shared_signal(&self, signal: LinuxSignal, info: Option<SigInfo>) {
-        let mut inner = self.inner.lock();
-        inner.shared_pending.insert(signal);
-        if let Some(info) = info {
-            inner
-                .shared_pending_info
-                .entry(signal as u8)
-                .or_insert(info);
-        }
-        self.refresh_exit_path(&inner);
-    }
-
     /// Throw away those of `set` waiting on the process, with their
     /// `siginfo_t`: the stops a `SIGCONT` cancels, and the continue a stop
     /// does (`prepare_signal` flushes `shared_pending` as well as each
     /// thread's).
     pub fn discard_shared_signals(&self, set: Sigset) {
-        let mut inner = self.inner.lock();
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
         let mut rest = Sigset::new(inner.shared_pending.val() & set.val());
         while let Some(signal) = rest.find_first_signal() {
             rest.remove(signal);
-            inner.shared_pending.remove(signal);
-            inner.shared_pending_info.remove(&(signal as u8));
+            (inner.shared_queue).discard(&mut inner.shared_pending, signal);
         }
-        self.refresh_exit_path(&inner);
+        self.refresh_exit_path(&guard);
     }
 
     /// Process-directed signals not yet pulled onto any thread (`shared_pending`).
@@ -4027,7 +4026,8 @@ impl LinuxProcess {
         if self.exit_path.shared_pending_bits.load(Ordering::Acquire) == 0 {
             return;
         }
-        let mut inner = self.inner.lock();
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
         if inner.shared_pending.is_empty() {
             return;
         }
@@ -4035,12 +4035,10 @@ impl LinuxProcess {
         while let Some(sig) = rest.find_first_signal() {
             rest.remove(sig);
             if lt.wants_signal(sig) {
-                inner.shared_pending.remove(sig);
-                let info = inner.shared_pending_info.remove(&(sig as u8));
-                lt.queue_signal(sig, info);
+                lt.absorb_signal(&mut inner.shared_queue, &mut inner.shared_pending, sig);
             }
         }
-        self.refresh_exit_path(&inner);
+        self.refresh_exit_path(&guard);
     }
 
     /// Close file that FD_CLOEXEC is set
@@ -4673,7 +4671,7 @@ impl LinuxProcessInner {
             // Process-directed pending set and exit signal are per-process
             // state of the *new* task, not a copy of the parent's queues.
             shared_pending: Sigset::default(),
-            shared_pending_info: BTreeMap::new(),
+            shared_queue: SigQueue::default(),
             exit_signal: LinuxSignal::SIGCHLD as u8,
         }
     }
@@ -5407,17 +5405,16 @@ pub fn set_signal_action_in(process: &Arc<Process>, signal: LinuxSignal, action:
     if !discards_when_pending(action.handler, signal) {
         return;
     }
+    let mut set = Sigset::empty();
+    set.insert(signal);
     if let Some(lp) = process.try_linux() {
-        let mut inner = lp.inner.lock();
-        inner.shared_pending.remove(signal);
-        inner.shared_pending_info.remove(&(signal as u8));
-        lp.refresh_exit_path(&inner);
+        lp.discard_shared_signals(set);
     }
     for thread in process.threads() {
+        // Thrown away, not taken: taking it made it the signal a running
+        // handler's `sigreturn` compares its frame against.
         if let Some(mut lt) = thread.try_lock_linux() {
-            if lt.signals.contains(signal) {
-                lt.take_siginfo(signal);
-            }
+            lt.discard_signal(signal);
         }
     }
 }
@@ -6189,130 +6186,8 @@ pub fn pending_after_send(mut pending: Sigset, signal: LinuxSignal) -> Sigset {
     pending
 }
 
-/// `prepare_signal()`: a stop and a continue cancel each other where they are
-/// waiting to be received, so a process never carries both and the last one
-/// sent is the one that decides.
-///
-/// Process-wide whoever the signal was aimed at, because the state it touches
-/// is: Linux's `prepare_signal` reaches the shared `task->signal`, so a
-/// `SIGCONT` aimed at one thread flushes the pending stop of the whole group.
-/// The thread-directed path did not call this at all -- see
-/// [`complete_signal_for_job_control`].
-///
-/// The process's own pending set too, where a signal every thread blocks
-/// waits: only the threads' were flushed, so a `SIGTSTP` blocked when a
-/// `SIGCONT` came still stopped the process once it was unblocked. And each
-/// signal goes with its `siginfo_t`, which stayed behind for the next one
-/// of that number to be reported with.
-pub fn prepare_signal(process: &Arc<Process>, signal: LinuxSignal) {
-    use crate::thread::ThreadExt;
-    let all = Sigset::new(u64::MAX);
-    let cancelled = Sigset::new(!pending_after_send(all, signal).val());
-    if cancelled.is_empty() {
-        return;
-    }
-    if let Some(lp) = process.try_linux() {
-        lp.discard_shared_signals(cancelled);
-    }
-    for thread in process.threads() {
-        if let Some(mut lt) = thread.try_lock_linux() {
-            lt.discard_signals(cancelled);
-        }
-    }
-}
-
-pub fn send_signal_to_process(pid: usize, signal: LinuxSignal) -> LxResult<()> {
-    send_signal_to_process_with_info(pid, signal, None)
-}
-
-/// [`send_signal_to_process`], with the `siginfo_t` the handler will be
-/// handed: who sent a `kill`, which child a `SIGCHLD` is about. `None` leaves
-/// [`SigInfo::bare`].
-pub fn send_signal_to_process_with_info(
-    pid: usize,
-    signal: LinuxSignal,
-    info: Option<SigInfo>,
-) -> LxResult<()> {
-    use crate::thread::ThreadExt;
-    if let Some(process) = ROOT_JOB.find_process(pid as KoID) {
-        if signal_trace_worthy(signal) {
-            // Who signals whom: a process that exits on a handled SIGTERM/
-            // SIGINT/SIGHUP leaves no other trace (the `[exit]` line only
-            // covers default-disposition deaths), and "labwc/foot vanished
-            // 25 ms after a job started" was otherwise unexplainable.
-            let (spid, sname) = current_process_pid_name();
-            zcore_drivers::klog_warn!(
-                "[signal] {:?} -> pid {} ({}) from pid {} ({})",
-                signal,
-                process.id(),
-                trace_name(&process),
-                spid,
-                sname
-            );
-        }
-        let threads = process.threads();
-        prepare_signal(&process, signal);
-        // Prefer a thread that has the signal *unblocked* — it can act on it
-        // right away — and deliver there.
-        let mut first: Option<Arc<Thread>> = None;
-        for thread in threads {
-            // `wants_signal()` in Linux: never a thread on its way out
-            // (`PF_EXITING`). A dying thread takes no signal again, so one
-            // queued to it is lost -- the SIGTERM that should have ended the
-            // process, sent while a worker was in `pthread_exit`.
-            if is_on_its_way_out(&thread) {
-                continue;
-            }
-            // Peek without holding the guard across a move of `thread`.
-            let delivered = if let Some(mut lt) = thread.try_lock_linux() {
-                // `wants_signal()`: unblocked, or parked in
-                // `rt_sigtimedwait` for exactly this signal.
-                if lt.wants_signal(signal) {
-                    lt.queue_signal(signal, info);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                // Lock held (e.g. PID 1 in waitpid): queue below rather
-                // than dropping the signal — that drop is why lunarbar's
-                // `kill 1` did nothing.
-                false
-            };
-            if delivered {
-                wake_signal_sleeper(&thread);
-                // Wake waitpid(-1): PID 1 blocks on this zircon bit.
-                process.signal_set(Signal::SIGCHLD);
-                wake_for_job_control(&process, signal);
-                return Ok(());
-            }
-            if first.is_none() {
-                first = Some(thread);
-            }
-        }
-        // Every thread has the signal blocked: it must still become *pending*
-        // (POSIX — masking only delays delivery, it does not discard the
-        // signal). Queue it once on `shared_pending` — never also on the first
-        // tid — so a later unblock / sigwait / signalfd pull cannot deliver
-        // the same process-directed signal twice.
-        if first.is_some() {
-            if let Some(lp) = process.try_linux() {
-                lp.queue_shared_signal(signal, info);
-            }
-            // Wake every sleeper: any thread may be the one that pulls next.
-            for t in process.threads() {
-                wake_signal_sleeper(&t);
-            }
-        }
-        // Pulse even when every thread had the Linux signal blocked: waitpid
-        // still needs to return so the waiter can notice the pending set.
-        process.signal_set(Signal::SIGCHLD);
-        wake_for_job_control(&process, signal);
-        Ok(())
-    } else {
-        Err(LxError::ESRCH)
-    }
-}
+mod send_signal;
+pub use send_signal::*;
 
 mod job_stop;
 use job_stop::wake_for_job_control;

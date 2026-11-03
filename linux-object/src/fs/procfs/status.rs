@@ -207,9 +207,12 @@ fn fd_table_size(highest_fd: Option<FileDesc>) -> usize {
 
 /// `SigQ:` to `SigCgt:`, as `task_sig()` writes them.
 ///
-/// `SigQ:` is the signals pending for every task of the process's REAL
-/// user, over that user's `RLIMIT_SIGPENDING` -- proc(5) says the user's,
-/// not the process's. `SigPnd:` and `SigBlk:` are `task`'s own; `ShdPnd:` is
+/// `SigQ:` is the signals queued for every task of the process's REAL user,
+/// as Linux counts them while it queues (one per entry: a standard signal
+/// sent twice is one, a real-time one sent twice is two, a POSIX timer is
+/// one for its whole life), over the process's `RLIMIT_SIGPENDING` --
+/// proc(5) says the user's, not the process's. It used to count pending
+/// BITS, task by task, which never saw a second entry. `SigPnd:` and `SigBlk:` are `task`'s own; `ShdPnd:` is
 /// the process's, the signals sent to it that no thread has taken yet.
 fn signal_lines(out: &mut String, lp: &LinuxProcess, task: Option<&Arc<Thread>>, ruid: u32) {
     let (pending, blocked) = task
@@ -226,7 +229,8 @@ fn signal_lines(out: &mut String, lp: &LinuxProcess, task: Option<&Arc<Thread>>,
     let limit = lp
         .rlimit(crate::process::RLIMIT_SIGPENDING, None, false)
         .map_or(0, |l| l.cur);
-    let _ = writeln!(out, "SigQ:\t{}/{}", signals_pending_for_user(ruid), limit);
+    let queued = crate::signal::queue::queued_for_user(ruid);
+    let _ = writeln!(out, "SigQ:\t{}/{}", queued, limit);
     for (key, set) in [
         ("SigPnd", pending),
         ("ShdPnd", lp.shared_pending()),
@@ -238,30 +242,6 @@ fn signal_lines(out: &mut String, lp: &LinuxProcess, task: Option<&Arc<Thread>>,
         // signal `n` -- the same word `sigset_t` holds.
         let _ = writeln!(out, "{}:\t{:016x}", key, set.val());
     }
-}
-
-/// The first half of `SigQ:`: signals pending on every live task of real
-/// user `uid`, thread-directed and process-directed alike. Linux keeps the
-/// count as it queues and dequeues; this kernel counts when asked.
-fn signals_pending_for_user(uid: u32) -> u64 {
-    signals_pending_for_user_in(&ROOT_JOB, uid)
-}
-
-/// [`signals_pending_for_user`] over one job's subtree, for the tests.
-fn signals_pending_for_user_in(job: &Arc<Job>, uid: u32) -> u64 {
-    crate::process::all_live_processes_in(job)
-        .iter()
-        .filter_map(|proc| {
-            let lp = proc.try_linux().filter(|lp| lp.uid() == uid)?;
-            let threads: u64 = proc
-                .threads()
-                .iter()
-                .filter_map(|t| t.try_lock_linux().map(|lt| lt.get_signal_info().0))
-                .map(|set| u64::from(set.val().count_ones()))
-                .sum();
-            Some(threads + u64::from(lp.shared_pending().val().count_ones()))
-        })
-        .sum()
 }
 
 /// `CapInh:` to `CapAmb:`: the sets the process keeps, the ones `capget(2)`

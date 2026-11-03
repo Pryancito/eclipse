@@ -766,6 +766,11 @@ async fn run_user(thread: CurrentThread) {
     // it clears it -- and after an `exit(2)` the list is already taken, so
     // this is a no-op.
     thread.release_robust_locks();
+    // And what was pending on it dies with it, each entry given back to the
+    // user it was counted against (`flush_sigqueue(&tsk->pending)` in
+    // `__exit_signal`): left to the `Thread` being dropped, a thread object
+    // something still held kept its user's `RLIMIT_SIGPENDING` spent.
+    thread.inner().lock_linux().flush_pending();
     kernel_hal::thread::set_current_thread(None);
 }
 

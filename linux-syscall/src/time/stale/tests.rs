@@ -149,6 +149,7 @@ fn timer_delete_of_another_process_s_timer_is_einval_and_leaves_it() {
     POSIX_TIMERS.lock().insert(
         theirs,
         PosixTimer {
+            _sigq: None,
             owner: 46_727,
             notify: TimerNotify::SIGALRM_TO_PROCESS,
             clock: PosixTimerClock::Base(ClockBase::Monotonic),

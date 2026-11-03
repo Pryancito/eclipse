@@ -10,7 +10,9 @@ use rcore_fs::vfs::{
     FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec, Walked,
 };
 use zircon_object::object::KernelObject;
-use zircon_object::task::{Job, Process, Status, Thread, ThreadState, ROOT_JOB};
+#[cfg(test)]
+use zircon_object::task::Job;
+use zircon_object::task::{Process, Status, Thread, ThreadState, ROOT_JOB};
 
 use super::proc_self::{Held, ProcessLink};
 use crate::process::ProcessExt;

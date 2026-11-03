@@ -15,7 +15,8 @@ use lazy_static::lazy_static;
 use linux_object::error::{LxError, SysResult};
 use linux_object::process::ProcessExt;
 use linux_object::process::{LinuxProcess, RLimit, CAP_SYS_TIME, RLIMIT_CPU, RLIM_INFINITY};
-use linux_object::signal::{SigInfo, Signal};
+use linux_object::signal::queue::Charge;
+use linux_object::signal::{SigInfo, Signal, SignalCode};
 use linux_object::thread::ThreadExt;
 use linux_object::time::*;
 use lock::Mutex;
@@ -950,8 +951,14 @@ impl Syscall<'_> {
             let proc = self.zircon_process();
             timer_notify_from_sigevent(&event, |tid| proc.get_child(tid).is_ok())?
         };
+        // `posixtimer_init_sigqueue()`: the timer's signal entry is counted
+        // against the caller's user for as long as the timer lives, and past
+        // `RLIMIT_SIGPENDING` there is no timer (`EAGAIN`).
+        let sigq = Charge::take(self.linux_process().signal_receiver(), false);
+        let sigq = Some(sigq.ok_or(LxError::EAGAIN)?);
         ensure_posix_timers_die_with_their_owner();
         let timer = PosixTimer {
+            _sigq: sigq,
             owner: self.zircon_process().id(),
             notify,
             clock,
@@ -1343,6 +1350,11 @@ fn timer_notify_from_sigevent(
 
 /// A per-process POSIX interval timer (`timer_create`).
 struct PosixTimer {
+    /// Its signal's entry, counted against its user while it exists; the
+    /// expiries go in uncounted ([`SigQueue::send_timer`]).
+    ///
+    /// [`SigQueue::send_timer`]: linux_object::signal::queue::SigQueue::send_timer
+    _sigq: Option<Charge>,
     /// Owning process KoID; a process may only operate on its own timers.
     owner: KoID,
     /// Where the expiry goes: signal, `si_value`, and which thread.
@@ -1909,14 +1921,18 @@ fn posix_timer_expiry_signal(
 /// looked at: a threaded program with a `SIGALRM` or `SIGPROF` handler ran
 /// it once per thread per expiry, and one `alarm(2)` came back as `EINTR`
 /// in every thread's blocking syscall at once.
+///
+/// A POSIX timer's expiry (`SI_TIMER`, which only this kernel builds here)
+/// goes in the timer's own entry (`posixtimer_send_sigqueue`); an interval
+/// timer's is an ordinary send (`it_real_fn` -> `kill_pid_info`).
 fn deliver_timer_signal(owner: KoID, target: Option<KoID>, signal: Signal, info: SigInfo) {
+    use linux_object::process::{send_signal_to_process_with_info, send_timer_signal_to_process};
     match target {
+        None if info.code == SignalCode::TIMER => {
+            let _ = send_timer_signal_to_process(owner as usize, signal, info);
+        }
         None => {
-            let _ = linux_object::process::send_signal_to_process_with_info(
-                owner as usize,
-                signal,
-                Some(info),
-            );
+            let _ = send_signal_to_process_with_info(owner as usize, signal, Some(info));
         }
         Some(tid) => {
             // The thread may be gone by now: a timer is deleted with its
@@ -1925,7 +1941,7 @@ fn deliver_timer_signal(owner: KoID, target: Option<KoID>, signal: Signal, info:
             if let Some(proc) = ROOT_JOB.find_process(owner) {
                 if let Ok(obj) = proc.get_child(tid) {
                     if let Ok(thread) = obj.downcast_arc::<Thread>() {
-                        thread.lock_linux().queue_signal(signal, Some(info));
+                        thread.lock_linux().send_timer_signal(signal, info);
                         linux_object::process::wake_signal_sleeper(&thread);
                     }
                 }
@@ -2286,6 +2302,9 @@ mod cpu_timer_tests;
 
 #[cfg(test)]
 mod rusage_tests;
+
+#[cfg(test)]
+mod sigq_tests;
 
 #[cfg(test)]
 mod itimer_tests {
@@ -2915,6 +2934,7 @@ mod exec_timer_tests {
         POSIX_TIMERS.lock().insert(
             id,
             PosixTimer {
+                _sigq: None,
                 owner,
                 notify: TimerNotify::SIGALRM_TO_PROCESS,
                 clock: PosixTimerClock::Base(ClockBase::Monotonic),
@@ -2980,6 +3000,7 @@ mod exec_timer_tests {
         let _guard = serialised();
         let owner = 0x4711_0007;
         let fresh = || PosixTimer {
+            _sigq: None,
             owner,
             notify: TimerNotify::SIGALRM_TO_PROCESS,
             clock: PosixTimerClock::Base(ClockBase::Monotonic),
@@ -3043,6 +3064,7 @@ mod exit_timer_tests {
         POSIX_TIMERS.lock().insert(
             id,
             PosixTimer {
+                _sigq: None,
                 owner,
                 notify: TimerNotify::SIGALRM_TO_PROCESS,
                 clock: PosixTimerClock::Base(ClockBase::Monotonic),
@@ -3280,6 +3302,7 @@ mod overrun_tests {
         POSIX_TIMERS.lock().insert(
             id,
             PosixTimer {
+                _sigq: None,
                 owner,
                 notify: TimerNotify::SIGALRM_TO_PROCESS,
                 clock: PosixTimerClock::Base(ClockBase::Monotonic),

@@ -77,7 +77,8 @@ fn a_forked_child_starts_with_a_clean_mirror() {
     // (`forked_child` clears the set) and so must not inherit the mirror.
     parent
         .linux()
-        .queue_shared_signal(LinuxSignal::SIGUSR1, None);
+        .queue_shared_signal(LinuxSignal::SIGUSR1, None)
+        .unwrap();
     let child = Process::fork_from(&parent).unwrap();
     assert_eq!(
         mirror(child.linux()),
@@ -92,7 +93,7 @@ fn a_forked_child_starts_with_a_clean_mirror() {
 fn a_queued_shared_signal_is_visible_without_the_lock() {
     let (proc, _t) = a_process_blocking_usr1(78_003);
     let lp = proc.linux();
-    lp.queue_shared_signal(LinuxSignal::SIGUSR1, None);
+    lp.queue_shared_signal(LinuxSignal::SIGUSR1, None).unwrap();
     assert_ne!(
         mirror(lp).0,
         0,
@@ -108,7 +109,7 @@ fn a_queued_shared_signal_is_visible_without_the_lock() {
 fn the_fast_path_does_not_swallow_a_pending_signal() {
     let (proc, thread) = a_process_blocking_usr1(78_004);
     let lp = proc.linux();
-    lp.queue_shared_signal(LinuxSignal::SIGUSR1, None);
+    lp.queue_shared_signal(LinuxSignal::SIGUSR1, None).unwrap();
     thread.lock_linux().set_signal_mask(Sigset::empty());
     lp.pull_shared_pending_into(&thread);
     assert!(
@@ -122,7 +123,7 @@ fn the_fast_path_does_not_swallow_a_pending_signal() {
 fn pulling_the_last_shared_signal_clears_the_mirror() {
     let (proc, thread) = a_process_blocking_usr1(78_005);
     let lp = proc.linux();
-    lp.queue_shared_signal(LinuxSignal::SIGUSR1, None);
+    lp.queue_shared_signal(LinuxSignal::SIGUSR1, None).unwrap();
     thread.lock_linux().set_signal_mask(Sigset::empty());
     lp.pull_shared_pending_into(&thread);
     assert_eq!(
@@ -139,8 +140,8 @@ fn pulling_the_last_shared_signal_clears_the_mirror() {
 fn a_pull_that_leaves_a_signal_behind_leaves_the_mirror_set() {
     let (proc, thread) = a_process_blocking_usr1(78_006);
     let lp = proc.linux();
-    lp.queue_shared_signal(LinuxSignal::SIGUSR1, None);
-    lp.queue_shared_signal(LinuxSignal::SIGUSR2, None);
+    lp.queue_shared_signal(LinuxSignal::SIGUSR1, None).unwrap();
+    lp.queue_shared_signal(LinuxSignal::SIGUSR2, None).unwrap();
     // Unblock only USR1, so USR2 stays on the shared set.
     thread
         .lock_linux()
@@ -162,7 +163,7 @@ fn a_pull_that_leaves_a_signal_behind_leaves_the_mirror_set() {
 fn a_shared_signal_discarded_by_sig_ign_clears_the_mirror() {
     let (proc, _t) = a_process_blocking_usr1(78_007);
     let lp = proc.linux();
-    lp.queue_shared_signal(LinuxSignal::SIGUSR1, None);
+    lp.queue_shared_signal(LinuxSignal::SIGUSR1, None).unwrap();
     // `SIG_IGN` discards what is already pending (this is the path
     // `set_signal_action_in` exists for).
     set_signal_action_in(
@@ -187,7 +188,7 @@ fn a_shared_signal_discarded_by_sig_ign_clears_the_mirror() {
 fn a_stop_a_continue_throws_away_on_the_process_clears_the_mirror() {
     let (proc, _t) = a_process_blocking_usr1(78_013);
     let lp = proc.linux();
-    lp.queue_shared_signal(LinuxSignal::SIGTSTP, None);
+    lp.queue_shared_signal(LinuxSignal::SIGTSTP, None).unwrap();
     prepare_signal(&proc, LinuxSignal::SIGCONT);
     assert_eq!(
         mirror(lp).0,
@@ -245,7 +246,7 @@ fn stopping_an_already_stopped_process_leaves_the_mirror_set() {
 fn a_signal_and_a_stop_at_once_both_come_out_right() {
     let (proc, _t) = a_process_blocking_usr1(78_011);
     let lp = proc.linux();
-    lp.queue_shared_signal(LinuxSignal::SIGUSR1, None);
+    lp.queue_shared_signal(LinuxSignal::SIGUSR1, None).unwrap();
     lp.job_stop(&proc, LinuxSignal::SIGTSTP as u8);
     let (sig, stop) = mirror(lp);
     assert_ne!(sig, 0, "the stop refresh overwrote the signal word");

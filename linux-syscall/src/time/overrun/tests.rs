@@ -26,6 +26,7 @@ fn a_timer(owner: KoID, notify: TimerNotify) -> usize {
     POSIX_TIMERS.lock().insert(
         id,
         PosixTimer {
+            _sigq: None,
             owner,
             notify,
             clock: PosixTimerClock::Base(ClockBase::Monotonic),

@@ -123,10 +123,12 @@ fn ignoring_a_signal_discards_what_was_pending_in_every_thread() {
 #[test]
 fn the_discarded_signal_does_not_leave_its_siginfo_behind() {
     let (proc, first, _second) = with_pending(43_504);
-    proc.linux().queue_shared_signal(
-        LinuxSignal::SIGUSR1,
-        Some(SigInfo::from_kernel(LinuxSignal::SIGUSR1)),
-    );
+    proc.linux()
+        .queue_shared_signal(
+            LinuxSignal::SIGUSR1,
+            Some(SigInfo::from_kernel(LinuxSignal::SIGUSR1)),
+        )
+        .unwrap();
     set_signal_action_in(&proc, LinuxSignal::SIGUSR1, entry(SIG_IGN));
 
     // Unblocking is what pulls the shared queue onto a thread. With the
@@ -141,7 +143,9 @@ fn the_discarded_signal_does_not_leave_its_siginfo_behind() {
     // A handler again, and a fresh SIGUSR1 that carries no information of
     // its own: what it is delivered with has to be a bare `SI_USER`.
     set_signal_action_in(&proc, LinuxSignal::SIGUSR1, entry(CAUGHT));
-    proc.linux().queue_shared_signal(LinuxSignal::SIGUSR1, None);
+    proc.linux()
+        .queue_shared_signal(LinuxSignal::SIGUSR1, None)
+        .unwrap();
     proc.linux().pull_shared_pending_into(&first);
     assert!(first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
     assert_eq!(
