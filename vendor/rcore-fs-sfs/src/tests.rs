@@ -1032,7 +1032,14 @@ fn concurrent_writers_never_shrink_the_file() -> Result<()> {
         assert_eq!(file.read_at(0, &mut back)?, total);
         for (i, c) in back.chunks(CHUNK).enumerate() {
             let want = (i % THREADS) as u8 + 1;
-            assert!(c.iter().all(|&b| b == want), "chunk {} lost its data: first={} want={} bad={}", i, c[0], want, c.iter().filter(|&&b| b != want).count());
+            assert!(
+                c.iter().all(|&b| b == want),
+                "chunk {} lost its data: first={} want={} bad={}",
+                i,
+                c[0],
+                want,
+                c.iter().filter(|&&b| b != want).count()
+            );
         }
         sfs.sync()?;
     }
