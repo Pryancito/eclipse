@@ -3458,6 +3458,58 @@ timer64_skipped:
 	cmpl	$-10, %eax		/* ECHILD, which is the right answer */
 	jne	bad_queueinfo
 
+	/* Step 86 (code 110): `timer_create` (259), whose `struct sigevent` is
+	 * the one structure of this layer where EVERY field moves. Its first
+	 * member is a `union sigval`, eight bytes here and FOUR to this
+	 * program, so `sigev_signo` sits at byte 4 and not 8, `sigev_notify`
+	 * at 8 and not 12, and `sigev_notify_thread_id` at 12 and not 16.
+	 *
+	 * The buffer below is the whole check, because the two readings
+	 * OVERLAP: bytes 8..12 are this program's `sigev_notify` and a native
+	 * reading's `sigev_signo`. They hold SIGEV_SIGNAL, which is zero, so a
+	 * kernel that reads the native offsets takes signal 0 and
+	 * `good_sigevent()` answers EINVAL (-22). One buffer, and the two
+	 * widths disagree about it by construction.
+	 *
+	 * Three answers, three meanings:
+	 *   -38 (ENOSYS) -> 259 is in no i386 table, which is what this
+	 *                   program got before this tanda
+	 *   -22 (EINVAL) -> the sigevent was read at the native offsets
+	 *     0          -> right
+	 *
+	 * `sev` is 4 modulo 8 on purpose: that is the alignment a
+	 * `struct compat_sigevent` really has, since every member of it is an
+	 * `int`, and a kernel reading `sigev_value` through an eight-byte
+	 * typed access refuses the address outright. */
+	movl	$0x80000000, sev + 0	/* sigev_value: a sival_ptr two gigs up */
+	movl	$14, sev + 4		/* sigev_signo: SIGALRM */
+	movl	$0, sev + 8		/* sigev_notify: SIGEV_SIGNAL */
+	movl	$0, sev + 12		/* sigev_notify_thread_id: unused */
+	movl	$0xffffffff, tmrid	/* so a kernel that writes no id is seen */
+
+	movl	$259, %eax		/* timer_create */
+	movl	$1, %ebx		/* CLOCK_MONOTONIC */
+	movl	$sev, %ecx
+	movl	$tmrid, %edx
+	int	$0x80
+	cmpl	$-38, %eax
+	je	bad_sigevent
+	cmpl	$-22, %eax
+	je	bad_sigevent
+	testl	%eax, %eax
+	jnz	bad_sigevent
+
+	/* And the id really came back: `timer_delete` (263) of it answers 0,
+	 * which it cannot do for the 0xffffffff left there above. This is the
+	 * check that the `timer_t` out-parameter was written, which is an
+	 * `int` at both widths and so is not part of the conversion --- it is
+	 * here because it costs one syscall and it also tidies the timer up. */
+	movl	$263, %eax		/* timer_delete */
+	movl	tmrid, %ebx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_sigevent
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -3806,6 +3858,9 @@ bad_timer64:
 	movl	$106, %ebx
 	jmp	die
 
+bad_sigevent:
+	movl	$110, %ebx
+	jmp	die
 bad_queueinfo:
 	movl	$109, %ebx
 	jmp	die
@@ -4187,6 +4242,13 @@ qpad85:
 	.long	0
 qinfo:
 	.space	128
+	.align 8
+spad86:
+	.long	0
+sev:
+	.space	64
+tmrid:
+	.long	0
 	.balign	8
 	.long	0
 its:

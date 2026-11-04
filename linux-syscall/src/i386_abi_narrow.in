@@ -30,8 +30,6 @@
 //     not an array of these structures -- and whose native number (132) has
 //     no handler in this kernel at all, so there is nothing for the table to
 //     point it at. The same goes for `futimesat` (299) and its native 261;
-//   - `timer_create` (259) passes a `struct sigevent`, whose union holds a
-//     pointer;
 //   - `select` (82) is i386's OLD select, which passes its arguments in a
 //     block of memory rather than in registers; `_newselect` (142) is the
 //     one that takes them the native way, and is the one listed here.
@@ -167,3 +165,14 @@ prlimit64
 // a 32-bit program may exec a 64-bit one and stop being a 32-bit process.
 execve
 execveat
+
+// struct sigevent
+//
+// `timer_create` (259) is the one here whose structure is neither halved nor
+// merely re-aligned: EVERY field moves. `sigev_value` is a `union sigval`, so
+// it is eight bytes natively and four to a 32-bit program, and `sigev_signo`,
+// `sigev_notify` and `sigev_notify_thread_id` all shift behind it -- the last
+// one by eight, because natively it sits in a union that holds pointers. The
+// offsets, and the zero extension of the `sival_ptr` that `compat_ptr()` is,
+// are in `crate::narrow::sigevent`.
+timer_create
