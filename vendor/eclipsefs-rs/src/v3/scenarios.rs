@@ -18,8 +18,18 @@ struct Faulty {
 
 impl BlockDevice for Faulty {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        let b = self.fail_read.load(Ordering::Relaxed) * BLOCK_SIZE;
-        if offset < b + BLOCK_SIZE && offset + buf.len() as u64 > b {
+        // Saturating, because "no read fails" is said with a block past the
+        // end of the address space: `u64::MAX / BLOCK_SIZE` blocks is the
+        // last aligned byte, and one block more does not fit in a `u64`. In
+        // release that wrapped to zero, the first comparison came out false
+        // and the disk worked by accident; with overflow checks on it
+        // panicked here, so these two tests passed only under the
+        // `--release` line CI runs and not under a plain `cargo test`.
+        let b = self
+            .fail_read
+            .load(Ordering::Relaxed)
+            .saturating_mul(BLOCK_SIZE);
+        if offset < b.saturating_add(BLOCK_SIZE) && offset + buf.len() as u64 > b {
             return Err(Error::Io);
         }
         self.ram.read_at(offset, buf)
@@ -36,6 +46,33 @@ impl BlockDevice for Faulty {
     fn size(&self) -> u64 {
         self.ram.size()
     }
+}
+
+/// The faulty disk says "nothing fails" with a block past the end of the
+/// address space, so its own arithmetic has to hold at the sentinel: that
+/// block times the block size is the last aligned byte, and one block more
+/// does not fit in a `u64`. Without this the two tests below it were the
+/// only thing holding the disk up, and they held it only in `--release`.
+#[test]
+fn a_faulty_disk_with_nothing_set_to_fail_reads_and_writes_everywhere() {
+    let ram = Ram::new(4 * MIB);
+    let dev = Faulty {
+        ram: ram.clone(),
+        fail_from: AtomicU64::new(u64::MAX),
+        fail_read: AtomicU64::new(u64::MAX / BLOCK_SIZE),
+    };
+    let mut buf = vec![0u8; BLOCK_SIZE as usize];
+    let last = ram.size() - BLOCK_SIZE;
+    dev.read_at(0, &mut buf).unwrap();
+    dev.read_at(last, &mut buf).unwrap();
+    dev.write_at(last, &buf).unwrap();
+    // And it still fails where it is told to, and only there.
+    dev.fail_read.store(last / BLOCK_SIZE, Ordering::Relaxed);
+    assert_eq!(dev.read_at(last, &mut buf), Err(Error::Io));
+    dev.read_at(0, &mut buf).unwrap();
+    dev.fail_from.store(last, Ordering::Relaxed);
+    assert_eq!(dev.write_at(last, &buf), Err(Error::Io));
+    dev.write_at(0, &buf).unwrap();
 }
 
 fn formatted(mib: usize) -> Arc<Ram> {
