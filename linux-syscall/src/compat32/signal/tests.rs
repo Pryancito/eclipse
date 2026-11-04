@@ -33,6 +33,7 @@ const SIGRETURN: u32 = 119;
 
 const EINVAL: isize = -(LxError::EINVAL as isize);
 const ENOSYS: isize = -(LxError::ENOSYS as isize);
+const EFAULT: isize = -(LxError::EFAULT as isize);
 
 // ---------------------------------------------------------------------------
 // The structures
@@ -611,4 +612,56 @@ fn a_sigreturn_for_the_other_frame_is_refused_rather_than_read() {
         );
         proc.exit(0);
     }
+}
+
+/// **The old frame is read through a CHECKED access, not dereferenced.**
+///
+/// A handler may unmap its own stack before it returns, and then the address
+/// the kernel saved is one with nothing behind it. A plain dereference of one
+/// does not fault politely in this kernel --- see the note on
+/// `KernelHandler::check_user_range` --- so both pieces of the frame go
+/// through `UserInPtr`, which asks first.
+///
+/// What this test asks for is the half of the check that does not need the
+/// address space: an address that is not a user address at all, with
+/// `set_strict_user_half` turned on because on the host every address looks
+/// like a user one. The other half --- "this user range has no mapping" ---
+/// is driven by `kernel_hal`'s own `refuse_user_range`, which is
+/// `pub(crate)` there, so it is covered by that crate's tests of
+/// `read_unaligned` rather than from here.
+///
+/// The mutation is the code this replaced: reading the `sigcontext_32` and
+/// the `extramask` raw. It does not make this test fail; it kills the process
+/// running it, which is the bug. Pointed out by Copilot on the #2424.
+#[test]
+fn the_old_frame_is_read_through_a_checked_access() {
+    /// Not a user address: the kernel half. A `sigreturn` cannot really
+    /// arrive with one, since the kernel stored the address itself --- what
+    /// it stands in for here is the read being checked at all.
+    const NOT_USER: usize = 0xffff_ffff_8000_0000;
+    const KEY_SP: usize = USER_AT + 0x1900;
+
+    let proc = a_process(48_564, Abi::Linux32);
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            // On the host every address is a user-half address, because the
+            // host's own heap and stack are where a test's buffers live; the
+            // bound has to be asked for, and on the thread the call runs on.
+            kernel_hal::user::set_strict_user_half(true);
+            sys.thread
+                .backup_context(UserContext::default(), 0, NOT_USER, KEY_SP);
+            sys.thread
+                .with_context(|ctx| {
+                    ctx.set_field(kernel_hal::context::UserContextField::StackPointer, KEY_SP)
+                })
+                .unwrap();
+            let got = as_mut(sys)
+                .compat32_syscall(SIGRETURN, [0, 0, 0, 0, 0, 0])
+                .await;
+            kernel_hal::user::set_strict_user_half(false);
+            got
+        })
+    });
+    assert_eq!(got, EFAULT, "an unreadable frame answered {}", got);
+    proc.exit(0);
 }

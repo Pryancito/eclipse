@@ -975,20 +975,27 @@ impl Syscall<'_> {
         // the interrupted registers from 820 bytes past the end of the frame.
         let narrow = self.narrow_abi();
         self.thread
-            .with_context(|ctx| {
+            .with_context(|ctx| -> Result<(), LxError> {
                 let mut linux = self.thread.lock_linux();
                 #[cfg(target_arch = "x86_64")]
                 if old_frame {
                     // `uctx_ptr` is where the frame's `sigcontext_32` is: an
                     // old frame has no `ucontext` to point at, and the slot
                     // that would hold the `siginfo` is zero.
+                    //
+                    // And this one can FAIL, which the two older paths cannot
+                    // say: it reads the frame through a checked access, so a
+                    // handler that unmapped its own stack gets an error here
+                    // instead of taking the machine down. Nothing is restored
+                    // in that case, so the thread is left as it was.
                     return linux.restore_after_an_old_handler32(ctx, &old_ctx, uctx_ptr);
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 let _ = old_frame;
-                linux.restore_after_a_handler(ctx, &old_ctx, siginfo_ptr, uctx_ptr, narrow)
+                linux.restore_after_a_handler(ctx, &old_ctx, siginfo_ptr, uctx_ptr, narrow);
+                Ok(())
             })
-            .map_err(|_| LxError::EINVAL)?;
+            .map_err(|_| LxError::EINVAL)??;
         // sigreturn has no return value of its own: the generic syscall-return
         // path writes our result into rax AFTER the context restore above, so
         // returning a fixed 0 would clobber the interrupted syscall's restored

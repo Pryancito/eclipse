@@ -968,23 +968,45 @@ impl LinuxThread {
     /// What it does do is the mask, which an old frame splits in two: the low
     /// 32 bits in `sc.oldmask` and the high 32 behind the `_fpstate_32`, in
     /// `extramask`. That is where `sys_sigreturn` reads them in Linux, and
-    /// where [`write_old_frame`](zcore_loader) put them.
+    /// where `zcore_loader`'s `write_old_frame` put them.
+    ///
+    /// ## Both pieces are read through a CHECKED access
+    ///
+    /// A handler is free to unmap its own stack before it calls `sigreturn`,
+    /// and the frame's address is then a user address with nothing behind it.
+    /// A plain dereference of one does not answer `EFAULT` here --- it takes
+    /// the machine down (see `KernelHandler::check_user_range`). So both
+    /// reads go through `UserInPtr`, which asks the address space first, and
+    /// nothing is restored unless both of them answered: a frame that cannot
+    /// be read leaves the thread exactly as it was and the call fails.
+    ///
+    /// `read_unaligned` and not `read`: the `sigcontext_32` sits eight bytes
+    /// into a frame whose own alignment makes `esp + 4` a multiple of 16, so
+    /// it is 4-aligned and not 8, and Linux's own `__get_user` asks nothing
+    /// of either.
+    ///
+    /// Pointed out by Copilot on the #2424. The two OLDER `sigreturn` paths
+    /// --- this one's `rt_` sibling and the native one --- still dereference
+    /// their frame raw, which is the same hole and was there before this
+    /// change; closing it for all three is a change of its own.
     #[cfg(target_arch = "x86_64")]
     pub fn restore_after_an_old_handler32(
         &mut self,
         ctx: &mut UserContext,
         old_ctx: &UserContext,
         sc_ptr: usize,
-    ) {
+    ) -> crate::error::LxResult {
         use crate::signal::ucontext::i386::{SigContext32, FPSTATE32_LEN};
-        let sc = unsafe { &*(sc_ptr as *const SigContext32) };
-        let extramask = unsafe {
-            *((sc_ptr + core::mem::size_of::<SigContext32>() + FPSTATE32_LEN) as *const u32)
-        };
+        let sc_p: UserInPtr<SigContext32> = sc_ptr.into();
+        let extramask_p: UserInPtr<u32> =
+            (sc_ptr + core::mem::size_of::<SigContext32>() + FPSTATE32_LEN).into();
+        let sc = sc_p.read_unaligned()?;
+        let extramask = extramask_p.read_unaligned()?;
         *ctx = *old_ctx;
         sc.restore_into(ctx);
         self.set_signal_mask(Sigset::new(sc.oldmask as u64 | ((extramask as u64) << 32)));
         self.handling_signal = None;
+        Ok(())
     }
 
     /// The `sigreturn` of a thread whose process has the given width, which
