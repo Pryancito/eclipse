@@ -955,6 +955,38 @@ impl LinuxThread {
         self.handling_signal = None;
     }
 
+    /// The `sigreturn` of an **old** i386 frame, the one an action without
+    /// `SA_SIGINFO` was given (`struct sigframe_ia32`).
+    ///
+    /// Three things it does not do, each because the frame does not carry
+    /// them: it compares no `siginfo` (there is none), it reads no `uc_flags`
+    /// or `uc_link` (likewise), and it puts back no alternate stack --- Linux
+    /// restores that in `sys_rt_sigreturn` and nowhere else, so a handler
+    /// without `SA_SIGINFO` leaves an `SS_AUTODISARM` stack disarmed there
+    /// too.
+    ///
+    /// What it does do is the mask, which an old frame splits in two: the low
+    /// 32 bits in `sc.oldmask` and the high 32 behind the `_fpstate_32`, in
+    /// `extramask`. That is where `sys_sigreturn` reads them in Linux, and
+    /// where [`write_old_frame`](zcore_loader) put them.
+    #[cfg(target_arch = "x86_64")]
+    pub fn restore_after_an_old_handler32(
+        &mut self,
+        ctx: &mut UserContext,
+        old_ctx: &UserContext,
+        sc_ptr: usize,
+    ) {
+        use crate::signal::ucontext::i386::{SigContext32, FPSTATE32_LEN};
+        let sc = unsafe { &*(sc_ptr as *const SigContext32) };
+        let extramask = unsafe {
+            *((sc_ptr + core::mem::size_of::<SigContext32>() + FPSTATE32_LEN) as *const u32)
+        };
+        *ctx = *old_ctx;
+        sc.restore_into(ctx);
+        self.set_signal_mask(Sigset::new(sc.oldmask as u64 | ((extramask as u64) << 32)));
+        self.handling_signal = None;
+    }
+
     /// The `sigreturn` of a thread whose process has the given width, which
     /// is the one door `linux-syscall` goes through.
     ///

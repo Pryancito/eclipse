@@ -89,3 +89,151 @@ fn the_sigreturn_is_found_four_bytes_up_and_not_eight() {
     assert_eq!(f.sigreturn_sp(), f.sp + 4);
     assert_ne!(f.sigreturn_sp(), f.sp + 8);
 }
+
+/// **The old frame is the one Linux's `struct sigframe_ia32` is**, member by
+/// member.
+///
+/// The kernel is the only thing that knows where `extramask` is --- the
+/// trampoline on the other side only does `esp - 8` arithmetic --- so getting
+/// the `_fpstate_32` size wrong would not show up as a crash: the high half
+/// of every restored mask would come out of the middle of a hole, and a
+/// program that blocks a real-time signal around a handler would silently
+/// come back with it unblocked.
+#[test]
+fn the_old_frame_is_the_sigframe_ia32_linux_pushes() {
+    assert_eq!(
+        OLD_FRAME32_SIZE,
+        8 + 88 + 624 + 4 + 8,
+        "pretcode and sig, the sigcontext_32, the _fpstate_32 nobody reads, \
+         extramask, retcode"
+    );
+    assert_eq!(OLD_FRAME32_SIZE, 732);
+    let f = OldFrame32::at(TOP).unwrap();
+    assert_eq!(f.sc_ptr, f.sp + 8, "the sigcontext follows the two words");
+    assert_eq!(
+        f.extramask_ptr(),
+        f.sc_ptr + 88 + 624,
+        "and the high half of the mask follows the fpstate"
+    );
+    assert_eq!(
+        f.extramask_ptr() + 4 + 8,
+        f.sp + OLD_FRAME32_SIZE,
+        "retcode is the last member"
+    );
+}
+
+/// **It is the BIGGER of the two frames**, which is what the writable-memory
+/// check has to be told.
+///
+/// Asking about the `rt_` frame's 260 bytes and then writing 732 would put
+/// the `_fpstate_32` and the `extramask` of a frame 472 bytes past the last
+/// address that was checked --- off the end of a stack mapping that has just
+/// enough room for the frame the kernel asked about.
+#[test]
+fn the_old_frame_is_the_larger_of_the_two() {
+    assert!(OLD_FRAME32_SIZE > FRAME32_SIZE);
+    assert_eq!(OLD_FRAME32_SIZE - FRAME32_SIZE, 472);
+}
+
+/// **An old frame's `sigreturn` is found EIGHT bytes up, not four.**
+///
+/// The two trampolines differ by one instruction: `__restore_rt` pops
+/// nothing, `__restore` pops the signal number before the `int $0x80`. So the
+/// two frames' `sigreturn` stack pointers are four bytes apart, and the saved
+/// context is keyed on that pointer: getting this one wrong by four bytes
+/// makes every `sigreturn` from an old frame `EINVAL`, which is a handler
+/// that kills its process on the way out.
+#[test]
+fn the_old_sigreturn_is_found_eight_bytes_up() {
+    let f = OldFrame32::at(TOP).unwrap();
+    assert_eq!(f.sigreturn_sp(), f.sp + 8);
+    assert_eq!(
+        f.sigreturn_sp(),
+        f.sc_ptr,
+        "which is &frame->sc, where Linux's regs->sp - 8 puts the frame base"
+    );
+    let rt = Frame32::at(TOP).unwrap();
+    assert_ne!(
+        rt.sigreturn_sp() - rt.sp,
+        f.sigreturn_sp() - f.sp,
+        "and the two cannot be confused for each other"
+    );
+}
+
+/// The alignment and the refusal, the same two properties the `rt_` frame's
+/// own tests pin, for the same two reasons.
+#[test]
+fn the_old_frame_is_aligned_and_a_stack_too_low_is_refused() {
+    for top in TOP - 15..=TOP {
+        let f = OldFrame32::at(top).unwrap();
+        assert_eq!((f.sp + 4) % 16, 0, "top={top:#x}");
+        assert!(f.sp + OLD_FRAME32_SIZE <= top);
+    }
+    assert_eq!(OldFrame32::at(0), None);
+    assert_eq!(OldFrame32::at(OLD_FRAME32_SIZE), None);
+    assert_eq!(OldFrame32::at(OLD_FRAME32_SIZE + 11), None);
+    assert!(OldFrame32::at(OLD_FRAME32_SIZE + 12).is_some());
+}
+
+/// **The mask goes over in two pieces**, and `write_old_frame` is where it is
+/// split.
+///
+/// Into a buffer of this process's own, which is all the frame writer needs:
+/// it takes addresses, and a host test can give it ones it owns.
+#[test]
+fn the_mask_is_split_between_oldmask_and_extramask() {
+    use linux_object::signal::Sigset;
+    // One real-time signal (bit 40) and one ordinary one, so both halves
+    // carry something and neither can pass for the other.
+    let mask = Sigset::new(0x0000_0100_0000_0002);
+    let mut buf = alloc::vec![0u8; OLD_FRAME32_SIZE + 16];
+    let base = (buf.as_mut_ptr() as usize + 15) & !0xf;
+    let frame = OldFrame32 {
+        sp: base,
+        sc_ptr: base + 8,
+    };
+    let sc = SigContext32::default();
+    // SAFETY: `base` is the start of a buffer of this process's own with
+    // room for a whole frame above it.
+    #[allow(unsafe_code)]
+    unsafe {
+        write_old_frame(frame, 0xdead_beef, 10, &sc, mask);
+    }
+    #[allow(unsafe_code)]
+    let (pretcode, sig, oldmask, extramask, retcode) = unsafe {
+        (
+            *(frame.sp as *const u32),
+            *((frame.sp + 4) as *const u32),
+            (*(frame.sc_ptr as *const SigContext32)).oldmask,
+            *(frame.extramask_ptr() as *const u32),
+            *((frame.extramask_ptr() + 4) as *const [u8; 8]),
+        )
+    };
+    assert_eq!(pretcode, 0xdead_beef, "the handler's return address");
+    assert_eq!(sig, 10, "its one argument");
+    assert_eq!(oldmask, 0x0000_0002, "the low 32 bits of the mask");
+    assert_eq!(extramask, 0x0000_0100, "and the high 32 behind the fpstate");
+    assert_eq!(
+        retcode, OLD_RETCODE,
+        "popl %eax; movl $119, %eax; int $0x80"
+    );
+}
+
+/// **An action without `SA_SIGINFO` is sized for the frame it is going to
+/// get.**
+///
+/// The writable-memory check and the write read the size from the same
+/// function, which is the point: a check made about 260 bytes followed by a
+/// write of 732 puts the `_fpstate_32` and the `extramask` off the end of a
+/// stack mapping that had just enough room for the frame the kernel asked
+/// about -- and the kernel is the one writing there.
+#[test]
+fn the_size_asked_about_is_the_size_of_the_frame_that_will_be_written() {
+    assert_eq!(frame32_size(true), FRAME32_SIZE);
+    assert_eq!(frame32_size(false), OLD_FRAME32_SIZE);
+    assert!(
+        frame32_size(false) > frame32_size(true),
+        "and the one a plain handler gets is the bigger: a check made about \
+         the other size is short by 472 bytes"
+    );
+}

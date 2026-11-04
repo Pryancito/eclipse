@@ -909,6 +909,39 @@ impl Syscall<'_> {
 
     /// Return from handling some signal
     pub fn sys_rt_sigreturn(&mut self) -> SysResult {
+        self.sigreturn_from(false)
+    }
+
+    /// `sigreturn` (i386 119), the pre-POSIX one, which returns from the
+    /// **old** frame --- the one an action without `SA_SIGINFO` is given.
+    ///
+    /// It is a different syscall in Linux and not a flag on this one for the
+    /// same reason it is a different frame: the two carry the registers at
+    /// different offsets and are returned from at stack pointers four bytes
+    /// apart, and the program knows which it has. There is no native twin: a
+    /// 64-bit process has only `rt_sigreturn`, and musl on x86_64 has only
+    /// `__restore_rt`.
+    pub fn sys_sigreturn(&mut self) -> SysResult {
+        self.sigreturn_from(true)
+    }
+
+    /// The body of both: find the frame this stack pointer belongs to and
+    /// restore the registers it saved.
+    ///
+    /// `old_frame` says which of i386's two frames the program is returning
+    /// from, which is which syscall it made --- the number is the only thing
+    /// that says it, both frames being found by the same stack pointer.
+    ///
+    /// And the two are checked against each other, because a program can ask
+    /// to return from a frame the kernel did not push: the frame it did push
+    /// records whether it had a `siginfo`, and the mismatch is `EINVAL`. That
+    /// is one place this is deliberately stricter than Linux, which reads the
+    /// frame out of user memory with `__get_user` and hands a mismatched
+    /// program a `sigcontext` read out of the middle of a `ucontext`. Here the
+    /// read is a plain dereference of an address the kernel stored, so the
+    /// mismatch has to be refused rather than read: an old frame's `siginfo`
+    /// slot is **zero**, and the `rt_` path would dereference it.
+    fn sigreturn_from(&mut self, old_frame: bool) -> SysResult {
         info!(
             "sigreturn: thread {} returns from handling the signal",
             self.thread.id()
@@ -924,6 +957,17 @@ impl Syscall<'_> {
             Some(v) => v,
             None => return Err(LxError::EINVAL),
         };
+        // Which of the two frames is at that stack pointer: an old frame has
+        // no `siginfo`, so its slot is zero and no frame with one can look
+        // like it.
+        if old_frame != (siginfo_ptr == 0) {
+            warn!(
+                "sigreturn: thread {} asked to return from the {} frame and is on the other one",
+                self.thread.id(),
+                if old_frame { "old" } else { "rt_" },
+            );
+            return Err(LxError::EINVAL);
+        }
         // Which frame is at those two addresses is a property of the
         // PROCESS, not of the call: a 32-bit program reaches this through
         // i386 number 173 and a native one through 15, and both arrive here.
@@ -932,13 +976,17 @@ impl Syscall<'_> {
         let narrow = self.narrow_abi();
         self.thread
             .with_context(|ctx| {
-                self.thread.lock_linux().restore_after_a_handler(
-                    ctx,
-                    &old_ctx,
-                    siginfo_ptr,
-                    uctx_ptr,
-                    narrow,
-                )
+                let mut linux = self.thread.lock_linux();
+                #[cfg(target_arch = "x86_64")]
+                if old_frame {
+                    // `uctx_ptr` is where the frame's `sigcontext_32` is: an
+                    // old frame has no `ucontext` to point at, and the slot
+                    // that would hold the `siginfo` is zero.
+                    return linux.restore_after_an_old_handler32(ctx, &old_ctx, uctx_ptr);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                let _ = old_frame;
+                linux.restore_after_a_handler(ctx, &old_ctx, siginfo_ptr, uctx_ptr, narrow)
             })
             .map_err(|_| LxError::EINVAL)?;
         // sigreturn has no return value of its own: the generic syscall-return

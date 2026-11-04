@@ -388,6 +388,32 @@ pub mod i386 {
         }
     }
 
+    /// `sizeof(struct _fpstate_32)`.
+    ///
+    /// The member Linux's `struct sigframe_ia32` calls `fpstate_unused`, and
+    /// unused is what it is: the real FP state goes after the frame, found
+    /// through `sc.fpstate`. It is still part of the structure, and the
+    /// `extramask` behind it is read by `sys_sigreturn`, so the size has to be
+    /// right or the high half of the restored mask comes out of the middle of
+    /// a hole. 624 bytes: 28 of the environment, 80 of the eight 80-bit
+    /// registers, 4 of `status`/`magic`, 24 of `_fxsr_env`, 8 of
+    /// `mxcsr`/`reserved`, 128 of `_fxsr_st`, 128 of `_xmm`, then 176 and 48
+    /// of padding.
+    pub const FPSTATE32_LEN: usize = 624;
+
+    /// The two words an **old** (non-`SA_SIGINFO`) i386 frame starts with.
+    ///
+    /// `struct sigframe_ia32` is the frame Linux pushes when the action has
+    /// no `SA_SIGINFO`, and its handler takes one argument, not three: the
+    /// return address and the signal number, and then the `sigcontext_32`
+    /// itself rather than a pointer to a `ucontext`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+    pub struct OldSigFrameHeader32 {
+        pub pretcode: u32,
+        pub sig: u32,
+    }
+
     /// The four words below the `siginfo` in `struct rt_sigframe_ia32`: the
     /// handler's return address and its three arguments, which i386 passes on
     /// the stack. See this module's own documentation.

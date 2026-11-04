@@ -17,6 +17,7 @@ use core::mem::{align_of, offset_of, size_of};
 use kernel_hal::context::UserContext;
 use linux_object::process::{Abi, LinuxProcess};
 use linux_object::signal::{SigInfo, Signal, SignalStack};
+use linux_object::thread::ThreadExt;
 use rcore_fs_ramfs::RamFS;
 use zircon_object::object::KoID;
 use zircon_object::task::{Process, ROOT_JOB};
@@ -27,6 +28,8 @@ use zircon_object::vm::{MMUFlags, VmObject};
 const RT_SIGACTION: u32 = 174;
 const SIGALTSTACK: u32 = 186;
 const RT_SIGRETURN: u32 = 173;
+/// And the pre-POSIX `sigreturn`, which returns from the OTHER i386 frame.
+const SIGRETURN: u32 = 119;
 
 const EINVAL: isize = -(LxError::EINVAL as isize);
 const ENOSYS: isize = -(LxError::ENOSYS as isize);
@@ -398,11 +401,116 @@ fn the_three_numbers_are_not_in_the_translation_table() {
             n
         );
     }
-    // And the pre-POSIX pair is still absent, deliberately: their structures
-    // are a third and a fourth layout. See this module's documentation.
+    // And the pre-POSIX pair has no row either, for two different reasons
+    // now: 119 is answered by the dispatch, like the three above, and 67 is
+    // not answered at all. See this module's documentation.
     for n in [67u32, 119] {
         assert_eq!(crate::compat32::native_number(n), None);
     }
+}
+
+/// **Number 119 reaches the old `sigreturn`.**
+///
+/// As with 173: no frame on this thread's stack, so `EINVAL` --- and
+/// `ENOSYS` is what it answered before this batch, which is what a 32-bit
+/// program got from every handler installed WITHOUT `SA_SIGINFO`. musl's
+/// i386 `__libc_sigaction` points `sa_restorer` at `__restore`, a plain
+/// `sigreturn`, for exactly those, so the handler of a `signal(3)` call ran
+/// and then died on the way out.
+#[test]
+fn number_119_reaches_the_old_sigreturn_and_is_not_enosys() {
+    let proc = a_process(48_560, Abi::Linux32);
+    let got = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            as_mut(sys)
+                .compat32_syscall(SIGRETURN, [0, 0, 0, 0, 0, 0])
+                .await
+        })
+    });
+    assert_eq!(got, EINVAL, "number 119 answered {}", got);
+    assert_ne!(got, ENOSYS);
+    proc.exit(0);
+}
+
+/// **The old `sigreturn` restores the registers from a bare `sigcontext_32`,
+/// and the mask from its two halves.**
+///
+/// The old frame has no `ucontext`: the `sigcontext_32` is in the frame
+/// itself, so `ip` is 56 bytes in and `sp` 28, without the twenty bytes of
+/// `uc_flags`, `uc_link` and `uc_stack` the `rt_` frame puts first. Reading
+/// it as a `ucontext` would resume at whatever those twenty bytes earlier
+/// happen to hold --- and nothing would fault or log, which is the shape of
+/// bug this test exists for.
+///
+/// The mask is the other half: an old frame carries its low 32 bits in
+/// `sc.oldmask` and its high 32 in the `extramask` behind the
+/// `_fpstate_32`, 624 bytes further on. A program that blocks a real-time
+/// signal around a handler is the one that notices.
+#[test]
+fn the_old_sigreturn_restores_the_registers_and_the_split_mask() {
+    const SC_AT: usize = USER_AT + 0x400;
+    const RESUME_AT: u32 = 0x0804_9100;
+    const RESUME_SP: u32 = USER_AT as u32 + 0xf00;
+    const KEY_SP: usize = USER_AT + 0x1000;
+    /// `sc.oldmask` and `extramask`: SIGUSR1 (bit 9) in the low half and the
+    /// real-time signal 40 (bit 39) in the high one, so neither half can
+    /// pass for the other and a mask read from one of them alone is visibly
+    /// wrong.
+    const LOW: u32 = 1 << 9;
+    const HIGH: u32 = 1 << 7;
+    /// `sizeof(struct sigcontext_32)` and `sizeof(struct _fpstate_32)`.
+    const SC_LEN: usize = 88;
+    const FPSTATE_LEN: usize = 624;
+
+    let proc = a_process(48_561, Abi::Linux32);
+    let (ret, ip, sp, mask) = on_a_thread(&proc, |sys| {
+        Box::pin(async move {
+            // A frame as `loader::linux::sigframe32::write_old_frame` leaves
+            // one, from `&frame->sc` on: the registers, then the fpstate
+            // nobody reads, then the high half of the mask.
+            let mut frame = alloc::vec![0u8; SC_LEN + FPSTATE_LEN + 4];
+            frame[28..32].copy_from_slice(&RESUME_SP.to_ne_bytes());
+            frame[56..60].copy_from_slice(&RESUME_AT.to_ne_bytes());
+            // `oldmask` is at byte 80, between `fpstate` and `cr2`.
+            frame[80..84].copy_from_slice(&LOW.to_ne_bytes());
+            let extramask = SC_LEN + FPSTATE_LEN;
+            frame[extramask..extramask + 4].copy_from_slice(&HIGH.to_ne_bytes());
+            put(SC_AT, &frame);
+
+            // The kernel side: no `siginfo` in this frame, so that slot is
+            // zero, and the `ucontext` slot holds `&frame->sc`.
+            sys.thread
+                .backup_context(UserContext::default(), 0, SC_AT, KEY_SP);
+            sys.thread
+                .with_context(|ctx| {
+                    ctx.set_field(kernel_hal::context::UserContextField::StackPointer, KEY_SP)
+                })
+                .unwrap();
+
+            let ret = as_mut(sys)
+                .compat32_syscall(SIGRETURN, [0, 0, 0, 0, 0, 0])
+                .await;
+            let (ip, sp) = sys
+                .thread
+                .with_context(|ctx| (ctx.general().rip, ctx.general().rsp))
+                .unwrap();
+            let mask = sys.thread.lock_linux().signal_mask();
+            (ret, ip, sp, mask)
+        })
+    });
+    assert_ne!(ret, ENOSYS);
+    assert_ne!(ret, EINVAL, "the frame was not found at the stack pointer");
+    assert_eq!(
+        ip, RESUME_AT as usize,
+        "resumed somewhere else: the sigcontext was read as a ucontext"
+    );
+    assert_eq!(sp, RESUME_SP as usize);
+    assert_eq!(
+        mask.val(),
+        LOW as u64 | ((HIGH as u64) << 32),
+        "the mask comes from sc.oldmask AND the extramask behind the fpstate"
+    );
+    proc.exit(0);
 }
 
 #[test]
@@ -461,4 +569,46 @@ fn the_sigreturn_of_a_32_bit_process_reads_the_32_bit_frame() {
     );
     assert_eq!(sp, RESUME_SP as usize);
     proc.exit(0);
+}
+
+/// **A `sigreturn` for the wrong one of the two frames is refused**, and the
+/// refusal is what keeps a kernel dereference off address zero.
+///
+/// The old frame's `siginfo` slot is zero, there being no `siginfo` in it. So
+/// a 32-bit program parked on an old frame that asks for 173 --- a handler
+/// without `SA_SIGINFO` whose `sa_restorer` is `__restore_rt`, which is a
+/// program out of contract, but one a kernel must survive --- would send the
+/// `rt_` path to read 128 bytes of `siginfo` from the null page. Both
+/// directions answer `EINVAL` instead.
+#[test]
+fn a_sigreturn_for_the_other_frame_is_refused_rather_than_read() {
+    const AT: usize = USER_AT + 0x600;
+    const KEY_SP: usize = USER_AT + 0x1800;
+
+    for (stored_siginfo, asked) in [(0usize, RT_SIGRETURN), (AT, SIGRETURN)] {
+        let proc = a_process(
+            if stored_siginfo == 0 { 48_562 } else { 48_563 },
+            Abi::Linux32,
+        );
+        let got = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                put(AT, &[0u8; 128]);
+                sys.thread
+                    .backup_context(UserContext::default(), stored_siginfo, AT, KEY_SP);
+                sys.thread
+                    .with_context(|ctx| {
+                        ctx.set_field(kernel_hal::context::UserContextField::StackPointer, KEY_SP)
+                    })
+                    .unwrap();
+                as_mut(sys)
+                    .compat32_syscall(asked, [0, 0, 0, 0, 0, 0])
+                    .await
+            })
+        });
+        assert_eq!(
+            got, EINVAL,
+            "number {asked} on the other frame answered {got}"
+        );
+        proc.exit(0);
+    }
 }
