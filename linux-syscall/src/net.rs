@@ -534,6 +534,7 @@ impl Syscall<'_> {
                 // the server has accepted, instead of getting ENOTCONN.
                 let server_side = UnixSocketState::new();
                 server_side.set_path(server.bound_path());
+                server_side.set_socket_type(server.sock_type());
                 UnixSocketState::connect_pair(&client, &server_side);
                 server.push_accept(server_side);
                 return Ok(0);
