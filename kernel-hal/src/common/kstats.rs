@@ -815,7 +815,17 @@ static NMI_RBP_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) };
 ///
 /// `rbp` is the interrupted frame pointer when the NMI landed in the kernel,
 /// and 0 when it landed in userspace (see [`NMI_RBP_PERCPU`]).
+///
+/// The CPU is named from the APIC, never from GS: an NMI can land in the
+/// `swapgs` windows of the syscall entry and return paths, where CS is ring 0
+/// but GS is the user's. Reading the id from there was a load of
+/// `gs:[logical_cpu_valid]` (offset 0x71) through the user GS base -- a
+/// kernel #PF at 0x71 taken inside the NMI, with user GS, whose `iretq` also
+/// re-enabled NMIs while the first one was still on its stack (#2402).
 pub fn note_nmi_rip(rip: u64, rbp: u64) {
+    #[cfg(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64")))]
+    let cpu = lock::current_cpu_id_via_apic() as usize;
+    #[cfg(not(all(target_os = "none", any(target_arch = "x86", target_arch = "x86_64"))))]
     let cpu = crate::cpu::cpu_id() as usize;
     if cpu < MAX_CORE_NUM {
         NMI_RIP_PERCPU[cpu].store(rip, Relaxed);

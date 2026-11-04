@@ -33,6 +33,17 @@ pub fn init() {
         if i == 3 || i == 4 || i == 0x80 {
             opt.set_privilege_level(PrivilegeLevel::Ring3);
         }
+        // NMI (vector 2) runs on its own IST stack (IST3; see gdt.rs). It is
+        // not maskable, so it also arrives in the syscall entry and return
+        // paths while `rsp` is walking the heap-allocated `UserContext`, and
+        // pushing a frame there wrote the handler's stack over neighbouring
+        // heap blocks (#2402). Linux gives NMI an IST stack for the same
+        // reason.
+        if i == 2 {
+            unsafe {
+                opt.set_stack_index(2);
+            }
+        }
         // Double fault (#DF, vector 8) runs on its own known-good IST stack
         // (see gdt.rs). Without it, the dominant #DF cause — a kernel stack
         // overflow — pushes the exception frame onto the very stack that just

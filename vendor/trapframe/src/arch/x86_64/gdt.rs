@@ -324,6 +324,14 @@ pub fn init() {
     // resumes, or panics with a backtrace instead of vanishing. 16 KiB is ample.
     let gp_stack_top = Box::leak(Box::new([0u8; 0x4000])).as_ptr() as u64 + 0x4000;
     region.tss.interrupt_stack_table[1] = VirtAddr::new(gp_stack_top);
+    // Dedicated NMI stack (IST3; see idt.rs vector 2). An NMI is delivered
+    // even with interrupts off, so it can land in the syscall entry/return
+    // windows where `rsp` points into the thread's `UserContext` on the heap
+    // (`mov rsp, rdi` ... `pop`s in syscall.S). Without an IST the CPU pushes
+    // its frame, and the handler its whole call chain, below that context:
+    // over whatever heap blocks sit there.
+    let nmi_stack_top = Box::leak(Box::new([0u8; 0x4000])).as_ptr() as u64 + 0x4000;
+    region.tss.interrupt_stack_table[2] = VirtAddr::new(nmi_stack_top);
     let region: &'static CpuLocalRegion = Box::leak(region);
     let tss: &'static TSS = &region.tss;
     let (tss0, tss1) = match Descriptor::tss_segment(tss) {
@@ -458,6 +466,14 @@ pub fn init_ap() {
     // resumes, or panics with a backtrace instead of vanishing. 16 KiB is ample.
     let gp_stack_top = Box::leak(Box::new([0u8; 0x4000])).as_ptr() as u64 + 0x4000;
     region.tss.interrupt_stack_table[1] = VirtAddr::new(gp_stack_top);
+    // Dedicated NMI stack (IST3; see idt.rs vector 2). An NMI is delivered
+    // even with interrupts off, so it can land in the syscall entry/return
+    // windows where `rsp` points into the thread's `UserContext` on the heap
+    // (`mov rsp, rdi` ... `pop`s in syscall.S). Without an IST the CPU pushes
+    // its frame, and the handler its whole call chain, below that context:
+    // over whatever heap blocks sit there.
+    let nmi_stack_top = Box::leak(Box::new([0u8; 0x4000])).as_ptr() as u64 + 0x4000;
+    region.tss.interrupt_stack_table[2] = VirtAddr::new(nmi_stack_top);
     let region: &'static CpuLocalRegion = Box::leak(region);
     let tss: &'static TSS = &region.tss;
     let (tss0, tss1) = match Descriptor::tss_segment(tss) {

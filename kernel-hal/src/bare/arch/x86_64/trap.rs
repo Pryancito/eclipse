@@ -878,12 +878,6 @@ fn report_ud_shape(rip: u64) {
 
 #[no_mangle]
 pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
-    trace!(
-        "Interrupt: {:#x} @ CPU{}",
-        tf.trap_num,
-        super::cpu::cpu_id()
-    );
-
     // [diag] NMI (vector 2) is used only as a "where are you stuck?" probe: it is
     // delivered even to a core spinning with interrupts disabled. Record the
     // interrupted RIP and return — do NOT fall through to the GernelFault panic.
@@ -902,6 +896,12 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
         crate::common::ipi::tlb_shootdown_ack_nmi();
         return;
     }
+
+    trace!(
+        "Interrupt: {:#x} @ CPU{}",
+        tf.trap_num,
+        super::cpu::cpu_id()
+    );
 
     // [diag] A data watchpoint (DR0-DR3) reports as #DB. It is a *trap*: the
     // store has already retired, so once the hit is reported the interrupted
