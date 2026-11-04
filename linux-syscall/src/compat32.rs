@@ -195,6 +195,20 @@ use time64::{
 /// See [`ipc`].
 use ipc::I386_IPC;
 
+/// `waitpid`, which x86_64 does not have AT ALL --- it kept only `wait4`
+/// (61) and `waitid` (247), so there is no native number for this one to be
+/// translated INTO and a row in either table is impossible. Linux has the
+/// same shape: `sys_waitpid` exists only where
+/// `CONFIG_ARCH_WANT_SYS_WAITPID` is set, which 32-bit x86 sets and x86_64
+/// does not, and its whole body is
+/// `kernel_wait4(pid, stat_addr, options, NULL)`.
+///
+/// Found by the sonda, not by reading: a 32-bit process could CREATE a child
+/// with `clone` (120) and then had no way to reap it --- number 7 answered
+/// `ENOSYS`, so `wait`, `waitpid` and `system(3)` were all out of reach. Step
+/// 88, which waits for the child it just made, is where it showed up.
+const I386_WAITPID: u32 = 7;
+
 /// And `ioctl`, which is in neither allowlist because the thing to vouch for
 /// is not the call but the **request**. See [`ioctl`].
 const I386_IOCTL: u32 = 54;
@@ -255,6 +269,19 @@ impl Syscall<'_> {
         // `ENOSYS` for a call that is right here.
         let [a0, a1, a2, a3, a4, a5] = args;
         match num {
+            // `waitpid`, a number x86_64 does not have: the same nucleus as
+            // `wait4` with the `struct rusage` the caller never passes, which
+            // is exactly what Linux's `sys_waitpid` is. `a0 as i32` is the
+            // load-bearing cast --- the registers arrive zero-extended, so
+            // the `-1` that means "any child" is `0xffff_ffff` here and a
+            // handler taking it as a `usize` would look for process four
+            // billion.
+            I386_WAITPID => {
+                return syscall_ret(
+                    self.sys_wait4(a0 as i32, a1.into(), a2 as u32, 0.into())
+                        .await,
+                );
+            }
             I386_SET_THREAD_AREA => return syscall_ret(self.sys_set_thread_area(a0)),
             I386_GET_THREAD_AREA => return syscall_ret(self.sys_get_thread_area(a0)),
             I386_LLSEEK => return syscall_ret(self.sys_llseek(a0, a1, a2, a3, a4)),
@@ -410,6 +437,9 @@ mod utimes_tests;
 /// `siginfo_t` that does not change size and a `struct rusage` that halves.
 #[cfg(test)]
 mod waitid_tests;
+
+#[cfg(test)]
+mod waitpid_tests;
 
 /// `timer_create` (259), whose `struct sigevent` moves EVERY field, because
 /// its first member is a union holding a pointer.
