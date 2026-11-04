@@ -275,8 +275,12 @@ fn the_time_left_is_written_at_the_width_of_the_number() {
             (narrow, (w, super::tests::get(TS_AT, 32)))
         })
     });
-    assert_eq!(narrow.0, 0, "pselect6 (308)");
-    assert_eq!(wide.0, 0, "pselect6_time64 (413) is not wired");
+    assert_eq!(narrow.0, 0, "308 has to answer 0 here");
+    assert_eq!(
+        wide.0, 0,
+        "413 has to answer 0 here: if this is the assert that falls, it is not \
+         wired at all and the widths below mean nothing"
+    );
     assert_eq!(
         super::tests::word(&narrow.1, 8),
         0xaaaa_aaaa,

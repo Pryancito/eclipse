@@ -852,6 +852,13 @@ impl Syscall<'_> {
     /// the process --- which is why this call is in both of this layer's
     /// rules at once, like `utimensat_time64` before it. See
     /// [`crate::compat32::time64`].
+    ///
+    /// The parameter is `timeout_abi32` and not the `abi32` the other `_at`
+    /// cores take, because in this one the name would be a lie: a 32-bit
+    /// process coming in by 413 passes `false` here while its sixth argument
+    /// is still read narrow. Everywhere else the two coincide and there is
+    /// only one width to name; here they do not. Pointed out by Copilot on the
+    /// #2414.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn pselect6_at(
         &mut self,
@@ -861,7 +868,7 @@ impl Syscall<'_> {
         err: UserInOutPtr<u32>,
         mut timeout: UserInOutPtr<TimeSpec>,
         sigset_arg: usize,
-        abi32: bool,
+        timeout_abi32: bool,
     ) -> SysResult {
         // pselect6's timeout is a `timespec` (NANOseconds). It was previously
         // parsed as select(2)'s `timeval` (MICROseconds), inflating every
@@ -871,7 +878,7 @@ impl Syscall<'_> {
         let (timeout_msecs, timeout_left) = if timeout.is_null() {
             (-1, None)
         } else {
-            let ts = crate::narrow::narrow_get(abi32, &timeout)?;
+            let ts = crate::narrow::narrow_get(timeout_abi32, &timeout)?;
             (ts.try_into_poll_msecs()?, Some(ts.try_into_duration()?))
         };
         let sticky = self.linux_process().personality() & STICKY_TIMEOUTS != 0;
@@ -901,7 +908,11 @@ impl Syscall<'_> {
             // A `timespec` in read-only memory must not turn a completed
             // select into EFAULT (`fs/select.c`, "sticky"): the write's
             // failure is ignored.
-            let _ = crate::narrow::narrow_put(abi32, &mut timeout, TimeSpec::from_duration(left));
+            let _ = crate::narrow::narrow_put(
+                timeout_abi32,
+                &mut timeout,
+                TimeSpec::from_duration(left),
+            );
         }
         result
     }

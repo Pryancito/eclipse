@@ -61,6 +61,14 @@ use linux_object::time::{ITimerSpec, ITimerVal, RUsage, TimeSpec, TimeVal, Tms};
 /// `timeval`s and fourteen `long`s.
 const MAX_WORDS: usize = 18;
 
+/// [`Narrow::UNSIGNED_WORDS`] is a `u32`, so a structure of more than
+/// thirty-two words could not say which of them are unsigned, and the `1 << i`
+/// that reads the mask would overflow. It cannot happen while `MAX_WORDS` is
+/// eighteen --- `words[..T::WORDS]` would panic long before --- but the mask's
+/// type is a bound of its own and this is the compiler, not a comment, saying
+/// so. Pointed out by Copilot on the #2414.
+const _: () = assert!(MAX_WORDS <= u32::BITS as usize);
+
 /// A structure laid out as a run of machine words: eight bytes each to a
 /// 64-bit process, four bytes each to a 32-bit one.
 ///
@@ -301,7 +309,7 @@ fn from_narrow_bytes<T: Narrow>(bytes: &[u8]) -> T {
     let mut words = [0u64; MAX_WORDS];
     let (slots, _) = bytes.as_chunks::<4>();
     for (i, (word, slot)) in words[..T::WORDS].iter_mut().zip(slots.iter()).enumerate() {
-        *word = if T::UNSIGNED_WORDS & (1 << i) != 0 {
+        *word = if T::UNSIGNED_WORDS & (1u32 << i) != 0 {
             u32::from_ne_bytes(*slot) as u64
         } else {
             i32::from_ne_bytes(*slot) as i64 as u64
