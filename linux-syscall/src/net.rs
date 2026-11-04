@@ -263,6 +263,30 @@ const SO_PEERGROUPS: usize = 59;
 /// its own IPC channels, would write nothing at all.
 const MEM_DEFAULT: usize = 212_992;
 
+/// The most one `sendmsg`/`recvmsg` moves in a single call on `file_like`.
+///
+/// `SYSCALL_IO_MAX` everywhere but on a message-oriented AF_UNIX socket,
+/// which takes a whole message up to `MEM_DEFAULT`, the `SO_SNDBUF` it
+/// reports. A caller sizes its messages by that answer: ipc-channel (Servo's
+/// IPC) cuts fragments of `SO_SNDBUF` minus the control-message reserve,
+/// about 207 KiB. With a 64 KiB gather every message past 64 KiB came back
+/// `EMSGSIZE`, which ipc-channel treats as fatal, while Linux takes it.
+fn message_io_cap(file_like: &Arc<dyn FileLike>) -> usize {
+    let message = file_like
+        .downcast_ref::<UnixSocketState>()
+        .is_some_and(|unix| {
+            matches!(
+                unix.sock_type(),
+                SocketType::SOCK_SEQPACKET | SocketType::SOCK_DGRAM
+            )
+        });
+    if message {
+        MEM_DEFAULT.max(super::SYSCALL_IO_MAX)
+    } else {
+        super::SYSCALL_IO_MAX
+    }
+}
+
 /// The two `SOL_SOCKET` options whose `ENOPROTOOPT` is the answer mainline
 /// Linux gives too, so a `getsockopt` for one of them is not worth shouting
 /// about.
@@ -534,6 +558,7 @@ impl Syscall<'_> {
                 // the server has accepted, instead of getting ENOTCONN.
                 let server_side = UnixSocketState::new();
                 server_side.set_path(server.bound_path());
+                server_side.set_socket_type(server.sock_type());
                 UnixSocketState::connect_pair(&client, &server_side);
                 server.push_accept(server_side);
                 return Ok(0);
@@ -1094,12 +1119,13 @@ impl Syscall<'_> {
         // Always through a fallible, capped buffer — `read_to_vec` was an
         // infallible allocation of the full gather size (up to SYSCALL_IO_MAX
         // for the stream short path, and that path used `vec![0; IO_MAX]` too).
+        let io_cap = message_io_cap(&file_like);
         let data = {
-            let want = if total > super::SYSCALL_IO_MAX {
+            let want = if total > io_cap {
                 if !matches!(sock_type, Some(SocketType::SOCK_STREAM)) {
                     return Err(LxError::EMSGSIZE);
                 }
-                super::SYSCALL_IO_MAX
+                io_cap
             } else {
                 total
             };
@@ -1183,10 +1209,10 @@ impl Syscall<'_> {
         let iov_ptr = hdr.msg_iov;
         let iovlen = hdr.msg_iovlen;
         let mut iovs = self.read_iovecs(iov_ptr, iovlen)?;
-        let total_len = iovs.total_len().min(super::SYSCALL_IO_MAX);
+        let file_like = self.linux_process().get_file_like(sockfd.into())?;
+        let total_len = iovs.total_len().min(message_io_cap(&file_like));
         let mut data = crate::try_zeroed_buf(total_len)?;
 
-        let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let old_flags = file_like.flags();
         let force_nonblock =
             (flags & MSG_DONTWAIT) != 0 && !old_flags.contains(OpenFlags::NON_BLOCK);
@@ -2146,6 +2172,37 @@ mod peercred_tests {
         assert_eq!(
             words(peercred_bytes(Some(43_102))),
             [43_102, u32::MAX, u32::MAX]
+        );
+    }
+}
+
+#[cfg(test)]
+mod message_io_cap_tests {
+    //! A message-oriented unix socket takes a whole message as big as the
+    //! `SO_SNDBUF` it reports; everything else keeps the 64 KiB gather.
+
+    use super::*;
+
+    fn unix(ty: SocketType) -> Arc<dyn FileLike> {
+        let s = UnixSocketState::new();
+        s.set_socket_type(ty);
+        s
+    }
+
+    #[test]
+    fn seqpacket_and_dgram_take_what_so_sndbuf_promises() {
+        for ty in [SocketType::SOCK_SEQPACKET, SocketType::SOCK_DGRAM] {
+            assert_eq!(message_io_cap(&unix(ty)), MEM_DEFAULT);
+        }
+        // ipc-channel's first fragment: SO_SNDBUF minus its 1 KiB reserve.
+        assert!(message_io_cap(&unix(SocketType::SOCK_SEQPACKET)) > 200 * 1024);
+    }
+
+    #[test]
+    fn a_stream_keeps_the_short_write_cap() {
+        assert_eq!(
+            message_io_cap(&unix(SocketType::SOCK_STREAM)),
+            super::super::SYSCALL_IO_MAX
         );
     }
 }

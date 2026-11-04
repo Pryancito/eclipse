@@ -104,12 +104,10 @@ pub struct UnixSocketState {
 struct UnixInner {
     flags: OpenFlags,
     /// The `type` argument this socket was created with. `sys_socket` routes
-    /// EVERY AF_UNIX type here -- `(Domain::AF_UNIX, _, _)` -- but this
-    /// implementation is byte-stream only: `write` appends into the peer's
-    /// `buffer` and `read` drains it, with no message boundaries anywhere. So
-    /// the requested type is recorded rather than implemented, purely so
-    /// callers can tell a datagram/seqpacket socket apart from a stream one
-    /// (`sendmsg` refuses to truncate an oversized message on the former).
+    /// EVERY AF_UNIX type here -- `(Domain::AF_UNIX, _, _)`. The bytes always
+    /// travel through the peer's `buffer`; what the type changes is whether a
+    /// write is one record (`SOCK_SEQPACKET` / `SOCK_DGRAM`, see `records`)
+    /// and whether `sendmsg` may truncate an oversized message (stream only).
     sock_type: SocketType,
     /// Local bound path (set by bind or inherited on accept)
     path: String,
@@ -122,6 +120,22 @@ struct UnixInner {
     total_written: usize,
     /// Monotonic total bytes ever consumed from `buffer`.
     total_read: usize,
+    /// Record boundaries in `buffer`, as the `total_written` offset where
+    /// each message from a message-oriented peer ends. A read never crosses
+    /// one, so `recvmsg` returns one message per call, as Linux does for
+    /// `SOCK_SEQPACKET` and `SOCK_DGRAM`.
+    ///
+    /// Without them two queued messages came out of one `recvmsg` glued
+    /// together. ipc-channel (Servo's IPC) sizes its read to the largest
+    /// fragment and checks the byte count against the header of the first
+    /// one: a second message in the same read made the counts disagree, so
+    /// the content process's replies never reached the browser and every
+    /// page stayed blank under a "Nueva pestaña" tab.
+    ///
+    /// A read shorter than the record leaves the rest at the head for the
+    /// next read. Linux would drop it and set `MSG_TRUNC`; keeping it loses
+    /// nothing and is what this socket did before records existed.
+    records: VecDeque<usize>,
     eventbus: EventBus,
     /// True after listen() is called
     is_listening: bool,
@@ -205,6 +219,7 @@ impl Default for UnixSocketState {
                 buffer: VecDeque::new(),
                 total_written: 0,
                 total_read: 0,
+                records: VecDeque::new(),
                 eventbus: EventBus::default(),
                 is_listening: false,
                 accept_queue: VecDeque::new(),
@@ -237,6 +252,13 @@ impl UnixSocketState {
     /// Record the `type` this socket was requested with (see `UnixInner::sock_type`).
     pub fn set_socket_type(&self, sock_type: SocketType) {
         self.inner.lock().sock_type = sock_type;
+    }
+
+    /// The `type` this socket was requested with. The server end that
+    /// `connect` builds takes the listener's, so a `SOCK_SEQPACKET` server
+    /// answers in records too.
+    pub fn sock_type(&self) -> SocketType {
+        self.inner.lock().sock_type
     }
 
     /// Wire two sockets together bidirectionally.
@@ -660,7 +682,20 @@ impl Socket for UnixSocketState {
             // old order answered `shutdown(SHUT_RD)` with 0 straight away and
             // silently dropped whatever the peer had already sent.
             if !inner.buffer.is_empty() {
-                let len = core::cmp::min(data.len(), inner.buffer.len());
+                // Records already read past are spent (a stream read before
+                // the type was known, say); drop them so the head is current.
+                while inner
+                    .records
+                    .front()
+                    .is_some_and(|end| *end <= inner.total_read)
+                {
+                    inner.records.pop_front();
+                }
+                let available = match inner.records.front() {
+                    Some(end) => (*end - inner.total_read).min(inner.buffer.len()),
+                    None => inner.buffer.len(),
+                };
+                let len = core::cmp::min(data.len(), available);
                 // Bulk copy from the deque's two contiguous halves instead of a
                 // per-byte pop_front loop: every Wayland/D-Bus message crosses
                 // here, and the byte loop made each one O(n) branchy work under
@@ -751,14 +786,18 @@ impl Socket for UnixSocketState {
         // that cycle hangs the whole machine — which is exactly what happened
         // when a Wayland client (alacritty) and the compositor (labwc) flooded
         // their socket bidirectionally. Mirrors `peer_pid`/`send_fds`.
-        let peer = {
+        let (peer, message) = {
             let inner = self.inner.lock();
             if inner.write_closed {
                 return Err(LxError::EPIPE);
             }
+            let message = matches!(
+                inner.sock_type,
+                SocketType::SOCK_SEQPACKET | SocketType::SOCK_DGRAM
+            );
             match &inner.peer {
                 None => return Err(LxError::ENOTCONN),
-                Some(peer_weak) => peer_weak.upgrade().ok_or(LxError::EPIPE)?,
+                Some(peer_weak) => (peer_weak.upgrade().ok_or(LxError::EPIPE)?, message),
             }
         };
         let mut pi = peer.lock();
@@ -774,6 +813,17 @@ impl Socket for UnixSocketState {
         let space = pi.send_space();
         if space == 0 {
             return Err(LxError::EAGAIN);
+        }
+        // A message goes in whole or not at all: a short write would split
+        // one record into two. Too big for the queue ever is `EMSGSIZE`;
+        // too big for the room left now is `EAGAIN`, which `sendmsg` waits on
+        // for a blocking caller.
+        if message && data.len() > space {
+            return Err(if data.len() > UNIX_STREAM_BUF_MAX {
+                LxError::EMSGSIZE
+            } else {
+                LxError::EAGAIN
+            });
         }
         let n = data.len().min(space);
         let n_offset = pi.total_written;
@@ -811,6 +861,10 @@ impl Socket for UnixSocketState {
         // of memcpys) instead of the element-wise TrustedLen loop.
         pi.buffer.extend(&data[..n]);
         pi.total_written += n;
+        if message && n > 0 {
+            let end = pi.total_written;
+            pi.records.push_back(end);
+        }
         pi.eventbus.set(Event::READABLE);
         Ok(n)
     }
@@ -2526,5 +2580,81 @@ mod is_socket_tests {
         use crate::process::dup_fd_tests::{an_open_log, Log};
         let f = an_open_log(Log::new(), crate::fs::OpenFlags::RDWR);
         assert!(!f.is_socket());
+    }
+}
+
+/// `SOCK_SEQPACKET` / `SOCK_DGRAM` keep each write as one record. Servo's
+/// ipc-channel depends on it: it reads with a buffer as big as its largest
+/// fragment and expects exactly one fragment back.
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    fn pair(ty: SocketType) -> (Arc<UnixSocketState>, Arc<UnixSocketState>) {
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+        a.set_socket_type(ty);
+        b.set_socket_type(ty);
+        (a, b)
+    }
+
+    async fn read(at: &Arc<UnixSocketState>, n: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; n];
+        let got = Socket::read(&**at, &mut buf).await.0.expect("read");
+        buf.truncate(got);
+        buf
+    }
+
+    #[async_std::test]
+    async fn two_seqpacket_messages_come_out_one_per_read() {
+        let (a, b) = pair(SocketType::SOCK_SEQPACKET);
+        Socket::write(&*a, b"primero", None).unwrap();
+        Socket::write(&*a, b"segundo!", None).unwrap();
+        assert_eq!(read(&b, 4096).await, b"primero");
+        assert_eq!(read(&b, 4096).await, b"segundo!");
+    }
+
+    #[async_std::test]
+    async fn a_datagram_pair_keeps_boundaries_too() {
+        let (a, b) = pair(SocketType::SOCK_DGRAM);
+        Socket::write(&*a, b"uno", None).unwrap();
+        Socket::write(&*a, b"dos", None).unwrap();
+        assert_eq!(read(&b, 64).await, b"uno");
+        assert_eq!(read(&b, 64).await, b"dos");
+    }
+
+    #[async_std::test]
+    async fn a_short_read_leaves_the_rest_of_the_record_and_stops_there() {
+        let (a, b) = pair(SocketType::SOCK_SEQPACKET);
+        Socket::write(&*a, b"abcdef", None).unwrap();
+        Socket::write(&*a, b"XYZ", None).unwrap();
+        assert_eq!(read(&b, 4).await, b"abcd");
+        assert_eq!(read(&b, 64).await, b"ef");
+        assert_eq!(read(&b, 64).await, b"XYZ");
+    }
+
+    #[async_std::test]
+    async fn a_stream_still_reads_across_writes() {
+        let (a, b) = pair(SocketType::SOCK_STREAM);
+        Socket::write(&*a, b"ab", None).unwrap();
+        Socket::write(&*a, b"cd", None).unwrap();
+        assert_eq!(read(&b, 64).await, b"abcd");
+    }
+
+    #[test]
+    fn a_message_never_goes_in_half() {
+        let (a, b) = pair(SocketType::SOCK_SEQPACKET);
+        let filler = vec![0u8; UNIX_STREAM_BUF_MAX - 10];
+        Socket::write(&*a, &filler, None).unwrap();
+        // Ten bytes of room, twenty asked: nothing goes in.
+        assert_eq!(Socket::write(&*a, &[1u8; 20], None), Err(LxError::EAGAIN));
+        assert_eq!(b.inner.lock().buffer.len(), filler.len());
+        // Bigger than the queue could ever hold.
+        let (c, _d) = pair(SocketType::SOCK_SEQPACKET);
+        assert_eq!(
+            Socket::write(&*c, &vec![0u8; UNIX_STREAM_BUF_MAX + 1], None),
+            Err(LxError::EMSGSIZE)
+        );
     }
 }
