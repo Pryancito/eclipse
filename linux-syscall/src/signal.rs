@@ -265,7 +265,11 @@ fn deliver_direct_sigkill(
 /// real-time signal past its `RLIMIT_SIGPENDING` (a `tkill` too, whose
 /// `SI_TKILL` is not `kill(2)`'s `SI_USER`), with nothing made pending and
 /// nobody woken.
-fn queue_signal_to_thread(thread: &Arc<Thread>, signal: Signal, info: SigInfo) -> LxResult<()> {
+pub(crate) fn queue_signal_to_thread(
+    thread: &Arc<Thread>,
+    signal: Signal,
+    info: SigInfo,
+) -> LxResult<()> {
     // The same three steps `do_send_specific` takes, and only the middle one
     // used to be here. `prepare_signal` and the job-control half of
     // `complete_signal` are process-wide even for a signal aimed at one
@@ -1096,12 +1100,50 @@ impl Syscall<'_> {
     pub async fn sys_rt_sigtimedwait(
         &mut self,
         set: UserInPtr<Sigset>,
-        mut info: UserOutPtr<SigInfo>,
+        info: UserOutPtr<SigInfo>,
         timeout: UserInPtr<TimeSpec>,
         sigsetsize: usize,
     ) -> SysResult {
+        self.rt_sigtimedwait_at(set, info, timeout, sigsetsize, self.narrow_abi())
+            .await
+    }
+
+    /// The core both `rt_sigtimedwait` (native 177 / i386's 177) and
+    /// `rt_sigtimedwait_time64` (i386's 421) reach, with the width of the
+    /// `struct timespec` handed in rather than asked of the process.
+    ///
+    /// The **third** call of this layer that is in both of its rules at once,
+    /// after `utimensat_time64` and `pselect6`, and the first where the two
+    /// structures go in opposite directions:
+    ///
+    /// | | whose width |
+    /// |---|---|
+    /// | the `struct timespec` timeout, inwards | the **number**'s |
+    /// | the `siginfo_t`, outwards | the **process**'s |
+    ///
+    /// So the parameter is `timeout_abi32` and names only the timeout; the
+    /// `siginfo_t` asks `self.narrow_abi()` below, because a `compat_siginfo`
+    /// is what a 32-bit process reads whichever number it came in by.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn rt_sigtimedwait_at(
+        &mut self,
+        set: UserInPtr<Sigset>,
+        mut info: UserOutPtr<SigInfo>,
+        timeout: UserInPtr<TimeSpec>,
+        sigsetsize: usize,
+        timeout_abi32: bool,
+    ) -> SysResult {
         check_sigsetsize(sigsetsize)?;
-        let mut waitset = set.read()?;
+        // Not `set.read()`: a `Sigset` is a `u64`, so the typed read demands
+        // an 8-aligned address, and an i386 `sigset_t` is
+        // `unsigned long sig[2]`, which aligns to **4**. A 32-bit program's
+        // waited-for set can therefore sit at an address congruent to 4
+        // modulo 8 --- and Linux reads it. This is the same alignment form of
+        // the trap `install_temp_sigmask` below already handles, and the
+        // reason this read is the width of the PROCESS and not of the number:
+        // the SIZE does not change with either, only whether the address may
+        // be 4-aligned.
+        let mut waitset = crate::narrow::wide_get_unaligned(self.narrow_abi(), &set)?;
         // SIGKILL/SIGSTOP can never be caught or waited for.
         waitset.remove(Signal::SIGKILL);
         waitset.remove(Signal::SIGSTOP);
@@ -1110,7 +1152,7 @@ impl Syscall<'_> {
         let deadline = if timeout.is_null() {
             None
         } else {
-            let dur = self.get_narrow(&timeout)?.try_into_duration()?;
+            let dur = crate::narrow::narrow_get(timeout_abi32, &timeout)?.try_into_duration()?;
             // Saturating: adding a `Duration` panics on overflow, and this
             // one comes from userspace.
             Some(kernel_hal::timer::timer_now().saturating_add(dur))
@@ -1125,7 +1167,18 @@ impl Syscall<'_> {
         // With what came with it: who sent it, which child it is about.
         // `sigwaitinfo(3)` is how a program asks for that.
         if !info.is_null() {
-            info.write(si)?;
+            if self.narrow_abi() {
+                // A `compat_siginfo`: the same 128 bytes, but the union
+                // starts at byte 12 and not 16, so copying the native ones
+                // across would hand a 32-bit program its own padding as
+                // `si_pid`. `to_i386_bytes` is the conversion the signal
+                // frame already pushes; see
+                // [`linux_object::signal::siginfo32`].
+                let mut at: UserOutPtr<u8> = info.as_addr().into();
+                at.write_array(&si.to_i386_bytes())?;
+            } else {
+                info.write(si)?;
+            }
         }
         Ok(sig as usize)
     }

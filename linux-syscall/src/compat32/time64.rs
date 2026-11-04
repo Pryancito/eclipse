@@ -80,10 +80,27 @@
 //! before: a **pointer**, which is zero-extended and not sign-extended. See
 //! `PSelectSigsetArg`.
 //!
+//! ## 421, and the third call in both rules at once
+//!
+//! `rt_sigtimedwait_time64` (421) is the third, after `utimensat_time64` and
+//! `pselect6`, and the first where the two structures go in **opposite
+//! directions**: a `struct timespec` timeout inwards, whose width is the
+//! number's, and a `siginfo_t` outwards, whose width is the process's.
+//!
+//! The `siginfo_t` is not halved at all --- 128 bytes at both widths --- so
+//! what the conversion is for is that its union STARTS four bytes earlier on
+//! i386. See [`linux_object::signal::siginfo32`], and
+//! [`crate::Syscall::rt_sigtimedwait_at`] for the core the two numbers share.
+//! Wiring it is also what let i386's plain `rt_sigtimedwait` (177) into the
+//! translation table, where both of its widths are the process's.
+//!
 //! ## What is still missing
 //!
-//! `recvmmsg_time64` (417); and `rt_sigtimedwait_time64` (421), which passes
-//! a `siginfo_t` outwards.
+//! Only `recvmmsg_time64` (417) --- and not for a reason of width.
+//! [`crate::Syscall::sys_recvmmsg`] takes four arguments and **does not read
+//! the timeout at all**, in either ABI, so there is no structure for 417 to
+//! convert. Honouring that timeout is a change to the native call and a job
+//! of its own; until then, a 417 here would convert nothing.
 
 use super::*;
 use crate::file::ITimerSpec;
@@ -116,6 +133,8 @@ pub(super) const I386_TIMER_GETTIME64: u32 = 408;
 pub(super) const I386_TIMER_SETTIME64: u32 = 409;
 /// i386's number for `pselect6_time64`.
 pub(super) const I386_PSELECT6_TIME64: u32 = 413;
+/// i386's number for `rt_sigtimedwait_time64`.
+pub(super) const I386_RT_SIGTIMEDWAIT_TIME64: u32 = 421;
 
 impl Syscall<'_> {
     /// `clock_gettime64` (403): the native call, writing a
@@ -247,6 +266,24 @@ impl Syscall<'_> {
             .await
     }
 
+    /// `rt_sigtimedwait_time64` (421): the timeout is a
+    /// `struct __kernel_timespec`.
+    ///
+    /// The other structure goes the other way. The `siginfo_t` this writes is
+    /// a `compat_siginfo` because the PROCESS is 32-bit, by this number or by
+    /// 177, so the core asks the process for that one and takes only the
+    /// timeout's width as a parameter.
+    pub async fn sys_rt_sigtimedwait_time64(
+        &mut self,
+        set: UserInPtr<linux_object::signal::Sigset>,
+        info: UserOutPtr<linux_object::signal::SigInfo>,
+        timeout: UserInPtr<TimeSpec>,
+        sigsetsize: usize,
+    ) -> SysResult {
+        self.rt_sigtimedwait_at(set, info, timeout, sigsetsize, false)
+            .await
+    }
+
     /// `sched_rr_get_interval_time64` (423).
     pub fn sys_sched_rr_get_interval_time64(
         &self,
@@ -289,3 +326,8 @@ mod shared_core_tests;
 /// first POINTER to go through [`crate::narrow`]. Own file, own subject.
 #[cfg(test)]
 mod pselect_tests;
+/// `rt_sigtimedwait_time64` (421) next to i386's 177: the third call in both
+/// rules at once, and the first whose two structures go in opposite
+/// directions. Own file, own subject.
+#[cfg(test)]
+mod sigtimedwait_tests;

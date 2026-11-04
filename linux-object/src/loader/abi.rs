@@ -552,6 +552,14 @@ pub const AT_EXECFN: u8 = 31;
 /// itself insists on, so the two answers to "how small may a signal stack
 /// be" agree, and it is larger than the frame we push (no FPU state goes in
 /// it, see `ucontext::MachineContext::fpstate`).
+///
+/// Only x86 passes it, which is where glibc needs it, so the two
+/// `map.insert` sites in [`crate::loader`] are `cfg(target_arch =
+/// "x86_64")` --- and on every other architecture nothing reads this, which
+/// `deny(warnings)` turns into a build failure. The number itself is not
+/// architecture-specific (it is 51 in `uapi/linux/auxvec.h` for everyone), so
+/// the constant stays and says so, the way `write_at` above does.
+#[allow(dead_code)]
 pub const AT_MINSIGSTKSZ: u8 = 51;
 
 /// The identity block of the aux vector: who the kernel says this process is,

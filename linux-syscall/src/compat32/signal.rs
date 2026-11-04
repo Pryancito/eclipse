@@ -29,9 +29,13 @@
 //! Their `struct old_sigaction` keeps a 32-bit `sa_mask` and their frame is a
 //! `struct sigframe_ia32` with no `siginfo` --- a second layout, reached only
 //! by a libc that does not use `rt_sigaction`, which musl and glibc both do.
-//! `rt_sigqueueinfo` (178) and `rt_sigtimedwait` (177) pass a `siginfo_t`
-//! **inwards**, which needs the conversion of
-//! [`linux_object::signal::siginfo32`] run backwards and is not written yet.
+//! `rt_sigqueueinfo` (178) passes a `siginfo_t` **inwards**, which needs the
+//! conversion of [`linux_object::signal::siginfo32`] run backwards and is not
+//! written yet. `rt_sigtimedwait` (177) is **not** here and needs no handler
+//! of its own: its `siginfo_t` goes **outwards**, so the conversion that
+//! already exists is the one it needs, and both of its structures are the
+//! width of the process, which is what the narrow table asks. It is in
+//! `i386_abi_narrow.in`.
 
 use super::*;
 use linux_object::signal::ucontext::i386::SignalStack32;
