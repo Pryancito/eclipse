@@ -46,6 +46,7 @@ use zircon_object::vm::{MMUFlags, VmObject};
 const I386_TIMER_CREATE: u32 = 259;
 
 const EINVAL: isize = -(LxError::EINVAL as isize);
+const EFAULT: isize = -(LxError::EFAULT as isize);
 const ENOSYS: isize = -(LxError::ENOSYS as isize);
 
 const CLOCK_MONOTONIC: usize = 1;
@@ -65,6 +66,11 @@ const SEV_AT: usize = USER_AT + 0x104;
 const SEV_AT_WIDE: usize = USER_AT + 0x800;
 /// Where the timer id comes back. A `timer_t` is an `int` at both widths.
 const ID_AT: usize = USER_AT + 0xc00;
+/// And an address that is **not even 4-aligned**: Linux asks nothing of the
+/// alignment of a `struct sigevent *`, so a program may point it into a `char`
+/// buffer at any byte. One each for the two widths.
+const SEV_AT_ODD: usize = USER_AT + 0x201;
+const SEV_AT_ODD_WIDE: usize = USER_AT + 0xa01;
 
 /// `SIGEV_SIGNAL`, which is zero --- and being zero is what makes the shared
 /// four bytes an invalid signal to the other reading.
@@ -78,7 +84,33 @@ const NOTIFY_SIGNO: i32 = Signal::SIGALRM as i32;
 /// and the value a sign-extending widening would turn into a kernel address.
 const SIVAL: u32 = 0x8000_0000;
 
-fn a_process(pid: KoID, abi: Abi) -> alloc::sync::Arc<Process> {
+/// A fixture process that exits when the test does.
+///
+/// The sibling files of this one end with a plain `proc.exit(0)`, which is
+/// enough for a passing test; here it is a guard because three of these tests
+/// CREATE A TIMER, and a timer outlives the test in the global registry --- it
+/// is `register_posix_timer`'s entry plus the signal-queue charge
+/// `RLIMIT_SIGPENDING` counts --- until its owner exits. A test that panics
+/// would leave those behind for whatever runs next. `ensure_posix_timers_die_
+/// with_their_owner` is what collects them, and the exit is what it waits for.
+/// Pointed out by Copilot on the #2422.
+struct Fixture(alloc::sync::Arc<Process>);
+
+impl core::ops::Deref for Fixture {
+    type Target = alloc::sync::Arc<Process>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.0.exit(0);
+    }
+}
+
+fn a_process(pid: KoID, abi: Abi) -> Fixture {
     let lp = LinuxProcess::new(RamFS::new(), 0);
     lp.set_abi(abi);
     let proc = Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "sigevent32", lp).unwrap();
@@ -92,7 +124,7 @@ fn a_process(pid: KoID, abi: Abi) -> alloc::sync::Arc<Process> {
             MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
         )
         .expect("pages of the process's own, at an address a u32 can hold");
-    proc
+    Fixture(proc)
 }
 
 /// A `Syscall` as a `&mut` one, since `compat32_syscall` takes `&mut self`.
@@ -274,4 +306,44 @@ fn the_sival_of_a_32_bit_caller_widens_with_zeros() {
     // which is what says the two paths mean the same number by it.
     assert_eq!(native.value, SIVAL as usize, "the native sigev_value");
     assert_eq!(native.signo, NOTIFY_SIGNO, "sigev_signo at byte 8");
+}
+
+/// **A `sigevent` that is not even 4-aligned is read, not refused.**
+///
+/// `get_compat_sigevent` is four `__get_user` calls and the native
+/// `do_timer_create` is one `copy_from_user`, and neither asks anything of the
+/// alignment --- so neither may this. A typed `UserPtr::read` would store
+/// through a `*i32` and insist on four bytes, answering `EFAULT` for a pointer
+/// Linux serves; `read_unaligned` is what makes both paths agree with it.
+///
+/// Two mutations die here, one per ABI: either path's reads put back to the
+/// typed `read()`. The 4-mod-8 tests above do not catch the 32-bit one,
+/// because 4 mod 8 is still 4-aligned --- which is exactly why this case is
+/// its own test. Pointed out by Copilot on the #2422.
+#[test]
+fn a_sigevent_at_an_odd_address_is_read_at_either_width() {
+    for (pid, abi, at) in [
+        (48_554, Abi::Linux32, SEV_AT_ODD),
+        (48_555, Abi::Linux, SEV_AT_ODD_WIDE),
+    ] {
+        let proc = a_process(pid, abi);
+        let rc = on_a_thread(&proc, move |sys| {
+            Box::pin(async move {
+                let mut sys = as_mut(sys);
+                let image = if abi == Abi::Linux32 {
+                    narrow_sigevent(NOTIFY_SIGNO, SIGEV_SIGNAL, 0)
+                } else {
+                    native_sigevent(NOTIFY_SIGNO, SIGEV_SIGNAL, 0)
+                };
+                put(at, &image);
+                timer_create_as(&mut sys, abi, [CLOCK_MONOTONIC, at, ID_AT, 0, 0, 0]).await
+            })
+        });
+        assert_ne!(
+            rc, EFAULT,
+            "{abi:?}: the sigevent at {at:#x} was read typed, which refuses an \
+             address this program is allowed to pass"
+        );
+        assert_eq!(rc, 0, "{abi:?}: 259 with a sigevent at an odd address");
+    }
 }

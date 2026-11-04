@@ -36,6 +36,20 @@
 //! because the value only ever comes back out through `to_i386_bytes`, which
 //! truncates it again. It is checked here, on the widened value.
 //!
+//! ## Read UNALIGNED, in both paths
+//!
+//! `get_compat_sigevent` is four `__get_user` calls and the native
+//! `do_timer_create` is one `copy_from_user` of the whole structure, and
+//! **neither asks anything of the alignment**: a program may hand over a
+//! `struct sigevent *` that points into a `char` buffer at any byte. A typed
+//! `UserPtr::read` stores through a `*T`, so it has to insist on
+//! `align_of::<T>()` --- four bytes for these fields, eight for the native
+//! `sigev_value` --- and would answer `EFAULT` for a pointer Linux serves. So
+//! every field here is read with `read_unaligned`, which is the same reason
+//! [`crate::narrow`]'s own helpers do: and note it applies to the **native**
+//! path too, because that one is a statement about the structure and not about
+//! the process. Pointed out by Copilot on the #2422.
+//!
 //! ## What this does NOT do
 //!
 //! Linux's `get_compat_sigevent` runs one `access_ok` over all 64 bytes of the
@@ -77,9 +91,6 @@ pub(crate) struct SigEvent {
 /// and never reaches this function.
 pub(crate) fn sigevent_get(abi32: bool, sevp: usize) -> Result<SigEvent, LxError> {
     if abi32 {
-        // Four 4-byte fields, so a 4-aligned read of each: that is all the
-        // alignment a 32-bit caller's `struct compat_sigevent` promises, and
-        // all these reads require.
         let value_p: UserInPtr<u32> = sevp.into();
         let signo_p: UserInPtr<i32> = (sevp + 4).into();
         let notify_p: UserInPtr<i32> = (sevp + 8).into();
@@ -87,10 +98,10 @@ pub(crate) fn sigevent_get(abi32: bool, sevp: usize) -> Result<SigEvent, LxError
         return Ok(SigEvent {
             // `as usize` of a `u32` is the zero extension, and it is the whole
             // of `compat_ptr()`.
-            value: value_p.read()? as usize,
-            signo: signo_p.read()?,
-            notify: notify_p.read()?,
-            thread_id: tid_p.read()?,
+            value: value_p.read_unaligned()? as usize,
+            signo: signo_p.read_unaligned()?,
+            notify: notify_p.read_unaligned()?,
+            thread_id: tid_p.read_unaligned()?,
         });
     }
     let value_p: UserInPtr<usize> = sevp.into();
@@ -98,9 +109,9 @@ pub(crate) fn sigevent_get(abi32: bool, sevp: usize) -> Result<SigEvent, LxError
     let notify_p: UserInPtr<i32> = (sevp + 12).into();
     let tid_p: UserInPtr<i32> = (sevp + 16).into();
     Ok(SigEvent {
-        value: value_p.read()?,
-        signo: signo_p.read()?,
-        notify: notify_p.read()?,
-        thread_id: tid_p.read()?,
+        value: value_p.read_unaligned()?,
+        signo: signo_p.read_unaligned()?,
+        notify: notify_p.read_unaligned()?,
+        thread_id: tid_p.read_unaligned()?,
     })
 }
