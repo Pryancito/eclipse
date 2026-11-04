@@ -57,7 +57,7 @@
 // The drawing stack, /proc readers, .desktop scanner and input tables live in
 // the `lunarbar` library next door, shared with `lunarrun` (see src/lib.rs).
 use lunarbar::look::Look;
-use lunarbar::{apps, draw, fill_guard, hunter, i18n, icons, obmenu, sysinfo};
+use lunarbar::{apps, draw, fill_guard, hunter, i18n, icons, meter, obmenu, sysinfo};
 
 mod hunter_menu;
 mod hunter_toast;
@@ -740,6 +740,15 @@ struct Metrics {
     kbd: String,
     /// hunter's shield; None (no hunter in this kernel) hides it.
     hunter: Option<hunter::Shield>,
+    /// The last minute of the three metrics that move, so a meter can draw
+    /// where a value came from and not only where it is. Held on `State` and
+    /// cloned in here per tick, because the snapshot is rebuilt every time
+    /// and a history rebuilt every time is not a history.
+    cpu_hist: meter::Ring,
+    mem_hist: meter::Ring,
+    /// Download rate in bytes/s — raw units, scaled to its own window at the
+    /// moment it is drawn.
+    net_hist: meter::Ring,
 }
 
 #[derive(Default)]
@@ -773,6 +782,9 @@ struct State {
     cpu: CpuMeter,
     net: NetMeter,
     metrics: Metrics,
+    /// See [`Metrics::cpu_hist`]: the rings themselves live here, where they
+    /// survive the rebuilding of the snapshot.
+    hist: (meter::Ring, meter::Ring, meter::Ring),
     /// Cached mixer level: read once at startup and updated when the user
     /// drags the slider, never re-read per tick. None hides the module.
     vol: Option<u32>,
@@ -812,12 +824,18 @@ struct State {
 impl State {
     /// One metrics pass per tick, shared by every bar render until the next.
     fn refresh_metrics(&mut self) {
+        let (cpu, mem, net) = (self.cpu.sample(), sysinfo::mem_percent(), self.net.sample());
+        self.hist.0.push_pct(cpu);
+        self.hist.1.push_pct(mem);
+        if let Some(n) = &net {
+            self.hist.2.push(n.down as f32);
+        }
         self.metrics = Metrics {
-            cpu: self.cpu.sample(),
-            mem: sysinfo::mem_percent(),
+            cpu,
+            mem,
             clock: sysinfo::clock_hhmm(),
             date: sysinfo::date_dm(),
-            net: self.net.sample(),
+            net,
             uptime: sysinfo::uptime(),
             load: sysinfo::loadavg(),
             disk: sysinfo::disk_root_percent(),
@@ -829,6 +847,9 @@ impl State {
             vol: self.vol,
             kbd: sysinfo::kbd_layout(),
             hunter: self.metrics.hunter,
+            cpu_hist: self.hist.0.clone(),
+            mem_hist: self.hist.1.clone(),
+            net_hist: self.hist.2.clone(),
         };
         if self.tick.is_multiple_of(hunter_menu::REFRESH_TICKS) {
             self.refresh_hunter();
@@ -2540,20 +2561,22 @@ fn draw_task(
         }
 
         let mem_s = cap(&format!("mem {}%", opt(m.mem)));
-        let mw = Canvas::text_width(&mem_s) + 10;
+        let mw = Canvas::text_width(&mem_s) + 10 + hist_w(&m.mem_hist);
         if rx - mw >= left_min {
             rx -= mw;
             let col = if m.mem.unwrap_or(0) >= 90 { pal().warn } else { pal().muted };
-            cv.text(&mem_s, rx, ty, col);
+            let hw = hist(cv, rx, h as i32, &m.mem_hist, false);
+            cv.text(&mem_s, rx + hw, ty, col);
             rx -= 10;
         }
 
         let cpu_s = cap(&format!("cpu {}%", opt(m.cpu)));
-        let cw = Canvas::text_width(&cpu_s) + 10;
+        let cw = Canvas::text_width(&cpu_s) + 10 + hist_w(&m.cpu_hist);
         if rx - cw >= left_min {
             rx -= cw;
             let col = if m.cpu.unwrap_or(0) >= 90 { pal().warn } else { pal().muted };
-            cv.text(&cpu_s, rx, ty, col);
+            let hw = hist(cv, rx, h as i32, &m.cpu_hist, false);
+            cv.text(&cpu_s, rx + hw, ty, col);
             rx -= 10;
         }
 
@@ -2561,7 +2584,7 @@ fn draw_task(
         // is the one place it can live, and it is what Plasma's tray shows.
         if single_bar() {
             if let Some(n) = m.net.as_ref() {
-                if let Some(x) = net_module(cv, rx, left_min, ty, h as i32, n) {
+                if let Some(x) = net_module(cv, rx, left_min, ty, h as i32, n, &m.net_hist) {
                     rx = x - 10;
                 }
             }
@@ -2699,6 +2722,32 @@ fn bar_edge(cv: &mut Canvas, w: i32, y_edge: i32, y_in: i32, lead_left: bool) {
 /// to its left.
 const METER_CELLS: i32 = 7;
 const METER_W: i32 = METER_CELLS * 4 - 1;
+/// Height of a module's history plot. Short enough to sit inside the row of
+/// text it belongs to, tall enough that a spike is a spike.
+const HIST_H: i32 = 11;
+
+/// Width a module has to reserve for its history, including the gap before
+/// the label — zero in the looks that do not draw one, and zero until there
+/// is something to draw.
+fn hist_w(r: &meter::Ring) -> i32 {
+    if tecno() && !r.is_empty() {
+        METER_W + 6
+    } else {
+        0
+    }
+}
+
+/// Draw that history. The slot is exactly as wide as the segmented meter, so
+/// a module that gains a past does not move the modules to its left.
+fn hist(cv: &mut Canvas, x: i32, h: i32, r: &meter::Ring, scaled: bool) -> i32 {
+    let w = hist_w(r);
+    if w == 0 {
+        return 0;
+    }
+    let p = pal();
+    meter::plot(cv, x, (h - HIST_H) / 2, METER_W, HIST_H, r, scaled, p.pill, p.accent, p.warn);
+    w
+}
 
 fn metric(
     cv: &mut Canvas,
@@ -2725,7 +2774,10 @@ fn metric(
         if tecno() {
             // Segments, not a continuous bar: a meter with a scale on it is
             // the one piece of this look that is not just a colour change.
-            cv.blocks(x, gy, METER_CELLS, f, ghh, pal().accent, pal().dim);
+            // And the lit colour is the sample's, not the theme's: one
+            // ramp, no thresholds to argue about.
+            let c = meter::ramp(f, pal().accent, pal().warn);
+            cv.blocks(x, gy, METER_CELLS, f, ghh, c, pal().dim);
         } else {
             cv.gauge(x, gy, gw, ghh, f, pal().pill);
         }
@@ -2734,19 +2786,30 @@ fn metric(
     Some(x)
 }
 
-fn net_module(cv: &mut Canvas, right: i32, min_x: i32, ty: i32, h: i32, n: &NetRate) -> Option<i32> {
+fn net_module(
+    cv: &mut Canvas,
+    right: i32,
+    min_x: i32,
+    ty: i32,
+    h: i32,
+    n: &NetRate,
+    hd: &meter::Ring,
+) -> Option<i32> {
     let down = sysinfo::fmt_rate(n.down);
     let up = sysinfo::fmt_rate(n.up);
     let ts = 9;
     let ty_tri = (h - ts) / 2;
     let dw = Canvas::text_width(&down);
     let uw = Canvas::text_width(&up);
-    let total = ts + 4 + dw + 10 + ts + 4 + uw;
+    let total = hist_w(hd) + ts + 4 + dw + 10 + ts + 4 + uw;
     let x = right - total;
     if x < min_x {
         return None;
     }
     let mut cx = x;
+    // Scaled to its own window: a link that idles at 2 kB/s and bursts to 2
+    // MB/s has no useful fixed axis, so the plot picks one every tick.
+    cx += hist(cv, cx, h, hd, true);
     cv.triangle(cx, ty_tri, ts, false, pal().accent);
     cx += ts + 4;
     cx += cv.text(&down, cx, ty, pal().muted);
@@ -2850,7 +2913,7 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> 
     }
     if let Some(n) = &m.net {
         if n.link {
-            net_module(cv, rx - 10, min_x, ty, hi, n);
+            net_module(cv, rx - 10, min_x, ty, hi, n, &m.net_hist);
         }
     }
 
@@ -4374,15 +4437,26 @@ fn main() {
 
         let mut cpu = CpuMeter::default();
         let mut net = NetMeter::default();
-        let _ = cpu.sample();
-        let _ = net.sample();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut h = (meter::Ring::default(), meter::Ring::default(), meter::Ring::default());
+        // Build the history a live session would have, so the preview shows
+        // the meters a session shows instead of a single column.
+        let (mut c, mut n) = (None, None);
+        for _ in 0..meter::WINDOW {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            c = cpu.sample();
+            n = net.sample();
+            h.0.push_pct(c);
+            h.1.push_pct(sysinfo::mem_percent());
+            if let Some(r) = &n {
+                h.2.push(r.down as f32);
+            }
+        }
         let m = Metrics {
-            cpu: cpu.sample(),
+            cpu: c,
             mem: sysinfo::mem_percent(),
             clock: sysinfo::clock_hhmm(),
             date: sysinfo::date_dm(),
-            net: net.sample(),
+            net: n,
             uptime: sysinfo::uptime(),
             load: sysinfo::loadavg(),
             disk: sysinfo::disk_root_percent(),
@@ -4392,6 +4466,9 @@ fn main() {
             kbd: sysinfo::kbd_layout(),
             // Shown even off Eclipse OS, so the preview has the shield in it.
             hunter: Some(hunter::read().map_or(hunter::Shield::Guarded, |s| s.shield(s.criticals))),
+            cpu_hist: h.0,
+            mem_hist: h.1,
+            net_hist: h.2,
         };
 
         // Top info bar occupies rows [0, bh) — in the KDE look there is no
