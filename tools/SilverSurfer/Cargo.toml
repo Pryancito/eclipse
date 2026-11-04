@@ -19,10 +19,16 @@ exclude = ["vendor"]
 #   Wayland socket is up but virtio-gpu is 2D-only, so the call returns 0.
 #   Asserting there aborts before the unix backend falls through to
 #   surfaceless llvmpipe, which is how the page is painted into wl_shm.
+# - servo-media-player, servo-media-gstreamer, servo-script-bindings: Media
+#   Source Extensions (MediaSource / SourceBuffer), which YouTube needs to
+#   play anything. See vendor/servo-media-gstreamer/mse.rs.
 # Tests are not vendored.
 [patch.crates-io]
+servo-media-gstreamer = { path = "vendor/servo-media-gstreamer" }
+servo-media-player = { path = "vendor/servo-media-player" }
 servo-net = { path = "vendor/servo-net" }
 servo-script = { path = "vendor/servo-script" }
+servo-script-bindings = { path = "vendor/servo-script-bindings" }
 surfman = { path = "vendor/surfman" }
 
 [features]

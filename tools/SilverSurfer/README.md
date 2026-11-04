@@ -192,8 +192,13 @@ con segmentos MPEG-TS) las reproduce GStreamer (`GstHLSDemux2`). El smoke HLS
 usa una lista media de Apple (bipbop) y solo la carga al pulsar «Probar HLS»,
 para no disparar `Player error` / `Invalid playlist` al abrir la página.
 
-No esperes YouTube ni DASH/MSE adaptativo por este camino: el reproductor de
-YouTube no alimenta un `<video src="…m3u8">` a GStreamer. Si una página pide
+Media Source Extensions (`MediaSource`, `SourceBuffer`) están implementadas
+en los Servo vendorizados (ver `vendor/servo-media-gstreamer/README.eclipse.md`):
+YouTube y otros reproductores DASH añaden fragmentos MP4 (H.264/AAC) o WebM
+(VP9/Opus) y GStreamer los demuxa y reproduce, con saltos. `isTypeSupported`
+responde según los decodificadores GStreamer instalados, así que un sistema sin
+`avdec_h264` o `vp9dec` recibe la otra variante o ninguna. No hay `changeType`
+entre contenedores (MP4↔WebM) ni EME (vídeo con DRM). Si una página pide
 HLS nativo con un master raro o cifrado, el demuxer puede fallar; el smoke lo
 marca en rojo en lugar de reintentar en bucle.
 
