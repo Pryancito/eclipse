@@ -592,3 +592,199 @@ fn sysinfo_fills_the_struct_the_caller_gave_it_and_nowhere_is_efault() {
         })
     });
 }
+
+// ─── The two fields a persona rewrites (`sys_newuname`'s second half) ───
+//
+// `uname` copies the struct and then lets the caller's execution domain
+// change two of its fields. Both halves are measured on this container's
+// Linux rather than read off the man page, which does not say WHICH BITS are
+// compared --- and that is the whole of what these tests pin:
+//
+// ```text
+//     persona                        machine    release
+//     0x00000000                     x86_64     6.18.44-fc-v233
+//     0x00000008  PER_LINUX32        i686       6.18.44-fc-v233
+//     0x00000018  dominio 0x18       x86_64     6.18.44-fc-v233
+//     0x00000108                     i686       6.18.44-fc-v233
+//     0x00020000  UNAME26            x86_64     2.6.78-fc-v233
+//     0x00020008  los dos            i686       2.6.78-fc-v233
+// ```
+//
+// Fixed pids: 47_22x.
+
+/// `PER_LINUX32`, the domain `linux32` and `setarch i386` set.
+const PER_LINUX32_PERSONA: usize = 0x0000_0008;
+
+/// A domain that is **not** `PER_LINUX32` but has its bit set: `0x18`. The
+/// lever that tells an equality from an `&`, and the one that is measured
+/// above --- Linux answers `x86_64` for it.
+const A_DOMAIN_WITH_THE_BIT_ON: usize = 0x0000_0018;
+
+/// `PER_LINUX32` with a bit above the low byte: `0x108`. The mirror lever,
+/// also measured --- Linux answers `i686`, so the domain is the low byte and
+/// the word above it does not count.
+const PER_LINUX32_PLUS_A_HIGH_BIT: usize = 0x0000_0108;
+
+/// `UNAME26`.
+const UNAME26_PERSONA: usize = 0x0020_0000;
+
+/// What this build's own `machine` is, which is what `i686` has to replace
+/// on x86_64 and must NOT replace anywhere else.
+fn native_machine() -> &'static str {
+    uname_machine(
+        cfg!(target_arch = "x86_64"),
+        cfg!(target_arch = "aarch64"),
+        cfg!(target_arch = "riscv64"),
+    )
+}
+
+/// The `machine` field `uname` writes for a process in persona `persona`.
+fn machine_under(sys: &Syscall<'_>, persona: usize) -> alloc::string::String {
+    sys.sys_personality(persona).unwrap();
+    let buf = utsname_of(sys);
+    alloc::string::String::from_utf8(field(&buf, MACHINE).to_vec()).unwrap()
+}
+
+/// **A process under `linux32` is told it is on an `i686`.**
+///
+/// Linux's `override_architecture`. Without it a 32-bit build environment is
+/// handed `x86_64` and configures itself for the wrong machine --- which is
+/// the entire reason the `linux32` command exists, since loading a 32-bit ELF
+/// does NOT set this persona by itself.
+#[test]
+fn a_process_in_the_32_bit_domain_is_told_it_is_on_an_i686() {
+    let proc = a_process(47_220, "uts-per-linux32");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let plain = machine_under(sys, 0);
+            assert_eq!(plain, native_machine(), "the plain machine moved");
+
+            let narrow = machine_under(sys, PER_LINUX32_PERSONA);
+            if cfg!(target_arch = "x86_64") {
+                assert_eq!(narrow, "i686", "PER_LINUX32 did not rename the machine");
+            } else {
+                // Linux guards the rewrite with `strncmp(machine, "x86_64")`:
+                // there is no 32-bit x86 for an aarch64 or riscv64 kernel to
+                // claim to be, so the name does not move.
+                assert_eq!(
+                    narrow,
+                    native_machine(),
+                    "a kernel that is not x86_64 renamed itself i686"
+                );
+            }
+
+            // And the release is NOT this persona's business.
+            sys.sys_personality(PER_LINUX32_PERSONA).unwrap();
+            let buf = utsname_of(sys);
+            assert_eq!(
+                field(&buf, RELEASE),
+                OS_RELEASE.as_bytes(),
+                "PER_LINUX32 changed the release as well"
+            );
+            sys.sys_personality(0).unwrap();
+        })
+    });
+    proc.exit(0);
+}
+
+/// **The domain is the LOW BYTE of the persona, and the test is an
+/// equality** --- both halves measured.
+///
+/// Two mutations die here and nowhere else: `persona & PER_LINUX32 != 0`,
+/// which would rename the machine for domain `0x18`; and a comparison
+/// against the whole word, which would stop renaming it for `0x108`. Neither
+/// is caught by the test above, where the persona is exactly `0x8`.
+#[test]
+fn the_domain_is_the_low_byte_and_is_compared_whole() {
+    if !cfg!(target_arch = "x86_64") {
+        return; // nothing is renamed on the other two, so there is no lever
+    }
+    let proc = a_process(47_221, "uts-per-mask");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            assert_eq!(
+                machine_under(sys, A_DOMAIN_WITH_THE_BIT_ON),
+                "x86_64",
+                "domain {:#x} was taken for PER_LINUX32: the bit was tested, \
+                 not the byte",
+                A_DOMAIN_WITH_THE_BIT_ON
+            );
+            assert_eq!(
+                machine_under(sys, PER_LINUX32_PLUS_A_HIGH_BIT),
+                "i686",
+                "persona {:#x} was not taken for PER_LINUX32: the whole word \
+                 was compared instead of the low byte",
+                PER_LINUX32_PLUS_A_HIGH_BIT
+            );
+            sys.sys_personality(0).unwrap();
+        })
+    });
+    proc.exit(0);
+}
+
+/// **`UNAME26` rewrites the release, and only the release.**
+///
+/// `setarch --uname-2.6`, for a build script that parses the release and
+/// refuses a leading 3 or more.
+#[test]
+fn the_uname26_persona_reports_a_2_6_release_and_leaves_the_machine_alone() {
+    let proc = a_process(47_222, "uts-uname26");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            sys.sys_personality(UNAME26_PERSONA).unwrap();
+            let buf = utsname_of(sys);
+            let release = core::str::from_utf8(field(&buf, RELEASE)).unwrap();
+            assert_eq!(
+                release,
+                release_for(UNAME26_PERSONA as u32, OS_RELEASE),
+                "the release the syscall wrote is not the one the rewrite makes"
+            );
+            assert!(
+                release.starts_with("2.6."),
+                "UNAME26 reported {} rather than a 2.6 release",
+                release
+            );
+            assert_ne!(
+                release, OS_RELEASE,
+                "the release did not move at all, so OS_RELEASE is already 2.6.x \
+                 and this test can no longer tell"
+            );
+            assert_eq!(
+                field(&buf, MACHINE),
+                native_machine().as_bytes(),
+                "UNAME26 renamed the machine as well"
+            );
+            sys.sys_personality(0).unwrap();
+        })
+    });
+    proc.exit(0);
+}
+
+/// **The two are independent**: a process can be in both, and gets both.
+/// `setarch i386 --uname-2.6` is one command.
+#[test]
+fn a_process_in_both_personas_gets_both_rewrites() {
+    let proc = a_process(47_223, "uts-both");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            sys.sys_personality(PER_LINUX32_PERSONA | UNAME26_PERSONA)
+                .unwrap();
+            let buf = utsname_of(sys);
+            assert!(
+                core::str::from_utf8(field(&buf, RELEASE))
+                    .unwrap()
+                    .starts_with("2.6."),
+                "the release rewrite stopped happening with PER_LINUX32 on"
+            );
+            if cfg!(target_arch = "x86_64") {
+                assert_eq!(
+                    field(&buf, MACHINE),
+                    b"i686",
+                    "the machine rewrite stopped happening with UNAME26 on"
+                );
+            }
+            sys.sys_personality(0).unwrap();
+        })
+    });
+    proc.exit(0);
+}

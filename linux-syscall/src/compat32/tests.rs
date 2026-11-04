@@ -513,3 +513,42 @@ fn the_calls_whose_only_difference_is_the_alignment_are_mapped() {
         );
     }
 }
+
+/// **`uname` (122) has a row, and its two older numbers must not.**
+///
+/// 122 was in neither allowlist, so a 32-bit process asking what machine it
+/// is on got `ENOSYS` --- from a call every `config.guess`, Python's
+/// `platform` and glibc's own startup make. Its `struct new_utsname` is six
+/// 65-byte `char` arrays, identical in both ABIs, and Linux's
+/// `syscall_32.tbl` row 122 is the plain `sys_newuname` with no `compat_`
+/// wrapper, so the native handler is the right handler.
+///
+/// `olduname` (109) and `oldolduname` (59) stay out, and this is the half
+/// worth asserting: their structures are SMALLER --- five 65-byte fields
+/// (325) and five 9-byte fields (45) --- so a row pointing either at the
+/// native handler would write 390 bytes into the caller's struct and past the
+/// end of it. That is the shape of the `waitid` rusage overflow, found in
+/// tanda 28.
+#[test]
+fn uname_is_mapped_and_its_two_older_numbers_are_not() {
+    assert_eq!(name(122), Some("uname"));
+    assert_eq!(native_number(122), Some(Sys::UNAME as u32));
+
+    assert_eq!(name(109), Some("olduname"));
+    assert_eq!(
+        native_number(109),
+        None,
+        "olduname writes a 325-byte struct and would be given the 390-byte handler"
+    );
+    assert_eq!(name(59), Some("oldolduname"));
+    assert_eq!(
+        native_number(59),
+        None,
+        "oldolduname writes a 45-byte struct and would be given the 390-byte handler"
+    );
+
+    // And the persona a 32-bit process reaches the renaming through was
+    // already mapped: `linux32` needs both calls, not one.
+    assert_eq!(name(136), Some("personality"));
+    assert!(native_number(136).is_some());
+}
