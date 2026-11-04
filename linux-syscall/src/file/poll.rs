@@ -414,10 +414,45 @@ fn clear_poll_io(
 ///
 /// It used to be declared inside `sys_pselect6`, where nothing outside that
 /// function body could name it and therefore nothing could pin it.
+///
+/// ## Two words, and both of them UNSIGNED
+///
+/// Sixteen bytes here and **eight** to a 32-bit process, which is
+/// `compat_sigset_argpack`: a `compat_uptr_t` and a `compat_size_t`. So it
+/// goes through [`crate::narrow`] like every other structure of two words ---
+/// except for the one thing that makes it the first of its kind here: its
+/// words are **zero**-extended, not sign-extended.
+///
+/// `ss` is a pointer. A 32-bit address with the top bit set, which is any
+/// address above 2 GiB, sign-extends to `0xffff_ffff_8xxx_xxxx` --- an
+/// address in no user map, so the call would answer `EFAULT` to a program
+/// Linux serves. Linux says this with a type: `compat_uptr_t` is `u32` and
+/// `compat_ptr()` is a zero-extending cast. `ss_len` is a `compat_size_t`,
+/// unsigned for the same kind of reason: a length is never negative, and a
+/// sign-extended one would be enormous rather than rejected.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct PSelectSigsetArg {
     ss: usize,
     ss_len: usize,
+}
+
+impl crate::narrow::Narrow for PSelectSigsetArg {
+    const WORDS: usize = 2;
+    /// Both words: see the type's own documentation.
+    const UNSIGNED_WORDS: u32 = 0b11;
+
+    fn to_words(self, out: &mut [u64]) {
+        out[0] = self.ss as u64;
+        out[1] = self.ss_len as u64;
+    }
+
+    fn from_words(words: &[u64]) -> Self {
+        Self {
+            ss: words[0] as usize,
+            ss_len: words[1] as usize,
+        }
+    }
 }
 
 impl Syscall<'_> {
@@ -793,8 +828,40 @@ impl Syscall<'_> {
         read: UserInOutPtr<u32>,
         write: UserInOutPtr<u32>,
         err: UserInOutPtr<u32>,
+        timeout: UserInOutPtr<TimeSpec>,
+        sigset_arg: usize,
+    ) -> SysResult {
+        self.pselect6_at(
+            nfds,
+            read,
+            write,
+            err,
+            timeout,
+            sigset_arg,
+            self.narrow_abi(),
+        )
+        .await
+    }
+
+    /// The core both `pselect6` (270 / i386's 308) and `pselect6_time64`
+    /// (i386's 413) reach, with the width of the `struct timespec` handed in
+    /// rather than asked of the process.
+    ///
+    /// Only the TIMEOUT's width is the number's. The sixth argument's two
+    /// words are `compat_sigset_argpack` either way, so that one is asked of
+    /// the process --- which is why this call is in both of this layer's
+    /// rules at once, like `utimensat_time64` before it. See
+    /// [`crate::compat32::time64`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn pselect6_at(
+        &mut self,
+        nfds: usize,
+        read: UserInOutPtr<u32>,
+        write: UserInOutPtr<u32>,
+        err: UserInOutPtr<u32>,
         mut timeout: UserInOutPtr<TimeSpec>,
         sigset_arg: usize,
+        abi32: bool,
     ) -> SysResult {
         // pselect6's timeout is a `timespec` (NANOseconds). It was previously
         // parsed as select(2)'s `timeval` (MICROseconds), inflating every
@@ -804,7 +871,7 @@ impl Syscall<'_> {
         let (timeout_msecs, timeout_left) = if timeout.is_null() {
             (-1, None)
         } else {
-            let ts = self.get_narrow(&timeout)?;
+            let ts = crate::narrow::narrow_get(abi32, &timeout)?;
             (ts.try_into_poll_msecs()?, Some(ts.try_into_duration()?))
         };
         let sticky = self.linux_process().personality() & STICKY_TIMEOUTS != 0;
@@ -813,7 +880,11 @@ impl Syscall<'_> {
         let (sigmask, sigsetsize) = if sigset_arg == 0 {
             (UserInPtr::<Sigset>::from(0), 0)
         } else {
-            let arg: PSelectSigsetArg = UserInPtr::from(sigset_arg).read()?;
+            // At the width of the PROCESS and not of the number: these two
+            // words are `compat_sigset_argpack` for a 32-bit caller whichever
+            // number it came in by.
+            let p: UserInPtr<PSelectSigsetArg> = sigset_arg.into();
+            let arg = crate::narrow::narrow_get(self.narrow_abi(), &p)?;
             (UserInPtr::from(arg.ss), arg.ss_len)
         };
         let mut guard = self.install_temp_sigmask(sigmask, sigsetsize)?;
@@ -830,7 +901,7 @@ impl Syscall<'_> {
             // A `timespec` in read-only memory must not turn a completed
             // select into EFAULT (`fs/select.c`, "sticky"): the write's
             // failure is ignored.
-            let _ = self.put_narrow(&mut timeout, TimeSpec::from_duration(left));
+            let _ = crate::narrow::narrow_put(abi32, &mut timeout, TimeSpec::from_duration(left));
         }
         result
     }
@@ -2534,6 +2605,7 @@ mod benches {
 mod pselect_sigset_arg_layout_tests {
     use super::PSelectSigsetArg;
     use core::mem::{align_of, offset_of, size_of};
+    use kernel_hal::user::UserInPtr;
 
     /// `struct sigset_argpack`: the pointer and then the length, both a word
     /// wide. Swapping them is the worst shape this operator produces, because
@@ -2547,6 +2619,108 @@ mod pselect_sigset_arg_layout_tests {
         assert_eq!(align_of::<PSelectSigsetArg>(), 8);
         assert_eq!(offset_of!(PSelectSigsetArg, ss), 0);
         assert_eq!(offset_of!(PSelectSigsetArg, ss_len), 8);
+    }
+
+    /// And the claim the narrow conversion rests on: two words and nothing
+    /// else, so `WORDS` and the native size agree. A field added without
+    /// touching the count would read the caller's pack short.
+    #[test]
+    fn the_pack_is_two_words_at_the_native_width() {
+        use crate::narrow::Narrow;
+        assert_eq!(
+            size_of::<PSelectSigsetArg>(),
+            PSelectSigsetArg::WORDS * size_of::<usize>()
+        );
+    }
+
+    /// Eight bytes to a 32-bit caller, and the length comes from offset
+    /// **four**. Read at the native width instead, `ss` would be the pointer
+    /// with the length's low half shifted in above it and `ss_len` would come
+    /// out of the eight bytes AFTER the pack.
+    #[test]
+    fn the_pack_of_a_32_bit_caller_is_eight_bytes() {
+        let mut room = Room::new();
+        let at = room.base();
+        put_words(at, &[0x0804_a02c, 8]);
+
+        let p: UserInPtr<PSelectSigsetArg> = at.into();
+        let narrow = crate::narrow::narrow_get(true, &p).expect("the pack under test");
+        assert_eq!(narrow.ss, 0x0804_a02c, "ss at 0");
+        assert_eq!(narrow.ss_len, 8, "ss_len at 4");
+
+        let wide = crate::narrow::narrow_get(false, &p).expect("the pack under test");
+        assert_eq!(wide.ss, 0x0000_0008_0804_a02c, "the native read pairs them");
+        assert_eq!(
+            wide.ss_len, 0xaaaa_aaaa_aaaa_aaaa,
+            "and reads past the pack"
+        );
+    }
+
+    /// **The pointer is ZERO-extended.** Every other structure that goes
+    /// through [`crate::narrow`] widens its words by sign extension, because
+    /// theirs are `__kernel_long_t` and a time before 1970 has to stay
+    /// negative. A 32-bit ADDRESS with the top bit set --- any address above
+    /// 2 GiB, which is where a program linked high puts its stack --- would
+    /// sign-extend to `0xffff_ffff_8xxx_xxxx`, an address in no user map, so
+    /// the call would answer `EFAULT` to a program Linux serves.
+    ///
+    /// This is the test that `PSelectSigsetArg::UNSIGNED_WORDS` exists for:
+    /// setting it to 0 leaves everything else green and fails here.
+    #[test]
+    fn an_address_above_two_gigabytes_is_not_sign_extended() {
+        let mut room = Room::new();
+        let at = room.base();
+        // `0xbfff_f000` is where i386 Linux puts the top of the stack, and a
+        // `sigset_t` on the stack is the ordinary case.
+        put_words(at, &[0xbfff_f000, 8]);
+
+        let p: UserInPtr<PSelectSigsetArg> = at.into();
+        let got = crate::narrow::narrow_get(true, &p).expect("the pack under test");
+        assert_eq!(
+            got.ss, 0xbfff_f000,
+            "a 32-bit address stays a 32-bit address: {:#x}",
+            got.ss
+        );
+        assert_eq!(got.ss_len, 8, "and the length is not touched either");
+    }
+
+    /// The same for the length, which is a `compat_size_t`: unsigned, so a
+    /// huge one arrives huge and is REJECTED by the size check rather than
+    /// arriving as a small negative that might pass something.
+    #[test]
+    fn a_length_with_its_top_bit_set_stays_huge() {
+        let mut room = Room::new();
+        let at = room.base();
+        put_words(at, &[0x0804_a02c, 0xffff_ffff]);
+
+        let p: UserInPtr<PSelectSigsetArg> = at.into();
+        let got = crate::narrow::narrow_get(true, &p).expect("the pack under test");
+        assert_eq!(got.ss_len, 0xffff_ffff, "not -1: {:#x}", got.ss_len);
+    }
+
+    /// A buffer handed out as an address a user pointer can be made from,
+    /// poisoned with `0xaa` as the i386 probe poisons its own.
+    struct Room([u32; 8]);
+
+    impl Room {
+        fn new() -> Self {
+            Self([0xaaaa_aaaa; 8])
+        }
+
+        fn base(&mut self) -> usize {
+            self.0.as_mut_ptr() as usize
+        }
+    }
+
+    /// Put `words` down at `at` through a user pointer, so the test needs no
+    /// `unsafe` of its own --- which this crate denies.
+    fn put_words(at: usize, words: &[u32]) {
+        let mut bytes = alloc::vec::Vec::new();
+        for w in words {
+            bytes.extend_from_slice(&w.to_ne_bytes());
+        }
+        let mut out: kernel_hal::user::UserOutPtr<u8> = at.into();
+        out.write_array(&bytes).expect("the buffer under test");
     }
 }
 

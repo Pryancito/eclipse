@@ -384,15 +384,24 @@ fn execve_is_mapped_because_the_handler_reads_argv_at_the_callers_width() {
     );
 }
 
-/// `pselect6` is the one to keep out, and the reason is not its timeout ---
-/// that is a `timespec`, which is converted. It is the sixth argument, a
-/// pointer to `{ const sigset_t *ss; size_t ss_len; }`: two words, so 8
-/// bytes to a 32-bit caller against 16 natively. Reading it at the native
-/// width would take the length out of the next structure along.
+/// `pselect6` passes TWO structures, and it was out of the table until the
+/// second one was converted: the timeout is a `timespec`, and the sixth
+/// argument is a pointer to `{ const sigset_t *ss; size_t ss_len; }` --- two
+/// words, so 8 bytes to a 32-bit caller against 16 natively. Reading that at
+/// the native width would take the length out of the next structure along.
+///
+/// Now both are converted, so it is mapped. The test stays, pointing the
+/// other way: what it pins is that the entry is there **and** that it is the
+/// native `pselect6` it points at, because the whole value of the entry is
+/// that one handler serves both ABIs.
 #[test]
-fn pselect6_stays_unmapped_for_its_sigset_argument_and_not_its_timeout() {
+fn pselect6_is_mapped_once_its_sigset_argument_is_converted_too() {
     assert_eq!(name(308), Some("pselect6"));
-    assert_eq!(native_number(308), None);
+    assert_eq!(
+        native_number(308),
+        Some(Sys::PSELECT6 as u32),
+        "pselect6 must point at the native pselect6"
+    );
 }
 
 /// `statx` and `prlimit64` are mapped for a reason that is not the one

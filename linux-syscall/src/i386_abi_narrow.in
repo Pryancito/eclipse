@@ -18,11 +18,11 @@
 // file.
 //
 // So a name belongs here once EVERY structure it passes is converted. A name
-// stays out while even one is not, and answers `ENOSYS` until then --
-// `pselect6` is the example worth keeping in mind: its timeout is a
-// `timespec`, which is converted, but its sixth argument points at a
-// `{ const sigset_t *ss; size_t ss_len; }` of two words, 8 bytes to a 32-bit
-// caller against 16 natively, and nothing converts that yet.
+// stays out while even one is not, and answers `ENOSYS` until then. That is
+// what `pselect6` was: its timeout was converted and its sixth argument, a
+// `{ const sigset_t *ss; size_t ss_len; }`, was not. Now both are, so it is
+// here -- and it is the entry that says the rule is about EVERY structure and
+// not about the obvious one.
 //
 // Not here, each for its own reason:
 //
@@ -54,6 +54,13 @@ ppoll
 // i386's `_newselect` is x86_64's `select`: the old `select` (82) is the one
 // that takes a block of memory, and is deliberately not here.
 _newselect = select
+
+// `pselect6` passes TWO structures, and that is why it was out of this table
+// until the two words of its sixth argument were converted: a `timespec` for
+// the timeout and a `{ const sigset_t *ss; size_t ss_len; }` for the sigmask,
+// 8 bytes to a 32-bit caller against 16 natively. Both words of the second
+// are UNSIGNED, which no other structure in this file is -- one is a pointer.
+pselect6
 
 // struct itimerval, struct itimerspec
 setitimer

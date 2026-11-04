@@ -124,6 +124,10 @@
  *   106 timer_settime64 (409) or timer_gettime64 (408) read or wrote its
  *       itimerspec at the narrow width: theirs is thirty-two bytes, where
  *       260 and 261 pass sixteen
+ *   107 pselect6 (308) or pselect6_time64 (413) got one of its TWO
+ *       structures wrong: the timeout, whose width is the number's, or the
+ *       sixth argument's `{ const sigset_t *ss; size_t ss_len; }`, whose
+ *       width is the PROCESS's by either number
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -3071,6 +3075,172 @@ statx_poison:
 	jnz	bad_timer64
 
 timer64_skipped:
+	/* Step 83: `pselect6` (308) and `pselect6_time64` (413), the call that
+	 * passes TWO structures whose widths are decided by DIFFERENT things.
+	 *
+	 *   - the timeout, a `struct timespec`: the NUMBER's width. Eight bytes
+	 *     by 308, sixteen by 413.
+	 *   - the sixth argument, a pointer to
+	 *     `{ const sigset_t *ss; size_t ss_len; }`: the PROCESS's width,
+	 *     which is EIGHT bytes by either number, because it is
+	 *     `compat_sigset_argpack` and not a time.
+	 *
+	 * Six arguments, so the sixth goes in %ebp, as `mmap2` above.
+	 *
+	 * Nothing is waited on: `nfds` is zero and the timeouts are either zero
+	 * or rejected before anything sleeps. */
+
+	/* A `tv_nsec` of two thousand million. Read as sixteen bytes --- which
+	 * is what 413 does --- it is out of range and the answer is EINVAL.
+	 * Read as eight it is the two LOW halves, `{0, 0}`, a timeout of zero
+	 * that returns at once. So this is the error that proves the wide
+	 * read. */
+	call	poison_tsp
+	movl	$0, tsp + 0		/* tv_sec, low half */
+	movl	$0, tsp + 4		/* and high */
+	movl	$2000000000, tsp + 8	/* tv_nsec, low half */
+	movl	$0, tsp + 12
+	movl	$413, %eax		/* pselect6_time64 */
+	xorl	%ebx, %ebx		/* nfds = 0 */
+	xorl	%ecx, %ecx		/* readfds = NULL */
+	xorl	%edx, %edx		/* writefds = NULL */
+	xorl	%esi, %esi		/* exceptfds = NULL */
+	movl	$tsp, %edi
+	xorl	%ebp, %ebp		/* no sigmask pack */
+	int	$0x80
+	cmpl	$-22, %eax
+	jne	bad_pselect
+
+	/* The same number with a timeout it accepts: all zeros, which is the
+	 * one value whose BYTES are valid at either width. */
+	call	poison_tsp
+	movl	$0, tsp + 0
+	movl	$0, tsp + 4
+	movl	$0, tsp + 8
+	movl	$0, tsp + 12
+	movl	$413, %eax
+	xorl	%ebx, %ebx
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	xorl	%esi, %esi
+	movl	$tsp, %edi
+	xorl	%ebp, %ebp
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_pselect
+
+	/* Now the sixth argument, by the NARROW number. The pack is two
+	 * four-byte words --- the address of the mask and `sizeof(sigset_t)`,
+	 * which is eight in both ABIs --- with `0xaa` behind it. A kernel
+	 * reading sixteen bytes takes the length out of that poison and
+	 * answers EINVAL to the size check. */
+	movl	$0, sigmask + 0		/* an empty mask: blocks nothing */
+	movl	$0, sigmask + 4
+	movl	$0xaaaaaaaa, sigpack + 8
+	movl	$0xaaaaaaaa, sigpack + 12
+	movl	$0xaaaaaaaa, sigpack + 16
+	movl	$0xaaaaaaaa, sigpack + 20
+	movl	$sigmask, sigpack + 0	/* ss */
+	movl	$8, sigpack + 4		/* ss_len */
+	call	poison_tsp
+	movl	$0, tsp + 0
+	movl	$0, tsp + 4
+	movl	$308, %eax		/* pselect6 */
+	xorl	%ebx, %ebx
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	xorl	%esi, %esi
+	movl	$tsp, %edi
+	movl	$sigpack, %ebp
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_pselect
+
+	/* And the same pack by the WIDE number, which must read it the same
+	 * eight bytes: its width is the process's, not the call's. This is the
+	 * assertion that fails if the sixth argument is ever handed the
+	 * number's width instead. */
+	call	poison_tsp
+	movl	$0, tsp + 0
+	movl	$0, tsp + 4
+	movl	$0, tsp + 8
+	movl	$0, tsp + 12
+	movl	$413, %eax
+	xorl	%ebx, %ebx
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	xorl	%esi, %esi
+	movl	$tsp, %edi
+	movl	$sigpack, %ebp
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_pselect
+
+	/* A pack whose LENGTH is wrong is refused, which is what says the
+	 * two above measured the pack at all rather than a kernel that never
+	 * read it. */
+	movl	$4, sigpack + 4		/* sizeof(sigset_t) in no ABI */
+	call	poison_tsp
+	movl	$0, tsp + 0
+	movl	$0, tsp + 4
+	movl	$0, tsp + 8
+	movl	$0, tsp + 12
+	movl	$413, %eax
+	xorl	%ebx, %ebx
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	xorl	%esi, %esi
+	movl	$tsp, %edi
+	movl	$sigpack, %ebp
+	int	$0x80
+	cmpl	$-22, %eax
+	jne	bad_pselect
+	movl	$8, sigpack + 4		/* put it back */
+
+	/* The write-back, which is the only thing this call WRITES: the time
+	 * LEFT of the timeout. One second, which a call over no descriptors
+	 * returns from at once, so nearly the whole second comes back --- and
+	 * where the poison starts again says at what width.
+	 *
+	 * By 308: eight bytes, so byte 8 is still poison. */
+	call	poison_tsp
+	movl	$1, tsp + 0		/* tv_sec = 1 */
+	movl	$0, tsp + 4		/* tv_nsec = 0 */
+	movl	$308, %eax
+	xorl	%ebx, %ebx
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	xorl	%esi, %esi
+	movl	$tsp, %edi
+	xorl	%ebp, %ebp
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_pselect
+	cmpl	$0xaaaaaaaa, tsp + 8
+	jne	bad_pselect
+
+	/* And by 413: sixteen, so byte 8 is NOT poison any more --- it is
+	 * `tv_nsec`'s low half --- and byte 16 still is. */
+	call	poison_tsp
+	movl	$1, tsp + 0
+	movl	$0, tsp + 4
+	movl	$0, tsp + 8
+	movl	$0, tsp + 12
+	movl	$413, %eax
+	xorl	%ebx, %ebx
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	xorl	%esi, %esi
+	movl	$tsp, %edi
+	xorl	%ebp, %ebp
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_pselect
+	cmpl	$0xaaaaaaaa, tsp + 8
+	je	bad_pselect
+	cmpl	$0xaaaaaaaa, tsp + 16
+	jne	bad_pselect
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -3419,6 +3589,10 @@ bad_timer64:
 	movl	$106, %ebx
 	jmp	die
 
+bad_pselect:
+	movl	$107, %ebx
+	jmp	die
+
 	/* 0xaa over the 128 bytes of `dsbuf`, so that every byte the kernel
 	 * writes is one this program did not put there and every byte it
 	 * does NOT write stays visible. Clobbers %eax, %ecx and %edi. */
@@ -3733,6 +3907,16 @@ fd4:
 	 * four bytes here. */
 timerid:
 	.long	0
+	/* Step 83's sixth argument: `{ const sigset_t *ss; size_t ss_len; }`,
+	 * two FOUR-byte words here against sixteen bytes natively, with slack
+	 * behind it so a read of the wrong width is visible. 4 mod 8, like
+	 * every other buffer in this program. */
+sigpack:
+	.space	24
+	/* And the `sigset_t` it points at: `unsigned long sig[2]` on i386,
+	 * which aligns to 4. */
+sigmask:
+	.space	8
 	.balign	8
 	.long	0
 its:

@@ -74,6 +74,20 @@ pub(crate) trait Narrow: Copy {
     /// How many words the structure is.
     const WORDS: usize;
 
+    /// Which words are **unsigned** in the 32-bit ABI, as a bitmask: bit `i`
+    /// set means word `i` is zero-extended on the way in rather than sign-
+    /// extended.
+    ///
+    /// Zero for every structure of times, because each of their fields is a
+    /// `__kernel_long_t` and a time before 1970 --- or a `-1` meaning "no
+    /// timeout" --- has to arrive negative. It is **not** zero for a word
+    /// that is a pointer or a `compat_size_t`, which is Linux's `compat_ptr`:
+    /// sign-extending a 32-bit address whose top bit is set would produce
+    /// `0xffff_ffff_xxxx_xxxx`, an address in no user map, so a program
+    /// passing a pointer above 2 GiB would get `EFAULT` where Linux serves
+    /// it. See [`crate::file::poll`]'s `PSelectSigsetArg`.
+    const UNSIGNED_WORDS: u32 = 0;
+
     /// The structure as its words, in ABI order. `out` is `WORDS` long.
     fn to_words(self, out: &mut [u64]);
 
@@ -281,12 +295,17 @@ fn from_native_bytes<T: Narrow>(bytes: &[u8]) -> T {
     T::from_words(&words[..T::WORDS])
 }
 
-/// `value` back out of its narrow image, each word **sign**-extended.
+/// `value` back out of its narrow image, each word sign-extended unless
+/// [`Narrow::UNSIGNED_WORDS`] says that word is unsigned.
 fn from_narrow_bytes<T: Narrow>(bytes: &[u8]) -> T {
     let mut words = [0u64; MAX_WORDS];
     let (slots, _) = bytes.as_chunks::<4>();
-    for (word, slot) in words[..T::WORDS].iter_mut().zip(slots.iter()) {
-        *word = i32::from_ne_bytes(*slot) as i64 as u64;
+    for (i, (word, slot)) in words[..T::WORDS].iter_mut().zip(slots.iter()).enumerate() {
+        *word = if T::UNSIGNED_WORDS & (1 << i) != 0 {
+            u32::from_ne_bytes(*slot) as u64
+        } else {
+            i32::from_ne_bytes(*slot) as i64 as u64
+        };
     }
     T::from_words(&words[..T::WORDS])
 }
