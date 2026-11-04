@@ -72,6 +72,21 @@ pselect6
 // structure and is still out, because its handler does not convert it yet.
 rt_sigtimedwait
 
+// And the three that pass a `sigset_t` and nothing else. Eight bytes in both
+// ABIs --- `_NSIG` is 64 either way --- so nothing is halved and the only
+// thing the conversion is for is the ALIGNMENT: on i386 a `sigset_t` is
+// `unsigned long sig[2]` and aligns to FOUR, so a 32-bit program's own can
+// sit at an address congruent to 4 modulo 8, which the typed read and write
+// refuse. Measured on this container's Linux: an i386 `rt_sigprocmask` with
+// its mask at such an address answers 0.
+//
+// They were in NEITHER list until now, which meant `ENOSYS`: a 32-bit
+// program could not block a signal at all, and the probe's step 84 found it
+// by being unable to get as far as its first `kill`.
+rt_sigprocmask
+rt_sigpending
+rt_sigsuspend
+
 // struct itimerval, struct itimerspec
 setitimer
 getitimer

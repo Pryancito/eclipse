@@ -426,6 +426,29 @@ fn rt_sigtimedwait_is_mapped_and_waitid_is_not() {
     );
 }
 
+/// The three calls that pass a `sigset_t` and nothing else are mapped, and
+/// they are the clearest case in the file of an entry that is ONLY about
+/// alignment: eight bytes in both ABIs, 4-aligned on i386 and 8-aligned here.
+///
+/// They were in neither allowlist until the probe's step 84 could not reach
+/// its first `kill`, which is to say a 32-bit program could not block a
+/// signal at all.
+#[test]
+fn the_three_sigset_calls_are_mapped() {
+    for (n, name_of, native) in [
+        (175, "rt_sigprocmask", Sys::RT_SIGPROCMASK),
+        (176, "rt_sigpending", Sys::RT_SIGPENDING),
+        (179, "rt_sigsuspend", Sys::RT_SIGSUSPEND),
+    ] {
+        assert_eq!(name(n), Some(name_of));
+        assert_eq!(
+            native_number(n),
+            Some(native as u32),
+            "i386 {n} must point at the native {name_of}"
+        );
+    }
+}
+
 /// `statx` and `prlimit64` are mapped for a reason that is not the one
 /// anybody looks for: both structures ARE the same bytes in both ABIs ---
 /// `struct statx` was designed that way, `struct rlimit64` is two `__u64`.

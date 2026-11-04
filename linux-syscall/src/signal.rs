@@ -9,7 +9,7 @@
 //! - sigaltstack
 
 use super::*;
-use crate::outparams::{commit_and_report_old, commit_and_report_old_with};
+use crate::outparams::commit_and_report_old_with;
 use linux_object::error::LxResult;
 use linux_object::process::{Credentials, LinuxProcess};
 use linux_object::signal::{
@@ -547,32 +547,45 @@ impl Syscall<'_> {
         );
         check_sigsetsize(sigsetsize)?;
         let old = self.thread.lock_linux().signal_mask();
-        commit_and_report_old(old, &mut oldset, || {
-            if set.is_null() {
-                return Ok(());
-            }
-            let set = set.read()?;
-            // `how` is validated INSIDE `sigprocmask()`, which Linux calls
-            // only `if (nset)`. So `rt_sigprocmask(<rubbish>, NULL, &old, 8)`
-            // -- how a program reads its own mask without touching it --
-            // succeeds there, and rejecting it here was a guard harder than
-            // the kernel's: one that refuses programs the kernel accepts.
-            let how = How::try_from(how).map_err(|_| LxError::EINVAL)?;
-            {
-                let mut thread = self.thread.lock_linux();
-                // SIGKILL and SIGSTOP can never be blocked; the three helpers
-                // below all drop them, and `sigprocmask(2)` is explicit that the
-                // attempt is ignored rather than refused.
-                match how {
-                    How::Block => thread.block_signals(&set),
-                    How::Unblock => thread.unblock_signals(&set),
-                    How::SetMask => thread.set_signal_mask(set),
+        // Both masks go through `crate::narrow` for the ALIGNMENT and not for
+        // the width: a `sigset_t` is eight bytes in both ABIs (`_NSIG` is 64
+        // either way), but on i386 it is `unsigned long sig[2]` and aligns to
+        // **4**, so a 32-bit program's own can sit at an address congruent to
+        // 4 modulo 8 --- and Linux reads and writes it. The typed `read` and
+        // `write_if_not_null` demand 8, which is why this call answered
+        // `EFAULT` to half the addresses a 32-bit program can pass. Same form
+        // as `install_temp_sigmask` and `rt_sigtimedwait_at` below.
+        let abi32 = self.narrow_abi();
+        commit_and_report_old_with(
+            old,
+            |old| crate::narrow::wide_put_unaligned_if_not_null(abi32, &mut oldset, old),
+            || {
+                if set.is_null() {
+                    return Ok(());
                 }
-            }
-            // Unblocking may make a process-shared pending signal deliverable.
-            self.linux_process().pull_shared_pending_into(self.thread);
-            Ok(())
-        })?;
+                let set = crate::narrow::wide_get_unaligned(abi32, &set)?;
+                // `how` is validated INSIDE `sigprocmask()`, which Linux calls
+                // only `if (nset)`. So `rt_sigprocmask(<rubbish>, NULL, &old, 8)`
+                // -- how a program reads its own mask without touching it --
+                // succeeds there, and rejecting it here was a guard harder than
+                // the kernel's: one that refuses programs the kernel accepts.
+                let how = How::try_from(how).map_err(|_| LxError::EINVAL)?;
+                {
+                    let mut thread = self.thread.lock_linux();
+                    // SIGKILL and SIGSTOP can never be blocked; the three helpers
+                    // below all drop them, and `sigprocmask(2)` is explicit that the
+                    // attempt is ignored rather than refused.
+                    match how {
+                        How::Block => thread.block_signals(&set),
+                        How::Unblock => thread.unblock_signals(&set),
+                        How::SetMask => thread.set_signal_mask(set),
+                    }
+                }
+                // Unblocking may make a process-shared pending signal deliverable.
+                self.linux_process().pull_shared_pending_into(self.thread);
+                Ok(())
+            },
+        )?;
         Ok(0)
     }
 
@@ -955,7 +968,8 @@ impl Syscall<'_> {
         sigsetsize: usize,
     ) -> SysResult {
         check_sigsetsize(sigsetsize)?;
-        let newmask = mask.read()?;
+        // The same alignment form: see `sys_rt_sigprocmask` above.
+        let newmask = crate::narrow::wide_get_unaligned(self.narrow_abi(), &mask)?;
         info!(
             "rt_sigsuspend: mask={:#x}, thread={}",
             newmask.val(),
@@ -1001,7 +1015,8 @@ impl Syscall<'_> {
         let pending = Sigset::new((thread.signals.val() | shared) & thread.signal_mask().val());
         drop(thread);
         info!("rt_sigpending: pending={:#x}", pending.val());
-        set.write(pending)?;
+        // The same alignment form: see `sys_rt_sigprocmask` above.
+        crate::narrow::wide_put_unaligned(self.narrow_abi(), &mut set, pending)?;
         Ok(0)
     }
 

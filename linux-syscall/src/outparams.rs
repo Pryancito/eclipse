@@ -7,7 +7,6 @@
 //! were written out by hand at each call site here, and at most sites the
 //! hand-written version was missing a piece.
 
-use kernel_hal::user::UserOutPtr;
 use linux_object::error::LxError;
 
 /// Apply a change, and copy the previous value out only once it succeeded.
@@ -21,22 +20,15 @@ use linux_object::error::LxError;
 ///
 /// Same shape as the `fd_set` of `select`, which was emptied before the wait
 /// could fail. One helper, so the rule cannot be half-applied again.
-pub(crate) fn commit_and_report_old<T>(
-    old: T,
-    out: &mut UserOutPtr<T>,
-    change: impl FnOnce() -> Result<(), LxError>,
-) -> Result<(), LxError> {
-    commit_and_report_old_with(old, |old| Ok(out.write_if_not_null(old)?), change)
-}
-
-/// [`commit_and_report_old`] where the caller says how the old value is
-/// written.
 ///
-/// The rule is the order, not the write: the change first, the copy out
-/// last. A structure whose width depends on the calling process's ABI
-/// (`struct itimerval`, `struct itimerspec`: see [`crate::narrow`]) cannot go
-/// out through `UserOutPtr::write_if_not_null`, so it passes the write in
-/// instead of reimplementing the order.
+/// **The rule is the order, not the write**, so the caller says how the old
+/// value goes out. There used to be a second, simpler entry point that did
+/// the typed `UserOutPtr::write_if_not_null` itself, but no caller is left
+/// that can use it: every one of these out-parameters is either a structure
+/// whose width depends on the calling process's ABI (`struct itimerval`,
+/// `struct itimerspec`: see [`crate::narrow`]) or one whose ALIGNMENT does (a
+/// `sigset_t`, which is the same eight bytes in both ABIs but 4-aligned on
+/// i386), and neither can go out through the typed write.
 pub(crate) fn commit_and_report_old_with<T>(
     old: T,
     write_old: impl FnOnce(T) -> Result<(), LxError>,
@@ -107,6 +99,7 @@ pub(crate) fn hand_out_one<D: Copy>(
 mod outparam_tests {
     use super::*;
     use core::cell::RefCell;
+    use kernel_hal::user::UserOutPtr;
 
     // `libos` addresses are ordinary host addresses, so a local variable is a
     // valid stand-in for the caller's buffer and the copy below runs for real.
@@ -118,7 +111,11 @@ mod outparam_tests {
     fn a_call_that_fails_leaves_the_callers_old_value_alone() {
         let mut slot = 0xdead_beefu64;
         let mut out = user_out(&mut slot);
-        let err = commit_and_report_old(1234u64, &mut out, || Err(LxError::EFAULT));
+        let err = commit_and_report_old_with(
+            1234u64,
+            |old| Ok(out.write_if_not_null(old)?),
+            || Err(LxError::EFAULT),
+        );
         assert_eq!(err, Err(LxError::EFAULT));
         assert_eq!(slot, 0xdead_beef, "a failed call wrote the caller's buffer");
     }
@@ -127,7 +124,10 @@ mod outparam_tests {
     fn a_call_that_succeeds_reports_the_value_from_before_it() {
         let mut slot = 0xdead_beefu64;
         let mut out = user_out(&mut slot);
-        assert_eq!(commit_and_report_old(1234u64, &mut out, || Ok(())), Ok(()));
+        assert_eq!(
+            commit_and_report_old_with(1234u64, |old| Ok(out.write_if_not_null(old)?), || Ok(())),
+            Ok(())
+        );
         assert_eq!(slot, 1234);
     }
 
@@ -138,10 +138,14 @@ mod outparam_tests {
         let mut ran = false;
         let mut slot = 0u64;
         let mut out = user_out(&mut slot);
-        commit_and_report_old(7u64, &mut out, || {
-            ran = true;
-            Ok(())
-        })
+        commit_and_report_old_with(
+            7u64,
+            |old| Ok(out.write_if_not_null(old)?),
+            || {
+                ran = true;
+                Ok(())
+            },
+        )
         .expect("nothing failed");
         assert!(ran, "the change never ran");
         assert_eq!(slot, 7);
@@ -154,10 +158,14 @@ mod outparam_tests {
         let mut ran = false;
         let mut out: UserOutPtr<u64> = UserOutPtr::from(0usize);
         assert_eq!(
-            commit_and_report_old(7u64, &mut out, || {
-                ran = true;
-                Ok(())
-            }),
+            commit_and_report_old_with(
+                7u64,
+                |old| Ok(out.write_if_not_null(old)?),
+                || {
+                    ran = true;
+                    Ok(())
+                }
+            ),
             Ok(())
         );
         assert!(ran);
@@ -269,6 +277,7 @@ mod benches {
     //! call that was folded away and never ran.
 
     use super::*;
+    use kernel_hal::user::UserOutPtr;
     use test::{black_box, Bencher};
 
     /// `libos` addresses are ordinary host addresses, so a local variable is
@@ -285,9 +294,11 @@ mod benches {
         let addr = user_out(&mut slot).as_addr();
         b.iter(|| {
             let mut out: UserOutPtr<u64> = UserOutPtr::from(black_box(addr));
-            black_box(commit_and_report_old(black_box(1234u64), &mut out, || {
-                black_box(Ok(()))
-            }))
+            black_box(commit_and_report_old_with(
+                black_box(1234u64),
+                |old| Ok(out.write_if_not_null(old)?),
+                || black_box(Ok(())),
+            ))
         });
     }
 
@@ -298,9 +309,11 @@ mod benches {
     fn commit_and_report_old_with_a_null_pointer(b: &mut Bencher) {
         b.iter(|| {
             let mut out: UserOutPtr<u64> = UserOutPtr::from(black_box(0usize));
-            black_box(commit_and_report_old(black_box(1234u64), &mut out, || {
-                black_box(Ok(()))
-            }))
+            black_box(commit_and_report_old_with(
+                black_box(1234u64),
+                |old| Ok(out.write_if_not_null(old)?),
+                || black_box(Ok(())),
+            ))
         });
     }
 
@@ -313,9 +326,11 @@ mod benches {
         let addr = user_out(&mut slot).as_addr();
         b.iter(|| {
             let mut out: UserOutPtr<u64> = UserOutPtr::from(black_box(addr));
-            black_box(commit_and_report_old(black_box(1234u64), &mut out, || {
-                black_box(Err(LxError::EFAULT))
-            }))
+            black_box(commit_and_report_old_with(
+                black_box(1234u64),
+                |old| Ok(out.write_if_not_null(old)?),
+                || black_box(Err(LxError::EFAULT)),
+            ))
         });
     }
 

@@ -151,3 +151,8 @@ impl Syscall<'_> {
 
 #[cfg(test)]
 mod tests;
+
+/// The three calls that pass a `sigset_t` and nothing else, where the only
+/// thing that differs is the ALIGNMENT. Own file, own subject.
+#[cfg(test)]
+mod mask_tests;

@@ -171,7 +171,7 @@ fn word(bytes: &[u8], at: usize) -> u32 {
 }
 
 /// A `Syscall` as a `&mut` one, since `compat32_syscall` takes `&mut self`.
-fn as_mut<'a>(sys: &Syscall<'a>) -> Syscall<'a> {
+pub(super) fn as_mut<'a>(sys: &Syscall<'a>) -> Syscall<'a> {
     Syscall {
         thread: sys.thread,
         thread_fn: sys.thread_fn,
