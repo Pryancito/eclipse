@@ -751,8 +751,9 @@ mod sigaltstack_tests {
 /// stack a signal frame fits on, and glibc sizes `SIGSTKSZ` from it. That is
 /// only a promise if the native frame -- `siginfo`, `ucontext` and the
 /// restorer's address, pushed on the alternate stack with no red zone --
-/// really is no bigger.
-#[cfg(test)]
+/// really is no bigger. Only x86_64 is given the entry, and only there is
+/// the frame that small.
+#[cfg(all(test, target_arch = "x86_64"))]
 mod min_sigstksz_tests {
     use super::*;
 
