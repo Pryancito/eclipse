@@ -207,6 +207,12 @@ la GPU, pero lo que se presenta no llega a verse: la página quedaba vacía bajo
 el indicador `GL`. Ahí la página se renderiza en el FBO fuera de pantalla de
 Servo y se lee al `wl_shm` del toplevel, como en software (`paint=EGL→wl_shm`
 en el log). `SILVERSURFER_PRESENT=egl` o `=shm` fuerza un camino u otro.
+Los tres primeros fotogramas leídos se resumen en el log
+(`fotograma N leído WxH medio=#rrggbb opacos=P%`): si salen y la ventana no
+cambia, el fallo está en la composición; si no salen o la pestaña no pasa de
+«Nueva pestaña», la página no llega a cargar. `SILVERSURFER_MULTIPROCESS=0`
+deja script y layout en el mismo proceso para descartar el proceso de
+contenido (`procesos=uno` en el log).
 `SILVERSURFER_SOFTWARE=1` hace lo contrario: salta EGL y pinta la página en
 software→wl_shm, el camino que toma Eclipse OS con labwc en pixman. Ahí el
 toplevel usa dos búferes: pixman no suelta un `wl_shm` hasta recibir otro, y

@@ -46,6 +46,7 @@ impl App {
             self.readback = cur;
             return self.paint_page_rgba(pw, ph);
         }
+        self.log_readback(&cur, pw, ph, true);
         let t1 = Instant::now();
         // Un búfer nuevo (resize, primer fotograma) se pinta entero.
         let fresh = self.shown.len() != len;
@@ -101,6 +102,7 @@ impl App {
         };
         let raw = image.into_raw();
         let width = image_width(&raw, pw);
+        self.log_readback(&raw, width, ph, false);
         let t1 = Instant::now();
         let dst_y = (self.chrome_h() * self.scale).max(0) as u32;
         // Este camino no lleva `shown`: el próximo BGRA copia entero.
@@ -119,6 +121,41 @@ impl App {
         }
         let height = self.parent_buf.as_ref().map_or(0, |b| b.height as u32);
         self.commit_parent_rows(0, height)
+    }
+
+    /// Resume en el log los primeros fotogramas leídos: tamaño, color medio y
+    /// cuántos píxeles son opacos. Distingue una lectura vacía (todo ceros)
+    /// de una página que sí llega pero no se ve.
+    pub(super) fn log_readback(&mut self, px: &[u8], width: u32, height: u32, bgra: bool) {
+        if self.read_frames >= 3 {
+            return;
+        }
+        self.read_frames += 1;
+        let (mut sum, mut opaque, mut n) = ([0u64; 3], 0u64, 0u64);
+        // Una muestra cada 7 píxeles basta y no cuesta nada.
+        for p in px.chunks_exact(4).step_by(7) {
+            let (r, g, b) = if bgra {
+                (p[2], p[1], p[0])
+            } else {
+                (p[0], p[1], p[2])
+            };
+            sum[0] += u64::from(r);
+            sum[1] += u64::from(g);
+            sum[2] += u64::from(b);
+            opaque += u64::from(p[3] == 255);
+            n += 1;
+        }
+        let n = n.max(1);
+        eprintln!(
+            "silversurfer: fotograma {} leído {}x{} medio=#{:02x}{:02x}{:02x} opacos={}%",
+            self.read_frames,
+            width,
+            height,
+            sum[0] / n,
+            sum[1] / n,
+            sum[2] / n,
+            opaque * 100 / n,
+        );
     }
 
     /// Vuelve a marcar el fotograma como pendiente para pintarlo más tarde.

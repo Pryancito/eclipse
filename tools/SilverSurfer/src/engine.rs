@@ -1341,7 +1341,22 @@ pub fn start(
 ) -> Result<Session, String> {
     install_crypto();
     let mut opts = Opts::default();
-    opts.multiprocess = true;
+    // SILVERSURFER_MULTIPROCESS=0 keeps script and layout in this process.
+    // On Eclipse OS a page that never leaves "Nueva pestaña" points at the
+    // content process (spawn, ipc-channel) rather than at painting; this
+    // tells the two apart without rebuilding.
+    opts.multiprocess = !matches!(
+        std::env::var("SILVERSURFER_MULTIPROCESS").as_deref(),
+        Ok("0") | Ok("no") | Ok("off")
+    );
+    eprintln!(
+        "silversurfer: procesos={}",
+        if opts.multiprocess {
+            "múltiples"
+        } else {
+            "uno"
+        }
+    );
     let mut preferences = Preferences::default();
     install_compat_preferences(&mut preferences);
 
