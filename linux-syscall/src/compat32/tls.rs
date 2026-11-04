@@ -39,6 +39,13 @@ use super::*;
 use kernel_hal::context::CompatUserDesc;
 use linux_object::error::LxError;
 
+/// i386's number for `clone`.
+///
+/// Its home is this module because what makes it i386's own is the thread
+/// pointer: the `tls` argument is a `struct user_desc *` and sits one place
+/// EARLIER than on x86_64. See [`install_child_compat_tls`].
+pub(crate) const I386_CLONE: u32 = 120;
+
 impl Syscall<'_> {
     /// `set_thread_area(2)`, i386 243.
     ///
@@ -134,4 +141,49 @@ fn to_array(bytes: &[u8]) -> [u8; 16] {
     let mut out = [0u8; 16];
     out.copy_from_slice(&bytes[..16]);
     out
+}
+
+/// Install the `user_desc` at `desc` into **`ctx`**, which is a child's
+/// context and not the calling thread's.
+///
+/// This is what `CLONE_SETTLS` means to a 32-bit process, and it is not what
+/// it means to a native one: there the word is the thread pointer itself, and
+/// here it is a **pointer to a `struct user_desc`** --- the same sixteen
+/// bytes `set_thread_area` takes. A kernel that wrote the word into the
+/// child's thread pointer would give a 32-bit thread a `%gs` base of
+/// whatever address its descriptor happened to live at.
+///
+/// `entry_number` has to name a slot: `-1` is **refused** here, where
+/// `set_thread_area` accepts it. That is Linux's own asymmetry --- its
+/// `set_new_tls` calls `do_set_thread_area` with `can_allocate = 0`, and a
+/// `-1` there is `EINVAL` --- and it is measurable from userspace: a 32-bit
+/// `clone(CLONE_SETTLS)` whose descriptor says `-1` answers `EINVAL` on this
+/// container's Linux. A library has already been handed its entry by
+/// `set_thread_area` in the parent and passes that number, which is why
+/// nothing real asks for `-1` here.
+///
+/// Nothing is written back to the caller: `set_new_tls` does not either.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn install_child_compat_tls(
+    ctx: &mut kernel_hal::context::UserContext,
+    desc: usize,
+) -> Result<(), LxError> {
+    let user: kernel_hal::user::UserInPtr<u8> = desc.into();
+    let bytes = user.read_array(16)?;
+    let info = CompatUserDesc::from_bytes(&to_array(&bytes));
+    let slot = kernel_hal::context::compat_tls_slot_of(info.entry_number).ok_or(LxError::EINVAL)?;
+    let descriptor = info.to_descriptor();
+    let selector = ctx
+        .set_compat_tls(slot, descriptor)
+        .ok_or(LxError::EINVAL)?;
+    // The same pairing `set_thread_area` makes, and for the same reason: the
+    // selector has to be in the saved `%gs` because `iretq` does not reload
+    // it. An empty descriptor clears it instead of pointing at a slot that
+    // now holds zero.
+    if descriptor == 0 {
+        ctx.set_compat_gs(0);
+    } else {
+        ctx.set_compat_gs(selector);
+    }
+    Ok(())
 }
