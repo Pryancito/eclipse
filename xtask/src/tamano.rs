@@ -118,7 +118,14 @@ const PASADOS: &[(&str, usize)] = &[
     // cruce que pasaba en falso: `install_tests` leía este fichero buscando
     // quién arranca cada wrapper, y lo que lo satisfacía era el texto de los
     // tests que ahora están fuera.
-    ("xtask/src/linux/mod.rs", 6000),
+    //
+    // 5750: BAJADO otra vez el 4-nov-2026 por lo mismo. El par de la etapa 4
+    // del compat de 32 bits (`i386_dyn`, y el `fresh_i386` que ahora
+    // comparten las dos caches de i386) lo dejó en 6062, así que
+    // `var_run_tests` salió a `linux/var_run_tests.rs` --- 348 líneas, ni una
+    // de producción --- y quedó en 5725. Le siguen quedando cuatro `mod` de
+    // test de primer nivel aquí para la próxima vez.
+    ("xtask/src/linux/mod.rs", 5750),
     // 7000: master llego a 6753 con el techo en 6750, asi que el trinquete
     // estaba rojo antes de esta tanda y no por ella. 7250: la busqueda por
     // tarjeta del nodo (multi-GPU) lo dejo en 7025; mismo caso que drm.rs.

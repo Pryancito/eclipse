@@ -34,6 +34,7 @@
 //! | `PT_INTERP` naming nothing                | `ENOENT`  |
 //! | `PT_INTERP` shorter than an ELF header    | `EIO`     |
 //! | `PT_INTERP` not an ELF for this machine   | `ELIBBAD` |
+//! | `PT_INTERP` of the other class than the program | `ELIBBAD` |
 //!
 //! It also measures every segment and the section table against the file,
 //! which Linux does not do: [`check_elf_bounds`] does, after the line, so a
@@ -401,7 +402,27 @@ impl LinuxElfLoader {
         if read < want {
             return Err(LxError::EIO);
         }
-        image_phdrs(&file, &head[..read], LxError::ELIBBAD)?;
+        let (interp_header, _) = image_phdrs(&file, &head[..read], LxError::ELIBBAD)?;
+        // The interpreter has to be of the program's own flavour, and not
+        // merely of one this kernel runs. `load_elf_binary` asks
+        // `elf_check_arch` and `EI_CLASS != ELF_CLASS` of the interpreter with
+        // the macros of the binfmt handler the MAIN program chose, so under
+        // `compat_binfmt_elf` -- an `EM_386` program -- both mean the 32-bit
+        // ones, and a 64-bit `ld.so` fails them. [`runnable_here`] cannot see
+        // that: on x86_64 it says yes to either class, which is right for the
+        // program and too wide for its interpreter.
+        //
+        // Measured on a Linux 6.18 host, both ways round: a 32-bit `ET_EXEC`
+        // whose `PT_INTERP` names an x86_64 image, and an x86_64 program whose
+        // `PT_INTERP` was patched to a 32-bit one, both give ELIBBAD
+        // ("Accessing a corrupted shared library"), never a load.
+        if (interp_header.class, interp_header.machine) != (header.class, header.machine) {
+            warn!(
+                "execve: PT_INTERP {:?} is class {} machine {}, the program is class {} machine {}",
+                interp, interp_header.class, interp_header.machine, header.class, header.machine
+            );
+            return Err(LxError::ELIBBAD);
+        }
         Ok(())
     }
 }
@@ -474,6 +495,47 @@ mod tests {
         let mut path = interp.as_bytes().to_vec();
         path.push(0);
         image(&[(PT_INTERP, &path)])
+    }
+
+    /// The same, of the 32-bit class this kernel also runs: an `EM_386`
+    /// `ET_EXEC` whose header and program headers are the ELF32 shapes, which
+    /// put `e_phoff` at 28 and `p_offset`/`p_filesz` at 4 and 16 of a
+    /// 32-byte program header. Only x86_64 runs one at all.
+    #[cfg(target_arch = "x86_64")]
+    fn image_i386(segments: &[(u32, &[u8])]) -> Vec<u8> {
+        let count = 1 + segments.len();
+        let phdr32 = |i: usize| EHDR_SIZE_32 + i * PHDR_SIZE_32;
+        let mut v = vec![0u8; phdr32(count)];
+        v[..4].copy_from_slice(b"\x7fELF");
+        v[4] = ELFCLASS32;
+        v[5] = ELFDATA2LSB;
+        v[6] = 1;
+        put16(&mut v, 16, ET_EXEC);
+        put16(&mut v, 18, EM_I386);
+        put32(&mut v, 28, EHDR_SIZE_32 as u32);
+        put16(&mut v, 40, EHDR_SIZE_32 as u16);
+        put16(&mut v, 42, PHDR_SIZE_32 as u16);
+        put16(&mut v, 44, count as u16);
+        for (i, (kind, bytes)) in segments.iter().enumerate() {
+            let at = phdr32(1 + i);
+            let offset = v.len() as u32;
+            v.extend_from_slice(bytes);
+            put32(&mut v, at, *kind);
+            put32(&mut v, at + 4, offset);
+            put32(&mut v, at + 16, bytes.len() as u32);
+        }
+        let len = v.len() as u32;
+        put32(&mut v, phdr32(0), PT_LOAD);
+        put32(&mut v, phdr32(0) + 16, len);
+        v
+    }
+
+    /// A 32-bit dynamic image whose `PT_INTERP` names `interp`.
+    #[cfg(target_arch = "x86_64")]
+    fn dynamic_i386(interp: &str) -> Vec<u8> {
+        let mut path = interp.as_bytes().to_vec();
+        path.push(0);
+        image_i386(&[(PT_INTERP, &path)])
     }
 
     struct Fs {
@@ -952,6 +1014,31 @@ mod tests {
         script.resize(EHDR_SIZE, b'#');
         fs.file("script", &script);
         assert_eq!(fs.run(&dynamic("/script")), Err(LxError::ELIBBAD));
+    }
+
+    /// An interpreter of the other class than the program it is the
+    /// interpreter of, both ways round. Each file on its own is one this
+    /// kernel runs, which is why nothing before this looked at the pair.
+    ///
+    /// Measured on a Linux 6.18 host: a 32-bit `ET_EXEC` whose `PT_INTERP`
+    /// names `/usr/bin/true` (x86_64), and `/usr/bin/true` itself with its
+    /// `PT_INTERP` patched to a 32-bit static image, both come back
+    /// "Accessing a corrupted shared library", which is `ELIBBAD`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn an_interpreter_of_the_other_class_than_its_program_is_elibbad() {
+        let fs = Fs::new();
+        // `/ld.so` is the 64-bit interpreter `Fs::new` installs.
+        fs.file("ld32.so", &image_i386(&[]));
+
+        // Each flavour with its own interpreter is let through, because the
+        // check is about the pair and not about either file.
+        assert_eq!(fs.run(&dynamic("/ld.so")), Ok(()));
+        assert_eq!(fs.run(&dynamic_i386("/ld32.so")), Ok(()));
+
+        // And crossed over, neither is.
+        assert_eq!(fs.run(&dynamic_i386("/ld.so")), Err(LxError::ELIBBAD));
+        assert_eq!(fs.run(&dynamic("/ld32.so")), Err(LxError::ELIBBAD));
     }
 
     /// A file that reports more bytes than it hands out, which is a file
