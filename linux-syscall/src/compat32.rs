@@ -181,9 +181,9 @@ use signal::{I386_RT_SIGACTION, I386_RT_SIGRETURN, I386_SIGALTSTACK};
 /// a property of the CALL and not of the process. See [`time64`].
 use time64::{
     I386_CLOCK_GETRES_TIME64, I386_CLOCK_GETTIME64, I386_CLOCK_NANOSLEEP_TIME64,
-    I386_CLOCK_SETTIME64, I386_FUTEX_TIME64, I386_PPOLL_TIME64, I386_SCHED_RR_GET_INTERVAL_TIME64,
-    I386_TIMERFD_GETTIME64, I386_TIMERFD_SETTIME64, I386_TIMER_GETTIME64, I386_TIMER_SETTIME64,
-    I386_UTIMENSAT_TIME64,
+    I386_CLOCK_SETTIME64, I386_FUTEX_TIME64, I386_PPOLL_TIME64, I386_PSELECT6_TIME64,
+    I386_SCHED_RR_GET_INTERVAL_TIME64, I386_TIMERFD_GETTIME64, I386_TIMERFD_SETTIME64,
+    I386_TIMER_GETTIME64, I386_TIMER_SETTIME64, I386_UTIMENSAT_TIME64,
 };
 
 /// And `ipc`, the eleven System V calls behind one number --- where the
@@ -329,6 +329,12 @@ impl Syscall<'_> {
             I386_PPOLL_TIME64 => {
                 return syscall_ret(
                     self.sys_ppoll_time64(a0.into(), a1, a2.into(), a3.into(), a4)
+                        .await,
+                );
+            }
+            I386_PSELECT6_TIME64 => {
+                return syscall_ret(
+                    self.sys_pselect6_time64(a0, a1.into(), a2.into(), a3.into(), a4.into(), a5)
                         .await,
                 );
             }

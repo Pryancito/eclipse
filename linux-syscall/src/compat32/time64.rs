@@ -68,11 +68,22 @@
 //! its own that arms nothing and reads the clock instead, so the width goes
 //! down into `cpu_timer_settime` too.
 //!
+//! And `pselect6_time64` (413), the SECOND call in both rules at once, and
+//! the one that made the second rule's shape plain: its timeout is the
+//! number's, and the two words of its sixth argument ---
+//! `{ const sigset_t *ss; size_t ss_len; }` --- are the process's, because
+//! they are `compat_sigset_argpack` whichever number the call came in by.
+//! Converting them is also what let i386's plain `pselect6` (308) into the
+//! translation table at last, so the two numbers reach the one handler.
+//!
+//! Those two words carry the one field no structure in [`crate::narrow`] had
+//! before: a **pointer**, which is zero-extended and not sign-extended. See
+//! `PSelectSigsetArg`.
+//!
 //! ## What is still missing
 //!
-//! `pselect6_time64` (413), whose sixth argument points at two words that
-//! nothing converts yet; `recvmmsg_time64` (417); and
-//! `rt_sigtimedwait_time64` (421), which passes a `siginfo_t` outwards.
+//! `recvmmsg_time64` (417); and `rt_sigtimedwait_time64` (421), which passes
+//! a `siginfo_t` outwards.
 
 use super::*;
 use crate::file::ITimerSpec;
@@ -103,6 +114,8 @@ pub(super) const I386_SCHED_RR_GET_INTERVAL_TIME64: u32 = 423;
 pub(super) const I386_TIMER_GETTIME64: u32 = 408;
 /// i386's number for `timer_settime64`.
 pub(super) const I386_TIMER_SETTIME64: u32 = 409;
+/// i386's number for `pselect6_time64`.
+pub(super) const I386_PSELECT6_TIME64: u32 = 413;
 
 impl Syscall<'_> {
     /// `clock_gettime64` (403): the native call, writing a
@@ -212,6 +225,28 @@ impl Syscall<'_> {
             .await
     }
 
+    /// `pselect6_time64` (413): the timeout is a `struct __kernel_timespec`.
+    ///
+    /// The SECOND structure this call passes is not a time at all and does
+    /// not change width with the number: the sixth argument's
+    /// `{ const sigset_t *ss; size_t ss_len; }` is `compat_sigset_argpack`
+    /// for a 32-bit caller whichever number it came in by. So, like
+    /// `utimensat_time64`, this call is in both of this layer's rules at
+    /// once, and the core takes only the one answer that the number decides.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sys_pselect6_time64(
+        &mut self,
+        nfds: usize,
+        read: kernel_hal::user::UserInOutPtr<u32>,
+        write: kernel_hal::user::UserInOutPtr<u32>,
+        err: kernel_hal::user::UserInOutPtr<u32>,
+        timeout: kernel_hal::user::UserInOutPtr<TimeSpec>,
+        sigset_arg: usize,
+    ) -> SysResult {
+        self.pselect6_at(nfds, read, write, err, timeout, sigset_arg, false)
+            .await
+    }
+
     /// `sched_rr_get_interval_time64` (423).
     pub fn sys_sched_rr_get_interval_time64(
         &self,
@@ -248,3 +283,9 @@ mod tests;
 /// handed in: own file so the two subjects do not share a ceiling.
 #[cfg(test)]
 mod shared_core_tests;
+
+/// `pselect6_time64` (413) next to i386's 308: the second call in both of
+/// this layer's rules at once, and the one whose sixth argument carries the
+/// first POINTER to go through [`crate::narrow`]. Own file, own subject.
+#[cfg(test)]
+mod pselect_tests;
