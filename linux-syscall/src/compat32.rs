@@ -182,7 +182,8 @@ use signal::{I386_RT_SIGACTION, I386_RT_SIGRETURN, I386_SIGALTSTACK};
 use time64::{
     I386_CLOCK_GETRES_TIME64, I386_CLOCK_GETTIME64, I386_CLOCK_NANOSLEEP_TIME64,
     I386_CLOCK_SETTIME64, I386_FUTEX_TIME64, I386_PPOLL_TIME64, I386_SCHED_RR_GET_INTERVAL_TIME64,
-    I386_TIMERFD_GETTIME64, I386_TIMERFD_SETTIME64, I386_UTIMENSAT_TIME64,
+    I386_TIMERFD_GETTIME64, I386_TIMERFD_SETTIME64, I386_TIMER_GETTIME64, I386_TIMER_SETTIME64,
+    I386_UTIMENSAT_TIME64,
 };
 
 /// And `ipc`, the eleven System V calls behind one number --- where the
@@ -333,6 +334,10 @@ impl Syscall<'_> {
             }
             I386_SCHED_RR_GET_INTERVAL_TIME64 => {
                 return syscall_ret(self.sys_sched_rr_get_interval_time64(a0, a1.into()));
+            }
+            I386_TIMER_GETTIME64 => return syscall_ret(self.sys_timer_gettime64(a0, a1)),
+            I386_TIMER_SETTIME64 => {
+                return syscall_ret(self.sys_timer_settime64(a0, a1, a2.into(), a3.into()));
             }
             I386_IPC => {
                 return syscall_ret(self.sys_ipc32(a0 as u32, a1, a2, a3, a4, a5).await);

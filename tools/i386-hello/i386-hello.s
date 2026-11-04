@@ -121,6 +121,9 @@
  *       sched_rr_get_interval_time64 (423) read or wrote its structure at
  *       the NARROW width: in this family the width is the CALL's, so a
  *       32-bit caller's timespec is sixteen bytes
+ *   106 timer_settime64 (409) or timer_gettime64 (408) read or wrote its
+ *       itimerspec at the narrow width: theirs is thirty-two bytes, where
+ *       260 and 261 pass sixteen
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -2938,6 +2941,136 @@ statx_poison:
 	cmpl	$0xaaaaaaaa, tsp + 16
 	jne	bad_time64_rest
 
+	/* Step 82: `timer_gettime64` (408) and `timer_settime64` (409), the
+	 * POSIX timers of `timer_create(2)`.
+	 *
+	 * Their `struct __kernel_itimerspec` is four 64-bit words --- thirty-two
+	 * bytes, where the narrow 260 and 261 pass sixteen. The timer itself is
+	 * made with 259, whose `struct sigevent` holds a pointer in a union and
+	 * so is NOT in the translation table. Passing a null `sevp` --- `SIGALRM`
+	 * to the process, the only form that needs no conversion --- does NOT
+	 * get round that: the table is consulted by NUMBER, so 259 answers
+	 * `ENOSYS` whatever its arguments say. **So on Eclipse this step skips
+	 * itself**, and what it measures it measures on a kernel that HAS 259:
+	 * the Linux of this container, where breaking an expectation here still
+	 * gives 106. Skipping and not failing, because a timer that cannot be
+	 * created is a missing 259 and not a wrong width --- and failing here
+	 * would stop the probe before step 61's `execve`.
+	 *
+	 * Lo vio Copilot en el #2411.
+	 *
+	 * `tsp` is 4 mod 8, which is the alignment a 32-bit program gives a
+	 * structure of `__s64`s. */
+	movl	$259, %eax		/* timer_create */
+	xorl	%ebx, %ebx		/* CLOCK_REALTIME */
+	xorl	%ecx, %ecx		/* sevp = NULL: SIGALRM to the process */
+	movl	$timerid, %edx
+	int	$0x80
+	/* `-ENOSYS`: this kernel has no 259 for a 32-bit process, so there is
+	 * no timer to ask about. Skip the step rather than fail it. */
+	cmpl	$-38, %eax
+	je	timer64_skipped
+	testl	%eax, %eax
+	jnz	bad_timer64
+
+	/* timer_settime64(id, 0, {interval 0, value {0, 2e9}}, NULL): a
+	 * tv_nsec of two thousand million is not a nanosecond count, and
+	 * `do_timer_settime` validates BOTH halves before arming, so the wide
+	 * read answers EINVAL. A kernel reading sixteen bytes finds an
+	 * interval of {0,0} and a value that is the HIGH halves of those two
+	 * zeros, so {0,0} as well, which disarms the timer and returns 0. The
+	 * expected answer here is the ERROR. */
+	call	poison_tsp
+	movl	$0, tsp + 0		/* it_interval.tv_sec  low */
+	movl	$0, tsp + 4		/*                     high */
+	movl	$0, tsp + 8		/* it_interval.tv_nsec low */
+	movl	$0, tsp + 12		/*                     high */
+	movl	$0, tsp + 16		/* it_value.tv_sec     low */
+	movl	$0, tsp + 20		/*                     high */
+	movl	$2000000000, tsp + 24	/* it_value.tv_nsec    low: out of range */
+	movl	$0, tsp + 28		/*                     high */
+	movl	$409, %eax
+	movl	timerid, %ebx
+	xorl	%ecx, %ecx		/* flags */
+	movl	$tsp, %edx
+	xorl	%esi, %esi		/* old_value = NULL */
+	int	$0x80
+	cmpl	$-22, %eax		/* -EINVAL */
+	jne	bad_timer64
+
+	/* And a spec that IS valid, so the same number returns 0: without this
+	 * the check above would pass on a kernel that refused every 409. One
+	 * second of interval, one of value. */
+	call	poison_tsp
+	movl	$1, tsp + 0		/* it_interval.tv_sec = 1 */
+	movl	$0, tsp + 4
+	movl	$0, tsp + 8
+	movl	$0, tsp + 12
+	/* A thousand seconds, and not one: the timer notifies with SIGALRM to
+	 * the process (a null `sevp`), so a value this step could reach would
+	 * kill the probe if anything between here and the `timer_delete`
+	 * below took a second. */
+	movl	$1000, tsp + 16		/* it_value.tv_sec = 1000 */
+	movl	$0, tsp + 20
+	movl	$0, tsp + 24
+	movl	$0, tsp + 28
+	movl	$409, %eax
+	movl	timerid, %ebx
+	xorl	%ecx, %ecx
+	movl	$tsp, %edx
+	xorl	%esi, %esi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_timer64
+
+	/* timer_gettime64(id, tsp): thirty-two bytes OUT. The timer is armed
+	 * with a one second interval, so `it_interval.tv_sec` is 1 at offset
+	 * 0 --- and a kernel writing the NARROW layout would put the interval
+	 * nanoseconds at 4, where the high half of those seconds belongs. */
+	call	poison_tsp
+	movl	$408, %eax
+	movl	timerid, %ebx
+	movl	$tsp, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_timer64
+	cmpl	$1, tsp + 0		/* it_interval.tv_sec  low */
+	jne	bad_timer64
+	cmpl	$0, tsp + 4		/*                     high */
+	jne	bad_timer64
+	/* The value counts down, so its seconds are 0 and its nanoseconds are
+	 * something: what this step can name is the HIGH halves, which the
+	 * narrow layout never writes. */
+	cmpl	$0, tsp + 20		/* it_value.tv_sec     high */
+	jne	bad_timer64
+	cmpl	$0, tsp + 28		/* it_value.tv_nsec    high */
+	jne	bad_timer64
+	/* And nothing past thirty-two, where the poison starts again. */
+	cmpl	$0xaaaaaaaa, tsp + 32
+	jne	bad_timer64
+
+	/* The narrow number next door, for the other half of the claim: 261
+	 * writes SIXTEEN bytes of the same timer, so byte 16 is still the
+	 * poison. */
+	call	poison_tsp
+	movl	$261, %eax		/* timer_gettime */
+	movl	timerid, %ebx
+	movl	$tsp, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_timer64
+	cmpl	$1, tsp + 0		/* it_interval.tv_sec */
+	jne	bad_timer64
+	cmpl	$0xaaaaaaaa, tsp + 16
+	jne	bad_timer64
+
+	movl	$263, %eax		/* timer_delete */
+	movl	timerid, %ebx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_timer64
+
+timer64_skipped:
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -3282,6 +3415,9 @@ bad_utimes:
 bad_time64_rest:
 	movl	$105, %ebx
 	jmp	die
+bad_timer64:
+	movl	$106, %ebx
+	jmp	die
 
 	/* 0xaa over the 128 bytes of `dsbuf`, so that every byte the kernel
 	 * writes is one this program did not put there and every byte it
@@ -3592,6 +3728,10 @@ dsbuf:
 tsp:
 	.space	48
 fd4:
+	.long	0
+	/* Step 82's POSIX timer id. A `timer_t` is a pointer-sized handle, so
+	 * four bytes here. */
+timerid:
 	.long	0
 	.balign	8
 	.long	0

@@ -61,12 +61,17 @@
 //! pair is thirty-two. One core, `Syscall::utimensat_at`, reached from both
 //! with the answer handed in.
 //!
+//! And `timer_gettime64` (408) with `timer_settime64` (409), the POSIX
+//! timers of `timer_create(2)`. Their `struct itimerspec` is converted in
+//! three places rather than one, because a timer on a CPU clock
+//! (`CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID`) takes a path of
+//! its own that arms nothing and reads the clock instead, so the width goes
+//! down into `cpu_timer_settime` too.
+//!
 //! ## What is still missing
 //!
-//! `timer_gettime64` (408) and `timer_settime64` (409), whose
-//! `struct itimerspec` this kernel converts in several places including the
-//! CPU-timer path; `pselect6_time64` (413), whose sixth argument points at
-//! two words that nothing converts yet; `recvmmsg_time64` (417); and
+//! `pselect6_time64` (413), whose sixth argument points at two words that
+//! nothing converts yet; `recvmmsg_time64` (417); and
 //! `rt_sigtimedwait_time64` (421), which passes a `siginfo_t` outwards.
 
 use super::*;
@@ -94,6 +99,10 @@ pub(super) const I386_UTIMENSAT_TIME64: u32 = 412;
 pub(super) const I386_PPOLL_TIME64: u32 = 414;
 /// i386's number for `sched_rr_get_interval_time64`.
 pub(super) const I386_SCHED_RR_GET_INTERVAL_TIME64: u32 = 423;
+/// i386's number for `timer_gettime64`.
+pub(super) const I386_TIMER_GETTIME64: u32 = 408;
+/// i386's number for `timer_settime64`.
+pub(super) const I386_TIMER_SETTIME64: u32 = 409;
 
 impl Syscall<'_> {
     /// `clock_gettime64` (403): the native call, writing a
@@ -210,6 +219,25 @@ impl Syscall<'_> {
         interval: UserOutPtr<TimeSpec>,
     ) -> SysResult {
         self.sched_rr_get_interval_at(pid, interval, false)
+    }
+
+    /// `timer_gettime64` (408): what is left of a POSIX timer and its
+    /// interval, as a `struct __kernel_itimerspec` --- thirty-two bytes,
+    /// where 260's is sixteen.
+    pub fn sys_timer_gettime64(&self, id: usize, curr_value: usize) -> SysResult {
+        self.timer_gettime_at(id, curr_value, false)
+    }
+
+    /// `timer_settime64` (409), whose `itimerspec` crosses in both
+    /// directions: the new value in and the old one out.
+    pub fn sys_timer_settime64(
+        &self,
+        id: usize,
+        flags: usize,
+        new_value: UserInPtr<linux_object::time::ITimerSpec>,
+        old_value: UserOutPtr<linux_object::time::ITimerSpec>,
+    ) -> SysResult {
+        self.timer_settime_at(id, flags, new_value, old_value, false)
     }
 }
 
