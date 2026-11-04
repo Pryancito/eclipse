@@ -903,6 +903,64 @@ mod tests {
         }
     }
 
+    /// Only part of a compressed extent sent: what goes down is where that
+    /// part sits inside the extent, not where the extent begins, and asking
+    /// for exactly it finds it. Every test above sends a whole extent from
+    /// block zero, where the two are the same number and the bound is never
+    /// the tight one.
+    #[test]
+    fn part_of_a_compressed_extent_is_remembered_at_its_own_offset() {
+        let z = Zext {
+            algo: Compression::Zstd,
+            disk_blocks: 2,
+            ram_blocks: 8,
+            offset: 0,
+        };
+        let e = Ext {
+            lblk: 0,
+            pblk: 700,
+            blocks: 8,
+            prealloc: false,
+            z: Some(z),
+        };
+        let mut s = Sent::default();
+        s.add(&e, 2, 6, FIRST_INO);
+        assert_eq!(s.find(&e, 2, 6), Some((FIRST_INO, 2)));
+        // The blocks before it never went out, so there is nothing to clone.
+        assert_eq!(s.find(&e, 0, 4), None);
+    }
+
+    /// With two extents written down, the one a clone comes from is the entry
+    /// that HOLDS the blocks -- the last at or below them -- and not the
+    /// first in the map. With a single entry each, as every test above has,
+    /// the first and the last are the same entry and either reading passes.
+    #[test]
+    fn a_clone_comes_from_the_entry_that_holds_it_not_the_first_one() {
+        let mut s = Sent::default();
+        s.add(&plain(0, 1000, 4), 0, 4, FIRST_INO + 1);
+        s.add(&plain(0, 2000, 4), 0, 4, FIRST_INO + 2);
+        assert_eq!(s.find(&plain(0, 2000, 4), 0, 4), Some((FIRST_INO + 2, 0)));
+        assert_eq!(s.find(&plain(0, 1000, 4), 0, 4), Some((FIRST_INO + 1, 0)));
+
+        let packed = |pblk| Ext {
+            lblk: 0,
+            pblk,
+            blocks: 4,
+            prealloc: false,
+            z: Some(Zext {
+                algo: Compression::Zstd,
+                disk_blocks: 2,
+                ram_blocks: 4,
+                offset: 0,
+            }),
+        };
+        let mut c = Sent::default();
+        c.add(&packed(700), 0, 4, FIRST_INO + 1);
+        c.add(&packed(800), 0, 4, FIRST_INO + 2);
+        assert_eq!(c.find(&packed(800), 0, 4), Some((FIRST_INO + 2, 0)));
+        assert_eq!(c.find(&packed(700), 0, 4), Some((FIRST_INO + 1, 0)));
+    }
+
     fn plain(lblk: u64, pblk: u64, blocks: u64) -> Ext {
         Ext {
             lblk,
