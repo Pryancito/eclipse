@@ -133,6 +133,12 @@
  *       inwards, whose width is the number's, or the siginfo_t outwards,
  *       which is 128 bytes at both widths but whose union starts at byte 12
  *       and not 16
+ *   109 rt_sigqueueinfo (178) or rt_tgsigqueueinfo (335) read the siginfo_t
+ *       INWARDS at the wrong offsets, or waitid (284) is not mapped
+ *   110 timer_create (259) read its `struct sigevent` at the native offsets,
+ *       where EVERY field moves because the first one is half as wide
+ *   111 a handler WITHOUT `SA_SIGINFO` could not return: that one needs the
+ *       old `struct sigframe_ia32` and `sigreturn` (119), not the `rt_` pair
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -3510,6 +3516,55 @@ timer64_skipped:
 	testl	%eax, %eax
 	jnz	bad_sigevent
 
+	/* Step 87 (code 111): a handler WITHOUT `SA_SIGINFO` returns through
+	 * `sigreturn` (119), which means the kernel has to have pushed the
+	 * OTHER i386 frame.
+	 *
+	 * i386 has two signal frames and Linux picks between them on that one
+	 * flag: `ia32_setup_rt_frame` for an action with `SA_SIGINFO` and
+	 * `ia32_setup_frame`, a `struct sigframe_ia32` with no `siginfo` and
+	 * no `ucontext`, for one without. The libc on this side agrees: musl's
+	 * i386 `__libc_sigaction` points `sa_restorer` at `__restore_rt` for
+	 * the first and at `__restore` --- a plain `sigreturn` --- for the
+	 * second. So EVERY handler a 32-bit program installs with `signal(3)`
+	 * comes back through number 119, and a kernel that always pushed the
+	 * `rt_` frame hands that call a frame it cannot read.
+	 *
+	 * The action below is the one musl builds for a plain handler, down to
+	 * the restorer, and the step is "does the handler return at all":
+	 * nothing after the `int $0x80` in `oldrest` runs if it does not.
+	 * `flag87` says the handler itself ran, so a kernel that never
+	 * delivered the signal fails here too rather than passing by doing
+	 * nothing.
+	 *
+	 * The `popl %eax` in the restorer is not decoration: the old
+	 * `sigreturn` reads its frame at `esp - 8` counted from `&frame->sc`,
+	 * so the trampoline takes the signal number off before the call. Four
+	 * bytes out and the kernel looks the frame up at an address this
+	 * program never arrives with. */
+	movl	$0, flag87
+	movl	$174, %eax		/* rt_sigaction */
+	movl	$10, %ebx		/* SIGUSR1 */
+	movl	$act87, %ecx
+	xorl	%edx, %edx
+	movl	$8, %esi
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_oldframe
+
+	movl	$20, %eax		/* getpid */
+	int	$0x80
+	movl	%eax, %ebx
+	movl	$37, %eax		/* kill(self, SIGUSR1) */
+	movl	$10, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_oldframe
+
+	/* Reached only if the restorer's `sigreturn` put the registers back. */
+	cmpl	$1, flag87
+	jne	bad_oldframe
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -3858,6 +3913,21 @@ bad_timer64:
 	movl	$106, %ebx
 	jmp	die
 
+/* The handler and the trampoline of step 87, which have to be code and so
+ * cannot live in `.data`. The handler takes one argument and ignores it: an
+ * old frame's handler is `void (int)`. */
+oldhandler:
+	movl	$1, flag87
+	ret
+
+oldrest:
+	popl	%eax			/* the signal number the handler left */
+	movl	$119, %eax		/* sigreturn */
+	int	$0x80
+
+bad_oldframe:
+	movl	$111, %ebx
+	jmp	die
 bad_sigevent:
 	movl	$110, %ebx
 	jmp	die
@@ -4243,6 +4313,21 @@ qpad85:
 qinfo:
 	.space	128
 	.align 8
+/* Step 87's action, as musl's `__libc_sigaction` builds one for a handler
+ * that did not ask for a `siginfo`: SA_RESTORER (0x04000000) and NO
+ * SA_SIGINFO, with the plain `sigreturn` trampoline. Its `sa_mask` is the
+ * twenty bytes of a `struct kernel_sigaction`, which is what number 174
+ * takes --- the pre-POSIX `sigaction` (67) and its sixteen-byte
+ * `old_sigaction` are a different call, and not one this kernel answers. */
+	.align 4
+act87:
+	.long	oldhandler
+	.long	0x04000000
+	.long	oldrest
+	.long	0, 0
+flag87:
+	.long	0
+
 spad86:
 	.long	0
 sev:

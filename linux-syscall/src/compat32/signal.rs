@@ -48,6 +48,11 @@ pub(super) const I386_SIGALTSTACK: u32 = 186;
 /// i386's number for `rt_sigreturn`, which has no native twin: the native
 /// `rt_sigreturn` reads a native frame.
 pub(super) const I386_RT_SIGRETURN: u32 = 173;
+/// And for the pre-POSIX `sigreturn`, which returns from the **old** frame:
+/// the one an action without `SA_SIGINFO` is given, and so the one a handler
+/// installed with `signal(3)` comes back from. It has no native twin at all,
+/// x86_64 having only the `rt_` form.
+pub(super) const I386_SIGRETURN: u32 = 119;
 
 /// `struct compat_sigaction` (`include/linux/compat.h`): twenty bytes.
 ///

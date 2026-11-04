@@ -799,9 +799,12 @@ fn taken_without_handler(
 /// smaller one, so asking about the native size would refuse a stack that has
 /// room for the frame it is actually about to get.
 #[cfg(target_arch = "x86_64")]
-fn sigframe_size(thread: &CurrentThread) -> usize {
+fn sigframe_size(thread: &CurrentThread, siginfo: bool) -> usize {
     if thread.proc().linux().abi().is_32bit() {
-        sigframe32::FRAME32_SIZE
+        // And WHICH of i386's two frames, which the action decides: without
+        // `SA_SIGINFO` the handler takes one argument and the frame is
+        // `struct sigframe_ia32`, the bigger of the two.
+        sigframe32::frame32_size(siginfo)
     } else {
         native_sigframe_size()
     }
@@ -810,7 +813,7 @@ fn sigframe_size(thread: &CurrentThread) -> usize {
 /// The same, where there is no 32-bit personality to ask about:
 /// `Abi::Linux32` is only ever set on x86_64.
 #[cfg(not(target_arch = "x86_64"))]
-fn sigframe_size(_thread: &CurrentThread) -> usize {
+fn sigframe_size(_thread: &CurrentThread, _siginfo: bool) -> usize {
     native_sigframe_size()
 }
 
@@ -1081,7 +1084,8 @@ fn handle_signal(
     // same range with `access_ok()` and answers a bad one with a forced
     // SIGSEGV, which is what a process gets for handing the kernel a stack
     // pointer it cannot use.
-    let frame_size = RED_ZONE_MAX_SIZE + sigframe_size(thread);
+    let want_siginfo = action.flags.contains(SignalActionFlags::SIGINFO);
+    let frame_size = RED_ZONE_MAX_SIZE + sigframe_size(thread, want_siginfo);
     let usable = frame_top.filter(|top| {
         let ranges: Vec<(usize, usize, bool)> = thread
             .proc()
@@ -1117,6 +1121,9 @@ fn handle_signal(
     };
     #[cfg(target_arch = "x86_64")]
     if thread.proc().linux().abi().is_32bit() {
+        if !want_siginfo {
+            return setup_old_i386_frame(thread, ctx, sp, signal, &action, sigmask);
+        }
         return setup_i386_frame(
             thread,
             ctx,
@@ -1230,6 +1237,85 @@ fn setup_i386_frame(
         g.rax = signal as usize;
         g.rdx = frame.siginfo_ptr;
         g.rcx = frame.uctx_ptr;
+    }
+    ctx
+}
+
+/// Enter a 32-bit process's handler with the **old** frame, which is what an
+/// action without `SA_SIGINFO` gets.
+///
+/// Linux chooses between its two ia32 frames on that one flag
+/// (`ia32_setup_frame` against `ia32_setup_rt_frame`), and so does the libc
+/// on the other side: musl's i386 `__libc_sigaction` sets `sa_restorer` to
+/// `__restore` --- a plain `sigreturn` --- for every action without
+/// `SA_SIGINFO`, and to `__restore_rt` only for those with it. So a 32-bit
+/// program that installs a handler through `signal(3)` returns from it by
+/// calling `sigreturn`, and a kernel that pushed the `rt_` frame regardless
+/// hands that call a frame it cannot read.
+///
+/// Three differences from the `rt_` frame, and each is one Linux makes:
+///
+/// - the handler takes **one** argument, so the header is two words;
+/// - there is no `siginfo` and no `ucontext`: the `sigcontext_32` is in the
+///   frame itself, and the mask rides in its `oldmask` and in the
+///   `extramask` behind it;
+/// - and the alternate stack is **not** in the frame, so the `sigreturn` of
+///   one cannot put it back. An `SS_AUTODISARM` stack therefore stays
+///   disarmed after a handler without `SA_SIGINFO`, which is Linux's own
+///   behaviour: `restore_altstack()` is in `sys_rt_sigreturn` and in nothing
+///   else.
+#[cfg(target_arch = "x86_64")]
+fn setup_old_i386_frame(
+    thread: &CurrentThread,
+    mut ctx: Box<UserContext>,
+    frame_top: usize,
+    signal: Signal,
+    action: &SignalAction,
+    sigmask: Sigset,
+) -> Box<UserContext> {
+    use linux_object::signal::ucontext::i386::SigContext32;
+    let frame = match sigframe32::OldFrame32::at(frame_top) {
+        Some(frame) => frame,
+        None => {
+            // The same answer, and for the same reason, as the `rt_` path's.
+            error!(
+                "[exit] pid={} nowhere to put the old 32-bit {:?} frame: top={:#x} (forcing SIGSEGV)",
+                thread.proc().id(),
+                signal,
+                frame_top,
+            );
+            thread
+                .proc()
+                .exit(linux_object::process::exit_code_killed_by(
+                    Signal::SIGSEGV as u8,
+                ));
+            return ctx;
+        }
+    };
+    let sc = SigContext32::from_context(&mut ctx);
+    // SAFETY: the user page table is live and the caller has checked that
+    // `OLD_FRAME32_SIZE` bytes below `frame_top` lie in one writable user
+    // mapping --- `sigframe_size` was asked about this frame, not the other.
+    #[allow(unsafe_code)]
+    unsafe {
+        sigframe32::write_old_frame(frame, action.restorer, signal as u32, &sc, sigmask);
+    }
+    // `sc_ptr` goes in the slot the `rt_` frame uses for its `ucontext`,
+    // because that is what `sys_sigreturn` reads the registers out of; the
+    // `siginfo` slot is zero, there being no `siginfo` in this frame. The key
+    // is EIGHT bytes up, not four: the trampoline for this frame pops the
+    // signal number before the `int $0x80`.
+    thread.backup_context(*ctx, 0, frame.sc_ptr, frame.sigreturn_sp());
+    // One argument, and the other two zero: an old frame's handler is
+    // `void (int)`, and i386 reads its arguments off the stack anyway.
+    ctx.setup_uspace(action.handler, frame.sp, &[signal as usize, 0, 0]);
+    {
+        // `ia32_setup_frame` leaves these three holding the signal number and
+        // two zeros, and a handler written in assembly may read them.
+        let g = ctx.general_mut();
+        g.rax = signal as usize;
+        g.rdx = 0;
+        g.rcx = 0;
     }
     ctx
 }
