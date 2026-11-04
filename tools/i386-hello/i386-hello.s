@@ -3434,12 +3434,16 @@ timer64_skipped:
 	movl	wpid, %eax
 	cmpl	%eax, winfo + 12
 	jne	bad_queueinfo
-	/* And the load-bearing pair: the sival this program sent, and NOT the
-	 * word a straight copy would have taken instead. */
+	/* And the load-bearing check: the sival this program sent at byte 20,
+	 * which is NOT the word it put at byte 24. One comparison is the whole
+	 * of it, because the two words were filled with different values: a
+	 * kernel that read the union at the native offset brings back
+	 * 0x5a5a0002 here and this falls. (It first had a second `cmpl` against
+	 * 0x5a5a0002, which could never fire --- after the first comparison
+	 * passes the word cannot also be the other value. Pointed out by
+	 * Copilot on the #2420.) */
 	cmpl	$0x5a5a0001, winfo + 20
 	jne	bad_queueinfo
-	cmpl	$0x5a5a0002, winfo + 20
-	je	bad_queueinfo
 
 	/* And the 284, for the table entry alone. */
 	movl	$284, %eax		/* waitid */

@@ -19,7 +19,7 @@
 //!    reason both of these take the unaligned path even though a native
 //!    caller's buffer would satisfy the typed one.
 //!
-//! The three callers are `rt_sigqueueinfo` (178) and `rt_tgsigqueueinfo`
+//! The four callers are `rt_sigqueueinfo` (178) and `rt_tgsigqueueinfo`
 //! (335), which pass one **inwards**, and `rt_sigtimedwait` (177) and
 //! `waitid` (284), which pass one **outwards**.
 
@@ -43,12 +43,13 @@ pub(crate) fn siginfo_get<P: Policy + Read>(
         return Ok(at.read()?);
     }
     let bytes: UserInPtr<u8> = at.as_addr().into();
-    let raw = bytes.read_array(SIGINFO_LEN)?;
-    // `read_array` of a fixed length cannot come back short, but the
-    // conversion takes an array and not a slice, so the length is restated
-    // where the compiler can hold it rather than asserted in a comment.
+    // `as_slice` and not `read_array`: both run the same `check_len_for`, but
+    // the second allocates a `Vec` of 128 bytes that is then copied into the
+    // array the conversion takes --- an allocation and a second copy on every
+    // one of these calls, for a length that is fixed and known. Pointed out by
+    // Copilot on the #2420.
     let mut narrow = [0u8; SIGINFO_LEN];
-    narrow.copy_from_slice(&raw);
+    narrow.copy_from_slice(bytes.as_slice(SIGINFO_LEN)?);
     Ok(SigInfo::from_i386_bytes(&narrow))
 }
 

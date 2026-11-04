@@ -122,6 +122,22 @@ fn as_mut<'a>(sys: &Syscall<'a>) -> Syscall<'a> {
     }
 }
 
+/// The number each ABI really comes in by: 284 through the i386 translation
+/// table for a 32-bit process, and the native 247 through the native
+/// dispatcher for a native one.
+///
+/// Calling `compat32_syscall(284, ..)` for a native process answers correctly
+/// --- the table is consulted by number and does not ask who is asking ---
+/// but it is a path a native process never takes, so a test that used it for
+/// both halves would be agreeing with something production never does.
+/// Pointed out by Copilot on the #2420.
+async fn waitid_as(sys: &mut Syscall<'_>, abi: Abi, args: [usize; 6]) -> isize {
+    match abi {
+        Abi::Linux32 => sys.compat32_syscall(I386_WAITID, args).await,
+        _ => sys.syscall(Sys::WAITID as u32, args).await,
+    }
+}
+
 fn put(at: usize, bytes: &[u8]) {
     let mut p: kernel_hal::user::UserOutPtr<u8> = at.into();
     p.write_array(bytes).expect("mapped above");
@@ -304,8 +320,9 @@ fn a_null_rusage_is_left_alone_by_either_width() {
             Box::pin(async move {
                 let mut sys = as_mut(sys);
                 put(info_at, &[0u8; SIGINFO_LEN]);
-                sys.compat32_syscall(
-                    I386_WAITID,
+                waitid_as(
+                    &mut sys,
+                    abi,
                     [P_PID as usize, child as usize, info_at, WEXITED, 0, 0],
                 )
                 .await
@@ -329,8 +346,9 @@ fn a_null_infop_is_left_alone_by_either_width() {
         let rc = on_a_thread(&parent, move |sys| {
             Box::pin(async move {
                 let mut sys = as_mut(sys);
-                sys.compat32_syscall(
-                    I386_WAITID,
+                waitid_as(
+                    &mut sys,
+                    abi,
                     [P_PID as usize, child as usize, 0, WEXITED, 0, 0],
                 )
                 .await
