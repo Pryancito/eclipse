@@ -32,7 +32,7 @@ use crate::narrow::sigevent::sigevent_get;
 use crate::on_a_thread::on_a_thread;
 use alloc::boxed::Box;
 use linux_object::error::LxError;
-use linux_object::process::{Abi, LinuxProcess};
+use linux_object::process::{Abi, ProcessExt};
 use linux_object::signal::Signal;
 use linux_object::thread::ThreadExt;
 use rcore_fs_ramfs::RamFS;
@@ -111,9 +111,14 @@ impl Drop for Fixture {
 }
 
 fn a_process(pid: KoID, abi: Abi) -> Fixture {
-    let lp = LinuxProcess::new(RamFS::new(), 0);
-    lp.set_abi(abi);
-    let proc = Process::create_with_fixed_id_ext(&ROOT_JOB, pid, "sigevent32", lp).unwrap();
+    // `create_linux` and not `create_with_fixed_id_ext`, which is what the
+    // sibling files use: the exit callback that runs the exit hooks ---
+    // and with them `drop_posix_timers_of` --- is installed by `create_linux`
+    // and by nothing else, so a process built the short way keeps its timers
+    // for ever however it ends. That is what `a_timer_dies_with_its_owner`
+    // measures.
+    let proc = Process::create_linux(&ROOT_JOB, RamFS::new(), 0, None, pid).unwrap();
+    proc.linux().set_abi(abi);
     Thread::create_linux(&proc).unwrap();
     proc.vmar()
         .map_at(
@@ -346,4 +351,43 @@ fn a_sigevent_at_an_odd_address_is_read_at_either_width() {
         );
         assert_eq!(rc, 0, "{abi:?}: 259 with a sigevent at an odd address");
     }
+}
+
+/// **The fixture's timers are gone once the fixture is.**
+///
+/// The guard above is only worth having if the exit it performs really
+/// collects the timers, and it did not: the exit callback that runs
+/// `linux-object`'s exit hooks --- and with them this crate's
+/// `drop_posix_timers_of` --- is installed inside `ProcessExt::create_linux`,
+/// so the `create_with_fixed_id_ext` the sibling files use never arms it and
+/// `exit(0)` left the entry and its `RLIMIT_SIGPENDING` charge in the global
+/// table for whatever ran next. Pointed out by Copilot on the #2423.
+///
+/// `drop_posix_timers_of` answers how many it had to collect, so asking for
+/// **zero** after the drop is the whole measurement: building the fixture the
+/// short way again makes this one, and only this one, fail.
+#[test]
+fn a_timer_dies_with_its_owner() {
+    let pid = 48_559;
+    {
+        let proc = a_process(pid, Abi::Linux32);
+        let rc = on_a_thread(&proc, |sys| {
+            Box::pin(async move {
+                let mut sys = as_mut(sys);
+                put(SEV_AT, &narrow_sigevent(NOTIFY_SIGNO, SIGEV_SIGNAL, 0));
+                timer_create_as(
+                    &mut sys,
+                    Abi::Linux32,
+                    [CLOCK_MONOTONIC, SEV_AT, ID_AT, 0, 0, 0],
+                )
+                .await
+            })
+        });
+        assert_eq!(rc, 0);
+    }
+    assert_eq!(
+        crate::time::drop_posix_timers_of(pid),
+        0,
+        "LEFT BEHIND: the exit hook did not run for this fixture"
+    );
 }
