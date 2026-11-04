@@ -247,6 +247,8 @@ pub struct App {
     /// being presented on its own EGL subsurface. Always true in software;
     /// with EGL, see [`egl_via_shm`].
     shm_present: bool,
+    /// Page frames read back so far; the first few are summarised in the log.
+    read_frames: u32,
     /// Hay un `wl_surface.frame` del toplevel sin responder: el compositor aún
     /// no mostró el fotograma anterior, así que el siguiente espera. Limita el
     /// camino software a la frecuencia del monitor (y a cero si no se ve).
@@ -339,6 +341,7 @@ impl App {
             shown: Vec::new(),
             bgra_read: true,
             shm_present: false,
+            read_frames: 0,
             frame_wait: None,
             last_rows: None,
         }
