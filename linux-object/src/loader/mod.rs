@@ -823,6 +823,10 @@ impl LinuxElfLoader {
                     map.insert(abi::AT_PHENT, elf.header.pt2.ph_entry_size() as usize);
                     map.insert(abi::AT_PHNUM, elf.header.pt2.ph_count() as usize);
                     map.insert(abi::AT_PAGESZ, PAGE_SIZE);
+                    // AT_MINSIGSTKSZ: Linux has passed it on x86 since 5.14 and
+                    // glibc depends on it -- see [`abi::AT_MINSIGSTKSZ`].
+                    #[cfg(target_arch = "x86_64")]
+                    map.insert(abi::AT_MINSIGSTKSZ, crate::signal::MIN_SIGSTACK_SIZE);
                     // Identity + AT_SECURE block: who this process is and
                     // whether the exec that is loading it raised privileges.
                     // These five must be present -- a missing block is itself
@@ -979,6 +983,10 @@ impl LinuxElfLoader {
                 map.insert(abi::AT_PHENT, elf.header.pt2.ph_entry_size() as usize);
                 map.insert(abi::AT_PHNUM, elf.header.pt2.ph_count() as usize);
                 map.insert(abi::AT_PAGESZ, PAGE_SIZE);
+                // AT_MINSIGSTKSZ: Linux has passed it on x86 since 5.14 and
+                // glibc depends on it -- see [`abi::AT_MINSIGSTKSZ`].
+                #[cfg(target_arch = "x86_64")]
+                map.insert(abi::AT_MINSIGSTKSZ, crate::signal::MIN_SIGSTACK_SIZE);
                 // Identity + AT_SECURE block — the same rule as the
                 // interpreter path above, asked once, so the two stacks a
                 // process can be given cannot disagree about who it is.

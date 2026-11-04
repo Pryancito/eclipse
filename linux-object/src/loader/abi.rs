@@ -534,6 +534,25 @@ pub const AT_EGID: u8 = 14;
 pub const AT_SECURE: u8 = 23;
 pub const AT_RANDOM: u8 = 25;
 pub const AT_EXECFN: u8 = 31;
+/// The smallest signal frame this kernel delivers, in bytes: what
+/// `sysconf(_SC_MINSIGSTKSZ)` reports and four times of which is
+/// `sysconf(_SC_SIGSTKSZ)`.
+///
+/// Linux has supplied it on x86 since 5.14, and glibc (2.34 and later) on x86
+/// cannot do without it: there `CONSTANT_MINSIGSTKSZ` is 0, ld.so has already
+/// worked out its own estimate from `CPUID` while relocating itself, and
+/// `_dl_parse_auxv` then overwrites that estimate with whatever the aux vector
+/// says -- 0 when the entry is missing. The first `sysconf(_SC_SIGSTKSZ)`
+/// after that, which a `SIGSTKSZ` compiled with `_DYNAMIC_STACK_SIZE_SOURCE`
+/// is, dies with `Fatal glibc error: ... sysconf_sigstksz: assertion failed:
+/// minsigstacksize != 0`. That is how `cargo build` lost the `stylo` build
+/// script; gVisor and WSL1 hit the same assertion before they passed it.
+///
+/// The value is [`crate::signal::MIN_SIGSTACK_SIZE`], the size `sigaltstack`
+/// itself insists on, so the two answers to "how small may a signal stack
+/// be" agree, and it is larger than the frame we push (no FPU state goes in
+/// it, see `ucontext::MachineContext::fpstate`).
+pub const AT_MINSIGSTKSZ: u8 = 51;
 
 /// The identity block of the aux vector: who the kernel says this process is,
 /// and whether the `execve` that started it raised its privileges.

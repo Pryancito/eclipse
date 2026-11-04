@@ -746,3 +746,26 @@ mod sigaltstack_tests {
         assert_eq!(word(16), s.size);
     }
 }
+
+/// `AT_MINSIGSTKSZ` hands userspace [`MIN_SIGSTACK_SIZE`] as the smallest
+/// stack a signal frame fits on, and glibc sizes `SIGSTKSZ` from it. That is
+/// only a promise if the native frame -- `siginfo`, `ucontext` and the
+/// restorer's address, pushed on the alternate stack with no red zone --
+/// really is no bigger.
+#[cfg(test)]
+mod min_sigstksz_tests {
+    use super::*;
+
+    #[test]
+    fn the_native_frame_fits_in_the_advertised_minimum() {
+        let frame = core::mem::size_of::<SigInfo>()
+            + core::mem::size_of::<SignalUserContext>()
+            + core::mem::size_of::<usize>();
+        assert!(
+            frame <= MIN_SIGSTACK_SIZE,
+            "a {}-byte frame does not fit the {} bytes AT_MINSIGSTKSZ promises",
+            frame,
+            MIN_SIGSTACK_SIZE
+        );
+    }
+}
