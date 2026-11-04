@@ -300,6 +300,20 @@ pub const SPA_POLYFILL_USERSCRIPT: &str = r#"(function () {
       window.ResizeObserver.prototype.unobserve = function () {};
       window.ResizeObserver.prototype.disconnect = function () {};
     }
+
+    // Media Source Extensions players (YouTube) poll playback quality.
+    if (typeof HTMLVideoElement !== "undefined" &&
+        typeof HTMLVideoElement.prototype.getVideoPlaybackQuality !== "function") {
+      HTMLVideoElement.prototype.getVideoPlaybackQuality = function () {
+        return {
+          creationTime: performance.now(),
+          totalVideoFrames: 0,
+          droppedVideoFrames: 0,
+          corruptedVideoFrames: 0,
+          totalFrameDelay: 0
+        };
+      };
+    }
   } catch (e) {}
 })();"#;
 
@@ -469,6 +483,7 @@ mod tests {
     fn spa_polyfill_covers_react_surface() {
         for needle in [
             "AbortController",
+            "getVideoPlaybackQuality",
             "AbortSignal.abort",
             "AbortSignal.timeout",
             "AbortSignal.any",

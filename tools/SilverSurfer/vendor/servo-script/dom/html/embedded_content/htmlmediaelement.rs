@@ -76,7 +76,9 @@ use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom, UnrootedDom};
 use crate::dom::bindings::str::{DOMString, USVString};
+use crate::dom::bindings::codegen::UnionTypes::BlobOrMediaSource;
 use crate::dom::blob::Blob;
+use crate::dom::media::mediasource::MediaSource;
 use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::document::Document;
 use crate::dom::element::attributes::storage::AttrRef;
@@ -601,6 +603,8 @@ pub(crate) struct HTMLMediaElement {
     /// is a blob.
     #[no_trace]
     blob_url: DomRefCell<Option<ServoUrl>>,
+    /// The attached MediaSource (Media Source Extensions), if the media resource is one.
+    media_source: MutNullableDom<MediaSource>,
     /// <https://html.spec.whatwg.org/multipage/#dom-media-played>
     played: DomRefCell<TimeRangesContainer>,
     // https://html.spec.whatwg.org/multipage/#dom-media-audiotracks
@@ -715,6 +719,7 @@ impl HTMLMediaElement {
             current_seek_position: Cell::new(f64::NAN),
             resource_url: DomRefCell::new(None),
             blob_url: DomRefCell::new(None),
+            media_source: Default::default(),
             played: DomRefCell::new(TimeRangesContainer::default()),
             audio_tracks_list: Default::default(),
             video_tracks_list: Default::default(),
@@ -1866,6 +1871,18 @@ impl HTMLMediaElement {
 
         // Step 5. Run the appropriate steps from the following list:
         match resource {
+            // Media Source Extensions: attach instead of fetching.
+            // <https://w3c.github.io/media-source/#mediasource-attach>
+            Resource::Url(url) if MediaSource::from_object_url(url.as_str()).is_some() => {
+                let source = MediaSource::from_object_url(url.as_str()).unwrap();
+                if !source.attach(self) {
+                    self.resource_selection_algorithm_failure_steps(cx);
+                    return;
+                }
+                self.media_source.set(Some(&source));
+                *self.resource_url.borrow_mut() = Some(url);
+                self.network_state.set(NetworkState::Loading);
+            },
             Resource::Url(url) => {
                 // Step 5.remote.1. Optionally, run the following substeps. This is the expected
                 // behavior if the user agent intends to not attempt to fetch the resource until the
@@ -1917,7 +1934,10 @@ impl HTMLMediaElement {
                 if let Some(ref src_object) = *self.src_object.borrow() {
                     match src_object {
                         SrcObject::Blob(blob) => {
-                            let blob_url = URL::CreateObjectURL(&self.global(), blob);
+                            let blob_url = URL::CreateObjectURL(
+                                &self.global(),
+                                BlobOrMediaSource::Blob(DomRoot::from_ref(&**blob)),
+                            );
                             *self.blob_url.borrow_mut() =
                                 Some(ServoUrl::parse(&blob_url.str()).expect("infallible"));
                             self.fetch_request(cx, None, None);
@@ -2043,6 +2063,11 @@ impl HTMLMediaElement {
         // Reset the flag that signals whether loadeddata was ever fired for
         // this invokation of the load algorithm.
         self.fired_loadeddata_event.set(false);
+
+        // Media Source Extensions: a new load detaches the MediaSource.
+        if let Some(source) = self.media_source.take() {
+            source.detach();
+        }
 
         // TODO Step 1. Set this element's is currently stalled to false.
 
@@ -2462,6 +2487,21 @@ impl HTMLMediaElement {
             .map(|player| player.lock().unwrap().get_id())
     }
 
+    /// The media player, for the attached MediaSource.
+    pub(crate) fn player(&self) -> Option<Arc<Mutex<dyn Player>>> {
+        self.player.borrow().clone()
+    }
+
+    /// `MediaSource.duration` changed (Media Source Extensions).
+    pub(crate) fn media_source_duration_changed(&self, duration: f64) {
+        let duration = if duration.is_finite() && duration >= 0.0 {
+            Some(Duration::from_secs_f64(duration))
+        } else {
+            None
+        };
+        self.playback_duration_changed(duration);
+    }
+
     fn create_media_player(&self, resource: &Resource) -> Result<(), ()> {
         let stream_type = match *resource {
             Resource::Object => {
@@ -2473,6 +2513,9 @@ impl HTMLMediaElement {
                 } else {
                     return Err(());
                 }
+            },
+            Resource::Url(ref url) if MediaSource::from_object_url(url.as_str()).is_some() => {
+                StreamType::MediaSource
             },
             _ => StreamType::Seekable,
         };
@@ -2544,8 +2587,9 @@ impl HTMLMediaElement {
                 self.media_type_id(),
                 HTMLMediaElementTypeId::HTMLVideoElement
             );
-            let should_enable_download_buffering =
-                (is_video || self.Loop()) && self.Preload() == "auto";
+            let should_enable_download_buffering = (is_video || self.Loop()) &&
+                self.Preload() == "auto" &&
+                stream_type != StreamType::MediaSource;
             if let Err(error) =
                 player_guard.set_download_buffering_enabled(should_enable_download_buffering)
             {
