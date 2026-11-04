@@ -603,6 +603,11 @@ pub(crate) mod ipcbuf;
 /// bytes at both widths, with its union starting four bytes earlier on i386.
 pub(crate) mod siginfo;
 
+/// The `struct sigevent` of `timer_create`, where EVERY field moves: its
+/// first member is a union holding a pointer, so it is half as wide there and
+/// everything behind it shifts.
+pub(crate) mod sigevent;
+
 #[cfg(test)]
 mod tests;
 

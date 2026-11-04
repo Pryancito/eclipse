@@ -396,3 +396,8 @@ mod utimes_tests;
 /// `siginfo_t` that does not change size and a `struct rusage` that halves.
 #[cfg(test)]
 mod waitid_tests;
+
+/// `timer_create` (259), whose `struct sigevent` moves EVERY field, because
+/// its first member is a union holding a pointer.
+#[cfg(test)]
+mod sigevent_tests;

@@ -1,6 +1,7 @@
 //! Syscalls for time
 //! - clock_gettime
 //!
+use crate::narrow::sigevent::SigEvent;
 use crate::outparams::commit_and_report_old_with;
 use crate::Syscall;
 use alloc::boxed::Box;
@@ -1001,19 +1002,11 @@ impl Syscall<'_> {
         let notify = if sevp == 0 {
             TimerNotify::SIGALRM_TO_PROCESS
         } else {
-            // struct sigevent: sigev_value (8 bytes) @ 0, sigev_signo @ 8,
-            // sigev_notify @ 12, and sigev_notify_thread_id @ 16 (64 bytes in
-            // all, so the four reads are inside it whatever the notify).
-            let value_p: UserInPtr<usize> = sevp.into();
-            let signo_p: UserInPtr<i32> = (sevp + 8).into();
-            let notify_p: UserInPtr<i32> = (sevp + 12).into();
-            let tid_p: UserInPtr<i32> = (sevp + 16).into();
-            let event = SigEvent {
-                value: value_p.read()?,
-                signo: signo_p.read()?,
-                notify: notify_p.read()?,
-                thread_id: tid_p.read()?,
-            };
+            // Every field of a `struct sigevent` sits at a different offset
+            // to a 32-bit caller, and its first one is half as wide, so the
+            // offsets live with the conversion in
+            // [`crate::narrow::sigevent`] rather than here.
+            let event = crate::narrow::sigevent::sigevent_get(self.narrow_abi(), sevp)?;
             let proc = self.zircon_process();
             timer_notify_from_sigevent(&event, |tid| proc.get_child(tid).is_ok())?
         };
@@ -1408,15 +1401,6 @@ impl TimerNotify {
         value: 0,
         thread: None,
     };
-}
-
-/// The fields of `struct sigevent` a timer reads.
-#[derive(Debug, Clone, Copy)]
-struct SigEvent {
-    value: usize,
-    signo: i32,
-    notify: i32,
-    thread_id: i32,
 }
 
 const SIGEV_SIGNAL: i32 = 0;

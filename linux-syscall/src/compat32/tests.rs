@@ -469,10 +469,25 @@ fn the_three_siginfo_calls_are_mapped() {
             "i386 {n} must point at the native {name_of}"
         );
     }
-    // And the one of the four that is still out: `timer_create` (259) needs
-    // the `compat_sigevent`, whose union holds a pointer, so it is `ENOSYS`
-    // on purpose and not by omission.
-    assert_eq!(native_number(259), None, "timer_create is not mapped yet");
+}
+
+/// `timer_create` (259), the one whose structure is neither halved nor merely
+/// re-aligned: EVERY field of a `struct sigevent` moves, because its first
+/// member is a union holding a pointer. It was deliberately out of the table
+/// --- and so `ENOSYS` to a 32-bit program --- until the conversion existed;
+/// the offsets are in `crate::narrow::sigevent` and the behaviour is pinned
+/// by `super::sigevent_tests`.
+///
+/// Its native number here is 222 and i386's is 259, so this pins the mapping
+/// and not only the presence of an entry.
+#[test]
+fn the_sigevent_call_is_mapped() {
+    assert_eq!(name(259), Some("timer_create"));
+    assert_eq!(
+        native_number(259),
+        Some(Sys::TIMER_CREATE as u32),
+        "i386 259 must point at the native timer_create"
+    );
 }
 
 /// `statx` and `prlimit64` are mapped for a reason that is not the one

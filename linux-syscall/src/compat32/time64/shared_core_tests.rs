@@ -255,10 +255,12 @@ const CLOCK_THREAD_CPUTIME_ID: usize = 3;
 
 /// A POSIX timer of this process, created through the NATIVE handler.
 ///
-/// `timer_create` is i386's 259 and is deliberately NOT in the translation
-/// table: it passes a `struct sigevent` whose union holds a pointer, and
-/// nothing converts that yet. So a 32-bit process cannot make a timer
-/// through this layer at all, and the test makes one the only way it can.
+/// Since the tanda 29 a 32-bit process can make one through the layer too
+/// (259 is in the table, and its `struct sigevent` is converted by
+/// `crate::narrow::sigevent`). It is still made here the native way with a
+/// null `sevp`, because what these tests are about is the width of the
+/// `struct itimerspec` of `timer_settime`, and a timer created some other
+/// way would add a second reason for them to fail.
 fn a_timer(sys: &Syscall<'_>, clock: usize) -> usize {
     let mut id = [0usize; 1];
     assert_eq!(
