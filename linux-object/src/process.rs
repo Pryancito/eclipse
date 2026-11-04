@@ -1781,6 +1781,44 @@ impl LinuxProcess {
         );
     }
 
+    /// Take a child back that could not be finished being built, before it
+    /// ever ran one instruction: it leaves the child table, and the exit the
+    /// caller gives it next leaves NO zombie, because a `clone` that answers
+    /// an error made no child at all and there is nothing to `wait` for.
+    ///
+    /// Linux is never in this state: `copy_process` links the new task into
+    /// its parent's children at the very end, past every failure, and the
+    /// `bad_fork_*` labels take the half-built task apart. Here
+    /// [`ProcessExt::fork_from`] files the child and some of what can fail
+    /// comes after it (`CLONE_SETTLS`'s `struct user_desc` above all), so the
+    /// undo is this call.
+    ///
+    /// Not [`Self::forget_child`], which is the other direction: THAT child
+    /// died and what is dropped is its zombie. This one also has to leave the
+    /// mark [`Self::record_child_exit`] looks for, because the caller exits
+    /// the child right after this and that callback would otherwise file a
+    /// zombie for a child the same call is reporting as never born.
+    pub fn abandon_child(&self, child_id: KoID) {
+        let mut inner = self.inner.lock();
+        let live = exit_handover::released(inner.children.remove(&child_id));
+        let zombie = exit_handover::released_zombie(inner.reaped_children.remove(&child_id));
+        inner.waited_without_zombie.insert(child_id);
+        drop(inner);
+        drop((live, zombie));
+    }
+
+    /// How many children this process is still carrying the "file no zombie
+    /// for it" mark for ([`Self::abandon_child`]).
+    ///
+    /// A diagnostic, and the only way a test can see the ORDER of the undo:
+    /// every mark is meant to be consumed by the death that follows it, and
+    /// one left behind sits under a pid this kernel recycles, where it would
+    /// swallow the zombie of the next real child to wear that pid. So the
+    /// right answer, for any process the kernel is done unwinding, is 0.
+    pub fn pending_zombie_suppressions(&self) -> usize {
+        self.inner.lock().waited_without_zombie.len()
+    }
+
     /// Drop a dead child without keeping anything for `wait*`: the reaper
     /// ignores `SIGCHLD` (or set `SA_NOCLDWAIT`), so Linux releases the
     /// task in `exit_notify` instead of leaving a zombie, and its CPU never
@@ -6290,6 +6328,10 @@ mod pending_signal_disposition_tests;
 
 #[cfg(test)]
 mod exit_status_tests;
+
+/// Taking back a child that was filed and then could not be finished.
+#[cfg(test)]
+mod abandon_child_tests;
 
 #[cfg(test)]
 mod sigchld_tests;

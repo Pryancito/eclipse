@@ -450,3 +450,7 @@ mod sigevent_tests;
 /// round --- and whose `tls` is a `struct user_desc *` and not a base.
 #[cfg(test)]
 mod clone_tests;
+
+/// A `clone` refused AFTER the child was filed in its parent's table.
+#[cfg(test)]
+mod clone_unwind_tests;

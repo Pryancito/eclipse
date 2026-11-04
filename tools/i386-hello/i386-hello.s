@@ -3467,6 +3467,13 @@ timer64_skipped:
 	je	bad_queueinfo
 	cmpl	$-10, %eax		/* ECHILD, which is the right answer */
 	jne	bad_queueinfo
+	/* That `ECHILD` is also what caught the hijo fantasma of the tanda 35:
+	 * in the SECOND image --- the one that runs after the `execve` of step
+	 * 61, and therefore after step 88's deliberately-refused `clone` --- it
+	 * came back as 0, because the refused clone had left its half-built
+	 * child in the parent's table. "You have a child, none of them ready",
+	 * for the rest of the process's life. So this line measures two things
+	 * now, and the step that breaks it may be 88 and not this one. */
 
 	/* Step 86 (code 110): `timer_create` (259), whose `struct sigevent` is
 	 * the one structure of this layer where EVERY field moves. Its first
