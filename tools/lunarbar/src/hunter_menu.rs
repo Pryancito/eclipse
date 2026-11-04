@@ -79,7 +79,7 @@ pub(super) fn draw_badge(
     } else {
         pal().pill
     };
-    cv.round_rect(*rx, btn_y, w, btn_h, 6, pill);
+    plate(cv, *rx, btn_y, w, btn_h, 6, pill);
     let (col, solid) = match shield {
         Shield::Alert => (pal().warn, true),
         Shield::Open => (pal().dim, false),
@@ -138,7 +138,7 @@ fn segments(
         } else {
             (pal().pill, 0.4, pal().dim)
         };
-        cv.round_rect_a(x, sy, w, sh, 5, bg, a);
+        plate_a(cv, x, sy, w, sh, 5, bg, a);
         let label = fit(label, w - 4);
         let tx = x + (w - Canvas::text_width(&label)) / 2;
         cv.text(&label, tx, sy + (sh - GLYPH_H) / 2, fg);
@@ -160,7 +160,7 @@ pub(super) fn draw(
     let t = hunter::text(i18n::Lang::current());
     let st = &m.st;
     draw_panel(cv, px, py, pw, ph, 10);
-    cv.round_rect_a(px, py, pw, ph, 10, pal().rule, 0.4);
+    plate_a(cv, px, py, pw, ph, 10, pal().rule, 0.4);
     let mut hits = Vec::new();
 
     // Header: the shield as the bar shows it (minus the alert, which opening
@@ -175,7 +175,7 @@ pub(super) fn draw(
     cv.text_bold(t.title, px + PAD + 24, py + 10, pal().text);
     // "open": the rest of hunter, in its own window.
     let (ox, ow) = (px + PAD + 24 + Canvas::text_width(t.title) + 12, Canvas::text_width(t.open) + 16);
-    cv.round_rect(ox, py + 7, ow, GLYPH_H + 6, 5, pal().pill);
+    plate(cv, ox, py + 7, ow, GLYPH_H + 6, 5, pal().pill);
     cv.text(t.open, ox + 8, py + 10, pal().accent);
     hits.push((ox, py + 7, ox + ow, py + 7 + GLYPH_H + 6, Action::HunterOpen));
     if st.sealed {
@@ -275,7 +275,7 @@ pub(super) fn draw(
         let x = px + PAD + i as i32 * (bw + gap);
         let armed = act == &Action::HunterLockdown && m.confirm;
         let bg = if armed { pal().warn } else { pal().pill };
-        cv.round_rect(x, y, bw, BTN_H, 6, bg);
+        plate(cv, x, y, bw, BTN_H, 6, bg);
         let label = fit(label, bw - 6);
         let fg = if armed { pal().white } else { pal().text };
         cv.text(

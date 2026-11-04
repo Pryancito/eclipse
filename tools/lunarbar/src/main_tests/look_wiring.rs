@@ -4,7 +4,7 @@ use super::*;
 
 /// Every look, so a row added to `Look` without a row here fails to compile
 /// rather than quietly inheriting whatever the `_` arm says.
-const LOOKS: [Look; 3] = [Look::Eclipse, Look::Kde, Look::Win11];
+const LOOKS: [Look; 4] = [Look::Eclipse, Look::Kde, Look::Win11, Look::Tecno];
 
 #[test]
 fn each_look_wears_its_own_palette() {
@@ -17,6 +17,7 @@ fn each_look_wears_its_own_palette() {
     assert_eq!(*pal_of(Look::Eclipse), PAL_ECLIPSE);
     assert_eq!(*pal_of(Look::Kde), PAL_KDE);
     assert_eq!(*pal_of(Look::Win11), PAL_WIN11);
+    assert_eq!(*pal_of(Look::Tecno), PAL_TECNO);
     // And no two looks share one, which is what a copy-pasted arm leaves
     // behind: with `Kde => &PAL_WIN11` the panel comes up grey-less and
     // nothing above would have caught it from a single row.
@@ -46,6 +47,9 @@ fn a_palette_keeps_the_colours_its_comment_cites() {
     assert_eq!(PAL_WIN11.accent, (0x00, 0x78, 0xd4), "Win11 accent");
     assert_eq!(PAL_WIN11.muted, (0xc5, 0xc5, 0xc5), "Win11 secondary text");
     assert_eq!(PAL_WIN11.warn, (0xe8, 0x11, 0x23), "Win11 critical");
+    assert_eq!(PAL_TECNO.bar_bg, (0x06, 0x0b, 0x12), "tecno ground");
+    assert_eq!(PAL_TECNO.accent, (0x3a, 0xd7, 0xe8), "tecno signal cyan");
+    assert_eq!(PAL_TECNO.rule, (0x1d, 0x5e, 0x6e), "tecno plate border");
 }
 
 #[test]
@@ -121,6 +125,10 @@ fn the_single_bar_looks_are_the_ones_with_a_bottom_panel_only() {
     assert!(centered_tasks_of(Look::Win11));
     assert!(!centered_tasks_of(Look::Kde));
     assert!(!centered_tasks_of(Look::Eclipse));
+    // `tecno` is `eclipse`'s layout wearing another skin: two bars, pinned
+    // left. Only how the bars are DRAWN changes.
+    assert!(!single_bar_of(Look::Tecno));
+    assert!(!centered_tasks_of(Look::Tecno));
     // Centred buttons only make sense on a single bar -- the taskbar is the
     // bar being centred -- so the one implies the other.
     for look in LOOKS {
@@ -145,6 +153,8 @@ fn only_the_win11_bar_is_translucent_and_the_two_flags_agree() {
     assert!(translucent_of(Look::Win11));
     assert!(!translucent_of(Look::Kde));
     assert!(!translucent_of(Look::Eclipse));
+    assert_eq!(bar_alpha_of(Look::Tecno), 1.0);
+    assert!(!translucent_of(Look::Tecno));
     for look in LOOKS {
         let a = bar_alpha_of(look);
         assert_eq!(
@@ -197,4 +207,47 @@ fn a_translucent_bar_is_filled_in_a_way_that_keeps_its_alpha() {
         acrylic.chunks(4).all(|px| px[3] > 0),
         "the fill did not reach every pixel of the bar"
     );
+}
+
+
+#[test]
+fn the_instrument_look_is_exactly_one_look_and_changes_three_things_together() {
+    // One flag, because it governs the shape of every plate, the case of
+    // every label AND the kind of meter at once: a look that picked up two
+    // of the three reads as a theme that half applied, which is not
+    // something anyone can report usefully.
+    assert!(tecno_of(Look::Tecno));
+    for look in LOOKS {
+        assert_eq!(
+            tecno_of(look),
+            look == Look::Tecno,
+            "{look:?} answers to the instrument look"
+        );
+    }
+}
+
+#[test]
+fn both_meters_measure_the_same_so_the_modules_do_not_shift_between_looks() {
+    // The top bar lays its modules out from the RIGHT edge, each one
+    // stepping left by its own width. A segmented meter wider or narrower
+    // than the continuous gauge would move every module to its left --
+    // and the clock and power HIT BOXES with them, since those are computed
+    // from the same running x. That is a mis-click, not a cosmetic drift.
+    assert_eq!(METER_W, 27, "the width `metric` reserves for either meter");
+    assert_eq!(METER_CELLS * 4 - 1, METER_W, "the cells do not fill the slot");
+}
+
+#[test]
+fn a_label_is_capitalised_only_where_the_look_asks_for_it() {
+    // `cap` is the only thing standing between `cpu 18%` and `CPU 18%`, and
+    // it reads the look through `tecno()`, which is fed from a `OnceLock`
+    // this test cannot set. What it CAN pin is that the transformation
+    // itself is the identity on text that is already capitals and that it
+    // leaves the digits and the per-cent sign alone -- a `to_uppercase`
+    // applied twice, or applied to a value, is where a label like `18%`
+    // would come back mangled.
+    assert_eq!("CPU 18%".to_uppercase(), "CPU 18%");
+    assert_eq!("cpu 18%".to_uppercase(), "CPU 18%");
+    assert_eq!("45°c".to_uppercase(), "45°C");
+    assert_eq!("bat 80% +".to_uppercase(), "BAT 80% +");
 }

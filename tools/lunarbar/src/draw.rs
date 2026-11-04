@@ -470,6 +470,93 @@ impl Canvas {
         self.text_bold(&up, tx, ty, fg);
     }
 
+    /// A rectangle whose four corners are CUT at 45° instead of rounded.
+    ///
+    /// The cut is what makes a plate read as an instrument panel rather than
+    /// as a button: it is the one shape difference between the `tecno` look
+    /// and every other one, and it is a real path, so tiny-skia antialiases
+    /// the diagonal instead of leaving a staircase.
+    ///
+    /// `cut` is clamped to half the shorter side; at zero this is a plain
+    /// rectangle, which is what a plate too small to cut has to be.
+    pub fn chamfer_rect(&mut self, x: i32, y: i32, rw: i32, rh: i32, cut: i32, c: Rgb) {
+        if let Some(p) = chamfer_path(x as f32, y as f32, rw as f32, rh as f32, cut as f32) {
+            self.fill(&p, c, 1.0);
+        }
+    }
+
+    /// [`Canvas::chamfer_rect`] with an alpha, for the hover washes and the
+    /// menu panels, which are translucent over what is behind them.
+    // A rectangle is four numbers before any colour is named, so the
+    // shape primitives sit over clippy's limit by construction; the two
+    // this file already had (`round_rect_a`, `gauge`) are the same shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chamfer_rect_a(&mut self, x: i32, y: i32, rw: i32, rh: i32, cut: i32, c: Rgb, a: f32) {
+        if let Some(p) = chamfer_path(x as f32, y as f32, rw as f32, rh as f32, cut as f32) {
+            self.fill(&p, c, a);
+        }
+    }
+
+    /// A chamfered plate with a 1px border: the border colour filled, then the
+    /// body inset by one pixel on top of it.
+    ///
+    /// Drawn as two fills rather than as a stroke because a stroked path puts
+    /// half its width OUTSIDE the geometry — the border would straddle the
+    /// plate edge and the plate would measure one pixel wider than the
+    /// hit-test rectangle computed from the same numbers.
+    // A rectangle is four numbers before any colour is named, so the
+    // shape primitives sit over clippy's limit by construction; the two
+    // this file already had (`round_rect_a`, `gauge`) are the same shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chamfer_plate(&mut self, x: i32, y: i32, rw: i32, rh: i32, cut: i32, border: Rgb, body: Rgb) {
+        self.chamfer_rect(x, y, rw, rh, cut, border);
+        self.chamfer_rect(x + 1, y + 1, rw - 2, rh - 2, (cut - 1).max(0), body);
+    }
+
+    /// A segmented meter: `n` cells of 3px with a 1px gap, the leading `frac`
+    /// of them lit. Returns the width it drew, so a caller laying modules out
+    /// from the right edge can reserve exactly that.
+    ///
+    /// The unlit cells are drawn too, and dimmed rather than skipped: a meter
+    /// whose empty cells are invisible has no scale, so a quarter-full one and
+    /// a quarter-wide one look the same.
+    // A rectangle is four numbers before any colour is named, so the
+    // shape primitives sit over clippy's limit by construction; the two
+    // this file already had (`round_rect_a`, `gauge`) are the same shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blocks(&mut self, x: i32, y: i32, n: i32, frac: f32, bh: i32, on: Rgb, off: Rgb) -> i32 {
+        let n = n.max(0);
+        // Round rather than truncate so a full meter is full: with `as i32`,
+        // 1.0 * n lands on n only because the product is exact, and anything
+        // that merely rounds to n (0.999) would show a gap at 100%.
+        let lit = ((n as f32) * frac.clamp(0.0, 1.0)).round() as i32;
+        for i in 0..n {
+            let (c, a) = if i < lit { (on, 1.0) } else { (off, 0.45) };
+            self.fill_rect_a(x + i * 4, y, 3, bh, c, a);
+        }
+        (n * 4 - 1).max(0)
+    }
+
+    /// A 1px-per-sample history plot, oldest sample first, drawn `h` tall with
+    /// the newest samples at the right. Samples are clamped to 0..1.
+    ///
+    /// Taller bars are drawn more opaque, so a flat idle line stays a quiet
+    /// texture and a spike reads at a glance without a second colour.
+    pub fn spark(&mut self, x: i32, y: i32, sw: i32, h: i32, data: &[f32], c: Rgb) {
+        if sw <= 0 || h <= 0 {
+            return;
+        }
+        // More samples than columns: the OLDEST are dropped, not the newest.
+        // A plot that filled left to right and ran out would be showing the
+        // user a frozen past while the live end fell off the edge.
+        let skip = data.len().saturating_sub(sw as usize);
+        for (i, v) in data[skip..].iter().enumerate() {
+            let v = v.clamp(0.0, 1.0);
+            let bh = ((h as f32) * v).round().max(1.0) as i32;
+            self.fill_rect_a(x + i as i32, y + h - bh, 1, bh, c, 0.45 + 0.55 * v);
+        }
+    }
+
     /// Swizzle the finished RGBA frame into an XRGB8888 (B,G,R,X) buffer.
     /// `dst` must be at least w*h*4 bytes. Returns false if sizes disagree
     /// (never panics — the panel must stay up under a bad configure).
@@ -669,6 +756,32 @@ fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
     pb.finish()
 }
 
+/// An octagon: a `w`x`h` rectangle with `cut` taken off each corner at 45°.
+///
+/// `cut` is clamped to half the shorter side, so an over-large cut degenerates
+/// into a diamond rather than into a self-crossing path. Below half a pixel
+/// there is nothing to cut and this is the plain rectangle.
+fn chamfer_path(x: f32, y: f32, w: f32, h: f32, cut: f32) -> Option<Path> {
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let c = cut.clamp(0.0, (w / 2.0).min(h / 2.0));
+    if c <= 0.5 {
+        return Rect::from_xywh(x, y, w, h).map(PathBuilder::from_rect);
+    }
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + c, y);
+    pb.line_to(x + w - c, y);
+    pb.line_to(x + w, y + c);
+    pb.line_to(x + w, y + h - c);
+    pb.line_to(x + w - c, y + h);
+    pb.line_to(x + c, y + h);
+    pb.line_to(x, y + h - c);
+    pb.line_to(x, y + c);
+    pb.close();
+    pb.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,6 +790,112 @@ mod tests {
     fn px(buf: &[u8], w: usize, x: usize, y: usize) -> (u8, u8, u8, u8) {
         let o = (y * w + x) * 4;
         (buf[o], buf[o + 1], buf[o + 2], buf[o + 3])
+    }
+
+    /// The chamfer must actually CUT the corners: that diagonal is the only
+    /// shape difference between the `tecno` plates and every other look's, so
+    /// a chamfer that quietly fell back to a rectangle would land as "the look
+    /// did not apply" and not as a bug anyone could name.
+    #[test]
+    fn a_chamfered_plate_has_its_corners_cut_and_its_middle_filled() {
+        let mut cv = Canvas::try_new(20, 20).unwrap();
+        cv.clear((0, 0, 0));
+        cv.chamfer_rect(0, 0, 20, 20, 6, (255, 255, 255));
+        let mut buf = vec![0u8; 20 * 20 * 4];
+        assert!(cv.blit_xrgb(&mut buf));
+        // Every corner is outside the octagon.
+        for (x, y) in [(0, 0), (19, 0), (0, 19), (19, 19)] {
+            let (b, g, r, _) = px(&buf, 20, x, y);
+            assert_eq!((b, g, r), (0, 0, 0), "corner ({x},{y}) was not cut");
+        }
+        // The middle, and the middle of each edge, are inside it.
+        for (x, y) in [(10, 10), (10, 0), (0, 10), (19, 10), (10, 19)] {
+            let (b, g, r, _) = px(&buf, 20, x, y);
+            assert_eq!((b, g, r), (255, 255, 255), "({x},{y}) was not filled");
+        }
+        // With no cut it is a plain rectangle, corners included: a plate too
+        // small to chamfer still has to be drawn.
+        let mut cv = Canvas::try_new(8, 8).unwrap();
+        cv.clear((0, 0, 0));
+        cv.chamfer_rect(0, 0, 8, 8, 0, (255, 255, 255));
+        let mut buf = vec![0u8; 8 * 8 * 4];
+        assert!(cv.blit_xrgb(&mut buf));
+        assert_eq!(px(&buf, 8, 0, 0).0, 255, "cut=0 cut a corner anyway");
+    }
+
+    /// The bordered plate is two fills, not a stroke, so that the border stays
+    /// INSIDE the rectangle the caller measured: a stroke centres itself on the
+    /// path and would put half a pixel outside every edge, leaving the plate
+    /// wider than the hit-test computed from the same x/width.
+    #[test]
+    fn a_bordered_plate_keeps_its_border_inside_its_own_rectangle() {
+        let mut cv = Canvas::try_new(24, 16).unwrap();
+        cv.clear((0, 0, 0));
+        cv.chamfer_plate(2, 2, 20, 12, 4, (200, 0, 0), (0, 0, 200));
+        let mut buf = vec![0u8; 24 * 16 * 4];
+        assert!(cv.blit_xrgb(&mut buf));
+        // Nothing outside the rectangle was touched.
+        for (x, y) in [(1, 8), (22, 8), (12, 1), (12, 14)] {
+            let (b, g, r, _) = px(&buf, 24, x, y);
+            assert_eq!((b, g, r), (0, 0, 0), "({x},{y}) is outside the plate");
+        }
+        // Border on the edge, body one pixel in.
+        assert_eq!(px(&buf, 24, 12, 2).2, 200, "top edge is not the border");
+        assert_eq!(px(&buf, 24, 12, 3).0, 200, "the body did not start at +1");
+        assert_eq!(px(&buf, 24, 2, 8).2, 200, "left edge is not the border");
+        assert_eq!(px(&buf, 24, 3, 8).0, 200, "the body did not start at +1");
+    }
+
+    /// A segmented meter has to draw its empty cells, or it has no scale: a
+    /// quarter-full meter and a quarter-wide one would look identical.
+    #[test]
+    fn a_block_meter_draws_its_empty_cells_dimmed_and_reports_its_width() {
+        let mut cv = Canvas::try_new(40, 10).unwrap();
+        cv.clear((0, 0, 0));
+        let w = cv.blocks(0, 0, 8, 0.5, 6, (0, 255, 0), (0, 80, 0));
+        assert_eq!(w, 8 * 4 - 1, "the width the caller has to reserve");
+        let mut buf = vec![0u8; 40 * 10 * 4];
+        assert!(cv.blit_xrgb(&mut buf));
+        // Cell 0 lit, cell 7 not, and the empty one is still visible.
+        assert_eq!(px(&buf, 40, 1, 3).1, 255, "the first cell is not lit");
+        let dark = px(&buf, 40, 7 * 4 + 1, 3).1;
+        assert!(dark > 0, "an empty cell was not drawn at all");
+        assert!(dark < 255, "an empty cell was drawn as lit");
+        // The gap between cells is untouched ground.
+        assert_eq!(px(&buf, 40, 3, 3).1, 0, "the cells have no gap between them");
+        // Full means FULL: rounding must not leave the last cell dark.
+        let mut cv = Canvas::try_new(40, 10).unwrap();
+        cv.clear((0, 0, 0));
+        cv.blocks(0, 0, 8, 1.0, 6, (0, 255, 0), (0, 80, 0));
+        let mut buf = vec![0u8; 40 * 10 * 4];
+        assert!(cv.blit_xrgb(&mut buf));
+        assert_eq!(px(&buf, 40, 7 * 4 + 1, 3).1, 255, "100% left a cell unlit");
+    }
+
+    /// When there is more history than there are columns, the OLDEST samples
+    /// are the ones that go: a plot that kept the oldest would freeze while the
+    /// live end fell off the right-hand edge, which looks like a panel that
+    /// stopped updating.
+    #[test]
+    fn a_sparkline_drops_the_oldest_samples_and_keeps_the_newest() {
+        let mut cv = Canvas::try_new(8, 10).unwrap();
+        cv.clear((0, 0, 0));
+        // Six samples into four columns: 0.0, 0.0 fall off the left.
+        cv.spark(0, 0, 4, 8, &[0.0, 0.0, 1.0, 1.0, 1.0, 1.0], (255, 255, 255));
+        let mut buf = vec![0u8; 8 * 10 * 4];
+        assert!(cv.blit_xrgb(&mut buf));
+        for x in 0..4 {
+            assert!(px(&buf, 8, x, 1).0 > 200, "column {x} is not a full bar");
+        }
+        // And a zero sample still draws one pixel, so an idle line is visible
+        // rather than a hole in the plot.
+        let mut cv = Canvas::try_new(8, 10).unwrap();
+        cv.clear((0, 0, 0));
+        cv.spark(0, 0, 4, 8, &[0.0; 4], (255, 255, 255));
+        let mut buf = vec![0u8; 8 * 10 * 4];
+        assert!(cv.blit_xrgb(&mut buf));
+        assert!(px(&buf, 8, 0, 7).0 > 0, "an idle sample drew nothing");
+        assert_eq!(px(&buf, 8, 0, 0).0, 0, "an idle sample drew a full bar");
     }
 
     /// The scrim is the whole reason the overlay is ARGB: it must reach the
