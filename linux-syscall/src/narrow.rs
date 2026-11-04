@@ -323,7 +323,7 @@ fn from_narrow_bytes<T: Narrow>(bytes: &[u8]) -> T {
 ///
 /// A free function, and not only a method on [`Syscall`], because two of the
 /// call sites are free helpers of their own (`sleep_or_eintr` and the
-/// `commit_and_report_old` of [`crate::outparams`]) and the alternative was
+/// `commit_and_report_old_with` of [`crate::outparams`]) and the alternative was
 /// for each of them to grow its own copy of the conversion.
 /// ## The wide branch is not an alignment promise
 ///
