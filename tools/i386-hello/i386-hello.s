@@ -3605,7 +3605,14 @@ timer64_skipped:
 
 	/* And the child really ran and really exited 0: waitpid(pid, &st, 0).
 	 * A kernel that answered a pid without making a child hangs here or
-	 * answers ECHILD, and either way does not reach the next step. */
+	 * answers ECHILD, and either way does not reach the next step.
+	 *
+	 * This is also the line that found the OTHER half of reaping a child,
+	 * in Eclipse and not here: `waitpid` is i386's number 7, x86_64 has
+	 * no `waitpid` at all, and so number 7 was in neither allowlist and
+	 * answered ENOSYS. A 32-bit process could make a child with the call
+	 * above and had no way to collect it. On this container's Linux the
+	 * step passed throughout, because there the number is real. */
 	movl	%eax, %ebx
 	movl	$7, %eax		/* waitpid */
 	movl	$clonest, %ecx
@@ -4468,17 +4475,17 @@ flag87:
 clonest:
 	.long	0xffffffff
 
-	/* Step 89's `struct utsname`: six 65-byte fields, 390 bytes, the same
-	 * in both ABIs. Poisoned, so a kernel that answers 0 without writing
-	 * anything is visible. */
-utsbuf:
-	.fill	390, 1, 0xaa
-	/* Where the persona in force before step 89 is kept, to be put back:
-	 * `personality` survives `execve`, and step 61 execs this very
-	 * program again. */
-oldpersona:
-	.long	0
-
+	/* Step 86's `struct sigevent`, 4 mod 8 --- which is the alignment a
+	 * `struct compat_sigevent` really has, every member of it being an
+	 * `int`. The `.balign 8` is not decoration: this pad only lands the
+	 * buffer at 4 mod 8 if the pad itself is 8-aligned, and until the
+	 * tanda 34 it was 8-aligned only by accident. Adding 394 bytes of
+	 * `utsbuf` ahead of it in the tanda 33 moved every buffer below here
+	 * by 2 modulo 4 and `timer_create` started answering EFAULT --- a
+	 * failure that looked like the kernel's and was this program's. Every
+	 * buffer whose alignment a step depends on says so with its own
+	 * `.balign`, and anything added goes at the END of this section. */
+	.balign	8
 spad86:
 	.long	0
 sev:
@@ -4657,3 +4664,20 @@ lock64:
 	.long	0, 0			/* l_start, 64 bits at offset 4 */
 	.long	0, 0			/* l_len, 64 bits at offset 12 */
 	.long	0			/* l_pid at offset 20 */
+
+	/* ─── Nothing above this line may move, so new buffers go HERE. ───
+	 *
+	 * Step 89's `struct utsname`: six 65-byte fields, 390 bytes, the same
+	 * in both ABIs. Poisoned, so a kernel that answers 0 without writing
+	 * anything is visible. 390 is not a multiple of four, which is
+	 * exactly why this block is last: put anywhere else it shifts every
+	 * symbol behind it out of the alignment its step was written for. */
+	.balign	8
+utsbuf:
+	.fill	390, 1, 0xaa
+	/* Where the persona in force before step 89 is kept, to be put back:
+	 * `personality` survives `execve`, and step 61 execs this very
+	 * program again. */
+	.balign	4
+oldpersona:
+	.long	0
