@@ -145,12 +145,12 @@ fn a_process(pid: KoID, abi: Abi) -> alloc::sync::Arc<Process> {
     proc
 }
 
-fn put(at: usize, bytes: &[u8]) {
+pub(super) fn put(at: usize, bytes: &[u8]) {
     let mut p: kernel_hal::user::UserOutPtr<u8> = at.into();
     p.write_array(bytes).expect("mapped above");
 }
 
-fn get(at: usize, len: usize) -> Vec<u8> {
+pub(super) fn get(at: usize, len: usize) -> Vec<u8> {
     let p: UserInPtr<u8> = at.into();
     p.read_array(len).expect("mapped above")
 }
@@ -166,7 +166,7 @@ fn narrow_action_bytes(a: SignalAction32) -> Vec<u8> {
     v
 }
 
-fn word(bytes: &[u8], at: usize) -> u32 {
+pub(super) fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_ne_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 

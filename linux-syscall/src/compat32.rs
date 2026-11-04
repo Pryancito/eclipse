@@ -391,3 +391,8 @@ mod unaligned_tests;
 /// array rather than the width of one structure.
 #[cfg(test)]
 mod utimes_tests;
+
+/// `waitid` (284), whose two out-parameters differ in two DIFFERENT ways: a
+/// `siginfo_t` that does not change size and a `struct rusage` that halves.
+#[cfg(test)]
+mod waitid_tests;

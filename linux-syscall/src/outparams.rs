@@ -23,12 +23,20 @@ use linux_object::error::LxError;
 ///
 /// **The rule is the order, not the write**, so the caller says how the old
 /// value goes out. There used to be a second, simpler entry point that did
-/// the typed `UserOutPtr::write_if_not_null` itself, but no caller is left
-/// that can use it: every one of these out-parameters is either a structure
-/// whose width depends on the calling process's ABI (`struct itimerval`,
-/// `struct itimerspec`: see [`crate::narrow`]) or one whose ALIGNMENT does (a
-/// `sigset_t`, which is the same eight bytes in both ABIs but 4-aligned on
-/// i386), and neither can go out through the typed write.
+/// the typed `UserOutPtr::write_if_not_null` itself; it was removed because
+/// **as the tree stands** not one caller can use it. Every out-parameter that
+/// reaches this helper today is either a structure whose width depends on the
+/// calling process's ABI (`struct itimerval`, `struct itimerspec`: see
+/// [`crate::narrow`]) or one whose ALIGNMENT does (a `sigset_t`, which is the
+/// same eight bytes in both ABIs but 4-aligned on i386), and neither of those
+/// can go out through the typed write.
+///
+/// That is a statement about the current set of call sites and not a promise
+/// about future ones: an out-parameter that is a plain `int` at both widths,
+/// 4-aligned at both, would be safe to write typed, and whoever adds one
+/// should see at a glance that it falls outside the two kinds above rather
+/// than find a doc comment that says it cannot exist. Pointed out by Copilot
+/// on the #2419.
 pub(crate) fn commit_and_report_old_with<T>(
     old: T,
     write_old: impl FnOnce(T) -> Result<(), LxError>,

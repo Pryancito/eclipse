@@ -30,8 +30,6 @@
 //     not an array of these structures -- and whose native number (132) has
 //     no handler in this kernel at all, so there is nothing for the table to
 //     point it at. The same goes for `futimesat` (299) and its native 261;
-//   - `waitid` (284) passes a `siginfo_t`, which is 128 bytes in both ABIs
-//     but not the same 128 bytes;
 //   - `timer_create` (259) passes a `struct sigevent`, whose union holds a
 //     pointer;
 //   - `select` (82) is i386's OLD select, which passes its arguments in a
@@ -68,9 +66,27 @@ pselect6
 // its union STARTS, byte 12 against byte 16, because i386 aligns it to four.
 // Copying the native bytes across would hand a 32-bit program its own
 // padding as `si_pid`; the conversion is `SigInfo::to_i386_bytes`, the same
-// one the 32-bit signal frame pushes. `waitid` (284) passes the same
-// structure and is still out, because its handler does not convert it yet.
+// one the 32-bit signal frame pushes.
 rt_sigtimedwait
+
+// The same `siginfo_t`, the other way round. These two are the first calls of
+// this table that read one INWARDS, so the conversion had to be written
+// backwards: each member of the live union widened from its four bytes to
+// eight, and a member that is a POINTER (`si_value`, `si_addr`) widened with
+// ZEROS and not with sign -- `compat_ptr()` is a cast of an `unsigned int`,
+// so a `sigqueue(3)` that sent 0x8000_0000 means two gigabytes up, not the
+// top of the address space. Read typed, a 32-bit caller's `si_uid` arrived as
+// its `si_pid`.
+rt_sigqueueinfo
+rt_tgsigqueueinfo
+
+// And `waitid`, which passes TWO out-parameters that differ in two different
+// ways: that same `siginfo_t`, 128 bytes either way, and a `struct rusage`,
+// which really is halved -- 72 bytes against 144. The second was going out
+// through the typed write, i.e. **72 bytes past the end** of a 32-bit
+// caller's buffer; `wait4` (114), which answers the same question, had gone
+// through the narrow put since the start.
+waitid
 
 // And the three that pass a `sigset_t` and nothing else. Eight bytes in both
 // ABIs --- `_NSIG` is 64 either way --- so nothing is halved and the only

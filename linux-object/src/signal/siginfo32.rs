@@ -29,7 +29,7 @@
 //! wrong conversion here is never a short write and never faults: it is 128
 //! bytes of plausible rubbish.
 
-use super::action::{SigInfo, SignalCode};
+use super::action::{SigInfo, SiginfoFields, SignalCode};
 use super::Signal;
 
 /// How wide a `siginfo_t` is at either width: `SI_MAX_SIZE`.
@@ -165,6 +165,48 @@ impl SigInfo {
             to += m.narrow_len();
         }
         out
+    }
+
+    /// The `siginfo_t` a 32-bit process handed the kernel.
+    ///
+    /// The inverse of [`SigInfo::to_i386_bytes`], and it runs the same table:
+    /// the three `int`s, then each member of the live layout widened from its
+    /// four bytes to the eight a native pointer takes.
+    ///
+    /// **A pointer widens with ZEROS, not with sign.** `si_value` and
+    /// `si_addr` are `compat_uptr_t` in Linux, and `compat_ptr()` is a plain
+    /// cast of an `unsigned int`: a `sigqueue(3)` that sent `0x8000_0000`
+    /// means the address two gigabytes up, not the top of the address space.
+    /// Sign-extending it would hand the receiver a pointer it never sent, and
+    /// this is the seventh form of the same trap --- `pselect6`'s sigset
+    /// pointer was the sixth.
+    ///
+    /// What the layout does not name stays zero. That is not a shortcut: the
+    /// caller's own bytes past the live member are a union's other members,
+    /// and copying them across at native offsets would put the caller's
+    /// rubbish where the receiver reads a real field. Linux does the same by
+    /// construction, because `copy_siginfo_from_user32` fills a zeroed
+    /// `kernel_siginfo` member by member.
+    pub fn from_i386_bytes(narrow: &[u8; SIGINFO_LEN]) -> Self {
+        let word = |at: usize| {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&narrow[at..at + 4]);
+            i32::from_ne_bytes(b)
+        };
+        let signo = word(0);
+        let errno = word(4);
+        let code = SignalCode(word(8));
+        let mut field = [0u8; SiginfoFields::PAD_SIZE];
+        let mut from = NARROW_FIELDS_AT;
+        let mut to = 0;
+        for m in siginfo_layout(signo, code).members() {
+            // The high half of a pointer is left as the zero it was
+            // initialised to, which IS the widening.
+            field[to..to + m.narrow_len()].copy_from_slice(&narrow[from..from + m.narrow_len()]);
+            from += m.narrow_len();
+            to += m.native_len();
+        }
+        SigInfo::from_parts(signo, errno, code, SiginfoFields::from_raw(field))
     }
 }
 
