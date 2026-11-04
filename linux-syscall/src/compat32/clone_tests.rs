@@ -52,7 +52,7 @@ fn a_thread_with_tls() -> usize {
 }
 
 /// `GDT_ENTRY_TLS_MIN`, the first entry number a 32-bit thread may name.
-const FIRST_ENTRY: u32 = 12;
+pub(super) const FIRST_ENTRY: u32 = 12;
 
 fn a_process(pid: KoID, abi: Abi) -> alloc::sync::Arc<Process> {
     let lp = LinuxProcess::new(RamFS::new(), 0);
@@ -62,7 +62,7 @@ fn a_process(pid: KoID, abi: Abi) -> alloc::sync::Arc<Process> {
 
 /// The sixteen bytes of a `struct user_desc` that names `entry`, with a base
 /// a 32-bit thread could really have.
-fn a_user_desc(entry: u32) -> [u8; 16] {
+pub(super) fn a_user_desc(entry: u32) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[0..4].copy_from_slice(&entry.to_ne_bytes());
     b[4..8].copy_from_slice(&0x0804_f000u32.to_ne_bytes()); // base_addr

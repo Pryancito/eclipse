@@ -43,6 +43,8 @@ mod process_vm;
 mod sched_attr;
 mod sched_task;
 use sched_task::SchedTask;
+/// The thread a forked child starts with, and the undo when it cannot have one.
+mod fork_start;
 /// `unshare(2)` without namespaces.
 mod unshare;
 use sched_attr::*;
@@ -782,103 +784,6 @@ impl Syscall<'_> {
         )
         .await;
         Ok((new_proc, tid))
-    }
-
-    /// The one thread a forked (or vforked) child starts with: this thread's
-    /// context with the stack, TLS and return value the caller asked for,
-    /// and the TID bookkeeping of `ctid` done BEFORE it runs a single user
-    /// instruction. Returns the child's thread id.
-    ///
-    /// The child's address space already exists (a copy from `fork_from`,
-    /// or this one from `vfork_from`), so `CLONE_CHILD_SETTID` cannot go
-    /// through this thread's `UserOutPtr`: after a `fork` that writes the
-    /// parent's memory, which the child does not see. It is written into the
-    /// child's VMAR instead; see [`publish_child_tid`].
-    fn start_forked_thread(
-        &self,
-        new_proc: &Arc<Process>,
-        newsp: usize,
-        newtls: usize,
-        ctid: ChildTidRequest,
-        child_of: ChildOf,
-        words: ParentWords,
-    ) -> LxResult<KoID> {
-        // What the child thread takes from this one -- the signal mask above
-        // all, which a `fork` inherits (sigprocmask(2)). `false`: a fork does
-        // not share the address space, so the alternate signal stack comes
-        // across too. (For a vfork, Linux's rule is `(clone_flags &
-        // (CLONE_VM|CLONE_VFORK)) == CLONE_VM`, and a vfork sets BOTH bits,
-        // so the stack comes across there just the same.)
-        let inherited = self.thread.lock_linux().forked_child();
-        let new_thread = Thread::create_linux_with(new_proc, inherited)?;
-        new_proc.linux().set_forking_thread(self.thread.id());
-        let mut new_ctx = self.thread.context_cloned()?;
-        if newsp != 0 {
-            new_ctx.set_field(UserContextField::StackPointer, newsp);
-        }
-        if newtls != 0 {
-            self.set_child_thread_pointer(&mut new_ctx, newtls)?;
-        }
-        new_ctx.set_field(UserContextField::ReturnValue, 0);
-        // A FreeBSD child returns 0 in %rax, 1 in %rdx and a clear carry flag
-        // (cpu_fork, sys/amd64/amd64/vm_machdep.c). libc's fork() stub branches
-        // on carry, so a stale CF inherited from the parent's context would make
-        // the child believe fork() failed. Linux needs only %rax = 0.
-        #[cfg(target_arch = "x86_64")]
-        if self.linux_process().abi() == linux_object::process::Abi::Freebsd {
-            let g = new_ctx.general_mut();
-            g.rdx = 1;
-            g.rflags &= !1;
-        }
-        new_thread.with_context(|ctx| *ctx = new_ctx)?;
-        // A child forked inside a signal handler has the handler's frame in
-        // its copy of the stack, and returns from it.
-        new_thread.inherit_backup_contexts(self.thread);
-        new_thread.inherit_sched(self.thread);
-        publish_child_tid(&new_thread, ctid);
-        // Everything below this line and above `start` is "what the child has
-        // to be holding before it can execute an instruction", and it is in
-        // the same function as the `start` on purpose: each of these used to
-        // be done somewhere the child was already running by the time it
-        // happened.
-        match child_of {
-            ChildOf::Caller(signal) => new_proc.linux().set_exit_signal(signal),
-            ChildOf::CallersParent => {
-                linux_object::process::give_to_callers_parent(self.zircon_process(), new_proc)
-            }
-        }
-        // hunter: inherit the parent's syscall whitelist into the child so a
-        // process cannot shed its policy merely by forking, and seed a fresh
-        // anomaly window for the new pid.
-        //
-        // BEFORE `start`, and that is the whole point: a pid with no
-        // whitelist registered is permissive (`is_syscall_allowed` answers
-        // `Ok` on a map miss), so every instant the child is runnable without
-        // its inherited policy is an instant in which it may make a syscall
-        // the policy forbids. Started first, that window is real on any
-        // machine with a second CPU to run the child on -- and on one CPU
-        // too, if the parent is preempted here. Linux installs the child's
-        // credentials and seccomp filters in `copy_process`, before
-        // `wake_up_new_task`, for the same reason.
-        hunter::task_fork(self.zircon_process().id(), new_proc.id());
-        // The caller's words, last before `start` (see `ParentWords`). The
-        // pidfd's can still fail if another thread took the page's write
-        // permission away since `check`; the child then runs anyway, as
-        // every child did when its pidfd was handed out after it started.
-        let pidfd = words
-            .pidfd
-            .map(|slot| self.hand_out_pidfd(PidFd::new(new_proc.clone(), PIDFD_OPEN_FLAGS), slot))
-            .transpose();
-        if let Some(mut slot) = words.parent_tid {
-            let _ = slot.write_if_not_null(new_thread.id() as i32);
-        }
-        new_thread.start(self.thread_fn).inspect_err(|_| {
-            if let Ok(Some(fd)) = pidfd {
-                let _ = self.linux_process().close_file(fd);
-            }
-        })?;
-        pidfd?;
-        Ok(new_thread.id())
     }
 
     /// `sys_fork` creates a child process.
