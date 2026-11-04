@@ -1454,9 +1454,20 @@ impl Syscall<'_> {
         // `infop` is written whether or not a child was found: a `WNOHANG`
         // that found nothing leaves `si_pid` zero, and used to leave the
         // caller's struct untouched, with the previous call's child in it.
-        infop.write_if_not_null(report.info)?;
+        //
+        // Both out-pointers go out at the CALLER's width, and they are two
+        // different kinds of difference. The `siginfo_t` is 128 bytes either
+        // way with its union four bytes earlier on i386
+        // ([`crate::narrow::siginfo`]); the `struct rusage` really is half the
+        // size, 72 bytes against 144 ([`crate::narrow`]), and writing it
+        // typed put **72 bytes past the end** of a 32-bit caller's buffer.
+        // `wait4` already went through the narrow put, which is what makes
+        // the omission here visible: the same structure, out of two calls
+        // that answer the same question, by two different routes.
+        let abi32 = self.narrow_abi();
+        crate::narrow::siginfo::siginfo_put_if_not_null(abi32, &mut infop, report.info)?;
         if let Some(rusage_of_child) = report.rusage {
-            rusage.write_if_not_null(rusage_of_child)?;
+            crate::narrow::narrow_put_if_not_null(abi32, &mut rusage, rusage_of_child)?;
         }
         Ok(0)
     }

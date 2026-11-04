@@ -3370,6 +3370,94 @@ timer64_skipped:
 	cmpl	%eax, winfo + 12
 	jne	bad_sigwait
 
+	/* Step 85: `rt_sigqueueinfo` (178), the first call that passes a
+	 * `siginfo_t` INWARDS, and `waitid` (284), which passes one out
+	 * alongside a `struct rusage`.
+	 *
+	 * The 178 is the one worth a real binary: the `siginfo_t` this program
+	 * writes has its union at byte 12 and a FOUR-byte `si_value`, so a
+	 * kernel that reads the 128 bytes straight across picks the sival up
+	 * from byte 24 instead of byte 20. Both words are filled, with
+	 * DIFFERENT values, so that reading the wrong one is visible rather
+	 * than merely unlucky:
+	 *
+	 *   byte 20 -> 0x5a5a0001, the real `si_value`
+	 *   byte 24 -> 0x5a5a0002, what a straight copy would hand over
+	 *
+	 * SIGRTMIN is still blocked from step 84, and that step's last wait
+	 * left nothing pending, so the queue starts empty here and the 177
+	 * below dequeues exactly what the 178 queued.
+	 *
+	 * The 284 can only be checked for being MAPPED, not for its
+	 * conversion: that needs a child, and this program never forks --- a
+	 * 32-bit `clone` is a later stage. `waitid(P_ALL, 0, NULL, WEXITED |
+	 * WNOHANG, NULL)` with no children answers ECHILD, which is -10; the
+	 * answer that says the table entry is missing is ENOSYS, -38. */
+
+	/* The `siginfo_t` going in: `_rt`, because `si_code` is SI_QUEUE. */
+	movl	$34, qinfo + 0		/* si_signo */
+	movl	$0, qinfo + 4		/* si_errno */
+	movl	$-1, qinfo + 8		/* si_code: SI_QUEUE */
+	movl	wpid, %eax
+	movl	%eax, qinfo + 12	/* si_pid */
+	movl	$0, qinfo + 16		/* si_uid: root */
+	movl	$0x5a5a0001, qinfo + 20	/* si_value, four bytes here */
+	movl	$0x5a5a0002, qinfo + 24	/* and the native offset's word */
+
+	movl	$178, %eax		/* rt_sigqueueinfo */
+	movl	wpid, %ebx
+	movl	$34, %ecx
+	movl	$qinfo, %edx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_queueinfo
+
+	/* Dequeue it, which writes the 32-bit `siginfo_t` back out. */
+	call	poison_winfo
+	movl	$0, wts + 0
+	movl	$0, wts + 4
+	movl	$177, %eax		/* rt_sigtimedwait */
+	movl	$wset, %ebx
+	movl	$winfo, %ecx
+	movl	$wts, %edx
+	movl	$8, %esi
+	int	$0x80
+	cmpl	$34, %eax
+	jne	bad_queueinfo
+
+	/* `si_code` survives whole: it is one of the three leading `int`s and
+	 * no conversion touches it. If this is the check that falls, the
+	 * signal that came back is not the one that was queued. */
+	cmpl	$-1, winfo + 8
+	jne	bad_queueinfo
+	/* `si_pid`, which `queued_from_user` keeps from the caller. */
+	movl	wpid, %eax
+	cmpl	%eax, winfo + 12
+	jne	bad_queueinfo
+	/* And the load-bearing check: the sival this program sent at byte 20,
+	 * which is NOT the word it put at byte 24. One comparison is the whole
+	 * of it, because the two words were filled with different values: a
+	 * kernel that read the union at the native offset brings back
+	 * 0x5a5a0002 here and this falls. (It first had a second `cmpl` against
+	 * 0x5a5a0002, which could never fire --- after the first comparison
+	 * passes the word cannot also be the other value. Pointed out by
+	 * Copilot on the #2420.) */
+	cmpl	$0x5a5a0001, winfo + 20
+	jne	bad_queueinfo
+
+	/* And the 284, for the table entry alone. */
+	movl	$284, %eax		/* waitid */
+	xorl	%ebx, %ebx		/* P_ALL */
+	xorl	%ecx, %ecx		/* id, ignored by P_ALL */
+	xorl	%edx, %edx		/* infop: none */
+	movl	$5, %esi		/* WEXITED | WNOHANG */
+	xorl	%edi, %edi		/* rusage: none */
+	int	$0x80
+	cmpl	$-38, %eax		/* ENOSYS: not in either i386 table */
+	je	bad_queueinfo
+	cmpl	$-10, %eax		/* ECHILD, which is the right answer */
+	jne	bad_queueinfo
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -3716,6 +3804,10 @@ bad_time64_rest:
 	jmp	die
 bad_timer64:
 	movl	$106, %ebx
+	jmp	die
+
+bad_queueinfo:
+	movl	$109, %ebx
 	jmp	die
 
 bad_sigwait:
@@ -4087,6 +4179,14 @@ winfo:
 	.space	128
 wpid:
 	.long	0
+
+	/* Step 85's `siginfo_t` going IN. 4 mod 8, as a 32-bit program's own
+	 * is, because on i386 the union of a `siginfo_t` aligns to four. */
+	.align 8
+qpad85:
+	.long	0
+qinfo:
+	.space	128
 	.balign	8
 	.long	0
 its:

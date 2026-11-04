@@ -408,21 +408,19 @@ fn pselect6_is_mapped_once_its_sigset_argument_is_converted_too() {
 /// a `timespec` timeout inwards and a `siginfo_t` outwards. The second is 128
 /// bytes at both widths, so nothing is halved; what moves is where its union
 /// STARTS, byte 12 against byte 16. Both are the width of the process, so the
-/// native handler serves i386 too and the entry belongs here --- while
-/// `waitid` (284), which passes the same structure, is still out, because its
-/// handler does not convert it.
+/// native handler serves i386 too and the entry belongs here.
+///
+/// This test used to end by pinning `waitid` (284) as **not** mapped, which
+/// was true while its handler wrote the native bytes. It is mapped now; the
+/// three calls that pass a `siginfo_t` are pinned together in
+/// [`the_three_siginfo_calls_are_mapped`].
 #[test]
-fn rt_sigtimedwait_is_mapped_and_waitid_is_not() {
+fn rt_sigtimedwait_is_mapped() {
     assert_eq!(name(177), Some("rt_sigtimedwait"));
     assert_eq!(
         native_number(177),
         Some(Sys::RT_SIGTIMEDWAIT as u32),
         "rt_sigtimedwait must point at the native rt_sigtimedwait"
-    );
-    assert_eq!(
-        native_number(284),
-        None,
-        "waitid passes the same siginfo_t and its handler does not convert it"
     );
 }
 
@@ -447,6 +445,34 @@ fn the_three_sigset_calls_are_mapped() {
             "i386 {n} must point at the native {name_of}"
         );
     }
+}
+
+/// The three that pass a `siginfo_t`, which is the one structure of this
+/// table whose SIZE does not change: 128 bytes at both widths, with its union
+/// starting at byte 12 instead of 16.
+///
+/// `waitid`'s native number is 247 and i386's is 284, so this also pins the
+/// mapping itself and not only the presence of an entry: a table that
+/// answered 284 with 284 would be a native dispatcher asked for an i386
+/// number, which is `ENOSYS`.
+#[test]
+fn the_three_siginfo_calls_are_mapped() {
+    for (n, name_of, native) in [
+        (178, "rt_sigqueueinfo", Sys::RT_SIGQUEUEINFO),
+        (335, "rt_tgsigqueueinfo", Sys::RT_TGSIGQUEUEINFO),
+        (284, "waitid", Sys::WAITID),
+    ] {
+        assert_eq!(name(n), Some(name_of));
+        assert_eq!(
+            native_number(n),
+            Some(native as u32),
+            "i386 {n} must point at the native {name_of}"
+        );
+    }
+    // And the one of the four that is still out: `timer_create` (259) needs
+    // the `compat_sigevent`, whose union holds a pointer, so it is `ENOSYS`
+    // on purpose and not by omission.
+    assert_eq!(native_number(259), None, "timer_create is not mapped yet");
 }
 
 /// `statx` and `prlimit64` are mapped for a reason that is not the one

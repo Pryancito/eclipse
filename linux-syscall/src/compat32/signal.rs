@@ -156,3 +156,9 @@ mod tests;
 /// thing that differs is the ALIGNMENT. Own file, own subject.
 #[cfg(test)]
 mod mask_tests;
+
+/// The two that read a `siginfo_t` INWARDS (178 and 335), whose subject is
+/// the conversion run backwards: own file, so the mask's ceiling and this
+/// one's stay separate.
+#[cfg(test)]
+mod queueinfo_tests;

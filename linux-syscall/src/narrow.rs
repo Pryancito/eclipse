@@ -599,6 +599,10 @@ pub(crate) mod msghdr;
 /// because Linux splits each of their times into a `_low`/`_high` pair.
 pub(crate) mod ipcbuf;
 
+/// The `siginfo_t`, the one structure here whose SIZE does not change: 128
+/// bytes at both widths, with its union starting four bytes earlier on i386.
+pub(crate) mod siginfo;
+
 #[cfg(test)]
 mod tests;
 

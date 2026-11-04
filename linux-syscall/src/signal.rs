@@ -1034,7 +1034,11 @@ impl Syscall<'_> {
         signum: usize,
         info: UserInPtr<SigInfo>,
     ) -> SysResult {
-        let user = info.read()?;
+        // Not `info.read()`: a 32-bit caller's `siginfo_t` has its union four
+        // bytes earlier and its `si_value` four bytes wide, and it aligns to
+        // 4. Reading it typed took the caller's `si_uid` as its `si_pid` ---
+        // and answered `EFAULT` outright to half the addresses it can pass.
+        let user = crate::narrow::siginfo::siginfo_get(self.narrow_abi(), &info)?;
         info!(
             "rt_sigqueueinfo: pid={}, sig={}, si_code={}",
             pid, signum, user.code.0
@@ -1073,7 +1077,8 @@ impl Syscall<'_> {
         signum: usize,
         info: UserInPtr<SigInfo>,
     ) -> SysResult {
-        let user = info.read()?;
+        // Same reading as the 178 above, and for the same two reasons.
+        let user = crate::narrow::siginfo::siginfo_get(self.narrow_abi(), &info)?;
         info!(
             "rt_tgsigqueueinfo: tgid={}, tid={}, sig={}, si_code={}",
             tgid, tid, signum, user.code.0
@@ -1181,20 +1186,12 @@ impl Syscall<'_> {
         let (sig, si) = sigtimedwait_on(self.thread, waitset, deadline).await?;
         // With what came with it: who sent it, which child it is about.
         // `sigwaitinfo(3)` is how a program asks for that.
-        if !info.is_null() {
-            if self.narrow_abi() {
-                // A `compat_siginfo`: the same 128 bytes, but the union
-                // starts at byte 12 and not 16, so copying the native ones
-                // across would hand a 32-bit program its own padding as
-                // `si_pid`. `to_i386_bytes` is the conversion the signal
-                // frame already pushes; see
-                // [`linux_object::signal::siginfo32`].
-                let mut at: UserOutPtr<u8> = info.as_addr().into();
-                at.write_array(&si.to_i386_bytes())?;
-            } else {
-                info.write(si)?;
-            }
-        }
+        // A 32-bit caller gets a `compat_siginfo`: the same 128 bytes, but
+        // the union starts at byte 12 and not 16, so copying the native ones
+        // across would hand it its own padding as `si_pid`. See
+        // [`crate::narrow::siginfo`], which is also what the two inward
+        // directions of `rt_sigqueueinfo` go through.
+        crate::narrow::siginfo::siginfo_put_if_not_null(self.narrow_abi(), &mut info, si)?;
         Ok(sig as usize)
     }
 

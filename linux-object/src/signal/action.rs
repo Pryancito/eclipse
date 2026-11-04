@@ -165,7 +165,18 @@ pub struct SiginfoFields {
 impl SiginfoFields {
     /// 128 bytes in all, minus the three `int`s and the padding that brings
     /// the union to pointer alignment.
-    const PAD_SIZE: usize = 128 - 2 * core::mem::size_of::<usize>();
+    pub(crate) const PAD_SIZE: usize = 128 - 2 * core::mem::size_of::<usize>();
+
+    /// The union's bytes exactly as given.
+    ///
+    /// The one caller is [`super::siginfo32::SigInfo::from_i386_bytes`],
+    /// which has already widened each member of the live layout and so holds
+    /// the native bytes; it cannot use the `write_*` helpers above, because
+    /// which of them applies is what `siginfo_layout` decides and the answer
+    /// is a table, not a branch per call site.
+    pub(crate) fn from_raw(pad: [u8; Self::PAD_SIZE]) -> Self {
+        SiginfoFields { pad }
+    }
 }
 
 impl Default for SiginfoFields {
@@ -401,6 +412,29 @@ impl SigInfo {
     }
 
     /// The bytes of this `siginfo_t` as userspace will read them.
+    /// A `siginfo_t` from its three leading `int`s and the raw bytes of the
+    /// union.
+    ///
+    /// For [`super::siginfo32::SigInfo::from_i386_bytes`], which is the only
+    /// place that has a whole union in hand rather than the arguments of one
+    /// of its members. Going through here rather than a struct literal is
+    /// what keeps `_pad` zero: see the field's own note on why those four
+    /// bytes used to be whatever the kernel stack held.
+    pub(crate) fn from_parts(
+        signo: i32,
+        errno: i32,
+        code: SignalCode,
+        field: SiginfoFields,
+    ) -> Self {
+        Self {
+            signo,
+            errno,
+            code,
+            _pad: 0,
+            field,
+        }
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         // SAFETY: `SigInfo` is `repr(C)` and has no implicit padding -- the
         // four bytes before the union are the named `_pad` field, which
