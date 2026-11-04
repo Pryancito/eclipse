@@ -109,6 +109,17 @@ fn gaps_name_every_missing_file_and_count_them() {
 }
 
 #[test]
+fn a_gap_names_every_path_the_entry_would_have_accepted() {
+    // Naming only the first alternative sends the reader looking for a file
+    // that was never required on its own.
+    assert_eq!(any_of(&["usr/bin/dpkg"]), "/usr/bin/dpkg");
+    assert_eq!(
+        any_of(&["usr/bin/apt", "usr/bin/apt-get"]),
+        "cualquiera de /usr/bin/apt o /usr/bin/apt-get"
+    );
+}
+
+#[test]
 fn every_must_have_file_is_one_verify_checks() {
     // The point of the list is to pre-empt `verify::check_apt`. If that
     // function grows a check, this list is where the reason comes from.
@@ -156,9 +167,9 @@ fn first_line_survives_an_empty_stderr() {
 fn bootstrap_de_verdad_deja_apt_en_la_rootfs() {
     let root = a_dir("real");
     bootstrap(&root, "x86_64");
-    assert!(
-        root.join("usr/bin/apt").is_file() || root.join("usr/bin/apt-get").is_file(),
-        "no hay apt en {}",
-        root.display()
-    );
+    let apt = root.join("usr/bin/apt").is_file() || root.join("usr/bin/apt-get").is_file();
+    // A whole rootfs is hundreds of MiB: clear it before the assert, or a
+    // failing run leaves it in /tmp for good.
+    let _ = fs::remove_dir_all(&root);
+    assert!(apt, "no hay apt en {}", root.display());
 }

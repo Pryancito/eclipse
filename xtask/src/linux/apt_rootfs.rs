@@ -586,6 +586,21 @@ const BOOTSTRAP_MUST_HAVE: &[(&[&str], &str)] = &[
     (&["usr/bin/hello", "bin/hello"], "hello"),
 ];
 
+/// `/usr/bin/apt` for one path, `cualquiera de /usr/bin/apt o /usr/bin/apt-get`
+/// for several: what the entry actually accepted.
+fn any_of(paths: &[&str]) -> String {
+    match paths {
+        [one] => format!("/{one}"),
+        many => format!(
+            "cualquiera de {}",
+            many.iter()
+                .map(|p| format!("/{p}"))
+                .collect::<Vec<_>>()
+                .join(" o ")
+        ),
+    }
+}
+
 /// Name every [`BOOTSTRAP_MUST_HAVE`] file that did not land, with the reason
 /// [`ExtractReport`] has for it. Returns how many are missing.
 fn report_bootstrap_gaps(root: &Path, cache: &Path, report: &ExtractReport) -> usize {
@@ -595,9 +610,12 @@ fn report_bootstrap_gaps(root: &Path, cache: &Path, report: &ExtractReport) -> u
             continue;
         }
         gaps += 1;
+        // Every alternative, not just the first: for the `apt` entry the hole
+        // is "neither /usr/bin/apt nor /usr/bin/apt-get", and naming only one
+        // sends whoever reads it looking for a file that was never required.
         eprintln!(
-            "warning: apt bootstrap: falta /{} en la rootfs — {pkg}: {}",
-            paths[0],
+            "warning: apt bootstrap: falta {} en la rootfs — {pkg}: {}",
+            any_of(paths),
             report.verdict(pkg),
         );
     }
@@ -1170,7 +1188,12 @@ fn deb_owner<'a>(name: &str, packages: &[&'a str]) -> Option<&'a str> {
     packages
         .iter()
         .find(|p| {
-            stem == **p || stem.starts_with(&format!("{p}:")) || name.starts_with(&format!("{p}_"))
+            stem == **p
+                // `pkg:amd64_…deb` (multiarch) and `pkg_version_arch.deb`,
+                // without building a prefix String per package per .deb: this
+                // runs over every file in a cache of several hundred.
+                || stem.strip_prefix(**p).is_some_and(|r| r.starts_with(':'))
+                || name.strip_prefix(**p).is_some_and(|r| r.starts_with('_'))
         })
         .copied()
 }
