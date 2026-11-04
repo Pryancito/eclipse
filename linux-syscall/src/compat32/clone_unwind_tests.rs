@@ -28,6 +28,7 @@ use crate::task::CloneFlags;
 use alloc::boxed::Box;
 use linux_object::process::{Abi, LinuxProcess};
 use linux_object::signal::Signal;
+use linux_object::thread::ThreadExt;
 use rcore_fs_ramfs::RamFS;
 use zircon_object::object::KoID;
 use zircon_object::task::{Process, ROOT_JOB};
@@ -67,10 +68,24 @@ fn as_mut<'a>(sys: &Syscall<'a>) -> Syscall<'a> {
     }
 }
 
+/// What one of these tests looks at, all of it read inside the caller's own
+/// thread because that is where a `SIGCHLD` would land.
+struct Afterwards {
+    /// What the `clone` answered.
+    cloned: isize,
+    /// What `waitpid(-1, WNOHANG)` answered next.
+    waited: isize,
+    /// Whether a Linux `SIGCHLD` is pending on the caller --- what a handler,
+    /// a `signalfd` or a `sigwait` would see.
+    sigchld: bool,
+    /// Marks left over from the undo; see
+    /// [`LinuxProcess::pending_zombie_suppressions`].
+    marks: usize,
+}
+
 /// A 32-bit `clone` with `desc` as its thread pointer, and then a
-/// `waitpid(-1, WNOHANG)`: what the clone answered, and what the parent is
-/// told about its children afterwards.
-fn clone_then_wait(pid: KoID, desc: [u8; 16]) -> (isize, isize) {
+/// `waitpid(-1, WNOHANG)`.
+fn clone_then_wait(pid: KoID, desc: [u8; 16]) -> Afterwards {
     let at = desc.as_ptr() as usize;
     let proc = a_process(pid, Abi::Linux32);
     let got = on_a_thread(&proc, move |sys| {
@@ -78,10 +93,26 @@ fn clone_then_wait(pid: KoID, desc: [u8; 16]) -> (isize, isize) {
             let cloned = as_mut(sys)
                 .compat32_syscall(I386_CLONE, [a_fork_with_tls(), 0, 0, at, 0, 0])
                 .await;
+            // BEFORE the wait, because the wait consumes it: both places a
+            // Linux signal can be waiting, on the thread and
+            // process-directed in `shared_pending` (where
+            // `send_signal_to_process_with_info` leaves it until a thread
+            // pulls it on). Read after the `waitpid` instead, the mutation
+            // that leaves the child its inherited `SIGCHLD` survives.
+            let sigchld = sys.thread.lock_linux().signals.contains(Signal::SIGCHLD)
+                || sys
+                    .linux_process()
+                    .shared_pending()
+                    .contains(Signal::SIGCHLD);
             let waited = as_mut(sys)
                 .compat32_syscall(I386_WAITPID, [ANY_CHILD, 0, WNOHANG, 0, 0, 0])
                 .await;
-            (cloned, waited)
+            Afterwards {
+                cloned,
+                waited,
+                sigchld,
+                marks: sys.linux_process().pending_zombie_suppressions(),
+            }
         })
     });
     proc.exit(0);
@@ -93,45 +124,70 @@ fn clone_then_wait(pid: KoID, desc: [u8; 16]) -> (isize, isize) {
 /// The descriptor names slot `-1`, which `set_new_tls` refuses
 /// (`can_allocate = 0`), so the failure lands in `set_child_thread_pointer`
 /// --- past `fork_from`, which has already filed the child. The clone is
-/// refused either way; what this test is about is the line after it.
+/// refused either way; what this test is about is everything after it.
 ///
-/// Two mutations die here: dropping `abandon_unstarted_child` from the error
-/// path of `start_forked_thread` (the child stays in the table and the wait
-/// answers 0), and taking the child out of the table without exiting it (the
-/// wait is right, but its address space and its slot in the job are kept for
-/// as long as the machine runs --- which this test cannot see, and the one
-/// below is why the first half is not enough).
+/// Three mutations die here. Dropping `abandon_unstarted_child` from the
+/// error path: the child stays in the table and the wait answers 0. Leaving
+/// the child its inherited exit signal: a **real Linux `SIGCHLD`** is queued
+/// for a child that was never born, which a handler or a `signalfd` sees.
+/// And doing the undo after the teardown instead of before it: the mark is
+/// left behind under a pid this kernel recycles.
 #[test]
 fn a_refused_clone_leaves_no_child_to_wait_for() {
-    let (cloned, waited) = clone_then_wait(48_590, a_user_desc(u32::MAX));
+    let after = clone_then_wait(48_590, a_user_desc(u32::MAX));
     assert_eq!(
-        cloned, EINVAL,
+        after.cloned, EINVAL,
         "the clone was not refused where this test needs it refused"
     );
     assert_eq!(
-        waited, ECHILD,
+        after.waited, ECHILD,
         "the parent was told it has a child: the refused clone left a phantom \
          in the child table, and every later wait answers 0 instead of ECHILD"
+    );
+    assert!(
+        !after.sigchld,
+        "a SIGCHLD was queued for a child the same call reported as never born"
+    );
+    assert_eq!(
+        after.marks, 0,
+        "the undo left its mark behind: the next child to wear that pid would \
+         die unreapable"
     );
 }
 
 /// **And a `clone` that succeeds still leaves one**, so the `ECHILD` above is
 /// the undo and not a `wait` that has stopped seeing children at all.
 ///
-/// `WNOHANG` over a live child is `0`: "you have one, it is not ready". That
-/// is the exact answer the phantom produced, which is why the two tests have
-/// to be read together --- a kernel that answered `ECHILD` to both would pass
-/// the one above and lose every `wait` in the system.
+/// A kernel that answered `ECHILD` to both would pass the test above and lose
+/// every `wait` in the system.
+///
+/// Two answers are right here and the difference is not this kernel's to
+/// decide: `0` if the child is still alive, and **its pid** if it has already
+/// run and gone. On the host the child's future is polled by the same
+/// executor as this call, so which of the two happens is a scheduling
+/// decision --- and both of them are "there was a child", which is the whole
+/// claim. (The flake was pointed out by Copilot on the #2428.)
 #[test]
 fn a_clone_that_works_does_leave_a_child() {
-    let (cloned, waited) = clone_then_wait(48_591, a_user_desc(FIRST_ENTRY));
+    let after = clone_then_wait(48_591, a_user_desc(FIRST_ENTRY));
     assert!(
-        cloned > 0,
+        after.cloned > 0,
         "the clone answered {}, so this test is not measuring a live child",
-        cloned
+        after.cloned
     );
-    assert_eq!(
-        waited, 0,
-        "a live child that has not exited is 0 under WNOHANG"
+    assert!(
+        after.waited == 0 || after.waited == after.cloned,
+        "waitpid answered {} for the child {}: neither a live child (0) nor \
+         the pid of one that had already ended",
+        after.waited,
+        after.cloned
     );
+    // And take the child away before leaving. It is a real forked process
+    // with a started thread, running a copy of this test thread's context on
+    // the host's shared executor: left behind it outlives the test, and what
+    // it does next is nobody's claim. `clone_then_wait` has already ended its
+    // parent.
+    if let Some(child) = ROOT_JOB.find_process(after.cloned as u64) {
+        child.exit(0);
+    }
 }

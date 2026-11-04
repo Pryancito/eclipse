@@ -1807,6 +1807,18 @@ impl LinuxProcess {
         drop((live, zombie));
     }
 
+    /// How many children this process is still carrying the "file no zombie
+    /// for it" mark for ([`Self::abandon_child`]).
+    ///
+    /// A diagnostic, and the only way a test can see the ORDER of the undo:
+    /// every mark is meant to be consumed by the death that follows it, and
+    /// one left behind sits under a pid this kernel recycles, where it would
+    /// swallow the zombie of the next real child to wear that pid. So the
+    /// right answer, for any process the kernel is done unwinding, is 0.
+    pub fn pending_zombie_suppressions(&self) -> usize {
+        self.inner.lock().waited_without_zombie.len()
+    }
+
     /// Drop a dead child without keeping anything for `wait*`: the reaper
     /// ignores `SIGCHLD` (or set `SA_NOCLDWAIT`), so Linux releases the
     /// task in `exit_notify` instead of leaving a zombie, and its CPU never

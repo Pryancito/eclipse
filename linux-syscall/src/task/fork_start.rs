@@ -57,7 +57,7 @@ impl Syscall<'_> {
         let mut pidfd: LxResult<Option<linux_object::fs::FileDesc>> = Ok(None);
         let inherited = self.thread.lock_linux().forked_child();
         let new_thread = Thread::create_linux_with(new_proc, inherited)
-            .inspect_err(|_| abandon_unstarted_child(new_proc))?;
+            .inspect_err(|_| abandon_unstarted_child(new_proc, None))?;
         // Everything from here to `start` can fail, and the child process is
         // ALREADY filed in its parent's child table: `fork_from` put it there
         // before this function was called. So the whole fallible tail is one
@@ -136,13 +136,7 @@ impl Syscall<'_> {
             Ok(())
         })();
         if let Err(err) = up_to_start {
-            // The thread first: `Thread::kill` on a thread that never ran
-            // finds no coroutine, so it never leaves the process's thread
-            // list and `Process::exit` -- which only tears down when the list
-            // is empty -- would never release the child's address space. See
-            // the long comment on the thread path's own `terminate_abandoned`.
-            new_thread.terminate_abandoned();
-            abandon_unstarted_child(new_proc);
+            abandon_unstarted_child(new_proc, Some(&new_thread));
             return Err(err);
         }
         // PAST `start`: the child is running. A pidfd word that cannot be
@@ -158,22 +152,46 @@ impl Syscall<'_> {
 /// Take back a child that was filed in its parent's table and then could not
 /// be finished, before it ran one instruction.
 ///
-/// Linux's `bad_fork_*` unwind, in the order this kernel needs it: the child
-/// leaves its parent's table FIRST (with the mark that stops its termination
-/// filing a zombie, see [`LinuxProcess::abandon_child`]), and only then is it
-/// exited --- which is what releases its address space and takes it out of
-/// its job.
+/// Linux's `bad_fork_*` unwind. The order is the whole of it, and it is the
+/// opposite of the obvious one, because **the teardown is what runs the
+/// child's termination callback**: `remove_thread` on the last thread sees an
+/// empty list and calls `terminate()` itself, and that callback is what files
+/// the zombie and sends the parent its `SIGCHLD`. So everything that has to
+/// be true of this child's death has to be true BEFORE it is torn down:
+///
+/// 1. **No exit signal.** A `clone` that answers an error tells the parent
+///    nothing: Linux's `bad_fork_*` labels never reach `exit_notify`. Left at
+///    its inherited `SIGCHLD` a refused `CLONE_SETTLS` queued a real Linux
+///    `SIGCHLD` --- visible to a handler, a `signalfd` or a `sigwait` --- for
+///    a child that was never born. `0` is "send nothing" (`clone3`).
+/// 2. **Out of the parent's table**, with the mark that stops the callback
+///    filing a zombie ([`LinuxProcess::abandon_child`]). Done after the
+///    teardown, as this first was, the callback had already filed the zombie
+///    and the mark stayed behind UNCONSUMED --- a stale entry under a pid the
+///    kernel recycles, which would swallow the zombie of the next real child
+///    to wear it. (Pointed out by Copilot on the #2428.)
+/// 3. **Then** the teardown, which is what releases the address space and
+///    takes the child out of its job: its one thread leaving, when there is
+///    one, and `exit` only when there is not. `Thread::kill` is no use here
+///    --- on a thread that never ran it finds no coroutine, so the thread
+///    never leaves the list, the list never empties and nothing is ever
+///    released.
 ///
 /// The parent is looked up on the child and not passed in, because it is not
 /// always the caller: `CLONE_PARENT` hands the child to the caller's own
 /// parent (`give_to_callers_parent`), and it is that table the child has to
 /// leave.
-///
-/// The exit code is nobody's to read: no zombie is kept, so no `wait` will
-/// ever see it.
-fn abandon_unstarted_child(child: &Arc<Process>) {
+fn abandon_unstarted_child(child: &Arc<Process>, thread: Option<&Arc<Thread>>) {
+    child.linux().set_exit_signal(0);
     if let Some(parent) = child.linux().parent() {
         parent.linux().abandon_child(child.id());
     }
-    child.exit(0);
+    match thread {
+        // The child has one thread and it never ran: taking it off the list
+        // IS the teardown (`remove_thread` -> `terminate`), and the exit code
+        // comes from the hint, which nobody will read.
+        Some(thread) => thread.terminate_abandoned(),
+        // Nothing was created to take back, so the process has to be told.
+        None => child.exit(0),
+    }
 }
