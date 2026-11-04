@@ -141,6 +141,8 @@
  *       old `struct sigframe_ia32` and `sigreturn` (119), not the `rt_` pair
  *   112 clone (120) read its last two arguments the x86_64 way round, or
  *       took its `tls` for a base instead of a `struct user_desc *`
+ *   113 uname (122) was not callable at all from 32 bits, or a process in
+ *       the PER_LINUX32 domain was not told it is on an `i686`
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -3628,6 +3630,66 @@ timer64_skipped:
 	cmpl	$-14, %eax		/* EFAULT */
 	jne	bad_clone
 
+	/* Step 89 (code 113): `uname` (122), which a 32-bit process could not
+	 * call AT ALL --- 122 was in neither allowlist, so it answered ENOSYS.
+	 * It is the question every `config.guess`, every `platform.machine()`
+	 * and glibc's own startup asks, and its `struct new_utsname` is six
+	 * 65-byte `char` arrays: byte for byte the native one, which is why
+	 * Linux's `syscall_32.tbl` row 122 is the plain `sys_newuname`.
+	 *
+	 * Two halves. First that the call works and fills the struct. */
+	movl	$122, %eax
+	movl	$utsbuf, %ebx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_uname
+	cmpb	$0xaa, utsbuf		/* sysname still poison: nothing written */
+	je	bad_uname
+	cmpb	$0, utsbuf		/* or empty, which no kernel reports */
+	je	bad_uname
+
+	/* And second the half a 32-bit process is the whole reason for:
+	 * `personality(PER_LINUX32)` and the machine becomes `i686`. That is
+	 * Linux's `override_architecture`, and it is the only route to the
+	 * name --- loading a 32-bit ELF does not set the persona, which is why
+	 * `linux32` exists as a command. Measured on the Linux of this
+	 * container: persona 8 answers i686, persona 0x18 answers x86_64 and
+	 * persona 0x108 answers i686, so the domain is the LOW BYTE compared
+	 * whole. */
+	movl	$136, %eax		/* personality */
+	movl	$8, %ebx		/* PER_LINUX32 */
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_uname
+	movl	%eax, oldpersona
+
+	movl	$122, %eax
+	movl	$utsbuf, %ebx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_uname
+	/* `machine` is the fifth field, so 4 * 65 bytes in. */
+	cmpl	$0x36383669, utsbuf + 260	/* "i686" */
+	jne	bad_uname
+	cmpb	$0, utsbuf + 264
+	jne	bad_uname
+
+	/* The mirror, which is what says the rename is the PERSONA's and not
+	 * this ABI's: back in the plain domain, the machine is not i686. */
+	movl	$136, %eax
+	movl	oldpersona, %ebx
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_uname
+
+	movl	$122, %eax
+	movl	$utsbuf, %ebx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_uname
+	cmpl	$0x36383669, utsbuf + 260
+	je	bad_uname
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -3994,6 +4056,9 @@ clone_child:
 	movl	$1, %eax
 	xorl	%ebx, %ebx
 	int	$0x80
+bad_uname:
+	movl	$113, %ebx
+	jmp	die
 bad_clone:
 	movl	$112, %ebx
 	jmp	die
@@ -4402,6 +4467,17 @@ flag87:
 	/* Where step 88's `waitpid` leaves the child's status. */
 clonest:
 	.long	0xffffffff
+
+	/* Step 89's `struct utsname`: six 65-byte fields, 390 bytes, the same
+	 * in both ABIs. Poisoned, so a kernel that answers 0 without writing
+	 * anything is visible. */
+utsbuf:
+	.fill	390, 1, 0xaa
+	/* Where the persona in force before step 89 is kept, to be put back:
+	 * `personality` survives `execve`, and step 61 execs this very
+	 * program again. */
+oldpersona:
+	.long	0
 
 spad86:
 	.long	0

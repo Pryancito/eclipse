@@ -122,11 +122,21 @@ impl Syscall<'_> {
         let hostname = uname::hostname();
         let domainname = uname::domainname();
 
-        let arch = uname_machine(
-            cfg!(target_arch = "x86_64"),
-            cfg!(target_arch = "aarch64"),
-            cfg!(target_arch = "riscv64"),
+        // `sys_newuname` copies the struct and THEN lets the caller's persona
+        // rewrite two of its fields (`override_architecture` and
+        // `override_release`). Both are here, so that a 32-bit process under
+        // `linux32` is told `i686` and an old build script under
+        // `setarch --uname-2.6` is told a 2.6 release.
+        let persona = self.linux_process().personality();
+        let arch = machine_for(
+            persona,
+            uname_machine(
+                cfg!(target_arch = "x86_64"),
+                cfg!(target_arch = "aarch64"),
+                cfg!(target_arch = "riscv64"),
+            ),
         );
+        let release = release_for(persona, uname::OS_RELEASE);
 
         // The whole 390-byte struct, each name cut to its 65-byte field
         // (`sys_newuname` copies the arrays, not the strings). Writing
@@ -134,12 +144,12 @@ impl Syscall<'_> {
         // than the field run into the next one, and the last one past the
         // caller's struct.
         let utsname = uname::utsname_bytes([
-            uname::OS_TYPE.as_bytes(),    // sysname
-            hostname.as_bytes(),          // nodename
-            uname::OS_RELEASE.as_bytes(), // release
-            version.as_bytes(),           // version
-            arch.as_bytes(),              // machine
-            domainname.as_bytes(),        // domainname
+            uname::OS_TYPE.as_bytes(), // sysname
+            hostname.as_bytes(),       // nodename
+            release.as_bytes(),        // release
+            version.as_bytes(),        // version
+            arch.as_bytes(),           // machine
+            domainname.as_bytes(),     // domainname
         ]);
         buf.write_array(&utsname)?;
         Ok(0)
@@ -1287,6 +1297,23 @@ enum SyslogPlan {
 /// same constant, and `setarch --list` reading back a persona it never set
 /// would have looked like success.
 const PERSONALITY_QUERY: u32 = 0xffff_ffff;
+
+/// `PER_MASK` (`<linux/personality.h>`): the execution domain lives in the
+/// LOW BYTE of the persona and everything above it is a modifier flag. The
+/// distinction is load-bearing and measured, not read: on this container's
+/// Linux a `personality(PER_LINUX32 | ADDR_LIMIT_3GB)` --- `0x800_0008` ---
+/// still answers `i686` from `uname`, which it would not if the domain were
+/// tested with `&` or compared whole.
+const PER_MASK: u32 = 0x00ff;
+
+/// `PER_LINUX32`: the domain `linux32` and `setarch i386` put a process in.
+/// See [`machine_for`].
+const PER_LINUX32: u32 = 0x0008;
+
+/// `UNAME26`: the modifier that makes `uname` report a 2.6 release, which is
+/// what `setarch --uname-2.6` sets. A flag bit, so tested with `&`. See
+/// [`release_for`].
+const UNAME26: u32 = 0x0020_0000;
 
 /// `membarrier(2)`'s commands (`<linux/membarrier.h>`). `MEMBARRIER_CMD_QUERY`
 /// is 0 and the rest are single bits, because the answer to the query is the
@@ -2524,6 +2551,167 @@ const fn uname_machine(x86_64: bool, aarch64: bool, riscv64: bool) -> &'static s
         "riscv64"
     } else {
         "unknown"
+    }
+}
+
+/// The `machine` a process in persona `persona` is told it runs on:
+/// Linux's `override_architecture`, which is the second half of
+/// `sys_newuname` and the reason `linux32 uname -m` says `i686`.
+///
+/// Measured on this container's Linux rather than read off the man page,
+/// because the man page does not say which bits are compared:
+///
+/// | persona | `uname -m` |
+/// |---|---|
+/// | `0` | `x86_64` |
+/// | `PER_LINUX32` | **`i686`** |
+/// | `PER_LINUX32 \| UNAME26` | **`i686`** |
+/// | `PER_LINUX32 \| ADDR_LIMIT_3GB` | **`i686`** |
+///
+/// So the domain is the low byte and nothing else, and the test is an
+/// EQUALITY: `PER_LINUX` with a flag on is not `PER_LINUX32`, and
+/// `PER_LINUX32` with a flag on still is.
+///
+/// Only `x86_64` is renamed. Linux guards the rewrite with
+/// `strncmp(name->machine, "x86_64", 6)`, so an aarch64 or riscv64 kernel in
+/// this persona reports its own name --- there is no 32-bit x86 to pretend to
+/// be. Note that this is the ONLY route to `i686`: a 32-bit ELF does not get
+/// the persona by being loaded (Linux's `set_personality_ia32` does not touch
+/// `PER_MASK`), which is exactly why `linux32` exists as a command.
+fn machine_for(persona: u32, machine: &'static str) -> &'static str {
+    if persona & PER_MASK == PER_LINUX32 && machine == "x86_64" {
+        "i686"
+    } else {
+        machine
+    }
+}
+
+/// The `release` a process in persona `persona` is told it runs, for the one
+/// persona that changes it: Linux's `override_release`, which `UNAME26`
+/// turns on and `setarch --uname-2.6` is the front end for. Build scripts
+/// older than the 3.0 renumbering parse the release and refuse a leading `3`
+/// or more, and this is the escape hatch Linux gave them.
+///
+/// The shape is Linux's, to the character: `2.6.<patchlevel + 60>` followed by
+/// whatever of the real release is not part of its leading numeric triple.
+/// Measured here, where the release is `6.18.44-fc-v233`:
+///
+/// ```text
+///     uname -r                 6.18.44-fc-v233
+///     personality(UNAME26)     2.6.78-fc-v233
+/// ```
+///
+/// `78` is `18 + 60`: the PATCHLEVEL, the middle number, which is what
+/// `(LINUX_VERSION_CODE >> 8) & 0xff` picks out. The tail is found by Linux's
+/// own scan --- walk while the characters are digits or dots and stop at the
+/// third dot or at the first character that is neither --- so a release with
+/// no tail gets none.
+fn release_for(persona: u32, release: &str) -> alloc::string::String {
+    use alloc::string::ToString;
+    if persona & UNAME26 == 0 {
+        return release.to_string();
+    }
+    // Linux's scan, which decides both where the triple ends and what of it
+    // is a number: it stops at the third dot or at the first character that
+    // is neither a digit nor a dot.
+    let mut dots = 0usize;
+    let mut end = release.len();
+    for (at, c) in release.char_indices() {
+        if c == '.' {
+            dots += 1;
+            if dots >= 3 {
+                end = at;
+                break;
+            }
+        } else if !c.is_ascii_digit() {
+            end = at;
+            break;
+        }
+    }
+    // The middle component of the triple is the patchlevel. A release with no
+    // second component has a patchlevel of 0, as a version code built from it
+    // would.
+    let patchlevel = release[..end]
+        .split('.')
+        .nth(1)
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(0);
+    // `& 0xff` is not decoration: `LINUX_VERSION_CODE` gives the field eight
+    // bits, so a patchlevel of 200 wraps there too rather than overflowing.
+    alloc::format!("2.6.{}{}", (patchlevel & 0xff) + 60, &release[end..])
+}
+
+#[cfg(test)]
+mod persona_rewrite_tests {
+    use super::{machine_for, release_for, PER_LINUX32, PER_MASK, UNAME26};
+
+    /// The persona words, from `<linux/personality.h>`. Asserted rather than
+    /// reused so that a constant that drifted is caught here: userspace sends
+    /// these numbers, and a kernel comparing a drifted constant against
+    /// itself would notice nothing.
+    #[test]
+    fn the_persona_words_are_the_ones_in_the_header() {
+        assert_eq!(PER_LINUX32, 0x0008);
+        assert_eq!(UNAME26, 0x0020_0000);
+        assert_eq!(PER_MASK, 0x00ff);
+    }
+
+    /// **The measurement, reproduced byte for byte.** On this container's
+    /// Linux --- release `6.18.44-fc-v233` --- a `personality(UNAME26)`
+    /// followed by `uname` answers `2.6.78-fc-v233`, and `78` is the
+    /// PATCHLEVEL `18` plus 60.
+    ///
+    /// This is the one test that would catch taking the first number of the
+    /// triple instead of the second (`2.6.66`), or the third (`2.6.104`), or
+    /// dropping the tail.
+    #[test]
+    fn the_release_a_uname26_process_reads_is_the_one_linux_answered() {
+        assert_eq!(
+            release_for(UNAME26, "6.18.44-fc-v233"),
+            "2.6.78-fc-v233",
+            "the rewrite no longer reproduces the measurement"
+        );
+    }
+
+    /// A release with nothing after its triple gets nothing after the
+    /// rewrite, which is this kernel's own case (`OS_RELEASE` is `0.7.0`).
+    #[test]
+    fn a_release_with_no_tail_keeps_none() {
+        assert_eq!(release_for(UNAME26, "0.7.0"), "2.6.67");
+        assert_eq!(release_for(UNAME26, "0.7.0-libos"), "2.6.67-libos");
+    }
+
+    /// Where the tail starts is Linux's scan, not a split on `-`: it stops at
+    /// the THIRD dot or at the first character that is neither a digit nor a
+    /// dot. So a fourth component is tail, dot and all.
+    #[test]
+    fn the_tail_is_whatever_is_not_part_of_the_leading_triple() {
+        assert_eq!(release_for(UNAME26, "1.2.3.4"), "2.6.62.4");
+        assert_eq!(release_for(UNAME26, "1.2.3rc1"), "2.6.62rc1");
+        // No second component at all: a patchlevel of 0, as a version code
+        // built from this release would have.
+        assert_eq!(release_for(UNAME26, "5"), "2.6.60");
+    }
+
+    /// And without the persona the release is handed back untouched. The
+    /// guard is the whole reason `uname` does not lie to everyone.
+    #[test]
+    fn a_process_without_uname26_reads_the_real_release() {
+        assert_eq!(release_for(0, "6.18.44-fc-v233"), "6.18.44-fc-v233");
+        assert_eq!(release_for(PER_LINUX32, "0.7.0"), "0.7.0");
+    }
+
+    /// Only `x86_64` is renamed, and only for this domain.
+    #[test]
+    fn only_x86_64_becomes_i686_and_only_in_the_32_bit_domain() {
+        assert_eq!(machine_for(PER_LINUX32, "x86_64"), "i686");
+        assert_eq!(machine_for(0, "x86_64"), "x86_64");
+        assert_eq!(machine_for(PER_LINUX32, "aarch64"), "aarch64");
+        assert_eq!(machine_for(PER_LINUX32, "riscv64"), "riscv64");
+        // The two measured levers, as pure calls: the domain is the low byte
+        // and is compared whole.
+        assert_eq!(machine_for(0x18, "x86_64"), "x86_64");
+        assert_eq!(machine_for(0x108, "x86_64"), "i686");
     }
 }
 

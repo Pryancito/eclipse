@@ -136,6 +136,22 @@ lremovexattr
 fremovexattr
 
 // --- identity and process scalars
+//
+// `uname` (122) belongs here and was missing, which is not a small gap: a
+// 32-bit program asking what machine it is on got `ENOSYS`, and that question
+// is asked by every `config.guess`, by Python's `platform`, and by glibc's own
+// startup. Its `struct new_utsname` is six 65-byte `char` arrays -- no `long`,
+// no pointer, no padding -- so it is byte-for-byte the native one, and Linux's
+// `syscall_32.tbl` agrees: row 122 is the plain `sys_newuname`, with no
+// `compat_` wrapper.
+//
+// Its two older numbers are NOT here, and must not be: i386 `olduname` (109)
+// takes a `struct old_utsname`, which has five fields and so is 325 bytes, and
+// `oldolduname` (59) takes a `struct oldold_utsname`, whose fields are 9 bytes
+// each. Pointing either at the native handler would write 390 bytes into a
+// smaller struct, which is the bug the `waitid` rusage had. Nothing links them
+// any more -- Linux keeps them only under
+// `CONFIG_ARCH_WANT_SYS_OLD_UNAME` -- so they answer `ENOSYS` with their name.
 getpid
 getppid
 gettid
@@ -145,6 +161,7 @@ setpgid
 getsid
 setsid
 umask
+uname
 personality
 set_tid_address
 sched_yield
