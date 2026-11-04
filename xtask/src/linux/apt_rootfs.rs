@@ -527,8 +527,9 @@ pub(super) fn bootstrap(root: &Path, arch: &str) {
     if root_status.is_file() {
         let _ = fs::copy(&root_status, &stage_status);
     }
-    if !extract_debs(&cache, BOOTSTRAP_PKGS, &stage) {
-        eprintln!("warning: apt bootstrap: extract failed");
+    let report = extract_debs(&cache, BOOTSTRAP_PKGS, &stage);
+    if !report.any() {
+        eprintln!("warning: apt bootstrap: no se extrajo ni un .deb");
         let _ = fs::remove_dir_all(&stage);
         return;
     }
@@ -562,19 +563,52 @@ pub(super) fn bootstrap(root: &Path, arch: &str) {
     }
     let _ = fs::remove_dir_all(&stage);
     fix_common_alternatives(root);
-    let hello = root.join("usr/bin/hello").is_file() || root.join("bin/hello").is_file();
-    if hello {
-        println!("apt bootstrap: smoke OK — /usr/bin/hello present");
-    } else {
-        eprintln!(
-            "warning: apt bootstrap: `hello` missing (offline download?). \
-             apt/dpkg may still be present."
-        );
+    if report_bootstrap_gaps(root, &cache, &report) == 0 {
+        println!("apt bootstrap: smoke OK — apt, dpkg y hello estan en la rootfs");
     }
     println!(
         "apt bootstrap: merged Ubuntu {DISTRO} runtime into {}",
         root.display()
     );
+}
+
+/// Files the bootstrap must leave behind, and the package that ships each.
+///
+/// `verify::check_apt` panics on exactly these, but it runs long after the
+/// bootstrap scrolled past and can only say "falta /usr/bin/apt". Checking
+/// them here, next to the extraction report, turns that into the reason.
+/// Several paths in one entry means "any of these will do", which is how
+/// `verify` reads `apt` / `apt-get`.
+const BOOTSTRAP_MUST_HAVE: &[(&[&str], &str)] = &[
+    (&["usr/bin/dpkg"], "dpkg"),
+    (&["usr/share/dpkg/cputable"], "dpkg"),
+    (&["usr/bin/apt", "usr/bin/apt-get"], "apt"),
+    (&["usr/bin/hello", "bin/hello"], "hello"),
+];
+
+/// Name every [`BOOTSTRAP_MUST_HAVE`] file that did not land, with the reason
+/// [`ExtractReport`] has for it. Returns how many are missing.
+fn report_bootstrap_gaps(root: &Path, cache: &Path, report: &ExtractReport) -> usize {
+    let mut gaps = 0;
+    for (paths, pkg) in BOOTSTRAP_MUST_HAVE {
+        if paths.iter().any(|rel| root.join(rel).is_file()) {
+            continue;
+        }
+        gaps += 1;
+        eprintln!(
+            "warning: apt bootstrap: falta /{} en la rootfs — {pkg}: {}",
+            paths[0],
+            report.verdict(pkg),
+        );
+    }
+    if gaps > 0 {
+        eprintln!(
+            "warning: apt bootstrap: {gaps} hueco(s) en la rootfs; la cache de .deb \
+             esta en {} (borrala para volver a bajarlos)",
+            cache.display(),
+        );
+    }
+    gaps
 }
 
 /// Debian/Ubuntu `update-alternatives` entries that never appear because we
@@ -741,10 +775,19 @@ pub(super) fn install_packages(root: &Path, arch: &str, packages: &[String]) {
         let _ = fs::copy(&root_status, &stage_status);
     }
     // Extract every .deb in the cache that we just needed (filter by name list).
-    if !extract_debs(&cache, &names, &stage) {
-        eprintln!("warning: apt install: extract failed");
+    let report = extract_debs(&cache, &names, &stage);
+    if !report.any() {
+        eprintln!("warning: apt install: no se extrajo ni un .deb");
         let _ = fs::remove_dir_all(&stage);
         return;
+    }
+    if !report.failed.is_empty() || !report.missing.is_empty() {
+        eprintln!(
+            "warning: apt install: {} de {} paquete(s) no llegaron al arbol; \
+             lo que dependa de ellos saldra MISSING mas abajo",
+            report.failed.len() + report.missing.len(),
+            names.len(),
+        );
     }
     merge_stage(&stage, root);
     for p in ["bin/bash", "usr/bin/bash"] {
@@ -1084,10 +1127,59 @@ fn cache_has_any_deb(cache: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn extract_debs(cache: &Path, packages: &[&str], stage: &Path) -> bool {
-    let mut any = false;
+/// Per-package outcome of [`extract_debs`].
+///
+/// This used to be a bare `bool`: one `.deb` out of 68 unpacking was enough to
+/// print "merged Ubuntu runtime" and let `verify` panic a thousand lines later
+/// with nothing but "falta /usr/bin/apt". Keeping the detail lets the
+/// bootstrap name the package and say *which* of the three things went wrong.
+#[derive(Default)]
+pub(super) struct ExtractReport {
+    /// Requested packages whose `.deb` unpacked into the stage.
+    extracted: Vec<String>,
+    /// Requested packages with no usable `.deb` in the cache.
+    missing: Vec<String>,
+    /// `(package, .deb file name, first line of dpkg-deb's stderr)`.
+    failed: Vec<(String, String, String)>,
+}
+
+impl ExtractReport {
+    /// Whether anything at all came out of the cache.
+    fn any(&self) -> bool {
+        !self.extracted.is_empty()
+    }
+
+    /// What happened to `pkg`, for the end-of-bootstrap summary.
+    fn verdict(&self, pkg: &str) -> String {
+        if let Some((_, file, err)) = self.failed.iter().find(|(p, _, _)| p == pkg) {
+            return format!("`dpkg-deb -x` fallo sobre {file}: {err}");
+        }
+        if self.missing.iter().any(|p| p == pkg) {
+            return "no habia ningun .deb suyo en la cache (la descarga no lo trajo)".into();
+        }
+        if self.extracted.iter().any(|p| p == pkg) {
+            return "su .deb se extrajo, asi que el fichero se perdio en el merge".into();
+        }
+        format!("{pkg} no estaba en la lista de paquetes de esta tanda")
+    }
+}
+
+/// Which requested package a cached `.deb` file name belongs to.
+fn deb_owner<'a>(name: &str, packages: &[&'a str]) -> Option<&'a str> {
+    let stem = name.split('_').next().unwrap_or("");
+    packages
+        .iter()
+        .find(|p| {
+            stem == **p || stem.starts_with(&format!("{p}:")) || name.starts_with(&format!("{p}_"))
+        })
+        .copied()
+}
+
+fn extract_debs(cache: &Path, packages: &[&str], stage: &Path) -> ExtractReport {
+    let mut report = ExtractReport::default();
     let Ok(entries) = fs::read_dir(cache) else {
-        return false;
+        report.missing = packages.iter().map(|p| (*p).to_string()).collect();
+        return report;
     };
     let debs: Vec<PathBuf> = entries
         .flatten()
@@ -1105,38 +1197,100 @@ fn extract_debs(cache: &Path, packages: &[&str], stage: &Path) -> bool {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        if !packages.is_empty() {
-            let stem = name.split('_').next().unwrap_or("");
-            let wanted = packages.iter().any(|p| {
-                stem == *p
-                    || stem.starts_with(&format!("{p}:"))
-                    || name.starts_with(&format!("{p}_"))
-            });
-            if !wanted {
-                continue;
-            }
+        let owner = deb_owner(&name, packages);
+        if !packages.is_empty() && owner.is_none() {
+            continue;
         }
         let _ = fs::remove_dir_all(&tmp);
         let _ = fs::create_dir_all(&tmp);
-        let status = Command::new("dpkg-deb")
+        let out = Command::new("dpkg-deb")
             .arg("-x")
             .arg(deb)
             .arg(&tmp)
-            .status();
-        if !matches!(status, Ok(s) if s.success()) {
-            eprintln!(
-                "apt extract: dpkg-deb failed on {} — removing (likely truncated)",
-                name
+            .output();
+        let failure = match &out {
+            Ok(o) if o.status.success() => None,
+            Ok(o) => Some(first_line(&String::from_utf8_lossy(&o.stderr))),
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(err) = failure {
+            // Only drop the file when the archive itself is unreadable. A
+            // `.deb` that reads fine but will not unpack (full disk, a
+            // compressor this dpkg-deb does not know) must survive: deleting
+            // it makes every later run re-download it and fail the same way,
+            // which is invisible because `apt-get download` then reports "ok".
+            let readable = matches!(
+                Command::new("dpkg-deb").arg("-f").arg(deb).output(),
+                Ok(o) if o.status.success()
             );
-            let _ = fs::remove_file(deb);
+            if readable {
+                eprintln!(
+                    "apt extract: `dpkg-deb -x` fallo sobre {name} y el .deb se lee bien, \
+                     asi que lo conservo: {err}"
+                );
+            } else {
+                eprintln!(
+                    "apt extract: {name} no se puede leer como .deb — lo borro \
+                     (descarga truncada): {err}"
+                );
+                let _ = fs::remove_file(deb);
+            }
+            if let Some(pkg) = owner {
+                report.failed.push((pkg.to_string(), name, err));
+            }
             continue;
         }
         merge_usrmerge_tree(&tmp, stage);
         record_deb_status(deb, &stage.join("var/lib/dpkg/status"));
-        any = true;
+        if let Some(pkg) = owner {
+            report.extracted.push(pkg.to_string());
+        }
     }
     let _ = fs::remove_dir_all(&tmp);
-    any
+    report.extracted.sort();
+    report.extracted.dedup();
+    for p in packages {
+        let seen =
+            report.extracted.iter().any(|e| e == p) || report.failed.iter().any(|(f, _, _)| f == p);
+        if !seen {
+            report.missing.push((*p).to_string());
+        }
+    }
+    if !report.failed.is_empty() || !report.missing.is_empty() {
+        eprintln!(
+            "warning: apt extract: {} extraido(s), {} sin .deb en la cache, {} con `dpkg-deb` en error{}",
+            report.extracted.len(),
+            report.missing.len(),
+            report.failed.len(),
+            preview(
+                &report
+                    .missing
+                    .iter()
+                    .cloned()
+                    .chain(report.failed.iter().map(|(p, _, _)| p.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    report
+}
+
+/// First non-empty line of a tool's stderr, trimmed, for a one-line report.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("sin mensaje")
+        .to_string()
+}
+
+/// ` (p.ej. a, b, c)` for a handful of names, or empty when there are none.
+fn preview(names: &[String]) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    let head: Vec<&str> = names.iter().take(8).map(String::as_str).collect();
+    format!(" (p.ej. {})", head.join(", "))
 }
 
 fn record_deb_status(deb: &Path, status_file: &Path) {
@@ -1529,6 +1683,9 @@ mod suite_pin_tests;
 
 #[cfg(all(test, unix))]
 mod staging_merge_tests;
+
+#[cfg(test)]
+mod extract_report_tests;
 
 #[cfg(test)]
 mod tests {
