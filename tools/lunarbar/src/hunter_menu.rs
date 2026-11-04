@@ -277,7 +277,9 @@ pub(super) fn draw(
         let bg = if armed { pal().warn } else { pal().pill };
         plate(cv, x, y, bw, BTN_H, 6, bg);
         let label = fit(label, bw - 6);
-        let fg = if armed { pal().white } else { pal().text };
+        // On the armed button the plate is filled with `warn`, so the
+        // label takes the look's on-accent tier and not `white`.
+        let fg = if armed { pal().on_accent } else { pal().text };
         cv.text(
             &label,
             x + (bw - Canvas::text_width(&label)) / 2,

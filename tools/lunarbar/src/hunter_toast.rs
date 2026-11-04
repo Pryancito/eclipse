@@ -263,7 +263,8 @@ fn draw(
                 bx -= bw;
                 let hot = hover == Some(Hit::Action(i, j));
                 let (bg, fg) = match (j, hot) {
-                    (0, _) => (col, pal().white),
+                    // The primary action is filled with the severity colour.
+                    (0, _) => (col, pal().on_accent),
                     (_, true) => (pal().pill_hover, pal().text),
                     _ => (pal().pill, pal().text),
                 };

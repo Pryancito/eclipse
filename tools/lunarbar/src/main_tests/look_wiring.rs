@@ -251,3 +251,99 @@ fn a_label_is_capitalised_only_where_the_look_asks_for_it() {
     assert_eq!("45°c".to_uppercase(), "45°C");
     assert_eq!("bat 80% +".to_uppercase(), "BAT 80% +");
 }
+
+/// WCAG relative luminance, and the contrast ratio built from it.
+///
+/// Worth the eight lines of sRGB maths rather than the cheap channel sum used
+/// elsewhere in this file: that one orders shades of ONE hue, which is all the
+/// tiering checks need, and it is useless across hues -- it calls `#3ad7e8`
+/// and `#ff8a5c` about equally light while one of them takes white and the
+/// other does not.
+fn contrast(a: Rgb, b: Rgb) -> f32 {
+    fn lum((r, g, b): Rgb) -> f32 {
+        let f = |c: u8| {
+            let c = c as f32 / 255.0;
+            if c <= 0.040_45 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+    }
+    let (x, y) = (lum(a), lum(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+#[test]
+fn text_on_a_filled_plate_can_be_read_in_the_look_it_was_designed_for() {
+    // `on_accent` is the text on a plate filled with `accent` or `warn`: the
+    // armed lockdown button and a toast's primary action. It is a role of its
+    // own because the right answer FLIPS with the look -- on a dark accent it
+    // is white, on a bright one it is the ground -- and the first draft of
+    // `tecno` used `white` for both, at 1.66:1 and 2.21:1. A label nobody can
+    // read on the button that asks for confirmation is the worst place in the
+    // session for this.
+    const AA: f32 = 4.5;
+    for look in LOOKS {
+        let p = pal_of(look);
+        // Looks that were already below the line when `on_accent` was split
+        // out of `white`. Raising them changes how the three shipped looks
+        // render, which is not this change's to decide, so the numbers are
+        // recorded instead: they cannot get worse without this failing.
+        let known = match look {
+            Look::Eclipse => Some((2.41, 2.90)),
+            Look::Kde => Some((2.43, 4.15)),
+            _ => None,
+        };
+        for (role, fill) in [("accent", p.accent), ("warn", p.warn)] {
+            let got = contrast(p.on_accent, fill);
+            let floor = match (known, role) {
+                (Some((a, _)), "accent") => a,
+                (Some((_, w)), _) => w,
+                (None, _) => AA,
+            };
+            assert!(
+                got >= floor - 0.01,
+                "{look:?}: text on a {role}-filled plate is {got:.2}:1, under {floor:.2}"
+            );
+        }
+    }
+    // And the look this change designs is held to the real line, both ways.
+    let t = pal_of(Look::Tecno);
+    assert!(contrast(t.on_accent, t.accent) >= AA);
+    assert!(contrast(t.on_accent, t.warn) >= AA);
+}
+
+#[test]
+fn the_dim_tier_is_readable_because_it_paints_enabled_text_too() {
+    // `dim` is not only decoration: it is the module labels on the bar, the
+    // search hint in the launcher and a clipboard entry's metadata -- text a
+    // user is meant to READ. `tecno` shipped its first draft at 3.4:1 on the
+    // bar ground, the worst of the four looks, which is what started this.
+    //
+    // The three older looks sit between 3.80 and 4.91 and are not raised here
+    // for the same reason as above, so the floor asserted for them is their
+    // own number; `tecno` is held to 4.5 on the ground AND on a plate, since
+    // half of what it paints sits on a plate.
+    for look in LOOKS {
+        let p = pal_of(look);
+        let floor = match look {
+            Look::Eclipse => 4.91,
+            Look::Kde => 3.93,
+            Look::Win11 => 3.80,
+            Look::Tecno => 4.5,
+        };
+        let on_bar = contrast(p.dim, p.bar_bg);
+        assert!(
+            on_bar >= floor - 0.01,
+            "{look:?}: dim text is {on_bar:.2}:1 on the bar ground, under {floor:.2}"
+        );
+    }
+    let t = pal_of(Look::Tecno);
+    assert!(
+        contrast(t.dim, t.pill) >= 4.5,
+        "tecno: dim text on a plate is {:.2}:1",
+        contrast(t.dim, t.pill)
+    );
+}

@@ -127,6 +127,13 @@ struct Pal {
     pill_hover: Rgb,
     btn_active: Rgb,
     white: Rgb,
+    /// Text drawn on a plate FILLED with `accent` or `warn`.
+    ///
+    /// Its own role because the right answer flips with the look: on a dark
+    /// accent, white; on a bright one, the ground. `white` was used here and
+    /// is still right for the active taskbar button, which is filled with
+    /// `btn_active` -- a dark colour in every look.
+    on_accent: Rgb,
     menu_panel: Rgb,
     menu_hover: Rgb,
 }
@@ -145,6 +152,7 @@ const PAL_ECLIPSE: Pal = Pal {
     pill_hover: (0x1a, 0x2f, 0x4e), // pill under the pointer
     btn_active: (0x1f, 0x3a, 0x63), // active taskbar button
     white: (0xff, 0xff, 0xff),      // active button text
+    on_accent: (0xff, 0xff, 0xff), // unchanged: see the contrast note in look_wiring
     menu_panel: (0x0b, 0x12, 0x20), // launcher menu panel, deep navy
     menu_hover: (0x1f, 0x3a, 0x63), // hovered menu row
 };
@@ -163,6 +171,7 @@ const PAL_KDE: Pal = Pal {
     pill_hover: (0x31, 0x36, 0x3b),
     btn_active: (0x1b, 0x1e, 0x20),
     white: (0xfc, 0xfc, 0xfc),
+    on_accent: (0xfc, 0xfc, 0xfc),
     menu_panel: (0x2a, 0x2e, 0x32),
     menu_hover: (0x3d, 0xae, 0xe9),
 };
@@ -182,6 +191,7 @@ const PAL_WIN11: Pal = Pal {
     pill_hover: (0x3a, 0x3a, 0x3a),
     btn_active: (0x2d, 0x2d, 0x2d),
     white: (0xff, 0xff, 0xff),
+    on_accent: (0xff, 0xff, 0xff),
     menu_panel: (0x2b, 0x2b, 0x2b),
     menu_hover: (0x3a, 0x3a, 0x3a),
 };
@@ -198,13 +208,20 @@ const PAL_TECNO: Pal = Pal {
     rule: (0x1d, 0x5e, 0x6e),       // plate borders and separators, steel cyan
     text: (0xdf, 0xf4, 0xf7),       // primary text
     muted: (0x9c, 0xc2, 0xcc),      // module values
-    dim: (0x4a, 0x6b, 0x75),        // module labels, minimized windows
+    // Also paints ENABLED text -- search hints, clipboard metadata -- and
+    // not only decoration, so it clears 4.5:1 on both the bar ground and a
+    // plate (6.8:1 and 6.3:1). The first draft was #4a6b75, at 3.4:1.
+    dim: (0x7f, 0x9c, 0xa5),        // module labels, minimized windows
     warn: (0xff, 0x8a, 0x5c),       // hot cpu/temp, low battery (semantic)
     accent: (0x3a, 0xd7, 0xe8),     // signal cyan: launcher, lit meters
     pill: (0x08, 0x16, 0x1d),       // plate body
     pill_hover: (0x10, 0x28, 0x33), // plate under the pointer
     btn_active: (0x10, 0x28, 0x33), // active taskbar button
     white: (0xf2, 0xfb, 0xfd),      // active button text: the brightest tier
+    // The ground, on a filled plate: this look's accent and warn are both
+    // bright enough that white on them is 1.66:1 and 2.21:1. This way round
+    // it is 11.3:1 and 8.5:1.
+    on_accent: (0x06, 0x0b, 0x12),
     menu_panel: (0x05, 0x0d, 0x13), // menu panel ground
     menu_hover: (0x10, 0x28, 0x33), // hovered menu row
 };
