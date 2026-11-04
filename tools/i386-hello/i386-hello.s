@@ -128,6 +128,11 @@
  *       structures wrong: the timeout, whose width is the number's, or the
  *       sixth argument's `{ const sigset_t *ss; size_t ss_len; }`, whose
  *       width is the PROCESS's by either number
+ *   108 rt_sigtimedwait (177) or rt_sigtimedwait_time64 (421) got one of
+ *       ITS two wrong, and they travel in opposite directions: the timeout
+ *       inwards, whose width is the number's, or the siginfo_t outwards,
+ *       which is 128 bytes at both widths but whose union starts at byte 12
+ *       and not 16
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -3241,6 +3246,130 @@ timer64_skipped:
 	cmpl	$0xaaaaaaaa, tsp + 16
 	jne	bad_pselect
 
+	/* Step 84: `rt_sigtimedwait` (177) and `rt_sigtimedwait_time64` (421),
+	 * the call whose two structures go in OPPOSITE directions.
+	 *
+	 *   - the timeout, inwards: the NUMBER's width. Eight bytes by 177,
+	 *     sixteen by 421.
+	 *   - the `siginfo_t`, outwards: the PROCESS's width, by either
+	 *     number. And this one is not halved at all --- it is 128 bytes at
+	 *     both widths --- so what the conversion is for is that its union
+	 *     STARTS at byte 12 here and at byte 16 natively, because i386
+	 *     aligns it to four and keeps no padding after `si_code`. A kernel
+	 *     that copies the native bytes across does not fault and does not
+	 *     write short: it hands this program its own padding as `si_pid`
+	 *     and the sender's pid as `si_uid`.
+	 *
+	 * The signal is blocked and then sent to this very process, so each
+	 * wait has something to dequeue and comes back at once: what the step
+	 * measures is the conversion and not the waiting. The last wait here
+	 * is a successful one, so nothing is left pending across the `execve`
+	 * below. */
+
+	/* Block SIGRTMIN (34), which is bit 33 of the mask. Unblocked, the
+	 * `kill` below would end the program instead of queueing. */
+	movl	$0, wsigmask + 0
+	movl	$2, wsigmask + 4	/* bit 33: 1 << (33 - 32) */
+	movl	$175, %eax		/* rt_sigprocmask */
+	xorl	%ebx, %ebx		/* SIG_BLOCK */
+	movl	$wsigmask, %ecx
+	xorl	%edx, %edx		/* no old set */
+	movl	$8, %esi		/* sizeof(sigset_t), 8 either way */
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_sigwait
+
+	/* Our own pid, which is what `si_pid` has to come back as. */
+	movl	$20, %eax		/* getpid */
+	int	$0x80
+	movl	%eax, wpid
+
+	/* The set to wait for is the same one bit. */
+	movl	$0, wset + 0
+	movl	$2, wset + 4
+
+	call	send_to_self
+
+	/* A `tv_nsec` of two thousand million again: out of range read as
+	 * sixteen bytes, and read as eight it is `{0, 0}`, a timeout of zero
+	 * that is served at once because the signal is already pending. So
+	 * 177 answers 34 and 421 answers EINVAL, and no single width passes
+	 * both. */
+	call	poison_winfo
+	movl	$0, wts + 0
+	movl	$0, wts + 4
+	movl	$2000000000, wts + 8
+	movl	$0, wts + 12
+	movl	$177, %eax		/* rt_sigtimedwait */
+	movl	$wset, %ebx
+	movl	$winfo, %ecx
+	movl	$wts, %edx
+	movl	$8, %esi		/* sigsetsize */
+	int	$0x80
+	cmpl	$34, %eax
+	jne	bad_sigwait
+
+	/* `si_pid` at byte 12, which is where a 4-aligned union begins. Read
+	 * at byte 16 it would be whatever followed, and byte 12 would be the
+	 * native struct's padding. */
+	movl	wpid, %eax
+	cmpl	%eax, winfo + 12
+	jne	bad_sigwait
+	/* And the same word NOT at byte 16, which is where the native struct
+	 * keeps `si_pid`: these two checks together are the discriminating
+	 * pair, because a kernel that copies the native bytes straight across
+	 * puts the pid at 16 and the padding at 12, and one that converts puts
+	 * the pid at 12.
+	 *
+	 * What cannot be checked is that the rest stayed poison, because
+	 * nothing did: Linux `clear_user`s the whole 128 bytes before filling
+	 * in the members the layout names, so everything else comes back ZERO
+	 * at either width. Measured here --- this check in its first form,
+	 * asking byte 20 to still be `0xaaaaaaaa`, failed on this container's
+	 * own Linux. */
+	cmpl	%eax, winfo + 16
+	je	bad_sigwait
+	/* And `si_signo`, which is the same word at both widths. */
+	cmpl	$34, winfo + 0
+	jne	bad_sigwait
+
+	/* The same bytes by 421, which reads sixteen of them. */
+	call	send_to_self
+	call	poison_winfo
+	movl	$421, %eax		/* rt_sigtimedwait_time64 */
+	movl	$wset, %ebx
+	movl	$winfo, %ecx
+	movl	$wts, %edx
+	movl	$8, %esi
+	int	$0x80
+	cmpl	$-22, %eax
+	jne	bad_sigwait
+	/* Refused before the wait, so nothing was written. */
+	cmpl	$0xaaaaaaaa, winfo + 12
+	jne	bad_sigwait
+
+	/* 421 with a timeout it accepts --- all zeros, the one value whose
+	 * bytes are valid at either width --- takes the signal that is still
+	 * pending from the `send_to_self` above and writes the SAME 32-bit
+	 * siginfo, because that width is the process's and not the number's.
+	 * This is the wait that leaves nothing pending. */
+	call	poison_winfo
+	movl	$0, wts + 0
+	movl	$0, wts + 4
+	movl	$0, wts + 8
+	movl	$0, wts + 12
+	movl	$421, %eax
+	movl	$wset, %ebx
+	movl	$winfo, %ecx
+	movl	$wts, %edx
+	movl	$8, %esi
+	int	$0x80
+	cmpl	$34, %eax
+	jne	bad_sigwait
+	movl	wpid, %eax
+	cmpl	%eax, winfo + 12
+	jne	bad_sigwait
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -3589,6 +3718,10 @@ bad_timer64:
 	movl	$106, %ebx
 	jmp	die
 
+bad_sigwait:
+	movl	$108, %ebx
+	jmp	die
+
 bad_pselect:
 	movl	$107, %ebx
 	jmp	die
@@ -3606,6 +3739,28 @@ poison_dsbuf:
 	/* 0xaa over the forty-eight bytes of `tsp`, so that the sixteen a
 	 * native stride would reach into are a value no clock produces and no
 	 * nanosecond field may hold. Clobbers %eax, %ecx and %edi. */
+	/* Send SIGRTMIN to this very process, so that the next wait has
+	 * something to dequeue. Blocked, so it queues rather than killing us.
+	 * Clobbers %eax, %ebx and %ecx. */
+send_to_self:
+	movl	$37, %eax		/* kill */
+	movl	wpid, %ebx
+	movl	$34, %ecx
+	int	$0x80
+	testl	%eax, %eax
+	jnz	bad_sigwait
+	ret
+
+	/* 0xaa over the 128 bytes of the `siginfo_t`, so that a byte the
+	 * kernel leaves alone is readable as one it left alone. Clobbers %eax,
+	 * %ecx and %edi. */
+poison_winfo:
+	movl	$winfo, %edi
+	movl	$32, %ecx
+	movl	$0xaaaaaaaa, %eax
+	rep	stosl
+	ret
+
 poison_tsp:
 	movl	$tsp, %edi
 	movl	$12, %ecx
@@ -3917,6 +4072,21 @@ sigpack:
 	 * which aligns to 4. */
 sigmask:
 	.space	8
+
+	/* Step 84's four buffers. The set and the `siginfo_t` are 4 mod 8,
+	 * like every other buffer here, because that is the alignment a 32-bit
+	 * program's own are: an i386 `sigset_t` is `unsigned long sig[2]` and
+	 * its `siginfo_t`'s union aligns to four. */
+wset:
+	.space	8
+wsigmask:
+	.space	8
+wts:
+	.space	16
+winfo:
+	.space	128
+wpid:
+	.long	0
 	.balign	8
 	.long	0
 its:

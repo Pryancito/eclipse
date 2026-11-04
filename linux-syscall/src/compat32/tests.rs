@@ -404,6 +404,28 @@ fn pselect6_is_mapped_once_its_sigset_argument_is_converted_too() {
     );
 }
 
+/// `rt_sigtimedwait` also passes two structures, and in OPPOSITE directions:
+/// a `timespec` timeout inwards and a `siginfo_t` outwards. The second is 128
+/// bytes at both widths, so nothing is halved; what moves is where its union
+/// STARTS, byte 12 against byte 16. Both are the width of the process, so the
+/// native handler serves i386 too and the entry belongs here --- while
+/// `waitid` (284), which passes the same structure, is still out, because its
+/// handler does not convert it.
+#[test]
+fn rt_sigtimedwait_is_mapped_and_waitid_is_not() {
+    assert_eq!(name(177), Some("rt_sigtimedwait"));
+    assert_eq!(
+        native_number(177),
+        Some(Sys::RT_SIGTIMEDWAIT as u32),
+        "rt_sigtimedwait must point at the native rt_sigtimedwait"
+    );
+    assert_eq!(
+        native_number(284),
+        None,
+        "waitid passes the same siginfo_t and its handler does not convert it"
+    );
+}
+
 /// `statx` and `prlimit64` are mapped for a reason that is not the one
 /// anybody looks for: both structures ARE the same bytes in both ABIs ---
 /// `struct statx` was designed that way, `struct rlimit64` is two `__u64`.

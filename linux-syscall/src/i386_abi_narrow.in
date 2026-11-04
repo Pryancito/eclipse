@@ -62,6 +62,16 @@ _newselect = select
 // are UNSIGNED, which no other structure in this file is -- one is a pointer.
 pselect6
 
+// `rt_sigtimedwait` also passes two, and in OPPOSITE directions: a
+// `timespec` timeout inwards and a `siginfo_t` outwards. The second is 128
+// bytes at both widths, so it is not halved at all -- what moves is where
+// its union STARTS, byte 12 against byte 16, because i386 aligns it to four.
+// Copying the native bytes across would hand a 32-bit program its own
+// padding as `si_pid`; the conversion is `SigInfo::to_i386_bytes`, the same
+// one the 32-bit signal frame pushes. `waitid` (284) passes the same
+// structure and is still out, because its handler does not convert it yet.
+rt_sigtimedwait
+
 // struct itimerval, struct itimerspec
 setitimer
 getitimer
