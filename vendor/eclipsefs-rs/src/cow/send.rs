@@ -803,7 +803,17 @@ impl Sent {
                 let o = z.offset + (s - e.lblk);
                 let (&(disk, start), &(n, ino, lb)) =
                     self.packed.range(..=(e.pblk, o)).next_back()?;
-                (disk == e.pblk && o + (t - s) <= start + n).then_some((ino, lb + (o - start)))
+                // `then`, not `then_some`: `then_some` takes its value by
+                // value, so `lb + (o - start)` is computed even when the
+                // condition is false -- and that is exactly when it can
+                // underflow. The map is keyed by `(disk block, offset)`, so
+                // `range(..=(pblk, o))` can land on an entry of a LOWER disk
+                // block whose offset is above `o`; `disk == e.pblk` then
+                // rejects it, but the subtraction has already happened. In
+                // release it wrapped and the value was thrown away, so this
+                // only showed with overflow checks on, which no line of CI
+                // runs for this crate.
+                (disk == e.pblk && o + (t - s) <= start + n).then(|| (ino, lb + (o - start)))
             }
         }
     }
@@ -893,6 +903,64 @@ mod tests {
         }
     }
 
+    /// Only part of a compressed extent sent: what goes down is where that
+    /// part sits inside the extent, not where the extent begins, and asking
+    /// for exactly it finds it. Every test above sends a whole extent from
+    /// block zero, where the two are the same number and the bound is never
+    /// the tight one.
+    #[test]
+    fn part_of_a_compressed_extent_is_remembered_at_its_own_offset() {
+        let z = Zext {
+            algo: Compression::Zstd,
+            disk_blocks: 2,
+            ram_blocks: 8,
+            offset: 0,
+        };
+        let e = Ext {
+            lblk: 0,
+            pblk: 700,
+            blocks: 8,
+            prealloc: false,
+            z: Some(z),
+        };
+        let mut s = Sent::default();
+        s.add(&e, 2, 6, FIRST_INO);
+        assert_eq!(s.find(&e, 2, 6), Some((FIRST_INO, 2)));
+        // The blocks before it never went out, so there is nothing to clone.
+        assert_eq!(s.find(&e, 0, 4), None);
+    }
+
+    /// With two extents written down, the one a clone comes from is the entry
+    /// that HOLDS the blocks -- the last at or below them -- and not the
+    /// first in the map. With a single entry each, as every test above has,
+    /// the first and the last are the same entry and either reading passes.
+    #[test]
+    fn a_clone_comes_from_the_entry_that_holds_it_not_the_first_one() {
+        let mut s = Sent::default();
+        s.add(&plain(0, 1000, 4), 0, 4, FIRST_INO + 1);
+        s.add(&plain(0, 2000, 4), 0, 4, FIRST_INO + 2);
+        assert_eq!(s.find(&plain(0, 2000, 4), 0, 4), Some((FIRST_INO + 2, 0)));
+        assert_eq!(s.find(&plain(0, 1000, 4), 0, 4), Some((FIRST_INO + 1, 0)));
+
+        let packed = |pblk| Ext {
+            lblk: 0,
+            pblk,
+            blocks: 4,
+            prealloc: false,
+            z: Some(Zext {
+                algo: Compression::Zstd,
+                disk_blocks: 2,
+                ram_blocks: 4,
+                offset: 0,
+            }),
+        };
+        let mut c = Sent::default();
+        c.add(&packed(700), 0, 4, FIRST_INO + 1);
+        c.add(&packed(800), 0, 4, FIRST_INO + 2);
+        assert_eq!(c.find(&packed(800), 0, 4), Some((FIRST_INO + 2, 0)));
+        assert_eq!(c.find(&packed(700), 0, 4), Some((FIRST_INO + 1, 0)));
+    }
+
     fn plain(lblk: u64, pblk: u64, blocks: u64) -> Ext {
         Ext {
             lblk,
@@ -941,6 +1009,45 @@ mod tests {
         assert_eq!(s.find(&other, 2, 6), None);
         // A plain extent at the same disk block is not that data either.
         assert_eq!(s.find(&plain(0, 700, 8), 0, 8), None);
+    }
+
+    /// The compressed map is keyed by `(disk block, offset)`, so a lookup for
+    /// one disk block can land on an entry of a LOWER one whose offset is
+    /// above the offset asked for. The answer is `None`, since it is other
+    /// data, and getting to that answer must not work out the offset into it:
+    /// `o - start` underflows there. A release build wrapped and threw the
+    /// value away, so the panic showed only with overflow checks on, which is
+    /// what `tests/model.rs` hit as soon as it ran outside `--release`.
+    ///
+    /// The plain map cannot do this: its key is the disk block alone, so
+    /// `range(..=p)` can only hand back a block at or below `p`.
+    #[test]
+    fn a_compressed_extent_of_a_lower_disk_block_is_not_subtracted_from() {
+        let z = Zext {
+            algo: Compression::Zstd,
+            disk_blocks: 2,
+            ram_blocks: 8,
+            offset: 5,
+        };
+        // Sent: blocks 5 onwards of the extent at disk block 700.
+        let e = Ext {
+            lblk: 0,
+            pblk: 700,
+            blocks: 3,
+            prealloc: false,
+            z: Some(z),
+        };
+        let mut s = Sent::default();
+        s.add(&e, 0, 3, FIRST_INO);
+        // Asked for: blocks 0 onwards of the extent at disk block 701.
+        // `(700, 5)` is the greatest key at or below `(701, 0)`, and 5 is
+        // above 0.
+        let other = Ext {
+            pblk: 701,
+            z: Some(Zext { offset: 0, ..z }),
+            ..e
+        };
+        assert_eq!(s.find(&other, 0, 2), None);
     }
 
     // -----------------------------------------------------------------------

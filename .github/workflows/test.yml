@@ -225,6 +225,20 @@ jobs:
           # rows assert what they measure (the fsync row went to the log, the
           # zstd file is compressed) and a row that stops doing so fails here.
           cargo test --release -p eclipsefs --features std --benches
+          # And the two filesystems again in DEBUG, which is the only way
+          # their arithmetic is ever checked: the `--release` lines above turn
+          # overflow checks off, so while those were the only lines, no job
+          # here ran a single `a + b` of theirs with a check on it.
+          # `cow::send::Sent::find` worked out an offset it then threw away,
+          # and the subtraction underflowed: nine of `tests/model.rs`'s twelve
+          # runs panicked under a plain `cargo test` and nothing could see it.
+          # The library and `model` are what caught it (every in-source test,
+          # plus the randomised whole-filesystem run): 4s and 211s unoptimised.
+          # eclipsefs' other integration targets add ~6 minutes on top and
+          # stay in release alone. The btrfs suite is 126s unoptimised, so it
+          # goes in whole.
+          cargo test -p eclipsefs --features std --lib --test model
+          cargo test -p btrfs --features std
           # The SFS the initramfs root lives on. Its suite is in the tree but
           # had never run here: the crate is only reached through `[patch]`,
           # and `--features std` is what gives its tests a file-backed device
