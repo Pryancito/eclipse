@@ -128,7 +128,10 @@ mod signal;
 mod socketcall;
 mod stat;
 mod time64;
-mod tls;
+/// `pub(crate)`, unlike its neighbours: the `clone` of a 32-bit process
+/// installs its child's thread pointer from here, and that lives in
+/// `crate::task`.
+pub(crate) mod tls;
 mod wide;
 
 /// The i386 numbers this kernel answers **itself**, because there is no native
@@ -176,6 +179,7 @@ const I386_SOCKETCALL: u32 = 102;
 /// three members do, a `struct sigaltstack` loses padding rather than bytes,
 /// and `rt_sigreturn` reads a 32-bit frame. See [`signal`].
 use signal::{I386_RT_SIGACTION, I386_RT_SIGRETURN, I386_SIGALTSTACK, I386_SIGRETURN};
+use tls::I386_CLONE;
 
 /// And the `*_time64` calls, the one family where the width of a structure is
 /// a property of the CALL and not of the process. See [`time64`].
@@ -292,6 +296,12 @@ impl Syscall<'_> {
             I386_SIGALTSTACK => {
                 return syscall_ret(self.sys_sigaltstack32(a0.into(), a1.into()));
             }
+            // `clone`, whose last two arguments i386 passes the OTHER way
+            // round from the x86_64 next to it: Linux's `CLONE_BACKWARDS`,
+            // which x86 selects only in 32 bits. See [`tls`].
+            I386_CLONE => {
+                return syscall_ret(self.sys_clone(a0, a1, a2.into(), a3, a4.into()).await);
+            }
             I386_RT_SIGRETURN => return syscall_ret(self.sys_rt_sigreturn()),
             // And the pre-POSIX `sigreturn`, which is a second call and not a
             // flag on the one above: it returns from i386's OTHER frame, the
@@ -405,3 +415,8 @@ mod waitid_tests;
 /// its first member is a union holding a pointer.
 #[cfg(test)]
 mod sigevent_tests;
+
+/// `clone` (120), whose fourth and fifth arguments i386 passes the other way
+/// round --- and whose `tls` is a `struct user_desc *` and not a base.
+#[cfg(test)]
+mod clone_tests;

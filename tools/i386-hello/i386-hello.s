@@ -139,6 +139,8 @@
  *       where EVERY field moves because the first one is half as wide
  *   111 a handler WITHOUT `SA_SIGINFO` could not return: that one needs the
  *       old `struct sigframe_ia32` and `sigreturn` (119), not the `rt_` pair
+ *   112 clone (120) read its last two arguments the x86_64 way round, or
+ *       took its `tls` for a base instead of a `struct user_desc *`
  *
  *   128+e  mmap2 of the two pages of the guard answered errno e
  *   160+e  munmap of just the second page answered errno e
@@ -3565,6 +3567,67 @@ timer64_skipped:
 	cmpl	$1, flag87
 	jne	bad_oldframe
 
+	/* Step 88 (code 112): `clone` (120), whose fourth and fifth arguments
+	 * i386 passes the OTHER way round from x86_64 --- and whose fourth is
+	 * not a thread pointer but a `struct user_desc *`.
+	 *
+	 * Linux has `CONFIG_CLONE_BACKWARDS`, which puts the `tls` before the
+	 * `child_tid`, and x86 selects it **only in 32 bits**: here the fourth
+	 * argument is the tls, and on the x86_64 next door the fifth is. No
+	 * name match can see that, which is why 120 was in neither table.
+	 *
+	 * The pair of calls below is the whole check, and it needs no shared
+	 * memory and no `gettid`: the descriptor goes in one slot and the
+	 * address 1 in the other.
+	 *
+	 *   - the descriptor fourth, rubbish fifth -> a child, because the
+	 *     fifth is the `child_tid` and nothing asked for it;
+	 *   - rubbish fourth, descriptor fifth -> EFAULT, because the fourth
+	 *     is read as sixteen bytes of `user_desc`.
+	 *
+	 * A kernel reading them the x86_64 way answers those two the other way
+	 * round. `tls_desc` is the descriptor step 17 already installed, so its
+	 * `entry_number` names a slot this thread owns --- which this path
+	 * requires: Linux's `set_new_tls` calls `do_set_thread_area` with
+	 * `can_allocate = 0`, so a `-1` here is EINVAL. */
+	movl	$120, %eax
+	movl	$0x00080011, %ebx	/* CLONE_SETTLS | SIGCHLD */
+	xorl	%ecx, %ecx		/* newsp: this stack, as a fork */
+	xorl	%edx, %edx		/* parent_tid: none */
+	movl	$tls_desc, %esi		/* fourth: the tls, a user_desc */
+	movl	$1, %edi		/* fifth: child_tid, unasked for */
+	int	$0x80
+	testl	%eax, %eax
+	jz	clone_child		/* the child: say nothing, exit 0 */
+	js	bad_clone		/* the parent: a refusal is the bug */
+
+	/* And the child really ran and really exited 0: waitpid(pid, &st, 0).
+	 * A kernel that answered a pid without making a child hangs here or
+	 * answers ECHILD, and either way does not reach the next step. */
+	movl	%eax, %ebx
+	movl	$7, %eax		/* waitpid */
+	movl	$clonest, %ecx
+	xorl	%edx, %edx
+	int	$0x80
+	testl	%eax, %eax
+	js	bad_clone
+	cmpl	$0, clonest
+	jne	bad_clone
+
+	/* The mirror: the descriptor in the FIFTH argument, where a kernel
+	 * with the x86_64 order would read it and succeed. */
+	movl	$120, %eax
+	movl	$0x00080011, %ebx
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	movl	$1, %esi		/* fourth: read as a user_desc -> EFAULT */
+	movl	$tls_desc, %edi
+	int	$0x80
+	testl	%eax, %eax
+	jz	clone_child		/* a child here is the bug, and it exits */
+	cmpl	$-14, %eax		/* EFAULT */
+	jne	bad_clone
+
 	/* Step 61: `execve` from a 32-bit process, which is what a 32-bit
 	 * program needs to start any program at all --- a shell, `xargs`, the
 	 * second half of a pipeline. Its `argv` and `envp` are arrays of
@@ -3925,6 +3988,15 @@ oldrest:
 	movl	$119, %eax		/* sigreturn */
 	int	$0x80
 
+clone_child:
+	/* The child of step 88, whichever call made it: exit 0 and let the
+	 * parent's `waitpid` be the one that reports. */
+	movl	$1, %eax
+	xorl	%ebx, %ebx
+	int	$0x80
+bad_clone:
+	movl	$112, %ebx
+	jmp	die
 bad_oldframe:
 	movl	$111, %ebx
 	jmp	die
@@ -4327,6 +4399,9 @@ act87:
 	.long	0, 0
 flag87:
 	.long	0
+	/* Where step 88's `waitpid` leaves the child's status. */
+clonest:
+	.long	0xffffffff
 
 spad86:
 	.long	0

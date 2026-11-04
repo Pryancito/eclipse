@@ -817,7 +817,7 @@ impl Syscall<'_> {
             new_ctx.set_field(UserContextField::StackPointer, newsp);
         }
         if newtls != 0 {
-            new_ctx.set_field(UserContextField::ThreadPointer, newtls);
+            self.set_child_thread_pointer(&mut new_ctx, newtls)?;
         }
         new_ctx.set_field(UserContextField::ReturnValue, 0);
         // A FreeBSD child returns 0 in %rax, 1 in %rdx and a clear carry flag
@@ -1122,6 +1122,32 @@ impl Syscall<'_> {
     /// context, honour the TID bookkeeping flags, and start it.
     ///
     /// Split out so that every `?` in it is a failure the caller can undo --
+    /// Give the child the thread pointer its ABI means by `newtls`.
+    ///
+    /// For a native process that word **is** the thread pointer, and this is
+    /// the `set_field` it always was. For a **32-bit** one it is a pointer to
+    /// a `struct user_desc`, because i386 keeps its thread pointer in a
+    /// segment base and not in an MSR: the sixteen bytes have to be read and
+    /// turned into a descriptor in the child's own slots. Writing the word
+    /// itself there would give the thread a `%gs` base of whatever address
+    /// the descriptor happened to live at.
+    ///
+    /// Linux draws the same line in the same place: `copy_thread` calls the
+    /// architecture's `set_new_tls`, which for a 32-bit task is
+    /// `do_set_thread_area`. See [`crate::compat32::tls`].
+    fn set_child_thread_pointer(
+        &self,
+        new_ctx: &mut kernel_hal::context::UserContext,
+        newtls: usize,
+    ) -> LxResult<()> {
+        #[cfg(target_arch = "x86_64")]
+        if self.linux_process().abi().is_32bit() {
+            return crate::compat32::tls::install_child_compat_tls(new_ctx, newtls);
+        }
+        new_ctx.set_field(UserContextField::ThreadPointer, newtls);
+        Ok(())
+    }
+
     /// see there for what a created-but-never-started thread costs.
     #[allow(clippy::too_many_arguments)]
     fn clone_start(
@@ -1138,7 +1164,7 @@ impl Syscall<'_> {
         let mut new_ctx = self.thread.context_cloned()?;
         new_ctx.set_field(UserContextField::StackPointer, newsp);
         if clone_flags.contains(CloneFlags::SETTLS) {
-            new_ctx.set_field(UserContextField::ThreadPointer, newtls);
+            self.set_child_thread_pointer(&mut new_ctx, newtls)?;
         }
         new_ctx.set_field(UserContextField::ReturnValue, 0);
         // A FreeBSD child returns 0 in %rax, 1 in %rdx and a clear carry flag
