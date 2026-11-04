@@ -1760,8 +1760,10 @@ fn look_rootfs(tag: &str) -> std::path::PathBuf {
     write_eclipse_look(&dir);
     write_theme(&dir);
     write_foot_config(&dir);
-    // The two imported labwc themes and the palettes for their looks; the
-    // table below holds them too, so without this half of it is missing.
+    // The instrument look and the two imported labwc themes, with the
+    // palettes for their looks; the table below holds them too, so without
+    // these half of it is missing.
+    super::tecno::install(&dir);
     super::upstream::install(&dir);
     write_labwc_rc(&dir);
     write_labwc_menu(&dir);
@@ -1780,6 +1782,7 @@ const LOOKS: &[(&str, &str, &str)] = &[
     ("kde", "Breeze-Dark", "background=232629"),
     ("eclipse", "Eclipse-Dark", "background=120f1c"),
     ("gnome", "labAdwaita-dark-xbm", "background=1d1d1d"),
+    ("tecno", "Tecno-Dark", "background=060b12"),
 ];
 
 /// `xml` with its comments taken out. rc.xml's comments name the very

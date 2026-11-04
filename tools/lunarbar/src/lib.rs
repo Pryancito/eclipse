@@ -42,6 +42,7 @@ pub mod icons;
 pub mod keys;
 pub mod list;
 pub mod look;
+pub mod meter;
 pub mod obmenu;
 pub mod open;
 pub mod par;

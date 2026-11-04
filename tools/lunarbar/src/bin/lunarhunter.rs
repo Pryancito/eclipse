@@ -155,6 +155,23 @@ const PAL_ECLIPSE: Palette = Palette {
     border: (0x27, 0x5a, 0x9e),
 };
 
+/// Eclipse `tecno`: the instrument-panel look. Same cold family as
+/// `PAL_ECLIPSE`, ground pushed nearly to black and the accent moved to a
+/// signal cyan, so it matches the panel the user switched with it.
+const PAL_TECNO: Palette = Palette {
+    bg: (0x05, 0x0d, 0x13),
+    rail: (0x03, 0x08, 0x0d),
+    field: (0x08, 0x16, 0x1d),
+    text: (0xdf, 0xf4, 0xf7),
+    // Secondary text, not decoration: 6.8:1 on the panel ground.
+    dim: (0x7f, 0x9c, 0xa5),
+    accent: (0x3a, 0xd7, 0xe8),
+    sel: (0x10, 0x28, 0x33),
+    sel_text: (0xdf, 0xf4, 0xf7),
+    on_accent: (0x04, 0x0a, 0x0e),
+    border: (0x1d, 0x5e, 0x6e),
+};
+
 const PAL_WIN11: Palette = Palette {
     bg: (0x20, 0x20, 0x20),
     rail: (0x1a, 0x1a, 0x1a),
@@ -173,6 +190,7 @@ fn palette(look: Look) -> &'static Palette {
         Look::Win11 => &PAL_WIN11,
         Look::Kde => &PAL_KDE,
         Look::Eclipse => &PAL_ECLIPSE,
+        Look::Tecno => &PAL_TECNO,
     }
 }
 

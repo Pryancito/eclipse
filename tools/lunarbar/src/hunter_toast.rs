@@ -209,7 +209,7 @@ fn draw(
         } else {
             pal().menu_panel
         };
-        cv.round_rect_a(x, y, w, MORE_H, 8, bg, 0.95);
+        plate_a(cv, x, y, w, MORE_H, 8, bg, 0.95);
         cv.text(&label, x + 12, y + (MORE_H - GLYPH_H) / 2, pal().muted);
         hits.push((x, y, x + w, y + MORE_H, Hit::More));
         y += MORE_H + GAP;
@@ -219,8 +219,8 @@ fn draw(
         let h = card_h(toast);
         let col = sev_color(a.severity);
         draw_panel(cv, x0, y, W, h, 10);
-        cv.round_rect_a(x0, y, W, h, 10, pal().rule, 0.35);
-        cv.round_rect_a(x0 + 1, y + 1, W - 2, h - 2, 9, pal().menu_panel, 1.0);
+        plate_a(cv, x0, y, W, h, 10, pal().rule, 0.35);
+        plate_a(cv, x0 + 1, y + 1, W - 2, h - 2, 9, pal().menu_panel, 1.0);
         // The severity as a stripe down the left edge.
         cv.round_rect(x0 + 1, y + 8, 3, h - 16, 1, col);
 
@@ -236,7 +236,7 @@ fn draw(
         // The close cross.
         let (cx, cy) = (x0 + W - PAD - CLOSE + 4, ty - 2);
         if hover == Some(Hit::Close(i)) {
-            cv.round_rect(cx, cy, CLOSE, CLOSE, 4, pal().pill_hover);
+            plate(cv, cx, cy, CLOSE, CLOSE, 4, pal().pill_hover);
         }
         cv.text(
             "x",
@@ -263,13 +263,14 @@ fn draw(
                 bx -= bw;
                 let hot = hover == Some(Hit::Action(i, j));
                 let (bg, fg) = match (j, hot) {
-                    (0, _) => (col, pal().white),
+                    // The primary action is filled with the severity colour.
+                    (0, _) => (col, pal().on_accent),
                     (_, true) => (pal().pill_hover, pal().text),
                     _ => (pal().pill, pal().text),
                 };
-                cv.round_rect(bx, by, bw, BTN_H, 6, bg);
+                plate(cv, bx, by, bw, BTN_H, 6, bg);
                 if j == 0 && hot {
-                    cv.round_rect_a(bx, by, bw, BTN_H, 6, pal().white, 0.15);
+                    plate_a(cv, bx, by, bw, BTN_H, 6, pal().white, 0.15);
                 }
                 cv.text(&label, bx + 10, by + (BTN_H - GLYPH_H) / 2, fg);
                 hits.push((bx, by, bx + bw, by + BTN_H, Hit::Action(i, j)));
