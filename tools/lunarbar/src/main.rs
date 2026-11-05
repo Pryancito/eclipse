@@ -2501,7 +2501,7 @@ fn draw_task(
             rx -= pw_w;
             let pill = if hover == Hover::Power { pal().pill_hover } else { pal().pill };
             plate(cv, rx, btn_y, pw_w, btn_h, 6, pill);
-            cv.power_icon(rx + (pw_w - pw_size) / 2, btn_y + (btn_h - pw_size) / 2, pw_size, pal().white);
+            cv.power_icon(rx + (pw_w - pw_size) / 2, btn_y + (btn_h - pw_size) / 2, pw_size, if tecno() { pal().warn } else { pal().white });
             power_hit = (rx, rx + pw_w);
             rx -= 10;
         }
@@ -2617,8 +2617,9 @@ fn draw_task(
         0
     };
     let launcher_hit = (lx, lx + launcher_w);
-    if hover == Hover::Launcher {
-        plate_a(cv, lx + 2, btn_y, launcher_w - 4, btn_h, 6, pal().menu_hover, 0.45);
+    if tecno() || hover == Hover::Launcher {
+        let c = if hover == Hover::Launcher { pal().menu_hover } else { pal().pill };
+        if tecno() { plate(cv, lx + 2, btn_y, launcher_w - 4, btn_h, 6, c) } else { plate_a(cv, lx + 2, btn_y, launcher_w - 4, btn_h, 6, c, 0.45) }
     }
     cv.disc_half(lx + 10, ly, d, pal().accent);
 
@@ -2841,7 +2842,7 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> 
         plate_a(cv, 2, btn_y, launcher_hit.1 - 4, btn_h, 6, pal().menu_hover, 0.45);
     }
     cv.crescent(10, ly, d, pal().accent);
-    lx += cv.text_bold(&wordmark, lx, ty, pal().text);
+    lx += cv.text_bold(&wordmark, lx, ty, if tecno() { pal().accent } else { pal().text });
 
     if let Some(up) = &m.uptime {
         lx += 12;
@@ -2868,17 +2869,17 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> 
             rx -= pw_w;
             let pill = if hover == Hover::Power { pal().pill_hover } else { pal().pill };
             plate(cv, rx, btn_y, pw_w, btn_h, 6, pill);
-            cv.power_icon(rx + (pw_w - pw_size) / 2, btn_y + (btn_h - pw_size) / 2, pw_size, pal().white);
+            cv.power_icon(rx + (pw_w - pw_size) / 2, btn_y + (btn_h - pw_size) / 2, pw_size, if tecno() { pal().warn } else { pal().white });
             power_hit = (rx, rx + pw_w);
             rx -= 10;
         }
 
-        let pw = Canvas::text_width(&m.date) + 20;
+        let pw = Canvas::text_width(&cap(&m.date)) + 20;
         if rx - pw >= min_x {
             rx -= pw;
             let pill = if hover == Hover::Clock { pal().pill_hover } else { pal().pill };
             plate(cv, rx, btn_y, pw, btn_h, 6, pill);
-            cv.text_bold(&m.date, rx + 10, ty, pal().text);
+            cv.text_bold(&cap(&m.date), rx + 10, ty, pal().text);
             clock_hit = (rx, rx + pw);
             rx -= 10;
         }

@@ -58,10 +58,16 @@ fn write_theme(rootfs: &Path) {
           window.inactive.title.bg.color: #060b14\n\
           window.active.label.text.color: #e6f1ff\n\
           window.inactive.label.text.color: #8aa4c2\n\
-          window.active.button.unpressed.image.color: #e6f1ff\n\
+          window.active.button.unpressed.image.color: #8aa4c2\n\
           window.active.button.pressed.image.color: #f2c14e\n\
-          window.active.button.hover.image.color: #f5f9ff\n\
-          window.inactive.button.unpressed.image.color: #8aa4c2\n\
+          window.active.button.hover.image.color: #38e1ff\n\
+          window.inactive.button.unpressed.image.color: #3a5878\n\
+          # Close is the one button in the warn colour, as in the mockup.\n\
+          window.active.button.close.unpressed.image.color: #ff8a5c\n\
+          window.active.button.close.hover.image.color: #ffab88\n\
+          window.inactive.button.close.unpressed.image.color: #3a5878\n\
+          # Titles left-aligned, like an instrument readout.\n\
+          window.label.text.justify: Left\n\
           \n\
           menu.title.bg.color: #0a1423\n\
           menu.title.text.color: #38e1ff\n\
@@ -86,7 +92,22 @@ fn write_theme(rootfs: &Path) {
           window.inactive.shadow.color: #000000 30\n",
     )
     .unwrap();
+    // The buttons: square frames with the glyph inside, as XBM so they need
+    // no librsvg (see `upstream.rs`) and take their colour from the keys
+    // above. 16x16, drawn 1:1 by labwc and centred in its 26px button.
+    for (name, bits) in BUTTONS {
+        fs::write(dir.join(name), bits).unwrap();
+    }
 }
+
+/// The window buttons of the "Orbital HUD" mockup: a 1px square with the
+/// glyph inside it. Generated once and vendored under `xtask/assets`.
+const BUTTONS: &[(&str, &[u8])] = &[
+    ("close.xbm", include_bytes!("../../../assets/tecno-buttons/close.xbm")),
+    ("iconify.xbm", include_bytes!("../../../assets/tecno-buttons/iconify.xbm")),
+    ("max.xbm", include_bytes!("../../../assets/tecno-buttons/max.xbm")),
+    ("max_toggled.xbm", include_bytes!("../../../assets/tecno-buttons/max_toggled.xbm")),
+];
 
 /// `foot.tecno.ini`, which `eclipse-look` copies over `foot.ini` when the
 /// look is switched. A terminal left in the previous look's palette is the
@@ -160,6 +181,28 @@ mod tests {
         assert!(rc.contains("window.active.title.bg.color: #0a1423"));
         assert!(rc.contains("window.inactive.title.bg.color: #060b14"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// labwc reads `<button>.xbm` beside the themerc. Each one has to be a
+    /// real 16x16 XBM with its frame drawn: a missing or empty file falls
+    /// back to labwc's built-in glyph and the frames silently disappear.
+    #[test]
+    fn the_window_buttons_are_framed_xbm_glyphs() {
+        let root = rootfs("buttons");
+        write_theme(&root);
+        let dir = root.join("usr/share/themes/Tecno-Dark/openbox-3");
+        for name in ["close", "iconify", "max", "max_toggled"] {
+            let xbm = fs::read_to_string(dir.join(format!("{name}.xbm"))).unwrap();
+            assert!(xbm.contains(&format!("#define {name}_width 16")), "{name}");
+            assert!(xbm.contains(&format!("#define {name}_height 16")), "{name}");
+            // The first two bytes are the top row of the frame: all set.
+            let first = xbm.split('{').nth(1).unwrap();
+            assert!(first.trim_start().starts_with("0xff, 0xff"), "{name} has no frame");
+        }
+        let rc = fs::read_to_string(dir.join("themerc")).unwrap();
+        assert!(rc.contains("window.active.button.close.unpressed.image.color: #ff8a5c"));
+        assert!(rc.contains("window.label.text.justify: Left"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A colour written `#10 28 33` is three tokens to openbox and not one

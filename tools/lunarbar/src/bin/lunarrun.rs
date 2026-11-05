@@ -795,12 +795,17 @@ fn draw_overlay(
     let ty = fy + (FIELD_H - GLYPH_H) / 2;
     // A ">" prompt instead of a magnifier: the font is a bitmap ISO-8859-1
     // face with no icon glyphs, and a hand-drawn lens at 15px reads as dirt.
-    cv.text_bold(">", fx + 10, ty, p.accent);
-    let tx = fx + 10 + 2 * GLYPH_W;
+    // tecno: the mockup's shell prompt `>_` and the shortcut flush right.
+    cv.text_bold(if hud { ">_" } else { ">" }, fx + 10, ty, p.accent);
+    let tx = fx + 10 + if hud { 3 } else { 2 } * GLYPH_W;
+    let key_w = if hud { Canvas::text_width(st.lang.run_key()) + 12 } else { 0 };
+    if hud {
+        cv.text(st.lang.run_key(), fx + fw - key_w + 2, ty, p.dim);
+    }
     if st.filter.is_empty() {
         cv.text(st.lang.run_hint(), tx, ty, p.dim);
     } else {
-        let max_chars = ((fw - 20 - 2 * GLYPH_W) / GLYPH_W).max(1) as usize;
+        let max_chars = ((fw - 20 - (tx - fx - 10) - key_w) / GLYPH_W).max(1) as usize;
         let shown_text: String = if st.filter.chars().count() > max_chars {
             st.filter
                 .chars()
@@ -852,6 +857,15 @@ fn draw_overlay(
             None => {
                 let ch = it.name.chars().next().unwrap_or('?');
                 cv.badge(ix, iy, ICON, ch, p.field, p.accent);
+                if hud {
+                    // The mockup's framed glyph box: a square well, hairline edge.
+                    cv.fill_rect_a(ix, iy, ICON, ICON, p.field, 1.0);
+                    for (x, y, w, h) in [(ix, iy, ICON, 1), (ix, iy + ICON - 1, ICON, 1), (ix, iy, 1, ICON), (ix + ICON - 1, iy, 1, ICON)] {
+                        cv.fill_rect_a(x, y, w, h, p.border, 1.0);
+                    }
+                    let up: String = ch.to_uppercase().take(1).collect();
+                    cv.text_bold(&up, ix + (ICON - GLYPH_W) / 2 + 1, iy + (ICON - GLYPH_H) / 2, p.accent);
+                }
             }
         }
         let text_x = ix + ICON + 10;

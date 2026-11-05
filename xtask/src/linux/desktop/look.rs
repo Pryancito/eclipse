@@ -104,6 +104,14 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           \x20       -e \"s|<name>labAdwaita-dark</name>|<name>$theme</name>|\" \\\n\
           \x20       -e \"s|<name>Tecno-Dark</name>|<name>$theme</name>|\" \\\n\
           \x20       \"$RC\" > \"$RC.new\" 2>/dev/null && mv \"$RC.new\" \"$RC\"\n\
+          # Titlebar, menu and OSD face: tecno is a monospace readout, every\n\
+          # other look the proportional DejaVu. Mono first, so Sans -> Mono\n\
+          # cannot be matched a second time.\n\
+          \x20   face=\"DejaVu Sans\"\n\
+          \x20   [ \"$look\" = tecno ] && face=\"DejaVu Sans Mono\"\n\
+          \x20   sed -e \"s|<name>DejaVu Sans Mono</name>|<name>$face</name>|\" \\\n\
+          \x20       -e \"s|<name>DejaVu Sans</name>|<name>$face</name>|\" \\\n\
+          \x20       \"$RC\" > \"$RC.new\" 2>/dev/null && mv \"$RC.new\" \"$RC\"\n\
           \x20 fi\n\
           # foot palette for new terminals (a running foot keeps its colours).\n\
           \x20 src=\"$CFG/foot/foot.$look.ini\"\n\
