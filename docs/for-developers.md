@@ -1,145 +1,188 @@
-﻿# 开发者注意事项（草案）
+# Notas para desarrolladores (borrador)
 
-本文用于同步开发 zCore 的一些策略选择并提醒开发者某些需要注意的信息。
+**Español** · [English](for-developers.en.md)
 
-> 本文暂时是一份草案，欢迎在相关微信群或 github [讨论区](https://github.com/rcore-os/zCore/discussions/356)发表对形式和内容的意见
+> Traducido del chino desde las notas del zCore original (rCore-OS). Se han
+> puesto al día la versión de la cadena de herramientas y la lista de
+> submódulos; la lista de características inestables es la de entonces.
 
-## 目录
+Este documento sirve para compartir algunas decisiones de desarrollo y avisar
+de cosas que hay que tener en cuenta.
 
-- [工具链支持策略](#工具链支持策略)
-  >
-  > - 确定跟踪工具链的时间点
-  > - 汇总使用到的不稳定特性，以及使用的原因
-  >
-- [代码质量保障](#代码质量保障)
-  > 介绍如何使用 `#[deny(...)]` 和 `#[allow(...)]`
-- [依赖管理策略](#依赖管理策略)
-  > 介绍何时应以何种方式引入依赖项
-- [features and cfg](#features-and-cfg)
-  > 介绍如何使用编译条件
+## Índice
 
-## 工具链支持策略
+- [Política de la cadena de herramientas](#política-de-la-cadena-de-herramientas)
+  > - Cuándo se actualiza la cadena de herramientas que se sigue
+  > - Qué características inestables se usan y por qué
+- [Calidad del código](#calidad-del-código)
+  > Cómo usar `#[deny(...)]` y `#[allow(...)]`
+- [Política de dependencias](#política-de-dependencias)
+  > Cuándo y cómo añadir una dependencia
+- [features y cfg](#features-y-cfg)
+  > Cómo usar la compilación condicional
 
-由于[下文](#使用的不稳定特性)详述的具体原因，本项目依赖一些不稳定特性，只能使用 nightly 工具链编译。仓库将测试可用的工具链记录在 cargo 可识别的[工具链配置文件](../rust-toolchain.toml)，使用 cargo 构建项目时会自动安装可靠的工具链。
+## Política de la cadena de herramientas
 
-仓库使用的工具链虽然是 nightly 的，但将伴随 stable 工具链的版本更新而更新。每当 stable 工具链更新，就将默认工具链更新到最接近最新 stable 的版本，周期约为 6 周。参考[版本信息网站](https://forge.rust-lang.org/)记录的最新稳定版分叉发生时间，使用对应的 nightly 即可。
+Por los motivos concretos que se detallan [más abajo](#características-inestables-que-se-usan),
+el proyecto depende de algunas características inestables y solo compila con
+una cadena nightly. El repositorio guarda la cadena probada en un
+[fichero de configuración de toolchain](../rust-toolchain.toml) que cargo
+entiende, así que al compilar con cargo se instala sola la cadena buena. Hoy
+está fijada a `nightly-2026-09-01`.
 
-下一次更新的版本为 1.64（2022-08-05），进行更新的日期为 2022 年 9 月 22 日。
+Aunque la cadena es nightly, se actualiza siguiendo a la estable: cada vez que
+sale una estable nueva, la cadena por defecto pasa a la nightly más cercana a
+esa estable, más o menos cada 6 semanas. Basta con mirar en la
+[web de versiones](https://forge.rust-lang.org/) cuándo se bifurcó la última
+estable y usar la nightly de esa fecha.
 
-> 本文档记录的预期更新时间将随着每次工具链更新而更新。
-
-### 使用的不稳定特性
+### Características inestables que se usan
 
 #### [`doc_cfg`](https://doc.rust-lang.org/unstable-book/language-features/doc-cfg.html)
 
-用到的模块：`zcore-drivers`、`kernel-hal`、`zcore-loader`
+Módulos: `zcore-drivers`, `kernel-hal`, `zcore-loader`
 
-用于在文档上标记对象可使用的平台信息。
+Marca en la documentación en qué plataformas está disponible cada elemento.
 
-标注有助于提升文档质量，但不影响使用，必要时可去除。
+Mejora la documentación pero no afecta al uso; se puede quitar si hace falta.
 
 #### [`naked_functions`](https://doc.rust-lang.org/unstable-book/language-features/naked-functions.html), [`asm_sym`](https://doc.rust-lang.org/unstable-book/language-features/asm-sym.html), [`asm_const`](https://doc.rust-lang.org/unstable-book/language-features/asm-const.html)
 
-用到的模块：`zcore`
+Módulo: `zcore`
 
-这三项用于支撑一个 rust 裸函数。裸函数不会自动插入栈操作，因此可用于设置栈之前的阶段。配合用于向内联汇编导入 rust 常量的 `asm_const` 和向内联汇编导入 rust 符号的 `asm_sym`，可以将整个启动阶段尽量置于 rust 的保护之下（避免硬编码常量或导出全局符号）。
+Las tres sirven para escribir una función desnuda en Rust. Una función desnuda
+no inserta operaciones de pila, así que se puede usar antes de preparar la
+pila. Junto con `asm_const`, que mete constantes de Rust en el ensamblador en
+línea, y `asm_sym`, que mete símbolos de Rust, permite dejar casi toda la fase
+de arranque bajo la protección de Rust (sin constantes escritas a mano ni
+símbolos globales exportados).
 
-可以移除，但不建议。
+Se puede quitar, pero no se recomienda.
 
 #### [`default_alloc_error_handler`](https://doc.rust-lang.org/unstable-book/language-features/default-alloc-error-handler.html)
 
-用到的模块：`zcore`
+Módulo: `zcore`
 
-要求 `alloc` 提供一个默认的分配失败回调。
+Pide a `alloc` un callback por defecto para los fallos de asignación.
 
-只要同时使用 `no_std` 和 `alloc` 就必然需要分配失败回调，可选默认的或通过另一个不稳定特性 [`alloc-error-handler`](https://doc.rust-lang.org/unstable-book/language-features/alloc-error-handler.html) 提供一个自定义的。
+En cuanto se usan `no_std` y `alloc` a la vez hace falta un callback de fallo
+de asignación: o el de por defecto o uno propio mediante otra característica
+inestable, [`alloc-error-handler`](https://doc.rust-lang.org/unstable-book/language-features/alloc-error-handler.html).
 
-## 代码质量保障
+## Calidad del código
 
-代码质量主要依赖 **clippy** 来保障。因此，需要创造利于 clippy 运行的环境，这包括三个部分：
+La calidad del código se apoya sobre todo en **clippy**, así que hay que
+preparar un entorno en el que clippy se ejecute con facilidad. Tiene tres
+partes:
 
-1. rust-analyzer 绑定
+1. Integración con rust-analyzer
 
-   如果使用 vs code 开发，rust-analyzer 支持 checkOnSave 功能，即保存时自动检查（得益于现代编译器的效率，这是可能的）。如果配合自动保存功能，可实现随时检查，只要将检查方式默认为 clippy，即可随时 clippy。
+   Si desarrollas con VS Code, rust-analyzer tiene la opción checkOnSave, que
+   comprueba al guardar (con lo rápidos que son los compiladores de hoy, es
+   viable). Con el guardado automático, se comprueba todo el rato; basta con
+   poner clippy como comprobación por defecto.
 
-   当然 clippy 运行比较慢，如果电脑性能不适应，只好关掉。
+   Claro que clippy es lento; si tu equipo no da para tanto, desactívalo.
 
 2. `#![deny(warnings)]`
 
-   这个选项将当前模块（当然也包括子模块）产生的警告视为错误，这会禁止产生警告的代码完成编译，有助于及早解决问题。clippy 也将产生警告，这些警告也被视作错误。
+   Esta opción trata como errores los avisos del módulo actual (y de sus
+   submódulos), lo que impide compilar código con avisos y ayuda a resolver
+   los problemas pronto. clippy también genera avisos, que igualmente cuentan
+   como errores.
 
-   目前，所有模块都添加了这个选项（有些还禁止了别的东西，unsafe_code 及 missing_docs 等，这不在我们的讨论范围内），且处在可通过编译的状态。开发时为了方便当然可以注释掉它们，但如果发布 PR，务必恢复这些选项。
+   Hoy todos los módulos tienen esta opción (algunos prohíben más cosas, como
+   unsafe_code o missing_docs, que no tratamos aquí) y compilan. Mientras
+   desarrollas puedes comentarla por comodidad, pero antes de abrir un PR
+   vuelve a ponerla.
 
-3. github actions
+3. GitHub Actions
 
-使用 clippy 检查代码已经写入 github 工作流，每次提交都会自动执行。这可以向其他开发者证明你的代码质量受到保障。可以在本地使用 `cargo check-style` 命令检查代码的合规性，其流程和使用 clippy 的方式与 github 工作流保持一致。
+   La comprobación con clippy está en el flujo de trabajo de GitHub y se
+   ejecuta en cada commit, lo que demuestra a los demás que la calidad de tu
+   código está cubierta. En local puedes comprobarlo con `cargo check-style`,
+   que sigue el mismo proceso y usa clippy igual que el flujo de GitHub.
 
-## 依赖管理策略
+## Política de dependencias
 
-依赖从特殊到一般，分为以下 4 种形式：
+De más particular a más general, las dependencias toman estas 4 formas:
 
-1. [git 子模块](#git-子模块)
-2. [个人仓库中基于 cargo 的项目](#个人仓库中基于-cargo-的项目)
-3. [组织仓库中基于 cargo 的项目](#组织仓库中基于-cargo-的项目)
-4. [发布到 crates.io 上的 crate](#发布到-cratesio-上的-crate)
+1. [Submódulos de git](#submódulos-de-git)
+2. [Proyectos cargo en repositorios personales](#proyectos-cargo-en-repositorios-personales)
+3. [Proyectos cargo en repositorios de una organización](#proyectos-cargo-en-repositorios-de-una-organización)
+4. [Crates publicados en crates.io](#crates-publicados-en-cratesio)
 
-### git 子模块
+### Submódulos de git
 
-最特殊的依赖方式，对于那些不使用 cargo（由于不是 rust 编写）的项目不得不如此。
+La forma más particular; es obligada para los proyectos que no usan cargo
+(porque no están escritos en Rust).
 
-目前使用此方式依赖的项目包括：
+Hoy dependen así:
 
 - libc-test
 
-  musl libc 的测例。使用 c 语言实现。
+  Los tests de musl libc, escritos en C.
 
 - tests
 
-  测试框架。主要使用 python。
+  El framework de tests, sobre todo en Python.
 
-- rboot
+- nvidia-rm-sys/vendor/open-gpu-kernel-modules
 
-  uefi 引导程序，使用 rust 实现。作为子模块是一个遗留问题，未来会解决。
+  Los módulos de kernel abiertos de NVIDIA, de donde sale el RM.
 
-### 个人仓库中基于 cargo 的项目
+(`rboot`, el cargador UEFI, era un submódulo y hoy vive dentro del
+repositorio.)
 
-比较特殊的依赖方式，当且仅当一个项目具有下列情况之一：
+### Proyectos cargo en repositorios personales
 
-- 属于实验性质，不稳定甚至可能放弃；
-- 稳定，但不适合发布到 crates.io，也没有组织愿意收录；
-- 从组织项目分叉，已提交 PR 但尚未采纳；
-- 从组织项目分叉，且出于充分的理由决定永久分叉，成为一个独立的项目；
+Una forma bastante particular. Un proyecto puede depender directamente de un
+proyecto personal si y solo si se da alguno de estos casos:
 
-可以直接从个人项目中直接依赖。
+- es experimental, inestable o incluso puede abandonarse;
+- es estable, pero no encaja en crates.io y ninguna organización quiere
+  acogerlo;
+- es un fork de un proyecto de una organización con un PR enviado pero aún no
+  aceptado;
+- es un fork de un proyecto de una organización que, por buenos motivos, se
+  ha decidido mantener separado para siempre como proyecto independiente.
 
-如有可能，上述情况应当积极解决。
+Si es posible, estos casos hay que resolverlos activamente.
 
-必须锁定提交哈希。
+Hay que fijar el hash del commit.
 
-### 组织仓库中基于 cargo 的项目
+### Proyectos cargo en repositorios de una organización
 
-正常的依赖方式，但若有可能，尽量发布到 crates.io。
+La forma normal, aunque si es posible es mejor publicarlos en crates.io.
 
-必须锁定提交哈希。
+Hay que fijar el hash del commit.
 
-### 发布到 crates.io 上的 crate
+### Crates publicados en crates.io
 
-正常的依赖方式，可以随意使用。
+La forma normal; se pueden usar sin más.
 
-尽量跟踪最新版本。对于无法跟踪的依赖，应记录理由。
+Intenta seguir la última versión. Si una dependencia no se puede seguir, deja
+anotado el motivo.
 
-## features and cfg
+## features y cfg
 
-zCore 支持多种平台的不同硬件，难以避免使用编译选项。但是不当使用编译选项，可能导致混乱，或者干扰测试的覆盖性。因此，建议遵从如下标准设置 `#[cfg(...)]`：
+zCore admite hardware distinto en varias plataformas, así que es difícil no
+usar opciones de compilación. Pero usarlas mal puede traer confusión o reducir
+la cobertura de los tests. Por eso se recomienda seguir estas reglas al poner
+`#[cfg(...)]`:
 
-1. 仅与由平台决定的，设置 target_arch；
-2. 受到其他因素影响的，考虑通过设备树等方式动态决定；
-3. 无法动态决定的，可以设置 feature，但应在所在项目的入口（lib.rs 或 main.rs）注明设置 feature 的原因；
-4. 平台相关的 feature，应增加如下的约束，而不是使用 `all(target_arch = ..., feature = ...)`：
+1. Lo que depende solo de la plataforma usa target_arch;
+2. lo que depende de otros factores, mejor decidirlo en tiempo de ejecución,
+   por ejemplo con el device tree;
+3. lo que no se puede decidir en tiempo de ejecución puede usar una feature,
+   pero hay que explicar el motivo en el punto de entrada del proyecto
+   (lib.rs o main.rs);
+4. una feature ligada a una plataforma debe llevar una restricción como esta,
+   en vez de usar `all(target_arch = ..., feature = ...)`:
 
    ```rust
    #[cfg(all(feature = "sbi", not(target_arch = "riscv64")))]
    compile_error!("`sbi` is only available on RISC-V platforms");
    ```
 
-> 现有代码不完全满足以上标准，将逐步改正
+> El código actual no cumple del todo estas reglas; se irá corrigiendo.

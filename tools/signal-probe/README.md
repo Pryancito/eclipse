@@ -1,5 +1,7 @@
 # signal-probe
 
+**Español** · [English](README.en.md)
+
 Sonda de **integridad** de la entrega de señales de Eclipse OS: si una señal
 devuelve el programa a donde estaba, como estaba. Un binario estatico de musl,
 sin dependencias, que se copia al rootfs y se corre desde la shell.

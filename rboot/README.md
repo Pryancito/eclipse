@@ -1,6 +1,8 @@
 # rBoot
 
-The x86_64 UEFI bootloader for rCore / zCore OS.
+**English** · [Español](README.es.md)
+
+The x86_64 UEFI bootloader for Eclipse OS (inherited from rCore / zCore).
 
 ## Build
 
@@ -27,3 +29,4 @@ Edit `rboot.conf` to configure the bootloader. See [`example-kernel/rboot.conf`]
 - `resolution` - graphic output resolution (e.g. `1024x768`)
 - `initramfs` - path to the initial ramdisk image
 - `cmdline` - kernel command line
+- `measure` - what to hash for measured boot: `kernel` (default), `all` or `off` (see [hunter's boot integrity](../docs/hunter-security.md#boot-integrity-measured-boot))

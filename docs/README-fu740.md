@@ -1,40 +1,52 @@
-# zCore on riscv64 for fu740
+# zCore en riscv64: placa SiFive fu740
 
-### 编译zCore for fu740系统镜像
+**Español** · [English](README-fu740.en.md)
 
-先在源码根目录下编译 riscv64 的文件系统。
+> Notas heredadas del zCore original (rCore-OS), traducidas del chino. La
+> placa se sigue compilando con `PLATFORM=fu740` en `zCore/Makefile`, pero no
+> se ha vuelto a probar en Eclipse.
 
-然后进入子目录 zCore 编译内核,会生成系统镜像`zcore-fu740.itb`
+### Compilar la imagen de zCore para fu740
 
-系统镜像会包含fu740板子的设备树, dtb设备树可以从fu740自带的Linux中的`/boot`目录中获取;
-也可以从sifive官方镜像中获取：https://github.com/sifive/freedom-u-sdk/releases/download/2022.04.00/demo-coreip-cli-unmatched-2022.04.00.rootfs.wic.xz
+Primero, en la raíz del código, compila el sistema de ficheros de riscv64.
+
+Después entra en el subdirectorio zCore y compila el kernel; se genera la
+imagen de sistema `zcore-fu740.itb`.
+
+La imagen incluye el device tree de la placa fu740. El dtb se puede sacar del
+directorio `/boot` del Linux que trae la fu740, o de la imagen oficial de
+SiFive:
+https://github.com/sifive/freedom-u-sdk/releases/download/2022.04.00/demo-coreip-cli-unmatched-2022.04.00.rootfs.wic.xz
 
 ```sh
-make riscv-image
+make rootfs ARCH=riscv64 && make image ARCH=riscv64
 cd zCore
 make build MODE=release LINUX=1 ARCH=riscv64 PLATFORM=fu740
 ```
 
-### 基于U-Boot启动系统镜像
+### Arrancar la imagen desde U-Boot
 
-首先搭建一台tftp服务器, 例如，在Linux服务器中安装`tftpd-hpa`, 一般tftp服务的目录会在`/srv/tftp/`;
+Primero monta un servidor tftp; por ejemplo, instala `tftpd-hpa` en un
+servidor Linux; el directorio del servicio tftp suele ser `/srv/tftp/`.
 
-然后把编译出的zCore for fu740系统镜像`zcore-fu740.itb`拷贝到tftp服务目录；
+Después copia la imagen compilada para fu740, `zcore-fu740.itb`, al directorio
+del servicio tftp.
 
-开发板fu740开机，并进入U-Boot命令行：
+Enciende la placa fu740 y entra en la línea de comandos de U-Boot:
 
 ```
-# 配置开发板IP地址和服务器IP地址
+# Configura la IP de la placa y la del servidor
 setenv ipaddr <IP>
 setenv serverip <Server IP>
 
-# 通过tftp协议加载系统镜像
+# Carga la imagen por tftp
 tftp 0xa0000000 zcore-fu740.itb
 
-# 运行
+# Ejecuta
 bootm 0xa0000000
 ```
 
-### fu740资料汇集
-Unmatched fu740 板子资料整理， 请见：
+### Documentación de la fu740
+
+La documentación recopilada de la placa Unmatched fu740 está en:
 https://github.com/oscomp/DocUnmatchedU740/blob/main/unmatched.md

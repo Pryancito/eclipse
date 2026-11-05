@@ -1,76 +1,76 @@
-# zCore (Eclipse OS)
+# Eclipse OS
 
-Un núcleo de sistema operativo basado en Zircon que proporciona compatibilidad con Linux.
+[![Descargas totales](https://img.shields.io/github/downloads/Pryancito/eclipse/total)](https://github.com/Pryancito/eclipse/releases)
+[![Descargas de la última versión](https://img.shields.io/github/downloads/Pryancito/eclipse/latest/total)](https://github.com/Pryancito/eclipse/releases/latest)
+[![Clones del repositorio](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FPryancito%2Feclipse%2Fbadges%2Fclones.json)](.github/workflows/clones-badge.yml)
 
-## Resumen del Proyecto
+**Español** · [English](README.en.md)
 
-zCore es una reimplementación del micronúcleo `Zircon` en Rust seguro como un programa de espacio de usuario.
+Eclipse OS es un sistema operativo completo escrito en Rust. Su núcleo nace de
+[zCore](https://github.com/rcore-os/zCore) (una reimplementación del micronúcleo
+Zircon de Fuchsia en Rust seguro) y le añade una personalidad **compatible con
+Linux** suficiente para arrancar un escritorio Wayland, navegadores, audio y
+aceleración NVIDIA sobre paquetes de Ubuntu.
 
-- Arquitectura de diseño de zCore.
-- Soporte para Zircon y Linux en modo bare-metal.
-- Soporte para Zircon y Linux en modo libos.
-- Para más guías sobre aplicaciones gráficas y otros detalles, consulte la [documentación original de arquitectura](README-arch.md).
+- **Núcleo**: Zircon + capa de compatibilidad Linux (`linux-object`,
+  `linux-syscall`), y además una ABI de FreeBSD/amd64.
+- **Arquitecturas**: x86_64 (QEMU y hardware real), aarch64 (QEMU) y riscv64
+  (QEMU y varias placas).
+- **Userspace**: init propio (`eclipse-init`), base estática con busybox y
+  paquetes de **Ubuntu 26.10** instalables con `apt`.
+- **Escritorio**: sesión Wayland con labwc, panel y fondo nativos (`lunarbar`,
+  `lunarbg`) y varias apariencias; Xorg disponible como alternativa.
+- **Almacenamiento**: raíz en **EclipseFS**, un sistema de archivos propio
+  copy-on-write; **btrfs** con driver propio como alternativa, más ext2/3/4 y
+  FAT32.
+- **Seguridad**: `hunter`, subsistema in-kernel de políticas e IDS.
 
-## Iniciar el Núcleo
-
-   ```bash
-   make qemu ARCH=x86_64
-   ```
-
-   Este comando iniciará zCore usando QEMU para la arquitectura especificada.
-
-   El sistema de archivos predeterminado incluirá la aplicación `busybox` y la biblioteca `musl-libc`. Estos se compilan automáticamente usando la cadena de herramientas de compilación cruzada correspondiente.
-
-## Configuración del Proceso Inicial (ROOTPROC)
-
-Para cambiar el proceso inicial (init) que zCore ejecuta al arrancar, se debe modificar el archivo de configuración `zCore/rboot.conf`.
-
-Dentro de este archivo, localice la línea `cmdline` y añada el parámetro `ROOTPROC`. Los parámetros en la línea de comandos se separan por el carácter `:`.
-
-**Ejemplo para ejecutar una shell de busybox (predeterminado):**
-```ini
-cmdline=LOG=warn:ROOTPROC=/bin/busybox?sh
-```
-
-**Ejemplo para ejecutar un binario específico con argumentos:**
-```ini
-cmdline=LOG=warn:ROOTPROC=/path/to/init?--option?value
-```
-
-**Formato:**
-- `ROOTPROC=/ruta/al/binario`: Especifica la ruta del ejecutable en el sistema de archivos.
-- `?`: Se usa para separar el comando de sus argumentos y los argumentos entre sí.
+La documentación técnica vive en [`docs/`](docs/README.md).
 
 ## Contenido
 
-- [Iniciar el Núcleo](#iniciar-el-núcleo)
-- [Configuración del Proceso Inicial (ROOTPROC)](#configuración-del-proceso-inicial-rootproc)
-- [Construcción del Proyecto](#construcción-del-proyecto)
-  - [Programas necesarios](#programas-necesarios)
-  - [Comandos de Construcción](#comandos-de-construcción)
-  - [Referencia de Comandos](#referencia-de-comandos)
-- [Soporte de Plataformas](#soporte-de-plataformas)
-  - [x86_64 (Qemu/ICH9)](#x86_64-qemuich9)
-  - [Qemu/virt (RISC-V)](#qemuvirt)
-  - [Allwinner D1/Nezha](#allwinner-d1nezha)
-  - [StarFive VisionFive](#starfive-visionfive)
-  - [CVITEK CR1825](#cvitek-cr1825)
+- [Arranque rápido](#arranque-rápido)
+- [Preparar el host](#preparar-el-host)
+- [Compilar](#compilar)
+  - [Comandos de xtask](#comandos-de-xtask)
+  - [Objetivos del Makefile](#objetivos-del-makefile)
+  - [Variantes e ISO de distribución](#variantes-e-iso-de-distribución)
+- [Opciones de arranque](#opciones-de-arranque)
+- [Plataformas](#plataformas)
+- [Paquetes (apt)](#paquetes-apt)
+- [Documentación](#documentación)
 
-## Construcción del Proyecto
+## Arranque rápido
 
-La construcción del proyecto utiliza el [patrón xtask](https://github.com/matklad/cargo-xtask). Las operaciones comunes están encapsuladas en comandos de `cargo`.
+```bash
+make qemu ARCH=x86_64
+```
 
-Además, se proporciona un [Makefile](Makefile) para compatibilidad con algunos scripts antiguos.
+Construye el rootfs, la imagen y el núcleo, y arranca Eclipse en QEMU con la
+sesión de escritorio `labwc`. Para la variante de consola:
 
-Los entornos de desarrollo probados actualmente incluyen Ubuntu 20.04, Ubuntu 22.04 y Debian 11.
+```bash
+make qemu VARIANT=minimal
+```
 
-### Programas necesarios
+Otras variables útiles de `make qemu`: `SMP=4`, `GRAPHIC=off`,
+`AUDIO=off`, `DESKTOP=xorg` (sesión X en lugar de labwc) y `KOPTS=a:b` para
+pasar opciones extra a la cmdline del núcleo.
 
-El host de compilación es **Linux** (x86_64). Instala estas herramientas **antes** de `cargo rootfs` / `make qemu`: xtask las invoca por nombre (`wget`, `tar`, `make`, …) y sin ellas el build no arranca.
+## Preparar el host
 
-#### Cadena Rust
+El host de compilación es **Linux x86_64**, preferiblemente **Debian o Ubuntu**:
+el rootfs de escritorio se arma con `apt-get download` y `dpkg-deb` del propio
+host (con un estado de apt aislado, así que la versión del host da igual; se
+usa a diario con Ubuntu 24.04). Instala estas herramientas **antes** de
+`cargo rootfs` / `make qemu`: xtask las invoca por nombre y sin ellas el build
+no arranca.
 
-El archivo [`rust-toolchain.toml`](rust-toolchain.toml) fija `nightly-2026-09-01` y los componentes `rust-src`, `llvm-tools-preview`, `rustfmt` y `clippy`. Con [rustup](https://rustup.rs) instalado, `cargo` descarga esa toolchain sola.
+### Cadena Rust
+
+[`rust-toolchain.toml`](rust-toolchain.toml) fija `nightly-2026-09-01` con los
+componentes `rust-src`, `llvm-tools-preview`, `rustfmt` y `clippy`. Con
+[rustup](https://rustup.rs) instalado, `cargo` descarga esa toolchain sola.
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -79,29 +79,25 @@ source "$HOME/.cargo/env"
 rustup target add x86_64-unknown-linux-musl
 ```
 
-`PATH` debe incluir `~/.cargo/bin` (`cargo`, `rustc`, `rustup`).
+`PATH` debe incluir `~/.cargo/bin`.
 
-#### Paquetes del sistema
+### Paquetes del sistema
 
 | Programa | Para qué | Paquete Debian/Ubuntu |
 |---|---|---|
-| `git` | clon de busybox y submódulos | `git` |
-| `make` | busybox, rboot, `Makefile` del repo | `make` |
-| `gcc` | tests de hilos y herramientas C del rootfs | `build-essential` |
-| `tar` | extraer el cross musl (`*-linux-musl-cross.tgz`) | `tar` |
-| `wget` o `curl` | apk estático, toolchain musl, `cacert.pem` | `wget` y/o `curl` |
+| `git` | busybox y submódulos | `git` |
+| `make`, `gcc` | busybox, rboot, herramientas C del rootfs | `build-essential` |
+| `tar`, `wget` o `curl` | cross musl, apk estático, `cacert.pem` | `tar`, `wget`, `curl` |
+| `apt-get`, `dpkg-deb` | paquetes de Ubuntu del rootfs de escritorio | `apt`, `dpkg` (ya vienen en Debian/Ubuntu) |
 | `sed` | ajustar `.config` de busybox | `sed` |
-| `python3` | regenerar headers SPIR-V (opcional) | `python3` |
-| `mkfs.vfat` | ESP FAT32 (`cargo image`, `make iso`) | `dosfstools` |
-| `mmd` / `mcopy` | copiar EFI al FAT | `mtools` |
+| `python3` | regenerar cabeceras SPIR-V (opcional) | `python3` |
+| `mkfs.vfat`, `mmd`/`mcopy` | ESP FAT32 (`cargo image`, `make iso`) | `dosfstools`, `mtools` |
 | `gzip` | comprimir `efi.img` / rootfs / home | `gzip` |
-| `qemu-system-x86_64` | `make qemu` / `cargo qemu` | `qemu-system-x86` |
-| `qemu-img` | `make qcow2` | `qemu-utils` |
+| `qemu-system-x86_64`, `qemu-img` | `make qemu`, `make qcow2` | `qemu-system-x86`, `qemu-utils` |
 | `xorriso` | `make iso` | `xorriso` |
 
-El cross **musl** (`x86_64-linux-musl-gcc`, `…-strip`) no se instala a mano: `cargo rootfs` lo baja a `ignored/target/x86_64/x86_64-linux-musl-cross/` (hace falta `wget`/`curl` y `tar`).
-
-Instalación típica en Debian/Ubuntu:
+El cross **musl** (`x86_64-linux-musl-gcc`, `…-strip`) no se instala a mano:
+`cargo rootfs` lo baja a `ignored/target/x86_64/x86_64-linux-musl-cross/`.
 
 ```bash
 sudo apt update
@@ -110,22 +106,33 @@ sudo apt install --no-install-recommends \
   dosfstools mtools gzip qemu-system-x86 qemu-utils xorriso
 ```
 
-En Fedora: `dnf install gcc make git tar wget curl python3 dosfstools mtools gzip qemu-system-x86 qemu-img xorriso`. En Arch: `pacman -S base-devel git wget python dosfstools mtools qemu-system-x86 xorriso`.
+En Fedora o Arch se pueden instalar las mismas herramientas
+(`dnf install gcc make git tar wget curl python3 dosfstools mtools gzip qemu-system-x86 qemu-img xorriso`,
+`pacman -S base-devel git wget python dosfstools mtools qemu-system-x86 xorriso`),
+pero sin `apt-get` el rootfs de escritorio no puede bajar sus paquetes; usa
+`VARIANT=minimal` o `ECLIPSE_PKG=apk` (camino Alpine heredado).
 
 Comprobar que el host está listo:
 
 ```bash
-command -v cargo git make gcc tar wget curl qemu-system-x86_64 mkfs.vfat mcopy gzip
+command -v cargo git make gcc tar wget curl qemu-system-x86_64 mkfs.vfat mcopy gzip apt-get dpkg-deb
 rustup show
 ```
 
-No hace falta `btrfs-progs` en el host: las imágenes btrfs las genera xtask. `cmake` / OpenCV / FFmpeg solo si se usa `cargo opencv` / `cargo ffmpeg`.
+No hace falta `btrfs-progs`: las imágenes EclipseFS y btrfs las genera xtask. `cmake`,
+OpenCV y FFmpeg solo se necesitan para `cargo opencv` / `cargo ffmpeg`. Hay una
+imagen Docker de desarrollo en [`tools/docker`](tools/docker/README.es.md).
 
-### Comandos de Construcción
+## Compilar
 
-El formato básico de los comandos es `cargo <comando> [--args [valor]]`. Esto es en realidad una abreviatura de `cargo run --package xtask --release -- <comando> [--args [valor]]`. El comando se pasa a la aplicación xtask para su análisis y ejecución.
+La construcción sigue el [patrón xtask](https://github.com/matklad/cargo-xtask):
+`cargo <comando> [--args]` es una abreviatura de
+`cargo run --package xtask --release -- <comando> [--args]`. El
+[Makefile](Makefile) envuelve los mismos pasos y es lo que usa la CI.
 
-Muchos comandos dependen de otros para preparar el entorno. El diagrama de dependencias es el siguiente:
+### Comandos de xtask
+
+Muchos comandos preparan primero lo que necesitan:
 
 ```text
 ┌────────────┐ ┌─────────────┐ ┌─────────────┐
@@ -145,91 +152,71 @@ Muchos comandos dependen de otros para preparar el entorno. El diagrama de depen
                  ┌────────┐  |  └───────────┘
                  | ffmpeg |──┘
                  └────────┘
--------------------------------------------------------------------
-Leyenda: A → B (A depende de B, ejecutar A ejecutará automáticamente B primero)
+Leyenda: A → B (A depende de B; ejecutar A ejecuta antes B)
 ```
 
-### Referencia de Comandos
+| Comando | Qué hace | Ejemplo |
+|---|---|---|
+| `update-all` | Actualiza toolchain, dependencias y submódulos | `cargo update-all` |
+| `check-style` | Comprueba que el código compila con varias combinaciones de features | `cargo check-style` |
+| `zircon-init` | Descarga los binarios precompilados del modo Zircon ([detalles](prebuilt/README.es.md)) | `cargo zircon-init` |
+| `dump` | Imprime la configuración de build | `cargo xtask dump` |
+| `git-proxy` | Pone o quita un proxy para git | `cargo git-proxy --global --port 12345` |
+| `rootfs` | Reconstruye el rootfs de Linux de una arquitectura | `cargo rootfs --arch x86_64 [--variant minimal]` |
+| `verify-rootfs` | Comprueba que el rootfs tiene lo que el arranque necesita | `cargo verify-rootfs --arch x86_64` |
+| `musl-libs`, `opencv`, `ffmpeg` | Copian esas bibliotecas al rootfs | `cargo musl-libs --arch riscv64` |
+| `libc-test`, `other-test` | Añaden suites de pruebas al rootfs | `cargo libc-test --arch x86_64` |
+| `image` | Genera la imagen del rootfs | `cargo image --arch x86_64 [--variant minimal]` |
+| `asm` | Desensambla el núcleo (por defecto en `target/zcore.asm`) | `cargo asm -m virt-riscv64 -o riscv64.asm` |
+| `bin` | Genera el binario crudo del núcleo para una máquina | `cargo bin -m nezha -o z.bin` |
+| `qemu` | Arranca en QEMU (`--gdb <puerto>` para depurar) | `cargo qemu --arch x86_64 --smp 4` |
+| `gdb` | Lanza gdb conectado a un puerto | `cargo gdb --arch riscv64 --port 1234` |
+| `linux-libos`, `libos-libc-test` | Ejecutan el modo LibOS en el host | `cargo linux-libos --args /bin/busybox` |
 
-#### **update-all**
-Actualiza la cadena de herramientas, las dependencias y los submódulos de git.
-```bash
-cargo update-all
-```
+La lista completa y sus opciones: `cargo xtask --help`. Las máquinas válidas para
+`-m` están en [`config/machine-features.toml`](config/machine-features.toml).
 
-#### **check-style**
-Chequeo estático. Verifica que el código compile con diversas opciones.
-```bash
-cargo check-style
-```
+### Objetivos del Makefile
 
-#### **zircon-init**
-Descarga los archivos binarios necesarios para el modo Zircon.
-```bash
-cargo zircon-init
-```
-
-#### **qemu**
-Inicia zCore en QEMU. Requiere tener QEMU instalado.
-```bash
-cargo qemu --arch x86_64 --smp 4
-```
-
-Soporte para conectar QEMU a GDB:
-```bash
-cargo qemu --arch x86_64 --smp 4 --gdb 1234
-```
-
-#### **rootfs**
-Reconstruye el rootfs de Linux.
-```bash
-cargo rootfs --arch x86_64
-cargo rootfs --arch x86_64 --variant minimal   # sin escritorio
-```
-
-#### **image**
-Construye el archivo de imagen del rootfs de Linux a partir del directorio correspondiente.
-```bash
-cargo image --arch x86_64
-cargo image --arch x86_64 --variant minimal
-```
+| Objetivo | Qué hace |
+|---|---|
+| `make qemu` | Imagen + arranque en QEMU (`ARCH`, `VARIANT`, `SMP`, `DESKTOP`, `KOPTS`, …) |
+| `make image` / `make rootfs` | Solo la imagen / solo el rootfs |
+| `make iso` | ISO UEFI arrancable de una variante y arquitectura |
+| `make release` | Todas las ISO de la matriz variante × arquitectura en `dist/` |
+| `make qcow2` / `make img` | Disco virtual / imagen cruda instalada |
+| `make vbox` | Arranca la imagen en VirtualBox |
+| `make qemu-iso-aarch64` | Arranca la ISO de aarch64 con la receta de memoria correcta |
+| `make check`, `make doc` | `cargo check-style` / documentación de rustdoc |
+| `make clean`, `make cleanup`, `make clean-everything` | Limpia rootfs e imágenes; además `ignored/target`; además todo `ignored/` (descargas) |
 
 ### Variantes e ISO de distribución
 
-Eclipse se publica en dos **variantes**, y cada una tiene su propio rootfs y sus
+Eclipse se publica en dos **variantes**, cada una con su propio rootfs y sus
 propios artefactos:
 
 | Variante | Qué lleva | Rootfs | Sesión |
 |---|---|---|---|
-| `desktop` (por defecto) | labwc/Xorg y todo el cierre de apk: Mesa, Firefox, XFCE, freedoom | `rootfs/<arch>` | la que diga `desktop=` / `/etc/eclipse/desktop`, por defecto `labwc` |
-| `minimal` | el sistema base: busybox, red, `install-eclipse` | `rootfs/<arch>-minimal` | consola (`/etc/eclipse/desktop` = `none`) |
+| `desktop` (por defecto) | labwc/Xorg y todos los paquetes de escritorio de Ubuntu: Mesa, Firefox, XFCE, PulseAudio, freedoom | `rootfs/<arch>` | la de `desktop=` / `/etc/eclipse/desktop`, por defecto `labwc` |
+| `minimal` | el sistema base: busybox, red, `eclipse-init`, `install-eclipse` | `rootfs/<arch>-minimal` | consola (`/etc/eclipse/desktop` = `none`) |
 
-`minimal` **no es un recorte posterior** de la de escritorio: es un rootfs que
-nunca ejecuta `desktop::install` ni `xorg::install`, así que los ficheros del
-escritorio no llegan a estar en disco. No hay, por tanto, una lista de qué podar
-que haya que mantener al día cada vez que se añade un paquete.
+`minimal` **no es un recorte** de la de escritorio: es un rootfs que nunca
+instala la pila gráfica, así que no hay una lista de qué podar que mantener.
 
-> **Hoy `minimal` no tiene sonido ni zonas horarias con nombre.** No por
-> diseño: ALSA, PulseAudio, `mpg123`, `tzdata` y `musl-locales` están en la
-> lista de paquetes de `xorg::install`, que la variante minimal no ejecuta. El
-> rootfs minimal sí escribe `pulseaudio.service` (no lleva `desktop =`, así que
-> arranca) y `eclipse-tz`, de modo que el servicio se reintenta contra un
-> binario que no existe y `TZ=Europe/Madrid` se queda en UTC. Separar esas
-> dependencias de base del conjunto gráfico es una tanda aparte; está anotado
-> en la revisión del #1754.
+> Hoy `minimal` **no tiene sonido ni zonas horarias con nombre**: ALSA,
+> PulseAudio, `mpg123` y `tzdata` están en la lista de paquetes de escritorio.
+> Separarlos es una tarea pendiente.
 
-La variante `desktop` **no lleva sufijo** en ninguna ruta intermedia, así que
+La variante `desktop` **no lleva sufijo** en ninguna ruta, así que
 `rootfs/x86_64`, `zCore/x86_64.img` e `ignored/target/efi.img.gz` siguen donde
-siempre y `make qemu` se comporta igual que antes de que existiera este eje.
-
-`make release` recorre la matriz de (variante × arquitectura) y saca una ISO por
-combinación, con el nombre diciendo las dos:
+siempre.
 
 ```bash
 make release                                  # toda la matriz
 make release ARCHS=x86_64                     # las dos variantes de x86_64
 make release VARIANTS=minimal                 # minimal en las dos arquitecturas
-make release ARCHS=x86_64 VARIANTS=desktop    # una sola
+make iso                                      # desktop, x86_64
+make iso VARIANT=minimal                      # minimal, x86_64
 ```
 
 ```text
@@ -239,122 +226,124 @@ dist/eclipse-desktop-aarch64.iso
 dist/eclipse-minimal-aarch64.iso
 ```
 
-Y cada combinación se puede pedir también con el objetivo de siempre:
-
-```bash
-make iso                                      # desktop, x86_64
-make iso VARIANT=minimal                      # minimal, x86_64
-```
-
 Una combinación que falle **no aborta el resto**: `make release` las intenta
-todas y acaba con un resumen de qué ISO existe y qué falta.
+todas y termina con un resumen. La CI construye y arranca la ISO minimal de
+x86_64 en cada cambio (`scripts/iso-smoke.sh`).
 
-> **La ISO de arm64 lleva la imagen dentro del kernel.** Una ISO es un solo
-> medio, así que el kernel no puede coger su raíz de un segundo disco como hace
-> `make qemu ARCH=aarch64`, y el `rayboot` precompilado que arranca aarch64
-> tampoco sabe pasarle un initramfs: su `Boot.json` no tiene campo para eso. Así
-> que para la ISO el cargador queda fuera de la ecuación — la imagen se enlaza
-> **dentro** del kernel (`LINK_USER_IMG=1`, la feature `link-user-img` de
-> `zCore/src/fs.rs`) y el kernel lee su raíz de sí mismo. Para arrancarla:
->
-> ```bash
-> make iso ARCH=aarch64 VARIANT=minimal
-> make qemu-iso-aarch64 ARCH=aarch64 VARIANT=minimal
-> ```
->
-> **Dale 1 GB, no 4.** Con `-m 4G` este kernel no imprime nada después del
-> «jump to kernel» de rayboot, que se lee igual que una ISO rota y no lo es; es
-> justo al revés que la de x86_64, que necesita 4 GB. `make qemu-iso-aarch64` ya
-> trae la receta buena.
->
-> **No es un instalador.** La ISO de x86_64 lleva los payloads que
-> `install-eclipse` escribe a disco; eso sigue siendo x86-only en
-> `xtask/src/linux/image.rs`, así que la de arm64 arranca la sesión de consola de
-> su variante y no instala nada.
->
-> **riscv64 sigue sin ISO**, y por otro motivo: QEMU arranca su kernel
-> directamente, sin medio UEFI, así que no hay ESP que meter en la ISO. El
-> detalle está en el objetivo `iso-unsupported-arch` del `Makefile`.
+Particularidades por arquitectura:
 
-## Soporte de Plataformas
+- **x86_64**: la ISO arranca el instalador en consola (`desktop=none`) y lleva
+  los payloads que `install-eclipse` escribe a disco. Necesita 4 GB de RAM en
+  QEMU.
+- **aarch64**: la imagen va **enlazada dentro del núcleo** (`LINK_USER_IMG=1`,
+  feature `link-user-img`), porque el `rayboot` precompilado no sabe pasar un
+  initramfs. Arráncala con `make qemu-iso-aarch64 ARCH=aarch64 VARIANT=minimal`
+  y **1 GB** de RAM (con `-m 4G` no imprime nada tras «jump to kernel»). No
+  instala: arranca la sesión de consola.
+- **riscv64**: sin ISO. QEMU arranca el núcleo directamente, sin UEFI (ver el
+  objetivo `iso-unsupported-arch` del `Makefile`).
 
-### x86_64 (Qemu y Hardware Real)
+## Opciones de arranque
 
-Soporte completo para arquitectura x86_64 en emuladores (QEMU) y en hardware real con mejoras significativas de compatibilidad:
+En x86_64 la línea de comandos del núcleo está en
+[`zCore/rboot.conf`](zCore/rboot.conf) (en la ESP:
+`\EFI\Boot\rboot.conf`), en la clave `cmdline`. Las opciones se separan con
+`:` y, dentro de un comando, `?` separa el programa de sus argumentos.
 
-- **Driver AHCI/SATA**: Soporte mejorado con inicialización robusta que incluye el protocolo de handoff BIOS/OS, estabilización del enlace físico PHY (SATA DET) y verificación flexible de firmas de dispositivos (`PORT_SIG`). También se activa el Bus Mastering PCI para prevenir fallos de Master Abort en hardware real.
-- **Driver NVMe**: Soporte para controladores de almacenamiento NVMe con consistencia de caché por DMA utilizando instrucciones `clflush`.
-- **Detección y Particionado Automático**: Detección dinámica de esquemas de particionamiento MBR y GPT al arranque del sistema. Las particiones (como `/dev/sda1` o `/dev/nvme0n1p1`) se registran automáticamente en `devfs` y se exponen como dispositivos independientes.
-- **Entrada y Teclado**: Soporte para teclado PS/2 con mapeo completo de la distribución de teclado en español, permitiendo el uso correcto de caracteres especiales y acentos (`ñ`, `Ñ`, `@`, `#`, `[`, `]`, `{`, `}`, `|`, `\`, `~`, `€`) a través de modificadores (AltGr y Shift).
-- **Instalador del Sistema (`install-eclipse`)**: Herramienta de instalación optimizada para desplegar el sistema en discos físicos y virtuales, con detección precisa de tamaño de disco combinando consultas a `sysfs` y la llamada `BLKGETSIZE64`. Realiza escrituras y modificaciones directamente sobre los dispositivos de partición (p. ej. `/dev/sda1` y `/dev/sda2`) para garantizar la consistencia de la caché de bloques y la correcta persistencia de ficheros clave de configuración (`/etc/fstab` y `rboot.conf`).
-- **Sistemas de Archivos**: El sistema de archivos raíz de Eclipse OS es **btrfs**, con un driver propio de lectura/escritura en el kernel (crate `vendor/btrfs-rs`) y generación de imágenes integrada en la compilación (sin depender de `btrfs-progs`); el sistema de archivos se expande automáticamente al tamaño de la partición en el primer montaje. Se mantiene soporte de **ext2/ext3/ext4** (instalaciones antiguas y discos externos) y **vfat/FAT32** (partición EFI). Las imágenes btrfs generadas son montables por Linux y pasan `btrfs check`.
-- **Estabilidad de Memoria ante Presión (OOM)**: Mitigación de pánicos del kernel por agotamiento de heap (BuddyAllocator) mediante límites estrictos de asignación temporal (1 MB) y procesamiento fragmentado (chunked) en syscalls de E/S (`sys_read`, `sys_pread`, etc.), y una estrategia de carga ELF (`sys_execve`) robusta utilizando mapeos dinámicos bajo demanda de `VmObject`s paginados en la región virtual del kernel (`KERNEL_ASPACE`) sin asignar memoria física contigua.
-- **Pila Gráfica (DRM/KMS)**: Implementación de la UAPI DRM/KMS de Linux que permite ejecutar software gráfico estándar — `Xorg` (`startx`) mediante los nodos de consola virtual y los `ioctl`s de VT/KD, y compositores Wayland (`wlroots`/`labwc`, con `WLR_RENDERER=pixman` por defecto cuando no hay GPU). Incluye soporte de PRIME (exportación/importación de dma-buf). Ver [docs/README-drm.md](docs/README-drm.md) y [docs/README-xorg.md](docs/README-xorg.md).
-- **Seguridad (`hunter`)**: Subsistema de seguridad in-kernel que combina una capa de aplicación de políticas estilo LSM con un sistema de detección de intrusiones (IDS) por comportamiento, registrando cada decisión en un log forense legible desde `/proc/hunter`. Ver [docs/hunter-security.md](docs/hunter-security.md).
-- **Estado**: El sistema arranca con éxito en hardware real e inicializa los controladores de almacenamiento, monta el sistema de archivos de forma nativa e inicia la consola interactiva (`busybox`).
+| Opción | Efecto | Por defecto |
+|---|---|---|
+| `INIT=` | Proceso PID 1. Solo se ejecuta si existe. | `/sbin/init` → `eclipse-init` (con el `init` de busybox de respaldo) |
+| `SHELL=` | Intérprete de cada terminal virtual (tty1–tty6, PID 101–106) | `/bin/busybox?sh` |
+| `ROOTPROC=` | Alias obsoleto de `SHELL=` | — |
+| `LOG=` | Nivel de log del núcleo: `error`, `warn`, `info`, `debug`, `trace` | `error` |
+| `ROOT=` | Dispositivo raíz; `install-eclipse` lo rellena al instalar | el medio de arranque |
+| `desktop=` | Sesión: `labwc`, `xorg` o `none` (manda sobre `/etc/eclipse/desktop`) | `labwc` |
 
-### Qemu/virt (RISC-V)
-
-Inicia directamente usando comandos de cargo, ver [Iniciar el Núcleo](#iniciar-el-núcleo).
-
-### Allwinner D1/Nezha
-
-Usa el siguiente comando para construir la imagen del sistema:
-```bash
-cargo bin -m nezha -o z.bin
-```
-Luego usa [rustsbi-d1](https://github.com/rustsbi/rustsbi-d1) para desplegar la imagen en Flash o DRAM.
-
-### StarFive VisionFive
-
-Usa el siguiente comando para construir la imagen:
-```bash
-cargo bin -m visionfive -o z.bin
+```ini
+cmdline=LOG=warn:INIT=/sbin/init:SHELL=/bin/busybox?sh
+cmdline=LOG=warn:INIT=/ruta/a/init?--opcion?valor
 ```
 
-### CVITEK CR1825
+Hay más parámetros por subsistema (NVIDIA, DRM, hunter…), descritos en sus
+guías; por ejemplo [`nvidia.*`](docs/README-nvidia-cmdline.md). El proceso de
+arranque y cómo medirlo está en [docs/README-boot.md](docs/README-boot.md), y el
+init en [docs/README-init.md](docs/README-init.md).
 
-Usa el siguiente comando para construir la imagen:
-```bash
-cargo bin -m cr1825 -o z.bin
-```
+## Plataformas
 
-## Gestión de Paquetes (apt / Ubuntu 26.10)
+### x86_64 (QEMU y hardware real)
 
-Eclipse OS usa **apt/dpkg** con paquetes de **Ubuntu 26.10 (stonking)** como grifo del userspace (no es Ubuntu completo: init y tools propias siguen siendo estáticos).
+- **Almacenamiento**: AHCI/SATA (con handoff BIOS/OS, estabilización del enlace
+  PHY y Bus Mastering PCI) y NVMe (coherencia de caché DMA con `clflush`).
+  Detección de particiones MBR y GPT; cada partición aparece en `devfs`
+  (`/dev/sda1`, `/dev/nvme0n1p1`…).
+- **Sistemas de archivos**: el sistema instalado usa por defecto **EclipseFS**
+  ([`vendor/eclipsefs-rs`](vendor/eclipsefs-rs/README.md)): árboles B+
+  copy-on-write, CRC32C en cada nodo y commits atómicos. Con
+  `ROOTFS_FS=btrfs` (o `ECLIPSE_ROOTFS_FS=btrfs` en xtask) se instala **btrfs**,
+  con driver propio (`vendor/btrfs-rs`) e imágenes que pasan `btrfs check`. Las
+  dos imágenes las genera xtask y se expanden al tamaño de la partición en el
+  primer montaje. También ext2/ext3/ext4 y vfat/FAT32 (partición EFI).
+- **Gráficos**: UAPI DRM/KMS de Linux con PRIME; Wayland (wlroots/labwc, con
+  `pixman` si no hay GPU) y Xorg. GPUs NVIDIA con el driver RM, CUDA y una uAPI
+  compatible con nouveau para NVK/zink. Ver
+  [DRM](docs/README-drm.md), [Xorg](docs/README-xorg.md) y
+  [NVIDIA](docs/README-nouveau-uapi.md).
+- **Entrada**: teclado PS/2 y USB HID (xHCI), con distribución española completa
+  (`ñ`, `@`, `€`, `{`, `}`… con AltGr y Shift).
+- **Audio**: Intel HDA con ALSA y PulseAudio ([guía](docs/README-audio.es.md)).
+- **Red**: Intel e1000/e1000e/ixgbe, Realtek y otros ([`drivers/src/net`](drivers/src/net)), con DHCP propio (`edhcpc`).
+- **Instalador**: `install-eclipse` escribe el sistema en un disco físico o
+  virtual, con detección del tamaño por `sysfs` y `BLKGETSIZE64`, y rellena
+  `/etc/fstab` y `rboot.conf`.
+- **Memoria**: syscalls de E/S troceadas y carga ELF con `VmObject`s paginados
+  para no agotar el heap del núcleo; herramientas de diagnóstico en
+  `/proc/memhogs` y [oops](docs/README-oops.md).
+- **Seguridad**: [hunter](docs/hunter-security.es.md), políticas estilo LSM + IDS
+  por comportamiento, con log forense en `/proc/hunter` y arranque medido.
 
-- Knob de build: `ECLIPSE_PKG=apt` (por defecto en x86_64/aarch64) o `ECLIPSE_PKG=apk` (legado Alpine).
-- En el guest: `apt-get update && apt-get install <paquete>`.
-- El cierre de escritorio se arma en xtask desde el archive de Ubuntu (`xtask/src/linux/apt_rootfs.rs`).
+### aarch64 (QEMU virt)
+
+`make qemu ARCH=aarch64` o la ISO descrita arriba.
+
+### RISC-V
+
+- **QEMU virt**: `make qemu ARCH=riscv64`.
+- **Placas** (la imagen de usuario va enlazada en el núcleo):
+
+| Placa | Comando | Guía |
+|---|---|---|
+| Allwinner D1 / Nezha | `cargo bin -m nezha -o z.bin` | [README-D1](docs/README-D1.md) |
+| StarFive VisionFive | `cargo bin -m visionfive -o z.bin` | [README-visionfive](docs/README-visionfive.md) |
+| CVITEK CR1825 | `cargo bin -m cr1825 -o z.bin` | — |
+| SiFive FU740 (Unmatched) | `cargo bin -m fu740 -o z.bin` | [README-fu740](docs/README-fu740.md) |
+| T-Head C910 | — | [README-C910](docs/README-C910.md) |
+
+## Paquetes (apt)
+
+Eclipse usa **apt/dpkg** con paquetes de **Ubuntu 26.10 (`stonking`)** para el
+userspace dinámico. No es Ubuntu completo: el init y las herramientas propias
+siguen siendo estáticos.
+
+- En el sistema: `apt-get update && apt-get install <paquete>`.
+- En el build: `ECLIPSE_PKG=apt` (por defecto en x86_64 y aarch64) o
+  `ECLIPSE_PKG=apk` (camino Alpine heredado; riscv64 sigue en apk).
+- El conjunto de escritorio se arma en
+  [`xtask/src/linux/apt_rootfs.rs`](xtask/src/linux/apt_rootfs.rs).
 
 ## Documentación
 
-### Compatibilidad con Linux
-- [Mapa de compatibilidad guiado por `Documentation/` del kernel](docs/linux-compat.md)
+El índice completo, con todas las guías en español e inglés, está en
+[docs/README.md](docs/README.md). Lo más consultado:
 
-### Gráficos y entorno de escritorio
-- [DRM / KMS — conformidad con la UAPI de Linux](docs/README-drm.md)
-- [uAPI compatible con nouveau en la GPU NVIDIA (opt-in, `nvidia.nouveau_uapi`)](docs/README-nouveau-uapi.md)
-- [Parámetros de arranque NVIDIA (`nvidia.cuda`, `nvidia.monitor`, … y `/sys/module/nvidia/parameters`)](docs/README-nvidia-cmdline.md)
-- [Ejecutar un servidor X (`startx`)](docs/README-xorg.md)
+- [Escritorio labwc y apariencias](docs/README-desktop.md)
+- [Arranque](docs/README-boot.md) e [init](docs/README-init.md)
+- [Compatibilidad con Linux](docs/linux-compat.md) y [con FreeBSD](docs/README-freebsd.md)
+- [DRM/KMS](docs/README-drm.md), [Xorg](docs/README-xorg.md), [audio](docs/README-audio.es.md)
+- [hunter](docs/hunter-security.es.md)
+- [Notas para desarrolladores](docs/for-developers.md) y [CI](docs/ci-testing.es.md)
+- [README original de zCore](README-arch.md)
 
-### Compatibilidad de ABI
-- [Compatibilidad con FreeBSD (ABI FreeBSD/amd64)](docs/README-freebsd.md)
+## Licencia
 
-### Seguridad
-- [hunter — subsistema de seguridad in-kernel](docs/hunter-security.md)
-- [hunter — informe de endurecimiento (red-team)](docs/hunter-hardening.md)
-
-### Plataformas RISC-V
-- [StarFive VisionFive](docs/README-visionfive.md)
-- [Allwinner D1/Nezha](docs/README-D1.md)
-- [Sophgo/CVITEK C910](docs/README-C910.md)
-- [StarFive JH7110 (FU740)](docs/README-fu740.md)
-- [Notas de portado a RISC-V 64](docs/porting-rv64.md)
-
-## Otros
-
-- [An English README](docs/README_EN.md)
-- [Notas para desarrolladores](docs/for-developers.md)
-- [Documentación de arquitectura original (upstream zCore)](README-arch.md)
-- [Registro de cambios del sistema de construcción](xtask/CHANGELOG.md)
+[MIT](LICENSE).

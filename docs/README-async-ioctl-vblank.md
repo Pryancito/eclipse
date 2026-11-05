@@ -1,5 +1,7 @@
 # `WAIT_VBLANK` blocks (resolved) — and the sync-`ioctl` constraint behind it
 
+**English** · [Español](README-async-ioctl-vblank.es.md)
+
 This started as a handoff for a refactor. The bug is fixed; what remains
 worth reading is *how*, because the constraint that shaped the fix is still
 there for the next ioctl that needs to wait.

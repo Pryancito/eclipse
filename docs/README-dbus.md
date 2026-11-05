@@ -1,5 +1,7 @@
 # D-Bus en Eclipse OS
 
+**Español** · [English](README-dbus.en.md)
+
 Eclipse arranca un **bus de sesión** de verdad. Hasta ahora no había ninguno:
 la dirección `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus` estaba fijada
 a propósito apuntando a un socket **sin demonio**, para que `connect()` fallara
@@ -18,11 +20,12 @@ SDL) siguen igual y los clientes encuentran el bus solos.
 |---|---|
 | Servicio | `/etc/eclipse/services/dbus.service` (`type = respawn`) |
 | Wrapper | `/usr/local/bin/eclipse-dbus` |
-| Demonio (Alpine) | `dbus-daemon --session --nofork --nopidfile --address=unix:path=/run/user/0/bus` |
+| Demonio (paquete `dbus`) | `dbus-daemon --session --nofork --nopidfile --address=unix:path=/run/user/0/bus` |
 | Demonio (Eclipse) | `/bin/eclipse-dbusd --session --address=unix:path=/run/user/0/bus` |
 
-El wrapper prefiere el `dbus-daemon` de Alpine cuando está instalado (el
-paquete `dbus` está en `DEFAULT_PACKAGES`, `xtask/src/linux/xorg.rs`) y cae a
+El wrapper prefiere el `dbus-daemon` del paquete `dbus` cuando está instalado
+(en la variante de escritorio viene de Ubuntu, lista `DESKTOP_UBUNTU` de
+`xtask/src/linux/apt_rootfs.rs`; con `ECLIPSE_PKG=apk`, de Alpine) y cae a
 `eclipse-dbusd` si no. Ambos aceptan el mismo `argv`, así que la elección es un
 `command -v`.
 
@@ -43,8 +46,8 @@ escuchando.
 `tools/eclipse-dbusd` es un bus de sesión escrito en Rust, estático contra musl,
 sin más dependencia que `libc`. Existe por dos razones concretas:
 
-1. Una imagen construida **sin acceso al mirror de Alpine** no tiene
-   `dbus-daemon`, y sin bus no arranca nada que use `GtkApplication` ni nada que
+1. Una imagen construida **sin acceso a los paquetes** (la variante `minimal`,
+   o un build sin red) no tiene `dbus-daemon`, y sin bus no arranca nada que use `GtkApplication` ni nada que
    registre un nombre para comprobar si ya hay otra copia corriendo.
 2. Es código nuestro, así que se puede **probar contra el kernel de Eclipse en
    QEMU** en vez de solo en hardware. Cada paso del probe es un viaje de ida y
@@ -104,7 +107,7 @@ make -C zCore ... CMDLINE="...:dbus.selftest"
 `eclipse-init` que arranca un servicio solo cuando ese token está en la línea de
 órdenes del kernel. En un arranque normal el servicio ni se carga.
 
-Con el `dbus-daemon` de Alpine instalado, las herramientas de siempre funcionan
+Con el paquete `dbus` instalado, las herramientas de siempre funcionan
 igual:
 
 ```sh

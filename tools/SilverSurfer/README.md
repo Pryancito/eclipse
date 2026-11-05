@@ -1,5 +1,7 @@
 # SilverSurfer
 
+**Español** · [English](README.en.md)
+
 Navegador de Eclipse OS para la sesión Wayland de labwc. El motor es el
 crate `servo` 0.7 (HTML, CSS, JavaScript, WebGL y WebGPU). El audio, el
 vídeo y el streaming HLS los reproduce GStreamer, a través del feature

@@ -1,5 +1,7 @@
 # abiprobe — the Linux ABI an Electron app leans on before it prints anything
 
+**English** · [Español](README.es.md)
+
 A single static binary that makes, one at a time, the calls a Chromium/Electron
 main process makes between `main()` and its first log line, and says PASS or
 FAIL with the errno for each. It is green on a real Linux kernel, so a FAIL

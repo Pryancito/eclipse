@@ -32,7 +32,8 @@ veces y exige que ninguna haga entrar en pánico al driver.
 
 En el kernel, `linux-object/src/fs/eclipsefs_mount.rs` lo monta con
 `mount -t eclipsefs`, y la búsqueda de la raíz lo reconoce si el disco no es
-btrfs. btrfs sigue siendo el sistema por defecto.
+btrfs. EclipseFS es el sistema de archivos por defecto de la raíz instalada
+(`DiskFs` en `xtask/src/linux/image.rs`); `ECLIPSE_ROOTFS_FS=btrfs` vuelve a btrfs.
 
 ## Qué viene de eclipsefs-lib y qué cambia
 

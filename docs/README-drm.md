@@ -1,5 +1,7 @@
 # DRM / KMS en Eclipse OS — conformidad con la UAPI de Linux
 
+**Español** · [English](README-drm.en.md)
+
 Este documento mapea la implementación de DRM (Direct Rendering Manager) de
 Eclipse OS contra la documentación del kernel de Linux
 ([`Documentation/gpu`](https://github.com/torvalds/linux/tree/master/Documentation/gpu)),
@@ -19,8 +21,9 @@ y registra qué está implementado, qué es parcial y qué falta.
   contrato observable desde userspace: una reimplementación desde cero **no
   necesita reproducirlos**, solo ofrecer la misma UAPI por encima.
 
-Eclipse OS no es Linux: no hay *midlayer* DRM ni drivers de GPU completos. En su
-lugar implementa la UAPI directamente sobre una ruta **"software KMS"**: cuando
+Eclipse OS no es Linux: no hay *midlayer* DRM. La ruta base implementa la UAPI
+directamente sobre un **"software KMS"** (las GPU NVIDIA añaden encima la uAPI de
+nouveau, ver [README-nouveau-uapi.md](README-nouveau-uapi.md)): cuando
 hay un framebuffer (UEFI GOP, virtio-gpu, …) se sintetizan los objetos KMS
 mínimos (1 CRTC + 1 connector + 1 encoder + 1 plane primario) y el *scanout* se
 hace copiando el *dumb buffer* del cliente al framebuffer (`blit_from`). Esto es
@@ -243,7 +246,7 @@ siendo la probada en hardware real — el mismo despliegue que hizo nouveau con
 (`zCore/rboot.conf`):
 
 ```ini
-cmdline=LOG=warn:drm.atomic:ROOTPROC=/bin/busybox?sh
+cmdline=LOG=warn:drm.atomic:SHELL=/bin/busybox?sh
 ```
 
 y quita `WLR_DRM_NO_ATOMIC=1` del entorno para que wlroots use la ruta
@@ -346,8 +349,9 @@ Detalles:
   `card0`.
 - **`drm-usage-stats.rst` (fdinfo)**. No se exponen estadísticas de
   uso/memoria/engine por `fdinfo`.
-- **Render / 3D**. No hay aceleración: se usa el render por software de Mesa
-  (`llvmpipe`/`softpipe`).
+- **Render / 3D**. Sin GPU NVIDIA se usa el render por software de Mesa
+  (`llvmpipe`/`softpipe`). Con NVIDIA y `nvidia.nouveau_uapi`, Mesa usa NVK y
+  zink sobre la GPU ([README-nouveau-uapi.md](README-nouveau-uapi.md)).
 
 ## Lo que aún diverge (auditoría del 20-sep-2026)
 
@@ -380,7 +384,8 @@ esto no:
 El kernel implementa la ruta **legacy-KMS + dumb buffers + scanout por
 software** (y, opt-in, la atómica). Para que wlroots/labwc usen la ruta por
 defecto (y NO intenten GBM/EGL/GL, que no hay aceleración) hay que forzar el
-renderer **pixman** y el KMS legacy por variables de entorno:
+renderer **pixman** y el KMS legacy por variables de entorno (en la imagen lo
+hace ya el wrapper `/usr/local/bin/labwc`; esto es para lanzarlo a mano):
 
 ```sh
 # Gestor de asientos (o arráncalo en /etc/init.d/rcS). Da acceso a
@@ -400,7 +405,7 @@ labwc
 ```
 
 > **Importante**: sin `WLR_RENDERER=pixman`, wlroots intenta primero el renderer
-> GLES2 sobre GBM/EGL (Mesa). Como aquí no hay GPU, esa ruta puede **colgarse,
+> GLES2 sobre GBM/EGL (Mesa). Sin GPU acelerada, esa ruta puede **colgarse,
 > fallar o funcionar extremadamente lenta**: Mesa cae a `llvmpipe` (render por
 > CPU) y cada frame además se vuelve a copiar al framebuffer DRM por software.
 > El síntoma típico del fallo de inicialización es que el log del kernel se queda

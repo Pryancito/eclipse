@@ -1,24 +1,29 @@
-# 在 visionfive 上运行zCore
+# zCore en la placa StarFive VisionFive
 
-## 一. visionfive 开发板烧写
+**Español** · [English](README-visionfive.en.md)
 
-> **NOTICE** 本文描述的上位机操作在 Ubuntu20.04 上测试可用
+> Notas heredadas del zCore original (rCore-OS), traducidas del chino. No se
+> han vuelto a probar en Eclipse.
 
-### 1. 在工控机上部署必要服务
+## 1. Grabar la placa VisionFive
+
+> **NOTICE** Las operaciones del equipo host que describe este documento se han probado en Ubuntu 20.04.
+
+### 1. Montar los servicios necesarios en el PC industrial
 
 ```bash
-#  部署 dhcpd
-# 1. 安装 dhcp3-server
+# Montar dhcpd
+# 1. Instalar dhcp3-server
 sudo apt install isc-dhcp-server
 
-# 2. 设置 dhcp 服务接口，这个接口为实际的物理网卡接口
+# 2. Elegir la interfaz del servicio dhcp: la interfaz de red física real
 vim /etc/default/isc-dhcp-server
 ------------------------------------------------
-INTERFACESv4="enp2s0" # 设置 dhcpv4 端口为 enp2s0
+INTERFACESv4="enp2s0" # el puerto dhcpv4 es enp2s0
 INTERFACESv6=""
 ------------------------------------------------
 
-# 3. 给这个接口配置 IP 地址，并 up 接口
+# 3. Dar una dirección IP a esa interfaz y levantarla
 vim /etc/netplan/01-network-manager-all.yaml
 -----------------------------------------------------------
 # Let NetworkManager manage all devices on this system
@@ -39,7 +44,7 @@ network:
 ------------------------------------------------------------
 sudo netplan appply
 
-# 4. 设置 dhcp 相关配置
+# 4. Configurar dhcp
 vim /etc/dhcp/dhcpd.conf
 ----------------------------------------------------
 subnet 192.168.10.0 netmask 255.255.255.0 {
@@ -51,44 +56,44 @@ subnet 192.168.10.0 netmask 255.255.255.0 {
 }
 -----------------------------------------------------
 
-# 5. 启动 dhcpd 服务
+# 5. Arrancar el servicio dhcpd
 systemctl restart isc-dhcp-server
 
-# 6. 检查 dhcpd 服务状态
+# 6. Comprobar el estado del servicio dhcpd
 systemctl status isc-dhcp-server
 
-#  部署 tftpd
-# 1. 安装 tftpd-hpa
+# Montar tftpd
+# 1. Instalar tftpd-hpa
 sudo apt install tftpd-hpa
 
-# 2. 修改配置
+# 2. Cambiar la configuración
 --------------------------------------------------------------
 TFTP_USERNAME="tftp"
-TFTP_DIRECTORY="/root/work/tftpboot" # 此项为 tftp 文件下载路径
+TFTP_DIRECTORY="/root/work/tftpboot" # ruta de descarga de ficheros de tftp
 TFTP_ADDRESS=":69"
 TFTP_OPTIONS="--secure"
 --------------------------------------------------------------
 
-# 3. 启动 tftpd 服务
+# 3. Arrancar el servicio tftpd
 systemctl restart tftpd-hpa
 
-# 4. 检查 tftpd 服务状态
+# 4. Comprobar el estado del servicio tftpd
 systemctl status tftpd-hpa
 ```
 
-### 2. 连接工控机和 visionfive 开发板
+### 2. Conectar el PC industrial y la placa VisionFive
 
 ![avatar](visionfive.jpg)
 
 ```bash
-# 圆头黑色线为工控机电源线
-# 黄色网线是用来板子 dhcp 获取地址的
-# 蓝色网线是工控机用来连接公网下载资源的，这里可以忽略
-# 白色 USB 接口是给板子供电的，5v/3A
-# 黑色 USB 接口是串口控制台
+# El cable negro de punta redonda es la alimentación del PC industrial
+# El cable de red amarillo es el que usa la placa para obtener dirección por dhcp
+# El cable de red azul es el que usa el PC industrial para descargar de la red pública; se puede ignorar
+# El conector USB blanco alimenta la placa, 5 V/3 A
+# El conector USB negro es la consola serie
 ```
 
-在工控机上打开串口助手（minicom），开发板上电后，过几秒钟会自动进入 u-boot 命令行模式
+Abre el asistente de puerto serie (minicom) en el PC industrial; tras encender la placa, a los pocos segundos entra sola en la línea de comandos de u-boot
 
 ```bash
 Welcome to minicom 2.7.1
@@ -104,43 +109,43 @@ VisionFive #
 VisionFive #
 VisionFive #
 
-# 此时可以使用 `help` 查看有哪些可用命令
-# 使用 `printenv` 查看配置了哪些环境变量
+# Aquí puedes usar `help` para ver qué comandos hay
+# y `printenv` para ver qué variables de entorno hay configuradas
 
-# 1. 输入 `dhcp` 命令，让开发板获取 IP 地址
-# 注意此时可能会自动下载服务器中的镜像, 请通过Ctrl+C打断
+# 1. Escribe el comando `dhcp` para que la placa obtenga una dirección IP
+# Ojo: puede que empiece a descargar sola la imagen del servidor; interrúmpelo con Ctrl+C
 dhcp
 
-# 2. 设置 tftp 客户端地址（本机）
-setenv ipaddr 192.168.10.121 # 设置 dhcp 获取的那个地址
+# 2. Dirección del cliente tftp (esta máquina)
+setenv ipaddr 192.168.10.121 # la dirección que dio dhcp
 
-# 3. 设置 tftp 服务端地址（工控机）
-setenv serverip 192.168.10.10 # 需要与自己 IP 在同一网段
+# 3. Dirección del servidor tftp (el PC industrial)
+setenv serverip 192.168.10.10 # tiene que estar en la misma subred que tu IP
 
-# 4. 测试一下网络是否通畅
-ping 192.168.10.10 # 试一下ping主机（可选）
+# 4. Comprobar que la red funciona
+ping 192.168.10.10 # prueba a hacer ping al host (opcional)
 
-# 5. 保存上述配置
-saveenv # 保存配置到 flash，之后就不再需要配置
+# 5. Guardar la configuración
+saveenv # la guarda en la flash; ya no hace falta volver a configurarla
 ```
 
-### 3. 制作 itb 格式镜像
+### 3. Crear la imagen en formato itb
 
 ```bash
-# 1. 从 visionfive 官方库下载 `starfive_fb.h` `starfive_vic7100_clk.dtsi` `starfive_vic7100_evb.dts`
+# 1. Descarga `starfive_fb.h`, `starfive_vic7100_clk.dtsi` y `starfive_vic7100_evb.dts` del repositorio oficial de VisionFive
 
-# 2. 使用以下命令编译 dtb
+# 2. Compila el dtb con estos comandos
 cpp -nostdinc -I include -undef -x assembler-with-cpp starfive_vic7100_evb.dts starfive.dts.0
 
-dtc -o starfive.dtb starfive.dts.0	# 预编译的starfive.dtb已放在prebuilt目录
+dtc -o starfive.dtb starfive.dts.0	# hay un starfive.dtb precompilado en el directorio prebuilt
 
-# 3. 压缩内核镜像到 `z.bin.gz`
+# 3. Comprime la imagen del kernel en `z.bin.gz`
 gzip -9 -cvf z.bin > z.bin.gz
 
-# 4. 制作 itb 文件
-mkimage -f zcore-starfive.its z.itb	# zcore-starfive.its即prebuilt目录下的starfive_fdt.its，故也可使用mkimage -f prebuilt/firmware/riscv/starfive_fdt.its z.itb达到相同的效果
+# 4. Crea el fichero itb
+mkimage -f zcore-starfive.its z.itb	# zcore-starfive.its es el starfive_fdt.its del directorio prebuilt, así que mkimage -f prebuilt/firmware/riscv/starfive_fdt.its z.itb hace lo mismo
 
-下面是 zcore-starfive.its 内容
+Este es el contenido de zcore-starfive.its
 --------------------------------------------------------------------
 /*
  * U-Boot uImage source file for "zCore-visionfive"
@@ -183,11 +188,11 @@ mkimage -f zcore-starfive.its z.itb	# zcore-starfive.its即prebuilt目录下的s
 };
 --------------------------------------------------------------------
 
-# 5. 将 `z.itb` 放入 tftp 服务器指定的下载路径
+# 5. Pon `z.itb` en la ruta de descarga del servidor tftp
 cp z.itb /path/to/tftpboot
 ```
 
-### 4. 上传 itb 文件到开发板内存，并从指定位置启动
+### 4. Subir el fichero itb a la memoria de la placa y arrancar desde esa dirección
 
 ```bash
 VisionFive #tftpboot 0xc0000000 z.itb
@@ -254,34 +259,34 @@ hart1 is the primary hart.
 [ 28.157926 WARN  1 0:0 linux_syscall] geteuid: unimplemented
 [ 28.166389 WARN  1 0:0 linux_syscall] geteuid: unimplemented
 / #
-```
 
-## 二. visionfive 移植问题处理
 
-### 1. 烧录问题
+## 2. Problemas del port a VisionFive
 
-我们使用 `tftpboot 0xc0000000 z.itb` 命令烧录，这个 `0xc0000000` 地址要留足内核解压后的空间。
+### 1. Grabación
 
-### 2. 内存映射问题
+Se graba con el comando `tftpboot 0xc0000000 z.itb`; la dirección `0xc0000000` tiene que dejar espacio de sobra para el kernel descomprimido.
 
-星光开发板的 u-boot 需要给内核和设备树设置加载位置， 然后通过 `a1` 寄存器将设备树的位置通知内核，实际上设备树被放置到超过 1 GiB 的位置上，而 zCore 只支持 1 GiB，所以报非法内存问题。我们需要修改内存映射布局，修改参考这 2 个commit：
+### 2. Mapa de memoria
+
+El u-boot de la placa StarFive tiene que fijar dónde se cargan el kernel y el device tree, y luego le pasa al kernel la posición del device tree en el registro `a1`. En la práctica el device tree queda por encima de 1 GiB, y zCore solo admitía 1 GiB, así que daba un error de memoria ilegal. Hay que cambiar la disposición del mapa de memoria; los cambios están en estos dos commits:
 
 [commit1](https://github.com/rcore-os/zCore/commit/227956d5df401c8f8f2fa746f8aa911d3530637f)
 
 [commit2](https://github.com/rcore-os/zCore/commit/16772b9363d02945863008c6a4639ad1cb37eed4)
 
-### 3. 中断处理中有 bug，需要使用当前核去处理对应中断，修复见
+### 3. Había un bug en el manejo de interrupciones: cada interrupción tiene que atenderla el núcleo actual. El arreglo está en
 
 [commit](https://github.com/rcore-os/zCore/commit/55b3145442f0f70c01527c20e87988d26c01a39b)
 
-### 4. 串口驱动
+### 4. Driver del puerto serie
 
-星光开发板支持 `16550` 驱动，只需做相应的代码适配即可，修改见
+La placa StarFive admite el driver `16550`; basta con adaptar el código. El cambio está en
 
 [commit](https://github.com/rcore-os/zCore/commit/55b3145442f0f70c01527c20e87988d26c01a39b)
 
-### 5. 未注册中断处理
+### 5. Interrupción sin registrar
 
-我们发现星光开发板从 `1` 号核心启动后会报一个 `131` 的中断，这个中断在设备树中是没有的，所以也没有在内核中注册，所以会报错，我们在中断处理的时候，将它的优先级降低做屏蔽处理了，见：
+Vimos que la placa StarFive, al arrancar desde el núcleo `1`, lanza la interrupción `131`, que no está en el device tree y por tanto no se registra en el kernel, así que da error. Al manejar las interrupciones le bajamos la prioridad para enmascararla, ver:
 
 [commit](https://github.com/rcore-os/zCore/commit/55b3145442f0f70c01527c20e87988d26c01a39b)

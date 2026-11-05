@@ -1,5 +1,7 @@
 # Tests de multihilo del kernel (clone/futex)
 
+**Español** · [English](README.en.md)
+
 Tests *freestanding* (sin libc) que reproducen la interacción de
 `pthread_create` de musl con el kernel y validan las primitivas en las que se
 apoya todo programa multihilo (sysbench, etc.):

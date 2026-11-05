@@ -1,5 +1,7 @@
 # Compatibilidad con FreeBSD (ABI FreeBSD/amd64)
 
+**Español** · [English](README-freebsd.en.md)
+
 Eclipse OS ejecuta binarios de Linux de forma nativa. Este documento describe la
 **capa de compatibilidad con FreeBSD/amd64**: la infraestructura que permite que
 un ejecutable etiquetado como FreeBSD entre al kernel por la misma instrucción
@@ -132,8 +134,8 @@ msg:
     .ascii "hola FreeBSD\n\0"
 ```
 
-Copie el ejecutable resultante al rootfs y láncelo con `ROOTPROC` (ver el
-[README principal](../README.md)). En el log del kernel debería aparecer:
+Copie el ejecutable resultante al rootfs y láncelo con `INIT=` o `SHELL=` en la
+cmdline (ver el [README principal](../README.md#opciones-de-arranque)). En el log del kernel debería aparecer:
 
 ```
 elf: detected FreeBSD ABI for "/bin/hello"

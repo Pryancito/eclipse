@@ -1,5 +1,7 @@
 # Zircon runtime prebuilts
 
+**English** · [Español](README.es.md)
+
 Download the runtime artifacts with `make zircon-init` (or `cargo zircon-init`).
 The installer uses the pinned GitHub Release
 [`prebuilt-260903`](https://github.com/rcore-os/zCore/releases/tag/prebuilt-260903),
