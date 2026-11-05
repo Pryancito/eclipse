@@ -827,6 +827,30 @@ impl Canvas {
         true
     }
 
+    /// Fade the whole canvas to opacity `k` and slide it `dy` pixels down
+    /// (up when negative), leaving clear rows behind: one frame of a popup's
+    /// entrance. The canvas is premultiplied, so every channel scales.
+    pub fn fade(&mut self, k: f32, dy: i32) {
+        let w = self.pix.width() as usize * 4;
+        let h = self.pix.height() as usize;
+        let k = (k.clamp(0.0, 1.0) * 256.0) as u32;
+        let data = self.pix.data_mut();
+        for b in data.iter_mut() {
+            *b = ((*b as u32 * k) >> 8) as u8;
+        }
+        let d = (dy.unsigned_abs() as usize).min(h);
+        if d == 0 {
+            return;
+        }
+        if dy > 0 {
+            data.copy_within(0..(h - d) * w, d * w);
+            data[..d * w].fill(0);
+        } else {
+            data.copy_within(d * w.., 0);
+            data[(h - d) * w..].fill(0);
+        }
+    }
+
     /// Draw a filled path at the given RGB with explicit alpha — for the
     /// menu's translucent scrim and hover highlights.
     pub fn fill_rect_a(&mut self, x: i32, y: i32, rw: i32, rh: i32, c: Rgb, a: f32) {
@@ -1202,6 +1226,22 @@ mod tests {
         let mut scaled = vec![0u8; 8 * 8 * 4 - 1];
         assert!(!cv.blit_argb_scaled(&mut scaled, 2));
         assert!(!cv.blit_xrgb_scaled(&mut scaled, 2));
+    }
+
+    /// A fade scales every premultiplied channel and a slide leaves clear rows.
+    #[test]
+    fn fade_dims_and_slides() {
+        let mut cv = Canvas::try_new(2, 4).unwrap();
+        cv.fill_rect_a(0, 0, 2, 1, (255, 255, 255), 1.0);
+        cv.fade(0.5, 2);
+        let mut buf = vec![0u8; 2 * 4 * 4];
+        assert!(cv.blit_argb(&mut buf));
+        assert_eq!(px(&buf, 2, 0, 0), (0, 0, 0, 0), "the top rows are cleared");
+        let (_, _, _, a) = px(&buf, 2, 0, 2);
+        assert!((a as i32 - 128).abs() <= 2, "the row moved down two and halved: {a}");
+        cv.fade(1.0, -2);
+        assert!(cv.blit_argb(&mut buf));
+        assert!(px(&buf, 2, 0, 0).3 > 100, "and back up");
     }
 
     /// Scale 0 would divide by zero in the nearest-neighbour walk.

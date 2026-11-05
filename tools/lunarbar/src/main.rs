@@ -63,6 +63,9 @@ mod hunter_menu;
 mod info;
 mod launcher;
 mod taskmenu;
+mod powermenu;
+mod fx;
+mod volmenu;
 use launcher::Row;
 use info::*;
 mod workspaces;
@@ -433,8 +436,11 @@ struct OutputInfo {
 
 /// state values from wlr-foreign-toplevel-management-unstable-v1
 /// (the `state` array carries u32 enum values).
+// zwlr_foreign_toplevel_handle_v1 `state` values, all in one place.
+const TOPLEVEL_STATE_MAXIMIZED: u32 = 0;
 const TOPLEVEL_STATE_MINIMIZED: u32 = 1;
 const TOPLEVEL_STATE_ACTIVATED: u32 = 2;
+const TOPLEVEL_STATE_FULLSCREEN: u32 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -577,14 +583,15 @@ enum PopupKind {
     },
     /// The month calendar, opened from the clock (bottom) or date (top) pill.
     Calendar { year: i32, month: u32 },
-    /// Power / Session menu popup.
-    PowerMenu,
+    /// Power / Session menu popup: the lit row, and the row waiting for
+    /// its confirming second press ([`powermenu`]).
+    PowerMenu { sel: usize, armed: Option<Action> },
     /// Right-click context menu for one window, keyed by its foreign-toplevel
     /// protocol id (never a list index — the window can close while the menu
     /// is open, and an index would then act on whoever took its slot).
     TaskMenu { tid: u32, title: String, win: taskmenu::Win, sel: usize },
     /// Volume control popup slider.
-    Volume { level: u32 },
+    Volume { level: u32, muted: bool, devices: Vec<String> },
     /// hunter's menu: modes, alerts and actions.
     Hunter(hunter_menu::Menu),
 }
@@ -618,6 +625,12 @@ enum Action {
     TaskFullscreen(u32),
     /// Click anywhere on the volume gauge; percent derived from x.
     VolumeGauge,
+    /// − / +: step the volume by this many percent.
+    VolumeStep(i8),
+    /// One of the usual levels under the meter.
+    VolumePreset(u8),
+    /// The mute switch.
+    VolumeMute,
     /// hunter: set a domain (index into `hunter::DOMAINS`) to a mode.
     HunterMode(u8, hunter::Mode),
     HunterLearning(bool),
@@ -681,6 +694,8 @@ struct Popup {
     /// wedge the menu: past [`FRAME_FALLBACK`] the gate opens anyway.
     frame_at: Option<Instant>,
     kind: PopupKind,
+    /// When the popup first drew: the clock of its entrance ([`fx`]).
+    born: Option<Instant>,
     /// Absolute hit rects (x0,y0,x1,y1) and what clicking them does.
     hits: Vec<(i32, i32, i32, i32, Action)>,
     /// Panel rect (x,y,w,h) — clicks outside it dismiss the popup.
@@ -755,6 +770,8 @@ struct Metrics {
     temp: Option<u32>,
     batt: Option<(u32, bool)>,
     vol: Option<u32>,
+    /// The sink is muted (the volume module then says so).
+    vol_muted: bool,
     /// Console/labwc layout, uppercase (`ES` / `US`), from `/proc/kbd`.
     kbd: String,
     /// hunter's shield; None (no hunter in this kernel) hides it.
@@ -812,6 +829,7 @@ struct State {
     /// Cached mixer level: read once at startup and updated when the user
     /// drags the slider, never re-read per tick. None hides the module.
     vol: Option<u32>,
+    vol_muted: bool,
     /// Cached XDG application list, and whether the scan has run (see
     /// toggle_apps: the walk is far too expensive to repeat per click).
     apps_cache: Vec<apps::AppEntry>,
@@ -869,6 +887,7 @@ impl State {
             // the 1 Hz tick. Primed at startup, updated when the user drags
             // the slider.
             vol: self.vol,
+            vol_muted: self.vol_muted,
             kbd: sysinfo::kbd_layout(),
             hunter: self.metrics.hunter,
             cpu_hist: self.hist.0.clone(),
@@ -1453,11 +1472,11 @@ impl State {
 
     /// Power button click: toggle the session power menu.
     fn toggle_power(&mut self, qh: &QueueHandle<State>, at_top: bool) {
-        if matches!(&self.popup, Some(p) if matches!(p.kind, PopupKind::PowerMenu)) {
+        if matches!(&self.popup, Some(p) if matches!(p.kind, PopupKind::PowerMenu { .. })) {
             self.close_popup();
             return;
         }
-        self.open_popup(qh, PopupKind::PowerMenu, at_top);
+        self.open_popup(qh, PopupKind::PowerMenu { sel: 0, armed: None }, at_top);
     }
 
     /// Right click on window button: toggle task context menu.
@@ -1484,7 +1503,9 @@ impl State {
             return;
         }
         let level = self.vol.unwrap_or(0);
-        self.open_popup(qh, PopupKind::Volume { level }, at_top);
+        self.vol_muted = volmenu::muted();
+        let (muted, devices) = (self.vol_muted, volmenu::devices());
+        self.open_popup(qh, PopupKind::Volume { level, muted, devices }, at_top);
     }
 
     /// The bar-surface rect of the button that opens `kind`, used as the
@@ -1495,7 +1516,7 @@ impl State {
         let (x0, x1) = match kind {
             PopupKind::Apps { .. } => bar.launcher_hit,
             PopupKind::Calendar { .. } => bar.clock_hit,
-            PopupKind::PowerMenu => bar.power_hit,
+            PopupKind::PowerMenu { .. } => bar.power_hit,
             PopupKind::Volume { .. } => bar.vol_hit,
             PopupKind::Hunter(_) => bar.hunter_hit,
             PopupKind::TaskMenu { tid, .. } => bar
@@ -1602,6 +1623,7 @@ impl State {
             frame_pending: false,
             frame_at: None,
             kind,
+            born: None,
             hits: Vec::new(),
             panel: (0, 0, 0, 0),
         });
@@ -1760,6 +1782,12 @@ impl State {
         let hits = draw_popup(&mut cv, px, py, pw, ph, &mut popup.kind, &mut self.icons);
         popup.panel = (px, py, pw, ph);
         popup.hits = hits;
+        // The entrance: faded and slid, then a repaint on the next frame.
+        let born = *popup.born.get_or_insert_with(Instant::now);
+        if let Some((k, dy)) = fx::opening(born.elapsed(), popup.at_top) {
+            cv.fade(k, dy);
+            popup.dirty = true;
+        }
 
         let data: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(popup.map.add(i * frame_size), frame_size) };
@@ -1868,21 +1896,8 @@ impl State {
             }
             Some(Action::PrevMonth) => self.cal_shift(qh, -1),
             Some(Action::NextMonth) => self.cal_shift(qh, 1),
-            Some(Action::PowerLock) => {
-                self.close_popup();
-                self.spawn("eclipse-lock || swaylock || lock");
-            }
-            Some(Action::PowerLogout) => {
-                self.close_popup();
-                self.spawn("labwc --exit || killall labwc || pkill labwc");
-            }
-            Some(Action::PowerReboot) => {
-                self.close_popup();
-                self.request_power(true);
-            }
-            Some(Action::PowerShutdown) => {
-                self.close_popup();
-                self.request_power(false);
+            Some(a @ (Action::PowerLock | Action::PowerLogout | Action::PowerReboot | Action::PowerShutdown)) => {
+                self.power_act(qh, a)
             }
             Some(
                 a @ (Action::TaskFocus(_)
@@ -1891,22 +1906,8 @@ impl State {
                 | Action::TaskFullscreen(_)
                 | Action::TaskClose(_)),
             ) => self.task_act(a),
-            Some(Action::VolumeGauge) => {
-                let (px, _py, pw, _ph) = panel;
-                let gw = (pw - 30).max(1);
-                let rel = (x - (px + 15)).clamp(0, gw);
-                let v = ((rel as u32 * 100) / gw as u32).min(100);
-                self.vol = Some(v);
-                if let Some(popup) = self.popup.as_mut() {
-                    if let PopupKind::Volume { level, .. } = &mut popup.kind {
-                        *level = v;
-                    }
-                }
-                self.spawn(&format!(
-                    "pactl set-sink-volume @DEFAULT_SINK@ {v}% >/dev/null 2>&1 || amixer set Master {v}% >/dev/null 2>&1 || wpctl set-volume @DEFAULT_AUDIO_SINK@ {v}%"
-                ));
-                self.render_popup(qh);
-                self.render_all();
+            Some(a @ (Action::VolumeGauge | Action::VolumeStep(_) | Action::VolumePreset(_) | Action::VolumeMute)) => {
+                self.volume_act(qh, a, x)
             }
             Some(a @ (Action::HunterMode(..)
             | Action::HunterLearning(_)
@@ -1934,6 +1935,15 @@ impl State {
                 if *sel != r {
                     *sel = r;
                     changed = true;
+                }
+            }
+            if let (PopupKind::PowerMenu { sel, armed }, Some(a)) = (&mut popup.kind, hit) {
+                if let Some(r) = powermenu::ROWS.iter().position(|&x| x == a) {
+                    if std::mem::replace(sel, r) != r {
+                        // Moving off an armed row disarms it.
+                        *armed = None;
+                        changed = true;
+                    }
                 }
             }
             if let (PopupKind::TaskMenu { tid, win, sel, .. }, Some(a)) = (&mut popup.kind, hit) {
@@ -1978,6 +1988,11 @@ impl State {
                 }
             }
             PopupKind::Calendar { .. } => self.cal_shift(qh, dir),
+            // The wheel turns the volume: down is quieter.
+            PopupKind::Volume { level, .. } => {
+                let v = volmenu::step(*level, -dir * volmenu::STEP);
+                self.set_volume(qh, v);
+            }
             _ => {}
         }
     }
@@ -1991,6 +2006,8 @@ impl State {
             Cal(i32),
             Render,
             Task(Action),
+            Power(Action),
+            Vol(Action),
         }
         let mut act = Do::Nothing;
         if let Some(popup) = self.popup.as_mut() {
@@ -2064,6 +2081,33 @@ impl State {
                         *scroll = *sel + 1 - rows_fit;
                     }
                 }
+                PopupKind::Volume { level, .. } => match key {
+                    KEY_ESC_WL => act = Do::Close,
+                    KEY_LEFT_WL | KEY_DOWN_WL => act = Do::Vol(Action::VolumePreset(volmenu::step(*level, -volmenu::STEP) as u8)),
+                    KEY_RIGHT_WL | KEY_UP_WL => act = Do::Vol(Action::VolumePreset(volmenu::step(*level, volmenu::STEP) as u8)),
+                    k if key_char(k) == Some('m') => act = Do::Vol(Action::VolumeMute),
+                    _ => {}
+                },
+                PopupKind::PowerMenu { sel, armed } => {
+                    let n = powermenu::ROWS.len();
+                    match key {
+                        KEY_ESC_WL if armed.is_some() => *armed = None,
+                        KEY_ESC_WL => act = Do::Close,
+                        KEY_UP_WL => {
+                            *sel = sel.saturating_sub(1);
+                            *armed = None;
+                        }
+                        KEY_DOWN_WL | KEY_TAB_WL => {
+                            *sel = (*sel + 1).min(n - 1);
+                            *armed = None;
+                        }
+                        KEY_ENTER_WL | KEY_KPENTER_WL => act = Do::Power(powermenu::ROWS[(*sel).min(n - 1)]),
+                        _ => {}
+                    }
+                    if matches!(act, Do::Nothing) {
+                        act = Do::Render;
+                    }
+                }
                 PopupKind::TaskMenu { tid, win, sel, .. } => {
                     let items = taskmenu::items(*tid, *win);
                     match key {
@@ -2095,6 +2139,8 @@ impl State {
             Do::Nothing => {}
             Do::Close => self.close_popup(),
             Do::Task(a) => self.task_act(a),
+            Do::Power(a) => self.power_act(qh, a),
+            Do::Vol(a) => self.volume_act(qh, a, 0),
             Do::Launch(cmd) => {
                 self.close_popup();
                 self.spawn(&cmd);
@@ -2594,7 +2640,7 @@ fn draw_task(
 
         // Volume module
         if let Some(v) = m.vol {
-            let vol_str = cap(&format!("vol {v}%"));
+            let vol_str = cap(&if m.vol_muted { "vol off".to_string() } else { format!("vol {v}%") });
             let vw = Canvas::text_width(&vol_str) + 10;
             if rx - vw >= left_min {
                 rx -= vw;
@@ -2863,9 +2909,9 @@ fn popup_size(kind: &PopupKind, oh: i32, bar_h: i32) -> (i32, i32) {
             7 * CAL_CELL_W + 2 * CAL_PAD,
             CAL_HEADER_H + CAL_WKD_H + 6 * CAL_CELL_H + CAL_PAD,
         ),
-        PopupKind::PowerMenu => (180, 160),
+        PopupKind::PowerMenu { .. } => powermenu::size(),
         PopupKind::TaskMenu { win, .. } => taskmenu::size(*win),
-        PopupKind::Volume { .. } => (180, 80),
+        PopupKind::Volume { .. } => volmenu::size(),
         PopupKind::Hunter(_) => hunter_menu::size(),
     }
 }
@@ -2878,7 +2924,8 @@ fn popup_size(kind: &PopupKind, oh: i32, bar_h: i32) -> (i32, i32) {
 /// drawn, the way every other toolkit draws it.
 fn draw_panel(cv: &mut Canvas, px: i32, py: i32, pw: i32, ph: i32, rad: i32) {
     panel_shadow(cv, px, py, pw, ph, rad);
-    plate_a(cv, px, py, pw, ph, rad, pal().menu_panel, 0.98);
+    let glass = if tecno() && fx::on() { fx::GLASS } else { 0.98 };
+    plate_a(cv, px, py, pw, ph, rad, pal().menu_panel, glass);
     if tecno() {
         // Gold focus brackets (lunarbg's crescent), 3px out, inside the shadow.
         cv.brackets(px, py, pw, ph, 12, 2, TECNO_GOLD);
@@ -2936,9 +2983,11 @@ fn draw_popup(
             draw_apps(cv, px, py, pw, ph, all, visible, *cat, filter, *sel, *scroll, icons)
         }
         PopupKind::Calendar { year, month } => draw_calendar(cv, px, py, pw, ph, *year, *month),
-        PopupKind::PowerMenu => draw_power_menu(cv, px, py, pw, ph),
+        PopupKind::PowerMenu { sel, armed } => {
+            powermenu::draw(cv, px, py, pw, *sel, *armed, sysinfo::uptime().as_deref())
+        }
         PopupKind::TaskMenu { tid, title, win, sel } => taskmenu::draw(cv, px, py, pw, *tid, title, *win, *sel),
-        PopupKind::Volume { level } => draw_volume_menu(cv, px, py, pw, ph, *level),
+        PopupKind::Volume { level, muted, devices } => volmenu::draw(cv, px, py, pw, *level, *muted, devices),
         PopupKind::Hunter(m) => hunter_menu::draw(cv, px, py, pw, ph, m),
     }
 }
@@ -3158,86 +3207,6 @@ fn draw_calendar(
 }
 
 // ── Power menu drawing ───────────────────────────────────────────────────────
-
-fn draw_power_menu(
-    cv: &mut Canvas,
-    px: i32,
-    py: i32,
-    pw: i32,
-    ph: i32,
-) -> Vec<(i32, i32, i32, i32, Action)> {
-    draw_panel(cv, px, py, pw, ph, 10);
-    plate_a(cv, px, py, pw, ph, 10, pal().rule, 0.4);
-
-    let items = [
-        (i18n::Lang::current().power_lock(), Action::PowerLock),
-        (i18n::Lang::current().power_logout(), Action::PowerLogout),
-        (i18n::Lang::current().power_reboot(), Action::PowerReboot),
-        (
-            i18n::Lang::current().power_shutdown(),
-            Action::PowerShutdown,
-        ),
-    ];
-
-    let row_h = 34;
-    let mut hits = Vec::new();
-    let y0 = py + 12;
-
-    for (i, (label, act)) in items.iter().enumerate() {
-        let ry = y0 + i as i32 * row_h;
-        let ix = px + 16;
-        let iy = ry + (row_h - 14) / 2;
-        let tx = px + 42;
-        let ty = ry + (row_h - GLYPH_H) / 2;
-
-        // Tecno: the glyphs are dim instruments, and shutdown is the one in
-        // warn orange, like the bar's power button.
-        let (ic, off) = if tecno() { (pal().dim, pal().warn) } else { (pal().white, pal().white) };
-        match act {
-            Action::PowerLock => cv.lock_icon(ix, iy, 14, ic),
-            Action::PowerLogout => cv.exit_icon(ix, iy, 14, ic),
-            Action::PowerReboot => cv.reboot_icon(ix, iy, 14, ic),
-            Action::PowerShutdown => cv.power_icon(ix, iy, 14, off),
-            _ => {}
-        }
-        cv.text(label, tx, ty, pal().text);
-        hits.push((px + 6, ry, px + pw - 6, ry + row_h, *act));
-    }
-
-    hits
-}
-
-// ── Volume control popup drawing ─────────────────────────────────────────────
-
-fn draw_volume_menu(
-    cv: &mut Canvas,
-    px: i32,
-    py: i32,
-    pw: i32,
-    ph: i32,
-    vol: u32,
-) -> Vec<(i32, i32, i32, i32, Action)> {
-    draw_panel(cv, px, py, pw, ph, 10);
-
-    cv.volume_icon(px + 14, py + 14, 16, pal().white, vol == 0);
-    let label = cap(&format!("volumen {}%", vol));
-    cv.text_bold(&label, px + 40, py + 16, pal().text);
-
-    let mut hits = Vec::new();
-    let gw = pw - 30;
-    let gy = py + 48;
-    if tecno() {
-        // The panel's segmented meter, one cell per 4px of the slider.
-        let c = meter::ramp(vol as f32 / 100.0, pal().accent, pal().warn);
-        cv.blocks(px + 15, gy, (gw + 1) / 4, vol as f32 / 100.0, 10, c, pal().dim);
-    } else {
-        cv.gauge(px + 15, gy, gw, 10, vol as f32 / 100.0, pal().pill);
-    }
-    // One continuous hitbox — percent is derived from the click x.
-    hits.push((px + 15, gy - 10, px + 15 + gw, gy + 20, Action::VolumeGauge));
-
-    hits
-}
 
 // ── Tooltip drawing ──────────────────────────────────────────────────────────
 
@@ -3926,7 +3895,7 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
         event: zwlr_foreign_toplevel_handle_v1::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<State>,
+        qh: &QueueHandle<State>,
     ) {
         use zwlr_foreign_toplevel_handle_v1::Event as E;
         let id = handle.id();
@@ -3951,14 +3920,23 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
                     if v == TOPLEVEL_STATE_MINIMIZED {
                         minimized = true;
                     }
-                    maximized |= v == taskmenu::STATE_MAXIMIZED;
-                    fullscreen |= v == taskmenu::STATE_FULLSCREEN;
+                    maximized |= v == TOPLEVEL_STATE_MAXIMIZED;
+                    fullscreen |= v == TOPLEVEL_STATE_FULLSCREEN;
                 }
                 if let Some(t) = state.toplevels.iter_mut().find(|t| t.handle.id() == id) {
                     t.activated = activated;
                     t.minimized = minimized;
                     t.maximized = maximized;
                     t.fullscreen = fullscreen;
+                }
+                // A window menu open on this window follows it: its rows
+                // name what each toggle will do NOW, not when it opened.
+                let tid = id.protocol_id();
+                if let Some(Popup { kind: PopupKind::TaskMenu { tid: t, win, .. }, .. }) = state.popup.as_mut() {
+                    if *t == tid {
+                        *win = taskmenu::Win { activated, minimized, maximized, fullscreen };
+                        state.render_popup(qh);
+                    }
                 }
             }
             E::Done => state.render_task_bars(),
@@ -4333,6 +4311,7 @@ fn main() {
             temp: sysinfo::temp_c(),
             batt: sysinfo::battery(),
             vol: sysinfo::volume(),
+            vol_muted: false,
             kbd: sysinfo::kbd_layout(),
             // Shown even off Eclipse OS, so the preview has the shield in it.
             hunter: Some(hunter::read().map_or(hunter::Shield::Guarded, |s| s.shield(s.criticals))),
@@ -4391,7 +4370,7 @@ fn main() {
         // LUNARBAR_DUMP_TASK=n: the window menu, its n-th row lit, for a
         // maximised window when LUNARBAR_DUMP_TASK_MAX is set.
         let want_task: Option<usize> = std::env::var("LUNARBAR_DUMP_TASK").ok().and_then(|v| v.parse().ok());
-        if want_menu || want_cal || want_power || want_hunter || want_toast || want_task.is_some() {
+        if want_menu || want_cal || want_power || want_hunter || want_toast || want_task.is_some() || std::env::var("LUNARBAR_DUMP_VOL").is_ok() {
             let mut cv = Canvas::new(w, full_h);
             // The compositor places the real thing; here the preview has to,
             // so it hangs the panel off the bottom bar the way the positioner
@@ -4406,15 +4385,23 @@ fn main() {
                 let py = (full_h as i32 - bh as i32 - POPUP_SHADOW - ph).max(POPUP_SHADOW);
                 (px, py, pw, ph)
             };
-            if let Some(sel) = want_task {
+            if let Some(v) = std::env::var("LUNARBAR_DUMP_VOL").ok().and_then(|v| v.parse::<u32>().ok()) {
+                let muted = std::env::var("LUNARBAR_DUMP_VOL_MUTED").is_ok();
+                let devices = vec!["Audio interno analógico estéreo".to_string()];
+                let (px, py, pw, _) = place(&PopupKind::Volume { level: v, muted, devices: devices.clone() }, false);
+                volmenu::draw(&mut cv, px - 120, py, pw, v, muted, &devices);
+            } else if let Some(sel) = want_task {
                 let max = std::env::var("LUNARBAR_DUMP_TASK_MAX").is_ok();
                 let win = taskmenu::Win { activated: max, maximized: max, ..Default::default() };
                 let (px, py, pw, _) = place(&PopupKind::TaskMenu { tid: 0, title: String::new(), win, sel }, true);
                 taskmenu::draw(&mut cv, px + 120, py, pw, 0, "foot · root@eclipse: ~", win, sel);
             } else if want_power {
-                let k = PopupKind::PowerMenu;
-                let (px, py, pw, ph) = place(&k, false);
-                draw_power_menu(&mut cv, px, py, pw, ph);
+                // LUNARBAR_DUMP_POWER=n lights row n; LUNARBAR_DUMP_POWER_ARMED arms it.
+                let sel = std::env::var("LUNARBAR_DUMP_POWER").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize).min(3);
+                let armed = std::env::var("LUNARBAR_DUMP_POWER_ARMED").is_ok().then_some(powermenu::ROWS[sel]);
+                let k = PopupKind::PowerMenu { sel, armed };
+                let (px, py, pw, _) = place(&k, false);
+                powermenu::draw(&mut cv, px, py, pw, sel, armed, Some("3h 12m"));
             } else if want_toast {
                 hunter_toast::draw_preview(&mut cv, w as i32, full_h as i32 - bh as i32);
             } else if want_hunter {
@@ -4457,9 +4444,19 @@ fn main() {
                 let (px, py, pw, ph) = place(&k, false);
                 draw_calendar(&mut cv, px, py, pw, ph, y, mo);
             }
+            // LUNARBAR_DUMP_FX_MS=t: the frame of the entrance t ms in.
+            if let Some(ms) = std::env::var("LUNARBAR_DUMP_FX_MS").ok().and_then(|v| v.parse().ok()) {
+                if let Some((k, dy)) = fx::opening(Duration::from_millis(ms), false) {
+                    cv.fade(k, dy);
+                }
+            }
             // Alpha-composite the overlay over the opaque preview.
             let mut over = vec![0u8; w * full_h * 4];
             let _ = cv.blit_argb(&mut over);
+            // LUNARBAR_DUMP_OVERLAY=path also writes the popup layer alone.
+            if let Ok(p) = std::env::var("LUNARBAR_DUMP_OVERLAY") {
+                let _ = std::fs::write(p, &over);
+            }
             for (dst, src) in buf.chunks_exact_mut(4).zip(over.chunks_exact(4)) {
                 let a = src[3] as u32;
                 if a == 0 {
@@ -4520,6 +4517,8 @@ fn main() {
     // Build the icon indexes before the bars map, so the first taskbar paint
     // does not stall the event loop on a cold-cache theme walk.
     state.vol = sysinfo::volume();
+    // The level (and mute) the last session left wins over the card's own.
+    state.restore_volume();
     state.icons.prewarm();
     state.refresh_metrics();
 
