@@ -1,5 +1,7 @@
 # Audio: HD Audio driver, NVIDIA HDMI, PulseAudio, and `/dev/dsp`
 
+**English** · [Español](README-audio.es.md)
+
 Eclipse's audio subsystem is a single Intel HD Audio (HDA) driver that covers
 every PCI class-0403 controller:
 
@@ -364,7 +366,7 @@ The stream state machine follows `sound/core/pcm_native.c`:
   `HWDEP_NEXT_DEVICE`/`RAWMIDI_NEXT_DEVICE` (none) and `POWER_STATE` (D0).
 
 `/etc/asound.conf` (written by xtask) sets `default` to the **PulseAudio
-plugin** when `pulseaudio` and `alsa-plugins-pulse` are in the image, so
+plugin** when `pulseaudio` and the ALSA pulse plugin (`libasound2-plugins`) are in the image, so
 mpg123/`aplay` multiplex through the daemon. The kernel PCM remains
 `eclipse_hw` (`hw:0,0`) for Pulse's own ALSA sink. Format conversion is still
 available as `aplay -D plug`. Without Pulse in the image, `default` is `hw:0,0`,
@@ -383,9 +385,9 @@ amixer set Master 50%         # Pulse ctl, or kernel Master if Pulse is down
 amixer set Master mute
 ```
 
-`alsa-lib`, `alsa-utils`, `pulseaudio`, `pulseaudio-alsa`, `pulseaudio-utils`,
-`libpulse` and `alsa-plugins-pulse` are baked into the rootfs package set
-(`xtask/src/linux/xorg.rs`); anything missing can be added at runtime with
+`libasound2t64`, `libasound2-plugins`, `alsa-utils`, `pulseaudio`,
+`pulseaudio-utils`, `libpulse0` and `mpg123` are baked into the rootfs package
+set (`DESKTOP_UBUNTU` in `xtask/src/linux/apt_rootfs.rs`); anything missing can be added at runtime with
 `apt-get install`. Each card exposes a simple **Master** mixer (`amixer set Master 50%`,
 `amixer set Master mute`) on the kernel node; with Pulse running, lunarbar and
 `pactl` adjust the sink volume instead.
