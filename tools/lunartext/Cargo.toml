@@ -1,0 +1,16 @@
+[package]
+name = "lunartext"
+version = "0.1.0"
+edition = "2021"
+description = "Eclipse OS: anti-aliased vector text (DejaVu Sans Mono) for the Lunar clients"
+publish = false
+
+# Standalone like the clients that use it (lunarbar, lunarbg, SilverSurfer):
+# userspace, NOT a member of the zCore workspace.
+[workspace]
+
+[dependencies]
+# Outline parser: pure Rust, no dependencies, so every client stays static.
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+# The rasteriser every Lunar client already links.
+tiny-skia = { version = "0.11", default-features = false, features = ["std"] }

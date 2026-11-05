@@ -277,6 +277,10 @@ impl DrawTarget for ArgbTarget<'_> {
 }
 
 fn label(target: &mut ArgbTarget<'_>, x: i32, y: i32, text: &str, rgb: Rgb) {
+    let (w, h) = (target.width, target.height);
+    if crate::vtext::label(target.data, w, h, x, y, text, (rgb.r, rgb.g, rgb.b), 1) {
+        return;
+    }
     let style = MonoTextStyle::new(&FONT_6X10, Rgb888::new(rgb.r, rgb.g, rgb.b));
     let _ = Text::new(text, Point::new(x, y), style).draw(target);
 }

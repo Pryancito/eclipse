@@ -56,6 +56,9 @@ libc = "0.2"
 url = "2"
 tiny-skia = { version = "0.11", default-features = false, features = ["std"] }
 embedded-graphics = "0.8"
+# Vector chrome labels (DejaVu Sans Mono outlines, anti-aliased at the device
+# scale), shared with the other Lunar clients; FONT_6X10 is the fallback.
+lunartext = { path = "../lunartext" }
 # `system` is the libwayland backend: Mesa needs the real `wl_display` and
 # `wl_surface` pointers, which the pure-Rust backend does not expose.
 # `dlopen` loads that library at run time instead of linking it.

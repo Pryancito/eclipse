@@ -163,9 +163,48 @@ impl PixBuf<'_> {
         }
     }
 
-    /// A 5x7 glyph centred at (gx, gy) with no outline: the caption sits on
-    /// a flat ground and an outline would only thicken it.
+    /// A capital the height of a 5x7 glyph at `scale`, centred at (gx, gy),
+    /// from DejaVu Sans Mono's outline with real coverage at its edges. With
+    /// no face (or a character it lacks) it is the 5x7 glyph.
     fn glyph(&mut self, ch: char, gx: f32, gy: f32, scale: usize, c: Rgb, alpha: f32) {
+        if !cfg!(test) && self.glyph_vector(ch, gx, gy, scale, c, alpha) {
+            return;
+        }
+        self.glyph5x7(ch, gx, gy, scale, c, alpha);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn glyph_vector(&mut self, ch: char, gx: f32, gy: f32, scale: usize, c: Rgb, alpha: f32) -> bool {
+        // DejaVu's capitals are 0.729 em tall: an em that makes them exactly
+        // the 5x7 glyph's 7 cells, on a baseline one pixel under them.
+        let cap = (7 * scale) as f32;
+        let em = cap / 0.729;
+        let cell = lunartext::Cell {
+            width: (em * 0.602).ceil() + 2.0,
+            em,
+            baseline: cap + 1.0,
+        };
+        let h = (cap + 2.0 + em * 0.25).ceil() as u32;
+        let Some((w, h, mask)) = lunartext::coverage(ch, lunartext::Weight::Regular, cell, h) else {
+            return false;
+        };
+        let left = (gx - w as f32 / 2.0).round() as i32;
+        let top = (gy - cap / 2.0 - 1.0).round() as i32;
+        for row in 0..h as i32 {
+            for col in 0..w as i32 {
+                let cov = mask[(row * w as i32 + col) as usize];
+                let (x, y) = (left + col, top + row);
+                if cov > 0 && x >= 0 && y >= 0 {
+                    self.blend(x as usize, y as usize, c, alpha * cov as f32 / 255.0);
+                }
+            }
+        }
+        true
+    }
+
+    /// The 5x7 glyph centred at (gx, gy) with no outline: the caption sits on
+    /// a flat ground and an outline would only thicken it.
+    fn glyph5x7(&mut self, ch: char, gx: f32, gy: f32, scale: usize, c: Rgb, alpha: f32) {
         let left = (gx - (5 * scale) as f32 / 2.0) as i32;
         let top = (gy - (7 * scale) as f32 / 2.0) as i32;
         for (row, bits) in super::glyph5x7(ch).iter().enumerate() {

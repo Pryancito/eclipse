@@ -3180,10 +3180,14 @@ impl LinuxRootfs {
             .join(triple)
             .join("release")
             .join("lunarbg");
-        // Rebuild when any source file is newer than the binary.
-        let newest_src = ["src/main.rs", "src/scene.rs", "src/par.rs", "Cargo.toml"]
-            .iter()
-            .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
+        // Rebuild when any source file (its own tree, the shared text crate
+        // and the manifest) is newer than the binary.
+        let newest_src = [newest_mtime_under(&dir.join("src")), lunartext_mtime()]
+            .into_iter()
+            .chain([fs::metadata(dir.join("Cargo.toml"))
+                .ok()
+                .and_then(|m| m.modified().ok())])
+            .flatten()
             .max();
         if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
             if let Ok(bin_mtime) = bin_meta.modified() {
@@ -3569,6 +3573,7 @@ impl LinuxRootfs {
         let executable = dir.join("target").join("release").join("silversurfer");
         let newest_src = [
             newest_mtime_under(&dir.join("src")),
+            lunartext_mtime(),
             fs::metadata(dir.join("Cargo.toml"))
                 .ok()
                 .and_then(|m| m.modified().ok()),
@@ -3677,6 +3682,7 @@ impl LinuxRootfs {
         // reaches the image.
         let newest_src = [
             newest_mtime_under(&dir.join("src")),
+            lunartext_mtime(),
             fs::metadata(dir.join("Cargo.toml"))
                 .ok()
                 .and_then(|m| m.modified().ok()),
@@ -5718,6 +5724,11 @@ mod hunter_schedule_tests;
 mod apk_closure_tests;
 
 /// The newest modification time of any file under `dir`, recursively.
+/// `tools/lunartext`, the vector text every Lunar client links by path.
+fn lunartext_mtime() -> Option<std::time::SystemTime> {
+    newest_mtime_under(&PROJECT_DIR.join("tools/lunartext/src"))
+}
+
 fn newest_mtime_under(dir: &Path) -> Option<std::time::SystemTime> {
     fs::read_dir(dir)
         .ok()?
