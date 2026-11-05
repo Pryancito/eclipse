@@ -2309,6 +2309,9 @@ fn write_labwc_rc(rootfs: &Path) {
          this minimises (or restores) every window through
          wlr-foreign-toplevel-management instead, which is version-proof. -->
     <keybind key="W-D"><action name="Execute"><command>/usr/local/bin/eclipse-showdesktop</command></action></keybind>
+    <!-- Super+L: lock the screen (lunarlock, a clock over every output; no
+         password by choice, a key or a click brings the desktop back). -->
+    <keybind key="W-L"><action name="Execute"><command>lunarlock</command></action></keybind>
     <!-- Desktop menu also on a key, in case the mouse is missing -->
     <keybind key="W-space"><action name="ShowMenu"><menu>root-menu</menu></action></keybind>
     <!-- Window management -->

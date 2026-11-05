@@ -571,6 +571,52 @@ impl Canvas {
         s.chars().count() as i32 * BIG_W + 1
     }
 
+    /// The advance of one character of [`Self::text_px`] at `px`.
+    pub fn px_advance(px: i32) -> i32 {
+        if crate::vtext::available() {
+            (px as f32 * 0.62).round() as i32
+        } else {
+            BIG_W * (px / BIG_H).max(1)
+        }
+    }
+
+    /// `s` with its em `px` pixels tall, for a readout far larger than the
+    /// cells (the lock screen's clock). The vector face is fitted to a cell of
+    /// [`Self::px_advance`]; without it the 10x20 face is drawn scaled by a
+    /// whole factor, square pixels and all. Returns the advance.
+    pub fn text_px(&mut self, s: &str, x: i32, y: i32, px: i32, c: Rgb) -> i32 {
+        let adv = Self::px_advance(px);
+        if crate::vtext::available() {
+            let cell = lunartext::Cell { width: adv as f32, em: px as f32, baseline: px as f32 * 0.95 };
+            let paint = Self::paint(c, 1.0);
+            for (n, ch) in s.chars().enumerate() {
+                if let Glyph::Ink(path) = lunartext::glyph(ch, Weight::Regular, cell) {
+                    let tx = (x + n as i32 * adv) as f32;
+                    self.pix.fill_path(&path, &paint, FillRule::Winding, Transform::from_translate(tx, y as f32), None);
+                }
+            }
+            return s.chars().count() as i32 * adv;
+        }
+        let k = (px / BIG_H).max(1);
+        let n = s.chars().count();
+        let Some(mut small) = Canvas::try_new(n * BIG_W as usize + 1, BIG_H as usize) else {
+            return 0;
+        };
+        small.text_big(s, 0, 0, (255, 255, 255));
+        let (sw, sh) = (small.pix.width() as usize, small.pix.height() as usize);
+        let px_data = small.pix.pixels();
+        for yy in 0..sh {
+            for xx in 0..sw {
+                let a = px_data[yy * sw + xx].alpha();
+                if a > 0 {
+                    let (bx, by) = (x + xx as i32 * k, y + yy as i32 * k);
+                    self.fill_rect_a(bx, by, k, k, c, a as f32 / 255.0);
+                }
+            }
+        }
+        n as i32 * BIG_W * k
+    }
+
     /// Mockup A's framed glyph box: a square well with a hairline edge and
     /// one bold character centred in it (the launcher's `>`, `$`, initials).
     pub fn glyph_box(&mut self, x: i32, y: i32, s: i32, ch: &str, well: Rgb, edge: Rgb, fg: Rgb) {
