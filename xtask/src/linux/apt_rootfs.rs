@@ -95,9 +95,22 @@ const MOZILLA_REPO_KEY_GPG: &[u8] = &[
     0xcd, 0x89, 0x4e, 0xba, 0xc9, 0xbd, 0x15,
 ];
 
-/// Mirror for amd64; arm64 uses ports.
+/// What the 32-bit runtime takes: the C library and the compiler's own
+/// support library, which is what a `-m32` binary links against and nothing
+/// more. `libstdc++6:i386` and the rest are not here --- the probe that
+/// measures this is C, and an image carrying libraries nothing calls is an
+/// image that got bigger for nothing.
+pub(super) const MULTILIB32_PKGS: &[&str] = &["libc6", "libgcc-s1"];
+
+/// The path an i386 ELF names in its `PT_INTERP`, relative to the root.
+const LOADER32: &str = "ld-linux.so.2";
+
+/// Mirror for amd64 --- and for **i386**, which lives in the same archive and
+/// not in ports: Ubuntu stopped being an i386 distribution after 19.10 but
+/// kept the architecture for multilib, so `dists/<suite>/main/binary-i386`
+/// is right there next to amd64's. arm64 uses ports.
 fn mirror(arch_deb: &str) -> &'static str {
-    if arch_deb == "amd64" {
+    if matches!(arch_deb, "amd64" | "i386") {
         "http://archive.ubuntu.com/ubuntu"
     } else {
         "http://ports.ubuntu.com/ubuntu-ports"
@@ -694,10 +707,113 @@ fn fix_common_alternatives(root: &Path) {
     }
 }
 
+/// The 32-bit runtime: what an **i386 dynamic** binary needs to start at all.
+///
+/// Eclipse's kernel runs i386 binaries --- that is what `compat32` is --- but
+/// a *dynamic* one asks the kernel for `/lib/ld-linux.so.2` and the image had
+/// no 32-bit userspace of any kind, so the `execve` could not resolve its
+/// interpreter and the program came out as 127, "not found", with the binary
+/// right there.
+///
+/// This is Ubuntu's own multilib, fetched the way everything else in this
+/// rootfs is: `libc6:i386` and `libgcc-s1:i386` from the SAME archive as
+/// amd64 (see [`mirror`]), extracted with `dpkg-deb -x`. Two packages, about
+/// three megabytes, and no second toolchain anywhere --- which is why it is
+/// glibc and not musl: musl.cc is not reachable from every build host and
+/// Ubuntu does not package musl for i386 at all, while the 64-bit userspace
+/// of this image is already glibc from this same suite.
+///
+/// Best-effort and silent about it: a build host that cannot reach the
+/// archive gets a warning and an image without 32-bit support, exactly as it
+/// already does for the rest of the apt tap. Nothing else in the image
+/// depends on these files.
+pub(super) fn multilib32(root: &Path, arch: &str) {
+    // x86_64 only: i386 code runs in the CPU's compatibility mode, which is
+    // an x86 thing, and `compat32` is built for no other architecture.
+    if arch != "x86_64" || !use_apt(arch) {
+        return;
+    }
+    const DEB: &str = "i386";
+    let cache = cache_dir(DEB);
+    let _ = fs::create_dir_all(&cache);
+    let stage = PROJECT_DIR.join("ignored").join("apt-multilib32");
+    let _ = fs::remove_dir_all(&stage);
+    let _ = fs::create_dir_all(&stage);
+
+    println!(
+        "apt multilib32: downloading {} i386 package(s) for the 32-bit runtime...",
+        MULTILIB32_PKGS.len()
+    );
+    if !download_packages(&cache, DEB, MULTILIB32_PKGS) {
+        eprintln!(
+            "warning: apt multilib32: download failed (offline?). \
+             A dynamic i386 binary will not start in this image."
+        );
+        let _ = fs::remove_dir_all(&stage);
+        return;
+    }
+    if !extract_debs(&cache, MULTILIB32_PKGS, &stage).any() {
+        eprintln!("warning: apt multilib32: no se extrajo ni un .deb de i386");
+        let _ = fs::remove_dir_all(&stage);
+        return;
+    }
+
+    // `/lib/i386-linux-gnu` and `/lib/ld-linux.so.2`, which are two of the
+    // four directories glibc's i386 loader searches with no configuration at
+    // all --- so no `ld.so.conf` and no cache have to be right for this to
+    // work. Copied and not symlinked, like the 64-bit loader above: the
+    // filesystem these end up in is packed by `mk-sfs`.
+    let tuple = gnu_tuple(DEB);
+    let from = [
+        stage.join("usr/lib").join(tuple),
+        stage.join("lib").join(tuple),
+    ];
+    let into = root.join("lib").join(tuple);
+    let _ = fs::create_dir_all(&into);
+    let mut copied = 0usize;
+    for dir in from.iter().filter(|d| d.is_dir()) {
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            // `.is_file()` follows a symlink, which is what is wanted: the
+            // deb ships `libc.so.6` as the real file and several names
+            // pointing at it, and each of those becomes a real copy here.
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            if fs::copy(&path, into.join(name)).is_ok() {
+                copied += 1;
+            }
+        }
+    }
+    // The interpreter, at the path every i386 ELF names in its `PT_INTERP`.
+    let loader = into.join(LOADER32);
+    let at = root.join("lib").join(LOADER32);
+    let installed = loader.is_file() && {
+        let _ = fs::remove_file(&at);
+        fs::copy(&loader, &at).is_ok()
+    };
+    if installed {
+        println!(
+            "apt multilib32: {copied} i386 library file(s) in /lib/{tuple}, \
+             loader at /lib/{LOADER32}"
+        );
+    } else {
+        eprintln!(
+            "warning: apt multilib32: {copied} file(s) copied but no \
+             {LOADER32}: a dynamic i386 binary will not start"
+        );
+    }
+    let _ = fs::remove_dir_all(&stage);
+}
+
 pub(super) fn gnu_tuple(deb: &str) -> &'static str {
     match deb {
         "amd64" => "x86_64-linux-gnu",
         "arm64" => "aarch64-linux-gnu",
+        "i386" => "i386-linux-gnu",
         _ => "x86_64-linux-gnu",
     }
 }
@@ -1719,6 +1835,53 @@ mod tests {
         assert_eq!(deb_arch("x86_64"), Some("amd64"));
         assert_eq!(deb_arch("aarch64"), Some("arm64"));
         assert_eq!(deb_arch("riscv64"), None);
+    }
+
+    /// **i386 se baja del archivo de amd64, no de ports.** Ubuntu dejo de ser
+    /// una distribucion de i386 despues de la 19.10 pero se quedo la
+    /// arquitectura para multilib, asi que `binary-i386` esta junto a la de
+    /// amd64; pedirsela a ports.ubuntu.com es un 404 por cada paquete, y el
+    /// camino es best-effort, asi que la imagen saldria sin runtime de 32
+    /// bits y sin que nada lo dijera mas alto que un warning.
+    #[test]
+    fn el_i386_vive_en_el_archivo_de_amd64_y_no_en_ports() {
+        assert_eq!(mirror("i386"), mirror("amd64"));
+        assert!(mirror("i386").contains("archive.ubuntu.com"));
+        assert_ne!(mirror("i386"), mirror("arm64"));
+        assert!(mirror("arm64").contains("ports"));
+        // Y el directorio donde van sus bibliotecas, que es el que busca el
+        // cargador de i386 sin que haya que configurarle nada.
+        assert_eq!(gnu_tuple("i386"), "i386-linux-gnu");
+        assert_eq!(gnu_tuple("amd64"), "x86_64-linux-gnu");
+    }
+
+    /// El runtime de 32 bits son DOS paquetes: la libc y la biblioteca de
+    /// soporte del compilador, que es contra lo que enlaza un binario `-m32`.
+    /// Nada mas: una imagen con bibliotecas que nadie llama es una imagen
+    /// mas grande para nada.
+    #[test]
+    fn el_runtime_de_32_bits_son_la_libc_y_libgcc() {
+        assert_eq!(MULTILIB32_PKGS, &["libc6", "libgcc-s1"]);
+        assert_eq!(LOADER32, "ld-linux.so.2");
+    }
+
+    /// Y no se mete en ninguna otra arquitectura: el modo de compatibilidad
+    /// es cosa de x86, y `compat32` no se construye para las otras dos. Sin
+    /// red: lo que se comprueba es que vuelve sin tocar el arbol.
+    #[test]
+    fn el_runtime_de_32_bits_es_solo_de_x86_64() {
+        let root = PROJECT_DIR
+            .join("ignored")
+            .join("test-multilib32-arm64-root");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        multilib32(&root, "aarch64");
+        multilib32(&root, "riscv64");
+        assert!(
+            !root.join("lib").exists(),
+            "multilib32 escribio en una rootfs que no es de x86_64"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

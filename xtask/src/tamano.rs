@@ -131,6 +131,14 @@ const PASADOS: &[(&str, usize)] = &[
     // `apk_arch_tests` a `linux/apk_arch_tests.rs`, y queda en 5689. El techo
     // se queda en 5750 porque es el múltiplo de 250 que le viene justo;
     // quedan TRES `mod` de test de primer nivel aquí.
+    //
+    // 5-nov otra vez, con la sonda dinamica de i386 (`i386_glibc`): 5791. Esta
+    // vez no salió un `mod` de test sino PRODUCCIÓN, que es lo que tocaba: las
+    // cuatro funciones que montan las sondas de 32 bits (`i386_hello`,
+    // `i386_glibc`, `i386_dyn_pairs` y el `fresh_i386`/`assemble_i386` que
+    // comparten) son un tema propio, así que se fueron a `linux/i386.rs` ---
+    // 308 líneas --- y el fichero queda en 5504. El techo sigue en 5750, que
+    // es el múltiplo de 250 que le viene justo.
     ("xtask/src/linux/mod.rs", 5750),
     // 7000: master llego a 6753 con el techo en 6750, asi que el trinquete
     // estaba rojo antes de esta tanda y no por ella. 7250: la busqueda por
