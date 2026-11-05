@@ -23,6 +23,8 @@ use std::{fs, path::Path};
 /// D-Bus, no Qt, no KF6):
 ///   * the labwc window theme, by rewriting `<name>` in `rc.xml` in place;
 ///   * the foot palette, by copying `foot.kde.ini` / `foot.eclipse.ini`;
+///   * the GTK stylesheet, by copying `gtk.<look>.css` over `gtk.css` (or
+///     removing it for a look that has none);
 ///   * the panel and the wallpaper, which read `/etc/eclipse/look` themselves
 ///     on start -- so the switch restarts lunarbar and lunarbg (eclipse-init
 ///     respawns both at once).
@@ -117,6 +119,15 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           # foot palette for new terminals (a running foot keeps its colours).\n\
           \x20 src=\"$CFG/foot/foot.$look.ini\"\n\
           \x20 [ -f \"$src\" ] && cp -f \"$src\" \"$CFG/foot/foot.ini\"\n\
+          # GTK stylesheet for new GTK windows (Firefox included): the look's\n\
+          # own, or none at all -- stock Adwaita-dark -- for a look without one.\n\
+          \x20 for v in gtk-3.0 gtk-4.0; do\n\
+          \x20   if [ -f \"$CFG/$v/gtk.$look.css\" ]; then\n\
+          \x20     cp -f \"$CFG/$v/gtk.$look.css\" \"$CFG/$v/gtk.css\"\n\
+          \x20   else\n\
+          \x20     rm -f \"$CFG/$v/gtk.css\"\n\
+          \x20   fi\n\
+          \x20 done\n\
           \x20 if [ \"$boot\" != boot ]; then\n\
           \x20   if [ -n \"${LABWC_PID:-}\" ] && kill -0 \"$LABWC_PID\" 2>/dev/null; then\n\
           \x20     kill -HUP \"$LABWC_PID\" 2>>\"$LOG\" || true\n\

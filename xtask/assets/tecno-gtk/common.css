@@ -1,0 +1,167 @@
+/* -- Shared by GTK 3 and GTK 4: the widgets themselves. -------------------
+ * Adwaita's own stylesheet uses literal colours, so naming colours alone
+ * does not repaint it: these rules do. Square corners, 1px hairlines, the
+ * cyan accent for focus and selection, as on the panel. */
+
+window, .background, dialog {
+  background-color: #060b14;
+  color: #e6f1ff;
+}
+
+headerbar, .titlebar, actionbar, toolbar, .toolbar, searchbar {
+  background: #0a1423;
+  background-image: none;
+  color: #e6f1ff;
+  border-color: #1d3550;
+  box-shadow: none;
+  border-radius: 0;
+}
+
+.sidebar, placessidebar, stacksidebar, .navigation-sidebar {
+  background-color: #0a1423;
+  color: #e6f1ff;
+}
+
+.view, list, listview, columnview, treeview.view, iconview, gridview,
+textview text, row {
+  background-color: #060b14;
+  color: #e6f1ff;
+}
+
+separator {
+  background: #1d3550;
+  min-width: 1px;
+  min-height: 1px;
+}
+
+button, menubutton > button, spinbutton button, combobox button,
+dropdown > button {
+  border-radius: 0;
+  background: #0a1423;
+  background-image: none;
+  border: 1px solid #1d3550;
+  color: #e6f1ff;
+  box-shadow: none;
+  text-shadow: none;
+  -gtk-icon-shadow: none;
+}
+button:hover { border-color: #38e1ff; }
+button:active, button:checked { background: #10233a; border-color: #38e1ff; }
+button:disabled { color: #8aa4c2; border-color: #1d3550; }
+button.flat { background: transparent; border-color: transparent; }
+button.flat:hover { border-color: #1d3550; }
+button.suggested-action {
+  background: #38e1ff; color: #04070d; border-color: #38e1ff;
+}
+button.destructive-action {
+  background: #0a1423; color: #ff8a5c; border-color: #ff8a5c;
+}
+
+entry, spinbutton, searchentry, passwordentry {
+  border-radius: 0;
+  background: #04070d;
+  background-image: none;
+  border: 1px solid #1d3550;
+  color: #e6f1ff;
+  box-shadow: none;
+}
+entry:focus, entry:focus-within, spinbutton:focus-within {
+  border-color: #38e1ff;
+  box-shadow: none;
+}
+
+selection, *:selected, row:selected, .view:selected, treeview.view:selected,
+flowboxchild:selected {
+  background-color: rgba(56, 225, 255, 0.20);
+  color: #e6f1ff;
+}
+
+popover > contents, popover.background, menu, .menu, .context-menu,
+.popup, tooltip, tooltip.background {
+  background: #0a1423;
+  color: #e6f1ff;
+  border: 1px solid #1d3550;
+  border-radius: 0;
+  box-shadow: none;
+}
+popover > arrow { background: #0a1423; border-color: #1d3550; }
+menuitem:hover, modelbutton:hover, popover modelbutton:hover {
+  background: rgba(56, 225, 255, 0.20);
+  color: #e6f1ff;
+}
+
+check, radio {
+  background: #04070d;
+  background-image: none;
+  border: 1px solid #1d3550;
+  color: #04070d;
+  box-shadow: none;
+}
+check { border-radius: 0; }
+check:checked, radio:checked, check:indeterminate {
+  background: #38e1ff;
+  border-color: #38e1ff;
+  color: #04070d;
+}
+
+switch {
+  border-radius: 0;
+  background: #04070d;
+  border: 1px solid #1d3550;
+}
+switch:checked { background: #38e1ff; border-color: #38e1ff; }
+switch slider {
+  border-radius: 0;
+  background: #e6f1ff;
+  border: none;
+  box-shadow: none;
+}
+
+progressbar trough, scale trough, levelbar trough {
+  background: #1d3550;
+  border: none;
+  border-radius: 0;
+}
+progressbar progress, scale highlight, levelbar block.filled {
+  background: #38e1ff;
+  background-image: none;
+  border-color: #38e1ff;
+  border-radius: 0;
+}
+scale slider {
+  border-radius: 0;
+  background: #e6f1ff;
+  border: 1px solid #38e1ff;
+  box-shadow: none;
+}
+
+scrollbar { background: transparent; border: none; }
+scrollbar slider {
+  background: #1d3550;
+  border: none;
+  border-radius: 0;
+  min-width: 4px;
+  min-height: 4px;
+}
+scrollbar slider:hover, scrollbar slider:active { background: #38e1ff; }
+
+notebook > header, tabbar, .tab-bar {
+  background: #0a1423;
+  border-color: #1d3550;
+}
+notebook > header tab { border-radius: 0; color: #8aa4c2; }
+notebook > header tab:checked {
+  color: #e6f1ff;
+  box-shadow: inset 0 -2px #38e1ff;
+}
+
+frame > border, .frame {
+  border: 1px solid #1d3550;
+  border-radius: 0;
+}
+
+link, *:link { color: #38e1ff; }
+.warning { color: #f2c14e; }
+.error { color: #ff8a5c; }
+.success { color: #6ee7a8; }
+.dim-label, .dim-label label { color: #8aa4c2; opacity: 1; }

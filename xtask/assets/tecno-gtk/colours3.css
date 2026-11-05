@@ -1,0 +1,28 @@
+/* Eclipse OS - tecno look for GTK 3 (generated into ~/.config/gtk-3.0/gtk.css
+ * by xtask: edit xtask/assets/tecno-gtk/ and rebuild, not this file).
+ *
+ * The named colours GTK 3 exports to applications. Adwaita itself does not
+ * read them, but Firefox does: its "system" theme paints the toolbar, the
+ * tabs and the URL bar from exactly these, which is how the browser goes
+ * tecno with no profile of its own to customise. */
+@define-color theme_bg_color #0a1423;
+@define-color theme_fg_color #e6f1ff;
+@define-color theme_base_color #060b14;
+@define-color theme_text_color #e6f1ff;
+@define-color theme_selected_bg_color #38e1ff;
+@define-color theme_selected_fg_color #04070d;
+@define-color insensitive_bg_color #0a1423;
+@define-color insensitive_fg_color #8aa4c2;
+@define-color insensitive_base_color #060b14;
+@define-color theme_unfocused_bg_color #0a1423;
+@define-color theme_unfocused_fg_color #8aa4c2;
+@define-color theme_unfocused_base_color #060b14;
+@define-color theme_unfocused_text_color #8aa4c2;
+@define-color theme_unfocused_selected_bg_color #1d3550;
+@define-color theme_unfocused_selected_fg_color #e6f1ff;
+@define-color borders #1d3550;
+@define-color unfocused_borders #1d3550;
+@define-color warning_color #f2c14e;
+@define-color error_color #ff8a5c;
+@define-color success_color #6ee7a8;
+
