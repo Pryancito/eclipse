@@ -70,8 +70,8 @@ pub fn op_label(op: Op, lang: Lang) -> &'static str {
     lang.s(match op {
         Op::Open => Key::file_btn_open,
         Op::Rename => Key::file_op_rename,
-        Op::Copy => Key::file_op_copy,
-        Op::Cut => Key::file_op_cut,
+        Op::Copy => Key::word_copy,
+        Op::Cut => Key::word_cut,
         Op::Paste => Key::file_op_paste,
         Op::NewDir => Key::file_op_newdir,
         Op::Trash => Key::file_op_trash,

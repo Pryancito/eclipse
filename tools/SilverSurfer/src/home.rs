@@ -15,17 +15,25 @@ fn hex(rgb: crate::look::Rgb) -> String {
     format!("#{:02x}{:02x}{:02x}", rgb.r, rgb.g, rgb.b)
 }
 
-fn render_home(look: Look) -> String {
+fn render_home(look: Look, lang: crate::Lang) -> String {
     let bg = hex(look.palette().panel);
+    // `<html lang>` is not decoration: it is what tells the engine which
+    // language the page is in, and it is the one thing on this page that is
+    // text at all. The page itself is a logo on a colour.
+    let tag = match lang {
+        crate::Lang::Es => "es",
+        crate::Lang::En => "en",
+    };
     HTML_TEMPLATE
         .replace("{{BG}}", &bg)
+        .replace("{{LANG}}", tag)
         .replace("{{LOGO}}", LOGO_SVG.trim())
 }
 
 /// Blank welcome page with the Eclipse OS logo, tinted to the current look.
 pub fn home_url() -> Url {
     let path = std::env::temp_dir().join("silversurfer-home.html");
-    let html = render_home(Look::current());
+    let html = render_home(Look::current(), crate::lang());
     let _ = std::fs::write(&path, html);
     Url::from_file_path(&path).expect("el directorio temporal es absoluto")
 }
@@ -43,8 +51,14 @@ mod tests {
 
     #[test]
     fn the_start_page_is_a_blank_canvas_with_the_eclipse_logo() {
-        let html = render_home(Look::Eclipse);
+        let html = render_home(Look::Eclipse, crate::Lang::Es);
+        assert!(html.contains("<html lang=\"es\">"));
+        assert!(
+            render_home(Look::Eclipse, crate::Lang::En).contains("<html lang=\"en\">"),
+            "the page says which language it is in"
+        );
         assert!(!html.contains("{{BG}}"));
+        assert!(!html.contains("{{LANG}}"));
         assert!(!html.contains("{{LOGO}}"));
         assert!(html.contains("#0b1220"), "eclipse panel colour: {html}");
         assert!(
@@ -67,9 +81,9 @@ mod tests {
 
     #[test]
     fn the_start_page_follows_the_active_look_palette() {
-        let kde = render_home(Look::Kde);
+        let kde = render_home(Look::Kde, crate::Lang::Es);
         assert!(kde.contains("#2a2e32"), "{kde}");
-        let win = render_home(Look::Win11);
+        let win = render_home(Look::Win11, crate::Lang::Es);
         assert!(win.contains("#2b2b2b"), "{win}");
     }
 

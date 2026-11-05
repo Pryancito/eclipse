@@ -240,8 +240,12 @@ impl App {
         }
         let gpu = self.session.as_ref().is_some_and(|s| s.gpu);
         let private = self.session.as_ref().is_some_and(|s| s.private);
-        let window_title = if private && !window_title.contains("Privado") {
-            format!("Privado — {window_title}")
+        // `Privado — …` / `Private — …`, and only once: the title comes back
+        // from the engine on every frame and a second pass would stack the
+        // word on itself.
+        let private_word = crate::lang().s(crate::Key::www_private);
+        let window_title = if private && !window_title.contains(private_word) {
+            format!("{private_word} — {window_title}")
         } else {
             window_title
         };

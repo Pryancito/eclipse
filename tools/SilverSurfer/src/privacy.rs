@@ -6,54 +6,74 @@
 
 use url::Url;
 
+use crate::Key;
+
 /// Página `about:privacy` (fichero temporal).
 pub fn privacy_page_url() -> Url {
-    let body = "\
-<!doctype html><meta charset=utf-8><title>Privacidad — SilverSurfer</title>\
-<style>body{font:14px/1.5 system-ui,sans-serif;margin:2rem;background:#111;color:#eee;max-width:40rem}\
-code{background:#222;padding:.1rem .35rem}a{color:#7ec8ff}h1{font-size:1.35rem}</style>\
-<h1>Privacidad</h1>\
-<p>La <strong>ventana privada</strong> (<code>--private</code> o Ctrl+Shift+P) no\
- restaura pestañas ni escribe <code>session.json</code>. Al cerrarla se borran\
- cookies, almacenamiento web y caché HTTP de esa instancia.</p>\
-<p>Servo 0.7 no aísla aún el almacenamiento privado por WebView; el proceso\
- dedicado es el aislamiento práctico en Eclipse.</p>\
+    let l = crate::lang();
+    let s = |k| l.s(k);
+    let head = s(Key::www_privacy);
+    let body = format!(
+        "<!doctype html><meta charset=utf-8><title>{head} — SilverSurfer</title>\
+<style>body{{font:14px/1.5 system-ui,sans-serif;margin:2rem;background:#111;color:#eee;max-width:40rem}}\
+code{{background:#222;padding:.1rem .35rem}}a{{color:#7ec8ff}}h1{{font-size:1.35rem}}</style>\
+<h1>{head}</h1>\
+<p>{window}</p>\
+<p>{servo}</p>\
 <ul>\
-<li><code>Ctrl+Shift+Delete</code> — borrar cookies y datos de sitio ahora</li>\
-<li><a href=\"about:clear\">about:clear</a> — misma acción vía página</li>\
-<li><a href=\"about:cookies\">about:cookies</a> — lista de sitios con datos</li>\
-<li><a href=\"about:passwords\">about:passwords</a> — logins guardados (no en privado)</li>\
-</ul>";
-    write_temp("silversurfer-privacy.html", body)
+<li><code>Ctrl+Shift+Delete</code> — {now}</li>\
+<li><a href=\"about:clear\">about:clear</a> — {same}</li>\
+<li><a href=\"about:cookies\">about:cookies</a> — {list}</li>\
+<li><a href=\"about:passwords\">about:passwords</a> — {logins}</li>\
+</ul>",
+        window = s(Key::www_privacy_window),
+        servo = s(Key::www_privacy_servo),
+        now = s(Key::www_privacy_clear_now),
+        same = s(Key::www_privacy_same_via_page),
+        list = s(Key::www_privacy_site_list),
+        logins = s(Key::www_privacy_logins),
+    );
+    write_temp("silversurfer-privacy.html", &body)
 }
 
 /// Confirmación tras borrar datos.
 pub fn cleared_page_url(summary: &str) -> Url {
+    let l = crate::lang();
     let body = format!(
-        "<!doctype html><meta charset=utf-8><title>Datos borrados — SilverSurfer</title>\
+        "<!doctype html><meta charset=utf-8><title>{head} — SilverSurfer</title>\
 <style>body{{font:14px/1.5 system-ui,sans-serif;margin:2rem;background:#111;color:#eee}}\
 a{{color:#7ec8ff}}</style>\
-<h1>Datos borrados</h1><p>{}</p>\
-<p><a href=\"about:privacy\">Volver a privacidad</a> · \
-<a href=\"about:home\">Inicio</a></p>",
-        html_escape(summary)
+<h1>{head}</h1><p>{summary}</p>\
+<p><a href=\"about:privacy\">{back}</a> · \
+<a href=\"about:home\">{home}</a></p>",
+        head = l.s(Key::www_cleared),
+        summary = html_escape(summary),
+        back = l.s(Key::www_back_to_privacy),
+        home = l.s(Key::word_home),
     );
     write_temp("silversurfer-cleared.html", &body)
 }
 
 /// Lista de sitios (nombres eTLD+1) con datos.
 pub fn cookies_page_html(sites: &[(String, String)]) -> String {
-    let mut body = String::from(
-        "<!doctype html><meta charset=utf-8><title>Cookies y datos — SilverSurfer</title>\
-<style>body{font:14px/1.45 system-ui,sans-serif;margin:2rem;background:#111;color:#eee}\
-.t{color:#999;font-size:12px;margin-left:.5rem}li{margin:.35rem 0}\
-a{color:#7ec8ff}h1{font-size:1.35rem}</style>\
-<h1>Cookies y datos de sitio</h1>",
+    let l = crate::lang();
+    let mut body = format!(
+        "<!doctype html><meta charset=utf-8><title>{tab} — SilverSurfer</title>\
+<style>body{{font:14px/1.45 system-ui,sans-serif;margin:2rem;background:#111;color:#eee}}\
+.t{{color:#999;font-size:12px;margin-left:.5rem}}li{{margin:.35rem 0}}\
+a{{color:#7ec8ff}}h1{{font-size:1.35rem}}</style>\
+<h1>{head}</h1>",
+        tab = l.s(Key::www_cookies_and_data),
+        head = l.s(Key::www_cookies_title),
     );
     if sites.is_empty() {
-        body.push_str("<p>No hay sitios con cookies ni almacenamiento local.</p>");
+        body.push_str(&format!("<p>{}</p>", l.s(Key::www_cookies_empty)));
     } else {
-        body.push_str(&format!("<p>{} sitios:</p><ul>", sites.len()));
+        body.push_str(&format!(
+            "<p>{} {}</p><ul>",
+            sites.len(),
+            l.s(Key::www_sites)
+        ));
         for (name, kinds) in sites {
             body.push_str(&format!(
                 "<li>{}<span class=t>{}</span></li>",
@@ -63,10 +83,12 @@ a{color:#7ec8ff}h1{font-size:1.35rem}</style>\
         }
         body.push_str("</ul>");
     }
-    body.push_str(
-        "<p><a href=\"about:clear\">Borrar todo</a> · \
-<a href=\"about:privacy\">Privacidad</a></p>",
-    );
+    body.push_str(&format!(
+        "<p><a href=\"about:clear\">{}</a> · \
+<a href=\"about:privacy\">{}</a></p>",
+        l.s(Key::www_clear_all),
+        l.s(Key::www_privacy),
+    ));
     body
 }
 
@@ -103,7 +125,9 @@ mod tests {
         let url = privacy_page_url();
         assert_eq!(url.scheme(), "file");
         let body = std::fs::read_to_string(url.to_file_path().unwrap()).unwrap();
-        assert!(body.contains("ventana privada"));
+        // Against the ROW, not against its Spanish column: this container's
+        // `/etc/eclipse/locale` is whatever the last measurement left in it.
+        assert!(body.contains(crate::lang().s(Key::www_privacy_window)));
         assert!(body.contains("Ctrl+Shift+Delete"));
     }
 
@@ -115,7 +139,7 @@ mod tests {
         ]);
         assert!(html.contains("example.com"));
         assert!(html.contains("servo.org"));
-        assert!(html.contains("2 sitios"));
+        assert!(html.contains(&format!("2 {}", crate::lang().s(Key::www_sites))));
     }
 
     #[test]

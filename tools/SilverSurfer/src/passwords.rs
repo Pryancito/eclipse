@@ -334,18 +334,20 @@ pub fn origin_of(url: &str) -> Option<String> {
 
 pub fn page_url() -> url::Url {
     let store = load();
-    let mut body = String::from(
-        "<!doctype html><meta charset=utf-8><title>Contraseñas — SilverSurfer</title>\
-<style>body{font:14px/1.45 system-ui,sans-serif;margin:2rem;background:#111;color:#eee}\
-.t{color:#999;font-size:12px}li{margin:.4rem 0}h1{font-size:1.35rem}\
-code{background:#222;padding:.1rem .3rem}</style>\
-<h1>Contraseñas guardadas</h1>\
-<p>Ctrl+Shift+L guarda el login visible. Autocompletado al cargar el origen.\
- Cifrado con ChaCha20-Poly1305 en <code>passwords.json</code>; la clave está\
- en <code>passwords.key</code>.</p>",
+    let l = crate::lang();
+    let mut body = format!(
+        "<!doctype html><meta charset=utf-8><title>{tab} — SilverSurfer</title>\
+<style>body{{font:14px/1.45 system-ui,sans-serif;margin:2rem;background:#111;color:#eee}}\
+.t{{color:#999;font-size:12px}}li{{margin:.4rem 0}}h1{{font-size:1.35rem}}\
+code{{background:#222;padding:.1rem .3rem}}</style>\
+<h1>{head}</h1>\
+<p>{how}</p>",
+        tab = l.s(crate::Key::www_passwords),
+        head = l.s(crate::Key::www_passwords_saved),
+        how = l.s(crate::Key::www_passwords_how),
     );
     if store.entries.is_empty() {
-        body.push_str("<p>Vacío.</p>");
+        body.push_str(&format!("<p>{}</p>", l.s(crate::Key::www_empty)));
     } else {
         body.push_str("<ul>");
         for e in &store.entries {

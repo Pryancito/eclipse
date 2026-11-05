@@ -445,7 +445,10 @@ pub fn render(view: &View<'_>) -> Pixels {
     let text = pal.text;
     let dim = pal.dim;
     for (i, rect) in lay.tabs.iter().enumerate() {
-        let raw = titles.get(i).map(String::as_str).unwrap_or("Nueva pestaña");
+        let raw = titles
+            .get(i)
+            .map(String::as_str)
+            .unwrap_or_else(|| crate::lang().s(crate::Key::www_new_tab));
         let loading = view.loading.get(i).copied().unwrap_or(false);
         let title = if loading {
             format!("…{raw}")
@@ -497,11 +500,11 @@ pub fn render(view: &View<'_>) -> Pixels {
             scale,
         );
     }
-    let placeholder = if view.find_mode {
-        "Buscar en la página"
+    let placeholder = crate::lang().s(if view.find_mode {
+        crate::Key::www_find_in_page
     } else {
-        "Buscar o escribir una dirección"
-    };
+        crate::Key::www_search_or_url
+    });
     let loc = if view.location.is_empty() {
         placeholder
     } else {

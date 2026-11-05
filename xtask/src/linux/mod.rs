@@ -2357,11 +2357,21 @@ impl LinuxRootfs {
         let dir = PROJECT_DIR.join("tools").join("install-eclipse");
         let executable = dir.join("install-eclipse");
         let source = dir.join("install-eclipse.c");
-        // Rebuild if missing or if source is newer than the binary.
-        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
-            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
-            {
-                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
+        // Rebuild if missing or if a source is newer than the binary. The
+        // string table lives in its own header, and a translation changed
+        // there leaves the installer looking up to date while the image still
+        // carries the old text, with nothing in any log to say so.
+        let sources = [source.clone(), dir.join("i18n.h")];
+        if executable.is_file()
+            && sources.iter().all(|src| src.is_file())
+            && self.cached_for_target(&executable)
+        {
+            if let Ok(bin_mtime) = fs::metadata(&executable).and_then(|m| m.modified()) {
+                let newest = sources
+                    .iter()
+                    .filter_map(|src| fs::metadata(src).and_then(|m| m.modified()).ok())
+                    .max();
+                if let Some(src_mtime) = newest {
                     if bin_mtime >= src_mtime {
                         return executable;
                     }
@@ -3252,13 +3262,17 @@ impl LinuxRootfs {
             .join("lunarbg");
         // Rebuild when any source file (its own tree, the shared text crate
         // and the manifest) is newer than the binary.
-        let newest_src = [newest_mtime_under(&dir.join("src")), lunartext_mtime()]
-            .into_iter()
-            .chain([fs::metadata(dir.join("Cargo.toml"))
-                .ok()
-                .and_then(|m| m.modified().ok())])
-            .flatten()
-            .max();
+        let newest_src = [
+            newest_mtime_under(&dir.join("src")),
+            lunartext_mtime(),
+            eclipse_i18n_mtime(),
+        ]
+        .into_iter()
+        .chain([fs::metadata(dir.join("Cargo.toml"))
+            .ok()
+            .and_then(|m| m.modified().ok())])
+        .flatten()
+        .max();
         if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
             if let Ok(bin_mtime) = bin_meta.modified() {
                 if bin_mtime >= src_mtime && self.cached_for_target(&executable) {
@@ -3700,6 +3714,7 @@ impl LinuxRootfs {
         let newest_src = [
             newest_mtime_under(&dir.join("src")),
             lunartext_mtime(),
+            eclipse_i18n_mtime(),
             fs::metadata(dir.join("Cargo.toml"))
                 .ok()
                 .and_then(|m| m.modified().ok()),
@@ -5381,6 +5396,9 @@ fn check_so<P: AsRef<Path>>(path: P) -> bool {
 
 #[cfg(test)]
 mod var_run_tests;
+
+#[cfg(test)]
+mod installer_i18n_tests;
 
 #[cfg(test)]
 mod fstab_template_tests;
