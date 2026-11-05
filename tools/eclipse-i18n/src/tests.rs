@@ -197,3 +197,29 @@ fn both_month_tables_run_january_to_december() {
         }
     }
 }
+
+/// A row's two columns take the same number of `{}` holes.
+///
+/// A translation that dropped the hole draws the sentence without the filename
+/// in it, and one that gained a hole prints a literal `{}` on the panel. Both
+/// are the kind of thing nobody sees until the desktop is running in the other
+/// language, which is exactly what this file is for.
+#[test]
+fn every_row_fills_the_same_holes_in_both_languages() {
+    for key in Key::ALL {
+        let (es, en) = key.pair();
+        assert_eq!(
+            es.matches("{}").count(),
+            en.matches("{}").count(),
+            "{}: the two columns do not take the same number of `{{}}` holes",
+            key.name()
+        );
+    }
+}
+
+/// The two languages do not write a fraction the same way.
+#[test]
+fn each_language_has_its_own_decimal_point() {
+    assert_eq!(Lang::Es.decimal_point(), ',');
+    assert_eq!(Lang::En.decimal_point(), '.');
+}

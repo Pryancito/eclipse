@@ -88,6 +88,19 @@ impl Lang {
         }
     }
 
+    /// The character a fraction is written with: `1,5 K` in Spanish, `1.5 K`
+    /// in English.
+    ///
+    /// Not a row of the table because it is not a string anybody translated:
+    /// it is how the language writes numbers, and the only number in the whole
+    /// desktop with a fraction in it is lunarfile's size column.
+    pub fn decimal_point(self) -> char {
+        match self {
+            Lang::Es => ',',
+            Lang::En => '.',
+        }
+    }
+
     // ── the named accessors the panel already called ─────────────────────
     //
     // Before the table existed, lunarbar's `i18n.rs` had one method per

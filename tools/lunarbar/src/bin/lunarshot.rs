@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H};
 use lunarbar::fill_guard;
 use lunarbar::hunter_notify::{self, Action as NotifyAction, Alert, Severity};
-use lunarbar::i18n::Lang;
+use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL};
 use lunarbar::proc::{self, map_shm_pool};
 use tiny_skia::{FilterQuality, IntSize, Pixmap, PixmapPaint, Transform};
@@ -178,10 +178,7 @@ fn pictures_dir(home: &Path, xdg: Option<&str>, lang: Lang) -> PathBuf {
             return home.join(name);
         }
     }
-    home.join(match lang {
-        Lang::Es => "Imágenes",
-        Lang::En => "Pictures",
-    })
+    home.join(lang.s(Key::pictures_folder))
 }
 
 /// `captura-2026-11-05-052612.png` for a moment, as local time.

@@ -223,10 +223,7 @@ pub fn draw(
 
 /// The today button's word.
 fn today_label() -> String {
-    let label = match i18n::Lang::current() {
-        i18n::Lang::Es => "hoy",
-        i18n::Lang::En => "today",
-    };
+    let label = i18n::Lang::current().s(i18n::Key::word_today);
     if tecno() {
         label.to_uppercase()
     } else {

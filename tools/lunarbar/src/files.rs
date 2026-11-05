@@ -13,6 +13,8 @@
 
 use std::path::Path;
 
+use crate::i18n::{Key, Lang};
+
 /// One row of a directory listing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -192,10 +194,13 @@ pub fn read_dir_sorted(dir: &str) -> std::io::Result<Vec<Entry>> {
 /// A byte count as a file manager shows it: `0 B`, `12 B`, `4,0 K`, `1,5 M`.
 ///
 /// Powers of 1024, one decimal below 10 of a unit and none above, which is what
-/// keeps the column from jittering between `9,9 M` and `10,0 M`. The separator
-/// is a comma because the image's locale is Spanish and this is the only number
-/// in the UI with a fraction in it.
-pub fn human_size(bytes: u64) -> String {
+/// keeps the column from jittering between `9,9 M` and `10,0 M`. The fraction
+/// is written with `lang`'s own separator -- a comma in Spanish, a point in
+/// English -- which is the only place in the desktop where that matters, since
+/// this is the only number in it with a fraction in it. The units are the
+/// single letters `B K M G T P`, which are not translated: they are the
+/// symbols, and `K` is `K` in both languages.
+pub fn human_size(bytes: u64, lang: Lang) -> String {
     const UNITS: [&str; 6] = ["B", "K", "M", "G", "T", "P"];
     if bytes < 1024 {
         return format!("{bytes} B");
@@ -209,7 +214,7 @@ pub fn human_size(bytes: u64) -> String {
         u += 1;
     }
     if v < 10.0 {
-        format!("{:.1} {}", v, UNITS[u]).replace('.', ",")
+        format!("{:.1} {}", v, UNITS[u]).replace('.', &lang.decimal_point().to_string())
     } else {
         format!("{:.0} {}", v, UNITS[u])
     }
@@ -280,12 +285,20 @@ pub fn default_dir(home: Option<&str>) -> String {
 
 // ── dates ────────────────────────────────────────────────────────────────────
 
-const MONTHS: [&str; 12] = [
-    "ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic",
-];
-
-/// The widest thing `short_date` returns, in characters (`28 sep 2025`).
-pub const DATE_CHARS: usize = 11;
+/// The widest thing `short_date` returns in `lang`, in characters.
+///
+/// It is not the same number in the two languages, and it has to be asked for
+/// rather than fixed: Spanish tops out at `28 sep 2025` (11), English at
+/// `yesterday 18:03` (15). A single number for both would either cut the
+/// English date off or leave four characters of air to the right of every
+/// Spanish one, and `lunarfile` charges the NAME column for whatever this
+/// says, so either one is paid for on every row.
+pub fn date_chars(lang: Lang) -> usize {
+    match lang {
+        Lang::Es => 11,
+        Lang::En => 15,
+    }
+}
 
 /// `(year, month 1-12, day)` of a count of days since 1970-01-01.
 ///
@@ -307,11 +320,12 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// A modification time as a file manager's date column shows it, relative to
 /// `now`, both in seconds since the epoch and read in a zone `offset` seconds
 /// east of UTC: `hoy 10:40`, `ayer 18:03`, `3 oct`, or `28 sep 2025` once it is
-/// another year. Never wider than `DATE_CHARS`.
+/// another year. Never wider than `date_chars(lang)`.
 ///
 /// A time in the future (a clock that was wrong when the file was written) is
 /// shown as a plain date rather than as "hoy", which would be a lie.
-pub fn short_date(mtime: i64, now: i64, offset: i64) -> String {
+pub fn short_date(mtime: i64, now: i64, offset: i64, lang: Lang) -> String {
+    let months = lang.month_short();
     let local = |t: i64| t.saturating_add(offset);
     let (t, n) = (local(mtime), local(now));
     let (day, today) = (t.div_euclid(86_400), n.div_euclid(86_400));
@@ -320,13 +334,13 @@ pub fn short_date(mtime: i64, now: i64, offset: i64) -> String {
     let (ny, _, _) = civil_from_days(today);
     let hm = format!("{:02}:{:02}", secs / 3600, secs / 60 % 60);
     if mtime <= now && day == today {
-        format!("hoy {hm}")
+        format!("{} {hm}", lang.s(Key::word_today))
     } else if mtime <= now && day + 1 == today {
-        format!("ayer {hm}")
+        format!("{} {hm}", lang.s(Key::word_yesterday))
     } else if y == ny {
-        format!("{d} {}", MONTHS[(m - 1) as usize])
+        format!("{d} {}", months[(m - 1) as usize])
     } else {
-        format!("{d} {} {y}", MONTHS[(m - 1) as usize])
+        format!("{d} {} {y}", months[(m - 1) as usize])
     }
 }
 
@@ -406,14 +420,17 @@ pub struct Place {
 /// gets the first few, not a rail taller than the screen.
 pub const MAX_PLACES: usize = 10;
 
-/// The usual folders under a home, in the order they are listed, each with
-/// the names it goes by: the Spanish one this image creates and the English
-/// one an imported home will have.
-const XDG_PLACES: [(&str, &[&str]); 4] = [
-    ("Documentos", &["Documentos", "Documents"]),
-    ("Descargas", &["Descargas", "Downloads"]),
-    ("Imágenes", &["Imágenes", "Imagenes", "Pictures"]),
-    ("Música", &["Música", "Musica", "Music"]),
+/// The usual folders under a home, in the order they are listed: the label the
+/// rail puts on each one, and the names it goes by on disk.
+///
+/// The names are BOTH languages' spellings whatever the session is in, and
+/// that is deliberate: an imported home has `Pictures` in it and a Spanish
+/// session still has to find it. Only the label follows the language.
+const XDG_PLACES: [(Key, &[&str]); 4] = [
+    (Key::file_place_documents, &["Documentos", "Documents"]),
+    (Key::file_place_downloads, &["Descargas", "Downloads"]),
+    (Key::pictures_folder, &["Imágenes", "Imagenes", "Pictures"]),
+    (Key::file_place_music, &["Música", "Musica", "Music"]),
 ];
 
 fn is_dir(p: &str) -> bool {
@@ -426,11 +443,11 @@ fn is_dir(p: &str) -> bool {
 /// A mount point is a directory that is not empty: `/mnt` with nothing
 /// mounted on it is an empty directory, and a rail entry that opens onto
 /// nothing is one the user learns to distrust.
-pub fn places_in(home: &str, mount_bases: &[&str]) -> Vec<Place> {
+pub fn places_in(home: &str, mount_bases: &[&str], lang: Lang) -> Vec<Place> {
     let mut out = Vec::new();
     if home != "/" {
         out.push(Place {
-            label: "Inicio".into(),
+            label: lang.s(Key::file_place_home).into(),
             path: home.to_string(),
         });
         for (label, names) in XDG_PLACES {
@@ -440,14 +457,14 @@ pub fn places_in(home: &str, mount_bases: &[&str]) -> Vec<Place> {
                 .find(|p| is_dir(p))
             {
                 out.push(Place {
-                    label: label.into(),
+                    label: lang.s(label).into(),
                     path,
                 });
             }
         }
     }
     out.push(Place {
-        label: "Raíz /".into(),
+        label: lang.s(Key::file_place_root).into(),
         path: "/".into(),
     });
     for base in mount_bases {
@@ -472,7 +489,7 @@ pub fn places_in(home: &str, mount_bases: &[&str]) -> Vec<Place> {
 
 /// `places_in` for this session: `$HOME`, and the mounts under `/media`,
 /// `/run/media/$USER` and `/mnt`.
-pub fn places(home: Option<&str>, user: Option<&str>) -> Vec<Place> {
+pub fn places(home: Option<&str>, user: Option<&str>, lang: Lang) -> Vec<Place> {
     let home = default_dir(home);
     let run_media = user
         .filter(|u| !u.is_empty() && !u.contains('/'))
@@ -482,7 +499,7 @@ pub fn places(home: Option<&str>, user: Option<&str>) -> Vec<Place> {
         bases.push(r);
     }
     bases.push("/mnt");
-    places_in(&home, &bases)
+    places_in(&home, &bases, lang)
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -712,30 +729,48 @@ mod tests {
 
     #[test]
     fn a_size_reads_in_the_unit_it_belongs_to_and_never_runs_off_the_table() {
-        assert_eq!(human_size(0), "0 B");
-        assert_eq!(human_size(1), "1 B");
-        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(0, Lang::Es), "0 B");
+        assert_eq!(human_size(1, Lang::Es), "1 B");
+        assert_eq!(human_size(1023, Lang::Es), "1023 B");
         // The unit changes exactly at the number it divides by.
-        assert_eq!(human_size(1024), "1,0 K");
-        assert_eq!(human_size(1536), "1,5 K");
-        assert_eq!(human_size(1024 * 1024), "1,0 M");
-        assert_eq!(human_size(1024 * 1024 * 1024), "1,0 G");
+        assert_eq!(human_size(1024, Lang::Es), "1,0 K");
+        assert_eq!(human_size(1536, Lang::Es), "1,5 K");
+        assert_eq!(human_size(1024 * 1024, Lang::Es), "1,0 M");
+        assert_eq!(human_size(1024 * 1024 * 1024, Lang::Es), "1,0 G");
         // One decimal below ten of a unit, none above, so the column does not
         // jitter between `9,9 M` and `10,0 M`.
-        assert_eq!(human_size(10 * 1024 * 1024), "10 M");
-        assert_eq!(human_size(999 * 1024 * 1024), "999 M");
+        assert_eq!(human_size(10 * 1024 * 1024, Lang::Es), "10 M");
+        assert_eq!(human_size(999 * 1024 * 1024, Lang::Es), "999 M");
         // u64::MAX must land in the last unit rather than index past the table.
-        let biggest = human_size(u64::MAX);
+        let biggest = human_size(u64::MAX, Lang::Es);
         assert!(biggest.ends_with(" P"), "{biggest}");
         // Every size in a wide sweep produces a unit from the table and nothing
         // with an `inf` or a `NaN` in it.
         for shift in 0..64 {
-            let s = human_size(1u64 << shift);
+            let s = human_size(1u64 << shift, Lang::Es);
             assert!(!s.contains("inf") && !s.contains("NaN"), "{s}");
             assert!(
                 ["B", "K", "M", "G", "T", "P"].contains(&s.rsplit(' ').next().unwrap()),
                 "{s}"
             );
+        }
+    }
+
+    /// The fraction is written the way the language writes it, and only the
+    /// fraction: `1023 B` and `10 M` have none and read the same in both.
+    #[test]
+    fn a_size_writes_its_fraction_the_way_the_language_does() {
+        assert_eq!(human_size(1536, Lang::Es), "1,5 K");
+        assert_eq!(human_size(1536, Lang::En), "1.5 K");
+        assert_eq!(human_size(1023, Lang::En), "1023 B");
+        assert_eq!(human_size(10 * 1024 * 1024, Lang::En), "10 M");
+        // The unit letters are symbols, not words: `K` is `K` in both.
+        for shift in 0..64 {
+            let (es, en) = (
+                human_size(1u64 << shift, Lang::Es),
+                human_size(1u64 << shift, Lang::En),
+            );
+            assert_eq!(es.rsplit(' ').next(), en.rsplit(' ').next(), "{es} / {en}");
         }
     }
 
@@ -948,23 +983,57 @@ mod tests {
     fn a_date_is_relative_to_today_and_never_wider_than_its_column() {
         // 2026-10-13 12:00:00 UTC.
         let now = 1_791_892_800;
-        assert_eq!(short_date(now - 3600, now, 0), "hoy 11:00");
-        assert_eq!(short_date(now - 86_400, now, 0), "ayer 12:00");
-        assert_eq!(short_date(now - 10 * 86_400, now, 0), "3 oct");
-        assert_eq!(short_date(now - 400 * 86_400, now, 0), "8 sep 2025");
+        assert_eq!(short_date(now - 3600, now, 0, Lang::Es), "hoy 11:00");
+        assert_eq!(short_date(now - 86_400, now, 0, Lang::Es), "ayer 12:00");
+        assert_eq!(short_date(now - 10 * 86_400, now, 0, Lang::Es), "3 oct");
+        assert_eq!(
+            short_date(now - 400 * 86_400, now, 0, Lang::Es),
+            "8 sep 2025"
+        );
         // The zone moves the day boundary: 23:30 UTC on the 12th is already
         // the 13th two hours east.
         let late = now - 12 * 3600 - 1800;
-        assert_eq!(short_date(late, now, 0), "ayer 23:30");
-        assert_eq!(short_date(late, now, 7200), "hoy 01:30");
+        assert_eq!(short_date(late, now, 0, Lang::Es), "ayer 23:30");
+        assert_eq!(short_date(late, now, 7200, Lang::Es), "hoy 01:30");
         // A file from the future is not "hoy".
-        assert_eq!(short_date(now + 60, now, 0), "13 oct");
+        assert_eq!(short_date(now + 60, now, 0, Lang::Es), "13 oct");
         // The epoch, leap days and far-off years all land in the column.
-        assert_eq!(short_date(0, now, 0), "1 ene 1970");
-        assert_eq!(short_date(951_782_400, now, 0), "29 feb 2000");
+        assert_eq!(short_date(0, now, 0, Lang::Es), "1 ene 1970");
+        assert_eq!(short_date(951_782_400, now, 0, Lang::Es), "29 feb 2000");
         for t in [0, 1, 951_782_400, now - 1, now, now + 1, 253_402_300_799] {
-            let s = short_date(t, now, 3600);
-            assert!(s.chars().count() <= DATE_CHARS, "{t}: {s}");
+            let s = short_date(t, now, 3600, Lang::Es);
+            assert!(s.chars().count() <= date_chars(Lang::Es), "{t}: {s}");
+        }
+    }
+
+    /// The date column in English, and inside `date_chars` in both languages.
+    ///
+    /// The width is the point: `date_chars` is what `lunarfile` reserves for
+    /// the column and charges the name column for, so a date one character
+    /// wider than it says is drawn over the name beside it.
+    #[test]
+    fn a_date_reads_in_the_session_language_and_still_fits_the_column() {
+        let now = 1_791_892_800;
+        assert_eq!(short_date(now - 3600, now, 0, Lang::En), "today 11:00");
+        assert_eq!(
+            short_date(now - 86_400, now, 0, Lang::En),
+            "yesterday 12:00"
+        );
+        assert_eq!(short_date(now - 10 * 86_400, now, 0, Lang::En), "3 oct");
+        assert_eq!(short_date(0, now, 0, Lang::En), "1 jan 1970");
+        // A sweep over a year of days from each landmark, so that every month
+        // name of both languages goes through the measurement and not just
+        // the three the assertions above happen to land on. The last landmark
+        // is the last second `civil_from_days` is meant for, so the sweep
+        // walks BACK from it rather than off the end of the calendar.
+        for lang in [Lang::Es, Lang::En] {
+            for t in [0, 1, 951_782_400, now - 1, now, now + 1, 253_402_300_799] {
+                for day in 0..366 {
+                    let s = short_date((t - day * 86_400).max(0), now, 3600, lang);
+                    let n = s.chars().count();
+                    assert!(n <= date_chars(lang), "{lang:?} {t}-{day}: {s}");
+                }
+            }
         }
     }
 
@@ -994,7 +1063,7 @@ mod tests {
         std::fs::create_dir_all(media.join("vacio")).unwrap();
         let (home, media) = (home.to_str().unwrap(), media.to_str().unwrap());
 
-        let got = places_in(home, &[media, "/no/existe"]);
+        let got = places_in(home, &[media, "/no/existe"], Lang::Es);
         let labels: Vec<&str> = got.iter().map(|p| p.label.as_str()).collect();
         assert_eq!(
             labels,
@@ -1003,8 +1072,24 @@ mod tests {
         assert_eq!(got[2].path, join_child(home, "Downloads"));
         assert_eq!(got[4].path, join_child(media, "USB"));
 
+        // In English the LABELS change and the paths do not: the folder on
+        // disk is called `Downloads` whatever language the session is in, and
+        // a rail that looked for `Descargas` only would miss it.
+        let got_en = places_in(home, &[media, "/no/existe"], Lang::En);
+        let labels_en: Vec<&str> = got_en.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(
+            labels_en,
+            ["Home", "Documents", "Downloads", "Root /", "USB"]
+        );
+        let paths = |v: &[Place]| v.iter().map(|p| p.path.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            paths(&got),
+            paths(&got_en),
+            "the folders are the same folders"
+        );
+
         // No home is no home entries, but the root is always there.
-        let got = places_in("/", &[]);
+        let got = places_in("/", &[], Lang::Es);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].path, "/");
 
@@ -1012,7 +1097,7 @@ mod tests {
         for n in 0..(MAX_PLACES + 5) {
             std::fs::create_dir_all(Path::new(media).join(format!("m{n:02}/x"))).unwrap();
         }
-        assert_eq!(places_in(home, &[media]).len(), MAX_PLACES);
+        assert_eq!(places_in(home, &[media], Lang::Es).len(), MAX_PLACES);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1051,7 +1136,7 @@ mod tests {
             std::fs::create_dir_all(media.join(name).join("x")).unwrap();
         }
 
-        let got = places_in("/", &[media.to_str().unwrap()]);
+        let got = places_in("/", &[media.to_str().unwrap()], Lang::Es);
         // A home of `/` contributes nothing, so the root is the first entry
         // and the mounts follow it.
         let mounts: Vec<&str> = got.iter().skip(1).map(|p| p.label.as_str()).collect();

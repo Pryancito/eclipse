@@ -16,6 +16,12 @@
 use super::*;
 use lunarbar::fileops;
 
+/// `$HOME` is not set, so there is nowhere to put a trash directory. Not a
+/// row of the string table: it cannot happen in a session (`eclipse-init`
+/// sets `HOME`), and the only person who can ever see it is whoever started
+/// lunarfile from an empty environment.
+const NO_TRASH: &str = "no trash directory: HOME is not set";
+
 /// One thing the menu can do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -43,29 +49,33 @@ pub const MENU_W: i32 = 256;
 pub const MENU_ROW_H: i32 = 28;
 pub const MENU_HEAD_H: i32 = 28;
 
-/// The key that does `op` without the menu.
-pub fn op_key(op: Op) -> &'static str {
+/// The key that does `op` without the menu, as the keycap is printed.
+///
+/// `Intro` and `Supr` are the Spanish keycaps and `Enter` and `Del` the
+/// English ones; the function keys and `Insert` are printed the same on both
+/// keyboards, so they are literals rather than rows of the table.
+pub fn op_key(op: Op, lang: Lang) -> &'static str {
     match op {
-        Op::Open => "Intro",
+        Op::Open => lang.s(Key::file_key_enter),
         Op::Rename => "F2",
         Op::Copy => "F5",
         Op::Cut => "F6",
         Op::Paste => "Insert",
         Op::NewDir => "F7",
-        Op::Trash => "Supr",
+        Op::Trash => lang.s(Key::file_key_del),
     }
 }
 
-pub fn op_label(op: Op) -> &'static str {
-    match op {
-        Op::Open => "Abrir",
-        Op::Rename => "Renombrar",
-        Op::Copy => "Copiar",
-        Op::Cut => "Cortar",
-        Op::Paste => "Pegar aquí",
-        Op::NewDir => "Nueva carpeta",
-        Op::Trash => "A la papelera",
-    }
+pub fn op_label(op: Op, lang: Lang) -> &'static str {
+    lang.s(match op {
+        Op::Open => Key::file_btn_open,
+        Op::Rename => Key::file_op_rename,
+        Op::Copy => Key::file_op_copy,
+        Op::Cut => Key::file_op_cut,
+        Op::Paste => Key::file_op_paste,
+        Op::NewDir => Key::file_op_newdir,
+        Op::Trash => Key::file_op_trash,
+    })
 }
 
 /// Each action's own colour, graded by what it does to the file: opening and
@@ -134,18 +144,26 @@ impl State {
         self.move_sel(0, Step::Clamp);
     }
 
-    fn fail(&mut self, what: &str, e: std::io::Error) {
-        self.note = format!("No se pudo {what}: {e}");
+    fn fail(&mut self, what: Key, e: std::io::Error) {
+        self.note = format!(
+            "{} {}: {}",
+            self.lang.s(Key::file_could_not),
+            self.lang.s(what),
+            fileops::message(&e, self.lang)
+        );
     }
 
     /// Do `op` to the selection.
     pub(crate) fn op(&mut self, op: Op) {
         self.menu = None;
         if !self.can(op) {
-            self.note = match op {
-                Op::Paste => "Nada que pegar: copia o corta algo antes (F5, F6)".into(),
-                _ => "Elige un archivo o una carpeta primero".into(),
-            };
+            self.note = self
+                .lang
+                .s(match op {
+                    Op::Paste => Key::file_nothing_to_paste,
+                    _ => Key::file_pick_something,
+                })
+                .to_string();
             return;
         }
         let name_of = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
@@ -158,23 +176,28 @@ impl State {
                 let Some(p) = self.chosen() else { return };
                 self.kept_filter = std::mem::replace(&mut self.field, name_of(&p));
                 self.edit = Some(Edit::Rename(p));
-                self.note = "Escribe el nombre nuevo · Intro renombra · Esc cancela".into();
+                self.note = self.lang.s(Key::file_rename_prompt).to_string();
                 self.refilter();
             }
             Op::NewDir => {
-                let free = fileops::free_name(std::path::Path::new(&self.dir), "Carpeta nueva", true);
+                let free = fileops::free_name(
+                    std::path::Path::new(&self.dir),
+                    self.lang.s(Key::file_new_folder_name),
+                    true,
+                );
                 self.kept_filter = std::mem::replace(&mut self.field, free);
                 self.edit = Some(Edit::NewDir);
-                self.note = "Nombre de la carpeta · Intro la crea · Esc cancela".into();
+                self.note = self.lang.s(Key::file_newdir_prompt).to_string();
                 self.refilter();
             }
             Op::Copy | Op::Cut => {
                 let Some(p) = self.chosen() else { return };
                 let cut = op == Op::Cut;
                 self.note = format!(
-                    "{}: {} · ve a otra carpeta e Insert lo pega",
-                    if cut { "Cortado" } else { "Copiado" },
-                    name_of(&p)
+                    "{}: {} · {}",
+                    self.lang.s(if cut { Key::file_cut } else { Key::file_copied }),
+                    name_of(&p),
+                    self.lang.s(Key::file_held_tail)
                 );
                 self.held = Some((p, cut));
             }
@@ -182,7 +205,7 @@ impl State {
             Op::Trash => {
                 let Some(p) = self.chosen() else { return };
                 let Some(trash) = fileops::trash_dir() else {
-                    self.note = "No hay papelera: falta HOME".into();
+                    self.note = NO_TRASH.to_string();
                     return;
                 };
                 match fileops::trash_into(std::path::Path::new(&p), &trash, files::now_secs()) {
@@ -191,9 +214,9 @@ impl State {
                             self.held = None;
                         }
                         self.reload_on(None);
-                        self.note = format!("A la papelera: {}", name_of(&p));
+                        self.note = format!("{}: {}", self.lang.s(Key::file_op_trash), name_of(&p));
                     }
-                    Err(e) => self.fail("mover a la papelera", e),
+                    Err(e) => self.fail(Key::file_what_trash, e),
                 }
             }
         }
@@ -205,8 +228,10 @@ impl State {
         let name = self.field.trim().to_string();
         self.field = std::mem::take(&mut self.kept_filter);
         let r = match &edit {
-            Edit::Rename(p) => fileops::rename(std::path::Path::new(p), &name).map(|_| "Renombrado"),
-            Edit::NewDir => fileops::make_dir(std::path::Path::new(&self.dir), &name).map(|_| "Carpeta creada"),
+            Edit::Rename(p) => fileops::rename(std::path::Path::new(p), &name)
+                .map(|_| self.lang.s(Key::file_renamed)),
+            Edit::NewDir => fileops::make_dir(std::path::Path::new(&self.dir), &name)
+                .map(|_| self.lang.s(Key::file_dir_created)),
         };
         match r {
             Ok(done) => {
@@ -223,7 +248,11 @@ impl State {
                 // Keep typing: the name is still there to fix.
                 self.kept_filter = std::mem::replace(&mut self.field, name);
                 self.edit = Some(edit);
-                self.note = format!("No se pudo: {e}");
+                self.note = format!(
+                    "{}: {}",
+                    self.lang.s(Key::file_could_not),
+                    fileops::message(&e, self.lang)
+                );
                 self.refilter();
             }
         }
@@ -274,9 +303,13 @@ pub fn draw_menu(cv: &mut Canvas, st: &State, lx: i32, lw: i32, y: i32, bottom: 
         let (mark, text) = if ok { (c, if i == sel { p.text } else { p.text }) } else { (p.dim, p.dim) };
         cv.fill_rect_a(mx + 14, ry + (MENU_ROW_H - 2 - 8) / 2, 8, 8, mark, if ok { 1.0 } else { 0.5 });
         let ty = ry + (MENU_ROW_H - 2 - GLYPH_H) / 2;
-        let label = if hud { op_label(op).to_uppercase() } else { op_label(op).to_string() };
+        let label = if hud {
+            op_label(op, st.lang).to_uppercase()
+        } else {
+            op_label(op, st.lang).to_string()
+        };
         cv.text(&label, mx + 32, ty, if i == sel && ok { c } else { text });
-        let k = op_key(op);
+        let k = op_key(op, st.lang);
         cv.text(k, mx + MENU_W - 12 - Canvas::text_width(k), ty, p.dim);
         hits.push(((mx + 4, ry, MENU_W - 8, MENU_ROW_H - 2), op));
     }
@@ -293,10 +326,17 @@ mod tests {
         for (i, &a) in OPS.iter().enumerate() {
             for &b in &OPS[..i] {
                 assert_ne!(op_colour(a, p), op_colour(b, p), "{a:?} {b:?}");
-                assert_ne!(op_key(a), op_key(b));
+                for lang in [Lang::Es, Lang::En] {
+                    assert_ne!(op_key(a, lang), op_key(b, lang), "{lang:?}");
+                }
             }
-            let label_w = Canvas::text_width(&op_label(a).to_uppercase());
-            assert!(32 + label_w + 12 + Canvas::text_width(op_key(a)) + 12 <= MENU_W, "{a:?}");
+            // The widest the row can be, in EITHER language: a label that
+            // overflows the menu is drawn over the keycap beside it.
+            for lang in [Lang::Es, Lang::En] {
+                let label_w = Canvas::text_width(&op_label(a, lang).to_uppercase());
+                let key_w = Canvas::text_width(op_key(a, lang));
+                assert!(32 + label_w + 12 + key_w + 12 <= MENU_W, "{a:?} {lang:?}");
+            }
         }
         for (k, op) in [(60, Op::Rename), (63, Op::Copy), (64, Op::Cut), (110, Op::Paste), (65, Op::NewDir), (111, Op::Trash), (66, Op::Trash)] {
             assert_eq!(op_for_key(k), Some(op));

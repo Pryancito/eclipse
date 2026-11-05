@@ -34,19 +34,21 @@ impl Job {
     }
 
     /// The footer line: `Copiando foto.iso · 45% · 120 M de 260 M · Esc cancela`.
-    pub fn line(&self) -> String {
+    pub fn line(&self, lang: Lang) -> String {
         let (d, t) = (self.prog.done.load(Ordering::Relaxed), self.prog.total.load(Ordering::Relaxed));
-        let verb = match (self.cut, self.prog.cancel.load(Ordering::Relaxed)) {
-            (_, true) => "Cancelando",
-            (true, _) => "Moviendo",
-            (false, _) => "Copiando",
-        };
+        let verb = lang.s(match (self.cut, self.prog.cancel.load(Ordering::Relaxed)) {
+            (_, true) => Key::file_job_cancelling,
+            (true, _) => Key::file_job_moving,
+            (false, _) => Key::file_job_copying,
+        });
         format!(
-            "{verb} {} · {}% · {} de {} · Esc cancela",
+            "{verb} {} · {}% · {} {} {} · {}",
             self.name,
             (self.prog.frac() * 100.0).floor() as u32,
-            files::human_size(d),
-            files::human_size(t)
+            files::human_size(d, lang),
+            lang.s(Key::word_of),
+            files::human_size(t, lang),
+            lang.s(Key::file_job_esc)
         )
     }
 }
@@ -59,7 +61,7 @@ impl State {
     /// Start pasting what is held into the folder on screen.
     pub(crate) fn start_paste(&mut self) {
         if self.job.is_some() {
-            self.note = "Espera a que termine la copia en curso (Esc la cancela)".into();
+            self.note = self.lang.s(Key::file_job_wait).to_string();
             return;
         }
         let Some((src, cut)) = self.held.clone() else { return };
@@ -107,13 +109,19 @@ impl State {
                 if self.dir == job.dir {
                     self.reload_on(n.as_deref());
                 }
-                self.note = format!("Pegado: {}", n.unwrap_or_default());
+                self.note = format!("{}: {}", self.lang.s(Key::file_pasted), n.unwrap_or_default());
             }
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
-                self.note = format!("Cancelado: {}", job.name);
+                self.note = format!("{}: {}", self.lang.s(Key::file_cancelled), job.name);
             }
-            Ok(Err(e)) => self.note = format!("No se pudo pegar: {e}"),
-            Err(_) => self.note = "La copia se detuvo por un error".into(),
+            Ok(Err(e)) => {
+                self.note = format!(
+                    "{}: {}",
+                    self.lang.s(Key::file_paste_failed),
+                    fileops::message(&e, self.lang)
+                )
+            }
+            Err(_) => self.note = self.lang.s(Key::file_copy_error).to_string(),
         }
         true
     }
@@ -149,13 +157,13 @@ mod tests {
         st.start_paste();
         assert!(st.job.is_some());
         st.start_paste();
-        assert!(st.note.starts_with("Espera"), "one paste at a time");
+        assert_eq!(st.note, st.lang.s(Key::file_job_wait), "one paste at a time");
         while st.job.as_ref().is_some_and(|j| j.running()) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(st.tick_job());
         assert!(st.job.is_none());
-        assert_eq!(st.note, "Pegado: f.bin");
+        assert_eq!(st.note, format!("{}: f.bin", st.lang.s(Key::file_pasted)));
         assert!(base.join("dst/f.bin").exists());
         assert_eq!(st.entry(st.sel).map(|e| e.name.as_str()), Some("f.bin"));
         let _ = std::fs::remove_dir_all(&base);
@@ -168,8 +176,16 @@ mod tests {
         prog.done.store(90 << 20, Ordering::Relaxed);
         let j = Job { handle: None, prog: prog.clone(), name: "disco.iso".into(), cut: false, dir: "/".into() };
         assert!(j.running());
-        assert_eq!(j.line(), "Copiando disco.iso · 45% · 90 M de 200 M · Esc cancela");
+        assert_eq!(
+            j.line(Lang::Es),
+            "Copiando disco.iso · 45% · 90 M de 200 M · Esc cancela"
+        );
+        assert_eq!(
+            j.line(Lang::En),
+            "Copying disco.iso · 45% · 90 M of 200 M · Esc cancels"
+        );
         prog.cancel.store(true, Ordering::Relaxed);
-        assert!(j.line().starts_with("Cancelando"));
+        assert!(j.line(Lang::Es).starts_with("Cancelando"));
+        assert!(j.line(Lang::En).starts_with("Cancelling"));
     }
 }
