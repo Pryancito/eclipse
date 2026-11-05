@@ -8,7 +8,7 @@ trae la imagen), la de KDE Plasma y la de Windows 11. El fondo siempre es
 **lunarbg**, el panel siempre es **lunarbar** y el lanzador siempre es
 **lunarrun**; lo que cambia es la paleta y la disposición.
 
-## Las tres apariencias
+## Las apariencias
 
 Se eligen con `eclipse-look` y se guardan en `/etc/eclipse/look` (manda
 `look=` de la cmdline si está). `eclipse-init` la aplica en el arranque,
@@ -16,18 +16,24 @@ igual que hace con el idioma y la zona horaria.
 
 ```sh
 eclipse-look            # imprime la actual
-eclipse-look eclipse    # la violeta original (por defecto)
+eclipse-look tecno      # panel de instrumentos «Orbital HUD» (por defecto)
+eclipse-look eclipse    # la violeta original
 eclipse-look kde        # KDE Breeze Dark
 eclipse-look win11      # Windows 11
 ```
 
-| | `eclipse` (por defecto) | `kde` | `win11` |
-|---|---|---|---|
-| Tema de ventanas | `Eclipse-Dark` (violeta) | `Breeze-Dark` (#31363b, acento #3daee9) | `Win11-Dark` (#202020, acento #0078d4) |
-| Panel | dos barras de 34 px (info arriba, tareas abajo) | una barra inferior de 44 px, estilo Plasma | una barra inferior de 48 px, **botones centrados**, translúcida |
-| Reloj | una línea abajo, fecha arriba | dos líneas, hora sobre fecha | dos líneas, hora sobre fecha |
-| Terminal | paleta violeta | paleta Breeze (Konsole) | paleta Campbell (Windows Terminal) |
-| Lanzador | en el tercio superior | en el tercio superior | menú Inicio sobre la barra |
+| | `tecno` (por defecto) | `eclipse` | `kde` | `win11` |
+|---|---|---|---|---|
+| Tema de ventanas | `Tecno-Dark` (#0a1423, acento cian #38e1ff, oro #f2c14e al pulsar) | `Eclipse-Dark` (violeta) | `Breeze-Dark` (#31363b, acento #3daee9) | `Win11-Dark` (#202020, acento #0078d4) |
+| Panel | dos barras de 34 px, placas cuadradas con filete, etiquetas en mayúsculas, medidores por segmentos con historial y escuadras doradas en los menús | dos barras de 34 px (info arriba, tareas abajo) | una barra inferior de 44 px, estilo Plasma | una barra inferior de 48 px, **botones centrados**, translúcida |
+| Reloj | una línea abajo, fecha arriba | una línea abajo, fecha arriba | dos líneas, hora sobre fecha | dos líneas, hora sobre fecha |
+| Terminal | paleta tecno (oro como amarillo) | paleta violeta | paleta Breeze (Konsole) | paleta Campbell (Windows Terminal) |
+| Lanzador | en el tercio superior, recto y con escuadras doradas | en el tercio superior | en el tercio superior | menú Inicio sobre la barra |
+
+`tecno` es el aspecto «Orbital HUD» de la maqueta que eligió Moebius (ver
+[img/tecno-orbital-hud.png](img/tecno-orbital-hud.png)): negro espacial,
+cian de instrumentación `#38e1ff`, filete `#1d3550` y el oro `#f2c14e` de la
+media luna de lunarbg para marcar lo que tiene el foco.
 
 Un cambio de apariencia reescribe el `<name>` del tema en `rc.xml`, copia la
 paleta de foot correspondiente y reinicia el panel (init lo relanza al

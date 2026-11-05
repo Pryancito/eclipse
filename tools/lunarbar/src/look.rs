@@ -1,6 +1,7 @@
-//! Which look the desktop is wearing: KDE's Breeze Dark, or Eclipse's own
-//! violet. Persisted by `eclipse-look` in `/etc/eclipse/look` (and applied at
-//! boot by eclipse-init), so every client agrees without an IPC bus.
+//! Which look the desktop is wearing: KDE's Breeze Dark, Windows 11 dark,
+//! Eclipse's own, or `tecno`. Persisted by `eclipse-look` in
+//! `/etc/eclipse/look` (and applied at boot by eclipse-init), so every client
+//! agrees without an IPC bus.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Look {
@@ -12,6 +13,11 @@ pub enum Look {
     /// Eclipse's own: two bars, blue-black ground, blue accent. The default,
     /// and what the image ships.
     Eclipse,
+    /// Eclipse's instrument-panel look: the same two bars, but cut corners
+    /// instead of rounded, modules labelled in capitals, and meters drawn as
+    /// segments and history plots rather than as a number on its own.
+    /// `#060b14` ground, `#38e1ff` accent, `#f2c14e` gold.
+    Tecno,
 }
 
 impl Look {
@@ -27,6 +33,9 @@ impl Look {
             "win11" | "windows" | "windows11" => Some(Look::Win11),
             "kde" | "breeze" => Some(Look::Kde),
             "eclipse" => Some(Look::Eclipse),
+            // `tech` as well: the setting is written by people at a prompt,
+            // and the two spellings are one keystroke apart.
+            "tecno" | "tech" => Some(Look::Tecno),
             _ => None,
         }
     }
@@ -45,11 +54,11 @@ impl Look {
 }
 
 impl Default for Look {
-    /// Eclipse's own look. Not a preference: the image's wallpaper, icons and
-    /// accent are all built for this one, so a client defaulting to another
-    /// comes up looking like it belongs to a different desktop.
+    /// `tecno`, the look the image ships with since Moebius made it the
+    /// default (2026-11-05). Not a preference: every client has to agree, or
+    /// one comes up dressed for a different desktop than the panel.
     fn default() -> Self {
-        Look::Eclipse
+        Look::Tecno
     }
 }
 
@@ -114,6 +123,11 @@ mod tests {
             ("eclipse", Look::Eclipse),
             ("Eclipse", Look::Eclipse),
             ("ECLIPSE", Look::Eclipse),
+            ("tecno", Look::Tecno),
+            ("Tecno", Look::Tecno),
+            ("TECNO", Look::Tecno),
+            ("tech", Look::Tecno),
+            ("TECH", Look::Tecno),
         ] {
             assert_eq!(Look::from_name(name), Some(want), "{name}");
         }
@@ -123,7 +137,7 @@ mod tests {
         assert_eq!(Look::from_name("\tEclipse "), Some(Look::Eclipse));
         // And nothing else is a look.
         for name in [
-            "", "  ", "plasma", "gnome", "kde11", "win", "look=kde", "#kde",
+            "", "  ", "plasma", "gnome", "kde11", "win", "look=kde", "#kde", "tecnologico",
         ] {
             assert_eq!(Look::from_name(name), None, "{name:?}");
         }
@@ -136,6 +150,7 @@ mod tests {
         // editing /etc/eclipse/look in vi actually leaves behind.
         assert_eq!(look_from_text("  look=kde\n"), Some(Look::Kde));
         assert_eq!(look_from_text("\tlook=win11"), Some(Look::Win11));
+        assert_eq!(look_from_text("look=tecno\n"), Some(Look::Tecno));
         assert_eq!(look_from_text("look=kde  \n"), Some(Look::Kde));
         // Comments and blank lines skipped, as the format allows.
         assert_eq!(
@@ -163,10 +178,10 @@ mod tests {
         // Not a preference: the image's wallpaper, panel and icons are all built
         // for this one, and a client that defaulted to another would come up
         // with a different accent from everything around it.
-        assert_eq!(Look::default(), Look::Eclipse);
+        assert_eq!(Look::default(), Look::Tecno);
         // With nothing set and no file, that is what a client gets.
-        assert_eq!(resolve(None, || None), Look::Eclipse);
-        assert_eq!(resolve(Some(""), || None), Look::Eclipse);
+        assert_eq!(resolve(None, || None), Look::Tecno);
+        assert_eq!(resolve(Some(""), || None), Look::Tecno);
     }
 
     #[test]

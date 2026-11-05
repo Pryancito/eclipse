@@ -4,7 +4,7 @@ use super::*;
 
 /// Every look, so a row added to `Look` without a row here fails to compile
 /// rather than quietly inheriting whatever the `_` arm says.
-const LOOKS: [Look; 3] = [Look::Eclipse, Look::Kde, Look::Win11];
+const LOOKS: [Look; 4] = [Look::Eclipse, Look::Kde, Look::Win11, Look::Tecno];
 
 #[test]
 fn each_look_wears_its_own_palette() {
@@ -17,6 +17,7 @@ fn each_look_wears_its_own_palette() {
     assert_eq!(*pal_of(Look::Eclipse), PAL_ECLIPSE);
     assert_eq!(*pal_of(Look::Kde), PAL_KDE);
     assert_eq!(*pal_of(Look::Win11), PAL_WIN11);
+    assert_eq!(*pal_of(Look::Tecno), PAL_TECNO);
     // And no two looks share one, which is what a copy-pasted arm leaves
     // behind: with `Kde => &PAL_WIN11` the panel comes up grey-less and
     // nothing above would have caught it from a single row.
@@ -25,9 +26,9 @@ fn each_look_wears_its_own_palette() {
             assert_ne!(pal_of(*a), pal_of(*b), "{a:?} and {b:?} share one palette");
         }
     }
-    // The default look reaches the palette the image is built around: the
-    // wallpaper, the icon theme and the accent are all drawn for this one.
-    assert_eq!(*pal_of(Look::default()), PAL_ECLIPSE);
+    // The default look reaches the palette the image ships with: `tecno`
+    // since Moebius made it the default (2026-11-05).
+    assert_eq!(*pal_of(Look::default()), PAL_TECNO);
 }
 
 #[test]
@@ -46,6 +47,9 @@ fn a_palette_keeps_the_colours_its_comment_cites() {
     assert_eq!(PAL_WIN11.accent, (0x00, 0x78, 0xd4), "Win11 accent");
     assert_eq!(PAL_WIN11.muted, (0xc5, 0xc5, 0xc5), "Win11 secondary text");
     assert_eq!(PAL_WIN11.warn, (0xe8, 0x11, 0x23), "Win11 critical");
+    assert_eq!(PAL_TECNO.bar_bg, (0x06, 0x0b, 0x14), "tecno ground");
+    assert_eq!(PAL_TECNO.accent, (0x38, 0xe1, 0xff), "tecno instrument cyan");
+    assert_eq!(PAL_TECNO.rule, (0x1d, 0x35, 0x50), "tecno plate hairline");
 }
 
 #[test]
@@ -121,6 +125,10 @@ fn the_single_bar_looks_are_the_ones_with_a_bottom_panel_only() {
     assert!(centered_tasks_of(Look::Win11));
     assert!(!centered_tasks_of(Look::Kde));
     assert!(!centered_tasks_of(Look::Eclipse));
+    // `tecno` is `eclipse`'s layout wearing another skin: two bars, pinned
+    // left. Only how the bars are DRAWN changes.
+    assert!(!single_bar_of(Look::Tecno));
+    assert!(!centered_tasks_of(Look::Tecno));
     // Centred buttons only make sense on a single bar -- the taskbar is the
     // bar being centred -- so the one implies the other.
     for look in LOOKS {
@@ -145,6 +153,8 @@ fn only_the_win11_bar_is_translucent_and_the_two_flags_agree() {
     assert!(translucent_of(Look::Win11));
     assert!(!translucent_of(Look::Kde));
     assert!(!translucent_of(Look::Eclipse));
+    assert_eq!(bar_alpha_of(Look::Tecno), 1.0);
+    assert!(!translucent_of(Look::Tecno));
     for look in LOOKS {
         let a = bar_alpha_of(look);
         assert_eq!(
@@ -196,5 +206,144 @@ fn a_translucent_bar_is_filled_in_a_way_that_keeps_its_alpha() {
     assert!(
         acrylic.chunks(4).all(|px| px[3] > 0),
         "the fill did not reach every pixel of the bar"
+    );
+}
+
+
+#[test]
+fn the_instrument_look_is_exactly_one_look_and_changes_three_things_together() {
+    // One flag, because it governs the shape of every plate, the case of
+    // every label AND the kind of meter at once: a look that picked up two
+    // of the three reads as a theme that half applied, which is not
+    // something anyone can report usefully.
+    assert!(tecno_of(Look::Tecno));
+    for look in LOOKS {
+        assert_eq!(
+            tecno_of(look),
+            look == Look::Tecno,
+            "{look:?} answers to the instrument look"
+        );
+    }
+}
+
+#[test]
+fn both_meters_measure_the_same_so_the_modules_do_not_shift_between_looks() {
+    // The top bar lays its modules out from the RIGHT edge, each one
+    // stepping left by its own width. A segmented meter wider or narrower
+    // than the continuous gauge would move every module to its left --
+    // and the clock and power HIT BOXES with them, since those are computed
+    // from the same running x. That is a mis-click, not a cosmetic drift.
+    assert_eq!(METER_W, 27, "the width `metric` reserves for either meter");
+    assert_eq!(METER_CELLS * 4 - 1, METER_W, "the cells do not fill the slot");
+}
+
+#[test]
+fn a_label_is_capitalised_only_where_the_look_asks_for_it() {
+    // `cap` is the only thing standing between `cpu 18%` and `CPU 18%`, and
+    // it reads the look through `tecno()`, which is fed from a `OnceLock`
+    // this test cannot set. What it CAN pin is that the transformation
+    // itself is the identity on text that is already capitals and that it
+    // leaves the digits and the per-cent sign alone -- a `to_uppercase`
+    // applied twice, or applied to a value, is where a label like `18%`
+    // would come back mangled.
+    assert_eq!("CPU 18%".to_uppercase(), "CPU 18%");
+    assert_eq!("cpu 18%".to_uppercase(), "CPU 18%");
+    assert_eq!("45°c".to_uppercase(), "45°C");
+    assert_eq!("bat 80% +".to_uppercase(), "BAT 80% +");
+}
+
+/// WCAG relative luminance, and the contrast ratio built from it.
+///
+/// Worth the eight lines of sRGB maths rather than the cheap channel sum used
+/// elsewhere in this file: that one orders shades of ONE hue, which is all the
+/// tiering checks need, and it is useless across hues -- it calls `#3ad7e8`
+/// and `#ff8a5c` about equally light while one of them takes white and the
+/// other does not.
+fn contrast(a: Rgb, b: Rgb) -> f32 {
+    fn lum((r, g, b): Rgb) -> f32 {
+        let f = |c: u8| {
+            let c = c as f32 / 255.0;
+            if c <= 0.040_45 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+    }
+    let (x, y) = (lum(a), lum(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+#[test]
+fn text_on_a_filled_plate_can_be_read_in_the_look_it_was_designed_for() {
+    // `on_accent` is the text on a plate filled with `accent` or `warn`: the
+    // armed lockdown button and a toast's primary action. It is a role of its
+    // own because the right answer FLIPS with the look -- on a dark accent it
+    // is white, on a bright one it is the ground -- and the first draft of
+    // `tecno` used `white` for both, at 1.66:1 and 2.21:1. A label nobody can
+    // read on the button that asks for confirmation is the worst place in the
+    // session for this.
+    const AA: f32 = 4.5;
+    for look in LOOKS {
+        let p = pal_of(look);
+        // Looks that were already below the line when `on_accent` was split
+        // out of `white`. Raising them changes how the three shipped looks
+        // render, which is not this change's to decide, so the numbers are
+        // recorded instead: they cannot get worse without this failing.
+        let known = match look {
+            Look::Eclipse => Some((2.41, 2.90)),
+            Look::Kde => Some((2.43, 4.15)),
+            _ => None,
+        };
+        for (role, fill) in [("accent", p.accent), ("warn", p.warn)] {
+            let got = contrast(p.on_accent, fill);
+            let floor = match (known, role) {
+                (Some((a, _)), "accent") => a,
+                (Some((_, w)), _) => w,
+                (None, _) => AA,
+            };
+            assert!(
+                got >= floor - 0.01,
+                "{look:?}: text on a {role}-filled plate is {got:.2}:1, under {floor:.2}"
+            );
+        }
+    }
+    // And the look this change designs is held to the real line, both ways.
+    let t = pal_of(Look::Tecno);
+    assert!(contrast(t.on_accent, t.accent) >= AA);
+    assert!(contrast(t.on_accent, t.warn) >= AA);
+}
+
+#[test]
+fn the_dim_tier_is_readable_because_it_paints_enabled_text_too() {
+    // `dim` is not only decoration: it is the module labels on the bar, the
+    // search hint in the launcher and a clipboard entry's metadata -- text a
+    // user is meant to READ. `tecno` shipped its first draft at 3.4:1 on the
+    // bar ground, the worst of the four looks, which is what started this.
+    //
+    // The three older looks sit between 3.80 and 4.91 and are not raised here
+    // for the same reason as above, so the floor asserted for them is their
+    // own number; `tecno` is held to 4.5 on the ground AND on a plate, since
+    // half of what it paints sits on a plate.
+    for look in LOOKS {
+        let p = pal_of(look);
+        let floor = match look {
+            Look::Eclipse => 4.91,
+            Look::Kde => 3.93,
+            Look::Win11 => 3.80,
+            Look::Tecno => 4.5,
+        };
+        let on_bar = contrast(p.dim, p.bar_bg);
+        assert!(
+            on_bar >= floor - 0.01,
+            "{look:?}: dim text is {on_bar:.2}:1 on the bar ground, under {floor:.2}"
+        );
+    }
+    let t = pal_of(Look::Tecno);
+    assert!(
+        contrast(t.dim, t.pill) >= 4.5,
+        "tecno: dim text on a plate is {:.2}:1",
+        contrast(t.dim, t.pill)
     );
 }

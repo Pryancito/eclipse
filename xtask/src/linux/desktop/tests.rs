@@ -899,6 +899,7 @@ fn kde_look_is_wired_through_theme_rc_and_foot() {
     write_theme(&dir);
     write_labwc_rc(&dir);
     write_foot_config(&dir);
+    tecno::install(&dir);
     write_eclipse_look(&dir);
     write_kde_helpers(&dir);
 
@@ -923,7 +924,7 @@ fn kde_look_is_wired_through_theme_rc_and_foot() {
     // and must name a theme that exists.
     let rc = fs::read_to_string(dir.join("root/.config/labwc/rc.xml")).unwrap();
     assert!(
-        rc.contains("<name>Eclipse-Dark</name>"),
+        rc.contains("<name>Tecno-Dark</name>"),
         "rc.xml must name the shipped theme verbatim for eclipse-look to swap it"
     );
 
@@ -964,8 +965,8 @@ fn kde_look_is_wired_through_theme_rc_and_foot() {
     }
     let conf = fs::read_to_string(dir.join("etc/eclipse/look")).unwrap();
     assert!(
-        conf.contains("look=eclipse"),
-        "the image ships Eclipse's own look"
+        conf.contains("look=tecno"),
+        "the image ships the tecno look"
     );
     // Every look eclipse-look accepts must have a theme that exists, or
     // switching to it leaves labwc on its built-in defaults.
@@ -995,8 +996,10 @@ fn kde_look_is_wired_through_theme_rc_and_foot() {
     let kde = fs::read_to_string(dir.join("root/.config/foot/foot.kde.ini")).unwrap();
     let win = fs::read_to_string(dir.join("root/.config/foot/foot.win11.ini")).unwrap();
     let ecl = fs::read_to_string(dir.join("root/.config/foot/foot.eclipse.ini")).unwrap();
+    let tecno = fs::read_to_string(dir.join("root/.config/foot/foot.tecno.ini")).unwrap();
     let active = fs::read_to_string(dir.join("root/.config/foot/foot.ini")).unwrap();
-    assert_eq!(ecl, active, "foot.ini must start as the shipped look");
+    assert_eq!(tecno, active, "foot.ini must start as the shipped look");
+    assert_ne!(ecl, active, "eclipse is no longer the shipped look");
     assert!(
         kde.contains("background=232629"),
         "KDE terminal palette is Breeze"
@@ -1760,8 +1763,10 @@ fn look_rootfs(tag: &str) -> std::path::PathBuf {
     write_eclipse_look(&dir);
     write_theme(&dir);
     write_foot_config(&dir);
-    // The two imported labwc themes and the palettes for their looks; the
-    // table below holds them too, so without this half of it is missing.
+    // The instrument look and the two imported labwc themes, with the
+    // palettes for their looks; the table below holds them too, so without
+    // these half of it is missing.
+    super::tecno::install(&dir);
     super::upstream::install(&dir);
     write_labwc_rc(&dir);
     write_labwc_menu(&dir);
@@ -1780,6 +1785,7 @@ const LOOKS: &[(&str, &str, &str)] = &[
     ("kde", "Breeze-Dark", "background=232629"),
     ("eclipse", "Eclipse-Dark", "background=120f1c"),
     ("gnome", "labAdwaita-dark-xbm", "background=1d1d1d"),
+    ("tecno", "Tecno-Dark", "background=060b14"),
 ];
 
 /// `xml` with its comments taken out. rc.xml's comments name the very
@@ -1916,7 +1922,7 @@ fn the_application_menu_is_a_pipe_menu_in_both_languages() {
 #[test]
 fn the_default_look_is_the_same_everywhere_it_is_written() {
     let dir = look_rootfs("default");
-    const DEFAULT: &str = "eclipse";
+    const DEFAULT: &str = "tecno";
     let (_, theme, _) = LOOKS
         .iter()
         .find(|(l, _, _)| *l == DEFAULT)
@@ -2098,7 +2104,7 @@ fn the_look_script_rewrites_every_place_the_old_look_is_named() {
         .unwrap()
         .0;
     assert!(
-        current.contains("echo eclipse"),
+        current.contains("echo tecno"),
         "an unknown look does not fall back to the default:\n{current}"
     );
     let _ = fs::remove_dir_all(&dir);

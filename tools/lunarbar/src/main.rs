@@ -57,7 +57,7 @@
 // The drawing stack, /proc readers, .desktop scanner and input tables live in
 // the `lunarbar` library next door, shared with `lunarrun` (see src/lib.rs).
 use lunarbar::look::Look;
-use lunarbar::{apps, draw, fill_guard, hunter, i18n, icons, obmenu, sysinfo};
+use lunarbar::{apps, draw, fill_guard, hunter, i18n, icons, meter, obmenu, sysinfo};
 
 mod hunter_menu;
 mod hunter_toast;
@@ -127,6 +127,13 @@ struct Pal {
     pill_hover: Rgb,
     btn_active: Rgb,
     white: Rgb,
+    /// Text drawn on a plate FILLED with `accent` or `warn`.
+    ///
+    /// Its own role because the right answer flips with the look: on a dark
+    /// accent, white; on a bright one, the ground. `white` was used here and
+    /// is still right for the active taskbar button, which is filled with
+    /// `btn_active` -- a dark colour in every look.
+    on_accent: Rgb,
     menu_panel: Rgb,
     menu_hover: Rgb,
 }
@@ -145,6 +152,7 @@ const PAL_ECLIPSE: Pal = Pal {
     pill_hover: (0x1a, 0x2f, 0x4e), // pill under the pointer
     btn_active: (0x1f, 0x3a, 0x63), // active taskbar button
     white: (0xff, 0xff, 0xff),      // active button text
+    on_accent: (0xff, 0xff, 0xff), // unchanged: see the contrast note in look_wiring
     menu_panel: (0x0b, 0x12, 0x20), // launcher menu panel, deep navy
     menu_hover: (0x1f, 0x3a, 0x63), // hovered menu row
 };
@@ -163,6 +171,7 @@ const PAL_KDE: Pal = Pal {
     pill_hover: (0x31, 0x36, 0x3b),
     btn_active: (0x1b, 0x1e, 0x20),
     white: (0xfc, 0xfc, 0xfc),
+    on_accent: (0xfc, 0xfc, 0xfc),
     menu_panel: (0x2a, 0x2e, 0x32),
     menu_hover: (0x3d, 0xae, 0xe9),
 };
@@ -182,8 +191,40 @@ const PAL_WIN11: Pal = Pal {
     pill_hover: (0x3a, 0x3a, 0x3a),
     btn_active: (0x2d, 0x2d, 0x2d),
     white: (0xff, 0xff, 0xff),
+    on_accent: (0xff, 0xff, 0xff),
     menu_panel: (0x2b, 0x2b, 0x2b),
     menu_hover: (0x3a, 0x3a, 0x3a),
+};
+
+/// Eclipse `tecno` — the instrument-panel look. Same two bars and the same
+/// cold family as `eclipse`, but the ground goes darker and the accent moves
+/// from a soft blue to a signal cyan, so a lit meter reads against it from
+/// across a desk.
+///
+/// `rule` is a BORDER here and not a 2px bar edge: in this look every plate
+/// is outlined rather than filled flat, which is what the cut corners are for.
+const TECNO_GOLD: Rgb = (0xf2, 0xc1, 0x4e); // focus brackets: lunarbg's crescent
+const PAL_TECNO: Pal = Pal {
+    bar_bg: (0x06, 0x0b, 0x14),     // bar ground, nearly black
+    rule: (0x1d, 0x35, 0x50),       // plate borders and separators, steel cyan
+    text: (0xe6, 0xf1, 0xff),       // primary text
+    muted: (0xc9, 0xd8, 0xea),      // module values
+    // Also paints ENABLED text -- search hints, clipboard metadata -- and
+    // not only decoration, so it clears 4.5:1 on both the bar ground and a
+    // plate (6.8:1 and 6.3:1). The first draft was #8aa4c2, at 3.4:1.
+    dim: (0x8a, 0xa4, 0xc2),        // module labels, minimized windows
+    warn: (0xff, 0x8a, 0x5c),       // hot cpu/temp, low battery (semantic)
+    accent: (0x38, 0xe1, 0xff),     // signal cyan: launcher, lit meters
+    pill: (0x0a, 0x14, 0x23),       // plate body
+    pill_hover: (0x0c, 0x2a, 0x3a), // plate under the pointer
+    btn_active: (0x0c, 0x2a, 0x3a), // active taskbar button
+    white: (0xf5, 0xf9, 0xff),      // active button text: the brightest tier
+    // The ground, on a filled plate: this look's accent and warn are both
+    // bright enough that white on them is 1.66:1 and 2.21:1. This way round
+    // it is 11.3:1 and 8.5:1.
+    on_accent: (0x06, 0x0b, 0x14),
+    menu_panel: (0x08, 0x0e, 0x1a), // menu panel ground
+    menu_hover: (0x0c, 0x2a, 0x3a), // hovered menu row
 };
 
 /// The look, resolved once. Every draw reads it through `pal()`; it cannot
@@ -212,6 +253,7 @@ fn pal_of(look: Look) -> &'static Pal {
         Look::Win11 => &PAL_WIN11,
         Look::Kde => &PAL_KDE,
         Look::Eclipse => &PAL_ECLIPSE,
+        Look::Tecno => &PAL_TECNO,
     }
 }
 
@@ -251,6 +293,57 @@ fn bar_alpha_of(look: Look) -> f32 {
     match look {
         Look::Win11 => 0.85,
         _ => 1.0,
+    }
+}
+
+/// Whether the panel is wearing the instrument-panel look.
+///
+/// It is one flag and not a scattering of `look() == ` because it governs
+/// THREE things at once -- the shape of every plate, the case of every module
+/// label, and segmented meters instead of continuous ones -- and a look that
+/// picked up two of the three would read as a half-applied theme.
+fn tecno() -> bool {
+    tecno_of(look())
+}
+
+/// [`tecno`] with the look handed in; see [`pal_of`] for why.
+fn tecno_of(look: Look) -> bool {
+    look == Look::Tecno
+}
+
+/// A solid plate in the look's own shape: a rounded pill, or -- under `tecno`
+/// -- a square plate with a hairline border (a chamfer of 0: the "Orbital
+/// HUD" mockup Moebius picked has square corners).
+fn plate(cv: &mut Canvas, x: i32, y: i32, w: i32, h: i32, rad: i32, c: Rgb) {
+    if tecno() {
+        cv.chamfer_plate(x, y, w, h, 0, pal().rule, c);
+    } else {
+        cv.round_rect(x, y, w, h, rad, c);
+    }
+}
+
+/// A translucent plate: the hover washes and the menu panels. No border --
+/// a wash is drawn ON TOP of a plate that already has one.
+// Same shape as `Canvas::round_rect_a`, which it stands in for.
+#[allow(clippy::too_many_arguments)]
+fn plate_a(cv: &mut Canvas, x: i32, y: i32, w: i32, h: i32, rad: i32, c: Rgb, a: f32) {
+    if tecno() {
+        cv.chamfer_rect_a(x, y, w, h, 0, c, a);
+    } else {
+        cv.round_rect_a(x, y, w, h, rad, c, a);
+    }
+}
+
+/// A module label the way the look writes it: `cpu 18%`, or `CPU 18%`.
+///
+/// Returns an owned string in both looks rather than a `Cow`: the callers all
+/// build theirs with `format!` anyway, so borrowing would save nothing and
+/// would make every call site carry the lifetime.
+fn cap(s: &str) -> String {
+    if tecno() {
+        s.to_uppercase()
+    } else {
+        s.to_string()
     }
 }
 
@@ -649,6 +742,15 @@ struct Metrics {
     kbd: String,
     /// hunter's shield; None (no hunter in this kernel) hides it.
     hunter: Option<hunter::Shield>,
+    /// The last minute of the three metrics that move, so a meter can draw
+    /// where a value came from and not only where it is. Held on `State` and
+    /// cloned in here per tick, because the snapshot is rebuilt every time
+    /// and a history rebuilt every time is not a history.
+    cpu_hist: meter::Ring,
+    mem_hist: meter::Ring,
+    /// Download rate in bytes/s — raw units, scaled to its own window at the
+    /// moment it is drawn.
+    net_hist: meter::Ring,
 }
 
 #[derive(Default)]
@@ -682,6 +784,9 @@ struct State {
     cpu: CpuMeter,
     net: NetMeter,
     metrics: Metrics,
+    /// See [`Metrics::cpu_hist`]: the rings themselves live here, where they
+    /// survive the rebuilding of the snapshot.
+    hist: (meter::Ring, meter::Ring, meter::Ring),
     /// Cached mixer level: read once at startup and updated when the user
     /// drags the slider, never re-read per tick. None hides the module.
     vol: Option<u32>,
@@ -721,12 +826,18 @@ struct State {
 impl State {
     /// One metrics pass per tick, shared by every bar render until the next.
     fn refresh_metrics(&mut self) {
+        let (cpu, mem, net) = (self.cpu.sample(), sysinfo::mem_percent(), self.net.sample());
+        self.hist.0.push_pct(cpu);
+        self.hist.1.push_pct(mem);
+        if let Some(n) = &net {
+            self.hist.2.push(n.down as f32);
+        }
         self.metrics = Metrics {
-            cpu: self.cpu.sample(),
-            mem: sysinfo::mem_percent(),
+            cpu,
+            mem,
             clock: sysinfo::clock_hhmm(),
             date: sysinfo::date_dm(),
-            net: self.net.sample(),
+            net,
             uptime: sysinfo::uptime(),
             load: sysinfo::loadavg(),
             disk: sysinfo::disk_root_percent(),
@@ -738,6 +849,9 @@ impl State {
             vol: self.vol,
             kbd: sysinfo::kbd_layout(),
             hunter: self.metrics.hunter,
+            cpu_hist: self.hist.0.clone(),
+            mem_hist: self.hist.1.clone(),
+            net_hist: self.hist.2.clone(),
         };
         if self.tick.is_multiple_of(hunter_menu::REFRESH_TICKS) {
             self.refresh_hunter();
@@ -2355,9 +2469,8 @@ fn draw_task(
     (i32, i32),
 ) {
     clear_bar(cv, w, h);
-    // border-top: 2px solid #6b5aa8
-    cv.hline(0, 0, w as i32, pal().rule, 1.0);
-    cv.hline(0, 1, w as i32, pal().rule, 1.0);
+    // border-top: 2px solid, or the tecno edge; see `bar_edge`.
+    bar_edge(cv, w as i32, 0, 1, false);
 
     let ty = (h as i32 + 2 - GLYPH_H) / 2; // text cell top, below the border
     let btn_h = (h as i32 - 10).max(1); // waybar: margin 3px + 2px border
@@ -2387,7 +2500,7 @@ fn draw_task(
         if rx - pw_w >= left_min {
             rx -= pw_w;
             let pill = if hover == Hover::Power { pal().pill_hover } else { pal().pill };
-            cv.round_rect(rx, btn_y, pw_w, btn_h, 6, pill);
+            plate(cv, rx, btn_y, pw_w, btn_h, 6, pill);
             cv.power_icon(rx + (pw_w - pw_size) / 2, btn_y + (btn_h - pw_size) / 2, pw_size, pal().white);
             power_hit = (rx, rx + pw_w);
             rx -= 10;
@@ -2405,7 +2518,7 @@ fn draw_task(
         if rx - pw >= left_min {
             rx -= pw;
             let pill = if hover == Hover::Clock { pal().pill_hover } else { pal().pill };
-            cv.round_rect(rx, btn_y, pw, btn_h, 6, pill);
+            plate(cv, rx, btn_y, pw, btn_h, 6, pill);
             if two_line {
                 let y0 = (h as i32 - (2 * GLYPH_H + 2)) / 2;
                 let cw = Canvas::text_width(&m.clock);
@@ -2425,7 +2538,7 @@ fn draw_task(
         if rx - kw >= left_min {
             rx -= kw;
             let pill = if hover == Hover::Kbd { pal().pill_hover } else { pal().pill };
-            cv.round_rect(rx, btn_y, kw, btn_h, 6, pill);
+            plate(cv, rx, btn_y, kw, btn_h, 6, pill);
             cv.text_bold(kbd, rx + 8, ty, pal().text);
             kbd_hit = (rx, rx + kw);
             rx -= 10;
@@ -2438,7 +2551,7 @@ fn draw_task(
 
         // Volume module
         if let Some(v) = m.vol {
-            let vol_str = format!("vol {v}%");
+            let vol_str = cap(&format!("vol {v}%"));
             let vw = Canvas::text_width(&vol_str) + 10;
             if rx - vw >= left_min {
                 rx -= vw;
@@ -2449,21 +2562,23 @@ fn draw_task(
             }
         }
 
-        let mem_s = format!("mem {}%", opt(m.mem));
-        let mw = Canvas::text_width(&mem_s) + 10;
+        let mem_s = cap(&format!("mem {}%", opt(m.mem)));
+        let mw = Canvas::text_width(&mem_s) + 10 + hist_w(&m.mem_hist);
         if rx - mw >= left_min {
             rx -= mw;
             let col = if m.mem.unwrap_or(0) >= 90 { pal().warn } else { pal().muted };
-            cv.text(&mem_s, rx, ty, col);
+            let hw = hist(cv, rx, h as i32, &m.mem_hist, false);
+            cv.text(&mem_s, rx + hw, ty, col);
             rx -= 10;
         }
 
-        let cpu_s = format!("cpu {}%", opt(m.cpu));
-        let cw = Canvas::text_width(&cpu_s) + 10;
+        let cpu_s = cap(&format!("cpu {}%", opt(m.cpu)));
+        let cw = Canvas::text_width(&cpu_s) + 10 + hist_w(&m.cpu_hist);
         if rx - cw >= left_min {
             rx -= cw;
             let col = if m.cpu.unwrap_or(0) >= 90 { pal().warn } else { pal().muted };
-            cv.text(&cpu_s, rx, ty, col);
+            let hw = hist(cv, rx, h as i32, &m.cpu_hist, false);
+            cv.text(&cpu_s, rx + hw, ty, col);
             rx -= 10;
         }
 
@@ -2471,7 +2586,7 @@ fn draw_task(
         // is the one place it can live, and it is what Plasma's tray shows.
         if single_bar() {
             if let Some(n) = m.net.as_ref() {
-                if let Some(x) = net_module(cv, rx, left_min, ty, h as i32, n) {
+                if let Some(x) = net_module(cv, rx, left_min, ty, h as i32, n, &m.net_hist) {
                     rx = x - 10;
                 }
             }
@@ -2503,7 +2618,7 @@ fn draw_task(
     };
     let launcher_hit = (lx, lx + launcher_w);
     if hover == Hover::Launcher {
-        cv.round_rect_a(lx + 2, btn_y, launcher_w - 4, btn_h, 6, pal().menu_hover, 0.45);
+        plate_a(cv, lx + 2, btn_y, launcher_w - 4, btn_h, 6, pal().menu_hover, 0.45);
     }
     cv.disc_half(lx + 10, ly, d, pal().accent);
 
@@ -2534,10 +2649,10 @@ fn draw_task(
         }
         let hovered = hover == Hover::Task(it.tid);
         if it.active {
-            cv.round_rect(x, btn_y, bw, btn_h, 6, pal().btn_active);
+            plate(cv, x, btn_y, bw, btn_h, 6, pal().btn_active);
             cv.active_line(x, btn_y + btn_h - 2, bw, pal().accent);
         } else if hovered {
-            cv.round_rect_a(x, btn_y, bw, btn_h, 6, pal().menu_hover, 0.55);
+            plate_a(cv, x, btn_y, bw, btn_h, 6, pal().menu_hover, 0.55);
         }
         let text_avail = bw - 16 - icon_pad;
         let icon_only = text_avail < GLYPH_W;
@@ -2584,7 +2699,57 @@ fn draw_task(
     (launcher_hit, hits, clock_hit, vol_hit, power_hit, kbd_hit, hunter_hit)
 }
 
+/// The rule that closes a bar against the desktop: `y_edge` is the row that
+/// touches the wallpaper, `y_in` the one inside it.
+///
+/// Flat 2px in every other look. Under `tecno` the inner row fades instead,
+/// and a short bright run of accent sits at one corner -- the leading one, so
+/// the top bar's starts where the wordmark is and the taskbar's where the
+/// clock is. It is what keeps the edge from reading as a plain border.
+fn bar_edge(cv: &mut Canvas, w: i32, y_edge: i32, y_in: i32, lead_left: bool) {
+    cv.hline(0, y_edge, w, pal().rule, 1.0);
+    cv.hline(0, y_in, w, pal().rule, if tecno() { 0.55 } else { 1.0 });
+    if tecno() {
+        let run = (w / 10).clamp(40, 160);
+        cv.hline(if lead_left { 0 } else { w - run }, y_edge, run, pal().accent, 1.0);
+    }
+}
+
 // ── Top bar: system info ─────────────────────────────────────────────────────
+
+/// Cells in a segmented meter, and the width both meters occupy. Seven cells
+/// of 3px with a 1px gap come to 27, one over the continuous gauge's 26, so
+/// the gauge is the one that gives: the modules are laid out from the right
+/// edge and a meter that measured differently per look would move everything
+/// to its left.
+const METER_CELLS: i32 = 7;
+const METER_W: i32 = METER_CELLS * 4 - 1;
+/// Height of a module's history plot. Short enough to sit inside the row of
+/// text it belongs to, tall enough that a spike is a spike.
+const HIST_H: i32 = 11;
+
+/// Width a module has to reserve for its history, including the gap before
+/// the label — zero in the looks that do not draw one, and zero until there
+/// is something to draw.
+fn hist_w(r: &meter::Ring) -> i32 {
+    if tecno() && !r.is_empty() {
+        METER_W + 6
+    } else {
+        0
+    }
+}
+
+/// Draw that history. The slot is exactly as wide as the segmented meter, so
+/// a module that gains a past does not move the modules to its left.
+fn hist(cv: &mut Canvas, x: i32, h: i32, r: &meter::Ring, scaled: bool) -> i32 {
+    let w = hist_w(r);
+    if w == 0 {
+        return 0;
+    }
+    let p = pal();
+    meter::plot(cv, x, (h - HIST_H) / 2, METER_W, HIST_H, r, scaled, p.pill, p.accent, p.warn);
+    w
+}
 
 fn metric(
     cv: &mut Canvas,
@@ -2597,7 +2762,9 @@ fn metric(
     col: Rgb,
 ) -> Option<i32> {
     let tw = Canvas::text_width(label);
-    let (gw, gpad) = if gauge.is_some() { (26, 6) } else { (0, 0) };
+    // The two meters must measure the SAME, or switching looks would shift
+    // every module on the bar by a few pixels and the hit boxes with them.
+    let (gw, gpad) = if gauge.is_some() { (METER_W, 6) } else { (0, 0) };
     let total = gw + gpad + tw;
     let x = right - total;
     if x < min_x {
@@ -2606,25 +2773,45 @@ fn metric(
     if let Some(f) = gauge {
         let ghh = 7;
         let gy = (h - ghh) / 2;
-        cv.gauge(x, gy, gw, ghh, f, pal().pill);
+        if tecno() {
+            // Segments, not a continuous bar: a meter with a scale on it is
+            // the one piece of this look that is not just a colour change.
+            // And the lit colour is the sample's, not the theme's: one
+            // ramp, no thresholds to argue about.
+            let c = meter::ramp(f, pal().accent, pal().warn);
+            cv.blocks(x, gy, METER_CELLS, f, ghh, c, pal().dim);
+        } else {
+            cv.gauge(x, gy, gw, ghh, f, pal().pill);
+        }
     }
     cv.text(label, x + gw + gpad, ty, col);
     Some(x)
 }
 
-fn net_module(cv: &mut Canvas, right: i32, min_x: i32, ty: i32, h: i32, n: &NetRate) -> Option<i32> {
+fn net_module(
+    cv: &mut Canvas,
+    right: i32,
+    min_x: i32,
+    ty: i32,
+    h: i32,
+    n: &NetRate,
+    hd: &meter::Ring,
+) -> Option<i32> {
     let down = sysinfo::fmt_rate(n.down);
     let up = sysinfo::fmt_rate(n.up);
     let ts = 9;
     let ty_tri = (h - ts) / 2;
     let dw = Canvas::text_width(&down);
     let uw = Canvas::text_width(&up);
-    let total = ts + 4 + dw + 10 + ts + 4 + uw;
+    let total = hist_w(hd) + ts + 4 + dw + 10 + ts + 4 + uw;
     let x = right - total;
     if x < min_x {
         return None;
     }
     let mut cx = x;
+    // Scaled to its own window: a link that idles at 2 kB/s and bursts to 2
+    // MB/s has no useful fixed axis, so the plot picks one every tick.
+    cx += hist(cv, cx, h, hd, true);
     cv.triangle(cx, ty_tri, ts, false, pal().accent);
     cx += ts + 4;
     cx += cv.text(&down, cx, ty, pal().muted);
@@ -2637,8 +2824,7 @@ fn net_module(cv: &mut Canvas, right: i32, min_x: i32, ty: i32, h: i32, n: &NetR
 
 fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> ((i32, i32), (i32, i32), (i32, i32)) {
     clear_bar(cv, w, h);
-    cv.hline(0, h as i32 - 1, w as i32, pal().rule, 1.0);
-    cv.hline(0, h as i32 - 2, w as i32, pal().rule, 1.0);
+    bar_edge(cv, w as i32, h as i32 - 2, h as i32 - 1, true);
 
     let ty = (h as i32 - 2 - GLYPH_H) / 2;
     let hi = h as i32;
@@ -2648,25 +2834,26 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> 
     let d = (hi * 18) / 34;
     let ly = (hi - d) / 2;
     let mut lx = 10 + d + 8;
-    let wordmark_w = Canvas::text_width("eclipse");
+    let wordmark = cap("eclipse");
+    let wordmark_w = Canvas::text_width(&wordmark);
     let launcher_hit = (0, lx + wordmark_w + 4);
     if hover == Hover::Launcher {
-        cv.round_rect_a(2, btn_y, launcher_hit.1 - 4, btn_h, 6, pal().menu_hover, 0.45);
+        plate_a(cv, 2, btn_y, launcher_hit.1 - 4, btn_h, 6, pal().menu_hover, 0.45);
     }
     cv.crescent(10, ly, d, pal().accent);
-    lx += cv.text_bold("eclipse", lx, ty, pal().text);
+    lx += cv.text_bold(&wordmark, lx, ty, pal().text);
 
     if let Some(up) = &m.uptime {
         lx += 12;
         cv.vrule(lx, hi, pal().rule);
         lx += 12;
-        lx += cv.text(&format!("up {up}"), lx, ty, pal().muted);
+        lx += cv.text(&cap(&format!("up {up}")), lx, ty, pal().muted);
     }
     if let Some(load) = m.load {
         lx += 12;
         cv.vrule(lx, hi, pal().rule);
         lx += 12;
-        lx += cv.text(&format!("load {load:.2}"), lx, ty, pal().muted);
+        lx += cv.text(&cap(&format!("load {load:.2}")), lx, ty, pal().muted);
     }
 
     let min_x = lx + 12;
@@ -2680,7 +2867,7 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> 
         if rx - pw_w >= min_x {
             rx -= pw_w;
             let pill = if hover == Hover::Power { pal().pill_hover } else { pal().pill };
-            cv.round_rect(rx, btn_y, pw_w, btn_h, 6, pill);
+            plate(cv, rx, btn_y, pw_w, btn_h, 6, pill);
             cv.power_icon(rx + (pw_w - pw_size) / 2, btn_y + (btn_h - pw_size) / 2, pw_size, pal().white);
             power_hit = (rx, rx + pw_w);
             rx -= 10;
@@ -2690,14 +2877,14 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> 
         if rx - pw >= min_x {
             rx -= pw;
             let pill = if hover == Hover::Clock { pal().pill_hover } else { pal().pill };
-            cv.round_rect(rx, btn_y, pw, btn_h, 6, pill);
+            plate(cv, rx, btn_y, pw, btn_h, 6, pill);
             cv.text_bold(&m.date, rx + 10, ty, pal().text);
             clock_hit = (rx, rx + pw);
             rx -= 10;
         }
     }
     if let Some((b, ch)) = m.batt {
-        let label = if ch { format!("bat {b}% +") } else { format!("bat {b}%") };
+        let label = cap(&if ch { format!("bat {b}% +") } else { format!("bat {b}%") });
         let col = if b < 15 && !ch { pal().warn } else { pal().muted };
         if let Some(x) = metric(cv, rx - 10, min_x, ty, hi, &label, Some(b as f32 / 100.0), col) {
             rx = x - 12;
@@ -2706,7 +2893,7 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> 
     }
     if let Some(t) = m.temp {
         let col = if t >= 85 { pal().warn } else { pal().muted };
-        if let Some(x) = metric(cv, rx - 10, min_x, ty, hi, &format!("{t}°c"), None, col) {
+        if let Some(x) = metric(cv, rx - 10, min_x, ty, hi, &cap(&format!("{t}°c")), None, col) {
             rx = x - 12;
             cv.vrule(rx, hi, pal().rule);
         }
@@ -2718,7 +2905,7 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> 
             min_x,
             ty,
             hi,
-            &format!("disk {dk}%"),
+            &cap(&format!("disk {dk}%")),
             Some(dk as f32 / 100.0),
             pal().muted,
         ) {
@@ -2728,7 +2915,7 @@ fn draw_info(cv: &mut Canvas, w: usize, h: usize, m: &Metrics, hover: Hover) -> 
     }
     if let Some(n) = &m.net {
         if n.link {
-            net_module(cv, rx - 10, min_x, ty, hi, n);
+            net_module(cv, rx - 10, min_x, ty, hi, n, &m.net_hist);
         }
     }
 
@@ -2838,6 +3025,16 @@ fn popup_size(kind: &PopupKind, oh: i32, bar_h: i32) -> (i32, i32) {
 /// — an xdg_popup is only as big as the menu, so the separation has to be
 /// drawn, the way every other toolkit draws it.
 fn draw_panel(cv: &mut Canvas, px: i32, py: i32, pw: i32, ph: i32, rad: i32) {
+    panel_shadow(cv, px, py, pw, ph, rad);
+    plate_a(cv, px, py, pw, ph, rad, pal().menu_panel, 0.98);
+    if tecno() {
+        // Gold focus brackets (lunarbg's crescent), 3px out, inside the shadow.
+        cv.brackets(px, py, pw, ph, 12, 2, TECNO_GOLD);
+    }
+}
+
+/// [`draw_panel`]'s drop shadow alone: rounded in every look.
+fn panel_shadow(cv: &mut Canvas, px: i32, py: i32, pw: i32, ph: i32, rad: i32) {
     // Concentric rounded rects, each a thin veil: they accumulate to a dark
     // core at the panel's edge and fade to nothing at the margin. Offset down
     // by a couple of pixels so the light reads as coming from above.
@@ -2852,7 +3049,6 @@ fn draw_panel(cv: &mut Canvas, px: i32, py: i32, pw: i32, ph: i32, rad: i32) {
             0.06,
         );
     }
-    cv.round_rect_a(px, py, pw, ph, rad, pal().menu_panel, 0.98);
 }
 
 /// Paint whichever popup is open into `cv` with its panel at `px`,`py`, and
@@ -2942,7 +3138,7 @@ fn draw_apps(
     let sy = py + APPS_HEADER_H + 6;
     let sw = pw - 20;
     let sh = APPS_SEARCH_H - 10;
-    cv.round_rect(sx, sy, sw, sh, 6, pal().pill);
+    plate(cv, sx, sy, sw, sh, 6, pal().pill);
     let f_y = sy + (sh - GLYPH_H) / 2;
     let caret_x = if filter.is_empty() {
         cv.text(i18n::Lang::current().apps_search(), sx + 10, f_y, pal().dim);
@@ -2972,7 +3168,7 @@ fn draw_apps(
             let y = list_top + (row - scroll) as i32 * APPS_ROW_H;
             let selected = row == sel;
             if selected {
-                cv.round_rect_a(px + 5, y + 1, pw - 10, APPS_ROW_H - 2, 6, pal().menu_hover, 1.0);
+                plate_a(cv, px + 5, y + 1, pw - 10, APPS_ROW_H - 2, 6, pal().menu_hover, 1.0);
             }
             let Some(e) = all.get(ai) else { continue };
             // Icon slot: the entry's Icon=, else its name against the theme
@@ -3077,7 +3273,7 @@ fn draw_calendar(
         let tx = x + (cell_w - Canvas::text_width(&s)) / 2;
         let dy = y + (cell_h - GLYPH_H) / 2;
         if today == Some((year, month, d as u32)) {
-            cv.round_rect(x + 2, y + 1, cell_w - 4, cell_h - 2, 6, pal().rule);
+            plate(cv, x + 2, y + 1, cell_w - 4, cell_h - 2, 6, pal().rule);
             cv.text_bold(&s, tx, dy, pal().white);
         } else {
             // Weekend columns slightly dimmed, like every desktop calendar.
@@ -3099,7 +3295,7 @@ fn draw_power_menu(
     ph: i32,
 ) -> Vec<(i32, i32, i32, i32, Action)> {
     draw_panel(cv, px, py, pw, ph, 10);
-    cv.round_rect_a(px, py, pw, ph, 10, pal().rule, 0.4);
+    plate_a(cv, px, py, pw, ph, 10, pal().rule, 0.4);
 
     let items = [
         (i18n::Lang::current().power_lock(), Action::PowerLock),
@@ -3148,7 +3344,7 @@ fn draw_task_menu(
     title: &str,
 ) -> Vec<(i32, i32, i32, i32, Action)> {
     draw_panel(cv, px, py, pw, ph, 10);
-    cv.round_rect_a(px, py, pw, ph, 10, pal().rule, 0.4);
+    plate_a(cv, px, py, pw, ph, 10, pal().rule, 0.4);
 
     let max_chars = ((pw - 24) / GLYPH_W) as usize;
     let head: String = if title.chars().count() > max_chars {
@@ -3211,8 +3407,8 @@ fn draw_volume_menu(
 /// Paint the taskbar tooltip: a hairline-bordered dark pill with the window's
 /// full title.
 fn draw_tooltip(cv: &mut Canvas, w: usize, h: usize, text: &str) {
-    cv.round_rect_a(0, 0, w as i32, h as i32, 6, pal().rule, 0.85);
-    cv.round_rect_a(1, 1, w as i32 - 2, h as i32 - 2, 5, pal().menu_panel, 1.0);
+    plate_a(cv, 0, 0, w as i32, h as i32, 6, pal().rule, 0.85);
+    plate_a(cv, 1, 1, w as i32 - 2, h as i32 - 2, 5, pal().menu_panel, 1.0);
     cv.text(text, 8, (h as i32 - GLYPH_H) / 2, pal().text);
 }
 
@@ -4215,7 +4411,9 @@ fn main() {
         .unwrap_or(match look() {
             Look::Win11 => 48, // Windows 11's taskbar height
             Look::Kde => 44,   // Plasma's default panel height
-            Look::Eclipse => 34, // what the waybar config this replaces used
+            // Two bars and a 34px height, exactly as `eclipse`: the tecno
+            // look changes how the bars are DRAWN, not how much room they take.
+            Look::Eclipse | Look::Tecno => 34,
         });
     let terminal = std::env::var("LUNARBAR_TERMINAL")
         .unwrap_or_else(|_| "/usr/local/bin/eclipse-terminal".into());
@@ -4250,15 +4448,26 @@ fn main() {
 
         let mut cpu = CpuMeter::default();
         let mut net = NetMeter::default();
-        let _ = cpu.sample();
-        let _ = net.sample();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut h = (meter::Ring::default(), meter::Ring::default(), meter::Ring::default());
+        // Build the history a live session would have, so the preview shows
+        // the meters a session shows instead of a single column.
+        let (mut c, mut n) = (None, None);
+        for _ in 0..meter::WINDOW {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            c = cpu.sample();
+            n = net.sample();
+            h.0.push_pct(c);
+            h.1.push_pct(sysinfo::mem_percent());
+            if let Some(r) = &n {
+                h.2.push(r.down as f32);
+            }
+        }
         let m = Metrics {
-            cpu: cpu.sample(),
+            cpu: c,
             mem: sysinfo::mem_percent(),
             clock: sysinfo::clock_hhmm(),
             date: sysinfo::date_dm(),
-            net: net.sample(),
+            net: n,
             uptime: sysinfo::uptime(),
             load: sysinfo::loadavg(),
             disk: sysinfo::disk_root_percent(),
@@ -4268,6 +4477,9 @@ fn main() {
             kbd: sysinfo::kbd_layout(),
             // Shown even off Eclipse OS, so the preview has the shield in it.
             hunter: Some(hunter::read().map_or(hunter::Shield::Guarded, |s| s.shield(s.criticals))),
+            cpu_hist: h.0,
+            mem_hist: h.1,
+            net_hist: h.2,
         };
 
         // Top info bar occupies rows [0, bh) — in the KDE look there is no

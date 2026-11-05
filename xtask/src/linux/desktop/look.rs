@@ -11,8 +11,9 @@ use std::{fs, path::Path};
 
 /// `/usr/local/bin/eclipse-look`: switch the desktop look between `eclipse`
 /// (the violet original, what the image ships), `kde` (KDE Breeze Dark),
-/// `win11` (Windows 11 dark) and `gnome` (`labAdwaita-dark-xbm`, straight
-/// from labwc's own theme repository, see [`super::upstream`]) -- persisted
+/// `win11` (Windows 11 dark), `gnome` (`labAdwaita-dark-xbm`, straight from
+/// labwc's own theme repository, see [`super::upstream`]) and `tecno` (the
+/// instrument panel, see [`super::tecno`]) -- persisted
 /// in
 /// `/etc/eclipse/look` like `eclipse-kbd`/`eclipse-locale`/`eclipse-tz` do
 /// with their own settings. `--boot` is what eclipse-init runs before the
@@ -33,14 +34,15 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
         b"#!/bin/sh\n\
           # Eclipse OS: desktop look (win11 = Windows 11 dark, kde = KDE\n\
           # Breeze Dark, gnome = labAdwaita-dark-xbm, from labwc's own theme\n\
-          # repository, eclipse = the violet original).\n\
+          # repository, tecno = the instrument panel, eclipse = the violet\n\
+          # original).\n\
           CONF=/etc/eclipse/look\n\
           CFG=\"${HOME:-/root}/.config\"\n\
           RC=\"$CFG/labwc/rc.xml\"\n\
           LOG=\"${HOME:-/root}/.eclipse-look.log\"\n\
           \n\
           look_ok() {\n\
-          \x20 case \"$1\" in win11|kde|eclipse|gnome) return 0 ;; *) return 1 ;; esac\n\
+          \x20 case \"$1\" in win11|kde|eclipse|gnome|tecno) return 0 ;; *) return 1 ;; esac\n\
           }\n\
           \n\
           theme_for() {\n\
@@ -48,6 +50,7 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           \x20 win11) echo Win11-Dark ;;\n\
           \x20 kde) echo Breeze-Dark ;;\n\
           \x20 gnome) echo labAdwaita-dark-xbm ;;\n\
+          \x20 tecno) echo Tecno-Dark ;;\n\
           \x20 *) echo Eclipse-Dark ;;\n\
           \x20 esac\n\
           }\n\
@@ -74,7 +77,7 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           current() {\n\
           \x20 f=$(file_look)\n\
           \x20 if look_ok \"$f\"; then echo \"$f\"; return; fi\n\
-          \x20 echo eclipse\n\
+          \x20 echo tecno\n\
           }\n\
           \n\
           resolve_boot() {\n\
@@ -99,6 +102,7 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           \x20       -e \"s|<name>Eclipse-Dark</name>|<name>$theme</name>|\" \\\n\
           \x20       -e \"s|<name>labAdwaita-dark-xbm</name>|<name>$theme</name>|\" \\\n\
           \x20       -e \"s|<name>labAdwaita-dark</name>|<name>$theme</name>|\" \\\n\
+          \x20       -e \"s|<name>Tecno-Dark</name>|<name>$theme</name>|\" \\\n\
           \x20       \"$RC\" > \"$RC.new\" 2>/dev/null && mv \"$RC.new\" \"$RC\"\n\
           \x20 fi\n\
           # foot palette for new terminals (a running foot keeps its colours).\n\
@@ -118,7 +122,7 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           }\n\
           \n\
           usage() {\n\
-          \x20 echo \"usage: eclipse-look [win11|kde|eclipse|gnome|--boot]\" >&2\n\
+          \x20 echo \"usage: eclipse-look [win11|kde|eclipse|gnome|tecno|--boot]\" >&2\n\
           \x20 exit 2\n\
           }\n\
           \n\
@@ -130,7 +134,7 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
           \x20 current\n\
           \x20 exit 0\n\
           \x20 ;;\n\
-          win11|kde|eclipse|gnome)\n\
+          win11|kde|eclipse|gnome|tecno)\n\
           \x20 apply \"$1\"\n\
           \x20 echo \"$1\"\n\
           \x20 ;;\n\
@@ -144,5 +148,5 @@ pub(super) fn write_eclipse_look(rootfs: &Path) {
     }
     let etc = rootfs.join("etc/eclipse");
     let _ = fs::create_dir_all(&etc);
-    fs::write(etc.join("look"), b"look=eclipse\n").unwrap();
+    fs::write(etc.join("look"), b"look=tecno\n").unwrap();
 }
