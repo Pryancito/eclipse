@@ -1,5 +1,7 @@
 # El arranque de Eclipse: cómo se mide
 
+**Español** · [English](README-boot.en.md)
+
 «¿Se puede arrancar más rápido?» no se contesta leyendo el código. Las partes
 caras del arranque no son las que calculan, son las que **esperan**, y hasta
 ahora no había forma de verlas: el núcleo sella cada línea de `dmesg`, lo que

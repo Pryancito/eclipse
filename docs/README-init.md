@@ -1,5 +1,7 @@
 # `eclipse-init`: qué hace, cómo se compara y qué le falta
 
+**Español** · [English](README-init.en.md)
+
 `tools/eclipse-init/src/main.rs` es el PID 1 del sistema instalado. El kernel de
 Eclipse ya monta la raíz, levanta la red y abre los intérpretes de cada VT, así
 que el init no necesita un gestor de servicios pesado (el `fork`/`exec` de

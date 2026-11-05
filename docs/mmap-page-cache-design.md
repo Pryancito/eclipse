@@ -1,9 +1,32 @@
 # Design: file-backed `mmap` writeback, `msync(2)`, and a shared page cache
 
-Status: **design only — not implemented**. This document is the plan for work
-that should be done against a *building, runnable* kernel, because it mutates
-user memory and the filesystem; a mistake corrupts user data, so it must not be
-landed blind.
+[Español](mmap-page-cache-design.es.md) · **English**
+
+Status (November 2026): **mostly implemented.** This started as a design-only
+plan; the code has since caught up with most of it:
+
+- **Stage A is in.** `sys_msync` (`linux-syscall/src/vm.rs`) validates its
+  arguments as the man page says and writes back the committed pages of every
+  `MAP_SHARED` file mapping in the range (`walk_mapped_msync` →
+  `linux_object::fs::sync_shared_file_vmo`). A shared VMO is also written back
+  before it is evicted (`writeback_shared_vmo`, bounded by the inode's current
+  size so it never extends the file).
+- **Stage B is in.** `MAP_SHARED` goes through `get_vmo_shared`, which hands
+  every mapper of an inode the same `VmObject` from the `SHARED_FILE_VMOS`
+  registry (`linux-object/src/fs/file.rs`), so shared mappings are coherent
+  with each other and across `fork`. Private file caches stay in the registry
+  as the page cache, and `page_cache_reclaim` gives their frames back when
+  memory is short.
+- **Stage C is in, in overlay form.** `read(2)`/`write(2)` do not go through
+  the VMO, but `cache_overlay_read` and `cache_overlay_write` keep them
+  coherent with whatever the cache has committed, and `cache_truncate` drops
+  cached pages past a new end.
+- **Still missing:** the hardware dirty bit (§3.1 option 2). Write-back is
+  still "every committed page", which rewrites clean pages that were only
+  read.
+
+The rest of this document is the original plan, kept because it explains why
+the pieces are shaped the way they are.
 
 It builds on the demand-paging readahead already added in
 `linux-object/src/fs/file.rs` (`Readahead` / `FileFrameFiller`).
@@ -12,7 +35,7 @@ It builds on the demand-paging readahead already added in
 
 ## 1. Current state and the gap
 
-### How a file `mmap` works today
+### How a file `mmap` worked when this was written
 
 `sys_mmap` (`linux-syscall/src/vm.rs`) for a file-backed mapping:
 

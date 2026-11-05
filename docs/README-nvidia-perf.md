@@ -1,5 +1,7 @@
 # Aceleración NVIDIA — camino a rendimiento tipo Linux
 
+**Español** · [English](README-nvidia-perf.en.md)
+
 Estado de los **6 bloques** hacia un escritorio con rendimiento comparable a
 Linux (nouveau/NVK + KMS HW). Actualizado con el trabajo de kernel en Eclipse.
 

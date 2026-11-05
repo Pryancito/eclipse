@@ -1,5 +1,7 @@
 # firefox-probe
 
+**English** · [Español](README.es.md)
+
 Firefox is a demanding test of a Linux personality, and a slow one to debug:
 it is a hundred megabytes of browser that either paints a window or does not.
 This tool asks the same questions Firefox asks, one at a time, and says which
@@ -44,7 +46,9 @@ reasoning does not hold on a distribution build. In `BrowserTabsRemoteAutostart`
 (`toolkit/xre/nsAppRunner.cpp`) the variable is honoured only when
 `allowDisablingE10s` is true, and in a `MOZILLA_OFFICIAL` build that requires
 `xpc::AreNonLocalConnectionsDisabled()` — which is false for any browser
-actually able to reach the network. Alpine sets `MOZILLA_OFFICIAL=1` for both
-`firefox` and `firefox-esr`, so content processes will spawn regardless, and
+actually able to reach the network. The image installs Mozilla's own build
+from Mozilla's apt repository (Ubuntu's `firefox` is a snap stub), and that is
+a `MOZILLA_OFFICIAL` build, as Alpine's `firefox` and `firefox-esr` were, so
+content processes will spawn regardless, and
 the IPC, shared-memory and process-launch sections above are all on the
 critical path.

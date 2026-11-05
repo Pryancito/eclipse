@@ -1,5 +1,7 @@
 # Diseño: pila gráfica NVIDIA por GPU (multi-GPU como en Linux)
 
+**Español** · [English](README-nvidia-multigpu-diseno.en.md)
+
 Paso 1 del plan «stack NVIDIA multi-GPU». Este documento es el entregable:
 no cambia código. Describe cómo lo organiza Linux, qué parte de Eclipse ya es
 por GPU y cuál sigue siendo única para toda la máquina, y propone cómo

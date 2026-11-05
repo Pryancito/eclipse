@@ -1,5 +1,7 @@
 # X11 kernel-interaction bench
 
+**English** · [Español](README.es.md)
+
 A QEMU smoke test for the kernel surface an X server (`startx`) uses on Eclipse
 OS (zCore). It boots zCore via UEFI with a tiny static C init (`xtest.c`) that
 drives, in one real boot, every primitive Xorg relies on:

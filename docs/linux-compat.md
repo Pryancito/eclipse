@@ -1,5 +1,7 @@
 # Compatibilidad con Linux guiada por `Documentation/`
 
+**Español** · [English](linux-compat.en.md)
+
 Eclipse OS implementa su capa Linux (`linux-syscall` + `linux-object`)
 tomando como referencia el árbol de documentación del kernel:
 <https://github.com/torvalds/linux/tree/master/Documentation> (junto con las
@@ -20,6 +22,8 @@ las decisiones donde nuestro kernel difiere deliberadamente.
 | `prctl(PR_SET_NO_NEW_PRIVS)` | **Documentation/userspace-api/no_new_privs.rst** | Flag unidireccional, heredado por `fork`/`execve`; con él activo `execve` no honra bits setuid/setgid |
 | `prctl` dumpable / timerslack / THP / capbset / tid_address | prctl(2) | Estado real por proceso/hilo; opciones desconocidas → `EINVAL` (antes *todas* devolvían 0, afirmando p. ej. que seccomp estaba activo) |
 | `personality` | personality(2) | Persona por proceso (PER_LINUX + modificadores como `ADDR_NO_RANDOMIZE`), heredada; consultable con 0xffffffff |
+| `execve` / `execveat` (`AT_EMPTY_PATH`, `fexecve`) | execve(2), execveat(2) | Implementado |
+| `process_vm_readv` / `process_vm_writev` | process_vm_readv(2) | Implementado |
 
 ## Señales
 
@@ -45,8 +49,8 @@ las decisiones donde nuestro kernel difiere deliberadamente.
 |---|---|---|
 | `renameat2` | renameat2(2), Documentation/filesystems/porting.rst | `RENAME_NOREPLACE` real (falla con `EEXIST`); `RENAME_EXCHANGE`/`WHITEOUT` → `EINVAL`, la respuesta documentada de un fs sin soporte |
 | `syncfs` | syncfs(2) | Sincroniza el fs del descriptor |
-| `/proc` (proc.rst) | **Documentation/filesystems/proc.rst** | pid: stat (con pgrp/session/tty_nr/tpgid reales), status, maps, fd, comm, environ, statm, exe, cmdline; global: meminfo, stat, uptime, loadavg, mounts, net/*, sys/*, sysvipc/msg |
-| xattrs | xattr.rst | Sin soporte en los fs: respuestas estándar (`ENODATA`/`EOPNOTSUPP`), no `ENOSYS` |
+| `/proc` (proc.rst) | **Documentation/filesystems/proc.rst** | pid: stat (con pgrp/session/tty_nr/tpgid reales), status, maps, fd, comm, environ, statm, exe, cmdline; global: meminfo, stat, uptime, loadavg, mounts, net/*, sys/*, sysvipc/{msg,sem,shm} |
+| xattrs (`get/set/list/removexattr` y sus formas `l*`/`f*`) | xattr.rst, `fs/xattr.c` | EclipseFS guarda atributos extendidos; el resto de fs responde como uno sin ellos (`ENODATA`/`EOPNOTSUPP`). Nombre, flags y fichero se validan antes, como Linux (`ENOENT`, `EBADF`, `ERANGE`, `E2BIG`) |
 
 ## Memoria
 
@@ -58,8 +62,9 @@ las decisiones donde nuestro kernel difiere deliberadamente.
 
 ## Decisiones deliberadas
 
-- **`clone3` → `ENOSYS`**: comportamiento pre-5.3; glibc/musl caen a `clone`
-  limpiamente (ver comentario en `linux-syscall/src/lib.rs` con la causa raíz).
+- **`clone3`**: se traduce a `clone` (`sys_clone3` en `linux-syscall/src/task.rs`).
+  Un `clone_args` más largo que la versión 0 con campos no nulos responde
+  `E2BIG`, como `copy_struct_from_user`.
 - **`rseq` → `ENOSYS` silencioso**: glibc lo sondea y cae con gracia.
 - **seccomp**: `prctl(PR_GET/SET_SECCOMP)` responde `EINVAL` como un kernel
   compilado sin `CONFIG_SECCOMP`; el syscall `seccomp` queda en `ENOSYS`.
@@ -69,8 +74,5 @@ las decisiones donde nuestro kernel difiere deliberadamente.
 
 ## Pendiente (candidatos siguientes, con su documento guía)
 
-- `execveat`/`fexecve` (execveat(2)).
-- `process_vm_readv`/`writev` (cross-memory attach).
-- `/proc/sysvipc/{sem,shm}` (proc.rst) para completar la tríada.
 - `openat2` con `RESOLVE_*` (Documentation/filesystems/path-lookup.rst).
 - Colas POSIX `mq_*` (mq_overview(7)).

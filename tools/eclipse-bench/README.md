@@ -1,5 +1,7 @@
 # eclipse-bench
 
+**English** · [Español](README.es.md)
+
 A small, dependency-free benchmark for Eclipse OS. One static musl binary, so it
 drops straight into the rootfs and runs from the shell.
 
@@ -54,7 +56,7 @@ it to the rootfs build the same way the other `tools/` binaries are added.
 - `--quick` — shorter budgets, roughly 3x faster, noisier.
 - `--drm PATH` — DRM device for the `gfx` section (default `/dev/dri/card0`).
 - `DIR` — directory for the disk tests. **It must be on the filesystem you want
-  to measure (the btrfs/ext2 root), not a tmpfs** like `/tmp` or `/run`, or the
+  to measure (the root, EclipseFS by default), not a tmpfs** like `/tmp` or `/run`, or the
   "disk" numbers will just measure RAM. Default: current directory.
 - `DISK_MB` — size of the disk test file (default 32).
 - `MEM_MB` — memory working-set size (default 32).
@@ -62,7 +64,7 @@ it to the rootfs build the same way the other `tools/` binaries are added.
 Example on a slow USB boot:
 
 ```sh
-cd /root            # on the btrfs root, NOT /tmp
+cd /root            # on the root filesystem, NOT /tmp
 ./eclipse-bench . 16 16
 ```
 

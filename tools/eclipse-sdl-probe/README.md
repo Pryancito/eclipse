@@ -1,5 +1,7 @@
 # eclipse-sdl-probe
 
+**Español** · [English](README.en.md)
+
 Prueba de humo y micro-bench de **SDL** (SDL2, SDL3 y, a través de
 sdl12-compat, SDL 1.2) para el escritorio de Eclipse OS. Dice qué biblioteca,
 qué backend de vídeo y qué *render driver* ha producido realmente la política
@@ -74,8 +76,9 @@ Con `nvidia.wlr_gles2` (o `renderer=gl-sw` en QEMU) el renderer pasa a
 `opengles2`. `video driver in use: x11` con `WAYLAND_DISPLAY` presente
 significa que algo pisó `SDL_VIDEODRIVER` y la app está dando el rodeo por
 Xwayland. Cualquier fallo sale como `SDLPROBE: FAIL ...` con el
-`SDL_GetError()` correspondiente y código de salida 1; `dlopen` fallido
-indica el `apk add` que falta.
+`SDL_GetError()` correspondiente y código de salida 1; un `dlopen` fallido
+quiere decir que falta la biblioteca (el mensaje todavía sugiere `apk add`; en
+la imagen de Ubuntu los paquetes son `libsdl2-2.0-0` y `libsdl3-0`).
 
 Los fps de la sesión pixman los limita el *frame callback* del compositor
 (vsync sobre el scanout software), no la CPU: ~60 fps es «todo bien», no

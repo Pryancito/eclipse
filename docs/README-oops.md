@@ -1,5 +1,7 @@
 # Contención de fallos del kernel (oops)
 
+**Español** · [English](README-oops.en.md)
+
 Un defecto en un programa de usuario no debe llevarse por delante el sistema
 operativo. Este documento describe qué parte de eso ya estaba resuelta, qué
 faltaba, y el mecanismo que cubre lo que faltaba.

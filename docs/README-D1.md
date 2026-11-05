@@ -1,23 +1,31 @@
-# zCore on riscv64
+# zCore en riscv64: placa Allwinner D1
 
-## D1开发板
-### 编译 zCore 系统镜像
+**Español** · [English](README-D1.en.md)
 
-先在源码根目录下编译 riscv64 的文件系统。
+> Notas heredadas del zCore original (rCore-OS), traducidas del chino. La
+> placa se sigue compilando con `PLATFORM=d1` en `zCore/Makefile`, pero no se
+> ha vuelto a probar en Eclipse.
 
-然后进入子目录 zCore 编译内核,会生成系统镜像`zcore.bin`
+## Placa de desarrollo D1
+
+### Compilar la imagen de sistema de zCore
+
+Primero, en la raíz del código, compila el sistema de ficheros de riscv64.
+
+Después entra en el subdirectorio zCore y compila el kernel; se genera la
+imagen de sistema `zcore.bin`.
 
 ```sh
-make riscv-image
+make rootfs ARCH=riscv64 && make image ARCH=riscv64
 cd zCore
 make build LINUX=1 ARCH=riscv64 PLATFORM=d1 MODE=release
 ```
 
-### riscv64 开发板的烧写
+### Grabar la placa riscv64
 
-以全志 D1 c906 开发板为例。
+Tomamos como ejemplo la placa Allwinner D1 con C906.
 
-下载并编译烧写工具 `xfel`:
+Descarga y compila la herramienta de grabación `xfel`:
 
 ```sh
 git clone https://github.com/xboot/xfel.git
@@ -25,17 +33,20 @@ cd xfel
 make
 ```
 
-### 自动烧写运行：
+### Grabar y ejecutar de forma automática
 
-安装好工具 `xfel`，开发板进入 FEL 模式，可在开发板的 Linux 系统中执行 `reboot efex` 命令进入 FEL 模式。然后运行：
+Con `xfel` instalado, pon la placa en modo FEL; desde el Linux de la placa se
+entra con el comando `reboot efex`. Después ejecuta:
 
 ```sh
 make run LINUX=1 ARCH=riscv64 PLATFORM=d1 MODE=release
 ```
 
-### (可选)手动烧写运行：
+### (Opcional) Grabar y ejecutar a mano
 
-1. 下载 D1 开发板的 [OpenSBI](https://github.com/elliott10/opensbi) 源码，并编译出镜像 build/platform/thead/c910/firmware/fw_payload.elf：
+1. Descarga el código de [OpenSBI](https://github.com/elliott10/opensbi) para
+   la placa D1 y compila la imagen
+   build/platform/thead/c910/firmware/fw_payload.elf:
 
     ```sh
     git clone https://github.com/elliott10/opensbi -b thead
@@ -43,16 +54,17 @@ make run LINUX=1 ARCH=riscv64 PLATFORM=d1 MODE=release
     make PLATFORM=thead/c910 CROSS_COMPILE=/path/to/toolchain/bin/riscv64-unknown-linux-gnu- SUNXI_CHIP=sun20iw1p1 PLATFORM_RISCV_ISA=rv64gcxthead
     ```
 
-    或使用预编译的镜像 [prebuilt/firmware/riscv/d1_fw_payload.elf](../prebuilt/firmware/riscv/d1_fw_payload.elf).
+    O usa la imagen precompilada [prebuilt/firmware/riscv/d1_fw_payload.elf](../prebuilt/firmware/riscv/d1_fw_payload.elf).
 
-2. 生成包含了 OpenSBI, dtb, zCore 的待烧写固件:
+2. Genera el firmware a grabar, que contiene OpenSBI, el dtb y zCore:
 
     ```sh
     rust-objcopy --binary-architecture=riscv64 ../prebuilt/firmware/d1/fw_payload.elf --strip-all -O binary ./zcore_d1.bin
     dd if=../target/riscv64/release/zcore.bin of=zcore_d1.bin bs=512 seek=2048
     ```
 
-3. 启动全志 D1 c906 开发板，并进入 FEL 模式。然后通过烧写工具 `xfel` 把 zCore 系统镜像载入到 DDR 中：
+3. Arranca la placa Allwinner D1 con C906 y ponla en modo FEL. Después carga la
+   imagen de zCore en la DDR con la herramienta `xfel`:
 
     ```
     sudo xfel ddr d1
@@ -60,9 +72,10 @@ make run LINUX=1 ARCH=riscv64 PLATFORM=d1 MODE=release
     sudo xfel exec 0x40000000
     ```
 
-### 引导运行
+### Arranque
 
-zCore 成功引导后, OpenSBI 会将 dtb 加载到高地址 `0x5ff00000`，运行如下所示：
+Cuando zCore arranca bien, OpenSBI carga el dtb en la dirección alta
+`0x5ff00000`, y se ve así:
 
 ```
 OpenSBI smartx-d1-tina-v1.0.1-release

@@ -1,5 +1,7 @@
 # Plan: port de nvidia-modeset (nvkms) a Eclipse
 
+**Español** · [English](README-nvkms-port.en.md)
+
 Continuación de [README-nvidia-multigpu-diseno.md](README-nvidia-multigpu-diseno.md).
 Decisión del 27-oct-2026: el modeset de todas las tarjetas lo hace **nvkms, el
 mismo código que usa Linux**, no un modeset escrito a mano en el shim.
