@@ -12,7 +12,8 @@ fn apps(n: usize) -> PopupKind {
             })
             .collect(),
         filter: String::new(),
-        visible: (0..n).collect(),
+        visible: (0..n).map(Row::App).collect(),
+        cat: None,
         sel: 0,
         scroll: 0,
     }

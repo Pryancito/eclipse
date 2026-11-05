@@ -32,6 +32,17 @@ use crate::vtext::{Cell, Glyph, Weight};
 
 pub type Rgb = (u8, u8, u8);
 
+/// One shape of a [`Canvas::line_icon`] pictogram, on its 12-unit grid.
+#[derive(Clone, Copy, Debug)]
+pub enum Ink {
+    /// An open polyline (repeat the first point to close it).
+    Line(&'static [(f32, f32)]),
+    /// An ellipse in the box x, y, w, h.
+    Oval(f32, f32, f32, f32),
+    /// A filled dot.
+    Dot(f32, f32),
+}
+
 /// Glyph cell height of the bar font (FONT_9X15).
 pub const GLYPH_H: i32 = 15;
 /// Glyph advance (cell width) of the bar font.
@@ -291,6 +302,46 @@ impl Canvas {
     pub fn active_line(&mut self, x: i32, y: i32, w: i32, c: Rgb) {
         if let Some(p) = rounded_rect_path((x + 4) as f32, y as f32, (w - 8).max(4) as f32, 2.0, 1.0) {
             self.fill(&p, c, 1.0);
+        }
+    }
+
+    /// A hairline pictogram drawn from `ops` on a 12-unit grid, fitted into
+    /// the `s`-pixel square at `x`,`y` inside a margin of `s / 6`. One stroke
+    /// width for every shape, so a set of these reads as one family.
+    pub fn line_icon(&mut self, x: i32, y: i32, s: i32, ops: &[Ink], c: Rgb) {
+        let m = s as f32 / 6.0;
+        let k = (s as f32 - 2.0 * m) / 12.0;
+        let (ox, oy) = (x as f32 + m, y as f32 + m);
+        let pt = |(px, py): (f32, f32)| (ox + px * k, oy + py * k);
+        let stroke = Stroke { width: 1.25, line_cap: tiny_skia::LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Stroke::default() };
+        let paint = Self::paint(c, 1.0);
+        for op in ops {
+            let mut pb = PathBuilder::new();
+            match *op {
+                Ink::Line(pts) => {
+                    for (i, &p) in pts.iter().enumerate() {
+                        let (px, py) = pt(p);
+                        if i == 0 { pb.move_to(px, py) } else { pb.line_to(px, py) }
+                    }
+                }
+                Ink::Oval(ax, ay, w, h) => {
+                    let (px, py) = pt((ax, ay));
+                    if let Some(r) = Rect::from_xywh(px, py, w * k, h * k) {
+                        pb.push_oval(r);
+                    }
+                }
+                Ink::Dot(cx, cy) => {
+                    let (px, py) = pt((cx, cy));
+                    pb.push_circle(px, py, 1.1 * k.max(1.0));
+                    if let Some(p) = pb.finish() {
+                        self.pix.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
+                    }
+                    continue;
+                }
+            }
+            if let Some(p) = pb.finish() {
+                self.pix.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
+            }
         }
     }
 
