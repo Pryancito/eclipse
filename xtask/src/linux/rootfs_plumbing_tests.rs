@@ -651,6 +651,7 @@ fn every_boot_service_names_its_program_and_how_it_is_supervised() {
             "/usr/local/bin/eclipse-lunarclip",
             "labwc",
         ),
+        ("notify", "respawn", "/usr/local/bin/eclipse-notify", ""),
         ("ntpd", "respawn", "/usr/local/bin/eclipse-ntpd", "udhcpc"),
         ("oopslog", "respawn", "/usr/local/bin/eclipse-oopslog", ""),
         // No `after`: `requires = dbus` implies it (#1744).
@@ -1001,7 +1002,9 @@ fn the_two_sessions_never_start_each_others_clients() {
         "hunterd",
         "ntpd",
         "oopslog",
-        // A bus service, not a session one: Xorg has GTK apps too.
+        // Bus services, not session ones: Xorg has GTK apps too, and a
+        // program that notifies there still deserves an answer.
+        "notify",
         "portal",
         "pulseaudio",
         "udhcpc",

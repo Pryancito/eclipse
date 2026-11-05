@@ -56,6 +56,7 @@
 pub mod bus;
 pub mod client;
 pub mod message;
+pub mod notify;
 pub mod portal;
 
 use std::collections::VecDeque;

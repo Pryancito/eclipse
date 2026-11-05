@@ -110,6 +110,9 @@ pub struct Action {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Alert {
     pub severity: Severity,
+    /// The program that sent it, when it came from another program through
+    /// `eclipse-notifyd`; empty for hunter's own alerts.
+    pub app: String,
     pub title: String,
     pub body: String,
     pub actions: Vec<Action>,
@@ -177,6 +180,7 @@ pub fn parse(text: &str) -> Option<Alert> {
         match key.trim() {
             "severity" => a.severity = Severity::parse(val.trim()).unwrap_or_default(),
             "title" => a.title = clean(val),
+            "app" => a.app = clean(val),
             "body" => a.body = clean(val),
             "timeout" => a.timeout = val.trim().parse().ok(),
             "reply" => a.reply = matches!(val.trim(), "1" | "yes" | "true"),
@@ -206,6 +210,9 @@ pub fn render(a: &Alert) -> String {
         a.severity.as_str(),
         clean(&a.title)
     );
+    if !a.app.is_empty() {
+        s += &format!("app={}\n", clean(&a.app));
+    }
     if !a.body.is_empty() {
         s += &format!("body={}\n", clean(&a.body));
     }
@@ -570,6 +577,7 @@ pub fn from_event(e: &Event, sealed: bool, lang: Lang) -> Alert {
         };
         return Alert {
             severity: Severity::Warn,
+            app: String::new(),
             title: t.net_ask.into(),
             body: clean(desc.strip_prefix("firewall: ").unwrap_or(desc)),
             actions: vec![
@@ -637,6 +645,7 @@ pub fn from_event(e: &Event, sealed: bool, lang: Lang) -> Alert {
     });
     actions.truncate(MAX_ACTIONS);
     Alert {
+        app: String::new(),
         severity: if e.critical {
             Severity::Crit
         } else {
@@ -667,9 +676,29 @@ mod tests {
     }
 
     #[test]
+    fn what_eclipse_notifyd_writes_is_an_alert_the_bar_reads() {
+        // Byte for byte what `eclipse_dbusd::notify::render` writes for a
+        // Firefox download with two buttons (its own test pins the same
+        // lines): the two crates do not share code, so the format is what
+        // they share, and this is where the bar's side of it is held.
+        let file = "severity=info\ntitle=Descarga completada\napp=Firefox\n\
+                    body=informe.pdf (2,1 MiB)\ntimeout=8\nreply=1\n\
+                    action=a0\tAbrir\naction=a1\tAbrir carpeta\n";
+        let a = parse(file).unwrap();
+        assert_eq!(a.app, "Firefox");
+        assert_eq!(a.title, "Descarga completada");
+        assert_eq!(a.timeout, Some(8));
+        assert!(a.reply);
+        assert_eq!(ids(&a), ["a0", "a1"]);
+        assert!(a.actions.iter().all(|x| x.run.is_none()));
+        assert_eq!(SPOOL, "/run/hunter/notify", "eclipse-notifyd writes here");
+    }
+
+    #[test]
     fn an_alert_survives_a_round_trip_through_its_file() {
         let a = Alert {
             severity: Severity::Crit,
+            app: "hunter".into(),
             title: "Firewall".into(),
             body: "¿permitir que /usr/bin/curl se conecte?".into(),
             actions: vec![

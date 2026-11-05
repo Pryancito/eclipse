@@ -24,6 +24,12 @@ path = "src/main.rs"
 name = "eclipse-portald"
 path = "src/bin/eclipse-portald.rs"
 
+# The notification server: `org.freedesktop.Notifications`, shown as cards of
+# the bar. Third binary of this package for the same reason as the portal.
+[[bin]]
+name = "eclipse-notifyd"
+path = "src/bin/eclipse-notifyd.rs"
+
 [dependencies]
 libc = "0.2"
 

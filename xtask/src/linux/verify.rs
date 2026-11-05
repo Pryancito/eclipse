@@ -1068,8 +1068,8 @@ mod cableado_tests {
         // este numero.
         let puertas = src.matches("self.cached_for_target(").count();
         assert_eq!(
-            puertas, 22,
-            "las puertas del arco eran 22 y ahora son {puertas}: si has añadido \
+            puertas, 23,
+            "las puertas del arco eran 23 y ahora son {puertas}: si has añadido \
              una cache con la suya, sube el numero; si has quitado una puerta, no"
         );
 

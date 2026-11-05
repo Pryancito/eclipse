@@ -114,6 +114,8 @@ pub(super) struct Toasts {
     pub(super) pointer_in: bool,
     /// The list changed since the surface last drew it.
     dirty: bool,
+    /// History entries the user has not looked at yet, for the bar's chip.
+    pub(super) unseen: usize,
 }
 
 /// The color of a severity: the stripe, the shield and the first button.
@@ -171,12 +173,14 @@ fn wrap(s: &str, w: i32, lines: usize) -> Vec<String> {
 
 fn card_h(t: &Toast) -> i32 {
     let body = wrap(&t.alert.body, W - 2 * PAD, BODY_LINES).len() as i32;
+    // A program's notification says whose it is on a line of its own.
+    let app = i32::from(!t.alert.app.is_empty()) * LINE;
     let btns = if t.alert.actions.is_empty() {
         0
     } else {
         8 + BTN_H
     };
-    PAD + LINE + body * LINE + btns + PAD - 4
+    PAD + app + LINE + body * LINE + btns + PAD - 4
 }
 
 /// The surface size for these cards and this many waiting behind them.
@@ -225,14 +229,27 @@ fn draw(
         cv.round_rect(x0 + 1, y + 8, 3, h - 16, 1, col);
 
         let ty = y + PAD;
-        cv.shield_icon(x0 + PAD, ty, 14, col, true);
         let mut title = a.title.clone();
         if toast.count > 1 {
             title += &format!("  x{}", toast.count);
         }
         let room = W - 2 * PAD - 22 - CLOSE - 6;
-        let title = wrap(&title, room, 1).pop().unwrap_or_default();
-        cv.text_bold(&title, x0 + PAD + 22, ty, pal().text);
+        // A program's card: who sent it on the first line, beside a mark in
+        // the severity's colour, and the title under it at full width. The
+        // shield is hunter's, and a download is not a security event.
+        let title_y = if a.app.is_empty() {
+            cv.shield_icon(x0 + PAD, ty, 14, col, true);
+            let title = wrap(&title, room, 1).pop().unwrap_or_default();
+            cv.text_bold(&title, x0 + PAD + 22, ty, pal().text);
+            ty
+        } else {
+            cv.round_rect(x0 + PAD + 3, ty + (GLYPH_H - 8) / 2, 8, 8, 1, col);
+            let who = wrap(&a.app.to_uppercase(), room, 1).pop().unwrap_or_default();
+            cv.text(&who, x0 + PAD + 22, ty, pal().muted);
+            let title = wrap(&title, W - 2 * PAD, 1).pop().unwrap_or_default();
+            cv.text_bold(&title, x0 + PAD, ty + LINE, pal().text);
+            ty + LINE
+        };
         // The close cross.
         let (cx, cy) = (x0 + W - PAD - CLOSE + 4, ty - 2);
         if hover == Some(Hit::Close(i)) {
@@ -246,7 +263,7 @@ fn draw(
         );
         hits.push((cx, cy, cx + CLOSE, cy + CLOSE, Hit::Close(i)));
 
-        let mut ly = ty + LINE;
+        let mut ly = title_y + LINE;
         for line in wrap(&a.body, W - 2 * PAD, BODY_LINES) {
             cv.text(&line, x0 + PAD, ly, pal().muted);
             ly += LINE;
@@ -282,6 +299,61 @@ fn draw(
     hits
 }
 
+/// The bar's notification chip: what came in while you were not looking.
+/// Returns its x-range, `(0, 0)` when there was no room.
+///
+/// It is there whether or not anything is waiting, so the history is always
+/// one click away; with something waiting it carries the count, in the
+/// accent colour, which is the one thing that should catch the eye.
+pub(super) fn draw_notes_badge(
+    cv: &mut Canvas,
+    rx: &mut i32,
+    left_min: i32,
+    btn_y: i32,
+    btn_h: i32,
+    hovered: bool,
+    unseen: usize,
+) -> (i32, i32) {
+    let label = if tecno() { "AVISOS" } else { "avisos" };
+    let count = match unseen {
+        0 => String::new(),
+        n if n > 99 => "99+".to_string(),
+        n => n.to_string(),
+    };
+    let cw = if count.is_empty() { 0 } else { Canvas::text_width(&count) + 6 };
+    let w = Canvas::text_width(label) + 16 + cw;
+    if *rx - w < left_min {
+        return (0, 0);
+    }
+    *rx -= w;
+    let pill = if hovered { pal().pill_hover } else { pal().pill };
+    plate(cv, *rx, btn_y, w, btn_h, 6, pill);
+    let ty = btn_y + (btn_h - GLYPH_H) / 2;
+    let col = if unseen > 0 { pal().text } else { pal().dim };
+    let adv = cv.text(label, *rx + 8, ty, col);
+    if !count.is_empty() {
+        let gold = if tecno() { TECNO_GOLD } else { pal().accent };
+        cv.text_bold(&count, *rx + 8 + adv + 6, ty, gold);
+    }
+    let hit = (*rx, *rx + w);
+    *rx -= 10;
+    hit
+}
+
+/// Write `a` into the notification history, for `lunarnotes` and the chip.
+/// Best effort: a history that cannot be written must not stop the card.
+fn remember(a: &Alert) {
+    let (path, _) = lunarbar::notes::session_paths();
+    let entry = lunarbar::notes::Entry {
+        when: lunarbar::notes::now(),
+        severity: a.severity.as_str().to_string(),
+        app: if a.app.is_empty() { "hunter".to_string() } else { a.app.clone() },
+        title: a.title.clone(),
+        body: a.body.clone(),
+    };
+    let _ = lunarbar::notes::record(&path, &entry);
+}
+
 impl Toasts {
     /// The cards on screen, with their index into the list, top to bottom
     /// (oldest of the shown first, newest last), and how many wait.
@@ -298,6 +370,8 @@ impl Toasts {
             old.deadline = None;
             self.list.push(old);
         } else {
+            // Once per card, not per repeat: the card counts its repeats.
+            remember(&t.alert);
             self.list.push(t);
         }
         self.dirty = true;
@@ -361,6 +435,7 @@ impl Toasts {
             if self.list.iter().any(|t| t.source == source) {
                 continue;
             }
+            remember(&alert);
             self.list.push(Toast {
                 alert,
                 source,
@@ -408,6 +483,10 @@ impl State {
         self.toasts
             .ingest_spool(notify::pending(Path::new(notify::SPOOL)));
         self.toasts.expire(Instant::now());
+        let (path, stamp) = lunarbar::notes::session_paths();
+        let unseen = lunarbar::notes::unseen(&lunarbar::notes::load(&path), lunarbar::notes::seen(&stamp));
+        // The bar's chip reads this when it next draws, within the tick.
+        self.toasts.unseen = unseen;
         if self.toasts.dirty {
             self.toasts.dirty = false;
             self.toast_sync(qh);
@@ -824,9 +903,20 @@ pub(super) fn draw_preview(cv: &mut Canvas, w: i32, h: i32) {
             ),
             1,
         ),
+        // A program's notification, as `eclipse-notifyd` hands it over.
         toast(
-            notify::from_event(&ev(false, "ANOMALY WARNING: fork flood from pid 412"), false, lang),
-            3,
+            Alert {
+                app: "Firefox".into(),
+                title: "Descarga completada".into(),
+                body: "informe-trimestral.pdf · 2,1 MiB".into(),
+                actions: vec![
+                    notify::Action { id: "a0".into(), label: "Abrir".into(), run: None },
+                    notify::Action { id: "a1".into(), label: "Abrir carpeta".into(), run: None },
+                ],
+                reply: true,
+                ..Alert::default()
+            },
+            1,
         ),
         toast(
             notify::from_event(
