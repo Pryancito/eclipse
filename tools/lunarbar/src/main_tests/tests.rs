@@ -23,7 +23,7 @@ const KINDS: [fn() -> PopupKind; 4] = [
     || PopupKind::Calendar { year: 2026, month: 8 },
     || PopupKind::PowerMenu { sel: 0, armed: None },
     || PopupKind::TaskMenu { tid: 1, title: String::new(), win: taskmenu::Win::default(), sel: 0 },
-    || PopupKind::Volume { level: 50 },
+    || PopupKind::Volume { level: 50, muted: false, devices: Vec::new() },
 ];
 
 /// The panel is sized from the result list, and the scroll clamp, the

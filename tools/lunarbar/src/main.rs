@@ -65,6 +65,7 @@ mod launcher;
 mod taskmenu;
 mod powermenu;
 mod fx;
+mod volmenu;
 use launcher::Row;
 use info::*;
 mod workspaces;
@@ -587,7 +588,7 @@ enum PopupKind {
     /// is open, and an index would then act on whoever took its slot).
     TaskMenu { tid: u32, title: String, win: taskmenu::Win, sel: usize },
     /// Volume control popup slider.
-    Volume { level: u32 },
+    Volume { level: u32, muted: bool, devices: Vec<String> },
     /// hunter's menu: modes, alerts and actions.
     Hunter(hunter_menu::Menu),
 }
@@ -621,6 +622,12 @@ enum Action {
     TaskFullscreen(u32),
     /// Click anywhere on the volume gauge; percent derived from x.
     VolumeGauge,
+    /// − / +: step the volume by this many percent.
+    VolumeStep(i8),
+    /// One of the usual levels under the meter.
+    VolumePreset(u8),
+    /// The mute switch.
+    VolumeMute,
     /// hunter: set a domain (index into `hunter::DOMAINS`) to a mode.
     HunterMode(u8, hunter::Mode),
     HunterLearning(bool),
@@ -760,6 +767,8 @@ struct Metrics {
     temp: Option<u32>,
     batt: Option<(u32, bool)>,
     vol: Option<u32>,
+    /// The sink is muted (the volume module then says so).
+    vol_muted: bool,
     /// Console/labwc layout, uppercase (`ES` / `US`), from `/proc/kbd`.
     kbd: String,
     /// hunter's shield; None (no hunter in this kernel) hides it.
@@ -817,6 +826,7 @@ struct State {
     /// Cached mixer level: read once at startup and updated when the user
     /// drags the slider, never re-read per tick. None hides the module.
     vol: Option<u32>,
+    vol_muted: bool,
     /// Cached XDG application list, and whether the scan has run (see
     /// toggle_apps: the walk is far too expensive to repeat per click).
     apps_cache: Vec<apps::AppEntry>,
@@ -874,6 +884,7 @@ impl State {
             // the 1 Hz tick. Primed at startup, updated when the user drags
             // the slider.
             vol: self.vol,
+            vol_muted: self.vol_muted,
             kbd: sysinfo::kbd_layout(),
             hunter: self.metrics.hunter,
             cpu_hist: self.hist.0.clone(),
@@ -1489,7 +1500,9 @@ impl State {
             return;
         }
         let level = self.vol.unwrap_or(0);
-        self.open_popup(qh, PopupKind::Volume { level }, at_top);
+        self.vol_muted = volmenu::muted();
+        let (muted, devices) = (self.vol_muted, volmenu::devices());
+        self.open_popup(qh, PopupKind::Volume { level, muted, devices }, at_top);
     }
 
     /// The bar-surface rect of the button that opens `kind`, used as the
@@ -1890,22 +1903,8 @@ impl State {
                 | Action::TaskFullscreen(_)
                 | Action::TaskClose(_)),
             ) => self.task_act(a),
-            Some(Action::VolumeGauge) => {
-                let (px, _py, pw, _ph) = panel;
-                let gw = (pw - 30).max(1);
-                let rel = (x - (px + 15)).clamp(0, gw);
-                let v = ((rel as u32 * 100) / gw as u32).min(100);
-                self.vol = Some(v);
-                if let Some(popup) = self.popup.as_mut() {
-                    if let PopupKind::Volume { level, .. } = &mut popup.kind {
-                        *level = v;
-                    }
-                }
-                self.spawn(&format!(
-                    "pactl set-sink-volume @DEFAULT_SINK@ {v}% >/dev/null 2>&1 || amixer set Master {v}% >/dev/null 2>&1 || wpctl set-volume @DEFAULT_AUDIO_SINK@ {v}%"
-                ));
-                self.render_popup(qh);
-                self.render_all();
+            Some(a @ (Action::VolumeGauge | Action::VolumeStep(_) | Action::VolumePreset(_) | Action::VolumeMute)) => {
+                self.volume_act(qh, a, x)
             }
             Some(a @ (Action::HunterMode(..)
             | Action::HunterLearning(_)
@@ -1986,6 +1985,11 @@ impl State {
                 }
             }
             PopupKind::Calendar { .. } => self.cal_shift(qh, dir),
+            // The wheel turns the volume: down is quieter.
+            PopupKind::Volume { level, .. } => {
+                let v = volmenu::step(*level, -dir * volmenu::STEP);
+                self.set_volume(qh, v);
+            }
             _ => {}
         }
     }
@@ -2000,6 +2004,7 @@ impl State {
             Render,
             Task(Action),
             Power(Action),
+            Vol(Action),
         }
         let mut act = Do::Nothing;
         if let Some(popup) = self.popup.as_mut() {
@@ -2073,6 +2078,13 @@ impl State {
                         *scroll = *sel + 1 - rows_fit;
                     }
                 }
+                PopupKind::Volume { level, .. } => match key {
+                    KEY_ESC_WL => act = Do::Close,
+                    KEY_LEFT_WL | KEY_DOWN_WL => act = Do::Vol(Action::VolumePreset(volmenu::step(*level, -volmenu::STEP) as u8)),
+                    KEY_RIGHT_WL | KEY_UP_WL => act = Do::Vol(Action::VolumePreset(volmenu::step(*level, volmenu::STEP) as u8)),
+                    k if key_char(k) == Some('m') => act = Do::Vol(Action::VolumeMute),
+                    _ => {}
+                },
                 PopupKind::PowerMenu { sel, armed } => {
                     let n = powermenu::ROWS.len();
                     match key {
@@ -2125,6 +2137,7 @@ impl State {
             Do::Close => self.close_popup(),
             Do::Task(a) => self.task_act(a),
             Do::Power(a) => self.power_act(qh, a),
+            Do::Vol(a) => self.volume_act(qh, a, 0),
             Do::Launch(cmd) => {
                 self.close_popup();
                 self.spawn(&cmd);
@@ -2624,7 +2637,7 @@ fn draw_task(
 
         // Volume module
         if let Some(v) = m.vol {
-            let vol_str = cap(&format!("vol {v}%"));
+            let vol_str = cap(&if m.vol_muted { "vol off".to_string() } else { format!("vol {v}%") });
             let vw = Canvas::text_width(&vol_str) + 10;
             if rx - vw >= left_min {
                 rx -= vw;
@@ -2895,7 +2908,7 @@ fn popup_size(kind: &PopupKind, oh: i32, bar_h: i32) -> (i32, i32) {
         ),
         PopupKind::PowerMenu { .. } => powermenu::size(),
         PopupKind::TaskMenu { win, .. } => taskmenu::size(*win),
-        PopupKind::Volume { .. } => (180, 80),
+        PopupKind::Volume { .. } => volmenu::size(),
         PopupKind::Hunter(_) => hunter_menu::size(),
     }
 }
@@ -2971,7 +2984,7 @@ fn draw_popup(
             powermenu::draw(cv, px, py, pw, *sel, *armed, sysinfo::uptime().as_deref())
         }
         PopupKind::TaskMenu { tid, title, win, sel } => taskmenu::draw(cv, px, py, pw, *tid, title, *win, *sel),
-        PopupKind::Volume { level } => draw_volume_menu(cv, px, py, pw, ph, *level),
+        PopupKind::Volume { level, muted, devices } => volmenu::draw(cv, px, py, pw, *level, *muted, devices),
         PopupKind::Hunter(m) => hunter_menu::draw(cv, px, py, pw, ph, m),
     }
 }
@@ -3191,38 +3204,6 @@ fn draw_calendar(
 }
 
 // ── Power menu drawing ───────────────────────────────────────────────────────
-
-// ── Volume control popup drawing ─────────────────────────────────────────────
-
-fn draw_volume_menu(
-    cv: &mut Canvas,
-    px: i32,
-    py: i32,
-    pw: i32,
-    ph: i32,
-    vol: u32,
-) -> Vec<(i32, i32, i32, i32, Action)> {
-    draw_panel(cv, px, py, pw, ph, 10);
-
-    cv.volume_icon(px + 14, py + 14, 16, pal().white, vol == 0);
-    let label = cap(&format!("volumen {}%", vol));
-    cv.text_bold(&label, px + 40, py + 16, pal().text);
-
-    let mut hits = Vec::new();
-    let gw = pw - 30;
-    let gy = py + 48;
-    if tecno() {
-        // The panel's segmented meter, one cell per 4px of the slider.
-        let c = meter::ramp(vol as f32 / 100.0, pal().accent, pal().warn);
-        cv.blocks(px + 15, gy, (gw + 1) / 4, vol as f32 / 100.0, 10, c, pal().dim);
-    } else {
-        cv.gauge(px + 15, gy, gw, 10, vol as f32 / 100.0, pal().pill);
-    }
-    // One continuous hitbox — percent is derived from the click x.
-    hits.push((px + 15, gy - 10, px + 15 + gw, gy + 20, Action::VolumeGauge));
-
-    hits
-}
 
 // ── Tooltip drawing ──────────────────────────────────────────────────────────
 
@@ -4318,6 +4299,7 @@ fn main() {
             temp: sysinfo::temp_c(),
             batt: sysinfo::battery(),
             vol: sysinfo::volume(),
+            vol_muted: false,
             kbd: sysinfo::kbd_layout(),
             // Shown even off Eclipse OS, so the preview has the shield in it.
             hunter: Some(hunter::read().map_or(hunter::Shield::Guarded, |s| s.shield(s.criticals))),
@@ -4376,7 +4358,7 @@ fn main() {
         // LUNARBAR_DUMP_TASK=n: the window menu, its n-th row lit, for a
         // maximised window when LUNARBAR_DUMP_TASK_MAX is set.
         let want_task: Option<usize> = std::env::var("LUNARBAR_DUMP_TASK").ok().and_then(|v| v.parse().ok());
-        if want_menu || want_cal || want_power || want_hunter || want_toast || want_task.is_some() {
+        if want_menu || want_cal || want_power || want_hunter || want_toast || want_task.is_some() || std::env::var("LUNARBAR_DUMP_VOL").is_ok() {
             let mut cv = Canvas::new(w, full_h);
             // The compositor places the real thing; here the preview has to,
             // so it hangs the panel off the bottom bar the way the positioner
@@ -4391,7 +4373,12 @@ fn main() {
                 let py = (full_h as i32 - bh as i32 - POPUP_SHADOW - ph).max(POPUP_SHADOW);
                 (px, py, pw, ph)
             };
-            if let Some(sel) = want_task {
+            if let Some(v) = std::env::var("LUNARBAR_DUMP_VOL").ok().and_then(|v| v.parse::<u32>().ok()) {
+                let muted = std::env::var("LUNARBAR_DUMP_VOL_MUTED").is_ok();
+                let devices = vec!["Audio interno analógico estéreo".to_string()];
+                let (px, py, pw, _) = place(&PopupKind::Volume { level: v, muted, devices: devices.clone() }, false);
+                volmenu::draw(&mut cv, px - 120, py, pw, v, muted, &devices);
+            } else if let Some(sel) = want_task {
                 let max = std::env::var("LUNARBAR_DUMP_TASK_MAX").is_ok();
                 let win = taskmenu::Win { activated: max, maximized: max, ..Default::default() };
                 let (px, py, pw, _) = place(&PopupKind::TaskMenu { tid: 0, title: String::new(), win, sel }, true);
