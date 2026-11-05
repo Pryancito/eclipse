@@ -1912,6 +1912,28 @@ pub(crate) fn steal_for_balance() -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
     task
 }
 
+/// The CPU each CPU last stole a task from, plus one (0: none yet). See the
+/// tie-break in `steal_task_inner`.
+static LAST_STEAL_VICTIM: [CacheAligned; MAX_CORE_NUM] = [const { CacheAligned::new() }; MAX_CORE_NUM];
+
+fn last_steal_victim(cpu: usize) -> usize {
+    if cpu >= MAX_CORE_NUM {
+        return usize::MAX;
+    }
+    (LAST_STEAL_VICTIM[cpu].0.load(Ordering::Relaxed) as usize).wrapping_sub(1)
+}
+
+fn note_steal_victim(cpu: usize, victim: usize) {
+    if cpu >= MAX_CORE_NUM {
+        return;
+    }
+    // Only this CPU writes its slot; read first so a repeat costs no store.
+    let v = victim as u64 + 1;
+    if LAST_STEAL_VICTIM[cpu].0.load(Ordering::Relaxed) != v {
+        LAST_STEAL_VICTIM[cpu].0.store(v, Ordering::Relaxed);
+    }
+}
+
 fn steal_task_min(min_count: usize, rebalance: bool) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
     // [null-exec] Run the whole scan non-preemptibly. This is now defense in
     // depth rather than the sole barrier: `candidates` no longer lives on this
@@ -2022,7 +2044,20 @@ fn steal_task_inner(min_count: usize, rebalance: bool) -> Option<(Key, Arc<Task>
     // every idle core probes the same lowest-id victim first and the rest of
     // them lose the `try_lock` and walk away empty.
     let online = num_online_cpus().max(1);
-    let distance = |cpu: usize| (cpu + online - current_cpu) % online;
+    // Between equally loaded victims, round-robin: the first one AFTER the
+    // victim this CPU took from last time, cyclically, so every idle thief
+    // still starts its probe somewhere different. Ties used to break on
+    // distance from the thief alone, so the same victim always won. Two tasks
+    // pinned to this CPU but queued on other owners (born elsewhere, no
+    // ownership migration) are one stealable task each, and the nearer
+    // owner's task was taken on every pass -- a CPU-bound one, preempted back
+    // onto its owner each time, so the other never ran: a 200 us sleeper
+    // pinned beside a spinner woke 1-5 times in half a second, one run in
+    // four. Only avoiding the last victim is not enough: with three candidates
+    // it alternates between the two nearest and the third still starves.
+    let last = last_steal_victim(current_cpu);
+    let origin = if last < online { last + 1 } else { current_cpu };
+    let distance = |cpu: usize| (cpu + online - origin % online) % online;
     candidates[..n].sort_unstable_by(|a, b| {
         b.1.cmp(&a.1)
             .then_with(|| distance(a.0).cmp(&distance(b.0)))
@@ -2047,6 +2082,7 @@ fn steal_task_inner(min_count: usize, rebalance: bool) -> Option<(Key, Arc<Task>
             STEAL_PROBED.fetch_add(1, Ordering::Relaxed);
             if let Some(task) = runtime.task_collection.try_take_task() {
                 STEAL_OK.fetch_add(1, Ordering::Relaxed);
+                note_steal_victim(current_cpu, cpu);
                 return Some(task);
             }
         }

@@ -1983,6 +1983,9 @@ impl Executor {
         // yielded), until the next pick says whether it was set aside for a
         // different one. See `runtime::kick_idle_for_set_aside`.
         let mut set_aside: Option<alloc::sync::Arc<WakerRef>> = None;
+        // The last pick was a rescue (see below): the next pass with work of
+        // our own queued serves that work first.
+        let mut last_rescued = false;
         // Entry attribution (see `runtime::WAKE_ENTRY_RESUMED`): this CPU is
         // about to look at its run queue having just arrived on this stack,
         // which is neither "waited for an interrupt" nor "waited out someone
@@ -2067,10 +2070,22 @@ impl Executor {
                 // empty. A CPU with work of its own never does -- so the task
                 // never runs again, rather than running late. See
                 // `runtime::STRANDED`.
-                if crate::runtime::stranded_peer_exists() {
+                //
+                // But not twice running while our own queue has work. A
+                // CPU-bound task stranded on a peer is preempted back onto
+                // that peer, which forwards it here again, so every pass came
+                // with a fresh rescue kick and the rescue took the same task
+                // each time: a thread woken on THIS CPU's own queue, pinned
+                // here beside it, waited 80-500 ms. Alternate, and keep the
+                // kick for the next pass so the stranded task is not dropped.
+                if last_rescued && self.task_collection.has_ready() {
+                    if rescue_kicked {
+                        crate::runtime::note_rescue_kick(crate::arch::cpu_id() as usize);
+                    }
+                } else if crate::runtime::stranded_peer_exists() {
                     task_info = crate::runtime::rescue_stranded_task();
                 }
-                if rescue_kicked && task_info.is_none() {
+                if rescue_kicked && task_info.is_none() && !last_rescued {
                     crate::runtime::note_rescue_kick_empty();
                 }
                 // Balance pull, unchanged: only on the rebalance tick, and only
@@ -2080,6 +2095,7 @@ impl Executor {
                     task_info = crate::runtime::steal_for_balance();
                 }
             }
+            last_rescued = task_info.is_some();
             if task_info.is_none() {
                 task_info = self.task_collection.take_task();
             }
