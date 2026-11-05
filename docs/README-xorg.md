@@ -2,8 +2,7 @@
 
 Eclipse OS (zCore) expone la capa de consola/terminal virtual que un servidor X
 de Linux necesita para tomar el control de la pantalla. Este documento explica
-qué soporta el núcleo y cómo configurar el espacio de usuario (p. ej. Alpine)
-para que `startx` funcione.
+qué soporta el núcleo y cómo está configurado el espacio de usuario para que `startx` funcione.
 
 ## Qué proporciona el núcleo
 
@@ -22,7 +21,7 @@ El núcleo implementa los dispositivos e `ioctl`s que `Xorg` usa en su rutina
 - **Framebuffer**: `/dev/fb0` con `FBIOGET_VSCREENINFO`/`FBIOGET_FSCREENINFO` y,
   como la resolución es fija, acepta `FBIOPUT_VSCREENINFO`, `FBIOPAN_DISPLAY` y
   `FBIOBLANK` para que el driver `fbdev` de X arranque.
-- **Entrada**: `/dev/input/event*` y `/dev/input/mice` (PS/2 y virtio).
+- **Entrada**: `/dev/input/event*` y `/dev/input/mice` (PS/2, USB HID y virtio).
 - **DRM**: `/dev/dri/card0` (parcial).
 - **Cambio de VT**: Ctrl+Alt+F1..F6. El modo KD es por-VT, así que al salir del
   VT gráfico de X se sigue viendo una consola de texto normal.
@@ -31,8 +30,8 @@ El núcleo implementa los dispositivos e `ioctl`s que `Xorg` usa en su rutina
 
 `cargo xtask image` instala los paquetes y genera la configuración; nada de
 esto hay que hacerlo a mano en una imagen construida con xtask
-(`xtask/src/linux/desktop.rs`, `write_xorg_config`). Para una instalación
-manual sobre Alpine:
+(`xtask/src/linux/desktop.rs`, `write_xorg_config`). Para instalarlo a mano
+con los paquetes de Ubuntu:
 
 ```sh
 apt-get install xserver-xorg-core xserver-xorg-video-fbdev xserver-xorg-input-libinput xinit libgl1-mesa-dri
@@ -147,9 +146,10 @@ mirar `/tmp/Xorg.log` (sección anterior) para el siguiente fallo.
   fuerza pulsando Ctrl+Alt+Fn otra vez, y la supresión de blits del VT gráfico
   no activo (ver `drm.rs`) mantiene visible la consola de texto como red de
   seguridad.
-- La aceleración por GPU no está disponible; usa el renderizado por software de
-  Mesa (`llvmpipe`/`softpipe`), por eso se instalan `mesa-dri-gallium` y
-  `llvm-libs`.
+- La sesión X usa `fbdev` y Mesa renderiza por software (`llvmpipe`, paquete
+  `libgl1-mesa-dri`). La aceleración por GPU existe en la sesión Wayland con
+  NVIDIA y `nvidia.nouveau_uapi` (ver [README-nouveau-uapi.md](README-nouveau-uapi.md)),
+  no en X.
 
 ## Pseudo-terminales (PTY)
 

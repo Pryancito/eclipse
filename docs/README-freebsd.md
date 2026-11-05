@@ -132,8 +132,8 @@ msg:
     .ascii "hola FreeBSD\n\0"
 ```
 
-Copie el ejecutable resultante al rootfs y láncelo con `ROOTPROC` (ver el
-[README principal](../README.md)). En el log del kernel debería aparecer:
+Copie el ejecutable resultante al rootfs y láncelo con `INIT=` o `SHELL=` en la
+cmdline (ver el [README principal](../README.md#opciones-de-arranque)). En el log del kernel debería aparecer:
 
 ```
 elf: detected FreeBSD ABI for "/bin/hello"
