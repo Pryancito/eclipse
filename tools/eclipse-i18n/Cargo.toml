@@ -1,0 +1,24 @@
+[package]
+name = "eclipse-i18n"
+version = "0.1.0"
+edition = "2021"
+description = "Eclipse OS: the UI strings of the Lunar clients, in Spanish and English"
+publish = false
+
+# Standalone like the clients that use it (lunarbar, lunarbg, SilverSurfer):
+# userspace, NOT a member of the zCore workspace.
+[workspace]
+
+# NO DEPENDENCIES, on purpose. These clients are static musl binaries with no
+# system libraries at all -- no GTK, no D-Bus, no fontconfig, no libwayland --
+# which is the whole reason lunarbar exists instead of waybar. Measured with
+# `cargo tree` before writing this: `gettext-rs` is 10 crates but pulls
+# `gettext-sys` -> `libgit2-sys` + `libz-sys`, so it compiles C and needs
+# libintl, which musl does not have; `rust-i18n` is 67 crates (serde, toml,
+# regex, ignore, globwalk, crossbeam) for a panel; `fluent-bundle` is 20 pure
+# Rust crates but loads its `.ftl` files AT RUNTIME, so the files have to be
+# installed in the rootfs and a missing key is a silent fallback instead of a
+# build error -- which is exactly the guarantee `every_key_has_both_languages`
+# below exists to give. A static table in Rust costs nothing and fails at
+# compile time.
+[dependencies]

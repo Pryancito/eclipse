@@ -898,7 +898,9 @@ pub fn kernel_report() -> String {
             out,
             "sched rescue: {} kicks sent, {} taken by a pass, {} taken with nothing rescued, \
              {} idle backlog kicks",
-            kicks, taken, empty,
+            kicks,
+            taken,
+            empty,
             kernel_hal::kstats::sched_idle_backlog_kicks()
         );
         let (denied, armed) = kernel_hal::thread::wake_floor_stats();

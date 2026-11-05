@@ -37,6 +37,10 @@ embedded-graphics = "0.8"
 # with lunarbg and SilverSurfer; see src/vtext.rs. Pure Rust, so the binaries
 # stay static; the bitmap face is the fallback.
 lunartext = { path = "../lunartext" }
+# The UI strings, in Spanish and English, shared with SilverSurfer and lunarbg
+# (separate crates, so a module inside lunarbar could not serve them). Zero
+# dependencies of its own; see its Cargo.toml for why it is not gettext.
+eclipse-i18n = { path = "../eclipse-i18n" }
 # Pure-Rust Wayland stack (no libwayland-client.so): the default wayland-backend
 # is the Rust implementation, so the binary is fully static. NO GTK, NO D-Bus,
 # NO gdk-pixbuf, NO fontconfig — the whole reason lunarbar exists as waybar's

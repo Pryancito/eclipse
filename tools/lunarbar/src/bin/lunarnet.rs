@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use lunarbar::draw::{Canvas, Rgb, GLYPH_H, GLYPH_W};
 use lunarbar::fill_guard;
+use lunarbar::i18n::{Key, Lang};
 use lunarbar::keys::{
     KEY_BACKSPACE_WL, KEY_DOWN_WL, KEY_ENTER_WL, KEY_ESC_WL, KEY_KPENTER_WL, KEY_LEFT_WL,
     KEY_RIGHT_WL, KEY_TAB_WL, KEY_UP_WL,
@@ -296,6 +297,7 @@ enum Tone {
 }
 
 struct Scene<'a> {
+    lang: Lang,
     live: &'a [Live],
     edit: &'a [Iface],
     /// Which of `edit` differ from the file.
@@ -324,12 +326,12 @@ fn frame(cv: &mut Canvas, r: Rect, c: Rgb) {
     }
 }
 
-fn state_word(state: &str) -> (&'static str, Rgb) {
+fn state_word(state: &str, lang: Lang) -> (&'static str, Rgb) {
     match state {
-        "up" => ("conectada", CYAN),
-        "dormant" => ("en espera", GOLD),
-        "down" | "lowerlayerdown" => ("sin conexión", WARN),
-        _ => ("sin estado", MUTED),
+        "up" => (lang.s(Key::net_state_up), CYAN),
+        "dormant" => (lang.s(Key::net_state_dormant), GOLD),
+        "down" | "lowerlayerdown" => (lang.s(Key::net_state_down), WARN),
+        _ => (lang.s(Key::net_state_unknown), MUTED),
     }
 }
 
@@ -343,9 +345,9 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
 
     // Head.
     let hy = py + (HEAD_H - GLYPH_H) / 2;
-    let tw = cv.text_bold("RED", px + PAD, hy, CYAN);
-    cv.text("IPv4 · IPv6 · DNS", px + PAD + tw + 12, hy, MUTED);
-    let keys = "Tab campo · ←→ modo · Intro aplicar · Esc cerrar";
+    let tw = cv.text_bold(s.lang.s(Key::net_title), px + PAD, hy, CYAN);
+    cv.text(s.lang.s(Key::net_subtitle), px + PAD + tw + 12, hy, MUTED);
+    let keys = s.lang.s(Key::net_keys);
     let kw = Canvas::text_width(keys);
     if kw < pw - 2 * PAD - 220 {
         cv.text(keys, px + pw - PAD - kw, hy, MUTED);
@@ -356,7 +358,7 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
     let body_h = ph - HEAD_H - FOOT_H;
     cv.fill_rect_a(px + LIST_W, py + HEAD_H + PAD, 1, body_h - 2 * PAD, HAIRLINE, 1.0);
     if s.live.is_empty() {
-        cv.text("no hay interfaces de red", px + PAD, py + HEAD_H + PAD + 8, MUTED);
+        cv.text(s.lang.s(Key::net_no_ifaces), px + PAD, py + HEAD_H + PAD + 8, MUTED);
     }
     for (k, lv) in s.live.iter().enumerate() {
         let r = iface_row(&l, k);
@@ -371,14 +373,14 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
         let x = px + PAD;
         let y1 = r.1 + 10;
         cv.text_bold(&fit(&lv.name, 112), x, y1, if on { TEXT } else { MUTED });
-        let (word, col) = state_word(&lv.state);
+        let (word, col) = state_word(&lv.state, s.lang);
         let ww = Canvas::text_width(word);
         cv.fill_rect_a(px + LIST_W - PAD - ww - 12, y1 + (GLYPH_H - 6) / 2, 6, 6, col, 1.0);
         cv.text(word, px + LIST_W - PAD - ww, y1, col);
         let mac = if lv.mac.is_empty() { "—" } else { &lv.mac };
         cv.text(mac, x, y1 + GLYPH_H + 6, DIM);
         if s.dirty.get(k).copied().unwrap_or(false) {
-            let t = "sin aplicar";
+            let t = s.lang.s(Key::net_unapplied);
             cv.text(t, x, y1 + 2 * (GLYPH_H + 6), GOLD);
         }
     }
@@ -393,67 +395,98 @@ fn draw(cv: &mut Canvas, w: i32, h: i32, s: &Scene) {
 
     // IPv4.
     let now4 = {
-        let mut t = if lv.v4.is_empty() { "sin dirección".to_string() } else { lv.v4.join(" ") };
+        let mut t = if lv.v4.is_empty() {
+            s.lang.s(Key::net_no_address).to_string()
+        } else {
+            lv.v4.join(" ")
+        };
         if let Some(g) = &lv.gateway4 {
-            t += &format!(" · vía {g}");
+            t += &format!(" · {} {g}", s.lang.s(Key::net_via));
         }
         t
     };
-    section(cv, &l, l.sec4, "IPV4", &now4);
-    let modes4 = V4::ALL.map(|m| match m {
-        V4::Dhcp => "DHCP",
-        V4::Static => "MANUAL",
-        V4::Off => "APAGADO",
+    section(cv, &l, l.sec4, "IPV4", &now4, s.lang);
+    let modes4 = V4::ALL.map(|m| {
+        s.lang.s(match m {
+            V4::Dhcp => Key::net_mode_dhcp,
+            V4::Static => Key::net_mode_manual,
+            V4::Off => Key::net_mode_off,
+        })
     });
     let at4 = V4::ALL.iter().position(|m| *m == i.v4).unwrap_or(0);
-    segments(cv, &l, l.sec4, &l.seg4, &modes4, at4, s.focus == Focus::Mode4);
+    segments(cv, &l, l.sec4, &l.seg4, &modes4, at4, s.focus == Focus::Mode4, s.lang);
+    // The static placeholders are EXAMPLE ADDRESSES, not prose: the same in
+    // both languages but for the parenthesis, which is a word.
+    let optional4 = format!("192.168.1.1  ({})", s.lang.s(Key::net_optional));
     let (ph4, pg4) = match i.v4 {
-        V4::Static => ("192.168.1.20/24", "192.168.1.1  (opcional)"),
-        V4::Dhcp => ("la da el servidor DHCP", "la da el servidor DHCP"),
-        V4::Off => ("sin IPv4", "sin IPv4"),
+        V4::Static => ("192.168.1.20/24", optional4.as_str()),
+        V4::Dhcp => (s.lang.s(Key::net_ph_dhcp), s.lang.s(Key::net_ph_dhcp)),
+        V4::Off => (s.lang.s(Key::net_ph_no_v4), s.lang.s(Key::net_ph_no_v4)),
     };
-    field(cv, &l, s, i, Focus::Addr4, "Dirección / prefijo", ph4, why(Field::Address4));
-    field(cv, &l, s, i, Focus::Gw4, "Puerta de enlace", pg4, why(Field::Gateway4));
+    let addr_label = s.lang.s(Key::net_addr_prefix);
+    let gw_label = s.lang.s(Key::net_gateway);
+    field(cv, &l, s, i, Focus::Addr4, addr_label, ph4, why(Field::Address4));
+    field(cv, &l, s, i, Focus::Gw4, gw_label, pg4, why(Field::Gateway4));
 
     // IPv6.
     let now6 = {
-        let mut t = if lv.v6.is_empty() { "sin dirección".to_string() } else { lv.v6.join(" ") };
+        let mut t = if lv.v6.is_empty() {
+            s.lang.s(Key::net_no_address).to_string()
+        } else {
+            lv.v6.join(" ")
+        };
         if let Some(g) = &lv.gateway6 {
-            t += &format!(" · vía {g}");
+            t += &format!(" · {} {g}", s.lang.s(Key::net_via));
         }
         t
     };
-    section(cv, &l, l.sec6, "IPV6", &now6);
-    let modes6 = V6::ALL.map(|m| match m {
-        V6::Auto => "AUTOMÁTICO",
-        V6::Dhcp => "DHCPV6",
-        V6::Static => "MANUAL",
+    section(cv, &l, l.sec6, "IPV6", &now6, s.lang);
+    let modes6 = V6::ALL.map(|m| {
+        s.lang.s(match m {
+            V6::Auto => Key::net_mode_auto,
+            V6::Dhcp => Key::net_mode_dhcpv6,
+            V6::Static => Key::net_mode_manual,
+        })
     });
     let at6 = V6::ALL.iter().position(|m| *m == i.v6).unwrap_or(0);
-    segments(cv, &l, l.sec6, &l.seg6, &modes6, at6, s.focus == Focus::Mode6);
+    segments(cv, &l, l.sec6, &l.seg6, &modes6, at6, s.focus == Focus::Mode6, s.lang);
+    let optional6 = format!("fe80::1  ({})", s.lang.s(Key::net_optional));
     let (ph6, pg6) = match i.v6 {
-        V6::Static => ("2001:db8::20/64", "fe80::1  (opcional)"),
-        V6::Auto => ("automática (SLAAC)", "la anuncia el router"),
-        V6::Dhcp => ("la da el servidor DHCPv6", "la anuncia el router"),
+        V6::Static => ("2001:db8::20/64", optional6.as_str()),
+        V6::Auto => (s.lang.s(Key::net_ph_slaac), s.lang.s(Key::net_ph_router)),
+        V6::Dhcp => (s.lang.s(Key::net_ph_dhcpv6), s.lang.s(Key::net_ph_router)),
     };
-    field(cv, &l, s, i, Focus::Addr6, "Dirección / prefijo", ph6, why(Field::Address6));
-    field(cv, &l, s, i, Focus::Gw6, "Puerta de enlace", pg6, why(Field::Gateway6));
+    field(cv, &l, s, i, Focus::Addr6, addr_label, ph6, why(Field::Address6));
+    field(cv, &l, s, i, Focus::Gw6, gw_label, pg6, why(Field::Gateway6));
 
     // DNS.
-    let dns_now = if s.dns_now.is_empty() { "ninguno".to_string() } else { s.dns_now.join(" ") };
-    section(cv, &l, l.secdns, "DNS", &dns_now);
-    field(cv, &l, s, i, Focus::Dns, "Servidores", "vacío: los que dé DHCP  (1.1.1.1 2606:4700::1111)", why(Field::Dns));
-    let hint = "separados por espacios; IPv4 e IPv6 mezclados";
+    let dns_now = if s.dns_now.is_empty() {
+        s.lang.s(Key::net_dns_none).to_string()
+    } else {
+        s.dns_now.join(" ")
+    };
+    section(cv, &l, l.secdns, "DNS", &dns_now, s.lang);
+    field(
+        cv,
+        &l,
+        s,
+        i,
+        Focus::Dns,
+        s.lang.s(Key::net_dns_servers),
+        s.lang.s(Key::net_dns_ph),
+        why(Field::Dns),
+    );
+    let hint = s.lang.s(Key::net_dns_hint);
     cv.text(&fit(hint, l.rw - LABEL_W), l.dns.0, l.dns.1 + FIELD_H + 6, DIM);
 
     draw_foot(cv, &l, s, s.dirty.get(s.sel).copied().unwrap_or(false));
 }
 
-fn section(cv: &mut Canvas, l: &Layout, top: i32, title: &str, now: &str) {
+fn section(cv: &mut Canvas, l: &Layout, top: i32, title: &str, now: &str, lang: Lang) {
     let y = top + (SEC_HEAD_H - GLYPH_H) / 2;
     let tw = cv.text_bold(title, l.rx, y, CYAN);
     cv.hline(l.rx, top + SEC_HEAD_H - 4, l.rw, HAIRLINE, 0.6);
-    let label = "ahora ";
+    let label = lang.s(Key::net_now);
     let room = l.rw - tw - 24;
     let lw = Canvas::text_width(label);
     let val = fit(now, room - lw);
@@ -463,9 +496,19 @@ fn section(cv: &mut Canvas, l: &Layout, top: i32, title: &str, now: &str) {
     cv.text(&val, x, y, TEXT);
 }
 
-fn segments(cv: &mut Canvas, l: &Layout, top: i32, segs: &[Rect; 3], names: &[&str; 3], at: usize, focused: bool) {
+#[allow(clippy::too_many_arguments)]
+fn segments(
+    cv: &mut Canvas,
+    l: &Layout,
+    top: i32,
+    segs: &[Rect; 3],
+    names: &[&str; 3],
+    at: usize,
+    focused: bool,
+    lang: Lang,
+) {
     let y = top + SEC_HEAD_H + (ROW_H - GLYPH_H) / 2;
-    cv.text("Modo", l.rx, y, MUTED);
+    cv.text(lang.s(Key::net_mode), l.rx, y, MUTED);
     for (k, r) in segs.iter().enumerate() {
         let on = k == at;
         if on {
@@ -491,7 +534,17 @@ fn segments(cv: &mut Canvas, l: &Layout, top: i32, segs: &[Rect; 3], names: &[&s
 }
 
 #[allow(clippy::too_many_arguments)]
-fn field(cv: &mut Canvas, l: &Layout, s: &Scene, i: &Iface, f: Focus, label: &str, hint: &str, why: Option<&str>) {
+#[allow(clippy::too_many_arguments)]
+fn field(
+    cv: &mut Canvas,
+    l: &Layout,
+    s: &Scene,
+    i: &Iface,
+    f: Focus,
+    label: &str,
+    hint: &str,
+    why: Option<Key>,
+) {
     let Some(which) = f.field() else { return };
     let r = field_rect(l, which);
     let enabled = f.enabled(i);
@@ -532,7 +585,7 @@ fn field(cv: &mut Canvas, l: &Layout, s: &Scene, i: &Iface, f: Focus, label: &st
         let room = l.rx + l.rw - x;
         // With no room beside it, "Aplicar" still says it on the status line.
         if room >= 8 * GLYPH_W {
-            cv.text(&fit(w, room), x, ty, WARN);
+            cv.text(&fit(s.lang.s(w), room), x, ty, WARN);
         }
     }
 }
@@ -556,8 +609,8 @@ fn draw_foot(cv: &mut Canvas, l: &Layout, s: &Scene, dirty: bool) {
     let (px, py, pw, ph) = l.panel;
     let top = py + ph - FOOT_H;
     cv.hline(px + PAD, top, pw - 2 * PAD, HAIRLINE, 1.0);
-    button(cv, l.revert, "DESHACER", false, s.focus == Focus::Revert);
-    button(cv, l.apply, "APLICAR", dirty, s.focus == Focus::Apply);
+    button(cv, l.revert, s.lang.s(Key::net_undo_caps), false, s.focus == Focus::Revert);
+    button(cv, l.apply, s.lang.s(Key::net_apply_caps), dirty, s.focus == Focus::Apply);
     let col = match s.tone {
         Tone::Plain => MUTED,
         Tone::Good => CYAN,
@@ -619,11 +672,16 @@ struct Editor {
     focus: Focus,
     status: String,
     tone: Tone,
+    /// Read once, at startup, like every other client: the session's language
+    /// does not change under a window that is already open (`eclipse-locale`
+    /// reconfigures labwc, it does not reach into running clients).
+    lang: Lang,
 }
 
 impl Editor {
     fn new(saved: Vec<Iface>, live: Vec<Live>, dns_now: Vec<String>) -> Self {
         let edit = live.iter().map(|l| netconf::settings_for(&saved, &l.name)).collect();
+        let lang = Lang::current();
         Editor {
             saved,
             live,
@@ -631,8 +689,9 @@ impl Editor {
             dns_now,
             sel: 0,
             focus: Focus::List,
-            status: "los cambios se guardan en /etc/eclipse/network".into(),
+            status: lang.s(Key::net_saved_in).into(),
             tone: Tone::Plain,
+            lang,
         }
     }
 
@@ -642,6 +701,7 @@ impl Editor {
 
     fn scene(&self) -> Scene<'_> {
         Scene {
+            lang: self.lang,
             live: &self.live,
             edit: &self.edit,
             dirty: &[],
@@ -727,7 +787,7 @@ impl Editor {
     fn revert(&mut self) {
         if let Some(name) = self.edit.get(self.sel).map(|i| i.name.clone()) {
             self.edit[self.sel] = netconf::settings_for(&self.saved, &name);
-            self.status = format!("{name}: vuelve a lo que dice el archivo");
+            self.status = format!("{name}: {}", self.lang.s(Key::net_reverted));
             self.tone = Tone::Plain;
         }
     }
@@ -770,22 +830,22 @@ impl Editor {
                 Field::Gateway6 => Focus::Gw6,
                 Field::Dns => Focus::Dns,
             };
-            self.status = format!("{}: {}", self.edit[k].name, p.why);
+            self.status = format!("{}: {}", self.edit[k].name, self.lang.s(p.why));
             self.tone = Tone::Bad;
             return;
         }
         let all = self.merged();
         if let Err(e) = save(&all) {
-            self.status = format!("no se pudo guardar /etc/eclipse/network: {e}");
+            self.status = format!("{}: {e}", self.lang.s(Key::net_save_failed));
             self.tone = Tone::Bad;
             return;
         }
         self.saved = all;
         if signal() {
-            self.status = "guardado y aplicado".into();
+            self.status = self.lang.s(Key::net_saved_applied).into();
             self.tone = Tone::Good;
         } else {
-            self.status = "guardado; el servicio de red no está en marcha, se aplicará al arrancar".into();
+            self.status = self.lang.s(Key::net_saved_no_service).into();
             self.tone = Tone::Bad;
         }
     }
@@ -879,7 +939,7 @@ impl Editor {
         let live_why = self.edit.get(self.sel).and_then(|i| {
             let f = self.focus.field()?;
             let p = netconf::check(i).into_iter().find(|p| p.field == f)?;
-            Some(format!("{}: {}", i.name, p.why))
+            Some(format!("{}: {}", i.name, self.lang.s(p.why)))
         });
         let mut s = Scene { dirty: &dirty, ..self.scene() };
         if let Some(w) = &live_why {
@@ -1264,7 +1324,7 @@ fn sample() -> Editor {
     i.gateway4 = "192.168.2.1".into();
     i.dns = "1.1.1.1 2606:4700:4700::1111".into();
     ed.focus = Focus::Gw4;
-    ed.status = "eth0: la puerta de enlace no está en la red de la dirección".into();
+    ed.status = format!("eth0: {}", ed.lang.s(Key::net_bad_gw_offnet));
     ed.tone = Tone::Bad;
     ed
 }
@@ -1541,7 +1601,10 @@ mod tests {
         assert_eq!(e.tone, Tone::Bad, "saved, but no service to tell");
         e.edit[1].dns = "9.9.9.9".into();
         e.apply(|_| Ok(()), || true);
-        assert_eq!((e.status.as_str(), e.tone), ("guardado y aplicado", Tone::Good));
+        assert_eq!(
+            (e.status.as_str(), e.tone),
+            (e.lang.s(Key::net_saved_applied), Tone::Good)
+        );
         e.apply(|_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)), || true);
         assert_eq!(e.tone, Tone::Bad);
         // Deshacer goes back to the file.
