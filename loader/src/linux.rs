@@ -1589,6 +1589,38 @@ macro_rules! run_with_irq_enable {
 
 /// Handle what brought the thread out of user mode. For a syscall cut short
 /// by a signal, `Some` with what it takes to make it again (`Interrupted`).
+/// Wake-up preemption on the way back to user mode from a system call: Linux's
+/// `exit_to_user_mode` checking `TIF_NEED_RESCHED`.
+///
+/// The trap path below only honours a reschedule request on an *interrupt*
+/// taken in user mode. The waker's IPI is an interrupt, but when it lands while
+/// the thread is inside a system call it is taken in kernel mode, where nobody
+/// looks; the request stays pending, and every later wake for this CPU
+/// coalesces onto it without sending another IPI. So a thread that makes
+/// system calls often (a server loop, anything calling `getcpu`,
+/// `clock_gettime` without a vDSO, `read` on a ready descriptor) held the CPU
+/// against a woken neighbour until a timer tick happened to land in user mode:
+/// a 1 ms `nanosleep` beside four such threads came back 2.9 ms late on
+/// average and 24 ms late at worst in QEMU, against 0.3 ms beside four pure
+/// compute loops.
+///
+/// Same rules as the interrupt path: peek, ask the RUN_TO_PARITY floor, and
+/// only then consume; a request the floor denies arms the floor timer instead.
+/// One relaxed load when no request is pending, which is almost every call.
+#[cfg(not(feature = "libos"))]
+async fn honour_wake_preempt_on_syscall_exit(thread: &CurrentThread) {
+    if !kernel_hal::thread::need_resched_pending() {
+        return;
+    }
+    if thread.sched_may_preempt_on_wake() {
+        if kernel_hal::thread::take_need_resched() {
+            kernel_hal::thread::preempt_now().await;
+        }
+    } else if let Some(floor) = thread.sched_wake_preempt_floor_end() {
+        kernel_hal::thread::arm_wake_preempt_floor(floor);
+    }
+}
+
 async fn handle_user_trap(
     thread: &CurrentThread,
     mut ctx: Box<UserContext>,
@@ -1645,6 +1677,8 @@ async fn handle_user_trap(
         };
         trace!("Syscall ret: {} -> {:x}", num as u32, ret);
         thread.with_context(|ctx| ctx.set_field(UserContextField::ReturnValue, ret))?;
+        #[cfg(not(feature = "libos"))]
+        honour_wake_preempt_on_syscall_exit(thread).await;
         return Ok(Interrupted::after(num, &args, ret));
     }
 

@@ -1198,6 +1198,84 @@ pub(crate) fn request_resched(owner: u8) {
     }
 }
 
+/// Idle CPUs a [`kick_idle_for_set_aside`] IPI is already on its way to, so a
+/// busy CPU switching tasks does not send the same halted peer one IPI per
+/// switch before it has even woken. Cleared by the target on its way out of
+/// the halt ([`note_idle_kick_served`]).
+static IDLE_KICK_PENDING: AtomicU64 = AtomicU64::new(0);
+/// Backlog kicks sent (see [`kick_idle_for_set_aside`]).
+static IDLE_BACKLOG_KICKS: AtomicU64 = AtomicU64::new(0);
+
+/// `(backlog kicks sent)` for `/proc/perf`.
+pub fn idle_backlog_kick_stats() -> u64 {
+    IDLE_BACKLOG_KICKS.load(Ordering::Relaxed)
+}
+
+/// Which halted peer to send a backlog kick to, or `None`: the nearest one
+/// after `cpu` (wrapping) among `idle`, so the busy CPUs of a machine do not
+/// all pick the same lowest-numbered idle one.
+pub(crate) fn pick_backlog_kick_target(idle: u64, cpu: usize, online: usize) -> Option<usize> {
+    let online = online.clamp(1, MAX_CORE_NUM);
+    (1..online)
+        .map(|d| (cpu + d) % online)
+        .find(|&t| idle & (1u64 << t) != 0)
+}
+
+/// This CPU just set a still-runnable task aside to run a different one, while
+/// a peer that may run the set-aside task is halted. Wake that peer so it
+/// steals it now.
+///
+/// Without this, nothing told it. A preempted task goes back to its *owner's*
+/// queue, the owner is usually busy, and the halted peers only look again at
+/// their own next interrupt. A task stolen once keeps its owner, so the queue
+/// that holds the backlog is in general NOT this CPU's: four CPU-bound threads
+/// created on CPU 0 and spread by stealing still all live on CPU 0's queue,
+/// and two of them shared CPU 1 for 12 ms while CPU 3 sat halted. Measuring
+/// this CPU's own queue (the first version of this kick) therefore never saw
+/// the backlog. The set-aside task is the backlog, wherever it is queued.
+///
+/// Firing only when a *different* task was picked is what keeps it cheap: a
+/// lone thread in a `sched_yield` loop is set aside and picked straight back,
+/// and costs nothing. `owner` is the CPU whose queue holds the task, the one
+/// the thief's scan must probe (see [`STEALABLE`]).
+pub(crate) fn kick_idle_for_set_aside(mask: u64, owner: usize) {
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu >= MAX_CORE_NUM || !WAKEUP_PREEMPT.load(Ordering::Relaxed) {
+        return;
+    }
+    let idle = SLEEPING_CPUS.load(Ordering::Relaxed)
+        & executor_ready_mask()
+        & mask
+        & !(1u64 << cpu)
+        & !IDLE_KICK_PENDING.load(Ordering::Relaxed);
+    if idle == 0 {
+        return;
+    }
+    let Some(target) = pick_backlog_kick_target(idle, cpu, num_online_cpus()) else {
+        return;
+    };
+    let bit = 1u64 << target;
+    if IDLE_KICK_PENDING.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+        return;
+    }
+    note_stealable(owner);
+    IDLE_BACKLOG_KICKS.fetch_add(1, Ordering::Relaxed);
+    send_resched_ipi(target);
+}
+
+/// This CPU left the halt: any backlog kick aimed at it has been delivered
+/// (or overtaken by another interrupt, which is as good).
+#[inline]
+pub(crate) fn note_idle_kick_served(cpu: usize) {
+    if cpu >= MAX_CORE_NUM {
+        return;
+    }
+    let bit = 1u64 << cpu;
+    if IDLE_KICK_PENDING.load(Ordering::Relaxed) & bit != 0 {
+        IDLE_KICK_PENDING.fetch_and(!bit, Ordering::AcqRel);
+    }
+}
+
 /// The CPUs that could actually pick up a task whose affinity is `mask`:
 /// allowed by the mask **and** inside their executor loop.
 ///
@@ -5666,5 +5744,34 @@ mod benches {
         let _g = resched_test_lock();
         let _m = Machine::of(u64::MAX);
         b.iter(|| runnable_task_count());
+    }
+}
+
+#[cfg(test)]
+mod backlog_kick_tests {
+    use super::pick_backlog_kick_target;
+
+    /// The nearest halted peer after the busy CPU, wrapping, and never the
+    /// busy CPU itself.
+    #[test]
+    fn picks_the_nearest_idle_peer_after_the_busy_cpu() {
+        let idle = (1 << 1) | (1 << 3);
+        assert_eq!(pick_backlog_kick_target(idle, 0, 4), Some(1));
+        assert_eq!(pick_backlog_kick_target(idle, 1, 4), Some(3));
+        assert_eq!(pick_backlog_kick_target(idle, 2, 4), Some(3));
+        assert_eq!(pick_backlog_kick_target(idle, 3, 4), Some(1));
+    }
+
+    #[test]
+    fn nobody_idle_or_only_self_is_no_target() {
+        assert_eq!(pick_backlog_kick_target(0, 0, 4), None);
+        assert_eq!(pick_backlog_kick_target(1 << 2, 2, 4), None);
+        assert_eq!(pick_backlog_kick_target(1 << 2, 0, 1), None);
+    }
+
+    /// A bit past the online count is not a CPU: never picked.
+    #[test]
+    fn an_offline_bit_is_never_picked() {
+        assert_eq!(pick_backlog_kick_target(1 << 5, 0, 4), None);
     }
 }

@@ -541,6 +541,30 @@ impl WakerRef {
         self
     }
 
+    /// Runnable and checked out to nobody: a wake (or yield) is pending and no
+    /// executor is polling it.
+    pub(crate) fn waiting_for_cpu(&self) -> bool {
+        !self.dropped.load(Ordering::SeqCst)
+            && self.page.has_pending_wake(self.idx)
+            && !self.page.is_borrowed(self.idx)
+    }
+
+    /// The CPU whose queue holds this task.
+    pub(crate) fn owner_cpu(&self) -> usize {
+        self.page.owner_cpu as usize
+    }
+
+    /// The CPUs this task may run on.
+    pub(crate) fn allowed_mask(&self) -> u64 {
+        match self.affinity.as_ref() {
+            Some(a) => match a.load(Ordering::Relaxed) {
+                0 => u64::MAX,
+                m => m,
+            },
+            None => u64::MAX,
+        }
+    }
+
     /// The task's mask when it forbids the CPU that owns this page.
     ///
     /// A task never leaves the page it was inserted on, so a thread born on
