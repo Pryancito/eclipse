@@ -1914,7 +1914,8 @@ pub(crate) fn steal_for_balance() -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
 
 /// The CPU each CPU last stole a task from, plus one (0: none yet). See the
 /// tie-break in `steal_task_inner`.
-static LAST_STEAL_VICTIM: [CacheAligned; MAX_CORE_NUM] = [const { CacheAligned::new() }; MAX_CORE_NUM];
+static LAST_STEAL_VICTIM: [CacheAligned; MAX_CORE_NUM] =
+    [const { CacheAligned::new() }; MAX_CORE_NUM];
 
 fn last_steal_victim(cpu: usize) -> usize {
     if cpu >= MAX_CORE_NUM {
