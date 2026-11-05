@@ -26,6 +26,9 @@ hal_fn_impl_default!(rand, super::hal_fn::console);
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod macos;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod fault_bridge;
+
 /// Non-SMP initialization.
 pub fn init() {
     drivers::init_early();

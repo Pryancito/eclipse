@@ -18,6 +18,15 @@ hal_fn_impl! {
                 super::macos::register_sigsegv_handler();
             }
 
+            // A guest that faults in a libos build raises a HOST signal, in
+            // this very process. Without this the host kills the lot --
+            // kernel, guest and harness -- and a test that was waiting for
+            // the exception never hears anything. See `fault_bridge`.
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            unsafe {
+                super::fault_bridge::init();
+            }
+
         }
     }
 }
